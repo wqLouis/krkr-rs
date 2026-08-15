@@ -29,10 +29,12 @@
 //! state makes parallel tests racy).
 
 mod debug;
+mod plugins;
 mod system;
 mod window;
 
 pub use debug::register_debug;
+pub use plugins::register_plugins;
 pub use system::{SystemContext, register_system, set_system_context};
 pub use window::register_window;
 
@@ -44,11 +46,12 @@ use std::sync::{Mutex, MutexGuard};
 
 use tjs2_sys::{Tjs2Engine, VAL_INTEGER, VAL_REAL, VAL_STRING, VAL_VOID, Value, tjs2_malloc};
 
-/// Register all native classes in this crate on `engine` (`System`, `Debug`
-/// and the stub `Window`).
+/// Register all native classes in this crate on `engine` (`System`, `Debug`,
+/// `Plugins` and the stub `Window`).
 pub fn register_all(engine: &Tjs2Engine) -> Result<(), String> {
     register_system(engine)?;
     register_debug(engine)?;
+    register_plugins(engine)?;
     register_window(engine)
 }
 
