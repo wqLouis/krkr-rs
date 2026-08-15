@@ -281,8 +281,9 @@ impl Xp3Archive {
                     }
                 }
                 b"aldr" => {
-                    if payload.len() >= 4 {
-                        file_hash = u32::from_le_bytes(payload[0..4].try_into().unwrap());
+                    // SAFETY: length checked by the match guard below.
+                    if let Some(h) = payload.get(0..4) {
+                        file_hash = u32::from_le_bytes(h.try_into().unwrap());
                     }
                 }
                 _ => { /* unknown sub-chunk: ignore */ }
