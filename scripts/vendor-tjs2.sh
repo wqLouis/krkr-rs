@@ -41,4 +41,31 @@ open(path, "w", encoding="utf-8").write(src.replace(old, new))
 print("patched:", path)
 PYEOF
 
+# 2. zero the VM register area on function entry: the exception-display
+#    register dump reads ALL allocated slots, including ones the VM never
+#    wrote; the stack allocator reuses memory, so those slots are
+#    uninitialized and reading them is UB (crashes under clang -O2, which
+#    eliminates tTJSVariantString's `if(!this)` guard).
+python3 - "$DEST/tjsInterCodeExec.cpp" << 'PYEOF'
+import sys
+path = sys.argv[1]
+src = open(path, encoding="utf-8").read()
+old = """            tTJSVariant *regs = TJSVariantArrayStack->Allocate(num_alloc);
+            tTJSVariant *ra =
+                regs + MaxVariableCount + VariableReserveCount; // register area"""
+new = """            tTJSVariant *regs = TJSVariantArrayStack->Allocate(num_alloc);
+            // krkr-rs patch: the exception-display register dump reads ALL
+            // num_alloc slots, including ones the VM never wrote; the
+            // allocator reuses memory, so those slots are uninitialized and
+            // reading them is UB (crashes under clang -O2, which eliminates
+            // tTJSVariantString's `if(!this)` guard). Zero them so the dump
+            // always sees tvtVoid slots.
+            std::memset(regs, 0, sizeof(tTJSVariant) * num_alloc);
+            tTJSVariant *ra =
+                regs + MaxVariableCount + VariableReserveCount; // register area"""
+assert old in src, "register-zero patch anchor not found (upstream changed?)"
+open(path, "w", encoding="utf-8").write(src.replace(old, new))
+print("patched:", path)
+PYEOF
+
 echo "vendored tjs2 -> $DEST"

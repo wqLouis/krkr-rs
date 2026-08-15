@@ -218,7 +218,12 @@ fn main() {
         "-Wno-tautological-constant-out-of-range-compare".into(),
     ];
     if profile == "release" {
-        flags.push("-O2".into());
+        // krkr-rs: upstream tjs2 has latent UB (uninitialized register slots
+        // read by the exception-display dump, null-string handling, ...) that
+        // crashes under clang -O2. Correctness first: compile the vendored
+        // C++ at -O0 in release too (the VM is not the perf bottleneck for a
+        // VN; rendering is). Revisit once the UB is fixed upstream.
+        flags.push("-O0".into());
         flags.push("-DNDEBUG".into());
     } else {
         flags.push("-O0".into());

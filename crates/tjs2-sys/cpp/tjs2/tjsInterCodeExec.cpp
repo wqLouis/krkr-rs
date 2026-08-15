@@ -10,6 +10,7 @@
 //---------------------------------------------------------------------------
 
 #include "tjsCommHead.h"
+#include <cstring>
 
 #include "tjsInterCodeExec.h"
 #include "tjsInterCodeGen.h"
@@ -644,6 +645,13 @@ namespace TJS {
         //	if(objthis) objthis->AddRef();
         try {
             tTJSVariant *regs = TJSVariantArrayStack->Allocate(num_alloc);
+            // krkr-rs patch: the exception-display register dump reads ALL
+            // num_alloc slots, including ones the VM never wrote; the
+            // allocator reuses memory, so those slots are uninitialized and
+            // reading them is UB (crashes under clang -O2, which eliminates
+            // tTJSVariantString's `if(!this)` guard). Zero them so the dump
+            // always sees tvtVoid slots.
+            std::memset(regs, 0, sizeof(tTJSVariant) * num_alloc);
             tTJSVariant *ra =
                 regs + MaxVariableCount + VariableReserveCount; // register area
 
