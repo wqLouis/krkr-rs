@@ -1,0 +1,9 @@
+[package]
+name = "tvp-streams"
+description = "Binary and text stream abstractions ported from TVP (tTJSBinaryStream / iTJSTextStream)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror = "2"

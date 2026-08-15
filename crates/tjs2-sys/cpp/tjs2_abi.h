@@ -5,6 +5,8 @@
 #ifndef TJS2_ABI_H
 #define TJS2_ABI_H
 
+#include <stddef.h> /* size_t */
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -57,6 +59,50 @@ int tjs2_eval(tjs2_engine *e, const char *expression, const char *name,
 
 /* Free a string returned via out_error. */
 void tjs2_free_string(char *s);
+
+/*
+ * Native class registration (static methods only for this milestone).
+ *
+ * The VM is single-threaded: register classes only from the thread that
+ * owns the engine, and not from inside a native method callback.
+ */
+
+/* A native method implemented in Rust.
+ *
+ * Returns 0 on success and fills `out`. On error returns non-zero and, if
+ * out_error is non-NULL, points it at a malloc'd UTF-8 message (free with
+ * tjs2_free_string).
+ *
+ *   engine   opaque tjs2_engine* the method was registered on
+ *   argc     number of arguments
+ *   argv     argc tjs2_value entries, valid only during the call
+ *   out      return slot, filled by the callback on success
+ */
+typedef int (*tjs2_native_method_fn)(void *engine, int argc,
+                                     const tjs2_value *argv, tjs2_value *out,
+                                     char **out_error);
+
+typedef struct tjs2_native_method {
+    const char *name;         /* UTF-8, method name on the class */
+    tjs2_native_method_fn fn; /* Rust callback */
+} tjs2_native_method;
+
+/*
+ * Register a native class named `class_name` on the VM **global object** so
+ * scripts can call ClassName.method(...). Methods are registered as static
+ * members; `objthis` is not passed through (instance semantics are a later
+ * milestone). The class and its methods are owned by the engine and released
+ * by tjs2_destroy.
+ *
+ * Returns 0 on success; non-zero on failure (invalid arguments, duplicate
+ * class name, or an exception while registering).
+ */
+int tjs2_register_native_class(tjs2_engine *e, const char *class_name_utf8,
+                               const tjs2_native_method *methods, int count);
+
+/* Allocate with malloc; used to build error strings on the Rust side.
+ * Pair with tjs2_free_string. */
+void *tjs2_malloc(size_t size);
 
 #ifdef __cplusplus
 } /* extern "C" */

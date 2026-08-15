@@ -26,6 +26,41 @@ pub const VAL_OBJECT: c_int = 4;
 /// valid for the duration of the call.
 pub type LogCb = extern "C" fn(level: c_int, msg: *const c_char, user: *mut c_void);
 
+/// A native method implemented in Rust, invoked by the VM when a script
+/// calls `ClassName.method(...)`.
+///
+/// Returns 0 on success (and fills `out`); on error returns non-zero and
+/// should set `*out_error` to a malloc'd NUL-terminated UTF-8 message
+/// (allocate with the C-side `tjs2_malloc` helper exposed in the `unsafe
+/// extern` block; the C++ side frees it with `tjs2_free_string`). Setting
+/// `*out_error` is optional — a generic message is used when it is left
+/// null.
+///
+/// `argv` points to `argc` [`Value`] entries and is only valid during the
+/// call. `out` receives the return value; strings written there (as
+/// `out.string`) must stay valid until the callback returns and the C++
+/// side copies them — use a static/thread-local buffer, or storage that
+/// outlives the call. `engine` is the opaque engine handle the method was
+/// registered on (unused for static methods).
+///
+/// The callback runs on the VM thread and must not panic (a panic across
+/// the `extern "C"` boundary aborts the process).
+pub type NativeMethodFn = extern "C" fn(
+    engine: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+) -> c_int;
+
+/// C-side mirror of `tjs2_native_method` (cpp/tjs2_abi.h).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct NativeMethod {
+    pub name: *const c_char,
+    pub f: NativeMethodFn,
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct Value {
@@ -59,6 +94,15 @@ unsafe extern "C" {
         out_error: *mut *mut c_char,
     ) -> c_int;
     fn tjs2_free_string(s: *mut c_char);
+    fn tjs2_register_native_class(
+        e: *mut Engine,
+        class_name: *const c_char,
+        methods: *const NativeMethod,
+        count: c_int,
+    ) -> c_int;
+    /// malloc-compatible allocation (for building error strings on the Rust
+    /// side; free with tjs2_free_string).
+    pub fn tjs2_malloc(size: usize) -> *mut c_void;
 }
 
 // ---------------------------------------------------------------------------
@@ -89,6 +133,22 @@ pub enum TjsValue {
 #[derive(Debug, thiserror::Error)]
 #[error("TJS error: {0}")]
 pub struct TjsError(String);
+
+/// Definition of one native method to attach to a class.
+pub struct NativeMethodDef {
+    pub name: &'static str,
+    pub f: NativeMethodFn,
+}
+
+/// Describes a native class to register on the VM global object (see
+/// [`Tjs2Engine::register_native_class`]).
+///
+/// The VM is single-threaded: register classes only from the thread that
+/// owns the engine.
+pub struct NativeClassBuilder<'a> {
+    pub name: &'a str,
+    pub methods: Vec<NativeMethodDef>,
+}
 
 impl Tjs2Engine {
     /// Create a new script engine.
@@ -164,6 +224,57 @@ impl Tjs2Engine {
             return Err(unsafe { take_error(error) });
         }
         Ok(unsafe { take_value(&result) })
+    }
+
+    /// Register a native class on the VM global object so scripts can call
+    /// `ClassName.method(...)`.
+    ///
+    /// Methods are registered as static members (instance semantics are a
+    /// later milestone). The class and its methods are owned by the engine
+    /// and released when it is dropped.
+    pub fn register_native_class(&self, builder: &NativeClassBuilder) -> Result<(), String> {
+        let class_name = CString::new(builder.name)
+            .map_err(|_| format!("class name contains a NUL byte: {:?}", builder.name))?;
+        // Method names must stay alive for the duration of the C call.
+        let method_names: Vec<CString> = builder
+            .methods
+            .iter()
+            .map(|m| {
+                CString::new(m.name)
+                    .map_err(|_| format!("method name contains a NUL byte: {:?}", m.name))
+            })
+            .collect::<Result<_, _>>()?;
+        let c_methods: Vec<NativeMethod> = builder
+            .methods
+            .iter()
+            .zip(&method_names)
+            .map(|(m, n)| NativeMethod {
+                name: n.as_ptr(),
+                f: m.f,
+            })
+            .collect();
+        // SAFETY: self.inner is a valid engine; class_name and c_methods are
+        // valid for the call. The C++ side copies everything it needs
+        // (names and callbacks) during registration.
+        let rc = unsafe {
+            tjs2_register_native_class(
+                self.inner,
+                class_name.as_ptr(),
+                if c_methods.is_empty() {
+                    ptr::null()
+                } else {
+                    c_methods.as_ptr()
+                },
+                c_methods.len() as c_int,
+            )
+        };
+        if rc != 0 {
+            return Err(format!(
+                "failed to register native class '{}' (error {rc})",
+                builder.name
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -255,5 +366,238 @@ mod tests {
         let e = Tjs2Engine::new().unwrap();
         let v = e.eval("'こんにちは' + '世界'", "test").unwrap();
         assert_eq!(v, TjsValue::String("こんにちは世界".into()));
+    }
+
+    // -------------------------------------------------------------------
+    // native class support
+    // -------------------------------------------------------------------
+
+    /// Build a malloc'd NUL-terminated UTF-8 error message for `*out_error`
+    /// (the C++ side frees it with tjs2_free_string).
+    fn alloc_error_string(msg: &str) -> *mut c_char {
+        let bytes = msg.as_bytes();
+        // SAFETY: tjs2_malloc is malloc; we write a NUL-terminated copy and
+        // the C++ trampoline frees it with tjs2_free_string.
+        unsafe {
+            let buf = tjs2_malloc(bytes.len() + 1) as *mut u8;
+            if buf.is_null() {
+                return ptr::null_mut();
+            }
+            ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len());
+            *buf.add(bytes.len()) = 0;
+            buf as *mut c_char
+        }
+    }
+
+    thread_local! {
+        /// Scratch buffer for `out.string`: stays valid until the next
+        /// callback on this thread, which is long enough — the C++ side
+        /// copies the string immediately after the callback returns.
+        static STRING_OUT: std::cell::RefCell<Vec<u8>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// Write `s` into `*out` as a string, using the thread-local buffer.
+    fn set_string_out(out: *mut Value, s: &str) {
+        STRING_OUT.with(|buf| {
+            let mut buf = buf.borrow_mut();
+            buf.clear();
+            buf.extend_from_slice(s.as_bytes());
+            buf.push(0);
+            // SAFETY: out is a valid slot provided by the C++ trampoline.
+            unsafe {
+                (*out).ty = VAL_STRING;
+                (*out).integer = 0;
+                (*out).real = 0.0;
+                (*out).string = buf.as_ptr() as *const c_char;
+            }
+        });
+    }
+
+    /// `TestNatives.add(a, b)`: integer sum; errors on argc < 2 or non-
+    /// integer arguments.
+    extern "C" fn native_add(
+        _engine: *mut c_void,
+        argc: c_int,
+        argv: *const Value,
+        out: *mut Value,
+        out_error: *mut *mut c_char,
+    ) -> c_int {
+        if argc < 2 {
+            // SAFETY: out_error points at a valid char* slot for the call.
+            unsafe { *out_error = alloc_error_string("add requires 2 arguments") };
+            return 1;
+        }
+        // SAFETY: argv is valid for argc entries during the call.
+        let args = unsafe { std::slice::from_raw_parts(argv, argc as usize) };
+        if args[0].ty != VAL_INTEGER || args[1].ty != VAL_INTEGER {
+            unsafe { *out_error = alloc_error_string("add expects integer arguments") };
+            return 1;
+        }
+        let sum = args[0].integer + args[1].integer;
+        // SAFETY: out is a valid return slot for the call.
+        unsafe {
+            (*out).ty = VAL_INTEGER;
+            (*out).integer = sum;
+            (*out).real = 0.0;
+            (*out).string = ptr::null();
+        }
+        0
+    }
+
+    /// `TestNatives.greet(name)`: returns "hello " + name; errors on argc
+    /// < 1 or a non-string argument.
+    extern "C" fn native_greet(
+        _engine: *mut c_void,
+        argc: c_int,
+        argv: *const Value,
+        out: *mut Value,
+        out_error: *mut *mut c_char,
+    ) -> c_int {
+        if argc < 1 {
+            unsafe { *out_error = alloc_error_string("greet requires 1 argument") };
+            return 1;
+        }
+        let args = unsafe { std::slice::from_raw_parts(argv, argc as usize) };
+        if args[0].ty != VAL_STRING {
+            unsafe { *out_error = alloc_error_string("greet expects a string argument") };
+            return 1;
+        }
+        // SAFETY: args[0].string is NUL-terminated UTF-8 for the call.
+        let name = unsafe { CStr::from_ptr(args[0].string) }.to_string_lossy();
+        set_string_out(out, &format!("hello {name}"));
+        0
+    }
+
+    /// `TestNatives.half(x)`: returns x / 2 as a real.
+    extern "C" fn native_half(
+        _engine: *mut c_void,
+        argc: c_int,
+        argv: *const Value,
+        out: *mut Value,
+        _out_error: *mut *mut c_char,
+    ) -> c_int {
+        if argc < 1 {
+            return 1;
+        }
+        let args = unsafe { std::slice::from_raw_parts(argv, argc as usize) };
+        let v = if args[0].ty == VAL_REAL {
+            args[0].real / 2.0
+        } else {
+            args[0].integer as f64 / 2.0
+        };
+        unsafe {
+            (*out).ty = VAL_REAL;
+            (*out).integer = 0;
+            (*out).real = v;
+            (*out).string = ptr::null();
+        }
+        0
+    }
+
+    /// `TestNatives.nop()`: returns nothing (void).
+    extern "C" fn native_nop(
+        _engine: *mut c_void,
+        _argc: c_int,
+        _argv: *const Value,
+        out: *mut Value,
+        _out_error: *mut *mut c_char,
+    ) -> c_int {
+        unsafe {
+            (*out).ty = VAL_VOID;
+            (*out).integer = 0;
+            (*out).real = 0.0;
+            (*out).string = ptr::null();
+        }
+        0
+    }
+
+    fn test_natives_builder() -> NativeClassBuilder<'static> {
+        NativeClassBuilder {
+            name: "TestNatives",
+            methods: vec![
+                NativeMethodDef {
+                    name: "add",
+                    f: native_add,
+                },
+                NativeMethodDef {
+                    name: "greet",
+                    f: native_greet,
+                },
+                NativeMethodDef {
+                    name: "half",
+                    f: native_half,
+                },
+                NativeMethodDef {
+                    name: "nop",
+                    f: native_nop,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn native_class_static_methods_work_from_scripts() {
+        let e = Tjs2Engine::new().unwrap();
+        e.register_native_class(&test_natives_builder()).unwrap();
+
+        assert_eq!(
+            e.eval("TestNatives.add(2, 3)", "test").unwrap(),
+            TjsValue::Integer(5)
+        );
+        assert_eq!(
+            e.eval("TestNatives.greet('x')", "test").unwrap(),
+            TjsValue::String("hello x".into())
+        );
+        // UTF-8 round-trips both ways.
+        assert_eq!(
+            e.eval("TestNatives.greet('世界')", "test").unwrap(),
+            TjsValue::String("hello 世界".into())
+        );
+        // real and void return paths
+        assert_eq!(
+            e.eval("TestNatives.half(5.0)", "test").unwrap(),
+            TjsValue::Real(2.5)
+        );
+        assert_eq!(e.eval("TestNatives.nop()", "test").unwrap(), TjsValue::Void);
+        // usable from a longer script, not just a bare expression
+        e.exec_script("var r = TestNatives.add(10, 32); r *= 2;", "test")
+            .unwrap();
+        assert_eq!(e.eval("r", "test").unwrap(), TjsValue::Integer(84));
+    }
+
+    #[test]
+    fn native_method_error_surfaces_as_tjs_error() {
+        let e = Tjs2Engine::new().unwrap();
+        e.register_native_class(&test_natives_builder()).unwrap();
+
+        // Error returned from Rust → error from eval, with the Rust message.
+        let err = e.eval("TestNatives.add(1)", "test").unwrap_err();
+        assert!(
+            err.to_string().contains("add requires 2 arguments"),
+            "unexpected error: {err}"
+        );
+
+        // ... and catchable from a script via try/catch (TJS requires `;`
+        // after expression statements inside blocks).
+        e.exec_script(
+            "var r = ''; try { TestNatives.add(1); } catch(e) { r = 'caught'; }",
+            "test",
+        )
+        .unwrap();
+        assert_eq!(
+            e.eval("r", "test").unwrap(),
+            TjsValue::String("caught".into())
+        );
+    }
+
+    #[test]
+    fn native_class_rejects_duplicate_registration() {
+        let e = Tjs2Engine::new().unwrap();
+        e.register_native_class(&test_natives_builder()).unwrap();
+        let err = e
+            .register_native_class(&test_natives_builder())
+            .unwrap_err();
+        assert!(err.contains("TestNatives"), "unexpected error: {err}");
     }
 }
