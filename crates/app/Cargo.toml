@@ -1,0 +1,18 @@
+[package]
+name = "krkr-app"
+description = "krkr-rs CLI + native wiring: registers TVP native classes, loads games"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "krkr-rs"
+path = "src/main.rs"
+
+[dependencies]
+engine = { path = "../engine" }
+tjs2-sys = { workspace = true }
+tvp-natives = { path = "../tvp-natives" }
+tvp-storages = { path = "../tvp-storages" }
+tvp-scripts = { path = "../tvp-scripts" }
+log = "0.4"

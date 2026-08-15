@@ -1,0 +1,19 @@
+{
+  "bool_true": true,
+  "bool_false": false,
+  "bool_num1": 1,
+  "bool_num0": 0,
+  "bool_str1": "1",
+  "bool_str0": "0",
+  "bool_str_true": "true",
+  "bool_str_false": "false",
+  "int_str": "42",
+  "int_float": 3.7,
+  "int_neg": -7,
+  "real_str": "2.5",
+  "real_int": 3,
+  "num_as_string": 42,
+  "flt_as_string": 0.5,
+  "garbage": "abc",
+  "empty_str": ""
+}

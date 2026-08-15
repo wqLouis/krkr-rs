@@ -1,0 +1,10 @@
+[package]
+name = "tvp-natives"
+description = "TVP native classes implemented in Rust: System, Debug (methods-first wave)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tjs2-sys = { workspace = true }
+log = "0.4"

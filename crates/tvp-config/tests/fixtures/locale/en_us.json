@@ -1,0 +1,10 @@
+{
+  "lang": "en_us",
+  "items": [
+    { "id": "preference_title", "text": "Global Preference" },
+    { "id": "preference_output_log", "text": "Output Log" },
+    { "id": "preference_select_renderer", "text": "Select Renderer" },
+    { "id": "notice", "text": "Notice" },
+    { "id": "en_only_key", "text": "English Only" }
+  ]
+}

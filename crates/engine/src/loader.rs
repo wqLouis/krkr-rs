@@ -1,7 +1,7 @@
 //! The load pipeline: mount storage → bootstrap the TJS2 VM → run
 //! `startup.tjs`.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use tjs2_sys::{Tjs2Engine, TjsValue};
 
@@ -34,19 +34,39 @@ pub struct LoadReport {
 /// are not registered yet, so real games will typically fail inside
 /// `startup.tjs` with a clear "identifier not found" error until those
 /// natives land.
-pub fn load_game(game_dir: &str) -> Result<LoadReport, LoadError> {
-    let mut storage = Storage::mount(game_dir).map_err(LoadError::Mount)?;
+/// Mount storage and bootstrap a fresh TJS2 VM. The caller (e.g. the app
+/// crate) may register native classes and set native contexts between
+/// [`prepare`] and [`run_startup`].
+pub fn prepare(game_dir: &str) -> Result<(Arc<Mutex<Storage>>, Arc<Tjs2Engine>), LoadError> {
+    let storage = Storage::mount(game_dir).map_err(LoadError::Mount)?;
+    let storage = Arc::new(Mutex::new(storage));
 
     // Bootstrap the VM.
-    let engine = Tjs2Engine::new().map_err(|e| LoadError::Vm(e.to_string()))?;
+    let engine = Arc::new(Tjs2Engine::new().map_err(|e| LoadError::Vm(e.to_string()))?);
     // SAFETY: null user pointer, no user data accessed.
     unsafe { engine.set_log_cb(Some(log_cb), std::ptr::null_mut()) };
+    Ok((storage, engine))
+}
 
+/// Load a game (no native classes registered): mount storage, find and
+/// execute `startup.tjs`. Native-less; used by tests and the pure load path.
+pub fn load_game(game_dir: &str) -> Result<LoadReport, LoadError> {
+    let (storage, engine) = prepare(game_dir)?;
+    run_startup(&engine, &storage)
+}
+
+/// Find and execute `startup.tjs` in the given engine/storage.
+pub fn run_startup(
+    engine: &Arc<Tjs2Engine>,
+    storage: &Arc<Mutex<Storage>>,
+) -> Result<LoadReport, LoadError> {
     // Find startup.tjs.
-    let startup_location = storage.find(STARTUP_SCRIPT);
+    let startup_location = storage.lock().unwrap().find(STARTUP_SCRIPT);
+    let game_dir = storage.lock().unwrap().game_dir().display().to_string();
+    let archives_mounted = storage.lock().unwrap().archives().count();
     let mut report = LoadReport {
-        game_dir: game_dir.to_string(),
-        archives_mounted: storage.archives().count(),
+        game_dir,
+        archives_mounted,
         startup_location: startup_location.as_ref().map(|loc| format!("{loc:?}")),
         startup_result: None,
         startup_error: None,
@@ -55,7 +75,7 @@ pub fn load_game(game_dir: &str) -> Result<LoadReport, LoadError> {
     match startup_location {
         Some(_) => {
             log::info!("found {STARTUP_SCRIPT}, executing...");
-            match execute_storage_script(&engine, &mut storage, STARTUP_SCRIPT) {
+            match execute_storage_script(engine, storage, STARTUP_SCRIPT) {
                 Ok(value) => {
                     report.startup_result = Some(value);
                     log::info!("startup.tjs executed successfully");
@@ -72,13 +92,18 @@ pub fn load_game(game_dir: &str) -> Result<LoadReport, LoadError> {
     Ok(report)
 }
 
-/// Read a script from storage and execute it in the engine.
+/// Read a script from storage and execute it in the engine. The storage lock
+/// is held only for the read, never across VM execution (natives may re-enter
+/// the VM and lock storage again).
 pub fn execute_storage_script(
     engine: &Tjs2Engine,
-    storage: &mut Storage,
+    storage: &Arc<Mutex<Storage>>,
     name: &str,
 ) -> Result<TjsValue, String> {
-    let source = storage.read(name).map_err(|e| e.to_string())?;
+    let source = {
+        let mut guard = storage.lock().unwrap();
+        guard.read(name).map_err(|e| e.to_string())?
+    };
     let text = String::from_utf8_lossy(&source).into_owned();
     engine.exec_script(&text, name).map_err(|e| e.to_string())
 }

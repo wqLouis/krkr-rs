@@ -1,10 +1,13 @@
-//! krkr-rs CLI — load module milestone.
+//! krkr-rs CLI — wires the TVP native classes into the engine and loads games.
 //!
-//!   krkr-rs load <game-dir>          mount storage + run startup.tjs
-//!   krkr-rs run <game-dir> <script>  mount storage + run one script
+//!   krkr-rs load <game-dir>          register natives + run startup.tjs
+//!   krkr-rs run <game-dir> <script>  register natives + run one script
 //!   krkr-rs list <game-dir>          list mounted archives and their entries
 
 use std::process::ExitCode;
+use std::sync::{Arc, Mutex};
+
+use engine::storage::Storage;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -41,20 +44,22 @@ fn print_usage() {
         "krkr-rs — KiriKiri2 rewrite (load module)\n\
          \n\
          usage:\n\
-         \x20 krkr-rs load <game-dir>          mount storage + run startup.tjs\n\
-         \x20 krkr-rs run <game-dir> <script>  mount storage + run one script\n\
+         \x20 krkr-rs load <game-dir>          register natives + run startup.tjs\n\
+         \x20 krkr-rs run <game-dir> <script>  register natives + run one script\n\
          \x20 krkr-rs list <game-dir>          list archives and entries\n\
          \n\
          options:\n\
-         \x20 -v, --verbose  debug logging\n\
-         \n\
-         the C++ TJS2 VM is compiled by build.rs (zig + bison, no cmake) and\n\
-         statically linked; see crates/tjs2-sys/build.rs"
+         \x20 -v, --verbose  debug logging"
     );
 }
 
+/// Full load path: mount storage, bootstrap the VM, register the TVP native
+/// classes (System/Debug/Window, Storages, Scripts), point their contexts at
+/// this engine + storage, then find and run `startup.tjs`.
 fn run_load(game_dir: &str) -> Result<(), String> {
-    let report = engine::load_game(game_dir).map_err(|e| e.to_string())?;
+    let (storage, engine) = engine::loader::prepare(game_dir).map_err(|e| e.to_string())?;
+    register_natives(&engine, &storage)?;
+    let report = engine::loader::run_startup(&engine, &storage).map_err(|e| e.to_string())?;
     println!(
         "loaded {}: {} archive(s), startup.tjs at {}",
         report.game_dir,
@@ -68,9 +73,9 @@ fn run_load(game_dir: &str) -> Result<(), String> {
 }
 
 fn run_script(game_dir: &str, script: &str) -> Result<(), String> {
-    let mut storage = engine::Storage::mount(game_dir).map_err(|e| e.to_string())?;
-    let engine = tjs2_sys::Tjs2Engine::new().map_err(|e| e.to_string())?;
-    match engine::loader::execute_storage_script(&engine, &mut storage, script) {
+    let (storage, engine) = engine::loader::prepare(game_dir).map_err(|e| e.to_string())?;
+    register_natives(&engine, &storage)?;
+    match engine::loader::execute_storage_script(&engine, &storage, script) {
         Ok(value) => {
             println!("{script} -> {value:?}");
             Ok(())
@@ -80,7 +85,7 @@ fn run_script(game_dir: &str, script: &str) -> Result<(), String> {
 }
 
 fn run_list(game_dir: &str) -> Result<(), String> {
-    let storage = engine::Storage::mount(game_dir).map_err(|e| e.to_string())?;
+    let storage = Storage::mount(game_dir).map_err(|e| e.to_string())?;
     for (path, arc) in storage.archives() {
         println!("{}  ({} entries)", path.display(), arc.len());
         for entry in arc.entries().take(20) {
@@ -95,5 +100,26 @@ fn run_list(game_dir: &str) -> Result<(), String> {
             println!("    ... {} more", arc.len() - 20);
         }
     }
+    Ok(())
+}
+
+/// Register every TVP native class and set the global contexts they read.
+fn register_natives(
+    engine: &Arc<tjs2_sys::Tjs2Engine>,
+    storage: &Arc<Mutex<Storage>>,
+) -> Result<(), String> {
+    // Point the System property getters at the mounted game.
+    let game_dir = storage.lock().unwrap().game_dir().to_path_buf();
+    tvp_natives::set_system_context(tvp_natives::SystemContext {
+        project_dir: game_dir,
+        app_data_dir: std::env::temp_dir(), // platform data dir (headless for now)
+        screen_size: (640, 480),            // virtual screen the game sees
+        touch_device: false,
+    });
+    tvp_natives::register_all(engine)?;
+    tvp_storages::register_storages(engine)?;
+    tvp_scripts::register_scripts(engine)?;
+    tvp_storages::set_storage(Some(storage.clone()));
+    tvp_scripts::set_context(Some(engine.clone()), Some(storage.clone()));
     Ok(())
 }

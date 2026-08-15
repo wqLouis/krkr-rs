@@ -1,0 +1,12 @@
+[package]
+name = "tvp-scripts"
+description = "Scripts native class in Rust: execStorage / evalStorage / exec over mounted storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tjs2-sys = { workspace = true }
+engine = { path = "../engine" }
+tvp-util = { path = "../tvp-util" }
+log = "0.4"

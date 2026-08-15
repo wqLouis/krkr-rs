@@ -1,0 +1,13 @@
+{
+  "outputlog": false,
+  "showfps": true,
+  "fps_limit": "30",
+  "menu_handler_opa": 0.3,
+  "user_language": "zh_cn",
+  "custom_int": 42,
+  "custom_float": 1.5,
+  "custom_bool": false,
+  "custom_string": "hello",
+  "string_bool": "1",
+  "string_int": "42"
+}

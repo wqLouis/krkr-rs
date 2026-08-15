@@ -1,0 +1,1169 @@
+//! `Storages` native class (Rust port of the reference `tTJSNC_Storages`).
+//!
+//! This crate registers the TJS2 native class `Storages` — the static
+//! storage-query API KiriKiri startup scripts use. It is backed by the
+//! mounted game storage ([`engine::Storage`]) plus a process-global list of
+//! auto search paths (maintained by `Storages.addAutoPath`).
+//!
+//! Ported from `reference/cpp/core/base/StorageIntf.cpp`
+//! (`tTJSNC_Storages`, `TVPIsExistentStorage`, `TVPGetPlacedPath`,
+//! `TVPAddAutoPath`/`TVPRemoveAutoPath`, the `TVPExtractStorage*` helpers)
+//! and `reference/cpp/core/base/impl/StorageImpl.cpp` (`getLocalName`).
+//!
+//! # Implemented methods
+//!
+//! | method | behavior |
+//! |---|---|
+//! | `isExistentStorage(name)` | `true` when the name resolves in the
+//!   mounted storage (disk file, mixed-case disk file, or `arc.xp3>path`
+//!   archive entry) or is a file inside one of the auto search paths. |
+//! | `getFileList(mask, attr)` | sorted, deduped storage names matching a
+//!   wildcard mask — see [`get_file_list`] for the exact semantics. |
+//! | `addAutoPath(path)` / `removeAutoPath(path)` | maintain the global
+//!   auto-path list; like the reference, a path must end with `/`, `\` or
+//!   `>` (`TVPMissingPathDelimiterAtLast`). |
+//! | `getLocalName(name)` | absolute local disk path for a disk file; the
+//!   name unchanged when no disk file exists; a TJS error for in-archive
+//!   names (the reference throws `TVPCannotGetLocalName`). |
+//! | `getFullPath(path)` | normalized storage name (lowercase, `/`
+//!   separators). |
+//! | `getPlacedPath(path)` | normalized name when found, `""` otherwise. |
+//! | `extractStorageExt/Name/Path`, `chopStorageExt` | pure string helpers
+//!   ported from the reference (they split on `/`, `\` and the `>` archive
+//!   delimiter). |
+//! | `clearArchiveCache()` | no-op (nothing is cached yet). |
+//!
+//! # Pending (registered, but raise a clear TJS error)
+//!
+//! - `stat(name)` / `open(name, flags)` — need object/stream return values;
+//!   the C ABI in `tjs2-sys` only marshals void/integer/real/string so far.
+//! - `searchCD(label)` — CD-volume search; disabled in the reference.
+//! - `selectFile(...)` — GUI file selector; platform-specific.
+//!
+//! # Return-value note for `getFileList`
+//!
+//! The FFI cannot return TJS arrays yet, so `getFileList` returns a single
+//! string of newline-joined storage names (no trailing newline). Returning a
+//! real TJS Array needs array marshaling in `tjs2-sys` (landing in parallel).
+//!
+//! # Process-global state
+//!
+//! [`STORAGE`] and [`AUTO_PATHS`] are process-wide; the engine calls
+//! [`set_storage`] once before running `startup.tjs`. Tests share these
+//! globals, so they must run single-threaded:
+//! `cargo test -p tvp-storages -- --test-threads=1`.
+
+use std::collections::BTreeSet;
+use std::ffi::{CStr, c_char, c_int, c_void};
+use std::path::{Path, PathBuf};
+use std::ptr;
+use std::sync::{Arc, Mutex};
+
+use engine::Storage;
+use tjs2_sys::{
+    NativeClassBuilder, NativeMethodDef, Tjs2Engine, VAL_INTEGER, VAL_REAL, VAL_STRING, VAL_VOID,
+    Value, tjs2_malloc,
+};
+
+// ---------------------------------------------------------------------------
+// Process-global state
+// ---------------------------------------------------------------------------
+
+/// The mounted game storage. Set by the engine (via [`set_storage`]) before
+/// running `startup.tjs`; all natives read it.
+static STORAGE: Mutex<Option<Arc<Mutex<Storage>>>> = Mutex::new(None);
+
+/// Auto search paths registered via `Storages.addAutoPath` (normalized,
+/// trailing `/` stripped).
+static AUTO_PATHS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Mount a game storage for the `Storages` class to query. Call once before
+/// running `startup.tjs`; pass `None` to detach (used between tests).
+pub fn set_storage(storage: Option<Arc<Mutex<Storage>>>) {
+    log::debug!(
+        "tvp-storages: storage {}",
+        if storage.is_some() {
+            "mounted"
+        } else {
+            "detached"
+        }
+    );
+    *STORAGE.lock().unwrap() = storage;
+}
+
+fn storage_arc() -> Option<Arc<Mutex<Storage>>> {
+    STORAGE.lock().unwrap().clone()
+}
+
+fn auto_paths_snapshot() -> Vec<PathBuf> {
+    AUTO_PATHS.lock().unwrap().clone()
+}
+
+// ---------------------------------------------------------------------------
+// Name normalization and helpers
+// ---------------------------------------------------------------------------
+
+/// Normalize a storage name the way `TVPNormalizeStorageName` does for the
+/// common case: ASCII-lowercase, `\` → `/`. (The reference also maps media
+/// prefixes such as `file://./`; not needed for the mounted-game model.)
+fn normalize_storage_name(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c == '\\' {
+                '/'
+            } else {
+                c.to_ascii_lowercase()
+            }
+        })
+        .collect()
+}
+
+/// Case-insensitive `*`/`?` wildcard match (ASCII case folding, like the
+/// reference's normalized storage names).
+fn wildcard_match(pattern: &str, text: &str) -> bool {
+    let pat: Vec<char> = pattern.chars().collect();
+    let text: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let (mut star, mut retry) = (usize::MAX, 0usize);
+    while ti < text.len() {
+        if pi < pat.len() && (pat[pi] == '?' || pat[pi].eq_ignore_ascii_case(&text[ti])) {
+            pi += 1;
+            ti += 1;
+        } else if pi < pat.len() && pat[pi] == '*' {
+            star = pi;
+            retry = ti;
+            pi += 1;
+        } else if star != usize::MAX {
+            pi = star + 1;
+            retry += 1;
+            ti = retry;
+        } else {
+            return false;
+        }
+    }
+    while pi < pat.len() && pat[pi] == '*' {
+        pi += 1;
+    }
+    pi == pat.len()
+}
+
+/// Recursively list a directory as normalized storage names. Returns
+/// `(name, is_dir, path)` where `name` is relative to `base`, lowercased and
+/// with `/` separators (the reference lowercases every listed name).
+fn disk_entries(base: &Path) -> Vec<(String, bool, PathBuf)> {
+    fn walk(dir: &Path, rel: &str, out: &mut Vec<(String, bool, PathBuf)>) {
+        let Ok(read) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in read.flatten() {
+            let Ok(ft) = entry.file_type() else { continue };
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let rel = if rel.is_empty() {
+                name
+            } else {
+                format!("{rel}/{name}")
+            };
+            if ft.is_dir() {
+                out.push((rel.to_ascii_lowercase(), true, entry.path()));
+                walk(&entry.path(), &rel, out);
+            } else if ft.is_file() {
+                out.push((rel.to_ascii_lowercase(), false, entry.path()));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(base, "", &mut out);
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Core storage queries
+// ---------------------------------------------------------------------------
+
+/// `TVPIsExistentStorageNoSearch`: does `name` resolve inside the mounted
+/// storage (disk or archives), without consulting the auto paths?
+fn exists_in_storage(name: &str) -> bool {
+    let Some(storage) = storage_arc() else {
+        return false;
+    };
+    if storage.lock().unwrap().exists(name) {
+        return true;
+    }
+    // Fallback: `engine::Storage::find` is case-sensitive on disk, but
+    // storage names are normalized to lowercase; scan for mixed-case files
+    // (the reference lowercases listed names too).
+    let game_dir = storage.lock().unwrap().game_dir().to_path_buf();
+    let normalized = normalize_storage_name(name);
+    disk_entries(&game_dir)
+        .iter()
+        .any(|(n, is_dir, _)| !is_dir && n == &normalized)
+}
+
+/// `TVPIsExistentStorage`: the mounted storage first, then the auto search
+/// paths.
+fn is_existent_storage(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let normalized = normalize_storage_name(name);
+    if exists_in_storage(&normalized) {
+        return true;
+    }
+    auto_paths_snapshot()
+        .iter()
+        .any(|dir| dir.join(&normalized).is_file())
+}
+
+/// `TVPGetPlacedPath`: the normalized storage name when found (mounted
+/// storage or auto paths), `""` when not found.
+fn placed_path(name: &str) -> String {
+    if name.is_empty() {
+        return String::new();
+    }
+    let normalized = normalize_storage_name(name);
+    if exists_in_storage(&normalized) {
+        return normalized;
+    }
+    // Auto paths: like the reference's auto-path table, the base storage
+    // name is looked up inside each auto path dir; when several paths
+    // contain the same name the last one wins (the reference's hash-table
+    // `Add` overwrites earlier entries).
+    let base = extract_storage_name(&normalized);
+    let mut found: Option<String> = None;
+    for dir in auto_paths_snapshot() {
+        if dir.join(&base).is_file() {
+            found = Some(format!("{}/{}", dir.display(), base));
+        }
+    }
+    found.unwrap_or_default()
+}
+
+/// `Storages.getLocalName`: the absolute local disk path for a disk file, or
+/// the name unchanged when no disk file exists.
+fn local_name(name: &str) -> Result<String, String> {
+    if name.contains('>') {
+        return Err(format!(
+            "Storages.getLocalName: \"{name}\" is inside an archive and has no local name (the reference throws TVPCannotGetLocalName)"
+        ));
+    }
+    let Some(storage) = storage_arc() else {
+        return Ok(name.to_string());
+    };
+    let game_dir = storage.lock().unwrap().game_dir().to_path_buf();
+    let normalized = normalize_storage_name(name);
+    let disk = disk_entries(&game_dir);
+    if let Some((_, _, path)) = disk
+        .into_iter()
+        .find(|(n, is_dir, _)| !is_dir && n == &normalized)
+    {
+        return Ok(path.to_string_lossy().into_owned());
+    }
+    // Not a disk file: return the name unchanged. (The reference walks the
+    // path components against the real filesystem and would produce a
+    // meaningless "/name" here, so we keep the input.)
+    Ok(name.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// getFileList
+// ---------------------------------------------------------------------------
+
+/// Windows `FILE_ATTRIBUTE_DIRECTORY` (0x10).
+pub const ATTR_DIRECTORY: i64 = 0x10;
+/// Windows `FILE_ATTRIBUTE_ARCHIVE` (0x20) — the "normal file" bit.
+pub const ATTR_NORMAL: i64 = 0x20;
+
+/// `Storages.getFileList(mask, attr)`: storage names matching a wildcard
+/// mask.
+///
+/// Semantics implemented (documented; the reference in this repo has no
+/// `getFileList`, so this follows the migration spec):
+///
+/// - The mask is normalized (lowercased, `\` → `/`).
+/// - If it contains `>` it addresses archives: `arcmask>inarcmask`, where
+///   `arcmask` wildcard-matches the archive file name (e.g. `*.xp3>data/*.ks`).
+/// - The part before the **last** `/` is a required *literal* directory
+///   prefix of the relative storage path (it may be empty — then files at
+///   any depth are candidates). The part after it is a `*`/`?` wildcard
+///   matched case-insensitively against the **base name** (an empty pattern
+///   matches everything, so a mask ending in `/` lists the whole subtree).
+/// - Disk files are walked recursively under the game dir and emitted as
+///   normalized relative storage names; archive entries are emitted as
+///   `arc.xp3>path`.
+/// - `attr` filters the results: `0` (omitted) or `0x20` → regular files;
+///   `0x10` → directories (emitted with a trailing `/`); bits OR together.
+/// - The result is sorted and deduped.
+///
+/// The FFI cannot return TJS arrays yet, so the native wrapper joins these
+/// names with `\n` into one string (see the crate docs).
+fn get_file_list(mask: &str, attr: i64) -> Vec<String> {
+    let mask = normalize_storage_name(mask);
+    let (arc_pat, in_arc_mask) = match mask.split_once('>') {
+        Some((arc, rest)) => (Some(arc.to_string()), rest.to_string()),
+        None => (None, mask),
+    };
+    let (dir_prefix, base_pat) = match in_arc_mask.rsplit_once('/') {
+        Some((dir, base)) => (
+            format!("{dir}/"),
+            if base.is_empty() {
+                "*".to_string()
+            } else {
+                base.to_string()
+            },
+        ),
+        None => (String::new(), in_arc_mask.clone()),
+    };
+    let include_files = attr == 0 || attr & ATTR_NORMAL != 0;
+    let include_dirs = attr & ATTR_DIRECTORY != 0;
+
+    let mut found = BTreeSet::new();
+
+    let Some(storage) = storage_arc() else {
+        return Vec::new();
+    };
+
+    // Disk files under the game dir, recursively.
+    {
+        let game_dir = storage.lock().unwrap().game_dir().to_path_buf();
+        for (name, is_dir, _) in disk_entries(&game_dir) {
+            let base = name.rsplit('/').next().unwrap_or(&name);
+            let prefix_ok = dir_prefix.is_empty() || name.starts_with(&dir_prefix);
+            let attr_ok = (is_dir && include_dirs) || (!is_dir && include_files);
+            if prefix_ok && attr_ok && wildcard_match(&base_pat, base) {
+                found.insert(if is_dir { format!("{name}/") } else { name });
+            }
+        }
+    }
+
+    // Archive entries, addressed as "arc.xp3>path".
+    {
+        let storage = storage.lock().unwrap();
+        for (arc_path, arc) in storage.archives() {
+            let Some(arc_file) = arc_path.file_name() else {
+                continue;
+            };
+            let arc_file = arc_file.to_string_lossy();
+            if let Some(pat) = &arc_pat
+                && !wildcard_match(pat, &arc_file)
+            {
+                continue;
+            }
+            for entry in arc.entries() {
+                let base = entry.name.rsplit('/').next().unwrap_or(&entry.name);
+                let prefix_ok = dir_prefix.is_empty() || entry.name.starts_with(&dir_prefix);
+                if prefix_ok && wildcard_match(&base_pat, base) {
+                    found.insert(format!("{arc_file}>{}", entry.name));
+                }
+            }
+        }
+    }
+
+    found.into_iter().collect()
+}
+
+// ---------------------------------------------------------------------------
+// addAutoPath / removeAutoPath
+// ---------------------------------------------------------------------------
+
+fn add_auto_path(path: &str) -> Result<(), String> {
+    if !path.ends_with(['/', '\\', '>']) {
+        return Err(format!(
+            "Storages.addAutoPath: path must end with '/', '\\\\' or '>' (the reference throws TVPMissingPathDelimiterAtLast); got \"{path}\""
+        ));
+    }
+    if path.contains('>') {
+        return Err(format!(
+            "Storages.addAutoPath: in-archive auto paths (\"arc.xp3>\") are not supported yet; got \"{path}\""
+        ));
+    }
+    let dir = PathBuf::from(normalize_storage_name(path).trim_end_matches('/'));
+    if dir.as_os_str().is_empty() {
+        return Err("Storages.addAutoPath: empty path".into());
+    }
+    let mut list = AUTO_PATHS.lock().unwrap();
+    if !list.contains(&dir) {
+        list.push(dir);
+        log::debug!("tvp-storages: added auto path \"{path}\"");
+    }
+    Ok(())
+}
+
+fn remove_auto_path(path: &str) -> Result<(), String> {
+    if !path.ends_with(['/', '\\', '>']) {
+        return Err(format!(
+            "Storages.removeAutoPath: path must end with '/', '\\\\' or '>' (the reference throws TVPMissingPathDelimiterAtLast); got \"{path}\""
+        ));
+    }
+    let dir = PathBuf::from(normalize_storage_name(path).trim_end_matches('/'));
+    let mut list = AUTO_PATHS.lock().unwrap();
+    if let Some(pos) = list.iter().position(|d| d == &dir) {
+        list.remove(pos);
+        log::debug!("tvp-storages: removed auto path \"{path}\"");
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Pure string helpers (ported verbatim from the reference)
+// ---------------------------------------------------------------------------
+
+/// `TVPExtractStorageExt`: the extension of the final component **including
+/// the dot**, or `""` when there is none before a `/`, `\` or `>` delimiter.
+fn extract_storage_ext(name: &str) -> String {
+    for (i, c) in name.char_indices().rev() {
+        match c {
+            '\\' | '/' | '>' => return String::new(),
+            '.' => return name[i..].to_string(),
+            _ => {}
+        }
+    }
+    String::new()
+}
+
+/// `TVPExtractStorageName`: the final path component after the last `/`,
+/// `\` or `>` delimiter.
+fn extract_storage_name(name: &str) -> String {
+    match name.rfind(['\\', '/', '>']) {
+        Some(i) => name[i + 1..].to_string(),
+        None => name.to_string(),
+    }
+}
+
+/// `TVPExtractStoragePath`: the path part of `name`, including the last
+/// `/`, `\` or `>` delimiter.
+fn extract_storage_path(name: &str) -> String {
+    match name.rfind(['\\', '/', '>']) {
+        Some(i) => name[..=i].to_string(),
+        None => String::new(),
+    }
+}
+
+/// `TVPChopStorageExt`: `name` without its extension (the dot is removed),
+/// or the whole name when there is no extension before a delimiter.
+fn chop_storage_ext(name: &str) -> String {
+    for (i, c) in name.char_indices().rev() {
+        match c {
+            '\\' | '/' | '>' => return name.to_string(),
+            '.' => return name[..i].to_string(),
+            _ => {}
+        }
+    }
+    name.to_string()
+}
+
+/// `TVPNormalizeStorageName` for the common case — `Storages.getFullPath`.
+fn get_full_path(name: &str) -> String {
+    normalize_storage_name(name)
+}
+
+// ---------------------------------------------------------------------------
+// FFI glue
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    /// Scratch buffer for `out.string`: stays valid until the next callback
+    /// on this thread — long enough, since the C++ side copies the string
+    /// immediately after the callback returns.
+    static STRING_OUT: std::cell::RefCell<Vec<u8>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn set_string_out(out: *mut Value, s: &str) {
+    STRING_OUT.with(|buf| {
+        let mut buf = buf.borrow_mut();
+        buf.clear();
+        buf.extend_from_slice(s.as_bytes());
+        buf.push(0);
+        // SAFETY: `out` is a valid return slot provided by the C++ trampoline.
+        unsafe {
+            (*out).ty = VAL_STRING;
+            (*out).integer = 0;
+            (*out).real = 0.0;
+            (*out).string = buf.as_ptr() as *const c_char;
+        }
+    });
+}
+
+fn set_int_out(out: *mut Value, v: i64) {
+    // SAFETY: `out` is a valid return slot provided by the C++ trampoline.
+    unsafe {
+        (*out).ty = VAL_INTEGER;
+        (*out).integer = v;
+        (*out).real = 0.0;
+        (*out).string = ptr::null();
+    }
+}
+
+fn set_void_out(out: *mut Value) {
+    // SAFETY: `out` is a valid return slot provided by the C++ trampoline.
+    unsafe {
+        (*out).ty = VAL_VOID;
+        (*out).integer = 0;
+        (*out).real = 0.0;
+        (*out).string = ptr::null();
+    }
+}
+
+/// Build a malloc'd NUL-terminated UTF-8 error message for `*out_error`
+/// (the C++ side frees it with `tjs2_free_string`).
+fn alloc_error_string(msg: &str) -> *mut c_char {
+    let bytes = msg.as_bytes();
+    // SAFETY: `tjs2_malloc` is malloc-compatible; we write a NUL-terminated
+    // copy that the C++ trampoline frees after the callback returns.
+    unsafe {
+        let buf = tjs2_malloc(bytes.len() + 1) as *mut u8;
+        if buf.is_null() {
+            return ptr::null_mut();
+        }
+        ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len());
+        *buf.add(bytes.len()) = 0;
+        buf as *mut c_char
+    }
+}
+
+fn set_error(out_error: *mut *mut c_char, msg: &str) {
+    // SAFETY: `out_error` points at a valid `char*` slot for this call.
+    unsafe { *out_error = alloc_error_string(msg) };
+}
+
+/// Read the argument slice. Returns an empty slice when `argc <= 0`.
+///
+/// # Safety
+/// `argv` must be valid for `argc` entries for the duration of the call (the
+/// C++ trampoline guarantees this).
+unsafe fn args<'a>(argc: c_int, argv: *const Value) -> &'a [Value] {
+    if argc <= 0 || argv.is_null() {
+        return &[];
+    }
+    // SAFETY: caller upholds the contract.
+    unsafe { std::slice::from_raw_parts(argv, argc as usize) }
+}
+
+fn arg_str(v: &Value) -> Option<String> {
+    if v.ty == VAL_STRING && !v.string.is_null() {
+        // SAFETY: the C++ side marshals strings as NUL-terminated UTF-8,
+        // valid for the duration of the call.
+        Some(
+            unsafe { CStr::from_ptr(v.string) }
+                .to_string_lossy()
+                .into_owned(),
+        )
+    } else {
+        None
+    }
+}
+
+fn arg_i64(v: &Value) -> Option<i64> {
+    match v.ty {
+        VAL_INTEGER => Some(v.integer),
+        VAL_REAL => Some(v.real as i64),
+        _ => None,
+    }
+}
+
+fn expect_string_arg(args: &[Value], method: &str) -> Result<String, String> {
+    args.first()
+        .and_then(arg_str)
+        .ok_or_else(|| format!("Storages.{method}: expected a string argument"))
+}
+
+// ---------------------------------------------------------------------------
+// Native methods
+// ---------------------------------------------------------------------------
+
+extern "C" fn native_is_existent_storage(
+    _engine: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    // SAFETY: the trampoline guarantees argv/out/out_error validity.
+    let args = unsafe { args(argc, argv) };
+    match expect_string_arg(args, "isExistentStorage") {
+        Ok(name) => {
+            set_int_out(out, i64::from(is_existent_storage(&name)));
+            0
+        }
+        Err(msg) => {
+            set_error(out_error, &msg);
+            1
+        }
+    }
+}
+
+extern "C" fn native_get_file_list(
+    _engine: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    // SAFETY: the trampoline guarantees argv/out/out_error validity.
+    let args = unsafe { args(argc, argv) };
+    let mask = match expect_string_arg(args, "getFileList") {
+        Ok(m) => m,
+        Err(msg) => {
+            set_error(out_error, &msg);
+            return 1;
+        }
+    };
+    let attr = args.get(1).and_then(arg_i64).unwrap_or(0);
+    let names = get_file_list(&mask, attr);
+    set_string_out(out, &names.join("\n"));
+    0
+}
+
+extern "C" fn native_add_auto_path(
+    _engine: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    // SAFETY: the trampoline guarantees argv/out/out_error validity.
+    let args = unsafe { args(argc, argv) };
+    match expect_string_arg(args, "addAutoPath").and_then(|p| add_auto_path(&p)) {
+        Ok(()) => {
+            set_void_out(out);
+            0
+        }
+        Err(msg) => {
+            set_error(out_error, &msg);
+            1
+        }
+    }
+}
+
+extern "C" fn native_remove_auto_path(
+    _engine: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    // SAFETY: the trampoline guarantees argv/out/out_error validity.
+    let args = unsafe { args(argc, argv) };
+    match expect_string_arg(args, "removeAutoPath").and_then(|p| remove_auto_path(&p)) {
+        Ok(()) => {
+            set_void_out(out);
+            0
+        }
+        Err(msg) => {
+            set_error(out_error, &msg);
+            1
+        }
+    }
+}
+
+extern "C" fn native_get_local_name(
+    _engine: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    // SAFETY: the trampoline guarantees argv/out/out_error validity.
+    let args = unsafe { args(argc, argv) };
+    match expect_string_arg(args, "getLocalName").and_then(|n| local_name(&n)) {
+        Ok(name) => {
+            set_string_out(out, &name);
+            0
+        }
+        Err(msg) => {
+            set_error(out_error, &msg);
+            1
+        }
+    }
+}
+
+/// Unary string-in/string-out natives (getFullPath, getPlacedPath, the
+/// extract/chop helpers).
+macro_rules! native_string_unary {
+    ($name:ident, $tjs_name:literal, $f:expr) => {
+        extern "C" fn $name(
+            _engine: *mut c_void,
+            argc: c_int,
+            argv: *const Value,
+            out: *mut Value,
+            out_error: *mut *mut c_char,
+        ) -> c_int {
+            // SAFETY: the trampoline guarantees argv/out/out_error validity.
+            let args = unsafe { args(argc, argv) };
+            match expect_string_arg(args, $tjs_name) {
+                Ok(s) => {
+                    set_string_out(out, &$f(&s));
+                    0
+                }
+                Err(msg) => {
+                    set_error(out_error, &msg);
+                    1
+                }
+            }
+        }
+    };
+}
+
+native_string_unary!(native_get_full_path, "getFullPath", get_full_path);
+native_string_unary!(native_get_placed_path, "getPlacedPath", placed_path);
+native_string_unary!(
+    native_extract_storage_ext,
+    "extractStorageExt",
+    extract_storage_ext
+);
+native_string_unary!(
+    native_extract_storage_name,
+    "extractStorageName",
+    extract_storage_name
+);
+native_string_unary!(
+    native_extract_storage_path,
+    "extractStoragePath",
+    extract_storage_path
+);
+native_string_unary!(native_chop_storage_ext, "chopStorageExt", chop_storage_ext);
+
+extern "C" fn native_clear_archive_cache(
+    _engine: *mut c_void,
+    _argc: c_int,
+    _argv: *const Value,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+) -> c_int {
+    // Nothing is cached yet; keep the no-op (the reference clears its
+    // archive/auto-path caches here).
+    set_void_out(out);
+    0
+}
+
+/// Placeholder native for a pending method: raises a clear TJS error.
+macro_rules! native_pending {
+    ($name:ident, $tjs_name:literal, $why:literal) => {
+        extern "C" fn $name(
+            _engine: *mut c_void,
+            _argc: c_int,
+            _argv: *const Value,
+            _out: *mut Value,
+            out_error: *mut *mut c_char,
+        ) -> c_int {
+            set_error(
+                out_error,
+                concat!("Storages.", $tjs_name, " is not implemented yet: ", $why),
+            );
+            1
+        }
+    };
+}
+
+native_pending!(
+    native_stat,
+    "stat",
+    "needs an object return value from the FFI (pending in tjs2-sys)"
+);
+native_pending!(
+    native_open,
+    "open",
+    "needs a stream object return value from the FFI (pending in tjs2-sys)"
+);
+native_pending!(
+    native_search_cd,
+    "searchCD",
+    "CD volume search is platform-specific and disabled in the reference"
+);
+native_pending!(
+    native_select_file,
+    "selectFile",
+    "GUI file selection is platform-specific"
+);
+
+// ---------------------------------------------------------------------------
+// Registration
+// ---------------------------------------------------------------------------
+
+/// Register the `Storages` native class on `engine` (static methods only,
+/// matching the current tjs2-sys milestone).
+pub fn register_storages(engine: &Tjs2Engine) -> Result<(), String> {
+    let builder = NativeClassBuilder {
+        name: "Storages",
+        properties: Vec::new(),
+        methods: vec![
+            NativeMethodDef {
+                name: "isExistentStorage",
+                f: native_is_existent_storage,
+            },
+            NativeMethodDef {
+                name: "getFileList",
+                f: native_get_file_list,
+            },
+            NativeMethodDef {
+                name: "addAutoPath",
+                f: native_add_auto_path,
+            },
+            NativeMethodDef {
+                name: "removeAutoPath",
+                f: native_remove_auto_path,
+            },
+            NativeMethodDef {
+                name: "getLocalName",
+                f: native_get_local_name,
+            },
+            NativeMethodDef {
+                name: "getFullPath",
+                f: native_get_full_path,
+            },
+            NativeMethodDef {
+                name: "getPlacedPath",
+                f: native_get_placed_path,
+            },
+            NativeMethodDef {
+                name: "extractStorageExt",
+                f: native_extract_storage_ext,
+            },
+            NativeMethodDef {
+                name: "extractStorageName",
+                f: native_extract_storage_name,
+            },
+            NativeMethodDef {
+                name: "extractStoragePath",
+                f: native_extract_storage_path,
+            },
+            NativeMethodDef {
+                name: "chopStorageExt",
+                f: native_chop_storage_ext,
+            },
+            NativeMethodDef {
+                name: "clearArchiveCache",
+                f: native_clear_archive_cache,
+            },
+            NativeMethodDef {
+                name: "stat",
+                f: native_stat,
+            },
+            NativeMethodDef {
+                name: "open",
+                f: native_open,
+            },
+            NativeMethodDef {
+                name: "searchCD",
+                f: native_search_cd,
+            },
+            NativeMethodDef {
+                name: "selectFile",
+                f: native_select_file,
+            },
+        ],
+    };
+    engine.register_native_class(&builder)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tjs2_sys::{Tjs2Engine, TjsValue};
+
+    /// Unique temp dir, removed on drop (no external test deps).
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> TempDir {
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "tvp-storages-test-{tag}-{}-{n}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir_all(&path).unwrap();
+            TempDir(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Clear the process-global state between tests.
+    fn reset_globals() {
+        *STORAGE.lock().unwrap() = None;
+        AUTO_PATHS.lock().unwrap().clear();
+    }
+
+    /// Create a game dir with the given files (`rel` → contents; a trailing
+    /// `/` creates a directory) and mount it via [`set_storage`].
+    fn mount_game(files: &[(&str, &str)]) -> (TempDir, PathBuf) {
+        let dir = TempDir::new("game");
+        for (rel, contents) in files {
+            let p = dir.path().join(rel);
+            if rel.ends_with('/') {
+                fs::create_dir_all(p).unwrap();
+            } else {
+                fs::create_dir_all(p.parent().unwrap()).unwrap();
+                fs::write(p, contents).unwrap();
+            }
+        }
+        let storage = Storage::mount(dir.path()).unwrap();
+        set_storage(Some(Arc::new(Mutex::new(storage))));
+        let path = dir.path().to_path_buf();
+        (dir, path)
+    }
+
+    fn engine_with_storages() -> Tjs2Engine {
+        let engine = Tjs2Engine::new().unwrap();
+        register_storages(&engine).unwrap();
+        engine
+    }
+
+    fn js_str(s: &str) -> String {
+        format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
+    }
+
+    #[test]
+    fn normalize_storage_name_lowercases_and_replaces_backslashes() {
+        assert_eq!(
+            normalize_storage_name(r"Data\BG\Title.jpg"),
+            "data/bg/title.jpg"
+        );
+        assert_eq!(normalize_storage_name("Startup.tjs"), "startup.tjs");
+        assert_eq!(
+            normalize_storage_name("arc.xp3>Data/X.TJS"),
+            "arc.xp3>data/x.tjs"
+        );
+    }
+
+    #[test]
+    fn wildcard_match_semantics() {
+        assert!(wildcard_match("*", "anything"));
+        assert!(wildcard_match("*", ""));
+        assert!(wildcard_match("", ""));
+        assert!(!wildcard_match("", "x"));
+        assert!(wildcard_match("*.tjs", "a.tjs"));
+        assert!(!wildcard_match("*.tjs", "a.txt"));
+        assert!(wildcard_match("?x", "ax"));
+        assert!(!wildcard_match("?x", "abc"));
+        assert!(wildcard_match("a*e", "apple"));
+        assert!(wildcard_match("A*", "apple"), "case-insensitive");
+        assert!(wildcard_match("a*c*d", "abcd"));
+        assert!(wildcard_match("a*b*c", "aXbYc"));
+        assert!(!wildcard_match("a*b", "ac"));
+        assert!(wildcard_match("*tjs", "a.tjs"));
+    }
+
+    #[test]
+    fn is_existent_storage_disk_and_mixed_case() {
+        reset_globals();
+        let (_dir, _) = mount_game(&[
+            ("startup.tjs", "System.init"),
+            ("data/a.tjs", "x"),
+            ("Data/BG.png", "img"),
+        ]);
+        let engine = engine_with_storages();
+
+        let exists = |name: &str| {
+            engine
+                .eval(
+                    &format!("Storages.isExistentStorage({})", js_str(name)),
+                    "t",
+                )
+                .unwrap()
+        };
+        assert_eq!(exists("startup.tjs"), TjsValue::Integer(1));
+        assert_eq!(exists("data/a.tjs"), TjsValue::Integer(1));
+        // mixed-case disk file: exact case resolves directly, and the
+        // normalized name resolves via the case-insensitive fallback
+        assert_eq!(exists("Data/BG.png"), TjsValue::Integer(1));
+        assert_eq!(exists("data/bg.png"), TjsValue::Integer(1));
+        assert_eq!(exists("missing.tjs"), TjsValue::Integer(0));
+        assert_eq!(exists(""), TjsValue::Integer(0));
+    }
+
+    #[test]
+    fn get_file_list_wildcards_and_attrs() {
+        reset_globals();
+        let (_dir, _) = mount_game(&[
+            ("a.tjs", "1"),
+            ("data/b.tjs", "2"),
+            ("data/sub/c.tjs", "3"),
+            ("pic.png", "4"),
+        ]);
+        let engine = engine_with_storages();
+
+        let list = |mask: &str, attr: Option<i64>| {
+            let expr = match attr {
+                Some(a) => format!("Storages.getFileList({}, {a})", js_str(mask)),
+                None => format!("Storages.getFileList({})", js_str(mask)),
+            };
+            match engine.eval(&expr, "t").unwrap() {
+                TjsValue::String(s) => s.split('\n').map(str::to_string).collect::<Vec<_>>(),
+                other => panic!("expected a string, got {other:?}"),
+            }
+        };
+
+        // base-name matching, recursive across the whole game dir
+        let names = list("*.tjs", None);
+        assert!(names.contains(&"a.tjs".to_string()));
+        assert!(names.contains(&"data/b.tjs".to_string()));
+        assert!(names.contains(&"data/sub/c.tjs".to_string()));
+        assert!(!names.contains(&"pic.png".to_string()));
+
+        // a directory prefix restricts the subtree
+        let names = list("data/*.tjs", None);
+        assert!(!names.contains(&"a.tjs".to_string()));
+        assert!(names.contains(&"data/b.tjs".to_string()));
+        assert!(names.contains(&"data/sub/c.tjs".to_string()));
+
+        // an exact-name mask still matches at any depth
+        let names = list("c.tjs", None);
+        assert_eq!(names, vec!["data/sub/c.tjs".to_string()]);
+
+        // attr 0x10 lists directories with a trailing '/'
+        let names = list("*", Some(0x10));
+        assert!(names.contains(&"data/".to_string()));
+        assert!(!names.contains(&"a.tjs".to_string()));
+
+        // attr 0x20 lists normal files (the default behavior)
+        let names = list("*.tjs", Some(0x20));
+        assert!(names.contains(&"a.tjs".to_string()));
+    }
+
+    #[test]
+    fn auto_path_add_remove_and_lookup() {
+        reset_globals();
+        let (_game, _) = mount_game(&[("startup.tjs", "s")]);
+        let auto = TempDir::new("auto");
+        fs::write(auto.path().join("patch.tjs"), "p").unwrap();
+        let engine = engine_with_storages();
+
+        let exists = |name: &str| {
+            engine
+                .eval(
+                    &format!("Storages.isExistentStorage({})", js_str(name)),
+                    "t",
+                )
+                .unwrap()
+        };
+        assert_eq!(exists("patch.tjs"), TjsValue::Integer(0));
+
+        // the reference requires a trailing delimiter
+        let err = engine
+            .eval("Storages.addAutoPath('no/trailing/slash')", "t")
+            .unwrap_err();
+        assert!(err.to_string().contains("trailing"), "unexpected: {err}");
+
+        let add = format!(
+            "Storages.addAutoPath({})",
+            js_str(&format!("{}/", auto.path().display()))
+        );
+        engine.eval(&add, "t").unwrap();
+        assert_eq!(exists("patch.tjs"), TjsValue::Integer(1));
+
+        // duplicate adds are harmless (deduped)
+        engine.eval(&add, "t").unwrap();
+        assert_eq!(exists("patch.tjs"), TjsValue::Integer(1));
+
+        let remove = format!(
+            "Storages.removeAutoPath({})",
+            js_str(&format!("{}/", auto.path().display()))
+        );
+        engine.eval(&remove, "t").unwrap();
+        assert_eq!(exists("patch.tjs"), TjsValue::Integer(0));
+    }
+
+    #[test]
+    fn get_local_name_disk_and_not_found() {
+        reset_globals();
+        let (_dir, _) = mount_game(&[("startup.tjs", "s"), ("Data/BG.png", "img")]);
+        let engine = engine_with_storages();
+
+        let TjsValue::String(s) = engine
+            .eval("Storages.getLocalName('startup.tjs')", "t")
+            .unwrap()
+        else {
+            panic!("expected a string");
+        };
+        assert!(s.ends_with("startup.tjs"), "unexpected: {s}");
+
+        // a mixed-case disk file resolves to the actual on-disk path
+        let TjsValue::String(s) = engine
+            .eval("Storages.getLocalName('data/bg.png')", "t")
+            .unwrap()
+        else {
+            panic!("expected a string");
+        };
+        assert!(s.ends_with("BG.png"), "unexpected: {s}");
+
+        // not on disk → the name is returned unchanged
+        assert_eq!(
+            engine
+                .eval("Storages.getLocalName('missing.tjs')", "t")
+                .unwrap(),
+            TjsValue::String("missing.tjs".into())
+        );
+    }
+
+    #[test]
+    fn string_helpers_match_reference() {
+        reset_globals();
+        let engine = engine_with_storages();
+        let eval = |expr: &str| engine.eval(expr, "t").unwrap();
+
+        assert_eq!(
+            eval("Storages.extractStorageName('data/x.tjs')"),
+            TjsValue::String("x.tjs".into())
+        );
+        // the `>` archive delimiter splits like '/' and '\'
+        assert_eq!(
+            eval("Storages.extractStorageName('arc.xp3>data/x.tjs')"),
+            TjsValue::String("x.tjs".into())
+        );
+        assert_eq!(
+            eval("Storages.extractStorageExt('a/b.ks')"),
+            TjsValue::String(".ks".into())
+        );
+        assert_eq!(
+            eval("Storages.extractStoragePath('data/x.tjs')"),
+            TjsValue::String("data/".into())
+        );
+        assert_eq!(
+            eval("Storages.chopStorageExt('data/x.tjs')"),
+            TjsValue::String("data/x".into())
+        );
+        assert_eq!(
+            eval("Storages.getFullPath('Data\\\\X.TJS')"),
+            TjsValue::String("data/x.tjs".into())
+        );
+        assert_eq!(
+            eval("Storages.getPlacedPath('missing.tjs')"),
+            TjsValue::String(String::new())
+        );
+        assert_eq!(eval("Storages.clearArchiveCache()"), TjsValue::Void);
+    }
+
+    #[test]
+    fn pending_methods_raise_clear_errors() {
+        reset_globals();
+        let engine = engine_with_storages();
+        for expr in [
+            "Storages.stat('a.tjs')",
+            "Storages.open('a.tjs')",
+            "Storages.searchCD('LABEL')",
+            "Storages.selectFile('dialog')",
+        ] {
+            let err = engine.eval(expr, "t").unwrap_err();
+            assert!(
+                err.to_string().contains("not implemented"),
+                "expected a 'not implemented' error for {expr}, got: {err}"
+            );
+        }
+    }
+}

@@ -1,0 +1,439 @@
+//! tvp-natives — TVP native classes implemented in Rust.
+//!
+//! This crate ports the KiriKiri TVP native classes to Rust and registers
+//! them on the TJS2 VM global object, so scripts can call
+//! `System.method(...)` / `Debug.method(...)`. This wave implements the
+//! **methods**; the property getters/setters need an FFI extension landing
+//! in parallel and are documented as pending in the module docs.
+//!
+//! Call [`register_all`] (or [`register_system`] / [`register_debug`]) once
+//! per engine, from the thread that owns the engine.
+//!
+//! # Global state
+//!
+//! The reference keeps process-wide state (command-line arguments, the log
+//! ring buffer, the log file handle). This port mirrors that: the state
+//! behind the natives is process-global (`static`), not per-engine, and
+//! protected by mutexes so the natives also work when called directly from
+//! Rust tests. The VM itself remains single-threaded.
+//!
+//! # Logging
+//!
+//! Natives emit through the `log` crate (`info!` / `debug!` / `warn!` /
+//! `error!`). This crate does not install a logger; the host application is
+//! expected to do so (without one the calls are no-ops).
+//!
+//! # Testing
+//!
+//! `cargo test -p tvp-natives -- --test-threads=1` (the process-global
+//! state makes parallel tests racy).
+
+mod debug;
+mod system;
+mod window;
+
+pub use debug::register_debug;
+pub use system::{SystemContext, register_system, set_system_context};
+pub use window::register_window;
+
+use std::cell::RefCell;
+use std::ffi::{CStr, c_char, c_int};
+use std::ptr;
+use std::slice;
+use std::sync::{Mutex, MutexGuard};
+
+use tjs2_sys::{Tjs2Engine, VAL_INTEGER, VAL_REAL, VAL_STRING, VAL_VOID, Value, tjs2_malloc};
+
+/// Register all native classes in this crate on `engine` (`System`, `Debug`
+/// and the stub `Window`).
+pub fn register_all(engine: &Tjs2Engine) -> Result<(), String> {
+    register_system(engine)?;
+    register_debug(engine)?;
+    register_window(engine)
+}
+
+// ---------------------------------------------------------------------------
+// Shared callback helpers
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    /// Scratch buffer for string return values (`out.string`). Stays valid
+    /// until the next native call on this thread, which is long enough: the
+    /// C++ trampoline copies the string immediately after the callback
+    /// returns.
+    static STRING_OUT: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+/// View the `argc` callback arguments as a slice. Returns an empty slice for
+/// a null pointer / zero count (the C++ side passes a null `argv` when a
+/// method is called without arguments).
+pub(crate) fn args<'a>(argv: *const Value, argc: c_int) -> &'a [Value] {
+    if argc <= 0 || argv.is_null() {
+        return &[];
+    }
+    // SAFETY: the C++ trampoline guarantees `argc` valid Value entries at
+    // `argv` for the duration of the call.
+    unsafe { slice::from_raw_parts(argv, argc as usize) }
+}
+
+/// Convert a callback argument to its string form, mirroring the reference's
+/// `ttstr(variant)` coercion: strings pass through, integers/reals use their
+/// decimal representation, void and objects become `""`.
+pub(crate) fn value_as_string(v: &Value) -> String {
+    match v.ty {
+        VAL_STRING if v.string.is_null() => String::new(),
+        VAL_STRING => {
+            // SAFETY: the C++ side guarantees a NUL-terminated UTF-8 string
+            // valid for the duration of the call.
+            let s = unsafe { CStr::from_ptr(v.string) };
+            s.to_string_lossy().into_owned()
+        }
+        VAL_INTEGER => v.integer.to_string(),
+        VAL_REAL => v.real.to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Convert a callback argument to a boolean (TJS `operator bool` semantics):
+/// integers/reals are non-zero, strings are non-empty, void is false,
+/// objects are true.
+pub(crate) fn value_as_bool(v: &Value) -> bool {
+    match v.ty {
+        VAL_INTEGER => v.integer != 0,
+        VAL_REAL => v.real != 0.0,
+        VAL_STRING => !value_as_string(v).is_empty(),
+        VAL_VOID => false,
+        _ => true,
+    }
+}
+
+/// Convert a callback argument to an integer (TJS `AsInteger` semantics).
+pub(crate) fn value_as_i64(v: &Value) -> i64 {
+    match v.ty {
+        VAL_INTEGER => v.integer,
+        VAL_REAL => v.real as i64,
+        VAL_STRING => value_as_string(v).parse().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// Report a native error: point `*out_error` at a malloc'd NUL-terminated
+/// message (the C++ side frees it with `tjs2_free_string`) and return the
+/// non-zero status code.
+pub(crate) fn report_error(out_error: *mut *mut c_char, msg: &str) -> c_int {
+    // SAFETY: out_error points at a valid char* slot for the duration of the
+    // call.
+    unsafe { *out_error = alloc_error_string(msg) };
+    1
+}
+
+/// Build a malloc'd NUL-terminated UTF-8 error message (freed on the C++
+/// side with `tjs2_free_string`).
+pub(crate) fn alloc_error_string(msg: &str) -> *mut c_char {
+    let bytes = msg.as_bytes();
+    // SAFETY: tjs2_malloc is malloc-compatible; we write a NUL-terminated
+    // copy and the C++ trampoline frees it with tjs2_free_string.
+    unsafe {
+        let buf = tjs2_malloc(bytes.len() + 1) as *mut u8;
+        if buf.is_null() {
+            return ptr::null_mut();
+        }
+        ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len());
+        *buf.add(bytes.len()) = 0;
+        buf as *mut c_char
+    }
+}
+
+/// Lock a global mutex, recovering from poisoning (a previous panic while
+/// holding it) instead of propagating the poison error across the FFI
+/// boundary (a panic on the VM thread aborts the process).
+pub(crate) fn lock_ok<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Write `s` into `*out` as a string return value.
+pub(crate) fn set_string_out(out: *mut Value, s: &str) {
+    STRING_OUT.with(|buf| {
+        let mut buf = buf.borrow_mut();
+        buf.clear();
+        buf.extend_from_slice(s.as_bytes());
+        buf.push(0);
+        // SAFETY: out is a valid return slot for the duration of the call.
+        unsafe {
+            (*out).ty = VAL_STRING;
+            (*out).integer = 0;
+            (*out).real = 0.0;
+            (*out).string = buf.as_ptr() as *const c_char;
+        }
+    });
+}
+
+/// Write an integer return value into `*out`.
+pub(crate) fn set_int_out(out: *mut Value, v: i64) {
+    // SAFETY: out is a valid return slot for the duration of the call.
+    unsafe {
+        (*out).ty = VAL_INTEGER;
+        (*out).integer = v;
+        (*out).real = 0.0;
+        (*out).string = ptr::null();
+    }
+}
+
+/// Write a real return value into `*out`.
+pub(crate) fn set_real_out(out: *mut Value, v: f64) {
+    // SAFETY: out is a valid return slot for the duration of the call.
+    unsafe {
+        (*out).ty = VAL_REAL;
+        (*out).integer = 0;
+        (*out).real = v;
+        (*out).string = ptr::null();
+    }
+}
+
+/// Clear the return slot (void return, matching the reference's
+/// `result->Clear()`).
+pub(crate) fn set_void_out(out: *mut Value) {
+    // SAFETY: out is a valid return slot for the duration of the call.
+    unsafe {
+        (*out).ty = VAL_VOID;
+        (*out).integer = 0;
+        (*out).real = 0.0;
+        (*out).string = ptr::null();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tjs2_sys::TjsValue;
+
+    fn registered_engine() -> Tjs2Engine {
+        let e = Tjs2Engine::new().expect("create engine");
+        register_all(&e).expect("register System + Debug");
+        e
+    }
+
+    // -- System.setArgument / System.getArgument --------------------------
+
+    #[test]
+    fn system_set_and_get_argument_roundtrip() {
+        let e = registered_engine();
+        e.exec_script("System.setArgument('-foo', 'bar');", "test")
+            .unwrap();
+        assert_eq!(
+            e.eval("System.getArgument('-foo')", "test").unwrap(),
+            TjsValue::String("bar".into())
+        );
+        // a repeated set replaces the value
+        e.exec_script("System.setArgument('-foo', 'baz');", "test")
+            .unwrap();
+        assert_eq!(
+            e.eval("System.getArgument('-foo')", "test").unwrap(),
+            TjsValue::String("baz".into())
+        );
+    }
+
+    #[test]
+    fn system_get_argument_returns_default_when_missing() {
+        let e = registered_engine();
+        assert_eq!(
+            e.eval("System.getArgument('-missing', 'dflt')", "test")
+                .unwrap(),
+            TjsValue::String("dflt".into())
+        );
+        // a non-string default keeps its own type
+        assert_eq!(
+            e.eval("System.getArgument('-missing2', 42)", "test")
+                .unwrap(),
+            TjsValue::Integer(42)
+        );
+    }
+
+    #[test]
+    fn system_get_argument_missing_without_default_is_void() {
+        let e = registered_engine();
+        // reference behavior: `result->Clear()` when the argument is absent
+        assert_eq!(
+            e.eval("System.getArgument('-nope')", "test").unwrap(),
+            TjsValue::Void
+        );
+    }
+
+    #[test]
+    fn system_bad_param_count_is_catchable() {
+        let e = registered_engine();
+        e.exec_script(
+            "var r = ''; try { System.getArgument(); } catch(e) { r = 'caught'; }",
+            "test",
+        )
+        .unwrap();
+        assert_eq!(
+            e.eval("r", "test").unwrap(),
+            TjsValue::String("caught".into())
+        );
+    }
+
+    // -- System misc ------------------------------------------------------
+
+    #[test]
+    fn system_inform_does_not_crash() {
+        let e = registered_engine();
+        assert_eq!(
+            e.eval("System.inform('x')", "test").unwrap(),
+            TjsValue::Void
+        );
+        // caption overload accepted
+        assert_eq!(
+            e.eval("System.inform('x', 'Cap')", "test").unwrap(),
+            TjsValue::Void
+        );
+    }
+
+    #[test]
+    fn system_get_tick_count_returns_non_negative_integer() {
+        let e = registered_engine();
+        match e.eval("System.getTickCount()", "test").unwrap() {
+            TjsValue::Integer(v) => assert!(v >= 0, "tick count must be >= 0, got {v}"),
+            other => panic!("expected Integer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn system_stubs_return_their_reference_types() {
+        let e = registered_engine();
+        assert_eq!(
+            e.eval("System.getKeyState(1)", "test").unwrap(),
+            TjsValue::Integer(0)
+        );
+        assert_eq!(
+            e.eval("System.system('cmd')", "test").unwrap(),
+            TjsValue::Integer(0)
+        );
+        assert_eq!(
+            e.eval("System.createAppLock('lock')", "test").unwrap(),
+            TjsValue::Integer(1) // single-process emulator: first instance wins
+        );
+        assert_eq!(e.eval("System.dumpHeap()", "test").unwrap(), TjsValue::Void);
+        // nullpo must NOT crash the process (the reference traps)
+        assert_eq!(e.eval("System.nullpo()", "test").unwrap(), TjsValue::Void);
+        assert_eq!(
+            e.eval("System.showVersion()", "test").unwrap(),
+            TjsValue::Void
+        );
+        assert_eq!(
+            e.eval("System.readRegValue('key')", "test").unwrap(),
+            TjsValue::Void
+        );
+    }
+
+    // -- Debug ------------------------------------------------------------
+
+    #[test]
+    fn debug_message_then_get_last_log() {
+        let e = registered_engine();
+        assert_eq!(
+            e.eval("Debug.message('hi')", "test").unwrap(),
+            TjsValue::Void
+        );
+        assert_eq!(
+            e.eval("Debug.getLastLog()", "test").unwrap(),
+            TjsValue::String("hi".into())
+        );
+    }
+
+    #[test]
+    fn debug_message_joins_multiple_arguments() {
+        let e = registered_engine();
+        e.exec_script("Debug.message('a', 'b', 'c');", "test")
+            .unwrap();
+        assert_eq!(
+            e.eval("Debug.getLastLog()", "test").unwrap(),
+            TjsValue::String("a, b, c".into())
+        );
+    }
+
+    #[test]
+    fn debug_get_last_log_lines_parameter() {
+        let e = registered_engine();
+        e.exec_script("Debug.message('one'); Debug.message('two');", "test")
+            .unwrap();
+        assert_eq!(
+            e.eval("Debug.getLastLog()", "test").unwrap(),
+            TjsValue::String("two".into())
+        );
+        assert_eq!(
+            e.eval("Debug.getLastLog(2)", "test").unwrap(),
+            TjsValue::String("one\ntwo".into())
+        );
+    }
+
+    #[test]
+    fn debug_log_as_error_toggles_message_level() {
+        install_capture_logger();
+        CAPTURED.lock().unwrap().clear();
+        let e = registered_engine();
+        e.exec_script(
+            "Debug.logAsError(false); Debug.message('normal'); \
+             Debug.logAsError(true); Debug.message('errmsg'); \
+             Debug.logAsError(false);",
+            "test",
+        )
+        .unwrap();
+        let captured = CAPTURED.lock().unwrap().clone();
+        assert!(
+            captured.contains(&(log::Level::Info, "normal".to_string())),
+            "expected info 'normal', captured: {captured:?}"
+        );
+        assert!(
+            captured.contains(&(log::Level::Error, "errmsg".to_string())),
+            "expected error 'errmsg', captured: {captured:?}"
+        );
+    }
+
+    #[test]
+    fn debug_start_log_to_file_appends() {
+        let e = registered_engine();
+        let path = "tvp_natives_test_log.txt";
+        let _ = std::fs::remove_file(path);
+        e.exec_script(
+            "Debug.startLogToFile('tvp_natives_test_log.txt'); Debug.message('file-line');",
+            "test",
+        )
+        .unwrap();
+        let content = std::fs::read_to_string(path).expect("log file written");
+        assert!(content.contains("file-line"), "content: {content:?}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    // -- log capture helper ------------------------------------------------
+
+    struct CaptureLogger;
+
+    static CAPTURE_LOGGER: CaptureLogger = CaptureLogger;
+    static CAPTURED: Mutex<Vec<(log::Level, String)>> = Mutex::new(Vec::new());
+    static LOGGER_ONCE: std::sync::Once = std::sync::Once::new();
+
+    impl log::Log for CaptureLogger {
+        fn enabled(&self, _metadata: &log::Metadata) -> bool {
+            true
+        }
+        fn log(&self, record: &log::Record) {
+            CAPTURED
+                .lock()
+                .expect("capture mutex")
+                .push((record.level(), record.args().to_string()));
+        }
+        fn flush(&self) {}
+    }
+
+    fn install_capture_logger() {
+        LOGGER_ONCE.call_once(|| {
+            log::set_logger(&CAPTURE_LOGGER).expect("install capture logger");
+            log::set_max_level(log::LevelFilter::Trace);
+        });
+    }
+}

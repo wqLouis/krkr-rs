@@ -1,0 +1,5 @@
+{
+  "renderer": "opengl",
+  "software_draw_thread": 4,
+  "vcursor_scale": 0.8
+}

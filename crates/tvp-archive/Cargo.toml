@@ -1,0 +1,13 @@
+[package]
+name = "tvp-archive"
+description = "Zip / 7z / tar archive readers with a uniform tTVPArchive-like interface"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+zip = "4"
+sevenz-rust = "0.6"
+tar = "0.4"
+thiserror = "2"
+xp3 = { workspace = true }

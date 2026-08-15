@@ -1,0 +1,8 @@
+{
+  "lang": "zh_cn",
+  "items": [
+    { "id": "preference_title", "text": "全局设置" },
+    { "id": "preference_output_log", "text": "打印日志" },
+    { "id": "notice", "text": "提示" }
+  ]
+}

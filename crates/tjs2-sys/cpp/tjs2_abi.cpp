@@ -172,6 +172,41 @@ public:
     }
 };
 
+// Convert a single tTJSVariant into a tjs2_value; string values are copied
+// into `storage` so the string pointer stays valid after conversion. This is
+// the per-entry logic shared by args_to_values (method arguments) and the
+// property set path (one value).
+void variant_to_value_one(const TJS::tTJSVariant &var, tjs2_value *out,
+                          std::string &storage) {
+    out->integer = 0;
+    out->real = 0.0;
+    out->string = nullptr;
+    switch(var.Type()) {
+        case tvtVoid:
+            out->type = TJS2_VAL_VOID;
+            break;
+        case tvtInteger:
+            out->type = TJS2_VAL_INTEGER;
+            out->integer = (long long)var.AsInteger();
+            break;
+        case tvtReal:
+            out->type = TJS2_VAL_REAL;
+            out->real = var.AsReal();
+            break;
+        case tvtString: {
+            out->type = TJS2_VAL_STRING;
+            ttstr s(var);
+            storage = s.AsStdString();
+            out->string = storage.c_str();
+            break;
+        }
+        default:
+            // objects/octets cross the boundary as opaque handles
+            out->type = TJS2_VAL_OBJECT;
+            break;
+    }
+}
+
 // Marshal the tTJSVariant arguments of a native method call into tjs2_value
 // entries. String values are copied into `storage` (one std::string per
 // argument) so every entry's string pointer stays valid for the duration of
@@ -184,35 +219,7 @@ void args_to_values(tjs_int numparams, tTJSVariant **param,
     out.resize(numparams);
     storage.resize(numparams);
     for(tjs_int i = 0; i < numparams; i++) {
-        tjs2_value &v = out[i];
-        v.integer = 0;
-        v.real = 0.0;
-        v.string = nullptr;
-        const TJS::tTJSVariant &var = *param[i];
-        switch(var.Type()) {
-            case tvtVoid:
-                v.type = TJS2_VAL_VOID;
-                break;
-            case tvtInteger:
-                v.type = TJS2_VAL_INTEGER;
-                v.integer = (long long)var.AsInteger();
-                break;
-            case tvtReal:
-                v.type = TJS2_VAL_REAL;
-                v.real = var.AsReal();
-                break;
-            case tvtString: {
-                v.type = TJS2_VAL_STRING;
-                ttstr s(var);
-                storage[i] = s.AsStdString();
-                v.string = storage[i].c_str();
-                break;
-            }
-            default:
-                // objects/octets cross the boundary as opaque handles
-                v.type = TJS2_VAL_OBJECT;
-                break;
-        }
+        variant_to_value_one(*param[i], &out[i], storage[i]);
     }
 }
 
@@ -293,6 +300,293 @@ tjs_error tjs2_dispatch_native_method(tjs2_native_method_dispatch *self,
     }
     TJS_CONVERT_TO_TJS_EXCEPTION
 }
+
+// ---------------------------------------------------------------------------
+// native property dispatch
+// ---------------------------------------------------------------------------
+
+class tjs2_native_property_dispatch;
+
+// Forward declarations: the dispatch class below calls these from its
+// PropGet/PropSet bodies (compiled as if right after the class).
+tjs_error tjs2_dispatch_native_property_get(tjs2_native_property_dispatch *self,
+                                            tTJSVariant *result,
+                                            iTJSDispatch2 *objthis);
+tjs_error tjs2_dispatch_native_property_set(tjs2_native_property_dispatch *self,
+                                            const tTJSVariant *param,
+                                            iTJSDispatch2 *objthis);
+
+// A per-property dispatch object, mirroring the wave-1 method dispatch: the
+// tTJSNativeClassPropertyGetCallback/SetCallback signatures (tjsNative.h)
+// carry no engine or Rust callback, so each registered property gets its own
+// object carrying that state; PropGet/PropSet (virtual, called by the VM when
+// scripts read/write the property) dispatch to the Rust callbacks.
+class tjs2_native_property_dispatch : public TJS::tTJSNativeClassProperty {
+    typedef TJS::tTJSNativeClassProperty inherited;
+
+public:
+    tjs2_engine *engine;
+    tjs2_native_property_get_fn get; // may be nullptr (write-only)
+    tjs2_native_property_set_fn set; // may be nullptr (read-only)
+
+    tjs2_native_property_dispatch(tjs2_engine *e, tjs2_native_property_get_fn g,
+                                  tjs2_native_property_set_fn s)
+        : inherited(nullptr, nullptr), engine(e), get(g), set(s) {}
+
+    tjs_error PropGet(tjs_uint32 flag, const tjs_char *membername,
+                      tjs_uint32 *hint, tTJSVariant *result,
+                      iTJSDispatch2 *objthis) override {
+        if(membername)
+            return inherited::PropGet(flag, membername, hint, result, objthis);
+        return tjs2_dispatch_native_property_get(this, result, objthis);
+    }
+
+    tjs_error PropSet(tjs_uint32 flag, const tjs_char *membername,
+                      tjs_uint32 *hint, const tTJSVariant *param,
+                      iTJSDispatch2 *objthis) override {
+        if(membername)
+            return inherited::PropSet(flag, membername, hint, param, objthis);
+        return tjs2_dispatch_native_property_set(this, param, objthis);
+    }
+};
+
+// Dispatch a property read to the Rust get callback. A property without a
+// getter is write-only: reading it yields Void.
+tjs_error tjs2_dispatch_native_property_get(tjs2_native_property_dispatch *self,
+                                            tTJSVariant *result,
+                                            iTJSDispatch2 *objthis) {
+    (void)objthis; // static properties: objthis is the class object
+    tjs2_engine *e = self->engine;
+    try {
+        if(result)
+            result->Clear();
+
+        if(!self->get)
+            return TJS_S_OK; // write-only: reading returns void
+
+        tjs2_value out;
+        out.type = TJS2_VAL_VOID;
+        out.integer = 0;
+        out.real = 0.0;
+        out.string = nullptr;
+
+        char *out_error = nullptr;
+        int rc = self->get(e, &out, &out_error);
+
+        if(rc != 0) {
+            std::string msg = out_error
+                                  ? out_error
+                                  : "native property get reported an error";
+            if(out_error)
+                tjs2_free_string(out_error);
+            throw TJS::eTJSError(ttstr(utf8_to_u16(msg.c_str()).c_str()));
+        }
+
+        if(result)
+            value_to_variant(&out, result);
+        return TJS_S_OK;
+    }
+    TJS_CONVERT_TO_TJS_EXCEPTION
+}
+
+// Dispatch a property write to the Rust set callback. A property without a
+// setter is read-only: writes are denied with an access-denied error.
+tjs_error tjs2_dispatch_native_property_set(tjs2_native_property_dispatch *self,
+                                            const tTJSVariant *param,
+                                            iTJSDispatch2 *objthis) {
+    (void)objthis;
+    tjs2_engine *e = self->engine;
+    try {
+        if(!self->set)
+            return TJS_E_ACCESSDENYED;
+
+        tjs2_value value;
+        std::string storage;
+        variant_to_value_one(*param, &value, storage);
+
+        char *out_error = nullptr;
+        int rc = self->set(e, &value, &out_error);
+
+        if(rc != 0) {
+            std::string msg = out_error
+                                  ? out_error
+                                  : "native property set reported an error";
+            if(out_error)
+                tjs2_free_string(out_error);
+            throw TJS::eTJSError(ttstr(utf8_to_u16(msg.c_str()).c_str()));
+        }
+        return TJS_S_OK;
+    }
+    TJS_CONVERT_TO_TJS_EXCEPTION
+}
+
+// ---------------------------------------------------------------------------
+// native instance dispatch
+// ---------------------------------------------------------------------------
+
+class tjs2_native_instance_method_dispatch;
+
+// Forward declaration: the dispatch class below calls this from its FuncCall
+// body (compiled as if right after the class).
+tjs_error tjs2_dispatch_native_instance_method(
+    tjs2_native_instance_method_dispatch *self, tTJSVariant *result,
+    tjs_int numparams, tTJSVariant **param, iTJSDispatch2 *objthis);
+
+// A per-method dispatch object for instance-based native classes, carrying
+// the engine, the Rust callback and the native class id. The id is what
+// NativeInstanceSupport keys per-object instances on, so FuncCall can
+// retrieve the Rust payload of the object the method was invoked on.
+class tjs2_native_instance_method_dispatch : public TJS::tTJSNativeClassMethod {
+    typedef TJS::tTJSNativeClassMethod inherited;
+
+public:
+    tjs2_engine *engine;
+    tjs2_native_instance_method_fn fn;
+    tjs_int32 classid;
+
+    tjs2_native_instance_method_dispatch(tjs2_engine *e,
+                                         tjs2_native_instance_method_fn f,
+                                         tjs_int32 cid)
+        : inherited(nullptr), engine(e), fn(f), classid(cid) {}
+
+    tjs_error FuncCall(tjs_uint32 flag, const tjs_char *membername,
+                       tjs_uint32 *hint, tTJSVariant *result,
+                       tjs_int numparams, tTJSVariant **param,
+                       iTJSDispatch2 *objthis) override {
+        if(membername)
+            return inherited::FuncCall(flag, membername, hint, result,
+                                       numparams, param, objthis);
+        return tjs2_dispatch_native_instance_method(this, result, numparams,
+                                                    param, objthis);
+    }
+};
+
+// The per-object native instance backing a Rust-owned payload. Created by
+// tjs2_native_class::CreateNativeInstance for every `new ClassName()`; the
+// Rust payload is allocated by the create callback and released by the
+// destroy callback when the TJS object dies (tTJSCustomObject::Finalize calls
+// Invalidate, then ~tTJSCustomObject calls Destruct() -> delete this, which
+// runs this destructor).
+class tjs2_native_instance : public TJS::tTJSNativeInstance {
+    typedef TJS::tTJSNativeInstance inherited;
+
+    tjs2_engine *engine;
+    tjs2_native_destroy_instance_fn destroy;
+    void *native_ptr;
+    bool valid;
+
+public:
+    tjs2_native_instance(tjs2_engine *e,
+                         tjs2_native_create_instance_fn create,
+                         tjs2_native_destroy_instance_fn d)
+        : engine(e), destroy(d), native_ptr(nullptr), valid(false) {
+        native_ptr = create(e);
+        valid = true;
+    }
+
+    ~tjs2_native_instance() override {
+        if(valid && destroy && native_ptr) {
+            destroy(engine, native_ptr);
+            native_ptr = nullptr;
+            valid = false;
+        }
+    }
+
+    // Called by the VM on finalize; the Rust payload stays alive until the
+    // destructor runs (Destruct -> delete this).
+    void Invalidate() override { inherited::Invalidate(); }
+
+    void *GetNativePtr() const { return native_ptr; }
+};
+
+// Dispatch an instance method call to the Rust callback. The instance payload
+// is retrieved from objthis via NativeInstanceSupport(TJS_NIS_GETINSTANCE,
+// classid) — the same mechanism the reference methods use (TJS_GET_NATIVE_
+// INSTANCE in tjsNative.h, e.g. EventIntf.cpp method bodies). The lookup
+// fails for objects that are not instances of this class (or for the class
+// object itself), which becomes a catchable TJS error.
+tjs_error tjs2_dispatch_native_instance_method(
+    tjs2_native_instance_method_dispatch *self, tTJSVariant *result,
+    tjs_int numparams, tTJSVariant **param, iTJSDispatch2 *objthis) {
+    tjs2_engine *e = self->engine;
+    try {
+        if(result)
+            result->Clear();
+
+        if(!objthis)
+            throw TJS::eTJSError(ttstr(TJS_W(
+                "native instance method called without an object")));
+
+        TJS::iTJSNativeInstance *native = nullptr;
+        tjs_error hr = objthis->NativeInstanceSupport(TJS_NIS_GETINSTANCE,
+                                                      self->classid, &native);
+        if(TJS_FAILED(hr) || !native)
+            throw TJS::eTJSError(ttstr(TJS_W(
+                "native instance method called on an object that is not an "
+                "instance of this native class")));
+
+        void *instance =
+            static_cast<tjs2_native_instance *>(native)->GetNativePtr();
+
+        std::vector<tjs2_value> argv;
+        std::vector<std::string> arg_storage;
+        args_to_values(numparams, param, argv, arg_storage);
+
+        tjs2_value out;
+        out.type = TJS2_VAL_VOID;
+        out.integer = 0;
+        out.real = 0.0;
+        out.string = nullptr;
+
+        char *out_error = nullptr;
+        // FFI handoff: `fn` is Rust code that must follow the ABI contract
+        // (instance/argv/out valid only during the call, out_error malloc'd).
+        int rc = self->fn(e, instance, (int)numparams,
+                          argv.empty() ? nullptr : argv.data(), &out,
+                          &out_error);
+
+        if(rc != 0) {
+            std::string msg =
+                out_error ? out_error
+                          : "native instance method reported an error";
+            if(out_error)
+                tjs2_free_string(out_error);
+            throw TJS::eTJSError(ttstr(utf8_to_u16(msg.c_str()).c_str()));
+        }
+
+        if(result)
+            value_to_variant(&out, result);
+        return TJS_S_OK;
+    }
+    TJS_CONVERT_TO_TJS_EXCEPTION
+}
+
+// ---------------------------------------------------------------------------
+// native instance / instance-capable native class
+// ---------------------------------------------------------------------------
+
+// tTJSNativeClass subclass whose CreateNativeInstance returns a
+// Rust-backed tjs2_native_instance. Follows the reference pattern
+// (e.g. tTJSNC_AsyncTrigger::CreateNativeInstance, EventIntf.cpp:1193).
+class tjs2_native_class : public TJS::tTJSNativeClass {
+    typedef TJS::tTJSNativeClass inherited;
+
+    tjs2_engine *engine;
+    tjs2_native_create_instance_fn create_instance;
+    tjs2_native_destroy_instance_fn destroy_instance;
+
+public:
+    tjs2_native_class(const ttstr &name, tjs2_engine *e,
+                      tjs2_native_create_instance_fn c,
+                      tjs2_native_destroy_instance_fn d)
+        : inherited(name), engine(e), create_instance(c), destroy_instance(d) {}
+
+protected:
+    TJS::iTJSNativeInstance *CreateNativeInstance() override {
+        return new tjs2_native_instance(engine, create_instance,
+                                        destroy_instance);
+    }
+};
 
 // RAII holder for the creation reference of a freshly built native class:
 // releases it on every failure path, or hands it off on success.
@@ -477,9 +771,12 @@ void *tjs2_malloc(size_t size) {
     return malloc(size);
 }
 
-int tjs2_register_native_class(tjs2_engine *e, const char *class_name_utf8,
-                               const tjs2_native_method *methods, int count) {
-    if(!e || !class_name_utf8 || count < 0 || (count > 0 && !methods))
+int tjs2_register_native_class_ex(tjs2_engine *e, const char *class_name_utf8,
+                                  const tjs2_native_method *methods, int count,
+                                  const tjs2_native_property *properties,
+                                  int prop_count) {
+    if(!e || !class_name_utf8 || count < 0 || (count > 0 && !methods) ||
+       prop_count < 0 || (prop_count > 0 && !properties))
         return -1;
     try {
         // Reject duplicate class names: re-registering would silently
@@ -494,7 +791,7 @@ int tjs2_register_native_class(tjs2_engine *e, const char *class_name_utf8,
 
         // Construct the native class. We do not subclass tTJSNativeClass:
         // CreateNativeInstance() stays nullptr (instances would carry no
-        // native data) which is fine for static-only methods.
+        // native data) which is fine for static-only classes.
         TJS::tTJSNativeClass *cls = new TJS::tTJSNativeClass(clsname);
         native_class_holder holder(cls);
 
@@ -514,12 +811,95 @@ int tjs2_register_native_class(tjs2_engine *e, const char *class_name_utf8,
                              TJS::nitMethod, TJS_STATICMEMBER);
         }
 
+        // Register each property as a static property member, mirroring
+        // TJS_END_NATIVE_STATIC_PROP_DECL (tjsNative.h): RegisterNCM(name,
+        // TJSCreateNativeClassProperty(get, set), classname, nitProperty,
+        // TJS_STATICMEMBER). Scripts read/write these as plain members and
+        // may `delete` them (they live in the class's member table).
+        for(int i = 0; i < prop_count; i++) {
+            const tjs2_native_property &p = properties[i];
+            if(!p.name || (!p.get && !p.set))
+                return -3;
+            std::u16string pname16 = utf8_to_u16(p.name);
+            auto *dsp = new tjs2_native_property_dispatch(e, p.get, p.set);
+            cls->RegisterNCM(pname16.c_str(), dsp, clsname.c_str(),
+                             TJS::nitProperty, TJS_STATICMEMBER);
+        }
+
         // Attach the class to the global object, following the reference
         // registerObject pattern (ScriptMgnIntf.cpp:476-483): wrap in a
         // variant (AddRef), drop the creation ref, PropSet onto the global.
         // We additionally keep one AddRef in the engine registry so the
         // class outlives the global member and is released exactly once by
         // tjs2_destroy.
+        iTJSDispatch2 *global = e->inner->GetGlobalNoAddRef();
+        cls->AddRef();
+        e->native_classes.push_back(cls);
+        e->native_class_names.push_back(name8);
+        TJS::tTJSVariant val(cls);
+        holder.dispose();
+        global->PropSet(TJS_MEMBERENSURE | TJS_IGNOREPROP, name16.c_str(),
+                        nullptr, &val, global);
+        return 0;
+    } catch(...) {
+        return -4;
+    }
+}
+
+int tjs2_register_native_class(tjs2_engine *e, const char *class_name_utf8,
+                               const tjs2_native_method *methods, int count) {
+    return tjs2_register_native_class_ex(e, class_name_utf8, methods, count,
+                                         nullptr, 0);
+}
+
+int tjs2_register_native_class_instance(
+    tjs2_engine *e, const char *class_name_utf8,
+    const tjs2_native_instance_method *methods, int count,
+    tjs2_native_create_instance_fn create_instance,
+    tjs2_native_destroy_instance_fn destroy_instance) {
+    if(!e || !class_name_utf8 || count < 0 || (count > 0 && !methods) ||
+       !create_instance)
+        return -1;
+    try {
+        // Reject duplicate class names, as in the static path.
+        std::string name8(class_name_utf8);
+        for(const auto &existing : e->native_class_names)
+            if(existing == name8)
+                return -2;
+
+        std::u16string name16 = utf8_to_u16(class_name_utf8);
+        ttstr clsname(name16.c_str());
+
+        // Register the class name and get its process-wide native class id.
+        // TJS_BEGIN_NATIVE_MEMBERS does the same (TJSRegisterNativeClass,
+        // tjsNative.cpp:25-32) and hands it to the class via SetClassID so
+        // that tTJSNativeClass::FuncCall registers each new object's native
+        // instance under this id (NativeInstanceSupport(TJS_NIS_REGISTER,
+        // _ClassID, ...)) and the method dispatchers can look it back up
+        // with TJS_NIS_GETINSTANCE during a call.
+        tjs_int32 classid = TJS::TJSRegisterNativeClass(clsname.c_str());
+
+        tjs2_native_class *cls =
+            new tjs2_native_class(clsname, e, create_instance, destroy_instance);
+        native_class_holder holder(cls);
+        cls->SetClassID(classid);
+
+        // Register each method as an instance member (no TJS_STATICMEMBER):
+        // tTJSNativeClass::FuncCall copies non-static members onto every
+        // created object (rebinding their objthis), so the same dispatch
+        // object serves method calls on all instances of the class.
+        for(int i = 0; i < count; i++) {
+            const tjs2_native_instance_method &m = methods[i];
+            if(!m.name || !m.fn)
+                return -3;
+            std::u16string mname16 = utf8_to_u16(m.name);
+            auto *dsp = new tjs2_native_instance_method_dispatch(e, m.fn,
+                                                                 classid);
+            cls->RegisterNCM(mname16.c_str(), dsp, clsname.c_str(),
+                             TJS::nitMethod);
+        }
+
+        // Attach to the global object, same as the static path.
         iTJSDispatch2 *global = e->inner->GetGlobalNoAddRef();
         cls->AddRef();
         e->native_classes.push_back(cls);
