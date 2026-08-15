@@ -23,7 +23,7 @@ use xp3::{
 //       u64 LE index_size + index bytes
 //     for zlib:
 //       u64 LE compressed_size + u64 LE real_size + zlib stream
-//   index data = chunks [4-byte tag][u32 LE size][payload]
+//   index data = chunks [4-byte tag][u64 LE size][payload]
 // ---------------------------------------------------------------------------
 
 /// One 28-byte `segm` entry as stored in the index.
@@ -80,10 +80,11 @@ impl Builder {
     fn add_file(&mut self, name: &str, flags: u32, hash: u32, segments: Vec<Seg>) {
         let org_size: u64 = segments.iter().map(|s| s.org_size).sum();
         let arc_size: u64 = segments.iter().map(|s| s.arc_size).sum();
-        let mut parts = Vec::new();
-        parts.push(info_chunk(flags, org_size, arc_size, name));
-        parts.push(segm_chunk(&segments));
-        parts.push(aldr_chunk(hash));
+        let parts = vec![
+            info_chunk(flags, org_size, arc_size, name),
+            segm_chunk(&segments),
+            aldr_chunk(hash),
+        ];
         self.file_chunks.push(file_chunk(&parts));
     }
 
@@ -124,7 +125,7 @@ fn info_chunk(flags: u32, org_size: u64, arc_size: u64, name: &str) -> Vec<u8> {
     let units: Vec<u16> = name.encode_utf16().collect();
     let mut chunk = Vec::new();
     chunk.extend_from_slice(b"info");
-    chunk.extend_from_slice(&((22 + units.len() * 2) as u32).to_le_bytes());
+    chunk.extend_from_slice(&((22 + units.len() * 2) as u64).to_le_bytes());
     chunk.extend_from_slice(&flags.to_le_bytes());
     chunk.extend_from_slice(&(org_size as i64).to_le_bytes());
     chunk.extend_from_slice(&(arc_size as i64).to_le_bytes());
@@ -140,7 +141,7 @@ fn info_chunk(flags: u32, org_size: u64, arc_size: u64, name: &str) -> Vec<u8> {
 fn segm_chunk(segments: &[Seg]) -> Vec<u8> {
     let mut chunk = Vec::new();
     chunk.extend_from_slice(b"segm");
-    chunk.extend_from_slice(&((segments.len() * 28) as u32).to_le_bytes());
+    chunk.extend_from_slice(&((segments.len() * 28) as u64).to_le_bytes());
     for s in segments {
         chunk.extend_from_slice(&s.flags.to_le_bytes());
         chunk.extend_from_slice(&(s.start as i64).to_le_bytes());
@@ -154,7 +155,7 @@ fn segm_chunk(segments: &[Seg]) -> Vec<u8> {
 fn aldr_chunk(hash: u32) -> Vec<u8> {
     let mut chunk = Vec::new();
     chunk.extend_from_slice(b"aldr");
-    chunk.extend_from_slice(&4u32.to_le_bytes());
+    chunk.extend_from_slice(&4u64.to_le_bytes());
     chunk.extend_from_slice(&hash.to_le_bytes());
     chunk
 }
@@ -164,7 +165,7 @@ fn file_chunk(sub_chunks: &[Vec<u8>]) -> Vec<u8> {
     let mut chunk = Vec::new();
     chunk.extend_from_slice(b"File");
     let size: usize = sub_chunks.iter().map(|c| c.len()).sum();
-    chunk.extend_from_slice(&(size as u32).to_le_bytes());
+    chunk.extend_from_slice(&(size as u64).to_le_bytes());
     for c in sub_chunks {
         chunk.extend_from_slice(c);
     }
@@ -401,20 +402,21 @@ fn garbage_magic_is_not_an_xp3() {
 }
 
 #[test]
-fn protected_file_is_refused() {
+fn protected_file_is_readable() {
     let mut b = Builder::new();
     let seg = b.raw_segment(b"top secret");
     b.add_file("secret.dat", FILE_PROTECTED, 0, vec![seg]);
     let bytes = b.finish(INDEX_ENCODE_RAW);
 
     with_archive(&bytes, |arc| {
-        // The entry is still listed...
+        // The entry is listed and read normally: the reference emulator sets
+        // TVPAllowExtractProtectedStorage=true, so DRM-flagged entries are
+        // readable (the bit only blocks extraction tooling).
         assert!(arc.entry("secret.dat").is_some());
-        // ...but reading it is refused (DRM).
-        match arc.read("secret.dat") {
-            Err(Error::Protected(name)) => assert_eq!(name, "secret.dat"),
-            other => panic!("expected Error::Protected, got {other:?}"),
-        }
+        let data = arc.read("secret.dat").expect("protected entry is readable");
+        assert_eq!(data, b"top secret");
+        let entry = arc.entry("secret.dat").unwrap();
+        assert_ne!(entry.flags & FILE_PROTECTED, 0, "flag bit is still exposed");
     });
 }
 

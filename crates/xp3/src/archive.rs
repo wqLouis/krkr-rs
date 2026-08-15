@@ -9,7 +9,7 @@ use flate2::read::ZlibDecoder;
 
 use crate::error::{Error, Result};
 use crate::{
-    FILE_PROTECTED, INDEX_CONTINUE, INDEX_ENCODE_METHOD_MASK, INDEX_ENCODE_RAW, INDEX_ENCODE_ZLIB,
+    INDEX_CONTINUE, INDEX_ENCODE_METHOD_MASK, INDEX_ENCODE_RAW, INDEX_ENCODE_ZLIB,
     SEGM_ENCODE_METHOD_MASK, SEGM_ENCODE_RAW, SEGM_ENCODE_ZLIB, XP3_MAGIC,
     normalize_in_archive_name,
 };
@@ -129,9 +129,8 @@ impl Xp3Archive {
 
     /// Read the full contents of an entry.
     pub fn read_entry(&mut self, entry: &Entry) -> Result<Vec<u8>> {
-        if entry.flags & FILE_PROTECTED != 0 {
-            return Err(Error::Protected(entry.raw_name.clone()));
-        }
+        // Note: `protected` (DRM bit) files are read normally — matching the
+        // reference emulator, which sets TVPAllowExtractProtectedStorage=true.
         let mut out = Vec::with_capacity(entry.org_size as usize);
         for seg in &entry.segments {
             let mut buf = vec![0u8; seg.arc_size as usize];
@@ -205,13 +204,14 @@ impl Xp3Archive {
         Ok(())
     }
 
-    /// Parse one index block: chunks of `[4-byte tag][u32 LE size][data]`.
+    /// Parse one index block: chunks of `[4-byte tag][u64 LE size][data]`.
     fn parse_index(&mut self, data: &[u8]) -> Result<()> {
         let mut pos = 0usize;
-        while pos + 8 <= data.len() {
+        while pos + 12 <= data.len() {
             let tag = &data[pos..pos + 4];
-            let size = u32::from_le_bytes(data[pos + 4..pos + 8].try_into().unwrap()) as usize;
-            pos += 8;
+            let size = u64::from_le_bytes(data[pos + 4..pos + 12].try_into().unwrap());
+            let size = usize::try_from(size).map_err(|_| Error::CorruptIndex("chunk too large"))?;
+            pos += 12;
             if pos + size > data.len() {
                 return Err(Error::CorruptIndex("chunk overruns index data"));
             }
@@ -235,10 +235,12 @@ impl Xp3Archive {
         let mut segments = Vec::new();
         let mut file_hash = 0u32;
 
-        while pos + 8 <= data.len() {
+        while pos + 12 <= data.len() {
             let tag = &data[pos..pos + 4];
-            let size = u32::from_le_bytes(data[pos + 4..pos + 8].try_into().unwrap()) as usize;
-            pos += 8;
+            let size = u64::from_le_bytes(data[pos + 4..pos + 12].try_into().unwrap());
+            let size =
+                usize::try_from(size).map_err(|_| Error::CorruptIndex("sub-chunk too large"))?;
+            pos += 12;
             if pos + size > data.len() {
                 return Err(Error::CorruptIndex("sub-chunk overruns File chunk"));
             }
