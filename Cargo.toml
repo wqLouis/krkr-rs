@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["crates/xp3", "crates/tjs2-sys", "crates/engine"]
+default-members = ["crates/engine"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+xp3 = { path = "crates/xp3" }
+tjs2-sys = { path = "crates/tjs2-sys" }
+
+[profile.release]
+lto = "thin"

@@ -1,0 +1,14 @@
+# Rust
+/target
+
+# Zig deps build artifacts
+/deps/zig-out/
+/deps/.zig-cache/
+/deps/zig-pkg/
+
+# Reference checkout (git clone of the krkr2 emulator)
+/reference/
+
+# Editor / OS
+*.swp
+.DS_Store

@@ -1,0 +1,16 @@
+[package]
+name = "engine"
+description = "krkr-rs load module: mount game storages, bootstrap the TJS2 VM, run startup.tjs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "krkr-rs"
+path = "src/main.rs"
+
+[dependencies]
+xp3 = { workspace = true }
+tjs2-sys = { workspace = true }
+log = "0.4"
+thiserror = "2"

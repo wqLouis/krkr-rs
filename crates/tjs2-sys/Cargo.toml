@@ -1,0 +1,10 @@
+[package]
+name = "tjs2-sys"
+description = "C ABI bindings to the C++ TJS2 scripting VM, compiled via build.rs + zig (no cmake)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+links = "tjs2"
+
+[dependencies]
+thiserror = "2"

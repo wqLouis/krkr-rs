@@ -1,0 +1,28 @@
+.{
+    .name = .krkr2_deps,
+    .version = "0.1.0",
+    .dependencies = .{
+        .fmt = .{
+            .url = "https://github.com/fmtlib/fmt/archive/refs/tags/10.2.1.tar.gz",
+            .hash = "N-V-__8AAC6NMwAvQbscvKb1VaN4g85RA3S5yld-1c0RfXHH",
+        },
+        .spdlog = .{
+            .url = "https://github.com/gabime/spdlog/archive/refs/tags/v1.14.1.tar.gz",
+            .hash = "N-V-__8AAJSgEQBm_CX16IKfCtcWMyIFbucHpA9_ojS59TbP",
+        },
+        .boost = .{
+            .url = "https://github.com/boostorg/boost/releases/download/boost-1.87.0/boost-1.87.0-b2-nodocs.tar.gz",
+            .hash = "N-V-__8AAEWNPBa4aeKN9QDVzlsod8_6QfovY_l0ItkR-2-C",
+        },
+        .oniguruma = .{
+            .url = "https://github.com/kkos/oniguruma/archive/refs/tags/v6.9.10.tar.gz",
+            .hash = "N-V-__8AAPwCMwB54AUHwsvlixvQkvI1tZ5pRs35ZHfr5Evi",
+        },
+    },
+    .minimum_zig_version = "0.14.0",
+    .fingerprint = 0xd34cf1ea2b4abd0,
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+    },
+}
