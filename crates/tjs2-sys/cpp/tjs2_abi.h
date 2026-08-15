@@ -61,6 +61,41 @@ int tjs2_eval(tjs2_engine *e, const char *expression, const char *name,
 void tjs2_free_string(char *s);
 
 /*
+ * Retained TJS values (function objects in particular), so Rust can hold a
+ * script value across engine calls and invoke it later — the Timer native
+ * needs this: timers fire from the host update loop and call their script
+ * callback.
+ *
+ * A tjs2_value cannot carry an object handle, so an OBJECT-typed value is
+ * resolved against the engine's most recent object-valued result (e.g. the
+ * result of eval'ing the name of a script function). Retained ids are
+ * engine-local; release them with tjs2_release_value before (or by)
+ * tjs2_destroy. Release is idempotent.
+ */
+typedef struct tjs2_value_id_t *tjs2_value_id;
+
+/* Retain a script value. Returns a per-engine id holding its own reference
+ * (the retained value stays callable until released), or NULL on failure
+ * (e.g. an OBJECT value when no object result is available to resolve
+ * against). */
+tjs2_value_id tjs2_retain_value(void *engine, const tjs2_value *v);
+
+/* Release a retained value. Idempotent: releasing an unknown or NULL id is
+ * a safe no-op. */
+void tjs2_release_value(void *engine, tjs2_value_id id);
+
+/*
+ * Invoke the retained value's default member (FuncCall, no membername, no
+ * objthis) with argc arguments. On success returns 0 and, if out is
+ * non-NULL, fills it. On failure (unknown id, non-callable value, or a
+ * script exception) returns non-zero and, if out_error is non-NULL, points
+ * it at a malloc'd UTF-8 message (free with tjs2_free_string).
+ */
+int tjs2_call_value(void *engine, tjs2_value_id id, int argc,
+                    const tjs2_value *argv, tjs2_value *out,
+                    char **out_error);
+
+/*
  * Native class registration (static methods only for this milestone).
  *
  * The VM is single-threaded: register classes only from the thread that

@@ -1,0 +1,17 @@
+[package]
+name = "render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Bevy render crate: turns the tvp-visual Scene into rendered Bevy entities"
+
+[lib]
+name = "krkr_render"
+
+[[bin]]
+name = "krkr-vn"
+path = "src/main.rs"
+
+[dependencies]
+bevy = "0.19"
+tvp-visual = { path = "../tvp-visual" }

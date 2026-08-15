@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/xp3", "crates/tjs2-sys", "crates/engine", "crates/kag", "crates/tvp-util", "crates/tvp-streams", "crates/tvp-natives", "crates/tvp-storages", "crates/tvp-scripts", "crates/tvp-archive", "crates/tvp-config", "crates/app"]
+members = ["crates/xp3", "crates/tjs2-sys", "crates/engine", "crates/kag", "crates/tvp-util", "crates/tvp-streams", "crates/tvp-natives", "crates/tvp-storages", "crates/tvp-scripts", "crates/tvp-archive", "crates/tvp-config", "crates/app", "crates/tvp-visual", "crates/render"]
 default-members = ["crates/engine"]
 
 [workspace.package]

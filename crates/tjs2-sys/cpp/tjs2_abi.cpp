@@ -6,10 +6,12 @@
 
 #include "tjsCommHead.h"
 
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <new>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "tjs.h"
@@ -63,6 +65,18 @@ struct tjs2_engine {
     // native_class_names (used for duplicate registration checks).
     std::vector<TJS::iTJSDispatch2 *> native_classes;
     std::vector<std::string> native_class_names;
+    // Retained values: id -> variant. Each variant holds its own reference
+    // (tTJSVariant copy/assign semantics AddRef object contents), so the
+    // value stays callable until the id is erased. Erasing (or destroying
+    // the map with the engine) releases the reference. Ids are engine-local
+    // and never 0 (0 is the null tjs2_value_id sentinel).
+    std::unordered_map<uintptr_t, TJS::tTJSVariant> retained;
+    uintptr_t next_retained_id = 1;
+    // The most recent object-valued result this engine produced (from
+    // exec/eval results and native-callback argument conversions). A
+    // tjs2_value carries no object handle, so tjs2_retain_value resolves an
+    // OBJECT-typed value against this slot.
+    TJS::tTJSVariant last_object;
 };
 
 namespace {
@@ -82,6 +96,11 @@ std::string u16_to_utf8(const tjs_char *s) {
 // stored in the engine's last_string buffer.
 void variant_to_value(tjs2_engine *e, const TJS::tTJSVariant &v,
                       tjs2_value *out) {
+    // Object values cannot cross the ABI as handles, so remember the most
+    // recent object result per engine even when out is null;
+    // tjs2_retain_value resolves OBJECT-typed tjs2_values against it.
+    if(v.Type() == tvtObject)
+        e->last_object = v;
     if(!out)
         return;
     out->integer = 0;
@@ -106,7 +125,12 @@ void variant_to_value(tjs2_engine *e, const TJS::tTJSVariant &v,
             out->string = e->last_string.c_str();
             break;
         }
+        case tvtObject:
+            out->type = TJS2_VAL_OBJECT;
+            break;
         default:
+            // octets etc. cross the boundary as opaque handles too, but are
+            // not retainable (no object closure behind them).
             out->type = TJS2_VAL_OBJECT;
             break;
     }
@@ -129,6 +153,16 @@ char *make_error_message(const TJS::eTJS &e) {
         std::memcpy(buf, "TJS error", 10); // includes NUL
         return buf;
     }
+}
+
+// Copy a plain ASCII/UTF-8 message into a malloc'd buffer for *out_error.
+char *make_error_string(const char *msg) {
+    size_t len = std::strlen(msg);
+    char *buf = (char *)malloc(len + 1);
+    if(!buf)
+        return nullptr;
+    std::memcpy(buf, msg, len + 1);
+    return buf;
 }
 
 // ---------------------------------------------------------------------------
@@ -175,9 +209,10 @@ public:
 // Convert a single tTJSVariant into a tjs2_value; string values are copied
 // into `storage` so the string pointer stays valid after conversion. This is
 // the per-entry logic shared by args_to_values (method arguments) and the
-// property set path (one value).
-void variant_to_value_one(const TJS::tTJSVariant &var, tjs2_value *out,
-                          std::string &storage) {
+// property set path (one value). Object values are remembered in the
+// engine's last_object slot so they can be retained later.
+void variant_to_value_one(tjs2_engine *e, const TJS::tTJSVariant &var,
+                          tjs2_value *out, std::string &storage) {
     out->integer = 0;
     out->real = 0.0;
     out->string = nullptr;
@@ -200,6 +235,10 @@ void variant_to_value_one(const TJS::tTJSVariant &var, tjs2_value *out,
             out->string = storage.c_str();
             break;
         }
+        case tvtObject:
+            e->last_object = var;
+            out->type = TJS2_VAL_OBJECT;
+            break;
         default:
             // objects/octets cross the boundary as opaque handles
             out->type = TJS2_VAL_OBJECT;
@@ -213,13 +252,13 @@ void variant_to_value_one(const TJS::tTJSVariant &var, tjs2_value *out,
 // the call — unlike the single-result path, the engine's last_string buffer
 // cannot be reused here because a string argument would be clobbered by the
 // next argument's conversion.
-void args_to_values(tjs_int numparams, tTJSVariant **param,
+void args_to_values(tjs2_engine *e, tjs_int numparams, tTJSVariant **param,
                     std::vector<tjs2_value> &out,
                     std::vector<std::string> &storage) {
     out.resize(numparams);
     storage.resize(numparams);
     for(tjs_int i = 0; i < numparams; i++) {
-        variant_to_value_one(*param[i], &out[i], storage[i]);
+        variant_to_value_one(e, *param[i], &out[i], storage[i]);
     }
 }
 
@@ -271,7 +310,7 @@ tjs_error tjs2_dispatch_native_method(tjs2_native_method_dispatch *self,
 
         std::vector<tjs2_value> argv;
         std::vector<std::string> arg_storage;
-        args_to_values(numparams, param, argv, arg_storage);
+        args_to_values(e, numparams, param, argv, arg_storage);
 
         tjs2_value out;
         out.type = TJS2_VAL_VOID;
@@ -402,7 +441,7 @@ tjs_error tjs2_dispatch_native_property_set(tjs2_native_property_dispatch *self,
 
         tjs2_value value;
         std::string storage;
-        variant_to_value_one(*param, &value, storage);
+        variant_to_value_one(e, *param, &value, storage);
 
         char *out_error = nullptr;
         int rc = self->set(e, &value, &out_error);
@@ -530,7 +569,7 @@ tjs_error tjs2_dispatch_native_instance_method(
 
         std::vector<tjs2_value> argv;
         std::vector<std::string> arg_storage;
-        args_to_values(numparams, param, argv, arg_storage);
+        args_to_values(e, numparams, param, argv, arg_storage);
 
         tjs2_value out;
         out.type = TJS2_VAL_VOID;
@@ -911,6 +950,134 @@ int tjs2_register_native_class_instance(
         return 0;
     } catch(...) {
         return -4;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// retained values (function objects)
+// ---------------------------------------------------------------------------
+
+// Retain a script value. The variant stored in the map is a refcounted copy
+// (tTJSVariant assignment AddRefs object contents), so the value stays
+// callable until the id is released. A tjs2_value cannot carry an object
+// handle: an OBJECT-typed value is resolved against the engine's last
+// object-valued result (the value of the most recent exec/eval that yielded
+// an object, e.g. eval'ing a script function's name). Returns NULL on
+// failure.
+tjs2_value_id tjs2_retain_value(void *engine, const tjs2_value *v) {
+    tjs2_engine *e = (tjs2_engine *)engine;
+    if(!e || !v)
+        return nullptr;
+    try {
+        TJS::tTJSVariant var;
+        if(v->type == TJS2_VAL_OBJECT) {
+            if(e->last_object.Type() != TJS::tvtObject)
+                return nullptr; // no object result to resolve against
+            var = e->last_object;
+        } else {
+            value_to_variant(v, &var);
+        }
+        // 0 is the null tjs2_value_id sentinel, so skip it.
+        uintptr_t id = e->next_retained_id++;
+        if(id == 0)
+            id = e->next_retained_id++;
+        e->retained.emplace(id, var);
+        return (tjs2_value_id)id;
+    } catch(...) {
+        return nullptr;
+    }
+}
+
+// Release a retained value. Idempotent: releasing an unknown or NULL id is a
+// safe no-op (erasing a missing key does nothing).
+void tjs2_release_value(void *engine, tjs2_value_id id) {
+    tjs2_engine *e = (tjs2_engine *)engine;
+    if(!e || !id)
+        return;
+    try {
+        e->retained.erase((uintptr_t)id);
+    } catch(...) {
+    }
+}
+
+// Invoke the retained value's default member with the given arguments.
+// Follows the VM's own calling convention for a plain function call
+// (tjsInterCodeExec.cpp CallFunction, VM_CALL): FuncCall with no membername
+// and no objthis — tTJSVariantClosure::FuncCall resolves objthis as
+// ObjThis ? ObjThis : Object (tjsVariant.h). Returns 0 on success and fills
+// `out`; non-zero on failure with a malloc'd message in *out_error.
+int tjs2_call_value(void *engine, tjs2_value_id id, int argc,
+                    const tjs2_value *argv, tjs2_value *out,
+                    char **out_error) {
+    tjs2_engine *e = (tjs2_engine *)engine;
+    if(!e || !id || argc < 0 || (argc > 0 && !argv)) {
+        if(out_error)
+            *out_error = make_error_string("invalid retained value");
+        return 1;
+    }
+    try {
+        if(out) {
+            out->type = TJS2_VAL_VOID;
+            out->integer = 0;
+            out->real = 0.0;
+            out->string = nullptr;
+        }
+
+        auto it = e->retained.find((uintptr_t)id);
+        if(it == e->retained.end()) {
+            if(out_error)
+                *out_error = make_error_string("invalid retained value");
+            return 1;
+        }
+
+        // Convert the arguments the same way the native-method dispatch
+        // converts results (value_to_variant); object/octet arguments cannot
+        // be reconstructed and raise a TJS error, matching the callback
+        // return-value path.
+        std::vector<TJS::tTJSVariant> arg_vars;
+        std::vector<TJS::tTJSVariant *> params;
+        arg_vars.reserve((size_t)argc);
+        params.reserve((size_t)argc);
+        for(int i = 0; i < argc; i++) {
+            arg_vars.emplace_back();
+            value_to_variant(&argv[i], &arg_vars.back());
+            params.push_back(&arg_vars.back());
+        }
+
+        TJS::tTJSVariant result;
+        TJS::tTJSVariantClosure clo =
+            it->second.AsObjectClosureNoAddRef(); // throws if not an object
+        tjs_error hr = clo.FuncCall(0, nullptr, nullptr, &result, argc,
+                                    params.empty() ? nullptr : params.data(),
+                                    nullptr);
+        if(TJS_FAILED(hr))
+            TJSThrowFrom_tjs_error(hr, TJS_W("")); // -> catch(eTJS) below
+
+        variant_to_value(e, result, out);
+        if(out_error)
+            *out_error = nullptr;
+        return 0;
+    } catch(const TJS::eTJS &err) {
+        if(out_error)
+            *out_error = make_error_message(err);
+        return 1;
+    } catch(const std::exception &err) {
+        if(out_error) {
+            std::string m = std::string("C++ exception: ") + err.what();
+            char *buf = (char *)malloc(m.size() + 1);
+            if(buf)
+                std::memcpy(buf, m.c_str(), m.size() + 1);
+            *out_error = buf;
+        }
+        return 1;
+    } catch(...) {
+        if(out_error) {
+            char *buf = (char *)malloc(8);
+            if(buf)
+                std::memcpy(buf, "unknown", 8);
+            *out_error = buf;
+        }
+        return 1;
     }
 }
 

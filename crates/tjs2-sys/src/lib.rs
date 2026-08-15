@@ -156,10 +156,29 @@ unsafe extern "C" {
         create_instance: NativeCreateInstanceFn,
         destroy_instance: NativeDestroyInstanceFn,
     ) -> c_int;
+    /// Opaque, per-engine id of a retained script value (mirror of
+    /// `tjs2_value_id` in cpp/tjs2_abi.h).
+    fn tjs2_retain_value(engine: *mut Engine, v: *const Value) -> Tjs2ValueId;
+    /// Release a retained value. Idempotent on the C++ side.
+    fn tjs2_release_value(engine: *mut Engine, id: Tjs2ValueId);
+    /// Invoke a retained value's default member with `argc` args.
+    fn tjs2_call_value(
+        engine: *mut Engine,
+        id: Tjs2ValueId,
+        argc: c_int,
+        argv: *const Value,
+        out: *mut Value,
+        out_error: *mut *mut c_char,
+    ) -> c_int;
     /// malloc-compatible allocation (for building error strings on the Rust
     /// side; free with tjs2_free_string).
     pub fn tjs2_malloc(size: usize) -> *mut c_void;
 }
+
+/// Opaque per-engine id of a retained script value (mirror of the C
+/// `tjs2_value_id` typedef: an opaque pointer that is never null for a live
+/// id).
+pub type Tjs2ValueId = *mut c_void;
 
 // ---------------------------------------------------------------------------
 // Safe wrapper
@@ -175,6 +194,42 @@ unsafe extern "C" {
 /// threads at the same time.
 pub struct Tjs2Engine {
     inner: *mut Engine,
+    /// Raw ids of all values retained on this engine (see
+    /// [`Self::retain_value`]). The engine releases every id in this
+    /// registry when it is dropped, so a forgotten [`ValueId`] (e.g. via
+    /// `std::mem::forget`) cannot leak a retained value or crash the
+    /// engine drop.
+    retained: std::cell::RefCell<Vec<Tjs2ValueId>>,
+}
+
+/// An opaque id of a script value retained on a [`Tjs2Engine`] (see
+/// [`Tjs2Engine::retain_value`]).
+///
+/// # Lifetimes
+///
+/// `ValueId<'a>` borrows the engine it was retained on, so a value id can
+/// never outlive its engine: dropping the engine while ids are still alive
+/// is rejected at compile time. (A `std::mem::forget`'d id is the one
+/// exception — its Drop never runs — and the engine's registry still
+/// releases it at engine drop.)
+///
+/// # Release
+///
+/// Dropping a `ValueId` releases the retained value on the C++ side. The
+/// release is idempotent (releasing an already-released id is a safe
+/// no-op), so dropping an id after an explicit
+/// [`Tjs2Engine::release_value`] is harmless. Retained values hold their
+/// own reference in the engine and stay callable across any number of
+/// engine calls until released.
+pub struct ValueId<'a> {
+    engine: &'a Tjs2Engine,
+    id: Tjs2ValueId,
+}
+
+impl Drop for ValueId<'_> {
+    fn drop(&mut self) {
+        self.engine.release_retained(self.id);
+    }
 }
 
 // SAFETY: process-wide VM globals mean engines must never run concurrently;
@@ -252,7 +307,10 @@ impl Tjs2Engine {
         if inner.is_null() {
             return Err("failed to create TJS2 engine");
         }
-        Ok(Tjs2Engine { inner })
+        Ok(Tjs2Engine {
+            inner,
+            retained: std::cell::RefCell::new(Vec::new()),
+        })
     }
 
     /// Install a console/log callback (replaces any previous one).
@@ -452,10 +510,133 @@ impl Tjs2Engine {
         }
         Ok(())
     }
+
+    /// Retain a script value so it stays alive and callable across engine
+    /// calls (see [`ValueId`] for the lifetime/release contract).
+    ///
+    /// A function object is obtained by evaluating its name:
+    /// `let f = engine.eval("f", "test")?;` yields [`TjsValue::Object`],
+    /// and the engine resolves it against the most recent object-valued
+    /// script result. Scalars (void/integer/real/string) can also be
+    /// retained, but only object values are callable.
+    pub fn retain_value(&self, v: &TjsValue) -> Result<ValueId<'_>, String> {
+        let mut strings = Vec::new();
+        let ffi = match v {
+            // The C++ side resolves OBJECT-typed values against the
+            // engine's most recent object result (no handle crosses the
+            // ABI).
+            TjsValue::Object => Value {
+                ty: VAL_OBJECT,
+                integer: 0,
+                real: 0.0,
+                string: ptr::null(),
+            },
+            other => value_to_ffi(other, &mut strings)?,
+        };
+        // SAFETY: `ffi` mirrors `v` (strings in `strings` stay alive for
+        // the call) and self.inner is a live engine.
+        let id = unsafe { tjs2_retain_value(self.inner, &ffi) };
+        if id.is_null() {
+            return Err(
+                "failed to retain value: object values are resolved against \
+the most recent object-valued script result (e.g. eval of the function's \
+name), and none was available"
+                    .into(),
+            );
+        }
+        self.retained.borrow_mut().push(id);
+        Ok(ValueId { engine: self, id })
+    }
+
+    /// Invoke a retained value with the given arguments (the value's
+    /// default member; no `this`). The value must be retained on this
+    /// engine and not yet released.
+    pub fn call_value(&self, id: &ValueId<'_>, args: &[TjsValue]) -> Result<TjsValue, String> {
+        if !std::ptr::eq(id.engine, self) {
+            return Err("value id belongs to a different engine".into());
+        }
+        if !self.retained.borrow().contains(&id.id) {
+            return Err(
+                "invalid retained value: not retained on this engine (already released?)".into(),
+            );
+        }
+        let mut strings = Vec::new();
+        let ffi_args: Vec<Value> = args
+            .iter()
+            .map(|a| value_to_ffi(a, &mut strings))
+            .collect::<Result<_, _>>()?;
+        let mut out = Value {
+            ty: VAL_VOID,
+            integer: 0,
+            real: 0.0,
+            string: ptr::null(),
+        };
+        let mut error: *mut c_char = ptr::null_mut();
+        // SAFETY: self.inner is a live engine, id.id is a live retained id,
+        // and ffi_args/strings stay alive for the call.
+        let rc = unsafe {
+            tjs2_call_value(
+                self.inner,
+                id.id,
+                ffi_args.len() as c_int,
+                if ffi_args.is_empty() {
+                    ptr::null()
+                } else {
+                    ffi_args.as_ptr()
+                },
+                &mut out,
+                &mut error,
+            )
+        };
+        if rc != 0 {
+            return Err(unsafe { take_error_string(error) });
+        }
+        // SAFETY: `out` was filled by the C++ side on success.
+        Ok(unsafe { take_value(&out) })
+    }
+
+    /// Release a retained value immediately (the id is also released when
+    /// dropped; call this only to free it earlier). The second release of
+    /// the same id is an error: the id is no longer registered on this
+    /// engine. (The C++-level release itself is idempotent — a safe no-op
+    /// for unknown ids — so dropping the id afterwards is harmless.)
+    pub fn release_value(&self, id: &ValueId<'_>) -> Result<(), String> {
+        if !std::ptr::eq(id.engine, self) {
+            return Err("value id belongs to a different engine".into());
+        }
+        let mut retained = self.retained.borrow_mut();
+        let Some(pos) = retained.iter().position(|i| *i == id.id) else {
+            return Err("invalid retained value: already released".into());
+        };
+        retained.remove(pos);
+        drop(retained);
+        self.release_retained(id.id);
+        Ok(())
+    }
+
+    /// FFI-release one raw retained id and drop it from the registry (used
+    /// by both [`ValueId`]'s Drop and engine drop). Releasing an id that is
+    /// not in the registry is still safe: the C++ side's erase of an
+    /// unknown id is a no-op.
+    fn release_retained(&self, id: Tjs2ValueId) {
+        self.retained.borrow_mut().retain(|i| *i != id);
+        // SAFETY: self.inner is a live engine while a ValueId (or the
+        // engine itself) holds a reference; release is idempotent.
+        unsafe { tjs2_release_value(self.inner, id) };
+    }
 }
 
 impl Drop for Tjs2Engine {
     fn drop(&mut self) {
+        // Release every still-retained value first (this covers ids whose
+        // ValueId was forgotten via std::mem::forget). The C++ side's
+        // release is idempotent, and its retained-value map also dies with
+        // the engine struct below, so there is no double release.
+        for &id in self.retained.get_mut().iter() {
+            // SAFETY: self.inner is a live engine.
+            unsafe { tjs2_release_value(self.inner, id) };
+        }
+        self.retained.get_mut().clear();
         // SAFETY: self.inner is a valid engine created by tjs2_create.
         unsafe { tjs2_destroy(self.inner) };
     }
@@ -490,12 +671,59 @@ unsafe fn take_value(v: *const Value) -> TjsValue {
 /// # Safety
 /// `e` must be either null or a malloc'd string owned by the C side.
 unsafe fn take_error(e: *mut c_char) -> TjsError {
+    TjsError(unsafe { take_error_string(e) })
+}
+
+/// Take ownership of an error string returned by the C side, as a plain
+/// String.
+///
+/// # Safety
+/// `e` must be either null or a malloc'd string owned by the C side.
+unsafe fn take_error_string(e: *mut c_char) -> String {
     if e.is_null() {
-        return TjsError("unknown TJS error".into());
+        return "unknown TJS error".into();
     }
     let msg = unsafe { CStr::from_ptr(e) }.to_string_lossy().into_owned();
     unsafe { tjs2_free_string(e) };
-    TjsError(msg)
+    msg
+}
+
+/// Convert a [`TjsValue`] into the C-side `tjs2_value` struct. Strings are
+/// NUL-terminated copies kept alive in `strings` for the duration of the
+/// call. Object values cannot be reconstructed on the Rust side (no object
+/// handle crosses the ABI) and are rejected.
+fn value_to_ffi(v: &TjsValue, strings: &mut Vec<CString>) -> Result<Value, String> {
+    let mut out = Value {
+        ty: VAL_VOID,
+        integer: 0,
+        real: 0.0,
+        string: ptr::null(),
+    };
+    match v {
+        TjsValue::Void => {}
+        TjsValue::Integer(i) => {
+            out.ty = VAL_INTEGER;
+            out.integer = *i;
+        }
+        TjsValue::Real(r) => {
+            out.ty = VAL_REAL;
+            out.real = *r;
+        }
+        TjsValue::String(s) => {
+            let c =
+                CString::new(s.as_str()).map_err(|_| "string contains a NUL byte".to_string())?;
+            out.ty = VAL_STRING;
+            out.string = c.as_ptr();
+            strings.push(c);
+        }
+        TjsValue::Object => {
+            return Err(
+                "object values cannot be passed as arguments (no object handle crosses the ABI)"
+                    .into(),
+            );
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -1141,5 +1369,142 @@ var ra = a.get(); var rb = b.get();",
             200,
             "every counter payload should have been destroyed"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // retained values (function objects)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn retained_function_can_be_called() {
+        let e = Tjs2Engine::new().unwrap();
+        e.exec_script("var f = function(a, b) { return a + b; };", "test")
+            .unwrap();
+        // Evaluating the function's name yields an object value; the engine
+        // resolves it against its most recent object result on retain.
+        let f = e.eval("f", "test").unwrap();
+        assert_eq!(f, TjsValue::Object);
+        let id = e.retain_value(&f).unwrap();
+        assert_eq!(
+            e.call_value(&id, &[TjsValue::Integer(2), TjsValue::Integer(40)])
+                .unwrap(),
+            TjsValue::Integer(42)
+        );
+    }
+
+    #[test]
+    fn retained_function_mutates_globals_across_calls() {
+        let e = Tjs2Engine::new().unwrap();
+        e.exec_script(
+            "var g = 0; var f = function() { g = g + 1; return g; };",
+            "test",
+        )
+        .unwrap();
+        let f = e.eval("f", "test").unwrap();
+        let id = e.retain_value(&f).unwrap();
+        assert_eq!(e.call_value(&id, &[]).unwrap(), TjsValue::Integer(1));
+        assert_eq!(e.call_value(&id, &[]).unwrap(), TjsValue::Integer(2));
+    }
+
+    #[test]
+    fn retained_noarg_function_returns_void() {
+        let e = Tjs2Engine::new().unwrap();
+        e.exec_script("var f = function() { };", "test").unwrap();
+        let f = e.eval("f", "test").unwrap();
+        let id = e.retain_value(&f).unwrap();
+        assert_eq!(e.call_value(&id, &[]).unwrap(), TjsValue::Void);
+    }
+
+    #[test]
+    fn retained_function_returns_string() {
+        let e = Tjs2Engine::new().unwrap();
+        e.exec_script("var f = function() { return 'hello from tjs'; };", "test")
+            .unwrap();
+        let f = e.eval("f", "test").unwrap();
+        let id = e.retain_value(&f).unwrap();
+        assert_eq!(
+            e.call_value(&id, &[]).unwrap(),
+            TjsValue::String("hello from tjs".into())
+        );
+    }
+
+    #[test]
+    fn calling_a_released_value_errors() {
+        let e = Tjs2Engine::new().unwrap();
+        e.exec_script("var f = function() { return 1; };", "test")
+            .unwrap();
+        let f = e.eval("f", "test").unwrap();
+        let id = e.retain_value(&f).unwrap();
+
+        // Releasing twice is an error (the second id is no longer
+        // registered on this engine).
+        e.release_value(&id).unwrap();
+        let err = e.release_value(&id).unwrap_err();
+        assert!(err.contains("already released"), "unexpected: {err}");
+
+        // Calling a released id is an error, not a crash.
+        let err = e.call_value(&id, &[]).unwrap_err();
+        assert!(err.contains("invalid retained value"), "unexpected: {err}");
+
+        // Dropping the id afterwards is still safe: the C++-level release
+        // is idempotent.
+        drop(id);
+    }
+
+    #[test]
+    fn ffi_call_value_with_unknown_id_errors() {
+        // The C++ side itself must reject unknown ids gracefully (the safe
+        // wrapper catches this before crossing the FFI, but the boundary
+        // contract is what matters for the Timer use case).
+        let e = Tjs2Engine::new().unwrap();
+        let mut out = Value {
+            ty: VAL_VOID,
+            integer: 0,
+            real: 0.0,
+            string: ptr::null(),
+        };
+        let mut error: *mut c_char = ptr::null_mut();
+        // SAFETY: e.inner is a live engine; the id is deliberately bogus.
+        let rc = unsafe {
+            tjs2_call_value(
+                e.inner,
+                ptr::null_mut(),
+                0,
+                ptr::null(),
+                &mut out,
+                &mut error,
+            )
+        };
+        assert_ne!(rc, 0);
+        // SAFETY: error was filled by the C++ side (or left null).
+        let msg = unsafe { take_error_string(error) };
+        assert!(msg.contains("invalid retained value"), "unexpected: {msg}");
+    }
+
+    #[test]
+    fn engine_drop_releases_retained_values() {
+        // A live ValueId borrows its engine, so "drop the engine while ids
+        // are alive" cannot even be expressed. What can happen is a
+        // forgotten id (std::mem::forget skips Drop); the engine's registry
+        // still releases every retained id at engine drop — no leak, no
+        // crash.
+        let e = Tjs2Engine::new().unwrap();
+        e.exec_script("var f = function() { return 42; };", "test")
+            .unwrap();
+        let f = e.eval("f", "test").unwrap();
+        let id = e.retain_value(&f).unwrap();
+        std::mem::forget(id);
+        drop(e);
+
+        // Normal path: ids dropped before the engine, then the engine
+        // drops.
+        let e2 = Tjs2Engine::new().unwrap();
+        e2.exec_script("var f = function() { return 7; };", "test")
+            .unwrap();
+        let f2 = e2.eval("f", "test").unwrap();
+        let id2 = e2.retain_value(&f2).unwrap();
+        assert_eq!(e2.call_value(&id2, &[]).unwrap(), TjsValue::Integer(7));
+        drop(id2);
+        drop(e2);
     }
 }
