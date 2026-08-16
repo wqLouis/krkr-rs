@@ -4,7 +4,7 @@ use tjs2_sys::Tjs2Engine;
 use tvp_sound::register_sound;
 
 #[test]
-fn probe_script_class_shadowing_native() {
+fn script_class_shadowing_wavesoundbuffer() {
     let dir = std::env::temp_dir().join("probe-shadow");
     let _ = std::fs::create_dir_all(&dir);
     let storage = Arc::new(Mutex::new(Storage::mount(&dir).unwrap()));
