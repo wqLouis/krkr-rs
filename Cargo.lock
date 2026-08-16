@@ -6012,6 +6012,7 @@ name = "tvp-visual"
 version = "0.1.0"
 dependencies = [
  "engine",
+ "flate2",
  "image",
  "log",
  "tempfile",
