@@ -140,6 +140,21 @@ pub fn set_real_out(out: *mut Value, v: f64) {
     }
 }
 
+/// Write an empty TJS array return value into `*out` (the C++ side copies
+/// the elements into a real TJS array before the callback returns; with
+/// zero elements it produces `[]`).
+pub fn set_empty_array_out(out: *mut Value) {
+    // SAFETY: out is a valid return slot for the duration of the call.
+    unsafe {
+        (*out).ty = tjs2_sys::VAL_ARRAY;
+        (*out).integer = 0;
+        (*out).real = 0.0;
+        (*out).string = ptr::null();
+        (*out).array = ptr::null();
+        (*out).array_count = 0;
+    }
+}
+
 /// Clear the return slot (void return).
 pub fn set_void_out(out: *mut Value) {
     // SAFETY: out is a valid return slot for the duration of the call.

@@ -108,6 +108,9 @@ void variant_to_value(tjs2_engine *e, const TJS::tTJSVariant &v,
     out->integer = 0;
     out->real = 0.0;
     out->string = nullptr;
+    out->array = nullptr;
+    out->array_count = 0;
+    out->retained = nullptr;
     switch(v.Type()) {
         case tvtVoid:
             out->type = TJS2_VAL_VOID;
@@ -167,6 +170,19 @@ char *make_error_string(const char *msg) {
     return buf;
 }
 
+// When the VM discards a native result (a bare expression statement passes
+// result == NULL), a TJS2_VAL_RETAINED result would otherwise linger in the
+// retained map forever: the map entry holds a reference nothing ever
+// releases. Consume it (release the reference) exactly as the conversion
+// would have.
+void consume_retained_if_discarded(tjs2_engine *e, const tjs2_value &out) {
+    if(out.type == TJS2_VAL_RETAINED && out.retained && e) {
+        auto it = e->retained.find((uintptr_t)out.retained);
+        if(it != e->retained.end())
+            e->retained.erase(it);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // native method dispatch
 // ---------------------------------------------------------------------------
@@ -218,6 +234,9 @@ void variant_to_value_one(tjs2_engine *e, const TJS::tTJSVariant &var,
     out->integer = 0;
     out->real = 0.0;
     out->string = nullptr;
+    out->array = nullptr;
+    out->array_count = 0;
+    out->retained = nullptr;
     switch(var.Type()) {
         case tvtVoid:
             out->type = TJS2_VAL_VOID;
@@ -353,6 +372,9 @@ tjs_error tjs2_dispatch_native_method(tjs2_native_method_dispatch *self,
         out.integer = 0;
         out.real = 0.0;
         out.string = nullptr;
+        out.array = nullptr;
+        out.array_count = 0;
+        out.retained = nullptr;
 
         char *out_error = nullptr;
         // FFI handoff: `fn` is Rust code that must follow the ABI contract
@@ -369,8 +391,13 @@ tjs_error tjs2_dispatch_native_method(tjs2_native_method_dispatch *self,
             throw TJS::eTJSError(ttstr(utf8_to_u16(msg.c_str()).c_str()));
         }
 
-        if(result)
+        if(result) {
             value_to_variant(e, &out, result);
+        } else {
+            // The VM discarded the result (bare statement): release any
+            // retained value instead of leaking the map entry.
+            consume_retained_if_discarded(e, out);
+        }
         return TJS_S_OK;
     }
     TJS_CONVERT_TO_TJS_EXCEPTION
@@ -444,6 +471,9 @@ tjs_error tjs2_dispatch_native_property_get(tjs2_native_property_dispatch *self,
         out.integer = 0;
         out.real = 0.0;
         out.string = nullptr;
+        out.array = nullptr;
+        out.array_count = 0;
+        out.retained = nullptr;
 
         char *out_error = nullptr;
         int rc = self->get(e, &out, &out_error);
@@ -457,8 +487,13 @@ tjs_error tjs2_dispatch_native_property_get(tjs2_native_property_dispatch *self,
             throw TJS::eTJSError(ttstr(utf8_to_u16(msg.c_str()).c_str()));
         }
 
-        if(result)
+        if(result) {
             value_to_variant(e, &out, result);
+        } else {
+            // The VM discarded the result (bare statement): release any
+            // retained value instead of leaking the map entry.
+            consume_retained_if_discarded(e, out);
+        }
         return TJS_S_OK;
     }
     TJS_CONVERT_TO_TJS_EXCEPTION
@@ -500,6 +535,7 @@ tjs_error tjs2_dispatch_native_property_set(tjs2_native_property_dispatch *self,
 // ---------------------------------------------------------------------------
 
 class tjs2_native_instance_method_dispatch;
+class tjs2_native_class;
 
 // Forward declaration: the dispatch class below calls this from its FuncCall
 // body (compiled as if right after the class).
@@ -534,6 +570,42 @@ public:
         return tjs2_dispatch_native_instance_method(this, result, numparams,
                                                     param, objthis);
     }
+};
+
+// A constructor-member dispatch for instance-based native classes. The
+// reference registers the class name itself as a member (via
+// TJS_BEGIN_NATIVE_CONSTRUCTOR_DECL), so script subclasses can call
+// `super.ClassName()` in their constructor:
+//
+//     class ScController extends KAGParser {
+//         function ScController(handle){ super.KAGParser(); ... }
+//     }
+//
+// Script-subclass objects have NO native instance yet, so this dispatch
+// creates one and registers it on objthis before invoking the Rust
+// constructor callback — mirroring what the reference's
+// TJS_GET_NATIVE_INSTANCE does for the constructor member. The FuncCall
+// body lives after the tjs2_native_class definition (it needs its
+// NewInstance() accessor).
+class tjs2_native_instance_constructor_dispatch
+    : public TJS::tTJSNativeClassMethod {
+    typedef TJS::tTJSNativeClassMethod inherited;
+
+public:
+    tjs2_engine *engine;
+    tjs2_native_class *cls;
+    tjs_int32 classid;
+    tjs2_native_instance_method_fn fn;
+
+    tjs2_native_instance_constructor_dispatch(
+        tjs2_engine *e, tjs2_native_class *c, tjs_int32 cid,
+        tjs2_native_instance_method_fn f)
+        : inherited(nullptr), engine(e), cls(c), classid(cid), fn(f) {}
+
+    tjs_error FuncCall(tjs_uint32 flag, const tjs_char *membername,
+                       tjs_uint32 *hint, tTJSVariant *result,
+                       tjs_int numparams, tTJSVariant **param,
+                       iTJSDispatch2 *objthis) override;
 };
 
 // The per-object native instance backing a Rust-owned payload. Created by
@@ -632,8 +704,13 @@ tjs_error tjs2_dispatch_native_instance_method(
             throw TJS::eTJSError(ttstr(utf8_to_u16(msg.c_str()).c_str()));
         }
 
-        if(result)
+        if(result) {
             value_to_variant(e, &out, result);
+        } else {
+            // The VM discarded the result (bare statement): release any
+            // retained value instead of leaking the map entry.
+            consume_retained_if_discarded(e, out);
+        }
         return TJS_S_OK;
     }
     TJS_CONVERT_TO_TJS_EXCEPTION
@@ -740,8 +817,13 @@ tjs_error tjs2_dispatch_native_instance_property_get(
             throw TJS::eTJSError(ttstr(utf8_to_u16(msg.c_str()).c_str()));
         }
 
-        if(result)
+        if(result) {
             value_to_variant(e, &out, result);
+        } else {
+            // The VM discarded the result (bare statement): release any
+            // retained value instead of leaking the map entry.
+            consume_retained_if_discarded(e, out);
+        }
         return TJS_S_OK;
     }
     TJS_CONVERT_TO_TJS_EXCEPTION
@@ -808,12 +890,74 @@ public:
                       tjs2_native_destroy_instance_fn d)
         : inherited(name), engine(e), create_instance(c), destroy_instance(d) {}
 
+    // Public accessor for the constructor dispatch (CreateNativeInstance is
+    // protected in the base class).
+    TJS::iTJSNativeInstance *NewInstance() { return CreateNativeInstance(); }
+
 protected:
     TJS::iTJSNativeInstance *CreateNativeInstance() override {
         return new tjs2_native_instance(engine, create_instance,
                                         destroy_instance);
     }
 };
+
+// Constructor-member dispatch body (see the class declaration above).
+tjs_error tjs2_native_instance_constructor_dispatch::FuncCall(
+    tjs_uint32 flag, const tjs_char *membername, tjs_uint32 *hint,
+    tTJSVariant *result, tjs_int numparams, tTJSVariant **param,
+    iTJSDispatch2 *objthis) {
+    if(membername)
+        return inherited::FuncCall(flag, membername, hint, result, numparams,
+                                   param, objthis);
+    if(!objthis)
+        throw TJS::eTJSError(ttstr(TJS_W(
+            "native instance constructor called without an object")));
+
+    tjs2_engine *e = this->engine;
+    TJS::iTJSNativeInstance *native = nullptr;
+    tjs_error hr = objthis->NativeInstanceSupport(TJS_NIS_GETINSTANCE,
+                                                  classid, &native);
+    if(TJS_FAILED(hr) || !native) {
+        // Script-subclass object: create + register the native instance
+        // (reference: TJS_GET_NATIVE_INSTANCE inside the constructor).
+        native = cls->NewInstance();
+        objthis->NativeInstanceSupport(TJS_NIS_REGISTER, classid, &native);
+    }
+    void *instance =
+        static_cast<tjs2_native_instance *>(native)->GetNativePtr();
+
+    std::vector<tjs2_value> argv;
+    std::vector<std::string> arg_storage;
+    args_to_values(e, numparams, param, argv, arg_storage);
+
+    tjs2_value out;
+    out.type = TJS2_VAL_VOID;
+    out.integer = 0;
+    out.real = 0.0;
+    out.string = nullptr;
+    out.array = nullptr;
+    out.array_count = 0;
+    out.retained = nullptr;
+
+    char *out_error = nullptr;
+    int rc = fn(e, instance, (int)numparams,
+                argv.empty() ? nullptr : argv.data(), &out, &out_error,
+                (void *)objthis);
+    if(rc != 0) {
+        std::string msg =
+            out_error ? out_error
+                      : "native instance constructor reported an error";
+        if(out_error)
+            tjs2_free_string(out_error);
+        throw TJS::eTJSError(ttstr(utf8_to_u16(msg.c_str()).c_str()));
+    }
+    if(result) {
+        value_to_variant(e, &out, result);
+    } else {
+        consume_retained_if_discarded(e, out);
+    }
+    return TJS_S_OK;
+}
 
 // RAII holder for the creation reference of a freshly built native class:
 // releases it on every failure path, or hands it off on success.
@@ -1130,10 +1274,21 @@ int tjs2_register_native_class_instance(
             if(!m.name || !m.fn)
                 return -3;
             std::u16string mname16 = utf8_to_u16(m.name);
-            auto *dsp = new tjs2_native_instance_method_dispatch(e, m.fn,
-                                                                 classid);
-            cls->RegisterNCM(mname16.c_str(), dsp, clsname.c_str(),
-                             TJS::nitMethod);
+            if(mname16 == name16) {
+                // The class-name member is the constructor: it must also
+                // work on script-subclass objects that do not have a native
+                // instance yet (`super.ClassName()`), so it uses the
+                // constructor dispatch which creates+registers on demand.
+                auto *dsp = new tjs2_native_instance_constructor_dispatch(
+                    e, cls, classid, m.fn);
+                cls->RegisterNCM(mname16.c_str(), dsp, clsname.c_str(),
+                                 TJS::nitMethod);
+            } else {
+                auto *dsp = new tjs2_native_instance_method_dispatch(e, m.fn,
+                                                                     classid);
+                cls->RegisterNCM(mname16.c_str(), dsp, clsname.c_str(),
+                                 TJS::nitMethod);
+            }
         }
 
         // Register each property as an instance member (no TJS_STATICMEMBER)
@@ -1200,6 +1355,63 @@ tjs2_value_id tjs2_retain_value(void *engine, const tjs2_value *v) {
     }
 }
 
+// Whether two variants are the same script value: scalar equality, or the
+// same closure (Object + ObjThis) for objects. Used to match a function
+// value registered by addContinuousHandler against the same function
+// passed to removeContinuousHandler (retain allocates a fresh id per call,
+// so raw-id comparison cannot work).
+static bool tjs2_same_value(const TJS::tTJSVariant &a,
+                            const TJS::tTJSVariant &b) {
+    if(a.Type() != b.Type())
+        return false;
+    switch(a.Type()) {
+        case TJS::tvtVoid:
+            return true;
+        case TJS::tvtInteger:
+            return a.AsInteger() == b.AsInteger();
+        case TJS::tvtReal:
+            return a.AsReal() == b.AsReal();
+        case TJS::tvtString: {
+            TJS::ttstr sa(a), sb(b);
+            return sa == sb;
+        }
+        case TJS::tvtObject: {
+            TJS::tTJSVariantClosure ca = a.AsObjectClosureNoAddRef();
+            TJS::tTJSVariantClosure cb = b.AsObjectClosureNoAddRef();
+            return ca.Object == cb.Object && ca.ObjThis == cb.ObjThis;
+        }
+        default:
+            return false;
+    }
+}
+
+// Find the retained id of a value already in the engine's retained map
+// (without retaining anything new). Resolves OBJECT-typed inputs against
+// last_object like tjs2_retain_value, then scans for a map entry that is
+// the same script value. Returns NULL (the null id) when not found.
+tjs2_value_id tjs2_find_retained_id(void *engine, const tjs2_value *v) {
+    tjs2_engine *e = (tjs2_engine *)engine;
+    if(!e || !v)
+        return nullptr;
+    try {
+        TJS::tTJSVariant var;
+        if(v->type == TJS2_VAL_OBJECT) {
+            if(e->last_object.Type() != TJS::tvtObject)
+                return nullptr; // no object result to resolve against
+            var = e->last_object;
+        } else {
+            value_to_variant(e, v, &var);
+        }
+        for(auto &kv : e->retained) {
+            if(tjs2_same_value(kv.second, var))
+                return (tjs2_value_id)kv.first;
+        }
+        return nullptr;
+    } catch(...) {
+        return nullptr;
+    }
+}
+
 // Retain a raw TJS object (used by natives returning their own `this` or a
 // related object — e.g. Window.primaryLayer returns the primary Layer
 // object). Adds a reference into the engine's retained map and returns the
@@ -1232,6 +1444,16 @@ tjs2_value_id tjs2_retain_object(void *engine, void *obj) {
     e->retained.emplace(id, TJS::tTJSVariant((TJS::iTJSDispatch2 *)obj,
                                              (TJS::iTJSDispatch2 *)obj));
     return (tjs2_value_id)id;
+}
+
+// Diagnostic: the number of entries currently in the retained-value map.
+// Used by the tjs2-sys test suite to prove retentions are consumed/released
+// (no unbounded growth).
+size_t tjs2_retained_count(void *engine) {
+    tjs2_engine *e = (tjs2_engine *)engine;
+    if(!e)
+        return 0;
+    return e->retained.size();
 }
 
 // Release a retained value. Idempotent: releasing an unknown or NULL id is a
@@ -1267,19 +1489,19 @@ int tjs2_call_value(void *engine, tjs2_value_id id, int argc,
             out->integer = 0;
             out->real = 0.0;
             out->string = nullptr;
-        }
-
-        auto it = e->retained.find((uintptr_t)id);
-        if(it == e->retained.end()) {
-            if(out_error)
-                *out_error = make_error_string("invalid retained value");
-            return 1;
+            out->array = nullptr;
+            out->array_count = 0;
+            out->retained = nullptr;
         }
 
         // Convert the arguments the same way the native-method dispatch
         // converts results (value_to_variant); object/octet arguments cannot
         // be reconstructed and raise a TJS error, matching the callback
-        // return-value path.
+        // return-value path. This runs BEFORE the retained-id lookup: the
+        // conversion can mutate the retained map (a TJS2_VAL_RETAINED
+        // argument consumes its entry), so no map iterator may be held
+        // across it (a held iterator would dangle once the entry is
+        // erased).
         std::vector<TJS::tTJSVariant> arg_vars;
         std::vector<TJS::tTJSVariant *> params;
         arg_vars.reserve((size_t)argc);
@@ -1290,10 +1512,101 @@ int tjs2_call_value(void *engine, tjs2_value_id id, int argc,
             params.push_back(&arg_vars.back());
         }
 
+        auto it = e->retained.find((uintptr_t)id);
+        if(it == e->retained.end()) {
+            if(out_error)
+                *out_error = make_error_string("invalid retained value");
+            return 1;
+        }
+
         TJS::tTJSVariant result;
         TJS::tTJSVariantClosure clo =
             it->second.AsObjectClosureNoAddRef(); // throws if not an object
         tjs_error hr = clo.FuncCall(0, nullptr, nullptr, &result, argc,
+                                    params.empty() ? nullptr : params.data(),
+                                    nullptr);
+        if(TJS_FAILED(hr))
+            TJSThrowFrom_tjs_error(hr, TJS_W("")); // -> catch(eTJS) below
+
+        variant_to_value(e, result, out);
+        if(out_error)
+            *out_error = nullptr;
+        return 0;
+    } catch(const TJS::eTJS &err) {
+        if(out_error)
+            *out_error = make_error_message(err);
+        return 1;
+    } catch(const std::exception &err) {
+        if(out_error) {
+            std::string m = std::string("C++ exception: ") + err.what();
+            char *buf = (char *)malloc(m.size() + 1);
+            if(buf)
+                std::memcpy(buf, m.c_str(), m.size() + 1);
+            *out_error = buf;
+        }
+        return 1;
+    } catch(...) {
+        if(out_error) {
+            char *buf = (char *)malloc(8);
+            if(buf)
+                std::memcpy(buf, "unknown", 8);
+            *out_error = buf;
+        }
+        return 1;
+    }
+}
+
+// Invoke a named member on a retained object value (e.g. the timer
+// object's `onTimer`), the way the reference's event system dispatches
+// (TimerIntf.cpp posts an "onTimer" event to the Timer object, whose
+// handler then resolves to the script subclass's override). Member lookup
+// goes through the object's own class chain, so a script subclass that
+// overrides `onTimer` (like the game's OnceTimer) runs its override
+// instead of the native method. Returns 0 on success and fills `out`;
+// non-zero on failure with a malloc'd message in *out_error.
+int tjs2_call_member(void *engine, tjs2_value_id id, const char *membername,
+                     int argc, const tjs2_value *argv, tjs2_value *out,
+                     char **out_error) {
+    tjs2_engine *e = (tjs2_engine *)engine;
+    if(!e || !id || !membername || argc < 0 || (argc > 0 && !argv)) {
+        if(out_error)
+            *out_error = make_error_string("invalid retained value");
+        return 1;
+    }
+    try {
+        if(out) {
+            out->type = TJS2_VAL_VOID;
+            out->integer = 0;
+            out->real = 0.0;
+            out->string = nullptr;
+            out->array = nullptr;
+            out->array_count = 0;
+            out->retained = nullptr;
+        }
+
+        std::vector<TJS::tTJSVariant> arg_vars;
+        std::vector<TJS::tTJSVariant *> params;
+        arg_vars.reserve((size_t)argc);
+        params.reserve((size_t)argc);
+        for(int i = 0; i < argc; i++) {
+            arg_vars.emplace_back();
+            value_to_variant(e, &argv[i], &arg_vars.back());
+            params.push_back(&arg_vars.back());
+        }
+
+        auto it = e->retained.find((uintptr_t)id);
+        if(it == e->retained.end()) {
+            if(out_error)
+                *out_error = make_error_string("invalid retained value");
+            return 1;
+        }
+
+        std::u16string member16 = utf8_to_u16(membername);
+        TJS::tTJSVariant result;
+        TJS::tTJSVariantClosure clo =
+            it->second.AsObjectClosureNoAddRef(); // throws if not an object
+        tjs_error hr = clo.FuncCall(0, member16.c_str(), nullptr, &result,
+                                    argc,
                                     params.empty() ? nullptr : params.data(),
                                     nullptr);
         if(TJS_FAILED(hr))

@@ -1360,13 +1360,19 @@ impl KagParserState {
         self.call_stack.len()
     }
 
-    pub fn get_macros(&self) -> String {
-        let entries: Vec<(String, String)> = self
-            .macros
+    /// The macros dictionary as an ordered `Vec<(name, body)>` (for
+    /// building a real TJS Dictionary result).
+    pub fn get_macros_entries(&self) -> Vec<(String, String)> {
+        self.macros
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        kvp::encode_dict(&entries)
+            .collect()
+    }
+
+    /// Serialize the macros dictionary as `name=body` kvp lines (kept for
+    /// `store()`/string round-trips).
+    pub fn get_macros(&self) -> String {
+        kvp::encode_dict(&self.get_macros_entries())
     }
 
     pub fn set_macros(&mut self, s: &str) -> Result<(), String> {
@@ -1380,11 +1386,18 @@ impl KagParserState {
 
     /// The top macro-args dictionary (`macroParams`/`mp`), or `None` when
     /// no macro arguments are on the stack (the reference returns void).
-    pub fn get_macro_params(&self) -> Option<String> {
+    /// The top macro-args dictionary (`macroParams`/`mp`) as ordered
+    /// `Vec<(name, value)>`, or `None` when no macro arguments are on the
+    /// stack (the reference returns void).
+    pub fn get_macro_params_entries(&self) -> Option<Vec<(String, String)>> {
         let top = self.macro_args.last()?;
-        let entries: Vec<(String, String)> =
-            top.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-        Some(kvp::encode_dict(&entries))
+        Some(top.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+    }
+
+    /// The top macro-args dictionary as kvp lines, or `None` when empty
+    /// (kept for callers that need the string form).
+    pub fn get_macro_params(&self) -> Option<String> {
+        Some(kvp::encode_dict(&self.get_macro_params_entries()?))
     }
 
     pub fn interrupt(&mut self) {

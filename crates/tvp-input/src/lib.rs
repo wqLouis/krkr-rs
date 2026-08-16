@@ -5,9 +5,9 @@
 //! call: `Mouse` and `Key`.
 //!
 //! The state is **not** fed by OS input capture here — the app (Bevy
-//! wiring, a later wave) writes into the shared state every frame; the
-//! natives only read it when scripts call them. The app drives the state
-//! with the frame protocol below.
+//! wiring in `crates/render/src/input_bridge.rs`) writes into the shared
+//! state every frame; the natives only read it when scripts call them. The
+//! frame protocol below is exactly what that bridge drives.
 //!
 //! # Frame protocol (the Bevy wiring API)
 //!
@@ -581,6 +581,15 @@ pub(crate) fn lock_ok<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
+    /// `input_state` is process-global; parallel tests race on it (segfault).
+    /// Serialize the crate's tests with one lock; all other crates stay
+    /// fully parallel.
+    static VM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn vm_lock() -> std::sync::MutexGuard<'static, ()> {
+        VM_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     use super::*;
     use tjs2_sys::TjsValue;
 
@@ -606,6 +615,7 @@ mod tests {
 
     #[test]
     fn mouse_and_key_read_back_simulated_input() {
+        let _vm_lock = vm_lock();
         let (e, state) = test_engine();
         {
             let mut s = state.lock().unwrap();
@@ -631,6 +641,7 @@ mod tests {
 
     #[test]
     fn key_released_and_repeat_semantics() {
+        let _vm_lock = vm_lock();
         let (e, state) = test_engine();
         let code = key_code("kReturn").unwrap();
 
@@ -677,6 +688,7 @@ mod tests {
 
     #[test]
     fn mouse_visible_toggle_and_wheel_accumulation() {
+        let _vm_lock = vm_lock();
         let (e, state) = test_engine();
 
         // visible defaults to true; setVisible toggles the shared state.
@@ -719,6 +731,7 @@ mod tests {
 
     #[test]
     fn unknown_key_codes_return_false_not_error() {
+        let _vm_lock = vm_lock();
         let (e, _state) = test_engine();
         assert_eq!(eval_i(&e, "Key.getPressed(0x9999)"), 0);
         assert_eq!(eval_i(&e, "Key.getReleased(0x9999)"), 0);
@@ -734,6 +747,7 @@ mod tests {
 
     #[test]
     fn mouse_button_out_of_range_returns_false() {
+        let _vm_lock = vm_lock();
         let (e, _state) = test_engine();
         assert_eq!(eval_i(&e, "Mouse.getPressed(5)"), 0);
         assert_eq!(eval_i(&e, "Mouse.getPressed(-1)"), 0);
@@ -745,6 +759,7 @@ mod tests {
 
     #[test]
     fn mouse_set_cursor_pos_writes_state() {
+        let _vm_lock = vm_lock();
         let (e, state) = test_engine();
         assert_eq!(
             e.eval("Mouse.setCursorPos(50, 60)", "test").unwrap(),
@@ -765,6 +780,7 @@ mod tests {
 
     #[test]
     fn key_constants_evaluate_to_reference_values() {
+        let _vm_lock = vm_lock();
         let (e, _state) = test_engine();
         for (name, expected) in [
             ("kBack", 0x08),
@@ -804,6 +820,7 @@ mod tests {
 
     #[test]
     fn every_registered_key_constant_evaluates_to_its_table_value() {
+        let _vm_lock = vm_lock();
         let (e, _state) = test_engine();
         for &(name, code) in KEY_CODE_TABLE {
             assert_eq!(
@@ -814,10 +831,78 @@ mod tests {
         }
     }
 
+    // -- bridge-fed edges: button press -> hold -> release, pos, key edges ---
+
+    #[test]
+    fn bridge_edges_pos_and_wheel_land_in_state() {
+        let _vm_lock = vm_lock();
+        let (_e, state) = test_engine();
+
+        // frame 1: the bridge records a left-button press edge, the cursor
+        // position, a key press, and a wheel notch.
+        {
+            let mut s = state.lock().unwrap();
+            s.begin_frame();
+            s.set_mouse_pos(640, 360);
+            s.set_mouse_button(MB_LEFT, true);
+            s.set_key_down(key_code("kReturn").unwrap());
+            s.add_wheel(0, 120, 0);
+            s.end_frame();
+        }
+        {
+            let s = state.lock().unwrap();
+            // position landed
+            assert_eq!((s.mouse.x, s.mouse.y), (640, 360));
+            // button down edge -> held, hold counter reset to 0, then
+            // end_frame bumped it to 1
+            assert!(s.is_mouse_button_down(MB_LEFT));
+            assert!(!s.is_mouse_button_released(MB_LEFT));
+            assert_eq!(s.mouse_button_repeat(MB_LEFT), 1);
+            // key down edge lands; repeat bumped to 1 by end_frame
+            assert!(s.is_key_down(key_code("kReturn").unwrap()));
+            assert_eq!(s.key_repeat(key_code("kReturn").unwrap()), 1);
+            // wheel accumulated
+            assert_eq!(s.mouse.wheel, (0, 120, 0));
+        }
+
+        // frame 2: still held (no new down edge), wheel cleared; a release
+        // edge arrives.
+        {
+            let mut s = state.lock().unwrap();
+            s.begin_frame();
+            s.set_mouse_button(MB_LEFT, false);
+            s.set_key_up(key_code("kReturn").unwrap());
+            s.end_frame();
+        }
+        {
+            let s = state.lock().unwrap();
+            // wheel was cleared by begin_frame
+            assert_eq!(s.mouse.wheel, (0, 0, 0));
+            // release edge visible this frame only
+            assert!(s.is_mouse_button_released(MB_LEFT));
+            assert!(!s.is_mouse_button_down(MB_LEFT));
+            assert!(s.is_key_released(key_code("kReturn").unwrap()));
+            assert!(!s.is_key_down(key_code("kReturn").unwrap()));
+        }
+
+        // frame 3: the release flag is gone (single-frame gatting).
+        {
+            let mut s = state.lock().unwrap();
+            s.begin_frame();
+            s.end_frame();
+        }
+        {
+            let s = state.lock().unwrap();
+            assert!(!s.is_mouse_button_released(MB_LEFT));
+            assert!(!s.is_key_released(key_code("kReturn").unwrap()));
+        }
+    }
+
     // -- last_pressed / hold counters at the Rust level ---------------------
 
     #[test]
     fn last_pressed_records_press_order() {
+        let _vm_lock = vm_lock();
         let (e, state) = test_engine();
         let (k_left, k_right) = (key_code("kLeft").unwrap(), key_code("kRight").unwrap());
 

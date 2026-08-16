@@ -25,6 +25,24 @@
 //! depth, so higher z renders on top. Only parent-less layers are in the
 //! order today; hierarchical children are a later milestone.
 //!
+//! # Blend modes
+//!
+//! TVP layers carry a blend `type` (`ltOpaque=1`, `ltAlpha=2`,
+//! `ltAdditive=3`, `ltSubtractive=4`, `ltAddAlpha=12`, ... — enum values
+//! per `reference/cpp/core/visual/drawable.h`; the game's constants are
+//! registered in `tvp-natives/src/constants.rs`). The scene model does NOT
+//! store the type (the natives keep it per-instance for script round-trips,
+//! see `layer_type_stored_per_instance_not_in_scene` in
+//! `tvp-visual/src/natives/layer.rs`), so every sprite here renders with
+//! plain straight-alpha blending regardless of type. **Additive /
+//! subtractive / multiplicative / ... blends are NOT implemented**: a layer
+//! whose script type is `ltAdditive` renders exactly like `ltAlpha` (with
+//! the composed window × layer opacity as alpha). This affects the title
+//! scene's COVER fade-in (`system/title.tjs` sets `type = ltAdditive`) and
+//! the ADV flash effects (`system/advscreen.tjs` sets ltAdditive/
+//! ltSubtractive), so such frames composite darker than the reference until
+//! real blend modes land.
+//!
 //! # Rebuild strategy
 //!
 //! Milestone approach: **full rebuild every frame** — every [`SceneSprite`]
@@ -594,6 +612,246 @@ mod tests {
             cache
                 .handle_for(bad, &scene, &mut images, &mut uploaded)
                 .is_none()
+        );
+    }
+
+    /// The real title scene's stack z-values (system_status.tjs:
+    /// LAYER_LOGO=110000, LAYER_COVER=150000, LAYER_HINT=210000; content
+    /// layers sit at z=0). The game's own comment: "レイヤー優先度（数字が
+    /// 大きいほど手前）" — larger z = closer/front. The sync must spawn the
+    /// z=210000 layer with the HIGHEST sprite z so it renders on top.
+    #[test]
+    fn sync_spawns_real_title_z_order() {
+        let mut scene = Scene::default();
+        let win = scene.add_window("title", (1280, 720));
+        // Insertion order mirrors the game: HINT (MainWindow ctor) and LOGO
+        // are created before the z=0 content layers.
+        let hint = scene.add_layer(win, None);
+        let logo = scene.add_layer(win, None);
+        let bg = scene.add_layer(win, None);
+        let cover = scene.add_layer(win, None);
+        let art = scene.add_layer(win, None);
+        scene.layer_mut(hint).unwrap().z_order = 210000;
+        scene.layer_mut(logo).unwrap().z_order = 110000;
+        scene.layer_mut(cover).unwrap().z_order = 150000;
+        for l in [bg, art] {
+            scene.layer_mut(l).unwrap().fill_color = Some([0, 0, 0, 255]);
+        }
+        for l in [logo, cover, hint] {
+            scene.layer_mut(l).unwrap().fill_color = Some([255, 255, 255, 255]);
+        }
+
+        let shared = SharedScene(Arc::new(RwLock::new(scene)));
+        let mut app = app_with_sync(shared.clone());
+        app.update();
+
+        let world = app.world_mut();
+        let mut q = world.query_filtered::<(&SceneSprite, &Transform), With<SceneSprite>>();
+        let mut by_layer = std::collections::HashMap::new();
+        for (m, t) in q.iter(world) {
+            by_layer.insert(m.layer_id, t.translation.z);
+        }
+        assert_eq!(by_layer[&bg], 0.0, "z=0 content is backmost");
+        assert_eq!(by_layer[&art], 1.0);
+        assert_eq!(
+            by_layer[&logo], 2.0,
+            "LAYER_LOGO (110000) in front of z=0 content"
+        );
+        assert_eq!(
+            by_layer[&cover], 3.0,
+            "LAYER_COVER (150000) in front of LOGO"
+        );
+        assert_eq!(by_layer[&hint], 4.0, "LAYER_HINT (210000) is frontmost");
+    }
+
+    /// Window opacity × layer opacity compose into the sprite alpha (TVP
+    /// opacity is 0..255 → scene stores 0..1; the sync multiplies the two).
+    #[test]
+    fn opacity_composition_window_times_layer() {
+        let mut scene = Scene::default();
+        let win = scene.add_window("t", (640, 480));
+        scene.window_mut(win).unwrap().opacity = 0.5;
+        let fill = scene.add_layer(win, None);
+        scene.layer_mut(fill).unwrap().rect = Rect {
+            x: 0,
+            y: 0,
+            w: 640,
+            h: 480,
+        };
+        scene.layer_mut(fill).unwrap().fill_color = Some([0, 0, 0, 255]);
+        scene.layer_mut(fill).unwrap().opacity = 0.5;
+        let bmp_id = scene.add_bitmap(8, 8, vec![255u8; 8 * 8 * 4]);
+        let bmp = scene.add_layer(win, None);
+        scene.layer_mut(bmp).unwrap().bitmap = Some(bmp_id);
+        scene.layer_mut(bmp).unwrap().rect = Rect {
+            x: 0,
+            y: 0,
+            w: 8,
+            h: 8,
+        };
+        scene.layer_mut(bmp).unwrap().opacity = 0.5;
+
+        let shared = SharedScene(Arc::new(RwLock::new(scene)));
+        let mut app = app_with_sync(shared.clone());
+        app.update();
+
+        let world = app.world_mut();
+        let mut q = world.query_filtered::<(&SceneSprite, &Sprite), With<SceneSprite>>();
+        let mut alphas = Vec::new();
+        for (_m, s) in q.iter(world) {
+            alphas.push(s.color.to_srgba().alpha);
+        }
+        assert_eq!(alphas.len(), 2);
+        for a in alphas {
+            assert!(
+                (a - 0.25).abs() < 1e-6,
+                "0.5 window × 0.5 layer must give sprite alpha 0.25; got {a}"
+            );
+        }
+    }
+
+    /// Fill colors are straight alpha: the RGB channels must NOT be scaled
+    /// by the composed opacity (Bevy sprites blend straight alpha by
+    /// default, matching TVP's straight-alpha bitmaps).
+    #[test]
+    fn fill_color_straight_alpha_keeps_rgb() {
+        let color = fill_sprite_color([255, 0, 0, 128], 1.0).to_srgba();
+        assert_eq!(color.red, 1.0, "RGB untouched by alpha");
+        assert_eq!(color.green, 0.0);
+        assert_eq!(color.blue, 0.0);
+        assert!((color.alpha - 128.0 / 255.0).abs() < 1e-6);
+
+        // Composed opacity scales alpha only.
+        let half = fill_sprite_color([255, 0, 0, 128], 0.5).to_srgba();
+        assert_eq!(half.red, 1.0);
+        assert!((half.alpha - 128.0 / 255.0 * 0.5).abs() < 1e-6);
+    }
+
+    /// The real title scene's bitmap layers land in the scene already sized
+    /// to their bitmap (the game calls `setSizeToImageSize`, which the
+    /// sprite's `_image` child forwards to the native); the sync renders
+    /// each at exactly that size with the texture uploaded.
+    #[test]
+    fn bitmap_layer_rect_matching_bitmap_size() {
+        let mut scene = Scene::default();
+        let win = scene.add_window("t", (1280, 720));
+        let bmp_id = scene.add_bitmap(251, 254, vec![0u8; 251 * 254 * 4]);
+        let l = scene.add_layer(win, None);
+        scene.layer_mut(l).unwrap().bitmap = Some(bmp_id);
+        // rect == bitmap size (setSizeToImageSize result; frm_0502c SKR).
+        scene.layer_mut(l).unwrap().rect = Rect {
+            x: 297,
+            y: 436,
+            w: 251,
+            h: 254,
+        };
+
+        let shared = SharedScene(Arc::new(RwLock::new(scene)));
+        let mut app = app_with_sync(shared.clone());
+        app.update();
+
+        let world = app.world_mut();
+        let mut q = world.query_filtered::<(&SceneSprite, &Sprite), With<SceneSprite>>();
+        let (_m, sprite) = q.single(world).expect("one sprite");
+        assert_eq!(sprite.custom_size, Some(Vec2::new(251.0, 254.0)));
+        assert!(sprite.image.is_strong(), "texture uploaded");
+        // White tint at full opacity: the texture's own RGBA shows through.
+        let c = sprite.color.to_srgba();
+        assert_eq!((c.red, c.green, c.blue, c.alpha), (1.0, 1.0, 1.0, 1.0));
+    }
+
+    /// A layer whose rect is still 1x1 (the game has not called
+    /// setSizeToImageSize yet) renders as a 1px sprite — the sync does NOT
+    /// auto-size to the bitmap. Expected: sizing is the script's job
+    /// (`Layer.setSizeToImageSize`), and the real title scene always sizes
+    /// its bitmap layers (verified via the headless scene dump).
+    #[test]
+    fn bitmap_layer_1x1_rect_stays_1px() {
+        let mut scene = Scene::default();
+        let win = scene.add_window("t", (1280, 720));
+        let bmp_id = scene.add_bitmap(64, 64, vec![0u8; 64 * 64 * 4]);
+        let l = scene.add_layer(win, None);
+        scene.layer_mut(l).unwrap().bitmap = Some(bmp_id);
+        scene.layer_mut(l).unwrap().rect = Rect {
+            x: 10,
+            y: 10,
+            w: 1,
+            h: 1,
+        };
+
+        let shared = SharedScene(Arc::new(RwLock::new(scene)));
+        let mut app = app_with_sync(shared.clone());
+        app.update();
+
+        let world = app.world_mut();
+        let mut q = world.query_filtered::<(&SceneSprite, &Sprite), With<SceneSprite>>();
+        let (_m, sprite) = q.single(world).expect("one sprite");
+        assert_eq!(sprite.custom_size, Some(Vec2::new(1.0, 1.0)));
+    }
+
+    /// Y-flip + center-anchor placement with the real title scene's
+    /// positions (window 1280x720, Bevy y-up origin at center).
+    #[test]
+    fn rect_center_real_title_positions() {
+        // Full-window layer → origin.
+        assert_eq!(
+            rect_center(
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: 1280,
+                    h: 720
+                },
+                1280,
+                720
+            ),
+            (0.0, 0.0)
+        );
+        // frm_0501b "gear" strip at TVP (0,317,1280x403): Bevy center
+        // x = 0, y = 360 - (317 + 201.5) = -158.5 (below center, y-down
+        // flipped to y-up).
+        assert_eq!(
+            rect_center(
+                Rect {
+                    x: 0,
+                    y: 317,
+                    w: 1280,
+                    h: 403
+                },
+                1280,
+                720
+            ),
+            (0.0, -158.5)
+        );
+        // A sprite whose TVP rect center is (780, 460) (rect
+        // (640,360,280x200)) lands at Bevy (780-640, 360-460) = (140, -100).
+        assert_eq!(
+            rect_center(
+                Rect {
+                    x: 640,
+                    y: 360,
+                    w: 280,
+                    h: 200
+                },
+                1280,
+                720
+            ),
+            (140.0, -100.0)
+        );
+        // frm_0507 title logo (371,286,539x149): center (640.5, 360.5) →
+        // (0.5, -0.5).
+        assert_eq!(
+            rect_center(
+                Rect {
+                    x: 371,
+                    y: 286,
+                    w: 539,
+                    h: 149
+                },
+                1280,
+                720
+            ),
+            (0.5, -0.5)
         );
     }
 }

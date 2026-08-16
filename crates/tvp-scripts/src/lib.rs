@@ -497,7 +497,16 @@ extern "C" fn native_exec_storage(
             "Scripts.execStorage: the execution-context argument is not supported yet; ignoring"
         );
     }
-    finish(out, out_error, execute_storage(&name, &mode, false))
+    let result = execute_storage(&name, &mode, false);
+    // Object results (e.g. `(const) [...]` save data) are retained and
+    // returned across the ABI, exactly like evalStorage.
+    if result.is_ok()
+        && let Ok(engine) = context_engine()
+        && try_retain_object_result(out, &engine)
+    {
+        return 0;
+    }
+    finish(out, out_error, result)
 }
 
 /// `Scripts.evalStorage(name[, mode[, context]])`.
@@ -693,7 +702,21 @@ pub fn register_scripts(engine: &Tjs2Engine) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+pub(crate) mod test_lock {
+    /// The TJS2 VM is single-threaded and the script natives keep a
+    /// process-global engine context; parallel tests race on it
+    /// (segfault). Serialize with one process-wide lock.
+    static VM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    pub(crate) fn vm_lock() -> std::sync::MutexGuard<'static, ()> {
+        VM_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    use crate::test_lock::vm_lock;
+
     use super::*;
     use tjs2_sys::TjsValue;
 
@@ -771,6 +794,7 @@ mod tests {
 
     #[test]
     fn exec_storage_runs_script_and_returns_top_level_return() {
+        let _vm_lock = vm_lock();
         // A trailing expression statement is NOT the script result (the
         // reference only returns the value of a top-level `return`).
         let env = TestEnv::new(
@@ -799,6 +823,7 @@ mod tests {
 
     #[test]
     fn exec_storage_defines_global_visible_to_outer_script() {
+        let _vm_lock = vm_lock();
         let env = TestEnv::new(
             "exec-global",
             &[(
@@ -818,6 +843,7 @@ mod tests {
 
     #[test]
     fn eval_storage_returns_expression_value() {
+        let _vm_lock = vm_lock();
         let env = TestEnv::new("eval-storage", &[("expr.tjs", b"2 * 21".as_slice())]);
 
         assert_eq!(
@@ -837,6 +863,7 @@ mod tests {
 
     #[test]
     fn exec_runs_raw_string() {
+        let _vm_lock = vm_lock();
         let env = TestEnv::new("exec-raw", &[]);
 
         assert_eq!(
@@ -853,6 +880,7 @@ mod tests {
 
     #[test]
     fn eval_returns_expression_value() {
+        let _vm_lock = vm_lock();
         let env = TestEnv::new("eval-raw", &[]);
 
         assert_eq!(env.eval_ok("Scripts.eval('6 * 7')"), TjsValue::Integer(42));
@@ -864,6 +892,7 @@ mod tests {
 
     #[test]
     fn mode_string_is_accepted_and_offset_applied() {
+        let _vm_lock = vm_lock();
         // mode "" and "exec" (no `oN` offset) behave like no mode
         let env = TestEnv::new(
             "mode",
@@ -896,6 +925,7 @@ mod tests {
 
     #[test]
     fn decode_utf8_bom_and_cp932() {
+        let _vm_lock = vm_lock();
         // UTF-8 with BOM — the common scenario-file encoding
         let env = TestEnv::new(
             "utf8-bom",
@@ -925,6 +955,7 @@ mod tests {
 
     #[test]
     fn missing_storage_and_bad_script_are_catchable() {
+        let _vm_lock = vm_lock();
         let env = TestEnv::new(
             "errors",
             &[("broken.tjs", b"this is not valid tjs".as_slice())],
@@ -953,6 +984,7 @@ mod tests {
 
     #[test]
     fn nested_exec_storage_reenters_vm() {
+        let _vm_lock = vm_lock();
         // A script loaded by execStorage loads another one itself (this is
         // how scenario/template chains work).
         let env = TestEnv::new(
@@ -976,6 +1008,7 @@ mod tests {
 
     #[test]
     fn real_and_void_results() {
+        let _vm_lock = vm_lock();
         let env = TestEnv::new(
             "types",
             &[
@@ -989,5 +1022,30 @@ mod tests {
         );
         // empty script → void
         assert_eq!(env.eval_ok("Scripts.execStorage('v.tjs')"), TjsValue::Void);
+    }
+
+    #[test]
+    fn exec_storage_object_result_is_retained_and_usable() {
+        let _vm_lock = vm_lock();
+        // Like evalStorage, an object-returning script (e.g. `(const) [...]`
+        // save data) is retained and crosses the ABI as a usable object.
+        let env = TestEnv::new(
+            "exec-storage-obj",
+            &[("save.tjs", b"return %[a: 1, b: 'x'];".as_slice())],
+        );
+        // The stored script's top-level dict becomes the execStorage result
+        // (retained), readable from the caller.
+        env.eval_ok(
+            "Scripts.exec(\"var r = Scripts.execStorage('save.tjs'); var a = r.a; var b = r.b;\")",
+        );
+        assert_eq!(env.eval_ok("a"), TjsValue::Integer(1));
+        assert_eq!(env.eval_ok("b"), TjsValue::String("x".into()));
+        // repeated calls do not corrupt the results (retain reuse)
+        for _ in 0..20 {
+            env.eval_ok(
+                "Scripts.exec(\"var r2 = Scripts.execStorage('save.tjs'); var a2 = r2.a;\")",
+            );
+            assert_eq!(env.eval_ok("a2"), TjsValue::Integer(1));
+        }
     }
 }

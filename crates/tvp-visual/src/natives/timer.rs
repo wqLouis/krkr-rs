@@ -4,8 +4,13 @@
 //! Script surface: `new Timer(callback[, actionName])`, properties
 //! `interval` (ms, rw), `enabled` (rw). Firing happens through
 //! [`timer_poll`], which the app's update loop calls each frame with a
-//! monotonic millisecond clock; due timers invoke their retained callback
-//! via [`tjs2_sys::Tjs2Engine::call_detached`].
+//! monotonic millisecond clock; due timers dispatch the **`onTimer` member
+//! on the timer object** — the reference posts an "onTimer" event to the
+//! Timer object and the object's class chain resolves the handler, so a
+//! script subclass that overrides `onTimer` (like the game's `OnceTimer`,
+//! which cancels itself and calls the wrapped function once) runs its
+//! override. A plain `Timer`'s `onTimer` is the native method below, which
+//! invokes the constructor's callback argument.
 
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
@@ -18,10 +23,16 @@ use super::ffi::{arg_bool, arg_i64, error_out, instance_ref};
 
 /// One registered timer.
 struct TimerState {
-    /// Retained script callback (the value passed to the constructor).
-    /// `None` while a callback is being invoked (taken out so the map guard
-    /// can be released before calling back into the VM).
+    /// Retained script callback (the value passed to the constructor); the
+    /// native `onTimer` method invokes it. `None` while a callback is being
+    /// invoked (taken out so the map guard can be released before calling
+    /// back into the VM).
     callback: Option<tjs2_sys::DetachedValue>,
+    /// Retained timer *object* (the `this` of the `new Timer(...)` /
+    /// `super.Timer(...)` expression): `timer_poll` dispatches its
+    /// `onTimer` member through the object's class chain, so script
+    /// subclass overrides run.
+    owner: Option<tjs2_sys::DetachedValue>,
     /// Interval in milliseconds.
     interval_ms: u64,
     enabled: bool,
@@ -48,16 +59,17 @@ fn next_id() -> u32 {
     id
 }
 
-/// `new Timer(callback[, actionName])` — retain the callback; the action
-/// name is accepted and ignored (the reference uses it to name the async
-/// trigger; we call the callback directly).
+/// `new Timer(callback[, actionName])` — retain the callback (arg0) and the
+/// timer object (`objthis`). The action name is accepted and ignored (the
+/// reference uses it to name the async trigger; we dispatch `onTimer`
+/// directly).
 extern "C" fn timer_ctor(
     _engine: *mut std::ffi::c_void,
     argc: std::ffi::c_int,
     argv: *const tjs2_sys::Value,
     out: *mut tjs2_sys::Value,
     out_error: *mut *mut std::ffi::c_char,
-    _objthis: *mut std::ffi::c_void,
+    objthis: *mut std::ffi::c_void,
 ) -> std::ffi::c_int {
     // SAFETY: the trampoline guarantees valid argv/out/out_error.
     let args = unsafe { super::ffi::args(argc, argv) };
@@ -73,10 +85,18 @@ extern "C" fn timer_ctor(
     // Retain the callback (arg0) as a detached value so it can live in the
     // global registry. Object values are resolved against the most recent
     // object-valued script result — the constructor argument.
-    let cb = TjsValue::Object;
-    let retained = match engine.retain_value_detached(&cb) {
+    let retained = match engine.retain_value_detached(&TjsValue::Object) {
         Ok(dv) => dv,
         Err(e) => return error_out(out_error, &format!("Timer: {e}")),
+    };
+    // Retain the timer object itself so `timer_poll` can dispatch its
+    // `onTimer` member (which resolves script-subclass overrides).
+    let owner = match engine.retain_object_detached(objthis) {
+        Ok(dv) => Some(dv),
+        Err(e) => {
+            log::warn!("Timer: cannot retain timer object ({e}); falling back to direct callback");
+            None
+        }
     };
     let id = next_id();
     let mut timers = TIMERS.lock().unwrap_or_else(|p| p.into_inner());
@@ -84,6 +104,7 @@ extern "C" fn timer_ctor(
         id,
         TimerState {
             callback: Some(retained),
+            owner,
             interval_ms: 1000,
             enabled: false,
             next_fire_ms: 0,
@@ -105,11 +126,63 @@ extern "C" fn timer_destroy(_engine: *mut std::ffi::c_void, instance: *mut std::
     if inst.constructed {
         let mut timers = TIMERS.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(state) = timers.remove(&inst.id) {
-            drop(state); // drops the DetachedValue -> releases the callback
+            drop(state); // drops the DetachedValues -> releases callback + object
         }
     }
     // SAFETY: instance came from Box::into_raw.
     unsafe { drop(Box::from_raw(instance as *mut TimerInst)) };
+}
+
+/// The native `onTimer` method: the reference's Timer class exposes
+/// `onTimer` as the event handler that invokes the constructor's callback
+/// (`ActionOwner`). A plain `new Timer(cb)` dispatches here; script
+/// subclasses that override `onTimer` (OnceTimer) never reach this method.
+extern "C" fn timer_on_timer(
+    _engine: *mut std::ffi::c_void,
+    instance: *mut std::ffi::c_void,
+    _argc: std::ffi::c_int,
+    _argv: *const tjs2_sys::Value,
+    out: *mut tjs2_sys::Value,
+    _out_error: *mut *mut std::ffi::c_char,
+    _objthis: *mut std::ffi::c_void,
+) -> std::ffi::c_int {
+    // SAFETY: instance is a valid TimerInst.
+    let inst = unsafe { instance_ref::<TimerInst>(instance) };
+    let engine = super::context_engine();
+    // Take the callback out so the map guard is released before the VM
+    // runs (the callback may register/disable timers).
+    let cb = {
+        let mut timers = TIMERS.lock().unwrap_or_else(|p| p.into_inner());
+        timers.get_mut(&inst.id).and_then(|t| t.callback.take())
+    };
+    if let Some(cb) = cb {
+        let result = engine.call_detached(&cb, &[]);
+        // Put the callback back (unless the timer was destroyed during the
+        // callback, in which case dropping it releases the retained value).
+        let mut timers = TIMERS.lock().unwrap_or_else(|p| p.into_inner());
+        match timers.get_mut(&inst.id) {
+            Some(t) => t.callback = Some(cb),
+            None => drop(cb),
+        }
+        if let Err(e) = result {
+            log::warn!("Timer {}: callback failed ({e}); disabling", inst.id);
+            if let Some(t) = TIMERS
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get_mut(&inst.id)
+            {
+                t.enabled = false;
+            }
+        }
+    }
+    // SAFETY: out is a valid return slot.
+    unsafe {
+        (*out).ty = tjs2_sys::VAL_VOID;
+        (*out).integer = 0;
+        (*out).real = 0.0;
+        (*out).string = std::ptr::null();
+    }
+    0
 }
 
 extern "C" fn timer_interval_get(
@@ -263,10 +336,16 @@ pub(crate) fn register_timer(engine: &Tjs2Engine) -> Result<(), String> {
         name: "Timer",
         create: timer_create,
         destroy: timer_destroy,
-        methods: vec![NativeInstanceMethodDef {
-            name: "Timer",
-            f: timer_ctor_hook,
-        }],
+        methods: vec![
+            NativeInstanceMethodDef {
+                name: "Timer",
+                f: timer_ctor_hook,
+            },
+            NativeInstanceMethodDef {
+                name: "onTimer",
+                f: timer_on_timer,
+            },
+        ],
         properties: vec![
             NativeInstancePropertyDef {
                 name: "id",
@@ -310,14 +389,14 @@ extern "C" fn timer_ctor_hook(
     argv: *const tjs2_sys::Value,
     out: *mut tjs2_sys::Value,
     out_error: *mut *mut std::ffi::c_char,
-    _objthis: *mut std::ffi::c_void,
+    objthis: *mut std::ffi::c_void,
 ) -> std::ffi::c_int {
     // SAFETY: instance is a valid TimerInst.
     let inst = unsafe { instance_ref::<TimerInst>(instance) };
     if inst.constructed {
         return error_out(out_error, "Timer: already constructed");
     }
-    let rc = timer_ctor(engine, argc, argv, out, out_error, std::ptr::null_mut());
+    let rc = timer_ctor(engine, argc, argv, out, out_error, objthis);
     if rc == 0 {
         // SAFETY: timer_ctor wrote the new timer id into *out.
         inst.id = unsafe { (*out).integer } as u32;
@@ -353,17 +432,40 @@ pub(crate) fn timer_poll(engine: &Tjs2Engine, now_ms: u64) {
         if !fire {
             continue;
         }
-        // Take the callback out so the map guard is released before the VM
-        // runs (the callback may register/disable timers).
-        let cb = {
-            let mut timers = TIMERS.lock().unwrap_or_else(|p| p.into_inner());
-            timers.get_mut(&id).and_then(|t| t.callback.take())
+        // Dispatch the timer object's `onTimer` member (the reference posts
+        // an "onTimer" event to the Timer object). The object's class chain
+        // resolves the handler: a script subclass that overrides `onTimer`
+        // (OnceTimer) runs its override; a plain Timer dispatches to the
+        // native method below, which invokes the ctor callback.
+        let owner = {
+            let timers = TIMERS.lock().unwrap_or_else(|p| p.into_inner());
+            timers
+                .get(&id)
+                .and_then(|t| t.owner.as_ref())
+                .map(|o| o.raw_id())
         };
-        let Some(cb) = cb else { continue };
-        match engine.call_detached(&cb, &[]) {
+        let result = match owner {
+            Some(owner_id) => engine.call_member(owner_id, "onTimer", &[]),
+            // No retained object (retain failed): fall back to the callback.
+            None => {
+                let cb = {
+                    let mut timers = TIMERS.lock().unwrap_or_else(|p| p.into_inner());
+                    timers.get_mut(&id).and_then(|t| t.callback.take())
+                };
+                let Some(cb) = cb else { continue };
+                let result = engine.call_detached(&cb, &[]);
+                let mut timers = TIMERS.lock().unwrap_or_else(|p| p.into_inner());
+                match timers.get_mut(&id) {
+                    Some(t) => t.callback = Some(cb),
+                    None => drop(cb),
+                }
+                result
+            }
+        };
+        match result {
             Ok(_) => {}
             Err(e) => {
-                log::warn!("Timer {id}: callback failed ({e}); disabling");
+                log::warn!("Timer {id}: onTimer failed ({e}); disabling");
                 if let Some(t) = TIMERS
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
@@ -372,13 +474,6 @@ pub(crate) fn timer_poll(engine: &Tjs2Engine, now_ms: u64) {
                     t.enabled = false;
                 }
             }
-        }
-        // Put the callback back (unless the timer was destroyed during the
-        // callback, in which case dropping it releases the retained value).
-        let mut timers = TIMERS.lock().unwrap_or_else(|p| p.into_inner());
-        match timers.get_mut(&id) {
-            Some(t) => t.callback = Some(cb),
-            None => drop(cb),
         }
     }
 }

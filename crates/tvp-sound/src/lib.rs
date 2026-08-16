@@ -45,12 +45,14 @@ pub mod decode;
 pub mod mixer;
 pub mod natives;
 pub mod player;
+pub mod wavesound;
 
 mod ffi;
 
 pub use decode::{DecodeError, DecodedAudio, decode_audio, decode_audio_bytes};
 pub use mixer::{Channel, Fade, Mixer};
 pub use natives::register_sound;
+pub use wavesound::sound_poll;
 
 use std::sync::{Arc, LazyLock, Mutex};
 

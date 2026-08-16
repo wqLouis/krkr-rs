@@ -30,10 +30,14 @@ struct Env {
     #[allow(dead_code)]
     storage: Arc<Mutex<Storage>>,
     _dir: TempDir,
+    _vm_lock: std::sync::MutexGuard<'static, ()>,
 }
 
 impl Env {
     fn new() -> Self {
+        let _vm_lock = tvp_visual::natives::vm_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let dir = tempfile::tempdir().expect("temp dir");
         let storage = Arc::new(Mutex::new(
             Storage::mount(dir.path()).expect("mount temp game dir"),
@@ -47,6 +51,7 @@ impl Env {
             scene,
             storage,
             _dir: dir,
+            _vm_lock,
         }
     }
 

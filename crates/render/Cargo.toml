@@ -18,7 +18,9 @@ engine = { path = "../engine" }
 log = "0.4"
 tjs2-sys = { workspace = true }
 tvp-kagparser = { path = "../tvp-kagparser" }
+tvp-input = { path = "../tvp-input" }
 tvp-natives = { path = "../tvp-natives" }
 tvp-scripts = { path = "../tvp-scripts" }
+tvp-sound = { path = "../tvp-sound" }
 tvp-storages = { path = "../tvp-storages" }
 tvp-visual = { path = "../tvp-visual" }

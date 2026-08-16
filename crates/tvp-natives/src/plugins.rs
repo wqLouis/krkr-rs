@@ -122,6 +122,8 @@ pub fn register_plugins(engine: &tjs2_sys::Tjs2Engine) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    use crate::test_lock::vm_lock;
+
     use super::*;
     use tjs2_sys::{Tjs2Engine, TjsValue};
 
@@ -133,6 +135,7 @@ mod tests {
 
     #[test]
     fn link_accepts_dll_names_and_returns_void() {
+        let _vm_lock = vm_lock();
         let e = registered_engine();
         // the startup.tjs idiom: `Plugins.link("extrans.dll");` etc.
         e.exec_script(
@@ -146,6 +149,7 @@ mod tests {
 
     #[test]
     fn unlink_returns_true() {
+        let _vm_lock = vm_lock();
         let e = registered_engine();
         assert_eq!(
             e.eval("Plugins.unlink('extrans.dll')", "test").unwrap(),
@@ -156,6 +160,7 @@ mod tests {
 
     #[test]
     fn get_list_is_void_pending() {
+        let _vm_lock = vm_lock();
         let e = registered_engine();
         // pending FFI: returns void (not an array)
         assert_eq!(e.eval("Plugins.getList()", "test").unwrap(), TjsValue::Void);

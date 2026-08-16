@@ -278,3 +278,62 @@ impl Scene {
 pub struct BitmapCache {
     pub by_name: HashMap<String, u32>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The real title scene's stack z-values (system_status.tjs:
+    /// LAYER_LOGO=110000, LAYER_COVER=150000, LAYER_HINT=210000; content
+    /// layers at 0). The game's own comment "数字が大きいほど手前" (larger =
+    /// closer/front) and the reference's AbsoluteOrderIndex semantics (higher
+    /// index draws later = in front) mean window_layer_order must return
+    /// ascending z, back→front, with insertion order only breaking ties.
+    #[test]
+    fn window_layer_order_real_title_z_values() {
+        let mut scene = Scene::default();
+        let win = scene.add_window("title", (1280, 720));
+        // Insertion order deliberately disagrees with z-order (HINT created
+        // first in MainWindow ctor, then LOGO, then z=0 content).
+        let hint = scene.add_layer(win, None);
+        let logo = scene.add_layer(win, None);
+        let bg = scene.add_layer(win, None);
+        let cover = scene.add_layer(win, None);
+        let art = scene.add_layer(win, None);
+        scene.layer_mut(hint).unwrap().z_order = 210000;
+        scene.layer_mut(logo).unwrap().z_order = 110000;
+        scene.layer_mut(cover).unwrap().z_order = 150000;
+        // bg + art keep z = 0.
+
+        let order = scene.window_layer_order(win);
+        let pos = |id: u32| order.iter().position(|&x| x == id).unwrap();
+        assert_eq!(order.len(), 5);
+        assert!(pos(bg) < pos(art), "equal z keeps insertion order");
+        assert!(
+            pos(art) < pos(logo),
+            "z=0 renders behind LAYER_LOGO (110000)"
+        );
+        assert!(pos(logo) < pos(cover), "110000 renders behind 150000");
+        assert!(pos(cover) < pos(hint), "150000 renders behind 210000");
+        assert_eq!(pos(hint), order.len() - 1, "LAYER_HINT is frontmost");
+    }
+
+    /// Children are excluded from the window render order today —
+    /// hierarchical compositing is a later milestone (documented in
+    /// crates/render/src/sync.rs).
+    #[test]
+    fn window_layer_order_excludes_children() {
+        let mut scene = Scene::default();
+        let win = scene.add_window("t", (1280, 720));
+        let parent = scene.add_layer(win, None);
+        let child = scene.add_layer(win, Some(parent));
+        let sibling = scene.add_layer(win, None);
+        let order = scene.window_layer_order(win);
+        assert!(order.contains(&parent));
+        assert!(order.contains(&sibling));
+        assert!(
+            !order.contains(&child),
+            "parented layers are not rendered yet"
+        );
+    }
+}

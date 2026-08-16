@@ -29,6 +29,8 @@ use engine::loader::LoadReport;
 use krkr_render::sync::{BitmapAssets, SharedScene, sync_scene};
 use tvp_visual::scene::{BitmapState, Rect, Scene};
 
+mod input_bridge;
+
 /// Game logical window size (1280x720, the title screen's native size).
 const GAME_SIZE: (u32, u32) = (1280, 720);
 /// Demo window size (also the game's logical size, 1280x720).
@@ -74,7 +76,7 @@ struct GameConfig {
 /// The running TJS2 VM + its start [`Instant`], inserted by [`game_startup`].
 /// [`run_vm`] polls it every frame for `timer_poll`'s `now_ms`.
 #[derive(Resource)]
-struct VmRuntime {
+pub(crate) struct VmRuntime {
     engine: Arc<tjs2_sys::Tjs2Engine>,
     started: Instant,
 }
@@ -105,6 +107,7 @@ fn game_app(shared: SharedScene, game_dir: PathBuf) -> App {
     app.insert_resource(shared)
         .insert_resource(GameConfig { game_dir })
         .init_resource::<BitmapAssets>()
+        .init_resource::<input_bridge::BridgeState>()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
                 title: "krkr-rs".into(),
@@ -116,7 +119,16 @@ fn game_app(shared: SharedScene, game_dir: PathBuf) -> App {
         .add_systems(Startup, game_startup)
         // run_vm BEFORE sync_scene: script mutations must render the same
         // frame, not one frame later.
-        .add_systems(Update, (run_vm, sync_scene).chain());
+        .add_systems(Update, (run_vm, sync_scene).chain())
+        // Input: Bevy events → tvp-input state → game window script methods.
+        // Chained and ordered after run_vm so the bridge never touches the
+        // single-threaded TJS VM concurrently with the timer polls.
+        .add_systems(
+            Update,
+            (input_bridge::capture_input, input_bridge::dispatch_input)
+                .chain()
+                .after(run_vm),
+        );
     app
 }
 
@@ -211,6 +223,10 @@ fn register_natives(
     tvp_storages::register_storages(engine)?;
     tvp_scripts::register_scripts(engine)?;
     tvp_visual::register_visual(engine, shared.0.clone(), storage.clone())?;
+    // The sound natives: WaveSoundBuffer (the game's SoundBuffer derives
+    // from it) + the fixture SoundBuffer/SoundChannel, backed by the
+    // clock-driven mixer.
+    tvp_sound::register_sound(engine, storage.clone())?;
     tvp_storages::set_storage(Some(storage.clone()));
     tvp_scripts::set_context(Some(engine.clone()), Some(storage.clone()));
     Ok(())
@@ -225,6 +241,10 @@ fn run_vm(vm: Res<VmRuntime>) {
         tvp_natives::async_trigger_poll(&vm.engine);
         tvp_visual::timer_poll(&vm.engine, now_ms);
         tvp_natives::continuous_handler_poll(&vm.engine);
+        // Sound: advance the mixer and deliver onStatusChanged /
+        // onFadeCompleted to live WaveSoundBuffer objects (a panic inside a
+        // script handler is caught below like the other polls).
+        tvp_sound::sound_poll(&vm.engine, now_ms as f64 / 1000.0);
     }));
     if let Err(payload) = result {
         log::error!(
@@ -726,5 +746,80 @@ mod tests {
         ["does not exist", "identifier not found"]
             .iter()
             .any(|pat| err.contains(pat))
+    }
+
+    /// Real-game headless timer-loop test: drive the KAG-style event loop
+    /// (`run_vm`: async triggers + timers + continuous handlers) for a few
+    /// wall-clock seconds and check the scene actually advances (the Logo
+    /// scene constructed at startup closes itself after its keyframe
+    /// animation and the SceneManager's 100 ms `onWaitSceneChange` timer
+    /// switches to the Title scene). No update may panic, and the scene
+    /// must change between the first and last dump.
+    ///
+    /// Requires the real game at `/mnt/DATA/Games/Others/test`; run with:
+    /// `cargo test -p render -- --ignored real_game_timer_loop_advances_scene`
+    #[test]
+    #[ignore = "needs the real game at /mnt/DATA/Games/Others/test (not in the repo); drives real-time timers, so it is slow"]
+    fn real_game_timer_loop_advances_scene() {
+        let game = PathBuf::from("/mnt/DATA/Games/Others/test");
+        assert!(game.is_dir(), "real game dir must exist for this test");
+        let shared = SharedScene(Arc::new(RwLock::new(Scene::default())));
+
+        let mut app = headless_game_app(shared.clone(), game);
+        app.update(); // Startup (prepare + register + startup.tjs) + first Update
+
+        let scene = shared.0.read().expect("shared scene lock poisoned");
+        let baseline = dump_scene(&scene);
+        let baseline_bitmaps: Vec<String> = scene
+            .bitmaps
+            .iter()
+            .filter_map(|b| b.name.clone())
+            .collect();
+        drop(scene);
+
+        // Drive ~18 s of wall-clock game time (the timers use the real
+        // elapsed clock, so we must actually wait). The logo scene's
+        // keyframe chain (OnceCall 1s + fades + OnceCall 3s/8s) takes
+        // ~13s before the SceneManager switches to the Title scene.
+        let mut last_dump = baseline.clone();
+        for i in 0..180 {
+            std::thread::sleep(Duration::from_millis(100));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| app.update()));
+            eprintln!("[tick-dbg] {i} done");
+            assert!(result.is_ok(), "app.update() panicked at tick {i}");
+            if i % 30 == 29 {
+                let scene = shared.0.read().unwrap();
+                let dump = dump_scene(&scene);
+                if dump != last_dump {
+                    println!("tick {i}: scene changed\n{dump}");
+                    last_dump = dump;
+                }
+            }
+        }
+
+        let scene = shared.0.read().unwrap();
+        let final_dump = dump_scene(&scene);
+        let final_bitmaps: Vec<String> = scene
+            .bitmaps
+            .iter()
+            .filter_map(|b| b.name.clone())
+            .collect();
+        drop(scene);
+        println!("final scene:\n{final_dump}");
+
+        // The Logo scene must have closed itself and the manager switched
+        // to the Title scene: the layer set (and typically the bitmap set)
+        // must differ from the startup baseline.
+        assert!(
+            final_dump != baseline,
+            "scene never changed over the timer loop (Logo never closed, \
+             SceneManager.onWaitSceneChange never fired)"
+        );
+        // Sanity: the game's scene layer ids are stable, so a different
+        // dump means a real transition, not churn.
+        assert!(
+            baseline_bitmaps.iter().any(|n| final_bitmaps.contains(n)),
+            "bitmap set changed completely; unexpected teardown"
+        );
     }
 }

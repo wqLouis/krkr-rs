@@ -790,6 +790,123 @@ native_pending!(
 
 /// Register the `Storages` native class on `engine` (static methods only,
 /// matching the current tjs2-sys milestone).
+/// Resolve a storage name to a local disk path (the game passes
+/// `System.dataPath + name`, i.e. absolute paths under the game dir).
+fn disk_path(name: &str) -> String {
+    let normalized = normalize_storage_name(name);
+    let Some(storage) = storage_arc() else {
+        return normalized;
+    };
+    let game_dir = storage.lock().unwrap().game_dir().to_path_buf();
+    let disk = disk_entries(&game_dir);
+    for (n, is_dir, path) in disk {
+        if !is_dir && n == normalized {
+            return path.to_string_lossy().into_owned();
+        }
+    }
+    // Not a mounted disk file: use the name as given (absolute path or
+    // game-dir-relative), like the reference's TVPGetLocallyAccessibleName.
+    let p = std::path::Path::new(&normalized);
+    if p.is_absolute() {
+        normalized
+    } else {
+        game_dir.join(&normalized).to_string_lossy().into_owned()
+    }
+}
+
+/// `Storages.deleteFile(name)` — remove a disk file (save data cleanup;
+/// the reference exposes this via the fstat plugin's Storages patch).
+extern "C" fn native_delete_file(
+    _engine: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    // SAFETY: the trampoline guarantees argv/out/out_error validity.
+    let args = unsafe { args(argc, argv) };
+    let name = match expect_string_arg(args, "deleteFile") {
+        Ok(n) => n,
+        Err(msg) => {
+            set_error(out_error, &msg);
+            return 1;
+        }
+    };
+    let path = disk_path(&name);
+    match std::fs::remove_file(&path) {
+        Ok(()) => {
+            set_void_out(out);
+            0
+        }
+        Err(e) => {
+            // The reference returns false (no exception) when the file is
+            // missing; propagate a message otherwise.
+            if e.kind() == std::io::ErrorKind::NotFound {
+                set_void_out(out);
+                0
+            } else {
+                set_error(out_error, &format!("Storages.deleteFile: {e}"));
+                1
+            }
+        }
+    }
+}
+
+/// `Storages.copyFile(from, to, failIfExist=false)` — copy a disk file
+/// (save-data copy/move; the reference exposes this via fstat's Storages
+/// patch: `TVPCopyFile(from, to)` with `failIfExist`).
+extern "C" fn native_copy_file(
+    _engine: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    // SAFETY: the trampoline guarantees argv/out/out_error validity.
+    let args = unsafe { args(argc, argv) };
+    if args.len() < 2 {
+        set_error(out_error, "Storages.copyFile requires 2 arguments");
+        return 1;
+    }
+    let from = match arg_str(&args[0]) {
+        Some(n) => n,
+        None => {
+            set_error(out_error, "Storages.copyFile: from must be a string");
+            return 1;
+        }
+    };
+    let to = match arg_str(&args[1]) {
+        Some(n) => n,
+        None => {
+            set_error(out_error, "Storages.copyFile: to must be a string");
+            return 1;
+        }
+    };
+    let fail_if_exist = args
+        .get(2)
+        .map(|v| matches!(v.ty, VAL_INTEGER if v.integer != 0))
+        .unwrap_or(false);
+    let from_path = disk_path(&from);
+    let to_path = disk_path(&to);
+    if fail_if_exist && std::path::Path::new(&to_path).exists() {
+        set_error(
+            out_error,
+            &format!("Storages.copyFile: destination already exists: {to}"),
+        );
+        return 1;
+    }
+    match std::fs::copy(&from_path, &to_path) {
+        Ok(_) => {
+            set_void_out(out);
+            0
+        }
+        Err(e) => {
+            set_error(out_error, &format!("Storages.copyFile: {e}"));
+            1
+        }
+    }
+}
+
 pub fn register_storages(engine: &Tjs2Engine) -> Result<(), String> {
     csv_parser::register_csv_parser(engine)?;
     let builder = NativeClassBuilder {
@@ -860,6 +977,14 @@ pub fn register_storages(engine: &Tjs2Engine) -> Result<(), String> {
                 name: "selectFile",
                 f: native_select_file,
             },
+            NativeMethodDef {
+                name: "copyFile",
+                f: native_copy_file,
+            },
+            NativeMethodDef {
+                name: "deleteFile",
+                f: native_delete_file,
+            },
         ],
     };
     engine.register_native_class(&builder)
@@ -870,7 +995,21 @@ pub fn register_storages(engine: &Tjs2Engine) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+pub(crate) mod test_lock {
+    /// The TJS2 VM is single-threaded and the storages natives keep a
+    /// process-global engine context; parallel tests race on it
+    /// (segfault). Serialize with one process-wide lock.
+    static VM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    pub(crate) fn vm_lock() -> std::sync::MutexGuard<'static, ()> {
+        VM_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    use crate::test_lock::vm_lock;
+
     use super::*;
     use std::fs;
     use tjs2_sys::{Tjs2Engine, TjsValue};
@@ -938,7 +1077,79 @@ mod tests {
     }
 
     #[test]
+    fn copy_and_delete_file_on_disk() {
+        let _vm_lock = vm_lock();
+        reset_globals();
+        let (dir, path) = mount_game(&[("save01.bmp", "save-data-bytes"), ("savedata/", "")]);
+        let engine = engine_with_storages();
+        let game = format!("{}/", path.to_string_lossy().replace('\\', "/"));
+
+        // deleteFile on an existing file (absolute game-dir path, like the
+        // game's `Storages.deleteFile(DATA_PATH + name)`)
+        let r = engine
+            .eval(
+                &format!(
+                    "Storages.deleteFile({})",
+                    js_str(&format!("{game}save01.bmp"))
+                ),
+                "t",
+            )
+            .unwrap();
+        assert_eq!(r, TjsValue::Void);
+        assert!(!dir.path().join("save01.bmp").exists());
+
+        // deleteFile on a missing file is not an error (fstat semantics)
+        let r = engine
+            .eval(
+                &format!(
+                    "Storages.deleteFile({})",
+                    js_str(&format!("{game}nope.bmp"))
+                ),
+                "t",
+            )
+            .unwrap();
+        assert_eq!(r, TjsValue::Void);
+
+        // copyFile creates a destination file
+        fs::write(dir.path().join("src.bmp"), "hello").unwrap();
+        let r = engine
+            .eval(
+                &format!(
+                    "Storages.copyFile({}, {}, false)",
+                    js_str(&format!("{game}src.bmp")),
+                    js_str(&format!("{game}savedata/dst.bmp"))
+                ),
+                "t",
+            )
+            .unwrap();
+        assert_eq!(r, TjsValue::Void);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("savedata/dst.bmp")).unwrap(),
+            "hello"
+        );
+
+        // failIfExist=true refuses to overwrite (raises a TJS error)
+        let err = engine
+            .eval(
+                &format!(
+                    "Storages.copyFile({0}, {1}, true)",
+                    js_str(&format!("{game}src.bmp")),
+                    js_str(&format!("{game}savedata/dst.bmp"))
+                ),
+                "t",
+            )
+            .err();
+        assert!(err.is_some(), "failIfExist=true should raise");
+        // destination still intact
+        assert_eq!(
+            fs::read_to_string(dir.path().join("savedata/dst.bmp")).unwrap(),
+            "hello"
+        );
+    }
+
+    #[test]
     fn normalize_storage_name_lowercases_and_replaces_backslashes() {
+        let _vm_lock = vm_lock();
         assert_eq!(
             normalize_storage_name(r"Data\BG\Title.jpg"),
             "data/bg/title.jpg"
@@ -952,6 +1163,7 @@ mod tests {
 
     #[test]
     fn wildcard_match_semantics() {
+        let _vm_lock = vm_lock();
         assert!(wildcard_match("*", "anything"));
         assert!(wildcard_match("*", ""));
         assert!(wildcard_match("", ""));
@@ -970,6 +1182,7 @@ mod tests {
 
     #[test]
     fn is_existent_storage_disk_and_mixed_case() {
+        let _vm_lock = vm_lock();
         reset_globals();
         let (_dir, _) = mount_game(&[
             ("startup.tjs", "System.init"),
@@ -998,6 +1211,7 @@ mod tests {
 
     #[test]
     fn get_file_list_wildcards_and_attrs() {
+        let _vm_lock = vm_lock();
         reset_globals();
         let (_dir, _) = mount_game(&[
             ("a.tjs", "1"),
@@ -1047,6 +1261,7 @@ mod tests {
 
     #[test]
     fn auto_path_add_remove_and_lookup() {
+        let _vm_lock = vm_lock();
         reset_globals();
         let (_game, _) = mount_game(&[("startup.tjs", "s")]);
         let auto = TempDir::new("auto");
@@ -1090,6 +1305,7 @@ mod tests {
 
     #[test]
     fn get_local_name_disk_and_not_found() {
+        let _vm_lock = vm_lock();
         reset_globals();
         let (_dir, _) = mount_game(&[("startup.tjs", "s"), ("Data/BG.png", "img")]);
         let engine = engine_with_storages();
@@ -1122,6 +1338,7 @@ mod tests {
 
     #[test]
     fn string_helpers_match_reference() {
+        let _vm_lock = vm_lock();
         reset_globals();
         let engine = engine_with_storages();
         let eval = |expr: &str| engine.eval(expr, "t").unwrap();
@@ -1160,6 +1377,7 @@ mod tests {
 
     #[test]
     fn pending_methods_raise_clear_errors() {
+        let _vm_lock = vm_lock();
         reset_globals();
         let engine = engine_with_storages();
         for expr in [

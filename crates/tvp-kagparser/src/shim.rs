@@ -1,12 +1,18 @@
 //! The script-side wrapper for the `KAGParser` native class.
 //!
-//! The tjs2-sys C ABI can only marshal void/int/real/string values across
-//! the native boundary, so the native returns *strings* where the
-//! reference returns TJS dictionaries (see [`crate`]). This module embeds
-//! the TJS code that decodes those strings back into dictionaries and
-//! wraps the native in a class exposing the reference-shaped surface:
-//! `getNextTag()` returning a dictionary, and the property-style members
-//! (`ignoreCR`, `processSpecialTags`, `macros`, `curLine`, ...).
+//! The native `KAGParser` now returns *real* TJS dictionaries (see
+//! [`crate`]), so `getNextTag()` produces `%["tagname":"ch","text":"H"]`
+//! directly and `getMacros`/`macros` return a live `Dictionary`. The only
+//! thing an ABI string-encoding could not do was receive an *object*
+//! argument, but the object-return side (which the game uses) works.
+//!
+//! This module keeps an optional `KAGParserCompat` **delegating** wrapper
+//! class that exposes the reference's property-style surface (`ignoreCR`,
+//! `processSpecialTags`, `curLine`, ...) as TJS properties and forwards the
+//! dict-returning methods straight through. The shipped game does **not**
+//! use this wrapper — it subclasses `KAGParser` directly via
+//! `super.KAGParser()` (now supported) — so this is purely a convenience /
+//! test surface.
 //!
 //! # Usage
 //!
@@ -16,78 +22,21 @@
 //! p.ignoreCR = true;
 //! p.processSpecialTags = true;
 //! p.loadScenario("scenario/01_01.ks");
-//! var tag = p.getNextTag();   // a dictionary, e.g. %["tagname":"ch","text":"H"]
+//! var tag = p.getNextTag();   // a dictionary: %["tagname":"ch","text":"H"]
 //! if (tag === void) { /* end of scenario */ }
 //! ```
-//!
-//! The wrapper is a *delegating* class, not a subclass: the current C ABI
-//! cannot create the native instance for `class X extends KAGParser`
-//! objects (there is no constructor member that would run
-//! `super.KAGParser()`), so `KAGParserCompat` owns a private `KAGParser`
-//! and forwards every call.
 
-/// TJS code installing the parser helpers and the `KAGParserCompat`
-/// wrapper class on the global object.
-pub const INSTALL_WRAPPER: &str = r#"// KAGParser string-encoding helpers + property wrapper (krkr-rs).
-function parseKAGField(s){
-	var r = "";
-	for(var i = 0; i < s.length; i++){
-		var c = s.charAt(i);
-		if(c == "\\" && i + 1 < s.length){
-			i++;
-			var n = s.charAt(i);
-			if(n == "n") r += "\n";
-			else if(n == "r") r += "\r";
-			else r += n;
-		}else{
-			r += c;
-		}
-	}
-	return r;
-}
-function encodeKAGField(s){
-	var r = "";
-	for(var i = 0; i < s.length; i++){
-		var c = s.charAt(i);
-		if(c == "\\") r += "\\\\";
-		else if(c == "\n") r += "\\n";
-		else if(c == "\r") r += "\\r";
-		else r += c;
-	}
-	return r;
-}
-function parseKAGDict(s){
-	var d = new Dictionary();
-	if(s === void || s == "") return d;
-	var lines = s.split("\n");
-	for(var i = 0; i < lines.length; i++){
-		var eq = lines[i].indexOf("=");
-		d[parseKAGField(lines[i].substr(0, eq))] = parseKAGField(lines[i].substr(eq + 1));
-	}
-	return d;
-}
-// NOTE: this TJS2 fork's grammar has NO for-in statement and Dictionary
-// exposes no key enumeration, so a script-side Dictionary cannot be
-// serialized. The macros surface therefore uses raw strings (see the
-// KAGParserCompat property below); the KAGParserEx.dll plugin that real
-// games use for dictionary scenarios is stubbed in krkr-rs anyway.
-function parseKAGTag(s){
-	if(s === void) return void;
-	var d = new Dictionary();
-	var lines = s.split("\n");
-	d.tagname = parseKAGField(lines[0]);
-	for(var i = 1; i < lines.length; i++){
-		var eq = lines[i].indexOf("=");
-		d[parseKAGField(lines[i].substr(0, eq))] = parseKAGField(lines[i].substr(eq + 1));
-	}
-	return d;
-}
+/// TJS code installing the `KAGParserCompat` wrapper class on the global
+/// object.
+pub const INSTALL_WRAPPER: &str = r#"// KAGParserCompat property wrapper (krkr-rs).
+// The native returns real TJS dictionaries for object-shaped results, so
+// the wrapper forwards them directly — no string decoding is needed.
 class KAGParserCompat {
 	var _p;
 	function KAGParserCompat(){
 		_p = new KAGParser();
 	}
-	function getNextTag(){ return parseKAGTag(_p.getNextTag()); }
+	function getNextTag(){ return _p.getNextTag(); }
 	function loadScenario(n){ return _p.loadScenario(n); }
 	function goToLabel(n){ return _p.goToLabel(n); }
 	function callLabel(n){ return _p.callLabel(n); }
@@ -105,10 +54,10 @@ class KAGParserCompat {
 	function getCurStorage(){ return _p.getCurStorage(); }
 	function setCurStorage(n){ return _p.setCurStorage(n); }
 	function getCurLabel(){ return _p.getCurLabel(); }
-	function getMacros(){ return parseKAGDict(_p.getMacros()); }
-	function setMacros(d){ return _p.setMacros(encodeKAGDict(d)); }
-	function getMacroParams(){ return parseKAGDict(_p.getMacroParams()); }
-	function getMP(){ return parseKAGDict(_p.getMP()); }
+	function getMacros(){ return _p.getMacros(); }
+	function setMacros(d){ return _p.setMacros(d); }
+	function getMacroParams(){ return _p.getMacroParams(); }
+	function getMP(){ return _p.getMP(); }
 	function getDebugLevel(){ return _p.getDebugLevel(); }
 	function setDebugLevel(v){ return _p.setDebugLevel(v); }
 	property ignoreCR {
@@ -126,16 +75,12 @@ class KAGParserCompat {
 	property curLine { getter{ return _p.getCurLine(); } }
 	property curPos { getter{ return _p.getCurPos(); } }
 	property curLineStr { getter{ return _p.getCurLineStr(); } }
-	// macros/macroParams are raw "k=v\n..." strings: this TJS2 fork cannot
-	// enumerate Dictionary members (no for-in), so object round-trips are
-	// unsupported (the game's dictionary scenarios go through the stubbed
-	// KAGParserEx.dll plugin).
 	property macros {
 		getter{ return _p.getMacros(); }
 		setter(v){ return _p.setMacros(v); }
 	}
 	property macroParams { getter{ return _p.getMacroParams(); } }
-	property mp { getter{ return parseKAGDict(_p.getMP()); } }
+	property mp { getter{ return _p.getMP(); } }
 	property callStackDepth { getter{ return _p.getCallStackDepth(); } }
 	property curStorage {
 		getter{ return _p.getCurStorage(); }

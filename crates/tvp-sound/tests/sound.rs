@@ -1,10 +1,11 @@
 //! Headless integration tests for tvp-sound: decode, the clock-driven
 //! mixer, and the SoundBuffer/SoundChannel native classes end-to-end.
 //!
-//! The TJS2 VM is not thread-safe, so these must run with
-//! `--test-threads=1` (workspace convention); each test creates its own
-//! engine and re-registers the natives (which installs a fresh global
-//! mixer, so the global clock starts at 0 for every test).
+//! The TJS2 VM is not thread-safe and the natives install a process-global
+//! mixer, so the tests serialize themselves with one process-wide lock
+//! (each test still creates its own engine and re-registers the natives,
+//! which installs a fresh global mixer, so the global clock starts at 0
+//! for every test).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -15,8 +16,16 @@ use tjs2_sys::{Tjs2Engine, TjsValue};
 use tvp_sound::{advance, decode_audio, register_sound};
 
 // ---------------------------------------------------------------------------
-// helpers
+// serialization + helpers
 // ---------------------------------------------------------------------------
+
+/// One process-wide lock serializing every test: the TJS2 VM and the
+/// global mixer are not thread-safe.
+static VM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn vm_lock() -> std::sync::MutexGuard<'static, ()> {
+    VM_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+}
 
 /// A unique temp directory that removes itself on drop.
 struct TestDir(PathBuf);
@@ -96,6 +105,7 @@ fn mounted(dir: &TestDir, name: &str, bytes: &[u8]) -> Arc<Mutex<Storage>> {
 
 #[test]
 fn decode_wav_sine_amplitude_and_frequency() {
+    let _vm_lock = vm_lock();
     let dir = TestDir::new();
     let storage = mounted(&dir, "test.wav", &sine_wav_bytes(44100, 1, 440.0, 1.0));
 
@@ -121,6 +131,7 @@ fn decode_wav_sine_amplitude_and_frequency() {
 
 #[test]
 fn decode_wav_stereo_interleaves() {
+    let _vm_lock = vm_lock();
     let dir = TestDir::new();
     let storage = mounted(&dir, "stereo.wav", &sine_wav_bytes(22050, 2, 330.0, 0.5));
 
@@ -138,6 +149,7 @@ fn decode_wav_stereo_interleaves() {
 
 #[test]
 fn decode_missing_file_errors() {
+    let _vm_lock = vm_lock();
     let dir = TestDir::new();
     let storage = mounted(&dir, "a.wav", &sine_wav_bytes(44100, 1, 440.0, 0.1));
 
@@ -151,6 +163,7 @@ fn decode_missing_file_errors() {
 
 #[test]
 fn decode_garbage_bytes_errors() {
+    let _vm_lock = vm_lock();
     let dir = TestDir::new();
     let storage = mounted(&dir, "junk.wav", b"this is not audio at all........");
     let err = decode_audio(&storage, "junk.wav").unwrap_err();
@@ -161,6 +174,7 @@ fn decode_garbage_bytes_errors() {
 /// (with a log line) when ffmpeg is unavailable.
 #[test]
 fn decode_ogg_vorbis_fixture() {
+    let _vm_lock = vm_lock();
     let dir = TestDir::new();
     let src = dir.path().join("src.wav");
     let ogg = dir.path().join("tone.ogg");
@@ -193,6 +207,7 @@ fn decode_ogg_vorbis_fixture() {
 
 #[test]
 fn soundbuffer_decodes_from_storage() {
+    let _vm_lock = vm_lock();
     let dir = TestDir::new();
     let storage = mounted(&dir, "test.wav", &sine_wav_bytes(44100, 1, 440.0, 1.0));
     let e = Tjs2Engine::new().unwrap();
@@ -226,6 +241,7 @@ fn soundbuffer_decodes_from_storage() {
 
 #[test]
 fn soundbuffer_unloaded_state() {
+    let _vm_lock = vm_lock();
     let dir = TestDir::new();
     let storage = mounted(&dir, "a.wav", &sine_wav_bytes(44100, 1, 440.0, 0.1));
     let e = Tjs2Engine::new().unwrap();
@@ -245,6 +261,7 @@ fn soundbuffer_unloaded_state() {
 
 #[test]
 fn soundbuffer_open_missing_file_throws() {
+    let _vm_lock = vm_lock();
     let dir = TestDir::new();
     let storage = mounted(&dir, "a.wav", &sine_wav_bytes(44100, 1, 440.0, 0.1));
     let e = Tjs2Engine::new().unwrap();
@@ -266,6 +283,7 @@ fn soundbuffer_open_missing_file_throws() {
 
 #[test]
 fn channel_play_advance_position_and_done() {
+    let _vm_lock = vm_lock();
     let dir = TestDir::new();
     let storage = mounted(&dir, "one.wav", &sine_wav_bytes(44100, 1, 440.0, 1.0));
     let e = Tjs2Engine::new().unwrap();
@@ -321,6 +339,7 @@ fn channel_play_advance_position_and_done() {
 
 #[test]
 fn channel_loop_wraps_position() {
+    let _vm_lock = vm_lock();
     let dir = TestDir::new();
     let storage = mounted(&dir, "one.wav", &sine_wav_bytes(44100, 1, 440.0, 1.0));
     let e = Tjs2Engine::new().unwrap();
@@ -360,6 +379,7 @@ fn channel_loop_wraps_position() {
 
 #[test]
 fn channel_pause_resume_stop_and_status() {
+    let _vm_lock = vm_lock();
     let dir = TestDir::new();
     let storage = mounted(&dir, "two.wav", &sine_wav_bytes(44100, 1, 220.0, 2.0));
     let e = Tjs2Engine::new().unwrap();
@@ -412,6 +432,7 @@ fn channel_pause_resume_stop_and_status() {
 
 #[test]
 fn channel_volume_pan_clamp_and_source_switch() {
+    let _vm_lock = vm_lock();
     let dir = TestDir::new();
     std::fs::write(
         dir.path().join("one.wav"),
@@ -491,6 +512,7 @@ fn channel_volume_pan_clamp_and_source_switch() {
 
 #[test]
 fn channel_play_by_name_and_by_id() {
+    let _vm_lock = vm_lock();
     let dir = TestDir::new();
     let storage = mounted(&dir, "one.wav", &sine_wav_bytes(44100, 1, 440.0, 1.0));
     let e = Tjs2Engine::new().unwrap();
@@ -522,6 +544,7 @@ fn channel_play_by_name_and_by_id() {
 
 #[test]
 fn channel_fade_ramps_volume() {
+    let _vm_lock = vm_lock();
     let dir = TestDir::new();
     let storage = mounted(&dir, "two.wav", &sine_wav_bytes(44100, 1, 220.0, 2.0));
     let e = Tjs2Engine::new().unwrap();
@@ -559,6 +582,7 @@ fn channel_fade_ramps_volume() {
 
 #[test]
 fn channel_set_volume_cancels_fade() {
+    let _vm_lock = vm_lock();
     let dir = TestDir::new();
     let storage = mounted(&dir, "two.wav", &sine_wav_bytes(44100, 1, 220.0, 2.0));
     let e = Tjs2Engine::new().unwrap();
@@ -585,6 +609,7 @@ fn channel_set_volume_cancels_fade() {
 
 #[test]
 fn channel_play_errors() {
+    let _vm_lock = vm_lock();
     let dir = TestDir::new();
     let storage = mounted(&dir, "a.wav", &sine_wav_bytes(44100, 1, 440.0, 0.1));
     let e = Tjs2Engine::new().unwrap();

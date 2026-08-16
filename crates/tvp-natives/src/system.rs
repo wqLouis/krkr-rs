@@ -111,6 +111,15 @@ extern "C" fn native_inform(
     0
 }
 
+/// Milliseconds since the first call (the reference's
+/// `TVPGetTickCount`/`TVPStartTickCount`); shared by `System.getTickCount`
+/// and the continuous-handler delivery so handlers see the same clock as
+/// the scripts.
+fn tick_count_ms() -> i64 {
+    let epoch = TICK_EPOCH.get_or_init(Instant::now);
+    epoch.elapsed().as_millis() as i64
+}
+
 /// `System.getTickCount()` → milliseconds since an arbitrary epoch (the
 /// first call), like the reference's `TVPGetTickCount`/`TVPStartTickCount`.
 extern "C" fn native_get_tick_count(
@@ -120,8 +129,7 @@ extern "C" fn native_get_tick_count(
     out: *mut Value,
     _out_error: *mut *mut c_char,
 ) -> c_int {
-    let epoch = TICK_EPOCH.get_or_init(Instant::now);
-    set_int_out(out, epoch.elapsed().as_millis() as i64);
+    set_int_out(out, tick_count_ms());
     0
 }
 
@@ -418,18 +426,23 @@ extern "C" fn system_do_compact(
 /// semantics).
 static CONTINUOUS_HANDLERS: Mutex<Vec<tjs2_sys::DetachedValue>> = Mutex::new(Vec::new());
 
-/// Advance every continuous handler once; returns whether any remain.
+/// Advance every continuous handler once, passing the current tick count
+/// (ms) as the handler's single argument — the reference
+/// (`TVPDeliverContinuousEvent` in EventIntf.cpp) calls each handler with
+/// `tick = TVPGetTickCount()`. A handler that raises a TJS error is
+/// removed (also matching the reference); the return value is ignored.
+/// Returns whether any remain.
 pub fn continuous_handler_poll(engine: &tjs2_sys::Tjs2Engine) -> bool {
+    let tick = tick_count_ms();
     let mut handlers = CONTINUOUS_HANDLERS
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     let taken = std::mem::take(&mut *handlers);
     let mut rest = Vec::with_capacity(taken.len());
     for h in taken {
-        let keep = !matches!(
-            engine.call_detached(&h, &[]),
-            Ok(tjs2_sys::TjsValue::Integer(0))
-        );
+        let keep = engine
+            .call_detached(&h, &[tjs2_sys::TjsValue::Integer(tick)])
+            .is_ok();
         if keep {
             rest.push(h);
         }
@@ -483,10 +496,12 @@ extern "C" fn native_remove_continuous_handler(
         );
     }
     let engine = crate::context_engine();
-    // Retain the arg to get its id, then drop any handler with that id
-    // (release semantics make the comparison by raw id).
-    if let Ok(dv) = engine.retain_value_detached(&tjs2_sys::TjsValue::Object) {
-        let id = dv.raw_id();
+    // Match by script-value identity, not raw id: every `retain_value`
+    // call allocates a fresh id, so the same function registered by
+    // addContinuousHandler and passed to removeContinuousHandler would
+    // never compare equal by id. find_retained_id finds the existing map
+    // entry for the same closure without retaining anything new.
+    if let Some(id) = engine.find_retained_id(&tjs2_sys::TjsValue::Object) {
         let mut handlers = CONTINUOUS_HANDLERS
             .lock()
             .unwrap_or_else(|p| p.into_inner());

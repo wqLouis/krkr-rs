@@ -11,11 +11,14 @@ pub const CONSTANTS_SCRIPT: &str = r#"const bsNone=0, bsSingle=1, bsSizeable=2, 
 
 #[cfg(test)]
 mod tests {
+    use crate::test_lock::vm_lock;
+
     use super::*;
     use tjs2_sys::Tjs2Engine;
 
     #[test]
     fn constants_parse_and_evaluate() {
+        let _vm_lock = vm_lock();
         let e = Tjs2Engine::new().unwrap();
         e.exec_script(CONSTANTS_SCRIPT, "constants").unwrap();
         assert_eq!(

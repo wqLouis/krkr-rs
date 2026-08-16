@@ -243,8 +243,21 @@ pub(crate) fn set_void_out(out: *mut Value) {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+pub(crate) mod test_lock {
+    /// The natives register a process-global VM context; parallel tests
+    /// race on it (segfault). Serialize with one process-wide lock; other
+    /// crates stay fully parallel.
+    static VM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    pub(crate) fn vm_lock() -> std::sync::MutexGuard<'static, ()> {
+        VM_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_lock::vm_lock;
     use tjs2_sys::TjsValue;
 
     fn registered_engine() -> Tjs2Engine {
@@ -257,6 +270,7 @@ mod tests {
 
     #[test]
     fn system_set_and_get_argument_roundtrip() {
+        let _vm_lock = vm_lock();
         let e = registered_engine();
         e.exec_script("System.setArgument('-foo', 'bar');", "test")
             .unwrap();
@@ -275,6 +289,7 @@ mod tests {
 
     #[test]
     fn system_get_argument_returns_default_when_missing() {
+        let _vm_lock = vm_lock();
         let e = registered_engine();
         assert_eq!(
             e.eval("System.getArgument('-missing', 'dflt')", "test")
@@ -291,6 +306,7 @@ mod tests {
 
     #[test]
     fn system_get_argument_missing_without_default_is_void() {
+        let _vm_lock = vm_lock();
         let e = registered_engine();
         // reference behavior: `result->Clear()` when the argument is absent
         assert_eq!(
@@ -301,6 +317,7 @@ mod tests {
 
     #[test]
     fn system_bad_param_count_is_catchable() {
+        let _vm_lock = vm_lock();
         let e = registered_engine();
         e.exec_script(
             "var r = ''; try { System.getArgument(); } catch(e) { r = 'caught'; }",
@@ -317,6 +334,7 @@ mod tests {
 
     #[test]
     fn system_inform_does_not_crash() {
+        let _vm_lock = vm_lock();
         let e = registered_engine();
         assert_eq!(
             e.eval("System.inform('x')", "test").unwrap(),
@@ -331,6 +349,7 @@ mod tests {
 
     #[test]
     fn system_get_tick_count_returns_non_negative_integer() {
+        let _vm_lock = vm_lock();
         let e = registered_engine();
         match e.eval("System.getTickCount()", "test").unwrap() {
             TjsValue::Integer(v) => assert!(v >= 0, "tick count must be >= 0, got {v}"),
@@ -340,6 +359,7 @@ mod tests {
 
     #[test]
     fn system_stubs_return_their_reference_types() {
+        let _vm_lock = vm_lock();
         let e = registered_engine();
         assert_eq!(
             e.eval("System.getKeyState(1)", "test").unwrap(),
@@ -370,6 +390,7 @@ mod tests {
 
     #[test]
     fn debug_message_then_get_last_log() {
+        let _vm_lock = vm_lock();
         let e = registered_engine();
         assert_eq!(
             e.eval("Debug.message('hi')", "test").unwrap(),
@@ -383,6 +404,7 @@ mod tests {
 
     #[test]
     fn debug_message_joins_multiple_arguments() {
+        let _vm_lock = vm_lock();
         let e = registered_engine();
         e.exec_script("Debug.message('a', 'b', 'c');", "test")
             .unwrap();
@@ -394,6 +416,7 @@ mod tests {
 
     #[test]
     fn debug_get_last_log_lines_parameter() {
+        let _vm_lock = vm_lock();
         let e = registered_engine();
         e.exec_script("Debug.message('one'); Debug.message('two');", "test")
             .unwrap();
@@ -409,6 +432,7 @@ mod tests {
 
     #[test]
     fn debug_log_as_error_toggles_message_level() {
+        let _vm_lock = vm_lock();
         install_capture_logger();
         CAPTURED.lock().unwrap().clear();
         let e = registered_engine();
@@ -432,6 +456,7 @@ mod tests {
 
     #[test]
     fn debug_start_log_to_file_appends() {
+        let _vm_lock = vm_lock();
         let e = registered_engine();
         let path = "tvp_natives_test_log.txt";
         let _ = std::fs::remove_file(path);

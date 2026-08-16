@@ -78,16 +78,16 @@ use crate::mixer::{Mixer, lock_ok};
 /// VM thread; the VM is single-threaded, so a thread-local is sufficient
 /// (the crate tests use `--test-threads=1` for the same reason).
 #[derive(Clone)]
-struct NativeContext {
-    storage: Arc<Mutex<Storage>>,
-    mixer: Arc<Mutex<Mixer>>,
+pub(crate) struct NativeContext {
+    pub(crate) storage: Arc<Mutex<Storage>>,
+    pub(crate) mixer: Arc<Mutex<Mixer>>,
 }
 
 thread_local! {
     static NATIVE_CTX: RefCell<Option<NativeContext>> = const { RefCell::new(None) };
 }
 
-fn native_ctx() -> Option<NativeContext> {
+pub(crate) fn native_ctx() -> Option<NativeContext> {
     NATIVE_CTX.with(|c| c.borrow().clone())
 }
 
@@ -723,6 +723,9 @@ pub fn register_sound(engine: &Tjs2Engine, storage: Arc<Mutex<Storage>>) -> Resu
     let mixer = Arc::new(Mutex::new(Mixer::new()));
     set_native_ctx(storage, mixer.clone());
     crate::set_global_mixer(mixer);
+
+    // The real `WaveSoundBuffer` (the game's `SoundBuffer` derives from it).
+    crate::wavesound::register_wavesound(engine)?;
 
     engine.register_native_class_instance(&NativeInstanceBuilder {
         name: "SoundBuffer",

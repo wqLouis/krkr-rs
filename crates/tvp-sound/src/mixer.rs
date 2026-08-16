@@ -103,6 +103,11 @@ pub struct Channel {
     pub done: bool,
     /// Active volume fade, if any.
     pub fade: Option<Fade>,
+    /// Sticky "a fade finished during the last [`Channel::advance`]" flag.
+    /// Set when a ramp completes, cleared by `play`/`stop`/`set_volume` and
+    /// by starting a new fade. The sound poll reads it to fire the owner's
+    /// `onFadeCompleted` event, then clears it.
+    pub fade_finished: bool,
 }
 
 impl Channel {
@@ -118,6 +123,7 @@ impl Channel {
             position_seconds: 0.0,
             done: false,
             fade: None,
+            fade_finished: false,
         }
     }
 
@@ -140,6 +146,7 @@ impl Channel {
         self.position_seconds = 0.0;
         self.done = false;
         self.fade = None;
+        self.fade_finished = false;
     }
 
     /// Stop playback, keeping the current position (the reference's `stop`
@@ -149,6 +156,7 @@ impl Channel {
         self.paused = false;
         self.done = false;
         self.fade = None;
+        self.fade_finished = false;
     }
 
     /// Pause: position stops advancing (no-op when not playing).
@@ -173,6 +181,7 @@ impl Channel {
     pub fn set_volume(&mut self, v: f32) {
         self.volume = v.clamp(0.0, MAX_VOLUME);
         self.fade = None;
+        self.fade_finished = false;
     }
 
     /// Set the pan (clamped to `-1..=1`).
@@ -198,6 +207,7 @@ impl Channel {
             duration,
             delay,
         ));
+        self.fade_finished = false;
     }
 
     /// Duration of the current source in seconds (0 when unloaded).
@@ -214,6 +224,7 @@ impl Channel {
                 // The ramp is done: the fade's target becomes the volume.
                 self.volume = f.to.clamp(0.0, MAX_VOLUME);
                 self.fade = None;
+                self.fade_finished = true;
             }
         }
 

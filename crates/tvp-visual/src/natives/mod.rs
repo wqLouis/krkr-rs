@@ -37,6 +37,26 @@ unsafe impl Sync for LayerTjsRegistry {}
 
 static LAYER_TJS_OBJECTS: LazyLock<LayerTjsRegistry> = LazyLock::new(Default::default);
 static WINDOW_TJS_OBJECTS: LazyLock<LayerTjsRegistry> = LazyLock::new(Default::default);
+
+/// Cursor position forwarded from the render crate's input bridge each
+/// frame (which reads the shared `tvp-input` state). `Layer.cursorX`/`Y`
+/// read it so scripts see the same cursor the bridge dispatches to
+/// `onMouseDown`/et al. Kept here (not in the scene) so `tvp-visual` does
+/// not need to depend on `tvp-input`.
+static SHARED_CURSOR_POS: LazyLock<Mutex<(i32, i32)>> = LazyLock::new(Default::default);
+
+/// Set the cursor position the `Layer.cursorX`/`cursorY` properties read.
+/// Called by the render input bridge once per frame from the `tvp-input`
+/// mouse position.
+pub fn set_shared_cursor_pos(x: i32, y: i32) {
+    *SHARED_CURSOR_POS.lock().unwrap_or_else(|p| p.into_inner()) = (x, y);
+}
+
+/// The cursor position last set via [`set_shared_cursor_pos`], in game
+/// (primary-layer) coordinates.
+pub(crate) fn shared_cursor_pos() -> (i32, i32) {
+    *SHARED_CURSOR_POS.lock().unwrap_or_else(|p| p.into_inner())
+}
 /// Address of the real `Tjs2Engine` handed to [`register_visual`] (see
 /// [`context_engine`]).
 static ENGINE: LazyLock<Mutex<Option<EnginePtr>>> = LazyLock::new(Default::default);
@@ -139,7 +159,10 @@ pub(crate) fn set_window_tjs_object(id: u32, objthis: *mut c_void) {
 }
 
 /// Look up a window's TJS object by scene id.
-pub(crate) fn window_tjs_object(id: u32) -> *mut c_void {
+///
+/// Public so the render crate's input bridge can retain the object and call
+/// its script `onMouseDown`/`onKeyDown`/... methods when driving input.
+pub fn window_tjs_object(id: u32) -> *mut c_void {
     WINDOW_TJS_OBJECTS
         .0
         .lock()
@@ -227,6 +250,23 @@ pub fn timer_poll(engine: &Tjs2Engine, now_ms: u64) {
     timer::timer_poll(engine, now_ms);
 }
 
+/// A process-wide mutex serializing tests that drive the crate-global VM
+/// context.
+///
+/// The visual natives register ONE engine/scene/storage into the
+/// process-global slots ([`SCENE`]/[`STORAGE`]/[`ENGINE`]) — the VM is
+/// single-threaded by design. Tests that register their own engine must
+/// therefore run one at a time: in parallel, one test's `register_visual`
+/// overwrites another test's engine pointer mid-flight and native callbacks
+/// dereference the wrong (freed) engine → SIGSEGV. Both the in-crate
+/// `tests::TestEnv` and the `tests/visual_natives.rs` integration harness
+/// hold a guard from this lock for the lifetime of their environment.
+#[doc(hidden)]
+pub fn vm_test_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use std::sync::{Arc, Mutex, RwLock};
@@ -253,10 +293,14 @@ pub(crate) mod tests {
         #[allow(dead_code)]
         pub storage: Arc<Mutex<engine::Storage>>,
         pub _dir: TempDir,
+        pub _vm_lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl TestEnv {
         pub fn new(_name: &str) -> Self {
+            let _vm_lock = super::vm_test_lock()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
             // Tests share the crate-global bitmap cache; reset it so stale
             // ids from a previous test's scene can't be returned.
             BITMAP_CACHE
@@ -278,6 +322,7 @@ pub(crate) mod tests {
                 scene,
                 storage,
                 _dir: dir,
+                _vm_lock,
             }
         }
 

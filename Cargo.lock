@@ -4974,9 +4974,11 @@ dependencies = [
  "engine",
  "log",
  "tjs2-sys",
+ "tvp-input",
  "tvp-kagparser",
  "tvp-natives",
  "tvp-scripts",
+ "tvp-sound",
  "tvp-storages",
  "tvp-visual",
 ]

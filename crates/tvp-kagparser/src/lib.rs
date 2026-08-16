@@ -100,8 +100,8 @@ use std::sync::{Arc, Mutex};
 
 use engine::Storage;
 use tjs2_sys::{
-    NativeInstanceBuilder, NativeInstanceMethodDef, Tjs2Engine, TjsValue, VAL_INTEGER, VAL_REAL,
-    VAL_STRING, VAL_VOID, Value,
+    NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef, Tjs2Engine,
+    TjsValue, VAL_INTEGER, VAL_REAL, VAL_STRING, VAL_VOID, Value,
 };
 use tvp_util::encoding;
 
@@ -211,6 +211,116 @@ fn set_string_result(out: *mut Value, s: &str) {
             (*out).string = buf.as_ptr() as *const c_char;
         }
     });
+}
+
+/// Escape a string for inclusion in a TJS `"..."` string literal so it
+/// can be embedded verbatim in a `%[...]` dictionary literal.
+fn tjs_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Build a TJS expression that constructs a dictionary with the given
+/// entries, in source order.
+///
+/// This TJS2 build rejects **quoted keys** in `%[...]` dictionary literals
+/// (verified: `%["a": 1]` is a syntax error, `%[a: 1]` works), so the
+/// expression assigns each entry imperatively instead — bracket assignment
+/// accepts arbitrary string keys and preserves the intended values:
+///
+/// ```tjs
+/// (function(){ var d = %[]; d["k"] = "v"; ...; return d; })()
+/// ```
+fn dict_literal(tagname: Option<&str>, params: &[(String, String)]) -> String {
+    let mut lit = String::from("(function(){ var d = %[]; ");
+    if let Some(name) = tagname {
+        lit.push_str("d[");
+        lit.push_str(&tjs_escape("tagname"));
+        lit.push_str("] = ");
+        lit.push_str(&tjs_escape(name));
+        lit.push_str("; ");
+    }
+    for (k, v) in params {
+        lit.push_str("d[");
+        lit.push_str(&tjs_escape(k));
+        lit.push_str("] = ");
+        lit.push_str(&tjs_escape(v));
+        lit.push_str("; ");
+    }
+    lit.push_str("return d; })()");
+    lit
+}
+
+/// Build a real TJS Dictionary from `entries` and write it into `out` as a
+/// retained object result (the `VAL_RETAINED` ABI slot the C++ side
+/// consumes as a reference). Returns Ok(()) on success; on failure returns
+/// the error string (the caller can fall back or propagate).
+fn set_dict_result(out: *mut Value, entries: &[(String, String)]) -> Result<(), String> {
+    let engine = context_engine()?;
+    let literal = dict_literal(None, entries);
+    let _ = engine.eval(&literal, "KAGParser");
+    match engine.retain_value_detached(&TjsValue::Object) {
+        Ok(dv) => {
+            // SAFETY: out is a valid result slot; the C++ side consumes the
+            // retention (copies + erases) before the callback returns.
+            unsafe {
+                (*out).ty = tjs2_sys::VAL_RETAINED;
+                (*out).integer = 0;
+                (*out).real = 0.0;
+                (*out).string = ptr::null();
+                (*out).array = ptr::null();
+                (*out).array_count = 0;
+                (*out).retained = dv.raw_id() as usize;
+            }
+            // The C++ conversion consumes the retention; forget the wrapper
+            // so its Drop does not release the id first (safe no-op after).
+            std::mem::forget(dv);
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Build a real TJS Dictionary for a parsed tag (`tagname` key plus every
+/// attribute, preserving source order) and write it into `out`.
+fn set_tag_dict_result(
+    out: *mut Value,
+    name: &str,
+    params: &[(String, String)],
+) -> Result<(), String> {
+    let engine = context_engine()?;
+    let literal = dict_literal(Some(name), params);
+    let _ = engine.eval(&literal, "KAGParser");
+    match engine.retain_value_detached(&TjsValue::Object) {
+        Ok(dv) => {
+            // SAFETY: out is a valid result slot; the C++ side consumes the
+            // retention (copies + erases) before the callback returns.
+            unsafe {
+                (*out).ty = tjs2_sys::VAL_RETAINED;
+                (*out).integer = 0;
+                (*out).real = 0.0;
+                (*out).string = ptr::null();
+                (*out).array = ptr::null();
+                (*out).array_count = 0;
+                (*out).retained = dv.raw_id() as usize;
+            }
+            std::mem::forget(dv);
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
 }
 
 fn set_out_void(out: *mut Value) {
@@ -475,10 +585,10 @@ extern "C" fn native_get_next_tag(
     };
     let result = st.next_tag(&mut ctx.environ());
     match result {
-        Ok(Some((name, params))) => {
-            set_string_result(out, &kvp::encode_tag(&name, &params));
-            0
-        }
+        Ok(Some((name, params))) => match set_tag_dict_result(out, &name, &params) {
+            Ok(()) => 0,
+            Err(e) => error_out(out_error, &e),
+        },
         Ok(None) => {
             set_out_void(out);
             0
@@ -828,21 +938,34 @@ extern "C" fn native_set_debug_level(
 }
 
 /// `getMacros()`: the macro dictionary as `name=body` lines.
+/// Get the macros `HashMap` as an ordered `Vec<(name, body)>` for
+/// constructing a real Dictionary result.
+fn macros_entries(instance: *mut c_void) -> Vec<(String, String)> {
+    unsafe { state_of(instance) }.get_macros_entries()
+}
+
+/// `getMacros()`: the macro dictionary as a real TJS Dictionary object.
 extern "C" fn native_get_macros(
     _engine: *mut c_void,
     instance: *mut c_void,
     _argc: c_int,
     _argv: *const Value,
     out: *mut Value,
-    _out_error: *mut *mut c_char,
+    out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    let s = unsafe { state_of(instance) }.get_macros();
-    set_string_result(out, &s);
-    0
+    let entries = macros_entries(instance);
+    match set_dict_result(out, &entries) {
+        Ok(()) => 0,
+        Err(e) => error_out(out_error, &e),
+    }
 }
 
-/// `setMacros(dictString)`: replace the macro dictionary.
+/// `setMacros(dict)`: replace the macro dictionary with a real Dictionary.
+/// The C ABI marshals only void/int/real/string arguments, so the argument
+/// is passed as a `setMacros.kvp`-style string; the game always installs
+/// macros via `(Dictionary.assign incontextof macros)(_macros)` on the
+/// `macros` property, which arrives here as a string-encoded dict.
 extern "C" fn native_set_macros(
     _engine: *mut c_void,
     instance: *mut c_void,
@@ -877,14 +1000,14 @@ extern "C" fn native_get_macro_params(
     _argc: c_int,
     _argv: *const Value,
     out: *mut Value,
-    _out_error: *mut *mut c_char,
+    out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    match unsafe { state_of(instance) }.get_macro_params() {
-        Some(s) => {
-            set_string_result(out, &s);
-            0
-        }
+    match unsafe { state_of(instance) }.get_macro_params_entries() {
+        Some(entries) => match set_dict_result(out, &entries) {
+            Ok(()) => 0,
+            Err(e) => error_out(out_error, &e),
+        },
         None => {
             set_out_void(out);
             0
@@ -995,6 +1118,271 @@ extern "C" fn native_get_cur_label(
 }
 
 // ---------------------------------------------------------------------------
+// native properties
+//
+// The reference registers `ignoreCR`, `processSpecialTags`, `debugLevel`,
+// `curLine`, `curPos`, `curLineStr`, `callStackDepth`, `curStorage`,
+// `curLabel`, `macros`, `macroParams`, `mp` as *properties* (see
+// `TJS_BEGIN_NATIVE_PROP_DECL` in reference/cpp/core/base/KAGParser.cpp),
+// and games' ScController subclasses write them as plain properties:
+//
+//     system/sccontroller.tjs:  ignoreCR = true; processSpecialTags = true;
+//     system/advscreen.tjs:     _scCtrl.ignoreCR = false;   (talk handler)
+//     system/animationsequence.tjs: debugLevel = tkdlNone;
+//
+// Without real properties these assignments land in the object's dynamic
+// storage and never reach the parser state. The bool/int/string ones are
+// wired here; the dictionary one (`macros`) returns the kvp string encoding
+// until the object-return work lands.
+// ---------------------------------------------------------------------------
+
+extern "C" fn prop_ignore_cr_get(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    set_out_integer(out, unsafe { state_of(instance) }.get_ignore_cr() as i64);
+    0
+}
+
+extern "C" fn prop_ignore_cr_set(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    value: *const Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: value follows the trampoline contract (one valid argument).
+    match param_to_bool(unsafe { &*value }) {
+        Ok(v) => {
+            unsafe { state_of(instance) }.set_ignore_cr(v);
+            0
+        }
+        Err(e) => error_out(_out_error, &e),
+    }
+}
+
+extern "C" fn prop_process_special_tags_get(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    set_out_integer(
+        out,
+        unsafe { state_of(instance) }.get_process_special_tags() as i64,
+    );
+    0
+}
+
+extern "C" fn prop_process_special_tags_set(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    value: *const Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: value follows the trampoline contract.
+    match param_to_bool(unsafe { &*value }) {
+        Ok(v) => {
+            unsafe { state_of(instance) }.set_process_special_tags(v);
+            0
+        }
+        Err(e) => error_out(_out_error, &e),
+    }
+}
+
+extern "C" fn prop_debug_level_get(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    set_out_integer(out, unsafe { state_of(instance) }.get_debug_level() as i64);
+    0
+}
+
+extern "C" fn prop_debug_level_set(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    value: *const Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: value follows the trampoline contract.
+    let v = match param_to_string(unsafe { &*value })
+        .and_then(|s| s.parse::<i32>().map_err(|e| e.to_string()))
+    {
+        Ok(v) => v,
+        Err(e) => return error_out(_out_error, &e),
+    };
+    unsafe { state_of(instance) }.set_debug_level(v);
+    0
+}
+
+extern "C" fn prop_cur_line_get(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    set_out_integer(out, unsafe { state_of(instance) }.get_cur_line() as i64);
+    0
+}
+
+extern "C" fn prop_cur_pos_get(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    set_out_integer(out, unsafe { state_of(instance) }.get_cur_pos() as i64);
+    0
+}
+
+extern "C" fn prop_cur_line_str_get(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let s = unsafe { state_of(instance) }.get_cur_line_str();
+    set_string_result(out, &s);
+    0
+}
+
+extern "C" fn prop_call_stack_depth_get(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    set_out_integer(
+        out,
+        unsafe { state_of(instance) }.get_call_stack_depth() as i64,
+    );
+    0
+}
+
+extern "C" fn prop_cur_storage_get(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let s = unsafe { state_of(instance) }.get_storage_name().to_string();
+    set_string_result(out, &s);
+    0
+}
+
+extern "C" fn prop_cur_storage_set(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    value: *const Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: value follows the trampoline contract.
+    let name = match param_to_string(unsafe { &*value }) {
+        Ok(name) => name,
+        Err(e) => return error_out(_out_error, &e),
+    };
+    let st = unsafe { state_of(instance) };
+    let mut ctx = match ContextEnv::new() {
+        Ok(v) => v,
+        Err(e) => return error_out(_out_error, &e),
+    };
+    match st.load_scenario(&name, &mut ctx.environ()) {
+        Ok(()) => 0,
+        Err(e) => error_out(_out_error, &e),
+    }
+}
+
+extern "C" fn prop_cur_label_get(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let s = unsafe { state_of(instance) }.get_cur_label().to_string();
+    set_string_result(out, &s);
+    0
+}
+
+// --- dictionary-shaped property -------------------------------------------------
+// `macros` is read/written by the game's `loadMacro`:
+//     (Dictionary.assign incontextof _macros)(macros);      // read
+//     (Dictionary.assign incontextof macros)(_macros);      // write
+// The getter returns a real Dictionary object so `Dictionary.assign` can
+// copy it; the setter receives the string-encoded dict built by the TJS
+// side when assigning a Dictionary back.
+extern "C" fn prop_macros_get(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let entries = macros_entries(instance);
+    match set_dict_result(out, &entries) {
+        Ok(()) => 0,
+        Err(e) => error_out(out_error, &e),
+    }
+}
+
+extern "C" fn prop_macros_set(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    value: *const Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: value follows the trampoline contract.
+    let s = match param_to_string(unsafe { &*value }) {
+        Ok(s) => s,
+        Err(e) => return error_out(_out_error, &e),
+    };
+    let st = unsafe { state_of(instance) };
+    let mut ctx = match ContextEnv::new() {
+        Ok(v) => v,
+        Err(e) => return error_out(_out_error, &e),
+    };
+    if let Err(e) = st.restore(&s, &mut ctx.environ()) {
+        return error_out(_out_error, &e);
+    }
+    0
+}
+
+/// `KAGParser()` — the constructor member. The tjs2-sys constructor
+/// dispatch creates+registers the native payload on script-subclass
+/// objects (the game's `class ScController extends KAGParser` calls
+/// `super.KAGParser()` in its constructor); for `new KAGParser()` the
+/// payload already exists. Nothing to initialize — the reference's
+/// constructor is empty (`return TJS_S_OK`).
+extern "C" fn kagparser_ctor(
+    _engine: *mut c_void,
+    _instance: *mut c_void,
+    _argc: c_int,
+    _argv: *const Value,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    set_out_void(out);
+    0
+}
+
+// ---------------------------------------------------------------------------
 // registration
 // ---------------------------------------------------------------------------
 
@@ -1006,6 +1394,10 @@ pub fn register_kagparser(engine: &Tjs2Engine) -> Result<(), String> {
         create: kagparser_create,
         destroy: kagparser_destroy,
         methods: vec![
+            NativeInstanceMethodDef {
+                name: "KAGParser",
+                f: kagparser_ctor,
+            },
             NativeInstanceMethodDef {
                 name: "loadScenario",
                 f: native_load_scenario,
@@ -1123,7 +1515,58 @@ pub fn register_kagparser(engine: &Tjs2Engine) -> Result<(), String> {
                 f: native_get_cur_label,
             },
         ],
-        properties: vec![],
+        properties: vec![
+            NativeInstancePropertyDef {
+                name: "ignoreCR",
+                get: Some(prop_ignore_cr_get),
+                set: Some(prop_ignore_cr_set),
+            },
+            NativeInstancePropertyDef {
+                name: "processSpecialTags",
+                get: Some(prop_process_special_tags_get),
+                set: Some(prop_process_special_tags_set),
+            },
+            NativeInstancePropertyDef {
+                name: "debugLevel",
+                get: Some(prop_debug_level_get),
+                set: Some(prop_debug_level_set),
+            },
+            NativeInstancePropertyDef {
+                name: "curLine",
+                get: Some(prop_cur_line_get),
+                set: None,
+            },
+            NativeInstancePropertyDef {
+                name: "curPos",
+                get: Some(prop_cur_pos_get),
+                set: None,
+            },
+            NativeInstancePropertyDef {
+                name: "curLineStr",
+                get: Some(prop_cur_line_str_get),
+                set: None,
+            },
+            NativeInstancePropertyDef {
+                name: "callStackDepth",
+                get: Some(prop_call_stack_depth_get),
+                set: None,
+            },
+            NativeInstancePropertyDef {
+                name: "curStorage",
+                get: Some(prop_cur_storage_get),
+                set: Some(prop_cur_storage_set),
+            },
+            NativeInstancePropertyDef {
+                name: "curLabel",
+                get: Some(prop_cur_label_get),
+                set: None,
+            },
+            NativeInstancePropertyDef {
+                name: "macros",
+                get: Some(prop_macros_get),
+                set: Some(prop_macros_set),
+            },
+        ],
     })
 }
 
@@ -1133,6 +1576,15 @@ pub fn register_kagparser(engine: &Tjs2Engine) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    /// The KAGParser native registers a process-global engine context;
+    /// parallel tests race on it (segfault). Serialize this crate's tests
+    /// with one lock; all other crates stay fully parallel.
+    static VM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn vm_lock() -> std::sync::MutexGuard<'static, ()> {
+        VM_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     use super::*;
 
     /// A scratch game directory under the system temp dir, removed on drop.
@@ -1216,6 +1668,7 @@ mod tests {
 
     #[test]
     fn native_walk_matches_reference_tag_sequence() {
+        let _vm_lock = vm_lock();
         let env = TestEnv::new(
             "walk",
             &[ks(
@@ -1230,35 +1683,39 @@ mod tests {
         );
         env.exec_ok("var p = new KAGParser(); p.loadScenario('test.ks');");
         // First tags: per-char ch tags, the [b] tag, text, [/b], '!'.
-        assert_eq!(
-            env.eval_ok("p.getNextTag()"),
-            TjsValue::String("ch\ntext=H".into())
+        env.exec_ok(
+            "var a = p.getNextTag(); var b = p.getNextTag(); \
+             var c = p.getNextTag(); var d = p.getNextTag();",
         );
-        assert_eq!(
-            env.eval_ok("p.getNextTag()"),
-            TjsValue::String("ch\ntext=e".into())
-        );
+        // getNextTag returns a real TJS Dictionary now: tagname + params.
+        assert_eq!(env.eval_ok("a.tagname"), TjsValue::String("ch".into()));
+        assert_eq!(env.eval_ok("a.text"), TjsValue::String("H".into()));
+        assert_eq!(env.eval_ok("b.tagname"), TjsValue::String("ch".into()));
+        assert_eq!(env.eval_ok("b.text"), TjsValue::String("e".into()));
         // Text runs are emitted one `ch` tag per character (the reference
         // `_GetNextTag` normal-character branch), so the third and fourth
         // tags are the remaining 'l' characters of "Hello".
-        assert_eq!(
-            env.eval_ok("p.getNextTag()"),
-            TjsValue::String("ch\ntext=l".into())
-        );
-        assert_eq!(
-            env.eval_ok("p.getNextTag()"),
-            TjsValue::String("ch\ntext=l".into())
-        );
+        assert_eq!(env.eval_ok("c.tagname"), TjsValue::String("ch".into()));
+        assert_eq!(env.eval_ok("c.text"), TjsValue::String("l".into()));
+        assert_eq!(env.eval_ok("d.tagname"), TjsValue::String("ch".into()));
+        assert_eq!(env.eval_ok("d.text"), TjsValue::String("l".into()));
         // ... walk to the end and assert the full sequence. The first four
         // `ch` tags (H, e, l, l) were already consumed above, so the
         // walked remainder starts with the 'o' and the space of "Hello ".
-        env.exec_ok("var w = []; var wt; while ((wt = p.getNextTag()) !== void) w.add(wt);");
-        let joined = env.eval_ok("w.join(\"\\x1e\")");
+        env.exec_ok(
+            "var w = []; var names = []; var wt; \
+             var waitd = null; var bgd = null; \
+             while ((wt = p.getNextTag()) !== void) { \
+                 w.add(wt); names.add(wt.tagname); \
+                 if (wt.tagname == 'wait' && waitd == null) waitd = wt; \
+                 if (wt.tagname == 'bg') bgd = wt; \
+             }",
+        );
+        let joined = env.eval_ok("names.join(\"\\x1e\")");
         let TjsValue::String(joined) = joined else {
             panic!("expected string")
         };
-        let tags: Vec<&str> = joined.split('\x1e').collect();
-        let names: Vec<&str> = tags.iter().map(|t| t.lines().next().unwrap()).collect();
+        let names: Vec<&str> = joined.split('\x1e').collect();
         assert_eq!(
             names,
             [
@@ -1270,10 +1727,17 @@ mod tests {
                 "wait", "r",
             ]
         );
-        // wait tag carries the bare-attr "1000"="true"
-        assert!(tags.contains(&"wait\n1000=true"));
+        // wait tag carries the bare-attr "1000"="true" (as a dict member)
+        assert_eq!(
+            env.eval_ok("waitd[\"1000\"]"),
+            TjsValue::String("true".into())
+        );
         // bg tag params in source order
-        assert!(tags.contains(&"bg\nstorage=chapter1/f01.jpg\neffect=0"));
+        assert_eq!(
+            env.eval_ok("bgd.storage"),
+            TjsValue::String("chapter1/f01.jpg".into())
+        );
+        assert_eq!(env.eval_ok("bgd.effect"), TjsValue::String("0".into()));
         // end of scenario → void
         assert_eq!(
             env.eval_ok("(new KAGParser()).getNextTag()"),
@@ -1282,7 +1746,45 @@ mod tests {
     }
 
     #[test]
+    fn native_properties_write_parser_state() {
+        let _vm_lock = vm_lock();
+        // The game's ScController writes these as plain properties; they
+        // must reach the parser state (not dynamic member storage).
+        // Reference defaults: processSpecialTags=true, ignoreCR=false,
+        // debugLevel=tkdlSimple(1) (KAGParser.cpp:316-322).
+        let env = TestEnv::new("props", &[ks("test.ks", "*start\nHello\n")]);
+        env.exec_ok(
+            "var p = new KAGParser(); \
+             p.ignoreCR = true; \
+             p.processSpecialTags = false; \
+             p.debugLevel = 2; \
+             p.loadScenario('test.ks'); \
+             var ig = p.ignoreCR; \
+             var pst = p.processSpecialTags; \
+             var dl = p.debugLevel; \
+             var cs = p.curStorage;",
+        );
+        assert_eq!(env.eval_ok("ig"), TjsValue::Integer(1));
+        assert_eq!(env.eval_ok("pst"), TjsValue::Integer(0));
+        assert_eq!(env.eval_ok("dl"), TjsValue::Integer(2));
+        assert_eq!(env.eval_ok("cs"), TjsValue::String("test.ks".into()));
+        // method getters still agree with the property values
+        assert_eq!(env.eval_ok("p.getIgnoreCR()"), TjsValue::Integer(1));
+        assert_eq!(
+            env.eval_ok("p.getProcessSpecialTags()"),
+            TjsValue::Integer(0)
+        );
+        assert_eq!(env.eval_ok("p.getDebugLevel()"), TjsValue::Integer(2));
+        // a fresh parser has the reference defaults
+        env.exec_ok("var q = new KAGParser(); var qdl = q.debugLevel; var qpst = q.processSpecialTags; var qcr = q.ignoreCR;");
+        assert_eq!(env.eval_ok("qdl"), TjsValue::Integer(1));
+        assert_eq!(env.eval_ok("qpst"), TjsValue::Integer(1));
+        assert_eq!(env.eval_ok("qcr"), TjsValue::Integer(0));
+    }
+
+    #[test]
     fn go_to_label_and_jump_loop_from_script() {
+        let _vm_lock = vm_lock();
         let env = TestEnv::new(
             "jumploop",
             &[ks(
@@ -1294,15 +1796,16 @@ mod tests {
             "var p = new KAGParser(); p.loadScenario('test.ks'); \
              var waits = 0; var seen = []; \
              while (waits < 2) { var t = p.getNextTag(); seen.add(t); \
-                 if (t !== void && t.indexOf('wait') == 0) waits++; } \
+                 if (t !== void && t.tagname == 'wait') waits++; } \
              var depth = p.getCallStackDepth();",
         );
         assert_eq!(env.eval_ok("waits"), TjsValue::Integer(2));
         assert_eq!(env.eval_ok("depth"), TjsValue::Integer(0));
         assert_eq!(
-            env.eval_ok("seen[0]"),
-            TjsValue::String("ch\ntext=O".into())
+            env.eval_ok("seen[0].tagname"),
+            TjsValue::String("ch".into())
         );
+        assert_eq!(env.eval_ok("seen[0].text"), TjsValue::String("O".into()));
         // goToLabel to a missing label is a catchable TJS error
         env.exec_ok(
             "var caught = ''; try { p.goToLabel('*nope'); } catch(e) { caught = 'missing'; }",
@@ -1312,6 +1815,7 @@ mod tests {
 
     #[test]
     fn call_label_and_return_tag_from_script() {
+        let _vm_lock = vm_lock();
         let env = TestEnv::new(
             "callreturn",
             &[ks(
@@ -1324,24 +1828,27 @@ mod tests {
         // callLabel pushes a return position and jumps
         env.exec_ok("p.callLabel('*sub');");
         assert_eq!(env.eval_ok("p.getCallStackDepth()"), TjsValue::Integer(1));
-        assert_eq!(
-            env.eval_ok("p.getNextTag()"),
-            TjsValue::String("ch\ntext=S".into())
-        );
+        env.exec_ok("var t = p.getNextTag(); var tn = t.tagname; var tx = t.text;");
+        assert_eq!(env.eval_ok("tn"), TjsValue::String("ch".into()));
+        assert_eq!(env.eval_ok("tx"), TjsValue::String("S".into()));
         // @return pops back to the caller (line after the callLabel)
         env.exec_ok("while (p.getNextTag() !== void) {}");
         assert_eq!(env.eval_ok("p.getCallStackDepth()"), TjsValue::Integer(0));
         // a bare @return with no call is a catchable error
         env.exec_ok("var q = new KAGParser(); q.loadScenario('test.ks');");
+        eprintln!("[t] q created");
         env.exec_ok(
             "var caught = ''; try { q.goToLabel('*sub'); while (q.getNextTag() !== void) {} } \
              catch(e) { caught = 'underflow'; }",
         );
+        eprintln!("[t] try-loop done");
         assert_eq!(env.eval_ok("caught"), TjsValue::String("underflow".into()));
+        eprintln!("[t] assert done");
     }
 
     #[test]
     fn load_failure_is_a_catchable_tjs_error() {
+        let _vm_lock = vm_lock();
         let env = TestEnv::new("loadfail", &[ks("ok.ks", "*start\nHello\n")]);
         // missing file
         assert!(
@@ -1364,6 +1871,7 @@ mod tests {
 
     #[test]
     fn macro_recording_expansion_and_macros_property() {
+        let _vm_lock = vm_lock();
         let env = TestEnv::new(
             "macro",
             &[ks(
@@ -1373,22 +1881,24 @@ mod tests {
         );
         env.exec_ok(
             "var p = new KAGParser(); p.loadScenario('test.ks'); \
-             var r = []; var t; \
-             while ((t = p.getNextTag()) !== void) r.add(t); \
-             var macrosStr = p.getMacros();",
+             var r = []; var t; var bgmd = null; \
+             while ((t = p.getNextTag()) !== void) { r.add(t); \
+                 if (t.tagname == 'bgmplay') bgmd = t; } \
+             var m = p.getMacros(); var mbody = m['bgm'];",
         );
-        // the macro body round-trips: expansion emitted bgmplay with the
-        // resolved %storage and the flag
-        let joined = env.eval_ok("r.join(\"\\x1e\")");
-        let TjsValue::String(joined) = joined else {
-            panic!()
-        };
-        assert!(
-            joined.contains("bgmplay\nstorage=01.mp3\nloop=true"),
-            "{joined}"
+        // expansion emitted a bgmplay tag with the resolved %storage and
+        // the loop flag (real dict members)
+        assert_eq!(
+            env.eval_ok("bgmd.tagname"),
+            TjsValue::String("bgmplay".into())
         );
+        assert_eq!(
+            env.eval_ok("bgmd.storage"),
+            TjsValue::String("01.mp3".into())
+        );
+        assert_eq!(env.eval_ok("bgmd.loop"), TjsValue::String("true".into()));
         // the recorded body contains the %-arg and the auto [macropop]
-        let TjsValue::String(macros) = env.eval_ok("macrosStr") else {
+        let TjsValue::String(macros) = env.eval_ok("mbody") else {
             panic!()
         };
         assert!(macros.contains("bgmplay"), "{macros}");
@@ -1407,14 +1917,78 @@ mod tests {
              var r = []; var t; \
              while ((t = p.getNextTag()) !== void) r.add(t);",
         );
-        assert_eq!(env.eval_ok("r[2]"), TjsValue::String("move\nmy=10".into()));
-        assert_eq!(env.eval_ok("r[4]"), TjsValue::String("move\nmy=99".into()));
+        assert_eq!(env.eval_ok("r[2].tagname"), TjsValue::String("move".into()));
+        assert_eq!(env.eval_ok("r[2].my"), TjsValue::String("10".into()));
+        assert_eq!(env.eval_ok("r[4].tagname"), TjsValue::String("move".into()));
+        assert_eq!(env.eval_ok("r[4].my"), TjsValue::String("99".into()));
         // macroParams returns the top macro-args dict (empty here)
         assert_eq!(env.eval_ok("p.getMacroParams()"), TjsValue::Void);
     }
 
     #[test]
+    fn game_load_macro_pattern_reads_real_dictionaries() {
+        let _vm_lock = vm_lock();
+        // The real game's `loadMacro` reads the macro table with
+        // `(Dictionary.assign incontextof _macros)(macros)` — `getMacros()`
+        // (and the `macros` property) must hand back a real Dictionary
+        // whose members, including Japanese macro names like the 165 in
+        // scenario/macro.ks, are readable and drive expansion.
+        let env = TestEnv::new(
+            "loadmacro",
+            &[ks(
+                "test.ks",
+                "[macro name=ジャンプ]\n@jump target=%target\n[endmacro]\n\
+                 [macro name=move]\n@move x=%x|0 y=%y|0\n[endmacro]\n\
+                 *start\n@ジャンプ target=*end\n*end\n",
+            )],
+        );
+        env.exec_ok("var p = new KAGParser(); p.loadScenario('test.ks');");
+        // The game's loadMacro walks the scenario to the end first (the
+        // reference records [macro] blocks as the walk encounters them):
+        // `loadScenario(file); while(getNextTag() !== void){}` -- sccontroller.tjs(140).
+        env.exec_ok("while (p.getNextTag() !== void) {}");
+        // the macros Dictionary is real: Japanese + ASCII names resolve,
+        // unknown members are void
+        env.exec_ok(
+            "var m = p.getMacros(); \
+             var j = m['ジャンプ']; var mv = m['move']; var absent = m['nope'];",
+        );
+        let TjsValue::String(j) = env.eval_ok("j") else {
+            panic!()
+        };
+        assert!(j.contains("jump"), "{j}");
+        assert!(j.contains("target=%target"), "{j}");
+        let TjsValue::String(mv) = env.eval_ok("mv") else {
+            panic!()
+        };
+        assert!(mv.contains("x=%x|0"), "{mv}");
+        assert_eq!(env.eval_ok("absent"), TjsValue::Void);
+        // the same Dictionary drives expansion: @ジャンプ target=end jumps
+        // to *end, so no tags are emitted after it
+        env.exec_ok(
+            "var r = []; var t; \
+             while ((t = p.getNextTag()) !== void) r.add(t.tagname);",
+        );
+        let TjsValue::String(names) = env.eval_ok("r.join('\x1e')") else {
+            panic!()
+        };
+        assert_eq!(names, "");
+        // Dictionary.assign against the property works like the game's
+        // loadMacro: copy the macros dict into a script Dictionary
+        env.exec_ok(
+            "var _macros = new Dictionary(); \
+             (Dictionary.assign incontextof _macros)(p.macros); \
+             var copied = _macros['move'];",
+        );
+        let TjsValue::String(copied) = env.eval_ok("copied") else {
+            panic!()
+        };
+        assert!(copied.contains("move"), "{copied}");
+    }
+
+    #[test]
     fn if_endif_evaluates_expressions_in_the_vm() {
+        let _vm_lock = vm_lock();
         // ChkGlobalFlagOn is a global function, exactly like the real
         // game's 01_01.ks uses it.
         let env = TestEnv::new(
@@ -1430,22 +2004,33 @@ mod tests {
             "var flag = 0; \
              function ChkGlobalFlagOn(n) { return n == 1 || n == 3; } \
              var p = new KAGParser(); p.loadScenario('test.ks'); \
-             var r = []; var t; \
-             while ((t = p.getNextTag()) !== void) r.add(t);",
+             var r = []; var names = []; var t; \
+             var onflag = null; var xtag = null; var ytag = null; \
+             while ((t = p.getNextTag()) !== void) { \
+                 r.add(t); names.add(t.tagname); \
+                 if (t.tagname == 'onflag') onflag = t; \
+                 if (t.tagname == 'x') xtag = t; \
+                 if (t.tagname == 'y') ytag = t; \
+             }",
         );
-        let joined = env.eval_ok("r.join(\"\\x1e\")");
-        let TjsValue::String(joined) = joined else {
+        // first if (flag 1 on) emitted, second (flag 2) skipped
+        assert_eq!(env.eval_ok("onflag.id"), TjsValue::String("201".into()));
+        let TjsValue::String(names) = env.eval_ok("names.join('\x1e')") else {
             panic!()
         };
-        assert!(joined.contains("onflag\nid=201"), "{joined}");
-        assert!(!joined.contains("id=202"), "{joined}");
+        assert!(!names.contains("id=202"), "{names}");
         // if-true → x emitted, else branch skipped; y must not appear
-        assert!(joined.contains("x\na=1"), "{joined}");
-        assert!(!joined.contains("y\nb=2"), "{joined}");
+        assert_eq!(env.eval_ok("xtag.tagname"), TjsValue::String("x".into()));
+        assert_eq!(env.eval_ok("xtag.a"), TjsValue::String("1".into()));
+        // `eval("ytag")` on a void-valued local falls back to the engine's
+        // last_object slot (documented FFI quirk), so compare with `=== null`.
+        assert_eq!(env.eval_ok("ytag === null"), TjsValue::Integer(1));
+        assert!(!names.contains("y"), "{names}");
     }
 
     #[test]
     fn store_restore_round_trip_from_script() {
+        let _vm_lock = vm_lock();
         let env = TestEnv::new(
             "store",
             &[ks(
@@ -1458,16 +2043,16 @@ mod tests {
              for (var i = 0; i < 5; i++) p.getNextTag(); \
              var saved = p.store();",
         );
-        // finish the scenario
+        // finish the scenario (collect tagnames — tags are dicts now)
         env.exec_ok(
             "var rest1 = []; var t; \
-             while ((t = p.getNextTag()) !== void) rest1.add(t);",
+             while ((t = p.getNextTag()) !== void) rest1.add(t.tagname);",
         );
         // restore and replay the remainder — identical sequence
         env.exec_ok("p.restore(saved);");
         env.exec_ok(
             "var rest2 = []; var t2; \
-             while ((t2 = p.getNextTag()) !== void) rest2.add(t2);",
+             while ((t2 = p.getNextTag()) !== void) rest2.add(t2.tagname);",
         );
         assert_eq!(
             env.eval_ok("rest1.join(\"\\x1e\")"),
@@ -1481,6 +2066,7 @@ mod tests {
 
     #[test]
     fn utf16le_and_cp932_scenarios_load() {
+        let _vm_lock = vm_lock();
         // UTF-16LE with BOM
         let utf16 = {
             let mut b = encoding::UTF16LE_BOM.to_vec();
@@ -1491,10 +2077,9 @@ mod tests {
         };
         let env = TestEnv::new("utf16", &[("u.ks", utf16)]);
         env.exec_ok("var p = new KAGParser(); p.loadScenario('u.ks');");
-        assert_eq!(
-            env.eval_ok("p.getNextTag()"),
-            TjsValue::String("ch\ntext=こ".into())
-        );
+        env.exec_ok("var t = p.getNextTag(); var tn = t.tagname; var tx = t.text;");
+        assert_eq!(env.eval_ok("tn"), TjsValue::String("ch".into()));
+        assert_eq!(env.eval_ok("tx"), TjsValue::String("こ".into()));
 
         // CP932 without BOM (legacy Japanese)
         let body = tvp_util::encoding::Encoding::Cp932
@@ -1502,35 +2087,32 @@ mod tests {
             .expect("encode cp932");
         let env = TestEnv::new("cp932", &[("j.ks", body)]);
         env.exec_ok("var p = new KAGParser(); p.loadScenario('j.ks');");
-        assert_eq!(
-            env.eval_ok("p.getNextTag()"),
-            TjsValue::String("ch\ntext=こ".into())
-        );
+        env.exec_ok("var t = p.getNextTag(); var tn = t.tagname; var tx = t.text;");
+        assert_eq!(env.eval_ok("tn"), TjsValue::String("ch".into()));
+        assert_eq!(env.eval_ok("tx"), TjsValue::String("こ".into()));
     }
 
     #[test]
     fn interrupt_returns_an_interrupt_tag() {
+        let _vm_lock = vm_lock();
         let env = TestEnv::new("interrupt", &[ks("test.ks", "*start\nHello\n")]);
         env.exec_ok("var p = new KAGParser(); p.loadScenario('test.ks');");
         env.exec_ok("p.interrupt();");
-        assert_eq!(
-            env.eval_ok("p.getNextTag()"),
-            TjsValue::String("interrupt".into())
-        );
+        env.exec_ok("var t = p.getNextTag(); var iname = t.tagname;");
+        assert_eq!(env.eval_ok("iname"), TjsValue::String("interrupt".into()));
         // the walk continues normally afterwards
-        assert_eq!(
-            env.eval_ok("p.getNextTag()"),
-            TjsValue::String("ch\ntext=H".into())
-        );
+        env.exec_ok("var t2 = p.getNextTag(); var tn = t2.tagname; var tx = t2.text;");
+        assert_eq!(env.eval_ok("tn"), TjsValue::String("ch".into()));
+        assert_eq!(env.eval_ok("tx"), TjsValue::String("H".into()));
         env.exec_ok("p.resetInterrupt(); p.interrupt(); p.resetInterrupt();");
-        assert_eq!(
-            env.eval_ok("p.getNextTag()"),
-            TjsValue::String("ch\ntext=e".into())
-        );
+        env.exec_ok("var t3 = p.getNextTag(); var t3n = t3.tagname; var t3x = t3.text;");
+        assert_eq!(env.eval_ok("t3n"), TjsValue::String("ch".into()));
+        assert_eq!(env.eval_ok("t3x"), TjsValue::String("e".into()));
     }
 
     #[test]
     fn shim_wrapper_restores_dictionary_and_property_surface() {
+        let _vm_lock = vm_lock();
         let env = TestEnv::new("shim", &[ks("test.ks", "*start\nHello\n@wait\n")]);
         env.exec_ok(shim::INSTALL_WRAPPER);
         env.exec_ok(
@@ -1559,50 +2141,56 @@ mod tests {
             env.eval_ok("p2.curLabel"),
             TjsValue::String("*start".into())
         );
-        // macros is a raw "k=v\n..." string (no for-in in this TJS2 fork,
-        // so Dictionary round-trips are unsupported)
+        // macros property: native returns a real Dictionary now; the
+        // string-encoded setter round-trips into a dict on read-back
         env.exec_ok(
             "var p3 = new KAGParserCompat(); p3.loadScenario('test.ks'); \
-             p3.macros = 'foo=bar'; var m2 = p3.macros;",
+             p3.macros = 'foo=bar'; var m2 = p3.macros; var m2foo = m2['foo'];",
         );
-        assert_eq!(env.eval_ok("m2"), TjsValue::String("foo=bar".into()));
+        assert_eq!(env.eval_ok("m2foo"), TjsValue::String("bar".into()));
     }
 
     #[test]
-    fn extending_the_native_class_is_an_abi_limitation() {
+    fn script_subclass_constructor_creates_the_native_instance() {
+        let _vm_lock = vm_lock();
         // The game's `class ScController extends KAGParser` +
-        // `super.KAGParser()` needs a constructor member that creates the
-        // native instance; the C ABI registers methods only, so the super
-        // constructor call fails. Documented limitation (the wrapper class
-        // from shim::INSTALL_WRAPPER is the supported pattern).
-        let env = TestEnv::new("extends", &[]);
+        // `super.KAGParser()`: the constructor member must create+register
+        // the native instance on the script-subclass object so subsequent
+        // native methods resolve (this used to be an ABI limitation).
+        let env = TestEnv::new("extends", &[ks("test.ks", "*start\nHello\n")]);
         env.exec_ok(
             "var ok = false; \
-             try { \
-                 class X extends KAGParser { function X() { super.KAGParser(); } } \
-                 var x = new X(); \
-                 ok = true; \
-             } catch(e) { }",
+             class X extends KAGParser { \
+                 function X() { super.KAGParser(); } \
+                 function getNext() { return getNextTag(); } \
+             } \
+             var x = new X(); \
+             x.loadScenario('test.ks'); \
+             var t = x.getNextTag(); \
+             x.ignoreCR = true; \
+             var ig = x.ignoreCR; \
+             ok = (t !== void);",
         );
-        assert_eq!(env.eval_ok("ok"), TjsValue::Integer(0));
+        // super.KAGParser() succeeded and the payload is reachable; the
+        // subclass reads the real dict's members like the game does
+        assert_eq!(env.eval_ok("ok"), TjsValue::Integer(1));
+        assert_eq!(env.eval_ok("t.tagname"), TjsValue::String("ch".into()));
+        assert_eq!(env.eval_ok("t.text"), TjsValue::String("H".into()));
+        assert_eq!(env.eval_ok("ig"), TjsValue::Integer(1));
     }
 
     #[test]
     fn load_scenario_rewinds_and_clear_resets() {
+        let _vm_lock = vm_lock();
         let env = TestEnv::new("rewind", &[ks("test.ks", "*start\nOne\nTwo\n")]);
         env.exec_ok("var p = new KAGParser(); p.loadScenario('test.ks'); p.getNextTag();");
         // the second call returns 'n' (the second character of "One": the
         // reference emits one `ch` tag per character)
-        assert_eq!(
-            env.eval_ok("p.getNextTag()"),
-            TjsValue::String("ch\ntext=n".into())
-        );
+        env.exec_ok("var t1 = p.getNextTag(); var t1x = t1.text;");
+        assert_eq!(env.eval_ok("t1x"), TjsValue::String("n".into()));
         // re-loading the same storage rewinds to the start
-        env.exec_ok("p.loadScenario('test.ks');");
-        assert_eq!(
-            env.eval_ok("p.getNextTag()"),
-            TjsValue::String("ch\ntext=O".into())
-        );
+        env.exec_ok("p.loadScenario('test.ks'); var t2 = p.getNextTag(); var t2x = t2.text;");
+        assert_eq!(env.eval_ok("t2x"), TjsValue::String("O".into()));
         // clear() unloads: getNextTag returns void immediately
         env.exec_ok("p.clear();");
         assert_eq!(env.eval_ok("p.getNextTag()"), TjsValue::Void);

@@ -58,7 +58,11 @@ pub(crate) struct LayerInst {
     pub id: u32,
     /// Whether the native constructor has run.
     pub constructed: bool,
-    /// The blend/affine type (ltAlpha=0 default).
+    /// The blend/affine type (ltAlpha=2 default; enum values per the reference
+    /// drawable.h: ltOpaque=1, ltAlpha=2, ltAdditive=3, ltSubtractive=4,
+    /// ltAddAlpha=12, ... — see tvp-natives/constants.rs). Stored per-instance
+    /// only: the scene model has no blend field, so the renderer alpha-blends
+    /// every sprite regardless of type.
     pub blend_type: i64,
 }
 
@@ -887,8 +891,23 @@ pub(crate) fn register_layer(engine: &Tjs2Engine) -> Result<(), String> {
                 get: Some(layer_top_get),
                 set: Some(layer_top_set),
             },
-            // The blend/affine type (ltAlpha=0, ltAdditive=2, ...). Stored
-            // per-instance so the game's reset() round-trips it.
+            // Cursor position, fed by the render input bridge from the shared
+            // tvp-input state. The game's MainWindow reads these in
+            // onMouseDown/onMouseMove (`primaryLayer.cursorX`/`cursorY`).
+            NativeInstancePropertyDef {
+                name: "cursorX",
+                get: Some(layer_cursor_x_get),
+                set: None,
+            },
+            NativeInstancePropertyDef {
+                name: "cursorY",
+                get: Some(layer_cursor_y_get),
+                set: None,
+            },
+            // The blend/affine type (ltAlpha=2, ltAdditive=3, ... per the reference
+            // drawable.h). Stored per-instance so the game's reset() round-trips it;
+            // the scene model carries no blend field, so additive/subtractive blends
+            // are not rendered yet (see sync.rs module docs).
             NativeInstancePropertyDef {
                 name: "type",
                 get: Some(layer_type_get),
@@ -956,6 +975,34 @@ extern "C" fn layer_id_get(
 ) -> c_int {
     let inst = unsafe { instance_ref::<LayerInst>(instance) };
     set_int_out(out, i64::from(inst.id));
+    0
+}
+
+/// `cursorX` — the cursor X in primary-layer / window logical coordinates,
+/// as fed by the render input bridge (mirrors `Mouse.getCursorX()`). The
+/// game reads `primaryLayer.cursorX`/`cursorY` in `onMouseDown`/`onMouseMove`.
+extern "C" fn layer_cursor_x_get(
+    _engine: *mut c_void,
+    _instance: *mut c_void,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let (x, _y) = super::shared_cursor_pos();
+    set_int_out(out, i64::from(x));
+    0
+}
+
+/// `cursorY` — the cursor Y in primary-layer / window logical coordinates.
+extern "C" fn layer_cursor_y_get(
+    _engine: *mut c_void,
+    _instance: *mut c_void,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let (_x, y) = super::shared_cursor_pos();
+    set_int_out(out, i64::from(y));
     0
 }
 
@@ -1225,5 +1272,103 @@ mod tests {
             .find(|l| l.id == env.eval_int("c.id") as u32)
             .expect("child layer");
         assert_eq!(c.parent, Some(env.eval_int("p.id") as u32));
+    }
+
+    #[test]
+    fn argb_to_rgba_known_colors() {
+        // TJS color 0xAARRGGBB → straight-alpha RGBA (the reference
+        // FillRect convention; matches the real title scene's fills).
+        assert_eq!(super::argb_to_rgba(0xff000000), [0, 0, 0, 255]); // opaque black
+        assert_eq!(super::argb_to_rgba(0xffffffff), [255, 255, 255, 255]); // white
+        assert_eq!(super::argb_to_rgba(0x80ff0000), [255, 0, 0, 128]); // half-alpha red
+        assert_eq!(super::argb_to_rgba(0x00000000), [0, 0, 0, 0]); // transparent
+        assert_eq!(super::argb_to_rgba(0xff123456), [0x12, 0x34, 0x56, 0xff]);
+    }
+
+    #[test]
+    fn layer_opacity_bounds() {
+        let env = TestEnv::new("layer-opacity-bounds");
+        env.run("var w = new Window(); var l = new Layer(w, null); l.opacity = 0;")
+            .unwrap();
+        assert_eq!(env.scene().layers[0].opacity, 0.0);
+        assert_eq!(env.eval_int("l.opacity"), 0);
+        env.run("l.opacity = 300;").unwrap();
+        assert_eq!(
+            env.scene().layers[0].opacity,
+            1.0,
+            "values above 255 clamp to 1.0"
+        );
+        assert_eq!(env.eval_int("l.opacity"), 255);
+    }
+
+    /// `layer.type` (blend mode: ltAlpha=2, ltAdditive=3, ...) round-trips
+    /// on the native instance but NEVER lands in the scene — LayerState has
+    /// no blend field. This is the documented reason the renderer
+    /// alpha-blends every sprite regardless of type (additive/subtractive
+    /// not implemented; see sync.rs module docs).
+    #[test]
+    fn layer_type_stored_per_instance_not_in_scene() {
+        let env = TestEnv::new("layer-type");
+        env.run("var w = new Window(); var l = new Layer(w, null); l.type = 3;")
+            .unwrap();
+        assert_eq!(
+            env.eval_int("l.type"),
+            3,
+            "script round-trip (ltAdditive=3)"
+        );
+        let scene = env.scene();
+        let layer = &scene.layers[0];
+        // The scene layer carries only renderer-visible state — no blend
+        // type, so the sync cannot distinguish additive from alpha.
+        assert_eq!(layer.fill_color, None);
+        assert_eq!(layer.bitmap, None);
+        assert_eq!(layer.z_order, 0);
+        assert_eq!(layer.opacity, 1.0);
+    }
+
+    /// The real title stack z-values assigned via `layer.absolute`: higher
+    /// z sorts in front (window_layer_order is back→front).
+    #[test]
+    fn layer_absolute_sorts_higher_z_in_front() {
+        let env = TestEnv::new("layer-absolute");
+        env.run(
+            "var w = new Window(); \
+             var hint = new Layer(w, null); hint.absolute = 210000; \
+             var logo = new Layer(w, null); logo.absolute = 110000; \
+             var bg = new Layer(w, null); \
+             var cover = new Layer(w, null); cover.absolute = 150000;",
+        )
+        .unwrap();
+        let scene = env.scene();
+        let ids = scene.window_layer_order(0);
+        assert_eq!(ids.len(), 4);
+        let pos = |id: u32| ids.iter().position(|&x| x == id).unwrap();
+        // Layer ids are assigned in creation order: hint=0, logo=1, bg=2,
+        // cover=3 (each `new Layer` bumps the scene's next_layer counter).
+        assert!(
+            pos(2) < pos(1) && pos(1) < pos(3) && pos(3) < pos(0),
+            "z=0 bg, then 110000, 150000, 210000"
+        );
+    }
+
+    /// `primaryLayer.cursorX`/`cursorY` mirror the cursor position the
+    /// render input bridge forwards via [`super::super::set_shared_cursor_pos`]
+    /// (which the bridge sources from the shared `tvp-input` mouse position).
+    #[test]
+    fn layer_cursor_x_y_mirror_shared_cursor_pos() {
+        let env = TestEnv::new("layer-cursor");
+        // Simulate the bridge forwarding this frame's cursor position.
+        super::super::set_shared_cursor_pos(400, 300);
+        env.run("var w = new Window(); var l = new Layer(w, null);")
+            .unwrap();
+        assert_eq!(env.eval_int("l.cursorX"), 400);
+        assert_eq!(env.eval_int("l.cursorY"), 300);
+        // The game reads them through the primary layer object.
+        assert_eq!(env.eval_int("w.primaryLayer.cursorX"), 400);
+        assert_eq!(env.eval_int("w.primaryLayer.cursorY"), 300);
+        // A later bridge update is reflected too.
+        super::super::set_shared_cursor_pos(5, 7);
+        assert_eq!(env.eval_int("l.cursorX"), 5);
+        assert_eq!(env.eval_int("l.cursorY"), 7);
     }
 }

@@ -100,6 +100,10 @@ tjs2_value_id tjs2_retain_value(void *engine, const tjs2_value *v);
  * a safe no-op. */
 void tjs2_release_value(void *engine, tjs2_value_id id);
 
+/* Diagnostic: number of entries currently in the retained-value map (used by
+ * the test suite to detect retention leaks). */
+size_t tjs2_retained_count(void *engine);
+
 /* Stack trace string for Scripts.getTraceString; malloc'd, free with
  * tjs2_free_string. */
 char *tjs2_get_stack_trace_string(void *engine, int limit);

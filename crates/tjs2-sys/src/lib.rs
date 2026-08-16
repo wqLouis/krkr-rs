@@ -201,15 +201,35 @@ unsafe extern "C" {
     /// Retain a raw TJS object (see the C++ side). Returns a per-engine id
     /// or 0 on failure.
     pub fn tjs2_retain_object(engine: *mut Engine, obj: *mut c_void) -> Tjs2ValueId;
+    /// Find the retained id of a value already in the engine's retained
+    /// map, without retaining anything new (identity match: the same
+    /// function object + ObjThis). Returns the null id when not found.
+    fn tjs2_find_retained_id(engine: *mut Engine, v: *const Value) -> Tjs2ValueId;
     /// Stack trace string (Scripts.getTraceString); malloc'd, free with
     /// `tjs2_free_string`.
     pub fn tjs2_get_stack_trace_string(engine: *mut Engine, limit: c_int) -> *mut c_char;
     /// Release a retained value. Idempotent on the C++ side.
     fn tjs2_release_value(engine: *mut Engine, id: Tjs2ValueId);
+    /// Number of entries currently in the engine's retained-value map
+    /// (diagnostic; the test suite uses it to prove retentions are consumed
+    /// or released).
+    pub fn tjs2_retained_count(engine: *mut Engine) -> usize;
     /// Invoke a retained value's default member with `argc` args.
     fn tjs2_call_value(
         engine: *mut Engine,
         id: Tjs2ValueId,
+        argc: c_int,
+        argv: *const Value,
+        out: *mut Value,
+        out_error: *mut *mut c_char,
+    ) -> c_int;
+    /// Invoke a named member on a retained object value (member lookup
+    /// goes through the object's own class chain, so script-subclass
+    /// overrides win over native methods).
+    fn tjs2_call_member(
+        engine: *mut Engine,
+        id: Tjs2ValueId,
+        membername: *const c_char,
         argc: c_int,
         argv: *const Value,
         out: *mut Value,
@@ -791,6 +811,115 @@ name), and none was available"
         })
     }
 
+    /// Retain a raw TJS object (e.g. a native instance's `objthis`) with a
+    /// lifetime detached from the engine borrow, like
+    /// [`Self::retain_value_detached`] but for a raw object pointer. The
+    /// returned handle releases the retention when dropped.
+    /// The raw `objthis` pointer comes from the C++ dispatch which holds the
+    /// object alive for the duration of the call (the native-callback
+    /// trampoline guarantees validity; the retained reference keeps it alive
+    /// afterward). Dereferencing happens only on the C++ side.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn retain_object_detached(&self, obj: *mut c_void) -> Result<DetachedValue, String> {
+        if obj.is_null() {
+            return Err("cannot retain a null object".into());
+        }
+        // SAFETY: obj is a live TJS object for the duration of the call.
+        let id = unsafe { tjs2_retain_object(self.inner, obj) };
+        if id.is_null() {
+            return Err("failed to retain object".into());
+        }
+        Ok(DetachedValue {
+            engine: self.inner,
+            id,
+        })
+    }
+
+    /// Find the retained id of a script value already retained on this
+    /// engine, without creating a new entry (identity match: same closure
+    /// object + ObjThis). Returns `None` when the value is not retained.
+    /// Object values are resolved against the most recent object-valued
+    /// script result, like [`Self::retain_value_detached`].
+    pub fn find_retained_id(&self, v: &TjsValue) -> Option<Tjs2ValueId> {
+        let mut strings = Vec::new();
+        let ffi = match v {
+            TjsValue::Object => Value {
+                ty: VAL_OBJECT,
+                integer: 0,
+                real: 0.0,
+                string: ptr::null(),
+                array: ptr::null(),
+                array_count: 0,
+                retained: 0,
+            },
+            other => match value_to_ffi(other, &mut strings) {
+                Ok(v) => v,
+                Err(_) => return None,
+            },
+        };
+        // SAFETY: `ffi` mirrors `v` and self.inner is a live engine.
+        let id = unsafe { tjs2_find_retained_id(self.inner, &ffi) };
+        if id.is_null() { None } else { Some(id) }
+    }
+
+    /// Invoke a named member on a retained object value (e.g. a Timer
+    /// object's `onTimer`). Member lookup goes through the object's own
+    /// class chain, so a script subclass overriding `onTimer` (the game's
+    /// `OnceTimer`) runs its override.
+    /// `id` is a retained value whose validity is owned by the
+    /// `DetachedValue`/`ValueId` handles (which keep the engine alive via
+    /// the borrow checker); the C++ side dereferences it within the call.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn call_member(
+        &self,
+        id: Tjs2ValueId,
+        membername: &str,
+        args: &[TjsValue],
+    ) -> Result<TjsValue, String> {
+        let mut strings = Vec::new();
+        let ffi_args: Vec<Value> = args
+            .iter()
+            .map(|a| value_to_ffi(a, &mut strings))
+            .collect::<Result<_, _>>()?;
+        let mut out = Value {
+            ty: VAL_VOID,
+            integer: 0,
+            real: 0.0,
+            string: ptr::null(),
+            array: ptr::null(),
+            array_count: 0,
+            retained: 0,
+        };
+        let mut error: *mut c_char = ptr::null_mut();
+        let name = std::ffi::CString::new(membername)
+            .map_err(|_| "member name contains a NUL byte".to_string())?;
+        // SAFETY: self.inner is a live engine and id is a live retained id;
+        // name/argv/out follow the ABI contract for the duration of the call.
+        // (The retained id's validity is owned by DetachedValue/ValueId,
+        // which keep the engine alive via the borrow checker; call_member
+        // itself does not dereference the pointer — the C++ side does.)
+        let rc = unsafe {
+            tjs2_call_member(
+                self.inner,
+                id,
+                name.as_ptr(),
+                ffi_args.len() as c_int,
+                if ffi_args.is_empty() {
+                    ptr::null()
+                } else {
+                    ffi_args.as_ptr()
+                },
+                &mut out,
+                &mut error,
+            )
+        };
+        if rc != 0 {
+            return Err(unsafe { take_error_string(error) });
+        }
+        // SAFETY: `out` was filled by the C++ side on success.
+        Ok(unsafe { take_value(&out) })
+    }
+
     /// Invoke a retained detached value (see [`Self::retain_value_detached`]).
     pub fn call_detached(&self, dv: &DetachedValue, args: &[TjsValue]) -> Result<TjsValue, String> {
         if !std::ptr::eq(dv.engine, self.inner) {
@@ -941,14 +1070,26 @@ fn value_to_ffi(v: &TjsValue, strings: &mut Vec<CString>) -> Result<Value, Strin
 mod tests {
     use super::*;
 
+    /// The C++ TJS2 VM (like the reference) is single-threaded by design:
+    /// concurrent engines in one process corrupt the C++ heap. These tests
+    /// are fast (31 tests ~0.1s), so serialize them with one process-wide
+    /// mutex and let every other crate keep full parallel speed.
+    static VM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn vm_lock() -> std::sync::MutexGuard<'static, ()> {
+        VM_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     #[test]
     fn engine_creates_and_destroys() {
+        let _vm_lock = vm_lock();
         let e = Tjs2Engine::new().expect("create engine");
         drop(e);
     }
 
     #[test]
     fn evaluates_integer_expression() {
+        let _vm_lock = vm_lock();
         let e = Tjs2Engine::new().unwrap();
         let v = e.eval("1 + 2 * 3", "test").unwrap();
         assert_eq!(v, TjsValue::Integer(7));
@@ -956,6 +1097,7 @@ mod tests {
 
     #[test]
     fn evaluates_string_expression() {
+        let _vm_lock = vm_lock();
         let e = Tjs2Engine::new().unwrap();
         let v = e.eval("'hello' + ' ' + 'world'", "test").unwrap();
         assert_eq!(v, TjsValue::String("hello world".into()));
@@ -963,6 +1105,7 @@ mod tests {
 
     #[test]
     fn executes_script_with_global_assignment() {
+        let _vm_lock = vm_lock();
         let e = Tjs2Engine::new().unwrap();
         e.exec_script("var x = 40; x += 2;", "test").unwrap();
         let v = e.eval("x", "test").unwrap();
@@ -971,6 +1114,7 @@ mod tests {
 
     #[test]
     fn script_error_is_reported() {
+        let _vm_lock = vm_lock();
         let e = Tjs2Engine::new().unwrap();
         let err = e.exec_script("this is not valid tjs", "test").unwrap_err();
         assert!(!err.to_string().is_empty());
@@ -978,6 +1122,7 @@ mod tests {
 
     #[test]
     fn unicode_strings_roundtrip() {
+        let _vm_lock = vm_lock();
         let e = Tjs2Engine::new().unwrap();
         let v = e.eval("'こんにちは' + '世界'", "test").unwrap();
         assert_eq!(v, TjsValue::String("こんにちは世界".into()));
@@ -1154,6 +1299,7 @@ mod tests {
 
     #[test]
     fn native_class_static_methods_work_from_scripts() {
+        let _vm_lock = vm_lock();
         let e = Tjs2Engine::new().unwrap();
         e.register_native_class(&test_natives_builder()).unwrap();
 
@@ -1184,6 +1330,7 @@ mod tests {
 
     #[test]
     fn native_method_error_surfaces_as_tjs_error() {
+        let _vm_lock = vm_lock();
         let e = Tjs2Engine::new().unwrap();
         e.register_native_class(&test_natives_builder()).unwrap();
 
@@ -1209,6 +1356,7 @@ mod tests {
 
     #[test]
     fn native_class_rejects_duplicate_registration() {
+        let _vm_lock = vm_lock();
         let e = Tjs2Engine::new().unwrap();
         e.register_native_class(&test_natives_builder()).unwrap();
         let err = e
@@ -1311,6 +1459,7 @@ mod tests {
 
     #[test]
     fn native_properties_work_from_scripts() {
+        let _vm_lock = vm_lock();
         PROP_VALUE.store(0, std::sync::atomic::Ordering::SeqCst);
         PROP_READONLY.store(7, std::sync::atomic::Ordering::SeqCst);
         PROP_WRITEONLY.store(0, std::sync::atomic::Ordering::SeqCst);
@@ -1349,6 +1498,7 @@ mod tests {
 
     #[test]
     fn native_property_set_error_surfaces_as_tjs_error() {
+        let _vm_lock = vm_lock();
         let e = Tjs2Engine::new().unwrap();
         e.register_native_class(&prop_builder()).unwrap();
         let err = e.eval("Prop.value = 'oops'", "test").unwrap_err();
@@ -1475,6 +1625,10 @@ mod tests {
                     name: "add",
                     f: counter_add,
                 },
+                NativeInstanceMethodDef {
+                    name: "objthis",
+                    f: counter_objthis,
+                },
             ],
             properties: vec![
                 NativeInstancePropertyDef {
@@ -1539,6 +1693,7 @@ mod tests {
 
     #[test]
     fn native_instance_properties_work_from_scripts() {
+        let _vm_lock = vm_lock();
         let e = Tjs2Engine::new().unwrap();
         e.register_native_class_instance(&counter_builder())
             .unwrap();
@@ -1568,6 +1723,7 @@ mod tests {
 
     #[test]
     fn native_instances_work_from_scripts() {
+        let _vm_lock = vm_lock();
         let e = Tjs2Engine::new().unwrap();
         e.register_native_class_instance(&counter_builder())
             .unwrap();
@@ -1604,6 +1760,7 @@ var ra = a.get(); var rb = b.get();",
 
     #[test]
     fn native_instance_method_on_wrong_object_errors() {
+        let _vm_lock = vm_lock();
         let e = Tjs2Engine::new().unwrap();
         e.register_native_class_instance(&counter_builder())
             .unwrap();
@@ -1628,6 +1785,7 @@ var ra = a.get(); var rb = b.get();",
 
     #[test]
     fn native_instance_method_error_surfaces_as_tjs_error() {
+        let _vm_lock = vm_lock();
         let e = Tjs2Engine::new().unwrap();
         e.register_native_class_instance(&counter_builder())
             .unwrap();
@@ -1641,6 +1799,7 @@ var ra = a.get(); var rb = b.get();",
 
     #[test]
     fn native_instances_destroy_callback_runs() {
+        let _vm_lock = vm_lock();
         COUNTER_CREATED.store(0, std::sync::atomic::Ordering::SeqCst);
         COUNTER_DESTROYED.store(0, std::sync::atomic::Ordering::SeqCst);
 
@@ -1678,6 +1837,7 @@ var ra = a.get(); var rb = b.get();",
 
     #[test]
     fn retained_function_can_be_called() {
+        let _vm_lock = vm_lock();
         let e = Tjs2Engine::new().unwrap();
         e.exec_script("var f = function(a, b) { return a + b; };", "test")
             .unwrap();
@@ -1695,6 +1855,7 @@ var ra = a.get(); var rb = b.get();",
 
     #[test]
     fn retained_function_mutates_globals_across_calls() {
+        let _vm_lock = vm_lock();
         let e = Tjs2Engine::new().unwrap();
         e.exec_script(
             "var g = 0; var f = function() { g = g + 1; return g; };",
@@ -1709,6 +1870,7 @@ var ra = a.get(); var rb = b.get();",
 
     #[test]
     fn retained_noarg_function_returns_void() {
+        let _vm_lock = vm_lock();
         let e = Tjs2Engine::new().unwrap();
         e.exec_script("var f = function() { };", "test").unwrap();
         let f = e.eval("f", "test").unwrap();
@@ -1718,6 +1880,7 @@ var ra = a.get(); var rb = b.get();",
 
     #[test]
     fn retained_function_returns_string() {
+        let _vm_lock = vm_lock();
         let e = Tjs2Engine::new().unwrap();
         e.exec_script("var f = function() { return 'hello from tjs'; };", "test")
             .unwrap();
@@ -1731,6 +1894,7 @@ var ra = a.get(); var rb = b.get();",
 
     #[test]
     fn calling_a_released_value_errors() {
+        let _vm_lock = vm_lock();
         let e = Tjs2Engine::new().unwrap();
         e.exec_script("var f = function() { return 1; };", "test")
             .unwrap();
@@ -1754,6 +1918,7 @@ var ra = a.get(); var rb = b.get();",
 
     #[test]
     fn ffi_call_value_with_unknown_id_errors() {
+        let _vm_lock = vm_lock();
         // The C++ side itself must reject unknown ids gracefully (the safe
         // wrapper catches this before crossing the FFI, but the boundary
         // contract is what matters for the Timer use case).
@@ -1787,6 +1952,7 @@ var ra = a.get(); var rb = b.get();",
 
     #[test]
     fn engine_drop_releases_retained_values() {
+        let _vm_lock = vm_lock();
         // A live ValueId borrows its engine, so "drop the engine while ids
         // are alive" cannot even be expressed. What can happen is a
         // forgotten id (std::mem::forget skips Drop); the engine's registry
@@ -1810,5 +1976,660 @@ var ra = a.get(); var rb = b.get();",
         assert_eq!(e2.call_value(&id2, &[]).unwrap(), TjsValue::Integer(7));
         drop(id2);
         drop(e2);
+    }
+
+    // -------------------------------------------------------------------
+    // FFI audit: retained-value consumption, scratch lifetimes, reentrancy
+    // -------------------------------------------------------------------
+
+    /// The objthis of the last instance method call (raw pointer as usize).
+    static LAST_OBJTHIS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// `Counter.objthis()` — returns the raw objthis pointer value and
+    /// records it, so tests can check the trailing C ABI arg is the real
+    /// per-instance object (non-null, distinct per instance).
+    extern "C" fn counter_objthis(
+        _engine: *mut c_void,
+        _instance: *mut c_void,
+        _argc: c_int,
+        _argv: *const Value,
+        out: *mut Value,
+        _out_error: *mut *mut c_char,
+        objthis: *mut c_void,
+    ) -> c_int {
+        LAST_OBJTHIS.store(objthis as usize, std::sync::atomic::Ordering::SeqCst);
+        // SAFETY: out is a valid return slot.
+        unsafe {
+            (*out).ty = VAL_INTEGER;
+            (*out).integer = objthis as usize as i64;
+            (*out).real = 0.0;
+            (*out).string = ptr::null();
+        }
+        0
+    }
+
+    thread_local! {
+        /// Scratch state for array-string returns (mirrors the tvp-storages
+        /// CSVParser helper): NUL-terminated buffers plus the pointer array
+        /// into them. Valid until the next native call on this thread; the
+        /// C++ side copies the elements into a TJS array before the callback
+        /// returns.
+        static ARRAY_OUT: std::cell::RefCell<(Vec<*const c_char>, Vec<Vec<u8>>)> =
+            const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+    }
+
+    /// Write an array-of-strings return value into `*out` (VAL_ARRAY).
+    fn set_array_strings_out(out: *mut Value, items: &[String]) {
+        ARRAY_OUT.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            slot.1.clear();
+            let mut ptrs: Vec<*const c_char> = Vec::with_capacity(items.len());
+            for s in items {
+                let mut b = s.as_bytes().to_vec();
+                b.push(0);
+                slot.1.push(b);
+            }
+            for b in &slot.1 {
+                ptrs.push(b.as_ptr() as *const c_char);
+            }
+            slot.0 = ptrs;
+            // SAFETY: out is a valid return slot; slot.0/slot.1 stay alive
+            // until the next call on this thread (the C++ side copies
+            // immediately).
+            unsafe {
+                (*out).ty = VAL_ARRAY;
+                (*out).integer = 0;
+                (*out).real = 0.0;
+                (*out).string = ptr::null();
+                (*out).array = slot.0.as_ptr();
+                (*out).array_count = slot.0.len() as c_int;
+            }
+        });
+    }
+
+    /// `RetainNatives.retainFirst(x)` — retains the (object) argument and
+    /// returns it across the ABI as VAL_RETAINED. This is the exact pattern
+    /// `Scripts.evalStorage` / `Layer.font` use: the C++ side consumes the
+    /// map entry (copies + erases) when it converts the result.
+    extern "C" fn native_retain_first_arg(
+        engine: *mut c_void,
+        argc: c_int,
+        argv: *const Value,
+        out: *mut Value,
+        _out_error: *mut *mut c_char,
+    ) -> c_int {
+        if argc < 1 {
+            return 1;
+        }
+        // SAFETY: argv is valid for argc entries during the call.
+        let first = unsafe { &*argv };
+        if first.ty != VAL_OBJECT {
+            return 1;
+        }
+        // A VAL_OBJECT tjs2_value carries no handle; the C++ side resolves
+        // it against the engine's most recent object result — the argument
+        // conversion just stored this object there.
+        let ffi = Value {
+            ty: VAL_OBJECT,
+            integer: 0,
+            real: 0.0,
+            string: ptr::null(),
+            array: ptr::null(),
+            array_count: 0,
+            retained: 0,
+        };
+        // SAFETY: engine is a live engine; ffi mirrors the object arg.
+        let id = unsafe { tjs2_retain_value(engine as *mut Engine, &ffi) };
+        if id.is_null() {
+            return 1;
+        }
+        // SAFETY: out is a valid return slot; the C++ side consumes the
+        // retention before the callback returns.
+        unsafe {
+            (*out).ty = VAL_RETAINED;
+            (*out).integer = 0;
+            (*out).real = 0.0;
+            (*out).string = ptr::null();
+            (*out).array = ptr::null();
+            (*out).array_count = 0;
+            (*out).retained = id as usize;
+        }
+        0
+    }
+
+    /// `RetainNatives.reentrant(x)` — retains its object argument, then
+    /// re-enters the VM with an eval that itself runs another native retain
+    /// (nested retain + consume), then returns the FIRST retention. If the
+    /// nested eval corrupted the in-flight retention, the caller gets the
+    /// wrong object.
+    extern "C" fn native_reentrant(
+        engine: *mut c_void,
+        argc: c_int,
+        argv: *const Value,
+        out: *mut Value,
+        _out_error: *mut *mut c_char,
+    ) -> c_int {
+        if argc < 1 || unsafe { &*argv }.ty != VAL_OBJECT {
+            return 1;
+        }
+        let ffi = Value {
+            ty: VAL_OBJECT,
+            integer: 0,
+            real: 0.0,
+            string: ptr::null(),
+            array: ptr::null(),
+            array_count: 0,
+            retained: 0,
+        };
+        // SAFETY: engine is a live engine.
+        let id = unsafe { tjs2_retain_value(engine as *mut Engine, &ffi) };
+        if id.is_null() {
+            return 1;
+        }
+        // Re-enter the VM from inside the callback: the eval clobbers
+        // last_object and runs a nested native that retains + consumes its
+        // own object.
+        let script = c"RetainNatives.retainFirst(%[nested: 1]); %[ev: 99]";
+        let mut inner = Value {
+            ty: VAL_VOID,
+            integer: 0,
+            real: 0.0,
+            string: ptr::null(),
+            array: ptr::null(),
+            array_count: 0,
+            retained: 0,
+        };
+        let mut err: *mut c_char = ptr::null_mut();
+        // SAFETY: engine is a live engine; the strings are NUL-terminated
+        // for the call.
+        let rc = unsafe {
+            tjs2_eval(
+                engine as *mut Engine,
+                script.as_ptr(),
+                c"reentrant".as_ptr(),
+                &mut inner,
+                &mut err,
+            )
+        };
+        if rc != 0 {
+            // SAFETY: err is malloc'd by the C++ side (or null).
+            let msg = unsafe { take_error_string(err) };
+            panic!("reentrant eval failed: {msg}");
+        }
+        // SAFETY: out is a valid return slot.
+        unsafe {
+            (*out).ty = VAL_RETAINED;
+            (*out).integer = 0;
+            (*out).real = 0.0;
+            (*out).string = ptr::null();
+            (*out).array = ptr::null();
+            (*out).array_count = 0;
+            (*out).retained = id as usize;
+        }
+        0
+    }
+
+    /// `RetainNatives.retainProp` (static property getter): evaluates a
+    /// fresh dict and returns it as VAL_RETAINED — the `Layer.font` pattern,
+    /// reachable as a bare statement (discarded result) or an assigned read.
+    extern "C" fn native_retain_prop_get(
+        engine: *mut c_void,
+        out: *mut Value,
+        _out_error: *mut *mut c_char,
+    ) -> c_int {
+        let mut inner = Value {
+            ty: VAL_VOID,
+            integer: 0,
+            real: 0.0,
+            string: ptr::null(),
+            array: ptr::null(),
+            array_count: 0,
+            retained: 0,
+        };
+        let mut err: *mut c_char = ptr::null_mut();
+        // SAFETY: engine is a live engine; the strings are NUL-terminated.
+        let rc = unsafe {
+            tjs2_eval(
+                engine as *mut Engine,
+                c"%[]".as_ptr(),
+                c"retainProp".as_ptr(),
+                &mut inner,
+                &mut err,
+            )
+        };
+        if rc != 0 {
+            return 1;
+        }
+        let ffi = Value {
+            ty: VAL_OBJECT,
+            integer: 0,
+            real: 0.0,
+            string: ptr::null(),
+            array: ptr::null(),
+            array_count: 0,
+            retained: 0,
+        };
+        // SAFETY: engine is a live engine; the eval just stored the dict in
+        // last_object.
+        let id = unsafe { tjs2_retain_value(engine as *mut Engine, &ffi) };
+        if id.is_null() {
+            return 1;
+        }
+        // SAFETY: out is a valid return slot; the C++ side consumes the
+        // retention before the callback returns.
+        unsafe {
+            (*out).ty = VAL_RETAINED;
+            (*out).integer = 0;
+            (*out).real = 0.0;
+            (*out).string = ptr::null();
+            (*out).array = ptr::null();
+            (*out).array_count = 0;
+            (*out).retained = id as usize;
+        }
+        0
+    }
+
+    fn retain_builder() -> NativeClassBuilder<'static> {
+        NativeClassBuilder {
+            name: "RetainNatives",
+            methods: vec![
+                NativeMethodDef {
+                    name: "retainFirst",
+                    f: native_retain_first_arg,
+                },
+                NativeMethodDef {
+                    name: "reentrant",
+                    f: native_reentrant,
+                },
+            ],
+            properties: vec![NativePropertyDef {
+                name: "retainProp",
+                get: Some(native_retain_prop_get),
+                set: None,
+            }],
+        }
+    }
+
+    /// Instance class with a `list(n)` method returning an array of `n`
+    /// strings (mirrors CSVParser.getNextLine).
+    extern "C" fn array_create(_engine: *mut c_void) -> *mut c_void {
+        Box::into_raw(Box::new(0i32)) as *mut c_void
+    }
+
+    extern "C" fn array_destroy(_engine: *mut c_void, instance: *mut c_void) {
+        // SAFETY: instance came from array_create.
+        unsafe { drop(Box::from_raw(instance as *mut i32)) };
+    }
+
+    /// `ArrayNatives.list(n)` — returns n distinct strings.
+    extern "C" fn array_list(
+        _engine: *mut c_void,
+        _instance: *mut c_void,
+        argc: c_int,
+        argv: *const Value,
+        out: *mut Value,
+        _out_error: *mut *mut c_char,
+        _objthis: *mut c_void,
+    ) -> c_int {
+        let n = if argc >= 1 {
+            // SAFETY: argv is valid for argc entries during the call.
+            unsafe { &*argv }.integer.max(0) as usize
+        } else {
+            0
+        };
+        let items: Vec<String> = (0..n)
+            .map(|i| format!("item-{i}-{}", "x".repeat(i % 7)))
+            .collect();
+        set_array_strings_out(out, &items);
+        0
+    }
+
+    /// `ArrayNatives.ret` (instance property getter): returns a fresh
+    /// retained dict — the `Window.primaryLayer` pattern, reachable as a
+    /// bare statement (discarded result).
+    extern "C" fn array_ret_get(
+        engine: *mut c_void,
+        _instance: *mut c_void,
+        out: *mut Value,
+        _out_error: *mut *mut c_char,
+        _objthis: *mut c_void,
+    ) -> c_int {
+        let mut inner = Value {
+            ty: VAL_VOID,
+            integer: 0,
+            real: 0.0,
+            string: ptr::null(),
+            array: ptr::null(),
+            array_count: 0,
+            retained: 0,
+        };
+        let mut err: *mut c_char = ptr::null_mut();
+        // SAFETY: engine is a live engine; the strings are NUL-terminated.
+        let rc = unsafe {
+            tjs2_eval(
+                engine as *mut Engine,
+                c"%[]".as_ptr(),
+                c"arrayRet".as_ptr(),
+                &mut inner,
+                &mut err,
+            )
+        };
+        if rc != 0 {
+            return 1;
+        }
+        let ffi = Value {
+            ty: VAL_OBJECT,
+            integer: 0,
+            real: 0.0,
+            string: ptr::null(),
+            array: ptr::null(),
+            array_count: 0,
+            retained: 0,
+        };
+        // SAFETY: engine is a live engine.
+        let id = unsafe { tjs2_retain_value(engine as *mut Engine, &ffi) };
+        if id.is_null() {
+            return 1;
+        }
+        // SAFETY: out is a valid return slot.
+        unsafe {
+            (*out).ty = VAL_RETAINED;
+            (*out).integer = 0;
+            (*out).real = 0.0;
+            (*out).string = ptr::null();
+            (*out).array = ptr::null();
+            (*out).array_count = 0;
+            (*out).retained = id as usize;
+        }
+        0
+    }
+
+    fn array_builder() -> NativeInstanceBuilder<'static> {
+        NativeInstanceBuilder {
+            name: "ArrayNatives",
+            create: array_create,
+            destroy: array_destroy,
+            methods: vec![NativeInstanceMethodDef {
+                name: "list",
+                f: array_list,
+            }],
+            properties: vec![NativeInstancePropertyDef {
+                name: "ret",
+                get: Some(array_ret_get),
+                set: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn static_native_returns_retained_object_usable_from_script() {
+        let _vm_lock = vm_lock();
+        // The Scripts.evalStorage / Layer.font pattern: a static native
+        // retains an object argument and returns it as VAL_RETAINED; the
+        // C++ side consumes the retention. The returned object must be the
+        // ORIGINAL (not a placeholder) and stay usable/mutable.
+        let e = Tjs2Engine::new().unwrap();
+        e.register_native_class(&retain_builder()).unwrap();
+        e.exec_script(
+            "var r = RetainNatives.retainFirst(%[a: 1]); var a = r.a; r.b = 42; var b = r.b;",
+            "test",
+        )
+        .unwrap();
+        assert_eq!(e.eval("a", "test").unwrap(), TjsValue::Integer(1));
+        assert_eq!(e.eval("b", "test").unwrap(), TjsValue::Integer(42));
+        // still the same object across engine calls
+        e.exec_script("r.c = 7;", "test").unwrap();
+        assert_eq!(e.eval("r.c", "test").unwrap(), TjsValue::Integer(7));
+    }
+
+    #[test]
+    fn discarded_retained_results_do_not_leak_in_the_map() {
+        let _vm_lock = vm_lock();
+        // The C++ retained-value map is the ground truth for retention
+        // leaks: every retain must be consumed (assigned result) or
+        // released (result discarded as a bare statement / bare property
+        // read — the VM passes result==NULL there and the dispatch must
+        // still release the entry). Repeated calls must not grow the map.
+        let e = Tjs2Engine::new().unwrap();
+        e.register_native_class(&retain_builder()).unwrap();
+        e.register_native_class_instance(&array_builder()).unwrap();
+        // Assigned result: consumed by the conversion.
+        e.exec_script(
+            "var r = RetainNatives.retainFirst(%[a: 1]); r = null; %[];",
+            "test",
+        )
+        .unwrap();
+        assert_eq!(
+            unsafe { tjs2_retained_count(e.inner) },
+            0,
+            "assigned retained result leaked"
+        );
+        // Bare statement (static method): the VM discards the result.
+        for _ in 0..100 {
+            e.exec_script("RetainNatives.retainFirst(%[b: 2]);", "test")
+                .unwrap();
+            assert_eq!(
+                unsafe { tjs2_retained_count(e.inner) },
+                0,
+                "bare-statement retained result leaked"
+            );
+        }
+        // Bare statement (static property getter; Layer.font pattern).
+        for _ in 0..100 {
+            e.exec_script("RetainNatives.retainProp;", "test").unwrap();
+            assert_eq!(
+                unsafe { tjs2_retained_count(e.inner) },
+                0,
+                "discarded static property result leaked"
+            );
+        }
+        // Bare statement (instance property getter; primaryLayer pattern).
+        e.exec_script("var a = new ArrayNatives();", "test")
+            .unwrap();
+        for _ in 0..100 {
+            e.exec_script("a.ret;", "test").unwrap();
+            assert_eq!(
+                unsafe { tjs2_retained_count(e.inner) },
+                0,
+                "discarded instance property result leaked"
+            );
+        }
+        // The map still works for live retentions afterwards.
+        e.exec_script("var f = function() { return 3; };", "test")
+            .unwrap();
+        let f = e.eval("f", "test").unwrap();
+        let id = e.retain_value(&f).unwrap();
+        assert_eq!(e.call_value(&id, &[]).unwrap(), TjsValue::Integer(3));
+        assert_eq!(unsafe { tjs2_retained_count(e.inner) }, 1);
+        drop(id);
+        assert_eq!(unsafe { tjs2_retained_count(e.inner) }, 0);
+    }
+
+    #[test]
+    fn release_twice_and_unknown_id_are_noops() {
+        let _vm_lock = vm_lock();
+        // The C++ claim "release of an unknown id is a safe no-op" must
+        // hold: double release of a live id, a raw id after the C++ side
+        // consumed it, and completely bogus ids must not crash or corrupt
+        // the engine.
+        let e = Tjs2Engine::new().unwrap();
+        e.exec_script("var f = function() { return 1; };", "test")
+            .unwrap();
+        let f = e.eval("f", "test").unwrap();
+        let id = e.retain_value(&f).unwrap();
+        let raw = id.id;
+        drop(id); // first release
+        // second release of the same raw id (no longer registered):
+        unsafe { tjs2_release_value(e.inner, raw) };
+        // never-allocated / null ids:
+        unsafe { tjs2_release_value(e.inner, 0x1 as Tjs2ValueId) };
+        unsafe { tjs2_release_value(e.inner, ptr::null_mut()) };
+        // engine still fully usable, and retains still work
+        assert_eq!(e.eval("1 + 1", "test").unwrap(), TjsValue::Integer(2));
+        e.exec_script("var g = function() { return 5; };", "test")
+            .unwrap();
+        let g = e.eval("g", "test").unwrap();
+        let id2 = e.retain_value(&g).unwrap();
+        assert_eq!(e.call_value(&id2, &[]).unwrap(), TjsValue::Integer(5));
+    }
+
+    #[test]
+    fn ffi_call_value_with_retained_arg_errors_cleanly() {
+        let _vm_lock = vm_lock();
+        // The unsafe FFI entry point must tolerate a TJS2_VAL_RETAINED
+        // argument: argument conversion consumes the map entry, so the
+        // subsequent call-value lookup must fail cleanly instead of reading
+        // through a dangling map iterator (the pre-fix UB).
+        let e = Tjs2Engine::new().unwrap();
+        e.exec_script("var f = function() { return 42; };", "test")
+            .unwrap();
+        let f = e.eval("f", "test").unwrap();
+        let id = e.retain_value(&f).unwrap();
+        // The argument is a RETAINED value for the SAME id being called.
+        let retained_arg = Value {
+            ty: VAL_RETAINED,
+            integer: 0,
+            real: 0.0,
+            string: ptr::null(),
+            array: ptr::null(),
+            array_count: 0,
+            retained: id.id as usize,
+        };
+        let mut out = Value {
+            ty: VAL_VOID,
+            integer: 0,
+            real: 0.0,
+            string: ptr::null(),
+            array: ptr::null(),
+            array_count: 0,
+            retained: 0,
+        };
+        let mut error: *mut c_char = ptr::null_mut();
+        // SAFETY: e.inner is live; the id and arg are deliberately
+        // self-referential.
+        let rc = unsafe { tjs2_call_value(e.inner, id.id, 1, &retained_arg, &mut out, &mut error) };
+        assert_ne!(rc, 0, "call with a consumed id must fail");
+        // SAFETY: error was filled by the C++ side (or left null).
+        let msg = unsafe { take_error_string(error) };
+        assert!(msg.contains("invalid retained value"), "unexpected: {msg}");
+        // The entry was consumed by the argument; the id's Drop release is
+        // a no-op.
+        drop(id);
+        // The engine is still healthy and other retains still work.
+        e.exec_script("var g = function() { return 9; };", "test")
+            .unwrap();
+        let g = e.eval("g", "test").unwrap();
+        let id2 = e.retain_value(&g).unwrap();
+        assert_eq!(e.call_value(&id2, &[]).unwrap(), TjsValue::Integer(9));
+    }
+
+    #[test]
+    fn array_return_many_strings_repeated_calls() {
+        let _vm_lock = vm_lock();
+        // VAL_ARRAY results live in a thread-local scratch buffer that is
+        // valid only until the next callback; repeated calls with different
+        // sizes must not observe stale bytes from the previous call.
+        let e = Tjs2Engine::new().unwrap();
+        e.register_native_class_instance(&array_builder()).unwrap();
+        e.exec_script("var a = new ArrayNatives();", "test")
+            .unwrap();
+        for n in [1usize, 50, 3, 1000, 7] {
+            let script = format!("var arr = a.list({n}); var s = arr.join(',');");
+            e.exec_script(&script, "test").unwrap();
+            let got = match e.eval("s", "test").unwrap() {
+                TjsValue::String(s) => s,
+                other => panic!("list({n}) returned non-string: {other:?}"),
+            };
+            let expected: Vec<String> = (0..n)
+                .map(|i| format!("item-{i}-{}", "x".repeat(i % 7)))
+                .collect();
+            assert_eq!(got, expected.join(","), "mismatch at n={n}");
+            // element count round-trips
+            let cnt = format!("var c = a.list({n}).count;");
+            e.exec_script(&cnt, "test").unwrap();
+            assert_eq!(e.eval("c", "test").unwrap(), TjsValue::Integer(n as i64));
+        }
+        // Interleave a string return between array returns (scratch reuse).
+        e.exec_script("var s1 = a.list(2).join(',');", "test")
+            .unwrap();
+        assert_eq!(
+            e.eval("s1", "test").unwrap(),
+            TjsValue::String("item-0-,item-1-x".into())
+        );
+    }
+
+    #[test]
+    fn native_that_evals_during_callback_does_not_corrupt_retention() {
+        let _vm_lock = vm_lock();
+        let e = Tjs2Engine::new().unwrap();
+        e.register_native_class(&retain_builder()).unwrap();
+        // Keep a function retained while a native re-enters the VM.
+        e.exec_script("var f = function() { return 123; };", "test")
+            .unwrap();
+        let f = e.eval("f", "test").unwrap();
+        let id = e.retain_value(&f).unwrap();
+        // The native retains its argument, evals (nested native retain +
+        // consume + last_object clobber), then returns the FIRST retention.
+        e.exec_script("var r = RetainNatives.reentrant(%[a: 7]);", "test")
+            .unwrap();
+        // The returned object is the original dict, not the nested eval's.
+        e.exec_script("var chk = r.a;", "test").unwrap();
+        assert_eq!(e.eval("chk", "test").unwrap(), TjsValue::Integer(7));
+        // The in-flight Rust-side retention survived the nested eval.
+        assert_eq!(e.call_value(&id, &[]).unwrap(), TjsValue::Integer(123));
+        // And the object returned by the reentrant native is still the
+        // original: mutations on it are visible.
+        e.exec_script("r.b = 99; var chk2 = r.b;", "test").unwrap();
+        assert_eq!(e.eval("chk2", "test").unwrap(), TjsValue::Integer(99));
+    }
+
+    #[test]
+    fn instance_property_on_class_object_errors_cleanly() {
+        let _vm_lock = vm_lock();
+        // An instance property dispatched with objthis = the class object
+        // (no native instance behind it) must produce a clean TJS error,
+        // not a crash, and the engine must stay usable.
+        let e = Tjs2Engine::new().unwrap();
+        e.register_native_class_instance(&counter_builder())
+            .unwrap();
+        let err = e.eval("Counter.value", "test").unwrap_err();
+        assert!(!err.to_string().is_empty(), "expected an error: {err}");
+        let err = e.eval("Counter.value = 5", "test").unwrap_err();
+        assert!(!err.to_string().is_empty(), "expected an error: {err}");
+        // engine still healthy afterwards
+        e.exec_script("var c = new Counter(); c.value = 3;", "test")
+            .unwrap();
+        assert_eq!(e.eval("c.value", "test").unwrap(), TjsValue::Integer(3));
+    }
+
+    #[test]
+    fn instance_callback_receives_valid_objthis() {
+        let _vm_lock = vm_lock();
+        let e = Tjs2Engine::new().unwrap();
+        e.register_native_class_instance(&counter_builder())
+            .unwrap();
+        // Two distinct instances must produce distinct, non-null objthis
+        // pointers on the trailing C ABI argument.
+        e.exec_script(
+            "var a = new Counter(); var b = new Counter(); var oa = a.objthis(); var ob = b.objthis();",
+            "test",
+        )
+        .unwrap();
+        let oa = match e.eval("oa", "test").unwrap() {
+            TjsValue::Integer(v) => v,
+            other => panic!("objthis returned {other:?}"),
+        };
+        let ob = match e.eval("ob", "test").unwrap() {
+            TjsValue::Integer(v) => v,
+            other => panic!("objthis returned {other:?}"),
+        };
+        assert_ne!(oa, 0, "objthis must be non-null");
+        assert_ne!(ob, 0, "objthis must be non-null");
+        assert_ne!(oa, ob, "different instances must have different objthis");
+        // The recorded pointer matches the returned value.
+        assert_eq!(
+            LAST_OBJTHIS.load(std::sync::atomic::Ordering::SeqCst) as i64,
+            ob
+        );
     }
 }

@@ -13,7 +13,6 @@
 //! `extends` bases that are neither script classes nor registered natives:
 //!
 //!   InputNotifyBase        SceneBase, EyeCatchBase, StaffRoll extend it
-//!   WaveSoundBuffer        SoundBuffer extends it (sound.tjs)
 //!   VideoOverlay           MovieLayer extends it (movie.tjs)
 //!   WIN32GenericDialogEX   k2compat dialog base
 //!   TextContentModelessDialog  k2compat dialog base
@@ -70,7 +69,6 @@ fn register_one(engine: &Tjs2Engine, name: &'static str) -> Result<(), String> {
 pub fn register_plugin_stubs(engine: &Tjs2Engine) -> Result<(), String> {
     for name in [
         "InputNotifyBase",
-        "WaveSoundBuffer",
         "VideoOverlay",
         "WIN32GenericDialogEX",
         "TextContentModelessDialog",
