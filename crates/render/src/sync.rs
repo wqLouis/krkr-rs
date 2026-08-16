@@ -150,12 +150,12 @@ pub fn sync_scene(
     cameras: Query<Entity, With<SceneCamera>>,
 ) {
     // Full rebuild: drop everything we spawned last frame (camera excluded).
+    // Roots auto-despawn their sprite children (despawning a parent removes
+    // the whole subtree), so only the roots need explicit despawn commands.
     for entity in &previous_roots {
         commands.entity(entity).despawn();
     }
-    for entity in &previous_sprites {
-        commands.entity(entity).despawn();
-    }
+    let _ = previous_sprites;
 
     let scene = shared.0.read().expect("shared scene lock poisoned");
     let mut uploaded: Vec<u32> = Vec::new();
