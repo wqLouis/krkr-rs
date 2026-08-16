@@ -60,6 +60,8 @@ use std::ptr;
 use std::sync::{Arc, Mutex};
 
 use engine::Storage;
+mod csv_parser;
+
 use tjs2_sys::{
     NativeClassBuilder, NativeMethodDef, Tjs2Engine, VAL_INTEGER, VAL_REAL, VAL_STRING, VAL_VOID,
     Value, tjs2_malloc,
@@ -75,8 +77,6 @@ static STORAGE: Mutex<Option<Arc<Mutex<Storage>>>> = Mutex::new(None);
 
 /// Auto search paths registered via `Storages.addAutoPath` (normalized,
 /// trailing `/` stripped).
-static AUTO_PATHS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
-
 /// Mount a game storage for the `Storages` class to query. Call once before
 /// running `startup.tjs`; pass `None` to detach (used between tests).
 pub fn set_storage(storage: Option<Arc<Mutex<Storage>>>) {
@@ -95,10 +95,6 @@ fn storage_arc() -> Option<Arc<Mutex<Storage>>> {
     STORAGE.lock().unwrap().clone()
 }
 
-fn auto_paths_snapshot() -> Vec<PathBuf> {
-    AUTO_PATHS.lock().unwrap().clone()
-}
-
 // ---------------------------------------------------------------------------
 // Name normalization and helpers
 // ---------------------------------------------------------------------------
@@ -106,6 +102,19 @@ fn auto_paths_snapshot() -> Vec<PathBuf> {
 /// Normalize a storage name the way `TVPNormalizeStorageName` does for the
 /// common case: ASCII-lowercase, `\` → `/`. (The reference also maps media
 /// prefixes such as `file://./`; not needed for the mounted-game model.)
+/// Resolve `base` (a storage name without directory) inside one auto path
+/// entry. Entries may be disk dirs (`system/`) or archive prefixes
+/// (`data.xp3>system/`); the latter are resolved through the mounted
+/// storage, like the reference's auto-path table.
+fn auto_path_resolves(entry: &str, base: &str) -> bool {
+    storage_arc()
+        .map(|st| {
+            let joined = format!("{entry}{base}");
+            st.lock().unwrap().find(&joined).is_some()
+        })
+        .unwrap_or(false)
+}
+
 fn normalize_storage_name(name: &str) -> String {
     name.chars()
         .map(|c| {
@@ -186,7 +195,14 @@ fn exists_in_storage(name: &str) -> bool {
     let Some(storage) = storage_arc() else {
         return false;
     };
-    if storage.lock().unwrap().exists(name) {
+    // `name` may already be normalized (lowercased) by the caller; try the
+    // raw name too so absolute disk paths with mixed case resolve on
+    // case-sensitive filesystems.
+    let found = {
+        let st = storage.lock().unwrap();
+        st.exists(name) || st.exists(&normalize_storage_name(name))
+    };
+    if found {
         return true;
     }
     // Fallback: `engine::Storage::find` is case-sensitive on disk, but
@@ -205,13 +221,16 @@ fn is_existent_storage(name: &str) -> bool {
     if name.is_empty() {
         return false;
     }
-    let normalized = normalize_storage_name(name);
-    if exists_in_storage(&normalized) {
+    // Try the raw name first (absolute paths with mixed case), then the
+    // normalized (lowercased) form.
+    if exists_in_storage(name) || exists_in_storage(&normalize_storage_name(name)) {
         return true;
     }
-    auto_paths_snapshot()
+    let normalized = normalize_storage_name(name);
+    let base = extract_storage_name(&normalized);
+    engine::storage::auto_paths()
         .iter()
-        .any(|dir| dir.join(&normalized).is_file())
+        .any(|entry| auto_path_resolves(entry, &base))
 }
 
 /// `TVPGetPlacedPath`: the normalized storage name when found (mounted
@@ -230,9 +249,9 @@ fn placed_path(name: &str) -> String {
     // `Add` overwrites earlier entries).
     let base = extract_storage_name(&normalized);
     let mut found: Option<String> = None;
-    for dir in auto_paths_snapshot() {
-        if dir.join(&base).is_file() {
-            found = Some(format!("{}/{}", dir.display(), base));
+    for entry in engine::storage::auto_paths() {
+        if auto_path_resolves(&entry, &base) {
+            found = Some(format!("{entry}{base}"));
         }
     }
     found.unwrap_or_default()
@@ -371,20 +390,12 @@ fn add_auto_path(path: &str) -> Result<(), String> {
             "Storages.addAutoPath: path must end with '/', '\\\\' or '>' (the reference throws TVPMissingPathDelimiterAtLast); got \"{path}\""
         ));
     }
-    if path.contains('>') {
-        return Err(format!(
-            "Storages.addAutoPath: in-archive auto paths (\"arc.xp3>\") are not supported yet; got \"{path}\""
-        ));
-    }
-    let dir = PathBuf::from(normalize_storage_name(path).trim_end_matches('/'));
-    if dir.as_os_str().is_empty() {
+    let entry = normalize_storage_name(path);
+    if entry.trim_end_matches(['/', '>']).is_empty() {
         return Err("Storages.addAutoPath: empty path".into());
     }
-    let mut list = AUTO_PATHS.lock().unwrap();
-    if !list.contains(&dir) {
-        list.push(dir);
-        log::debug!("tvp-storages: added auto path \"{path}\"");
-    }
+    engine::storage::add_auto_path(entry);
+    log::debug!("tvp-storages: added auto path \"{path}\"");
     Ok(())
 }
 
@@ -394,12 +405,9 @@ fn remove_auto_path(path: &str) -> Result<(), String> {
             "Storages.removeAutoPath: path must end with '/', '\\\\' or '>' (the reference throws TVPMissingPathDelimiterAtLast); got \"{path}\""
         ));
     }
-    let dir = PathBuf::from(normalize_storage_name(path).trim_end_matches('/'));
-    let mut list = AUTO_PATHS.lock().unwrap();
-    if let Some(pos) = list.iter().position(|d| d == &dir) {
-        list.remove(pos);
-        log::debug!("tvp-storages: removed auto path \"{path}\"");
-    }
+    let entry = normalize_storage_name(path);
+    engine::storage::remove_auto_path(&entry);
+    log::debug!("tvp-storages: removed auto path \"{path}\"");
     Ok(())
 }
 
@@ -783,6 +791,7 @@ native_pending!(
 /// Register the `Storages` native class on `engine` (static methods only,
 /// matching the current tjs2-sys milestone).
 pub fn register_storages(engine: &Tjs2Engine) -> Result<(), String> {
+    csv_parser::register_csv_parser(engine)?;
     let builder = NativeClassBuilder {
         name: "Storages",
         properties: Vec::new(),
@@ -896,7 +905,7 @@ mod tests {
     /// Clear the process-global state between tests.
     fn reset_globals() {
         *STORAGE.lock().unwrap() = None;
-        AUTO_PATHS.lock().unwrap().clear();
+        engine::storage::set_auto_paths(Vec::new());
     }
 
     /// Create a game dir with the given files (`rel` → contents; a trailing

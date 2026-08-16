@@ -1,0 +1,10 @@
+[package]
+name = "tvp-text"
+description = "Text rendering core: glyph rasterization (ab_glyph) and CJK layout, foundation for KAG message text"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ab_glyph = "0.2"
+fontdb = { version = "0.23", default-features = false, features = ["std", "fs"] }

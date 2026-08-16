@@ -1,13 +1,13 @@
 [package]
-name = "tvp-scripts"
-description = "Scripts native class in Rust: execStorage / evalStorage / exec over mounted storage"
+name = "tvp-kagparser"
+description = "KAGParser native class in Rust: loads .ks scenarios and steps through parsed tags (KAG engine behind ADV text scenes)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-flate2 = "1"
 tjs2-sys = { workspace = true }
 engine = { path = "../engine" }
+kag = { path = "../kag" }
 tvp-util = { path = "../tvp-util" }
 log = "0.4"

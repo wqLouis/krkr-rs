@@ -53,6 +53,7 @@
 
 use std::cell::RefCell;
 use std::ffi::{CStr, c_char, c_int, c_void};
+use std::io::Read;
 use std::ptr;
 use std::sync::{Arc, Mutex};
 
@@ -126,15 +127,103 @@ fn context_engine() -> Result<Arc<Tjs2Engine>, String> {
 
 /// Decode script bytes the way the reference text stream does: honor a
 /// leading BOM, else UTF-8, else CP932 (mirrors `ks_check.rs`).
+/// Decompress/decrypt a script or save stream with the reference's `FE FE`
+/// magic (tTVPTextReadStream, TextStream.cpp):
+///
+/// * mode 2 — zlib stream: `FE FE 02 FF FE <compressed:u64 LE>
+///   <uncompressed:u64 LE> <zlib data>`; the payload is UTF-16LE text.
+/// * mode 0/1 — XOR / bit-rotate ciphers over UTF-16 text (rare; the game's
+///   system.dat uses mode 2).
+///
+/// Returns the decoded UTF-16LE bytes (no BOM) for non-magic data unchanged.
+fn decompress_script(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    if bytes.len() < 3 || bytes[0] != 0xFE || bytes[1] != 0xFE {
+        return Ok(bytes.to_vec());
+    }
+    let mode = bytes[2];
+    if mode == 2 {
+        // bytes[3..5] is the UTF-16LE BOM marker; sizes start at +5.
+        if bytes.len() < 21 {
+            return Err("FE FE data too short for compressed mode".into());
+        }
+        let compressed = u64::from_le_bytes(bytes[5..13].try_into().unwrap()) as usize;
+        let uncompressed = u64::from_le_bytes(bytes[13..21].try_into().unwrap()) as usize;
+        if 21 + compressed > bytes.len() {
+            return Err("FE FE compressed size overruns the data".into());
+        }
+        let mut out = Vec::with_capacity(uncompressed);
+        let mut dec = flate2::read::ZlibDecoder::new(&bytes[21..21 + compressed]);
+        dec.read_to_end(&mut out)
+            .map_err(|e| format!("FE FE zlib decode failed: {e}"))?;
+        if out.len() != uncompressed {
+            return Err(format!(
+                "FE FE size mismatch: expected {uncompressed}, got {}",
+                out.len()
+            ));
+        }
+        Ok(out)
+    } else if mode == 0 || mode == 1 {
+        // UTF-16LE payload with a simple per-char cipher.
+        if bytes.len() < 4 {
+            return Err("FE FE data too short for cipher mode".into());
+        }
+        let src = &bytes[4..];
+        if !src.len().is_multiple_of(2) {
+            return Err("FE FE cipher payload must be even-length".into());
+        }
+        let mut out = Vec::with_capacity(src.len());
+        for chunk in src.chunks_exact(2) {
+            let mut ch = u16::from_le_bytes([chunk[0], chunk[1]]);
+            if mode == 0 {
+                if ch >= 0x20 {
+                    ch ^= ((ch & 0xfe) << 8) ^ 1;
+                }
+            } else {
+                ch = ((ch & 0xaaaa) >> 1) | ((ch & 0x5555) << 1);
+            }
+            out.extend_from_slice(&ch.to_le_bytes());
+        }
+        Ok(out)
+    } else {
+        Err(format!("FE FE unsupported mode {mode}"))
+    }
+}
+
 fn decode_script(bytes: &[u8]) -> Result<String, String> {
     let (body, enc) = encoding::strip_bom(bytes);
     match enc {
         Some(enc) => enc.decode(body).map_err(|e| e.to_string()),
-        None => match String::from_utf8(body.to_vec()) {
-            Ok(text) => Ok(text),
-            Err(_) => encoding::decode(body, "cp932").map_err(|e| e.to_string()),
-        },
+        None => {
+            if looks_like_utf16le(body) {
+                // BOM-less UTF-16LE (the FE FE decompressor yields this for
+                // `(const) [...]` save data).
+                let units: Vec<u16> = body
+                    .chunks_exact(2)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .collect();
+                return String::from_utf16(&units).map_err(|e| e.to_string());
+            }
+            match String::from_utf8(body.to_vec()) {
+                Ok(text) => Ok(text),
+                Err(_) => encoding::decode(body, "cp932").map_err(|e| e.to_string()),
+            }
+        }
     }
+}
+
+/// Heuristic: even-length payload with a high ratio of zero bytes in the
+/// high position → BOM-less UTF-16LE.
+fn looks_like_utf16le(bytes: &[u8]) -> bool {
+    if bytes.len() < 4 || !bytes.len().is_multiple_of(2) {
+        return false;
+    }
+    let mut high_zeros = 0usize;
+    for chunk in bytes.chunks_exact(2) {
+        if chunk[1] == 0 {
+            high_zeros += 1;
+        }
+    }
+    high_zeros * 4 >= bytes.len() / 2 // >= 25% of units have a zero high byte
 }
 
 /// Parse a text-stream mode string for the `oN` byte offset, mirroring the
@@ -186,15 +275,15 @@ fn execute_storage(name: &str, mode: &str, expression: bool) -> Result<TjsValue,
     };
 
     // The reference's tTVPTextReadStream decrypts/decompresses data with
-    // the FE FE magic; we do not support that yet.
-    if bytes.starts_with(&[0xFE, 0xFE]) {
-        return Err(format!(
-            "Scripts: '{name}' looks like encrypted/compressed script data \
-             (FE FE magic), which is not supported yet"
-        ));
-    }
+    // the FE FE magic (TextStream.cpp): `FE FE <mode> FF FE <compressed:u64>
+    // <uncompressed:u64> <zlib stream>` for mode 2; mode 0/1 are the
+    // simple XOR/rotate ciphers for UTF-16 text.
+    let bytes = match decompress_script(bytes) {
+        Ok(b) => b,
+        Err(e) => return Err(format!("Scripts: '{name}': {e}")),
+    };
 
-    let text = decode_script(bytes)?;
+    let text = decode_script(&bytes)?;
     log::debug!(
         "Scripts: {} '{name}' ({} bytes)",
         if expression { "eval" } else { "exec" },
@@ -341,6 +430,36 @@ fn finish(out: *mut Value, out_error: *mut *mut c_char, result: Result<TjsValue,
     }
 }
 
+/// After an eval, if the script produced an OBJECT result (an array or dict
+/// literal — `(const) [...]` save data), retain it and return it across the
+/// ABI via the retained-value slot. Returns true when handled.
+fn try_retain_object_result(out: *mut Value, engine: &tjs2_sys::Tjs2Engine) -> bool {
+    match engine.retain_value_detached(&tjs2_sys::TjsValue::Object) {
+        Ok(dv) => {
+            // SAFETY: `out` is a valid result slot for this call; the C++
+            // side copies the retained variant into the result before the
+            // callback returns.
+            unsafe {
+                (*out).ty = tjs2_sys::VAL_RETAINED;
+                (*out).integer = 0;
+                (*out).real = 0.0;
+                (*out).string = std::ptr::null();
+                (*out).array = std::ptr::null();
+                (*out).array_count = 0;
+                (*out).retained = dv.raw_id() as usize;
+            }
+            // The C++ side CONSUMES the retention (copies + erases the map
+            // entry) when it converts the result, so the DetachedValue must
+            // outlive this callback — leak it (its Drop would release the
+            // id before the conversion runs; forgetting skips the release,
+            // which is then a safe no-op after the erase).
+            std::mem::forget(dv);
+            true
+        }
+        Err(_) => false, // no object result; keep the scalar void
+    }
+}
+
 // ---------------------------------------------------------------------------
 // native methods
 // ---------------------------------------------------------------------------
@@ -414,7 +533,14 @@ extern "C" fn native_eval_storage(
             "Scripts.evalStorage: the execution-context argument is not supported yet; ignoring"
         );
     }
-    finish(out, out_error, execute_storage(&name, &mode, true))
+    let result = execute_storage(&name, &mode, true);
+    if result.is_ok()
+        && let Ok(engine) = context_engine()
+        && try_retain_object_result(out, &engine)
+    {
+        return 0;
+    }
+    finish(out, out_error, result)
 }
 
 /// `Scripts.exec(script[, name[, lineofs[, context]]])`.
@@ -499,10 +625,40 @@ extern "C" fn native_eval(
 // registration
 // ---------------------------------------------------------------------------
 
+/// `Scripts.getTraceString(limit?)` — the current VM stack trace as a string
+/// (reference `TJSGetStackTraceString`).
+extern "C" fn native_get_trace_string(
+    engine: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+) -> c_int {
+    let limit = if argc >= 1 && !argv.is_null() {
+        // SAFETY: argv/argc follow the contract.
+        unsafe { &*argv }.integer as i32
+    } else {
+        0
+    };
+    // SAFETY: engine is a live engine; the string is malloc'd and freed
+    // below (the C++ trampoline copies the result immediately).
+    let ptr =
+        unsafe { tjs2_sys::tjs2_get_stack_trace_string(engine as *mut tjs2_sys::Engine, limit) };
+    if ptr.is_null() {
+        set_out_void(out);
+        return 0;
+    }
+    // SAFETY: ptr is NUL-terminated (allocated by the C++ side).
+    let s = unsafe { std::ffi::CStr::from_ptr(ptr) }
+        .to_string_lossy()
+        .into_owned();
+    // SAFETY: ptr was malloc'd by tjs2_get_stack_trace_string.
+    unsafe { tjs2_sys::tjs2_free_string(ptr) };
+    set_string_result(out, &s);
+    0
+}
+
 /// Register the `Scripts` native class on `engine`'s global object.
-///
-/// `dump`, `getTraceString` and `dumpStringHeap` are deliberately not
-/// registered yet (they need VM internals that the C ABI does not expose).
 pub fn register_scripts(engine: &Tjs2Engine) -> Result<(), String> {
     engine.register_native_class(&NativeClassBuilder {
         name: "Scripts",
@@ -523,6 +679,10 @@ pub fn register_scripts(engine: &Tjs2Engine) -> Result<(), String> {
             NativeMethodDef {
                 name: "eval",
                 f: native_eval,
+            },
+            NativeMethodDef {
+                name: "getTraceString",
+                f: native_get_trace_string,
             },
         ],
     })

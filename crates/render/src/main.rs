@@ -1,26 +1,36 @@
-//! `krkr-vn` binary: the demo harness (and future game runner).
+//! `krkr-vn` binary: the demo harness and the graphical game runner.
 //!
 //! * `krkr-vn demo` — builds a small [`Scene`] in code and renders it for a
 //!   few seconds (or until the window closes), proving the scene → Bevy
 //!   pipeline end to end.
-//! * `krkr-vn run <game-dir>` — placeholder until the visual natives crate
-//!   lands: prints `visual natives not yet integrated` and exits 1. The
-//!   [`startup`] fn keeps the call shape ready for the future wiring
-//!   (prepare engine, register natives, run startup.tjs — WAVE3 SA-5).
+//! * `krkr-vn run <game-dir> [--headless]` — the real game runner: mounts
+//!   the game's storage, registers the TVP native classes (`System`,
+//!   `Storages`, `Scripts`, then the visual `Window`/`Layer`/`Bitmap`/
+//!   `Font`/`Timer` bound to the shared [`Scene`]), runs `startup.tjs`, and
+//!   then drives the VM's timers every frame **before** syncing the scene
+//!   into Bevy entities (script mutations render the same frame).
+//!   `--headless` runs one pass of the same pipeline with no window or GPU
+//!   (MinimalPlugins) and dumps the resulting scene state to stdout.
 
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use bevy::app::{App, AppExit};
+use bevy::asset::Assets;
 use bevy::ecs::schedule::IntoScheduleConfigs;
+use bevy::image::Image;
 use bevy::prelude::{
-    DefaultPlugins, MessageWriter, PluginGroup, Res, ResMut, Resource, Time, Update,
+    Commands, DefaultPlugins, MessageWriter, MinimalPlugins, PluginGroup, Res, ResMut, Resource,
+    Startup, Time, Update,
 };
 use bevy::window::{Window, WindowPlugin};
+use engine::loader::LoadReport;
 use krkr_render::sync::{BitmapAssets, SharedScene, sync_scene};
 use tvp_visual::scene::{BitmapState, Rect, Scene};
 
+/// Game logical window size (1280x720, the title screen's native size).
+const GAME_SIZE: (u32, u32) = (1280, 720);
 /// Demo window size (also the game's logical size, 1280x720).
 const DEMO_SIZE: (u32, u32) = (1280, 720);
 /// Demo duration before auto-exit (window close also exits).
@@ -28,41 +38,296 @@ const DEMO_SECONDS: f32 = 8.0;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    engine::init_logging(args.iter().any(|a| a == "-v" || a == "--verbose"));
     match args.first().map(String::as_str) {
         Some("demo") => run_demo(),
         Some("run") => {
-            let Some(game_dir) = args.get(1).map(PathBuf::from) else {
-                eprintln!("krkr-vn: usage: krkr-vn run <game-dir>");
+            let rest: Vec<&String> = args.iter().skip(1).collect();
+            let headless = rest.iter().any(|a| a.as_str() == "--headless");
+            let Some(game_dir) = rest
+                .iter()
+                .find(|a| !a.starts_with('-'))
+                .map(|a| PathBuf::from(a.as_str()))
+            else {
+                eprintln!("krkr-vn: usage: krkr-vn run <game-dir> [--headless]");
                 std::process::exit(2);
             };
-            run_game(&game_dir);
+            run_game(&game_dir, headless);
         }
         _ => {
-            eprintln!("krkr-vn: usage: krkr-vn demo | krkr-vn run <game-dir>");
+            eprintln!("krkr-vn: usage: krkr-vn demo | krkr-vn run <game-dir> [--headless]");
             std::process::exit(2);
         }
     }
 }
 
-/// `krkr-vn run <game-dir>` — placeholder. The real wiring (prepare engine,
-/// register natives, set contexts, run startup.tjs) lands with the natives
-/// crate; this keeps the structure ready.
-fn run_game(game_dir: &std::path::Path) -> ! {
+// ---------------------------------------------------------------------------
+// Game runner (`krkr-vn run <game-dir>`)
+// ---------------------------------------------------------------------------
+
+/// `krkr-vn run <game-dir>` configuration (windowed or headless).
+#[derive(Resource)]
+struct GameConfig {
+    game_dir: PathBuf,
+}
+
+/// The running TJS2 VM + its start [`Instant`], inserted by [`game_startup`].
+/// [`run_vm`] polls it every frame for `timer_poll`'s `now_ms`.
+#[derive(Resource)]
+struct VmRuntime {
+    engine: Arc<tjs2_sys::Tjs2Engine>,
+    started: Instant,
+}
+
+/// Result of executing `startup.tjs` — kept so `--headless` and the
+/// integration test can inspect what actually ran.
+#[derive(Resource)]
+struct StartupReport(LoadReport);
+
+/// `krkr-vn run <game-dir>`: mount the game, register natives, run
+/// `startup.tjs`, then loop (VM timers → scene sync → render).
+/// `--headless` runs one pass with no window and dumps the scene instead.
+fn run_game(game_dir: &std::path::Path, headless: bool) -> ! {
     let shared = SharedScene(Arc::new(RwLock::new(Scene::default())));
-    match startup(&shared, game_dir) {
-        Ok(()) => std::process::exit(0),
-        Err(message) => {
-            eprintln!("krkr-vn: {message}");
+    if headless {
+        run_headless(shared, game_dir.to_path_buf());
+    }
+    println!("krkr-vn: running {game_dir:?} (close the window to exit)");
+    game_app(shared, game_dir.to_path_buf()).run();
+    unreachable!("App::run returns only after the app exits")
+}
+
+/// The windowed game app: default plugins (window + renderer), the shared
+/// scene, and the game pipeline. The window is 1280x720 "krkr-rs"; closing
+/// it exits (default `ExitCondition::OnPrimaryClosed`).
+fn game_app(shared: SharedScene, game_dir: PathBuf) -> App {
+    let mut app = App::new();
+    app.insert_resource(shared)
+        .insert_resource(GameConfig { game_dir })
+        .init_resource::<BitmapAssets>()
+        .add_plugins(DefaultPlugins.set(WindowPlugin {
+            primary_window: Some(Window {
+                title: "krkr-rs".into(),
+                resolution: GAME_SIZE.into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+        .add_systems(Startup, game_startup)
+        // run_vm BEFORE sync_scene: script mutations must render the same
+        // frame, not one frame later.
+        .add_systems(Update, (run_vm, sync_scene).chain());
+    app
+}
+
+/// The headless game app: `MinimalPlugins` (no window/renderer — works on
+/// GPU-less machines), the shared scene, and the same pipeline. One
+/// `App::update()` drives Startup (prepare + register + startup.tjs) and one
+/// Update (timer_poll + sync_scene).
+fn headless_game_app(shared: SharedScene, game_dir: PathBuf) -> App {
+    let mut app = App::new();
+    app.insert_resource(shared)
+        .insert_resource(GameConfig { game_dir })
+        .insert_resource(Assets::<Image>::default())
+        .init_resource::<BitmapAssets>()
+        .add_plugins(MinimalPlugins)
+        .add_systems(Startup, game_startup)
+        .add_systems(Update, (run_vm, sync_scene).chain());
+    app
+}
+
+/// Startup system (runs once): mount storage, bootstrap the TJS2 VM,
+/// register every TVP native class, set their contexts, and run
+/// `startup.tjs`. Mount/VM/registration errors are fatal (log + exit); a
+/// **script-level** error in `startup.tjs` is NOT fatal — the game
+/// continues into its timer event loop (WAVE3 SA-5), so it is logged only.
+fn game_startup(config: Res<GameConfig>, shared: Res<SharedScene>, mut commands: Commands) {
+    // 1. Mount storage (game dir + xp3 archives) and bootstrap the VM.
+    let game_dir = config.game_dir.display().to_string();
+    let (storage, engine) = match engine::loader::prepare(&game_dir) {
+        Ok(pair) => pair,
+        Err(e) => {
+            log::error!("krkr-vn: cannot load game {game_dir:?}: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    // 2. Point the `System.*` property getters at the mounted game.
+    tvp_natives::set_system_context(tvp_natives::SystemContext {
+        project_dir: config.game_dir.clone(),
+        app_data_dir: std::env::temp_dir(),
+        screen_size: GAME_SIZE,
+        touch_device: false,
+    });
+
+    // 3. Register the native classes; the visual ones bind to our shared
+    //    scene (natives mutate it under a write lock, sync_scene renders
+    //    it under a read lock).
+    register_natives(&engine, &storage, &shared).unwrap_or_else(|e| {
+        log::error!("krkr-vn: native registration failed: {e}");
+        std::process::exit(1);
+    });
+
+    // 4. Run startup.tjs; a script error is non-fatal (log it and keep
+    //    going — timers still fire and the scene keeps syncing).
+    match engine::loader::run_startup(&engine, &storage) {
+        Ok(report) => {
+            log::info!(
+                "startup report: {} archive(s), startup.tjs at {}",
+                report.archives_mounted,
+                report.startup_location.as_deref().unwrap_or("<not found>")
+            );
+            if let Some(err) = &report.startup_error {
+                log::warn!("startup.tjs error (non-fatal, game continues): {err}");
+            }
+            commands.insert_resource(StartupReport(report));
+        }
+        Err(e) => {
+            log::error!("krkr-vn: cannot run startup.tjs: {e}");
             std::process::exit(1);
         }
     }
+
+    // 5. Hand the VM to the update loop; `now_ms` is measured from here.
+    commands.insert_resource(VmRuntime {
+        engine,
+        started: Instant::now(),
+    });
 }
 
-/// Future engine wiring fills this in: prepare the engine, register the
-/// tvp-* natives, set contexts and run `startup.tjs`. Not yet implemented —
-/// the visual natives are under parallel development (see WAVE3.md).
-pub fn startup(_scene: &SharedScene, _game_dir: &std::path::Path) -> Result<(), String> {
-    Err("visual natives not yet integrated".into())
+/// Register every TVP native class and set the global contexts they read
+/// (order matters: base natives first, the visual ones last).
+fn register_natives(
+    engine: &Arc<tjs2_sys::Tjs2Engine>,
+    storage: &Arc<Mutex<engine::Storage>>,
+    shared: &SharedScene,
+) -> Result<(), String> {
+    engine
+        .as_ref()
+        .set_data_dir(&storage.lock().unwrap().game_dir().display().to_string());
+    tvp_natives::register_all(engine)?;
+    tvp_kagparser::register_kagparser(engine)?;
+    tvp_kagparser::set_context(Some(engine.clone()), Some(storage.clone()));
+    tvp_storages::register_storages(engine)?;
+    tvp_scripts::register_scripts(engine)?;
+    tvp_visual::register_visual(engine, shared.0.clone(), storage.clone())?;
+    tvp_storages::set_storage(Some(storage.clone()));
+    tvp_scripts::set_context(Some(engine.clone()), Some(storage.clone()));
+    Ok(())
+}
+
+/// Drive the TJS2 VM once per frame: fire due timers (the game's event
+/// loop). A panic inside a TJS callback must not kill the app — catch it,
+/// log it, and keep the frame going.
+fn run_vm(vm: Res<VmRuntime>) {
+    let now_ms = vm.started.elapsed().as_millis() as u64;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        tvp_natives::async_trigger_poll(&vm.engine);
+        tvp_visual::timer_poll(&vm.engine, now_ms);
+        tvp_natives::continuous_handler_poll(&vm.engine);
+    }));
+    if let Err(payload) = result {
+        log::error!(
+            "timer_poll panicked in a TJS callback (caught; the app continues): {}",
+            panic_message(&payload)
+        );
+    }
+}
+
+/// Human-readable message from a `catch_unwind` panic payload.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
+}
+
+/// `krkr-vn run <game-dir> --headless`: drive ONE pass of the app's systems
+/// manually (no window — this machine has no GPU adapter, so a window
+/// cannot open), then dump the resulting [`Scene`] state to stdout and exit
+/// 0. Proves the whole chain: real startup.tjs → natives → Scene populated
+/// with the title-screen data.
+fn run_headless(shared: SharedScene, game_dir: PathBuf) -> ! {
+    let mut app = headless_game_app(shared.clone(), game_dir);
+    app.update(); // Startup (prepare + register + startup.tjs) + one Update (timer_poll + sync_scene)
+
+    if let Some(report) = app.world().get_resource::<StartupReport>() {
+        println!(
+            "startup report: {} archive(s), startup.tjs at {}",
+            report.0.archives_mounted,
+            report
+                .0
+                .startup_location
+                .as_deref()
+                .unwrap_or("<not found>")
+        );
+        if let Some(err) = &report.0.startup_error {
+            println!("startup.tjs error (non-fatal): {err}");
+        }
+    }
+
+    let scene = shared.0.read().expect("shared scene lock poisoned");
+    println!("{}", dump_scene(&scene));
+    drop(scene);
+
+    std::process::exit(0);
+}
+
+/// One-line-per-window/layer/bitmap summary of the scene state (pixel
+/// contents are counted, not printed).
+fn dump_scene(scene: &Scene) -> String {
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "scene dump: {} window(s), {} layer(s), {} bitmap(s), {} font(s)",
+        scene.windows.len(),
+        scene.layers.len(),
+        scene.bitmaps.len(),
+        scene.fonts.len()
+    ));
+    for w in &scene.windows {
+        lines.push(format!(
+            "window #{} {:?} {}x{} visible={} opacity={} primary_layer={}",
+            w.id,
+            w.title,
+            w.inner_size.0,
+            w.inner_size.1,
+            w.visible,
+            w.opacity,
+            w.primary_layer
+                .map_or_else(|| "none".to_string(), |id| id.to_string())
+        ));
+    }
+    for l in &scene.layers {
+        lines.push(format!(
+            "layer #{} win={} rect=({},{},{}x{}) bitmap={} fill={} visible={} opacity={} z={}",
+            l.id,
+            l.window,
+            l.rect.x,
+            l.rect.y,
+            l.rect.w,
+            l.rect.h,
+            l.bitmap
+                .map_or_else(|| "none".to_string(), |id| id.to_string()),
+            l.fill_color
+                .map_or_else(|| "none".to_string(), |f| format!("{f:?}")),
+            l.visible,
+            l.opacity,
+            l.z_order
+        ));
+    }
+    for b in &scene.bitmaps {
+        lines.push(format!(
+            "bitmap #{} {}x{} name={}",
+            b.id,
+            b.width,
+            b.height,
+            b.name.as_deref().unwrap_or("<unnamed>")
+        ));
+    }
+    lines.join("\n")
 }
 
 // ---------------------------------------------------------------------------
@@ -385,5 +650,81 @@ mod tests {
             let opacity = scene.layer(ids.pulse_layer).unwrap().opacity;
             assert!((0.35..=1.0).contains(&opacity));
         }
+    }
+
+    /// Real-game headless integration test: the same pipeline the bin runs
+    /// (`krkr-vn run <game-dir> --headless`), driven in-process — Startup
+    /// (prepare + register natives + startup.tjs) then one Update
+    /// (timer_poll + sync_scene).
+    ///
+    /// Requires the real game at `/mnt/DATA/Games/Others/test` on this
+    /// machine, which is NOT committed to the repo, so this test is
+    /// `#[ignore]`d by default. Run it with:
+    /// `cargo test -p render -- --ignored real_game_headless_populates_scene`
+    /// or verify the same path manually via
+    /// `cargo run -p render --bin krkr-vn -- run /mnt/DATA/Games/Others/test --headless`.
+    #[test]
+    #[ignore = "needs the real game at /mnt/DATA/Games/Others/test (not in the repo); use --ignored or the --headless manual run"]
+    fn real_game_headless_populates_scene() {
+        let game = PathBuf::from("/mnt/DATA/Games/Others/test");
+        assert!(game.is_dir(), "real game dir must exist for this test");
+        let shared = SharedScene(Arc::new(RwLock::new(Scene::default())));
+
+        let mut app = headless_game_app(shared.clone(), game);
+        app.update();
+
+        // startup.tjs executed: the report exists; a remaining script error
+        // must be a *known missing-native* one — the parallel tvp-visual
+        // natives may not cover every class the init path touches.
+        let report = &app
+            .world()
+            .get_resource::<StartupReport>()
+            .expect("game_startup must run startup.tjs and store the report")
+            .0;
+        assert!(report.archives_mounted > 0, "game xp3 archives must mount");
+        if let Some(err) = &report.startup_error {
+            assert!(
+                is_known_missing_native_error(err),
+                "unexpected startup error (should be none or a missing-native one): {err}"
+            );
+        }
+
+        // The title screen: ≥1 window with a primary layer, and ≥1 bitmap
+        // decoded from the game's xp3 archives (FRM_0501b / bg images).
+        let scene = shared.0.read().expect("shared scene lock poisoned");
+        assert!(
+            !scene.windows.is_empty(),
+            "startup.tjs must create at least one window"
+        );
+        assert!(
+            scene.windows.iter().any(|w| w.primary_layer.is_some()),
+            "at least one window must have a primary layer"
+        );
+        assert!(
+            !scene.bitmaps.is_empty(),
+            "startup.tjs must decode ≥1 bitmap from the game's xp3 archives"
+        );
+        drop(scene);
+
+        // Print what loaded (mirrors the --headless dump).
+        let scene = shared.0.read().unwrap();
+        println!("{}", dump_scene(&scene));
+        for bmp in &scene.bitmaps {
+            println!(
+                "loaded bitmap: {} ({}x{})",
+                bmp.name.as_deref().unwrap_or("<unnamed>"),
+                bmp.width,
+                bmp.height
+            );
+        }
+    }
+
+    /// Known TJS "missing native" error patterns — a startup error that
+    /// matches one of these is the parallel natives work being incomplete,
+    /// not a regression; anything else is unexpected.
+    fn is_known_missing_native_error(err: &str) -> bool {
+        ["does not exist", "identifier not found"]
+            .iter()
+            .any(|pat| err.contains(pat))
     }
 }

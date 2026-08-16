@@ -400,6 +400,102 @@ extern "C" fn native_show_version(
     0
 }
 
+/// `System.doCompact(...)` — stubbed no-op (compaction is a GC hint).
+extern "C" fn system_do_compact(
+    _engine: *mut c_void,
+    _argc: c_int,
+    _argv: *const tjs2_sys::Value,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+) -> c_int {
+    crate::set_void_out(out);
+    0
+}
+
+/// Continuous-handler callbacks (`System.addContinuousHandler`), invoked
+/// once per frame by [`continuous_handler_poll`]. A handler returning
+/// `false`/0 removes itself (the reference `TVPDeliverContinuousEvents`
+/// semantics).
+static CONTINUOUS_HANDLERS: Mutex<Vec<tjs2_sys::DetachedValue>> = Mutex::new(Vec::new());
+
+/// Advance every continuous handler once; returns whether any remain.
+pub fn continuous_handler_poll(engine: &tjs2_sys::Tjs2Engine) -> bool {
+    let mut handlers = CONTINUOUS_HANDLERS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let taken = std::mem::take(&mut *handlers);
+    let mut rest = Vec::with_capacity(taken.len());
+    for h in taken {
+        let keep = !matches!(
+            engine.call_detached(&h, &[]),
+            Ok(tjs2_sys::TjsValue::Integer(0))
+        );
+        if keep {
+            rest.push(h);
+        }
+    }
+    *handlers = rest;
+    !handlers.is_empty()
+}
+
+/// `System.addContinuousHandler(fn)` — register a per-frame callback.
+extern "C" fn native_add_continuous_handler(
+    _engine: *mut c_void,
+    argc: c_int,
+    argv: *const tjs2_sys::Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    let args = crate::args(argv, argc);
+    if args.is_empty() {
+        return crate::report_error(out_error, "System.addContinuousHandler requires 1 argument");
+    }
+    let engine = crate::context_engine();
+    match engine.retain_value_detached(&tjs2_sys::TjsValue::Object) {
+        Ok(dv) => {
+            CONTINUOUS_HANDLERS
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(dv);
+            crate::set_void_out(out);
+            0
+        }
+        Err(_) => {
+            crate::set_void_out(out);
+            0
+        }
+    }
+}
+
+/// `System.removeContinuousHandler(fn)` — unregister a per-frame callback.
+extern "C" fn native_remove_continuous_handler(
+    _engine: *mut c_void,
+    argc: c_int,
+    argv: *const tjs2_sys::Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    let args = crate::args(argv, argc);
+    if args.is_empty() {
+        return crate::report_error(
+            out_error,
+            "System.removeContinuousHandler requires 1 argument",
+        );
+    }
+    let engine = crate::context_engine();
+    // Retain the arg to get its id, then drop any handler with that id
+    // (release semantics make the comparison by raw id).
+    if let Ok(dv) = engine.retain_value_detached(&tjs2_sys::TjsValue::Object) {
+        let id = dv.raw_id();
+        let mut handlers = CONTINUOUS_HANDLERS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        handlers.retain(|h| h.raw_id() != id);
+    }
+    crate::set_void_out(out);
+    0
+}
+
 /// Register the `System` native class (methods + the property getters games
 /// rely on: `exePath`, `dataPath`, `personalPath`, `savedGamesPath`, ...).
 pub fn register_system(engine: &tjs2_sys::Tjs2Engine) -> Result<(), String> {
@@ -462,6 +558,18 @@ pub fn register_system(engine: &tjs2_sys::Tjs2Engine) -> Result<(), String> {
             NativeMethodDef {
                 name: "showVersion",
                 f: native_show_version,
+            },
+            NativeMethodDef {
+                name: "doCompact",
+                f: system_do_compact,
+            },
+            NativeMethodDef {
+                name: "addContinuousHandler",
+                f: native_add_continuous_handler,
+            },
+            NativeMethodDef {
+                name: "removeContinuousHandler",
+                f: native_remove_continuous_handler,
             },
         ],
     })
@@ -565,15 +673,25 @@ fn system_properties() -> Vec<tjs2_sys::NativePropertyDef> {
     ]
 }
 
+fn dir_with_separator(path: &std::path::Path) -> String {
+    // The game concatenates e.g. `System.exePath + "data.xp3"` and expects
+    // path properties to end with a separator (the reference's
+    // TVPNativeProjectDir ends with '/'); without it the join silently
+    // merges (".../test" + "data.xp3" → ".../testdata.xp3").
+    let s = path.display().to_string();
+    if s.ends_with('/') { s } else { format!("{s}/") }
+}
+
 extern "C" fn prop_exe_path(_e: *mut c_void, out: *mut Value, _err: *mut *mut c_char) -> c_int {
-    set_string_out(out, &system_context().project_dir.display().to_string());
+    set_string_out(out, &dir_with_separator(&system_context().project_dir));
     0
 }
 
 extern "C" fn prop_data_path(_e: *mut c_void, out: *mut Value, _err: *mut *mut c_char) -> c_int {
     // This emulator mounts the game folder as the data dir (Kirikiroid2
-    // behavior): System.dataPath == the game directory.
-    set_string_out(out, &system_context().project_dir.display().to_string());
+    // behavior): System.dataPath == the game directory (trailing separator:
+    // the game concatenates `DATA_PATH + "system.dat"`).
+    set_string_out(out, &dir_with_separator(&system_context().project_dir));
     0
 }
 

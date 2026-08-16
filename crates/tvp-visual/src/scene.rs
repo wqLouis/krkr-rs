@@ -72,7 +72,7 @@ pub struct FontState {
 }
 
 /// Rectangle in window coordinates.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Rect {
     pub x: i32,
     pub y: i32,

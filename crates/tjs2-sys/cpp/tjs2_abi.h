@@ -5,6 +5,8 @@
 #ifndef TJS2_ABI_H
 #define TJS2_ABI_H
 
+#include <vector>
+
 #include <stddef.h> /* size_t */
 
 #ifdef __cplusplus
@@ -28,6 +30,10 @@ typedef void (*tjs2_log_cb)(int level, const char *msg, void *user);
 #define TJS2_VAL_REAL 2
 #define TJS2_VAL_STRING 3
 #define TJS2_VAL_OBJECT 4
+#define TJS2_VAL_ARRAY 5
+#define TJS2_VAL_RETAINED 6
+
+typedef struct tjs2_value_id_t *tjs2_value_id;
 
 typedef struct {
     int type;
@@ -35,10 +41,20 @@ typedef struct {
     double real;
     /* UTF-8 string; owned by the engine, valid until the next engine call. */
     const char *string;
+    /* TJS2_VAL_ARRAY: `count` NUL-terminated UTF-8 strings (owned by the
+     * caller, valid until the callback returns). */
+    const char **array;
+    int array_count;
+    /* TJS2_VAL_RETAINED: a value retained via tjs2_retain_value. */
+    tjs2_value_id retained;
 } tjs2_value;
 
 /* Create / destroy a script engine instance. */
 tjs2_engine *tjs2_create(void);
+
+// Stream factories + data dir (see streams.cpp).
+void tjs2_wire_stream_factories(void);
+void tjs2_set_data_dir(const char *dir);
 void tjs2_destroy(tjs2_engine *e);
 
 /* Set the console output / log callback (may be NULL). */
@@ -72,7 +88,7 @@ void tjs2_free_string(char *s);
  * engine-local; release them with tjs2_release_value before (or by)
  * tjs2_destroy. Release is idempotent.
  */
-typedef struct tjs2_value_id_t *tjs2_value_id;
+
 
 /* Retain a script value. Returns a per-engine id holding its own reference
  * (the retained value stays callable until released), or NULL on failure
@@ -83,6 +99,13 @@ tjs2_value_id tjs2_retain_value(void *engine, const tjs2_value *v);
 /* Release a retained value. Idempotent: releasing an unknown or NULL id is
  * a safe no-op. */
 void tjs2_release_value(void *engine, tjs2_value_id id);
+
+/* Stack trace string for Scripts.getTraceString; malloc'd, free with
+ * tjs2_free_string. */
+char *tjs2_get_stack_trace_string(void *engine, int limit);
+
+/* Retain a raw TJS object (see tjs2_abi.cpp). Returns a per-engine id or NULL. */
+tjs2_value_id tjs2_retain_object(void *engine, void *obj);
 
 /*
  * Invoke the retained value's default member (FuncCall, no membername, no
@@ -183,12 +206,31 @@ typedef void (*tjs2_native_destroy_instance_fn)(void *engine, void *instance);
  * the create callback for the object the method was called on. */
 typedef int (*tjs2_native_instance_method_fn)(void *engine, void *instance,
                                               int argc, const tjs2_value *argv,
-                                              tjs2_value *out, char **out_error);
+                                              tjs2_value *out, char **out_error,
+                                              void *objthis);
 
 typedef struct tjs2_native_instance_method {
     const char *name;                  /* UTF-8, method name on the class */
     tjs2_native_instance_method_fn fn; /* Rust callback */
 } tjs2_native_instance_method;
+
+/* An instance property implemented in Rust. Same conventions as the
+ * static property callbacks, plus `instance`: the payload of the object
+ * the property was accessed on. get/set may be NULL (Void / read-only). */
+typedef int (*tjs2_native_instance_property_get_fn)(void *engine, void *instance,
+                                                    tjs2_value *out,
+                                                    char **out_error,
+                                                    void *objthis);
+typedef int (*tjs2_native_instance_property_set_fn)(void *engine, void *instance,
+                                                    const tjs2_value *value,
+                                                    char **out_error,
+                                                    void *objthis);
+
+typedef struct tjs2_native_instance_property {
+    const char *name; /* UTF-8, property name on the class */
+    tjs2_native_instance_property_get_fn get; /* may be NULL */
+    tjs2_native_instance_property_set_fn set; /* may be NULL */
+} tjs2_native_instance_property;
 
 /*
  * Register a native class whose instances carry a Rust-owned payload.
@@ -204,6 +246,7 @@ typedef struct tjs2_native_instance_method {
 int tjs2_register_native_class_instance(
     tjs2_engine *e, const char *class_name_utf8,
     const tjs2_native_instance_method *methods, int count,
+    const tjs2_native_instance_property *properties, int property_count,
     tjs2_native_create_instance_fn create_instance,
     tjs2_native_destroy_instance_fn destroy_instance);
 

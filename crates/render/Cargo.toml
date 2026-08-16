@@ -14,4 +14,11 @@ path = "src/main.rs"
 
 [dependencies]
 bevy = "0.19"
+engine = { path = "../engine" }
+log = "0.4"
+tjs2-sys = { workspace = true }
+tvp-kagparser = { path = "../tvp-kagparser" }
+tvp-natives = { path = "../tvp-natives" }
+tvp-scripts = { path = "../tvp-scripts" }
+tvp-storages = { path = "../tvp-storages" }
 tvp-visual = { path = "../tvp-visual" }

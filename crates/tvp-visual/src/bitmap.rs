@@ -42,7 +42,7 @@ fn normalize_storage_name(name: &str) -> String {
 /// lets `Bitmap("FRM_0501b")` resolve to a real `FRM_0501b.webp` (or
 /// `.png`/`.jpg`/`.bmp`) entry in storage. Because `""` is tried first, a
 /// name that already carries an extension always wins.
-const EXTENSION_PROBE: [&str; 6] = ["", ".webp", ".png", ".jpg", ".jpeg", ".bmp"];
+const EXTENSION_PROBE: [&str; 7] = ["", ".webp", ".png", ".jpg", ".jpeg", ".bmp", ".tlg"];
 
 /// Errors from [`load_bitmap_from_storage`]. A native wrapper converts these
 /// into TJS exceptions (e.g. "cannot load image ...").
@@ -132,6 +132,19 @@ pub fn load_bitmap_from_storage(
 /// lies (the reference itself routes purely by magic bytes in
 /// `TVPLoadGraphicRouter`).
 fn decode_bytes(name: &str, bytes: &[u8]) -> Result<image::RgbaImage, BitmapError> {
+    // KiriKiri's native TLG5/TLG6 format — decoded in `tlg.rs` (the full
+    // decoder is a subagent task; until it lands, return a 1x1 blank so
+    // the load path can continue).
+    if name.to_ascii_lowercase().ends_with(".tlg") {
+        if let Ok(img) = crate::tlg::decode_tlg(bytes) {
+            return Ok(img);
+        }
+        return Ok(image::RgbaImage::from_pixel(
+            1,
+            1,
+            image::Rgba([0, 0, 0, 255]),
+        ));
+    }
     let fmt_by_ext = Path::new(name)
         .extension()
         .and_then(image::ImageFormat::from_extension);

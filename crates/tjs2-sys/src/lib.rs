@@ -21,6 +21,8 @@ pub const VAL_INTEGER: c_int = 1;
 pub const VAL_REAL: c_int = 2;
 pub const VAL_STRING: c_int = 3;
 pub const VAL_OBJECT: c_int = 4;
+pub const VAL_ARRAY: c_int = 5;
+pub const VAL_RETAINED: c_int = 6;
 
 /// Callback for console output / logs from the VM. `msg` is UTF-8 and only
 /// valid for the duration of the call.
@@ -97,6 +99,7 @@ pub type NativeInstanceMethodFn = extern "C" fn(
     argv: *const Value,
     out: *mut Value,
     out_error: *mut *mut c_char,
+    objthis: *mut c_void,
 ) -> c_int;
 
 /// C-side mirror of `tjs2_native_instance_method` (cpp/tjs2_abi.h).
@@ -107,6 +110,36 @@ pub struct NativeInstanceMethod {
     pub f: NativeInstanceMethodFn,
 }
 
+/// An instance property implemented in Rust: like [`NativePropertyGetFn`]/
+/// [`NativePropertySetFn`], plus `instance` — the payload of the object the
+/// property was accessed on.
+pub type NativeInstancePropertyGetFn = extern "C" fn(
+    engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    objthis: *mut c_void,
+) -> c_int;
+
+/// Setter half of an instance property. `value` is valid for the duration of
+/// the call.
+pub type NativeInstancePropertySetFn = extern "C" fn(
+    engine: *mut c_void,
+    instance: *mut c_void,
+    value: *const Value,
+    out_error: *mut *mut c_char,
+    objthis: *mut c_void,
+) -> c_int;
+
+/// C-side mirror of `tjs2_native_instance_property` (cpp/tjs2_abi.h).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct NativeInstanceProperty {
+    pub name: *const c_char,
+    pub get: Option<NativeInstancePropertyGetFn>,
+    pub set: Option<NativeInstancePropertySetFn>,
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct Value {
@@ -114,6 +147,9 @@ pub struct Value {
     pub integer: i64,
     pub real: f64,
     pub string: *const c_char,
+    pub array: *const *const c_char,
+    pub array_count: c_int,
+    pub retained: usize,
 }
 
 #[repr(C)]
@@ -123,6 +159,7 @@ pub struct Engine {
 
 unsafe extern "C" {
     fn tjs2_create() -> *mut Engine;
+    fn tjs2_set_data_dir(dir: *const c_char);
     fn tjs2_destroy(e: *mut Engine);
     fn tjs2_set_log_cb(e: *mut Engine, cb: LogCb, user: *mut c_void);
     fn tjs2_exec_script(
@@ -139,7 +176,7 @@ unsafe extern "C" {
         out_result: *mut Value,
         out_error: *mut *mut c_char,
     ) -> c_int;
-    fn tjs2_free_string(s: *mut c_char);
+    pub fn tjs2_free_string(s: *mut c_char);
     fn tjs2_register_native_class_ex(
         e: *mut Engine,
         class_name: *const c_char,
@@ -153,12 +190,20 @@ unsafe extern "C" {
         class_name: *const c_char,
         methods: *const NativeInstanceMethod,
         count: c_int,
+        properties: *const NativeInstanceProperty,
+        property_count: c_int,
         create_instance: NativeCreateInstanceFn,
         destroy_instance: NativeDestroyInstanceFn,
     ) -> c_int;
     /// Opaque, per-engine id of a retained script value (mirror of
     /// `tjs2_value_id` in cpp/tjs2_abi.h).
     fn tjs2_retain_value(engine: *mut Engine, v: *const Value) -> Tjs2ValueId;
+    /// Retain a raw TJS object (see the C++ side). Returns a per-engine id
+    /// or 0 on failure.
+    pub fn tjs2_retain_object(engine: *mut Engine, obj: *mut c_void) -> Tjs2ValueId;
+    /// Stack trace string (Scripts.getTraceString); malloc'd, free with
+    /// `tjs2_free_string`.
+    pub fn tjs2_get_stack_trace_string(engine: *mut Engine, limit: c_int) -> *mut c_char;
     /// Release a retained value. Idempotent on the C++ side.
     fn tjs2_release_value(engine: *mut Engine, id: Tjs2ValueId);
     /// Invoke a retained value's default member with `argc` args.
@@ -226,6 +271,33 @@ pub struct ValueId<'a> {
     id: Tjs2ValueId,
 }
 
+/// A retained script value with a lifetime detached from the engine borrow
+/// (see [`Tjs2Engine::retain_value_detached`]). Dropping it releases the
+/// value. The engine MUST outlive every `DetachedValue` it created.
+pub struct DetachedValue {
+    engine: *mut Engine,
+    id: Tjs2ValueId,
+}
+
+// SAFETY: the VM is single-threaded by construction (see Tjs2Engine); a
+// DetachedValue is only ever used on that thread.
+unsafe impl Send for DetachedValue {}
+unsafe impl Sync for DetachedValue {}
+
+impl DetachedValue {
+    /// The raw retained id (for returning it across the ABI).
+    pub fn raw_id(&self) -> Tjs2ValueId {
+        self.id
+    }
+}
+
+impl Drop for DetachedValue {
+    fn drop(&mut self) {
+        // SAFETY: the C++ side's release is idempotent.
+        unsafe { tjs2_release_value(self.engine, self.id) }
+    }
+}
+
 impl Drop for ValueId<'_> {
     fn drop(&mut self) {
         self.engine.release_retained(self.id);
@@ -274,6 +346,13 @@ pub struct NativeInstanceMethodDef {
     pub f: NativeInstanceMethodFn,
 }
 
+/// Definition of one instance property to attach to a class.
+pub struct NativeInstancePropertyDef {
+    pub name: &'static str,
+    pub get: Option<NativeInstancePropertyGetFn>,
+    pub set: Option<NativeInstancePropertySetFn>,
+}
+
 /// Describes a native class to register on the VM global object (see
 /// [`Tjs2Engine::register_native_class`]).
 ///
@@ -297,9 +376,24 @@ pub struct NativeInstanceBuilder<'a> {
     pub create: NativeCreateInstanceFn,
     pub destroy: NativeDestroyInstanceFn,
     pub methods: Vec<NativeInstanceMethodDef>,
+    pub properties: Vec<NativeInstancePropertyDef>,
 }
 
 impl Tjs2Engine {
+    /// The raw engine pointer (for FFI helpers that need it).
+    pub fn raw(&self) -> *mut Engine {
+        self.inner
+    }
+
+    /// Point the C++ stream factories at a directory for relative save/load
+    /// paths (the game's DATA_PATH is absolute, but some code passes plain
+    /// names).
+    pub fn set_data_dir(&self, dir: &str) {
+        // SAFETY: dir is a valid NUL-terminated C string for the call.
+        let c = std::ffi::CString::new(dir).unwrap_or_default();
+        unsafe { tjs2_set_data_dir(c.as_ptr()) };
+    }
+
     /// Create a new script engine.
     pub fn new() -> Result<Self, &'static str> {
         // SAFETY: tjs2_create returns a heap-allocated engine or null.
@@ -332,6 +426,9 @@ impl Tjs2Engine {
             integer: 0,
             real: 0.0,
             string: ptr::null(),
+            array: ptr::null(),
+            array_count: 0,
+            retained: 0,
         };
         let mut error: *mut c_char = ptr::null_mut();
         // SAFETY: all pointers point to valid, live data for the call.
@@ -360,6 +457,9 @@ impl Tjs2Engine {
             integer: 0,
             real: 0.0,
             string: ptr::null(),
+            array: ptr::null(),
+            array_count: 0,
+            retained: 0,
         };
         let mut error: *mut c_char = ptr::null_mut();
         // SAFETY: all pointers point to valid, live data for the call.
@@ -485,7 +585,25 @@ impl Tjs2Engine {
                 f: m.f,
             })
             .collect();
-        // SAFETY: self.inner is a valid engine; the names and array are
+        let property_names: Vec<CString> = builder
+            .properties
+            .iter()
+            .map(|p| {
+                CString::new(p.name)
+                    .map_err(|_| format!("property name contains a NUL byte: {:?}", p.name))
+            })
+            .collect::<Result<_, _>>()?;
+        let c_properties: Vec<NativeInstanceProperty> = builder
+            .properties
+            .iter()
+            .zip(&property_names)
+            .map(|(p, n)| NativeInstanceProperty {
+                name: n.as_ptr(),
+                get: p.get,
+                set: p.set,
+            })
+            .collect();
+        // SAFETY: self.inner is a valid engine; the names and arrays are
         // valid for the call. The C++ side copies everything it needs
         // (names and callbacks) during registration.
         let rc = unsafe {
@@ -498,6 +616,12 @@ impl Tjs2Engine {
                     c_methods.as_ptr()
                 },
                 c_methods.len() as c_int,
+                if c_properties.is_empty() {
+                    ptr::null()
+                } else {
+                    c_properties.as_ptr()
+                },
+                c_properties.len() as c_int,
                 builder.create,
                 builder.destroy,
             )
@@ -530,6 +654,9 @@ impl Tjs2Engine {
                 integer: 0,
                 real: 0.0,
                 string: ptr::null(),
+                array: ptr::null(),
+                array_count: 0,
+                retained: 0,
             },
             other => value_to_ffi(other, &mut strings)?,
         };
@@ -570,6 +697,9 @@ name), and none was available"
             integer: 0,
             real: 0.0,
             string: ptr::null(),
+            array: ptr::null(),
+            array_count: 0,
+            retained: 0,
         };
         let mut error: *mut c_char = ptr::null_mut();
         // SAFETY: self.inner is a live engine, id.id is a live retained id,
@@ -623,6 +753,84 @@ name), and none was available"
         // SAFETY: self.inner is a live engine while a ValueId (or the
         // engine itself) holds a reference; release is idempotent.
         unsafe { tjs2_release_value(self.inner, id) };
+    }
+
+    /// Retain a script value with a lifetime detached from the engine
+    /// borrow — for storage in process-global registries (the timer
+    /// natives).
+    ///
+    /// SAFETY: the engine MUST outlive every `DetachedValue` it created;
+    /// krkr-rs keeps the VM alive for the whole app, so this holds.
+    pub fn retain_value_detached(&self, v: &TjsValue) -> Result<DetachedValue, String> {
+        let mut strings = Vec::new();
+        let ffi = match v {
+            TjsValue::Object => Value {
+                ty: VAL_OBJECT,
+                integer: 0,
+                real: 0.0,
+                string: ptr::null(),
+                array: ptr::null(),
+                array_count: 0,
+                retained: 0,
+            },
+            other => value_to_ffi(other, &mut strings)?,
+        };
+        // SAFETY: `ffi` mirrors `v` and self.inner is a live engine.
+        let id = unsafe { tjs2_retain_value(self.inner, &ffi) };
+        if id.is_null() {
+            return Err(
+                "failed to retain value: object values are resolved against \
+the most recent object-valued script result (e.g. eval of the function's \
+name), and none was available"
+                    .into(),
+            );
+        }
+        Ok(DetachedValue {
+            engine: self.inner,
+            id,
+        })
+    }
+
+    /// Invoke a retained detached value (see [`Self::retain_value_detached`]).
+    pub fn call_detached(&self, dv: &DetachedValue, args: &[TjsValue]) -> Result<TjsValue, String> {
+        if !std::ptr::eq(dv.engine, self.inner) {
+            return Err("detached value belongs to a different engine".into());
+        }
+        let mut strings = Vec::new();
+        let ffi_args: Vec<Value> = args
+            .iter()
+            .map(|a| value_to_ffi(a, &mut strings))
+            .collect::<Result<_, _>>()?;
+        let mut out = Value {
+            ty: VAL_VOID,
+            integer: 0,
+            real: 0.0,
+            string: ptr::null(),
+            array: ptr::null(),
+            array_count: 0,
+            retained: 0,
+        };
+        let mut error: *mut c_char = ptr::null_mut();
+        // SAFETY: self.inner is a live engine and dv.id is a live retained id.
+        let rc = unsafe {
+            tjs2_call_value(
+                self.inner,
+                dv.id,
+                ffi_args.len() as c_int,
+                if ffi_args.is_empty() {
+                    ptr::null()
+                } else {
+                    ffi_args.as_ptr()
+                },
+                &mut out,
+                &mut error,
+            )
+        };
+        if rc != 0 {
+            return Err(unsafe { take_error_string(error) });
+        }
+        // SAFETY: `out` was filled by the C++ side on success.
+        Ok(unsafe { take_value(&out) })
     }
 }
 
@@ -698,6 +906,9 @@ fn value_to_ffi(v: &TjsValue, strings: &mut Vec<CString>) -> Result<Value, Strin
         integer: 0,
         real: 0.0,
         string: ptr::null(),
+        array: ptr::null(),
+        array_count: 0,
+        retained: 0,
     };
     match v {
         TjsValue::Void => {}
@@ -1184,6 +1395,7 @@ mod tests {
         _argv: *const Value,
         out: *mut Value,
         _out_error: *mut *mut c_char,
+        _objthis: *mut c_void,
     ) -> c_int {
         // SAFETY: instance is a valid Counter payload for the call.
         unsafe { *counter_ptr(instance) += 1 };
@@ -1204,6 +1416,7 @@ mod tests {
         _argv: *const Value,
         out: *mut Value,
         _out_error: *mut *mut c_char,
+        _objthis: *mut c_void,
     ) -> c_int {
         let v = unsafe { *counter_ptr(instance) };
         unsafe {
@@ -1223,6 +1436,7 @@ mod tests {
         argv: *const Value,
         out: *mut Value,
         out_error: *mut *mut c_char,
+        _objthis: *mut c_void,
     ) -> c_int {
         if argc < 1 {
             unsafe { *out_error = alloc_error_string("Counter.add requires 1 argument") };
@@ -1262,7 +1476,94 @@ mod tests {
                     f: counter_add,
                 },
             ],
+            properties: vec![
+                NativeInstancePropertyDef {
+                    name: "value",
+                    get: Some(counter_value_get),
+                    set: Some(counter_value_set),
+                },
+                NativeInstancePropertyDef {
+                    name: "readonly",
+                    get: Some(counter_readonly_get),
+                    set: None,
+                },
+            ],
         }
+    }
+
+    extern "C" fn counter_value_get(
+        _engine: *mut c_void,
+        instance: *mut c_void,
+        out: *mut Value,
+        _out_error: *mut *mut c_char,
+        _objthis: *mut c_void,
+    ) -> c_int {
+        // SAFETY: instance is a valid Counter payload.
+        let c = unsafe { &mut *counter_ptr(instance) };
+        // SAFETY: out is a valid return slot.
+        unsafe {
+            (*out).ty = VAL_INTEGER;
+            (*out).integer = i64::from(*c);
+        }
+        0
+    }
+
+    extern "C" fn counter_value_set(
+        _engine: *mut c_void,
+        instance: *mut c_void,
+        value: *const Value,
+        _out_error: *mut *mut c_char,
+        _objthis: *mut c_void,
+    ) -> c_int {
+        // SAFETY: instance is a valid Counter payload; value is valid.
+        let c = unsafe { &mut *counter_ptr(instance) };
+        let v = unsafe { &*value };
+        *c = v.integer as i32;
+        0
+    }
+
+    extern "C" fn counter_readonly_get(
+        _engine: *mut c_void,
+        _instance: *mut c_void,
+        out: *mut Value,
+        _out_error: *mut *mut c_char,
+        _objthis: *mut c_void,
+    ) -> c_int {
+        // SAFETY: out is a valid return slot.
+        unsafe {
+            (*out).ty = VAL_INTEGER;
+            (*out).integer = 7;
+        }
+        0
+    }
+
+    #[test]
+    fn native_instance_properties_work_from_scripts() {
+        let e = Tjs2Engine::new().unwrap();
+        e.register_native_class_instance(&counter_builder())
+            .unwrap();
+
+        e.exec_script(
+            "var c = new Counter(); c.value = 42; var r = c.value;",
+            "test",
+        )
+        .unwrap();
+        assert_eq!(e.eval("r", "test").unwrap(), TjsValue::Integer(42));
+
+        // read-only property: reads work, writes are denied.
+        e.exec_script("var ro = c.readonly;", "test").unwrap();
+        assert_eq!(e.eval("ro", "test").unwrap(), TjsValue::Integer(7));
+        let write_err = e.exec_script("c.readonly = 1;", "test");
+        assert!(write_err.is_err(), "write to read-only property must error");
+
+        // per-instance state.
+        e.exec_script(
+            "var b = new Counter(); b.value = 5; var rb = b.value; var rc = c.value;",
+            "test",
+        )
+        .unwrap();
+        assert_eq!(e.eval("rb", "test").unwrap(), TjsValue::Integer(5));
+        assert_eq!(e.eval("rc", "test").unwrap(), TjsValue::Integer(42));
     }
 
     #[test]
@@ -1462,6 +1763,9 @@ var ra = a.get(); var rb = b.get();",
             integer: 0,
             real: 0.0,
             string: ptr::null(),
+            array: ptr::null(),
+            array_count: 0,
+            retained: 0,
         };
         let mut error: *mut c_char = ptr::null_mut();
         // SAFETY: e.inner is a live engine; the id is deliberately bogus.

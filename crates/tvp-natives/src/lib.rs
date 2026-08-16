@@ -28,15 +28,22 @@
 //! `cargo test -p tvp-natives -- --test-threads=1` (the process-global
 //! state makes parallel tests racy).
 
+mod async_trigger;
+mod chain_item_base;
+mod constants;
 mod debug;
+mod menu_item;
+mod plugin_stubs;
 mod plugins;
 mod system;
-mod window;
 
+pub use async_trigger::{async_trigger_poll, register_async_trigger};
+pub use chain_item_base::register_chain_item_base;
 pub use debug::register_debug;
+pub use menu_item::register_menu_item;
+pub use plugin_stubs::register_plugin_stubs;
 pub use plugins::register_plugins;
-pub use system::{SystemContext, register_system, set_system_context};
-pub use window::register_window;
+pub use system::{SystemContext, continuous_handler_poll, register_system, set_system_context};
 
 use std::cell::RefCell;
 use std::ffi::{CStr, c_char, c_int};
@@ -44,15 +51,41 @@ use std::ptr;
 use std::slice;
 use std::sync::{Mutex, MutexGuard};
 
+use std::sync::OnceLock;
+
 use tjs2_sys::{Tjs2Engine, VAL_INTEGER, VAL_REAL, VAL_STRING, VAL_VOID, Value, tjs2_malloc};
 
+/// The engine the natives are registered on (needed by natives whose
+/// callbacks receive only the raw `tjs2_engine*` ABI pointer, which is NOT a
+/// `Tjs2Engine*` — see the visual Timer's comment). Set by [`register_all`];
+/// the engine outlives every native call (process-lifetime app VM).
+static ENGINE: OnceLock<usize> = OnceLock::new();
+
+/// The registered engine as a shared reference.
+pub(crate) fn context_engine() -> &'static Tjs2Engine {
+    // SAFETY: the address was stored by register_all and the engine is never
+    // freed before the process ends.
+    unsafe { &*(*ENGINE.get().expect("tvp-natives: engine context not set") as *const Tjs2Engine) }
+}
+
 /// Register all native classes in this crate on `engine` (`System`, `Debug`,
-/// `Plugins` and the stub `Window`).
+/// `Plugins`, and the `MenuItem` stub that keeps k2compat's menu-delay
+/// machinery from installing a throwing lazy loader).
 pub fn register_all(engine: &Tjs2Engine) -> Result<(), String> {
+    let _ = ENGINE.set(engine as *const Tjs2Engine as usize);
+    // Global TVP constants (ltOpaque, ssShift, ...) the game scripts use as
+    // bare globals.
+    engine
+        .exec_script(constants::CONSTANTS_SCRIPT, "TVP_global_constants")
+        .map_err(|e| format!("failed to evaluate TVP global constants: {e}"))?;
     register_system(engine)?;
     register_debug(engine)?;
     register_plugins(engine)?;
-    register_window(engine)
+    register_plugin_stubs(engine)?;
+    register_menu_item(engine)?;
+    register_chain_item_base(engine)?;
+    register_async_trigger(engine)?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

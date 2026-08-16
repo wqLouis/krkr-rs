@@ -1,0 +1,9 @@
+[package]
+name = "tvp-input"
+description = "Shared input state + the Mouse/Key TJS natives (the Bevy app writes the state; scripts read it)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tjs2-sys = { workspace = true }

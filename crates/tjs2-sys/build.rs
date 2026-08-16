@@ -239,6 +239,7 @@ fn main() {
         sources.push(gen_dir.join(format!("{stem}.tab.cpp")));
     }
     sources.push(manifest_dir.join("cpp/tjs2_abi.cpp"));
+    sources.push(manifest_dir.join("cpp/streams.cpp"));
 
     let failed = std::sync::Arc::new(AtomicUsize::new(0));
     let lock = std::sync::Arc::new(Mutex::new(()));
