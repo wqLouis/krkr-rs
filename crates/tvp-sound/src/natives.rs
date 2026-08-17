@@ -88,18 +88,13 @@ pub(crate) struct NativeContext {
 static NATIVE_CTX: std::sync::Mutex<Option<NativeContext>> = std::sync::Mutex::new(None);
 
 pub(crate) fn native_ctx() -> Option<NativeContext> {
-    NATIVE_CTX
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .clone()
+    NATIVE_CTX.lock().unwrap_or_else(|p| p.into_inner()).clone()
 }
 
 /// Point the native classes at the mounted storage and mixer (called by
 /// [`register_sound`]).
 fn set_native_ctx(storage: Arc<Mutex<Storage>>, mixer: Arc<Mutex<Mixer>>) {
-    *NATIVE_CTX
-        .lock()
-        .unwrap_or_else(|p| p.into_inner()) = Some(NativeContext { storage, mixer });
+    *NATIVE_CTX.lock().unwrap_or_else(|p| p.into_inner()) = Some(NativeContext { storage, mixer });
 }
 
 // ---------------------------------------------------------------------------

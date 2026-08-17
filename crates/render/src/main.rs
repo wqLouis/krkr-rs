@@ -843,7 +843,9 @@ mod tests {
         let mut last_dump = baseline.clone();
         for i in 0..180 {
             std::thread::sleep(Duration::from_millis(100));
-            if i % 10 == 0 { eprintln!("[hb] tick {i}"); }
+            if i % 10 == 0 {
+                eprintln!("[hb] tick {i}");
+            }
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| app.update()));
             assert!(result.is_ok(), "app.update() panicked at tick {i}");
             if i % 20 == 19 {

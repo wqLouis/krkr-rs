@@ -63,12 +63,16 @@ the AttentionVoice. Now the ctor retains argv[0], and `sound_poll` delivers
 BOTH `action(%[type,status])` (dict, via a new `TjsValue::Retained` ABI path)
 and `onStatusChanged(status)`.
 
-### 5. Voice files are Ogg Opus; symphonia 0.5 has no Opus decoder (WORKED AROUND)
+### 5. Voice files are Ogg Opus; no Opus decoder in the default registry (WORKED AROUND)
 `voice/*.ogg` are **Ogg Opus** (`OpusHead`), while `bgm/*.ogg` are Vorbis.
-symphonia 0.5.5 has no `symphonia-codec-opus` (added in 0.6+). `decode_audio`
-now detects Opus and returns a ~60 ms silent buffer (the voices still drive
-the script sequencing via `onStatusChanged("stop")`). Real Opus decoding needs
-a symphonia 0.6 upgrade — see Stage 4.
+Upgraded to **symphonia 0.6.1** (decode API migrated: `probe()`/`probe`,
+`default_track(TrackType::Audio)`, `make_audio_decoder`, `copy_to_slice_interleaved`)
+and **rodio 0.22** (`DeviceSinkBuilder::open_default_sink` → `MixerDeviceSink`).
+The default codec registry still has no Opus decoder (it ships separately as
+`symphonia-adapter-libopus`, which needs the C libopus). `decode_audio` detects
+Opus and returns a ~60 ms silent buffer so the voices still drive the script
+sequencing via `onStatusChanged("stop")`. Real Opus decoding is a follow-up —
+see Stage 4.
 
 ### 6. Cross-thread deadlock in the sound natives (FIXED — run_vm lock)
 `sound_poll` was observed running on **multiple Bevy worker threads**
@@ -117,9 +121,9 @@ Bevy moves the system across threads.
 
 ## Stage 4 — Known open issues
 
-- **Symphonia 0.5 lacks Opus**: upgrade to symphonia 0.6 +
-  `symphonia-adapter-libopus` so voices actually decode (currently silence).
-  Requires adapting the decode API (0.5→0.6 broke some interfaces).
+- **Opus voice decode**: `symphonia-adapter-libopus` (needs the C libopus)
+  so voices actually decode (currently a silent ~60 ms buffer keeps the
+  sequencing working). BGM (Vorbis) already decodes for real.
 - **Blend modes**: `layer.type` (ltAdditive etc.) reaches the scene but Bevy
   still source-over blends — real GPU blend modes pending (render crate).
 - **Hierarchy flattening**: parent/child order/opacity composed depth-first;

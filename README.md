@@ -19,7 +19,7 @@ scripts, `.tjs` scripts, `.xp3` archives). The goal: run a real game end to end.
 | TLG5/TLG6 image decode | ✅ real KiriKiri formats (byte-identical to reference) |
 | Logo → Title scene flow | 🔶 chain runs; stalled at the ATTENTION screen (see TODO.md) |
 | Input bridge (mouse/key → script) | ✅ wired; click-through verification pending |
-| Audio (BGM/SE/voice) | 🔶 rodio output wired; Opus voice decode pending (symphonia 0.6) |
+| Audio (BGM/SE/voice) | 🔶 rodio output wired (rodio 0.22, symphonia 0.6); Opus voice decode pending |
 | ADV scenario loop | 🔶 KAGParser natives in; needs text + hit-test verification |
 
 Details and the full investigation log are in [TODO.md](TODO.md).

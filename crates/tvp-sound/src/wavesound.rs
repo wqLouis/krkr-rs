@@ -331,7 +331,10 @@ extern "C" fn ws_play(
     // script sequences waiting on completion advance.
     if inst.stream_id != 0 {
         let mut streams = lock_ok(&STREAMS);
-        let ch_id = streams.get(&inst.stream_id).map(|s| s.channel_id).unwrap_or(0);
+        let ch_id = streams
+            .get(&inst.stream_id)
+            .map(|s| s.channel_id)
+            .unwrap_or(0);
         if ch_id == 0 {
             if let Some(st) = streams.get_mut(&inst.stream_id) {
                 st.emitted_failed_stop = true;
@@ -991,7 +994,8 @@ pub fn sound_poll(engine: &Tjs2Engine, now_seconds: f64) {
                 .ok()
                 .and_then(|_| engine.retain_value_detached(&TjsValue::Object).ok());
             if let Some(dv) = retained {
-                let _ = engine.call_member(owner, "action", &[TjsValue::Retained(dv.raw_id() as u64)]);
+                let _ =
+                    engine.call_member(owner, "action", &[TjsValue::Retained(dv.raw_id() as u64)]);
             }
         }
 

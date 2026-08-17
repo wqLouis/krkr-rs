@@ -16,13 +16,12 @@ use std::io::Cursor;
 use std::sync::{Arc, Mutex};
 
 use engine::Storage;
-use symphonia::core::audio::SampleBuffer;
-use symphonia::core::codecs::DecoderOptions;
+use symphonia::core::codecs::audio::AudioDecoderOptions;
 use symphonia::core::errors::Error as SymphoniaError;
-use symphonia::core::formats::FormatOptions;
+use symphonia::core::formats::probe::Hint;
+use symphonia::core::formats::{FormatOptions, TrackType};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
-use symphonia::core::probe::Hint;
 
 /// Fully-decoded, interleaved `f32` PCM audio.
 ///
@@ -95,14 +94,25 @@ pub fn decode_audio(
 ///
 /// Public mainly so tests can feed fixtures without a mounted storage.
 pub fn decode_audio_bytes(bytes: &[u8], name: &str) -> Result<DecodedAudio, DecodeError> {
-    // The game's voice files are Ogg Opus (symphonia 0.5 has no Opus
-    // decoder — voices decode as "unsupported codec"). The voices drive
-    // the script's sequencing via onStatusChanged("stop"), so a short
-    // silent buffer lets them "play and finish" immediately and keeps the
-    // logo→title chain moving. Real Opus decoding is a follow-up
-    // (symphonia 0.6 + symphonia-adapter-libopus).
+    // Probe the container. The extension hint only nudges the probe; the
+    // bytes themselves decide the format.
+    let mss = MediaSourceStream::new(Box::new(Cursor::new(bytes.to_vec())), Default::default());
+    let mut hint = Hint::new();
+    if let Some(ext) = name.rsplit('.').next()
+        && !ext.is_empty()
+    {
+        hint.with_extension(ext);
+    }
+    // The game's voice files are Ogg Opus (symphonia's default registry has
+    // no Opus decoder even on 0.6 — the Opus decoder ships separately as
+    // `symphonia-adapter-libopus`, which needs the C libopus). The voices
+    // drive the script's sequencing via `onStatusChanged("stop")`, so a
+    // short silent buffer lets them "play and finish" immediately and keeps
+    // the logo→title chain moving. Real Opus decode is a follow-up.
     if bytes.starts_with(b"OggS") && bytes.windows(8).any(|w| w == b"OpusHead") {
-        log::warn!("decode_audio: {name}: Ogg Opus is not decoded yet; returning a short silent buffer (voice sequencing still works)");
+        log::warn!(
+            "decode_audio: {name}: Ogg Opus is not decoded yet; returning a short silent buffer (voice sequencing still works)"
+        );
         let rate = 48000u32;
         let channels = 2u16;
         // ~60 ms of silence: enough for the mixer to report a play→stop
@@ -114,50 +124,49 @@ pub fn decode_audio_bytes(bytes: &[u8], name: &str) -> Result<DecodedAudio, Deco
             samples: vec![0.0; n],
         });
     }
-    // Probe the container. The extension hint only nudges the probe; the
-    // bytes themselves decide the format.
-    let mss = MediaSourceStream::new(Box::new(Cursor::new(bytes.to_vec())), Default::default());
-    let mut hint = Hint::new();
-    if let Some(ext) = name.rsplit('.').next()
-        && !ext.is_empty()
-    {
-        hint.with_extension(ext);
-    }
-    let probed = symphonia::default::get_probe()
-        .format(
+    let mut format = symphonia::default::get_probe()
+        .probe(
             &hint,
             mss,
-            &FormatOptions::default(),
-            &MetadataOptions::default(),
+            FormatOptions::default(),
+            MetadataOptions::default(),
         )
         .map_err(|e| DecodeError::Format {
             name: name.to_string(),
             detail: format!("{e}"),
         })?;
 
-    let mut format = probed.format;
-
-    // Pick the default (first) audio track.
+    // Pick the default audio track.
     let track = format
-        .default_track()
+        .default_track(TrackType::Audio)
         .ok_or_else(|| DecodeError::NoTrack(name.to_string()))?;
     let track_id = track.id;
+    let codec_params = track
+        .codec_params
+        .as_ref()
+        .and_then(|cp| cp.audio())
+        .ok_or_else(|| DecodeError::NoTrack(name.to_string()))?;
     let mut decoder = symphonia::default::get_codecs()
-        .make(&track.codec_params, &DecoderOptions::default())
+        .make_audio_decoder(codec_params, &AudioDecoderOptions::default())
         .map_err(|e| DecodeError::Format {
             name: name.to_string(),
             detail: format!("codec: {e}"),
         })?;
 
     let mut samples: Vec<f32> = Vec::new();
-    let mut sample_rate = track.codec_params.sample_rate.unwrap_or(0);
-    let mut channels = track.codec_params.channels.map(|c| c.count()).unwrap_or(0) as u16;
+    let mut sample_rate = codec_params.sample_rate.unwrap_or(0);
+    let mut channels = codec_params
+        .channels
+        .as_ref()
+        .map(|c| c.count())
+        .unwrap_or(0) as u16;
 
     loop {
         let packet = match format.next_packet() {
-            Ok(p) => p,
-            // End of stream: the container signals EOF as an UnexpectedEof
-            // I/O error.
+            Ok(Some(p)) => p,
+            // End of stream: symphonia 0.6 signals EOF with Ok(None).
+            Ok(None) => break,
+            // Legacy end-of-stream I/O error (some containers).
             Err(SymphoniaError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 break;
             }
@@ -171,19 +180,18 @@ pub fn decode_audio_bytes(bytes: &[u8], name: &str) -> Result<DecodedAudio, Deco
                 });
             }
         };
-        if packet.track_id() != track_id {
+        if packet.track_id != track_id {
             continue;
         }
 
         match decoder.decode(&packet) {
             Ok(decoded) => {
-                sample_rate = decoded.spec().rate;
-                channels = decoded.spec().channels.count() as u16;
-                // Convert whatever the codec produced (u8/i16/i32/f32/...)
-                // into interleaved f32.
-                let mut buf = SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec());
-                buf.copy_interleaved_ref(decoded);
-                samples.extend_from_slice(buf.samples());
+                sample_rate = decoded.spec().rate();
+                channels = decoded.spec().channels().count() as u16;
+                // Convert whatever the codec produced into interleaved f32.
+                let start = samples.len();
+                samples.resize(start + decoded.samples_interleaved(), 0.0);
+                decoded.copy_to_slice_interleaved(&mut samples[start..]);
             }
             // A corrupt frame: skip it, keep decoding the rest.
             Err(SymphoniaError::DecodeError(_)) => continue,

@@ -3,36 +3,31 @@
 //! The clock-driven [`Mixer`] is the source of truth and works headless
 //! (this machine has no audio device). This module is the *output* half for
 //! machines that do have one: [`start_output`] opens a rodio/cpal output
-//! stream and appends an infinite [`MixerSource`] that pulls the mixer's
+//! sink and appends an infinite [`MixerSource`] that pulls the mixer's
 //! current mix at the device's sample rate. Everything here is fallible and
 //! never required by tests — headless machines just don't call it.
 //!
-//! # Setup notes (rodio 0.20)
+//! # Setup notes (rodio 0.22)
 //!
-//! - `rodio = { version = "0.20", default-features = false, features =
-//!   ["symphonia-wav", "symphonia-vorbis", "symphonia-flac",
-//!   "symphonia-mp3"] }`. rodio's decode features map onto `symphonia`
-//!   features; the direct `symphonia` dependency in `Cargo.toml` enables
-//!   the same set (plus `ogg`/`pcm`) and Cargo unifies them, so rodio's
-//!   internal symphonia is the same build as ours.
-//! - rodio 0.20 does **not** resample: a source must deliver the device's
-//!   sample rate. `MixerSource` is constructed with the device rate by
-//!   [`start_output`] and renders every channel at that rate.
-//! - cpal 0.15 (pulled by rodio 0.20) builds on Linux against ALSA; with no
-//!   sound card, `OutputStream::try_default()` fails at runtime and
-//!   [`start_output`] returns an error instead of panicking.
-//! - cpal 0.15 deliberately makes `cpal::Stream` **`!Send`/`!Sync`** (the
-//!   `NotSendSyncAcrossAllPlatforms` marker, kept for Android AAudio
-//!   support). rodio's [`OutputStream`] wraps that stream, so an
-//!   [`OutputGuard`] can only be created **and dropped on the thread that
-//!   opened it** (dropping on another thread is UB). In a Bevy app the
-//!   guard must live on the main thread — see [`start_output_on_main_thread`]
-//!   and [`crate::set_sound_output_enabled`] for the two supported ways to wire it.
+//! - rodio 0.22 replaced `OutputStream`/`Sink` with a `DeviceSinkBuilder` →
+//!   `MixerDeviceSink` model: `DeviceSinkBuilder::open_default_sink()`
+//!   returns a sink whose [`MixerDeviceSink::mixer`] is a rodio `Mixer`;
+//!   callers `add()` a [`Source`] to it. The sink internally resamples, so
+//!   `MixerSource` renders at the device's rate.
+//! - cpal (pulled by rodio) builds on Linux against ALSA; with no sound
+//!   card, `open_default_sink` fails at runtime and [`start_output`]
+//!   returns an error instead of panicking.
+//! - cpal makes its `Stream` **`!Send`/`!Sync`** on some platforms; rodio's
+//!   `MixerDeviceSink` wraps it, so an [`OutputGuard`] can only be created
+//!   **and dropped on the thread that opened it** (dropping on another
+//!   thread is UB). In a Bevy app the guard must live on the main thread —
+//!   see [`start_output_on_main_thread`] and
+//!   [`crate::set_sound_output_enabled`] for the two supported ways to wire it.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use rodio::{OutputStream, OutputStreamHandle, Sink, Source, cpal};
+use rodio::{DeviceSinkBuilder, MixerDeviceSink, Source};
 
 use crate::mixer::{Mixer, lock_ok};
 
@@ -90,16 +85,16 @@ impl Iterator for MixerSource {
 impl Source for MixerSource {
     /// Never ends: the source renders whatever the mixer currently has
     /// (silence when nothing is playing).
-    fn current_frame_len(&self) -> Option<usize> {
+    fn current_span_len(&self) -> Option<usize> {
         None
     }
 
-    fn channels(&self) -> u16 {
-        self.channels
+    fn channels(&self) -> rodio::ChannelCount {
+        std::num::NonZero::new(self.channels).expect("channels >= 1 by construction")
     }
 
-    fn sample_rate(&self) -> u32 {
-        self.sample_rate
+    fn sample_rate(&self) -> rodio::SampleRate {
+        std::num::NonZero::new(self.sample_rate).expect("non-zero sample rate")
     }
 
     fn total_duration(&self) -> Option<std::time::Duration> {
@@ -156,19 +151,15 @@ impl OutputStatus {
 /// enforce it at compile time, or flip [`OutputStatus`] from any thread
 /// and open the stream on the main thread.
 pub fn start_output(mixer: Arc<Mutex<Mixer>>) -> Result<OutputGuard, OutputError> {
-    let (stream, handle) =
-        OutputStream::try_default().map_err(|e| OutputError::NoDevice(format!("{e}")))?;
-    let sink = Sink::try_new(&handle).map_err(|e| OutputError::Sink(format!("{e}")))?;
+    let sink = DeviceSinkBuilder::open_default_sink()
+        .map_err(|e| OutputError::NoDevice(format!("{e}")))?;
 
-    // Render at the device's rate; rodio does not resample.
-    let (rate, channels) = device_config();
+    // rodio 0.22 resamples internally, so render at the device rate.
+    let rate = sink.config().sample_rate().get();
+    let channels = sink.config().channel_count().get();
 
-    sink.append(MixerSource::new(mixer, rate, channels));
-    Ok(OutputGuard {
-        _stream: stream,
-        _handle: handle,
-        _sink: sink,
-    })
+    sink.mixer().add(MixerSource::new(mixer, rate, channels));
+    Ok(OutputGuard { _sink: sink })
 }
 
 /// Start real-device output with the main-thread-only guarantee baked into
@@ -210,28 +201,13 @@ pub struct MainThreadOutputGuard {
 unsafe impl Send for MainThreadOutputGuard {}
 unsafe impl Sync for MainThreadOutputGuard {}
 
-/// Keep the rodio output stream and sink alive (dropping stops output).
-/// The underscore-prefixed fields are held only for their `Drop` side
-/// effects, so they are intentionally not read.
+/// Keep the rodio output sink alive (dropping stops output). The
+/// underscore-prefixed field is held only for its `Drop` side effects, so
+/// it is intentionally not read.
 ///
 /// **Not `Send`/`Sync`** — see the module docs and [`start_output`].
 pub struct OutputGuard {
-    _stream: OutputStream,
-    _handle: OutputStreamHandle,
-    _sink: Sink,
-}
-
-/// Best-effort device sample rate / channel count (defaults 44100/2 when the
-/// device cannot be queried).
-fn device_config() -> (u32, u16) {
-    use rodio::cpal::traits::{DeviceTrait, HostTrait};
-    let Some(device) = cpal::default_host().default_output_device() else {
-        return (44_100, 2);
-    };
-    match device.default_output_config() {
-        Ok(config) => (config.sample_rate().0, config.channels()),
-        Err(_) => (44_100, 2),
-    }
+    _sink: MixerDeviceSink,
 }
 
 #[cfg(test)]
