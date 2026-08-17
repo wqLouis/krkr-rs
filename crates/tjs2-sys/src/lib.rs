@@ -338,6 +338,14 @@ pub enum TjsValue {
     Real(f64),
     String(String),
     Object,
+    /// A retained value id (from [`Tjs2Engine::retain_value_detached`] /
+    /// [`Tjs2Engine::retain_object_detached`]) passed as an argument. The
+    /// C++ side copies the retained variant into the argument slot, so
+    /// object/dict values that cannot otherwise cross the ABI can be
+    /// passed to a member call (e.g. a KiriKiri event dictionary to an
+    /// owner's `action(ev)` method). The retention is consumed by the
+    /// copy (the Rust side's `DetachedValue` drop is then a safe no-op).
+    Retained(u64),
 }
 
 /// Error raised by the VM during execution.
@@ -1061,6 +1069,18 @@ fn value_to_ffi(v: &TjsValue, strings: &mut Vec<CString>) -> Result<Value, Strin
                 "object values cannot be passed as arguments (no object handle crosses the ABI)"
                     .into(),
             );
+        }
+        TjsValue::Retained(id) => {
+            // Pass a retained value id; the C++ side copies the retained
+            // variant into the argument slot (VAL_RETAINED path in
+            // `value_to_variant`), consuming the retention.
+            out.ty = VAL_RETAINED;
+            out.integer = 0;
+            out.real = 0.0;
+            out.string = ptr::null();
+            out.array = ptr::null();
+            out.array_count = 0;
+            out.retained = *id as usize;
         }
     }
     Ok(out)

@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/xp3", "crates/tjs2-sys", "crates/engine", "crates/kag", "crates/tvp-util", "crates/tvp-streams", "crates/tvp-natives", "crates/tvp-storages", "crates/tvp-scripts", "crates/tvp-archive", "crates/tvp-config", "crates/app", "crates/tvp-visual", "crates/render", "crates/tvp-text", "crates/tvp-kagparser", "crates/tvp-input", "crates/tvp-sound"]
-default-members = ["crates/engine"]
+default-members = ["crates/render", "crates/app"]
 
 [workspace.package]
 version = "0.1.0"
@@ -14,3 +14,5 @@ tjs2-sys = { path = "crates/tjs2-sys" }
 
 [profile.release]
 lto = "thin"
+strip = "symbols"
+codegen-units = 1

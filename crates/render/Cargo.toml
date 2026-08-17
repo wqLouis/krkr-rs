@@ -9,7 +9,7 @@ description = "Bevy render crate: turns the tvp-visual Scene into rendered Bevy 
 name = "krkr_render"
 
 [[bin]]
-name = "krkr-vn"
+name = "krkr-rs"
 path = "src/main.rs"
 
 [dependencies]

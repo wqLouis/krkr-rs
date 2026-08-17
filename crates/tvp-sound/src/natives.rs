@@ -57,7 +57,6 @@
 //!   `getX`/`setX` methods. This matches the reference, which exposes both
 //!   forms (`getVolume`/`setVolume`, `getPan`/`setPan`, ...).
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -72,29 +71,35 @@ use tjs2_sys::{
 use crate::decode::{DecodedAudio, decode_audio};
 use crate::ffi;
 use crate::mixer::{Mixer, lock_ok};
+use crate::player::{MainThreadOutputGuard, start_output_on_main_thread};
 
 /// Engine-side context every native method needs: the mounted storage (for
 /// decoding) and the mixer (for channels). Set by [`register_sound`] on the
-/// VM thread; the VM is single-threaded, so a thread-local is sufficient
-/// (the crate tests use `--test-threads=1` for the same reason).
+/// VM thread. The VM is single-threaded, so one process-global slot is
+/// safe — and **required**: Bevy's parallel scheduler runs `Startup` and
+/// `Update` systems on different worker threads, so a thread-local would
+/// be invisible to the natives called from `run_vm` on another thread.
 #[derive(Clone)]
 pub(crate) struct NativeContext {
     pub(crate) storage: Arc<Mutex<Storage>>,
     pub(crate) mixer: Arc<Mutex<Mixer>>,
 }
 
-thread_local! {
-    static NATIVE_CTX: RefCell<Option<NativeContext>> = const { RefCell::new(None) };
-}
+static NATIVE_CTX: std::sync::Mutex<Option<NativeContext>> = std::sync::Mutex::new(None);
 
 pub(crate) fn native_ctx() -> Option<NativeContext> {
-    NATIVE_CTX.with(|c| c.borrow().clone())
+    NATIVE_CTX
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
 }
 
 /// Point the native classes at the mounted storage and mixer (called by
 /// [`register_sound`]).
 fn set_native_ctx(storage: Arc<Mutex<Storage>>, mixer: Arc<Mutex<Mixer>>) {
-    NATIVE_CTX.with(|c| *c.borrow_mut() = Some(NativeContext { storage, mixer }));
+    *NATIVE_CTX
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = Some(NativeContext { storage, mixer });
 }
 
 // ---------------------------------------------------------------------------
@@ -714,11 +719,44 @@ fn method(name: &'static str, f: NativeInstanceMethodFn) -> NativeInstanceMethod
     NativeInstanceMethodDef { name, f }
 }
 
+/// Set the rodio output to start (or stop) streaming the global mixer to
+/// the real audio device.
+///
+/// The stream is opened **on the calling thread** (rodio/cpal streams are
+/// `!Send`/`!Sync`), so call this from the main thread once at startup —
+/// e.g. in the app's `Startup` after `register_sound`, or in a dedicated
+/// audio-startup system. On machines with no audio device this logs and
+/// falls back to silent (headless) advancement; it never panics.
+///
+/// Returns the guard that keeps the stream alive; it must be **held** (in
+/// a `Resource` on the main thread) and dropped on the same thread it was
+/// created on.
+pub fn set_sound_output_enabled(
+    main_thread_token: std::thread::ThreadId,
+    enabled: bool,
+) -> Result<Option<MainThreadOutputGuard>, crate::player::OutputError> {
+    if !enabled {
+        return Ok(None);
+    }
+    let mixer = crate::global_mixer().ok_or_else(|| {
+        crate::player::OutputError::NoDevice("no global mixer (register_sound not called)".into())
+    })?;
+    start_output_on_main_thread(main_thread_token, mixer).map(Some)
+}
+
 /// Register the `SoundBuffer` and `SoundChannel` native classes on
 /// `engine`, pointing them at `storage` (and creating the process-wide
 /// mixer used by [`crate::advance`]).
 ///
 /// Must be called on the VM thread before any script uses the classes.
+///
+/// # Audio output wiring
+///
+/// Registration does **not** open an audio device by itself (the mixer is
+/// pure computation and must keep working headless). The app is
+/// responsible for pulling the mixer to the speakers; the supported way is
+/// to call [`set_sound_output_enabled`] from the main thread right after
+/// this returns (see the function docs for the `!Send`/`!Sync` caveat).
 pub fn register_sound(engine: &Tjs2Engine, storage: Arc<Mutex<Storage>>) -> Result<(), String> {
     let mixer = Arc::new(Mutex::new(Mixer::new()));
     set_native_ctx(storage, mixer.clone());

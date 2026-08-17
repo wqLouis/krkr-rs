@@ -1410,6 +1410,7 @@ mod tests {
             };
             match engine.eval(&expr, "t").unwrap() {
                 TjsValue::String(s) => s.split('\n').map(str::to_string).collect::<Vec<_>>(),
+                TjsValue::Retained(_) => panic!("expected a string, got retained"),
                 other => panic!("expected a string, got {other:?}"),
             }
         };

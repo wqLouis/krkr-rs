@@ -768,6 +768,7 @@ mod tests {
     fn read_log(engine: &Tjs2Engine) -> String {
         match engine.eval("global.__log", "test") {
             Ok(TjsValue::String(s)) => s,
+            Ok(TjsValue::Retained(_)) => panic!("global.__log retained (unexpected)"),
             other => panic!("global.__log -> {other:?}"),
         }
     }

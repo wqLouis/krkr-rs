@@ -32,6 +32,7 @@ mod async_trigger;
 mod chain_item_base;
 mod constants;
 mod debug;
+mod extrans;
 mod menu_item;
 mod plugin_stubs;
 mod plugins;
@@ -40,6 +41,10 @@ mod system;
 pub use async_trigger::{async_trigger_poll, register_async_trigger};
 pub use chain_item_base::register_chain_item_base;
 pub use debug::register_debug;
+pub use extrans::{
+    TRANS_TYPE_EXCHANGE, TRANS_TYPE_SIMPLE, TRANS_UPDATE_DIVISIBLE, TRANS_UPDATE_DIVISIBLE_FADE,
+    TRANS_UPDATE_GIVE_UPDATE, TransitionKind, register_trans, transition_kind,
+};
 pub use menu_item::register_menu_item;
 pub use plugin_stubs::register_plugin_stubs;
 pub use plugins::register_plugins;
@@ -120,6 +125,7 @@ pub fn register_all(engine: &Tjs2Engine) -> Result<(), String> {
     register_debug(engine)?;
     register_plugins(engine)?;
     register_plugin_stubs(engine)?;
+    register_trans(engine)?;
     register_menu_item(engine)?;
     register_chain_item_base(engine)?;
     register_async_trigger(engine)?;

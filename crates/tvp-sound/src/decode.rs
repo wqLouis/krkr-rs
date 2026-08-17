@@ -95,6 +95,25 @@ pub fn decode_audio(
 ///
 /// Public mainly so tests can feed fixtures without a mounted storage.
 pub fn decode_audio_bytes(bytes: &[u8], name: &str) -> Result<DecodedAudio, DecodeError> {
+    // The game's voice files are Ogg Opus (symphonia 0.5 has no Opus
+    // decoder — voices decode as "unsupported codec"). The voices drive
+    // the script's sequencing via onStatusChanged("stop"), so a short
+    // silent buffer lets them "play and finish" immediately and keeps the
+    // logo→title chain moving. Real Opus decoding is a follow-up
+    // (symphonia 0.6 + symphonia-adapter-libopus).
+    if bytes.starts_with(b"OggS") && bytes.windows(8).any(|w| w == b"OpusHead") {
+        log::warn!("decode_audio: {name}: Ogg Opus is not decoded yet; returning a short silent buffer (voice sequencing still works)");
+        let rate = 48000u32;
+        let channels = 2u16;
+        // ~60 ms of silence: enough for the mixer to report a play→stop
+        // transition on the next poll.
+        let n = (rate as usize / 1000 * 60) * channels as usize;
+        return Ok(DecodedAudio {
+            sample_rate: rate,
+            channels,
+            samples: vec![0.0; n],
+        });
+    }
     // Probe the container. The extension hint only nudges the probe; the
     // bytes themselves decide the format.
     let mss = MediaSourceStream::new(Box::new(Cursor::new(bytes.to_vec())), Default::default());

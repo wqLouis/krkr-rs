@@ -86,6 +86,7 @@ extern "C" fn native_link(
     let emulated = matches!(
         normalized.as_str(),
         "csvparser.dll"
+            | "extrans.dll"
             | "fstat.dll"
             | "kagparser.dll"
             | "kagparserex.dll"

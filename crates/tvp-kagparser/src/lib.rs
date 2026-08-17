@@ -431,7 +431,7 @@ impl ContextEnv {
                     Ok(TjsValue::Integer(i)) => Ok(EvalResult::Integer(i)),
                     Ok(TjsValue::Real(r)) => Ok(EvalResult::Real(r)),
                     Ok(TjsValue::String(s)) => Ok(EvalResult::Str(s)),
-                    Ok(TjsValue::Object) => {
+                    Ok(TjsValue::Object) | Ok(TjsValue::Retained(_)) => {
                         log::warn!(
                             "KAGParser: expression {exp:?} returned an object; treating as void"
                         );

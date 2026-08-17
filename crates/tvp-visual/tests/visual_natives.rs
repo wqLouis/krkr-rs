@@ -192,17 +192,24 @@ fn timer_fires_callback_via_poll() {
         "nothing fires before the first poll"
     );
 
-    // Enabling reschedules "now" (0); the first poll at now_ms = 0 is due.
+    // The reference reschedules on enable: fire at *now + interval*, so
+    // with the last polled clock 0 the first fire is at 50, not 0.
     tvp_visual::timer_poll(&env.engine, 0);
+    assert_eq!(env.eval_int("fired"), 0, "not due until now+interval(50)");
+
+    // 49 is not due; at 50 the timer fires (and reschedules to 100).
+    tvp_visual::timer_poll(&env.engine, 49);
+    assert_eq!(env.eval_int("fired"), 0);
+    tvp_visual::timer_poll(&env.engine, 50);
     assert_eq!(env.eval_int("fired"), 1);
     assert_eq!(env.eval_int("t.count"), 1, "count tracks fires");
 
-    // Next fire is 0 + interval(50) = 50; 49 is not due.
-    tvp_visual::timer_poll(&env.engine, 49);
+    // Next fire is 50 + interval(50) = 100; 99 is not due.
+    tvp_visual::timer_poll(&env.engine, 99);
     assert_eq!(env.eval_int("fired"), 1);
 
-    // At 50 the timer fires again and reschedules to 100.
-    tvp_visual::timer_poll(&env.engine, 50);
+    // At 100 the timer fires again and reschedules to 150.
+    tvp_visual::timer_poll(&env.engine, 100);
     assert_eq!(env.eval_int("fired"), 2);
     assert_eq!(env.eval_int("t.count"), 2);
 
@@ -210,4 +217,41 @@ fn timer_fires_callback_via_poll() {
     env.run("t.enabled = false;");
     tvp_visual::timer_poll(&env.engine, 1_000_000);
     assert_eq!(env.eval_int("fired"), 2);
+}
+
+/// Kirikiroid2 compatibility: `OnceCall(fn, ms)` fires the callback exactly
+/// once after `ms` milliseconds, and `OnceCallCancel(fn)` cancels it by
+/// function identity. This is what the game's Logo constructor calls
+/// (`system/Title.tjs`: `OnceCall(step01, 1000)`); without it the logo
+/// keyframe chain never starts.
+#[test]
+fn oncecall_fires_once_and_cancels() {
+    let env = Env::new();
+    env.run(
+        "var fired = 0; \
+         function step() { fired++; } \
+         var t = OnceCall(step, 100);",
+    );
+    assert_eq!(env.eval_int("fired"), 0, "nothing before the poll");
+
+    // Before the deadline: nothing.
+    tvp_visual::timer_poll(&env.engine, 50);
+    assert_eq!(env.eval_int("fired"), 0);
+
+    // At/after the deadline the callback fires exactly once, and the timer
+    // disables itself (one-shot): further polls do not re-fire.
+    tvp_visual::timer_poll(&env.engine, 100);
+    assert_eq!(env.eval_int("fired"), 1);
+    tvp_visual::timer_poll(&env.engine, 10_000);
+    assert_eq!(env.eval_int("fired"), 1, "one-shot: never fires again");
+
+    // OnceCallCancel stops a pending callback by function identity.
+    env.run(
+        "var fired2 = 0; \
+         function step2() { fired2++; } \
+         OnceCall(step2, 100); \
+         OnceCallCancel(step2);",
+    );
+    tvp_visual::timer_poll(&env.engine, 200);
+    assert_eq!(env.eval_int("fired2"), 0, "cancelled callback never fires");
 }

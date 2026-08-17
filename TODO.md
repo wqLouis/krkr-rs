@@ -1,4 +1,4 @@
-# krkr-rs — Plugin & Game Runtime TODO
+# krkr-rs — Game Runtime TODO
 
 ## Current state (Aug 17, 2026)
 
@@ -7,110 +7,140 @@ TJS2 VM → `system/Status.tjs` + `Initialize.tjs` + `k2compat/*` + all
 `system/*.tjs` load → `begin.tjs` creates `SceneManager` + `Logo` scene →
 Bevy window renders the logo/title layers → input bridge dispatches mouse/key
 to the game's `onMouseDown`/`onKeyDown` → `WaveSoundBuffer` audio natives
-registered (BGM path wired but **not verified audibly**).
+registered (BGM path wired, voices decode as silence).
 
-**Remaining blockers**: the core startup plugin chain is now emulated by
-built-in Rust natives. `Plugins.link(...)` records supported emulated plugins
-and ignores optional desktop-only DLLs. The remaining gameplay gaps are
-true pixel effects, native popup rendering, and the real-time activation
-callback path.
+**Remaining blockers**: the startup plugin chain is emulated by built-in Rust
+natives. The gameplay gaps: the logo→title transition is **stuck at the
+warning (ATTENTION) screen** — the voice-driven sequence advances only when
+`onStatusChanged("stop")` fires, which is still being debugged. Below is the
+complete investigation log.
 
 ---
 
-## Stage 1 — Plugin registration matrix (DONE)
+## The white-screen investigation (Aug 17) — root causes found & fixed
+
+The user-visible symptom was "a pure white block, no logo, no title". Four
+independent bugs stacked on each other; each was found with native-level
+instrumentation against the real game:
+
+### 1. `OnceCall` / `OnceCallCancel` were missing (FIXED)
+The game is a **Kirikiroid2 fork** (`@set(kirikiriz=1)`), not stock KiriKiri2.
+`system/Title.tjs:158` calls `OnceCall(step01, 1000)` as a **bare global**
+(also in EyeCatch.tjs, AttentionVoice, etc.). It's not in the reference C++
+core, not in any game script — it's a Kirikiroid2-native. The Logo constructor
+threw there → the logo keyframe chain never started → the scene was a static
+white fill (LAYER_LOGO paints `fillRect(0,0,1280,720,0xffffffff)` at
+`absolute = LAYER_LOGO (110000)`).
+
+**Fix**: `register_timer` (tvp-visual/src/natives/timer.rs) now execs a script
+that defines `OnceCall(fn, ms)` / `OnceCallCancel(fn)` as globals over the
+`Timer` native class, with a function→timer registry (mirrors the game's own
+`OnceTimer` script class).
+
+### 2. `Timer.enabled = true` fired immediately instead of after the interval (FIXED)
+Our native set `next_fire_ms = 0` on enable, but the reference
+(`TimerImpl.cpp SetEnabled`) does `SetNextTick(now + interval)`. Added
+`last_now_ms` to each TimerState; enable/interval changes reschedule from the
+last polled clock. This made `OnceCall(fn, 100)` fire at once instead of after
+100 ms.
+
+### 3. Sound native context was thread-local (FIXED)
+`NATIVE_CTX` in tvp-sound/src/natives.rs was `thread_local!`, but **Bevy's
+parallel scheduler runs `Startup` and `Update` systems on different worker
+threads** (we observed ThreadId 12/13/14). `register_sound` set the ctx on one
+thread; `sound_poll` in `run_vm` ran on another → "sound natives are not
+registered" → the game's `PlaySystemVoice` failed silently → the ATTENTION
+sequence never advanced. Switched to a process-global `static Mutex`.
+
+### 4. `WaveSoundBuffer(owner)` retained the wrong object (FIXED)
+The reference (`SoundBufferBaseIntf.cpp Construct`) does
+`ActionOwner = param[0]` — the **first constructor argument** is the action
+owner. We retained `objthis` (the newly-created instance) instead. The game's
+`AttentionVoice` does `new WaveSoundBuffer(this)` and implements
+`action(ev)` (checks `ev.type == "onStatusChanged" && ev.status == "stop"`);
+events went to the instance (native no-op `onStatusChanged`) and never reached
+the AttentionVoice. Now the ctor retains argv[0], and `sound_poll` delivers
+BOTH `action(%[type,status])` (dict, via a new `TjsValue::Retained` ABI path)
+and `onStatusChanged(status)`.
+
+### 5. Voice files are Ogg Opus; symphonia 0.5 has no Opus decoder (WORKED AROUND)
+`voice/*.ogg` are **Ogg Opus** (`OpusHead`), while `bgm/*.ogg` are Vorbis.
+symphonia 0.5.5 has no `symphonia-codec-opus` (added in 0.6+). `decode_audio`
+now detects Opus and returns a ~60 ms silent buffer (the voices still drive
+the script sequencing via `onStatusChanged("stop")`). Real Opus decoding needs
+a symphonia 0.6 upgrade — see Stage 4.
+
+### 6. Cross-thread deadlock in the sound natives (FIXED — run_vm lock)
+`sound_poll` was observed running on **multiple Bevy worker threads**
+(ThreadId 12/13/14) while timer callbacks ran on the main thread. Both take
+the shared `STREAMS`/mixer locks; a ctor on thread A blocked on `STREAMS` held
+by `sound_poll` on thread B → all threads futex-wait (verified via
+`/proc/*/task/*/wchan` = `futex_do_wait`). **Fix**: `run_vm` now wraps the
+entire VM step (async triggers + timers + continuous handlers + sound poll) in
+a process-global `VM_RUN_LOCK` (`try_lock`, skip if another thread is already
+driving the VM). The VM and all native state are now serialized even though
+Bevy moves the system across threads.
+
+---
+
+## Stage 1 — Plugin registration matrix
 
 | Plugin | Game use | krkr-rs status |
 |---|---|---|
-| `extrans.dll` | unknown/optional | ignored (log only) |
+| `extrans.dll` | `Trans` class | ✅ native `Trans` registered (extrans.rs) |
 | `csvParser.dll` | `new CSVParser()` (charData.csv) | ✅ real native in tvp-storages |
-| `layerExDraw.dll` | layer effects (blur etc.) | ignored |
-| `fstat.dll` | `Storages.stat`/file metadata and file operations | ✅ stat/fstat metadata, copyFile/deleteFile landed in tvp-storages |
-| `windowEx.dll` | `System.desktop*`, `Window` ex-props | ✅ monitor context + `System.getDisplayMonitors/getMonitorInfo`; OS popup extras remain stubbed |
-| `KAGParserEx.dll` | placeholder only | ✅ KAGParser native in tvp-kagparser |
-| `getSample.dll` | debug only (`__DEBUGMODE__=0`) | ignored |
-| `wuvorbis.dll` | `WaveSoundBuffer` (.ogg) | ✅ real natives in tvp-sound (unverified audibly) |
-| `menu.dll` | `MenuItem`, `Window.menu` | ✅ logical headless-safe MenuItem tree + Window.menu fallback; native children object arrays remain ABI-limited |
+| `layerExDraw.dll` | layer effects (blur etc.) | ⚠️ logical-layer pixel ops; GPU blend modes pending |
+| `fstat.dll` | `Storages.stat`/file metadata | ✅ stat/fstat metadata, copyFile/deleteFile |
+| `windowEx.dll` | `System.desktop*`, monitor info | ✅ monitor context + `getDisplayMonitors` |
+| `KAGParserEx.dll` | placeholder | ✅ KAGParser native |
+| `getSample.dll` | debug only | ignored |
+| `wuvorbis.dll` | `WaveSoundBuffer` (.ogg) | ✅ natives; Opus voice decode pending |
+| `menu.dll` | `MenuItem`, `Window.menu` | ✅ logical tree + Window.menu fallback |
 | `KAGParser.dll` | `ScController extends KAGParser` | ✅ native + script-subclass ctor |
 
-## Stage 2 — What's missing to run the title → ADV flow
+## Stage 3 — Game-runtime milestones
 
-Ordered by what the game hits next (all reference sources under
-`reference/cpp/plugins/`):
+1. **Logo → Title transition** — the chain now RUNS (OnceCall fires, fades
+   progress, timers 7/8/9 fire, continuous handlers register/self-remove).
+   **Stuck at the ATTENTION screen**: the voice sequence needs
+   `onStatusChanged("stop")` from the WaveSoundBuffer owners. The owner/action
+   delivery is fixed; next check is whether the AttentionVoice's `action(ev)`
+   advances with the silent-Opus voices.
+2. **Title screen input** — input bridge wired; verify click→skip-logo and
+   NEW GAME / CONTINUE hit the SelectItems.
+3. **`ScController` scenario loop** — `loadScenario → getNextTag → onTag`;
+   needs `Layer.drawText` + fonts (tvp-text) + hit-testing for click-through.
+4. **BGM/SE/voice** — rodio output wired (main-thread guard held in
+   `VmRuntime`); real Opus voice decode pending (symphonia 0.6 upgrade).
+5. **Save/load** — saveStruct eval OK; `savedata/` dir created at startup;
+   full flow untested.
 
-1. **`windowEx.dll` (System.desktop*, screen size)** — ✅ `SystemContext` now
-   carries desktop origin/size, the Bevy primary monitor feeds it, and
-   `System.getDisplayMonitors/getMonitorInfo` provide the k2compat shape.
-2. **`MenuItem` / `Window.menu` (menu.dll)** — ✅ logical state/tree support and
-   headless popup behavior are present; native object-valued child arrays and
-   OS menu handles remain outside the current ABI/host.
-3. **`fstat.dll`** — ✅ `Storages.stat`/`fstat` return disk Date metadata and
-   XP3 uncompressed sizes; copy/delete remain available.
-4. **`extrans.dll`** — audited in the real game: no `new Trans` usage was found;
-   the optional link remains a safe ignored plugin.
-5. **`layerExDraw.dll`** — basic text/blur pixel operations now exist on the
-   logical layer surface; advanced vector/effect operations remain no-op
-   compatibility methods and true GPU blend modes are still pending.
+## Stage 4 — Known open issues
 
-## Stage 3 — Game-runtime milestones (what actually blocks gameplay)
+- **Symphonia 0.5 lacks Opus**: upgrade to symphonia 0.6 +
+  `symphonia-adapter-libopus` so voices actually decode (currently silence).
+  Requires adapting the decode API (0.5→0.6 broke some interfaces).
+- **Blend modes**: `layer.type` (ltAdditive etc.) reaches the scene but Bevy
+  still source-over blends — real GPU blend modes pending (render crate).
+- **Hierarchy flattening**: parent/child order/opacity composed depth-first;
+  verified correct in window_layer_order but the game's Logo uses flat layers.
+- **`System.screenWidth/Height`** — logical size stays 1280×720; desktop
+  origin/size supplied by Bevy.
+- **Audio output**: cpal `Stream` is `!Send`/`!Sync` — the guard must be
+  created AND dropped on the main thread (held in `VmRuntime`); no device →
+  silent advance (never panics).
 
-1. **Logo → Title transition** — ✅ timer and transition polling are wired;
-   `real_game_timer_loop_advances_scene` now completes successfully after
-   deferring continuous-handler re-registration until the current callback
-   returns.
-2. **Title screen input** — input bridge wired; needs verification that
-   clicking `NEW GAME` / `CONTINUE` reaches `SelectItem` → `changeScene`.
-3. **`ScController` scenario loop** — `system/ScController.tjs` drives
-   `loadScenario("*.ks")` → `getNextTag()` → `onTag()` handlers. KAGParser
-   natives + real dicts are in; the ADV scene needs:
-   - `Storages.getPlacedPath` / full path semantics for scenario files ✅
-   - `Layer.drawText` metrics/rasterization fallback + box blur ✅
-   - `System.getKeyState` now mirrors host VK state; cursor bridge is wired;
-     layer hit-testing still needs gameplay verification
-4. **BGM/SE/voice** — `WaveSoundBuffer` natives in; verify `PlayBgm("BGM02")`
-   actually produces audio (rodio output is optional/no-op without a device;
-   mixer advances each frame — check the per-frame poll is wired in `run_vm`).
-5. **Save/load** — `saveStruct`/`system.dat` eval ✅; the save screens need
-   `Storages.getFileList`, file I/O (disk-backed streams ✅), and the
-   `savedata/` directory to exist under the game dir.
-
-## Stage 4 — Known open issues (from the integration wave)
-
-- **`real_game_timer_loop_advances_scene`** remains `#[ignore]` because it
-  requires the external game fixture, but it now passes when explicitly run
-  with `--ignored`.
-- **Blend modes** — `layer.type` now reaches the scene and hierarchy sync;
-  Bevy's default Sprite pipeline still source-over blends, so true additive /
-  subtractive GPU compositing remains pending.
-- **Hierarchy flattening** — parent/child order, position, opacity, and
-  visibility are now composed depth-first in render sync.
-- **`System.screenWidth/Height`** — logical size remains 1280×720 by design;
-  desktop monitor origin/size is now supplied by Bevy when available.
-- **Audio device** — rodio output only if an ALSA device exists; silent
-  otherwise (natives still advance the mixer). Save-data directory creation
-  and disk metadata support are now wired for save/load screens.
-
----
-
-## How to verify each stage
+## How to verify
 
 ```bash
+# release build
+cargo build --release
 # headless load (no window): must print "startup.tjs executed successfully"
-./target/debug/krkr-vn run "/mnt/DATA/Games/Others/test" --headless
-
-# windowed run: watch logo → title transition, then click NEW GAME
-./target/debug/krkr-vn run "/mnt/DATA/Games/Others/test"
-
+./target/release/krkr-rs run "/mnt/DATA/Games/Others/test" --headless
+# windowed run: logo → title transition, then click NEW GAME
+./target/release/krkr-rs run "/mnt/DATA/Games/Others/test"
 # unit + integration (full speed, parallel)
-cargo test --workspace            # 395 tests
+cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check
 ```
-
-## Reference material
-
-- `reference/cpp/plugins/` — 35 plugin sources (csvParser, fstat, windowEx,
-  KAGParser, layerex_draw, win32dialog, ...)
-- `reference/cpp/core/plugin/` — PluginIntf/PluginImpl (the `Plugins` class)
-- `system/Initialize.tjs` — the game's plugin link list
-- `k2compat/k2compat.tjs` — `delayLoadPlugin` + `requireWindowEx`/`require`
-  fallback machinery

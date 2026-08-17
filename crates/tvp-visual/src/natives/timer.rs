@@ -38,6 +38,10 @@ struct TimerState {
     enabled: bool,
     /// Monotonic-clock time of the next fire.
     next_fire_ms: u64,
+    /// The most recent clock value seen by [`timer_poll`] (the reference
+    /// reschedules from *now + interval* on enable/interval change, so we
+    /// need the last polled clock; 0 before the first poll).
+    last_now_ms: u64,
     /// How many times the timer has fired.
     count: u64,
 }
@@ -108,6 +112,7 @@ extern "C" fn timer_ctor(
             interval_ms: 1000,
             enabled: false,
             next_fire_ms: 0,
+            last_now_ms: 0,
             count: 0,
         },
     );
@@ -218,6 +223,12 @@ extern "C" fn timer_interval_set(
     let mut timers = TIMERS.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(t) = timers.get_mut(&inst.id) {
         t.interval_ms = arg_i64(v).max(1) as u64;
+        // The reference reschedules an *enabled* timer from now + interval
+        // when its interval changes (SetInterval: CancelEvents + SetNextTick
+        // now+interval).
+        if t.enabled {
+            t.next_fire_ms = t.last_now_ms.saturating_add(t.interval_ms);
+        }
     }
     0
 }
@@ -256,8 +267,9 @@ extern "C" fn timer_enabled_set(
     if let Some(t) = timers.get_mut(&inst.id) {
         t.enabled = arg_bool(v);
         if t.enabled {
-            // Reschedule from now (the reference reschedules on enable).
-            t.next_fire_ms = 0;
+            // The reference reschedules on enable: fire at now + interval
+            // (SetEnabled: SetNextTick(now + interval)), not immediately.
+            t.next_fire_ms = t.last_now_ms.saturating_add(t.interval_ms);
         }
     }
     0
@@ -330,7 +342,18 @@ extern "C" fn timer_id_get(
     0
 }
 
-/// Register the `Timer` native class (instance-based).
+/// Register the `Timer` native class (instance-based) plus the Kirikiroid2
+/// compatibility globals `OnceCall` / `OnceCallCancel`.
+///
+/// The game this engine targets (`@set(kirikiriz=1)`, run on Kirikiroid2)
+/// calls `OnceCall(fn, ms)` / `OnceCallCancel(fn)` as **bare global
+/// functions** (e.g. `system/Title.tjs` Logo constructor:
+/// `OnceCall(step01, 1000)`). They are one-shot timers: `OnceCall` runs the
+/// callback once after `ms` milliseconds; `OnceCallCancel` cancels a
+/// pending one by function identity. They are implemented as script
+/// globals over the `Timer` native class (the same machinery the game's
+/// own `OnceTimer` script class uses), with a function→timer registry so
+/// `OnceCallCancel(fn)` can disable the pending timer.
 pub(crate) fn register_timer(engine: &Tjs2Engine) -> Result<(), String> {
     engine.register_native_class_instance(&NativeInstanceBuilder {
         name: "Timer",
@@ -373,7 +396,60 @@ pub(crate) fn register_timer(engine: &Tjs2Engine) -> Result<(), String> {
                 set: None,
             },
         ],
-    })
+    })?;
+
+    // Kirikiroid2 compatibility: `OnceCall(fn, ms)` / `OnceCallCancel(fn)`.
+    // One-shot timers over the `Timer` native class, with a function→timer
+    // registry for cancellation by function identity. The game's scripts
+    // (Title.tjs, EyeCatch.tjs, AttentionVoice, ...) call these as bare
+    // globals; without them the logo keyframe chain never starts.
+    let oncecall_script = r#"
+        if(typeof global.OnceCall == "undefined"){
+            global._onceCallReg = [];
+            // Mirrors the game's own `OnceTimer` script class
+            // (system/Utility.tjs): a one-shot timer that disables itself
+            // after the first onTimer. The native Timer's onTimer invokes
+            // the constructor callback; this subclass overrides it to
+            // self-cancel first (so the wrapper's onTimer runs once).
+            class _OnceCallTimer extends Timer{
+                function _OnceCallTimer(func, time){
+                    super.Timer(func, "");
+                    interval = int(time);
+                    capacity = 1;
+                    enabled = true;
+                }
+                function onTimer(){
+                    enabled = false;
+                    super.onTimer();
+                }
+            }
+            global.OnceCall = function(func, time){
+                var t = new _OnceCallTimer(func, time);
+                for(var i=0;i<global._onceCallReg.count;i++){
+                    if(global._onceCallReg[i].func == func){
+                        global._onceCallReg[i].timer.enabled = false;
+                        global._onceCallReg[i].timer = t;
+                        return t;
+                    }
+                }
+                global._onceCallReg.add(%[func:func, timer:t]);
+                return t;
+            };
+            global.OnceCallCancel = function(func){
+                for(var i=0;i<global._onceCallReg.count;i++){
+                    if(global._onceCallReg[i].func == func){
+                        global._onceCallReg[i].timer.enabled = false;
+                        return;
+                    }
+                }
+            };
+        }
+    "#;
+    // SAFETY-ish: exec_script runs on the VM thread at registration time.
+    engine
+        .exec_script(oncecall_script, "krkr_rs_oncecall")
+        .map_err(|e| format!("failed to define OnceCall globals: {e}"))?;
+    Ok(())
 }
 
 extern "C" fn timer_create(engine: *mut std::ffi::c_void) -> *mut std::ffi::c_void {
@@ -407,6 +483,15 @@ extern "C" fn timer_ctor_hook(
 
 /// Fire due timers. `now_ms` is a monotonic millisecond clock.
 pub(crate) fn timer_poll(engine: &Tjs2Engine, now_ms: u64) {
+    // Remember the latest clock so enable/interval changes reschedule from
+    // the current time (the reference's SetEnabled/SetInterval use
+    // TVPGetTickCount()).
+    {
+        let mut timers = TIMERS.lock().unwrap_or_else(|p| p.into_inner());
+        for t in timers.values_mut() {
+            t.last_now_ms = now_ms;
+        }
+    }
     // Snapshot the ids of due timers, then fire them one at a time so a
     // callback that registers/disables timers is safe.
     let due: Vec<(u32, u64)> = {

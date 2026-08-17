@@ -378,7 +378,7 @@ fn set_out_result(out: *mut Value, v: TjsValue) {
             }
         }
         TjsValue::String(s) => set_string_result(out, &s),
-        TjsValue::Object => {
+        TjsValue::Object | TjsValue::Retained(_) => {
             // The C ABI carries no object handle; the reference returns the
             // object, we fall back to void.
             log::warn!("Scripts: object result cannot cross the C ABI yet; returning void");

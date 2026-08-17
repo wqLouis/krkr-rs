@@ -1,9 +1,9 @@
-//! `krkr-vn` binary: the demo harness and the graphical game runner.
+//! `krkr-rs` binary: the demo harness and the graphical game runner.
 //!
-//! * `krkr-vn demo` — builds a small [`Scene`] in code and renders it for a
+//! * `krkr-rs demo` — builds a small [`Scene`] in code and renders it for a
 //!   few seconds (or until the window closes), proving the scene → Bevy
 //!   pipeline end to end.
-//! * `krkr-vn run <game-dir> [--headless]` — the real game runner: mounts
+//! * `krkr-rs run <game-dir> [--headless]` — the real game runner: mounts
 //!   the game's storage, registers the TVP native classes (`System`,
 //!   `Storages`, `Scripts`, then the visual `Window`/`Layer`/`Bitmap`/
 //!   `Font`/`Timer` bound to the shared [`Scene`]), runs `startup.tjs`, and
@@ -51,23 +51,23 @@ fn main() {
                 .find(|a| !a.starts_with('-'))
                 .map(|a| PathBuf::from(a.as_str()))
             else {
-                eprintln!("krkr-vn: usage: krkr-vn run <game-dir> [--headless]");
+                eprintln!("krkr-rs: usage: krkr-rs run <game-dir> [--headless]");
                 std::process::exit(2);
             };
             run_game(&game_dir, headless);
         }
         _ => {
-            eprintln!("krkr-vn: usage: krkr-vn demo | krkr-vn run <game-dir> [--headless]");
+            eprintln!("krkr-rs: usage: krkr-rs demo | krkr-rs run <game-dir> [--headless]");
             std::process::exit(2);
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Game runner (`krkr-vn run <game-dir>`)
+// Game runner (`krkr-rs run <game-dir>`)
 // ---------------------------------------------------------------------------
 
-/// `krkr-vn run <game-dir>` configuration (windowed or headless).
+/// `krkr-rs run <game-dir>` configuration (windowed or headless).
 #[derive(Resource)]
 struct GameConfig {
     game_dir: PathBuf,
@@ -79,6 +79,13 @@ struct GameConfig {
 pub(crate) struct VmRuntime {
     engine: Arc<tjs2_sys::Tjs2Engine>,
     started: Instant,
+    /// Optional live audio output guard (rodio/cpal stream owned by the
+    /// main thread). Held here so it lives for the app's lifetime and is
+    /// dropped on the main thread when the app exits (cpal 0.15's `Stream`
+    /// is `!Send`/`!Sync`; the wrapper makes it safe to hold in a
+    /// `Resource` as long as it is created and dropped on the same thread).
+    #[allow(dead_code)]
+    audio_output: Option<tvp_sound::MainThreadOutputGuard>,
 }
 
 /// Result of executing `startup.tjs` — kept so `--headless` and the
@@ -86,7 +93,7 @@ pub(crate) struct VmRuntime {
 #[derive(Resource)]
 struct StartupReport(LoadReport);
 
-/// `krkr-vn run <game-dir>`: mount the game, register natives, run
+/// `krkr-rs run <game-dir>`: mount the game, register natives, run
 /// `startup.tjs`, then loop (VM timers → scene sync → render).
 /// `--headless` runs one pass with no window and dumps the scene instead.
 fn run_game(game_dir: &std::path::Path, headless: bool) -> ! {
@@ -94,7 +101,7 @@ fn run_game(game_dir: &std::path::Path, headless: bool) -> ! {
     if headless {
         run_headless(shared, game_dir.to_path_buf());
     }
-    println!("krkr-vn: running {game_dir:?} (close the window to exit)");
+    println!("krkr-rs: running {game_dir:?} (close the window to exit)");
     game_app(shared, game_dir.to_path_buf()).run();
     unreachable!("App::run returns only after the app exits")
 }
@@ -164,7 +171,7 @@ fn game_startup(
     let (storage, engine) = match engine::loader::prepare(&game_dir) {
         Ok(pair) => pair,
         Err(e) => {
-            log::error!("krkr-vn: cannot load game {game_dir:?}: {e}");
+            log::error!("krkr-rs: cannot load game {game_dir:?}: {e}");
             std::process::exit(1);
         }
     };
@@ -198,7 +205,7 @@ fn game_startup(
     //    scene (natives mutate it under a write lock, sync_scene renders
     //    it under a read lock).
     register_natives(&engine, &storage, &shared).unwrap_or_else(|e| {
-        log::error!("krkr-vn: native registration failed: {e}");
+        log::error!("krkr-rs: native registration failed: {e}");
         std::process::exit(1);
     });
 
@@ -217,15 +224,23 @@ fn game_startup(
             commands.insert_resource(StartupReport(report));
         }
         Err(e) => {
-            log::error!("krkr-vn: cannot run startup.tjs: {e}");
+            log::error!("krkr-rs: cannot run startup.tjs: {e}");
             std::process::exit(1);
         }
     }
 
     // 6. Hand the VM to the update loop; `now_ms` is measured from here.
+    //    Open the audio output on the main thread (rodio/cpal; no device →
+    //    logs and continues silently). The guard must be created and
+    //    dropped on the same thread, so it lives in the `VmRuntime`
+    //    resource which is inserted and dropped on the main thread.
+    let audio_output = tvp_sound::set_sound_output_enabled(std::thread::current().id(), true)
+        .map_err(|e| log::warn!("krkr-rs: audio output disabled: {e}"))
+        .unwrap_or(None);
     commands.insert_resource(VmRuntime {
         engine,
         started: Instant::now(),
+        audio_output,
     });
 }
 
@@ -257,7 +272,27 @@ fn register_natives(
 /// Drive the TJS2 VM once per frame: fire due timers (the game's event
 /// loop). A panic inside a TJS callback must not kill the app — catch it,
 /// log it, and keep the frame going.
+/// Serialize the whole VM-driving system across Bevy worker threads.
+///
+/// The TJS2 VM is single-threaded and the natives share process-global
+/// mutable state (sound `STREAMS`/mixer, timer registry, continuous
+/// handlers). Bevy's parallel scheduler moves `run_vm` between worker
+/// threads across frames while timer callbacks run on the main thread, so
+/// without this lock the shared sound locks deadlock (a ctor on thread A
+/// blocks on `STREAMS` held by `sound_poll` on thread B and vice versa).
+static VM_RUN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn run_vm(vm: Res<VmRuntime>) {
+    // Hold the lock for the entire VM step so no other thread can touch the
+    // shared native state mid-frame. One shot: if the lock is already held
+    // by a re-entrant call on this thread, skip (the outer call completes
+    // the step).
+    let guard = VM_RUN_LOCK.try_lock();
+    let _guard = match guard {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::WouldBlock) => return,
+        Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+    };
     let now_ms = vm.started.elapsed().as_millis() as u64;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         tvp_natives::async_trigger_poll(&vm.engine);
@@ -287,7 +322,7 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
-/// `krkr-vn run <game-dir> --headless`: drive ONE pass of the app's systems
+/// `krkr-rs run <game-dir> --headless`: drive ONE pass of the app's systems
 /// manually (no window — this machine has no GPU adapter, so a window
 /// cannot open), then dump the resulting [`Scene`] state to stdout and exit
 /// 0. Proves the whole chain: real startup.tjs → natives → Scene populated
@@ -344,9 +379,11 @@ fn dump_scene(scene: &Scene) -> String {
     }
     for l in &scene.layers {
         lines.push(format!(
-            "layer #{} win={} rect=({},{},{}x{}) bitmap={} fill={} visible={} opacity={} z={}",
+            "layer #{} win={} parent={} children={:?} rect=({},{},{}x{}) bitmap={} fill={} visible={} opacity={} z={}",
             l.id,
             l.window,
+            l.parent.map_or_else(|| "none".to_string(), |id| id.to_string()),
+            l.children,
             l.rect.x,
             l.rect.y,
             l.rect.w,
@@ -397,10 +434,10 @@ struct DemoAnimateState {
 #[derive(Resource)]
 struct DemoTimer(Duration);
 
-/// `krkr-vn demo`: build a scene in code, render it, animate it.
+/// `krkr-rs demo`: build a scene in code, render it, animate it.
 fn run_demo() -> ! {
     println!(
-        "krkr-vn demo: rendering {}x{} scene for {DEMO_SECONDS}s (close the window to exit early)",
+        "krkr-rs demo: rendering {}x{} scene for {DEMO_SECONDS}s (close the window to exit early)",
         DEMO_SIZE.0, DEMO_SIZE.1
     );
 
@@ -573,7 +610,7 @@ fn repaint_checker(bitmap: &mut BitmapState, epoch: i32) {
 
 fn demo_auto_exit(time: Res<Time>, timer: Res<DemoTimer>, mut exit: MessageWriter<AppExit>) {
     if time.elapsed() >= timer.0 {
-        println!("krkr-vn demo: done, exiting");
+        println!("krkr-rs demo: done, exiting");
         exit.write(AppExit::Success);
     }
 }
@@ -695,7 +732,7 @@ mod tests {
     }
 
     /// Real-game headless integration test: the same pipeline the bin runs
-    /// (`krkr-vn run <game-dir> --headless`), driven in-process — Startup
+    /// (`krkr-rs run <game-dir> --headless`), driven in-process — Startup
     /// (prepare + register natives + startup.tjs) then one Update
     /// (timer_poll + sync_scene).
     ///
@@ -704,7 +741,7 @@ mod tests {
     /// `#[ignore]`d by default. Run it with:
     /// `cargo test -p render -- --ignored real_game_headless_populates_scene`
     /// or verify the same path manually via
-    /// `cargo run -p render --bin krkr-vn -- run /mnt/DATA/Games/Others/test --headless`.
+    /// `cargo run -p render --bin krkr-rs -- run /mnt/DATA/Games/Others/test --headless`.
     #[test]
     #[ignore = "needs the real game at /mnt/DATA/Games/Others/test (not in the repo); use --ignored or the --headless manual run"]
     fn real_game_headless_populates_scene() {
@@ -806,13 +843,15 @@ mod tests {
         let mut last_dump = baseline.clone();
         for i in 0..180 {
             std::thread::sleep(Duration::from_millis(100));
+            if i % 10 == 0 { eprintln!("[hb] tick {i}"); }
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| app.update()));
             assert!(result.is_ok(), "app.update() panicked at tick {i}");
-            if i % 30 == 29 {
+            if i % 20 == 19 {
                 let scene = shared.0.read().unwrap();
+                println!("t={}s FULL DUMP:", (i + 1) / 10);
+                println!("{}", dump_scene(&scene));
                 let dump = dump_scene(&scene);
                 if dump != last_dump {
-                    println!("tick {i}: scene changed\n{dump}");
                     last_dump = dump;
                 }
             }

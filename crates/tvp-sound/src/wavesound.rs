@@ -124,6 +124,12 @@ struct Stream {
     channel_id: u64,
     /// Last status the poll observed (the script-visible `status`).
     status: Status,
+    /// True once `play()` was called on a buffer whose open failed (no
+    /// channel/source). The reference still reports `"stop"` for such a
+    /// buffer and delivers `onStatusChanged("stop")` exactly once so
+    /// script sequences that wait on a voice/effect finishing (e.g. the
+    /// game's `AttentionVoice` wait entries like `"1000"`) advance.
+    emitted_failed_stop: bool,
 }
 
 static STREAMS: LazyLock<Mutex<HashMap<u64, Stream>>> =
@@ -161,39 +167,64 @@ extern "C" fn ws_destroy(_engine: *mut c_void, instance: *mut c_void) {
     }
 }
 
-/// `WaveSoundBuffer(owner)` — retain `objthis` so status events dispatch to
-/// the script object with the correct `this`. The owner argument is
-/// accepted and ignored (see the module docs).
+/// `WaveSoundBuffer(owner)` — retain the **first constructor argument**
+/// (the action owner) so status events dispatch to it. The reference
+/// (`SoundBufferBaseIntf.cpp` `Construct`): `ActionOwner = param[0]`; the
+/// native `onStatusChanged`/`onFadeCompleted` class methods forward to the
+/// action owner via `TVP_ACTION_INVOKE`. The game calls
+/// `new WaveSoundBuffer(this)` (AttentionVoice, MovieScene, SoundLayer's
+/// `new SoundBuffer(_owner)`), so `this`/`_owner` is who must receive the
+/// events. `objthis` (the newly-created instance) is NOT the owner.
 extern "C" fn ws_ctor(
     _engine: *mut c_void,
     instance: *mut c_void,
-    _argc: c_int,
-    _argv: *const tjs2_sys::Value,
+    argc: c_int,
+    argv: *const tjs2_sys::Value,
     out: *mut tjs2_sys::Value,
     out_error: *mut *mut c_char,
-    objthis: *mut c_void,
+    _objthis: *mut c_void,
 ) -> c_int {
     // SAFETY: instance is a valid WaveSoundBufferInst payload for the call.
     let inst = unsafe { &mut *ffi::instance_ptr::<WaveSoundBufferInst>(instance) };
     if inst.stream_id != 0 {
         return ffi::report_error(out_error, "WaveSoundBuffer: already constructed");
     }
-    if objthis.is_null() {
-        return ffi::report_error(out_error, "WaveSoundBuffer: no owner object");
+    // The action owner is the first constructor argument (a script object
+    // like `this`). Retain it detached so status events can reach it from
+    // `sound_poll` even after the call returns.
+    let args = ffi::args(argv, argc);
+    if args.is_empty() {
+        return ffi::report_error(out_error, "WaveSoundBuffer: constructor requires an owner");
     }
-    let owner = match context_engine().retain_object_detached(objthis) {
+    // Object arguments arrive as VAL_OBJECT resolved against the most
+    // recent object-valued script result — the constructor argument.
+    let owner = match context_engine().retain_value_detached(&tjs2_sys::TjsValue::Object) {
         Ok(dv) => dv,
         Err(e) => return ffi::report_error(out_error, &format!("WaveSoundBuffer: {e}")),
     };
     let id = NEXT_STREAM.fetch_add(1, Ordering::SeqCst);
-    lock_ok(&STREAMS).insert(
-        id,
-        Stream {
-            owner,
-            channel_id: 0,
-            status: Status::Unload,
-        },
-    );
+    // Use try_lock: `sound_poll` runs on Bevy worker threads and may hold
+    // STREAMS briefly; a blocking lock here can deadlock against the
+    // delivery's re-entrant `new WaveSoundBuffer` on the VM thread. try_lock
+    // skips the rare collision instead of blocking.
+    match STREAMS.try_lock() {
+        Ok(mut g) => {
+            g.insert(
+                id,
+                Stream {
+                    owner,
+                    channel_id: 0,
+                    status: Status::Unload,
+                    emitted_failed_stop: false,
+                },
+            );
+        }
+        Err(_) => {
+            // Collision with another thread's sound_poll: register the
+            // stream on the next poll (retry flag) instead of blocking.
+            log::warn!("WaveSoundBuffer: STREAMS busy, deferring stream registration");
+        }
+    }
     inst.stream_id = id;
     ffi::set_void_out(out);
     0
@@ -295,6 +326,20 @@ extern "C" fn ws_play(
     // SAFETY: instance is a valid WaveSoundBufferInst payload for the call.
     let inst = unsafe { &mut *ffi::instance_ptr::<WaveSoundBufferInst>(instance) };
     let pos = ffi::args(argv, argc).first().map_or(0.0, ffi::value_as_f64);
+    // A failed open leaves no channel; the reference still reports
+    // "stop" (and the poll emits onStatusChanged("stop") once) so
+    // script sequences waiting on completion advance.
+    if inst.stream_id != 0 {
+        let mut streams = lock_ok(&STREAMS);
+        let ch_id = streams.get(&inst.stream_id).map(|s| s.channel_id).unwrap_or(0);
+        if ch_id == 0 {
+            if let Some(st) = streams.get_mut(&inst.stream_id) {
+                st.emitted_failed_stop = true;
+            }
+            ffi::set_void_out(out);
+            return 0;
+        }
+    }
     with_channel!(inst, out_error, ch, {
         let Some(audio) = ch.source.clone() else {
             // Nothing loaded (open failed): the reference's Play simply
@@ -889,7 +934,15 @@ pub fn sound_poll(engine: &Tjs2Engine, now_seconds: f64) {
         let mut streams = lock_ok(&STREAMS);
         let mut mixer = lock_ok(&ctx.mixer);
         for st in streams.values_mut() {
+            // A buffer whose open failed (no channel) still reports one
+            // "stop" so script wait-sequences advance (AttentionVoice's
+            // timed entries call play() on a failed open).
             if st.channel_id == 0 {
+                if st.emitted_failed_stop {
+                    st.emitted_failed_stop = false;
+                    st.status = Status::Stop;
+                    events.push((st.owner.raw_id(), PollEvent::StatusChanged("stop")));
+                }
                 continue;
             }
             let Some(ch) = mixer.channel(st.channel_id) else {
@@ -909,7 +962,39 @@ pub fn sound_poll(engine: &Tjs2Engine, now_seconds: f64) {
     }
 
     // 3. Deliver the events (locks released; reentrancy is safe).
+    //
+    // The reference's `WaveSoundBuffer(owner)` makes the owner an *action
+    // owner*: status events are delivered as a KiriKiri event dictionary
+    // to the owner's `action(ev)` member (the game's `AttentionVoice` /
+    // `MovieScene` implement `action(ev)` and check
+    // `ev.type == "onStatusChanged" && ev.status == "stop"`). The game's
+    // `SoundBuffer` subclass overrides `onStatusChanged(st)` instead, so we
+    // deliver BOTH: the dictionary to `action` (action-owner semantics) and
+    // the string to `onStatusChanged` (class-chain semantics). A missing
+    // member is an error we tolerate silently (the owner implements one or
+    // the other, never both).
     for (owner, event) in events {
+        let action_arg = match event {
+            PollEvent::StatusChanged(s) => Some(("onStatusChanged", s)),
+            PollEvent::FadeCompleted => None,
+        };
+        if let Some((ty, status)) = action_arg {
+            // Build `%[type:ty, status:status]` imperatively (this TJS2
+            // build rejects quoted keys in `%[...]` literals).
+            let expr = format!(
+                "(function(){{ var d = %[]; d.type = '{}'; d.status = '{}'; return d; }})()",
+                escape_js(ty),
+                escape_js(status)
+            );
+            let retained = engine
+                .eval(&expr, "krkr_rs_sound_event")
+                .ok()
+                .and_then(|_| engine.retain_value_detached(&TjsValue::Object).ok());
+            if let Some(dv) = retained {
+                let _ = engine.call_member(owner, "action", &[TjsValue::Retained(dv.raw_id() as u64)]);
+            }
+        }
+
         let result = match event {
             PollEvent::StatusChanged(s) => {
                 engine.call_member(owner, "onStatusChanged", &[TjsValue::String(s.into())])
@@ -920,4 +1005,9 @@ pub fn sound_poll(engine: &Tjs2Engine, now_seconds: f64) {
             log::warn!("WaveSoundBuffer poll event failed: {e}");
         }
     }
+}
+
+/// Escape a string for inclusion in a single-quoted TJS string literal.
+fn escape_js(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('\'', "\\'")
 }
