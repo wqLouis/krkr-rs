@@ -4,6 +4,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::SystemTime;
 
 use xp3::{Xp3Archive, normalize_in_archive_name};
 
@@ -42,6 +43,35 @@ fn storage_base(name: &str) -> &str {
     name.rsplit('/').next().unwrap_or(name)
 }
 
+/// Find a disk file by normalized relative name. Storage names are
+/// case-insensitive in the reference engine even when the host filesystem is
+/// not; `find` keeps its fast exact-case path, while metadata queries use this
+/// fallback for the normalized spelling.
+fn find_disk_case_insensitive(base: &Path, relative: &str) -> Option<PathBuf> {
+    fn walk(dir: &Path, prefix: &str, target: &str) -> Option<PathBuf> {
+        for entry in fs::read_dir(dir).ok()?.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let relative = if prefix.is_empty() {
+                name
+            } else {
+                format!("{prefix}/{name}")
+            };
+            if path.is_file() && relative.eq_ignore_ascii_case(target) {
+                return Some(path);
+            }
+            if path.is_dir()
+                && let Some(found) = walk(&path, &relative, target)
+            {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    walk(base, "", relative)
+}
+
 /// A mounted game storage: one game directory plus all `.xp3` archives
 /// found inside it.
 pub struct Storage {
@@ -58,6 +88,20 @@ pub enum Location {
     Disk(PathBuf),
     /// A file inside an archive: (archive path, normalized in-archive name).
     Archive(PathBuf, String),
+}
+
+/// Metadata returned for a resolved storage entry.
+///
+/// XP3 indexes carry the uncompressed file size but do not carry filesystem
+/// timestamps, so archive entries have `None` for all three time fields.
+/// Disk entries use the host filesystem metadata and preserve the native
+/// timestamp resolution exposed by [`std::fs::Metadata`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageMetadata {
+    pub size: u64,
+    pub modified: Option<SystemTime>,
+    pub accessed: Option<SystemTime>,
+    pub created: Option<SystemTime>,
 }
 
 impl Storage {
@@ -173,6 +217,48 @@ impl Storage {
                 arc.read(&in_arc).map_err(ReadError::Xp3)
             }
             None => Err(ReadError::NotFound(name.to_string())),
+        }
+    }
+
+    /// Return metadata for a resolved storage entry.
+    ///
+    /// Disk files are read through [`std::fs::metadata`]. For an XP3 entry,
+    /// `size` is the uncompressed size from the archive index; archive
+    /// timestamps are intentionally absent because XP3 has no timestamp
+    /// fields. Names follow the same resolution order as [`Self::find`].
+    pub fn stat(&self, name: &str) -> Option<StorageMetadata> {
+        let location = self.find(name).or_else(|| {
+            let normalized = normalize_in_archive_name(name);
+            if normalized.contains('>') {
+                None
+            } else {
+                find_disk_case_insensitive(&self.game_dir, &normalized).map(Location::Disk)
+            }
+        });
+        match location {
+            Some(Location::Disk(path)) => {
+                let metadata = fs::metadata(path).ok()?;
+                Some(StorageMetadata {
+                    size: metadata.len(),
+                    modified: metadata.modified().ok(),
+                    accessed: metadata.accessed().ok(),
+                    created: metadata.created().ok(),
+                })
+            }
+            Some(Location::Archive(archive_path, in_archive)) => {
+                let archive = self
+                    .archives
+                    .iter()
+                    .find(|(path, _)| *path == archive_path)?;
+                let entry = archive.1.entry(&in_archive)?;
+                Some(StorageMetadata {
+                    size: entry.org_size,
+                    modified: None,
+                    accessed: None,
+                    created: None,
+                })
+            }
+            None => None,
         }
     }
 

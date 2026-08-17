@@ -32,11 +32,12 @@
 //!   ported from the reference (they split on `/`, `\` and the `>` archive
 //!   delimiter). |
 //! | `clearArchiveCache()` | no-op (nothing is cached yet). |
+//! | `stat(name)` / `fstat(name)` | a TJS dictionary with disk size and Date
+//!   timestamps, or archive-entry size. |
 //!
 //! # Pending (registered, but raise a clear TJS error)
 //!
-//! - `stat(name)` / `open(name, flags)` — need object/stream return values;
-//!   the C ABI in `tjs2-sys` only marshals void/integer/real/string so far.
+//! - `open(name, flags)` — needs a stream object return value.
 //! - `searchCD(label)` — CD-volume search; disabled in the reference.
 //! - `selectFile(...)` — GUI file selector; platform-specific.
 //!
@@ -58,13 +59,15 @@ use std::ffi::{CStr, c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use engine::Storage;
+use engine::storage::StorageMetadata;
 mod csv_parser;
 
 use tjs2_sys::{
-    NativeClassBuilder, NativeMethodDef, Tjs2Engine, VAL_INTEGER, VAL_REAL, VAL_STRING, VAL_VOID,
-    Value, tjs2_malloc,
+    Engine, NativeClassBuilder, NativeMethodDef, Tjs2Engine, VAL_INTEGER, VAL_REAL, VAL_RETAINED,
+    VAL_STRING, VAL_VOID, Value, tjs2_free_string, tjs2_malloc,
 };
 
 // ---------------------------------------------------------------------------
@@ -74,6 +77,21 @@ use tjs2_sys::{
 /// The mounted game storage. Set by the engine (via [`set_storage`]) before
 /// running `startup.tjs`; all natives read it.
 static STORAGE: Mutex<Option<Arc<Mutex<Storage>>>> = Mutex::new(None);
+
+// The small part of the tjs2 ABI needed to construct a retained dictionary.
+// These symbols are part of tjs2-sys' C ABI but are intentionally private in
+// its safe Rust wrapper; declaring them here keeps this milestone scoped to
+// the storage crates.
+unsafe extern "C" {
+    fn tjs2_eval(
+        engine: *mut Engine,
+        expression: *const c_char,
+        name: *const c_char,
+        out_result: *mut Value,
+        out_error: *mut *mut c_char,
+    ) -> c_int;
+    fn tjs2_retain_value(engine: *mut Engine, value: *const Value) -> *mut c_void;
+}
 
 /// Auto search paths registered via `Storages.addAutoPath` (normalized,
 /// trailing `/` stripped).
@@ -281,6 +299,125 @@ fn local_name(name: &str) -> Result<String, String> {
     // path components against the real filesystem and would produce a
     // meaningless "/name" here, so we keep the input.)
     Ok(name.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// stat / fstat
+// ---------------------------------------------------------------------------
+
+/// Resolve metadata using the same normalized-name fallback as the other
+/// Storages queries. The second lookup matters for callers passing a mixed
+/// case storage name on a case-sensitive host filesystem.
+fn storage_stat(name: &str) -> Option<StorageMetadata> {
+    let storage = storage_arc()?;
+    let storage = storage.lock().ok()?;
+    storage
+        .stat(name)
+        .or_else(|| storage.stat(&normalize_storage_name(name)))
+}
+
+/// Convert a host timestamp to the seconds representation used by TVP_stat
+/// and by the fstat plugin's Date.setTime call.
+fn unix_seconds(time: SystemTime) -> Option<i64> {
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(duration) => i64::try_from(duration.as_secs()).ok(),
+        Err(error) => i64::try_from(error.duration().as_secs())
+            .ok()
+            .map(|seconds| -seconds),
+    }
+}
+
+fn stat_dictionary_script(metadata: &StorageMetadata) -> String {
+    let mut script = format!(
+        "(function(){{ var d = %[]; d[\"size\"] = {};",
+        metadata.size
+    );
+    for (name, value) in [
+        ("mtime", metadata.modified),
+        ("ctime", metadata.created),
+        ("atime", metadata.accessed),
+    ] {
+        if let Some(seconds) = value.and_then(unix_seconds) {
+            script.push_str(&format!(" d[\"{name}\"] = new Date({seconds});"));
+        }
+    }
+    script.push_str(" return d; })()");
+    script
+}
+
+/// Build a real TJS dictionary and return it through the retained-value ABI.
+/// `tjs2_eval` leaves the newly-created object in the engine's object-result
+/// slot; retaining that slot is the same pattern used by KAGParser and the
+/// visual natives.
+fn set_stat_result(
+    engine: *mut c_void,
+    out: *mut Value,
+    metadata: &StorageMetadata,
+) -> Result<(), String> {
+    let expression = std::ffi::CString::new(stat_dictionary_script(metadata))
+        .map_err(|_| "Storages.stat: generated dictionary contained NUL".to_string())?;
+    let name = c"Storages.stat";
+    let mut result = Value {
+        ty: VAL_VOID,
+        integer: 0,
+        real: 0.0,
+        string: ptr::null(),
+        array: ptr::null(),
+        array_count: 0,
+        retained: 0,
+    };
+    let mut error = ptr::null_mut();
+    // SAFETY: the callback's engine and result pointers are valid for this
+    // call; the C ABI copies the expression and error as needed.
+    let rc = unsafe {
+        tjs2_eval(
+            engine.cast::<Engine>(),
+            expression.as_ptr(),
+            name.as_ptr(),
+            &mut result,
+            &mut error,
+        )
+    };
+    if rc != 0 {
+        let message = if error.is_null() {
+            "failed to construct metadata dictionary".to_string()
+        } else {
+            // SAFETY: tjs2_eval returns a NUL-terminated owned error string.
+            let message = unsafe { CStr::from_ptr(error) }
+                .to_string_lossy()
+                .into_owned();
+            // SAFETY: ownership of the error string belongs to this caller.
+            unsafe { tjs2_free_string(error) };
+            message
+        };
+        return Err(message);
+    }
+    let object = Value {
+        ty: tjs2_sys::VAL_OBJECT,
+        integer: 0,
+        real: 0.0,
+        string: ptr::null(),
+        array: ptr::null(),
+        array_count: 0,
+        retained: 0,
+    };
+    // SAFETY: result's object is the engine's most recent object result.
+    let retained = unsafe { tjs2_retain_value(engine.cast::<Engine>(), &object) };
+    if retained.is_null() {
+        return Err("Storages.stat: failed to retain metadata dictionary".into());
+    }
+    // SAFETY: `out` is the trampoline's valid result slot. The C++ side
+    // consumes the retained id while converting this result.
+    unsafe {
+        (*out).ty = VAL_RETAINED;
+        (*out).integer = 0;
+        (*out).real = 0.0;
+        (*out).string = ptr::null();
+        (*out).array = ptr::null();
+        (*out).array_count = 0;
+        (*out).retained = retained as usize;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -763,11 +900,52 @@ macro_rules! native_pending {
     };
 }
 
-native_pending!(
-    native_stat,
-    "stat",
-    "needs an object return value from the FFI (pending in tjs2-sys)"
-);
+/// `Storages.stat(name)` / the fstat plugin's `Storages.fstat(name)`.
+///
+/// Disk entries include size plus Date-valued mtime/ctime/atime. XP3 entries
+/// include their uncompressed size and omit timestamps, matching fstat.dll.
+extern "C" fn native_stat(
+    engine: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    let args = unsafe { args(argc, argv) };
+    let name = match expect_string_arg(args, "stat") {
+        Ok(name) => name,
+        Err(message) => {
+            set_error(out_error, &message);
+            return 1;
+        }
+    };
+    let Some(metadata) = storage_stat(&name) else {
+        set_error(
+            out_error,
+            &format!("Storages.stat: storage not found: {name}"),
+        );
+        return 1;
+    };
+    match set_stat_result(engine, out, &metadata) {
+        Ok(()) => 0,
+        Err(message) => {
+            set_error(out_error, &message);
+            1
+        }
+    }
+}
+
+/// fstat.dll names the same operation `fstat`; keep this alias because game
+/// scripts commonly call `Storages.fstat` after linking the plugin.
+extern "C" fn native_fstat(
+    engine: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    native_stat(engine, argc, argv, out, out_error)
+}
 native_pending!(
     native_open,
     "open",
@@ -964,6 +1142,10 @@ pub fn register_storages(engine: &Tjs2Engine) -> Result<(), String> {
             NativeMethodDef {
                 name: "stat",
                 f: native_stat,
+            },
+            NativeMethodDef {
+                name: "fstat",
+                f: native_fstat,
             },
             NativeMethodDef {
                 name: "open",
@@ -1375,13 +1557,115 @@ mod tests {
         assert_eq!(eval("Storages.clearArchiveCache()"), TjsValue::Void);
     }
 
+    /// Build the smallest valid raw XP3 archive needed by the metadata test.
+    fn test_xp3(name: &str, data: &[u8]) -> Vec<u8> {
+        let mut archive = vec![
+            0x58, 0x50, 0x33, 0x0d, 0x0a, 0x20, 0x0a, 0x1a, 0x8b, 0x67, 0x01,
+        ];
+        archive.extend_from_slice(&0u64.to_le_bytes());
+        let segment_start = archive.len() as u64;
+        archive.extend_from_slice(data);
+        let index_offset = archive.len() as u64;
+
+        let utf16: Vec<u16> = name.encode_utf16().collect();
+        let mut info = Vec::new();
+        info.extend_from_slice(b"info");
+        info.extend_from_slice(&(22u64 + utf16.len() as u64 * 2).to_le_bytes());
+        info.extend_from_slice(&0u32.to_le_bytes());
+        info.extend_from_slice(&(data.len() as i64).to_le_bytes());
+        info.extend_from_slice(&(data.len() as i64).to_le_bytes());
+        info.extend_from_slice(&(utf16.len() as i16).to_le_bytes());
+        for unit in utf16 {
+            info.extend_from_slice(&unit.to_le_bytes());
+        }
+
+        let mut segm = Vec::new();
+        segm.extend_from_slice(b"segm");
+        segm.extend_from_slice(&28u64.to_le_bytes());
+        segm.extend_from_slice(&0u32.to_le_bytes());
+        segm.extend_from_slice(&(segment_start as i64).to_le_bytes());
+        segm.extend_from_slice(&(data.len() as i64).to_le_bytes());
+        segm.extend_from_slice(&(data.len() as i64).to_le_bytes());
+
+        let mut file = Vec::new();
+        file.extend_from_slice(b"File");
+        file.extend_from_slice(&((info.len() + segm.len()) as u64).to_le_bytes());
+        file.extend_from_slice(&info);
+        file.extend_from_slice(&segm);
+
+        archive.push(0); // raw index
+        archive.extend_from_slice(&(file.len() as u64).to_le_bytes());
+        archive.extend_from_slice(&file);
+        archive[11..19].copy_from_slice(&index_offset.to_le_bytes());
+        archive
+    }
+
     #[test]
-    fn pending_methods_raise_clear_errors() {
+    fn stat_archive_entry_reports_uncompressed_size_without_dates() {
         let _vm_lock = vm_lock();
         reset_globals();
+        let dir = TempDir::new("archive-stat");
+        fs::write(
+            dir.path().join("data.xp3"),
+            test_xp3("Data/inside.ks", b"archive bytes"),
+        )
+        .unwrap();
+        let storage = Storage::mount(dir.path()).unwrap();
+        let metadata = storage
+            .stat("DATA.XP3>DATA/INSIDE.KS")
+            .expect("archive entry metadata");
+        assert_eq!(metadata.size, 13);
+        assert!(metadata.modified.is_none());
+        assert!(metadata.accessed.is_none());
+        assert!(metadata.created.is_none());
+
+        set_storage(Some(Arc::new(Mutex::new(storage))));
         let engine = engine_with_storages();
+        assert_eq!(
+            engine
+                .eval("Storages.fstat('data.xp3>data/inside.ks').size", "t")
+                .unwrap(),
+            TjsValue::Integer(13)
+        );
+        assert_eq!(
+            engine
+                .eval("typeof Storages.stat('data.xp3>data/inside.ks').mtime", "t")
+                .unwrap(),
+            TjsValue::String("undefined".into())
+        );
+    }
+
+    #[test]
+    fn stat_and_fstat_return_metadata_dictionaries() {
+        let _vm_lock = vm_lock();
+        reset_globals();
+        let (_dir, _path) = mount_game(&[("a.tjs", "12345")]);
+        let engine = engine_with_storages();
+
+        assert_eq!(
+            engine.eval("Storages.stat('a.tjs').size", "t").unwrap(),
+            TjsValue::Integer(5)
+        );
+        // Disk timestamps are Date objects, not encoded strings or integers.
+        assert_eq!(
+            engine
+                .eval("typeof Storages.stat('a.tjs').mtime", "t")
+                .unwrap(),
+            TjsValue::String("Object".into())
+        );
+        assert_eq!(
+            engine
+                .eval("typeof Storages.stat('a.tjs').atime", "t")
+                .unwrap(),
+            TjsValue::String("Object".into())
+        );
+        assert_eq!(
+            engine.eval("Storages.fstat('a.tjs').size", "t").unwrap(),
+            TjsValue::Integer(5)
+        );
+
+        // The remaining fstat methods are still intentionally unimplemented.
         for expr in [
-            "Storages.stat('a.tjs')",
             "Storages.open('a.tjs')",
             "Storages.searchCD('LABEL')",
             "Storages.selectFile('dialog')",

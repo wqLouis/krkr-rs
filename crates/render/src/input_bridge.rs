@@ -164,11 +164,13 @@ pub(crate) fn capture_input(
     for code in keyboard.get_just_pressed() {
         if let Some(vk) = bevy_key_to_vk(*code) {
             s.set_key_down(vk);
+            tvp_natives::set_key_state(vk, true);
         }
     }
     for code in keyboard.get_just_released() {
         if let Some(vk) = bevy_key_to_vk(*code) {
             s.set_key_up(vk);
+            tvp_natives::set_key_state(vk, false);
         }
     }
 

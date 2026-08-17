@@ -207,6 +207,62 @@ extern "C" fn font_id_get(
     0
 }
 
+/// Estimate text width using TVP's common half-width/full-width rule. The
+/// renderer can later replace this with `tvp-text` glyph metrics, but this
+/// deterministic fallback is already sufficient for layout and hit testing
+/// on systems without a matching Japanese font installed.
+extern "C" fn font_text_width(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    let Some(text) = args.first().map(arg_string) else {
+        return error_out(out_error, "Font.getTextWidth requires text");
+    };
+    let inst = unsafe { instance_ref::<FontInst>(instance) };
+    let height = context_scene_read()
+        .fonts
+        .iter()
+        .find(|f| f.id == inst.id)
+        .map(|f| f.height.max(1) as f64)
+        .unwrap_or(12.0);
+    let width: f64 = text
+        .chars()
+        .map(|c| if c.is_ascii() { height * 0.55 } else { height })
+        .sum();
+    unsafe {
+        (*out).ty = tjs2_sys::VAL_REAL;
+        (*out).integer = 0;
+        (*out).real = width;
+    }
+    0
+}
+
+extern "C" fn font_text_height(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    _argc: c_int,
+    _argv: *const Value,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let inst = unsafe { instance_ref::<FontInst>(instance) };
+    let height = context_scene_read()
+        .fonts
+        .iter()
+        .find(|f| f.id == inst.id)
+        .map(|f| f.height)
+        .unwrap_or(12);
+    set_int_out(out, i64::from(height));
+    0
+}
+
 /// Register the `Font` native class.
 /// `Font.mapPrerenderedFont(file)` — stubbed no-op (prerendered font
 /// mapping is not implemented; the game falls back to vector fonts).
@@ -246,6 +302,14 @@ pub(crate) fn register_font(engine: &Tjs2Engine) -> Result<(), String> {
             NativeInstanceMethodDef {
                 name: "mapPrerenderedFont",
                 f: font_map_prerendered_noop,
+            },
+            NativeInstanceMethodDef {
+                name: "getTextWidth",
+                f: font_text_width,
+            },
+            NativeInstanceMethodDef {
+                name: "getTextHeight",
+                f: font_text_height,
             },
         ],
         properties: vec![

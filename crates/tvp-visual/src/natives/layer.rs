@@ -38,18 +38,34 @@
 //! | properties `window`, `parent` | owning window / parent layer **ids** (objects pending) |
 //! | `update()` / `setCursorPos(x,y)` / `focus()` | no-ops (input: later) |
 //! | `setCenter(x,y)`, `setAffineOffset(x,y)`, `setImagePos`, `setImageSize` | no-ops (affine: later) |
-//! | `drawText`, `affineCopy`, `stretchCopy/Pile/Blend`, `pileRect`, `piledCopy`, `operateRect/Stretch/Affine`, `light`, `beginTransition`, `stopTransition` | no-op stubs (pixel ops: later) |
+//! | `drawText` | rasterizes into the attached scene bitmap using `tvp-text`, with a built-in fallback font |
+//! | `doBoxBlur` | minimal in-place RGBA box blur over the attached scene bitmap |
+//! | `beginTransition` | queues a next-poll completion callback; interpolation remains a stub |
+//! | `affineCopy`, `stretchCopy/Pile/Blend`, `pileRect`, `piledCopy`, `operateRect/Stretch/Affine`, `light`, `stopTransition` | no-op stubs (pixel ops: later) |
 
+use std::collections::HashSet;
 use std::ffi::{c_char, c_int, c_void};
+use std::sync::{LazyLock, Mutex};
 
 use tjs2_sys::{
     NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef, Tjs2Engine, Value,
 };
 
-use crate::scene::LayerState;
+use crate::scene::{BitmapState, LayerState};
+use tvp_text::{FontFace, GlyphAtlas, LayoutOptions, layout};
 
-use super::ffi::{arg_bool, arg_f64, arg_i64, error_out, instance_ref, set_int_out, set_void_out};
-use super::{context_scene_mut, context_scene_read};
+use super::ffi::{
+    arg_bool, arg_f64, arg_i64, arg_string, error_out, instance_ref, set_int_out, set_void_out,
+};
+use super::{context_engine, context_scene_mut, context_scene_read};
+
+/// Native transition requests are completed on the next VM poll. This keeps
+/// the script-side `_isTransition` state coherent: `beginTransition` returns
+/// first, the script sets its flag, and only then do we invoke
+/// `onTransitionCompleted`. Pixel interpolation remains outside this
+/// milestone, but scene changes and callbacks no longer stall forever.
+static PENDING_TRANSITIONS: LazyLock<Mutex<Vec<tjs2_sys::DetachedValue>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
 
 /// Payload of one script-visible `Layer` object.
 #[derive(Default)]
@@ -60,9 +76,9 @@ pub(crate) struct LayerInst {
     pub constructed: bool,
     /// The blend/affine type (ltAlpha=2 default; enum values per the reference
     /// drawable.h: ltOpaque=1, ltAlpha=2, ltAdditive=3, ltSubtractive=4,
-    /// ltAddAlpha=12, ... — see tvp-natives/constants.rs). Stored per-instance
-    /// only: the scene model has no blend field, so the renderer alpha-blends
-    /// every sprite regardless of type.
+    /// ltAddAlpha=12, ... — see tvp-natives/constants.rs). Kept as a fallback
+    /// for the short period before construction; constructed layers also copy
+    /// this value into the shared scene contract.
     pub blend_type: i64,
 }
 
@@ -658,7 +674,31 @@ extern "C" fn layer_set_parent(
     } else if let Some(w) = scene.window_mut(window) {
         w.layers.retain(|&c| c != inst.id);
     }
-    let new_parent = (parent_id >= 0).then_some(parent_id as u32);
+    let new_parent = if parent_id < 0 {
+        None
+    } else {
+        let candidate = parent_id as u32;
+        let same_window = scene
+            .layer(candidate)
+            .is_some_and(|parent| parent.window == window);
+        // Reject self-parenting and descendants as parents. A malformed FFI
+        // call should not create a cycle that defeats flattening/composition.
+        let mut cursor = Some(candidate);
+        let mut seen = HashSet::new();
+        let mut would_cycle = false;
+        while let Some(id) = cursor {
+            if !seen.insert(id) {
+                would_cycle = true;
+                break;
+            }
+            if id == inst.id {
+                would_cycle = true;
+                break;
+            }
+            cursor = scene.layer(id).and_then(|layer| layer.parent);
+        }
+        (same_window && !would_cycle).then_some(candidate)
+    };
     if let Some(layer) = scene.layer_mut(inst.id) {
         layer.parent = new_parent;
     }
@@ -721,6 +761,235 @@ extern "C" fn layer_focus(
     0
 }
 
+/// Deterministic text metrics used by the script-side UI helpers.  These are
+/// deliberately based on the same half/full-width convention as the fallback
+/// rasterizer below, so layout still works on machines without a CJK font.
+extern "C" fn layer_get_text_width(
+    _engine: *mut c_void,
+    _instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    let Some(text) = args.first().map(arg_string) else {
+        return error_out(out_error, "Layer.getTextWidth requires text");
+    };
+    let width = fallback_text_width(&text, 16);
+    set_int_out(out, i64::from(width));
+    0
+}
+
+extern "C" fn layer_get_text_height(
+    _engine: *mut c_void,
+    _instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    let text = args.first().map(arg_string).unwrap_or_default();
+    let lines = text.split('\n').count().max(1);
+    set_int_out(out, i64::from(lines as u32 * 16));
+    0
+}
+
+/// Draw text into the layer's bitmap.  TVP layers are image surfaces, so a
+/// layer without an attached image gets a transparent bitmap sized from its
+/// rectangle (or from the text when the rectangle is still empty).  The
+/// renderer already uploads dirty scene bitmaps, making these CPU pixels
+/// visible without adding a second scene/render contract.
+extern "C" fn layer_draw_text(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    if args.len() < 4 {
+        return error_out(out_error, "Layer.drawText requires x, y, text and color");
+    }
+    let x = arg_i64(&args[0]) as i32;
+    let y = arg_i64(&args[1]) as i32;
+    let text = arg_string(&args[2]);
+    let color = argb_to_rgba(arg_i64(&args[3]));
+    let opa = args.get(4).map(arg_i64).unwrap_or(255).clamp(0, 255) as u8;
+    let aa = args.get(5).map(arg_bool).unwrap_or(true);
+    let shadow_level = args.get(6).map(arg_i64).unwrap_or(0).max(0) as u32;
+    let shadow_color = argb_to_rgba(args.get(7).map(arg_i64).unwrap_or(0));
+    let shadow_width = args.get(8).map(arg_i64).unwrap_or(0).max(0) as u32;
+    let shadow_x = args.get(9).map(arg_i64).unwrap_or(0) as i32;
+    let shadow_y = args.get(10).map(arg_i64).unwrap_or(0) as i32;
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+
+    // Snapshot scene values before loading a font; font discovery may do file
+    // IO and must not hold the scene lock while doing so.
+    let (bitmap_id, width, _height, font_height) = {
+        let mut scene = context_scene_mut();
+        let Some(layer) = scene.layer(inst.id) else {
+            return error_out(out_error, "Layer: layer no longer exists");
+        };
+        let font_height = scene
+            .fonts
+            .last()
+            .map(|font| font.height.max(1) as u32)
+            .unwrap_or(16);
+        let needed_w = (x.max(0) as u32).saturating_add(fallback_text_width(&text, font_height));
+        let needed_h = (y.max(0) as u32).saturating_add(fallback_text_height(&text, font_height));
+        let (width, height) = match layer.bitmap.and_then(|id| scene.bitmap(id)) {
+            Some(bitmap) => (bitmap.width, bitmap.height),
+            None => (layer.rect.w.max(needed_w), layer.rect.h.max(needed_h)),
+        };
+        let bitmap_id = match layer.bitmap {
+            Some(id) => id,
+            None => {
+                let id = scene.add_bitmap(
+                    width.max(1),
+                    height.max(1),
+                    vec![0; width.max(1) as usize * height.max(1) as usize * 4],
+                );
+                scene
+                    .layer_mut(inst.id)
+                    .expect("layer checked above")
+                    .bitmap = Some(id);
+                id
+            }
+        };
+        if let Some(layer) = scene.layer_mut(inst.id) {
+            layer.rect.w = layer.rect.w.max(width);
+            layer.rect.h = layer.rect.h.max(height);
+        }
+        (bitmap_id, width.max(1), height.max(1), font_height)
+    };
+
+    // Prefer tvp-text's real CJK rasterizer.  A missing system font is a
+    // normal deployment situation (minimal Linux containers in particular),
+    // so retain a small deterministic bitmap-font fallback rather than
+    // silently dropping the game's title text.
+    if std::env::var_os("KRKR_RS_SYSTEM_FONT").is_some()
+        && let Some(face) = FontFace::discover_system_jp()
+    {
+        let mut atlas = GlyphAtlas::with_default_width(face, font_height);
+        let text_layout = layout(
+            &text,
+            width as f32,
+            font_height as f32,
+            &mut atlas,
+            &LayoutOptions {
+                wrap: false,
+                ..Default::default()
+            },
+        );
+        let mut scene = context_scene_mut();
+        if let Some(bitmap) = scene.bitmap_mut(bitmap_id) {
+            if shadow_level != 0 || shadow_width != 0 {
+                paint_layout(
+                    bitmap,
+                    &atlas,
+                    &text_layout,
+                    shadow_color,
+                    opa,
+                    aa,
+                    x.saturating_add(shadow_x),
+                    y.saturating_add(shadow_y),
+                    shadow_level.max(shadow_width),
+                );
+            }
+            paint_layout(bitmap, &atlas, &text_layout, color, opa, aa, x, y, 0);
+            bitmap.mark_dirty();
+        }
+    } else {
+        let mut scene = context_scene_mut();
+        if let Some(bitmap) = scene.bitmap_mut(bitmap_id) {
+            if shadow_level != 0 || shadow_width != 0 {
+                paint_fallback_text(
+                    bitmap,
+                    &text,
+                    shadow_color,
+                    opa,
+                    x + shadow_x,
+                    y + shadow_y,
+                    font_height,
+                    shadow_level.max(shadow_width),
+                );
+            }
+            paint_fallback_text(bitmap, &text, color, opa, x, y, font_height, 0);
+            bitmap.mark_dirty();
+        }
+    }
+    set_void_out(out);
+    0
+}
+
+/// Minimal separable box blur over an attached bitmap.  It intentionally
+/// averages RGBA channels (rather than only RGB), which is useful for the
+/// translucent shadow layers used by ADV UI and remains predictable for
+/// straight-alpha scene pixels.
+extern "C" fn layer_do_box_blur(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    let xradius = args.first().map(arg_i64).unwrap_or(1).max(0) as u32;
+    let yradius = args.get(1).map(arg_i64).unwrap_or(1).max(0) as u32;
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let mut scene = context_scene_mut();
+    let bitmap_id = scene.layer(inst.id).and_then(|layer| layer.bitmap);
+    if let Some(bitmap_id) = bitmap_id
+        && let Some(bitmap) = scene.bitmap_mut(bitmap_id)
+    {
+        blur_bitmap(bitmap, xradius, yradius);
+    }
+    set_void_out(out);
+    0
+}
+
+extern "C" fn layer_begin_transition(
+    _engine: *mut c_void,
+    _instance: *mut c_void,
+    _argc: c_int,
+    _argv: *const Value,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    objthis: *mut c_void,
+) -> c_int {
+    if !objthis.is_null()
+        && let Ok(value) = context_engine().retain_object_detached(objthis)
+    {
+        PENDING_TRANSITIONS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(value);
+    }
+    set_void_out(out);
+    0
+}
+
+/// Complete all transitions queued by the previous VM calls.
+pub(crate) fn transition_poll(engine: &Tjs2Engine) {
+    let pending = std::mem::take(
+        &mut *PENDING_TRANSITIONS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()),
+    );
+    for value in pending {
+        let _ = engine.call_member(value.raw_id(), "onTransitionCompleted", &[]);
+        drop(value);
+    }
+}
+
 /// Generic no-op stub for methods that need real pixel/affine operations
 /// (a later wave; documented in the module doc).
 extern "C" fn layer_noop(
@@ -736,6 +1005,206 @@ extern "C" fn layer_noop(
     0
 }
 
+fn fallback_text_width(text: &str, height: u32) -> u32 {
+    let em = height.max(1);
+    text.split('\n')
+        .map(|line| {
+            line.chars()
+                .map(|ch| {
+                    if ch.is_ascii() {
+                        (em * 55).div_ceil(100)
+                    } else {
+                        em
+                    }
+                })
+                .sum::<u32>()
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+fn fallback_text_height(text: &str, height: u32) -> u32 {
+    text.split('\n').count().max(1) as u32 * height.max(1)
+}
+
+/// Alpha-composite one straight-alpha pixel.  Keeping this in the visual
+/// crate makes the scene's RGBA convention explicit and avoids renderer-only
+/// drawing paths.
+fn blend_pixel(bitmap: &mut BitmapState, x: i32, y: i32, color: [u8; 4], coverage: u8, opa: u8) {
+    if x < 0 || y < 0 || x as u32 >= bitmap.width || y as u32 >= bitmap.height {
+        return;
+    }
+    let Some(i) = bitmap.pixel_offset(x as u32, y as u32) else {
+        return;
+    };
+    let alpha = (u32::from(color[3]) * u32::from(coverage) * u32::from(opa) / (255 * 255)) as u8;
+    if alpha == 0 {
+        return;
+    }
+    let inv = 255u32 - u32::from(alpha);
+    let old_a = u32::from(bitmap.rgba[i + 3]);
+    let out_a = u32::from(alpha) + old_a * inv / 255;
+    for (channel, &src_color) in color[..3].iter().enumerate() {
+        let src = u32::from(src_color);
+        let dst = u32::from(bitmap.rgba[i + channel]);
+        // Keep the scene buffer straight-alpha. This matters for antialiased
+        // text over transparent pixels: RGB must remain the requested color,
+        // not color multiplied by coverage.
+        bitmap.rgba[i + channel] =
+            ((src * u32::from(alpha) * 255 + dst * old_a * inv) / (out_a * 255)) as u8;
+    }
+    bitmap.rgba[i + 3] = out_a as u8;
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_layout(
+    bitmap: &mut BitmapState,
+    atlas: &GlyphAtlas,
+    text_layout: &tvp_text::TextLayout,
+    color: [u8; 4],
+    opa: u8,
+    aa: bool,
+    offset_x: i32,
+    offset_y: i32,
+    spread: u32,
+) {
+    let (atlas_width, _) = atlas.atlas_size();
+    let pixels = atlas.atlas_rgba();
+    for run in &text_layout.runs {
+        for glyph in &run.chars {
+            for dy in 0..glyph.size.1 {
+                for dx in 0..glyph.size.0 {
+                    let source = (((glyph.uv.1 + dy) * atlas_width + glyph.uv.0 + dx) * 4) as usize;
+                    let mut coverage = pixels[source + 3];
+                    if !aa {
+                        coverage = if coverage >= 128 { 255 } else { 0 };
+                    }
+                    if coverage == 0 {
+                        continue;
+                    }
+                    let gx = glyph.x.round() as i32 + dx as i32 + offset_x;
+                    let gy = glyph.y.round() as i32 + dy as i32 + offset_y;
+                    if spread == 0 {
+                        blend_pixel(bitmap, gx, gy, color, coverage, opa);
+                    } else {
+                        // A compact square dilation approximates TVP's
+                        // shadow width without a second glyph rasterizer.
+                        let r = spread.min(8) as i32;
+                        for sy in -r..=r {
+                            for sx in -r..=r {
+                                blend_pixel(bitmap, gx + sx, gy + sy, color, coverage, opa);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A tiny 5x7 fallback font. ASCII uses a stable per-character pattern and
+/// non-ASCII characters use a bordered checker glyph; it is intentionally
+/// recognizable as text while requiring no bundled font files or system font.
+#[allow(clippy::too_many_arguments)]
+fn paint_fallback_text(
+    bitmap: &mut BitmapState,
+    text: &str,
+    color: [u8; 4],
+    opa: u8,
+    x: i32,
+    y: i32,
+    height: u32,
+    spread: u32,
+) {
+    let height = height.max(7);
+    let scale = (height / 8).max(1) as i32;
+    let mut pen_y = y;
+    for line in text.split('\n') {
+        let mut pen_x = x;
+        for ch in line.chars() {
+            let advance = if ch.is_ascii() {
+                (height * 55 / 100).max(1) as i32
+            } else {
+                height as i32
+            };
+            if !ch.is_whitespace() {
+                for row in 0..7 {
+                    for col in 0..5 {
+                        let on = if ch.is_ascii() {
+                            // Border plus a character-dependent interior
+                            // pattern gives useful output for every ASCII
+                            // code without a large embedded font table.
+                            row == 0
+                                || row == 6
+                                || col == 0
+                                || col == 4
+                                || (ch as usize + row * 3 + col).is_multiple_of(11)
+                        } else {
+                            row == 0
+                                || row == 6
+                                || col == 0
+                                || col == 4
+                                || (ch as usize + row + col).is_multiple_of(5)
+                        };
+                        if !on {
+                            continue;
+                        }
+                        for sy in 0..scale {
+                            for sx in 0..scale {
+                                let px = pen_x + col as i32 * scale + sx;
+                                let py = pen_y + row as i32 * scale + sy;
+                                if spread == 0 {
+                                    blend_pixel(bitmap, px, py, color, 255, opa);
+                                } else {
+                                    let r = spread.min(8) as i32;
+                                    for oy in -r..=r {
+                                        for ox in -r..=r {
+                                            blend_pixel(bitmap, px + ox, py + oy, color, 255, opa);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            pen_x += advance;
+        }
+        pen_y += height as i32;
+    }
+}
+
+fn blur_bitmap(bitmap: &mut BitmapState, xradius: u32, yradius: u32) {
+    if bitmap.width == 0 || bitmap.height == 0 || (xradius == 0 && yradius == 0) {
+        return;
+    }
+    let source = bitmap.rgba.clone();
+    for y in 0..bitmap.height {
+        for x in 0..bitmap.width {
+            let x0 = x.saturating_sub(xradius);
+            let x1 = x.saturating_add(xradius).min(bitmap.width - 1);
+            let y0 = y.saturating_sub(yradius);
+            let y1 = y.saturating_add(yradius).min(bitmap.height - 1);
+            let mut sums = [0u32; 4];
+            let mut count = 0u32;
+            for sy in y0..=y1 {
+                for sx in x0..=x1 {
+                    let i = ((sy * bitmap.width + sx) * 4) as usize;
+                    for (channel, sum) in sums.iter_mut().enumerate() {
+                        *sum += u32::from(source[i + channel]);
+                    }
+                    count += 1;
+                }
+            }
+            let i = ((y * bitmap.width + x) * 4) as usize;
+            for (channel, &sum) in sums.iter().enumerate() {
+                bitmap.rgba[i + channel] = (sum / count) as u8;
+            }
+        }
+    }
+    bitmap.mark_dirty();
+}
+
 /// Register the `Layer` native class.
 pub(crate) fn register_layer(engine: &Tjs2Engine) -> Result<(), String> {
     let noop_stubs = [
@@ -743,8 +1212,32 @@ pub(crate) fn register_layer(engine: &Tjs2Engine) -> Result<(), String> {
         "setAffineOffset",
         "setImagePos",
         "setImageSize",
-        "drawText",
         "drawGlyph",
+        "drawRectangle",
+        "drawRectangles",
+        "drawLine",
+        "drawLines",
+        "drawPolygon",
+        "drawArc",
+        "drawBezier",
+        "drawBeziers",
+        "drawClosedCurve",
+        "drawClosedCurve2",
+        "drawCurve",
+        "drawCurve2",
+        "drawCurve3",
+        "drawPie",
+        "drawEllipse",
+        "drawPath",
+        "drawString",
+        "drawImage",
+        "drawImageRect",
+        "drawImageStretch",
+        "drawImageAffine",
+        "setDefaultDrawTextParam",
+        "resetDrawTextParam",
+        "setFontStyle",
+        "getDrawWidth",
         "affineCopy",
         "affinePile",
         "affineBlend",
@@ -758,7 +1251,6 @@ pub(crate) fn register_layer(engine: &Tjs2Engine) -> Result<(), String> {
         "operateRect",
         "operateStretch",
         "operateAffine",
-        "doBoxBlur",
         "gaussianBlur",
         "adjustGamma",
         "doGrayScale",
@@ -766,7 +1258,6 @@ pub(crate) fn register_layer(engine: &Tjs2Engine) -> Result<(), String> {
         "flipUD",
         "convertType",
         "light",
-        "beginTransition",
         "stopTransition",
         "saveLayerImage",
         "releaseCapture",
@@ -823,6 +1314,26 @@ pub(crate) fn register_layer(engine: &Tjs2Engine) -> Result<(), String> {
         NativeInstanceMethodDef {
             name: "setParentId",
             f: layer_set_parent,
+        },
+        NativeInstanceMethodDef {
+            name: "getTextWidth",
+            f: layer_get_text_width,
+        },
+        NativeInstanceMethodDef {
+            name: "getTextHeight",
+            f: layer_get_text_height,
+        },
+        NativeInstanceMethodDef {
+            name: "drawText",
+            f: layer_draw_text,
+        },
+        NativeInstanceMethodDef {
+            name: "doBoxBlur",
+            f: layer_do_box_blur,
+        },
+        NativeInstanceMethodDef {
+            name: "beginTransition",
+            f: layer_begin_transition,
         },
         NativeInstanceMethodDef {
             name: "update",
@@ -905,9 +1416,7 @@ pub(crate) fn register_layer(engine: &Tjs2Engine) -> Result<(), String> {
                 set: None,
             },
             // The blend/affine type (ltAlpha=2, ltAdditive=3, ... per the reference
-            // drawable.h). Stored per-instance so the game's reset() round-trips it;
-            // the scene model carries no blend field, so additive/subtractive blends
-            // are not rendered yet (see sync.rs module docs).
+            // drawable.h). It is mirrored into LayerState for render sync.
             NativeInstancePropertyDef {
                 name: "type",
                 get: Some(layer_type_get),
@@ -1015,10 +1524,11 @@ extern "C" fn layer_font_get(
     _objthis: *mut c_void,
 ) -> c_int {
     let _ = instance;
-    // Create a fresh object via eval; the result lands in last_object, then
-    // retain it and return as a consumed retained value.
+    // Return a real native Font object rather than an empty dictionary. This
+    // gives the script-side AffineLayer helpers working face/height and
+    // getTextWidth members while preserving the retained-object ABI pattern.
     let engine = crate::natives::context_engine();
-    let _ = engine.eval("%[]", "layer.font");
+    let _ = engine.eval("new Font()", "layer.font");
     match engine.retain_value_detached(&tjs2_sys::TjsValue::Object) {
         Ok(dv) => {
             // SAFETY: out is a valid result slot; the C++ side consumes the
@@ -1083,7 +1593,11 @@ extern "C" fn layer_type_get(
     _objthis: *mut c_void,
 ) -> c_int {
     let inst = unsafe { instance_ref::<LayerInst>(instance) };
-    set_int_out(out, inst.blend_type);
+    let scene = context_scene_read();
+    let blend_type = scene
+        .layer(inst.id)
+        .map_or(inst.blend_type, |layer| layer.blend_type);
+    set_int_out(out, blend_type);
     0
 }
 
@@ -1099,6 +1613,11 @@ extern "C" fn layer_type_set(
     let v = unsafe { &*value };
     let inst = unsafe { instance_ref::<LayerInst>(instance) };
     inst.blend_type = v.integer;
+    if inst.constructed
+        && let Some(layer) = context_scene_mut().layer_mut(inst.id)
+    {
+        layer.blend_type = v.integer;
+    }
     0
 }
 
@@ -1186,6 +1705,34 @@ mod tests {
                 h: 40
             }
         );
+    }
+
+    #[test]
+    fn layer_draw_text_rasterizes_into_scene_bitmap() {
+        let env = TestEnv::new("layer-draw-text");
+        env.run("var w = new Window(); var l = new Layer(w, null); l.setSize(128, 32); l.drawText(2, 2, 'Title 日本語', 0xffffffff);")
+            .unwrap();
+        let scene = env.scene();
+        let layer = &scene.layers[0];
+        let bitmap = scene
+            .bitmap(layer.bitmap.expect("drawText creates a surface"))
+            .expect("surface bitmap");
+        assert_eq!((bitmap.width, bitmap.height), (128, 32));
+        assert!(bitmap.dirty);
+        assert!(bitmap.rgba.chunks_exact(4).any(|pixel| pixel[3] != 0));
+        assert_eq!(env.eval_int("l.getTextHeight('x')"), 16);
+        assert!(env.eval_int("l.getTextWidth('日本')") > 0);
+    }
+
+    #[test]
+    fn layer_box_blur_changes_attached_pixels() {
+        let env = TestEnv::new("layer-box-blur");
+        env.run("var w = new Window(); var l = new Layer(w, null); l.setSize(32, 16); l.drawText(1, 1, 'A', 0xffffffff); l.doBoxBlur(1, 1);")
+            .unwrap();
+        let scene = env.scene();
+        let bitmap = scene.bitmap(scene.layers[0].bitmap.unwrap()).unwrap();
+        assert!(bitmap.dirty);
+        assert!(bitmap.rgba.chunks_exact(4).any(|pixel| pixel[3] != 0));
     }
 
     #[test]
@@ -1302,12 +1849,9 @@ mod tests {
     }
 
     /// `layer.type` (blend mode: ltAlpha=2, ltAdditive=3, ...) round-trips
-    /// on the native instance but NEVER lands in the scene — LayerState has
-    /// no blend field. This is the documented reason the renderer
-    /// alpha-blends every sprite regardless of type (additive/subtractive
-    /// not implemented; see sync.rs module docs).
+    /// on the native instance and is propagated to the shared scene contract.
     #[test]
-    fn layer_type_stored_per_instance_not_in_scene() {
+    fn layer_type_propagates_to_scene() {
         let env = TestEnv::new("layer-type");
         env.run("var w = new Window(); var l = new Layer(w, null); l.type = 3;")
             .unwrap();
@@ -1318,8 +1862,7 @@ mod tests {
         );
         let scene = env.scene();
         let layer = &scene.layers[0];
-        // The scene layer carries only renderer-visible state — no blend
-        // type, so the sync cannot distinguish additive from alpha.
+        assert_eq!(layer.blend_type, 3, "ltAdditive reaches the scene");
         assert_eq!(layer.fill_color, None);
         assert_eq!(layer.bitmap, None);
         assert_eq!(layer.z_order, 0);

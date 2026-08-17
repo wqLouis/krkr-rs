@@ -45,6 +45,11 @@ pub(crate) struct WindowInst {
     pub id: u32,
     /// Whether the native constructor has run.
     pub constructed: bool,
+    /// `Window.menu` is backed by a script object stored in a uniquely named
+    /// global.  Keeping the reference in the VM (rather than returning a
+    /// newly-created object on each property read) gives the property stable
+    /// identity without coupling this crate to the optional menu plugin.
+    pub menu_ready: bool,
 }
 
 /// `new Window()` payload factory.
@@ -261,6 +266,76 @@ extern "C" fn window_caption_set(
 
 /// `primaryLayer` — the scene id of the window's primary layer, or -1 when
 /// none is attached (object returns are pending; see the builder).
+/// Return the stable logical root menu for this window.
+///
+/// The normal application registers the native `MenuItem` class from
+/// `tvp-natives` before registering visual natives.  Small visual-only/headless
+/// users (including this crate's tests) do not necessarily register that
+/// optional class, so install a deliberately small TJS fallback in that case.
+/// The fallback has the same stateful tree surface needed by headless scripts;
+/// it never attempts to create platform menus.
+extern "C" fn window_menu_get(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let inst = unsafe { instance_ref::<WindowInst>(instance) };
+    if !inst.constructed {
+        return error_out(out_error, "Window.menu: window is not constructed");
+    }
+    let engine = super::context_engine();
+    let name = format!("__krkr_window_menu_{}", inst.id);
+    if !inst.menu_ready {
+        let init = format!(
+            "if (typeof global.MenuItem == 'undefined') {{ \
+                 global.MenuItem = function(owner, caption) {{ \
+                   this.caption = (caption === undefined ? '' : caption); \
+                   this.checked = false; this.enabled = true; this.radio = false; \
+                   this.group = 0; this.visible = true; this.shortcut = ''; \
+                   this.children = []; this.parent = null; this.root = this; \
+                   this.add = function(item) {{ this.children[this.children.count] = item; item.parent = this; item.root = this.root; }}; \
+                   this.insert = function(item, index) {{ this.children.splice(index, 0, item); item.parent = this; item.root = this.root; }}; \
+                   this.remove = function(item) {{ var i = this.children.indexOf(item); if (i >= 0) {{ this.children.splice(i, 1); item.parent = null; item.root = item; }} }}; \
+                   this.fireClick = function() {{ if (this.enabled && this.onClick) this.onClick(); }}; \
+                   this.popup = function() {{ return 1; }}; \
+                 }}; \
+               }}; \
+               if (typeof global.{0} == 'undefined') global.{0} = %[caption:'', checked:0, enabled:1, radio:0, group:0, visible:1, shortcut:'', children:[], parent:void, root:void]; global.{0}.root = global.{0}; global.{0}.add = function(item) {{ this.children[this.children.count] = item; item.parent = this; item.root = this.root; }}; global.{0}.insert = function(item, index) {{ this.children[index] = item; item.parent = this; item.root = this.root; }}; global.{0}.remove = function(item) {{ var i = 0; while (i < this.children.count && this.children[i] !== item) i++; if (i < this.children.count) this.children[i] = void; item.parent = void; item.root = item; }}; global.{0}.fireClick = function() {{ if (this.enabled && this.onClick !== void) this.onClick(); }}; global.{0}.popup = function() {{ return 1; }};",
+            name
+        );
+        if let Err(e) = engine.exec_script(&init, "Window.menu") {
+            return error_out(out_error, &format!("Window.menu: {e}"));
+        }
+        inst.menu_ready = true;
+    }
+    match engine.eval(&name, "Window.menu") {
+        Ok(tjs2_sys::TjsValue::Object) => {
+            match engine.retain_value_detached(&tjs2_sys::TjsValue::Object) {
+                Ok(value) => {
+                    // C++ consumes a retained return value.
+                    let id = value.raw_id();
+                    unsafe {
+                        (*out).ty = tjs2_sys::VAL_RETAINED;
+                        (*out).integer = 0;
+                        (*out).real = 0.0;
+                        (*out).string = std::ptr::null();
+                        (*out).array = std::ptr::null();
+                        (*out).array_count = 0;
+                        (*out).retained = id as usize;
+                    }
+                    std::mem::forget(value);
+                    0
+                }
+                Err(e) => error_out(out_error, &format!("Window.menu: {e}")),
+            }
+        }
+        Ok(_) => error_out(out_error, "Window.menu: root is not an object"),
+        Err(e) => error_out(out_error, &format!("Window.menu: {e}")),
+    }
+}
+
 extern "C" fn window_primary_layer_get(
     _engine: *mut c_void,
     instance: *mut c_void,
@@ -490,6 +565,11 @@ pub(crate) fn register_window(engine: &Tjs2Engine) -> Result<(), String> {
             NativeInstancePropertyDef {
                 name: "primaryLayer",
                 get: Some(window_primary_layer_get),
+                set: None,
+            },
+            NativeInstancePropertyDef {
+                name: "menu",
+                get: Some(window_menu_get),
                 set: None,
             },
             // Window style/config properties the game's MainWindow sets.
@@ -725,6 +805,19 @@ mod tests {
         // reads round-trip through the script
         assert_eq!(env.eval_string("w.caption"), "hello");
         assert_eq!(env.eval_int("w.visible"), 0);
+    }
+
+    #[test]
+    fn window_menu_is_stable_and_stateful() {
+        let env = TestEnv::new("window-menu");
+        env.run("var w = new Window(); var a = w.menu; var b = w.menu; a.caption = 'Root'; var c = %[caption:'Child']; a.add(c);").unwrap();
+        assert_eq!(
+            env.eval("a === b", "menu").unwrap(),
+            tjs2_sys::TjsValue::Integer(1)
+        );
+        assert_eq!(env.eval_string("w.menu.caption"), "Root");
+        assert_eq!(env.eval_int("w.menu.children.length"), 1);
+        assert_eq!(env.eval_string("w.menu.children[0].caption"), "Child");
     }
 
     #[test]

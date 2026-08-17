@@ -21,10 +21,10 @@ use bevy::asset::Assets;
 use bevy::ecs::schedule::IntoScheduleConfigs;
 use bevy::image::Image;
 use bevy::prelude::{
-    Commands, DefaultPlugins, MessageWriter, MinimalPlugins, PluginGroup, Res, ResMut, Resource,
-    Startup, Time, Update,
+    Commands, DefaultPlugins, MessageWriter, MinimalPlugins, PluginGroup, Query, Res, ResMut,
+    Resource, Startup, Time, Update, With,
 };
-use bevy::window::{Window, WindowPlugin};
+use bevy::window::{Monitor, PrimaryMonitor, Window, WindowPlugin};
 use engine::loader::LoadReport;
 use krkr_render::sync::{BitmapAssets, SharedScene, sync_scene};
 use tvp_visual::scene::{BitmapState, Rect, Scene};
@@ -153,7 +153,12 @@ fn headless_game_app(shared: SharedScene, game_dir: PathBuf) -> App {
 /// `startup.tjs`. Mount/VM/registration errors are fatal (log + exit); a
 /// **script-level** error in `startup.tjs` is NOT fatal — the game
 /// continues into its timer event loop (WAVE3 SA-5), so it is logged only.
-fn game_startup(config: Res<GameConfig>, shared: Res<SharedScene>, mut commands: Commands) {
+fn game_startup(
+    config: Res<GameConfig>,
+    shared: Res<SharedScene>,
+    monitors: Query<&Monitor, With<PrimaryMonitor>>,
+    mut commands: Commands,
+) {
     // 1. Mount storage (game dir + xp3 archives) and bootstrap the VM.
     let game_dir = config.game_dir.display().to_string();
     let (storage, engine) = match engine::loader::prepare(&game_dir) {
@@ -164,15 +169,32 @@ fn game_startup(config: Res<GameConfig>, shared: Res<SharedScene>, mut commands:
         }
     };
 
-    // 2. Point the `System.*` property getters at the mounted game.
+    // 2. Ensure the save-data directory exists before scripts enumerate or
+    // copy save slots.
+    if let Err(e) = std::fs::create_dir_all(config.game_dir.join("savedata")) {
+        log::warn!("cannot create savedata directory: {e}");
+    }
+
+    // 3. Point the `System.*` property getters at the mounted game.
+    let (desktop_origin, desktop_size) = monitors
+        .single()
+        .map(|monitor| {
+            (
+                (monitor.physical_position.x, monitor.physical_position.y),
+                (monitor.physical_width, monitor.physical_height),
+            )
+        })
+        .unwrap_or(((0, 0), GAME_SIZE));
     tvp_natives::set_system_context(tvp_natives::SystemContext {
         project_dir: config.game_dir.clone(),
         app_data_dir: std::env::temp_dir(),
         screen_size: GAME_SIZE,
+        desktop_origin,
+        desktop_size,
         touch_device: false,
     });
 
-    // 3. Register the native classes; the visual ones bind to our shared
+    // 4. Register the native classes; the visual ones bind to our shared
     //    scene (natives mutate it under a write lock, sync_scene renders
     //    it under a read lock).
     register_natives(&engine, &storage, &shared).unwrap_or_else(|e| {
@@ -180,7 +202,7 @@ fn game_startup(config: Res<GameConfig>, shared: Res<SharedScene>, mut commands:
         std::process::exit(1);
     });
 
-    // 4. Run startup.tjs; a script error is non-fatal (log it and keep
+    // 5. Run startup.tjs; a script error is non-fatal (log it and keep
     //    going — timers still fire and the scene keeps syncing).
     match engine::loader::run_startup(&engine, &storage) {
         Ok(report) => {
@@ -200,7 +222,7 @@ fn game_startup(config: Res<GameConfig>, shared: Res<SharedScene>, mut commands:
         }
     }
 
-    // 5. Hand the VM to the update loop; `now_ms` is measured from here.
+    // 6. Hand the VM to the update loop; `now_ms` is measured from here.
     commands.insert_resource(VmRuntime {
         engine,
         started: Instant::now(),
@@ -785,7 +807,6 @@ mod tests {
         for i in 0..180 {
             std::thread::sleep(Duration::from_millis(100));
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| app.update()));
-            eprintln!("[tick-dbg] {i} done");
             assert!(result.is_ok(), "app.update() panicked at tick {i}");
             if i % 30 == 29 {
                 let scene = shared.0.read().unwrap();

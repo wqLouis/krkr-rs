@@ -19,29 +19,26 @@
 //!
 //! # Z order
 //!
-//! [`Scene::window_layer_order`] already returns layers back → front (sorted
-//! by z-order/insertion); we assign `z = index as f32` (backmost = 0,
-//! frontmost = N-1). Bevy sorts 2D sprites back-to-front by view-space
-//! depth, so higher z renders on top. Only parent-less layers are in the
-//! order today; hierarchical children are a later milestone.
+//! [`Scene::window_layer_order`] returns a flattened back → front traversal:
+//! every parent is immediately followed by its sorted child subtree. We assign
+//! `z = index as f32` (backmost = 0, frontmost = N-1). Bevy sorts 2D sprites
+//! back-to-front by view-space depth, so higher z renders on top. Child rects
+//! are composed with all ancestor positions and child opacity is multiplied
+//! through all ancestors before spawning the flat sprite list.
 //!
 //! # Blend modes
 //!
 //! TVP layers carry a blend `type` (`ltOpaque=1`, `ltAlpha=2`,
-//! `ltAdditive=3`, `ltSubtractive=4`, `ltAddAlpha=12`, ... — enum values
-//! per `reference/cpp/core/visual/drawable.h`; the game's constants are
-//! registered in `tvp-natives/src/constants.rs`). The scene model does NOT
-//! store the type (the natives keep it per-instance for script round-trips,
-//! see `layer_type_stored_per_instance_not_in_scene` in
-//! `tvp-visual/src/natives/layer.rs`), so every sprite here renders with
-//! plain straight-alpha blending regardless of type. **Additive /
-//! subtractive / multiplicative / ... blends are NOT implemented**: a layer
-//! whose script type is `ltAdditive` renders exactly like `ltAlpha` (with
-//! the composed window × layer opacity as alpha). This affects the title
-//! scene's COVER fade-in (`system/title.tjs` sets `type = ltAdditive`) and
-//! the ADV flash effects (`system/advscreen.tjs` sets ltAdditive/
-//! ltSubtractive), so such frames composite darker than the reference until
-//! real blend modes land.
+//! `ltAdditive=3`, `ltSubtractive=4`, `ltAddAlpha=12`, ...). The type now
+//! propagates from the native into [`LayerState`] and [`SceneSprite`], so it
+//! is no longer silently lost during sync. Bevy 0.19's built-in `Sprite`
+//! component has one fixed source-over alpha pipeline: it has no per-entity
+//! additive/subtractive `BlendState` field. Consequently all four modes are
+//! currently represented and ordered correctly, but their GPU compositing is
+//! source-over; implementing true additive/subtractive needs a custom
+//! `Material2d` pipeline (a deliberate later renderer change). This explicit
+//! limitation is preferable to pretending the native type was alpha. Alpha
+//! and opacity composition remain correct for every mode.
 //!
 //! # Rebuild strategy
 //!
@@ -149,6 +146,10 @@ pub struct WindowRoot {
 #[derive(Component)]
 pub struct SceneSprite {
     pub layer_id: u32,
+    /// Native TVP `Layer.type`. The built-in Bevy Sprite pipeline currently
+    /// renders this marker with source-over alpha; see the module docs for
+    /// why additive/subtractive need a custom material to become GPU blends.
+    pub blend_type: i64,
 }
 
 /// The 2D camera we manage (for the first window). Kept across frames — it
@@ -214,8 +215,11 @@ pub fn sync_scene(
             let Some(layer) = scene.layer(layer_id) else {
                 continue;
             };
-            let (x, y) = rect_center(layer.rect, win_w, win_h);
-            let alpha = win_opacity * clamp_opacity(layer.opacity);
+            let Some(composed) = compose_layer(&scene, layer_id) else {
+                continue;
+            };
+            let (x, y) = rect_center(composed.rect, win_w, win_h);
+            let alpha = win_opacity * composed.opacity;
             let sprite = build_sprite(
                 layer,
                 alpha,
@@ -227,10 +231,13 @@ pub fn sync_scene(
 
             let sprite = commands
                 .spawn((
-                    SceneSprite { layer_id },
+                    SceneSprite {
+                        layer_id,
+                        blend_type: layer.blend_type,
+                    },
                     sprite,
                     Transform::from_xyz(x, y, sprite_z(index)),
-                    if layer.visible {
+                    if composed.visible {
                         Visibility::Visible
                     } else {
                         Visibility::Hidden
@@ -291,6 +298,53 @@ fn build_sprite(
 // ---------------------------------------------------------------------------
 // Pure conversion helpers (unit-tested; no Bevy world access).
 // ---------------------------------------------------------------------------
+
+/// A layer after parent transforms, opacity, and visibility have been
+/// composed. The renderer intentionally keeps entities flat under WindowRoot
+/// so one global z sequence can represent the depth-first layer tree.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ComposedLayer {
+    rect: Rect,
+    opacity: f32,
+    visible: bool,
+}
+
+/// Compose a layer's position, opacity, and visibility through its ancestors.
+/// Invalid links stop the chain; cycles are ignored after the first visit.
+fn compose_layer(scene: &Scene, layer_id: u32) -> Option<ComposedLayer> {
+    let mut chain = Vec::new();
+    let mut current = Some(layer_id);
+    let mut visited = std::collections::HashSet::new();
+    let window = scene.layer(layer_id)?.window;
+    while let Some(id) = current {
+        if !visited.insert(id) {
+            break;
+        }
+        let layer = scene.layer(id)?;
+        if layer.window != window {
+            break;
+        }
+        chain.push(layer);
+        current = layer.parent;
+    }
+    chain.reverse();
+
+    let mut result = ComposedLayer {
+        rect: Rect::default(),
+        opacity: 1.0,
+        visible: true,
+    };
+    for layer in chain {
+        result.rect.x = result.rect.x.saturating_add(layer.rect.x);
+        result.rect.y = result.rect.y.saturating_add(layer.rect.y);
+        // A child owns its own size; only its origin is relative to its parent.
+        result.rect.w = layer.rect.w;
+        result.rect.h = layer.rect.h;
+        result.opacity *= clamp_opacity(layer.opacity);
+        result.visible &= layer.visible;
+    }
+    Some(result)
+}
 
 /// TVP (y-down, top-left origin) rect center → Bevy (y-up, centered origin)
 /// world position. See the module docs for the convention.
@@ -439,6 +493,77 @@ mod tests {
         // The dirty flag was cleared after upload.
         let scene = shared.0.read().unwrap();
         assert!(!scene.bitmap(bmp).unwrap().dirty);
+    }
+
+    #[test]
+    fn hierarchy_composes_position_opacity_visibility_and_order() {
+        let mut scene = Scene::default();
+        let win = scene.add_window("t", (640, 480));
+        scene.window_mut(win).unwrap().opacity = 0.8;
+        let parent = scene.add_layer(win, None);
+        scene.layer_mut(parent).unwrap().rect = Rect {
+            x: 100,
+            y: 40,
+            w: 200,
+            h: 100,
+        };
+        scene.layer_mut(parent).unwrap().opacity = 0.5;
+        let child = scene.add_layer(win, Some(parent));
+        scene.layer_mut(child).unwrap().rect = Rect {
+            x: 12,
+            y: 8,
+            w: 20,
+            h: 10,
+        };
+        scene.layer_mut(child).unwrap().opacity = 0.5;
+        let sibling = scene.add_layer(win, None);
+        scene.layer_mut(sibling).unwrap().rect = Rect {
+            x: 1,
+            y: 2,
+            w: 3,
+            h: 4,
+        };
+
+        let shared = SharedScene(Arc::new(RwLock::new(scene)));
+        let mut app = app_with_sync(shared);
+        app.update();
+
+        let world = app.world_mut();
+        let mut q =
+            world.query_filtered::<(&SceneSprite, &Transform, &Sprite), With<SceneSprite>>();
+        let mut by_id = std::collections::HashMap::new();
+        for (marker, transform, sprite) in q.iter(world) {
+            by_id.insert(
+                marker.layer_id,
+                (transform.translation, sprite.color.to_srgba().alpha),
+            );
+        }
+        // Parent is centered at TVP (200,90) -> Bevy (-120,150); child is
+        // relative to its parent at TVP rect origin (112,48), with its own
+        // 20x10 center at (122,53) -> Bevy (-198,187).
+        assert_eq!(by_id[&parent].0, Vec3::new(-120.0, 150.0, 0.0));
+        assert_eq!(by_id[&child].0, Vec3::new(-198.0, 187.0, 1.0));
+        assert_eq!(by_id[&sibling].0.z, 2.0);
+        assert!((by_id[&child].1 - 0.8 * 0.5 * 0.5).abs() < 1e-6);
+        assert!(by_id[&parent].0.z < by_id[&child].0.z);
+        assert!(by_id[&child].0.z < by_id[&sibling].0.z);
+    }
+
+    #[test]
+    fn sync_scene_propagates_blend_type_marker() {
+        let mut scene = Scene::default();
+        let win = scene.add_window("t", (64, 64));
+        let layer = scene.add_layer(win, None);
+        scene.layer_mut(layer).unwrap().blend_type = tvp_visual::scene::LT_ADDITIVE;
+        let shared = SharedScene(Arc::new(RwLock::new(scene)));
+        let mut app = app_with_sync(shared);
+        app.update();
+        let world = app.world_mut();
+        let mut q = world.query_filtered::<&SceneSprite, With<SceneSprite>>();
+        assert_eq!(
+            q.single(world).unwrap().blend_type,
+            tvp_visual::scene::LT_ADDITIVE
+        );
     }
 
     #[test]

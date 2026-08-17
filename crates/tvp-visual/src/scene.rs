@@ -7,7 +7,7 @@
 //!
 //! No Bevy types here — this crate stays engine-agnostic.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// One logical window.
 #[derive(Debug, Clone)]
@@ -25,6 +25,16 @@ pub struct WindowState {
     pub layers: Vec<u32>,
 }
 
+/// TVP drawable types used by `Layer.type`.
+///
+/// The renderer currently uses Bevy's built-in sprite pipeline. The values are
+/// kept as the native integer contract so unsupported future TVP modes can
+/// still round-trip without changing this shared model.
+pub const LT_OPAQUE: i64 = 1;
+pub const LT_ALPHA: i64 = 2;
+pub const LT_ADDITIVE: i64 = 3;
+pub const LT_SUBTRACTIVE: i64 = 4;
+
 /// One logical layer (sprite surface) attached to a window.
 #[derive(Debug, Clone)]
 pub struct LayerState {
@@ -39,7 +49,10 @@ pub struct LayerState {
     pub rect: Rect,
     pub visible: bool,
     pub opacity: f32,
-    /// Z order among parent-less layers of the same window.
+    /// TVP drawable/blend type (`ltAlpha` by default). Kept in the scene so
+    /// render synchronization does not lose `Layer.type` updates.
+    pub blend_type: i64,
+    /// Z order among sibling layers of the same window.
     pub z_order: i32,
     /// Solid fill (RGBA, straight alpha) used when there is no bitmap.
     pub fill_color: Option<[u8; 4]>,
@@ -58,6 +71,20 @@ pub struct BitmapState {
     pub name: Option<String>,
     /// Set when contents changed; the renderer re-uploads on true.
     pub dirty: bool,
+}
+
+impl BitmapState {
+    /// Mark pixels as changed. Native drawing operations use this instead of
+    /// relying on a renderer-specific upload mechanism.
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    /// Return the byte offset of a pixel, or `None` outside the bitmap.
+    pub fn pixel_offset(&self, x: u32, y: u32) -> Option<usize> {
+        (x < self.width && y < self.height)
+            .then_some((y as usize * self.width as usize + x as usize) * 4)
+    }
 }
 
 /// One font face (text rendering arrives in milestone 3B).
@@ -126,6 +153,13 @@ impl Scene {
 
     /// Add a layer. `parent == None` attaches to the window directly.
     pub fn add_layer(&mut self, window: u32, parent: Option<u32>) -> u32 {
+        // A parent belongs to the same window; invalid/cross-window ids fall
+        // back to a window-attached layer rather than creating an unreachable
+        // subtree.
+        let parent = parent.filter(|parent_id| {
+            self.layer(*parent_id)
+                .is_some_and(|layer| layer.window == window)
+        });
         let id = self.next_layer;
         self.next_layer += 1;
         let primary = self.window(window).and_then(|w| w.primary_layer).is_none();
@@ -138,6 +172,7 @@ impl Scene {
             rect: Rect::default(),
             visible: true,
             opacity: 1.0,
+            blend_type: LT_ALPHA,
             z_order: 0,
             fill_color: None,
             hit_threshold: 0,
@@ -257,19 +292,106 @@ impl Scene {
         self.fonts.iter().find(|f| f.id == id)
     }
 
-    /// All layers of a window sorted back -> front (parents before children,
-    /// then by insertion/z-order among siblings). Simple stable sort by
-    /// (z_order, insertion index).
+    /// All layers of a window flattened back -> front.
+    ///
+    /// A parent's complete subtree is emitted before the next sibling. This
+    /// is important for TVP's layer tree: a parent is a backdrop/container,
+    /// while its children are composited in front of it. Sibling `z_order`
+    /// remains the primary key and the maintained sibling vectors provide the
+    /// stable tie-breaker (including `bringToFront`). Invalid or cyclic links
+    /// are handled defensively and cannot make a layer disappear or recurse
+    /// forever.
     pub fn window_layer_order(&self, window: u32) -> Vec<u32> {
-        let mut order: Vec<(u32, i32, usize)> = self
+        let Some(window_state) = self.window(window) else {
+            return Vec::new();
+        };
+        let mut roots = window_state.layers.clone();
+        // Include layers created by older callers that did not update the
+        // window list. This also makes the contract robust to hand-built test
+        // scenes and stale FFI links.
+        for layer in self
             .layers
             .iter()
-            .enumerate()
-            .filter(|(_, l)| l.window == window && l.parent.is_none())
-            .map(|(i, l)| (l.id, l.z_order, i))
+            .filter(|l| l.window == window && l.parent.is_none())
+        {
+            if !roots.contains(&layer.id) {
+                roots.push(layer.id);
+            }
+        }
+        let root_sibling_order = roots.clone();
+        self.sort_siblings(&mut roots, None, Some(&root_sibling_order));
+
+        let mut order = Vec::new();
+        let mut visited = HashSet::new();
+        for id in roots {
+            self.append_layer_subtree(window, id, &mut order, &mut visited);
+        }
+        // A malformed parent link should not hide a layer from rendering.
+        // Valid children omitted from a parent's `children` list are found by
+        // append_layer_subtree; this final pass is for cycles/invalid links.
+        let mut leftovers: Vec<u32> = self
+            .layers
+            .iter()
+            .filter(|l| l.window == window && !visited.contains(&l.id))
+            .map(|l| l.id)
             .collect();
-        order.sort_by_key(|&(_, z, i)| (z, i as i64));
-        order.into_iter().map(|(id, _, _)| id).collect()
+        self.sort_siblings(&mut leftovers, None, None);
+        for id in leftovers {
+            self.append_layer_subtree(window, id, &mut order, &mut visited);
+        }
+        order
+    }
+
+    fn sort_siblings(&self, ids: &mut [u32], parent: Option<u32>, preferred_order: Option<&[u32]>) {
+        let sibling_order = preferred_order
+            .map(|ids| ids.to_vec())
+            .or_else(|| parent.and_then(|id| self.layer(id).map(|l| l.children.clone())));
+        ids.sort_by(|a, b| {
+            let a_layer = self.layer(*a);
+            let b_layer = self.layer(*b);
+            let az = a_layer.map_or(0, |l| l.z_order);
+            let bz = b_layer.map_or(0, |l| l.z_order);
+            let apos = sibling_order
+                .as_ref()
+                .and_then(|v| v.iter().position(|id| id == a))
+                .unwrap_or(usize::MAX);
+            let bpos = sibling_order
+                .as_ref()
+                .and_then(|v| v.iter().position(|id| id == b))
+                .unwrap_or(usize::MAX);
+            (az, apos, *a).cmp(&(bz, bpos, *b))
+        });
+    }
+
+    fn append_layer_subtree(
+        &self,
+        window: u32,
+        id: u32,
+        order: &mut Vec<u32>,
+        visited: &mut HashSet<u32>,
+    ) {
+        let Some(layer) = self.layer(id) else { return };
+        if layer.window != window || !visited.insert(id) {
+            return;
+        }
+        order.push(id);
+
+        let mut children = layer.children.clone();
+        let missing_children: Vec<u32> = self
+            .layers
+            .iter()
+            .filter(|candidate| {
+                candidate.window == window
+                    && candidate.parent == Some(id)
+                    && !children.contains(&candidate.id)
+            })
+            .map(|candidate| candidate.id)
+            .collect();
+        children.extend(missing_children);
+        self.sort_siblings(&mut children, Some(id), None);
+        for child in children {
+            self.append_layer_subtree(window, child, order, visited);
+        }
     }
 }
 
@@ -318,22 +440,26 @@ mod tests {
         assert_eq!(pos(hint), order.len() - 1, "LAYER_HINT is frontmost");
     }
 
-    /// Children are excluded from the window render order today —
-    /// hierarchical compositing is a later milestone (documented in
-    /// crates/render/src/sync.rs).
+    /// A parent is emitted before its children, and the complete child
+    /// subtree remains together before the next root sibling.
     #[test]
-    fn window_layer_order_excludes_children() {
+    fn window_layer_order_flattens_hierarchy() {
         let mut scene = Scene::default();
         let win = scene.add_window("t", (1280, 720));
         let parent = scene.add_layer(win, None);
         let child = scene.add_layer(win, Some(parent));
         let sibling = scene.add_layer(win, None);
         let order = scene.window_layer_order(win);
-        assert!(order.contains(&parent));
-        assert!(order.contains(&sibling));
-        assert!(
-            !order.contains(&child),
-            "parented layers are not rendered yet"
-        );
+        assert_eq!(order, vec![parent, child, sibling]);
+    }
+
+    #[test]
+    fn moving_layer_to_front_updates_equal_z_sibling_order() {
+        let mut scene = Scene::default();
+        let win = scene.add_window("t", (1, 1));
+        let back = scene.add_layer(win, None);
+        let front = scene.add_layer(win, None);
+        scene.layer_move_to_front(back);
+        assert_eq!(scene.window_layer_order(win), vec![front, back]);
     }
 }

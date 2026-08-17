@@ -110,10 +110,13 @@ fn register_natives(
 ) -> Result<(), String> {
     // Point the System property getters at the mounted game.
     let game_dir = storage.lock().unwrap().game_dir().to_path_buf();
+    let _ = std::fs::create_dir_all(game_dir.join("savedata"));
     tvp_natives::set_system_context(tvp_natives::SystemContext {
         project_dir: game_dir,
         app_data_dir: std::env::temp_dir(), // platform data dir (headless for now)
         screen_size: (640, 480),            // virtual screen the game sees
+        desktop_origin: (0, 0),
+        desktop_size: (640, 480),
         touch_device: false,
     });
     tvp_natives::register_all(engine)?;

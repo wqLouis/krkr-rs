@@ -43,36 +43,74 @@ pub use debug::register_debug;
 pub use menu_item::register_menu_item;
 pub use plugin_stubs::register_plugin_stubs;
 pub use plugins::register_plugins;
-pub use system::{SystemContext, continuous_handler_poll, register_system, set_system_context};
+pub use system::{
+    SystemContext, continuous_handler_poll, register_system, set_key_state, set_system_context,
+};
 
 use std::cell::RefCell;
 use std::ffi::{CStr, c_char, c_int};
 use std::ptr;
 use std::slice;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{LazyLock, Mutex, MutexGuard};
 
-use std::sync::OnceLock;
-
-use tjs2_sys::{Tjs2Engine, VAL_INTEGER, VAL_REAL, VAL_STRING, VAL_VOID, Value, tjs2_malloc};
+use tjs2_sys::{
+    Tjs2Engine, TjsValue, VAL_INTEGER, VAL_REAL, VAL_RETAINED, VAL_STRING, VAL_VOID, Value,
+    tjs2_malloc,
+};
 
 /// The engine the natives are registered on (needed by natives whose
 /// callbacks receive only the raw `tjs2_engine*` ABI pointer, which is NOT a
 /// `Tjs2Engine*` — see the visual Timer's comment). Set by [`register_all`];
 /// the engine outlives every native call (process-lifetime app VM).
-static ENGINE: OnceLock<usize> = OnceLock::new();
+static ENGINE: LazyLock<Mutex<Option<usize>>> = LazyLock::new(|| Mutex::new(None));
 
 /// The registered engine as a shared reference.
 pub(crate) fn context_engine() -> &'static Tjs2Engine {
     // SAFETY: the address was stored by register_all and the engine is never
     // freed before the process ends.
-    unsafe { &*(*ENGINE.get().expect("tvp-natives: engine context not set") as *const Tjs2Engine) }
+    let ptr = *lock_ok(&ENGINE)
+        .as_ref()
+        .expect("tvp-natives: engine context not set");
+    // SAFETY: the host keeps the registered engine alive while callbacks run.
+    unsafe { &*(ptr as *const Tjs2Engine) }
+}
+
+/// Evaluate a TJS expression that returns an object and place that object in
+/// a native callback result.  The C ABI cannot construct dictionaries
+/// directly, but it can transfer a retained object; this helper centralizes
+/// the same pattern used by the KAG parser and visual natives.
+///
+/// The C++ trampoline consumes the retained id while copying the result, so
+/// the temporary Rust owner is intentionally forgotten after the id is put
+/// in `out`.
+pub(crate) fn set_object_result(
+    out: *mut Value,
+    expression: &str,
+    name: &str,
+) -> Result<(), String> {
+    context_engine()
+        .eval(expression, name)
+        .map_err(|e| e.to_string())?;
+    let value = context_engine().retain_value_detached(&TjsValue::Object)?;
+    // SAFETY: `out` is the valid result slot supplied by the C++ trampoline.
+    unsafe {
+        (*out).ty = VAL_RETAINED;
+        (*out).integer = 0;
+        (*out).real = 0.0;
+        (*out).string = std::ptr::null();
+        (*out).array = std::ptr::null();
+        (*out).array_count = 0;
+        (*out).retained = value.raw_id() as usize;
+    }
+    std::mem::forget(value);
+    Ok(())
 }
 
 /// Register all native classes in this crate on `engine` (`System`, `Debug`,
 /// `Plugins`, and the `MenuItem` stub that keeps k2compat's menu-delay
 /// machinery from installing a throwing lazy loader).
 pub fn register_all(engine: &Tjs2Engine) -> Result<(), String> {
-    let _ = ENGINE.set(engine as *const Tjs2Engine as usize);
+    *lock_ok(&ENGINE) = Some(engine as *const Tjs2Engine as usize);
     // Global TVP constants (ltOpaque, ssShift, ...) the game scripts use as
     // bare globals.
     engine
@@ -384,6 +422,54 @@ mod tests {
             e.eval("System.readRegValue('key')", "test").unwrap(),
             TjsValue::Void
         );
+    }
+
+    #[test]
+    fn system_key_state_tracks_host_input() {
+        let _vm_lock = vm_lock();
+        let e = registered_engine();
+        set_key_state(0x41, true);
+        assert_eq!(
+            e.eval("System.getKeyState(0x41)", "test").unwrap(),
+            TjsValue::Integer(1)
+        );
+        set_key_state(0x41, false);
+        assert_eq!(
+            e.eval("System.getKeyState(0x41)", "test").unwrap(),
+            TjsValue::Integer(0)
+        );
+    }
+
+    #[test]
+    fn system_monitor_properties_follow_context() {
+        let _vm_lock = vm_lock();
+        let e = registered_engine();
+        let cwd = std::env::current_dir().unwrap();
+        set_system_context(SystemContext {
+            project_dir: cwd.clone(),
+            app_data_dir: cwd,
+            screen_size: (800, 600),
+            desktop_origin: (-1920, 0),
+            desktop_size: (3840, 2160),
+            touch_device: false,
+        });
+        assert_eq!(
+            e.eval("System.screenWidth", "test").unwrap(),
+            TjsValue::Integer(800)
+        );
+        assert_eq!(
+            e.eval("System.desktopLeft", "test").unwrap(),
+            TjsValue::Integer(-1920)
+        );
+        assert_eq!(
+            e.eval("System.desktopWidth", "test").unwrap(),
+            TjsValue::Integer(3840)
+        );
+        assert_eq!(
+            e.eval("System.desktopHeight", "test").unwrap(),
+            TjsValue::Integer(2160)
+        );
+        set_system_context(SystemContext::default());
     }
 
     // -- Debug ------------------------------------------------------------

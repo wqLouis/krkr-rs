@@ -9,12 +9,11 @@ Bevy window renders the logo/title layers → input bridge dispatches mouse/key
 to the game's `onMouseDown`/`onKeyDown` → `WaveSoundBuffer` audio natives
 registered (BGM path wired but **not verified audibly**).
 
-**Blocked on**: the game's plugin chain. `Plugins.link(...)` currently **logs
-and ignores** every plugin, and k2compat's `delayLoadPlugin` fallbacks depend
-on the plugin-provided classes. Several plugin classes are no-op stubs
-(`MenuItem`, `ChainItemBase`, `InputNotifyBase`, `VideoOverlay`, ...); others
-are missing entirely (`CSVParser` exists but `extrans`/`fstat`/`windowEx`
-surface is absent).
+**Remaining blockers**: the core startup plugin chain is now emulated by
+built-in Rust natives. `Plugins.link(...)` records supported emulated plugins
+and ignores optional desktop-only DLLs. The remaining gameplay gaps are
+true pixel effects, native popup rendering, and the real-time activation
+callback path.
 
 ---
 
@@ -25,12 +24,12 @@ surface is absent).
 | `extrans.dll` | unknown/optional | ignored (log only) |
 | `csvParser.dll` | `new CSVParser()` (charData.csv) | ✅ real native in tvp-storages |
 | `layerExDraw.dll` | layer effects (blur etc.) | ignored |
-| `fstat.dll` | `Storages.deleteFile`/`copyFile` | ✅ copyFile/deleteFile landed in tvp-storages |
-| `windowEx.dll` | `System.desktop*`, `Window` ex-props | ❌ **missing** — k2compat requires it via `Krkr2CompatUtils.requireWindowEx()` |
+| `fstat.dll` | `Storages.stat`/file metadata and file operations | ✅ stat/fstat metadata, copyFile/deleteFile landed in tvp-storages |
+| `windowEx.dll` | `System.desktop*`, `Window` ex-props | ✅ monitor context + `System.getDisplayMonitors/getMonitorInfo`; OS popup extras remain stubbed |
 | `KAGParserEx.dll` | placeholder only | ✅ KAGParser native in tvp-kagparser |
 | `getSample.dll` | debug only (`__DEBUGMODE__=0`) | ignored |
 | `wuvorbis.dll` | `WaveSoundBuffer` (.ogg) | ✅ real natives in tvp-sound (unverified audibly) |
-| `menu.dll` | `MenuItem`, `Window.menu` | ⚠️ stub class `MenuItem` in tvp-natives |
+| `menu.dll` | `MenuItem`, `Window.menu` | ✅ logical headless-safe MenuItem tree + Window.menu fallback; native children object arrays remain ABI-limited |
 | `KAGParser.dll` | `ScController extends KAGParser` | ✅ native + script-subclass ctor |
 
 ## Stage 2 — What's missing to run the title → ADV flow
@@ -38,38 +37,35 @@ surface is absent).
 Ordered by what the game hits next (all reference sources under
 `reference/cpp/plugins/`):
 
-1. **`windowEx.dll` (System.desktop*, screen size)** — `system/window.tjs` +
-   `k2compat_deskinfo.tjs` read `System.desktopLeft/Top/Width/Height` and
-   `System.screenWidth/Height` for window placement & fullscreen. Our
-   `System` returns hardcoded 1280×720; k2compat's `requireWindowEx()` sets
-   `K2COMPAT_SPEC_DESKTOPINFO`. Reference: `reference/cpp/plugins/windowEx.cpp`.
-   → wire real monitor size (bevy `Window` / winit) into `System` props.
-2. **`MenuItem` / `Window.menu` (menu.dll)** — k2compat registers a
-   `delayLoadPlugin("menu.dll", ...)`; when clicked the title/config screens
-   can open context menus. Stub exists; decide stub-vs-real.
-3. **`fstat.dll`** — `Storages.stat()` returns file metadata (size/mtime) for
-   the save/load list (`save/load` screens call it). Currently `stat` returns
-   pending/error. Reference: `reference/cpp/plugins/fstat/main.cpp`.
-4. **`extrans.dll`** — `Trans`/splash utilities; the game links it but may
-   never call it (audit: no `new Trans` in game scripts → confirm, then drop
-   or stub).
-5. **`layerExDraw.dll`** — `Layer` blur/glow effects used by ADV effects
-   (`EnvEffect.tjs`). Milestone-sized (pixel ops) — defer to the visual wave.
+1. **`windowEx.dll` (System.desktop*, screen size)** — ✅ `SystemContext` now
+   carries desktop origin/size, the Bevy primary monitor feeds it, and
+   `System.getDisplayMonitors/getMonitorInfo` provide the k2compat shape.
+2. **`MenuItem` / `Window.menu` (menu.dll)** — ✅ logical state/tree support and
+   headless popup behavior are present; native object-valued child arrays and
+   OS menu handles remain outside the current ABI/host.
+3. **`fstat.dll`** — ✅ `Storages.stat`/`fstat` return disk Date metadata and
+   XP3 uncompressed sizes; copy/delete remain available.
+4. **`extrans.dll`** — audited in the real game: no `new Trans` usage was found;
+   the optional link remains a safe ignored plugin.
+5. **`layerExDraw.dll`** — basic text/blur pixel operations now exist on the
+   logical layer surface; advanced vector/effect operations remain no-op
+   compatibility methods and true GPU blend modes are still pending.
 
 ## Stage 3 — Game-runtime milestones (what actually blocks gameplay)
 
-1. **Logo → Title transition** — Timer/continuous-handler rewrite landed; the
-   logo's 13s sequence + `changeScene(SCENE_TITLE)` needs a **real-time
-   headless verification** (the `real_game_timer_loop_advances_scene` test
-   currently hangs — see below).
+1. **Logo → Title transition** — ✅ timer and transition polling are wired;
+   `real_game_timer_loop_advances_scene` now completes successfully after
+   deferring continuous-handler re-registration until the current callback
+   returns.
 2. **Title screen input** — input bridge wired; needs verification that
    clicking `NEW GAME` / `CONTINUE` reaches `SelectItem` → `changeScene`.
 3. **`ScController` scenario loop** — `system/ScController.tjs` drives
    `loadScenario("*.ks")` → `getNextTag()` → `onTag()` handlers. KAGParser
    natives + real dicts are in; the ADV scene needs:
-   - `Storages.getPlacedPath` / full path semantics for scenario files ✅ mostly
-   - `Layer.drawText` + font glyphs (message area) — **text rendering** (tvp-text)
-   - `System.getKeyState` / cursor / `HitTest` for click-through
+   - `Storages.getPlacedPath` / full path semantics for scenario files ✅
+   - `Layer.drawText` metrics/rasterization fallback + box blur ✅
+   - `System.getKeyState` now mirrors host VK state; cursor bridge is wired;
+     layer hit-testing still needs gameplay verification
 4. **BGM/SE/voice** — `WaveSoundBuffer` natives in; verify `PlayBgm("BGM02")`
    actually produces audio (rodio output is optional/no-op without a device;
    mixer advances each frame — check the per-frame poll is wired in `run_vm`).
@@ -79,18 +75,19 @@ Ordered by what the game hits next (all reference sources under
 
 ## Stage 4 — Known open issues (from the integration wave)
 
-- **`real_game_timer_loop_advances_scene` test hangs** (render crate,
-  `#[ignore]`d) — the logo scene never closes in the headless drive loop.
-  Root-cause candidate: `beginActivation`/`setTransitionCompleteCall`
-  chain needs `AsyncTrigger` idle-flush ordering vs `continuous_handler_poll`
-  in the same frame (the scene *does* progress in the windowed run — verify).
-- **Blend modes unimplemented** — `layer.type` (ltAdditive etc.) never reaches
-  the scene; everything alpha-blends. Affects title COVER fade + ADV flashes.
-- **Hierarchy flattening** — parent fills draw in FRONT of their children
-  (FFI object-parent resolution pending); the logo white card covers its art.
-- **`System.screenWidth/Height` hardcoded** to 1280×720 (Stage 2.1).
+- **`real_game_timer_loop_advances_scene`** remains `#[ignore]` because it
+  requires the external game fixture, but it now passes when explicitly run
+  with `--ignored`.
+- **Blend modes** — `layer.type` now reaches the scene and hierarchy sync;
+  Bevy's default Sprite pipeline still source-over blends, so true additive /
+  subtractive GPU compositing remains pending.
+- **Hierarchy flattening** — parent/child order, position, opacity, and
+  visibility are now composed depth-first in render sync.
+- **`System.screenWidth/Height`** — logical size remains 1280×720 by design;
+  desktop monitor origin/size is now supplied by Bevy when available.
 - **Audio device** — rodio output only if an ALSA device exists; silent
-  otherwise (natives still advance the mixer).
+  otherwise (natives still advance the mixer). Save-data directory creation
+  and disk metadata support are now wired for save/load screens.
 
 ---
 

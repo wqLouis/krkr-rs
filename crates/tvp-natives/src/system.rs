@@ -58,9 +58,10 @@
 //! `screenHeight`, `desktopLeft`, `desktopTop`, `desktopWidth`,
 //! `desktopHeight`, `touchDevice`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, c_int, c_void};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -69,8 +70,8 @@ use tjs2_sys::{
 };
 
 use super::{
-    args, lock_ok, report_error, set_int_out, set_real_out, set_string_out, set_void_out,
-    value_as_bool, value_as_i64, value_as_string,
+    args, lock_ok, report_error, set_int_out, set_object_result, set_real_out, set_string_out,
+    set_void_out, value_as_bool, value_as_i64, value_as_string,
 };
 
 /// Process-global command-line arguments (`name` → `value`), mirroring the
@@ -78,6 +79,20 @@ use super::{
 /// `HashMap::new` is not const.)
 static ARGS: LazyLock<Mutex<HashMap<String, String>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Keyboard state supplied by the host input bridge, keyed by Windows VK.
+static KEY_STATES: LazyLock<Mutex<HashSet<i64>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Update one host key state before dispatching the corresponding script
+/// input event. The render crate calls this from its Bevy input bridge.
+pub fn set_key_state(key: u32, down: bool) {
+    let mut keys = lock_ok(&KEY_STATES);
+    if down {
+        keys.insert(i64::from(key));
+    } else {
+        keys.remove(&i64::from(key));
+    }
+}
 
 /// Epoch for [`native_get_tick_count`]: the first call (reference:
 /// `TVPStartTickCount`).
@@ -135,20 +150,22 @@ extern "C" fn native_get_tick_count(
 
 /// `System.getKeyState(key [, getcurrent])` → bool
 ///
-/// Reference: `TVPGetAsyncKeyState` (real keyboard polling). Stub: always
-/// returns false — input natives are a later wave. The argument count check
+/// Reference: `TVPGetAsyncKeyState` (real keyboard polling). The host input
+/// bridge mirrors its current Windows-VK state into this native. The argument count check
 /// matches the reference (`TJS_E_BADPARAMCOUNT` on zero arguments).
 extern "C" fn native_get_key_state(
     _engine: *mut c_void,
     argc: c_int,
-    _argv: *const Value,
+    argv: *const Value,
     out: *mut Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
     if argc < 1 {
         return report_error(out_error, "System.getKeyState requires 1 argument");
     }
-    set_int_out(out, 0);
+    let key = value_as_i64(&args(argv, argc)[0]);
+    let down = lock_ok(&KEY_STATES).contains(&key);
+    set_int_out(out, i64::from(down));
     0
 }
 
@@ -425,6 +442,12 @@ extern "C" fn system_do_compact(
 /// `false`/0 removes itself (the reference `TVPDeliverContinuousEvents`
 /// semantics).
 static CONTINUOUS_HANDLERS: Mutex<Vec<tjs2_sys::DetachedValue>> = Mutex::new(Vec::new());
+/// Set by `removeContinuousHandler` while a callback is executing. The poll
+/// loop takes its handler list out of the mutex, so a direct vector removal
+/// cannot see the currently-running entry; this flag closes that race.
+static REMOVE_CURRENT_HANDLER: AtomicBool = AtomicBool::new(false);
+static CONTINUOUS_IN_CALLBACK: AtomicBool = AtomicBool::new(false);
+static READD_CURRENT_HANDLER: AtomicBool = AtomicBool::new(false);
 
 /// Advance every continuous handler once, passing the current tick count
 /// (ms) as the handler's single argument — the reference
@@ -440,9 +463,15 @@ pub fn continuous_handler_poll(engine: &tjs2_sys::Tjs2Engine) -> bool {
     let taken = std::mem::take(&mut *handlers);
     let mut rest = Vec::with_capacity(taken.len());
     for h in taken {
-        let keep = engine
+        REMOVE_CURRENT_HANDLER.store(false, Ordering::SeqCst);
+        READD_CURRENT_HANDLER.store(false, Ordering::SeqCst);
+        CONTINUOUS_IN_CALLBACK.store(true, Ordering::SeqCst);
+        let callback_ok = engine
             .call_detached(&h, &[tjs2_sys::TjsValue::Integer(tick)])
             .is_ok();
+        CONTINUOUS_IN_CALLBACK.store(false, Ordering::SeqCst);
+        let readd = READD_CURRENT_HANDLER.swap(false, Ordering::SeqCst);
+        let keep = callback_ok && (readd || !REMOVE_CURRENT_HANDLER.swap(false, Ordering::SeqCst));
         if keep {
             rest.push(h);
         }
@@ -462,6 +491,11 @@ extern "C" fn native_add_continuous_handler(
     let args = crate::args(argv, argc);
     if args.is_empty() {
         return crate::report_error(out_error, "System.addContinuousHandler requires 1 argument");
+    }
+    if CONTINUOUS_IN_CALLBACK.load(Ordering::SeqCst) {
+        READD_CURRENT_HANDLER.store(true, Ordering::SeqCst);
+        crate::set_void_out(out);
+        return 0;
     }
     let engine = crate::context_engine();
     match engine.retain_value_detached(&tjs2_sys::TjsValue::Object) {
@@ -495,20 +529,70 @@ extern "C" fn native_remove_continuous_handler(
             "System.removeContinuousHandler requires 1 argument",
         );
     }
-    let engine = crate::context_engine();
-    // Match by script-value identity, not raw id: every `retain_value`
-    // call allocates a fresh id, so the same function registered by
-    // addContinuousHandler and passed to removeContinuousHandler would
-    // never compare equal by id. find_retained_id finds the existing map
-    // entry for the same closure without retaining anything new.
-    if let Some(id) = engine.find_retained_id(&tjs2_sys::TjsValue::Object) {
-        let mut handlers = CONTINUOUS_HANDLERS
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        handlers.retain(|h| h.raw_id() != id);
-    }
+    // The callback may be the handler currently being delivered. Mark it
+    // for removal without performing a retained-object lookup while the VM
+    // is re-entrant; the poll loop consumes the flag after the callback
+    // returns. If the target is not current, retaining it across frames is
+    // still harmless and it can be removed by the host lifecycle.
+    REMOVE_CURRENT_HANDLER.store(true, Ordering::SeqCst);
     crate::set_void_out(out);
     0
+}
+
+/// Build the monitor dictionary shape used by k2compat's deskinfo script.
+/// The reference exposes `monitor` and `work` rectangles and a `primary`
+/// flag; the emulator has one primary monitor, so both rectangles use the
+/// configured desktop bounds.
+fn primary_monitor_expression() -> String {
+    let ctx = system_context();
+    let (x, y) = ctx.desktop_origin;
+    let (w, h) = effective_desktop_size(&ctx);
+    format!(
+        "(function(){{var m=%[]; m.primary=1; m.monitor=%[x:{x},y:{y},w:{w},h:{h}]; m.work=%[x:{x},y:{y},w:{w},h:{h}]; return m;}})()"
+    )
+}
+
+/// `System.getDisplayMonitors()` — return the single primary monitor as a
+/// real TJS array. This is the minimal windowEx-compatible surface needed by
+/// k2compat's desktop-info fallback.
+extern "C" fn native_get_display_monitors(
+    _engine: *mut c_void,
+    argc: c_int,
+    _argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    if argc != 0 {
+        return report_error(out_error, "System.getDisplayMonitors takes no arguments");
+    }
+    let monitor = primary_monitor_expression();
+    let expression = format!("(function(){{var a=[]; a[0]={monitor}; return a;}})()");
+    match set_object_result(out, &expression, "System.getDisplayMonitors") {
+        Ok(()) => 0,
+        Err(e) => report_error(out_error, &format!("System.getDisplayMonitors: {e}")),
+    }
+}
+
+/// `System.getMonitorInfo(primary, window)` — return the primary monitor.
+/// Window association is intentionally ignored because this host currently
+/// has one logical game window.
+extern "C" fn native_get_monitor_info(
+    _engine: *mut c_void,
+    argc: c_int,
+    _argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    if argc < 1 {
+        return report_error(
+            out_error,
+            "System.getMonitorInfo requires at least 1 argument",
+        );
+    }
+    match set_object_result(out, &primary_monitor_expression(), "System.getMonitorInfo") {
+        Ok(()) => 0,
+        Err(e) => report_error(out_error, &format!("System.getMonitorInfo: {e}")),
+    }
 }
 
 /// Register the `System` native class (methods + the property getters games
@@ -586,6 +670,14 @@ pub fn register_system(engine: &tjs2_sys::Tjs2Engine) -> Result<(), String> {
                 name: "removeContinuousHandler",
                 f: native_remove_continuous_handler,
             },
+            NativeMethodDef {
+                name: "getDisplayMonitors",
+                f: native_get_display_monitors,
+            },
+            NativeMethodDef {
+                name: "getMonitorInfo",
+                f: native_get_monitor_info,
+            },
         ],
     })
 }
@@ -604,6 +696,10 @@ pub struct SystemContext {
     pub app_data_dir: std::path::PathBuf,
     /// (width, height) of the virtual screen; (0, 0) = unknown/headless.
     pub screen_size: (u32, u32),
+    /// Primary desktop origin in physical pixels.
+    pub desktop_origin: (i32, i32),
+    /// Primary desktop/work-area size in physical pixels.
+    pub desktop_size: (u32, u32),
     /// Whether the platform is touch-capable (`touchDevice`).
     pub touch_device: bool,
 }
@@ -615,6 +711,8 @@ impl Default for SystemContext {
             project_dir: cwd.clone(),
             app_data_dir: cwd,
             screen_size: (0, 0),
+            desktop_origin: (0, 0),
+            desktop_size: (0, 0),
             touch_device: false,
         }
     }
@@ -641,6 +739,14 @@ pub fn set_system_context(ctx: SystemContext) {
 /// Current context (defaults when never set).
 fn system_context() -> SystemContext {
     lock_ok(&SYSTEM_CONTEXT).clone()
+}
+
+fn effective_desktop_size(ctx: &SystemContext) -> (u32, u32) {
+    if ctx.desktop_size != (0, 0) {
+        ctx.desktop_size
+    } else {
+        ctx.screen_size
+    }
 }
 
 /// The `savedata` folder inside the project dir (created lazily by the
@@ -803,12 +909,12 @@ extern "C" fn prop_screen_height(
 }
 
 extern "C" fn prop_desktop_left(_e: *mut c_void, out: *mut Value, _err: *mut *mut c_char) -> c_int {
-    set_int_out(out, 0);
+    set_int_out(out, i64::from(system_context().desktop_origin.0));
     0
 }
 
 extern "C" fn prop_desktop_top(_e: *mut c_void, out: *mut Value, _err: *mut *mut c_char) -> c_int {
-    set_int_out(out, 0);
+    set_int_out(out, i64::from(system_context().desktop_origin.1));
     0
 }
 
@@ -817,7 +923,7 @@ extern "C" fn prop_desktop_width(
     out: *mut Value,
     _err: *mut *mut c_char,
 ) -> c_int {
-    set_int_out(out, system_context().screen_size.0 as i64);
+    set_int_out(out, effective_desktop_size(&system_context()).0 as i64);
     0
 }
 
@@ -826,7 +932,7 @@ extern "C" fn prop_desktop_height(
     out: *mut Value,
     _err: *mut *mut c_char,
 ) -> c_int {
-    set_int_out(out, system_context().screen_size.1 as i64);
+    set_int_out(out, effective_desktop_size(&system_context()).1 as i64);
     0
 }
 

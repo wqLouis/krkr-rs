@@ -247,6 +247,7 @@ pub fn register_visual(
 /// Fire due timers. The app's update loop calls this with a monotonic
 /// millisecond clock. Timer callbacks run synchronously on the VM thread.
 pub fn timer_poll(engine: &Tjs2Engine, now_ms: u64) {
+    layer::transition_poll(engine);
     timer::timer_poll(engine, now_ms);
 }
 

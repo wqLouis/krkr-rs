@@ -6020,6 +6020,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tjs2-sys",
+ "tvp-text",
 ]
 
 [[package]]
