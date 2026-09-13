@@ -139,7 +139,11 @@ pub(crate) fn set_layer_tjs_object(id: u32, objthis: *mut c_void) {
 }
 
 /// Look up a layer's TJS object by scene id.
-pub(crate) fn layer_tjs_object(id: u32) -> *mut c_void {
+///
+/// Public so the render crate's input bridge can retain the object and call
+/// its script `onMouseDown`/`onMouseMove`/... hit-test handlers, the way the
+/// reference layer manager routes input to the layer under the cursor.
+pub fn layer_tjs_object(id: u32) -> *mut c_void {
     LAYER_TJS_OBJECTS
         .0
         .lock()

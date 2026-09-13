@@ -74,6 +74,12 @@ pub(crate) struct BridgeState {
     prev_keys: HashSet<u32>,
     /// Cursor position the last `onMouseMove` was dispatched for.
     last_move_pos: (i32, i32),
+    /// Layer that last received `onMouseEnter` (for enter/leave edges), the
+    /// reference `LastMouseMoveSent`.
+    last_move_layer: Option<u32>,
+    /// Layer that received `onMouseDown` and therefore owns the following
+    /// `onMouseUp`/moves until release, the reference `CaptureOwner`.
+    capture_layer: Option<u32>,
 }
 
 /// The input events one frame produced, ready to dispatch to windows.
@@ -381,7 +387,217 @@ pub(crate) fn dispatch_input(
         return;
     }
     let scene = shared.0.read().expect("shared scene lock poisoned");
-    dispatch_to_windows(vm.engine.as_ref(), &scene, &events);
+    let engine = vm.engine.as_ref();
+    // The reference `tTJSNI_BaseWindow::OnMouseDown` first posts the event to
+    // the Window object, then forwards it to the draw device, which routes it
+    // to the layer under the cursor. Mirror both.
+    dispatch_to_windows(engine, &scene, &events);
+    dispatch_mouse_to_layers(engine, &scene, &events, &mut bridge);
+}
+
+/// Route mouse events to the layer under the cursor, the reference
+/// `tTVPLayerManager::PrimaryMouseMove`/`PrimaryMouseDown`/`PrimaryMouseUp`:
+/// hit-test the layer tree, fire `onMouseEnter`/`onMouseLeave` on change,
+/// `onMouseMove` with layer-local coordinates, and capture the pressed layer
+/// for the following `onMouseUp`.
+pub(crate) fn dispatch_mouse_to_layers(
+    engine: &Tjs2Engine,
+    scene: &Scene,
+    events: &FrameEvents,
+    bridge: &mut BridgeState,
+) {
+    let Some(win) = scene.windows.first() else {
+        return;
+    };
+    if !win.visible {
+        return;
+    }
+    // Drop a capture/last-hit whose layer has been removed.
+    bridge.capture_layer = bridge.capture_layer.filter(|id| scene.layer(*id).is_some());
+    bridge.last_move_layer = bridge
+        .last_move_layer
+        .filter(|id| scene.layer(*id).is_some());
+
+    let (px, py) = events.position;
+
+    // Mouse move: enter/leave edges, then the move handler.
+    if let Some((x, y)) = events.moved {
+        let hit = bridge
+            .capture_layer
+            .or_else(|| hit_test(scene, win.id, x, y));
+        if bridge.last_move_layer != hit {
+            if let Some(prev) = bridge.last_move_layer {
+                call_layer(engine, prev, "onMouseLeave", &[]);
+            }
+            if let Some(l) = hit {
+                call_layer(engine, l, "onMouseEnter", &[]);
+            }
+            bridge.last_move_layer = hit;
+        }
+        if let Some(l) = hit {
+            let (lx, ly) = layer_local(scene, l, x, y);
+            call_layer(
+                engine,
+                l,
+                "onMouseMove",
+                &[
+                    TjsValue::Integer(i64::from(lx)),
+                    TjsValue::Integer(i64::from(ly)),
+                    TjsValue::Integer(i64::from(events.shift)),
+                ],
+            );
+        }
+    }
+
+    // Mouse down: hit-test (unless captured) and remember the owner.
+    for &b in &events.button_down {
+        let l = bridge
+            .capture_layer
+            .or_else(|| hit_test(scene, win.id, px, py));
+        if let Some(l) = l {
+            let (lx, ly) = layer_local(scene, l, px, py);
+            call_layer(
+                engine,
+                l,
+                "onMouseDown",
+                &[
+                    TjsValue::Integer(i64::from(lx)),
+                    TjsValue::Integer(i64::from(ly)),
+                    TjsValue::Integer(b as i64),
+                    TjsValue::Integer(i64::from(events.shift)),
+                ],
+            );
+            bridge.capture_layer = Some(l);
+        }
+    }
+
+    // Mouse up: deliver to the capture owner, then release it.
+    for &b in &events.button_up {
+        if let Some(l) = bridge
+            .capture_layer
+            .or_else(|| hit_test(scene, win.id, px, py))
+        {
+            let (lx, ly) = layer_local(scene, l, px, py);
+            call_layer(
+                engine,
+                l,
+                "onMouseUp",
+                &[
+                    TjsValue::Integer(i64::from(lx)),
+                    TjsValue::Integer(i64::from(ly)),
+                    TjsValue::Integer(b as i64),
+                    TjsValue::Integer(i64::from(events.shift)),
+                ],
+            );
+        }
+        bridge.capture_layer = None;
+    }
+}
+
+/// Invoke one script method on a layer's TJS object, tolerating a missing
+/// handler (most layers implement only a few of the mouse events).
+fn call_layer(engine: &Tjs2Engine, layer_id: u32, method: &str, args: &[TjsValue]) {
+    let obj = tvp_visual::natives::layer_tjs_object(layer_id);
+    if obj.is_null() {
+        return;
+    }
+    let Ok(dv) = engine.retain_object_detached(obj) else {
+        return;
+    };
+    if let Err(e) = engine.call_member(dv.raw_id(), method, args)
+        && !e.contains("does not exist")
+    {
+        log::warn!("input bridge: layer #{layer_id}.{method} failed: {e}");
+    }
+}
+
+/// A point in the primary layer's coordinates → the layer's local
+/// coordinates (subtract each ancestor's `Rect.left/top`, the reference
+/// `FromPrimaryCoordinates`).
+fn layer_local(scene: &Scene, layer_id: u32, x: i32, y: i32) -> (i32, i32) {
+    let mut lx = x;
+    let mut ly = y;
+    let mut current = Some(layer_id);
+    while let Some(id) = current {
+        let Some(layer) = scene.layer(id) else {
+            break;
+        };
+        lx -= layer.rect.x;
+        ly -= layer.rect.y;
+        current = layer.parent;
+    }
+    (lx, ly)
+}
+
+/// The topmost hittable layer at a primary-layer point, or `None`. Mirrors
+/// the reference `GetMostFrontChildAt`: walk the tree front-to-back, clip to
+/// each ancestor rect, then test the layer itself.
+pub(crate) fn hit_test(scene: &Scene, window_id: u32, x: i32, y: i32) -> Option<u32> {
+    let win = scene.window(window_id)?;
+    for &id in win.layers.iter().rev() {
+        if let Some(hit) = hit_test_layer(scene, id, x, y) {
+            return Some(hit);
+        }
+    }
+    None
+}
+
+fn hit_test_layer(scene: &Scene, layer_id: u32, px: i32, py: i32) -> Option<u32> {
+    let layer = scene.layer(layer_id)?;
+    if !layer.visible {
+        return None;
+    }
+    let x = px - layer.rect.x;
+    let y = py - layer.rect.y;
+    if x < 0 || y < 0 || x >= layer.rect.w as i32 || y >= layer.rect.h as i32 {
+        return None;
+    }
+    for &child in layer.children.iter().rev() {
+        if let Some(hit) = hit_test_layer(scene, child, x, y) {
+            return Some(hit);
+        }
+    }
+    hit_test_self(scene, layer, x, y).then_some(layer_id)
+}
+
+/// The reference `_HitTestNoVisibleCheck` for `htMask` (`htProvince` and
+/// province images are not modelled). `hit_threshold == 0` accepts any pixel
+/// (and any no-image layer); `256` rejects everything.
+fn hit_test_self(scene: &Scene, layer: &tvp_visual::scene::LayerState, x: i32, y: i32) -> bool {
+    if layer.hit_type == 1 {
+        return false; // htProvince: no province image is tracked
+    }
+    match layer.bitmap.and_then(|id| scene.bitmap(id)) {
+        Some(bmp) => {
+            let iw = if layer.image_width > 0 {
+                layer.image_width
+            } else {
+                bmp.width
+            };
+            let ih = if layer.image_height > 0 {
+                layer.image_height
+            } else {
+                bmp.height
+            };
+            let px = x - layer.image_left;
+            let py = y - layer.image_top;
+            if px < 0 || py < 0 || px >= iw as i32 || py >= ih as i32 {
+                return false;
+            }
+            if layer.hit_threshold <= 0 {
+                return true;
+            }
+            let bx = ((px as u32) * bmp.width / iw.max(1)).min(bmp.width.saturating_sub(1));
+            let by = ((py as u32) * bmp.height / ih.max(1)).min(bmp.height.saturating_sub(1));
+            let alpha = bmp
+                .rgba
+                .get((by as usize * bmp.width as usize + bx as usize) * 4 + 3)
+                .copied()
+                .unwrap_or(0);
+            alpha as i32 >= layer.hit_threshold
+        }
+        None => layer.hit_threshold <= 0,
+    }
 }
 
 /// Recover this frame's input edges from the shared state vs the previous
@@ -650,6 +866,93 @@ mod tests {
         state.end_frame();
         let shift = shift_flags(&state);
         assert_eq!(shift, (1 << 0) | (1 << 2) | (1 << 4)); // ssShift|ssCtrl|ssRight
+    }
+
+    /// Layer hit-testing mirrors the reference `GetMostFrontChildAt`:
+    /// frontmost child wins, the layer rect clips, and `htMask` alpha is
+    /// compared against `hitThreshold`.
+    #[test]
+    fn hit_test_finds_frontmost_layer_and_respects_mask() {
+        use tvp_visual::scene::Rect;
+        let mut scene = Scene::default();
+        let win = scene.add_window("t", (200, 200));
+
+        // Background: full window, fully opaque.
+        let bg = scene.add_layer(win, None);
+        let bg_bmp = scene.add_bitmap(4, 4, vec![255u8; 4 * 4 * 4]);
+        {
+            let l = scene.layer_mut(bg).unwrap();
+            l.rect = Rect {
+                x: 0,
+                y: 0,
+                w: 200,
+                h: 200,
+            };
+            l.bitmap = Some(bg_bmp);
+            l.image_width = 200;
+            l.image_height = 200;
+            l.hit_threshold = 0;
+        }
+
+        // Button on top (50,50,40x40), all pixels opaque except (0,0).
+        let btn = scene.add_layer(win, None);
+        let mut rgba = vec![255u8; 4 * 4 * 4];
+        rgba[3] = 0; // pixel (0,0) alpha 0
+        let btn_bmp = scene.add_bitmap(4, 4, rgba);
+        {
+            let l = scene.layer_mut(btn).unwrap();
+            l.rect = Rect {
+                x: 50,
+                y: 50,
+                w: 40,
+                h: 40,
+            };
+            l.bitmap = Some(btn_bmp);
+            l.image_width = 40;
+            l.image_height = 40;
+            l.hit_threshold = 1;
+        }
+
+        // Opaque button pixel -> the button.
+        assert_eq!(hit_test(&scene, win, 60, 60), Some(btn));
+        // Transparent button pixel -> falls through to the background.
+        assert_eq!(hit_test(&scene, win, 50, 50), Some(bg));
+        // Outside everything.
+        assert_eq!(hit_test(&scene, win, 190, 190), Some(bg));
+        assert_eq!(hit_test(&scene, win, 500, 500), None);
+
+        // With no bitmap and hitThreshold 0, the layer rect itself hits.
+        let flat = scene.add_layer(win, None);
+        scene.layer_mut(flat).unwrap().rect = Rect {
+            x: 0,
+            y: 0,
+            w: 10,
+            h: 10,
+        };
+        assert_eq!(hit_test(&scene, win, 5, 5), Some(flat));
+    }
+
+    /// Layer-local coordinates subtract every ancestor offset.
+    #[test]
+    fn layer_local_subtracts_ancestors() {
+        use tvp_visual::scene::Rect;
+        let mut scene = Scene::default();
+        let win = scene.add_window("t", (200, 200));
+        let parent = scene.add_layer(win, None);
+        scene.layer_mut(parent).unwrap().rect = Rect {
+            x: 100,
+            y: 50,
+            w: 100,
+            h: 100,
+        };
+        let child = scene.add_layer(win, Some(parent));
+        scene.layer_mut(child).unwrap().rect = Rect {
+            x: 10,
+            y: 20,
+            w: 30,
+            h: 30,
+        };
+        assert_eq!(layer_local(&scene, child, 130, 90), (20, 20));
     }
 
     /// Full end-to-end dispatch with a *stub* script window (no real game):
