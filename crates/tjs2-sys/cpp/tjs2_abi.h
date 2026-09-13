@@ -32,6 +32,12 @@ typedef void (*tjs2_log_cb)(int level, const char *msg, void *user);
 #define TJS2_VAL_OBJECT 4
 #define TJS2_VAL_ARRAY 5
 #define TJS2_VAL_RETAINED 6
+#define TJS2_VAL_OCTET 7
+/* TJS `null`: an object value with no object pointer (tvtObject with
+ * Object == nullptr). Distinct from TJS2_VAL_VOID (no value) and from
+ * TJS2_VAL_OBJECT with a zero handle (an object whose handle was not
+ * marshaled). */
+#define TJS2_VAL_NULL 8
 
 typedef struct tjs2_value_id_t *tjs2_value_id;
 
@@ -39,11 +45,16 @@ typedef struct {
     int type;
     long long integer;
     double real;
-    /* UTF-8 string; owned by the engine, valid until the next engine call. */
+    /* UTF-8 string; owned by the engine, valid until the next engine call.
+     * TJS2_VAL_OCTET: raw binary data (may contain NUL); `array_count` is its
+     * byte length. Also owned by the engine/caller for the duration of the
+     * call, exactly like `string`. */
     const char *string;
     /* TJS2_VAL_ARRAY: `count` NUL-terminated UTF-8 strings (owned by the
      * caller, valid until the callback returns). */
     const char **array;
+    /* TJS2_VAL_ARRAY: element count. TJS2_VAL_OCTET: byte length of
+     * `string`. */
     int array_count;
     /* TJS2_VAL_RETAINED: a value retained via tjs2_retain_value.
      * TJS2_VAL_OBJECT: the raw iTJSDispatch2* of the object argument (an

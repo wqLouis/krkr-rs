@@ -220,8 +220,63 @@ fn parse_i64_or_f64(s: &str) -> Option<i64> {
         .or_else(|| t.parse::<f64>().ok().map(|f| f.trunc() as i64))
 }
 
+/// C `atoi`: skip leading ASCII whitespace, accept an optional sign, then
+/// consume the longest run of decimal digits. Returns 0 when no digit
+/// follows (exactly like `atoi`), so a present-but-garbage value yields 0
+/// rather than a parse error. Overflow clamps instead of wrapping (the C
+/// behavior is undefined there).
+fn atoi(s: &str) -> i64 {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let negative = match bytes.get(i) {
+        Some(b'-') => {
+            i += 1;
+            true
+        }
+        Some(b'+') => {
+            i += 1;
+            false
+        }
+        _ => false,
+    };
+    let start = i;
+    let mut magnitude: i128 = 0;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        magnitude = (magnitude * 10 + (bytes[i] - b'0') as i128).min(i64::MAX as i128 + 1);
+        i += 1;
+    }
+    if i == start {
+        return 0;
+    }
+    let magnitude = magnitude.min(i64::MAX as i128);
+    if negative {
+        -(magnitude as i64)
+    } else {
+        magnitude as i64
+    }
+}
+
+/// C `atof`: parse the longest numeric prefix of `s` (leading whitespace
+/// ignored), returning 0.0 when there is none. `atoi`/`atof` both stop at
+/// the first non-numeric byte, so `"42abc"` is 42 and `"1.5x"` is 1.5.
+fn atof(s: &str) -> f64 {
+    let t = s.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    let mut end = t.len();
+    while end > 0 {
+        if let Ok(v) = t[..end].parse::<f64>() {
+            return v;
+        }
+        end = t[..end].char_indices().next_back().map_or(0, |(i, _)| i);
+    }
+    0.0
+}
+
 /// `atoi` on a JSON value: numbers parse directly (floats truncate toward
-/// zero), strings go through [`parse_i64_or_f64`], anything else is `None`.
+/// zero), strings go through the C `atoi` prefix parser ([`atoi`]), anything
+/// else is `None`.
 pub(crate) fn value_to_i64(value: &Value) -> Option<i64> {
     match value {
         Value::Number(n) => {
@@ -233,16 +288,17 @@ pub(crate) fn value_to_i64(value: &Value) -> Option<i64> {
             }
             n.as_f64().map(|f| f.trunc() as i64)
         }
-        Value::String(s) => parse_i64_or_f64(s),
+        Value::String(s) => Some(atoi(s)),
         _ => None,
     }
 }
 
-/// `atof` on a JSON value.
+/// `atof` on a JSON value: numbers pass through, strings go through the C
+/// `atof` prefix parser ([`atof`]).
 pub(crate) fn value_to_f64(value: &Value) -> Option<f64> {
     match value {
         Value::Number(n) => n.as_f64(),
-        Value::String(s) => s.trim().parse().ok(),
+        Value::String(s) => Some(atof(s)),
         _ => None,
     }
 }

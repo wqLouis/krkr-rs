@@ -131,12 +131,32 @@ void variant_to_value(tjs2_engine *e, const TJS::tTJSVariant &v,
             break;
         }
         case tvtObject:
-            out->type = TJS2_VAL_OBJECT;
+            // TJS `null` is an object with a null Object pointer; keep it
+            // distinct from a real object and from void.
+            out->type = v.AsObjectNoAddRef() ? TJS2_VAL_OBJECT : TJS2_VAL_NULL;
             break;
+        case tvtOctet: {
+            // Raw binary data. std::string can carry embedded NULs, so the
+            // bytes stay valid until the next engine call (same lifetime as
+            // the UTF-8 string results). `array_count` carries the length.
+            TJS::tTJSVariantOctet *oct = v.AsOctetNoAddRef();
+            if(oct) {
+                e->last_string.assign(
+                    reinterpret_cast<const char *>(oct->GetData()),
+                    oct->GetLength());
+                out->array_count = (int)oct->GetLength();
+            } else {
+                e->last_string.clear();
+                out->array_count = 0;
+            }
+            out->string = e->last_string.data();
+            out->type = TJS2_VAL_OCTET;
+            break;
+        }
         default:
-            // octets etc. cross the boundary as opaque handles too, but are
-            // not retainable (no object closure behind them).
-            out->type = TJS2_VAL_OBJECT;
+            // No other variant type exists; keep the ABI total rather than
+            // misclassifying an unknown value as an object.
+            out->type = TJS2_VAL_VOID;
             break;
     }
 }
@@ -152,10 +172,11 @@ char *make_error_message(const TJS::eTJS &e) {
         std::memcpy(buf, msg.c_str(), msg.size() + 1);
         return buf;
     } catch(...) {
-        char *buf = (char *)malloc(8);
+        // "TJS error" is 10 bytes including the NUL terminator.
+        char *buf = (char *)malloc(10);
         if(!buf)
             return nullptr;
-        std::memcpy(buf, "TJS error", 10); // includes NUL
+        std::memcpy(buf, "TJS error", 10);
         return buf;
     }
 }
@@ -262,13 +283,36 @@ void variant_to_value_one(tjs2_engine *e, const TJS::tTJSVariant &var,
             // several object arguments (e.g. Layer.drawPolygon(app, points));
             // last_object only remembers the last one, so each argument
             // records its own handle for tjs2_retain_value.
-            out->retained =
-                reinterpret_cast<tjs2_value_id>(var.AsObjectNoAddRef());
-            out->type = TJS2_VAL_OBJECT;
+            if(var.AsObjectNoAddRef()) {
+                out->retained =
+                    reinterpret_cast<tjs2_value_id>(var.AsObjectNoAddRef());
+                out->type = TJS2_VAL_OBJECT;
+            } else {
+                // TJS `null` (tvtObject with a null Object pointer) must not
+                // masquerade as a handle-less object, or retaining it would
+                // fall back to last_object and retain the wrong value.
+                out->retained = nullptr;
+                out->type = TJS2_VAL_NULL;
+            }
             break;
+        case tvtOctet: {
+            // Raw binary data; `storage` keeps the bytes alive until the
+            // callback returns, `array_count` carries the length.
+            TJS::tTJSVariantOctet *oct = var.AsOctetNoAddRef();
+            if(oct) {
+                storage.assign(
+                    reinterpret_cast<const char *>(oct->GetData()),
+                    oct->GetLength());
+                out->string = storage.data();
+                out->array_count = (int)oct->GetLength();
+            }
+            out->type = TJS2_VAL_OCTET;
+            break;
+        }
         default:
-            // objects/octets cross the boundary as opaque handles
-            out->type = TJS2_VAL_OBJECT;
+            // No other variant type exists; keep the ABI total rather than
+            // misclassifying an unknown value as an object.
+            out->type = TJS2_VAL_VOID;
             break;
     }
 }
@@ -324,6 +368,39 @@ void value_to_variant(tjs2_engine *e, const tjs2_value *in, TJS::tTJSVariant *ou
             e->retained.erase(it);
             break;
         }
+        case TJS2_VAL_OCTET: {
+            const tjs_uint8 *data =
+                reinterpret_cast<const tjs_uint8 *>(in->string);
+            tjs_uint len = in->array_count > 0 ? (tjs_uint)in->array_count : 0;
+            TJS::tTJSVariantOctet *oct = TJS::TJSAllocVariantOctet(data, len);
+            *out = oct; // AddRefs (or sets an empty octet for null)
+            if(oct)
+                oct->Release(); // transfer the allocation reference
+            break;
+        }
+        case TJS2_VAL_OBJECT: {
+            // A raw object handle can be reconstructed when present (native
+            // arguments marshal it in `retained`); a handle-less object
+            // (eval/exec results, synthetic TjsValue::Object) is resolved
+            // against the engine's last object-valued result, like
+            // resolve_value_variant does.
+            if(in->retained) {
+                TJS::iTJSDispatch2 *obj =
+                    reinterpret_cast<TJS::iTJSDispatch2 *>(in->retained);
+                *out = TJS::tTJSVariant(obj, obj);
+            } else if(e && e->last_object.Type() == TJS::tvtObject) {
+                *out = e->last_object;
+            } else {
+                throw TJS::eTJSError(ttstr(TJS_W(
+                    "object value carries no handle and no object result is "
+                    "available")));
+            }
+            break;
+        }
+        case TJS2_VAL_NULL:
+            // TJS `null`: a tvtObject with a null Object pointer.
+            *out = (TJS::iTJSDispatch2 *)nullptr;
+            break;
         case TJS2_VAL_ARRAY: {
             TJS::iTJSDispatch2 *arr = TJS::TJSCreateArrayObject();
             if(in->array && in->array_count > 0) {
@@ -628,6 +705,17 @@ class tjs2_native_instance : public TJS::tTJSNativeInstance {
     void *native_ptr;
     bool valid;
 
+    // Release the Rust payload exactly once. Called from Invalidate() (at
+    // finalize) and from the destructor; the second call is a no-op.
+    void release_payload() {
+        if(valid) {
+            if(destroy && native_ptr)
+                destroy(engine, native_ptr);
+            native_ptr = nullptr;
+            valid = false;
+        }
+    }
+
 public:
     tjs2_native_instance(tjs2_engine *e,
                          tjs2_native_create_instance_fn create,
@@ -637,19 +725,26 @@ public:
         valid = true;
     }
 
-    ~tjs2_native_instance() override {
-        if(valid && destroy && native_ptr) {
-            destroy(engine, native_ptr);
-            native_ptr = nullptr;
-            valid = false;
-        }
+    ~tjs2_native_instance() override { release_payload(); }
+
+    // Called by tTJSCustomObject::Finalize (tjsObject.cpp:389-405) before
+    // the object's members are deleted. Reference native instances override
+    // this to drop their resources (e.g. EventIntf.cpp:1032 stops a timer),
+    // so a finalized object no longer dispatches into a live payload. We
+    // release the Rust payload here; any later method/property access
+    // resolves to a null payload and is rejected (see the GetNativePtr()
+    // checks in the dispatchers), instead of touching freed memory.
+    void Invalidate() override {
+        release_payload();
+        inherited::Invalidate();
     }
 
-    // Called by the VM on finalize; the Rust payload stays alive until the
-    // destructor runs (Destruct -> delete this).
-    void Invalidate() override { inherited::Invalidate(); }
-
-    void *GetNativePtr() const { return native_ptr; }
+    // Null once the object has been finalized/invalidated, so the
+    // dispatchers can reject calls on finalized objects instead of handing
+    // Rust a payload that has already been destroyed. Also null if the Rust
+    // create callback returned null.
+    void *GetNativePtr() const { return valid ? native_ptr : nullptr; }
+    bool IsValid() const { return valid; }
 };
 
 // Dispatch an instance method call to the Rust callback. The instance payload
@@ -680,6 +775,9 @@ tjs_error tjs2_dispatch_native_instance_method(
 
         void *instance =
             static_cast<tjs2_native_instance *>(native)->GetNativePtr();
+        if(!instance)
+            throw TJS::eTJSError(ttstr(TJS_W(
+                "native instance method called on an invalidated object")));
 
         std::vector<tjs2_value> argv;
         std::vector<std::string> arg_storage;
@@ -801,6 +899,9 @@ tjs_error tjs2_dispatch_native_instance_property_get(
 
         void *instance =
             static_cast<tjs2_native_instance *>(native)->GetNativePtr();
+        if(!instance)
+            throw TJS::eTJSError(ttstr(TJS_W(
+                "native instance property read on an invalidated object")));
 
         tjs2_value out;
         out.type = TJS2_VAL_VOID;
@@ -857,6 +958,9 @@ tjs_error tjs2_dispatch_native_instance_property_set(
 
         void *instance =
             static_cast<tjs2_native_instance *>(native)->GetNativePtr();
+        if(!instance)
+            throw TJS::eTJSError(ttstr(TJS_W(
+                "native instance property write on an invalidated object")));
 
         tjs2_value value;
         std::string storage;
@@ -915,54 +1019,74 @@ tjs_error tjs2_native_instance_constructor_dispatch::FuncCall(
     if(membername)
         return inherited::FuncCall(flag, membername, hint, result, numparams,
                                    param, objthis);
-    if(!objthis)
-        throw TJS::eTJSError(ttstr(TJS_W(
-            "native instance constructor called without an object")));
-
     tjs2_engine *e = this->engine;
-    TJS::iTJSNativeInstance *native = nullptr;
-    tjs_error hr = objthis->NativeInstanceSupport(TJS_NIS_GETINSTANCE,
-                                                  classid, &native);
-    if(TJS_FAILED(hr) || !native) {
-        // Script-subclass object: create + register the native instance
-        // (reference: TJS_GET_NATIVE_INSTANCE inside the constructor).
-        native = cls->NewInstance();
-        objthis->NativeInstanceSupport(TJS_NIS_REGISTER, classid, &native);
-    }
-    void *instance =
-        static_cast<tjs2_native_instance *>(native)->GetNativePtr();
+    try {
+        if(result)
+            result->Clear();
+        if(!objthis)
+            throw TJS::eTJSError(ttstr(TJS_W(
+                "native instance constructor called without an object")));
 
-    std::vector<tjs2_value> argv;
-    std::vector<std::string> arg_storage;
-    args_to_values(e, numparams, param, argv, arg_storage);
+        TJS::iTJSNativeInstance *native = nullptr;
+        tjs_error hr = objthis->NativeInstanceSupport(TJS_NIS_GETINSTANCE,
+                                                      classid, &native);
+        if(TJS_FAILED(hr) || !native) {
+            // Script-subclass object: create + register the native instance
+            // (reference: TJS_GET_NATIVE_INSTANCE inside the constructor,
+            // tjsNative.h:368-381). Check both the allocation and the
+            // registration; a failure must not leave a null/absent instance
+            // behind for the payload lookup below.
+            TJS::iTJSNativeInstance *created = cls->NewInstance();
+            if(!created)
+                throw TJS::eTJSError(
+                    ttstr(TJS_W("failed to create native instance")));
+            hr = objthis->NativeInstanceSupport(TJS_NIS_REGISTER, classid,
+                                                &created);
+            if(TJS_FAILED(hr))
+                throw TJS::eTJSError(
+                    ttstr(TJS_W("failed to register native instance")));
+            native = created;
+        }
+        void *instance =
+            static_cast<tjs2_native_instance *>(native)->GetNativePtr();
+        if(!instance)
+            throw TJS::eTJSError(ttstr(TJS_W(
+                "native instance constructor called on an invalidated "
+                "object")));
 
-    tjs2_value out;
-    out.type = TJS2_VAL_VOID;
-    out.integer = 0;
-    out.real = 0.0;
-    out.string = nullptr;
-    out.array = nullptr;
-    out.array_count = 0;
-    out.retained = nullptr;
+        std::vector<tjs2_value> argv;
+        std::vector<std::string> arg_storage;
+        args_to_values(e, numparams, param, argv, arg_storage);
 
-    char *out_error = nullptr;
-    int rc = fn(e, instance, (int)numparams,
-                argv.empty() ? nullptr : argv.data(), &out, &out_error,
-                (void *)objthis);
-    if(rc != 0) {
-        std::string msg =
-            out_error ? out_error
-                      : "native instance constructor reported an error";
-        if(out_error)
-            tjs2_free_string(out_error);
-        throw TJS::eTJSError(ttstr(utf8_to_u16(msg.c_str()).c_str()));
+        tjs2_value out;
+        out.type = TJS2_VAL_VOID;
+        out.integer = 0;
+        out.real = 0.0;
+        out.string = nullptr;
+        out.array = nullptr;
+        out.array_count = 0;
+        out.retained = nullptr;
+
+        char *out_error = nullptr;
+        int rc = fn(e, instance, (int)numparams,
+                    argv.empty() ? nullptr : argv.data(), &out, &out_error,
+                    (void *)objthis);
+        if(rc != 0) {
+            std::string msg =
+                out_error ? out_error
+                          : "native instance constructor reported an error";
+            if(out_error)
+                tjs2_free_string(out_error);
+            throw TJS::eTJSError(ttstr(utf8_to_u16(msg.c_str()).c_str()));
+        }
+        if(result) {
+            value_to_variant(e, &out, result);
+        } else {
+            consume_retained_if_discarded(e, out);
+        }
+        return TJS_S_OK;
     }
-    if(result) {
-        value_to_variant(e, &out, result);
-    } else {
-        consume_retained_if_discarded(e, out);
-    }
-    return TJS_S_OK;
+    TJS_CONVERT_TO_TJS_EXCEPTION
 }
 
 // RAII holder for the creation reference of a freshly built native class:
@@ -1049,8 +1173,10 @@ static bool resolve_value_variant(tjs2_engine *e, const tjs2_value *v,
 extern "C" {
 
 tjs2_engine *tjs2_create(void) {
-    ensure_spdlog_loggers();
     try {
+        // May throw (logger registration). Keep it inside the try so no C++
+        // exception can cross the C ABI boundary.
+        ensure_spdlog_loggers();
         tjs2_engine *e = new (std::nothrow) tjs2_engine;
         if(!e)
             return nullptr;
@@ -1076,13 +1202,19 @@ void tjs2_destroy(tjs2_engine *e) {
         return;
     try {
         e->inner->Shutdown();
+        // Drop retained values, the last-object slot and the registered
+        // classes while the VM is still alive: their releases/destructors
+        // may touch global VM state that ~tTJS frees. (The global object's
+        // refs were already dropped by Shutdown's Global->Clear().)
+        e->retained.clear();
+        e->last_object.Clear();
+        for(TJS::iTJSDispatch2 *cls : e->native_classes)
+            cls->Release();
+        e->native_classes.clear();
+        e->native_class_names.clear();
         e->inner->Release(); // refcounted; ~tTJS is protected
     } catch(...) {
     }
-    // Release the classes we registered (the global object's refs were
-    // dropped by Shutdown's Global->Clear()).
-    for(TJS::iTJSDispatch2 *cls : e->native_classes)
-        cls->Release();
     delete e;
 }
 
@@ -1253,8 +1385,10 @@ int tjs2_register_native_class_ex(tjs2_engine *e, const char *class_name_utf8,
         e->native_class_names.push_back(name8);
         TJS::tTJSVariant val(cls);
         holder.dispose();
-        global->PropSet(TJS_MEMBERENSURE | TJS_IGNOREPROP, name16.c_str(),
-                        nullptr, &val, global);
+        tjs_error hr = global->PropSet(TJS_MEMBERENSURE | TJS_IGNOREPROP,
+                                       name16.c_str(), nullptr, &val, global);
+        if(TJS_FAILED(hr))
+            return -6;
         return 0;
     } catch(...) {
         return -4;
@@ -1380,8 +1514,10 @@ int tjs2_register_native_class_instance(
         e->native_class_names.push_back(name8);
         TJS::tTJSVariant val(cls);
         holder.dispose();
-        global->PropSet(TJS_MEMBERENSURE | TJS_IGNOREPROP, name16.c_str(),
-                        nullptr, &val, global);
+        tjs_error hr = global->PropSet(TJS_MEMBERENSURE | TJS_IGNOREPROP,
+                                       name16.c_str(), nullptr, &val, global);
+        if(TJS_FAILED(hr))
+            return -6;
         return 0;
     } catch(...) {
         return -4;
@@ -1498,12 +1634,17 @@ tjs2_value_id tjs2_retain_object(void *engine, void *obj) {
     tjs2_engine *e = (tjs2_engine *)engine;
     if(!e || !obj)
         return nullptr;
-    uintptr_t id = e->next_retained_id++;
-    if(id == 0)
-        id = e->next_retained_id++;
-    e->retained.emplace(id, TJS::tTJSVariant((TJS::iTJSDispatch2 *)obj,
-                                             (TJS::iTJSDispatch2 *)obj));
-    return (tjs2_value_id)id;
+    try {
+        uintptr_t id = e->next_retained_id++;
+        if(id == 0)
+            id = e->next_retained_id++;
+        e->retained.emplace(id, TJS::tTJSVariant((TJS::iTJSDispatch2 *)obj,
+                                                 (TJS::iTJSDispatch2 *)obj));
+        return (tjs2_value_id)id;
+    } catch(...) {
+        // Never let a C++ exception (e.g. bad_alloc) cross the C ABI.
+        return nullptr;
+    }
 }
 
 // Diagnostic: the number of entries currently in the retained-value map.
@@ -1743,6 +1884,15 @@ int tjs2_prop_get(void *engine, tjs2_value_id id, const char *membername,
     } catch(const TJS::eTJS &err) {
         if(out_error)
             *out_error = make_error_message(err);
+        return 1;
+    } catch(const std::exception &err) {
+        if(out_error) {
+            std::string m = std::string("C++ exception: ") + err.what();
+            char *buf = (char *)malloc(m.size() + 1);
+            if(buf)
+                std::memcpy(buf, m.c_str(), m.size() + 1);
+            *out_error = buf;
+        }
         return 1;
     } catch(...) {
         if(out_error)

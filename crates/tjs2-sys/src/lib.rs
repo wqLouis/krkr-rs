@@ -23,6 +23,14 @@ pub const VAL_STRING: c_int = 3;
 pub const VAL_OBJECT: c_int = 4;
 pub const VAL_ARRAY: c_int = 5;
 pub const VAL_RETAINED: c_int = 6;
+/// Raw binary data (C++ `tvtOctet`). For values produced by the engine the
+/// bytes live in `string` and the length in `array_count`; native callbacks
+/// read them with [`Value::octet_bytes`].
+pub const VAL_OCTET: c_int = 7;
+/// TJS `null`: an object value with no object pointer (`tvtObject` with
+/// `Object == nullptr`), distinct from [`VAL_VOID`] and from [`VAL_OBJECT`]
+/// with a zero handle.
+pub const VAL_NULL: c_int = 8;
 
 /// Callback for console output / logs from the VM. `msg` is UTF-8 and only
 /// valid for the duration of the call.
@@ -167,6 +175,28 @@ impl Value {
             self.retained as *mut c_void
         } else {
             ptr::null_mut()
+        }
+    }
+
+    /// Raw octet bytes of a `VAL_OCTET` value, or `None` for any other type.
+    ///
+    /// `array_count` is the byte length (the `VAL_OCTET` counterpart of the
+    /// string length). An empty octet yields `None` because the engine cannot
+    /// carry a zero-length payload pointer.
+    ///
+    /// # Safety
+    /// The bytes are owned by the engine (or by the caller for the duration
+    /// of the callback) and are only valid while the value is in scope — do
+    /// not retain the returned slice past the callback that received it.
+    pub unsafe fn octet_bytes(&self) -> Option<&[u8]> {
+        if self.ty == VAL_OCTET && !self.string.is_null() && self.array_count > 0 {
+            // SAFETY: the caller upholds the lifetime contract above; the
+            // pointer is non-null and `array_count` bytes are readable.
+            Some(unsafe {
+                std::slice::from_raw_parts(self.string as *const u8, self.array_count as usize)
+            })
+        } else {
+            None
         }
     }
 }
@@ -1155,6 +1185,15 @@ unsafe fn take_value(v: *const Value) -> TjsValue {
             TjsValue::String(s)
         }
         VAL_STRING => TjsValue::String(String::new()),
+        // The safe `TjsValue` surface has no octet variant (adding one would
+        // be a breaking API change for the whole workspace). Raw native
+        // callbacks read octet arguments through `Value::octet_bytes`; an
+        // octet returned by eval/exec is surfaced as an opaque Object, like
+        // before this type existed.
+        VAL_OCTET => TjsValue::Object,
+        // TJS `null` is still an object to the safe wrapper (its `object_handle`
+        // is null).
+        VAL_NULL => TjsValue::Object,
         _ => TjsValue::Object,
     }
 }
@@ -1999,6 +2038,45 @@ var ra = a.get(); var rb = b.get();",
         );
     }
 
+    #[test]
+    fn invalidated_native_instance_releases_payload_and_stops_dispatching() {
+        let _vm_lock = vm_lock();
+        COUNTER_CREATED.store(0, std::sync::atomic::Ordering::SeqCst);
+        COUNTER_DESTROYED.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        let e = Tjs2Engine::new().unwrap();
+        e.register_native_class_instance(&counter_builder())
+            .unwrap();
+        // `var m = c.inc` stores the method closure with ObjThis = c, so it
+        // keeps `c` alive across `invalidate c`. Invalidate runs the native
+        // instance's Invalidate() -> Rust destroy at finalize time.
+        e.exec_script(
+            "var c = new Counter(); c.inc(); var m = c.inc; invalidate c;",
+            "test",
+        )
+        .unwrap();
+        assert_eq!(
+            COUNTER_DESTROYED.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "invalidate must release the native payload at finalize time"
+        );
+        // The object is still alive (m holds a reference) but its payload is
+        // gone. Calling the closure must raise a catchable TJS error rather
+        // than dispatch into freed memory.
+        let err = e.exec_script("m();", "test").unwrap_err();
+        assert!(
+            err.to_string().contains("invalidated"),
+            "expected an invalidated-instance error, got: {err}"
+        );
+        // The payload was destroyed exactly once (no destructor double free).
+        assert_eq!(
+            COUNTER_DESTROYED.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "payload must be destroyed exactly once"
+        );
+        // Dropping the engine with `c`/`m` still alive must not crash.
+    }
+
     // -------------------------------------------------------------------
     // retained values (function objects)
     // -------------------------------------------------------------------
@@ -2576,6 +2654,8 @@ var ra = a.get(); var rb = b.get();",
                 VAL_INTEGER => 100 + a.integer,
                 VAL_STRING => 200 + a.object_handle().is_null() as i64,
                 VAL_OBJECT => 300 + a.object_handle().is_null() as i64,
+                VAL_NULL => 500,
+                VAL_OCTET => 600,
                 _ => 400,
             }
         };
@@ -2784,6 +2864,25 @@ var ra = a.get(); var rb = b.get();",
         assert_eq!(e.eval("ci", "test").unwrap(), TjsValue::Integer(105));
         assert_eq!(e.eval("cs", "test").unwrap(), TjsValue::Integer(201));
         // object: 300 + (handle is null ? 1 : 0) => handle present => 300
+        assert_eq!(e.eval("co", "test").unwrap(), TjsValue::Integer(300));
+    }
+
+    #[test]
+    fn null_object_arg_is_distinct_from_void_and_object() {
+        let _vm_lock = vm_lock();
+        let e = Tjs2Engine::new().unwrap();
+        e.register_native_class(&arg_builder()).unwrap();
+        // TJS `null` is `tvtObject` with Object == nullptr: it must not be
+        // reported as VAL_OBJECT with a zero handle (which would make
+        // retain_object_arg fall back to last_object and keep the wrong
+        // object), nor as void.
+        e.exec_script(
+            "var cn = ArgNatives.classify(null); \
+             var co = ArgNatives.classify(%[k: 1]);",
+            "test",
+        )
+        .unwrap();
+        assert_eq!(e.eval("cn", "test").unwrap(), TjsValue::Integer(500));
         assert_eq!(e.eval("co", "test").unwrap(), TjsValue::Integer(300));
     }
 
@@ -3035,6 +3134,118 @@ var ra = a.get(); var rb = b.get();",
         assert_eq!(
             LAST_OBJTHIS.load(std::sync::atomic::Ordering::SeqCst) as i64,
             ob
+        );
+    }
+
+    // --- octets ---------------------------------------------------------
+
+    /// `OctetNatives.make()` — builds a real TJS octet (4 bytes, including a
+    /// NUL and a high byte) and returns it as a retained value; the C++ side
+    /// converts the retention into a `tvtOctet`.
+    extern "C" fn octet_make(
+        engine: *mut c_void,
+        _argc: c_int,
+        _argv: *const Value,
+        out: *mut Value,
+        _out_error: *mut *mut c_char,
+    ) -> c_int {
+        const BYTES: [u8; 4] = [0x00, 0x01, 0x02, 0xFF];
+        let ffi = Value {
+            ty: VAL_OCTET,
+            integer: 0,
+            real: 0.0,
+            string: BYTES.as_ptr() as *const c_char,
+            array: ptr::null(),
+            array_count: BYTES.len() as c_int,
+            retained: 0,
+        };
+        // SAFETY: engine is a live engine; the C++ side copies the bytes
+        // into a refcounted tTJSVariantOctet during the call.
+        let id = unsafe { tjs2_retain_value(engine as *mut Engine, &ffi) };
+        if id.is_null() {
+            return 1;
+        }
+        // SAFETY: out is a valid return slot; the C++ side consumes the
+        // retention when it converts the native result.
+        unsafe {
+            (*out).ty = VAL_RETAINED;
+            (*out).integer = 0;
+            (*out).real = 0.0;
+            (*out).string = ptr::null();
+            (*out).array = ptr::null();
+            (*out).array_count = 0;
+            (*out).retained = id as usize;
+        }
+        0
+    }
+
+    /// `OctetNatives.sum(x)` — reads a `VAL_OCTET` argument through
+    /// [`Value::octet_bytes`] and returns (sum * 1000 + length) so one
+    /// integer checks both the bytes and the length.
+    extern "C" fn octet_sum(
+        _engine: *mut c_void,
+        argc: c_int,
+        argv: *const Value,
+        out: *mut Value,
+        _out_error: *mut *mut c_char,
+    ) -> c_int {
+        if argc < 1 {
+            return 1;
+        }
+        // SAFETY: argv is valid for argc entries during the call.
+        let arg = unsafe { &*argv };
+        if arg.ty != VAL_OCTET {
+            return 1;
+        }
+        // SAFETY: the ABI guarantees the bytes live for the duration of the
+        // callback.
+        let bytes = unsafe { arg.octet_bytes() };
+        let sum: i64 = bytes.map_or(0, |b| b.iter().map(|&x| i64::from(x)).sum());
+        let len = bytes.map_or(0, |b| b.len() as i64);
+        // SAFETY: out is a valid return slot.
+        unsafe {
+            (*out).ty = VAL_INTEGER;
+            (*out).integer = sum * 1000 + len;
+            (*out).real = 0.0;
+            (*out).string = ptr::null();
+        }
+        0
+    }
+
+    fn octet_builder() -> NativeClassBuilder<'static> {
+        NativeClassBuilder {
+            name: "OctetNatives",
+            methods: vec![
+                NativeMethodDef {
+                    name: "make",
+                    f: octet_make,
+                },
+                NativeMethodDef {
+                    name: "sum",
+                    f: octet_sum,
+                },
+            ],
+            properties: vec![],
+        }
+    }
+
+    #[test]
+    fn octet_arguments_and_results_round_trip() {
+        let _vm_lock = vm_lock();
+        let e = Tjs2Engine::new().unwrap();
+        e.register_native_class(&octet_builder()).unwrap();
+        // The native-produced octet is a real TJS octet (`typeof` sees it),
+        // not an opaque object or a string.
+        assert_eq!(
+            e.eval("typeof OctetNatives.make()", "test").unwrap(),
+            TjsValue::String("Octet".into())
+        );
+        // Passing it back to a native exposes the exact bytes — the embedded
+        // NUL and 0xFF included: sum(0,1,2,255)=258, length 4 => 258004.
+        assert_eq!(
+            e.eval("OctetNatives.sum(OctetNatives.make())", "test")
+                .unwrap(),
+            TjsValue::Integer(258_004)
         );
     }
 }

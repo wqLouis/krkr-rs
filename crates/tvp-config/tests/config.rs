@@ -287,3 +287,26 @@ fn unknown_keys_round_trip() {
         Some("hello")
     );
 }
+
+// --- atoi/atof prefix parsing (C semantics) ---
+
+#[test]
+fn atoi_atof_parse_leading_numeric_prefix() {
+    let cfg = GlobalConfig::new();
+    // C atoi/atof stop at the first non-numeric byte; the JSON port must too.
+    cfg.set_string("trailing_int", "42abc");
+    cfg.set_string("trailing_real", "1.5x");
+    cfg.set_string("leading_ws", "  -12 ");
+    cfg.set_string("plus", "+7");
+    cfg.set_string("no_digits", "abc");
+    cfg.set_string("exp", "1e3zzz");
+    cfg.set_string("float_as_int", "1.9");
+    assert_eq!(cfg.get_integer("trailing_int"), 42);
+    assert_eq!(cfg.get_real("trailing_real"), 1.5);
+    assert_eq!(cfg.get_integer("leading_ws"), -12);
+    assert_eq!(cfg.get_integer("plus"), 7);
+    assert_eq!(cfg.get_integer("no_digits"), 0);
+    assert_eq!(cfg.get_real("exp"), 1000.0);
+    // atoi stops at the decimal point, unlike a float parse + truncate.
+    assert_eq!(cfg.get_integer("float_as_int"), 1);
+}
