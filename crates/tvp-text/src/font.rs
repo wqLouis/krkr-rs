@@ -7,8 +7,11 @@
 //! name* of each face inside a `.ttc` collection — which `ab_glyph` alone
 //! cannot (its `Font` trait does not expose the name table).
 
+use std::collections::HashMap;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use ab_glyph::{Font, FontVec, GlyphId, InvalidFont, PxScale, PxScaleFont, ScaleFont};
 use fontdb::{Database, Query};
@@ -68,10 +71,16 @@ impl From<InvalidFont> for FontError {
 /// `pixel_height` means a full `units_per_em` em square in pixels — the
 /// convention CJK fonts use for full-width glyph boxes.
 pub struct FontFace {
+    /// Process-unique id, assigned on construction. Used to key the glyph
+    /// atlas cache without cloning the (multi-MB, non-`Clone`) font data.
+    id: u64,
     font: FontVec,
     collection_index: u32,
     family: Option<String>,
 }
+
+/// Hands out [`FontFace::id`] values.
+static NEXT_FACE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Preferred Japanese-capable CJK sans face on this machine.
 pub(crate) const NOTO_SANS_CJK_JP: &str = "Noto Sans CJK JP";
@@ -116,13 +125,21 @@ impl FontFace {
 
     /// Load a face from raw bytes with an explicit collection index.
     pub fn from_memory_indexed(bytes: Vec<u8>, collection_index: u32) -> Result<Self, FontError> {
-        let font = FontVec::try_from_vec_and_index(bytes.clone(), collection_index)?;
+        // Parse the family name before moving the bytes into `FontVec` so the
+        // multi-MB buffer is not cloned an extra time.
         let family = family_name_of(&bytes, collection_index);
+        let font = FontVec::try_from_vec_and_index(bytes, collection_index)?;
         Ok(Self {
+            id: NEXT_FACE_ID.fetch_add(1, Ordering::Relaxed),
             font,
             collection_index,
             family,
         })
+    }
+
+    /// Process-unique id for this face (see [`FontFace::id`]).
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     /// Index of this face inside its source file (0 for plain fonts).
@@ -202,10 +219,68 @@ impl FontFace {
 impl fmt::Debug for FontFace {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FontFace")
+            .field("id", &self.id)
             .field("collection_index", &self.collection_index)
             .field("family", &self.family)
             .finish_non_exhaustive()
     }
+}
+
+/// Identifies a font-face request so resolved faces can be cached. The key is
+/// the *request*, not the resulting face: repeated `drawText` calls with the
+/// same override / default therefore share one parse.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum FaceRequest {
+    /// Auto-discover the default Japanese CJK face
+    /// ([`FontFace::discover_system_jp`]).
+    SystemJp,
+    /// Load face index 0 from a specific file (e.g. the
+    /// `KRKR_RS_SYSTEM_FONT` override).
+    Path(PathBuf),
+}
+
+impl FaceRequest {
+    /// Build a request from an optional font-file override: `Some(path)`
+    /// selects that file, `None` asks for the system JP face.
+    pub fn from_override(path: Option<PathBuf>) -> Self {
+        match path {
+            Some(path) => Self::Path(path),
+            None => Self::SystemJp,
+        }
+    }
+}
+
+/// Process-global cache of resolved faces, including negative results (so a
+/// machine without a CJK font does not rescan the filesystem on every
+/// `drawText` call).
+static FACE_CACHE: LazyLock<Mutex<HashMap<FaceRequest, Option<Arc<FontFace>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Resolve `request` to a shared font face, discovering and parsing it at most
+/// once per process.
+///
+/// `FontFace` is `Send + Sync`, so a single process-global `Arc` is shared
+/// across threads. Locking the cache across discovery is intentional: the VM
+/// is effectively serialized, and it guarantees every caller receives the
+/// *same* `Arc` (hence one stable [`FontFace::id`]) so the per-height atlas
+/// cache never duplicates a face.
+///
+/// Discovery does file IO and parses a multi-MB font, so callers must invoke
+/// this **without** holding the scene lock.
+pub fn resolve_face(request: &FaceRequest) -> Option<Arc<FontFace>> {
+    let mut cache = FACE_CACHE
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if let Some(cached) = cache.get(request) {
+        return cached.clone();
+    }
+    let resolved = match request {
+        FaceRequest::Path(path) => FontFace::from_path(path, 0).ok(),
+        FaceRequest::SystemJp => FontFace::discover_system_jp(),
+    }
+    .map(Arc::new);
+    cache.insert(request.clone(), resolved.clone());
+    resolved
 }
 
 /// Resolve the glyph id for `c`, applying the missing-glyph fallback:

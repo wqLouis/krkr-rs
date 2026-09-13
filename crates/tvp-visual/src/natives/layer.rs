@@ -59,7 +59,7 @@ use tjs2_sys::{
 };
 
 use crate::scene::{BitmapState, LayerState, Scene};
-use tvp_text::{FontFace, GlyphAtlas, LayoutOptions, layout};
+use tvp_text::{FaceRequest, GlyphAtlas, LayoutOptions, layout, resolve_face, with_cached_atlas};
 
 use super::ffi::{
     arg_bool, arg_f64, arg_i64, arg_string, error_out, instance_ref, set_int_out, set_null_out,
@@ -1510,41 +1510,53 @@ extern "C" fn layer_draw_text(
     // normal deployment situation (minimal Linux containers in particular),
     // so retain a small deterministic bitmap-font fallback rather than
     // silently dropping the game's title text.
+    //
     // `KRKR_RS_SYSTEM_FONT` as a path overrides discovery (useful for
     // hermetic CI); otherwise probe the system font database so Japanese
     // glyphs (e.g. "日本語") rasterize through `ab_glyph` instead of the
     // 5×7 checker fallback.
-    let system_face = std::env::var_os("KRKR_RS_SYSTEM_FONT")
-        .and_then(|p| FontFace::from_path(&p, 0).ok())
-        .or_else(FontFace::discover_system_jp);
-    if let Some(face) = system_face {
-        let mut atlas = GlyphAtlas::with_default_width(face, font_height);
-        let text_layout = layout(
-            &text,
-            width as f32,
-            font_height as f32,
-            &mut atlas,
-            &LayoutOptions {
-                wrap: false,
-                ..Default::default()
-            },
-        );
+    //
+    // Both the resolved face and the per-height atlas are cached process-wide
+    // (`resolve_face` / `with_cached_atlas`). Every `drawText` call used to
+    // rescan the system font database, re-parse a multi-MB font and rebuild
+    // the glyph cache; `MessageArea.charOutput` draws one character per call,
+    // so that dominated the config screen. The face is resolved once and the
+    // atlas is rasterized once per `(face, height)`.
+    let request = FaceRequest::from_override(
+        std::env::var_os("KRKR_RS_SYSTEM_FONT").map(std::path::PathBuf::from),
+    );
+    if let Some(face) = resolve_face(&request) {
+        // Layout rasterizes new glyphs; do it before taking the scene lock.
+        let text_layout = with_cached_atlas(face.clone(), font_height, |atlas| {
+            layout(
+                &text,
+                width as f32,
+                font_height as f32,
+                atlas,
+                &LayoutOptions {
+                    wrap: false,
+                    ..Default::default()
+                },
+            )
+        });
         let mut scene = context_scene_mut();
         if let Some(bitmap) = scene.bitmap_mut(bitmap_id) {
-            if shadow_level != 0 || shadow_width != 0 {
-                paint_layout(
-                    bitmap,
-                    &atlas,
-                    &text_layout,
-                    shadow_color,
-                    opa,
-                    aa,
-                    x.saturating_add(shadow_x),
-                    y.saturating_add(shadow_y),
-                    shadow_level.max(shadow_width),
-                );
-            }
-            paint_layout(bitmap, &atlas, &text_layout, color, opa, aa, x, y, 0);
+            with_cached_atlas(face, font_height, |atlas| {
+                if shadow_level != 0 || shadow_width != 0 {
+                    paint_layout(
+                        bitmap,
+                        atlas,
+                        &text_layout,
+                        shadow_color,
+                        opa,
+                        aa,
+                        x.saturating_add(shadow_x),
+                        y.saturating_add(shadow_y),
+                        shadow_level.max(shadow_width),
+                    );
+                }
+                paint_layout(bitmap, atlas, &text_layout, color, opa, aa, x, y, 0);
+            });
             bitmap.mark_dirty();
         }
     } else {
@@ -2795,6 +2807,38 @@ mod tests {
                 .chunks_exact(4)
                 .any(|pixel| pixel[3] != 0 && pixel[0] > 0 && pixel[1] == 0 && pixel[2] == 0),
             "a 0x00RRGGBB shadow color must paint red shadow pixels"
+        );
+    }
+
+    /// Regression guard for the config-screen lag: the game's
+    /// `MessageArea.charOutput` calls `drawText` once per character
+    /// (`system/MessageArea.tjs`), so a text-heavy Config screen used to
+    /// rescan the system font database, re-parse a multi-MB font and rebuild
+    /// the glyph atlas on every character (~170 ms/call in a debug build).
+    /// The process-global face + per-height atlas caches make repeated calls
+    /// reuse the parsed face and rasterized glyphs. The bound is deliberately
+    /// generous so the test stays robust on slow CI; the meaningful guard is
+    /// that 500 calls complete at all instead of taking tens of seconds.
+    #[test]
+    fn layer_draw_text_many_calls_reuse_font_cache() {
+        let env = TestEnv::new("layer-draw-text-cache");
+        env.run("var w = new Window(); var l = new Layer(w, null); l.setSize(512, 512);")
+            .unwrap();
+        let start = std::time::Instant::now();
+        env.run("for (var i = 0; i < 500; i = i + 1) l.drawText(0, i, 'あ', 0x00ffffff);")
+            .unwrap();
+        let elapsed = start.elapsed();
+        eprintln!("500 drawText calls: {elapsed:?}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "500 drawText calls must be font-cache-served, took {elapsed:?}"
+        );
+        // Every character painted something into the shared layer surface.
+        let scene = env.scene();
+        let bitmap = scene.bitmap(scene.layers[0].bitmap.unwrap()).unwrap();
+        assert!(
+            bitmap.rgba.chunks_exact(4).any(|pixel| pixel[3] != 0),
+            "drawText must paint through the shared atlas"
         );
     }
 

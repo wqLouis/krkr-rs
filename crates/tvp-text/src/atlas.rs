@@ -20,6 +20,7 @@
 //! KAG text sets are small and bounded in practice.
 
 use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use ab_glyph::{Font, PxScale, ScaleFont};
 
@@ -48,7 +49,7 @@ pub struct GlyphSlot {
 
 /// Rasterized glyph cache for one face at one pixel height.
 pub struct GlyphAtlas {
-    font: FontFace,
+    font: Arc<FontFace>,
     /// Requested pixel height (KAG font height, i.e. the em size in px).
     pixel_height: u32,
     /// The `ab_glyph` scale corresponding to `pixel_height` (see
@@ -75,7 +76,7 @@ pub struct GlyphAtlas {
 impl GlyphAtlas {
     /// Create an atlas for `font` at `pixel_height`, with a default width of
     /// 512 px.
-    pub fn with_default_width(font: FontFace, pixel_height: u32) -> Self {
+    pub fn with_default_width(font: impl Into<Arc<FontFace>>, pixel_height: u32) -> Self {
         Self::new(font, pixel_height, 512)
     }
 
@@ -83,7 +84,8 @@ impl GlyphAtlas {
     ///
     /// `atlas_width` is the fixed atlas width in pixels; the height grows on
     /// demand. `pixel_height` must be at least 1.
-    pub fn new(font: FontFace, pixel_height: u32, atlas_width: u32) -> Self {
+    pub fn new(font: impl Into<Arc<FontFace>>, pixel_height: u32, atlas_width: u32) -> Self {
+        let font = font.into();
         assert!(
             pixel_height >= 1,
             "pixel_height must be >= 1, got {pixel_height}"
@@ -232,4 +234,50 @@ impl GlyphAtlas {
     pub fn glyph_count(&self) -> usize {
         self.slots.len()
     }
+}
+
+/// Cache key: `(face id, pixel height)`. Keying by height means multiple
+/// concurrent text sizes (e.g. 12 px and 24 px) each keep their own atlas and
+/// never thrash one another.
+type AtlasKey = (u64, u32);
+
+/// Process-global glyph atlases, shared across `drawText` calls so a glyph is
+/// rasterized once per `(face, height)` for the lifetime of the process.
+///
+/// Each atlas sits behind its own `Mutex` so that building/locking an atlas
+/// for one height does not block unrelated heights; the short outer lock only
+/// looks up the `Arc`.
+static ATLAS_CACHE: LazyLock<Mutex<HashMap<AtlasKey, Arc<Mutex<GlyphAtlas>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Run `f` with the process-wide cached atlas for `(face, pixel_height)`,
+/// creating and caching it on first use.
+///
+/// The atlas grows across calls (rows are only appended and existing glyph
+/// slots stay valid; see the module docs), so repeated `drawText` calls reuse
+/// already-rasterized glyphs instead of re-parsing the font and re-rasterizing
+/// every character. Callers must keep the scene lock out of `f` if `f` can
+/// rasterize new glyphs.
+pub fn with_cached_atlas<R>(
+    face: Arc<FontFace>,
+    pixel_height: u32,
+    f: impl FnOnce(&mut GlyphAtlas) -> R,
+) -> R {
+    let key = (face.id(), pixel_height);
+    let atlas = {
+        let mut cache = ATLAS_CACHE
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        cache
+            .entry(key)
+            .or_insert_with(|| {
+                Arc::new(Mutex::new(GlyphAtlas::with_default_width(
+                    face,
+                    pixel_height,
+                )))
+            })
+            .clone()
+    };
+    let mut guard = atlas.lock().unwrap_or_else(|poison| poison.into_inner());
+    f(&mut guard)
 }

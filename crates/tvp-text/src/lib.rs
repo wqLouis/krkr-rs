@@ -54,7 +54,7 @@ pub mod font;
 pub mod layout;
 pub mod measure;
 
-pub use atlas::{GlyphAtlas, GlyphSlot};
-pub use font::{FontError, FontFace};
+pub use atlas::{GlyphAtlas, GlyphSlot, with_cached_atlas};
+pub use font::{FaceRequest, FontError, FontFace, resolve_face};
 pub use layout::{Align, GlyphRun, LayoutOptions, PlacedGlyph, TextLayout, layout};
 pub use measure::measure_width;
