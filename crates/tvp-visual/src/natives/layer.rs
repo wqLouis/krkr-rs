@@ -44,6 +44,7 @@
 //! | `setCursorPos(x,y)` / `focus()` | no-ops (input: later) |
 //! | `setCenter(x,y)`, `setAffineOffset(x,y)`, `setImagePos`, `setImageSize` | no-ops (affine: later) |
 //! | `drawText` | rasterizes into the attached scene bitmap using `tvp-text`, with a built-in fallback font |
+//! | `drawPolygon` / `drawRectangle` / `drawLine` / `drawLines` / `drawArc` / `drawBezier` / `drawBeziers` | rasterizes a `GdiPlus.Appearance`'s ordered fills/strokes into the attached scene bitmap (`natives::raster`) |
 //! | `doBoxBlur` | minimal in-place RGBA box blur over the attached scene bitmap |
 //! | `beginTransition` | queues a next-poll completion callback; interpolation remains a stub |
 //! | `affineCopy`, `stretchCopy/Pile/Blend`, `pileRect`, `piledCopy`, `operateRect/Stretch/Affine`, `light`, `stopTransition` | no-op stubs (pixel ops: later) |
@@ -64,6 +65,8 @@ use super::ffi::{
     arg_bool, arg_f64, arg_i64, arg_string, error_out, instance_ref, set_int_out, set_null_out,
     set_void_out,
 };
+use super::gdiplus::{AppearanceState, BrushKind, DrawKind};
+use super::raster::{self, blend_pixel};
 use super::{context_engine, context_scene_mut, context_scene_read};
 
 /// Native transition requests are completed on the next VM poll. This keeps
@@ -108,8 +111,10 @@ extern "C" fn layer_destroy(_engine: *mut c_void, instance: *mut c_void) {
 
 /// TJS color `0xAARRGGBB` → RGBA (straight alpha), matching the reference
 /// `argb_to_rgba` convention (see `LayerImpl.cpp` `FillRect` / the
-/// `tTVPBaseBitmap::FillRect` argb handling).
-fn argb_to_rgba(color: i64) -> [u8; 4] {
+/// `tTVPBaseBitmap::FillRect` argb handling). Shared with the GdiPlus
+/// appearance parser, whose `ARGB` colors likewise carry alpha in the high
+/// byte.
+pub(crate) fn argb_to_rgba(color: i64) -> [u8; 4] {
     let c = color as u32;
     [
         ((c >> 16) & 0xff) as u8,
@@ -1381,6 +1386,28 @@ extern "C" fn layer_get_text_height(
     0
 }
 
+/// Ensure `layer_id` has an attached bitmap at least `min_w × min_h`,
+/// allocating a transparent one (and growing the layer rect) exactly like
+/// `drawText` does. Returns the bitmap id, or `None` if the layer is gone.
+fn ensure_layer_bitmap(scene: &mut Scene, layer_id: u32, min_w: u32, min_h: u32) -> Option<u32> {
+    let (existing, w, h) = {
+        let layer = scene.layer(layer_id)?;
+        let w = layer.rect.w.max(min_w).max(1);
+        let h = layer.rect.h.max(min_h).max(1);
+        (layer.bitmap, w, h)
+    };
+    if let Some(id) = existing {
+        return Some(id);
+    }
+    let id = scene.add_bitmap(w, h, vec![0; w as usize * h as usize * 4]);
+    if let Some(layer) = scene.layer_mut(layer_id) {
+        layer.bitmap = Some(id);
+        layer.rect.w = layer.rect.w.max(w);
+        layer.rect.h = layer.rect.h.max(h);
+    }
+    Some(id)
+}
+
 /// Draw text into the layer's bitmap.  TVP layers are image surfaces, so a
 /// layer without an attached image gets a transparent bitmap sized from its
 /// rectangle (or from the text when the rectangle is still empty).  The
@@ -1440,25 +1467,10 @@ extern "C" fn layer_draw_text(
             Some(bitmap) => (bitmap.width, bitmap.height),
             None => (layer.rect.w.max(needed_w), layer.rect.h.max(needed_h)),
         };
-        let bitmap_id = match layer.bitmap {
+        let bitmap_id = match ensure_layer_bitmap(&mut scene, inst.id, needed_w, needed_h) {
             Some(id) => id,
-            None => {
-                let id = scene.add_bitmap(
-                    width.max(1),
-                    height.max(1),
-                    vec![0; width.max(1) as usize * height.max(1) as usize * 4],
-                );
-                scene
-                    .layer_mut(inst.id)
-                    .expect("layer checked above")
-                    .bitmap = Some(id);
-                id
-            }
+            None => return error_out(out_error, "Layer: layer no longer exists"),
         };
-        if let Some(layer) = scene.layer_mut(inst.id) {
-            layer.rect.w = layer.rect.w.max(width);
-            layer.rect.h = layer.rect.h.max(height);
-        }
         (bitmap_id, width.max(1), height.max(1), font_height)
     };
 
@@ -1521,6 +1533,333 @@ extern "C" fn layer_draw_text(
             paint_fallback_text(bitmap, &text, color, opa, x, y, font_height, 0);
             bitmap.mark_dirty();
         }
+    }
+    set_void_out(out);
+    0
+}
+
+// ---------------------------------------------------------------------------
+// GdiPlus `Layer.draw*` (see `super::gdiplus` and `super::raster`)
+// ---------------------------------------------------------------------------
+
+/// Read a numeric member (`Integer`/`Real`) from a retained object.
+fn member_f64(engine: &Tjs2Engine, id: tjs2_sys::Tjs2ValueId, name: &str) -> Option<f64> {
+    match engine.get_member(id, name) {
+        Ok(TjsValue::Integer(v)) => Some(v as f64),
+        Ok(TjsValue::Real(v)) => Some(v),
+        _ => None,
+    }
+}
+
+/// Parse a TJS points array (`[[x, y], ...]`) into layer-local coordinates.
+///
+/// Uses the per-argument object handle ([`Tjs2Engine::retain_object_arg`]) so
+/// the geometry array is resolved independently of any other object argument
+/// (the `drawPolygon(app, points)` case that the old last-object shortcut
+/// confused). Nested elements are descended through `get_member` +
+/// `retain_value_detached`, which the ABI's last-object slot does support once
+/// the parent id is held.
+fn parse_points(engine: &Tjs2Engine, arg: &Value) -> Vec<(f64, f64)> {
+    if arg.ty != tjs2_sys::VAL_OBJECT {
+        return Vec::new();
+    }
+    let Ok(array) = engine.retain_object_arg(arg) else {
+        return Vec::new();
+    };
+    let count = match engine.get_member(array.raw_id(), "count") {
+        Ok(TjsValue::Integer(n)) => n.max(0) as usize,
+        Ok(TjsValue::Real(n)) => n.max(0.0) as usize,
+        _ => 0,
+    };
+    let mut pts = Vec::with_capacity(count);
+    for i in 0..count {
+        if engine.get_member(array.raw_id(), &i.to_string()).is_err() {
+            continue;
+        }
+        let Ok(pair) = engine.retain_value_detached(&TjsValue::Object) else {
+            continue;
+        };
+        match (
+            member_f64(engine, pair.raw_id(), "0"),
+            member_f64(engine, pair.raw_id(), "1"),
+        ) {
+            (Some(x), Some(y)) => pts.push((x, y)),
+            _ => continue,
+        }
+    }
+    pts
+}
+
+/// Rasterize an appearance's ordered draw infos onto a path.
+///
+/// Fills run first (in append order), then strokes, mirroring the reference
+/// `drawPath` for the game's brush-then-pen construction. `allow_fill` is
+/// false for the open `drawLine`/`drawLines` methods, whose brushes are
+/// ignored.
+fn apply_appearance(
+    bitmap: &mut BitmapState,
+    pts: &[(f64, f64)],
+    closed: bool,
+    allow_fill: bool,
+    state: &AppearanceState,
+) {
+    if allow_fill {
+        for info in &state.infos {
+            if let DrawKind::Brush(brush) = info {
+                fill_brush(bitmap, pts, brush);
+            }
+        }
+    }
+    for info in &state.infos {
+        if let DrawKind::Pen { brush, width } = info {
+            stroke_brush(bitmap, pts, closed, brush, *width);
+        }
+    }
+}
+
+fn fill_brush(bitmap: &mut BitmapState, pts: &[(f64, f64)], brush: &BrushKind) {
+    match brush {
+        BrushKind::Solid(color) => raster::fill_polygon(bitmap, pts, *color),
+        BrushKind::Hatch { style, fore, back } => {
+            raster::fill_polygon_hatch(bitmap, pts, *style, *fore, *back)
+        }
+    }
+}
+
+fn stroke_brush(
+    bitmap: &mut BitmapState,
+    pts: &[(f64, f64)],
+    closed: bool,
+    brush: &BrushKind,
+    width: f64,
+) {
+    let color = match brush {
+        BrushKind::Solid(color) => *color,
+        // A hatch pen is approximated by its foreground color.
+        BrushKind::Hatch { fore, .. } => *fore,
+    };
+    raster::stroke_polyline(bitmap, pts, closed, color, width);
+}
+
+/// Shared tail for the GdiPlus draw handlers: snapshot the appearance from
+/// the first argument's object handle, ensure the layer bitmap, rasterize,
+/// and mark it dirty.
+fn draw_gdiplus_path(
+    layer_id: u32,
+    app_arg: &Value,
+    pts: &[(f64, f64)],
+    closed: bool,
+    allow_fill: bool,
+) -> Result<(), String> {
+    let state = super::gdiplus::appearance_snapshot(app_arg.object_handle()).unwrap_or_default();
+    let (min_w, min_h) = raster::bbox_size(pts);
+    let mut scene = context_scene_mut();
+    let Some(bitmap_id) = ensure_layer_bitmap(&mut scene, layer_id, min_w, min_h) else {
+        return Err("Layer: layer no longer exists".into());
+    };
+    if let Some(bitmap) = scene.bitmap_mut(bitmap_id) {
+        apply_appearance(bitmap, pts, closed, allow_fill, &state);
+        bitmap.mark_dirty();
+    }
+    Ok(())
+}
+
+/// `drawPolygon(app, points)` — closed polygon: fill with brushes, stroke
+/// with pens.
+extern "C" fn layer_draw_polygon(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    if args.len() < 2 {
+        return error_out(out_error, "Layer.drawPolygon requires (app, points)");
+    }
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let pts = parse_points(context_engine(), &args[1]);
+    if pts.len() >= 2
+        && let Err(e) = draw_gdiplus_path(inst.id, &args[0], &pts, true, true)
+    {
+        return error_out(out_error, &e);
+    }
+    set_void_out(out);
+    0
+}
+
+/// `drawRectangle(app, x, y, w, h)` — closed rect: fill + stroke.
+extern "C" fn layer_draw_rectangle(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    if args.len() < 5 {
+        return error_out(out_error, "Layer.drawRectangle requires (app, x, y, w, h)");
+    }
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let (x, y, w, h) = (
+        arg_f64(&args[1]),
+        arg_f64(&args[2]),
+        arg_f64(&args[3]),
+        arg_f64(&args[4]),
+    );
+    let pts = [(x, y), (x + w, y), (x + w, y + h), (x, y + h)];
+    if let Err(e) = draw_gdiplus_path(inst.id, &args[0], &pts, true, true) {
+        return error_out(out_error, &e);
+    }
+    set_void_out(out);
+    0
+}
+
+/// `drawLine(app, x1, y1, x2, y2)` — open segment, stroke only.
+extern "C" fn layer_draw_line(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    if args.len() < 5 {
+        return error_out(out_error, "Layer.drawLine requires (app, x1, y1, x2, y2)");
+    }
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let pts = [
+        (arg_f64(&args[1]), arg_f64(&args[2])),
+        (arg_f64(&args[3]), arg_f64(&args[4])),
+    ];
+    if let Err(e) = draw_gdiplus_path(inst.id, &args[0], &pts, false, false) {
+        return error_out(out_error, &e);
+    }
+    set_void_out(out);
+    0
+}
+
+/// `drawLines(app, points)` — open polyline, stroke only.
+extern "C" fn layer_draw_lines(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    if args.len() < 2 {
+        return error_out(out_error, "Layer.drawLines requires (app, points)");
+    }
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let pts = parse_points(context_engine(), &args[1]);
+    if pts.len() >= 2
+        && let Err(e) = draw_gdiplus_path(inst.id, &args[0], &pts, false, false)
+    {
+        return error_out(out_error, &e);
+    }
+    set_void_out(out);
+    0
+}
+
+/// `drawArc(app, x, y, w, h, start, sweep)` — elliptical arc: fill (implicitly
+/// closed) + stroke.
+extern "C" fn layer_draw_arc(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    if args.len() < 7 {
+        return error_out(
+            out_error,
+            "Layer.drawArc requires (app, x, y, w, h, startAngle, sweepAngle)",
+        );
+    }
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let pts = raster::flatten_arc(
+        arg_f64(&args[1]),
+        arg_f64(&args[2]),
+        arg_f64(&args[3]),
+        arg_f64(&args[4]),
+        arg_f64(&args[5]),
+        arg_f64(&args[6]),
+    );
+    if pts.len() >= 2
+        && let Err(e) = draw_gdiplus_path(inst.id, &args[0], &pts, false, true)
+    {
+        return error_out(out_error, &e);
+    }
+    set_void_out(out);
+    0
+}
+
+/// `drawBezier(app, x1, y1, x2, y2, x3, y3, x4, y4)` — single cubic.
+extern "C" fn layer_draw_bezier(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    if args.len() < 9 {
+        return error_out(out_error, "Layer.drawBezier requires 8 coordinates");
+    }
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let coord = |i: usize| -> (f64, f64) { (arg_f64(&args[i]), arg_f64(&args[i + 1])) };
+    let pts = raster::flatten_cubic(coord(1), coord(3), coord(5), coord(7), 24);
+    if let Err(e) = draw_gdiplus_path(inst.id, &args[0], &pts, false, true) {
+        return error_out(out_error, &e);
+    }
+    set_void_out(out);
+    0
+}
+
+/// `drawBeziers(app, points)` — `points[0]` is the start, then groups of
+/// `(control1, control2, end)`.
+extern "C" fn layer_draw_beziers(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    if args.len() < 2 {
+        return error_out(out_error, "Layer.drawBeziers requires (app, points)");
+    }
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let pts = parse_points(context_engine(), &args[1]);
+    let mut path: Vec<(f64, f64)> = pts.first().copied().into_iter().collect();
+    for chunk in pts.get(1..).unwrap_or(&[]).chunks(3) {
+        if chunk.len() < 3 {
+            break;
+        }
+        let start = *path.last().expect("path seeded above");
+        let cubic = raster::flatten_cubic(start, chunk[0], chunk[1], chunk[2], 16);
+        path.extend_from_slice(&cubic[1..]);
+    }
+    if path.len() >= 2
+        && let Err(e) = draw_gdiplus_path(inst.id, &args[0], &path, false, true)
+    {
+        return error_out(out_error, &e);
     }
     set_void_out(out);
     0
@@ -1623,35 +1962,6 @@ fn fallback_text_width(text: &str, height: u32) -> u32 {
 
 fn fallback_text_height(text: &str, height: u32) -> u32 {
     text.split('\n').count().max(1) as u32 * height.max(1)
-}
-
-/// Alpha-composite one straight-alpha pixel.  Keeping this in the visual
-/// crate makes the scene's RGBA convention explicit and avoids renderer-only
-/// drawing paths.
-fn blend_pixel(bitmap: &mut BitmapState, x: i32, y: i32, color: [u8; 4], coverage: u8, opa: u8) {
-    if x < 0 || y < 0 || x as u32 >= bitmap.width || y as u32 >= bitmap.height {
-        return;
-    }
-    let Some(i) = bitmap.pixel_offset(x as u32, y as u32) else {
-        return;
-    };
-    let alpha = (u32::from(color[3]) * u32::from(coverage) * u32::from(opa) / (255 * 255)) as u8;
-    if alpha == 0 {
-        return;
-    }
-    let inv = 255u32 - u32::from(alpha);
-    let old_a = u32::from(bitmap.rgba[i + 3]);
-    let out_a = u32::from(alpha) + old_a * inv / 255;
-    for (channel, &src_color) in color[..3].iter().enumerate() {
-        let src = u32::from(src_color);
-        let dst = u32::from(bitmap.rgba[i + channel]);
-        // Keep the scene buffer straight-alpha. This matters for antialiased
-        // text over transparent pixels: RGB must remain the requested color,
-        // not color multiplied by coverage.
-        bitmap.rgba[i + channel] =
-            ((src * u32::from(alpha) * 255 + dst * old_a * inv) / (out_a * 255)) as u8;
-    }
-    bitmap.rgba[i + 3] = out_a as u8;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1809,14 +2119,7 @@ pub(crate) fn register_layer(engine: &Tjs2Engine) -> Result<(), String> {
         "setCenter",
         "setAffineOffset",
         "drawGlyph",
-        "drawRectangle",
         "drawRectangles",
-        "drawLine",
-        "drawLines",
-        "drawPolygon",
-        "drawArc",
-        "drawBezier",
-        "drawBeziers",
         "drawClosedCurve",
         "drawClosedCurve2",
         "drawCurve",
@@ -1966,6 +2269,34 @@ pub(crate) fn register_layer(engine: &Tjs2Engine) -> Result<(), String> {
         NativeInstanceMethodDef {
             name: "drawText",
             f: layer_draw_text,
+        },
+        NativeInstanceMethodDef {
+            name: "drawPolygon",
+            f: layer_draw_polygon,
+        },
+        NativeInstanceMethodDef {
+            name: "drawRectangle",
+            f: layer_draw_rectangle,
+        },
+        NativeInstanceMethodDef {
+            name: "drawLine",
+            f: layer_draw_line,
+        },
+        NativeInstanceMethodDef {
+            name: "drawLines",
+            f: layer_draw_lines,
+        },
+        NativeInstanceMethodDef {
+            name: "drawArc",
+            f: layer_draw_arc,
+        },
+        NativeInstanceMethodDef {
+            name: "drawBezier",
+            f: layer_draw_bezier,
+        },
+        NativeInstanceMethodDef {
+            name: "drawBeziers",
+            f: layer_draw_beziers,
         },
         NativeInstanceMethodDef {
             name: "doBoxBlur",
@@ -2433,6 +2764,128 @@ mod tests {
                 .any(|pixel| pixel[3] != 0 && pixel[0] > 0 && pixel[1] == 0 && pixel[2] == 0),
             "a 0x00RRGGBB shadow color must paint red shadow pixels"
         );
+    }
+
+    /// Read an RGBA pixel from a scene bitmap.
+    fn pixel(bitmap: &crate::scene::BitmapState, x: u32, y: u32) -> [u8; 4] {
+        let i = ((y * bitmap.width + x) as usize) * 4;
+        [
+            bitmap.rgba[i],
+            bitmap.rgba[i + 1],
+            bitmap.rgba[i + 2],
+            bitmap.rgba[i + 3],
+        ]
+    }
+
+    /// A solid GdiPlus brush (`0xAARRGGBB`, alpha from the high byte) fills a
+    /// closed polygon drawn with `drawPolygon`.
+    #[test]
+    fn layer_draw_polygon_fills_with_solid_brush() {
+        let env = TestEnv::new("layer-draw-polygon");
+        env.run(
+            "var w = new Window(); var l = new Layer(w, null); l.setSize(32, 32); \
+             var app = new GdiPlus.Appearance(); app.addBrush(0xffff0000); \
+             l.drawPolygon(app, [[4,4],[28,4],[28,28],[4,28]]);",
+        )
+        .unwrap();
+        let scene = env.scene();
+        let bitmap = scene
+            .bitmap(scene.layers[0].bitmap.expect("drawPolygon allocates"))
+            .unwrap();
+        assert!(bitmap.dirty);
+        assert_eq!(pixel(bitmap, 16, 16), [255, 0, 0, 255], "solid red fill");
+    }
+
+    /// `drawPolygon(app, points)` resolves `app` and `points` independently:
+    /// the old last-object shortcut resolved `points` as the appearance, so
+    /// nothing was ever painted.
+    #[test]
+    fn layer_draw_polygon_distinguishes_app_from_points() {
+        let env = TestEnv::new("layer-draw-polygon-handles");
+        env.run(
+            "var w = new Window(); var l = new Layer(w, null); l.setSize(32, 32); \
+             var big = new GdiPlus.Appearance(); big.addBrush(0xffff0000); \
+             var bigPts = [[2,2],[30,2],[30,30],[2,30]]; \
+             l.drawPolygon(big, bigPts); \
+             var small = new GdiPlus.Appearance(); small.addBrush(0xff00ff00); \
+             var smallPts = [[10,10],[22,10],[22,22],[10,22]]; \
+             l.drawPolygon(small, smallPts);",
+        )
+        .unwrap();
+        let scene = env.scene();
+        let bitmap = scene.bitmap(scene.layers[0].bitmap.unwrap()).unwrap();
+        // The second (green) polygon overpaints the shared center; the first
+        // (red) polygon is visible in its non-overlapping corner. Both draws
+        // succeeding proves each `app` handle resolved correctly.
+        assert_eq!(pixel(bitmap, 16, 16), [0, 255, 0, 255], "green overpaint");
+        assert_eq!(pixel(bitmap, 5, 5), [255, 0, 0, 255], "red first fill");
+    }
+
+    /// `drawRectangle` fills with the brush and strokes with the pen;
+    /// `drawLine` strokes only.
+    #[test]
+    fn layer_draw_rectangle_and_line_produce_pixels() {
+        let env = TestEnv::new("layer-draw-rect-line");
+        env.run(
+            "var w = new Window(); var l = new Layer(w, null); l.setSize(40, 40); \
+             var app = new GdiPlus.Appearance(); \
+             app.addBrush(0xff00ff00); app.addPen(0xffffffff, 2); \
+             l.drawRectangle(app, 4, 4, 32, 32); \
+             var pen = new GdiPlus.Appearance(); pen.addPen(0xff0000ff, 3); \
+             l.drawLine(pen, 0, 0, 39, 39);",
+        )
+        .unwrap();
+        let scene = env.scene();
+        let bitmap = scene.bitmap(scene.layers[0].bitmap.unwrap()).unwrap();
+        // Interior is the green fill (away from the blue diagonal); the
+        // border is the white pen stroke.
+        assert_eq!(pixel(bitmap, 20, 12), [0, 255, 0, 255], "green fill");
+        assert_eq!(pixel(bitmap, 4, 20), [255, 255, 255, 255], "white stroke");
+        // The blue diagonal line paints somewhere along its path.
+        assert!(
+            bitmap
+                .rgba
+                .chunks_exact(4)
+                .any(|p| p[3] > 0 && p[2] > 200 && p[0] < 60),
+            "blue line pixels"
+        );
+    }
+
+    /// `drawLines` strokes an open polyline (brushes are ignored).
+    #[test]
+    fn layer_draw_lines_strokes_polyline() {
+        let env = TestEnv::new("layer-draw-lines");
+        env.run(
+            "var w = new Window(); var l = new Layer(w, null); l.setSize(32, 32); \
+             var app = new GdiPlus.Appearance(); \
+             app.addBrush(0xffff0000); app.addPen(0xffffffff, 2); \
+             l.drawLines(app, [[0,0],[16,16],[32,0]]);",
+        )
+        .unwrap();
+        let scene = env.scene();
+        let bitmap = scene.bitmap(scene.layers[0].bitmap.unwrap()).unwrap();
+        // The stroke paints white; the red brush must be ignored (no red
+        // pixels anywhere).
+        assert_eq!(pixel(bitmap, 0, 0), [255, 255, 255, 255], "stroke start");
+        assert!(
+            bitmap.rgba.chunks_exact(4).all(|p| p[0] == 0 || p[1] > 0),
+            "drawLines ignores brushes (no red-only fill)"
+        );
+    }
+
+    /// `drawArc` fills the implicitly-closed elliptical path.
+    #[test]
+    fn layer_draw_arc_fills_circle() {
+        let env = TestEnv::new("layer-draw-arc");
+        env.run(
+            "var w = new Window(); var l = new Layer(w, null); l.setSize(24, 24); \
+             var app = new GdiPlus.Appearance(); app.addBrush(0xff0000ff); \
+             l.drawArc(app, 2, 2, 20, 20, 0, 360);",
+        )
+        .unwrap();
+        let scene = env.scene();
+        let bitmap = scene.bitmap(scene.layers[0].bitmap.unwrap()).unwrap();
+        assert_eq!(pixel(bitmap, 12, 12), [0, 0, 255, 255], "filled circle");
     }
 
     #[test]

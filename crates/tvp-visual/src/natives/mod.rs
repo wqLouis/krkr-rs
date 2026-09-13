@@ -8,7 +8,9 @@
 pub mod bitmap;
 pub mod ffi;
 pub mod font;
+pub(crate) mod gdiplus;
 pub mod layer;
+pub(crate) mod raster;
 pub mod timer;
 pub mod window;
 
@@ -245,6 +247,7 @@ pub fn register_visual(
     bitmap::register_bitmap(engine)?;
     font::register_font(engine)?;
     timer::register_timer(engine)?;
+    gdiplus::register_gdiplus(engine)?;
     Ok(())
 }
 
@@ -317,6 +320,9 @@ pub(crate) mod tests {
                 .unwrap_or_else(|p| p.into_inner())
                 .by_name
                 .clear();
+            // Appearance state is keyed by raw object pointers; clear it so
+            // a reused address from a previous test cannot leak in.
+            super::gdiplus::reset_gdiplus_registry();
             let dir = tempfile::tempdir().expect("temp dir");
             let storage =
                 engine::Storage::mount(dir.path().to_str().unwrap()).expect("mount temp game dir");
