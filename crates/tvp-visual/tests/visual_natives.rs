@@ -265,3 +265,47 @@ fn oncecall_fires_once_and_cancels() {
     tvp_visual::timer_poll(&env.engine, 200);
     assert_eq!(env.eval_int("fired2"), 0, "cancelled callback never fires");
 }
+
+/// The in-game Config screen's `TBUTTON` toggles (`ConfigWindow.tjs`
+/// `createButton` → `ToggleOnBaseButton.create` in `SelectItem.tjs`) build a
+/// child `_check` layer with `copyFromBitmapToMainImage(file)` followed by
+/// `setSize(sheetW \ nPattern, sheetH)`. The reference sizes the main image
+/// to the bitmap *inside* `copyFromBitmapToMainImage`
+/// (`LayerIntf.cpp:2432` `AssignMainImageWithUpdate`), so the layer rect clips
+/// one 100×40 cell and `setImagePos(-100, 0)` selects pattern 1.
+///
+/// Regression: without that image-size assignment `ImageWidth` stayed 0,
+/// `setSize` grew it to the cell width, and the renderer scaled the whole
+/// 400×40 sheet into a single cell.
+#[test]
+fn tbutton_sprite_sheet_cell_setup() {
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var parent = new Layer(w, null); parent.visible = true; \
+         var check = new Layer(w, parent); \
+         var sheet = new Bitmap(400, 40); \
+         check.copyFromBitmapToMainImage(sheet); \
+         check.setSize(check.imageWidth \\ 4, check.imageHeight); \
+         check.setPos(0, 0); \
+         check.setImagePos(-(check.width * 1), 0);",
+    );
+
+    let scene = env.scene();
+    let check = &scene.layers[1];
+    assert_eq!(
+        (check.image_width, check.image_height),
+        (400, 40),
+        "copyFromBitmapToMainImage sizes the image to the full sheet"
+    );
+    assert_eq!(
+        (check.rect.w, check.rect.h),
+        (100, 40),
+        "setSize clips the layer to one cell"
+    );
+    assert_eq!(
+        (check.image_left, check.image_top),
+        (-100, 0),
+        "setButton(1) pans the sheet to the second cell"
+    );
+}

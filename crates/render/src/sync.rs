@@ -1774,6 +1774,60 @@ mod tests {
         );
     }
 
+    /// `TBUTTON` config toggle: a 400×40 four-cell sheet (cells 100×40) with
+    /// `setSize(100, 40)` + `setImageSize(400, 40)` + `setImagePos(-100, 0)`
+    /// (pattern 1). Only the second cell may be sampled — this is the
+    /// `ToggleOnBaseButton.create`/`setButton` setup (`system/SelectItem.tjs`,
+    /// `system/ConfigWindow.tjs` `createButton`). Regression: if
+    /// `copyFromBitmapToMainImage` leaves `ImageWidth` at 0, `setSize` grows
+    /// it to the cell width and the whole 400px sheet is scaled into one
+    /// cell (samples the full bitmap instead of `x = 100`).
+    #[test]
+    fn visible_image_region_selects_tbutton_sheet_cell() {
+        let layer = Rect {
+            x: 144,
+            y: 244,
+            w: 100,
+            h: 40,
+        };
+        // pattern 1 → setImagePos(-(cell width * 1), 0) = (-100, 0).
+        let (src, dest) = visible_image_region(layer, -100, 0, 400, 40, 400, 40).unwrap();
+        assert_eq!(
+            src,
+            Rect {
+                x: 100,
+                y: 0,
+                w: 100,
+                h: 40
+            }
+        );
+        assert_eq!(
+            dest,
+            Rect {
+                x: 144,
+                y: 244,
+                w: 100,
+                h: 40
+            }
+        );
+
+        // All four patterns select their own cell, never the whole sheet.
+        for (pattern, expected_x) in [(0, 0), (1, 100), (2, 200), (3, 300)] {
+            let (src, _) =
+                visible_image_region(layer, -100 * pattern, 0, 400, 40, 400, 40).unwrap();
+            assert_eq!(
+                src,
+                Rect {
+                    x: expected_x,
+                    y: 0,
+                    w: 100,
+                    h: 40
+                },
+                "pattern {pattern} must sample its own cell"
+            );
+        }
+    }
+
     /// A large image is clipped to the layer: the visible dest is the layer
     /// rect and the source is the matching region of the bitmap.
     #[test]

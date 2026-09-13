@@ -758,9 +758,18 @@ extern "C" fn layer_set_bitmap(
 }
 
 /// `copyFromBitmapToMainImage(bitmap)` — the reference copies the bitmap's
-/// pixels into the layer's main image. Our logical model attaches the
-/// bitmap to the layer, which renders identically for a full-size base image
-/// (the game's savedata header does exactly that, then `setSizeToImageSize`).
+/// pixels into the layer's main image and then calls
+/// `InternalSetImageSize(bitmap->GetWidth(), bitmap->GetHeight())`
+/// (`LayerIntf.cpp:2432` `AssignMainImageWithUpdate`). Our logical model
+/// attaches the bitmap to the layer and mirrors that image-size assignment.
+///
+/// The size assignment is required for the game's sprite-sheet buttons:
+/// `ToggleOnBaseButton.create` / `RadioOnBaseButton.create`
+/// (`system/SelectItem.tjs`) do `_check.copyFromBitmapToMainImage(file)`
+/// followed by `_check.setSize(sheetW \\ nPattern, sheetH)`. Without it the
+/// `_check` layer's `ImageWidth` is still 0, so `setSize` grows it to the
+/// *cell* width; the renderer then scales the whole sheet down into one cell
+/// instead of clipping a single frame.
 extern "C" fn layer_copy_from_bitmap_to_main_image(
     _engine: *mut c_void,
     instance: *mut c_void,
@@ -790,10 +799,20 @@ extern "C" fn layer_copy_from_bitmap_to_main_image(
             "Layer.copyFromBitmapToMainImage: no bitmap with that id",
         );
     }
+    // `AssignMainImageWithUpdate` sizes the main image to the assigned
+    // bitmap; read the dimensions before taking the mutable layer borrow.
+    let dims = if bitmap_id >= 0 {
+        scene.bitmap(bitmap_id as u32).map(|b| (b.width, b.height))
+    } else {
+        None
+    };
     let Some(layer) = scene.layer_mut(inst.id) else {
         return error_out(out_error, "Layer: layer no longer exists");
     };
     layer.bitmap = (bitmap_id >= 0).then_some(bitmap_id as u32);
+    if let Some((w, h)) = dims {
+        internal_set_image_size(layer, w, h);
+    }
     set_void_out(out);
     0
 }
