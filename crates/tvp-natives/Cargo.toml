@@ -8,5 +8,6 @@ license.workspace = true
 [dependencies]
 tjs2-sys = { workspace = true }
 engine = { path = "../engine" }
+tvp-input = { path = "../tvp-input" }
 log = "0.4"
 ffmpeg-next = "9.0.0"

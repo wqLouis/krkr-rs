@@ -8,7 +8,9 @@
 //! * `inputString` — logs at `info!` and returns the initial value (the
 //!   headless "OK" path; the reference shows a modal input box).
 //! * `getTickCount` — milliseconds since an arbitrary epoch (first call).
-//! * `getKeyState` — real, wired from the host input bridge.
+//! * `getKeyState` — real, over the shared [`tvp_input::InputState`]: mouse-button
+//!   VKs map to the mouse state, `VK_PADANY` aggregates the gamepad, and
+//!   `getcurrent=false` reproduces the reference's consumed-on-read push latch.
 //! * `shellExecute` — launches with the platform opener (`xdg-open` /
 //!   `open` / `cmd start`).
 //! * `system` — stub returning 0 (the reference's `_wsystem` is commented
@@ -125,18 +127,77 @@ fn set_command_line(name: &str, value: &str) {
     args.insert(0, new_entry);
 }
 
-/// Keyboard state supplied by the host input bridge, keyed by Windows VK.
-static KEY_STATES: LazyLock<Mutex<HashSet<i64>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+/// Reference-compatible "pushed since the last query" latch — the `0x10`
+/// bit of the reference scancode byte (`TVPWindow.h:213`,
+/// `TVPGetKeyMouseAsyncState`). `System.getKeyState(code, false)` reads and
+/// clears it.
+///
+/// `tvp-input` exposes the current down set plus the per-frame released
+/// edge, not a persistent latch, so the latch is reconstructed here: a
+/// fresh down transition, or a release not yet accounted for, sets the bit;
+/// the next `getKeyState(code, false)` consumes it.
+#[derive(Default)]
+struct PushLatch {
+    /// Codes observed down at the previous `getKeyState(code, false)` call.
+    down: HashSet<u32>,
+    /// `0x10` bits set but not yet consumed.
+    pushed: HashSet<u32>,
+    /// Frame a release was latched in, so repeated queries in one frame do
+    /// not re-latch the same release.
+    release_frame: HashMap<u32, u64>,
+}
+
+static PUSH_LATCH: LazyLock<Mutex<PushLatch>> = LazyLock::new(|| Mutex::new(PushLatch::default()));
 
 /// Update one host key state before dispatching the corresponding script
-/// input event. The render crate calls this from its Bevy input bridge.
+/// input event. The render crate calls this from its Bevy input bridge,
+/// which already writes the shared [`tvp_input::InputState`] while holding
+/// its lock; the forwarding below is a no-op on that path (`try_lock`
+/// fails) and lets other callers/tests feed the same state.
 pub fn set_key_state(key: u32, down: bool) {
-    let mut keys = lock_ok(&KEY_STATES);
-    if down {
-        keys.insert(i64::from(key));
-    } else {
-        keys.remove(&i64::from(key));
+    let state = tvp_input::input_state();
+    if let Ok(mut state) = state.try_lock() {
+        if down {
+            state.set_key_down(key);
+        } else {
+            state.set_key_up(key);
+        }
     }
+}
+
+/// Query the shared input state the way the reference
+/// `TVPGetAsyncKeyState` does (`SystemImpl.cpp:41`):
+///
+/// * `getcurrent == true` → `tvp_input::InputState::vk_pressed`, which
+///   resolves mouse-button VKs and aggregates `VK_PADANY`.
+/// * `getcurrent == false` → the reference's persistent `0x10` push latch,
+///   consumed on read (see [`PushLatch`]).
+fn get_key_state(code: u32, getcurrent: bool) -> bool {
+    let (down, released, frame) = {
+        let state = tvp_input::input_state();
+        let state = state.lock().unwrap_or_else(|p| p.into_inner());
+        (state.vk_pressed(code), state.vk_released(code), state.frame)
+    };
+    if getcurrent {
+        return down;
+    }
+    let mut latch = lock_ok(&PUSH_LATCH);
+    let was_down = latch.down.contains(&code);
+    if down && !was_down {
+        latch.pushed.insert(code);
+    } else if released && !was_down && latch.release_frame.get(&code).copied() != Some(frame) {
+        // A press+release between two queries (the down edge was never
+        // observed): latch it, and remember the frame so repeated queries
+        // this frame do not latch the same release again.
+        latch.pushed.insert(code);
+        latch.release_frame.insert(code, frame);
+    }
+    if down {
+        latch.down.insert(code);
+    } else {
+        latch.down.remove(&code);
+    }
+    latch.pushed.remove(&code)
 }
 
 /// Epoch for [`native_get_tick_count`]: the first call (reference:
@@ -201,9 +262,14 @@ extern "C" fn native_get_tick_count(
 
 /// `System.getKeyState(key [, getcurrent])` → bool
 ///
-/// Reference: `TVPGetAsyncKeyState` (real keyboard polling). The host input
-/// bridge mirrors its current Windows-VK state into this native. The argument count check
-/// matches the reference (`TJS_E_BADPARAMCOUNT` on zero arguments).
+/// Reference: `TVPGetAsyncKeyState` (`SystemImpl.cpp:41`). `getcurrent`
+/// defaults to true; when true the result is whether the key/mouse-button/
+/// gamepad code is currently held; when false it is the reference's
+/// consumed-on-read "pushed since the last query" latch (`0x10` bit). The
+/// shared [`tvp_input::InputState`] resolves the mouse-button VKs and the
+/// gamepad `VK_PAD*` codes (with `VK_PADANY` aggregating every pad button).
+/// The argument-count check matches the reference (`TJS_E_BADPARAMCOUNT` on
+/// zero arguments).
 extern "C" fn native_get_key_state(
     _engine: *mut c_void,
     argc: c_int,
@@ -214,9 +280,11 @@ extern "C" fn native_get_key_state(
     if argc < 1 {
         return report_error(out_error, "System.getKeyState requires 1 argument");
     }
-    let key = value_as_i64(&args(argv, argc)[0]);
-    let down = lock_ok(&KEY_STATES).contains(&key);
-    set_int_out(out, i64::from(down));
+    let a = args(argv, argc);
+    let key = value_as_i64(&a[0]) as u32;
+    // reference: `getcurrent = 0 != (tjs_int)*param[1]`
+    let getcurrent = argc < 2 || value_as_i64(&a[1]) != 0;
+    set_int_out(out, i64::from(get_key_state(key, getcurrent)));
     0
 }
 
@@ -1706,5 +1774,100 @@ mod tests {
             e.eval("System.getArgument('-argcheck')", "test").unwrap(),
             tjs2_sys::TjsValue::String("y".into())
         );
+    }
+
+    // -- getKeyState over the shared tvp-input state --------------------
+
+    /// Reset both the shared input state and the `getKeyState(code,false)`
+    /// latch so each test starts clean.
+    fn reset_input_state() {
+        *lock_ok(&PUSH_LATCH) = PushLatch::default();
+        let state = tvp_input::input_state();
+        *state.lock().unwrap_or_else(|p| p.into_inner()) = tvp_input::InputState::new();
+    }
+
+    fn with_input<T>(f: impl FnOnce(&mut tvp_input::InputState) -> T) -> T {
+        let state = tvp_input::input_state();
+        let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
+        f(&mut s)
+    }
+
+    fn state_int(e: &tjs2_sys::Tjs2Engine, expr: &str) -> i64 {
+        match e.eval(expr, "test").unwrap() {
+            tjs2_sys::TjsValue::Integer(v) => v,
+            other => panic!("{expr} -> {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_key_state_resolves_mouse_vks_and_aggregates_padany() {
+        let _vm_lock = crate::test_lock::vm_lock();
+        reset_input_state();
+        let e = engine_with_system();
+        with_input(|s| {
+            s.begin_frame();
+            s.set_mouse_button(tvp_input::MB_RIGHT, true);
+            s.set_key_down(tvp_input::pad::VK_PAD1);
+            s.end_frame();
+        });
+        // mouse-button VKs resolve to the mouse state (0x02 = VK_RBUTTON)
+        assert_eq!(state_int(&e, "System.getKeyState(0x02)"), 1);
+        assert_eq!(state_int(&e, "System.getKeyState(0x01)"), 0);
+        // a concrete pad code and VK_PADANY (0x1DF) aggregate every pad code
+        assert_eq!(state_int(&e, "System.getKeyState(0x1C0)"), 1);
+        assert_eq!(state_int(&e, "System.getKeyState(0x1DF)"), 1);
+        with_input(|s| {
+            s.begin_frame();
+            s.set_mouse_button(tvp_input::MB_RIGHT, false);
+            s.set_key_up(tvp_input::pad::VK_PAD1);
+            s.end_frame();
+        });
+        assert_eq!(state_int(&e, "System.getKeyState(0x02)"), 0);
+        assert_eq!(state_int(&e, "System.getKeyState(0x1DF)"), 0);
+    }
+
+    #[test]
+    fn get_key_state_getcurrent_false_is_a_consumed_push_latch() {
+        let _vm_lock = crate::test_lock::vm_lock();
+        reset_input_state();
+        let e = engine_with_system();
+        // Frame 0: press K (0x4B).
+        with_input(|s| {
+            s.begin_frame();
+            s.set_key_down(0x4B);
+            s.end_frame();
+        });
+        // The latch is read once, then cleared; current state stays true.
+        assert_eq!(state_int(&e, "System.getKeyState(0x4B, false)"), 1);
+        assert_eq!(state_int(&e, "System.getKeyState(0x4B, false)"), 0);
+        assert_eq!(state_int(&e, "System.getKeyState(0x4B)"), 1);
+        // Frame 1: release; the down edge was already consumed -> no latch.
+        with_input(|s| {
+            s.begin_frame();
+            s.set_key_up(0x4B);
+            s.end_frame();
+        });
+        assert_eq!(state_int(&e, "System.getKeyState(0x4B, false)"), 0);
+        // Frame 2: press+release between queries -> the latch still catches it.
+        with_input(|s| {
+            s.begin_frame();
+            s.set_key_down(0x4B);
+            s.set_key_up(0x4B);
+            s.end_frame();
+        });
+        assert_eq!(state_int(&e, "System.getKeyState(0x4B, false)"), 1);
+        assert_eq!(state_int(&e, "System.getKeyState(0x4B, false)"), 0);
+        assert_eq!(state_int(&e, "System.getKeyState(0x4B)"), 0);
+        // `getcurrent` is parsed as an integer (truncating), like the
+        // reference: 0.5 -> 0 (false, the push latch), 2.5 -> 2 (true,
+        // current state). Press+release 0x4C so the two differ.
+        with_input(|s| {
+            s.begin_frame();
+            s.set_key_down(0x4C);
+            s.set_key_up(0x4C);
+            s.end_frame();
+        });
+        assert_eq!(state_int(&e, "System.getKeyState(0x4C, 0.5)"), 1);
+        assert_eq!(state_int(&e, "System.getKeyState(0x4C, 2.5)"), 0);
     }
 }
