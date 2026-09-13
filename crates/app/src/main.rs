@@ -5,7 +5,7 @@
 //!   krkr-rs list <game-dir>          list mounted archives and their entries
 
 use std::process::ExitCode;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use engine::storage::Storage;
 
@@ -104,6 +104,9 @@ fn run_list(game_dir: &str) -> Result<(), String> {
 }
 
 /// Register every TVP native class and set the global contexts they read.
+/// Mirrors `crates/render/src/main.rs::register_natives` so `krkr-cli load`
+/// exercises the same class surface as the graphical runner (`KAGParser`,
+/// visual `Window`/`Layer`/`Bitmap`/`Font`/`Timer`, sound `WaveSoundBuffer`).
 fn register_natives(
     engine: &Arc<tjs2_sys::Tjs2Engine>,
     storage: &Arc<Mutex<Storage>>,
@@ -119,9 +122,20 @@ fn register_natives(
         desktop_size: (640, 480),
         touch_device: false,
     });
+    engine
+        .as_ref()
+        .set_data_dir(&storage.lock().unwrap().game_dir().display().to_string());
     tvp_natives::register_all(engine)?;
+    tvp_kagparser::register_kagparser(engine)?;
+    tvp_kagparser::set_context(Some(engine.clone()), Some(storage.clone()));
     tvp_storages::register_storages(engine)?;
     tvp_scripts::register_scripts(engine)?;
+    // The visual natives only need a scene to mutate; the CLI never renders
+    // it, but registering them keeps `startup.tjs` from throwing on
+    // `Window`/`Layer`/`Bitmap` construction.
+    let scene = Arc::new(RwLock::new(tvp_visual::scene::Scene::default()));
+    tvp_visual::register_visual(engine, scene, storage.clone())?;
+    tvp_sound::register_sound(engine, storage.clone())?;
     tvp_storages::set_storage(Some(storage.clone()));
     tvp_scripts::set_context(Some(engine.clone()), Some(storage.clone()));
     Ok(())

@@ -486,6 +486,17 @@ pub fn sync_scene(
                         }
                     }
                 }
+                LayerVisual::Skip => {
+                    // `ltBinder`: a container layer the reference never blits
+                    // (`Blt` returns "no action"). Drop any entity/material a
+                    // previous blend type may have spawned.
+                    if let Some(cached) = cached_materials.remove(&layer_id) {
+                        materials.remove(cached.handle.id());
+                    }
+                    if let Some(entity) = sprites.remove(&layer_id) {
+                        commands.entity(entity).despawn();
+                    }
+                }
             }
         }
     }
@@ -532,9 +543,10 @@ pub fn sync_scene(
     *last_projection = projection_size;
 }
 
-/// What the sync builds for one layer: a plain [`Sprite`] or the blend
+/// What the sync builds for one layer: a plain [`Sprite`], the blend
 /// configuration for a custom-material quad (the caller resolves/reuses the
-/// actual [`LayerBlendMaterial`] so it can stay cached).
+/// actual [`LayerBlendMaterial`] so it can stay cached), or nothing at all
+/// for `ltBinder`.
 enum LayerVisual {
     Sprite(Sprite),
     Blended {
@@ -542,6 +554,19 @@ enum LayerVisual {
         texture: Handle<Image>,
         color: LinearRgba,
     },
+    /// `ltBinder` — draws nothing (see [`crate::blend`]).
+    Skip,
+}
+
+/// The visual for a layer that draws nothing: a zero-size, fully
+/// transparent sprite. A missing/corrupt bitmap must not paint an opaque
+/// rectangle over the scene.
+fn invisible_layer_visual() -> LayerVisual {
+    LayerVisual::Sprite(Sprite {
+        color: Color::NONE,
+        custom_size: Some(Vec2::ZERO),
+        ..Default::default()
+    })
 }
 
 /// Build the visual for one layer.
@@ -580,19 +605,19 @@ fn build_layer_visual(
     let path = render_path_for(layer.blend_type, alpha);
     let size = Vec2::new(layer_rect.w as f32, layer_rect.h as f32);
 
+    // `ltBinder` is a container: the reference `Blt` returns "no action", so
+    // the layer never draws even if it carries a bitmap/fill (its children
+    // are separate scene layers and still render).
+    if matches!(path, LayerRenderPath::Skip) {
+        return (LayerVisual::Skip, layer_rect);
+    }
+
     // A layer with neither an image nor a solid fill draws nothing (the
     // reference's `MainImage` is filled with the transparent `NeutralColor`,
     // not opaque black). Rendering it as black painted over the background
     // art and made the title screen look stacked.
     if layer.bitmap.is_none() && layer.fill_color.is_none() {
-        return (
-            LayerVisual::Sprite(Sprite {
-                color: Color::NONE,
-                custom_size: Some(Vec2::ZERO),
-                ..Default::default()
-            }),
-            layer_rect,
-        );
+        return (invisible_layer_visual(), layer_rect);
     }
 
     match path {
@@ -654,10 +679,13 @@ fn build_layer_visual(
                     }
                 }
             }
-            let color = layer
-                .fill_color
-                .map(|fill| fill_sprite_color(fill, alpha))
-                .unwrap_or_else(|| Color::srgba(0.0, 0.0, 0.0, clamp_opacity(alpha)));
+            // No usable bitmap (missing id, zero-sized, or short RGBA). Draw
+            // the solid fill if there is one; otherwise nothing — never an
+            // opaque black rectangle for a corrupt texture.
+            let Some(fill) = layer.fill_color else {
+                return (invisible_layer_visual(), layer_rect);
+            };
+            let color = fill_sprite_color(fill, alpha);
             (
                 LayerVisual::Sprite(Sprite::from_color(color, size)),
                 layer_rect,
@@ -673,6 +701,10 @@ fn build_layer_visual(
             let texture = match bitmap_texture {
                 Some(handle) => handle,
                 None => {
+                    // No usable bitmap and no fill → nothing to composite.
+                    if layer.fill_color.is_none() {
+                        return (invisible_layer_visual(), layer_rect);
+                    }
                     if gpu.white_1x1.is_none() {
                         gpu.white_1x1 = Some(images.add(Image::new(
                             Extent3d {
@@ -691,18 +723,30 @@ fn build_layer_visual(
                         .expect("white 1×1 texture just created")
                 }
             };
-            let color = layer
+            let mut color = layer
                 .fill_color
-                .map_or_else(|| bitmap_tint(alpha), |fill| fill_sprite_color(fill, alpha));
+                .map_or_else(|| bitmap_tint(alpha), |fill| fill_sprite_color(fill, alpha))
+                .to_linear();
+            // Multiply/screen composite the source with a `Dst`/`OneMinusDst`
+            // fixed-function factor, so the shader's straight RGB must already
+            // carry the `·alpha` term (see `is_premultiplied_source`).
+            if mode.is_premultiplied_source() {
+                color.red *= color.alpha;
+                color.green *= color.alpha;
+                color.blue *= color.alpha;
+            }
             (
                 LayerVisual::Blended {
                     mode,
                     texture,
-                    color: color.to_linear(),
+                    color,
                 },
                 layer_rect,
             )
         }
+        // `render_path_for` returns `Skip` for `ltBinder`, handled by the
+        // early return above; keep the arm total without `unreachable!`.
+        LayerRenderPath::Skip => (LayerVisual::Skip, layer_rect),
     }
 }
 
@@ -2195,5 +2239,190 @@ mod tests {
         shared.0.write().unwrap().remove_layer(layer);
         app.update();
         assert_eq!(material_count(&mut app), 0, "material freed with the layer");
+    }
+
+    /// `ltBinder` (0) is a container the reference never blits. A binder
+    /// carrying a bitmap/fill must spawn no layer entity at all, while its
+    /// children still render.
+    #[test]
+    fn binder_layer_is_not_drawn() {
+        let mut scene = Scene::default();
+        let win = scene.add_window("t", (64, 64));
+        let binder = scene.add_layer(win, None);
+        {
+            let l = scene.layer_mut(binder).unwrap();
+            l.blend_type = crate::blend::LT_BINDER;
+            l.fill_color = Some([9, 9, 9, 255]);
+            l.rect = Rect {
+                x: 0,
+                y: 0,
+                w: 64,
+                h: 64,
+            };
+        }
+        let child = scene.add_layer(win, Some(binder));
+        {
+            let l = scene.layer_mut(child).unwrap();
+            l.fill_color = Some([1, 2, 3, 255]);
+            l.rect = Rect {
+                x: 0,
+                y: 0,
+                w: 8,
+                h: 8,
+            };
+        }
+        let shared = SharedScene(Arc::new(RwLock::new(scene)));
+        let mut app = app_with_sync(shared);
+        app.update();
+
+        let entities = sprite_entities(app.world_mut());
+        assert!(
+            !entities.contains_key(&binder),
+            "ltBinder must not spawn a drawable entity"
+        );
+        assert!(
+            entities.contains_key(&child),
+            "binder children still render"
+        );
+    }
+
+    /// `ltMultiplicative` takes the real multiply material path; its tint RGB
+    /// is pre-multiplied by the composed alpha so the fixed-function `Dst`
+    /// factor yields `src*a*dst`.
+    #[test]
+    fn multiply_layer_spawns_material_with_premultiplied_tint() {
+        let mut scene = Scene::default();
+        let win = scene.add_window("t", (64, 64));
+        let layer = scene.add_layer(win, None);
+        {
+            let l = scene.layer_mut(layer).unwrap();
+            l.blend_type = crate::blend::LT_MULTIPLICATIVE;
+            l.opacity = 0.5;
+            l.fill_color = Some([200, 100, 50, 255]);
+            l.rect = Rect {
+                x: 0,
+                y: 0,
+                w: 64,
+                h: 64,
+            };
+        }
+        let shared = SharedScene(Arc::new(RwLock::new(scene)));
+        let mut app = app_with_sync(shared);
+        app.update();
+
+        let world = app.world_mut();
+        let (_, material) = world
+            .query_filtered::<(&Mesh2d, &MeshMaterial2d<LayerBlendMaterial>), With<SceneSprite>>()
+            .single(world)
+            .expect("one multiply quad");
+        let mat = world
+            .resource::<Assets<LayerBlendMaterial>>()
+            .get(&material.0)
+            .unwrap();
+        assert_eq!(LayerBlendMode::from(mat), LayerBlendMode::Multiply);
+        let expected = {
+            let mut c = fill_sprite_color([200, 100, 50, 255], 0.5).to_linear();
+            c.red *= c.alpha;
+            c.green *= c.alpha;
+            c.blue *= c.alpha;
+            c
+        };
+        assert_eq!(mat.color(), expected, "multiply tint is pre-multiplied");
+        // Unlike a plain source-over fill, the RGB is no longer the raw fill.
+        assert!(mat.color().red < fill_sprite_color([200, 100, 50, 255], 0.5).to_linear().red);
+    }
+
+    /// `ltAddAlpha` takes the additive-alpha material path (`One`/
+    /// `OneMinusSrcAlpha`), not source-over.
+    #[test]
+    fn add_alpha_layer_spawns_add_alpha_material() {
+        let mut scene = Scene::default();
+        let win = scene.add_window("t", (64, 64));
+        let layer = scene.add_layer(win, None);
+        {
+            let l = scene.layer_mut(layer).unwrap();
+            l.blend_type = crate::blend::LT_ADD_ALPHA;
+            l.fill_color = Some([40, 80, 120, 200]);
+            l.rect = Rect {
+                x: 0,
+                y: 0,
+                w: 64,
+                h: 64,
+            };
+        }
+        let shared = SharedScene(Arc::new(RwLock::new(scene)));
+        let mut app = app_with_sync(shared);
+        app.update();
+
+        let world = app.world_mut();
+        let (_, material) = world
+            .query_filtered::<(&Mesh2d, &MeshMaterial2d<LayerBlendMaterial>), With<SceneSprite>>()
+            .single(world)
+            .expect("one add-alpha quad");
+        let mat = world
+            .resource::<Assets<LayerBlendMaterial>>()
+            .get(&material.0)
+            .unwrap();
+        assert_eq!(LayerBlendMode::from(mat), LayerBlendMode::AddAlpha);
+    }
+
+    /// A layer pointing at a missing/zero-sized bitmap with no solid fill
+    /// must draw nothing — never an opaque black rectangle (source-over) or
+    /// a white quad (material path).
+    #[test]
+    fn missing_bitmap_draws_nothing() {
+        // Source-over path (ltAlpha).
+        let mut scene = Scene::default();
+        let win = scene.add_window("t", (64, 64));
+        let sprite_layer = scene.add_layer(win, None);
+        {
+            let l = scene.layer_mut(sprite_layer).unwrap();
+            l.bitmap = Some(9999); // never added
+            l.rect = Rect {
+                x: 0,
+                y: 0,
+                w: 64,
+                h: 64,
+            };
+        }
+        // Material path (ltAdditive) pointing at the same missing bitmap.
+        let quad_layer = scene.add_layer(win, None);
+        {
+            let l = scene.layer_mut(quad_layer).unwrap();
+            l.bitmap = Some(9999);
+            l.blend_type = tvp_visual::scene::LT_ADDITIVE;
+            l.rect = Rect {
+                x: 0,
+                y: 0,
+                w: 64,
+                h: 64,
+            };
+        }
+        let shared = SharedScene(Arc::new(RwLock::new(scene)));
+        let mut app = app_with_sync(shared);
+        app.update();
+
+        let world = app.world_mut();
+        // No blended quad may be spawned for the additive missing bitmap.
+        assert_eq!(
+            world
+                .query_filtered::<Entity, With<MeshMaterial2d<LayerBlendMaterial>>>()
+                .iter(world)
+                .count(),
+            0,
+            "missing bitmap must not spawn a material quad"
+        );
+        // The source-over placeholders are fully transparent and zero-sized.
+        let mut q = world.query_filtered::<&Sprite, With<SceneSprite>>();
+        let placeholders: Vec<&Sprite> = q.iter(world).collect();
+        assert_eq!(
+            placeholders.len(),
+            2,
+            "both layers keep an inert placeholder"
+        );
+        for sprite in placeholders {
+            assert_eq!(sprite.custom_size, Some(Vec2::ZERO));
+            assert_eq!(sprite.color.to_srgba().alpha, 0.0);
+        }
     }
 }

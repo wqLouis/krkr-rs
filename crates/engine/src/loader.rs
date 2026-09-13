@@ -26,17 +26,13 @@ pub struct LoadReport {
     pub startup_error: Option<String>,
 }
 
-/// Load a game: mount storage, find and execute `startup.tjs` in a fresh
-/// TJS2 VM. Logs progress through `log`.
-///
-/// This is the "no rendering" milestone: archives are mounted and scripts
-/// run, but the TVP native classes games call (`Storages`, `System`, ...)
-/// are not registered yet, so real games will typically fail inside
-/// `startup.tjs` with a clear "identifier not found" error until those
-/// natives land.
 /// Mount storage and bootstrap a fresh TJS2 VM. The caller (e.g. the app
 /// crate) may register native classes and set native contexts between
 /// [`prepare`] and [`run_startup`].
+///
+/// This is the "no rendering" milestone: archives are mounted and scripts can
+/// run, but the TVP native classes games call (`Storages`, `System`, ...) are
+/// only registered by the caller.
 pub fn prepare(game_dir: &str) -> Result<(Arc<Mutex<Storage>>, Arc<Tjs2Engine>), LoadError> {
     let storage = Storage::mount(game_dir).map_err(LoadError::Mount)?;
     let storage = Arc::new(Mutex::new(storage));
@@ -49,7 +45,8 @@ pub fn prepare(game_dir: &str) -> Result<(Arc<Mutex<Storage>>, Arc<Tjs2Engine>),
 }
 
 /// Load a game (no native classes registered): mount storage, find and
-/// execute `startup.tjs`. Native-less; used by tests and the pure load path.
+/// execute `startup.tjs`, in a fresh TJS2 VM. Native-less; used by tests and
+/// the pure load path. Logs progress through `log`.
 pub fn load_game(game_dir: &str) -> Result<LoadReport, LoadError> {
     let (storage, engine) = prepare(game_dir)?;
     run_startup(&engine, &storage)

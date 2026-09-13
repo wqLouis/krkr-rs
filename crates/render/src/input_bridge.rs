@@ -1344,16 +1344,29 @@ mod tests {
         assert!(!bridge.dead_layers.contains(&layer_id));
         assert_eq!(read_log(&engine), "m:10,10,0;");
 
-        // Invalidate the layer's TJS object while the layer stays in the
-        // scene (exactly what the game does).
+        // `invalidate l;` finalizes the native payload. Since the
+        // `tjs2-sys` lifetime fix the VM runs the native `destroy` at
+        // finalize time, so `tvp-visual`'s `Layer.destroy` removes the
+        // layer from the scene immediately (see
+        // `crates/tvp-visual/src/natives/layer.rs::layer_destroy`). The
+        // input bridge's blacklist still guards the window between a stale
+        // object being dispatched to and the scene being rebuilt.
         engine.exec_script("invalidate l;", "test").unwrap();
 
-        // Frame 2: the dispatch hits the invalidated object; the layer is
-        // marked dead on the first failure and the enter/capture state is
-        // cleared, instead of logging once per frame forever.
-        let calls = dispatch_layer_frame(&scene, &mut bridge, (20, 20));
-        assert!(calls.iter().any(|c| c.layer_id == layer_id));
-        execute_layer_calls(engine.as_ref(), &calls, &mut bridge);
+        // Frame 2: a dispatch planned against the now-stale object is marked
+        // dead on the first failure, its capture/enter state is cleared, and
+        // the handler never runs again. Build the call directly because the
+        // scene no longer offers the layer to the hit test.
+        let stale = vec![LayerCall {
+            layer_id,
+            method: "onMouseMove",
+            args: vec![
+                TjsValue::Integer(20),
+                TjsValue::Integer(20),
+                TjsValue::Integer(0),
+            ],
+        }];
+        execute_layer_calls(engine.as_ref(), &stale, &mut bridge);
         assert!(
             bridge.dead_layers.contains(&layer_id),
             "the invalidated layer must be marked dead"
@@ -1364,7 +1377,7 @@ mod tests {
         assert_eq!(read_log(&engine), "m:10,10,0;");
 
         // Frame 3: the dead layer is excluded from the hit test, so nothing
-        // is planned or dispatched for it.
+        // is planned or dispatched for it even if a stale list entry remains.
         let calls = dispatch_layer_frame(&scene, &mut bridge, (30, 30));
         assert!(
             !calls.iter().any(|c| c.layer_id == layer_id),
@@ -1372,6 +1385,54 @@ mod tests {
         );
         execute_layer_calls(engine.as_ref(), &calls, &mut bridge);
         assert_eq!(read_log(&engine), "m:10,10,0;");
+    }
+
+    /// A layer recorded in [`BridgeState::dead_layers`] is treated as no-hit
+    /// even while it is still present in the scene, so a lower live layer (or
+    /// nothing) receives the event instead of the stale object.
+    #[test]
+    fn dead_layers_are_excluded_from_hit_testing() {
+        use tvp_visual::scene::Rect;
+        let mut scene = Scene::default();
+        let win = scene.add_window("t", (200, 200));
+        let layer = scene.add_layer(win, None);
+        {
+            let l = scene.layer_mut(layer).unwrap();
+            l.rect = Rect {
+                x: 0,
+                y: 0,
+                w: 200,
+                h: 200,
+            };
+            l.visible = true;
+            l.hit_threshold = 0;
+        }
+        assert_eq!(hit_test(&scene, win, 5, 5), Some(layer));
+
+        let mut dead = HashSet::new();
+        assert_eq!(hit_test_excluding(&scene, win, 5, 5, &dead), Some(layer));
+        dead.insert(layer);
+        assert_eq!(
+            hit_test_excluding(&scene, win, 5, 5, &dead),
+            None,
+            "a dead layer is treated as no-hit"
+        );
+    }
+
+    /// `mark_layer_dead` drops any capture/enter state pointing at the dead
+    /// layer and reports the first transition only.
+    #[test]
+    fn mark_layer_dead_clears_capture_and_enter_state() {
+        let mut bridge = BridgeState {
+            last_move_layer: Some(7),
+            capture_layer: Some(7),
+            ..Default::default()
+        };
+        assert!(mark_layer_dead(&mut bridge, 7), "first mark is reported");
+        assert!(bridge.dead_layers.contains(&7));
+        assert_eq!(bridge.last_move_layer, None);
+        assert_eq!(bridge.capture_layer, None);
+        assert!(!mark_layer_dead(&mut bridge, 7), "second mark is quiet");
     }
 
     /// Drive one synthetic mouse-move frame through `collect_frame_events` +
