@@ -54,12 +54,21 @@ const MAX_PIXEL_BYTES: usize = 1 << 28;
 
 /// Decode TLG5/TLG6 bytes into an RGBA8 image.
 pub fn decode_tlg(bytes: &[u8]) -> Result<RgbaImage, String> {
+    decode_tlg_with_info(bytes).map(|(img, _)| img)
+}
+
+/// Decode TLG5/TLG6 bytes into an RGBA8 image plus whether the file stores
+/// an alpha plane (the color count byte: 3 = opaque, 4 = alpha). The
+/// descriptor is used by `loadHeader`/`load` to report `bpp`.
+pub fn decode_tlg_with_info(bytes: &[u8]) -> Result<(RgbaImage, bool), String> {
     let raw = strip_sds(bytes)?;
-    if raw.len() >= 11 && raw[..11] == TLG5_MAGIC {
-        return decode_tlg5(raw);
+    if raw.len() >= 12 && raw[..11] == TLG5_MAGIC {
+        let colors = raw[11];
+        return decode_tlg5(raw).map(|img| (img, colors >= 4));
     }
-    if raw.len() >= 11 && raw[..11] == TLG6_MAGIC {
-        return decode_tlg6(raw);
+    if raw.len() >= 12 && raw[..11] == TLG6_MAGIC {
+        let colors = raw[11];
+        return decode_tlg6(raw).map(|img| (img, colors >= 4));
     }
     Err("not a TLG5/TLG6 image (bad magic)".into())
 }

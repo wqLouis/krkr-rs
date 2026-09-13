@@ -1,17 +1,83 @@
-//! Bitmap loading for the TVP visual natives.
+//! Bitmap loading/decoding/saving for the TVP visual natives.
 //!
-//! Implements the reference `Bitmap(name)` / `Bitmap(width, height)`
-//! constructor semantics (`reference/cpp/core/visual/BitmapIntf.cpp`):
-//! game image files (`.webp` / `.png` / `.jpg` / `.bmp`) read from game
-//! storage are decoded to RGBA8 and registered in the [`scene::Scene`]
-//! bitmap table. This is what `new Bitmap("FRM_0501b")` will call once the
-//! natives land.
+//! Implements the reference image pipeline behind `Bitmap(name)` /
+//! `Bitmap(width, height)` / `Bitmap.load(name)` / `Bitmap.loadAsync(name)`
+//! (`reference/cpp/core/visual/BitmapIntf.cpp`,
+//! `reference/cpp/core/visual/GraphicsLoaderIntf.cpp`): game image files
+//! (`.webp` / `.png` / `.jpg` / `.jpeg` / `.bmp` / `.dib` / `.tlg` /
+//! `.tlg5` / `.tlg6`) read from game storage are decoded to RGBA8 and
+//! registered in the [`scene::Scene`] bitmap table.
+//!
+//! The reference routes purely by **magic bytes** in `TVPLoadGraphicRouter`
+//! (with extension-based handler lookup); we detect by extension first and
+//! fall back to magic sniffing, matching the router's effective behavior
+//! for the formats the `image` crate (plus [`crate::tlg`]) can decode.
+//!
+//! Bitmap contents are always straight-alpha RGBA8 in this crate (the
+//! renderer's contract); the reference's internal 0xAARRGGBB memory layout
+//! is converted at the script boundary.
 
 use std::path::Path;
 
 use engine::Storage;
+use image::{DynamicImage, ImageFormat, RgbaImage};
 
 use crate::scene::{self, BitmapCache};
+
+/// One decoded image: RGBA8 pixels plus the intrinsic size and whether the
+/// source format carried an alpha channel (used by `loadHeader`'s `bpp`).
+#[derive(Debug, Clone)]
+pub struct DecodedImage {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+    pub has_alpha: bool,
+}
+
+impl DecodedImage {
+    /// Convert a decoded `image` crate image, preserving whether the source
+    /// color type had an alpha channel.
+    fn from_dynamic(img: DynamicImage) -> Self {
+        let has_alpha = img.color().has_alpha();
+        let rgba = img.to_rgba8();
+        Self {
+            width: rgba.width(),
+            height: rgba.height(),
+            rgba: rgba.into_raw(),
+            has_alpha,
+        }
+    }
+
+    fn from_rgba(img: RgbaImage, has_alpha: bool) -> Self {
+        Self {
+            width: img.width(),
+            height: img.height(),
+            rgba: img.into_raw(),
+            has_alpha,
+        }
+    }
+}
+
+/// Errors from the storage-backed bitmap pipeline. A native wrapper
+/// converts these into TJS exceptions (e.g. "cannot load image ...").
+#[derive(Debug, thiserror::Error)]
+pub enum BitmapError {
+    /// No storage entry matched the name, with or without an image extension.
+    #[error("bitmap not found in storage: {0}")]
+    NotFound(String),
+    /// The storage entry existed but could not be read (I/O or archive error).
+    #[error("cannot read bitmap {0}: {1}")]
+    Read(String, String),
+    /// The bytes were not a decodable image.
+    #[error("cannot decode image {0}: {1}")]
+    Decode(String, String),
+    /// A save request used a type string no handler accepts.
+    #[error("unknown graphic format: {0}")]
+    UnknownFormat(String),
+    /// Encoding/saving failed.
+    #[error("cannot save bitmap {0}: {1}")]
+    Save(String, String),
+}
 
 /// Storage-name normalization, mirroring the engine's storage rules
 /// (`xp3::normalize_in_archive_name`, which `engine::Storage` applies to
@@ -37,53 +103,177 @@ fn normalize_storage_name(name: &str) -> String {
     out
 }
 
-/// Extension probing list for `Bitmap(name)`, in reference order: the name
-/// as-is first, then with common image extensions appended. This is what
-/// lets `Bitmap("FRM_0501b")` resolve to a real `FRM_0501b.webp` (or
-/// `.png`/`.jpg`/`.bmp`) entry in storage. Because `""` is tried first, a
-/// name that already carries an extension always wins.
-const EXTENSION_PROBE: [&str; 7] = ["", ".webp", ".png", ".jpg", ".jpeg", ".bmp", ".tlg"];
+/// Extension probing list for `Bitmap(name)` / `Bitmap.load(name)`.
+///
+/// The reference's `TVPFindGraphicLoadHandler` appends each registered
+/// extension and returns the first storage hit; the handler table is
+/// registered in the order `.pvr .jxr .bpg .webp .bmp .dib .jpeg .jpg
+/// .jif .png .tlg .tlg5 .tlg6`. Formats this crate cannot decode are
+/// omitted from the probe so a miss surfaces as a decode error instead of
+/// resolving to an unsupported file. `""` is first so an explicit
+/// extension always wins.
+const EXTENSION_PROBE: [&str; 9] = [
+    "", ".webp", ".png", ".jpg", ".jpeg", ".jif", ".bmp", ".dib", ".tlg",
+];
 
-/// Errors from [`load_bitmap_from_storage`]. A native wrapper converts these
-/// into TJS exceptions (e.g. "cannot load image ...").
-#[derive(Debug, thiserror::Error)]
-pub enum BitmapError {
-    /// No storage entry matched the name, with or without an image extension.
-    #[error("bitmap not found in storage: {0}")]
-    NotFound(String),
-    /// The storage entry existed but could not be read (I/O or archive error).
-    #[error("cannot read bitmap {0}: {1}")]
-    Read(String, String),
-    /// The bytes were not a decodable image.
-    #[error("cannot decode image {0}: {1}")]
-    Decode(String, String),
+/// All TLG spellings the reference registers.
+const TLG_EXTENSIONS: [&str; 3] = [".tlg", ".tlg5", ".tlg6"];
+
+/// True for a storage name that routes to the native TLG decoder.
+fn is_tlg_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    TLG_EXTENSIONS.iter().any(|ext| lower.ends_with(ext))
 }
 
-/// Load a bitmap from game storage and register it in the scene's bitmap
-/// table, returning its id.
+/// Resolve a storage name to an existing entry by probing [`EXTENSION_PROBE`].
 ///
-/// Semantics match the reference `Bitmap(name)` constructor:
-/// 1. The name is normalized like the engine does (case-insensitive, `\` →
-///    `/`) and probed with the [`EXTENSION_PROBE`] list, so
-///    `Bitmap("FRM_0501b")` finds `FRM_0501b.webp` while
-///    `Bitmap("bg/bg01a01.webp")` matches exactly.
-/// 2. The [`BitmapCache`] is consulted first: loading the same file twice
-///    returns the **same** bitmap id (the reference caches bitmaps by
-///    storage name and shares them; `Bitmap("x")` and `Bitmap("x.webp")`
-///    therefore alias to one bitmap).
-/// 3. The bytes are read and decoded via the `image` crate (format detected
-///    by file extension, falling back to magic bytes), converted to RGBA8,
-///    and registered with `scene.add_bitmap`; the resolved storage name is
-///    recorded on the state and the cache. The state is marked dirty (the
-///    scene default) so the renderer uploads it.
-/// 4. Failures map to [`BitmapError`]: no storage entry → [`BitmapError::NotFound`],
-///    unreadable entry → [`BitmapError::Read`], undecodable bytes →
-///    [`BitmapError::Decode`].
+/// `""` first means an explicit extension always wins, exactly like the
+/// reference's `TVPGuessGraphicLoadHandler`/`TVPFindGraphicLoadHandler`.
+fn resolve_storage_name(storage: &Storage, name: &str) -> Result<String, BitmapError> {
+    let normalized = normalize_storage_name(name);
+    EXTENSION_PROBE
+        .iter()
+        .map(|ext| format!("{normalized}{ext}"))
+        .find(|cand| storage.exists(cand))
+        .ok_or_else(|| BitmapError::NotFound(name.to_string()))
+}
+
+/// Color-key sentinel meaning "no color key" (reference `TVP_clNone`,
+/// `LayerIntf.h:122`).
+pub const COLOR_KEY_NONE: u32 = 0x1fff_ffff;
+/// Color-key sentinel meaning "adaptive" — the most frequent color on the
+/// first scanline becomes transparent (reference `TVP_clAdapt`,
+/// `LayerIntf.h:121`).
+pub const COLOR_KEY_ADAPT: u32 = 0x01ff_ffff;
+
+/// Apply the reference's color-key transparency to a decoded RGBA8 image
+/// (`TVPLoadGraphic` / `TVPMakeAlphaFromKey`,
+/// `GraphicsLoaderIntf.cpp:1070-1076`): pixels whose RGB equals the key
+/// become fully transparent, all others fully opaque.
 ///
-/// `request_hint` is the optional size some games request (the reference's
-/// "province" load / `desw`/`desh` parameters). It is currently ignored:
-/// we always decode at the image's intrinsic size. The parameter exists so
-/// the natives can pass it through without changing signatures later.
+/// Handles `TVP_clNone` (no key), `TVP_clAdapt` (most frequent first-row
+/// color) and an exact `0x00RRGGBB` key. The palette-index and alpha-mat
+/// encodings (`TVP_clPalIdx`/`TVP_clAlphaMat`) need the original palette or
+/// matte channel, which the `image` crate has already expanded, so they are
+/// left as-is (and are not silently reinterpreted as an exact key).
+pub fn apply_color_key(rgba: &mut [u8], width: u32, keyidx: u32) {
+    if keyidx == COLOR_KEY_NONE {
+        return;
+    }
+    if keyidx == COLOR_KEY_ADAPT {
+        let key = adaptive_color_key(rgba, width);
+        make_alpha_from_key(rgba, key);
+        return;
+    }
+    if (keyidx & 0xff00_0000) == 0 {
+        make_alpha_from_key(rgba, keyidx & 0x00ff_ffff);
+    }
+}
+
+/// The most frequent RGB value on the first scanline (reference
+/// `TVPMakeAlphaFromAdaptiveColor`, `GraphicsLoaderIntf.cpp:1150`).
+fn adaptive_color_key(rgba: &[u8], width: u32) -> u32 {
+    use std::collections::HashMap;
+    let mut counts: HashMap<u32, u32> = HashMap::new();
+    let mut best = 0u32;
+    let mut best_count = 0u32;
+    for px in rgba.chunks_exact(4).take(width as usize) {
+        let rgb = (u32::from(px[0]) << 16) | (u32::from(px[1]) << 8) | u32::from(px[2]);
+        let count = counts.entry(rgb).or_insert(0);
+        *count += 1;
+        if *count > best_count {
+            best_count = *count;
+            best = rgb;
+        }
+    }
+    best
+}
+
+/// Make `key`-colored pixels transparent and everything else opaque.
+fn make_alpha_from_key(rgba: &mut [u8], key: u32) {
+    for px in rgba.chunks_exact_mut(4) {
+        let rgb = (u32::from(px[0]) << 16) | (u32::from(px[1]) << 8) | u32::from(px[2]);
+        px[3] = if rgb == key { 0 } else { 255 };
+    }
+}
+
+/// The `image` crate format for a storage name, mapping the reference's
+/// extra spellings (`.jif` → JPEG, `.dib` → BMP) onto their decoders.
+fn format_for_name(name: &str) -> Option<ImageFormat> {
+    let ext = Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())?
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "jif" => Some(ImageFormat::Jpeg),
+        "dib" => Some(ImageFormat::Bmp),
+        other => ImageFormat::from_extension(other),
+    }
+}
+
+/// Decode image bytes into RGBA8.
+///
+/// TLG (`.tlg`/`.tlg5`/`.tlg6`) is routed to [`crate::tlg::decode_tlg`];
+/// everything else goes through the `image` crate, preferring the format
+/// implied by the file extension and falling back to magic-byte sniffing
+/// (the reference itself routes purely by magic bytes in
+/// `TVPLoadGraphicRouter`). A failed TLG decode is a real error — never a
+/// placeholder image.
+pub fn decode_image(name: &str, bytes: &[u8]) -> Result<DecodedImage, BitmapError> {
+    if is_tlg_name(name) {
+        return crate::tlg::decode_tlg_with_info(bytes)
+            .map(|(img, has_alpha)| DecodedImage::from_rgba(img, has_alpha))
+            .map_err(|e| BitmapError::Decode(name.to_string(), e));
+    }
+    if let Some(fmt) = format_for_name(name)
+        && let Ok(img) = image::load_from_memory_with_format(bytes, fmt)
+    {
+        return Ok(DecodedImage::from_dynamic(img));
+    }
+    let fmt = image::guess_format(bytes)
+        .map_err(|e| BitmapError::Decode(name.to_string(), e.to_string()))?;
+    image::load_from_memory_with_format(bytes, fmt)
+        .map(DecodedImage::from_dynamic)
+        .map_err(|e| BitmapError::Decode(name.to_string(), e.to_string()))
+}
+
+/// Resolve, read and decode a storage image without touching the scene.
+/// Used by the async loader's background thread, which must not mutate the
+/// scene (only the VM thread does that).
+pub fn read_and_decode_from_storage(
+    storage: &mut Storage,
+    name: &str,
+) -> Result<(String, DecodedImage), BitmapError> {
+    let resolved = resolve_storage_name(storage, name)?;
+    let bytes = storage.read(&resolved).map_err(|e| match e {
+        engine::storage::ReadError::NotFound(n) => BitmapError::NotFound(n),
+        other => BitmapError::Read(resolved.clone(), other.to_string()),
+    })?;
+    let decoded = decode_image(&resolved, &bytes)?;
+    Ok((resolved, decoded))
+}
+
+/// Overwrite an existing bitmap's pixels/size in place (the async loader
+/// reuses its instance-owned bitmap instead of orphaning the previous one
+/// on every `loadAsync`).
+pub fn replace_bitmap_rgba(
+    scene: &mut scene::Scene,
+    id: u32,
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+) {
+    let Some(bmp) = scene.bitmap_mut(id) else {
+        return;
+    };
+    bmp.width = width;
+    bmp.height = height;
+    bmp.rgba = rgba;
+    bmp.mark_dirty();
+}
+
+/// Load a bitmap from game storage and register it in the scene, returning
+/// its id. Equivalent to [`load_bitmap_into_storage`] with no target.
 pub fn load_bitmap_from_storage(
     scene: &mut scene::Scene,
     cache: &mut BitmapCache,
@@ -91,23 +281,52 @@ pub fn load_bitmap_from_storage(
     name: &str,
     request_hint: Option<(u32, u32)>,
 ) -> Result<u32, BitmapError> {
-    // `request_hint` is reserved for the reference's size-requested loads;
-    // see the doc comment. (Borrowed-until-used so the parameter is not
-    // dead while we wait for that feature.)
+    load_bitmap_into_storage(scene, cache, storage, name, None, request_hint)
+}
+
+/// Load a bitmap from game storage, optionally **into an existing scene
+/// bitmap** (`target`) so a re-`load` replaces the pixels in place instead
+/// of orphaning the old bitmap.
+///
+/// Semantics match the reference `Bitmap(name)` constructor / `load(name)`:
+/// 1. The name is normalized like the engine does (case-insensitive,
+///    `\` → `/`) and probed with the [`EXTENSION_PROBE`] list, so
+///    `Bitmap("FRM_0501b")` finds `FRM_0501b.webp` while
+///    `Bitmap("bg/bg01a01.webp")` matches exactly.
+/// 2. `target == None` returns a **fresh, independently-owned** scene
+///    bitmap. A [`BitmapCache`] hit only avoids re-decoding: its pixels are
+///    copied into the new bitmap. This matches the reference, where
+///    `TVPLoadGraphic` copies the cached image into every `Bitmap`
+///    (`AssignToTexture`), so `Bitmap("x")` twice yields two bitmaps that
+///    can be mutated independently.
+/// 3. `target == Some(id)` decodes and overwrites that existing bitmap in
+///    place (the reference `Bitmap.load` replaces the current image).
+///
+/// `request_hint` is the reference's desired-size load (`desw`/`desh`); it
+/// is not used by the current renderer (which always draws at intrinsic
+/// size), so the parameter is accepted and ignored.
+pub fn load_bitmap_into_storage(
+    scene: &mut scene::Scene,
+    cache: &mut BitmapCache,
+    storage: &mut Storage,
+    name: &str,
+    target: Option<u32>,
+    request_hint: Option<(u32, u32)>,
+) -> Result<u32, BitmapError> {
     let _ = request_hint;
 
-    let normalized = normalize_storage_name(name);
+    let resolved = resolve_storage_name(storage, name)?;
 
-    // Probe extensions. `""` first → an explicit extension always wins.
-    let resolved = EXTENSION_PROBE
-        .iter()
-        .map(|ext| format!("{normalized}{ext}"))
-        .find(|cand| storage.exists(cand))
-        .ok_or_else(|| BitmapError::NotFound(name.to_string()))?;
-
-    // The reference caches bitmaps by storage name: reuse the registered
-    // bitmap if this file is already in the scene.
-    if let Some(&id) = cache.by_name.get(&resolved) {
+    // A fresh load copies from the cached template (independently owned).
+    if target.is_none()
+        && let Some(&template) = cache.by_name.get(&resolved)
+        && let Some(bmp) = scene.bitmap(template)
+    {
+        let (w, h, rgba) = (bmp.width, bmp.height, bmp.rgba.clone());
+        let id = scene.add_bitmap(w, h, rgba);
+        if let Some(b) = scene.bitmap_mut(id) {
+            b.name = Some(resolved);
+        }
         return Ok(id);
     }
 
@@ -116,64 +335,259 @@ pub fn load_bitmap_from_storage(
         other => BitmapError::Read(resolved.clone(), other.to_string()),
     })?;
 
-    let rgba = decode_bytes(&resolved, &bytes)?;
-    let id = scene.add_bitmap(rgba.width(), rgba.height(), rgba.into_raw());
+    let decoded = decode_image(&resolved, &bytes)?;
+
+    let id = match target {
+        Some(tid) if scene.bitmap(tid).is_some() => {
+            let (w, h, rgba) = (decoded.width, decoded.height, decoded.rgba);
+            let b = scene.bitmap_mut(tid).expect("checked above");
+            b.width = w;
+            b.height = h;
+            b.rgba = rgba;
+            b.mark_dirty();
+            tid
+        }
+        _ => scene.add_bitmap(decoded.width, decoded.height, decoded.rgba),
+    };
     if let Some(b) = scene.bitmap_mut(id) {
         b.name = Some(resolved.clone());
     }
-    cache.by_name.insert(resolved, id);
+    // Only a freshly-decoded bitmap becomes the pristine cache template; an
+    // explicit `target` is instance-owned and must not be mutated through
+    // the cache by a later load.
+    if target.is_none() {
+        cache.by_name.insert(resolved, id);
+    }
     Ok(id)
 }
 
-/// Decode image bytes into an RGBA8 buffer.
-///
-/// Format is detected by the file extension first (task: extension wins),
-/// falling back to magic-byte sniffing when the extension is absent or
-/// lies (the reference itself routes purely by magic bytes in
-/// `TVPLoadGraphicRouter`).
-fn decode_bytes(name: &str, bytes: &[u8]) -> Result<image::RgbaImage, BitmapError> {
-    // KiriKiri's native TLG5/TLG6 format — decoded in `tlg.rs` (the full
-    // decoder is a subagent task; until it lands, return a 1x1 blank so
-    // the load path can continue).
-    if name.to_ascii_lowercase().ends_with(".tlg") {
-        if let Ok(img) = crate::tlg::decode_tlg(bytes) {
-            return Ok(img);
-        }
-        return Ok(image::RgbaImage::from_pixel(
-            1,
-            1,
-            image::Rgba([0, 0, 0, 255]),
-        ));
-    }
-    let fmt_by_ext = Path::new(name)
-        .extension()
-        .and_then(image::ImageFormat::from_extension);
-    if let Some(fmt) = fmt_by_ext
-        && let Ok(img) = image::load_from_memory_with_format(bytes, fmt)
-    {
-        return Ok(img.to_rgba8());
-    }
-    let fmt = image::guess_format(bytes)
-        .map_err(|e| BitmapError::Decode(name.to_string(), e.to_string()))?;
-    image::load_from_memory_with_format(bytes, fmt)
-        .map(|img| img.to_rgba8())
-        .map_err(|e| BitmapError::Decode(name.to_string(), e.to_string()))
+/// Read only an image's header (size + alpha) from storage, for
+/// `Bitmap.loadHeader`.
+pub fn load_image_header(
+    storage: &mut Storage,
+    name: &str,
+) -> Result<(u32, u32, bool), BitmapError> {
+    let resolved = resolve_storage_name(storage, name)?;
+    let bytes = storage.read(&resolved).map_err(|e| match e {
+        engine::storage::ReadError::NotFound(n) => BitmapError::NotFound(n),
+        other => BitmapError::Read(resolved.clone(), other.to_string()),
+    })?;
+    let decoded = decode_image(&resolved, &bytes)?;
+    Ok((decoded.width, decoded.height, decoded.has_alpha))
 }
 
 /// Create a blank bitmap and register it in the scene, returning its id.
 ///
 /// Mirrors the reference `Bitmap(width, height)` constructor
 /// (`tTJSNC_Bitmap::Construct` → `new tTVPBaseBitmap(w, h, bpp)`). Note on
-/// contents: the reference leaves the backing texture **uninitialized**
-/// (`glTexImage2D(..., nullptr)` in `RenderManager_ogl.cpp` — actual pixels
-/// are driver-dependent garbage). We instead fill with deterministic
-/// transparent black (RGBA 0,0,0,0) so the renderer always sees defined
-/// data; the reference itself only defines contents via the colorkey/
-/// `SetPixel`/`FillRect` APIs. Zero sizes are clamped to 1, matching the
-/// reference's `SetSize` behavior.
+/// contents: the reference leaves the backing texture **uninitialized**;
+/// we instead fill with deterministic transparent black (RGBA 0,0,0,0).
+/// Zero sizes are clamped to 1, matching the reference's `SetSize`
+/// behavior.
 pub fn add_blank_bitmap(scene: &mut scene::Scene, w: u32, h: u32) -> u32 {
     let w = w.max(1);
     let h = h.max(1);
     let rgba = vec![0u8; w as usize * h as usize * 4];
     scene.add_bitmap(w, h, rgba)
+}
+
+/// Resize a bitmap, preserving the overlapping top-left region and filling
+/// any expanded area with transparent black — the reference
+/// `SetSizeWithFill(w, h, 0)` used by `Bitmap.setSize` / `width=` /
+/// `height=`. Zero dimensions are clamped to 1.
+pub fn resize_bitmap_keep(scene: &mut scene::Scene, id: u32, w: u32, h: u32) {
+    let w = w.max(1);
+    let h = h.max(1);
+    let Some(bmp) = scene.bitmap(id) else {
+        return;
+    };
+    if bmp.width == w && bmp.height == h {
+        return;
+    }
+    let old_w = bmp.width;
+    let old_h = bmp.height;
+    let mut rgba = vec![0u8; w as usize * h as usize * 4];
+    let copy_w = old_w.min(w) as usize;
+    let copy_h = old_h.min(h) as usize;
+    for y in 0..copy_h {
+        let src = &bmp.rgba[y * old_w as usize * 4..(y * old_w as usize + copy_w) * 4];
+        let dst = &mut rgba[y * w as usize * 4..(y * w as usize + copy_w) * 4];
+        dst.copy_from_slice(src);
+    }
+    let Some(bmp) = scene.bitmap_mut(id) else {
+        return;
+    };
+    bmp.width = w;
+    bmp.height = h;
+    bmp.rgba = rgba;
+    bmp.mark_dirty();
+}
+
+/// Image encoders this crate can write, mirroring the reference save
+/// handlers for the formats the `image` crate supports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaveFormat {
+    Png,
+    Jpeg,
+    Bmp,
+}
+
+/// Map a script `save(name, type)` type string to an encoder, following the
+/// reference `AcceptSave` predicates (`TVPAcceptSaveAsPNG` /
+/// `TVPAcceptSaveAsBMP` / `TVPAcceptSaveAsJPG`): a `StartsWith` on the bare
+/// name, or the exact dotted extension.
+pub fn save_format_from_type(type_name: &str) -> Option<SaveFormat> {
+    let t = type_name.to_ascii_lowercase();
+    if t.starts_with("png") || t == ".png" {
+        Some(SaveFormat::Png)
+    } else if t.starts_with("bmp") || t == ".bmp" || t == ".dib" {
+        Some(SaveFormat::Bmp)
+    } else if t.starts_with("jpg")
+        || t.starts_with("jpeg")
+        || t == ".jpg"
+        || t == ".jpeg"
+        || t == ".jif"
+    {
+        Some(SaveFormat::Jpeg)
+    } else {
+        None
+    }
+}
+
+/// Encode an RGBA8 buffer in `format`. JPEG has no alpha, so its alpha is
+/// dropped (matching the reference's JPEG save).
+pub fn encode_image(
+    format: SaveFormat,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+) -> Result<Vec<u8>, BitmapError> {
+    use image::ImageEncoder;
+    let mut out = Vec::new();
+    let res = match format {
+        SaveFormat::Png => image::codecs::png::PngEncoder::new(&mut out).write_image(
+            rgba,
+            width,
+            height,
+            image::ExtendedColorType::Rgba8,
+        ),
+        SaveFormat::Jpeg => {
+            let rgb: Vec<u8> = rgba
+                .chunks_exact(4)
+                .flat_map(|p| [p[0], p[1], p[2]])
+                .collect();
+            image::codecs::jpeg::JpegEncoder::new(&mut out).write_image(
+                &rgb,
+                width,
+                height,
+                image::ExtendedColorType::Rgb8,
+            )
+        }
+        SaveFormat::Bmp => image::codecs::bmp::BmpEncoder::new(&mut out).write_image(
+            rgba,
+            width,
+            height,
+            image::ExtendedColorType::Rgba8,
+        ),
+    };
+    res.map(|()| out)
+        .map_err(|e| BitmapError::Save(format!("{format:?}").to_ascii_lowercase(), e.to_string()))
+}
+
+/// Write an encoded bitmap to the game directory (the reference
+/// `TVPSaveImage` / `TVPCreateStream(write)` path). The storage name is
+/// normalized (`\` → `/`, ASCII-lowercased) and resolved under the mount's
+/// game directory; parent directories are created. Path traversal outside
+/// the game directory is rejected.
+pub fn save_bitmap_to_storage(
+    storage: &Storage,
+    name: &str,
+    format: SaveFormat,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+) -> Result<(), BitmapError> {
+    let bytes = encode_image(format, width, height, rgba)?;
+    let normalized = normalize_storage_name(name);
+    let relative = Path::new(&normalized);
+    if relative.components().any(|c| {
+        matches!(
+            c,
+            std::path::Component::ParentDir | std::path::Component::RootDir
+        )
+    }) {
+        return Err(BitmapError::Save(
+            name.to_string(),
+            "path escapes the game directory".into(),
+        ));
+    }
+    let path = storage.game_dir().join(relative);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| BitmapError::Save(name.to_string(), e.to_string()))?;
+    }
+    std::fs::write(&path, bytes).map_err(|e| BitmapError::Save(name.to_string(), e.to_string()))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pattern(w: u32, h: u32) -> Vec<u8> {
+        (0..w * h)
+            .flat_map(|i| {
+                let x = i % w;
+                let y = i / w;
+                [(x * 7) as u8, (y * 11) as u8, 128, 255]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn format_for_name_maps_reference_spellings() {
+        assert_eq!(format_for_name("a.jpg"), Some(ImageFormat::Jpeg));
+        assert_eq!(format_for_name("a.jif"), Some(ImageFormat::Jpeg));
+        assert_eq!(format_for_name("a.bmp"), Some(ImageFormat::Bmp));
+        assert_eq!(format_for_name("a.dib"), Some(ImageFormat::Bmp));
+        assert_eq!(format_for_name("a.png"), Some(ImageFormat::Png));
+        assert_eq!(format_for_name("a.tlg"), None, "TLG is routed separately");
+    }
+
+    #[test]
+    fn save_format_matches_reference_accept_predicates() {
+        assert_eq!(save_format_from_type("bmp"), Some(SaveFormat::Bmp));
+        assert_eq!(save_format_from_type(".dib"), Some(SaveFormat::Bmp));
+        assert_eq!(save_format_from_type("png"), Some(SaveFormat::Png));
+        assert_eq!(save_format_from_type(".jpeg"), Some(SaveFormat::Jpeg));
+        assert_eq!(save_format_from_type(".jif"), Some(SaveFormat::Jpeg));
+        assert_eq!(save_format_from_type("tlg6"), None);
+    }
+
+    #[test]
+    fn encode_decode_roundtrip_lossless_formats() {
+        let (w, h) = (9u32, 5u32);
+        let rgba = pattern(w, h);
+        for fmt in [SaveFormat::Png, SaveFormat::Bmp] {
+            let bytes = encode_image(fmt, w, h, &rgba).unwrap();
+            let name = match fmt {
+                SaveFormat::Png => "x.png",
+                SaveFormat::Bmp => "x.bmp",
+                SaveFormat::Jpeg => unreachable!(),
+            };
+            let decoded = decode_image(name, &bytes).unwrap();
+            assert_eq!((decoded.width, decoded.height), (w, h));
+            assert_eq!(decoded.rgba, rgba, "{fmt:?} is lossless");
+        }
+    }
+
+    #[test]
+    fn encode_jpeg_has_no_alpha_and_correct_size() {
+        let (w, h) = (8u32, 6u32);
+        let bytes = encode_image(SaveFormat::Jpeg, w, h, &pattern(w, h)).unwrap();
+        let decoded = decode_image("x.jpg", &bytes).unwrap();
+        assert_eq!((decoded.width, decoded.height), (w, h));
+        assert!(!decoded.has_alpha);
+        assert!(decoded.rgba.iter().any(|&b| b != 0));
+    }
 }

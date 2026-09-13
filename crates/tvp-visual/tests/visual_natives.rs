@@ -309,3 +309,44 @@ fn tbutton_sprite_sheet_cell_setup() {
         "setButton(1) pans the sheet to the second cell"
     );
 }
+
+/// `Bitmap.loadAsync` decodes on a background thread; the VM poll hook
+/// `natives::bitmap::async_poll` applies the pixels, clears `loading`, and
+/// dispatches the script `onLoaded` — the `Album.tjs` PreviewThumbnail
+/// pattern (`system/Album.tjs:1275` `loadAsync`, `:1286` `onLoaded`). The
+/// app's `timer_poll` calls `async_poll`; the test drives it directly (the
+/// `natives/mod.rs` wiring is a one-line hook outside this task's scope).
+#[test]
+fn bitmap_load_async_fires_on_loaded_via_poll() {
+    let env = Env::new();
+    let (w, h) = (5u32, 3u32);
+    let rgba: Vec<u8> = (0..w * h).flat_map(|_| [0u8, 255, 0, 255]).collect();
+    env.write_webp("async_img.webp", &rgba, w, h);
+
+    env.run(
+        "var fired = 0; \
+         class ProbeBitmap extends Bitmap { \
+           function ProbeBitmap() { Bitmap(); } \
+           function onLoaded(meta, async, error, message) { \
+             fired++; \
+           } \
+         } \
+         var b = new ProbeBitmap(); b.loadAsync('async_img');",
+    );
+    // The VM thread never blocks: `loading` is set synchronously and only
+    // cleared by the poll, so this assertion is deterministic.
+    assert_eq!(env.eval_int("b.loading"), 1, "loading set synchronously");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        tvp_visual::natives::bitmap::async_poll(&env.engine);
+        if env.eval_int("b.loading") == 0 {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "async load timed out");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert_eq!(env.eval_int("b.width"), i64::from(w));
+    assert_eq!(env.eval_int("b.height"), i64::from(h));
+    assert_eq!(env.eval_int("fired"), 1, "onLoaded fired exactly once");
+}

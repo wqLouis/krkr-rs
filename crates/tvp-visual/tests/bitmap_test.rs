@@ -73,6 +73,11 @@ fn write_encoded(dir: &Path, name: &str, rgba: &[u8], w: u32, h: u32, fmt: image
                 .encode(rgba, w, h, ExtendedColorType::Rgba8)
                 .expect("webp encode");
         }
+        image::ImageFormat::Bmp => {
+            image::codecs::bmp::BmpEncoder::new(&mut bytes)
+                .write_image(rgba, w, h, ExtendedColorType::Rgba8)
+                .expect("bmp encode");
+        }
         other => panic!("unsupported test format {other:?}"),
     }
     fs::write(dir.join(name), bytes).expect("write encoded image");
@@ -138,21 +143,22 @@ fn extension_probing_finds_extensionless_name() {
 }
 
 #[test]
-fn cache_returns_same_id_for_same_file() {
+fn cache_avoids_redecode_but_each_load_is_independent() {
     let mut scene = Scene::default();
     let mut cache = BitmapCache::default();
     let mut storage = fixture_storage();
 
-    // First load resolves `frm_06r97` → `frm_06r97.webp` and caches it
-    // under the resolved name; the second query (with the explicit
-    // extension) must hit that cache entry and return the same id — the
-    // reference shares cached bitmaps by storage name.
+    // First load resolves `frm_06r97` → `frm_06r97.webp` and caches a
+    // pristine template; the second query (with the explicit extension)
+    // hits that cache (no re-decode) but gets its own pixel buffer, matching
+    // the reference `AssignToTexture` copy.
     let a = load_bitmap_from_storage(&mut scene, &mut cache, &mut storage, "frm_06r97", None)
         .expect("load 1");
     let b = load_bitmap_from_storage(&mut scene, &mut cache, &mut storage, FIXTURE_WEBP, None)
         .expect("load 2");
-    assert_eq!(a, b, "same file must map to one shared bitmap");
-    assert_eq!(scene.bitmaps.len(), 1, "no duplicate bitmap registered");
+    assert_ne!(a, b, "each Bitmap owns its pixels");
+    assert_eq!(scene.bitmaps.len(), 2, "template + one owned copy");
+    assert_eq!(scene.bitmap(a).unwrap().rgba, scene.bitmap(b).unwrap().rgba);
     assert!(cache.by_name.contains_key(FIXTURE_WEBP));
 }
 
@@ -192,8 +198,11 @@ fn case_insensitive_queries_alias() {
         .expect("uppercase query resolves");
     let b = load_bitmap_from_storage(&mut scene, &mut cache, &mut storage, "frm_06r97", None)
         .expect("lowercase query resolves");
-    assert_eq!(a, b, "case variants alias to the same bitmap");
-    assert_eq!(scene.bitmaps.len(), 1);
+    // Case variants resolve to one cached template (one decode) but each
+    // load owns its pixels.
+    assert_ne!(a, b);
+    assert_eq!(scene.bitmaps.len(), 2);
+    assert_eq!(scene.bitmap(a).unwrap().rgba, scene.bitmap(b).unwrap().rgba);
 }
 
 #[test]
@@ -254,5 +263,90 @@ fn roundtrip_png_jpeg_webp_through_storage() {
         } else {
             assert!(bmp.rgba.iter().any(|&p| p != 0), "{name} must have content");
         }
+    }
+}
+
+/// A deterministic RGBA test pattern (opaque, so BMP/PNG stay lossless).
+fn pattern(w: u32, h: u32) -> Vec<u8> {
+    (0..w * h)
+        .flat_map(|i| {
+            let x = i % w;
+            let y = i / w;
+            [(x * 13) as u8, (y * 29) as u8, 0x80, 255]
+        })
+        .collect()
+}
+
+/// Every format the native pipeline must decode, including the reference's
+/// alternate spellings `.dib` (BMP) and `.jif` (JPEG), with **exact**
+/// dimensions. PNG/BMP/WebP are lossless (pixels exact); JPEG is lossy.
+#[test]
+fn decodes_every_supported_format_with_exact_dimensions() {
+    let (w, h) = (13u32, 7u32);
+    let rgba = pattern(w, h);
+    let dir = TempDir::new("formats");
+    write_encoded(dir.path(), "a.png", &rgba, w, h, image::ImageFormat::Png);
+    write_encoded(dir.path(), "a.bmp", &rgba, w, h, image::ImageFormat::Bmp);
+    write_encoded(dir.path(), "a.dib", &rgba, w, h, image::ImageFormat::Bmp);
+    write_encoded(dir.path(), "a.jpg", &rgba, w, h, image::ImageFormat::Jpeg);
+    write_encoded(dir.path(), "a.jif", &rgba, w, h, image::ImageFormat::Jpeg);
+    write_encoded(dir.path(), "a.webp", &rgba, w, h, image::ImageFormat::WebP);
+
+    let mut storage = Storage::mount(dir.path()).expect("temp dir mounts");
+    let mut scene = Scene::default();
+    let mut cache = BitmapCache::default();
+    for (name, lossless) in [
+        ("a.png", true),
+        ("a.bmp", true),
+        ("a.dib", true),
+        ("a.webp", true),
+        ("a.jpg", false),
+        ("a.jif", false),
+    ] {
+        let id = load_bitmap_from_storage(&mut scene, &mut cache, &mut storage, name, None)
+            .unwrap_or_else(|e| panic!("load {name}: {e}"));
+        let bmp = scene.bitmap(id).unwrap();
+        assert_eq!((bmp.width, bmp.height), (w, h), "{name} dimensions");
+        assert_eq!(bmp.rgba.len(), (w * h * 4) as usize, "{name} buffer");
+        if lossless {
+            assert_eq!(bmp.rgba, rgba, "{name} pixels are lossless");
+        }
+    }
+}
+
+/// The committed real-game fixture is a **lossy** (VP8) WebP with an alpha
+/// chunk; the decoder must handle lossy webp and report its exact size.
+#[test]
+fn real_game_lossy_webp_decodes_with_exact_size() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(FIXTURE_WEBP);
+    let bytes = fs::read(&path).expect("fixture reads");
+    // RIFF container with a `VP8 ` (lossy) chunk, not `VP8L` (lossless).
+    assert!(
+        bytes.windows(4).any(|c| c == b"VP8 "),
+        "fixture must be lossy VP8 webp"
+    );
+    assert!(!bytes.windows(4).any(|c| c == b"VP8L"));
+    let decoded = tvp_visual::bitmap::decode_image(FIXTURE_WEBP, &bytes).expect("lossy webp");
+    assert_eq!((decoded.width, decoded.height), (FIXTURE_W, FIXTURE_H));
+    assert!(decoded.has_alpha, "the fixture has an ALPH chunk");
+    assert_eq!(decoded.rgba.len(), (FIXTURE_W * FIXTURE_H * 4) as usize);
+}
+
+/// The real-game TLG5/TLG6 fixtures decode with exact dimensions through the
+/// same `load_bitmap_from_storage` path the natives use.
+#[test]
+fn real_game_tlg_fixtures_decode_with_exact_size() {
+    let mut storage = fixture_storage();
+    let mut scene = Scene::default();
+    let mut cache = BitmapCache::default();
+    for name in ["frm_0303a.tlg", "frm_0303b.tlg"] {
+        let id = load_bitmap_from_storage(&mut scene, &mut cache, &mut storage, name, None)
+            .unwrap_or_else(|e| panic!("load {name}: {e}"));
+        let bmp = scene.bitmap(id).unwrap();
+        assert_eq!((bmp.width, bmp.height), (280, 200), "{name} dimensions");
+        assert_eq!(bmp.rgba.len(), (280 * 200 * 4) as usize, "{name} buffer");
+        assert!(bmp.rgba.iter().any(|&p| p != 0), "{name} has content");
     }
 }

@@ -274,6 +274,10 @@ pub fn register_visual(
 /// Fire due timers. The app's update loop calls this with a monotonic
 /// millisecond clock. Timer callbacks run synchronously on the VM thread.
 pub fn timer_poll(engine: &Tjs2Engine, now_ms: u64) {
+    // Apply any completed async `Bitmap` loads and fire their `onLoaded`
+    // (`BitmapIntf.cpp:367` `loadAsync`). Must run on the VM thread's poll
+    // phase, before the paint handlers below.
+    bitmap::async_poll(engine);
     layer::transition_poll(engine);
     timer::timer_poll(engine, now_ms);
     // Fire the script `onPaint` handlers requested by `update()` this frame
