@@ -24,9 +24,12 @@ Reference engine in tree: `reference/` (the **KrKr2 Emulator**,
 | F | Out-of-process Wine worker for one **self-contained compute** task (e.g. a Windows-only codec), shared-memory IPC | **Viable-with-caveats** | Clean isolation, bounded surface; but krkr-rs already decodes the game's audio natively, so the value is niche. |
 | G | Continue the **native Rust reimplementation** (current) | **Viable** — recommended | Already working; matches what Kirikiroid2 and the KrKr2 reference do. |
 | H | **ARM/Android** Wine + box64/box86 + Winlator/Hangover | **Not viable for embedding; viable only as a full Windows app under Wine** | i386 PE needs WoW64 + Box64/FEX (Hangover) or Box86; extra 2–10×+ emulation; still Wine-owned process/window. |
+| I | **Minimal Wayland compositor as Wine's display backend** (Android + box64): run Windows `.exe`s, not the DLLs | **Viable-with-caveats** for running Windows games; **not** a way to call the game's DLLs in-process | Wine's `winewayland.drv` needs only a small strict set of globals that Smithay already provides; the hard parts are the Android EGL backend and the box64/Wine packaging. See §12. |
 
-The two approaches worth sketching are **D** (window-level coexistence) and **E**
-(process-level, same-address-space DLL loading). See §8.
+The two **DLL-focused** approaches worth sketching are **D** (window-level
+coexistence) and **E** (process-level, same-address-space DLL loading). See §8.
+The separate, more promising **product** path — running whole Windows `.exe`s
+under Wine behind an in-app minimal Wayland compositor — is evaluated in §12.
 
 ---
 
@@ -557,6 +560,258 @@ Scale: **S** < 1 day · **M** ~days · **L** ~1–3 weeks · **XL** months.
 On ARM/Android, the same conclusion holds: Wine + Box64/Hangover/Winlator can run
 a *Windows* KiriKiri app, but it cannot inject those DLLs into krkr-rs, and this
 package does not contain a Windows engine to run.
+
+This recommendation concerns **coupling Wine to krkr-rs**. A *separate* goal —
+running arbitrary Windows `.exe`s behind an in-app minimal Wayland compositor —
+is evaluated in §12, and the relationship between the two product paths is
+summarised in §13.
+
+---
+
+## 12. Minimal Wayland compositor as Wine's display backend (Android + box64)
+
+This is a **different product goal** from §1–§11: not "call the game's DLLs from
+krkr-rs", but "run arbitrary **Windows `.exe`s** (x86/x86_64) on Android with
+box64, without a desktop, X11, or full DE". The app owns the Android surface
+(`ANativeWindow`) and runs a **minimal Wayland compositor** inside itself; Wine
+connects to that compositor as an ordinary Wayland client and renders into it.
+The `.dll`-calling question is explicitly **secondary / out of scope** here.
+
+### 12.1 What Wine's Wayland driver actually requires
+
+`dlls/winewayland.drv/wayland.c` binds globals in `registry_handle_global`
+(`:93`) and then hard-fails in the "required protocol globals" block
+(`:325-349`):
+
+| Global | Required? | Source |
+|---|---|---|
+| `wl_compositor` (v4) | **hard** (init fails) | `wayland.c:116-119`, check `:326` |
+| `xdg_wm_base` (v2) | **hard** | `:121-128`, check `:331` |
+| `wl_shm` (v1) | **hard** | `:130-132`, check `:336` |
+| `wl_subcompositor` | **hard** | `:161-164`, check `:341` |
+| `wp_viewporter` (v1) | **hard** | `:156-159`, check `:346` |
+| `wl_output` (+ `zxdg_output_manager_v1` v≤3) | needed in practice (screen size/scale) | `:99-114` |
+| `wl_seat` (v≤8) | needed in practice (input) | `:134-151`, `seat_listener :83` |
+| `zwp_pointer_constraints_v1`, `zwp_relative_pointer_manager_v1`, `zwp_text_input_manager_v3`, `wl_data_device_manager`/`zwlr_data_control_manager_v1`, `xdg_toplevel_icon_manager_v1`, `wp_fractional_scale_manager_v1` | optional (ERR + continue) | `:352-374` |
+| `wp_cursor_shape_manager_v1`, `wp_pointer_warp_v1`, `wp_alpha_modifier_v1`, `wl_fixes` | optional, bound if present | `:197-226` |
+
+Notably, **`zwp_linux_dmabuf_v1` is not in Wine's list.** Grepping the whole
+driver for `linux_dmabuf`/`zwp_linux` finds nothing. Wine's *own* window buffer
+path is **`wl_shm`**: `window_surface.c` defines `struct wayland_shm_buffer`
+(`:59`, created at `:135/:159`) and `wayland_surface.c:507` attaches it with
+`wl_surface_attach`. Child/owned Win32 windows become **subsurfaces**
+(`wayland_surface.c:386-390` `wl_subcompositor_get_subsurface`, `:402`
+`wl_subsurface_set_desync`). That is why `wl_subcompositor` is hard-required
+even though there is no "desktop".
+
+So the **CPU baseline is `wl_shm`** and is sufficient for GDI-windowed apps
+(which includes most visual novels and 2D games).
+
+GPU acceleration is a different story, and it does **not** go through Wine's
+shm buffers:
+
+* **OpenGL / D3D-via-wined3d:** `opengl.c` creates a `wl_egl_window`
+  (`:51`, `:98` `wl_egl_window_create`) and calls `eglCreateWindowSurface`
+  (`:99`) with `EGL_PLATFORM_WAYLAND_KHR` (`:114`). The **native Mesa EGL
+driver** (running inside the Wine process) decides how to present — normally
+  dmabuf, falling back to shm.
+* **Vulkan (native Vulkan games / DXVK / vkd3d):** `vulkan.c:41-56` builds a
+  `VkWaylandSurfaceKHR` on Wine's own `process_wayland.wl_display` and the
+  window's `wl_surface` (`p_vkCreateWaylandSurfaceKHR`). The **native Vulkan
+driver** presents directly to the compositor via Wayland WSI (dmabuf).
+
+Therefore the compositor should advertise `zwp_linux_dmabuf_v1` and import
+dmabufs to get accelerated games — but it is **Mesa/the app's GL/Vulkan stack**
+that binds it, not `winewayland.drv`.
+
+**Can a Smithay compositor satisfy this?** Yes, for the strict set and most of
+the optional set:
+
+* `CompositorState::new` creates **both** `wl_compositor` and `wl_subcompositor`
+  in one delegate (`src/wayland/compositor/mod.rs:5-6`, `:689-726`).
+* Smithay ships `shm`, `shell::xdg`, `viewporter`, `fractional_scale`,
+  `output` (`zxdg_output_manager_v1`), `seat`, `dmabuf` (linux-dmabuf +
+  `import_dmabuf` in the GLES renderer), `pointer_constraints`,
+  `relative_pointer`, `pointer_warp`, `cursor_shape.rs`, `alpha_modifier`,
+  `xdg_toplevel_icon.rs`, `text_input`, `fixes.rs`, and `selection`
+  (`wl_data_device_manager`).
+* dmabuf import is real: `src/wayland/dmabuf/mod.rs` + `GlesRenderer::import_dmabuf`
+  (`backend/renderer/gles/mod.rs:1258`) via EGLImage (`:85`).
+* Only `zwlr_data_control_manager_v1` (a wlroots extension) has no Smithay
+  equivalent; Wine falls back to `wl_data_device_manager`.
+
+`examples/minimal.rs` in Smithay is already a **client-usable, winit-backed
+compositor**: it creates `Display`, `CompositorState`, `ShmState`,
+`XdgShellState`, `SeatState` (`:143-154`), binds a real socket
+(`ListeningSocket::bind("wayland-5") :162`), sets `WAYLAND_DISPLAY` (`:171`),
+and accepts external clients (`insert_client :244`). It is missing only
+`wp_viewporter` and an `wl_output`, which are small additions.
+
+**Xwayland / Xvfb fallback.** If a game needs `winex11.drv` (some do), run
+**Xwayland** as a client of our compositor and set Wine's `Graphics` driver
+accordingly (`HKCU\Software\Wine\Drivers\Graphics = wayland,x11`, the same key
+the Hangover README documents). That keeps GPU paths but adds Xwayland
+integration (`xwayland_shell`, `xwayland_keyboard_grab` exist in Smithay).
+`Xvfb` is the degenerate fallback: no Wayland, but nothing GPU-accelerated -
+you would capture an X11 framebuffer on the CPU.
+
+### 12.2 Compositing Wine's buffers into the Android surface
+
+The app owns the `ANativeWindow` (NativeActivity/GameActivity). Two decisions:
+
+**Which renderer composites?** Smithay core ships a **GLES** renderer and a
+**pixman** (CPU) renderer; it has **no wgpu renderer**. So:
+
+| Path | Mechanism | Cost / verdict |
+|---|---|---|
+| **GLES (recommended)** | Create an EGL context/surface on the `ANativeWindow`; Smithay `GlesRenderer`; import client shm and dmabufs (EGLImage) | Best performance; needs an Android EGL bridge (below) |
+| **CPU (baseline)** | Smithay `pixman` composites shm buffers; upload to wgpu/GLES texture | Trivial to prove, too slow for real games |
+| **wgpu** | Drive `ANativeWindow` with wgpu/Bevy; feed Smithay's client buffers in as wgpu textures | wgpu has no stable dmabuf-import API, so zero-copy is hard; a custom renderer is a sizeable project |
+
+**Android EGL gap.** Smithay's `EGLNativeDisplay`/`EGLNativeSurface` are public
+traits (`backend/egl/native.rs:131`, `:284`) but the only impls are GBM, X11, and
+Wayland (`:378`, `:401`); there is **no `EGL_PLATFORM_ANDROID_KHR` impl**. Two
+ways out: (a) implement the traits for Android
+(`eglGetPlatformDisplay(EGL_PLATFORM_ANDROID_KHR, EGL_DEFAULT_DISPLAY, …)` +
+`eglCreateWindowSurface(display, config, ANativeWindow*, …)`); or (b) create the
+EGL display externally with `khronos-egl`/`ndk` and wrap it with
+`EGLDisplay::from_raw` (documented at `backend/egl/display.rs:239-241`). This is
+bounded, well-defined work, but it is the first piece Smithay does not give you.
+
+**Zero-copy vs readback.** dmabuf import via EGLImage is true zero-copy on the
+GPU; the failure mode is Adreno/Turnip **format+modifier negotiation**
+(`zwp_linux_dmabuf_v1` feedback). The safe fallback is `wl_shm` for GDI apps and
+a GPU→CPU copy for accelerated ones (acceptable for a prototype, not for 60 fps).
+
+**Input injection.** Android touch/key events arrive in the app; the compositor
+injects them as `wl_pointer`/`wl_keyboard`/`wl_touch` on its `wl_seat`. Wine
+consumes them via `wayland_pointer.c` / `wayland_keyboard.c`
+(`wayland.c:65-86` seat capabilities). This needs an Android-keycode → evdev →
+XKB → Windows-VK mapping and pointer-region mapping (touch to the composited
+window rect). box64 is not involved in input.
+
+### 12.3 Process and lifecycle
+
+The app is the compositor **and** the launcher:
+
+```
+Wayland socket:  $XDG_RUNTIME_DIR/wayland-krkr   (app-private dir, mode 0700)
+WINEPREFIX:      <app files>/prefix              (wineboot on first run)
+env:             WAYLAND_DISPLAY=wayland-krkr, XDG_RUNTIME_DIR=<private dir>
+web:             HKCU\Software\Wine\Drivers\Graphics = wayland   (if autodetect fails)
+launch:          box64 wine game.exe   (or `wine game.exe` under Hangover)
+```
+
+* No desktop shell, no X server, no DE. Wine creates `xdg_toplevel`s
+  (`window.c:254-284`) which the compositor maps fullscreen (or scaled) into the
+  `ANativeWindow`; children become subsurfaces.
+* Wine still forks its own `wineserver` daemon; the compositor must keep
+  `display.dispatch_clients`/`flush_clients` running on its event loop while
+  Wine is alive.
+* Lifecycle = spawn Wine, wait, tear down the prefix/socket; handle crashes and
+  per-game env. This is ordinary process management and is the *easy* part.
+
+### 12.4 What already exists on Android, and what we build
+
+The Wine + box64 + GPU stack is largely productized already:
+
+* **Winlator** assembles Wine + **Box86/Box64** + Mesa **Turnip/Zink/VirGL** +
+  **DXVK/VKD3D** + wined3d as downloadable `.tzst` components — its repo has
+  `installable_components/box64/box64-0.3.{3,5,7}.tzst`,
+  `turnip-24.1.0/25.0.0/26.0.3`, `dxvk-0.96 … 2.3.1`, and
+  `wined3d-4.21/7.8/10.0`. It is a **full app + display server** today; our idea
+  is to replace its display layer with an in-app minimal Wayland compositor.
+* **Hangover** is aarch64 Wine with emulator DLLs: i386 via `wowbox64.dll`
+  (Box64, default), `libwow64fex.dll` (FEX), or `wow64cpu.dll` (native i386 on
+  x86_64); it breaks out of emulation at the Win32/Wine syscall boundary and has
+  Termux packages. It still needs a Wayland (or X11) compositor.
+* **box64** is the x86_64-on-ARM64 emulator (`DynaRec` "5–10× faster than the
+  interpreter alone"); 32-bit x86 needs box86/box32, or Wine's WOW64 build
+  ("experimental"), or Hangover's `wowbox64`.
+
+What **we** would build (the XL part): the minimal Smithay compositor + Android
+EGL backend + input bridge + the launcher/prefix-management UI. The Wine, box64,
+and GPU drivers are existing artifacts to bundle.
+
+**Performance / compatibility envelope:** x86_64 Windows games are the sweet
+spot (box64 + Turnip + DXVK); i386 games are the fragile case (box86 on
+AArch64-capable hosts, or experimental WOW64/Hangover); GPU compatibility
+depends on the device's Vulkan/GL drivers (Turnip for Adreno, Zink/VirGL
+otherwise). Expect a per-game compatibility matrix, not a guarantee.
+
+### 12.5 Smallest first milestone: prove it on Linux x86_64, then port
+
+Do **not** start on Android. Wine runs i386/x86_64 PE natively on x86_64, so the
+same compositor can be validated on the desktop with zero emulation:
+
+| Stage | Goal | Works? | Effort |
+|---|---|---|---|
+| **0** | Take Smithay `examples/minimal.rs`; add `ViewporterState` + one `wl_output` + fullscreen `xdg_toplevel` mapping. Run it with its winit output on Linux x86_64. | Compositor usable by external clients | **S/M** |
+| **1** | `WINEPREFIX=$(mktemp -d) WAYLAND_DISPLAY=wayland-5 wine notepad.exe` (or a 2D GDI game). Confirm Wine binds our globals, maps an `xdg_toplevel`, and renders through `wl_shm`. | CPU/GDI render proven | **S** |
+| **2** | Add `zwp_linux_dmabuf_v1` (Smithay `DmabufState` + `import_dmabuf`) and `wl_seat` input injection. Run a D3D/Vulkan Windows game; verify GPU presentation. | Accelerated render + input proven | **M/L** |
+| **3** | Replace the winit output with "composite into a texture" (Bevy/wgpu or GLES-on-GL) and expose a library API; add touch→`wl_seat`. | The in-app integration shape proven on desktop | **M** |
+| **4** | Android: NativeActivity/GameActivity + `ANativeWindow`; implement `EGLNativeDisplay`/`EGLNativeSurface` for Android (or `EGLDisplay::from_raw`); socket in app-private dir. | Wine renders into the Android surface | **L/XL** |
+| **5** | Bundle box64 + Wine (+ Turnip/DXVK); bootstrap/repair the prefix; per-game config and a launcher UI. | Shippable game runner | **XL** |
+
+Stage 0–2 are the decisive feasibility test and are cheap. If a stock Wine
+game cannot render through a ~300-line Smithay compositor on Linux x86_64, the
+Android stage will not rescue it.
+
+### 12.6 Verdict per stage, and the biggest risks
+
+| Stage | Verdict |
+|---|---|
+| 0 — minimal compositor (Linux) | **Viable** |
+| 1 — Wine GDI/`.exe` via `wl_shm` | **Viable** |
+| 2 — dmabuf GPU + input | **Viable-with-caveats** (modifier negotiation, seat mapping) |
+| 3 — composite into app texture | **Viable-with-caveats** (no wgpu renderer in Smithay; GLES or CPU) |
+| 4 — Android EGL + `ANativeWindow` | **Viable-with-caveats** (custom EGL platform; XL-ish) |
+| 5 — box64 + Wine packaging | **Viable-with-caveats** (per-game compat, drivers, maintenance) |
+
+Biggest risks:
+
+1. **Android EGL is not a Smithay platform.** The single largest new subsystem;
+   dmabuf modifier mismatches on mobile GPUs are a common failure mode.
+2. **wgpu is a poor fit for the compositor.** Smithay has no wgpu renderer, and
+   wgpu lacks stable dmabuf import, so the attractive "Bevy/wgpu owns everything"
+   design needs a custom renderer or an extra GPU→CPU copy. GLES keeps zero-copy.
+3. **Compatibility is a long tail.** box64/WOW64 + Turnip + DXVK + per-game
+   quirks is a support burden Winlator already carries; we would inherit it.
+4. **This is a games launcher, not the VN engine.** Running `.exe`s this way
+   conflicts with Android's app model (process lifetime, storage, audio focus,
+   permissions) and is a much larger, more fragile product than krkr-rs.
+5. **Licensing/distribution.** Wine LGPL-2.1 (bundle obligations), box64 MIT,
+   Winlator/Hangover LGPL-2.1; the Windows games themselves are the user's. Same
+   caution as §9.
+6. **It does not help the DLL problem.** Even with this running, the TVP plugin
+   DLLs still execute only inside Wine's process; krkr-rs still cannot call them
+   (§3–§4).
+
+---
+
+## 13. Two independent product paths
+
+The §12 Wayland/Wine work and the krkr-rs native port do **not** depend on each
+other, and should be decided separately:
+
+* **krkr-rs native reimplementation (approach G)** is the right path for
+  *running KiriKiri games with fidelity, performance, and control* — the current
+  goal. Keep reimplementing the plugin surface as built-in natives; do not route
+  it through Wine. This is where the existing investment already is.
+* **Wine + minimal Wayland compositor on Android (§12)** is the right path only
+  if the goal changes to *a general Windows-`.exe` runner* for games that are
+  **not** KiriKiri ports and have no native reimplementation. It is technically
+  promising (the strict protocol set is small, Smithay covers it, and the
+  Wine/box64/GPU stack exists) but it is a separate, XL-scale product with its
+  own compatibility and distribution burden.
+
+**Recommendation:** continue to invest in the native krkr-rs path; treat the
+Wayland-compositor runner as an independent, optional research track. If the
+runner is pursued, timebox **Stage 0–2 (Linux x86_64)** first — it is cheap and
+it answers the only question that matters: does a stock Wine game render and
+accept input through a minimal Smithay compositor? Only then commit to the
+Android/box64 packaging. Do not merge the two products into one engine, and keep
+"load the game's DLLs in-process" a non-goal in both.
 
 ---
 
