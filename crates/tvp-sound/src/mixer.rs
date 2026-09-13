@@ -94,6 +94,14 @@ pub struct Channel {
     pub paused: bool,
     /// Base volume in `0..=1`.
     pub volume: f32,
+    /// Secondary volume in `0..=1`, multiplied with [`Self::volume`] and
+    /// the mixer's global volume (reference `Volume2`; the game's
+    /// `volume2` property, used for config/per-voice volume).
+    pub volume2: f32,
+    /// Playback-rate multiplier (reference `frequency / sampleRate`); `1.0`
+    /// is native speed. Changes both pitch and tempo, matching the
+    /// reference's DirectSound frequency control.
+    pub rate: f64,
     /// Pan in `-1..=1` (`-1` full left, `+1` full right, `0` center).
     pub pan: f32,
     /// Loop the source forever.
@@ -120,6 +128,8 @@ impl Channel {
             playing: false,
             paused: false,
             volume: MAX_VOLUME,
+            volume2: MAX_VOLUME,
+            rate: 1.0,
             pan: 0.0,
             looping: false,
             position_seconds: 0.0,
@@ -197,18 +207,37 @@ impl Channel {
         self.fade_finished = false;
     }
 
+    /// Set the secondary volume (clamped to `0..=1`).
+    pub fn set_volume2(&mut self, v: f32) {
+        self.volume2 = v.clamp(0.0, MAX_VOLUME);
+    }
+
+    /// Set the playback-rate multiplier (reference `frequency`). Clamped to
+    /// a sane positive range; `1.0` is native speed.
+    pub fn set_rate(&mut self, r: f64) {
+        self.rate = r.clamp(0.01, 100.0);
+    }
+
     /// Set the pan (clamped to `-1..=1`).
     pub fn set_pan(&mut self, p: f32) {
         self.pan = p.clamp(-MAX_PAN, MAX_PAN);
     }
 
-    /// The volume actually used for rendering: the fade's ramped value while
-    /// a fade is active, else the base volume.
+    /// The per-buffer volume actually used for rendering: the fade's ramped
+    /// value while a fade is active, else the base volume. This is what the
+    /// reference `GetVolume` reports (it does **not** include `volume2` or
+    /// the global volume).
     pub fn effective_volume(&self) -> f32 {
         match &self.fade {
             Some(f) => f.volume(),
             None => self.volume,
         }
+    }
+
+    /// The full channel gain including [`Self::volume2`] (but not the
+    /// mixer's global volume, which [`Mixer::render_mix`] applies).
+    pub fn output_gain(&self) -> f32 {
+        self.effective_volume() * self.volume2
     }
 
     /// Start a linear fade to `to` over `duration` seconds after `delay`
@@ -258,6 +287,20 @@ impl Channel {
 
         let mut became_done = false;
         if self.is_playing() {
+            let rate = self.rate.max(0.0);
+            // The `.sli` loop link (reference `tTVPWaveLoopManager`): when
+            // looping, the track loops `To..From` instead of the whole file.
+            let loop_bounds = if self.looping {
+                self.source.as_ref().and_then(|s| {
+                    let sr = f64::from(s.sample_rate().max(1));
+                    s.loop_link()
+                        .map(|l| (l.to as f64 / sr, l.from as f64 / sr))
+                })
+            } else {
+                None
+            };
+            let loop_end = loop_bounds.map(|(_, end)| end);
+
             // A streaming source may not have decoded the frames the wall
             // clock has reached (the worker is still starting up, or `open`
             // was followed immediately by `play`). Advancing the position
@@ -268,7 +311,7 @@ impl Channel {
             // until frames arrive instead.
             let step = match watermark {
                 Some(available) if available >= self.position_seconds => {
-                    (self.position_seconds + dt).min(available) - self.position_seconds
+                    (self.position_seconds + dt * rate).min(available) - self.position_seconds
                 }
                 // A seek/loop restart is in flight (the watermark is behind
                 // the requested position): hold until the worker republishes
@@ -276,7 +319,7 @@ impl Channel {
                 Some(_) => 0.0,
                 // Whole-file source: every frame is available, so the clock
                 // is the position.
-                None => dt,
+                None => dt * rate,
             };
             self.position_seconds += step;
             let dur = self.duration_seconds();
@@ -285,8 +328,12 @@ impl Channel {
             // streaming position to the decoded watermark, so it can reach
             // the duration exactly and must still flip to `done`. A
             // whole-file source keeps the reference's "strictly past the
-            // end" rule (exactly at the end is still playing).
-            let at_end = if dur.is_finite() {
+            // end" rule (exactly at the end is still playing). When a `.sli`
+            // loop link is active, its `From` is the loop end instead of the
+            // full duration.
+            let at_end = if let Some(end) = loop_end {
+                self.position_seconds >= end
+            } else if dur.is_finite() {
                 self.source
                     .as_ref()
                     .is_some_and(|s| s.playback_ended(self.position_seconds))
@@ -297,15 +344,29 @@ impl Channel {
             };
             if at_end {
                 if self.looping {
-                    if dur.is_finite() {
+                    if let Some((start, end)) = loop_bounds {
+                        // Jump back to the loop start, keeping any overshoot
+                        // as an offset into the loop body.
+                        let span = (end - start).max(f64::MIN_POSITIVE);
+                        let overshoot = (self.position_seconds - end).max(0.0) % span;
+                        self.position_seconds = start + overshoot;
+                        if let Some(source) = &self.source {
+                            let frame = (self.position_seconds * source.sample_rate() as f64)
+                                .round() as u64;
+                            source.on_loop_wrap_to_frame(frame);
+                        }
+                    } else if dur.is_finite() {
                         // Wrap around, keeping the overshoot remainder.
                         self.position_seconds %= dur;
+                        if let Some(source) = &self.source {
+                            source.on_loop_wrap();
+                        }
                     } else {
                         // A streaming loop restarts its decoder at 0.
                         self.position_seconds = 0.0;
-                    }
-                    if let Some(source) = &self.source {
-                        source.on_loop_wrap();
+                        if let Some(source) = &self.source {
+                            source.on_loop_wrap();
+                        }
                     }
                 } else {
                     if dur.is_finite() {
@@ -334,6 +395,10 @@ pub struct Mixer {
     next_id: u64,
     /// Internal monotonic clock in seconds (the app's timestamps).
     clock: f64,
+    /// Global volume multiplier in `0..=1` (reference
+    /// `tTJSNI_WaveSoundBuffer::GlobalVolume`) applied to every channel at
+    /// render time.
+    global_volume: f32,
 }
 
 impl Default for Mixer {
@@ -346,6 +411,7 @@ impl Default for Mixer {
             // spawn a fresh empty channel and the buffer would never play.
             next_id: 1,
             clock: 0.0,
+            global_volume: MAX_VOLUME,
         }
     }
 }
@@ -412,6 +478,16 @@ impl Mixer {
         self.clock
     }
 
+    /// The global volume multiplier (`0..=1`).
+    pub fn global_volume(&self) -> f32 {
+        self.global_volume
+    }
+
+    /// Set the global volume multiplier, clamped to `0..=1`.
+    pub fn set_global_volume(&mut self, v: f32) {
+        self.global_volume = v.clamp(0.0, MAX_VOLUME);
+    }
+
     /// Render one audio-device chunk and advance the mixer by its duration.
     ///
     /// This is what [`crate::player::MixerSource`] calls: the audio callback
@@ -461,7 +537,7 @@ impl Mixer {
                 continue;
             }
             let Some(src) = &c.source else { continue };
-            let v = c.effective_volume();
+            let v = c.output_gain() * self.global_volume;
             if v <= 0.0 {
                 continue;
             }
@@ -475,8 +551,9 @@ impl Mixer {
                 // Render from the channel's current playback position; the
                 // app's clock (`advance_to`) keeps it moving. Ignoring the
                 // position made the output device replay the first buffer
-                // forever (effectively silence).
-                let t = c.position_seconds + i as f64 / out_rate_f;
+                // forever (effectively silence). `rate` preserves the
+                // reference's `frequency` control (pitch + tempo).
+                let t = c.position_seconds + i as f64 / out_rate_f * c.rate;
                 let sample_pos = (t * src_rate).max(0.0);
                 let i0 = sample_pos.floor() as u64;
                 let frac = (sample_pos - i0 as f64) as f32;
@@ -529,6 +606,7 @@ pub fn lock_ok<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sli::{LoopCondition, LoopLink, SliInfo};
 
     fn tone(rate: u32, channels: u16, seconds: f64) -> DecodedAudio {
         let frames = (rate as f64 * seconds) as usize;
@@ -738,6 +816,94 @@ mod tests {
         // And it is actually audible, not a replay of the first buffer.
         let peak = out.iter().fold(0.0f32, |m, s| m.max(s.abs()));
         assert!(peak > 0.4, "resampled peak {peak}");
+    }
+
+    /// A `.sli` loop link makes a looping channel loop `To..From` instead
+    /// of the whole file (the game's BGM intro/loop behaviour).
+    fn tone_with_loop(rate: u32, seconds: f64, from_sec: f64, to_sec: f64) -> Arc<AudioTrack> {
+        let info = SliInfo {
+            links: vec![LoopLink {
+                from: (from_sec * f64::from(rate)) as u64,
+                to: (to_sec * f64::from(rate)) as u64,
+                smooth: false,
+                condition: LoopCondition::None,
+                ref_value: 0,
+                cond_var: 0,
+            }],
+            labels: Vec::new(),
+        };
+        AudioTrack::from_decoded_with_loop(Arc::new(tone(rate, 1, seconds)), Some(info))
+    }
+
+    #[test]
+    fn sli_loop_point_wraps_into_the_loop_region() {
+        let mut m = Mixer::new();
+        let id = m.spawn_channel();
+        // 2.0s track, loop from sample 1.0s back to 0.5s.
+        m.channel(id)
+            .unwrap()
+            .play_track(tone_with_loop(44100, 2.0, 1.0, 0.5));
+        m.channel(id).unwrap().looping = true;
+
+        // Cross the loop end (1.0s) by 0.1s -> 0.5 + 0.1 = 0.6s.
+        m.advance(1.1);
+        let c = m.channel_ref(id).unwrap();
+        assert!(c.is_playing(), "loop keeps playing");
+        assert!(
+            (c.position_seconds - 0.6).abs() < 1e-6,
+            "looped to the loop start + overshoot, got {}",
+            c.position_seconds
+        );
+
+        // A second pass wraps again.
+        m.advance(0.5);
+        let c = m.channel_ref(id).unwrap();
+        assert!(
+            (c.position_seconds - 0.6).abs() < 1e-6,
+            "second wrap, got {}",
+            c.position_seconds
+        );
+    }
+
+    #[test]
+    fn volume2_and_global_volume_multiply_the_gain() {
+        let mut m = Mixer::new();
+        let id = m.spawn_channel();
+        {
+            let c = m.channel(id).unwrap();
+            c.play(Arc::new(tone(44100, 1, 1.0)));
+            c.set_volume(1.0);
+            c.set_volume2(0.5);
+            // The reference `GetVolume` reports the base volume only.
+            assert_eq!(c.effective_volume(), 1.0);
+            assert_eq!(c.volume2, 0.5);
+            assert!((c.output_gain() - 0.5).abs() < 1e-6);
+        }
+        m.set_global_volume(0.5);
+        assert!((m.global_volume() - 0.5).abs() < 1e-6);
+
+        // Render is actually attenuated by the product.
+        let mut out = vec![0.0f32; 4410];
+        m.render_mix(&mut out, 44100, 1);
+        let peak = out.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(
+            (0.1..=0.13).contains(&peak),
+            "tone at gain 0.25 peak ~0.125, got {peak}"
+        );
+    }
+
+    #[test]
+    fn rate_advances_position_faster() {
+        let mut m = Mixer::new();
+        let id = m.spawn_channel();
+        let c = m.channel(id).unwrap();
+        c.play(Arc::new(tone(44100, 1, 2.0)));
+        c.set_rate(2.0);
+        m.advance(0.5);
+        assert!(
+            (m.channel_ref(id).unwrap().position_seconds - 1.0).abs() < 1e-9,
+            "rate 2.0 plays 1.0s of source in 0.5s"
+        );
     }
 
     #[test]

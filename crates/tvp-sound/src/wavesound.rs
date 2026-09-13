@@ -15,7 +15,8 @@
 //!   `action(ev)`), mirroring the reference's `Owner`/`ActionOwner`.
 //! - `open(name)` — read and probe `name` from storage, then decode it on
 //!   a background worker (whole-file for short sounds, bounded streaming
-//!   for long tracks). The buffer stays "unload" until the data is ready.
+//!   for long tracks). Also loads the `<name>.sli` side-car loop points
+//!   (`crate::sli`). The buffer stays "unload" until the data is ready.
 //! - `play(pos = 0)` — start playback from `pos` seconds (or the current
 //!   position when `pos` is 0 and the channel is already playing, matching
 //!   the reference's play-from-current-position).
@@ -32,16 +33,22 @@
 //!   where BGM-playlist chaining reaches the action owner.
 //!
 //! **Properties** (the game's `SoundLayer` reads/writes these directly on
-//! its `SoundBuffer` instances):
+//! its `SoundBuffer` instances; all ported from
+//! `reference/cpp/core/sound/WaveIntf.cpp` + `win32/WaveImpl.cpp`):
 //!
 //! - `volume` (rw, 0..=100000 — divided by 100000 for the mixer).
+//! - `volume2` (rw, 0..=100000) — secondary volume, multiplied with
+//!   `volume` (reference `Volume2`; the game's config/per-voice volume).
 //! - `pan` (rw, 0..=100000).
-//! - `position` (rw, **seconds**).
-//! - `status` (ro) — `"unload"|"play"|"pause"|"stop"`.
-//! - `looping` (rw, bool), `paused` (rw, bool).
+//! - `position` (rw, **milliseconds**), `samplePosition` (rw, samples).
+//! - `totalTime` (ro, milliseconds), `frequency` (rw, Hz — a playback-rate
+//!   control), `bits` (ro), `channels` (ro).
+//! - `status` (ro) — `"unload"|"play"|"stop"` (the reference's
+//!   `GetStatusString` has no `pause`; `paused` does not change status).
+//! - `looping` (rw, bool), `paused` (rw, bool — settable before `play`).
 //! - `speed` (rw) — **stored only**: PhaseVocoder playback is out of scope
 //!   (documented limitation; the value round-trips but playback rate is
-//!   unaffected).
+//!   unaffected). Use `frequency` for a real rate change.
 //! - `filters` (ro) — a fresh empty array per access. The game's BGM path
 //!   (`createFilter:1`) calls `.filters.clear()` / `.filters.add(...)` and
 //!   reads `filters[0]`; an empty array keeps that path from crashing while
@@ -90,16 +97,18 @@ fn context_engine() -> Option<&'static Tjs2Engine> {
 }
 
 /// Script-visible playback status (the reference's `tTVPSoundStatus`).
+///
+/// The reference's `GetStatusString` only ever maps `ssUnload`/`ssStop`/
+/// `ssPlay`; `paused` does **not** change the status (the pause property is
+/// independent), so there is no `pause` string here.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Status {
     /// No data loaded yet.
     Unload,
     /// Loaded but not playing.
     Stop,
-    /// Playing (or paused).
+    /// Playing (or paused; the reference keeps reporting `play`).
     Play,
-    /// Paused.
-    Pause,
 }
 
 impl Status {
@@ -108,7 +117,6 @@ impl Status {
             Status::Unload => "unload",
             Status::Stop => "stop",
             Status::Play => "play",
-            Status::Pause => "pause",
         }
     }
 }
@@ -154,12 +162,16 @@ struct WaveSoundBufferInst {
     stream_id: u64,
     /// `speed` property value (stored only; see the module docs).
     speed: f64,
+    /// `frequency` property override (reference `SetFrequency`), applied as
+    /// a playback-rate multiplier. `None` = the source's native rate.
+    frequency: Option<u32>,
 }
 
 extern "C" fn ws_create(_engine: *mut c_void) -> *mut c_void {
     Box::into_raw(Box::new(WaveSoundBufferInst {
         stream_id: 0,
         speed: 1.0,
+        frequency: None,
     })) as *mut c_void
 }
 
@@ -347,7 +359,11 @@ extern "C" fn ws_play(
 ) -> c_int {
     // SAFETY: instance is a valid WaveSoundBufferInst payload for the call.
     let inst = unsafe { &mut *ffi::instance_ptr::<WaveSoundBufferInst>(instance) };
-    let pos = ffi::args(argv, argc).first().map_or(0.0, ffi::value_as_f64);
+    // The argument is an optional start position in **milliseconds**
+    // (reference `position`/`SetPosition` units). The reference `play()`
+    // itself takes no argument; the game calls `.play(pos)` and then sets
+    // `.position = pos`, so honouring it here is harmless and saves a beat.
+    let pos_ms = ffi::args(argv, argc).first().map_or(0.0, ffi::value_as_f64);
     // A failed open leaves no channel; the reference still reports
     // "stop" (and the poll emits onStatusChanged("stop") once) so
     // script sequences waiting on completion advance.
@@ -372,9 +388,23 @@ extern "C" fn ws_play(
             ffi::set_void_out(out);
             return 0;
         };
+        // Reference `Play()` returns immediately when `BufferPlaying` is
+        // already set (position keeps going) instead of restarting at 0.
+        if ch.playing {
+            if pos_ms > 0.0 {
+                ch.set_position(pos_ms / 1000.0);
+            }
+            ffi::set_void_out(out);
+            return 0;
+        }
+        // `Play()` keeps the pause flag (reference `StartPlay` checks
+        // `Paused`); the eyecatch jingle relies on `paused = true` before
+        // `play()` and unpausing later.
+        let paused = ch.paused;
         ch.play_track(track);
-        if pos > 0.0 {
-            ch.set_position(pos);
+        ch.paused = paused;
+        if pos_ms > 0.0 {
+            ch.set_position(pos_ms / 1000.0);
         }
         ffi::set_void_out(out);
         0
@@ -396,6 +426,8 @@ extern "C" fn ws_stop(
     let inst = unsafe { &mut *ffi::instance_ptr::<WaveSoundBufferInst>(instance) };
     with_channel!(inst, out_error, ch, {
         ch.stop();
+        // The reference `Stop()` rewinds the decoder to 0 as well.
+        ch.set_position(0.0);
         ffi::set_void_out(out);
         0
     })
@@ -414,9 +446,7 @@ extern "C" fn ws_pause(
     // SAFETY: instance is a valid WaveSoundBufferInst payload for the call.
     let inst = unsafe { &mut *ffi::instance_ptr::<WaveSoundBufferInst>(instance) };
     with_channel!(inst, out_error, ch, {
-        if ch.playing {
-            ch.pause();
-        }
+        ch.paused = true;
         ffi::set_void_out(out);
         0
     })
@@ -435,9 +465,7 @@ extern "C" fn ws_resume(
     // SAFETY: instance is a valid WaveSoundBufferInst payload for the call.
     let inst = unsafe { &mut *ffi::instance_ptr::<WaveSoundBufferInst>(instance) };
     with_channel!(inst, out_error, ch, {
-        if ch.paused {
-            ch.resume();
-        }
+        ch.paused = false;
         ffi::set_void_out(out);
         0
     })
@@ -467,8 +495,8 @@ extern "C" fn ws_fade(
     } else {
         0.0
     };
-    if time_ms < 0.0 || delay_ms < 0.0 {
-        return ffi::report_error(out_error, "WaveSoundBuffer.fade: negative time");
+    if time_ms <= 0.0 || delay_ms < 0.0 {
+        return ffi::report_error(out_error, "WaveSoundBuffer.fade: invalid time");
     }
     with_channel!(inst, out_error, ch, {
         ch.fade(to as f32, time_ms / 1000.0, delay_ms / 1000.0);
@@ -770,8 +798,9 @@ extern "C" fn ws_pan_set(
     })
 }
 
-/// `position` getter — seconds.
-extern "C" fn ws_position_get(
+/// `volume2` getter — 0..=100000 (reference `GetVolume2`). Multiplied with
+/// `volume` and the global volume at render time.
+extern "C" fn ws_volume2_get(
     _engine: *mut c_void,
     instance: *mut c_void,
     out: *mut tjs2_sys::Value,
@@ -781,13 +810,13 @@ extern "C" fn ws_position_get(
     // SAFETY: instance is a valid WaveSoundBufferInst payload for the call.
     let inst = unsafe { &mut *ffi::instance_ptr::<WaveSoundBufferInst>(instance) };
     with_channel!(inst, out_error, ch, {
-        ffi::set_real_out(out, ch.position_seconds);
+        ffi::set_int_out(out, (f64::from(ch.volume2) * TVP_VOLUME_SCALE) as i64);
         0
     })
 }
 
-/// `position` setter — seconds (seek).
-extern "C" fn ws_position_set(
+/// `volume2` setter — 100000-scale, divided for the mixer.
+extern "C" fn ws_volume2_set(
     _engine: *mut c_void,
     instance: *mut c_void,
     value: *const tjs2_sys::Value,
@@ -799,7 +828,201 @@ extern "C" fn ws_position_set(
     // SAFETY: value points at the property value for the duration of the call.
     let v = unsafe { &*value };
     with_channel!(inst, out_error, ch, {
-        ch.set_position(ffi::value_as_f64(v));
+        ch.set_volume2((ffi::value_as_f64(v) / TVP_VOLUME_SCALE) as f32);
+        0
+    })
+}
+
+/// `position` getter — **milliseconds** (reference `GetPosition`:
+/// `GetSamplePosition() * 1000 / SamplesPerSec`).
+extern "C" fn ws_position_get(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut tjs2_sys::Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: instance is a valid WaveSoundBufferInst payload for the call.
+    let inst = unsafe { &mut *ffi::instance_ptr::<WaveSoundBufferInst>(instance) };
+    with_channel!(inst, out_error, ch, {
+        ffi::set_int_out(out, (ch.position_seconds * 1000.0) as i64);
+        0
+    })
+}
+
+/// `position` setter — **milliseconds**, converted to seconds for the
+/// mixer (reference `SetPosition`). The reference ignores a seek at/after
+/// the known end; mirror that so a bad script value cannot wedge the
+/// channel past EOF.
+extern "C" fn ws_position_set(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    value: *const tjs2_sys::Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: instance is a valid payload; value is valid for the call.
+    let inst = unsafe { &mut *ffi::instance_ptr::<WaveSoundBufferInst>(instance) };
+    // SAFETY: value points at the property value for the duration of the call.
+    let v = unsafe { &*value };
+    let ms = ffi::value_as_f64(v);
+    with_channel!(inst, out_error, ch, {
+        let total_ms = ch
+            .source
+            .as_ref()
+            .and_then(|t| t.known_duration_seconds())
+            .map(|d| d * 1000.0);
+        if total_ms.is_none_or(|t| ms < t) {
+            ch.set_position(ms / 1000.0);
+        }
+        0
+    })
+}
+
+/// `samplePosition` getter — playback position in sample granules
+/// (reference `GetSamplePosition`).
+extern "C" fn ws_sample_position_get(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut tjs2_sys::Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: instance is a valid WaveSoundBufferInst payload for the call.
+    let inst = unsafe { &mut *ffi::instance_ptr::<WaveSoundBufferInst>(instance) };
+    with_channel!(inst, out_error, ch, {
+        let rate = ch.source.as_ref().map_or(0, |t| t.sample_rate());
+        ffi::set_int_out(out, (ch.position_seconds * f64::from(rate)) as i64);
+        0
+    })
+}
+
+/// `samplePosition` setter — sample granules to seconds.
+extern "C" fn ws_sample_position_set(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    value: *const tjs2_sys::Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: instance is a valid payload; value is valid for the call.
+    let inst = unsafe { &mut *ffi::instance_ptr::<WaveSoundBufferInst>(instance) };
+    // SAFETY: value points at the property value for the duration of the call.
+    let v = unsafe { &*value };
+    let samples = ffi::value_as_f64(v);
+    with_channel!(inst, out_error, ch, {
+        let rate = ch.source.as_ref().map_or(0, |t| t.sample_rate());
+        if rate > 0 {
+            let total = ch.source.as_ref().and_then(|t| t.total_frames());
+            if total.is_none_or(|t| samples < t as f64) {
+                ch.set_position(samples / f64::from(rate));
+            }
+        }
+        0
+    })
+}
+
+/// `totalTime` getter — total duration in **milliseconds** (reference
+/// `GetTotalTime`), or 0 when the container did not state it.
+extern "C" fn ws_total_time_get(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut tjs2_sys::Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: instance is a valid WaveSoundBufferInst payload for the call.
+    let inst = unsafe { &mut *ffi::instance_ptr::<WaveSoundBufferInst>(instance) };
+    with_channel!(inst, out_error, ch, {
+        let ms = ch
+            .source
+            .as_ref()
+            .and_then(|t| t.known_duration_seconds())
+            .map_or(0, |d| (d * 1000.0) as i64);
+        ffi::set_int_out(out, ms);
+        0
+    })
+}
+
+/// `frequency` getter — the source's sample rate, or the override set on
+/// this buffer (reference `GetFrequency`).
+extern "C" fn ws_frequency_get(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut tjs2_sys::Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: instance is a valid WaveSoundBufferInst payload for the call.
+    let inst = unsafe { &mut *ffi::instance_ptr::<WaveSoundBufferInst>(instance) };
+    let requested = inst.frequency;
+    with_channel!(inst, out_error, ch, {
+        let freq = requested.unwrap_or_else(|| ch.source.as_ref().map_or(0, |t| t.sample_rate()));
+        ffi::set_int_out(out, i64::from(freq));
+        0
+    })
+}
+
+/// `frequency` setter — changes the playback rate (reference
+/// `SetFrequency` sets the DirectSound buffer frequency; pitch and tempo
+/// both change).
+extern "C" fn ws_frequency_set(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    value: *const tjs2_sys::Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: instance is a valid payload; value is valid for the call.
+    let inst = unsafe { &mut *ffi::instance_ptr::<WaveSoundBufferInst>(instance) };
+    // SAFETY: value points at the property value for the duration of the call.
+    let v = unsafe { &*value };
+    let freq = ffi::value_as_f64(v);
+    inst.frequency = if freq > 0.0 { Some(freq as u32) } else { None };
+    let requested = inst.frequency;
+    with_channel!(inst, out_error, ch, {
+        let native = ch.source.as_ref().map_or(0, |t| t.sample_rate());
+        if let Some(f) = requested {
+            if native > 0 {
+                ch.set_rate(f64::from(f) / f64::from(native));
+            }
+        } else {
+            ch.set_rate(1.0);
+        }
+        0
+    })
+}
+
+/// `bits` getter — reference `GetBitsPerSample`. Every decoder in this port
+/// produces f32 from a 16-bit-class source, so report 16 (the game uses it
+/// only to estimate a byte rate).
+extern "C" fn ws_bits_get(
+    _engine: *mut c_void,
+    _instance: *mut c_void,
+    out: *mut tjs2_sys::Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    ffi::set_int_out(out, 16);
+    0
+}
+
+/// `channels` getter — the source's channel count (reference
+/// `GetChannels`).
+extern "C" fn ws_channels_get(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut tjs2_sys::Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: instance is a valid WaveSoundBufferInst payload for the call.
+    let inst = unsafe { &mut *ffi::instance_ptr::<WaveSoundBufferInst>(instance) };
+    with_channel!(inst, out_error, ch, {
+        ffi::set_int_out(
+            out,
+            i64::from(ch.source.as_ref().map_or(0, |t| t.channels())),
+        );
         0
     })
 }
@@ -884,13 +1107,9 @@ extern "C" fn ws_paused_set(
     // SAFETY: value points at the property value for the duration of the call.
     let v = unsafe { &*value };
     with_channel!(inst, out_error, ch, {
-        if ffi::value_as_bool(v) {
-            if ch.playing {
-                ch.pause();
-            }
-        } else if ch.paused {
-            ch.resume();
-        }
+        // The reference `SetPaused` only sets the flag; `Play()`/`StartPlay`
+        // respect it (a buffer can be paused before it ever plays).
+        ch.paused = ffi::value_as_bool(v);
         0
     })
 }
@@ -976,8 +1195,18 @@ pub(crate) fn register_wavesound(engine: &Tjs2Engine) -> Result<(), String> {
         ],
         properties: vec![
             property("volume", ws_volume_get, Some(ws_volume_set)),
+            property("volume2", ws_volume2_get, Some(ws_volume2_set)),
             property("pan", ws_pan_get, Some(ws_pan_set)),
             property("position", ws_position_get, Some(ws_position_set)),
+            property(
+                "samplePosition",
+                ws_sample_position_get,
+                Some(ws_sample_position_set),
+            ),
+            property("totalTime", ws_total_time_get, None),
+            property("frequency", ws_frequency_get, Some(ws_frequency_set)),
+            property("bits", ws_bits_get, None),
+            property("channels", ws_channels_get, None),
             property("status", ws_status_get, None),
             property("looping", ws_looping_get, Some(ws_looping_set)),
             property("paused", ws_paused_get, Some(ws_paused_set)),
@@ -1019,7 +1248,8 @@ fn derive_status(ch: &Channel) -> Status {
         Some(s) if s.is_failed() => Status::Stop,
         Some(s) if !s.is_ready() => Status::Unload,
         Some(_) if !ch.playing => Status::Stop,
-        Some(_) if ch.paused => Status::Pause,
+        // The reference keeps reporting `play` while paused; `pause` is not
+        // a status.
         Some(_) => Status::Play,
     }
 }

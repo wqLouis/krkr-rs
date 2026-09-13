@@ -33,12 +33,17 @@
 //! 0.20 uses the same symphonia 0.5, so Cargo unifies the crates and the
 //! features enabled here also upgrade rodio's copy.
 //!
-//! # Volume/pan scale
+//! # Volume/pan scale and loop points
 //!
-//! This wave's script surface uses `volume 0..=1` and `pan -1..=1` (the
-//! task's spec). The reference engine uses `0..=100000` for both
-//! (`WaveSoundBuffer`/`SoundChannel`); porting the game's `system/sound.tjs`
-//! later means dividing/multiplying by 100000 at that boundary.
+//! The game's `WaveSoundBuffer` surface (`system/sound.tjs` derives
+//! `SoundBuffer` from it) uses the reference's `0..=100000` scale for
+//! `volume`/`volume2`/`pan`, and `position`/`totalTime` in **milliseconds**.
+//! The task-level `SoundChannel` class keeps the simpler `0..=1` /
+//! `-1..=1` scale and seconds-based positions.
+//!
+//! `WaveSoundBuffer.open(name)` also loads the `<name>.sli` side-car
+//! ([`sli`]); a looping channel then loops the link's `To..From` region
+//! instead of the whole file, matching the reference `Open` + loop manager.
 //!
 //! # Testing
 //!
@@ -51,6 +56,7 @@ pub mod decode;
 pub mod mixer;
 pub mod natives;
 pub mod player;
+pub mod sli;
 pub mod source;
 pub mod wavesound;
 
@@ -63,6 +69,7 @@ pub use decode::{
 pub use mixer::{Channel, Fade, Mixer};
 pub use natives::register_sound;
 pub use natives::set_sound_output_enabled;
+pub use sli::{LoopCondition, LoopLink, SliInfo, WaveLabel};
 pub use source::{AudioTrack, active_decode_workers, open_track, open_track_bytes};
 pub use wavesound::sound_poll;
 

@@ -63,7 +63,8 @@
 //! | `getPressed(button)` / `getReleased(button)` | bool — held /
 //!   released-this-frame state of one of the TVP mouse buttons |
 //! | `getRepeat(button)` | frames the button has been held |
-//! | `getClickCount(button)` | 0 (stub; click counting is not implemented) |
+//! | `getClickCount(button)` | presses in the current multi-click sequence
+//!   (1 = single, 2 = double, ...; 0 once the sequence times out) |
 //!
 //! Buttons are indexed by the TVP button constants from
 //! `reference/cpp/core/visual/tvpinputdefs.h`
@@ -103,7 +104,10 @@
 //!   out-of-range mouse buttons. This port returns 0/false for unknown
 //!   codes and buttons instead (tests require it, and it is more robust
 //!   against scripts probing values).
-//! * `Mouse.getClickCount` is a 0 stub.
+//! * `Mouse.getClickCount` counts presses within
+//!   [`MOUSE_CLICK_SEQUENCE_FRAMES`] frames and [`MOUSE_CLICK_MAX_MOVE`]
+//!   pixels; the reference delegates to the OS double-click time and
+//!   cursor region, which this frame-based state cannot query.
 //!
 //! # Testing
 //!
@@ -185,6 +189,14 @@ pub use buttons::{
     VK_XBUTTON1, VK_XBUTTON2,
 };
 
+/// Frames within which a follow-up press counts as the next click of a
+/// multi-click sequence (`Mouse.getClickCount`). At the usual 60 fps this
+/// is ~500 ms, the Windows double-click time.
+pub const MOUSE_CLICK_SEQUENCE_FRAMES: u64 = 30;
+/// Maximum cursor movement (device pixels) between presses for them to
+/// still count as one multi-click sequence.
+pub const MOUSE_CLICK_MAX_MOVE: i32 = 4;
+
 /// Mouse state shared with the app.
 #[derive(Debug, Clone)]
 pub struct MouseState {
@@ -209,6 +221,17 @@ pub struct MouseState {
     /// Per-button consecutive frames held, incremented by `end_frame`
     /// while the button stays down. `Mouse.getRepeat(button)` reads this.
     pub hold: Vec<u32>,
+    /// Per-button count of presses in the current multi-click sequence
+    /// (1 for a single click, 2 for a double-click, ...). Maintained by
+    /// [`InputState::set_mouse_button`] on each rising edge; read through
+    /// [`InputState::mouse_click_count`] / `Mouse.getClickCount`.
+    pub click_count: Vec<u32>,
+    /// Frame index of the last press of the current sequence
+    /// (`u64::MAX` = never pressed); used to break the sequence on a timeout.
+    pub last_click_frame: Vec<u64>,
+    /// Cursor position of the last press of the current sequence; used to
+    /// break the sequence on movement.
+    pub last_click_pos: Vec<(i32, i32)>,
     /// Cursor visibility — `Mouse.isVisible()` / `Mouse.setVisible`.
     pub visible: bool,
 }
@@ -222,6 +245,9 @@ impl Default for MouseState {
             buttons: vec![false; MOUSE_BUTTONS],
             released: vec![false; MOUSE_BUTTONS],
             hold: vec![0; MOUSE_BUTTONS],
+            click_count: vec![0; MOUSE_BUTTONS],
+            last_click_frame: vec![u64::MAX; MOUSE_BUTTONS],
+            last_click_pos: vec![(0, 0); MOUSE_BUTTONS],
             visible: true,
         }
     }
@@ -324,9 +350,29 @@ impl InputState {
         if button >= MOUSE_BUTTONS {
             return false;
         }
+        let was_down = self.mouse.buttons[button];
         self.mouse.buttons[button] = down;
         if down {
             self.mouse.hold[button] = 0;
+            // Count only a real rising edge as a click, and extend the
+            // current multi-click sequence when it is close enough in time
+            // and space (the reference `Mouse.getClickCount` gesture).
+            if !was_down {
+                let last_frame = self.mouse.last_click_frame[button];
+                let (lx, ly) = self.mouse.last_click_pos[button];
+                let close_in_time = last_frame != u64::MAX
+                    && self.frame.saturating_sub(last_frame) <= MOUSE_CLICK_SEQUENCE_FRAMES;
+                let close_in_space = (self.mouse.x - lx).abs() <= MOUSE_CLICK_MAX_MOVE
+                    && (self.mouse.y - ly).abs() <= MOUSE_CLICK_MAX_MOVE;
+                if close_in_time && close_in_space {
+                    self.mouse.click_count[button] =
+                        self.mouse.click_count[button].saturating_add(1);
+                } else {
+                    self.mouse.click_count[button] = 1;
+                }
+                self.mouse.last_click_frame[button] = self.frame;
+                self.mouse.last_click_pos[button] = (self.mouse.x, self.mouse.y);
+            }
         } else {
             self.mouse.released[button] = true;
         }
@@ -391,6 +437,23 @@ impl InputState {
     /// out-of-range indices.
     pub fn mouse_button_repeat(&self, button: usize) -> u32 {
         self.mouse.hold.get(button).copied().unwrap_or(0)
+    }
+
+    /// The number of presses in the current multi-click sequence for
+    /// `button` (`Mouse.getClickCount`): 1 for a single click, 2 for a
+    /// double-click, and so on. Returns 0 for out-of-range buttons or once
+    /// the sequence has timed out (no click within
+    /// [`MOUSE_CLICK_SEQUENCE_FRAMES`]).
+    pub fn mouse_click_count(&self, button: usize) -> u32 {
+        if button >= MOUSE_BUTTONS {
+            return 0;
+        }
+        let last = self.mouse.last_click_frame[button];
+        if last == u64::MAX || self.frame.saturating_sub(last) > MOUSE_CLICK_SEQUENCE_FRAMES {
+            0
+        } else {
+            self.mouse.click_count[button]
+        }
     }
 }
 
@@ -723,8 +786,62 @@ mod tests {
         }
         assert_eq!(eval_i(&e, "Mouse.getWheelRot()"), 0);
 
-        // getClickCount is a 0 stub.
+        // no click happened, so getClickCount is 0.
         assert_eq!(eval_i(&e, "Mouse.getClickCount(0)"), 0);
+    }
+
+    // -- getClickCount: single/double click sequences and timeout ------------
+
+    #[test]
+    fn mouse_click_count_tracks_multi_click_sequences() {
+        let _vm_lock = vm_lock();
+        let (e, state) = test_engine();
+
+        // Frame 0: a single left click at (10, 10).
+        {
+            let mut s = state.lock().unwrap();
+            s.begin_frame();
+            s.set_mouse_pos(10, 10);
+            s.set_mouse_button(MB_LEFT, true);
+            s.end_frame();
+        }
+        assert_eq!(eval_i(&e, "Mouse.getClickCount(0)"), 1);
+
+        // Next frame: release then click again at the same spot within the
+        // window -> double click.
+        {
+            let mut s = state.lock().unwrap();
+            s.begin_frame();
+            s.set_mouse_button(MB_LEFT, false);
+            s.set_mouse_button(MB_LEFT, true);
+            s.end_frame();
+        }
+        assert_eq!(eval_i(&e, "Mouse.getClickCount(0)"), 2);
+
+        // A click far away starts a fresh sequence.
+        {
+            let mut s = state.lock().unwrap();
+            s.begin_frame();
+            s.set_mouse_button(MB_LEFT, false);
+            s.set_mouse_pos(500, 500);
+            s.set_mouse_button(MB_LEFT, true);
+            s.end_frame();
+        }
+        assert_eq!(eval_i(&e, "Mouse.getClickCount(0)"), 1);
+
+        // Idle past the sequence window: the count decays to 0.
+        {
+            let mut s = state.lock().unwrap();
+            for _ in 0..=MOUSE_CLICK_SEQUENCE_FRAMES {
+                s.begin_frame();
+                s.end_frame();
+            }
+        }
+        assert_eq!(eval_i(&e, "Mouse.getClickCount(0)"), 0);
+
+        // Out-of-range buttons return 0 (documented deviation).
+        assert_eq!(eval_i(&e, "Mouse.getClickCount(99)"), 0);
+        assert_eq!(eval_i(&e, "Mouse.getClickCount(-1)"), 0);
     }
 
     // -- Test 4: unknown key codes are false, not errors --------------------

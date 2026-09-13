@@ -239,6 +239,20 @@ fn real_game_opus_voice_decodes_to_audible_pcm() {
     );
 }
 
+/// The real game's BGM ships a `bgm/bgm02.ogg.sli` side-car; `open_track`
+/// must load its loop link so the BGM loops `To..From` instead of boringly
+/// repeating the whole intro+body.
+#[test]
+fn real_game_bgm_sli_loop_points_are_loaded() {
+    let _vm_lock = vm_lock();
+    let storage = mount_real_game();
+    let track = tvp_sound::open_track(&storage, REAL_BGM).expect("open real bgm");
+    let link = track.loop_link().expect("bgm02.ogg.sli loop link");
+    assert_eq!(link.from, 4_047_569);
+    assert_eq!(link.to, 726_487);
+    assert!(!link.smooth);
+}
+
 /// Regression for the async streaming-decode change on the **real game
 /// BGM**: `open`+`play` before the worker has produced anything must not let
 /// the mixer clock run past the decoded watermark (the old

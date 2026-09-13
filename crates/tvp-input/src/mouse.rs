@@ -224,21 +224,25 @@ extern "C" fn native_get_repeat(
     0
 }
 
-/// `Mouse.getClickCount(button)` → int.
-///
-/// Stub returning 0 — click counting (double-click detection) is not
-/// implemented yet; the arg-count check matches the reference.
+/// `Mouse.getClickCount(button)` → int — the number of presses in the
+/// current multi-click sequence for the button (1 = single click, 2 =
+/// double-click, ...). The sequence is broken by a timeout
+/// ([`crate::MOUSE_CLICK_SEQUENCE_FRAMES`]) or by cursor movement
+/// ([`crate::MOUSE_CLICK_MAX_MOVE`]). Out-of-range buttons return 0 (the
+/// reference raises `TJS_E_INVALIDPARAM` — documented deviation).
 extern "C" fn native_get_click_count(
     _engine: *mut c_void,
     argc: c_int,
-    _argv: *const Value,
+    argv: *const Value,
     out: *mut Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
     if argc < 1 {
         return report_error(out_error, "Mouse.getClickCount requires 1 argument");
     }
-    set_int_out(out, 0);
+    let a = args(argv, argc);
+    let count = with_state(|s| button_index(&a[0]).map_or(0, |b| s.mouse_click_count(b)));
+    set_int_out(out, i64::from(count));
     0
 }
 

@@ -40,6 +40,7 @@ use engine::Storage;
 use crate::decode::{
     AudioMetadata, DecodeError, DecodedAudio, StreamDecoder, decode_audio_bytes, probe_audio,
 };
+use crate::sli::{self, LoopLink, SliInfo};
 
 /// A whole-file decode is kept in RAM only when the estimated PCM size is
 /// at most this many bytes. Longer tracks stream through a bounded ring.
@@ -120,6 +121,8 @@ pub struct AudioTrack {
     duration: Option<f64>,
     state: TrackState,
     cancel: Arc<AtomicBool>,
+    /// Parsed `<name>.sli` loop information, when the side-car exists.
+    loop_info: Option<SliInfo>,
 }
 
 impl std::fmt::Debug for AudioTrack {
@@ -146,6 +149,7 @@ impl AudioTrack {
         metadata: &AudioMetadata,
         state: TrackState,
         cancel: Arc<AtomicBool>,
+        loop_info: Option<SliInfo>,
     ) -> Arc<AudioTrack> {
         let channels = metadata.channels.max(1);
         let duration = metadata.duration_seconds.or_else(|| {
@@ -160,12 +164,22 @@ impl AudioTrack {
             duration,
             state,
             cancel,
+            loop_info,
         })
     }
 
     /// Wrap an already-decoded buffer as a ready track (used by the
     /// synchronous [`crate::mixer::Channel::play`] API and tests).
     pub fn from_decoded(audio: Arc<DecodedAudio>) -> Arc<AudioTrack> {
+        Self::from_decoded_with_loop(audio, None)
+    }
+
+    /// Like [`Self::from_decoded`] but with parsed `.sli` loop information
+    /// attached (used by tests and by the storage-backed loader).
+    pub fn from_decoded_with_loop(
+        audio: Arc<DecodedAudio>,
+        loop_info: Option<SliInfo>,
+    ) -> Arc<AudioTrack> {
         let metadata = AudioMetadata {
             sample_rate: audio.sample_rate.max(1),
             channels: audio.channels.max(1),
@@ -178,14 +192,25 @@ impl AudioTrack {
             &metadata,
             TrackState::Full(slot),
             Arc::new(AtomicBool::new(false)),
+            loop_info,
         )
     }
 
     /// Start decoding `bytes` fully into memory on a background worker.
-    fn start_full(metadata: AudioMetadata, bytes: Vec<u8>, name: String) -> Arc<AudioTrack> {
+    fn start_full(
+        metadata: AudioMetadata,
+        bytes: Vec<u8>,
+        name: String,
+        loop_info: Option<SliInfo>,
+    ) -> Arc<AudioTrack> {
         let slot = Arc::new(OnceLock::new());
         let cancel = Arc::new(AtomicBool::new(false));
-        let track = AudioTrack::new(&metadata, TrackState::Full(slot.clone()), cancel.clone());
+        let track = AudioTrack::new(
+            &metadata,
+            TrackState::Full(slot.clone()),
+            cancel.clone(),
+            loop_info,
+        );
         let worker_slot = slot.clone();
         let worker_cancel = cancel.clone();
         let worker_name = name.clone();
@@ -206,10 +231,20 @@ impl AudioTrack {
 
     /// Start decoding `bytes` into a bounded ring buffer on a background
     /// worker.
-    fn start_stream(metadata: AudioMetadata, bytes: Vec<u8>, name: String) -> Arc<AudioTrack> {
+    fn start_stream(
+        metadata: AudioMetadata,
+        bytes: Vec<u8>,
+        name: String,
+        loop_info: Option<SliInfo>,
+    ) -> Arc<AudioTrack> {
         let ring = StreamRing::new(metadata.sample_rate.max(1), metadata.channels.max(1));
         let cancel = Arc::new(AtomicBool::new(false));
-        let track = AudioTrack::new(&metadata, TrackState::Stream(ring.clone()), cancel.clone());
+        let track = AudioTrack::new(
+            &metadata,
+            TrackState::Stream(ring.clone()),
+            cancel.clone(),
+            loop_info,
+        );
         let worker_ring = ring.clone();
         let worker_cancel = cancel.clone();
         let worker_name = name.clone();
@@ -362,6 +397,24 @@ impl AudioTrack {
         self.request_seek_seconds(0.0);
     }
 
+    /// Seek a looping source back to the `.sli` link's `To` sample (the
+    /// reference `tTVPWaveLoopManager` jump). No-op for a whole-file source.
+    pub fn on_loop_wrap_to_frame(&self, frame: u64) {
+        if let TrackState::Stream(ring) = &self.state {
+            ring.request_seek(frame);
+        }
+    }
+
+    /// Parsed `.sli` loop information, when the side-car entry was present.
+    pub fn sli(&self) -> Option<&SliInfo> {
+        self.loop_info.as_ref()
+    }
+
+    /// The first unconditional, non-degenerate `.sli` loop link, if any.
+    pub fn loop_link(&self) -> Option<&LoopLink> {
+        self.loop_info.as_ref().and_then(SliInfo::active_link)
+    }
+
     /// Frames currently resident in the streaming ring (0 for whole-file).
     pub fn buffered_frames(&self) -> u64 {
         match &self.state {
@@ -436,17 +489,36 @@ pub fn open_track(
     storage: &Arc<Mutex<Storage>>,
     name: &str,
 ) -> Result<Arc<AudioTrack>, DecodeError> {
-    let bytes = {
+    let (bytes, sli_bytes) = {
         let mut storage = storage
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        storage.read(name)?
+        let bytes = storage.read(name)?;
+        // The reference `Open` transparently reads `<storagename>.sli`
+        // (WaveImpl.cpp `Open`); the game's BGM loop points live there.
+        let sli_bytes = storage.read(&format!("{name}.sli")).ok();
+        (bytes, sli_bytes)
     };
-    open_track_bytes(bytes, name)
+    let loop_info = sli_bytes.as_deref().and_then(|b| match sli::parse(b) {
+        Ok(info) => Some(info),
+        Err(e) => {
+            log::warn!("tvp-sound: {name}.sli: {e}");
+            None
+        }
+    });
+    open_track_bytes_inner(bytes, name, loop_info)
 }
 
 /// Like [`open_track`] but takes the already-read (compressed) bytes.
 pub fn open_track_bytes(bytes: Vec<u8>, name: &str) -> Result<Arc<AudioTrack>, DecodeError> {
+    open_track_bytes_inner(bytes, name, None)
+}
+
+fn open_track_bytes_inner(
+    bytes: Vec<u8>,
+    name: &str,
+    loop_info: Option<SliInfo>,
+) -> Result<Arc<AudioTrack>, DecodeError> {
     let metadata = probe_audio(&bytes, name)?;
     // Estimate the decoded PCM size from the container metadata; fall back
     // to a generous bytes->PCM ratio when the container omits the frame
@@ -467,9 +539,19 @@ pub fn open_track_bytes(bytes: Vec<u8>, name: &str) -> Result<Arc<AudioTrack>, D
                 .total_frames
                 .map_or_else(|| "?".to_string(), |f| f.to_string()),
         );
-        Ok(AudioTrack::start_stream(metadata, bytes, name.to_string()))
+        Ok(AudioTrack::start_stream(
+            metadata,
+            bytes,
+            name.to_string(),
+            loop_info,
+        ))
     } else {
-        Ok(AudioTrack::start_full(metadata, bytes, name.to_string()))
+        Ok(AudioTrack::start_full(
+            metadata,
+            bytes,
+            name.to_string(),
+            loop_info,
+        ))
     }
 }
 
