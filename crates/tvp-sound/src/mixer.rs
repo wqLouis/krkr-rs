@@ -259,12 +259,26 @@ impl Channel {
 
 /// The clock-driven mixer: a collection of channels advanced by the app's
 /// update loop.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Mixer {
     channels: Vec<Channel>,
     next_id: u64,
     /// Internal monotonic clock in seconds (the app's timestamps).
     clock: f64,
+}
+
+impl Default for Mixer {
+    fn default() -> Self {
+        Mixer {
+            channels: Vec::new(),
+            // Channel ids start at **1**: `0` is the "no channel yet"
+            // sentinel for the WaveSoundBuffer natives (`Stream::channel_id`),
+            // so an id-0 first channel would make every subsequent access
+            // spawn a fresh empty channel and the buffer would never play.
+            next_id: 1,
+            clock: 0.0,
+        }
+    }
 }
 
 impl Mixer {

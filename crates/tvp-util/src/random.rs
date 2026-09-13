@@ -247,7 +247,7 @@ impl Random {
 pub fn push_environ_noise(buf: &[u8]) {
     Random::global()
         .lock()
-        .expect("global random pool poisoned")
+        .unwrap_or_else(|p| p.into_inner())
         .push_noise(buf);
 }
 
@@ -255,7 +255,7 @@ pub fn push_environ_noise(buf: &[u8]) {
 pub fn get_random_bits_128() -> [u8; 16] {
     Random::global()
         .lock()
-        .expect("global random pool poisoned")
+        .unwrap_or_else(|p| p.into_inner())
         .get_random_bits_128()
 }
 

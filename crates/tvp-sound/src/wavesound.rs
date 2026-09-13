@@ -8,13 +8,11 @@
 //! **Methods** (the game calls these via `super.xxx` from its script
 //! subclass):
 //!
-//! - `WaveSoundBuffer(owner)` — constructor. Retains `objthis` (the script
-//!   object, possibly the derived `SoundBuffer` instance, since the derived
-//!   ctor calls `WaveSoundBuffer(owner)` with `this` bound) so status
-//!   events dispatch through the object's class chain with the correct
-//!   `this`. The owner argument is accepted and ignored (the reference
-//!   stores it as the *action owner*; we deliver events straight to the
-//!   object).
+//! - `WaveSoundBuffer(owner)` — constructor. Retains `objthis` (the event
+//!   target: the script object, possibly the derived `SoundBuffer`
+//!   instance, since the derived ctor calls `WaveSoundBuffer(owner)` with
+//!   `this` bound) and `owner` (the action owner that receives
+//!   `action(ev)`), mirroring the reference's `Owner`/`ActionOwner`.
 //! - `open(name)` — decode `name` from storage; the buffer becomes
 //!   "stopped" (TVP: status is "unload" until opened).
 //! - `play(pos = 0)` — start playback from `pos` seconds (or the current
@@ -26,11 +24,11 @@
 //! - `fadeIn(timeMs)` / `fadeOut(timeMs[, target])`.
 //! - `stopFade()` — cancel the active fade, keeping the fade's target.
 //! - `getStatus()` — `"unload" | "play" | "pause" | "stop"`.
-//! - `onStatusChanged(st)` / `onFadeCompleted()` — **no-op native handlers**:
-//!   the game's subclass calls `super.onStatusChanged(...)` at the end of
-//!   its override; the base handler in the reference re-posts the event to
-//!   the owner, and since we already deliver events straight to the object
-//!   this must be a no-op to avoid double delivery.
+//! - `onStatusChanged(st)` / `onFadeCompleted()` — native handlers that
+//!   forward a KiriKiri event dictionary to the action owner's `action(ev)`
+//!   (reference `WaveIntf.cpp` / `TVP_ACTION_INVOKE`). The game's
+//!   `SoundBuffer` override calls `super.onStatusChanged(...)`, so this is
+//!   where BGM-playlist chaining reaches the action owner.
 //!
 //! **Properties** (the game's `SoundLayer` reads/writes these directly on
 //! its `SoundBuffer` instances):
@@ -84,10 +82,10 @@ const TVP_VOLUME_SCALE: f64 = 100_000.0;
 /// process, so the pointer stays valid for every native object's lifetime.
 static ENGINE: OnceLock<usize> = OnceLock::new();
 
-fn context_engine() -> &'static Tjs2Engine {
-    // SAFETY: set once by register_wavesound; the engine outlives every
-    // native call (process-lifetime app VM).
-    unsafe { &*(*ENGINE.get().expect("tvp-sound: engine context not set") as *const Tjs2Engine) }
+fn context_engine() -> Option<&'static Tjs2Engine> {
+    ENGINE
+        .get()
+        .map(|ptr| unsafe { &*(*ptr as *const Tjs2Engine) })
 }
 
 /// Script-visible playback status (the reference's `tTVPSoundStatus`).
@@ -114,12 +112,24 @@ impl Status {
     }
 }
 
-/// One live `WaveSoundBuffer` object: the retained script object (so
-/// `onStatusChanged`/`onFadeCompleted` dispatch with `this` bound to the
-/// script instance) and the mixer channel it plays on.
+/// One live `WaveSoundBuffer` object: the two retained script objects (so
+/// events dispatch with `this` bound to the right instance) and the mixer
+/// channel it plays on.
+///
+/// The pair mirrors the reference `SoundBufferBaseIntf.cpp`: `self_obj` is
+/// `Owner` — the `WaveSoundBuffer`/script-subclass instance that
+/// `SetStatus` posts `onStatusChanged`/`onFadeCompleted` to — and
+/// `action_owner` is `ActionOwner` — constructor argument 0, which the
+/// native handlers forward the KiriKiri event dictionary to via
+/// `action(ev)` (the game's `AttentionVoice` implements `action`).
 struct Stream {
-    /// Retained script object (`objthis` captured by the constructor).
-    owner: DetachedValue,
+    /// Retained `objthis` (the `WaveSoundBuffer` or a script subclass like
+    /// the game's `SoundBuffer`). Events are delivered here through its
+    /// class chain, so a subclass `onStatusChanged` override runs first and
+    /// may call `super.onStatusChanged(...)` to reach the native handler.
+    self_obj: DetachedValue,
+    /// Retained constructor argument 0; receives `action(ev)`.
+    action_owner: DetachedValue,
     /// Mixer channel id (0 until `open`/`play` spawns one).
     channel_id: u64,
     /// Last status the poll observed (the script-visible `status`).
@@ -167,14 +177,21 @@ extern "C" fn ws_destroy(_engine: *mut c_void, instance: *mut c_void) {
     }
 }
 
-/// `WaveSoundBuffer(owner)` — retain the **first constructor argument**
-/// (the action owner) so status events dispatch to it. The reference
-/// (`SoundBufferBaseIntf.cpp` `Construct`): `ActionOwner = param[0]`; the
-/// native `onStatusChanged`/`onFadeCompleted` class methods forward to the
-/// action owner via `TVP_ACTION_INVOKE`. The game calls
-/// `new WaveSoundBuffer(this)` (AttentionVoice, MovieScene, SoundLayer's
-/// `new SoundBuffer(_owner)`), so `this`/`_owner` is who must receive the
-/// events. `objthis` (the newly-created instance) is NOT the owner.
+/// `WaveSoundBuffer(owner)` — the reference constructor
+/// (`SoundBufferBaseIntf.cpp` `Construct`): retain `objthis` as `Owner`
+/// (the event target) and the **first constructor argument** as
+/// `ActionOwner`. The reference keeps `Owner` as a raw pointer and
+/// `ActionOwner` as a strong closure; we retain both detached so
+/// [`sound_poll`] can deliver `onStatusChanged`/`onFadeCompleted` to the
+/// instance's class chain, whose native handler forwards the event
+/// dictionary to `ActionOwner.action(ev)`.
+///
+/// The game calls `new WaveSoundBuffer(this)` (AttentionVoice, MovieScene)
+/// and `class SoundBuffer extends WaveSoundBuffer` + `new SoundBuffer(owner)`
+/// (BGM/SE). For the former `objthis` is a plain `WaveSoundBuffer` whose
+/// native handler runs directly; for the latter `objthis` is the
+/// `SoundBuffer` and its `onStatusChanged` override runs before calling
+/// `super.onStatusChanged(...)`.
 extern "C" fn ws_ctor(
     _engine: *mut c_void,
     instance: *mut c_void,
@@ -182,7 +199,7 @@ extern "C" fn ws_ctor(
     argv: *const tjs2_sys::Value,
     out: *mut tjs2_sys::Value,
     out_error: *mut *mut c_char,
-    _objthis: *mut c_void,
+    objthis: *mut c_void,
 ) -> c_int {
     // SAFETY: instance is a valid WaveSoundBufferInst payload for the call.
     let inst = unsafe { &mut *ffi::instance_ptr::<WaveSoundBufferInst>(instance) };
@@ -198,33 +215,36 @@ extern "C" fn ws_ctor(
     }
     // Object arguments arrive as VAL_OBJECT resolved against the most
     // recent object-valued script result — the constructor argument.
-    let owner = match context_engine().retain_value_detached(&tjs2_sys::TjsValue::Object) {
+    let Some(engine) = context_engine() else {
+        return ffi::report_error(
+            out_error,
+            "WaveSoundBuffer: engine context not set (register_wavesound not called)",
+        );
+    };
+    let action_owner = match engine.retain_value_detached(&tjs2_sys::TjsValue::Object) {
+        Ok(dv) => dv,
+        Err(e) => return ffi::report_error(out_error, &format!("WaveSoundBuffer: {e}")),
+    };
+    // `objthis` is the object status events are posted to (reference
+    // `Owner`); sound_poll dispatches its onStatusChanged/onFadeCompleted.
+    let self_obj = match engine.retain_object_detached(objthis) {
         Ok(dv) => dv,
         Err(e) => return ffi::report_error(out_error, &format!("WaveSoundBuffer: {e}")),
     };
     let id = NEXT_STREAM.fetch_add(1, Ordering::SeqCst);
-    // Use try_lock: `sound_poll` runs on Bevy worker threads and may hold
-    // STREAMS briefly; a blocking lock here can deadlock against the
-    // delivery's re-entrant `new WaveSoundBuffer` on the VM thread. try_lock
-    // skips the rare collision instead of blocking.
-    match STREAMS.try_lock() {
-        Ok(mut g) => {
-            g.insert(
-                id,
-                Stream {
-                    owner,
-                    channel_id: 0,
-                    status: Status::Unload,
-                    emitted_failed_stop: false,
-                },
-            );
-        }
-        Err(_) => {
-            // Collision with another thread's sound_poll: register the
-            // stream on the next poll (retry flag) instead of blocking.
-            log::warn!("WaveSoundBuffer: STREAMS busy, deferring stream registration");
-        }
-    }
+    // sound_poll never holds STREAMS while delivering events (see below),
+    // so a blocking lock here cannot deadlock against a re-entrant
+    // `new WaveSoundBuffer` from an action handler.
+    lock_ok(&STREAMS).insert(
+        id,
+        Stream {
+            self_obj,
+            action_owner,
+            channel_id: 0,
+            status: Status::Unload,
+            emitted_failed_stop: false,
+        },
+    );
     inst.stream_id = id;
     ffi::set_void_out(out);
     0
@@ -555,26 +575,50 @@ extern "C" fn ws_get_status(
     0
 }
 
-/// The native `onStatusChanged` handler. The game's subclass calls
-/// `super.onStatusChanged(...)` at the end of its override; the base
-/// handler must be a no-op here (events are delivered straight to the
-/// object by [`sound_poll`]).
+/// The native `onStatusChanged(st)` handler (reference `WaveIntf.cpp`
+/// `onStatusChanged`): the reference's base handler forwards a KiriKiri
+/// event dictionary `%[type:"onStatusChanged", target:this, status:st]` to
+/// the retained action owner's `action(ev)`. A plain
+/// `new WaveSoundBuffer(owner)` reaches this directly; the game's
+/// `SoundBuffer.onStatusChanged(st)` override calls
+/// `super.onStatusChanged(...)`, so this is where BGM-playlist chaining
+/// reaches the action owner.
 extern "C" fn ws_on_status_changed(
     _engine: *mut c_void,
     instance: *mut c_void,
-    _argc: c_int,
-    _argv: *const tjs2_sys::Value,
+    argc: c_int,
+    argv: *const tjs2_sys::Value,
     out: *mut tjs2_sys::Value,
     _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
     // SAFETY: instance is a valid WaveSoundBufferInst payload for the call.
-    let _inst = unsafe { &mut *ffi::instance_ptr::<WaveSoundBufferInst>(instance) };
+    let inst = unsafe { &mut *ffi::instance_ptr::<WaveSoundBufferInst>(instance) };
     ffi::set_void_out(out);
+    let Some(engine) = context_engine() else {
+        return 0;
+    };
+    // `super.onStatusChanged(st)` forwards the status; a bare call falls
+    // back to the stream's current status.
+    let args = ffi::args(argv, argc);
+    let status = args
+        .first()
+        .map(ffi::value_as_string)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            lock_ok(&STREAMS)
+                .get(&inst.stream_id)
+                .map_or_else(|| "unload".to_string(), |s| s.status.as_str().to_string())
+        });
+    dispatch_action(engine, inst.stream_id, "onStatusChanged", Some(&status));
     0
 }
 
-/// The native `onFadeCompleted` handler (no-op; see `onStatusChanged`).
+/// The native `onFadeCompleted()` handler (reference `WaveIntf.cpp`):
+/// forwards `%[type:"onFadeCompleted", target:this]` to the action owner.
+/// The game's `SoundBuffer.onFadeCompleted` override does not call
+/// `super`, so this only runs for a plain buffer or a subclass that
+/// forwards.
 extern "C" fn ws_on_fade_completed(
     _engine: *mut c_void,
     instance: *mut c_void,
@@ -585,9 +629,54 @@ extern "C" fn ws_on_fade_completed(
     _objthis: *mut c_void,
 ) -> c_int {
     // SAFETY: instance is a valid WaveSoundBufferInst payload for the call.
-    let _inst = unsafe { &mut *ffi::instance_ptr::<WaveSoundBufferInst>(instance) };
+    let inst = unsafe { &mut *ffi::instance_ptr::<WaveSoundBufferInst>(instance) };
     ffi::set_void_out(out);
+    if let Some(engine) = context_engine() {
+        dispatch_action(engine, inst.stream_id, "onFadeCompleted", None);
+    }
     0
+}
+
+/// Build the KiriKiri event dictionary and call the stream's action
+/// owner's `action(ev)` (reference `TVP_ACTION_INVOKE_BEGIN` / `_MEMBER` /
+/// `_END`). `status` is the extra `%[status:...]` member the
+/// `onStatusChanged` event carries.
+///
+/// The reference macro ignores the `FuncCall` return code, so a missing
+/// `action` member is silently tolerated (the action owner only implements
+/// `action` when it wants the events; e.g. the game's `SoundBuffer` passes
+/// a manager that may not). Only a genuine script error is logged.
+fn dispatch_action(engine: &Tjs2Engine, stream_id: u64, event_type: &str, status: Option<&str>) {
+    let Some(owner) = lock_ok(&STREAMS)
+        .get(&stream_id)
+        .map(|s| s.action_owner.raw_id())
+    else {
+        return;
+    };
+    // Build `%[type:ty, status:status]` imperatively (this TJS2 build
+    // rejects quoted keys in `%[...]` literals).
+    let mut expr = format!(
+        "(function(){{ var d = %[]; d.type = '{}';",
+        escape_js(event_type)
+    );
+    if let Some(status) = status {
+        expr.push_str(&format!(" d.status = '{}';", escape_js(status)));
+    }
+    expr.push_str(" return d; })()");
+    let retained = engine
+        .eval(&expr, "krkr_rs_sound_event")
+        .ok()
+        .and_then(|_| engine.retain_value_detached(&TjsValue::Object).ok());
+    let Some(dv) = retained else {
+        return;
+    };
+    if let Err(e) = engine.call_member(owner, "action", &[TjsValue::Retained(dv.raw_id() as u64)]) {
+        // `Member "" does not exist` is the reference-tolerated missing
+        // `action`; keep it quiet. Anything else is a real handler error.
+        if !e.contains("does not exist") {
+            log::warn!("WaveSoundBuffer action({event_type}) dispatch failed: {e}");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -893,7 +982,26 @@ pub(crate) fn register_wavesound(engine: &Tjs2Engine) -> Result<(), String> {
             property("speed", ws_speed_get, Some(ws_speed_set)),
             property("filters", ws_filters_get, None),
         ],
-    })
+    })?;
+    // The reference's `WaveSoundBuffer` exposes nested filter classes; the
+    // game's `SoundLayer` does `new WaveSoundBuffer.PhaseVocoder()` when a
+    // BGM is played with `createFilter:1` (the title/the OP). Filter
+    // processing is out of scope, but the class must exist and construct
+    // so the playlist setup does not throw.
+    engine
+        .exec_script(
+            r#"
+            if(typeof WaveSoundBuffer.PhaseVocoder == "undefined"){
+                class _PhaseVocoder {
+                    function _PhaseVocoder(){}
+                }
+                WaveSoundBuffer.PhaseVocoder = _PhaseVocoder;
+            }
+            "#,
+            "WaveSoundBuffer_PhaseVocoder",
+        )
+        .map_err(|e| format!("register WaveSoundBuffer.PhaseVocoder: {e}"))?;
+    Ok(())
 }
 
 /// Derive a stream's script-visible status from its mixer channel state.
@@ -928,7 +1036,9 @@ pub fn sound_poll(engine: &Tjs2Engine, now_seconds: f64) {
     // 1. Advance the mixer (no-op before register_sound set one).
     crate::advance(now_seconds);
 
-    // 2. Walk the live streams under the locks and queue events.
+    // 2. Walk the live streams under the locks and queue events. Events
+    // target the retained instance (`self_obj`), so the script class chain
+    // (a `SoundBuffer.onStatusChanged` override) resolves the handler.
     let mut events: Vec<(tjs2_sys::Tjs2ValueId, PollEvent)> = Vec::new();
     {
         let Some(ctx) = native_ctx() else {
@@ -944,7 +1054,7 @@ pub fn sound_poll(engine: &Tjs2Engine, now_seconds: f64) {
                 if st.emitted_failed_stop {
                     st.emitted_failed_stop = false;
                     st.status = Status::Stop;
-                    events.push((st.owner.raw_id(), PollEvent::StatusChanged("stop")));
+                    events.push((st.self_obj.raw_id(), PollEvent::StatusChanged("stop")));
                 }
                 continue;
             }
@@ -953,57 +1063,36 @@ pub fn sound_poll(engine: &Tjs2Engine, now_seconds: f64) {
             };
             if ch.fade_finished {
                 ch.fade_finished = false;
-                events.push((st.owner.raw_id(), PollEvent::FadeCompleted));
+                events.push((st.self_obj.raw_id(), PollEvent::FadeCompleted));
             }
             let derived = derive_status(ch);
             if derived != st.status {
                 let arg = derived.as_str();
                 st.status = derived;
-                events.push((st.owner.raw_id(), PollEvent::StatusChanged(arg)));
+                events.push((st.self_obj.raw_id(), PollEvent::StatusChanged(arg)));
             }
         }
     }
 
     // 3. Deliver the events (locks released; reentrancy is safe).
     //
-    // The reference's `WaveSoundBuffer(owner)` makes the owner an *action
-    // owner*: status events are delivered as a KiriKiri event dictionary
-    // to the owner's `action(ev)` member (the game's `AttentionVoice` /
-    // `MovieScene` implement `action(ev)` and check
-    // `ev.type == "onStatusChanged" && ev.status == "stop"`). The game's
-    // `SoundBuffer` subclass overrides `onStatusChanged(st)` instead, so we
-    // deliver BOTH: the dictionary to `action` (action-owner semantics) and
-    // the string to `onStatusChanged` (class-chain semantics). A missing
-    // member is an error we tolerate silently (the owner implements one or
-    // the other, never both).
-    for (owner, event) in events {
-        let action_arg = match event {
-            PollEvent::StatusChanged(s) => Some(("onStatusChanged", s)),
-            PollEvent::FadeCompleted => None,
-        };
-        if let Some((ty, status)) = action_arg {
-            // Build `%[type:ty, status:status]` imperatively (this TJS2
-            // build rejects quoted keys in `%[...]` literals).
-            let expr = format!(
-                "(function(){{ var d = %[]; d.type = '{}'; d.status = '{}'; return d; }})()",
-                escape_js(ty),
-                escape_js(status)
-            );
-            let retained = engine
-                .eval(&expr, "krkr_rs_sound_event")
-                .ok()
-                .and_then(|_| engine.retain_value_detached(&TjsValue::Object).ok());
-            if let Some(dv) = retained {
-                let _ =
-                    engine.call_member(owner, "action", &[TjsValue::Retained(dv.raw_id() as u64)]);
-            }
-        }
-
+    // The reference's `SetStatus` posts `onStatusChanged` to the
+    // `WaveSoundBuffer` *instance* (`Owner`), not to the action owner.
+    // `onStatusChanged`/`onFadeCompleted` then run through the instance's
+    // class chain: a script subclass override (the game's
+    // `SoundBuffer.onStatusChanged`, which advances the BGM playlist on
+    // "stop") runs first, and its `super.onStatusChanged(...)` reaches the
+    // native handler, which forwards the event dictionary to the action
+    // owner's `action(ev)` (the game's `AttentionVoice`). A plain
+    // `WaveSoundBuffer(this)` has no override, so the native handler runs
+    // directly. This exactly mirrors the reference event flow, instead of
+    // calling `action` and `onStatusChanged` on the action owner.
+    for (target, event) in events {
         let result = match event {
             PollEvent::StatusChanged(s) => {
-                engine.call_member(owner, "onStatusChanged", &[TjsValue::String(s.into())])
+                engine.call_member(target, "onStatusChanged", &[TjsValue::String(s.into())])
             }
-            PollEvent::FadeCompleted => engine.call_member(owner, "onFadeCompleted", &[]),
+            PollEvent::FadeCompleted => engine.call_member(target, "onFadeCompleted", &[]),
         };
         if let Err(e) = result {
             log::warn!("WaveSoundBuffer poll event failed: {e}");

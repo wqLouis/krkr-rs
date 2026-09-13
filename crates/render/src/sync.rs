@@ -29,16 +29,16 @@
 //! # Blend modes
 //!
 //! TVP layers carry a blend `type` (`ltOpaque=1`, `ltAlpha=2`,
-//! `ltAdditive=3`, `ltSubtractive=4`, `ltAddAlpha=12`, ...). The type now
-//! propagates from the native into [`LayerState`] and [`SceneSprite`], so it
-//! is no longer silently lost during sync. Bevy 0.19's built-in `Sprite`
-//! component has one fixed source-over alpha pipeline: it has no per-entity
-//! additive/subtractive `BlendState` field. Consequently all four modes are
-//! currently represented and ordered correctly, but their GPU compositing is
-//! source-over; implementing true additive/subtractive needs a custom
-//! `Material2d` pipeline (a deliberate later renderer change). This explicit
-//! limitation is preferable to pretending the native type was alpha. Alpha
-//! and opacity composition remain correct for every mode.
+//! `ltAdditive=3`, `ltSubtractive=4`, `ltAddAlpha=12`, ...). The type
+//! propagates from the native into [`LayerState`] and [`SceneSprite`], and
+//! since Stage 4 it also drives **real GPU blending**: [`render_path_for`]
+//! routes each layer either onto the built-in straight-alpha `Sprite`
+//! pipeline (source-over modes) or onto a `Mesh2d` quad with the custom
+//! [`LayerBlendMaterial`], whose per-mode pipeline variants carry the actual
+//! fixed-function `BlendState` (add = `src*a + dst`, subtractive =
+//! reverse-subtract, opaque = replace). See [`crate::blend`] for the full
+//! mapping table. Blended quads render in the same z-sorted transparent 2D
+//! phase as sprites, so mixed stacks keep their back-to-front order.
 //!
 //! # Rebuild strategy
 //!
@@ -46,10 +46,13 @@
 //! and [`WindowRoot`] entity is despawned and respawned from the current
 //! scene snapshot. The scene is small (a few dozen layers), so the churn is
 //! negligible and correctness wins; layer/window removal is handled for free.
-//! The only incremental part is **texture upload**: [`BitmapAssets`] caches
-//! one [`Handle<Image>`] per bitmap id, and [`tvp_visual::scene::BitmapState::dirty`]
-//! is the sole trigger for a re-upload (the flag is cleared here after the
-//! upload).
+//! The only incremental parts are **texture upload**: [`BitmapAssets`] caches
+//! one [`Handle<Image>`] per bitmap id ([`tvp_visual::scene::BitmapState::dirty`]
+//! is the sole trigger for a re-upload, cleared here after the upload), and
+//! the shared GPU primitives ([`GpuPrimitives`]: unit quad mesh + white 1×1
+//! texture) created once and reused. Per-frame [`LayerBlendMaterial`] assets
+//! are tracked in [`FrameBlendMaterials`] and freed at the next sync so they
+//! never accumulate.
 //!
 //! # Locking
 //!
@@ -63,12 +66,18 @@ use std::sync::{Arc, RwLock};
 
 use bevy::asset::{Assets, Handle, RenderAssetUsages};
 use bevy::camera::{Camera2d, ClearColorConfig};
+use bevy::color::Color;
 use bevy::ecs::prelude::{Commands, Component, Entity, Query, Res, ResMut, Resource, With};
 use bevy::image::Image;
-use bevy::math::Vec2;
-use bevy::prelude::{Camera, Color, Sprite, Transform, Visibility};
+use bevy::math::primitives::Rectangle;
+use bevy::math::{Vec2, Vec3};
+use bevy::mesh::{Mesh, Mesh2d};
+use bevy::prelude::{Camera, Sprite, Transform, Visibility};
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+use bevy::sprite_render::MeshMaterial2d;
 use tvp_visual::scene::{BitmapState, LayerState, Rect, Scene};
+
+use crate::blend::{LayerBlendMaterial, LayerRenderPath, render_path_for};
 
 /// The shared logical scene: natives (VM) write under the lock, this crate
 /// reads under it. See WAVE3.md.
@@ -135,6 +144,22 @@ fn upload_bitmap(bitmap: &BitmapState, images: &mut Assets<Image>) -> Handle<Ima
     images.add(image)
 }
 
+/// Lazily-created shared GPU primitives reused across frames (and shared by
+/// every blended layer): a centered 1×1 quad mesh (scaled to the layer rect
+/// via the transform) and a 1×1 white texture that stands in for solid-fill
+/// layers on the custom-material path (the tint alone drives the color).
+#[derive(Resource, Default)]
+pub struct GpuPrimitives {
+    unit_quad: Option<Handle<Mesh>>,
+    white_1x1: Option<Handle<Image>>,
+}
+
+/// Strong handles of the [`LayerBlendMaterial`] assets created by the last
+/// sync. The full rebuild despawns their entities every frame, so these are
+/// removed at the start of the next sync — material assets never accumulate.
+#[derive(Resource, Default)]
+pub struct FrameBlendMaterials(Vec<Handle<LayerBlendMaterial>>);
+
 /// Root entity for one logical window: the background/anchor node that owns
 /// the window's layer sprites.
 #[derive(Component)]
@@ -143,12 +168,17 @@ pub struct WindowRoot {
 }
 
 /// One spawned layer sprite.
+///
+/// Layers whose native blend type maps to plain source-over carry the
+/// built-in [`Sprite`]; layers needing a real GPU blend (additive,
+/// subtractive, opaque-replace) instead carry a `Mesh2d` quad with a
+/// [`LayerBlendMaterial`] and no `Sprite`. Both shapes share this marker so
+/// the rebuild and tests see one flat list of layer entities.
 #[derive(Component)]
 pub struct SceneSprite {
     pub layer_id: u32,
-    /// Native TVP `Layer.type`. The built-in Bevy Sprite pipeline currently
-    /// renders this marker with source-over alpha; see the module docs for
-    /// why additive/subtractive need a custom material to become GPU blends.
+    /// Native TVP `Layer.type`; also drives the render path via
+    /// [`render_path_for`] (see [`crate::blend`] for the mapping).
     pub blend_type: i64,
 }
 
@@ -159,11 +189,16 @@ pub struct SceneCamera;
 
 /// The scene → Bevy sync system. Run in `Update`, after the VM tick mutates
 /// the scene.
+#[allow(clippy::too_many_arguments)]
 pub fn sync_scene(
     mut commands: Commands,
     shared: Res<SharedScene>,
     mut bitmaps: ResMut<BitmapAssets>,
     mut images: ResMut<Assets<Image>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<LayerBlendMaterial>>,
+    mut gpu: ResMut<GpuPrimitives>,
+    mut frame_materials: ResMut<FrameBlendMaterials>,
     previous_roots: Query<Entity, With<WindowRoot>>,
     previous_sprites: Query<Entity, With<SceneSprite>>,
     cameras: Query<Entity, With<SceneCamera>>,
@@ -175,6 +210,13 @@ pub fn sync_scene(
         commands.entity(entity).despawn();
     }
     let _ = previous_sprites;
+
+    // The entities referencing last frame's blend materials are gone; free
+    // the assets so they don't accumulate (one fresh material per blended
+    // layer per frame is fine, a growing pool is not).
+    for handle in frame_materials.0.drain(..) {
+        materials.remove(handle.id());
+    }
 
     let scene = shared.0.read().expect("shared scene lock poisoned");
     let mut uploaded: Vec<u32> = Vec::new();
@@ -220,30 +262,47 @@ pub fn sync_scene(
             };
             let (x, y) = rect_center(composed.rect, win_w, win_h);
             let alpha = win_opacity * composed.opacity;
-            let sprite = build_sprite(
+            let visual = build_layer_visual(
                 layer,
                 alpha,
                 &mut bitmaps,
                 &scene,
                 &mut images,
                 &mut uploaded,
+                &mut meshes,
+                &mut materials,
+                &mut gpu,
+                &mut frame_materials.0,
             );
-
-            let sprite = commands
-                .spawn((
-                    SceneSprite {
-                        layer_id,
-                        blend_type: layer.blend_type,
-                    },
-                    sprite,
-                    Transform::from_xyz(x, y, sprite_z(index)),
-                    if composed.visible {
-                        Visibility::Visible
-                    } else {
-                        Visibility::Hidden
-                    },
-                ))
-                .id();
+            let transform = Transform::from_xyz(x, y, sprite_z(index));
+            let visibility = if composed.visible {
+                Visibility::Visible
+            } else {
+                Visibility::Hidden
+            };
+            let marker = SceneSprite {
+                layer_id,
+                blend_type: layer.blend_type,
+            };
+            // Blended quads reuse the shared unit quad scaled to the layer
+            // rect; sprites carry their size via custom_size instead.
+            let sprite = match visual {
+                LayerVisual::Sprite(sprite) => {
+                    commands.spawn((marker, sprite, transform, visibility))
+                }
+                LayerVisual::Blended { mesh, material } => {
+                    let mut transform = transform;
+                    transform.scale = Vec3::new(layer.rect.w as f32, layer.rect.h as f32, 1.0);
+                    commands.spawn((
+                        marker,
+                        Mesh2d(mesh),
+                        MeshMaterial2d(material),
+                        transform,
+                        visibility,
+                    ))
+                }
+            }
+            .id();
             commands.entity(root).add_child(sprite);
         }
     }
@@ -260,37 +319,110 @@ pub fn sync_scene(
     }
 }
 
-/// Build the [`Sprite`] for one layer.
+/// What the sync spawns for one layer: a plain [`Sprite`] or a blended
+/// mesh + [`LayerBlendMaterial`] pair.
+enum LayerVisual {
+    Sprite(Sprite),
+    Blended {
+        mesh: Handle<Mesh>,
+        material: Handle<LayerBlendMaterial>,
+    },
+}
+
+/// Build the visual for one layer.
 ///
-/// * Bitmap layer → texture from [`BitmapAssets`], tinted white with the
-///   composed alpha (the texture carries the actual RGB/alpha).
+/// The native blend type decides the render path ([`render_path_for`]):
+/// * source-over modes (and unknown types) → built-in [`Sprite`] (straight
+///   alpha, unchanged from earlier milestones);
+/// * additive / subtractive / opaque-at-full-opacity → unit quad with a
+///   fresh [`LayerBlendMaterial`] whose pipeline variant carries the actual
+///   fixed-function blend state.
+///
+/// Content rules are shared by both paths:
+/// * Bitmap layer → texture from [`BitmapAssets`], white tint at the
+///   composed alpha (the texture carries the RGB/alpha).
 /// * Fill layer → solid color from `fill_color` (straight alpha), alpha
-///   multiplied with the composed window × layer opacity.
-/// * Bitmap missing/invalid, no fill → transparent black.
-fn build_sprite(
+///   multiplied with the composed window × layer opacity; on the material
+///   path a shared 1×1 white texture stands in for the bitmap.
+#[allow(clippy::too_many_arguments)]
+fn build_layer_visual(
     layer: &LayerState,
     alpha: f32,
     bitmaps: &mut BitmapAssets,
     scene: &Scene,
     images: &mut Assets<Image>,
     uploaded: &mut Vec<u32>,
-) -> Sprite {
-    match layer
-        .bitmap
-        .and_then(|id| bitmaps.handle_for(id, scene, images, uploaded))
-    {
-        Some(handle) => Sprite {
-            image: handle,
-            color: bitmap_tint(alpha),
-            custom_size: Some(Vec2::new(layer.rect.w as f32, layer.rect.h as f32)),
-            ..Default::default()
-        },
-        None => {
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<LayerBlendMaterial>,
+    gpu: &mut GpuPrimitives,
+    frame_materials: &mut Vec<Handle<LayerBlendMaterial>>,
+) -> LayerVisual {
+    let path = render_path_for(layer.blend_type, alpha);
+    let size = Vec2::new(layer.rect.w as f32, layer.rect.h as f32);
+
+    match path {
+        LayerRenderPath::Sprite => {
+            let sprite = match layer
+                .bitmap
+                .and_then(|id| bitmaps.handle_for(id, scene, images, uploaded))
+            {
+                Some(handle) => Sprite {
+                    image: handle,
+                    color: bitmap_tint(alpha),
+                    custom_size: Some(size),
+                    ..Default::default()
+                },
+                None => {
+                    let color = layer
+                        .fill_color
+                        .map(|fill| fill_sprite_color(fill, alpha))
+                        .unwrap_or_else(|| Color::srgba(0.0, 0.0, 0.0, clamp_opacity(alpha)));
+                    Sprite::from_color(color, size)
+                }
+            };
+            LayerVisual::Sprite(sprite)
+        }
+        LayerRenderPath::Material(mode) => {
+            // Bitmap texture if present, else a shared white 1×1 stand-in
+            // for solid fills (never bind Bevy's fallback: it is transparent
+            // black and would zero out additive/subtractive fills).
+            let bitmap_texture = layer
+                .bitmap
+                .and_then(|id| bitmaps.handle_for(id, scene, images, uploaded));
+            let texture = match bitmap_texture {
+                Some(handle) => handle,
+                None => {
+                    if gpu.white_1x1.is_none() {
+                        gpu.white_1x1 = Some(images.add(Image::new(
+                            Extent3d {
+                                width: 1,
+                                height: 1,
+                                depth_or_array_layers: 1,
+                            },
+                            TextureDimension::D2,
+                            vec![255; 4],
+                            TextureFormat::Rgba8UnormSrgb,
+                            RenderAssetUsages::default(),
+                        )));
+                    }
+                    gpu.white_1x1
+                        .clone()
+                        .expect("white 1×1 texture just created")
+                }
+            };
             let color = layer
                 .fill_color
-                .map(|fill| fill_sprite_color(fill, alpha))
-                .unwrap_or_else(|| Color::srgba(0.0, 0.0, 0.0, alpha));
-            Sprite::from_color(color, Vec2::new(layer.rect.w as f32, layer.rect.h as f32))
+                .map_or_else(|| bitmap_tint(alpha), |fill| fill_sprite_color(fill, alpha));
+            let quad = gpu
+                .unit_quad
+                .get_or_insert_with(|| meshes.add(Rectangle::new(1.0, 1.0)))
+                .clone();
+            let material = materials.add(LayerBlendMaterial::new(color.to_linear(), texture, mode));
+            frame_materials.push(material.clone());
+            LayerVisual::Blended {
+                mesh: quad,
+                material,
+            }
         }
     }
 }
@@ -391,6 +523,7 @@ pub fn fill_sprite_color(fill: [u8; 4], alpha: f32) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::blend::{LayerBlendMode, LayerBlendPlugin};
     use bevy::app::{App, Update};
     use bevy::math::Vec3;
     use tvp_visual::scene::Rect;
@@ -423,11 +556,17 @@ mod tests {
 
     /// An App with just the sync system and the resources it needs (no
     /// renderer/window — this runs the real sync code without a GPU).
+    /// [`LayerBlendPlugin`] registers the blend-material asset store (its
+    /// render-app parts are skipped without a RenderApp).
     fn app_with_sync(shared: SharedScene) -> App {
         let mut app = App::new();
         app.insert_resource(shared)
             .insert_resource(Assets::<Image>::default())
+            .insert_resource(Assets::<Mesh>::default())
             .init_resource::<BitmapAssets>()
+            .init_resource::<GpuPrimitives>()
+            .init_resource::<FrameBlendMaterials>()
+            .add_plugins(LayerBlendPlugin)
             .add_systems(Update, sync_scene);
         app
     }
@@ -564,6 +703,195 @@ mod tests {
             q.single(world).unwrap().blend_type,
             tvp_visual::scene::LT_ADDITIVE
         );
+    }
+
+    /// Stage 4: an ltAdditive layer must become a Mesh2d quad with a
+    /// [`LayerBlendMaterial`] whose mode is a real GPU Additive blend (not
+    /// a source-over sprite), positioned/sized like any other layer.
+    #[test]
+    fn additive_layer_spawns_gpu_blend_material_quad() {
+        let mut scene = Scene::default();
+        let win = scene.add_window("t", (1280, 720));
+        let bmp_id = scene.add_bitmap(32, 32, vec![0u8; 32 * 32 * 4]);
+        let layer = scene.add_layer(win, None);
+        {
+            let l = scene.layer_mut(layer).unwrap();
+            l.blend_type = tvp_visual::scene::LT_ADDITIVE;
+            l.bitmap = Some(bmp_id);
+            l.rect = Rect {
+                x: 100,
+                y: 200,
+                w: 32,
+                h: 32,
+            };
+        }
+        let shared = SharedScene(Arc::new(RwLock::new(scene)));
+        let mut app = app_with_sync(shared.clone());
+        app.update();
+
+        let world = app.world_mut();
+        // No plain Sprite: the built-in pipeline cannot composite additively.
+        assert_eq!(
+            world
+                .query_filtered::<&Sprite, With<SceneSprite>>()
+                .iter(world)
+                .count(),
+            0,
+            "additive layer must not render as a source-over sprite"
+        );
+        let (marker, mesh, material, transform) = world
+            .query_filtered::<(
+                &SceneSprite,
+                &Mesh2d,
+                &MeshMaterial2d<LayerBlendMaterial>,
+                &Transform,
+            ), With<SceneSprite>>()
+            .single(world)
+            .expect("one blended quad");
+        assert_eq!(marker.blend_type, tvp_visual::scene::LT_ADDITIVE);
+        assert!(mesh.0.is_strong(), "unit quad mesh bound");
+
+        let mat_assets = world.resource::<Assets<LayerBlendMaterial>>();
+        let mat = mat_assets.get(&material.0).expect("material exists");
+        assert_eq!(
+            LayerBlendMode::from(mat),
+            LayerBlendMode::Additive,
+            "material carries the GPU blend mode"
+        );
+        assert!(mat.texture().is_some(), "bitmap texture bound");
+
+        // Same placement rules as sprites: center + rect size as scale.
+        // TVP rect (100,200,32x32) in 1280x720 → Bevy
+        // (100+16-640, 360-(200+16)) = (-524, 144), z=0.
+        assert_eq!(transform.translation, Vec3::new(-524.0, 144.0, 0.0));
+        assert_eq!(transform.scale, Vec3::new(32.0, 32.0, 1.0));
+
+        // The dirty flag of the uploaded bitmap was still cleared.
+        assert!(!shared.0.read().unwrap().bitmap(bmp_id).unwrap().dirty);
+    }
+
+    /// Subtractive layers take the material path too, with the Subtractive
+    /// mode on their material.
+    #[test]
+    fn subtractive_layer_spawns_subtractive_material() {
+        let mut scene = Scene::default();
+        let win = scene.add_window("t", (640, 480));
+        let layer = scene.add_layer(win, None);
+        {
+            let l = scene.layer_mut(layer).unwrap();
+            l.blend_type = tvp_visual::scene::LT_SUBTRACTIVE;
+            l.fill_color = Some([40, 40, 40, 255]);
+            l.rect = Rect {
+                x: 0,
+                y: 0,
+                w: 64,
+                h: 64,
+            };
+        }
+        let shared = SharedScene(Arc::new(RwLock::new(scene)));
+        let mut app = app_with_sync(shared);
+        app.update();
+
+        let world = app.world_mut();
+        let (_, material) = world
+            .query_filtered::<(&Mesh2d, &MeshMaterial2d<LayerBlendMaterial>), With<SceneSprite>>()
+            .single(world)
+            .expect("one blended quad");
+        let mat = world
+            .resource::<Assets<LayerBlendMaterial>>()
+            .get(&material.0)
+            .unwrap();
+        assert_eq!(LayerBlendMode::from(mat), LayerBlendMode::Subtractive);
+        // Fill-only layers bind the shared white 1×1 texture so the tint
+        // alone drives the color.
+        assert!(mat.texture().is_some());
+    }
+
+    /// An ltOpaque layer at full opacity takes the replace (no-blend)
+    /// material path; under partial window/layer opacity it must degrade to
+    /// a source-over Sprite so the opacity still applies.
+    #[test]
+    fn opaque_layer_replace_at_full_opacity_sprite_under_opacity() {
+        let mut scene = Scene::default();
+        let win = scene.add_window("t", (64, 64));
+        let full = scene.add_layer(win, None);
+        {
+            let l = scene.layer_mut(full).unwrap();
+            l.blend_type = tvp_visual::scene::LT_OPAQUE;
+            l.fill_color = Some([1, 2, 3, 255]);
+            l.rect = Rect {
+                x: 0,
+                y: 0,
+                w: 64,
+                h: 64,
+            };
+        }
+        let faded = scene.add_layer(win, None);
+        {
+            let l = scene.layer_mut(faded).unwrap();
+            l.blend_type = tvp_visual::scene::LT_OPAQUE;
+            l.opacity = 0.5;
+            l.fill_color = Some([4, 5, 6, 255]);
+            l.rect = Rect {
+                x: 0,
+                y: 0,
+                w: 64,
+                h: 64,
+            };
+        }
+        let shared = SharedScene(Arc::new(RwLock::new(scene)));
+        let mut app = app_with_sync(shared);
+        app.update();
+
+        let world = app.world_mut();
+        let faded_is_sprite = world
+            .query_filtered::<(&SceneSprite, &Sprite), With<SceneSprite>>()
+            .iter(world)
+            .any(|(m, _)| m.layer_id == faded);
+        let full_replaces = world
+            .query_filtered::<(
+                &SceneSprite,
+                &MeshMaterial2d<LayerBlendMaterial>,
+            ), With<SceneSprite>>()
+            .iter(world)
+            .any(|(m, _)| m.layer_id == full);
+        assert!(
+            faded_is_sprite,
+            "faded opaque layer stays on the sprite path"
+        );
+        assert!(full_replaces, "full-opacity opaque layer replaces");
+    }
+
+    /// Blended quads share the flat z sequence with sprites: an additive
+    /// layer spawned last must get the highest z even though it renders via
+    /// a different pipeline.
+    #[test]
+    fn blended_quads_share_z_order_with_sprites() {
+        let mut scene = Scene::default();
+        let win = scene.add_window("t", (64, 64));
+        let back = scene.add_layer(win, None);
+        scene.layer_mut(back).unwrap().fill_color = Some([0, 0, 0, 255]);
+        let front = scene.add_layer(win, None);
+        scene.layer_mut(front).unwrap().blend_type = tvp_visual::scene::LT_ADDITIVE;
+        scene.layer_mut(front).unwrap().fill_color = Some([9, 9, 9, 255]);
+        scene.layer_mut(front).unwrap().rect = Rect {
+            x: 0,
+            y: 0,
+            w: 64,
+            h: 64,
+        };
+        let shared = SharedScene(Arc::new(RwLock::new(scene)));
+        let mut app = app_with_sync(shared);
+        app.update();
+
+        let world = app.world_mut();
+        let mut q = world.query_filtered::<(&SceneSprite, &Transform), With<SceneSprite>>();
+        let mut by_id = std::collections::HashMap::new();
+        for (m, t) in q.iter(world) {
+            by_id.insert(m.layer_id, t.translation.z);
+        }
+        assert_eq!(by_id[&back], 0.0);
+        assert_eq!(by_id[&front], 1.0, "blended quad keeps the z sequence");
     }
 
     #[test]
@@ -905,7 +1233,7 @@ mod tests {
         };
 
         let shared = SharedScene(Arc::new(RwLock::new(scene)));
-        let mut app = app_with_sync(shared.clone());
+        let mut app = app_with_sync(shared);
         app.update();
 
         let world = app.world_mut();

@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
+use std::time::Duration;
 
 use tjs2_sys::{
     NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef, Tjs2Engine, TjsValue,
@@ -164,10 +165,15 @@ extern "C" fn timer_on_timer(
         let result = engine.call_detached(&cb, &[]);
         // Put the callback back (unless the timer was destroyed during the
         // callback, in which case dropping it releases the retained value).
-        let mut timers = TIMERS.lock().unwrap_or_else(|p| p.into_inner());
-        match timers.get_mut(&inst.id) {
-            Some(t) => t.callback = Some(cb),
-            None => drop(cb),
+        // Scope the guard: the error branch below must re-lock TIMERS, and
+        // `std::sync::Mutex` is not reentrant (a live guard here would
+        // self-deadlock the VM thread whenever a callback errors).
+        {
+            let mut timers = TIMERS.lock().unwrap_or_else(|p| p.into_inner());
+            match timers.get_mut(&inst.id) {
+                Some(t) => t.callback = Some(cb),
+                None => drop(cb),
+            }
         }
         if let Err(e) = result {
             log::warn!("Timer {}: callback failed ({e}); disabling", inst.id);
@@ -529,6 +535,11 @@ pub(crate) fn timer_poll(engine: &Tjs2Engine, now_ms: u64) {
                 .and_then(|t| t.owner.as_ref())
                 .map(|o| o.raw_id())
         };
+        let trace = std::env::var("KRKR_TIMER_TRACE").is_ok();
+        let fire_start = std::time::Instant::now();
+        if trace {
+            eprintln!("[timer-trace] firing timer {id} (interval {interval_ms}ms) at poll");
+        }
         let result = match owner {
             Some(owner_id) => engine.call_member(owner_id, "onTimer", &[]),
             // No retained object (retain failed): fall back to the callback.
@@ -547,6 +558,14 @@ pub(crate) fn timer_poll(engine: &Tjs2Engine, now_ms: u64) {
                 result
             }
         };
+        if trace {
+            let dt = fire_start.elapsed();
+            if dt >= Duration::from_millis(500) {
+                eprintln!("[timer-trace] timer {id} callback took {dt:?} (SLOW/HANGING?)");
+            } else {
+                eprintln!("[timer-trace] timer {id} callback done in {dt:?}");
+            }
+        }
         match result {
             Ok(_) => {}
             Err(e) => {

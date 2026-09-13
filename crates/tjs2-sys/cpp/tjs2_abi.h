@@ -123,6 +123,15 @@ int tjs2_call_value(void *engine, tjs2_value_id id, int argc,
                     char **out_error);
 
 /*
+ * Read a named property from a retained object value (PropGet through the
+ * object's class chain). Same conventions as tjs2_call_value: returns 0 on
+ * success and fills out; on failure returns non-zero with a malloc'd UTF-8
+ * message in out_error.
+ */
+int tjs2_prop_get(void *engine, tjs2_value_id id, const char *membername,
+                  tjs2_value *out, char **out_error);
+
+/*
  * Native class registration (static methods only for this milestone).
  *
  * The VM is single-threaded: register classes only from the thread that

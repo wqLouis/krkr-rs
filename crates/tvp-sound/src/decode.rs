@@ -13,10 +13,11 @@
 //! copy. Playback output lives in [`crate::player`] on top of rodio.
 
 use std::io::Cursor;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use engine::Storage;
 use symphonia::core::codecs::audio::AudioDecoderOptions;
+use symphonia::core::codecs::registry::CodecRegistry;
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::{FormatOptions, TrackType};
@@ -72,6 +73,40 @@ pub enum DecodeError {
     Empty(String),
 }
 
+/// Global codec registry that includes the Opus decoder via
+/// `symphonia-adapter-libopus`. Opus is not in symphonia's default
+/// registry (it ships separately as `symphonia-adapter-libopus`, which
+/// needs the C libopus). The game's voice files are Ogg Opus
+/// (`OpusHead`), while BGM are Vorbis. With this registry, real Opus
+/// voices decode to full PCM so the logo→title sequencing can wait on
+/// actual voice durations instead of the ~60 ms silent fallback.
+static CODEC_REGISTRY: LazyLock<CodecRegistry> = LazyLock::new(|| {
+    let mut registry = CodecRegistry::new();
+    symphonia::default::register_enabled_codecs(&mut registry);
+    registry.register_audio_decoder::<symphonia_adapter_libopus::OpusDecoder>();
+    registry
+});
+
+fn is_opus(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"OggS") && bytes.windows(8).any(|w| w == b"OpusHead")
+}
+
+fn silent_fallback(name: &str) -> DecodedAudio {
+    log::warn!(
+        "decode_audio: {name}: Opus decode failed or produced no samples; returning a short silent buffer so voice sequencing still drives onStatusChanged(\"stop\")"
+    );
+    let rate = 48000u32;
+    let channels = 2u16;
+    // ~60 ms of silence: enough for the mixer to report a play→stop
+    // transition on the next poll, even when real decode is unavailable.
+    let n = (rate as usize / 1000 * 60) * channels as usize;
+    DecodedAudio {
+        sample_rate: rate,
+        channels,
+        samples: vec![0.0; n],
+    }
+}
+
 /// Decode a storage entry by name (wav/ogg/vorbis/flac/mp3).
 ///
 /// Locks `storage` briefly to read the entry's bytes, then fully decodes
@@ -103,38 +138,28 @@ pub fn decode_audio_bytes(bytes: &[u8], name: &str) -> Result<DecodedAudio, Deco
     {
         hint.with_extension(ext);
     }
-    // The game's voice files are Ogg Opus (symphonia's default registry has
-    // no Opus decoder even on 0.6 — the Opus decoder ships separately as
-    // `symphonia-adapter-libopus`, which needs the C libopus). The voices
-    // drive the script's sequencing via `onStatusChanged("stop")`, so a
-    // short silent buffer lets them "play and finish" immediately and keeps
-    // the logo→title chain moving. Real Opus decode is a follow-up.
-    if bytes.starts_with(b"OggS") && bytes.windows(8).any(|w| w == b"OpusHead") {
-        log::warn!(
-            "decode_audio: {name}: Ogg Opus is not decoded yet; returning a short silent buffer (voice sequencing still works)"
-        );
-        let rate = 48000u32;
-        let channels = 2u16;
-        // ~60 ms of silence: enough for the mixer to report a play→stop
-        // transition on the next poll.
-        let n = (rate as usize / 1000 * 60) * channels as usize;
-        return Ok(DecodedAudio {
-            sample_rate: rate,
-            channels,
-            samples: vec![0.0; n],
-        });
-    }
-    let mut format = symphonia::default::get_probe()
-        .probe(
-            &hint,
-            mss,
-            FormatOptions::default(),
-            MetadataOptions::default(),
-        )
-        .map_err(|e| DecodeError::Format {
-            name: name.to_string(),
-            detail: format!("{e}"),
-        })?;
+    let opus = is_opus(bytes);
+    let mut format = match symphonia::default::get_probe().probe(
+        &hint,
+        mss,
+        FormatOptions::default(),
+        MetadataOptions::default(),
+    ) {
+        Ok(f) => f,
+        Err(e) => {
+            if opus {
+                log::warn!(
+                    "decode_audio: {name}: Opus probe failed ({e}), falling back to silent buffer"
+                );
+                return Ok(silent_fallback(name));
+            } else {
+                return Err(DecodeError::Format {
+                    name: name.to_string(),
+                    detail: format!("{e}"),
+                });
+            }
+        }
+    };
 
     // Pick the default audio track.
     let track = format
@@ -146,12 +171,24 @@ pub fn decode_audio_bytes(bytes: &[u8], name: &str) -> Result<DecodedAudio, Deco
         .as_ref()
         .and_then(|cp| cp.audio())
         .ok_or_else(|| DecodeError::NoTrack(name.to_string()))?;
-    let mut decoder = symphonia::default::get_codecs()
+    let mut decoder = match CODEC_REGISTRY
         .make_audio_decoder(codec_params, &AudioDecoderOptions::default())
-        .map_err(|e| DecodeError::Format {
-            name: name.to_string(),
-            detail: format!("codec: {e}"),
-        })?;
+    {
+        Ok(d) => d,
+        Err(e) => {
+            if opus {
+                log::warn!(
+                    "decode_audio: {name}: Opus codec not available ({e}), falling back to silent buffer"
+                );
+                return Ok(silent_fallback(name));
+            } else {
+                return Err(DecodeError::Format {
+                    name: name.to_string(),
+                    detail: format!("codec: {e}"),
+                });
+            }
+        }
+    };
 
     let mut samples: Vec<f32> = Vec::new();
     let mut sample_rate = codec_params.sample_rate.unwrap_or(0);
@@ -205,12 +242,23 @@ pub fn decode_audio_bytes(bytes: &[u8], name: &str) -> Result<DecodedAudio, Deco
     }
 
     if samples.is_empty() {
+        if opus {
+            return Ok(silent_fallback(name));
+        }
         return Err(DecodeError::Empty(name.to_string()));
     }
 
-    Ok(DecodedAudio {
+    let audio = DecodedAudio {
         sample_rate,
         channels,
         samples,
-    })
+    };
+    log::info!(
+        "decode_audio: {name}: decoded {} Hz, {} ch, {:.2}s ({} frames)",
+        audio.sample_rate,
+        audio.channels,
+        audio.duration_seconds(),
+        audio.frames()
+    );
+    Ok(audio)
 }

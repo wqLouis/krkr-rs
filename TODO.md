@@ -1,19 +1,81 @@
 # krkr-rs — Game Runtime TODO
 
-## Current state (Aug 17, 2026)
+## Current state (Sep 13, 2026)
 
 **Working**: mount `.xp3` (23,572 + 174 entries) → run `startup.tjs` via the C++
 TJS2 VM → `system/Status.tjs` + `Initialize.tjs` + `k2compat/*` + all
 `system/*.tjs` load → `begin.tjs` creates `SceneManager` + `Logo` scene →
-Bevy window renders the logo/title layers → input bridge dispatches mouse/key
-to the game's `onMouseDown`/`onKeyDown` → `WaveSoundBuffer` audio natives
-registered (BGM path wired, voices decode as silence).
+Bevy window renders the logo/title layers → **the full logo → ATTENTION →
+title transition completes** (voice-driven, verified headlessly by
+`attention-harness`) → the title scene constructs its `SelectItem`s → input
+bridge dispatches mouse/key to the game's `onMouseDown`/`onKeyDown` →
+`WaveSoundBuffer` audio natives with **real Ogg Opus voice decode**.
 
 **Remaining blockers**: the startup plugin chain is emulated by built-in Rust
-natives. The gameplay gaps: the logo→title transition is **stuck at the
-warning (ATTENTION) screen** — the voice-driven sequence advances only when
-`onStatusChanged("stop")` fires, which is still being debugged. Below is the
-complete investigation log.
+natives. Gameplay gaps: title-screen item interaction (`SelectItem`
+hit-testing / activation), the `ScController` scenario loop, and save/load.
+Below is the investigation log; the logo→title milestone is closed.
+
+---
+
+## Logo → title milestone closed (Sep 13)
+
+The last blockers that kept the sequence frozen were found and fixed:
+
+### A. Opus voice decode (FIXED)
+Registered `symphonia-adapter-libopus` in a custom codec registry, so
+`voice/*.ogg` (Ogg Opus) decode to real PCM with their true durations; the
+silent ~60 ms fallback is now only a last resort. `AttentionVoice.action(ev)`
+advances one entry per voice with the real (multi-second) timing.
+
+### B. Reference-faithful sound event delivery (FIXED)
+`WaveSoundBuffer` now retains **both** `objthis` (event target) and constructor
+argument 0 (action owner), mirroring `SoundBufferBaseIntf.cpp`. `sound_poll`
+posts `onStatusChanged` to the *instance*, so a script subclass override (the
+game's `SoundBuffer.onStatusChanged`, which chains BGM and sets `_destroy`)
+runs first and its `super.onStatusChanged(...)` reaches the native handler,
+which forwards `%[type,status]` to `action(ev)`. Previously we called
+`action` *and* `onStatusChanged` on the action owner, so the `SoundBuffer`
+override never ran and every plain `WaveSoundBuffer(this)` logged a spurious
+`Member "" does not exist`.
+
+### C. Timer self-deadlock on a failing callback (FIXED)
+`tvp-visual` `timer_on_timer` left its `TIMERS` guard alive across the
+callback error branch, which re-locked the same non-reentrant `Mutex`:
+whenever a script `onTimer` raised, the VM thread self-deadlocked. This hung
+the title transition (a `finalize` error fired inside a timer). The guard is
+now scoped and the error path re-locks safely.
+
+### D. Missing native `finalize` on every native class (FIXED)
+The reference's class macro always includes `TJS_DECL_EMPTY_FINALIZE_METHOD`,
+so a script subclass can call `super.finalize()` (e.g. the game's
+`AffineLayer.finalize`). The ABI now auto-registers a no-op `finalize` on
+every instance class unless it provides its own.
+
+### E. `Layer.hitType` / `Layer.cursor` (FIXED)
+`SelectItemBase` sets `hitType = htMask` and `cursor = crDefault`; both now
+exist as Layer properties (values stored in `LayerState`, hit-testing
+semantics still pending).
+
+### F. Object-valued `Layer.parent` + `Layer` member surface (FIXED)
+The title scene builds a layer hierarchy with `.parent = <Layer object>`, so
+`parent` is now a real object-aware property: the getter returns the parent
+Layer's retained TJS object, the setter accepts a Layer object (its `id` is
+read through a new `tjs2_prop_get` ABI) or an integer id, and the `Layer`
+constructor resolves an object parent too. The same ABI generalizes
+`setBitmap`/`setImage`/`copyFromBitmapToMainImage` to accept `Bitmap`
+objects. Added `Layer.face` / `Layer.holdAlpha` and a batch of no-op stubs
+(`setMainPixel`, `bringToBack`, `focusNext`, …), plus a
+`WaveSoundBuffer.PhaseVocoder` stub class for the filtered title BGM.
+
+### G. Embedded WGSL path (FIXED)
+`LayerBlendMaterial` referenced `embedded://render/…`, but the crate's lib
+name is `krkr_render`, so the embedded asset was never found (Bevy logged
+`Path not found`). Corrected to `embedded://krkr_render/…`.
+
+After F/G the title scene constructs end-to-end with **zero TJS
+exceptions** and stays stable (`attention-harness` climbs through the logo,
+runs the ATTENTION voices, changes to scene 2, and idles cleanly).
 
 ---
 
@@ -93,39 +155,42 @@ Bevy moves the system across threads.
 |---|---|---|
 | `extrans.dll` | `Trans` class | ✅ native `Trans` registered (extrans.rs) |
 | `csvParser.dll` | `new CSVParser()` (charData.csv) | ✅ real native in tvp-storages |
-| `layerExDraw.dll` | layer effects (blur etc.) | ⚠️ logical-layer pixel ops; GPU blend modes pending |
+| `layerExDraw.dll` | layer effects (blur etc.) | ⚠️ logical-layer pixel ops; GPU blend modes ✅ |
 | `fstat.dll` | `Storages.stat`/file metadata | ✅ stat/fstat metadata, copyFile/deleteFile |
 | `windowEx.dll` | `System.desktop*`, monitor info | ✅ monitor context + `getDisplayMonitors` |
 | `KAGParserEx.dll` | placeholder | ✅ KAGParser native |
 | `getSample.dll` | debug only | ignored |
-| `wuvorbis.dll` | `WaveSoundBuffer` (.ogg) | ✅ natives; Opus voice decode pending |
+| `wuvorbis.dll` | `WaveSoundBuffer` (.ogg) | ✅ natives + real Ogg Opus/Vorbis decode |
 | `menu.dll` | `MenuItem`, `Window.menu` | ✅ logical tree + Window.menu fallback |
 | `KAGParser.dll` | `ScController extends KAGParser` | ✅ native + script-subclass ctor |
 
 ## Stage 3 — Game-runtime milestones
 
-1. **Logo → Title transition** — the chain now RUNS (OnceCall fires, fades
-   progress, timers 7/8/9 fire, continuous handlers register/self-remove).
-   **Stuck at the ATTENTION screen**: the voice sequence needs
-   `onStatusChanged("stop")` from the WaveSoundBuffer owners. The owner/action
-   delivery is fixed; next check is whether the AttentionVoice's `action(ev)`
-   advances with the silent-Opus voices.
-2. **Title screen input** — input bridge wired; verify click→skip-logo and
-   NEW GAME / CONTINUE hit the SelectItems.
+1. **Logo → Title transition** — ✅ **CLOSED** (Sep 13). `OnceCall` chain
+   runs, the ATTENTION voice sequence advances one entry per real Opus voice,
+   and `step06` calls `game.changeScene(SCENE_TITLE)`. Verified headlessly by
+   `attention-harness` (scene 0 → 2, logo closed) after fixing the Opus
+   decode, the reference sound ownership, the timer self-deadlock, the
+   native `finalize`, and `Layer.hitType`/`cursor`.
+2. **Title screen input** — title scene constructs its `SelectItem`s (after
+   the `hitType`/`cursor` fix). Next: wire hit-testing so click→skip-logo and
+   NEW GAME / CONTINUE activate the items.
 3. **`ScController` scenario loop** — `loadScenario → getNextTag → onTag`;
    needs `Layer.drawText` + fonts (tvp-text) + hit-testing for click-through.
-4. **BGM/SE/voice** — rodio output wired (main-thread guard held in
-   `VmRuntime`); real Opus voice decode pending (symphonia 0.6 upgrade).
+4. **BGM/SE/voice** — rodio output wired; **real Opus voice decode done**
+   (`symphonia-adapter-libopus`); Vorbis BGM decodes for real.
 5. **Save/load** — saveStruct eval OK; `savedata/` dir created at startup;
    full flow untested.
 
 ## Stage 4 — Known open issues
 
-- **Opus voice decode**: `symphonia-adapter-libopus` (needs the C libopus)
-  so voices actually decode (currently a silent ~60 ms buffer keeps the
-  sequencing working). BGM (Vorbis) already decodes for real.
-- **Blend modes**: `layer.type` (ltAdditive etc.) reaches the scene but Bevy
-  still source-over blends — real GPU blend modes pending (render crate).
+- **Opus voice decode**: ✅ done — `symphonia-adapter-libopus` is registered
+  in a custom codec registry; voices decode to real PCM (the ~60 ms silent
+  buffer remains only as a probe/decode-failure fallback). BGM (Vorbis)
+  already decodes for real.
+- **Blend modes**: ✅ done — `render::blend` maps `layer.type` to real GPU
+  blend states (source-over / add / reverse-subtract / replace) via a
+  `LayerBlendMaterial` + `Material2d` pipeline variants.
 - **Hierarchy flattening**: parent/child order/opacity composed depth-first;
   verified correct in window_layer_order but the game's Logo uses flat layers.
 - **`System.screenWidth/Height`** — logical size stays 1280×720; desktop
@@ -133,6 +198,32 @@ Bevy moves the system across threads.
 - **Audio output**: cpal `Stream` is `!Send`/`!Sync` — the guard must be
   created AND dropped on the main thread (held in `VmRuntime`); no device →
   silent advance (never panics).
+
+## Stage 5 — Rendering architecture (long-term)
+
+**Custom `wgpu` renderer integrated with the TJS engine** (roadmap; not
+started). The current Bevy renderer works, but TVP's compositor is an
+immediate-mode 2D layering model, not an ECS scene graph, and Bevy's
+parallel scheduler + thread-affine resources (VM, cpal `Stream`) keep
+forcing workarounds (`VM_RUN_LOCK`, main-thread audio guards, the
+`DefaultPlugins`/`MinimalPlugins` dual path, `Material2d` specialization
+for four fixed blend modes).
+
+Plan (adopt incrementally, behind the existing `Scene` snapshot seam):
+
+1. Keep Bevy while gameplay semantics are the bottleneck. First remove the
+   *thread-affinity* pain with Bevy-native tools: make the VM and the audio
+   sink `NonSend` resources (main-thread pinned) and drop `VM_RUN_LOCK`.
+2. Formalize the seam: `sync.rs` already reads the shared `Scene` and emits
+   draws — extract a backend boundary (`Scene` → draw list).
+3. When the *rendering model* (transitions, affine layers, masks, text
+   effects, movie) is what blocks progress, implement a standalone
+   `wgpu` + `winit` backend behind that boundary: one thread owning VM +
+   natives + mixer + queue, batched instanced quads, one pipeline per blend
+   mode, deterministic frame timing.
+
+Do **not** rewrite while the renderer is ahead of the game logic; the
+motivation is the compositing model and thread determinism, not raw speed.
 
 ## How to verify
 

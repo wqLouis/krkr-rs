@@ -82,21 +82,12 @@ extern "C" fn native_link(
         return report_error(out_error, "Plugins.link requires 1 argument");
     }
     let name = value_as_string(&args(argv, argc)[0]);
-    let normalized = name.to_ascii_lowercase();
-    let emulated = matches!(
-        normalized.as_str(),
-        "csvparser.dll"
-            | "extrans.dll"
-            | "fstat.dll"
-            | "kagparser.dll"
-            | "kagparserex.dll"
-            | "menu.dll"
-            | "wuvorbis.dll"
-    );
+    let key = plugin_key(&name);
+    let emulated = is_emulated_plugin(&key);
     if emulated {
         log::info!("Plugins.link({name:?}): emulated by built-in Rust natives");
         let mut loaded = LOADED_PLUGINS.lock().unwrap_or_else(|p| p.into_inner());
-        if !loaded.iter().any(|item| item.eq_ignore_ascii_case(&name)) {
+        if !loaded.iter().any(|item| plugin_key(item) == key) {
             loaded.push(name);
         }
     } else {
@@ -104,6 +95,52 @@ extern "C" fn native_link(
     }
     set_void_out(out);
     0
+}
+
+/// Normalize a plugin name to its base file name, lowercased, so
+/// `C:\game\plugin\extrans.dll`, `extrans.tpm` and `Extrans.DLL`
+/// compare equal. The title screen links `extrans.dll`, `csvParser.dll`,
+/// etc. by bare file name, but future games may pass a storage path.
+fn plugin_key(name: &str) -> String {
+    let base = name.rsplit(['/', '\\', '>']).next().unwrap_or(name);
+    base.to_ascii_lowercase()
+}
+
+fn is_emulated_plugin(key: &str) -> bool {
+    // Strip extension for the extension-agnostic check (.dll vs .tpm).
+    let stem = key.rsplit_once('.').map(|(s, _)| s).unwrap_or(key);
+    matches!(
+        key,
+        "csvparser.dll"
+            | "csvparser.tpm"
+            | "extrans.dll"
+            | "extrans.tpm"
+            | "fstat.dll"
+            | "fstat.tpm"
+            | "kagparser.dll"
+            | "kagparser.tpm"
+            | "kagparserex.dll"
+            | "kagparserex.tpm"
+            | "menu.dll"
+            | "menu.tpm"
+            | "wuvorbis.dll"
+            | "wuvorbis.tpm"
+            | "windowex.dll"
+            | "windowex.tpm"
+            | "layerexdraw.dll"
+            | "layerexdraw.tpm"
+    ) || matches!(
+        stem,
+        "csvparser"
+            | "extrans"
+            | "fstat"
+            | "kagparser"
+            | "kagparserex"
+            | "menu"
+            | "wuvorbis"
+            | "windowex"
+            | "layerexdraw"
+    )
 }
 
 /// `Plugins.unlink(name)` → bool
@@ -123,10 +160,11 @@ extern "C" fn native_unlink(
     }
     let name = value_as_string(&args(argv, argc)[0]);
     log::info!("Plugins.unlink({name:?})");
+    let key = plugin_key(&name);
     LOADED_PLUGINS
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .retain(|item| !item.eq_ignore_ascii_case(&name));
+        .retain(|item| plugin_key(item) != key);
     set_int_out(out, 1);
     0
 }

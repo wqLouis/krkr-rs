@@ -57,6 +57,18 @@ pub struct LayerState {
     /// Solid fill (RGBA, straight alpha) used when there is no bitmap.
     pub fill_color: Option<[u8; 4]>,
     pub hit_threshold: i32,
+    /// Hit-test mode (reference `tTVPHitType`): `htMask=0` (per-pixel
+    /// threshold) or `htProvince=1` (non-transparent province). Stored so
+    /// `SelectItemBase` can set it; input hit-testing reads it later.
+    pub hit_type: i32,
+    /// Mouse-cursor id (reference `tTVPCursorType`, e.g. `crDefault=0`,
+    /// `crHandPoint=-21`). Stored; the desktop cursor is not yet driven.
+    pub cursor: i32,
+    /// Draw face (`dfBoth=0`, `dfMain=1`, `dfMask=2`, `dfProvince=3`,
+    /// `dfAddAlpha=4`). Stored; the renderer always draws the main image.
+    pub face: i32,
+    /// `holdAlpha` — keep the alpha when drawing. Stored only for now.
+    pub hold_alpha: bool,
     pub is_primary: bool,
 }
 
@@ -176,6 +188,10 @@ impl Scene {
             z_order: 0,
             fill_color: None,
             hit_threshold: 0,
+            hit_type: 0,
+            cursor: 0,
+            face: 0,
+            hold_alpha: false,
             is_primary: false,
         });
         // First layer of a window becomes its primary layer.

@@ -10,9 +10,15 @@
 //! [`tvp_visual::scene::FontState`] entries are currently ignored by the
 //! sync system.
 
+pub mod blend;
 pub mod sync;
 
+pub use blend::{
+    LT_ADD_ALPHA, LT_PS_ADDITIVE, LT_PS_NORMAL, LT_PS_SUBTRACTIVE, LayerBlendMaterial,
+    LayerBlendMode, LayerBlendPlugin, LayerRenderPath, blend_mode_for, blend_state_for,
+    render_path_for,
+};
 pub use sync::{
-    BitmapAssets, SceneCamera, SceneSprite, SharedScene, WindowRoot, clamp_opacity, rect_center,
-    sprite_z, sync_scene,
+    BitmapAssets, GpuPrimitives, SceneCamera, SceneSprite, SharedScene, WindowRoot, clamp_opacity,
+    rect_center, sprite_z, sync_scene,
 };

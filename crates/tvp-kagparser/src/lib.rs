@@ -1352,15 +1352,20 @@ extern "C" fn prop_macros_set(
         Ok(s) => s,
         Err(e) => return error_out(_out_error, &e),
     };
-    let st = unsafe { state_of(instance) };
-    let mut ctx = match ContextEnv::new() {
-        Ok(v) => v,
-        Err(e) => return error_out(_out_error, &e),
-    };
-    if let Err(e) = st.restore(&s, &mut ctx.environ()) {
-        return error_out(_out_error, &e);
+    // The reference `macros` property is read-only (`TJS_DENY_NATIVE_PROP_SETTER`):
+    // the game mutates it in place via `(Dictionary.assign incontextof macros)(dict)`,
+    // never via `p.macros = dict`. A direct `p.macros = "..."` must not be treated
+    // as a full `restore` — that would be a false restore of the whole parser state
+    // (storageName/curLabel/callStack/etc.) from a kvp string like `"foo=bar"`
+    // (anti-60 pattern). The legacy string-encoded setter path is therefore
+    // `setMacros` (kvp dict), matching `native_set_macros`, with a read-only warning.
+    log::warn!(
+        "KAGParser: macros property is read-only in the reference (assign incontextof macros); treating `p.macros = ...` as setMacros"
+    );
+    match unsafe { state_of(instance) }.set_macros(&s) {
+        Ok(()) => 0,
+        Err(e) => error_out(_out_error, &e),
     }
-    0
 }
 
 /// `KAGParser()` — the constructor member. The tjs2-sys constructor

@@ -223,6 +223,15 @@ unsafe extern "C" {
         out: *mut Value,
         out_error: *mut *mut c_char,
     ) -> c_int;
+    /// Read a named property from a retained object value through its class
+    /// chain (`PropGet`).
+    fn tjs2_prop_get(
+        engine: *mut Engine,
+        id: Tjs2ValueId,
+        membername: *const c_char,
+        out: *mut Value,
+        out_error: *mut *mut c_char,
+    ) -> c_int;
     /// Invoke a named member on a retained object value (member lookup
     /// goes through the object's own class chain, so script-subclass
     /// overrides win over native methods).
@@ -921,6 +930,34 @@ name), and none was available"
                 &mut error,
             )
         };
+        if rc != 0 {
+            return Err(unsafe { take_error_string(error) });
+        }
+        // SAFETY: `out` was filled by the C++ side on success.
+        Ok(unsafe { take_value(&out) })
+    }
+
+    /// Read a named property from a retained object value through its class
+    /// chain (`PropGet`). Natives use this to resolve an object argument to
+    /// one of its script-visible properties — e.g. `Layer.parent = <Layer>`
+    /// reads the right-hand object's `id`.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn get_member(&self, id: Tjs2ValueId, membername: &str) -> Result<TjsValue, String> {
+        let name = std::ffi::CString::new(membername)
+            .map_err(|_| "member name contains a NUL byte".to_string())?;
+        let mut out = Value {
+            ty: VAL_VOID,
+            integer: 0,
+            real: 0.0,
+            string: ptr::null(),
+            array: ptr::null(),
+            array_count: 0,
+            retained: 0,
+        };
+        let mut error: *mut c_char = ptr::null_mut();
+        // SAFETY: self.inner is a live engine and id is a live retained id;
+        // name/out follow the ABI contract for the duration of the call.
+        let rc = unsafe { tjs2_prop_get(self.inner, id, name.as_ptr(), &mut out, &mut error) };
         if rc != 0 {
             return Err(unsafe { take_error_string(error) });
         }

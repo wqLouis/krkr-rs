@@ -30,6 +30,11 @@ const REAL_GAME_DIR: &str = "/mnt/DATA/Games/Others/test";
 /// `scripts/extract_xp3.py`).
 const REAL_BGM: &str = "bgm/bgm02.ogg";
 
+/// A real Ogg Opus voice file that actually exists in the game. The game's
+/// `voice/*.ogg` are Opus (`OpusHead`), not Vorbis — this is the regression
+/// fixture for the `symphonia-adapter-libopus` decoder registration.
+const REAL_VOICE_OPUS: &str = "voice/azs000001.ogg";
+
 /// One process-wide lock serializing every test: the TJS2 VM and the
 /// global mixer are not thread-safe (same pattern as tests/sound.rs).
 static VM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -122,5 +127,79 @@ fn real_game_bgm_ogg_decodes_to_audible_pcm() {
     assert!(
         rms > 0.001,
         "real BGM renders audible PCM: rms {rms} is silence"
+    );
+}
+
+/// Regression test for real **Ogg Opus** decoding through [`tvp_sound::decode_audio`].
+///
+/// The game's voices are `OpusHead` Ogg files; symphonia's default registry has
+/// no Opus decoder, so before `symphonia-adapter-libopus` was registered these
+/// decoded to a ~60 ms silent fallback buffer (48000 Hz / 2 ch). Asserting the
+/// real voice's actual shape (mono, multi-second, non-silent) proves the real
+/// Opus decoder is wired and produces audible PCM.
+#[test]
+fn real_game_opus_voice_decodes_to_audible_pcm() {
+    let _vm_lock = vm_lock();
+    let storage = mount_real_game();
+
+    let audio = tvp_sound::decode_audio(&storage, REAL_VOICE_OPUS)
+        .unwrap_or_else(|e| panic!("decode real Opus voice {REAL_VOICE_OPUS}: {e}"));
+
+    // Not the silent fallback: it would be 2ch stereo at ~60 ms. The real
+    // voice is mono and 3+ seconds long.
+    assert_eq!(
+        audio.channels, 1,
+        "Opus voice must decode to its native mono, got {audio:?} (silent fallback?)"
+    );
+    let duration = audio.duration_seconds();
+    assert!(
+        duration > 3.0,
+        "real Opus voice should be >3s of audio, got {duration}s (silent fallback?)"
+    );
+    eprintln!(
+        "real Opus voice {REAL_VOICE_OPUS}: {} Hz, {} ch, {:.2}s, {} frames",
+        audio.sample_rate,
+        audio.channels,
+        duration,
+        audio.frames()
+    );
+
+    // Audible: a meaningful share of samples must be non-zero (the probe
+    // found all 155551 samples non-zero; allow headroom for quiet passages).
+    let nonzero = audio.samples.iter().filter(|&&s| s != 0.0).count();
+    assert!(
+        nonzero * 10 >= audio.samples.len() * 9,
+        "Opus voice PCM is mostly zero ({nonzero}/{}) — silent decode?",
+        audio.samples.len()
+    );
+    let peak = audio.samples.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+    assert!(peak > 0.01, "Opus voice peak {peak} is silence");
+
+    // End-to-end: play it on a mixer channel like the game's voice sequencing
+    // does and prove non-silent PCM comes out of the live mix.
+    let e = Tjs2Engine::new().unwrap();
+    register_sound(&e, storage.clone()).unwrap();
+    e.exec_script(
+        &format!(r#"var vch = new SoundChannel(); vch.play("{REAL_VOICE_OPUS}");"#),
+        "realvoice",
+    )
+    .unwrap();
+    advance(1.0);
+    assert_eq!(
+        e.eval("vch.isPlaying()", "realvoice").unwrap(),
+        TjsValue::Integer(1),
+        "Opus voice channel must still be playing after 1s (silent fallback would be done)"
+    );
+    let mut pcm = vec![0.0f32; 44100 * 2];
+    {
+        let mixer = tvp_sound::global_mixer().expect("register_sound set a global mixer");
+        let mixer = mixer.lock().unwrap_or_else(|p| p.into_inner());
+        mixer.render_mix(&mut pcm, 44100, 2);
+    }
+    let rms = (pcm.iter().map(|s| s * s).sum::<f32>() / pcm.len() as f32).sqrt();
+    eprintln!("rendered 1s of Opus voice mix: rms={rms:.4}");
+    assert!(
+        rms > 0.0005,
+        "rendered Opus voice mix is silence: rms {rms}"
     );
 }

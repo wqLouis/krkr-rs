@@ -48,10 +48,11 @@ use std::ffi::{c_char, c_int, c_void};
 use std::sync::{LazyLock, Mutex};
 
 use tjs2_sys::{
-    NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef, Tjs2Engine, Value,
+    NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef, Tjs2Engine,
+    TjsValue, Value,
 };
 
-use crate::scene::{BitmapState, LayerState};
+use crate::scene::{BitmapState, LayerState, Scene};
 use tvp_text::{FontFace, GlyphAtlas, LayoutOptions, layout};
 
 use super::ffi::{
@@ -151,10 +152,18 @@ extern "C" fn layer_ctor(
             }
         }
     };
-    // Parent as int ≥ 0 → parent layer id; anything else (Layer object /
-    // null / void) → attach to the window.
+    // Parent: an int ≥ 0 is a parent layer id; a Layer **object** is
+    // resolved to its scene id; null/void attaches to the window. The game
+    // constructs `new Layer(win, parentLayer)` throughout.
     let parent = match args.get(1) {
         Some(a) if a.ty == tjs2_sys::VAL_INTEGER && a.integer >= 0 => Some(a.integer as u32),
+        Some(a) if a.ty == tjs2_sys::VAL_OBJECT => {
+            let engine = crate::natives::context_engine();
+            match resolve_object_id_arg(engine, a) {
+                Ok(id) if id >= 0 => Some(id as u32),
+                _ => None,
+            }
+        }
         _ => None,
     };
     let inst = unsafe { instance_ref::<LayerInst>(instance) };
@@ -357,11 +366,27 @@ extern "C" fn layer_set_size_to_image_size(
     0
 }
 
-/// `setBitmap(id)` / `setImage(id)` — attach a bitmap to the layer by scene
-/// id (-1 clears it). The real TVP methods take a Bitmap **object**, which
-/// the FFI cannot resolve yet (object arguments are pending); the game's
-/// init path uses `loadImages(name)`, and scripts can pass the id read from
-/// `bitmap.id` / `window.primaryLayer` / `layer.bitmap`-style int sources.
+/// Resolve an object argument (a `Bitmap`/`Layer`/`Window`) or an integer to
+/// the object's `id` member. `TjsValue::Object` resolves against the
+/// engine's most recent object result — the argument just passed.
+fn resolve_object_id_arg(engine: &Tjs2Engine, v: &Value) -> Result<i64, String> {
+    match v.ty {
+        tjs2_sys::VAL_INTEGER | tjs2_sys::VAL_REAL => Ok(arg_i64(v)),
+        tjs2_sys::VAL_OBJECT => {
+            let dv = engine.retain_value_detached(&TjsValue::Object)?;
+            match engine.get_member(dv.raw_id(), "id") {
+                Ok(TjsValue::Integer(id)) => Ok(id),
+                Ok(TjsValue::Real(id)) => Ok(id as i64),
+                Ok(_) => Ok(-1),
+                Err(e) => Err(e),
+            }
+        }
+        _ => Ok(-1),
+    }
+}
+
+/// `setBitmap(id)` / `setImage(id)` — attach a bitmap to the layer, by scene
+/// id or by `Bitmap` object.
 extern "C" fn layer_set_bitmap(
     _engine: *mut c_void,
     instance: *mut c_void,
@@ -376,11 +401,56 @@ extern "C" fn layer_set_bitmap(
     let Some(&id_arg) = args.first() else {
         return error_out(out_error, "Layer.setBitmap requires 1 argument");
     };
-    let bitmap_id = arg_i64(&id_arg);
+    let engine = crate::natives::context_engine();
+    let bitmap_id = match resolve_object_id_arg(engine, &id_arg) {
+        Ok(id) => id,
+        Err(e) => return error_out(out_error, &e),
+    };
     let inst = unsafe { instance_ref::<LayerInst>(instance) };
     let mut scene = context_scene_mut();
     if bitmap_id >= 0 && scene.bitmap(bitmap_id as u32).is_none() {
         return error_out(out_error, "Layer.setBitmap: no bitmap with that id");
+    }
+    let Some(layer) = scene.layer_mut(inst.id) else {
+        return error_out(out_error, "Layer: layer no longer exists");
+    };
+    layer.bitmap = (bitmap_id >= 0).then_some(bitmap_id as u32);
+    set_void_out(out);
+    0
+}
+
+/// `copyFromBitmapToMainImage(bitmap)` — the reference copies the bitmap's
+/// pixels into the layer's main image. Our logical model attaches the
+/// bitmap to the layer, which renders identically for a full-size base image
+/// (the game's savedata header does exactly that, then `setSizeToImageSize`).
+extern "C" fn layer_copy_from_bitmap_to_main_image(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    let Some(&bitmap_arg) = args.first() else {
+        return error_out(
+            out_error,
+            "Layer.copyFromBitmapToMainImage requires a bitmap",
+        );
+    };
+    let engine = crate::natives::context_engine();
+    let bitmap_id = match resolve_object_id_arg(engine, &bitmap_arg) {
+        Ok(id) => id,
+        Err(e) => return error_out(out_error, &e),
+    };
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let mut scene = context_scene_mut();
+    if bitmap_id >= 0 && scene.bitmap(bitmap_id as u32).is_none() {
+        return error_out(
+            out_error,
+            "Layer.copyFromBitmapToMainImage: no bitmap with that id",
+        );
     }
     let Some(layer) = scene.layer_mut(inst.id) else {
         return error_out(out_error, "Layer: layer no longer exists");
@@ -488,6 +558,37 @@ layer_int_prop!(
     layer_hit_threshold_set,
     |l: &LayerState| i64::from(l.hit_threshold),
     |l: &mut LayerState, v: &Value| l.hit_threshold = arg_i64(v) as i32
+);
+// `hitType` (`htMask`/`htProvince`): the game's `SelectItemBase` sets it.
+// Hit-testing semantics arrive with the input work; the value round-trips.
+layer_int_prop!(
+    layer_hit_type_get,
+    layer_hit_type_set,
+    |l: &LayerState| i64::from(l.hit_type),
+    |l: &mut LayerState, v: &Value| l.hit_type = arg_i64(v) as i32
+);
+// `cursor` (a `crXXX` id, or a storage name in the reference): the game's
+// `SelectItem` sets `crDefault`/`crHandPoint`. Stored only for now.
+layer_int_prop!(
+    layer_cursor_get,
+    layer_cursor_set,
+    |l: &LayerState| i64::from(l.cursor),
+    |l: &mut LayerState, v: &Value| l.cursor = arg_i64(v) as i32
+);
+// `face` (`dfMain`/`dfMask`/...): the savedata header switches face around
+// `copyRect`. The renderer always draws the main image; the value round-trips.
+layer_int_prop!(
+    layer_face_get,
+    layer_face_set,
+    |l: &LayerState| i64::from(l.face),
+    |l: &mut LayerState, v: &Value| l.face = arg_i64(v) as i32
+);
+// `holdAlpha` — stored only.
+layer_int_prop!(
+    layer_hold_alpha_get,
+    layer_hold_alpha_set,
+    |l: &LayerState| i64::from(l.hold_alpha),
+    |l: &mut LayerState, v: &Value| l.hold_alpha = arg_bool(v)
 );
 // `imageLeft` / `imageTop` currently alias the rect position (a later wave
 // adds real image-offset state).
@@ -622,8 +723,9 @@ extern "C" fn layer_window_get(
     0
 }
 
-/// `parent` — the parent layer's scene id, or -1 (int; object returns
-/// pending).
+/// `parent` — the parent layer's TJS object (retained), or `-1` when the
+/// layer sits directly on the window. Scripts chain method calls through
+/// it (`parent.onMouseDown(...)`), so returning the object matters.
 extern "C" fn layer_parent_get(
     _engine: *mut c_void,
     instance: *mut c_void,
@@ -636,8 +738,96 @@ extern "C" fn layer_parent_get(
     let Some(layer) = scene.layer(inst.id) else {
         return error_out(out_error, "Layer: layer no longer exists");
     };
-    set_int_out(out, layer.parent.map_or(-1, i64::from));
+    let Some(parent_id) = layer.parent else {
+        set_int_out(out, -1);
+        return 0;
+    };
+    // Return the parent's TJS object (retained) so scripts can call members
+    // on it, mirroring the reference and the `window` getter.
+    let parent_obj = super::layer_tjs_object(parent_id);
+    if !parent_obj.is_null() {
+        let engine = crate::natives::context_engine();
+        // SAFETY: engine is the registered engine; parent_obj is a live TJS
+        // object owned by the script.
+        let rid = unsafe { tjs2_sys::tjs2_retain_object(engine.raw(), parent_obj) };
+        if !rid.is_null() {
+            // SAFETY: out is a valid result slot.
+            unsafe {
+                (*out).ty = tjs2_sys::VAL_RETAINED;
+                (*out).integer = 0;
+                (*out).real = 0.0;
+                (*out).string = std::ptr::null();
+                (*out).array = std::ptr::null();
+                (*out).array_count = 0;
+                (*out).retained = rid as usize;
+            }
+            return 0;
+        }
+    }
+    set_int_out(out, i64::from(parent_id));
     0
+}
+
+/// Core reparenting shared by `setParentId(id)` and the `parent` property
+/// setter. `parent_id < 0` attaches the layer to its window.
+fn reparent(scene: &mut Scene, layer_id: u32, parent_id: i64) {
+    // Read the old parent + window under a short borrow, then drop it so the
+    // parent/window mutations below don't conflict.
+    let Some((old_parent, window)) = scene
+        .layer(layer_id)
+        .map(|layer| (layer.parent, layer.window))
+    else {
+        return;
+    };
+    // Detach from the old parent (or window list).
+    if let Some(old) = old_parent {
+        if let Some(p) = scene.layer_mut(old) {
+            p.children.retain(|&c| c != layer_id);
+        }
+    } else if let Some(w) = scene.window_mut(window) {
+        w.layers.retain(|&c| c != layer_id);
+    }
+    let new_parent = if parent_id < 0 {
+        None
+    } else {
+        let candidate = parent_id as u32;
+        let same_window = scene
+            .layer(candidate)
+            .is_some_and(|parent| parent.window == window);
+        // Reject self-parenting and descendants as parents. A malformed FFI
+        // call should not create a cycle that defeats flattening/composition.
+        let mut cursor = Some(candidate);
+        let mut seen = HashSet::new();
+        let mut would_cycle = false;
+        while let Some(id) = cursor {
+            if !seen.insert(id) {
+                would_cycle = true;
+                break;
+            }
+            if id == layer_id {
+                would_cycle = true;
+                break;
+            }
+            cursor = scene.layer(id).and_then(|layer| layer.parent);
+        }
+        (same_window && !would_cycle).then_some(candidate)
+    };
+    if let Some(layer) = scene.layer_mut(layer_id) {
+        layer.parent = new_parent;
+    }
+    // Attach to the new parent (or window list).
+    match new_parent {
+        Some(p) => {
+            if let Some(p) = scene.layer_mut(p) {
+                p.children.push(layer_id);
+            }
+        }
+        None => {
+            if let Some(w) = scene.window_mut(window) {
+                w.layers.push(layer_id);
+            }
+        }
+    }
 }
 
 /// `setParentId(id)` — re-parent the layer (-1 attaches to the window).
@@ -657,65 +847,51 @@ extern "C" fn layer_set_parent(
     };
     let parent_id = arg_i64(&id_arg);
     let inst = unsafe { instance_ref::<LayerInst>(instance) };
-    let mut scene = context_scene_mut();
-    // Read the old parent + window under a short borrow, then drop it so the
-    // parent/window mutations below don't conflict.
-    let (old_parent, window) = {
-        let Some(layer) = scene.layer_mut(inst.id) else {
-            return error_out(out_error, "Layer: layer no longer exists");
-        };
-        (layer.parent, layer.window)
-    };
-    // Detach from the old parent (or window list).
-    if let Some(old) = old_parent {
-        if let Some(p) = scene.layer_mut(old) {
-            p.children.retain(|&c| c != inst.id);
-        }
-    } else if let Some(w) = scene.window_mut(window) {
-        w.layers.retain(|&c| c != inst.id);
+    if context_scene_read().layer(inst.id).is_none() {
+        return error_out(out_error, "Layer: layer no longer exists");
     }
-    let new_parent = if parent_id < 0 {
-        None
-    } else {
-        let candidate = parent_id as u32;
-        let same_window = scene
-            .layer(candidate)
-            .is_some_and(|parent| parent.window == window);
-        // Reject self-parenting and descendants as parents. A malformed FFI
-        // call should not create a cycle that defeats flattening/composition.
-        let mut cursor = Some(candidate);
-        let mut seen = HashSet::new();
-        let mut would_cycle = false;
-        while let Some(id) = cursor {
-            if !seen.insert(id) {
-                would_cycle = true;
-                break;
-            }
-            if id == inst.id {
-                would_cycle = true;
-                break;
-            }
-            cursor = scene.layer(id).and_then(|layer| layer.parent);
-        }
-        (same_window && !would_cycle).then_some(candidate)
-    };
-    if let Some(layer) = scene.layer_mut(inst.id) {
-        layer.parent = new_parent;
-    }
-    // Attach to the new parent (or window list).
-    match new_parent {
-        Some(p) => {
-            if let Some(p) = scene.layer_mut(p) {
-                p.children.push(inst.id);
-            }
-        }
-        None => {
-            if let Some(w) = scene.window_mut(window) {
-                w.layers.push(inst.id);
-            }
-        }
-    }
+    reparent(&mut context_scene_mut(), inst.id, parent_id);
     set_void_out(out);
+    0
+}
+
+/// `parent` setter — accepts a Layer object (its scene `id` is read through
+/// the class chain) or an integer id; `null`/negative attaches to the
+/// window. This is the reference's `SetParent`.
+extern "C" fn layer_parent_set(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    value: *const Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    // SAFETY: value is a valid value slot for the duration of the call.
+    let v = unsafe { &*value };
+    let parent_id: i64 = match v.ty {
+        tjs2_sys::VAL_INTEGER | tjs2_sys::VAL_REAL => arg_i64(v),
+        tjs2_sys::VAL_OBJECT => {
+            // Resolve the Layer object to its scene id. `TjsValue::Object`
+            // resolves against the engine's most recent object result — the
+            // value just assigned.
+            let engine = crate::natives::context_engine();
+            let dv = match engine.retain_value_detached(&TjsValue::Object) {
+                Ok(dv) => dv,
+                Err(e) => return error_out(out_error, &e),
+            };
+            match engine.get_member(dv.raw_id(), "id") {
+                Ok(TjsValue::Integer(id)) => id,
+                Ok(TjsValue::Real(id)) => id as i64,
+                Ok(_) => -1,
+                Err(e) => return error_out(out_error, &e),
+            }
+        }
+        _ => -1,
+    };
+    if context_scene_read().layer(inst.id).is_none() {
+        return error_out(out_error, "Layer: layer no longer exists");
+    }
+    reparent(&mut context_scene_mut(), inst.id, parent_id);
     0
 }
 
@@ -873,9 +1049,14 @@ extern "C" fn layer_draw_text(
     // normal deployment situation (minimal Linux containers in particular),
     // so retain a small deterministic bitmap-font fallback rather than
     // silently dropping the game's title text.
-    if std::env::var_os("KRKR_RS_SYSTEM_FONT").is_some()
-        && let Some(face) = FontFace::discover_system_jp()
-    {
+    // `KRKR_RS_SYSTEM_FONT` as a path overrides discovery (useful for
+    // hermetic CI); otherwise probe the system font database so Japanese
+    // glyphs (e.g. "日本語") rasterize through `ab_glyph` instead of the
+    // 5×7 checker fallback.
+    let system_face = std::env::var_os("KRKR_RS_SYSTEM_FONT")
+        .and_then(|p| FontFace::from_path(&p, 0).ok())
+        .or_else(FontFace::discover_system_jp);
+    if let Some(face) = system_face {
         let mut atlas = GlyphAtlas::with_default_width(face, font_height);
         let text_layout = layout(
             &text,
@@ -1265,6 +1446,28 @@ pub(crate) fn register_layer(engine: &Tjs2Engine) -> Result<(), String> {
         "setMode",
         "removeMode",
         "clear",
+        // Pixel/province access and sibling ordering used by UI scripts; the
+        // logical model covers the visible behavior, these are no-ops.
+        "setMainPixel",
+        "getMainPixel",
+        "setMaskPixel",
+        "getMaskPixel",
+        "setProvincePixel",
+        "getProvincePixel",
+        "independMainImage",
+        "independProvinceImage",
+        "loadProvinceImage",
+        "bringToBack",
+        "moveBefore",
+        "moveBehind",
+        "focusNext",
+        "focusPrev",
+        "getList",
+        "onHitTest",
+        "dump",
+        "setAttentionPos",
+        "captureMouse",
+        "captureTouch",
     ];
     let mut methods: Vec<NativeInstanceMethodDef> = vec![
         NativeInstanceMethodDef {
@@ -1302,6 +1505,10 @@ pub(crate) fn register_layer(engine: &Tjs2Engine) -> Result<(), String> {
         NativeInstanceMethodDef {
             name: "setImage",
             f: layer_set_bitmap,
+        },
+        NativeInstanceMethodDef {
+            name: "copyFromBitmapToMainImage",
+            f: layer_copy_from_bitmap_to_main_image,
         },
         NativeInstanceMethodDef {
             name: "bringToFront",
@@ -1439,6 +1646,26 @@ pub(crate) fn register_layer(engine: &Tjs2Engine) -> Result<(), String> {
                 set: Some(layer_hit_threshold_set),
             },
             NativeInstancePropertyDef {
+                name: "hitType",
+                get: Some(layer_hit_type_get),
+                set: Some(layer_hit_type_set),
+            },
+            NativeInstancePropertyDef {
+                name: "cursor",
+                get: Some(layer_cursor_get),
+                set: Some(layer_cursor_set),
+            },
+            NativeInstancePropertyDef {
+                name: "face",
+                get: Some(layer_face_get),
+                set: Some(layer_face_set),
+            },
+            NativeInstancePropertyDef {
+                name: "holdAlpha",
+                get: Some(layer_hold_alpha_get),
+                set: Some(layer_hold_alpha_set),
+            },
+            NativeInstancePropertyDef {
                 name: "imageLeft",
                 get: Some(layer_image_left_get),
                 set: Some(layer_image_left_set),
@@ -1458,8 +1685,9 @@ pub(crate) fn register_layer(engine: &Tjs2Engine) -> Result<(), String> {
                 get: Some(layer_image_height_get),
                 set: None,
             },
-            // `window` / `parent` return scene **ids** (object returns are
-            // pending, like `Window.primaryLayer`).
+            // `window` returns the owning Window's TJS object; `parent`
+            // returns the parent Layer's TJS object (or -1 at the window
+            // root) and is settable with a Layer object / id.
             NativeInstancePropertyDef {
                 name: "window",
                 get: Some(layer_window_get),
@@ -1468,7 +1696,7 @@ pub(crate) fn register_layer(engine: &Tjs2Engine) -> Result<(), String> {
             NativeInstancePropertyDef {
                 name: "parent",
                 get: Some(layer_parent_get),
-                set: None,
+                set: Some(layer_parent_set),
             },
         ],
     })
@@ -1800,25 +2028,47 @@ mod tests {
              var pw = c.window; var pp = c.parent;",
         )
         .unwrap();
-        // window returns the owning Window's TJS object (retained), so it
-        // evaluates as an object
+        // window returns the owning Window's TJS object (retained)
         assert!(matches!(
             env.eval("pw", "test"),
             Ok(tjs2_sys::TjsValue::Object)
         ));
-        // a Layer OBJECT parent cannot be resolved by the FFI (milestone
-        // simplification): the layer attaches to the window instead
-        assert_eq!(env.eval_int("pp"), -1);
-        // re-parent by id works
+        // The constructor resolves a Layer-object parent, and `parent` reads
+        // back as that same object (retained).
+        assert!(matches!(
+            env.eval("pp", "test"),
+            Ok(tjs2_sys::TjsValue::Object)
+        ));
+        assert_eq!(
+            env.eval_int("pp === p"),
+            1,
+            "parent is the same Layer object"
+        );
+        // re-parent by id works; parent still reads back as the object
         env.run("c.setParentId(p.id);").unwrap();
-        assert_eq!(env.eval_int("c.parent"), 0);
-        let scene = env.scene();
-        let c = scene
-            .layers
-            .iter()
-            .find(|l| l.id == env.eval_int("c.id") as u32)
-            .expect("child layer");
-        assert_eq!(c.parent, Some(env.eval_int("p.id") as u32));
+        assert_eq!(env.eval_int("c.parent === p"), 1);
+        {
+            let scene = env.scene();
+            let c = scene
+                .layers
+                .iter()
+                .find(|l| l.id == env.eval_int("c.id") as u32)
+                .expect("child layer");
+            assert_eq!(c.parent, Some(env.eval_int("p.id") as u32));
+        }
+        // assigning a Layer object re-parents too
+        env.run("var p2 = new Layer(w, null); c.parent = p2;")
+            .unwrap();
+        assert_eq!(env.eval_int("c.parent === p2"), 1);
+        {
+            let scene = env.scene();
+            let c = scene
+                .layers
+                .iter()
+                .find(|l| l.id == env.eval_int("c.id") as u32)
+                .expect("child layer");
+            assert_eq!(c.parent, Some(env.eval_int("p2.id") as u32));
+        }
     }
 
     #[test]

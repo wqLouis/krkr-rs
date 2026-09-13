@@ -509,10 +509,23 @@ impl KagParserState {
                         return Ok(Some(out));
                     }
                 }
-                Event::Label { .. } => {
+                Event::Label {
+                    name,
+                    macro_name,
+                    line,
+                } => {
                     if self.recording_macro {
                         return Err(MSG_LABEL_IN_MACRO.to_string());
                     }
+                    // Mirror reference SkipCommentOrLabel: advancing past
+                    // a label updates the current label/page/line even
+                    // though the label itself emits no tag.
+                    let name = name.clone();
+                    let macro_name = macro_name.clone();
+                    let line = *line;
+                    self.cur_label = name;
+                    self.cur_page = macro_name.unwrap_or_default();
+                    self.cur_line = line;
                     self.advance_current();
                 }
                 Event::Comment { .. } | Event::Directive { .. } => {

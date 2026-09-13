@@ -16,12 +16,12 @@ static AUTO_PATHS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// Replace the auto-path list (used at startup).
 pub fn set_auto_paths(paths: Vec<String>) {
-    *AUTO_PATHS.lock().unwrap() = paths;
+    *AUTO_PATHS.lock().unwrap_or_else(|p| p.into_inner()) = paths;
 }
 
 /// Append one auto path (the `Storages.addAutoPath` native).
 pub fn add_auto_path(path: String) {
-    let mut list = AUTO_PATHS.lock().unwrap();
+    let mut list = AUTO_PATHS.lock().unwrap_or_else(|p| p.into_inner());
     if !list.contains(&path) {
         list.push(path);
     }
@@ -29,13 +29,13 @@ pub fn add_auto_path(path: String) {
 
 /// Remove one auto path (the `Storages.removeAutoPath` native).
 pub fn remove_auto_path(path: &str) {
-    let mut list = AUTO_PATHS.lock().unwrap();
+    let mut list = AUTO_PATHS.lock().unwrap_or_else(|p| p.into_inner());
     list.retain(|p| p != path);
 }
 
 /// Current auto-path list.
 pub fn auto_paths() -> Vec<String> {
-    AUTO_PATHS.lock().unwrap().clone()
+    AUTO_PATHS.lock().unwrap_or_else(|p| p.into_inner()).clone()
 }
 
 /// The base storage name (the part after the last `/`).

@@ -26,7 +26,9 @@ use bevy::prelude::{
 };
 use bevy::window::{Monitor, PrimaryMonitor, Window, WindowPlugin};
 use engine::loader::LoadReport;
-use krkr_render::sync::{BitmapAssets, SharedScene, sync_scene};
+use krkr_render::GpuPrimitives;
+use krkr_render::blend::LayerBlendPlugin;
+use krkr_render::sync::{BitmapAssets, FrameBlendMaterials, SharedScene, sync_scene};
 use tvp_visual::scene::{BitmapState, Rect, Scene};
 
 mod input_bridge;
@@ -114,6 +116,8 @@ fn game_app(shared: SharedScene, game_dir: PathBuf) -> App {
     app.insert_resource(shared)
         .insert_resource(GameConfig { game_dir })
         .init_resource::<BitmapAssets>()
+        .init_resource::<GpuPrimitives>()
+        .init_resource::<FrameBlendMaterials>()
         .init_resource::<input_bridge::BridgeState>()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
@@ -123,6 +127,7 @@ fn game_app(shared: SharedScene, game_dir: PathBuf) -> App {
             }),
             ..Default::default()
         }))
+        .add_plugins(LayerBlendPlugin)
         .add_systems(Startup, game_startup)
         // run_vm BEFORE sync_scene: script mutations must render the same
         // frame, not one frame later.
@@ -148,7 +153,13 @@ fn headless_game_app(shared: SharedScene, game_dir: PathBuf) -> App {
     app.insert_resource(shared)
         .insert_resource(GameConfig { game_dir })
         .insert_resource(Assets::<Image>::default())
+        // The sync may spawn Mesh2d quads for GPU-blended layers; keep the
+        // mesh store alive even without an asset plugin/renderer.
+        .insert_resource(Assets::<bevy::mesh::Mesh>::default())
         .init_resource::<BitmapAssets>()
+        .init_resource::<GpuPrimitives>()
+        .init_resource::<FrameBlendMaterials>()
+        .add_plugins(LayerBlendPlugin)
         .add_plugins(MinimalPlugins)
         .add_systems(Startup, game_startup)
         .add_systems(Update, (run_vm, sync_scene).chain());
@@ -316,7 +327,7 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {
         (*s).to_string()
     } else if let Some(s) = payload.downcast_ref::<String>() {
-        s.clone()
+        s.to_string()
     } else {
         "unknown panic payload".to_string()
     }
@@ -379,7 +390,7 @@ fn dump_scene(scene: &Scene) -> String {
     }
     for l in &scene.layers {
         lines.push(format!(
-            "layer #{} win={} parent={} children={:?} rect=({},{},{}x{}) bitmap={} fill={} visible={} opacity={} z={}",
+            "layer #{} win={} parent={} children={:?} rect=({},{},{}x{}) bitmap={} fill={} visible={} opacity={} z={} type={}",
             l.id,
             l.window,
             l.parent.map_or_else(|| "none".to_string(), |id| id.to_string()),
@@ -394,7 +405,8 @@ fn dump_scene(scene: &Scene) -> String {
                 .map_or_else(|| "none".to_string(), |f| format!("{f:?}")),
             l.visible,
             l.opacity,
-            l.z_order
+            l.z_order,
+            l.blend_type
         ));
     }
     for b in &scene.bitmaps {
@@ -456,6 +468,8 @@ fn demo_app(shared: SharedScene, ids: DemoIds) -> App {
     app.insert_resource(shared)
         .insert_resource(ids)
         .init_resource::<BitmapAssets>()
+        .init_resource::<GpuPrimitives>()
+        .init_resource::<FrameBlendMaterials>()
         .init_resource::<DemoAnimateState>()
         .insert_resource(DemoTimer(Duration::from_secs_f32(DEMO_SECONDS)))
         .add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -466,6 +480,7 @@ fn demo_app(shared: SharedScene, ids: DemoIds) -> App {
             }),
             ..Default::default()
         }))
+        .add_plugins(LayerBlendPlugin)
         .add_systems(Update, (animate_demo, sync_scene).chain())
         .add_systems(Update, demo_auto_exit);
     app
@@ -671,8 +686,12 @@ mod tests {
             .insert_resource(shared.clone())
             .insert_resource(ids)
             .insert_resource(Assets::<Image>::default())
+            .insert_resource(Assets::<bevy::mesh::Mesh>::default())
             .init_resource::<BitmapAssets>()
+            .init_resource::<GpuPrimitives>()
+            .init_resource::<FrameBlendMaterials>()
             .init_resource::<DemoAnimateState>()
+            .add_plugins(krkr_render::blend::LayerBlendPlugin)
             .insert_resource(DemoTimer(Duration::from_secs_f32(DEMO_SECONDS)))
             .add_systems(Update, (animate_demo, sync_scene).chain())
             .add_systems(Update, demo_auto_exit);

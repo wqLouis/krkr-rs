@@ -17,9 +17,10 @@ scripts, `.tjs` scripts, `.xp3` archives). The goal: run a real game end to end.
 | `startup.tjs` execution | ✅ full init chain (k2compat, `system/*.tjs`, `begin.tjs`) |
 | Plugin surface (`Plugins.link`) | ✅ emulated as built-in natives (csvParser, fstat, windowEx, KAGParser, menu, extrans, wuvorbis) |
 | TLG5/TLG6 image decode | ✅ real KiriKiri formats (byte-identical to reference) |
-| Logo → Title scene flow | 🔶 chain runs; stalled at the ATTENTION screen (see TODO.md) |
+| Logo → Title scene flow | ✅ full logo → ATTENTION → title transition completes (verified headlessly) |
 | Input bridge (mouse/key → script) | ✅ wired; click-through verification pending |
-| Audio (BGM/SE/voice) | 🔶 rodio output wired (rodio 0.22, symphonia 0.6); Opus voice decode pending |
+| Audio (BGM/SE/voice) | ✅ rodio output; real Ogg Opus/Vorbis decode (symphonia 0.6) |
+| GPU blend modes | ✅ `layer.type` → real blend states (over / add / reverse-subtract / replace) |
 | ADV scenario loop | 🔶 KAGParser natives in; needs text + hit-test verification |
 
 Details and the full investigation log are in [TODO.md](TODO.md).

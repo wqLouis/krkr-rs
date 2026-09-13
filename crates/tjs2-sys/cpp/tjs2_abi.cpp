@@ -1231,6 +1231,22 @@ int tjs2_register_native_class(tjs2_engine *e, const char *class_name_utf8,
                                          nullptr, 0);
 }
 
+// Empty method body used for the automatically-registered `finalize` member
+// (see tjs2_register_native_class_instance).
+int tjs2_noop_instance_method(void *, void *, int, const tjs2_value *,
+                              tjs2_value *out, char **, void *) {
+    if(out) {
+        out->type = TJS2_VAL_VOID;
+        out->integer = 0;
+        out->real = 0.0;
+        out->string = nullptr;
+        out->array = nullptr;
+        out->array_count = 0;
+        out->retained = nullptr;
+    }
+    return 0;
+}
+
 int tjs2_register_native_class_instance(
     tjs2_engine *e, const char *class_name_utf8,
     const tjs2_native_instance_method *methods, int count,
@@ -1269,11 +1285,14 @@ int tjs2_register_native_class_instance(
         // tTJSNativeClass::FuncCall copies non-static members onto every
         // created object (rebinding their objthis), so the same dispatch
         // object serves method calls on all instances of the class.
+        bool has_finalize = false;
         for(int i = 0; i < count; i++) {
             const tjs2_native_instance_method &m = methods[i];
             if(!m.name || !m.fn)
                 return -3;
             std::u16string mname16 = utf8_to_u16(m.name);
+            if(mname16 == u"finalize")
+                has_finalize = true;
             if(mname16 == name16) {
                 // The class-name member is the constructor: it must also
                 // work on script-subclass objects that do not have a native
@@ -1289,6 +1308,19 @@ int tjs2_register_native_class_instance(
                 cls->RegisterNCM(mname16.c_str(), dsp, clsname.c_str(),
                                  TJS::nitMethod);
             }
+        }
+
+        // The reference's `TJS_BEGIN_NATIVE_MEMBERS` classes include
+        // `TJS_DECL_EMPTY_FINALIZE_METHOD`, so a script subclass can call
+        // `super.finalize()` (e.g. the game's AffineLayer.finalize). Mirror
+        // that by giving every instance class a no-op `finalize` unless it
+        // registered its own.
+        if(!has_finalize) {
+            auto *dsp = new tjs2_native_instance_method_dispatch(
+                e, tjs2_noop_instance_method, classid);
+            static const char16_t finalize_name[] = u"finalize";
+            cls->RegisterNCM(finalize_name, dsp, clsname.c_str(),
+                             TJS::nitMethod);
         }
 
         // Register each property as an instance member (no TJS_STATICMEMBER)
@@ -1636,6 +1668,57 @@ int tjs2_call_member(void *engine, tjs2_value_id id, const char *membername,
                 std::memcpy(buf, "unknown", 8);
             *out_error = buf;
         }
+        return 1;
+    }
+}
+
+// Read a named property from a retained object value through its class
+// chain (PropGet). Used by natives that must resolve an object argument to
+// one of its script-visible properties (e.g. Layer.parent = <Layer object>
+// -> the parent's `id`). Same error convention as tjs2_call_member.
+int tjs2_prop_get(void *engine, tjs2_value_id id, const char *membername,
+                  tjs2_value *out, char **out_error) {
+    tjs2_engine *e = (tjs2_engine *)engine;
+    if(!e || !id || !membername) {
+        if(out_error)
+            *out_error = make_error_string("invalid retained value");
+        return 1;
+    }
+    try {
+        if(out) {
+            out->type = TJS2_VAL_VOID;
+            out->integer = 0;
+            out->real = 0.0;
+            out->string = nullptr;
+            out->array = nullptr;
+            out->array_count = 0;
+            out->retained = nullptr;
+        }
+        auto it = e->retained.find((uintptr_t)id);
+        if(it == e->retained.end()) {
+            if(out_error)
+                *out_error = make_error_string("invalid retained value");
+            return 1;
+        }
+        std::u16string member16 = utf8_to_u16(membername);
+        TJS::tTJSVariant result;
+        TJS::tTJSVariantClosure clo =
+            it->second.AsObjectClosureNoAddRef(); // throws if not an object
+        tjs_error hr = clo.PropGet(0, member16.c_str(), nullptr, &result,
+                                   nullptr);
+        if(TJS_FAILED(hr))
+            TJSThrowFrom_tjs_error(hr, member16.c_str()); // -> catch below
+        variant_to_value(e, result, out);
+        if(out_error)
+            *out_error = nullptr;
+        return 0;
+    } catch(const TJS::eTJS &err) {
+        if(out_error)
+            *out_error = make_error_message(err);
+        return 1;
+    } catch(...) {
+        if(out_error)
+            *out_error = make_error_string("prop_get failed");
         return 1;
     }
 }

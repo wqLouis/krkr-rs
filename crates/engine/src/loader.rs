@@ -61,9 +61,21 @@ pub fn run_startup(
     storage: &Arc<Mutex<Storage>>,
 ) -> Result<LoadReport, LoadError> {
     // Find startup.tjs.
-    let startup_location = storage.lock().unwrap().find(STARTUP_SCRIPT);
-    let game_dir = storage.lock().unwrap().game_dir().display().to_string();
-    let archives_mounted = storage.lock().unwrap().archives().count();
+    let startup_location = storage
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .find(STARTUP_SCRIPT);
+    let game_dir = storage
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .game_dir()
+        .display()
+        .to_string();
+    let archives_mounted = storage
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .archives()
+        .count();
     let mut report = LoadReport {
         game_dir,
         archives_mounted,
@@ -101,7 +113,7 @@ pub fn execute_storage_script(
     name: &str,
 ) -> Result<TjsValue, String> {
     let source = {
-        let mut guard = storage.lock().unwrap();
+        let mut guard = storage.lock().unwrap_or_else(|p| p.into_inner());
         guard.read(name).map_err(|e| e.to_string())?
     };
     let text = String::from_utf8_lossy(&source).into_owned();

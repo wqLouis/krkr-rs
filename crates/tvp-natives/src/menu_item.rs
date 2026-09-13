@@ -80,6 +80,10 @@ fn item_ptr_from_arg(engine: &Tjs2Engine, value: &Value) -> Option<*mut MenuItem
     if value.ty != VAL_OBJECT {
         return None;
     }
+    // `find_retained_id` scans the engine's retained map for the *same* value (closure +
+    // ObjThis). Like the reference, object arguments arrive as the engine's most recent
+    // object result (System's menu tree passes plain `new MenuItem()` instances), so this
+    // resolves the MenuItem for add/insert/remove faithfully.
     let key = engine.find_retained_id(&TjsValue::Object)? as usize;
     ITEMS
         .lock()

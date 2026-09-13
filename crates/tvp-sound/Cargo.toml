@@ -16,4 +16,5 @@ thiserror = "2"
 # Cargo unifies them) because its API is a much better fit for headless
 # decode-to-memory than rodio's Decoder, which is tied to device streams.
 symphonia = { version = "0.6", default-features = false, features = ["wav", "pcm", "ogg", "vorbis", "flac", "mp3"] }
+symphonia-adapter-libopus = "0.3"
 rodio = { version = "0.22", default-features = false, features = ["playback", "symphonia-wav", "symphonia-vorbis", "symphonia-flac", "symphonia-mp3"] }
