@@ -66,6 +66,10 @@ const BUTTON_MAP: [(MouseButton, usize); 5] = [
 /// Previous-frame snapshot the bridge diffuses against, so button/key
 /// **edges** can be recovered from the persistent held state the
 /// `tvp-input` frame protocol keeps.
+///
+/// It also remembers layers whose script object turned out to be
+/// invalidated ([`Self::dead_layers`]) so the bridge stops dispatching to
+/// them instead of logging a failure on every mouse-move frame.
 #[derive(Resource, Default)]
 pub(crate) struct BridgeState {
     /// Mouse buttons held at the end of the last dispatched frame.
@@ -80,6 +84,14 @@ pub(crate) struct BridgeState {
     /// Layer that received `onMouseDown` and therefore owns the following
     /// `onMouseUp`/moves until release, the reference `CaptureOwner`.
     capture_layer: Option<u32>,
+    /// Layer ids whose TJS object is invalidated/unusable. The game can
+    /// `invalidate` a Layer's object while the layer is still present in the
+    /// scene, which makes `call_member` throw `The object is already
+    /// invalidated` once per mouse-move frame. Such layers are treated as
+    /// no-hit by [`plan_layer_calls`] and never dispatched to again. The
+    /// scene itself is left untouched here — removing the stale layer is a
+    /// separate `tvp-visual` fix.
+    dead_layers: HashSet<u32>,
 }
 
 /// The input events one frame produced, ready to dispatch to windows.
@@ -419,7 +431,7 @@ pub(crate) fn dispatch_input(
     // the Window object, then forwards it to the draw device, which routes it
     // to the layer under the cursor. Mirror both.
     dispatch_to_windows(engine, &window_ids, &events);
-    execute_layer_calls(engine, &layer_calls);
+    execute_layer_calls(engine, &layer_calls, &mut bridge);
 }
 
 /// One planned script call to a layer: resolved and invoked after the scene
@@ -447,11 +459,15 @@ fn plan_layer_calls(
     if !win.visible {
         return calls;
     }
-    // Drop a capture/last-hit whose layer has been removed.
-    bridge.capture_layer = bridge.capture_layer.filter(|id| scene.layer(*id).is_some());
+    // Drop a capture/last-hit whose layer has been removed or whose script
+    // object is known to be dead.
+    let dead = &bridge.dead_layers;
+    bridge.capture_layer = bridge
+        .capture_layer
+        .filter(|id| scene.layer(*id).is_some() && !dead.contains(id));
     bridge.last_move_layer = bridge
         .last_move_layer
-        .filter(|id| scene.layer(*id).is_some());
+        .filter(|id| scene.layer(*id).is_some() && !dead.contains(id));
 
     let (px, py) = events.position;
 
@@ -459,7 +475,7 @@ fn plan_layer_calls(
     if let Some((x, y)) = events.moved {
         let hit = bridge
             .capture_layer
-            .or_else(|| hit_test(scene, win.id, x, y));
+            .or_else(|| hit_test_excluding(scene, win.id, x, y, &bridge.dead_layers));
         if bridge.last_move_layer != hit {
             if let Some(prev) = bridge.last_move_layer {
                 calls.push(LayerCall {
@@ -495,7 +511,7 @@ fn plan_layer_calls(
     for &b in &events.button_down {
         let l = bridge
             .capture_layer
-            .or_else(|| hit_test(scene, win.id, px, py));
+            .or_else(|| hit_test_excluding(scene, win.id, px, py, &bridge.dead_layers));
         if let Some(l) = l {
             let (lx, ly) = layer_local(scene, l, px, py);
             calls.push(LayerCall {
@@ -516,7 +532,7 @@ fn plan_layer_calls(
     for &b in &events.button_up {
         if let Some(l) = bridge
             .capture_layer
-            .or_else(|| hit_test(scene, win.id, px, py))
+            .or_else(|| hit_test_excluding(scene, win.id, px, py, &bridge.dead_layers))
         {
             let (lx, ly) = layer_local(scene, l, px, py);
             calls.push(LayerCall {
@@ -536,30 +552,74 @@ fn plan_layer_calls(
     calls
 }
 
-/// Execute the planned layer calls with no scene lock held. Missing handlers
-/// (most layers implement only a few of the mouse events) are tolerated.
-fn execute_layer_calls(engine: &Tjs2Engine, calls: &[LayerCall]) {
+/// Execute the planned layer calls with no scene lock held.
+///
+/// A layer whose script object is missing (`does not exist`) is tolerated and
+/// stays live — most layers implement only a few of the mouse events. A layer
+/// whose object is **invalidated** (or cannot be retained at all) is recorded
+/// in [`BridgeState::dead_layers`] so later frames skip it; any capture/enter
+/// state pointing at it is cleared at the same time.
+fn execute_layer_calls(engine: &Tjs2Engine, calls: &[LayerCall], bridge: &mut BridgeState) {
     for call in calls {
         let obj = tvp_visual::natives::layer_tjs_object(call.layer_id);
         if obj.is_null() {
             continue;
         }
-        let Ok(dv) = engine.retain_object_detached(obj) else {
-            continue;
+        let dv = match engine.retain_object_detached(obj) {
+            Ok(dv) => dv,
+            Err(e) => {
+                if mark_layer_dead(bridge, call.layer_id) {
+                    log::warn!(
+                        "input bridge: layer #{} object cannot be retained; \
+                         marking it dead: {e}",
+                        call.layer_id
+                    );
+                }
+                continue;
+            }
         };
-        if let Err(e) = engine.call_member(dv.raw_id(), call.method, &call.args)
-            && !e.contains("does not exist")
-        {
-            log::warn!(
-                "input bridge: layer #{}.{} failed: {e}",
-                call.layer_id,
-                call.method
-            );
+        if let Err(e) = engine.call_member(dv.raw_id(), call.method, &call.args) {
+            if is_invalidated_error(&e) {
+                if mark_layer_dead(bridge, call.layer_id) {
+                    log::warn!(
+                        "input bridge: layer #{} object is invalidated; \
+                         marking it dead: {e}",
+                        call.layer_id
+                    );
+                }
+            } else if !e.contains("does not exist") {
+                log::warn!(
+                    "input bridge: layer #{}.{} failed: {e}",
+                    call.layer_id,
+                    call.method
+                );
+            }
         }
         if std::env::var_os("KRKR_INPUT_TRACE").is_some() && call.method != "onMouseMove" {
             eprintln!("[input] call layer #{}.{}", call.layer_id, call.method);
         }
     }
+}
+
+/// Whether a `call_member` error means the object is no longer usable
+/// (TJS's `TJSInvalidObject`, "The object is already invalidated"). Matched
+/// case-insensitively so the exact wording does not matter.
+fn is_invalidated_error(msg: &str) -> bool {
+    msg.to_ascii_lowercase().contains("invalidated")
+}
+
+/// Mark `id` as having a dead TJS object, dropping any capture/enter state
+/// that points at it. Returns `true` when it was not already marked (so the
+/// caller logs the first failure only).
+fn mark_layer_dead(bridge: &mut BridgeState, id: u32) -> bool {
+    let newly_dead = bridge.dead_layers.insert(id);
+    if bridge.capture_layer == Some(id) {
+        bridge.capture_layer = None;
+    }
+    if bridge.last_move_layer == Some(id) {
+        bridge.last_move_layer = None;
+    }
+    newly_dead
 }
 
 /// A point in the primary layer's coordinates → the layer's local
@@ -582,14 +642,35 @@ fn layer_local(scene: &Scene, layer_id: u32, x: i32, y: i32) -> (i32, i32) {
 
 /// The topmost hittable layer at a primary-layer point, or `None`.
 ///
+/// Convenience wrapper over [`hit_test_excluding`] for tests and callers
+/// with no dead layers; the production dispatch path passes
+/// [`BridgeState::dead_layers`] directly.
+#[cfg(test)]
+pub(crate) fn hit_test(scene: &Scene, window_id: u32, x: i32, y: i32) -> Option<u32> {
+    hit_test_excluding(scene, window_id, x, y, &HashSet::new())
+}
+
+/// Like [`hit_test`] but skips `dead` layers: their script object is
+/// invalidated, so treating them as no-hit lets the bridge reach a live layer
+/// beneath them instead of dispatching into a dead object every frame.
+///
 /// Our renderer flattens the layer tree by **absolute** rects (it does not
 /// clip children to their parent's rect), and the game's `AffineLayer`
 /// containers only size their `_image` child — the parent rect is normally
 /// fixed up by the script `onPaint` we do not run, so it stays `0×0`. We
 /// therefore hit-test the same flattened front-to-back order the renderer
 /// uses, composed through ancestors, instead of clipping to each parent.
-pub(crate) fn hit_test(scene: &Scene, window_id: u32, x: i32, y: i32) -> Option<u32> {
+fn hit_test_excluding(
+    scene: &Scene,
+    window_id: u32,
+    x: i32,
+    y: i32,
+    dead: &HashSet<u32>,
+) -> Option<u32> {
     for layer_id in scene.window_layer_order(window_id).into_iter().rev() {
+        if dead.contains(&layer_id) {
+            continue;
+        }
         let Some(layer) = scene.layer(layer_id) else {
             continue;
         };
@@ -1180,6 +1261,136 @@ mod tests {
         };
         // Nothing held on release → shift=0 for the up edges.
         assert_eq!(log, "u:320,240,0,0;ku:13,0;");
+    }
+
+    /// A layer whose TJS object is invalidated while the layer is still in
+    /// the scene must be marked dead on the first failed dispatch and then
+    /// skipped, instead of throwing `The object is already invalidated` on
+    /// every mouse-move frame forever (see [`BridgeState::dead_layers`]).
+    #[test]
+    fn invalidated_layer_is_marked_dead_and_skipped() {
+        let _vm_lock = tvp_visual::natives::vm_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
+        let dir = std::env::temp_dir().join(format!(
+            "krkr-rs-input-bridge-dead-layer-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp game dir");
+
+        let engine = Arc::new(Tjs2Engine::new().expect("engine"));
+        tvp_input::register_all(&engine).expect("register Mouse + Key");
+        let storage = Arc::new(Mutex::new(
+            engine::Storage::mount(dir.to_str().unwrap()).expect("mount"),
+        ));
+        let scene = Arc::new(RwLock::new(Scene::default()));
+        tvp_visual::register_visual(&engine, scene.clone(), storage.clone())
+            .expect("register visual natives");
+
+        // A Window + a hittable Layer subclass that records onMouseMove.
+        engine
+            .exec_script(
+                r#"
+                global.__log = "";
+                class TestWin extends Window {
+                    function TestWin() { super.Window(); }
+                }
+                class TestLayer extends Layer {
+                    function TestLayer(win, par) { super.Layer(win, par); }
+                    function onMouseMove(x, y, shift) {
+                        global.__log += "m:" + x + "," + y + "," + shift + ";";
+                    }
+                }
+                var w = new TestWin();
+                var l = new TestLayer(w, null);
+                global.__layerId = l.id;
+                "#,
+                "test",
+            )
+            .expect("define TestWin/TestLayer");
+
+        let layer_id = match engine.eval("global.__layerId", "test") {
+            Ok(TjsValue::Integer(id)) => id as u32,
+            other => panic!("global.__layerId -> {other:?}"),
+        };
+        assert!(!tvp_visual::natives::layer_tjs_object(layer_id).is_null());
+
+        // Make the layer hit-testable across the whole window.
+        {
+            let mut sc = scene.write().unwrap();
+            let l = sc.layer_mut(layer_id).expect("layer");
+            l.rect = tvp_visual::scene::Rect {
+                x: 0,
+                y: 0,
+                w: 200,
+                h: 200,
+            };
+            l.visible = true;
+            l.hit_threshold = 0;
+        }
+
+        let mut bridge = BridgeState::default();
+
+        // Frame 1: the live layer receives `onMouseMove` exactly once.
+        let calls = dispatch_layer_frame(&scene, &mut bridge, (10, 10));
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.layer_id == layer_id && c.method == "onMouseMove"),
+            "the live layer should receive onMouseMove"
+        );
+        execute_layer_calls(engine.as_ref(), &calls, &mut bridge);
+        assert!(!bridge.dead_layers.contains(&layer_id));
+        assert_eq!(read_log(&engine), "m:10,10,0;");
+
+        // Invalidate the layer's TJS object while the layer stays in the
+        // scene (exactly what the game does).
+        engine.exec_script("invalidate l;", "test").unwrap();
+
+        // Frame 2: the dispatch hits the invalidated object; the layer is
+        // marked dead on the first failure and the enter/capture state is
+        // cleared, instead of logging once per frame forever.
+        let calls = dispatch_layer_frame(&scene, &mut bridge, (20, 20));
+        assert!(calls.iter().any(|c| c.layer_id == layer_id));
+        execute_layer_calls(engine.as_ref(), &calls, &mut bridge);
+        assert!(
+            bridge.dead_layers.contains(&layer_id),
+            "the invalidated layer must be marked dead"
+        );
+        assert_eq!(bridge.last_move_layer, None);
+        assert_eq!(bridge.capture_layer, None);
+        // The handler never ran again.
+        assert_eq!(read_log(&engine), "m:10,10,0;");
+
+        // Frame 3: the dead layer is excluded from the hit test, so nothing
+        // is planned or dispatched for it.
+        let calls = dispatch_layer_frame(&scene, &mut bridge, (30, 30));
+        assert!(
+            !calls.iter().any(|c| c.layer_id == layer_id),
+            "dead layers must not be planned again"
+        );
+        execute_layer_calls(engine.as_ref(), &calls, &mut bridge);
+        assert_eq!(read_log(&engine), "m:10,10,0;");
+    }
+
+    /// Drive one synthetic mouse-move frame through `collect_frame_events` +
+    /// `plan_layer_calls` (the pure steps `dispatch_input` runs under the
+    /// scene lock) and return the planned layer calls.
+    fn dispatch_layer_frame(
+        scene: &Arc<RwLock<Scene>>,
+        bridge: &mut BridgeState,
+        pos: (i32, i32),
+    ) -> Vec<LayerCall> {
+        let state = tvp_input::input_state();
+        let mut s = state.lock().unwrap();
+        s.begin_frame();
+        s.set_mouse_pos(pos.0, pos.1);
+        s.end_frame();
+        let events = collect_frame_events(&s, bridge);
+        drop(s);
+        let sc = scene.read().unwrap();
+        plan_layer_calls(&sc, &events, bridge)
     }
 
     fn read_log(engine: &Tjs2Engine) -> String {
