@@ -76,49 +76,45 @@ struct Context {
     storage: Option<Arc<Mutex<Storage>>>,
 }
 
-thread_local! {
-    static CONTEXT: RefCell<Context> = const {
-        RefCell::new(Context {
-            engine: None,
-            storage: None,
-        })
-    };
-}
+/// The VM runs on a Bevy worker thread while `set_context` is called on the
+/// main thread during startup, so the context must be process-global: a
+/// thread-local would be empty on the worker. The TJS VM is single-threaded
+/// and serialized by the render crate's `VM_RUN_LOCK`, so a `Mutex` is safe
+/// (the getters clone the `Arc`s and release it before any VM call).
+static CONTEXT: Mutex<Context> = Mutex::new(Context {
+    engine: None,
+    storage: None,
+});
 
 /// Point the `Scripts` class at the running VM and storage.
 ///
 /// The engine calls this before executing `startup.tjs` so that
 /// `Scripts.execStorage` can call back into the same VM (this is how
-/// k2compat-style scripts load each other). The TJS2 VM is single-threaded,
-/// so the context is a thread-local: set it on the thread that owns the
-/// engine (the crate tests use `--test-threads=1` for the same reason).
+/// k2compat-style scripts load each other).
 pub fn set_context(engine: Option<Arc<Tjs2Engine>>, storage: Option<Arc<Mutex<Storage>>>) {
-    CONTEXT.with(|c| *c.borrow_mut() = Context { engine, storage });
+    *CONTEXT.lock().unwrap_or_else(|p| p.into_inner()) = Context { engine, storage };
 }
 
-/// Clone the engine + storage handles out of the context (the borrow ends
+/// Clone the engine + storage handles out of the context (the guard ends
 /// before any VM call, so nested `Scripts.*` calls can re-enter freely).
 fn context_engine_and_storage() -> Result<(Arc<Tjs2Engine>, Arc<Mutex<Storage>>), String> {
-    CONTEXT.with(|c| {
-        let c = c.borrow();
-        match (&c.engine, &c.storage) {
-            (Some(engine), Some(storage)) => Ok((engine.clone(), storage.clone())),
-            _ => Err(
-                "Scripts context is not set: set_context(engine, storage) must be called \
-                 before using Scripts.execStorage/evalStorage"
-                    .into(),
-            ),
-        }
-    })
+    let ctx = CONTEXT.lock().unwrap_or_else(|p| p.into_inner());
+    match (&ctx.engine, &ctx.storage) {
+        (Some(engine), Some(storage)) => Ok((engine.clone(), storage.clone())),
+        _ => Err(
+            "Scripts context is not set: set_context(engine, storage) must be called \
+             before using Scripts.execStorage/evalStorage"
+                .into(),
+        ),
+    }
 }
 
 /// Clone the engine handle out of the context.
 fn context_engine() -> Result<Arc<Tjs2Engine>, String> {
-    CONTEXT.with(|c| {
-        c.borrow().engine.clone().ok_or_else(|| {
-            "Scripts context is not set: set_context(engine, ...) must be called".into()
-        })
-    })
+    let ctx = CONTEXT.lock().unwrap_or_else(|p| p.into_inner());
+    ctx.engine
+        .clone()
+        .ok_or_else(|| "Scripts context is not set: set_context(engine, ...) must be called".into())
 }
 
 // ---------------------------------------------------------------------------

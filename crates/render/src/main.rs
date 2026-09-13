@@ -98,14 +98,15 @@ struct StartupReport(LoadReport);
 /// `krkr-rs run <game-dir>`: mount the game, register natives, run
 /// `startup.tjs`, then loop (VM timers → scene sync → render).
 /// `--headless` runs one pass with no window and dumps the scene instead.
-fn run_game(game_dir: &std::path::Path, headless: bool) -> ! {
+fn run_game(game_dir: &std::path::Path, headless: bool) {
     let shared = SharedScene(Arc::new(RwLock::new(Scene::default())));
     if headless {
         run_headless(shared, game_dir.to_path_buf());
     }
     println!("krkr-rs: running {game_dir:?} (close the window to exit)");
+    // Returns when the app exits (window closed, `System.exit`, or an exit
+    // requested by a script).
     game_app(shared, game_dir.to_path_buf()).run();
-    unreachable!("App::run returns only after the app exits")
 }
 
 /// The windowed game app: default plugins (window + renderer), the shared

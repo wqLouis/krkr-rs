@@ -123,31 +123,32 @@ struct Context {
     storage: Option<Arc<Mutex<Storage>>>,
 }
 
-thread_local! {
-    static CONTEXT: RefCell<Context> = const {
-        RefCell::new(Context { engine: None, storage: None })
-    };
-}
+/// The VM runs on a Bevy worker thread while `set_context` is called on the
+/// main thread during startup, so this must be process-global (a thread-local
+/// would be empty on the worker). The TJS VM is single-threaded and
+/// serialized by the render crate's `VM_RUN_LOCK`, so a `Mutex` is safe.
+static CONTEXT: Mutex<Context> = Mutex::new(Context {
+    engine: None,
+    storage: None,
+});
 
 /// Point the `KAGParser` native at the running VM and storage (mirrors
 /// `tvp_scripts::set_context`; call before executing `startup.tjs`).
 pub fn set_context(engine: Option<Arc<Tjs2Engine>>, storage: Option<Arc<Mutex<Storage>>>) {
-    CONTEXT.with(|c| *c.borrow_mut() = Context { engine, storage });
+    *CONTEXT.lock().unwrap_or_else(|p| p.into_inner()) = Context { engine, storage };
 }
 
 fn context_engine() -> Result<Arc<Tjs2Engine>, String> {
-    CONTEXT.with(|c| {
-        c.borrow().engine.clone().ok_or_else(|| {
-            "KAGParser context is not set: set_context(engine, storage) must be called".into()
-        })
+    let ctx = CONTEXT.lock().unwrap_or_else(|p| p.into_inner());
+    ctx.engine.clone().ok_or_else(|| {
+        "KAGParser context is not set: set_context(engine, storage) must be called".into()
     })
 }
 
 fn context_storage() -> Result<Arc<Mutex<Storage>>, String> {
-    CONTEXT.with(|c| {
-        c.borrow().storage.clone().ok_or_else(|| {
-            "KAGParser context is not set: set_context(engine, storage) must be called".into()
-        })
+    let ctx = CONTEXT.lock().unwrap_or_else(|p| p.into_inner());
+    ctx.storage.clone().ok_or_else(|| {
+        "KAGParser context is not set: set_context(engine, storage) must be called".into()
     })
 }
 
