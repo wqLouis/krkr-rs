@@ -37,6 +37,7 @@ mod menu_item;
 mod plugin_stubs;
 mod plugins;
 mod system;
+mod video_overlay;
 
 pub use async_trigger::{async_trigger_poll, register_async_trigger};
 pub use chain_item_base::register_chain_item_base;
@@ -52,6 +53,7 @@ pub use system::{
     SystemContext, continuous_handler_poll, register_system, set_key_state, set_system_context,
     take_exit_request,
 };
+pub use video_overlay::register_video_overlay;
 
 use std::cell::RefCell;
 use std::ffi::{CStr, c_char, c_int};
@@ -126,6 +128,7 @@ pub fn register_all(engine: &Tjs2Engine) -> Result<(), String> {
     register_debug(engine)?;
     register_plugins(engine)?;
     register_plugin_stubs(engine)?;
+    register_video_overlay(engine)?;
     register_trans(engine)?;
     register_menu_item(engine)?;
     register_chain_item_base(engine)?;
@@ -195,6 +198,16 @@ pub(crate) fn value_as_i64(v: &Value) -> i64 {
         VAL_REAL => v.real as i64,
         VAL_STRING => value_as_string(v).parse().unwrap_or(0),
         _ => 0,
+    }
+}
+
+/// Convert a callback argument to a real (TJS `AsReal` semantics).
+pub(crate) fn value_as_f64(v: &Value) -> f64 {
+    match v.ty {
+        VAL_INTEGER => v.integer as f64,
+        VAL_REAL => v.real,
+        VAL_STRING => value_as_string(v).parse().unwrap_or(0.0),
+        _ => 0.0,
     }
 }
 

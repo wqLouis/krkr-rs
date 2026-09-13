@@ -13,10 +13,14 @@
 //! `extends` bases that are neither script classes nor registered natives:
 //!
 //!   InputNotifyBase        SceneBase, EyeCatchBase, StaffRoll extend it
-//!   VideoOverlay           MovieLayer extends it (movie.tjs)
 //!   WIN32GenericDialogEX   k2compat dialog base
 //!   TextContentModelessDialog  k2compat dialog base
 //!   SubMenu / SliderV      dialog widgets
+//!
+//! `VideoOverlay` (the base of `MovieLayer` in movie.tjs) is deliberately
+//! NOT registered here: the game calls real members on it (`open`, `play`,
+//! `originalWidth`, ...), so it has a dedicated non-throwing stub in
+//! [`crate::video_overlay`].
 
 use std::ffi::{c_char, c_int, c_void};
 
@@ -69,7 +73,6 @@ fn register_one(engine: &Tjs2Engine, name: &'static str) -> Result<(), String> {
 pub fn register_plugin_stubs(engine: &Tjs2Engine) -> Result<(), String> {
     for name in [
         "InputNotifyBase",
-        "VideoOverlay",
         "WIN32GenericDialogEX",
         "TextContentModelessDialog",
         "SubMenu",
