@@ -334,7 +334,26 @@ impl AudioTrack {
                 .get()
                 .and_then(|r| r.as_ref().ok())
                 .is_some_and(|a| seconds >= a.duration_seconds()),
-            TrackState::Stream(ring) => ring.has_ended_at(seconds, self.sample_rate),
+            TrackState::Stream(ring) => ring.playback_ended(seconds, self.sample_rate),
+        }
+    }
+
+    /// Whether playback has consumed every frame the source actually
+    /// produced.
+    ///
+    /// Unlike [`Self::has_ended_at`], this does **not** short-circuit on a
+    /// container-declared duration. The device clock clamps a streaming
+    /// position to the decoded watermark, so it can reach the declared
+    /// duration exactly without ever exceeding it; this is what lets the
+    /// channel flip to `done` at that point. A whole-file source keeps the
+    /// reference's exact-end semantics (done only strictly past the end).
+    pub fn playback_ended(&self, seconds: f64) -> bool {
+        match &self.state {
+            TrackState::Full(slot) => slot
+                .get()
+                .and_then(|r| r.as_ref().ok())
+                .is_some_and(|a| seconds > a.duration_seconds()),
+            TrackState::Stream(ring) => ring.playback_ended(seconds, self.sample_rate),
         }
     }
 
@@ -348,6 +367,24 @@ impl AudioTrack {
         match &self.state {
             TrackState::Full(_) => 0,
             TrackState::Stream(ring) => ring.buffered_frames(),
+        }
+    }
+
+    /// For a streaming track, the absolute end of decoded audio in seconds
+    /// (the playback watermark). `None` for a whole-file track, whose frames
+    /// are all available the moment it is ready.
+    ///
+    /// The mixer must never advance a streaming channel's position past this
+    /// watermark: doing so silently skips the undecoded head of the track
+    /// (the `open`→`play` race) and, once the wall clock is further ahead
+    /// than the whole ring, drops every decoded frame and plays permanent
+    /// silence.
+    pub fn available_end_seconds(&self) -> Option<f64> {
+        match &self.state {
+            TrackState::Full(_) => None,
+            TrackState::Stream(ring) => {
+                Some(ring.available_end() as f64 / f64::from(self.sample_rate.max(1)))
+            }
         }
     }
 
@@ -421,11 +458,19 @@ pub fn open_track_bytes(bytes: Vec<u8>, name: &str) -> Result<Arc<AudioTrack>, D
                 .saturating_mul(4)
         })
         .unwrap_or_else(|| (bytes.len() as u64).saturating_mul(24));
-    Ok(if estimated_pcm > FULL_BUFFER_MAX_BYTES {
-        AudioTrack::start_stream(metadata, bytes, name.to_string())
+    if estimated_pcm > FULL_BUFFER_MAX_BYTES {
+        log::info!(
+            "decode_audio: {name}: streaming {} Hz, {} ch, {} frames (decode-ahead {STREAM_AHEAD_SECONDS}s)",
+            metadata.sample_rate.max(1),
+            metadata.channels.max(1),
+            metadata
+                .total_frames
+                .map_or_else(|| "?".to_string(), |f| f.to_string()),
+        );
+        Ok(AudioTrack::start_stream(metadata, bytes, name.to_string()))
     } else {
-        AudioTrack::start_full(metadata, bytes, name.to_string())
-    })
+        Ok(AudioTrack::start_full(metadata, bytes, name.to_string()))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -602,7 +647,7 @@ impl StreamRing {
         if idx < st.base || idx >= st.base + st.len {
             return None;
         }
-        let off = (idx - st.base) as usize * st.channels;
+        let off = (idx % st.cap_frames) as usize * st.channels;
         let l = st.data[off];
         let r = if st.channels >= 2 {
             st.data[off + 1]
@@ -629,10 +674,21 @@ impl StreamRing {
     }
 
     /// Ask the worker to restart decoding at absolute `frame`.
+    ///
+    /// The buffered window is dropped immediately (not when the worker gets
+    /// around to the seek) so the playback watermark jumps to the target at
+    /// once: the mixer then holds the (new) position until the worker
+    /// republishes frames there, instead of briefly advancing over the stale
+    /// window and drifting the seek.
     fn request_seek(&self, frame: u64) {
         {
             let mut st = lock_ring(&self.state);
             st.seek = Some(frame);
+            st.base = frame;
+            st.len = 0;
+            st.produced = frame;
+            st.eof = false;
+            st.error = None;
         }
         self.space.notify_all();
     }
@@ -668,8 +724,9 @@ impl StreamRing {
     }
 
     /// Whether the producer has finished and playback has consumed
-    /// everything produced up to `seconds`.
-    fn has_ended_at(&self, seconds: f64, sample_rate: u32) -> bool {
+    /// everything produced up to `seconds` (the declared duration is
+    /// ignored — see [`crate::source::AudioTrack::playback_ended`]).
+    fn playback_ended(&self, seconds: f64, sample_rate: u32) -> bool {
         let st = lock_ring(&self.state);
         if !st.eof {
             return false;
@@ -680,6 +737,12 @@ impl StreamRing {
 
     fn buffered_frames(&self) -> u64 {
         lock_ring(&self.state).len
+    }
+
+    /// Absolute frame index one past the newest decoded frame.
+    fn available_end(&self) -> u64 {
+        let st = lock_ring(&self.state);
+        st.base + st.len
     }
 
     fn capacity_frames(&self) -> u64 {
@@ -698,4 +761,80 @@ fn lock_ring(state: &Mutex<RingState>) -> std::sync::MutexGuard<'_, RingState> {
     state
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A ring that writes at `frame % capacity` must read back the same
+    /// slot. The original implementation read linearly from `base`, so as
+    /// soon as `release_before` advanced `base` (every playback step) the
+    /// read and write cursors diverged and playback read the wrong — or
+    /// silent — samples.
+    #[test]
+    fn ring_reads_back_written_frames_across_release_and_wrap() {
+        let cap = 48000 * u64::from(STREAM_AHEAD_SECONDS);
+        let ring = StreamRing::new(48000, 1);
+
+        // Fill the ring, encoding the absolute frame index in the sample.
+        let first: Vec<f32> = (0..cap).map(|i| i as f32).collect();
+        assert_eq!(ring.push(&first), cap);
+        assert_eq!(ring.frame(0), Some((0.0, 0.0)));
+        assert_eq!(
+            ring.frame(cap - 1),
+            Some(((cap - 1) as f32, (cap - 1) as f32))
+        );
+
+        // Consume all but the last 10 frames. `base` is now non-zero.
+        ring.release_before(cap - 10);
+        assert_eq!(ring.frame(cap - 11), None, "released frame must be gone");
+        assert_eq!(
+            ring.frame(cap - 10),
+            Some(((cap - 10) as f32, (cap - 10) as f32))
+        );
+
+        // Push the next frames: the ring is nearly empty (10 frames
+        // retained), so all 20 fit and the write wraps the buffer.
+        let second: Vec<f32> = (cap..cap + 20).map(|i| i as f32).collect();
+        assert_eq!(ring.push(&second), 20);
+        for idx in (cap - 10)..(cap + 20) {
+            assert_eq!(
+                ring.frame(idx),
+                Some((idx as f32, idx as f32)),
+                "frame {idx} read back wrong"
+            );
+        }
+        assert_eq!(ring.available_end(), cap + 20);
+    }
+
+    /// A seek must immediately publish the new watermark (and drop the old
+    /// window) so the mixer holds the new position instead of advancing over
+    /// stale audio.
+    #[test]
+    fn ring_seek_resets_window_before_worker_consumes_it() {
+        let ring = StreamRing::new(48000, 1);
+        let first: Vec<f32> = (0..1000).map(|i| i as f32).collect();
+        ring.push(&first);
+        assert_eq!(ring.available_end(), 1000);
+
+        ring.request_seek(500);
+        assert_eq!(
+            ring.available_end(),
+            500,
+            "watermark jumps to the seek target"
+        );
+        assert_eq!(
+            ring.buffered_frames(),
+            0,
+            "old window is dropped immediately"
+        );
+        assert_eq!(ring.frame(500), None);
+
+        assert_eq!(ring.take_seek(), Some(500));
+        let resumed: Vec<f32> = (500..600).map(|i| i as f32).collect();
+        ring.push(&resumed);
+        assert_eq!(ring.frame(500), Some((500.0, 500.0)));
+        assert_eq!(ring.available_end(), 600);
+    }
 }

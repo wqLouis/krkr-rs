@@ -231,7 +231,21 @@ impl Channel {
 
     /// Advance this channel by `dt` seconds. Returns true if the channel
     /// reached its end during this step (non-looping source).
+    ///
+    /// This is the headless clock: the app's update loop drives it, and no
+    /// audio is pulled from the result. The device path instead uses
+    /// [`Mixer::render_mix_advancing`], which advances each streaming
+    /// channel only by the frames it actually rendered.
     pub fn advance(&mut self, dt: f64) -> bool {
+        self.advance_inner(dt, None)
+    }
+
+    /// [`Channel::advance`] with an explicit decoded watermark (seconds).
+    ///
+    /// `watermark` is `Some(end)` for a streaming source and `None` for a
+    /// whole-file source. Capturing it before rendering is what keeps the
+    /// position in lock-step with the frames actually played.
+    fn advance_inner(&mut self, dt: f64, watermark: Option<f64>) -> bool {
         if let Some(f) = &mut self.fade {
             f.advance(dt);
             if f.finished() {
@@ -244,13 +258,38 @@ impl Channel {
 
         let mut became_done = false;
         if self.is_playing() {
-            self.position_seconds += dt;
+            // A streaming source may not have decoded the frames the wall
+            // clock has reached (the worker is still starting up, or `open`
+            // was followed immediately by `play`). Advancing the position
+            // past the end of decoded audio silently skips the head of the
+            // track and, once the clock outruns the whole decode-ahead ring,
+            // permanently drops every decoded frame (the position is always
+            // ahead of the data). Hold the position at the decoded watermark
+            // until frames arrive instead.
+            let step = match watermark {
+                Some(available) if available >= self.position_seconds => {
+                    (self.position_seconds + dt).min(available) - self.position_seconds
+                }
+                // A seek/loop restart is in flight (the watermark is behind
+                // the requested position): hold until the worker republishes
+                // frames there.
+                Some(_) => 0.0,
+                // Whole-file source: every frame is available, so the clock
+                // is the position.
+                None => dt,
+            };
+            self.position_seconds += step;
             let dur = self.duration_seconds();
-            // A known duration uses the reference's exact-end semantics;
-            // an unknown-duration stream is done once it has produced all
-            // of its frames.
+            // End detection uses the frames the source actually produced, not
+            // just a container-declared duration: the device clock clamps a
+            // streaming position to the decoded watermark, so it can reach
+            // the duration exactly and must still flip to `done`. A
+            // whole-file source keeps the reference's "strictly past the
+            // end" rule (exactly at the end is still playing).
             let at_end = if dur.is_finite() {
-                self.position_seconds >= dur
+                self.source
+                    .as_ref()
+                    .is_some_and(|s| s.playback_ended(self.position_seconds))
             } else {
                 self.source
                     .as_ref()
@@ -268,18 +307,10 @@ impl Channel {
                     if let Some(source) = &self.source {
                         source.on_loop_wrap();
                     }
-                } else if dur.is_finite() {
-                    if self.position_seconds > dur {
-                        // Strictly past the end: done. (Exactly at the end
-                        // the channel is still "playing" until the next
-                        // advance, matching the task's "advance(1.0) →
-                        // isDone false" for a 1s source.)
-                        self.position_seconds = dur;
-                        self.playing = false;
-                        self.done = true;
-                        became_done = true;
-                    }
                 } else {
+                    if dur.is_finite() {
+                        self.position_seconds = self.position_seconds.min(dur);
+                    }
                     self.playing = false;
                     self.done = true;
                     became_done = true;
@@ -387,12 +418,25 @@ impl Mixer {
     /// is the clock while a device is streaming, so each rendered chunk must
     /// move the play positions (otherwise the next callback replays it).
     pub fn render_mix_advancing(&mut self, out: &mut [f32], out_rate: u32, out_channels: u16) {
+        // Snapshot each channel's decoded watermark *before* rendering. The
+        // advance below must only move over audio that was renderable for
+        // this chunk; querying the watermark after the render would consume
+        // frames the worker published mid-render without ever playing them.
+        let watermarks: Vec<Option<f64>> = self
+            .channels
+            .iter()
+            .map(|c| c.source.as_ref().and_then(|s| s.available_end_seconds()))
+            .collect();
         self.render_mix(out, out_rate, out_channels);
         let channels = usize::from(out_channels);
         if out_rate > 0 && channels > 0 {
             let frames = out.len() / channels;
             if frames > 0 {
-                self.advance(frames as f64 / f64::from(out_rate));
+                let dt = frames as f64 / f64::from(out_rate);
+                self.clock += dt;
+                for (c, watermark) in self.channels.iter_mut().zip(watermarks) {
+                    c.advance_inner(dt, watermark);
+                }
             }
         }
     }

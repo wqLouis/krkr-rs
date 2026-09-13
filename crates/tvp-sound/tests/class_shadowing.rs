@@ -65,12 +65,14 @@ fn wavesoundbuffer_subclass_shadowing_and_status_events() {
         var overrideCount = 0;
         var actionType = "";
         var actionStatus = "";
+        var statusLog = "";
         var owner = %[action: function(ev) { actionType = ev.type; actionStatus = ev.status; }];
         class SoundBuffer extends WaveSoundBuffer {
             function SoundBuffer(owner){ WaveSoundBuffer(owner); }
             function open(){ super.open("one.wav"); }
             function onStatusChanged(st){
                 overrideCount++;
+                statusLog = statusLog + "|" + st;
                 super.onStatusChanged(...);
             }
             function test(){ return this.getStatus(); }
@@ -109,6 +111,20 @@ fn wavesoundbuffer_subclass_shadowing_and_status_events() {
         TjsValue::Integer(1),
         "the script subclass onStatusChanged override must run"
     );
+    let play_log = match e.eval("statusLog", "probe").unwrap() {
+        TjsValue::String(s) => s,
+        other => panic!("statusLog not a string: {other:?}"),
+    };
+    assert_eq!(
+        play_log.matches("|play").count(),
+        1,
+        "onStatusChanged(\"play\") must fire exactly once, log: {play_log:?}"
+    );
+    assert_eq!(
+        play_log.matches("|stop").count(),
+        0,
+        "no spurious stop event before the track has played, log: {play_log:?}"
+    );
     assert_eq!(
         e.eval("actionType", "probe").unwrap(),
         TjsValue::String("onStatusChanged".into())
@@ -126,6 +142,20 @@ fn wavesoundbuffer_subclass_shadowing_and_status_events() {
         e.eval("actionStatus", "probe").unwrap(),
         TjsValue::String("stop".into()),
         "the stop transition must reach the action owner too"
+    );
+    let stop_log = match e.eval("statusLog", "probe").unwrap() {
+        TjsValue::String(s) => s,
+        other => panic!("statusLog not a string: {other:?}"),
+    };
+    assert_eq!(
+        stop_log.matches("|play").count(),
+        1,
+        "the play event must not repeat when the track ends, log: {stop_log:?}"
+    );
+    assert_eq!(
+        stop_log.matches("|stop").count(),
+        1,
+        "the natural end must fire onStatusChanged(\"stop\") exactly once, log: {stop_log:?}"
     );
 
     let _ = std::fs::remove_dir_all(&dir);

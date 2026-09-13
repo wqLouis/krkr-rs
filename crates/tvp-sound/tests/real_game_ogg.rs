@@ -17,6 +17,7 @@
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use engine::Storage;
 use tjs2_sys::{Tjs2Engine, TjsValue};
@@ -235,5 +236,120 @@ fn real_game_opus_voice_decodes_to_audible_pcm() {
     assert!(
         rms > 0.0005,
         "rendered Opus voice mix is silence: rms {rms}"
+    );
+}
+
+/// Regression for the async streaming-decode change on the **real game
+/// BGM**: `open`+`play` before the worker has produced anything must not let
+/// the mixer clock run past the decoded watermark (the old
+/// `render_mix`→`advance` order could race ahead, drop every frame and play
+/// permanent silence), and playback must start at the beginning of the track
+/// instead of skipping its head.
+#[test]
+fn real_game_bgm_streams_from_the_start() {
+    let _vm_lock = vm_lock();
+    let storage = mount_real_game();
+    let track = tvp_sound::open_track(&storage, REAL_BGM).expect("open real bgm");
+    assert!(
+        track.is_streaming(),
+        "the 122 s real BGM must take the bounded streaming path"
+    );
+
+    let mut mixer = tvp_sound::Mixer::new();
+    let id = mixer.spawn_channel();
+    // Play immediately (the game's `open`→`play` sequence, no wait).
+    mixer.channel(id).unwrap().play_track(track.clone());
+
+    let rate = 44100u32;
+    let mut out = vec![0.0f32; 4410 * 2]; // 100 ms stereo
+    let mut first_sound_at: Option<f64> = None;
+    let mut audible_blocks = 0usize;
+    let mut rendered_blocks = 0usize;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while rendered_blocks < 50 {
+        let pos = mixer.channel_ref(id).unwrap().position_seconds;
+        let available = track
+            .available_end_seconds()
+            .expect("streaming BGM has a decoded watermark");
+        assert!(
+            pos <= available + 1e-6,
+            "BGM position {pos:.6}s ran past the decoded watermark {available:.6}s"
+        );
+        if available <= pos {
+            assert!(
+                Instant::now() < deadline,
+                "BGM streaming worker never produced the next frames"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+            continue;
+        }
+        mixer.render_mix_advancing(&mut out, rate, 2);
+        rendered_blocks += 1;
+        let rms = (out.iter().map(|s| s * s).sum::<f32>() / out.len() as f32).sqrt();
+        if rms > 1e-4 {
+            if first_sound_at.is_none() {
+                first_sound_at = Some(mixer.channel_ref(id).unwrap().position_seconds);
+            }
+            audible_blocks += 1;
+        }
+    }
+
+    let first = first_sound_at.expect("real BGM never produced any audio (permanent silence)");
+    assert!(
+        first < 1.0,
+        "real BGM skipped its head: first audio at {first:.3}s"
+    );
+    assert!(
+        audible_blocks > 20,
+        "real BGM had only {audible_blocks} audible 100 ms blocks out of 50"
+    );
+}
+
+/// Regression: a real short Opus voice (a whole-file decode) plays to its
+/// end on the device clock, with non-silent PCM throughout and a final
+/// position at the real duration.
+#[test]
+fn real_game_opus_voice_plays_fully() {
+    let _vm_lock = vm_lock();
+    let storage = mount_real_game();
+    let track = tvp_sound::open_track(&storage, REAL_VOICE_OPUS).expect("open real voice");
+    assert!(
+        !track.is_streaming(),
+        "the 3 s voice must take the whole-file path"
+    );
+    let duration = track.known_duration_seconds().expect("voice duration");
+
+    let mut mixer = tvp_sound::Mixer::new();
+    let id = mixer.spawn_channel();
+    mixer.channel(id).unwrap().play_track(track.clone());
+
+    // Wait for the background decode to publish the whole buffer.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !track.is_ready() {
+        assert!(Instant::now() < deadline, "voice decode never finished");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    let rate = 44100u32;
+    let mut out = vec![0.0f32; 4410]; // 100 ms mono
+    let mut audible_blocks = 0usize;
+    while !mixer.channel_ref(id).unwrap().done {
+        mixer.render_mix_advancing(&mut out, rate, 1);
+        let rms = (out.iter().map(|s| s * s).sum::<f32>() / out.len() as f32).sqrt();
+        if rms > 1e-4 {
+            audible_blocks += 1;
+        }
+        assert!(Instant::now() < deadline, "voice never reached its end");
+    }
+
+    // 3.24 s in 100 ms blocks is ~32; the last block is partial.
+    assert!(
+        audible_blocks >= 25,
+        "voice had only {audible_blocks} audible 100 ms blocks"
+    );
+    let final_pos = mixer.channel_ref(id).unwrap().position_seconds;
+    assert!(
+        (final_pos - duration).abs() < 0.2,
+        "voice ended at {final_pos:.3}s, expected {duration:.3}s"
     );
 }

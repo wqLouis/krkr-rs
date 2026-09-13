@@ -253,3 +253,148 @@ fn long_track_memory_is_bounded() {
         "streaming tracks hold no whole-file buffer"
     );
 }
+
+/// Regression for the async streaming-decode change: a long track that is
+/// `open`ed and `play`ed *before* its worker has decoded anything must start
+/// at the beginning (position 0), never let the mixer clock run past the
+/// decoded watermark, stay audible through the whole track, and finish at
+/// the real end.
+///
+/// This drives [`Mixer::render_mix_advancing`] (the device/audio-callback
+/// path) rather than `advance` + `render_mix`: with the old
+/// `render_mix`-then-`advance` mix a channel whose ring was empty (the
+/// `open`→`play` race, or a worker slower than the clock) advanced its
+/// position anyway, dropping every frame the worker later published and
+/// ending in permanent silence.
+#[test]
+fn streaming_playback_starts_at_zero_stays_audible_and_ends() {
+    let _lock = test_lock();
+    let dir = TestDir::new();
+    let seconds = 60.0;
+    let storage = mounted(&dir, "long.wav", &sine_wav_bytes(44100, 1, 440.0, seconds));
+    let track = open_track(&storage, "long.wav").expect("open track");
+    assert!(
+        track.is_streaming(),
+        "60 s of 44.1 kHz PCM must exceed the whole-file cap"
+    );
+
+    let mut mixer = Mixer::new();
+    let id = mixer.spawn_channel();
+    // Play immediately: this is the game's `open`→`play` sequence.
+    mixer.channel(id).unwrap().play_track(track.clone());
+
+    let rate = 44100u32;
+    let chunk_frames = 4410usize; // 100 ms
+    let mut out = vec![0.0f32; chunk_frames];
+    let mut first_sound_at: Option<f64> = None;
+    let mut audible_blocks = 0usize;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        // The playback position must never lead the decoded audio.
+        let pos = mixer.channel_ref(id).unwrap().position_seconds;
+        let available = track
+            .available_end_seconds()
+            .expect("streaming track has a watermark");
+        assert!(
+            pos <= available + 1e-6,
+            "position {pos:.6}s ran past the decoded watermark {available:.6}s"
+        );
+        if mixer.channel_ref(id).unwrap().done {
+            break;
+        }
+        if available <= pos {
+            // The worker has not published the next frames yet: wait for it,
+            // like the real device callback would just render silence.
+            assert!(
+                Instant::now() < deadline,
+                "streaming worker never produced the rest of the track"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+            continue;
+        }
+        mixer.render_mix_advancing(&mut out, rate, 1);
+        let rms = (out
+            .iter()
+            .map(|s| f64::from(*s) * f64::from(*s))
+            .sum::<f64>()
+            / out.len() as f64)
+            .sqrt();
+        assert!(
+            rms > 1e-4,
+            "streaming playback went silent at position {pos:.3}s"
+        );
+        if first_sound_at.is_none() {
+            first_sound_at = Some(mixer.channel_ref(id).unwrap().position_seconds);
+        }
+        audible_blocks += 1;
+        assert!(
+            Instant::now() < deadline,
+            "streaming playback never reached the end"
+        );
+    }
+
+    let first = first_sound_at.expect("stream produced no audio at all");
+    assert!(
+        first < 0.5,
+        "stream skipped its head: first audio at {first:.3}s instead of 0"
+    );
+    assert!(
+        audible_blocks > 500,
+        "stream had only {audible_blocks} audible 100 ms blocks of 600"
+    );
+    let duration = track.known_duration_seconds().expect("wav duration");
+    let final_pos = mixer.channel_ref(id).unwrap().position_seconds;
+    assert!(
+        (final_pos - duration).abs() < 0.2,
+        "stream ended at {final_pos:.3}s, expected {duration:.3}s"
+    );
+}
+
+/// End-to-end sample correctness for the streaming ring: the fixture is a
+/// 60 s ramp whose sample value is `frame / total_frames`, so a mixer that
+/// reads the wrong ring slot (the original `push` wrote modulo capacity but
+/// `frame` read linearly from `base`) or skips the head produces values that
+/// do not match the playback position. This is the end-to-end counterpart of
+/// [`source::tests::ring_reads_back_written_frames_across_release_and_wrap`].
+#[test]
+fn streaming_rendered_samples_match_playback_position() {
+    let _lock = test_lock();
+    let dir = TestDir::new();
+    let rate = 44100u32;
+    let seconds = 60.0;
+    let frames = (f64::from(rate) * seconds) as usize;
+    let samples: Vec<i16> = (0..frames)
+        .map(|i| ((i as f64 / frames as f64) * 32767.0) as i16)
+        .collect();
+    let storage = mounted(&dir, "ramp.wav", &wav_pcm16(rate, 1, &samples));
+    let track = open_track(&storage, "ramp.wav").expect("open track");
+    assert!(track.is_streaming());
+
+    let mut mixer = Mixer::new();
+    let id = mixer.spawn_channel();
+    mixer.channel(id).unwrap().play_track(track.clone());
+
+    let chunk_frames = 4410usize;
+    let mut out = vec![0.0f32; chunk_frames];
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut checked = 0usize;
+    while checked < 200 {
+        let pos = mixer.channel_ref(id).unwrap().position_seconds;
+        let available = track.available_end_seconds().unwrap();
+        if available <= pos {
+            assert!(Instant::now() < deadline, "streaming worker stalled");
+            std::thread::sleep(Duration::from_millis(1));
+            continue;
+        }
+        mixer.render_mix_advancing(&mut out, rate, 1);
+        // The first sample of the chunk must encode the playback position.
+        let expected = (pos / seconds) as f32;
+        assert!(
+            (out[0] - expected).abs() < 0.02,
+            "sample at {pos:.3}s was {} but the ramp expects {expected:.3} \
+             (wrong ring slot or skipped head)",
+            out[0]
+        );
+        checked += 1;
+    }
+}
