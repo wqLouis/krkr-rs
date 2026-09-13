@@ -1,18 +1,28 @@
-//! `Key` native class — port of the reference `Key` class (in the full
-//! krkrz tree: `core/base/KeyIntf.cpp`, `TVPCreateNativeClass_Key`; not
-//! part of this repository's reference subset).
+//! `Key` native class — a port compatibility class over the shared
+//! [`crate::InputState`].
 //!
-//! A static class: `Key.getPressed(code)` / `getReleased(code)` /
-//! `getRepeat(code)` query the shared [`crate::InputState`] (see the crate
-//! docs for the frame protocol), and the `kXXX` constants are get-only
-//! properties carrying the Windows virtual-key codes.
+//! The reference subset has no native `Key` class (the reference input API
+//! is `System.getKeyState` + the `Window` events); this class follows the
+//! common KiriKiri script idiom. `Key.getPressed(code)` /
+//! `getReleased(code)` / `getRepeat(code)` query the shared state through
+//! [`crate::InputState::vk_pressed`], which uses the *same* Windows
+//! virtual-key space as the reference: the mouse-button VKs
+//! (`VK_LBUTTON`..`VK_XBUTTON2`) resolve to the mouse-button state, and
+//! `VK_PADANY` is true when any gamepad button is held, mirroring
+//! `TVPGetAsyncKeyState` (`reference/cpp/core/base/impl/SystemImpl.cpp:43`)
+//! and `TVPGetJoyPadAsyncState`
+//! (`reference/cpp/core/visual/impl/DInputMgn.cpp:696`).
 //!
-//! The constant table is ported from `reference/cpp/core/environ/vkdefine.h`
-//! (the `VK_*` codes this engine uses everywhere, e.g. in
-//! `System.getKeyState`) under the standard krkrz `Key` constant names;
-//! the browser/media/launch/OEM keys come from the standard Windows
-//! virtual-key table (they are not in the reference's `vkdefine.h` but are
-//! part of the krkrz `Key` class).
+//! The `kXXX` constants are get-only properties carrying the Windows
+//! virtual-key codes. The table is ported from the reference global `VK_*`
+//! table (`reference/cpp/core/base/ScriptMgnIntf.cpp`, incl. `VK_CANCEL`
+//! and the KiriKiri `VK_PAD*` codes from
+//! `reference/cpp/core/visual/tvpinputdefs.h`), plus the standard extended
+//! Windows keys (browser/media/OEM), under the conventional `Key` names.
+//!
+//! Key codes are Windows virtual-key codes (`VK_*`), the same codes
+//! `System.getKeyState` uses — see
+//! `reference/cpp/core/environ/vkdefine.h`.
 
 use std::ffi::{c_char, c_int, c_void};
 
@@ -29,9 +39,9 @@ use crate::{args, report_error, set_int_out, value_as_i64, with_state};
 macro_rules! key_code_table {
     ($(($rname:ident, $tjs:literal, $code:expr)),* $(,)?) => {
         /// The `Key` class key-code constants: TJS constant name → Windows
-        /// virtual-key code, in declaration order (port of the reference
-        /// `KeyIntf.cpp` table; codes from `environ/vkdefine.h` / the
-        /// standard Windows virtual-key table).
+        /// virtual-key code, in declaration order (ported from the reference
+        /// global `VK_*` table in `ScriptMgnIntf.cpp` / `tvpinputdefs.h` and
+        /// the standard Windows virtual-key table).
         pub const KEY_CODE_TABLE: &[(&str, u32)] = &[ $(($tjs, $code)),* ];
 
         /// Look up the Windows virtual-key code for a TJS `Key.kXXX`
@@ -75,6 +85,15 @@ macro_rules! key_code_table {
 // letters, Windows keys, numpad, function keys, modifier keys, browser/
 // media/launch keys, OEM keys, and the IME/rare keys.
 key_code_table! {
+    // -- mouse buttons (VK_LBUTTON..VK_XBUTTON2; the reference scancode
+    //    array is indexed by VK and covers these, so Key resolves them) ----
+    (kLButton, "kLButton", 0x01),     // VK_LBUTTON
+    (kRButton, "kRButton", 0x02),     // VK_RBUTTON
+    (kCancel, "kCancel", 0x03),       // VK_CANCEL
+    (kMButton, "kMButton", 0x04),     // VK_MBUTTON
+    (kXButton1, "kXButton1", 0x05),   // VK_XBUTTON1
+    (kXButton2, "kXButton2", 0x06),   // VK_XBUTTON2
+
     // -- navigation / control ------------------------------------------------
     (kBack, "kBack", 0x08),           // VK_BACK
     (kTab, "kTab", 0x09),             // VK_TAB
@@ -248,6 +267,23 @@ key_code_table! {
     (kOEM7, "kOEM7", 0xDE),           // VK_OEM_7 ('"'' for US)
     (kOEM8, "kOEM8", 0xDF),           // VK_OEM_8
 
+    // -- KiriKiri gamepad (VK_PAD*, `tvpinputdefs.h`) --------------------------
+    (kPadLeft, "kPadLeft", 0x1B5),   // VK_PADLEFT
+    (kPadUp, "kPadUp", 0x1B6),       // VK_PADUP
+    (kPadRight, "kPadRight", 0x1B7), // VK_PADRIGHT
+    (kPadDown, "kPadDown", 0x1B8),   // VK_PADDOWN
+    (kPad1, "kPad1", 0x1C0),         // VK_PAD1
+    (kPad2, "kPad2", 0x1C1),         // VK_PAD2
+    (kPad3, "kPad3", 0x1C2),         // VK_PAD3
+    (kPad4, "kPad4", 0x1C3),         // VK_PAD4
+    (kPad5, "kPad5", 0x1C4),         // VK_PAD5
+    (kPad6, "kPad6", 0x1C5),         // VK_PAD6
+    (kPad7, "kPad7", 0x1C6),         // VK_PAD7
+    (kPad8, "kPad8", 0x1C7),         // VK_PAD8
+    (kPad9, "kPad9", 0x1C8),         // VK_PAD9
+    (kPad10, "kPad10", 0x1C9),       // VK_PAD10
+    (kPadAny, "kPadAny", 0x1DF),     // VK_PADANY
+
     // -- IME / rare keys ---------------------------------------------------------
     (kProcessKey, "kProcessKey", 0xE5), // VK_PROCESSKEY
     (kAttn, "kAttn", 0xF6),             // VK_ATTN
@@ -261,15 +297,15 @@ key_code_table! {
     (kOEMClear, "kOEMClear", 0xFE),     // VK_OEM_CLEAR
 }
 
-/// Coerce a TJS argument to a key code. Out-of-range / negative values
-/// simply never match a tracked key — the reference raises
-/// `TJS_E_INVALIDPARAM` for codes ≥ 256, this port returns false/0
-/// (documented deviation; tests require it).
+/// Coerce a TJS argument to a key code. Out-of-range / negative values never
+/// match a tracked key, and resolve through [`InputState::vk_pressed`] etc.,
+/// so the reference virtual-key lookups (mouse buttons, `VK_PADANY`) work.
 fn key_code_arg(v: &Value) -> u32 {
     value_as_i64(v) as u32
 }
 
-/// `Key.getPressed(code)` → bool — whether the key is currently held.
+/// `Key.getPressed(code)` → bool — whether the key (or mouse button / any
+/// gamepad button for `VK_PADANY`) is currently held.
 extern "C" fn native_get_pressed(
     _engine: *mut c_void,
     argc: c_int,
@@ -281,7 +317,7 @@ extern "C" fn native_get_pressed(
         return report_error(out_error, "Key.getPressed requires 1 argument");
     }
     let code = key_code_arg(&args(argv, argc)[0]);
-    let pressed = with_state(|s| s.keys.pressed.contains_key(&code));
+    let pressed = with_state(|s| s.vk_pressed(code));
     set_int_out(out, i64::from(pressed));
     0
 }
@@ -300,7 +336,7 @@ extern "C" fn native_get_released(
         return report_error(out_error, "Key.getReleased requires 1 argument");
     }
     let code = key_code_arg(&args(argv, argc)[0]);
-    let released = with_state(|s| s.keys.released.contains_key(&code));
+    let released = with_state(|s| s.vk_released(code));
     set_int_out(out, i64::from(released));
     0
 }
@@ -318,7 +354,7 @@ extern "C" fn native_get_repeat(
         return report_error(out_error, "Key.getRepeat requires 1 argument");
     }
     let code = key_code_arg(&args(argv, argc)[0]);
-    let repeat = with_state(|s| s.keys.repeat.get(&code).copied().unwrap_or(0));
+    let repeat = with_state(|s| s.vk_repeat(code));
     set_int_out(out, i64::from(repeat));
     0
 }

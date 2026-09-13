@@ -45,10 +45,7 @@
 //!
 //! # Native surface
 //!
-//! `Mouse` (static class; port of the reference `Mouse` class, which lives
-//! in `reference/cpp/core/base/MouseIntf.cpp` in the full krkrz tree — not
-//! present in this repository's reference subset, so the surface below
-//! follows the well-known krkrz API):
+//! `Mouse` (static class):
 //!
 //! | method | returns |
 //! |---|---|
@@ -71,8 +68,7 @@
 //! (`enum tTVPMouseButton { mbLeft, mbRight, mbMiddle, mbX1, mbX2 }`):
 //! [`MB_LEFT`]=0, [`MB_RIGHT`]=1, [`MB_MIDDLE`]=2, [`MB_X1`]=3, [`MB_X2`]=4.
 //!
-//! `Key` (static class; port of the reference `Key` class, normally
-//! `reference/cpp/core/base/KeyIntf.cpp`):
+//! `Key` (static class):
 //!
 //! | member | returns |
 //! |---|---|
@@ -82,28 +78,55 @@
 //!   held, 0 when not held) |
 //! | `kBack`, `kTab`, `kReturn`, `kShift`, `kControl`, `kMenu`,
 //!   `kEscape`, `kSpace`, `kLeft`, `kUp`, `kRight`, `kDown`, `kA`..`kZ`,
-//!   `k0`..`k9`, `kF1`..`kF24`, `kNumPad0`..`kNumPad9`, ... | get-only
+//!   `k0`..`k9`, `kF1`..`kF24`, `kNumPad0`..`kNumPad9`, the mouse-button
+//!   VKs (`kLButton`, `kRButton`, `kMButton`, `kXButton1`, `kXButton2`) and
+//!   the KiriKiri gamepad VKs (`kPadLeft`..`kPadAny`), ... | get-only
 //!   constant properties: the Windows virtual-key code (see
 //!   [`KEY_CODE_TABLE`]) |
 //!
 //! Key codes are Windows virtual-key codes (`VK_*`), the same codes
 //! `System.getKeyState` uses — see
-//! `reference/cpp/core/environ/vkdefine.h`.
+//! `reference/cpp/core/environ/vkdefine.h`, `ScriptMgnIntf.cpp` (the global
+//! `VK_*` table, incl. `VK_CANCEL` and `VK_PAD*`) and `tvpinputdefs.h`.
+//!
+//! # Relationship to the reference
+//!
+//! The provided reference subset has **no** `Mouse`/`Key` native class.
+//! The reference input surface is:
+//!
+//! * `reference/cpp/core/visual/tvpinputdefs.h` — `enum tTVPMouseButton`
+//!   (`mbLeft`..`mbX2`), the `TVP_SS_*` shift-state flags, the IME modes and
+//!   the KiriKiri-specific `VK_PAD*` gamepad virtual-key codes (incl.
+//!   `VK_PADANY`);
+//! * `System.getKeyState(code[, getcurrent=true])` — registered by
+//!   `tvp-natives`; reference `reference/cpp/core/base/impl/SystemImpl.cpp:634`
+//!   (`TVPGetAsyncKeyState`, `:43`) over the host scancode array
+//!   (`reference/cpp/core/environ/impl/TVPWindow.h:213`,
+//!   `reference/cpp/core/visual/impl/DInputMgn.cpp:696` for the pad path);
+//! * `Window` mouse/key/touch events plus `mouseCursorState` /
+//!   `hideMouseCursor` (`reference/cpp/core/visual/WindowIntf.cpp`).
+//!
+//! `Mouse`/`Key` are a **port compatibility layer** over the same shared
+//! state (their member set follows the common KiriKiri script idiom, not a
+//! reference C++ class). They deliberately share the reference key-code
+//! space, so `Key.getPressed(code)` understands the mouse-button VKs (mapped
+//! to the mouse state, like the reference's scancode array) and `VK_PADANY`
+//! (true when any gamepad button is held), exactly as
+//! `System.getKeyState(code)` does.
 //!
 //! # Deviations from the reference (documented)
 //!
-//! * `Mouse.getCursorPos` in the reference takes an object argument and
-//!   fills its `x`/`y` properties. The C ABI in `tjs2-sys` cannot marshal
-//!   TJS objects, so this port returns the position as a `"x,y"` string
-//!   instead.
-//! * The reference's `Key.getPressed` returns void when the key is up and
-//!   `TVPKeyRepeatCount / 2` when it is down (a press "ticker"); this port
-//!   returns a plain bool (0/1). `Key.getRepeat` returns the per-key
-//!   held-frame count instead of the global `TVPKeyRepeatCount`.
-//! * The reference raises `TJS_E_INVALIDPARAM` for key codes ≥ 256 and
-//!   out-of-range mouse buttons. This port returns 0/false for unknown
-//!   codes and buttons instead (tests require it, and it is more robust
-//!   against scripts probing values).
+//! * `Mouse.getCursorPos` returns the position as an `"x,y"` string. The
+//!   C ABI in `tjs2-sys` has no `tjs2_prop_set`, so a native cannot fill an
+//!   object argument's `x`/`y` properties; a game that passes an object gets
+//!   the string form. Supporting the object form needs a `tjs2_prop_set`
+//!   addition to the ABI (reported, not implemented here).
+//! * `Mouse.setCursorPos` records the position and a *warp request*
+//!   ([`InputState::take_mouse_warp`]); the host input bridge must consume it
+//!   to move the OS cursor.
+//! * Unknown key codes / out-of-range mouse buttons return 0/false rather
+//!   than raising. This matches the reference `TVPGetAsyncKeyState`, which
+//!   bounds-checks the scancode array and returns false.
 //! * `Mouse.getClickCount` counts presses within
 //!   [`MOUSE_CLICK_SEQUENCE_FRAMES`] frames and [`MOUSE_CLICK_MAX_MOVE`]
 //!   pixels; the reference delegates to the OS double-click time and
@@ -189,6 +212,115 @@ pub use buttons::{
     VK_XBUTTON1, VK_XBUTTON2,
 };
 
+/// Gamepad (joypad) virtual-key codes — the KiriKiri-specific `VK_PAD*`
+/// range from `reference/cpp/core/visual/tvpinputdefs.h` (`VK_PAD_FIRST` is
+/// `0x1B0`, `VK_PAD_LAST`/`VK_PADANY` are `0x1DF`).
+///
+/// The pad path is the reference `TVPGetJoyPadAsyncState`
+/// (`reference/cpp/core/visual/impl/DInputMgn.cpp:696`): a plain button code
+/// maps to one pad flag, and [`VK_PADANY`] is true when *any* pad button is
+/// held. The host input bridge feeds these through
+/// [`InputState::set_key_down`]/[`InputState::set_key_up`] like any other
+/// VK code; [`InputState::vk_pressed`] and the `Key` natives treat
+/// [`VK_PADANY`] specially.
+pub mod pad {
+    /// First KiriKiri pad virtual-key code (`VK_PAD_FIRST`).
+    pub const VK_PAD_FIRST: u32 = 0x1B0;
+    pub const VK_PADLEFT: u32 = 0x1B5;
+    pub const VK_PADUP: u32 = 0x1B6;
+    pub const VK_PADRIGHT: u32 = 0x1B7;
+    pub const VK_PADDOWN: u32 = 0x1B8;
+    pub const VK_PAD1: u32 = 0x1C0;
+    pub const VK_PAD2: u32 = 0x1C1;
+    pub const VK_PAD3: u32 = 0x1C2;
+    pub const VK_PAD4: u32 = 0x1C3;
+    pub const VK_PAD5: u32 = 0x1C4;
+    pub const VK_PAD6: u32 = 0x1C5;
+    pub const VK_PAD7: u32 = 0x1C6;
+    pub const VK_PAD8: u32 = 0x1C7;
+    pub const VK_PAD9: u32 = 0x1C8;
+    pub const VK_PAD10: u32 = 0x1C9;
+    /// "Any pad button held" pseudo-key (`VK_PADANY`).
+    pub const VK_PADANY: u32 = 0x1DF;
+    /// Last KiriKiri pad virtual-key code (`VK_PAD_LAST`).
+    pub const VK_PAD_LAST: u32 = 0x1DF;
+
+    /// Every concrete pad button code (the direction pad plus pad buttons
+    /// 1..10), in `tvpinputdefs.h` order. [`VK_PADANY`] is not included: it
+    /// is a query pseudo-code, not a button.
+    pub const PAD_CODES: [u32; 14] = [
+        VK_PADLEFT,
+        VK_PADUP,
+        VK_PADRIGHT,
+        VK_PADDOWN,
+        VK_PAD1,
+        VK_PAD2,
+        VK_PAD3,
+        VK_PAD4,
+        VK_PAD5,
+        VK_PAD6,
+        VK_PAD7,
+        VK_PAD8,
+        VK_PAD9,
+        VK_PAD10,
+    ];
+
+    /// Whether `code` lies in the KiriKiri pad virtual-key range
+    /// (`VK_PAD_FIRST..=VK_PAD_LAST`), i.e. the reference
+    /// `keycode >= VK_PAD_FIRST && keycode <= VK_PAD_LAST` branch of
+    /// `TVPGetAsyncKeyState` (`SystemImpl.cpp:47`).
+    pub fn is_pad_code(code: u32) -> bool {
+        (VK_PAD_FIRST..=VK_PAD_LAST).contains(&code)
+    }
+}
+
+pub use pad::{
+    PAD_CODES, VK_PAD_FIRST, VK_PAD_LAST, VK_PAD1, VK_PAD2, VK_PAD3, VK_PAD4, VK_PAD5, VK_PAD6,
+    VK_PAD7, VK_PAD8, VK_PAD9, VK_PAD10, VK_PADANY, VK_PADDOWN, VK_PADLEFT, VK_PADRIGHT, VK_PADUP,
+};
+
+/// Shift-state flag bits — port of the `TVP_SS_*` defines from
+/// `reference/cpp/core/visual/tvpinputdefs.h:37`. These are the `shift`
+/// argument of the `Window` `onMouseDown`/`onMouseUp`/`onMouseMove`/
+/// `onMouseWheel`/`onKeyDown`/`onKeyUp` events.
+pub mod shift_state {
+    /// Shift key held (`TVP_SS_SHIFT`).
+    pub const TVP_SS_SHIFT: u32 = 0x01;
+    /// Alt/Menu key held (`TVP_SS_ALT`).
+    pub const TVP_SS_ALT: u32 = 0x02;
+    /// Control key held (`TVP_SS_CTRL`).
+    pub const TVP_SS_CTRL: u32 = 0x04;
+    /// Left mouse button held (`TVP_SS_LEFT`).
+    pub const TVP_SS_LEFT: u32 = 0x08;
+    /// Right mouse button held (`TVP_SS_RIGHT`).
+    pub const TVP_SS_RIGHT: u32 = 0x10;
+    /// Middle mouse button held (`TVP_SS_MIDDLE`).
+    pub const TVP_SS_MIDDLE: u32 = 0x20;
+    /// Event is the second click of a double-click (`TVP_SS_DOUBLE`).
+    pub const TVP_SS_DOUBLE: u32 = 0x40;
+    /// Event is an auto-repeat (`TVP_SS_REPEAT`).
+    pub const TVP_SS_REPEAT: u32 = 0x80;
+
+    /// `TVPIsAnyMouseButtonPressedInShiftStateFlags`
+    /// (`reference/cpp/core/visual/tvpinputdefs.h:51`): whether any of the
+    /// mouse-button bits is set.
+    pub fn any_mouse_button_pressed(state: u32) -> bool {
+        state & (TVP_SS_LEFT | TVP_SS_RIGHT | TVP_SS_MIDDLE | TVP_SS_DOUBLE) != 0
+    }
+}
+
+pub use shift_state::{
+    TVP_SS_ALT, TVP_SS_CTRL, TVP_SS_DOUBLE, TVP_SS_LEFT, TVP_SS_MIDDLE, TVP_SS_REPEAT,
+    TVP_SS_RIGHT, TVP_SS_SHIFT,
+};
+
+/// The Windows virtual-key codes for the keyboard modifiers the shift-state
+/// mask reports (`VK_SHIFT`/`VK_CONTROL`/`VK_MENU` from
+/// `reference/cpp/core/environ/vkdefine.h`).
+pub const VK_SHIFT: u32 = 0x10;
+pub const VK_CONTROL: u32 = 0x11;
+pub const VK_MENU: u32 = 0x12;
+
 /// Frames within which a follow-up press counts as the next click of a
 /// multi-click sequence (`Mouse.getClickCount`). At the usual 60 fps this
 /// is ~500 ms, the Windows double-click time.
@@ -234,6 +366,11 @@ pub struct MouseState {
     pub last_click_pos: Vec<(i32, i32)>,
     /// Cursor visibility — `Mouse.isVisible()` / `Mouse.setVisible`.
     pub visible: bool,
+    /// Pending OS-cursor warp requested by `Mouse.setCursorPos` (the host
+    /// bridge consumes it via [`InputState::take_mouse_warp`]). `None` when
+    /// no warp is pending. This is separate from [`MouseState::x`]/`y` so the
+    /// state lookup is unconditional even if the host never applies it.
+    pub warp_request: Option<(i32, i32)>,
 }
 
 impl Default for MouseState {
@@ -249,6 +386,7 @@ impl Default for MouseState {
             last_click_frame: vec![u64::MAX; MOUSE_BUTTONS],
             last_click_pos: vec![(0, 0); MOUSE_BUTTONS],
             visible: true,
+            warp_request: None,
         }
     }
 }
@@ -332,6 +470,23 @@ impl InputState {
         self.mouse.y = y;
     }
 
+    /// `Mouse.setCursorPos(x, y)`: move the logical cursor *and* queue an
+    /// OS-cursor warp request for the host bridge
+    /// ([`InputState::take_mouse_warp`]). The position is applied
+    /// immediately so scripts that read `getCursorX/Y` back see it even when
+    /// the host never consumes the warp.
+    pub fn warp_mouse_pos(&mut self, x: i32, y: i32) {
+        self.mouse.x = x;
+        self.mouse.y = y;
+        self.mouse.warp_request = Some((x, y));
+    }
+
+    /// Take (and clear) the pending OS-cursor warp requested by
+    /// `Mouse.setCursorPos`, if any. Returns `None` when no warp is pending.
+    pub fn take_mouse_warp(&mut self) -> Option<(i32, i32)> {
+        self.mouse.warp_request.take()
+    }
+
     /// Accumulate wheel deltas for this frame (`Mouse.getWheelRot*` read
     /// them; `begin_frame` resets them). Typical vertical notches are
     /// ±120.
@@ -343,38 +498,43 @@ impl InputState {
 
     /// Set a mouse button's held state. `button` is a TVP button index
     /// ([`MB_LEFT`]..[`MB_X2`]); out-of-range indices are ignored. A
-    /// `down` transition resets the button's hold counter; an `up`
-    /// transition sets its released-this-frame flag. Returns false when
-    /// `button` is out of range.
+    /// rising `down` edge resets the button's hold counter and advances the
+    /// multi-click sequence; a falling edge sets its released-this-frame
+    /// flag and clears the hold counter. Redundant calls (no state change)
+    /// leave the hold counter intact. Returns false when `button` is out of
+    /// range.
     pub fn set_mouse_button(&mut self, button: usize, down: bool) -> bool {
         if button >= MOUSE_BUTTONS {
             return false;
         }
         let was_down = self.mouse.buttons[button];
+        if down == was_down {
+            // No edge: keep the held-frame counter so a repeated "down"
+            // report does not restart the repeat count.
+            return true;
+        }
         self.mouse.buttons[button] = down;
         if down {
             self.mouse.hold[button] = 0;
             // Count only a real rising edge as a click, and extend the
             // current multi-click sequence when it is close enough in time
             // and space (the reference `Mouse.getClickCount` gesture).
-            if !was_down {
-                let last_frame = self.mouse.last_click_frame[button];
-                let (lx, ly) = self.mouse.last_click_pos[button];
-                let close_in_time = last_frame != u64::MAX
-                    && self.frame.saturating_sub(last_frame) <= MOUSE_CLICK_SEQUENCE_FRAMES;
-                let close_in_space = (self.mouse.x - lx).abs() <= MOUSE_CLICK_MAX_MOVE
-                    && (self.mouse.y - ly).abs() <= MOUSE_CLICK_MAX_MOVE;
-                if close_in_time && close_in_space {
-                    self.mouse.click_count[button] =
-                        self.mouse.click_count[button].saturating_add(1);
-                } else {
-                    self.mouse.click_count[button] = 1;
-                }
-                self.mouse.last_click_frame[button] = self.frame;
-                self.mouse.last_click_pos[button] = (self.mouse.x, self.mouse.y);
+            let last_frame = self.mouse.last_click_frame[button];
+            let (lx, ly) = self.mouse.last_click_pos[button];
+            let close_in_time = last_frame != u64::MAX
+                && self.frame.saturating_sub(last_frame) <= MOUSE_CLICK_SEQUENCE_FRAMES;
+            let close_in_space = (self.mouse.x - lx).abs() <= MOUSE_CLICK_MAX_MOVE
+                && (self.mouse.y - ly).abs() <= MOUSE_CLICK_MAX_MOVE;
+            if close_in_time && close_in_space {
+                self.mouse.click_count[button] = self.mouse.click_count[button].saturating_add(1);
+            } else {
+                self.mouse.click_count[button] = 1;
             }
+            self.mouse.last_click_frame[button] = self.frame;
+            self.mouse.last_click_pos[button] = (self.mouse.x, self.mouse.y);
         } else {
             self.mouse.released[button] = true;
+            self.mouse.hold[button] = 0;
         }
         true
     }
@@ -433,10 +593,97 @@ impl InputState {
         self.mouse.released.get(button).copied().unwrap_or(false)
     }
 
-    /// Frames `button` has been held (`Mouse.getRepeat`); 0 for
-    /// out-of-range indices.
+    /// Frames `button` has been held (`Mouse.getRepeat`); 0 for an
+    /// out-of-range button or while the button is not held.
     pub fn mouse_button_repeat(&self, button: usize) -> u32 {
+        if !self.mouse.buttons.get(button).copied().unwrap_or(false) {
+            return 0;
+        }
         self.mouse.hold.get(button).copied().unwrap_or(0)
+    }
+
+    // -- reference virtual-key lookup --------------------------------------
+
+    /// Whether Windows virtual-key `code` is currently held, spanning the
+    /// same code space as the reference `System.getKeyState`:
+    ///
+    /// * mouse-button VKs (`VK_LBUTTON`, `VK_RBUTTON`, `VK_MBUTTON`,
+    ///   `VK_XBUTTON1/2`) map to the mouse-button state (the reference
+    ///   scancode array is indexed by VK and covers them);
+    /// * `VK_PADANY` is true when *any* concrete pad code is held
+    ///   (`DInputMgn.cpp:696`, `bit = -1`);
+    /// * everything else is a keyboard key from [`KeyState::pressed`].
+    pub fn vk_pressed(&self, code: u32) -> bool {
+        if let Some(b) = buttons::from_vk(code) {
+            return self.mouse.buttons.get(b).copied().unwrap_or(false);
+        }
+        if code == VK_PADANY {
+            return PAD_CODES
+                .iter()
+                .any(|&c| self.keys.pressed.contains_key(&c));
+        }
+        self.keys.pressed.contains_key(&code)
+    }
+
+    /// Whether virtual-key `code` was released this frame; same mapping as
+    /// [`InputState::vk_pressed`].
+    pub fn vk_released(&self, code: u32) -> bool {
+        if let Some(b) = buttons::from_vk(code) {
+            return self.mouse.released.get(b).copied().unwrap_or(false);
+        }
+        if code == VK_PADANY {
+            return PAD_CODES
+                .iter()
+                .any(|&c| self.keys.released.contains_key(&c));
+        }
+        self.keys.released.contains_key(&code)
+    }
+
+    /// Held-frame count for virtual-key `code` (`Key.getRepeat`); 0 while the
+    /// key/button is not held. `VK_PADANY` reports the longest-held pad
+    /// button.
+    pub fn vk_repeat(&self, code: u32) -> u32 {
+        if let Some(b) = buttons::from_vk(code) {
+            return self.mouse_button_repeat(b);
+        }
+        if code == VK_PADANY {
+            return PAD_CODES
+                .iter()
+                .map(|&c| self.keys.repeat.get(&c).copied().unwrap_or(0))
+                .max()
+                .unwrap_or(0);
+        }
+        self.keys.repeat.get(&code).copied().unwrap_or(0)
+    }
+
+    /// The reference `TVP_SS_*` shift mask for the currently held state —
+    /// the `shift` argument of the `Window` `onMouseDown`/`onMouseUp`/
+    /// `onMouseMove`/`onMouseWheel`/`onKeyDown`/`onKeyUp` events. Sets the
+    /// held-modifier and held-mouse-button bits; `TVP_SS_DOUBLE` and
+    /// `TVP_SS_REPEAT` are event-specific and are left to the caller
+    /// (e.g. from [`InputState::mouse_click_count`] and
+    /// [`InputState::vk_repeat`]).
+    pub fn shift_flags(&self) -> u32 {
+        let mut flags = 0;
+        if self.vk_pressed(VK_SHIFT) {
+            flags |= TVP_SS_SHIFT;
+        }
+        if self.vk_pressed(VK_MENU) {
+            flags |= TVP_SS_ALT;
+        }
+        if self.vk_pressed(VK_CONTROL) {
+            flags |= TVP_SS_CTRL;
+        }
+        if self.is_mouse_button_down(MB_LEFT) {
+            flags |= TVP_SS_LEFT;
+        }
+        if self.is_mouse_button_down(MB_RIGHT) {
+            flags |= TVP_SS_RIGHT;
+        }
+        if self.is_mouse_button_down(MB_MIDDLE) {
+            flags |= TVP_SS_MIDDLE;
+        }
+        flags
     }
 
     /// The number of presses in the current multi-click sequence for
@@ -889,8 +1136,143 @@ mod tests {
             50,
             "the shared state must reflect Mouse.setCursorPos"
         );
+        // setCursorPos also queues an OS-cursor warp for the host bridge.
+        assert_eq!(
+            state.lock().unwrap().take_mouse_warp(),
+            Some((50, 60)),
+            "Mouse.setCursorPos must queue a cursor warp"
+        );
+        assert_eq!(
+            state.lock().unwrap().take_mouse_warp(),
+            None,
+            "the warp request is consumed once"
+        );
         // the arg-count check matches the reference (TJS_E_BADPARAMCOUNT)
         assert!(e.eval("Mouse.setCursorPos(1)", "test").is_err());
+    }
+
+    // -- getCursorPos tolerates an (unfillable) object argument -------------
+
+    #[test]
+    fn mouse_get_cursor_pos_accepts_an_object_argument() {
+        let _vm_lock = vm_lock();
+        let (e, state) = test_engine();
+        state.lock().unwrap().set_mouse_pos(7, 9);
+        // The ABI has no object property setter, so the port returns the
+        // string form; passing an object must not raise an arity error.
+        assert_eq!(
+            e.eval("Mouse.getCursorPos(%[x:0, y:0])", "test").unwrap(),
+            TjsValue::String("7,9".into())
+        );
+    }
+
+    // -- mouse hold/repeat resets on release, redundant down keeps it -------
+
+    #[test]
+    fn mouse_repeat_resets_on_release_and_ignores_redundant_down() {
+        let _vm_lock = vm_lock();
+        let (e, state) = test_engine();
+
+        // frame 1: press; end_frame bumps hold to 1.
+        {
+            let mut s = state.lock().unwrap();
+            s.begin_frame();
+            s.set_mouse_button(MB_LEFT, true);
+            s.end_frame();
+        }
+        assert_eq!(eval_i(&e, "Mouse.getRepeat(0)"), 1);
+
+        // frame 2: a redundant down (same state) must not reset the count;
+        // end_frame bumps it to 2.
+        {
+            let mut s = state.lock().unwrap();
+            s.begin_frame();
+            s.set_mouse_button(MB_LEFT, true);
+            s.end_frame();
+        }
+        assert_eq!(eval_i(&e, "Mouse.getRepeat(0)"), 2);
+
+        // frame 3: release — repeat drops to 0 immediately.
+        {
+            let mut s = state.lock().unwrap();
+            s.begin_frame();
+            s.set_mouse_button(MB_LEFT, false);
+            s.end_frame();
+        }
+        assert_eq!(eval_i(&e, "Mouse.getRepeat(0)"), 0);
+        assert_eq!(eval_i(&e, "Mouse.getReleased(0)"), 1);
+        assert_eq!(state.lock().unwrap().mouse_button_repeat(MB_LEFT), 0);
+
+        // a spurious release (button already up) is not a release edge.
+        {
+            let mut s = state.lock().unwrap();
+            s.begin_frame();
+            s.set_mouse_button(MB_LEFT, false);
+            s.end_frame();
+        }
+        assert_eq!(eval_i(&e, "Mouse.getReleased(0)"), 0);
+    }
+
+    // -- mouse-button VKs resolve through Key (reference scancode array) ----
+
+    #[test]
+    fn key_resolves_mouse_button_vks() {
+        let _vm_lock = vm_lock();
+        let (e, state) = test_engine();
+        {
+            let mut s = state.lock().unwrap();
+            s.begin_frame();
+            s.set_mouse_button(MB_LEFT, true);
+            s.end_frame();
+        }
+        // The reference scancode array is indexed by VK and covers the mouse
+        // buttons, so System.getKeyState(VK_LBUTTON) sees them; Key mirrors it.
+        assert_eq!(eval_i(&e, "Key.getPressed(Key.kLButton)"), 1);
+        assert_eq!(eval_i(&e, "Key.getPressed(Key.kRButton)"), 0);
+        assert_eq!(eval_i(&e, "Key.kLButton"), 0x01);
+        assert_eq!(eval_i(&e, "Key.kCancel"), 0x03);
+
+        {
+            let mut s = state.lock().unwrap();
+            s.begin_frame();
+            s.set_mouse_button(MB_LEFT, false);
+            s.end_frame();
+        }
+        assert_eq!(eval_i(&e, "Key.getReleased(Key.kLButton)"), 1);
+    }
+
+    // -- gamepad VK_PAD and VK_PADANY aggregation ---------------------------
+
+    #[test]
+    fn key_aggregates_gamepad_buttons_and_pad_any() {
+        let _vm_lock = vm_lock();
+        let (e, state) = test_engine();
+        {
+            let mut s = state.lock().unwrap();
+            s.begin_frame();
+            // feed two concrete pad codes like the host bridge would
+            s.set_key_down(VK_PAD1);
+            s.set_key_down(VK_PADUP);
+            s.end_frame();
+        }
+        assert_eq!(eval_i(&e, "Key.getPressed(Key.kPad1)"), 1);
+        assert_eq!(eval_i(&e, "Key.getPressed(Key.kPadUp)"), 1);
+        assert_eq!(eval_i(&e, "Key.getPressed(Key.kPad2)"), 0);
+        // VK_PADANY is true while any pad button is held (DInputMgn.cpp:696).
+        assert_eq!(eval_i(&e, "Key.getPressed(Key.kPadAny)"), 1);
+        assert_eq!(eval_i(&e, "Key.getRepeat(Key.kPadAny)"), 1);
+        assert_eq!(eval_i(&e, "Key.kPadAny"), 0x1DF);
+        assert_eq!(eval_i(&e, "Key.kPad1"), 0x1C0);
+
+        {
+            let mut s = state.lock().unwrap();
+            s.begin_frame();
+            s.set_key_up(VK_PAD1);
+            s.set_key_up(VK_PADUP);
+            s.end_frame();
+        }
+        assert_eq!(eval_i(&e, "Key.getPressed(Key.kPadAny)"), 0);
+        assert_eq!(eval_i(&e, "Key.getReleased(Key.kPadAny)"), 1);
     }
 
     // -- key constants ------------------------------------------------------
@@ -1060,5 +1442,41 @@ mod tests {
         assert_eq!(state.lock().unwrap().keys.last_pressed, vec![k_left]);
         assert_eq!(state.lock().unwrap().keys.pressed.get(&k_left), Some(&1));
         assert_eq!(eval_i(&e, "Key.getRepeat(Key.kLeft)"), 1);
+    }
+
+    // -- reference TVP_SS_* shift-state mask ---------------------------------
+
+    #[test]
+    fn shift_flags_compose_modifiers_and_buttons() {
+        let _vm_lock = vm_lock();
+        let (_e, state) = test_engine();
+        {
+            let mut s = state.lock().unwrap();
+            s.begin_frame();
+            s.set_key_down(VK_SHIFT);
+            s.set_key_down(VK_CONTROL);
+            s.set_mouse_button(MB_LEFT, true);
+            s.end_frame();
+        }
+        let s = state.lock().unwrap();
+        let flags = s.shift_flags();
+        assert_eq!(flags & TVP_SS_SHIFT, TVP_SS_SHIFT);
+        assert_eq!(flags & TVP_SS_CTRL, TVP_SS_CTRL);
+        assert_eq!(flags & TVP_SS_ALT, 0);
+        assert_eq!(flags & TVP_SS_LEFT, TVP_SS_LEFT);
+        assert_eq!(flags & TVP_SS_RIGHT, 0);
+        assert!(shift_state::any_mouse_button_pressed(flags));
+        assert!(!shift_state::any_mouse_button_pressed(
+            TVP_SS_SHIFT | TVP_SS_ALT
+        ));
+        // the flag values match tvpinputdefs.h
+        assert_eq!(TVP_SS_SHIFT, 0x01);
+        assert_eq!(TVP_SS_ALT, 0x02);
+        assert_eq!(TVP_SS_CTRL, 0x04);
+        assert_eq!(TVP_SS_LEFT, 0x08);
+        assert_eq!(TVP_SS_RIGHT, 0x10);
+        assert_eq!(TVP_SS_MIDDLE, 0x20);
+        assert_eq!(TVP_SS_DOUBLE, 0x40);
+        assert_eq!(TVP_SS_REPEAT, 0x80);
     }
 }

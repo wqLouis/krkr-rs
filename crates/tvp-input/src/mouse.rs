@@ -1,13 +1,15 @@
-//! `Mouse` native class — port of the reference `Mouse` class (in the full
-//! krkrz tree: `core/base/MouseIntf.cpp`, `TVPCreateNativeClass_Mouse`;
-//! not part of this repository's reference subset).
+//! `Mouse` native class — a port compatibility class over the shared
+//! [`crate::InputState`].
 //!
-//! A static class: scripts call `Mouse.method(...)`; the class carries no
-//! instance state. Every method reads (or writes, for `setCursorPos` /
-//! `setVisible`) the shared [`crate::InputState`] the app feeds every
-//! frame — see the crate docs for the frame protocol and the documented
-//! deviations (notably `getCursorPos` returning a `"x,y"` string and
-//! out-of-range buttons returning false instead of raising).
+//! The reference subset has no native `Mouse` class (positions arrive
+//! through the `Window` `onMouseMove`/`onMouseDown` events, and cursor
+//! visibility through `Window.mouseCursorState` / `hideMouseCursor`); this
+//! class follows the common KiriKiri script idiom. It is static: scripts
+//! call `Mouse.method(...)`; the class carries no instance state. Every
+//! method reads (or writes) the shared [`crate::InputState`] the app feeds
+//! every frame — see the crate docs for the frame protocol and the
+//! documented deviations (notably `getCursorPos` returning a `"x,y"` string
+//! and `setCursorPos` queueing a cursor warp for the host bridge).
 
 use std::ffi::{c_char, c_int, c_void};
 
@@ -20,9 +22,11 @@ use crate::{
 
 /// `Mouse.getCursorPos()` → `"x,y"` string.
 ///
-/// The reference takes an object argument and fills its `x`/`y` properties;
-/// the C ABI cannot marshal TJS objects, so this port returns the position
-/// as a `"x,y"` string instead (documented deviation).
+/// The conventional KiriKiri `Mouse.getCursorPos` API fills an object
+/// argument's `x`/`y` properties. The `tjs2-sys` ABI exposes no object
+/// property *setter*, so this port returns the position as a `"x,y"` string
+/// instead. An object argument is accepted and ignored so callers that pass
+/// one still get a value rather than an arity error (documented deviation).
 extern "C" fn native_get_cursor_pos(
     _engine: *mut c_void,
     _argc: c_int,
@@ -63,9 +67,10 @@ extern "C" fn native_get_cursor_y(
 
 /// `Mouse.setCursorPos(x, y)` → void.
 ///
-/// Writes the cursor position back into the shared state (the app can read
-/// it back, e.g. to re-apply it to the OS cursor). The reference requires
-/// two arguments (`TJS_E_BADPARAMCOUNT` otherwise).
+/// Writes the cursor position back into the shared state and queues an
+/// OS-cursor warp request ([`crate::InputState::take_mouse_warp`]) for the
+/// host input bridge to apply. The reference requires two arguments
+/// (`TJS_E_BADPARAMCOUNT` otherwise).
 extern "C" fn native_set_cursor_pos(
     _engine: *mut c_void,
     argc: c_int,
@@ -79,7 +84,7 @@ extern "C" fn native_set_cursor_pos(
     let a = args(argv, argc);
     let x = value_as_i64(&a[0]) as i32;
     let y = value_as_i64(&a[1]) as i32;
-    with_state(|s| s.set_mouse_pos(x, y));
+    with_state(|s| s.warp_mouse_pos(x, y));
     set_void_out(out);
     0
 }
