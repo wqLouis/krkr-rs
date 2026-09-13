@@ -96,14 +96,10 @@ extern "C" fn csv_parser_init_storage(
             return 1;
         }
     };
-    // CSV data is UTF-8 or CP932; decode tolerantly.
-    let text = match String::from_utf8(bytes.clone()) {
-        Ok(t) => t,
-        Err(_) => match decode_cp932_lossy(&bytes) {
-            Ok(t) => t,
-            Err(_) => String::from_utf8_lossy(&bytes).into_owned(),
-        },
-    };
+    // CSV data is usually UTF-8, UTF-16 (with a BOM) or CP932. The
+    // reference detects the encoding with uchardet (which maps Shift_JIS to
+    // cp932); `charData.csv` in the reference game is Windows-31J.
+    let text = decode_text_lossy(&bytes);
     inst.lines = text
         .split('\n')
         .map(|l| l.trim_end_matches('\r').to_string())
@@ -176,13 +172,28 @@ pub fn register_csv_parser(engine: &Tjs2Engine) -> Result<(), String> {
     })
 }
 
-/// A UTF-8→CP932-lossy helper (used when the CSV is not UTF-8).
-pub(crate) fn decode_cp932_lossy(bytes: &[u8]) -> Result<String, String> {
-    // tvp-util's encoding module is the canonical decoder; this crate does
-    // not depend on it, so implement a minimal pass-through here (the game's
-    // charData.csv is UTF-8 in practice).
-    let _ = bytes;
-    Err("cp932 decode unavailable".into())
+/// Decode a text storage to UTF-8, honoring a leading BOM and falling back
+/// to CP932 when the bytes are not valid UTF-8.
+///
+/// This mirrors the reference's `TextStream.cpp` behavior (BOM detection,
+/// then `uchardet`, which reports Shift_JIS as `cp932`). It is
+/// **infallible**: undecodable bytes are replaced with U+FFFD, so a corrupt
+/// CSV never aborts `CharDataInit`.
+pub(crate) fn decode_text_lossy(bytes: &[u8]) -> String {
+    // A BOM pins the encoding exactly (UTF-8/16/32).
+    let (body, bom) = tvp_util::encoding::strip_bom(bytes);
+    if let Some(encoding) = bom
+        && let Ok(text) = encoding.decode(body)
+    {
+        return text;
+    }
+    if let Ok(text) = std::str::from_utf8(body) {
+        return text.to_owned();
+    }
+    // CP932 (Windows-31J) is the effective result for Japanese game data;
+    // `encoding_rs` substitutes U+FFFD for invalid sequences.
+    let (text, _, _) = encoding_rs::SHIFT_JIS.decode(body);
+    text.into_owned()
 }
 
 thread_local! {
@@ -221,4 +232,59 @@ pub(crate) fn set_array_strings_out(out: *mut Value, items: &[String]) {
             (*out).array_count = slot.0.len() as c_int;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decodes_utf8_with_and_without_bom() {
+        assert_eq!(decode_text_lossy(b"a,b\n1,2"), "a,b\n1,2");
+        let mut bom = tvp_util::encoding::UTF8_BOM.to_vec();
+        bom.extend_from_slice("名前,値".as_bytes());
+        assert_eq!(decode_text_lossy(&bom), "名前,値");
+    }
+
+    #[test]
+    fn decodes_utf16le_with_bom() {
+        let mut bytes = tvp_util::encoding::UTF16LE_BOM.to_vec();
+        bytes.extend_from_slice(
+            &"名前,値"
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(decode_text_lossy(&bytes), "名前,値");
+    }
+
+    #[test]
+    fn decodes_cp932_japanese() {
+        // "キャラ名,テスト" in Windows-31J (cp932). This is the actual encoding
+        // of the reference game's `system/charData.csv`.
+        let cp932 = [
+            0x83, 0x4c, 0x83, 0x83, 0x83, 0x89, 0x96, 0xbc, 0x2c, 0x83, 0x65, 0x83, 0x58, 0x83,
+            0x67,
+        ];
+        assert_eq!(decode_text_lossy(&cp932), "キャラ名,テスト");
+        // A CP932 string that also happens to contain an ASCII comma still
+        // decodes (the comma is a normal byte in the legacy encoding).
+        assert!(decode_text_lossy(&cp932).contains(','));
+    }
+
+    #[test]
+    fn invalid_bytes_are_replaced_not_panicked() {
+        // 0xFF is not a valid CP932 lead byte; the decoder must not panic and
+        // must yield a replacement character.
+        let text = decode_text_lossy(&[b'a', 0xFF, b'b']);
+        assert!(text.starts_with('a') && text.ends_with('b'));
+        assert!(text.contains('\u{FFFD}'), "got {text:?}");
+    }
+
+    #[test]
+    fn csv_line_parsing_quotes_and_commas() {
+        assert_eq!(parse_csv_line("a,b,c"), ["a", "b", "c"]);
+        assert_eq!(parse_csv_line("\"a,b\",c"), ["a,b", "c"]);
+        assert_eq!(parse_csv_line("\"a\"\"b\",c"), ["a\"b", "c"]);
+    }
 }

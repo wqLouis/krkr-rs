@@ -59,21 +59,32 @@ pub const SEGM_ENCODE_RAW: u32 = 0;
 pub const SEGM_ENCODE_ZLIB: u32 = 1;
 
 /// Normalize an in-archive storage name the way the reference engine does:
-/// lowercase, `\` → `/`, collapse runs of `/` (a single leading `/` is kept).
+/// lowercase, `\` → `/`, collapse runs of `/`, and **drop leading slashes**.
+///
+/// This mirrors `tTVPArchive::NormalizeInArchiveStorageName`
+/// (`reference/cpp/core/base/StorageIntf.cpp:566`): the very first `/` is
+/// skipped together with any following ones (the reference only emits a slash
+/// once `ptr != org_ptr`, i.e. after the first non-slash byte).
 pub fn normalize_in_archive_name(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
-    let mut chars = name.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            'A'..='Z' => out.push(c.to_ascii_lowercase()),
-            '\\' => out.push('/'),
-            '/' => {
+    let mut started = false;
+    let mut prev_slash = false;
+    for c in name.chars() {
+        let c = match c {
+            'A'..='Z' => c.to_ascii_lowercase(),
+            '\\' => '/',
+            _ => c,
+        };
+        if c == '/' {
+            // Leading slashes are dropped; interior runs collapse to one.
+            if started && !prev_slash {
                 out.push('/');
-                while chars.peek() == Some(&'/') {
-                    chars.next();
-                }
+                prev_slash = true;
             }
-            _ => out.push(c),
+        } else {
+            out.push(c);
+            started = true;
+            prev_slash = false;
         }
     }
     out

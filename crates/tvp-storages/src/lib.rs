@@ -34,18 +34,18 @@
 //! | `clearArchiveCache()` | no-op (nothing is cached yet). |
 //! | `stat(name)` / `fstat(name)` | a TJS dictionary with disk size and Date
 //!   timestamps, or archive-entry size. |
+//! | `selectFile(param)` | no headless GUI dialog exists, so behaves like a
+//!   user cancel: leaves `param` untouched and returns `false`. |
 //!
 //! # Pending (registered, but raise a clear TJS error)
 //!
 //! - `open(name, flags)` — needs a stream object return value.
 //! - `searchCD(label)` — CD-volume search; disabled in the reference.
-//! - `selectFile(...)` — GUI file selector; platform-specific.
 //!
-//! # Return-value note for `getFileList`
+//! # Return value of `getFileList`
 //!
-//! The FFI cannot return TJS arrays yet, so `getFileList` returns a single
-//! string of newline-joined storage names (no trailing newline). Returning a
-//! real TJS Array needs array marshaling in `tjs2-sys` (landing in parallel).
+//! `getFileList` returns a real TJS `Array` of storage-name strings (the same
+//! `VAL_ARRAY` marshaling `CSVParser.getNextLine` uses), sorted and deduped.
 //!
 //! # Process-global state
 //!
@@ -448,10 +448,10 @@ pub const ATTR_NORMAL: i64 = 0x20;
 ///   `arc.xp3>path`.
 /// - `attr` filters the results: `0` (omitted) or `0x20` → regular files;
 ///   `0x10` → directories (emitted with a trailing `/`); bits OR together.
-/// - The result is sorted and deduped.
+/// - The result is sorted and deduped, and returned as a TJS `Array`.
 ///
-/// The FFI cannot return TJS arrays yet, so the native wrapper joins these
-/// names with `\n` into one string (see the crate docs).
+/// The native wrapper marshals these names as a `VAL_ARRAY` (the same path
+/// `CSVParser.getNextLine` uses).
 fn get_file_list(mask: &str, attr: i64) -> Vec<String> {
     let mask = normalize_storage_name(mask);
     let (arc_pat, in_arc_mask) = match mask.split_once('>') {
@@ -755,7 +755,7 @@ extern "C" fn native_get_file_list(
     };
     let attr = args.get(1).and_then(arg_i64).unwrap_or(0);
     let names = get_file_list(&mask, attr);
-    set_string_out(out, &names.join("\n"));
+    csv_parser::set_array_strings_out(out, &names);
     0
 }
 
@@ -956,11 +956,24 @@ native_pending!(
     "searchCD",
     "CD volume search is platform-specific and disabled in the reference"
 );
-native_pending!(
-    native_select_file,
-    "selectFile",
-    "GUI file selection is platform-specific"
-);
+
+/// `Storages.selectFile(param)` — the built-in GUI file selector.
+///
+/// This port has no portable headless file dialog, so it behaves like a user
+/// cancel in the reference (`TVPSelectFile` returns false): `param.name` is
+/// left untouched and the native returns `0`. The game's editor-launch path
+/// then falls back to its default editor. This is a documented remaining gap,
+/// not a silent success (see `docs/missing/07-text-storage.md`).
+extern "C" fn native_select_file(
+    _engine: *mut c_void,
+    _argc: c_int,
+    _argv: *const Value,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+) -> c_int {
+    set_int_out(out, 0);
+    0
+}
 
 // ---------------------------------------------------------------------------
 // Registration
@@ -1404,13 +1417,15 @@ mod tests {
         let engine = engine_with_storages();
 
         let list = |mask: &str, attr: Option<i64>| {
-            let expr = match attr {
+            let call = match attr {
                 Some(a) => format!("Storages.getFileList({}, {a})", js_str(mask)),
                 None => format!("Storages.getFileList({})", js_str(mask)),
             };
+            // The native returns a TJS Array; join it in-script so the test
+            // can assert on a plain string result.
+            let expr = format!("{call}.join('\\n')");
             match engine.eval(&expr, "t").unwrap() {
                 TjsValue::String(s) => s.split('\n').map(str::to_string).collect::<Vec<_>>(),
-                TjsValue::Retained(_) => panic!("expected a string, got retained"),
                 other => panic!("expected a string, got {other:?}"),
             }
         };
@@ -1440,6 +1455,51 @@ mod tests {
         // attr 0x20 lists normal files (the default behavior)
         let names = list("*.tjs", Some(0x20));
         assert!(names.contains(&"a.tjs".to_string()));
+
+        // The native really returns a TJS Array (not a joined string): it has
+        // a `.count` and indexes like any Array.
+        assert_eq!(
+            engine
+                .eval("Storages.getFileList('*.tjs').count", "t")
+                .unwrap(),
+            TjsValue::Integer(3)
+        );
+        assert_eq!(
+            engine
+                .eval("Storages.getFileList('*.tjs')[0]", "t")
+                .unwrap(),
+            TjsValue::String("a.tjs".into())
+        );
+    }
+
+    #[test]
+    fn csv_parser_decodes_cp932_storage_end_to_end() {
+        let _vm_lock = vm_lock();
+        reset_globals();
+        // `system/charData.csv` in the reference game is Windows-31J (cp932),
+        // not UTF-8. Build a minimal two-row CSV with a Japanese name and run
+        // it through the same `initStorage`/`getNextLine` flow `CharDataInit`
+        // uses.
+        let dir = TempDir::new("csv-cp932");
+        let mut csv = Vec::new();
+        csv.extend_from_slice(b"index,name\n");
+        csv.extend_from_slice(b"0,");
+        // "キャラ名" in cp932.
+        csv.extend_from_slice(&[0x83, 0x4c, 0x83, 0x83, 0x83, 0x89, 0x96, 0xbc]);
+        fs::write(dir.path().join("charData.csv"), &csv).unwrap();
+        let storage = Storage::mount(dir.path()).unwrap();
+        set_storage(Some(Arc::new(Mutex::new(storage))));
+        let engine = engine_with_storages();
+
+        let result = engine
+            .eval(
+                "(function(){ var c = new CSVParser(); c.initStorage('charData.csv'); \
+                 var h = c.getNextLine(); var r = c.getNextLine(); \
+                 return h[1] + ':' + r[1]; })()",
+                "t",
+            )
+            .unwrap();
+        assert_eq!(result, TjsValue::String("name:キャラ名".into()));
     }
 
     #[test]
@@ -1665,12 +1725,17 @@ mod tests {
             TjsValue::Integer(5)
         );
 
-        // The remaining fstat methods are still intentionally unimplemented.
-        for expr in [
-            "Storages.open('a.tjs')",
-            "Storages.searchCD('LABEL')",
-            "Storages.selectFile('dialog')",
-        ] {
+        // `selectFile` cannot show a headless dialog, so it degrades like a
+        // user cancel (returns false/0) instead of raising.
+        assert_eq!(
+            engine
+                .eval("Storages.selectFile(%[name:'', title:'x'])", "t")
+                .unwrap(),
+            TjsValue::Integer(0)
+        );
+
+        // `open` and `searchCD` are still intentionally unimplemented.
+        for expr in ["Storages.open('a.tjs')", "Storages.searchCD('LABEL')"] {
             let err = engine.eval(expr, "t").unwrap_err();
             assert!(
                 err.to_string().contains("not implemented"),

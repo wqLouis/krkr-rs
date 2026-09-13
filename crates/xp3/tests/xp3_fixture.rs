@@ -98,23 +98,54 @@ impl Builder {
 
         let mut out = self.file;
         let index_ofs = out.len() as u64;
+        out.extend_from_slice(&encode_index_block(index_flags, &index_data));
+        out[11..19].copy_from_slice(&index_ofs.to_le_bytes());
+        out
+    }
 
-        out.push(index_flags);
-        match index_flags & 0x07 {
-            INDEX_ENCODE_RAW => {
-                out.extend_from_slice(&(index_data.len() as u64).to_le_bytes());
-                out.extend_from_slice(&index_data);
+    /// Finish the archive with several **chained** index blocks, splitting
+    /// `file_chunks` according to `per_block` (one count per block; extra
+    /// chunks go into the last block). Each non-final block sets
+    /// `INDEX_CONTINUE` and is followed by a u64 pointer to the next block,
+    /// matching the reference `XP3Archive.cpp` chain layout.
+    fn finish_chained(self, index_flags: u8, per_block: &[usize]) -> Vec<u8> {
+        let mut blocks: Vec<Vec<u8>> = Vec::new();
+        let mut next = 0usize;
+        for &count in per_block {
+            let mut data = Vec::new();
+            for _ in 0..count {
+                if next < self.file_chunks.len() {
+                    data.extend_from_slice(&self.file_chunks[next]);
+                    next += 1;
+                }
             }
-            INDEX_ENCODE_ZLIB => {
-                let compressed = zlib(&index_data);
-                out.extend_from_slice(&(compressed.len() as u64).to_le_bytes());
-                out.extend_from_slice(&(index_data.len() as u64).to_le_bytes());
-                out.extend_from_slice(&compressed);
+            blocks.push(data);
+        }
+        if next < self.file_chunks.len() {
+            let last = blocks.last_mut().expect("at least one block");
+            while next < self.file_chunks.len() {
+                last.extend_from_slice(&self.file_chunks[next]);
+                next += 1;
             }
-            other => panic!("unsupported index flag bits: 0x{other:02x}"),
         }
 
-        out[11..19].copy_from_slice(&index_ofs.to_le_bytes());
+        let mut out = self.file;
+        let first = out.len() as u64;
+        for (i, data) in blocks.iter().enumerate() {
+            let last = i + 1 == blocks.len();
+            let flag = if last {
+                index_flags
+            } else {
+                index_flags | 0x80 // INDEX_CONTINUE
+            };
+            out.extend_from_slice(&encode_index_block(flag, data));
+            if !last {
+                // The next block starts after this 8-byte pointer.
+                let next_ofs = out.len() as u64 + 8;
+                out.extend_from_slice(&next_ofs.to_le_bytes());
+            }
+        }
+        out[11..19].copy_from_slice(&first.to_le_bytes());
         out
     }
 }
@@ -176,6 +207,27 @@ fn zlib(data: &[u8]) -> Vec<u8> {
     let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
     enc.write_all(data).unwrap();
     enc.finish().unwrap()
+}
+
+/// Encode one index block: flag byte, then (raw) size + data or (zlib)
+/// compressed/real sizes + stream.
+fn encode_index_block(flag: u8, index_data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(flag);
+    match flag & 0x07 {
+        INDEX_ENCODE_RAW => {
+            out.extend_from_slice(&(index_data.len() as u64).to_le_bytes());
+            out.extend_from_slice(index_data);
+        }
+        INDEX_ENCODE_ZLIB => {
+            let compressed = zlib(index_data);
+            out.extend_from_slice(&(compressed.len() as u64).to_le_bytes());
+            out.extend_from_slice(&(index_data.len() as u64).to_le_bytes());
+            out.extend_from_slice(&compressed);
+        }
+        other => panic!("unsupported index flag bits: 0x{other:02x}"),
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -253,6 +305,27 @@ fn zlib_compressed_index() {
         assert_eq!(arc.len(), 100);
         assert_eq!(arc.read("file_042.dat").unwrap(), b"content of file 042");
         assert_eq!(arc.read("FILE_000.DAT").unwrap(), b"content of file 000");
+    });
+}
+
+#[test]
+fn chained_index_blocks_are_concatenated() {
+    // Two index blocks linked with INDEX_CONTINUE: the first holds `a.txt`,
+    // the second `b.txt`. The reader must follow the offset stored right after
+    // the first block (not re-read the initial pointer at offset 11).
+    let mut b = Builder::new();
+    let seg1 = b.raw_segment(b"first");
+    b.add_file("a.txt", 0, 0, vec![seg1]);
+    let seg2 = b.raw_segment(b"second");
+    b.add_file("b.txt", 0, 0, vec![seg2]);
+    let bytes = b.finish_chained(INDEX_ENCODE_RAW, &[1, 1]);
+
+    with_archive(&bytes, |arc| {
+        assert_eq!(arc.len(), 2);
+        let names: Vec<&str> = arc.entries().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["a.txt", "b.txt"]);
+        assert_eq!(arc.read("a.txt").unwrap(), b"first");
+        assert_eq!(arc.read("b.txt").unwrap(), b"second");
     });
 }
 

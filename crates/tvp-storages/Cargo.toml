@@ -9,4 +9,5 @@ license.workspace = true
 tjs2-sys = { workspace = true }
 engine = { path = "../engine" }
 tvp-util = { path = "../tvp-util" }
+encoding_rs = "0.8"
 log = "0.4"

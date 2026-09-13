@@ -33,8 +33,11 @@
 //! * `tTJSBinaryStream::ReadBuffer(_, 0)` reads everything remaining;
 //!   here that is [`BinaryStream::read_to_end`].
 //! * Text input detects the BOM (`EF BB BF` → UTF-8, `FF FE` →
-//!   UTF-16LE, `FE FF` → UTF-16BE); a BOM-less stream is UTF-8, matching
-//!   `G_DefaultReadEncoding = "UTF-8"` in this codebase.
+//!   UTF-16LE, `FE FF` → UTF-16BE, and the UTF-32 BOMs). A BOM-less
+//!   stream is decoded as UTF-8 when the bytes are valid UTF-8, else as
+//!   CP932 (Windows-31J) when valid, mirroring the reference's
+//!   `uchardet`-based detection (`TextStream.cpp` reports Shift_JIS as
+//!   `cp932`). `G_DefaultReadEncoding` is `"UTF-8"`.
 //! * Text input treats `CRLF`, lone `CR` and lone `LF` all as line
 //!   terminators and normalizes them to `\n`.
 //! * Text output defaults to CRLF line endings, matching the
@@ -69,6 +72,15 @@ pub enum Error {
     /// are replaced with U+FFFD, see [`text`]).
     #[error("input is not valid UTF-8: {0}")]
     InvalidUtf8(#[from] std::string::FromUtf8Error),
+
+    /// A legacy/UTF-32 encoding could not decode the input bytes.
+    #[error("cannot decode text as {encoding}: {message}")]
+    Decode {
+        /// Canonical name of the encoding that failed.
+        encoding: &'static str,
+        /// The underlying decoder message.
+        message: String,
+    },
 }
 
 /// Convenience alias for [`Error`].

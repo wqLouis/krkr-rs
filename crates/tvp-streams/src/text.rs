@@ -42,32 +42,74 @@ pub const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
 /// A character encoding detected from (or forced on) a text stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Encoding {
-    /// UTF-8 (the default when no BOM is present).
+    /// UTF-8 (the default when no BOM is present and the bytes are valid
+    /// UTF-8).
     Utf8,
     /// UTF-16 little-endian.
     Utf16Le,
     /// UTF-16 big-endian.
     Utf16Be,
+    /// UTF-32 little-endian.
+    Utf32Le,
+    /// UTF-32 big-endian.
+    Utf32Be,
+    /// CP932, i.e. Windows-31J (Shift_JIS + NEC/IBM extensions) — the
+    /// encoding of Japanese KiriKiri text files without a BOM.
+    Cp932,
+    /// WHATWG GBK (GB2312 superset, CP936 areas).
+    Gbk,
 }
 
 impl Encoding {
-    /// The BOM bytes for this encoding, if it has one.
+    /// The BOM bytes for this encoding, if it has one. CP932 and GBK have no
+    /// BOM (they are detected by content, like the reference `uchardet`).
     pub fn bom(self) -> Option<&'static [u8]> {
         match self {
             Encoding::Utf8 => Some(&UTF8_BOM),
             Encoding::Utf16Le => Some(&[0xFF, 0xFE]),
             Encoding::Utf16Be => Some(&[0xFE, 0xFF]),
+            Encoding::Utf32Le => Some(&[0xFF, 0xFE, 0x00, 0x00]),
+            Encoding::Utf32Be => Some(&[0x00, 0x00, 0xFE, 0xFF]),
+            Encoding::Cp932 | Encoding::Gbk => None,
         }
+    }
+
+    /// The canonical name, matching the strings `TextStream.cpp` uses
+    /// (`"UTF-8"`, `"UTF-16LE"`, ...).
+    pub fn name(self) -> &'static str {
+        match self {
+            Encoding::Utf8 => "UTF-8",
+            Encoding::Utf16Le => "UTF-16LE",
+            Encoding::Utf16Be => "UTF-16BE",
+            Encoding::Utf32Le => "UTF-32LE",
+            Encoding::Utf32Be => "UTF-32BE",
+            Encoding::Cp932 => "cp932",
+            Encoding::Gbk => "GBK",
+        }
+    }
+
+    /// The corresponding [`tvp_util::encoding::Encoding`] for the encodings
+    /// this crate delegates to it (legacy + UTF-32).
+    fn util(self) -> Option<tvp_util::encoding::Encoding> {
+        use tvp_util::encoding::Encoding as U;
+        Some(match self {
+            Encoding::Utf32Le => U::Utf32Le,
+            Encoding::Utf32Be => U::Utf32Be,
+            Encoding::Cp932 => U::Cp932,
+            Encoding::Gbk => U::Gbk,
+            Encoding::Utf8 | Encoding::Utf16Le | Encoding::Utf16Be => return None,
+        })
     }
 }
 
 /// Detect the encoding from a leading byte-order mark.
 ///
 /// Returns the encoding and the BOM length in bytes, or `None` if there
-/// is no recognizable BOM (the caller then defaults to UTF-8, like the
-/// C++ `G_DefaultReadEncoding`). The checks follow `checkTextEncoding`
-/// in `TextStream.cpp` (UTF-16LE before UTF-16BE before UTF-8; the byte
-/// patterns are disjoint so the order only matters for exactness).
+/// is no recognizable BOM (the caller then sniffs the content, defaulting
+/// to UTF-8/CP932). The checks follow `checkTextEncoding` in
+/// `TextStream.cpp` (UTF-16LE before UTF-16BE before UTF-8, then the
+/// UTF-32 BOMs); because the UTF-32LE BOM starts with the UTF-16LE BOM
+/// pattern, it is (as in the reference) matched as UTF-16LE.
 pub fn detect_bom(bytes: &[u8]) -> Option<(Encoding, usize)> {
     if bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE {
         Some((Encoding::Utf16Le, 2))
@@ -75,8 +117,32 @@ pub fn detect_bom(bytes: &[u8]) -> Option<(Encoding, usize)> {
         Some((Encoding::Utf16Be, 2))
     } else if bytes.len() >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF {
         Some((Encoding::Utf8, 3))
+    } else if bytes.len() >= 4
+        && bytes[0] == 0x00
+        && bytes[1] == 0x00
+        && bytes[2] == 0xFE
+        && bytes[3] == 0xFF
+    {
+        Some((Encoding::Utf32Be, 4))
     } else {
         None
+    }
+}
+
+/// Sniff a BOM-less byte sequence the way the reference's `uchardet` step
+/// does for the common cases: valid UTF-8 wins, then valid CP932 (reported as
+/// `cp932`). Anything else is treated as UTF-8 so the strict decoder reports a
+/// clear error rather than silently mangling binary data.
+pub fn detect_encoding(bytes: &[u8]) -> (Encoding, usize) {
+    if let Some(found) = detect_bom(bytes) {
+        return found;
+    }
+    if std::str::from_utf8(bytes).is_ok() {
+        (Encoding::Utf8, 0)
+    } else if tvp_util::encoding::is_valid_cp932(bytes) {
+        (Encoding::Cp932, 0)
+    } else {
+        (Encoding::Utf8, 0)
     }
 }
 
@@ -86,6 +152,16 @@ fn decode(bytes: &[u8], encoding: Encoding) -> Result<String> {
         Encoding::Utf8 => String::from_utf8(bytes.to_vec()).map_err(Error::from),
         Encoding::Utf16Le => decode_utf16(bytes, false),
         Encoding::Utf16Be => decode_utf16(bytes, true),
+        // Legacy and UTF-32 use the canonical tvp-util decoders (strict), so
+        // `G_DefaultReadEncoding`/`uchardet` results behave like the
+        // reference's `boost::locale::conv` conversions.
+        other => {
+            let util = other.util().expect("only delegated encodings reach here");
+            util.decode(bytes).map_err(|e| Error::Decode {
+                encoding: other.name(),
+                message: e.to_string(),
+            })
+        }
     }
 }
 
@@ -141,12 +217,31 @@ pub struct TextReadStream<S: BinaryStream> {
 }
 
 impl<S: BinaryStream> TextReadStream<S> {
-    /// Read all remaining bytes of `inner`, detect the encoding from the
-    /// BOM (defaulting to UTF-8), decode and normalize line endings.
+    /// Read all remaining bytes of `inner`, detect the encoding (BOM, else
+    /// UTF-8/CP932 content sniffing), decode and normalize line endings.
     pub fn open(mut inner: S) -> Result<Self> {
         let mut raw = Vec::new();
         inner.read_to_end(&mut raw)?;
-        let (encoding, bom_size) = detect_bom(&raw).unwrap_or((Encoding::Utf8, 0));
+        let (encoding, bom_size) = detect_encoding(&raw);
+        let text = normalize_line_endings(&decode(&raw[bom_size..], encoding)?);
+        Ok(Self {
+            inner,
+            encoding,
+            text,
+            pos: 0,
+        })
+    }
+
+    /// Like [`open`](Self::open) but forces `encoding` instead of sniffing
+    /// (a BOM matching `encoding` is still stripped). This is the analogue of
+    /// the reference's configurable `G_DefaultReadEncoding`.
+    pub fn open_as(mut inner: S, encoding: Encoding) -> Result<Self> {
+        let mut raw = Vec::new();
+        inner.read_to_end(&mut raw)?;
+        let bom_size = match detect_bom(&raw) {
+            Some((detected, len)) if detected == encoding => len,
+            _ => 0,
+        };
         let text = normalize_line_endings(&decode(&raw[bom_size..], encoding)?);
         Ok(Self {
             inner,
@@ -402,17 +497,84 @@ mod tests {
         assert_eq!(r.read_to_end().unwrap(), text);
     }
 
+    // --- non-BOM encodings --------------------------------------------
+
     #[test]
-    fn invalid_utf8_is_an_error() {
-        // 0xC3 followed by a non-continuation byte is invalid UTF-8, and
-        // there is no BOM to deflect it to UTF-16
-        let err = TextReadStream::open(MemoryStream::from_bytes(&[0xC3, 0x28])).unwrap_err();
-        assert!(matches!(err, Error::InvalidUtf8(_)));
-        // ...and a UTF-8 BOM does not excuse invalid continuation bytes
+    fn cp932_without_bom_is_detected() {
+        // "キャラ名" in Windows-31J (cp932), no BOM: the reference's uchardet
+        // step reports Shift_JIS as cp932.
+        let bytes = [0x83, 0x4c, 0x83, 0x83, 0x83, 0x89, 0x96, 0xbc];
+        let mut r = read(&bytes);
+        assert_eq!(r.encoding(), Encoding::Cp932);
+        assert_eq!(r.read_to_end().unwrap(), "キャラ名");
+    }
+
+    #[test]
+    fn gbk_without_bom_decodes_when_forced() {
+        let bytes = [0xd6, 0xd0, 0xce, 0xc4, 0xb2, 0xe2, 0xca, 0xd4]; // "中文测试" GBK
+        let mut r = TextReadStream::open_as(MemoryStream::from_bytes(&bytes), Encoding::Gbk)
+            .expect("gbk decode");
+        assert_eq!(r.encoding(), Encoding::Gbk);
+        assert_eq!(r.read_to_end().unwrap(), "中文测试");
+    }
+
+    #[test]
+    fn explicit_encoding_forces_a_bomless_utf8_stream() {
+        // Valid UTF-8 would sniff as UTF-8, but open_as must honor the caller.
+        let mut r =
+            TextReadStream::open_as(MemoryStream::from_bytes("abc".as_bytes()), Encoding::Cp932)
+                .unwrap();
+        assert_eq!(r.encoding(), Encoding::Cp932);
+        assert_eq!(r.read_to_end().unwrap(), "abc");
+    }
+
+    #[test]
+    fn utf32be_with_bom_decodes() {
+        let text = "日本語";
+        let mut bytes = vec![0x00, 0x00, 0xFE, 0xFF];
+        for c in text.chars() {
+            bytes.extend_from_slice(&(c as u32).to_be_bytes());
+        }
+        assert_eq!(detect_bom(&bytes), Some((Encoding::Utf32Be, 4)));
+        let mut r =
+            TextReadStream::open_as(MemoryStream::from_bytes(&bytes), Encoding::Utf32Be).unwrap();
+        assert_eq!(r.encoding(), Encoding::Utf32Be);
+        assert_eq!(r.read_to_end().unwrap(), text);
+    }
+
+    #[test]
+    fn invalid_legacy_sequence_is_a_clear_error() {
+        // 0xFF is not a valid CP932 lead byte; forcing CP932 must report a
+        // `Decode` error (not panic).
+        let err = TextReadStream::open_as(MemoryStream::from_bytes(&[0xFF, 0xFF]), Encoding::Cp932)
+            .unwrap_err();
+        match err {
+            Error::Decode { encoding, .. } => assert_eq!(encoding, "cp932"),
+            other => panic!("expected Error::Decode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invalid_utf8_is_decoded_as_cp932_or_errors() {
+        // 0xC3 is a valid single-byte CP932 half-width katakana (0xA1..0xDF),
+        // so `0xC3 0x28` is no longer an error: it sniffs as CP932 and yields
+        // half-width katakana + '('. This is the reference's uchardet behavior
+        // (Shift_JIS -> cp932) applied to BOM-less input.
+        let mut r = read(&[0xC3, 0x28]);
+        assert_eq!(r.encoding(), Encoding::Cp932);
+        assert_eq!(r.read_to_end().unwrap(), "ﾃ(");
+
+        // 0xFF is invalid as both UTF-8 and CP932, so content sniffing falls
+        // back to UTF-8 and reports a clear error.
+        let err = TextReadStream::open(MemoryStream::from_bytes(&[0xFF, 0xFF])).unwrap_err();
+        assert!(matches!(err, Error::InvalidUtf8(_)), "got {err:?}");
+
+        // A UTF-8 BOM pins the encoding, so invalid continuation bytes are
+        // still an error (the sniffing fallback must not override the BOM).
         let mut bytes = UTF8_BOM.to_vec();
-        bytes.extend_from_slice(&[0xC3, 0x28]);
+        bytes.extend_from_slice(&[0xFF, 0xFF]);
         let err = TextReadStream::open(MemoryStream::from_bytes(&bytes)).unwrap_err();
-        assert!(matches!(err, Error::InvalidUtf8(_)));
+        assert!(matches!(err, Error::InvalidUtf8(_)), "got {err:?}");
     }
 
     // --- line endings --------------------------------------------------

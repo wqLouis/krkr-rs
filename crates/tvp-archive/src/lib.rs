@@ -322,7 +322,7 @@ mod tests {
         );
         assert_eq!(
             normalize_in_archive_name("//leading/slash"),
-            "/leading/slash"
+            "leading/slash"
         );
     }
 }

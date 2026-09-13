@@ -157,8 +157,12 @@ impl Xp3Archive {
     // -- internals ----------------------------------------------------------
 
     /// Read the (possibly chained) index blocks, replicating the reference
-    /// engine's loop: the next index offset is re-read from position 11.
+    /// engine's loop (`XP3Archive.cpp:349`): the first index offset is read
+    /// from offset 11, and after a block with `INDEX_CONTINUE` the **next**
+    /// offset is read from the current position (immediately after that
+    /// block's data).
     fn read_index(&mut self) -> Result<()> {
+        self.file.seek(SeekFrom::Start(self.base + 11))?;
         let mut chain = 0usize;
         loop {
             chain += 1;
@@ -166,7 +170,6 @@ impl Xp3Archive {
                 return Err(Error::IndexChainTooLong(chain));
             }
 
-            self.file.seek(SeekFrom::Start(self.base + 11))?;
             let index_ofs = read_u64_le(&mut self.file)?;
             if index_ofs == 0 {
                 if self.entries.is_empty() {
@@ -197,6 +200,9 @@ impl Xp3Archive {
 
             self.parse_index(&data)?;
 
+            // On CONTINUE the stream is left right after this block's data,
+            // where the next index offset is stored; the next loop iteration
+            // reads it from there.
             if flag & INDEX_CONTINUE == 0 {
                 break;
             }
@@ -367,9 +373,14 @@ mod tests {
             normalize_in_archive_name("data//bg///a.jpg"),
             "data/bg/a.jpg"
         );
+        // Leading slashes are dropped (reference only keeps a slash after the
+        // first non-slash byte).
         assert_eq!(
             normalize_in_archive_name("//leading/slash"),
-            "/leading/slash"
+            "leading/slash"
         );
+        assert_eq!(normalize_in_archive_name("/leading"), "leading");
+        assert_eq!(normalize_in_archive_name("/"), "");
+        assert_eq!(normalize_in_archive_name("a//b"), "a/b");
     }
 }

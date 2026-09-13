@@ -93,13 +93,18 @@ pub struct PrerenderedGlyph {
 }
 
 impl PrerenderedGlyph {
-    /// Horizontal advance in pixels (reference `CellIncX`, falling back to the
-    /// dedicated `Inc` field).
+    /// Horizontal advance in pixels.
+    ///
+    /// Prefers the reference `CellIncX` (what `TVPGetCharacter` uses to
+    /// advance the pen while drawing, `LayerBitmapImpl.cpp:283`), falling back
+    /// to the dedicated `Inc` field. The two differ only for the rare no-ink
+    /// `∥` (U+2225) glyph in a few shipped `.tft` files; preferring `IncX`
+    /// keeps the drawn glyph positions identical to the reference.
     pub fn advance(&self) -> i32 {
-        if self.inc != 0 {
-            self.inc as i32
-        } else {
+        if self.inc_x != 0 {
             self.inc_x as i32
+        } else {
+            self.inc as i32
         }
     }
 }
@@ -324,11 +329,16 @@ mod tests {
 
     /// Build a minimal version-1 `.tft` with one glyph for `ch`.
     fn build_tft(ch: char, w: u16, h: u16, coverage: &[u8]) -> Vec<u8> {
+        build_tft_version(ch, w, h, coverage, 1)
+    }
+
+    /// Build a minimal `.tft` of the given version with one glyph for `ch`.
+    fn build_tft_version(ch: char, w: u16, h: u16, coverage: &[u8], version: u8) -> Vec<u8> {
         let ch_index = HEADER_LEN + coverage.len();
         let index = ch_index + 2;
         let mut data = vec![0u8; index + ITEM_LEN];
         data[..22].copy_from_slice(MAGIC);
-        data[22] = 1; // version
+        data[22] = version;
         data[23] = 2; // 16-bit unicode
         data[24..28].copy_from_slice(&1u32.to_le_bytes());
         data[28..32].copy_from_slice(&(ch_index as u32).to_le_bytes());
@@ -343,6 +353,39 @@ mod tests {
         item[10..12].copy_from_slice(&(h as i16).to_le_bytes()); // origin_y
         item[12..14].copy_from_slice(&(w as i16).to_le_bytes()); // inc_x
         item[16..18].copy_from_slice(&(w as i16).to_le_bytes()); // inc
+        data
+    }
+
+    /// Build a version-1 `.tft` from a sorted list of `(char, coverage)`,
+    /// all with the given bitmap size and advance.
+    fn build_multi(glyphs: &[(char, u8)], w: u16, h: u16, advance: i16) -> Vec<u8> {
+        let count = glyphs.len();
+        let mut bitmaps = Vec::new();
+        for &(_, cov) in glyphs {
+            bitmaps.push(cov);
+        }
+        let ch_index = HEADER_LEN + bitmaps.len();
+        let index = ch_index + count * 2;
+        let mut data = vec![0u8; index + count * ITEM_LEN];
+        data[..22].copy_from_slice(MAGIC);
+        data[22] = 1;
+        data[23] = 2;
+        data[24..28].copy_from_slice(&(count as u32).to_le_bytes());
+        data[28..32].copy_from_slice(&(ch_index as u32).to_le_bytes());
+        data[32..36].copy_from_slice(&(index as u32).to_le_bytes());
+        data[HEADER_LEN..HEADER_LEN + bitmaps.len()].copy_from_slice(&bitmaps);
+        for (i, &(ch, _)) in glyphs.iter().enumerate() {
+            data[ch_index + i * 2..ch_index + i * 2 + 2]
+                .copy_from_slice(&(ch as u16).to_le_bytes());
+            // Each 1-byte bitmap starts at HEADER_LEN + i.
+            let item = &mut data[index + i * ITEM_LEN..index + (i + 1) * ITEM_LEN];
+            item[0..4].copy_from_slice(&((HEADER_LEN + i) as u32).to_le_bytes());
+            item[4..6].copy_from_slice(&w.to_le_bytes());
+            item[6..8].copy_from_slice(&h.to_le_bytes());
+            item[10..12].copy_from_slice(&(h as i16).to_le_bytes());
+            item[12..14].copy_from_slice(&advance.to_le_bytes());
+            item[16..18].copy_from_slice(&advance.to_le_bytes());
+        }
         data
     }
 
@@ -372,6 +415,58 @@ mod tests {
     }
 
     #[test]
+    fn version0_uses_0x41_length_marker() {
+        // version 0: 0x41 then a length byte repeats the previous value.
+        // [2, 0x41, 3] → 2, then 3 repeats of 2 → [2,2,2,2]; ×4 → [8,8,8,8].
+        let bytes = build_tft_version('y', 4, 1, &[2, 0x41, 3], 0);
+        let font = PrerenderedFont::from_bytes(bytes).unwrap();
+        assert_eq!(font.version(), 0);
+        let glyph = font.find('y').unwrap();
+        assert_eq!(font.rasterize(&glyph), vec![8, 8, 8, 8]);
+    }
+
+    #[test]
+    fn binary_search_finds_each_glyph_and_rejects_absent() {
+        // A sorted index must be searched correctly at both ends and in the
+        // middle (the reference uses a half-open binary search).
+        let glyphs = [('A', 1u8), ('B', 2), ('C', 3), ('Z', 4)];
+        let bytes = build_multi(&glyphs, 1, 1, 7);
+        let font = PrerenderedFont::from_bytes(bytes).unwrap();
+        assert_eq!(font.glyph_count(), 4);
+        for &(ch, cov) in &glyphs {
+            let g = font.find(ch).unwrap_or_else(|| panic!("{ch:?} missing"));
+            assert_eq!(g.advance(), 7);
+            assert_eq!(font.rasterize(&g), vec![cov.saturating_mul(4)]);
+        }
+        assert!(font.find('D').is_none());
+        assert!(font.find('0').is_none());
+        assert!(font.find('\u{100}').is_none());
+    }
+
+    /// Build a version-1 `.tft` with a 1×1 glyph whose `IncX` and `Inc`
+    /// differ (a few shipped fonts do this for the no-ink `∥` U+2225).
+    fn build_tft_divergent_advance(ch: char, inc_x: i16, inc: i16) -> Vec<u8> {
+        let mut data = build_tft_version(ch, 1, 1, &[1], 1);
+        let index = HEADER_LEN + 1 + 2;
+        let item = &mut data[index..index + ITEM_LEN];
+        item[12..14].copy_from_slice(&inc_x.to_le_bytes()); // inc_x
+        item[16..18].copy_from_slice(&inc.to_le_bytes()); // inc
+        data
+    }
+
+    #[test]
+    fn advance_prefers_inc_x_over_inc() {
+        // Draw metrics (`CellIncX`) win; the dedicated `Inc` is the fallback.
+        let font = PrerenderedFont::from_bytes(build_tft_divergent_advance('∥', 4, 15)).unwrap();
+        let glyph = font.find('∥').unwrap();
+        assert_eq!((glyph.inc_x, glyph.inc), (4, 15));
+        assert_eq!(glyph.advance(), 4);
+
+        let font = PrerenderedFont::from_bytes(build_tft_divergent_advance('x', 0, 9)).unwrap();
+        assert_eq!(font.find('x').unwrap().advance(), 9);
+    }
+
+    #[test]
     fn rejects_malformed_files() {
         assert_eq!(
             PrerenderedFont::from_bytes(vec![0; 4]).unwrap_err(),
@@ -389,6 +484,24 @@ mod tests {
             PrerenderedFont::from_bytes(bytes).unwrap_err(),
             PrerenderedFontError::NotUnicode
         );
+    }
+
+    /// Validate the parser against a real `.tft` supplied by the caller
+    /// (e.g. a game file). Set `KRKR_RS_TEST_TFT=/path/to/font.tft` to run;
+    /// otherwise this is a no-op so CI stays hermetic.
+    #[test]
+    fn real_tft_parses_when_available() {
+        let Some(path) = std::env::var_os("KRKR_RS_TEST_TFT") else {
+            return;
+        };
+        let data = std::fs::read(path).expect("read tft");
+        let font = PrerenderedFont::from_bytes(data).expect("parse tft");
+        assert!(font.glyph_count() > 0);
+        let glyph = font.find('あ').expect("あ must be present");
+        assert!(glyph.width > 0 && glyph.height > 0);
+        let coverage = font.rasterize(&glyph);
+        assert_eq!(coverage.len(), glyph.width as usize * glyph.height as usize);
+        assert!(coverage.iter().any(|&a| a > 0), "ink expected");
     }
 
     #[test]
