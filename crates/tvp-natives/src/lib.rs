@@ -33,6 +33,7 @@ mod chain_item_base;
 mod constants;
 mod debug;
 mod extrans;
+mod gdiplus;
 mod menu_item;
 mod plugin_stubs;
 mod plugins;
@@ -45,6 +46,7 @@ pub use extrans::{
     TRANS_TYPE_EXCHANGE, TRANS_TYPE_SIMPLE, TRANS_UPDATE_DIVISIBLE, TRANS_UPDATE_DIVISIBLE_FADE,
     TRANS_UPDATE_GIVE_UPDATE, TransitionKind, register_trans, transition_kind,
 };
+pub use gdiplus::register_gdiplus;
 pub use menu_item::register_menu_item;
 pub use plugin_stubs::register_plugin_stubs;
 pub use plugins::register_plugins;
@@ -128,6 +130,7 @@ pub fn register_all(engine: &Tjs2Engine) -> Result<(), String> {
     register_plugin_stubs(engine)?;
     register_trans(engine)?;
     register_menu_item(engine)?;
+    register_gdiplus(engine)?;
     register_chain_item_base(engine)?;
     register_async_trigger(engine)?;
     Ok(())
