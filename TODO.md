@@ -5,19 +5,28 @@
 **Working**: mount `.xp3` (23,572 + 174 entries) → run `startup.tjs` via the C++
 TJS2 VM → `system/Status.tjs` + `Initialize.tjs` + `k2compat/*` + all
 `system/*.tjs` load → `begin.tjs` creates `SceneManager` + `Logo` scene →
-Bevy window renders the logo/title layers → **the full logo → ATTENTION →
-title transition completes** (voice-driven, verified headlessly by
-`attention-harness`) → the title scene constructs its `SelectItem`s → input
-bridge dispatches mouse/key to the game's `onMouseDown`/`onKeyDown` with
-**engine-side layer hit-testing** (sprite sheets + `0×0` affine containers) →
-`WaveSoundBuffer` audio natives with **real Ogg Opus voice decode**; the
+Bevy window renders the logo/title layers (the `AffineLayer`/`Sprite`
+`onPaint`→`assignImages` composite now promotes the inner `_image` bitmap to
+the visible parent) → **the full logo → ATTENTION → title transition
+completes** (voice-driven, verified headlessly by `attention-harness`) → the
+title scene constructs its `SelectItem`s → input bridge dispatches mouse/key
+to the game's `onMouseDown`/`onKeyDown` with **engine-side layer hit-testing**
+(sprite sheets + `0×0` affine containers) and an aspect-correct cursor→game
+mapping (matches the camera's `AutoMin` scale, so hit areas follow the
+rendered buttons at any window aspect) → `WaveSoundBuffer` audio natives with
+**real Ogg Opus voice decode** → **NEW GAME starts the debut scenario
+`scenario/01_01.ks`** (the `KAGParser`/`Scripts` VM contexts are
+process-global, and a minimal `GdiPlus` plugin lets the ADV `MessageFrame`
+construct); the scenario loop runs `onflag → scene → hide/blackout/cg/update →
+playse → talk/ch → hitret` and stops at the first `hitret` click-wait. The
 window scales the 1280×720 scene on resize, and `System.exit` / window close
-quit gracefully.
+quit gracefully. An Android/WASM feasibility assessment lives in
+`docs/portability.md`.
 
 **Remaining blockers**: the startup plugin chain is emulated by built-in Rust
-natives. Gameplay gaps: confirming title-menu activation end to end, the
-`ScController` scenario loop, and save/load. Below is the investigation log;
-the logo→title milestone is closed.
+natives; `GdiPlus` is a no-op stub (the message frame draws nothing yet),
+transition/`@update` interpolation is a stub, and save/load is unported.
+Below is the investigation log; the logo→title milestone is closed.
 
 ---
 
