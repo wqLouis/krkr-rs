@@ -357,6 +357,21 @@ pub enum TjsValue {
     Retained(u64),
 }
 
+/// Result of [`Tjs2Engine::eval_retained`] / [`Tjs2Engine::exec_script_retained`].
+///
+/// Scalars cross the ABI directly, but an object/function result cannot be
+/// represented by a [`TjsValue`] (no object handle crosses the boundary).
+/// Those are retained on the engine and returned as an RAII
+/// [`DetachedValue`]: pass its [`DetachedValue::raw_id`] to the C++ side as
+/// `VAL_RETAINED` (which consumes the retention), or drop it to release the
+/// reference.
+pub enum RetainedValue {
+    /// A void/integer/real/string result, usable directly.
+    Value(TjsValue),
+    /// An object/function result, retained on the engine.
+    Object(DetachedValue),
+}
+
 /// Error raised by the VM during execution.
 #[derive(Debug, thiserror::Error)]
 #[error("TJS error: {0}")]
@@ -513,6 +528,45 @@ impl Tjs2Engine {
             return Err(unsafe { take_error(error) });
         }
         Ok(unsafe { take_value(&result) })
+    }
+
+    /// Execute a script like [`Self::exec_script`], but retain an object
+    /// result instead of losing it across the ABI.
+    ///
+    /// The C++ side records the most recent object-valued result when
+    /// `tjs2_exec_script` returns, so [`Self::retain_value_detached`] can
+    /// resolve an [`TjsValue::Object`] to the freshly produced object. Only
+    /// the object arm is retained; void/integer/real/string results are
+    /// returned as [`RetainedValue::Value`] and never allocate a retention.
+    pub fn exec_script_retained(
+        &self,
+        script: &str,
+        name: &str,
+    ) -> Result<RetainedValue, TjsError> {
+        let v = self.exec_script(script, name)?;
+        self.retain_object_result(v)
+    }
+
+    /// Evaluate an expression like [`Self::eval`], but retain an object
+    /// result instead of losing it across the ABI. See
+    /// [`Self::exec_script_retained`].
+    pub fn eval_retained(&self, expression: &str, name: &str) -> Result<RetainedValue, TjsError> {
+        let v = self.eval(expression, name)?;
+        self.retain_object_result(v)
+    }
+
+    /// Wrap a successful eval/exec result: retain objects, pass scalars
+    /// through. The C++ `variant_to_value` overwrites `last_object` with the
+    /// final result when it is an object, so the retention always resolves
+    /// to the value that was just produced (never a nested object).
+    fn retain_object_result(&self, v: TjsValue) -> Result<RetainedValue, TjsError> {
+        if matches!(v, TjsValue::Object) {
+            self.retain_value_detached(&TjsValue::Object)
+                .map(RetainedValue::Object)
+                .map_err(TjsError)
+        } else {
+            Ok(RetainedValue::Value(v))
+        }
     }
 
     /// Register a native class on the VM global object so scripts can call
@@ -1947,6 +2001,82 @@ var ra = a.get(); var rb = b.get();",
             e.call_value(&id, &[]).unwrap(),
             TjsValue::String("hello from tjs".into())
         );
+    }
+
+    #[test]
+    fn eval_retained_returns_callable_function_and_scalars() {
+        let _vm_lock = vm_lock();
+        let e = Tjs2Engine::new().unwrap();
+        e.exec_script("var f = function(a, b) { return a + b; };", "test")
+            .unwrap();
+
+        // Object/function result: retained (RAII) and callable.
+        let f = e.eval_retained("f", "test").unwrap();
+        let RetainedValue::Object(f) = f else {
+            panic!("eval_retained('f') must be an object")
+        };
+        assert_eq!(unsafe { tjs2_retained_count(e.inner) }, 1);
+        assert_eq!(
+            e.call_detached(&f, &[TjsValue::Integer(2), TjsValue::Integer(40)])
+                .unwrap(),
+            TjsValue::Integer(42)
+        );
+        drop(f);
+        assert_eq!(unsafe { tjs2_retained_count(e.inner) }, 0);
+
+        // Scalar results pass through and never allocate a retention.
+        assert!(matches!(
+            e.eval_retained("6 * 7", "test").unwrap(),
+            RetainedValue::Value(TjsValue::Integer(42))
+        ));
+        assert!(matches!(
+            e.eval_retained("'a' + 'b'", "test").unwrap(),
+            RetainedValue::Value(TjsValue::String(s)) if s == "ab"
+        ));
+        e.exec_script("function nothing() { }", "test").unwrap();
+        assert!(matches!(
+            e.eval_retained("nothing()", "test").unwrap(),
+            RetainedValue::Value(TjsValue::Void)
+        ));
+        assert_eq!(unsafe { tjs2_retained_count(e.inner) }, 0);
+
+        // A scalar eval after an object eval does not resurrect the object
+        // (`tjs2_eval` clears `last_object` at entry).
+        assert!(matches!(
+            e.eval_retained("1 + 1", "test").unwrap(),
+            RetainedValue::Value(TjsValue::Integer(2))
+        ));
+        assert_eq!(unsafe { tjs2_retained_count(e.inner) }, 0);
+    }
+
+    #[test]
+    fn exec_script_retained_returns_object_member() {
+        let _vm_lock = vm_lock();
+        let e = Tjs2Engine::new().unwrap();
+
+        let r = e
+            .exec_script_retained("return %[a: 1, b: 'x'];", "test")
+            .unwrap();
+        let RetainedValue::Object(dv) = r else {
+            panic!("exec_script_retained must return an object")
+        };
+        assert_eq!(
+            e.get_member(dv.raw_id(), "a").unwrap(),
+            TjsValue::Integer(1)
+        );
+        assert_eq!(
+            e.get_member(dv.raw_id(), "b").unwrap(),
+            TjsValue::String("x".into())
+        );
+        drop(dv);
+        assert_eq!(unsafe { tjs2_retained_count(e.inner) }, 0);
+
+        // A void script returns a scalar value, not a retention.
+        assert!(matches!(
+            e.exec_script_retained("var x = 1;", "test").unwrap(),
+            RetainedValue::Value(TjsValue::Void)
+        ));
+        assert_eq!(unsafe { tjs2_retained_count(e.inner) }, 0);
     }
 
     #[test]

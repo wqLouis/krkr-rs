@@ -47,9 +47,11 @@
 //! # ABI limits
 //!
 //! The C ABI (`tjs2_value` / `value_to_variant` in `tjs2_abi.cpp`)
-//! marshals void / integer / real / string results. Object results cannot
-//! cross the boundary yet, so they are returned as `void` with a warning
-//! (the reference returns the object itself).
+//! marshals void / integer / real / string results directly. An object or
+//! function result is retained on the engine and returned through the
+//! `VAL_RETAINED` slot instead (see `Tjs2Engine::eval_retained` and
+//! `RetainedValue`); the C++ trampoline consumes that retention when it
+//! converts the native's return value.
 
 use std::cell::RefCell;
 use std::ffi::{CStr, c_char, c_int, c_void};
@@ -59,8 +61,8 @@ use std::sync::{Arc, Mutex};
 
 use engine::Storage;
 use tjs2_sys::{
-    NativeClassBuilder, NativeMethodDef, Tjs2Engine, TjsValue, VAL_INTEGER, VAL_REAL, VAL_STRING,
-    VAL_VOID, Value,
+    NativeClassBuilder, NativeMethodDef, RetainedValue, Tjs2Engine, TjsValue, VAL_INTEGER,
+    VAL_REAL, VAL_RETAINED, VAL_STRING, VAL_VOID, Value,
 };
 use tvp_util::encoding;
 
@@ -250,8 +252,9 @@ fn mode_offset(mode: &str) -> Option<usize> {
 
 /// Read storage `name` (honoring the mode's `oN` offset), decode it and
 /// run it in the context VM as a script (`expression == false`) or an
-/// expression (`expression == true`).
-fn execute_storage(name: &str, mode: &str, expression: bool) -> Result<TjsValue, String> {
+/// expression (`expression == true`), retaining an object result so it can
+/// cross the ABI.
+fn execute_storage(name: &str, mode: &str, expression: bool) -> Result<RetainedValue, String> {
     let (engine, storage) = context_engine_and_storage()?;
 
     let bytes = {
@@ -286,9 +289,11 @@ fn execute_storage(name: &str, mode: &str, expression: bool) -> Result<TjsValue,
         text.len()
     );
     if expression {
-        engine.eval(&text, name).map_err(|e| e.to_string())
+        engine.eval_retained(&text, name).map_err(|e| e.to_string())
     } else {
-        engine.exec_script(&text, name).map_err(|e| e.to_string())
+        engine
+            .exec_script_retained(&text, name)
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -374,12 +379,31 @@ fn set_out_result(out: *mut Value, v: TjsValue) {
             }
         }
         TjsValue::String(s) => set_string_result(out, &s),
-        TjsValue::Object | TjsValue::Retained(_) => {
-            // The C ABI carries no object handle; the reference returns the
-            // object, we fall back to void.
-            log::warn!("Scripts: object result cannot cross the C ABI yet; returning void");
+        TjsValue::Retained(id) => set_out_retained(out, id as usize),
+        TjsValue::Object => {
+            // Object results go through the retained path
+            // (`eval_retained` / `exec_script_retained`); an object reaching
+            // this scalar-only marshaller means it was not retained, so
+            // fall back to void rather than lying about a handle.
+            log::warn!("Scripts: unretained object result; returning void");
             set_out_void(out);
         }
+    }
+}
+
+/// Write a retained id into `*out` as `VAL_RETAINED`. The C++ trampoline
+/// copies the retained value (consuming the map entry) when the native
+/// returns, so the caller must not release the id first.
+fn set_out_retained(out: *mut Value, id: usize) {
+    // SAFETY: `out` is a valid result slot for the duration of the call.
+    unsafe {
+        (*out).ty = VAL_RETAINED;
+        (*out).integer = 0;
+        (*out).real = 0.0;
+        (*out).string = ptr::null();
+        (*out).array = ptr::null();
+        (*out).array_count = 0;
+        (*out).retained = id;
     }
 }
 
@@ -415,44 +439,30 @@ fn param_to_string(v: &Value) -> Result<String, String> {
     }
 }
 
-/// Convert a `TjsValue` produced by the context VM into the C result slot.
-fn finish(out: *mut Value, out_error: *mut *mut c_char, result: Result<TjsValue, String>) -> c_int {
+/// Marshal a `RetainedValue` produced by the context VM into the C result
+/// slot. Object results are handed over as a `VAL_RETAINED` id; the C++
+/// side consumes the retention when it converts the result after the
+/// callback returns, so the guard is leaked here.
+fn finish_retained(
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    result: Result<RetainedValue, String>,
+) -> c_int {
     match result {
-        Ok(v) => {
+        Ok(RetainedValue::Value(v)) => {
             set_out_result(out, v);
             0
         }
-        Err(e) => error_out(out_error, &e),
-    }
-}
-
-/// After an eval, if the script produced an OBJECT result (an array or dict
-/// literal — `(const) [...]` save data), retain it and return it across the
-/// ABI via the retained-value slot. Returns true when handled.
-fn try_retain_object_result(out: *mut Value, engine: &tjs2_sys::Tjs2Engine) -> bool {
-    match engine.retain_value_detached(&tjs2_sys::TjsValue::Object) {
-        Ok(dv) => {
-            // SAFETY: `out` is a valid result slot for this call; the C++
-            // side copies the retained variant into the result before the
-            // callback returns.
-            unsafe {
-                (*out).ty = tjs2_sys::VAL_RETAINED;
-                (*out).integer = 0;
-                (*out).real = 0.0;
-                (*out).string = std::ptr::null();
-                (*out).array = std::ptr::null();
-                (*out).array_count = 0;
-                (*out).retained = dv.raw_id() as usize;
-            }
-            // The C++ side CONSUMES the retention (copies + erases the map
-            // entry) when it converts the result, so the DetachedValue must
-            // outlive this callback — leak it (its Drop would release the
-            // id before the conversion runs; forgetting skips the release,
-            // which is then a safe no-op after the erase).
+        Ok(RetainedValue::Object(dv)) => {
+            set_out_retained(out, dv.raw_id() as usize);
+            // The C++ conversion consumes the retention after this callback
+            // returns; dropping the guard now would erase the map entry
+            // first, so leak it. (The release is idempotent, so the leaked
+            // guard would be a no-op even if it did run.)
             std::mem::forget(dv);
-            true
+            0
         }
-        Err(_) => false, // no object result; keep the scalar void
+        Err(e) => error_out(out_error, &e),
     }
 }
 
@@ -494,15 +504,10 @@ extern "C" fn native_exec_storage(
         );
     }
     let result = execute_storage(&name, &mode, false);
-    // Object results (e.g. `(const) [...]` save data) are retained and
-    // returned across the ABI, exactly like evalStorage.
-    if result.is_ok()
-        && let Ok(engine) = context_engine()
-        && try_retain_object_result(out, &engine)
-    {
-        return 0;
-    }
-    finish(out, out_error, result)
+    // Object results (e.g. `(const) [...]` save data, or a function
+    // expression) are retained and returned across the ABI, exactly like
+    // evalStorage.
+    finish_retained(out, out_error, result)
 }
 
 /// `Scripts.evalStorage(name[, mode[, context]])`.
@@ -539,13 +544,7 @@ extern "C" fn native_eval_storage(
         );
     }
     let result = execute_storage(&name, &mode, true);
-    if result.is_ok()
-        && let Ok(engine) = context_engine()
-        && try_retain_object_result(out, &engine)
-    {
-        return 0;
-    }
-    finish(out, out_error, result)
+    finish_retained(out, out_error, result)
 }
 
 /// `Scripts.exec(script[, name[, lineofs[, context]]])`.
@@ -581,11 +580,11 @@ extern "C" fn native_exec(
     }
     let result = match context_engine() {
         Ok(engine) => engine
-            .exec_script(&script, &name)
+            .exec_script_retained(&script, &name)
             .map_err(|e| e.to_string()),
         Err(e) => Err(e),
     };
-    finish(out, out_error, result)
+    finish_retained(out, out_error, result)
 }
 
 /// `Scripts.eval(expression[, name[, lineofs[, context]]])`.
@@ -620,10 +619,12 @@ extern "C" fn native_eval(
         log::warn!("Scripts.eval: the execution-context argument is not supported yet; ignoring");
     }
     let result = match context_engine() {
-        Ok(engine) => engine.eval(&expression, &name).map_err(|e| e.to_string()),
+        Ok(engine) => engine
+            .eval_retained(&expression, &name)
+            .map_err(|e| e.to_string()),
         Err(e) => Err(e),
     };
-    finish(out, out_error, result)
+    finish_retained(out, out_error, result)
 }
 
 // ---------------------------------------------------------------------------
@@ -884,6 +885,105 @@ mod tests {
             env.eval_ok("Scripts.eval(\"'a' + 'b'\")"),
             TjsValue::String("ab".into())
         );
+    }
+
+    #[test]
+    fn eval_returns_function_object_usable_from_script() {
+        let _vm_lock = vm_lock();
+        // The Action.tjs pattern: `var func = Scripts.eval(elm.action);
+        // func(this, elm);` — the function must cross the ABI as a usable
+        // object, not void.
+        let env = TestEnv::new("eval-object", &[]);
+        env.engine
+            .exec_script("var action = 'function(a, b) { return a * b; }';", "test")
+            .unwrap();
+        env.eval_ok("Scripts.exec(\"var func = Scripts.eval(action); var result = func(6, 7);\")");
+        assert_eq!(env.eval_ok("result"), TjsValue::Integer(42));
+
+        // A named function and a dictionary result are usable too.
+        env.engine
+            .exec_script("function globalFn(a) { return a + 1; }", "test")
+            .unwrap();
+        env.eval_ok("Scripts.exec(\"var f = Scripts.eval('globalFn'); var n = f(41);\")");
+        assert_eq!(env.eval_ok("n"), TjsValue::Integer(42));
+
+        env.engine
+            .exec_script("var globalObj = %[a: 7];", "test")
+            .unwrap();
+        env.eval_ok("Scripts.exec(\"var o = Scripts.eval('globalObj'); var a = o.a;\")");
+        assert_eq!(env.eval_ok("a"), TjsValue::Integer(7));
+    }
+
+    #[test]
+    fn exec_returns_object_usable_from_script() {
+        let _vm_lock = vm_lock();
+        // Scripts.exec's top-level `return` can be an object; the caller can
+        // read its members (both exec and eval use the retained path).
+        let env = TestEnv::new("exec-object", &[]);
+        env.engine
+            .exec_script(
+                "var globalObj = %[a: 1, b: 'x']; var objRef = globalObj;",
+                "test",
+            )
+            .unwrap();
+        env.eval_ok(
+            "Scripts.exec(\"var r = Scripts.exec('return objRef;'); var a = r.a; var b = r.b;\")",
+        );
+        assert_eq!(env.eval_ok("a"), TjsValue::Integer(1));
+        assert_eq!(env.eval_ok("b"), TjsValue::String("x".into()));
+    }
+
+    #[test]
+    fn nested_object_eval_does_not_leak_into_scalar_result() {
+        let _vm_lock = vm_lock();
+        // The outer eval returns 42, but a nested Scripts.eval produced an
+        // object on the way. The outer result must stay an integer (the old
+        // "retain last_object" hack would have returned the nested object).
+        let env = TestEnv::new("eval-stale", &[]);
+        env.engine.exec_script("var o = %[a: 1];", "test").unwrap();
+        assert_eq!(
+            env.eval_ok("Scripts.eval(\"(Scripts.eval('o'), 42)\")"),
+            TjsValue::Integer(42)
+        );
+    }
+
+    #[test]
+    fn action_sequence_eval_pattern_runs() {
+        let _vm_lock = vm_lock();
+        // Exactly Action.tjs:314-315, the failing call:
+        //   var func = Scripts.eval(elm.action);
+        //   func(this, elm);
+        // Before the fix Scripts.eval returned void, so `func(this, elm)`
+        // raised "Cannot convert the variable type (() to Object)" and the
+        // owning Timer was disabled. The evaluated function must be a real
+        // callable object and receive both arguments.
+        let env = TestEnv::new("action-pattern", &[]);
+        let script = r#"
+            var holder = %[];
+            var elm = %[action: "function(self, e) { self.count = e.step; return true; }", step: 7];
+            var func = Scripts.eval(elm.action);
+            func(holder, elm);
+        "#;
+        env.engine
+            .exec_script(script, "Action.tjs")
+            .expect("the ActionSequense pattern must run");
+        assert_eq!(env.eval_ok("holder.count"), TjsValue::Integer(7));
+    }
+
+    #[test]
+    fn eval_object_results_do_not_leak_retentions() {
+        let _vm_lock = vm_lock();
+        let env = TestEnv::new("eval-leak", &[]);
+        env.engine.exec_script("var o = %[a: 1];", "test").unwrap();
+        for _ in 0..50 {
+            env.eval_ok("Scripts.eval('o')");
+        }
+        // Every object result was consumed by the native return conversion
+        // (the C++ trampoline erases the entry), so the map is empty.
+        let count = unsafe { tjs2_sys::tjs2_retained_count(env.engine.raw()) };
+        assert_eq!(count, 0, "Scripts.eval object results leaked");
+        // The engine is still healthy afterwards.
+        assert_eq!(env.eval_ok("Scripts.eval('6 * 7')"), TjsValue::Integer(42));
     }
 
     #[test]
