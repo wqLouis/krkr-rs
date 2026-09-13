@@ -392,31 +392,55 @@ pub(crate) fn dispatch_input(
             events.button_down, events.button_up, events.moved, events.position, events.wheel,
         );
     }
-    let scene = shared.0.read().expect("shared scene lock poisoned");
+    // Plan the dispatch under the scene read lock (pure: hit-testing and
+    // coordinate math only), then release it before calling into the TJS VM.
+    // Holding the read lock across `call_member` deadlocks: a script handler
+    // reads the scene again, and `sync_scene` may already be queued for the
+    // write lock, so the re-entrant read blocks on the writer and the writer
+    // blocks on our read.
+    let (window_ids, layer_calls) = {
+        let scene = shared.0.read().expect("shared scene lock poisoned");
+        let window_ids: Vec<u32> = scene
+            .windows
+            .iter()
+            .filter(|w| w.visible)
+            .map(|w| w.id)
+            .collect();
+        (window_ids, plan_layer_calls(&scene, &events, &mut bridge))
+    };
+
     let engine = vm.engine.as_ref();
     // The reference `tTJSNI_BaseWindow::OnMouseDown` first posts the event to
     // the Window object, then forwards it to the draw device, which routes it
     // to the layer under the cursor. Mirror both.
-    dispatch_to_windows(engine, &scene, &events);
-    dispatch_mouse_to_layers(engine, &scene, &events, &mut bridge);
+    dispatch_to_windows(engine, &window_ids, &events);
+    execute_layer_calls(engine, &layer_calls);
 }
 
-/// Route mouse events to the layer under the cursor, the reference
+/// One planned script call to a layer: resolved and invoked after the scene
+/// lock is released (see [`dispatch_input`]).
+struct LayerCall {
+    layer_id: u32,
+    method: &'static str,
+    args: Vec<TjsValue>,
+}
+
+/// Plan the layer mouse dispatch, the reference
 /// `tTVPLayerManager::PrimaryMouseMove`/`PrimaryMouseDown`/`PrimaryMouseUp`:
 /// hit-test the layer tree, fire `onMouseEnter`/`onMouseLeave` on change,
 /// `onMouseMove` with layer-local coordinates, and capture the pressed layer
-/// for the following `onMouseUp`.
-pub(crate) fn dispatch_mouse_to_layers(
-    engine: &Tjs2Engine,
+/// for the following `onMouseUp`. Pure: no VM calls, no scene writes.
+fn plan_layer_calls(
     scene: &Scene,
     events: &FrameEvents,
     bridge: &mut BridgeState,
-) {
+) -> Vec<LayerCall> {
+    let mut calls = Vec::new();
     let Some(win) = scene.windows.first() else {
-        return;
+        return calls;
     };
     if !win.visible {
-        return;
+        return calls;
     }
     // Drop a capture/last-hit whose layer has been removed.
     bridge.capture_layer = bridge.capture_layer.filter(|id| scene.layer(*id).is_some());
@@ -433,25 +457,32 @@ pub(crate) fn dispatch_mouse_to_layers(
             .or_else(|| hit_test(scene, win.id, x, y));
         if bridge.last_move_layer != hit {
             if let Some(prev) = bridge.last_move_layer {
-                call_layer(engine, prev, "onMouseLeave", &[]);
+                calls.push(LayerCall {
+                    layer_id: prev,
+                    method: "onMouseLeave",
+                    args: Vec::new(),
+                });
             }
             if let Some(l) = hit {
-                call_layer(engine, l, "onMouseEnter", &[]);
+                calls.push(LayerCall {
+                    layer_id: l,
+                    method: "onMouseEnter",
+                    args: Vec::new(),
+                });
             }
             bridge.last_move_layer = hit;
         }
         if let Some(l) = hit {
             let (lx, ly) = layer_local(scene, l, x, y);
-            call_layer(
-                engine,
-                l,
-                "onMouseMove",
-                &[
+            calls.push(LayerCall {
+                layer_id: l,
+                method: "onMouseMove",
+                args: vec![
                     TjsValue::Integer(i64::from(lx)),
                     TjsValue::Integer(i64::from(ly)),
                     TjsValue::Integer(i64::from(events.shift)),
                 ],
-            );
+            });
         }
     }
 
@@ -462,17 +493,16 @@ pub(crate) fn dispatch_mouse_to_layers(
             .or_else(|| hit_test(scene, win.id, px, py));
         if let Some(l) = l {
             let (lx, ly) = layer_local(scene, l, px, py);
-            call_layer(
-                engine,
-                l,
-                "onMouseDown",
-                &[
+            calls.push(LayerCall {
+                layer_id: l,
+                method: "onMouseDown",
+                args: vec![
                     TjsValue::Integer(i64::from(lx)),
                     TjsValue::Integer(i64::from(ly)),
                     TjsValue::Integer(b as i64),
                     TjsValue::Integer(i64::from(events.shift)),
                 ],
-            );
+            });
             bridge.capture_layer = Some(l);
         }
     }
@@ -484,39 +514,46 @@ pub(crate) fn dispatch_mouse_to_layers(
             .or_else(|| hit_test(scene, win.id, px, py))
         {
             let (lx, ly) = layer_local(scene, l, px, py);
-            call_layer(
-                engine,
-                l,
-                "onMouseUp",
-                &[
+            calls.push(LayerCall {
+                layer_id: l,
+                method: "onMouseUp",
+                args: vec![
                     TjsValue::Integer(i64::from(lx)),
                     TjsValue::Integer(i64::from(ly)),
                     TjsValue::Integer(b as i64),
                     TjsValue::Integer(i64::from(events.shift)),
                 ],
-            );
+            });
         }
         bridge.capture_layer = None;
     }
+
+    calls
 }
 
-/// Invoke one script method on a layer's TJS object, tolerating a missing
-/// handler (most layers implement only a few of the mouse events).
-fn call_layer(engine: &Tjs2Engine, layer_id: u32, method: &str, args: &[TjsValue]) {
-    let obj = tvp_visual::natives::layer_tjs_object(layer_id);
-    if obj.is_null() {
-        return;
-    }
-    let Ok(dv) = engine.retain_object_detached(obj) else {
-        return;
-    };
-    if let Err(e) = engine.call_member(dv.raw_id(), method, args)
-        && !e.contains("does not exist")
-    {
-        log::warn!("input bridge: layer #{layer_id}.{method} failed: {e}");
-    }
-    if std::env::var_os("KRKR_INPUT_TRACE").is_some() && method != "onMouseMove" {
-        eprintln!("[input] call layer #{layer_id}.{method}");
+/// Execute the planned layer calls with no scene lock held. Missing handlers
+/// (most layers implement only a few of the mouse events) are tolerated.
+fn execute_layer_calls(engine: &Tjs2Engine, calls: &[LayerCall]) {
+    for call in calls {
+        let obj = tvp_visual::natives::layer_tjs_object(call.layer_id);
+        if obj.is_null() {
+            continue;
+        }
+        let Ok(dv) = engine.retain_object_detached(obj) else {
+            continue;
+        };
+        if let Err(e) = engine.call_member(dv.raw_id(), call.method, &call.args)
+            && !e.contains("does not exist")
+        {
+            log::warn!(
+                "input bridge: layer #{}.{} failed: {e}",
+                call.layer_id,
+                call.method
+            );
+        }
+        if std::env::var_os("KRKR_INPUT_TRACE").is_some() && call.method != "onMouseMove" {
+            eprintln!("[input] call layer #{}.{}", call.layer_id, call.method);
+        }
     }
 }
 
@@ -728,9 +765,9 @@ fn shift_flags(state: &InputState) -> i32 {
 /// `onKeyDown(key, shift)`, `onKeyUp(key, shift)` — with `button` the TVP
 /// `mbLeft`..`mbX2` index, `key` the Windows VK code, and `shift` the
 /// `ss*` mask.
-pub(crate) fn dispatch_to_windows(engine: &Tjs2Engine, scene: &Scene, events: &FrameEvents) {
-    for win in &scene.windows {
-        let obj = tvp_visual::natives::window_tjs_object(win.id);
+pub(crate) fn dispatch_to_windows(engine: &Tjs2Engine, window_ids: &[u32], events: &FrameEvents) {
+    for &win_id in window_ids {
+        let obj = tvp_visual::natives::window_tjs_object(win_id);
         if obj.is_null() {
             continue;
         }
@@ -738,8 +775,7 @@ pub(crate) fn dispatch_to_windows(engine: &Tjs2Engine, scene: &Scene, events: &F
         // engine MUST outlive the DetachedValue — the caller owns it).
         let Ok(dv) = engine.retain_object_detached(obj) else {
             log::warn!(
-                "input bridge: window #{} object cannot be retained; skipping its input",
-                win.id
+                "input bridge: window #{win_id} object cannot be retained; skipping its input"
             );
             continue;
         };
@@ -760,7 +796,7 @@ pub(crate) fn dispatch_to_windows(engine: &Tjs2Engine, scene: &Scene, events: &F
         }
         for &b in &events.button_down {
             if std::env::var_os("KRKR_INPUT_TRACE").is_some() {
-                eprintln!("[input] window #{} onMouseDown button={b}", win.id);
+                eprintln!("[input] window #{win_id} onMouseDown button={b}");
             }
             call_guarded(
                 engine,
@@ -776,7 +812,7 @@ pub(crate) fn dispatch_to_windows(engine: &Tjs2Engine, scene: &Scene, events: &F
         }
         for &b in &events.button_up {
             if std::env::var_os("KRKR_INPUT_TRACE").is_some() {
-                eprintln!("[input] window #{} onMouseUp button={b}", win.id);
+                eprintln!("[input] window #{win_id} onMouseUp button={b}");
             }
             call_guarded(
                 engine,
@@ -1103,9 +1139,11 @@ mod tests {
             let state = tvp_input::input_state();
             let s = state.lock().unwrap();
             let events = collect_frame_events(&s, &mut bridge);
-            let scene_guard = scene.read().unwrap();
-            dispatch_to_windows(engine.as_ref(), &scene_guard, &events);
-            drop(scene_guard);
+            // Compute the window ids, then drop the scene guard before the VM
+            // calls (holding it across `call_member` deadlocks a handler that
+            // takes a scene lock).
+            let window_ids: Vec<u32> = scene.read().unwrap().windows.iter().map(|w| w.id).collect();
+            dispatch_to_windows(engine.as_ref(), &window_ids, &events);
             drop(s);
             (events, read_log(&engine))
         };
@@ -1130,9 +1168,8 @@ mod tests {
             let state = tvp_input::input_state();
             let s = state.lock().unwrap();
             let events = collect_frame_events(&s, &mut bridge);
-            let scene_guard = scene.read().unwrap();
-            dispatch_to_windows(engine.as_ref(), &scene_guard, &events);
-            drop(scene_guard);
+            let window_ids: Vec<u32> = scene.read().unwrap().windows.iter().map(|w| w.id).collect();
+            dispatch_to_windows(engine.as_ref(), &window_ids, &events);
             drop(s);
             read_log(&engine)
         };
