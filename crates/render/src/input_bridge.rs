@@ -386,6 +386,12 @@ pub(crate) fn dispatch_input(
     if events.is_empty() {
         return;
     }
+    if std::env::var_os("KRKR_INPUT_TRACE").is_some() {
+        eprintln!(
+            "[input] down={:?} up={:?} moved={:?} pos={:?} wheel={:?}",
+            events.button_down, events.button_up, events.moved, events.position, events.wheel,
+        );
+    }
     let scene = shared.0.read().expect("shared scene lock poisoned");
     let engine = vm.engine.as_ref();
     // The reference `tTJSNI_BaseWindow::OnMouseDown` first posts the event to
@@ -508,6 +514,9 @@ fn call_layer(engine: &Tjs2Engine, layer_id: u32, method: &str, args: &[TjsValue
         && !e.contains("does not exist")
     {
         log::warn!("input bridge: layer #{layer_id}.{method} failed: {e}");
+    }
+    if std::env::var_os("KRKR_INPUT_TRACE").is_some() && method != "onMouseMove" {
+        eprintln!("[input] call layer #{layer_id}.{method}");
     }
 }
 
