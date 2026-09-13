@@ -78,6 +78,13 @@ pub struct LayerState {
     /// `holdAlpha` — keep the alpha when drawing. Stored only for now.
     pub hold_alpha: bool,
     pub is_primary: bool,
+    /// Reference `tTJSNI_BaseLayer::CallOnPaint`: set by the script-visible
+    /// `update()` (and `loadImages`/`setSize*`, which call it) and cleared by
+    /// the engine once it dispatches the layer's `onPaint` handler. The
+    /// game's `AffineLayer.onPaint` copies its hidden inner `_image` layer's
+    /// bitmap onto the visible outer layer, so this flag is what makes the
+    /// intro logo and every `Sprite`/`AffineLayer` render.
+    pub pending_paint: bool,
 }
 
 /// One decoded bitmap (RGBA8, straight alpha).
@@ -210,6 +217,7 @@ impl Scene {
             face: 0,
             hold_alpha: false,
             is_primary: false,
+            pending_paint: false,
         });
         // First layer of a window becomes its primary layer, which the
         // reference `tTVPLayerManager::AttachPrimary` forces visible (a new

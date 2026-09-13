@@ -28,7 +28,8 @@
 //! | `setPos(x, y[, w, h])` | set rect position (4 args set bounds) |
 //! | `setSize(w, h)` | set rect size |
 //! | `fillRect(x, y, w, h, color)` | solid fill (0xAARRGGBB → RGBA) |
-//! | `loadImages(name)` / `assignImages(name)` | load a bitmap from storage |
+//! | `loadImages(name)` | load a bitmap from storage |
+//! | `assignImages(source)` | share an image: a storage name, a `Layer` (bitmap + image rect/size), or a `Bitmap` |
 //! | `setSizeToImageSize()` | resize to the current bitmap |
 //! | `setBitmap(id)` / `setImage(id)` | attach a bitmap by scene id (-1 clears; object args pending) |
 //! | `bringToFront()` / `moveToFront()` | z-order to front |
@@ -36,7 +37,9 @@
 //! | properties `visible`, `opacity` (0..255), `width`, `height`, `left`, `top`, `absolute`, `hitThreshold` | layer state |
 //! | properties `imageLeft`, `imageTop`, `imageWidth`, `imageHeight` | attached-image geometry |
 //! | properties `window`, `parent` | owning window / parent layer **ids** (objects pending) |
-//! | `update()` / `setCursorPos(x,y)` / `focus()` | no-ops (input: later) |
+//! | `update()` | request this layer's script `onPaint` on the next VM poll (reference `CallOnPaint`; drives the `AffineLayer` composite) |
+//! | `onPaint()` | base no-op action (script subclasses override it and call `super.onPaint(...)`) |
+//! | `setCursorPos(x,y)` / `focus()` | no-ops (input: later) |
 //! | `setCenter(x,y)`, `setAffineOffset(x,y)`, `setImagePos`, `setImageSize` | no-ops (affine: later) |
 //! | `drawText` | rasterizes into the attached scene bitmap using `tvp-text`, with a built-in fallback font |
 //! | `doBoxBlur` | minimal in-place RGBA box blur over the attached scene bitmap |
@@ -484,6 +487,182 @@ extern "C" fn layer_load_images(
         Err(_) => {
             set_void_out(out);
             0
+        }
+    }
+}
+
+/// `assignImages(value)` — copy an image onto this layer.
+///
+/// The reference `tTJSNI_BaseLayer::AssignImages` shares the source
+/// `MainImage` (`reference/cpp/core/visual/LayerIntf.cpp:2394`); the game's
+/// `AffineLayer.onPaint` calls it with its hidden inner `_image` **Layer**
+/// (`system/AffineLayer.tjs:133-145`) so the visible outer layer ends up
+/// carrying the bitmap. Accepted sources:
+///
+/// * a storage name (string) → the existing [`layer_load_images`] path;
+/// * a `Layer` object → share its bitmap and copy its image
+///   placement/size (`image_left/top`, `image_width/height`, `rect.w/h`);
+/// * a `Bitmap` object → attach the bitmap and size the image to it.
+///
+/// An integer scene id is accepted as well (it resolves to whichever scene
+/// table owns it), which keeps the object-id ABI path exercised by the
+/// tests.
+extern "C" fn layer_assign_images(
+    engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: argv/out/out_error are valid for the call.
+    let args = unsafe { super::ffi::args(argc, argv) };
+    let Some(&src_arg) = args.first() else {
+        return error_out(out_error, "Layer.assignImages requires 1 argument");
+    };
+    // A storage name keeps the original load semantics.
+    if src_arg.ty == tjs2_sys::VAL_STRING {
+        return layer_load_images(engine, instance, argc, argv, out, out_error, objthis);
+    }
+    let tjs_engine = crate::natives::context_engine();
+    let (kind, src_id) = match resolve_image_source(tjs_engine, &src_arg) {
+        Ok(v) => v,
+        Err(e) => return error_out(out_error, &e),
+    };
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let mut scene = context_scene_mut();
+    if scene.layer(inst.id).is_none() {
+        return error_out(out_error, "Layer: layer no longer exists");
+    }
+    // Prefer a Layer source (the AffineLayer idiom): share its main image
+    // and copy the image placement/size onto the target so the visible
+    // layer draws what the hidden `_image` child loaded. The fields are
+    // copied out first so the immutable borrow ends before `layer_mut`.
+    // A `Bitmap` object (`kind == Some(false)`) skips straight to the bitmap
+    // branch; integer ids are ambiguous (the layer and bitmap tables have
+    // independent id spaces), so they try the layer table first.
+    let layer_src = if kind == Some(false) {
+        None
+    } else {
+        scene.layer(src_id).map(|src| {
+            (
+                src.bitmap,
+                src.image_left,
+                src.image_top,
+                src.image_width,
+                src.image_height,
+                src.rect.w,
+                src.rect.h,
+            )
+        })
+    };
+    if let Some((bitmap, image_left, image_top, image_width, image_height, w, h)) = layer_src {
+        if let Some(target) = scene.layer_mut(inst.id) {
+            target.bitmap = bitmap;
+            target.image_left = image_left;
+            target.image_top = image_top;
+            target.image_width = image_width;
+            target.image_height = image_height;
+            target.rect.w = w;
+            target.rect.h = h;
+        }
+        set_void_out(out);
+        return 0;
+    }
+    // A Bitmap source attaches directly and sizes the image to the bitmap.
+    let bitmap_dims = scene.bitmap(src_id).map(|b| (b.width, b.height));
+    if let Some((w, h)) = bitmap_dims {
+        if let Some(target) = scene.layer_mut(inst.id) {
+            target.bitmap = Some(src_id);
+            target.image_left = 0;
+            target.image_top = 0;
+            target.image_width = w;
+            target.image_height = h;
+            target.rect.w = w;
+            target.rect.h = h;
+        }
+        set_void_out(out);
+        return 0;
+    }
+    error_out(out_error, "Layer.assignImages: no such Layer or Bitmap")
+}
+
+/// Resolve an `assignImages` object/integer argument to an image source.
+///
+/// Returns `(kind, scene_id)` where `kind` is `Some(true)` for a `Layer`
+/// object, `Some(false)` for a `Bitmap` object, and `None` for an integer id
+/// (the scene keeps independent layer and bitmap id spaces, so the caller
+/// probes the layer table first). A `Layer` is distinguished from a `Bitmap`
+/// by the `hasImage` property, which only the layer class exposes, so a
+/// `Bitmap` whose numeric id happens to equal a live layer id still resolves
+/// to the bitmap.
+fn resolve_image_source(engine: &Tjs2Engine, v: &Value) -> Result<(Option<bool>, u32), String> {
+    let invalid = || "Layer.assignImages expects a Layer, Bitmap, or storage name".to_string();
+    match v.ty {
+        tjs2_sys::VAL_INTEGER | tjs2_sys::VAL_REAL => {
+            let id = arg_i64(v);
+            if id < 0 {
+                Err(invalid())
+            } else {
+                Ok((None, id as u32))
+            }
+        }
+        tjs2_sys::VAL_OBJECT => {
+            let dv = engine.retain_value_detached(&TjsValue::Object)?;
+            let id = match engine.get_member(dv.raw_id(), "id") {
+                Ok(TjsValue::Integer(id)) => id,
+                Ok(TjsValue::Real(id)) => id as i64,
+                Ok(_) => -1,
+                Err(e) => return Err(e),
+            };
+            if id < 0 {
+                return Err(invalid());
+            }
+            let is_layer = engine.get_member(dv.raw_id(), "hasImage").is_ok();
+            Ok((Some(is_layer), id as u32))
+        }
+        _ => Err(invalid()),
+    }
+}
+
+/// Complete the `onPaint` events requested by `update()`.
+///
+/// The reference engine fires a layer's script `onPaint` during the paint
+/// phase when `CallOnPaint` is set (`reference/cpp/core/visual/LayerIntf.cpp`
+/// `BeforeCompletion`). We model that with [`LayerState::pending_paint`], set
+/// by the native `update()` (which the game's `AffineLayer.calcAffine`
+/// calls). Running the script handler from this VM poll phase — never while
+/// `sync_scene` holds the scene read lock — lets the game's
+/// `AffineLayer.onPaint` copy its hidden inner `_image` bitmap onto the
+/// visible outer layer, which is what makes the intro logo and all
+/// `Sprite`/`AffineLayer` artwork render.
+///
+/// The pending flags are cleared before any handler runs: a handler may call
+/// `update()` again (e.g. via a property setter that recalculates the
+/// affine) and that must schedule the next paint, not be swallowed here.
+pub(crate) fn paint_poll(engine: &Tjs2Engine) {
+    let ready: Vec<u32> = {
+        let mut scene = context_scene_mut();
+        let mut ready = Vec::new();
+        for layer in &mut scene.layers {
+            if layer.pending_paint {
+                layer.pending_paint = false;
+                ready.push(layer.id);
+            }
+        }
+        ready
+    };
+    for id in ready {
+        let obj = super::layer_tjs_object(id);
+        if obj.is_null() {
+            continue;
+        }
+        // Retain the object for the call: a handler may drop the last script
+        // reference to the layer, and the retention keeps it alive until the
+        // call returns.
+        if let Ok(value) = engine.retain_object_detached(obj) {
+            let _ = engine.call_member(value.raw_id(), "onPaint", &[]);
         }
     }
 }
@@ -1063,16 +1242,26 @@ extern "C" fn layer_parent_set(
     0
 }
 
-/// `update()` — no-op (the render loop syncs every frame).
+/// `update()` — request an `onPaint` dispatch on the next VM poll.
+///
+/// The reference `update` sets `CallOnPaint` (see `tTJSNI_BaseLayer::
+/// UpdateByScript`); the game's `AffineLayer.calcAffine`/`calcOffset` call it
+/// after every image/size/position change, and the engine later fires the
+/// script `onPaint`. Marking the layer here is what ultimately runs the
+/// AffineLayer composite; the flag is consumed by [`paint_poll`].
 extern "C" fn layer_update(
     _engine: *mut c_void,
-    _instance: *mut c_void,
+    instance: *mut c_void,
     _argc: c_int,
     _argv: *const Value,
     out: *mut Value,
     _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    if let Some(layer) = context_scene_mut().layer_mut(inst.id) {
+        layer.pending_paint = true;
+    }
     set_void_out(out);
     0
 }
@@ -1633,6 +1822,13 @@ pub(crate) fn register_layer(engine: &Tjs2Engine) -> Result<(), String> {
         "setAttentionPos",
         "captureMouse",
         "captureTouch",
+        // Base `onPaint` action. The reference native dispatches the layer's
+        // own script `onPaint` action; our engine already invokes the script
+        // handler from [`paint_poll`], so the base implementation only needs
+        // to exist for the game's `super.onPaint(...)` call to resolve. It
+        // must stay a no-op: dispatching here would recurse (the script's
+        // `onPaint` calls `super.onPaint`).
+        "onPaint",
     ];
     let mut methods: Vec<NativeInstanceMethodDef> = vec![
         NativeInstanceMethodDef {
@@ -1657,7 +1853,7 @@ pub(crate) fn register_layer(engine: &Tjs2Engine) -> Result<(), String> {
         },
         NativeInstanceMethodDef {
             name: "assignImages",
-            f: layer_load_images,
+            f: layer_assign_images,
         },
         NativeInstanceMethodDef {
             name: "setSizeToImageSize",

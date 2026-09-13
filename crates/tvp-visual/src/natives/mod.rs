@@ -253,6 +253,10 @@ pub fn register_visual(
 pub fn timer_poll(engine: &Tjs2Engine, now_ms: u64) {
     layer::transition_poll(engine);
     timer::timer_poll(engine, now_ms);
+    // Fire the script `onPaint` handlers requested by `update()` this frame
+    // (the game's `AffineLayer.onPaint` composite). This runs in the VM poll
+    // phase, never inside `sync_scene`'s scene read lock.
+    layer::paint_poll(engine);
 }
 
 /// A process-wide mutex serializing tests that drive the crate-global VM
