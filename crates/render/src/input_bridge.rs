@@ -133,12 +133,17 @@ pub(crate) fn capture_input(
     shared: Res<SharedScene>,
 ) {
     let (game_w, game_h) = game_size(&shared);
-    let (scale_x, scale_y) = match windows.iter().next() {
-        Some(w) if w.width() > 0.0 && w.height() > 0.0 => (
-            f64::from(game_w) / f64::from(w.width()),
-            f64::from(game_h) / f64::from(w.height()),
+    // The scene camera uses `ScalingMode::AutoMin` (aspect-preserving), so map
+    // the cursor with the same uniform scale + centering offset instead of
+    // stretching each axis independently (see `sync::window_to_game_transform`).
+    let (scale, offset_x, offset_y) = match windows.iter().next() {
+        Some(w) if w.width() > 0.0 && w.height() > 0.0 => {
+            krkr_render::sync::window_to_game_transform((w.width(), w.height()), (game_w, game_h))
+        }
+        _ => krkr_render::sync::window_to_game_transform(
+            (game_w as f32, game_h as f32),
+            (game_w, game_h),
         ),
-        _ => (1.0, 1.0),
     };
 
     let state = tvp_input::input_state();
@@ -148,9 +153,9 @@ pub(crate) fn capture_input(
     // Cursor position: the last CursorMoved of the frame, clamped to the
     // game bounds.
     if let Some(pos) = cursor_moved.read().last() {
-        let x = ((pos.position.x * scale_x as f32).round() as i32)
+        let x = ((pos.position.x / scale + offset_x).round() as i32)
             .clamp(0, game_w.saturating_sub(1) as i32);
-        let y = ((pos.position.y * scale_y as f32).round() as i32)
+        let y = ((pos.position.y / scale + offset_y).round() as i32)
             .clamp(0, game_h.saturating_sub(1) as i32);
         s.set_mouse_pos(x, y);
     }

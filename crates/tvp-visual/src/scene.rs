@@ -116,6 +116,11 @@ pub struct FontState {
     pub color: [u8; 4],
     pub bold: bool,
     pub italic: bool,
+    pub strikeout: bool,
+    pub underline: bool,
+    /// Rotation in the reference's tenths-of-a-degree units (game code does
+    /// `font.angle \ 10`).
+    pub angle: f64,
 }
 
 /// Rectangle in window coordinates.
@@ -327,6 +332,9 @@ impl Scene {
             color,
             bold: false,
             italic: false,
+            strikeout: false,
+            underline: false,
+            angle: 0.0,
         });
         id
     }

@@ -13,7 +13,10 @@ use tjs2_sys::{
     NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef, Tjs2Engine, Value,
 };
 
-use super::ffi::{arg_i64, arg_string, error_out, instance_ref, set_int_out, set_string_out};
+use super::ffi::{
+    arg_f64, arg_i64, arg_string, error_out, instance_ref, set_int_out, set_real_out,
+    set_string_out,
+};
 use super::{context_scene_mut, context_scene_read};
 
 /// Payload of one script-visible `Font` object.
@@ -207,6 +210,87 @@ extern "C" fn font_id_get(
     0
 }
 
+/// Generate the get/set pair for a boolean `Font` property backed by a
+/// [`FontState`](crate::scene::FontState) field. The reference exposes these
+/// as TJS booleans; we return integers (0/1), which TJS coerces in `if`.
+macro_rules! font_bool_prop {
+    ($get_fn:ident, $set_fn:ident, $field:ident) => {
+        extern "C" fn $get_fn(
+            _engine: *mut c_void,
+            instance: *mut c_void,
+            out: *mut Value,
+            out_error: *mut *mut c_char,
+            _objthis: *mut c_void,
+        ) -> c_int {
+            let inst = unsafe { instance_ref::<FontInst>(instance) };
+            let scene = context_scene_read();
+            let Some(font) = scene.fonts.iter().find(|f| f.id == inst.id) else {
+                return error_out(out_error, "Font: font no longer exists");
+            };
+            set_int_out(out, i64::from(font.$field));
+            0
+        }
+
+        extern "C" fn $set_fn(
+            _engine: *mut c_void,
+            instance: *mut c_void,
+            value: *const Value,
+            _out_error: *mut *mut c_char,
+            _objthis: *mut c_void,
+        ) -> c_int {
+            // SAFETY: value is valid for the call.
+            let v = unsafe { &*value };
+            let inst = unsafe { instance_ref::<FontInst>(instance) };
+            let mut scene = context_scene_mut();
+            let Some(font) = scene.fonts.iter_mut().find(|f| f.id == inst.id) else {
+                return 1;
+            };
+            font.$field = arg_i64(v) != 0;
+            0
+        }
+    };
+}
+
+font_bool_prop!(font_bold_get, font_bold_set, bold);
+font_bool_prop!(font_italic_get, font_italic_set, italic);
+font_bool_prop!(font_strikeout_get, font_strikeout_set, strikeout);
+font_bool_prop!(font_underline_get, font_underline_set, underline);
+
+/// `angle` — glyph rotation (real; the game divides by 10 before use).
+extern "C" fn font_angle_get(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let inst = unsafe { instance_ref::<FontInst>(instance) };
+    let scene = context_scene_read();
+    let Some(font) = scene.fonts.iter().find(|f| f.id == inst.id) else {
+        return error_out(out_error, "Font: font no longer exists");
+    };
+    set_real_out(out, font.angle);
+    0
+}
+
+extern "C" fn font_angle_set(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    value: *const Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: value is valid for the call.
+    let v = unsafe { &*value };
+    let inst = unsafe { instance_ref::<FontInst>(instance) };
+    let mut scene = context_scene_mut();
+    let Some(font) = scene.fonts.iter_mut().find(|f| f.id == inst.id) else {
+        return 1;
+    };
+    font.angle = arg_f64(v);
+    0
+}
+
 /// Estimate text width using TVP's common half-width/full-width rule. The
 /// renderer can later replace this with `tvp-text` glyph metrics, but this
 /// deterministic fallback is already sufficient for layout and hit testing
@@ -332,6 +416,31 @@ pub(crate) fn register_font(engine: &Tjs2Engine) -> Result<(), String> {
                 name: "color",
                 get: Some(font_color_get),
                 set: Some(font_color_set),
+            },
+            NativeInstancePropertyDef {
+                name: "bold",
+                get: Some(font_bold_get),
+                set: Some(font_bold_set),
+            },
+            NativeInstancePropertyDef {
+                name: "italic",
+                get: Some(font_italic_get),
+                set: Some(font_italic_set),
+            },
+            NativeInstancePropertyDef {
+                name: "strikeout",
+                get: Some(font_strikeout_get),
+                set: Some(font_strikeout_set),
+            },
+            NativeInstancePropertyDef {
+                name: "underline",
+                get: Some(font_underline_get),
+                set: Some(font_underline_set),
+            },
+            NativeInstancePropertyDef {
+                name: "angle",
+                get: Some(font_angle_get),
+                set: Some(font_angle_set),
             },
         ],
     })

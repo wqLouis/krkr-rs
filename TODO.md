@@ -8,13 +8,16 @@ TJS2 VM → `system/Status.tjs` + `Initialize.tjs` + `k2compat/*` + all
 Bevy window renders the logo/title layers → **the full logo → ATTENTION →
 title transition completes** (voice-driven, verified headlessly by
 `attention-harness`) → the title scene constructs its `SelectItem`s → input
-bridge dispatches mouse/key to the game's `onMouseDown`/`onKeyDown` →
-`WaveSoundBuffer` audio natives with **real Ogg Opus voice decode**.
+bridge dispatches mouse/key to the game's `onMouseDown`/`onKeyDown` with
+**engine-side layer hit-testing** (sprite sheets + `0×0` affine containers) →
+`WaveSoundBuffer` audio natives with **real Ogg Opus voice decode**; the
+window scales the 1280×720 scene on resize, and `System.exit` / window close
+quit gracefully.
 
 **Remaining blockers**: the startup plugin chain is emulated by built-in Rust
-natives. Gameplay gaps: title-screen item interaction (`SelectItem`
-hit-testing / activation), the `ScController` scenario loop, and save/load.
-Below is the investigation log; the logo→title milestone is closed.
+natives. Gameplay gaps: confirming title-menu activation end to end, the
+`ScController` scenario loop, and save/load. Below is the investigation log;
+the logo→title milestone is closed.
 
 ---
 

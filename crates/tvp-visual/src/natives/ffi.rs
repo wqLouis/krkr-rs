@@ -68,6 +68,17 @@ pub(crate) fn set_int_out(out: *mut Value, v: i64) {
     }
 }
 
+/// Write a real (floating-point) return value into `*out`.
+pub(crate) fn set_real_out(out: *mut Value, v: f64) {
+    // SAFETY: `out` is a valid return slot for the duration of the call.
+    unsafe {
+        (*out).ty = tjs2_sys::VAL_REAL;
+        (*out).integer = 0;
+        (*out).real = v;
+        (*out).string = ptr::null();
+    }
+}
+
 /// Write a void return value into `*out`.
 pub(crate) fn set_void_out(out: *mut Value) {
     // SAFETY: `out` is a valid return slot for the duration of the call.

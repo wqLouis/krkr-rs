@@ -253,7 +253,33 @@ pub fn sync_scene(
     let scene = shared.0.read().expect("shared scene lock poisoned");
     let mut uploaded: Vec<u32> = Vec::new();
 
-    let mut spawned_camera = !cameras.is_empty();
+    // The first window owns the 2D camera. Re-insert its projection every
+    // sync so a runtime `inner_size` change (the in-game config resolution
+    // option) keeps the logical scene centred instead of leaving the camera
+    // pinned to whatever size was current when it was spawned. The camera
+    // entity itself is kept across frames.
+    if let Some(window) = scene.windows.first() {
+        let projection = scene_projection(window.inner_size);
+        match cameras.iter().next() {
+            Some(camera) => {
+                commands.entity(camera).insert(projection);
+            }
+            None => {
+                // The first window gets the 2D camera. Extra windows have no
+                // camera yet (single-primary-window milestone; WAVE3).
+                commands.spawn((
+                    SceneCamera,
+                    Camera2d,
+                    projection,
+                    Camera {
+                        clear_color: ClearColorConfig::Custom(Color::srgb(0.0, 0.0, 0.0)),
+                        ..Default::default()
+                    },
+                ));
+            }
+        }
+    }
+
     for window in &scene.windows {
         // Background / root node for this window.
         let root = commands
@@ -264,21 +290,6 @@ pub fn sync_scene(
                 Transform::default(),
             ))
             .id();
-
-        // The first window gets the 2D camera. Extra windows have no camera
-        // yet (single-primary-window milestone; documented in WAVE3).
-        if !spawned_camera {
-            spawned_camera = true;
-            commands.spawn((
-                SceneCamera,
-                Camera2d,
-                scene_projection(window.inner_size),
-                Camera {
-                    clear_color: ClearColorConfig::Custom(Color::srgb(0.0, 0.0, 0.0)),
-                    ..Default::default()
-                },
-            ));
-        }
 
         if !window.visible {
             continue;
@@ -660,6 +671,25 @@ pub fn rect_center(rect: Rect, window_w: u32, window_h: u32) -> (f32, f32) {
     (x, y)
 }
 
+/// Map OS-window logical pixels into game (primary-layer) coordinates under
+/// the scene camera's aspect-preserving [`ScalingMode::AutoMin`] projection
+/// (see [`scene_projection`]).
+///
+/// Returns `(scale, offset_x, offset_y)` so that a window pixel
+/// `(px, py)` (origin top-left) maps to game coordinates
+/// `(px / scale + offset_x, py / scale + offset_y)`. Bevy maps the render
+/// target's pixels to world units with the same `scale = min(w/gw, h/gh)`
+/// and centers the projection on the origin; this inverts that (the DPI
+/// factor cancels because both the cursor and the window size are logical).
+pub fn window_to_game_transform(window: (f32, f32), game: (u32, u32)) -> (f32, f32, f32) {
+    let (w, h) = window;
+    let (gw, gh) = (game.0 as f32, game.1 as f32);
+    let scale = (w / gw).min(h / gh).max(f32::EPSILON);
+    let offset_x = gw / 2.0 - w / (2.0 * scale);
+    let offset_y = gh / 2.0 - h / (2.0 * scale);
+    (scale, offset_x, offset_y)
+}
+
 /// Z depth for a layer at `index` in the back → front render order.
 /// Backmost (index 0) sits at z = 0; Bevy sorts 2D sprites by view depth, so
 /// higher z renders on top.
@@ -859,6 +889,154 @@ mod tests {
             ),
             "degenerate window size must fall back to 1280x720, got {:?}",
             ortho.scaling_mode
+        );
+    }
+
+    /// Window pixel → game coordinate using a `(scale, offset_x, offset_y)`
+    /// transform from [`window_to_game_transform`].
+    fn game_point(px: f32, py: f32, transform: (f32, f32, f32)) -> (f32, f32) {
+        let (scale, offset_x, offset_y) = transform;
+        (px / scale + offset_x, py / scale + offset_y)
+    }
+
+    /// Inverse of [`game_point`]: game coordinate → window pixel.
+    fn window_point(gx: f32, gy: f32, transform: (f32, f32, f32)) -> (f32, f32) {
+        let (scale, offset_x, offset_y) = transform;
+        ((gx - offset_x) * scale, (gy - offset_y) * scale)
+    }
+
+    /// Exact 16:9 window sizes scale by a whole power of two and need no
+    /// centering offset along either axis.
+    #[test]
+    fn window_to_game_transform_exact_16_9() {
+        for (window, expected_scale) in [((2560.0, 1440.0), 2.0_f32), ((640.0, 360.0), 0.5_f32)] {
+            let (scale, offset_x, offset_y) = window_to_game_transform(window, (1280, 720));
+            assert!(
+                (scale - expected_scale).abs() < 1e-6,
+                "scale for {window:?}: got {scale}"
+            );
+            assert!(offset_x.abs() < 1e-6, "offset_x for {window:?}: {offset_x}");
+            assert!(offset_y.abs() < 1e-6, "offset_y for {window:?}: {offset_y}");
+        }
+    }
+
+    /// Wider than 16:9: the height fits exactly, so the extra width is split
+    /// into a symmetric horizontal letterbox (`offset_x < 0`). The transform
+    /// is raw — no clamping — so the window's left edge maps left of the game
+    /// and its right edge past it.
+    #[test]
+    fn window_to_game_transform_wider_than_16_9() {
+        let transform = window_to_game_transform((2560.0, 720.0), (1280, 720));
+        let (scale, offset_x, offset_y) = transform;
+        assert!((scale - 1.0).abs() < 1e-6, "scale: {scale}");
+        assert!((offset_x - -640.0).abs() < 1e-6, "offset_x: {offset_x}");
+        assert!(offset_y.abs() < 1e-6, "offset_y: {offset_y}");
+
+        assert_eq!(game_point(0.0, 0.0, transform), (-640.0, 0.0));
+        assert_eq!(game_point(2560.0, 720.0, transform), (1920.0, 720.0));
+    }
+
+    /// Narrower than 16:9: the width fits exactly, so the extra height is
+    /// split into a symmetric vertical letterbox (`offset_y < 0`). The
+    /// content's top-left game pixel `(0,0)` comes from the matching window
+    /// pixel and round-trips.
+    #[test]
+    fn window_to_game_transform_narrower_than_16_9() {
+        let transform = window_to_game_transform((1000.0, 720.0), (1280, 720));
+        let (scale, offset_x, offset_y) = transform;
+        assert!((scale - 0.78125).abs() < 1e-6, "scale: {scale}");
+        assert!(offset_x.abs() < 1e-6, "offset_x: {offset_x}");
+        assert!((offset_y - -100.8).abs() < 1e-4, "offset_y: {offset_y}");
+
+        let top_left_px = window_point(0.0, 0.0, transform);
+        assert!(top_left_px.0.abs() < 1e-4, "px: {top_left_px:?}");
+        assert!((top_left_px.1 - 78.75).abs() < 1e-4, "py: {top_left_px:?}");
+        let round_trip = game_point(top_left_px.0, top_left_px.1, transform);
+        assert!(
+            round_trip.0.abs() < 1e-4 && round_trip.1.abs() < 1e-4,
+            "round trip: {round_trip:?}"
+        );
+    }
+
+    /// The window center always maps to the game-space center, across exact
+    /// and mismatched aspect ratios.
+    #[test]
+    fn window_to_game_transform_center_round_trips() {
+        let game = (1280u32, 720u32);
+        for window in [
+            (2560.0, 1440.0),
+            (640.0, 360.0),
+            (2560.0, 720.0),
+            (1000.0, 720.0),
+            (1280.0, 720.0),
+            (800.0, 600.0),
+            (1920.0, 1200.0),
+        ] {
+            let transform = window_to_game_transform(window, game);
+            let center = game_point(window.0 / 2.0, window.1 / 2.0, transform);
+            assert!(
+                (center.0 - game.0 as f32 / 2.0).abs() < 1e-3
+                    && (center.1 - game.1 as f32 / 2.0).abs() < 1e-3,
+                "window {window:?} center must map to game center, got {center:?}"
+            );
+        }
+    }
+
+    /// Read the single [`SceneCamera`]'s entity.
+    fn single_camera(app: &mut App) -> Entity {
+        let world = app.world_mut();
+        let mut q = world.query_filtered::<Entity, With<SceneCamera>>();
+        q.single(world).expect("exactly one scene camera")
+    }
+
+    /// Assert the camera's projection pins `width × height` world units.
+    fn assert_camera_projection(app: &mut App, width: f32, height: f32) {
+        let world = app.world_mut();
+        let mut q = world.query_filtered::<&Projection, With<SceneCamera>>();
+        let projection = q.single(world).expect("camera has a projection");
+        let Projection::Orthographic(ortho) = projection else {
+            panic!("expected an orthographic 2D projection, got {projection:?}");
+        };
+        assert!(
+            matches!(
+                ortho.scaling_mode,
+                ScalingMode::AutoMin { min_width, min_height }
+                    if (min_width - width).abs() < 1e-6 && (min_height - height).abs() < 1e-6
+            ),
+            "projection must fit the {width}x{height} logical scene, got {:?}",
+            ortho.scaling_mode
+        );
+    }
+
+    /// The camera projection must follow a runtime `inner_size` change (the
+    /// in-game config resolution option) instead of staying pinned to the size
+    /// captured when the camera was spawned. The camera entity is reused.
+    #[test]
+    fn camera_projection_tracks_window_inner_size_changes() {
+        let mut scene = Scene::default();
+        let win = scene.add_window("t", (1280, 720));
+        let shared = SharedScene(Arc::new(RwLock::new(scene)));
+        let mut app = app_with_sync(shared.clone());
+        app.update();
+
+        assert_camera_projection(&mut app, 1280.0, 720.0);
+        let camera_before = single_camera(&mut app);
+
+        // The game switches resolution at runtime.
+        shared
+            .0
+            .write()
+            .unwrap()
+            .window_mut(win)
+            .unwrap()
+            .inner_size = (1920, 1080);
+        app.update();
+
+        assert_camera_projection(&mut app, 1920.0, 1080.0);
+        assert_eq!(
+            single_camera(&mut app),
+            camera_before,
+            "the camera entity is kept; only its projection is updated"
         );
     }
 

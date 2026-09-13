@@ -366,15 +366,24 @@ extern "C" fn layer_copy_rect(
     };
     let inst = unsafe { instance_ref::<LayerInst>(instance) };
     let mut scene = context_scene_mut();
-    if bitmap_id >= 0 && scene.bitmap(bitmap_id as u32).is_none() {
+    // `src` may be a `Bitmap` (its id is a bitmap id) or a `Layer` (the
+    // reference accepts both: a Layer contributes its main image). Resolve
+    // the object id against the scene so a Layer source copies its bitmap.
+    let bitmap = if bitmap_id < 0 {
+        None
+    } else if scene.bitmap(bitmap_id as u32).is_some() {
+        Some(bitmap_id as u32)
+    } else if let Some(src_layer) = scene.layer(bitmap_id as u32) {
+        src_layer.bitmap
+    } else {
         return error_out(out_error, "Layer.copyRect: no such bitmap");
-    }
+    };
     // The copied source region size (args 5/6) if provided, else the bitmap
     // size; the renderer maps `image_width/height` onto the bitmap pixels.
     let Some(layer) = scene.layer_mut(inst.id) else {
         return error_out(out_error, "Layer: layer no longer exists");
     };
-    layer.bitmap = (bitmap_id >= 0).then_some(bitmap_id as u32);
+    layer.bitmap = bitmap;
     set_void_out(out);
     0
 }
