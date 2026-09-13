@@ -130,7 +130,7 @@ extern "C" fn native_inform(
 /// `TVPGetTickCount`/`TVPStartTickCount`); shared by `System.getTickCount`
 /// and the continuous-handler delivery so handlers see the same clock as
 /// the scripts.
-fn tick_count_ms() -> i64 {
+pub(crate) fn tick_count_ms() -> i64 {
     let epoch = TICK_EPOCH.get_or_init(Instant::now);
     epoch.elapsed().as_millis() as i64
 }
@@ -477,7 +477,13 @@ pub fn continuous_handler_poll(engine: &tjs2_sys::Tjs2Engine) -> bool {
         }
     }
     *handlers = rest;
-    !handlers.is_empty()
+    let any = !handlers.is_empty();
+    drop(handlers);
+    // The video overlay playback state machine rides the same per-frame
+    // clock as the continuous handlers (reference: the video decoder's own
+    // event thread; krkr-rs has no decoder thread).
+    crate::video_overlay::video_overlay_poll(engine);
+    any
 }
 
 /// `System.addContinuousHandler(fn)` — register a per-frame callback.
@@ -766,6 +772,13 @@ pub fn set_system_context(ctx: SystemContext) {
 /// Current context (defaults when never set).
 fn system_context() -> SystemContext {
     lock_ok(&SYSTEM_CONTEXT).clone()
+}
+
+/// Game/project directory the mounted game storage resolves against
+/// (`System.dataPath`/`exePath`). Used by the video overlay to lazily mount
+/// the game storage and read movie files.
+pub(crate) fn project_dir() -> std::path::PathBuf {
+    system_context().project_dir
 }
 
 fn effective_desktop_size(ctx: &SystemContext) -> (u32, u32) {

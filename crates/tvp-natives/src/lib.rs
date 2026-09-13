@@ -53,7 +53,7 @@ pub use system::{
     SystemContext, continuous_handler_poll, register_system, set_key_state, set_system_context,
     take_exit_request,
 };
-pub use video_overlay::register_video_overlay;
+pub use video_overlay::{register_video_overlay, set_video_storage, video_overlay_poll};
 
 use std::cell::RefCell;
 use std::ffi::{CStr, c_char, c_int};

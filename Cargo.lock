@@ -5880,6 +5880,7 @@ dependencies = [
 name = "tvp-natives"
 version = "0.1.0"
 dependencies = [
+ "engine",
  "log",
  "tjs2-sys",
 ]

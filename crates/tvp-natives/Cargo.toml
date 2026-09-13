@@ -7,4 +7,5 @@ license.workspace = true
 
 [dependencies]
 tjs2-sys = { workspace = true }
+engine = { path = "../engine" }
 log = "0.4"
