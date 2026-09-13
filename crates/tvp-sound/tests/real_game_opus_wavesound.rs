@@ -50,8 +50,25 @@ fn real_game_opus_voice_plays_via_wavesoundbuffer() {
     )
     .unwrap();
 
-    // 0.5s in: the ~60 ms silent fallback would already be "stop" here.
-    // The app drives `advance` + `sound_poll` once per frame; mirror that.
+    // The voice decodes asynchronously: pump the poll until the play
+    // transition fires (a ~60 ms silent fallback would already be "stop"
+    // here). The app drives `advance` + `sound_poll` once per frame; mirror
+    // that.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        advance(0.0);
+        sound_poll(&e, 0.0);
+        if e.eval("ws.status", "wsopus").unwrap() == TjsValue::String("play".into()) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Opus voice never became play: {:?}",
+            e.eval("ws.status", "wsopus")
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    // 0.5s in it must still be playing.
     advance(0.5);
     sound_poll(&e, 0.5);
     assert_eq!(

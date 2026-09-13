@@ -82,9 +82,10 @@ fn real_game_bgm_ogg_decodes_to_audible_pcm() {
     );
 
     // 2. Play it on a mixer channel the way the game does: `new
-    //    SoundChannel()` → `ch.play(name)` decodes on the fly and hands the
-    //    channel the source. Advance the clock 1.5s so the channel is
-    //    mid-playback.
+    //    SoundChannel()` → `ch.play(name)` starts the background decode and
+    //    hands the channel the source. A long BGM streams, so wait until its
+    //    decoder has buffered enough for the 1.5s playback position before
+    //    asserting/rendering.
     e.exec_script(
         r#"
         var ch = new SoundChannel();
@@ -94,7 +95,27 @@ fn real_game_bgm_ogg_decodes_to_audible_pcm() {
         "realbgm",
     )
     .unwrap();
-    advance(1.5);
+    {
+        let mixer = tvp_sound::global_mixer().expect("register_sound set a global mixer");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            advance(1.5);
+            let mut probe = vec![0.0f32; 4410 * 2];
+            {
+                let m = mixer.lock().unwrap_or_else(|p| p.into_inner());
+                m.render_mix(&mut probe, 44100, 2);
+            }
+            let peak = probe.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+            if peak > 0.01 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "real BGM never buffered audio at 1.5s (peak {peak})"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
     assert_eq!(
         e.eval("ch.isPlaying()", "realbgm").unwrap(),
         TjsValue::Integer(1),
@@ -184,6 +205,19 @@ fn real_game_opus_voice_decodes_to_audible_pcm() {
         "realvoice",
     )
     .unwrap();
+    // The voice decodes asynchronously; wait until it is ready to play.
+    let mut ready = false;
+    for _ in 0..10_000 {
+        if matches!(
+            e.eval("vch.isPlaying()", "realvoice"),
+            Ok(TjsValue::Integer(1))
+        ) {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(ready, "Opus voice never became ready");
     advance(1.0);
     assert_eq!(
         e.eval("vch.isPlaying()", "realvoice").unwrap(),

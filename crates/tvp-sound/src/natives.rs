@@ -11,9 +11,11 @@
 //!   so the argument is silently dropped by the VM and buffers are loaded
 //!   explicitly with `open` — the same load-by-storage-name path the game
 //!   uses via `WaveSoundBuffer.open`.)
-//! - `open(name)` — decode `name` from storage; throws a TJS error when the
-//!   entry is missing or undecodable. Becomes the "most recently opened"
-//!   buffer (see [`SoundChannel.play`] object-argument resolution).
+//! - `open(name)` — read and probe `name` from storage, then decode it on a
+//!   background worker (whole-file for short sounds, bounded streaming for
+//!   long tracks). Throws a TJS error when the entry is missing; the buffer
+//!   becomes "most recently opened" (see [`SoundChannel.play`] object-argument
+//!   resolution) and reports `"ready"` once decoding completes.
 //! - `getBufferId()` → integer id (0 while unloaded). Buffers are also
 //!   addressable by id, because object arguments cannot cross the ABI.
 //! - `getBufferInfo()` → string `"(rate,channels,length_seconds)"`, e.g.
@@ -68,10 +70,10 @@ use tjs2_sys::{
     VAL_STRING,
 };
 
-use crate::decode::{DecodedAudio, decode_audio};
 use crate::ffi;
 use crate::mixer::{Mixer, lock_ok};
 use crate::player::{MainThreadOutputGuard, start_output_on_main_thread};
+use crate::source::{AudioTrack, open_track};
 
 /// Engine-side context every native method needs: the mounted storage (for
 /// decoding) and the mixer (for channels). Set by [`register_sound`] on the
@@ -101,16 +103,16 @@ fn set_native_ctx(storage: Arc<Mutex<Storage>>, mixer: Arc<Mutex<Mixer>>) {
 // buffer registry
 // ---------------------------------------------------------------------------
 
-/// Decoded audio by buffer id. Buffers are addressable by id because
-/// object arguments cannot cross the ABI.
-static BUFFER_AUDIO: LazyLock<Mutex<HashMap<u64, Arc<DecodedAudio>>>> =
+/// Decoded/loading audio by buffer id. Buffers are addressable by id
+/// because object arguments cannot cross the ABI.
+static BUFFER_AUDIO: LazyLock<Mutex<HashMap<u64, Arc<AudioTrack>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// The most recently opened buffer's audio — the resolution used by
+/// The most recently opened buffer's track — the resolution used by
 /// `SoundChannel.play(buffer)` for object arguments (the ABI hands us an
 /// opaque object handle, not the object's identity; opening a buffer right
 /// before playing it is the idiomatic pattern this heuristic covers).
-static LAST_OPENED: LazyLock<Mutex<Option<Arc<DecodedAudio>>>> = LazyLock::new(|| Mutex::new(None));
+static LAST_OPENED: LazyLock<Mutex<Option<Arc<AudioTrack>>>> = LazyLock::new(|| Mutex::new(None));
 
 static NEXT_BUFFER_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -122,12 +124,13 @@ static NEXT_BUFFER_ID: AtomicU64 = AtomicU64::new(1);
 struct SoundBufferInst {
     /// Buffer id (0 = unloaded).
     id: u64,
-    /// Decoded audio, present after a successful `open`.
-    audio: Option<Arc<DecodedAudio>>,
+    /// Source track, present after a successful `open` (possibly still
+    /// loading or streaming on a background worker).
+    track: Option<Arc<AudioTrack>>,
 }
 
 extern "C" fn sb_create(_engine: *mut c_void) -> *mut c_void {
-    Box::into_raw(Box::new(SoundBufferInst { id: 0, audio: None })) as *mut c_void
+    Box::into_raw(Box::new(SoundBufferInst { id: 0, track: None })) as *mut c_void
 }
 
 extern "C" fn sb_destroy(_engine: *mut c_void, instance: *mut c_void) {
@@ -135,7 +138,11 @@ extern "C" fn sb_destroy(_engine: *mut c_void, instance: *mut c_void) {
     unsafe { drop(Box::from_raw(instance as *mut SoundBufferInst)) };
 }
 
-/// `SoundBuffer.open(name)`: decode `name` from storage. Throws on failure.
+/// `SoundBuffer.open(name)`: read and probe `name` from storage, then
+/// decode it on a background worker. Throws synchronously only when the
+/// entry is missing or its container cannot be probed; a later packet
+/// decode failure surfaces as `getStatus()` staying `"unload"` with a
+/// logged warning.
 extern "C" fn sb_open(
     _engine: *mut c_void,
     instance: *mut c_void,
@@ -158,14 +165,14 @@ extern "C" fn sb_open(
     let Some(ctx) = native_ctx() else {
         return ffi::report_error(out_error, "sound natives are not registered");
     };
-    let audio = match decode_audio(&ctx.storage, &name) {
-        Ok(a) => Arc::new(a),
+    let track = match open_track(&ctx.storage, &name) {
+        Ok(t) => t,
         Err(e) => return ffi::report_error(out_error, &format!("SoundBuffer.open: {e}")),
     };
     let id = NEXT_BUFFER_ID.fetch_add(1, Ordering::SeqCst);
-    lock_ok(&BUFFER_AUDIO).insert(id, audio.clone());
-    *lock_ok(&LAST_OPENED) = Some(audio.clone());
-    inst.audio = Some(audio);
+    lock_ok(&BUFFER_AUDIO).insert(id, track.clone());
+    *lock_ok(&LAST_OPENED) = Some(track.clone());
+    inst.track = Some(track);
     inst.id = id;
     ffi::set_void_out(out);
     0
@@ -200,14 +207,10 @@ extern "C" fn sb_get_buffer_info(
 ) -> c_int {
     // SAFETY: instance is a valid SoundBufferInst payload for the call.
     let inst = unsafe { &*ffi::instance_ptr::<SoundBufferInst>(instance) };
-    match &inst.audio {
-        Some(a) => {
-            let info = format!(
-                "({},{},{:.2})",
-                a.sample_rate,
-                a.channels,
-                a.duration_seconds()
-            );
+    match &inst.track {
+        Some(t) => {
+            let duration = t.known_duration_seconds().unwrap_or(0.0);
+            let info = format!("({},{},{:.2})", t.sample_rate(), t.channels(), duration);
             ffi::set_string_out(out, &info);
         }
         None => ffi::set_void_out(out),
@@ -229,7 +232,7 @@ extern "C" fn sb_get_status(
     let inst = unsafe { &*ffi::instance_ptr::<SoundBufferInst>(instance) };
     ffi::set_string_out(
         out,
-        if inst.audio.is_some() {
+        if inst.track.as_ref().is_some_and(|t| t.is_ready()) {
             "ready"
         } else {
             "unload"
@@ -312,8 +315,8 @@ extern "C" fn sc_play(
     let source = match arg.ty {
         VAL_STRING => {
             let name = ffi::value_as_string(arg);
-            match decode_audio(&ctx.storage, &name) {
-                Ok(a) => Arc::new(a),
+            match open_track(&ctx.storage, &name) {
+                Ok(t) => t,
                 Err(e) => return ffi::report_error(out_error, &format!("SoundChannel.play: {e}")),
             }
         }
@@ -351,7 +354,7 @@ extern "C" fn sc_play(
                 &format!("SoundChannel#{}: mixer channel missing", inst.channel_id),
             );
         };
-        ch.play(source);
+        ch.play_track(source);
     }
     ffi::set_void_out(out);
     0
@@ -601,8 +604,10 @@ extern "C" fn sc_get_status(
     _objthis: *mut c_void,
 ) -> c_int {
     with_channel!(instance, out_error, ch, {
-        let status = match (ch.source.is_some(), ch.playing, ch.paused) {
-            (false, _, _) => "unload",
+        let status = match (&ch.source, ch.playing, ch.paused) {
+            (None, _, _) => "unload",
+            (Some(s), _, _) if s.is_failed() => "stop",
+            (Some(s), _, _) if !s.is_ready() => "unload",
             (_, true, false) => "play",
             (_, true, true) => "pause",
             (_, false, _) => "stop",

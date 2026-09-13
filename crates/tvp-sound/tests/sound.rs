@@ -99,6 +99,35 @@ fn mounted(dir: &TestDir, name: &str, bytes: &[u8]) -> Arc<Mutex<Storage>> {
     ))
 }
 
+/// Wait until a `SoundBuffer` finishes its background decode (`getStatus`
+/// reaches `"ready"`).
+fn wait_buffer_ready(e: &Tjs2Engine, var: &str) {
+    for _ in 0..10_000 {
+        if matches!(
+            e.eval(&format!("{var}.getStatus()"), "wait"),
+            Ok(TjsValue::String(s)) if s == "ready"
+        ) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    panic!("{var} never became ready");
+}
+
+/// Wait until a `SoundChannel` starts playing (its source is ready).
+fn wait_channel_playing(e: &Tjs2Engine, var: &str) {
+    for _ in 0..10_000 {
+        if matches!(
+            e.eval(&format!("{var}.isPlaying()"), "wait"),
+            Ok(TjsValue::Integer(1))
+        ) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    panic!("{var} never started playing");
+}
+
 // ---------------------------------------------------------------------------
 // decode
 // ---------------------------------------------------------------------------
@@ -225,12 +254,13 @@ fn soundbuffer_decodes_from_storage() {
     )
     .unwrap();
 
+    wait_buffer_ready(&e, "b");
     assert_eq!(
         e.eval("info", "sb1").unwrap(),
         TjsValue::String("(44100,1,1.00)".into())
     );
     assert_eq!(
-        e.eval("status", "sb1").unwrap(),
+        e.eval("b.getStatus()", "sb1").unwrap(),
         TjsValue::String("ready".into())
     );
     match e.eval("bid", "sb1").unwrap() {
@@ -299,6 +329,7 @@ fn channel_play_advance_position_and_done() {
         "ch1",
     )
     .unwrap();
+    wait_channel_playing(&e, "ch");
     assert_eq!(
         e.eval("ch.isPlaying()", "ch1").unwrap(),
         TjsValue::Integer(1)
@@ -356,6 +387,7 @@ fn channel_loop_wraps_position() {
         "ch2",
     )
     .unwrap();
+    wait_channel_playing(&e, "ch");
     advance(1.2); // one full second, then 0.2s into the loop
     assert_eq!(
         e.eval("ch.isPlaying()", "ch2").unwrap(),
@@ -395,6 +427,7 @@ fn channel_pause_resume_stop_and_status() {
         "ch3",
     )
     .unwrap();
+    wait_channel_playing(&e, "ch");
     advance(1.0);
     e.exec_script("ch.pause();", "ch3").unwrap();
     assert_eq!(
@@ -463,6 +496,7 @@ fn channel_volume_pan_clamp_and_source_switch() {
         "ch4",
     )
     .unwrap();
+    wait_channel_playing(&e, "ch");
 
     // volume clamps to 0..1
     e.exec_script("ch.setVolume(2.0);", "ch4").unwrap();
@@ -521,6 +555,7 @@ fn channel_play_by_name_and_by_id() {
     // play by storage name (decoded on the fly)
     e.exec_script("var ch = new SoundChannel(); ch.play(\"one.wav\");", "ch5")
         .unwrap();
+    wait_channel_playing(&e, "ch");
     assert_eq!(
         e.eval("ch.isPlaying()", "ch5").unwrap(),
         TjsValue::Integer(1)
@@ -536,6 +571,7 @@ fn channel_play_by_name_and_by_id() {
         "ch5",
     )
     .unwrap();
+    wait_channel_playing(&e, "ch");
     assert_eq!(
         e.eval("ch.isPlaying()", "ch5").unwrap(),
         TjsValue::Integer(1)
@@ -561,6 +597,7 @@ fn channel_fade_ramps_volume() {
         "ch6",
     )
     .unwrap();
+    wait_channel_playing(&e, "ch");
     advance(0.5); // halfway through the 1s fade
     let v = match e.eval("ch.getVolume()", "ch6").unwrap() {
         TjsValue::Real(v) => v,
@@ -600,6 +637,7 @@ fn channel_set_volume_cancels_fade() {
         "ch7",
     )
     .unwrap();
+    wait_channel_playing(&e, "ch");
     advance(0.5); // the cancelled fade must not move the volume
     assert_eq!(
         e.eval("ch.getVolume()", "ch7").unwrap(),
@@ -640,6 +678,7 @@ fn channel_play_errors() {
         "ch8",
     )
     .unwrap();
+    wait_channel_playing(&e, "ch");
     assert_eq!(
         e.eval("ch.isPlaying()", "ch8").unwrap(),
         TjsValue::Integer(1)

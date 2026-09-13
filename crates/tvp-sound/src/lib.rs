@@ -1,21 +1,27 @@
 //! # tvp-sound — decoding + clock-driven playback + the TVP sound natives
 //!
-//! The audio module of krkr-rs, in three layers:
+//! The audio module of krkr-rs, in four layers:
 //!
 //! 1. **[`decode`]** — `decode_audio(storage, name)` turns a storage entry
 //!    (wav / ogg / vorbis / flac / mp3) into fully-decoded interleaved
-//!    `f32` PCM ([`DecodedAudio`]).
-//! 2. **[`mixer`]** — a global clock-driven [`Mixer`] of [`Channel`]s.
+//!    `f32` PCM ([`DecodedAudio`]). It also exposes `probe_audio` and
+//!    [`StreamDecoder`], the building blocks of the asynchronous path.
+//! 2. **[`source`]** — [`AudioTrack`]: asynchronous loading. `open_track`
+//!    reads and probes on the calling thread, then a background worker
+//!    decodes short sounds whole and long tracks into a bounded decode-ahead
+//!    ring, so `open` never blocks on the packet decode and long BGM uses
+//!    bounded memory.
+//! 3. **[`mixer`]** — a global clock-driven [`Mixer`] of [`Channel`]s.
 //!    Playback is **pure computation**: the app's update loop calls
 //!    [`advance`] (or `Mixer::advance(dt)`) each frame, which moves
 //!    positions, applies fades, and sets per-channel "done" state. No audio
 //!    device is involved — this machine is headless and everything must
 //!    work without one. [`player`] is the optional rodio output half.
-//! 3. **[`natives`]** — `register_sound(engine, storage)` registers the
+//! 4. **[`natives`]** — `register_sound(engine, storage)` registers the
 //!    `SoundBuffer` and `SoundChannel` native classes. `SoundBuffer`
-//!    decodes a storage entry; `SoundChannel` is a thin handle onto a mixer
-//!    channel (`play`/`stop`/`pause`/`resume`, position, volume `0..1`,
-//!    pan `-1..1`, loop, fades, `isPlaying`/`isDone`).
+//!    loads a storage entry asynchronously; `SoundChannel` is a thin handle
+//!    onto a mixer channel (`play`/`stop`/`pause`/`resume`, position, volume
+//!    `0..1`, pan `-1..1`, loop, fades, `isPlaying`/`isDone`).
 //!
 //! # Decoder choice (documented)
 //!
@@ -45,14 +51,19 @@ pub mod decode;
 pub mod mixer;
 pub mod natives;
 pub mod player;
+pub mod source;
 pub mod wavesound;
 
 mod ffi;
 
-pub use decode::{DecodeError, DecodedAudio, decode_audio, decode_audio_bytes};
+pub use decode::{
+    AudioMetadata, DecodeError, DecodedAudio, StreamDecoder, decode_audio, decode_audio_bytes,
+    probe_audio,
+};
 pub use mixer::{Channel, Fade, Mixer};
 pub use natives::register_sound;
 pub use natives::set_sound_output_enabled;
+pub use source::{AudioTrack, active_decode_workers, open_track, open_track_bytes};
 pub use wavesound::sound_poll;
 
 pub use player::{

@@ -13,8 +13,9 @@
 //!   instance, since the derived ctor calls `WaveSoundBuffer(owner)` with
 //!   `this` bound) and `owner` (the action owner that receives
 //!   `action(ev)`), mirroring the reference's `Owner`/`ActionOwner`.
-//! - `open(name)` — decode `name` from storage; the buffer becomes
-//!   "stopped" (TVP: status is "unload" until opened).
+//! - `open(name)` — read and probe `name` from storage, then decode it on
+//!   a background worker (whole-file for short sounds, bounded streaming
+//!   for long tracks). The buffer stays "unload" until the data is ready.
 //! - `play(pos = 0)` — start playback from `pos` seconds (or the current
 //!   position when `pos` is 0 and the channel is already playing, matching
 //!   the reference's play-from-current-position).
@@ -62,7 +63,7 @@
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::sync::{LazyLock, Mutex, OnceLock};
 
 use tjs2_sys::{
     DetachedValue, NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef,
@@ -302,8 +303,8 @@ extern "C" fn ws_open(
     let Some(ctx) = native_ctx() else {
         return ffi::report_error(out_error, "sound natives are not registered");
     };
-    let audio = match crate::decode::decode_audio(&ctx.storage, &name) {
-        Ok(a) => Arc::new(a),
+    let track = match crate::source::open_track(&ctx.storage, &name) {
+        Ok(t) => t,
         Err(e) => return ffi::report_error(out_error, &format!("WaveSoundBuffer.open: {e}")),
     };
 
@@ -321,8 +322,9 @@ extern "C" fn ws_open(
             &format!("WaveSoundBuffer#{}: mixer channel missing", st.channel_id),
         );
     };
-    // Load the source without starting playback (the poll derives "stop").
-    ch.source = Some(audio);
+    // Install the (possibly still-loading/streaming) track without starting
+    // playback; the poll derives "stop" once it is ready.
+    ch.source = Some(track);
     ch.playing = false;
     ch.paused = false;
     ch.done = false;
@@ -364,13 +366,13 @@ extern "C" fn ws_play(
         }
     }
     with_channel!(inst, out_error, ch, {
-        let Some(audio) = ch.source.clone() else {
+        let Some(track) = ch.source.clone() else {
             // Nothing loaded (open failed): the reference's Play simply
             // does nothing when there is no decoder.
             ffi::set_void_out(out);
             return 0;
         };
-        ch.play(audio);
+        ch.play_track(track);
         if pos > 0.0 {
             ch.set_position(pos);
         }
@@ -1005,15 +1007,20 @@ pub(crate) fn register_wavesound(engine: &Tjs2Engine) -> Result<(), String> {
 }
 
 /// Derive a stream's script-visible status from its mixer channel state.
+///
+/// A source that is still decoding or failed reads as `unload`; the status
+/// only becomes `stop`/`play`/`pause` once the track is ready, so scripts
+/// never see a spurious `stop` before the data lands. A failed decode reads
+/// as `stop` (matching the silent-fallback behaviour) so wait-sequences
+/// still advance.
 fn derive_status(ch: &Channel) -> Status {
-    if ch.source.is_none() {
-        Status::Unload
-    } else if !ch.playing {
-        Status::Stop
-    } else if ch.paused {
-        Status::Pause
-    } else {
-        Status::Play
+    match &ch.source {
+        None => Status::Unload,
+        Some(s) if s.is_failed() => Status::Stop,
+        Some(s) if !s.is_ready() => Status::Unload,
+        Some(_) if !ch.playing => Status::Stop,
+        Some(_) if ch.paused => Status::Pause,
+        Some(_) => Status::Play,
     }
 }
 

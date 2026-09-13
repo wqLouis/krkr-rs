@@ -23,6 +23,7 @@
 use std::sync::{Arc, Mutex};
 
 use crate::decode::DecodedAudio;
+use crate::source::AudioTrack;
 
 /// Volume clamp (the task's channel surface uses `0..=1`; the reference
 /// engine uses `0..=100000` — see the crate docs for the scale mapping).
@@ -84,8 +85,9 @@ impl Fade {
 pub struct Channel {
     /// Stable channel id (assigned by the [`Mixer`]).
     pub id: u64,
-    /// Decoded source, if one has been `play`ed.
-    pub source: Option<Arc<DecodedAudio>>,
+    /// Source, if one has been `play`ed. The track may still be loading or
+    /// streaming; the mixer renders silence until frames are available.
+    pub source: Option<Arc<AudioTrack>>,
     /// Whether playback is running (`false` after `stop`, at end, ...).
     pub playing: bool,
     /// Whether playback is paused (`position` does not advance).
@@ -135,12 +137,18 @@ impl Channel {
             && self
                 .source
                 .as_ref()
-                .is_some_and(|s| !s.samples.is_empty() && s.channels > 0)
+                .is_some_and(|s| s.is_ready() && !s.is_empty())
     }
 
-    /// Start (or restart) `source` from position 0.
+    /// Start (or restart) a fully-decoded source from position 0.
     pub fn play(&mut self, source: Arc<DecodedAudio>) {
-        self.source = Some(source);
+        self.play_track(AudioTrack::from_decoded(source));
+    }
+
+    /// Start (or restart) `track` from position 0. Accepts a still-loading
+    /// or streaming track: playback begins as soon as frames are available.
+    pub fn play_track(&mut self, track: Arc<AudioTrack>) {
+        self.source = Some(track);
         self.playing = true;
         self.paused = false;
         self.position_seconds = 0.0;
@@ -175,6 +183,11 @@ impl Channel {
     /// the end, which stops the channel on the next advance).
     pub fn set_position(&mut self, secs: f64) {
         self.position_seconds = secs.max(0.0);
+        // A streaming track must restart its decoder near the new position;
+        // a whole-file track already has every frame in memory.
+        if let Some(source) = &self.source {
+            source.request_seek_seconds(self.position_seconds);
+        }
     }
 
     /// Set the base volume (clamped to `0..=1`); cancels an active fade.
@@ -210,7 +223,8 @@ impl Channel {
         self.fade_finished = false;
     }
 
-    /// Duration of the current source in seconds (0 when unloaded).
+    /// Duration of the current source in seconds (0 when unloaded,
+    /// `INFINITY` when the source's length is unknown).
     pub fn duration_seconds(&self) -> f64 {
         self.source.as_ref().map_or(0.0, |a| a.duration_seconds())
     }
@@ -230,27 +244,51 @@ impl Channel {
 
         let mut became_done = false;
         if self.is_playing() {
-            let dur = self.duration_seconds();
-            if dur <= 0.0 {
-                self.playing = false;
-                self.done = true;
-                return true;
-            }
             self.position_seconds += dt;
-            if self.position_seconds >= dur {
+            let dur = self.duration_seconds();
+            // A known duration uses the reference's exact-end semantics;
+            // an unknown-duration stream is done once it has produced all
+            // of its frames.
+            let at_end = if dur.is_finite() {
+                self.position_seconds >= dur
+            } else {
+                self.source
+                    .as_ref()
+                    .is_some_and(|s| s.has_ended_at(self.position_seconds))
+            };
+            if at_end {
                 if self.looping {
-                    // Wrap around, keeping the overshoot remainder.
-                    self.position_seconds %= dur;
-                } else if self.position_seconds > dur {
-                    // Strictly past the end: done. (Exactly at the end the
-                    // channel is still "playing" until the next advance,
-                    // matching the task's "advance(1.0) → isDone false"
-                    // for a 1s source.)
-                    self.position_seconds = dur;
+                    if dur.is_finite() {
+                        // Wrap around, keeping the overshoot remainder.
+                        self.position_seconds %= dur;
+                    } else {
+                        // A streaming loop restarts its decoder at 0.
+                        self.position_seconds = 0.0;
+                    }
+                    if let Some(source) = &self.source {
+                        source.on_loop_wrap();
+                    }
+                } else if dur.is_finite() {
+                    if self.position_seconds > dur {
+                        // Strictly past the end: done. (Exactly at the end
+                        // the channel is still "playing" until the next
+                        // advance, matching the task's "advance(1.0) →
+                        // isDone false" for a 1s source.)
+                        self.position_seconds = dur;
+                        self.playing = false;
+                        self.done = true;
+                        became_done = true;
+                    }
+                } else {
                     self.playing = false;
                     self.done = true;
                     became_done = true;
                 }
+            }
+            // Free decoded frames the playback position has passed so a
+            // streaming worker can keep decoding ahead with bounded memory.
+            if let Some(source) = &self.source {
+                source.release_before(self.position_seconds);
             }
         }
         became_done
@@ -384,10 +422,9 @@ impl Mixer {
                 continue;
             }
             let (gl, gr) = pan_gains(c.pan);
-            let src_rate = f64::from(src.sample_rate.max(1));
-            let src_ch = usize::from(src.channels);
-            let total_frames = src.frames() as usize;
-            if src_ch > 2 || total_frames == 0 {
+            let src_rate = f64::from(src.sample_rate().max(1));
+            let src_ch = src.channels();
+            if src_ch == 0 || src_ch > 2 {
                 continue;
             }
             for (i, frame) in out.chunks_mut(out_ch).enumerate() {
@@ -397,21 +434,23 @@ impl Mixer {
                 // forever (effectively silence).
                 let t = c.position_seconds + i as f64 / out_rate_f;
                 let sample_pos = (t * src_rate).max(0.0);
-                let i0 = sample_pos.floor() as usize;
+                let i0 = sample_pos.floor() as u64;
                 let frac = (sample_pos - i0 as f64) as f32;
-                let i0 = i0.min(total_frames - 1);
-                let i1 = (i0 + 1).min(total_frames - 1);
+                // A frame that is not decoded yet (loading/underrun) yields
+                // no output for this sample instead of blocking; the last
+                // frame of a complete source reuses itself (clamped), which
+                // is what the old `i1.min(total_frames - 1)` did.
+                let Some((a0, b0)) = src.frame(i0) else {
+                    continue;
+                };
+                let (a1, b1) = src.frame(i0 + 1).unwrap_or((a0, b0));
                 // Linear interpolation: source and device rates usually
                 // differ (48 kHz Vorbis/Opus on a 44.1 kHz device), and
                 // nearest-neighbour sampling there is audibly aliased.
                 let (l, r) = if src_ch == 1 {
-                    let a = src.samples[i0];
-                    let b = src.samples[i1];
-                    let s = a + (b - a) * frac;
+                    let s = a0 + (a1 - a0) * frac;
                     (s, s)
                 } else {
-                    let (a0, b0) = (src.samples[i0 * 2], src.samples[i0 * 2 + 1]);
-                    let (a1, b1) = (src.samples[i1 * 2], src.samples[i1 * 2 + 1]);
                     (a0 + (a1 - a0) * frac, b0 + (b1 - b0) * frac)
                 };
                 if out_ch == 1 {

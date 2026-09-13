@@ -88,8 +88,22 @@ fn wavesoundbuffer_subclass_shadowing_and_status_events() {
     // its `super`.
 
     // play() transition -> onStatusChanged override -> super -> action(ev).
-    advance(0.05);
-    sound_poll(&e, 0.05);
+    // The 0.2s WAV decodes asynchronously; pump the poll at clock 0 until
+    // the play transition fires.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        advance(0.0);
+        sound_poll(&e, 0.0);
+        if e.eval("actionStatus", "probe").unwrap() == TjsValue::String("play".into()) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "play transition never fired: {:?}",
+            e.eval("actionStatus", "probe")
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
     assert_eq!(
         e.eval("overrideCount >= 1", "probe").unwrap(),
         TjsValue::Integer(1),
