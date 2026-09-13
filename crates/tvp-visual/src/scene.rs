@@ -206,13 +206,16 @@ impl Scene {
             hold_alpha: false,
             is_primary: false,
         });
-        // First layer of a window becomes its primary layer.
+        // First layer of a window becomes its primary layer, which the
+        // reference `tTVPLayerManager::AttachPrimary` forces visible (a new
+        // layer otherwise defaults to hidden).
         if primary {
             if let Some(w) = self.window_mut(window) {
                 w.primary_layer = Some(id);
             }
             if let Some(l) = self.layer_mut(id) {
                 l.is_primary = true;
+                l.visible = true;
             }
         }
         match parent {

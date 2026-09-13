@@ -396,14 +396,23 @@ impl Mixer {
                 // position made the output device replay the first buffer
                 // forever (effectively silence).
                 let t = c.position_seconds + i as f64 / out_rate_f;
-                let sample_pos = t * src_rate;
-                let idx = (sample_pos.floor() as usize).min(total_frames - 1);
-                let base = idx * src_ch;
+                let sample_pos = (t * src_rate).max(0.0);
+                let i0 = sample_pos.floor() as usize;
+                let frac = (sample_pos - i0 as f64) as f32;
+                let i0 = i0.min(total_frames - 1);
+                let i1 = (i0 + 1).min(total_frames - 1);
+                // Linear interpolation: source and device rates usually
+                // differ (48 kHz Vorbis/Opus on a 44.1 kHz device), and
+                // nearest-neighbour sampling there is audibly aliased.
                 let (l, r) = if src_ch == 1 {
-                    let s = src.samples[base];
+                    let a = src.samples[i0];
+                    let b = src.samples[i1];
+                    let s = a + (b - a) * frac;
                     (s, s)
                 } else {
-                    (src.samples[base], src.samples[base + 1])
+                    let (a0, b0) = (src.samples[i0 * 2], src.samples[i0 * 2 + 1]);
+                    let (a1, b1) = (src.samples[i1 * 2], src.samples[i1 * 2 + 1]);
+                    (a0 + (a1 - a0) * frac, b0 + (b1 - b0) * frac)
                 };
                 if out_ch == 1 {
                     frame[0] += (l * gl + r * gr) * 0.5 * v;
@@ -412,6 +421,11 @@ impl Mixer {
                     frame[1] += r * v * gr;
                 }
             }
+        }
+        // Keep the summed mix in range so the device never hard-clips a
+        // loud voice + BGM overlap into crackle.
+        for s in out.iter_mut() {
+            *s = s.clamp(-1.0, 1.0);
         }
     }
 }
