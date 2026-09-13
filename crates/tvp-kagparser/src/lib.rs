@@ -109,7 +109,7 @@ pub mod kvp;
 pub mod shim;
 pub mod state;
 
-use state::{Environ, EvalResult, KagParserState};
+use state::{Environ, EvalResult, KagParserState, LabelCallback};
 
 // ---------------------------------------------------------------------------
 // context
@@ -410,6 +410,16 @@ unsafe fn state_of(instance: *mut c_void) -> &'static mut KagParserState {
 /// (storage) for the [`Environ`] the parser walks in.
 type EvalClosure = Box<dyn FnMut(&str) -> Result<EvalResult, String>>;
 type LoadClosure = Box<dyn FnMut(&str) -> Result<String, String>>;
+/// A callback that fires the owner object's `onLabel(label, pageName)`.
+type LabelClosure = Box<dyn FnMut(&str, Option<&str>)>;
+
+/// Reborrow a boxed label closure as a `dyn FnMut` with the borrow's own
+/// object lifetime. `Environ<'a>` is invariant over `'a`, so the `'static`
+/// object of `LabelClosure` cannot be returned directly; this helper applies
+/// the trait-object lifetime shortening explicitly.
+fn shorten_label_closure<'a>(c: &'a mut LabelClosure) -> LabelCallback<'a> {
+    &mut **c
+}
 
 /// Build the `Environ` (eval + storage callbacks) from the context. The
 /// closures own their `Arc`s so the VM and storage stay alive across the
@@ -418,10 +428,20 @@ struct ContextEnv {
     _engine: Arc<Tjs2Engine>,
     eval_closure: EvalClosure,
     load_closure: LoadClosure,
+    label_closure: Option<LabelClosure>,
 }
 
 impl ContextEnv {
     fn new() -> Result<Self, String> {
+        Self::new_with_owner(ptr::null_mut())
+    }
+
+    /// Build the environment and, when `owner` is non-null, a callback that
+    /// invokes `owner.onLabel(label, pageName)` (reference
+    /// `SkipCommentOrLabel`). Member lookup goes through the object's class
+    /// chain so a script subclass override runs; a missing `onLabel` (the
+    /// base class) is ignored.
+    fn new_with_owner(owner: *mut c_void) -> Result<Self, String> {
         let engine = context_engine()?;
         let storage = context_storage()?;
         let eval_closure: EvalClosure = {
@@ -452,17 +472,42 @@ impl ContextEnv {
             };
             decode_script(&bytes)
         });
+        let label_closure: Option<LabelClosure> = if owner.is_null() {
+            None
+        } else {
+            // Retain lazily inside the callback: labels are rare compared
+            // with `getNextTag` calls, and the owner pointer is alive for the
+            // whole native call anyway.
+            let engine = engine.clone();
+            Some(Box::new(move |label: &str, page: Option<&str>| {
+                let Ok(id) = engine.retain_object_detached(owner) else {
+                    return;
+                };
+                let args = [
+                    TjsValue::String(label.to_string()),
+                    page.map(|p| TjsValue::String(p.to_string()))
+                        .unwrap_or(TjsValue::Void),
+                ];
+                // Ignore a missing `onLabel` (base KAGParser) and any error a
+                // handler raises; the reference FuncCall result is likewise
+                // not acted on.
+                let _ = engine.call_member(id.raw_id(), "onLabel", &args);
+            }))
+        };
         Ok(ContextEnv {
             _engine: engine,
             eval_closure,
             load_closure,
+            label_closure,
         })
     }
 
     fn environ(&mut self) -> Environ<'_> {
+        let fire_label = self.label_closure.as_mut().map(shorten_label_closure);
         Environ {
             eval: &mut *self.eval_closure,
             load_storage: &mut *self.load_closure,
+            fire_label,
         }
     }
 }
@@ -577,10 +622,12 @@ extern "C" fn native_get_next_tag(
     _argv: *const Value,
     out: *mut Value,
     out_error: *mut *mut c_char,
-    _objthis: *mut c_void,
+    objthis: *mut c_void,
 ) -> c_int {
     let st = unsafe { state_of(instance) };
-    let mut ctx = match ContextEnv::new() {
+    // The owner object is needed to fire `onLabel(label, pageName)` as the
+    // walk passes labels (the reference `SkipCommentOrLabel`).
+    let mut ctx = match ContextEnv::new_with_owner(objthis) {
         Ok(v) => v,
         Err(e) => return error_out(out_error, &e),
     };
@@ -899,6 +946,51 @@ extern "C" fn native_set_process_special_tags(
     }
 }
 
+/// `getMultiLineTagEnabled()` (KAGParserEx extension).
+extern "C" fn native_get_multi_line_tag_enabled(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    _argc: c_int,
+    _argv: *const Value,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    set_out_integer(
+        out,
+        unsafe { state_of(instance) }.get_multi_line_tag_enabled() as i64,
+    );
+    0
+}
+
+/// `setMultiLineTagEnabled(v)` (KAGParserEx extension).
+extern "C" fn native_set_multi_line_tag_enabled(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    if argc < 1 {
+        return error_out(
+            out_error,
+            "KAGParser.setMultiLineTagEnabled requires 1 argument",
+        );
+    }
+    // SAFETY: argv points to `argc` valid entries for the call.
+    let args = unsafe { std::slice::from_raw_parts(argv, argc as usize) };
+    match param_to_bool(&args[0]) {
+        Ok(v) => {
+            unsafe { state_of(instance) }.set_multi_line_tag_enabled(v);
+            set_out_void(out);
+            0
+        }
+        Err(e) => error_out(out_error, &e),
+    }
+}
+
 /// `getDebugLevel()`.
 extern "C" fn native_get_debug_level(
     _engine: *mut c_void,
@@ -1207,6 +1299,37 @@ extern "C" fn prop_debug_level_get(
     0
 }
 
+extern "C" fn prop_multi_line_tag_enabled_get(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    set_out_integer(
+        out,
+        unsafe { state_of(instance) }.get_multi_line_tag_enabled() as i64,
+    );
+    0
+}
+
+extern "C" fn prop_multi_line_tag_enabled_set(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    value: *const Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: value follows the trampoline contract.
+    match param_to_bool(unsafe { &*value }) {
+        Ok(v) => {
+            unsafe { state_of(instance) }.set_multi_line_tag_enabled(v);
+            0
+        }
+        Err(e) => error_out(_out_error, &e),
+    }
+}
+
 extern "C" fn prop_debug_level_set(
     _engine: *mut c_void,
     instance: *mut c_void,
@@ -1481,6 +1604,14 @@ pub fn register_kagparser(engine: &Tjs2Engine) -> Result<(), String> {
                 f: native_set_process_special_tags,
             },
             NativeInstanceMethodDef {
+                name: "getMultiLineTagEnabled",
+                f: native_get_multi_line_tag_enabled,
+            },
+            NativeInstanceMethodDef {
+                name: "setMultiLineTagEnabled",
+                f: native_set_multi_line_tag_enabled,
+            },
+            NativeInstanceMethodDef {
                 name: "getDebugLevel",
                 f: native_get_debug_level,
             },
@@ -1531,6 +1662,11 @@ pub fn register_kagparser(engine: &Tjs2Engine) -> Result<(), String> {
                 name: "processSpecialTags",
                 get: Some(prop_process_special_tags_get),
                 set: Some(prop_process_special_tags_set),
+            },
+            NativeInstancePropertyDef {
+                name: "multiLineTagEnabled",
+                get: Some(prop_multi_line_tag_enabled_get),
+                set: Some(prop_multi_line_tag_enabled_set),
             },
             NativeInstancePropertyDef {
                 name: "debugLevel",
@@ -2204,5 +2340,81 @@ mod tests {
             env.eval_ok("p.getCurStorage()"),
             TjsValue::String("".into())
         );
+    }
+
+    #[test]
+    fn multi_line_tag_property_parses_ams_continuations() {
+        let _vm_lock = vm_lock();
+        // The exact shape the game's AnimationSequenceController uses:
+        // `multiLineTagEnabled = true` then a `.ams` `@motion` whose `path`
+        // lives on a `;`-prefixed continuation line.
+        let env = TestEnv::new(
+            "multiline",
+            &[ks(
+                "test.ams",
+                "@motion id=MARK accel=2 time=750 \\\n; path=\"0, 1, 2\"\n@wait time=750\n",
+            )],
+        );
+        env.exec_ok(
+            "var p = new KAGParser(); \
+             p.multiLineTagEnabled = true; \
+             p.ignoreCR = true; \
+             p.loadScenario('test.ams'); \
+             var m = p.getNextTag(); var w = p.getNextTag();",
+        );
+        assert_eq!(env.eval_ok("m.tagname"), TjsValue::String("motion".into()));
+        assert_eq!(env.eval_ok("m.id"), TjsValue::String("MARK".into()));
+        assert_eq!(env.eval_ok("m.time"), TjsValue::String("750".into()));
+        assert_eq!(env.eval_ok("m.path"), TjsValue::String("0, 1, 2".into()));
+        assert_eq!(env.eval_ok("w.tagname"), TjsValue::String("wait".into()));
+        // the property round-trips and defaults to off
+        assert_eq!(env.eval_ok("p.multiLineTagEnabled"), TjsValue::Integer(1));
+        env.exec_ok("var q = new KAGParser(); var qd = q.multiLineTagEnabled;");
+        assert_eq!(env.eval_ok("qd"), TjsValue::Integer(0));
+        // without the property the continuation line stays a comment and
+        // `path` is lost
+        env.exec_ok(
+            "var r = new KAGParser(); r.ignoreCR = true; r.loadScenario('test.ams'); \
+             var rm = r.getNextTag(); var rpath = rm.path;",
+        );
+        assert_eq!(
+            env.eval_ok("(rpath === null) || (rpath === void)"),
+            TjsValue::Integer(1)
+        );
+    }
+
+    #[test]
+    fn on_label_fires_on_script_subclass() {
+        let _vm_lock = vm_lock();
+        // AnimationSequenceController.onLabel reads the page name to decide
+        // fixed vs volatile caching for `*attribute|...` labels.
+        let env = TestEnv::new(
+            "onlabel",
+            &[ks("test.ks", "*attribute|fixed\n@x a=1\n*loop\n@y b=2\n")],
+        );
+        env.exec_ok(
+            "var labels = []; var pages = []; \
+             class C extends KAGParser { \
+                 function C() { super.KAGParser(); ignoreCR = true; } \
+                 function onLabel(l, p) { labels.add(l); pages.add(p); } \
+             } \
+             var c = new C(); c.loadScenario('test.ks'); \
+             while (c.getNextTag() !== void) {}",
+        );
+        assert_eq!(env.eval_ok("labels.count"), TjsValue::Integer(2));
+        assert_eq!(
+            env.eval_ok("labels[0]"),
+            TjsValue::String("*attribute".into())
+        );
+        assert_eq!(env.eval_ok("pages[0]"), TjsValue::String("fixed".into()));
+        assert_eq!(env.eval_ok("labels[1]"), TjsValue::String("*loop".into()));
+        // a label without a page passes void as the second argument
+        assert_eq!(env.eval_ok("pages[1] === void"), TjsValue::Integer(1));
+        // a base KAGParser has no onLabel; the walk must still work
+        env.exec_ok(
+            "var p = new KAGParser(); p.loadScenario('test.ks'); \
+             var n = 0; while (p.getNextTag() !== void) n++;",
+        );
+        assert_eq!(env.eval_ok("n > 0"), TjsValue::Integer(1));
     }
 }

@@ -60,6 +60,8 @@ class KAGParserCompat {
 	function getMP(){ return _p.getMP(); }
 	function getDebugLevel(){ return _p.getDebugLevel(); }
 	function setDebugLevel(v){ return _p.setDebugLevel(v); }
+	function getMultiLineTagEnabled(){ return _p.getMultiLineTagEnabled(); }
+	function setMultiLineTagEnabled(v){ return _p.setMultiLineTagEnabled(v); }
 	property ignoreCR {
 		getter{ return _p.getIgnoreCR(); }
 		setter(v){ return _p.setIgnoreCR(v); }
@@ -67,6 +69,10 @@ class KAGParserCompat {
 	property processSpecialTags {
 		getter{ return _p.getProcessSpecialTags(); }
 		setter(v){ return _p.setProcessSpecialTags(v); }
+	}
+	property multiLineTagEnabled {
+		getter{ return _p.getMultiLineTagEnabled(); }
+		setter(v){ return _p.setMultiLineTagEnabled(v); }
 	}
 	property debugLevel {
 		getter{ return _p.getDebugLevel(); }

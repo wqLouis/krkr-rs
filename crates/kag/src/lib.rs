@@ -69,6 +69,9 @@
 //! * Label names keep their leading `*` (the reference's label cache is
 //!   keyed by `*name`, and `GoToLabel`/`CallLabel` receive `*`-prefixed
 //!   names).
+//! * The KAGParserEx *multi-line tag* extension is available opt-in through
+//!   [`ParseOptions::multiline_tags`] (the `multiLineTagEnabled` property);
+//!   [`parse`] leaves it off, matching the base parser.
 //! * Duplicate labels: the reference suffixes duplicates (`name:2`, …) for
 //!   jump disambiguation; this crate records the first occurrence in
 //!   [`Scenario::labels`].
@@ -160,22 +163,65 @@ pub enum Error {
 /// Convenience alias.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Parse a KAG scenario from decoded UTF-8 text.
+/// Options controlling [`parse_with_options`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ParseOptions {
+    /// Enable the KAGParserEx *multi-line tag* extension
+    /// (`multiLineTagEnabled`): a tag line that ends with whitespace + `\`
+    /// continues on the next line, which must begin with `;` (a comment to
+    /// the base parser):
+    ///
+    /// ```text
+    /// @tag hoge=123 fuga=test \
+    /// ;    someoption=true \
+    /// ;    andmore=false
+    /// ```
+    ///
+    /// The trailing `\` and the leading `;` of each continuation line are
+    /// removed and the lines are joined with the whitespace that preceded
+    /// the `\`. A `\` not preceded by whitespace is *not* a continuation
+    /// (it is part of the preceding value), and a continuation whose next
+    /// line does not start with `;` is a syntax error, matching the
+    /// reference KAGParserEx.
+    pub multiline_tags: bool,
+}
+
+/// Parse a KAG scenario from decoded UTF-8 text with default options.
 ///
 /// See the [crate-level documentation](crate) for the exact syntax and for
 /// the deliberate divergences from the reference C++ parser.
 pub fn parse(source: &str) -> Result<Scenario> {
-    let lines = split_lines(source);
-    if lines.is_empty() {
+    parse_with_options(source, ParseOptions::default())
+}
+
+/// Parse a KAG scenario from decoded UTF-8 text.
+///
+/// Identical to [`parse`] except that KAGParserEx features can be enabled
+/// through [`ParseOptions`].
+///
+/// See the [crate-level documentation](crate) for the exact syntax and for
+/// the deliberate divergences from the reference C++ parser.
+pub fn parse_with_options(source: &str, options: ParseOptions) -> Result<Scenario> {
+    let raw_lines = split_lines(source);
+    if raw_lines.is_empty() {
         return Err(Error::EmptyScenario);
     }
+    // The reference strips leading tabs from every line (LoadScenario
+    // pass 2) before classifying it; multi-line joining operates on the
+    // tab-stripped text.
+    let lines: Vec<(usize, String)> = if options.multiline_tags {
+        join_multiline_lines(&raw_lines)?
+    } else {
+        raw_lines
+            .iter()
+            .enumerate()
+            .map(|(idx, line)| (idx + 1, line.trim_start_matches('\t').to_string()))
+            .collect()
+    };
     let mut events = Vec::new();
     let mut labels = BTreeMap::new();
-    for (idx, line) in lines.iter().enumerate() {
-        let lineno = idx + 1;
-        // The reference strips leading tabs from every line (LoadScenario
-        // pass 2) before classifying it.
-        let content = line.trim_start_matches('\t');
+    for (lineno, content) in &lines {
+        let lineno = *lineno;
         if content.is_empty() {
             // Empty line: the reference emits an "r" tag here; we emit
             // nothing.
@@ -232,6 +278,56 @@ fn split_lines(source: &str) -> Vec<&str> {
         lines.push(&source[start..]);
     }
     lines
+}
+
+/// Join KAGParserEx multi-line tag continuations (see
+/// [`ParseOptions::multiline_tags`]).
+///
+/// Every returned entry is `(line_number, joined_content)` where
+/// `line_number` is the 1-based source line of the **first** line of the
+/// logical tag. Continuation lines are folded into it, so the line count of
+/// the result is smaller than the source line count.
+fn join_multiline_lines(lines: &[&str]) -> Result<Vec<(usize, String)>> {
+    let mut out: Vec<(usize, String)> = Vec::with_capacity(lines.len());
+    let mut i = 0;
+    while i < lines.len() {
+        let lineno = i + 1;
+        let mut current = lines[i].trim_start_matches('\t').to_string();
+        loop {
+            // A continuation marker is a trailing `\` that is preceded by
+            // at least one whitespace character (`@tag foo=1 \`).
+            let trimmed = current.trim_end_matches([' ', '\t']);
+            let is_continuation = trimmed.ends_with('\\')
+                && trimmed.len() >= 2
+                && trimmed[..trimmed.len() - 1].ends_with([' ', '\t']);
+            if !is_continuation {
+                break;
+            }
+            let Some(next_raw) = lines.get(i + 1) else {
+                return Err(Error::Syntax {
+                    line: lineno,
+                    message: "line continuation at end of file",
+                });
+            };
+            let next = next_raw.trim_start_matches('\t');
+            let Some(rest) = next.strip_prefix(';') else {
+                return Err(Error::Syntax {
+                    line: lineno,
+                    message: "line continuation must be followed by a ';' line",
+                });
+            };
+            // Drop only the trailing `\`, keeping the whitespace before it
+            // as the separator, then append the continuation line without
+            // its leading `;`.
+            let mut merged = trimmed[..trimmed.len() - 1].to_string();
+            merged.push_str(rest);
+            current = merged;
+            i += 1;
+        }
+        out.push((lineno, current));
+        i += 1;
+    }
+    Ok(out)
 }
 
 /// Split a label line into `(name, macro_name)`. `name` is the part before
@@ -1066,5 +1162,113 @@ mod tests {
             ]
         );
         assert_eq!(scenario.labels.get("*start"), Some(&1));
+    }
+
+    // --- KAGParserEx multi-line tags (multiLineTagEnabled) ----------------
+
+    fn opts() -> ParseOptions {
+        ParseOptions {
+            multiline_tags: true,
+        }
+    }
+
+    #[test]
+    fn multiline_line_command_is_joined() {
+        // The KAGParserEx readme example: a line command continued over
+        // `;`-prefixed lines.
+        let scenario = parse_with_options(
+            "@tag hoge=123 fuga=test \\\n;    someoption=true \\\n;    andmore=false\n",
+            opts(),
+        )
+        .unwrap();
+        assert_eq!(
+            scenario.events,
+            vec![tag(
+                "tag",
+                &[
+                    ("hoge", "123"),
+                    ("fuga", "test"),
+                    ("someoption", "true"),
+                    ("andmore", "false"),
+                ],
+                Bracket::At,
+                1,
+            )]
+        );
+    }
+
+    #[test]
+    fn multiline_bracket_tag_is_joined() {
+        // The `[tag ... ]` form works the same; the first line is the
+        // logical line number.
+        let scenario =
+            parse_with_options("hello\n[tag a=1 \\\n; b=2 \\\n; c=3]\n", opts()).unwrap();
+        assert_eq!(
+            scenario.events,
+            vec![
+                text("hello", 1),
+                tag(
+                    "tag",
+                    &[("a", "1"), ("b", "2"), ("c", "3")],
+                    Bracket::Square,
+                    2,
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn multiline_requires_a_space_before_the_backslash() {
+        // `hoge=123\` attaches the backslash to the value; it is not a
+        // continuation (reference KAGParserEx readme).
+        let scenario = parse_with_options("@tag hoge=123\\\n; next=1\n", opts()).unwrap();
+        match &scenario.events[0] {
+            Event::Tag { name, params, .. } => {
+                assert_eq!(name, "tag");
+                assert_eq!(params, &[("hoge".to_string(), "123\\".to_string())]);
+            }
+            other => panic!("expected tag, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multiline_continuation_must_be_followed_by_a_semicolon_line() {
+        let err = parse_with_options("@tag a=1 \\\nnext=2\n", opts()).unwrap_err();
+        assert_eq!(
+            err,
+            Error::Syntax {
+                line: 1,
+                message: "line continuation must be followed by a ';' line",
+            }
+        );
+    }
+
+    #[test]
+    fn multiline_continuation_at_eof_is_an_error() {
+        let err = parse_with_options("@tag a=1 \\\n", opts()).unwrap_err();
+        assert_eq!(
+            err,
+            Error::Syntax {
+                line: 1,
+                message: "line continuation at end of file",
+            }
+        );
+    }
+
+    #[test]
+    fn multiline_is_off_by_default() {
+        // Without the option the `\` is an ordinary attribute and the next
+        // line is a comment, so no continuation happens.
+        let scenario = parse("@tag a=1 \\\n; b=2\n").unwrap();
+        assert_eq!(
+            scenario.events,
+            vec![
+                tag("tag", &[("a", "1"), ("\\", "true")], Bracket::At, 1),
+                Event::Comment {
+                    text: " b=2".into(),
+                    line: 2,
+                },
+            ]
+        );
     }
 }

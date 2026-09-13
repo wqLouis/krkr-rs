@@ -92,12 +92,20 @@ fn format_real(r: f64) -> String {
     }
 }
 
+/// Owner callback that fires `onLabel(label, pageName)` as the walk passes
+/// a label line (reference `SkipCommentOrLabel`).
+pub type LabelCallback<'a> = &'a mut dyn FnMut(&str, Option<&str>);
+
 /// The environment a parser walks in: expression evaluation (into the TJS
 /// VM) and scenario loading (from storage). Both are injectable so the
 /// state machine stays pure and unit-testable.
 pub struct Environ<'a> {
     pub eval: &'a mut dyn FnMut(&str) -> Result<EvalResult, String>,
     pub load_storage: &'a mut dyn FnMut(&str) -> Result<String, String>,
+    /// Fires the owner's `onLabel(label, pageName)` callback as the walk
+    /// passes a label line (reference `SkipCommentOrLabel`). `None` in pure
+    /// state-machine tests, where no owner object exists.
+    pub fire_label: Option<LabelCallback<'a>>,
 }
 
 /// One pending macro/emb expansion spliced ahead of the main event stream
@@ -221,6 +229,7 @@ pub struct KagParserState {
     interrupted: bool,
     ignore_cr: bool,
     process_special_tags: bool,
+    multi_line_tag_enabled: bool,
     debug_level: i32,
 }
 
@@ -257,6 +266,7 @@ impl Default for KagParserState {
             interrupted: false,
             ignore_cr: false,
             process_special_tags: true,
+            multi_line_tag_enabled: false,
             debug_level: 1,
         }
     }
@@ -281,7 +291,10 @@ impl KagParserState {
     /// Load a scenario from already-decoded text. The reference throws on
     /// an empty scenario and on syntax errors; we report the same.
     pub fn load_scenario_text(&mut self, name: &str, text: &str) -> Result<(), String> {
-        let scenario = kag::parse(text).map_err(|e| match e {
+        let options = kag::ParseOptions {
+            multiline_tags: self.multi_line_tag_enabled,
+        };
+        let scenario = kag::parse_with_options(text, options).map_err(|e| match e {
             kag::Error::EmptyScenario => MSG_NO_LINE.replace("%1", name),
             e => format!("{MSG_SYNTAX} ({e})"),
         })?;
@@ -327,7 +340,12 @@ impl KagParserState {
     }
 
     /// `r eol=true` emissions for empty lines before the first event.
+    /// Suppressed entirely when `ignore_cr` is on (the reference wraps every
+    /// line-end emission, including this leading gap, in `if(!IgnoreCR)`).
     fn initial_gap_lines(&self) -> usize {
+        if self.ignore_cr {
+            return 0;
+        }
         let first_line = self
             .events
             .first()
@@ -518,14 +536,18 @@ impl KagParserState {
                         return Err(MSG_LABEL_IN_MACRO.to_string());
                     }
                     // Mirror reference SkipCommentOrLabel: advancing past
-                    // a label updates the current label/page/line even
+                    // a label updates the current label/page/line and fires
+                    // the owner's `onLabel(label, pageName)` callback even
                     // though the label itself emits no tag.
                     let name = name.clone();
                     let macro_name = macro_name.clone();
                     let line = *line;
-                    self.cur_label = name;
-                    self.cur_page = macro_name.unwrap_or_default();
+                    self.cur_label = name.clone();
+                    self.cur_page = macro_name.clone().unwrap_or_default();
                     self.cur_line = line;
+                    if let Some(fire) = env.fire_label.as_deref_mut() {
+                        fire(&name, macro_name.as_deref());
+                    }
                     self.advance_current();
                 }
                 Event::Comment { .. } | Event::Directive { .. } => {
@@ -1088,6 +1110,10 @@ impl KagParserState {
             "processSpecialTags".into(),
             bool_str(self.process_special_tags),
         ));
+        v.push((
+            "multiLineTagEnabled".into(),
+            bool_str(self.multi_line_tag_enabled),
+        ));
         v.push(("interrupted".into(), bool_str(self.interrupted)));
         v.push(("debugLevel".into(), self.debug_level.to_string()));
         v.push(("excludeLevel".into(), self.exclude_level.to_string()));
@@ -1180,6 +1206,16 @@ impl KagParserState {
         let cur_page = get("curPage").unwrap_or("").to_string();
         let storage_short = get("storageShortName").unwrap_or("").to_string();
 
+        // Parser options must be in place *before* `load_scenario`, because
+        // `multi_line_tag_enabled` changes how the scenario text is parsed.
+        self.ignore_cr = get_bool("ignoreCR");
+        self.process_special_tags = get_bool("processSpecialTags");
+        self.multi_line_tag_enabled = get_bool("multiLineTagEnabled");
+        self.interrupted = get_bool("interrupted");
+        if let Some(d) = get_int("debugLevel") {
+            self.debug_level = d as i32;
+        }
+
         self.clear();
         if !storage.is_empty() {
             self.load_scenario(&storage, env)?;
@@ -1188,13 +1224,7 @@ impl KagParserState {
             self.go_to_label(&cur_label)?;
         }
 
-        // flags
-        self.ignore_cr = get_bool("ignoreCR");
-        self.process_special_tags = get_bool("processSpecialTags");
-        self.interrupted = get_bool("interrupted");
-        if let Some(d) = get_int("debugLevel") {
-            self.debug_level = d as i32;
-        }
+        // flags (the rest are position/state restored below)
         if let Some(i) = get_int("eventIndex") {
             self.event_index = i as usize;
         }
@@ -1351,6 +1381,16 @@ impl KagParserState {
 
     pub fn set_process_special_tags(&mut self, v: bool) {
         self.process_special_tags = v;
+    }
+
+    /// `multiLineTagEnabled` (KAGParserEx extension): join `\`-continued
+    /// tag lines (see [`kag::ParseOptions::multiline_tags`]).
+    pub fn get_multi_line_tag_enabled(&self) -> bool {
+        self.multi_line_tag_enabled
+    }
+
+    pub fn set_multi_line_tag_enabled(&mut self, v: bool) {
+        self.multi_line_tag_enabled = v;
     }
 
     pub fn get_debug_level(&self) -> i32 {
@@ -1889,6 +1929,7 @@ mod tests {
                         .cloned()
                         .ok_or_else(|| format!("storage {name} not found"))
                 },
+                fire_label: None,
             };
             f(state, &mut env)
         }
@@ -2119,6 +2160,47 @@ mod tests {
     }
 
     #[test]
+    fn nested_if_else_endif_restores_the_exclusion_level() {
+        // [if a [if b x else y] else z] — the inner endif must restore the
+        // outer exclusion level, not just pop one frame blindly.
+        let src =
+            "@if exp=\"a\"\n@if exp=\"b\"\n@x\n@else\n@y\n@endif\n@x2\n@else\n@z\n@endif\n@end\n";
+
+        // a=true, b=true → x, x2
+        let mut ev = |e: &str| Ok(EvalResult::Integer((e == "a" || e == "b") as i64));
+        let mut h = Harness::new(&[("a.ks", src)]);
+        h.with_env(&mut ev, |state, env| {
+            state.load_scenario("a.ks", env).unwrap();
+            let names: Vec<String> = std::iter::from_fn(|| state.next_tag(env).unwrap())
+                .map(|(n, _)| n)
+                .collect();
+            assert_eq!(names, ["x", "x2", "end"]);
+        });
+
+        // a=true, b=false → y, x2
+        let mut ev = |e: &str| Ok(EvalResult::Integer((e == "a") as i64));
+        let mut h = Harness::new(&[("a.ks", src)]);
+        h.with_env(&mut ev, |state, env| {
+            state.load_scenario("a.ks", env).unwrap();
+            let names: Vec<String> = std::iter::from_fn(|| state.next_tag(env).unwrap())
+                .map(|(n, _)| n)
+                .collect();
+            assert_eq!(names, ["y", "x2", "end"]);
+        });
+
+        // a=false → z only
+        let mut ev = |_e: &str| Ok(EvalResult::Integer(0));
+        let mut h = Harness::new(&[("a.ks", src)]);
+        h.with_env(&mut ev, |state, env| {
+            state.load_scenario("a.ks", env).unwrap();
+            let names: Vec<String> = std::iter::from_fn(|| state.next_tag(env).unwrap())
+                .map(|(n, _)| n)
+                .collect();
+            assert_eq!(names, ["z", "end"]);
+        });
+    }
+
+    #[test]
     fn macro_recording_and_expansion_with_args() {
         let mut h = Harness::new(&[(
             "a.ks",
@@ -2333,5 +2415,117 @@ mod tests {
         ];
         let s = encode_events(&events);
         assert_eq!(decode_events(&s), events);
+    }
+
+    #[test]
+    fn on_label_fires_for_each_label() {
+        let mut state = KagParserState::default();
+        let mut files: BTreeMap<String, String> = BTreeMap::new();
+        files.insert("a.ks".into(), "*start|page\n@x a=1\n*next\n@y b=2\n".into());
+        let mut no_eval: fn(&str) -> Result<EvalResult, String> = no_eval;
+        let mut labels: Vec<(String, Option<String>)> = Vec::new();
+        let mut fire = |l: &str, p: Option<&str>| {
+            labels.push((l.to_string(), p.map(str::to_string)));
+        };
+        let mut load = |name: &str| {
+            files
+                .get(name)
+                .cloned()
+                .ok_or_else(|| format!("missing {name}"))
+        };
+        let mut env = Environ {
+            eval: &mut no_eval,
+            load_storage: &mut load,
+            fire_label: Some(&mut fire),
+        };
+        state.load_scenario("a.ks", &mut env).unwrap();
+        while state.next_tag(&mut env).unwrap().is_some() {}
+        assert_eq!(
+            labels,
+            vec![
+                ("*start".to_string(), Some("page".to_string())),
+                ("*next".to_string(), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn multi_line_tag_enabled_joins_ams_style_continuations() {
+        // The exact shape used by the game's 33 `.ams` animation files.
+        let mut h = Harness::new(&[(
+            "a.ams",
+            "\t@motion id=MARK accel=2 time=750 \\\n\t; path=\"0, 0, 0, 255, 100, 100, 0\"\n\t@wait time=750\n",
+        )]);
+        let mut no_eval: fn(&str) -> Result<EvalResult, String> = no_eval;
+        h.with_env(&mut no_eval, |state, env| {
+            state.set_multi_line_tag_enabled(true);
+            state.set_ignore_cr(true);
+            state.load_scenario("a.ams", env).unwrap();
+            let motion = state.next_tag(env).unwrap().unwrap();
+            assert_eq!(motion.0, "motion");
+            assert_eq!(
+                motion.1,
+                vec![
+                    ("id".to_string(), "MARK".to_string()),
+                    ("accel".to_string(), "2".to_string()),
+                    ("time".to_string(), "750".to_string()),
+                    ("path".to_string(), "0, 0, 0, 255, 100, 100, 0".to_string()),
+                ]
+            );
+            let wait = state.next_tag(env).unwrap().unwrap();
+            assert_eq!(wait, tag("wait", &[("time", "750")]));
+            assert!(state.next_tag(env).unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn multi_line_tag_off_by_default_keeps_the_backslash_attribute() {
+        let mut h = Harness::new(&[("a.ams", "@motion id=MARK \\\n; path=x\n")]);
+        let tags = h.walk("a.ams");
+        assert_eq!(tags[0].0, "motion");
+        assert!(tags[0].1.contains(&("\\".to_string(), "true".to_string())));
+        // the continuation line is an ordinary comment, not a tag
+        assert!(!tags.iter().any(|t| t.0 == "path"));
+    }
+
+    #[test]
+    fn ignore_cr_suppresses_leading_empty_line_r() {
+        let mut h = Harness::new(&[("a.ks", "\n\n*start\nHello\n")]);
+        let mut no_eval: fn(&str) -> Result<EvalResult, String> = no_eval;
+        h.with_env(&mut no_eval, |state, env| {
+            state.set_ignore_cr(true);
+            state.load_scenario("a.ks", env).unwrap();
+            // The two leading empty lines must not emit r tags.
+            let t = state.next_tag(env).unwrap().unwrap();
+            assert_eq!(t, tag("ch", &[("text", "H")]));
+        });
+        // Without ignoreCR they do (one per empty line).
+        let mut h2 = Harness::new(&[("a.ks", "\n\n*start\nHello\n")]);
+        let tags = h2.walk("a.ks");
+        assert_eq!(tags[0], tag("r", &[("eol", "true")]));
+        assert_eq!(tags[1], tag("r", &[("eol", "true")]));
+    }
+
+    #[test]
+    fn store_restore_round_trips_the_multi_line_flag() {
+        let mut h = Harness::new(&[("a.ams", "@motion id=MARK \\\n; path=abc\n@wait time=1\n")]);
+        let mut no_eval: fn(&str) -> Result<EvalResult, String> = no_eval;
+        h.with_env(&mut no_eval, |state, env| {
+            state.set_multi_line_tag_enabled(true);
+            state.set_ignore_cr(true);
+            state.load_scenario("a.ams", env).unwrap();
+            let saved = state.store();
+            assert!(saved.contains("multiLineTagEnabled=1"), "{saved}");
+            state.set_multi_line_tag_enabled(false);
+            state.set_ignore_cr(false);
+            state.restore(&saved, env).unwrap();
+            assert!(state.get_multi_line_tag_enabled());
+            assert!(state.get_ignore_cr());
+            // The restored scenario must be re-parsed with the flag on, so
+            // the continuation-provided `path` survives.
+            let (name, params) = state.next_tag(env).unwrap().unwrap();
+            assert_eq!(name, "motion");
+            assert!(params.iter().any(|(k, v)| k == "path" && v == "abc"));
+        });
     }
 }
