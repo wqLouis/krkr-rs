@@ -892,6 +892,7 @@ mod tests {
             l.image_width = 200;
             l.image_height = 200;
             l.hit_threshold = 0;
+            l.visible = true;
         }
 
         // Button on top (50,50,40x40), all pixels opaque except (0,0).
@@ -911,6 +912,7 @@ mod tests {
             l.image_width = 40;
             l.image_height = 40;
             l.hit_threshold = 1;
+            l.visible = true;
         }
 
         // Opaque button pixel -> the button.
@@ -923,12 +925,17 @@ mod tests {
 
         // With no bitmap and hitThreshold 0, the layer rect itself hits.
         let flat = scene.add_layer(win, None);
-        scene.layer_mut(flat).unwrap().rect = Rect {
-            x: 0,
-            y: 0,
-            w: 10,
-            h: 10,
-        };
+        {
+            let l = scene.layer_mut(flat).unwrap();
+            l.rect = Rect {
+                x: 0,
+                y: 0,
+                w: 10,
+                h: 10,
+            };
+            l.visible = true;
+            l.hit_threshold = 0;
+        }
         assert_eq!(hit_test(&scene, win, 5, 5), Some(flat));
     }
 

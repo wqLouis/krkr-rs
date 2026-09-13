@@ -63,7 +63,7 @@ impl MixerSource {
 
     fn refill(&mut self) {
         let mut frame = vec![0.0f32; CHUNK_FRAMES * usize::from(self.channels)];
-        lock_ok(&self.mixer).render_mix(&mut frame, self.sample_rate, self.channels);
+        lock_ok(&self.mixer).render_mix_advancing(&mut frame, self.sample_rate, self.channels);
         self.chunk = frame;
         self.pos = 0;
     }
@@ -159,7 +159,15 @@ pub fn start_output(mixer: Arc<Mutex<Mixer>>) -> Result<OutputGuard, OutputError
     let channels = sink.config().channel_count().get();
 
     sink.mixer().add(MixerSource::new(mixer, rate, channels));
+    // Mark the device as the mixer clock source (see `crate::advance`).
+    crate::set_audio_output_active(true);
     Ok(OutputGuard { _sink: sink })
+}
+
+impl Drop for OutputGuard {
+    fn drop(&mut self) {
+        crate::set_audio_output_active(false);
+    }
 }
 
 /// Start real-device output with the main-thread-only guarantee baked into

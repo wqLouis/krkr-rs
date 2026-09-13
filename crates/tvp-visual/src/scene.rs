@@ -190,7 +190,7 @@ impl Scene {
             children: Vec::new(),
             bitmap: None,
             rect: Rect::default(),
-            visible: true,
+            visible: false,
             opacity: 1.0,
             blend_type: LT_ALPHA,
             z_order: 0,
@@ -199,7 +199,7 @@ impl Scene {
             image_top: 0,
             image_width: 0,
             image_height: 0,
-            hit_threshold: 0,
+            hit_threshold: 16,
             hit_type: 0,
             cursor: 0,
             face: 0,
@@ -239,23 +239,35 @@ impl Scene {
     }
 
     pub fn remove_layer(&mut self, id: u32) {
-        // Copy the ids out of the borrow so `self` can be mutated below.
-        let (win, parent) = match self.layer(id) {
-            Some(l) => (l.window, l.parent),
-            None => return,
+        let Some(root) = self.layer(id) else {
+            return;
         };
+        let (win, parent) = (root.window, root.parent);
+        // Collect the whole subtree: a destroyed parent takes its children
+        // with it (the reference layer tree owns them). Descendants removed
+        // here get a no-op `remove_layer` when their own destroy runs.
+        let mut stack = vec![id];
+        let mut remove = Vec::new();
+        while let Some(cur) = stack.pop() {
+            if let Some(l) = self.layer(cur) {
+                remove.push(cur);
+                stack.extend(l.children.iter().copied());
+            }
+        }
         if let Some(w) = self.window_mut(win) {
-            w.layers.retain(|&x| x != id);
-            if w.primary_layer == Some(id) {
+            w.layers.retain(|x| !remove.contains(x));
+            if let Some(p) = w.primary_layer
+                && remove.contains(&p)
+            {
                 w.primary_layer = None;
             }
         }
         if let Some(p) = parent
             && let Some(pl) = self.layer_mut(p)
         {
-            pl.children.retain(|&x| x != id);
+            pl.children.retain(|x| !remove.contains(x));
         }
-        self.layers.retain(|l| l.id != id);
+        self.layers.retain(|l| !remove.contains(&l.id));
     }
 
     pub fn layer_move_to_front(&mut self, id: u32) {

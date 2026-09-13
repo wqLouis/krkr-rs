@@ -2189,6 +2189,38 @@ mod tests {
     }
 
     #[test]
+    fn deep_script_subclass_chain_resolves_object_parent() {
+        // Mimic the game's `SavedataHeader -> SelectItemGroupSprite ->
+        // ActivateLayer -> Layer` chain: the object parent must survive
+        // several `super` hops (the save-data panel was landing under the
+        // title root instead of its window).
+        let env = TestEnv::new("deep-chain");
+        env.run(
+            "class AL extends Layer { function AL(win, par){ super.Layer(win, par); } } \
+             class GRP extends AL { function GRP(win, par){ super.AL(win, par); } } \
+             class HDR extends GRP { function HDR(win, par){ super.GRP(win, par); } } \
+             var w = new Window(); \
+             var root = new GRP(w, w.primaryLayer); \
+             var h = new HDR(w, root); \
+             var ok = (h.parent === root); \
+             var rootId = root.id; var hId = h.id;",
+        )
+        .unwrap();
+        assert_eq!(
+            env.eval_int("ok"),
+            1,
+            "deep super chain keeps the object parent"
+        );
+        let scene = env.scene();
+        let h = scene
+            .layers
+            .iter()
+            .find(|l| l.id == env.eval_int("hId") as u32)
+            .expect("header layer");
+        assert_eq!(h.parent, Some(env.eval_int("rootId") as u32));
+    }
+
+    #[test]
     fn layer_parent_and_window_properties() {
         let env = TestEnv::new("layer-tree");
         env.run(

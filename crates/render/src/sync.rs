@@ -369,6 +369,21 @@ fn build_layer_visual(
     let path = render_path_for(layer.blend_type, alpha);
     let size = Vec2::new(layer_rect.w as f32, layer_rect.h as f32);
 
+    // A layer with neither an image nor a solid fill draws nothing (the
+    // reference's `MainImage` is filled with the transparent `NeutralColor`,
+    // not opaque black). Rendering it as black painted over the background
+    // art and made the title screen look stacked.
+    if layer.bitmap.is_none() && layer.fill_color.is_none() {
+        return (
+            LayerVisual::Sprite(Sprite {
+                color: Color::NONE,
+                custom_size: Some(Vec2::ZERO),
+                ..Default::default()
+            }),
+            layer_rect,
+        );
+    }
+
     match path {
         LayerRenderPath::Sprite => {
             if let Some(bitmap) = layer
@@ -773,6 +788,8 @@ mod tests {
             h: 100,
         };
         scene.layer_mut(parent).unwrap().opacity = 0.5;
+        scene.layer_mut(parent).unwrap().visible = true;
+        scene.layer_mut(parent).unwrap().fill_color = Some([255, 255, 255, 255]);
         let child = scene.add_layer(win, Some(parent));
         scene.layer_mut(child).unwrap().rect = Rect {
             x: 12,
@@ -781,6 +798,8 @@ mod tests {
             h: 10,
         };
         scene.layer_mut(child).unwrap().opacity = 0.5;
+        scene.layer_mut(child).unwrap().visible = true;
+        scene.layer_mut(child).unwrap().fill_color = Some([255, 255, 255, 255]);
         let sibling = scene.add_layer(win, None);
         scene.layer_mut(sibling).unwrap().rect = Rect {
             x: 1,

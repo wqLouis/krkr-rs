@@ -128,6 +128,17 @@ fn main() {
     }
 
     probe(&engine, started.elapsed().as_millis() as u64);
+    for expr in [
+        "typeof SPR_LOADSAVE",
+        "(typeof SPR_LOADSAVE=='undefined'||SPR_LOADSAVE===null)?-999:SPR_LOADSAVE.id",
+        "(typeof SPR_LOADSAVE=='undefined'||SPR_LOADSAVE===null)?-999:SPR_LOADSAVE.opacity",
+        "(typeof SPR_LOADSAVE=='undefined'||SPR_LOADSAVE===null)?-999:SPR_LOADSAVE.visible",
+        "(typeof SPR_LOADSAVE=='undefined'||SPR_LOADSAVE===null)?-999:SPR_LOADSAVE.parent.id",
+        "(typeof SPR_LOADSAVE=='undefined'||SPR_LOADSAVE===null)?-999:SPR_LOADSAVE.parent.width",
+        "IsAnyWindow()",
+    ] {
+        println!("probe {expr} = {:?}", engine.eval(expr, "dump"));
+    }
     dump_scene(&scene);
     println!("harness: done");
 }
@@ -146,7 +157,7 @@ fn dump_scene(shared: &Arc<RwLock<Scene>>) {
     println!("layers: {}", scene.layers.len());
     for l in &scene.layers {
         println!(
-            "  L#{:<3} win={} parent={:?} rect=({},{},{}x{}) img=(l{} t{} {}x{}) bmp={:?} vis={} op={:.2} type={} z={}",
+            "  L#{:<3} win={} parent={:?} rect=({},{},{}x{}) img=(l{} t{} {}x{}) bmp={:?} vis={} op={:.2} type={} hit(ty={},th={}) fill={:?} z={}",
             l.id,
             l.window,
             l.parent,
@@ -162,6 +173,9 @@ fn dump_scene(shared: &Arc<RwLock<Scene>>) {
             l.visible,
             l.opacity,
             l.blend_type,
+            l.hit_type,
+            l.hit_threshold,
+            l.fill_color,
             l.z_order,
         );
     }
@@ -173,6 +187,29 @@ fn dump_scene(shared: &Arc<RwLock<Scene>>) {
             .map(|b| (b.id, b.width, b.height, b.name.clone()))
             .collect::<Vec<_>>()
     );
+    // Per-bitmap content stats: a decoded TLG that came out all-zero would
+    // render black even though its dimensions look right.
+    for b in &scene.bitmaps {
+        let n = (b.width as u64 * b.height as u64).max(1);
+        let mut rgb = 0u64;
+        let mut alpha = 0u64;
+        let mut max_alpha = 0u8;
+        for px in b.rgba.chunks_exact(4) {
+            rgb += u64::from(px[0]) + u64::from(px[1]) + u64::from(px[2]);
+            alpha += u64::from(px[3]);
+            max_alpha = max_alpha.max(px[3]);
+        }
+        println!(
+            "  bmp #{:<3} {}x{} avgRGB={} avgA={} maxA={} name={:?}",
+            b.id,
+            b.width,
+            b.height,
+            rgb / (n * 3).max(1),
+            alpha / n,
+            max_alpha,
+            b.name,
+        );
+    }
     println!("--- end scene dump ---");
 }
 

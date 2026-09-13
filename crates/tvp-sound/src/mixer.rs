@@ -343,6 +343,22 @@ impl Mixer {
         self.clock
     }
 
+    /// Render one audio-device chunk and advance the mixer by its duration.
+    ///
+    /// This is what [`crate::player::MixerSource`] calls: the audio callback
+    /// is the clock while a device is streaming, so each rendered chunk must
+    /// move the play positions (otherwise the next callback replays it).
+    pub fn render_mix_advancing(&mut self, out: &mut [f32], out_rate: u32, out_channels: u16) {
+        self.render_mix(out, out_rate, out_channels);
+        let channels = usize::from(out_channels);
+        if out_rate > 0 && channels > 0 {
+            let frames = out.len() / channels;
+            if frames > 0 {
+                self.advance(frames as f64 / f64::from(out_rate));
+            }
+        }
+    }
+
     /// Render the current mix into `out` (interleaved `f32`).
     ///
     /// Every playing channel is resampled from its own sample rate to
@@ -375,7 +391,11 @@ impl Mixer {
                 continue;
             }
             for (i, frame) in out.chunks_mut(out_ch).enumerate() {
-                let t = i as f64 / out_rate_f;
+                // Render from the channel's current playback position; the
+                // app's clock (`advance_to`) keeps it moving. Ignoring the
+                // position made the output device replay the first buffer
+                // forever (effectively silence).
+                let t = c.position_seconds + i as f64 / out_rate_f;
                 let sample_pos = t * src_rate;
                 let idx = (sample_pos.floor() as usize).min(total_frames - 1);
                 let base = idx * src_ch;

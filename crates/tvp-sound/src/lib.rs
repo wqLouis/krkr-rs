@@ -60,7 +60,24 @@ pub use player::{
     start_output_on_main_thread,
 };
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
+
+/// Whether a real audio device is streaming the mixer. When it is, the
+/// audio callback drives playback positions (rendering chunk-by-chunk) and
+/// [`advance`] must not also jump them to wall time — otherwise the two
+/// clocks fight and the output stutters.
+static AUDIO_OUTPUT_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Mark whether a real audio device is streaming (see [`AUDIO_OUTPUT_ACTIVE`]).
+pub fn set_audio_output_active(on: bool) {
+    AUDIO_OUTPUT_ACTIVE.store(on, Ordering::Relaxed);
+}
+
+/// Whether a real audio device is currently streaming the mixer.
+pub fn audio_output_active() -> bool {
+    AUDIO_OUTPUT_ACTIVE.load(Ordering::Relaxed)
+}
 
 /// The process-wide mixer that [`advance`] drives.
 ///
@@ -87,6 +104,11 @@ pub fn global_mixer() -> Option<Arc<Mutex<Mixer>>> {
 /// each playing channel by the elapsed delta and flips per-channel "done"
 /// state. No-op before [`register_sound`] set a mixer.
 pub fn advance(now_seconds: f64) {
+    // With a live device the callback is the clock; jumping positions to
+    // wall time would double-advance and stutter. Headless still uses this.
+    if audio_output_active() {
+        return;
+    }
     if let Some(m) = global_mixer() {
         mixer::lock_ok(&m).advance_to(now_seconds);
     }
