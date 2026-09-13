@@ -1402,11 +1402,21 @@ extern "C" fn layer_draw_text(
     let x = arg_i64(&args[0]) as i32;
     let y = arg_i64(&args[1]) as i32;
     let text = arg_string(&args[2]);
-    let color = argb_to_rgba(arg_i64(&args[3]));
+    // Text colors are 0xRRGGBB: the game passes a zero high byte (e.g.
+    // 0x00A0FFD2), and the reference text blend ignores the top byte
+    // (`(color & 0xFFFFFF) | (src[x] << 24)`, LayerBitmapImpl.cpp). `opa`
+    // carries the text alpha, so forcing the color's alpha to 255 keeps the
+    // glyph coverage (which `paint_layout`/`paint_fallback_text` scale by
+    // `opa`) instead of dropping every glyph. `fillRect` keeps the
+    // `0xAARRGGBB` convention above.
+    let mut color = argb_to_rgba(arg_i64(&args[3]));
+    color[3] = 255;
     let opa = args.get(4).map(arg_i64).unwrap_or(255).clamp(0, 255) as u8;
     let aa = args.get(5).map(arg_bool).unwrap_or(true);
     let shadow_level = args.get(6).map(arg_i64).unwrap_or(0).max(0) as u32;
-    let shadow_color = argb_to_rgba(args.get(7).map(arg_i64).unwrap_or(0));
+    // The shadow color is likewise RGB-only; alpha comes from `opa`.
+    let mut shadow_color = argb_to_rgba(args.get(7).map(arg_i64).unwrap_or(0));
+    shadow_color[3] = 255;
     let shadow_width = args.get(8).map(arg_i64).unwrap_or(0).max(0) as u32;
     let shadow_x = args.get(9).map(arg_i64).unwrap_or(0) as i32;
     let shadow_y = args.get(10).map(arg_i64).unwrap_or(0) as i32;
@@ -2370,7 +2380,10 @@ mod tests {
     #[test]
     fn layer_draw_text_rasterizes_into_scene_bitmap() {
         let env = TestEnv::new("layer-draw-text");
-        env.run("var w = new Window(); var l = new Layer(w, null); l.setSize(128, 32); l.drawText(2, 2, 'Title 日本語', 0xffffffff);")
+        // 0x00FFFFFF: the game's text colors carry a zero high byte (e.g.
+        // 0x00A0FFD2); alpha comes from the `opa` argument, so glyphs must
+        // still paint. This is the regression guard for the dropped-text bug.
+        env.run("var w = new Window(); var l = new Layer(w, null); l.setSize(128, 32); l.drawText(2, 2, 'Title 日本語', 0x00ffffff);")
             .unwrap();
         let scene = env.scene();
         let layer = &scene.layers[0];
@@ -2379,9 +2392,47 @@ mod tests {
             .expect("surface bitmap");
         assert_eq!((bitmap.width, bitmap.height), (128, 32));
         assert!(bitmap.dirty);
-        assert!(bitmap.rgba.chunks_exact(4).any(|pixel| pixel[3] != 0));
+        assert!(
+            bitmap.rgba.chunks_exact(4).any(|pixel| pixel[3] != 0),
+            "a 0x00RRGGBB color must paint (alpha comes from opa)"
+        );
         assert_eq!(env.eval_int("l.getTextHeight('x')"), 16);
         assert!(env.eval_int("l.getTextWidth('日本')") > 0);
+    }
+
+    /// `opa = 0` must paint nothing: the glyph coverage is scaled by the
+    /// opacity, so every contributed alpha is zero.
+    #[test]
+    fn layer_draw_text_zero_opacity_paints_nothing() {
+        let env = TestEnv::new("layer-draw-text-opa0");
+        env.run("var w = new Window(); var l = new Layer(w, null); l.setSize(128, 32); l.drawText(2, 2, 'Title', 0x00ffffff, 0);")
+            .unwrap();
+        let scene = env.scene();
+        let bitmap = scene.bitmap(scene.layers[0].bitmap.unwrap()).unwrap();
+        assert!(
+            bitmap.rgba.chunks_exact(4).all(|pixel| pixel[3] == 0),
+            "opa=0 must paint nothing"
+        );
+    }
+
+    /// A shadow color is also RGB-only (`0x00RRGGBB`); it must paint even
+    /// though the top byte is zero. The black main text and red shadow make
+    /// the shadow pixels identifiable (`r > 0, g == b == 0`).
+    #[test]
+    fn layer_draw_text_shadow_zero_high_byte_paints() {
+        let env = TestEnv::new("layer-draw-text-shadow");
+        // drawText(x, y, text, color, opa, aa, shadowlevel, shadowcolor, shadowwidth)
+        env.run("var w = new Window(); var l = new Layer(w, null); l.setSize(128, 32); l.drawText(2, 2, 'Shadow', 0x00000000, 255, true, 1, 0x00ff0000, 1);")
+            .unwrap();
+        let scene = env.scene();
+        let bitmap = scene.bitmap(scene.layers[0].bitmap.unwrap()).unwrap();
+        assert!(
+            bitmap
+                .rgba
+                .chunks_exact(4)
+                .any(|pixel| pixel[3] != 0 && pixel[0] > 0 && pixel[1] == 0 && pixel[2] == 0),
+            "a 0x00RRGGBB shadow color must paint red shadow pixels"
+        );
     }
 
     #[test]
