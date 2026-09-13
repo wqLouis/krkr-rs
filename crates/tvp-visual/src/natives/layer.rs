@@ -399,8 +399,22 @@ extern "C" fn layer_copy_rect(
     0
 }
 
-/// `fillRect(x, y, w, h, color)` — solid fill; `color` is `0xAARRGGBB`
-/// (TJS integer), stored as straight-alpha RGBA in `LayerState::fill_color`.
+/// `fillRect(x, y, w, h, color)` — fill a rectangle of the layer's **own
+/// image**; `color` is `0xAARRGGBB` (TJS integer).
+///
+/// Mirrors the reference `tTJSNI_BaseLayer::FillRect`
+/// (`reference/cpp/core/visual/LayerIntf.cpp:4272`): it fills the layer's
+/// `MainImage` over `(x, y, x+w, y+h)` and does **not** change the layer's
+/// position or size. The previous implementation combined `setPos` +
+/// `setSize` + `fill_color`, which moved the layer to `(x, y)` — the bug that
+/// reset `MessageArea` from `(314, 516)` to `(0, 0)` on `clear()`.
+///
+/// If the layer has an image, `raster::fill_rect_replace` copies the color
+/// into the region (the reference `FillARGB` is a color copy, so a transparent
+/// fill clears). If it has no image, we keep the cheaper solid-fill fallback:
+/// `fill_color` is set and `rect.w`/`rect.h` grow to cover the region so a
+/// zero-sized layer becomes visible — position is still never touched (the
+/// game's only bitmapless fills cover the whole layer).
 extern "C" fn layer_fill_rect(
     _engine: *mut c_void,
     instance: *mut c_void,
@@ -415,16 +429,34 @@ extern "C" fn layer_fill_rect(
     if args.len() < 5 {
         return error_out(out_error, "Layer.fillRect requires 5 arguments");
     }
+    let x = arg_i64(&args[0]) as i32;
+    let y = arg_i64(&args[1]) as i32;
+    let w = arg_i64(&args[2]).max(0) as u32;
+    let h = arg_i64(&args[3]).max(0) as u32;
+    let color = argb_to_rgba(arg_i64(&args[4]));
     let inst = unsafe { instance_ref::<LayerInst>(instance) };
     let mut scene = context_scene_mut();
-    let Some(layer) = scene.layer_mut(inst.id) else {
+    if scene.layer(inst.id).is_none() {
         return error_out(out_error, "Layer: layer no longer exists");
-    };
-    layer.rect.x = arg_i64(&args[0]) as i32;
-    layer.rect.y = arg_i64(&args[1]) as i32;
-    layer.rect.w = arg_i64(&args[2]).max(0) as u32;
-    layer.rect.h = arg_i64(&args[3]).max(0) as u32;
-    layer.fill_color = Some(argb_to_rgba(arg_i64(&args[4])));
+    }
+    let bitmap_id = scene.layer(inst.id).and_then(|layer| layer.bitmap);
+    match bitmap_id {
+        Some(bitmap_id) => {
+            if let Some(bitmap) = scene.bitmap_mut(bitmap_id) {
+                raster::fill_rect_replace(bitmap, x, y, w, h, color);
+                bitmap.mark_dirty();
+            }
+        }
+        None => {
+            if let Some(layer) = scene.layer_mut(inst.id) {
+                layer.fill_color = Some(color);
+                // A bitmapless fill is drawn as a solid layer rect, so give
+                // it the size the fill needs — but never its position.
+                layer.rect.w = layer.rect.w.max(x.max(0) as u32 + w);
+                layer.rect.h = layer.rect.h.max(y.max(0) as u32 + h);
+            }
+        }
+    }
     set_void_out(out);
     0
 }
@@ -2886,6 +2918,89 @@ mod tests {
         let scene = env.scene();
         let bitmap = scene.bitmap(scene.layers[0].bitmap.unwrap()).unwrap();
         assert_eq!(pixel(bitmap, 12, 12), [0, 0, 255, 255], "filled circle");
+    }
+
+    /// `fillRect` must not move the layer (reference `FillRect` only touches
+    /// the layer's own image). A bitmapless layer keeps the solid-fill
+    /// fallback, but its position is untouched.
+    #[test]
+    fn layer_fill_rect_does_not_move_position() {
+        let env = TestEnv::new("layer-fillrect-position");
+        env.run(
+            "var w = new Window(); var l = new Layer(w, null); \
+             l.setSize(64, 64); l.setPos(314, 516); \
+             l.fillRect(0, 0, 64, 64, 0xffff0000);",
+        )
+        .unwrap();
+        let scene = env.scene();
+        let layer = &scene.layers[0];
+        assert_eq!(
+            (layer.rect.x, layer.rect.y),
+            (314, 516),
+            "fillRect must not reset the position"
+        );
+        assert_eq!((layer.rect.w, layer.rect.h), (64, 64));
+        assert_eq!(layer.fill_color, Some([255, 0, 0, 255]));
+    }
+
+    /// When the layer has an image, `fillRect` replaces the exact region in
+    /// the image (so translucent/transparent fills are honored).
+    #[test]
+    fn layer_fill_rect_replaces_pixels_in_existing_image() {
+        let env = TestEnv::new("layer-fillrect-bitmap");
+        env.run(
+            "var w = new Window(); var l = new Layer(w, null); \
+             l.setSize(32, 32); l.setPos(100, 200); \
+             var b = new Bitmap(32, 32); l.setBitmap(b.id); \
+             l.fillRect(4, 4, 8, 8, 0xff123456);",
+        )
+        .unwrap();
+        let scene = env.scene();
+        let layer = &scene.layers[0];
+        assert_eq!(
+            (layer.rect.x, layer.rect.y),
+            (100, 200),
+            "fillRect must not move a bitmap layer either"
+        );
+        assert!(
+            layer.fill_color.is_none(),
+            "image fill leaves fill_color unset"
+        );
+        let bitmap = scene.bitmap(layer.bitmap.unwrap()).unwrap();
+        assert!(bitmap.dirty);
+        assert_eq!(
+            pixel(bitmap, 6, 6),
+            [0x12, 0x34, 0x56, 0xff],
+            "filled region"
+        );
+        assert_eq!(
+            pixel(bitmap, 0, 0),
+            [0, 0, 0, 0],
+            "outside region untouched"
+        );
+    }
+
+    /// The exact `MessageArea.clear()` pattern: a transparent `fillRect`
+    /// clears the existing image and leaves the layer's position alone.
+    #[test]
+    fn layer_fill_rect_transparent_clears_without_moving() {
+        let env = TestEnv::new("layer-fillrect-clear");
+        env.run(
+            "var w = new Window(); var l = new Layer(w, null); \
+             l.setSize(32, 32); l.setPos(314, 516); \
+             var b = new Bitmap(32, 32); l.setBitmap(b.id); \
+             l.fillRect(0, 0, 32, 32, 0xffffffff); \
+             l.fillRect(0, 0, 32, 32, 0x00000000);",
+        )
+        .unwrap();
+        let scene = env.scene();
+        let layer = &scene.layers[0];
+        assert_eq!((layer.rect.x, layer.rect.y), (314, 516));
+        let bitmap = scene.bitmap(layer.bitmap.unwrap()).unwrap();
+        assert!(
+            bitmap.rgba.chunks_exact(4).all(|p| p[3] == 0),
+            "a transparent fillRect must clear the image"
+        );
     }
 
     #[test]

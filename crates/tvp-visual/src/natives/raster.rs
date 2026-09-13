@@ -53,6 +53,44 @@ pub(crate) fn blend_pixel(
     bitmap.rgba[i + 3] = out_a as u8;
 }
 
+/// Replace a rectangle's pixels with a straight-alpha color.
+///
+/// This is the reference `Layer.fillRect` semantics: `tTVPBaseBitmap::Fill`
+/// maps to the `FillARGB` render method, a color **copy** (not a source-over
+/// blend), so the requested ARGB value — including its alpha — becomes the
+/// pixel. That is what lets `fillRect(0, 0, w, h, RGB(0, 0, 0, 0))` clear an
+/// existing message image (`MessageArea.clear()`). The rectangle is clipped
+/// to the bitmap; the layer's position is never consulted or changed.
+pub(crate) fn fill_rect_replace(
+    bitmap: &mut BitmapState,
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+    color: [u8; 4],
+) {
+    if bitmap.width == 0 || bitmap.height == 0 {
+        return;
+    }
+    let w = w.min(i32::MAX as u32) as i32;
+    let h = h.min(i32::MAX as u32) as i32;
+    let x0 = x.max(0);
+    let y0 = y.max(0);
+    let x1 = x.saturating_add(w).min(bitmap.width as i32);
+    let y1 = y.saturating_add(h).min(bitmap.height as i32);
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    let width = bitmap.width as usize;
+    for py in y0..y1 {
+        let row = py as usize * width;
+        for px in x0..x1 {
+            let i = (row + px as usize) * 4;
+            bitmap.rgba[i..i + 4].copy_from_slice(&color);
+        }
+    }
+}
+
 /// Even-odd (alternate) point-in-polygon test at a sub-pixel sample.
 fn point_in_polygon(x: f64, y: f64, pts: &[(f64, f64)]) -> bool {
     let mut inside = false;
