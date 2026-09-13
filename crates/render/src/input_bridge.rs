@@ -538,35 +538,56 @@ fn layer_local(scene: &Scene, layer_id: u32, x: i32, y: i32) -> (i32, i32) {
     (lx, ly)
 }
 
-/// The topmost hittable layer at a primary-layer point, or `None`. Mirrors
-/// the reference `GetMostFrontChildAt`: walk the tree front-to-back, clip to
-/// each ancestor rect, then test the layer itself.
+/// The topmost hittable layer at a primary-layer point, or `None`.
+///
+/// Our renderer flattens the layer tree by **absolute** rects (it does not
+/// clip children to their parent's rect), and the game's `AffineLayer`
+/// containers only size their `_image` child — the parent rect is normally
+/// fixed up by the script `onPaint` we do not run, so it stays `0×0`. We
+/// therefore hit-test the same flattened front-to-back order the renderer
+/// uses, composed through ancestors, instead of clipping to each parent.
 pub(crate) fn hit_test(scene: &Scene, window_id: u32, x: i32, y: i32) -> Option<u32> {
-    let win = scene.window(window_id)?;
-    for &id in win.layers.iter().rev() {
-        if let Some(hit) = hit_test_layer(scene, id, x, y) {
-            return Some(hit);
+    for layer_id in scene.window_layer_order(window_id).into_iter().rev() {
+        let Some(layer) = scene.layer(layer_id) else {
+            continue;
+        };
+        let Some((abs, visible)) = compose_abs(scene, layer_id) else {
+            continue;
+        };
+        if !visible {
+            continue;
+        }
+        let lx = x - abs.x;
+        let ly = y - abs.y;
+        if lx < 0 || ly < 0 || lx >= layer.rect.w as i32 || ly >= layer.rect.h as i32 {
+            continue;
+        }
+        if hit_test_self(scene, layer, lx, ly) {
+            return Some(layer_id);
         }
     }
     None
 }
 
-fn hit_test_layer(scene: &Scene, layer_id: u32, px: i32, py: i32) -> Option<u32> {
-    let layer = scene.layer(layer_id)?;
-    if !layer.visible {
-        return None;
-    }
-    let x = px - layer.rect.x;
-    let y = py - layer.rect.y;
-    if x < 0 || y < 0 || x >= layer.rect.w as i32 || y >= layer.rect.h as i32 {
-        return None;
-    }
-    for &child in layer.children.iter().rev() {
-        if let Some(hit) = hit_test_layer(scene, child, x, y) {
-            return Some(hit);
+/// A layer's absolute rect + composed visibility (sum of ancestor offsets).
+fn compose_abs(scene: &Scene, layer_id: u32) -> Option<(tvp_visual::scene::Rect, bool)> {
+    let mut x = 0i32;
+    let mut y = 0i32;
+    let mut visible = true;
+    let mut current = Some(layer_id);
+    let (mut w, mut h) = (0, 0);
+    while let Some(id) = current {
+        let layer = scene.layer(id)?;
+        if id == layer_id {
+            w = layer.rect.w;
+            h = layer.rect.h;
         }
+        x += layer.rect.x;
+        y += layer.rect.y;
+        visible &= layer.visible;
+        current = layer.parent;
     }
-    hit_test_self(scene, layer, x, y).then_some(layer_id)
+    Some((tvp_visual::scene::Rect { x, y, w, h }, visible))
 }
 
 /// The reference `_HitTestNoVisibleCheck` for `htMask` (`htProvince` and
@@ -969,6 +990,35 @@ mod tests {
             h: 30,
         };
         assert_eq!(layer_local(&scene, child, 130, 90), (20, 20));
+    }
+
+    /// Container layers like the game's `AffineLayer` keep a `0×0` rect
+    /// (they size only their `_image` child; the parent rect is fixed up by
+    /// the script `onPaint` we do not run). A child must still be hittable by
+    /// its absolute rect.
+    #[test]
+    fn hit_test_reaches_children_of_zero_size_containers() {
+        use tvp_visual::scene::Rect;
+        let mut scene = Scene::default();
+        let win = scene.add_window("t", (400, 300));
+        let container = scene.add_layer(win, None);
+        scene.layer_mut(container).unwrap().visible = true;
+        // 0x0 container, as the real title root ends up.
+        let btn = scene.add_layer(win, Some(container));
+        {
+            let l = scene.layer_mut(btn).unwrap();
+            l.rect = Rect {
+                x: 50,
+                y: 50,
+                w: 40,
+                h: 40,
+            };
+            l.visible = true;
+            l.fill_color = Some([255, 255, 255, 255]);
+            l.hit_threshold = 0;
+        }
+        assert_eq!(hit_test(&scene, win, 60, 60), Some(btn));
+        assert_eq!(hit_test(&scene, win, 10, 10), None);
     }
 
     /// Full end-to-end dispatch with a *stub* script window (no real game):
