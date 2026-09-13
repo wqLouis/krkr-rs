@@ -258,6 +258,12 @@ void variant_to_value_one(tjs2_engine *e, const TJS::tTJSVariant &var,
         }
         case tvtObject:
             e->last_object = var;
+            // Carry the object handle itself. A native method can receive
+            // several object arguments (e.g. Layer.drawPolygon(app, points));
+            // last_object only remembers the last one, so each argument
+            // records its own handle for tjs2_retain_value.
+            out->retained =
+                reinterpret_cast<tjs2_value_id>(var.AsObjectNoAddRef());
             out->type = TJS2_VAL_OBJECT;
             break;
         default:
@@ -1007,6 +1013,36 @@ public:
 } // namespace
 
 // ---------------------------------------------------------------------------
+// value resolution shared by the retained-value entry points
+// ---------------------------------------------------------------------------
+
+// Resolve a tjs2_value into a tTJSVariant. An OBJECT value that carries its
+// own raw object handle (set by variant_to_value_one when marshalling native
+// arguments) resolves to exactly that object, so a native taking several
+// object arguments can retain each one. A zero handle keeps the legacy
+// fallback: resolve against the engine's most recent object-valued result
+// (used by the Rust-side synthetic TjsValue::Object and by eval results).
+// Returns false only when an OBJECT value has neither a handle nor a
+// last_object to fall back to.
+static bool resolve_value_variant(tjs2_engine *e, const tjs2_value *v,
+                                  TJS::tTJSVariant &var) {
+    if(v->type == TJS2_VAL_OBJECT) {
+        if(v->retained) {
+            TJS::iTJSDispatch2 *obj =
+                reinterpret_cast<TJS::iTJSDispatch2 *>(v->retained);
+            var = TJS::tTJSVariant(obj, obj);
+            return true;
+        }
+        if(e->last_object.Type() != TJS::tvtObject)
+            return false; // no object result to resolve against
+        var = e->last_object;
+        return true;
+    }
+    value_to_variant(e, v, &var);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // C ABI
 // ---------------------------------------------------------------------------
 
@@ -1358,24 +1394,20 @@ int tjs2_register_native_class_instance(
 
 // Retain a script value. The variant stored in the map is a refcounted copy
 // (tTJSVariant assignment AddRefs object contents), so the value stays
-// callable until the id is released. A tjs2_value cannot carry an object
-// handle: an OBJECT-typed value is resolved against the engine's last
-// object-valued result (the value of the most recent exec/eval that yielded
-// an object, e.g. eval'ing a script function's name). Returns NULL on
-// failure.
+// callable until the id is released. An OBJECT-typed value that carries a
+// raw object handle (a native method argument marshalled by
+// variant_to_value_one) retains that exact object; a handle-less OBJECT
+// value falls back to the engine's last object-valued result (the value of
+// the most recent exec/eval that yielded an object, e.g. eval'ing a script
+// function's name). Returns NULL on failure.
 tjs2_value_id tjs2_retain_value(void *engine, const tjs2_value *v) {
     tjs2_engine *e = (tjs2_engine *)engine;
     if(!e || !v)
         return nullptr;
     try {
         TJS::tTJSVariant var;
-        if(v->type == TJS2_VAL_OBJECT) {
-            if(e->last_object.Type() != TJS::tvtObject)
-                return nullptr; // no object result to resolve against
-            var = e->last_object;
-        } else {
-            value_to_variant(e, v, &var);
-        }
+        if(!resolve_value_variant(e, v, var))
+            return nullptr;
         // 0 is the null tjs2_value_id sentinel, so skip it.
         uintptr_t id = e->next_retained_id++;
         if(id == 0)
@@ -1418,22 +1450,18 @@ static bool tjs2_same_value(const TJS::tTJSVariant &a,
 }
 
 // Find the retained id of a value already in the engine's retained map
-// (without retaining anything new). Resolves OBJECT-typed inputs against
-// last_object like tjs2_retain_value, then scans for a map entry that is
-// the same script value. Returns NULL (the null id) when not found.
+// (without retaining anything new). OBJECT-typed inputs resolve exactly like
+// tjs2_retain_value (per-argument handle first, last_object fallback), then
+// the map is scanned for a map entry that is the same script value. Returns
+// NULL (the null id) when not found.
 tjs2_value_id tjs2_find_retained_id(void *engine, const tjs2_value *v) {
     tjs2_engine *e = (tjs2_engine *)engine;
     if(!e || !v)
         return nullptr;
     try {
         TJS::tTJSVariant var;
-        if(v->type == TJS2_VAL_OBJECT) {
-            if(e->last_object.Type() != TJS::tvtObject)
-                return nullptr; // no object result to resolve against
-            var = e->last_object;
-        } else {
-            value_to_variant(e, v, &var);
-        }
+        if(!resolve_value_variant(e, v, var))
+            return nullptr;
         for(auto &kv : e->retained) {
             if(tjs2_same_value(kv.second, var))
                 return (tjs2_value_id)kv.first;

@@ -45,7 +45,12 @@ typedef struct {
      * caller, valid until the callback returns). */
     const char **array;
     int array_count;
-    /* TJS2_VAL_RETAINED: a value retained via tjs2_retain_value. */
+    /* TJS2_VAL_RETAINED: a value retained via tjs2_retain_value.
+     * TJS2_VAL_OBJECT: the raw iTJSDispatch2* of the object argument (an
+     *   opaque pointer in this ABI; 0 when the object is not known).
+     *   tjs2_retain_value retains exactly this object when it is set, and
+     *   otherwise falls back to the engine's most recent object-valued
+     *   result. */
     tjs2_value_id retained;
 } tjs2_value;
 

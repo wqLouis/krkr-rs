@@ -152,6 +152,25 @@ pub struct Value {
     pub retained: usize,
 }
 
+impl Value {
+    /// Raw TJS object pointer carried by a `VAL_OBJECT` argument, or null
+    /// for any other value type.
+    ///
+    /// C++ `variant_to_value_one` records the raw `iTJSDispatch2*` of every
+    /// object argument in the `retained` slot, so a native that receives
+    /// several object arguments can address each one individually (e.g.
+    /// `Layer.drawPolygon(app, points)`). The pointer is owned by the VM and
+    /// is only guaranteed valid for the duration of the callback; use
+    /// [`Tjs2Engine::retain_object_arg`] to keep the object past the call.
+    pub fn object_handle(&self) -> *mut c_void {
+        if self.ty == VAL_OBJECT {
+            self.retained as *mut c_void
+        } else {
+            ptr::null_mut()
+        }
+    }
+}
+
 #[repr(C)]
 pub struct Engine {
     _private: [u8; 0],
@@ -882,6 +901,21 @@ name), and none was available"
         })
     }
 
+    /// Retain the object carried by a native callback argument (`argv[i]`),
+    /// using the per-argument handle recorded by the C++ side. Unlike
+    /// [`Self::retain_value_detached`] with [`TjsValue::Object`], this does
+    /// not depend on the engine's "most recent object" slot, so it is correct
+    /// when the call passes more than one object (e.g.
+    /// `Layer.drawPolygon(app, points)`).
+    ///
+    /// `v` must be a `VAL_OBJECT` argument; a value without a handle falls
+    /// back to the last-object resolution of [`Self::retain_value_detached`].
+    pub fn retain_object_arg(&self, v: &Value) -> Result<DetachedValue, String> {
+        // SAFETY: self.inner is a live engine and `v` is a valid ABI value
+        // for the duration of the call.
+        unsafe { retain_object_arg_raw(self.inner, v) }
+    }
+
     /// Retain a raw TJS object (e.g. a native instance's `objthis`) with a
     /// lifetime detached from the engine borrow, like
     /// [`Self::retain_value_detached`] but for a raw object pointer. The
@@ -1060,6 +1094,29 @@ name), and none was available"
         // SAFETY: `out` was filled by the C++ side on success.
         Ok(unsafe { take_value(&out) })
     }
+}
+
+/// Raw-engine form of [`Tjs2Engine::retain_object_arg`] for native method
+/// callbacks, which receive the opaque `tjs2_engine*` instead of a
+/// `&Tjs2Engine`.
+///
+/// # Safety
+/// `engine` must be a live engine (the one the callback was registered on)
+/// and `v` must point at a valid `tjs2_value` for the duration of the call.
+pub unsafe fn retain_object_arg_raw(
+    engine: *mut Engine,
+    v: &Value,
+) -> Result<DetachedValue, String> {
+    if v.ty != VAL_OBJECT {
+        return Err("retain_object_arg: value is not an object".into());
+    }
+    // SAFETY: caller guarantees `engine` is live and `v` is valid; the C++
+    // side AddRefs the object into the engine's retained map.
+    let id = unsafe { tjs2_retain_value(engine, v) };
+    if id.is_null() {
+        return Err("failed to retain object argument".into());
+    }
+    Ok(DetachedValue { engine, id })
 }
 
 impl Drop for Tjs2Engine {
@@ -2437,6 +2494,122 @@ var ra = a.get(); var rb = b.get();",
         }
     }
 
+    /// Retain `args[index]` via its per-argument object handle and return it
+    /// across the ABI as VAL_RETAINED (the C++ side consumes the retention
+    /// when it converts the native result).
+    fn retain_arg_and_return(
+        engine: *mut c_void,
+        args: &[Value],
+        index: usize,
+        out: *mut Value,
+    ) -> c_int {
+        let Some(arg) = args.get(index) else {
+            return 1;
+        };
+        // Exercise the raw callback form of Tjs2Engine::retain_object_arg.
+        let dv = match unsafe { retain_object_arg_raw(engine as *mut Engine, arg) } {
+            Ok(dv) => dv,
+            Err(_) => return 1,
+        };
+        // SAFETY: out is a valid return slot; the C++ side consumes the
+        // retention after the callback returns.
+        unsafe {
+            (*out).ty = VAL_RETAINED;
+            (*out).integer = 0;
+            (*out).real = 0.0;
+            (*out).string = ptr::null();
+            (*out).array = ptr::null();
+            (*out).array_count = 0;
+            (*out).retained = dv.raw_id() as usize;
+        }
+        std::mem::forget(dv);
+        0
+    }
+
+    /// `ArgNatives.pickFirst(a, b)` — retains the FIRST object argument.
+    extern "C" fn native_pick_first(
+        engine: *mut c_void,
+        argc: c_int,
+        argv: *const Value,
+        out: *mut Value,
+        _out_error: *mut *mut c_char,
+    ) -> c_int {
+        if argc < 2 {
+            return 1;
+        }
+        // SAFETY: argv is valid for argc entries during the call.
+        let args = unsafe { std::slice::from_raw_parts(argv, argc as usize) };
+        retain_arg_and_return(engine, args, 0, out)
+    }
+
+    /// `ArgNatives.pickLast(a, b)` — retains the SECOND object argument.
+    extern "C" fn native_pick_last(
+        engine: *mut c_void,
+        argc: c_int,
+        argv: *const Value,
+        out: *mut Value,
+        _out_error: *mut *mut c_char,
+    ) -> c_int {
+        if argc < 2 {
+            return 1;
+        }
+        // SAFETY: argv is valid for argc entries during the call.
+        let args = unsafe { std::slice::from_raw_parts(argv, argc as usize) };
+        retain_arg_and_return(engine, args, 1, out)
+    }
+
+    /// `ArgNatives.classify(x)` — encodes the argument kind and whether it
+    /// carries a raw object handle (non-objects must carry none).
+    extern "C" fn native_classify(
+        _engine: *mut c_void,
+        argc: c_int,
+        argv: *const Value,
+        out: *mut Value,
+        _out_error: *mut *mut c_char,
+    ) -> c_int {
+        let code: i64 = if argc < 1 {
+            -1
+        } else {
+            // SAFETY: argv is valid for at least one entry during the call.
+            let a = unsafe { &*argv };
+            match a.ty {
+                VAL_INTEGER => 100 + a.integer,
+                VAL_STRING => 200 + a.object_handle().is_null() as i64,
+                VAL_OBJECT => 300 + a.object_handle().is_null() as i64,
+                _ => 400,
+            }
+        };
+        // SAFETY: out is a valid return slot.
+        unsafe {
+            (*out).ty = VAL_INTEGER;
+            (*out).integer = code;
+            (*out).real = 0.0;
+            (*out).string = ptr::null();
+        }
+        0
+    }
+
+    fn arg_builder() -> NativeClassBuilder<'static> {
+        NativeClassBuilder {
+            name: "ArgNatives",
+            methods: vec![
+                NativeMethodDef {
+                    name: "pickFirst",
+                    f: native_pick_first,
+                },
+                NativeMethodDef {
+                    name: "pickLast",
+                    f: native_pick_last,
+                },
+                NativeMethodDef {
+                    name: "classify",
+                    f: native_classify,
+                },
+            ],
+            properties: vec![],
+        }
+    }
+
     /// Instance class with a `list(n)` method returning an array of `n`
     /// strings (mirrors CSVParser.getNextLine).
     extern "C" fn array_create(_engine: *mut c_void) -> *mut c_void {
@@ -2567,6 +2740,51 @@ var ra = a.get(); var rb = b.get();",
         // still the same object across engine calls
         e.exec_script("r.c = 7;", "test").unwrap();
         assert_eq!(e.eval("r.c", "test").unwrap(), TjsValue::Integer(7));
+    }
+
+    #[test]
+    fn two_object_args_retain_each_argument_individually() {
+        let _vm_lock = vm_lock();
+        // Regression: variant_to_value_one only remembered the LAST object
+        // argument in last_object, so retaining the first of
+        // `drawPolygon(app, points)` resolved to `points`. Each argument now
+        // carries its own raw object handle.
+        let e = Tjs2Engine::new().unwrap();
+        e.register_native_class(&arg_builder()).unwrap();
+        e.exec_script(
+            "var first = %[id: 1]; var second = %[id: 2]; \
+             var fa = ArgNatives.pickFirst(first, second); \
+             var la = ArgNatives.pickLast(first, second);",
+            "test",
+        )
+        .unwrap();
+        // pickFirst must resolve `first` (id 1), not the last argument.
+        assert_eq!(e.eval("fa.id", "test").unwrap(), TjsValue::Integer(1));
+        assert_eq!(e.eval("la.id", "test").unwrap(), TjsValue::Integer(2));
+        // The returned handle is the ORIGINAL object, not a copy.
+        e.exec_script("fa.id = 11;", "test").unwrap();
+        assert_eq!(e.eval("first.id", "test").unwrap(), TjsValue::Integer(11));
+        assert_eq!(e.eval("second.id", "test").unwrap(), TjsValue::Integer(2));
+    }
+
+    #[test]
+    fn scalar_and_string_args_carry_no_object_handle() {
+        let _vm_lock = vm_lock();
+        // (c) scalar/string marshalling is unchanged and carries no handle;
+        // object args do carry one.
+        let e = Tjs2Engine::new().unwrap();
+        e.register_native_class(&arg_builder()).unwrap();
+        e.exec_script(
+            "var ci = ArgNatives.classify(5); \
+             var cs = ArgNatives.classify('x'); \
+             var co = ArgNatives.classify(%[k: 1]);",
+            "test",
+        )
+        .unwrap();
+        assert_eq!(e.eval("ci", "test").unwrap(), TjsValue::Integer(105));
+        assert_eq!(e.eval("cs", "test").unwrap(), TjsValue::Integer(201));
+        // object: 300 + (handle is null ? 1 : 0) => handle present => 300
+        assert_eq!(e.eval("co", "test").unwrap(), TjsValue::Integer(300));
     }
 
     #[test]
