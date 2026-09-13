@@ -51,9 +51,19 @@
 //! | `tileRect(left,top,w,h,tile[,x,y])` | repeats a source Layer/Bitmap over the rect (a clipped `copyRect` loop) |
 //! | `fillOperateRect(left,top,w,h,color[,mode])` | blend fill using a `tTVPBlendOperationMode` |
 //! | `doDropShadow` / `doBlurLight` | SDK shadow / blur-light compositions (box blur + composite) |
+//! | `saveLayerImage(name[,type])` | encodes the main image (BMP/PNG/JPEG) under the game dir/absolute path |
+//! | `stretchCopy` / `stretchPile` / `stretchBlend` / `operateStretch` | resampled blit (nearest/bilinear/bicubic) with copy or a blend mode |
+//! | `operateRect` | one-region blend blit (`tTVPBlendOperationMode`) |
+//! | `affineCopy` / `affinePile` / `affineBlend` / `operateAffine` | 3-point/matrix affine resampled blit |
+//! | `light` | brightness/contrast LUT (`ApplyLightContrast`) |
+//! | `doGrayScale` / `adjustGamma` | luma and per-channel gamma/level remap |
+//! | `flipLR` / `flipUD` | whole-image mirror |
+//! | `gaussianBlur` | separable Gaussian blur |
+//! | `independMainImage` | detaches the layer from a shared bitmap (private copy/blank) |
 //! | `setClip([l,t,w,h])` | reference `ClipRect` (no args resets to the image); respected by the pixel ops |
+//! | `onClick` / `onDoubleClick` / `onMouseDown|Up|Move|Enter|Leave|Wheel` / `onKeyDown|Up` | dispatch to the layer's action owner via `actionOwner.action(event)` (`TVP_ACTION_INVOKE`) |
 //! | `beginTransition` | queues a next-poll completion callback; interpolation remains a stub |
-//! | `affineCopy`, `stretchCopy/Pile/Blend`, `pileRect`, `piledCopy`, `operateRect/Stretch/Affine`, `light`, `stopTransition` | no-op stubs (pixel ops: later) |
+//! | `pileRect`, `piledCopy`, `blendRect`, `convertType`, `setCenter`, `setAffineOffset`, `drawImage*`, `drawGlyph/String/Curve/Pie/Ellipse/Path`, `stopTransition` | no-op stubs (pixel ops: later) |
 
 use std::collections::HashSet;
 use std::ffi::{c_char, c_int, c_void};
@@ -100,6 +110,20 @@ pub(crate) struct LayerInst {
     /// for the short period before construction; constructed layers also copy
     /// this value into the shared scene contract.
     pub blend_type: i64,
+    /// Reference `tTJSNI_BaseLayer::ActionOwner`: the object passed as the
+    /// first constructor argument (the window). The native `on*` event
+    /// methods dispatch to `actionOwner.action(eventObject)`. The raw handle
+    /// is re-retained per dispatch; `_keepalive` keeps the object alive for
+    /// the layer's lifetime.
+    pub action_owner: Option<ActionOwner>,
+}
+
+/// A retained reference to the layer's action owner.
+pub(crate) struct ActionOwner {
+    /// Raw TJS object handle (re-retained per event dispatch).
+    pub(crate) raw: *mut c_void,
+    /// Keeps the object alive (AddRef); released when the layer is destroyed.
+    _keepalive: tjs2_sys::DetachedValue,
 }
 
 /// `new Layer(...)` payload factory.
@@ -197,6 +221,37 @@ extern "C" fn layer_ctor(
     if inst.constructed {
         return error_out(out_error, "Layer: this layer is already constructed");
     }
+    // Reference `ActionOwner = param[0]` (`LayerIntf.cpp:476`): the object
+    // passed as the first constructor argument (the window). The native `on*`
+    // event methods dispatch to `actionOwner.action(event)`.
+    let engine = crate::natives::context_engine();
+    inst.action_owner = match args.first() {
+        Some(a) if a.ty == tjs2_sys::VAL_OBJECT && a.retained != 0 => {
+            let raw = a.retained as *mut c_void;
+            engine
+                .retain_object_detached(raw)
+                .ok()
+                .map(|dv| ActionOwner {
+                    raw,
+                    _keepalive: dv,
+                })
+        }
+        Some(a) if a.ty == tjs2_sys::VAL_INTEGER => {
+            let obj = super::window_tjs_object(a.integer as u32);
+            if obj.is_null() {
+                None
+            } else {
+                engine
+                    .retain_object_detached(obj)
+                    .ok()
+                    .map(|dv| ActionOwner {
+                        raw: obj,
+                        _keepalive: dv,
+                    })
+            }
+        }
+        _ => None,
+    };
     let mut scene = context_scene_mut();
     if scene.window(win_id).is_none() {
         return error_out(out_error, "Layer: the given window does not exist");
@@ -2709,6 +2764,858 @@ extern "C" fn layer_do_blur_light(
     0
 }
 
+/// `stretchCopy(dx, dy, dw, dh, src, sx, sy, sw, sh[, type])` — reference
+/// `tTJSNI_BaseLayer::StretchCopy` (`LayerIntf.cpp:4672`; native `:9002`).
+/// The `bmCopy` path replaces pixels with a resampled source region.
+extern "C" fn layer_stretch_copy(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    if args.len() < 9 {
+        return error_out(out_error, "Layer.stretchCopy requires 9 arguments");
+    }
+    // Resolve the source object before taking the scene lock (`hasImage`
+    // re-enters the scene).
+    let engine = crate::natives::context_engine();
+    let (kind, src_id) = match resolve_image_source(engine, &args[4]) {
+        Ok(v) => v,
+        Err(_) => return error_out(out_error, "Layer.stretchCopy expects a Layer or Bitmap"),
+    };
+    let dx = arg_i64(&args[0]) as i32;
+    let dy = arg_i64(&args[1]) as i32;
+    let dw = arg_i64(&args[2]);
+    let dh = arg_i64(&args[3]);
+    let sx = arg_i64(&args[5]) as i32;
+    let sy = arg_i64(&args[6]) as i32;
+    let sw = arg_i64(&args[7]);
+    let sh = arg_i64(&args[8]);
+    let stretch_type = args.get(9).map(arg_i64).unwrap_or(0);
+    let destrect = (
+        dx,
+        dy,
+        dx.saturating_add(dw as i32),
+        dy.saturating_add(dh as i32),
+    );
+    let srcrect = (
+        sx,
+        sy,
+        sx.saturating_add(sw as i32),
+        sy.saturating_add(sh as i32),
+    );
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let mut scene = context_scene_mut();
+    let Some(src_bmp) = tile_bitmap_for_source(&scene, kind, src_id) else {
+        return error_out(out_error, "Layer.stretchCopy: source has no image");
+    };
+    let Some(layer) = scene.layer(inst.id) else {
+        return error_out(out_error, "Layer: layer no longer exists");
+    };
+    let clip = layer_pixel_rect(layer);
+    let Some(bitmap_id) = layer.bitmap else {
+        return error_out(out_error, "Layer.stretchCopy: layer has no image");
+    };
+    let Some(destrect) = layer_ops::intersect_rect(destrect, clip) else {
+        set_void_out(out);
+        return 0;
+    };
+    if let Some(dst) = scene.bitmap_mut(bitmap_id) {
+        layer_ops::stretch_blit(dst, destrect, &src_bmp, srcrect, stretch_type);
+    }
+    set_void_out(out);
+    0
+}
+
+/// `doGrayScale()` — reference `tTJSNI_BaseLayer::DoGrayScale`
+/// (`LayerIntf.cpp:5898`; native `:9616`). Not affected by the draw face.
+extern "C" fn layer_do_gray_scale(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    _argc: c_int,
+    _argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let mut scene = context_scene_mut();
+    let Some(layer) = scene.layer(inst.id) else {
+        return error_out(out_error, "Layer: layer no longer exists");
+    };
+    let clip = layer_pixel_rect(layer);
+    let Some(bitmap_id) = layer.bitmap else {
+        return error_out(out_error, "Layer.doGrayScale: layer has no image");
+    };
+    if let Some(bitmap) = scene.bitmap_mut(bitmap_id) {
+        layer_ops::do_gray_scale(bitmap, clip);
+    }
+    set_void_out(out);
+    0
+}
+
+/// `adjustGamma(rgamma, rfloor, rceil, ggamma, gfloor, gceil, bgamma,
+/// bfloor, bceil)` — reference `tTJSNI_BaseLayer::AdjustGamma`
+/// (`LayerIntf.cpp:5715`; native `:9529`). Missing args keep the identity
+/// value (`TVPIntactGammaAdjustData`).
+extern "C" fn layer_adjust_gamma(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    let mut data = layer_ops::GammaAdjust::intact();
+    let real = |i: usize, d: f64| args.get(i).map(arg_f64).unwrap_or(d);
+    let int = |i: usize, d: i32| args.get(i).map(|v| arg_i64(v) as i32).unwrap_or(d);
+    data.r_gamma = real(0, data.r_gamma);
+    data.r_floor = int(1, data.r_floor);
+    data.r_ceil = int(2, data.r_ceil);
+    data.g_gamma = real(3, data.g_gamma);
+    data.g_floor = int(4, data.g_floor);
+    data.g_ceil = int(5, data.g_ceil);
+    data.b_gamma = real(6, data.b_gamma);
+    data.b_floor = int(7, data.b_floor);
+    data.b_ceil = int(8, data.b_ceil);
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let mut scene = context_scene_mut();
+    let Some(layer) = scene.layer(inst.id) else {
+        return error_out(out_error, "Layer: layer no longer exists");
+    };
+    let clip = layer_pixel_rect(layer);
+    let Some(bitmap_id) = layer.bitmap else {
+        return error_out(out_error, "Layer.adjustGamma: layer has no image");
+    };
+    if let Some(bitmap) = scene.bitmap_mut(bitmap_id) {
+        layer_ops::adjust_gamma(bitmap, clip, data);
+    }
+    set_void_out(out);
+    0
+}
+
+/// `light(brightness, contrast)` — reference `ApplyLightContrast`
+/// (`LayerIntf.cpp:1006`; native `:8302`).
+extern "C" fn layer_light(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    if args.len() < 2 {
+        return error_out(out_error, "Layer.light requires 2 arguments");
+    }
+    let brightness = arg_i64(&args[0]) as i32;
+    let contrast = arg_i64(&args[1]) as i32;
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let mut scene = context_scene_mut();
+    let Some(layer) = scene.layer(inst.id) else {
+        return error_out(out_error, "Layer: layer no longer exists");
+    };
+    let clip = layer_pixel_rect(layer);
+    let Some(bitmap_id) = layer.bitmap else {
+        return error_out(out_error, "Layer.light: layer has no image");
+    };
+    if let Some(bitmap) = scene.bitmap_mut(bitmap_id) {
+        layer_ops::light_contrast(bitmap, clip, brightness, contrast);
+    }
+    set_void_out(out);
+    0
+}
+
+/// `flipLR()` — reference `LRFlip` (`LayerIntf.cpp:5910`).
+extern "C" fn layer_flip_lr(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    _argc: c_int,
+    _argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let mut scene = context_scene_mut();
+    let Some(bitmap_id) = scene.layer(inst.id).and_then(|l| l.bitmap) else {
+        return error_out(out_error, "Layer.flipLR: layer has no image");
+    };
+    if let Some(bitmap) = scene.bitmap_mut(bitmap_id) {
+        layer_ops::flip_lr(bitmap);
+    }
+    set_void_out(out);
+    0
+}
+
+/// `flipUD()` — reference `UDFlip` (`LayerIntf.cpp:5925`).
+extern "C" fn layer_flip_ud(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    _argc: c_int,
+    _argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let mut scene = context_scene_mut();
+    let Some(bitmap_id) = scene.layer(inst.id).and_then(|l| l.bitmap) else {
+        return error_out(out_error, "Layer.flipUD: layer has no image");
+    };
+    if let Some(bitmap) = scene.bitmap_mut(bitmap_id) {
+        layer_ops::flip_ud(bitmap);
+    }
+    set_void_out(out);
+    0
+}
+
+/// `independMainImage([copy=true])` — reference `IndependMainImage`
+/// (`LayerIntf.cpp:2679`). Detaches the layer from a shared bitmap by
+/// allocating a private copy (or blank pixels when `copy` is false).
+extern "C" fn layer_independ_main_image(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    let copy = match args.first() {
+        Some(v) if v.ty != tjs2_sys::VAL_VOID => arg_bool(v),
+        _ => true,
+    };
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let mut scene = context_scene_mut();
+    let Some(bitmap_id) = scene.layer(inst.id).and_then(|l| l.bitmap) else {
+        set_void_out(out);
+        return 0;
+    };
+    let Some((w, h, rgba)) = scene
+        .bitmap(bitmap_id)
+        .map(|b| (b.width, b.height, b.rgba.clone()))
+    else {
+        return error_out(out_error, "Layer.independMainImage: no such bitmap");
+    };
+    let rgba = if copy {
+        rgba
+    } else {
+        vec![0u8; w as usize * h as usize * 4]
+    };
+    let new_id = scene.add_bitmap(w, h, rgba);
+    if let Some(layer) = scene.layer_mut(inst.id) {
+        layer.bitmap = Some(new_id);
+    }
+    set_void_out(out);
+    0
+}
+
+/// `gaussianBlur(radius[, sigma])` — reference `ApplyGaussianBlur`
+/// (`LayerIntf.cpp:5745`; native `:9565`).
+extern "C" fn layer_gaussian_blur(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    if args.is_empty() {
+        return error_out(out_error, "Layer.gaussianBlur requires a radius");
+    }
+    let radius = arg_i64(&args[0]).max(1) as i32;
+    let sigma = match args.get(1) {
+        Some(v) if v.ty != tjs2_sys::VAL_VOID => arg_f64(v),
+        _ => f64::from((radius as f32 / 2.5).max(1.0)),
+    } as f32;
+    if sigma <= 0.0 {
+        return error_out(out_error, "Layer.gaussianBlur: sigma must be positive");
+    }
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let mut scene = context_scene_mut();
+    let Some(layer) = scene.layer(inst.id) else {
+        return error_out(out_error, "Layer: layer no longer exists");
+    };
+    let clip = layer_pixel_rect(layer);
+    let Some(bitmap_id) = layer.bitmap else {
+        return error_out(out_error, "Layer.gaussianBlur: layer has no image");
+    };
+    if let Some(bitmap) = scene.bitmap_mut(bitmap_id) {
+        layer_ops::gaussian_blur(bitmap, clip, radius, sigma);
+    }
+    set_void_out(out);
+    0
+}
+
+/// Parse a stretch/operate source and its `(kind, id, automode)`. Must run
+/// before the scene lock (`resolve_image_source` re-enters the scene).
+fn resolve_operate_source(engine: &Tjs2Engine, arg: &Value) -> Result<(Option<bool>, u32), String> {
+    resolve_image_source(engine, arg).map_err(|_| "expects a Layer or Bitmap".to_string())
+}
+
+/// `operateRect(dx, dy, src, sx, sy, sw, sh[, mode=omAuto, opa=255])` —
+/// reference `tTJSNI_BaseLayer::OperateRect` (`LayerIntf.cpp:5224`; native
+/// `:8941`).
+extern "C" fn layer_operate_rect(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    if args.len() < 7 {
+        return error_out(out_error, "Layer.operateRect requires 7 arguments");
+    }
+    let engine = crate::natives::context_engine();
+    let (kind, src_id) = match resolve_operate_source(engine, &args[2]) {
+        Ok(v) => v,
+        Err(e) => return error_out(out_error, &format!("Layer.operateRect: {e}")),
+    };
+    let dx = arg_i64(&args[0]) as i32;
+    let dy = arg_i64(&args[1]) as i32;
+    let sx = arg_i64(&args[3]) as i32;
+    let sy = arg_i64(&args[4]) as i32;
+    let sw = arg_i64(&args[5]);
+    let sh = arg_i64(&args[6]);
+    let mut mode = args.get(7).map(arg_i64).unwrap_or(128);
+    let opa = args.get(8).map(arg_i64).unwrap_or(255).clamp(0, 255) as u8;
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let mut scene = context_scene_mut();
+    let Some(src) = tile_bitmap_for_source(&scene, kind, src_id) else {
+        return error_out(out_error, "Layer.operateRect: source has no image");
+    };
+    if mode == 128 {
+        mode = scene.layer(src_id).map_or(2, |l| l.blend_type);
+    }
+    let srcrect = (
+        sx,
+        sy,
+        sx.saturating_add(sw as i32),
+        sy.saturating_add(sh as i32),
+    );
+    let Some(bitmap_id) = scene.layer(inst.id).and_then(|l| l.bitmap) else {
+        return error_out(out_error, "Layer.operateRect: layer has no image");
+    };
+    if let Some(dst) = scene.bitmap_mut(bitmap_id) {
+        layer_ops::operate_rect(dst, dx, dy, &src, srcrect, mode, opa);
+    }
+    set_void_out(out);
+    0
+}
+
+/// Shared body for `stretchPile`/`stretchBlend`/`operateStretch`:
+/// `(dx, dy, dw, dh, src, sx, sy, sw, sh[, mode/opa/type])`.
+#[allow(clippy::too_many_arguments)]
+fn layer_stretch_common(
+    argc: c_int,
+    argv: *const Value,
+    instance: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    default_mode: i64,
+    mode_index: usize,
+    opa_index: usize,
+    type_index: usize,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    if args.len() < 9 {
+        return error_out(out_error, "Layer.stretch* requires 9 arguments");
+    }
+    let engine = crate::natives::context_engine();
+    let (kind, src_id) = match resolve_operate_source(engine, &args[4]) {
+        Ok(v) => v,
+        Err(e) => return error_out(out_error, &format!("Layer.stretch*: {e}")),
+    };
+    let dx = arg_i64(&args[0]) as i32;
+    let dy = arg_i64(&args[1]) as i32;
+    let dw = arg_i64(&args[2]);
+    let dh = arg_i64(&args[3]);
+    let sx = arg_i64(&args[5]) as i32;
+    let sy = arg_i64(&args[6]) as i32;
+    let sw = arg_i64(&args[7]);
+    let sh = arg_i64(&args[8]);
+    let mut mode = args.get(mode_index).map(arg_i64).unwrap_or(default_mode);
+    let opa = args
+        .get(opa_index)
+        .map(arg_i64)
+        .unwrap_or(255)
+        .clamp(0, 255) as u8;
+    let stretch_type = args.get(type_index).map(arg_i64).unwrap_or(0);
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let mut scene = context_scene_mut();
+    let Some(src) = tile_bitmap_for_source(&scene, kind, src_id) else {
+        return error_out(out_error, "Layer.stretch*: source has no image");
+    };
+    if mode == 128 {
+        mode = scene.layer(src_id).map_or(2, |l| l.blend_type);
+    }
+    let destrect = (
+        dx,
+        dy,
+        dx.saturating_add(dw as i32),
+        dy.saturating_add(dh as i32),
+    );
+    let srcrect = (
+        sx,
+        sy,
+        sx.saturating_add(sw as i32),
+        sy.saturating_add(sh as i32),
+    );
+    let Some(bitmap_id) = scene.layer(inst.id).and_then(|l| l.bitmap) else {
+        return error_out(out_error, "Layer.stretch*: layer has no image");
+    };
+    if let Some(dst) = scene.bitmap_mut(bitmap_id) {
+        layer_ops::stretch_blit_mode(dst, destrect, &src, srcrect, stretch_type, mode, opa);
+    }
+    set_void_out(out);
+    0
+}
+
+/// `stretchPile(dx,dy,dw,dh,src,sx,sy,sw,sh[,opa=255,type=0])` —
+/// reference `StretchPile` (`LayerIntf.cpp:5264`).
+extern "C" fn layer_stretch_pile(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    layer_stretch_common(argc, argv, instance, out, out_error, 2, 100, 9, 10)
+}
+
+/// `stretchBlend(...)` — reference `StretchBlend` (`LayerIntf.cpp:5319`).
+extern "C" fn layer_stretch_blend(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    layer_stretch_common(argc, argv, instance, out, out_error, 2, 100, 9, 10)
+}
+
+/// `operateStretch(dx,dy,dw,dh,src,sx,sy,sw,sh[,mode=omAuto,opa=255,type=0])`
+/// — reference `OperateStretch` (`LayerIntf.cpp:5374`; native `:9154`).
+extern "C" fn layer_operate_stretch(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    layer_stretch_common(argc, argv, instance, out, out_error, 128, 9, 10, 11)
+}
+
+/// Shared body for `affineCopy`/`affinePile`/`affineBlend`/`operateAffine`:
+/// `(src, sx, sy, sw, sh, affine, a, b, c, d, tx, ty[, type][, clear])`.
+#[allow(clippy::too_many_arguments)]
+fn layer_affine_common(
+    argc: c_int,
+    argv: *const Value,
+    instance: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    default_mode: i64,
+    mode_index: Option<usize>,
+    type_index: usize,
+    clear_index: usize,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    if args.len() < 12 {
+        return error_out(out_error, "Layer.affine* requires 12 arguments");
+    }
+    let engine = crate::natives::context_engine();
+    let (kind, src_id) = match resolve_operate_source(engine, &args[0]) {
+        Ok(v) => v,
+        Err(e) => return error_out(out_error, &format!("Layer.affine*: {e}")),
+    };
+    let sx = arg_i64(&args[1]) as i32;
+    let sy = arg_i64(&args[2]) as i32;
+    let sw = arg_i64(&args[3]);
+    let sh = arg_i64(&args[4]);
+    let is_matrix = arg_bool(&args[5]);
+    let f = |i: usize| arg_f64(&args[i]);
+    let stretch_type = args.get(type_index).map(arg_i64).unwrap_or(0);
+    let clear = args.get(clear_index).map(arg_bool).unwrap_or(false);
+    let mut mode = mode_index
+        .and_then(|i| args.get(i))
+        .map(arg_i64)
+        .unwrap_or(default_mode);
+    let opa = if let Some(i) = mode_index {
+        args.get(i + 1).map(arg_i64).unwrap_or(255).clamp(0, 255) as u8
+    } else {
+        255
+    };
+    let (left, top, right, bottom) = (
+        sx as f64,
+        sy as f64,
+        (sx as i64 + sw) as f64,
+        (sy as i64 + sh) as f64,
+    );
+    let (p0, p1, p2) = if is_matrix {
+        let (a, b, c, d, tx, ty) = (f(6), f(7), f(8), f(9), f(10), f(11));
+        let map = |x: f64, y: f64| (a * x + c * y + tx, b * x + d * y + ty);
+        (map(left, top), map(right, top), map(left, bottom))
+    } else {
+        ((f(6), f(7)), (f(8), f(9)), (f(10), f(11)))
+    };
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let mut scene = context_scene_mut();
+    let Some(src) = tile_bitmap_for_source(&scene, kind, src_id) else {
+        return error_out(out_error, "Layer.affine*: source has no image");
+    };
+    if mode == 128 {
+        mode = scene.layer(src_id).map_or(2, |l| l.blend_type);
+    }
+    let srcrect = (
+        sx,
+        sy,
+        sx.saturating_add(sw as i32),
+        sy.saturating_add(sh as i32),
+    );
+    let Some(bitmap_id) = scene.layer(inst.id).and_then(|l| l.bitmap) else {
+        return error_out(out_error, "Layer.affine*: layer has no image");
+    };
+    if let Some(dst) = scene.bitmap_mut(bitmap_id) {
+        layer_ops::affine_blit(
+            dst,
+            p0,
+            p1,
+            p2,
+            &src,
+            srcrect,
+            stretch_type,
+            mode,
+            opa,
+            clear,
+            [0, 0, 0, 0],
+        );
+    }
+    set_void_out(out);
+    0
+}
+
+/// `affineCopy(src, sx,sy,sw,sh, affine, a,b,c,d,tx,ty[, type][, clear])` —
+/// reference `AffineCopy` (`LayerIntf.cpp:4730`; native `:9227`).
+extern "C" fn layer_affine_copy(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    layer_affine_common(argc, argv, instance, out, out_error, 1, None, 12, 13)
+}
+
+/// `affinePile(...)` — reference `AffinePile` (`LayerIntf.cpp:4765`).
+extern "C" fn layer_affine_pile(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    layer_affine_common(argc, argv, instance, out, out_error, 2, None, 12, 13)
+}
+
+/// `affineBlend(...)` — reference `AffineBlend` (`LayerIntf.cpp:4795`).
+extern "C" fn layer_affine_blend(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    layer_affine_common(argc, argv, instance, out, out_error, 2, None, 12, 13)
+}
+
+/// `operateAffine(src, sx,sy,sw,sh, affine, a,b,c,d,tx,ty[, mode][, opa][, type])`
+/// — reference `OperateAffine` (`LayerIntf.cpp:5617`; native `:9423`).
+extern "C" fn layer_operate_affine(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // Args: src,sx,sy,sw,sh,affine,a,b,c,d,tx,ty, mode=12, opa=13, type=14
+    layer_affine_common(argc, argv, instance, out, out_error, 128, Some(12), 14, 15)
+}
+
+/// The `image` format implied by a `saveLayerImage` `type` argument, falling
+/// back to the storage-name extension and finally BMP.
+fn save_image_format(name: &str, kind: Option<&str>) -> Option<image::ImageFormat> {
+    use image::ImageFormat;
+    let from_ext = || {
+        std::path::Path::new(name)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+    };
+    let kind = match kind {
+        Some(k) if !k.is_empty() => k.to_ascii_lowercase(),
+        _ => from_ext().unwrap_or_else(|| "bmp".to_string()),
+    };
+    match kind.as_str() {
+        "bmp" => Some(ImageFormat::Bmp),
+        "png" => Some(ImageFormat::Png),
+        "jpg" | "jpeg" => Some(ImageFormat::Jpeg),
+        _ => None,
+    }
+}
+
+/// Encode a scene bitmap to image bytes for `saveLayerImage`.
+fn encode_layer_image(bitmap: &BitmapState, format: image::ImageFormat) -> Result<Vec<u8>, String> {
+    use image::ImageEncoder;
+    let mut bytes = Vec::new();
+    match format {
+        image::ImageFormat::Bmp => {
+            image::codecs::bmp::BmpEncoder::new(&mut bytes)
+                .write_image(
+                    &bitmap.rgba,
+                    bitmap.width,
+                    bitmap.height,
+                    image::ExtendedColorType::Rgba8,
+                )
+                .map_err(|e| e.to_string())?;
+        }
+        image::ImageFormat::Png => {
+            image::codecs::png::PngEncoder::new(&mut bytes)
+                .write_image(
+                    &bitmap.rgba,
+                    bitmap.width,
+                    bitmap.height,
+                    image::ExtendedColorType::Rgba8,
+                )
+                .map_err(|e| e.to_string())?;
+        }
+        image::ImageFormat::Jpeg => {
+            let rgb: Vec<u8> = bitmap
+                .rgba
+                .chunks_exact(4)
+                .flat_map(|p| [p[0], p[1], p[2]])
+                .collect();
+            image::codecs::jpeg::JpegEncoder::new(&mut bytes)
+                .write_image(
+                    &rgb,
+                    bitmap.width,
+                    bitmap.height,
+                    image::ExtendedColorType::Rgb8,
+                )
+                .map_err(|e| e.to_string())?;
+        }
+        other => return Err(format!("unsupported save format {other:?}")),
+    }
+    Ok(bytes)
+}
+
+/// Resolve a `saveLayerImage` name to a host path. Absolute names are used
+/// as-is; relative names resolve under the mounted game directory. Storage
+/// `\` separators are normalized to `/` (the reference is Windows-oriented).
+fn save_host_path(game_dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let slash = name.replace('\\', "/");
+    let path = std::path::Path::new(&slash);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        game_dir.join(slash.trim_start_matches('/'))
+    }
+}
+
+/// `saveLayerImage(name[, type])` — reference
+/// `tTJSNI_BaseLayer::SaveLayerImage` (`LayerIntf.cpp:2699`; native `:8408`).
+/// Encodes the main image to `name` via the `type`-selected handler (BMP /
+/// PNG / JPEG). TLG encoding is not available in this port.
+extern "C" fn layer_save_layer_image(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    if args.is_empty() || args[0].ty != tjs2_sys::VAL_STRING {
+        return error_out(out_error, "Layer.saveLayerImage requires a storage name");
+    }
+    let name = super::ffi::arg_string(&args[0]);
+    let kind = args
+        .get(1)
+        .filter(|v| v.ty == tjs2_sys::VAL_STRING)
+        .map(super::ffi::arg_string);
+    let Some(format) = save_image_format(&name, kind.as_deref()) else {
+        return error_out(
+            out_error,
+            &format!("Layer.saveLayerImage: unknown format for {name}"),
+        );
+    };
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let (scene, storage) = super::context_scene_storage();
+    let Some(bitmap) = scene
+        .layer(inst.id)
+        .and_then(|l| l.bitmap)
+        .and_then(|b| scene.bitmap(b))
+    else {
+        return error_out(out_error, "Layer.saveLayerImage: layer has no image");
+    };
+    let bytes = match encode_layer_image(bitmap, format) {
+        Ok(b) => b,
+        Err(e) => return error_out(out_error, &format!("Layer.saveLayerImage: {e}")),
+    };
+    let path = save_host_path(storage.game_dir(), &name);
+    if let Some(parent) = path.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        return error_out(out_error, &format!("Layer.saveLayerImage: {e}"));
+    }
+    if let Err(e) = std::fs::write(&path, &bytes) {
+        return error_out(out_error, &format!("Layer.saveLayerImage: {e}"));
+    }
+    set_void_out(out);
+    0
+}
+
+/// The TJS helper implementing `TVP_ACTION_INVOKE` (`EventIntf.h:208`): it
+/// builds the event dictionary `%[type, target, ...members]` and calls
+/// `owner.action(ev)`. The VM exposes no `arguments` object, so the (at most
+/// four) member name/value pairs are passed as fixed optional parameters.
+const LAYER_EVENT_DISPATCH: &str = "(function(owner,target,t,n1,v1,n2,v2,n3,v3,n4,v4){\
+    var ev=%[type:t,target:target];\n    if(n1!==void)ev[n1]=v1;\n    if(n2!==void)ev[n2]=v2;\n    if(n3!==void)ev[n3]=v3;\n    if(n4!==void)ev[n4]=v4;\n    return owner.action(ev);})";
+
+/// The maximum number of event members any `Layer` event carries (`x`, `y`,
+/// `button`, `shift` for `onMouseDown`).
+const LAYER_EVENT_MAX_MEMBERS: usize = 4;
+
+/// Dispatch one layer event to its action owner: retain the owner and the
+/// layer target, evaluate the helper closure, and invoke it with the event
+/// type plus alternating member name/value pairs.
+fn dispatch_layer_event(
+    engine: &Tjs2Engine,
+    owner_raw: *mut c_void,
+    target: *mut c_void,
+    event_type: &str,
+    members: &[(&str, i64)],
+) {
+    let Ok(owner) = engine.retain_object_detached(owner_raw) else {
+        return;
+    };
+    let Ok(target_dv) = engine.retain_object_detached(target) else {
+        return;
+    };
+    let Ok(helper) = engine.eval_retained(LAYER_EVENT_DISPATCH, "layerEvent") else {
+        return;
+    };
+    let tjs2_sys::RetainedValue::Object(helper_dv) = helper else {
+        return;
+    };
+    let mut args: Vec<TjsValue> = vec![
+        TjsValue::Retained(owner.raw_id() as u64),
+        TjsValue::Retained(target_dv.raw_id() as u64),
+        TjsValue::String(event_type.to_string()),
+    ];
+    for i in 0..LAYER_EVENT_MAX_MEMBERS {
+        match members.get(i) {
+            Some((name, value)) => {
+                args.push(TjsValue::String((*name).to_string()));
+                args.push(TjsValue::Integer(*value));
+            }
+            None => {
+                args.push(TjsValue::Void);
+                args.push(TjsValue::Void);
+            }
+        }
+    }
+    // `owner`/`target_dv` retentions are consumed by the argument copy; their
+    // drops are no-ops. Errors surface as a script `action` throw, which the
+    // VM reports elsewhere; the native method itself stays void.
+    if let Err(e) = engine.call_detached(&helper_dv, &args) {
+        log::warn!("layer event dispatch ({event_type}) failed: {e}");
+    }
+}
+
+/// Define a native `Layer` event method whose arguments become the named
+/// members of the event dictionary dispatched to the action owner. The
+/// reference requires `names.len()` arguments.
+macro_rules! layer_event_method {
+    ($fn_name:ident, $event:literal, [$($member:literal),* $(,)?]) => {
+        extern "C" fn $fn_name(
+            _engine: *mut c_void,
+            instance: *mut c_void,
+            argc: c_int,
+            argv: *const Value,
+            out: *mut Value,
+            out_error: *mut *mut c_char,
+            objthis: *mut c_void,
+        ) -> c_int {
+            let args = unsafe { super::ffi::args(argc, argv) };
+            let names: &[&str] = &[$($member),*];
+            if args.len() < names.len() {
+                return error_out(out_error, concat!("Layer.", $event, " requires more arguments"));
+            }
+            let inst = unsafe { instance_ref::<LayerInst>(instance) };
+            if let Some(owner) = &inst.action_owner {
+                let members: Vec<(&str, i64)> = names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, name)| (*name, arg_i64(&args[i])))
+                    .collect();
+                let engine = crate::natives::context_engine();
+                dispatch_layer_event(engine, owner.raw, objthis, $event, &members);
+            }
+            set_void_out(out);
+            0
+        }
+    };
+}
+
+layer_event_method!(layer_click, "onClick", ["x", "y"]);
+layer_event_method!(layer_double_click, "onDoubleClick", ["x", "y"]);
+layer_event_method!(
+    layer_mouse_down,
+    "onMouseDown",
+    ["x", "y", "button", "shift"]
+);
+layer_event_method!(layer_mouse_up, "onMouseUp", ["x", "y", "button", "shift"]);
+layer_event_method!(layer_mouse_move, "onMouseMove", ["x", "y", "shift"]);
+layer_event_method!(layer_mouse_enter, "onMouseEnter", []);
+layer_event_method!(layer_mouse_leave, "onMouseLeave", []);
+layer_event_method!(
+    layer_mouse_wheel,
+    "onMouseWheel",
+    ["shift", "delta", "x", "y"]
+);
+layer_event_method!(layer_key_down, "onKeyDown", ["key", "shift", "process"]);
+layer_event_method!(layer_key_up, "onKeyUp", ["key", "shift", "process"]);
+
 /// `setClip([left, top, width, height])` — reference
 /// `tTJSNI_BaseLayer::SetClip`/`ResetClip` (`LayerIntf.cpp:4032`). With no
 /// args (or a `void` first arg) the clip resets to the whole image.
@@ -2789,27 +3696,11 @@ pub(crate) fn register_layer(engine: &Tjs2Engine) -> Result<(), String> {
         "resetDrawTextParam",
         "setFontStyle",
         "getDrawWidth",
-        "affineCopy",
-        "affinePile",
-        "affineBlend",
-        "stretchCopy",
-        "stretchPile",
-        "stretchBlend",
         "pileRect",
         "piledCopy",
         "blendRect",
-        "operateRect",
-        "operateStretch",
-        "operateAffine",
-        "gaussianBlur",
-        "adjustGamma",
-        "doGrayScale",
-        "flipLR",
-        "flipUD",
         "convertType",
-        "light",
         "stopTransition",
-        "saveLayerImage",
         "releaseCapture",
         "releaseTouchCapture",
         "setMode",
@@ -2823,7 +3714,6 @@ pub(crate) fn register_layer(engine: &Tjs2Engine) -> Result<(), String> {
         "getMaskPixel",
         "setProvincePixel",
         "getProvincePixel",
-        "independMainImage",
         "independProvinceImage",
         "loadProvinceImage",
         "bringToBack",
@@ -2983,8 +3873,116 @@ pub(crate) fn register_layer(engine: &Tjs2Engine) -> Result<(), String> {
             f: layer_do_blur_light,
         },
         NativeInstanceMethodDef {
+            name: "stretchCopy",
+            f: layer_stretch_copy,
+        },
+        NativeInstanceMethodDef {
+            name: "stretchPile",
+            f: layer_stretch_pile,
+        },
+        NativeInstanceMethodDef {
+            name: "stretchBlend",
+            f: layer_stretch_blend,
+        },
+        NativeInstanceMethodDef {
+            name: "operateRect",
+            f: layer_operate_rect,
+        },
+        NativeInstanceMethodDef {
+            name: "operateStretch",
+            f: layer_operate_stretch,
+        },
+        NativeInstanceMethodDef {
+            name: "affineCopy",
+            f: layer_affine_copy,
+        },
+        NativeInstanceMethodDef {
+            name: "affinePile",
+            f: layer_affine_pile,
+        },
+        NativeInstanceMethodDef {
+            name: "affineBlend",
+            f: layer_affine_blend,
+        },
+        NativeInstanceMethodDef {
+            name: "operateAffine",
+            f: layer_operate_affine,
+        },
+        NativeInstanceMethodDef {
+            name: "light",
+            f: layer_light,
+        },
+        NativeInstanceMethodDef {
+            name: "flipLR",
+            f: layer_flip_lr,
+        },
+        NativeInstanceMethodDef {
+            name: "flipUD",
+            f: layer_flip_ud,
+        },
+        NativeInstanceMethodDef {
+            name: "independMainImage",
+            f: layer_independ_main_image,
+        },
+        NativeInstanceMethodDef {
+            name: "gaussianBlur",
+            f: layer_gaussian_blur,
+        },
+        NativeInstanceMethodDef {
+            name: "doGrayScale",
+            f: layer_do_gray_scale,
+        },
+        NativeInstanceMethodDef {
+            name: "adjustGamma",
+            f: layer_adjust_gamma,
+        },
+        NativeInstanceMethodDef {
+            name: "saveLayerImage",
+            f: layer_save_layer_image,
+        },
+        NativeInstanceMethodDef {
             name: "setClip",
             f: layer_set_clip,
+        },
+        NativeInstanceMethodDef {
+            name: "onClick",
+            f: layer_click,
+        },
+        NativeInstanceMethodDef {
+            name: "onDoubleClick",
+            f: layer_double_click,
+        },
+        NativeInstanceMethodDef {
+            name: "onMouseDown",
+            f: layer_mouse_down,
+        },
+        NativeInstanceMethodDef {
+            name: "onMouseUp",
+            f: layer_mouse_up,
+        },
+        NativeInstanceMethodDef {
+            name: "onMouseMove",
+            f: layer_mouse_move,
+        },
+        NativeInstanceMethodDef {
+            name: "onMouseEnter",
+            f: layer_mouse_enter,
+        },
+        NativeInstanceMethodDef {
+            name: "onMouseLeave",
+            f: layer_mouse_leave,
+        },
+        NativeInstanceMethodDef {
+            name: "onMouseWheel",
+            f: layer_mouse_wheel,
+        },
+        NativeInstanceMethodDef {
+            name: "onKeyDown",
+            f: layer_key_down,
+        },
+        NativeInstanceMethodDef {
+            name: "onKeyUp",
+            f: layer_key_up,
         },
         NativeInstanceMethodDef {
             name: "beginTransition",
@@ -4413,6 +5411,25 @@ mod tests {
         assert!(
             glyphs >= 3,
             "drawText must rasterize 'ABC' through the configured face, got {glyphs} glyphs"
+        );
+    }
+
+    /// `saveLayerImage` resolves relative names under the game dir and
+    /// normalizes the storage `\` separator; absolute names are used as-is.
+    #[test]
+    fn save_host_path_normalizes_storage_separators() {
+        let game = std::path::Path::new("/games/title");
+        assert_eq!(
+            super::save_host_path(game, "thumb\\a.bmp"),
+            std::path::PathBuf::from("/games/title/thumb/a.bmp")
+        );
+        assert_eq!(
+            super::save_host_path(game, "/abs/x.png"),
+            std::path::PathBuf::from("/abs/x.png")
+        );
+        assert_eq!(
+            super::save_host_path(game, "sub/dir/y.jpg"),
+            std::path::PathBuf::from("/games/title/sub/dir/y.jpg")
         );
     }
 }

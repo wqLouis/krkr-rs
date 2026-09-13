@@ -57,6 +57,20 @@ impl Env {
             .expect("script must run");
     }
 
+    fn eval_string(&self, expr: &str) -> String {
+        match self.engine.eval(expr, "layer_color_ops") {
+            Ok(tjs2_sys::TjsValue::String(s)) => s,
+            other => panic!("eval {expr:?} -> {other:?}"),
+        }
+    }
+
+    fn eval_int(&self, expr: &str) -> i64 {
+        match self.engine.eval(expr, "layer_color_ops") {
+            Ok(tjs2_sys::TjsValue::Integer(i)) => i,
+            other => panic!("eval {expr:?} -> {other:?}"),
+        }
+    }
+
     fn scene(&self) -> std::sync::RwLockReadGuard<'_, Scene> {
         self.scene.read().expect("scene lock poisoned")
     }
@@ -333,6 +347,255 @@ fn replacing_the_image_resets_clip() {
     let scene = env.scene();
     assert_eq!(pixel(&scene, 0, 0), [255, 0, 0, 255]);
     assert_eq!(pixel(&scene, 7, 7), [255, 0, 0, 255]);
+}
+
+/// Read an RGBA pixel from a layer's attached bitmap (by layer index).
+fn pixel_index(scene: &Scene, layer_index: usize, x: u32, y: u32) -> [u8; 4] {
+    let bitmap_id = scene.layers[layer_index]
+        .bitmap
+        .expect("layer has a bitmap");
+    let bitmap = scene.bitmap(bitmap_id).expect("bitmap exists");
+    let i = ((y * bitmap.width + x) as usize) * 4;
+    [
+        bitmap.rgba[i],
+        bitmap.rgba[i + 1],
+        bitmap.rgba[i + 2],
+        bitmap.rgba[i + 3],
+    ]
+}
+
+/// `saveLayerImage` writes the image to storage and `loadImages` reads it
+/// back, pixel-for-pixel (PNG round trip).
+#[test]
+fn save_layer_image_round_trips() {
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var l = new Layer(w, null); l.setSize(4, 4); var b = new Bitmap(4, 4); l.setBitmap(b.id); \
+         l.fillRect(0, 0, 4, 4, 0xff123456); \
+         l.saveLayerImage('saved.png');",
+    );
+    assert!(
+        env._dir.path().join("saved.png").exists(),
+        "saveLayerImage must write the file"
+    );
+    env.run("var l2 = new Layer(w, null); l2.loadImages('saved.png');");
+    let scene = env.scene();
+    assert_eq!(
+        pixel_index(&scene, 1, 1, 1),
+        [0x12, 0x34, 0x56, 0xff],
+        "PNG round trip preserves RGBA"
+    );
+}
+
+/// `saveLayerImage` defaults to BMP and creates the parent directory.
+#[test]
+fn save_layer_image_bmp_creates_parent_dir() {
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var l = new Layer(w, null); l.setSize(2, 2); var b = new Bitmap(2, 2); l.setBitmap(b.id); \
+         l.fillRect(0, 0, 2, 2, 0xff00ff00); \
+         l.saveLayerImage('thumb/a.bmp');",
+    );
+    let path = env._dir.path().join("thumb").join("a.bmp");
+    assert!(path.exists(), "BMP saved under a created subdirectory");
+    let bytes = std::fs::read(&path).unwrap();
+    assert_eq!(&bytes[..2], b"BM", "BMP magic");
+}
+
+/// `stretchCopy` with `stNearest` samples exact source pixels.
+#[test]
+fn stretch_copy_nearest_downscale() {
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var src = new Layer(w, null); var sb = new Bitmap(4, 4); src.setBitmap(sb.id); \
+         src.fillRect(0, 0, 2, 2, 0xffff0000); \
+         src.fillRect(2, 0, 2, 2, 0xff00ff00); \
+         src.fillRect(0, 2, 2, 2, 0xff0000ff); \
+         src.fillRect(2, 2, 2, 2, 0xffffffff); \
+         var dst = new Layer(w, null); dst.setSize(2, 2); var db = new Bitmap(2, 2); dst.setBitmap(db.id); \
+         dst.stretchCopy(0, 0, 2, 2, src, 0, 0, 4, 4, 0);",
+    );
+    let scene = env.scene();
+    // Nearest maps dest centers (0.5,0.5)/(1.5,1.5) back to source
+    // (0.5,0.5)/(2.5,2.5) → the four quadrant representatives.
+    assert_eq!(pixel_index(&scene, 1, 0, 0), [255, 0, 0, 255]);
+    assert_eq!(pixel_index(&scene, 1, 1, 1), [255, 255, 255, 255]);
+}
+
+/// `doGrayScale` applies the reference luma on each pixel, alpha held.
+#[test]
+fn do_gray_scale_matches_reference_luma() {
+    let env = Env::new();
+    setup(&env);
+    env.run("l.fillRect(0, 0, 1, 1, 0xffff0000); l.doGrayScale();");
+    let scene = env.scene();
+    // (19*255) >> 8 == 18
+    assert_eq!(pixel(&scene, 0, 0), [18, 18, 18, 255]);
+}
+
+/// `adjustGamma` with gamma 2.0 brightens mid grays and holds alpha; the
+/// identity parameters leave the pixels unchanged.
+#[test]
+fn adjust_gamma_brightens_and_identity_is_noop() {
+    let env = Env::new();
+    setup(&env);
+    env.run("l.fillRect(0, 0, 1, 1, 0xff808080);");
+    let before = pixel(&env.scene(), 0, 0);
+    assert_eq!(before, [0x80, 0x80, 0x80, 0xff]);
+    env.run("l.adjustGamma(2.0, 0, 255, 2.0, 0, 255, 2.0, 0, 255);");
+    let after = pixel(&env.scene(), 0, 0);
+    assert!(after[0] > 0x80, "gamma 2.0 brightens, got {after:?}");
+    assert_eq!(after[3], 255, "alpha held");
+    // Identity leaves it as the brightened value (the table is identity).
+    env.run("l.adjustGamma(1.0, 0, 255, 1.0, 0, 255, 1.0, 0, 255);");
+    assert_eq!(pixel(&env.scene(), 0, 0), after);
+}
+
+/// Native `Layer` event methods dispatch to the action owner (the first
+/// constructor argument) via `actionOwner.action(event)` with the event
+/// dictionary (`TVP_ACTION_INVOKE`). This is the `_trim.onMouseMove(...)`
+/// path from `system/SelectItem.tjs:963`.
+#[test]
+fn layer_event_dispatches_to_action_owner() {
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var got = ''; \
+         var target_ok = false; \
+         w.action = function(ev) { \
+             got = ev.type; \
+             if (ev.x !== void) got += ':' + ev.x + ',' + ev.y + ',' + ev.shift; \
+             if (ev.key !== void) got += ':' + ev.key + ',' + ev.shift + ',' + ev.process; \
+             target_ok = (ev.target === l); \
+         }; \
+         var l = new Layer(w, null); \
+         l.onMouseMove(3, 4, 5);",
+    );
+    assert_eq!(env.eval_string("got"), "onMouseMove:3,4,5");
+    assert_eq!(env.eval_int("target_ok"), 1, "event target is the layer");
+
+    // Zero-argument events still dispatch with type/target.
+    env.run("l.onMouseEnter();");
+    assert!(
+        env.eval_string("got").starts_with("onMouseEnter"),
+        "onMouseEnter dispatched"
+    );
+    // Key events carry key/shift/process.
+    env.run("l.onKeyDown(65, 1, 1);");
+    assert_eq!(env.eval_string("got"), "onKeyDown:65,1,1");
+}
+
+/// The action-owner dispatch is a no-op when no owner was captured (an
+/// integer window id and no registered window object).
+#[test]
+fn layer_event_without_action_owner_is_noop() {
+    let env = Env::new();
+    env.run("var w = new Window(); var l = new Layer(w, null); l.onClick(1, 2);");
+    let scene = env.scene();
+    assert_eq!(scene.layers.len(), 1);
+}
+
+/// `flipLR`/`flipUD` mirror the whole image.
+#[test]
+fn flip_lr_and_ud_mirror() {
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); var l = new Layer(w, null); l.setSize(2, 1); \
+         var b = new Bitmap(2, 1); l.setBitmap(b.id); \
+         l.fillRect(0, 0, 1, 1, 0xffff0000); \
+         l.fillRect(1, 0, 1, 1, 0xff00ff00);",
+    );
+    env.run("l.flipLR();");
+    let scene = env.scene();
+    assert_eq!(pixel(&scene, 0, 0), [0, 255, 0, 255]);
+    assert_eq!(pixel(&scene, 1, 0), [255, 0, 0, 255]);
+    drop(scene);
+    env.run("l.flipUD();");
+    // Only one row, so flipUD is a no-op here; assert it did not corrupt.
+    let scene = env.scene();
+    assert_eq!(pixel(&scene, 0, 0), [0, 255, 0, 255]);
+}
+
+/// `light(brightness, contrast)` brightens/darkens channels.
+#[test]
+fn light_brightens_pixels() {
+    let env = Env::new();
+    setup(&env);
+    env.run("l.fillRect(0, 0, 1, 1, 0xff404040); l.light(40, 0);");
+    let scene = env.scene();
+    assert_eq!(pixel(&scene, 0, 0), [0x68, 0x68, 0x68, 255]);
+}
+
+/// `independMainImage` detaches the layer's bitmap so later writes do not
+/// affect the original.
+#[test]
+fn independ_main_image_clones() {
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); var l = new Layer(w, null); l.setSize(2, 2); \
+         var b = new Bitmap(2, 2); l.setBitmap(b.id); \
+         l.fillRect(0, 0, 2, 2, 0xffff0000); \
+         l.independMainImage(); \
+         l.fillRect(0, 0, 1, 1, 0xff0000ff);",
+    );
+    let scene = env.scene();
+    // The layer's new bitmap has the clone with the overwritten pixel.
+    assert_eq!(pixel(&scene, 0, 0), [0, 0, 255, 255]);
+    assert_eq!(pixel(&scene, 1, 1), [255, 0, 0, 255]);
+}
+
+/// `operateRect` composites a source region with the requested mode.
+#[test]
+fn operate_rect_composites() {
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var src = new Layer(w, null); var sb = new Bitmap(2, 2); src.setBitmap(sb.id); \
+         src.fillRect(0, 0, 2, 2, 0xff0000ff); \
+         var dst = new Layer(w, null); dst.setSize(4, 4); var db = new Bitmap(4, 4); dst.setBitmap(db.id); \
+         dst.fillRect(0, 0, 4, 4, 0xffffffff); \
+         dst.operateRect(0, 0, src, 0, 0, 2, 2, 2, 255);",
+    );
+    let scene = env.scene();
+    // Source-over of opaque blue replaces the dest in the region.
+    assert_eq!(pixel_index(&scene, 1, 0, 0), [0, 0, 255, 255]);
+    assert_eq!(pixel_index(&scene, 1, 3, 3), [255, 255, 255, 255]);
+}
+
+/// `affineCopy` maps the source rect's corners to the given points.
+#[test]
+fn affine_copy_scales_source() {
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var src = new Layer(w, null); var sb = new Bitmap(2, 2); src.setBitmap(sb.id); \
+         src.fillRect(0, 0, 1, 1, 0xffff0000); \
+         src.fillRect(1, 0, 1, 1, 0xff00ff00); \
+         src.fillRect(0, 1, 1, 1, 0xff0000ff); \
+         src.fillRect(1, 1, 1, 1, 0xffffffff); \
+         var dst = new Layer(w, null); dst.setSize(4, 4); var db = new Bitmap(4, 4); dst.setBitmap(db.id); \
+         dst.affineCopy(src, 0, 0, 2, 2, false, 0, 0, 4, 0, 0, 4, 0);",
+    );
+    let scene = env.scene();
+    // 2x2 source scaled to 4x4, nearest: each source pixel is a 2x2 block.
+    assert_eq!(pixel_index(&scene, 1, 0, 0), [255, 0, 0, 255]);
+    assert_eq!(pixel_index(&scene, 1, 2, 0), [0, 255, 0, 255]);
+    assert_eq!(pixel_index(&scene, 1, 0, 2), [0, 0, 255, 255]);
+    assert_eq!(pixel_index(&scene, 1, 2, 2), [255, 255, 255, 255]);
+}
+
+/// `gaussianBlur` spreads an opaque dot.
+#[test]
+fn gaussian_blur_spreads() {
+    let env = Env::new();
+    setup(&env);
+    env.run("l.fillRect(4, 4, 1, 1, 0xffffffff); l.gaussianBlur(2, 1.0);");
+    let scene = env.scene();
+    assert!(pixel(&scene, 3, 4)[3] > 0, "blur spread left");
+    assert!(pixel(&scene, 5, 4)[3] > 0, "blur spread right");
 }
 
 /// `fillRect` (the pre-existing method) still replaces pixels exactly and

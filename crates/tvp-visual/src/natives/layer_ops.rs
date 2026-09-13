@@ -788,3 +788,634 @@ pub(crate) fn blur_bitmap_in_place(bitmap: &mut BitmapState, xradius: u32, yradi
     }
     bitmap.mark_dirty();
 }
+
+// ---------------------------------------------------------------------------
+// Stretch / tone operations (the thumbnail pipeline)
+// ---------------------------------------------------------------------------
+
+/// Read a pixel clamped to the bitmap edges (out-of-range samples repeat the
+/// border, the usual resampler edge policy).
+fn read_pixel_clamped(bitmap: &BitmapState, x: i32, y: i32) -> [u8; 4] {
+    if bitmap.width == 0 || bitmap.height == 0 {
+        return [0, 0, 0, 0];
+    }
+    let x = x.clamp(0, bitmap.width as i32 - 1) as u32;
+    let y = y.clamp(0, bitmap.height as i32 - 1) as u32;
+    read_pixel(bitmap, x as i32, y as i32)
+}
+
+/// Catmull-Rom cubic interpolation of four samples at `t` in `0..=1`.
+fn cubic(v0: f32, v1: f32, v2: f32, v3: f32, t: f32) -> f32 {
+    let a = -0.5 * v0 + 1.5 * v1 - 1.5 * v2 + 0.5 * v3;
+    let b = v0 - 2.5 * v1 + 2.0 * v2 - 0.5 * v3;
+    let c = -0.5 * v0 + 0.5 * v2;
+    a * t * t * t + b * t * t + c * t + v1
+}
+
+/// Bilinear sample at fractional `(fx, fy)`.
+fn sample_bilinear(bitmap: &BitmapState, fx: f32, fy: f32) -> [u8; 4] {
+    let x0 = fx.floor();
+    let y0 = fy.floor();
+    let tx = fx - x0;
+    let ty = fy - y0;
+    let (x0, y0) = (x0 as i32, y0 as i32);
+    let p00 = read_pixel_clamped(bitmap, x0, y0);
+    let p10 = read_pixel_clamped(bitmap, x0 + 1, y0);
+    let p01 = read_pixel_clamped(bitmap, x0, y0 + 1);
+    let p11 = read_pixel_clamped(bitmap, x0 + 1, y0 + 1);
+    let mut out = [0u8; 4];
+    for (c, o) in out.iter_mut().enumerate() {
+        let top = f32::from(p00[c]) + (f32::from(p10[c]) - f32::from(p00[c])) * tx;
+        let bot = f32::from(p01[c]) + (f32::from(p11[c]) - f32::from(p01[c])) * tx;
+        *o = (top + (bot - top) * ty).round().clamp(0.0, 255.0) as u8;
+    }
+    out
+}
+
+/// Bicubic (Catmull-Rom) sample at fractional `(fx, fy)`.
+fn sample_bicubic(bitmap: &BitmapState, fx: f32, fy: f32) -> [u8; 4] {
+    let x0 = fx.floor() as i32;
+    let y0 = fy.floor() as i32;
+    let tx = fx - x0 as f32;
+    let ty = fy - y0 as f32;
+    let mut out = [0u8; 4];
+    for (c, o) in out.iter_mut().enumerate() {
+        let mut rows = [0.0f32; 4];
+        for (j, row) in rows.iter_mut().enumerate() {
+            let yy = y0 - 1 + j as i32;
+            let p0 = read_pixel_clamped(bitmap, x0 - 1, yy)[c];
+            let p1 = read_pixel_clamped(bitmap, x0, yy)[c];
+            let p2 = read_pixel_clamped(bitmap, x0 + 1, yy)[c];
+            let p3 = read_pixel_clamped(bitmap, x0 + 2, yy)[c];
+            *row = cubic(
+                f32::from(p0),
+                f32::from(p1),
+                f32::from(p2),
+                f32::from(p3),
+                tx,
+            );
+        }
+        *o = cubic(rows[0], rows[1], rows[2], rows[3], ty)
+            .round()
+            .clamp(0.0, 255.0) as u8;
+    }
+    out
+}
+
+/// Sample the source at dest-pixel center `(x, y)` using the mapping from the
+/// destination rect onto the source rect.
+fn stretch_sample(
+    bitmap: &BitmapState,
+    src: RectI,
+    dest: RectI,
+    x: i32,
+    y: i32,
+    kind: i64,
+) -> [u8; 4] {
+    let dw = (dest.2 - dest.0) as f32;
+    let dh = (dest.3 - dest.1) as f32;
+    let sw = (src.2 - src.0) as f32;
+    let sh = (src.3 - src.1) as f32;
+    let u = (x as f32 - dest.0 as f32 + 0.5) / dw;
+    let v = (y as f32 - dest.1 as f32 + 0.5) / dh;
+    let fx = src.0 as f32 + u * sw - 0.5;
+    let fy = src.1 as f32 + v * sh - 0.5;
+    match kind {
+        0 => {
+            // stNearest
+            let sx = (fx + 0.5).floor() as i32;
+            let sy = (fy + 0.5).floor() as i32;
+            read_pixel_clamped(bitmap, sx, sy)
+        }
+        // stCubic / stFastCubic → Catmull-Rom; the higher-quality spline
+        // kernels reduce to bicubic (no assembly pipeline needed).
+        3 | 5 => sample_bicubic(bitmap, fx, fy),
+        // stLinear / stFastLinear / everything else.
+        _ => sample_bilinear(bitmap, fx, fy),
+    }
+}
+
+/// `StretchBlt` copy: resample `src[src_rect]` into `dst[dest]`, replacing
+/// pixels. `dest`/`src_rect` are half-open; `dest` is clipped to the bitmap.
+/// This is the `bmCopy` path of `tTJSNI_BaseLayer::StretchCopy`
+/// (`LayerIntf.cpp:4672`) — the operation behind `saveLayerImage` thumbnails.
+pub(crate) fn stretch_blit(
+    dst: &mut BitmapState,
+    dest: RectI,
+    src: &BitmapState,
+    src_rect: RectI,
+    stretch_type: i64,
+) {
+    let dw = dest.2 - dest.0;
+    let dh = dest.3 - dest.1;
+    let sw = src_rect.2 - src_rect.0;
+    let sh = src_rect.3 - src_rect.1;
+    if dw <= 0 || dh <= 0 || sw <= 0 || sh <= 0 {
+        return;
+    }
+    let Some(dc) = intersect(dst, dest) else {
+        return;
+    };
+    for y in dc.1..dc.3 {
+        for x in dc.0..dc.2 {
+            let color = stretch_sample(src, src_rect, dest, x, y, stretch_type);
+            write_pixel(dst, x, y, color);
+        }
+    }
+    dst.mark_dirty();
+}
+
+/// `TVPDoGrayScale`: luma `(19*R + 183*G + 54*B) >> 8` in all three channels,
+/// alpha held (`tvpgl.cpp:10350`).
+pub(crate) fn do_gray_scale(bitmap: &mut BitmapState, rect: RectI) {
+    let Some((x0, y0, x1, y1)) = intersect(bitmap, rect) else {
+        return;
+    };
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let mut d = read_pixel(bitmap, x, y);
+            let gray =
+                ((19 * u32::from(d[0]) + 183 * u32::from(d[1]) + 54 * u32::from(d[2])) >> 8) as u8;
+            d[0] = gray;
+            d[1] = gray;
+            d[2] = gray;
+            write_pixel(bitmap, x, y, d);
+        }
+    }
+    bitmap.mark_dirty();
+}
+
+/// The reference `tTVPGLGammaAdjustData` (R/G/B gamma, floor, ceil).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GammaAdjust {
+    pub r_gamma: f64,
+    pub r_floor: i32,
+    pub r_ceil: i32,
+    pub g_gamma: f64,
+    pub g_floor: i32,
+    pub g_ceil: i32,
+    pub b_gamma: f64,
+    pub b_floor: i32,
+    pub b_ceil: i32,
+}
+
+impl GammaAdjust {
+    /// `TVPIntactGammaAdjustData` (identity).
+    pub(crate) fn intact() -> Self {
+        Self {
+            r_gamma: 1.0,
+            r_floor: 0,
+            r_ceil: 255,
+            g_gamma: 1.0,
+            g_floor: 0,
+            g_ceil: 255,
+            b_gamma: 1.0,
+            b_floor: 0,
+            b_ceil: 255,
+        }
+    }
+}
+
+fn gamma_table(gamma: f64, floor: i32, ceil: i32) -> [u8; 256] {
+    // `TVPInitGammaAdjustTempData_c` (`tvpgl.cpp:10405`): the reference uses
+    // `exp(log(i/255) * (1/gamma))`, i.e. `pow(i/255, 1/gamma)`.
+    let ramp = (ceil - floor) as f64;
+    let g = if gamma == 0.0 { f64::MAX } else { 1.0 / gamma };
+    let mut table = [0u8; 256];
+    for (i, slot) in table.iter_mut().enumerate() {
+        let rate = (i as f64 / 255.0).ln();
+        let n = (rate * g).exp() * ramp + 0.5 + floor as f64;
+        *slot = n.clamp(0.0, 255.0) as u8;
+    }
+    table
+}
+
+/// `TVPAdjustGamma`: per-channel gamma/level remap, only on non-fully-
+/// transparent pixels (`tvpgl.cpp:10462`).
+pub(crate) fn adjust_gamma(bitmap: &mut BitmapState, rect: RectI, data: GammaAdjust) {
+    let Some((x0, y0, x1, y1)) = intersect(bitmap, rect) else {
+        return;
+    };
+    let r = gamma_table(data.r_gamma, data.r_floor, data.r_ceil);
+    let g = gamma_table(data.g_gamma, data.g_floor, data.g_ceil);
+    let b = gamma_table(data.b_gamma, data.b_floor, data.b_ceil);
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let mut d = read_pixel(bitmap, x, y);
+            if d[3] == 0 {
+                continue;
+            }
+            d[0] = r[d[0] as usize];
+            d[1] = g[d[1] as usize];
+            d[2] = b[d[2] as usize];
+            write_pixel(bitmap, x, y, d);
+        }
+    }
+    bitmap.mark_dirty();
+}
+
+// ---------------------------------------------------------------------------
+// Tone / geometry / composite operations (the rest of the LayerExDraw surface)
+// ---------------------------------------------------------------------------
+
+/// `tTJSNI_BaseLayer::ApplyLightContrast` (`LayerIntf.cpp:1006`): brightness
+/// offset followed by a `(259*(C+255))/(255*(259-C))` contrast factor, both
+/// clamped per channel; alpha held.
+pub(crate) fn light_contrast(
+    bitmap: &mut BitmapState,
+    rect: RectI,
+    brightness: i32,
+    contrast: i32,
+) {
+    let Some((x0, y0, x1, y1)) = intersect(bitmap, rect) else {
+        return;
+    };
+    let c = contrast.clamp(-255, 255);
+    let factor = if c == 0 {
+        1.0
+    } else if c == 255 {
+        259.0 * (255.0 + 255.0) / (255.0 * (259.0 - 254.9))
+    } else if c == -255 {
+        0.0
+    } else {
+        (259.0 * (c as f64 + 255.0)) / (255.0 * (259.0 - c as f64))
+    };
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let mut d = read_pixel(bitmap, x, y);
+            for channel in d.iter_mut().take(3) {
+                let bright = (i32::from(*channel) + brightness).clamp(0, 255);
+                let out = factor * (bright as f64 - 128.0) + 128.0;
+                *channel = out.clamp(0.0, 255.0) as u8;
+            }
+            write_pixel(bitmap, x, y, d);
+        }
+    }
+    bitmap.mark_dirty();
+}
+
+/// `tTJSNI_BaseLayer::LRFlip` (`LayerIntf.cpp:5910`): mirror the whole main
+/// image horizontally.
+pub(crate) fn flip_lr(bitmap: &mut BitmapState) {
+    if bitmap.width < 2 || bitmap.height == 0 {
+        return;
+    }
+    let w = bitmap.width as usize;
+    for y in 0..bitmap.height as usize {
+        for x in 0..w / 2 {
+            let a = (y * w + x) * 4;
+            let b = (y * w + (w - 1 - x)) * 4;
+            for k in 0..4 {
+                bitmap.rgba.swap(a + k, b + k);
+            }
+        }
+    }
+    bitmap.mark_dirty();
+}
+
+/// `tTJSNI_BaseLayer::UDFlip` (`LayerIntf.cpp:5925`): mirror vertically.
+pub(crate) fn flip_ud(bitmap: &mut BitmapState) {
+    if bitmap.height < 2 || bitmap.width == 0 {
+        return;
+    }
+    let w = bitmap.width as usize;
+    let h = bitmap.height as usize;
+    for y in 0..h / 2 {
+        for x in 0..w {
+            let a = (y * w + x) * 4;
+            let b = ((h - 1 - y) * w + x) * 4;
+            for k in 0..4 {
+                bitmap.rgba.swap(a + k, b + k);
+            }
+        }
+    }
+    bitmap.mark_dirty();
+}
+
+/// The 1-D Gaussian kernel used by the reference `generate_1d_gaussian_kernel`
+/// (`LayerIntf.cpp:5729`).
+fn gaussian_kernel(radius: i32, sigma: f32) -> Vec<f32> {
+    let size = (2 * radius + 1) as usize;
+    let mut kernel = vec![0.0f32; size];
+    let r2 = 2.0 * sigma * sigma;
+    let mut sum = 0.0f32;
+    for (i, k) in kernel.iter_mut().enumerate() {
+        let x = i as i32 - radius;
+        *k = (-(x * x) as f32 / r2).exp();
+        sum += *k;
+    }
+    if sum != 0.0 {
+        for k in &mut kernel {
+            *k /= sum;
+        }
+    }
+    kernel
+}
+
+/// Separable Gaussian blur over the clip region (`Layer.gaussianBlur`;
+/// reference `ApplyGaussianBlur` `LayerIntf.cpp:5745`). Pixels outside the
+/// region clamp to the edge.
+pub(crate) fn gaussian_blur(bitmap: &mut BitmapState, rect: RectI, radius: i32, sigma: f32) {
+    if radius <= 0 || sigma <= 0.0 {
+        return;
+    }
+    let Some((x0, y0, x1, y1)) = intersect(bitmap, rect) else {
+        return;
+    };
+    let kernel = gaussian_kernel(radius, sigma);
+    let r = radius;
+    let mut tmp = bitmap.rgba.clone();
+    let w = bitmap.width as i32;
+    let h = bitmap.height as i32;
+    let at = |buf: &[u8], x: i32, y: i32| -> [u8; 4] {
+        let cx = x.clamp(0, w - 1) as usize;
+        let cy = y.clamp(0, h - 1) as usize;
+        let i = (cy * w as usize + cx) * 4;
+        [buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]
+    };
+    // Horizontal pass: src -> tmp.
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let mut acc = [0.0f32; 4];
+            for (ki, &k) in kernel.iter().enumerate() {
+                let p = at(&bitmap.rgba, x - r + ki as i32, y);
+                for (c, a) in acc.iter_mut().enumerate() {
+                    *a += f32::from(p[c]) * k;
+                }
+            }
+            let i = ((y as usize) * bitmap.width as usize + x as usize) * 4;
+            for (c, &a) in acc.iter().enumerate() {
+                tmp[i + c] = a.round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    // Vertical pass: tmp -> bitmap.
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let mut acc = [0.0f32; 4];
+            for (ki, &k) in kernel.iter().enumerate() {
+                let p = at(&tmp, x, y - r + ki as i32);
+                for (c, a) in acc.iter_mut().enumerate() {
+                    *a += f32::from(p[c]) * k;
+                }
+            }
+            let i = ((y as usize) * bitmap.width as usize + x as usize) * 4;
+            for (c, &a) in acc.iter().enumerate() {
+                bitmap.rgba[i + c] = a.round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    bitmap.mark_dirty();
+}
+
+/// Blend one source pixel onto `dst` using a `tTVPBlendOperationMode`
+/// (`LayerIntf.h:76`). The Photoshop-specific modes without a C fallback in
+/// the reference reduce to source-over (the assembly pipeline is absent);
+/// `omPsHardLight` is implemented because the SDK `doBlurLight` uses it.
+pub(crate) fn blend_pixel_mode(
+    dst: &mut BitmapState,
+    x: i32,
+    y: i32,
+    src: [u8; 4],
+    opa: u8,
+    mode: i64,
+) {
+    match mode {
+        // omOpaque / ltOpaque: copy the source (including alpha).
+        1 => write_pixel(dst, x, y, src),
+        // omAdditive / ltAdditive: saturating add, source scaled by `opa`.
+        3 => {
+            let mut d = read_pixel(dst, x, y);
+            for c in 0..3 {
+                d[c] = d[c].saturating_add(((u32::from(src[c]) * u32::from(opa)) / 255) as u8);
+            }
+            write_pixel(dst, x, y, d);
+        }
+        // omSubtractive / ltSubtractive.
+        4 => {
+            let mut d = read_pixel(dst, x, y);
+            for c in 0..3 {
+                d[c] = d[c].saturating_sub(((u32::from(src[c]) * u32::from(opa)) / 255) as u8);
+            }
+            write_pixel(dst, x, y, d);
+        }
+        // omMultiplicative / ltMultiplicative.
+        5 => {
+            let mut d = read_pixel(dst, x, y);
+            let opa = u32::from(opa);
+            for c in 0..3 {
+                let s = u32::from(src[c]) * opa / 255;
+                d[c] = (u32::from(d[c]) * s / 255) as u8;
+            }
+            write_pixel(dst, x, y, d);
+        }
+        // omDarken / ltDarken.
+        9 => {
+            let mut d = read_pixel(dst, x, y);
+            for c in 0..3 {
+                d[c] = d[c].min(src[c]);
+            }
+            write_pixel(dst, x, y, d);
+        }
+        // omLighten / ltLighten.
+        10 => {
+            let mut d = read_pixel(dst, x, y);
+            for c in 0..3 {
+                d[c] = d[c].max(src[c]);
+            }
+            write_pixel(dst, x, y, d);
+        }
+        // omScreen / ltScreen.
+        11 => {
+            let mut d = read_pixel(dst, x, y);
+            for c in 0..3 {
+                let blended = 255 - (255 - u32::from(d[c])) * (255 - u32::from(src[c])) / 255;
+                d[c] = ((u32::from(d[c]) * (255 - u32::from(opa)) + blended * 255) / 255) as u8;
+            }
+            write_pixel(dst, x, y, d);
+        }
+        // ltPsHardLight (19): standard hard-light, alpha-composited.
+        19 => {
+            let d = read_pixel(dst, x, y);
+            let mut blended = [0u8; 4];
+            for c in 0..3 {
+                let sv = i32::from(src[c]);
+                let dv = i32::from(d[c]);
+                blended[c] = if sv < 128 {
+                    (2 * sv * dv / 255).clamp(0, 255) as u8
+                } else {
+                    (255 - 2 * (255 - sv) * (255 - dv) / 255).clamp(0, 255) as u8
+                };
+            }
+            blended[3] = src[3];
+            blend_pixel(dst, x, y, blended, 255, opa);
+        }
+        // Everything else (omAlpha=2, omPsNormal=13, omAddAlpha=12, and the
+        // remaining PS modes): source-over.
+        _ => blend_pixel(dst, x, y, src, 255, opa),
+    }
+}
+
+/// `tTJSNI_BaseLayer::OperateRect` (`LayerIntf.cpp:5224`): blend a source
+/// region onto `dst` at `(dx, dy)` with `mode` and `opa`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn operate_rect(
+    dst: &mut BitmapState,
+    dx: i32,
+    dy: i32,
+    src: &BitmapState,
+    src_rect: RectI,
+    mode: i64,
+    opa: u8,
+) {
+    let sw = src_rect.2 - src_rect.0;
+    let sh = src_rect.3 - src_rect.1;
+    if sw <= 0 || sh <= 0 {
+        return;
+    }
+    let Some(dc) = intersect(dst, (dx, dy, dx + sw, dy + sh)) else {
+        return;
+    };
+    for y in dc.1..dc.3 {
+        for x in dc.0..dc.2 {
+            let color = read_pixel(src, src_rect.0 + (x - dx), src_rect.1 + (y - dy));
+            blend_pixel_mode(dst, x, y, color, opa, mode);
+        }
+    }
+    dst.mark_dirty();
+}
+
+/// `StretchPile`/`StretchBlend`/`OperateStretch`: resample `src[src_rect]`
+/// into `dst[dest]` and blend with `mode` (or copy when `mode == 1`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn stretch_blit_mode(
+    dst: &mut BitmapState,
+    dest: RectI,
+    src: &BitmapState,
+    src_rect: RectI,
+    stretch_type: i64,
+    mode: i64,
+    opa: u8,
+) {
+    let dw = dest.2 - dest.0;
+    let dh = dest.3 - dest.1;
+    if dw <= 0 || dh <= 0 || src_rect.2 <= src_rect.0 || src_rect.3 <= src_rect.1 {
+        return;
+    }
+    let Some(dc) = intersect(dst, dest) else {
+        return;
+    };
+    for y in dc.1..dc.3 {
+        for x in dc.0..dc.2 {
+            let color = stretch_sample(src, src_rect, dest, x, y, stretch_type);
+            blend_pixel_mode(dst, x, y, color, opa, mode);
+        }
+    }
+    dst.mark_dirty();
+}
+
+/// The forward affine map of the three destination corners `p0` (src LT),
+/// `p1` (src RT), `p2` (src LB) — see `AffineBlt` (`LayerBitmapIntf.cpp:3461`).
+/// Returns `(a, b, c, d, e, f)` such that `u,v ∈ [0,1]` maps to
+/// `x = a + b*u + c*v`, `y = d + e*u + f*v`.
+fn affine_forward(p0: (f64, f64), p1: (f64, f64), p2: (f64, f64)) -> [f64; 6] {
+    [
+        p0.0,
+        p1.0 - p0.0,
+        p2.0 - p0.0,
+        p0.1,
+        p1.1 - p0.1,
+        p2.1 - p0.1,
+    ]
+}
+
+/// `affineCopy`/`affinePile`/`affineBlend`/`operateAffine`: map the source
+/// rect's LT/RT/LB corners to `p0/p1/p2` and resample into `dst` with `mode`
+/// (`1` = copy) and `opa`. Inverse-maps each destination pixel and bilinearly
+/// samples the source.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn affine_blit(
+    dst: &mut BitmapState,
+    p0: (f64, f64),
+    p1: (f64, f64),
+    p2: (f64, f64),
+    src: &BitmapState,
+    src_rect: RectI,
+    stretch_type: i64,
+    mode: i64,
+    opa: u8,
+    clear: bool,
+    clear_color: [u8; 4],
+) {
+    let m = affine_forward(p0, p1, p2);
+    let det = m[1] * m[5] - m[2] * m[4];
+    if det.abs() < 1e-12 {
+        return;
+    }
+    // Inverse of the 2x2 [b c; e f].
+    let inv = [m[5] / det, -m[2] / det, -m[4] / det, m[1] / det];
+    // Bounding box of the mapped unit square.
+    let corners = [
+        (m[0], m[3]),
+        (m[0] + m[1], m[3] + m[4]),
+        (m[0] + m[2], m[3] + m[5]),
+        (m[0] + m[1] + m[2], m[3] + m[4] + m[5]),
+    ];
+    let min_x = corners
+        .iter()
+        .map(|c| c.0)
+        .fold(f64::INFINITY, f64::min)
+        .floor() as i32;
+    let max_x = corners
+        .iter()
+        .map(|c| c.0)
+        .fold(f64::NEG_INFINITY, f64::max)
+        .ceil() as i32;
+    let min_y = corners
+        .iter()
+        .map(|c| c.1)
+        .fold(f64::INFINITY, f64::min)
+        .floor() as i32;
+    let max_y = corners
+        .iter()
+        .map(|c| c.1)
+        .fold(f64::NEG_INFINITY, f64::max)
+        .ceil() as i32;
+    let Some(dc) = intersect(dst, (min_x, min_y, max_x + 1, max_y + 1)) else {
+        return;
+    };
+    if clear {
+        let clip = (min_x, min_y, max_x + 1, max_y + 1);
+        if let Some(cc) = intersect(dst, clip) {
+            for y in cc.1..cc.3 {
+                for x in cc.0..cc.2 {
+                    write_pixel(dst, x, y, clear_color);
+                }
+            }
+        }
+    }
+    let sw = (src_rect.2 - src_rect.0) as f64;
+    let sh = (src_rect.3 - src_rect.1) as f64;
+    for y in dc.1..dc.3 {
+        for x in dc.0..dc.2 {
+            let px = x as f64 + 0.5 - m[0];
+            let py = y as f64 + 0.5 - m[3];
+            let u = inv[0] * px + inv[1] * py;
+            let v = inv[2] * px + inv[3] * py;
+            if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
+                continue;
+            }
+            let fx = src_rect.0 as f32 + (u * sw) as f32 - 0.5;
+            let fy = src_rect.1 as f32 + (v * sh) as f32 - 0.5;
+            let color = if stretch_type == 0 {
+                read_pixel_clamped(src, (fx + 0.5).floor() as i32, (fy + 0.5).floor() as i32)
+            } else if stretch_type == 3 || stretch_type == 5 {
+                sample_bicubic(src, fx, fy)
+            } else {
+                sample_bilinear(src, fx, fy)
+            };
+            blend_pixel_mode(dst, x, y, color, opa, mode);
+        }
+    }
+    dst.mark_dirty();
+}
