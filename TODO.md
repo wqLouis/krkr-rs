@@ -16,17 +16,24 @@ mapping (matches the camera's `AutoMin` scale, so hit areas follow the
 rendered buttons at any window aspect) → `WaveSoundBuffer` audio natives with
 **real Ogg Opus voice decode** → **NEW GAME starts the debut scenario
 `scenario/01_01.ks`** (the `KAGParser`/`Scripts` VM contexts are
-process-global, and a minimal `GdiPlus` plugin lets the ADV `MessageFrame`
-construct); the scenario loop runs `onflag → scene → hide/blackout/cg/update →
-playse → talk/ch → hitret` and stops at the first `hitret` click-wait. The
-window scales the 1280×720 scene on resize, and `System.exit` / window close
-quit gracefully. An Android/WASM feasibility assessment lives in
-`docs/portability.md`.
+process-global; the real `GdiPlus` plugin is implemented in `tvp-visual`).
+The scenario loop runs `onflag → scene → hide/blackout/cg/update → playse →
+talk/ch → hitret` and stops at the first `hitret` click-wait. **Dialogue text
+rasterizes** (`Layer.drawText` takes alpha from `opa`, not the color high
+byte) and lands inside the message frame (`fillRect` no longer moves the
+layer). `Layer.parent`/`window` return real `null`, and `Scripts.eval`/`exec`
+return object/function results, so the game's `GetAbsolutePos`/Action paths
+no longer throw. `Layer.drawPolygon/drawRectangle/drawLine/drawArc/drawBezier`
+rasterize `GdiPlus.Appearance` brushes/pens. The window scales the 1280×720
+scene on resize, and `System.exit` / window close quit gracefully. An
+Android/WASM feasibility assessment lives in `docs/portability.md` and a
+`GdiPlus` design spec in `docs/gdiplus.md`.
 
 **Remaining blockers**: the startup plugin chain is emulated by built-in Rust
-natives; `GdiPlus` is a no-op stub (the message frame draws nothing yet),
-transition/`@update` interpolation is a stub, and save/load is unported.
-Below is the investigation log; the logo→title milestone is closed.
+natives; `@update`/`@blackout` transition interpolation is a stub (tags run,
+animation jumps); `GdiPlus` hatch/antialiasing are approximations; and
+save/load is unported. Below is the investigation log; the logo→title
+milestone is closed.
 
 ---
 
