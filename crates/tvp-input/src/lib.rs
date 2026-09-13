@@ -116,11 +116,11 @@
 //!
 //! # Deviations from the reference (documented)
 //!
-//! * `Mouse.getCursorPos` returns the position as an `"x,y"` string. The
-//!   C ABI in `tjs2-sys` has no `tjs2_prop_set`, so a native cannot fill an
-//!   object argument's `x`/`y` properties; a game that passes an object gets
-//!   the string form. Supporting the object form needs a `tjs2_prop_set`
-//!   addition to the ABI (reported, not implemented here).
+//! * `Mouse.getCursorPos()` with no argument returns the position as an
+//!   `"x,y"` string; with an object argument it fills the object's `x`/`y`
+//!   properties (via `Tjs2Engine::set_member`) and returns void, which is
+//!   the conventional out-parameter form. The string form is a port
+//!   convenience for callers that expect a value.
 //! * `Mouse.setCursorPos` records the position and a *warp request*
 //!   ([`InputState::take_mouse_warp`]); the host input bridge must consume it
 //!   to move the OS cursor.
@@ -158,9 +158,39 @@ use tjs2_sys::{Tjs2Engine, VAL_INTEGER, VAL_REAL, VAL_STRING, VAL_VOID, Value, t
 /// single-threaded). The app calls this next to the other
 /// `register_*` calls before running `startup.tjs`.
 pub fn register_all(engine: &Tjs2Engine) -> Result<(), String> {
+    install_engine(engine);
     register_mouse(engine)?;
     register_key(engine)?;
     Ok(())
+}
+
+/// The engine the input natives were registered on.
+///
+/// Native callbacks receive only the raw `tjs2_engine*` ABI pointer (which
+/// is *not* a `Tjs2Engine*`), but `Mouse.getCursorPos(obj)` must call
+/// [`Tjs2Engine::set_member`] to fill the object. Store the registered
+/// engine address at setup like `tvp-natives`/`tvp-visual` do; the host
+/// keeps the engine alive for the process, so the address stays valid for
+/// every callback. The address is the stable heap allocation the caller
+/// passes (an `Arc<Tjs2Engine>` target, or a boxed engine in tests).
+static ENGINE: OnceLock<Mutex<Option<usize>>> = OnceLock::new();
+
+/// Record `engine` as the context for the input natives (idempotent).
+fn install_engine(engine: &Tjs2Engine) {
+    let cell = ENGINE.get_or_init(|| Mutex::new(None));
+    *lock_ok(cell) = Some(engine as *const Tjs2Engine as usize);
+}
+
+/// The registered engine as a shared reference (see [`ENGINE`]).
+///
+/// Panics only if called before [`register_all`], which cannot happen for a
+/// native callback: the callback exists only because registration ran.
+pub(crate) fn context_engine() -> &'static Tjs2Engine {
+    let cell = ENGINE.get_or_init(|| Mutex::new(None));
+    let ptr = lock_ok(cell).expect("tvp-input: engine context not set");
+    // SAFETY: the address was stored by register_all from a stable
+    // `&Tjs2Engine`; the host keeps that engine alive while callbacks run.
+    unsafe { &*(ptr as *const Tjs2Engine) }
 }
 
 // ---------------------------------------------------------------------------
@@ -906,8 +936,10 @@ mod tests {
     /// Fresh engine with `Mouse`/`Key` registered and a fresh, installed
     /// input state (tests must run single-threaded — the state is
     /// process-global).
-    fn test_engine() -> (Tjs2Engine, Arc<Mutex<InputState>>) {
-        let e = Tjs2Engine::new().expect("create engine");
+    fn test_engine() -> (Box<Tjs2Engine>, Arc<Mutex<InputState>>) {
+        // Box the engine so its address is stable for the natives that call
+        // back into `Tjs2Engine::set_member` (`context_engine`).
+        let e = Box::new(Tjs2Engine::new().expect("create engine"));
         register_all(&e).expect("register Mouse + Key");
         let state = Arc::new(Mutex::new(InputState::new()));
         set_context(Some(state.clone()));
@@ -1154,14 +1186,36 @@ mod tests {
     // -- getCursorPos tolerates an (unfillable) object argument -------------
 
     #[test]
-    fn mouse_get_cursor_pos_accepts_an_object_argument() {
+    fn mouse_get_cursor_pos_fills_an_object_argument() {
         let _vm_lock = vm_lock();
         let (e, state) = test_engine();
         state.lock().unwrap().set_mouse_pos(7, 9);
-        // The ABI has no object property setter, so the port returns the
-        // string form; passing an object must not raise an arity error.
+
+        // Object form: fill obj.x / obj.y in place and return void.
+        e.exec_script("global.__pos = %[x:0, y:0];", "test")
+            .expect("define pos");
         assert_eq!(
-            e.eval("Mouse.getCursorPos(%[x:0, y:0])", "test").unwrap(),
+            e.eval("Mouse.getCursorPos(global.__pos)", "test").unwrap(),
+            TjsValue::Void,
+            "Mouse.getCursorPos(obj) returns void"
+        );
+        assert_eq!(eval_i(&e, "global.__pos.x"), 7);
+        assert_eq!(eval_i(&e, "global.__pos.y"), 9);
+        // set_member uses TJS_MEMBERENSURE: a missing member is created.
+        e.exec_script("global.__empty = %[];", "test").unwrap();
+        e.eval("Mouse.getCursorPos(global.__empty)", "test")
+            .unwrap();
+        assert_eq!(eval_i(&e, "global.__empty.x"), 7);
+        assert_eq!(eval_i(&e, "global.__empty.y"), 9);
+
+        // No-argument form returns the "x,y" string.
+        assert_eq!(
+            e.eval("Mouse.getCursorPos()", "test").unwrap(),
+            TjsValue::String("7,9".into())
+        );
+        // A non-object argument falls back to the string form.
+        assert_eq!(
+            e.eval("Mouse.getCursorPos(123)", "test").unwrap(),
             TjsValue::String("7,9".into())
         );
     }

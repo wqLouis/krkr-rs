@@ -13,29 +13,48 @@
 
 use std::ffi::{c_char, c_int, c_void};
 
-use tjs2_sys::{NativeClassBuilder, NativeMethodDef, Tjs2Engine, Value};
+use tjs2_sys::{NativeClassBuilder, NativeMethodDef, Tjs2Engine, TjsValue, VAL_OBJECT, Value};
 
 use crate::{
-    MOUSE_BUTTONS, args, report_error, set_int_out, set_string_out, set_void_out, value_as_bool,
-    value_as_i64, with_state,
+    MOUSE_BUTTONS, args, context_engine, report_error, set_int_out, set_string_out, set_void_out,
+    value_as_bool, value_as_i64, with_state,
 };
 
-/// `Mouse.getCursorPos()` → `"x,y"` string.
+/// `Mouse.getCursorPos([obj])`.
 ///
-/// The conventional KiriKiri `Mouse.getCursorPos` API fills an object
-/// argument's `x`/`y` properties. The `tjs2-sys` ABI exposes no object
-/// property *setter*, so this port returns the position as a `"x,y"` string
-/// instead. An object argument is accepted and ignored so callers that pass
-/// one still get a value rather than an arity error (documented deviation).
+/// * With an object argument the position is written into `obj.x`/`obj.y`
+///   (via [`Tjs2Engine::set_member`]) and the method returns void — the
+///   conventional KiriKiri out-parameter form.
+/// * With no object argument it returns the position as an `"x,y"` string
+///   (port convenience, so a value-returning caller still gets something).
+///   A non-object argument is treated as absent.
 extern "C" fn native_get_cursor_pos(
     _engine: *mut c_void,
-    _argc: c_int,
-    _argv: *const Value,
+    argc: c_int,
+    argv: *const Value,
     out: *mut Value,
-    _out_error: *mut *mut c_char,
+    out_error: *mut *mut c_char,
 ) -> c_int {
     let (x, y) = with_state(|s| (s.mouse.x, s.mouse.y));
-    set_string_out(out, &format!("{x},{y}"));
+    let a = args(argv, argc);
+    if let Some(obj) = a.first().filter(|v| v.ty == VAL_OBJECT) {
+        let engine = context_engine();
+        let Ok(id) = engine.retain_object_arg(obj) else {
+            return report_error(out_error, "Mouse.getCursorPos: cannot retain object");
+        };
+        // `set_member` uses TJS_MEMBERENSURE semantics: `x`/`y` are created
+        // when missing and an existing native/script setter is invoked, like
+        // a plain `obj.x = ...` assignment.
+        let fill = engine
+            .set_member(id.raw_id(), "x", &TjsValue::Integer(i64::from(x)))
+            .and_then(|()| engine.set_member(id.raw_id(), "y", &TjsValue::Integer(i64::from(y))));
+        if let Err(e) = fill {
+            return report_error(out_error, &format!("Mouse.getCursorPos: {e}"));
+        }
+        set_void_out(out);
+    } else {
+        set_string_out(out, &format!("{x},{y}"));
+    }
     0
 }
 
