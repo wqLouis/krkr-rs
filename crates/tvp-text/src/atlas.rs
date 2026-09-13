@@ -24,7 +24,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use ab_glyph::{Font, PxScale, ScaleFont};
 
-use crate::font::{FontFace, glyph_id_with_fallback, px_scale_for_height};
+use crate::font::{FontFace, glyph_id_with_fallback, px_scale_for_height, round_advance};
 
 /// Padding, in pixels, kept around every glyph inside its cell. Absorbs the
 /// +1 px that integerized bounds can exceed the font's declared metrics by,
@@ -32,7 +32,8 @@ use crate::font::{FontFace, glyph_id_with_fallback, px_scale_for_height};
 const PAD: u32 = 2;
 
 /// A single rasterized glyph: the position and size of its ink quad inside the
-/// atlas RGBA buffer, plus the horizontal advance used by layout.
+/// atlas RGBA buffer, plus the horizontal advance and baseline bearing used by
+/// layout.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GlyphSlot {
     /// Atlas x of the ink quad's top-left corner, in pixels.
@@ -45,6 +46,12 @@ pub struct GlyphSlot {
     pub h: u32,
     /// Horizontal advance in pixels at this atlas's pixel height.
     pub advance: f32,
+    /// Distance from the baseline up to the top of the ink quad, in pixels
+    /// (FreeType `bitmap_top`). 0 for whitespace / zero-ink glyphs. Layout
+    /// places the ink top at `line_top + ascent - bearing_y`, matching the
+    /// reference `drect.top = y + baseline - bitmap_top`
+    /// (`LayerBitmapImpl.cpp:913`, `FreeType.cpp:499`).
+    pub bearing_y: i32,
 }
 
 /// Rasterized glyph cache for one face at one pixel height.
@@ -160,6 +167,7 @@ impl GlyphAtlas {
                 w: 0,
                 h: 0,
                 advance: 0.0,
+                bearing_y: 0,
             };
         }
         if let Some(&slot) = self.slots.get(&c) {
@@ -173,15 +181,24 @@ impl GlyphAtlas {
     fn rasterize_new(&mut self, c: char) -> GlyphSlot {
         let scaled = self.font.font().as_scaled(self.scale);
         let id = glyph_id_with_fallback(c, &scaled);
-        let mut advance = scaled.h_advance(id);
+        // The reference rounds the draw advance to a whole pixel too: it copies
+        // `FTFace->glyph->advance.x` and then `FT_PosToInt`s it
+        // (`FreeType.cpp:488`, `:626`).
+        let mut advance = round_advance(scaled.h_advance(id)) as f32;
         let glyph = id.with_scale_and_position(self.scale, ab_glyph::point(0.0, 0.0));
-        let (u, v, w, h) = match scaled.outline_glyph(glyph) {
+        let (u, v, w, h, bearing_y) = match scaled.outline_glyph(glyph) {
             Some(outline) => {
                 let bounds = outline.px_bounds();
                 let (mut w, h) = (bounds.width() as u32, bounds.height() as u32);
+                // `px_bounds` is relative to the pen at the baseline (y-down),
+                // so the ink top is at `min.y` (negative above the baseline).
+                // FreeType's `bitmap_top` is the positive distance the other
+                // way; this is what the reference stores as the glyph's
+                // vertical bearing.
+                let bearing_y = (-bounds.min.y).round() as i32;
                 if w == 0 || h == 0 {
-                    // No ink (e.g. space): still cache the advance.
-                    (0, 0, 0, 0)
+                    // No ink (e.g. space): still cache the advance and bearing.
+                    (0, 0, 0, 0, bearing_y)
                 } else {
                     // Rasterize into a scratch cell so bold can dilate the
                     // coverage before it lands in the packed atlas.
@@ -222,10 +239,10 @@ impl GlyphAtlas {
                             self.rgba[i..i + 4].copy_from_slice(&[255, 255, 255, alpha]);
                         }
                     }
-                    (base_x, base_y, w, h)
+                    (base_x, base_y, w, h, bearing_y)
                 }
             }
-            None => (0, 0, 0, 0),
+            None => (0, 0, 0, 0, 0),
         };
         GlyphSlot {
             u,
@@ -233,6 +250,7 @@ impl GlyphAtlas {
             w,
             h,
             advance,
+            bearing_y,
         }
     }
 

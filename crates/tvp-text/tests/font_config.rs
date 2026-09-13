@@ -135,6 +135,33 @@ fn comma_separated_face_list_matches_tokens() {
 }
 
 #[test]
+fn at_prefixed_vertical_face_name_resolves_to_base() {
+    if !font_exists(FREE_SANS) {
+        eprintln!("skipping: {FREE_SANS} not present");
+        return;
+    }
+    with_clean_config(|| {
+        let config = FontConfig::from_json_str(&format!(
+            r#"{{ "faces": {{ "MS Gothic": "{FREE_SANS}" }} }}"#
+        ))
+        .unwrap();
+        set_font_config(Some(config));
+
+        // The reference vertical-font form is a leading `@`; `TVPFindFont`
+        // strips it and looks up the base name (`FontImpl.cpp:282`).
+        let vertical = resolve_face(&FaceRequest::Named("@MS Gothic".into()))
+            .expect("@-prefixed face must resolve via the base name");
+        assert_eq!(vertical.family_name(), Some("FreeSans"));
+        assert_eq!(
+            resolve_face(&FaceRequest::Named("@MS Gothic".into()))
+                .unwrap()
+                .family_name(),
+            Some("FreeSans")
+        );
+    });
+}
+
+#[test]
 fn fallback_chain_uses_first_entry_that_loads() {
     if !font_exists(FREE_SANS) || !font_exists(FREE_SERIF) {
         eprintln!("skipping: GNU FreeFont files not present");

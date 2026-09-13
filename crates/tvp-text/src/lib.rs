@@ -13,8 +13,12 @@
 //!   reimplemented), with `fontdb`-based system discovery and TTC face
 //!   selection.
 //! - [`layout`]: line breaking, wrapping and alignment; returns placed glyphs
-//!   with atlas UVs plus the total block height for layer sizing.
-//! - [`measure`]: pixel width of a string for hit-testing / centering.
+//!   with atlas UVs plus the total block height for layer sizing. Also handles
+//!   `.tft` pre-rendered fonts ([`layout_prerendered`]) with their true
+//!   `OriginX`/`OriginY` bearings.
+//! - [`measure`]: pixel width/height of a string, matching the reference
+//!   `Font.getTextWidth`/`getTextHeight` (per-glyph rounded advances, missing
+//!   glyphs measured as the pixel height).
 //!
 //! # Conventions
 //!
@@ -59,8 +63,13 @@ pub mod prerendered;
 pub use atlas::{GlyphAtlas, GlyphSlot, with_cached_atlas, with_cached_atlas_styled};
 pub use font::{FaceRequest, FontError, FontFace, font_config, resolve_face, set_font_config};
 pub use font_config::{FontConfig, FontConfigError, FontEntry};
-pub use layout::{Align, GlyphRun, LayoutOptions, PlacedGlyph, TextLayout, layout};
-pub use measure::measure_width;
+pub use layout::{
+    Align, GlyphRun, LayoutOptions, PlacedGlyph, PlacedPrerenderedGlyph, PrerenderedGlyphRun,
+    PrerenderedLayoutOptions, PrerenderedTextLayout, TextLayout, layout, layout_prerendered,
+};
+pub use measure::{
+    EscapedExtents, escaped_extents, escaped_extents_of, measure_height, measure_width,
+};
 pub use prerendered::{
     PrerenderedFont, PrerenderedFontError, PrerenderedGlyph, PrerenderedKey,
     clear_prerendered_fonts, map_prerendered_font, prerendered_font,

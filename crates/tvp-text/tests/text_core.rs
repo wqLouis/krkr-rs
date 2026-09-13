@@ -349,6 +349,56 @@ fn missing_glyph_falls_back_without_panicking() {
 }
 
 #[test]
+fn baseline_placement_matches_font_metrics() {
+    let Some(face) = jp_face() else {
+        eprintln!("skipping: no Noto Sans CJK JP on this machine");
+        return;
+    };
+    let mut atlas = GlyphAtlas::with_default_width(face, 48);
+    let ascent = atlas.ascent();
+    let result = layout("Ag", 1000.0, 48.0, &mut atlas, &LayoutOptions::default());
+    let run = &result.runs[0];
+    let a = run.chars[0];
+    let g = run.chars[1];
+    let baseline = run.y + ascent;
+
+    // The reference draws each glyph at `top = y + ascent - bitmap_top`
+    // (`LayerBitmapImpl.cpp:917`), i.e. relative to the line's baseline. `A`
+    // has no descender, so its ink bottom sits on the baseline; `g` descends
+    // below it. Vertically centering the ink would move `A`'s bottom up by
+    // roughly `(line_height - ink_height) / 2`.
+    assert!(
+        (a.y + a.size.1 as f32 - baseline).abs() <= 1.0,
+        "A bottom {} vs baseline {baseline}",
+        a.y + a.size.1 as f32
+    );
+    assert!(
+        g.y + g.size.1 as f32 > baseline,
+        "g must descend below the baseline: bottom {} vs {baseline}",
+        g.y + g.size.1 as f32
+    );
+    assert!(
+        a.y < baseline && g.y < baseline,
+        "ink starts above baseline"
+    );
+}
+
+#[test]
+fn blank_and_control_characters_do_not_place_glyphs() {
+    let Some(face) = jp_face() else {
+        eprintln!("skipping: no Noto Sans CJK JP on this machine");
+        return;
+    };
+    let mut atlas = GlyphAtlas::with_default_width(face, 24);
+    // A carriage return (CRLF leftovers) is a control character and must be
+    // skipped, not placed as a zero-size glyph.
+    let result = layout("a\rb", 1000.0, 24.0, &mut atlas, &LayoutOptions::default());
+    let placed: String = result.runs[0].chars.iter().map(|g| g.ch).collect();
+    assert_eq!(placed, "ab");
+    assert_eq!(atlas.glyph_count(), 2, "control chars are not rasterized");
+}
+
+#[test]
 fn empty_and_whitespace_only_produce_no_runs() {
     let Some(face) = jp_face() else {
         eprintln!("skipping: no Noto Sans CJK JP on this machine");

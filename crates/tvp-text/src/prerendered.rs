@@ -80,24 +80,32 @@ pub struct PrerenderedGlyph {
     pub width: u16,
     /// Bitmap height in pixels.
     pub height: u16,
-    /// Left edge relative to the pen position.
+    /// Left edge of the coverage bitmap relative to the pen position
+    /// (FreeType `bitmap_left`, reference `OriginX`).
     pub origin_x: i16,
-    /// Distance from the glyph top to the baseline (reference `OriginY`).
+    /// Distance from the baseline **up** to the top of the coverage bitmap
+    /// (FreeType `bitmap_top`, reference `OriginY`). The reference draws the
+    /// ink at `drect.top = pen_y + ascent − OriginY`
+    /// (`LayerBitmapImpl.cpp:279`, `:913`).
     pub origin_y: i16,
-    /// Horizontal advance, in the reference's cell metrics.
+    /// Horizontal pen advance used while drawing (`CellIncX`), in pixels.
     pub inc_x: i16,
-    /// Vertical advance (0 for horizontal text).
+    /// Vertical pen advance (`CellIncY`, 0 for horizontal text).
     pub inc_y: i16,
-    /// Character advance; falls back to `inc_x` when zero.
+    /// Character advance used by `Font.getTextWidth` measurement. The
+    /// reference `GetTextSize` sums this field for characters present in the
+    /// `.tft` (`LayerBitmapImpl.cpp:1448`); for most glyphs it equals
+    /// `inc_x`, but a few shipped fonts differ for the no-ink `∥` (U+2225).
     pub inc: i16,
 }
 
 impl PrerenderedGlyph {
-    /// Horizontal advance in pixels.
+    /// Horizontal advance in pixels used for drawing.
     ///
-    /// Prefers the reference `CellIncX` (what `TVPGetCharacter` uses to
-    /// advance the pen while drawing, `LayerBitmapImpl.cpp:283`), falling back
-    /// to the dedicated `Inc` field. The two differ only for the rare no-ink
+    /// Prefers the reference `CellIncX` (what `TVPGetCharacter` copies into
+    /// the character's `Metrics.CellIncX` and `DrawTextMultiple` uses to
+    /// advance the pen, `LayerBitmapImpl.cpp:279`, `:1367`), falling back to
+    /// the dedicated `Inc` field. The two differ only for the rare no-ink
     /// `∥` (U+2225) glyph in a few shipped `.tft` files; preferring `IncX`
     /// keeps the drawn glyph positions identical to the reference.
     pub fn advance(&self) -> i32 {
@@ -106,6 +114,26 @@ impl PrerenderedGlyph {
         } else {
             self.inc as i32
         }
+    }
+
+    /// The advance the reference `Font.getTextWidth` sums for a mapped `.tft`:
+    /// the raw `Inc` field (`LayerBitmapImpl.cpp:1448`). This is *not* the draw
+    /// advance for the rare divergent glyphs (see [`Self::advance`]).
+    pub fn measure_advance(&self) -> i32 {
+        self.inc as i32
+    }
+
+    /// Left edge of the coverage bitmap for a pen at `pen_x`: the reference
+    /// `drect.left = pen_x + OriginX` (`LayerBitmapImpl.cpp:912`).
+    pub fn left(&self, pen_x: i32) -> i32 {
+        pen_x + i32::from(self.origin_x)
+    }
+
+    /// Top edge of the coverage bitmap for a line whose top is `line_top` and
+    /// whose baseline is `ascent` below it: the reference
+    /// `drect.top = pen_y + ascent − OriginY` (`LayerBitmapImpl.cpp:913`).
+    pub fn top(&self, line_top: i32, ascent: i32) -> i32 {
+        line_top + ascent - i32::from(self.origin_y)
     }
 }
 
@@ -215,6 +243,34 @@ impl PrerenderedFont {
             }
         }
         None
+    }
+
+    /// Reference `Font.getTextWidth` for a mapped `.tft`: sum the `Inc` field
+    /// of every character present (`LayerBitmapImpl.cpp:1435-1470`).
+    ///
+    /// `fallback(ch)` is invoked for characters absent from the `.tft`, the
+    /// place where the reference calls the outline rasterizer's
+    /// `GetTextExtent`. It returns the extent in pixels. The sum is clamped at
+    /// 0. NUL terminates the string, matching the reference C-string loop.
+    pub fn measure_width_with(&self, text: &str, mut fallback: impl FnMut(char) -> i32) -> u32 {
+        let mut width = 0_i32;
+        for ch in text.chars() {
+            if ch == '\0' {
+                break;
+            }
+            match self.find(ch) {
+                Some(glyph) => width += glyph.measure_advance(),
+                None => width += fallback(ch),
+            }
+        }
+        width.max(0) as u32
+    }
+
+    /// [`measure_width_with`](Self::measure_width_with) counting characters
+    /// absent from the `.tft` as zero width. Prefer the explicit `_with` form
+    /// when a rasterizer fallback is available.
+    pub fn measure_width(&self, text: &str) -> u32 {
+        self.measure_width_with(text, |_| 0)
     }
 
     /// Decompress a glyph's coverage bitmap into a `width * height` buffer of
@@ -464,6 +520,122 @@ mod tests {
 
         let font = PrerenderedFont::from_bytes(build_tft_divergent_advance('x', 0, 9)).unwrap();
         assert_eq!(font.find('x').unwrap().advance(), 9);
+    }
+
+    #[test]
+    fn measure_advance_uses_inc_field() {
+        // Reference `GetTextSize` (`LayerBitmapImpl.cpp:1448`) sums the `Inc`
+        // field, not the draw `CellIncX`.
+        let font = PrerenderedFont::from_bytes(build_tft_divergent_advance('∥', 4, 15)).unwrap();
+        let glyph = font.find('∥').unwrap();
+        assert_eq!(glyph.advance(), 4, "draw advance is IncX");
+        assert_eq!(glyph.measure_advance(), 15, "measure advance is Inc");
+        assert_eq!(font.measure_width("∥"), 15);
+        assert_eq!(font.measure_width("∥∥"), 30);
+    }
+
+    #[test]
+    fn measure_width_with_falls_back_per_character() {
+        let font = PrerenderedFont::from_bytes(build_tft('A', 2, 2, &[1, 2, 3, 4])).unwrap();
+        // 'B' is absent, so the fallback closure supplies its extent.
+        let seen = std::cell::Cell::new(false);
+        let w = font.measure_width_with("AB", |c| {
+            assert_eq!(c, 'B');
+            seen.set(true);
+            7
+        });
+        assert!(seen.get());
+        assert_eq!(w, 2 + 7);
+        assert_eq!(font.measure_width("A"), 2);
+        assert_eq!(font.measure_width("AB"), 2, "absent chars count as zero");
+    }
+
+    #[test]
+    fn origin_places_the_bitmap_relative_to_baseline() {
+        // The reference draws a `.tft` glyph at
+        //   left = pen_x + OriginX
+        //   top  = line_top + ascent - OriginY
+        // (`LayerBitmapImpl.cpp:912-913`).
+        let mut data = build_tft_version('g', 2, 3, &[1, 1, 1, 2, 2, 2], 1);
+        let index = HEADER_LEN + 6 + 2;
+        let item = &mut data[index..index + ITEM_LEN];
+        item[8..10].copy_from_slice(&1i16.to_le_bytes()); // origin_x
+        item[10..12].copy_from_slice(&4i16.to_le_bytes()); // origin_y
+        let font = PrerenderedFont::from_bytes(data).unwrap();
+        let glyph = font.find('g').unwrap();
+        assert_eq!(glyph.left(100), 101);
+        assert_eq!(glyph.top(10, 12), 10 + 12 - 4);
+        assert_eq!(glyph.top(0, 6), 2);
+    }
+
+    #[test]
+    fn real_tft_fixtures_when_available() {
+        // Parse every `.tft` in `KRKR_RS_TFT_DIR` (the game's 24
+        // `font/*.tft` faces extracted from `data.xp3`) and check the metric
+        // invariants the generic rules rely on. No-op when the directory is
+        // unset, so CI stays hermetic.
+        let Some(dir) = std::env::var_os("KRKR_RS_TFT_DIR") else {
+            return;
+        };
+        let mut count = 0usize;
+        let mut divergent = 0usize;
+        for entry in std::fs::read_dir(&dir).expect("read tft dir") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("tft") {
+                continue;
+            }
+            let data = std::fs::read(&path).expect("read tft");
+            let font = PrerenderedFont::from_bytes(data)
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            assert!(
+                font.glyph_count() > 1000,
+                "{}: too few glyphs",
+                path.display()
+            );
+
+            let a = font.find('あ').expect("あ present");
+            assert!(a.width > 0 && a.height > 0, "あ has ink: {a:?}");
+            assert!(a.origin_y > 0, "あ baseline bearing: {a:?}");
+            assert_eq!(
+                font.rasterize(&a).len(),
+                a.width as usize * a.height as usize
+            );
+
+            // Generic `.tft` layout places the ink with its true bearing:
+            // top = line_top + ascent - OriginY.
+            let laid = crate::layout_prerendered(
+                &font,
+                "あ",
+                10_000,
+                30,
+                40,
+                &crate::PrerenderedLayoutOptions::default(),
+            );
+            assert_eq!(laid.runs[0].chars[0].y, 30 - i32::from(a.origin_y));
+            assert_eq!(laid.runs[0].chars[0].x, i32::from(a.origin_x));
+
+            // The reference measure sums `Inc`; the draw advance is `IncX`.
+            for ch in ['A', 'あ', '日', '0'] {
+                let g = font.find(ch).expect("glyph present");
+                assert!(g.advance() > 0, "{ch:?} advances: {g:?}");
+                assert!(g.measure_advance() > 0, "{ch:?} measures: {g:?}");
+            }
+            if let Some(p) = font.find('∥')
+                && p.inc_x != p.inc
+            {
+                // The documented divergent glyph: measure disagrees with draw.
+                divergent += 1;
+                assert_eq!(p.advance(), i32::from(p.inc_x));
+                assert_eq!(p.measure_advance(), i32::from(p.inc));
+            }
+            count += 1;
+        }
+        assert!(count >= 1, "no .tft files found in {dir:?}");
+        // The game ships 12 faces with the divergent `∥`; if the caller points
+        // at the full set, confirm the well-known case is covered.
+        if count >= 24 {
+            assert_eq!(divergent, 12, "expected 12 faces with divergent ∥");
+        }
     }
 
     #[test]

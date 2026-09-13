@@ -95,6 +95,19 @@ const KNOWN_JP_PATHS: &[&str] = &[
     "/usr/local/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
 ];
 
+/// Round a pixel-space advance to a whole pixel the way the reference
+/// `FT_PosToInt` rounds a 26.6 fixed-point value (`FreeType.h:65`):
+/// `((x + 32) >> 6)`, i.e. round-half-up for positive values.
+///
+/// FreeType stores advances as 26.6 fixed point, so `x` is `advance * 64`
+/// before the shift; on an `f32` pixel value this is `floor(advance + 0.5)`.
+/// The reference `tFreeTypeFace::GetGlyphSizeFromCharcode`
+/// (`FreeType.cpp:626`) rounds this way before summing, so measurement must
+/// round per glyph, not once at the end.
+pub(crate) fn round_advance(advance: f32) -> i32 {
+    (advance + 0.5).floor() as i32
+}
+
 /// Convert a requested pixel height into an `ab_glyph` scale.
 ///
 /// `ab_glyph` treats `PxScale.y` as the font's line height (`ascent −
@@ -386,13 +399,27 @@ fn resolve_named(name: &str, config: Option<&FontConfig>) -> Option<FontFace> {
 
     // KAG face strings are comma-separated preference lists; try the whole
     // string first (so a full-list key can be mapped explicitly) and then
-    // each trimmed token. This is still fully explicit: every token must be
-    // present in `faces` — there is no implicit per-token system lookup.
-    let mut candidates = vec![name];
+    // each trimmed token. A leading `@` marks the reference's vertical font
+    // form; `TVPFindFont` (`FontImpl.cpp:282`) strips it and falls back to the
+    // base name, so try both spellings. This is still fully explicit: every
+    // token must be present in `faces` — there is no implicit per-token system
+    // lookup.
+    let mut candidates: Vec<String> = vec![name.to_string()];
+    let push = |candidate: &str, candidates: &mut Vec<String>| {
+        if let Some(stripped) = candidate.strip_prefix('@')
+            && !stripped.is_empty()
+        {
+            candidates.push(stripped.to_string());
+        }
+    };
+    push(name, &mut candidates);
     if name.contains(',') {
-        candidates.extend(name.split(',').map(str::trim).filter(|s| !s.is_empty()));
+        for token in name.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            candidates.push(token.to_string());
+            push(token, &mut candidates);
+        }
     }
-    for candidate in candidates {
+    for candidate in &candidates {
         if let Some(entry) = config.face(candidate)
             && let Ok(face) = load_entry(entry)
         {
