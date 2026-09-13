@@ -67,7 +67,7 @@
 //! the poll with all locks released (never while holding the mixer/stream
 //! locks), so the script handlers can call back into the natives freely.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, c_int, c_void};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
@@ -149,6 +149,13 @@ struct Stream {
     /// script sequences that wait on a voice/effect finishing (e.g. the
     /// game's `AttentionVoice` wait entries like `"1000"`) advance.
     emitted_failed_stop: bool,
+    /// Set when a dispatch to this stream returned `TJSInvalidObject` (the
+    /// script dropped the buffer with `invalidate`, so `self_obj`/
+    /// `action_owner` are dead). The stream is skipped from then on and
+    /// reaped (retained objects released, mixer channel removed) at a safe
+    /// point after the VM calls return. Mirrors the input bridge's
+    /// `dead_layers` set.
+    dead: bool,
 }
 
 static STREAMS: LazyLock<Mutex<HashMap<u64, Stream>>> =
@@ -256,6 +263,7 @@ extern "C" fn ws_ctor(
             channel_id: 0,
             status: Status::Unload,
             emitted_failed_stop: false,
+            dead: false,
         },
     );
     inst.stream_id = id;
@@ -701,12 +709,72 @@ fn dispatch_action(engine: &Tjs2Engine, stream_id: u64, event_type: &str, status
         return;
     };
     if let Err(e) = engine.call_member(owner, "action", &[TjsValue::Retained(dv.raw_id() as u64)]) {
-        // `Member "" does not exist` is the reference-tolerated missing
-        // `action`; keep it quiet. Anything else is a real handler error.
-        if !e.contains("does not exist") {
+        if is_invalidated_error(&e) {
+            // The action owner was invalidated too; stop dispatching to this
+            // stream and let the poll reap it.
+            mark_stream_dead(stream_id);
+        } else if !e.contains("does not exist") {
+            // `Member "" does not exist` is the reference-tolerated missing
+            // `action`; keep it quiet. Anything else is a real handler error.
             log::warn!("WaveSoundBuffer action({event_type}) dispatch failed: {e}");
         }
     }
+}
+
+/// Whether a native-callback error is TJS `TJSInvalidObject` (the script
+/// object was dropped/`invalidate`d). The reference keeps dispatching
+/// forever; we treat it as terminal for the stream.
+fn is_invalidated_error(e: &str) -> bool {
+    e.contains("already invalidated")
+}
+
+/// Flag one stream for reaping (see [`reap_dead_streams`]). Safe to call
+/// while a VM call is in progress: it only flips a flag.
+fn mark_stream_dead(stream_id: u64) {
+    if let Some(st) = lock_ok(&STREAMS).get_mut(&stream_id) {
+        st.dead = true;
+    }
+}
+
+/// Remove every stream whose object was invalidated: drop the retained
+/// `self_obj`/`action_owner` (releasing their engine references) and
+/// remove its mixer channel, which in turn drops the `AudioTrack` and
+/// cancels any decode worker.
+///
+/// The lock is released before the `DetachedValue`s drop (their release
+/// can re-enter the engine), and the caller must not be inside a VM call on
+/// the stream being reaped.
+fn reap_dead_streams() {
+    let dead: Vec<Stream> = {
+        let mut streams = lock_ok(&STREAMS);
+        let ids: Vec<u64> = streams
+            .iter()
+            .filter(|(_, s)| s.dead)
+            .map(|(id, _)| *id)
+            .collect();
+        ids.into_iter()
+            .filter_map(|id| streams.remove(&id))
+            .collect()
+    };
+    if dead.is_empty() {
+        return;
+    }
+    if let Some(ctx) = native_ctx() {
+        let mut mixer = lock_ok(&ctx.mixer);
+        for st in &dead {
+            mixer.remove_channel(st.channel_id);
+        }
+    }
+    // `dead` drops here, releasing the retained script objects outside any
+    // lock (and outside active VM calls).
+    drop(dead);
+}
+
+/// Number of live `WaveSoundBuffer` streams (diagnostic / tests): entries
+/// remaining in the poll's stream registry. Invalidated buffers are reaped
+/// during [`sound_poll`], so this drops after their last dispatch.
+pub fn active_stream_count() -> usize {
+    lock_ok(&STREAMS).len()
 }
 
 // ---------------------------------------------------------------------------
@@ -1276,14 +1344,19 @@ pub fn sound_poll(engine: &Tjs2Engine, now_seconds: f64) {
     // 2. Walk the live streams under the locks and queue events. Events
     // target the retained instance (`self_obj`), so the script class chain
     // (a `SoundBuffer.onStatusChanged` override) resolves the handler.
-    let mut events: Vec<(tjs2_sys::Tjs2ValueId, PollEvent)> = Vec::new();
+    let mut events: Vec<(u64, tjs2_sys::Tjs2ValueId, PollEvent)> = Vec::new();
     {
         let Some(ctx) = native_ctx() else {
             return;
         };
         let mut streams = lock_ok(&STREAMS);
         let mut mixer = lock_ok(&ctx.mixer);
-        for st in streams.values_mut() {
+        for (id, st) in streams.iter_mut() {
+            // Never dispatch to a stream whose script object was already
+            // found invalid (reaped at the end of this poll).
+            if st.dead {
+                continue;
+            }
             // A buffer whose open failed (no channel) still reports one
             // "stop" so script wait-sequences advance (AttentionVoice's
             // timed entries call play() on a failed open).
@@ -1291,7 +1364,7 @@ pub fn sound_poll(engine: &Tjs2Engine, now_seconds: f64) {
                 if st.emitted_failed_stop {
                     st.emitted_failed_stop = false;
                     st.status = Status::Stop;
-                    events.push((st.self_obj.raw_id(), PollEvent::StatusChanged("stop")));
+                    events.push((*id, st.self_obj.raw_id(), PollEvent::StatusChanged("stop")));
                 }
                 continue;
             }
@@ -1300,13 +1373,13 @@ pub fn sound_poll(engine: &Tjs2Engine, now_seconds: f64) {
             };
             if ch.fade_finished {
                 ch.fade_finished = false;
-                events.push((st.self_obj.raw_id(), PollEvent::FadeCompleted));
+                events.push((*id, st.self_obj.raw_id(), PollEvent::FadeCompleted));
             }
             let derived = derive_status(ch);
             if derived != st.status {
                 let arg = derived.as_str();
                 st.status = derived;
-                events.push((st.self_obj.raw_id(), PollEvent::StatusChanged(arg)));
+                events.push((*id, st.self_obj.raw_id(), PollEvent::StatusChanged(arg)));
             }
         }
     }
@@ -1324,7 +1397,11 @@ pub fn sound_poll(engine: &Tjs2Engine, now_seconds: f64) {
     // `WaveSoundBuffer(this)` has no override, so the native handler runs
     // directly. This exactly mirrors the reference event flow, instead of
     // calling `action` and `onStatusChanged` on the action owner.
-    for (target, event) in events {
+    let mut dead: HashSet<u64> = HashSet::new();
+    for (stream_id, target, event) in events {
+        if dead.contains(&stream_id) {
+            continue;
+        }
         let result = match event {
             PollEvent::StatusChanged(s) => {
                 engine.call_member(target, "onStatusChanged", &[TjsValue::String(s.into())])
@@ -1332,9 +1409,21 @@ pub fn sound_poll(engine: &Tjs2Engine, now_seconds: f64) {
             PollEvent::FadeCompleted => engine.call_member(target, "onFadeCompleted", &[]),
         };
         if let Err(e) = result {
-            log::warn!("WaveSoundBuffer poll event failed: {e}");
+            if is_invalidated_error(&e) {
+                // The script dropped the buffer; stop dispatching to it and
+                // reap it below (drop retained objects + mixer channel).
+                dead.insert(stream_id);
+                mark_stream_dead(stream_id);
+            } else {
+                log::warn!("WaveSoundBuffer poll event failed: {e}");
+            }
         }
     }
+
+    // 4. Reap streams whose objects were invalidated (either during this
+    // delivery, or by a nested `dispatch_action` through a native handler).
+    // Safe here: no VM call is in progress for these streams.
+    reap_dead_streams();
 }
 
 /// Escape a string for inclusion in a single-quoted TJS string literal.

@@ -71,7 +71,7 @@ pub use natives::register_sound;
 pub use natives::set_sound_output_enabled;
 pub use sli::{LoopCondition, LoopLink, SliInfo, WaveLabel};
 pub use source::{AudioTrack, active_decode_workers, open_track, open_track_bytes};
-pub use wavesound::sound_poll;
+pub use wavesound::{active_stream_count, sound_poll};
 
 pub use player::{
     MainThreadOutputGuard, MixerSource, OutputError, OutputGuard, OutputStatus, start_output,
