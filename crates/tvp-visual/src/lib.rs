@@ -31,3 +31,8 @@ pub mod scene;
 pub mod tlg;
 
 pub use natives::{register_visual, timer_poll};
+
+// The explicit font configuration lives in `tvp-text` (where `resolve_face`
+// consumes it). Re-exported here so the render binary can install it without
+// taking a direct `tvp-text` dependency.
+pub use tvp_text::{FontConfig, FontConfigError, set_font_config};

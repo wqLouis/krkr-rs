@@ -19,6 +19,13 @@ use super::ffi::{
 };
 use super::{context_scene_mut, context_scene_read};
 
+/// Default face name for a freshly constructed `Font` (reference's
+/// `MS Gothic`-ish default). Also the face a layer's lazily created font
+/// starts with before `setFontStyle` overrides it.
+pub(crate) const DEFAULT_FONT_FACE: &str = "MS Gothic";
+/// Default `Font.height` in pixels.
+pub(crate) const DEFAULT_FONT_HEIGHT: i32 = 12;
+
 /// Payload of one script-visible `Font` object.
 #[derive(Default)]
 pub(crate) struct FontInst {
@@ -26,6 +33,15 @@ pub(crate) struct FontInst {
     pub id: u32,
     /// Whether the native constructor has run.
     pub constructed: bool,
+    /// Whether this object *owns* its [`FontState`](crate::scene::FontState)
+    /// and must remove it on destruction.
+    ///
+    /// A plain `new Font()` owns its state. A wrapper produced by
+    /// `Layer.font` is created by `new Font()` too, but immediately rebound to
+    /// the layer's shared state via `__bind`, which clears this flag and drops
+    /// the throwaway state. Destroying a non-owning wrapper must never delete
+    /// the layer's font.
+    pub owns_state: bool,
 }
 
 /// `new Font(...)` payload factory.
@@ -37,7 +53,7 @@ extern "C" fn font_create(_engine: *mut c_void) -> *mut c_void {
 extern "C" fn font_destroy(_engine: *mut c_void, instance: *mut c_void) {
     // SAFETY: the trampoline passes the payload from font_create.
     let inst = unsafe { instance_ref::<FontInst>(instance) };
-    if inst.constructed {
+    if inst.constructed && inst.owns_state {
         let mut scene = context_scene_mut();
         scene.fonts.retain(|f| f.id != inst.id);
     }
@@ -79,14 +95,54 @@ extern "C" fn font_ctor(
         .first()
         .filter(|v| v.ty == tjs2_sys::VAL_STRING)
         .map(arg_string)
-        .unwrap_or_else(|| "MS Gothic".to_string());
-    let height = args.get(1).map(arg_i64).unwrap_or(12) as i32;
+        .unwrap_or_else(|| DEFAULT_FONT_FACE.to_string());
+    let height = args
+        .get(1)
+        .map(arg_i64)
+        .unwrap_or(i64::from(DEFAULT_FONT_HEIGHT)) as i32;
     let color = args.get(2).map(arg_i64).unwrap_or(0xffffffff);
     let mut scene = context_scene_mut();
     let id = scene.add_font(face, height, argb_to_rgba(color));
     inst.id = id;
     inst.constructed = true;
+    inst.owns_state = true;
     set_int_out(out, i64::from(id));
+    0
+}
+
+/// `__bind(id)` — internal: point this `Font` object at an existing
+/// [`FontState`](crate::scene::FontState), dropping the throwaway state the
+/// constructor just allocated.
+///
+/// `Layer.font` creates a fresh wrapper via `new Font()` and rebinds it to the
+/// layer's shared state. Property writes (`font.face = ...`) then land on the
+/// layer's state, matching the reference's cached `FontObject`, while the
+/// wrapper stays disposable (`font_destroy` must not delete the shared state).
+extern "C" fn font_bind(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    let Some(id) = args.first().map(arg_i64) else {
+        return error_out(out_error, "Font.__bind requires a font id");
+    };
+    let id = id.max(0) as u32;
+    let inst = unsafe { instance_ref::<FontInst>(instance) };
+    let mut scene = context_scene_mut();
+    if scene.font(id).is_none() {
+        return error_out(out_error, "Font.__bind: font id does not exist");
+    }
+    if inst.owns_state && inst.id != id {
+        scene.fonts.retain(|f| f.id != inst.id);
+    }
+    inst.id = id;
+    inst.owns_state = false;
+    set_void_out(out);
     0
 }
 
@@ -382,6 +438,10 @@ pub(crate) fn register_font(engine: &Tjs2Engine) -> Result<(), String> {
             NativeInstanceMethodDef {
                 name: "Font",
                 f: font_ctor,
+            },
+            NativeInstanceMethodDef {
+                name: "__bind",
+                f: font_bind,
             },
             NativeInstanceMethodDef {
                 name: "mapPrerenderedFont",

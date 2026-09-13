@@ -77,6 +77,10 @@ pub struct LayerState {
     pub face: i32,
     /// `holdAlpha` — keep the alpha when drawing. Stored only for now.
     pub hold_alpha: bool,
+    /// Font id (into [`Scene::fonts`]) backing `layer.font`, or `None` until
+    /// the script reads `layer.font` (which lazily allocates one). `drawText`
+    /// resolves the requested face from here.
+    pub font_id: Option<u32>,
     pub is_primary: bool,
     /// Reference `tTJSNI_BaseLayer::CallOnPaint`: set by the script-visible
     /// `update()` (and `loadImages`/`setSize*`, which call it) and cleared by
@@ -216,6 +220,7 @@ impl Scene {
             cursor: 0,
             face: 0,
             hold_alpha: false,
+            font_id: None,
             is_primary: false,
             pending_paint: false,
         });

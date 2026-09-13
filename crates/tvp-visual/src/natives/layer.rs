@@ -103,6 +103,12 @@ extern "C" fn layer_destroy(_engine: *mut c_void, instance: *mut c_void) {
     let inst = unsafe { instance_ref::<LayerInst>(instance) };
     if inst.constructed {
         let mut scene = context_scene_mut();
+        // The layer's font state is owned by the layer (created lazily by
+        // `layer.font`), so destroy it with the layer.
+        let font_id = scene.layer(inst.id).and_then(|l| l.font_id);
+        if let Some(font_id) = font_id {
+            scene.fonts.retain(|f| f.id != font_id);
+        }
         scene.remove_layer(inst.id);
     }
     // SAFETY: instance came from Box::into_raw.
@@ -1483,16 +1489,22 @@ extern "C" fn layer_draw_text(
 
     // Snapshot scene values before loading a font; font discovery may do file
     // IO and must not hold the scene lock while doing so.
-    let (bitmap_id, width, _height, font_height) = {
+    let (bitmap_id, width, _height, font_height, face_override) = {
         let mut scene = context_scene_mut();
         let Some(layer) = scene.layer(inst.id) else {
             return error_out(out_error, "Layer: layer no longer exists");
         };
-        let font_height = scene
-            .fonts
-            .last()
-            .map(|font| font.height.max(1) as u32)
-            .unwrap_or(16);
+        // Prefer the layer's own font (`layer.font`, tracked in the scene);
+        // fall back to the newest registered `Font` for scripts that draw
+        // without ever touching `layer.font`.
+        let layer_font = layer.font_id.and_then(|id| scene.font(id));
+        let (face_override, font_height) = match layer_font {
+            Some(font) => (Some(font.face.clone()), font.height.max(1) as u32),
+            None => match scene.fonts.last() {
+                Some(font) => (Some(font.face.clone()), font.height.max(1) as u32),
+                None => (None, 16),
+            },
+        };
         let needed_w = (x.max(0) as u32).saturating_add(fallback_text_width(&text, font_height));
         let needed_h = (y.max(0) as u32).saturating_add(fallback_text_height(&text, font_height));
         let (width, height) = match layer.bitmap.and_then(|id| scene.bitmap(id)) {
@@ -1503,28 +1515,39 @@ extern "C" fn layer_draw_text(
             Some(id) => id,
             None => return error_out(out_error, "Layer: layer no longer exists"),
         };
-        (bitmap_id, width.max(1), height.max(1), font_height)
+        (
+            bitmap_id,
+            width.max(1),
+            height.max(1),
+            font_height,
+            face_override,
+        )
     };
 
-    // Prefer tvp-text's real CJK rasterizer.  A missing system font is a
-    // normal deployment situation (minimal Linux containers in particular),
-    // so retain a small deterministic bitmap-font fallback rather than
-    // silently dropping the game's title text.
+    // Prefer tvp-text's real CJK rasterizer. A missing font is a normal
+    // deployment situation (minimal Linux containers in particular), so
+    // retain a small deterministic bitmap-font fallback rather than silently
+    // dropping the game's title text.
     //
-    // `KRKR_RS_SYSTEM_FONT` as a path overrides discovery (useful for
-    // hermetic CI); otherwise probe the system font database so Japanese
-    // glyphs (e.g. "日本語") rasterize through `ab_glyph` instead of the
-    // 5×7 checker fallback.
+    // `KRKR_RS_SYSTEM_FONT` is an explicit path override and always wins
+    // (hermetic CI). Otherwise ask for the layer's tracked face by name;
+    // `resolve_face` maps it through the configured `faces`/`fallback` chain
+    // (or system discovery when no config is installed). With no face tracked
+    // at all, `SystemJp` is kept for scripts that never create a `Font`.
     //
     // Both the resolved face and the per-height atlas are cached process-wide
-    // (`resolve_face` / `with_cached_atlas`). Every `drawText` call used to
-    // rescan the system font database, re-parse a multi-MB font and rebuild
-    // the glyph cache; `MessageArea.charOutput` draws one character per call,
-    // so that dominated the config screen. The face is resolved once and the
-    // atlas is rasterized once per `(face, height)`.
-    let request = FaceRequest::from_override(
-        std::env::var_os("KRKR_RS_SYSTEM_FONT").map(std::path::PathBuf::from),
-    );
+    // (`resolve_face` / `with_cached_atlas`). `MessageArea.charOutput` draws
+    // one character per call, so the face is resolved once and the atlas
+    // rasterized once per `(face, height)`.
+    let request =
+        if let Some(path) = std::env::var_os("KRKR_RS_SYSTEM_FONT").map(std::path::PathBuf::from) {
+            FaceRequest::Path(path)
+        } else {
+            match face_override {
+                Some(face) => FaceRequest::Named(face),
+                None => FaceRequest::SystemJp,
+            }
+        };
     if let Some(face) = resolve_face(&request) {
         // Layout rasterizes new glyphs; do it before taking the scene lock.
         let text_layout = with_cached_atlas(face.clone(), font_height, |atlas| {
@@ -2388,13 +2411,15 @@ pub(crate) fn register_layer(engine: &Tjs2Engine) -> Result<(), String> {
                 set: None,
             },
             // The layer's Font object (k2compat writes `this.font.doUserSelect`
-            // and `this.font.face`). Returns a fresh script object so the
-            // assignments succeed; the font's visual state is not consumed
-            // by the headless load path.
+            // and `this.font.face`; MessageArea's `setFontStyle` does
+            // `with(font){ .face = ... }`). Every access returns a wrapper
+            // bound to the layer's shared font state, so those writes persist
+            // and `drawText` reads the requested face back through
+            // `FaceRequest::Named`.
             NativeInstancePropertyDef {
                 name: "font",
                 get: Some(layer_font_get),
-                set: None,
+                set: Some(layer_font_set),
             },
             NativeInstancePropertyDef {
                 name: "visible",
@@ -2560,43 +2585,146 @@ extern "C" fn layer_cursor_y_get(
     0
 }
 
-/// `layer.font` — a script object the game assigns font properties on.
+/// `layer.font` — a script `Font` object backed by the layer's shared
+/// [`FontState`](crate::scene::FontState).
+///
+/// The game sets its text font with `with(layer.font){ .face = ...; .height
+/// = ... }` (see `system/MessageArea.tjs` `setFontStyle`). Callers read
+/// `layer.font` repeatedly, so every call returns a fresh, disposable wrapper
+/// **bound to the same layer-owned state** (`Font.__bind`): property writes
+/// land on the shared state, and `drawText` reads the face back from it. The
+/// first access lazily creates the state; `layer_destroy` removes it.
 extern "C" fn layer_font_get(
     _engine: *mut c_void,
     instance: *mut c_void,
     out: *mut Value,
-    _out_error: *mut *mut c_char,
+    out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    let _ = instance;
-    // Return a real native Font object rather than an empty dictionary. This
-    // gives the script-side AffineLayer helpers working face/height and
-    // getTextWidth members while preserving the retained-object ABI pattern.
-    let engine = crate::natives::context_engine();
-    let _ = engine.eval("new Font()", "layer.font");
-    match engine.retain_value_detached(&tjs2_sys::TjsValue::Object) {
-        Ok(dv) => {
-            // SAFETY: out is a valid result slot; the C++ side consumes the
-            // retention (copies + erases) before the callback returns.
-            unsafe {
-                (*out).ty = tjs2_sys::VAL_RETAINED;
-                (*out).integer = 0;
-                (*out).real = 0.0;
-                (*out).string = std::ptr::null();
-                (*out).array = std::ptr::null();
-                (*out).array_count = 0;
-                (*out).retained = dv.raw_id() as usize;
-            }
-            // The C++ conversion consumes the retention; forget the wrapper
-            // so its Drop does not release the id first (safe no-op after).
-            std::mem::forget(dv);
-            0
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+
+    // Resolve (or lazily allocate) the layer's font state id under the scene
+    // lock, then drop it before evaluating script.
+    let font_id = {
+        let mut scene = context_scene_mut();
+        if scene.layer(inst.id).is_none() {
+            return error_out(out_error, "Layer: layer no longer exists");
         }
+        let existing = scene.layer(inst.id).and_then(|layer| layer.font_id);
+        match existing {
+            Some(id) if scene.font(id).is_some() => id,
+            _ => {
+                let id = scene.add_font(
+                    super::font::DEFAULT_FONT_FACE.to_string(),
+                    super::font::DEFAULT_FONT_HEIGHT,
+                    [255, 255, 255, 255],
+                );
+                if let Some(layer) = scene.layer_mut(inst.id) {
+                    layer.font_id = Some(id);
+                }
+                id
+            }
+        }
+    };
+
+    // Create a throwaway `Font` and rebind it to the layer's state. The
+    // wrapper is disposable; only the shared state persists.
+    let engine = crate::natives::context_engine();
+    if engine.eval("new Font()", "layer.font").is_err() {
+        set_void_out(out);
+        return 0;
+    }
+    let dv = match engine.retain_value_detached(&tjs2_sys::TjsValue::Object) {
+        Ok(dv) => dv,
         Err(_) => {
             set_void_out(out);
-            0
+            return 0;
         }
+    };
+    // `__bind` repoints the wrapper at the layer's shared state. (A
+    // multi-statement `eval` does not reliably dispatch the call, so invoke
+    // the method on the retained wrapper directly.)
+    if engine
+        .call_member(
+            dv.raw_id(),
+            "__bind",
+            &[tjs2_sys::TjsValue::Integer(i64::from(font_id))],
+        )
+        .is_err()
+    {
+        set_void_out(out);
+        return 0;
     }
+    // SAFETY: out is a valid result slot; the C++ side consumes the
+    // retention (copies + erases) before the callback returns.
+    unsafe {
+        (*out).ty = tjs2_sys::VAL_RETAINED;
+        (*out).integer = 0;
+        (*out).real = 0.0;
+        (*out).string = std::ptr::null();
+        (*out).array = std::ptr::null();
+        (*out).array_count = 0;
+        (*out).retained = dv.raw_id() as usize;
+    }
+    // The C++ conversion consumes the retention; forget the wrapper so its
+    // Drop does not release the id first (safe no-op after).
+    std::mem::forget(dv);
+    0
+}
+
+/// `layer.font = font` setter — copy a `Font` object's properties into the
+/// layer's own state.
+///
+/// The reference *denies* this setter, but the game's `AffineLayer` defines
+/// `property font { setter(v) { _image.font = v; } }`. Copying (rather than
+/// aliasing the source state) keeps the layer independent of the source
+/// object's lifetime: a later `invalidate` of the source cannot clear the
+/// layer's font.
+extern "C" fn layer_font_set(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    value: *const Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: value is a valid value slot for the duration of the call.
+    let v = unsafe { &*value };
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let engine = crate::natives::context_engine();
+    let src_id = match resolve_object_id_arg(engine, v) {
+        Ok(id) if id >= 0 => id as u32,
+        // null/void or an unreadable object: leave the layer's font unchanged.
+        _ => return 0,
+    };
+    let mut scene = context_scene_mut();
+    if scene.layer(inst.id).is_none() {
+        return error_out(out_error, "Layer: layer no longer exists");
+    }
+    let Some(src) = scene.font(src_id).cloned() else {
+        return 0;
+    };
+    let existing = scene.layer(inst.id).and_then(|layer| layer.font_id);
+    let dst_id = match existing {
+        Some(id) if scene.font(id).is_some() => id,
+        _ => {
+            let id = scene.add_font(src.face.clone(), src.height, src.color);
+            if let Some(layer) = scene.layer_mut(inst.id) {
+                layer.font_id = Some(id);
+            }
+            id
+        }
+    };
+    if let Some(dst) = scene.fonts.iter_mut().find(|f| f.id == dst_id) {
+        dst.face = src.face;
+        dst.height = src.height;
+        dst.color = src.color;
+        dst.bold = src.bold;
+        dst.italic = src.italic;
+        dst.strikeout = src.strikeout;
+        dst.underline = src.underline;
+        dst.angle = src.angle;
+    }
+    0
 }
 
 /// `layer.hasImage` getter.
@@ -3383,5 +3511,100 @@ mod tests {
         super::super::set_shared_cursor_pos(5, 7);
         assert_eq!(env.eval_int("l.cursorX"), 5);
         assert_eq!(env.eval_int("l.cursorY"), 7);
+    }
+
+    /// `layer.font` returns wrappers bound to ONE shared layer font state, so
+    /// `with(font){ .face = ...; .height = ... }` persists across accesses
+    /// (this is exactly what `system/MessageArea.tjs` does). The throwaway
+    /// state from each `new Font()` must be dropped, not accumulated.
+    #[test]
+    fn layer_font_state_is_shared_across_accesses() {
+        let env = TestEnv::new("layer-font-shared");
+        env.run(
+            "var w = new Window(); var l = new Layer(w, null); \
+             l.font.face = 'MS Gothic'; l.font.height = 24; \
+             l.font.bold = true;",
+        )
+        .unwrap();
+        {
+            let scene = env.scene();
+            assert_eq!(scene.fonts.len(), 1, "wrappers must not leak FontStates");
+            let front = scene.layers[0].font_id.expect("layer owns a font");
+            let font = scene.font(front).expect("layer font exists");
+            assert_eq!(font.face, "MS Gothic");
+            assert_eq!(font.height, 24);
+            assert!(font.bold);
+        }
+        // Reads create more wrappers but see the shared state's values.
+        assert_eq!(env.eval_string("l.font.face"), "MS Gothic");
+        assert_eq!(env.eval_int("l.font.height"), 24);
+        assert_eq!(env.eval_int("l.font.bold"), 1);
+        assert_eq!(env.scene().fonts.len(), 1, "still exactly one FontState");
+    }
+
+    /// `layer.font = f` copies the source `Font`'s properties into a
+    /// layer-owned state (the reference denies this setter, but the game's
+    /// `AffineLayer` assigns it).
+    #[test]
+    fn layer_font_setter_copies_font_object() {
+        let env = TestEnv::new("layer-font-setter");
+        env.run(
+            "var w = new Window(); var l = new Layer(w, null); \
+             var f = new Font('MS 明朝', 20, 0xffff0000); \
+             l.font = f;",
+        )
+        .unwrap();
+        let scene = env.scene();
+        let id = scene.layers[0].font_id.expect("setter creates layer font");
+        let font = scene.font(id).expect("layer font exists");
+        assert_eq!(font.face, "MS 明朝");
+        assert_eq!(font.height, 20);
+        assert_eq!(font.color, [255, 0, 0, 255]);
+    }
+
+    /// A `drawText` on a layer whose face is mapped in the installed
+    /// `FontConfig` must rasterize through that face. Verified structurally:
+    /// the process-global atlas keyed by the configured face's id gains the
+    /// drawn glyphs (it would stay empty if `drawText` had fallen back to
+    /// system discovery).
+    #[test]
+    fn draw_text_uses_configured_named_face() {
+        const FREE_SANS: &str = "/usr/share/fonts/gnu-free/FreeSans.otf";
+        if !std::path::Path::new(FREE_SANS).is_file() {
+            eprintln!("skipping: {FREE_SANS} not present");
+            return;
+        }
+        struct ConfigGuard;
+        impl Drop for ConfigGuard {
+            fn drop(&mut self) {
+                tvp_text::set_font_config(None);
+            }
+        }
+        let _guard = ConfigGuard;
+        let env = TestEnv::new("layer-draw-text-configured-face");
+        // Install the config *after* `TestEnv` acquires the VM test lock, so
+        // no other visual-native test can observe it mid-draw.
+        let config = tvp_text::FontConfig::from_json_str(&format!(
+            r#"{{ "faces": {{ "MS Gothic": "{FREE_SANS}" }} }}"#
+        ))
+        .expect("valid config");
+        tvp_text::set_font_config(Some(config));
+
+        env.run(
+            "var w = new Window(); var l = new Layer(w, null); \
+             l.setSize(64, 32); \
+             l.font.face = 'MS Gothic'; l.font.height = 16; \
+             l.drawText(2, 2, 'ABC', 0xffffff);",
+        )
+        .unwrap();
+        drop(env.scene());
+
+        let face = tvp_text::resolve_face(&tvp_text::FaceRequest::Named("MS Gothic".into()))
+            .expect("configured face resolves");
+        let glyphs = tvp_text::with_cached_atlas(face, 16, |atlas| atlas.glyph_count());
+        assert!(
+            glyphs >= 3,
+            "drawText must rasterize 'ABC' through the configured face, got {glyphs} glyphs"
+        );
     }
 }

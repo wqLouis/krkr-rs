@@ -47,19 +47,54 @@ fn main() {
         Some("demo") => run_demo(),
         Some("run") => {
             let rest: Vec<&String> = args.iter().skip(1).collect();
-            let headless = rest.iter().any(|a| a.as_str() == "--headless");
-            let Some(game_dir) = rest
-                .iter()
-                .find(|a| !a.starts_with('-'))
-                .map(|a| PathBuf::from(a.as_str()))
-            else {
-                eprintln!("krkr-rs: usage: krkr-rs run <game-dir> [--headless]");
+            let mut headless = false;
+            let mut game_dir: Option<PathBuf> = None;
+            let mut font_config: Option<PathBuf> = None;
+            let mut i = 0;
+            while i < rest.len() {
+                let arg = rest[i].as_str();
+                match arg {
+                    "--headless" => headless = true,
+                    // Verbosity is handled by `engine::init_logging`; the
+                    // `run` subcommand just tolerates it anywhere.
+                    "-v" | "--verbose" => {}
+                    "--font-config" => {
+                        i += 1;
+                        match rest.get(i) {
+                            Some(path) => font_config = Some(PathBuf::from(path.as_str())),
+                            None => {
+                                eprintln!("krkr-rs: --font-config requires a path");
+                                std::process::exit(2);
+                            }
+                        }
+                    }
+                    _ if arg.starts_with("--font-config=") => {
+                        font_config = Some(PathBuf::from(&arg["--font-config=".len()..]));
+                    }
+                    _ if arg.starts_with('-') => {
+                        eprintln!("krkr-rs: unknown option {arg}");
+                        std::process::exit(2);
+                    }
+                    _ => {
+                        if game_dir.is_none() {
+                            game_dir = Some(PathBuf::from(arg));
+                        }
+                    }
+                }
+                i += 1;
+            }
+            let Some(game_dir) = game_dir else {
+                eprintln!(
+                    "krkr-rs: usage: krkr-rs run <game-dir> [--headless] [--font-config <path>]"
+                );
                 std::process::exit(2);
             };
-            run_game(&game_dir, headless);
+            run_game(&game_dir, font_config, headless);
         }
         _ => {
-            eprintln!("krkr-rs: usage: krkr-rs demo | krkr-rs run <game-dir> [--headless]");
+            eprintln!(
+                "krkr-rs: usage: krkr-rs demo | krkr-rs run <game-dir> [--headless] [--font-config <path>]"
+            );
             std::process::exit(2);
         }
     }
@@ -73,6 +108,9 @@ fn main() {
 #[derive(Resource)]
 struct GameConfig {
     game_dir: PathBuf,
+    /// CLI `--font-config <path>` override (highest precedence; see
+    /// [`load_font_config`]).
+    font_config: Option<PathBuf>,
 }
 
 /// The running TJS2 VM + its start [`Instant`], inserted by [`game_startup`].
@@ -98,25 +136,28 @@ struct StartupReport(LoadReport);
 /// `krkr-rs run <game-dir>`: mount the game, register natives, run
 /// `startup.tjs`, then loop (VM timers → scene sync → render).
 /// `--headless` runs one pass with no window and dumps the scene instead.
-fn run_game(game_dir: &std::path::Path, headless: bool) {
+fn run_game(game_dir: &std::path::Path, font_config: Option<PathBuf>, headless: bool) {
     let shared = SharedScene(Arc::new(RwLock::new(Scene::default())));
     if headless {
-        run_headless(shared, game_dir.to_path_buf());
+        run_headless(shared, game_dir.to_path_buf(), font_config.clone());
     }
     println!("krkr-rs: running {game_dir:?} (close the window to exit)");
     // Returns when the app exits (window closed, `System.exit`, or an exit
     // requested by a script).
-    game_app(shared, game_dir.to_path_buf()).run();
+    game_app(shared, game_dir.to_path_buf(), font_config).run();
 }
 
 /// The windowed game app: default plugins (window + renderer), the shared
 /// scene, and the game pipeline. The window is 1280x720 "krkr-rs"; closing
 /// it exits (Bevy's default `ExitCondition::OnAllClosed`; the app has a
 /// single primary window, so closing it fires the exit).
-fn game_app(shared: SharedScene, game_dir: PathBuf) -> App {
+fn game_app(shared: SharedScene, game_dir: PathBuf, font_config: Option<PathBuf>) -> App {
     let mut app = App::new();
     app.insert_resource(shared)
-        .insert_resource(GameConfig { game_dir })
+        .insert_resource(GameConfig {
+            game_dir,
+            font_config,
+        })
         .init_resource::<BitmapAssets>()
         .init_resource::<GpuPrimitives>()
         .init_resource::<FrameBlendMaterials>()
@@ -173,10 +214,13 @@ fn poll_game_exit(mut exit: MessageWriter<AppExit>) {
 /// GPU-less machines), the shared scene, and the same pipeline. One
 /// `App::update()` drives Startup (prepare + register + startup.tjs) and one
 /// Update (timer_poll + sync_scene).
-fn headless_game_app(shared: SharedScene, game_dir: PathBuf) -> App {
+fn headless_game_app(shared: SharedScene, game_dir: PathBuf, font_config: Option<PathBuf>) -> App {
     let mut app = App::new();
     app.insert_resource(shared)
-        .insert_resource(GameConfig { game_dir })
+        .insert_resource(GameConfig {
+            game_dir,
+            font_config,
+        })
         .insert_resource(Assets::<Image>::default())
         // The sync may spawn Mesh2d quads for GPU-blended layers; keep the
         // mesh store alive even without an asset plugin/renderer.
@@ -189,6 +233,46 @@ fn headless_game_app(shared: SharedScene, game_dir: PathBuf) -> App {
         .add_systems(Startup, game_startup)
         .add_systems(Update, (run_vm, sync_scene).chain());
     app
+}
+
+/// Load the explicit font configuration for this run.
+///
+/// Precedence:
+/// 1. CLI `--font-config <path>` (stored in [`GameConfig::font_config`]);
+/// 2. the `KRKR_RS_FONT_CONFIG` environment variable;
+/// 3. `<game-dir>/fonts.json` (auto-detected);
+/// 4. nothing.
+///
+/// Returns `None` when no config is present, which keeps the pre-config
+/// behavior (system discovery) so a game works out of the box. A config that
+/// is present but cannot be read/parsed logs a clear error and installs an
+/// **empty** config (discovery disabled): a user who asked for explicit font
+/// selection must not silently get implicit system fonts.
+fn load_font_config(config: &GameConfig) -> Option<tvp_visual::FontConfig> {
+    let explicit = config
+        .font_config
+        .clone()
+        .or_else(|| std::env::var_os("KRKR_RS_FONT_CONFIG").map(PathBuf::from));
+    let path = match explicit {
+        Some(path) => path,
+        None => {
+            let candidate = config.game_dir.join("fonts.json");
+            if !candidate.is_file() {
+                return None;
+            }
+            candidate
+        }
+    };
+    match tvp_visual::FontConfig::from_file(&path) {
+        Ok(cfg) => {
+            log::info!("krkr-rs: font config loaded from {}", path.display());
+            Some(cfg)
+        }
+        Err(e) => {
+            log::error!("krkr-rs: {e}");
+            Some(tvp_visual::FontConfig::default())
+        }
+    }
 }
 
 /// Startup system (runs once): mount storage, bootstrap the TJS2 VM,
@@ -244,6 +328,11 @@ fn game_startup(
         log::error!("krkr-rs: native registration failed: {e}");
         std::process::exit(1);
     });
+
+    // 4b. Install the explicit font configuration (if any) before
+    //     `startup.tjs` creates its text layers. No config found keeps the
+    //     out-of-the-box system discovery (see `load_font_config`).
+    tvp_visual::set_font_config(load_font_config(&config));
 
     // 5. Run startup.tjs; a script error is non-fatal (log it and keep
     //    going — timers still fire and the scene keeps syncing).
@@ -363,8 +452,8 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// cannot open), then dump the resulting [`Scene`] state to stdout and exit
 /// 0. Proves the whole chain: real startup.tjs → natives → Scene populated
 /// with the title-screen data.
-fn run_headless(shared: SharedScene, game_dir: PathBuf) -> ! {
-    let mut app = headless_game_app(shared.clone(), game_dir);
+fn run_headless(shared: SharedScene, game_dir: PathBuf, font_config: Option<PathBuf>) -> ! {
+    let mut app = headless_game_app(shared.clone(), game_dir, font_config);
     app.update(); // Startup (prepare + register + startup.tjs) + one Update (timer_poll + sync_scene)
 
     if let Some(report) = app.world().get_resource::<StartupReport>() {
@@ -793,7 +882,7 @@ mod tests {
         assert!(game.is_dir(), "real game dir must exist for this test");
         let shared = SharedScene(Arc::new(RwLock::new(Scene::default())));
 
-        let mut app = headless_game_app(shared.clone(), game);
+        let mut app = headless_game_app(shared.clone(), game, None);
         app.update();
 
         // startup.tjs executed: the report exists; a remaining script error
@@ -868,7 +957,7 @@ mod tests {
         assert!(game.is_dir(), "real game dir must exist for this test");
         let shared = SharedScene(Arc::new(RwLock::new(Scene::default())));
 
-        let mut app = headless_game_app(shared.clone(), game);
+        let mut app = headless_game_app(shared.clone(), game, None);
         app.update(); // Startup (prepare + register + startup.tjs) + first Update
 
         let scene = shared.0.read().expect("shared scene lock poisoned");

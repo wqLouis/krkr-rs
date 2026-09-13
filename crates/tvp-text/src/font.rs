@@ -11,10 +11,12 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 
 use ab_glyph::{Font, FontVec, GlyphId, InvalidFont, PxScale, PxScaleFont, ScaleFont};
 use fontdb::{Database, Query};
+
+use crate::font_config::{FontConfig, FontEntry};
 
 /// Errors produced while loading a font face.
 #[derive(Debug)]
@@ -228,15 +230,21 @@ impl fmt::Debug for FontFace {
 
 /// Identifies a font-face request so resolved faces can be cached. The key is
 /// the *request*, not the resulting face: repeated `drawText` calls with the
-/// same override / default therefore share one parse.
+/// same override / default / named face therefore share one parse.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum FaceRequest {
     /// Auto-discover the default Japanese CJK face
-    /// ([`FontFace::discover_system_jp`]).
+    /// ([`FontFace::discover_system_jp`]). With an installed [`FontConfig`]
+    /// this first walks the configured fallback chain.
     SystemJp,
     /// Load face index 0 from a specific file (e.g. the
-    /// `KRKR_RS_SYSTEM_FONT` override).
+    /// `KRKR_RS_SYSTEM_FONT` override). Always takes precedence and is never
+    /// remapped by a [`FontConfig`].
     Path(PathBuf),
+    /// A face requested by *name* (a KAG `Font.face`/`Layer.font.face`).
+    /// Resolution follows [`resolve_face`]: explicit `faces` map, then the
+    /// `fallback` chain, then (only if opted in) system discovery.
+    Named(String),
 }
 
 impl FaceRequest {
@@ -250,14 +258,68 @@ impl FaceRequest {
     }
 }
 
+/// The process-global explicit font configuration. `None` means "no config":
+/// today's out-of-the-box behavior (system discovery). See
+/// [`set_font_config`].
+static FONT_CONFIG: LazyLock<RwLock<Option<FontConfig>>> = LazyLock::new(|| RwLock::new(None));
+
+/// Bumped on every [`set_font_config`] so [`FACE_CACHE`] is invalidated when
+/// the configuration changes.
+static CONFIG_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Install (or clear) the process-global [`FontConfig`].
+///
+/// * `Some(config)` — explicit font selection. `Named`/`SystemJp` requests
+///   use `config.faces` then `config.fallback`; system discovery happens only
+///   when `config.allow_system_discovery` is true.
+/// * `None` — no config: `Named`/`SystemJp` fall back to
+///   [`FontFace::discover_system_jp`], preserving the game's out-of-the-box
+///   behavior on machines without a `fonts.json`.
+///
+/// The face cache is invalidated (generation bump) so a new config takes
+/// effect immediately.
+pub fn set_font_config(config: Option<FontConfig>) {
+    *FONT_CONFIG
+        .write()
+        .unwrap_or_else(|poison| poison.into_inner()) = config;
+    CONFIG_GENERATION.fetch_add(1, Ordering::SeqCst);
+}
+
+/// A snapshot of the currently installed [`FontConfig`] (cloned so callers do
+/// not hold the lock across font file IO).
+pub fn font_config() -> Option<FontConfig> {
+    FONT_CONFIG
+        .read()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone()
+}
+
 /// Process-global cache of resolved faces, including negative results (so a
 /// machine without a CJK font does not rescan the filesystem on every
-/// `drawText` call).
-static FACE_CACHE: LazyLock<Mutex<HashMap<FaceRequest, Option<Arc<FontFace>>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// `drawText` call). Entries belong to a config generation and are dropped
+/// when the configuration changes.
+#[derive(Default)]
+struct FaceCache {
+    generation: u64,
+    entries: HashMap<FaceRequest, Option<Arc<FontFace>>>,
+}
+
+static FACE_CACHE: LazyLock<Mutex<FaceCache>> = LazyLock::new(|| Mutex::new(FaceCache::default()));
 
 /// Resolve `request` to a shared font face, discovering and parsing it at most
-/// once per process.
+/// once per process (and configuration generation).
+///
+/// Resolution:
+///
+/// * `Path` — always load that file directly.
+/// * `Named(name)` — case-insensitive `faces` lookup; a comma-separated name
+///   (KAG's `Font.face` is often `"A,B,C"`) is tried whole and then token by
+///   token. On a miss, walk the `fallback` chain in order (first entry that
+///   loads). Only if still unresolved and `allow_system_discovery` is set,
+///   fall back to [`FontFace::discover_system_jp`].
+/// * `SystemJp` — the `fallback` chain, then discovery if allowed.
+/// * With **no** config installed, `Named`/`SystemJp` behave exactly like the
+///   pre-config port: system discovery.
 ///
 /// `FontFace` is `Send + Sync`, so a single process-global `Arc` is shared
 /// across threads. Locking the cache across discovery is intentional: the VM
@@ -268,19 +330,93 @@ static FACE_CACHE: LazyLock<Mutex<HashMap<FaceRequest, Option<Arc<FontFace>>>>> 
 /// Discovery does file IO and parses a multi-MB font, so callers must invoke
 /// this **without** holding the scene lock.
 pub fn resolve_face(request: &FaceRequest) -> Option<Arc<FontFace>> {
+    let generation = CONFIG_GENERATION.load(Ordering::SeqCst);
     let mut cache = FACE_CACHE
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
-    if let Some(cached) = cache.get(request) {
+    if cache.generation != generation {
+        cache.entries.clear();
+        cache.generation = generation;
+    }
+    if let Some(cached) = cache.entries.get(request) {
         return cached.clone();
     }
-    let resolved = match request {
-        FaceRequest::Path(path) => FontFace::from_path(path, 0).ok(),
-        FaceRequest::SystemJp => FontFace::discover_system_jp(),
-    }
-    .map(Arc::new);
-    cache.insert(request.clone(), resolved.clone());
+    // Snapshot the config while holding the cache lock. Discovery/parsing
+    // below still runs under the cache lock (intentional; see the doc
+    // comment) and `set_font_config` never takes the cache lock, so there is
+    // no lock-order inversion.
+    let config = font_config();
+    let resolved = resolve_request(request, config.as_ref()).map(Arc::new);
+    cache.entries.insert(request.clone(), resolved.clone());
     resolved
+}
+
+/// Apply the resolution rules for one request against a config snapshot.
+fn resolve_request(request: &FaceRequest, config: Option<&FontConfig>) -> Option<FontFace> {
+    match request {
+        FaceRequest::Path(path) => FontFace::from_path(path, 0).ok(),
+        FaceRequest::SystemJp => resolve_default(config),
+        FaceRequest::Named(name) => resolve_named(name, config),
+    }
+}
+
+/// `SystemJp`: fallback chain, then opted-in system discovery.
+fn resolve_default(config: Option<&FontConfig>) -> Option<FontFace> {
+    match config {
+        Some(config) => {
+            if let Some(face) = load_fallback(&config.fallback) {
+                return Some(face);
+            }
+            if config.allow_system_discovery {
+                return FontFace::discover_system_jp();
+            }
+            None
+        }
+        // No config: preserve the original out-of-the-box discovery.
+        None => FontFace::discover_system_jp(),
+    }
+}
+
+/// `Named`: explicit mapping, then fallback, then opted-in discovery.
+fn resolve_named(name: &str, config: Option<&FontConfig>) -> Option<FontFace> {
+    let Some(config) = config else {
+        // No config: behave like the pre-config port.
+        return FontFace::discover_system_jp();
+    };
+
+    // KAG face strings are comma-separated preference lists; try the whole
+    // string first (so a full-list key can be mapped explicitly) and then
+    // each trimmed token. This is still fully explicit: every token must be
+    // present in `faces` — there is no implicit per-token system lookup.
+    let mut candidates = vec![name];
+    if name.contains(',') {
+        candidates.extend(name.split(',').map(str::trim).filter(|s| !s.is_empty()));
+    }
+    for candidate in candidates {
+        if let Some(entry) = config.face(candidate)
+            && let Ok(face) = load_entry(entry)
+        {
+            return Some(face);
+        }
+    }
+
+    if let Some(face) = load_fallback(&config.fallback) {
+        return Some(face);
+    }
+    if config.allow_system_discovery {
+        return FontFace::discover_system_jp();
+    }
+    None
+}
+
+/// Load a single config entry's face.
+fn load_entry(entry: &FontEntry) -> Result<FontFace, FontError> {
+    FontFace::from_path(entry.path(), entry.index())
+}
+
+/// First fallback entry that loads, in order.
+fn load_fallback(fallback: &[FontEntry]) -> Option<FontFace> {
+    fallback.iter().find_map(|entry| load_entry(entry).ok())
 }
 
 /// Resolve the glyph id for `c`, applying the missing-glyph fallback:
