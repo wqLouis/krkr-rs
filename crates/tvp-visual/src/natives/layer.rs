@@ -43,7 +43,7 @@
 //! | `onPaint()` | base no-op action (script subclasses override it and call `super.onPaint(...)`) |
 //! | `setCursorPos(x,y)` / `focus()` | no-ops (input: later) |
 //! | `setCenter(x,y)`, `setAffineOffset(x,y)`, `setImagePos`, `setImageSize` | no-ops (affine: later) |
-//! | `drawText` | rasterizes into the attached scene bitmap using `tvp-text`, with a built-in fallback font |
+//! | `drawText` | rasterizes into the attached scene bitmap using `tvp-text` (face/height/bold/italic/underline/strikeout/angle); a missing face logs a warning and draws nothing rather than fabricating glyphs |
 //! | `drawPolygon` / `drawRectangle` / `drawLine` / `drawLines` / `drawArc` / `drawBezier` / `drawBeziers` | rasterizes a `GdiPlus.Appearance`'s ordered fills/strokes into the attached scene bitmap (`natives::raster`) |
 //! | `doBoxBlur` | minimal in-place RGBA box blur over the attached scene bitmap |
 //! | `beginTransition` | queues a next-poll completion callback; interpolation remains a stub |
@@ -59,7 +59,10 @@ use tjs2_sys::{
 };
 
 use crate::scene::{BitmapState, LayerState, Scene};
-use tvp_text::{FaceRequest, GlyphAtlas, LayoutOptions, layout, resolve_face, with_cached_atlas};
+use tvp_text::{
+    FaceRequest, GlyphAtlas, LayoutOptions, PrerenderedFont, PrerenderedKey, layout,
+    prerendered_font, resolve_face, with_cached_atlas_styled,
+};
 
 use super::ffi::{
     arg_bool, arg_f64, arg_i64, arg_string, error_out, instance_ref, set_int_out, set_null_out,
@@ -1446,6 +1449,37 @@ fn ensure_layer_bitmap(scene: &mut Scene, layer_id: u32, min_w: u32, min_h: u32)
     Some(id)
 }
 
+/// Text style snapshot taken from the layer's tracked [`FontState`] before
+/// font resolution / rasterization (which must happen outside the scene lock).
+///
+/// `face`/`height` select the rasterized face; the remaining fields are
+/// applied at paint time: `bold` selects the emboldened atlas, `italic` shears
+/// each glyph, `underline`/`strikeout` draw horizontal rules across each run,
+/// and `angle` rotates each glyph (the reference stores it in tenths of a
+/// degree).
+#[derive(Clone, Copy, Debug, Default)]
+struct DrawTextStyle {
+    bold: bool,
+    italic: bool,
+    underline: bool,
+    strikeout: bool,
+    angle_deg: f64,
+}
+
+impl DrawTextStyle {
+    fn from_font(font: &crate::scene::FontState) -> Self {
+        Self {
+            bold: font.bold,
+            italic: font.italic,
+            underline: font.underline,
+            strikeout: font.strikeout,
+            // `Font.angle` is in tenths of a degree (reference
+            // `RadianAngle = Angle * PI / 1800`).
+            angle_deg: font.angle / 10.0,
+        }
+    }
+}
+
 /// Draw text into the layer's bitmap.  TVP layers are image surfaces, so a
 /// layer without an attached image gets a transparent bitmap sized from its
 /// rectangle (or from the text when the rectangle is still empty).  The
@@ -1489,7 +1523,7 @@ extern "C" fn layer_draw_text(
 
     // Snapshot scene values before loading a font; font discovery may do file
     // IO and must not hold the scene lock while doing so.
-    let (bitmap_id, width, _height, font_height, face_override) = {
+    let (bitmap_id, width, _height, font_height, style, face_override) = {
         let mut scene = context_scene_mut();
         let Some(layer) = scene.layer(inst.id) else {
             return error_out(out_error, "Layer: layer no longer exists");
@@ -1498,11 +1532,19 @@ extern "C" fn layer_draw_text(
         // fall back to the newest registered `Font` for scripts that draw
         // without ever touching `layer.font`.
         let layer_font = layer.font_id.and_then(|id| scene.font(id));
-        let (face_override, font_height) = match layer_font {
-            Some(font) => (Some(font.face.clone()), font.height.max(1) as u32),
+        let (face_override, font_height, style) = match layer_font {
+            Some(font) => (
+                Some(font.face.clone()),
+                font.height.max(1) as u32,
+                DrawTextStyle::from_font(font),
+            ),
             None => match scene.fonts.last() {
-                Some(font) => (Some(font.face.clone()), font.height.max(1) as u32),
-                None => (None, 16),
+                Some(font) => (
+                    Some(font.face.clone()),
+                    font.height.max(1) as u32,
+                    DrawTextStyle::from_font(font),
+                ),
+                None => (None, 16, DrawTextStyle::default()),
             },
         };
         let needed_w = (x.max(0) as u32).saturating_add(fallback_text_width(&text, font_height));
@@ -1520,51 +1562,109 @@ extern "C" fn layer_draw_text(
             width.max(1),
             height.max(1),
             font_height,
+            style,
             face_override,
         )
     };
 
-    // Prefer tvp-text's real CJK rasterizer. A missing font is a normal
-    // deployment situation (minimal Linux containers in particular), so
-    // retain a small deterministic bitmap-font fallback rather than silently
-    // dropping the game's title text.
+    // Pre-rendered `.tft` fonts take precedence when the layer font's exact
+    // properties were mapped by `Font.mapPrerenderedFont` and every character
+    // in this call is present. `MessageArea.charOutput` draws one character per
+    // call, so a per-call all-or-nothing choice still mixes correctly on a
+    // per-character basis (a CJK char missing from a Japanese `.tft` falls
+    // back to the vector path for that call).
+    let prerender_key = face_override.as_ref().map(|face| PrerenderedKey {
+        face: face.clone(),
+        height: font_height as i32,
+        bold: style.bold,
+        italic: style.italic,
+        angle: (style.angle_deg * 10.0).round() as i32,
+    });
+    if let Some(key) = &prerender_key
+        && let Some(pfont) = prerendered_font(key)
+        && text
+            .chars()
+            .all(|c| c.is_control() || pfont.find(c).is_some())
+    {
+        let mut scene = context_scene_mut();
+        if let Some(bitmap) = scene.bitmap_mut(bitmap_id) {
+            if shadow_level != 0 || shadow_width != 0 {
+                paint_prerendered_text(
+                    bitmap,
+                    &pfont,
+                    &text,
+                    shadow_color,
+                    opa,
+                    aa,
+                    x.saturating_add(shadow_x),
+                    y.saturating_add(shadow_y),
+                    font_height,
+                    shadow_width.min(16),
+                    style,
+                );
+            }
+            paint_prerendered_text(
+                bitmap,
+                &pfont,
+                &text,
+                color,
+                opa,
+                aa,
+                x,
+                y,
+                font_height,
+                0,
+                style,
+            );
+            bitmap.mark_dirty();
+        }
+        set_void_out(out);
+        return 0;
+    }
+
+    // Prefer tvp-text's real rasterizer. `KRKR_RS_SYSTEM_FONT` is an explicit
+    // path override and always wins (hermetic CI). Otherwise ask for the
+    // layer's tracked face by name; `resolve_face` maps it through the
+    // configured `faces`/`fallback` chain (or system discovery when no config
+    // is installed). With no face tracked at all, `SystemJp` is kept for
+    // scripts that never create a `Font`.
     //
-    // `KRKR_RS_SYSTEM_FONT` is an explicit path override and always wins
-    // (hermetic CI). Otherwise ask for the layer's tracked face by name;
-    // `resolve_face` maps it through the configured `faces`/`fallback` chain
-    // (or system discovery when no config is installed). With no face tracked
-    // at all, `SystemJp` is kept for scripts that never create a `Font`.
-    //
-    // Both the resolved face and the per-height atlas are cached process-wide
-    // (`resolve_face` / `with_cached_atlas`). `MessageArea.charOutput` draws
-    // one character per call, so the face is resolved once and the atlas
-    // rasterized once per `(face, height)`.
+    // Both the resolved face and the per-height/bold atlas are cached
+    // process-wide (`resolve_face` / `with_cached_atlas_styled`).
+    // `MessageArea.charOutput` draws one character per call, so the face is
+    // resolved once and each glyph rasterized once per `(face, height, bold)`.
     let request =
         if let Some(path) = std::env::var_os("KRKR_RS_SYSTEM_FONT").map(std::path::PathBuf::from) {
             FaceRequest::Path(path)
         } else {
-            match face_override {
+            match face_override.clone() {
                 Some(face) => FaceRequest::Named(face),
                 None => FaceRequest::SystemJp,
             }
         };
     if let Some(face) = resolve_face(&request) {
         // Layout rasterizes new glyphs; do it before taking the scene lock.
-        let text_layout = with_cached_atlas(face.clone(), font_height, |atlas| {
-            layout(
-                &text,
-                width as f32,
-                font_height as f32,
-                atlas,
-                &LayoutOptions {
-                    wrap: false,
-                    ..Default::default()
-                },
-            )
-        });
+        let text_layout =
+            with_cached_atlas_styled(face.clone(), font_height, style.bold, |atlas| {
+                layout(
+                    &text,
+                    width as f32,
+                    font_height as f32,
+                    atlas,
+                    &LayoutOptions {
+                        wrap: false,
+                        ..Default::default()
+                    },
+                )
+            });
         let mut scene = context_scene_mut();
         if let Some(bitmap) = scene.bitmap_mut(bitmap_id) {
-            with_cached_atlas(face, font_height, |atlas| {
+            with_cached_atlas_styled(face, font_height, style.bold, |atlas| {
+                // The reference `shadowlevel` is a blur *level* (0..255-ish),
+                // not a pixel radius; `shadowwidth` is the radius. Treating the
+                // level as a spread (the game uses 3024) painted an 8 px box
+                // behind every glyph, merging them into an opaque band. Use
+                // the width instead.
                 if shadow_level != 0 || shadow_width != 0 {
                     paint_layout(
                         bitmap,
@@ -1575,31 +1675,30 @@ extern "C" fn layer_draw_text(
                         aa,
                         x.saturating_add(shadow_x),
                         y.saturating_add(shadow_y),
-                        shadow_level.max(shadow_width),
+                        shadow_width.min(16),
+                        style,
                     );
                 }
-                paint_layout(bitmap, atlas, &text_layout, color, opa, aa, x, y, 0);
+                paint_layout(bitmap, atlas, &text_layout, color, opa, aa, x, y, 0, style);
             });
             bitmap.mark_dirty();
         }
     } else {
-        let mut scene = context_scene_mut();
-        if let Some(bitmap) = scene.bitmap_mut(bitmap_id) {
-            if shadow_level != 0 || shadow_width != 0 {
-                paint_fallback_text(
-                    bitmap,
-                    &text,
-                    shadow_color,
-                    opa,
-                    x + shadow_x,
-                    y + shadow_y,
-                    font_height,
-                    shadow_level.max(shadow_width),
-                );
-            }
-            paint_fallback_text(bitmap, &text, color, opa, x, y, font_height, 0);
-            bitmap.mark_dirty();
+        // No rasterizable face resolved: an explicit `fonts.json` with no
+        // mapping for this face, no loadable fallback, and system discovery
+        // disabled (or a machine without any CJK font). Do **not** fabricate
+        // box glyphs / an opaque block; leave the layer transparent and warn
+        // once so the misconfiguration is visible in the log.
+        static WARNED_NO_FACE: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if !WARNED_NO_FACE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "krkr-rs: Layer.drawText: no font face resolved for {:?}; text left blank \
+                 (configure `faces`/`fallback` in fonts.json or install a CJK font)",
+                face_override
+            );
         }
+        let _ = bitmap_id;
     }
     set_void_out(out);
     0
@@ -2031,6 +2130,126 @@ fn fallback_text_height(text: &str, height: u32) -> u32 {
     text.split('\n').count().max(1) as u32 * height.max(1)
 }
 
+/// Composite a string from a `.tft` pre-rendered font.
+///
+/// The caller guarantees `text` contains only characters present in `pfont`
+/// (plus newlines/controls). Glyphs are vertically centered in the em box,
+/// matching the vector layout convention. Synthetic rotation/italic are not
+/// applied because the `.tft` bitmap is already baked for its
+/// `(face, height, bold, italic, angle)` key.
+#[allow(clippy::too_many_arguments)]
+fn paint_prerendered_text(
+    bitmap: &mut BitmapState,
+    pfont: &PrerenderedFont,
+    text: &str,
+    color: [u8; 4],
+    opa: u8,
+    aa: bool,
+    x: i32,
+    y: i32,
+    font_height: u32,
+    spread: u32,
+    style: DrawTextStyle,
+) {
+    let line_height = font_height.max(1) as i32;
+    let ascent = (font_height as f32 * 0.85) as i32;
+    let thickness = (font_height / 14).max(1) as i32;
+    let mut pen_x = x;
+    let mut pen_y = y;
+    let mut line_start = x;
+
+    for ch in text.chars() {
+        if ch == '\n' {
+            paint_prerendered_rules(
+                bitmap, line_start, pen_x, pen_y, ascent, thickness, color, opa, style,
+            );
+            pen_x = x;
+            line_start = x;
+            pen_y += line_height;
+            continue;
+        }
+        if ch.is_control() {
+            continue;
+        }
+        let Some(glyph) = pfont.find(ch) else {
+            continue;
+        };
+        let cov = pfont.rasterize(&glyph);
+        let gw = glyph.width as i32;
+        let gh = glyph.height as i32;
+        let top = pen_y + (line_height - gh) / 2;
+        let left = pen_x + glyph.origin_x as i32;
+        for dy in 0..gh {
+            for dx in 0..gw {
+                let mut a = cov[(dy * gw + dx) as usize];
+                if !aa {
+                    a = if a >= 128 { 255 } else { 0 };
+                }
+                if a == 0 {
+                    continue;
+                }
+                let gx = left + dx;
+                let gy = top + dy;
+                if spread == 0 {
+                    blend_pixel(bitmap, gx, gy, color, a, opa);
+                } else {
+                    let r = spread.min(16) as i32;
+                    for sy in -r..=r {
+                        for sx in -r..=r {
+                            blend_pixel(bitmap, gx + sx, gy + sy, color, a, opa);
+                        }
+                    }
+                }
+            }
+        }
+        pen_x += glyph.advance();
+    }
+    paint_prerendered_rules(
+        bitmap, line_start, pen_x, pen_y, ascent, thickness, color, opa, style,
+    );
+}
+
+/// Underline / strikeout rules for one pre-rendered line.
+#[allow(clippy::too_many_arguments)]
+fn paint_prerendered_rules(
+    bitmap: &mut BitmapState,
+    x0: i32,
+    x1: i32,
+    line_y: i32,
+    ascent: i32,
+    thickness: i32,
+    color: [u8; 4],
+    opa: u8,
+    style: DrawTextStyle,
+) {
+    if style.underline {
+        paint_rule(
+            bitmap,
+            x0,
+            x1,
+            line_y + ascent + 2,
+            thickness,
+            color,
+            opa,
+            0,
+            0,
+        );
+    }
+    if style.strikeout {
+        paint_rule(
+            bitmap,
+            x0,
+            x1,
+            line_y + ascent - ascent / 3,
+            thickness,
+            color,
+            opa,
+            0,
+            0,
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn paint_layout(
     bitmap: &mut BitmapState,
@@ -2042,13 +2261,24 @@ fn paint_layout(
     offset_x: i32,
     offset_y: i32,
     spread: u32,
+    style: DrawTextStyle,
 ) {
     let (atlas_width, _) = atlas.atlas_size();
     let pixels = atlas.atlas_rgba();
+    let angle = style.angle_deg.to_radians();
+    let rotate = style.angle_deg.abs() > 1e-6;
+    // Synthetic italic: shear each glyph around its vertical center. 0.25 is a
+    // conventional oblique slant (about 14 degrees). Rotation supersedes the
+    // shear when both are requested.
+    let italic = style.italic && !rotate;
+    const ITALIC_SLANT: f32 = 0.25;
+
     for run in &text_layout.runs {
         for glyph in &run.chars {
-            for dy in 0..glyph.size.1 {
-                for dx in 0..glyph.size.0 {
+            let gw = glyph.size.0;
+            let gh = glyph.size.1;
+            for dy in 0..gh {
+                for dx in 0..gw {
                     let source = (((glyph.uv.1 + dy) * atlas_width + glyph.uv.0 + dx) * 4) as usize;
                     let mut coverage = pixels[source + 3];
                     if !aa {
@@ -2057,14 +2287,30 @@ fn paint_layout(
                     if coverage == 0 {
                         continue;
                     }
-                    let gx = glyph.x.round() as i32 + dx as i32 + offset_x;
-                    let gy = glyph.y.round() as i32 + dy as i32 + offset_y;
+                    let base_x = glyph.x.round();
+                    let base_y = glyph.y.round();
+                    let (mut px, mut py) = (base_x + dx as f32, base_y + dy as f32);
+                    if italic {
+                        px += ITALIC_SLANT * (gh as f32 / 2.0 - dy as f32);
+                    } else if rotate {
+                        let cx = gw as f64 / 2.0;
+                        let cy = gh as f64 / 2.0;
+                        let (ox, oy) = (dx as f64 - cx, dy as f64 - cy);
+                        let (rx, ry) = (
+                            ox * angle.cos() - oy * angle.sin(),
+                            ox * angle.sin() + oy * angle.cos(),
+                        );
+                        px = base_x + (cx + rx) as f32;
+                        py = base_y + (cy + ry) as f32;
+                    }
+                    let gx = px.round() as i32 + offset_x;
+                    let gy = py.round() as i32 + offset_y;
                     if spread == 0 {
                         blend_pixel(bitmap, gx, gy, color, coverage, opa);
                     } else {
-                        // A compact square dilation approximates TVP's
-                        // shadow width without a second glyph rasterizer.
-                        let r = spread.min(8) as i32;
+                        // A compact square dilation approximates TVP's shadow
+                        // blur width without a second glyph rasterizer.
+                        let r = spread.min(16) as i32;
                         for sy in -r..=r {
                             for sx in -r..=r {
                                 blend_pixel(bitmap, gx + sx, gy + sy, color, coverage, opa);
@@ -2075,77 +2321,51 @@ fn paint_layout(
             }
         }
     }
+
+    // Underline / strikeout: horizontal rules spanning each run.
+    if style.underline || style.strikeout {
+        let thickness = (atlas.pixel_height() / 14).max(1) as i32;
+        let ascent = atlas.ascent();
+        for run in &text_layout.runs {
+            let Some(first) = run.chars.first() else {
+                continue;
+            };
+            let start = first.x.round() as i32;
+            let end = (first.x + run.width).round() as i32;
+            if style.underline {
+                let y = (run.y + ascent + 2.0).round() as i32;
+                paint_rule(
+                    bitmap, start, end, y, thickness, color, opa, offset_x, offset_y,
+                );
+            }
+            if style.strikeout {
+                let y = (run.y + run.line_height / 2.0).round() as i32;
+                paint_rule(
+                    bitmap, start, end, y, thickness, color, opa, offset_x, offset_y,
+                );
+            }
+        }
+    }
 }
 
-/// A tiny 5x7 fallback font. ASCII uses a stable per-character pattern and
-/// non-ASCII characters use a bordered checker glyph; it is intentionally
-/// recognizable as text while requiring no bundled font files or system font.
+/// Fill a `thickness`-px horizontal rule from `x0` (inclusive) to `x1`
+/// (exclusive); used by underline / strikeout.
 #[allow(clippy::too_many_arguments)]
-fn paint_fallback_text(
+fn paint_rule(
     bitmap: &mut BitmapState,
-    text: &str,
+    x0: i32,
+    x1: i32,
+    y: i32,
+    thickness: i32,
     color: [u8; 4],
     opa: u8,
-    x: i32,
-    y: i32,
-    height: u32,
-    spread: u32,
+    offset_x: i32,
+    offset_y: i32,
 ) {
-    let height = height.max(7);
-    let scale = (height / 8).max(1) as i32;
-    let mut pen_y = y;
-    for line in text.split('\n') {
-        let mut pen_x = x;
-        for ch in line.chars() {
-            let advance = if ch.is_ascii() {
-                (height * 55 / 100).max(1) as i32
-            } else {
-                height as i32
-            };
-            if !ch.is_whitespace() {
-                for row in 0..7 {
-                    for col in 0..5 {
-                        let on = if ch.is_ascii() {
-                            // Border plus a character-dependent interior
-                            // pattern gives useful output for every ASCII
-                            // code without a large embedded font table.
-                            row == 0
-                                || row == 6
-                                || col == 0
-                                || col == 4
-                                || (ch as usize + row * 3 + col).is_multiple_of(11)
-                        } else {
-                            row == 0
-                                || row == 6
-                                || col == 0
-                                || col == 4
-                                || (ch as usize + row + col).is_multiple_of(5)
-                        };
-                        if !on {
-                            continue;
-                        }
-                        for sy in 0..scale {
-                            for sx in 0..scale {
-                                let px = pen_x + col as i32 * scale + sx;
-                                let py = pen_y + row as i32 * scale + sy;
-                                if spread == 0 {
-                                    blend_pixel(bitmap, px, py, color, 255, opa);
-                                } else {
-                                    let r = spread.min(8) as i32;
-                                    for oy in -r..=r {
-                                        for ox in -r..=r {
-                                            blend_pixel(bitmap, px + ox, py + oy, color, 255, opa);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            pen_x += advance;
+    for yy in 0..thickness {
+        for xx in x0..x1 {
+            blend_pixel(bitmap, xx + offset_x, y + yy + offset_y, color, 255, opa);
         }
-        pen_y += height as i32;
     }
 }
 
@@ -2935,6 +3155,197 @@ mod tests {
                 .chunks_exact(4)
                 .any(|pixel| pixel[3] != 0 && pixel[0] > 0 && pixel[1] == 0 && pixel[2] == 0),
             "a 0x00RRGGBB shadow color must paint red shadow pixels"
+        );
+    }
+
+    /// Count pixels with a non-zero alpha in a bitmap.
+    fn bitmap_ink(bitmap: &crate::scene::BitmapState) -> usize {
+        bitmap.rgba.chunks_exact(4).filter(|p| p[3] != 0).count()
+    }
+
+    /// True when a fully transparent column exists *between* the first and
+    /// last inked columns (i.e. the text is not one solid block).
+    fn bitmap_has_gap(bitmap: &crate::scene::BitmapState) -> bool {
+        let col_has_ink = |x: u32| {
+            (0..bitmap.height).any(|y| bitmap.rgba[((y * bitmap.width + x) * 4 + 3) as usize] != 0)
+        };
+        let inked: Vec<u32> = (0..bitmap.width).filter(|&x| col_has_ink(x)).collect();
+        let (Some(&first), Some(&last)) = (inked.first(), inked.last()) else {
+            return false;
+        };
+        (first..=last).any(|x| !col_has_ink(x))
+    }
+
+    /// With no resolvable face, `drawText` must leave the layer transparent
+    /// instead of fabricating a filled checker glyph (which read as an opaque
+    /// text background). Uses an explicit config with discovery disabled so
+    /// the test does not depend on the machine's font set.
+    #[test]
+    fn layer_draw_text_without_face_stays_transparent() {
+        if std::env::var_os("KRKR_RS_SYSTEM_FONT").is_some() {
+            eprintln!("skipping: KRKR_RS_SYSTEM_FONT overrides face resolution");
+            return;
+        }
+        struct ConfigGuard;
+        impl Drop for ConfigGuard {
+            fn drop(&mut self) {
+                tvp_text::set_font_config(None);
+            }
+        }
+        // Acquire the VM test lock first: the font config is process-global,
+        // so it must only change while no other visual-native test is drawing.
+        let env = TestEnv::new("layer-draw-text-no-face");
+        let _guard = ConfigGuard;
+        tvp_text::set_font_config(Some(tvp_text::FontConfig {
+            allow_system_discovery: false,
+            ..Default::default()
+        }));
+        env.run("var w = new Window(); var l = new Layer(w, null); l.setSize(128, 32); l.drawText(2, 2, '日本語', 0x00ffffff);")
+            .unwrap();
+        let scene = env.scene();
+        let bitmap = scene.bitmap(scene.layers[0].bitmap.unwrap()).unwrap();
+        assert_eq!(
+            bitmap_ink(bitmap),
+            0,
+            "no resolved face must leave the layer transparent, not a solid block"
+        );
+    }
+
+    /// Synthetic bold must add coverage (the bold atlas is a separate cache
+    /// entry from the regular one).
+    #[test]
+    fn layer_draw_text_bold_adds_coverage() {
+        let env = TestEnv::new("layer-draw-text-bold");
+        env.run(
+            "var w = new Window(); \
+             var a = new Layer(w, null); a.setSize(96, 40); a.font.height = 32; a.drawText(2, 2, 'MA', 0xffffffff); \
+             var b = new Layer(w, null); b.setSize(96, 40); b.font.height = 32; b.font.bold = true; b.drawText(2, 2, 'MA', 0xffffffff);",
+        )
+        .unwrap();
+        let scene = env.scene();
+        let normal = bitmap_ink(scene.bitmap(scene.layers[0].bitmap.unwrap()).unwrap());
+        let bold = bitmap_ink(scene.bitmap(scene.layers[1].bitmap.unwrap()).unwrap());
+        assert!(normal > 0, "the regular glyphs must paint");
+        assert!(bold > normal, "bold must add coverage: {bold} vs {normal}");
+    }
+
+    /// Underline / strikeout must paint extra rules (the glyph alone would not
+    /// reach the run's full advance width).
+    #[test]
+    fn layer_draw_text_underline_and_strikeout_paint() {
+        let env = TestEnv::new("layer-draw-text-underline");
+        env.run(
+            "var w = new Window(); \
+             var a = new Layer(w, null); a.setSize(96, 40); a.font.height = 32; a.drawText(2, 2, 'I', 0xffffffff); \
+             var b = new Layer(w, null); b.setSize(96, 40); b.font.height = 32; b.font.underline = true; b.font.strikeout = true; b.drawText(2, 2, 'I', 0xffffffff);",
+        )
+        .unwrap();
+        let scene = env.scene();
+        let plain = bitmap_ink(scene.bitmap(scene.layers[0].bitmap.unwrap()).unwrap());
+        let styled = bitmap_ink(scene.bitmap(scene.layers[1].bitmap.unwrap()).unwrap());
+        assert!(
+            styled > plain,
+            "underline + strikeout must add rules: {styled} vs {plain}"
+        );
+    }
+
+    /// Italic shears the glyph, so the painted pixels differ from the upright
+    /// rendering (but still paint ink).
+    #[test]
+    fn layer_draw_text_italic_shears_glyph() {
+        let env = TestEnv::new("layer-draw-text-italic");
+        env.run(
+            "var w = new Window(); \
+             var a = new Layer(w, null); a.setSize(96, 40); a.font.height = 32; a.drawText(2, 2, 'I', 0xffffffff); \
+             var b = new Layer(w, null); b.setSize(96, 40); b.font.height = 32; b.font.italic = true; b.drawText(2, 2, 'I', 0xffffffff);",
+        )
+        .unwrap();
+        let scene = env.scene();
+        let upright = scene
+            .bitmap(scene.layers[0].bitmap.unwrap())
+            .unwrap()
+            .rgba
+            .clone();
+        let italic = &scene.bitmap(scene.layers[1].bitmap.unwrap()).unwrap().rgba;
+        assert!(italic.chunks_exact(4).any(|p| p[3] != 0));
+        assert_ne!(upright, *italic, "italic must shear the glyph");
+    }
+
+    /// The game's `MessageArea` defaults (`shadowlevel=3024`,
+    /// `shadowwidth=3`) must not be interpreted as an 8 px spread that merges
+    /// glyphs into a solid band. A transparent column must remain between two
+    /// glyphs.
+    #[test]
+    fn layer_draw_text_shadow_uses_width_not_level() {
+        let env = TestEnv::new("layer-draw-text-shadow-width");
+        env.run("var w = new Window(); var l = new Layer(w, null); l.setSize(160, 48); l.font.height = 30; l.drawText(2, 2, 'A A', 0x00ffffff, 255, true, 3024, 0x00202020, 3);")
+            .unwrap();
+        let scene = env.scene();
+        let bitmap = scene.bitmap(scene.layers[0].bitmap.unwrap()).unwrap();
+        assert!(
+            bitmap_has_gap(bitmap),
+            "a 3 px shadow must leave a transparent gap between glyphs"
+        );
+    }
+
+    /// Build a minimal version-1 `.tft` with one solid 2×2 glyph for `ch`.
+    fn tiny_tft(ch: char) -> Vec<u8> {
+        const MAGIC: &[u8; 22] = b"TVP pre-rendered font\x1a";
+        const HEADER: usize = 36;
+        // Literal coverage 63 → ×4 (upscale) → 252.
+        let coverage = [63u8; 4];
+        let ch_index = HEADER + coverage.len();
+        let index = ch_index + 2;
+        let mut data = vec![0u8; index + 20];
+        data[..22].copy_from_slice(MAGIC);
+        data[22] = 1;
+        data[23] = 2;
+        data[24..28].copy_from_slice(&1u32.to_le_bytes());
+        data[28..32].copy_from_slice(&(ch_index as u32).to_le_bytes());
+        data[32..36].copy_from_slice(&(index as u32).to_le_bytes());
+        data[HEADER..HEADER + 4].copy_from_slice(&coverage);
+        data[ch_index..ch_index + 2].copy_from_slice(&(ch as u16).to_le_bytes());
+        let item = &mut data[index..index + 20];
+        item[0..4].copy_from_slice(&(HEADER as u32).to_le_bytes());
+        item[4..6].copy_from_slice(&2u16.to_le_bytes()); // width
+        item[6..8].copy_from_slice(&2u16.to_le_bytes()); // height
+        item[10..12].copy_from_slice(&2i16.to_le_bytes()); // origin_y
+        item[12..14].copy_from_slice(&3i16.to_le_bytes()); // inc_x
+        item[16..18].copy_from_slice(&3i16.to_le_bytes()); // inc
+        data
+    }
+
+    /// `Font.mapPrerenderedFont` + `Layer.drawText` must composite the `.tft`
+    /// bitmap and `Font.getTextWidth` must use its baked advance.
+    #[test]
+    fn layer_draw_text_uses_mapped_prerendered_font() {
+        struct RegistryGuard;
+        impl Drop for RegistryGuard {
+            fn drop(&mut self) {
+                tvp_text::clear_prerendered_fonts();
+            }
+        }
+        let env = TestEnv::new("layer-draw-text-prerendered");
+        let _guard = RegistryGuard;
+        std::fs::write(env._dir.path().join("testfont.tft"), tiny_tft('A')).unwrap();
+        env.run("var f = new Font('MyFace', 30, 0xffffff); f.mapPrerenderedFont('testfont.tft');")
+            .unwrap();
+        let advance = env.eval("f.getTextWidth('A')", "test").expect("script");
+        assert_eq!(advance, tjs2_sys::TjsValue::Real(3.0));
+
+        env.run(
+            "var w = new Window(); var l = new Layer(w, null); l.setSize(32, 32); \
+             l.font.face = 'MyFace'; l.font.height = 30; \
+             l.drawText(1, 1, 'A', 0xffffff);",
+        )
+        .unwrap();
+        let scene = env.scene();
+        let bitmap = scene.bitmap(scene.layers[0].bitmap.unwrap()).unwrap();
+        assert!(bitmap_ink(bitmap) > 0, "prerendered glyph must paint");
+        // The 2×2 ink is centered in the 30 px line at y = 1 + (30-2)/2 = 15.
+        assert!(
+            bitmap.rgba[((15 * bitmap.width + 1) * 4 + 3) as usize] > 0,
+            "prerendered ink must land at the centered glyph position"
         );
     }
 

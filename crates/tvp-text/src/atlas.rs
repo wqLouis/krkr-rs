@@ -52,6 +52,8 @@ pub struct GlyphAtlas {
     font: Arc<FontFace>,
     /// Requested pixel height (KAG font height, i.e. the em size in px).
     pixel_height: u32,
+    /// Whether glyphs are synthetically emboldened (KAG `Font.bold`).
+    bold: bool,
     /// The `ab_glyph` scale corresponding to `pixel_height` (see
     /// [`px_scale_for_height`] for why this is not `pixel_height` itself).
     scale: PxScale,
@@ -80,11 +82,35 @@ impl GlyphAtlas {
         Self::new(font, pixel_height, 512)
     }
 
+    /// Create a bold atlas for `font` at `pixel_height`, with a default width
+    /// of 512 px (see [`GlyphAtlas::new_bold`]).
+    pub fn with_default_width_bold(
+        font: impl Into<Arc<FontFace>>,
+        pixel_height: u32,
+        bold: bool,
+    ) -> Self {
+        Self::new_bold(font, pixel_height, 512, bold)
+    }
+
     /// Create an atlas for `font` at `pixel_height`.
     ///
     /// `atlas_width` is the fixed atlas width in pixels; the height grows on
     /// demand. `pixel_height` must be at least 1.
     pub fn new(font: impl Into<Arc<FontFace>>, pixel_height: u32, atlas_width: u32) -> Self {
+        Self::new_bold(font, pixel_height, atlas_width, false)
+    }
+
+    /// Create an atlas with optional synthetic emboldening.
+    ///
+    /// `bold` applies a 1 px horizontal coverage dilation at rasterization
+    /// time (ab_glyph has no `FT_GlyphSlot_Embolden` equivalent), and widens
+    /// the advance by the same amount so emboldened glyphs do not collide.
+    pub fn new_bold(
+        font: impl Into<Arc<FontFace>>,
+        pixel_height: u32,
+        atlas_width: u32,
+        bold: bool,
+    ) -> Self {
         let font = font.into();
         assert!(
             pixel_height >= 1,
@@ -95,7 +121,11 @@ impl GlyphAtlas {
         // ascent − descent at this scale = the full vertical extent; the ink
         // of any glyph fits inside it by definition of the font's metrics.
         let line_height = scaled.ascent() - scaled.descent();
-        let cell = (line_height.ceil() as u32).max(pixel_height) + 2 * PAD;
+        // One extra padding column when bold: the 1 px dilation must stay
+        // inside the cell (PAD already covers the right edge, but keeping the
+        // reasoning explicit here documents why bold never clips).
+        let bold_pad = u32::from(bold);
+        let cell = (line_height.ceil() as u32).max(pixel_height) + 2 * PAD + bold_pad;
         let width = atlas_width.max(cell);
         let cols = (width / cell).max(1);
         let height = cell;
@@ -103,6 +133,7 @@ impl GlyphAtlas {
         Self {
             font,
             pixel_height,
+            bold,
             scale,
             cell,
             cols,
@@ -142,34 +173,55 @@ impl GlyphAtlas {
     fn rasterize_new(&mut self, c: char) -> GlyphSlot {
         let scaled = self.font.font().as_scaled(self.scale);
         let id = glyph_id_with_fallback(c, &scaled);
-        let advance = scaled.h_advance(id);
+        let mut advance = scaled.h_advance(id);
         let glyph = id.with_scale_and_position(self.scale, ab_glyph::point(0.0, 0.0));
         let (u, v, w, h) = match scaled.outline_glyph(glyph) {
             Some(outline) => {
                 let bounds = outline.px_bounds();
-                let (w, h) = (bounds.width() as u32, bounds.height() as u32);
+                let (mut w, h) = (bounds.width() as u32, bounds.height() as u32);
                 if w == 0 || h == 0 {
                     // No ink (e.g. space): still cache the advance.
                     (0, 0, 0, 0)
                 } else {
+                    // Rasterize into a scratch cell so bold can dilate the
+                    // coverage before it lands in the packed atlas.
+                    let cell = self.cell as usize;
+                    let mut cov = vec![0u8; cell * cell];
+                    let base = PAD as usize;
+                    outline.draw(|dx, dy, coverage| {
+                        let x = base + dx as usize;
+                        let y = base + dy as usize;
+                        if x < cell && y < cell {
+                            let alpha = (coverage.clamp(0.0, 1.0) * 255.0).round() as u8;
+                            let slot = &mut cov[y * cell + x];
+                            *slot = (*slot).max(alpha);
+                        }
+                    });
+                    if self.bold {
+                        embolden_coverage(&mut cov, cell);
+                        // The right edge grew by one pixel.
+                        w += 1;
+                        advance += 1.0;
+                    }
                     let index = self.alloc_cell();
                     let (col, row) = (index % self.cols, index / self.cols);
                     let base_x = col * self.cell + PAD;
                     let base_y = row * self.cell + PAD;
-                    let atlas_width = self.width;
-                    outline.draw(|dx, dy, coverage| {
-                        let ax = base_x + dx;
-                        let ay = base_y + dy;
-                        if ax >= atlas_width || ay >= self.height {
-                            return;
+                    for yy in 0..cell {
+                        for xx in 0..cell {
+                            let alpha = cov[yy * cell + xx];
+                            if alpha == 0 {
+                                continue;
+                            }
+                            let ax = base_x + xx as u32;
+                            let ay = base_y + yy as u32;
+                            if ax >= self.width || ay >= self.height {
+                                continue;
+                            }
+                            let i = ((ay * self.width + ax) * 4) as usize;
+                            self.rgba[i..i + 4].copy_from_slice(&[255, 255, 255, alpha]);
                         }
-                        let alpha = (coverage.clamp(0.0, 1.0) * 255.0).round() as u8;
-                        if alpha == 0 {
-                            return;
-                        }
-                        let i = ((ay * atlas_width + ax) * 4) as usize;
-                        self.rgba[i..i + 4].copy_from_slice(&[255, 255, 255, alpha]);
-                    });
+                    }
                     (base_x, base_y, w, h)
                 }
             }
@@ -225,6 +277,17 @@ impl GlyphAtlas {
         scaled.ascent() - scaled.descent()
     }
 
+    /// Ascent (`baseline` above the top of the em box) in pixels at this
+    /// atlas's pixel height. Used for underline/strikeout placement.
+    pub fn ascent(&self) -> f32 {
+        self.font.font().as_scaled(self.scale).ascent()
+    }
+
+    /// Whether glyphs in this atlas are synthetically emboldened.
+    pub fn bold(&self) -> bool {
+        self.bold
+    }
+
     /// The cached slot for `c`, if it has been rasterized.
     pub fn slot(&self, c: char) -> Option<GlyphSlot> {
         self.slots.get(&c).copied()
@@ -236,10 +299,26 @@ impl GlyphAtlas {
     }
 }
 
-/// Cache key: `(face id, pixel height)`. Keying by height means multiple
+/// Horizontally dilate a rasterized glyph's coverage by one pixel to the
+/// right, producing a synthetic bold. `cov` is a `cell × cell` buffer; the
+/// caller reserves an extra padding column for the growth.
+fn embolden_coverage(cov: &mut [u8], cell: usize) {
+    for y in 0..cell {
+        let row = y * cell;
+        for x in (1..cell).rev() {
+            let prev = cov[row + x - 1];
+            if prev > cov[row + x] {
+                cov[row + x] = prev;
+            }
+        }
+    }
+}
+
+/// Cache key: `(face id, pixel height, bold)`. Keying by height means multiple
 /// concurrent text sizes (e.g. 12 px and 24 px) each keep their own atlas and
-/// never thrash one another.
-type AtlasKey = (u64, u32);
+/// never thrash one another; keying by `bold` keeps the emboldened raster
+/// separate from the regular one.
+type AtlasKey = (u64, u32, bool);
 
 /// Process-global glyph atlases, shared across `drawText` calls so a glyph is
 /// rasterized once per `(face, height)` for the lifetime of the process.
@@ -263,7 +342,18 @@ pub fn with_cached_atlas<R>(
     pixel_height: u32,
     f: impl FnOnce(&mut GlyphAtlas) -> R,
 ) -> R {
-    let key = (face.id(), pixel_height);
+    with_cached_atlas_styled(face, pixel_height, false, f)
+}
+
+/// Like [`with_cached_atlas`], but selects the synthetic-bold atlas when
+/// `bold` is set. Bold and regular atlases are cached independently.
+pub fn with_cached_atlas_styled<R>(
+    face: Arc<FontFace>,
+    pixel_height: u32,
+    bold: bool,
+    f: impl FnOnce(&mut GlyphAtlas) -> R,
+) -> R {
+    let key = (face.id(), pixel_height, bold);
     let atlas = {
         let mut cache = ATLAS_CACHE
             .lock()
@@ -271,9 +361,10 @@ pub fn with_cached_atlas<R>(
         cache
             .entry(key)
             .or_insert_with(|| {
-                Arc::new(Mutex::new(GlyphAtlas::with_default_width(
+                Arc::new(Mutex::new(GlyphAtlas::with_default_width_bold(
                     face,
                     pixel_height,
+                    bold,
                 )))
             })
             .clone()

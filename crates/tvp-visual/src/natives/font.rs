@@ -7,7 +7,9 @@
 //! arrives in milestone 3B; until then `Layer.font` returns a script-side
 //! font object with no-op text helpers (see the setup script in `mod.rs`).
 
+use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use tjs2_sys::{
     NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef, Tjs2Engine, Value,
@@ -18,6 +20,7 @@ use super::ffi::{
     set_string_out,
 };
 use super::{context_scene_mut, context_scene_read};
+use tvp_text::{PrerenderedFont, PrerenderedKey, map_prerendered_font, prerendered_font};
 
 /// Default face name for a freshly constructed `Font` (reference's
 /// `MS Gothic`-ish default). Also the face a layer's lazily created font
@@ -347,10 +350,10 @@ extern "C" fn font_angle_set(
     0
 }
 
-/// Estimate text width using TVP's common half-width/full-width rule. The
-/// renderer can later replace this with `tvp-text` glyph metrics, but this
-/// deterministic fallback is already sufficient for layout and hit testing
-/// on systems without a matching Japanese font installed.
+/// Estimate text width using TVP's common half-width/full-width rule. When the
+/// font's properties are mapped to a pre-rendered `.tft`, use that font's
+/// baked advances instead (the message layer advances its cursor with this
+/// call, so it must match the drawn glyphs).
 extern "C" fn font_text_width(
     _engine: *mut c_void,
     instance: *mut c_void,
@@ -365,22 +368,41 @@ extern "C" fn font_text_width(
         return error_out(out_error, "Font.getTextWidth requires text");
     };
     let inst = unsafe { instance_ref::<FontInst>(instance) };
-    let height = context_scene_read()
-        .fonts
-        .iter()
-        .find(|f| f.id == inst.id)
-        .map(|f| f.height.max(1) as f64)
-        .unwrap_or(12.0);
-    let width: f64 = text
-        .chars()
-        .map(|c| if c.is_ascii() { height * 0.55 } else { height })
-        .sum();
-    unsafe {
-        (*out).ty = tjs2_sys::VAL_REAL;
-        (*out).integer = 0;
-        (*out).real = width;
-    }
+    // Snapshot the mapping key, then drop the scene lock before consulting the
+    // pre-rendered registry.
+    let key = {
+        let scene = context_scene_read();
+        let Some(font) = scene.fonts.iter().find(|f| f.id == inst.id) else {
+            return error_out(out_error, "Font: font no longer exists");
+        };
+        PrerenderedKey {
+            face: font.face.clone(),
+            height: font.height,
+            bold: font.bold,
+            italic: font.italic,
+            angle: font.angle as i32,
+        }
+    };
+    let height = key.height.max(1) as f64;
+    let width: f64 = if let Some(pfont) = prerendered_font(&key) {
+        text.chars()
+            .map(|c| {
+                pfont
+                    .find(c)
+                    .map(|g| g.advance() as f64)
+                    .unwrap_or_else(|| half_or_full(c, height))
+            })
+            .sum()
+    } else {
+        text.chars().map(|c| half_or_full(c, height)).sum()
+    };
+    set_real_out(out, width);
     0
+}
+
+/// TVP's default advance estimate: ASCII ≈ 0.55 em, everything else a full em.
+fn half_or_full(c: char, height: f64) -> f64 {
+    if c.is_ascii() { height * 0.55 } else { height }
 }
 
 extern "C" fn font_text_height(
@@ -403,20 +425,81 @@ extern "C" fn font_text_height(
     0
 }
 
-/// Register the `Font` native class.
-/// `Font.mapPrerenderedFont(file)` — stubbed no-op (prerendered font
-/// mapping is not implemented; the game falls back to vector fonts).
-extern "C" fn font_map_prerendered_noop(
+/// Cache of parsed `.tft` fonts keyed by the storage name they were loaded
+/// from, so `PrerenderedFontInit` (which maps every size of every face) never
+/// parses the same multi-hundred-KB file twice.
+static PRERENDERED_CACHE: LazyLock<Mutex<HashMap<String, Arc<PrerenderedFont>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Load and parse a `.tft` from game storage, caching by storage name.
+fn load_prerendered_cached(name: &str) -> Result<Arc<PrerenderedFont>, String> {
+    if let Some(font) = PRERENDERED_CACHE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(name)
+        .cloned()
+    {
+        return Ok(font);
+    }
+    let bytes = {
+        let mut storage = super::context_storage();
+        storage
+            .read(name)
+            .or_else(|_| storage.read(&format!("{name}.tft")))
+            .map_err(|e| format!("cannot read prerendered font: {e}"))?
+    };
+    let font = Arc::new(PrerenderedFont::from_bytes(bytes).map_err(|e| e.to_string())?);
+    PRERENDERED_CACHE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(name.to_string(), font.clone());
+    Ok(font)
+}
+
+/// `Font.mapPrerenderedFont(file)` — load a TVP `.tft` pre-rendered bitmap
+/// font from game storage and map it to this font's properties. Subsequent
+/// `Layer.drawText` calls whose layer font matches those properties composite
+/// the pre-rendered glyphs instead of outlining a system face.
+///
+/// The mapping is keyed by `(face, height, bold, italic, angle)` exactly like
+/// the reference `TVPPrerenderedFontMapVector`, so the mapping registered on a
+/// throwaway `new Font()` in `PrerenderedFontInit` applies to every later font
+/// with the same properties (including a layer's tracked font).
+extern "C" fn font_map_prerendered(
     _engine: *mut c_void,
-    _instance: *mut c_void,
-    _argc: c_int,
-    _argv: *const tjs2_sys::Value,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const tjs2_sys::Value,
     out: *mut Value,
-    _out_error: *mut *mut c_char,
+    out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    set_void_out(out);
-    0
+    let args = unsafe { super::ffi::args(argc, argv) };
+    let Some(name) = args.first().map(arg_string) else {
+        return error_out(out_error, "Font.mapPrerenderedFont requires a file name");
+    };
+    let inst = unsafe { instance_ref::<FontInst>(instance) };
+    let key = {
+        let scene = context_scene_read();
+        let Some(font) = scene.fonts.iter().find(|f| f.id == inst.id) else {
+            return error_out(out_error, "Font: font no longer exists");
+        };
+        PrerenderedKey {
+            face: font.face.clone(),
+            height: font.height,
+            bold: font.bold,
+            italic: font.italic,
+            angle: font.angle as i32,
+        }
+    };
+    match load_prerendered_cached(&name) {
+        Ok(font) => {
+            map_prerendered_font(key, font);
+            set_void_out(out);
+            0
+        }
+        Err(e) => error_out(out_error, &format!("Font.mapPrerenderedFont({name}): {e}")),
+    }
 }
 
 fn set_void_out(out: *mut Value) {
@@ -445,7 +528,7 @@ pub(crate) fn register_font(engine: &Tjs2Engine) -> Result<(), String> {
             },
             NativeInstanceMethodDef {
                 name: "mapPrerenderedFont",
-                f: font_map_prerendered_noop,
+                f: font_map_prerendered,
             },
             NativeInstanceMethodDef {
                 name: "getTextWidth",

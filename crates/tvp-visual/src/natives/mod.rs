@@ -225,6 +225,25 @@ pub(crate) fn context_scene_storage() -> (
     )
 }
 
+/// Lock the shared storage context only (for game-file reads that do not touch
+/// the scene, e.g. `.tft` pre-rendered fonts).
+pub(crate) fn context_storage() -> std::sync::MutexGuard<'static, Storage> {
+    let guard = STORAGE.lock().unwrap_or_else(|p| p.into_inner());
+    let storage_arc = guard
+        .as_ref()
+        .expect("register_visual: storage context not set")
+        .clone();
+    drop(guard);
+    let storage = storage_arc.lock().unwrap_or_else(|p| p.into_inner());
+    // SAFETY: `storage_arc` is cloned from the `static` STORAGE slot.
+    unsafe {
+        std::mem::transmute::<
+            std::sync::MutexGuard<'_, Storage>,
+            std::sync::MutexGuard<'static, Storage>,
+        >(storage)
+    }
+}
+
 /// The bitmap-name cache shared by `Bitmap(name)` loads.
 pub(crate) fn bitmap_cache() -> std::sync::MutexGuard<'static, BitmapCache> {
     BITMAP_CACHE.lock().unwrap_or_else(|p| p.into_inner())

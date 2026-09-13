@@ -54,9 +54,14 @@ pub mod font;
 pub mod font_config;
 pub mod layout;
 pub mod measure;
+pub mod prerendered;
 
-pub use atlas::{GlyphAtlas, GlyphSlot, with_cached_atlas};
+pub use atlas::{GlyphAtlas, GlyphSlot, with_cached_atlas, with_cached_atlas_styled};
 pub use font::{FaceRequest, FontError, FontFace, font_config, resolve_face, set_font_config};
 pub use font_config::{FontConfig, FontConfigError, FontEntry};
 pub use layout::{Align, GlyphRun, LayoutOptions, PlacedGlyph, TextLayout, layout};
 pub use measure::measure_width;
+pub use prerendered::{
+    PrerenderedFont, PrerenderedFontError, PrerenderedGlyph, PrerenderedKey,
+    clear_prerendered_fonts, map_prerendered_font, prerendered_font,
+};
