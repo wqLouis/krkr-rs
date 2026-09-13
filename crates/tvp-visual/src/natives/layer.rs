@@ -46,6 +46,12 @@
 //! | `drawText` | rasterizes into the attached scene bitmap using `tvp-text` (face/height/bold/italic/underline/strikeout/angle); a missing face logs a warning and draws nothing rather than fabricating glyphs |
 //! | `drawPolygon` / `drawRectangle` / `drawLine` / `drawLines` / `drawArc` / `drawBezier` / `drawBeziers` | rasterizes a `GdiPlus.Appearance`'s ordered fills/strokes into the attached scene bitmap (`natives::raster`) |
 //! | `doBoxBlur` | minimal in-place RGBA box blur over the attached scene bitmap |
+//! | `colorRect(x,y,w,h,color[,opa=255])` | blend-aware rect fill (`FillColorOnAlpha` / `RemoveConstOpacity`); draw-face- and clip-aware |
+//! | `colorize(hue,sat,blend)` / `noise(level)` | `layerExImage` hue/saturation reblend and RGB noise over the clip region |
+//! | `tileRect(left,top,w,h,tile[,x,y])` | repeats a source Layer/Bitmap over the rect (a clipped `copyRect` loop) |
+//! | `fillOperateRect(left,top,w,h,color[,mode])` | blend fill using a `tTVPBlendOperationMode` |
+//! | `doDropShadow` / `doBlurLight` | SDK shadow / blur-light compositions (box blur + composite) |
+//! | `setClip([l,t,w,h])` | reference `ClipRect` (no args resets to the image); respected by the pixel ops |
 //! | `beginTransition` | queues a next-poll completion callback; interpolation remains a stub |
 //! | `affineCopy`, `stretchCopy/Pile/Blend`, `pileRect`, `piledCopy`, `operateRect/Stretch/Affine`, `light`, `stopTransition` | no-op stubs (pixel ops: later) |
 
@@ -69,6 +75,7 @@ use super::ffi::{
     set_void_out,
 };
 use super::gdiplus::{AppearanceState, BrushKind, DrawKind};
+use super::layer_ops::{self, RectI};
 use super::raster::{self, blend_pixel};
 use super::{context_engine, context_scene_mut, context_scene_read};
 
@@ -508,6 +515,7 @@ extern "C" fn layer_load_images(
         .unwrap_or((0, 0));
     if let Some(layer) = scene.layer_mut(inst.id) {
         layer.bitmap = Some(bitmap_id);
+        layer.clip = None;
         layer.image_left = 0;
         layer.image_top = 0;
         internal_set_image_size(layer, dims.0, dims.1);
@@ -609,6 +617,7 @@ extern "C" fn layer_assign_images(
     if let Some((bitmap, image_left, image_top, image_width, image_height, w, h)) = layer_src {
         if let Some(target) = scene.layer_mut(inst.id) {
             target.bitmap = bitmap;
+            target.clip = None;
             target.image_left = image_left;
             target.image_top = image_top;
             target.image_width = image_width;
@@ -624,6 +633,7 @@ extern "C" fn layer_assign_images(
     if let Some((w, h)) = bitmap_dims {
         if let Some(target) = scene.layer_mut(inst.id) {
             target.bitmap = Some(src_id);
+            target.clip = None;
             target.image_left = 0;
             target.image_top = 0;
             target.image_width = w;
@@ -817,6 +827,7 @@ extern "C" fn layer_set_bitmap(
         return error_out(out_error, "Layer: layer no longer exists");
     };
     layer.bitmap = (bitmap_id >= 0).then_some(bitmap_id as u32);
+    layer.clip = None;
     set_void_out(out);
     0
 }
@@ -874,6 +885,7 @@ extern "C" fn layer_copy_from_bitmap_to_main_image(
         return error_out(out_error, "Layer: layer no longer exists");
     };
     layer.bitmap = (bitmap_id >= 0).then_some(bitmap_id as u32);
+    layer.clip = None;
     if let Some((w, h)) = dims {
         internal_set_image_size(layer, w, h);
     }
@@ -1443,6 +1455,7 @@ fn ensure_layer_bitmap(scene: &mut Scene, layer_id: u32, min_w: u32, min_h: u32)
     let id = scene.add_bitmap(w, h, vec![0; w as usize * h as usize * 4]);
     if let Some(layer) = scene.layer_mut(layer_id) {
         layer.bitmap = Some(id);
+        layer.clip = None;
         layer.rect.w = layer.rect.w.max(w);
         layer.rect.h = layer.rect.h.max(h);
     }
@@ -2369,35 +2382,387 @@ fn paint_rule(
     }
 }
 
-fn blur_bitmap(bitmap: &mut BitmapState, xradius: u32, yradius: u32) {
-    if bitmap.width == 0 || bitmap.height == 0 || (xradius == 0 && yradius == 0) {
-        return;
+/// Reference `UpdateDrawFace`: the layer's main-image draw face. `face`
+/// overrides the blend/type-derived face unless it is `dfAuto` (128).
+fn layer_draw_face(layer: &LayerState) -> i32 {
+    const DF_ALPHA: i32 = 0;
+    const DF_OPAQUE: i32 = 1;
+    const DF_ADD_ALPHA: i32 = 4;
+    const DF_AUTO: i32 = 128;
+    if layer.face != DF_AUTO {
+        return layer.face;
     }
-    let source = bitmap.rgba.clone();
-    for y in 0..bitmap.height {
-        for x in 0..bitmap.width {
-            let x0 = x.saturating_sub(xradius);
-            let x1 = x.saturating_add(xradius).min(bitmap.width - 1);
-            let y0 = y.saturating_sub(yradius);
-            let y1 = y.saturating_add(yradius).min(bitmap.height - 1);
-            let mut sums = [0u32; 4];
-            let mut count = 0u32;
-            for sy in y0..=y1 {
-                for sx in x0..=x1 {
-                    let i = ((sy * bitmap.width + sx) * 4) as usize;
-                    for (channel, sum) in sums.iter_mut().enumerate() {
-                        *sum += u32::from(source[i + channel]);
-                    }
-                    count += 1;
-                }
-            }
-            let i = ((y * bitmap.width + x) * 4) as usize;
-            for (channel, &sum) in sums.iter().enumerate() {
-                bitmap.rgba[i + channel] = (sum / count) as u8;
+    match layer.blend_type {
+        // ltAlpha(2) and every ltPs*(13..=28) use the alpha face.
+        2 | 13..=28 => DF_ALPHA,
+        // ltAddAlpha(12)
+        12 => DF_ADD_ALPHA,
+        // ltOpaque(1), ltAdditive(3), ltSubtractive(4), ... default
+        _ => DF_OPAQUE,
+    }
+}
+
+/// The layer's `ClipRect` in image pixels. `None` means the whole image, so
+/// callers pass the full `i32` range and let the pixel op clip to the bitmap
+/// bounds.
+fn layer_pixel_rect(layer: &LayerState) -> RectI {
+    match layer.clip {
+        Some(c) => (c.x, c.y, c.x + c.w as i32, c.y + c.h as i32),
+        None => (i32::MIN, i32::MIN, i32::MAX, i32::MAX),
+    }
+}
+
+/// `colorRect(x, y, w, h, color[, opa=255])` — blend-aware rectangle fill.
+/// Reference `tTJSNI_BaseLayer::ColorRect` (`LayerIntf.cpp:4338`); native arg
+/// parsing at `LayerIntf.cpp:8672`.
+extern "C" fn layer_color_rect(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    if args.len() < 5 {
+        return error_out(out_error, "Layer.colorRect requires 5 arguments");
+    }
+    let x = arg_i64(&args[0]) as i32;
+    let y = arg_i64(&args[1]) as i32;
+    let w = arg_i64(&args[2]);
+    let h = arg_i64(&args[3]);
+    let color = argb_to_rgba(arg_i64(&args[4]));
+    // The reference defaults a missing/void `opa` to 255.
+    let opa = if args.len() >= 6 && args[5].ty != tjs2_sys::VAL_VOID {
+        arg_i64(&args[5]) as i32
+    } else {
+        255
+    };
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let mut scene = context_scene_mut();
+    let Some(layer) = scene.layer(inst.id) else {
+        return error_out(out_error, "Layer: layer no longer exists");
+    };
+    let face = layer_draw_face(layer);
+    let rect = (x, y, x.saturating_add(w as i32), y.saturating_add(h as i32));
+    let Some(destrect) = layer_ops::intersect_rect(rect, layer_pixel_rect(layer)) else {
+        set_void_out(out);
+        return 0;
+    };
+    let Some(bitmap_id) = layer.bitmap else {
+        return error_out(out_error, "Layer.colorRect: layer has no image");
+    };
+    let Some(bitmap) = scene.bitmap_mut(bitmap_id) else {
+        return error_out(out_error, "Layer.colorRect: no such bitmap");
+    };
+    match face {
+        // dfAlpha / dfBoth
+        0 => {
+            if opa > 0 {
+                layer_ops::fill_color_on_alpha(bitmap, destrect, color, opa);
+            } else {
+                layer_ops::remove_const_opacity(bitmap, destrect, -opa);
             }
         }
+        // dfAddAlpha
+        4 => {
+            if opa < 0 {
+                return error_out(
+                    out_error,
+                    "Layer.colorRect: negative opacity is not supported on additive alpha",
+                );
+            }
+            layer_ops::fill_color_on_add_alpha(bitmap, destrect, color, opa);
+        }
+        // dfOpaque / dfMain
+        1 => layer_ops::fill_color_hold_alpha(bitmap, destrect, color, opa),
+        // dfMask: the low byte of the ARGB color is the blue channel.
+        2 => layer_ops::fill_mask(bitmap, destrect, color[2]),
+        // dfProvince: the engine has no province plane; ignore (the
+        // reference writes ProvinceImage, which is not modelled here).
+        _ => {}
     }
-    bitmap.mark_dirty();
+    set_void_out(out);
+    0
+}
+
+/// `colorize(hue, sat, blend)` — `layerExImage::colorize`. Operates on the
+/// layer's current `ClipRect`.
+extern "C" fn layer_colorize(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    let hue = args.first().map(arg_i64).unwrap_or(0) as i32;
+    let sat = args.get(1).map(arg_i64).unwrap_or(0) as i32;
+    let blend = args.get(2).map(arg_f64).unwrap_or(1.0);
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let mut scene = context_scene_mut();
+    let Some(layer) = scene.layer(inst.id) else {
+        set_void_out(out);
+        return 0;
+    };
+    let rect = layer_pixel_rect(layer);
+    let Some(bitmap_id) = layer.bitmap else {
+        set_void_out(out);
+        return 0;
+    };
+    if let Some(bitmap) = scene.bitmap_mut(bitmap_id) {
+        layer_ops::colorize(bitmap, rect, hue, sat, blend);
+    }
+    set_void_out(out);
+    0
+}
+
+/// `noise(level)` — `layerExImage::noise`. Operates on the `ClipRect`.
+extern "C" fn layer_noise(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    let level = args.first().map(arg_i64).unwrap_or(0) as i32;
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let mut scene = context_scene_mut();
+    let Some(layer) = scene.layer(inst.id) else {
+        set_void_out(out);
+        return 0;
+    };
+    let rect = layer_pixel_rect(layer);
+    let Some(bitmap_id) = layer.bitmap else {
+        set_void_out(out);
+        return 0;
+    };
+    if let Some(bitmap) = scene.bitmap_mut(bitmap_id) {
+        layer_ops::noise(bitmap, rect, level);
+    }
+    set_void_out(out);
+    0
+}
+
+/// Map a resolved `tile` source to its attached bitmap. `kind`/`id` come
+/// from [`resolve_image_source`], which must be called **before** the scene
+/// lock is taken (it reads the layer's `hasImage` property, which re-enters
+/// the scene).
+fn tile_bitmap_for_source(scene: &Scene, kind: Option<bool>, id: u32) -> Option<BitmapState> {
+    let bitmap_id = match kind {
+        // Layer object
+        Some(true) => scene.layer(id).and_then(|l| l.bitmap),
+        // Bitmap object
+        Some(false) => Some(id),
+        // Integer id: probe the bitmap table first, then the layer table
+        // (the same convention `copyRect` uses).
+        None => {
+            if scene.bitmap(id).is_some() {
+                Some(id)
+            } else {
+                scene.layer(id).and_then(|l| l.bitmap)
+            }
+        }
+    };
+    scene.bitmap(bitmap_id?).cloned()
+}
+
+/// `tileRect(left, top, width, height, tile[, x=0, y=0])` — the SDK's
+/// `Layer.tileRect` composition (a clipped `copyRect` loop).
+extern "C" fn layer_tile_rect(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    if args.len() < 5 {
+        return error_out(out_error, "Layer.tileRect requires 5 arguments");
+    }
+    let left = arg_i64(&args[0]) as i32;
+    let top = arg_i64(&args[1]) as i32;
+    let width = arg_i64(&args[2]).max(0) as u32;
+    let height = arg_i64(&args[3]).max(0) as u32;
+    let x = args.get(5).map(arg_i64).unwrap_or(0) as i32;
+    let y = args.get(6).map(arg_i64).unwrap_or(0) as i32;
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    // Resolve the tile object *before* taking the scene lock: reading the
+    // layer's `hasImage` property re-enters the scene.
+    let engine = crate::natives::context_engine();
+    let (kind, src_id) = match resolve_image_source(engine, &args[4]) {
+        Ok(v) => v,
+        Err(_) => return error_out(out_error, "Layer.tileRect expects a Layer or Bitmap"),
+    };
+    let mut scene = context_scene_mut();
+    let Some(tile) = tile_bitmap_for_source(&scene, kind, src_id) else {
+        return error_out(out_error, "Layer.tileRect: tile has no image");
+    };
+    let tile_rect = (0, 0, tile.width as i32, tile.height as i32);
+    let Some(bitmap_id) = scene.layer(inst.id).and_then(|l| l.bitmap) else {
+        return error_out(out_error, "Layer.tileRect: layer has no image");
+    };
+    if let Some(dst) = scene.bitmap_mut(bitmap_id) {
+        layer_ops::tile_rect(dst, left, top, width, height, &tile, tile_rect, x, y);
+    }
+    set_void_out(out);
+    0
+}
+
+/// `fillOperateRect(left, top, width, height, color[, mode=ltPsNormal])` —
+/// the SDK fills the region through `operateRect`, so this is a blend fill.
+extern "C" fn layer_fill_operate_rect(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    if args.len() < 5 {
+        return error_out(out_error, "Layer.fillOperateRect requires 5 arguments");
+    }
+    let left = arg_i64(&args[0]) as i32;
+    let top = arg_i64(&args[1]) as i32;
+    let width = arg_i64(&args[2]).max(0) as u32;
+    let height = arg_i64(&args[3]).max(0) as u32;
+    let color = argb_to_rgba(arg_i64(&args[4]));
+    let mode = args.get(5).map(arg_i64).unwrap_or(13);
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let mut scene = context_scene_mut();
+    let Some(bitmap_id) = scene.layer(inst.id).and_then(|l| l.bitmap) else {
+        return error_out(out_error, "Layer.fillOperateRect: layer has no image");
+    };
+    if let Some(bitmap) = scene.bitmap_mut(bitmap_id) {
+        layer_ops::fill_operate_rect(bitmap, left, top, width, height, color, mode);
+    }
+    set_void_out(out);
+    0
+}
+
+/// `doDropShadow(dx=10, dy=10, blur=3, shadowColor=0x000000,
+/// shadowOpacity=200)` — the SDK composition (shadow + blur + offset).
+extern "C" fn layer_do_drop_shadow(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    let dx = args.first().map(arg_i64).unwrap_or(10) as i32;
+    let dy = args.get(1).map(arg_i64).unwrap_or(10) as i32;
+    let blur = args.get(2).map(arg_i64).unwrap_or(3).max(0) as u32;
+    let shadow_color = argb_to_rgba(args.get(3).map(arg_i64).unwrap_or(0));
+    let shadow_opacity = args.get(4).map(arg_i64).unwrap_or(200).clamp(0, 255) as u8;
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let mut scene = context_scene_mut();
+    let Some(bitmap_id) = scene.layer(inst.id).and_then(|l| l.bitmap) else {
+        set_void_out(out);
+        return 0;
+    };
+    if let Some(bitmap) = scene.bitmap_mut(bitmap_id) {
+        layer_ops::do_drop_shadow(bitmap, dx, dy, blur, shadow_color, shadow_opacity);
+    }
+    set_void_out(out);
+    0
+}
+
+/// `doBlurLight(blur=10, blurOpacity=128, lightOpacity=200,
+/// lightType=ltPsHardLight)` — the SDK composition.
+extern "C" fn layer_do_blur_light(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    let blur = args.first().map(arg_i64).unwrap_or(10).max(0) as u32;
+    let blur_opacity = args.get(1).map(arg_i64).unwrap_or(128).clamp(0, 255) as u8;
+    let light_opacity = args.get(2).map(arg_i64).unwrap_or(200).clamp(0, 255) as u8;
+    let light_type = args.get(3).map(arg_i64).unwrap_or(19);
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let mut scene = context_scene_mut();
+    let Some(bitmap_id) = scene.layer(inst.id).and_then(|l| l.bitmap) else {
+        set_void_out(out);
+        return 0;
+    };
+    if let Some(bitmap) = scene.bitmap_mut(bitmap_id) {
+        layer_ops::do_blur_light(bitmap, blur, blur_opacity, light_opacity, light_type);
+    }
+    set_void_out(out);
+    0
+}
+
+/// `setClip([left, top, width, height])` — reference
+/// `tTJSNI_BaseLayer::SetClip`/`ResetClip` (`LayerIntf.cpp:4032`). With no
+/// args (or a `void` first arg) the clip resets to the whole image.
+extern "C" fn layer_set_clip(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let mut scene = context_scene_mut();
+    let Some(layer) = scene.layer(inst.id) else {
+        return error_out(out_error, "Layer: layer no longer exists");
+    };
+    if args.is_empty() || args[0].ty == tjs2_sys::VAL_VOID {
+        if let Some(layer) = scene.layer_mut(inst.id) {
+            layer.clip = None;
+        }
+        set_void_out(out);
+        return 0;
+    }
+    if args.len() < 4 {
+        return error_out(out_error, "Layer.setClip requires 0 or 4 arguments");
+    }
+    let left = arg_i64(&args[0]) as i32;
+    let top = arg_i64(&args[1]) as i32;
+    let width = arg_i64(&args[2]) as i32;
+    let height = arg_i64(&args[3]) as i32;
+    let (img_w, img_h) = layer
+        .bitmap
+        .and_then(|b| scene.bitmap(b).map(|b| (b.width as i32, b.height as i32)))
+        .unwrap_or((layer.image_width as i32, layer.image_height as i32));
+    let left = left.max(0);
+    let top = top.max(0);
+    let right = left.saturating_add(width).min(img_w.max(left));
+    let bottom = top.saturating_add(height).min(img_h.max(top));
+    if let Some(layer) = scene.layer_mut(inst.id) {
+        layer.clip = Some(crate::scene::Rect {
+            x: left,
+            y: top,
+            w: (right - left).max(0) as u32,
+            h: (bottom - top).max(0) as u32,
+        });
+    }
+    set_void_out(out);
+    0
+}
+
+fn blur_bitmap(bitmap: &mut BitmapState, xradius: u32, yradius: u32) {
+    layer_ops::blur_bitmap_in_place(bitmap, xradius, yradius);
 }
 
 /// Register the `Layer` native class.
@@ -2498,6 +2863,10 @@ pub(crate) fn register_layer(engine: &Tjs2Engine) -> Result<(), String> {
             f: layer_fill_rect,
         },
         NativeInstanceMethodDef {
+            name: "colorRect",
+            f: layer_color_rect,
+        },
+        NativeInstanceMethodDef {
             name: "loadImages",
             f: layer_load_images,
         },
@@ -2588,6 +2957,34 @@ pub(crate) fn register_layer(engine: &Tjs2Engine) -> Result<(), String> {
         NativeInstanceMethodDef {
             name: "doBoxBlur",
             f: layer_do_box_blur,
+        },
+        NativeInstanceMethodDef {
+            name: "colorize",
+            f: layer_colorize,
+        },
+        NativeInstanceMethodDef {
+            name: "noise",
+            f: layer_noise,
+        },
+        NativeInstanceMethodDef {
+            name: "tileRect",
+            f: layer_tile_rect,
+        },
+        NativeInstanceMethodDef {
+            name: "fillOperateRect",
+            f: layer_fill_operate_rect,
+        },
+        NativeInstanceMethodDef {
+            name: "doDropShadow",
+            f: layer_do_drop_shadow,
+        },
+        NativeInstanceMethodDef {
+            name: "doBlurLight",
+            f: layer_do_blur_light,
+        },
+        NativeInstanceMethodDef {
+            name: "setClip",
+            f: layer_set_clip,
         },
         NativeInstanceMethodDef {
             name: "beginTransition",

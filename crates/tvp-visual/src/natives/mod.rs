@@ -10,6 +10,7 @@ pub mod ffi;
 pub mod font;
 pub(crate) mod gdiplus;
 pub mod layer;
+pub(crate) mod layer_ops;
 pub(crate) mod raster;
 pub mod timer;
 pub mod window;

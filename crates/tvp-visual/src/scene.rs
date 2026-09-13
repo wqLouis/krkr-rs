@@ -75,6 +75,12 @@ pub struct LayerState {
     /// Draw face (`dfBoth=0`, `dfMain=1`, `dfMask=2`, `dfProvince=3`,
     /// `dfAddAlpha=4`). Stored; the renderer always draws the main image.
     pub face: i32,
+    /// Reference `ClipRect` set by `Layer.setClip(left, top, width, height)`:
+    /// a half-open `[x, x+w) x [y, y+h)` region in image pixels. `None` means
+    /// the whole main image (the reference resets/initializes it to the image
+    /// size). Pixel operations (`colorRect`, `colorize`, `noise`, ...) clip
+    /// against it exactly like the reference.
+    pub clip: Option<Rect>,
     /// `holdAlpha` — keep the alpha when drawing. Stored only for now.
     pub hold_alpha: bool,
     /// Font id (into [`Scene::fonts`]) backing `layer.font`, or `None` until
@@ -266,6 +272,7 @@ impl Scene {
             hit_type: 0,
             cursor: 0,
             face: 0,
+            clip: None,
             hold_alpha: false,
             font_id: None,
             is_primary: false,
