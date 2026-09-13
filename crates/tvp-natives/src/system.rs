@@ -347,7 +347,7 @@ extern "C" fn native_terminate(
     } else {
         0
     };
-    TERMINATE_CODE.store(code as i32, std::sync::atomic::Ordering::SeqCst);
+    request_exit(code as i32);
     log::info!("System.terminate({code}) — emulator termination requested");
     set_void_out(out);
     0
@@ -369,7 +369,7 @@ extern "C" fn native_exit(
     } else {
         0
     };
-    TERMINATE_CODE.store(code as i32, std::sync::atomic::Ordering::SeqCst);
+    request_exit(code as i32);
     log::info!("System.exit({code}) — emulator termination requested");
     set_void_out(out);
     0
@@ -727,8 +727,35 @@ static TITLE: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new(String::new(
 /// `System.eventDisabled` flag (writable; event processing not implemented).
 static EVENT_DISABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Exit code recorded by `System.exit` (0 = not requested).
+/// Exit code recorded by `System.exit` (0 = not requested). Public mirror of
+/// the most recent request; the *pending* request is `EXIT_REQUEST`.
 pub static TERMINATE_CODE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// Pending exit request (`System.exit` / `System.terminate`), consumed
+/// exactly once by the host. `None` until `request_exit` records a code;
+/// `take_exit_request` clears it so a request is reported once.
+static EXIT_REQUEST: Mutex<Option<i32>> = Mutex::new(None);
+
+/// Record an exit request: mirror the code in the public `TERMINATE_CODE` and
+/// latch it for `take_exit_request`. Called by both `System.exit` and
+/// `System.terminate`.
+fn request_exit(code: i32) {
+    TERMINATE_CODE.store(code, Ordering::SeqCst);
+    *lock_ok(&EXIT_REQUEST) = Some(code);
+}
+
+/// Atomically consume the pending exit request.
+///
+/// Returns the code recorded by the most recent `System.exit` /
+/// `System.terminate` call and clears it, so a request is reported **exactly
+/// once**: the first call after a request yields `Some(code)`, subsequent
+/// calls yield `None` until a new request arrives. The game runner
+/// (`render::game_app`) polls this each frame and maps it to Bevy's
+/// `AppExit` (`Success` for code 0, `Error` otherwise).
+#[must_use]
+pub fn take_exit_request() -> Option<i32> {
+    lock_ok(&EXIT_REQUEST).take()
+}
 
 /// Set the context the `System` property getters read. The app calls this
 /// after mounting the game and before running `startup.tjs`.
@@ -939,4 +966,36 @@ extern "C" fn prop_desktop_height(
 extern "C" fn prop_touch_device(_e: *mut c_void, out: *mut Value, _err: *mut *mut c_char) -> c_int {
     set_int_out(out, system_context().touch_device as i64);
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exit_request_is_reported_exactly_once() {
+        // Drain any request left behind by another test in this binary so
+        // the assertions below start from a clean slate.
+        let _ = take_exit_request();
+        assert_eq!(take_exit_request(), None, "nothing pending after drain");
+
+        // A recorded request is returned once, then cleared.
+        request_exit(7);
+        assert_eq!(take_exit_request(), Some(7));
+        assert_eq!(take_exit_request(), None, "request must be consumed once");
+
+        // Zero is a valid code (success) and is still consumed.
+        request_exit(0);
+        assert_eq!(take_exit_request(), Some(0));
+        assert_eq!(take_exit_request(), None);
+
+        // A later request replaces the previous state and is reported once.
+        request_exit(3);
+        request_exit(9);
+        assert_eq!(take_exit_request(), Some(9));
+        assert_eq!(take_exit_request(), None);
+
+        // The public mirror always reflects the most recent request code.
+        assert_eq!(TERMINATE_CODE.load(Ordering::SeqCst), 9);
+    }
 }

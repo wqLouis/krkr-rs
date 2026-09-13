@@ -110,7 +110,8 @@ fn run_game(game_dir: &std::path::Path, headless: bool) -> ! {
 
 /// The windowed game app: default plugins (window + renderer), the shared
 /// scene, and the game pipeline. The window is 1280x720 "krkr-rs"; closing
-/// it exits (default `ExitCondition::OnPrimaryClosed`).
+/// it exits (Bevy's default `ExitCondition::OnAllClosed`; the app has a
+/// single primary window, so closing it fires the exit).
 fn game_app(shared: SharedScene, game_dir: PathBuf) -> App {
     let mut app = App::new();
     app.insert_resource(shared)
@@ -132,6 +133,11 @@ fn game_app(shared: SharedScene, game_dir: PathBuf) -> App {
         // run_vm BEFORE sync_scene: script mutations must render the same
         // frame, not one frame later.
         .add_systems(Update, (run_vm, sync_scene).chain())
+        // `System.exit` / `System.terminate` from the VM → Bevy `AppExit`.
+        // Runs after `run_vm` so an exit requested by this frame's script
+        // shuts the app down immediately (the window-close path stays with
+        // Bevy's default `WindowPlugin`; single window ⇒ `OnAllClosed` fires).
+        .add_systems(Update, poll_game_exit.after(run_vm))
         // Input: Bevy events → tvp-input state → game window script methods.
         // Chained and ordered after run_vm so the bridge never touches the
         // single-threaded TJS VM concurrently with the timer polls.
@@ -142,6 +148,24 @@ fn game_app(shared: SharedScene, game_dir: PathBuf) -> App {
                 .after(run_vm),
         );
     app
+}
+
+/// Translate a TJS `System.exit` / `System.terminate` request into a Bevy
+/// [`AppExit`]. The VM request is consumed exactly once by
+/// [`tvp_natives::take_exit_request`]; `AppExit::Error` only carries a `u8`,
+/// so non-zero `i32` codes are clamped into `1..=255` (a non-zero code always
+/// stays a failure).
+fn poll_game_exit(mut exit: MessageWriter<AppExit>) {
+    let Some(code) = tvp_natives::take_exit_request() else {
+        return;
+    };
+    let app_exit = if code == 0 {
+        AppExit::Success
+    } else {
+        AppExit::from_code(code.unsigned_abs().clamp(1, u8::MAX as u32) as u8)
+    };
+    log::info!("System.exit({code}) — shutting down the game runner");
+    exit.write(app_exit);
 }
 
 /// The headless game app: `MinimalPlugins` (no window/renderer — works on

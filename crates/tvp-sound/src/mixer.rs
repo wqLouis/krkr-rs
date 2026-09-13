@@ -633,6 +633,30 @@ mod tests {
         );
     }
 
+    /// A 48 kHz source rendered on a 44.1 kHz device must stay at the same
+    /// pitch (linear interpolation, not a playback-rate change).
+    #[test]
+    fn render_resamples_48k_to_44k_at_correct_pitch() {
+        let mut m = Mixer::new();
+        let c = m.spawn_channel();
+        m.channel(c).unwrap().play(Arc::new(tone(48000, 1, 1.0)));
+        // One second of output at 44.1 kHz consumes exactly the 48 kHz source.
+        let mut out = vec![0.0f32; 44100];
+        m.render_mix(&mut out, 44100, 1);
+        let crossings = out
+            .windows(2)
+            .filter(|w| (w[0] < 0.0) != (w[1] < 0.0))
+            .count();
+        let freq = crossings as f64 / 2.0;
+        assert!(
+            (freq - 440.0).abs() < 15.0,
+            "resampled pitch {freq} Hz, expected ~440"
+        );
+        // And it is actually audible, not a replay of the first buffer.
+        let peak = out.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(peak > 0.4, "resampled peak {peak}");
+    }
+
     #[test]
     fn advance_to_absolute_clock() {
         let mut m = Mixer::new();

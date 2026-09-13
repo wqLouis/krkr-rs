@@ -18,7 +18,9 @@ scripts, `.tjs` scripts, `.xp3` archives). The goal: run a real game end to end.
 | Plugin surface (`Plugins.link`) | ✅ emulated as built-in natives (csvParser, fstat, windowEx, KAGParser, menu, extrans, wuvorbis) |
 | TLG5/TLG6 image decode | ✅ real KiriKiri formats (byte-identical to reference) |
 | Logo → Title scene flow | ✅ full logo → ATTENTION → title transition completes (verified headlessly) |
-| Input bridge (mouse/key → script) | ✅ wired; click-through verification pending |
+| Input bridge (mouse/key → script) | ✅ wired; layer hit-testing + title menu clicks |
+| Window resizing | ✅ camera scales the 1280×720 scene (aspect-preserving) |
+| Graceful quit | ✅ window close + `System.exit`/`terminate` → `AppExit` |
 | Audio (BGM/SE/voice) | ✅ rodio output; real Ogg Opus/Vorbis decode (symphonia 0.6) |
 | GPU blend modes | ✅ `layer.type` → real blend states (over / add / reverse-subtract / replace) |
 | ADV scenario loop | 🔶 KAGParser natives in; needs text + hit-test verification |

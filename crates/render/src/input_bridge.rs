@@ -759,6 +759,9 @@ pub(crate) fn dispatch_to_windows(engine: &Tjs2Engine, scene: &Scene, events: &F
             );
         }
         for &b in &events.button_down {
+            if std::env::var_os("KRKR_INPUT_TRACE").is_some() {
+                eprintln!("[input] window #{} onMouseDown button={b}", win.id);
+            }
             call_guarded(
                 engine,
                 id,
@@ -772,6 +775,9 @@ pub(crate) fn dispatch_to_windows(engine: &Tjs2Engine, scene: &Scene, events: &F
             );
         }
         for &b in &events.button_up {
+            if std::env::var_os("KRKR_INPUT_TRACE").is_some() {
+                eprintln!("[input] window #{} onMouseUp button={b}", win.id);
+            }
             call_guarded(
                 engine,
                 id,

@@ -50,6 +50,7 @@ pub use plugin_stubs::register_plugin_stubs;
 pub use plugins::register_plugins;
 pub use system::{
     SystemContext, continuous_handler_poll, register_system, set_key_state, set_system_context,
+    take_exit_request,
 };
 
 use std::cell::RefCell;

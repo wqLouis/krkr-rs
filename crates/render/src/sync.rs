@@ -65,7 +65,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use bevy::asset::{Assets, Handle, RenderAssetUsages};
-use bevy::camera::{Camera2d, ClearColorConfig};
+use bevy::camera::{Camera2d, ClearColorConfig, OrthographicProjection, Projection, ScalingMode};
 use bevy::color::Color;
 use bevy::ecs::prelude::{Commands, Component, Entity, Query, Res, ResMut, Resource, With};
 use bevy::image::Image;
@@ -187,6 +187,38 @@ pub struct SceneSprite {
 #[derive(Component)]
 pub struct SceneCamera;
 
+/// The logical scene size used when a window carries a degenerate
+/// (`0 × 0`) [`WindowState::inner_size`](tvp_visual::scene::WindowState::inner_size).
+pub const DEFAULT_LOGICAL_SIZE: (u32, u32) = (1280, 720);
+
+/// Logical scene size for a window: its `inner_size`, or
+/// [`DEFAULT_LOGICAL_SIZE`] when that is zero-sized.
+fn logical_size(inner_size: (u32, u32)) -> (u32, u32) {
+    if inner_size.0 == 0 || inner_size.1 == 0 {
+        DEFAULT_LOGICAL_SIZE
+    } else {
+        inner_size
+    }
+}
+
+/// The orthographic 2D projection for a logical scene of `inner_size` world
+/// units.
+///
+/// `ScalingMode::AutoMin` keeps the aspect ratio and never shows less than
+/// the logical scene: resizing the OS window *scales* the game (no
+/// stretching), letterboxing extra space on the non-16:9 axis. (`Fixed`
+/// would stretch the scene instead, which distorts a visual novel.)
+fn scene_projection(inner_size: (u32, u32)) -> Projection {
+    let (width, height) = logical_size(inner_size);
+    Projection::Orthographic(OrthographicProjection {
+        scaling_mode: ScalingMode::AutoMin {
+            min_width: width as f32,
+            min_height: height as f32,
+        },
+        ..OrthographicProjection::default_2d()
+    })
+}
+
 /// The scene → Bevy sync system. Run in `Update`, after the VM tick mutates
 /// the scene.
 #[allow(clippy::too_many_arguments)]
@@ -240,6 +272,7 @@ pub fn sync_scene(
             commands.spawn((
                 SceneCamera,
                 Camera2d,
+                scene_projection(window.inner_size),
                 Camera {
                     clear_color: ClearColorConfig::Custom(Color::srgb(0.0, 0.0, 0.0)),
                     ..Default::default()
@@ -773,6 +806,60 @@ mod tests {
         // The dirty flag was cleared after upload.
         let scene = shared.0.read().unwrap();
         assert!(!scene.bitmap(bmp).unwrap().dirty);
+    }
+
+    /// The camera must pin the visible world to the window's logical
+    /// `inner_size`, so resizing the OS window scales the game instead of
+    /// revealing more/less of the 1280x720 scene.
+    #[test]
+    fn camera_projection_is_fixed_logical_scene() {
+        let mut scene = Scene::default();
+        scene.add_window("t", (1280, 720));
+        let shared = SharedScene(Arc::new(RwLock::new(scene)));
+        let mut app = app_with_sync(shared);
+        app.update();
+
+        let world = app.world_mut();
+        let mut q = world.query_filtered::<&Projection, With<SceneCamera>>();
+        let projection = q.single(world).expect("camera spawned with a projection");
+        let Projection::Orthographic(ortho) = projection else {
+            panic!("expected an orthographic 2D projection, got {projection:?}");
+        };
+        assert!(
+            matches!(
+                ortho.scaling_mode,
+                ScalingMode::AutoMin { min_width, min_height }
+                    if min_width == 1280.0 && min_height == 720.0
+            ),
+            "projection must fit the 1280x720 logical scene, got {:?}",
+            ortho.scaling_mode
+        );
+    }
+
+    /// A window without a usable inner size falls back to 1280x720.
+    #[test]
+    fn camera_projection_falls_back_to_1280x720() {
+        let mut scene = Scene::default();
+        scene.add_window("t", (0, 0));
+        let shared = SharedScene(Arc::new(RwLock::new(scene)));
+        let mut app = app_with_sync(shared);
+        app.update();
+
+        let world = app.world_mut();
+        let mut q = world.query_filtered::<&Projection, With<SceneCamera>>();
+        let projection = q.single(world).expect("camera spawned with a projection");
+        let Projection::Orthographic(ortho) = projection else {
+            panic!("expected an orthographic 2D projection, got {projection:?}");
+        };
+        assert!(
+            matches!(
+                ortho.scaling_mode,
+                ScalingMode::AutoMin { min_width, min_height }
+                    if min_width == 1280.0 && min_height == 720.0
+            ),
+            "degenerate window size must fall back to 1280x720, got {:?}",
+            ortho.scaling_mode
+        );
     }
 
     #[test]
