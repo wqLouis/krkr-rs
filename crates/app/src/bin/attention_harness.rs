@@ -128,7 +128,52 @@ fn main() {
     }
 
     probe(&engine, started.elapsed().as_millis() as u64);
+    dump_scene(&scene);
     println!("harness: done");
+}
+
+/// Dump the logical scene at the end so the title layout can be inspected
+/// without a GPU (positions, image rects, sizes, bitmaps).
+fn dump_scene(shared: &Arc<RwLock<Scene>>) {
+    let scene = shared.read().unwrap_or_else(|p| p.into_inner());
+    println!("--- scene dump ---");
+    for w in &scene.windows {
+        println!(
+            "window #{} \"{}\" inner={}x{} layers={:?} primary={:?}",
+            w.id, w.title, w.inner_size.0, w.inner_size.1, w.layers, w.primary_layer
+        );
+    }
+    println!("layers: {}", scene.layers.len());
+    for l in &scene.layers {
+        println!(
+            "  L#{:<3} win={} parent={:?} rect=({},{},{}x{}) img=(l{} t{} {}x{}) bmp={:?} vis={} op={:.2} type={} z={}",
+            l.id,
+            l.window,
+            l.parent,
+            l.rect.x,
+            l.rect.y,
+            l.rect.w,
+            l.rect.h,
+            l.image_left,
+            l.image_top,
+            l.image_width,
+            l.image_height,
+            l.bitmap,
+            l.visible,
+            l.opacity,
+            l.blend_type,
+            l.z_order,
+        );
+    }
+    println!(
+        "bitmaps: {:?}",
+        scene
+            .bitmaps
+            .iter()
+            .map(|b| (b.id, b.width, b.height, b.name.clone()))
+            .collect::<Vec<_>>()
+    );
+    println!("--- end scene dump ---");
 }
 
 static STUCK_STAGE: std::sync::OnceLock<Arc<Mutex<String>>> = std::sync::OnceLock::new();

@@ -217,6 +217,46 @@ extern "C" fn layer_set_pos(
     0
 }
 
+/// Reference `InternalSetImageSize`: set the drawn image size, keeping the
+/// image covering the layer rect (shrinking the layer or shifting the image
+/// offset as needed).
+fn internal_set_image_size(layer: &mut LayerState, width: u32, height: u32) {
+    if width < layer.rect.w {
+        layer.image_left = 0;
+        layer.rect.w = width;
+    }
+    if (width as i32 + layer.image_left) < layer.rect.w as i32 {
+        layer.image_left = layer.rect.w as i32 - width as i32;
+    }
+    if height < layer.rect.h {
+        layer.image_top = 0;
+        layer.rect.h = height;
+    }
+    if (height as i32 + layer.image_top) < layer.rect.h as i32 {
+        layer.image_top = layer.rect.h as i32 - height as i32;
+    }
+    layer.image_width = width;
+    layer.image_height = height;
+}
+
+/// Reference `ImageLayerSizeChanged`: after the layer rect changes, keep the
+/// image at least as large as the layer and its offset such that the layer
+/// stays covered.
+fn image_layer_size_changed(layer: &mut LayerState) {
+    if layer.image_width < layer.rect.w {
+        layer.image_width = layer.rect.w;
+    }
+    if (layer.image_width as i32 + layer.image_left) < layer.rect.w as i32 {
+        layer.image_left = layer.rect.w as i32 - layer.image_width as i32;
+    }
+    if layer.image_height < layer.rect.h {
+        layer.image_height = layer.rect.h;
+    }
+    if (layer.image_height as i32 + layer.image_top) < layer.rect.h as i32 {
+        layer.image_top = layer.rect.h as i32 - layer.image_height as i32;
+    }
+}
+
 /// `setSize(w, h)` — set the rect size (negative values clamp to 0).
 extern "C" fn layer_set_size(
     _engine: *mut c_void,
@@ -239,6 +279,102 @@ extern "C" fn layer_set_size(
     };
     layer.rect.w = arg_i64(&args[0]).max(0) as u32;
     layer.rect.h = arg_i64(&args[1]).max(0) as u32;
+    image_layer_size_changed(layer);
+    set_void_out(out);
+    0
+}
+
+/// `setImagePos(x, y)` — reference `SetImagePosition`: place the image inside
+/// the layer (offsets are typically ≤ 0; a sprite sheet uses `-frameW*n`).
+extern "C" fn layer_set_image_pos(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: argv/out/out_error are valid for the call.
+    let args = unsafe { super::ffi::args(argc, argv) };
+    if args.len() < 2 {
+        return error_out(out_error, "Layer.setImagePos requires 2 arguments");
+    }
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let mut scene = context_scene_mut();
+    let Some(layer) = scene.layer_mut(inst.id) else {
+        return error_out(out_error, "Layer: layer no longer exists");
+    };
+    layer.image_left = arg_i64(&args[0]) as i32;
+    layer.image_top = arg_i64(&args[1]) as i32;
+    set_void_out(out);
+    0
+}
+
+/// `setImageSize(w, h)` — reference `SetImageSize`.
+extern "C" fn layer_set_image_size(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: argv/out/out_error are valid for the call.
+    let args = unsafe { super::ffi::args(argc, argv) };
+    if args.len() < 2 {
+        return error_out(out_error, "Layer.setImageSize requires 2 arguments");
+    }
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let mut scene = context_scene_mut();
+    let Some(layer) = scene.layer_mut(inst.id) else {
+        return error_out(out_error, "Layer: layer no longer exists");
+    };
+    internal_set_image_size(
+        layer,
+        arg_i64(&args[0]).max(0) as u32,
+        arg_i64(&args[1]).max(0) as u32,
+    );
+    set_void_out(out);
+    0
+}
+
+/// `copyRect(dx, dy, src, sx, sy, sw, sh)` — the game's `Button.create`
+/// passes a `Bitmap` object and copies the whole sheet into the layer's main
+/// image. Full pixel blitting is not modelled yet; we attach the source
+/// bitmap and size the image to the copied region, which renders the same
+/// for the full-sheet copy the title UI uses.
+extern "C" fn layer_copy_rect(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: argv/out/out_error are valid for the call.
+    let args = unsafe { super::ffi::args(argc, argv) };
+    let Some(src_arg) = args.get(2) else {
+        return error_out(out_error, "Layer.copyRect requires a source image");
+    };
+    let engine = crate::natives::context_engine();
+    let bitmap_id = match resolve_object_id_arg(engine, src_arg) {
+        Ok(id) => id,
+        Err(e) => return error_out(out_error, &e),
+    };
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let mut scene = context_scene_mut();
+    if bitmap_id >= 0 && scene.bitmap(bitmap_id as u32).is_none() {
+        return error_out(out_error, "Layer.copyRect: no such bitmap");
+    }
+    // The copied source region size (args 5/6) if provided, else the bitmap
+    // size; the renderer maps `image_width/height` onto the bitmap pixels.
+    let Some(layer) = scene.layer_mut(inst.id) else {
+        return error_out(out_error, "Layer: layer no longer exists");
+    };
+    layer.bitmap = (bitmap_id >= 0).then_some(bitmap_id as u32);
     set_void_out(out);
     0
 }
@@ -305,8 +441,15 @@ extern "C" fn layer_load_images(
         Ok(id) => id,
         Err(e) => return error_out(out_error, &format!("Layer.loadImages: {e}")),
     };
+    let dims = scene
+        .bitmap(bitmap_id)
+        .map(|b| (b.width, b.height))
+        .unwrap_or((0, 0));
     if let Some(layer) = scene.layer_mut(inst.id) {
         layer.bitmap = Some(bitmap_id);
+        layer.image_left = 0;
+        layer.image_top = 0;
+        internal_set_image_size(layer, dims.0, dims.1);
     }
     // The reference returns an image-tag dictionary (mode/opacity); a
     // retained script object lets `ret.mode`/`ret.opacity` read undefined
@@ -359,8 +502,15 @@ extern "C" fn layer_set_size_to_image_size(
     };
     let mut scene = context_scene_mut();
     if let Some(layer) = scene.layer_mut(inst.id) {
-        layer.rect.w = dims.0;
-        layer.rect.h = dims.1;
+        // Prefer the tracked image size; fall back to the bitmap dims.
+        let (w, h) = if layer.image_width > 0 || layer.image_height > 0 {
+            (layer.image_width, layer.image_height)
+        } else {
+            dims
+        };
+        layer.rect.w = w;
+        layer.rect.h = h;
+        image_layer_size_changed(layer);
     }
     set_void_out(out);
     0
@@ -590,19 +740,19 @@ layer_int_prop!(
     |l: &LayerState| i64::from(l.hold_alpha),
     |l: &mut LayerState, v: &Value| l.hold_alpha = arg_bool(v)
 );
-// `imageLeft` / `imageTop` currently alias the rect position (a later wave
-// adds real image-offset state).
+// `imageLeft` / `imageTop` — the image's offset inside the layer (reference
+// `ImageLeft`/`ImageTop`; negative selects a sprite-sheet frame).
 layer_int_prop!(
     layer_image_left_get,
     layer_image_left_set,
-    |l: &LayerState| i64::from(l.rect.x),
-    |l: &mut LayerState, v: &Value| l.rect.x = arg_i64(v) as i32
+    |l: &LayerState| i64::from(l.image_left),
+    |l: &mut LayerState, v: &Value| l.image_left = arg_i64(v) as i32
 );
 layer_int_prop!(
     layer_image_top_get,
     layer_image_top_set,
-    |l: &LayerState| i64::from(l.rect.y),
-    |l: &mut LayerState, v: &Value| l.rect.y = arg_i64(v) as i32
+    |l: &LayerState| i64::from(l.image_top),
+    |l: &mut LayerState, v: &Value| l.image_top = arg_i64(v) as i32
 );
 
 /// `opacity` — layer opacity in TJS2's 0..255 scale. The scene stores
@@ -642,7 +792,8 @@ extern "C" fn layer_opacity_set(
     0
 }
 
-/// `imageWidth` — the attached bitmap's width (0 when no bitmap).
+/// `imageWidth` — the drawn image width (the tracked `ImageWidth`, which
+/// `loadImages`/`setImageSize` set; falls back to the bitmap width).
 extern "C" fn layer_image_width_get(
     _engine: *mut c_void,
     instance: *mut c_void,
@@ -655,10 +806,14 @@ extern "C" fn layer_image_width_get(
     let Some(layer) = scene.layer(inst.id) else {
         return error_out(out_error, "Layer: layer no longer exists");
     };
-    let w = layer
-        .bitmap
-        .and_then(|id| scene.bitmap(id))
-        .map_or(0, |b| b.width);
+    let w = if layer.image_width > 0 {
+        layer.image_width
+    } else {
+        layer
+            .bitmap
+            .and_then(|id| scene.bitmap(id))
+            .map_or(0, |b| b.width)
+    };
     set_int_out(out, i64::from(w));
     0
 }
@@ -676,10 +831,14 @@ extern "C" fn layer_image_height_get(
     let Some(layer) = scene.layer(inst.id) else {
         return error_out(out_error, "Layer: layer no longer exists");
     };
-    let h = layer
-        .bitmap
-        .and_then(|id| scene.bitmap(id))
-        .map_or(0, |b| b.height);
+    let h = if layer.image_height > 0 {
+        layer.image_height
+    } else {
+        layer
+            .bitmap
+            .and_then(|id| scene.bitmap(id))
+            .map_or(0, |b| b.height)
+    };
     set_int_out(out, i64::from(h));
     0
 }
@@ -1391,8 +1550,6 @@ pub(crate) fn register_layer(engine: &Tjs2Engine) -> Result<(), String> {
     let noop_stubs = [
         "setCenter",
         "setAffineOffset",
-        "setImagePos",
-        "setImageSize",
         "drawGlyph",
         "drawRectangle",
         "drawRectangles",
@@ -1427,7 +1584,6 @@ pub(crate) fn register_layer(engine: &Tjs2Engine) -> Result<(), String> {
         "stretchBlend",
         "pileRect",
         "piledCopy",
-        "copyRect",
         "blendRect",
         "operateRect",
         "operateStretch",
@@ -1509,6 +1665,18 @@ pub(crate) fn register_layer(engine: &Tjs2Engine) -> Result<(), String> {
         NativeInstanceMethodDef {
             name: "copyFromBitmapToMainImage",
             f: layer_copy_from_bitmap_to_main_image,
+        },
+        NativeInstanceMethodDef {
+            name: "setImagePos",
+            f: layer_set_image_pos,
+        },
+        NativeInstanceMethodDef {
+            name: "setImageSize",
+            f: layer_set_image_size,
+        },
+        NativeInstanceMethodDef {
+            name: "copyRect",
+            f: layer_copy_rect,
         },
         NativeInstanceMethodDef {
             name: "bringToFront",

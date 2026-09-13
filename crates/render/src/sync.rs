@@ -260,10 +260,10 @@ pub fn sync_scene(
             let Some(composed) = compose_layer(&scene, layer_id) else {
                 continue;
             };
-            let (x, y) = rect_center(composed.rect, win_w, win_h);
             let alpha = win_opacity * composed.opacity;
-            let visual = build_layer_visual(
+            let (visual, draw_rect) = build_layer_visual(
                 layer,
+                composed.rect,
                 alpha,
                 &mut bitmaps,
                 &scene,
@@ -274,6 +274,7 @@ pub fn sync_scene(
                 &mut gpu,
                 &mut frame_materials.0,
             );
+            let (x, y) = rect_center(draw_rect, win_w, win_h);
             let transform = Transform::from_xyz(x, y, sprite_z(index));
             let visibility = if composed.visible {
                 Visibility::Visible
@@ -284,7 +285,7 @@ pub fn sync_scene(
                 layer_id,
                 blend_type: layer.blend_type,
             };
-            // Blended quads reuse the shared unit quad scaled to the layer
+            // Blended quads reuse the shared unit quad scaled to the drawn
             // rect; sprites carry their size via custom_size instead.
             let sprite = match visual {
                 LayerVisual::Sprite(sprite) => {
@@ -292,7 +293,7 @@ pub fn sync_scene(
                 }
                 LayerVisual::Blended { mesh, material } => {
                     let mut transform = transform;
-                    transform.scale = Vec3::new(layer.rect.w as f32, layer.rect.h as f32, 1.0);
+                    transform.scale = Vec3::new(draw_rect.w as f32, draw_rect.h as f32, 1.0);
                     commands.spawn((
                         marker,
                         Mesh2d(mesh),
@@ -331,6 +332,11 @@ enum LayerVisual {
 
 /// Build the visual for one layer.
 ///
+/// `layer_rect` is the layer's **absolute** (composed) rect; image placement
+/// is relative to it. Returns the visual plus the screen rect it should be
+/// positioned at (the clipped image rect for bitmap layers, the layer rect
+/// for fills).
+///
 /// The native blend type decides the render path ([`render_path_for`]):
 /// * source-over modes (and unknown types) → built-in [`Sprite`] (straight
 ///   alpha, unchanged from earlier milestones);
@@ -340,13 +346,16 @@ enum LayerVisual {
 ///
 /// Content rules are shared by both paths:
 /// * Bitmap layer → texture from [`BitmapAssets`], white tint at the
-///   composed alpha (the texture carries the RGB/alpha).
+///   composed alpha; only the image region visible inside the layer rect is
+///   drawn (reference `ImageLeft`/`ImageTop`/`ImageWidth`/`ImageHeight`,
+///   which is how the game's buttons select a sprite-sheet frame).
 /// * Fill layer → solid color from `fill_color` (straight alpha), alpha
 ///   multiplied with the composed window × layer opacity; on the material
 ///   path a shared 1×1 white texture stands in for the bitmap.
 #[allow(clippy::too_many_arguments)]
 fn build_layer_visual(
     layer: &LayerState,
+    layer_rect: Rect,
     alpha: f32,
     bitmaps: &mut BitmapAssets,
     scene: &Scene,
@@ -356,31 +365,77 @@ fn build_layer_visual(
     materials: &mut Assets<LayerBlendMaterial>,
     gpu: &mut GpuPrimitives,
     frame_materials: &mut Vec<Handle<LayerBlendMaterial>>,
-) -> LayerVisual {
+) -> (LayerVisual, Rect) {
     let path = render_path_for(layer.blend_type, alpha);
-    let size = Vec2::new(layer.rect.w as f32, layer.rect.h as f32);
+    let size = Vec2::new(layer_rect.w as f32, layer_rect.h as f32);
 
     match path {
         LayerRenderPath::Sprite => {
-            let sprite = match layer
+            if let Some(bitmap) = layer
                 .bitmap
                 .and_then(|id| bitmaps.handle_for(id, scene, images, uploaded))
             {
-                Some(handle) => Sprite {
-                    image: handle,
-                    color: bitmap_tint(alpha),
-                    custom_size: Some(size),
-                    ..Default::default()
-                },
-                None => {
-                    let color = layer
-                        .fill_color
-                        .map(|fill| fill_sprite_color(fill, alpha))
-                        .unwrap_or_else(|| Color::srgba(0.0, 0.0, 0.0, clamp_opacity(alpha)));
-                    Sprite::from_color(color, size)
+                let (bmp_w, bmp_h) = layer
+                    .bitmap
+                    .and_then(|id| scene.bitmap(id))
+                    .map_or((1, 1), |b| (b.width.max(1), b.height.max(1)));
+                let (img_w, img_h) = (
+                    if layer.image_width > 0 {
+                        layer.image_width
+                    } else {
+                        bmp_w
+                    },
+                    if layer.image_height > 0 {
+                        layer.image_height
+                    } else {
+                        bmp_h
+                    },
+                );
+                match visible_image_region(
+                    layer_rect,
+                    layer.image_left,
+                    layer.image_top,
+                    img_w,
+                    img_h,
+                    bmp_w,
+                    bmp_h,
+                ) {
+                    Some((src, dest)) => {
+                        let sprite = Sprite {
+                            image: bitmap,
+                            color: bitmap_tint(alpha),
+                            rect: Some(bevy::math::Rect::new(
+                                src.x as f32,
+                                src.y as f32,
+                                (src.x + src.w as i32) as f32,
+                                (src.y + src.h as i32) as f32,
+                            )),
+                            custom_size: Some(Vec2::new(dest.w as f32, dest.h as f32)),
+                            ..Default::default()
+                        };
+                        return (LayerVisual::Sprite(sprite), dest);
+                    }
+                    None => {
+                        // Fully clipped: spawn an invisible zero-size sprite.
+                        let sprite = Sprite {
+                            image: bitmap,
+                            color: Color::NONE,
+                            custom_size: Some(Vec2::ZERO),
+                            rect: Some(bevy::math::Rect::new(0.0, 0.0, 0.0, 0.0)),
+                            ..Default::default()
+                        };
+                        return (LayerVisual::Sprite(sprite), layer_rect);
+                    }
                 }
-            };
-            LayerVisual::Sprite(sprite)
+            }
+            let color = layer
+                .fill_color
+                .map(|fill| fill_sprite_color(fill, alpha))
+                .unwrap_or_else(|| Color::srgba(0.0, 0.0, 0.0, clamp_opacity(alpha)));
+            (
+                LayerVisual::Sprite(Sprite::from_color(color, size)),
+                layer_rect,
+            )
         }
         LayerRenderPath::Material(mode) => {
             // Bitmap texture if present, else a shared white 1×1 stand-in
@@ -419,10 +474,13 @@ fn build_layer_visual(
                 .clone();
             let material = materials.add(LayerBlendMaterial::new(color.to_linear(), texture, mode));
             frame_materials.push(material.clone());
-            LayerVisual::Blended {
-                mesh: quad,
-                material,
-            }
+            (
+                LayerVisual::Blended {
+                    mesh: quad,
+                    material,
+                },
+                layer_rect,
+            )
         }
     }
 }
@@ -476,6 +534,74 @@ fn compose_layer(scene: &Scene, layer_id: u32) -> Option<ComposedLayer> {
         result.visible &= layer.visible;
     }
     Some(result)
+}
+
+/// Compute the visible part of a layer's image after clipping it to the
+/// layer's absolute rect. Returns `(source_pixels, dest_tvp)`:
+/// * `source_pixels`: the sub-rectangle of the bitmap to sample (bitmap
+///   pixel coordinates).
+/// * `dest_tvp`: the screen-space rect (absolute TVP coordinates) to draw it
+///   at.
+///
+/// This implements the reference `ImageLeft`/`ImageTop`/`ImageWidth`/
+/// `ImageHeight` model: the image is placed at `(layer.x + image_left,
+/// layer.y + image_top)` at size `image_width × image_height`, then clipped
+/// to the layer rect. The game's buttons select a sprite-sheet frame with a
+/// negative `image_left`.
+#[allow(clippy::too_many_arguments)]
+fn visible_image_region(
+    layer_rect: Rect,
+    image_left: i32,
+    image_top: i32,
+    image_width: u32,
+    image_height: u32,
+    bmp_w: u32,
+    bmp_h: u32,
+) -> Option<(Rect, Rect)> {
+    let img_x = layer_rect.x + image_left;
+    let img_y = layer_rect.y + image_top;
+    let vx0 = img_x.max(layer_rect.x);
+    let vy0 = img_y.max(layer_rect.y);
+    let vx1 = (img_x + image_width as i32).min(layer_rect.x + layer_rect.w as i32);
+    let vy1 = (img_y + image_height as i32).min(layer_rect.y + layer_rect.h as i32);
+    if vx1 <= vx0 || vy1 <= vy0 {
+        return None;
+    }
+    let dest = Rect {
+        x: vx0,
+        y: vy0,
+        w: (vx1 - vx0) as u32,
+        h: (vy1 - vy0) as u32,
+    };
+    // `image_width/height` is the drawn size; map the visible region back to
+    // bitmap pixels (equal in the common `loadImages` case).
+    let scale_x = if image_width == 0 {
+        1.0
+    } else {
+        bmp_w as f32 / image_width as f32
+    };
+    let scale_y = if image_height == 0 {
+        1.0
+    } else {
+        bmp_h as f32 / image_height as f32
+    };
+    let sx = (((vx0 - img_x) as f32) * scale_x).floor().max(0.0) as u32;
+    let sy = (((vy0 - img_y) as f32) * scale_y).floor().max(0.0) as u32;
+    let sw = (((dest.w as f32) * scale_x).ceil() as u32)
+        .min(bmp_w.saturating_sub(sx))
+        .max(1);
+    let sh = (((dest.h as f32) * scale_y).ceil() as u32)
+        .min(bmp_h.saturating_sub(sy))
+        .max(1);
+    Some((
+        Rect {
+            x: sx as i32,
+            y: sy as i32,
+            w: sw,
+            h: sh,
+        },
+        dest,
+    ))
 }
 
 /// TVP (y-down, top-left origin) rect center → Bevy (y-up, centered origin)
@@ -1306,5 +1432,98 @@ mod tests {
             ),
             (0.5, -0.5)
         );
+    }
+
+    /// Sprite-sheet frame selection: a 96×32 sheet in a 32×32 layer with
+    /// `imageLeft = -32` shows the middle frame, and the source rect is
+    /// mapped back to bitmap pixels. This is exactly the game's
+    /// `Button.setButton(n)` path.
+    #[test]
+    fn visible_image_region_selects_sprite_frame() {
+        let layer = Rect {
+            x: 100,
+            y: 100,
+            w: 32,
+            h: 32,
+        };
+        let (src, dest) = visible_image_region(layer, -32, 0, 96, 32, 96, 32).unwrap();
+        assert_eq!(
+            src,
+            Rect {
+                x: 32,
+                y: 0,
+                w: 32,
+                h: 32
+            }
+        );
+        assert_eq!(
+            dest,
+            Rect {
+                x: 100,
+                y: 100,
+                w: 32,
+                h: 32
+            }
+        );
+
+        // First frame (no offset).
+        let (src, _) = visible_image_region(layer, 0, 0, 96, 32, 96, 32).unwrap();
+        assert_eq!(
+            src,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 32,
+                h: 32
+            }
+        );
+        // Third frame.
+        let (src, _) = visible_image_region(layer, -64, 0, 96, 32, 96, 32).unwrap();
+        assert_eq!(
+            src,
+            Rect {
+                x: 64,
+                y: 0,
+                w: 32,
+                h: 32
+            }
+        );
+    }
+
+    /// A large image is clipped to the layer: the visible dest is the layer
+    /// rect and the source is the matching region of the bitmap.
+    #[test]
+    fn visible_image_region_clips_large_image() {
+        // A 100×100 layer showing a 200×200 image offset by (-20,-30):
+        // visible screen rect = (x+? ...) clipped to the layer.
+        let layer = Rect {
+            x: 50,
+            y: 60,
+            w: 100,
+            h: 100,
+        };
+        let (src, dest) = visible_image_region(layer, -20, -30, 200, 200, 200, 200).unwrap();
+        assert_eq!(
+            dest,
+            Rect {
+                x: 50,
+                y: 60,
+                w: 100,
+                h: 100
+            }
+        );
+        assert_eq!(
+            src,
+            Rect {
+                x: 20,
+                y: 30,
+                w: 100,
+                h: 100
+            }
+        );
+
+        // An image placed entirely outside the layer yields nothing.
+        assert!(visible_image_region(layer, -500, 0, 200, 200, 200, 200).is_none());
+        assert!(visible_image_region(layer, 0, -500, 200, 200, 200, 200).is_none());
     }
 }

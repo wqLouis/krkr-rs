@@ -124,16 +124,26 @@ fn game_init_pattern_populates_scene() {
         assert_eq!(scene.layers.len(), 1);
         let layer = &scene.layers[0];
         assert_eq!(layer.window, win.id);
+        // `fillRect` set the rect to 1280×720, but the following `loadImages`
+        // replaces the main image and resizes the layer to the 64×48 bitmap
+        // (reference `InternalSetImageSize`), which is exactly what the game's
+        // sprite layers rely on.
         assert_eq!(
             layer.rect,
             tvp_visual::scene::Rect {
                 x: 0,
                 y: 0,
-                w: 1280,
-                h: 720
+                w: img_w,
+                h: img_h
             },
-            "fillRect sets the layer rect"
+            "loadImages resizes the layer to the loaded image"
         );
+        assert_eq!(
+            (layer.image_width, layer.image_height),
+            (img_w, img_h),
+            "image size tracks the loaded bitmap"
+        );
+        assert_eq!((layer.image_left, layer.image_top), (0, 0));
         // 0xffffffff -> straight-alpha RGBA white.
         assert_eq!(layer.fill_color, Some([255, 255, 255, 255]));
         assert_eq!(layer.z_order, 1, "absolute = 1");

@@ -56,6 +56,14 @@ pub struct LayerState {
     pub z_order: i32,
     /// Solid fill (RGBA, straight alpha) used when there is no bitmap.
     pub fill_color: Option<[u8; 4]>,
+    /// Image placement inside the layer (reference `ImageLeft`/`ImageTop`,
+    /// typically ≤ 0) and the drawn image size (`ImageWidth`/`ImageHeight`,
+    /// may exceed the layer rect — the layer clips it). The game's buttons
+    /// use a sprite sheet here: `setImagePos(-frameW*n, 0)` selects a frame.
+    pub image_left: i32,
+    pub image_top: i32,
+    pub image_width: u32,
+    pub image_height: u32,
     pub hit_threshold: i32,
     /// Hit-test mode (reference `tTVPHitType`): `htMask=0` (per-pixel
     /// threshold) or `htProvince=1` (non-transparent province). Stored so
@@ -187,6 +195,10 @@ impl Scene {
             blend_type: LT_ALPHA,
             z_order: 0,
             fill_color: None,
+            image_left: 0,
+            image_top: 0,
+            image_width: 0,
+            image_height: 0,
             hit_threshold: 0,
             hit_type: 0,
             cursor: 0,
