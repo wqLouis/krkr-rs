@@ -148,6 +148,22 @@ int tjs2_prop_get(void *engine, tjs2_value_id id, const char *membername,
                   tjs2_value *out, char **out_error);
 
 /*
+ * Write a named property on a retained object value (PropSet through the
+ * object's class chain). TJS_MEMBERENSURE is passed, matching the flag the
+ * VM uses for plain assignment (tjsInterCodeExec.cpp:1182): a missing member
+ * is created, and an existing native or script property setter is invoked.
+ *
+ * `value` is a tjs2_value produced by the Rust side (scalars/strings,
+ * octets, null, or a TJS2_VAL_RETAINED id, which is consumed). Writing to an
+ * invalid/invalidated object, a read-only property, or an unknown member is
+ * reported as a catchable error. Same error convention as tjs2_prop_get:
+ * returns 0 on success; on failure returns non-zero with a malloc'd UTF-8
+ * message in out_error.
+ */
+int tjs2_prop_set(void *engine, tjs2_value_id id, const char *membername,
+                  const tjs2_value *value, char **out_error);
+
+/*
  * Native class registration (static methods only for this milestone).
  *
  * The VM is single-threaded: register classes only from the thread that

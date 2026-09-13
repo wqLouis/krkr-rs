@@ -281,6 +281,16 @@ unsafe extern "C" {
         out: *mut Value,
         out_error: *mut *mut c_char,
     ) -> c_int;
+    /// Write a named property on a retained object value through its class
+    /// chain (`PropSet`, with `TJS_MEMBERENSURE` so a missing member is
+    /// created and an existing property setter is invoked).
+    fn tjs2_prop_set(
+        engine: *mut Engine,
+        id: Tjs2ValueId,
+        membername: *const c_char,
+        value: *const Value,
+        out_error: *mut *mut c_char,
+    ) -> c_int;
     /// Invoke a named member on a retained object value (member lookup
     /// goes through the object's own class chain, so script-subclass
     /// overrides win over native methods).
@@ -1081,6 +1091,34 @@ name), and none was available"
         }
         // SAFETY: `out` was filled by the C++ side on success.
         Ok(unsafe { take_value(&out) })
+    }
+
+    /// Write a named property on a retained object value through its class
+    /// chain (`PropSet`). `TJS_MEMBERENSURE` semantics match TJS plain
+    /// assignment: a missing member is created, and an existing native or
+    /// script property setter is invoked. `value` may be a scalar/string, an
+    /// octet, null, or a [`TjsValue::Retained`] id (the retention is consumed
+    /// by the write).
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn set_member(
+        &self,
+        id: Tjs2ValueId,
+        membername: &str,
+        value: &TjsValue,
+    ) -> Result<(), String> {
+        let mut strings = Vec::new();
+        let ffi = value_to_ffi(value, &mut strings)?;
+        let name = std::ffi::CString::new(membername)
+            .map_err(|_| "member name contains a NUL byte".to_string())?;
+        let mut error: *mut c_char = ptr::null_mut();
+        // SAFETY: self.inner is a live engine and id is a live retained id;
+        // name/value (including any string storage in `strings`) follow the
+        // ABI contract for the duration of the call.
+        let rc = unsafe { tjs2_prop_set(self.inner, id, name.as_ptr(), &ffi, &mut error) };
+        if rc != 0 {
+            return Err(unsafe { take_error_string(error) });
+        }
+        Ok(())
     }
 
     /// Invoke a retained detached value (see [`Self::retain_value_detached`]).
@@ -3247,5 +3285,111 @@ var ra = a.get(); var rb = b.get();",
                 .unwrap(),
             TjsValue::Integer(258_004)
         );
+    }
+
+    // --- property writes (tjs2_prop_set) -------------------------------
+
+    #[test]
+    fn prop_set_creates_and_reads_back_members_on_plain_object() {
+        let _vm_lock = vm_lock();
+        let e = Tjs2Engine::new().unwrap();
+        e.exec_script("var o = %[];", "test").unwrap();
+        let v = e.eval("o", "test").unwrap();
+        let id = e.retain_value_detached(&v).unwrap();
+        // New members are created (TJS_MEMBERENSURE); scalars and strings.
+        e.set_member(id.raw_id(), "x", &TjsValue::Integer(42))
+            .unwrap();
+        e.set_member(id.raw_id(), "name", &TjsValue::String("hi".into()))
+            .unwrap();
+        e.set_member(id.raw_id(), "r", &TjsValue::Real(1.5))
+            .unwrap();
+        assert_eq!(
+            e.get_member(id.raw_id(), "x").unwrap(),
+            TjsValue::Integer(42)
+        );
+        assert_eq!(
+            e.get_member(id.raw_id(), "name").unwrap(),
+            TjsValue::String("hi".into())
+        );
+        assert_eq!(e.get_member(id.raw_id(), "r").unwrap(), TjsValue::Real(1.5));
+        // The writes are visible to the script's own reference to the object.
+        e.exec_script("var got = o.x; var gotname = o.name;", "test")
+            .unwrap();
+        assert_eq!(e.eval("got", "test").unwrap(), TjsValue::Integer(42));
+        assert_eq!(
+            e.eval("gotname", "test").unwrap(),
+            TjsValue::String("hi".into())
+        );
+    }
+
+    #[test]
+    fn prop_set_invokes_native_instance_property_setter() {
+        let _vm_lock = vm_lock();
+        let e = Tjs2Engine::new().unwrap();
+        e.register_native_class_instance(&counter_builder())
+            .unwrap();
+        e.exec_script("var c = new Counter();", "test").unwrap();
+        let v = e.eval("c", "test").unwrap();
+        let id = e.retain_value_detached(&v).unwrap();
+        // The write must run the native setter (Counter.value).
+        e.set_member(id.raw_id(), "value", &TjsValue::Integer(7))
+            .unwrap();
+        assert_eq!(
+            e.get_member(id.raw_id(), "value").unwrap(),
+            TjsValue::Integer(7)
+        );
+        e.exec_script("var got = c.value;", "test").unwrap();
+        assert_eq!(e.eval("got", "test").unwrap(), TjsValue::Integer(7));
+        // Read-only native property: the write is denied as a clean error.
+        let err = e
+            .set_member(id.raw_id(), "readonly", &TjsValue::Integer(1))
+            .unwrap_err();
+        assert!(!err.is_empty(), "expected a denied-write error: {err}");
+    }
+
+    #[test]
+    fn prop_set_accepts_retained_object_values() {
+        let _vm_lock = vm_lock();
+        let e = Tjs2Engine::new().unwrap();
+        e.exec_script("var parent = %[]; var child = %[]; child.flag = 9;", "test")
+            .unwrap();
+        let p = e.eval("parent", "test").unwrap();
+        let pid = e.retain_value_detached(&p).unwrap();
+        let c = e.eval("child", "test").unwrap();
+        let cid = e.retain_value_detached(&c).unwrap();
+        // parent.child = <retained child>; the VAL_RETAINED conversion
+        // consumes the child retention.
+        e.set_member(
+            pid.raw_id(),
+            "child",
+            &TjsValue::Retained(cid.raw_id() as u64),
+        )
+        .unwrap();
+        e.exec_script("var f = parent.child.flag;", "test").unwrap();
+        assert_eq!(e.eval("f", "test").unwrap(), TjsValue::Integer(9));
+    }
+
+    #[test]
+    fn prop_set_errors_cleanly_for_null_and_invalidated_objects() {
+        let _vm_lock = vm_lock();
+        let e = Tjs2Engine::new().unwrap();
+        e.register_native_class_instance(&counter_builder())
+            .unwrap();
+        // Unknown/null retained id.
+        let err = e
+            .set_member(std::ptr::null_mut(), "x", &TjsValue::Integer(1))
+            .unwrap_err();
+        assert!(!err.is_empty(), "null id must error: {err}");
+        // Invalidated object: finalize deletes its members, so PropSet returns
+        // TJS_E_INVALIDOBJECT. The global `c` (and the retained id) keep it
+        // alive, so this exercises the validity guard, not a dangling object.
+        e.exec_script("var c = new Counter(); invalidate c;", "test")
+            .unwrap();
+        let v = e.eval("c", "test").unwrap();
+        let id = e.retain_value_detached(&v).unwrap();
+        let err = e
+            .set_member(id.raw_id(), "value", &TjsValue::Integer(3))
+            .unwrap_err();
+        assert!(!err.is_empty(), "invalidated object must error: {err}");
     }
 }

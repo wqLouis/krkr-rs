@@ -1901,4 +1901,65 @@ int tjs2_prop_get(void *engine, tjs2_value_id id, const char *membername,
     }
 }
 
+// Write a named property on a retained object value through its class chain
+// (PropSet). TJS_MEMBERENSURE matches the VM's plain-assignment flag
+// (tjsInterCodeExec.cpp:1182), so a missing member is created and an existing
+// native/script property setter runs. The closure resolves objthis exactly
+// like tjs2_prop_get/tjs2_call_member (tjsVariant.h:261-269). Same error
+// convention as tjs2_prop_get.
+int tjs2_prop_set(void *engine, tjs2_value_id id, const char *membername,
+                  const tjs2_value *value, char **out_error) {
+    tjs2_engine *e = (tjs2_engine *)engine;
+    if(!e || !id || !membername || !value) {
+        if(out_error)
+            *out_error = make_error_string("invalid retained value");
+        return 1;
+    }
+    try {
+        // Validate the target before converting the value: conversion can
+        // consume a TJS2_VAL_RETAINED entry (possibly the target itself), so
+        // re-resolve the closure afterwards.
+        if(e->retained.find((uintptr_t)id) == e->retained.end()) {
+            if(out_error)
+                *out_error = make_error_string("invalid retained value");
+            return 1;
+        }
+        TJS::tTJSVariant var;
+        value_to_variant(e, value, &var);
+        auto it = e->retained.find((uintptr_t)id);
+        if(it == e->retained.end()) {
+            if(out_error)
+                *out_error = make_error_string("invalid retained value");
+            return 1;
+        }
+        std::u16string member16 = utf8_to_u16(membername);
+        TJS::tTJSVariantClosure clo =
+            it->second.AsObjectClosureNoAddRef(); // throws if not an object
+        tjs_error hr = clo.PropSet(TJS_MEMBERENSURE, member16.c_str(), nullptr,
+                                   &var, nullptr);
+        if(TJS_FAILED(hr))
+            TJSThrowFrom_tjs_error(hr, member16.c_str()); // -> catch below
+        if(out_error)
+            *out_error = nullptr;
+        return 0;
+    } catch(const TJS::eTJS &err) {
+        if(out_error)
+            *out_error = make_error_message(err);
+        return 1;
+    } catch(const std::exception &err) {
+        if(out_error) {
+            std::string m = std::string("C++ exception: ") + err.what();
+            char *buf = (char *)malloc(m.size() + 1);
+            if(buf)
+                std::memcpy(buf, m.c_str(), m.size() + 1);
+            *out_error = buf;
+        }
+        return 1;
+    } catch(...) {
+        if(out_error)
+            *out_error = make_error_string("prop_set failed");
+        return 1;
+    }
+}
+
 } // extern "C"
