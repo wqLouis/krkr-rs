@@ -5,8 +5,10 @@
 //! Implemented methods:
 //!
 //! * `inform` — logs at `info!` (the reference shows a modal message box).
+//! * `inputString` — logs at `info!` and returns the initial value (the
+//!   headless "OK" path; the reference shows a modal input box).
 //! * `getTickCount` — milliseconds since an arbitrary epoch (first call).
-//! * `getKeyState` — stub, always false (input natives are a later wave).
+//! * `getKeyState` — real, wired from the host input bridge.
 //! * `shellExecute` — launches with the platform opener (`xdg-open` /
 //!   `open` / `cmd start`).
 //! * `system` — stub returning 0 (the reference's `_wsystem` is commented
@@ -14,7 +16,8 @@
 //! * `readRegValue` — stub returning void (registry not implemented).
 //! * `getArgument` / `setArgument` — process-global command-line arguments
 //!   (see below).
-//! * `createAppLock` — stub returning false (app lock not implemented).
+//! * `createAppLock` — returns true (single-process emulator: first
+//!   instance wins).
 //! * `dumpHeap` — void no-op, as in the reference (`TVPHeapDump` commented
 //!   out).
 //! * `nullpo` — the reference deliberately crashes (`*(int*)0 = 0` /
@@ -22,6 +25,12 @@
 //!   aborting.
 //! * `showVersion` — logs the version at `info!` (the reference's version
 //!   dialog is commented out).
+//! * `toActualColor` — real `TVPToActualColor` (`ColorToRGB` table + the
+//!   RGB byte-order swap).
+//! * `clearGraphicCache` / `touchImages` — no-ops (no global image cache).
+//! * `createUUID` — real RFC-4122 v4 UUID from a clock/counter/address seed.
+//! * `assignMessage` — stores an `id` → `message` override and returns true.
+//! * `doCompact` — no-op (compaction is a GC hint).
 //!
 //! # `setArgument` / `getArgument` semantics
 //!
@@ -33,30 +42,31 @@
 //!   stores the key `"-debugwin"`; there is no implicit dash insertion or
 //!   stripping (the reference only adds a dash when parsing *config-file*
 //!   options at startup, not in `setArgument`/`getArgument`).
-//! * Arguments are `name=value` pairs. `setArgument(name, value)` stores
-//!   `name` → `value`, replacing any previous value (the reference replaces
-//!   the matching entry) or inserting a new one.
-//! * `getArgument(name [, default])` returns the stored value. When the
-//!   name is missing it returns `default` if a second argument was given
-//!   (preserving its type), otherwise void — the reference's
-//!   `result->Clear()`. In the reference an argument stored without `=`
-//!   (possible only via startup config parsing) reads back as the string
-//!   `"yes"`; this port always stores explicit values, so that case never
-//!   arises from `setArgument`.
+//! * Arguments are `name=value` pairs stored in an ordered vector, exactly
+//!   like the reference's `TVPProgramArguments`. `setArgument(name, value)`
+//!   rewrites the first entry that matches `name` by **prefix** (the next
+//!   character must be `=` or end-of-string) or inserts `name=value` at the
+//!   front when none matches. `getArgument(name [, default])` returns that
+//!   entry's value; a value-less entry reads back as the string `"yes"`.
+//!   When nothing matches it returns `default` if a second argument was
+//!   given (preserving its type), otherwise void — the reference's
+//!   `result->Clear()`.
 //!
-//! Deviation: the reference keeps an **ordered vector** of `name=value`
-//! strings and matches names by **prefix** (`getArgument("-f")` matches an
-//! entry `-foo=...`; `setArgument` rewrites the matched entry to the shorter
-//! name). This port stores an exact-match `HashMap`, so names must match
-//! exactly — which is how real scripts always call it.
+//! Prefix matching follows `TVPGetCommandLine` exactly: an entry matches
+//! when its name equals `name` and the next character is `=` (value) or the
+//! end of the string (`"yes"`). A longer entry whose name merely starts
+//! with `name` (e.g. querying `-f` against `-foo=...`) does **not** match,
+//! and `setArgument` rewrites only such a full-name entry.
 //!
-//! # Pending (FFI property extension, landing in parallel)
+//! # Properties
 //!
-//! The property getters/setters are not in this wave:
-//! `exePath`, `platform`, `osName`, `personalPath`, `appDataPath`,
-//! `dataPath`, `exeName`, `savedGamesPath`, `title`, `screenWidth`,
-//! `screenHeight`, `desktopLeft`, `desktopTop`, `desktopWidth`,
-//! `desktopHeight`, `touchDevice`.
+//! The full reference property surface is implemented: `exePath`,
+//! `dataPath`, `personalPath`, `savedGamesPath`, `appDataPath`, `exeName`,
+//! `title`, `eventDisabled`, `screenWidth`/`screenHeight`, `desktopLeft`/
+//! `desktopTop`/`desktopWidth`/`desktopHeight`, `touchDevice`,
+//! `versionString`, `versionInformation`, `platformName`, `osName`,
+//! `processorNum`, `exeBits`, `osBits`, `graphicCacheLimit`,
+//! `exitOnWindowClose`, `exitOnNoWindowStartup` and `drawThreadNum`.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, c_int, c_void};
@@ -74,11 +84,46 @@ use super::{
     set_void_out, value_as_bool, value_as_i64, value_as_string,
 };
 
-/// Process-global command-line arguments (`name` → `value`), mirroring the
-/// reference's process-wide `TVPProgramArguments` stock. (`LazyLock` because
-/// `HashMap::new` is not const.)
-static ARGS: LazyLock<Mutex<HashMap<String, String>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Process-global command-line arguments, mirroring the reference's
+/// process-wide `TVPProgramArguments` (`SysInitImpl.cpp:456`): an ordered
+/// vector of `name=value` strings matched by **prefix**, where the matched
+/// entry's next character must be `=` or the end of the string. A
+/// value-less entry reads back as `"yes"` (the reference's
+/// `TVPGetCommandLine`).
+static ARGS: LazyLock<Mutex<Vec<String>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// Reference-prefix lookup: `name` matches an entry whose next character
+/// after the prefix is `=` (value) or end-of-string ("yes").
+fn get_command_line(name: &str) -> Option<String> {
+    let args = lock_ok(&ARGS);
+    for entry in args.iter() {
+        if let Some(rest) = entry.strip_prefix(name) {
+            if rest.is_empty() {
+                return Some("yes".to_string());
+            }
+            if let Some(value) = rest.strip_prefix('=') {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Reference `TVPSetCommandLine`: rewrite the first prefix-matching entry to
+/// `name=value`, or insert a new entry at the front when none matches.
+fn set_command_line(name: &str, value: &str) {
+    let mut args = lock_ok(&ARGS);
+    let new_entry = format!("{name}={value}");
+    for entry in args.iter_mut() {
+        if let Some(rest) = entry.strip_prefix(name)
+            && (rest.is_empty() || rest.starts_with('='))
+        {
+            *entry = new_entry;
+            return;
+        }
+    }
+    args.insert(0, new_entry);
+}
 
 /// Keyboard state supplied by the host input bridge, keyed by Windows VK.
 static KEY_STATES: LazyLock<Mutex<HashSet<i64>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
@@ -101,9 +146,10 @@ static TICK_EPOCH: OnceLock<Instant> = OnceLock::new();
 /// `System.inform(text [, caption [, buttons]])`
 ///
 /// Reference: `TVPShowSimpleMessageBox` — a modal dialog; with a buttons
-/// argument the pressed button index is returned. This port logs the text
-/// (with the default caption `"Information"` when omitted) at `info!` and
-/// returns void — there is no GUI yet. Button handling is not implemented.
+/// argument the pressed button index is returned. krkr-rs has no GUI: logs
+/// the text (with the default caption `"Information"` when omitted) at
+/// `info!`. With a buttons argument it returns `0` (the left/first button),
+/// matching the reference's "OK clicked" path; without one it returns void.
 extern "C" fn native_inform(
     _engine: *mut c_void,
     argc: c_int,
@@ -122,7 +168,12 @@ extern "C" fn native_inform(
         "Information".to_string()
     };
     log::info!("System.inform [{caption}]: {text}");
-    set_void_out(out);
+    if argc >= 3 && a[2].ty != VAL_VOID {
+        // buttons overload: reference returns the clicked index; headless OK.
+        set_int_out(out, 0);
+    } else {
+        set_void_out(out);
+    }
     0
 }
 
@@ -262,7 +313,7 @@ extern "C" fn native_get_argument(
     }
     let a = args(argv, argc);
     let name = value_as_string(&a[0]);
-    match lock_ok(&ARGS).get(&name).cloned() {
+    match get_command_line(&name) {
         Some(value) => {
             set_string_out(out, &value);
             0
@@ -309,7 +360,7 @@ extern "C" fn native_set_argument(
     let a = args(argv, argc);
     let name = value_as_string(&a[0]);
     let value = value_as_string(&a[1]);
-    lock_ok(&ARGS).insert(name, value);
+    set_command_line(&name, &value);
     set_void_out(out);
     0
 }
@@ -423,6 +474,234 @@ extern "C" fn native_show_version(
     log::info!("KiriKiri (krkr-rs) {}", env!("CARGO_PKG_VERSION"));
     set_void_out(out);
     0
+}
+
+/// `System.inputString(caption, prompt, initial)` → string
+///
+/// Reference: `TVPShowSimpleInputBox` shows a modal text input; on OK the
+/// result is the edited value, on Cancel it is void. krkr-rs has no GUI:
+/// this port logs the prompt and returns the caller's initial value (the
+/// "OK" path). Requires three arguments, like the reference.
+extern "C" fn native_input_string(
+    _engine: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    if argc < 3 {
+        return report_error(out_error, "System.inputString requires 3 arguments");
+    }
+    let a = args(argv, argc);
+    let caption = value_as_string(&a[0]);
+    let prompt = value_as_string(&a[1]);
+    let initial = value_as_string(&a[2]);
+    log::info!("System.inputString [{caption}]: {prompt} (returning initial value)");
+    set_string_out(out, &initial);
+    0
+}
+
+/// Convert a TVP system color (the `cl*` constants, high byte set) to its
+/// actual `0xRRGGBB` value. Ported from `ColorToRGB`
+/// (`reference/cpp/core/environ/Application.cpp:874`) plus the byte-order
+/// swap in `TVPToActualColor` (`reference/cpp/core/visual/impl/LayerImpl.cpp:21`).
+fn color_to_actual(color: u32) -> u32 {
+    // ColorToRGB's table is in 0xBBGGRR; the swap below returns 0xRRGGBB.
+    let rgb_bbggrr = match color {
+        0x8000_0000 => 0x00c8_c8c8, // clScrollBar
+        0x8000_0001 => 0x0000_0000, // clBackground
+        0x8000_0002 => 0x00d1_b499, // clActiveCaption
+        0x8000_0003 => 0x00db_cdbf, // clInactiveCaption
+        0x8000_0004 => 0x00f0_f0f0, // clMenu
+        0x8000_0005 => 0x00ff_ffff, // clWindow
+        0x8000_0006 => 0x0064_6464, // clWindowFrame
+        0x8000_0007 => 0x0000_0000, // clMenuText
+        0x8000_0008 => 0x0000_0000, // clWindowText
+        0x8000_0009 => 0x0000_0000, // clCaptionText
+        0x8000_000a => 0x00b4_b4b4, // clActiveBorder
+        0x8000_000b => 0x00fc_f7f4, // clInactiveBorder
+        0x8000_000c => 0x00ab_abab, // clAppWorkSpace
+        0x8000_000d => 0x00ff_9933, // clHighlight
+        0x8000_000e => 0x00ff_ffff, // clHighlightText
+        0x8000_000f => 0x00f0_f0f0, // clBtnFace
+        0x8000_0010 => 0x00a0_a0a0, // clBtnShadow
+        0x8000_0011 => 0x006d_6d6d, // clGrayText
+        0x8000_0012 => 0x0000_0000, // clBtnText
+        0x8000_0013 => 0x0054_4e43, // clInactiveCaptionText
+        0x8000_0014 => 0x00ff_ffff, // clBtnHighlight
+        0x8000_0015 => 0x0069_6969, // cl3DDkShadow
+        0x8000_0016 => 0x00e3_e3e3, // cl3DLight
+        0x8000_0017 => 0x0000_0000, // clInfoText
+        0x8000_0018 => 0x00e1_ffff, // clInfoBk
+        0x8000_0019 => 0x0000_0000, // clUnknown
+        0x8000_001a => 0x00cc_6600, // clHotLight
+        0x8000_001b => 0x00ea_d1b9, // clGradientActiveCaption
+        0x8000_001c => 0x00f2_e4d7, // clGradientInactiveCaption
+        0x8000_001d => 0x00ff_9933, // clMenuLight
+        0x8000_001e => 0x00f0_f0f0, // clMenuBar
+        other => other & 0x00ff_ffff,
+    };
+    ((rgb_bbggrr & 0xff) << 16) | (rgb_bbggrr & 0xff00) | ((rgb_bbggrr & 0xff0000) >> 16)
+}
+
+/// `System.toActualColor(color)` → int
+///
+/// Reference: `TVPToActualColor` (`LayoutImpl.cpp:21`). System colors (the
+/// high byte set) are converted from the `0xBBGGRR` `ColorToRGB` table;
+/// ordinary colors pass through masked to `0xRRGGBB`.
+extern "C" fn native_to_actual_color(
+    _engine: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    if argc < 1 {
+        return report_error(out_error, "System.toActualColor requires 1 argument");
+    }
+    let color = value_as_i64(&args(argv, argc)[0]) as u32;
+    let actual = if color & 0xff00_0000 != 0 {
+        color_to_actual(color)
+    } else {
+        color & 0x00ff_ffff
+    };
+    set_int_out(out, i64::from(actual));
+    0
+}
+
+/// `System.clearGraphicCache()` → void
+///
+/// Reference: `TVPClearGraphicCache` (`SystemIntf.cpp:215`). krkr-rs has no
+/// global image cache yet, so this is a no-op (kept so scripts that call it
+/// do not throw).
+extern "C" fn native_clear_graphic_cache(
+    _engine: *mut c_void,
+    _argc: c_int,
+    _argv: *const Value,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+) -> c_int {
+    set_void_out(out);
+    0
+}
+
+/// `System.touchImages(storages[, limit[, timeout]])` → void
+///
+/// Reference: `TVPTouchImages` (`SystemIntf.cpp:224`) pre-caches images.
+/// krkr-rs caches per layer on demand, so this validates the argument count
+/// and does nothing.
+extern "C" fn native_touch_images(
+    _engine: *mut c_void,
+    argc: c_int,
+    _argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    if argc < 1 {
+        return report_error(out_error, "System.touchImages requires 1 argument");
+    }
+    set_void_out(out);
+    0
+}
+
+/// `System.createUUID()` → string
+///
+/// Reference: `TVPGetRandomBits128` + RFC-4122 version/variant bits
+/// (`SystemIntf.cpp:259`). krkr-rs has no RNG dependency; the seed mixes the
+/// clock, a process-local counter and the heap address, which is enough for
+/// a transient identifier.
+extern "C" fn native_create_uuid(
+    _engine: *mut c_void,
+    argc: c_int,
+    _argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    if argc != 0 {
+        return report_error(out_error, "System.createUUID takes no arguments");
+    }
+    set_string_out(out, &make_uuid());
+    0
+}
+
+/// `System.assignMessage(id, message)` → bool
+///
+/// Reference: `TJSAssignMessage` (`SystemIntf.cpp:288`) installs a message
+/// override. krkr-rs stores the mapping process-globally and returns true.
+static MESSAGE_MAP: LazyLock<Mutex<HashMap<String, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+extern "C" fn native_assign_message(
+    _engine: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    if argc < 2 {
+        return report_error(out_error, "System.assignMessage requires 2 arguments");
+    }
+    let a = args(argv, argc);
+    let id = value_as_string(&a[0]);
+    let message = value_as_string(&a[1]);
+    lock_ok(&MESSAGE_MAP).insert(id, message);
+    set_int_out(out, 1);
+    0
+}
+
+/// Read back a previously assigned message (used by tests).
+#[cfg(test)]
+pub fn assigned_message(id: &str) -> Option<String> {
+    lock_ok(&MESSAGE_MAP).get(id).cloned()
+}
+
+/// Generate a random UUID v4 string.
+fn make_uuid() -> String {
+    // Seed from the clock, a per-process counter and the stack address.
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let addr = &n as *const u64 as u64;
+    let mut state = nanos ^ n.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ addr;
+    if state == 0 {
+        state = 0x1234_5678_9abc_def0;
+    }
+    let mut next = || {
+        // xorshift64* step
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        state.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    };
+    let mut bytes = [0u8; 16];
+    for chunk in bytes.chunks_mut(8) {
+        let v = next().to_le_bytes();
+        chunk.copy_from_slice(&v[..chunk.len()]);
+    }
+    bytes[6] = (bytes[6] & 0x0f) | 0x40; // version 4
+    bytes[8] = (bytes[8] & 0x3f) | 0x80; // RFC 4122 variant
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15]
+    )
 }
 
 /// `System.doCompact(...)` — stubbed no-op (compaction is a GC hint).
@@ -665,6 +944,30 @@ pub fn register_system(engine: &tjs2_sys::Tjs2Engine) -> Result<(), String> {
                 f: native_show_version,
             },
             NativeMethodDef {
+                name: "inputString",
+                f: native_input_string,
+            },
+            NativeMethodDef {
+                name: "toActualColor",
+                f: native_to_actual_color,
+            },
+            NativeMethodDef {
+                name: "clearGraphicCache",
+                f: native_clear_graphic_cache,
+            },
+            NativeMethodDef {
+                name: "touchImages",
+                f: native_touch_images,
+            },
+            NativeMethodDef {
+                name: "createUUID",
+                f: native_create_uuid,
+            },
+            NativeMethodDef {
+                name: "assignMessage",
+                f: native_assign_message,
+            },
+            NativeMethodDef {
                 name: "doCompact",
                 f: system_do_compact,
             },
@@ -732,6 +1035,29 @@ static TITLE: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new(String::new(
 
 /// `System.eventDisabled` flag (writable; event processing not implemented).
 static EVENT_DISABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `System.graphicCacheLimit` (writable; the cache is not sized yet, the
+/// value is stored for compatibility).
+static GRAPHIC_CACHE_LIMIT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// `System.exitOnWindowClose` (writable flag; the host window bridge reads
+/// it through [`exit_on_window_close`]).
+static EXIT_ON_WINDOW_CLOSE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// `System.exitOnNoWindowStartup` (writable flag, stored only).
+static EXIT_ON_NO_WINDOW_STARTUP: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// `System.drawThreadNum` (writable; the renderer decides its own thread
+/// count, the value is stored for compatibility).
+static DRAW_THREAD_NUM: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// Read the `System.exitOnWindowClose` flag (reference
+/// `TVPTerminateOnWindowClose`, used by the window-close handler).
+pub fn exit_on_window_close() -> bool {
+    EXIT_ON_WINDOW_CLOSE.load(Ordering::SeqCst)
+}
 
 /// Exit code recorded by `System.exit` (0 = not requested). Public mirror of
 /// the most recent request; the *pending* request is `EXIT_REQUEST`.
@@ -831,6 +1157,33 @@ fn system_properties() -> Vec<tjs2_sys::NativePropertyDef> {
         getter("desktopWidth", prop_desktop_width),
         getter("desktopHeight", prop_desktop_height),
         getter("touchDevice", prop_touch_device),
+        getter("versionString", prop_version_string),
+        getter("versionInformation", prop_version_information),
+        getter("platformName", prop_platform_name),
+        getter("osName", prop_os_name),
+        getter("processorNum", prop_processor_num),
+        getter("exeBits", prop_exe_bits),
+        getter("osBits", prop_os_bits),
+        NativePropertyDef {
+            name: "graphicCacheLimit",
+            get: Some(prop_graphic_cache_limit_get),
+            set: Some(prop_graphic_cache_limit_set),
+        },
+        NativePropertyDef {
+            name: "exitOnWindowClose",
+            get: Some(prop_exit_on_window_close_get),
+            set: Some(prop_exit_on_window_close_set),
+        },
+        NativePropertyDef {
+            name: "exitOnNoWindowStartup",
+            get: Some(prop_exit_on_no_window_startup_get),
+            set: Some(prop_exit_on_no_window_startup_set),
+        },
+        NativePropertyDef {
+            name: "drawThreadNum",
+            get: Some(prop_draw_thread_num_get),
+            set: Some(prop_draw_thread_num_set),
+        },
     ]
 }
 
@@ -981,6 +1334,169 @@ extern "C" fn prop_touch_device(_e: *mut c_void, out: *mut Value, _err: *mut *mu
     0
 }
 
+/// The reference's `TVPGetVersionString`: `major.minor.release.build`.
+extern "C" fn prop_version_string(
+    _e: *mut c_void,
+    out: *mut Value,
+    _err: *mut *mut c_char,
+) -> c_int {
+    set_string_out(out, &format!("{}.0", env!("CARGO_PKG_VERSION")));
+    0
+}
+
+/// The reference's `TVPGetVersionInformation`: a descriptive multi-line
+/// version banner (`MsgIntf.cpp:158`).
+extern "C" fn prop_version_information(
+    _e: *mut c_void,
+    out: *mut Value,
+    _err: *mut *mut c_char,
+) -> c_int {
+    set_string_out(
+        out,
+        &format!(
+            "krkr-rs {} (KiriKiri2/TVP native port)",
+            env!("CARGO_PKG_VERSION")
+        ),
+    );
+    0
+}
+
+/// Reference `TVPGetPlatformName` (`MainScene.cpp:1400`).
+fn platform_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "Win32"
+    } else if cfg!(target_os = "macos") {
+        "MacOS"
+    } else if cfg!(target_os = "android") {
+        "Android"
+    } else if cfg!(target_os = "ios") {
+        "iPhone"
+    } else {
+        "Linux"
+    }
+}
+
+extern "C" fn prop_platform_name(
+    _e: *mut c_void,
+    out: *mut Value,
+    _err: *mut *mut c_char,
+) -> c_int {
+    set_string_out(out, platform_name());
+    0
+}
+
+/// In this fork `TVPGetOSName` returns `TVPGetPlatformName`.
+extern "C" fn prop_os_name(_e: *mut c_void, out: *mut Value, _err: *mut *mut c_char) -> c_int {
+    set_string_out(out, platform_name());
+    0
+}
+
+extern "C" fn prop_processor_num(
+    _e: *mut c_void,
+    out: *mut Value,
+    _err: *mut *mut c_char,
+) -> c_int {
+    let n = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    set_int_out(out, n as i64);
+    0
+}
+
+extern "C" fn prop_exe_bits(_e: *mut c_void, out: *mut Value, _err: *mut *mut c_char) -> c_int {
+    set_int_out(out, (std::mem::size_of::<usize>() * 8) as i64);
+    0
+}
+
+extern "C" fn prop_os_bits(_e: *mut c_void, out: *mut Value, _err: *mut *mut c_char) -> c_int {
+    // Reference `TVPGetOSBits` (`SystemImpl.cpp:71`).
+    set_int_out(out, (std::mem::size_of::<usize>() * 8) as i64);
+    0
+}
+
+extern "C" fn prop_graphic_cache_limit_get(
+    _e: *mut c_void,
+    out: *mut Value,
+    _err: *mut *mut c_char,
+) -> c_int {
+    set_int_out(out, GRAPHIC_CACHE_LIMIT.load(Ordering::SeqCst));
+    0
+}
+
+extern "C" fn prop_graphic_cache_limit_set(
+    _e: *mut c_void,
+    value: *const Value,
+    _err: *mut *mut c_char,
+) -> c_int {
+    // SAFETY: the C++ trampoline passes a valid value slot.
+    let v = unsafe { &*value };
+    GRAPHIC_CACHE_LIMIT.store(value_as_i64(v), Ordering::SeqCst);
+    0
+}
+
+extern "C" fn prop_exit_on_window_close_get(
+    _e: *mut c_void,
+    out: *mut Value,
+    _err: *mut *mut c_char,
+) -> c_int {
+    set_int_out(out, i64::from(EXIT_ON_WINDOW_CLOSE.load(Ordering::SeqCst)));
+    0
+}
+
+extern "C" fn prop_exit_on_window_close_set(
+    _e: *mut c_void,
+    value: *const Value,
+    _err: *mut *mut c_char,
+) -> c_int {
+    // SAFETY: the C++ trampoline passes a valid value slot.
+    let v = unsafe { &*value };
+    EXIT_ON_WINDOW_CLOSE.store(value_as_bool(v), Ordering::SeqCst);
+    0
+}
+
+extern "C" fn prop_exit_on_no_window_startup_get(
+    _e: *mut c_void,
+    out: *mut Value,
+    _err: *mut *mut c_char,
+) -> c_int {
+    set_int_out(
+        out,
+        i64::from(EXIT_ON_NO_WINDOW_STARTUP.load(Ordering::SeqCst)),
+    );
+    0
+}
+
+extern "C" fn prop_exit_on_no_window_startup_set(
+    _e: *mut c_void,
+    value: *const Value,
+    _err: *mut *mut c_char,
+) -> c_int {
+    // SAFETY: the C++ trampoline passes a valid value slot.
+    let v = unsafe { &*value };
+    EXIT_ON_NO_WINDOW_STARTUP.store(value_as_bool(v), Ordering::SeqCst);
+    0
+}
+
+extern "C" fn prop_draw_thread_num_get(
+    _e: *mut c_void,
+    out: *mut Value,
+    _err: *mut *mut c_char,
+) -> c_int {
+    set_int_out(out, DRAW_THREAD_NUM.load(Ordering::SeqCst));
+    0
+}
+
+extern "C" fn prop_draw_thread_num_set(
+    _e: *mut c_void,
+    value: *const Value,
+    _err: *mut *mut c_char,
+) -> c_int {
+    // SAFETY: the C++ trampoline passes a valid value slot.
+    let v = unsafe { &*value };
+    DRAW_THREAD_NUM.store(value_as_i64(v), Ordering::SeqCst);
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1010,5 +1526,185 @@ mod tests {
 
         // The public mirror always reflects the most recent request code.
         assert_eq!(TERMINATE_CODE.load(Ordering::SeqCst), 9);
+    }
+
+    fn engine_with_system() -> tjs2_sys::Tjs2Engine {
+        let e = tjs2_sys::Tjs2Engine::new().expect("create engine");
+        register_system(&e).expect("register System");
+        e
+    }
+
+    #[test]
+    fn input_string_returns_initial_value_and_checks_arity() {
+        let _vm_lock = crate::test_lock::vm_lock();
+        let e = engine_with_system();
+        assert_eq!(
+            e.eval("System.inputString('Caption', 'Prompt', 'initial')", "test")
+                .unwrap(),
+            tjs2_sys::TjsValue::String("initial".into())
+        );
+        // reference requires 3 parameters
+        assert!(
+            e.eval("System.inputString('Caption', 'Prompt')", "test")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn to_actual_color_maps_system_colors_and_passes_rgb() {
+        let _vm_lock = crate::test_lock::vm_lock();
+        let e = engine_with_system();
+        // clHighlight = 0x8000000d -> ColorToRGB 0xff9933 (BBGGRR) -> 0x3399ff
+        assert_eq!(
+            e.eval("System.toActualColor(0x8000000d)", "test").unwrap(),
+            tjs2_sys::TjsValue::Integer(0x3399ff)
+        );
+        // ordinary 0xRRGGBB passes through
+        assert_eq!(
+            e.eval("System.toActualColor(0x123456)", "test").unwrap(),
+            tjs2_sys::TjsValue::Integer(0x123456)
+        );
+        assert!(e.eval("System.toActualColor()", "test").is_err());
+    }
+
+    #[test]
+    fn create_uuid_has_rfc4122_shape_and_is_unique() {
+        let _vm_lock = crate::test_lock::vm_lock();
+        let e = engine_with_system();
+        let first = match e.eval("System.createUUID()", "test").unwrap() {
+            tjs2_sys::TjsValue::String(s) => s,
+            other => panic!("expected string, got {other:?}"),
+        };
+        assert_eq!(first.len(), 36, "uuid: {first}");
+        let bytes = first.as_bytes();
+        for (i, b) in bytes.iter().enumerate() {
+            match i {
+                8 | 13 | 18 | 23 => assert_eq!(*b, b'-', "uuid: {first}"),
+                _ => assert!(b.is_ascii_hexdigit(), "uuid: {first}"),
+            }
+        }
+        assert_eq!(&first[14..15], "4", "version nibble: {first}");
+        assert!("89ab".contains(&first[19..20]), "variant nibble: {first}");
+        let second = match e.eval("System.createUUID()", "test").unwrap() {
+            tjs2_sys::TjsValue::String(s) => s,
+            other => panic!("expected string, got {other:?}"),
+        };
+        assert_ne!(first, second, "two UUIDs should differ");
+    }
+
+    #[test]
+    fn assign_message_round_trips() {
+        let _vm_lock = crate::test_lock::vm_lock();
+        let e = engine_with_system();
+        assert_eq!(
+            e.eval("System.assignMessage('msg.id', 'hello')", "test")
+                .unwrap(),
+            tjs2_sys::TjsValue::Integer(1)
+        );
+        assert_eq!(assigned_message("msg.id").as_deref(), Some("hello"));
+        assert!(e.eval("System.assignMessage('only-one')", "test").is_err());
+    }
+
+    #[test]
+    fn system_version_and_environment_properties() {
+        let _vm_lock = crate::test_lock::vm_lock();
+        let e = engine_with_system();
+        assert!(matches!(
+            e.eval("System.versionString", "test").unwrap(),
+            tjs2_sys::TjsValue::String(s) if !s.is_empty()
+        ));
+        assert!(matches!(
+            e.eval("System.versionInformation", "test").unwrap(),
+            tjs2_sys::TjsValue::String(s) if s.contains("krkr-rs")
+        ));
+        assert!(matches!(
+            e.eval("System.platformName", "test").unwrap(),
+            tjs2_sys::TjsValue::String(_)
+        ));
+        assert_eq!(
+            e.eval("System.osName === System.platformName", "test")
+                .unwrap(),
+            tjs2_sys::TjsValue::Integer(1)
+        );
+        match e.eval("System.processorNum", "test").unwrap() {
+            tjs2_sys::TjsValue::Integer(n) => assert!(n >= 1),
+            other => panic!("processorNum: {other:?}"),
+        }
+        assert_eq!(
+            e.eval("System.exeBits", "test").unwrap(),
+            tjs2_sys::TjsValue::Integer((std::mem::size_of::<usize>() * 8) as i64)
+        );
+        assert_eq!(
+            e.eval("System.osBits", "test").unwrap(),
+            tjs2_sys::TjsValue::Integer((std::mem::size_of::<usize>() * 8) as i64)
+        );
+        assert_eq!(
+            e.eval("System.exitOnWindowClose", "test").unwrap(),
+            tjs2_sys::TjsValue::Integer(1)
+        );
+        assert_eq!(
+            e.eval(
+                "System.graphicCacheLimit = 64; System.graphicCacheLimit",
+                "test"
+            )
+            .unwrap(),
+            tjs2_sys::TjsValue::Integer(64)
+        );
+        assert_eq!(
+            e.eval("System.drawThreadNum = 4; System.drawThreadNum", "test")
+                .unwrap(),
+            tjs2_sys::TjsValue::Integer(4)
+        );
+        e.exec_script("System.exitOnWindowClose = false;", "test")
+            .unwrap();
+        assert_eq!(
+            e.eval("System.exitOnWindowClose", "test").unwrap(),
+            tjs2_sys::TjsValue::Integer(0)
+        );
+        assert!(!exit_on_window_close());
+        // restore the default for other tests in this binary
+        e.exec_script("System.exitOnWindowClose = true;", "test")
+            .unwrap();
+    }
+
+    #[test]
+    fn noop_surface_methods_do_not_throw() {
+        let _vm_lock = crate::test_lock::vm_lock();
+        let e = engine_with_system();
+        e.exec_script(
+            "System.clearGraphicCache(); System.touchImages([]); \
+             System.touchImages([], 100, 5); System.doCompact(); \
+             System.doCompact(0);",
+            "test",
+        )
+        .unwrap();
+        assert!(e.eval("System.touchImages()", "test").is_err());
+    }
+
+    #[test]
+    fn argument_matching_follows_the_reference_separator_rule() {
+        let _vm_lock = crate::test_lock::vm_lock();
+        let e = engine_with_system();
+        e.exec_script("System.setArgument('-argcheck', 'x');", "test")
+            .unwrap();
+        // the exact name matches and reads back its value
+        assert_eq!(
+            e.eval("System.getArgument('-argcheck')", "test").unwrap(),
+            tjs2_sys::TjsValue::String("x".into())
+        );
+        // a strict prefix of a stored name does NOT match (TVPGetCommandLine
+        // requires `=` or end-of-string after the queried name)
+        assert_eq!(
+            e.eval("System.getArgument('-arg', 'dflt')", "test")
+                .unwrap(),
+            tjs2_sys::TjsValue::String("dflt".into())
+        );
+        // setArgument replaces the existing entry, not a prefix match
+        e.exec_script("System.setArgument('-argcheck', 'y');", "test")
+            .unwrap();
+        assert_eq!(
+            e.eval("System.getArgument('-argcheck')", "test").unwrap(),
+            tjs2_sys::TjsValue::String("y".into())
+        );
     }
 }

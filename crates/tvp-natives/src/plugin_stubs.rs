@@ -82,3 +82,30 @@ pub fn register_plugin_stubs(engine: &Tjs2Engine) -> Result<(), String> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::test_lock::vm_lock;
+
+    use super::*;
+    use tjs2_sys::Tjs2Engine;
+
+    #[test]
+    fn stub_plugin_bases_resolve_and_can_be_extended() {
+        let _vm_lock = vm_lock();
+        let engine = Tjs2Engine::new().expect("create engine");
+        register_plugin_stubs(&engine).expect("register plugin stubs");
+        // Every stub is a usable superclass marker and instance base.
+        engine
+            .exec_script(
+                "class SceneBaseX extends InputNotifyBase {} \
+                 class DlgX extends WIN32GenericDialogEX {} \
+                 class TextX extends TextContentModelessDialog {} \
+                 class SubX extends SubMenu {} \
+                 class SliderX extends SliderV {} \
+                 new SceneBaseX(); new DlgX(); new TextX(); new SubX(); new SliderX();",
+                "plugin_stubs",
+            )
+            .expect("stub plugin bases must resolve and construct");
+    }
+}

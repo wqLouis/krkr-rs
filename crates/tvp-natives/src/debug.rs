@@ -2,10 +2,11 @@
 //! `reference/cpp/core/utils/DebugIntf.cpp` (`tTJSNC_Debug`).
 //!
 //! Implemented methods: `message`, `notice`, `startLogToFile`, `logAsError`,
-//! `getLastLog`. `addLoggingHandler` and `removeLoggingHandler` are void
-//! stubs (the logging-handler list is not implemented). The properties
-//! (`logLocation`, `logToFileOnError`, `clearLogFileOnError`) are pending on
-//! the FFI property extension.
+//! `getLastLog`, `addLoggingHandler`, `removeLoggingHandler` (the handler
+//! list is real: each `message`/`notice` string is dispatched to the
+//! retained callbacks). The properties `logLocation`, `logToFileOnError` and
+//! `clearLogFileOnError` are stored (the reference's auto-log-to-file error
+//! path is not wired to the host yet).
 //!
 //! Log flow: `message`/`notice` write to the `log` crate (`message` at
 //! `info!` — or `error!` while [`logAsError`] is true — `notice` at
@@ -35,11 +36,11 @@ use std::io::Write;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use tjs2_sys::{NativeClassBuilder, NativeMethodDef, Value};
+use tjs2_sys::{DetachedValue, NativeClassBuilder, NativeMethodDef, NativePropertyDef, Value};
 
 use super::{
-    args, lock_ok, report_error, set_string_out, set_void_out, value_as_bool, value_as_i64,
-    value_as_string,
+    args, context_engine, lock_ok, report_error, set_int_out, set_string_out, set_void_out,
+    value_as_bool, value_as_i64, value_as_string,
 };
 
 /// Handle of the file opened by `startLogToFile`; `message`/`notice` append
@@ -54,6 +55,46 @@ const LOG_BUFFER_CAP: usize = 100;
 
 /// When true, `message` logs at `error!` instead of `info!`.
 static LOG_AS_ERROR: AtomicBool = AtomicBool::new(false);
+
+/// `Debug.logLocation` (reference `TVPLogLocation`; a file/directory the
+/// reference writes error logs to).
+static LOG_LOCATION: Mutex<String> = Mutex::new(String::new());
+
+/// `Debug.logToFileOnError` (reference `TVPAutoLogToFileOnError`).
+static LOG_TO_FILE_ON_ERROR: AtomicBool = AtomicBool::new(false);
+
+/// `Debug.clearLogFileOnError` (reference `TVPAutoClearLogOnError`).
+static CLEAR_LOG_FILE_ON_ERROR: AtomicBool = AtomicBool::new(false);
+
+/// Retained `addLoggingHandler` callbacks; each `message`/`notice` string is
+/// dispatched to every handler (reference `TVPAddLoggingHandler`).
+static LOGGING_HANDLERS: Mutex<Vec<DetachedValue>> = Mutex::new(Vec::new());
+
+/// Dispatch `text` to every registered logging handler (errors are logged
+/// and the handler is kept, like the reference). The handler list is moved
+/// out of the mutex while callbacks run so a handler that itself logs cannot
+/// deadlock on a re-entrant lock.
+fn dispatch_logging_handlers(text: &str) {
+    let handlers = {
+        let mut guard = lock_ok(&LOGGING_HANDLERS);
+        if guard.is_empty() {
+            return;
+        }
+        std::mem::take(&mut *guard)
+    };
+    let engine = context_engine();
+    for handler in &handlers {
+        if let Err(e) = engine.call_detached(handler, &[tjs2_sys::TjsValue::String(text.into())]) {
+            log::debug!("Debug logging handler failed: {e}");
+        }
+    }
+    // Restore the handlers unless a callback replaced the list (re-entrant
+    // add/remove while logging is not expected; new handlers win).
+    let mut guard = lock_ok(&LOGGING_HANDLERS);
+    if guard.is_empty() {
+        *guard = handlers;
+    }
+}
 
 /// Join the callback arguments into one string with `", "` separators,
 /// mirroring the reference's `message`/`notice` multi-argument handling.
@@ -100,6 +141,7 @@ extern "C" fn native_message(
     let text = join_args(a);
     push_log(text.clone());
     write_log_file(&text);
+    dispatch_logging_handlers(&text);
     if LOG_AS_ERROR.load(Ordering::Relaxed) {
         log::error!("{text}");
     } else {
@@ -128,6 +170,7 @@ extern "C" fn native_notice(
     let text = join_args(a);
     push_log(text.clone());
     write_log_file(&text);
+    dispatch_logging_handlers(&text);
     log::debug!("{text}");
     set_void_out(out);
     0
@@ -234,18 +277,31 @@ extern "C" fn native_get_last_log(
 
 /// `Debug.addLoggingHandler(fn)` → void
 ///
-/// Reference: appends a callable to the logging-handler list (each log line
-/// is dispatched to the handlers). Stub: validates the argument count and
-/// does nothing — the handler list is not implemented.
+/// Reference: appends a callable to the logging-handler list; each
+/// `message`/`notice` string is dispatched to every handler. The callback is
+/// retained and called with the logged text.
 extern "C" fn native_add_logging_handler(
     _engine: *mut c_void,
     argc: c_int,
-    _argv: *const Value,
+    argv: *const Value,
     out: *mut Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
     if argc < 1 {
         return report_error(out_error, "Debug.addLoggingHandler requires 1 argument");
+    }
+    let a = args(argv, argc);
+    if a[0].ty != tjs2_sys::VAL_OBJECT {
+        set_void_out(out);
+        return 0;
+    }
+    let engine = context_engine();
+    // `retain_value_detached(Object)` resolves the call's most recent object
+    // argument while preserving its closure `ObjThis`, so removal by
+    // `find_retained_id` (which compares Object+ObjThis) matches.
+    match engine.retain_value_detached(&tjs2_sys::TjsValue::Object) {
+        Ok(handler) => lock_ok(&LOGGING_HANDLERS).push(handler),
+        Err(e) => log::debug!("Debug.addLoggingHandler: cannot retain handler: {e}"),
     }
     set_void_out(out);
     0
@@ -253,30 +309,117 @@ extern "C" fn native_add_logging_handler(
 
 /// `Debug.removeLoggingHandler(fn)` → void
 ///
-/// Reference: removes a callable from the logging-handler list. Stub: same
-/// as [`native_add_logging_handler`].
+/// Reference: removes a callable from the logging-handler list. The argument
+/// object is resolved against the current call's object slot and matched by
+/// retained identity.
 extern "C" fn native_remove_logging_handler(
     _engine: *mut c_void,
     argc: c_int,
-    _argv: *const Value,
+    argv: *const Value,
     out: *mut Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
     if argc < 1 {
         return report_error(out_error, "Debug.removeLoggingHandler requires 1 argument");
     }
+    let engine = context_engine();
+    let a = args(argv, argc);
+    // `find_retained_id` resolves an object against the engine's most recent
+    // object argument, which the trampoline set to this call's `fn` (only
+    // objects are accepted, so a stale slot cannot match).
+    if a[0].ty == tjs2_sys::VAL_OBJECT
+        && let Some(id) = engine.find_retained_id(&tjs2_sys::TjsValue::Object)
+    {
+        lock_ok(&LOGGING_HANDLERS).retain(|handler| handler.raw_id() != id);
+    }
     set_void_out(out);
     0
 }
 
-/// Register the `Debug` native class (methods only; properties are pending
-/// on the FFI property extension — see the module docs).
+/// `Debug.logLocation` getter.
+extern "C" fn prop_log_location_get(
+    _e: *mut c_void,
+    out: *mut Value,
+    _err: *mut *mut c_char,
+) -> c_int {
+    set_string_out(out, &lock_ok(&LOG_LOCATION));
+    0
+}
+
+/// `Debug.logLocation` setter.
+extern "C" fn prop_log_location_set(
+    _e: *mut c_void,
+    value: *const Value,
+    _err: *mut *mut c_char,
+) -> c_int {
+    // SAFETY: the C++ trampoline passes a valid value slot.
+    *lock_ok(&LOG_LOCATION) = value_as_string(unsafe { &*value });
+    0
+}
+
+extern "C" fn prop_log_to_file_on_error_get(
+    _e: *mut c_void,
+    out: *mut Value,
+    _err: *mut *mut c_char,
+) -> c_int {
+    set_int_out(out, i64::from(LOG_TO_FILE_ON_ERROR.load(Ordering::SeqCst)));
+    0
+}
+
+extern "C" fn prop_log_to_file_on_error_set(
+    _e: *mut c_void,
+    value: *const Value,
+    _err: *mut *mut c_char,
+) -> c_int {
+    // SAFETY: the C++ trampoline passes a valid value slot.
+    LOG_TO_FILE_ON_ERROR.store(value_as_bool(unsafe { &*value }), Ordering::SeqCst);
+    0
+}
+
+extern "C" fn prop_clear_log_file_on_error_get(
+    _e: *mut c_void,
+    out: *mut Value,
+    _err: *mut *mut c_char,
+) -> c_int {
+    set_int_out(
+        out,
+        i64::from(CLEAR_LOG_FILE_ON_ERROR.load(Ordering::SeqCst)),
+    );
+    0
+}
+
+extern "C" fn prop_clear_log_file_on_error_set(
+    _e: *mut c_void,
+    value: *const Value,
+    _err: *mut *mut c_char,
+) -> c_int {
+    // SAFETY: the C++ trampoline passes a valid value slot.
+    CLEAR_LOG_FILE_ON_ERROR.store(value_as_bool(unsafe { &*value }), Ordering::SeqCst);
+    0
+}
+
+/// Register the `Debug` native class (methods + the logging properties).
 pub fn register_debug(engine: &tjs2_sys::Tjs2Engine) -> Result<(), String> {
+    lock_ok(&LOGGING_HANDLERS).clear();
     engine.register_native_class(&NativeClassBuilder {
         name: "Debug",
-        // property registration is pending on the FFI property extension
-        // (tjs2_register_native_class_ex) landing in parallel
-        properties: Vec::new(),
+        properties: vec![
+            NativePropertyDef {
+                name: "logLocation",
+                get: Some(prop_log_location_get),
+                set: Some(prop_log_location_set),
+            },
+            NativePropertyDef {
+                name: "logToFileOnError",
+                get: Some(prop_log_to_file_on_error_get),
+                set: Some(prop_log_to_file_on_error_set),
+            },
+            NativePropertyDef {
+                name: "clearLogFileOnError",
+                get: Some(prop_clear_log_file_on_error_get),
+                set: Some(prop_clear_log_file_on_error_set),
+            },
+        ],
         methods: vec![
             NativeMethodDef {
                 name: "message",
@@ -308,4 +451,101 @@ pub fn register_debug(engine: &tjs2_sys::Tjs2Engine) -> Result<(), String> {
             },
         ],
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::test_lock::vm_lock;
+
+    use tjs2_sys::{Tjs2Engine, TjsValue};
+
+    fn engine() -> &'static Tjs2Engine {
+        // Leak the engine so its address is stable: `register_all` stores the
+        // `Tjs2Engine` wrapper address in a process global used by the Debug
+        // logging handlers.
+        let e = Box::leak(Box::new(Tjs2Engine::new().expect("create engine")));
+        crate::register_all(e).expect("register all natives");
+        e
+    }
+
+    #[test]
+    fn logging_handler_receives_messages_and_can_be_removed() {
+        let _vm_lock = vm_lock();
+        let e = engine();
+        e.exec_script(
+            "var got = []; function h(s) { got.push(s); } \
+             Debug.addLoggingHandler(h); Debug.message('one'); Debug.notice('two');",
+            "test",
+        )
+        .unwrap();
+        assert_eq!(e.eval("got.count", "test").unwrap(), TjsValue::Integer(2));
+        assert_eq!(
+            e.eval("got[0]", "test").unwrap(),
+            TjsValue::String("one".into())
+        );
+        assert_eq!(
+            e.eval("got[1]", "test").unwrap(),
+            TjsValue::String("two".into())
+        );
+        // removing by identity stops delivery
+        e.exec_script(
+            "Debug.removeLoggingHandler(h); Debug.message('three');",
+            "test",
+        )
+        .unwrap();
+        assert_eq!(e.eval("got.count", "test").unwrap(), TjsValue::Integer(2));
+    }
+
+    #[test]
+    fn non_object_handler_argument_is_ignored() {
+        let _vm_lock = vm_lock();
+        let e = engine();
+        e.exec_script(
+            "Debug.addLoggingHandler(42); Debug.message('still works');",
+            "test",
+        )
+        .unwrap();
+        assert_eq!(
+            e.eval("Debug.getLastLog()", "test").unwrap(),
+            TjsValue::String("still works".into())
+        );
+    }
+
+    #[test]
+    fn debug_properties_round_trip() {
+        let _vm_lock = vm_lock();
+        let e = engine();
+        assert_eq!(
+            e.eval("Debug.logToFileOnError", "test").unwrap(),
+            TjsValue::Integer(0)
+        );
+        assert_eq!(
+            e.eval("Debug.clearLogFileOnError", "test").unwrap(),
+            TjsValue::Integer(0)
+        );
+        e.exec_script(
+            "Debug.logLocation = 'logs/'; Debug.logToFileOnError = true; \
+             Debug.clearLogFileOnError = true;",
+            "test",
+        )
+        .unwrap();
+        assert_eq!(
+            e.eval("Debug.logLocation", "test").unwrap(),
+            TjsValue::String("logs/".into())
+        );
+        assert_eq!(
+            e.eval("Debug.logToFileOnError", "test").unwrap(),
+            TjsValue::Integer(1)
+        );
+        assert_eq!(
+            e.eval("Debug.clearLogFileOnError", "test").unwrap(),
+            TjsValue::Integer(1)
+        );
+        // restore defaults for other tests in this binary
+        e.exec_script(
+            "Debug.logToFileOnError = false; Debug.clearLogFileOnError = false;",
+            "test",
+        )
+        .unwrap();
+    }
 }

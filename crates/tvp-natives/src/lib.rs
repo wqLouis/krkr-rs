@@ -50,8 +50,8 @@ pub use menu_item::register_menu_item;
 pub use plugin_stubs::register_plugin_stubs;
 pub use plugins::register_plugins;
 pub use system::{
-    SystemContext, continuous_handler_poll, register_system, set_key_state, set_system_context,
-    take_exit_request,
+    SystemContext, continuous_handler_poll, exit_on_window_close, register_system, set_key_state,
+    set_system_context, take_exit_request,
 };
 pub use video_overlay::{register_video_overlay, set_video_storage, video_overlay_poll};
 
@@ -318,9 +318,13 @@ mod tests {
     use crate::test_lock::vm_lock;
     use tjs2_sys::TjsValue;
 
-    fn registered_engine() -> Tjs2Engine {
-        let e = Tjs2Engine::new().expect("create engine");
-        register_all(&e).expect("register System + Debug");
+    /// Create an engine and register all natives. The engine is leaked so the
+    /// `Tjs2Engine` wrapper address stored by `register_all` stays valid: the
+    /// native callbacks resolve it from a process global, and returning the
+    /// engine by value would move it and leave a stale pointer.
+    fn registered_engine() -> &'static Tjs2Engine {
+        let e = Box::leak(Box::new(Tjs2Engine::new().expect("create engine")));
+        register_all(e).expect("register System + Debug");
         e
     }
 

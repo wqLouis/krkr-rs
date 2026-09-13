@@ -35,12 +35,22 @@
 //! `context` argument (execute inside another object's context) is not
 //! supported either, and is ignored with a warning.
 //!
+//! `getTraceString(limit)` is real (over `tjs2_get_stack_trace_string`), and
+//! `textEncoding` is a real get/set property: a non-empty value becomes the
+//! fallback decoder for scripts with no BOM (reference
+//! `G_DefaultReadEncoding`), while the default (`"UTF-8"`) keeps the port's
+//! automatic BOM → UTF-16LE → UTF-8 → CP932 detection.
+//!
 //! # Pending (need VM internals; not implemented)
 //!
+//! - `compileStorage` — reference `TVPCompileStorage`: compiles a storage
+//!   script to bytecode and writes it to an output stream. The C ABI exposes
+//!   no bytecode writer.
 //! - `dump` — reference `TVPDumpScriptEngine`: dumps the VM's compiled
 //!   code. The C ABI exposes no dump entry point.
-//! - `getTraceString` — reference `TJSGetStackTraceString(limit)`: reads
-//!   the VM's current stack trace. Not exposed over the C ABI.
+//! - `setCallMissing` / `getClassNames` — need `iTJSDispatch2::
+//!   ClassInstanceInfo` (`TJS_CII_SET_MISSING` / `TJS_CII_GET`), which the C
+//!   ABI does not expose.
 //! - `dumpStringHeap` — reference `TJSDumpStringHeap()` (debug builds
 //!   only).
 //!
@@ -61,8 +71,8 @@ use std::sync::{Arc, Mutex};
 
 use engine::Storage;
 use tjs2_sys::{
-    NativeClassBuilder, NativeMethodDef, RetainedValue, Tjs2Engine, TjsValue, VAL_INTEGER,
-    VAL_REAL, VAL_RETAINED, VAL_STRING, VAL_VOID, Value,
+    NativeClassBuilder, NativeMethodDef, NativePropertyDef, RetainedValue, Tjs2Engine, TjsValue,
+    VAL_INTEGER, VAL_REAL, VAL_RETAINED, VAL_STRING, VAL_VOID, Value,
 };
 use tvp_util::encoding;
 
@@ -87,6 +97,30 @@ static CONTEXT: Mutex<Context> = Mutex::new(Context {
     engine: None,
     storage: None,
 });
+
+/// Process-global `Scripts.textEncoding` override. `None` keeps the port's
+/// automatic detection (BOM → UTF-16LE heuristic → UTF-8 → CP932); a set
+/// value is used verbatim as the fallback decoder, mirroring the reference
+/// `G_DefaultReadEncoding` (`TextStream.cpp:141`). The getter reports
+/// `"UTF-8"` when unset, matching `TVPGetDefaultReadEncoding`.
+static TEXT_ENCODING: Mutex<Option<String>> = Mutex::new(None);
+
+/// The current `Scripts.textEncoding` value for the getter.
+fn text_encoding_value() -> String {
+    TEXT_ENCODING
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+        .unwrap_or_else(|| "UTF-8".to_string())
+}
+
+/// The configured fallback encoding, if any.
+fn configured_text_encoding() -> Option<String> {
+    TEXT_ENCODING
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+}
 
 /// Point the `Scripts` class at the running VM and storage.
 ///
@@ -200,6 +234,13 @@ fn decode_script(bytes: &[u8]) -> Result<String, String> {
                     .map(|c| u16::from_le_bytes([c[0], c[1]]))
                     .collect();
                 return String::from_utf16(&units).map_err(|e| e.to_string());
+            }
+            // An explicit `Scripts.textEncoding` wins over the heuristic
+            // fallback, like the reference's `G_DefaultReadEncoding`.
+            if let Some(name) = configured_text_encoding()
+                && !name.is_empty()
+            {
+                return encoding::decode(body, &name).map_err(|e| e.to_string());
             }
             match String::from_utf8(body.to_vec()) {
                 Ok(text) => Ok(text),
@@ -664,11 +705,56 @@ extern "C" fn native_get_trace_string(
     0
 }
 
+/// `Scripts.textEncoding` getter (reference `TVPGetDefaultReadEncoding`).
+extern "C" fn native_text_encoding_get(
+    _engine: *mut c_void,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+) -> c_int {
+    set_string_result(out, &text_encoding_value());
+    0
+}
+
+/// `Scripts.textEncoding` setter (reference `TVPSetDefaultReadEncoding`).
+/// An empty string restores the port's automatic detection.
+extern "C" fn native_text_encoding_set(
+    _engine: *mut c_void,
+    value: *const Value,
+    _out_error: *mut *mut c_char,
+) -> c_int {
+    // SAFETY: the C++ trampoline passes a valid value slot.
+    let name = value_as_string_arg(unsafe { &*value });
+    *TEXT_ENCODING.lock().unwrap_or_else(|p| p.into_inner()) =
+        if name.is_empty() { None } else { Some(name) };
+    0
+}
+
+/// Convert an ABI value to a string for the property setter (void/number →
+/// empty/adecimal, objects → empty).
+fn value_as_string_arg(v: &Value) -> String {
+    match v.ty {
+        VAL_STRING if v.string.is_null() => String::new(),
+        VAL_STRING => {
+            // SAFETY: argv strings are NUL-terminated UTF-8 for the call.
+            unsafe { CStr::from_ptr(v.string) }
+                .to_string_lossy()
+                .into_owned()
+        }
+        VAL_INTEGER => v.integer.to_string(),
+        VAL_REAL => v.real.to_string(),
+        _ => String::new(),
+    }
+}
+
 /// Register the `Scripts` native class on `engine`'s global object.
 pub fn register_scripts(engine: &Tjs2Engine) -> Result<(), String> {
     engine.register_native_class(&NativeClassBuilder {
         name: "Scripts",
-        properties: vec![],
+        properties: vec![NativePropertyDef {
+            name: "textEncoding",
+            get: Some(native_text_encoding_get),
+            set: Some(native_text_encoding_set),
+        }],
         methods: vec![
             NativeMethodDef {
                 name: "execStorage",
@@ -1047,6 +1133,41 @@ mod tests {
             env.eval_ok("fromCp932"),
             TjsValue::String("こんにちは".into())
         );
+    }
+
+    #[test]
+    fn text_encoding_property_controls_the_fallback() {
+        let _vm_lock = vm_lock();
+        let env = TestEnv::new(
+            "text-encoding",
+            &[("plain.tjs", b"var tePlain = 1;".as_slice())],
+        );
+        // default (auto) reports UTF-8 like TVPGetDefaultReadEncoding
+        assert_eq!(
+            env.eval_ok("Scripts.textEncoding"),
+            TjsValue::String("UTF-8".into())
+        );
+        // an explicitly configured encoding is consulted for BOM-less data
+        env.eval_ok("Scripts.textEncoding = 'no-such-encoding'");
+        assert_eq!(
+            env.eval_ok("Scripts.textEncoding"),
+            TjsValue::String("no-such-encoding".into())
+        );
+        assert!(
+            env.eval("Scripts.execStorage('plain.tjs')").is_err(),
+            "an invalid configured encoding must surface as a script error"
+        );
+        // resetting to '' restores automatic detection
+        env.eval_ok("Scripts.textEncoding = ''");
+        assert_eq!(
+            env.eval_ok("Scripts.textEncoding"),
+            TjsValue::String("UTF-8".into())
+        );
+        assert_eq!(
+            env.eval_ok("Scripts.execStorage('plain.tjs')"),
+            TjsValue::Void
+        );
+        assert_eq!(env.eval_ok("tePlain"), TjsValue::Integer(1));
     }
 
     #[test]
