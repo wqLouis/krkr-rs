@@ -9,3 +9,4 @@ license.workspace = true
 tjs2-sys = { workspace = true }
 engine = { path = "../engine" }
 log = "0.4"
+ffmpeg-next = "9.0.0"

@@ -1,7 +1,7 @@
-//! `VideoOverlay` native class — non-throwing stub of the reference
-//! `tTJSNC_VideoOverlay` (`reference/cpp/core/visual/VideoOvlIntf.cpp` +
-//! `VideoOvlImpl.{h,cpp}`) with **real** MPEG-1/2 metadata and a real
-//! clock-driven playback state machine.
+//! `VideoOverlay` native class — the reference `tTJSNC_VideoOverlay`
+//! (`reference/cpp/core/visual/VideoOvlIntf.cpp` + `VideoOvlImpl.{h,cpp}`)
+//! with **real FFmpeg-backed movie decoding** and a real clock-driven
+//! playback state machine.
 //!
 //! The reference `VideoOverlay` is a **standalone** native class (it does
 //! *not* derive from `Layer`): it owns a rectangle/visibility/playback state
@@ -16,12 +16,22 @@
 //! * [`open`](VideoOverlay) reads the file through the mounted game storage
 //!   ([`engine::Storage`], the same storage the other natives use; injected
 //!   via [`set_video_storage`] or lazily mounted from
-//!   `System.dataPath`/`project_dir`) and parses the MPEG-1/2 sequence
-//!   header + sequence extension for the coded size and frame rate, and
-//!   scans picture start codes / PES stream ids for the frame count and
-//!   stream inventory. This drives `originalWidth`, `originalHeight`,
-//!   `fps`, `totalFrame`, `numberOfFrame`, `totalTime` and
-//!   `numberOfAudioStream`/`numberOfVideoStream`.
+//!   `System.dataPath`/`project_dir`) and opens it with FFmpeg (see
+//!   [`video`]): the game's `.mpg` files are really **H.264/AAC MP4**
+//!   containers. `originalWidth`, `originalHeight`, `fps`, `totalFrame`,
+//!   `numberOfFrame`, `totalTime` and `numberOfAudioStream`/
+//!   `numberOfVideoStream` come from the container. If FFmpeg cannot open
+//!   the bytes the legacy MPEG-1/2 sequence-header parser is used as a
+//!   fallback (the synthetic streams the unit tests build).
+//! * Video is decoded with `libavcodec` and converted to RGBA with
+//!   `libswscale`; [`present_current`] updates the overlay's layer bitmap on
+//!   the movie clock (`play`/`pause`/`stop`/`rewind`, `position`/`frame`
+//!   setters and [`video_overlay_poll`]). The latest frame is exposed to
+//!   scripts through `frameWidth`/`frameHeight`/`frameBytes`/
+//!   `frameChecksum`.
+//! * AAC audio is decoded (via `libswresample`) to interleaved `f32` PCM and
+//!   exposed through `audioSampleCount`/`audioSampleRate`/`audioChannels`
+//!   and [`video::MovieDecoder::audio_pcm`].
 //! * A clock-driven state machine: `play`/`pause`/`stop`/`rewind` move
 //!   `position` (ms) and `frame` off the engine tick clock; `loop` and
 //!   `setSegmentLoop` wrap the frame range; `setPeriodEvent` fires the
@@ -30,15 +40,14 @@
 //!   `setTransitionCompleteCall` fires when a non-looping stream (or a
 //!   segment loop wrap) completes.
 //!
-//! # What is NOT real (pixel decode)
+//! # Remaining gap (layer attachment / audio device)
 //!
-//! There is no video codec in krkr-rs, so **no pixel frames are decoded**
-//! and nothing is drawn: `layer1`/`layer2` are accepted and ignored. The
-//! metadata and the timing/event surface above are real, which is enough
-//! for `EnvEffectFilter`/`MovieLayer` to run their timers and sound-cue
-//! logic instead of having the effect disabled. Adding real frames needs an
-//! MPEG decoder (e.g. an FFmpeg binding) feeding a `Layer` bitmap — out of
-//! scope for this stub.
+//! The decoded frame is held in this native's own layer bitmap and surfaced
+//! through the properties above; it is **not** yet uploaded into the script
+//! `layer1` tvp-visual bitmap, because that scene lives in another crate
+//! (a future render-side frame sink can consume the same buffer). The
+//! decoded PCM is ready but is not yet fed into the engine mixer channel
+//! (`tvp-sound`); the property surface exposes it instead.
 //!
 //! # Timer driving
 //!
@@ -67,6 +76,14 @@ use tjs2_sys::{
 use crate::{
     args, context_engine, report_error, set_int_out, set_void_out, value_as_i64, value_as_string,
 };
+
+// Real FFmpeg-backed decoding lives in `src/video/`; declared here (rather
+// than in `lib.rs`) so the new module stays inside this class's scope. Some
+// of its API (whole-track PCM, blank-frame check) is exercised by tests and
+// reserved for the render-side frame sink, hence `dead_code`.
+#[allow(dead_code)]
+#[path = "video/mod.rs"]
+mod video;
 
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -391,6 +408,12 @@ struct VideoOverlayInst {
     objthis: *mut c_void,
     transition_call: Option<DetachedValue>,
 
+    // real decoding (FFmpeg) and the presented layer bitmap
+    /// Decoder for the currently-open movie (`None` for unparsed files).
+    decoder: Option<video::MovieDecoder>,
+    /// The RGBA layer bitmap last presented by the movie clock.
+    frame: Option<video::RgbaFrame>,
+
     // audio / mixing passthrough
     mode: i64,
     audio_balance: i64,
@@ -399,6 +422,12 @@ struct VideoOverlayInst {
     enabled_video_stream: i64,
     mixing_alpha: f64,
     mixing_bg: i64,
+
+    // video adjustment passthrough (inert without a decoder)
+    contrast: f64,
+    brightness: f64,
+    hue: f64,
+    saturation: f64,
 }
 
 impl Default for VideoOverlayInst {
@@ -429,6 +458,8 @@ impl Default for VideoOverlayInst {
             period_fired: false,
             objthis: std::ptr::null_mut(),
             transition_call: None,
+            decoder: None,
+            frame: None,
             mode: 0,
             audio_balance: 0,
             audio_volume: 0,
@@ -436,6 +467,10 @@ impl Default for VideoOverlayInst {
             enabled_video_stream: 0,
             mixing_alpha: 0.0,
             mixing_bg: 0,
+            contrast: 1.0,
+            brightness: 0.0,
+            hue: 0.0,
+            saturation: 1.0,
         }
     }
 }
@@ -508,6 +543,26 @@ fn set_status(inst: &mut VideoOverlayInst, status: PlayStatus) -> Option<PlaySta
         Some(status)
     } else {
         None
+    }
+}
+
+/// Decode and store the RGBA layer bitmap for the overlay's current movie
+/// position. A no-op when the movie has no real decoder (the legacy MPEG
+/// fallback accepts metadata but cannot decode pixels).
+fn present_current(inst: &mut VideoOverlayInst, now: u64) {
+    if inst.decoder.is_none() {
+        return;
+    }
+    let position = current_position_ms(inst, now);
+    let decoded = inst
+        .decoder
+        .as_mut()
+        .map(|decoder| decoder.present_at(position));
+    match decoded {
+        Some(Ok(Some(frame))) => inst.frame = Some(frame),
+        Some(Ok(None)) => {}
+        Some(Err(e)) => log::debug!("VideoOverlay: present at {position} ms failed: {e}"),
+        None => {}
     }
 }
 
@@ -618,6 +673,7 @@ fn poll_with_now(engine: &Tjs2Engine, now: u64) {
         let (outcome, objthis, transition) = {
             let inst = unsafe { &mut *ptr };
             let outcome = advance_playback(inst, now);
+            present_current(inst, now);
             let objthis = inst.objthis;
             let transition = if outcome.transition_complete {
                 inst.transition_call.take()
@@ -774,6 +830,24 @@ macro_rules! ro_real_field {
     };
 }
 
+/// Read-only real property that always returns a fixed value (the
+/// `*RangeMin`/`*RangeMax`/`*DefaultValue`/`*StepSize` metadata the
+/// reference's video backend reports).
+macro_rules! ro_real_const {
+    ($getter:ident, $value:expr) => {
+        extern "C" fn $getter(
+            _engine: *mut c_void,
+            _instance: *mut c_void,
+            out: *mut Value,
+            _out_error: *mut *mut c_char,
+            _objthis: *mut c_void,
+        ) -> c_int {
+            crate::set_real_out(out, $value);
+            0
+        }
+    };
+}
+
 // -- rectangle / visibility -------------------------------------------------
 
 int_prop!(left_get, left_set, left);
@@ -812,6 +886,34 @@ int_prop!(
 real_prop!(mixing_alpha_get, mixing_alpha_set, mixing_alpha);
 int_prop!(mixing_bg_get, mixing_bg_set, mixing_bg);
 
+// -- video adjustment (inert without a decoder) -----------------------------
+//
+// The reference forwards these to the platform video player (`KRMoviePlayer`
+// in this fork overrides every getter with an empty body), so the ranges are
+// effectively backend-defined. These are the documented neutral ranges used
+// by the emulator; the values are stored but cannot affect pixels until a
+// decoder exists.
+real_prop!(contrast_get, contrast_set, contrast);
+real_prop!(brightness_get, brightness_set, brightness);
+real_prop!(hue_get, hue_set, hue);
+real_prop!(saturation_get, saturation_set, saturation);
+ro_real_const!(contrast_range_min_get, 0.0);
+ro_real_const!(contrast_range_max_get, 2.0);
+ro_real_const!(contrast_default_value_get, 1.0);
+ro_real_const!(contrast_step_size_get, 0.01);
+ro_real_const!(brightness_range_min_get, -1.0);
+ro_real_const!(brightness_range_max_get, 1.0);
+ro_real_const!(brightness_default_value_get, 0.0);
+ro_real_const!(brightness_step_size_get, 0.01);
+ro_real_const!(hue_range_min_get, -180.0);
+ro_real_const!(hue_range_max_get, 180.0);
+ro_real_const!(hue_default_value_get, 0.0);
+ro_real_const!(hue_step_size_get, 1.0);
+ro_real_const!(saturation_range_min_get, 0.0);
+ro_real_const!(saturation_range_max_get, 2.0);
+ro_real_const!(saturation_default_value_get, 1.0);
+ro_real_const!(saturation_step_size_get, 0.01);
+
 // -- real media metadata ----------------------------------------------------
 
 ro_int_field!(original_width_get, original_width);
@@ -822,6 +924,118 @@ ro_int_field!(total_time_get, total_time_ms);
 ro_int_field!(number_of_audio_stream_get, number_of_audio_stream);
 ro_int_field!(number_of_video_stream_get, number_of_video_stream);
 ro_real_field!(fps_get, fps);
+
+// -- decoded layer bitmap diagnostics ---------------------------------------
+//
+// These expose the real decoded RGBA layer bitmap and the decoded audio
+// track to scripts (and to the integration tests). They are read-only and
+// report 0 when the file has no real decoder (legacy MPEG fallback).
+
+extern "C" fn frame_width_get(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: `instance` is a live VideoOverlayInst payload.
+    let inst = unsafe { &*(instance as *const VideoOverlayInst) };
+    set_int_out(out, inst.frame.as_ref().map_or(0, |f| i64::from(f.width)));
+    0
+}
+
+extern "C" fn frame_height_get(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: `instance` is a live VideoOverlayInst payload.
+    let inst = unsafe { &*(instance as *const VideoOverlayInst) };
+    set_int_out(out, inst.frame.as_ref().map_or(0, |f| i64::from(f.height)));
+    0
+}
+
+extern "C" fn frame_bytes_get(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: `instance` is a live VideoOverlayInst payload.
+    let inst = unsafe { &*(instance as *const VideoOverlayInst) };
+    set_int_out(out, inst.frame.as_ref().map_or(0, |f| f.data.len() as i64));
+    0
+}
+
+extern "C" fn frame_checksum_get(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: `instance` is a live VideoOverlayInst payload.
+    let inst = unsafe { &*(instance as *const VideoOverlayInst) };
+    set_int_out(out, inst.frame.as_ref().map_or(0, |f| f.checksum() as i64));
+    0
+}
+
+extern "C" fn audio_sample_count_get(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: `instance` is a live VideoOverlayInst payload.
+    let inst = unsafe { &*(instance as *const VideoOverlayInst) };
+    let count = inst
+        .decoder
+        .as_ref()
+        .and_then(|d| d.cached_audio())
+        .map_or(0, |pcm| pcm.sample_values() as i64);
+    set_int_out(out, count);
+    0
+}
+
+extern "C" fn audio_sample_rate_get(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: `instance` is a live VideoOverlayInst payload.
+    let inst = unsafe { &*(instance as *const VideoOverlayInst) };
+    let rate = inst
+        .decoder
+        .as_ref()
+        .and_then(|d| d.cached_audio())
+        .map_or(0, |pcm| i64::from(pcm.sample_rate));
+    set_int_out(out, rate);
+    0
+}
+
+extern "C" fn audio_channels_get(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: `instance` is a live VideoOverlayInst payload.
+    let inst = unsafe { &*(instance as *const VideoOverlayInst) };
+    let channels = inst
+        .decoder
+        .as_ref()
+        .and_then(|d| d.cached_audio())
+        .map_or(0, |pcm| i64::from(pcm.channels));
+    set_int_out(out, channels);
+    0
+}
 
 // ---------------------------------------------------------------------------
 // Dynamic (clock-driven) properties
@@ -850,10 +1064,12 @@ extern "C" fn position_set(
     // SAFETY: `instance` is live; `value` is valid for the call.
     let inst = unsafe { &mut *(instance as *mut VideoOverlayInst) };
     let position = value_as_i64(unsafe { &*value }).max(0);
+    let now = now_ms();
     inst.position_ms = position;
     inst.play_anchor_position_ms = position;
-    inst.play_anchor_ms = now_ms();
+    inst.play_anchor_ms = now;
     inst.period_fired = false;
+    present_current(inst, now);
     0
 }
 
@@ -880,10 +1096,12 @@ extern "C" fn frame_set(
     // SAFETY: `instance` is live; `value` is valid for the call.
     let inst = unsafe { &mut *(instance as *mut VideoOverlayInst) };
     let frame = value_as_i64(unsafe { &*value }).max(0);
+    let now = now_ms();
     inst.position_ms = frame_to_ms(inst.fps, frame);
     inst.play_anchor_position_ms = inst.position_ms;
-    inst.play_anchor_ms = now_ms();
+    inst.play_anchor_ms = now;
     inst.period_fired = false;
+    present_current(inst, now);
     0
 }
 
@@ -924,9 +1142,11 @@ extern "C" fn vo_ctor(
     0
 }
 
-/// `open(file)`: read the file through the game storage and parse its MPEG
-/// metadata. A missing file raises a TJS error; an opened non-MPEG file is
-/// accepted with zero metadata (logged).
+/// `open(file)`: read the file through the game storage and open it with
+/// FFmpeg (the game's `.mpg` files are really H.264/AAC MP4 containers),
+/// falling back to the legacy MPEG-1/2 sequence parser when FFmpeg cannot
+/// open the bytes. A missing file raises a TJS error; an opened file that
+/// neither decoder understands is accepted with zero metadata (logged).
 extern "C" fn vo_open(
     _engine: *mut c_void,
     instance: *mut c_void,
@@ -945,15 +1165,33 @@ extern "C" fn vo_open(
         Ok(bytes) => bytes,
         Err(e) => return report_error(out_error, &e),
     };
-    let metadata = parse_mpeg_metadata(&bytes);
+    // The MPEG header parser is cheap and kept as a fallback for the
+    // synthetic elementary streams the tests build.
+    let mpeg = parse_mpeg_metadata(&bytes);
+    let decoder = match video::MovieDecoder::open(bytes) {
+        Ok(decoder) => Some(decoder),
+        Err(e) => {
+            log::debug!("VideoOverlay.open({file:?}): ffmpeg could not open the media: {e}");
+            None
+        }
+    };
+    let ffmpeg = decoder.as_ref().map(|d| d.metadata().clone());
+    let frame = decoder.as_ref().and_then(|d| d.current_frame().cloned());
     // SAFETY: `instance` is a live VideoOverlayInst payload.
     let inst = unsafe { &mut *(instance as *mut VideoOverlayInst) };
-    apply_open(inst, metadata, &file);
+    apply_open(inst, ffmpeg, mpeg, decoder, frame, &file);
     set_void_out(out);
     0
 }
 
-fn apply_open(inst: &mut VideoOverlayInst, metadata: Option<MpegMetadata>, file: &str) {
+fn apply_open(
+    inst: &mut VideoOverlayInst,
+    ffmpeg: Option<video::MovieMetadata>,
+    mpeg: Option<MpegMetadata>,
+    decoder: Option<video::MovieDecoder>,
+    frame: Option<video::RgbaFrame>,
+    file: &str,
+) {
     inst.playing = false;
     inst.period_fired = false;
     inst.position_ms = 0;
@@ -967,31 +1205,77 @@ fn apply_open(inst: &mut VideoOverlayInst, metadata: Option<MpegMetadata>, file:
     inst.number_of_audio_stream = 0;
     inst.number_of_video_stream = 0;
     inst.status = PlayStatus::Stop;
+    inst.decoder = decoder;
+    inst.frame = frame;
     set_active(inst as *mut VideoOverlayInst, false);
 
-    if let Some(metadata) = metadata {
-        inst.original_width = i64::from(metadata.width);
-        inst.original_height = i64::from(metadata.height);
-        inst.fps = metadata.fps;
-        inst.total_frame = metadata.total_frames;
-        inst.total_time_ms = metadata.total_time_ms;
-        inst.number_of_audio_stream = metadata.audio_streams;
-        inst.number_of_video_stream = metadata.video_streams.max(1);
-        if inst.width == 0 {
-            inst.width = i64::from(metadata.width);
-        }
-        if inst.height == 0 {
-            inst.height = i64::from(metadata.height);
-        }
-        log::info!(
-            "VideoOverlay.open({file:?}): {}x{} @ {:.3} fps, {} frame(s)",
+    if let Some(metadata) = ffmpeg {
+        apply_metadata(
+            inst,
             metadata.width,
             metadata.height,
             metadata.fps,
-            metadata.total_frames
+            metadata.total_frames,
+            metadata.total_time_ms,
+            metadata.audio_streams,
+            metadata.video_streams,
+        );
+        log::info!(
+            "VideoOverlay.open({file:?}): {}x{} @ {:.3} fps, {} frame(s), {} audio stream(s) [ffmpeg]",
+            metadata.width,
+            metadata.height,
+            metadata.fps,
+            metadata.total_frames,
+            metadata.audio_streams,
+        );
+    } else if let Some(metadata) = mpeg {
+        apply_metadata(
+            inst,
+            metadata.width,
+            metadata.height,
+            metadata.fps,
+            metadata.total_frames,
+            metadata.total_time_ms,
+            metadata.audio_streams,
+            metadata.video_streams,
+        );
+        log::info!(
+            "VideoOverlay.open({file:?}): {}x{} @ {:.3} fps, {} frame(s) [mpeg sequence header]",
+            metadata.width,
+            metadata.height,
+            metadata.fps,
+            metadata.total_frames,
         );
     } else {
-        log::warn!("VideoOverlay.open({file:?}): no MPEG sequence header; metadata unavailable");
+        log::warn!("VideoOverlay.open({file:?}): no decodable video; metadata unavailable");
+    }
+}
+
+/// Store decoded metadata in the instance fields and adopt the coded size
+/// as the default rectangle when the script has not set one.
+#[allow(clippy::too_many_arguments)]
+fn apply_metadata(
+    inst: &mut VideoOverlayInst,
+    width: u32,
+    height: u32,
+    fps: f64,
+    total_frames: i64,
+    total_time_ms: i64,
+    audio_streams: i64,
+    video_streams: i64,
+) {
+    inst.original_width = i64::from(width);
+    inst.original_height = i64::from(height);
+    inst.fps = fps;
+    inst.total_frame = total_frames;
+    inst.total_time_ms = total_time_ms;
+    inst.number_of_audio_stream = audio_streams;
+    inst.number_of_video_stream = video_streams.max(1);
+    if inst.width == 0 {
+        inst.width = i64::from(width);
+    }
+    if inst.height == 0 {
+        inst.height = i64::from(height);
     }
 }
 
@@ -1025,6 +1309,8 @@ fn apply_close(inst: &mut VideoOverlayInst) {
     inst.number_of_audio_stream = 0;
     inst.number_of_video_stream = 0;
     inst.status = PlayStatus::Unload;
+    inst.decoder = None;
+    inst.frame = None;
     set_active(inst as *mut VideoOverlayInst, false);
 }
 
@@ -1060,6 +1346,8 @@ extern "C" fn vo_play(
         (set_status(inst, PlayStatus::Play), inst.objthis)
     };
     set_active(instance as *mut VideoOverlayInst, true);
+    // SAFETY: `instance` is a live VideoOverlayInst payload.
+    present_current(unsafe { &mut *(instance as *mut VideoOverlayInst) }, now);
     if let Some(status) = status {
         fire_status(objthis, status);
     }
@@ -1088,6 +1376,8 @@ extern "C" fn vo_pause(
         (set_status(inst, PlayStatus::Pause), inst.objthis)
     };
     set_active(instance as *mut VideoOverlayInst, false);
+    // SAFETY: `instance` is a live VideoOverlayInst payload.
+    present_current(unsafe { &mut *(instance as *mut VideoOverlayInst) }, now);
     if let Some(status) = status {
         fire_status(objthis, status);
     }
@@ -1115,6 +1405,11 @@ extern "C" fn vo_stop(
         (set_status(inst, PlayStatus::Stop), inst.objthis)
     };
     set_active(instance as *mut VideoOverlayInst, false);
+    // SAFETY: `instance` is a live VideoOverlayInst payload.
+    present_current(
+        unsafe { &mut *(instance as *mut VideoOverlayInst) },
+        now_ms(),
+    );
     if let Some(status) = status {
         fire_status(objthis, status);
     }
@@ -1139,6 +1434,7 @@ extern "C" fn vo_rewind(
     inst.play_anchor_position_ms = 0;
     inst.play_anchor_ms = now;
     inst.period_fired = false;
+    present_current(inst, now);
     set_void_out(out);
     0
 }
@@ -1573,6 +1869,106 @@ pub fn register_video_overlay(engine: &Tjs2Engine) -> Result<(), String> {
                 set: Some(mixing_bg_set),
             },
             NativeInstancePropertyDef {
+                name: "contrast",
+                get: Some(contrast_get),
+                set: Some(contrast_set),
+            },
+            NativeInstancePropertyDef {
+                name: "contrastRangeMin",
+                get: Some(contrast_range_min_get),
+                set: None,
+            },
+            NativeInstancePropertyDef {
+                name: "contrastRangeMax",
+                get: Some(contrast_range_max_get),
+                set: None,
+            },
+            NativeInstancePropertyDef {
+                name: "contrastDefaultValue",
+                get: Some(contrast_default_value_get),
+                set: None,
+            },
+            NativeInstancePropertyDef {
+                name: "contrastStepSize",
+                get: Some(contrast_step_size_get),
+                set: None,
+            },
+            NativeInstancePropertyDef {
+                name: "brightness",
+                get: Some(brightness_get),
+                set: Some(brightness_set),
+            },
+            NativeInstancePropertyDef {
+                name: "brightnessRangeMin",
+                get: Some(brightness_range_min_get),
+                set: None,
+            },
+            NativeInstancePropertyDef {
+                name: "brightnessRangeMax",
+                get: Some(brightness_range_max_get),
+                set: None,
+            },
+            NativeInstancePropertyDef {
+                name: "brightnessDefaultValue",
+                get: Some(brightness_default_value_get),
+                set: None,
+            },
+            NativeInstancePropertyDef {
+                name: "brightnessStepSize",
+                get: Some(brightness_step_size_get),
+                set: None,
+            },
+            NativeInstancePropertyDef {
+                name: "hue",
+                get: Some(hue_get),
+                set: Some(hue_set),
+            },
+            NativeInstancePropertyDef {
+                name: "hueRangeMin",
+                get: Some(hue_range_min_get),
+                set: None,
+            },
+            NativeInstancePropertyDef {
+                name: "hueRangeMax",
+                get: Some(hue_range_max_get),
+                set: None,
+            },
+            NativeInstancePropertyDef {
+                name: "hueDefaultValue",
+                get: Some(hue_default_value_get),
+                set: None,
+            },
+            NativeInstancePropertyDef {
+                name: "hueStepSize",
+                get: Some(hue_step_size_get),
+                set: None,
+            },
+            NativeInstancePropertyDef {
+                name: "saturation",
+                get: Some(saturation_get),
+                set: Some(saturation_set),
+            },
+            NativeInstancePropertyDef {
+                name: "saturationRangeMin",
+                get: Some(saturation_range_min_get),
+                set: None,
+            },
+            NativeInstancePropertyDef {
+                name: "saturationRangeMax",
+                get: Some(saturation_range_max_get),
+                set: None,
+            },
+            NativeInstancePropertyDef {
+                name: "saturationDefaultValue",
+                get: Some(saturation_default_value_get),
+                set: None,
+            },
+            NativeInstancePropertyDef {
+                name: "saturationStepSize",
+                get: Some(saturation_step_size_get),
+                set: None,
+            },
+            NativeInstancePropertyDef {
                 name: "originalWidth",
                 get: Some(original_width_get),
                 set: None,
@@ -1610,6 +2006,41 @@ pub fn register_video_overlay(engine: &Tjs2Engine) -> Result<(), String> {
             NativeInstancePropertyDef {
                 name: "numberOfVideoStream",
                 get: Some(number_of_video_stream_get),
+                set: None,
+            },
+            NativeInstancePropertyDef {
+                name: "frameWidth",
+                get: Some(frame_width_get),
+                set: None,
+            },
+            NativeInstancePropertyDef {
+                name: "frameHeight",
+                get: Some(frame_height_get),
+                set: None,
+            },
+            NativeInstancePropertyDef {
+                name: "frameBytes",
+                get: Some(frame_bytes_get),
+                set: None,
+            },
+            NativeInstancePropertyDef {
+                name: "frameChecksum",
+                get: Some(frame_checksum_get),
+                set: None,
+            },
+            NativeInstancePropertyDef {
+                name: "audioSampleCount",
+                get: Some(audio_sample_count_get),
+                set: None,
+            },
+            NativeInstancePropertyDef {
+                name: "audioSampleRate",
+                get: Some(audio_sample_rate_get),
+                set: None,
+            },
+            NativeInstancePropertyDef {
+                name: "audioChannels",
+                get: Some(audio_channels_get),
                 set: None,
             },
             NativeInstancePropertyDef {
@@ -2070,5 +2501,34 @@ mod tests {
 
         set_video_storage(None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn adjustment_properties_round_trip() {
+        let _vm_lock = vm_lock();
+        let engine = Tjs2Engine::new().expect("create engine");
+        crate::register_all(&engine).expect("register all natives");
+        engine
+            .exec_script(
+                r#"
+                var v = new VideoOverlay(null);
+                var before = v.contrast;
+                var cmin = v.contrastRangeMin;
+                v.contrast = 1.5;
+                v.brightness = -0.5;
+                v.hue = 90.0;
+                v.saturation = 0.25;
+                var after = v.contrast;
+                var sat = v.saturation;
+                var smax = v.saturationRangeMax;
+                "#,
+                "video_overlay_adjust",
+            )
+            .expect("adjustment members must not throw");
+        assert_eq!(engine.eval("before", "test").unwrap(), TjsValue::Real(1.0));
+        assert_eq!(engine.eval("after", "test").unwrap(), TjsValue::Real(1.5));
+        assert_eq!(engine.eval("sat", "test").unwrap(), TjsValue::Real(0.25));
+        assert_eq!(engine.eval("cmin", "test").unwrap(), TjsValue::Real(0.0));
+        assert_eq!(engine.eval("smax", "test").unwrap(), TjsValue::Real(2.0));
     }
 }
