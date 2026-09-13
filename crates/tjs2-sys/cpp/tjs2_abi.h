@@ -51,10 +51,14 @@ typedef struct {
      * call, exactly like `string`. */
     const char *string;
     /* TJS2_VAL_ARRAY: `count` NUL-terminated UTF-8 strings (owned by the
-     * caller, valid until the callback returns). */
+     * caller, valid until the callback returns).
+     * TJS2_VAL_OBJECT: the closure receiver (`objthis`, an opaque
+     *   iTJSDispatch2*) of the object argument when it is a method/closure
+     *   reference; 0 for a plain object. Retaining the value preserves the
+     *   receiver so a later call runs with the correct `this`. */
     const char **array;
     /* TJS2_VAL_ARRAY: element count. TJS2_VAL_OCTET: byte length of
-     * `string`. */
+     * `string`. Unused (0) for objects. */
     int array_count;
     /* TJS2_VAL_RETAINED: a value retained via tjs2_retain_value.
      * TJS2_VAL_OBJECT: the raw iTJSDispatch2* of the object argument (an

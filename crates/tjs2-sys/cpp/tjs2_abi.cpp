@@ -132,8 +132,16 @@ void variant_to_value(tjs2_engine *e, const TJS::tTJSVariant &v,
         }
         case tvtObject:
             // TJS `null` is an object with a null Object pointer; keep it
-            // distinct from a real object and from void.
-            out->type = v.AsObjectNoAddRef() ? TJS2_VAL_OBJECT : TJS2_VAL_NULL;
+            // distinct from a real object and from void. A real object's
+            // closure receiver (ObjThis) is carried in the otherwise-unused
+            // `array` slot (see variant_to_value_one).
+            if(v.AsObjectNoAddRef()) {
+                out->type = TJS2_VAL_OBJECT;
+                out->array = reinterpret_cast<const char **>(
+                    v.AsObjectThisNoAddRef());
+            } else {
+                out->type = TJS2_VAL_NULL;
+            }
             break;
         case tvtOctet: {
             // Raw binary data. std::string can carry embedded NULs, so the
@@ -286,12 +294,21 @@ void variant_to_value_one(tjs2_engine *e, const TJS::tTJSVariant &var,
             if(var.AsObjectNoAddRef()) {
                 out->retained =
                     reinterpret_cast<tjs2_value_id>(var.AsObjectNoAddRef());
+                // A method/closure reference has a distinct ObjThis (its
+                // receiver). Marshal it in the unused-for-objects `array`
+                // slot so a native that retains the argument and invokes it
+                // later runs with the correct `this` (tTJSVariantClosure::
+                // FuncCall prefers ObjThis, tjsVariant.h:227-238). Null for a
+                // plain object.
+                out->array = reinterpret_cast<const char **>(
+                    var.AsObjectThisNoAddRef());
                 out->type = TJS2_VAL_OBJECT;
             } else {
                 // TJS `null` (tvtObject with a null Object pointer) must not
                 // masquerade as a handle-less object, or retaining it would
                 // fall back to last_object and retain the wrong value.
                 out->retained = nullptr;
+                out->array = nullptr;
                 out->type = TJS2_VAL_NULL;
             }
             break;
@@ -387,7 +404,11 @@ void value_to_variant(tjs2_engine *e, const tjs2_value *in, TJS::tTJSVariant *ou
             if(in->retained) {
                 TJS::iTJSDispatch2 *obj =
                     reinterpret_cast<TJS::iTJSDispatch2 *>(in->retained);
-                *out = TJS::tTJSVariant(obj, obj);
+                TJS::iTJSDispatch2 *objthis =
+                    in->array ? reinterpret_cast<TJS::iTJSDispatch2 *>(
+                                    const_cast<char **>(in->array))
+                              : obj;
+                *out = TJS::tTJSVariant(obj, objthis);
             } else if(e && e->last_object.Type() == TJS::tvtObject) {
                 *out = e->last_object;
             } else {
@@ -703,10 +724,10 @@ class tjs2_native_instance : public TJS::tTJSNativeInstance {
     tjs2_engine *engine;
     tjs2_native_destroy_instance_fn destroy;
     void *native_ptr;
-    bool valid;
+    bool valid;       // payload allocated and not yet released
+    bool invalidated; // finalized; direct dispatch must stop
 
-    // Release the Rust payload exactly once. Called from Invalidate() (at
-    // finalize) and from the destructor; the second call is a no-op.
+    // Release the Rust payload exactly once (from the destructor).
     void release_payload() {
         if(valid) {
             if(destroy && native_ptr)
@@ -720,30 +741,37 @@ public:
     tjs2_native_instance(tjs2_engine *e,
                          tjs2_native_create_instance_fn create,
                          tjs2_native_destroy_instance_fn d)
-        : engine(e), destroy(d), native_ptr(nullptr), valid(false) {
+        : engine(e), destroy(d), native_ptr(nullptr), valid(false),
+          invalidated(false) {
         native_ptr = create(e);
         valid = true;
     }
 
     ~tjs2_native_instance() override { release_payload(); }
 
-    // Called by tTJSCustomObject::Finalize (tjsObject.cpp:389-405) before
-    // the object's members are deleted. Reference native instances override
-    // this to drop their resources (e.g. EventIntf.cpp:1032 stops a timer),
-    // so a finalized object no longer dispatches into a live payload. We
-    // release the Rust payload here; any later method/property access
-    // resolves to a null payload and is rejected (see the GetNativePtr()
-    // checks in the dispatchers), instead of touching freed memory.
+    // Reference `tTJSNativeInstance::Invalidate()` is a no-op (tjsNative.h:42)
+    // and `Destruct()` deletes the instance (tjsNative.h:44). Concrete
+    // natives release resources in `Invalidate`, but the C++ instance object
+    // stays alive until `Destruct()`, and `tTJSCustomObject::Finalize()`
+    // calls the script `finalize` BEFORE `Invalidate()` (tjsObject.cpp:389-
+    // 405). Freeing the Rust payload here would tear down backing state
+    // (e.g. remove a scene layer via the destroy callback) while sibling or
+    // child objects are still finalizing; defer the release to the
+    // destructor and only mark the instance so direct dispatch stops. This
+    // keeps a script `finalize` able to set native properties
+    // (`SelectItemBase.finalize`: `cursor = crDefault`) while still refusing
+    // calls on a finalized object (the first-task guard).
     void Invalidate() override {
-        release_payload();
+        invalidated = true;
         inherited::Invalidate();
     }
 
-    // Null once the object has been finalized/invalidated, so the
-    // dispatchers can reject calls on finalized objects instead of handing
-    // Rust a payload that has already been destroyed. Also null if the Rust
-    // create callback returned null.
-    void *GetNativePtr() const { return valid ? native_ptr : nullptr; }
+    // Null once finalized (so the dispatchers reject calls) or if the Rust
+    // create callback returned null. The payload itself is released only by
+    // the destructor.
+    void *GetNativePtr() const {
+        return (valid && !invalidated) ? native_ptr : nullptr;
+    }
     bool IsValid() const { return valid; }
 };
 
@@ -1154,7 +1182,14 @@ static bool resolve_value_variant(tjs2_engine *e, const tjs2_value *v,
         if(v->retained) {
             TJS::iTJSDispatch2 *obj =
                 reinterpret_cast<TJS::iTJSDispatch2 *>(v->retained);
-            var = TJS::tTJSVariant(obj, obj);
+            // `array` carries the closure's ObjThis for a native argument
+            // (null for a plain object); fall back to `obj` otherwise, which
+            // matches tTJSVariantClosure's Object-as-receiver default.
+            TJS::iTJSDispatch2 *objthis =
+                v->array ? reinterpret_cast<TJS::iTJSDispatch2 *>(
+                               const_cast<char **>(v->array))
+                         : obj;
+            var = TJS::tTJSVariant(obj, objthis);
             return true;
         }
         if(e->last_object.Type() != TJS::tvtObject)

@@ -178,6 +178,24 @@ impl Value {
         }
     }
 
+    /// The raw closure receiver (`objthis`) carried by a `VAL_OBJECT`, or
+    /// null for a plain object.
+    ///
+    /// The C++ side stores a method/closure reference's receiver in the
+    /// otherwise-unused `array` slot of the object value (see
+    /// `object_handle`). Retaining the value through [`Tjs2Engine::retain_object_arg`]
+    /// / [`retain_object_arg_raw`] then preserves the correct `this`, so a
+    /// native that holds a method reference and calls it later (e.g. the
+    /// game's `new AsyncTrigger(onCleaning, "")`) runs it on the right
+    /// object. The pointer is owned by the VM and valid only for the call.
+    pub fn object_objthis(&self) -> *mut c_void {
+        if self.ty == VAL_OBJECT {
+            self.array as *mut c_void
+        } else {
+            ptr::null_mut()
+        }
+    }
+
     /// Raw octet bytes of a `VAL_OCTET` value, or `None` for any other type.
     ///
     /// `array_count` is the byte length (the `VAL_OCTET` counterpart of the
@@ -1760,6 +1778,24 @@ mod tests {
     static COUNTER_CREATED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     static COUNTER_DESTROYED: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(0);
+    static COUNTER_VALUE_SET: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    /// `Counter()` constructor member — lets a script subclass call
+    /// `super.Counter()`, which creates + registers the native instance.
+    extern "C" fn counter_ctor(
+        _engine: *mut c_void,
+        _instance: *mut c_void,
+        _argc: c_int,
+        _argv: *const Value,
+        out: *mut Value,
+        _out_error: *mut *mut c_char,
+        _objthis: *mut c_void,
+    ) -> c_int {
+        // SAFETY: out is a valid return slot.
+        unsafe { (*out).ty = VAL_VOID };
+        0
+    }
 
     /// Create a fresh heap i32 counter payload for `new Counter()`.
     extern "C" fn counter_create(_engine: *mut c_void) -> *mut c_void {
@@ -1859,6 +1895,10 @@ mod tests {
             destroy: counter_destroy,
             methods: vec![
                 NativeInstanceMethodDef {
+                    name: "Counter",
+                    f: counter_ctor,
+                },
+                NativeInstanceMethodDef {
                     name: "inc",
                     f: counter_inc,
                 },
@@ -1918,6 +1958,7 @@ mod tests {
         let c = unsafe { &mut *counter_ptr(instance) };
         let v = unsafe { &*value };
         *c = v.integer as i32;
+        COUNTER_VALUE_SET.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         0
     }
 
@@ -2077,7 +2118,7 @@ var ra = a.get(); var rb = b.get();",
     }
 
     #[test]
-    fn invalidated_native_instance_releases_payload_and_stops_dispatching() {
+    fn invalidated_native_instance_stops_dispatching_and_releases_on_destroy() {
         let _vm_lock = vm_lock();
         COUNTER_CREATED.store(0, std::sync::atomic::Ordering::SeqCst);
         COUNTER_DESTROYED.store(0, std::sync::atomic::Ordering::SeqCst);
@@ -2086,33 +2127,43 @@ var ra = a.get(); var rb = b.get();",
         e.register_native_class_instance(&counter_builder())
             .unwrap();
         // `var m = c.inc` stores the method closure with ObjThis = c, so it
-        // keeps `c` alive across `invalidate c`. Invalidate runs the native
-        // instance's Invalidate() -> Rust destroy at finalize time.
+        // keeps `c` alive across `invalidate c`.
         e.exec_script(
             "var c = new Counter(); c.inc(); var m = c.inc; invalidate c;",
             "test",
         )
         .unwrap();
+        // Reference lifecycle: `tTJSNativeInstance::Invalidate()` releases
+        // resources but the native instance is destroyed by `Destruct()`
+        // (tjsNative.h:35-49); the Rust payload is freed by the destructor,
+        // NOT at invalidate. This keeps backing state alive for any
+        // remaining finalizers.
         assert_eq!(
             COUNTER_DESTROYED.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "invalidate must release the native payload at finalize time"
+            0,
+            "invalidate must not free the native payload"
         );
-        // The object is still alive (m holds a reference) but its payload is
-        // gone. Calling the closure must raise a catchable TJS error rather
-        // than dispatch into freed memory.
+        // Direct dispatch on a finalized object is still refused (catchable),
+        // rather than running on a torn-down instance.
         let err = e.exec_script("m();", "test").unwrap_err();
         assert!(
             err.to_string().contains("invalidated"),
             "expected an invalidated-instance error, got: {err}"
         );
-        // The payload was destroyed exactly once (no destructor double free).
+        assert_eq!(
+            COUNTER_DESTROYED.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the failed dispatch must not have freed the payload"
+        );
+        // Releasing the last references must eventually run the destructor:
+        // dropping the engine certainly does. Exactly one Rust destroy, no
+        // double free.
+        drop(e);
         assert_eq!(
             COUNTER_DESTROYED.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "payload must be destroyed exactly once"
         );
-        // Dropping the engine with `c`/`m` still alive must not crash.
     }
 
     // -------------------------------------------------------------------
@@ -3391,5 +3442,269 @@ var ra = a.get(); var rb = b.get();",
             .set_member(id.raw_id(), "value", &TjsValue::Integer(3))
             .unwrap_err();
         assert!(!err.is_empty(), "invalidated object must error: {err}");
+    }
+
+    // --- closure receiver (ObjThis) round-trip --------------------------
+
+    /// `CallbackNatives.callWithSelf(fn)` — retains the function/closure
+    /// argument (preserving its ObjThis) and invokes it immediately. If the
+    /// receiver were lost, a method reference would run with the wrong `this`
+    /// (the function object), so `this.n` would be missing.
+    extern "C" fn native_call_with_self(
+        engine: *mut c_void,
+        argc: c_int,
+        argv: *const Value,
+        out: *mut Value,
+        out_error: *mut *mut c_char,
+    ) -> c_int {
+        if argc < 1 {
+            return 1;
+        }
+        // SAFETY: argv is valid for argc entries during the call.
+        let arg = unsafe { &*argv };
+        if arg.ty != VAL_OBJECT {
+            return 1;
+        }
+        // Retain through the per-argument handle; the C++ side reconstructs
+        // the closure with its ObjThis (see Value::object_objthis).
+        let dv = match unsafe { retain_object_arg_raw(engine as *mut Engine, arg) } {
+            Ok(dv) => dv,
+            Err(_) => return 1,
+        };
+        let mut inner = Value {
+            ty: VAL_VOID,
+            integer: 0,
+            real: 0.0,
+            string: ptr::null(),
+            array: ptr::null(),
+            array_count: 0,
+            retained: 0,
+        };
+        let mut err: *mut c_char = ptr::null_mut();
+        // SAFETY: engine is live; dv holds the retention (tjs2_call_value
+        // does not consume it; it is released when dv drops).
+        let rc = unsafe {
+            tjs2_call_value(
+                engine as *mut Engine,
+                dv.raw_id(),
+                0,
+                ptr::null(),
+                &mut inner,
+                &mut err,
+            )
+        };
+        if rc != 0 {
+            // SAFETY: err is malloc'd by the C++ side (or null).
+            let msg = unsafe { take_error_string(err) };
+            // SAFETY: out_error is a valid slot.
+            unsafe { *out_error = alloc_error_string(&msg) };
+            return 1;
+        }
+        // SAFETY: out is a valid return slot; inner holds a copied result.
+        unsafe { *out = inner };
+        0
+    }
+
+    fn callback_builder() -> NativeClassBuilder<'static> {
+        NativeClassBuilder {
+            name: "CallbackNatives",
+            methods: vec![NativeMethodDef {
+                name: "callWithSelf",
+                f: native_call_with_self,
+            }],
+            properties: vec![],
+        }
+    }
+
+    #[test]
+    fn method_reference_argument_preserves_objthis() {
+        let _vm_lock = vm_lock();
+        let e = Tjs2Engine::new().unwrap();
+        e.register_native_class(&callback_builder()).unwrap();
+        e.exec_script(
+            "class Holder { \
+                 var n; \
+                 function Holder(v) { n = v; } \
+                 function bump() { return n + 1; } \
+             } \
+             var h = new Holder(41);",
+            "test",
+        )
+        .unwrap();
+        // A method reference carries ObjThis = h. The native retains it and
+        // calls it: `n` resolves on h, not on the function object.
+        e.exec_script("var r = CallbackNatives.callWithSelf(h.bump);", "test")
+            .unwrap();
+        assert_eq!(e.eval("r", "test").unwrap(), TjsValue::Integer(42));
+        // A plain global function (no receiver) still works.
+        e.exec_script(
+            "function plain() { return 7; } \
+             var p = CallbackNatives.callWithSelf(plain);",
+            "test",
+        )
+        .unwrap();
+        assert_eq!(e.eval("p", "test").unwrap(), TjsValue::Integer(7));
+        // The eval -> retain -> call path preserves the receiver too (via
+        // the engine's last-object slot).
+        let v = e.eval("h.bump", "test").unwrap();
+        assert_eq!(v, TjsValue::Object);
+        let id = e.retain_value_detached(&v).unwrap();
+        assert_eq!(e.call_detached(&id, &[]).unwrap(), TjsValue::Integer(42));
+    }
+
+    // --- parent/child instance teardown --------------------------------
+
+    static PARENT_TORN_DOWN: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    static CHILD_FINALIZE_SET: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    extern "C" fn parent_like_create(_engine: *mut c_void) -> *mut c_void {
+        Box::into_raw(Box::new(0u8)) as *mut c_void
+    }
+    extern "C" fn parent_like_destroy(_engine: *mut c_void, instance: *mut c_void) {
+        // Simulates a native destroy that tears down shared backing state
+        // (the reference `tTJSNI_BaseWindow`/`BaseLayer` cleanup).
+        PARENT_TORN_DOWN.store(true, std::sync::atomic::Ordering::SeqCst);
+        // SAFETY: instance came from parent_like_create.
+        unsafe { drop(Box::from_raw(instance as *mut u8)) };
+    }
+    extern "C" fn child_like_create(_engine: *mut c_void) -> *mut c_void {
+        Box::into_raw(Box::new(0u8)) as *mut c_void
+    }
+    extern "C" fn child_like_destroy(_engine: *mut c_void, instance: *mut c_void) {
+        // SAFETY: instance came from child_like_create.
+        unsafe { drop(Box::from_raw(instance as *mut u8)) };
+    }
+    extern "C" fn child_like_ctor(
+        _engine: *mut c_void,
+        _instance: *mut c_void,
+        _argc: c_int,
+        _argv: *const Value,
+        out: *mut Value,
+        _out_error: *mut *mut c_char,
+        _objthis: *mut c_void,
+    ) -> c_int {
+        // SAFETY: out is a valid return slot.
+        unsafe { (*out).ty = VAL_VOID };
+        0
+    }
+    extern "C" fn child_probe_set(
+        _engine: *mut c_void,
+        _instance: *mut c_void,
+        _value: *const Value,
+        _out_error: *mut *mut c_char,
+        _objthis: *mut c_void,
+    ) -> c_int {
+        if PARENT_TORN_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
+            // Same shape as the Layer setter when its scene entry is gone.
+            return 1;
+        }
+        CHILD_FINALIZE_SET.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        0
+    }
+    fn parent_like_builder() -> NativeInstanceBuilder<'static> {
+        NativeInstanceBuilder {
+            name: "ParentLike",
+            create: parent_like_create,
+            destroy: parent_like_destroy,
+            methods: vec![],
+            properties: vec![],
+        }
+    }
+    fn child_like_builder() -> NativeInstanceBuilder<'static> {
+        NativeInstanceBuilder {
+            name: "ChildLike",
+            create: child_like_create,
+            destroy: child_like_destroy,
+            methods: vec![NativeInstanceMethodDef {
+                name: "ChildLike",
+                f: child_like_ctor,
+            }],
+            properties: vec![NativeInstancePropertyDef {
+                name: "childProbe",
+                get: None,
+                set: Some(child_probe_set),
+            }],
+        }
+    }
+
+    #[test]
+    fn script_finalize_can_set_native_property_before_invalidate() {
+        let _vm_lock = vm_lock();
+        COUNTER_VALUE_SET.store(0, std::sync::atomic::Ordering::SeqCst);
+        COUNTER_DESTROYED.store(0, std::sync::atomic::Ordering::SeqCst);
+        let e = Tjs2Engine::new().unwrap();
+        e.register_native_class_instance(&counter_builder())
+            .unwrap();
+        // Reference `tTJSCustomObject::Finalize()` (tjsObject.cpp:389-405)
+        // runs the script `finalize` BEFORE `ClassInstances[i]->Invalidate()`,
+        // and the reference `Invalidate` does not destroy the native instance
+        // (tjsNative.h:35-49). A finalize-time native property write must
+        // therefore reach a live payload.
+        e.exec_script(
+            "class FinalizeCounter extends Counter { \
+                 function FinalizeCounter() { super.Counter(); } \
+                 function finalize() { value = 123; super.finalize(); } \
+             } \
+             var fc = new FinalizeCounter(); \
+             var probe = fc.value; \
+             invalidate fc;",
+            "test",
+        )
+        .unwrap();
+        assert_eq!(
+            e.eval("probe", "test").unwrap(),
+            TjsValue::Integer(0),
+            "the native instance exists before finalize"
+        );
+        assert_eq!(
+            COUNTER_VALUE_SET.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the script finalize must set the native property"
+        );
+        assert_eq!(
+            COUNTER_DESTROYED.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "Invalidate must not free the payload before other finalizers run"
+        );
+    }
+
+    #[test]
+    fn invalidating_a_parent_instance_does_not_tear_down_children_early() {
+        // Mirrors the game's layer-tree teardown: a parent native instance's
+        // destroy callback removes backing state, and a child's script
+        // `finalize` sets a native property. With the reference lifecycle the
+        // parent's payload is released at destruction, not at Invalidate, so
+        // the child's finalize still sees live state.
+        let _vm_lock = vm_lock();
+        PARENT_TORN_DOWN.store(false, std::sync::atomic::Ordering::SeqCst);
+        CHILD_FINALIZE_SET.store(0, std::sync::atomic::Ordering::SeqCst);
+        let e = Tjs2Engine::new().unwrap();
+        e.register_native_class_instance(&parent_like_builder())
+            .unwrap();
+        e.register_native_class_instance(&child_like_builder())
+            .unwrap();
+        e.exec_script(
+            "class ChildSub extends ChildLike { \
+                 function ChildSub() { super.ChildLike(); } \
+                 function finalize() { childProbe = 1; super.finalize(); } \
+             } \
+             var p = new ParentLike(); \
+             var c = new ChildSub(); \
+             invalidate p; \
+             invalidate c;",
+            "test",
+        )
+        .unwrap();
+        assert_eq!(
+            CHILD_FINALIZE_SET.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the child finalize must set its native property"
+        );
+        assert!(
+            !PARENT_TORN_DOWN.load(std::sync::atomic::Ordering::SeqCst),
+            "the parent must not have torn down child state before the child finalize"
+        );
     }
 }
