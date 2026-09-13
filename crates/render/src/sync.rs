@@ -42,16 +42,21 @@
 //!
 //! # Rebuild strategy
 //!
-//! Milestone approach: **full rebuild every frame** — every [`SceneSprite`]
-//! and [`WindowRoot`] entity is despawned and respawned from the current
-//! scene snapshot. The scene is small (a few dozen layers), so the churn is
-//! negligible and correctness wins; layer/window removal is handled for free.
-//! The only incremental parts are **texture upload**: [`BitmapAssets`] caches
-//! one [`Handle<Image>`] per bitmap id ([`tvp_visual::scene::BitmapState::dirty`]
-//! is the sole trigger for a re-upload, cleared here after the upload), and
-//! the shared GPU primitives ([`GpuPrimitives`]: unit quad mesh + white 1×1
-//! texture) created once and reused. Per-frame [`LayerBlendMaterial`] assets
-//! are tracked in [`FrameBlendMaterials`] and freed at the next sync so they
+//! The sync is **incremental**: the entities it owns are cached in
+//! [`FrameBlendMaterials`] keyed by window/layer id and updated in place. A
+//! newly-appeared layer spawns one entity; a removed layer's entity is
+//! despawned; an existing layer only gets `Transform`/`Sprite`/`Mesh2d`/
+//! material/`Visibility` re-inserted. A [`Scene::revision`] counter (bumped by
+//! every scene mutation) plus the camera's logical size let an unchanged frame
+//! skip the whole sync.
+//!
+//! **Texture upload** stays dirty-gated: [`BitmapAssets`] caches one
+//! [`Handle<Image>`] per bitmap id ([`tvp_visual::scene::BitmapState::dirty`]
+//! is the sole trigger for a re-upload, cleared here after the upload). The
+//! shared GPU primitives ([`GpuPrimitives`]: unit quad mesh + white 1×1
+//! texture) are created once and reused. A [`LayerBlendMaterial`] is cached
+//! per blended layer and only replaced when its blend mode / texture / tint
+//! changes, and freed when the layer leaves the material path — so materials
 //! never accumulate.
 //!
 //! # Locking
@@ -61,12 +66,12 @@
 //! main thread today, but the lock discipline is kept explicit for the
 //! future threading model (WAVE3.md).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 use bevy::asset::{Assets, Handle, RenderAssetUsages};
 use bevy::camera::{Camera2d, ClearColorConfig, OrthographicProjection, Projection, ScalingMode};
-use bevy::color::Color;
+use bevy::color::{Color, LinearRgba};
 use bevy::ecs::prelude::{Commands, Component, Entity, Query, Res, ResMut, Resource, With};
 use bevy::image::Image;
 use bevy::math::primitives::Rectangle;
@@ -77,7 +82,7 @@ use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::sprite_render::MeshMaterial2d;
 use tvp_visual::scene::{BitmapState, LayerState, Rect, Scene};
 
-use crate::blend::{LayerBlendMaterial, LayerRenderPath, render_path_for};
+use crate::blend::{LayerBlendMaterial, LayerBlendMode, LayerRenderPath, render_path_for};
 
 /// The shared logical scene: natives (VM) write under the lock, this crate
 /// reads under it. See WAVE3.md.
@@ -154,11 +159,45 @@ pub struct GpuPrimitives {
     white_1x1: Option<Handle<Image>>,
 }
 
-/// Strong handles of the [`LayerBlendMaterial`] assets created by the last
-/// sync. The full rebuild despawns their entities every frame, so these are
-/// removed at the start of the next sync — material assets never accumulate.
+/// Incremental sync state: the entities spawned last frame (keyed by
+/// window/layer id), the cached [`LayerBlendMaterial`] per blended layer, and
+/// the revision/camera bookkeeping that lets an unchanged frame skip the sync
+/// entirely.
+///
+/// (Historically this resource only tracked the per-frame blend materials; it
+/// keeps that public name so the app wiring in `main.rs` does not need to
+/// change.)
 #[derive(Resource, Default)]
-pub struct FrameBlendMaterials(Vec<Handle<LayerBlendMaterial>>);
+pub struct FrameBlendMaterials {
+    /// `window.id` → root entity.
+    roots: HashMap<u32, Entity>,
+    /// `layer.id` → layer sprite/quad entity.
+    sprites: HashMap<u32, Entity>,
+    /// `layer.id` → cached blend material for layers on the material path.
+    materials: HashMap<u32, CachedMaterial>,
+    /// [`Scene::revision`] at the last completed sync (`None` before the
+    /// first sync).
+    last_revision: Option<u64>,
+    /// Logical scene size the camera projection was last built for.
+    last_projection: Option<(u32, u32)>,
+}
+
+/// One cached [`LayerBlendMaterial`] plus the configuration it was built
+/// from. It is reused while that configuration is unchanged and replaced
+/// (freeing the old asset) when it changes.
+#[derive(Clone)]
+struct CachedMaterial {
+    handle: Handle<LayerBlendMaterial>,
+    mode: LayerBlendMode,
+    texture: Handle<Image>,
+    color: LinearRgba,
+}
+
+impl CachedMaterial {
+    fn matches(&self, mode: LayerBlendMode, texture: &Handle<Image>, color: LinearRgba) -> bool {
+        self.mode == mode && self.texture == *texture && self.color == color
+    }
+}
 
 /// Root entity for one logical window: the background/anchor node that owns
 /// the window's layer sprites.
@@ -230,39 +269,38 @@ pub fn sync_scene(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<LayerBlendMaterial>>,
     mut gpu: ResMut<GpuPrimitives>,
-    mut frame_materials: ResMut<FrameBlendMaterials>,
-    previous_roots: Query<Entity, With<WindowRoot>>,
-    previous_sprites: Query<Entity, With<SceneSprite>>,
+    mut state: ResMut<FrameBlendMaterials>,
     cameras: Query<Entity, With<SceneCamera>>,
 ) {
-    // Full rebuild: drop everything we spawned last frame (camera excluded).
-    // Roots auto-despawn their sprite children (despawning a parent removes
-    // the whole subtree), so only the roots need explicit despawn commands.
-    for entity in &previous_roots {
-        commands.entity(entity).despawn();
-    }
-    let _ = previous_sprites;
-
-    // The entities referencing last frame's blend materials are gone; free
-    // the assets so they don't accumulate (one fresh material per blended
-    // layer per frame is fine, a growing pool is not).
-    for handle in frame_materials.0.drain(..) {
-        materials.remove(handle.id());
-    }
-
     let scene = shared.0.read().expect("shared scene lock poisoned");
+
+    let projection_size = scene.windows.first().map(|w| logical_size(w.inner_size));
+
+    // Idle fast path: the scene has not mutated since the last sync, the
+    // camera projection is current, and the window set is unchanged. The
+    // window-count check also catches a window removed through a native's
+    // direct `windows.retain` (which cannot bump the revision).
+    if state.last_revision == Some(scene.revision())
+        && state.last_projection == projection_size
+        && state.roots.len() == scene.windows.len()
+        && cameras.iter().next().is_some()
+    {
+        return;
+    }
+
     let mut uploaded: Vec<u32> = Vec::new();
 
-    // The first window owns the 2D camera. Re-insert its projection every
-    // sync so a runtime `inner_size` change (the in-game config resolution
-    // option) keeps the logical scene centred instead of leaving the camera
-    // pinned to whatever size was current when it was spawned. The camera
-    // entity itself is kept across frames.
-    if let Some(window) = scene.windows.first() {
-        let projection = scene_projection(window.inner_size);
+    // The first window owns the 2D camera. Spawn it once; re-insert its
+    // projection only when the logical scene size actually changes, so the
+    // common frame does no camera work. The camera entity is kept across
+    // frames.
+    if let Some(size) = projection_size {
+        let projection = scene_projection(size);
         match cameras.iter().next() {
             Some(camera) => {
-                commands.entity(camera).insert(projection);
+                if state.last_projection != Some(size) {
+                    commands.entity(camera).insert(projection);
+                }
             }
             None => {
                 // The first window gets the 2D camera. Extra windows have no
@@ -280,16 +318,37 @@ pub fn sync_scene(
         }
     }
 
+    // Split the resource into disjoint field borrows so the retention
+    // closures below can touch the entity maps and the material cache at the
+    // same time.
+    let FrameBlendMaterials {
+        roots,
+        sprites,
+        materials: cached_materials,
+        last_revision,
+        last_projection,
+    } = &mut *state;
+
+    let mut live_layers: HashSet<u32> = HashSet::new();
+    let mut live_windows: HashSet<u32> = HashSet::new();
+
     for window in &scene.windows {
-        // Background / root node for this window.
-        let root = commands
-            .spawn((
-                WindowRoot {
-                    window_id: window.id,
-                },
-                Transform::default(),
-            ))
-            .id();
+        live_windows.insert(window.id);
+        let root = match roots.get(&window.id).copied() {
+            Some(root) => root,
+            None => {
+                let root = commands
+                    .spawn((
+                        WindowRoot {
+                            window_id: window.id,
+                        },
+                        Transform::default(),
+                    ))
+                    .id();
+                roots.insert(window.id, root);
+                root
+            }
+        };
 
         if !window.visible {
             continue;
@@ -304,6 +363,7 @@ pub fn sync_scene(
             let Some(composed) = compose_layer(&scene, layer_id) else {
                 continue;
             };
+            live_layers.insert(layer_id);
             let alpha = win_opacity * composed.opacity;
             let (visual, draw_rect) = build_layer_visual(
                 layer,
@@ -313,10 +373,7 @@ pub fn sync_scene(
                 &scene,
                 &mut images,
                 &mut uploaded,
-                &mut meshes,
-                &mut materials,
                 &mut gpu,
-                &mut frame_materials.0,
             );
             let (x, y) = rect_center(draw_rect, win_w, win_h);
             let transform = Transform::from_xyz(x, y, sprite_z(index));
@@ -329,48 +386,161 @@ pub fn sync_scene(
                 layer_id,
                 blend_type: layer.blend_type,
             };
-            // Blended quads reuse the shared unit quad scaled to the drawn
-            // rect; sprites carry their size via custom_size instead.
-            let sprite = match visual {
+
+            match visual {
                 LayerVisual::Sprite(sprite) => {
-                    commands.spawn((marker, sprite, transform, visibility))
+                    // Switching away from the material path: drop the blended
+                    // entity and free its cached material, then respawn.
+                    if let Some(cached) = cached_materials.remove(&layer_id) {
+                        if let Some(entity) = sprites.remove(&layer_id) {
+                            commands.entity(entity).despawn();
+                        }
+                        materials.remove(cached.handle.id());
+                    }
+                    match sprites.get(&layer_id).copied() {
+                        Some(entity) => {
+                            commands
+                                .entity(entity)
+                                .insert((sprite, transform, visibility));
+                        }
+                        None => {
+                            let entity =
+                                commands.spawn((marker, sprite, transform, visibility)).id();
+                            commands.entity(root).add_child(entity);
+                            sprites.insert(layer_id, entity);
+                        }
+                    }
                 }
-                LayerVisual::Blended { mesh, material } => {
+                LayerVisual::Blended {
+                    mode,
+                    texture,
+                    color,
+                } => {
+                    // Switching to the material path from a plain sprite:
+                    // replace the sprite entity with a quad.
+                    if sprites.contains_key(&layer_id)
+                        && !cached_materials.contains_key(&layer_id)
+                        && let Some(entity) = sprites.remove(&layer_id)
+                    {
+                        commands.entity(entity).despawn();
+                    }
+                    let material = if let Some(cached) = cached_materials.get_mut(&layer_id) {
+                        if cached.matches(mode, &texture, color) {
+                            cached.handle.clone()
+                        } else {
+                            materials.remove(cached.handle.id());
+                            let handle = materials.add(LayerBlendMaterial::new(
+                                color,
+                                texture.clone(),
+                                mode,
+                            ));
+                            cached.handle = handle.clone();
+                            cached.mode = mode;
+                            cached.texture = texture;
+                            cached.color = color;
+                            handle
+                        }
+                    } else {
+                        let handle =
+                            materials.add(LayerBlendMaterial::new(color, texture.clone(), mode));
+                        cached_materials.insert(
+                            layer_id,
+                            CachedMaterial {
+                                handle: handle.clone(),
+                                mode,
+                                texture,
+                                color,
+                            },
+                        );
+                        handle
+                    };
+                    // Blended quads reuse the shared unit quad scaled to the
+                    // drawn rect.
+                    let quad = gpu
+                        .unit_quad
+                        .get_or_insert_with(|| meshes.add(Rectangle::new(1.0, 1.0)))
+                        .clone();
                     let mut transform = transform;
                     transform.scale = Vec3::new(draw_rect.w as f32, draw_rect.h as f32, 1.0);
-                    commands.spawn((
-                        marker,
-                        Mesh2d(mesh),
-                        MeshMaterial2d(material),
-                        transform,
-                        visibility,
-                    ))
+                    match sprites.get(&layer_id).copied() {
+                        Some(entity) => {
+                            commands.entity(entity).insert((
+                                Mesh2d(quad),
+                                MeshMaterial2d(material),
+                                transform,
+                                visibility,
+                            ));
+                        }
+                        None => {
+                            let entity = commands
+                                .spawn((
+                                    marker,
+                                    Mesh2d(quad),
+                                    MeshMaterial2d(material),
+                                    transform,
+                                    visibility,
+                                ))
+                                .id();
+                            commands.entity(root).add_child(entity);
+                            sprites.insert(layer_id, entity);
+                        }
+                    }
                 }
             }
-            .id();
-            commands.entity(root).add_child(sprite);
         }
     }
 
+    // Despawn layers that disappeared from the scene...
+    sprites.retain(|layer_id, entity| {
+        if live_layers.contains(layer_id) {
+            return true;
+        }
+        commands.entity(*entity).despawn();
+        false
+    });
+    // ...free their cached materials...
+    cached_materials.retain(|layer_id, cached| {
+        if live_layers.contains(layer_id) {
+            return true;
+        }
+        materials.remove(cached.handle.id());
+        false
+    });
+    // ...and the roots of removed windows.
+    roots.retain(|window_id, entity| {
+        if live_windows.contains(window_id) {
+            return true;
+        }
+        commands.entity(*entity).despawn();
+        false
+    });
+
+    let revision = scene.revision();
     drop(scene);
 
-    // Clear the dirty flags of the bitmaps we uploaded this frame. Short
-    // write lock; same thread today, kept explicit for the future.
-    let mut scene = shared.0.write().expect("shared scene lock poisoned");
-    for id in uploaded {
-        if let Some(bitmap) = scene.bitmap_mut(id) {
-            bitmap.dirty = false;
+    // Clear the dirty flags of the bitmaps we uploaded this frame. This is
+    // renderer bookkeeping and does not bump the scene revision (a short
+    // write lock; same thread today, kept explicit for the future).
+    if !uploaded.is_empty() {
+        let mut scene = shared.0.write().expect("shared scene lock poisoned");
+        for id in uploaded {
+            scene.set_bitmap_clean(id);
         }
     }
+
+    *last_revision = Some(revision);
+    *last_projection = projection_size;
 }
 
-/// What the sync spawns for one layer: a plain [`Sprite`] or a blended
-/// mesh + [`LayerBlendMaterial`] pair.
+/// What the sync builds for one layer: a plain [`Sprite`] or the blend
+/// configuration for a custom-material quad (the caller resolves/reuses the
+/// actual [`LayerBlendMaterial`] so it can stay cached).
 enum LayerVisual {
     Sprite(Sprite),
     Blended {
-        mesh: Handle<Mesh>,
-        material: Handle<LayerBlendMaterial>,
+        mode: LayerBlendMode,
+        texture: Handle<Image>,
+        color: LinearRgba,
     },
 }
 
@@ -405,10 +575,7 @@ fn build_layer_visual(
     scene: &Scene,
     images: &mut Assets<Image>,
     uploaded: &mut Vec<u32>,
-    meshes: &mut Assets<Mesh>,
-    materials: &mut Assets<LayerBlendMaterial>,
     gpu: &mut GpuPrimitives,
-    frame_materials: &mut Vec<Handle<LayerBlendMaterial>>,
 ) -> (LayerVisual, Rect) {
     let path = render_path_for(layer.blend_type, alpha);
     let size = Vec2::new(layer_rect.w as f32, layer_rect.h as f32);
@@ -527,16 +694,11 @@ fn build_layer_visual(
             let color = layer
                 .fill_color
                 .map_or_else(|| bitmap_tint(alpha), |fill| fill_sprite_color(fill, alpha));
-            let quad = gpu
-                .unit_quad
-                .get_or_insert_with(|| meshes.add(Rectangle::new(1.0, 1.0)))
-                .clone();
-            let material = materials.add(LayerBlendMaterial::new(color.to_linear(), texture, mode));
-            frame_materials.push(material.clone());
             (
                 LayerVisual::Blended {
-                    mesh: quad,
-                    material,
+                    mode,
+                    texture,
+                    color: color.to_linear(),
                 },
                 layer_rect,
             )
@@ -1863,5 +2025,175 @@ mod tests {
         // An image placed entirely outside the layer yields nothing.
         assert!(visible_image_region(layer, -500, 0, 200, 200, 200, 200).is_none());
         assert!(visible_image_region(layer, 0, -500, 200, 200, 200, 200).is_none());
+    }
+
+    /// Map every spawned layer entity by its `layer_id`.
+    fn sprite_entities(world: &mut bevy::ecs::world::World) -> HashMap<u32, Entity> {
+        let mut query = world.query_filtered::<(Entity, &SceneSprite), With<SceneSprite>>();
+        query
+            .iter(world)
+            .map(|(entity, marker)| (marker.layer_id, entity))
+            .collect()
+    }
+
+    /// (a) An unchanged scene must not churn entities: repeated idempotent
+    /// syncs keep the *same* entity ids (the fast path skips entirely).
+    #[test]
+    fn idle_frames_skip_sync_and_keep_entity_identity() {
+        let (shared, _l1, _bmp) = two_layer_scene();
+        let mut app = app_with_sync(shared.clone());
+        app.update();
+
+        let first = sprite_entities(app.world_mut());
+        assert_eq!(first.len(), 2);
+        let revision = shared.0.read().unwrap().revision();
+        assert_eq!(
+            app.world().resource::<FrameBlendMaterials>().last_revision,
+            Some(revision),
+            "the first sync records the revision it built"
+        );
+
+        app.update();
+        app.update();
+        assert_eq!(
+            sprite_entities(app.world_mut()),
+            first,
+            "idle frames must keep the same entities"
+        );
+        assert_eq!(
+            shared.0.read().unwrap().revision(),
+            revision,
+            "idle frames do not mutate the scene"
+        );
+    }
+
+    /// (b) A revision bump forces the incremental path, which updates the
+    /// existing entity in place instead of respawning it.
+    #[test]
+    fn revision_bump_updates_in_place_without_respawning() {
+        let (shared, l1, _bmp) = two_layer_scene();
+        let mut app = app_with_sync(shared.clone());
+        app.update();
+        let entity = sprite_entities(app.world_mut())[&l1];
+
+        let revision_before = shared.0.read().unwrap().revision();
+        // A mutable accessor bumps the revision (over-approximation).
+        shared.0.write().unwrap().layer_mut(l1).unwrap().rect.x += 10;
+        let revision_after = shared.0.read().unwrap().revision();
+        assert!(
+            revision_after > revision_before,
+            "a scene mutation bumps the revision"
+        );
+
+        app.update();
+        let after = sprite_entities(app.world_mut());
+        assert_eq!(
+            after[&l1], entity,
+            "an existing layer is updated, not despawned/respawned"
+        );
+        assert_eq!(
+            app.world().resource::<FrameBlendMaterials>().last_revision,
+            Some(revision_after),
+            "the sync records the new revision"
+        );
+
+        let world = app.world_mut();
+        let mut query = world.query_filtered::<(&SceneSprite, &Transform), With<SceneSprite>>();
+        let x = query
+            .iter(world)
+            .find(|(marker, _)| marker.layer_id == l1)
+            .map(|(_, transform)| transform.translation.x)
+            .expect("layer sprite still exists");
+        // TVP rect x moved 100 → 110: bevy x = 110 + 32 - 320 = -178.
+        assert_eq!(x, -178.0, "the in-place update moved the entity");
+    }
+
+    /// (c) A layer that appears spawns exactly one new entity; a removed
+    /// layer despawns its entity on the next sync.
+    #[test]
+    fn layers_appearing_and_removing_spawn_and_despawn() {
+        let (shared, _bg, _) = two_layer_scene();
+        let mut app = app_with_sync(shared.clone());
+        app.update();
+        assert_eq!(sprite_count(app.world_mut()), 2);
+
+        let win = shared.0.read().unwrap().windows[0].id;
+        let added = {
+            let mut scene = shared.0.write().unwrap();
+            let id = scene.add_layer(win, None);
+            scene.layer_mut(id).unwrap().fill_color = Some([1, 2, 3, 255]);
+            id
+        };
+        app.update();
+        let entities = sprite_entities(app.world_mut());
+        assert_eq!(
+            entities.len(),
+            3,
+            "an appearing layer spawns exactly one entity"
+        );
+        assert!(entities.contains_key(&added));
+
+        let removed_entity = entities[&added];
+        shared.0.write().unwrap().remove_layer(added);
+        app.update();
+        let after = sprite_entities(app.world_mut());
+        assert_eq!(after.len(), 2, "the removed layer's entity is gone");
+        assert!(!after.contains_key(&added));
+        assert!(
+            app.world().get::<SceneSprite>(removed_entity).is_none(),
+            "the removed entity was actually despawned"
+        );
+    }
+
+    /// Blend materials are cached per layer: an unchanged resync reuses one,
+    /// a blend change replaces (never accumulates) it, and removing the layer
+    /// frees it.
+    #[test]
+    fn blend_materials_are_cached_replaced_and_freed() {
+        let mut scene = Scene::default();
+        let win = scene.add_window("t", (64, 64));
+        let layer = scene.add_layer(win, None);
+        {
+            let l = scene.layer_mut(layer).unwrap();
+            l.blend_type = tvp_visual::scene::LT_ADDITIVE;
+            l.fill_color = Some([1, 2, 3, 255]);
+            l.rect = Rect {
+                x: 0,
+                y: 0,
+                w: 64,
+                h: 64,
+            };
+        }
+        let shared = SharedScene(Arc::new(RwLock::new(scene)));
+        let mut app = app_with_sync(shared.clone());
+        app.update();
+        let material_count =
+            |app: &mut App| app.world().resource::<Assets<LayerBlendMaterial>>().len();
+        assert_eq!(material_count(&mut app), 1, "one material for one layer");
+
+        // Same blend config: the cached material is reused.
+        shared.0.write().unwrap().layer_mut(layer).unwrap();
+        app.update();
+        assert_eq!(material_count(&mut app), 1, "cached material reused");
+
+        // Different blend mode: replaced, still exactly one.
+        shared
+            .0
+            .write()
+            .unwrap()
+            .layer_mut(layer)
+            .unwrap()
+            .blend_type = tvp_visual::scene::LT_SUBTRACTIVE;
+        app.update();
+        assert_eq!(
+            material_count(&mut app),
+            1,
+            "material replaced, not stacked"
+        );
+
+        // Removed layer: its material is freed.
+        shared.0.write().unwrap().remove_layer(layer);
+        app.update();
+        assert_eq!(material_count(&mut app), 0, "material freed with the layer");
     }
 }
