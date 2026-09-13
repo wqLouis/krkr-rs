@@ -33,7 +33,9 @@ use tjs2_sys::{
 
 use crate::scene::Scene;
 
-use super::ffi::{arg_bool, arg_i64, error_out, instance_ref, set_int_out, set_void_out};
+use super::ffi::{
+    arg_bool, arg_i64, error_out, instance_ref, set_int_out, set_null_out, set_void_out,
+};
 use super::{context_scene_mut, context_scene_read};
 
 /// Payload of one script-visible `Window` object.
@@ -345,40 +347,36 @@ extern "C" fn window_primary_layer_get(
 ) -> c_int {
     let inst = unsafe { instance_ref::<WindowInst>(instance) };
     // Return the primary Layer's TJS object (retained), so scripts can do
-    // `with(primaryLayer){ .setSize(...) ... }` like the real engine.
+    // `with(primaryLayer){ .setSize(...) ... }` like the real engine. When
+    // there is no primary layer (or its object is gone) return `null`, never
+    // an integer: scripts treat `primaryLayer` as an object.
     let layer_id = context_scene_read()
         .window(inst.id)
         .and_then(|w| w.primary_layer);
-    match layer_id.and_then(|id| {
-        let obj = super::layer_tjs_object(id);
-        if obj.is_null() { None } else { Some(obj) }
-    }) {
-        Some(obj) => {
-            let engine = crate::natives::context_engine();
-            // SAFETY: engine is the registered engine; obj is a live TJS
-            // object for the duration of the process.
-            let rid = unsafe { tjs2_sys::tjs2_retain_object(engine.raw(), obj) };
-            if !rid.is_null() {
-                // SAFETY: out is a valid result slot.
-                unsafe {
-                    (*out).ty = tjs2_sys::VAL_RETAINED;
-                    (*out).integer = 0;
-                    (*out).real = 0.0;
-                    (*out).string = std::ptr::null();
-                    (*out).array = std::ptr::null();
-                    (*out).array_count = 0;
-                    (*out).retained = rid as usize;
-                }
-                return 0;
+    let obj = layer_id
+        .map(super::layer_tjs_object)
+        .filter(|obj| !obj.is_null());
+    let engine = crate::natives::context_engine();
+    if let Some(obj) = obj {
+        // SAFETY: engine is the registered engine; obj is a live TJS object
+        // for the duration of the process.
+        let rid = unsafe { tjs2_sys::tjs2_retain_object(engine.raw(), obj) };
+        if !rid.is_null() {
+            // SAFETY: out is a valid result slot.
+            unsafe {
+                (*out).ty = tjs2_sys::VAL_RETAINED;
+                (*out).integer = 0;
+                (*out).real = 0.0;
+                (*out).string = std::ptr::null();
+                (*out).array = std::ptr::null();
+                (*out).array_count = 0;
+                (*out).retained = rid as usize;
             }
-            set_int_out(out, -1);
-            0
-        }
-        None => {
-            set_int_out(out, -1);
-            0
+            return 0;
         }
     }
+    set_null_out(engine, out);
+    0
 }
 
 /// `add(layer)` / `remove(layer)` — no-ops: the real TVP methods take Layer
@@ -559,9 +557,10 @@ pub(crate) fn register_window(engine: &Tjs2Engine) -> Result<(), String> {
                 get: Some(window_height_get),
                 set: None,
             },
-            // Object returns are not supported by the FFI yet; expose the
-            // primary layer's scene id (the game's init path passes it as a
-            // parent id, which the Layer ctor accepts as an int).
+            // The primary Layer's TJS object (retained), or `null` when the
+            // window has no primary layer. The game uses it as an object
+            // (`with(primaryLayer){ ... }`, `new Layer(win, primaryLayer)`)
+            // and compares it against `null`.
             NativeInstancePropertyDef {
                 name: "primaryLayer",
                 get: Some(window_primary_layer_get),

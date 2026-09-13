@@ -4,21 +4,23 @@
 //! game uses. Instances are backed by a [`crate::scene::Scene`] layer; the
 //! payload holds the scene layer id.
 //!
-//! **Object arguments are a milestone simplification**: the FFI cannot
-//! resolve object arguments — a Window/Layer object crossing the ABI
-//! arrives as an opaque `VAL_OBJECT` with no handle. The constructor
-//! therefore treats
+//! **Object arguments**: the FFI cannot hand Rust an object handle, so a
+//! Window/Layer object crossing the ABI arrives as an opaque `VAL_OBJECT`
+//! and is resolved to its scene id by reading its members. Layer/Bitmap ids
+//! are read through `nativeId` (an engine-internal `Layer` property) with an
+//! `id` fallback, so a game class that overrides `id` (e.g. `ADVObject`
+//! returns `_info.id`, nil during construction) is never invoked too early.
+//! The constructor treats
 //!
 //! * `window` as int → the window with that scene id; anything else
 //!   (Window object, `null`, `void`) → the **first** window in the scene
 //!   (the game creates exactly one window); an error if there is none,
-//! * `parent` as int ≥ 0 → the parent layer's scene id; anything else
-//!   (Layer object, `null`, `void`) → `None` (attach directly to the
-//!   window; `w.primaryLayer` returns an int id the game can pass back).
+//! * `parent` as int ≥ 0 → the parent layer's scene id; a Layer object →
+//!   its resolved scene id; `null`/`void` → `None` (attach directly to the
+//!   window; `w.primaryLayer` returns the real Layer object).
 //!
 //! The first layer of a window auto-becomes its primary layer (scene
-//! `add_layer` semantics), so `window.primaryLayer` reads the first layer's
-//! id.
+//! `add_layer` semantics).
 //!
 //! Surface:
 //!
@@ -36,7 +38,7 @@
 //! | `setParentId(id)` | re-parent by layer id (-1 → window) |
 //! | properties `visible`, `opacity` (0..255), `width`, `height`, `left`, `top`, `absolute`, `hitThreshold` | layer state |
 //! | properties `imageLeft`, `imageTop`, `imageWidth`, `imageHeight` | attached-image geometry |
-//! | properties `window`, `parent` | owning window / parent layer **ids** (objects pending) |
+//! | properties `window`, `parent` | owning Window / parent Layer **objects** (retained), or `null` at the window root |
 //! | `update()` | request this layer's script `onPaint` on the next VM poll (reference `CallOnPaint`; drives the `AffineLayer` composite) |
 //! | `onPaint()` | base no-op action (script subclasses override it and call `super.onPaint(...)`) |
 //! | `setCursorPos(x,y)` / `focus()` | no-ops (input: later) |
@@ -59,7 +61,8 @@ use crate::scene::{BitmapState, LayerState, Scene};
 use tvp_text::{FontFace, GlyphAtlas, LayoutOptions, layout};
 
 use super::ffi::{
-    arg_bool, arg_f64, arg_i64, arg_string, error_out, instance_ref, set_int_out, set_void_out,
+    arg_bool, arg_f64, arg_i64, arg_string, error_out, instance_ref, set_int_out, set_null_out,
+    set_void_out,
 };
 use super::{context_engine, context_scene_mut, context_scene_read};
 
@@ -610,12 +613,7 @@ fn resolve_image_source(engine: &Tjs2Engine, v: &Value) -> Result<(Option<bool>,
         }
         tjs2_sys::VAL_OBJECT => {
             let dv = engine.retain_value_detached(&TjsValue::Object)?;
-            let id = match engine.get_member(dv.raw_id(), "id") {
-                Ok(TjsValue::Integer(id)) => id,
-                Ok(TjsValue::Real(id)) => id as i64,
-                Ok(_) => -1,
-                Err(e) => return Err(e),
-            };
+            let id = read_object_id(engine, dv.raw_id())?;
             if id < 0 {
                 return Err(invalid());
             }
@@ -704,20 +702,40 @@ extern "C" fn layer_set_size_to_image_size(
     0
 }
 
+/// Read an object's scene id without tripping a game-script `id` override.
+///
+/// `Layer` exposes an engine-internal `nativeId` property that returns the
+/// native instance's scene id directly. Game classes often override the
+/// script-visible `id` (e.g. `ADVObject.id` returns `_info.id`), which throws
+/// while `_info` is still nil during construction, so `nativeId` is tried
+/// first. `Bitmap` has no `nativeId`, so the ordinary `id` is the fallback.
+fn read_object_id(engine: &Tjs2Engine, id: tjs2_sys::Tjs2ValueId) -> Result<i64, String> {
+    let mut last_error = None;
+    for member in ["nativeId", "id"] {
+        match engine.get_member(id, member) {
+            Ok(TjsValue::Integer(v)) => return Ok(v),
+            Ok(TjsValue::Real(v)) => return Ok(v as i64),
+            Ok(_) => {}
+            Err(e) => last_error = Some(e),
+        }
+    }
+    match last_error {
+        Some(e) => Err(e),
+        None => Ok(-1),
+    }
+}
+
 /// Resolve an object argument (a `Bitmap`/`Layer`/`Window`) or an integer to
-/// the object's `id` member. `TjsValue::Object` resolves against the
-/// engine's most recent object result — the argument just passed.
+/// the object's scene id. `TjsValue::Object` resolves against the engine's
+/// most recent object result — the argument just passed. Object ids are read
+/// through [`read_object_id`] so a game class's `id` override is not invoked
+/// before the object is fully constructed.
 fn resolve_object_id_arg(engine: &Tjs2Engine, v: &Value) -> Result<i64, String> {
     match v.ty {
         tjs2_sys::VAL_INTEGER | tjs2_sys::VAL_REAL => Ok(arg_i64(v)),
         tjs2_sys::VAL_OBJECT => {
             let dv = engine.retain_value_detached(&TjsValue::Object)?;
-            match engine.get_member(dv.raw_id(), "id") {
-                Ok(TjsValue::Integer(id)) => Ok(id),
-                Ok(TjsValue::Real(id)) => Ok(id as i64),
-                Ok(_) => Ok(-1),
-                Err(e) => Err(e),
-            }
+            read_object_id(engine, dv.raw_id())
         }
         _ => Ok(-1),
     }
@@ -1050,7 +1068,9 @@ extern "C" fn layer_image_height_get(
     0
 }
 
-/// `window` — the owning window's scene id (int; object returns pending).
+/// `window` — the owning Window's TJS object (retained), or `null` if it is
+/// unavailable. Scripts compare/use it as an object, so it must never be an
+/// integer.
 extern "C" fn layer_window_get(
     _engine: *mut c_void,
     instance: *mut c_void,
@@ -1059,13 +1079,18 @@ extern "C" fn layer_window_get(
     _objthis: *mut c_void,
 ) -> c_int {
     let inst = unsafe { instance_ref::<LayerInst>(instance) };
-    let scene = context_scene_read();
-    let Some(layer) = scene.layer(inst.id) else {
-        return error_out(out_error, "Layer: layer no longer exists");
+    // Read the window id under a short read lock; drop it before any VM
+    // re-entry (`set_null_out` evaluates the `null` literal).
+    let window = {
+        let scene = context_scene_read();
+        let Some(layer) = scene.layer(inst.id) else {
+            return error_out(out_error, "Layer: layer no longer exists");
+        };
+        layer.window
     };
     // Return the owning Window's TJS object (retained) so scripts can call
     // members on it (`window.addInputNotify(this)`).
-    let win_obj = super::window_tjs_object(layer.window);
+    let win_obj = super::window_tjs_object(window);
     if !win_obj.is_null() {
         let engine = crate::natives::context_engine();
         // SAFETY: engine is the registered engine; win_obj is a live TJS
@@ -1085,13 +1110,15 @@ extern "C" fn layer_window_get(
             return 0;
         }
     }
-    set_int_out(out, i64::from(layer.window));
+    set_null_out(crate::natives::context_engine(), out);
     0
 }
 
-/// `parent` — the parent layer's TJS object (retained), or `-1` when the
-/// layer sits directly on the window. Scripts chain method calls through
-/// it (`parent.onMouseDown(...)`), so returning the object matters.
+/// `parent` — the parent layer's TJS object (retained), or `null` when the
+/// layer sits directly on the window. Scripts chain method calls through it
+/// (`parent.onMouseDown(...)`) and compare it against objects, so it must be
+/// an object or `null` — never an integer (an int would fail the script's
+/// object conversion).
 extern "C" fn layer_parent_get(
     _engine: *mut c_void,
     instance: *mut c_void,
@@ -1100,12 +1127,17 @@ extern "C" fn layer_parent_get(
     _objthis: *mut c_void,
 ) -> c_int {
     let inst = unsafe { instance_ref::<LayerInst>(instance) };
-    let scene = context_scene_read();
-    let Some(layer) = scene.layer(inst.id) else {
-        return error_out(out_error, "Layer: layer no longer exists");
+    // Read the parent id under a short read lock; drop it before any VM
+    // re-entry (`set_null_out` evaluates the `null` literal).
+    let parent_id = {
+        let scene = context_scene_read();
+        let Some(layer) = scene.layer(inst.id) else {
+            return error_out(out_error, "Layer: layer no longer exists");
+        };
+        layer.parent
     };
-    let Some(parent_id) = layer.parent else {
-        set_int_out(out, -1);
+    let Some(parent_id) = parent_id else {
+        set_null_out(crate::natives::context_engine(), out);
         return 0;
     };
     // Return the parent's TJS object (retained) so scripts can call members
@@ -1130,7 +1162,9 @@ extern "C" fn layer_parent_get(
             return 0;
         }
     }
-    set_int_out(out, i64::from(parent_id));
+    // The parent object is unavailable (e.g. its TJS object was collected):
+    // return `null` rather than an int id, so object comparisons stay valid.
+    set_null_out(crate::natives::context_engine(), out);
     0
 }
 
@@ -1239,17 +1273,14 @@ extern "C" fn layer_parent_set(
         tjs2_sys::VAL_OBJECT => {
             // Resolve the Layer object to its scene id. `TjsValue::Object`
             // resolves against the engine's most recent object result — the
-            // value just assigned.
+            // value just assigned. `null` (a null-object variant) has no id,
+            // so it reads as "no parent" (-1), matching the reference's
+            // detach semantics; `nativeId` avoids a game class's `id`
+            // override (see [`read_object_id`]).
             let engine = crate::natives::context_engine();
-            let dv = match engine.retain_value_detached(&TjsValue::Object) {
-                Ok(dv) => dv,
-                Err(e) => return error_out(out_error, &e),
-            };
-            match engine.get_member(dv.raw_id(), "id") {
-                Ok(TjsValue::Integer(id)) => id,
-                Ok(TjsValue::Real(id)) => id as i64,
-                Ok(_) => -1,
-                Err(e) => return error_out(out_error, &e),
+            match engine.retain_value_detached(&TjsValue::Object) {
+                Ok(dv) => read_object_id(engine, dv.raw_id()).unwrap_or(-1),
+                Err(_) => -1,
             }
         }
         _ => -1,
@@ -1962,6 +1993,15 @@ pub(crate) fn register_layer(engine: &Tjs2Engine) -> Result<(), String> {
                 get: Some(layer_id_get),
                 set: None,
             },
+            // Engine-internal alias of `id` that game scripts never override.
+            // `Layer`-typed object arguments are resolved through this so a
+            // script class that overrides the visible `id` (e.g. `ADVObject`
+            // returns `_info.id`) is not invoked during its own construction.
+            NativeInstancePropertyDef {
+                name: "nativeId",
+                get: Some(layer_id_get),
+                set: None,
+            },
             // The layer's Font object (k2compat writes `this.font.doUserSelect`
             // and `this.font.face`). Returns a fresh script object so the
             // assignments succeed; the font's visual state is not consumed
@@ -2493,6 +2533,99 @@ mod tests {
                 .expect("child layer");
             assert_eq!(c.parent, Some(env.eval_int("p2.id") as u32));
         }
+    }
+
+    /// A parentless layer's `parent` must be a real TJS `null` — not `void`
+    /// (`void != null` is true in this VM) and not the old integer `-1`
+    /// (comparing an int against an object target throws, which broke the
+    /// game's `layer.parent != tgt && layer.parent != null` check).
+    #[test]
+    fn parentless_layer_parent_is_null() {
+        let env = TestEnv::new("layer-parent-null");
+        env.run("var w = new Window(); var l = new Layer(w, null);")
+            .unwrap();
+        assert_eq!(env.eval_int("l.parent == null"), 1);
+        assert_eq!(env.eval_int("l.parent === null"), 1);
+        assert_eq!(env.eval_int("l.parent != null"), 0);
+        // The exact game comparison must not throw now.
+        env.run("var tgt = new Layer(w, null); var ok = (l.parent != tgt);")
+            .unwrap();
+        assert_eq!(env.eval_int("ok"), 1);
+    }
+
+    /// `window.primaryLayer` with no primary layer is `null`, never an int.
+    #[test]
+    fn primary_layer_is_null_when_absent() {
+        let env = TestEnv::new("window-primary-null");
+        env.run("var w = new Window();").unwrap();
+        assert_eq!(env.eval_int("w.primaryLayer == null"), 1);
+        assert_eq!(env.eval_int("w.primaryLayer === null"), 1);
+    }
+
+    /// Object-valued getters (`window`, `parent`) return retained objects for
+    /// a parented layer, never an int.
+    #[test]
+    fn object_getters_return_objects_for_parented_layer() {
+        let env = TestEnv::new("layer-object-getters");
+        env.run("var w = new Window(); var p = new Layer(w, null); var c = new Layer(w, p);")
+            .unwrap();
+        assert!(matches!(
+            env.eval("c.parent", "test"),
+            Ok(tjs2_sys::TjsValue::Object)
+        ));
+        assert!(matches!(
+            env.eval("c.window", "test"),
+            Ok(tjs2_sys::TjsValue::Object)
+        ));
+        assert_eq!(env.eval_int("c.parent === p"), 1);
+    }
+
+    /// Setting `parent = null` detaches the layer without throwing.
+    #[test]
+    fn parent_setter_accepts_null_to_detach() {
+        let env = TestEnv::new("layer-parent-null-set");
+        env.run("var w = new Window(); var p = new Layer(w, null); var c = new Layer(w, p);")
+            .unwrap();
+        env.run("c.parent = null;").unwrap();
+        let scene = env.scene();
+        assert_eq!(scene.layers[1].parent, None, "null detaches to the window");
+    }
+
+    /// Model the game's `ADVObject`: a script subclass overrides `id` with a
+    /// getter that dereferences `_info`, which is still nil during
+    /// construction. Resolving the object as a parent must read the native
+    /// `nativeId`, not the overridden `id`, or the constructor throws.
+    #[test]
+    fn layer_constructor_reads_native_id_not_overridden_id() {
+        let env = TestEnv::new("layer-native-id");
+        env.run(
+            "class Info { var id = 7; } \
+             class Bad extends Layer { \
+                 var _info; \
+                 function Bad(win, par) { super.Layer(win, par); } \
+                 property id { \
+                     setter(v) { if (_info === void) _info = new Info(); _info.id = v; } \
+                     getter() { return _info.id; } \
+                 } \
+             } \
+             var w = new Window(); \
+             var bad = new Bad(w, null); \
+             var idThrew = false; \
+             try { var x = bad.id; } catch (e) { idThrew = true; } \
+             var child = new Layer(w, bad); \
+             var ok = (child.parent === bad);",
+        )
+        .unwrap();
+        assert_eq!(
+            env.eval_int("idThrew"),
+            1,
+            "the overridden id getter still throws (model check)"
+        );
+        assert_eq!(
+            env.eval_int("ok"),
+            1,
+            "parent resolved through nativeId without invoking the override"
+        );
     }
 
     #[test]

@@ -9,7 +9,7 @@ use std::cell::RefCell;
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::ptr;
 
-use tjs2_sys::{VAL_INTEGER, VAL_REAL, VAL_STRING, VAL_VOID, Value, tjs2_malloc};
+use tjs2_sys::{Tjs2Engine, VAL_INTEGER, VAL_REAL, VAL_STRING, VAL_VOID, Value, tjs2_malloc};
 
 thread_local! {
     /// Scratch buffer for string return values (`out.string`). Stays valid
@@ -88,6 +88,36 @@ pub(crate) fn set_void_out(out: *mut Value) {
         (*out).real = 0.0;
         (*out).string = ptr::null();
     }
+}
+
+/// Write a TJS `null` return value into `*out`.
+///
+/// The C ABI has no `VAL_NULL`: a TJS `null` is a `tvtObject` variant whose
+/// object pointer is null, distinct from `void` (`void != null` is **true**
+/// in this VM). The only way to produce it across the ABI is to evaluate the
+/// `null` literal and retain the resulting object variant
+/// ([`Tjs2Engine::eval_retained`]). On the unexpected failure path this falls
+/// back to `void`, which is still safely falsy for `if (x)` checks (but
+/// callers that need an object should not rely on that).
+pub(crate) fn set_null_out(engine: &Tjs2Engine, out: *mut Value) {
+    if let Ok(tjs2_sys::RetainedValue::Object(dv)) = engine.eval_retained("null", "native.null") {
+        // SAFETY: `out` is a valid return slot for the duration of the call;
+        // the C++ side consumes the retention before the callback returns.
+        unsafe {
+            (*out).ty = tjs2_sys::VAL_RETAINED;
+            (*out).integer = 0;
+            (*out).real = 0.0;
+            (*out).string = ptr::null();
+            (*out).array = ptr::null();
+            (*out).array_count = 0;
+            (*out).retained = dv.raw_id() as usize;
+        }
+        // The C++ conversion consumes the retention; forget the wrapper so
+        // its Drop does not release the id first.
+        std::mem::forget(dv);
+        return;
+    }
+    set_void_out(out);
 }
 
 /// Write a string return value into `*out` via the thread-local buffer.
