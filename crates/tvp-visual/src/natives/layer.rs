@@ -398,10 +398,10 @@ fn resize_main_image(scene: &mut Scene, layer_id: u32, width: u32, height: u32) 
 }
 
 /// Reference `tTJSNI_BaseLayer::ChangeImageSize` (`LayerIntf.cpp:2307`):
-/// resize the MainImage to exactly `(width, height)`, reset the clip and
-/// mark the image modified. When no MainImage exists only the modified flag
-/// is set (the reference also resizes `ProvinceImage`, which is not
-/// modelled). The numeric image window is re-synced from the bitmap.
+/// resize the MainImage to exactly `(width, height)`, resize the province
+/// plane to the same size (`ProvinceImage->SetSizeWithFill(width, height, 0)`),
+/// reset the clip and mark the image modified. When no MainImage exists only
+/// the modified flag is set. The numeric image window is re-synced.
 fn change_image_size(scene: &mut Scene, layer_id: u32, width: u32, height: u32) {
     if scene.layer(layer_id).and_then(|l| l.bitmap).is_some() {
         resize_main_image(scene, layer_id, width, height);
@@ -412,14 +412,18 @@ fn change_image_size(scene: &mut Scene, layer_id: u32, width: u32, height: u32) 
     } else if let Some(layer) = scene.layer_mut(layer_id) {
         layer.image_modified = true;
     }
+    if scene.layer(layer_id).is_some_and(|l| l.province.is_some()) {
+        scene.resize_province_image(layer_id, width, height);
+    }
     sync_image_dims(scene, layer_id);
 }
 
 /// Reference `tTJSNI_BaseLayer::AllocateImage` (`LayerIntf.cpp:2326`): when
 /// the layer has no MainImage, create one at the current rect size filled
 /// with `neutral_color` and reset the image offsets; reset the clip and mark
-/// the image modified either way. A zero-sized rect allocates 1x1 (the
-/// reference `tTVPBaseTexture` constructor clamps `0` to `1`).
+/// the image modified either way. An existing province plane is resized to
+/// the MainImage. A zero-sized rect allocates 1x1 (the reference
+/// `tTVPBaseTexture` constructor clamps `0` to `1`).
 fn allocate_layer_image(scene: &mut Scene, layer_id: u32) {
     let (has_image, w, h, neutral) = {
         let Some(layer) = scene.layer(layer_id) else {
@@ -451,16 +455,20 @@ fn allocate_layer_image(scene: &mut Scene, layer_id: u32) {
         layer.clip = None;
         layer.image_modified = true;
     }
+    if scene.layer(layer_id).is_some_and(|l| l.province.is_some()) {
+        scene.resize_province_image(layer_id, w, h);
+    }
 }
 
 /// Reference `tTJSNI_BaseLayer::DeallocateImage` (`LayerIntf.cpp:2349`):
-/// drop the MainImage (and the not-modelled ProvinceImage).
+/// drop the MainImage and the province plane.
 fn deallocate_layer_image(scene: &mut Scene, layer_id: u32) {
     if let Some(layer) = scene.layer_mut(layer_id)
         && layer.bitmap.take().is_some()
     {
         layer.image_modified = true;
     }
+    scene.deallocate_province_image(layer_id);
 }
 
 /// Ensure the layer has a MainImage for a pixel operation, allocating one at
@@ -1517,6 +1525,19 @@ extern "C" fn layer_assign_images(
             )
         })
     };
+    // Reference `AssignImages` (`LayerIntf.cpp:2394`) also copies the province
+    // plane (or deallocates the target's when the source has none).
+    let province_src = if kind == Some(false) {
+        None
+    } else {
+        scene.layer(src_id).map(|src| {
+            (
+                src.province.clone(),
+                src.province_width,
+                src.province_height,
+            )
+        })
+    };
     if let Some((bitmap, image_left, image_top, image_width, image_height, w, h)) = layer_src {
         if let Some(target) = scene.layer_mut(inst.id) {
             target.bitmap = bitmap;
@@ -1527,6 +1548,16 @@ extern "C" fn layer_assign_images(
             target.image_height = image_height;
             target.rect.w = w;
             target.rect.h = h;
+            if let Some((province, pw, ph)) = province_src {
+                target.province = province;
+                if target.province.is_some() {
+                    target.province_width = pw;
+                    target.province_height = ph;
+                } else {
+                    target.province_width = 0;
+                    target.province_height = 0;
+                }
+            }
         }
         set_void_out(out);
         return 0;
@@ -4014,8 +4045,9 @@ extern "C" fn layer_color_rect(
         1 => layer_ops::fill_color_hold_alpha(bitmap, destrect, color, opa),
         // dfMask: the low byte of the ARGB color is the blue channel.
         2 => layer_ops::fill_mask(bitmap, destrect, color[2]),
-        // dfProvince: the engine has no province plane; ignore (the
-        // reference writes ProvinceImage, which is not modelled here).
+        // dfProvince: the province plane is now modelled and written through
+        // `setProvincePixel`/`provinceImageBufferForWrite`; `colorRect` does
+        // not route its low byte here (no game flow needs it).
         _ => {}
     }
     set_void_out(out);
@@ -5197,14 +5229,14 @@ pub(crate) fn register_layer(engine: &Tjs2Engine) -> Result<(), String> {
         "setMode",
         "removeMode",
         "clear",
-        // Pixel/province access and sibling ordering used by UI scripts; the
+        // Pixel/mask access and sibling ordering used by UI scripts; the
         // logical model covers the visible behavior, these are no-ops.
+        // `getProvincePixel`/`setProvincePixel` are wired to the province
+        // plane below.
         "setMainPixel",
         "getMainPixel",
         "setMaskPixel",
         "getMaskPixel",
-        "setProvincePixel",
-        "getProvincePixel",
         "independProvinceImage",
         "loadProvinceImage",
         "bringToBack",
@@ -5306,6 +5338,14 @@ pub(crate) fn register_layer(engine: &Tjs2Engine) -> Result<(), String> {
         NativeInstanceMethodDef {
             name: "drawText",
             f: layer_draw_text,
+        },
+        NativeInstanceMethodDef {
+            name: "getProvincePixel",
+            f: layer_get_province_pixel,
+        },
+        NativeInstanceMethodDef {
+            name: "setProvincePixel",
+            f: layer_set_province_pixel,
         },
         NativeInstanceMethodDef {
             name: "drawPolygon",
@@ -5634,6 +5674,39 @@ pub(crate) fn register_layer(engine: &Tjs2Engine) -> Result<(), String> {
                 name: "hasImage",
                 get: Some(layer_has_image_get),
                 set: Some(layer_has_image_set),
+            },
+            // Raw pixel-buffer addresses / pitches (reference
+            // `LayerIntf.cpp:11406-11489`). Read-only; the address is valid
+            // until the corresponding image is resized.
+            NativeInstancePropertyDef {
+                name: "mainImageBuffer",
+                get: Some(layer_main_image_buffer_get),
+                set: None,
+            },
+            NativeInstancePropertyDef {
+                name: "mainImageBufferForWrite",
+                get: Some(layer_main_image_buffer_for_write_get),
+                set: None,
+            },
+            NativeInstancePropertyDef {
+                name: "mainImageBufferPitch",
+                get: Some(layer_main_image_buffer_pitch_get),
+                set: None,
+            },
+            NativeInstancePropertyDef {
+                name: "provinceImageBuffer",
+                get: Some(layer_province_image_buffer_get),
+                set: None,
+            },
+            NativeInstancePropertyDef {
+                name: "provinceImageBufferForWrite",
+                get: Some(layer_province_image_buffer_for_write_get),
+                set: None,
+            },
+            NativeInstancePropertyDef {
+                name: "provinceImageBufferPitch",
+                get: Some(layer_province_image_buffer_pitch_get),
+                set: None,
             },
             NativeInstancePropertyDef {
                 name: "absolute",
@@ -6055,6 +6128,158 @@ extern "C" fn layer_has_image_set(
     } else {
         deallocate_layer_image(&mut scene, inst.id);
     }
+    0
+}
+
+/// `mainImageBuffer` — reference `GetMainImagePixelBuffer`
+/// (`LayerIntf.cpp:3005`): the address of the MainImage RGBA pixel buffer, or
+/// 0 when the layer has no image. The address stays valid until the MainImage
+/// is resized (the reference's `GetScanLine(0)` contract).
+extern "C" fn layer_main_image_buffer_get(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let scene = context_scene_read();
+    set_int_out(out, scene.main_image_pixel_buffer(inst.id) as i64);
+    0
+}
+
+/// `mainImageBufferForWrite` — reference `GetMainImagePixelBufferForWrite`
+/// (`LayerIntf.cpp:3012`): like `mainImageBuffer`, but marks the image
+/// modified. 0 when absent.
+extern "C" fn layer_main_image_buffer_for_write_get(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let mut scene = context_scene_mut();
+    set_int_out(out, scene.main_image_pixel_buffer_for_write(inst.id) as i64);
+    0
+}
+
+/// `mainImageBufferPitch` — reference `GetMainImagePixelBufferPitch`
+/// (`LayerIntf.cpp:3020`): bytes per row (`width * 4`), or 0 when absent.
+extern "C" fn layer_main_image_buffer_pitch_get(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let scene = context_scene_read();
+    set_int_out(out, i64::from(scene.main_image_pitch(inst.id)));
+    0
+}
+
+/// `provinceImageBuffer` — reference `GetProvinceImagePixelBuffer`
+/// (`LayerIntf.cpp:3027`): the address of the 8bpp province plane, or 0 when
+/// absent. Valid until the plane is resized.
+extern "C" fn layer_province_image_buffer_get(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let scene = context_scene_read();
+    set_int_out(out, scene.province_image_pixel_buffer(inst.id) as i64);
+    0
+}
+
+/// `provinceImageBufferForWrite` — reference
+/// `GetProvinceImagePixelBufferForWrite` (`LayerIntf.cpp:3034`): allocates the
+/// province plane when absent (`AllocateProvinceImage`), marks the image
+/// modified and returns its address.
+extern "C" fn layer_province_image_buffer_for_write_get(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let mut scene = context_scene_mut();
+    set_int_out(
+        out,
+        scene.province_image_pixel_buffer_for_write(inst.id) as i64,
+    );
+    0
+}
+
+/// `provinceImageBufferPitch` — reference `GetProvinceImagePixelBufferPitch`
+/// (`LayerIntf.cpp:3042`): bytes per row (`width`), or 0 when absent.
+extern "C" fn layer_province_image_buffer_pitch_get(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let scene = context_scene_read();
+    set_int_out(out, i64::from(scene.province_image_pitch(inst.id)));
+    0
+}
+
+/// `getProvincePixel(x, y)` — reference `GetProvincePixel`
+/// (`LayerIntf.cpp:2973`): 0 when the plane is absent or the coordinate is
+/// outside it.
+extern "C" fn layer_get_province_pixel(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    if args.len() < 2 {
+        return error_out(out_error, "Layer.getProvincePixel requires x and y");
+    }
+    let x = arg_i64(&args[0]) as i32;
+    let y = arg_i64(&args[1]) as i32;
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let scene = context_scene_read();
+    set_int_out(out, i64::from(scene.get_province_pixel(inst.id, x, y)));
+    0
+}
+
+/// `setProvincePixel(x, y, n)` — reference `SetProvincePixel`
+/// (`LayerIntf.cpp:2985`): allocates the province plane when absent, clips to
+/// `ClipRect`, stores the low byte and marks the image modified.
+extern "C" fn layer_set_province_pixel(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    if args.len() < 3 {
+        return error_out(out_error, "Layer.setProvincePixel requires x, y and n");
+    }
+    let x = arg_i64(&args[0]) as i32;
+    let y = arg_i64(&args[1]) as i32;
+    let n = arg_i64(&args[2]) as i32;
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let mut scene = context_scene_mut();
+    if scene.layer(inst.id).is_none() {
+        return error_out(out_error, "Layer: layer no longer exists");
+    }
+    scene.set_province_pixel(inst.id, x, y, n);
+    set_void_out(out);
     0
 }
 

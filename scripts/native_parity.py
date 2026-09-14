@@ -519,14 +519,16 @@ def _builder_spans(
     """Return ``(start, end, class_name)`` for every native class builder."""
     spans: list[tuple[int, int, str]] = []
     consts = _const_strings(code, strings)
-    for m in re.finditer(r"Native(?:Instance|Class)Builder\s*\{", code):
+    for m in re.finditer(
+        r"Native(?:Instance|Class)Builder\s*\{|NativeStaticMembers\s*\{", code
+    ):
         open_pos = code.index("{", m.start())
         end = _match_brace(code, open_pos)
         # Read the builder's own `name:` field from the *original* text (the
         # literal contents are blanked in `code`); fall back to a const
         # identifier (gdiplus uses APPEARANCE_CLASS).
         name_text = raw[open_pos:end]
-        first = re.search(r"\bname\s*:\s*", name_text)
+        first = re.search(r"\b(?:class_)?name\s*:\s*", name_text)
         cls = None
         if first:
             rest = name_text[first.end() :]

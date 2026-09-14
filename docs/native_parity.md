@@ -20,36 +20,36 @@ The checker exits non-zero when a missing member is **not** listed in `scripts/n
 | --- | ---: |
 | tracked classes | 15 |
 | reference members | 527 |
-| matched | 474 |
-| **missing** | **53** |
+| matched | 493 |
+| **missing** | **34** |
 | extra (Rust only) | 105 |
-| coverage | **89.9%** |
+| coverage | **93.5%** |
 
 ## Per-class coverage
 
 | class | ref | rust | matched | missing | extra | coverage |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `Layer` | 150 | 169 | 124 | 26 | 45 | 82.7% |
+| `Layer` | 150 | 175 | 130 | 20 | 45 | 86.7% |
 | `Bitmap` | 20 | 22 | 20 | 0 | 2 | 100.0% |
 | `Window` | 83 | 91 | 83 | 0 | 8 | 100.0% |
 | `Font` | 22 | 14 | 11 | 11 | 3 | 50.0% |
 | `Timer` | 6 | 7 | 5 | 1 | 2 | 83.3% |
 | `System` | 50 | 52 | 50 | 0 | 2 | 100.0% |
-| `Debug` | 13 | 11 | 11 | 2 | 0 | 84.6% |
+| `Debug` | 13 | 13 | 13 | 0 | 0 | 100.0% |
 | `Plugins` | 3 | 4 | 3 | 0 | 1 | 100.0% |
-| `VideoOverlay` | 70 | 75 | 66 | 4 | 9 | 94.3% |
+| `VideoOverlay` | 70 | 79 | 70 | 0 | 9 | 100.0% |
 | `AsyncTrigger` | 6 | 6 | 6 | 0 | 0 | 100.0% |
-| `MenuItem` | 22 | 19 | 19 | 3 | 0 | 86.4% |
+| `MenuItem` | 22 | 20 | 20 | 2 | 0 | 90.9% |
 | `Storages` | 13 | 20 | 13 | 0 | 7 | 100.0% |
-| `Scripts` | 11 | 7 | 7 | 4 | 0 | 63.6% |
-| `KAGParser` | 25 | 43 | 23 | 2 | 20 | 92.0% |
+| `Scripts` | 11 | 11 | 11 | 0 | 0 | 100.0% |
+| `KAGParser` | 25 | 45 | 25 | 0 | 20 | 100.0% |
 | `WaveSoundBuffer` | 33 | 39 | 33 | 0 | 6 | 100.0% |
 
 ## Missing members by class
 
-### `Layer` — 26 missing
+### `Layer` — 20 missing
 
-`children`, `getLayerAt`, `joinFocusChain`, `mainImageBuffer`, `mainImageBufferForWrite`, `mainImageBufferPitch`, `nextFocusable`, `onBeforeFocus`, `onBlur`, `onFocus`, `onKeyPress`, `onMultiTouch`, `onNodeDisabled`, `onNodeEnabled`, `onSearchNextFocusable`, `onSearchPrevFocusable`, `onTouchDown`, `onTouchMove`, `onTouchRotate`, `onTouchScaling`, `onTouchUp`, `onTransitionCompleted`, `prevFocusable`, `provinceImageBuffer`, `provinceImageBufferForWrite`, `provinceImageBufferPitch`
+`children`, `getLayerAt`, `joinFocusChain`, `nextFocusable`, `onBeforeFocus`, `onBlur`, `onFocus`, `onKeyPress`, `onMultiTouch`, `onNodeDisabled`, `onNodeEnabled`, `onSearchNextFocusable`, `onSearchPrevFocusable`, `onTouchDown`, `onTouchMove`, `onTouchRotate`, `onTouchScaling`, `onTouchUp`, `onTransitionCompleted`, `prevFocusable`
 
 ### `Font` — 11 missing
 
@@ -59,25 +59,9 @@ The checker exits non-zero when a missing member is **not** listed in `scripts/n
 
 `mode`
 
-### `Debug` — 2 missing
+### `MenuItem` — 2 missing
 
-`console`, `controller`
-
-### `VideoOverlay` — 4 missing
-
-`onCallbackCommand`, `onFrameUpdate`, `onPeriod`, `onStatusChanged`
-
-### `MenuItem` — 3 missing
-
-`HMENU`, `keycodeToText`, `textToKeycode`
-
-### `Scripts` — 4 missing
-
-`compileStorage`, `dump`, `getClassNames`, `setCallMissing`
-
-### `KAGParser` — 2 missing
-
-`macroParams`, `mp`
+`keycodeToText`, `textToKeycode`
 
 ## Extra members by class
 

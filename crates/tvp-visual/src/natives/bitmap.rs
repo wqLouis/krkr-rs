@@ -14,9 +14,8 @@
 //! * `save(name,type,meta)` (`:326`),
 //! * `load(name[,colorkey])` (`:343`), `loadAsync(name)` (`:367`),
 //! * `loadHeader(name)` (`:378`) and `getSaveOption(type)` (`:403`)
-//!   — registered as instance methods because the current tjs2-sys ABI has
-//!   no static-member support for instance classes (see the module note at
-//!   the bottom of this file),
+//!   — declared `TJS_END_NATIVE_STATIC_METHOD_DECL`, so they are registered
+//!   as static members on the `Bitmap` class object (no instance needed);
 //! * properties `width`/`height` (`:454`/`:472`), `buffer` (`:490`),
 //!   `bufferForWrite` (`:504`), `bufferPitch` (`:519`), `loading` (`:533`),
 //! * the `onLoaded(meta, async, error, message)` event (`:432`), dispatched
@@ -43,7 +42,8 @@ use std::sync::{Arc, LazyLock, Mutex, Weak};
 
 use tjs2_sys::{
     DetachedValue, NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef,
-    RetainedValue, Tjs2Engine, TjsValue, VAL_RETAINED, VAL_STRING, Value,
+    NativeMethodDef, NativeStaticMembers, RetainedValue, Tjs2Engine, TjsValue, VAL_RETAINED,
+    VAL_STRING, Value,
 };
 
 use super::ffi::{arg_i64, arg_string, args, error_out, instance_ref, set_int_out, set_void_out};
@@ -721,16 +721,14 @@ extern "C" fn bitmap_load_async(
 }
 
 /// `loadHeader(name)` (`BitmapIntf.cpp:378`) — image size/alpha dictionary.
-/// Registered as an instance method (see the module note about static
-/// members); the receiver is ignored.
+/// A `TJS_END_NATIVE_STATIC_METHOD_DECL` member: it lives on the `Bitmap`
+/// class object and is reachable without an instance.
 extern "C" fn bitmap_load_header(
     _engine: *mut c_void,
-    _instance: *mut c_void,
     argc: c_int,
     argv: *const Value,
     out: *mut Value,
     out_error: *mut *mut c_char,
-    _objthis: *mut c_void,
 ) -> c_int {
     let args = unsafe { args(argc, argv) };
     if args.is_empty() {
@@ -755,15 +753,13 @@ extern "C" fn bitmap_load_header(
 }
 
 /// `getSaveOption(type)` (`BitmapIntf.cpp:399`) — save-option dictionary.
-/// Registered as an instance method (see the module note).
+/// A `TJS_END_NATIVE_STATIC_METHOD_DECL` member (see `bitmap_load_header`).
 extern "C" fn bitmap_get_save_option(
     _engine: *mut c_void,
-    _instance: *mut c_void,
     argc: c_int,
     argv: *const Value,
     out: *mut Value,
     out_error: *mut *mut c_char,
-    _objthis: *mut c_void,
 ) -> c_int {
     let args = unsafe { args(argc, argv) };
     if args.is_empty() {
@@ -1165,14 +1161,6 @@ pub(crate) fn register_bitmap(engine: &Tjs2Engine) -> Result<(), String> {
                 f: bitmap_load_async,
             },
             NativeInstanceMethodDef {
-                name: "loadHeader",
-                f: bitmap_load_header,
-            },
-            NativeInstanceMethodDef {
-                name: "getSaveOption",
-                f: bitmap_get_save_option,
-            },
-            NativeInstanceMethodDef {
                 name: "onLoaded",
                 f: bitmap_on_loaded,
             },
@@ -1219,22 +1207,26 @@ pub(crate) fn register_bitmap(engine: &Tjs2Engine) -> Result<(), String> {
                 set: None,
             },
         ],
+    })?;
+    // `loadHeader` / `getSaveOption` are `TJS_END_NATIVE_STATIC_METHOD_DECL`
+    // members in the reference (`BitmapIntf.cpp:378` / `:403`): they live on
+    // the class object (`Bitmap.loadHeader(name)`), not on instances.
+    engine.register_native_static_members(&NativeStaticMembers {
+        class_name: "Bitmap",
+        methods: vec![
+            NativeMethodDef {
+                name: "loadHeader",
+                f: bitmap_load_header,
+            },
+            NativeMethodDef {
+                name: "getSaveOption",
+                f: bitmap_get_save_option,
+            },
+        ],
+        properties: vec![],
     })
 }
 
-// NOTE: `loadHeader` and `getSaveOption` are static in the reference
-// (`BitmapIntf.cpp:378` / `:403`, closed with `TJS_END_NATIVE_STATIC_METHOD_DECL`),
-// i.e. scripts call them as `Bitmap.loadHeader(name)` /
-// `Bitmap.getSaveOption(type)`. Our tjs2-sys ABI registers `Bitmap` through
-// `register_native_class_instance`, whose member table has no static-member
-// flag (static members go through the separate `register_native_class`
-// path), so they are registered as *instance* methods that ignore the
-// receiver: `new Bitmap().loadHeader(name)` works, but the reference's
-// static form fails with "native instance method called on an object that
-// is not an instance of this native class". A follow-up tjs2-sys ABI
-// addition (a `TJS_STATICMEMBER` flag on instance-class methods) is needed
-// to make the static spelling work; it cannot be done inside `tvp-visual`.
-//
 // `save` intentionally does not implement the reference's TLG/TLG5/TLG6
 // writer (there is no TLG encoder in this crate); it throws
 // `Unknown graphic format` for those types instead of silently doing
@@ -1563,12 +1555,32 @@ mod tests {
     fn load_header_reads_dimensions_without_scene_bitmap() {
         let env = TestEnv::new("bitmap-header");
         red_fixture(&env);
-        env.run("var b = new Bitmap(); var h = b.loadHeader('testimg');")
-            .unwrap();
+        // `Bitmap.loadHeader` is a static member (`BitmapIntf.cpp:378`,
+        // closed by TJS_END_NATIVE_STATIC_METHOD_DECL): callable on the
+        // class object with no instance.
+        env.run("var h = Bitmap.loadHeader('testimg');").unwrap();
         assert_eq!(env.eval_int("h.width"), 4);
         assert_eq!(env.eval_int("h.height"), 2);
         assert_eq!(env.eval_int("h.bpp"), 32);
-        assert_eq!(env.scene().bitmaps.len(), 1, "only the blank ctor bitmap");
+        assert_eq!(env.scene().bitmaps.len(), 0, "loadHeader creates no bitmap");
+    }
+
+    #[test]
+    fn static_bitmap_members_are_not_copied_onto_instances() {
+        let env = TestEnv::new("bitmap-static-instance");
+        red_fixture(&env);
+        env.run("var b = new Bitmap();").unwrap();
+        // The members live on the class object (TJS_STATICMEMBER), so an
+        // instance does not see them; the reference raises member-not-found.
+        env.run(
+            "var got_header = 'no error'; \
+             try { b.loadHeader('testimg'); } catch (e) { got_header = 'error'; } \
+             var got_save = 'no error'; \
+             try { b.getSaveOption('bmp'); } catch (e) { got_save = 'error'; }",
+        )
+        .unwrap();
+        assert_eq!(env.eval_string("got_header"), "error");
+        assert_eq!(env.eval_string("got_save"), "error");
     }
 
     #[test]
@@ -1591,12 +1603,12 @@ mod tests {
     #[test]
     fn get_save_option_returns_dictionary_for_known_types() {
         let env = TestEnv::new("bitmap-saveopt");
-        env.run("var b = new Bitmap(); var o = b.getSaveOption('bmp');")
-            .unwrap();
+        // `Bitmap.getSaveOption` is a static member (`BitmapIntf.cpp:403`).
+        env.run("var o = Bitmap.getSaveOption('bmp');").unwrap();
         // The bpp option is a dictionary with a "type" key.
         assert_eq!(env.eval_string("o.bpp.type"), "select");
         // PNG exposes an (empty) option dictionary rather than void.
-        env.run("var p = b.getSaveOption('png'); var png_ok = (p !== void);")
+        env.run("var p = Bitmap.getSaveOption('png'); var png_ok = (p !== void);")
             .unwrap();
         assert_eq!(env.eval_int("png_ok"), 1);
     }

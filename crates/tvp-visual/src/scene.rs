@@ -67,6 +67,16 @@ pub struct LayerState {
     pub image_top: i32,
     pub image_width: u32,
     pub image_height: u32,
+    /// Reference `ProvinceImage` (`LayerIntf.cpp:2359` `AllocateProvinceImage`):
+    /// an 8-bit plane (`province_width * province_height` bytes, one byte per
+    /// pixel) backing `getProvincePixel`/`setProvincePixel` and the
+    /// `provinceImageBuffer*` properties. `None` until `setProvincePixel` or a
+    /// `provinceImageBufferForWrite` read allocates it. The plane is layer
+    /// owned (the reference allocates a fresh `tTVPBaseBitmap(..., 8)`), so it
+    /// is not shared through `bitmap`.
+    pub province: Option<Box<[u8]>>,
+    pub province_width: u32,
+    pub province_height: u32,
     pub hit_threshold: i32,
     /// Hit-test mode (reference `tTVPHitType`): `htMask=0` (per-pixel
     /// threshold) or `htProvince=1` (non-transparent province). Stored so
@@ -299,6 +309,9 @@ impl Scene {
             image_top: 0,
             image_width: 0,
             image_height: 0,
+            province: None,
+            province_width: 0,
+            province_height: 0,
             hit_threshold: 16,
             hit_type: 0,
             cursor: 0,
@@ -373,6 +386,233 @@ impl Scene {
         match index {
             Some(index) => self.layers.get_mut(index),
             None => self.layers.iter_mut().find(|l| l.id == id),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Layer MainImage / ProvinceImage raw-pixel access
+    //
+    // The reference exposes the underlying `tTVPBaseBitmap` scan-line
+    // pointers (`GetMainImagePixelBuffer*` / `GetProvinceImagePixelBuffer*`,
+    // `LayerIntf.cpp:3005-3044`) as `tTVInteger` addresses. The buffers are
+    // heap allocations replaced wholesale on a resize, so a returned address
+    // stays valid until the next resize of the same image (or until the
+    // layer/bitmap is dropped). The VM is single-threaded, matching the
+    // reference's raw-pointer contract. All access goes through the safe
+    // slice closures below; producing the address is the single boundary.
+    // ------------------------------------------------------------------
+
+    /// Bytes per row of the layer's MainImage (RGBA8 → `width * 4`), or 0
+    /// when the layer has no image. Reference `GetMainImagePixelBufferPitch`
+    /// (`LayerIntf.cpp:3020`).
+    pub fn main_image_pitch(&self, layer_id: u32) -> u32 {
+        let Some(bitmap_id) = self.layer(layer_id).and_then(|l| l.bitmap) else {
+            return 0;
+        };
+        self.bitmap(bitmap_id).map_or(0, |b| b.width * 4)
+    }
+
+    /// Bytes per row of the layer's ProvinceImage (`width` bytes, 8bpp), or 0
+    /// when absent. Reference `GetProvinceImagePixelBufferPitch`
+    /// (`LayerIntf.cpp:3042`).
+    pub fn province_image_pitch(&self, layer_id: u32) -> u32 {
+        let Some(layer) = self.layer(layer_id) else {
+            return 0;
+        };
+        if layer.province.is_none() {
+            return 0;
+        }
+        layer.province_width
+    }
+
+    /// Address of the layer's MainImage pixel buffer, or 0 when absent.
+    /// Reference `GetMainImagePixelBuffer` (`LayerIntf.cpp:3005`).
+    pub fn main_image_pixel_buffer(&self, layer_id: u32) -> usize {
+        let Some(bitmap_id) = self.layer(layer_id).and_then(|l| l.bitmap) else {
+            return 0;
+        };
+        self.bitmap(bitmap_id)
+            .map_or(0, |b| b.rgba.as_ptr() as usize)
+    }
+
+    /// Address of the layer's MainImage pixel buffer for writing, marking the
+    /// bitmap dirty (the reference `GetMainImagePixelBufferForWrite` sets
+    /// `ImageModified` and calls `GetScanLineForWrite`). 0 when absent.
+    pub fn main_image_pixel_buffer_for_write(&mut self, layer_id: u32) -> usize {
+        let Some(bitmap_id) = self.layer(layer_id).and_then(|l| l.bitmap) else {
+            return 0;
+        };
+        let Some(bitmap) = self.bitmap_mut(bitmap_id) else {
+            return 0;
+        };
+        bitmap.mark_dirty();
+        bitmap.rgba.as_mut_ptr() as usize
+    }
+
+    /// Address of the layer's ProvinceImage pixel buffer, or 0 when absent.
+    /// Reference `GetProvinceImagePixelBuffer` (`LayerIntf.cpp:3027`).
+    pub fn province_image_pixel_buffer(&self, layer_id: u32) -> usize {
+        self.layer(layer_id)
+            .and_then(|l| l.province.as_deref())
+            .map_or(0, |p| p.as_ptr() as usize)
+    }
+
+    /// Address of the layer's ProvinceImage pixel buffer for writing,
+    /// allocating the plane first (the reference `AllocateProvinceImage`).
+    /// Marks the image modified. Reference `GetProvinceImagePixelBufferForWrite`
+    /// (`LayerIntf.cpp:3034`).
+    pub fn province_image_pixel_buffer_for_write(&mut self, layer_id: u32) -> usize {
+        self.allocate_province_image(layer_id);
+        let Some(layer) = self.layer_mut(layer_id) else {
+            return 0;
+        };
+        if layer.province.is_none() {
+            return 0;
+        }
+        layer.image_modified = true;
+        layer
+            .province
+            .as_deref_mut()
+            .map_or(0, |p| p.as_mut_ptr() as usize)
+    }
+
+    /// Safe read access to the layer's MainImage RGBA pixels. Returns `None`
+    /// when the layer or its image is absent.
+    pub fn with_main_image_pixels<R>(
+        &self,
+        layer_id: u32,
+        f: impl FnOnce(&[u8]) -> R,
+    ) -> Option<R> {
+        let bitmap_id = self.layer(layer_id)?.bitmap?;
+        self.bitmap(bitmap_id).map(|b| f(&b.rgba))
+    }
+
+    /// Safe write access to the layer's MainImage RGBA pixels; marks the
+    /// bitmap dirty. Returns `None` when the layer or its image is absent.
+    pub fn with_main_image_pixels_mut<R>(
+        &mut self,
+        layer_id: u32,
+        f: impl FnOnce(&mut [u8]) -> R,
+    ) -> Option<R> {
+        let bitmap_id = self.layer(layer_id)?.bitmap?;
+        let bitmap = self.bitmap_mut(bitmap_id)?;
+        bitmap.mark_dirty();
+        Some(f(&mut bitmap.rgba))
+    }
+
+    /// Safe read access to the layer's ProvinceImage plane. Returns `None`
+    /// when the layer or its province plane is absent.
+    pub fn with_province_pixels<R>(&self, layer_id: u32, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+        let layer = self.layer(layer_id)?;
+        layer.province.as_deref().map(f)
+    }
+
+    /// Safe write access to the layer's ProvinceImage plane; marks the image
+    /// modified. Returns `None` when the layer or its province plane is
+    /// absent.
+    pub fn with_province_pixels_mut<R>(
+        &mut self,
+        layer_id: u32,
+        f: impl FnOnce(&mut [u8]) -> R,
+    ) -> Option<R> {
+        let layer = self.layer_mut(layer_id)?;
+        layer.image_modified = true;
+        layer.province.as_deref_mut().map(f)
+    }
+
+    /// Reference `AllocateProvinceImage` (`LayerIntf.cpp:2359`): size the
+    /// province plane from the MainImage (or the layer rect when there is no
+    /// MainImage) and fill the new area with 0.
+    pub fn allocate_province_image(&mut self, layer_id: u32) {
+        let (w, h) = {
+            let Some(layer) = self.layer(layer_id) else {
+                return;
+            };
+            match layer.bitmap.and_then(|id| self.bitmap(id)) {
+                Some(bitmap) => (bitmap.width, bitmap.height),
+                None => (layer.rect.w, layer.rect.h),
+            }
+        };
+        self.resize_province_image(layer_id, w, h);
+    }
+
+    /// Reference `ProvinceImage->SetSizeWithFill(w, h, 0)`: resize the province
+    /// plane, preserving the overlapping top-left region and filling the
+    /// expansion with 0. A 0-sized province is clamped to 1x1 (the reference
+    /// `tTVPBaseBitmap` constructor does the same).
+    pub fn resize_province_image(&mut self, layer_id: u32, w: u32, h: u32) {
+        let w = w.max(1);
+        let h = h.max(1);
+        let Some(layer) = self.layer_mut(layer_id) else {
+            return;
+        };
+        if layer.province.is_some() && layer.province_width == w && layer.province_height == h {
+            return;
+        }
+        let old_w = layer.province_width;
+        let old_h = layer.province_height;
+        let mut buf = vec![0u8; w as usize * h as usize].into_boxed_slice();
+        if let Some(old) = layer.province.take() {
+            let copy_w = old_w.min(w) as usize;
+            let copy_h = old_h.min(h) as usize;
+            for y in 0..copy_h {
+                let src = &old[y * old_w as usize..y * old_w as usize + copy_w];
+                let dst = &mut buf[y * w as usize..y * w as usize + copy_w];
+                dst.copy_from_slice(src);
+            }
+        }
+        layer.province = Some(buf);
+        layer.province_width = w;
+        layer.province_height = h;
+        layer.image_modified = true;
+    }
+
+    /// Reference `DeallocateProvinceImage` (`LayerIntf.cpp:2374`): drop the
+    /// province plane.
+    pub fn deallocate_province_image(&mut self, layer_id: u32) {
+        if let Some(layer) = self.layer_mut(layer_id)
+            && layer.province.take().is_some()
+        {
+            layer.province_width = 0;
+            layer.province_height = 0;
+            layer.image_modified = true;
+        }
+    }
+
+    /// Reference `GetProvincePixel` (`LayerIntf.cpp:2973`): 0 when the plane is
+    /// absent or the coordinate is outside it.
+    pub fn get_province_pixel(&self, layer_id: u32, x: i32, y: i32) -> i32 {
+        let Some(layer) = self.layer(layer_id) else {
+            return 0;
+        };
+        let Some(buf) = layer.province.as_deref() else {
+            return 0;
+        };
+        if x < 0 || y < 0 || x >= layer.province_width as i32 || y >= layer.province_height as i32 {
+            return 0;
+        }
+        i32::from(buf[y as usize * layer.province_width as usize + x as usize])
+    }
+
+    /// Reference `SetProvincePixel` (`LayerIntf.cpp:2985`): allocate the plane
+    /// when absent, clip against `ClipRect` (and the plane bounds), store the
+    /// low byte and mark the image modified.
+    pub fn set_province_pixel(&mut self, layer_id: u32, x: i32, y: i32, n: i32) {
+        self.allocate_province_image(layer_id);
+        let Some(layer) = self.layer_mut(layer_id) else {
+            return;
+        };
+        let (w, h) = (layer.province_width, layer.province_height);
+        let in_clip = match layer.clip {
+            Some(c) => x >= c.x && y >= c.y && x < c.x + c.w as i32 && y < c.y + c.h as i32,
+            None => true,
+        };
+        if !in_clip || x < 0 || y < 0 || x >= w as i32 || y >= h as i32 {
+            return;
+        }
+        if let Some(buf) = layer.province.as_deref_mut() {
+            buf[y as usize * w as usize + x as usize] = n as u8;
+            layer.image_modified = true;
         }
     }
 

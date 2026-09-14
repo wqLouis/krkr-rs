@@ -4,8 +4,6 @@
 #   python3 scripts/native_parity.py --update-allow
 # The checker fails when a missing member is not listed here.
 
-Debug.console
-Debug.controller
 Font.defaultFaceName
 Font.doUserSelect
 Font.faceIsFileName
@@ -17,14 +15,9 @@ Font.getGlyphDrawRect
 Font.getList
 Font.rasterizer
 Font.unmapPrerenderedFont
-KAGParser.macroParams
-KAGParser.mp
 Layer.children
 Layer.getLayerAt
 Layer.joinFocusChain
-Layer.mainImageBuffer
-Layer.mainImageBufferForWrite
-Layer.mainImageBufferPitch
 Layer.nextFocusable
 Layer.onBeforeFocus
 Layer.onBlur
@@ -42,18 +35,6 @@ Layer.onTouchScaling
 Layer.onTouchUp
 Layer.onTransitionCompleted
 Layer.prevFocusable
-Layer.provinceImageBuffer
-Layer.provinceImageBufferForWrite
-Layer.provinceImageBufferPitch
-MenuItem.HMENU
 MenuItem.keycodeToText
 MenuItem.textToKeycode
-Scripts.compileStorage
-Scripts.dump
-Scripts.getClassNames
-Scripts.setCallMissing
 Timer.mode
-VideoOverlay.onCallbackCommand
-VideoOverlay.onFrameUpdate
-VideoOverlay.onPeriod
-VideoOverlay.onStatusChanged

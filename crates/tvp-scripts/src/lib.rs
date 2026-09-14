@@ -41,26 +41,23 @@
 //! `G_DefaultReadEncoding`), while the default (`"UTF-8"`) keeps the port's
 //! automatic BOM → UTF-16LE → UTF-8 → CP932 detection.
 //!
-//! # Pending (need new `tjs2-sys` C-ABI entry points; not implemented)
+//! # Bytecode and class-introspection members
 //!
-//! These four reference members (`ScriptMgnIntf.cpp:1356,1440,1474,1497`)
-//! cannot be built on the current C ABI. Each needs a small `tjs2_abi.cpp`
-//! addition (the C++ side owns the VM internals, the Rust wrapper cannot
-//! reach them):
+//! These build on the `tjs2-sys` ABI for `tTJS::CompileScript` / `Dump` /
+//! `iTJSDispatch2::ClassInstanceInfo` (reference `ScriptMgnIntf.cpp`):
 //!
-//! - `compileStorage` — reference `TVPCompileStorage`. Needs
-//!   `tjs2_compile_script(engine, script, output_path, isresult,
-//!   outputdebug, isexpression, name, lineofs, err)` wrapping
-//!   `tTJS::CompileScript` with a `TJSCreateBinaryStreamForWrite` output.
-//! - `dump` — reference `TVPDumpScriptEngine`. Needs `tjs2_dump(engine)`
-//!   wrapping `tTJS::Dump()`.
-//! - `getClassNames` — needs `tjs2_get_class_names(engine, obj, out, err)`
-//!   wrapping `iTJSDispatch2::ClassInstanceInfo(TJS_CII_GET, ...)` and
-//!   building a TJS Array.
-//! - `setCallMissing` — needs `tjs2_set_call_missing(engine, obj, err)`
-//!   wrapping `ClassInstanceInfo(TJS_CII_SET_MISSING, ...)`.
-//! - `dumpStringHeap` — reference `TJSDumpStringHeap()` (debug builds
-//!   only).
+//! - `compileStorage(name, output[, isresult[, outputdebug[, isexpression]]])`
+//!   — read `name` through storage like `execStorage`, then compile it to
+//!   the bytecode file `output` (`TVPCompileStorage`, `:1357`).
+//! - `dump()` — dump every live script block to the engine log
+//!   (`TVPDumpScriptEngine`, `:1440`).
+//! - `getClassNames(obj)` — the object's class-name chain, most-derived
+//!   first, as a TJS `Array` (`:1497`).
+//! - `setCallMissing(obj)` — install `obj`'s `missing` method as its
+//!   absent-member handler (`:1474`).
+//!
+//! `dumpStringHeap` (`:1466`) remains unavailable: `TJSDumpStringHeap()` is
+//! compiled only under `TJS_DEBUG_DUMP_STRING` and has no C ABI.
 //!
 //! # ABI limits
 //!
@@ -299,16 +296,15 @@ fn mode_offset(mode: &str) -> Option<usize> {
     None
 }
 
-/// Read storage `name` (honoring the mode's `oN` offset), decode it and
-/// run it in the context VM as a script (`expression == false`) or an
-/// expression (`expression == true`), retaining an object result so it can
-/// cross the ABI.
-fn execute_storage(name: &str, mode: &str, expression: bool) -> Result<RetainedValue, String> {
-    let (engine, storage) = context_engine_and_storage()?;
-
+/// Read storage `name`, honor the mode's `oN` offset, decompress the `FE FE`
+/// container and decode the resulting text. Shared by `execStorage` /
+/// `evalStorage` / `compileStorage` — the reference's
+/// `TVPCreateTextStreamForRead` + `Read(buffer, 0)` path (`TextStream.cpp`).
+fn load_storage_text(name: &str, mode: &str) -> Result<String, String> {
+    let (_engine, storage) = context_engine_and_storage()?;
     let bytes = {
-        // The lock is released before the VM runs, so a script executed
-        // here may itself call Scripts.execStorage without deadlocking.
+        // The lock is released before any VM call, so a script that runs
+        // later may itself re-enter the storage without deadlocking.
         let mut storage = storage
             .lock()
             .map_err(|_| "Scripts: storage lock is poisoned".to_string())?;
@@ -331,7 +327,16 @@ fn execute_storage(name: &str, mode: &str, expression: bool) -> Result<RetainedV
         Err(e) => return Err(format!("Scripts: '{name}': {e}")),
     };
 
-    let text = decode_script(&bytes)?;
+    decode_script(&bytes)
+}
+
+/// Read storage `name` (honoring the mode's `oN` offset), decode it and
+/// run it in the context VM as a script (`expression == false`) or an
+/// expression (`expression == true`), retaining an object result so it can
+/// cross the ABI.
+fn execute_storage(name: &str, mode: &str, expression: bool) -> Result<RetainedValue, String> {
+    let engine = context_engine()?;
+    let text = load_storage_text(name, mode)?;
     log::debug!(
         "Scripts: {} '{name}' ({} bytes)",
         if expression { "eval" } else { "exec" },
@@ -676,6 +681,174 @@ extern "C" fn native_eval(
     finish_retained(out, out_error, result)
 }
 
+/// Interpret an optional boolean argument the way the reference's
+/// `(tjs_int)*param[i]` conversion does for `compileStorage`'s flags.
+fn param_truthy(v: &Value) -> bool {
+    match v.ty {
+        VAL_INTEGER => v.integer != 0,
+        VAL_REAL => v.real != 0.0,
+        _ => false,
+    }
+}
+
+/// `Scripts.compileStorage(name, output[, isresult[, outputdebug[,
+/// isexpression]]])` — compile the storage script `name` to the bytecode
+/// file `output` (reference `TVPCompileStorage`, `ScriptMgnIntf.cpp:1357`).
+extern "C" fn native_compile_storage(
+    _engine: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    if argc < 2 {
+        return error_out(
+            out_error,
+            "Scripts.compileStorage requires at least 2 arguments",
+        );
+    }
+    // SAFETY: argv points to `argc` valid entries for the duration of the call.
+    let args = unsafe { std::slice::from_raw_parts(argv, argc as usize) };
+    let name = match param_to_string(&args[0]) {
+        Ok(name) => name,
+        Err(e) => return error_out(out_error, &e),
+    };
+    let output = match param_to_string(&args[1]) {
+        Ok(output) => output,
+        Err(e) => return error_out(out_error, &format!("Scripts.compileStorage: {e}")),
+    };
+    let isresult = argc >= 3 && param_truthy(&args[2]);
+    let outputdebug = argc >= 4 && param_truthy(&args[3]);
+    let isexpression = argc >= 5 && param_truthy(&args[4]);
+    // The reference reads the source through the storage text stream and
+    // labels the compiled block with the storage name (`TVPCompileStorage`).
+    let text = match load_storage_text(&name, "") {
+        Ok(text) => text,
+        Err(e) => return error_out(out_error, &e),
+    };
+    let engine = match context_engine() {
+        Ok(engine) => engine,
+        Err(e) => return error_out(out_error, &e),
+    };
+    match engine.compile_script(
+        &text,
+        &output,
+        isresult,
+        outputdebug,
+        isexpression,
+        &name,
+        0,
+    ) {
+        Ok(()) => {
+            set_out_void(out);
+            0
+        }
+        Err(e) => error_out(out_error, &format!("Scripts.compileStorage: {e}")),
+    }
+}
+
+/// `Scripts.dump()` — dump every live script block through the engine's
+/// console/log output (reference `TVPDumpScriptEngine`, `ScriptMgnIntf.cpp:1440`).
+extern "C" fn native_dump(
+    _engine: *mut c_void,
+    _argc: c_int,
+    _argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    match context_engine() {
+        Ok(engine) => match engine.dump() {
+            Ok(()) => {
+                set_out_void(out);
+                0
+            }
+            Err(e) => error_out(out_error, &format!("Scripts.dump: {e}")),
+        },
+        Err(e) => error_out(out_error, &e),
+    }
+}
+
+/// `Scripts.getClassNames(obj)` — the class-name chain of `obj`, most-derived
+/// first, as a TJS `Array` (reference `ScriptMgnIntf.cpp:1497`).
+extern "C" fn native_get_class_names(
+    _engine: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    if argc < 1 {
+        return error_out(
+            out_error,
+            "Scripts.getClassNames requires at least 1 argument",
+        );
+    }
+    // SAFETY: argv points to `argc` valid entries for the duration of the call.
+    let args = unsafe { std::slice::from_raw_parts(argv, argc as usize) };
+    let engine = match context_engine() {
+        Ok(engine) => engine,
+        Err(e) => return error_out(out_error, &e),
+    };
+    let object = match engine.retain_object_arg(&args[0]) {
+        Ok(object) => object,
+        Err(_) => {
+            return error_out(
+                out_error,
+                "Scripts.getClassNames: argument is not an object",
+            );
+        }
+    };
+    match engine.get_class_names(object.raw_id()) {
+        Ok(names) => {
+            // The C++ trampoline consumes the retention when it copies the
+            // native result, so hand the id over and leak the guard.
+            set_out_retained(out, names.raw_id() as usize);
+            std::mem::forget(names);
+            0
+        }
+        Err(e) => error_out(out_error, &format!("Scripts.getClassNames: {e}")),
+    }
+}
+
+/// `Scripts.setCallMissing(obj)` — enable `obj`'s `missing` method for absent
+/// members (reference `ScriptMgnIntf.cpp:1474`).
+extern "C" fn native_set_call_missing(
+    _engine: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    if argc < 1 {
+        return error_out(
+            out_error,
+            "Scripts.setCallMissing requires at least 1 argument",
+        );
+    }
+    // SAFETY: argv points to `argc` valid entries for the duration of the call.
+    let args = unsafe { std::slice::from_raw_parts(argv, argc as usize) };
+    let engine = match context_engine() {
+        Ok(engine) => engine,
+        Err(e) => return error_out(out_error, &e),
+    };
+    let object = match engine.retain_object_arg(&args[0]) {
+        Ok(object) => object,
+        Err(_) => {
+            return error_out(
+                out_error,
+                "Scripts.setCallMissing: argument is not an object",
+            );
+        }
+    };
+    match engine.set_call_missing(object.raw_id()) {
+        Ok(()) => {
+            set_out_void(out);
+            0
+        }
+        Err(e) => error_out(out_error, &format!("Scripts.setCallMissing: {e}")),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // registration
 // ---------------------------------------------------------------------------
@@ -784,6 +957,22 @@ pub fn register_scripts(engine: &Tjs2Engine) -> Result<(), String> {
                 name: "getTraceString",
                 f: native_get_trace_string,
             },
+            NativeMethodDef {
+                name: "compileStorage",
+                f: native_compile_storage,
+            },
+            NativeMethodDef {
+                name: "dump",
+                f: native_dump,
+            },
+            NativeMethodDef {
+                name: "getClassNames",
+                f: native_get_class_names,
+            },
+            NativeMethodDef {
+                name: "setCallMissing",
+                f: native_set_call_missing,
+            },
         ],
     })
 }
@@ -863,6 +1052,10 @@ mod tests {
                 std::fs::write(path, bytes).expect("write fixture file");
             }
             let engine = Arc::new(Tjs2Engine::new().expect("create engine"));
+            // The script stream factories resolve relative paths against the
+            // data dir (set by the app at startup); point them at the temp
+            // game dir so `compileStorage`'s output path lands there.
+            engine.set_data_dir(&dir.path().display().to_string());
             let storage = Arc::new(Mutex::new(
                 Storage::mount(dir.path()).expect("mount storage"),
             ));
@@ -1272,5 +1465,141 @@ mod tests {
             );
             assert_eq!(env.eval_ok("a2"), TjsValue::Integer(1));
         }
+    }
+
+    // -- compileStorage / dump -------------------------------------------
+
+    #[test]
+    fn compile_storage_writes_bytecode() {
+        let _vm_lock = vm_lock();
+        let env = TestEnv::new(
+            "compile-storage",
+            &[
+                (
+                    "script.tjs",
+                    b"var compiledValue = 42; return compiledValue;".as_slice(),
+                ),
+                ("expr.tjs", b"6 * 7".as_slice()),
+                ("broken.tjs", b"this is not valid tjs".as_slice()),
+            ],
+        );
+
+        // A statement script compiles to a binary file in the data dir.
+        assert_eq!(
+            env.eval_ok("Scripts.compileStorage('script.tjs', 'out.tjsb')"),
+            TjsValue::Void
+        );
+        let bytes = std::fs::read(env._dir.path().join("out.tjsb"))
+            .expect("compiled bytecode must be written");
+        assert!(!bytes.is_empty(), "compiled bytecode must not be empty");
+
+        // The isresult/outputdebug/isexpression flags reach CompileScript.
+        assert_eq!(
+            env.eval_ok("Scripts.compileStorage('expr.tjs', 'expr.tjsb', true, false, true)"),
+            TjsValue::Void
+        );
+        assert!(
+            !std::fs::read(env._dir.path().join("expr.tjsb"))
+                .expect("expression bytecode must be written")
+                .is_empty()
+        );
+
+        // A compile error is a catchable TJS error, not a silent no-op.
+        assert!(
+            env.eval("Scripts.compileStorage('broken.tjs', 'bad.tjsb')")
+                .is_err()
+        );
+        // A missing input storage is reported too.
+        assert!(
+            env.eval("Scripts.compileStorage('missing.tjs', 'x.tjsb')")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn dump_runs_and_reaches_the_log_callback() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static DUMP_SEEN: AtomicBool = AtomicBool::new(false);
+
+        extern "C" fn capture(_level: c_int, msg: *const c_char, _user: *mut c_void) {
+            if msg.is_null() {
+                return;
+            }
+            // SAFETY: msg is a NUL-terminated UTF-8 string for the call.
+            let s = unsafe { CStr::from_ptr(msg) }.to_string_lossy();
+            if s.contains("TJS Context Dump") {
+                DUMP_SEEN.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let _vm_lock = vm_lock();
+        DUMP_SEEN.store(false, Ordering::SeqCst);
+        let env = TestEnv::new("dump", &[]);
+        env.engine
+            .exec_script("var dumpedValue = 1;", "dump-test")
+            .unwrap();
+        // SAFETY: the callback needs no user pointer.
+        unsafe { env.engine.set_log_cb(Some(capture), ptr::null_mut()) };
+        assert_eq!(env.eval_ok("Scripts.dump()"), TjsValue::Void);
+        assert!(
+            DUMP_SEEN.load(Ordering::SeqCst),
+            "dump output must reach the log callback"
+        );
+    }
+
+    // -- getClassNames / setCallMissing ----------------------------------
+
+    #[test]
+    fn get_class_names_returns_the_class_chain() {
+        let _vm_lock = vm_lock();
+        let env = TestEnv::new("get-class-names", &[]);
+        // TJS's built-in `Array` is a native class, so `new Array()` records
+        // its class name at construction (`tTJSNativeClass::FuncCall` ->
+        // ClassInstanceInfo(TJS_CII_ADD)).
+        env.engine
+            .exec_script("var probe = new Array();", "test")
+            .unwrap();
+
+        // The returned array is usable from the script (retained across the
+        // ABI) and holds the class chain, most-derived first.
+        env.eval_ok("Scripts.exec(\"var names = Scripts.getClassNames(probe);\")");
+        assert_eq!(env.eval_ok("names.length"), TjsValue::Integer(1));
+        assert_eq!(env.eval_ok("names[0]"), TjsValue::String("Array".into()));
+
+        // A non-object argument is rejected.
+        assert!(env.eval("Scripts.getClassNames(42)").is_err());
+    }
+
+    #[test]
+    fn set_call_missing_installs_a_handler() {
+        let _vm_lock = vm_lock();
+        let env = TestEnv::new("set-call-missing", &[]);
+        env.engine
+            .exec_script(
+                "var probe = '';\
+                 var o = %[missing: function(getorset, name, value) { probe = name; return true; }];\
+                 o.known = 5;",
+                "test",
+            )
+            .unwrap();
+
+        // Before enabling it, the `missing` handler does not run (a missing
+        // read yields void in TJS).
+        let _ = env.eval("o.absentMember");
+        assert_eq!(env.eval_ok("probe"), TjsValue::String(String::new()));
+
+        assert_eq!(env.eval_ok("Scripts.setCallMissing(o)"), TjsValue::Void);
+
+        // After enabling it, the `missing` method receives the member name.
+        assert_eq!(env.eval_ok("o.absentMember"), TjsValue::Void);
+        assert_eq!(
+            env.eval_ok("probe"),
+            TjsValue::String("absentMember".into())
+        );
+        // Known members still resolve normally.
+        assert_eq!(env.eval_ok("o.known"), TjsValue::Integer(5));
+
+        // A non-object argument is rejected.
+        assert!(env.eval("Scripts.setCallMissing(42)").is_err());
     }
 }

@@ -70,6 +70,13 @@ impl Env {
         }
     }
 
+    fn eval_int(&self, expr: &str) -> i64 {
+        match self.engine.eval(expr, "layer_image_model") {
+            Ok(tjs2_sys::TjsValue::Integer(i)) => i,
+            other => panic!("eval {expr:?} -> {other:?}"),
+        }
+    }
+
     fn write_webp(&self, name: &str, rgba: &[u8], w: u32, h: u32) {
         let mut bytes = Vec::new();
         image::codecs::webp::WebPEncoder::new_lossless(&mut bytes)
@@ -440,4 +447,211 @@ fn draw_image_allocates_dest_image() {
     let scene = env.scene();
     assert_eq!(bitmap_dims(&scene, 0), (4, 4));
     assert_eq!(pixel(&scene, 0, 1, 1), [4, 5, 6, 255]);
+}
+
+/// `mainImageBuffer`/`mainImageBufferForWrite` return the same non-zero
+/// address (a write does not reallocate), and `mainImageBufferPitch` is
+/// `width * 4` for the RGBA plane (reference
+/// `GetMainImagePixelBuffer*`, `LayerIntf.cpp:3005-3023`).
+#[test]
+fn main_image_buffer_pointer_and_pitch() {
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); var l = new Layer(w, null); \
+         l.setSize(4, 3); l.hasImage = true; \
+         var read = l.mainImageBuffer; \
+         var write = l.mainImageBufferForWrite; \
+         l.colorRect(0, 0, 4, 3, 0xff00ff00); \
+         var after = l.mainImageBuffer; \
+         var pitch = l.mainImageBufferPitch;",
+    );
+    let read = env.eval_int("read");
+    let write = env.eval_int("write");
+    let after = env.eval_int("after");
+    assert_ne!(read, 0, "main image buffer is non-zero");
+    assert_eq!(read, write, "a write does not move the buffer");
+    assert_eq!(read, after, "in-place pixel writes keep the address");
+    assert_eq!(env.eval_int("pitch"), 16, "pitch = width * 4");
+}
+
+/// A MainImage resize replaces the heap buffer, so the address handed to the
+/// script is invalidated — the reference's documented contract.
+#[test]
+fn main_image_buffer_invalidated_on_resize() {
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); var l = new Layer(w, null); \
+         l.setSize(4, 4); l.hasImage = true; \
+         var before = l.mainImageBuffer; var beforePitch = l.mainImageBufferPitch; \
+         l.setSize(40, 4); \
+         var after = l.mainImageBuffer; var afterPitch = l.mainImageBufferPitch;",
+    );
+    assert_ne!(env.eval_int("before"), 0);
+    assert_ne!(env.eval_int("after"), 0);
+    assert_ne!(
+        env.eval_int("before"),
+        env.eval_int("after"),
+        "resize replaces the pixel buffer"
+    );
+    assert_eq!(env.eval_int("beforePitch"), 16);
+    assert_eq!(env.eval_int("afterPitch"), 160);
+}
+
+/// The buffer properties return 0 when the image/plane is absent (the
+/// reference getters return `nullptr`/0).
+#[test]
+fn buffer_properties_are_zero_when_absent() {
+    let env = Env::new();
+    env.run("var w = new Window(); var l = new Layer(w, null); l.setSize(4, 3);");
+    for prop in [
+        "mainImageBuffer",
+        "mainImageBufferForWrite",
+        "mainImageBufferPitch",
+        "provinceImageBuffer",
+        "provinceImageBufferPitch",
+    ] {
+        assert_eq!(env.eval_int(&format!("l.{prop}")), 0, "{prop} absent");
+    }
+    // For-write allocates the province plane, so the plain getter stays 0.
+    env.run("l.hasImage = true;");
+    assert_eq!(env.eval_int("l.provinceImageBuffer"), 0);
+    assert_eq!(env.eval_int("l.provinceImageBufferPitch"), 0);
+}
+
+/// `setProvincePixel`/`getProvincePixel` round-trip through the 8bpp plane;
+/// an absent plane reads as 0 and out-of-bounds reads are 0 (reference
+/// `GetProvincePixel`/`SetProvincePixel`, `LayerIntf.cpp:2973-2999`).
+#[test]
+fn province_pixel_round_trip_and_absent_zero() {
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); var l = new Layer(w, null); \
+         l.setSize(4, 3); l.hasImage = true; \
+         var absentBuffer = l.provinceImageBuffer; \
+         var absentPitch = l.provinceImageBufferPitch; \
+         var absentPixel = l.getProvincePixel(0, 0); \
+         l.setProvincePixel(1, 2, 200); \
+         var got = l.getProvincePixel(1, 2); \
+         var oob = l.getProvincePixel(99, 99); \
+         var other = l.getProvincePixel(0, 0); \
+         var buffer = l.provinceImageBuffer; \
+         var pitch = l.provinceImageBufferPitch;",
+    );
+    assert_eq!(
+        env.eval_int("absentBuffer"),
+        0,
+        "absent province buffer is 0"
+    );
+    assert_eq!(env.eval_int("absentPitch"), 0, "absent province pitch is 0");
+    assert_eq!(env.eval_int("absentPixel"), 0, "absent province pixel is 0");
+    assert_eq!(env.eval_int("got"), 200, "setProvincePixel round-trips");
+    assert_eq!(env.eval_int("oob"), 0, "out-of-bounds reads 0");
+    assert_eq!(env.eval_int("other"), 0, "untouched pixel stays 0");
+    assert_ne!(env.eval_int("buffer"), 0, "plane allocated on write");
+    assert_eq!(env.eval_int("pitch"), 4, "province pitch = width");
+}
+
+/// `provinceImageBufferForWrite` allocates an absent plane sized to the
+/// MainImage and returns a stable, non-zero address (reference
+/// `GetProvinceImagePixelBufferForWrite` → `AllocateProvinceImage`).
+#[test]
+fn province_buffer_for_write_allocates_and_is_stable() {
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); var l = new Layer(w, null); \
+         l.setSize(5, 2); l.hasImage = true; \
+         var before = l.provinceImageBuffer; \
+         var addr = l.provinceImageBufferForWrite; \
+         var pitch = l.provinceImageBufferPitch; \
+         l.setProvincePixel(0, 0, 1); l.setProvincePixel(4, 1, 2); \
+         var again = l.provinceImageBuffer;",
+    );
+    assert_eq!(env.eval_int("before"), 0);
+    assert_ne!(env.eval_int("addr"), 0);
+    assert_eq!(env.eval_int("again"), env.eval_int("addr"), "stable");
+    assert_eq!(env.eval_int("pitch"), 5);
+}
+
+/// The province plane follows the MainImage size on `setImageSize` and keeps
+/// the overlapping values (reference `ChangeImageSize` resizes
+/// `ProvinceImage->SetSizeWithFill(width, height, 0)`). The resize also
+/// replaces the plane's heap buffer, invalidating the old address.
+#[test]
+fn province_plane_resizes_with_main_image() {
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); var l = new Layer(w, null); \
+         l.setSize(4, 3); l.hasImage = true; \
+         l.setProvincePixel(0, 0, 7); \
+         var before = l.provinceImageBuffer; \
+         l.setImageSize(8, 5); \
+         var after = l.provinceImageBuffer; \
+         var pitch = l.provinceImageBufferPitch; \
+         var kept = l.getProvincePixel(0, 0); \
+         var fresh = l.getProvincePixel(7, 4);",
+    );
+    assert_ne!(env.eval_int("before"), 0);
+    assert_ne!(env.eval_int("after"), 0);
+    assert_ne!(
+        env.eval_int("before"),
+        env.eval_int("after"),
+        "resize replaces the province buffer"
+    );
+    assert_eq!(env.eval_int("pitch"), 8, "province grew with the image");
+    assert_eq!(env.eval_int("kept"), 7, "overlap preserved");
+    assert_eq!(env.eval_int("fresh"), 0, "expansion filled with 0");
+}
+
+/// `hasImage = false` runs `DeallocateImage`, which drops the province plane
+/// too (reference `LayerIntf.cpp:2349`).
+#[test]
+fn has_image_false_drops_province() {
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); var l = new Layer(w, null); \
+         l.setSize(4, 3); l.hasImage = true; \
+         l.setProvincePixel(0, 0, 9); \
+         l.hasImage = false; \
+         var buffer = l.provinceImageBuffer; \
+         var pixel = l.getProvincePixel(0, 0);",
+    );
+    assert_eq!(env.eval_int("buffer"), 0, "province dropped with the image");
+    assert_eq!(env.eval_int("pixel"), 0, "pixel reads 0 after deallocate");
+}
+
+/// The safe slice accessors (`with_main_image_pixels*`,
+/// `with_province_pixels*`) are the outward API the natives use to produce
+/// buffer addresses; they must read/write the live buffers.
+#[test]
+fn safe_pixel_accessors_read_and_write() {
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); var l = new Layer(w, null); l.setSize(2, 2); l.hasImage = true;",
+    );
+    let mut scene = env.scene.write().expect("scene lock");
+    assert_eq!(
+        scene.with_main_image_pixels(0, |p| p.len()),
+        Some(16),
+        "2x2 RGBA main image"
+    );
+    scene
+        .with_main_image_pixels_mut(0, |p| p[0] = 0xAB)
+        .expect("main image mut");
+    assert_eq!(scene.with_main_image_pixels(0, |p| p[0]), Some(0xAB));
+
+    assert!(
+        scene.with_province_pixels(0, |p| p.len()).is_none(),
+        "province absent before allocation"
+    );
+    scene.set_province_pixel(0, 1, 1, 42);
+    assert_eq!(scene.get_province_pixel(0, 1, 1), 42);
+    assert_eq!(
+        scene.with_province_pixels(0, |p| p[3]),
+        Some(42),
+        "province accessor sees the write"
+    );
+    scene
+        .with_province_pixels_mut(0, |p| p[0] = 7)
+        .expect("province mut");
+    assert_eq!(scene.get_province_pixel(0, 0, 0), 7);
 }
