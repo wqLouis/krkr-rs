@@ -48,6 +48,10 @@ pub use extrans::{
     TRANS_UPDATE_GIVE_UPDATE, TransitionKind, register_trans, transition_kind,
 };
 pub use menu_item::register_menu_item;
+pub use menu_item::{
+    MenuItemSnapshot, MenuSnapshot, fire_menu_click, menu_snapshot, menu_snapshots,
+    take_popup_request,
+};
 pub use plugin_stubs::register_plugin_stubs;
 pub use plugins::register_plugins;
 pub use system::{

@@ -20,26 +20,26 @@ The checker exits non-zero when a missing member is **not** listed in `scripts/n
 | --- | ---: |
 | tracked classes | 15 |
 | reference members | 527 |
-| matched | 493 |
-| **missing** | **34** |
-| extra (Rust only) | 105 |
-| coverage | **93.5%** |
+| matched | 527 |
+| **missing** | **0** |
+| extra (Rust only) | 106 |
+| coverage | **100.0%** |
 
 ## Per-class coverage
 
 | class | ref | rust | matched | missing | extra | coverage |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `Layer` | 150 | 175 | 130 | 20 | 45 | 86.7% |
+| `Layer` | 150 | 195 | 150 | 0 | 45 | 100.0% |
 | `Bitmap` | 20 | 22 | 20 | 0 | 2 | 100.0% |
 | `Window` | 83 | 91 | 83 | 0 | 8 | 100.0% |
-| `Font` | 22 | 14 | 11 | 11 | 3 | 50.0% |
-| `Timer` | 6 | 7 | 5 | 1 | 2 | 83.3% |
+| `Font` | 22 | 25 | 22 | 0 | 3 | 100.0% |
+| `Timer` | 6 | 8 | 6 | 0 | 2 | 100.0% |
 | `System` | 50 | 52 | 50 | 0 | 2 | 100.0% |
 | `Debug` | 13 | 13 | 13 | 0 | 0 | 100.0% |
 | `Plugins` | 3 | 4 | 3 | 0 | 1 | 100.0% |
 | `VideoOverlay` | 70 | 79 | 70 | 0 | 9 | 100.0% |
 | `AsyncTrigger` | 6 | 6 | 6 | 0 | 0 | 100.0% |
-| `MenuItem` | 22 | 20 | 20 | 2 | 0 | 90.9% |
+| `MenuItem` | 22 | 23 | 22 | 0 | 1 | 100.0% |
 | `Storages` | 13 | 20 | 13 | 0 | 7 | 100.0% |
 | `Scripts` | 11 | 11 | 11 | 0 | 0 | 100.0% |
 | `KAGParser` | 25 | 45 | 25 | 0 | 20 | 100.0% |
@@ -47,22 +47,7 @@ The checker exits non-zero when a missing member is **not** listed in `scripts/n
 
 ## Missing members by class
 
-### `Layer` — 20 missing
-
-`children`, `getLayerAt`, `joinFocusChain`, `nextFocusable`, `onBeforeFocus`, `onBlur`, `onFocus`, `onKeyPress`, `onMultiTouch`, `onNodeDisabled`, `onNodeEnabled`, `onSearchNextFocusable`, `onSearchPrevFocusable`, `onTouchDown`, `onTouchMove`, `onTouchRotate`, `onTouchScaling`, `onTouchUp`, `onTransitionCompleted`, `prevFocusable`
-
-### `Font` — 11 missing
-
-`defaultFaceName`, `doUserSelect`, `faceIsFileName`, `getEscHeightX`, `getEscHeightY`, `getEscWidthX`, `getEscWidthY`, `getGlyphDrawRect`, `getList`, `rasterizer`, `unmapPrerenderedFont`
-
-### `Timer` — 1 missing
-
-`mode`
-
-### `MenuItem` — 2 missing
-
-`keycodeToText`, `textToKeycode`
-
+_None for tracked classes._
 ## Extra members by class
 
 Rust registrations with no reference counterpart; usually intentional engine internals.
@@ -98,6 +83,10 @@ Rust registrations with no reference counterpart; usually intentional engine int
 ### `VideoOverlay` — 9 extra
 
 `audioChannels`, `audioSampleCount`, `audioSampleRate`, `frameBytes`, `frameChecksum`, `frameHeight`, `frameWidth`, `setTransitionCompleteCall`, `totalFrame`
+
+### `MenuItem` — 1 extra
+
+`_attachWindow`
 
 ### `Storages` — 7 extra
 

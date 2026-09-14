@@ -11,6 +11,7 @@
 //! sync system.
 
 pub mod blend;
+pub mod menu;
 pub mod sync;
 
 pub use blend::{
@@ -22,6 +23,7 @@ pub use blend::{
     LayerBlendMaterial, LayerBlendMode, LayerBlendPlugin, LayerRenderPath, blend_mode_for,
     blend_state_for, render_path_for,
 };
+pub use menu::{MenuEntry, MenuNode, MenuPlugin, MenuRoot, MenuUiState, visible_nodes};
 pub use sync::{
     BitmapAssets, GpuPrimitives, SceneCamera, SceneSprite, SharedScene, WindowRoot, clamp_opacity,
     rect_center, sprite_z, sync_scene,

@@ -4,37 +4,3 @@
 #   python3 scripts/native_parity.py --update-allow
 # The checker fails when a missing member is not listed here.
 
-Font.defaultFaceName
-Font.doUserSelect
-Font.faceIsFileName
-Font.getEscHeightX
-Font.getEscHeightY
-Font.getEscWidthX
-Font.getEscWidthY
-Font.getGlyphDrawRect
-Font.getList
-Font.rasterizer
-Font.unmapPrerenderedFont
-Layer.children
-Layer.getLayerAt
-Layer.joinFocusChain
-Layer.nextFocusable
-Layer.onBeforeFocus
-Layer.onBlur
-Layer.onFocus
-Layer.onKeyPress
-Layer.onMultiTouch
-Layer.onNodeDisabled
-Layer.onNodeEnabled
-Layer.onSearchNextFocusable
-Layer.onSearchPrevFocusable
-Layer.onTouchDown
-Layer.onTouchMove
-Layer.onTouchRotate
-Layer.onTouchScaling
-Layer.onTouchUp
-Layer.onTransitionCompleted
-Layer.prevFocusable
-MenuItem.keycodeToText
-MenuItem.textToKeycode
-Timer.mode

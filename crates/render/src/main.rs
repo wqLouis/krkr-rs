@@ -171,6 +171,7 @@ fn game_app(shared: SharedScene, game_dir: PathBuf, font_config: Option<PathBuf>
             ..Default::default()
         }))
         .add_plugins(LayerBlendPlugin)
+        .add_plugins(krkr_render::menu::MenuPlugin)
         .add_systems(Startup, game_startup)
         // run_vm BEFORE sync_scene: script mutations must render the same
         // frame, not one frame later.
@@ -229,6 +230,7 @@ fn headless_game_app(shared: SharedScene, game_dir: PathBuf, font_config: Option
         .init_resource::<GpuPrimitives>()
         .init_resource::<FrameBlendMaterials>()
         .add_plugins(LayerBlendPlugin)
+        .add_plugins(krkr_render::menu::MenuPlugin)
         .add_plugins(MinimalPlugins)
         .add_systems(Startup, game_startup)
         .add_systems(Update, (run_vm, sync_scene).chain());
@@ -599,6 +601,7 @@ fn demo_app(shared: SharedScene, ids: DemoIds) -> App {
             ..Default::default()
         }))
         .add_plugins(LayerBlendPlugin)
+        .add_plugins(krkr_render::menu::MenuPlugin)
         .add_systems(Update, (animate_demo, sync_scene).chain())
         .add_systems(Update, demo_auto_exit);
     app
@@ -792,6 +795,15 @@ mod tests {
     use bevy::prelude::{Image, MinimalPlugins, Virtual};
     use bevy::time::Time;
     use krkr_render::sync::SceneSprite;
+
+    /// The VM is process-global and single-threaded; serialize the render
+    /// tests that register an engine (they would otherwise corrupt the C++
+    /// heap when run in parallel).
+    static MENU_VM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn menu_vm_lock() -> std::sync::MutexGuard<'static, ()> {
+        MENU_VM_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
 
     /// The demo app without a window/renderer (MinimalPlugins has `Time`, so
     /// the animator runs) — lets us exercise the full animate → sync loop on
@@ -1020,5 +1032,135 @@ mod tests {
             baseline_bitmaps.iter().any(|n| final_bitmaps.contains(n)),
             "bitmap set changed completely; unexpected teardown"
         );
+    }
+
+    /// The in-engine menu: a native `MenuItem` tree yields the expected Bevy
+    /// UI nodes, opening a submenu adds its rows, and pressing a leaf runs the
+    /// script `onClick` through `krkr_render::menu`'s activation path.
+    #[test]
+    fn menu_ui_renders_tree_and_activation_fires_callback() {
+        use krkr_render::menu::MenuEntry;
+        let _lock = menu_vm_lock();
+
+        // 1. Build a native tree in the shared registry.
+        let engine = Box::leak(Box::new(tjs2_sys::Tjs2Engine::new().unwrap()));
+        tvp_natives::register_all(engine).unwrap();
+        engine
+            .exec_script(
+                "var w = %[id: 9001];\
+                 var root = __krkr_make_window_menu(w);\
+                 var open = new MenuItem(null, 'Open'); open.shortcut = 'Ctrl+O';\
+                 var recent = new MenuItem(null, 'Recent');\
+                 var quit = new MenuItem(null, 'Quit'); quit.enabled = false;\
+                 root.add(open); root.add(recent); root.add(quit);\
+                 recent.add(new MenuItem(null, 'File A'));\
+                 var fired = 0; open.onClick = function() { fired++; };",
+                "menu-ui",
+            )
+            .unwrap();
+
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(krkr_render::menu::MenuPlugin);
+        app.update();
+
+        // 2. Top level only: Open, Recent, Quit.
+        let entries: Vec<(Entity, MenuEntry)> = {
+            let world = app.world_mut();
+            let mut query = world.query::<(Entity, &MenuEntry)>();
+            query.iter(world).map(|(e, m)| (e, *m)).collect()
+        };
+        assert_eq!(
+            entries.len(),
+            3,
+            "only top-level rows until a submenu opens"
+        );
+        let recent = entries
+            .iter()
+            .find(|(_, m)| m.has_children)
+            .map(|(e, _)| *e)
+            .expect("the Recent submenu is present");
+
+        // 3. Opening Recent adds its child row (the open path is re-rendered).
+        app.world_mut()
+            .entity_mut(recent)
+            .insert(bevy::prelude::Interaction::Pressed);
+        app.update();
+        let entries: Vec<(Entity, MenuEntry)> = {
+            let world = app.world_mut();
+            let mut query = world.query::<(Entity, &MenuEntry)>();
+            query.iter(world).map(|(e, m)| (e, *m)).collect()
+        };
+        assert_eq!(entries.len(), 4, "Recent contributes one dropdown row");
+
+        // 4. Press the enabled leaf; its onClick must fire.
+        let open = entries
+            .iter()
+            .find(|(_, m)| m.enabled && !m.has_children)
+            .map(|(e, _)| *e)
+            .expect("the Open leaf is present");
+        app.world_mut()
+            .entity_mut(open)
+            .insert(bevy::prelude::Interaction::Pressed);
+        app.update();
+        assert_eq!(
+            engine.eval("fired", "menu-ui").unwrap(),
+            tjs2_sys::TjsValue::Integer(1),
+            "pressing the row must run the script onClick"
+        );
+    }
+
+    /// `Window.menu` attaches a native `MenuItem` root and registers it for
+    /// the renderer; repeated reads return the same object.
+    #[test]
+    fn window_menu_getter_attaches_native_root() {
+        let _lock = menu_vm_lock();
+        let engine = Box::leak(Box::new(tjs2_sys::Tjs2Engine::new().unwrap()));
+        tvp_natives::register_all(engine).unwrap();
+        let scene = std::sync::Arc::new(std::sync::RwLock::new(Scene::default()));
+        let storage = std::sync::Arc::new(std::sync::Mutex::new(
+            engine::Storage::mount(std::env::temp_dir()).expect("mount temp dir"),
+        ));
+        tvp_visual::register_visual(engine, scene, storage).unwrap();
+        engine
+            .exec_script(
+                "var w = new Window();\
+                 var a = w.menu; var b = w.menu;\
+                 a.add(new MenuItem(null, 'File'));",
+                "window-menu",
+            )
+            .unwrap();
+        assert_eq!(
+            engine.eval("a === b", "window-menu").unwrap(),
+            tjs2_sys::TjsValue::Integer(1),
+            "Window.menu must have stable identity"
+        );
+        let id = match engine.eval("w.id", "window-menu").unwrap() {
+            tjs2_sys::TjsValue::Integer(v) => v as u32,
+            other => panic!("window id must be an integer, got {other:?}"),
+        };
+        let snapshot =
+            tvp_natives::menu_snapshot(id).expect("Window.menu must register the root tree");
+        assert_eq!(snapshot.root.children.len(), 1);
+        assert_eq!(snapshot.root.children[0].caption, "File");
+
+        // The setter replaces the root and re-registers it for the renderer.
+        engine
+            .exec_script(
+                "var other = new MenuItem(null, null);\
+                 other.add(new MenuItem(null, 'Edit'));\
+                 w.menu = other;",
+                "window-menu",
+            )
+            .unwrap();
+        assert_eq!(
+            engine.eval("w.menu === other", "window-menu").unwrap(),
+            tjs2_sys::TjsValue::Integer(1),
+            "Window.menu must return the assigned root"
+        );
+        let snapshot =
+            tvp_natives::menu_snapshot(id).expect("setter must re-register the root tree");
+        assert_eq!(snapshot.root.children.len(), 1);
+        assert_eq!(snapshot.root.children[0].caption, "Edit");
     }
 }

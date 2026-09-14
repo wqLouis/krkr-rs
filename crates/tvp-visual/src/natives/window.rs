@@ -1742,23 +1742,97 @@ fn resolve_object_id_arg(engine: &Tjs2Engine, v: &Value) -> Result<i64, String> 
 }
 
 //---------------------------------------------------------------------------
-// `Window.menu` (kept from the previous milestone)
+// `Window.menu`
 //---------------------------------------------------------------------------
 
-/// Return the stable logical root menu for this window.
+/// True when the game registered the native `MenuItem` class from
+/// `tvp-natives` (the class installs `global.__krkr_native_MenuItem`).
+fn native_menu_item_available(engine: &Tjs2Engine) -> bool {
+    matches!(
+        engine.eval("global.__krkr_native_MenuItem", "Window.menu"),
+        Ok(TjsValue::Integer(1))
+    )
+}
+
+/// True when the window's root-menu global already holds a value.
+fn window_menu_global_exists(engine: &Tjs2Engine, name: &str) -> bool {
+    matches!(
+        engine.eval(
+            &format!("typeof global.{name} != 'undefined'"),
+            "Window.menu"
+        ),
+        Ok(TjsValue::Integer(1))
+    )
+}
+
+/// Run the `tvp-natives` helper that constructs the window's root MenuItem as
+/// `new MenuItem(window, window)` (reference `TVPCreateMenuItemObject`,
+/// `MenuItemIntf.cpp:560`) and stores it under `name`.
+fn create_native_window_menu(
+    engine: &Tjs2Engine,
+    window: *mut c_void,
+    name: &str,
+) -> Result<(), String> {
+    let window = engine
+        .retain_object_detached(window)
+        .map_err(|e| format!("cannot retain the window: {e}"))?;
+    let helper = match engine.eval_retained("global.__krkr_make_window_menu", "Window.menu") {
+        Ok(RetainedValue::Object(value)) => value,
+        Ok(_) => return Err("native MenuItem window helper is not a function".into()),
+        Err(e) => return Err(format!("native MenuItem window helper unavailable: {e}")),
+    };
+    engine
+        .call_detached(&helper, &[TjsValue::Retained(window.raw_id() as u64)])
+        .map_err(|e| format!("cannot create the root MenuItem: {e}"))?;
+    if !window_menu_global_exists(engine, name) {
+        return Err("root MenuItem was not stored".into());
+    }
+    Ok(())
+}
+
+/// Place a retained object result in `out` from a named global.
+fn return_global_menu(
+    engine: &Tjs2Engine,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    name: &str,
+) -> c_int {
+    match engine.eval_retained(&format!("global.{name}"), "Window.menu") {
+        Ok(RetainedValue::Object(value)) => {
+            // C++ consumes a retained return value.
+            let id = value.raw_id();
+            unsafe {
+                (*out).ty = tjs2_sys::VAL_RETAINED;
+                (*out).integer = 0;
+                (*out).real = 0.0;
+                (*out).string = std::ptr::null();
+                (*out).array = std::ptr::null();
+                (*out).array_count = 0;
+                (*out).retained = id as usize;
+            }
+            std::mem::forget(value);
+            0
+        }
+        Ok(_) => error_out(out_error, "Window.menu: root is not an object"),
+        Err(e) => error_out(out_error, &format!("Window.menu: {e}")),
+    }
+}
+
+/// Return the stable root `MenuItem` for this window (reference
+/// `WindowMenuProperty::PropGet`, `MenuItemImpl.cpp:65`).
 ///
 /// The normal application registers the native `MenuItem` class from
-/// `tvp-natives` before registering visual natives.  Small visual-only/headless
-/// users (including this crate's tests) do not necessarily register that
-/// optional class, so install a deliberately small TJS fallback in that case.
-/// The fallback has the same stateful tree surface needed by headless scripts;
-/// it never attempts to create platform menus.
+/// `tvp-natives`; when present the root is a real native item (so the render
+/// layer can draw and activate it). Small visual-only/headless users
+/// (including this crate's tests) may not register that optional class, so a
+/// deliberately small TJS fallback with the same stateful tree surface is
+/// installed instead.
 extern "C" fn window_menu_get(
     _engine: *mut c_void,
     instance: *mut c_void,
     out: *mut Value,
     out_error: *mut *mut c_char,
-    _objthis: *mut c_void,
+    objthis: *mut c_void,
 ) -> c_int {
     let inst = unsafe { instance_ref::<WindowInst>(instance) };
     if !inst.constructed {
@@ -1767,50 +1841,88 @@ extern "C" fn window_menu_get(
     let engine = context_engine();
     let name = format!("__krkr_window_menu_{}", inst.id);
     if !inst.menu_ready {
-        let init = format!(
-            "if (typeof global.MenuItem == 'undefined') {{ \
-                 global.MenuItem = function(owner, caption) {{ \
-                   this.caption = (caption === undefined ? '' : caption); \
-                   this.checked = false; this.enabled = true; this.radio = false; \
-                   this.group = 0; this.visible = true; this.shortcut = ''; \
-                   this.children = []; this.parent = null; this.root = this; \
-                   this.add = function(item) {{ this.children[this.children.count] = item; item.parent = this; item.root = this.root; }}; \
-                   this.insert = function(item, index) {{ this.children.splice(index, 0, item); item.parent = this; item.root = this.root; }}; \
-                   this.remove = function(item) {{ var i = this.children.indexOf(item); if (i >= 0) {{ this.children.splice(i, 1); item.parent = null; item.root = item; }} }}; \
-                   this.fireClick = function() {{ if (this.enabled && this.onClick) this.onClick(); }}; \
-                   this.popup = function() {{ return 1; }}; \
-                 }}; \
-               }}; \
-               if (typeof global.{0} == 'undefined') global.{0} = %[caption:'', checked:0, enabled:1, radio:0, group:0, visible:1, shortcut:'', children:[], parent:void, root:void]; global.{0}.root = global.{0}; global.{0}.add = function(item) {{ this.children[this.children.count] = item; item.parent = this; item.root = this.root; }}; global.{0}.insert = function(item, index) {{ this.children[index] = item; item.parent = this; item.root = this.root; }}; global.{0}.remove = function(item) {{ var i = 0; while (i < this.children.count && this.children[i] !== item) i++; if (i < this.children.count) this.children[i] = void; item.parent = void; item.root = item; }}; global.{0}.fireClick = function() {{ if (this.enabled && this.onClick !== void) this.onClick(); }}; global.{0}.popup = function() {{ return 1; }};",
-            name
-        );
-        if let Err(e) = engine.exec_script(&init, "Window.menu") {
-            return error_out(out_error, &format!("Window.menu: {e}"));
+        if native_menu_item_available(engine) {
+            if !window_menu_global_exists(engine, &name)
+                && let Err(e) = create_native_window_menu(engine, objthis, &name)
+            {
+                return error_out(out_error, &format!("Window.menu: {e}"));
+            }
+        } else {
+            let init = format!(
+                "if (typeof global.MenuItem == 'undefined') {{ \
+                     global.MenuItem = function(owner, caption) {{ \
+                       this.caption = (caption === undefined ? '' : caption); \
+                       this.checked = false; this.enabled = true; this.radio = false; \
+                       this.group = 0; this.visible = true; this.shortcut = ''; \
+                       this.children = []; this.parent = null; this.root = this; \
+                       this.add = function(item) {{ this.children[this.children.count] = item; item.parent = this; item.root = this.root; }}; \
+                       this.insert = function(item, index) {{ this.children.splice(index, 0, item); item.parent = this; item.root = this.root; }}; \
+                       this.remove = function(item) {{ var i = this.children.indexOf(item); if (i >= 0) {{ this.children.splice(i, 1); item.parent = null; item.root = item; }} }}; \
+                       this.fireClick = function() {{ if (this.enabled && this.onClick) this.onClick(); }}; \
+                       this.popup = function() {{ return 1; }}; \
+                     }}; \
+                   }}; \
+                   if (typeof global.{0} == 'undefined') global.{0} = %[caption:'', checked:0, enabled:1, radio:0, group:0, visible:1, shortcut:'', children:[], parent:void, root:void]; global.{0}.root = global.{0}; global.{0}.add = function(item) {{ this.children[this.children.count] = item; item.parent = this; item.root = this.root; }}; global.{0}.insert = function(item, index) {{ this.children[index] = item; item.parent = this; item.root = this.root; }}; global.{0}.remove = function(item) {{ var i = 0; while (i < this.children.count && this.children[i] !== item) i++; if (i < this.children.count) this.children[i] = void; item.parent = void; item.root = item; }}; global.{0}.fireClick = function() {{ if (this.enabled && this.onClick !== void) this.onClick(); }}; global.{0}.popup = function() {{ return 1; }};",
+                name
+            );
+            if let Err(e) = engine.exec_script(&init, "Window.menu") {
+                return error_out(out_error, &format!("Window.menu: {e}"));
+            }
         }
         inst.menu_ready = true;
     }
-    match engine.eval(&name, "Window.menu") {
-        Ok(tjs2_sys::TjsValue::Object) => {
-            match engine.retain_value_detached(&tjs2_sys::TjsValue::Object) {
-                Ok(value) => {
-                    // C++ consumes a retained return value.
-                    let id = value.raw_id();
-                    unsafe {
-                        (*out).ty = tjs2_sys::VAL_RETAINED;
-                        (*out).integer = 0;
-                        (*out).real = 0.0;
-                        (*out).string = std::ptr::null();
-                        (*out).array = std::ptr::null();
-                        (*out).array_count = 0;
-                        (*out).retained = id as usize;
-                    }
-                    std::mem::forget(value);
-                    0
-                }
-                Err(e) => error_out(out_error, &format!("Window.menu: {e}")),
-            }
+    return_global_menu(engine, out, out_error, &name)
+}
+
+/// Replace this window's root `MenuItem` (reference `WindowMenuProperty`
+/// denies the setter, `MenuItemImpl.cpp:87`; the in-engine host honors it so
+/// scripts can swap the whole menu bar).
+extern "C" fn window_menu_set(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    value: *const Value,
+    out_error: *mut *mut c_char,
+    objthis: *mut c_void,
+) -> c_int {
+    let inst = unsafe { instance_ref::<WindowInst>(instance) };
+    if !inst.constructed {
+        return error_out(out_error, "Window.menu: window is not constructed");
+    }
+    let value = unsafe { &*value };
+    if value.ty != tjs2_sys::VAL_OBJECT || value.object_handle().is_null() {
+        return error_out(out_error, "Window.menu: a MenuItem object is required");
+    }
+    let engine = context_engine();
+    if !native_menu_item_available(engine) {
+        return error_out(
+            out_error,
+            "Window.menu: assigning a root requires the native MenuItem class",
+        );
+    }
+    let menu = match engine.retain_object_detached(value.object_handle()) {
+        Ok(m) => m,
+        Err(e) => return error_out(out_error, &format!("Window.menu: {e}")),
+    };
+    let window = match engine.retain_object_detached(objthis) {
+        Ok(w) => w,
+        Err(e) => return error_out(out_error, &format!("Window.menu: {e}")),
+    };
+    let helper = match engine.eval_retained("global.__krkr_set_window_menu", "Window.menu") {
+        Ok(RetainedValue::Object(value)) => value,
+        Ok(_) => return error_out(out_error, "Window.menu: setter helper is not a function"),
+        Err(e) => return error_out(out_error, &format!("Window.menu: {e}")),
+    };
+    match engine.call_detached(
+        &helper,
+        &[
+            TjsValue::Retained(window.raw_id() as u64),
+            TjsValue::Retained(menu.raw_id() as u64),
+        ],
+    ) {
+        Ok(_) => {
+            inst.menu_ready = true;
+            0
         }
-        Ok(_) => error_out(out_error, "Window.menu: root is not an object"),
         Err(e) => error_out(out_error, &format!("Window.menu: {e}")),
     }
 }
@@ -2411,7 +2523,7 @@ pub(crate) fn register_window(engine: &Tjs2Engine) -> Result<(), String> {
             NativeInstancePropertyDef {
                 name: "menu",
                 get: Some(window_menu_get),
-                set: None,
+                set: Some(window_menu_set),
             },
             NativeInstancePropertyDef {
                 name: "innerSunken",
