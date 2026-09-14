@@ -1,17 +1,32 @@
-//! In-engine menu bar / dropdowns drawn with Bevy UI from the native
-//! `MenuItem` tree.
+//! In-engine menu bar / dropdowns / context popups drawn with Bevy UI from the
+//! native `MenuItem` tree.
 //!
 //! The Linux/Bevy host has no native OS menu, so this module renders the
-//! logical tree exposed by `crates/tvp-natives/src/menu_item.rs`
-//! (`menu_snapshots`) as a real in-app menu: a horizontal bar of top-level
-//! items, dropdown columns for `popup`/hover-opened submenus, and
-//! checked/radio/disabled state plus shortcut text on each row. Activating a
-//! leaf calls [`tvp_natives::fire_menu_click`], which runs the script
-//! `onClick` handler exactly like the reference's `fireClick`
+//! logical tree exposed by `crates/tvp-natives/src/menu_item.rs` as a real
+//! in-app menu:
+//!
+//! * a horizontal bar of top-level items for every registered window menu
+//!   ([`menu_snapshots`]), and
+//! * a floating context popup for `MenuItem.popup(flags, x, y)`
+//!   ([`take_popup_request`]), positioned at the requested client coordinates.
+//!
+//! Dropdown columns for `popup`/hover-opened submenus, checked/radio/disabled
+//! state and shortcut text are rendered on each row. Activating a leaf calls
+//! [`tvp_natives::fire_menu_click`], which runs the script `onClick` handler
+//! exactly like the reference's `fireClick`
 //! (`reference/cpp/core/visual/MenuItemImpl.cpp:305`).
 //!
-//! Re-rendering is driven by a signature: whenever the logical tree or the
-//! open path changes, the whole menu entity tree is rebuilt.
+//! Re-rendering is driven by a signature: whenever the logical tree, the open
+//! path or the popup request changes, the whole menu entity tree is rebuilt.
+//!
+//! # Visibility
+//!
+//! The bar only appears when a registered root has at least one *visible*
+//! top-level item. The real game defines native `MenuItem`s only for its
+//! debug hotkeys (`k2compat.tjs` `createDebugShortcutMenuItem`) and sets
+//! `visible = false` on every one of them, so those do not surface as UI (the
+//! reference hides invisible items the same way). A tree with visible items
+//! renders immediately; see the tests and [`visible_nodes`].
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -30,6 +45,12 @@ pub const MENU_ENTRY_HEIGHT: f32 = 22.0;
 pub const MENU_ENTRY_MIN_WIDTH: f32 = 140.0;
 /// Font size used for captions and shortcut text.
 const MENU_FONT_SIZE: f32 = 14.0;
+/// Stack order for the top-level bar (above any game UI).
+const MENU_BAR_Z: i32 = 1000;
+/// Stack order for a context popup (above the bar / click-away backdrop).
+const MENU_POPUP_Z: i32 = 1001;
+/// Stack order for the click-away backdrop under a context popup.
+const MENU_BACKDROP_Z: i32 = 999;
 
 /// One flattened, currently-visible menu entry. Pure data so it can be unit
 /// tested without a Bevy app.
@@ -42,7 +63,7 @@ pub struct MenuNode {
     pub radio: bool,
     pub enabled: bool,
     pub has_children: bool,
-    /// `0` for a top-level bar item, `1+` for dropdown rows.
+    /// `0` for a top-level bar item, `1+` for dropdown / popup rows.
     pub depth: u32,
     /// Parent handle, or `0` for a top-level item.
     pub parent: i64,
@@ -104,9 +125,13 @@ pub fn path_to_handle(root: &MenuItemSnapshot, target: i64) -> Option<Vec<i64>> 
     None
 }
 
-/// Marker for the spawned menu container.
+/// Marker for the spawned menu bar / popup container (and its backdrop).
 #[derive(Component)]
 pub struct MenuRoot;
+
+/// Marker for the full-screen click-away backdrop shown under a context popup.
+#[derive(Component)]
+pub struct MenuBackdrop;
 
 /// Component attached to every interactive menu row.
 #[derive(Component, Clone, Copy, Debug)]
@@ -117,13 +142,24 @@ pub struct MenuEntry {
     pub enabled: bool,
 }
 
-/// Renderer-side state: the currently open dropdown path and the entity of
-/// the last built menu, plus the signature used to avoid needless rebuilds.
+/// An active context popup: the item's captured tree plus the requested
+/// client-space anchor.
+#[derive(Debug)]
+struct PopupState {
+    x: f32,
+    y: f32,
+    item: MenuItemSnapshot,
+}
+
+/// Renderer-side state: the currently open dropdown path, the active context
+/// popup, the entity of the last built menu, and the signature used to avoid
+/// needless rebuilds.
 #[derive(Resource, Default)]
 pub struct MenuUiState {
     signature: u64,
     open: Vec<i64>,
     root: Option<Entity>,
+    popup: Option<PopupState>,
 }
 
 /// Registers the menu systems. Add after the default plugins.
@@ -140,8 +176,24 @@ impl Plugin for MenuPlugin {
 /// path. Runs before [`menu_sync_ui`] so a change is rendered the same frame.
 fn menu_update(
     mut state: ResMut<MenuUiState>,
+    keys: Option<Res<ButtonInput<KeyCode>>>,
     mut entries: Query<(&Interaction, &MenuEntry, &mut BackgroundColor), Changed<Interaction>>,
+    backdrop: Query<&Interaction, (With<MenuBackdrop>, Changed<Interaction>)>,
 ) {
+    // Escape closes any open bar dropdown or context popup.
+    if keys.is_some_and(|keys| keys.just_pressed(KeyCode::Escape)) {
+        state.open.clear();
+        state.popup = None;
+    }
+
+    // A press anywhere on the click-away backdrop dismisses the popup.
+    for interaction in &backdrop {
+        if *interaction == Interaction::Pressed {
+            state.popup = None;
+            state.open.clear();
+        }
+    }
+
     for (interaction, entry, mut background) in &mut entries {
         // Keep the hover highlight in sync even for disabled items.
         *background = BackgroundColor(entry_background(entry.depth, entry.enabled, *interaction));
@@ -160,6 +212,7 @@ fn menu_update(
                 } else {
                     let handle = entry.handle;
                     state.open.clear();
+                    state.popup = None;
                     if !fire_menu_click(handle) {
                         log::debug!("menu: handle {handle} did not fire (disabled or gone)");
                     }
@@ -169,14 +222,17 @@ fn menu_update(
         }
     }
 
-    if let Some(handle) = take_popup_request()
-        && let Some(path) = menu_snapshots()
-            .iter()
-            .find_map(|view| path_to_handle(&view.root, handle))
-    {
-        // `path` ends at the requested item; its children open when the item
-        // itself is in the open set.
-        state.open = path;
+    if let Some((handle, x, y, item)) = take_popup_request() {
+        // A context popup owns the screen while it is open: drop any bar
+        // dropdown path and remember the requested item + position. The
+        // popup item itself is the root of the open path so nested submenus
+        // truncate correctly at depth 1.
+        state.open = vec![handle];
+        state.popup = Some(PopupState {
+            x: x as f32,
+            y: y as f32,
+            item,
+        });
     }
 }
 
@@ -189,18 +245,45 @@ fn open_at(open: &mut Vec<i64>, handle: i64, depth: u32) {
     }
 }
 
-/// Rebuild the Bevy UI when the tree or open path changes.
+/// Rebuild the Bevy UI when the tree, open path or popup changes.
 fn menu_sync_ui(
     mut commands: Commands,
     mut state: ResMut<MenuUiState>,
     existing: Query<Entity, With<MenuRoot>>,
 ) {
-    let views = menu_snapshots();
+    // Resolve a context popup first; it takes over the whole menu surface.
+    // Otherwise flatten every registered window root into the top-level bar.
     let mut nodes: Vec<MenuNode> = Vec::new();
-    for view in &views {
-        nodes.extend(visible_nodes(view, &state.open));
+    let mut popup_anchor: Option<Vec2> = None;
+    let mut popup_parent = 0i64;
+    let popup = state.popup.take();
+    let mut keep_popup = None;
+    if let Some(popup) = popup {
+        if !popup.item.children.is_empty() {
+            for child in &popup.item.children {
+                push_node(child, 1, popup.item.handle, &state.open, &mut nodes);
+            }
+            if nodes.is_empty() {
+                // The item exists but all of its rows are hidden.
+                state.open.clear();
+            } else {
+                popup_anchor = Some(Vec2::new(popup.x, popup.y));
+                popup_parent = popup.item.handle;
+                keep_popup = Some(popup);
+            }
+        } else {
+            // A leaf item has no popup to show.
+            state.open.clear();
+        }
     }
-    let signature = signature_of(&nodes, &state.open);
+    state.popup = keep_popup;
+    if popup_anchor.is_none() {
+        for view in &menu_snapshots() {
+            nodes.extend(visible_nodes(view, &state.open));
+        }
+    }
+
+    let signature = signature_of(&nodes, &state.open, popup_anchor);
 
     // The root may have been removed by a previous frame; treat a missing
     // entity as "needs rebuild".
@@ -208,13 +291,67 @@ fn menu_sync_ui(
     if root_alive && signature == state.signature {
         return;
     }
-    if let Some(entity) = state.root.take()
-        && existing.contains(entity)
-    {
+    // A rebuild replaces the whole surface; `despawn` also removes the popup
+    // backdrop and every row.
+    for entity in &existing {
         commands.entity(entity).despawn();
     }
+    state.root = None;
     state.signature = signature;
     if nodes.is_empty() {
+        return;
+    }
+
+    // Group dropdown children by their parent handle.
+    let mut by_parent: HashMap<i64, Vec<&MenuNode>> = HashMap::new();
+    for node in &nodes {
+        by_parent.entry(node.parent).or_default().push(node);
+    }
+    let root_parent = if popup_anchor.is_some() {
+        popup_parent
+    } else {
+        0
+    };
+    let Some(top) = by_parent.get(&root_parent) else {
+        return;
+    };
+
+    if let Some(anchor) = popup_anchor {
+        // Full-screen click-away backdrop behind the popup.
+        commands.spawn((
+            MenuRoot,
+            MenuBackdrop,
+            Button,
+            Node {
+                position_type: PositionType::Absolute,
+                top: Val::Px(0.0),
+                left: Val::Px(0.0),
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                ..default()
+            },
+            BackgroundColor(Color::NONE),
+            GlobalZIndex(MENU_BACKDROP_Z),
+        ));
+        let root = commands
+            .spawn((
+                MenuRoot,
+                Node {
+                    position_type: PositionType::Absolute,
+                    top: Val::Px(anchor.y),
+                    left: Val::Px(anchor.x),
+                    flex_direction: FlexDirection::Column,
+                    min_width: Val::Px(MENU_ENTRY_MIN_WIDTH),
+                    ..default()
+                },
+                BackgroundColor(Color::srgba(0.13, 0.13, 0.16, 0.98)),
+                GlobalZIndex(MENU_POPUP_Z),
+            ))
+            .id();
+        for node in top {
+            spawn_entry(&mut commands, root, node, &by_parent, &state.open);
+        }
+        state.root = Some(root);
         return;
     }
 
@@ -232,19 +369,11 @@ fn menu_sync_ui(
                 ..default()
             },
             BackgroundColor(Color::srgba(0.10, 0.10, 0.12, 0.92)),
-            ZIndex(1000),
+            GlobalZIndex(MENU_BAR_Z),
         ))
         .id();
-
-    // Group dropdown children by their parent handle.
-    let mut by_parent: HashMap<i64, Vec<&MenuNode>> = HashMap::new();
-    for node in &nodes {
-        by_parent.entry(node.parent).or_default().push(node);
-    }
-    if let Some(top) = by_parent.get(&0) {
-        for node in top {
-            spawn_entry(&mut commands, root, node, &by_parent, &state.open);
-        }
+    for node in top {
+        spawn_entry(&mut commands, root, node, &by_parent, &state.open);
     }
     state.root = Some(root);
 }
@@ -318,18 +447,26 @@ fn spawn_entry(
     }
 
     if node.has_children && open.contains(&node.handle) {
+        // A top-level bar item drops its menu below itself; every deeper
+        // submenu (and every popup row) opens to the right, like the
+        // reference's cascading menus.
+        let (top, left) = if node.depth == 0 {
+            (Val::Percent(100.0), Val::Px(0.0))
+        } else {
+            (Val::Px(0.0), Val::Percent(100.0))
+        };
         let dropdown = commands
             .spawn((
                 Node {
                     position_type: PositionType::Absolute,
-                    top: Val::Percent(100.0),
-                    left: Val::Px(0.0),
+                    top,
+                    left,
                     flex_direction: FlexDirection::Column,
                     min_width: Val::Px(MENU_ENTRY_MIN_WIDTH),
                     ..default()
                 },
                 BackgroundColor(Color::srgba(0.13, 0.13, 0.16, 0.96)),
-                ZIndex(1001),
+                GlobalZIndex(MENU_POPUP_Z),
             ))
             .id();
         commands.entity(entity).add_child(dropdown);
@@ -372,19 +509,45 @@ fn entry_background(depth: u32, enabled: bool, interaction: Interaction) -> Colo
     }
 }
 
-fn signature_of(nodes: &[MenuNode], open: &[i64]) -> u64 {
+fn signature_of(nodes: &[MenuNode], open: &[i64], popup: Option<Vec2>) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     nodes.len().hash(&mut hasher);
     for node in nodes {
         node.hash(&mut hasher);
     }
     open.hash(&mut hasher);
+    popup
+        .map(|anchor| (anchor.x.to_bits(), anchor.y.to_bits()))
+        .hash(&mut hasher);
     hasher.finish()
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Mutex, MutexGuard};
+
     use super::*;
+    use tjs2_sys::{Tjs2Engine, TjsValue};
+
+    /// The VM and the menu registry are process-global; serialize the tests
+    /// that build a real `MenuItem` tree.
+    static MENU_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn test_lock() -> MutexGuard<'static, ()> {
+        MENU_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn engine() -> &'static Tjs2Engine {
+        let engine = Box::leak(Box::new(Tjs2Engine::new().unwrap()));
+        tvp_natives::register_all(engine).unwrap();
+        engine
+    }
+
+    fn menu_app() -> App {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins).add_plugins(MenuPlugin);
+        app
+    }
 
     fn item(handle: i64, caption: &str, children: Vec<MenuItemSnapshot>) -> MenuItemSnapshot {
         MenuItemSnapshot {
@@ -425,6 +588,23 @@ mod tests {
                 children: vec![open, recent, quit],
             },
         }
+    }
+
+    fn entries(world: &mut World) -> Vec<(Entity, MenuEntry)> {
+        let mut query = world.query::<(Entity, &MenuEntry)>();
+        query.iter(world).map(|(e, m)| (e, *m)).collect()
+    }
+
+    fn non_backdrop_roots(world: &mut World) -> Vec<Node> {
+        let mut query = world.query_filtered::<&Node, (With<MenuRoot>, Without<MenuBackdrop>)>();
+        query.iter(world).cloned().collect()
+    }
+
+    /// The floating context popup (a vertical column), if one is on screen.
+    fn popup_root(world: &mut World) -> Option<Node> {
+        non_backdrop_roots(world)
+            .into_iter()
+            .find(|node| node.flex_direction == FlexDirection::Column)
     }
 
     #[test]
@@ -475,5 +655,161 @@ mod tests {
         assert_eq!(marker_caption(&node), "\u{25cb} View");
         node.checked = true;
         assert_eq!(marker_caption(&node), "\u{25cf} View");
+    }
+
+    /// A registered window tree with visible items produces a top-level bar
+    /// with one row per visible item; hidden and disabled state is preserved.
+    #[test]
+    fn top_level_bar_renders_visible_tree() {
+        let _lock = test_lock();
+        let engine = engine();
+        engine
+            .exec_script(
+                "var w = %[id: 501];\
+                 var root = __krkr_make_window_menu(w);\
+                 var alpha = new MenuItem(null, 'Alpha');\
+                 var hidden = new MenuItem(null, 'Hidden'); hidden.visible = false;\
+                 var gamma = new MenuItem(null, 'Gamma'); gamma.enabled = false;\
+                 var delta = new MenuItem(null, 'Delta'); delta.checked = true; delta.shortcut = 'Ctrl+D';\
+                 root.add(alpha); root.add(hidden); root.add(gamma); root.add(delta);",
+                "menu-bar",
+            )
+            .unwrap();
+
+        let mut app = menu_app();
+        app.update();
+
+        let world = app.world_mut();
+        let rows = entries(world);
+        assert_eq!(rows.len(), 3, "the hidden top-level item must not render");
+        assert!(rows.iter().all(|(_, m)| m.depth == 0));
+
+        let node = non_backdrop_roots(world)
+            .into_iter()
+            .next()
+            .expect("the bar root must exist");
+        assert_eq!(node.top, Val::Px(0.0));
+        assert_eq!(node.left, Val::Px(0.0));
+        assert_eq!(node.width, Val::Percent(100.0));
+        assert_eq!(node.height, Val::Px(MENU_BAR_HEIGHT));
+
+        // The disabled "Gamma" row is present but marked disabled.
+        assert_eq!(rows.iter().filter(|(_, m)| !m.enabled).count(), 1);
+        // "Delta" has a shortcut and a checked marker in its caption.
+        let delta = tvp_natives::menu_snapshots()
+            .into_iter()
+            .find(|s| s.window == 501)
+            .and_then(|s| s.root.children.into_iter().find(|c| c.caption == "Delta"))
+            .expect("Delta must be registered");
+        let delta_node = visible_nodes(&tvp_natives::menu_snapshot(501).unwrap(), &[])
+            .into_iter()
+            .find(|n| n.handle == delta.handle)
+            .unwrap();
+        assert!(delta_node.checked);
+        assert_eq!(delta_node.shortcut, "Ctrl+D");
+        assert_eq!(marker_caption(&delta_node), "\u{2713} Delta");
+    }
+
+    /// `popup(flags, x, y)` renders the item's submenu at the requested client
+    /// position (not the top-left corner), and pressing a leaf fires its
+    /// `onClick` and closes the popup.
+    #[test]
+    fn popup_renders_at_requested_position_and_activates() {
+        let _lock = test_lock();
+        let engine = engine();
+        engine
+            .exec_script(
+                "var fired = 0;\
+                 var root = new MenuItem(null, 'Context');\
+                 var copy = new MenuItem(null, 'Copy');\
+                 copy.onClick = function() { fired++; };\
+                 root.add(copy);\
+                 var paste = new MenuItem(null, 'Paste'); paste.enabled = false;\
+                 root.add(paste);\
+                 root.popup(0, 40, 60);",
+                "menu-popup",
+            )
+            .unwrap();
+
+        let mut app = menu_app();
+        app.update();
+
+        {
+            let world = app.world_mut();
+            let node = popup_root(world).expect("the popup root must exist");
+            assert_eq!(
+                node.left,
+                Val::Px(40.0),
+                "popup must honour the requested x"
+            );
+            assert_eq!(node.top, Val::Px(60.0), "popup must honour the requested y");
+            assert_eq!(
+                node.flex_direction,
+                FlexDirection::Column,
+                "a popup is a vertical column"
+            );
+            let rows = entries(world);
+            assert_eq!(rows.len(), 2, "the popup shows the item's two children");
+            assert!(
+                rows.iter().all(|(_, m)| m.depth == 1),
+                "popup rows are dropdown rows, not bar rows"
+            );
+            assert_eq!(rows.iter().filter(|(_, m)| !m.enabled).count(), 1);
+        }
+
+        // Press the enabled "Copy" leaf: the script callback fires and the
+        // popup is dismissed.
+        let copy = {
+            let world = app.world_mut();
+            entries(world)
+                .into_iter()
+                .find(|(_, m)| m.enabled)
+                .map(|(e, _)| e)
+                .expect("the enabled Copy leaf must be present")
+        };
+        app.world_mut()
+            .entity_mut(copy)
+            .insert(Interaction::Pressed);
+        app.update();
+        assert_eq!(
+            engine.eval("fired", "menu-popup").unwrap(),
+            TjsValue::Integer(1),
+            "pressing the popup row must run the script onClick"
+        );
+        app.update();
+        assert!(
+            popup_root(app.world_mut()).is_none(),
+            "the popup must close after activating a leaf"
+        );
+    }
+
+    /// A popup requested for a leaf item (no children) is ignored rather than
+    /// rendering an empty floating box.
+    #[test]
+    fn popup_on_leaf_renders_nothing() {
+        let _lock = test_lock();
+        let engine = engine();
+        engine
+            .exec_script(
+                "var leaf = new MenuItem(null, 'Leaf'); leaf.popup(0, 5, 5);",
+                "menu-leaf-popup",
+            )
+            .unwrap();
+        let mut app = menu_app();
+        app.update();
+        assert!(popup_root(app.world_mut()).is_none());
+    }
+
+    /// `open_at` keeps only the path prefix, so hovering a sibling replaces
+    /// the previous dropdown instead of appending to it.
+    #[test]
+    fn open_at_replaces_siblings() {
+        let mut open = vec![1i64, 2];
+        open_at(&mut open, 3, 0);
+        assert_eq!(open, vec![3]);
+        open_at(&mut open, 4, 1);
+        assert_eq!(open, vec![3, 4]);
+        open_at(&mut open, 5, 1);
+        assert_eq!(open, vec![3, 5]);
     }
 }

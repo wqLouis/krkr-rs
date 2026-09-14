@@ -136,6 +136,19 @@ pub struct MenuSnapshot {
     pub root: MenuItemSnapshot,
 }
 
+/// A pending `popup(flags, x, y)` request consumed by the renderer.
+///
+/// Kept as a tuple of publicly reachable types (no new exported name) so the
+/// private `menu_item` module does not leak an unreachable type through the
+/// crate root: `(handle, x, y, item)`. The item snapshot is captured when
+/// `popup()` is called, which is exactly the moment the reference `TrackPopup`
+/// would freeze the popup menu. The reference shows the item's submenu as a
+/// native OS popup at the requested client coordinates; on this platform the
+/// request is handed to the in-engine Bevy UI instead, so the position has to
+/// travel with the handle (a context menu that ignored `x`/`y` would always
+/// land in a corner).
+pub type PopupRequest = (i64, i32, i32, MenuItemSnapshot);
+
 // The VM is single threaded.  The registry uses integer addresses so it does
 // not make raw pointers part of its Send/Sync contract.
 static ITEMS: LazyLock<Mutex<HashMap<usize, usize>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -152,7 +165,7 @@ static LIVE_ITEMS: LazyLock<Mutex<HashSet<usize>>> = LazyLock::new(|| Mutex::new
 static WINDOW_ROOTS: LazyLock<Mutex<HashMap<u32, usize>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 /// Pending `popup(flags, x, y)` request consumed by the renderer.
-static POPUP_REQUEST: LazyLock<Mutex<Option<i64>>> = LazyLock::new(|| Mutex::new(None));
+static POPUP_REQUEST: LazyLock<Mutex<Option<PopupRequest>>> = LazyLock::new(|| Mutex::new(None));
 
 fn item_ptr_from_arg(value: &Value) -> Option<*mut MenuItemInst> {
     if value.ty != VAL_OBJECT {
@@ -626,8 +639,15 @@ extern "C" fn menu_item_popup(
     if argc < 3 {
         return crate::report_error(err, "MenuItem.popup requires flags, x and y");
     }
-    let handle = instance as i64;
-    *POPUP_REQUEST.lock().unwrap_or_else(|p| p.into_inner()) = Some(handle);
+    let values = args(_argv, argc);
+    let item = unsafe { &*(instance as *const MenuItemInst) };
+    let request = (
+        instance as i64,
+        value_as_i64(&values[1]) as i32,
+        value_as_i64(&values[2]) as i32,
+        snapshot_item(item as *const MenuItemInst),
+    );
+    *POPUP_REQUEST.lock().unwrap_or_else(|p| p.into_inner()) = Some(request);
     set_int_out(out, 1);
     0
 }
@@ -1139,8 +1159,9 @@ pub fn fire_menu_click(handle: i64) -> bool {
 }
 
 /// Consume the pending `popup(flags, x, y)` request, if any. The renderer
-/// opens the item's dropdown when it sees one.
-pub fn take_popup_request() -> Option<i64> {
+/// opens the captured item's submenu at the requested position when it sees
+/// one.
+pub fn take_popup_request() -> Option<PopupRequest> {
     POPUP_REQUEST
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -1514,7 +1535,40 @@ mod tests {
             TjsValue::Integer(v) => v,
             other => panic!("{other:?}"),
         };
-        assert_eq!(take_popup_request(), Some(handle));
+        // The request keeps the requested client position so the in-engine
+        // UI can open the context menu where `popup(flags, x, y)` asked.
+        let (req_handle, x, y, item) = take_popup_request().expect("popup must be pending");
+        assert_eq!(req_handle, handle);
+        assert_eq!((x, y), (10, 20));
+        assert_eq!(item.handle, handle);
         assert_eq!(take_popup_request(), None);
+    }
+
+    /// A detached `MenuItem` (never added to a window root) still publishes a
+    /// complete snapshot with its children, which is what the renderer needs
+    /// to draw a `popup()` context menu without a window tree.
+    #[test]
+    fn popup_captures_detached_item_tree() {
+        let _lock = vm_lock();
+        let engine = Tjs2Engine::new().unwrap();
+        register_all(&engine).unwrap();
+        engine
+            .exec_script(
+                "var root = new MenuItem(null, 'Context');\
+                 root.add(new MenuItem(null, 'Copy'));\
+                 var past = new MenuItem(null, 'Paste'); past.enabled = false;\
+                 root.add(past);\
+                 root.popup(0, 4, 8);",
+                "menu",
+            )
+            .unwrap();
+        let (handle, x, y, snapshot) = take_popup_request().expect("detached popup must publish");
+        assert_eq!(snapshot.handle, handle);
+        assert_eq!(snapshot.caption, "Context");
+        assert_eq!(snapshot.children.len(), 2);
+        assert_eq!(snapshot.children[0].caption, "Copy");
+        assert!(!snapshot.children[1].enabled);
+        assert_eq!((x, y), (4, 8));
+        assert!(take_popup_request().is_none());
     }
 }
