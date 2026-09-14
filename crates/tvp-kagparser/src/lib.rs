@@ -89,9 +89,20 @@
 //! native instance with the current ABI (no constructor member); use the
 //! wrapper class instead.
 //!
-//! The KAGParserEx additions (`getRawTag`, `getRawTagCount`, `getTag`,
-//! `isTagAvailable`, `getParameter`) are **not** in the reference
-//! KAGParser and the game does not use them; they are not implemented.
+//! KAGParserEx (`KAGParserEx.dll`) is **merged into the core `KAGParser`** in
+//! this reference: `reference/cpp/plugins/KAGParser/kagparserex.cpp` is a
+//! 225-byte placeholder whose comment says it was built into core. Its
+//! documented extensions (plugin `readme.txt`) are `multiLineTagEnabled`,
+//! parameter-macro expansion (`macroParams`/`mp`, `@pmacro`/`@erasepmacro`)
+//! and `emb`'s `escape` parameter — all implemented here. Both games set
+//! `multiLineTagEnabled` (`system/animationsequence.tjs`) and
+//! `processSpecialTags` (`system/sccontroller.tjs`).
+//!
+//! Names such as `getRawTag`/`getRawTagCount`/`getTag`/`isTagAvailable`/
+//! `getParameter` belong to a *different* KAGParserEx variant: they are absent
+//! from this reference (both core and plugin) and unused by the games, so they
+//! are deliberately not registered (calling them correctly raises
+//! "Member does not exist").
 
 use std::cell::RefCell;
 use std::ffi::{CStr, c_char, c_int, c_void};
