@@ -367,6 +367,25 @@ unsafe extern "C" {
     pub fn tjs2_malloc(size: usize) -> *mut c_void;
 }
 
+// The C++ stream layer (cpp/streams.cpp) inflates/deflates the `FE FE 02`
+// save container with zlib. Linking it here keeps the build.rs C++ compile
+// flags untouched.
+#[link(name = "z")]
+unsafe extern "C" {}
+
+// Diagnostic helper implemented in cpp/streams.cpp: decode a whole text
+// stream (honoring the mode's `oN` offset and the `FE FE` crypt container)
+// into a malloc'd UTF-8 string (free with [`tjs2_free_string`]). Returns 0
+// on success. Used by the stream tests below.
+#[allow(dead_code)]
+unsafe extern "C" {
+    fn tjs2_read_text_stream_all(
+        path_utf8: *const c_char,
+        mode_utf8: *const c_char,
+        out_utf8: *mut *mut c_char,
+    ) -> c_int;
+}
+
 /// Opaque per-engine id of a retained script value (mirror of the C
 /// `tjs2_value_id` typedef: an opaque pointer that is never null for a live
 /// id).
@@ -4283,5 +4302,213 @@ var ra = a.get(); var rb = b.get();",
             })
             .unwrap_err();
         assert!(err.contains("NoSuchClass"), "unexpected error: {err}");
+    }
+
+    // -------------------------------------------------------------------
+    // save/load streams (cpp/streams.cpp)
+    // -------------------------------------------------------------------
+
+    /// Expected text of the embedded crypt-mode fixtures. Single line, so
+    /// `Array.load` yields exactly one element.
+    const FIXTURE_TEXT: &str =
+        "(const) %[ \"title\" => \"フィクスチャ\", \"scenario\" => \"01_01\", \"value\" => 42 ]";
+
+    const FIXTURE_MODE0: &[u8] = &[
+        0xfe, 0xfe, 0x00, 0xff, 0xfe, 0x29, 0x28, 0x62, 0x62, 0x6e, 0x6e, 0x6f, 0x6e, 0x72, 0x72,
+        0x75, 0x74, 0x28, 0x28, 0x21, 0x20, 0x24, 0x24, 0x5a, 0x5a, 0x21, 0x20, 0x23, 0x22, 0x75,
+        0x74, 0x68, 0x68, 0x75, 0x74, 0x6d, 0x6c, 0x64, 0x64, 0x23, 0x22, 0x21, 0x20, 0x3c, 0x3c,
+        0x3f, 0x3e, 0x21, 0x20, 0x23, 0x22, 0xd4, 0xe4, 0xa2, 0x92, 0xae, 0x9e, 0xb8, 0x88, 0xc0,
+        0xf0, 0xe2, 0xd2, 0x23, 0x22, 0x2d, 0x2c, 0x21, 0x20, 0x23, 0x22, 0x72, 0x72, 0x62, 0x62,
+        0x64, 0x64, 0x6f, 0x6e, 0x60, 0x60, 0x73, 0x72, 0x68, 0x68, 0x6e, 0x6e, 0x23, 0x22, 0x21,
+        0x20, 0x3c, 0x3c, 0x3f, 0x3e, 0x21, 0x20, 0x23, 0x22, 0x31, 0x30, 0x30, 0x30, 0x5e, 0x5e,
+        0x31, 0x30, 0x30, 0x30, 0x23, 0x22, 0x2d, 0x2c, 0x21, 0x20, 0x23, 0x22, 0x77, 0x76, 0x60,
+        0x60, 0x6d, 0x6c, 0x74, 0x74, 0x64, 0x64, 0x23, 0x22, 0x21, 0x20, 0x3c, 0x3c, 0x3f, 0x3e,
+        0x21, 0x20, 0x35, 0x34, 0x33, 0x32, 0x21, 0x20, 0x5c, 0x5c,
+    ];
+
+    const FIXTURE_MODE1: &[u8] = &[
+        0xfe, 0xfe, 0x01, 0xff, 0xfe, 0x14, 0x00, 0x93, 0x00, 0x9f, 0x00, 0x9d, 0x00, 0xb3, 0x00,
+        0xb8, 0x00, 0x16, 0x00, 0x10, 0x00, 0x1a, 0x00, 0xa7, 0x00, 0x10, 0x00, 0x11, 0x00, 0xb8,
+        0x00, 0x96, 0x00, 0xb8, 0x00, 0x9c, 0x00, 0x9a, 0x00, 0x11, 0x00, 0x10, 0x00, 0x3e, 0x00,
+        0x3d, 0x00, 0x10, 0x00, 0x11, 0x00, 0xea, 0x30, 0x53, 0x30, 0x5f, 0x30, 0x76, 0x30, 0xc2,
+        0x30, 0xd3, 0x30, 0x11, 0x00, 0x1c, 0x00, 0x10, 0x00, 0x11, 0x00, 0xb3, 0x00, 0x93, 0x00,
+        0x9a, 0x00, 0x9d, 0x00, 0x92, 0x00, 0xb1, 0x00, 0x96, 0x00, 0x9f, 0x00, 0x11, 0x00, 0x10,
+        0x00, 0x3e, 0x00, 0x3d, 0x00, 0x10, 0x00, 0x11, 0x00, 0x30, 0x00, 0x32, 0x00, 0xaf, 0x00,
+        0x30, 0x00, 0x32, 0x00, 0x11, 0x00, 0x1c, 0x00, 0x10, 0x00, 0x11, 0x00, 0xb9, 0x00, 0x92,
+        0x00, 0x9c, 0x00, 0xba, 0x00, 0x9a, 0x00, 0x11, 0x00, 0x10, 0x00, 0x3e, 0x00, 0x3d, 0x00,
+        0x10, 0x00, 0x38, 0x00, 0x31, 0x00, 0x10, 0x00, 0xae, 0x00,
+    ];
+
+    const FIXTURE_MODE2: &[u8] = &[
+        0xfe, 0xfe, 0x02, 0xff, 0xfe, 0x65, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x8c, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x78, 0xda, 0xd3, 0x60, 0x48, 0x66, 0xc8, 0x67, 0xc8,
+        0x63, 0x28, 0x66, 0x28, 0x61, 0xd0, 0x64, 0x50, 0x60, 0x50, 0x65, 0x88, 0x06, 0x92, 0x4a,
+        0x40, 0x5e, 0x26, 0x10, 0xe7, 0x30, 0xa4, 0x02, 0xd9, 0x0a, 0x0c, 0xb6, 0x0c, 0x76, 0x60,
+        0xd1, 0xab, 0x06, 0x8b, 0x0d, 0xd6, 0x1b, 0xec, 0x34, 0x38, 0x68, 0xf0, 0xd8, 0x40, 0x89,
+        0x41, 0x07, 0x2c, 0x56, 0x0c, 0x34, 0x21, 0x15, 0x68, 0x42, 0x22, 0x43, 0x11, 0x50, 0x4f,
+        0x3e, 0x8a, 0x7a, 0x03, 0x06, 0x43, 0x86, 0x78, 0x30, 0x09, 0x53, 0x5d, 0x06, 0x54, 0x97,
+        0xc3, 0x50, 0x8a, 0x62, 0xae, 0x09, 0x83, 0x11, 0x90, 0x8c, 0x65, 0x00, 0x00, 0xc3, 0xea,
+        0x16, 0x91,
+    ];
+
+    /// Decode a whole text stream through the C++ reader (honoring the
+    /// mode's `oN` offset and the `FE FE` crypt container) and return the
+    /// UTF-8 text.
+    fn read_text_stream(path: &std::path::Path, mode: &str) -> String {
+        let path = CString::new(path.to_string_lossy().as_bytes()).unwrap();
+        let mode = CString::new(mode).unwrap();
+        let mut out: *mut c_char = ptr::null_mut();
+        // SAFETY: both C strings are valid for the call; the C++ helper
+        // writes a malloc'd NUL-terminated UTF-8 string into `out`.
+        let rc = unsafe { tjs2_read_text_stream_all(path.as_ptr(), mode.as_ptr(), &mut out) };
+        assert_eq!(rc, 0, "tjs2_read_text_stream_all failed for mode {mode:?}");
+        assert!(!out.is_null(), "helper returned a null string");
+        // SAFETY: out is a NUL-terminated malloc'd string owned by us.
+        let text = unsafe { CStr::from_ptr(out) }
+            .to_string_lossy()
+            .into_owned();
+        // SAFETY: the helper allocated it with malloc; free it exactly once.
+        unsafe { tjs2_free_string(out) };
+        text
+    }
+
+    /// A unique temp path for a test file (no `tempfile` dependency).
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("tjs2-sys-{}-{nanos}-{name}", std::process::id()))
+    }
+
+    #[test]
+    fn reads_a_fixture_in_each_crypt_mode() {
+        let _vm_lock = vm_lock();
+        for (name, fixture) in [
+            ("crypt-mode0", FIXTURE_MODE0),
+            ("crypt-mode1", FIXTURE_MODE1),
+            ("crypt-mode2", FIXTURE_MODE2),
+        ] {
+            let path = temp_path(name);
+            std::fs::write(&path, fixture).unwrap();
+            let text = read_text_stream(&path, "");
+            assert_eq!(text, FIXTURE_TEXT, "{name} decoded incorrectly");
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    #[test]
+    fn honors_the_offset_of_an_offset_prefixed_fixture() {
+        let _vm_lock = vm_lock();
+        let prefix = b"KRKR-SAVE-HEADER"; // 16 bytes
+        let mut data = prefix.to_vec();
+        data.extend_from_slice(FIXTURE_MODE2);
+        let path = temp_path("offset");
+        std::fs::write(&path, &data).unwrap();
+        let text = read_text_stream(&path, &format!("o{}", prefix.len()));
+        assert_eq!(text, FIXTURE_TEXT);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn array_save_load_roundtrips_each_crypt_mode() {
+        let _vm_lock = vm_lock();
+        let e = Tjs2Engine::new().unwrap();
+        for (name, mode) in [
+            ("default-mode2", "o8"),
+            ("mode0", "o8c0"),
+            ("mode1", "o8c1"),
+            ("mode2-level", "o8z9"),
+        ] {
+            let path = temp_path(name);
+            let prefix = b"PREFIX!!";
+            std::fs::write(&path, prefix).unwrap();
+            let path_lit = format!("{:?}", path.to_string_lossy());
+            let setup = format!(
+                "var a = ['alpha', 'beta', 'gamma'];\n\
+                 a.save({path_lit}, '{mode}');\n\
+                 var b = [];\n\
+                 b.load({path_lit}, '{mode}');"
+            );
+            e.exec_script(&setup, name).unwrap();
+            let v = e.eval("b[0] + '|' + b[1] + '|' + b[2]", name).unwrap();
+            assert_eq!(
+                v,
+                TjsValue::String("alpha|beta|gamma".into()),
+                "mode {mode}"
+            );
+            let bytes = std::fs::read(&path).unwrap();
+            assert_eq!(
+                &bytes[..prefix.len()],
+                prefix,
+                "mode {mode} clobbered the prefix"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    #[test]
+    fn struct_roundtrips_through_an_offset_prefixed_file() {
+        let _vm_lock = vm_lock();
+        let e = Tjs2Engine::new().unwrap();
+        let path = temp_path("struct");
+        let prefix = b"PREFIX!!";
+        std::fs::write(&path, prefix).unwrap();
+        let path_lit = format!("{:?}", path.to_string_lossy());
+        // `Array.saveStruct` is an instance method (the Dictionary variant is
+        // registered as a static member in the vendored core and is not
+        // reachable from an instance); both write the same text struct
+        // through cpp/streams.cpp.
+        let script = format!(
+            "var a = ['Round Trip', '05_12', 42];\n\
+             a.saveStruct({path_lit}, 'o8');"
+        );
+        e.exec_script(&script, "test").unwrap();
+
+        // The BMP-like prefix must survive the write.
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[..prefix.len()], prefix, "the prefix was clobbered");
+
+        // Read the struct back through the C++ reader and reconstruct it.
+        let text = read_text_stream(&path, "o8");
+        let retained = e.eval_retained(&text, "struct").unwrap();
+        let retained = match retained {
+            RetainedValue::Object(o) => o,
+            RetainedValue::Value(v) => panic!("struct eval returned a scalar: {v:?}"),
+        };
+        assert_eq!(
+            e.get_member(retained.raw_id(), "0").unwrap(),
+            TjsValue::String("Round Trip".into())
+        );
+        assert_eq!(
+            e.get_member(retained.raw_id(), "1").unwrap(),
+            TjsValue::String("05_12".into())
+        );
+        assert_eq!(
+            e.get_member(retained.raw_id(), "2").unwrap(),
+            TjsValue::Integer(42)
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn reads_the_real_kag_save_fixture() {
+        let _vm_lock = vm_lock();
+        const FIXTURE: &str = "/mnt/DATA/Games/Others/【KR】不可视之药与坎坷的命运/【KR】不可视之药与坎坷的命运/savedata/qsave01.bmp";
+        if !std::path::Path::new(FIXTURE).exists() {
+            eprintln!("skipping: real KAG fixture not present at {FIXTURE}");
+            return;
+        }
+        // The BMP thumbnail is 83086 bytes; the save struct follows it.
+        let text = read_text_stream(std::path::Path::new(FIXTURE), "o83086");
+        assert!(text.contains("(const)"), "fixture is not a TJS struct");
+        assert!(
+            text.contains("\"title\""),
+            "fixture is missing the title field"
+        );
+        assert!(
+            text.contains("\"scenario\""),
+            "fixture is missing the scenario field"
+        );
     }
 }
