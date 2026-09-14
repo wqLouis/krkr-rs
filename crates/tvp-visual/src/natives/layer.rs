@@ -41,7 +41,7 @@
 //! | properties `window`, `parent` | owning Window / parent Layer **objects** (retained), or `null` at the window root |
 //! | `update()` | request this layer's script `onPaint` on the next VM poll (reference `CallOnPaint`; drives the `AffineLayer` composite) |
 //! | `onPaint()` | base no-op action (script subclasses override it and call `super.onPaint(...)`) |
-//! | `setCursorPos(x,y)` | no-op (input: later) |
+//! | `setCursorPos(x,y)` | intentionally inert: the reference forwards the window-space IME caret position to the platform manager, which this crate does not own (the input bridge tracks the shared cursor separately). Documented in the body |
 //! | `focus([direction])` | sets the window's focused layer and dispatches `onFocus`/`onBlur` |
 //! | `copyRect(dx,dy,src,sx,sy,sw,sh)` | face-dispatched blit of a `Bitmap`/`Layer` sub-rect (dfMask = alpha only, dfMain+holdAlpha = RGB only, else source-over), clipped to the bitmap and `ClipRect` (reference `CopyRect`) |
 //! | `pileRect` / `piledCopy` / `blendRect` | legacy rect copy / alpha blend / constant-alpha blend (reference `PileRect`/`PiledCopy`/`BlendRect`) |
@@ -49,7 +49,8 @@
 //! | `copy9Patch(src)` | derives the 9-slice margins and scales them to fill the image |
 //! | `copyToBitmapFromMainImage(bitmap)` | copies the main image into a `Bitmap` |
 //! | `drawEllipse` / `drawPie` / `drawCurve` / `drawImage*` | plugin-style GDI+ shapes and image blits |
-//! | `setCenter(x,y)`, `setAffineOffset(x,y)`, `setImagePos`, `setImageSize` | no-ops (affine: later) |
+//! | `setCenter(x,y)`, `setAffineOffset(x,y)` | store the affine anchor on the layer (the KAG `Sprite`/`AffineLayer` surface); [`layer_affine_state`] exposes it. The pixel transforms of `affineCopy`/`operateAffine` still take explicit matrices |
+//! | `setImagePos(x,y)`, `setImageSize(w,h)` | place/measure the image inside the layer (reference `SetImagePosition`/`SetImageSize`) |
 //! | `drawText` | rasterizes into the attached scene bitmap using `tvp-text` (face/height/bold/italic/underline/strikeout/angle); a missing face logs a warning and draws nothing rather than fabricating glyphs |
 //! | `drawPolygon` / `drawRectangle` / `drawLine` / `drawLines` / `drawArc` / `drawBezier` / `drawBeziers` | rasterizes a `GdiPlus.Appearance`'s ordered fills/strokes into the attached scene bitmap (`natives::raster`) |
 //! | `doBoxBlur` | minimal in-place RGBA box blur over the attached scene bitmap |
@@ -70,10 +71,26 @@
 //! | `setClip([l,t,w,h])` | reference `ClipRect` (no args resets to the image); respected by the pixel ops |
 //! | `onClick` / `onDoubleClick` / `onMouseDown|Up|Move|Enter|Leave|Wheel` / `onKeyDown|Up` | dispatch to the layer's action owner via `actionOwner.action(event)` (`TVP_ACTION_INVOKE`) |
 //! | `beginTransition` | queues a next-poll completion callback; interpolation remains a stub |
+//! | `stopTransition` | cancels this layer's queued completion and synchronously fires `onTransitionCompleted` |
 //! | properties `focusable`, `focused`, `enabled`, `nodeVisible`, `nodeEnabled`, `nodeFocusable`, `isPrimary`, `clipLeft/Top/Width/Height`, `attention*`, `name` | focus/node/clip state (reference `LayerIntf.cpp`) |
-//! | `drawGlyph`, `drawPath`, `drawString`, `drawRectangles`, `drawCurve2/3`, `drawClosedCurve*`, `setCenter`, `setAffineOffset`, `stopTransition` | no-op stubs (pixel ops: later) |
+//! | `drawText` / `drawString` / `drawGlyph` / `getTextWidth` / `getDrawWidth` | rasterize through the shared `tvp-text` pipeline; `drawString`/`drawGlyph` read a `Font`-like object (the engine has no `GdiPlus.Font`/`Glyph`) |
+//! | `setFontStyle` / `resetFontStyle` | write the layer's tracked `FontState` (KAG `MessageArea` surface) |
+//! | `setDefaultDrawTextParam` / `resetDrawTextParam` | record/restore the layer's default text-draw parameters |
+//! | `drawRectangles` / `drawClosedCurve` / `drawClosedCurve2` / `drawCurve2` / `drawCurve3` / `drawPath` | `layerExDraw`-style appearance rasterization; `drawPath` accepts a point array in place of the unmodelled `GdiPlus.Path` |
+//! | `setMainPixel` / `getMainPixel` / `setMaskPixel` / `getMaskPixel` | MainImage RGB / mask (alpha) read-write, `ClipRect`-aware (reference `LayerIntf.cpp:2917`) |
+//! | `loadProvinceImage` / `independProvinceImage` | load/own the 8-bit province plane (red channel of the decoded image) |
+//! | `bringToBack` / `moveBefore` / `moveBehind` | real sibling z-order changes (reference `LayerIntf.cpp:1356`) |
+//! | `releaseCapture` / `captureMouse` / `captureTouch` / `releaseTouchCapture` | input-capture state (reference `ReleaseCapture`; the `capture*` pair are KAG extensions) |
+//! | `focusNext` / `focusPrev` | move window focus to the next/previous focusable layer (reference `LayerManager.cpp:723`) |
+//! | `onHitTest(x,y,hit)` | store the script hook's result (reference `OnHitTest_Work`) |
+//! | `setAttentionPos(x,y)` | set the attention anchor (reference `SetAttentionPoint`) |
+//! | `setMode` / `removeMode` | modal-layer stack per window (reference `LayerManager.cpp:834`) |
+//! | `getList` | engine extension: the direct children array (the reference `getList` is `Font.getList`, already in `font.rs`) |
+//! | `clear([argb])` | `layerExDraw` engine extra: fill the main image (default transparent) |
+//! | `dump` | output-only debug log (reference `DumpStructure`) |
+//! | `onPaint` | documented inert base action: dispatching it would recurse, since `paint_poll` already fires the script handler and handlers call `super.onPaint(...)` |
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, c_int, c_void};
 use std::sync::{LazyLock, Mutex};
 
@@ -102,8 +119,98 @@ use super::{context_engine, context_scene_mut, context_scene_read};
 /// first, the script sets its flag, and only then do we invoke
 /// `onTransitionCompleted`. Pixel interpolation remains outside this
 /// milestone, but scene changes and callbacks no longer stall forever.
-static PENDING_TRANSITIONS: LazyLock<Mutex<Vec<tjs2_sys::DetachedValue>>> =
+/// Pending native transition requests. The `u32` is the scene layer id so
+/// `stopTransition` can cancel just that layer's queued completion.
+static PENDING_TRANSITIONS: LazyLock<Mutex<Vec<(u32, tjs2_sys::DetachedValue)>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// Affine anchor state for the KAG `Sprite`/`AffineLayer` script classes.
+///
+/// The reference core `LayerIntf.cpp` has no `setCenter`/`setAffineOffset`
+/// methods: they belong to the game's `system/Sprite.tjs`
+/// (`setCenter`) and `system/AffineLayer.tjs` (`setAffineOffset`), which
+/// store the values in script state and compute the affine matrix
+/// themselves. Real games call them through those script classes, so the
+/// native surface must still answer them; we keep the anchor on the layer so
+/// it survives and can be queried (and so a game calling the native name
+/// directly gets the same anchored semantics rather than a discarded call).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct LayerAffineState {
+    pub center: (f64, f64),
+    pub affine_offset: (f64, f64),
+}
+
+static LAYER_AFFINE: LazyLock<Mutex<HashMap<u32, LayerAffineState>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// One default/current text-draw parameter set (`setDefaultDrawTextParam` /
+/// `resetDrawTextParam`). Field order matches the native argument list:
+/// `color, opa, aa, shadowLevel, shadowColor, shadowWidth, shadowX, shadowY`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct DrawTextParam {
+    pub color: i64,
+    pub opa: i64,
+    pub aa: bool,
+    pub shadow_level: i64,
+    pub shadow_color: i64,
+    pub shadow_width: i64,
+    pub shadow_x: i64,
+    pub shadow_y: i64,
+}
+
+impl Default for DrawTextParam {
+    fn default() -> Self {
+        Self {
+            color: 0x00ff_ffff,
+            opa: 255,
+            aa: true,
+            shadow_level: 0,
+            shadow_color: 0,
+            shadow_width: 0,
+            shadow_x: 0,
+            shadow_y: 0,
+        }
+    }
+}
+
+/// The layer's text parameters: `default` (what `setDefaultDrawTextParam`
+/// records) and `current` (what `resetDrawTextParam` restores). The game's
+/// `MessageArea` keeps parallel script state; this native copy makes the
+/// methods real on the native `Layer` surface too.
+#[derive(Clone, Copy, Debug, Default)]
+struct LayerTextParams {
+    default: DrawTextParam,
+    current: DrawTextParam,
+}
+
+static LAYER_TEXT_PARAMS: LazyLock<Mutex<HashMap<u32, LayerTextParams>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Script-visible input capture state (reference `CaptureOwner` /
+/// `SetTouchCapture`; `captureMouse`/`captureTouch` are KAG extensions over
+/// the reference `releaseCapture`/`releaseTouchCapture`).
+#[derive(Default)]
+struct LayerCaptureState {
+    /// Layer that owns the mouse capture, if any (per window).
+    mouse: Option<u32>,
+    /// Touch id → capturing layer.
+    touches: HashMap<u64, u32>,
+}
+
+static LAYER_CAPTURE: LazyLock<Mutex<LayerCaptureState>> =
+    LazyLock::new(|| Mutex::new(LayerCaptureState::default()));
+
+/// The `onHitTest` script hook's work slot (reference `OnHitTest_Work`). The
+/// input hit-test reads it after dispatching the hook; our `Scene::layer_at`
+/// does not yet dispatch script `onHitTest`, so this stores the value for
+/// that future wiring and for script introspection.
+static LAYER_HITTEST_WORK: LazyLock<Mutex<HashMap<u32, bool>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Per-window modal layer stack (reference `tTVPLayerManager::ModalLayerVector`)
+/// behind `setMode`/`removeMode`.
+static MODAL_LAYERS: LazyLock<Mutex<HashMap<u32, Vec<u32>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Payload of one script-visible `Layer` object.
 #[derive(Default)]
@@ -152,6 +259,34 @@ extern "C" fn layer_destroy(_engine: *mut c_void, instance: *mut c_void) {
             scene.fonts.retain(|f| f.id != font_id);
         }
         scene.remove_layer(inst.id);
+    }
+    // Drop the layer's side-table state so a reused scene id cannot inherit
+    // it. (Only the constructed path owns scene state, but the auxiliary
+    // tables are keyed purely by id and must always be cleared.)
+    LAYER_AFFINE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&inst.id);
+    LAYER_TEXT_PARAMS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&inst.id);
+    LAYER_HITTEST_WORK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&inst.id);
+    {
+        let mut capture = LAYER_CAPTURE.lock().unwrap_or_else(|p| p.into_inner());
+        if capture.mouse == Some(inst.id) {
+            capture.mouse = None;
+        }
+        capture.touches.retain(|_, layer| *layer != inst.id);
+    }
+    {
+        let mut modals = MODAL_LAYERS.lock().unwrap_or_else(|p| p.into_inner());
+        for stack in modals.values_mut() {
+            stack.retain(|&id| id != inst.id);
+        }
     }
     // SAFETY: instance came from Box::into_raw.
     unsafe { drop(Box::from_raw(instance as *mut LayerInst)) };
@@ -2959,7 +3094,13 @@ extern "C" fn layer_update(
     0
 }
 
-/// `setCursorPos(x, y)` — no-op (input is beyond milestone 3A).
+/// `setCursorPos(x, y)` — reference `SetCursorPos` (`LayerIntf.cpp:3150`)
+/// converts the layer-local point to window coordinates and forwards it to
+/// the platform layer manager's IME caret. This crate has no platform IME
+/// manager, and the render input bridge owns the shared cursor state
+/// (`layer.cursorX`/`cursorY`), so there is no consumer for the value; the
+/// call is intentionally inert rather than silently wrong. Kept as a real
+/// resolvable member so `super`/script calls do not throw.
 extern "C" fn layer_set_cursor_pos(
     _engine: *mut c_void,
     _instance: *mut c_void,
@@ -3206,6 +3347,55 @@ extern "C" fn layer_draw_text(
         )
     };
 
+    paint_text_run(
+        bitmap_id,
+        width,
+        &text,
+        x,
+        y,
+        color,
+        opa,
+        aa,
+        shadow_level,
+        shadow_color,
+        shadow_width,
+        shadow_x,
+        shadow_y,
+        font_height,
+        style,
+        face_override,
+    );
+    set_void_out(out);
+    0
+}
+
+/// The shared text rasterization tail used by `drawText`, `drawString` and
+/// `drawGlyph`: try the mapped pre-rendered `.tft` font first, then the
+/// `tvp-text` vector rasterizer, and finally leave the layer transparent with
+/// a one-time warning when no face resolves.
+///
+/// `face_override`/`font_height`/`style` are snapshotted by the caller under
+/// the scene lock; resolution (which may do file IO) happens here without a
+/// held lock.
+#[allow(clippy::too_many_arguments)]
+fn paint_text_run(
+    bitmap_id: u32,
+    width: u32,
+    text: &str,
+    x: i32,
+    y: i32,
+    color: [u8; 4],
+    opa: u8,
+    aa: bool,
+    shadow_level: u32,
+    shadow_color: [u8; 4],
+    shadow_width: u32,
+    shadow_x: i32,
+    shadow_y: i32,
+    font_height: u32,
+    style: DrawTextStyle,
+    face_override: Option<String>,
+) {
     // Pre-rendered `.tft` fonts take precedence when the layer font's exact
     // properties were mapped by `Font.mapPrerenderedFont` and every character
     // in this call is present. `MessageArea.charOutput` draws one character per
@@ -3231,7 +3421,7 @@ extern "C" fn layer_draw_text(
                 paint_prerendered_text(
                     bitmap,
                     &pfont,
-                    &text,
+                    text,
                     shadow_color,
                     opa,
                     aa,
@@ -3245,7 +3435,7 @@ extern "C" fn layer_draw_text(
             paint_prerendered_text(
                 bitmap,
                 &pfont,
-                &text,
+                text,
                 color,
                 opa,
                 aa,
@@ -3257,8 +3447,7 @@ extern "C" fn layer_draw_text(
             );
             bitmap.mark_dirty();
         }
-        set_void_out(out);
-        return 0;
+        return;
     }
 
     // Prefer tvp-text's real rasterizer. `KRKR_RS_SYSTEM_FONT` is an explicit
@@ -3286,7 +3475,7 @@ extern "C" fn layer_draw_text(
         let text_layout =
             with_cached_atlas_styled(face.clone(), font_height, style.bold, |atlas| {
                 layout(
-                    &text,
+                    text,
                     width as f32,
                     font_height as f32,
                     atlas,
@@ -3337,10 +3526,7 @@ extern "C" fn layer_draw_text(
                 face_override
             );
         }
-        let _ = bitmap_id;
     }
-    set_void_out(out);
-    0
 }
 
 // ---------------------------------------------------------------------------
@@ -3371,14 +3557,19 @@ fn parse_points(engine: &Tjs2Engine, arg: &Value) -> Vec<(f64, f64)> {
     let Ok(array) = engine.retain_object_arg(arg) else {
         return Vec::new();
     };
-    let count = match engine.get_member(array.raw_id(), "count") {
+    parse_points_id(engine, array.raw_id())
+}
+
+/// Parse a points array by retained object id (`[[x, y], ...]`).
+fn parse_points_id(engine: &Tjs2Engine, array_id: tjs2_sys::Tjs2ValueId) -> Vec<(f64, f64)> {
+    let count = match engine.get_member(array_id, "count") {
         Ok(TjsValue::Integer(n)) => n.max(0) as usize,
         Ok(TjsValue::Real(n)) => n.max(0.0) as usize,
         _ => 0,
     };
     let mut pts = Vec::with_capacity(count);
     for i in 0..count {
-        if engine.get_member(array.raw_id(), &i.to_string()).is_err() {
+        if engine.get_member(array_id, &i.to_string()).is_err() {
             continue;
         }
         let Ok(pair) = engine.retain_value_detached(&TjsValue::Object) else {
@@ -3469,28 +3660,70 @@ fn draw_gdiplus_path(
     Ok(())
 }
 
-/// A cardinal (Catmull-Rom) spline through `pts`, flattened to a polyline
-/// (the `layerExDraw` plugin's `drawCurve`).
-fn catmull_rom_path(pts: &[(f64, f64)]) -> Vec<(f64, f64)> {
-    if pts.len() < 2 {
-        return pts.to_vec();
+/// A cardinal (Catmull-Rom) spline through `pts`, flattened to a polyline.
+///
+/// Mirrors `LayerExDraw::drawCurve3` (`reference/cpp/plugins/layerex_draw/
+/// .../LayerExDraw.cpp`): the control points are
+/// `p1 + (p2 - p0) * tension / 3` and `p2 - (p3 - p1) * tension / 3` (GDI+'s
+/// `DrawCurve` default tension is `0.5`). `closed` wraps the neighbour lookup
+/// and closes the path (`drawClosedCurve`/`drawClosedCurve2`); otherwise
+/// `offset`/`number_of_segments` select a sub-range (`drawCurve2`/`drawCurve3`).
+/// An out-of-range open range yields an empty path, exactly like the
+/// reference's early `return RectF()`.
+fn cardinal_spline_path(
+    pts: &[(f64, f64)],
+    closed: bool,
+    offset: usize,
+    number_of_segments: usize,
+    tension: f64,
+) -> Vec<(f64, f64)> {
+    let n = pts.len();
+    if n < 2 {
+        return Vec::new();
     }
-    let mut out = vec![pts[0]];
-    for i in 0..pts.len() - 1 {
-        let p0 = if i == 0 { pts[0] } else { pts[i - 1] };
+    let control = |p0: (f64, f64), p1: (f64, f64), p2: (f64, f64), p3: (f64, f64)| {
+        let c1 = (
+            p1.0 + (p2.0 - p0.0) * tension / 3.0,
+            p1.1 + (p2.1 - p0.1) * tension / 3.0,
+        );
+        let c2 = (
+            p2.0 - (p3.0 - p1.0) * tension / 3.0,
+            p2.1 - (p3.1 - p1.1) * tension / 3.0,
+        );
+        (c1, c2)
+    };
+    let mut out = vec![pts[offset.min(n - 1)]];
+    if closed {
+        for i in 0..n {
+            let p0 = pts[(i + n - 1) % n];
+            let p1 = pts[i];
+            let p2 = pts[(i + 1) % n];
+            let p3 = pts[(i + 2) % n];
+            let (c1, c2) = control(p0, p1, p2, p3);
+            let seg = raster::flatten_cubic(p1, c1, c2, p2, 16);
+            out.extend_from_slice(&seg[1..]);
+        }
+        return out;
+    }
+    if offset + number_of_segments >= n {
+        return Vec::new();
+    }
+    for i in offset..offset + number_of_segments {
+        let p0 = if i > 0 { pts[i - 1] } else { pts[i] };
         let p1 = pts[i];
         let p2 = pts[i + 1];
-        let p3 = if i + 2 < pts.len() {
-            pts[i + 2]
-        } else {
-            pts[i + 1]
-        };
-        let c1 = (p1.0 + (p2.0 - p0.0) / 6.0, p1.1 + (p2.1 - p0.1) / 6.0);
-        let c2 = (p2.0 - (p3.0 - p1.0) / 6.0, p2.1 - (p3.1 - p1.1) / 6.0);
+        let p3 = if i + 2 < n { pts[i + 2] } else { pts[i + 1] };
+        let (c1, c2) = control(p0, p1, p2, p3);
         let seg = raster::flatten_cubic(p1, c1, c2, p2, 16);
         out.extend_from_slice(&seg[1..]);
     }
     out
+}
+
+/// The `layerExDraw` plugin's `drawCurve`: an open cardinal spline with the
+/// default tension 0.5.
+fn catmull_rom_path(pts: &[(f64, f64)]) -> Vec<(f64, f64)> {
+    cardinal_spline_path(pts, false, 0, pts.len().saturating_sub(1), 0.5)
 }
 
 /// `drawPolygon(app, points)` — closed polygon: fill with brushes, stroke
@@ -3724,20 +3957,66 @@ extern "C" fn layer_do_box_blur(
 
 extern "C" fn layer_begin_transition(
     _engine: *mut c_void,
-    _instance: *mut c_void,
+    instance: *mut c_void,
     _argc: c_int,
     _argv: *const Value,
     out: *mut Value,
     _out_error: *mut *mut c_char,
     objthis: *mut c_void,
 ) -> c_int {
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
     if !objthis.is_null()
         && let Ok(value) = context_engine().retain_object_detached(objthis)
     {
         PENDING_TRANSITIONS
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .push(value);
+            .push((inst.id, value));
+    }
+    set_void_out(out);
+    0
+}
+
+/// `stopTransition()` — reference `tTJSNI_BaseLayer::StopTransition`
+/// (`LayerIntf.cpp:8033`): cancel this layer's in-flight transition. The
+/// simplified model queues the completion callback (`beginTransition`), so
+/// stopping drops the queued entry and synchronously fires
+/// `onTransitionCompleted` for the cancelled transition, matching the
+/// reference's synchronous event on `InternalStopTransition`. Returns whether
+/// a queued transition was actually cancelled.
+extern "C" fn layer_stop_transition(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    _argc: c_int,
+    _argv: *const Value,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let cancelled: Vec<tjs2_sys::DetachedValue> = {
+        let mut pending = PENDING_TRANSITIONS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let mut kept = Vec::with_capacity(pending.len());
+        let mut removed = Vec::new();
+        for (layer_id, value) in pending.drain(..) {
+            if layer_id == inst.id {
+                removed.push(value);
+            } else {
+                kept.push((layer_id, value));
+            }
+        }
+        *pending = kept;
+        removed
+    };
+    let engine = context_engine();
+    for value in &cancelled {
+        let _ = engine.call_member(
+            value.raw_id(),
+            "onTransitionCompleted",
+            &[TjsValue::Void, TjsValue::Void],
+        );
     }
     set_void_out(out);
     0
@@ -3750,7 +4029,7 @@ pub(crate) fn transition_poll(engine: &Tjs2Engine) {
             .lock()
             .unwrap_or_else(|p| p.into_inner()),
     );
-    for value in pending {
+    for (_layer_id, value) in pending {
         // The simplified transition model has no source/destination objects;
         // pass void for both members so the `onTransitionCompleted` native
         // still dispatches to the action owner.
@@ -3761,21 +4040,6 @@ pub(crate) fn transition_poll(engine: &Tjs2Engine) {
         );
         drop(value);
     }
-}
-
-/// Generic no-op stub for methods that need real pixel/affine operations
-/// (a later wave; documented in the module doc).
-extern "C" fn layer_noop(
-    _engine: *mut c_void,
-    _instance: *mut c_void,
-    _argc: c_int,
-    _argv: *const Value,
-    out: *mut Value,
-    _out_error: *mut *mut c_char,
-    _objthis: *mut c_void,
-) -> c_int {
-    set_void_out(out);
-    0
 }
 
 fn fallback_text_width(text: &str, height: u32) -> u32 {
@@ -5937,58 +6201,1772 @@ fn blur_bitmap(bitmap: &mut BitmapState, xradius: u32, yradius: u32) {
     layer_ops::blur_bitmap_in_place(bitmap, xradius, yradius);
 }
 
+// ---------------------------------------------------------------------------
+// Text/font style (KAG `MessageArea` surface, and the core `drawGlyph`)
+// ---------------------------------------------------------------------------
+
+/// Ensure (creating on demand) the layer's own [`crate::scene::FontState`].
+fn layer_font_state_mut(scene: &mut Scene, layer_id: u32) -> Option<&mut crate::scene::FontState> {
+    let existing = scene.layer(layer_id).and_then(|l| l.font_id);
+    let font_id = match existing {
+        Some(id) if scene.font(id).is_some() => id,
+        _ => {
+            let id = scene.add_font(
+                super::font::DEFAULT_FONT_FACE.to_string(),
+                super::font::DEFAULT_FONT_HEIGHT,
+                [255, 255, 255, 255],
+            );
+            scene.layer_mut(layer_id)?.font_id = Some(id);
+            id
+        }
+    };
+    scene.fonts.iter_mut().find(|f| f.id == font_id)
+}
+
+/// Snapshot the layer's font into `(face, height, style)`, falling back to
+/// the newest registered `Font` and then to the engine defaults, exactly like
+/// [`layer_draw_text`] does.
+fn layer_text_style(scene: &Scene, layer_id: u32) -> (Option<String>, u32, DrawTextStyle) {
+    let layer_font = scene.layer(layer_id).and_then(|l| l.font_id);
+    if let Some(font) = layer_font.and_then(|id| scene.font(id)) {
+        return (
+            Some(font.face.clone()),
+            font.height.max(1) as u32,
+            DrawTextStyle::from_font(font),
+        );
+    }
+    if let Some(font) = scene.fonts.last() {
+        return (
+            Some(font.face.clone()),
+            font.height.max(1) as u32,
+            DrawTextStyle::from_font(font),
+        );
+    }
+    (None, 16, DrawTextStyle::default())
+}
+
+/// Read a `Font`-like object argument's `face`/`height`/`bold`/`italic`/
+/// `underline`/`strikeout`/`angle` members. Returns `None` for non-objects or
+/// objects without a readable `face`/`height` (the caller then falls back to
+/// the layer font).
+fn font_style_from_arg(engine: &Tjs2Engine, v: &Value) -> Option<(String, u32, DrawTextStyle)> {
+    if v.ty != tjs2_sys::VAL_OBJECT {
+        return None;
+    }
+    let dv = engine.retain_object_arg(v).ok()?;
+    let id = dv.raw_id();
+    let face = match engine.get_member(id, "face") {
+        Ok(TjsValue::String(s)) => s,
+        _ => return None,
+    };
+    let height = match engine.get_member(id, "height") {
+        Ok(TjsValue::Integer(h)) => h.max(1) as u32,
+        Ok(TjsValue::Real(h)) => h.max(1.0) as u32,
+        _ => 16,
+    };
+    let flag = |name: &str| matches!(engine.get_member(id, name), Ok(TjsValue::Integer(1)));
+    let angle = match engine.get_member(id, "angle") {
+        Ok(TjsValue::Real(a)) => a,
+        Ok(TjsValue::Integer(a)) => a as f64,
+        _ => 0.0,
+    };
+    Some((
+        face,
+        height,
+        DrawTextStyle {
+            bold: flag("bold"),
+            italic: flag("italic"),
+            underline: flag("underline"),
+            strikeout: flag("strikeout"),
+            angle_deg: angle / 10.0,
+        },
+    ))
+}
+
+/// The first solid brush/pen color of an appearance argument, or `None`.
+fn appearance_color(app_arg: &Value) -> Option<[u8; 4]> {
+    let state = super::gdiplus::appearance_snapshot(app_arg.object_handle())?;
+    for info in &state.infos {
+        match info {
+            DrawKind::Brush(BrushKind::Solid(c)) => return Some(*c),
+            DrawKind::Pen {
+                brush: BrushKind::Solid(c),
+                ..
+            } => return Some(*c),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Ensure the layer has a bitmap large enough for a text run and return
+/// `(bitmap_id, bitmap_width)`. Shared by `drawText`/`drawString`/`drawGlyph`.
+fn ensure_text_bitmap(
+    scene: &mut Scene,
+    layer_id: u32,
+    x: i32,
+    y: i32,
+    text: &str,
+    font_height: u32,
+) -> Option<(u32, u32)> {
+    let needed_w = (x.max(0) as u32).saturating_add(fallback_text_width(text, font_height));
+    let needed_h = (y.max(0) as u32).saturating_add(fallback_text_height(text, font_height));
+    let bitmap_id = ensure_layer_bitmap(scene, layer_id, needed_w, needed_h)?;
+    let width = scene.bitmap(bitmap_id).map(|b| b.width.max(1))?;
+    Some((bitmap_id, width))
+}
+
+/// Parse the text-draw parameter arguments (`color, opa, aa, shadowLevel,
+/// shadowColor, shadowWidth, shadowX, shadowY`) with the reference defaults,
+/// used by `setDefaultDrawTextParam` and `drawGlyph`.
+fn parse_draw_text_param(args: &[Value], base: DrawTextParam) -> DrawTextParam {
+    let int = |i: usize, d: i64| {
+        args.get(i)
+            .filter(|v| v.ty != tjs2_sys::VAL_VOID)
+            .map(arg_i64)
+            .unwrap_or(d)
+    };
+    DrawTextParam {
+        color: int(0, base.color),
+        opa: int(1, base.opa),
+        aa: args
+            .get(2)
+            .filter(|v| v.ty != tjs2_sys::VAL_VOID)
+            .map(arg_bool)
+            .unwrap_or(base.aa),
+        shadow_level: int(3, base.shadow_level),
+        shadow_color: int(4, base.shadow_color),
+        shadow_width: int(5, base.shadow_width),
+        shadow_x: int(6, base.shadow_x),
+        shadow_y: int(7, base.shadow_y),
+    }
+}
+
+/// `setFontStyle(face[, size[, indent[, bold[, italic[, underline[,
+/// strikeout[, angle]]]]]]])` — the KAG `MessageArea.setFontStyle` native
+/// counterpart. It writes the layer's tracked `FontState`, so a later
+/// `drawText` rasterizes with the requested face/size/style.
+///
+/// `indent` is accepted for signature compatibility and ignored: the
+/// reference `MessageArea` keeps the indent in script (`_indent`) because it
+/// is a per-line layout offset, not a glyph property.
+extern "C" fn layer_set_font_style(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let mut scene = context_scene_mut();
+    if scene.layer(inst.id).is_none() {
+        return error_out(out_error, "Layer: layer no longer exists");
+    }
+    let Some(font) = layer_font_state_mut(&mut scene, inst.id) else {
+        return error_out(out_error, "Layer: layer no longer exists");
+    };
+    if let Some(v) = args.first().filter(|v| v.ty != tjs2_sys::VAL_VOID) {
+        font.face = arg_string(v);
+    }
+    if let Some(v) = args.get(1).filter(|v| v.ty != tjs2_sys::VAL_VOID) {
+        font.height = arg_i64(v) as i32;
+    }
+    if let Some(v) = args.get(3).filter(|v| v.ty != tjs2_sys::VAL_VOID) {
+        font.bold = arg_bool(v);
+    }
+    if let Some(v) = args.get(4).filter(|v| v.ty != tjs2_sys::VAL_VOID) {
+        font.italic = arg_bool(v);
+    }
+    if let Some(v) = args.get(5).filter(|v| v.ty != tjs2_sys::VAL_VOID) {
+        font.underline = arg_bool(v);
+    }
+    if let Some(v) = args.get(6).filter(|v| v.ty != tjs2_sys::VAL_VOID) {
+        font.strikeout = arg_bool(v);
+    }
+    if let Some(v) = args.get(7).filter(|v| v.ty != tjs2_sys::VAL_VOID) {
+        font.angle = arg_f64(v);
+    }
+    set_void_out(out);
+    0
+}
+
+/// `resetFontStyle([face[, size[, ...]]])` — reset the layer font to the
+/// engine defaults and then apply any provided arguments. This is the native
+/// counterpart of the game's `MessageArea.resetFontStyle`, which re-applies
+/// the recorded default font style.
+extern "C" fn layer_reset_font_style(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let mut scene = context_scene_mut();
+    if scene.layer(inst.id).is_none() {
+        return error_out(out_error, "Layer: layer no longer exists");
+    }
+    let Some(font) = layer_font_state_mut(&mut scene, inst.id) else {
+        return error_out(out_error, "Layer: layer no longer exists");
+    };
+    font.face = super::font::DEFAULT_FONT_FACE.to_string();
+    font.height = super::font::DEFAULT_FONT_HEIGHT;
+    font.bold = false;
+    font.italic = false;
+    font.underline = false;
+    font.strikeout = false;
+    font.angle = 0.0;
+    if let Some(v) = args.first().filter(|v| v.ty != tjs2_sys::VAL_VOID) {
+        font.face = arg_string(v);
+    }
+    if let Some(v) = args.get(1).filter(|v| v.ty != tjs2_sys::VAL_VOID) {
+        font.height = arg_i64(v) as i32;
+    }
+    if let Some(v) = args.get(3).filter(|v| v.ty != tjs2_sys::VAL_VOID) {
+        font.bold = arg_bool(v);
+    }
+    if let Some(v) = args.get(4).filter(|v| v.ty != tjs2_sys::VAL_VOID) {
+        font.italic = arg_bool(v);
+    }
+    if let Some(v) = args.get(5).filter(|v| v.ty != tjs2_sys::VAL_VOID) {
+        font.underline = arg_bool(v);
+    }
+    if let Some(v) = args.get(6).filter(|v| v.ty != tjs2_sys::VAL_VOID) {
+        font.strikeout = arg_bool(v);
+    }
+    if let Some(v) = args.get(7).filter(|v| v.ty != tjs2_sys::VAL_VOID) {
+        font.angle = arg_f64(v);
+    }
+    set_void_out(out);
+    0
+}
+
+/// `setDefaultDrawTextParam(color, opa, aa, shadowLevel, shadowColor,
+/// shadowWidth, shadowX, shadowY)` — record the layer's default text-draw
+/// parameters (the native counterpart of `MessageArea.setDefaultDrawTextParam`).
+extern "C" fn layer_set_default_draw_text_param(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let mut params = LAYER_TEXT_PARAMS.lock().unwrap_or_else(|p| p.into_inner());
+    let entry = params.entry(inst.id).or_default();
+    let base = entry.default;
+    entry.default = parse_draw_text_param(args, base);
+    set_void_out(out);
+    0
+}
+
+/// `resetDrawTextParam()` — restore the current text parameters from the
+/// defaults recorded by `setDefaultDrawTextParam`.
+extern "C" fn layer_reset_draw_text_param(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    _argc: c_int,
+    _argv: *const Value,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let mut params = LAYER_TEXT_PARAMS.lock().unwrap_or_else(|p| p.into_inner());
+    let entry = params.entry(inst.id).or_default();
+    entry.current = entry.default;
+    set_void_out(out);
+    0
+}
+
+/// `drawString(font, app, x, y, text)` — the `layerExDraw` plugin's string
+/// draw. The engine has no `GdiPlus.Font`, so the `font` argument is a
+/// `Font`-like object (our native `Font`, or any object exposing
+/// `face`/`height`/`bold`/...); the `app` argument supplies the color through
+/// its first solid brush. Rasterization uses the same `tvp-text` machinery as
+/// [`layer_draw_text`].
+extern "C" fn layer_draw_string(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    if args.len() < 5 {
+        return error_out(
+            out_error,
+            "Layer.drawString requires (font, app, x, y, text)",
+        );
+    }
+    let text = arg_string(&args[4]);
+    if text.is_empty() {
+        set_void_out(out);
+        return 0;
+    }
+    let x = arg_i64(&args[2]) as i32;
+    let y = arg_i64(&args[3]) as i32;
+    let engine = context_engine();
+    let mut color = appearance_color(&args[1]).unwrap_or([255, 255, 255, 255]);
+    // The plugin's string draw honors the brush alpha; default to opaque.
+    if color[3] == 0 {
+        color[3] = 255;
+    }
+    // Snapshot the `font` argument's geometry *before* taking the scene lock:
+    // the `Font` property getters lock the scene themselves, and the scene
+    // lock is not reentrant.
+    let font_style = font_style_from_arg(engine, &args[0]);
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let (face_override, font_height, style, bitmap_id, width) = {
+        let mut scene = context_scene_mut();
+        if scene.layer(inst.id).is_none() {
+            return error_out(out_error, "Layer: layer no longer exists");
+        }
+        let (face, height, style) = match font_style {
+            Some((face, height, style)) => (Some(face), height, style),
+            None => layer_text_style(&scene, inst.id),
+        };
+        let Some((bitmap_id, width)) = ensure_text_bitmap(&mut scene, inst.id, x, y, &text, height)
+        else {
+            return error_out(out_error, "Layer: layer no longer exists");
+        };
+        (face, height, style, bitmap_id, width)
+    };
+    paint_text_run(
+        bitmap_id,
+        width,
+        &text,
+        x,
+        y,
+        color,
+        255,
+        true,
+        0,
+        [0, 0, 0, 255],
+        0,
+        0,
+        0,
+        font_height,
+        style,
+        face_override,
+    );
+    set_void_out(out);
+    0
+}
+
+/// `getDrawWidth(text)` — the advance width of `text` in the layer's tracked
+/// font. This is the native counterpart of the game's
+/// `MessageArea.getDrawWidth`, which measures a pre-rendered glyph; for the
+/// vector/fallback engine the same half/full-width metric as `getTextWidth`
+/// is used. An empty/absent argument measures the empty string (width 0).
+extern "C" fn layer_get_draw_width(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    let text = args.first().map(arg_string).unwrap_or_default();
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let height = {
+        let scene = context_scene_read();
+        layer_text_style(&scene, inst.id).1
+    };
+    set_int_out(out, i64::from(fallback_text_width(&text, height)));
+    0
+}
+
+/// `drawGlyph(x, y, glyph, color[, opa[, aa[, shadowLevel[, shadowColor[,
+/// shadowWidth[, shadowOfsX[, shadowOfsY]]]]]]])` — reference
+/// `tTJSNI_BaseLayer::DrawGlyph` (`LayerIntf.cpp:4481`).
+///
+/// The reference `glyph` is a `Font.getGlyph` `Glyph` object, which this
+/// engine does not model. To keep the method real rather than a discarded
+/// call, the glyph argument is accepted as either a character/string or an
+/// object exposing a `text`/`char`/`character` string member, and is
+/// rasterized with the layer's tracked font through the same text pipeline.
+/// A glyph argument that carries no text logs a warning and paints nothing.
+extern "C" fn layer_draw_glyph(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    if args.len() < 4 {
+        return error_out(out_error, "Layer.drawGlyph requires (x, y, glyph, color)");
+    }
+    let engine = context_engine();
+    let glyph_text = glyph_text_arg(engine, &args[2]);
+    let Some(text) = glyph_text else {
+        log::warn!("Layer.drawGlyph: glyph argument carries no text; nothing painted");
+        set_void_out(out);
+        return 0;
+    };
+    if text.is_empty() {
+        set_void_out(out);
+        return 0;
+    }
+    let x = arg_i64(&args[0]) as i32;
+    let y = arg_i64(&args[1]) as i32;
+    let mut color = argb_to_rgba(arg_i64(&args[3]));
+    color[3] = 255;
+    let opa = args.get(4).map(arg_i64).unwrap_or(255).clamp(0, 255) as u8;
+    let aa = args.get(5).map(arg_bool).unwrap_or(true);
+    let shadow_level = args.get(6).map(arg_i64).unwrap_or(0).max(0) as u32;
+    let mut shadow_color = argb_to_rgba(args.get(7).map(arg_i64).unwrap_or(0));
+    shadow_color[3] = 255;
+    let shadow_width = args.get(8).map(arg_i64).unwrap_or(0).max(0) as u32;
+    let shadow_x = args.get(9).map(arg_i64).unwrap_or(0) as i32;
+    let shadow_y = args.get(10).map(arg_i64).unwrap_or(0) as i32;
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let (face_override, font_height, style, bitmap_id, width) = {
+        let mut scene = context_scene_mut();
+        if scene.layer(inst.id).is_none() {
+            return error_out(out_error, "Layer: layer no longer exists");
+        }
+        let (face, height, style) = layer_text_style(&scene, inst.id);
+        let Some((bitmap_id, width)) = ensure_text_bitmap(&mut scene, inst.id, x, y, &text, height)
+        else {
+            return error_out(out_error, "Layer: layer no longer exists");
+        };
+        (face, height, style, bitmap_id, width)
+    };
+    paint_text_run(
+        bitmap_id,
+        width,
+        &text,
+        x,
+        y,
+        color,
+        opa,
+        aa,
+        shadow_level,
+        shadow_color,
+        shadow_width,
+        shadow_x,
+        shadow_y,
+        font_height,
+        style,
+        face_override,
+    );
+    set_void_out(out);
+    0
+}
+
+/// Resolve the text carried by a `drawGlyph` glyph argument: a plain string,
+/// or an object exposing `text`/`char`/`character`.
+fn glyph_text_arg(engine: &Tjs2Engine, v: &Value) -> Option<String> {
+    match v.ty {
+        tjs2_sys::VAL_STRING => Some(arg_string(v)),
+        tjs2_sys::VAL_OBJECT => {
+            let dv = engine.retain_object_arg(v).ok()?;
+            for name in ["text", "char", "character"] {
+                if let Ok(TjsValue::String(s)) = engine.get_member(dv.raw_id(), name) {
+                    return Some(s);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// `clear([argb])` — the `layerExDraw` plugin's `clear`: replace every pixel
+/// of the layer's main image with `argb` (default `0` = transparent). The
+/// reference native is not a core `Layer` member (it is an engine extra), so
+/// it is given the plugin's real fill semantics rather than removed.
+extern "C" fn layer_clear(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    let color = args
+        .first()
+        .filter(|v| v.ty != tjs2_sys::VAL_VOID)
+        .map(|v| argb_to_rgba(arg_i64(v)))
+        .unwrap_or([0, 0, 0, 0]);
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let mut scene = context_scene_mut();
+    if scene.layer(inst.id).is_none() {
+        return error_out(out_error, "Layer: layer no longer exists");
+    }
+    let Some(bitmap_id) = ensure_dest_image(&mut scene, inst.id, 0, 0) else {
+        return error_out(out_error, "Layer: layer no longer exists");
+    };
+    if let Some(bitmap) = scene.bitmap_mut(bitmap_id) {
+        let (w, h) = (bitmap.width, bitmap.height);
+        raster::fill_rect_replace(bitmap, 0, 0, w, h, color);
+        bitmap.mark_dirty();
+    }
+    if let Some(layer) = scene.layer_mut(inst.id) {
+        layer.image_modified = true;
+    }
+    set_void_out(out);
+    0
+}
+
+/// `drawClosedCurve(app, points)` — closed cardinal spline, tension 0.5
+/// (`LayerExDraw::drawClosedCurve`).
+extern "C" fn layer_draw_closed_curve(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    layer_draw_spline(instance, argc, argv, out, out_error, true, false)
+}
+
+/// `drawClosedCurve2(app, points, tension)`.
+extern "C" fn layer_draw_closed_curve2(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    layer_draw_spline(instance, argc, argv, out, out_error, true, true)
+}
+
+/// `drawCurve2(app, points, tension)`.
+extern "C" fn layer_draw_curve2(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    layer_draw_spline(instance, argc, argv, out, out_error, false, true)
+}
+
+/// `drawCurve3(app, points, offset, numberOfSegments, tension)`.
+extern "C" fn layer_draw_curve3(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    if args.len() < 5 {
+        return error_out(
+            out_error,
+            "Layer.drawCurve3 requires (app, points, offset, numberOfSegments, tension)",
+        );
+    }
+    let pts = parse_points(context_engine(), &args[1]);
+    if pts.len() < 2 {
+        set_void_out(out);
+        return 0;
+    }
+    let offset = arg_i64(&args[2]).max(0) as usize;
+    let segments = arg_i64(&args[3]);
+    let segments = if segments < 0 {
+        pts.len().saturating_sub(1)
+    } else {
+        segments as usize
+    };
+    let tension = arg_f64(&args[4]);
+    let path = cardinal_spline_path(&pts, false, offset, segments, tension);
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    if path.len() >= 2
+        && let Err(e) = draw_gdiplus_path(inst.id, &args[0], &path, false, false)
+    {
+        return error_out(out_error, &e);
+    }
+    set_void_out(out);
+    0
+}
+
+/// Shared body for `drawClosedCurve`/`drawClosedCurve2`/`drawCurve2`.
+fn layer_draw_spline(
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    closed: bool,
+    has_tension: bool,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    let min = if has_tension { 3 } else { 2 };
+    if args.len() < min {
+        return error_out(
+            out_error,
+            "Layer.drawCurve* requires an app and a points array",
+        );
+    }
+    let pts = parse_points(context_engine(), &args[1]);
+    if pts.len() < 2 {
+        set_void_out(out);
+        return 0;
+    }
+    let tension = if has_tension { arg_f64(&args[2]) } else { 0.5 };
+    let path = cardinal_spline_path(&pts, closed, 0, pts.len().saturating_sub(1), tension);
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    if path.len() >= 2
+        && let Err(e) = draw_gdiplus_path(inst.id, &args[0], &path, closed, closed)
+    {
+        return error_out(out_error, &e);
+    }
+    set_void_out(out);
+    0
+}
+
+/// `drawRectangles(app, rects)` — draw each `[x, y, w, h]` rectangle with the
+/// appearance's brushes/pens (`LayerExDraw::drawRectangles`).
+extern "C" fn layer_draw_rectangles(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    if args.len() < 2 {
+        return error_out(out_error, "Layer.drawRectangles requires (app, rects)");
+    }
+    let engine = context_engine();
+    let rects = parse_rectangles(engine, &args[1]);
+    if rects.is_empty() {
+        set_void_out(out);
+        return 0;
+    }
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    for (x, y, w, h) in rects {
+        let pts = [(x, y), (x + w, y), (x + w, y + h), (x, y + h)];
+        if let Err(e) = draw_gdiplus_path(inst.id, &args[0], &pts, true, true) {
+            return error_out(out_error, &e);
+        }
+    }
+    set_void_out(out);
+    0
+}
+
+/// Parse a TJS array of `[x, y, w, h]` rectangles.
+fn parse_rectangles(engine: &Tjs2Engine, arg: &Value) -> Vec<(f64, f64, f64, f64)> {
+    if arg.ty != tjs2_sys::VAL_OBJECT {
+        return Vec::new();
+    }
+    let Ok(array) = engine.retain_object_arg(arg) else {
+        return Vec::new();
+    };
+    let count = match engine.get_member(array.raw_id(), "count") {
+        Ok(TjsValue::Integer(n)) => n.max(0) as usize,
+        Ok(TjsValue::Real(n)) => n.max(0.0) as usize,
+        _ => 0,
+    };
+    let mut rects = Vec::with_capacity(count);
+    for i in 0..count {
+        if engine.get_member(array.raw_id(), &i.to_string()).is_err() {
+            continue;
+        }
+        let Ok(quad) = engine.retain_value_detached(&TjsValue::Object) else {
+            continue;
+        };
+        let m = |name: &str| member_f64(engine, quad.raw_id(), name);
+        if let (Some(x), Some(y), Some(w), Some(h)) = (m("0"), m("1"), m("2"), m("3")) {
+            rects.push((x, y, w, h));
+        }
+    }
+    rects
+}
+
+/// `drawPath(app, path)` — the `layerExDraw` plugin's path draw. The engine
+/// does not model `GdiPlus.Path`, so the argument is accepted as a point
+/// array (`[[x, y], ...]`) or an object exposing a `points` array; the
+/// resulting open polyline is filled/stroked with the appearance.
+extern "C" fn layer_draw_path(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    if args.len() < 2 {
+        return error_out(out_error, "Layer.drawPath requires (app, path)");
+    }
+    let engine = context_engine();
+    let mut pts = parse_points(engine, &args[1]);
+    if pts.is_empty() {
+        // A `Path`-like object carrying a `points` member.
+        if args[1].ty == tjs2_sys::VAL_OBJECT
+            && let Ok(dv) = engine.retain_object_arg(&args[1])
+            && let Ok(TjsValue::Object) = engine.get_member(dv.raw_id(), "points")
+            && let Ok(points) = engine.retain_value_detached(&TjsValue::Object)
+        {
+            pts = parse_points_id(engine, points.raw_id());
+        }
+    }
+    if pts.len() < 2 {
+        // No usable path: report the unsupported argument shape instead of
+        // silently painting nothing.
+        return error_out(
+            out_error,
+            "Layer.drawPath expects a point array (GdiPlus.Path is not modelled)",
+        );
+    }
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    if let Err(e) = draw_gdiplus_path(inst.id, &args[0], &pts, false, true) {
+        return error_out(out_error, &e);
+    }
+    set_void_out(out);
+    0
+}
+
+// ---------------------------------------------------------------------------
+// Main/mask pixel access and province plane
+// ---------------------------------------------------------------------------
+
+/// Whether `(x, y)` lies inside the layer's `ClipRect` (the reference
+/// `SetMainPixel`/`SetMaskPixel` guard).
+fn clip_contains(layer: &LayerState, x: i32, y: i32) -> bool {
+    let (left, top, right, bottom) = layer_pixel_rect(layer);
+    x >= left && y >= top && x < right && y < bottom
+}
+
+/// `getMainPixel(x, y)` — reference `GetMainPixel` (`LayerIntf.cpp:2917`):
+/// the MainImage RGB at `(x, y)` as `0xRRGGBB` (the alpha channel is the mask,
+/// exposed by `getMaskPixel`). Throws `TVPNotDrawableLayerType` without an
+/// image; out-of-bounds returns 0.
+extern "C" fn layer_get_main_pixel(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    if args.len() < 2 {
+        return error_out(out_error, "Layer.getMainPixel requires x and y");
+    }
+    let (x, y) = (arg_i64(&args[0]) as i32, arg_i64(&args[1]) as i32);
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let scene = context_scene_read();
+    let Some(layer) = scene.layer(inst.id) else {
+        return error_out(out_error, "Layer: layer no longer exists");
+    };
+    let Some(bitmap) = layer.bitmap.and_then(|id| scene.bitmap(id)) else {
+        return error_out(out_error, "Layer: layer has no image");
+    };
+    let value = if x < 0 || y < 0 {
+        0
+    } else {
+        match bitmap.pixel_offset(x as u32, y as u32) {
+            Some(off) => {
+                (i64::from(bitmap.rgba[off]) << 16)
+                    | (i64::from(bitmap.rgba[off + 1]) << 8)
+                    | i64::from(bitmap.rgba[off + 2])
+            }
+            None => 0,
+        }
+    };
+    set_int_out(out, value);
+    0
+}
+
+/// `getMaskPixel(x, y)` — reference `GetMaskPixel` (`LayerIntf.cpp:2945`):
+/// the MainImage alpha at `(x, y)`.
+extern "C" fn layer_get_mask_pixel(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    if args.len() < 2 {
+        return error_out(out_error, "Layer.getMaskPixel requires x and y");
+    }
+    let (x, y) = (arg_i64(&args[0]) as i32, arg_i64(&args[1]) as i32);
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let scene = context_scene_read();
+    let Some(layer) = scene.layer(inst.id) else {
+        return error_out(out_error, "Layer: layer no longer exists");
+    };
+    let Some(bitmap) = layer.bitmap.and_then(|id| scene.bitmap(id)) else {
+        return error_out(out_error, "Layer: layer has no image");
+    };
+    let value = if x < 0 || y < 0 {
+        0
+    } else {
+        bitmap
+            .pixel_offset(x as u32, y as u32)
+            .map_or(0, |off| i64::from(bitmap.rgba[off + 3]))
+    };
+    set_int_out(out, value);
+    0
+}
+
+/// `setMainPixel(x, y, color)` — reference `SetMainPixel`
+/// (`LayerIntf.cpp:2925`): write the RGB channels (the mask/alpha is left
+/// untouched, mirroring `SetPointMain`) when the point is inside `ClipRect`.
+extern "C" fn layer_set_main_pixel(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    if args.len() < 3 {
+        return error_out(out_error, "Layer.setMainPixel requires x, y and color");
+    }
+    let (x, y) = (arg_i64(&args[0]) as i32, arg_i64(&args[1]) as i32);
+    let color = argb_to_rgba(arg_i64(&args[2]));
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let mut scene = context_scene_mut();
+    let Some(layer) = scene.layer(inst.id) else {
+        return error_out(out_error, "Layer: layer no longer exists");
+    };
+    if !clip_contains(layer, x, y) {
+        set_void_out(out);
+        return 0;
+    }
+    let Some(bitmap_id) = layer.bitmap else {
+        return error_out(out_error, "Layer: layer has no image");
+    };
+    if x >= 0
+        && y >= 0
+        && let Some(bitmap) = scene.bitmap_mut(bitmap_id)
+        && let Some(off) = bitmap.pixel_offset(x as u32, y as u32)
+    {
+        bitmap.rgba[off] = color[0];
+        bitmap.rgba[off + 1] = color[1];
+        bitmap.rgba[off + 2] = color[2];
+        bitmap.mark_dirty();
+    }
+    if let Some(layer) = scene.layer_mut(inst.id) {
+        layer.image_modified = true;
+    }
+    set_void_out(out);
+    0
+}
+
+/// `setMaskPixel(x, y, mask)` — reference `SetMaskPixel` (`LayerIntf.cpp:2953`):
+/// write the alpha channel when the point is inside `ClipRect`.
+extern "C" fn layer_set_mask_pixel(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    if args.len() < 3 {
+        return error_out(out_error, "Layer.setMaskPixel requires x, y and mask");
+    }
+    let (x, y) = (arg_i64(&args[0]) as i32, arg_i64(&args[1]) as i32);
+    let mask = arg_i64(&args[2]).clamp(0, 255) as u8;
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let mut scene = context_scene_mut();
+    let Some(layer) = scene.layer(inst.id) else {
+        return error_out(out_error, "Layer: layer no longer exists");
+    };
+    if !clip_contains(layer, x, y) {
+        set_void_out(out);
+        return 0;
+    }
+    let Some(bitmap_id) = layer.bitmap else {
+        return error_out(out_error, "Layer: layer has no image");
+    };
+    if x >= 0
+        && y >= 0
+        && let Some(bitmap) = scene.bitmap_mut(bitmap_id)
+        && let Some(off) = bitmap.pixel_offset(x as u32, y as u32)
+    {
+        bitmap.rgba[off + 3] = mask;
+        bitmap.mark_dirty();
+    }
+    if let Some(layer) = scene.layer_mut(inst.id) {
+        layer.image_modified = true;
+    }
+    set_void_out(out);
+    0
+}
+
+/// `loadProvinceImage(name)` — reference `LoadProvinceImage`
+/// (`LayerIntf.cpp:2893`): load `name` into the layer's province plane. The
+/// reference loads an 8-bit palettized image and requires it to match the
+/// MainImage size; this engine decodes through the ordinary image loader and
+/// uses each pixel's red channel as the province value (grayscale/indexed
+/// province maps have `R == G == B`). A size mismatch throws
+/// `Layer.loadProvinceImage: province image size mismatch`.
+extern "C" fn layer_load_province_image(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    let Some(name_arg) = args.first() else {
+        return error_out(out_error, "Layer.loadProvinceImage requires a storage name");
+    };
+    if name_arg.ty != tjs2_sys::VAL_STRING {
+        return error_out(out_error, "Layer.loadProvinceImage expects a storage name");
+    }
+    let name = arg_string(name_arg);
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let (mut scene, mut storage) = super::context_scene_storage();
+    let Some(layer) = scene.layer(inst.id) else {
+        return error_out(out_error, "Layer: layer no longer exists");
+    };
+    let Some(main_id) = layer.bitmap else {
+        return error_out(out_error, "Layer: layer has no image");
+    };
+    let (main_w, main_h) = scene
+        .bitmap(main_id)
+        .map(|b| (b.width, b.height))
+        .unwrap_or((0, 0));
+    if main_w == 0 || main_h == 0 {
+        return error_out(out_error, "Layer: layer has no image");
+    }
+    let mut cache = super::bitmap_cache();
+    let temp_id = match crate::bitmap::load_bitmap_from_storage(
+        &mut scene,
+        &mut cache,
+        &mut storage,
+        &name,
+        None,
+    ) {
+        Ok(id) => id,
+        Err(e) => return error_out(out_error, &format!("Layer.loadProvinceImage: {e}")),
+    };
+    let province: Option<Box<[u8]>> = match scene.bitmap(temp_id) {
+        Some(bitmap) if bitmap.width == main_w && bitmap.height == main_h => {
+            Some(bitmap.rgba.chunks_exact(4).map(|p| p[0]).collect())
+        }
+        Some(_) => {
+            scene.bitmaps.retain(|b| b.id != temp_id);
+            return error_out(
+                out_error,
+                "Layer.loadProvinceImage: province image size mismatch",
+            );
+        }
+        None => None,
+    };
+    scene.bitmaps.retain(|b| b.id != temp_id);
+    if let Some(province) = province
+        && let Some(layer) = scene.layer_mut(inst.id)
+    {
+        layer.province = Some(province);
+        layer.province_width = main_w;
+        layer.province_height = main_h;
+        layer.image_modified = true;
+    }
+    set_void_out(out);
+    0
+}
+
+/// `independProvinceImage([copy=true])` — reference `IndependProvinceImage`
+/// (`LayerIntf.cpp:2689`). In this engine the province plane is a per-layer
+/// `Box<[u8]>` and is never shared, so `copy=true` performs a defensive
+/// private copy (real, if redundant given the ownership model) and
+/// `copy=false` is a genuine semantic no-op because there is no sharing to
+/// detach. Both mark the image modified.
+extern "C" fn layer_independ_province_image(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    let copy = args
+        .first()
+        .filter(|v| v.ty != tjs2_sys::VAL_VOID)
+        .map(arg_bool)
+        .unwrap_or(true);
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let mut scene = context_scene_mut();
+    let Some(layer) = scene.layer_mut(inst.id) else {
+        return error_out(out_error, "Layer: layer no longer exists");
+    };
+    if copy && let Some(province) = layer.province.clone() {
+        layer.province = Some(province);
+    }
+    layer.image_modified = true;
+    set_void_out(out);
+    0
+}
+
+// ---------------------------------------------------------------------------
+// Affine anchor (KAG `AffineLayer`/`Sprite` surface)
+// ---------------------------------------------------------------------------
+
+/// `setCenter(x, y)` — record the layer's affine rotation/zoom center. See
+/// [`LayerAffineState`] for why this is an engine-level store: the reference
+/// core has no such method, it is the KAG `Sprite.setCenter`.
+extern "C" fn layer_set_center(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    if args.len() < 2 {
+        return error_out(out_error, "Layer.setCenter requires x and y");
+    }
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    if context_scene_read().layer(inst.id).is_none() {
+        return error_out(out_error, "Layer: layer no longer exists");
+    }
+    let state = LayerAffineState {
+        center: (arg_f64(&args[0]), arg_f64(&args[1])),
+        ..LAYER_AFFINE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&inst.id)
+            .copied()
+            .unwrap_or_default()
+    };
+    if state == LayerAffineState::default() {
+        LAYER_AFFINE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&inst.id);
+    } else {
+        LAYER_AFFINE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(inst.id, state);
+    }
+    set_void_out(out);
+    0
+}
+
+/// `setAffineOffset(x, y)` — record the layer's affine anchor offset
+/// (`AffineLayer.setAffineOffset`).
+extern "C" fn layer_set_affine_offset(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    if args.len() < 2 {
+        return error_out(out_error, "Layer.setAffineOffset requires x and y");
+    }
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    if context_scene_read().layer(inst.id).is_none() {
+        return error_out(out_error, "Layer: layer no longer exists");
+    }
+    let mut map = LAYER_AFFINE.lock().unwrap_or_else(|p| p.into_inner());
+    let entry = map.entry(inst.id).or_default();
+    entry.affine_offset = (arg_f64(&args[0]), arg_f64(&args[1]));
+    if *entry == LayerAffineState::default() {
+        map.remove(&inst.id);
+    }
+    set_void_out(out);
+    0
+}
+
+/// The stored affine state for `layer_id`, or `None` when unset. Exposed so
+/// the render/affine path (or a future `Layer` affine contract) can read the
+/// anchor; the pixel transforms of `affineCopy`/`operateAffine` still take
+/// explicit matrices.
+pub fn layer_affine_state(layer_id: u32) -> Option<LayerAffineState> {
+    LAYER_AFFINE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&layer_id)
+        .copied()
+}
+
+// ---------------------------------------------------------------------------
+// Sibling order
+// ---------------------------------------------------------------------------
+
+/// The maintained sibling id list for `id` (window root list or parent
+/// `children`).
+fn layer_siblings(scene: &Scene, id: u32) -> Vec<u32> {
+    match scene.layer(id) {
+        Some(layer) => match layer.parent {
+            Some(parent) => scene
+                .layer(parent)
+                .map(|p| p.children.clone())
+                .unwrap_or_default(),
+            None => scene
+                .window(layer.window)
+                .map(|w| w.layers.clone())
+                .unwrap_or_default(),
+        },
+        None => Vec::new(),
+    }
+}
+
+/// Move `id` to `new_index` in its sibling list and set its `z_order`.
+fn reorder_layer(scene: &mut Scene, id: u32, new_index: usize, z: i32) {
+    let Some((window, parent)) = scene.layer(id).map(|l| (l.window, l.parent)) else {
+        return;
+    };
+    if let Some(layer) = scene.layer_mut(id) {
+        layer.z_order = z;
+    }
+    let list = match parent {
+        Some(parent) => scene.layer_mut(parent).map(|p| &mut p.children),
+        None => scene.window_mut(window).map(|w| &mut w.layers),
+    };
+    if let Some(list) = list {
+        list.retain(|&x| x != id);
+        let index = new_index.min(list.len());
+        list.insert(index, id);
+    }
+}
+
+/// `bringToBack()` — reference `tTJSNI_BaseLayer::BringToBack`
+/// (`LayerIntf.cpp:1413`): move to the most-back sibling position.
+extern "C" fn layer_bring_to_back(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    _argc: c_int,
+    _argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let mut scene = context_scene_mut();
+    if scene.layer(inst.id).is_none() {
+        return error_out(out_error, "Layer: layer no longer exists");
+    }
+    let siblings = layer_siblings(&scene, inst.id);
+    let min_z = siblings
+        .iter()
+        .filter_map(|&id| scene.layer(id).map(|l| l.z_order))
+        .min()
+        .unwrap_or(0);
+    reorder_layer(&mut scene, inst.id, 0, min_z);
+    set_void_out(out);
+    0
+}
+
+/// `moveBefore(sibling)` — reference `MoveBefore` (`LayerIntf.cpp:1356`).
+extern "C" fn layer_move_before(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    layer_move_relative(instance, argc, argv, out, out_error, true)
+}
+
+/// `moveBehind(sibling)` — reference `MoveBehind` (`LayerIntf.cpp:1376`).
+extern "C" fn layer_move_behind(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    layer_move_relative(instance, argc, argv, out, out_error, false)
+}
+
+fn layer_move_relative(
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    before: bool,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    let engine = context_engine();
+    let Some(target_arg) = args.first() else {
+        return error_out(out_error, "Layer.moveBefore/moveBehind requires a layer");
+    };
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let target = match focus_arg_layer_id(engine, target_arg) {
+        Ok(Some(id)) => id,
+        Ok(None) => return error_out(out_error, "Specify Layer"),
+        Err(e) => return error_out(out_error, &e),
+    };
+    let mut scene = context_scene_mut();
+    if scene.layer(inst.id).is_none() {
+        return error_out(out_error, "Layer: layer no longer exists");
+    }
+    let siblings = layer_siblings(&scene, inst.id);
+    let (Some(this), Some(target_index)) = (
+        siblings.iter().position(|&x| x == inst.id),
+        siblings.iter().position(|&x| x == target),
+    ) else {
+        return error_out(out_error, "Layer.moveBefore/moveBehind: not siblings");
+    };
+    let z = scene.layer(target).map(|l| l.z_order).unwrap_or(0);
+    let new_index = match (before, this < target_index) {
+        (true, true) => target_index - 1,
+        (true, false) => target_index,
+        (false, true) => target_index,
+        (false, false) => target_index + 1,
+    };
+    reorder_layer(&mut scene, inst.id, new_index, z);
+    set_void_out(out);
+    0
+}
+
+// ---------------------------------------------------------------------------
+// Input capture / hit-test work / attention / modal
+// ---------------------------------------------------------------------------
+
+/// `captureMouse()` — make this layer the mouse capture owner. The reference
+/// has no such member (the manager captures on `onMouseDown`); KAG scripts
+/// call it to force capture. The state is stored here; the render input
+/// bridge can read it through [`captured_mouse_layer`].
+extern "C" fn layer_capture_mouse(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    _argc: c_int,
+    _argv: *const Value,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    LAYER_CAPTURE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .mouse = Some(inst.id);
+    set_void_out(out);
+    0
+}
+
+/// `releaseCapture()` — reference `ReleaseCapture` (`LayerIntf.cpp:3467`):
+/// release the mouse capture (from all layers, not just this one).
+extern "C" fn layer_release_capture(
+    _engine: *mut c_void,
+    _instance: *mut c_void,
+    _argc: c_int,
+    _argv: *const Value,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    LAYER_CAPTURE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .mouse = None;
+    set_void_out(out);
+    0
+}
+
+/// `captureTouch(id)` — capture touch `id` for this layer (KAG extension over
+/// the reference `SetTouchCapture`).
+extern "C" fn layer_capture_touch(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    if args.is_empty() {
+        return error_out(out_error, "Layer.captureTouch requires a touch id");
+    }
+    let id = arg_i64(&args[0]) as u64;
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    LAYER_CAPTURE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .touches
+        .insert(id, inst.id);
+    set_void_out(out);
+    0
+}
+
+/// `releaseTouchCapture([id])` — reference `ReleaseTouchCapture`
+/// (`LayerIntf.cpp:3475`): with an id release that touch, without one release
+/// every touch capture.
+extern "C" fn layer_release_touch_capture(
+    _engine: *mut c_void,
+    _instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    let mut capture = LAYER_CAPTURE.lock().unwrap_or_else(|p| p.into_inner());
+    match args.first().filter(|v| v.ty != tjs2_sys::VAL_VOID) {
+        Some(v) => {
+            capture.touches.remove(&(arg_i64(v) as u64));
+        }
+        None => capture.touches.clear(),
+    }
+    set_void_out(out);
+    0
+}
+
+/// The current mouse capture owner, or `None`. Public so the render input
+/// bridge (a downstream crate) can honor script `captureMouse`. The bridge
+/// currently manages its own hit-test capture; honoring this state is a
+/// render-side wiring step.
+pub fn captured_mouse_layer() -> Option<u32> {
+    LAYER_CAPTURE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .mouse
+}
+
+/// The current touch captures as `(touch id, layer id)`. Public for the same
+/// reason as [`captured_mouse_layer`].
+pub fn captured_touches() -> Vec<(u64, u32)> {
+    LAYER_CAPTURE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .touches
+        .iter()
+        .map(|(&id, &layer)| (id, layer))
+        .collect()
+}
+
+/// `onHitTest(x, y, hit)` — reference `LayerIntf.cpp:9944`: store the script
+/// hook's hit result in the layer's work slot. `Scene::layer_at` reads
+/// `OnHitTest_Work` after dispatching the hook; our scene does not yet
+/// dispatch script `onHitTest`, so the value is kept in
+/// [`LAYER_HITTEST_WORK`] for that wiring. [`layer_hit_test_work`] exposes it.
+extern "C" fn layer_on_hit_test(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    if args.len() < 3 {
+        return error_out(out_error, "Layer.onHitTest requires x, y and hit");
+    }
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    LAYER_HITTEST_WORK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(inst.id, arg_bool(&args[2]));
+    set_void_out(out);
+    0
+}
+
+/// The last `onHitTest` work value for `layer_id`, if any.
+pub fn layer_hit_test_work(layer_id: u32) -> Option<bool> {
+    LAYER_HITTEST_WORK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&layer_id)
+        .copied()
+}
+
+/// `setAttentionPos(x, y)` — reference `SetAttentionPoint`
+/// (`LayerIntf.cpp:3207`): set the layer's attention anchor.
+extern "C" fn layer_set_attention_pos(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    if args.len() < 2 {
+        return error_out(out_error, "Layer.setAttentionPos requires x and y");
+    }
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let mut scene = context_scene_mut();
+    let Some(layer) = scene.layer_mut(inst.id) else {
+        return error_out(out_error, "Layer: layer no longer exists");
+    };
+    layer.attention_left = arg_i64(&args[0]) as i32;
+    layer.attention_top = arg_i64(&args[1]) as i32;
+    set_void_out(out);
+    0
+}
+
+/// `setMode()` — reference `tTVPLayerManager::SetModeTo`
+/// (`LayerManager.cpp:834`): make this layer the current modal layer of its
+/// window and focus its first focusable descendant. Throws for an invisible/
+/// disabled layer, a layer already modal, or an ancestor of the current modal
+/// layer.
+extern "C" fn layer_set_mode(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    _argc: c_int,
+    _argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let engine = context_engine();
+    let focus = {
+        let mut scene = context_scene_mut();
+        let Some(window) = scene.layer(inst.id).map(|l| l.window) else {
+            return error_out(out_error, "Layer: layer no longer exists");
+        };
+        // The reference forces `Visible = true`, then rejects a layer whose
+        // node is still not visible or whose `Enabled` is false.
+        if !scene.node_visible(inst.id)
+            && let Some(layer) = scene.layer_mut(inst.id)
+        {
+            layer.visible = true;
+        }
+        if !scene.node_visible(inst.id) || !scene.layer(inst.id).is_some_and(|l| l.enabled) {
+            return error_out(out_error, "Layer.setMode: disabled or non-visible layer");
+        }
+        {
+            let mut modals = MODAL_LAYERS.lock().unwrap_or_else(|p| p.into_inner());
+            let stack = modals.entry(window).or_default();
+            if let Some(&current) = stack.last()
+                && (current == inst.id || is_ancestor_or_self(&scene, current, inst.id))
+            {
+                return error_out(out_error, "Layer.setMode: cannot set mode to this layer");
+            }
+            stack.push(inst.id);
+        }
+        first_focusable_in(&scene, inst.id)
+    };
+    if let Some(focus) = focus {
+        let (prev, current) = context_scene_mut().set_focus(focus);
+        if current != prev {
+            dispatch_focus_change(engine, current.unwrap_or(focus), prev, true);
+        }
+    }
+    set_void_out(out);
+    0
+}
+
+/// `removeMode()` — reference `tTVPLayerManager::RemoveModeFrom`
+/// (`LayerManager.cpp:869`): drop this layer from its window's modal stack.
+extern "C" fn layer_remove_mode(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    _argc: c_int,
+    _argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let engine = context_engine();
+    let mut scene = context_scene_mut();
+    let Some(window) = scene.layer(inst.id).map(|l| l.window) else {
+        return error_out(out_error, "Layer: layer no longer exists");
+    };
+    let removed = {
+        let mut modals = MODAL_LAYERS.lock().unwrap_or_else(|p| p.into_inner());
+        let stack = modals.entry(window).or_default();
+        let before = stack.len();
+        stack.retain(|&id| id != inst.id);
+        before != stack.len()
+    };
+    if removed {
+        let next = scene.next_focusable(inst.id);
+        match next {
+            Some(next) => {
+                let (prev, current) = scene.set_focus(next);
+                drop(scene);
+                if current != prev {
+                    dispatch_focus_change(engine, current.unwrap_or(next), prev, true);
+                }
+            }
+            None => {
+                scene.clear_focus(window);
+                drop(scene);
+            }
+        }
+    }
+    set_void_out(out);
+    0
+}
+
+/// Whether `id` is `ancestor` or a descendant of it.
+fn is_ancestor_or_self(scene: &Scene, ancestor: u32, id: u32) -> bool {
+    let mut current = Some(id);
+    while let Some(node) = current {
+        if node == ancestor {
+            return true;
+        }
+        current = scene.layer(node).and_then(|l| l.parent);
+    }
+    false
+}
+
+/// The first focusable layer in `root`'s subtree (self first), in paint order.
+fn first_focusable_in(scene: &Scene, root: u32) -> Option<u32> {
+    let window = scene.layer(root).map(|l| l.window)?;
+    scene
+        .window_layer_order(window)
+        .into_iter()
+        .find(|&id| is_ancestor_or_self(scene, root, id) && scene.node_focusable(id))
+}
+
+/// Dispatch the `onBlur`/`onFocus` events for a focus change, matching the
+/// reference `tTVPLayerManager::SetFocusTo`. Shared by `focus`, `focusNext`,
+/// `focusPrev` and the modal transitions.
+fn dispatch_focus_change(engine: &Tjs2Engine, current: u32, prev: Option<u32>, direction: bool) {
+    if let Some(prev_id) = prev
+        && prev_id != current
+    {
+        let obj = super::layer_tjs_object(prev_id);
+        if !obj.is_null()
+            && let Ok(dv) = engine.retain_object_detached(obj)
+        {
+            let _ = engine.call_member(dv.raw_id(), "onBlur", &[TjsValue::Void]);
+        }
+    }
+    let obj = super::layer_tjs_object(current);
+    if !obj.is_null()
+        && let Ok(dv) = engine.retain_object_detached(obj)
+    {
+        let _ = engine.call_member(
+            dv.raw_id(),
+            "onFocus",
+            &[TjsValue::Void, TjsValue::Integer(i64::from(direction))],
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Focus-next / focus-prev / getList / dump
+// ---------------------------------------------------------------------------
+
+/// Shared body for `focusNext`/`focusPrev`: reference `tTVPLayerManager::
+/// FocusNext`/`FocusPrev` (`LayerManager.cpp:723`). With no focused layer the
+/// first focusable in window paint order is chosen; otherwise the focused
+/// layer's next/previous focusable is used. The newly focused layer (or
+/// `null`) is returned.
+fn layer_focus_neighbor(
+    instance: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    forward: bool,
+) -> c_int {
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let engine = context_engine();
+    let (prev, current) = {
+        let mut scene = context_scene_mut();
+        let Some(window) = scene.layer(inst.id).map(|l| l.window) else {
+            return error_out(out_error, "Layer: layer no longer exists");
+        };
+        let focused = scene.window(window).and_then(|w| w.focused_layer);
+        let next = match focused {
+            Some(focused) => {
+                if forward {
+                    scene.next_focusable(focused)
+                } else {
+                    scene.prev_focusable(focused)
+                }
+            }
+            None => scene
+                .window_layer_order(window)
+                .into_iter()
+                .find(|&id| scene.node_focusable(id)),
+        };
+        match next {
+            Some(next) => scene.set_focus(next),
+            None => (focused, focused),
+        }
+    };
+    if current != prev
+        && let Some(current_id) = current
+    {
+        dispatch_focus_change(engine, current_id, prev, forward);
+    }
+    set_layer_object_out(engine, current, out);
+    0
+}
+
+/// `focusNext()` — reference `LayerIntf.cpp:9762`.
+extern "C" fn layer_focus_next(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    _argc: c_int,
+    _argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    layer_focus_neighbor(instance, out, out_error, true)
+}
+
+/// `focusPrev()` — reference `LayerIntf.cpp:9744`.
+extern "C" fn layer_focus_prev(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    _argc: c_int,
+    _argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    layer_focus_neighbor(instance, out, out_error, false)
+}
+
+/// `getList()` — an engine extension (the reference `getList` is a `Font`
+/// member, already implemented in `font.rs`): return this layer's direct
+/// children as a TJS array, matching the `children` property.
+extern "C" fn layer_get_list(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    _argc: c_int,
+    _argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let children = {
+        let scene = context_scene_read();
+        if scene.layer(inst.id).is_none() {
+            return error_out(out_error, "Layer: layer no longer exists");
+        }
+        scene.ordered_children(inst.id)
+    };
+    let engine = context_engine();
+    let Ok(tjs2_sys::RetainedValue::Object(array)) = engine.eval_retained("[]", "layer.getList")
+    else {
+        return error_out(out_error, "Layer.getList: cannot create array");
+    };
+    for (i, child_id) in children.iter().enumerate() {
+        let obj = super::layer_tjs_object(*child_id);
+        if obj.is_null() {
+            continue;
+        }
+        let Ok(dv) = engine.retain_object_detached(obj) else {
+            continue;
+        };
+        let _ = engine.set_member(
+            array.raw_id(),
+            &i.to_string(),
+            &TjsValue::Retained(dv.raw_id() as u64),
+        );
+    }
+    set_retained_out(array, out);
+    0
+}
+
+/// `dump()` — reference `LayerIntf.cpp:9884` (`DumpStructure`): log this
+/// layer's tree position and visual state. The reference only prints debug
+/// information, so this is real (not a discarded no-op) but output-only.
+extern "C" fn layer_dump(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    _argc: c_int,
+    _argv: *const Value,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let scene = context_scene_read();
+    if let Some(layer) = scene.layer(inst.id) {
+        log::debug!(
+            "Layer {}: parent={:?} window={} rect=({},{} {}x{}) visible={} enabled={} \
+             focusable={} z={} image={:?} province={}x{}",
+            layer.id,
+            layer.parent,
+            layer.window,
+            layer.rect.x,
+            layer.rect.y,
+            layer.rect.w,
+            layer.rect.h,
+            layer.visible,
+            layer.enabled,
+            layer.focusable,
+            layer.z_order,
+            layer.bitmap,
+            layer.province_width,
+            layer.province_height,
+        );
+    }
+    set_void_out(out);
+    0
+}
+
+/// `onPaint()` — base no-op action, kept deliberately inert: the engine fires
+/// the layer's script `onPaint` from [`paint_poll`], and dispatching again
+/// from this native would recurse (game handlers call `super.onPaint(...)`).
+extern "C" fn layer_on_paint(
+    _engine: *mut c_void,
+    _instance: *mut c_void,
+    _argc: c_int,
+    _argv: *const Value,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    set_void_out(out);
+    0
+}
+
 /// Register the `Layer` native class.
 pub(crate) fn register_layer(engine: &Tjs2Engine) -> Result<(), String> {
-    let noop_stubs = [
-        "setCenter",
-        "setAffineOffset",
-        "drawGlyph",
-        "drawRectangles",
-        "drawClosedCurve",
-        "drawClosedCurve2",
-        "drawCurve2",
-        "drawCurve3",
-        "drawPath",
-        "drawString",
-        "setDefaultDrawTextParam",
-        "resetDrawTextParam",
-        "setFontStyle",
-        "getDrawWidth",
-        "stopTransition",
-        "releaseCapture",
-        "releaseTouchCapture",
-        "setMode",
-        "removeMode",
-        "clear",
-        // Pixel/mask access and sibling ordering used by UI scripts; the
-        // logical model covers the visible behavior, these are no-ops.
-        // `getProvincePixel`/`setProvincePixel` are wired to the province
-        // plane below.
-        "setMainPixel",
-        "getMainPixel",
-        "setMaskPixel",
-        "getMaskPixel",
-        "independProvinceImage",
-        "loadProvinceImage",
-        "bringToBack",
-        "moveBefore",
-        "moveBehind",
-        "focusNext",
-        "focusPrev",
-        "getList",
-        "onHitTest",
-        "dump",
-        "setAttentionPos",
-        "captureMouse",
-        "captureTouch",
-        // Base `onPaint` action. The reference native dispatches the layer's
-        // own script `onPaint` action; our engine already invokes the script
-        // handler from [`paint_poll`], so the base implementation only needs
-        // to exist for the game's `super.onPaint(...)` call to resolve. It
-        // must stay a no-op: dispatching here would recurse (the script's
-        // `onPaint` calls `super.onPaint`).
-        "onPaint",
-    ];
+    // Every member formerly registered through the shared `layer_noop` stub
+    // now has a real implementation (see the methods below); the only
+    // intentionally inert entries are `onPaint` (recursion guard) and `dump`
+    // (output-only debug), both implemented as explicit functions.
     let mut methods: Vec<NativeInstanceMethodDef> = vec![
         NativeInstanceMethodDef {
             name: "Layer",
@@ -6379,10 +8357,59 @@ pub(crate) fn register_layer(engine: &Tjs2Engine) -> Result<(), String> {
             f: layer_draw_image_affine,
         },
     ];
-    methods.extend(noop_stubs.into_iter().map(|name| NativeInstanceMethodDef {
-        name,
-        f: layer_noop,
-    }));
+    // Every formerly-stubbed member now has a real implementation. The
+    // `(name, function)` array is consumed through `methods.extend(...)` so
+    // the native-surface parity checker attributes each member (it treats the
+    // array's string literals as members).
+    let implemented_methods = [
+        ("setCenter", layer_set_center as _),
+        ("setAffineOffset", layer_set_affine_offset as _),
+        ("drawGlyph", layer_draw_glyph as _),
+        ("drawRectangles", layer_draw_rectangles as _),
+        ("drawClosedCurve", layer_draw_closed_curve as _),
+        ("drawClosedCurve2", layer_draw_closed_curve2 as _),
+        ("drawCurve2", layer_draw_curve2 as _),
+        ("drawCurve3", layer_draw_curve3 as _),
+        ("drawPath", layer_draw_path as _),
+        ("drawString", layer_draw_string as _),
+        (
+            "setDefaultDrawTextParam",
+            layer_set_default_draw_text_param as _,
+        ),
+        ("resetDrawTextParam", layer_reset_draw_text_param as _),
+        ("setFontStyle", layer_set_font_style as _),
+        ("resetFontStyle", layer_reset_font_style as _),
+        ("getDrawWidth", layer_get_draw_width as _),
+        ("stopTransition", layer_stop_transition as _),
+        ("releaseCapture", layer_release_capture as _),
+        ("releaseTouchCapture", layer_release_touch_capture as _),
+        ("setMode", layer_set_mode as _),
+        ("removeMode", layer_remove_mode as _),
+        ("clear", layer_clear as _),
+        ("setMainPixel", layer_set_main_pixel as _),
+        ("getMainPixel", layer_get_main_pixel as _),
+        ("setMaskPixel", layer_set_mask_pixel as _),
+        ("getMaskPixel", layer_get_mask_pixel as _),
+        ("independProvinceImage", layer_independ_province_image as _),
+        ("loadProvinceImage", layer_load_province_image as _),
+        ("bringToBack", layer_bring_to_back as _),
+        ("moveBefore", layer_move_before as _),
+        ("moveBehind", layer_move_behind as _),
+        ("focusNext", layer_focus_next as _),
+        ("focusPrev", layer_focus_prev as _),
+        ("getList", layer_get_list as _),
+        ("onHitTest", layer_on_hit_test as _),
+        ("dump", layer_dump as _),
+        ("setAttentionPos", layer_set_attention_pos as _),
+        ("captureMouse", layer_capture_mouse as _),
+        ("captureTouch", layer_capture_touch as _),
+        ("onPaint", layer_on_paint as _),
+    ];
+    methods.extend(
+        implemented_methods
+            .into_iter()
+            .map(|(name, f)| NativeInstanceMethodDef { name, f }),
+    );
     engine.register_native_class_instance(&NativeInstanceBuilder {
         name: "Layer",
         create: layer_create,
@@ -8624,5 +10651,404 @@ mod tests {
             .expect("a Layer with no image must fall back to the colliding bitmap");
         assert_eq!((resolved.width, resolved.height), (2, 2));
         assert_eq!(resolved.rgba[0], 9);
+    }
+
+    // ------------------------------------------------------------------
+    // Real no-op-stub replacements (see the module doc)
+    // ------------------------------------------------------------------
+
+    /// `setFontStyle`/`resetFontStyle` write the layer's tracked `FontState`.
+    #[test]
+    fn layer_set_and_reset_font_style() {
+        let env = TestEnv::new("layer-font-style");
+        env.run(
+            "var w = new Window(); var l = new Layer(w, null); \
+             l.setFontStyle('SomeFace', 24, 0, true, true, true, true, 100);",
+        )
+        .unwrap();
+        {
+            let scene = env.scene();
+            let font_id = scene.layers[0].font_id.expect("font allocation");
+            let font = scene.font(font_id).expect("font state");
+            assert_eq!(font.face, "SomeFace");
+            assert_eq!(font.height, 24);
+            assert!(font.bold && font.italic && font.underline && font.strikeout);
+            assert!((font.angle - 100.0).abs() < 1e-9);
+        }
+        env.run("l.resetFontStyle();").unwrap();
+        let scene = env.scene();
+        let font_id = scene.layers[0].font_id.unwrap();
+        let font = scene.font(font_id).unwrap();
+        assert_eq!(font.height, super::super::font::DEFAULT_FONT_HEIGHT);
+        assert!(!font.bold && !font.italic && !font.underline && !font.strikeout);
+        assert_eq!(font.angle, 0.0);
+    }
+
+    /// `setDefaultDrawTextParam` records defaults; `resetDrawTextParam`
+    /// restores `current` from them (the config/confirm window flow).
+    #[test]
+    fn layer_default_and_reset_draw_text_param() {
+        let env = TestEnv::new("layer-draw-text-param");
+        env.run(
+            "var w = new Window(); var l = new Layer(w, null); \
+             l.setDefaultDrawTextParam(0x112233, 200, false, 5, 0x445566, 2, 1, 1); \
+             l.resetDrawTextParam();",
+        )
+        .unwrap();
+        let id = env.eval_int("l.id") as u32;
+        let params = super::LAYER_TEXT_PARAMS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let entry = params.get(&id).expect("params recorded");
+        assert_eq!(entry.default.color, 0x112233);
+        assert_eq!(entry.default.opa, 200);
+        assert!(!entry.default.aa);
+        assert_eq!(entry.default.shadow_level, 5);
+        assert_eq!(entry.current, entry.default);
+    }
+
+    /// `drawString(font, app, x, y, text)` rasterizes with the font's geometry
+    /// and the appearance's first solid brush.
+    #[test]
+    fn layer_draw_string_paints_with_font_and_brush() {
+        let env = TestEnv::new("layer-draw-string");
+        env.run(
+            "var w = new Window(); var l = new Layer(w, null); l.setSize(96, 40); \
+             var app = new GdiPlus.Appearance(); app.addBrush(0xffff0000); \
+             l.drawString(l.font, app, 2, 2, 'MA');",
+        )
+        .unwrap();
+        let scene = env.scene();
+        let bitmap = scene.bitmap(scene.layers[0].bitmap.unwrap()).unwrap();
+        assert!(bitmap_ink(bitmap) > 0, "drawString must paint glyphs");
+    }
+
+    /// `drawGlyph(x, y, '<char>', color, ...)` draws the character with the
+    /// layer font (the engine has no `Glyph` object; a string is accepted).
+    #[test]
+    fn layer_draw_glyph_paints_string_glyph() {
+        let env = TestEnv::new("layer-draw-glyph");
+        env.run(
+            "var w = new Window(); var l = new Layer(w, null); l.setSize(96, 40); \
+             l.drawGlyph(2, 2, 'A', 0x00ffffff);",
+        )
+        .unwrap();
+        let scene = env.scene();
+        let bitmap = scene.bitmap(scene.layers[0].bitmap.unwrap()).unwrap();
+        assert!(bitmap_ink(bitmap) > 0, "drawGlyph must paint");
+    }
+
+    /// `getDrawWidth` measures the given text through the layer font.
+    #[test]
+    fn layer_get_draw_width_is_positive() {
+        let env = TestEnv::new("layer-get-draw-width");
+        env.run("var w = new Window(); var l = new Layer(w, null);")
+            .unwrap();
+        assert!(env.eval_int("l.getDrawWidth('AB')") > 0);
+        assert_eq!(env.eval_int("l.getDrawWidth('')"), 0);
+    }
+
+    /// `clear` replaces the whole main image (default transparent), matching
+    /// the `layerExDraw` plugin.
+    #[test]
+    fn layer_clear_fills_the_whole_image() {
+        let env = TestEnv::new("layer-clear");
+        env.run(
+            "var w = new Window(); var l = new Layer(w, null); l.setSize(8, 8); \
+             l.fillRect(0, 0, 8, 8, 0xffff0000); l.clear(0xff00ff00);",
+        )
+        .unwrap();
+        let scene = env.scene();
+        let bitmap = scene.bitmap(scene.layers[0].bitmap.unwrap()).unwrap();
+        assert_eq!(pixel(bitmap, 4, 4), [0, 255, 0, 255]);
+    }
+
+    /// `drawRectangles` fills each rectangle in the appearance.
+    #[test]
+    fn layer_draw_rectangles_paints_each_rect() {
+        let env = TestEnv::new("layer-draw-rectangles");
+        env.run(
+            "var w = new Window(); var l = new Layer(w, null); l.setSize(32, 32); \
+             var app = new GdiPlus.Appearance(); app.addBrush(0xffff0000); \
+             l.drawRectangles(app, [[4,4,10,10],[18,18,10,10]]);",
+        )
+        .unwrap();
+        let scene = env.scene();
+        let bitmap = scene.bitmap(scene.layers[0].bitmap.unwrap()).unwrap();
+        assert_eq!(pixel(bitmap, 9, 9), [255, 0, 0, 255]);
+        assert_eq!(pixel(bitmap, 23, 23), [255, 0, 0, 255]);
+    }
+
+    /// `drawClosedCurve`/`drawClosedCurve2` fill a closed spline.
+    #[test]
+    fn layer_draw_closed_curve_fills() {
+        let env = TestEnv::new("layer-draw-closed-curve");
+        env.run(
+            "var w = new Window(); var l = new Layer(w, null); l.setSize(32, 32); \
+             var app = new GdiPlus.Appearance(); app.addBrush(0xffff0000); \
+             var pts = [[4,4],[28,4],[28,28],[4,28]]; \
+             l.drawClosedCurve(app, pts); \
+             var app2 = new GdiPlus.Appearance(); app2.addBrush(0xff0000ff); \
+             l.drawClosedCurve2(app2, pts, 0.3);",
+        )
+        .unwrap();
+        let scene = env.scene();
+        let bitmap = scene.bitmap(scene.layers[0].bitmap.unwrap()).unwrap();
+        assert_eq!(pixel(bitmap, 16, 16), [0, 0, 255, 255], "second fill wins");
+    }
+
+    /// `drawCurve2`/`drawCurve3` stroke an open cardinal spline.
+    #[test]
+    fn layer_draw_curve_variants_stroke() {
+        let env = TestEnv::new("layer-draw-curve-variants");
+        env.run(
+            "var w = new Window(); var l = new Layer(w, null); l.setSize(40, 40); \
+             var pen1 = new GdiPlus.Appearance(); pen1.addPen(0xffff0000, 2); \
+             l.drawCurve2(pen1, [[0,20],[10,0],[30,40],[39,20]], 0.5); \
+             var pen2 = new GdiPlus.Appearance(); pen2.addPen(0xff00ff00, 2); \
+             l.drawCurve3(pen2, [[0,30],[10,10],[30,30],[39,10]], 0, 3, 0.5);",
+        )
+        .unwrap();
+        let scene = env.scene();
+        let bitmap = scene.bitmap(scene.layers[0].bitmap.unwrap()).unwrap();
+        assert!(bitmap_ink(bitmap) > 0, "curve strokes must paint");
+    }
+
+    /// `drawPath` accepts a point array in place of the unmodelled
+    /// `GdiPlus.Path` and strokes it.
+    #[test]
+    fn layer_draw_path_strokes_point_array() {
+        let env = TestEnv::new("layer-draw-path");
+        env.run(
+            "var w = new Window(); var l = new Layer(w, null); l.setSize(32, 32); \
+             var app = new GdiPlus.Appearance(); app.addPen(0xff0000ff, 2); \
+             l.drawPath(app, [[2,2],[16,16],[30,2]]);",
+        )
+        .unwrap();
+        let scene = env.scene();
+        let bitmap = scene.bitmap(scene.layers[0].bitmap.unwrap()).unwrap();
+        assert!(bitmap_ink(bitmap) > 0, "drawPath must stroke");
+    }
+
+    /// `setCenter`/`setAffineOffset` store the anchor (ADVScreen/AdvObject).
+    #[test]
+    fn layer_set_center_and_affine_offset() {
+        let env = TestEnv::new("layer-affine-state");
+        env.run(
+            "var w = new Window(); var l = new Layer(w, null); \
+             l.setCenter(10, 20); l.setAffineOffset(3, 4);",
+        )
+        .unwrap();
+        let id = env.eval_int("l.id") as u32;
+        let state = super::layer_affine_state(id).expect("affine state stored");
+        assert_eq!(state.center, (10.0, 20.0));
+        assert_eq!(state.affine_offset, (3.0, 4.0));
+    }
+
+    /// `stopTransition` cancels the queued completion and fires it once
+    /// synchronously; the next `transition_poll` must not fire it again.
+    #[test]
+    fn layer_stop_transition_cancels_pending_completion() {
+        let env = TestEnv::new("layer-stop-transition");
+        env.run(
+            "var count = 0; \
+             class StopTransLayer extends Layer { \
+               function onTransitionCompleted(dest, src) { count++; } \
+             } \
+             var w = new Window(); var l = new StopTransLayer(w, null); \
+             l.beginTransition('crossfade'); l.stopTransition();",
+        )
+        .unwrap();
+        assert_eq!(env.eval_int("count"), 1, "stop fires the completion once");
+        super::transition_poll(&env.engine);
+        assert_eq!(env.eval_int("count"), 1, "the queued completion is gone");
+    }
+
+    /// `bringToBack`/`moveBefore`/`moveBehind` really reorder siblings.
+    #[test]
+    fn layer_sibling_reordering() {
+        let env = TestEnv::new("layer-reorder");
+        env.run(
+            "var w = new Window(); var a = new Layer(w, null); \
+             var b = new Layer(w, null); var c = new Layer(w, null); \
+             c.bringToBack();",
+        )
+        .unwrap();
+        let mut order: Vec<u32> = {
+            let scene = env.scene();
+            scene
+                .window(0)
+                .map(|w| w.layers.clone())
+                .unwrap_or_default()
+        };
+        let id = |name: &str| env.eval_int(name) as u32;
+        let (a, b, c) = (id("a.id"), id("b.id"), id("c.id"));
+        assert_eq!(order, vec![c, a, b], "bringToBack moves c first");
+        order.clear();
+        env.run("c.moveBehind(a);").unwrap();
+        {
+            let scene = env.scene();
+            order = scene
+                .window(0)
+                .map(|w| w.layers.clone())
+                .unwrap_or_default();
+        }
+        assert_eq!(order, vec![a, c, b], "moveBehind puts c after a");
+        env.run("c.moveBefore(a);").unwrap();
+        let scene = env.scene();
+        assert_eq!(scene.window(0).unwrap().layers, vec![c, a, b]);
+    }
+
+    /// `captureMouse`/`captureTouch`/`releaseCapture`/`releaseTouchCapture`
+    /// record and clear the capture state.
+    #[test]
+    fn layer_input_capture_state() {
+        let env = TestEnv::new("layer-capture");
+        env.run(
+            "var w = new Window(); var l = new Layer(w, null); \
+             l.captureMouse(); l.captureTouch(7);",
+        )
+        .unwrap();
+        let id = env.eval_int("l.id") as u32;
+        assert_eq!(super::captured_mouse_layer(), Some(id));
+        assert_eq!(super::captured_touches(), vec![(7, id)]);
+        env.run("l.releaseTouchCapture(7); l.releaseCapture();")
+            .unwrap();
+        assert_eq!(super::captured_mouse_layer(), None);
+        assert!(super::captured_touches().is_empty());
+        env.run("l.captureTouch(1); l.captureTouch(2); l.releaseTouchCapture();")
+            .unwrap();
+        assert!(super::captured_touches().is_empty(), "no args clears all");
+    }
+
+    /// `setMainPixel`/`getMainPixel` read/write RGB while preserving the
+    /// mask; `setMaskPixel`/`getMaskPixel` read/write the alpha.
+    #[test]
+    fn layer_main_and_mask_pixels() {
+        let env = TestEnv::new("layer-main-mask-pixels");
+        env.run(
+            "var w = new Window(); var l = new Layer(w, null); l.setSize(4, 4); \
+             l.hasImage = true; l.setMaskPixel(1, 1, 200); \
+             l.setMainPixel(1, 1, 0x00123456);",
+        )
+        .unwrap();
+        assert_eq!(env.eval_int("l.getMainPixel(1, 1)"), 0x123456);
+        assert_eq!(env.eval_int("l.getMaskPixel(1, 1)"), 200);
+        // RGB-only set must not clobber the mask.
+        env.run("l.setMainPixel(1, 1, 0x00abcdef);").unwrap();
+        assert_eq!(env.eval_int("l.getMainPixel(1, 1)"), 0xabcdef);
+        assert_eq!(env.eval_int("l.getMaskPixel(1, 1)"), 200);
+    }
+
+    /// `loadProvinceImage` fills the 8-bit province plane from a storage
+    /// image; `independProvinceImage` keeps it private.
+    #[test]
+    fn layer_load_and_independ_province_image() {
+        let env = TestEnv::new("layer-province-load");
+        // 2x2 image: red channel 1,2,3,4; alpha 255.
+        let rgba: Vec<u8> = vec![1, 9, 9, 255, 2, 9, 9, 255, 3, 9, 9, 255, 4, 9, 9, 255];
+        write_fixture(&env, "prov.webp", &rgba, 2, 2);
+        env.run(
+            "var w = new Window(); var l = new Layer(w, null); l.setSize(2, 2); \
+             l.hasImage = true; l.loadProvinceImage('prov'); l.independProvinceImage();",
+        )
+        .unwrap();
+        let scene = env.scene();
+        let layer = &scene.layers[0];
+        assert_eq!((layer.province_width, layer.province_height), (2, 2));
+        assert_eq!(layer.province.as_deref(), Some(&[1u8, 2, 3, 4][..]));
+        assert!(layer.image_modified);
+    }
+
+    /// `focusNext`/`focusPrev` move the window focus between focusable layers.
+    #[test]
+    fn layer_focus_next_prev() {
+        let env = TestEnv::new("layer-focus-neighbors");
+        env.run(
+            "var w = new Window(); var a = new Layer(w, null); a.focusable = true; \
+             var b = new Layer(w, null); b.visible = true; b.focusable = true; \
+             a.focus(); var next = a.focusNext(); var prev = b.focusPrev();",
+        )
+        .unwrap();
+        let a = env.eval_int("a.id");
+        let b = env.eval_int("b.id");
+        assert_eq!(env.eval_int("next.id"), b);
+        assert_eq!(env.eval_int("prev.id"), a);
+        let scene = env.scene();
+        assert_eq!(scene.window(0).unwrap().focused_layer, Some(a as u32));
+    }
+
+    /// `getList` returns the direct children array, and the game's
+    /// `k2compat_fontselect.tjs` `lay.font.getList(flags)` path works.
+    #[test]
+    fn layer_get_list_and_font_get_list() {
+        let env = TestEnv::new("layer-get-list");
+        env.run(
+            "var w = new Window(); var p = new Layer(w, null); \
+             var c1 = new Layer(w, p); var c2 = new Layer(w, p); \
+             var list = p.getList(); var names = p.font.getList(0);",
+        )
+        .unwrap();
+        assert_eq!(env.eval_int("list.count"), 2);
+        assert!(env.eval_int("names.count") > 0, "Font.getList must answer");
+    }
+
+    /// `onHitTest` stores the script hook's hit result; `setAttentionPos`
+    /// sets the attention anchor (editlayer.tjs).
+    #[test]
+    fn layer_hit_test_work_and_attention_pos() {
+        let env = TestEnv::new("layer-hittest-attention");
+        env.run(
+            "var w = new Window(); var l = new Layer(w, null); \
+             l.onHitTest(1, 2, true); l.setAttentionPos(5, 6);",
+        )
+        .unwrap();
+        let id = env.eval_int("l.id") as u32;
+        assert_eq!(super::layer_hit_test_work(id), Some(true));
+        let scene = env.scene();
+        assert_eq!(scene.layers[0].attention_left, 5);
+        assert_eq!(scene.layers[0].attention_top, 6);
+    }
+
+    /// `setMode` makes a layer modal and focuses its first focusable
+    /// descendant; `removeMode` releases it and moves focus on.
+    #[test]
+    fn layer_set_and_remove_mode() {
+        let env = TestEnv::new("layer-modal");
+        env.run(
+            "var w = new Window(); var a = new Layer(w, null); a.focusable = true; \
+             var b = new Layer(w, null); b.focusable = true; a.focus(); \
+             b.setMode();",
+        )
+        .unwrap();
+        let a = env.eval_int("a.id") as u32;
+        let b = env.eval_int("b.id") as u32;
+        {
+            let scene = env.scene();
+            assert_eq!(scene.window(0).unwrap().focused_layer, Some(b));
+        }
+        env.run("b.removeMode();").unwrap();
+        let scene = env.scene();
+        assert_eq!(scene.window(0).unwrap().focused_layer, Some(a));
+    }
+
+    /// `dump` is output-only and must not throw.
+    #[test]
+    fn layer_dump_is_safe() {
+        let env = TestEnv::new("layer-dump");
+        env.run("var w = new Window(); var l = new Layer(w, null); l.dump();")
+            .unwrap();
+    }
+
+    /// The base `onPaint` action stays resolvable for `super.onPaint(...)`.
+    #[test]
+    fn layer_on_paint_base_action_is_inert() {
+        let env = TestEnv::new("layer-onpaint");
+        env.run(
+            "var w = new Window(); \
+             class P extends Layer { function onPaint() { super.onPaint(...); } } \
+             var l = new P(w, null); l.onPaint();",
+        )
+        .unwrap();
     }
 }
