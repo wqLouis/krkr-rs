@@ -157,6 +157,14 @@ pub struct BitmapState {
     pub name: Option<String>,
     /// Set when contents changed; the renderer re-uploads on true.
     pub dirty: bool,
+    /// True when this bitmap is a window primary layer's **screen buffer**
+    /// (synthesized by `composite_primary_layer` / `ensure_primary_bitmap`).
+    /// The reference composites the layer tree into the primary layer's
+    /// MainImage and scripts read it back (`piledCopy(0, 0,
+    /// window.primaryLayer, …)`, `saveLayerImage`); it is never content to
+    /// blit. Drawing it would replay the snapshot captured when the script
+    /// last read it and leave stale imagery on screen.
+    pub screen_buffer: bool,
 }
 
 impl BitmapState {
@@ -1068,6 +1076,7 @@ impl Scene {
             rgba,
             name: None,
             dirty: true,
+            screen_buffer: false,
         });
         self.touch();
         id

@@ -10779,6 +10779,14 @@ mod tests {
             scene.layers[0].bitmap.is_some(),
             "compositing allocates the primary MainImage"
         );
+        // ...and it is flagged as a screen buffer, so the renderer never
+        // blits it as a sprite (that would replay a stale snapshot and leave
+        // the previous scene's imagery on screen).
+        let primary_bitmap = scene.layers[0].bitmap.unwrap();
+        assert!(
+            scene.bitmap(primary_bitmap).unwrap().screen_buffer,
+            "the primary MainImage is a screen buffer, not drawable content"
+        );
     }
 
     /// `copyRect(0, 0, window.primaryLayer, ...)` takes the same

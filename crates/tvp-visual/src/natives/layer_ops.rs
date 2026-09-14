@@ -1921,9 +1921,17 @@ fn primary_target_size(scene: &Scene, primary_id: u32, window: u32) -> Option<(u
 /// already attached (or a previous composite) is left untouched.
 fn ensure_primary_bitmap(scene: &mut Scene, primary_id: u32, w: u32, h: u32) -> Option<u32> {
     if let Some(bitmap_id) = scene.layer(primary_id)?.bitmap {
+        // Reusing an existing buffer: the composite below overwrites it
+        // entirely, so it becomes the screen buffer either way.
+        if let Some(bitmap) = scene.bitmap_mut(bitmap_id) {
+            bitmap.screen_buffer = true;
+        }
         return Some(bitmap_id);
     }
     let bitmap_id = scene.add_bitmap(w, h, vec![0; w as usize * h as usize * 4]);
+    if let Some(bitmap) = scene.bitmap_mut(bitmap_id) {
+        bitmap.screen_buffer = true;
+    }
     let layer = scene.layer_mut(primary_id)?;
     layer.bitmap = Some(bitmap_id);
     layer.image_left = 0;

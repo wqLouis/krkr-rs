@@ -406,6 +406,79 @@ pub fn sync_host_window_resolution(
     }
 }
 
+/// Whether `layer_id`'s bitmap is a synthesized **screen buffer** (a window
+/// primary layer's composited MainImage) rather than drawable content. See
+/// [`BitmapState::screen_buffer`].
+fn is_screen_buffer_layer(scene: &Scene, layer_id: u32) -> bool {
+    scene
+        .layer(layer_id)
+        .and_then(|layer| layer.bitmap)
+        .and_then(|bitmap| scene.bitmap(bitmap))
+        .is_some_and(|bitmap| bitmap.screen_buffer)
+}
+
+/// Dev diagnostic: with `KRKR_DUMP_LAYERS=1` in the environment, log each
+/// window's draw order and every layer in it (id, parent, visibility,
+/// opacity, rect, image size and source bitmap name) about once a second.
+/// Used to find layers that are not torn down or cleared when a scene
+/// changes.
+fn dump_layers(scene: &Scene, sprites: &HashMap<u32, bevy::prelude::Entity>) {
+    use std::time::{Duration, Instant};
+    static LAST: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+    {
+        let mut last = LAST.lock().unwrap_or_else(|p| p.into_inner());
+        let now = Instant::now();
+        if last.is_some_and(|t| now.duration_since(t) < Duration::from_secs(1)) {
+            return;
+        }
+        *last = Some(now);
+    }
+    log::info!(
+        "DUMP scene: layers={} bitmaps={}",
+        scene.layers.len(),
+        scene.bitmaps.len()
+    );
+    for window in &scene.windows {
+        let order = scene.window_layer_order(window.id);
+        log::info!(
+            "DUMP window #{} primary={:?} roots={} draw_order={}",
+            window.id,
+            window.primary_layer,
+            window.layers.len(),
+            order.len()
+        );
+        for id in &order {
+            let Some(layer) = scene.layer(*id) else {
+                continue;
+            };
+            let name = layer
+                .bitmap
+                .and_then(|b| scene.bitmap(b))
+                .and_then(|b| b.name.clone())
+                .unwrap_or_default();
+            let screen_buffer = layer
+                .bitmap
+                .and_then(|b| scene.bitmap(b))
+                .is_some_and(|b| b.screen_buffer);
+            log::info!(
+                "DUMP  L#{id} parent={:?} vis={} sb={} sprite={} op={:.2} rect=({},{},{},{}) img={}x{} lib={:?} bmp={name:?}",
+                layer.parent,
+                layer.visible,
+                screen_buffer,
+                sprites.contains_key(id),
+                layer.opacity,
+                layer.rect.x,
+                layer.rect.y,
+                layer.rect.w,
+                layer.rect.h,
+                layer.image_width,
+                layer.image_height,
+                layer.image_left,
+            );
+        }
+    }
+}
+
 /// The scene → Bevy sync system. Run in `Update`, after the VM tick mutates
 /// the scene.
 #[allow(clippy::too_many_arguments)]
@@ -430,6 +503,10 @@ pub fn sync_scene(
         .unwrap_or(false);
 
     let scene = shared.0.read().expect("shared scene lock poisoned");
+
+    if std::env::var_os("KRKR_DUMP_LAYERS").is_some() {
+        dump_layers(&scene, &state.sprites);
+    }
 
     let projection_size = scene
         .windows
@@ -521,6 +598,15 @@ pub fn sync_scene(
             let Some(layer) = scene.layer(layer_id) else {
                 continue;
             };
+            // The window's primary layer is the **screen buffer**: the
+            // reference composites the layer tree into its MainImage and
+            // scripts read it back (`piledCopy(0, 0, window.primaryLayer, …)`,
+            // `saveLayerImage`, save thumbnails). It is never a sprite —
+            // drawing it would blit the snapshot taken when the script last
+            // read it, leaving the previous scene's imagery on screen.
+            if is_screen_buffer_layer(&scene, layer_id) {
+                continue;
+            }
             let Some(composed) = compose_layer(&scene, layer_id) else {
                 continue;
             };
@@ -2504,6 +2590,36 @@ mod tests {
             .expect("layer sprite still exists");
         // TVP rect x moved 100 → 110: bevy x = 110 + 32 - 320 = -178.
         assert_eq!(x, -178.0, "the in-place update moved the entity");
+    }
+
+    /// A layer whose bitmap is a window primary layer's synthesized **screen
+    /// buffer** must never spawn a sprite. The reference composites the layer
+    /// tree into the primary layer's MainImage and scripts read it back
+    /// (`piledCopy(0, 0, window.primaryLayer, …)`, `saveLayerImage`), so
+    /// drawing it would blit the snapshot captured when the script last read
+    /// it and leave the previous scene's imagery on screen.
+    #[test]
+    fn primary_layer_screen_buffer_is_not_rendered() {
+        let (shared, l1, bmp) = two_layer_scene();
+        {
+            let mut scene = shared.0.write().unwrap();
+            let win = scene.windows[0].id;
+            scene.window_mut(win).unwrap().primary_layer = Some(l1);
+            // Exactly what `ensure_primary_bitmap` does.
+            scene.bitmap_mut(bmp).unwrap().screen_buffer = true;
+        }
+        let mut app = app_with_sync(shared.clone());
+        app.update();
+        let entities = sprite_entities(app.world_mut());
+        assert!(
+            !entities.contains_key(&l1),
+            "the primary layer's screen buffer must not be drawn"
+        );
+        // The primary layer is not the only layer: the other one still draws.
+        assert!(
+            sprite_count(app.world_mut()) >= 1,
+            "other layers keep rendering"
+        );
     }
 
     /// (c) A layer that appears spawns exactly one new entity; a removed
