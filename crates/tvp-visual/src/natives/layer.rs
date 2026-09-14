@@ -829,8 +829,16 @@ extern "C" fn layer_convert_type(
     };
     let face = layer_draw_face(layer);
     let clip = layer_pixel_rect(layer);
-    let Some(bitmap_id) = layer.bitmap else {
-        return error_out(out_error, "Layer.convertType: layer has no image");
+    let bitmap_id = match layer.bitmap {
+        Some(id) => id,
+        // KAG layers are image-capable and call pixel ops before any
+        // explicit allocation, so allocate the MainImage on demand
+        // (reference `AllocateImage`) instead of throwing
+        // `TVPNotDrawableLayerType` (`LayerIntf.cpp:2326`).
+        None => match ensure_dest_image(&mut scene, inst.id, 0, 0) {
+            Some(id) => id,
+            None => return error_out(out_error, "Layer.convertType: layer no longer exists"),
+        },
     };
     if face == DF_ADD_ALPHA && fromtype == DF_ALPHA {
         if let Some(b) = scene.bitmap_mut(bitmap_id) {
@@ -899,8 +907,21 @@ fn layer_legacy_rect_common(
         return error_out(out_error, "Layer: layer no longer exists");
     };
     let clip = layer_pixel_rect(layer);
-    let Some(bitmap_id) = layer.bitmap else {
-        return error_out(out_error, "Layer.pileRect/blendRect: layer has no image");
+    let bitmap_id = match layer.bitmap {
+        Some(id) => id,
+        // KAG layers are image-capable and call pixel ops before any
+        // explicit allocation, so allocate the MainImage on demand
+        // (reference `AllocateImage`) instead of throwing
+        // `TVPNotDrawableLayerType` (`LayerIntf.cpp:2326`).
+        None => match ensure_dest_image(&mut scene, inst.id, 0, 0) {
+            Some(id) => id,
+            None => {
+                return error_out(
+                    out_error,
+                    "Layer.pileRect/blendRect: layer no longer exists",
+                );
+            }
+        },
     };
     let srcrect = (
         sx,
@@ -989,8 +1010,8 @@ extern "C" fn layer_copy_9patch(
     let Some(src) = tile_bitmap_for_source(&scene, kind, src_id) else {
         return error_out(out_error, "Layer.copy9Patch: source has no image");
     };
-    let Some(bitmap_id) = scene.layer(inst.id).and_then(|l| l.bitmap) else {
-        return error_out(out_error, "Layer.copy9Patch: layer has no image");
+    let Some(bitmap_id) = ensure_dest_image(&mut scene, inst.id, 0, 0) else {
+        return error_out(out_error, "Layer.copy9Patch: layer no longer exists");
     };
     if let Some(dst) = scene.bitmap_mut(bitmap_id) {
         let _ = layer_ops::copy_9patch(dst, &src);
@@ -3999,8 +4020,16 @@ extern "C" fn layer_color_rect(
         set_void_out(out);
         return 0;
     };
-    let Some(bitmap_id) = layer.bitmap else {
-        return error_out(out_error, "Layer.colorRect: layer has no image");
+    let bitmap_id = match layer.bitmap {
+        Some(id) => id,
+        // KAG layers are image-capable and call pixel ops before any
+        // explicit allocation, so allocate the MainImage on demand
+        // (reference `AllocateImage`) instead of throwing
+        // `TVPNotDrawableLayerType` (`LayerIntf.cpp:2326`).
+        None => match ensure_dest_image(&mut scene, inst.id, 0, 0) {
+            Some(id) => id,
+            None => return error_out(out_error, "Layer.colorRect: layer no longer exists"),
+        },
     };
     let Some(bitmap) = scene.bitmap_mut(bitmap_id) else {
         return error_out(out_error, "Layer.colorRect: no such bitmap");
@@ -4157,8 +4186,8 @@ extern "C" fn layer_tile_rect(
         return error_out(out_error, "Layer.tileRect: tile has no image");
     };
     let tile_rect = (0, 0, tile.width as i32, tile.height as i32);
-    let Some(bitmap_id) = scene.layer(inst.id).and_then(|l| l.bitmap) else {
-        return error_out(out_error, "Layer.tileRect: layer has no image");
+    let Some(bitmap_id) = ensure_dest_image(&mut scene, inst.id, 0, 0) else {
+        return error_out(out_error, "Layer.tileRect: layer no longer exists");
     };
     if let Some(dst) = scene.bitmap_mut(bitmap_id) {
         layer_ops::tile_rect(dst, left, top, width, height, &tile, tile_rect, x, y);
@@ -4190,8 +4219,8 @@ extern "C" fn layer_fill_operate_rect(
     let mode = args.get(5).map(arg_i64).unwrap_or(13);
     let inst = unsafe { instance_ref::<LayerInst>(instance) };
     let mut scene = context_scene_mut();
-    let Some(bitmap_id) = scene.layer(inst.id).and_then(|l| l.bitmap) else {
-        return error_out(out_error, "Layer.fillOperateRect: layer has no image");
+    let Some(bitmap_id) = ensure_dest_image(&mut scene, inst.id, 0, 0) else {
+        return error_out(out_error, "Layer.fillOperateRect: layer no longer exists");
     };
     if let Some(bitmap) = scene.bitmap_mut(bitmap_id) {
         layer_ops::fill_operate_rect(bitmap, left, top, width, height, color, mode);
@@ -4346,8 +4375,16 @@ extern "C" fn layer_do_gray_scale(
         return error_out(out_error, "Layer: layer no longer exists");
     };
     let clip = layer_pixel_rect(layer);
-    let Some(bitmap_id) = layer.bitmap else {
-        return error_out(out_error, "Layer.doGrayScale: layer has no image");
+    let bitmap_id = match layer.bitmap {
+        Some(id) => id,
+        // KAG layers are image-capable and call pixel ops before any
+        // explicit allocation, so allocate the MainImage on demand
+        // (reference `AllocateImage`) instead of throwing
+        // `TVPNotDrawableLayerType` (`LayerIntf.cpp:2326`).
+        None => match ensure_dest_image(&mut scene, inst.id, 0, 0) {
+            Some(id) => id,
+            None => return error_out(out_error, "Layer.doGrayScale: layer no longer exists"),
+        },
     };
     if let Some(bitmap) = scene.bitmap_mut(bitmap_id) {
         layer_ops::do_gray_scale(bitmap, clip);
@@ -4388,8 +4425,16 @@ extern "C" fn layer_adjust_gamma(
         return error_out(out_error, "Layer: layer no longer exists");
     };
     let clip = layer_pixel_rect(layer);
-    let Some(bitmap_id) = layer.bitmap else {
-        return error_out(out_error, "Layer.adjustGamma: layer has no image");
+    let bitmap_id = match layer.bitmap {
+        Some(id) => id,
+        // KAG layers are image-capable and call pixel ops before any
+        // explicit allocation, so allocate the MainImage on demand
+        // (reference `AllocateImage`) instead of throwing
+        // `TVPNotDrawableLayerType` (`LayerIntf.cpp:2326`).
+        None => match ensure_dest_image(&mut scene, inst.id, 0, 0) {
+            Some(id) => id,
+            None => return error_out(out_error, "Layer.adjustGamma: layer no longer exists"),
+        },
     };
     if let Some(bitmap) = scene.bitmap_mut(bitmap_id) {
         layer_ops::adjust_gamma(bitmap, clip, data);
@@ -4421,8 +4466,16 @@ extern "C" fn layer_light(
         return error_out(out_error, "Layer: layer no longer exists");
     };
     let clip = layer_pixel_rect(layer);
-    let Some(bitmap_id) = layer.bitmap else {
-        return error_out(out_error, "Layer.light: layer has no image");
+    let bitmap_id = match layer.bitmap {
+        Some(id) => id,
+        // KAG layers are image-capable and call pixel ops before any
+        // explicit allocation, so allocate the MainImage on demand
+        // (reference `AllocateImage`) instead of throwing
+        // `TVPNotDrawableLayerType` (`LayerIntf.cpp:2326`).
+        None => match ensure_dest_image(&mut scene, inst.id, 0, 0) {
+            Some(id) => id,
+            None => return error_out(out_error, "Layer.light: layer no longer exists"),
+        },
     };
     if let Some(bitmap) = scene.bitmap_mut(bitmap_id) {
         layer_ops::light_contrast(bitmap, clip, brightness, contrast);
@@ -4443,8 +4496,8 @@ extern "C" fn layer_flip_lr(
 ) -> c_int {
     let inst = unsafe { instance_ref::<LayerInst>(instance) };
     let mut scene = context_scene_mut();
-    let Some(bitmap_id) = scene.layer(inst.id).and_then(|l| l.bitmap) else {
-        return error_out(out_error, "Layer.flipLR: layer has no image");
+    let Some(bitmap_id) = ensure_dest_image(&mut scene, inst.id, 0, 0) else {
+        return error_out(out_error, "Layer.flipLR: layer no longer exists");
     };
     if let Some(bitmap) = scene.bitmap_mut(bitmap_id) {
         layer_ops::flip_lr(bitmap);
@@ -4465,8 +4518,8 @@ extern "C" fn layer_flip_ud(
 ) -> c_int {
     let inst = unsafe { instance_ref::<LayerInst>(instance) };
     let mut scene = context_scene_mut();
-    let Some(bitmap_id) = scene.layer(inst.id).and_then(|l| l.bitmap) else {
-        return error_out(out_error, "Layer.flipUD: layer has no image");
+    let Some(bitmap_id) = ensure_dest_image(&mut scene, inst.id, 0, 0) else {
+        return error_out(out_error, "Layer.flipUD: layer no longer exists");
     };
     if let Some(bitmap) = scene.bitmap_mut(bitmap_id) {
         layer_ops::flip_ud(bitmap);
@@ -4546,8 +4599,16 @@ extern "C" fn layer_gaussian_blur(
         return error_out(out_error, "Layer: layer no longer exists");
     };
     let clip = layer_pixel_rect(layer);
-    let Some(bitmap_id) = layer.bitmap else {
-        return error_out(out_error, "Layer.gaussianBlur: layer has no image");
+    let bitmap_id = match layer.bitmap {
+        Some(id) => id,
+        // KAG layers are image-capable and call pixel ops before any
+        // explicit allocation, so allocate the MainImage on demand
+        // (reference `AllocateImage`) instead of throwing
+        // `TVPNotDrawableLayerType` (`LayerIntf.cpp:2326`).
+        None => match ensure_dest_image(&mut scene, inst.id, 0, 0) {
+            Some(id) => id,
+            None => return error_out(out_error, "Layer.gaussianBlur: layer no longer exists"),
+        },
     };
     if let Some(bitmap) = scene.bitmap_mut(bitmap_id) {
         layer_ops::gaussian_blur(bitmap, clip, radius, sigma);
@@ -4611,8 +4672,8 @@ extern "C" fn layer_operate_rect(
         sx.saturating_add(sw as i32),
         sy.saturating_add(sh as i32),
     );
-    let Some(bitmap_id) = scene.layer(inst.id).and_then(|l| l.bitmap) else {
-        return error_out(out_error, "Layer.operateRect: layer has no image");
+    let Some(bitmap_id) = ensure_dest_image(&mut scene, inst.id, 0, 0) else {
+        return error_out(out_error, "Layer.operateRect: layer no longer exists");
     };
     if let Some(dst) = scene.bitmap_mut(bitmap_id) {
         layer_ops::operate_rect(dst, dx, dy, &src, srcrect, mode, opa);
@@ -4810,8 +4871,8 @@ fn layer_affine_common(
         sx.saturating_add(sw as i32),
         sy.saturating_add(sh as i32),
     );
-    let Some(bitmap_id) = scene.layer(inst.id).and_then(|l| l.bitmap) else {
-        return error_out(out_error, "Layer.affine*: layer has no image");
+    let Some(bitmap_id) = ensure_dest_image(&mut scene, inst.id, 0, 0) else {
+        return error_out(out_error, "Layer.affine*: layer no longer exists");
     };
     if let Some(dst) = scene.bitmap_mut(bitmap_id) {
         layer_ops::affine_blit(
