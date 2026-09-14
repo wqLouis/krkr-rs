@@ -177,9 +177,9 @@ impl FrameEvents {
 ///
 /// Runs before [`dispatch_input`] (chained in `main.rs`) and after
 /// `run_vm`, so scripts never see input mid-poll. Cursor positions are
-/// mapped from the OS window into game (primary-layer) coordinates — the
-/// window is currently 1:1 with the game (1280x720), but a WM-scaled window
-/// is handled by scaling through the window's logical size.
+/// mapped from the OS window into game (primary-layer) coordinates by
+/// [`krkr_render::sync::window_to_game_transform`], which applies the same
+/// aspect-preserving scale the scene camera uses.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn capture_input(
     mouse_input: Res<ButtonInput<MouseButton>>,
@@ -297,14 +297,16 @@ pub(crate) fn capture_input(
 }
 
 /// The game resolution to map cursor positions into: the first scene
-/// window's inner (logical client) size, falling back to the title size.
+/// window's logical rendering resolution (the primary layer's size), falling
+/// back to the title size.
+///
+/// This must match [`krkr_render::sync::scene_projection`]'s logical size
+/// exactly — the primary layer, *not* the possibly-zoomed client size — so
+/// that cursor/input coordinates stay in the coordinate space the game's
+/// layers and hit rectangles use.
 fn game_size(shared: &SharedScene) -> (u32, u32) {
     let scene = shared.0.read().expect("shared scene lock poisoned");
-    scene
-        .windows
-        .first()
-        .map(|w| w.inner_size)
-        .unwrap_or(DEFAULT_GAME_SIZE)
+    krkr_render::sync::first_window_logical_size(&scene).unwrap_or(DEFAULT_GAME_SIZE)
 }
 
 /// Map a Bevy [`KeyCode`] to the Windows virtual-key code the game's
@@ -1423,6 +1425,31 @@ mod tests {
             game_to_window_pixel((1280, 720), transform),
             (2560.0, 1440.0)
         );
+    }
+
+    /// The cursor mapping size must be the game's logical rendering
+    /// resolution (the primary layer), not the zoomed OS client size, so
+    /// hit-testing after a resolution change stays in the game's coordinate
+    /// space. A window without a primary layer falls back to its client size.
+    #[test]
+    fn game_size_uses_primary_layer_not_zoomed_client_size() {
+        use tvp_visual::scene::Rect;
+        let mut scene = Scene::default();
+        let win = scene.add_window("t", (1920, 1080));
+        let primary = scene.add_layer(win, None);
+        scene.layer_mut(primary).unwrap().rect = Rect {
+            x: 0,
+            y: 0,
+            w: 1280,
+            h: 720,
+        };
+        let shared = SharedScene(Arc::new(RwLock::new(scene)));
+        assert_eq!(game_size(&shared), (1280, 720));
+
+        let mut scene = Scene::default();
+        scene.add_window("t", (1024, 768));
+        let shared = SharedScene(Arc::new(RwLock::new(scene)));
+        assert_eq!(game_size(&shared), (1024, 768));
     }
 
     /// Left-button presses complete a click gesture: the first fires

@@ -1602,6 +1602,33 @@ mod tests {
         e
     }
 
+    /// `System.screenWidth`/`screenHeight` follow the installed context, which
+    /// the render bridge keeps current as the game resizes its window (the
+    /// TODO's "logical size stays 1280x720" bug).
+    #[test]
+    fn screen_size_follows_the_system_context() {
+        let _vm_lock = crate::test_lock::vm_lock();
+        let e = engine_with_system();
+        let cwd = std::env::current_dir().unwrap();
+        set_system_context(SystemContext {
+            project_dir: cwd.clone(),
+            app_data_dir: cwd,
+            screen_size: (1920, 1080),
+            desktop_origin: (0, 0),
+            desktop_size: (3840, 2160),
+            touch_device: false,
+        });
+        assert_eq!(
+            e.eval("System.screenWidth", "test").unwrap(),
+            tjs2_sys::TjsValue::Integer(1920)
+        );
+        assert_eq!(
+            e.eval("System.screenHeight", "test").unwrap(),
+            tjs2_sys::TjsValue::Integer(1080)
+        );
+        set_system_context(SystemContext::default());
+    }
+
     #[test]
     fn input_string_returns_initial_value_and_checks_arity() {
         let _vm_lock = crate::test_lock::vm_lock();

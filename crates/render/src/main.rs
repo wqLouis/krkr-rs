@@ -28,7 +28,10 @@ use bevy::window::{Monitor, PrimaryMonitor, Window, WindowPlugin};
 use engine::loader::LoadReport;
 use krkr_render::GpuPrimitives;
 use krkr_render::blend::LayerBlendPlugin;
-use krkr_render::sync::{BitmapAssets, FrameBlendMaterials, SharedScene, sync_scene};
+use krkr_render::sync::{
+    BitmapAssets, FrameBlendMaterials, HostWindowResolution, SharedScene, SystemContextState,
+    sync_host_window_resolution, sync_scene,
+};
 use tvp_visual::scene::{BitmapState, Rect, Scene};
 
 mod input_bridge;
@@ -161,6 +164,7 @@ fn game_app(shared: SharedScene, game_dir: PathBuf, font_config: Option<PathBuf>
         .init_resource::<BitmapAssets>()
         .init_resource::<GpuPrimitives>()
         .init_resource::<FrameBlendMaterials>()
+        .init_resource::<HostWindowResolution>()
         .init_resource::<input_bridge::BridgeState>()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
@@ -174,8 +178,13 @@ fn game_app(shared: SharedScene, game_dir: PathBuf, font_config: Option<PathBuf>
         .add_plugins(krkr_render::menu::MenuPlugin)
         .add_systems(Startup, game_startup)
         // run_vm BEFORE sync_scene: script mutations must render the same
-        // frame, not one frame later.
-        .add_systems(Update, (run_vm, sync_scene).chain())
+        // frame, not one frame later. `sync_host_window_resolution` runs
+        // between them so a `Window.setSize`/`setZoom` this frame resizes the
+        // OS window before the scene is synced.
+        .add_systems(
+            Update,
+            (run_vm, sync_host_window_resolution, sync_scene).chain(),
+        )
         // `System.exit` / `System.terminate` from the VM → Bevy `AppExit`.
         // Runs after `run_vm` so an exit requested by this frame's script
         // shuts the app down immediately (the window-close path stays with
@@ -314,14 +323,19 @@ fn game_startup(
             )
         })
         .unwrap_or(((0, 0), GAME_SIZE));
-    tvp_natives::set_system_context(tvp_natives::SystemContext {
+    let system_context = tvp_natives::SystemContext {
         project_dir: config.game_dir.clone(),
         app_data_dir: std::env::temp_dir(),
         screen_size: GAME_SIZE,
         desktop_origin,
         desktop_size,
         touch_device: false,
-    });
+    };
+    tvp_natives::set_system_context(system_context.clone());
+    // Keep the installed context as a resource so the render bridge can keep
+    // `System.screenWidth`/`screenHeight` current as the game resizes its
+    // window (see `sync_host_window_resolution`).
+    commands.insert_resource(SystemContextState(system_context));
 
     // 4. Register the native classes; the visual ones bind to our shared
     //    scene (natives mutate it under a write lock, sync_scene renders

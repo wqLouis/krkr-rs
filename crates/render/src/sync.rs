@@ -80,7 +80,8 @@ use bevy::mesh::{Mesh, Mesh2d};
 use bevy::prelude::{Camera, Sprite, Transform, Visibility};
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::sprite_render::MeshMaterial2d;
-use tvp_visual::scene::{BitmapState, LayerState, Rect, Scene};
+use bevy::window::Window;
+use tvp_visual::scene::{BitmapState, LayerState, Rect, Scene, WindowState};
 
 use crate::blend::{LayerBlendMaterial, LayerBlendMode, LayerRenderPath, render_path_for};
 
@@ -226,29 +227,59 @@ pub struct SceneSprite {
 #[derive(Component)]
 pub struct SceneCamera;
 
-/// The logical scene size used when a window carries a degenerate
-/// (`0 × 0`) [`WindowState::inner_size`](tvp_visual::scene::WindowState::inner_size).
+/// The logical scene size used when a window carries neither a sized
+/// primary layer nor a usable (`0 × 0`)
+/// [`WindowState::inner_size`](tvp_visual::scene::WindowState::inner_size).
 pub const DEFAULT_LOGICAL_SIZE: (u32, u32) = (1280, 720);
 
-/// Logical scene size for a window: its `inner_size`, or
-/// [`DEFAULT_LOGICAL_SIZE`] when that is zero-sized.
-fn logical_size(inner_size: (u32, u32)) -> (u32, u32) {
-    if inner_size.0 == 0 || inner_size.1 == 0 {
-        DEFAULT_LOGICAL_SIZE
-    } else {
-        inner_size
+/// The game's logical rendering resolution for `window`: the surface the
+/// camera projects and that layer rects are expressed in.
+///
+/// KiriKiri renders the window's **primary layer** and scales that surface
+/// into the OS client area (reference `tTJSNI_Window::NotifySrcResize` →
+/// `DrawDevice->GetSrcSize` → `SetPaintBoxSize`, `WindowImpl.cpp:1265`;
+/// `TVPWindowLayer::RecalcPaintBox`, `TVPWindow.cpp:431`). `Window.zoom` /
+/// `setInnerSize` therefore change the OS client size
+/// ([`WindowState::inner_size`]) but *not* the game's logical resolution, so
+/// the camera must project the primary layer instead of the zoomed client
+/// size — otherwise a zoom would double-scale the scene (logical == client
+/// size) and the game's 1280×720 artwork would be pushed into a corner.
+///
+/// The primary layer's size is the game's declared screen size (this game:
+/// `Layer.setSize(WINDOW_WIDTH, WINDOW_HEIGHT)`; reference
+/// `DrawDevice->GetSrcSize`). A window whose primary layer is unsized (or
+/// absent) falls back to its `inner_size`, and then to
+/// [`DEFAULT_LOGICAL_SIZE`] when that is degenerate too.
+pub fn window_logical_size(scene: &Scene, window: &WindowState) -> (u32, u32) {
+    if let Some(primary) = window.primary_layer.and_then(|id| scene.layer(id))
+        && primary.rect.w > 0
+        && primary.rect.h > 0
+    {
+        return (primary.rect.w, primary.rect.h);
     }
+    if window.inner_size.0 > 0 && window.inner_size.1 > 0 {
+        return window.inner_size;
+    }
+    DEFAULT_LOGICAL_SIZE
 }
 
-/// The orthographic 2D projection for a logical scene of `inner_size` world
+/// Logical rendering resolution of the first (primary) scene window, or
+/// `None` when the scene has no window. Used by the input bridge to map OS
+/// window pixels into game coordinates with the exact same transform the
+/// camera uses.
+pub fn first_window_logical_size(scene: &Scene) -> Option<(u32, u32)> {
+    scene.windows.first().map(|w| window_logical_size(scene, w))
+}
+
+/// The orthographic 2D projection for a logical scene of `logical` world
 /// units.
 ///
 /// `ScalingMode::AutoMin` keeps the aspect ratio and never shows less than
 /// the logical scene: resizing the OS window *scales* the game (no
 /// stretching), letterboxing extra space on the non-16:9 axis. (`Fixed`
 /// would stretch the scene instead, which distorts a visual novel.)
-fn scene_projection(inner_size: (u32, u32)) -> Projection {
-    let (width, height) = logical_size(inner_size);
+fn scene_projection(logical: (u32, u32)) -> Projection {
+    let (width, height) = logical;
     Projection::Orthographic(OrthographicProjection {
         scaling_mode: ScalingMode::AutoMin {
             min_width: width as f32,
@@ -256,6 +287,114 @@ fn scene_projection(inner_size: (u32, u32)) -> Projection {
         },
         ..OrthographicProjection::default_2d()
     })
+}
+
+/// The OS client size last pushed to the host window (logical pixels). Lets
+/// [`sync_host_window_resolution`] tell a game-initiated `Window.setSize` /
+/// `setInnerSize` / `setZoom` from an interactive OS resize: only the former
+/// changes [`WindowState::inner_size`] out from under the tracked value.
+#[derive(Resource, Default)]
+pub struct HostWindowResolution {
+    applied: Option<(u32, u32)>,
+}
+
+impl HostWindowResolution {
+    /// The client size last applied or observed, for tests.
+    pub fn applied(&self) -> Option<(u32, u32)> {
+        self.applied
+    }
+}
+
+/// Pure resize decision for [`sync_host_window_resolution`].
+///
+/// Returns the new client size the host window should take, or `None` to
+/// leave it alone:
+///
+/// * the game changed its declared size (`declared != applied`) → resize the
+///   host window to match;
+/// * first observation → adopt `declared` unless the host already matches;
+/// * otherwise (the user resized the OS window, `declared == applied`) →
+///   leave the host window alone so the renderer's aspect-preserving camera
+///   scales the game instead of fighting the WM.
+fn host_window_resize(
+    declared: (u32, u32),
+    host: (u32, u32),
+    applied: Option<(u32, u32)>,
+) -> Option<(u32, u32)> {
+    if declared.0 == 0 || declared.1 == 0 {
+        return None;
+    }
+    match applied {
+        Some(previous) if previous != declared => Some(declared),
+        None if host != declared => Some(declared),
+        _ => None,
+    }
+}
+
+/// The `System` context currently installed in `tvp_natives`, kept as a Bevy
+/// resource so [`sync_host_window_resolution`] can update just the virtual
+/// screen size as the game changes its window client size (the startup
+/// context pins `System.screenWidth`/`screenHeight`, and `tvp_natives` has no
+/// getter to read it back).
+#[derive(Resource, Clone)]
+pub struct SystemContextState(pub tvp_natives::SystemContext);
+
+/// Apply the game's declared window client size to the host OS window, and
+/// keep `System.screenWidth`/`screenHeight` in sync.
+///
+/// Game-initiated (`Window.setSize` / `setInnerSize` / `setZoom` /
+/// `changeScreenMode`) writes [`WindowState::inner_size`]; this system pushes
+/// that to the Bevy window so the OS window actually changes size. The scene
+/// camera itself projects the primary layer (see [`window_logical_size`]), so
+/// the game content is then scaled by `ScalingMode::AutoMin` — no scene
+/// resize is needed.
+///
+/// An **interactive** OS resize is intentionally *not* mirrored back into the
+/// scene: the camera scales automatically and cursor mapping reads the live
+/// Bevy window size, so the game's declared size stays authoritative. (Host
+/// only: winit owns the interactive resize; script `onResizing` /
+/// `onMoveSizeEnd` events and a real fullscreen toggle are not dispatched
+/// here — `changeScreenMode`'s OS-level part stays with the host.)
+pub fn sync_host_window_resolution(
+    mut windows: Query<&mut Window>,
+    shared: Res<SharedScene>,
+    mut state: ResMut<HostWindowResolution>,
+    system_ctx: Option<ResMut<SystemContextState>>,
+) {
+    let Some(mut window) = windows.iter_mut().next() else {
+        return;
+    };
+    let host = (
+        window.width().round().max(0.0) as u32,
+        window.height().round().max(0.0) as u32,
+    );
+    let declared = {
+        let scene = shared.0.read().expect("shared scene lock poisoned");
+        scene.windows.first().map(|w| w.inner_size)
+    };
+    let Some(declared) = declared else {
+        return;
+    };
+    // `System.screenWidth`/`screenHeight` report the game's declared virtual
+    // screen (the TODO's "logical size stays 1280x720" fix). Updating the
+    // installed context only when it actually changes avoids re-locking it
+    // every frame.
+    if let Some(mut ctx) = system_ctx
+        && ctx.0.screen_size != declared
+    {
+        ctx.0.screen_size = declared;
+        tvp_natives::set_system_context(ctx.0.clone());
+    }
+    match host_window_resize(declared, host, state.applied) {
+        Some(size) => {
+            window.resolution.set(size.0 as f32, size.1 as f32);
+            state.applied = Some(size);
+        }
+        None if state.applied.is_none() => {
+            state.applied = Some(declared);
+        }
+        None => {}
+    }
 }
 
 /// The scene → Bevy sync system. Run in `Update`, after the VM tick mutates
@@ -274,7 +413,10 @@ pub fn sync_scene(
 ) {
     let scene = shared.0.read().expect("shared scene lock poisoned");
 
-    let projection_size = scene.windows.first().map(|w| logical_size(w.inner_size));
+    let projection_size = scene
+        .windows
+        .first()
+        .map(|w| window_logical_size(&scene, w));
 
     // Idle fast path: the scene has not mutated since the last sync, the
     // camera projection is current, and the window set is unchanged. The
@@ -353,7 +495,7 @@ pub fn sync_scene(
         if !window.visible {
             continue;
         }
-        let (win_w, win_h) = window.inner_size;
+        let (win_w, win_h) = window_logical_size(&scene, window);
         let win_opacity = clamp_opacity(window.opacity);
 
         for (index, layer_id) in scene.window_layer_order(window.id).into_iter().enumerate() {
@@ -1188,6 +1330,31 @@ mod tests {
         }
     }
 
+    /// An OS window resize on a zoomed game keeps the forward and inverse
+    /// cursor transforms exact: the game's logical resolution stays 1280×720
+    /// (the primary layer) while the OS window varies (1920×1080 at 150 %,
+    /// an arbitrary interactive size, or a letterboxed aspect).
+    #[test]
+    fn cursor_mapping_stays_exact_across_zoom_and_os_resize() {
+        let game = (1280u32, 720u32);
+        for window in [
+            (1920.0f32, 1080.0f32),
+            (1600.0, 900.0),
+            (2560.0, 1440.0),
+            (1000.0, 720.0),
+        ] {
+            let transform = window_to_game_transform(window, game);
+            for (gx, gy) in [(0.0f32, 0.0f32), (640.0, 360.0), (1279.0, 719.0)] {
+                let (px, py) = window_point(gx, gy, transform);
+                let (rx, ry) = game_point(px, py, transform);
+                assert!(
+                    (rx - gx).abs() < 1e-3 && (ry - gy).abs() < 1e-3,
+                    "{window:?}: game ({gx},{gy}) -> window ({px},{py}) -> game ({rx},{ry})"
+                );
+            }
+        }
+    }
+
     /// Read the single [`SceneCamera`]'s entity.
     fn single_camera(app: &mut App) -> Entity {
         let world = app.world_mut();
@@ -1217,6 +1384,9 @@ mod tests {
     /// The camera projection must follow a runtime `inner_size` change (the
     /// in-game config resolution option) instead of staying pinned to the size
     /// captured when the camera was spawned. The camera entity is reused.
+    ///
+    /// This is the *fallback* path: a window with no sized primary layer has
+    /// nothing else to project.
     #[test]
     fn camera_projection_tracks_window_inner_size_changes() {
         let mut scene = Scene::default();
@@ -1246,11 +1416,162 @@ mod tests {
         );
     }
 
+    /// The logical size is the **primary layer** (the game's rendering
+    /// surface), not the possibly-zoomed window client size. A 1280×720
+    /// primary layer in a 1920×1080 (150 % zoom) window must stay centered and
+    /// keep projecting 1280×720 — otherwise the artwork would shrink into the
+    /// corner and input coordinates would leave the game's space.
+    #[test]
+    fn logical_size_follows_primary_layer_not_zoomed_client_size() {
+        let mut scene = Scene::default();
+        let win = scene.add_window("t", (1920, 1080));
+        let primary = scene.add_layer(win, None);
+        scene.layer_mut(primary).unwrap().rect = Rect {
+            x: 0,
+            y: 0,
+            w: 1280,
+            h: 720,
+        };
+        scene.layer_mut(primary).unwrap().fill_color = Some([10, 20, 30, 255]);
+        let shared = SharedScene(Arc::new(RwLock::new(scene)));
+        let mut app = app_with_sync(shared.clone());
+        app.update();
+
+        // The camera projects the game surface, not the zoomed client size.
+        assert_camera_projection(&mut app, 1280.0, 720.0);
+        // The 1280×720 primary layer is centered exactly (no corner offset).
+        let world = app.world_mut();
+        let mut q = world.query_filtered::<(&SceneSprite, &Transform), With<SceneSprite>>();
+        let (_, transform) = q.single(world).expect("primary layer sprite");
+        assert_eq!(transform.translation, Vec3::ZERO);
+
+        let scene = shared.0.read().unwrap();
+        let window = scene.windows.first().unwrap();
+        assert_eq!(window_logical_size(&scene, window), (1280, 720));
+    }
+
+    /// A game-initiated change to its rendering surface (the primary layer's
+    /// size) must retarget the camera projection, and the camera entity is
+    /// reused.
+    #[test]
+    fn camera_projection_tracks_primary_layer_resize() {
+        let mut scene = Scene::default();
+        let win = scene.add_window("t", (1280, 720));
+        let primary = scene.add_layer(win, None);
+        scene.layer_mut(primary).unwrap().rect = Rect {
+            x: 0,
+            y: 0,
+            w: 1280,
+            h: 720,
+        };
+        scene.layer_mut(primary).unwrap().fill_color = Some([0, 0, 0, 255]);
+        let shared = SharedScene(Arc::new(RwLock::new(scene)));
+        let mut app = app_with_sync(shared.clone());
+        app.update();
+
+        assert_camera_projection(&mut app, 1280.0, 720.0);
+        let camera_before = single_camera(&mut app);
+
+        {
+            let mut scene = shared.0.write().unwrap();
+            let layer = scene.layer_mut(primary).unwrap();
+            layer.rect.w = 1920;
+            layer.rect.h = 1080;
+        }
+        app.update();
+
+        assert_camera_projection(&mut app, 1920.0, 1080.0);
+        assert_eq!(single_camera(&mut app), camera_before);
+    }
+
+    /// The OS-window resize decision: a game-initiated change is applied, an
+    /// interactive OS resize is left alone, and the first observation adopts
+    /// the game's declared size.
+    #[test]
+    fn host_window_resize_only_follows_game_changes() {
+        // First observation adopts a different declared size.
+        assert_eq!(
+            host_window_resize((1024, 768), (1280, 720), None),
+            Some((1024, 768))
+        );
+        // First observation where the host already matches: nothing to do.
+        assert_eq!(host_window_resize((1280, 720), (1280, 720), None), None);
+        // The game changed its declared size: apply it.
+        assert_eq!(
+            host_window_resize((1920, 1080), (1280, 720), Some((1280, 720))),
+            Some((1920, 1080))
+        );
+        // Interactive OS resize (declared == applied): leave the host alone.
+        assert_eq!(
+            host_window_resize((1280, 720), (1600, 900), Some((1280, 720))),
+            None
+        );
+        // Degenerate declared size: ignore.
+        assert_eq!(host_window_resize((0, 0), (1280, 720), None), None);
+    }
+
+    /// A `Window.setSize`/`setZoom` pushes the declared client size to the
+    /// Bevy OS window and updates `System.screenWidth`/`screenHeight`.
+    #[test]
+    fn sync_host_window_resolution_resizes_os_window_and_updates_system_screen() {
+        let mut scene = Scene::default();
+        let win = scene.add_window("t", (1280, 720));
+        let shared = SharedScene(Arc::new(RwLock::new(scene)));
+
+        let mut app = App::new();
+        app.insert_resource(shared.clone())
+            .init_resource::<HostWindowResolution>()
+            .insert_resource(SystemContextState(tvp_natives::SystemContext {
+                project_dir: std::path::PathBuf::from("/tmp"),
+                app_data_dir: std::path::PathBuf::from("/tmp"),
+                screen_size: (1280, 720),
+                desktop_origin: (0, 0),
+                desktop_size: (1920, 1080),
+                touch_device: false,
+            }))
+            .add_systems(Update, sync_host_window_resolution);
+        app.world_mut().spawn(Window::default());
+        app.update();
+
+        // The game zooms to 150 %: `setInnerSize(1920, 1080)`.
+        shared
+            .0
+            .write()
+            .unwrap()
+            .window_mut(win)
+            .unwrap()
+            .inner_size = (1920, 1080);
+        app.update();
+
+        let world = app.world_mut();
+        let mut q = world.query::<&Window>();
+        let window = q.single(world).expect("host window");
+        assert_eq!((window.width(), window.height()), (1920.0, 1080.0));
+        assert_eq!(
+            world.resource::<SystemContextState>().0.screen_size,
+            (1920, 1080)
+        );
+        assert_eq!(
+            world.resource::<HostWindowResolution>().applied(),
+            Some((1920, 1080))
+        );
+    }
+
     #[test]
     fn hierarchy_composes_position_opacity_visibility_and_order() {
         let mut scene = Scene::default();
         let win = scene.add_window("t", (640, 480));
         scene.window_mut(win).unwrap().opacity = 0.8;
+        // The window's screen surface: the first layer becomes the primary
+        // layer and defines the logical resolution (640x480).
+        let screen = scene.add_layer(win, None);
+        scene.layer_mut(screen).unwrap().rect = Rect {
+            x: 0,
+            y: 0,
+            w: 640,
+            h: 480,
+        };
+        scene.layer_mut(screen).unwrap().visible = true;
         let parent = scene.add_layer(win, None);
         scene.layer_mut(parent).unwrap().rect = Rect {
             x: 100,
@@ -1295,10 +1616,12 @@ mod tests {
         }
         // Parent is centered at TVP (200,90) -> Bevy (-120,150); child is
         // relative to its parent at TVP rect origin (112,48), with its own
-        // 20x10 center at (122,53) -> Bevy (-198,187).
-        assert_eq!(by_id[&parent].0, Vec3::new(-120.0, 150.0, 0.0));
-        assert_eq!(by_id[&child].0, Vec3::new(-198.0, 187.0, 1.0));
-        assert_eq!(by_id[&sibling].0.z, 2.0);
+        // 20x10 center at (122,53) -> Bevy (-198,187). The full-window
+        // primary `screen` layer is index 0, so parent/child/sibling are
+        // z = 1/2/3.
+        assert_eq!(by_id[&parent].0, Vec3::new(-120.0, 150.0, 1.0));
+        assert_eq!(by_id[&child].0, Vec3::new(-198.0, 187.0, 2.0));
+        assert_eq!(by_id[&sibling].0.z, 3.0);
         assert!((by_id[&child].1 - 0.8 * 0.5 * 0.5).abs() < 1e-6);
         assert!(by_id[&parent].0.z < by_id[&child].0.z);
         assert!(by_id[&child].0.z < by_id[&sibling].0.z);
@@ -1328,6 +1651,14 @@ mod tests {
     fn additive_layer_spawns_gpu_blend_material_quad() {
         let mut scene = Scene::default();
         let win = scene.add_window("t", (1280, 720));
+        // Full-window primary layer: the logical screen surface.
+        let screen = scene.add_layer(win, None);
+        scene.layer_mut(screen).unwrap().rect = Rect {
+            x: 0,
+            y: 0,
+            w: 1280,
+            h: 720,
+        };
         let bmp_id = scene.add_bitmap(32, 32, vec![0u8; 32 * 32 * 4]);
         let layer = scene.add_layer(win, None);
         {
@@ -1346,13 +1677,16 @@ mod tests {
         app.update();
 
         let world = app.world_mut();
-        // No plain Sprite: the built-in pipeline cannot composite additively.
-        assert_eq!(
-            world
-                .query_filtered::<&Sprite, With<SceneSprite>>()
-                .iter(world)
-                .count(),
-            0,
+        // The additive layer itself must not render as a source-over sprite
+        // (the full-window primary screen layer is a plain Sprite).
+        let additive_entity = world
+            .query_filtered::<(Entity, &SceneSprite), With<SceneSprite>>()
+            .iter(world)
+            .find(|(_, marker)| marker.layer_id == layer)
+            .map(|(entity, _)| entity)
+            .expect("additive layer spawned");
+        assert!(
+            world.entity(additive_entity).get::<Sprite>().is_none(),
             "additive layer must not render as a source-over sprite"
         );
         let (marker, mesh, material, transform) = world
@@ -1378,8 +1712,9 @@ mod tests {
 
         // Same placement rules as sprites: center + rect size as scale.
         // TVP rect (100,200,32x32) in 1280x720 → Bevy
-        // (100+16-640, 360-(200+16)) = (-524, 144), z=0.
-        assert_eq!(transform.translation, Vec3::new(-524.0, 144.0, 0.0));
+        // (100+16-640, 360-(200+16)) = (-524, 144), z=1 (after the primary
+        // screen layer).
+        assert_eq!(transform.translation, Vec3::new(-524.0, 144.0, 1.0));
         assert_eq!(transform.scale, Vec3::new(32.0, 32.0, 1.0));
 
         // The dirty flag of the uploaded bitmap was still cleared.
