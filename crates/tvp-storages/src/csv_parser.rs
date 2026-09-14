@@ -154,6 +154,7 @@ pub fn register_csv_parser(engine: &Tjs2Engine) -> Result<(), String> {
         name: "CSVParser",
         create: csv_parser_create,
         destroy: csv_parser_destroy,
+        invalidate: None,
         methods: vec![
             NativeInstanceMethodDef {
                 name: "CSVParser",

@@ -1134,6 +1134,7 @@ pub(crate) fn register_bitmap(engine: &Tjs2Engine) -> Result<(), String> {
         name: "Bitmap",
         create: bitmap_create,
         destroy: bitmap_destroy,
+        invalidate: None,
         methods: vec![
             NativeInstanceMethodDef {
                 name: "Bitmap",

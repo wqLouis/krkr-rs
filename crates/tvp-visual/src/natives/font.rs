@@ -964,6 +964,7 @@ pub(crate) fn register_font(engine: &Tjs2Engine) -> Result<(), String> {
         name: "Font",
         create: font_create,
         destroy: font_destroy,
+        invalidate: None,
         methods: vec![
             NativeInstanceMethodDef {
                 name: "Font",

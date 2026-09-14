@@ -144,6 +144,12 @@ pub struct LayerState {
     /// bitmap onto the visible outer layer, so this flag is what makes the
     /// intro logo and every `Sprite`/`AffineLayer` render.
     pub pending_paint: bool,
+    /// Reference `tTJSNI_BaseLayer::Shutdown`: set by `Invalidate`
+    /// (`LayerIntf.cpp:516`). A shut-down layer is inert — hit-testing,
+    /// input dispatch, `onPaint` polling and rendering must not touch it.
+    /// The record stays in the table only until the script reference drops
+    /// and [`Scene::destroy_layer`] removes it.
+    pub shutdown: bool,
 }
 
 /// One decoded bitmap (RGBA8, straight alpha).
@@ -354,6 +360,7 @@ impl Scene {
             font_id: None,
             is_primary: false,
             pending_paint: false,
+            shutdown: false,
         });
         self.layer_index.insert(id, self.layers.len() - 1);
         // First layer of a window becomes its primary layer, which the
@@ -696,11 +703,7 @@ impl Scene {
         // The removed layer owns its lazily-allocated font; drop it with the
         // layer (a surviving child keeps its own font).
         if let Some(font_id) = font_id {
-            self.fonts.retain(|f| f.id != font_id);
-            self.font_index.clear();
-            for (index, font) in self.fonts.iter().enumerate() {
-                self.font_index.insert(font.id, index);
-            }
+            self.remove_font(font_id);
         }
         // Indices shifted: rebuild the id→index map.
         self.layer_index.clear();
@@ -718,6 +721,63 @@ impl Scene {
             }
         }
         self.touch();
+    }
+
+    /// Reference `tTJSNI_BaseLayer::Invalidate` (`LayerIntf.cpp:515`): the
+    /// explicit native teardown the script triggers with `invalidate layer`.
+    /// This is the **cycle breaker**: it detaches the layer from its window
+    /// and parent, parts each direct child (the children become window roots
+    /// and stay alive — the script's reference counts decide their fate),
+    /// and releases the resources the layer owns (MainImage, province plane,
+    /// font, primary slot).
+    ///
+    /// The layer is fully unregistered from the scene here — the reference's
+    /// `Manager->UnregisterSelfFromWindow()` / `Manager->Release()` leave it
+    /// detached and inert, and the script has already invalidated it. The
+    /// later [`Scene::destroy_layer`] (when the TJS reference count finally
+    /// drops) is then a no-op. This is [`Scene::remove_layer`]'s `Part()`
+    /// semantics — it must **not** recurse into the child subtree. Keeping
+    /// the inert record instead let invalidated scenes accumulate forever
+    /// (their TJS objects are retained by script state).
+    pub fn invalidate_layer(&mut self, id: u32) {
+        if self.layer(id).is_none() {
+            return;
+        }
+        // Mark it inert first so a re-entrant query cannot touch it while the
+        // tree is being parted.
+        if let Some(l) = self.layer_mut(id) {
+            l.shutdown = true;
+            l.pending_paint = false;
+        }
+        self.remove_layer(id);
+    }
+
+    /// Drop a font record and rebuild the id→index map.
+    fn remove_font(&mut self, font_id: u32) {
+        self.fonts.retain(|f| f.id != font_id);
+        self.font_index.clear();
+        for (index, font) in self.fonts.iter().enumerate() {
+            self.font_index.insert(font.id, index);
+        }
+    }
+
+    /// Reference `tTJSNI_BaseWindow::Invalidate` (`WindowIntf.cpp:175`): the
+    /// window invalidates every object registered to it (`ObjectVector`) and
+    /// severs its primary layer. In this port every layer whose `window` is
+    /// `window` is such a registered object, so invalidate each of them. The
+    /// window keeps no strong TJS reference to its layers, but this still
+    /// detaches the tree and releases the per-layer resources so an
+    /// `invalidate win` cannot leave the layer tree rooted.
+    pub fn invalidate_window(&mut self, window: u32) {
+        let ids: Vec<u32> = self
+            .layers
+            .iter()
+            .filter(|layer| layer.window == window)
+            .map(|layer| layer.id)
+            .collect();
+        for id in ids {
+            self.invalidate_layer(id);
+        }
     }
 
     /// Destroy a layer and its **entire** child subtree — the reference
@@ -1269,7 +1329,11 @@ impl Scene {
         // the sibling sorts below.
         let mut all_children: HashMap<Option<u32>, Vec<u32>> = HashMap::new();
         let mut window_layers: Vec<u32> = Vec::new();
-        for layer in self.layers.iter().filter(|l| l.window == window) {
+        for layer in self
+            .layers
+            .iter()
+            .filter(|l| l.window == window && !l.shutdown)
+        {
             window_layers.push(layer.id);
             all_children.entry(layer.parent).or_default().push(layer.id);
         }
@@ -1357,7 +1421,7 @@ impl Scene {
         visited: &mut HashSet<u32>,
     ) {
         let Some(layer) = self.layer(id) else { return };
-        if layer.window != window || !visited.insert(id) {
+        if layer.window != window || layer.shutdown || !visited.insert(id) {
             return;
         }
         order.push(id);

@@ -1837,6 +1837,7 @@ fn register_phase_vocoder(engine: &Tjs2Engine) -> Result<(), String> {
         name: "__TvpPhaseVocoder",
         create: phase_vocoder_create,
         destroy: phase_vocoder_destroy,
+        invalidate: None,
         methods: vec![],
         properties: vec![
             NativeInstancePropertyDef {
@@ -1880,6 +1881,7 @@ pub(crate) fn register_wavesound(engine: &Tjs2Engine) -> Result<(), String> {
         name: "WaveSoundBuffer",
         create: ws_create,
         destroy: ws_destroy,
+        invalidate: None,
         methods: vec![
             method("WaveSoundBuffer", ws_ctor),
             method("open", ws_open),

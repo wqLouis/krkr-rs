@@ -1720,6 +1720,7 @@ pub fn register_kagparser(engine: &Tjs2Engine) -> Result<(), String> {
         name: "KAGParser",
         create: kagparser_create,
         destroy: kagparser_destroy,
+        invalidate: None,
         methods: vec![
             NativeInstanceMethodDef {
                 name: "KAGParser",

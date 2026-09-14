@@ -307,6 +307,7 @@ pub(crate) fn register_gdiplus(engine: &Tjs2Engine) -> Result<(), String> {
         name: APPEARANCE_CLASS,
         create: appearance_create,
         destroy: appearance_destroy,
+        invalidate: None,
         methods: vec![
             NativeInstanceMethodDef {
                 name: APPEARANCE_CLASS, // class-name constructor hook

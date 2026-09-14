@@ -267,6 +267,7 @@ pub fn register_async_trigger(engine: &Tjs2Engine) -> Result<(), String> {
         name: "AsyncTrigger",
         create: async_trigger_create,
         destroy: async_trigger_destroy,
+        invalidate: None,
         methods: vec![
             NativeInstanceMethodDef {
                 name: "AsyncTrigger",

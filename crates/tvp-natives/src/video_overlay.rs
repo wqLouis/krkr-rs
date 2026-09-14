@@ -2311,6 +2311,7 @@ pub fn register_video_overlay(engine: &Tjs2Engine) -> Result<(), String> {
         name: "VideoOverlay",
         create: vo_create,
         destroy: vo_destroy,
+        invalidate: None,
         methods: vec![
             NativeInstanceMethodDef {
                 name: "VideoOverlay", // class-name ctor hook

@@ -98,6 +98,12 @@ pub type NativeCreateInstanceFn = extern "C" fn(engine: *mut c_void) -> *mut c_v
 /// when the TJS object is destroyed.
 pub type NativeDestroyInstanceFn = extern "C" fn(engine: *mut c_void, instance: *mut c_void);
 
+/// Tear down a payload's native resources when the TJS object is invalidated
+/// (reference `iTJSNativeInstance::Invalidate`). Optional: `None` means the
+/// payload is only released by [`NativeDestroyInstanceFn`]. The payload must
+/// stay valid after this call — the destroy callback still runs later.
+pub type NativeInvalidateInstanceFn = extern "C" fn(engine: *mut c_void, instance: *mut c_void);
+
 /// An instance method implemented in Rust: like [`NativeMethodFn`], plus
 /// `instance` — the opaque payload of the object the method was called on.
 pub type NativeInstanceMethodFn = extern "C" fn(
@@ -294,6 +300,7 @@ unsafe extern "C" {
         property_count: c_int,
         create_instance: NativeCreateInstanceFn,
         destroy_instance: NativeDestroyInstanceFn,
+        invalidate_instance: Option<NativeInvalidateInstanceFn>,
     ) -> c_int;
     /// Attach static (class-level) members to an already-registered native
     /// class (reference `TJS_END_NATIVE_STATIC_METHOD_DECL` /
@@ -576,6 +583,9 @@ pub struct NativeInstanceBuilder<'a> {
     pub name: &'a str,
     pub create: NativeCreateInstanceFn,
     pub destroy: NativeDestroyInstanceFn,
+    /// Optional native teardown hook (reference `Invalidate`). `None` keeps
+    /// the previous behaviour: the payload is released only at destroy.
+    pub invalidate: Option<NativeInvalidateInstanceFn>,
     pub methods: Vec<NativeInstanceMethodDef>,
     pub properties: Vec<NativeInstancePropertyDef>,
 }
@@ -955,6 +965,7 @@ impl Tjs2Engine {
                 c_properties.len() as c_int,
                 builder.create,
                 builder.destroy,
+                builder.invalidate,
             )
         };
         if rc != 0 {
@@ -2259,6 +2270,7 @@ mod tests {
             name: "Counter",
             create: counter_create,
             destroy: counter_destroy,
+            invalidate: None,
             methods: vec![
                 NativeInstanceMethodDef {
                     name: "Counter",
@@ -3269,6 +3281,7 @@ var ra = a.get(); var rb = b.get();",
             name: "ArrayNatives",
             create: array_create,
             destroy: array_destroy,
+            invalidate: None,
             methods: vec![NativeInstanceMethodDef {
                 name: "list",
                 f: array_list,
@@ -3999,6 +4012,7 @@ var ra = a.get(); var rb = b.get();",
             name: "ParentLike",
             create: parent_like_create,
             destroy: parent_like_destroy,
+            invalidate: None,
             methods: vec![],
             properties: vec![],
         }
@@ -4008,6 +4022,7 @@ var ra = a.get(); var rb = b.get();",
             name: "ChildLike",
             create: child_like_create,
             destroy: child_like_destroy,
+            invalidate: None,
             methods: vec![NativeInstanceMethodDef {
                 name: "ChildLike",
                 f: child_like_ctor,

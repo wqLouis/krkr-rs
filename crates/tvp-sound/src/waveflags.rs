@@ -175,6 +175,7 @@ pub(crate) fn register_waveflags(engine: &Tjs2Engine) -> Result<(), String> {
         name: "WaveFlags",
         create: wf_create,
         destroy: wf_destroy,
+        invalidate: None,
         methods: vec![
             NativeInstanceMethodDef {
                 name: "WaveFlags",

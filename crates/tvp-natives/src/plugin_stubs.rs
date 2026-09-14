@@ -85,6 +85,7 @@ fn register_one(engine: &Tjs2Engine, name: &'static str) -> Result<(), String> {
         name,
         create: noop_create,
         destroy: noop_destroy,
+        invalidate: None,
         methods: vec![NativeInstanceMethodDef {
             name, // class-name ctor hook
             f: noop_ctor,

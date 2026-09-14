@@ -477,6 +477,7 @@ pub fn register_trans(engine: &Tjs2Engine) -> Result<(), String> {
         name: "Trans",
         create: trans_create,
         destroy: trans_destroy,
+        invalidate: None,
         methods: vec![
             NativeInstanceMethodDef {
                 name: "Trans", // class-name ctor hook

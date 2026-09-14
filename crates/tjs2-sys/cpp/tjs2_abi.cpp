@@ -373,7 +373,17 @@ struct tjs2_param_frame_guard {
         : engine(e) {
         engine->param_stack.push_back({p, count});
     }
-    ~tjs2_param_frame_guard() { engine->param_stack.pop_back(); }
+    ~tjs2_param_frame_guard() {
+        engine->param_stack.pop_back();
+        // Drop the argument-derived object slot. `variant_to_value_one`
+        // records the last object argument so a handle-less
+        // `TjsValue::Object` can resolve against it *during* the callback;
+        // keeping it afterwards pins that object (and the whole scene it
+        // roots) alive across calls, defeating the reference-counted
+        // teardown. Results (`exec`/`eval`) still populate `last_object` for
+        // `tjs2_retain_value` after those calls.
+        engine->last_object.Clear();
+    }
 };
 
 // Convert a tjs2_value produced by a Rust native method callback into a
@@ -649,6 +659,9 @@ tjs_error tjs2_dispatch_native_property_set(tjs2_native_property_dispatch *self,
 
         char *out_error = nullptr;
         int rc = self->set(e, &value, &out_error);
+        // The write argument is no longer needed for handle-less object
+        // resolution (see the parameter-frame guard).
+        e->last_object.Clear();
 
         if(rc != 0) {
             std::string msg = out_error
@@ -752,6 +765,7 @@ class tjs2_native_instance : public TJS::tTJSNativeInstance {
 
     tjs2_engine *engine;
     tjs2_native_destroy_instance_fn destroy;
+    tjs2_native_invalidate_instance_fn invalidate;
     void *native_ptr;
     bool valid;       // payload allocated and not yet released
     bool invalidated; // finalized; direct dispatch must stop
@@ -769,9 +783,10 @@ class tjs2_native_instance : public TJS::tTJSNativeInstance {
 public:
     tjs2_native_instance(tjs2_engine *e,
                          tjs2_native_create_instance_fn create,
-                         tjs2_native_destroy_instance_fn d)
-        : engine(e), destroy(d), native_ptr(nullptr), valid(false),
-          invalidated(false) {
+                         tjs2_native_destroy_instance_fn d,
+                         tjs2_native_invalidate_instance_fn inv)
+        : engine(e), destroy(d), invalidate(inv), native_ptr(nullptr),
+          valid(false), invalidated(false) {
         native_ptr = create(e);
         valid = true;
     }
@@ -790,8 +805,18 @@ public:
     // keeps a script `finalize` able to set native properties
     // (`SelectItemBase.finalize`: `cursor = crDefault`) while still refusing
     // calls on a finalized object (the first-task guard).
+    //
+    // An optional Rust `invalidate` callback runs the native teardown now
+    // (reference concrete `Invalidate` bodies): it detaches the object from
+    // its owner and releases the resources it holds, breaking the
+    // script/native reference cycle so the object can reach refcount 0. The
+    // payload itself stays allocated for the later destructor.
     void Invalidate() override {
-        invalidated = true;
+        if(!invalidated) {
+            invalidated = true; // stop direct dispatch immediately
+            if(invalidate && native_ptr)
+                invalidate(engine, native_ptr);
+        }
         inherited::Invalidate();
     }
 
@@ -1028,6 +1053,9 @@ tjs_error tjs2_dispatch_native_instance_property_set(
 
         char *out_error = nullptr;
         int rc = self->set(e, instance, &value, &out_error, (void *)objthis);
+        // The write argument is no longer needed for handle-less object
+        // resolution (see the parameter-frame guard).
+        e->last_object.Clear();
 
         if(rc != 0) {
             std::string msg = out_error
@@ -1053,12 +1081,15 @@ class tjs2_native_class : public TJS::tTJSNativeClass {
     tjs2_engine *engine;
     tjs2_native_create_instance_fn create_instance;
     tjs2_native_destroy_instance_fn destroy_instance;
+    tjs2_native_invalidate_instance_fn invalidate_instance;
 
 public:
     tjs2_native_class(const ttstr &name, tjs2_engine *e,
                       tjs2_native_create_instance_fn c,
-                      tjs2_native_destroy_instance_fn d)
-        : inherited(name), engine(e), create_instance(c), destroy_instance(d) {}
+                      tjs2_native_destroy_instance_fn d,
+                      tjs2_native_invalidate_instance_fn inv)
+        : inherited(name), engine(e), create_instance(c), destroy_instance(d),
+          invalidate_instance(inv) {}
 
     // Public accessor for the constructor dispatch (CreateNativeInstance is
     // protected in the base class).
@@ -1067,7 +1098,8 @@ public:
 protected:
     TJS::iTJSNativeInstance *CreateNativeInstance() override {
         return new tjs2_native_instance(engine, create_instance,
-                                        destroy_instance);
+                                        destroy_instance,
+                                        invalidate_instance);
     }
 };
 
@@ -1756,7 +1788,8 @@ int tjs2_register_native_class_instance(
     const tjs2_native_instance_method *methods, int count,
     const tjs2_native_instance_property *properties, int property_count,
     tjs2_native_create_instance_fn create_instance,
-    tjs2_native_destroy_instance_fn destroy_instance) {
+    tjs2_native_destroy_instance_fn destroy_instance,
+    tjs2_native_invalidate_instance_fn invalidate_instance) {
     if(!e || !class_name_utf8 || count < 0 || (count > 0 && !methods) ||
        property_count < 0 || (property_count > 0 && !properties) ||
        !create_instance)
@@ -1781,7 +1814,8 @@ int tjs2_register_native_class_instance(
         tjs_int32 classid = TJS::TJSRegisterNativeClass(clsname.c_str());
 
         tjs2_native_class *cls =
-            new tjs2_native_class(clsname, e, create_instance, destroy_instance);
+            new tjs2_native_class(clsname, e, create_instance, destroy_instance,
+                                  invalidate_instance);
         native_class_holder holder(cls);
         cls->SetClassID(classid);
 

@@ -1174,6 +1174,7 @@ pub fn register_menu_item(engine: &Tjs2Engine) -> Result<(), String> {
         name: "MenuItem",
         create: menu_item_create,
         destroy: menu_item_destroy,
+        invalidate: None,
         methods: vec![
             NativeInstanceMethodDef {
                 name: "MenuItem",

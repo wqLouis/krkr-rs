@@ -264,36 +264,75 @@ extern "C" fn layer_destroy(_engine: *mut c_void, instance: *mut c_void) {
     // Drop the layer's side-table state so a reused scene id cannot inherit
     // it. (Only the constructed path owns scene state, but the auxiliary
     // tables are keyed purely by id and must always be cleared.)
-    LAYER_AFFINE
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .remove(&inst.id);
-    LAYER_TEXT_PARAMS
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .remove(&inst.id);
-    LAYER_HITTEST_WORK
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .remove(&inst.id);
-    {
-        let mut capture = LAYER_CAPTURE.lock().unwrap_or_else(|p| p.into_inner());
-        if capture.mouse == Some(inst.id) {
-            capture.mouse = None;
-        }
-        capture.touches.retain(|_, layer| *layer != inst.id);
-    }
-    {
-        let mut modals = MODAL_LAYERS.lock().unwrap_or_else(|p| p.into_inner());
-        for stack in modals.values_mut() {
-            stack.retain(|&id| id != inst.id);
-        }
-    }
+    clear_layer_side_tables(inst.id);
     // Drop the raw TJS-object registration: the registry does not AddRef, so
     // keeping it would let input dispatch call a freed object.
     super::clear_layer_tjs_object(inst.id);
     // SAFETY: instance came from Box::into_raw.
     unsafe { drop(Box::from_raw(instance as *mut LayerInst)) };
+}
+
+/// Cancel a layer's queued transition entries without firing the completion
+/// callback (the layer is being torn down / invalidated).
+fn cancel_layer_transition(id: u32) {
+    let mut pending = PENDING_TRANSITIONS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    pending.retain(|(layer_id, _)| *layer_id != id);
+}
+
+/// Clear every side-table entry keyed by a layer id (capture, modal stack,
+/// affine anchor, text params, hit-test work). Shared by destroy and the
+/// explicit `invalidate` teardown.
+fn clear_layer_side_tables(id: u32) {
+    LAYER_AFFINE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&id);
+    LAYER_TEXT_PARAMS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&id);
+    LAYER_HITTEST_WORK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&id);
+    {
+        let mut capture = LAYER_CAPTURE.lock().unwrap_or_else(|p| p.into_inner());
+        if capture.mouse == Some(id) {
+            capture.mouse = None;
+        }
+        capture.touches.retain(|_, layer| *layer != id);
+    }
+    {
+        let mut modals = MODAL_LAYERS.lock().unwrap_or_else(|p| p.into_inner());
+        for stack in modals.values_mut() {
+            stack.retain(|&layer| layer != id);
+        }
+    }
+}
+
+/// `invalidate` hook (reference `tTJSNI_BaseLayer::Invalidate`,
+/// `LayerIntf.cpp:515`): the explicit teardown the script triggers with
+/// `invalidate layer`. It stops the layer's transition, drops its side-table
+/// state and — most importantly — releases the retained
+/// `ActionOwner`/window (`LayerIntf.h:174`), breaking the layer ⇄ window
+/// reference cycle so the TJS reference count can reach zero. The scene
+/// layer is parted (children become window roots) and marked shutdown; the
+/// later `layer_destroy` removes it.
+extern "C" fn layer_invalidate(_engine: *mut c_void, instance: *mut c_void) {
+    // SAFETY: the trampoline passes the payload from layer_create.
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    // Release the strong window reference first: dropping it may run the
+    // Window destructor, which locks the scene, so do it before taking the
+    // lock below.
+    inst.action_owner = None;
+    cancel_layer_transition(inst.id);
+    clear_layer_side_tables(inst.id);
+    if inst.constructed {
+        let mut scene = context_scene_mut();
+        scene.invalidate_layer(inst.id);
+    }
 }
 
 /// TJS color `0xAARRGGBB` → RGBA (straight alpha), matching the reference
@@ -1884,7 +1923,7 @@ pub(crate) fn paint_poll(engine: &Tjs2Engine) {
         let mut scene = context_scene_mut();
         let mut ready = Vec::new();
         for layer in &mut scene.layers {
-            if layer.pending_paint {
+            if layer.pending_paint && !layer.shutdown {
                 layer.pending_paint = false;
                 ready.push(layer.id);
             }
@@ -8480,6 +8519,7 @@ pub(crate) fn register_layer(engine: &Tjs2Engine) -> Result<(), String> {
         name: "Layer",
         create: layer_create,
         destroy: layer_destroy,
+        invalidate: Some(layer_invalidate),
         methods,
         properties: vec![
             NativeInstancePropertyDef {
@@ -10108,37 +10148,49 @@ mod tests {
         assert_eq!(scene.windows.len(), 1);
     }
 
-    /// Destroying a parent's native instance must take its child subtree with
-    /// it (reference `Invalidate` + GC cascade), even while the child is still
-    /// referenced from the script. `remove_layer` alone kept the children as
-    /// window roots, which left a torn-down scene's images on screen.
+    /// Dropping a parent's native instance runs the reference `Invalidate`
+    /// teardown first (`tTJSCustomObject::Finalize` -> `Invalidate`), so its
+    /// direct children are **parted** to window roots rather than destroyed
+    /// with the parent. The children are removed once the script invalidates
+    /// and drops them (the reference teardown).
     #[test]
-    fn layer_destroy_removes_child_subtree() {
+    fn layer_destroy_parts_children_and_keeps_them() {
         let env = TestEnv::new("layer-destroy-subtree");
         env.run(
             "var w = new Window(); \
              var p = new Layer(w, null); \
              var c = new Layer(w, p); \
              var g = new Layer(w, c); \
-             var cid = c.id; var gid = g.id; \
+             var pid = p.id; var cid = c.id; var gid = g.id; \
              p = null;",
         )
         .unwrap();
-        let scene = env.scene();
-        // The child/grandchild TJS objects are still alive (`c`/`g`), but the
-        // destroyed parent's subtree must be gone from the scene.
+        let pid = env.eval_int("pid") as u32;
         let cid = env.eval_int("cid") as u32;
         let gid = env.eval_int("gid") as u32;
-        assert!(
-            scene.layer(cid).is_none(),
-            "child must be removed with its parent"
-        );
-        assert!(
-            scene.layer(gid).is_none(),
-            "grandchild must be removed with its parent"
-        );
-        let win = scene.windows.first().expect("window").id;
-        assert!(scene.window(win).unwrap().layers.is_empty());
+        {
+            let scene = env.scene();
+            assert!(scene.layer(pid).is_none(), "parent removed");
+            assert!(
+                scene.layer(cid).is_some(),
+                "child survives as a window root"
+            );
+            assert_eq!(scene.layer(cid).unwrap().parent, None);
+            assert_eq!(
+                scene.layer(gid).unwrap().parent,
+                Some(cid),
+                "grandchild stays under the child"
+            );
+            let win = scene.windows.first().expect("window").id;
+            assert!(scene.window_layer_order(win).contains(&cid));
+        }
+        // The script's teardown invalidates the children, breaking their
+        // native self-cycle, and drops them.
+        env.run("invalidate c; invalidate g; c = null; g = null; p = null; w = null;")
+            .unwrap();
+        let scene = env.scene();
+        assert!(scene.layer(cid).is_none(), "invalidated child removed");
+        assert!(scene.layer(gid).is_none(), "invalidated grandchild removed");
     }
 
     #[test]
@@ -11289,5 +11341,183 @@ mod tests {
              var l = new P(w, null); l.onPaint();",
         )
         .unwrap();
+    }
+
+    /// The trivial repro: an unreferenced layer must be destroyed by the
+    /// reference-count cascade (`layer_destroy` -> `destroy_layer`).
+    #[test]
+    fn unreferenced_layer_is_destroyed() {
+        let env = TestEnv::new("layer-unref");
+        env.run("var w = new Window(); var l = new Layer(w, null); l = null; w = null;")
+            .unwrap();
+        assert_eq!(env.scene().layers.len(), 0, "layer must be destroyed");
+    }
+
+    /// `invalidate` is the reference teardown the script uses on a scene
+    /// change. It parts the layer (unregistering it) and severs its direct
+    /// children (they become window roots and stay alive); the later script
+    /// drop removes the children's records.
+    #[test]
+    fn invalidate_parts_layer_and_keeps_children() {
+        let env = TestEnv::new("layer-invalidate-part");
+        env.run(
+            "var w = new Window(); var p = new Layer(w, null); var c = new Layer(w, p); \
+             var pid = p.id; var cid = c.id; invalidate p;",
+        )
+        .unwrap();
+        let pid = env.eval_int("pid") as u32;
+        let cid = env.eval_int("cid") as u32;
+        let scene = env.scene();
+        let win = scene.windows.first().expect("window").id;
+        assert!(
+            scene.layer(pid).is_none(),
+            "invalidated layer is unregistered"
+        );
+        assert_eq!(
+            scene.layer(cid).expect("child survives").parent,
+            None,
+            "child is part'ed to a window root"
+        );
+        let order = scene.window_layer_order(win);
+        assert!(!order.contains(&pid), "invalidated layer is not rendered");
+        assert!(order.contains(&cid), "child is still a window root");
+        drop(scene);
+        // Dropping the script references collapses the records.
+        env.run("invalidate c; p = null; c = null; w = null;")
+            .unwrap();
+        assert_eq!(env.scene().layers.len(), 0, "subtree collapses by refcount");
+    }
+
+    /// `invalidate` an intermediate layer parts only its direct children; the
+    /// grandchild stays under the child (the script reference count decides
+    /// the whole surviving subtree's fate). The children carry their own
+    /// native self-cycle (the method members' `ObjThis`), so they must be
+    /// invalidated too before their references can drop to zero, exactly as
+    /// the reference teardown does.
+    #[test]
+    fn invalidate_severs_only_direct_children() {
+        let env = TestEnv::new("layer-invalidate-gchild");
+        env.run(
+            "var w = new Window(); var p = new Layer(w, null); var c = new Layer(w, p.id); \
+             var g = new Layer(w, c.id); var cid = c.id; var gid = g.id; invalidate p;",
+        )
+        .unwrap();
+        let cid = env.eval_int("cid") as u32;
+        let gid = env.eval_int("gid") as u32;
+        {
+            let scene = env.scene();
+            assert_eq!(scene.layer(cid).unwrap().parent, None);
+            assert_eq!(
+                scene.layer(gid).unwrap().parent,
+                Some(cid),
+                "grandchild stays attached (only direct children are parted)"
+            );
+        }
+        env.run("invalidate c; invalidate g; g = null; c = null; p = null; w = null;")
+            .unwrap();
+        assert_eq!(env.scene().layers.len(), 0);
+    }
+
+    /// `invalidate` an intermediate layer releases the `ActionOwner` window
+    /// reference (the cycle breaker): afterwards the window object can reach
+    /// refcount 0 and be destroyed.
+    #[test]
+    fn invalidate_releases_action_owner() {
+        let env = TestEnv::new("layer-invalidate-owner");
+        env.run(
+            "var w = new Window(); var p = new Layer(w, null); \
+             invalidate p; p = null; w = null;",
+        )
+        .unwrap();
+        assert_eq!(env.scene().layers.len(), 0);
+    }
+
+    /// `invalidate` a primary layer: the window loses its primary and the
+    /// screen buffer / MainImage is released.
+    #[test]
+    fn invalidate_primary_releases_screen_buffer() {
+        let env = TestEnv::new("layer-invalidate-primary");
+        // Composite the primary so it owns a screen-buffer MainImage.
+        env.run(
+            "var w = new Window(); w.setSize(8, 8); \
+             var primary = new Layer(w, null); primary.setSize(8, 8); \
+             var child = new Layer(w, primary); child.setSize(8, 8); child.visible = true; \
+             child.hasImage = true; child.fillRect(0, 0, 8, 8, 0xffff0000); \
+             var dst = new Layer(w, null); dst.setSize(8, 8); dst.hasImage = true; \
+             dst.piledCopy(0, 0, primary, 0, 0, 8, 8); \
+             var primaryId = primary.id;",
+        )
+        .unwrap();
+        let (primary_id, screen_bmp) = {
+            let scene = env.scene();
+            let primary = scene
+                .layers
+                .iter()
+                .find(|l| l.is_primary)
+                .expect("primary layer");
+            (primary.id, primary.bitmap)
+        };
+        assert!(
+            screen_bmp.is_some(),
+            "composite allocated the screen buffer"
+        );
+        env.run("invalidate primary;").unwrap();
+        let scene = env.scene();
+        assert!(
+            scene
+                .window(0)
+                .is_none_or(|w| w.primary_layer != Some(primary_id)),
+            "window must lose its primary layer"
+        );
+        if let Some(bmp) = screen_bmp {
+            assert!(
+                scene.bitmap(bmp).is_none(),
+                "screen buffer is released with the invalidated primary"
+            );
+        }
+    }
+
+    /// Regression for the real bug: after building a scene with N owned
+    /// layers/bitmaps, invalidating + dropping the root must return the
+    /// scene to its starting baseline instead of accumulating forever.
+    #[test]
+    fn scene_rebuild_after_invalidate_returns_to_baseline() {
+        let env = TestEnv::new("layer-invalidate-rebuild");
+        let (base_layers, base_bitmaps) = {
+            let scene = env.scene();
+            (scene.layers.len(), scene.bitmaps.len())
+        };
+        env.run(
+            "var w = new Window(); var root = new Layer(w, null); var kids = []; \
+             for (var i = 0; i < 20; i = i + 1) { \
+                 var l = new Layer(w, root); l.setSize(4, 4); l.hasImage = true; \
+                 l.fillRect(0, 0, 4, 4, 0xff0000ff); kids.push(l); \
+             }",
+        )
+        .unwrap();
+        {
+            let scene = env.scene();
+            assert!(
+                scene.layers.len() >= 20,
+                "the scene really built the subtree"
+            );
+            assert!(scene.bitmaps.len() > base_bitmaps);
+        }
+        env.run(
+            "for (var j = 0; j < kids.length; j = j + 1) invalidate kids[j]; \
+             invalidate root; root = null; kids = null; w = null;",
+        )
+        .unwrap();
+        let scene = env.scene();
+        assert_eq!(
+            scene.layers.len(),
+            base_layers,
+            "invalidated subtree leaves no layers behind"
+        );
+        assert_eq!(
+            scene.bitmaps.len(),
+            base_bitmaps,
+            "invalidated subtree leaves no bitmaps behind"
+        );
     }
 }

@@ -415,6 +415,7 @@ pub(crate) fn register_timer(engine: &Tjs2Engine) -> Result<(), String> {
         name: "Timer",
         create: timer_create,
         destroy: timer_destroy,
+        invalidate: None,
         methods: vec![
             NativeInstanceMethodDef {
                 name: "Timer",

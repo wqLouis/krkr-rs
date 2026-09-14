@@ -1379,6 +1379,7 @@ fn register_storage_stream(engine: &Tjs2Engine) -> Result<(), String> {
         name: "__TvpStorageStream",
         create: stream_create,
         destroy: stream_destroy,
+        invalidate: None,
         methods: vec![
             NativeInstanceMethodDef {
                 name: "read",

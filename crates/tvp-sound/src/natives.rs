@@ -769,6 +769,7 @@ pub fn register_sound(engine: &Tjs2Engine, storage: Arc<Mutex<Storage>>) -> Resu
         name: "SoundBuffer",
         create: sb_create,
         destroy: sb_destroy,
+        invalidate: None,
         methods: vec![
             method("open", sb_open),
             method("getBufferId", sb_get_buffer_id),
@@ -782,6 +783,7 @@ pub fn register_sound(engine: &Tjs2Engine, storage: Arc<Mutex<Storage>>) -> Resu
         name: "SoundChannel",
         create: sc_create,
         destroy: sc_destroy,
+        invalidate: None,
         methods: vec![
             method("play", sc_play),
             method("stop", sc_stop),

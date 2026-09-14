@@ -83,6 +83,7 @@ pub fn register_chain_item_base(engine: &Tjs2Engine) -> Result<(), String> {
         name: "ChainItemBase",
         create: chain_item_base_create,
         destroy: chain_item_base_destroy,
+        invalidate: None,
         methods: vec![NativeInstanceMethodDef {
             name: "ChainItemBase", // class-name ctor hook
             f: chain_item_base_ctor,

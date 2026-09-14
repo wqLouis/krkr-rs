@@ -367,6 +367,19 @@ extern "C" fn window_destroy(_engine: *mut c_void, instance: *mut c_void) {
     unsafe { drop(Box::from_raw(instance as *mut WindowInst)) };
 }
 
+/// `invalidate` hook (reference `tTJSNI_BaseWindow::Invalidate`,
+/// `WindowIntf.cpp:175`): invalidate every layer registered to the window and
+/// sever the primary layer, so `invalidate win` does not leave the layer tree
+/// rooted at the (about-to-die) window.
+extern "C" fn window_invalidate(_engine: *mut c_void, instance: *mut c_void) {
+    // SAFETY: the trampoline passes the payload from window_create.
+    let inst = unsafe { instance_ref::<WindowInst>(instance) };
+    if inst.constructed {
+        let mut scene = context_scene_mut();
+        scene.invalidate_window(inst.id);
+    }
+}
+
 /// Remove a window and every layer attached to it from the scene.
 fn remove_window(scene: &mut Scene, id: u32) {
     let layer_ids: Vec<u32> = scene
@@ -2727,6 +2740,7 @@ pub(crate) fn register_window(engine: &Tjs2Engine) -> Result<(), String> {
         name: "Window",
         create: window_create,
         destroy: window_destroy,
+        invalidate: Some(window_invalidate),
         methods: vec![
             NativeInstanceMethodDef {
                 name: "Window",

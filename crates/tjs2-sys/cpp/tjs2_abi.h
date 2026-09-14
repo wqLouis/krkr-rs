@@ -324,6 +324,14 @@ typedef void *(*tjs2_native_create_instance_fn)(void *engine);
  * once when the TJS object is destroyed. */
 typedef void (*tjs2_native_destroy_instance_fn)(void *engine, void *instance);
 
+/* Tear down a payload's native resources when the TJS object is invalidated
+ * (reference `iTJSNativeInstance::Invalidate`, tjsNative.h:42). Optional;
+ * may be NULL. The payload is still released by
+ * tjs2_native_destroy_instance_fn when the object is destroyed, so the
+ * callback must leave the payload valid for the later destructor (the
+ * reference keeps the C++ instance alive until `Destruct`). */
+typedef void (*tjs2_native_invalidate_instance_fn)(void *engine, void *instance);
+
 /* An instance method implemented in Rust. Same conventions as
  * tjs2_native_method_fn, plus `instance`: the opaque payload created by
  * the create callback for the object the method was called on. */
@@ -371,7 +379,8 @@ int tjs2_register_native_class_instance(
     const tjs2_native_instance_method *methods, int count,
     const tjs2_native_instance_property *properties, int property_count,
     tjs2_native_create_instance_fn create_instance,
-    tjs2_native_destroy_instance_fn destroy_instance);
+    tjs2_native_destroy_instance_fn destroy_instance,
+    tjs2_native_invalidate_instance_fn invalidate_instance);
 
 /*
  * Attach static (class-level) members to an already-registered native class
