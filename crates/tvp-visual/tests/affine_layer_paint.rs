@@ -79,7 +79,7 @@ fn layer(scene: &Scene, id: u32) -> &LayerState {
 /// placement/size onto the target — the reference `AssignImages`
 /// (`LayerIntf.cpp:2394`).
 #[test]
-fn assign_images_layer_shares_bitmap_and_image_rect() {
+fn assign_images_layer_copies_bitmap_and_image_rect() {
     let env = Env::new();
     env.run(
         "var w = new Window(); \
@@ -95,11 +95,14 @@ fn assign_images_layer_shares_bitmap_and_image_rect() {
     let scene = env.scene();
     let parent = layer(&scene, 0);
     let child = layer(&scene, 1);
-    assert_eq!(
-        parent.bitmap, child.bitmap,
-        "parent shares the child bitmap"
+    assert!(
+        parent.bitmap.is_some() && parent.bitmap != child.bitmap,
+        "parent gets its own copy of the child bitmap (not a shared id)"
     );
-    assert_eq!(parent.bitmap, Some(0), "bitmap id attached");
+    let pb = parent.bitmap.and_then(|id| scene.bitmap(id)).unwrap();
+    let cb = child.bitmap.and_then(|id| scene.bitmap(id)).unwrap();
+    assert_eq!((pb.width, pb.height), (cb.width, cb.height));
+    assert_eq!(pb.rgba, cb.rgba, "copied pixels match");
     assert_eq!(
         (parent.image_left, parent.image_top),
         (-4, -6),
@@ -198,7 +201,10 @@ fn on_paint_direct_call_composites_hidden_image() {
     let scene = env.scene();
     let p = layer(&scene, 0);
     let img = layer(&scene, 1);
-    assert_eq!(p.bitmap, img.bitmap, "visible outer carries the bitmap");
+    assert!(
+        p.bitmap.is_some() && p.bitmap != img.bitmap,
+        "visible outer carries its own copy of the child bitmap"
+    );
     assert_eq!((p.image_left, p.image_top), (-2, -3));
     assert_eq!((p.rect.w, p.rect.h), (24, 12));
     assert!(!img.visible, "_image child stays hidden (no double draw)");
@@ -240,7 +246,10 @@ fn update_then_paint_poll_dispatches_on_paint() {
     let scene = env.scene();
     let p = layer(&scene, 0);
     let img = layer(&scene, 1);
-    assert_eq!(p.bitmap, img.bitmap, "paint_poll copied the child bitmap");
+    assert!(
+        p.bitmap.is_some() && p.bitmap != img.bitmap,
+        "paint_poll gave the outer its own copy of the child bitmap"
+    );
     assert_eq!((p.image_left, p.image_top), (-5, -7));
     assert_eq!((p.image_width, p.image_height), (40, 20));
     assert_eq!((p.rect.w, p.rect.h), (40, 20));

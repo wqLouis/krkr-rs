@@ -1554,13 +1554,48 @@ extern "C" fn layer_assign_images(
         })
     };
     if let Some((bitmap, image_left, image_top, image_width, image_height, w, h)) = layer_src {
+        // Reference `AssignImages` **copies** the source MainImage
+        // (`MainImage->Assign(*src)` / `new tTVPBaseTexture(*src)`,
+        // `LayerIntf.cpp:2394`) — it does not share pixels. Sharing let an
+        // `AffineLayer` resize the same bitmap its inner `_image` used, which
+        // desynced `image_width` from the bitmap and squished/cropped the
+        // image. Reuse the target's own bitmap when it has one (so the
+        // per-frame `AffineLayer.onPaint` does not allocate a new image).
+        let src_pixels = bitmap
+            .and_then(|id| scene.bitmap(id))
+            .map(|b| (b.width, b.height, b.rgba.clone()));
+        let copied = match src_pixels {
+            Some((cw, ch, rgba)) => {
+                let id = match scene.layer(inst.id).and_then(|l| l.bitmap) {
+                    Some(existing) => existing,
+                    None => scene.add_bitmap(cw, ch, vec![0u8; cw as usize * ch as usize * 4]),
+                };
+                if let Some(b) = scene.bitmap_mut(id) {
+                    b.width = cw;
+                    b.height = ch;
+                    b.rgba = rgba;
+                    b.mark_dirty();
+                }
+                Some((cw, ch, id))
+            }
+            None => None,
+        };
         if let Some(target) = scene.layer_mut(inst.id) {
-            target.bitmap = bitmap;
+            match copied {
+                Some((cw, ch, id)) => {
+                    target.bitmap = Some(id);
+                    target.image_width = cw;
+                    target.image_height = ch;
+                }
+                None => {
+                    target.bitmap = None;
+                    target.image_width = image_width;
+                    target.image_height = image_height;
+                }
+            }
             target.clip = None;
             target.image_left = image_left;
             target.image_top = image_top;
-            target.image_width = image_width;
-            target.image_height = image_height;
             target.rect.w = w;
             target.rect.h = h;
             if let Some((province, pw, ph)) = province_src {
