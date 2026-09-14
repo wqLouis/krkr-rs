@@ -1427,9 +1427,30 @@ fn register_storage_stream(engine: &Tjs2Engine) -> Result<(), String> {
 /// This port has no portable headless file dialog, so it behaves like a user
 /// cancel in the reference (`TVPSelectFile` returns false): `param.name` is
 /// left untouched and the native returns `0`. The game's editor-launch path
-/// then falls back to its default editor. This is a documented remaining gap,
-/// not a silent success (see `docs/missing/07-text-storage.md`).
+/// then falls back to its default editor. This is a documented host-only gap
+/// (no portal/file-dialog backend is available headlessly), reported as a user
+/// cancel rather than a silent success.
 extern "C" fn native_select_file(
+    _engine: *mut c_void,
+    _argc: c_int,
+    _argv: *const Value,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+) -> c_int {
+    set_int_out(out, 0);
+    0
+}
+
+/// `Storages.selectDirectory(param)` — the built-in GUI folder selector.
+///
+/// Like [`native_select_file`] there is no portable headless folder dialog, so
+/// this behaves like a user cancel: `param.name` is left untouched and the
+/// native returns `0`. The KR game calls it from
+/// `system/window.tjs::selectScreenShotDirectory` (via
+/// `System.shellExecute("explorer", ...)`); without this member registered the
+/// call raised `Member "selectDirectory" does not exist` and aborted the
+/// screen-shot-directory flow. Documented host-only gap.
+extern "C" fn native_select_directory(
     _engine: *mut c_void,
     _argc: c_int,
     _argv: *const Value,
@@ -1637,6 +1658,10 @@ pub fn register_storages(engine: &Tjs2Engine) -> Result<(), String> {
             NativeMethodDef {
                 name: "selectFile",
                 f: native_select_file,
+            },
+            NativeMethodDef {
+                name: "selectDirectory",
+                f: native_select_directory,
             },
             NativeMethodDef {
                 name: "copyFile",

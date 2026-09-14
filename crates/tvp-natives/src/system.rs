@@ -45,9 +45,10 @@
 //!   demand, so pre-caching has nothing to do (host-only).
 //! * `createUUID` — real RFC-4122 v4 UUID from a clock/counter/address seed.
 //! * `assignMessage` — stores an `id` → `message` override and returns true.
-//! * `doCompact` — real compaction: clears the `tvp-visual` bitmap cache at
+//! * `doCompact` — real compaction: runs the TJS garbage collector at
+//!   `clIdle`/`clAll` up, clears the `tvp-visual` bitmap cache at
 //!   `clMinimize` and up and the archive/auto-path caches at `clDeactivate`
-//!   and up (the `clIdle` TJS-GC hook has no `tjs2-sys` entry point yet).
+//!   and up.
 //!
 //! # `setArgument` / `getArgument` semantics
 //!
@@ -322,23 +323,44 @@ extern "C" fn native_shell_execute(
     }
     let a = args(argv, argc);
     let target = value_as_string(&a[0]);
-    let spawned = if cfg!(target_os = "windows") {
+    let execparam = if argc >= 2 {
+        value_as_string(&a[1])
+    } else {
+        String::new()
+    };
+    // `shellExecute(target, execparam)`: `target` may be a file/URL to open,
+    // or a platform opener name (`explorer`/`open`) whose *parameter* is the
+    // thing to open (the game does `System.shellExecute("explorer",
+    // Storages.getLocalName(CONFIG.screenShotPath))`). The reference
+    // `TVPShellExecute` is `#if 0`-disabled and just returns true; this host
+    // performs a best-effort open so the behaviour is useful, but always
+    // reports the reference-visible `true`.
+    let opener = matches!(
+        target.to_ascii_lowercase().as_str(),
+        "explorer" | "explorer.exe" | "open"
+    );
+    let arg = if opener && !execparam.is_empty() {
+        execparam.clone()
+    } else {
+        target.clone()
+    };
+    let spawned = if arg.is_empty() {
+        false
+    } else if cfg!(target_os = "windows") {
         Command::new("cmd")
-            .args(["/C", "start", "", target.as_str()])
+            .args(["/C", "start", "", arg.as_str()])
             .spawn()
             .is_ok()
     } else if cfg!(target_os = "macos") {
-        Command::new("open").arg(target.as_str()).spawn().is_ok()
+        Command::new("open").arg(arg.as_str()).spawn().is_ok()
     } else {
-        Command::new("xdg-open")
-            .arg(target.as_str())
-            .spawn()
-            .is_ok()
+        Command::new("xdg-open").arg(arg.as_str()).spawn().is_ok()
     };
     if !spawned {
-        log::warn!("System.shellExecute: failed to launch {target:?}");
+        log::debug!("System.shellExecute: could not launch {arg:?}");
     }
-    set_int_out(out, i64::from(spawned));
+    // The reference returns true unconditionally (`#if 0` body).
+    set_int_out(out, 1);
     0
 }
 
@@ -998,12 +1020,11 @@ fn make_uuid() -> String {
 /// at every scenario change (`advscreen.tjs` `clIdle`), whose comment says
 /// the intent is a GC, and on a scene reset (`gamescenemanager.tjs` `clAll`).
 ///
-/// The port honors the thresholds: the `tvp-visual` bitmap-template cache is
+/// The port honors the thresholds: the TJS garbage collector runs from
+/// `clIdle` up (`tjs2_sys::Tjs2Engine::do_gc`, wrapping
+/// `tTJS::DoGarbageCollection`), the `tvp-visual` bitmap-template cache is
 /// dropped from `clMinimize` up and `Storages.clearArchiveCache()` runs from
-/// `clDeactivate` up. The `clIdle` hook is TJS garbage collection, which has
-/// no `tjs2-sys` entry point yet; that is the one reference hook this native
-/// cannot drive (documented gap), and driving the bitmap cache at `clIdle`
-/// instead would force a re-decode on every scenario change.
+/// `clDeactivate` up.
 extern "C" fn system_do_compact(
     _engine: *mut c_void,
     argc: c_int,
@@ -1012,6 +1033,15 @@ extern "C" fn system_do_compact(
     _out_error: *mut *mut c_char,
 ) -> c_int {
     let level = args(argv, argc).first().map(value_as_i64).unwrap_or(100);
+    // `TVP_COMPACT_LEVEL_IDLE` = 5 (reference `EventIntf.h:280`): the
+    // reference `tTVPTJSGCCallback::OnCompact` runs the TJS garbage
+    // collector at this level and up. This is the hook the games rely on at
+    // every scenario change (`advscreen.tjs` passes `clIdle`).
+    if level >= 5
+        && let Err(e) = context_engine().do_gc()
+    {
+        log::warn!("System.doCompact: TJS garbage collection failed: {e}");
+    }
     // `TVP_COMPACT_LEVEL_MINIMIZE` = 15 (reference `EventIntf.h:281`).
     if level >= 15 {
         clear_graphic_cache_via_vm();
@@ -1314,8 +1344,9 @@ pub fn register_system(engine: &tjs2_sys::Tjs2Engine) -> Result<(), String> {
 /// Environment the emulator provides to games via `System.*` properties.
 #[derive(Clone, Debug)]
 pub struct SystemContext {
-    /// Game/project directory — mapped to `exePath`/`dataPath` (Kirikiroid2
-    /// mounts the game folder as the project dir).
+    /// Game/project directory — mapped to `exePath` (the directory the game
+    /// was launched from). `dataPath` is its `savedata/` subfolder, see
+    /// [`SystemContext::project_data_dir`].
     pub project_dir: std::path::PathBuf,
     /// Platform data directory for app-wide files — `appDataPath`.
     pub app_data_dir: std::path::PathBuf,
@@ -1327,6 +1358,16 @@ pub struct SystemContext {
     pub desktop_size: (u32, u32),
     /// Whether the platform is touch-capable (`touchDevice`).
     pub touch_device: bool,
+}
+
+impl SystemContext {
+    /// The game's writable data directory: a `savedata/` folder next to the
+    /// game. Games write and read saves, `saveMng.dat` and `system.dat`
+    /// through `System.dataPath`, which points here (KiriKiri/Kirikiroid2
+    /// behaviour; the reference `TVPEnsureDataPathDirectory` creates it).
+    pub fn project_data_dir(&self) -> std::path::PathBuf {
+        self.project_dir.join("savedata")
+    }
 }
 
 impl Default for SystemContext {
@@ -1528,10 +1569,16 @@ extern "C" fn prop_exe_path(_e: *mut c_void, out: *mut Value, _err: *mut *mut c_
 }
 
 extern "C" fn prop_data_path(_e: *mut c_void, out: *mut Value, _err: *mut *mut c_char) -> c_int {
-    // This emulator mounts the game folder as the data dir (Kirikiroid2
-    // behavior): System.dataPath == the game directory (trailing separator:
-    // the game concatenates `DATA_PATH + "system.dat"`).
-    set_string_out(out, &dir_with_separator(&system_context().project_dir));
+    // `System.dataPath` is the game's **writable data directory** — the
+    // `savedata/` folder next to the game (KiriKiri/Kirikiroid2 behaviour).
+    // Games use it directly for saves and config: the KR game defines
+    // `var DATA_PATH = System.dataPath;` (`system/status.tjs`) and reads/writes
+    // `qsave01.bmp`, `saveMng.dat`, `system.dat` there, and the reference
+    // `TVPEnsureDataPathDirectory` creates it. Using the game root instead made
+    // quick save/load look in the wrong folder.
+    let dir = system_context().project_data_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    set_string_out(out, &dir_with_separator(&dir));
     0
 }
 
