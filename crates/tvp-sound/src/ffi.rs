@@ -12,7 +12,7 @@ use std::ffi::{CStr, c_char, c_int, c_void};
 use std::ptr;
 use std::slice;
 
-use tjs2_sys::{VAL_INTEGER, VAL_REAL, VAL_STRING, VAL_VOID, Value, tjs2_malloc};
+use tjs2_sys::{DetachedValue, VAL_INTEGER, VAL_REAL, VAL_STRING, VAL_VOID, Value, tjs2_malloc};
 
 /// The argument slice of a native method call.
 ///
@@ -138,6 +138,27 @@ pub fn set_real_out(out: *mut Value, v: f64) {
         (*out).real = v;
         (*out).string = ptr::null();
     }
+}
+
+/// Hand a retained TJS object back as the callback result.
+///
+/// The C++ trampoline consumes the retained id while copying the result,
+/// so the Rust owner is forgotten after the id is placed in `out` (same
+/// pattern as `tvp-natives::set_object_result`).
+pub fn set_retained_out(out: *mut Value, dv: DetachedValue) {
+    let id = dv.raw_id();
+    // SAFETY: out is a valid return slot for the duration of the call.
+    unsafe {
+        (*out).ty = tjs2_sys::VAL_RETAINED;
+        (*out).integer = 0;
+        (*out).real = 0.0;
+        (*out).string = ptr::null();
+        (*out).array = ptr::null();
+        (*out).array_count = 0;
+        (*out).retained = id as usize;
+    }
+    // The retained id now belongs to the result value.
+    std::mem::forget(dv);
 }
 
 /// Write an empty TJS array return value into `*out` (the C++ side copies

@@ -104,6 +104,13 @@ pub struct Channel {
     pub rate: f64,
     /// Pan in `-1..=1` (`-1` full left, `+1` full right, `0` center).
     pub pan: f32,
+    /// 3D position `(x, y, z)` (reference `PosX`/`PosY`/`PosZ`), used for
+    /// the DirectSound3D default distance attenuation. Defaults to the
+    /// origin (full volume).
+    pub pos: [f32; 3],
+    /// Conditional `.sli` loop-link flags (reference `WaveFlags`), consulted
+    /// when choosing which link to jump at the loop point.
+    pub loop_flags: [i32; crate::sli::TVP_WL_MAX_FLAGS],
     /// Loop the source forever.
     pub looping: bool,
     /// Playback position in seconds.
@@ -131,6 +138,8 @@ impl Channel {
             volume2: MAX_VOLUME,
             rate: 1.0,
             pan: 0.0,
+            pos: [0.0; 3],
+            loop_flags: [0; crate::sli::TVP_WL_MAX_FLAGS],
             looping: false,
             position_seconds: 0.0,
             done: false,
@@ -234,10 +243,37 @@ impl Channel {
         }
     }
 
-    /// The full channel gain including [`Self::volume2`] (but not the
-    /// mixer's global volume, which [`Mixer::render_mix`] applies).
+    /// The full channel gain including [`Self::volume2`] and the 3D
+    /// distance attenuation (but not the mixer's global volume / focus
+    /// mute, which [`Mixer::render_mix`] applies).
     pub fn output_gain(&self) -> f32 {
-        self.effective_volume() * self.volume2
+        self.effective_volume() * self.volume2 * self.spatial_attenuation()
+    }
+
+    /// Set the 3D position (reference `SetPos`).
+    pub fn set_pos(&mut self, x: f32, y: f32, z: f32) {
+        self.pos = [x, y, z];
+    }
+
+    /// DirectSound3D default-distance attenuation for [`Self::pos`].
+    ///
+    /// DirectSound3D's default listener sits at the origin with minimum
+    /// distance 1.0, maximum distance 1e9 and rolloff 1.0, so the linear
+    /// gain is `min / (min + rolloff * (d - min))` with `d` clamped to
+    /// `[min, max]` (`DS3D_DEFAULTMINDISTANCE`/`_MAXDISTANCE`/`_ROLLOFF`).
+    /// At the origin this is exactly 1.0, so channels that never touch
+    /// `posX/Y/Z` are unaffected.
+    pub fn spatial_attenuation(&self) -> f32 {
+        const MIN_DISTANCE: f32 = 1.0;
+        const MAX_DISTANCE: f32 = 1.0e9;
+        const ROLLOFF: f32 = 1.0;
+        let [x, y, z] = self.pos;
+        let d = (x * x + y * y + z * z).sqrt();
+        if !d.is_finite() {
+            return 0.0;
+        }
+        let d = d.clamp(MIN_DISTANCE, MAX_DISTANCE);
+        (MIN_DISTANCE / (MIN_DISTANCE + ROLLOFF * (d - MIN_DISTANCE))).clamp(0.0, 1.0)
     }
 
     /// Start a linear fade to `to` over `duration` seconds after `delay`
@@ -293,7 +329,7 @@ impl Channel {
             let loop_bounds = if self.looping {
                 self.source.as_ref().and_then(|s| {
                     let sr = f64::from(s.sample_rate().max(1));
-                    s.loop_link()
+                    s.loop_link_with_flags(&self.loop_flags)
                         .map(|l| (l.to as f64 / sr, l.from as f64 / sr))
                 })
             } else {
@@ -399,6 +435,14 @@ pub struct Mixer {
     /// `tTJSNI_WaveSoundBuffer::GlobalVolume`) applied to every channel at
     /// render time.
     global_volume: f32,
+    /// Global focus mode (reference `tTVPSoundGlobalFocusMode`): `0` never
+    /// mute, `1` mute when minimized, `2` mute when deactivated. The host
+    /// feeds [`Mixer::set_app_focused`]/[`Mixer::set_app_minimized`].
+    global_focus_mode: i32,
+    /// Whether the host window is active (reference focus state).
+    app_focused: bool,
+    /// Whether the host window is minimized.
+    app_minimized: bool,
 }
 
 impl Default for Mixer {
@@ -412,6 +456,9 @@ impl Default for Mixer {
             next_id: 1,
             clock: 0.0,
             global_volume: MAX_VOLUME,
+            global_focus_mode: 0,
+            app_focused: true,
+            app_minimized: false,
         }
     }
 }
@@ -488,6 +535,39 @@ impl Mixer {
         self.global_volume = v.clamp(0.0, MAX_VOLUME);
     }
 
+    /// The global focus mode (`0` never mute, `1` mute-on-minimize, `2`
+    /// mute-on-deactivate; reference `tTVPSoundGlobalFocusMode`).
+    pub fn global_focus_mode(&self) -> i32 {
+        self.global_focus_mode
+    }
+
+    /// Set the global focus mode, clamped to the three reference values.
+    pub fn set_global_focus_mode(&mut self, mode: i32) {
+        self.global_focus_mode = mode.clamp(0, 2);
+    }
+
+    /// Feed the host window's active state (reference focus tracking).
+    pub fn set_app_focused(&mut self, focused: bool) {
+        self.app_focused = focused;
+    }
+
+    /// Feed the host window's minimized state.
+    pub fn set_app_minimized(&mut self, minimized: bool) {
+        self.app_minimized = minimized;
+    }
+
+    /// The focus mute gain (`1.0` audible, `0.0` muted) for the current
+    /// focus mode and host state (reference `SetVolumeToSoundBuffer`'s
+    /// `mutevol`).
+    pub fn focus_gain(&self) -> f32 {
+        let muted = match self.global_focus_mode {
+            1 => self.app_minimized,
+            2 => !self.app_focused || self.app_minimized,
+            _ => false,
+        };
+        if muted { 0.0 } else { 1.0 }
+    }
+
     /// Render one audio-device chunk and advance the mixer by its duration.
     ///
     /// This is what [`crate::player::MixerSource`] calls: the audio callback
@@ -537,7 +617,7 @@ impl Mixer {
                 continue;
             }
             let Some(src) = &c.source else { continue };
-            let v = c.output_gain() * self.global_volume;
+            let v = c.output_gain() * self.global_volume * self.focus_gain();
             if v <= 0.0 {
                 continue;
             }
@@ -889,6 +969,108 @@ mod tests {
         assert!(
             (0.1..=0.13).contains(&peak),
             "tone at gain 0.25 peak ~0.125, got {peak}"
+        );
+    }
+
+    #[test]
+    fn spatial_attenuation_matches_directsound_defaults() {
+        let mut m = Mixer::new();
+        let id = m.spawn_channel();
+        let c = m.channel(id).unwrap();
+        // Origin and anything inside DirectSound3D's minimum distance is
+        // full volume (the default listener at the origin).
+        c.set_pos(0.0, 0.0, 0.0);
+        assert_eq!(c.spatial_attenuation(), 1.0);
+        c.set_pos(0.5, 0.0, 0.0);
+        assert_eq!(c.spatial_attenuation(), 1.0);
+        // Beyond the minimum distance the linear rolloff applies:
+        // 1 / (1 + 1 * (d - 1)).
+        c.set_pos(2.0, 0.0, 0.0);
+        assert!((c.spatial_attenuation() - 0.5).abs() < 1e-6);
+        c.set_pos(0.0, 0.0, 3.0);
+        assert!((c.spatial_attenuation() - 1.0 / 3.0).abs() < 1e-6);
+        // output_gain folds the attenuation in.
+        c.set_volume(1.0);
+        c.set_volume2(1.0);
+        c.set_pos(3.0, 0.0, 0.0);
+        assert!((c.output_gain() - 1.0 / 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn global_focus_mode_mutes_by_host_state() {
+        let mut m = Mixer::new();
+        // Mode 0 never mutes.
+        assert_eq!(m.focus_gain(), 1.0);
+        m.set_app_minimized(true);
+        assert_eq!(m.focus_gain(), 1.0);
+        // Mode 1 mutes only while minimized.
+        m.set_global_focus_mode(1);
+        assert_eq!(m.focus_gain(), 0.0);
+        m.set_app_minimized(false);
+        assert_eq!(m.focus_gain(), 1.0);
+        // Mode 2 mutes when deactivated or minimized.
+        m.set_global_focus_mode(2);
+        m.set_app_focused(false);
+        assert_eq!(m.focus_gain(), 0.0);
+        m.set_app_focused(true);
+        m.set_app_minimized(true);
+        assert_eq!(m.focus_gain(), 0.0);
+        m.set_app_minimized(false);
+        assert_eq!(m.focus_gain(), 1.0);
+        // The mode clamps to the three reference values.
+        m.set_global_focus_mode(9);
+        assert_eq!(m.global_focus_mode(), 2);
+        m.set_global_focus_mode(-1);
+        assert_eq!(m.global_focus_mode(), 0);
+    }
+
+    #[test]
+    fn conditional_sli_link_uses_channel_flags() {
+        // Two links: a conditional one (flag 0 == 1) to 0.8s listed first,
+        // and an unconditional fallback to 0.5s. File order picks the
+        // conditional one only when its flag matches.
+        let info = SliInfo {
+            links: vec![
+                LoopLink {
+                    from: 44100,
+                    to: 35280,
+                    smooth: false,
+                    condition: LoopCondition::Equal,
+                    ref_value: 1,
+                    cond_var: 0,
+                },
+                LoopLink {
+                    from: 44100,
+                    to: 22050,
+                    smooth: false,
+                    condition: LoopCondition::None,
+                    ref_value: 0,
+                    cond_var: 0,
+                },
+            ],
+            labels: Vec::new(),
+        };
+        let track = AudioTrack::from_decoded_with_loop(Arc::new(tone(44100, 1, 2.0)), Some(info));
+        let mut m = Mixer::new();
+        let id = m.spawn_channel();
+        m.channel(id).unwrap().play_track(track);
+        m.channel(id).unwrap().looping = true;
+
+        // Flag clear -> fallback link to 0.5s.
+        m.advance(1.1);
+        assert!(
+            (m.channel_ref(id).unwrap().position_seconds - 0.6).abs() < 1e-6,
+            "fallback link, got {}",
+            m.channel_ref(id).unwrap().position_seconds
+        );
+
+        // Flag set -> conditional link to 0.8s.
+        m.channel(id).unwrap().loop_flags[0] = 1;
+        m.advance(0.5);
+        assert!(
+            (m.channel_ref(id).unwrap().position_seconds - 0.9).abs() < 1e-6,
+            "conditional link, got {}",
+            m.channel_ref(id).unwrap().position_seconds
         );
     }
 

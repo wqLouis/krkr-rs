@@ -40,7 +40,7 @@ use engine::Storage;
 use crate::decode::{
     AudioMetadata, DecodeError, DecodedAudio, StreamDecoder, decode_audio_bytes, probe_audio,
 };
-use crate::sli::{self, LoopLink, SliInfo};
+use crate::sli::{self, LoopLink, SliInfo, WaveLabel};
 
 /// A whole-file decode is kept in RAM only when the estimated PCM size is
 /// at most this many bytes. Longer tracks stream through a bounded ring.
@@ -413,6 +413,20 @@ impl AudioTrack {
     /// The first unconditional, non-degenerate `.sli` loop link, if any.
     pub fn loop_link(&self) -> Option<&LoopLink> {
         self.loop_info.as_ref().and_then(SliInfo::active_link)
+    }
+
+    /// The first `.sli` loop link whose flag condition holds for `flags`
+    /// (reference `GetNearestEvent`; the game's files have one link).
+    pub fn loop_link_with_flags(&self, flags: &[i32]) -> Option<&LoopLink> {
+        self.loop_info
+            .as_ref()
+            .and_then(|s| s.active_link_with_flags(flags))
+    }
+
+    /// The `.sli` labels for this track (empty when the side-car is absent),
+    /// in file order.
+    pub fn labels(&self) -> &[WaveLabel] {
+        self.loop_info.as_ref().map_or(&[], |s| &s.labels)
     }
 
     /// Frames currently resident in the streaming ring (0 for whole-file).

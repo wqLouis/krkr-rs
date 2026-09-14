@@ -61,6 +61,7 @@ pub mod source;
 pub mod wavesound;
 
 mod ffi;
+mod waveflags;
 
 pub use decode::{
     AudioMetadata, DecodeError, DecodedAudio, StreamDecoder, decode_audio, decode_audio_bytes,

@@ -19,6 +19,13 @@
 //! (`ReadInformation`, `ReadLinkInformation`, `ReadLabelInformation`,
 //! `GetCondition`), `WaveLoopManager.h` (`tTVPWaveLoopLink`).
 
+/// Number of conditional flags the reference tracks (reference
+/// `TVP_WL_MAX_FLAGS`).
+pub const TVP_WL_MAX_FLAGS: usize = 16;
+
+/// Maximum flag value (reference `TVP_WL_MAX_FLAG_VALUE`).
+pub const TVP_WL_MAX_FLAG_VALUE: i32 = 9999;
+
 /// A loop-link condition (reference `tTVPWaveLoopLinkCondition`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoopCondition {
@@ -36,6 +43,28 @@ pub enum LoopCondition {
     Lesser,
     /// `Condition=le`.
     LesserOrEqual,
+}
+
+impl LoopLink {
+    /// Whether this link's condition holds for the given flag values
+    /// (reference `tTVPWaveLoopManager::GetNearestEvent` condition test).
+    pub fn matches(&self, flags: &[i32]) -> bool {
+        let value = if self.cond_var >= 0 {
+            flags.get(self.cond_var as usize).copied().unwrap_or(0)
+        } else {
+            0
+        };
+        let value = i64::from(value);
+        match self.condition {
+            LoopCondition::None => true,
+            LoopCondition::Equal => value == self.ref_value,
+            LoopCondition::NotEqual => value != self.ref_value,
+            LoopCondition::Greater => value > self.ref_value,
+            LoopCondition::GreaterOrEqual => value >= self.ref_value,
+            LoopCondition::Lesser => value < self.ref_value,
+            LoopCondition::LesserOrEqual => value <= self.ref_value,
+        }
+    }
 }
 
 impl LoopCondition {
@@ -90,13 +119,22 @@ pub struct SliInfo {
 }
 
 impl SliInfo {
-    /// The first unconditional, non-degenerate loop link — what this port
-    /// actually honours. `None` when the file only has conditional links or
-    /// no link at all.
+    /// The first unconditional, non-degenerate loop link — used when no
+    /// flag state is available. `None` when the file only has conditional
+    /// links or no link at all.
     pub fn active_link(&self) -> Option<&LoopLink> {
         self.links
             .iter()
             .find(|l| l.condition == LoopCondition::None && l.from > l.to)
+    }
+
+    /// The first non-degenerate link whose condition holds for `flags`
+    /// (reference `GetNearestEvent` picks the nearest matching link; the
+    /// game's files have a single link, so file order is enough here).
+    pub fn active_link_with_flags(&self, flags: &[i32]) -> Option<&LoopLink> {
+        self.links
+            .iter()
+            .find(|l| l.from > l.to && l.matches(flags))
     }
 }
 
@@ -310,5 +348,20 @@ mod tests {
     fn empty_and_comment_only_are_empty() {
         assert!(parse(b"").unwrap().links.is_empty());
         assert!(parse(b"# just a comment\n").unwrap().links.is_empty());
+    }
+
+    #[test]
+    fn conditional_link_selection_uses_flags() {
+        // Two links: a conditional one (flag 3 == 1) listed first and an
+        // unconditional fallback. The conditional wins only when its flag
+        // is set (file order, like the single-link game files).
+        let text = b"#2.00\nLink { From=300; To=20; Condition=eq; RefValue=1; CondVar=3; }\nLink { From=200; To=10; Condition=no; }\n";
+        let info = parse(text).expect("parse");
+        let mut flags = [0i32; TVP_WL_MAX_FLAGS];
+        let fallback = info.active_link_with_flags(&flags).expect("fallback");
+        assert_eq!(fallback.to, 10);
+        flags[3] = 1;
+        let conditional = info.active_link_with_flags(&flags).expect("conditional");
+        assert_eq!(conditional.to, 20);
     }
 }

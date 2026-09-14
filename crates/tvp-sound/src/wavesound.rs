@@ -80,6 +80,7 @@ use tjs2_sys::{
 use crate::ffi;
 use crate::mixer::{Channel, lock_ok};
 use crate::natives::native_ctx;
+use crate::sli::{TVP_WL_MAX_FLAG_VALUE, TVP_WL_MAX_FLAGS, WaveLabel};
 
 /// The script volume/pan scale (the reference's `tjs_int` 0..=100000); the
 /// mixer works in 0..=1, so every boundary divides/multiplies by this.
@@ -156,6 +157,25 @@ struct Stream {
     /// point after the VM calls return. Mirrors the input bridge's
     /// `dead_layers` set.
     dead: bool,
+    /// Conditional loop flags (`WaveFlags`), consulted for `.sli` link
+    /// selection at the loop point.
+    flags: [i32; TVP_WL_MAX_FLAGS],
+    /// `useVisBuffer` state (the visualisation capture is host/wave-out
+    /// only; see the module docs).
+    use_vis_buffer: bool,
+    /// `.sli` labels for the loaded track, sorted by sample position (the
+    /// reference keeps a `LabelEventQueue` sorted by offset). Empty until
+    /// `open` installs a track.
+    labels: Vec<WaveLabel>,
+    /// The track's sample rate, used to convert label sample positions to
+    /// the millisecond `position` the reference's `labels` dictionary
+    /// carries.
+    label_rate: u32,
+    /// Next `.sli` label index to fire (labels are fired in position order).
+    next_label: usize,
+    /// Playback position (source seconds) at the last poll, to detect label
+    /// crossings and backwards seeks/loop wraps.
+    last_sample: f64,
 }
 
 static STREAMS: LazyLock<Mutex<HashMap<u64, Stream>>> =
@@ -241,7 +261,18 @@ extern "C" fn ws_ctor(
             "WaveSoundBuffer: engine context not set (register_wavesound not called)",
         );
     };
-    let action_owner = match engine.retain_value_detached(&tjs2_sys::TjsValue::Object) {
+    // Prefer the constructor argument's own object handle (correct even
+    // when more than one object is in play); fall back to the engine's
+    // most-recent-object resolution for a plain `null` owner.
+    let action_owner = if let Some(arg) = args
+        .first()
+        .filter(|a| a.ty == tjs2_sys::VAL_OBJECT && !a.object_handle().is_null())
+    {
+        engine.retain_object_arg(arg)
+    } else {
+        engine.retain_value_detached(&tjs2_sys::TjsValue::Object)
+    };
+    let action_owner = match action_owner {
         Ok(dv) => dv,
         Err(e) => return ffi::report_error(out_error, &format!("WaveSoundBuffer: {e}")),
     };
@@ -264,6 +295,12 @@ extern "C" fn ws_ctor(
             status: Status::Unload,
             emitted_failed_stop: false,
             dead: false,
+            flags: [0; TVP_WL_MAX_FLAGS],
+            use_vis_buffer: false,
+            labels: Vec::new(),
+            label_rate: 0,
+            next_label: 0,
+            last_sample: 0.0,
         },
     );
     inst.stream_id = id;
@@ -342,6 +379,16 @@ extern "C" fn ws_open(
             &format!("WaveSoundBuffer#{}: mixer channel missing", st.channel_id),
         );
     };
+    // Snapshot the `.sli` labels (sorted like the reference's
+    // `LabelEventQueue`) and the track's rate for the `labels` dictionary
+    // and `onLabel` polling, before the track moves into the channel.
+    let mut labels: Vec<WaveLabel> = track.labels().to_vec();
+    labels.sort_by_key(|l| l.position);
+    st.labels = labels;
+    st.label_rate = track.sample_rate();
+    st.next_label = 0;
+    st.last_sample = 0.0;
+
     // Install the (possibly still-loading/streaming) track without starting
     // playback; the poll derives "stop" once it is ready.
     ch.source = Some(track);
@@ -648,7 +695,39 @@ extern "C" fn ws_on_status_changed(
                 .get(&inst.stream_id)
                 .map_or_else(|| "unload".to_string(), |s| s.status.as_str().to_string())
         });
-    dispatch_action(engine, inst.stream_id, "onStatusChanged", Some(&status));
+    dispatch_action(
+        engine,
+        inst.stream_id,
+        "onStatusChanged",
+        &[("status", &status)],
+    );
+    0
+}
+
+/// The native `onLabel(name)` handler (reference `WaveIntf.cpp`
+/// `onLabel`): forwards `%[type:"onLabel", target:this, name:name]` to the
+/// action owner. The reference's `InvokeLabelEvent` posts this to the
+/// buffer instance when playback crosses a `.sli` `Label`; the poll below
+/// delivers the same event through the instance's class chain.
+extern "C" fn ws_on_label(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const tjs2_sys::Value,
+    out: *mut tjs2_sys::Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: instance is a valid WaveSoundBufferInst payload for the call.
+    let inst = unsafe { &mut *ffi::instance_ptr::<WaveSoundBufferInst>(instance) };
+    ffi::set_void_out(out);
+    let name = ffi::args(argv, argc)
+        .first()
+        .map(ffi::value_as_string)
+        .unwrap_or_default();
+    if let Some(engine) = context_engine() {
+        dispatch_action(engine, inst.stream_id, "onLabel", &[("name", &name)]);
+    }
     0
 }
 
@@ -670,21 +749,26 @@ extern "C" fn ws_on_fade_completed(
     let inst = unsafe { &mut *ffi::instance_ptr::<WaveSoundBufferInst>(instance) };
     ffi::set_void_out(out);
     if let Some(engine) = context_engine() {
-        dispatch_action(engine, inst.stream_id, "onFadeCompleted", None);
+        dispatch_action(engine, inst.stream_id, "onFadeCompleted", &[]);
     }
     0
 }
 
 /// Build the KiriKiri event dictionary and call the stream's action
 /// owner's `action(ev)` (reference `TVP_ACTION_INVOKE_BEGIN` / `_MEMBER` /
-/// `_END`). `status` is the extra `%[status:...]` member the
-/// `onStatusChanged` event carries.
+/// `_END`). `members` are the extra dictionary members the event carries
+/// (`status` for `onStatusChanged`, `name` for `onLabel`).
 ///
 /// The reference macro ignores the `FuncCall` return code, so a missing
 /// `action` member is silently tolerated (the action owner only implements
 /// `action` when it wants the events; e.g. the game's `SoundBuffer` passes
 /// a manager that may not). Only a genuine script error is logged.
-fn dispatch_action(engine: &Tjs2Engine, stream_id: u64, event_type: &str, status: Option<&str>) {
+fn dispatch_action(
+    engine: &Tjs2Engine,
+    stream_id: u64,
+    event_type: &str,
+    members: &[(&str, &str)],
+) {
     let Some(owner) = lock_ok(&STREAMS)
         .get(&stream_id)
         .map(|s| s.action_owner.raw_id())
@@ -697,8 +781,8 @@ fn dispatch_action(engine: &Tjs2Engine, stream_id: u64, event_type: &str, status
         "(function(){{ var d = %[]; d.type = '{}';",
         escape_js(event_type)
     );
-    if let Some(status) = status {
-        expr.push_str(&format!(" d.status = '{}';", escape_js(status)));
+    for (key, value) in members {
+        expr.push_str(&format!(" d.{key} = '{}';", escape_js(value)));
     }
     expr.push_str(" return d; })()");
     let retained = engine
@@ -775,6 +859,32 @@ fn reap_dead_streams() {
 /// during [`sound_poll`], so this drops after their last dispatch.
 pub fn active_stream_count() -> usize {
     lock_ok(&STREAMS).len()
+}
+
+/// Read one conditional loop flag (`WaveFlags` property).
+pub(crate) fn stream_flag(stream_id: u64, index: usize) -> i32 {
+    lock_ok(&STREAMS)
+        .get(&stream_id)
+        .and_then(|s| s.flags.get(index))
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Write one conditional loop flag, clamped to the reference's
+/// `TVP_WL_MAX_FLAG_VALUE`.
+pub(crate) fn set_stream_flag(stream_id: u64, index: usize, value: i32) {
+    if let Some(st) = lock_ok(&STREAMS).get_mut(&stream_id)
+        && let Some(slot) = st.flags.get_mut(index)
+    {
+        *slot = value.clamp(0, TVP_WL_MAX_FLAG_VALUE);
+    }
+}
+
+/// Clear every conditional loop flag (`WaveFlags.reset`).
+pub(crate) fn reset_stream_flags(stream_id: u64) {
+    if let Some(st) = lock_ok(&STREAMS).get_mut(&stream_id) {
+        st.flags = [0; TVP_WL_MAX_FLAGS];
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1229,6 +1339,320 @@ extern "C" fn ws_filters_get(
     0
 }
 
+/// Evaluate `expr` and hand its object result back as the callback result
+/// (the C ABI cannot construct dictionaries/objects directly, but it can
+/// transfer a retained object; see `tvp-natives::set_object_result`).
+fn set_eval_object_out(out: *mut tjs2_sys::Value, expr: &str, name: &str) -> Result<(), String> {
+    let engine = context_engine().ok_or_else(|| "sound natives are not registered".to_string())?;
+    engine.eval(expr, name).map_err(|e| e.to_string())?;
+    let dv = engine.retain_value_detached(&TjsValue::Object)?;
+    ffi::set_retained_out(out, dv);
+    Ok(())
+}
+
+/// `setPos(x, y, z)` — reference `WaveIntf.cpp` `setPos` →
+/// `WaveImpl.cpp::SetPos`: store the 3D position and apply DirectSound3D
+/// distance attenuation at render time (see `Channel::spatial_attenuation`).
+extern "C" fn ws_set_pos(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const tjs2_sys::Value,
+    out: *mut tjs2_sys::Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: instance is a valid WaveSoundBufferInst payload for the call.
+    let inst = unsafe { &mut *ffi::instance_ptr::<WaveSoundBufferInst>(instance) };
+    let args = ffi::args(argv, argc);
+    if args.len() < 3 {
+        return ffi::report_error(out_error, "WaveSoundBuffer.setPos requires x, y, z");
+    }
+    let (x, y, z) = (
+        ffi::value_as_f64(&args[0]) as f32,
+        ffi::value_as_f64(&args[1]) as f32,
+        ffi::value_as_f64(&args[2]) as f32,
+    );
+    with_channel!(inst, out_error, ch, {
+        ch.set_pos(x, y, z);
+        ffi::set_void_out(out);
+        0
+    })
+}
+
+/// Generate the `posX`/`posY`/`posZ` getter/setter pair for one axis of
+/// the channel's 3D position (reference `GetPosX`/`SetPosX`).
+macro_rules! pos_properties {
+    ($($axis:literal => $get:ident, $set:ident),* $(,)?) => {
+        $(
+            extern "C" fn $get(
+                _engine: *mut c_void,
+                instance: *mut c_void,
+                out: *mut tjs2_sys::Value,
+                out_error: *mut *mut c_char,
+                _objthis: *mut c_void,
+            ) -> c_int {
+                // SAFETY: instance is a valid WaveSoundBufferInst payload.
+                let inst = unsafe { &mut *ffi::instance_ptr::<WaveSoundBufferInst>(instance) };
+                with_channel!(inst, out_error, ch, {
+                    ffi::set_real_out(out, f64::from(ch.pos[$axis]));
+                    0
+                })
+            }
+
+            extern "C" fn $set(
+                _engine: *mut c_void,
+                instance: *mut c_void,
+                value: *const tjs2_sys::Value,
+                out_error: *mut *mut c_char,
+                _objthis: *mut c_void,
+            ) -> c_int {
+                // SAFETY: instance is a valid payload; value is valid for the call.
+                let inst = unsafe { &mut *ffi::instance_ptr::<WaveSoundBufferInst>(instance) };
+                // SAFETY: value points at the property value for the call.
+                let v = unsafe { &*value };
+                let new = ffi::value_as_f64(v) as f32;
+                with_channel!(inst, out_error, ch, {
+                    ch.pos[$axis] = new;
+                    0
+                })
+            }
+        )*
+    };
+}
+
+pos_properties!(
+    0 => ws_pos_x_get, ws_pos_x_set,
+    1 => ws_pos_y_get, ws_pos_y_set,
+    2 => ws_pos_z_get, ws_pos_z_set,
+);
+
+/// `flags` getter — a `WaveFlags` object bound to this buffer's stream
+/// (reference `WaveIntf.cpp` `flags` → `GetWaveFlagsObjectNoAddRef`). The
+/// reference caches one instance per buffer; this port builds a fresh one
+/// per access and returns it retained.
+extern "C" fn ws_flags_get(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut tjs2_sys::Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: instance is a valid WaveSoundBufferInst payload for the call.
+    let inst = unsafe { &mut *ffi::instance_ptr::<WaveSoundBufferInst>(instance) };
+    let expr = format!("new WaveFlags({})", inst.stream_id);
+    match set_eval_object_out(out, &expr, "WaveSoundBuffer.flags") {
+        Ok(()) => 0,
+        Err(e) => ffi::report_error(out_error, &format!("WaveSoundBuffer.flags: {e}")),
+    }
+}
+
+/// `labels` getter — a Dictionary of the `.sli` labels keyed by name
+/// (reference `WaveIntf.cpp` `labels` → `GetWaveLabelsObjectNoAddRef`).
+/// Each value carries `name`, `samplePosition` (granules) and `position`
+/// (milliseconds). Empty names are skipped, like the reference.
+extern "C" fn ws_labels_get(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut tjs2_sys::Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: instance is a valid WaveSoundBufferInst payload for the call.
+    let inst = unsafe { &mut *ffi::instance_ptr::<WaveSoundBufferInst>(instance) };
+    let (labels, rate) = {
+        let streams = lock_ok(&STREAMS);
+        let Some(st) = streams.get(&inst.stream_id) else {
+            return ffi::report_error(out_error, "WaveSoundBuffer: not constructed");
+        };
+        (st.labels.clone(), st.label_rate)
+    };
+    let mut expr = String::from("(function(){ var d = %[];");
+    let mut n = 0usize;
+    for label in &labels {
+        if label.name.is_empty() {
+            continue;
+        }
+        let name = escape_js(&label.name);
+        let pos = label.position;
+        let ms = if rate > 0 {
+            (pos as i64) * 1000 / i64::from(rate)
+        } else {
+            0
+        };
+        expr.push_str(&format!(
+            " var e{n} = %[]; e{n}.name = '{name}'; e{n}.samplePosition = {pos}; \
+             e{n}.position = {ms}; d['{name}'] = e{n};"
+        ));
+        n += 1;
+    }
+    expr.push_str(" return d; })()");
+    match set_eval_object_out(out, &expr, "WaveSoundBuffer.labels") {
+        Ok(()) => 0,
+        Err(e) => ffi::report_error(out_error, &format!("WaveSoundBuffer.labels: {e}")),
+    }
+}
+
+/// `useVisBuffer` getter — stored flag (reference `GetUseVisBuffer`).
+extern "C" fn ws_use_vis_buffer_get(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut tjs2_sys::Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: instance is a valid WaveSoundBufferInst payload for the call.
+    let inst = unsafe { &mut *ffi::instance_ptr::<WaveSoundBufferInst>(instance) };
+    let on = lock_ok(&STREAMS)
+        .get(&inst.stream_id)
+        .is_some_and(|s| s.use_vis_buffer);
+    ffi::set_int_out(out, i64::from(on));
+    0
+}
+
+/// `useVisBuffer` setter — stored flag (reference `SetUseVisBuffer`). Using
+/// the visualization buffer only allocates the reference's DirectSound
+/// capture ring; this port has no wave-out cursor, so the flag is state
+/// only (see the module docs).
+extern "C" fn ws_use_vis_buffer_set(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    value: *const tjs2_sys::Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: instance is a valid payload; value is valid for the call.
+    let inst = unsafe { &mut *ffi::instance_ptr::<WaveSoundBufferInst>(instance) };
+    // SAFETY: value points at the property value for the duration of the call.
+    let v = unsafe { &*value };
+    let on = ffi::value_as_bool(v);
+    if let Some(st) = lock_ok(&STREAMS).get_mut(&inst.stream_id) {
+        st.use_vis_buffer = on;
+    }
+    0
+}
+
+/// `getVisBuffer(dest, numsamples, channels[, aheadsamples])` — reference
+/// `WaveImpl.cpp::GetVisBuffer`. The reference copies samples out of its
+/// DirectSound write ring into the caller's raw `dest` pointer.
+///
+/// This port mixes with a headless clock-driven mixer and has no DirectSound
+/// wave-out cursor, and the raw `dest` pointer cannot cross the
+/// `tjs2_value` ABI. The method is registered for surface parity and returns
+/// 0 samples — exactly the reference's early-out when no visualization ring
+/// exists (`!UseVisBuffer`/`!VisBuffer`). See the module docs.
+extern "C" fn ws_get_vis_buffer(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    _argv: *const tjs2_sys::Value,
+    out: *mut tjs2_sys::Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: instance is a valid WaveSoundBufferInst payload for the call.
+    let _inst = unsafe { &mut *ffi::instance_ptr::<WaveSoundBufferInst>(instance) };
+    if argc < 3 {
+        return ffi::report_error(
+            out_error,
+            "WaveSoundBuffer.getVisBuffer requires dest, numsamples, channels",
+        );
+    }
+    ffi::set_int_out(out, 0);
+    0
+}
+
+/// `freeDirectSound()` — reference `WaveImpl.cpp` static `freeDirectSound`
+/// calls `TVPReleaseDirectSound()`. krkr-rs has no process-wide DirectSound
+/// device: real output is an optional rodio stream owned by the app's
+/// `OutputGuard`, which this native cannot reach. Documented host-only; see
+/// the module docs.
+extern "C" fn ws_free_direct_sound(
+    _engine: *mut c_void,
+    _instance: *mut c_void,
+    _argc: c_int,
+    _argv: *const tjs2_sys::Value,
+    out: *mut tjs2_sys::Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    ffi::set_void_out(out);
+    0
+}
+
+/// `globalVolume` getter — the process-wide mixer gain (reference
+/// `tTJSNI_WaveSoundBuffer::GetGlobalVolume`). The reference exposes this
+/// as a *static* class property; the instance-class ABI has no static
+/// members, so this port registers it as an instance property backed by the
+/// same global mixer state (documented deviation).
+extern "C" fn ws_global_volume_get(
+    _engine: *mut c_void,
+    _instance: *mut c_void,
+    out: *mut tjs2_sys::Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let Some(ctx) = native_ctx() else {
+        return ffi::report_error(out_error, "sound natives are not registered");
+    };
+    let v = lock_ok(&ctx.mixer).global_volume();
+    ffi::set_int_out(out, (f64::from(v) * TVP_VOLUME_SCALE) as i64);
+    0
+}
+
+/// `globalVolume` setter (reference `SetGlobalVolume`, clamped 0..=100000).
+extern "C" fn ws_global_volume_set(
+    _engine: *mut c_void,
+    _instance: *mut c_void,
+    value: *const tjs2_sys::Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: value points at the property value for the duration of the call.
+    let v = unsafe { &*value };
+    let Some(ctx) = native_ctx() else {
+        return ffi::report_error(out_error, "sound natives are not registered");
+    };
+    let gain = ffi::value_as_f64(v) / TVP_VOLUME_SCALE;
+    lock_ok(&ctx.mixer).set_global_volume(gain as f32);
+    0
+}
+
+/// `globalFocusMode` getter — `0` never mute, `1` mute-on-minimize,
+/// `2` mute-on-deactivate (reference `GetGlobalFocusMode`). Registered as
+/// an instance property, like `globalVolume`.
+extern "C" fn ws_global_focus_mode_get(
+    _engine: *mut c_void,
+    _instance: *mut c_void,
+    out: *mut tjs2_sys::Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let Some(ctx) = native_ctx() else {
+        return ffi::report_error(out_error, "sound natives are not registered");
+    };
+    let mode = lock_ok(&ctx.mixer).global_focus_mode();
+    ffi::set_int_out(out, i64::from(mode));
+    0
+}
+
+/// `globalFocusMode` setter (reference `SetGlobalFocusMode`).
+extern "C" fn ws_global_focus_mode_set(
+    _engine: *mut c_void,
+    _instance: *mut c_void,
+    value: *const tjs2_sys::Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: value points at the property value for the duration of the call.
+    let v = unsafe { &*value };
+    let Some(ctx) = native_ctx() else {
+        return ffi::report_error(out_error, "sound natives are not registered");
+    };
+    lock_ok(&ctx.mixer).set_global_focus_mode(ffi::value_as_f64(v) as i32);
+    0
+}
+
 // ---------------------------------------------------------------------------
 // registration + the per-frame poll
 // ---------------------------------------------------------------------------
@@ -1242,6 +1666,9 @@ fn method(name: &'static str, f: tjs2_sys::NativeInstanceMethodFn) -> NativeInst
 /// delivery.
 pub(crate) fn register_wavesound(engine: &Tjs2Engine) -> Result<(), String> {
     let _ = ENGINE.set(engine as *const Tjs2Engine as usize);
+    // The `flags` property constructs a `WaveFlags` object, so the class
+    // must exist before scripts can read it.
+    crate::waveflags::register_waveflags(engine)?;
     engine.register_native_class_instance(&NativeInstanceBuilder {
         name: "WaveSoundBuffer",
         create: ws_create,
@@ -1258,8 +1685,12 @@ pub(crate) fn register_wavesound(engine: &Tjs2Engine) -> Result<(), String> {
             method("fadeOut", ws_fade_out),
             method("stopFade", ws_stop_fade),
             method("getStatus", ws_get_status),
+            method("setPos", ws_set_pos),
+            method("getVisBuffer", ws_get_vis_buffer),
+            method("freeDirectSound", ws_free_direct_sound),
             method("onStatusChanged", ws_on_status_changed),
             method("onFadeCompleted", ws_on_fade_completed),
+            method("onLabel", ws_on_label),
         ],
         properties: vec![
             property("volume", ws_volume_get, Some(ws_volume_set)),
@@ -1280,6 +1711,26 @@ pub(crate) fn register_wavesound(engine: &Tjs2Engine) -> Result<(), String> {
             property("paused", ws_paused_get, Some(ws_paused_set)),
             property("speed", ws_speed_get, Some(ws_speed_set)),
             property("filters", ws_filters_get, None),
+            property("posX", ws_pos_x_get, Some(ws_pos_x_set)),
+            property("posY", ws_pos_y_get, Some(ws_pos_y_set)),
+            property("posZ", ws_pos_z_get, Some(ws_pos_z_set)),
+            property("flags", ws_flags_get, None),
+            property("labels", ws_labels_get, None),
+            property(
+                "useVisBuffer",
+                ws_use_vis_buffer_get,
+                Some(ws_use_vis_buffer_set),
+            ),
+            property(
+                "globalVolume",
+                ws_global_volume_get,
+                Some(ws_global_volume_set),
+            ),
+            property(
+                "globalFocusMode",
+                ws_global_focus_mode_get,
+                Some(ws_global_focus_mode_set),
+            ),
         ],
     })?;
     // The reference's `WaveSoundBuffer` exposes nested filter classes; the
@@ -1326,6 +1777,9 @@ fn derive_status(ch: &Channel) -> Status {
 enum PollEvent {
     StatusChanged(&'static str),
     FadeCompleted,
+    /// A `.sli` `Label` the playhead crossed (reference
+    /// `InvokeLabelEvent`); the payload is the label name.
+    Label(String),
 }
 
 /// Drive the sound pipeline once per frame: advance the global mixer to
@@ -1375,6 +1829,42 @@ pub fn sound_poll(engine: &Tjs2Engine, now_seconds: f64) {
                 ch.fade_finished = false;
                 events.push((*id, st.self_obj.raw_id(), PollEvent::FadeCompleted));
             }
+            // `.sli` label events: fire every label whose sample position
+            // the playhead passed since the previous poll (reference
+            // `FireLabelEventsAndGetNearestLabelEventStep`). A backwards jump
+            // (loop wrap or seek) re-arms from the new position, so labels
+            // inside the loop region fire once per pass, like the reference
+            // rebuilding its `LabelEventQueue` from the re-decoded segment.
+            if !st.labels.is_empty() {
+                let rate = f64::from(
+                    ch.source
+                        .as_ref()
+                        .map_or(st.label_rate.max(1), |s| s.sample_rate().max(1)),
+                );
+                let current = ch.position_seconds * rate;
+                if !ch.is_playing() {
+                    // Keep the watermark aligned with a paused/stopped
+                    // position so a later restart does not fire labels the
+                    // playhead never passed.
+                    st.last_sample = current;
+                } else {
+                    if current < st.last_sample {
+                        st.next_label =
+                            st.labels.partition_point(|l| (l.position as f64) < current);
+                    }
+                    while st.next_label < st.labels.len() {
+                        let pos = st.labels[st.next_label].position;
+                        if (pos as f64) > current {
+                            break;
+                        }
+                        let name = st.labels[st.next_label].name.clone();
+                        events.push((*id, st.self_obj.raw_id(), PollEvent::Label(name)));
+                        st.next_label += 1;
+                    }
+                    st.last_sample = current;
+                }
+            }
+
             let derived = derive_status(ch);
             if derived != st.status {
                 let arg = derived.as_str();
@@ -1407,6 +1897,9 @@ pub fn sound_poll(engine: &Tjs2Engine, now_seconds: f64) {
                 engine.call_member(target, "onStatusChanged", &[TjsValue::String(s.into())])
             }
             PollEvent::FadeCompleted => engine.call_member(target, "onFadeCompleted", &[]),
+            PollEvent::Label(name) => {
+                engine.call_member(target, "onLabel", &[TjsValue::String(name)])
+            }
         };
         if let Err(e) = result {
             if is_invalidated_error(&e) {

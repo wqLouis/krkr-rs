@@ -96,6 +96,14 @@ fn eval_i(e: &Tjs2Engine, expr: &str) -> i64 {
     }
 }
 
+fn eval_f(e: &Tjs2Engine, expr: &str) -> f64 {
+    match e.eval(expr, "probe").expect("eval succeeds") {
+        TjsValue::Real(v) => v,
+        TjsValue::Integer(v) => v as f64,
+        other => panic!("expected a number for {expr:?}, got {other:?}"),
+    }
+}
+
 /// Pure probe: `open_track` reads the `<name>.sli` side-car and exposes the
 /// loop link (the game's `bgm/*.ogg.sli` loop points).
 #[test]
@@ -122,6 +130,14 @@ fn open_track_reads_sli_loop_points() {
 fn wavesoundbuffer_reference_property_surface() {
     let dir = TestDir::new();
     std::fs::write(dir.0.join("one.wav"), sine_wav_bytes(44100, 440.0, 1.0)).expect("wav");
+    // A labeled track for the `labels` dictionary / `onLabel` fan-out: the
+    // label sits at 0.2 s (8820 granules).
+    std::fs::write(dir.0.join("labeled.wav"), sine_wav_bytes(44100, 440.0, 1.0)).expect("wav");
+    std::fs::write(
+        dir.0.join("labeled.wav.sli"),
+        b"#2.00\nLabel { Position=8820; Name='mid'; }\n",
+    )
+    .expect("sli");
     let storage = mount_dir(&dir);
 
     let e = Tjs2Engine::new().unwrap();
@@ -205,4 +221,117 @@ fn wavesoundbuffer_reference_property_surface() {
     e.exec_script("ws.frequency = 22050;", "wsprops").unwrap();
     assert_eq!(eval_i(&e, "ws.frequency"), 22050);
     assert_eq!(eval_i(&e, "ws.channels"), 1, "metadata still readable");
+
+    // ---- setPos / posX / posY / posZ (reference 3D position) ----
+    e.exec_script("ws.setPos(1, 2, 2);", "wsprops").unwrap();
+    assert!((eval_f(&e, "ws.posX") - 1.0).abs() < 1e-6);
+    assert!((eval_f(&e, "ws.posY") - 2.0).abs() < 1e-6);
+    assert!((eval_f(&e, "ws.posZ") - 2.0).abs() < 1e-6);
+    // Individual axis writes are independent.
+    e.exec_script("ws.posX = 3; ws.posZ = -4;", "wsprops")
+        .unwrap();
+    assert!((eval_f(&e, "ws.posX") - 3.0).abs() < 1e-6);
+    assert!((eval_f(&e, "ws.posY") - 2.0).abs() < 1e-6);
+    assert!((eval_f(&e, "ws.posZ") + 4.0).abs() < 1e-6);
+    e.exec_script("ws.setPos(0, 0, 0);", "wsprops").unwrap();
+
+    // ---- flags: the WaveFlags object the .sli conditions read ----
+    e.exec_script("var wf = ws.flags;", "wsprops").unwrap();
+    assert_eq!(eval_i(&e, "wf.count"), 16, "TVP_WL_MAX_FLAGS");
+    e.exec_script("wf[0] = 7; wf[3] = 42;", "wsprops").unwrap();
+    assert_eq!(eval_i(&e, "wf[0]"), 7);
+    assert_eq!(eval_i(&e, "wf[3]"), 42);
+    // The reference clamps flag values to TVP_WL_MAX_FLAG_VALUE.
+    e.exec_script("wf[0] = 100000;", "wsprops").unwrap();
+    assert_eq!(
+        eval_i(&e, "wf[0]"),
+        9999,
+        "clamped to TVP_WL_MAX_FLAG_VALUE"
+    );
+    e.exec_script("wf.reset();", "wsprops").unwrap();
+    assert_eq!(eval_i(&e, "wf[0]"), 0);
+    assert_eq!(eval_i(&e, "wf[3]"), 0);
+
+    // ---- labels dictionary + onLabel fan-out ----
+    // A track without an `.sli` has no labels.
+    assert!(matches!(
+        e.eval("ws.labels['mid']", "wsprops"),
+        Ok(TjsValue::Void)
+    ));
+
+    // A labeled track exposes the reference dictionary shape and fires
+    // `onLabel(name)` through the buffer instance when the playhead
+    // crosses the label.
+    e.exec_script(
+        r#"
+        var labelEvent = "";
+        var labelName = "";
+        // The native onLabel handler forwards the label event dictionary to
+        // the action owner's action(ev), exactly like onStatusChanged.
+        var owner = %[action: function(ev) {
+            if(ev.type == "onLabel") { labelEvent = ev.type; labelName = ev.name; }
+        }];
+        var lp = new WaveSoundBuffer(owner);
+        lp.open("labeled.wav");
+        "#,
+        "wsprops",
+    )
+    .unwrap();
+    wait_status(&e, "lp", "stop");
+    assert_eq!(
+        e.eval("lp.labels['mid'].name", "wsprops").unwrap(),
+        TjsValue::String("mid".into())
+    );
+    assert_eq!(eval_i(&e, "lp.labels['mid'].samplePosition"), 8820);
+    assert_eq!(
+        eval_i(&e, "lp.labels['mid'].position"),
+        200,
+        "8820 granules at 44100 Hz = 200 ms"
+    );
+    e.exec_script("lp.play();", "wsprops").unwrap();
+    // The global mixer clock already sits at 0.45 s. Poll the play
+    // transition first (0.05 s, before the label), then cross the 0.2 s
+    // label.
+    sound_poll(&e, 0.5);
+    sound_poll(&e, 0.75);
+    assert_eq!(
+        e.eval("labelEvent", "wsprops").unwrap(),
+        TjsValue::String("onLabel".into()),
+        "the label event type did not reach the action owner"
+    );
+    assert_eq!(
+        e.eval("labelName", "wsprops").unwrap(),
+        TjsValue::String("mid".into()),
+        "the label name did not reach the action owner"
+    );
+
+    // ---- useVisBuffer / getVisBuffer / freeDirectSound ----
+    e.exec_script("ws.useVisBuffer = true;", "wsprops").unwrap();
+    assert_eq!(eval_i(&e, "ws.useVisBuffer"), 1);
+    e.exec_script("ws.useVisBuffer = false;", "wsprops")
+        .unwrap();
+    assert_eq!(eval_i(&e, "ws.useVisBuffer"), 0);
+    // No DirectSound write ring in this headless port: 0 samples, but the
+    // reference argument shape must be accepted.
+    assert_eq!(eval_i(&e, "ws.getVisBuffer(0, 100, 1, 0)"), 0);
+    e.exec_script("ws.freeDirectSound();", "wsprops").unwrap();
+
+    // ---- globalVolume / globalFocusMode (real global mixer state) ----
+    e.exec_script("ws.globalVolume = 50000;", "wsprops")
+        .unwrap();
+    assert_eq!(eval_i(&e, "ws.globalVolume"), 50000);
+    e.exec_script("ws.globalVolume = 200000;", "wsprops")
+        .unwrap();
+    assert_eq!(eval_i(&e, "ws.globalVolume"), 100000, "clamped high");
+    e.exec_script("ws.globalVolume = -5;", "wsprops").unwrap();
+    assert_eq!(eval_i(&e, "ws.globalVolume"), 0, "clamped low");
+    e.exec_script("ws.globalVolume = 100000;", "wsprops")
+        .unwrap();
+
+    e.exec_script("ws.globalFocusMode = 2;", "wsprops").unwrap();
+    assert_eq!(eval_i(&e, "ws.globalFocusMode"), 2);
+    e.exec_script("ws.globalFocusMode = 9;", "wsprops").unwrap();
+    assert_eq!(eval_i(&e, "ws.globalFocusMode"), 2, "clamped 0..=2");
+    e.exec_script("ws.globalFocusMode = 0;", "wsprops").unwrap();
+    assert_eq!(eval_i(&e, "ws.globalFocusMode"), 0);
 }
