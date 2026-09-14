@@ -419,6 +419,23 @@ struct MixingLayer {
     alpha: f64,
 }
 
+/// One `layer1`/`layer2` target. The reference `tTJSNI_VideoOverlay` stores
+/// the raw `tTJSNI_BaseLayer *` (`VideoOvlImpl.h:48`) that the `layer1`/
+/// `layer2` setters assign and the getters hand back; krkr-rs keeps the
+/// Layer TJS object retained (so scripts can read `v.layer1` back and keep
+/// using it) plus the raw object handle for the getter.
+struct LayerRef {
+    /// Keeps the Layer TJS object alive while the overlay references it.
+    #[allow(dead_code)]
+    keepalive: DetachedValue,
+    /// Raw TJS object pointer, valid for re-retention by the getter.
+    objthis: *mut c_void,
+    /// Engine-internal layer id (the Layer `nativeId` property); kept for the
+    /// render-side mixing path.
+    #[allow(dead_code)]
+    id: u32,
+}
+
 /// A copy of a mixing layer's MainImage RGBA pixels. The reference passes the
 /// layer's live image pointer to the video player; krkr-rs copies it once per
 /// presented frame because tvp-natives cannot hold the tvp-visual scene lock
@@ -481,6 +498,9 @@ struct VideoOverlayInst {
     /// `setMixingLayer` state; `None` means no mixing bitmap
     /// (`resetMixingLayer` / a non-visible or null argument).
     mixing_layer: Option<MixingLayer>,
+    /// `layer1`/`layer2` assignment state (reference `Layer1`/`Layer2`).
+    layer1: Option<LayerRef>,
+    layer2: Option<LayerRef>,
 
     // real decoding (FFmpeg) and the presented layer bitmap
     /// Decoder for the currently-open movie (`None` for unparsed files).
@@ -535,6 +555,8 @@ impl Default for VideoOverlayInst {
             last_frame_update: -1,
             transition_call: None,
             mixing_layer: None,
+            layer1: None,
+            layer2: None,
             decoder: None,
             frame: None,
             mode: 0,
@@ -2167,29 +2189,116 @@ extern "C" fn vo_set_transition_complete_call(
     0
 }
 
-/// `layer1`/`layer2` getter: no Layer is attached, so read as void
-/// (reference returns the layer or null).
-extern "C" fn vo_layer_get(
-    _engine: *mut c_void,
-    _instance: *mut c_void,
-    out: *mut Value,
-    _out_error: *mut *mut c_char,
-    _objthis: *mut c_void,
-) -> c_int {
-    set_void_out(out);
-    0
+/// Write a TJS `null` result (distinct from `void`) into `out`.
+fn vo_set_null_out(out: *mut Value) {
+    // SAFETY: `out` is a valid result slot for the duration of the call.
+    unsafe {
+        (*out).ty = tjs2_sys::VAL_NULL;
+        (*out).integer = 0;
+        (*out).real = 0.0;
+        (*out).string = std::ptr::null();
+        (*out).array = std::ptr::null();
+        (*out).array_count = 0;
+        (*out).retained = 0;
+    }
 }
 
-/// `layer1`/`layer2` setter: accept any value and ignore it.
-extern "C" fn vo_layer_set(
-    _engine: *mut c_void,
-    _instance: *mut c_void,
-    _value: *const Value,
-    _out_error: *mut *mut c_char,
-    _objthis: *mut c_void,
-) -> c_int {
-    0
+/// Hand a retained object id back as the callback result (the trampoline
+/// consumes the id while copying the value).
+fn vo_set_retained_out(out: *mut Value, dv: DetachedValue) {
+    let id = dv.raw_id();
+    // SAFETY: `out` is a valid result slot for the duration of the call.
+    unsafe {
+        (*out).ty = tjs2_sys::VAL_RETAINED;
+        (*out).integer = 0;
+        (*out).real = 0.0;
+        (*out).string = std::ptr::null();
+        (*out).array = std::ptr::null();
+        (*out).array_count = 0;
+        (*out).retained = id as usize;
+    }
+    std::mem::forget(dv);
 }
+
+/// Resolve a `layer1`/`layer2` setter argument to a [`LayerRef`].
+///
+/// Reference `tTJSNI_VideoOverlay::SetLayer1`/`SetLayer2`
+/// (`VideoOvlImpl.cpp:792`): a null/void argument clears the slot; any other
+/// object must be a Layer (the reference resolves `tTJSNC_Layer::ClassID`
+/// through `NativeInstanceSupport` and throws `TVPSpecifyLayer` otherwise).
+/// krkr-rs validates the same way [`resolve_mixing_layer`] does: a Layer
+/// object (including a script subclass) carries a non-negative `nativeId`.
+fn resolve_layer_ref(engine: &Tjs2Engine, value: &Value) -> Result<Option<LayerRef>, String> {
+    let objthis = value.object_handle();
+    if value.ty != tjs2_sys::VAL_OBJECT || objthis.is_null() {
+        return Ok(None);
+    }
+    let keepalive = engine
+        .retain_object_arg(value)
+        .map_err(|_| "VideoOverlay: specify layer".to_string())?;
+    let id = match engine.get_member(keepalive.raw_id(), "nativeId") {
+        Ok(TjsValue::Integer(id)) if id >= 0 => id as u32,
+        _ => return Err("VideoOverlay: specify layer".to_string()),
+    };
+    Ok(Some(LayerRef {
+        keepalive,
+        objthis,
+        id,
+    }))
+}
+
+/// Write the retained `layer1`/`layer2` object (or TJS `null`) into `out`.
+fn return_layer_ref(engine: &Tjs2Engine, layer: Option<&LayerRef>, out: *mut Value) {
+    let Some(layer) = layer else {
+        return vo_set_null_out(out);
+    };
+    match engine.retain_object_detached(layer.objthis) {
+        Ok(dv) => vo_set_retained_out(out, dv),
+        // The Layer object is gone; the reference reads back as null.
+        Err(_) => vo_set_null_out(out),
+    }
+}
+
+/// Generate the `layer1`/`layer2` getter/setter pair for one instance field.
+macro_rules! vo_layer_property {
+    ($get:ident, $set:ident, $field:ident) => {
+        extern "C" fn $get(
+            _engine: *mut c_void,
+            instance: *mut c_void,
+            out: *mut Value,
+            _out_error: *mut *mut c_char,
+            _objthis: *mut c_void,
+        ) -> c_int {
+            // SAFETY: `instance` is a live VideoOverlayInst payload.
+            let inst = unsafe { &*(instance as *const VideoOverlayInst) };
+            return_layer_ref(context_engine(), inst.$field.as_ref(), out);
+            0
+        }
+
+        extern "C" fn $set(
+            _engine: *mut c_void,
+            instance: *mut c_void,
+            value: *const Value,
+            out_error: *mut *mut c_char,
+            _objthis: *mut c_void,
+        ) -> c_int {
+            // SAFETY: `instance` is a live VideoOverlayInst payload and
+            // `value` is valid for the duration of the callback.
+            let inst = unsafe { &mut *(instance as *mut VideoOverlayInst) };
+            let value = unsafe { &*value };
+            match resolve_layer_ref(context_engine(), value) {
+                Ok(layer) => {
+                    inst.$field = layer;
+                    0
+                }
+                Err(e) => report_error(out_error, &e),
+            }
+        }
+    };
+}
+
+vo_layer_property!(vo_layer1_get, vo_layer1_set, layer1);
+vo_layer_property!(vo_layer2_get, vo_layer2_set, layer2);
 
 // ---------------------------------------------------------------------------
 // Registration
@@ -2568,13 +2677,13 @@ pub fn register_video_overlay(engine: &Tjs2Engine) -> Result<(), String> {
             },
             NativeInstancePropertyDef {
                 name: "layer1",
-                get: Some(vo_layer_get),
-                set: Some(vo_layer_set),
+                get: Some(vo_layer1_get),
+                set: Some(vo_layer1_set),
             },
             NativeInstancePropertyDef {
                 name: "layer2",
-                get: Some(vo_layer_get),
-                set: Some(vo_layer_set),
+                get: Some(vo_layer2_get),
+                set: Some(vo_layer2_set),
             },
         ],
     })
@@ -3296,5 +3405,42 @@ mod tests {
             (2, 2, 8)
         );
         assert_eq!(background.rgba, pixels);
+    }
+
+    /// `layer1`/`layer2` store the assigned Layer object and return it
+    /// (reference `tTJSNI_VideoOverlay::SetLayer1/GetLayer1`,
+    /// `VideoOvlImpl.cpp:792`). A non-Layer object raises `TVPSpecifyLayer`.
+    #[test]
+    fn video_overlay_layer_refs_roundtrip_and_validate() {
+        let _vm_lock = vm_lock();
+        let engine = Tjs2Engine::new().expect("create engine");
+        crate::register_all(&engine).expect("register all natives");
+        engine
+            .exec_script(
+                "var v = new VideoOverlay(null); \
+                 var l = %[nativeId: 7]; \
+                 v.layer1 = l; \
+                 var same1 = (v.layer1 === l); \
+                 v.layer2 = l; \
+                 var same2 = (v.layer2 === l); \
+                 v.layer1 = null; \
+                 var cleared = (v.layer1 === null);",
+                "video_overlay_layer_refs",
+            )
+            .expect("layer refs must round-trip");
+        assert_eq!(engine.eval("same1", "test").unwrap(), TjsValue::Integer(1));
+        assert_eq!(engine.eval("same2", "test").unwrap(), TjsValue::Integer(1));
+        assert_eq!(
+            engine.eval("cleared", "test").unwrap(),
+            TjsValue::Integer(1)
+        );
+        // A non-Layer object (no `nativeId`) must raise, not be stored.
+        let thrown = engine
+            .eval(
+                "(function(){ try { v.layer1 = %[]; return 0; } catch(e){ return 1; } })()",
+                "test",
+            )
+            .unwrap();
+        assert_eq!(thrown, TjsValue::Integer(1));
     }
 }

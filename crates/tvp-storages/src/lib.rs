@@ -31,15 +31,20 @@
 //! | `extractStorageExt/Name/Path`, `chopStorageExt` | pure string helpers
 //!   ported from the reference (they split on `/`, `\` and the `>` archive
 //!   delimiter). |
-//! | `clearArchiveCache()` | no-op (nothing is cached yet). |
+//! | `clearArchiveCache()` | clears the positive placed-path cache and
+//!   remounts the storage so every XP3 handle is released and lazily reopened
+//!   (reference `TVPClearArchiveCache`). |
 //! | `stat(name)` / `fstat(name)` | a TJS dictionary with disk size and Date
 //!   timestamps, or archive-entry size. |
 //! | `selectFile(param)` | no headless GUI dialog exists, so behaves like a
 //!   user cancel: leaves `param` untouched and returns `false`. |
+//! | `open(name[, flags])` | a real binary stream object
+//!   (`read`/`write`/`seek`/`getSize`/`getPosition`/`close`); read mode must
+//!   resolve in storage, write modes flush to the resolved disk path on
+//!   `close`. |
 //!
 //! # Pending (registered, but raise a clear TJS error)
 //!
-//! - `open(name, flags)` — needs a stream object return value.
 //! - `searchCD(label)` — CD-volume search; disabled in the reference.
 //!
 //! # Return value of `getFileList`
@@ -54,11 +59,11 @@
 //! globals, so they must run single-threaded:
 //! `cargo test -p tvp-storages -- --test-threads=1`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use engine::Storage;
@@ -66,8 +71,9 @@ use engine::storage::StorageMetadata;
 mod csv_parser;
 
 use tjs2_sys::{
-    Engine, NativeClassBuilder, NativeMethodDef, Tjs2Engine, VAL_INTEGER, VAL_REAL, VAL_RETAINED,
-    VAL_STRING, VAL_VOID, Value, tjs2_free_string, tjs2_malloc,
+    Engine, NativeClassBuilder, NativeInstanceBuilder, NativeInstanceMethodDef, NativeMethodDef,
+    Tjs2Engine, VAL_INTEGER, VAL_REAL, VAL_RETAINED, VAL_STRING, VAL_VOID, Value, tjs2_free_string,
+    tjs2_malloc,
 };
 
 // ---------------------------------------------------------------------------
@@ -111,6 +117,21 @@ pub fn set_storage(storage: Option<Arc<Mutex<Storage>>>) {
 
 fn storage_arc() -> Option<Arc<Mutex<Storage>>> {
     STORAGE.lock().unwrap().clone()
+}
+
+/// Positive-result cache for `TVPGetPlacedPath` (the reference's
+/// `TVPAutoPathCache`): requested name -> placed normalized storage name.
+/// Only hits are stored (the reference does not cache misses). It is
+/// invalidated by `Storages.clearArchiveCache()` and whenever the auto-path
+/// list changes, so it never serves a stale placement.
+static PLACED_PATH_CACHE: LazyLock<Mutex<HashMap<String, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn clear_placed_path_cache() {
+    PLACED_PATH_CACHE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -252,11 +273,33 @@ fn is_existent_storage(name: &str) -> bool {
 }
 
 /// `TVPGetPlacedPath`: the normalized storage name when found (mounted
-/// storage or auto paths), `""` when not found.
+/// storage or auto paths), `""` when not found. Positive results are cached
+/// like the reference's `TVPAutoPathCache`; the cache is cleared by
+/// `Storages.clearArchiveCache()` and on any auto-path change.
 fn placed_path(name: &str) -> String {
     if name.is_empty() {
         return String::new();
     }
+    if let Some(hit) = PLACED_PATH_CACHE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(name)
+        .cloned()
+    {
+        return hit;
+    }
+    let found = compute_placed_path(name);
+    if !found.is_empty() {
+        PLACED_PATH_CACHE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(name.to_string(), found.clone());
+    }
+    found
+}
+
+/// Uncached placement computation behind [`placed_path`].
+fn compute_placed_path(name: &str) -> String {
     let normalized = normalize_storage_name(name);
     if exists_in_storage(&normalized) {
         return normalized;
@@ -532,6 +575,7 @@ fn add_auto_path(path: &str) -> Result<(), String> {
         return Err("Storages.addAutoPath: empty path".into());
     }
     engine::storage::add_auto_path(entry);
+    clear_placed_path_cache();
     log::debug!("tvp-storages: added auto path \"{path}\"");
     Ok(())
 }
@@ -544,6 +588,7 @@ fn remove_auto_path(path: &str) -> Result<(), String> {
     }
     let entry = normalize_storage_name(path);
     engine::storage::remove_auto_path(&entry);
+    clear_placed_path_cache();
     log::debug!("tvp-storages: removed auto path \"{path}\"");
     Ok(())
 }
@@ -875,8 +920,22 @@ extern "C" fn native_clear_archive_cache(
     out: *mut Value,
     _out_error: *mut *mut c_char,
 ) -> c_int {
-    // Nothing is cached yet; keep the no-op (the reference clears its
-    // archive/auto-path caches here).
+    // Reference `TVPClearArchiveCache` (`StorageIntf.cpp:728`) clears the
+    // archive-handle cache; the port's placed-path cache is the reference's
+    // `TVPAutoPathCache`, so both are dropped here. The mounted XP3 handles
+    // live in `Storage`, so remount the game directory to release and
+    // reopen them lazily (a failure keeps the current handles).
+    clear_placed_path_cache();
+    if let Some(storage) = storage_arc() {
+        let game_dir = storage.lock().unwrap().game_dir().to_path_buf();
+        match Storage::mount(&game_dir) {
+            Ok(fresh) => {
+                *storage.lock().unwrap() = fresh;
+                log::debug!("tvp-storages: cleared archive cache (remounted {game_dir:?})");
+            }
+            Err(e) => log::warn!("tvp-storages: clearArchiveCache remount failed: {e}"),
+        }
+    }
     set_void_out(out);
     0
 }
@@ -947,15 +1006,421 @@ extern "C" fn native_fstat(
     native_stat(engine, argc, argv, out, out_error)
 }
 native_pending!(
-    native_open,
-    "open",
-    "needs a stream object return value from the FFI (pending in tjs2-sys)"
-);
-native_pending!(
     native_search_cd,
     "searchCD",
     "CD volume search is platform-specific and disabled in the reference"
 );
+
+// ---------------------------------------------------------------------------
+// Storages.open + the minimal binary stream object
+// ---------------------------------------------------------------------------
+
+/// Reference `tTJSBinaryStream` open flags (`tjs.h:243`).
+const TJS_BS_READ: i64 = 0;
+const TJS_BS_WRITE: i64 = 1;
+const TJS_BS_APPEND: i64 = 2;
+const TJS_BS_UPDATE: i64 = 3;
+
+/// One `Storages.open` stream. The reference returns a `tTJSBinaryStream`,
+/// which has no script-visible Rust counterpart; this minimal native owns the
+/// bytes and implements the reference stream operations (`Read`/`Write`/
+/// `Seek`/`Close`/`GetSize`/`GetPosition`) so the object is a real, usable
+/// stream rather than an opaque token.
+struct StorageStreamInst {
+    data: Vec<u8>,
+    pos: usize,
+    /// `TJS_BS_WRITE`/`APPEND`/`UPDATE`: flush back to disk on `close`/drop.
+    writable: bool,
+    /// Storage name the write-mode flush targets.
+    name: String,
+}
+
+/// One stream handed from `Storages.open` to the freshly constructed native
+/// instance. The VM is single-threaded, so a one-slot handoff is enough: the
+/// `create` callback runs synchronously inside `new __TvpStorageStream()`.
+static PENDING_STREAM: Mutex<Option<StorageStreamInst>> = Mutex::new(None);
+
+extern "C" fn stream_create(_engine: *mut c_void) -> *mut c_void {
+    let inst = PENDING_STREAM
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .take()
+        .unwrap_or(StorageStreamInst {
+            data: Vec::new(),
+            pos: 0,
+            writable: false,
+            name: String::new(),
+        });
+    Box::into_raw(Box::new(inst)) as *mut c_void
+}
+
+extern "C" fn stream_destroy(_engine: *mut c_void, instance: *mut c_void) {
+    if !instance.is_null() {
+        // SAFETY: instance came from stream_create's Box::into_raw.
+        let inst = unsafe { Box::from_raw(instance as *mut StorageStreamInst) };
+        // A writable stream not explicitly closed still flushes on drop.
+        if inst.writable && !inst.name.is_empty() {
+            flush_stream(&inst);
+        }
+    }
+}
+
+/// Write a writable stream's buffer back to its disk path.
+fn flush_stream(inst: &StorageStreamInst) {
+    let path = disk_path(&inst.name);
+    if let Some(parent) = std::path::Path::new(&path).parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        log::warn!("Storages.open: cannot create parent of {path}: {e}");
+        return;
+    }
+    if let Err(e) = std::fs::write(&path, &inst.data) {
+        log::warn!("Storages.open: write {path} failed: {e}");
+    }
+}
+
+/// Borrow the native instance payload.
+fn stream_mut(instance: *mut c_void) -> &'static mut StorageStreamInst {
+    // SAFETY: the dispatcher guarantees `instance` is the payload returned by
+    // stream_create for this native object.
+    unsafe { &mut *(instance as *mut StorageStreamInst) }
+}
+
+/// Retain a byte slice as a real TJS octet result (the C ABI has no direct
+/// octet result slot; the C++ side copies the retained octet).
+fn set_octet_out(engine: *mut c_void, out: *mut Value, bytes: &[u8]) {
+    let ffi = Value {
+        ty: tjs2_sys::VAL_OCTET,
+        integer: 0,
+        real: 0.0,
+        string: if bytes.is_empty() {
+            ptr::null()
+        } else {
+            bytes.as_ptr() as *const c_char
+        },
+        array: ptr::null(),
+        array_count: bytes.len() as c_int,
+        retained: 0,
+    };
+    // SAFETY: engine is the live VM and the C++ side copies the bytes into a
+    // refcounted octet during the call.
+    let id = unsafe { tjs2_retain_value(engine.cast::<Engine>(), &ffi) };
+    // SAFETY: `out` is the trampoline's valid result slot; it consumes the id.
+    unsafe {
+        (*out).ty = VAL_RETAINED;
+        (*out).integer = 0;
+        (*out).real = 0.0;
+        (*out).string = ptr::null();
+        (*out).array = ptr::null();
+        (*out).array_count = 0;
+        (*out).retained = id as usize;
+    }
+}
+
+/// `StorageStream.read(count)` — return up to `count` bytes from the cursor.
+extern "C" fn stream_read(
+    engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: the trampoline guarantees argv/out/out_error validity.
+    let args = unsafe { args(argc, argv) };
+    let Some(count) = args.first().and_then(arg_i64) else {
+        set_error(out_error, "StorageStream.read requires a byte count");
+        return 1;
+    };
+    let inst = stream_mut(instance);
+    let end = inst
+        .pos
+        .saturating_add(count.max(0) as usize)
+        .min(inst.data.len());
+    let bytes = inst.data[inst.pos..end].to_vec();
+    inst.pos = end;
+    set_octet_out(engine, out, &bytes);
+    0
+}
+
+/// `StorageStream.write(data)` — write an octet (or string bytes) at the
+/// cursor, extending the buffer as needed.
+extern "C" fn stream_write(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: the trampoline guarantees argv/out/out_error validity.
+    let args = unsafe { args(argc, argv) };
+    let Some(arg) = args.first() else {
+        set_error(out_error, "StorageStream.write requires data");
+        return 1;
+    };
+    // SAFETY: `arg` is a valid value for the duration of the call.
+    let bytes = if arg.ty == tjs2_sys::VAL_OCTET {
+        unsafe { arg.octet_bytes() }.unwrap_or(&[]).to_vec()
+    } else {
+        arg_str(arg).unwrap_or_default().into_bytes()
+    };
+    let inst = stream_mut(instance);
+    if !inst.writable {
+        set_error(out_error, "StorageStream.write: stream is read-only");
+        return 1;
+    }
+    if inst.pos > inst.data.len() {
+        inst.data.resize(inst.pos, 0);
+    }
+    let end = inst.pos + bytes.len();
+    if end > inst.data.len() {
+        inst.data.resize(end, 0);
+    }
+    inst.data[inst.pos..end].copy_from_slice(&bytes);
+    inst.pos = end;
+    set_int_out(out, bytes.len() as i64);
+    0
+}
+
+/// `StorageStream.seek(offset, origin)` — reference `Seek` semantics: the
+/// cursor never leaves `[0, size]`.
+extern "C" fn stream_seek(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: the trampoline guarantees argv/out/out_error validity.
+    let args = unsafe { args(argc, argv) };
+    let Some(offset) = args.first().and_then(arg_i64) else {
+        set_error(out_error, "StorageStream.seek requires an offset");
+        return 1;
+    };
+    let origin = args.get(1).and_then(arg_i64).unwrap_or(0);
+    let inst = stream_mut(instance);
+    let base = match origin {
+        0 => 0i64,
+        1 => inst.pos as i64,
+        2 => inst.data.len() as i64,
+        other => {
+            set_error(
+                out_error,
+                &format!("StorageStream.seek: bad origin {other}"),
+            );
+            return 1;
+        }
+    };
+    inst.pos = (base + offset).clamp(0, inst.data.len() as i64) as usize;
+    set_int_out(out, inst.pos as i64);
+    0
+}
+
+/// `StorageStream.getSize()`.
+extern "C" fn stream_get_size(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    _argc: c_int,
+    _argv: *const Value,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    set_int_out(out, stream_mut(instance).data.len() as i64);
+    0
+}
+
+/// `StorageStream.getPosition()`.
+extern "C" fn stream_get_position(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    _argc: c_int,
+    _argv: *const Value,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    set_int_out(out, stream_mut(instance).pos as i64);
+    0
+}
+
+/// `StorageStream.close()` — flush a writable stream to disk.
+extern "C" fn stream_close(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    _argc: c_int,
+    _argv: *const Value,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let inst = stream_mut(instance);
+    if inst.writable && !inst.name.is_empty() {
+        flush_stream(inst);
+    }
+    set_void_out(out);
+    0
+}
+
+/// `Storages.open(name[, flags])` — open a storage entry and return a binary
+/// stream object. Reference flags: `TJS_BS_READ` (0, default), `WRITE` (1),
+/// `APPEND` (2), `UPDATE` (3). Read mode must resolve in the mounted storage;
+/// write modes start from the existing bytes (when present) and flush to the
+/// resolved disk path on `close`.
+extern "C" fn native_open(
+    engine: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    // SAFETY: the trampoline guarantees argv/out/out_error validity.
+    let args = unsafe { args(argc, argv) };
+    let name = match expect_string_arg(args, "open") {
+        Ok(name) => name,
+        Err(message) => {
+            set_error(out_error, &message);
+            return 1;
+        }
+    };
+    let flags = args.get(1).and_then(arg_i64).unwrap_or(TJS_BS_READ);
+    let Some(storage) = storage_arc() else {
+        set_error(out_error, "Storages.open: no storage mounted");
+        return 1;
+    };
+    let existing = storage.lock().unwrap().read(&name);
+    let (data, pos, writable) = match flags {
+        TJS_BS_READ => match existing {
+            Ok(data) => (data, 0, false),
+            Err(e) => {
+                set_error(out_error, &format!("Storages.open: {e}"));
+                return 1;
+            }
+        },
+        TJS_BS_WRITE => (Vec::new(), 0, true),
+        TJS_BS_APPEND => {
+            let data = existing.unwrap_or_default();
+            let pos = data.len();
+            (data, pos, true)
+        }
+        TJS_BS_UPDATE => (existing.unwrap_or_default(), 0, true),
+        other => {
+            set_error(out_error, &format!("Storages.open: unknown flags {other}"));
+            return 1;
+        }
+    };
+    *PENDING_STREAM.lock().unwrap_or_else(|p| p.into_inner()) = Some(StorageStreamInst {
+        data,
+        pos,
+        writable,
+        name,
+    });
+    let expression = c"new __TvpStorageStream()";
+    let script_name = c"Storages.open";
+    let mut result = Value {
+        ty: VAL_VOID,
+        integer: 0,
+        real: 0.0,
+        string: ptr::null(),
+        array: ptr::null(),
+        array_count: 0,
+        retained: 0,
+    };
+    let mut error = ptr::null_mut();
+    // SAFETY: engine is the callback's live VM; the ABI copies the expression.
+    let rc = unsafe {
+        tjs2_eval(
+            engine.cast::<Engine>(),
+            expression.as_ptr(),
+            script_name.as_ptr(),
+            &mut result,
+            &mut error,
+        )
+    };
+    if rc != 0 {
+        *PENDING_STREAM.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        let message = if error.is_null() {
+            "failed to construct stream object".to_string()
+        } else {
+            // SAFETY: tjs2_eval returns a NUL-terminated owned error string.
+            let message = unsafe { CStr::from_ptr(error) }
+                .to_string_lossy()
+                .into_owned();
+            // SAFETY: ownership of the error string belongs to this caller.
+            unsafe { tjs2_free_string(error) };
+            message
+        };
+        set_error(out_error, &format!("Storages.open: {message}"));
+        return 1;
+    }
+    let object = Value {
+        ty: tjs2_sys::VAL_OBJECT,
+        integer: 0,
+        real: 0.0,
+        string: ptr::null(),
+        array: ptr::null(),
+        array_count: 0,
+        retained: 0,
+    };
+    // SAFETY: `result`'s object is the engine's most recent object result.
+    let retained = unsafe { tjs2_retain_value(engine.cast::<Engine>(), &object) };
+    if retained.is_null() {
+        set_error(out_error, "Storages.open: failed to retain stream object");
+        return 1;
+    }
+    // SAFETY: `out` is the trampoline's valid result slot.
+    unsafe {
+        (*out).ty = VAL_RETAINED;
+        (*out).integer = 0;
+        (*out).real = 0.0;
+        (*out).string = ptr::null();
+        (*out).array = ptr::null();
+        (*out).array_count = 0;
+        (*out).retained = retained as usize;
+    }
+    0
+}
+
+/// Register the minimal `Storages.open` stream class.
+fn register_storage_stream(engine: &Tjs2Engine) -> Result<(), String> {
+    engine.register_native_class_instance(&NativeInstanceBuilder {
+        name: "__TvpStorageStream",
+        create: stream_create,
+        destroy: stream_destroy,
+        methods: vec![
+            NativeInstanceMethodDef {
+                name: "read",
+                f: stream_read,
+            },
+            NativeInstanceMethodDef {
+                name: "write",
+                f: stream_write,
+            },
+            NativeInstanceMethodDef {
+                name: "seek",
+                f: stream_seek,
+            },
+            NativeInstanceMethodDef {
+                name: "getSize",
+                f: stream_get_size,
+            },
+            NativeInstanceMethodDef {
+                name: "getPosition",
+                f: stream_get_position,
+            },
+            NativeInstanceMethodDef {
+                name: "close",
+                f: stream_close,
+            },
+        ],
+        properties: vec![],
+    })
+}
 
 /// `Storages.selectFile(param)` — the built-in GUI file selector.
 ///
@@ -1100,6 +1565,7 @@ extern "C" fn native_copy_file(
 
 pub fn register_storages(engine: &Tjs2Engine) -> Result<(), String> {
     csv_parser::register_csv_parser(engine)?;
+    register_storage_stream(engine)?;
     let builder = NativeClassBuilder {
         name: "Storages",
         properties: Vec::new(),
@@ -1734,13 +2200,65 @@ mod tests {
             TjsValue::Integer(0)
         );
 
-        // `open` and `searchCD` are still intentionally unimplemented.
-        for expr in ["Storages.open('a.tjs')", "Storages.searchCD('LABEL')"] {
-            let err = engine.eval(expr, "t").unwrap_err();
-            assert!(
-                err.to_string().contains("not implemented"),
-                "expected a 'not implemented' error for {expr}, got: {err}"
-            );
-        }
+        // `open` returns a real binary stream: read advances the cursor,
+        // seek rewinds it, and the size reflects the storage bytes.
+        engine
+            .exec_script(
+                "var st = Storages.open('a.tjs'); \
+                 var streamType = typeof st; \
+                 var size = st.getSize(); \
+                 st.read(2); \
+                 var pos = st.getPosition(); \
+                 st.seek(0, 0); \
+                 var rewound = st.getPosition(); \
+                 st.close();",
+                "t",
+            )
+            .unwrap();
+        assert_eq!(
+            engine.eval("streamType", "t").unwrap(),
+            TjsValue::String("Object".into())
+        );
+        assert_eq!(engine.eval("size", "t").unwrap(), TjsValue::Integer(5));
+        assert_eq!(engine.eval("pos", "t").unwrap(), TjsValue::Integer(2));
+        assert_eq!(engine.eval("rewound", "t").unwrap(), TjsValue::Integer(0));
+        // `searchCD` remains platform-specific and intentionally raises.
+        let err = engine.eval("Storages.searchCD('LABEL')", "t").unwrap_err();
+        assert!(
+            err.to_string().contains("not implemented"),
+            "expected a 'not implemented' error for searchCD, got: {err}"
+        );
+    }
+
+    #[test]
+    fn open_write_mode_flushes_to_disk_and_clear_archive_cache_runs() {
+        let _vm_lock = vm_lock();
+        reset_globals();
+        let (dir, path) = mount_game(&[]);
+        let engine = engine_with_storages();
+        // Write mode (flags 1): start empty, write, close -> flush to disk.
+        engine
+            .exec_script(
+                "var st = Storages.open('new.bin', 1); \
+                 st.write('hello'); \
+                 var pos = st.getPosition(); \
+                 st.close();",
+                "t",
+            )
+            .unwrap();
+        assert_eq!(engine.eval("pos", "t").unwrap(), TjsValue::Integer(5));
+        assert_eq!(std::fs::read(path.join("new.bin")).unwrap(), b"hello");
+        // `clearArchiveCache` clears the placed-path cache and remounts the
+        // storage without disturbing the mounted game.
+        engine
+            .exec_script("Storages.clearArchiveCache();", "t")
+            .unwrap();
+        assert_eq!(
+            engine
+                .eval("Storages.getPlacedPath('new.bin')", "t")
+                .unwrap(),
+            TjsValue::String("new.bin".into())
+        );
+        drop(dir);
     }
 }

@@ -2,20 +2,44 @@
 //!
 //! The game's scripts declare `class X extends <PluginBase>` for base
 //! classes provided by the bundled plugins (`menu.dll`, `windowEx.dll`,
-//! `fstat.dll`, ...) that krkr-rs stubs. With no plugin loaded, the
-//! `extends` clause fails to resolve. Every one of these bases is used only
-//! as a superclass marker or a thin interface (script-defined subclasses
-//! provide the real members), so a shared no-op instance class with a
-//! class-name constructor hook is faithful: instances chain through it to
-//! the script classes and the natives behind them.
+//! `fstat.dll`, ...) that krkr-rs replaces with built-in natives. With no
+//! plugin loaded, the `extends` clause fails to resolve, so each base is
+//! registered as an instance class whose constructor accepts any arguments.
 //!
-//! Verified against the game's scripts (system/*.tjs + patch) — the only
-//! `extends` bases that are neither script classes nor registered natives:
+//! # Verification (both shipped games' scripts)
 //!
-//!   InputNotifyBase        SceneBase, EyeCatchBase, StaffRoll extend it
-//!   WIN32GenericDialogEX   k2compat dialog base
-//!   TextContentModelessDialog  k2compat dialog base
-//!   SubMenu / SliderV      dialog widgets
+//! The bases below are only used as superclass markers or are reached only
+//! through plugin paths the emulator replaces; no script calls a *native*
+//! member of these classes on a path the engine exercises:
+//!
+//! | base | where used | native members called? |
+//! |---|---|---|
+//! | `InputNotifyBase` | `system/eyecatch.tjs` (`class EyeCatchBase extends
+//!   ActivateLayer, InputNotifyBase`) | no — marker mixin; input is routed by
+//!   `Window.addInputNotify`/`removeInputNotify` |
+//! | `WIN32GenericDialogEX` | `k2compat/k2compat.tjs` checks only
+//!   `typeof global.WIN32GenericDialogEX` to decide whether to load the
+//!   real `win32dialog.tjs` | no — its dialog members (`addLText`,
+//!   `addLineInput`, ...) are reached only from `System.inputString`, which
+//!   neither game calls (the k2compat override is never forced) |
+//! | `TextContentModelessDialog` | `k2compat/k2compat_padcommon.tjs` (loaded
+//!   only from the optional `Pad`/`Debug.console` delay-loaders) | no |
+//! | `SubMenu` | `system/messageframe.tjs` (superclass of `SystemMenu`,
+//!   `QuickSaveMenu`, `JumpMenu`, `ConfigSubMenu`) | **inherited Layer
+//!   members only** (`setSize`, `loadImages`, `copyRect`, ...); see below |
+//! | `SliderV` | not referenced by either game's scripts | no |
+//!
+//! # `SubMenu`
+//!
+//! `menu.dll`'s `SubMenu` is a `Layer` subclass in the reference, so its
+//! script subclasses (`SystemMenu`, ...) call inherited `Layer` members plus
+//! the plugin's `addItem`/`join`. A bare instance-class stub cannot express
+//! native inheritance through the current `tjs2-sys` builder (no base-class
+//! field), and `addItem`/`join` belong to the menu registry in
+//! `menu_item.rs`. Both are outside this file's scope and are reported rather
+//! than papered over. In the shipped games the whole path is latent: it runs
+//! only if `MessageFrame` is instantiated, and neither game's scripts do that
+//! (only `LoadScript("MessageFrame.tjs")` defines the class).
 //!
 //! `VideoOverlay` (the base of `MovieLayer` in movie.tjs) is deliberately
 //! NOT registered here: the game calls real members on it (`open`, `play`,

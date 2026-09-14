@@ -31,17 +31,21 @@
 //! | `changeScreenMode` | set the declared client size (`sync_host_window_resolution`) + `fullScreen` |
 //! | `mainWindow` / `focusedLayer` / `primaryLayer` | retained TJS objects (or `null`) |
 //! | `HWND` / `layerTreeOwnerInterface` | opaque native-instance pointer (inert token) |
-//! | `drawDevice` | documented inert: reads `null`, writes ignored (no draw-device class) |
+//! | `drawDevice` | assigned draw-device object retained and returned; no draw-device class is constructed, so reading before assignment is `null` |
 //! | `getTouchPoint` / `touchPointCount` | tracked from the native touch events |
-//! | `getMouseVelocity` / `getTouchVelocity` | return `0`; the ABI cannot write back out-params |
+//! | `bringToFront` | records a host raise/focus request (see [`take_window_raise_requests`]) |
+//! | `update([type])` | forces this frame's layer `onPaint` + marks the window for an immediate host redraw (see [`take_window_update_requests`]) |
+//! | `getMouseVelocity` / `getTouchVelocity` | return `0`; the ABI cannot write back out-params (the tracker is exposed to the input bridge, see [`take_mouse_velocity_reset_requests`]) |
+//! | `resetMouseVelocity` | records a host velocity-reset request for the input bridge |
 //! | `addInputNotify` / `registerExEvent` | documented host-inert extras (script state / WM hook only) |
 //! | `findFullScreenCandidates` / `registerMessageReceiver` | argument-checked no-ops |
 
 use std::ffi::{c_char, c_int, c_void};
+use std::sync::Mutex;
 
 use tjs2_sys::{
-    NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef, RetainedValue,
-    Tjs2Engine, TjsValue, Value,
+    DetachedValue, NativeClassBuilder, NativeInstanceBuilder, NativeInstanceMethodDef,
+    NativeInstancePropertyDef, NativeMethodDef, RetainedValue, Tjs2Engine, TjsValue, Value,
 };
 
 use crate::scene::Scene;
@@ -80,6 +84,10 @@ pub(crate) struct WindowInst {
     pub id: u32,
     /// Whether the native constructor has run.
     pub constructed: bool,
+    /// Assigned `drawDevice` object (reference `DrawDeviceObject`,
+    /// `WindowIntf.cpp:255`). No draw-device class is modelled, so only the
+    /// identity round-trips; the renderer owns the real draw device.
+    draw_device: Option<DrawDeviceRef>,
     /// `Window.menu` is backed by a script object stored in a uniquely named
     /// global.  Keeping the reference in the VM (rather than returning a
     /// newly-created object on each property read) gives the property stable
@@ -125,6 +133,7 @@ impl Default for WindowInst {
             id: 0,
             constructed: false,
             menu_ready: false,
+            draw_device: None,
             left: 0,
             top: 0,
             min_width: 0,
@@ -152,6 +161,70 @@ impl Default for WindowInst {
         }
     }
 }
+
+/// One assigned `Window.drawDevice` object. The reference stores a TJS object
+/// (`DrawDeviceObject`) and separately resolves its `iTVPDrawDevice`
+/// interface; krkr-rs has no draw-device class, so only the object identity
+/// is kept (the renderer is the real draw device).
+struct DrawDeviceRef {
+    /// Keeps the assigned object alive while the window references it.
+    #[allow(dead_code)]
+    keepalive: DetachedValue,
+    /// Raw TJS object pointer, valid for re-retention by the getter.
+    objthis: *mut c_void,
+}
+
+/// `Window.bringToFront()` requests queued until the host polls them.
+static RAISE_REQUESTS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+/// `Window.update()` requests queued until the host polls them; the `i32` is
+/// the reference `tTVPUpdateType` (`0` = normal, `1` = entire).
+static UPDATE_REQUESTS: Mutex<Vec<(u32, i32)>> = Mutex::new(Vec::new());
+/// `Window.resetMouseVelocity()` requests queued for the input bridge.
+static MOUSE_VELOCITY_RESET_REQUESTS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+fn lock_requests<T>(m: &Mutex<Vec<T>>) -> std::sync::MutexGuard<'_, Vec<T>> {
+    m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Drain the pending `bringToFront()` requests (window ids). The host window
+/// bridge should raise/focus the matching Bevy window; this is the OS-window
+/// boundary the headless scene model cannot cross.
+pub fn take_window_raise_requests() -> Vec<u32> {
+    std::mem::take(&mut *lock_requests(&RAISE_REQUESTS))
+}
+
+/// Drain the pending `update()` requests as `(window id, update type)`. The
+/// host should schedule an immediate redraw of that window; the engine has
+/// already marked its layer tree for `onPaint`.
+pub fn take_window_update_requests() -> Vec<(u32, i32)> {
+    std::mem::take(&mut *lock_requests(&UPDATE_REQUESTS))
+}
+
+/// Drain the pending `resetMouseVelocity()` requests (window ids). The input
+/// bridge owns the mouse-velocity tracker, so it should clear that window's
+/// samples; this is the tracker boundary.
+pub fn take_mouse_velocity_reset_requests() -> Vec<u32> {
+    std::mem::take(&mut *lock_requests(&MOUSE_VELOCITY_RESET_REQUESTS))
+}
+
+/// Whether `System.eventDisabled` is set, read through the shared VM.
+///
+/// The host input bridge already depends on this crate, so this is the
+/// reachable accessor for the flag `tvp-natives` owns (its
+/// `system::events_disabled` is not re-exported). The render bridge should
+/// return early from `dispatch_input` while this is true; both games set it
+/// only inside their `exceptionHandler`, right before terminating. A missing
+/// `System` class (a bare visual-only test engine) reads as `false`.
+pub fn events_disabled() -> bool {
+    match context_engine().eval("System.eventDisabled", "events_disabled") {
+        Ok(TjsValue::Integer(v)) => v != 0,
+        Ok(TjsValue::Real(v)) => v != 0.0,
+        _ => false,
+    }
+}
+
+/// Reference `tTVPUpdateType::utNormal`.
+const UT_NORMAL: i32 = 0;
 
 /// `new Window()` payload factory.
 extern "C" fn window_create(_engine: *mut c_void) -> *mut c_void {
@@ -1012,30 +1085,64 @@ extern "C" fn window_hide_mouse_cursor(
     0
 }
 
-/// `bringToFront()` — no-op (single-window milestone).
+/// `bringToFront()` — queue a host raise/focus request for this window.
+///
+/// Reference `tTJSNI_Window::BringToFront` (`WindowImpl.cpp:1487`) calls
+/// `_form->BringToFront()`. The OS window belongs to the Bevy host, so the
+/// request is published for [`take_window_raise_requests`] instead of being
+/// silently dropped (the same host-hook pattern as [`notify_window_resize`]).
 extern "C" fn window_bring_to_front(
     _engine: *mut c_void,
-    _instance: *mut c_void,
+    instance: *mut c_void,
     _argc: c_int,
     _argv: *const Value,
     out: *mut Value,
     _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    let id = win(instance).id;
+    lock_requests(&RAISE_REQUESTS).push(id);
     set_void_out(out);
     0
 }
 
-/// `update()` — no-op (the render loop syncs every frame).
+/// `update([type])` — force the window's layer tree to repaint now and queue
+/// a host redraw request.
+///
+/// Reference `tTJSNI_Window::Update(type)` (`WindowImpl.cpp:1493`) calls
+/// `_form->UpdateWindow(type)` (`utNormal` = needed region, `utEntire` =
+/// whole window). krkr-rs cannot touch the OS window from here, so it (a)
+/// marks every layer under the window for the engine's `onPaint` dispatch
+/// this frame and (b) publishes `(window id, type)` for
+/// [`take_window_update_requests`]. A no-argument call is `utNormal`.
 extern "C" fn window_update(
     _engine: *mut c_void,
-    _instance: *mut c_void,
-    _argc: c_int,
-    _argv: *const Value,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
     out: *mut Value,
     _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: argv/out are valid for the call.
+    let args = unsafe { super::ffi::args(argc, argv) };
+    let update_type = args.first().map(|v| arg_i64(v) as i32).unwrap_or(UT_NORMAL);
+    let id = win(instance).id;
+    lock_requests(&UPDATE_REQUESTS).push((id, update_type));
+    // Repaint the logical layer tree now rather than waiting for the next
+    // unrelated mutation: `paint_poll` fires each marked layer's `onPaint`,
+    // and the revision bump makes the renderer resync even with no layers.
+    let mut scene = context_scene_mut();
+    let layer_ids: Vec<u32> = scene
+        .window(id)
+        .map(|w| w.layers.clone())
+        .unwrap_or_default();
+    for layer in layer_ids {
+        if let Some(l) = scene.layer_mut(layer) {
+            l.pending_paint = true;
+        }
+    }
+    let _ = scene.window_mut(id);
     set_void_out(out);
     0
 }
@@ -1227,16 +1334,22 @@ extern "C" fn window_get_mouse_velocity(
     0
 }
 
-/// `resetMouseVelocity()` — no-op (no tracker).
+/// `resetMouseVelocity()` — queue a host velocity-reset request for this
+/// window. The input bridge owns the sample history, so this clears its
+/// tracker through [`take_mouse_velocity_reset_requests`] rather than
+/// ignoring the call (reference `tTJSNI_Window::ResetMouseVelocity`,
+/// `WindowImpl.cpp:1949`).
 extern "C" fn window_reset_mouse_velocity(
     _engine: *mut c_void,
-    _instance: *mut c_void,
+    instance: *mut c_void,
     _argc: c_int,
     _argv: *const Value,
     out: *mut Value,
     _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    let id = win(instance).id;
+    lock_requests(&MOUSE_VELOCITY_RESET_REQUESTS).push(id);
     set_void_out(out);
     0
 }
@@ -1517,29 +1630,71 @@ extern "C" fn window_layer_tree_owner_interface_get(
     0
 }
 
-/// `drawDevice` getter — no draw-device class exists in the headless port, so
-/// the reference's default `BasicDrawDevice` cannot be constructed; reads
-/// return TJS `null` (documented inert).
+/// `drawDevice` getter — the assigned draw-device object, or `null` when
+/// none was set. The reference returns `DrawDeviceObject`
+/// (`WindowIntf.cpp:2303`).
 extern "C" fn window_draw_device_get(
-    _e: *mut c_void,
-    _instance: *mut c_void,
+    _engine: *mut c_void,
+    instance: *mut c_void,
     out: *mut Value,
     _err: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    set_null_out(context_engine(), out);
+    let inst = win(instance);
+    let engine = context_engine();
+    let obj = inst.draw_device.as_ref().map(|d| d.objthis);
+    if let Some(obj) = obj
+        && set_object_out(engine, obj, out)
+    {
+        return 0;
+    }
+    set_null_out(engine, out);
     0
 }
 
-/// `drawDevice` setter — accepted and ignored (no draw-device class).
+/// `drawDevice` setter — retain and store the assigned object when it is a
+/// real draw device. The reference (`WindowIntf.cpp:255` →
+/// `SetDrawDeviceObject`) reads the object's `interface` property and keeps
+/// the object only when that resolves to a non-null `iTVPDrawDevice`. krkr-rs
+/// has no draw-device class, so it applies the same test: an object exposing a
+/// non-zero `interface` is stored by identity; anything else leaves the
+/// property unchanged (the reference throws here, but no game assigns a
+/// non-device and the headless property stays `null`). `null`/`void` clears.
 extern "C" fn window_draw_device_set(
-    _e: *mut c_void,
-    _instance: *mut c_void,
-    _value: *const Value,
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    value: *const Value,
     _err: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    0
+    let inst = win(instance);
+    // SAFETY: value is valid for the call.
+    let v = unsafe { &*value };
+    if matches!(v.ty, tjs2_sys::VAL_VOID | tjs2_sys::VAL_NULL) {
+        inst.draw_device = None;
+        return 0;
+    }
+    if v.ty != tjs2_sys::VAL_OBJECT || v.object_handle().is_null() {
+        return 0;
+    }
+    let engine = context_engine();
+    match engine.retain_object_arg(v) {
+        Ok(keepalive) => {
+            let has_interface = match engine.get_member(keepalive.raw_id(), "interface") {
+                Ok(TjsValue::Integer(n)) => n != 0,
+                Ok(TjsValue::Real(n)) => n != 0.0,
+                _ => false,
+            };
+            if has_interface {
+                inst.draw_device = Some(DrawDeviceRef {
+                    keepalive,
+                    objthis: v.object_handle(),
+                });
+            }
+            0
+        }
+        Err(_) => 0,
+    }
 }
 
 /// Retain a TJS object into a `VAL_RETAINED` result slot. Returns `false`
@@ -2369,8 +2524,55 @@ pub fn notify_window_activate(engine: &Tjs2Engine, window_id: u32, active: bool)
 // Registration
 //---------------------------------------------------------------------------
 
+//---------------------------------------------------------------------------
+// Graphics-cache bridge
+//---------------------------------------------------------------------------
+
+/// Clear the scene bitmap-name cache (reference `TVPClearGraphicCache`,
+/// `GraphicsLoaderIntf.cpp:1456`): the next `Bitmap(name)` decodes from
+/// storage again instead of reusing a template. Live `Bitmap` objects keep
+/// their pixels; only the reuse map is dropped (the reference's cache holds
+/// refcounted images, the port has no refcounts).
+extern "C" fn graphic_cache_clear(
+    _engine: *mut c_void,
+    _argc: c_int,
+    _argv: *const Value,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+) -> c_int {
+    super::bitmap_cache().by_name.clear();
+    set_void_out(out);
+    0
+}
+
+/// Register the graphics-cache bridge that the `System` natives
+/// (`System.clearGraphicCache` / `System.doCompact`, in `tvp-natives`) call
+/// through the shared VM. The bitmap cache lives in this crate, so the
+/// bridge is a hidden global script function rather than a direct
+/// dependency.
+pub(crate) fn register_graphic_cache_bridge(engine: &Tjs2Engine) -> Result<(), String> {
+    engine.register_native_class(&NativeClassBuilder {
+        name: "__TvpGraphicCache",
+        properties: Vec::new(),
+        methods: vec![NativeMethodDef {
+            name: "clear",
+            f: graphic_cache_clear,
+        }],
+    })?;
+    engine
+        .exec_script(
+            "if(typeof global.__tvp_clearGraphicCache == \"undefined\"){\n\
+             global.__tvp_clearGraphicCache = function(){ __TvpGraphicCache.clear(); };\n\
+         }",
+            "TvpGraphicCacheBridge",
+        )
+        .map_err(|e| format!("register graphic-cache bridge: {e}"))?;
+    Ok(())
+}
+
 /// Register the `Window` native class.
 pub(crate) fn register_window(engine: &Tjs2Engine) -> Result<(), String> {
+    register_graphic_cache_bridge(engine)?;
     engine.register_native_class_instance(&NativeInstanceBuilder {
         name: "Window",
         create: window_create,
@@ -3006,5 +3208,65 @@ mod tests {
         assert_eq!(env.eval_int("w.fullScreen"), 1);
         let scene = env.scene();
         assert_eq!(scene.windows[0].inner_size, (1024, 768));
+    }
+
+    #[test]
+    fn window_bring_to_front_update_and_velocity_reset_queue_host_requests() {
+        use super::{
+            take_mouse_velocity_reset_requests, take_window_raise_requests,
+            take_window_update_requests,
+        };
+        let env = TestEnv::new("window-host-requests");
+        // Drain leftovers from an earlier test in this serialized binary.
+        let _ = take_window_raise_requests();
+        let _ = take_window_update_requests();
+        let _ = take_mouse_velocity_reset_requests();
+        env.run(
+            "var w = new Window(); \
+             w.bringToFront(); \
+             w.update(1); \
+             w.resetMouseVelocity();",
+        )
+        .unwrap();
+        let id = env.eval_int("w.id") as u32;
+        assert_eq!(take_window_raise_requests(), vec![id]);
+        assert_eq!(take_window_update_requests(), vec![(id, 1)]);
+        assert_eq!(take_mouse_velocity_reset_requests(), vec![id]);
+    }
+
+    #[test]
+    fn window_update_marks_layers_for_repaint() {
+        let env = TestEnv::new("window-update-repaint");
+        env.run("var w = new Window(); var l = new Layer(w, null); w.update();")
+            .unwrap();
+        let scene = env.scene();
+        assert!(
+            scene.layers[0].pending_paint,
+            "update() must request onPaint"
+        );
+    }
+
+    #[test]
+    fn window_draw_device_roundtrips_and_ignores_non_devices() {
+        let env = TestEnv::new("window-draw-device");
+        env.run("var w = new Window(); var dd = %[interface:123]; w.drawDevice = dd;")
+            .unwrap();
+        assert_eq!(env.eval_int("w.drawDevice === dd"), 1);
+        // null/void clears the assignment.
+        env.run("w.drawDevice = null;").unwrap();
+        assert_eq!(env.eval_int("w.drawDevice === null"), 1);
+        // An object without a non-zero `interface` is not a draw device and
+        // leaves the property unchanged (the reference rejects it).
+        env.run("w.drawDevice = %[];").unwrap();
+        assert_eq!(env.eval_int("w.drawDevice === null"), 1);
+    }
+
+    #[test]
+    fn events_disabled_defaults_false_without_system() {
+        let env = TestEnv::new("window-events-disabled");
+        env.run("var w = new Window();").unwrap();
+        // The visual-only test engine has no `System` class, so the accessor
+        // degrades to false instead of throwing.
+        assert!(!super::events_disabled());
     }
 }

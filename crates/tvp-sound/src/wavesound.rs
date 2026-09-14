@@ -46,13 +46,17 @@
 //! - `status` (ro) — `"unload"|"play"|"stop"` (the reference's
 //!   `GetStatusString` has no `pause`; `paused` does not change status).
 //! - `looping` (rw, bool), `paused` (rw, bool — settable before `play`).
-//! - `speed` (rw) — **stored only**: PhaseVocoder playback is out of scope
-//!   (documented limitation; the value round-trips but playback rate is
-//!   unaffected). Use `frequency` for a real rate change.
-//! - `filters` (ro) — a fresh empty array per access. The game's BGM path
-//!   (`createFilter:1`) calls `.filters.clear()` / `.filters.add(...)` and
-//!   reads `filters[0]`; an empty array keeps that path from crashing while
-//!   filter processing stays unimplemented (PhaseVocoder out of scope).
+//! - `speed` (rw) — **stored only**: the value round-trips, but the mixer
+//!   does not apply the phase-vocoder time stretch. Use `frequency` for a
+//!   real rate change.
+//! - `filters` (ro) — the buffer's stable, real TJS `Array` (reference
+//!   `GetFiltersNoAddRef`). The game's BGM path does `.filters.clear()` /
+//!   `.filters.add(new WaveSoundBuffer.PhaseVocoder())` and later reads
+//!   `filters[0]`; the array keeps identity across reads.
+//! - `WaveSoundBuffer.PhaseVocoder` — a real native filter class with the
+//!   reference's `window`/`overlap`/`pitch`/`time`/`interface` members. The
+//!   phase-vocoder DSP itself is not applied by the mixer (documented gap),
+//!   but the members store and return their values like the reference.
 //!
 //! # Status events
 //!
@@ -74,7 +78,7 @@ use std::sync::{LazyLock, Mutex, OnceLock};
 
 use tjs2_sys::{
     DetachedValue, NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef,
-    Tjs2Engine, TjsValue,
+    RetainedValue, Tjs2Engine, TjsValue,
 };
 
 use crate::ffi;
@@ -192,6 +196,14 @@ struct WaveSoundBufferInst {
     /// `frequency` property override (reference `SetFrequency`), applied as
     /// a playback-rate multiplier. `None` = the source's native rate.
     frequency: Option<u32>,
+    /// Stable `filters` array (reference `Filters`, a real TJS Array). The
+    /// array keeps object identity across property reads because it lives in
+    /// a uniquely named global; this is the keepalive. The game does
+    /// `.filters.clear()` / `.filters.add(...)` / `filters[0]`.
+    filters_array: Option<DetachedValue>,
+    /// Global name holding the `filters` array (the ABI cannot re-retain an
+    /// existing id, so the getter re-evaluates the global).
+    filters_global: Option<String>,
 }
 
 extern "C" fn ws_create(_engine: *mut c_void) -> *mut c_void {
@@ -199,6 +211,8 @@ extern "C" fn ws_create(_engine: *mut c_void) -> *mut c_void {
         stream_id: 0,
         speed: 1.0,
         frequency: None,
+        filters_array: None,
+        filters_global: None,
     })) as *mut c_void
 }
 
@@ -304,6 +318,22 @@ extern "C" fn ws_ctor(
         },
     );
     inst.stream_id = id;
+    // Build the stable `filters` array the game mutates. A named global keeps
+    // the array alive and gives the getter a way to return the same object
+    // (the ABI cannot re-retain an existing retained id).
+    let filters_name = format!("__krkr_wsb_filters_{id}");
+    if engine
+        .exec_script(
+            &format!("global.{filters_name} = [];"),
+            "WaveSoundBuffer.filters",
+        )
+        .is_ok()
+        && let Ok(RetainedValue::Object(array)) =
+            engine.eval_retained(&format!("global.{filters_name}"), "WaveSoundBuffer.filters")
+    {
+        inst.filters_array = Some(array);
+        inst.filters_global = Some(filters_name);
+    }
     ffi::set_void_out(out);
     0
 }
@@ -1322,21 +1352,39 @@ extern "C" fn ws_speed_set(
     0
 }
 
-/// `filters` getter — a fresh empty array per access. The game's BGM path
-/// (`createFilter:1`) calls `.filters.clear()` / `.filters.add(...)` and
-/// reads `filters[0]`; an empty array keeps that path from crashing while
-/// filter processing stays unimplemented (PhaseVocoder out of scope).
+/// `filters` getter — the buffer's stable filter array (reference
+/// `GetFiltersNoAddRef`). The game's BGM path (`SoundBuffer.speed` setter,
+/// `system/sound.tjs`) does `.filters.clear()` / `.filters.add(new
+/// WaveSoundBuffer.PhaseVocoder())` and later reads `filters[0]`, so the
+/// array must keep identity across reads. The array is a real TJS `Array`;
+/// the PhaseVocoder objects added to it are real native instances.
 extern "C" fn ws_filters_get(
     _engine: *mut c_void,
     instance: *mut c_void,
     out: *mut tjs2_sys::Value,
-    _out_error: *mut *mut c_char,
+    out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
     // SAFETY: instance is a valid WaveSoundBufferInst payload for the call.
-    let _inst = unsafe { &mut *ffi::instance_ptr::<WaveSoundBufferInst>(instance) };
-    ffi::set_empty_array_out(out);
-    0
+    let inst = unsafe { &mut *ffi::instance_ptr::<WaveSoundBufferInst>(instance) };
+    let Some(name) = inst.filters_global.as_ref() else {
+        ffi::set_empty_array_out(out);
+        return 0;
+    };
+    let Some(engine) = context_engine() else {
+        return ffi::report_error(out_error, "WaveSoundBuffer.filters: engine context not set");
+    };
+    match engine.eval_retained(&format!("global.{name}"), "WaveSoundBuffer.filters") {
+        Ok(RetainedValue::Object(array)) => {
+            ffi::set_retained_out(out, array);
+            0
+        }
+        Ok(RetainedValue::Value(_)) => {
+            ffi::set_empty_array_out(out);
+            0
+        }
+        Err(e) => ffi::report_error(out_error, &format!("WaveSoundBuffer.filters: {e}")),
+    }
 }
 
 /// Evaluate `expr` and hand its object result back as the callback result
@@ -1661,6 +1709,165 @@ fn method(name: &'static str, f: tjs2_sys::NativeInstanceMethodFn) -> NativeInst
     NativeInstanceMethodDef { name, f }
 }
 
+// ---------------------------------------------------------------------------
+// PhaseVocoder (exposed as `WaveSoundBuffer.PhaseVocoder`)
+// ---------------------------------------------------------------------------
+
+/// Payload of one `WaveSoundBuffer.PhaseVocoder` filter object. Reference
+/// `tTJSNI_PhaseVocoder` (`PhaseVocoderFilter.cpp:139`) defaults are
+/// `window=4096`, `overlap=0`, `pitch=1.0`, `time=1.0`. The properties are
+/// real stored state; the phase-vocoder DSP itself is not applied by the
+/// mixer (see the module docs), so `time` round-trips but does not alter
+/// playback yet.
+struct PhaseVocoderInst {
+    window: i64,
+    overlap: i64,
+    pitch: f64,
+    time: f64,
+}
+
+impl Default for PhaseVocoderInst {
+    fn default() -> Self {
+        Self {
+            window: 4096,
+            overlap: 0,
+            pitch: 1.0,
+            time: 1.0,
+        }
+    }
+}
+
+extern "C" fn phase_vocoder_create(_engine: *mut c_void) -> *mut c_void {
+    Box::into_raw(Box::new(PhaseVocoderInst::default())) as *mut c_void
+}
+
+extern "C" fn phase_vocoder_destroy(_engine: *mut c_void, instance: *mut c_void) {
+    if !instance.is_null() {
+        // SAFETY: instance came from phase_vocoder_create's Box::into_raw.
+        drop(unsafe { Box::from_raw(instance as *mut PhaseVocoderInst) });
+    }
+}
+
+/// Borrow the PhaseVocoder instance payload.
+fn phase_vocoder(instance: *mut c_void) -> &'static mut PhaseVocoderInst {
+    // SAFETY: the dispatcher guarantees `instance` is the create payload.
+    unsafe { &mut *(instance as *mut PhaseVocoderInst) }
+}
+
+/// `interface` — the reference returns the `iTVPBasicWaveFilter` pointer as
+/// an opaque integer token. The `PhaseVocoderInst` address is the analogue.
+extern "C" fn pv_interface_get(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut tjs2_sys::Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    ffi::set_int_out(out, instance as usize as i64);
+    0
+}
+
+/// Generate the integer and real PhaseVocoder properties.
+macro_rules! pv_i64_property {
+    ($get:ident, $set:ident, $field:ident) => {
+        extern "C" fn $get(
+            _engine: *mut c_void,
+            instance: *mut c_void,
+            out: *mut tjs2_sys::Value,
+            _out_error: *mut *mut c_char,
+            _objthis: *mut c_void,
+        ) -> c_int {
+            ffi::set_int_out(out, phase_vocoder(instance).$field);
+            0
+        }
+
+        extern "C" fn $set(
+            _engine: *mut c_void,
+            instance: *mut c_void,
+            value: *const tjs2_sys::Value,
+            _out_error: *mut *mut c_char,
+            _objthis: *mut c_void,
+        ) -> c_int {
+            // SAFETY: value points at the property value for the call.
+            let v = unsafe { &*value };
+            phase_vocoder(instance).$field = ffi::value_as_f64(v) as i64;
+            0
+        }
+    };
+}
+
+macro_rules! pv_f64_property {
+    ($get:ident, $set:ident, $field:ident) => {
+        extern "C" fn $get(
+            _engine: *mut c_void,
+            instance: *mut c_void,
+            out: *mut tjs2_sys::Value,
+            _out_error: *mut *mut c_char,
+            _objthis: *mut c_void,
+        ) -> c_int {
+            ffi::set_real_out(out, phase_vocoder(instance).$field);
+            0
+        }
+
+        extern "C" fn $set(
+            _engine: *mut c_void,
+            instance: *mut c_void,
+            value: *const tjs2_sys::Value,
+            _out_error: *mut *mut c_char,
+            _objthis: *mut c_void,
+        ) -> c_int {
+            // SAFETY: value points at the property value for the call.
+            let v = unsafe { &*value };
+            phase_vocoder(instance).$field = ffi::value_as_f64(v);
+            0
+        }
+    };
+}
+
+pv_i64_property!(pv_window_get, pv_window_set, window);
+pv_i64_property!(pv_overlap_get, pv_overlap_set, overlap);
+pv_f64_property!(pv_pitch_get, pv_pitch_set, pitch);
+pv_f64_property!(pv_time_get, pv_time_set, time);
+
+/// Register the `PhaseVocoder` native class (exposed by the script as
+/// `WaveSoundBuffer.PhaseVocoder`, mirroring the reference's
+/// `ScriptMgnIntf.cpp:515` nested-class registration).
+fn register_phase_vocoder(engine: &Tjs2Engine) -> Result<(), String> {
+    engine.register_native_class_instance(&NativeInstanceBuilder {
+        name: "__TvpPhaseVocoder",
+        create: phase_vocoder_create,
+        destroy: phase_vocoder_destroy,
+        methods: vec![],
+        properties: vec![
+            NativeInstancePropertyDef {
+                name: "interface",
+                get: Some(pv_interface_get),
+                set: None,
+            },
+            NativeInstancePropertyDef {
+                name: "window",
+                get: Some(pv_window_get),
+                set: Some(pv_window_set),
+            },
+            NativeInstancePropertyDef {
+                name: "overlap",
+                get: Some(pv_overlap_get),
+                set: Some(pv_overlap_set),
+            },
+            NativeInstancePropertyDef {
+                name: "pitch",
+                get: Some(pv_pitch_get),
+                set: Some(pv_pitch_set),
+            },
+            NativeInstancePropertyDef {
+                name: "time",
+                get: Some(pv_time_get),
+                set: Some(pv_time_set),
+            },
+        ],
+    })
+}
+
 /// Register the `WaveSoundBuffer` native class on `engine`. Must be called
 /// on the VM thread; the engine pointer is kept for the poll's event
 /// delivery.
@@ -1735,17 +1942,15 @@ pub(crate) fn register_wavesound(engine: &Tjs2Engine) -> Result<(), String> {
     })?;
     // The reference's `WaveSoundBuffer` exposes nested filter classes; the
     // game's `SoundLayer` does `new WaveSoundBuffer.PhaseVocoder()` when a
-    // BGM is played with `createFilter:1` (the title/the OP). Filter
-    // processing is out of scope, but the class must exist and construct
-    // so the playlist setup does not throw.
+    // BGM is played with `createFilter:1` (the title/the OP). The class is a
+    // real native instance (window/overlap/pitch/time); the phase-vocoder
+    // DSP is not applied by the mixer yet.
+    register_phase_vocoder(engine)?;
     engine
         .exec_script(
             r#"
             if(typeof WaveSoundBuffer.PhaseVocoder == "undefined"){
-                class _PhaseVocoder {
-                    function _PhaseVocoder(){}
-                }
-                WaveSoundBuffer.PhaseVocoder = _PhaseVocoder;
+                WaveSoundBuffer.PhaseVocoder = __TvpPhaseVocoder;
             }
             "#,
             "WaveSoundBuffer_PhaseVocoder",
@@ -1922,4 +2127,38 @@ pub fn sound_poll(engine: &Tjs2Engine, now_seconds: f64) {
 /// Escape a string for inclusion in a single-quoted TJS string literal.
 fn escape_js(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\'', "\\'")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The `filters` array must keep object identity across property reads
+    /// (the game does `.filters.clear()`/`.filters.add(...)` and later reads
+    /// `filters[0]`), and `WaveSoundBuffer.PhaseVocoder` must be a real
+    /// native class whose properties round-trip.
+    #[test]
+    fn filters_array_is_stable_and_phase_vocoder_roundtrips() {
+        let engine = Tjs2Engine::new().expect("create engine");
+        register_wavesound(&engine).expect("register wavesound");
+        engine
+            .exec_script(
+                "var b = new WaveSoundBuffer(%[]); \
+                 b.filters.add(new WaveSoundBuffer.PhaseVocoder()); \
+                 b.filters[0].time = 2.5; \
+                 b.filters[0].pitch = 0.5; \
+                 var count = b.filters.count; \
+                 var t = b.filters[0].time; \
+                 var p = b.filters[0].pitch; \
+                 var same = (b.filters === b.filters); \
+                 var win = b.filters[0].window;",
+                "filters",
+            )
+            .expect("filters script");
+        assert_eq!(engine.eval("count", "t").unwrap(), TjsValue::Integer(1));
+        assert_eq!(engine.eval("t", "t").unwrap(), TjsValue::Real(2.5));
+        assert_eq!(engine.eval("p", "t").unwrap(), TjsValue::Real(0.5));
+        assert_eq!(engine.eval("same", "t").unwrap(), TjsValue::Integer(1));
+        assert_eq!(engine.eval("win", "t").unwrap(), TjsValue::Integer(4096));
+    }
 }

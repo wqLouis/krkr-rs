@@ -37,10 +37,17 @@
 //!   dialog is commented out).
 //! * `toActualColor` — real `TVPToActualColor` (`ColorToRGB` table + the
 //!   RGB byte-order swap).
-//! * `clearGraphicCache` / `touchImages` — no-ops (no global image cache).
+//! * `clearGraphicCache` — clears the `tvp-visual` bitmap-template cache
+//!   through the shared-VM bridge (`Window` registration publishes
+//!   `global.__tvp_clearGraphicCache`); real `TVPClearGraphicCache`
+//!   (`SystemIntf.cpp:215`).
+//! * `touchImages` — validates its arguments; krkr-rs caches per layer on
+//!   demand, so pre-caching has nothing to do (host-only).
 //! * `createUUID` — real RFC-4122 v4 UUID from a clock/counter/address seed.
 //! * `assignMessage` — stores an `id` → `message` override and returns true.
-//! * `doCompact` — no-op (compaction is a GC hint).
+//! * `doCompact` — real compaction: clears the `tvp-visual` bitmap cache at
+//!   `clMinimize` and up and the archive/auto-path caches at `clDeactivate`
+//!   and up (the `clIdle` TJS-GC hook has no `tjs2-sys` entry point yet).
 //!
 //! # `setArgument` / `getArgument` semantics
 //!
@@ -829,9 +836,11 @@ extern "C" fn native_to_actual_color(
 
 /// `System.clearGraphicCache()` → void
 ///
-/// Reference: `TVPClearGraphicCache` (`SystemIntf.cpp:215`). krkr-rs has no
-/// global image cache yet, so this is a no-op (kept so scripts that call it
-/// do not throw).
+/// Reference: `TVPClearGraphicCache` (`SystemIntf.cpp:215`), which clears the
+/// shared decoded-image cache. The bitmap cache lives in `tvp-visual`, so
+/// this calls that crate's `global.__tvp_clearGraphicCache` bridge (see
+/// `Window` registration). The render/CLI hosts register the visual natives;
+/// a bare `tvp-natives` engine has no bridge and the call is a guarded no-op.
 extern "C" fn native_clear_graphic_cache(
     _engine: *mut c_void,
     _argc: c_int,
@@ -839,8 +848,25 @@ extern "C" fn native_clear_graphic_cache(
     out: *mut Value,
     _out_error: *mut *mut c_char,
 ) -> c_int {
+    clear_graphic_cache_via_vm();
     set_void_out(out);
     0
+}
+
+/// Invoke the `tvp-visual` graphics-cache bridge through the shared VM.
+///
+/// `System.clearGraphicCache` / `System.doCompact` live in this crate while
+/// the name→bitmap-template cache lives in `tvp-visual`; registering a second
+/// native dependency is unnecessary because both crates already share the
+/// VM. The visual crate publishes `global.__tvp_clearGraphicCache` during
+/// `Window` registration, and the guard makes the call harmless when only the
+/// `System`/`Debug` natives are registered (unit tests).
+fn clear_graphic_cache_via_vm() {
+    let script = "if(typeof global.__tvp_clearGraphicCache != \"undefined\") \
+                  global.__tvp_clearGraphicCache();";
+    if let Err(e) = context_engine().exec_script(script, "System.clearGraphicCache") {
+        log::warn!("System.clearGraphicCache: graphics-cache bridge failed: {e}");
+    }
 }
 
 /// `System.touchImages(storages[, limit[, timeout]])` → void
@@ -962,14 +988,42 @@ fn make_uuid() -> String {
     )
 }
 
-/// `System.doCompact(...)` — stubbed no-op (compaction is a GC hint).
+/// `System.doCompact(level = TVP_COMPACT_LEVEL_MAX)` — real compaction.
+///
+/// Reference `System.doCompact` (`SystemIntf.cpp:306`) defaults `level` to
+/// `TVP_COMPACT_LEVEL_MAX` (100) and calls `TVPDeliverCompactEvent(level)`,
+/// whose hooks (`EventIntf.h:279`) run the TJS garbage collector at
+/// `clIdle` (5), clear the auto-path/archive caches at `clDeactivate` (10)
+/// and clear the graphic/font caches at `clMinimize` (15). The games call it
+/// at every scenario change (`advscreen.tjs` `clIdle`), whose comment says
+/// the intent is a GC, and on a scene reset (`gamescenemanager.tjs` `clAll`).
+///
+/// The port honors the thresholds: the `tvp-visual` bitmap-template cache is
+/// dropped from `clMinimize` up and `Storages.clearArchiveCache()` runs from
+/// `clDeactivate` up. The `clIdle` hook is TJS garbage collection, which has
+/// no `tjs2-sys` entry point yet; that is the one reference hook this native
+/// cannot drive (documented gap), and driving the bitmap cache at `clIdle`
+/// instead would force a re-decode on every scenario change.
 extern "C" fn system_do_compact(
     _engine: *mut c_void,
-    _argc: c_int,
-    _argv: *const tjs2_sys::Value,
+    argc: c_int,
+    argv: *const tjs2_sys::Value,
     out: *mut Value,
     _out_error: *mut *mut c_char,
 ) -> c_int {
+    let level = args(argv, argc).first().map(value_as_i64).unwrap_or(100);
+    // `TVP_COMPACT_LEVEL_MINIMIZE` = 15 (reference `EventIntf.h:281`).
+    if level >= 15 {
+        clear_graphic_cache_via_vm();
+    }
+    // `TVP_COMPACT_LEVEL_DEACTIVATE` = 10.
+    if level >= 10 {
+        let script = "if(typeof global.Storages != \"undefined\") \
+                      global.Storages.clearArchiveCache();";
+        if let Err(e) = context_engine().exec_script(script, "System.doCompact") {
+            log::warn!("System.doCompact: archive-cache bridge failed: {e}");
+        }
+    }
     crate::set_void_out(out);
     0
 }
@@ -1321,6 +1375,16 @@ pub fn exit_on_window_close() -> bool {
     EXIT_ON_WINDOW_CLOSE.load(Ordering::SeqCst)
 }
 
+/// Whether `System.eventDisabled` is set (reference
+/// `TVPGetSystemEventDisabledState`). The reference gates `TVPPostEvent` and
+/// `TVPPostInputEvent` (discardable events) on this flag; krkr-rs delivers
+/// input directly from the host input bridge, so the bridge should check this
+/// before dispatching (both games set it inside the `exceptionHandler` right
+/// before `System.terminate`, so normal play is unaffected).
+pub fn events_disabled() -> bool {
+    EVENT_DISABLED.load(Ordering::SeqCst)
+}
+
 /// Exit code recorded by `System.exit` (0 = not requested). Public mirror of
 /// the most recent request; the *pending* request is `EXIT_REQUEST`.
 pub static TERMINATE_CODE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
@@ -1531,10 +1595,7 @@ extern "C" fn prop_event_disabled_get(
     out: *mut Value,
     _err: *mut *mut c_char,
 ) -> c_int {
-    set_int_out(
-        out,
-        EVENT_DISABLED.load(std::sync::atomic::Ordering::SeqCst) as i64,
-    );
+    set_int_out(out, i64::from(events_disabled()));
     0
 }
 
@@ -2086,6 +2147,23 @@ mod tests {
         )
         .unwrap();
         assert!(e.eval("System.touchImages()", "test").is_err());
+    }
+
+    #[test]
+    fn event_disabled_property_roundtrips() {
+        let _vm_lock = crate::test_lock::vm_lock();
+        let e = engine_with_system();
+        assert!(!events_disabled());
+        e.exec_script("System.eventDisabled = true;", "test")
+            .unwrap();
+        assert!(events_disabled());
+        assert_eq!(
+            e.eval("System.eventDisabled", "test").unwrap(),
+            tjs2_sys::TjsValue::Integer(1)
+        );
+        e.exec_script("System.eventDisabled = false;", "test")
+            .unwrap();
+        assert!(!events_disabled());
     }
 
     #[test]
