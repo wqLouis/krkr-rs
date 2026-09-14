@@ -27,11 +27,14 @@
 //! | `onResize` … `onDisplayRotate` | dispatch `objthis.action(event)` (`TVP_ACTION_INVOKE`) |
 //! | `postInputEvent(name, params)` | synthesize an `onKeyDown`/`Up`/`Press` action event |
 //! | `showModal` / `setMaskRegion` / `removeMaskRegion` | persisted modal/mask state |
+//! | `add` / `remove` | attach/detach a Layer under `primaryLayer` in the scene tree |
+//! | `changeScreenMode` | set the declared client size (`sync_host_window_resolution`) + `fullScreen` |
 //! | `mainWindow` / `focusedLayer` / `primaryLayer` | retained TJS objects (or `null`) |
 //! | `HWND` / `layerTreeOwnerInterface` | opaque native-instance pointer (inert token) |
 //! | `drawDevice` | documented inert: reads `null`, writes ignored (no draw-device class) |
 //! | `getTouchPoint` / `touchPointCount` | tracked from the native touch events |
 //! | `getMouseVelocity` / `getTouchVelocity` | return `0`; the ABI cannot write back out-params |
+//! | `addInputNotify` / `registerExEvent` | documented host-inert extras (script state / WM hook only) |
 //! | `findFullScreenCandidates` / `registerMessageReceiver` | argument-checked no-ops |
 
 use std::ffi::{c_char, c_int, c_void};
@@ -1928,14 +1931,250 @@ extern "C" fn window_menu_set(
 }
 
 //---------------------------------------------------------------------------
-// Legacy no-op helpers (kept for the extras the game probes)
+// Layer registration (`add`/`remove`) and the engine-internal extras
 //---------------------------------------------------------------------------
 
-/// `add(layer)` / `remove(layer)` — no-ops: the real TVP methods take Layer
-/// **objects**, which the FFI could not resolve in this milestone. Layers are
-/// attached to their window at construction and removed with `close`, so the
-/// scene stays consistent without them.
-extern "C" fn window_add_remove_noop(
+/// Resolve a Layer **object** argument passed to `add`/`remove` to its scene
+/// id. Uses [`resolve_object_id_arg`] (integer ids pass through; an object is
+/// read through its `nativeId`/`id` members) and then, for an object
+/// argument, requires the id to name *that* object's registered layer
+/// (`mod::layer_tjs_object`): `Bitmap`/`Font`/`Timer` carry a `nativeId` too,
+/// so a scene id collision must not be mistaken for a layer. `null` and
+/// non-object values yield `None`.
+fn resolve_layer_id(v: &Value) -> Option<u32> {
+    let engine = context_engine();
+    let id = resolve_object_id_arg(engine, v).ok()?;
+    if id < 0 {
+        return None;
+    }
+    let id = id as u32;
+    if v.ty == tjs2_sys::VAL_OBJECT {
+        let obj = super::layer_tjs_object(id);
+        if obj.is_null() || obj != v.object_handle() {
+            return None;
+        }
+    }
+    Some(id)
+}
+
+/// Re-parent `layer_id` inside its window to `new_parent` (`None` attaches it
+/// to the window root). Shared by `add`/`remove`; mirrors the relevant half
+/// of `layer::reparent`, including the same-window invariant and a
+/// cycle/tree guard.
+fn reparent_in_window(scene: &mut Scene, layer_id: u32, new_parent: Option<u32>) {
+    let Some((old_parent, window)) = scene
+        .layer(layer_id)
+        .map(|layer| (layer.parent, layer.window))
+    else {
+        return;
+    };
+    if old_parent == new_parent {
+        return;
+    }
+    // Reject a target that is the layer itself or one of its descendants: the
+    // host scene must stay a tree. Bounded by the layer count so a
+    // pre-existing malformed cycle cannot loop forever.
+    if let Some(target) = new_parent {
+        let mut cursor = Some(target);
+        let mut steps = 0usize;
+        while let Some(id) = cursor {
+            if id == layer_id {
+                return;
+            }
+            steps += 1;
+            if steps > scene.layers.len() {
+                return;
+            }
+            cursor = scene.layer(id).and_then(|layer| layer.parent);
+        }
+    }
+    // Detach from the old parent (or the window root list).
+    if let Some(old) = old_parent {
+        if let Some(parent) = scene.layer_mut(old) {
+            parent.children.retain(|&c| c != layer_id);
+        }
+    } else if let Some(w) = scene.window_mut(window) {
+        w.layers.retain(|&c| c != layer_id);
+    }
+    if let Some(layer) = scene.layer_mut(layer_id) {
+        layer.parent = new_parent;
+    }
+    // Attach to the new parent (or the window root list).
+    match new_parent {
+        Some(parent) => {
+            if let Some(parent) = scene.layer_mut(parent) {
+                parent.children.push(layer_id);
+            }
+        }
+        None => {
+            if let Some(w) = scene.window_mut(window) {
+                w.layers.push(layer_id);
+            }
+        }
+    }
+}
+
+/// Shared body of `add`/`remove`. Returns the missing-argument error; an
+/// invalid id or a layer owned by another window is tolerated (the reference
+/// `tTJSNI_BaseWindow::Add`/`Remove` accept any object and only touch their
+/// own registry).
+fn window_attach_detach(
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    to_primary: bool,
+) -> Result<(), String> {
+    // SAFETY: argv/argc are a valid callback argument list.
+    let args = unsafe { super::ffi::args(argc, argv) };
+    let Some(first) = args.first() else {
+        return Err("Window.add/remove requires 1 argument".into());
+    };
+    let window_id = win(instance).id;
+    let Some(layer_id) = resolve_layer_id(first) else {
+        // A non-Layer object (the game also registers `SystemRegister` /
+        // `SaveManager`): the reference adds it to a closure registry this
+        // host does not model, and it has no scene layer to touch. Tolerate.
+        return Ok(());
+    };
+    let mut scene = context_scene_mut();
+    let Some(layer) = scene.layer(layer_id) else {
+        // Unknown/stale id: nothing to attach or detach.
+        return Ok(());
+    };
+    if layer.window != window_id {
+        // `Scene` cannot represent cross-window parenting (`add_layer` /
+        // `reparent` reject a parent from another window), so a foreign layer
+        // is left alone rather than corrupting either window's tree.
+        return Ok(());
+    }
+    let target = if to_primary {
+        // `add` makes the layer a child of the window's primary layer. The
+        // primary layer cannot parent itself, so it stays at the root.
+        scene
+            .window(window_id)
+            .and_then(|w| w.primary_layer)
+            .filter(|&primary| primary != layer_id)
+    } else {
+        None
+    };
+    reparent_in_window(&mut scene, layer_id, target);
+    Ok(())
+}
+
+/// `add(layer)` — register/attach a Layer to this window.
+///
+/// Reference `tTJSNI_BaseWindow::Add` (`WindowIntf.cpp:695`) pushes the
+/// argument object into the window's invalidation registry (`ObjectVector`),
+/// which the window invalidates on teardown. The host scene already ties every
+/// layer's lifetime to its window (`remove_window`) and does not model the
+/// invalidation registry, so the observable effect here is the layer-tree
+/// attach: a Layer owned by this window becomes a child of `primaryLayer`, the
+/// root the reference layer manager keeps the tree under. Non-Layer objects
+/// (the game registers `SystemRegister` and `SaveManager`) and layers owned by
+/// another window are accepted and left unchanged, matching `Add`'s tolerant
+/// behavior.
+extern "C" fn window_add(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    match window_attach_detach(instance, argc, argv, true) {
+        Ok(()) => {
+            set_void_out(out);
+            0
+        }
+        Err(e) => error_out(out_error, &e),
+    }
+}
+
+/// `remove(layer)` — detach a Layer from the window's primary-layer subtree.
+///
+/// Reference `tTJSNI_BaseWindow::Remove` (`WindowIntf.cpp:705`) removes the
+/// argument object from the invalidation registry. The host effect is the
+/// inverse of [`window_add`]: a Layer owned by this window is detached from
+/// its parent and re-attached at the window root (`parent = None`), where the
+/// reference layer manager keeps window-level layers. Invalid ids, foreign
+/// windows and non-Layer objects are tolerated.
+extern "C" fn window_remove(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    match window_attach_detach(instance, argc, argv, false) {
+        Ok(()) => {
+            set_void_out(out);
+            0
+        }
+        Err(e) => error_out(out_error, &e),
+    }
+}
+
+/// `changeScreenMode(width, height[, bpp[, fullscreen]])` — change the
+/// window's screen mode.
+///
+/// The reference `Window` native (`WindowIntf.cpp`) registers no member of
+/// this name; it is an extra the games probe. The reference's screen-mode path
+/// is `TVPSwitchToFullScreen(HWND, w, h, drawdevice)`
+/// (`impl/WindowImpl.cpp:899`), which asks the draw device to switch the
+/// display to the requested `(w, h, bpp)`. This host has no native
+/// display-mode API, so the OS-level switch is out of scope. The logical
+/// effect the render bridge consumes is the game's declared client size:
+/// `sync_host_window_resolution` (`crates/render/src/sync.rs`) resizes the
+/// OS/Bevy window to `WindowState::inner_size`. A numeric `(width, height)`
+/// pair therefore updates that size exactly like `setInnerSize` (each
+/// dimension clamped at zero, `onResize` fired on change), and a trailing
+/// boolean records the persisted `fullScreen` state. The boolean-only form
+/// the games' `MainWindow`
+/// override uses (`changeScreenMode(true)`, `system/window.tjs:197`) records
+/// `fullScreen` and leaves the size to the script, which calls
+/// `setZoom`/`setInnerSize` itself. `bpp` is genuinely host-only — the
+/// renderer is always RGBA8 — and is ignored. The reference's fullscreen
+/// display-mode switch itself stays with the host, exactly as
+/// `sync_host_window_resolution` documents.
+extern "C" fn window_change_screen_mode(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: argv/argc are a valid callback argument list.
+    let args = unsafe { super::ffi::args(argc, argv) };
+    // `(w, h[, bpp][, fullscreen])` carries the mode size; a lone boolean is
+    // the games' fullscreen toggle.
+    if args.len() >= 2 {
+        set_window_inner_size(instance, objthis, arg_i64(&args[0]), arg_i64(&args[1]));
+        if let Some(fullscreen) = args.get(3) {
+            win(instance).full_screen = arg_bool(fullscreen);
+        }
+    } else if let Some(fullscreen) = args.first() {
+        win(instance).full_screen = arg_bool(fullscreen);
+    }
+    set_void_out(out);
+    0
+}
+
+/// `addInputNotify(obj)` — engine-internal extra with no reference native.
+///
+/// The test games define `MainWindow.addInputNotify` (`system/window.tjs:407`)
+/// as `inputNotify.add(obj)` and drive it from `dispatchInputNotify`; the list
+/// and the dispatch are script state, and the reference `Window`
+/// (`WindowIntf.cpp`) registers no such method. The host delivers input through
+/// `objthis.action(event)` (`fire_window_event`), which the script's
+/// `MainWindow.action` override already routes into `dispatchInputNotify`.
+/// There is no native notification list to mutate, so the call is accepted
+/// (any argument count) and has no host-side effect by construction.
+extern "C" fn window_add_input_notify(
     _engine: *mut c_void,
     _instance: *mut c_void,
     _argc: c_int,
@@ -1948,9 +2187,18 @@ extern "C" fn window_add_remove_noop(
     0
 }
 
-/// Argument-tolerant no-op for the engine-internal extras
-/// (`addInputNotify`, `changeScreenMode`, `registerExEvent`).
-extern "C" fn window_noop2(
+/// `registerExEvent()` — `WindowEx` plugin extra with no `WindowIntf.cpp`
+/// counterpart.
+///
+/// The plugin's `WindowEx::checkExEvents`
+/// (`reference/cpp/plugins/windowEx.cpp:730`) caches only whether the window
+/// object defines `onResizing`/`onMoving`/`onMove`/`onNcMsMove`, for the
+/// Windows message hook that decides which non-client notifications to raise.
+/// That hook does not exist in this host (winit owns the OS window;
+/// `sync_host_window_resolution` dispatches `onResize` directly), so the cached
+/// flags would never be consulted. The call is accepted (any argument count)
+/// and documented as host-inert rather than silently stubbed.
+extern "C" fn window_register_ex_event(
     _engine: *mut c_void,
     _instance: *mut c_void,
     _argc: c_int,
@@ -2158,11 +2406,11 @@ pub(crate) fn register_window(engine: &Tjs2Engine) -> Result<(), String> {
             },
             NativeInstanceMethodDef {
                 name: "add",
-                f: window_add_remove_noop,
+                f: window_add,
             },
             NativeInstanceMethodDef {
                 name: "remove",
-                f: window_add_remove_noop,
+                f: window_remove,
             },
             NativeInstanceMethodDef {
                 name: "setSize",
@@ -2320,15 +2568,15 @@ pub(crate) fn register_window(engine: &Tjs2Engine) -> Result<(), String> {
             // Engine-internal extras the game probes.
             NativeInstanceMethodDef {
                 name: "addInputNotify",
-                f: window_noop2,
+                f: window_add_input_notify,
             },
             NativeInstanceMethodDef {
                 name: "changeScreenMode",
-                f: window_noop2,
+                f: window_change_screen_mode,
             },
             NativeInstanceMethodDef {
                 name: "registerExEvent",
-                f: window_noop2,
+                f: window_register_ex_event,
             },
         ],
         properties: vec![
@@ -2642,5 +2890,121 @@ mod tests {
         let scene = env.scene();
         assert_eq!(scene.windows.len(), 0);
         assert_eq!(scene.layers.len(), 0);
+    }
+
+    #[test]
+    fn window_add_remove_reparents_layers() {
+        let env = TestEnv::new("window-add-remove");
+        env.run(
+            "var w = new Window(); \
+             var primary = new Layer(w, null); \
+             var child = new Layer(w, null); \
+             w.add(child);",
+        )
+        .unwrap();
+        let child_id = env.eval_int("child.id") as u32;
+        let scene = env.scene();
+        let primary_id = scene.windows[0].primary_layer.expect("primary layer");
+        assert_ne!(child_id, primary_id);
+        // `add` makes the layer a child of the window's primary layer and
+        // removes it from the window root list.
+        assert_eq!(scene.layer(child_id).unwrap().parent, Some(primary_id));
+        assert!(
+            scene
+                .layer(primary_id)
+                .unwrap()
+                .children
+                .contains(&child_id)
+        );
+        assert!(!scene.windows[0].layers.contains(&child_id));
+        drop(scene);
+
+        // `remove` unparents it back to the window root.
+        env.run("w.remove(child);").unwrap();
+        let scene = env.scene();
+        assert_eq!(scene.layer(child_id).unwrap().parent, None);
+        assert!(scene.windows[0].layers.contains(&child_id));
+        assert!(
+            !scene
+                .layer(primary_id)
+                .unwrap()
+                .children
+                .contains(&child_id)
+        );
+    }
+
+    #[test]
+    fn window_add_tolerates_primary_and_non_layer() {
+        let env = TestEnv::new("window-add-tolerate");
+        env.run(
+            "var w = new Window(); \
+             var primary = new Layer(w, null); \
+             w.add(primary); \
+             w.add(%[id: primary.id]); \
+             w.remove(999999);",
+        )
+        .unwrap();
+        let primary_id = env.eval_int("primary.id") as u32;
+        let scene = env.scene();
+        // The primary layer can never become its own child.
+        assert_eq!(scene.layer(primary_id).unwrap().parent, None);
+        assert!(scene.layer(primary_id).unwrap().children.is_empty());
+        // The non-Layer dictionary whose `id` collides with the real layer
+        // must not be mistaken for it (the object-identity check rejects it).
+    }
+
+    #[test]
+    fn window_add_rejects_foreign_window_layer() {
+        let env = TestEnv::new("window-add-foreign");
+        env.run("var w = new Window(); var other = new Window();")
+            .unwrap();
+        let w_id = env.eval_int("w.id") as u32;
+        let other_id = env.eval_int("other.id") as u32;
+        // A layer owned by `other`, created directly in the scene. (The
+        // script `Layer(win, parent)` resolves a Window object to the first
+        // scene window, so the foreign owner is set up here.)
+        let foreign_id = env
+            .scene
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .add_layer(other_id, None);
+        env.run(&format!("w.add({foreign_id});")).unwrap();
+        let scene = env.scene();
+        // A layer owned by another window is left where it is: the first
+        // window neither parents it nor loses it to a scene mutation.
+        assert_eq!(scene.layer(foreign_id).unwrap().window, other_id);
+        assert_eq!(scene.layer(foreign_id).unwrap().parent, None);
+        let w = scene.windows.iter().find(|x| x.id == w_id).unwrap();
+        assert!(!w.layers.contains(&foreign_id));
+    }
+
+    #[test]
+    fn window_change_screen_mode_sets_declared_size() {
+        let env = TestEnv::new("window-change-screen-mode");
+        env.run(
+            "var w = new Window(); \
+             var resized = 0; \
+             w.action = function(ev){ if (ev.type == 'onResize') resized++; };",
+        )
+        .unwrap();
+
+        env.run("w.changeScreenMode(1024, 768);").unwrap();
+        let scene = env.scene();
+        assert_eq!(scene.windows[0].inner_size, (1024, 768));
+        drop(scene);
+        assert_eq!(env.eval_int("w.width"), 1024);
+        assert_eq!(env.eval_int("w.height"), 768);
+        assert_eq!(env.eval_int("resized"), 1);
+
+        // The same size does not re-fire `onResize`.
+        env.run("w.changeScreenMode(1024, 768);").unwrap();
+        assert_eq!(env.eval_int("resized"), 1);
+
+        // The games' boolean-only form records `fullScreen` and leaves the
+        // declared size to the script (there is no host display-mode API).
+        env.run("w.changeScreenMode(true);").unwrap();
+        assert_eq!(env.eval_int("w.fullScreen"), 1);
+        let scene = env.scene();
+        assert_eq!(scene.windows[0].inner_size, (1024, 768));
     }
 }
