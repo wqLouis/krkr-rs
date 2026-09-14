@@ -1058,17 +1058,41 @@ extern "C" fn system_do_compact(
     0
 }
 
-/// Continuous-handler callbacks (`System.addContinuousHandler`), invoked
-/// once per frame by [`continuous_handler_poll`]. A handler returning
-/// `false`/0 removes itself (the reference `TVPDeliverContinuousEvents`
-/// semantics).
-static CONTINUOUS_HANDLERS: Mutex<Vec<tjs2_sys::DetachedValue>> = Mutex::new(Vec::new());
-/// Set by `removeContinuousHandler` while a callback is executing. The poll
-/// loop takes its handler list out of the mutex, so a direct vector removal
-/// cannot see the currently-running entry; this flag closes that race.
+/// One registered continuous handler: the retained closure plus its
+/// **identity** — `(Object, ObjThis)` of the argument, exactly the pair the
+/// reference's `TVPAddContinuousHandler`/`TVPRemoveContinuousHandler` compare
+/// with `std::find` (`EventIntf.cpp:890/902`).
+struct ContinuousHandler {
+    value: tjs2_sys::DetachedValue,
+    key: (usize, usize),
+}
+
+/// Continuous-handler callbacks (`System.addContinuousHandler`), invoked once
+/// per frame by [`continuous_handler_poll`]. A slot is `None` while its
+/// handler is being delivered or after `removeContinuousHandler`; the poll
+/// compacts the tombstones afterwards, like the reference's single pass over
+/// `TVPContinuousHandlerVector`.
+static CONTINUOUS_HANDLERS: Mutex<Vec<Option<ContinuousHandler>>> = Mutex::new(Vec::new());
+/// Identity of the handler currently being delivered (if any), so
+/// `removeContinuousHandler` can retire the running handler even though its
+/// slot is temporarily empty.
+static CURRENT_HANDLER: Mutex<Option<(usize, usize)>> = Mutex::new(None);
+/// Set by `removeContinuousHandler` when the target is the running handler; it
+/// is consumed (and the handler dropped) after the callback returns.
 static REMOVE_CURRENT_HANDLER: AtomicBool = AtomicBool::new(false);
+/// Set while a continuous handler's callback is executing. `addContinuousHandler`
+/// inside a callback appends as usual (the reference allows it and even
+/// delivers the new handler in the same pass); this flag only records that the
+/// delivery is re-entrant.
 static CONTINUOUS_IN_CALLBACK: AtomicBool = AtomicBool::new(false);
-static READD_CURRENT_HANDLER: AtomicBool = AtomicBool::new(false);
+
+/// Identity of a `System.addContinuousHandler`/`removeContinuousHandler`
+/// argument: `(Object, ObjThis)`. Both come from the per-argument ABI handle
+/// (`tjs2_abi.cpp:307-318`), so the comparison does not depend on the
+/// order-sensitive `last_object` slot.
+fn continuous_handler_key(arg: &tjs2_sys::Value) -> (usize, usize) {
+    (arg.object_handle() as usize, arg.object_objthis() as usize)
+}
 
 /// Advance every continuous handler once, passing the current tick count
 /// (ms) as the handler's single argument — the reference
@@ -1078,28 +1102,68 @@ static READD_CURRENT_HANDLER: AtomicBool = AtomicBool::new(false);
 /// Returns whether any remain.
 pub fn continuous_handler_poll(engine: &tjs2_sys::Tjs2Engine) -> bool {
     let tick = tick_count_ms();
-    let mut handlers = CONTINUOUS_HANDLERS
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
-    let taken = std::mem::take(&mut *handlers);
-    let mut rest = Vec::with_capacity(taken.len());
-    for h in taken {
-        REMOVE_CURRENT_HANDLER.store(false, Ordering::SeqCst);
-        READD_CURRENT_HANDLER.store(false, Ordering::SeqCst);
-        CONTINUOUS_IN_CALLBACK.store(true, Ordering::SeqCst);
-        let callback_ok = engine
-            .call_detached(&h, &[tjs2_sys::TjsValue::Integer(tick)])
-            .is_ok();
-        CONTINUOUS_IN_CALLBACK.store(false, Ordering::SeqCst);
-        let readd = READD_CURRENT_HANDLER.swap(false, Ordering::SeqCst);
-        let keep = callback_ok && (readd || !REMOVE_CURRENT_HANDLER.swap(false, Ordering::SeqCst));
-        if keep {
-            rest.push(h);
+    // Faithful port of `_TVPDeliverContinuousEvent` (`EventIntf.cpp:782`):
+    // iterate the vector **by index**, re-reading its length every step, so a
+    // callback that registers another handler has it delivered in the same
+    // pass; a handler that removes itself leaves a `None` tombstone which is
+    // compacted after the loop. The mutex is never held while a callback runs
+    // (the callback legitimately calls add/removeContinuousHandler).
+    let mut index = 0usize;
+    loop {
+        // Root the handler for the duration of the call, leaving a tombstone
+        // in its slot (exactly the reference's `Object = ObjThis = nullptr`).
+        let taken = {
+            let mut list = CONTINUOUS_HANDLERS
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if index >= list.len() {
+                break;
+            }
+            list[index].take()
+        };
+        if let Some(handler) = taken {
+            *CURRENT_HANDLER.lock().unwrap_or_else(|p| p.into_inner()) = Some(handler.key);
+            REMOVE_CURRENT_HANDLER.store(false, Ordering::SeqCst);
+            CONTINUOUS_IN_CALLBACK.store(true, Ordering::SeqCst);
+            let callback =
+                engine.call_detached(&handler.value, &[tjs2_sys::TjsValue::Integer(tick)]);
+            if let Err(e) = &callback {
+                // The reference also drops a handler that raised a TJS error,
+                // but silently dropping it hides a stuck game (KAG's
+                // `ActivateLayer.on_activationTimer` drives load/transition
+                // screens, so losing it leaves the loading page up forever).
+                log::warn!(
+                    "System.addContinuousHandler: handler raised an error and was removed: {e}"
+                );
+            }
+            let callback_ok = callback.is_ok();
+            CONTINUOUS_IN_CALLBACK.store(false, Ordering::SeqCst);
+            *CURRENT_HANDLER.lock().unwrap_or_else(|p| p.into_inner()) = None;
+            let removed = REMOVE_CURRENT_HANDLER.swap(false, Ordering::SeqCst);
+            // A handler that raised a TJS error is dropped (reference), as is
+            // one that removed itself during the call.
+            if callback_ok && !removed {
+                let mut list = CONTINUOUS_HANDLERS
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                if index < list.len() && list[index].is_none() {
+                    list[index] = Some(handler);
+                } else {
+                    // The slot was consumed/moved: keep the handler alive at
+                    // the end rather than losing it.
+                    list.push(Some(handler));
+                }
+            }
         }
+        index += 1;
     }
-    *handlers = rest;
-    let any = !handlers.is_empty();
-    drop(handlers);
+    let any = {
+        let mut list = CONTINUOUS_HANDLERS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        list.retain(|slot| slot.is_some());
+        !list.is_empty()
+    };
     // The video overlay playback state machine rides the same per-frame
     // clock as the continuous handlers (reference: the video decoder's own
     // event thread; krkr-rs has no decoder thread).
@@ -1123,26 +1187,37 @@ extern "C" fn native_add_continuous_handler(
     if args.is_empty() {
         return crate::report_error(out_error, "System.addContinuousHandler requires 1 argument");
     }
-    if CONTINUOUS_IN_CALLBACK.load(Ordering::SeqCst) {
-        READD_CURRENT_HANDLER.store(true, Ordering::SeqCst);
-        crate::set_void_out(out);
-        return 0;
-    }
     let engine = crate::context_engine();
-    match engine.retain_value_detached(&tjs2_sys::TjsValue::Object) {
-        Ok(dv) => {
-            CONTINUOUS_HANDLERS
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .push(dv);
-            crate::set_void_out(out);
-            0
+    // Retain the **argument** (the per-argument ABI handle), not the
+    // engine's `last_object` slot: which object that holds depends on the
+    // evaluation order of the surrounding expression, so relying on it made
+    // registration silently capture the wrong callback.
+    let value = match engine.retain_object_arg(&args[0]) {
+        Ok(value) => value,
+        Err(e) => {
+            return crate::report_error(
+                out_error,
+                &format!("System.addContinuousHandler: cannot retain the handler: {e}"),
+            );
         }
-        Err(_) => {
+    };
+    let key = continuous_handler_key(&args[0]);
+    {
+        let mut list = CONTINUOUS_HANDLERS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // `TVPAddContinuousHandler` ignores a handler that is already
+        // registered (identity compare; `EventIntf.cpp:890`).
+        if list.iter().flatten().any(|h| h.key == key) {
             crate::set_void_out(out);
-            0
+            return 0;
         }
+        // Registering from inside a callback is allowed and takes effect in
+        // the same delivery pass (the poll re-reads the length).
+        list.push(Some(ContinuousHandler { value, key }));
     }
+    crate::set_void_out(out);
+    0
 }
 
 /// `System.removeContinuousHandler(fn)` — unregister a per-frame callback.
@@ -1160,12 +1235,24 @@ extern "C" fn native_remove_continuous_handler(
             "System.removeContinuousHandler requires 1 argument",
         );
     }
-    // The callback may be the handler currently being delivered. Mark it
-    // for removal without performing a retained-object lookup while the VM
-    // is re-entrant; the poll loop consumes the flag after the callback
-    // returns. If the target is not current, retaining it across frames is
-    // still harmless and it can be removed by the host lifecycle.
-    REMOVE_CURRENT_HANDLER.store(true, Ordering::SeqCst);
+    let key = continuous_handler_key(&args[0]);
+    // Removing the handler that is currently executing: its slot is a
+    // tombstone while it runs, so mark it for retirement instead.
+    let is_current = *CURRENT_HANDLER.lock().unwrap_or_else(|p| p.into_inner()) == Some(key);
+    if is_current {
+        REMOVE_CURRENT_HANDLER.store(true, Ordering::SeqCst);
+    } else {
+        let mut list = CONTINUOUS_HANDLERS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // `TVPRemoveContinuousHandler`: retire the matching entry by identity
+        // (`EventIntf.cpp:902`).
+        for slot in list.iter_mut() {
+            if slot.as_ref().is_some_and(|h| h.key == key) {
+                *slot = None;
+            }
+        }
+    }
     crate::set_void_out(out);
     0
 }
@@ -1870,6 +1957,89 @@ extern "C" fn prop_draw_thread_num_set(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tjs2_sys::TjsValue;
+
+    /// `System.addContinuousHandler` must register the **argument itself**,
+    /// and a registration made from inside a running callback must not be
+    /// lost. Together those keep KAG's load/transition screen alive:
+    /// `ActivateLayer.beginActivation` registers `on_activationTimer`, and the
+    /// transition-complete callback that runs *from* a handler may start the
+    /// next activation. Previously any `addContinuousHandler` executed while a
+    /// callback was running was silently discarded (`READD_CURRENT_HANDLER`),
+    /// so the activation never ticked: the game sat on the loading page with
+    /// all input swallowed.
+    #[test]
+    fn continuous_handler_added_from_inside_a_callback_is_kept() {
+        let _vm_lock = crate::test_lock::vm_lock();
+        let e = engine_with_system();
+        CONTINUOUS_HANDLERS.lock().unwrap().clear();
+        e.exec_script(
+            "var order = []; \
+             function first(t){ order.add(\"first\"); \
+                 System.removeContinuousHandler(first); \
+                 System.addContinuousHandler(second); } \
+             function second(t){ order.add(\"second\"); \
+                 System.removeContinuousHandler(second); } \
+             System.addContinuousHandler(first);",
+            "continuous",
+        )
+        .unwrap();
+
+        // One pass delivers `first`, which registers `second`; like the
+        // reference the new handler is delivered in the same pass. The return
+        // value reports whether handlers are left — none, both retired
+        // themselves.
+        assert!(!continuous_handler_poll(&e));
+        assert_eq!(e.eval("order.count", "t").unwrap(), TjsValue::Integer(2));
+        assert_eq!(
+            e.eval("order[0]", "t").unwrap(),
+            TjsValue::String("first".into())
+        );
+        assert_eq!(
+            e.eval("order[1]", "t").unwrap(),
+            TjsValue::String("second".into())
+        );
+        // Nothing is delivered a second time.
+        assert!(!continuous_handler_poll(&e));
+        assert_eq!(e.eval("order.count", "t").unwrap(), TjsValue::Integer(2));
+    }
+
+    /// `removeContinuousHandler` must retire the handler it names, and
+    /// `addContinuousHandler` must ignore a handler that is already
+    /// registered (the reference compares the closure identity).
+    #[test]
+    fn continuous_handler_add_dedups_and_remove_targets_the_named_handler() {
+        let _vm_lock = crate::test_lock::vm_lock();
+        let e = engine_with_system();
+        CONTINUOUS_HANDLERS.lock().unwrap().clear();
+        e.exec_script(
+            "var hits = []; \
+             function a(t){ hits.add(\"a\"); } \
+             function b(t){ hits.add(\"b\"); } \
+             System.addContinuousHandler(a); \
+             System.addContinuousHandler(a); \
+             System.addContinuousHandler(b);",
+            "continuous",
+        )
+        .unwrap();
+        // The duplicate `a` is not registered twice: one pass records a, b.
+        assert!(continuous_handler_poll(&e));
+        assert_eq!(e.eval("hits.count", "t").unwrap(), TjsValue::Integer(2));
+        // Retiring `b` from outside a callback removes exactly `b`; `a` keeps
+        // running (the old code removed the *next delivered* handler instead,
+        // which is how an unrelated handler could disappear).
+        e.exec_script("System.removeContinuousHandler(b);", "t")
+            .unwrap();
+        assert!(continuous_handler_poll(&e));
+        assert_eq!(e.eval("hits.count", "t").unwrap(), TjsValue::Integer(3));
+        assert_eq!(
+            e.eval("hits[2]", "t").unwrap(),
+            TjsValue::String("a".into())
+        );
+        e.exec_script("System.removeContinuousHandler(a);", "t")
+            .unwrap();
+        assert!(!continuous_handler_poll(&e));
+    }
 
     #[test]
     fn exit_request_is_reported_exactly_once() {

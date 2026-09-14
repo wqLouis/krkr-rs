@@ -170,7 +170,11 @@ fn invoke_action(inst: &AsyncTriggerInst) {
         None => eng.call_detached(action, &[]),
     };
     if let Err(e) = result {
-        log::debug!("AsyncTrigger: action failed: {e}");
+        // A failure here is why a deferred callback "never happened": KAG
+        // dispatches transition-complete handlers (`loadStart`, `loadEnd`)
+        // through `AsyncTrigger`, so a silent failure leaves the load screen
+        // up with input still captured.
+        log::warn!("AsyncTrigger: action failed: {e}");
     }
 }
 
