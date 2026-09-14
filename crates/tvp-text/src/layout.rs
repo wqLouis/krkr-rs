@@ -39,6 +39,13 @@
 //! pen advances by `CellIncX` (`LayerBitmapImpl.cpp:279`, `:1367`). The caller
 //! supplies the `ascent` because the reference takes it from the mapped
 //! outline face (`TVPGetCharacter`'s `AscentOfsY`, `LayerBitmapImpl.cpp:725`).
+//! It must be the same [`GlyphAtlas::ascent`] the vector path uses for that
+//! `(face, height, bold)`, so a `.tft` glyph and an outline glyph on one line
+//! share a baseline; likewise `line_height` should be that atlas's
+//! [`GlyphAtlas::line_height`]. When no outline face resolves to a rasterizer,
+//! a mapped `.tft` is still self-contained: use the pixel height as a
+//! deterministic fallback ascent/line height (the same fallback the visual
+//! layer uses) rather than a made-up fraction of the em.
 //!
 //! # Not implemented (matching this reference revision)
 //!

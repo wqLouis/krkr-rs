@@ -3396,6 +3396,30 @@ fn paint_text_run(
     style: DrawTextStyle,
     face_override: Option<String>,
 ) {
+    // Resolve the outline face once, up front, so the `.tft` and vector paths
+    // share it. `KRKR_RS_SYSTEM_FONT` is an explicit path override and always
+    // wins (hermetic CI). Otherwise ask for the layer's tracked face by name;
+    // `resolve_face` maps it through the configured `faces`/`fallback` chain
+    // (or system discovery when no config is installed). With no face tracked
+    // at all, `SystemJp` is kept for scripts that never create a `Font`.
+    //
+    // Both the resolved face and the per-height/bold atlas are cached
+    // process-wide (`resolve_face` / `with_cached_atlas_styled`).
+    // `MessageArea.charOutput` draws one character per call, so the face is
+    // resolved once and each glyph rasterized once per `(face, height, bold)`.
+    // Resolution does file IO/parsing, so it must happen outside the scene
+    // lock.
+    let request =
+        if let Some(path) = std::env::var_os("KRKR_RS_SYSTEM_FONT").map(std::path::PathBuf::from) {
+            FaceRequest::Path(path)
+        } else {
+            match face_override.clone() {
+                Some(face) => FaceRequest::Named(face),
+                None => FaceRequest::SystemJp,
+            }
+        };
+    let face = resolve_face(&request);
+
     // Pre-rendered `.tft` fonts take precedence when the layer font's exact
     // properties were mapped by `Font.mapPrerenderedFont` and every character
     // in this call is present. `MessageArea.charOutput` draws one character per
@@ -3415,6 +3439,22 @@ fn paint_text_run(
             .chars()
             .all(|c| c.is_control() || pfont.find(c).is_some())
     {
+        // Baseline and line advance come from the mapped outline face's
+        // rasterizer — the same values `layout` uses for the vector path. A
+        // `.tft` stores no ascent, so this is the only way the two paths can
+        // agree on one baseline. When no outline face resolves, a mapped
+        // `.tft` is still self-contained, so fall back to the pixel height as
+        // a neutral whole-em ascent/line advance (deterministic, and shared by
+        // any caller that has to draw without a rasterizer) instead of the old
+        // fabricated `height * 0.85`.
+        let (ascent, line_height) = match &face {
+            Some(face) => {
+                with_cached_atlas_styled(face.clone(), font_height, style.bold, |atlas| {
+                    (atlas.ascent(), atlas.line_height())
+                })
+            }
+            None => (font_height as f32, font_height as f32),
+        };
         let mut scene = context_scene_mut();
         if let Some(bitmap) = scene.bitmap_mut(bitmap_id) {
             if shadow_level != 0 || shadow_width != 0 {
@@ -3428,6 +3468,8 @@ fn paint_text_run(
                     x.saturating_add(shadow_x),
                     y.saturating_add(shadow_y),
                     font_height,
+                    ascent,
+                    line_height,
                     shadow_width.min(16),
                     style,
                 );
@@ -3442,6 +3484,8 @@ fn paint_text_run(
                 x,
                 y,
                 font_height,
+                ascent,
+                line_height,
                 0,
                 style,
             );
@@ -3450,27 +3494,7 @@ fn paint_text_run(
         return;
     }
 
-    // Prefer tvp-text's real rasterizer. `KRKR_RS_SYSTEM_FONT` is an explicit
-    // path override and always wins (hermetic CI). Otherwise ask for the
-    // layer's tracked face by name; `resolve_face` maps it through the
-    // configured `faces`/`fallback` chain (or system discovery when no config
-    // is installed). With no face tracked at all, `SystemJp` is kept for
-    // scripts that never create a `Font`.
-    //
-    // Both the resolved face and the per-height/bold atlas are cached
-    // process-wide (`resolve_face` / `with_cached_atlas_styled`).
-    // `MessageArea.charOutput` draws one character per call, so the face is
-    // resolved once and each glyph rasterized once per `(face, height, bold)`.
-    let request =
-        if let Some(path) = std::env::var_os("KRKR_RS_SYSTEM_FONT").map(std::path::PathBuf::from) {
-            FaceRequest::Path(path)
-        } else {
-            match face_override.clone() {
-                Some(face) => FaceRequest::Named(face),
-                None => FaceRequest::SystemJp,
-            }
-        };
-    if let Some(face) = resolve_face(&request) {
+    if let Some(face) = face {
         // Layout rasterizes new glyphs; do it before taking the scene lock.
         let text_layout =
             with_cached_atlas_styled(face.clone(), font_height, style.bold, |atlas| {
@@ -4070,8 +4094,13 @@ fn fallback_text_height(text: &str, height: u32) -> u32 {
 /// (plus newlines/controls). Ink is placed at the reference baseline:
 /// `left = pen_x + OriginX`, `top = line_top + ascent − OriginY`
 /// (`PrerenderedGlyph::left/top`; `LayerBitmapImpl.cpp:279`, `:913`).
-/// Synthetic rotation/italic are not applied because the `.tft` bitmap is
-/// already baked for its `(face, height, bold, italic, angle)` key.
+///
+/// `ascent`/`line_height` come from the mapped outline face's rasterizer — the
+/// same values the vector path's `layout` uses — so `.tft` and outline glyphs
+/// on one line share a baseline and multi-line advance. The `.tft` stores no
+/// ascent of its own, so the caller must resolve it. Synthetic
+/// rotation/italic are not applied because the `.tft` bitmap is already baked
+/// for its `(face, height, bold, italic, angle)` key.
 #[allow(clippy::too_many_arguments)]
 fn paint_prerendered_text(
     bitmap: &mut BitmapState,
@@ -4083,20 +4112,31 @@ fn paint_prerendered_text(
     x: i32,
     y: i32,
     font_height: u32,
+    ascent: f32,
+    line_height: f32,
     spread: u32,
     style: DrawTextStyle,
 ) {
-    let line_height = font_height.max(1) as i32;
-    let ascent = (font_height as f32 * 0.85) as i32;
     let thickness = (font_height / 14).max(1) as i32;
     let mut pen_x = x;
-    let mut pen_y = y;
+    // Keep the pen in f32 like `layout`/`paint_layout`, so a multi-line `.tft`
+    // block lands on the same rows as the vector path.
+    let mut pen_y = y as f32;
     let mut line_start = x;
 
     for ch in text.chars() {
         if ch == '\n' {
             paint_prerendered_rules(
-                bitmap, line_start, pen_x, pen_y, ascent, thickness, color, opa, style,
+                bitmap,
+                line_start,
+                pen_x,
+                pen_y,
+                ascent,
+                line_height,
+                thickness,
+                color,
+                opa,
+                style,
             );
             pen_x = x;
             line_start = x;
@@ -4114,8 +4154,9 @@ fn paint_prerendered_text(
         let gh = glyph.height as i32;
         // Reference baseline placement: `OriginY` is the distance from the
         // baseline up to the ink top, so the `.tft` glyphs honor it instead
-        // of being centered in the em box.
-        let top = glyph.top(pen_y, ascent);
+        // of being centered in the em box. Rounding matches the vector path's
+        // `glyph.y.round()`.
+        let top = (pen_y + ascent - f32::from(glyph.origin_y)).round() as i32;
         let left = glyph.left(pen_x);
         for dy in 0..gh {
             for dx in 0..gw {
@@ -4143,18 +4184,32 @@ fn paint_prerendered_text(
         pen_x += glyph.advance();
     }
     paint_prerendered_rules(
-        bitmap, line_start, pen_x, pen_y, ascent, thickness, color, opa, style,
+        bitmap,
+        line_start,
+        pen_x,
+        pen_y,
+        ascent,
+        line_height,
+        thickness,
+        color,
+        opa,
+        style,
     );
 }
 
 /// Underline / strikeout rules for one pre-rendered line.
+///
+/// Uses the same placement formulas as the vector path's `paint_layout`
+/// (underline `line_y + ascent + 2`, strikeout `line_y + line_height / 2`) so a
+/// `.tft` line and an outline line put their rules on the same row.
 #[allow(clippy::too_many_arguments)]
 fn paint_prerendered_rules(
     bitmap: &mut BitmapState,
     x0: i32,
     x1: i32,
-    line_y: i32,
-    ascent: i32,
+    line_y: f32,
+    ascent: f32,
+    line_height: f32,
     thickness: i32,
     color: [u8; 4],
     opa: u8,
@@ -4165,7 +4220,7 @@ fn paint_prerendered_rules(
             bitmap,
             x0,
             x1,
-            line_y + ascent + 2,
+            (line_y + ascent + 2.0).round() as i32,
             thickness,
             color,
             opa,
@@ -4178,7 +4233,7 @@ fn paint_prerendered_rules(
             bitmap,
             x0,
             x1,
-            line_y + ascent - ascent / 3,
+            (line_y + line_height / 2.0).round() as i32,
             thickness,
             color,
             opa,
@@ -5377,15 +5432,15 @@ fn encode_layer_image(bitmap: &BitmapState, format: image::ImageFormat) -> Resul
     use image::ImageEncoder;
     let mut bytes = Vec::new();
     match format {
+        // Shared with `saveBitmap`/`saveLayerImage`'s storage path so the
+        // classic 54-byte header (the offset KAG's `GetImageFileSize`
+        // assumes) is used everywhere; see `bitmap::encode_bmp`.
         image::ImageFormat::Bmp => {
-            image::codecs::bmp::BmpEncoder::new(&mut bytes)
-                .write_image(
-                    &bitmap.rgba,
-                    bitmap.width,
-                    bitmap.height,
-                    image::ExtendedColorType::Rgba8,
-                )
-                .map_err(|e| e.to_string())?;
+            return Ok(crate::bitmap::encode_bmp(
+                bitmap.width,
+                bitmap.height,
+                &bitmap.rgba,
+            ));
         }
         image::ImageFormat::Png => {
             image::codecs::png::PngEncoder::new(&mut bytes)
@@ -9436,8 +9491,9 @@ mod tests {
         );
     }
 
-    /// Build a minimal version-1 `.tft` with one solid 2×2 glyph for `ch`.
-    fn tiny_tft(ch: char) -> Vec<u8> {
+    /// Build a minimal version-1 `.tft` with one solid 2×2 glyph for `ch`,
+    /// whose `OriginY` (the baseline-to-ink-top bearing) is `origin_y`.
+    fn tiny_tft(ch: char, origin_y: i16) -> Vec<u8> {
         const MAGIC: &[u8; 22] = b"TVP pre-rendered font\x1a";
         const HEADER: usize = 36;
         // Literal coverage 63 → ×4 (upscale) → 252.
@@ -9457,10 +9513,20 @@ mod tests {
         item[0..4].copy_from_slice(&(HEADER as u32).to_le_bytes());
         item[4..6].copy_from_slice(&2u16.to_le_bytes()); // width
         item[6..8].copy_from_slice(&2u16.to_le_bytes()); // height
-        item[10..12].copy_from_slice(&2i16.to_le_bytes()); // origin_y
+        item[10..12].copy_from_slice(&origin_y.to_le_bytes()); // origin_y
         item[12..14].copy_from_slice(&3i16.to_le_bytes()); // inc_x
         item[16..18].copy_from_slice(&3i16.to_le_bytes()); // inc
         data
+    }
+
+    /// The face request `paint_text_run` makes for a named layer face. It
+    /// honors `KRKR_RS_SYSTEM_FONT` exactly like the production code, so a
+    /// test can resolve the same rasterizer the draw will use.
+    fn text_face_request(name: &str) -> tvp_text::FaceRequest {
+        match std::env::var_os("KRKR_RS_SYSTEM_FONT") {
+            Some(path) => tvp_text::FaceRequest::Path(std::path::PathBuf::from(path)),
+            None => tvp_text::FaceRequest::Named(name.to_string()),
+        }
     }
 
     /// `Font.mapPrerenderedFont` + `Layer.drawText` must composite the `.tft`
@@ -9475,14 +9541,14 @@ mod tests {
         }
         let env = TestEnv::new("layer-draw-text-prerendered");
         let _guard = RegistryGuard;
-        std::fs::write(env._dir.path().join("testfont.tft"), tiny_tft('A')).unwrap();
+        std::fs::write(env._dir.path().join("testfont.tft"), tiny_tft('A', 2)).unwrap();
         env.run("var f = new Font('MyFace', 30, 0xffffff); f.mapPrerenderedFont('testfont.tft');")
             .unwrap();
         let advance = env.eval("f.getTextWidth('A')", "test").expect("script");
         assert_eq!(advance, tjs2_sys::TjsValue::Real(3.0));
 
         env.run(
-            "var w = new Window(); var l = new Layer(w, null); l.setSize(32, 32); \
+            "var w = new Window(); var l = new Layer(w, null); l.setSize(64, 64); \
              l.font.face = 'MyFace'; l.font.height = 30; \
              l.drawText(1, 1, 'A', 0xffffff);",
         )
@@ -9490,12 +9556,103 @@ mod tests {
         let scene = env.scene();
         let bitmap = scene.bitmap(scene.layers[0].bitmap.unwrap()).unwrap();
         assert!(bitmap_ink(bitmap) > 0, "prerendered glyph must paint");
-        // The `.tft` `origin_y = 2` places the ink at the reference baseline:
-        // `top = line_top + ascent - origin_y` = 1 + 25 - 2 = 24 (the WIP
-        // change from the old centered layout; `ascent` = 30 * 0.85).
+        // The `.tft` `origin_y = 2` places the ink at the mapped outline
+        // face's baseline: `top = line_top + ascent - origin_y`, where the
+        // ascent is the rasterizer's (`GlyphAtlas::ascent`), not the old
+        // fabricated `height * 0.85`.
+        let face = tvp_text::resolve_face(&text_face_request("MyFace"))
+            .expect("a face resolves on this machine");
+        let ascent = tvp_text::with_cached_atlas(face, 30, |atlas| atlas.ascent());
+        let expected_top = (1.0 + ascent - 2.0).round() as u32;
         assert!(
-            bitmap.rgba[((24 * bitmap.width + 1) * 4 + 3) as usize] > 0,
-            "prerendered ink must land at the baseline (origin_y) position"
+            bitmap.rgba[((expected_top * bitmap.width + 1) * 4 + 3) as usize] > 0,
+            "prerendered ink must land at the mapped baseline (row {expected_top}, ascent {ascent})"
+        );
+    }
+
+    /// A `.tft` glyph and the outline glyph for the *same* character must
+    /// share one baseline: the `.tft` path takes its ascent from the mapped
+    /// outline face's rasterizer, not a fabricated `height * 0.85`. Regression
+    /// for "some characters render lower than others" when
+    /// `MessageArea.charOutput` mixes `.tft` CJK characters with per-call
+    /// vector fallback.
+    #[test]
+    fn layer_draw_text_prerendered_and_vector_share_baseline() {
+        struct RegistryGuard;
+        impl Drop for RegistryGuard {
+            fn drop(&mut self) {
+                tvp_text::clear_prerendered_fonts();
+            }
+        }
+        let env = TestEnv::new("layer-draw-text-shared-baseline");
+        let _guard = RegistryGuard;
+        let height = 30u32;
+
+        // Resolve the same face `drawText` will use, and read the outline
+        // bearing, the resolved ascent, and the atlas's internal top padding.
+        // The padding is a vector-path detail; measuring it lets the two ink
+        // rows be compared as baselines without hardcoding it.
+        let face = tvp_text::resolve_face(&text_face_request("SharedBaselineFace"))
+            .expect("a face resolves on this machine");
+        let (bearing_y, ascent, top_pad) = tvp_text::with_cached_atlas(face, height, |atlas| {
+            let slot = atlas.rasterize_char('A');
+            let (w, _) = atlas.atlas_size();
+            let alpha = |x: u32, y: u32| atlas.atlas_rgba()[((y * w + x) * 4 + 3) as usize];
+            let top_pad = (0..slot.h + 8)
+                .find(|&dy| (0..slot.w).any(|dx| alpha(slot.u + dx, slot.v + dy) != 0))
+                .unwrap_or(0) as i32;
+            (slot.bearing_y, atlas.ascent(), top_pad)
+        });
+
+        // Vector path first, before the mapping exists; then map the same
+        // `(face, height, style)` to a one-glyph `.tft` and draw the identical
+        // call through it.
+        env.run(
+            "var w = new Window(); \
+             var vec = new Layer(w, null); vec.setSize(64, 64); \
+             vec.font.face = 'SharedBaselineFace'; vec.font.height = 30; \
+             vec.drawText(1, 1, 'A', 0xffffffff);",
+        )
+        .unwrap();
+        std::fs::write(
+            env._dir.path().join("shared_baseline.tft"),
+            tiny_tft('A', bearing_y as i16),
+        )
+        .unwrap();
+        env.run(
+            "var f = new Font('SharedBaselineFace', 30, 0xffffff); \
+             f.mapPrerenderedFont('shared_baseline.tft'); \
+             var tft = new Layer(w, null); tft.setSize(64, 64); \
+             tft.font.face = 'SharedBaselineFace'; tft.font.height = 30; \
+             tft.drawText(1, 1, 'A', 0xffffffff);",
+        )
+        .unwrap();
+
+        let scene = env.scene();
+        let vector = scene.bitmap(scene.layers[0].bitmap.unwrap()).unwrap();
+        let prerendered = scene.bitmap(scene.layers[1].bitmap.unwrap()).unwrap();
+        let first_ink_row = |b: &crate::scene::BitmapState| -> i32 {
+            (0..b.height)
+                .find(|&y| (0..b.width).any(|x| b.rgba[((y * b.width + x) * 4 + 3) as usize] != 0))
+                .expect("both paths must paint ink") as i32
+        };
+        let vec_top = first_ink_row(vector);
+        let tft_top = first_ink_row(prerendered);
+        // The `.tft` baseline is the rasterizer ascent; the vector ink
+        // additionally sits `top_pad` px into its atlas cell. Both baselines
+        // (`ink_top + bearing`) must agree.
+        assert_eq!(
+            tft_top + bearing_y,
+            vec_top + bearing_y - top_pad,
+            "the `.tft` and outline glyphs must share a baseline \
+             (tft_top={tft_top}, vec_top={vec_top}, top_pad={top_pad})"
+        );
+        // Pin the value directly too: a regression to `height * 0.85` would
+        // place the `.tft` ink several px off this row.
+        assert_eq!(
+            tft_top,
+            (1.0 + ascent - bearing_y as f32).round() as i32,
+            "the `.tft` ink must land at `y + atlas.ascent() - OriginY`"
         );
     }
 

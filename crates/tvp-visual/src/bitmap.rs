@@ -26,7 +26,7 @@
 //! renderer's contract); the reference's internal 0xAARRGGBB memory layout
 //! is converted at the script boundary.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use engine::Storage;
 use image::{DynamicImage, ImageFormat, RgbaImage};
@@ -142,11 +142,34 @@ fn is_tlg_name(name: &str) -> bool {
 /// reference's `TVPGuessGraphicLoadHandler`/`TVPFindGraphicLoadHandler`.
 fn resolve_storage_name(storage: &Storage, name: &str) -> Result<String, BitmapError> {
     let normalized = normalize_storage_name(name);
-    EXTENSION_PROBE
-        .iter()
-        .map(|ext| format!("{normalized}{ext}"))
-        .find(|cand| storage.exists(cand))
-        .ok_or_else(|| BitmapError::NotFound(name.to_string()))
+    // Probe the raw name first, then the normalized (lowercased, `\`-folded)
+    // form, exactly like `tvp_storages::exists_in_storage` does. Storage
+    // names are case-insensitive in the reference, but a *relative* name is
+    // resolved against the game dir (where the disk scan is case-insensitive)
+    // while an **absolute** path must not be force-lowercased: on a
+    // case-sensitive filesystem `<game>/savedata/qsave01.bmp` becomes
+    // `/mnt/data/.../【kr】...` and stops resolving. That broke
+    // `Layer.loadImages(System.dataPath + "qsave01.bmp")`, i.e. loading a
+    // save thumbnail (and therefore every save).
+    let mut bases: Vec<&str> = vec![name];
+    if normalized != name {
+        bases.push(&normalized);
+    }
+    let found = bases.into_iter().find_map(|base| {
+        EXTENSION_PROBE
+            .iter()
+            .map(|ext| format!("{base}{ext}"))
+            .find(|cand| storage.exists(cand))
+    });
+    if found.is_none() {
+        log::debug!(
+            "resolve_storage_name: {name:?} (normalized {normalized:?}) matched no candidate; \
+             game_dir={:?} raw_exists={}",
+            storage.game_dir,
+            storage.exists(name)
+        );
+    }
+    found.ok_or_else(|| BitmapError::NotFound(name.to_string()))
 }
 
 /// Color-key sentinel meaning "no color key" (reference `TVP_clNone`,
@@ -549,6 +572,7 @@ pub fn encode_image(
     use image::ImageEncoder;
     let mut out = Vec::new();
     let res = match format {
+        SaveFormat::Bmp => return Ok(encode_bmp(width, height, rgba)),
         SaveFormat::Png => image::codecs::png::PngEncoder::new(&mut out).write_image(
             rgba,
             width,
@@ -567,15 +591,58 @@ pub fn encode_image(
                 image::ExtendedColorType::Rgb8,
             )
         }
-        SaveFormat::Bmp => image::codecs::bmp::BmpEncoder::new(&mut out).write_image(
-            rgba,
-            width,
-            height,
-            image::ExtendedColorType::Rgba8,
-        ),
     };
     res.map(|()| out)
         .map_err(|e| BitmapError::Save(format!("{format:?}").to_ascii_lowercase(), e.to_string()))
+}
+
+/// Encode RGBA8 as a 32bpp `BI_RGB` BMP with the **classic 54-byte header**
+/// (14-byte `BITMAPFILEHEADER` + 40-byte `BITMAPINFOHEADER`) and bottom-up
+/// rows, exactly like the reference `TVPSaveTextureAsBMP`
+/// (`GraphicsLoaderIntf.cpp:783-869`: `bfOffBits = sizeof(BITMAPFILEHEADER) +
+/// sizeof(BITMAPINFOHEADER)`, `biSize = 40`, `biSizeImage = 0`, rows written
+/// `y = height-1 .. 0` with R/B swapped).
+///
+/// The header size is load-bearing for KiriKiri games: KAG derives the save
+/// stream offset from the thumbnail as `GetImageFileSize(img) =
+/// imageWidth * imageHeight * 4 + 54` (`system/utility.tjs`) and then appends
+/// the save data with `temp.saveStruct(DATA_PATH + file, "o%d".sprintf(…))`.
+/// A V4/V5 header (108-byte `biSize`, `bfOffBits = 122`) therefore misplaces
+/// every appended save by 68 bytes, corrupting both the thumbnail and the
+/// data; `image`'s `BmpEncoder` emits V4 for RGBA, so write it ourselves.
+pub(crate) fn encode_bmp(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
+    const FILE_HEADER: u32 = 14;
+    const INFO_HEADER: u32 = 40;
+    // 32bpp rows are already 4-byte aligned, so the BMP pitch is `width * 4`
+    // (`bmppitch = (((w*4 - 1) >> 2) + 1) << 2`).
+    let pitch = width * 4;
+    let image_size = pitch * height;
+    let mut out = Vec::with_capacity((FILE_HEADER + INFO_HEADER + image_size) as usize);
+    out.extend_from_slice(b"BM");
+    out.extend_from_slice(&(FILE_HEADER + INFO_HEADER + image_size).to_le_bytes()); // bfSize
+    out.extend_from_slice(&0u16.to_le_bytes()); // bfReserved1
+    out.extend_from_slice(&0u16.to_le_bytes()); // bfReserved2
+    out.extend_from_slice(&(FILE_HEADER + INFO_HEADER).to_le_bytes()); // bfOffBits
+    out.extend_from_slice(&INFO_HEADER.to_le_bytes()); // biSize
+    out.extend_from_slice(&width.to_le_bytes()); // biWidth
+    out.extend_from_slice(&height.to_le_bytes()); // biHeight (positive = bottom-up)
+    out.extend_from_slice(&1u16.to_le_bytes()); // biPlanes
+    out.extend_from_slice(&32u16.to_le_bytes()); // biBitCount
+    out.extend_from_slice(&0u32.to_le_bytes()); // biCompression = BI_RGB
+    out.extend_from_slice(&0u32.to_le_bytes()); // biSizeImage
+    out.extend_from_slice(&0u32.to_le_bytes()); // biXPelsPerMeter
+    out.extend_from_slice(&0u32.to_le_bytes()); // biYPelsPerMeter
+    out.extend_from_slice(&0u32.to_le_bytes()); // biClrUsed
+    out.extend_from_slice(&0u32.to_le_bytes()); // biClrImportant
+    // Bottom-up, BGRA (the reference's `TVPReverseRGB`).
+    for y in (0..height).rev() {
+        let start = (y * width * 4) as usize;
+        let row = &rgba[start..start + (width * 4) as usize];
+        for px in row.chunks_exact(4) {
+            out.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+        }
+    }
+    out
 }
 
 /// Write an encoded bitmap to the game directory (the reference
@@ -592,20 +659,37 @@ pub fn save_bitmap_to_storage(
     rgba: &[u8],
 ) -> Result<(), BitmapError> {
     let bytes = encode_image(format, width, height, rgba)?;
-    let normalized = normalize_storage_name(name);
-    let relative = Path::new(&normalized);
-    if relative.components().any(|c| {
-        matches!(
-            c,
-            std::path::Component::ParentDir | std::path::Component::RootDir
-        )
-    }) {
+    let root = storage.game_dir();
+    // Games save with `System.dataPath + name`, i.e. an **absolute** path
+    // already pointing inside the game directory; a bare name is resolved
+    // under the mount like the reference's `TVPCreateStream(write)`. The
+    // previous code normalized (ASCII-lowercased) the whole name and then
+    // rejected any absolute path as "escapes the game directory", so every
+    // save to `System.dataPath + file` failed on a case-sensitive host.
+    let path = if Path::new(name).is_absolute() {
+        PathBuf::from(name)
+    } else {
+        let normalized = normalize_storage_name(name);
+        let relative = Path::new(&normalized);
+        if relative.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir | std::path::Component::RootDir
+            )
+        }) {
+            return Err(BitmapError::Save(
+                name.to_string(),
+                "path escapes the game directory".into(),
+            ));
+        }
+        root.join(relative)
+    };
+    if !path.starts_with(root) {
         return Err(BitmapError::Save(
             name.to_string(),
             "path escapes the game directory".into(),
         ));
     }
-    let path = storage.game_dir().join(relative);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| BitmapError::Save(name.to_string(), e.to_string()))?;
@@ -737,5 +821,125 @@ mod tests {
         assert_eq!((decoded.width, decoded.height), (w, h));
         assert!(!decoded.has_alpha);
         assert!(decoded.rgba.iter().any(|&b| b != 0));
+    }
+
+    /// A unique scratch directory that cleans itself up on drop.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            // An **uppercase** component: the point of several tests below is
+            // that lowercasing an absolute path must not be required.
+            static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir = std::env::temp_dir()
+                .join(format!("TvpVisualBitmap-{tag}-{}-{n}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn bmp_save_uses_the_classic_54_byte_header() {
+        // KAG derives the appended-save offset as `w*h*4 + 54`
+        // (`utility.tjs::GetImageFileSize`), so the BMP header must be the
+        // 14-byte file header + 40-byte `BITMAPINFOHEADER`, never a V4/V5 one.
+        let (w, h) = (7u32, 3u32);
+        let rgba = pattern(w, h);
+        let bytes = encode_image(SaveFormat::Bmp, w, h, &rgba).unwrap();
+        assert_eq!(bytes.len(), (w * h * 4 + 54) as usize, "w*h*4 + 54");
+        assert_eq!(&bytes[..2], b"BM");
+        assert_eq!(u32::from_le_bytes(bytes[10..14].try_into().unwrap()), 54);
+        assert_eq!(u32::from_le_bytes(bytes[14..18].try_into().unwrap()), 40);
+        assert_eq!(u32::from_le_bytes(bytes[30..34].try_into().unwrap()), 0);
+        // Rows are stored bottom-up with R/B swapped: the first stored row is
+        // the last image row.
+        let first = &bytes[54..58];
+        let last_row_x0 = &rgba[((h - 1) * w * 4) as usize..][..4];
+        assert_eq!(
+            first,
+            &[
+                last_row_x0[2],
+                last_row_x0[1],
+                last_row_x0[0],
+                last_row_x0[3]
+            ]
+        );
+        // And it round-trips.
+        let decoded = decode_image("x.bmp", &bytes).unwrap();
+        assert_eq!((decoded.width, decoded.height), (w, h));
+        assert_eq!(decoded.rgba, rgba);
+    }
+
+    #[test]
+    fn resolve_storage_name_keeps_the_raw_absolute_path() {
+        // An absolute `<game>/savedata/Save01.bmp` must resolve without being
+        // ASCII-lowercased: on a case-sensitive filesystem the lowercased
+        // path (`.../savedata/save01.bmp` under a `/tmp/TvpVisualBitmap-…`)
+        // does not exist. This is what broke `Layer.loadImages(System.dataPath
+        // + "qsave01.bmp")`, i.e. every save load.
+        let dir = TempDir::new("rawpath");
+        std::fs::create_dir_all(dir.path().join("savedata")).unwrap();
+        std::fs::write(dir.path().join("savedata/Save01.bmp"), b"BM").unwrap();
+        let storage = Storage::mount(dir.path()).expect("temp dir mounts");
+        let absolute = dir.path().join("savedata/Save01.bmp");
+        let absolute = absolute.to_string_lossy().into_owned();
+        let resolved = resolve_storage_name(&storage, &absolute).expect("raw path resolves");
+        assert_eq!(resolved, absolute);
+        // A relative name still resolves through the extension probe.
+        assert_eq!(
+            resolve_storage_name(&storage, "savedata/Save01").unwrap(),
+            "savedata/Save01.bmp"
+        );
+    }
+
+    #[test]
+    fn save_bitmap_to_storage_accepts_absolute_paths_inside_the_game_dir() {
+        let dir = TempDir::new("saveabs");
+        let storage = Storage::mount(dir.path()).expect("temp dir mounts");
+        let (w, h) = (5u32, 4u32);
+        let rgba = pattern(w, h);
+        let target = dir.path().join("savedata/qsave01.bmp");
+        save_bitmap_to_storage(
+            &storage,
+            &target.to_string_lossy(),
+            SaveFormat::Bmp,
+            w,
+            h,
+            &rgba,
+        )
+        .expect("absolute path inside the mount is writable");
+        let written = std::fs::read(&target).unwrap();
+        assert_eq!(written.len(), (w * h * 4 + 54) as usize);
+        // Relative names still resolve under the game directory.
+        save_bitmap_to_storage(&storage, "sub/x.bmp", SaveFormat::Bmp, w, h, &rgba).unwrap();
+        assert!(dir.path().join("sub/x.bmp").is_file());
+        // Escaping the game directory is still refused.
+        let outside = std::env::temp_dir().join("TvpVisualBitmap-escape.bmp");
+        assert!(
+            save_bitmap_to_storage(
+                &storage,
+                &outside.to_string_lossy(),
+                SaveFormat::Bmp,
+                w,
+                h,
+                &rgba
+            )
+            .is_err()
+        );
+        assert!(
+            save_bitmap_to_storage(&storage, "../escape.bmp", SaveFormat::Bmp, w, h, &rgba)
+                .is_err()
+        );
     }
 }
