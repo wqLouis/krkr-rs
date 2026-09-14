@@ -234,24 +234,11 @@ fn exists_in_storage(name: &str) -> bool {
     let Some(storage) = storage_arc() else {
         return false;
     };
-    // `name` may already be normalized (lowercased) by the caller; try the
-    // raw name too so absolute disk paths with mixed case resolve on
-    // case-sensitive filesystems.
-    let found = {
-        let st = storage.lock().unwrap();
-        st.exists(name) || st.exists(&normalize_storage_name(name))
-    };
-    if found {
-        return true;
-    }
-    // Fallback: `engine::Storage::find` is case-sensitive on disk, but
-    // storage names are normalized to lowercase; scan for mixed-case files
-    // (the reference lowercases listed names too).
-    let game_dir = storage.lock().unwrap().game_dir().to_path_buf();
-    let normalized = normalize_storage_name(name);
-    disk_entries(&game_dir)
-        .iter()
-        .any(|(n, is_dir, _)| !is_dir && n == &normalized)
+    let st = storage.lock().unwrap();
+    // `Storage::find` is now case-insensitive for both relative and absolute
+    // names (it lowercases/descends the storage-relative part only), so the
+    // raw name is enough; the normalized spelling is a cheap extra fast path.
+    st.exists(name) || st.exists(&normalize_storage_name(name))
 }
 
 /// `TVPIsExistentStorage`: the mounted storage first, then the auto search
@@ -1469,26 +1456,27 @@ extern "C" fn native_select_directory(
 /// matching the current tjs2-sys milestone).
 /// Resolve a storage name to a local disk path (the game passes
 /// `System.dataPath + name`, i.e. absolute paths under the game dir).
+///
+/// An existing case-variant is reused (so a write updates the real file
+/// instead of creating a case duplicate); a genuinely new name keeps the
+/// mount prefix's real spelling and lowercases the storage-relative part,
+/// like the reference's normalized storage names.
 fn disk_path(name: &str) -> String {
-    let normalized = normalize_storage_name(name);
-    let Some(storage) = storage_arc() else {
-        return normalized;
-    };
-    let game_dir = storage.lock().unwrap().game_dir().to_path_buf();
-    let disk = disk_entries(&game_dir);
-    for (n, is_dir, path) in disk {
-        if !is_dir && n == normalized {
-            return path.to_string_lossy().into_owned();
+    if let Some(storage) = storage_arc() {
+        let storage = storage.lock().unwrap();
+        if let Some(existing) = storage.find_disk(name) {
+            return existing.to_string_lossy().into_owned();
+        }
+        if let Some(relative) = storage.relative_disk_name(name) {
+            let relative = normalize_storage_name(&relative);
+            return storage
+                .game_dir()
+                .join(relative)
+                .to_string_lossy()
+                .into_owned();
         }
     }
-    // Not a mounted disk file: use the name as given (absolute path or
-    // game-dir-relative), like the reference's TVPGetLocallyAccessibleName.
-    let p = std::path::Path::new(&normalized);
-    if p.is_absolute() {
-        normalized
-    } else {
-        game_dir.join(&normalized).to_string_lossy().into_owned()
-    }
+    normalize_storage_name(name)
 }
 
 /// `Storages.deleteFile(name)` — remove a disk file (save data cleanup;
@@ -2285,5 +2273,83 @@ mod tests {
             TjsValue::String("new.bin".into())
         );
         drop(dir);
+    }
+
+    #[test]
+    fn is_existent_storage_resolves_absolute_mixed_case_only_inside_mount() {
+        let _vm_lock = vm_lock();
+        reset_globals();
+        let (_dir, path) = mount_game(&[("savedata/savemng.dat", "old")]);
+        let engine = engine_with_storages();
+        let game = format!("{}/", path.to_string_lossy().replace('\\', "/"));
+        let exists = |name: &str| {
+            engine
+                .eval(
+                    &format!("Storages.isExistentStorage({})", js_str(name)),
+                    "t",
+                )
+                .unwrap()
+        };
+        assert_eq!(
+            exists(&format!("{game}savedata/saveMng.dat")),
+            TjsValue::Integer(1)
+        );
+        assert_eq!(
+            exists(&format!("{game}savedata/SAVEMNG.DAT")),
+            TjsValue::Integer(1)
+        );
+        assert_eq!(
+            exists(&format!("{game}SAVEDATA/SAVEMNG.DAT")),
+            TjsValue::Integer(1)
+        );
+        // A path outside the mount must not resolve.
+        let outside =
+            std::env::temp_dir().join(format!("tvp-storages-outside-{}.dat", std::process::id()));
+        fs::write(&outside, b"x").unwrap();
+        assert_eq!(exists(&outside.to_string_lossy()), TjsValue::Integer(0));
+        let _ = fs::remove_file(&outside);
+    }
+
+    #[test]
+    fn stream_factory_writes_case_insensitively_and_lowercases_new_names() {
+        let _vm_lock = vm_lock();
+        reset_globals();
+        let (dir, path) = mount_game(&[("savedata/savemng.dat", "old")]);
+        let engine = engine_with_storages();
+        engine.set_data_dir(&path.to_string_lossy());
+        let game = format!("{}/", path.to_string_lossy().replace('\\', "/"));
+
+        // Save through the C++ stream factory using the capital spelling: the
+        // existing lowercase file must be updated, not duplicated.
+        let script = format!(
+            "var a = ['hello']; a.saveStruct({}, 'o0');",
+            js_str(&format!("{game}savedata/SaveMng.dat"))
+        );
+        engine.exec_script(&script, "t").unwrap();
+        let mut files: Vec<_> = fs::read_dir(path.join("savedata"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        files.sort();
+        assert_eq!(files, vec!["savemng.dat".to_string()], "no duplicate");
+
+        // Re-read the written file through `Storage::find`.
+        let storage = Storage::mount(dir.path()).unwrap();
+        let resolved = storage
+            .find(&format!("{game}savedata/saveMng.dat"))
+            .expect("capital spelling resolves");
+        assert_eq!(
+            resolved,
+            engine::storage::Location::Disk(path.join("savedata/savemng.dat"))
+        );
+
+        // A brand-new name is created with the lowercased relative spelling.
+        let script = format!(
+            "var b = ['new']; b.saveStruct({}, 'o0');",
+            js_str(&format!("{game}savedata/NewSave.DAT"))
+        );
+        engine.exec_script(&script, "t").unwrap();
+        assert!(path.join("savedata/newsave.dat").is_file());
+        assert!(!path.join("savedata/NewSave.DAT").exists());
     }
 }

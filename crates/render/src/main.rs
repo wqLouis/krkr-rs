@@ -453,6 +453,23 @@ fn run_vm(vm: Res<VmRuntime>) {
         Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
     };
     let now_ms = vm.started.elapsed().as_millis() as u64;
+    // Dev hook: run `$KRKR_EVAL` once, `$KRKR_EVAL_AT_MS` ms into the game
+    // loop (default 3000), so a headless script can drive the *running* game
+    // (scene changes, save/load, transitions) that `krkr-cli load` cannot
+    // reach because it never ticks. Debug aid only.
+    if let Ok(script) = std::env::var("KRKR_EVAL") {
+        let at = std::env::var("KRKR_EVAL_AT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(3000);
+        static EVALED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if now_ms >= at && !EVALED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            match vm.engine.eval_retained(&script, "krkr-eval") {
+                Ok(_) => log::info!("KRKR_EVAL -> ok"),
+                Err(e) => log::error!("KRKR_EVAL !! {e}"),
+            }
+        }
+    }
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         tvp_natives::async_trigger_poll(&vm.engine);
         tvp_visual::timer_poll(&vm.engine, now_ms);

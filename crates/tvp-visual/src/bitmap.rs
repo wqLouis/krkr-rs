@@ -26,7 +26,7 @@
 //! renderer's contract); the reference's internal 0xAARRGGBB memory layout
 //! is converted at the script boundary.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use engine::Storage;
 use image::{DynamicImage, ImageFormat, RgbaImage};
@@ -662,27 +662,27 @@ pub fn save_bitmap_to_storage(
     let root = storage.game_dir();
     // Games save with `System.dataPath + name`, i.e. an **absolute** path
     // already pointing inside the game directory; a bare name is resolved
-    // under the mount like the reference's `TVPCreateStream(write)`. The
-    // previous code normalized (ASCII-lowercased) the whole name and then
-    // rejected any absolute path as "escapes the game directory", so every
-    // save to `System.dataPath + file` failed on a case-sensitive host.
-    let path = if Path::new(name).is_absolute() {
-        PathBuf::from(name)
-    } else {
-        let normalized = normalize_storage_name(name);
-        let relative = Path::new(&normalized);
-        if relative.components().any(|c| {
-            matches!(
-                c,
-                std::path::Component::ParentDir | std::path::Component::RootDir
-            )
-        }) {
-            return Err(BitmapError::Save(
-                name.to_string(),
-                "path escapes the game directory".into(),
-            ));
-        }
-        root.join(relative)
+    // under the mount like the reference's `TVPCreateStream(write)`.
+    //
+    // `relative_disk_name` strips the mount prefix without lowercasing it and
+    // rejects absolute paths outside the mount as well as traversal
+    // components, so the escape check below can never be fooled.
+    let relative = storage.relative_disk_name(name).ok_or_else(|| {
+        BitmapError::Save(name.to_string(), "path escapes the game directory".into())
+    })?;
+    if relative.is_empty() {
+        return Err(BitmapError::Save(
+            name.to_string(),
+            "path escapes the game directory".into(),
+        ));
+    }
+    // Storage names are case-insensitive: update an existing case-variant
+    // (e.g. `savedata/savemng.dat`) instead of creating a duplicate, and
+    // otherwise create the new file with the lowercased storage-relative
+    // spelling the reference/KR fork uses.
+    let path = match storage.find_disk(name) {
+        Some(existing) => existing,
+        None => root.join(normalize_storage_name(&relative)),
     };
     if !path.starts_with(root) {
         return Err(BitmapError::Save(
@@ -701,6 +701,7 @@ pub fn save_bitmap_to_storage(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn pattern(w: u32, h: u32) -> Vec<u8> {
         (0..w * h)
@@ -941,5 +942,53 @@ mod tests {
             save_bitmap_to_storage(&storage, "../escape.bmp", SaveFormat::Bmp, w, h, &rgba)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn save_bitmap_updates_existing_case_variant_and_lowercases_new_names() {
+        let dir = TempDir::new("saveci");
+        std::fs::create_dir_all(dir.path().join("savedata")).unwrap();
+        let canonical = dir.path().join("savedata/savemng.dat");
+        std::fs::write(&canonical, b"original").unwrap();
+        let storage = Storage::mount(dir.path()).expect("temp dir mounts");
+        let (w, h) = (3u32, 2u32);
+        let rgba = pattern(w, h);
+
+        // Requesting the capital spelling updates the existing lowercase file
+        // instead of creating a duplicate.
+        save_bitmap_to_storage(
+            &storage,
+            &dir.path().join("savedata/SaveMng.dat").to_string_lossy(),
+            SaveFormat::Bmp,
+            w,
+            h,
+            &rgba,
+        )
+        .expect("case-variant save");
+        let mut files: Vec<_> = std::fs::read_dir(dir.path().join("savedata"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        files.sort();
+        assert_eq!(
+            files,
+            vec!["savemng.dat".to_string()],
+            "no duplicate created"
+        );
+        let written = std::fs::read(&canonical).unwrap();
+        assert_eq!(written.len(), (w * h * 4 + 54) as usize);
+
+        // A brand-new name is created with the lowercased relative spelling.
+        save_bitmap_to_storage(
+            &storage,
+            &dir.path().join("savedata/NewSave.BMP").to_string_lossy(),
+            SaveFormat::Bmp,
+            w,
+            h,
+            &rgba,
+        )
+        .expect("new save");
+        assert!(dir.path().join("savedata/newsave.bmp").is_file());
+        assert!(!dir.path().join("savedata/NewSave.BMP").exists());
     }
 }

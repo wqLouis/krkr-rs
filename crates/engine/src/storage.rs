@@ -43,33 +43,46 @@ fn storage_base(name: &str) -> &str {
     name.rsplit('/').next().unwrap_or(name)
 }
 
-/// Find a disk file by normalized relative name. Storage names are
-/// case-insensitive in the reference engine even when the host filesystem is
-/// not; `find` keeps its fast exact-case path, while metadata queries use this
-/// fallback for the normalized spelling.
+/// Find a disk file by normalized relative name, comparing path components
+/// case-insensitively (ASCII) and descending into a directory only when the
+/// target's next component matches its name. Cost is therefore bounded by the
+/// path depth rather than by the size of the tree, and no `str` is ever
+/// sliced at a non-`char` boundary (components are split on `/`).
 fn find_disk_case_insensitive(base: &Path, relative: &str) -> Option<PathBuf> {
-    fn walk(dir: &Path, prefix: &str, target: &str) -> Option<PathBuf> {
+    fn descend(dir: &Path, parts: &[&str]) -> Option<PathBuf> {
+        let want = parts[0];
+        // Directories whose name matches this component and that still have
+        // remaining target components to match are searched after the direct
+        // file hit, so a file directly at this level wins.
+        let mut subdirs = Vec::new();
         for entry in fs::read_dir(dir).ok()?.flatten() {
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let relative = if prefix.is_empty() {
-                name
-            } else {
-                format!("{prefix}/{name}")
-            };
-            if path.is_file() && relative.eq_ignore_ascii_case(target) {
-                return Some(path);
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !name.eq_ignore_ascii_case(want) {
+                continue;
             }
-            if path.is_dir()
-                && let Some(found) = walk(&path, &relative, target)
-            {
+            let path = entry.path();
+            if parts.len() == 1 {
+                if path.is_file() {
+                    return Some(path);
+                }
+            } else if path.is_dir() {
+                subdirs.push(path);
+            }
+        }
+        for subdir in subdirs {
+            if let Some(found) = descend(&subdir, &parts[1..]) {
                 return Some(found);
             }
         }
         None
     }
 
-    walk(base, "", relative)
+    let parts: Vec<&str> = relative.split('/').filter(|p| !p.is_empty()).collect();
+    if parts.is_empty() {
+        return None;
+    }
+    descend(base, &parts)
 }
 
 /// A mounted game storage: one game directory plus all `.xp3` archives
@@ -145,8 +158,13 @@ impl Storage {
     }
 
     /// Resolve a storage name to a location, mirroring the reference search
-    /// order: explicit `arc.xp3>path` → disk file (as-is, then normalized)
-    /// → first archive containing the normalized name.
+    /// order: explicit `arc.xp3>path` → disk file (case-insensitive) → first
+    /// archive containing the normalized name → auto paths.
+    ///
+    /// Storage names are case-insensitive in the reference engine even when
+    /// the host filesystem is not. Only the *storage-relative* part is
+    /// normalized; the mount prefix keeps the real filesystem spelling (and a
+    /// name that escapes the mount never resolves).
     pub fn find(&self, name: &str) -> Option<Location> {
         // Explicit archive addressing: "foo.xp3>data/script.ks"
         if let Some((arc, rest)) = name.split_once('>') {
@@ -167,17 +185,20 @@ impl Storage {
             return None;
         }
 
-        // Disk file.
-        for cand in [name, &normalize_in_archive_name(name)] {
-            let path = self.game_dir.join(cand);
-            if path.is_file() {
-                return Some(Location::Disk(path));
-            }
+        // Resolve the storage-relative part. Absolute names must point inside
+        // the mount, and traversal components are refused, so a name can
+        // never resolve outside the game directory.
+        let relative = self.relative_disk_name(name)?;
+
+        // Disk file (exact normalized spelling first, then the script's
+        // spelling, then a bounded case-insensitive walk).
+        if let Some(location) = self.find_disk_relative(&relative) {
+            return Some(location);
         }
 
-        // Archives, in mount order.
+        // Archives, in mount order (looked up by the storage-relative name).
+        let normalized = normalize_in_archive_name(&relative);
         for (path, arc) in &self.archives {
-            let normalized = normalize_in_archive_name(name);
             if arc.entry(&normalized).is_some() {
                 return Some(Location::Archive(path.clone(), normalized));
             }
@@ -186,8 +207,7 @@ impl Storage {
         // Auto paths: the base name joined with each registered prefix
         // (last added wins, like the reference's hash-table Add). Archive
         // prefixes recurse into `find`; plain dirs hit the disk.
-        let normalized_name = normalize_in_archive_name(name);
-        let base = storage_base(&normalized_name);
+        let base = storage_base(&normalized);
         for entry in auto_paths().iter().rev() {
             let joined = format!("{entry}{base}");
             if entry.contains('>') {
@@ -202,6 +222,68 @@ impl Storage {
             }
         }
         None
+    }
+
+    /// The storage-relative part of `name` (using `/` separators), or `None`
+    /// when the name is absolute and does not point inside the mount, or
+    /// contains a traversal (`..`) component.
+    pub fn relative_disk_name(&self, name: &str) -> Option<String> {
+        // Fold Windows separators so a `\`-separated storage name behaves
+        // like the reference on any host. The mount prefix itself contains no
+        // backslashes, so this cannot corrupt it.
+        let separators = name.replace('\\', "/");
+        let path = Path::new(&separators);
+        let relative = if path.is_absolute() {
+            path.strip_prefix(&self.game_dir).ok()?.to_path_buf()
+        } else {
+            path.to_path_buf()
+        };
+        if relative.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        }) {
+            return None;
+        }
+        Some(relative.to_string_lossy().replace('\\', "/"))
+    }
+
+    /// Resolve an existing disk file for a storage name, case-insensitively.
+    /// Returns the real on-disk path so writers can update the existing file
+    /// instead of creating a case-variant duplicate.
+    pub fn find_disk(&self, name: &str) -> Option<PathBuf> {
+        let relative = self.relative_disk_name(name)?;
+        match self.find_disk_relative(&relative)? {
+            Location::Disk(path) => Some(path),
+            Location::Archive(..) => None,
+        }
+    }
+
+    /// Disk branch of [`Self::find`], given an already-resolved relative name.
+    fn find_disk_relative(&self, relative: &str) -> Option<Location> {
+        if relative.is_empty() {
+            return None;
+        }
+        // Reference semantics: storage names are normalized to lowercase
+        // before lookup, so the lowercase spelling wins when both a lowercase
+        // and a mixed-case file exist.
+        let normalized = normalize_in_archive_name(relative);
+        let candidate = self.game_dir.join(&normalized);
+        if candidate.is_file() {
+            return Some(Location::Disk(candidate));
+        }
+        // Fast path: the exact spelling the script used.
+        if normalized != relative {
+            let exact = self.game_dir.join(relative);
+            if exact.is_file() {
+                return Some(Location::Disk(exact));
+            }
+        }
+        // Bounded, component-wise case-insensitive walk.
+        find_disk_case_insensitive(&self.game_dir, &normalized).map(Location::Disk)
     }
 
     /// Read a storage entry to bytes (disk file or archive member).
@@ -227,15 +309,7 @@ impl Storage {
     /// timestamps are intentionally absent because XP3 has no timestamp
     /// fields. Names follow the same resolution order as [`Self::find`].
     pub fn stat(&self, name: &str) -> Option<StorageMetadata> {
-        let location = self.find(name).or_else(|| {
-            let normalized = normalize_in_archive_name(name);
-            if normalized.contains('>') {
-                None
-            } else {
-                find_disk_case_insensitive(&self.game_dir, &normalized).map(Location::Disk)
-            }
-        });
-        match location {
+        match self.find(name) {
             Some(Location::Disk(path)) => {
                 let metadata = fs::metadata(path).ok()?;
                 Some(StorageMetadata {
@@ -303,6 +377,114 @@ mod tests {
             "data/bg/title.jpg"
         );
     }
+
+    /// A unique scratch directory with an **uppercase** component, so the
+    /// tests prove the mount prefix is not lowercased.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir =
+                std::env::temp_dir().join(format!("TvpStorage-{tag}-{}-{n}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn absolute_and_relative_mixed_case_resolve_to_real_file() {
+        let dir = TempDir::new("mixedcase");
+        fs::create_dir_all(dir.path().join("savedata")).unwrap();
+        let real = dir.path().join("savedata/savemng.dat");
+        fs::write(&real, b"save data").unwrap();
+        let storage = Storage::mount(dir.path()).unwrap();
+
+        let game = dir.path().to_string_lossy().into_owned();
+        for name in [
+            format!("{game}/savedata/saveMng.dat"),
+            format!("{game}/SAVEDATA/SAVEMNG.DAT"),
+            "savedata/saveMng.dat".to_string(),
+            "SAVEDATA/SAVEMNG.DAT".to_string(),
+        ] {
+            let location = storage
+                .find(&name)
+                .unwrap_or_else(|| panic!("{name} must resolve"));
+            assert_eq!(location, Location::Disk(real.clone()), "{name}");
+            assert!(storage.exists(&name), "{name}");
+            assert_eq!(storage.stat(&name).unwrap().size, 9, "{name}");
+            assert_eq!(storage.find_disk(&name).unwrap(), real, "{name}");
+        }
+
+        // A path outside the mount never resolves, even when it exists.
+        let outside =
+            std::env::temp_dir().join(format!("TvpStorage-outside-{}.txt", std::process::id()));
+        fs::write(&outside, b"x").unwrap();
+        assert!(storage.find(&outside.to_string_lossy()).is_none());
+        assert!(!storage.exists(&outside.to_string_lossy()));
+        assert!(
+            storage
+                .relative_disk_name(&outside.to_string_lossy())
+                .is_none()
+        );
+        let _ = fs::remove_file(&outside);
+    }
+
+    #[test]
+    fn lowercase_canonical_wins_over_exact_case_variant() {
+        // The reference lowercases storage names before lookup, so when two
+        // files differ only by case the canonical (lowercase) one wins. This
+        // is what makes the game's `saveMng.dat` read the real `savemng.dat`
+        // even though a stray exact-case `saveMng.dat` exists next to it.
+        let dir = TempDir::new("shadow");
+        fs::create_dir_all(dir.path().join("savedata")).unwrap();
+        fs::write(dir.path().join("savedata/savemng.dat"), b"canonical").unwrap();
+        fs::write(dir.path().join("savedata/saveMng.dat"), b"stray").unwrap();
+        let storage = Storage::mount(dir.path()).unwrap();
+        let location = storage
+            .find(&format!("{}/savedata/saveMng.dat", dir.path().display()))
+            .unwrap();
+        assert_eq!(
+            location,
+            Location::Disk(dir.path().join("savedata/savemng.dat"))
+        );
+    }
+
+    #[test]
+    fn traversal_and_outer_names_do_not_resolve() {
+        let dir = TempDir::new("traversal");
+        fs::create_dir_all(dir.path().join("savedata")).unwrap();
+        fs::write(dir.path().join("escape.dat"), b"in").unwrap();
+        fs::write(
+            dir.path()
+                .parent()
+                .unwrap()
+                .join(format!("TvpStorage-neighbour-{}.dat", std::process::id())),
+            b"out",
+        )
+        .unwrap();
+        let storage = Storage::mount(dir.path()).unwrap();
+        assert!(storage.find("../escape.dat").is_none());
+        assert!(storage.find("savedata/../../escape.dat").is_none());
+        let _ = fs::remove_file(
+            dir.path()
+                .parent()
+                .unwrap()
+                .join(format!("TvpStorage-neighbour-{}.dat", std::process::id())),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -311,8 +493,13 @@ mod probe_tests {
 
     #[test]
     fn absolute_path_resolves() {
-        let storage = Storage::mount("/mnt/DATA/Games/Others/test").unwrap();
-        let loc = storage.find("/mnt/DATA/Games/Others/test/data.xp3");
+        let game = "/mnt/DATA/Games/Others/test";
+        if !Path::new(game).is_dir() {
+            eprintln!("skipping: {game} is not present on this host");
+            return;
+        }
+        let storage = Storage::mount(game).unwrap();
+        let loc = storage.find(&format!("{game}/data.xp3"));
         println!("absolute: {loc:?}");
         assert!(loc.is_some(), "absolute path must resolve");
         assert!(storage.find("data.xp3").is_some());

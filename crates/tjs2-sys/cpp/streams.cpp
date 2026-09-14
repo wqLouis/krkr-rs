@@ -40,6 +40,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <vector>
@@ -54,17 +55,152 @@ void tjs2_set_data_dir(const char *dir) {
     g_data_dir = dir ? dir : "";
 }
 
+// ---------------------------------------------------------------------------
+// Case-insensitive path resolution
+//
+// Storage names are case-insensitive in the reference engine (and the KR fork
+// lowercases them on write), while the host filesystem may be case-sensitive.
+// `resolve_path_str` therefore resolves an existing file case-insensitively
+// and, for a genuinely new file under the data dir, lowercases the
+// storage-relative part so the canonical spelling is created. Only the
+// storage-relative part is normalized: the mount prefix keeps its real
+// filesystem spelling.
+// ---------------------------------------------------------------------------
+
+namespace fs = std::filesystem;
+
+static char ascii_lower_char(char c) {
+    return (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
+}
+
+static std::string ascii_lower_copy(const std::string &s) {
+    std::string out = s;
+    for(char &c : out)
+        c = ascii_lower_char(c);
+    return out;
+}
+
+// ASCII-only case-insensitive equality; non-ASCII bytes compare exactly so a
+// UTF-8 component is never folded or byte-sliced.
+static bool ascii_ieq(const std::string &a, const std::string &b) {
+    if(a.size() != b.size())
+        return false;
+    for(size_t i = 0; i < a.size(); ++i)
+        if(ascii_lower_char(a[i]) != ascii_lower_char(b[i]))
+            return false;
+    return true;
+}
+
+// True when `path` names `dir` itself or a path inside it. Separator-aware and
+// case-sensitive (the caller decides whether to lowercase the remainder).
+static bool path_is_under(const std::string &path, std::string dir) {
+    while(!dir.empty() && (dir.back() == '/' || dir.back() == '\\'))
+        dir.pop_back();
+    if(dir.empty() || path.size() < dir.size())
+        return false;
+    if(path.compare(0, dir.size(), dir) != 0)
+        return false;
+    if(path.size() == dir.size())
+        return true;
+    char c = path[dir.size()];
+    return c == '/' || c == '\\';
+}
+
+// Resolve `full` component by component against the real filesystem, keeping
+// the real spelling of existing entries. Components that do not exist yet are
+// appended with `lowercase_new` applied (true for storage-relative names under
+// the data dir). Uses the non-throwing `std::filesystem` overloads so a
+// permission error can never propagate as a C++ exception.
+static std::string resolve_ci(const std::string &full, bool lowercase_new) {
+    if(full.empty())
+        return full;
+    bool absolute = full[0] == '/' || full[0] == '\\';
+    std::vector<std::string> parts;
+    {
+        std::string comp;
+        for(size_t i = absolute ? 1 : 0; i < full.size(); ++i) {
+            char c = full[i];
+            if(c == '/' || c == '\\') {
+                if(!comp.empty()) {
+                    parts.push_back(comp);
+                    comp.clear();
+                }
+            } else {
+                comp.push_back(c);
+            }
+        }
+        if(!comp.empty())
+            parts.push_back(comp);
+    }
+    if(parts.empty())
+        return full;
+
+    std::error_code ec;
+    fs::path cur = absolute ? fs::path("/") : fs::path();
+    for(size_t idx = 0; idx < parts.size(); ++idx) {
+        std::string match;
+        if(fs::is_directory(cur, ec)) {
+            fs::directory_iterator it(cur, ec);
+            const fs::directory_iterator end;
+            while(!ec && it != end) {
+                std::string name = it->path().filename().string();
+                if(ascii_ieq(name, parts[idx])) {
+                    match = name;
+                    break;
+                }
+                it.increment(ec);
+            }
+        }
+        if(!match.empty()) {
+            cur /= match;
+            continue;
+        }
+        // First missing component: append the rest, lowercasing them when
+        // this is a new storage-relative name under the data dir.
+        for(size_t j = idx; j < parts.size(); ++j) {
+            std::string name = parts[j];
+            if(lowercase_new)
+                name = ascii_lower_copy(name);
+            cur /= name;
+        }
+        return cur.string();
+    }
+    return cur.string();
+}
+
 // Resolve a storage-ish name to a filesystem path.
 static std::string resolve_path_str(const std::string &s) {
     if(s.empty())
         return s;
-    if(s[0] == '/' || s[0] == '\\')
-        return s; // absolute
-    if(s.find(":/") != std::string::npos || s.find(":") == 1)
-        return s; // drive letter
-    if(!g_data_dir.empty())
-        return g_data_dir + "/" + s;
-    return s;
+    bool absolute = s[0] == '/' || s[0] == '\\';
+    bool drive = s.find(":/") != std::string::npos || s.find(":") == 1;
+    std::string full;
+    if(absolute || drive) {
+        full = s; // absolute / drive-letter
+    } else if(!g_data_dir.empty()) {
+        full = g_data_dir + "/" + s;
+    } else {
+        return s;
+    }
+
+    std::error_code ec;
+    bool under_data = !g_data_dir.empty() && path_is_under(full, g_data_dir);
+    if(under_data) {
+        // Reference semantics: storage names are normalized to lowercase
+        // under the data dir. Prefer the lowercase storage-relative spelling
+        // so a write updates the canonical file rather than an exact-case
+        // duplicate (and so a read finds it regardless of the spelling).
+        std::string relative = full.substr(g_data_dir.size());
+        size_t start = relative.find_first_not_of("/\\");
+        relative = (start == std::string::npos) ? std::string() : relative.substr(start);
+        std::string lowered = g_data_dir + "/" + ascii_lower_copy(relative);
+        std::string resolved = resolve_ci(lowered, true);
+        if(fs::exists(resolved, ec))
+            return resolved;
+    }
+    if(fs::exists(full, ec))
+        return full;
+    return resolve_ci(full, under_data);
 }
 
 static std::string resolve_path(const ttstr &name) {
