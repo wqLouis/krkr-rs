@@ -243,6 +243,36 @@ unsafe extern "C" {
         out_result: *mut Value,
         out_error: *mut *mut c_char,
     ) -> c_int;
+    /// Compile a UTF-8 script to a binary bytecode file (reference
+    /// `tTJS::CompileScript` / `TVPCompileStorage`).
+    pub fn tjs2_compile_script(
+        e: *mut Engine,
+        script: *const c_char,
+        output_path: *const c_char,
+        isresult: c_int,
+        outputdebug: c_int,
+        isexpression: c_int,
+        name: *const c_char,
+        lineofs: c_int,
+        out_error: *mut *mut c_char,
+    ) -> c_int;
+    /// Dump all live script blocks to the console/log output (`tTJS::Dump`).
+    pub fn tjs2_dump(e: *mut Engine, out_error: *mut *mut c_char) -> c_int;
+    /// Class names of a retained object, as a retained TJS Array (reference
+    /// `Scripts.getClassNames`).
+    pub fn tjs2_get_class_names(
+        e: *mut Engine,
+        obj: Tjs2ValueId,
+        out: *mut Value,
+        out_error: *mut *mut c_char,
+    ) -> c_int;
+    /// Enable the `missing` member handler on a retained object (reference
+    /// `Scripts.setCallMissing`).
+    pub fn tjs2_set_call_missing(
+        e: *mut Engine,
+        obj: Tjs2ValueId,
+        out_error: *mut *mut c_char,
+    ) -> c_int;
     pub fn tjs2_free_string(s: *mut c_char);
     fn tjs2_register_native_class_ex(
         e: *mut Engine,
@@ -261,6 +291,17 @@ unsafe extern "C" {
         property_count: c_int,
         create_instance: NativeCreateInstanceFn,
         destroy_instance: NativeDestroyInstanceFn,
+    ) -> c_int;
+    /// Attach static (class-level) members to an already-registered native
+    /// class (reference `TJS_END_NATIVE_STATIC_METHOD_DECL` /
+    /// `TJS_END_NATIVE_STATIC_PROP_DECL_OUTER`).
+    fn tjs2_register_native_static_members(
+        e: *mut Engine,
+        class_name: *const c_char,
+        methods: *const NativeMethod,
+        count: c_int,
+        properties: *const NativeProperty,
+        prop_count: c_int,
     ) -> c_int;
     /// Opaque, per-engine id of a retained script value (mirror of
     /// `tjs2_value_id` in cpp/tjs2_abi.h).
@@ -508,6 +549,25 @@ pub struct NativeInstanceBuilder<'a> {
     pub properties: Vec<NativeInstancePropertyDef>,
 }
 
+/// Static (class-level) members to attach to a native class already
+/// registered through [`Tjs2Engine::register_native_class`] or
+/// [`Tjs2Engine::register_native_class_instance`].
+///
+/// The reference declares these with `TJS_STATICMEMBER` (e.g.
+/// `Bitmap.loadHeader` / `Bitmap.getSaveOption` and
+/// `MenuItem.textToKeycode` / `MenuItem.keycodeToText`): they live on the
+/// class object, are reachable without an instance, and are not copied onto
+/// instances. Methods/properties use the static callback signatures (no
+/// instance and no `objthis`).
+///
+/// The VM is single-threaded: register members only from the thread that
+/// owns the engine, and after the class itself is registered.
+pub struct NativeStaticMembers<'a> {
+    pub class_name: &'a str,
+    pub methods: Vec<NativeMethodDef>,
+    pub properties: Vec<NativePropertyDef>,
+}
+
 impl Tjs2Engine {
     /// The raw engine pointer (for FFI helpers that need it).
     pub fn raw(&self) -> *mut Engine {
@@ -605,6 +665,64 @@ impl Tjs2Engine {
             return Err(unsafe { take_error(error) });
         }
         Ok(unsafe { take_value(&result) })
+    }
+
+    /// Compile a UTF-8 script to a binary bytecode file (reference
+    /// `TVPCompileStorage` / `tTJS::CompileScript`).
+    ///
+    /// `output_path` is a plain filesystem path (the wired stream factory is
+    /// file-backed) or a data-dir-relative name. `isresult` selects whether
+    /// the compiled block keeps a result register, `outputdebug` embeds
+    /// debug information, and `isexpression` compiles an expression rather
+    /// than a statement script. `name` / `lineofs` label the script block
+    /// for diagnostics.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compile_script(
+        &self,
+        script: &str,
+        output_path: &str,
+        isresult: bool,
+        outputdebug: bool,
+        isexpression: bool,
+        name: &str,
+        lineofs: i32,
+    ) -> Result<(), TjsError> {
+        let script = CString::new(script).map_err(|_| TjsError("script contains NUL".into()))?;
+        let output_path =
+            CString::new(output_path).map_err(|_| TjsError("output path contains NUL".into()))?;
+        let name = CString::new(name).map_err(|_| TjsError("name contains NUL".into()))?;
+        let mut error: *mut c_char = ptr::null_mut();
+        // SAFETY: all pointers are valid for the call; the C++ side copies
+        // the UTF-8 strings and writes the output file.
+        let rc = unsafe {
+            tjs2_compile_script(
+                self.inner,
+                script.as_ptr(),
+                output_path.as_ptr(),
+                isresult as c_int,
+                outputdebug as c_int,
+                isexpression as c_int,
+                name.as_ptr(),
+                lineofs,
+                &mut error,
+            )
+        };
+        if rc != 0 {
+            return Err(unsafe { take_error(error) });
+        }
+        Ok(())
+    }
+
+    /// Dump all live script blocks through the log callback installed with
+    /// [`Self::set_log_cb`] (reference `TVPDumpScriptEngine` / `tTJS::Dump`).
+    pub fn dump(&self) -> Result<(), TjsError> {
+        let mut error: *mut c_char = ptr::null_mut();
+        // SAFETY: self.inner is a live engine.
+        let rc = unsafe { tjs2_dump(self.inner, &mut error) };
+        if rc != 0 {
+            return Err(unsafe { take_error(error) });
+        }
+        Ok(())
     }
 
     /// Execute a script like [`Self::exec_script`], but retain an object
@@ -798,6 +916,90 @@ impl Tjs2Engine {
             return Err(format!(
                 "failed to register native instance class '{}' (error {rc})",
                 builder.name
+            ));
+        }
+        Ok(())
+    }
+
+    /// Attach static (class-level) members to an already-registered native
+    /// class (reference `TJS_END_NATIVE_STATIC_METHOD_DECL` /
+    /// `TJS_END_NATIVE_STATIC_PROP_DECL_OUTER`).
+    ///
+    /// Instance-capable classes put every member on their instances; the
+    /// reference instead declares some members with `TJS_STATICMEMBER`
+    /// (`Bitmap.loadHeader` / `Bitmap.getSaveOption`,
+    /// `MenuItem.textToKeycode` / `MenuItem.keycodeToText`), which live on
+    /// the class object, are reachable without an instance, and stay
+    /// invisible to instances. Call this after
+    /// [`Self::register_native_class_instance`] / [`Self::register_native_class`]
+    /// with the class's name; methods and properties use the static callback
+    /// signatures ([`NativeMethodDef`] / [`NativePropertyDef`]).
+    pub fn register_native_static_members(
+        &self,
+        members: &NativeStaticMembers,
+    ) -> Result<(), String> {
+        let class_name = CString::new(members.class_name)
+            .map_err(|_| format!("class name contains a NUL byte: {:?}", members.class_name))?;
+        let method_names: Vec<CString> = members
+            .methods
+            .iter()
+            .map(|m| {
+                CString::new(m.name)
+                    .map_err(|_| format!("method name contains a NUL byte: {:?}", m.name))
+            })
+            .collect::<Result<_, _>>()?;
+        let c_methods: Vec<NativeMethod> = members
+            .methods
+            .iter()
+            .zip(&method_names)
+            .map(|(m, n)| NativeMethod {
+                name: n.as_ptr(),
+                f: m.f,
+            })
+            .collect();
+        let property_names: Vec<CString> = members
+            .properties
+            .iter()
+            .map(|p| {
+                CString::new(p.name)
+                    .map_err(|_| format!("property name contains a NUL byte: {:?}", p.name))
+            })
+            .collect::<Result<_, _>>()?;
+        let c_properties: Vec<NativeProperty> = members
+            .properties
+            .iter()
+            .zip(&property_names)
+            .map(|(p, n)| NativeProperty {
+                name: n.as_ptr(),
+                get: p.get,
+                set: p.set,
+            })
+            .collect();
+        // SAFETY: self.inner is a valid engine; the names and arrays are
+        // valid for the call. The C++ side copies what it needs during
+        // registration.
+        let rc = unsafe {
+            tjs2_register_native_static_members(
+                self.inner,
+                class_name.as_ptr(),
+                if c_methods.is_empty() {
+                    ptr::null()
+                } else {
+                    c_methods.as_ptr()
+                },
+                c_methods.len() as c_int,
+                if c_properties.is_empty() {
+                    ptr::null()
+                } else {
+                    c_properties.as_ptr()
+                },
+                c_properties.len() as c_int,
+            )
+        };
+        if rc != 0 {
+            return Err(format!(
+                "failed to register static members on native class '{}' (error {rc})",
+                members.class_name
             ));
         }
         Ok(())
@@ -1133,6 +1335,55 @@ name), and none was available"
         // name/value (including any string storage in `strings`) follow the
         // ABI contract for the duration of the call.
         let rc = unsafe { tjs2_prop_set(self.inner, id, name.as_ptr(), &ffi, &mut error) };
+        if rc != 0 {
+            return Err(unsafe { take_error_string(error) });
+        }
+        Ok(())
+    }
+
+    /// Class names of a retained object, most-derived first, as a new TJS
+    /// Array (reference `Scripts.getClassNames`).
+    ///
+    /// The array is retained on the engine and returned as a
+    /// [`DetachedValue`]; hand its [`DetachedValue::raw_id`] back as a
+    /// `VAL_RETAINED` native result (the trampoline consumes it), or drop it
+    /// to release the reference. `obj` must be a live retained object id.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn get_class_names(&self, obj: Tjs2ValueId) -> Result<DetachedValue, String> {
+        let mut out = Value {
+            ty: VAL_VOID,
+            integer: 0,
+            real: 0.0,
+            string: ptr::null(),
+            array: ptr::null(),
+            array_count: 0,
+            retained: 0,
+        };
+        let mut error: *mut c_char = ptr::null_mut();
+        // SAFETY: self.inner is a live engine and obj is a retained id (its
+        // validity is owned by the caller's ValueId/DetachedValue).
+        let rc = unsafe { tjs2_get_class_names(self.inner, obj, &mut out, &mut error) };
+        if rc != 0 {
+            return Err(unsafe { take_error_string(error) });
+        }
+        if out.ty != VAL_RETAINED || out.retained == 0 {
+            return Err("tjs2_get_class_names returned no retained array".into());
+        }
+        Ok(DetachedValue {
+            engine: self.inner,
+            id: out.retained as Tjs2ValueId,
+        })
+    }
+
+    /// Enable the `missing` member handler on a retained object (reference
+    /// `Scripts.setCallMissing`): after this call an access to an absent
+    /// member invokes the object's `missing` method.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn set_call_missing(&self, obj: Tjs2ValueId) -> Result<(), String> {
+        let mut error: *mut c_char = ptr::null_mut();
+        // SAFETY: self.inner is a live engine and obj is a retained id; the
+        // C++ side dereferences it through its retained-value map.
+        let rc = unsafe { tjs2_set_call_missing(self.inner, obj, &mut error) };
         if rc != 0 {
             return Err(unsafe { take_error_string(error) });
         }
@@ -3706,5 +3957,331 @@ var ra = a.get(); var rb = b.get();",
             !PARENT_TORN_DOWN.load(std::sync::atomic::Ordering::SeqCst),
             "the parent must not have torn down child state before the child finalize"
         );
+    }
+
+    // --- tjs2_compile_script / tjs2_dump --------------------------------
+
+    #[test]
+    fn compile_script_writes_binary_bytecode_file() {
+        let _vm_lock = vm_lock();
+        let e = Tjs2Engine::new().unwrap();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "krkr-rs-tjs2-compile-{}-{}.tjsb",
+            std::process::id(),
+            nanos
+        ));
+        let path_str = path.to_string_lossy().into_owned();
+
+        // A statement script compiles and the binary output is written.
+        e.compile_script(
+            "var compiledValue = 42;",
+            &path_str,
+            false,
+            false,
+            false,
+            "compiled.tjs",
+            0,
+        )
+        .expect("compile must succeed");
+        let bytes = std::fs::read(&path).expect("compiled output file must exist");
+        assert!(!bytes.is_empty(), "compiled bytecode must not be empty");
+
+        // An expression compiles too (isexpression = true).
+        let expr_path = std::env::temp_dir().join(format!(
+            "krkr-rs-tjs2-compile-expr-{}-{}.tjsb",
+            std::process::id(),
+            nanos
+        ));
+        let expr_str = expr_path.to_string_lossy().into_owned();
+        e.compile_script("6 * 7", &expr_str, true, false, true, "expr.tjs", 0)
+            .expect("expression compile must succeed");
+        assert!(!std::fs::read(&expr_path).unwrap().is_empty());
+
+        // A syntactically invalid script is reported as an error.
+        let err = e
+            .compile_script(
+                "this is not valid tjs",
+                &path_str,
+                false,
+                false,
+                false,
+                "bad.tjs",
+                0,
+            )
+            .unwrap_err();
+        assert!(
+            !err.to_string().is_empty(),
+            "compile error must be reported"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&expr_path);
+    }
+
+    #[test]
+    fn dump_reports_the_context_through_the_log_callback() {
+        static DUMP_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        extern "C" fn capture(_level: c_int, msg: *const c_char, _user: *mut c_void) {
+            if msg.is_null() {
+                return;
+            }
+            // SAFETY: msg is a NUL-terminated UTF-8 string for the call.
+            let s = unsafe { CStr::from_ptr(msg) }.to_string_lossy();
+            if s.contains("TJS Context Dump") {
+                DUMP_SEEN.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let _vm_lock = vm_lock();
+        DUMP_SEEN.store(false, std::sync::atomic::Ordering::SeqCst);
+        let e = Tjs2Engine::new().unwrap();
+        e.exec_script("var dumpedValue = 1;", "dump-test").unwrap();
+        // SAFETY: the callback is a plain fn with no user pointer needs.
+        unsafe { e.set_log_cb(Some(capture), ptr::null_mut()) };
+        e.dump().expect("dump must succeed");
+        assert!(
+            DUMP_SEEN.load(std::sync::atomic::Ordering::SeqCst),
+            "dump output must reach the log callback"
+        );
+    }
+
+    // --- tjs2_get_class_names / tjs2_set_call_missing -------------------
+
+    #[test]
+    fn get_class_names_returns_the_object_class_chain() {
+        let _vm_lock = vm_lock();
+        let e = Tjs2Engine::new().unwrap();
+        e.register_native_class_instance(&counter_builder())
+            .unwrap();
+        e.exec_script("var c = new Counter();", "test").unwrap();
+        let v = e.eval("c", "test").unwrap();
+        assert_eq!(v, TjsValue::Object);
+        let obj = e.retain_value_detached(&v).unwrap();
+
+        // A native instance registers its class name at construction
+        // (tTJSNativeClass::FuncCall -> ClassInstanceInfo(TJS_CII_ADD)).
+        let names = e
+            .get_class_names(obj.raw_id())
+            .expect("getClassNames must succeed");
+
+        // Expose the returned array to the script for inspection: the
+        // DetachedValue is consumed by the write (C++ erases the entry).
+        e.exec_script("var holder = %[];", "test").unwrap();
+        let hv = e.eval("holder", "test").unwrap();
+        let holder = e.retain_value_detached(&hv).unwrap();
+        e.set_member(
+            holder.raw_id(),
+            "names",
+            &TjsValue::Retained(names.raw_id() as u64),
+        )
+        .unwrap();
+        assert_eq!(
+            e.eval("holder.names.length", "test").unwrap(),
+            TjsValue::Integer(1)
+        );
+        assert_eq!(
+            e.eval("holder.names[0]", "test").unwrap(),
+            TjsValue::String("Counter".into())
+        );
+    }
+
+    #[test]
+    fn get_class_names_rejects_a_non_object_retained_value() {
+        let _vm_lock = vm_lock();
+        let e = Tjs2Engine::new().unwrap();
+        let v = e.eval("41", "test").unwrap();
+        let id = e.retain_value_detached(&v).unwrap();
+        let err = match e.get_class_names(id.raw_id()) {
+            Ok(_) => panic!("a scalar must not have class names"),
+            Err(e) => e,
+        };
+        assert!(!err.is_empty(), "a scalar must not have class names: {err}");
+    }
+
+    #[test]
+    fn set_call_missing_installs_a_missing_member_handler() {
+        let _vm_lock = vm_lock();
+        let e = Tjs2Engine::new().unwrap();
+        e.exec_script(
+            "var probe = '';\
+             var o = %[missing: function(getorset, name, value) { probe = name; return true; }];\
+             o.known = 5;",
+            "test",
+        )
+        .unwrap();
+        let v = e.eval("o", "test").unwrap();
+        let id = e.retain_value_detached(&v).unwrap();
+
+        // Before enabling it, the `missing` handler does not run (a missing
+        // read yields void rather than a hard error in TJS).
+        let _ = e.eval("o.absentMember", "test");
+        assert_eq!(
+            e.eval("probe", "test").unwrap(),
+            TjsValue::String(String::new())
+        );
+
+        e.set_call_missing(id.raw_id())
+            .expect("setCallMissing must succeed");
+
+        // After enabling it, the `missing` method receives the member name;
+        // it returns true (found) with no value, so the read is void.
+        assert_eq!(e.eval("o.absentMember", "test").unwrap(), TjsValue::Void);
+        assert_eq!(
+            e.eval("probe", "test").unwrap(),
+            TjsValue::String("absentMember".into())
+        );
+        // Known members still resolve normally (the handler is only a
+        // fallback; it never runs because `known` exists).
+        assert_eq!(e.eval("o.known", "test").unwrap(), TjsValue::Integer(5));
+    }
+
+    // --- static members on an instance class ----------------------------
+
+    static STATIC_PROP_VALUE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+    extern "C" fn static_prop_get(
+        _engine: *mut c_void,
+        out: *mut Value,
+        _out_error: *mut *mut c_char,
+    ) -> c_int {
+        // SAFETY: out is a valid return slot.
+        unsafe {
+            (*out).ty = VAL_INTEGER;
+            (*out).integer = STATIC_PROP_VALUE.load(std::sync::atomic::Ordering::SeqCst);
+            (*out).real = 0.0;
+            (*out).string = ptr::null();
+        }
+        0
+    }
+
+    extern "C" fn static_prop_set(
+        _engine: *mut c_void,
+        value: *const Value,
+        out_error: *mut *mut c_char,
+    ) -> c_int {
+        // SAFETY: value points at a valid tjs2_value for the call.
+        let v = unsafe { &*value };
+        if v.ty != VAL_INTEGER {
+            unsafe { *out_error = alloc_error_string("staticValue expects an integer") };
+            return 1;
+        }
+        STATIC_PROP_VALUE.store(v.integer, std::sync::atomic::Ordering::SeqCst);
+        0
+    }
+
+    #[test]
+    fn static_members_are_visible_on_the_class_but_not_on_instances() {
+        let _vm_lock = vm_lock();
+        STATIC_PROP_VALUE.store(7, std::sync::atomic::Ordering::SeqCst);
+        let e = Tjs2Engine::new().unwrap();
+        e.register_native_class_instance(&counter_builder())
+            .unwrap();
+        // TJS_STATICMEMBER members: a method (reference
+        // TJS_END_NATIVE_STATIC_METHOD_DECL) and a read-only property
+        // (reference TJS_END_NATIVE_STATIC_PROP_DECL_OUTER). The property
+        // is read-only like `MenuItem.textToKeycode`: a script *write* to a
+        // class member lets TJS clear its static flag (PropSet without
+        // TJS_STATICMEMBER clears TJS_SYMBOL_STATIC), so a writable static
+        // property would then be copied to later instances — exactly the
+        // reference's own behavior.
+        e.register_native_static_members(&NativeStaticMembers {
+            class_name: "Counter",
+            methods: vec![NativeMethodDef {
+                name: "staticAdd",
+                f: native_add,
+            }],
+            properties: vec![NativePropertyDef {
+                name: "staticValue",
+                get: Some(static_prop_get),
+                set: None,
+            }],
+        })
+        .unwrap();
+
+        // Reachable on the class object with no instance.
+        assert_eq!(
+            e.eval("Counter.staticAdd(2, 3)", "test").unwrap(),
+            TjsValue::Integer(5)
+        );
+        assert_eq!(
+            e.eval("Counter.staticValue", "test").unwrap(),
+            TjsValue::Integer(7)
+        );
+
+        // Instance members are untouched by the static registration.
+        e.exec_script("var c = new Counter(); c.inc(); c.add(41);", "test")
+            .unwrap();
+        assert_eq!(e.eval("c.get()", "test").unwrap(), TjsValue::Integer(42));
+        assert_eq!(e.eval("c.value", "test").unwrap(), TjsValue::Integer(42));
+
+        // ... and the static members are not copied onto instances.
+        let err = e.eval("c.staticAdd(1, 2)", "test").unwrap_err();
+        assert!(
+            !err.to_string().is_empty(),
+            "instance must not see staticAdd"
+        );
+        let err = e.eval("c.staticValue", "test").unwrap_err();
+        assert!(
+            !err.to_string().is_empty(),
+            "instance must not see staticValue"
+        );
+        // The class-level property still reads normally afterwards.
+        assert_eq!(
+            e.eval("Counter.staticValue", "test").unwrap(),
+            TjsValue::Integer(7)
+        );
+    }
+
+    #[test]
+    fn static_property_setter_runs_on_the_class_object() {
+        let _vm_lock = vm_lock();
+        STATIC_PROP_VALUE.store(0, std::sync::atomic::Ordering::SeqCst);
+        let e = Tjs2Engine::new().unwrap();
+        e.register_native_class_instance(&counter_builder())
+            .unwrap();
+        e.register_native_static_members(&NativeStaticMembers {
+            class_name: "Counter",
+            methods: vec![],
+            properties: vec![NativePropertyDef {
+                name: "writableStatic",
+                get: Some(static_prop_get),
+                set: Some(static_prop_set),
+            }],
+        })
+        .unwrap();
+        assert_eq!(
+            e.eval("Counter.writableStatic", "test").unwrap(),
+            TjsValue::Integer(0)
+        );
+        e.eval("Counter.writableStatic = 42", "test").unwrap();
+        assert_eq!(
+            e.eval("Counter.writableStatic", "test").unwrap(),
+            TjsValue::Integer(42)
+        );
+        assert_eq!(
+            STATIC_PROP_VALUE.load(std::sync::atomic::Ordering::SeqCst),
+            42
+        );
+    }
+
+    #[test]
+    fn static_members_reject_an_unknown_class() {
+        let _vm_lock = vm_lock();
+        let e = Tjs2Engine::new().unwrap();
+        let err = e
+            .register_native_static_members(&NativeStaticMembers {
+                class_name: "NoSuchClass",
+                methods: vec![NativeMethodDef {
+                    name: "m",
+                    f: native_nop,
+                }],
+                properties: vec![],
+            })
+            .unwrap_err();
+        assert!(err.contains("NoSuchClass"), "unexpected error: {err}");
     }
 }

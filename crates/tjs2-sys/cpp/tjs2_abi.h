@@ -93,6 +93,55 @@ int tjs2_exec_script(tjs2_engine *e, const char *script, const char *name,
 int tjs2_eval(tjs2_engine *e, const char *expression, const char *name,
               tjs2_value *out_result, char **out_error);
 
+/*
+ * Compile a UTF-8 script to a binary bytecode stream (reference
+ * `tTJS::CompileScript` / `TVPCompileStorage`). `output_path` names the
+ * binary file to create; it is resolved by the wired binary-stream factory
+ * (absolute paths, data-dir-relative names). `isresult`, `outputdebug` and
+ * `isexpression` mirror the reference bool parameters; `name` and `lineofs`
+ * label the script block for diagnostics.
+ *
+ * Returns 0 on success. On failure returns non-zero and, if out_error is
+ * non-NULL, points it at a malloc'd UTF-8 message (free with
+ * tjs2_free_string). The output file is written incrementally, so a failed
+ * compile may leave a partial file (the caller controls the path).
+ */
+int tjs2_compile_script(tjs2_engine *e, const char *script,
+                        const char *output_path, int isresult,
+                        int outputdebug, int isexpression, const char *name,
+                        int lineofs, char **out_error);
+
+/*
+ * Dump every live script block to the engine's console/log output
+ * (reference `tTJS::Dump` / `TVPDumpScriptEngine`). Returns 0 on success;
+ * on failure returns non-zero with a malloc'd message in *out_error.
+ */
+int tjs2_dump(tjs2_engine *e, char **out_error);
+
+/*
+ * Class-name list of a retained object (reference `Scripts.getClassNames`):
+ * loop `iTJSDispatch2::ClassInstanceInfo(TJS_CII_GET, n, value)` and build
+ * a TJS Array of names, the last (most-derived) class first. `obj` is a
+ * retained object id (see tjs2_retain_value / tjs2_retain_object).
+ *
+ * Returns 0 on success and, if out is non-NULL, fills it with a
+ * TJS2_VAL_RETAINED id for the new Array (release it with
+ * tjs2_release_value, or consume it through a native's return slot). On
+ * failure returns non-zero with a malloc'd UTF-8 message in *out_error.
+ */
+int tjs2_get_class_names(tjs2_engine *e, tjs2_value_id obj, tjs2_value *out,
+                         char **out_error);
+
+/*
+ * Enable the "missing" member handler on a retained object (reference
+ * `Scripts.setCallMissing`): `ClassInstanceInfo(TJS_CII_SET_MISSING, 0,
+ * "missing")` so an unknown member routes to the object's `missing`
+ * method. Returns 0 on success; on failure returns non-zero with a malloc'd
+ * message in *out_error.
+ */
+int tjs2_set_call_missing(tjs2_engine *e, tjs2_value_id obj,
+                          char **out_error);
+
 /* Free a string returned via out_error. */
 void tjs2_free_string(char *s);
 
@@ -298,6 +347,25 @@ int tjs2_register_native_class_instance(
     const tjs2_native_instance_property *properties, int property_count,
     tjs2_native_create_instance_fn create_instance,
     tjs2_native_destroy_instance_fn destroy_instance);
+
+/*
+ * Attach static (class-level) members to an already-registered native class
+ * (reference `TJS_END_NATIVE_STATIC_METHOD_DECL` /
+ * `TJS_END_NATIVE_STATIC_PROP_DECL_OUTER`). Instance-capable classes
+ * registered with tjs2_register_native_class_instance put every member on
+ * their instances; this adds the members the reference declares with
+ * TJS_STATICMEMBER so they live on the class object and are not copied onto
+ * instances (e.g. `Bitmap.loadHeader`, `MenuItem.textToKeycode`).
+ *
+ * `class_name_utf8` must name a class already registered on this engine.
+ * Methods use the static callback signature (no instance/objthis). Returns 0
+ * on success; non-zero on failure (unknown class, invalid arguments,
+ * duplicate member, or an exception while registering).
+ */
+int tjs2_register_native_static_members(
+    tjs2_engine *e, const char *class_name_utf8,
+    const tjs2_native_method *methods, int count,
+    const tjs2_native_property *properties, int prop_count);
 
 /* Allocate with malloc; used to build error strings on the Rust side.
  * Pair with tjs2_free_string. */
