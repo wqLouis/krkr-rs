@@ -1,0 +1,391 @@
+diff -ruN a/tjsInterCodeExec.cpp b/tjsInterCodeExec.cpp
+--- a/tjsInterCodeExec.cpp
++++ b/tjsInterCodeExec.cpp
+@@ -10,6 +10,7 @@
+ //---------------------------------------------------------------------------
+ 
+ #include "tjsCommHead.h"
++#include <cstring>
+ 
+ #include "tjsInterCodeExec.h"
+ #include "tjsInterCodeGen.h"
+@@ -54,15 +55,17 @@
+ 
+             if(!TJS_strcmp(name, TJS_W("length"))) {
+                 // get string length
++                // krkr-rs: `AsStringNoAddRef` yields null for the empty
++                // string; use the null-safe length helper (UB otherwise).
+                 const tTJSVariantString *s = str->AsStringNoAddRef();
+-                *result = tTVInteger(s->GetLength());
++                *result = tTVInteger(TJSVariantStringLength(s));
+                 return;
+             }
+             if(name[0] >= TJS_W('0') && name[0] <= TJS_W('9')) {
+                 const tTJSVariantString *valstr = str->AsStringNoAddRef();
+                 const tjs_char *s = str->GetString();
+                 tjs_int n = TJS_atoi(name);
+-                tjs_int len = valstr->GetLength();
++                tjs_int len = TJSVariantStringLength(valstr);
+                 if(n == len) {
+                     *result = tTJSVariant(TJS_W(""));
+                     return;
+@@ -83,7 +86,7 @@
+             const tTJSVariantString *valstr = str->AsStringNoAddRef();
+             const tjs_char *s = str->GetString();
+             tjs_int n = (tjs_int)member.AsInteger();
+-            tjs_int len = valstr->GetLength();
++            tjs_int len = TJSVariantStringLength(valstr);
+             if(n == len) {
+                 *result = tTJSVariant(TJS_W(""));
+                 return;
+@@ -644,6 +647,13 @@
+         //	if(objthis) objthis->AddRef();
+         try {
+             tTJSVariant *regs = TJSVariantArrayStack->Allocate(num_alloc);
++            // krkr-rs patch: the exception-display register dump reads ALL
++            // num_alloc slots, including ones the VM never wrote; the
++            // allocator reuses memory, so those slots are uninitialized and
++            // reading them is UB (crashes under clang -O2, which eliminates
++            // tTJSVariantString's `if(!this)` guard). Zero them so the dump
++            // always sees tvtVoid slots.
++            std::memset(regs, 0, sizeof(tTJSVariant) * num_alloc);
+             tTJSVariant *ra =
+                 regs + MaxVariableCount + VariableReserveCount; // register area
+ 
+@@ -1514,10 +1524,11 @@
+             try {
+                 // TODO: verify here needs hint holding
+                 hr = clo.PropGet(
+-                    flags, *str, nullptr, TJS_GET_VM_REG_ADDR(ra, code[1]),
++                    flags, TJSVariantStringChars(str), nullptr,
++                    TJS_GET_VM_REG_ADDR(ra, code[1]),
+                     clo.ObjThis ? clo.ObjThis : ra[-1].AsObjectNoAddRef());
+                 if(TJS_FAILED(hr))
+-                    TJSThrowFrom_tjs_error(hr, *str);
++                    TJSThrowFrom_tjs_error(hr, TJSVariantStringChars(str));
+             } catch(...) {
+                 if(str)
+                     str->Release();
+@@ -1573,10 +1584,11 @@
+                     clo.ObjThis ? clo.ObjThis : ra[-1].AsObjectNoAddRef());
+                 if(hr == TJS_E_NOTIMPL)
+                     hr = clo.PropSet(
+-                        flags, *str, nullptr, TJS_GET_VM_REG_ADDR(ra, code[3]),
++                        flags, TJSVariantStringChars(str), nullptr,
++                        TJS_GET_VM_REG_ADDR(ra, code[3]),
+                         clo.ObjThis ? clo.ObjThis : ra[-1].AsObjectNoAddRef());
+                 if(TJS_FAILED(hr))
+-                    TJSThrowFrom_tjs_error(hr, *str);
++                    TJSThrowFrom_tjs_error(hr, TJSVariantStringChars(str));
+             } catch(...) {
+                 if(str)
+                     str->Release();
+@@ -1648,12 +1660,12 @@
+             }
+             try {
+                 tjs_error hr = clo.Operation(
+-                    ope, *str, nullptr,
++                    ope, TJSVariantStringChars(str), nullptr,
+                     code[1] ? TJS_GET_VM_REG_ADDR(ra, code[1]) : nullptr,
+                     TJS_GET_VM_REG_ADDR(ra, code[4]),
+                     clo.ObjThis ? clo.ObjThis : ra[-1].AsObjectNoAddRef());
+                 if(TJS_FAILED(hr))
+-                    TJSThrowFrom_tjs_error(hr, *str);
++                    TJSThrowFrom_tjs_error(hr, TJSVariantStringChars(str));
+             } catch(...) {
+                 if(str)
+                     str->Release();
+@@ -1747,12 +1759,12 @@
+             tjs_error hr;
+             try {
+                 hr = clo.Operation(
+-                    ope, *str, nullptr,
++                    ope, TJSVariantStringChars(str), nullptr,
+                     code[1] ? TJS_GET_VM_REG_ADDR(ra, code[1]) : nullptr,
+                     nullptr,
+                     clo.ObjThis ? clo.ObjThis : ra[-1].AsObjectNoAddRef());
+                 if(TJS_FAILED(hr))
+-                    TJSThrowFrom_tjs_error(hr, *str);
++                    TJSThrowFrom_tjs_error(hr, TJSVariantStringChars(str));
+             } catch(...) {
+                 if(str)
+                     str->Release();
+@@ -1842,7 +1854,7 @@
+ 
+         try {
+             tjs_error hr = clo.DeleteMember(
+-                0, *str, nullptr,
++                0, TJSVariantStringChars(str), nullptr,
+                 clo.ObjThis ? clo.ObjThis : ra[-1].AsObjectNoAddRef());
+             if(code[1]) {
+                 if(TJS_FAILED(hr))
+@@ -1942,7 +1954,8 @@
+             try {
+                 // TODO: verify here needs hint holding
+                 hr = clo.PropGet(
+-                    flags, *str, nullptr, TJS_GET_VM_REG_ADDR(ra, code[1]),
++                    flags, TJSVariantStringChars(str), nullptr,
++                    TJS_GET_VM_REG_ADDR(ra, code[1]),
+                     clo.ObjThis ? clo.ObjThis : ra[-1].AsObjectNoAddRef());
+                 if(hr == TJS_S_OK) {
+                     TypeOf(TJS_GET_VM_REG(ra, code[1]));
+@@ -2664,7 +2677,7 @@
+         // puts val's character code on val
+         tTJSVariantString *str = val.AsString();
+         if(str) {
+-            const tjs_char *ch = (const tjs_char *)*str;
++            const tjs_char *ch = TJSVariantStringChars(str);
+             val = tTVInteger(ch[0]);
+             str->Release();
+             return;
+@@ -2688,7 +2701,8 @@
+         if(str) {
+             tjs_error hr;
+             try {
+-                hr = TJSDefaultIsInstanceOf(0, targ, (const tjs_char *)*str,
++                hr = TJSDefaultIsInstanceOf(0, targ,
++                                            TJSVariantStringChars(str),
+                                             nullptr);
+             } catch(...) {
+                 str->Release();
+diff -ruN a/tjsInterCodeGen.cpp b/tjsInterCodeGen.cpp
+--- a/tjsInterCodeGen.cpp
++++ b/tjsInterCodeGen.cpp
+@@ -46,6 +46,11 @@
+ 
+     void parser::error(const std::string &msg) {
+         spdlog::get("tjs2")->critical(msg);
++        // krkr-rs patch: the upstream code only logs and relies on the
++        // grammar's `error ";"` recovery, which can leave the script block
++        // half-parsed and crash later at execution. Abort the parse with a
++        // proper TJS error instead.
++        TJS_eTJSScriptError(ttstr(msg.c_str()).c_str(), ptr, -1);
+     }
+ 
+     //---------------------------------------------------------------------------
+diff -ruN a/tjsString.cpp b/tjsString.cpp
+--- a/tjsString.cpp
++++ b/tjsString.cpp
+@@ -55,7 +55,11 @@
+     }
+ 
+     //---------------------------------------------------------------------------
+-    tjs_int64 tTJSString::AsInteger() const { return Ptr->ToInteger(); }
++    // krkr-rs: a null `Ptr` is the empty string; `ToInteger` on it must yield
++    // 0 WITHOUT a null-`this` member call (UB under clang -O1+).
++    tjs_int64 tTJSString::AsInteger() const {
++        return Ptr ? Ptr->ToInteger() : 0;
++    }
+ 
+     //---------------------------------------------------------------------------
+     void tTJSString::Replace(const tTJSString &from, const tTJSString &to,
+@@ -272,7 +276,10 @@
+         tjs_char *p1 = (tjs_char *)_str.c_str() + _str.length() - 1;
+         while(p0 < p1 && *p1 != '\0' && *p1 < 0x20)
+             *p1-- = '\0';
+-        _str.Ptr->FixLength();
++        // krkr-rs: an all-whitespace/empty input makes `_str.Ptr` null; guard
++        // the null-`this` call (UB under clang -O1+).
++        if(_str.Ptr)
++            _str.Ptr->FixLength();
+         return _str;
+     }
+ 
+diff -ruN a/tjsString.h b/tjsString.h
+--- a/tjsString.h
++++ b/tjsString.h
+@@ -413,7 +413,13 @@
+             return InternalIndepend();
+         }
+ 
+-        [[nodiscard]] tjs_int GetLen() const { return Ptr->GetLength(); }
++        // krkr-rs: `Ptr == nullptr` is the representation of an empty string,
++        // so there is nothing to dereference. Calling `tTJSVariantString::GetLength`
++        // with `this == nullptr` is UB (clang >= -O1 deletes its null-`this`
++        // guard and crashes); check here instead.
++        [[nodiscard]] tjs_int GetLen() const {
++            return Ptr ? Ptr->GetLength() : 0;
++        }
+ 
+         [[nodiscard]] tjs_int length() const { return GetLen(); }
+ 
+diff -ruN a/tjsVariant.cpp b/tjsVariant.cpp
+--- a/tjsVariant.cpp
++++ b/tjsVariant.cpp
+@@ -866,8 +866,8 @@
+         tTJSVariantString *s1, *s2;
+         s1 = AsString();
+         s2 = val2.AsString();
+-        const tjs_char *p1 = *s1;
+-        const tjs_char *p2 = *s2;
++        const tjs_char *p1 = TJSVariantStringChars(s1);
++        const tjs_char *p2 = TJSVariantStringChars(s2);
+         if(!p1)
+             p1 = TJS_W("");
+         if(!p2)
+@@ -894,8 +894,8 @@
+         tTJSVariantString *s1, *s2;
+         s1 = AsString();
+         s2 = val2.AsString();
+-        const tjs_char *p1 = *s1;
+-        const tjs_char *p2 = *s2;
++        const tjs_char *p1 = TJSVariantStringChars(s1);
++        const tjs_char *p2 = TJSVariantStringChars(s2);
+         if(!p1)
+             p1 = TJS_W("");
+         if(!p2)
+@@ -934,8 +934,14 @@
+ 
+     //---------------------------------------------------------------------------
+     void tTJSVariant::increment() {
+-        if(vt == tvtString)
+-            String->ToNumber(*this);
++        // krkr-rs: null `String` is the empty string; `ToNumber` on it yields 0
++        // (a null-`this` call is UB under clang -O1+).
++        if(vt == tvtString) {
++            if(String)
++                String->ToNumber(*this);
++            else
++                *this = (tjs_int)0;
++        }
+ 
+         if(vt == tvtReal) {
+             TJSSetFPUE();
+@@ -950,8 +956,13 @@
+ 
+     //---------------------------------------------------------------------------
+     void tTJSVariant::decrement() {
+-        if(vt == tvtString)
+-            String->ToNumber(*this);
++        // krkr-rs: null `String` is the empty string; see increment().
++        if(vt == tvtString) {
++            if(String)
++                String->ToNumber(*this);
++            else
++                *this = (tjs_int)0;
++        }
+ 
+         if(vt == tvtReal) {
+             TJSSetFPUE();
+@@ -1075,7 +1086,12 @@
+             return; // nothing to do
+ 
+         if(vt == tvtString) {
+-            String->ToNumber(*this);
++            // krkr-rs: null `String` is the empty string; `ToNumber` on it
++            // yields 0 (a null-`this` call is UB under clang -O1+).
++            if(String)
++                String->ToNumber(*this);
++            else
++                *this = (tjs_int)0;
+             return;
+         }
+ 
+@@ -1144,7 +1160,8 @@
+             tTJSVariantString *s1, *s2;
+             s1 = AsString();
+             s2 = rhs.AsString();
+-            val.String = TJSAllocVariantString(*s1, *s2);
++            val.String = TJSAllocVariantString(
++                TJSVariantStringChars(s1), TJSVariantStringChars(s2));
+             if(s1)
+                 s1->Release();
+             if(s2)
+diff -ruN a/tjsVariant.h b/tjsVariant.h
+--- a/tjsVariant.h
++++ b/tjsVariant.h
+@@ -795,7 +795,9 @@
+             // returns String
+             if(vt != tvtString)
+                 TJSThrowVariantConvertError(*this, tvtString);
+-            return *String;
++            // krkr-rs: a null `String` is the empty string; avoid a
++            // null-`this` conversion (UB under clang -O1+).
++            return String ? String->operator const tjs_char *() : nullptr;
+         }
+ 
+         TJS_METHOD_DEF(tjs_uint32 *, GetHint, ()) {
+@@ -866,7 +868,10 @@
+                 case tvtObject:
+                     TJSThrowVariantConvertError(*this, tvtInteger);
+                 case tvtString:
+-                    return String->ToInteger();
++                    // krkr-rs: an empty string is stored as a null `String`;
++                    // `tTJSVariantString::ToInteger`'s null-`this` guard is UB
++                    // under clang -O1+, so return 0 here.
++                    return String ? String->ToInteger() : 0;
+                 case tvtInteger:
+                     return Integer;
+                 case tvtReal:
+@@ -886,7 +891,12 @@
+                 case tvtObject:
+                     TJSThrowVariantConvertError(*this, tvtInteger, tvtReal);
+                 case tvtString:
+-                    String->ToNumber(targ);
++                    // krkr-rs: null `String` is the empty string; `ToNumber` on
++                    // it yields 0 (see above).
++                    if(String)
++                        String->ToNumber(targ);
++                    else
++                        targ = (tjs_int)0;
+                     return;
+                 case tvtInteger:
+                     targ = Integer;
+@@ -943,7 +953,8 @@
+                 case tvtObject:
+                     TJSThrowVariantConvertError(*this, tvtReal);
+                 case tvtString:
+-                    return String->ToReal();
++                    // krkr-rs: null `String` is the empty string; yield 0.
++                    return String ? String->ToReal() : 0;
+                 case tvtInteger:
+                     return (tTVReal)Integer;
+                 case tvtReal:
+@@ -1163,7 +1174,12 @@
+ 
+             if(vt == tvtString) {
+                 tTJSVariant val;
+-                String->ToNumber(val);
++                // krkr-rs: null `String` is the empty string; `ToNumber` on it
++                // yields 0 (a null-`this` call is UB under clang -O1+).
++                if(String)
++                    String->ToNumber(val);
++                else
++                    val = (tjs_int)0;
+                 return val;
+             }
+ 
+@@ -1212,7 +1228,8 @@
+                 tTJSVariantString *s1, *s2;
+                 s1 = AsString();
+                 s2 = rhs.AsString();
+-                val.String = TJSAllocVariantString(*s1, *s2);
++                val.String = TJSAllocVariantString(
++                    TJSVariantStringChars(s1), TJSVariantStringChars(s2));
+                 if(s1)
+                     s1->Release();
+                 if(s2)
+diff -ruN a/tjsVariantString.h b/tjsVariantString.h
+--- a/tjsVariantString.h
++++ b/tjsVariantString.h
+@@ -216,6 +216,20 @@
+             }
+         }
+     };
++
++    // krkr-rs: the canonical representation of an empty TJS string is a null
++    // `tTJSVariantString *`. Calling a member function on that null pointer is
++    // UB, and clang >= -O1 deletes the null-`this` guards inside the methods
++    // (crashing the VM). Convert through these helpers instead: they check for
++    // null *before* the member call. Observable behaviour is unchanged (a null
++    // string still reads as an empty/null character pointer and length 0).
++    inline const tjs_char *TJSVariantStringChars(const tTJSVariantString *s) {
++        return s ? s->operator const tjs_char *() : nullptr;
++    }
++    inline tjs_int TJSVariantStringLength(const tTJSVariantString *s) {
++        return s ? s->GetLength() : 0;
++    }
++
+     TJS_EXP_FUNC_DEF(tTJSVariantString *, TJSAllocVariantString,
+                      (const tjs_char *ref1, const tjs_char *ref2));
+ 
