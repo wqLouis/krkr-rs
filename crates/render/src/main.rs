@@ -485,7 +485,15 @@ fn run_vm(vm: Res<VmRuntime>) {
             LAST_EVAL.store(now_ms, std::sync::atomic::Ordering::SeqCst);
             match vm.engine.eval_retained(&script, "krkr-eval") {
                 Ok(_) => log::info!("KRKR_EVAL -> ok"),
-                Err(e) => log::error!("KRKR_EVAL !! {e}"),
+                // `eval` compiles an **expression**; a multi-statement probe
+                // (the usual shape for instrumentation) is a syntax error
+                // there, so fall back to running it as a script.
+                Err(eval_err) => match vm.engine.exec_script_retained(&script, "krkr-eval") {
+                    Ok(_) => log::info!("KRKR_EVAL -> ok (exec)"),
+                    Err(exec_err) => {
+                        log::error!("KRKR_EVAL !! eval: {eval_err} / exec: {exec_err}")
+                    }
+                },
             }
         }
     }
