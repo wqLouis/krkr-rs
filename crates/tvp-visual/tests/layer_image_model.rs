@@ -113,6 +113,37 @@ fn bitmap_dims(scene: &Scene, layer_index: usize) -> (u32, u32) {
     (bitmap.width, bitmap.height)
 }
 
+/// `setImageSize` on a freshly created layer (no MainImage) allocates the
+/// image and sizes it exactly. KAG's solid-color flash depends on this
+/// (`system/advscreen.tjs` `flashEnter`: on a missing color image it does
+/// `temp.setImageSize(W, H)` then uses `temp` as a `stretchCopy` source — the
+/// real game's `@flash color=white` hit `Layer.stretchCopy: source has no
+/// image` because our lenient `setImageSize` only recorded the dimensions).
+/// The reference constructs every layer with a 32x32 transparent default
+/// image, so its `SetImageSize` always has a MainImage to resize; our layers
+/// allocate lazily in `ChangeImageSize`.
+#[test]
+fn set_image_size_on_fresh_layer_allocates_and_is_usable_as_source() {
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var src = new Layer(w, null); src.setImageSize(8, 6); src.setSizeToImageSize(); \
+         var dst = new Layer(w, null); dst.setImageSize(8, 6); \
+         dst.stretchCopy(0, 0, 8, 6, src, 0, 0, 8, 6, 0);",
+    );
+    let scene = env.scene();
+    assert!(
+        scene.layers[0].bitmap.is_some(),
+        "setImageSize allocates the source image"
+    );
+    assert_eq!(bitmap_dims(&scene, 0), (8, 6));
+    assert_eq!(
+        (scene.layers[0].image_width, scene.layers[0].image_height),
+        (8, 6)
+    );
+    assert_eq!((scene.layers[0].rect.w, scene.layers[0].rect.h), (8, 6));
+}
+
 /// `hasImage = true` allocates the MainImage at the rect size, transparent,
 /// resets the clip and reports `hasImage`; `false` drops it. This is the
 /// setter that used to be a silent no-op and broke `ConfigVoiceSliderH`.

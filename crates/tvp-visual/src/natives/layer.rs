@@ -400,8 +400,13 @@ fn resize_main_image(scene: &mut Scene, layer_id: u32, width: u32, height: u32) 
 /// Reference `tTJSNI_BaseLayer::ChangeImageSize` (`LayerIntf.cpp:2307`):
 /// resize the MainImage to exactly `(width, height)`, resize the province
 /// plane to the same size (`ProvinceImage->SetSizeWithFill(width, height, 0)`),
-/// reset the clip and mark the image modified. When no MainImage exists only
-/// the modified flag is set. The numeric image window is re-synced.
+/// reset the clip and mark the image modified. When no MainImage exists yet,
+/// allocate one of that size (the reference constructs every layer with a
+/// 32x32 transparent default image, so its `SetImageSize` always has a
+/// MainImage to resize; our layers allocate lazily, and doing it here means a
+/// `setImageSize` on a fresh layer yields a usable image — e.g. KAG's
+/// solid-color flash does `temp.setImageSize(w, h)` and then uses `temp` as a
+/// `stretchCopy` source). The numeric image window is re-synced.
 fn change_image_size(scene: &mut Scene, layer_id: u32, width: u32, height: u32) {
     if scene.layer(layer_id).and_then(|l| l.bitmap).is_some() {
         resize_main_image(scene, layer_id, width, height);
@@ -409,8 +414,8 @@ fn change_image_size(scene: &mut Scene, layer_id: u32, width: u32, height: u32) 
             layer.clip = None;
             layer.image_modified = true;
         }
-    } else if let Some(layer) = scene.layer_mut(layer_id) {
-        layer.image_modified = true;
+    } else {
+        ensure_dest_image(scene, layer_id, width.max(1), height.max(1));
     }
     if scene.layer(layer_id).is_some_and(|l| l.province.is_some()) {
         scene.resize_province_image(layer_id, width, height);
