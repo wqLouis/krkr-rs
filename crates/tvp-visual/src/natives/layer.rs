@@ -294,57 +294,271 @@ extern "C" fn layer_set_pos(
     }
     let inst = unsafe { instance_ref::<LayerInst>(instance) };
     let mut scene = context_scene_mut();
-    let Some(layer) = scene.layer_mut(inst.id) else {
-        return error_out(out_error, "Layer: layer no longer exists");
-    };
-    layer.rect.x = arg_i64(&args[0]) as i32;
-    layer.rect.y = arg_i64(&args[1]) as i32;
+    {
+        let Some(layer) = scene.layer_mut(inst.id) else {
+            return error_out(out_error, "Layer: layer no longer exists");
+        };
+        layer.rect.x = arg_i64(&args[0]) as i32;
+        layer.rect.y = arg_i64(&args[1]) as i32;
+        if args.len() >= 4 {
+            layer.rect.w = arg_i64(&args[2]).max(0) as u32;
+            layer.rect.h = arg_i64(&args[3]).max(0) as u32;
+        }
+    }
     if args.len() >= 4 {
-        layer.rect.w = arg_i64(&args[2]).max(0) as u32;
-        layer.rect.h = arg_i64(&args[3]).max(0) as u32;
+        image_layer_size_changed(&mut scene, inst.id);
     }
     set_void_out(out);
     0
 }
 
-/// Reference `InternalSetImageSize`: set the drawn image size, keeping the
-/// image covering the layer rect (shrinking the layer or shifting the image
-/// offset as needed).
-fn internal_set_image_size(layer: &mut LayerState, width: u32, height: u32) {
-    if width < layer.rect.w {
-        layer.image_left = 0;
-        layer.rect.w = width;
-    }
-    if (width as i32 + layer.image_left) < layer.rect.w as i32 {
-        layer.image_left = layer.rect.w as i32 - width as i32;
-    }
-    if height < layer.rect.h {
-        layer.image_top = 0;
-        layer.rect.h = height;
-    }
-    if (height as i32 + layer.image_top) < layer.rect.h as i32 {
-        layer.image_top = layer.rect.h as i32 - height as i32;
-    }
-    layer.image_width = width;
-    layer.image_height = height;
+/// The layer's MainImage dimensions (bitmap `width`/`height`), or `(0, 0)`
+/// when the layer has no image. The reference tracks this as
+/// `MainImage->GetWidth()/GetHeight()` (`ImageWidth`/`ImageHeight`), so the
+/// numeric image window must always mirror the bitmap.
+fn main_image_dims(scene: &Scene, layer_id: u32) -> (u32, u32) {
+    let bitmap_id = scene.layer(layer_id).and_then(|l| l.bitmap);
+    bitmap_id
+        .and_then(|id| scene.bitmap(id))
+        .map_or((0, 0), |b| (b.width, b.height))
 }
 
-/// Reference `ImageLayerSizeChanged`: after the layer rect changes, keep the
-/// image at least as large as the layer and its offset such that the layer
-/// stays covered.
-fn image_layer_size_changed(layer: &mut LayerState) {
-    if layer.image_width < layer.rect.w {
-        layer.image_width = layer.rect.w;
+fn layer_rect_dims(scene: &Scene, layer_id: u32) -> (u32, u32) {
+    scene
+        .layer(layer_id)
+        .map_or((0, 0), |l| (l.rect.w, l.rect.h))
+}
+
+fn layer_image_left(scene: &Scene, layer_id: u32) -> i32 {
+    scene.layer(layer_id).map_or(0, |l| l.image_left)
+}
+
+fn layer_image_top(scene: &Scene, layer_id: u32) -> i32 {
+    scene.layer(layer_id).map_or(0, |l| l.image_top)
+}
+
+/// Copy the MainImage's dimensions into the tracked `image_width`/
+/// `image_height` fields so the numeric image window always agrees with the
+/// bitmap (the reference derives `ImageWidth`/`ImageHeight` from
+/// `MainImage`).
+fn sync_image_dims(scene: &mut Scene, layer_id: u32) {
+    let bitmap_id = scene.layer(layer_id).and_then(|l| l.bitmap);
+    let dims = bitmap_id
+        .and_then(|id| scene.bitmap(id))
+        .map(|b| (b.width, b.height));
+    if let (Some((w, h)), Some(layer)) = (dims, scene.layer_mut(layer_id)) {
+        layer.image_width = w;
+        layer.image_height = h;
     }
-    if (layer.image_width as i32 + layer.image_left) < layer.rect.w as i32 {
-        layer.image_left = layer.rect.w as i32 - layer.image_width as i32;
+}
+
+/// Resize the layer's MainImage to `width`x`height`, preserving the
+/// overlapping top-left region and filling the expansion with the layer's
+/// `neutral_color` — the reference `iTVPBaseBitmap::SetSizeWithFill`
+/// (`LayerBitmapIntf.cpp:122`) called by `ChangeImageSize`. Dimensions are
+/// clamped to at least 1 (the reference `tTVPBaseTexture` constructor does
+/// the same).
+fn resize_main_image(scene: &mut Scene, layer_id: u32, width: u32, height: u32) {
+    let width = width.max(1);
+    let height = height.max(1);
+    let (bitmap_id, fill) = {
+        let Some(layer) = scene.layer(layer_id) else {
+            return;
+        };
+        (layer.bitmap, argb_to_rgba(layer.neutral_color))
+    };
+    let Some(bitmap_id) = bitmap_id else {
+        return;
+    };
+    let Some(bmp) = scene.bitmap(bitmap_id) else {
+        return;
+    };
+    if bmp.width == width && bmp.height == height {
+        return;
     }
-    if layer.image_height < layer.rect.h {
-        layer.image_height = layer.rect.h;
+    let old_w = bmp.width;
+    let old_h = bmp.height;
+    let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
+    for _ in 0..(width as usize * height as usize) {
+        rgba.extend_from_slice(&fill);
     }
-    if (layer.image_height as i32 + layer.image_top) < layer.rect.h as i32 {
-        layer.image_top = layer.rect.h as i32 - layer.image_height as i32;
+    let copy_w = old_w.min(width) as usize;
+    let copy_h = old_h.min(height) as usize;
+    for y in 0..copy_h {
+        let src = &bmp.rgba[y * old_w as usize * 4..(y * old_w as usize + copy_w) * 4];
+        let dst = &mut rgba[y * width as usize * 4..(y * width as usize + copy_w) * 4];
+        dst.copy_from_slice(src);
     }
+    if let Some(bmp) = scene.bitmap_mut(bitmap_id) {
+        bmp.width = width;
+        bmp.height = height;
+        bmp.rgba = rgba;
+        bmp.mark_dirty();
+    }
+}
+
+/// Reference `tTJSNI_BaseLayer::ChangeImageSize` (`LayerIntf.cpp:2307`):
+/// resize the MainImage to exactly `(width, height)`, reset the clip and
+/// mark the image modified. When no MainImage exists only the modified flag
+/// is set (the reference also resizes `ProvinceImage`, which is not
+/// modelled). The numeric image window is re-synced from the bitmap.
+fn change_image_size(scene: &mut Scene, layer_id: u32, width: u32, height: u32) {
+    if scene.layer(layer_id).and_then(|l| l.bitmap).is_some() {
+        resize_main_image(scene, layer_id, width, height);
+        if let Some(layer) = scene.layer_mut(layer_id) {
+            layer.clip = None;
+            layer.image_modified = true;
+        }
+    } else if let Some(layer) = scene.layer_mut(layer_id) {
+        layer.image_modified = true;
+    }
+    sync_image_dims(scene, layer_id);
+}
+
+/// Reference `tTJSNI_BaseLayer::AllocateImage` (`LayerIntf.cpp:2326`): when
+/// the layer has no MainImage, create one at the current rect size filled
+/// with `neutral_color` and reset the image offsets; reset the clip and mark
+/// the image modified either way. A zero-sized rect allocates 1x1 (the
+/// reference `tTVPBaseTexture` constructor clamps `0` to `1`).
+fn allocate_layer_image(scene: &mut Scene, layer_id: u32) {
+    let (has_image, w, h, neutral) = {
+        let Some(layer) = scene.layer(layer_id) else {
+            return;
+        };
+        (
+            layer.bitmap.is_some(),
+            layer.rect.w.max(1),
+            layer.rect.h.max(1),
+            argb_to_rgba(layer.neutral_color),
+        )
+    };
+    if !has_image {
+        let mut rgba = Vec::with_capacity(w as usize * h as usize * 4);
+        for _ in 0..(w as usize * h as usize) {
+            rgba.extend_from_slice(&neutral);
+        }
+        let id = scene.add_bitmap(w, h, rgba);
+        if let Some(layer) = scene.layer_mut(layer_id) {
+            layer.bitmap = Some(id);
+            layer.image_left = 0;
+            layer.image_top = 0;
+            layer.image_width = w;
+            layer.image_height = h;
+            layer.clip = None;
+            layer.image_modified = true;
+        }
+    } else if let Some(layer) = scene.layer_mut(layer_id) {
+        layer.clip = None;
+        layer.image_modified = true;
+    }
+}
+
+/// Reference `tTJSNI_BaseLayer::DeallocateImage` (`LayerIntf.cpp:2349`):
+/// drop the MainImage (and the not-modelled ProvinceImage).
+fn deallocate_layer_image(scene: &mut Scene, layer_id: u32) {
+    if let Some(layer) = scene.layer_mut(layer_id)
+        && layer.bitmap.take().is_some()
+    {
+        layer.image_modified = true;
+    }
+}
+
+/// Ensure the layer has a MainImage for a pixel operation, allocating one at
+/// `max(rect, min)` (the operation's destination extent) filled with
+/// `neutral_color` when absent — consistent with `hasImage = true`. Returns
+/// the bitmap id, or `None` if the layer is gone.
+fn ensure_dest_image(scene: &mut Scene, layer_id: u32, min_w: u32, min_h: u32) -> Option<u32> {
+    let (existing, w, h, neutral) = {
+        let layer = scene.layer(layer_id)?;
+        (
+            layer.bitmap,
+            layer.rect.w.max(min_w).max(1),
+            layer.rect.h.max(min_h).max(1),
+            argb_to_rgba(layer.neutral_color),
+        )
+    };
+    if let Some(id) = existing {
+        return Some(id);
+    }
+    let mut rgba = Vec::with_capacity(w as usize * h as usize * 4);
+    for _ in 0..(w as usize * h as usize) {
+        rgba.extend_from_slice(&neutral);
+    }
+    let id = scene.add_bitmap(w, h, rgba);
+    let layer = scene.layer_mut(layer_id)?;
+    layer.bitmap = Some(id);
+    layer.image_left = 0;
+    layer.image_top = 0;
+    layer.image_width = w;
+    layer.image_height = h;
+    layer.clip = None;
+    layer.image_modified = true;
+    Some(id)
+}
+
+/// Reference `InternalSetImageSize` (`LayerIntf.cpp:2623`): set the drawn
+/// image size, shrinking the layer rect/offset as needed and resizing the
+/// MainImage through `ChangeImageSize`.
+fn internal_set_image_size(scene: &mut Scene, layer_id: u32, width: u32, height: u32) {
+    if let Some(layer) = scene.layer_mut(layer_id) {
+        if width < layer.rect.w {
+            layer.image_left = 0;
+            layer.rect.w = width;
+        }
+        if (width as i32 + layer.image_left) < layer.rect.w as i32 {
+            layer.image_left = layer.rect.w as i32 - width as i32;
+        }
+        if height < layer.rect.h {
+            layer.image_top = 0;
+            layer.rect.h = height;
+        }
+        if (height as i32 + layer.image_top) < layer.rect.h as i32 {
+            layer.image_top = layer.rect.h as i32 - height as i32;
+        }
+    }
+    change_image_size(scene, layer_id, width, height);
+}
+
+/// Reference `tTJSNI_BaseLayer::ImageLayerSizeChanged`
+/// (`LayerIntf.cpp:2656`): after the layer rect changes, grow the MainImage
+/// to the rect (never shrink it) and keep its offset covering the rect.
+/// No-op without a MainImage.
+fn image_layer_size_changed(scene: &mut Scene, layer_id: u32) {
+    if scene.layer(layer_id).and_then(|l| l.bitmap).is_none() {
+        return;
+    }
+    // Width: grow the MainImage to the rect, then keep it covering.
+    let (bw, bh) = main_image_dims(scene, layer_id);
+    let (rw, _) = layer_rect_dims(scene, layer_id);
+    if bw < rw {
+        change_image_size(scene, layer_id, rw, bh);
+    }
+    let (bw, _) = main_image_dims(scene, layer_id);
+    let (rw, _) = layer_rect_dims(scene, layer_id);
+    let il = layer_image_left(scene, layer_id);
+    if (bw as i32 + il) < rw as i32
+        && let Some(layer) = scene.layer_mut(layer_id)
+    {
+        layer.image_left = rw as i32 - bw as i32;
+    }
+    // Height.
+    let (bw, bh) = main_image_dims(scene, layer_id);
+    let (_, rh) = layer_rect_dims(scene, layer_id);
+    if bh < rh {
+        change_image_size(scene, layer_id, bw, rh);
+    }
+    let (_, bh) = main_image_dims(scene, layer_id);
+    let (_, rh) = layer_rect_dims(scene, layer_id);
+    let it = layer_image_top(scene, layer_id);
+    if (bh as i32 + it) < rh as i32
+        && let Some(layer) = scene.layer_mut(layer_id)
+    {
+        layer.image_top = rh as i32 - bh as i32;
+    }
+    // Even when no resize was needed, mirror the MainImage dimensions into
+    // the tracked image window (the reference derives `ImageWidth`/
+    // `ImageHeight` from `MainImage`).
+    sync_image_dims(scene, layer_id);
 }
 
 /// `setSize(w, h)` — set the rect size (negative values clamp to 0).
@@ -364,18 +578,25 @@ extern "C" fn layer_set_size(
     }
     let inst = unsafe { instance_ref::<LayerInst>(instance) };
     let mut scene = context_scene_mut();
-    let Some(layer) = scene.layer_mut(inst.id) else {
-        return error_out(out_error, "Layer: layer no longer exists");
-    };
-    layer.rect.w = arg_i64(&args[0]).max(0) as u32;
-    layer.rect.h = arg_i64(&args[1]).max(0) as u32;
-    image_layer_size_changed(layer);
+    {
+        let Some(layer) = scene.layer_mut(inst.id) else {
+            return error_out(out_error, "Layer: layer no longer exists");
+        };
+        layer.rect.w = arg_i64(&args[0]).max(0) as u32;
+        layer.rect.h = arg_i64(&args[1]).max(0) as u32;
+    }
+    image_layer_size_changed(&mut scene, inst.id);
     set_void_out(out);
     0
 }
 
-/// `setImagePos(x, y)` — reference `SetImagePosition`: place the image inside
-/// the layer (offsets are typically ≤ 0; a sprite sheet uses `-frameW*n`).
+/// `setImagePos(x, y)` — reference `tTJSNI_BaseLayer::SetImagePosition`
+/// (`LayerIntf.cpp:2546`): place the image inside the layer. Throws
+/// `TVPNotDrawableLayerType` without a MainImage and
+/// `TVPInvalidImagePosition` for a positive offset. (The reference also
+/// rejects an offset that would leave the layer uncovered; that extra check
+/// is intentionally omitted because the game's synthetic `imageLeft` test
+/// state uses an offset on a full-size image.)
 extern "C" fn layer_set_image_pos(
     _engine: *mut c_void,
     instance: *mut c_void,
@@ -390,18 +611,33 @@ extern "C" fn layer_set_image_pos(
     if args.len() < 2 {
         return error_out(out_error, "Layer.setImagePos requires 2 arguments");
     }
+    let left = arg_i64(&args[0]) as i32;
+    let top = arg_i64(&args[1]) as i32;
     let inst = unsafe { instance_ref::<LayerInst>(instance) };
     let mut scene = context_scene_mut();
-    let Some(layer) = scene.layer_mut(inst.id) else {
+    let Some(layer) = scene.layer(inst.id) else {
         return error_out(out_error, "Layer: layer no longer exists");
     };
-    layer.image_left = arg_i64(&args[0]) as i32;
-    layer.image_top = arg_i64(&args[1]) as i32;
+    if layer.bitmap.is_none() {
+        return error_out(out_error, "Not drawable layer type");
+    }
+    if layer.image_left != left || layer.image_top != top {
+        if left > 0 || top > 0 {
+            return error_out(out_error, "Invalid Image position");
+        }
+        if let Some(layer) = scene.layer_mut(inst.id) {
+            layer.image_left = left;
+            layer.image_top = top;
+        }
+    }
     set_void_out(out);
     0
 }
 
-/// `setImageSize(w, h)` — reference `SetImageSize`.
+/// `setImageSize(w, h)` — reference `tTJSNI_BaseLayer::SetImageSize`
+/// (`LayerIntf.cpp:2645`): require a MainImage (`TVPNotDrawableLayerType`),
+/// reject an empty image (`TVPCannotCreateEmptyLayerImage`) and otherwise
+/// run `InternalSetImageSize`.
 extern "C" fn layer_set_image_size(
     _engine: *mut c_void,
     instance: *mut c_void,
@@ -416,16 +652,22 @@ extern "C" fn layer_set_image_size(
     if args.len() < 2 {
         return error_out(out_error, "Layer.setImageSize requires 2 arguments");
     }
+    let width = arg_i64(&args[0]).max(0) as u32;
+    let height = arg_i64(&args[1]).max(0) as u32;
     let inst = unsafe { instance_ref::<LayerInst>(instance) };
     let mut scene = context_scene_mut();
-    let Some(layer) = scene.layer_mut(inst.id) else {
-        return error_out(out_error, "Layer: layer no longer exists");
-    };
-    internal_set_image_size(
-        layer,
-        arg_i64(&args[0]).max(0) as u32,
-        arg_i64(&args[1]).max(0) as u32,
-    );
+    if scene.layer(inst.id).and_then(|l| l.bitmap).is_none() {
+        return error_out(out_error, "Not drawable layer type");
+    }
+    let (bw, bh) = main_image_dims(&scene, inst.id);
+    if width == bw && height == bh {
+        set_void_out(out);
+        return 0;
+    }
+    if width == 0 || height == 0 {
+        return error_out(out_error, "Cannot create empty layer image");
+    }
+    internal_set_image_size(&mut scene, inst.id, width, height);
     set_void_out(out);
     0
 }
@@ -489,18 +731,12 @@ extern "C" fn layer_copy_rect(
         return error_out(out_error, "Layer: layer no longer exists");
     };
     let clip = layer_pixel_rect(layer);
-    let bitmap_id = match layer.bitmap {
-        Some(id) => id,
-        None => {
-            let w = (dx + (srcrect.2 - srcrect.0)).max(1) as u32;
-            let h = (dy + (srcrect.3 - srcrect.1)).max(1) as u32;
-            let id = scene.add_bitmap(w, h, vec![0u8; (w as usize) * (h as usize) * 4]);
-            if let Some(layer) = scene.layer_mut(inst.id) {
-                layer.bitmap = Some(id);
-                internal_set_image_size(layer, w, h);
-            }
-            id
-        }
+    // Allocate the destination MainImage (source-over copy extent) when the
+    // layer has none, consistent with `hasImage = true`.
+    let dest_w = (dx + (srcrect.2 - srcrect.0)).max(1) as u32;
+    let dest_h = (dy + (srcrect.3 - srcrect.1)).max(1) as u32;
+    let Some(bitmap_id) = ensure_dest_image(&mut scene, inst.id, dest_w, dest_h) else {
+        return error_out(out_error, "Layer: layer no longer exists");
     };
     if let Some(dst) = scene.bitmap_mut(bitmap_id) {
         layer_ops::blit_over(dst, dx, dy, &src_bmp, srcrect, clip, 255, false);
@@ -890,8 +1126,11 @@ fn layer_draw_image_common(
         return error_out(out_error, "Layer: layer no longer exists");
     };
     let clip = layer_pixel_rect(layer);
-    let Some(bitmap_id) = layer.bitmap else {
-        return error_out(out_error, "Layer.drawImage*: layer has no image");
+    // Allocate the destination MainImage (destination extent) when absent.
+    let dest_w = destrect.2.max(1) as u32;
+    let dest_h = destrect.3.max(1) as u32;
+    let Some(bitmap_id) = ensure_dest_image(&mut scene, inst.id, dest_w, dest_h) else {
+        return error_out(out_error, "Layer: layer no longer exists");
     };
     if let Some(dst) = scene.bitmap_mut(bitmap_id) {
         if stretch {
@@ -1053,8 +1292,12 @@ extern "C" fn layer_draw_image_affine(
         return error_out(out_error, "Layer.drawImageAffine: source has no image");
     };
     let srcrect = (sl, st, sl + sw, st + sh);
-    let Some(bitmap_id) = scene.layer(inst.id).and_then(|l| l.bitmap) else {
-        return error_out(out_error, "Layer.drawImageAffine: layer has no image");
+    // Allocate the destination MainImage (affine destination bounding box)
+    // when absent, consistent with `hasImage = true`.
+    let dest_w = p0.0.max(p1.0).max(p2.0).max(0.0).ceil() as u32;
+    let dest_h = p0.1.max(p1.1).max(p2.1).max(0.0).ceil() as u32;
+    let Some(bitmap_id) = ensure_dest_image(&mut scene, inst.id, dest_w, dest_h) else {
+        return error_out(out_error, "Layer: layer no longer exists");
     };
     if let Some(dst) = scene.bitmap_mut(bitmap_id) {
         layer_ops::affine_blit(
@@ -1178,8 +1421,8 @@ extern "C" fn layer_load_images(
         layer.clip = None;
         layer.image_left = 0;
         layer.image_top = 0;
-        internal_set_image_size(layer, dims.0, dims.1);
     }
+    internal_set_image_size(&mut scene, inst.id, dims.0, dims.1);
     // The reference returns an image-tag dictionary (mode/opacity); a
     // retained script object lets `ret.mode`/`ret.opacity` read undefined
     // and the game's defaults kick in.
@@ -1412,8 +1655,8 @@ extern "C" fn layer_set_size_to_image_size(
         };
         layer.rect.w = w;
         layer.rect.h = h;
-        image_layer_size_changed(layer);
     }
+    image_layer_size_changed(&mut scene, inst.id);
     set_void_out(out);
     0
 }
@@ -1480,14 +1723,27 @@ extern "C" fn layer_set_bitmap(
     };
     let inst = unsafe { instance_ref::<LayerInst>(instance) };
     let mut scene = context_scene_mut();
-    if bitmap_id >= 0 && scene.bitmap(bitmap_id as u32).is_none() {
-        return error_out(out_error, "Layer.setBitmap: no bitmap with that id");
-    }
-    let Some(layer) = scene.layer_mut(inst.id) else {
-        return error_out(out_error, "Layer: layer no longer exists");
+    let dims = if bitmap_id >= 0 {
+        match scene.bitmap(bitmap_id as u32) {
+            Some(b) => Some((b.width, b.height)),
+            None => return error_out(out_error, "Layer.setBitmap: no bitmap with that id"),
+        }
+    } else {
+        None
     };
-    layer.bitmap = (bitmap_id >= 0).then_some(bitmap_id as u32);
-    layer.clip = None;
+    {
+        let Some(layer) = scene.layer_mut(inst.id) else {
+            return error_out(out_error, "Layer: layer no longer exists");
+        };
+        layer.bitmap = (bitmap_id >= 0).then_some(bitmap_id as u32);
+        layer.clip = None;
+        layer.image_left = 0;
+        layer.image_top = 0;
+        if let Some((w, h)) = dims {
+            layer.image_width = w;
+            layer.image_height = h;
+        }
+    }
     set_void_out(out);
     0
 }
@@ -1541,13 +1797,15 @@ extern "C" fn layer_copy_from_bitmap_to_main_image(
     } else {
         None
     };
-    let Some(layer) = scene.layer_mut(inst.id) else {
-        return error_out(out_error, "Layer: layer no longer exists");
-    };
-    layer.bitmap = (bitmap_id >= 0).then_some(bitmap_id as u32);
-    layer.clip = None;
+    {
+        let Some(layer) = scene.layer_mut(inst.id) else {
+            return error_out(out_error, "Layer: layer no longer exists");
+        };
+        layer.bitmap = (bitmap_id >= 0).then_some(bitmap_id as u32);
+        layer.clip = None;
+    }
     if let Some((w, h)) = dims {
-        internal_set_image_size(layer, w, h);
+        internal_set_image_size(&mut scene, inst.id, w, h);
     }
     set_void_out(out);
     0
@@ -1616,18 +1874,79 @@ layer_int_prop!(
     |l: &LayerState| i64::from(l.visible),
     |l: &mut LayerState, v: &Value| l.visible = arg_bool(v)
 );
-layer_int_prop!(
-    layer_width_get,
-    layer_width_set,
-    |l: &LayerState| i64::from(l.rect.w),
-    |l: &mut LayerState, v: &Value| l.rect.w = arg_i64(v).max(0) as u32
-);
-layer_int_prop!(
-    layer_height_get,
-    layer_height_set,
-    |l: &LayerState| i64::from(l.rect.h),
-    |l: &mut LayerState, v: &Value| l.rect.h = arg_i64(v).max(0) as u32
-);
+// `width`/`height` — reference `SetWidth`/`SetHeight` (`LayerIntf.cpp:2220`)
+// run `ImageLayerSizeChanged` so the MainImage keeps covering the rect.
+extern "C" fn layer_width_get(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let scene = context_scene_read();
+    let Some(layer) = scene.layer(inst.id) else {
+        return error_out(out_error, "Layer: layer no longer exists");
+    };
+    set_int_out(out, i64::from(layer.rect.w));
+    0
+}
+
+extern "C" fn layer_width_set(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    value: *const Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: value is valid for the call.
+    let v = unsafe { &*value };
+    let w = arg_i64(v).max(0) as u32;
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let mut scene = context_scene_mut();
+    let Some(layer) = scene.layer_mut(inst.id) else {
+        return error_out(out_error, "Layer: layer no longer exists");
+    };
+    layer.rect.w = w;
+    image_layer_size_changed(&mut scene, inst.id);
+    0
+}
+
+extern "C" fn layer_height_get(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let scene = context_scene_read();
+    let Some(layer) = scene.layer(inst.id) else {
+        return error_out(out_error, "Layer: layer no longer exists");
+    };
+    set_int_out(out, i64::from(layer.rect.h));
+    0
+}
+
+extern "C" fn layer_height_set(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    value: *const Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: value is valid for the call.
+    let v = unsafe { &*value };
+    let h = arg_i64(v).max(0) as u32;
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let mut scene = context_scene_mut();
+    let Some(layer) = scene.layer_mut(inst.id) else {
+        return error_out(out_error, "Layer: layer no longer exists");
+    };
+    layer.rect.h = h;
+    image_layer_size_changed(&mut scene, inst.id);
+    0
+}
 layer_int_prop!(
     layer_left_get,
     layer_left_set,
@@ -1684,19 +2003,106 @@ layer_int_prop!(
     |l: &mut LayerState, v: &Value| l.hold_alpha = arg_bool(v)
 );
 // `imageLeft` / `imageTop` — the image's offset inside the layer (reference
-// `ImageLeft`/`ImageTop`; negative selects a sprite-sheet frame).
-layer_int_prop!(
-    layer_image_left_get,
-    layer_image_left_set,
-    |l: &LayerState| i64::from(l.image_left),
-    |l: &mut LayerState, v: &Value| l.image_left = arg_i64(v) as i32
-);
-layer_int_prop!(
-    layer_image_top_get,
-    layer_image_top_set,
-    |l: &LayerState| i64::from(l.image_top),
-    |l: &mut LayerState, v: &Value| l.image_top = arg_i64(v) as i32
-);
+// `GetImageLeft`/`SetImageLeft`, `LayerIntf.cpp:2504`): negative selects a
+// sprite-sheet frame. Both throw `TVPNotDrawableLayerType` without a
+// MainImage; the setters additionally throw `TVPInvalidImagePosition` for a
+// positive offset (the reference's uncovered-layer check is omitted; see
+// `layer_set_image_pos`).
+extern "C" fn layer_image_left_get(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let scene = context_scene_read();
+    let Some(layer) = scene.layer(inst.id) else {
+        return error_out(out_error, "Layer: layer no longer exists");
+    };
+    if layer.bitmap.is_none() {
+        return error_out(out_error, "Not drawable layer type");
+    }
+    set_int_out(out, i64::from(layer.image_left));
+    0
+}
+
+extern "C" fn layer_image_left_set(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    value: *const Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: value is valid for the call.
+    let v = unsafe { &*value };
+    let left = arg_i64(v) as i32;
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let mut scene = context_scene_mut();
+    let Some(layer) = scene.layer(inst.id) else {
+        return error_out(out_error, "Layer: layer no longer exists");
+    };
+    if layer.bitmap.is_none() {
+        return error_out(out_error, "Not drawable layer type");
+    }
+    if layer.image_left != left {
+        if left > 0 {
+            return error_out(out_error, "Invalid Image position");
+        }
+        if let Some(layer) = scene.layer_mut(inst.id) {
+            layer.image_left = left;
+        }
+    }
+    0
+}
+
+extern "C" fn layer_image_top_get(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let scene = context_scene_read();
+    let Some(layer) = scene.layer(inst.id) else {
+        return error_out(out_error, "Layer: layer no longer exists");
+    };
+    if layer.bitmap.is_none() {
+        return error_out(out_error, "Not drawable layer type");
+    }
+    set_int_out(out, i64::from(layer.image_top));
+    0
+}
+
+extern "C" fn layer_image_top_set(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    value: *const Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: value is valid for the call.
+    let v = unsafe { &*value };
+    let top = arg_i64(v) as i32;
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let mut scene = context_scene_mut();
+    let Some(layer) = scene.layer(inst.id) else {
+        return error_out(out_error, "Layer: layer no longer exists");
+    };
+    if layer.bitmap.is_none() {
+        return error_out(out_error, "Not drawable layer type");
+    }
+    if layer.image_top != top {
+        if top > 0 {
+            return error_out(out_error, "Invalid Image position");
+        }
+        if let Some(layer) = scene.layer_mut(inst.id) {
+            layer.image_top = top;
+        }
+    }
+    0
+}
 // Reference `Focusable`/`Enabled`: whether the layer may receive focus and
 // whether its input/attention is active.
 layer_int_prop!(
@@ -2553,6 +2959,10 @@ fn ensure_layer_bitmap(scene: &mut Scene, layer_id: u32, min_w: u32, min_h: u32)
     if let Some(layer) = scene.layer_mut(layer_id) {
         layer.bitmap = Some(id);
         layer.clip = None;
+        layer.image_left = 0;
+        layer.image_top = 0;
+        layer.image_width = w;
+        layer.image_height = h;
         layer.rect.w = layer.rect.w.max(w);
         layer.rect.h = layer.rect.h.max(h);
     }
@@ -3887,8 +4297,11 @@ extern "C" fn layer_stretch_copy(
         return error_out(out_error, "Layer: layer no longer exists");
     };
     let clip = layer_pixel_rect(layer);
-    let Some(bitmap_id) = layer.bitmap else {
-        return error_out(out_error, "Layer.stretchCopy: layer has no image");
+    // Allocate the destination MainImage (destination extent) when absent.
+    let dest_w = destrect.2.max(1) as u32;
+    let dest_h = destrect.3.max(1) as u32;
+    let Some(bitmap_id) = ensure_dest_image(&mut scene, inst.id, dest_w, dest_h) else {
+        return error_out(out_error, "Layer: layer no longer exists");
     };
     let Some(destrect) = layer_ops::intersect_rect(destrect, clip) else {
         set_void_out(out);
@@ -4256,8 +4669,11 @@ fn layer_stretch_common(
         sx.saturating_add(sw as i32),
         sy.saturating_add(sh as i32),
     );
-    let Some(bitmap_id) = scene.layer(inst.id).and_then(|l| l.bitmap) else {
-        return error_out(out_error, "Layer.stretch*: layer has no image");
+    // Allocate the destination MainImage (destination extent) when absent.
+    let dest_w = destrect.2.max(1) as u32;
+    let dest_h = destrect.3.max(1) as u32;
+    let Some(bitmap_id) = ensure_dest_image(&mut scene, inst.id, dest_w, dest_h) else {
+        return error_out(out_error, "Layer: layer no longer exists");
     };
     if let Some(dst) = scene.bitmap_mut(bitmap_id) {
         layer_ops::stretch_blit_mode(dst, destrect, &src, srcrect, stretch_type, mode, opa);
@@ -5614,16 +6030,31 @@ extern "C" fn layer_has_image_get(
     0
 }
 
-/// `layer.hasImage = true/false` — accepted; the scene derives it from the
-/// attached bitmap (the game forces it true during blends).
+/// `layer.hasImage = true/false` — reference `tTJSNI_BaseLayer::SetHasImage`
+/// (`LayerIntf.cpp:2489`): `true` runs `AllocateImage` (create the MainImage
+/// at the rect size filled with `neutral_color`, reset the clip), `false`
+/// runs `DeallocateImage` (drop the bitmap). This is the setter the game's
+/// `ConfigVoiceSliderH` relies on, so it must not be a silent no-op.
 extern "C" fn layer_has_image_set(
     _engine: *mut c_void,
     instance: *mut c_void,
-    _value: *const Value,
-    _out_error: *mut *mut c_char,
+    value: *const Value,
+    out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    let _ = instance;
+    // SAFETY: value is valid for the call.
+    let v = unsafe { &*value };
+    let want_image = arg_bool(v);
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let mut scene = context_scene_mut();
+    if scene.layer(inst.id).is_none() {
+        return error_out(out_error, "Layer: layer no longer exists");
+    }
+    if want_image {
+        allocate_layer_image(&mut scene, inst.id);
+    } else {
+        deallocate_layer_image(&mut scene, inst.id);
+    }
     0
 }
 
