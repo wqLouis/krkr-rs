@@ -289,6 +289,15 @@ fn scene_projection(logical: (u32, u32)) -> Projection {
     })
 }
 
+/// Set by the window-request consumer when a script `Window.update()` asked
+/// for an immediate redraw. [`sync_scene`] reads and clears it, bypassing the
+/// revision-based idle fast path so the redraw happens the same frame even if
+/// the update did not otherwise mutate the scene (the native already marks
+/// the layers `pending_paint` and bumps the revision, so this is a belt-and-
+/// braces guarantee).
+#[derive(Resource, Default)]
+pub struct WindowRedrawRequested(pub bool);
+
 /// The OS client size last pushed to the host window (logical pixels). Lets
 /// [`sync_host_window_resolution`] tell a game-initiated `Window.setSize` /
 /// `setInnerSize` / `setZoom` from an interactive OS resize: only the former
@@ -409,8 +418,17 @@ pub fn sync_scene(
     mut materials: ResMut<Assets<LayerBlendMaterial>>,
     mut gpu: ResMut<GpuPrimitives>,
     mut state: ResMut<FrameBlendMaterials>,
+    mut redraw: Option<ResMut<WindowRedrawRequested>>,
     cameras: Query<Entity, With<SceneCamera>>,
 ) {
+    // A script `Window.update()` explicitly asked for a redraw: honor it even
+    // when nothing else changed (the resource is optional so the sync's unit
+    // tests, which never insert it, keep their existing setup).
+    let forced_redraw = redraw
+        .as_deref_mut()
+        .map(|flag| std::mem::take(&mut flag.0))
+        .unwrap_or(false);
+
     let scene = shared.0.read().expect("shared scene lock poisoned");
 
     let projection_size = scene
@@ -422,7 +440,8 @@ pub fn sync_scene(
     // camera projection is current, and the window set is unchanged. The
     // window-count check also catches a window removed through a native's
     // direct `windows.retain` (which cannot bump the revision).
-    if state.last_revision == Some(scene.revision())
+    if !forced_redraw
+        && state.last_revision == Some(scene.revision())
         && state.last_projection == projection_size
         && state.roots.len() == scene.windows.len()
         && cameras.iter().next().is_some()

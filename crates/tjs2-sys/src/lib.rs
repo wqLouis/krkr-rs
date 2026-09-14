@@ -258,6 +258,9 @@ unsafe extern "C" {
     ) -> c_int;
     /// Dump all live script blocks to the console/log output (`tTJS::Dump`).
     pub fn tjs2_dump(e: *mut Engine, out_error: *mut *mut c_char) -> c_int;
+    /// Run the TJS2 garbage collector (`tTJS::DoGarbageCollection`); the
+    /// `clIdle` half of `System.doCompact`.
+    fn tjs2_do_gc(e: *mut Engine, out_error: *mut *mut c_char) -> c_int;
     /// Class names of a retained object, as a retained TJS Array (reference
     /// `Scripts.getClassNames`).
     pub fn tjs2_get_class_names(
@@ -347,6 +350,15 @@ unsafe extern "C" {
         engine: *mut Engine,
         id: Tjs2ValueId,
         membername: *const c_char,
+        value: *const Value,
+        out_error: *mut *mut c_char,
+    ) -> c_int;
+    /// Write a value back into a by-reference argument of the native method
+    /// call currently executing on this engine (reference native methods do
+    /// `(*param[index]) = value`).
+    fn tjs2_set_arg(
+        engine: *mut Engine,
+        index: c_int,
         value: *const Value,
         out_error: *mut *mut c_char,
     ) -> c_int;
@@ -738,6 +750,20 @@ impl Tjs2Engine {
         let mut error: *mut c_char = ptr::null_mut();
         // SAFETY: self.inner is a live engine.
         let rc = unsafe { tjs2_dump(self.inner, &mut error) };
+        if rc != 0 {
+            return Err(unsafe { take_error(error) });
+        }
+        Ok(())
+    }
+
+    /// Run the TJS2 garbage collector (reference `tTJS::DoGarbageCollection`,
+    /// `tjs.cpp:495`). This is the `clIdle` half of `System.doCompact`: the
+    /// reference's compact-event hook invokes it whenever the compact level
+    /// reaches `TVP_COMPACT_LEVEL_IDLE`.
+    pub fn do_gc(&self) -> Result<(), TjsError> {
+        let mut error: *mut c_char = ptr::null_mut();
+        // SAFETY: self.inner is a live engine.
+        let rc = unsafe { tjs2_do_gc(self.inner, &mut error) };
         if rc != 0 {
             return Err(unsafe { take_error(error) });
         }
@@ -1354,6 +1380,33 @@ name), and none was available"
         // name/value (including any string storage in `strings`) follow the
         // ABI contract for the duration of the call.
         let rc = unsafe { tjs2_prop_set(self.inner, id, name.as_ptr(), &ffi, &mut error) };
+        if rc != 0 {
+            return Err(unsafe { take_error_string(error) });
+        }
+        Ok(())
+    }
+
+    /// Write a value back into a by-reference argument of the native method
+    /// call currently executing on this engine.
+    ///
+    /// The C ABI snapshots every native-method argument into a [`Value`]
+    /// copy, so a Rust callback cannot modify the caller's variable by
+    /// writing through `argv`. This entry point (backed by
+    /// `tjs2_set_arg`) reaches the caller's original `tTJSVariant` slot and
+    /// therefore implements the reference's `(*param[index]) = value`
+    /// out-parameter pattern (e.g. `Window.getMouseVelocity`).
+    ///
+    /// Only valid while a native method callback is running on `self`; the
+    /// call frame is pushed around the callback and popped afterwards. An
+    /// `index` outside the current call's argument count is an error.
+    pub fn set_arg(&self, index: usize, value: &TjsValue) -> Result<(), String> {
+        let mut strings = Vec::new();
+        let ffi = value_to_ffi(value, &mut strings)?;
+        let mut error: *mut c_char = ptr::null_mut();
+        // SAFETY: self.inner is a live engine; the call frame (if any) is
+        // the one this callback was invoked for, and `ffi`/`strings` stay
+        // alive for the call.
+        let rc = unsafe { tjs2_set_arg(self.inner, index as c_int, &ffi, &mut error) };
         if rc != 0 {
             return Err(unsafe { take_error_string(error) });
         }
@@ -2158,6 +2211,49 @@ mod tests {
         0
     }
 
+    /// `Counter.out(v)`: writes `2 * counter` back into argument 0 through
+    /// the `tjs2_set_arg` out-parameter ABI (the reference's
+    /// `(*param[0]) = value` pattern).
+    extern "C" fn counter_out(
+        engine: *mut c_void,
+        instance: *mut c_void,
+        argc: c_int,
+        _argv: *const Value,
+        out: *mut Value,
+        out_error: *mut *mut c_char,
+        _objthis: *mut c_void,
+    ) -> c_int {
+        if argc < 1 {
+            unsafe { *out_error = alloc_error_string("Counter.out requires 1 argument") };
+            return 1;
+        }
+        let c = unsafe { *counter_ptr(instance) };
+        let written = Value {
+            ty: VAL_INTEGER,
+            integer: i64::from(c) * 2,
+            real: 0.0,
+            string: ptr::null(),
+            array: ptr::null(),
+            array_count: 0,
+            retained: 0,
+        };
+        let mut err: *mut c_char = ptr::null_mut();
+        // SAFETY: `engine` is the live engine for this callback and a native
+        // call frame is active (the trampoline pushes it around the fn call).
+        let rc = unsafe { tjs2_set_arg(engine as *mut Engine, 0, &written, &mut err) };
+        if rc != 0 {
+            unsafe { *out_error = err };
+            return 1;
+        }
+        unsafe {
+            (*out).ty = VAL_INTEGER;
+            (*out).integer = 1;
+            (*out).real = 0.0;
+            (*out).string = ptr::null();
+        }
+        0
+    }
+
     fn counter_builder() -> NativeInstanceBuilder<'static> {
         NativeInstanceBuilder {
             name: "Counter",
@@ -2179,6 +2275,10 @@ mod tests {
                 NativeInstanceMethodDef {
                     name: "add",
                     f: counter_add,
+                },
+                NativeInstanceMethodDef {
+                    name: "out",
+                    f: counter_out,
                 },
                 NativeInstanceMethodDef {
                     name: "objthis",
@@ -2275,6 +2375,27 @@ mod tests {
         .unwrap();
         assert_eq!(e.eval("rb", "test").unwrap(), TjsValue::Integer(5));
         assert_eq!(e.eval("rc", "test").unwrap(), TjsValue::Integer(42));
+    }
+
+    #[test]
+    fn native_instance_out_param_writes_back_to_the_caller() {
+        let _vm_lock = vm_lock();
+        let e = Tjs2Engine::new().unwrap();
+        e.register_native_class_instance(&counter_builder())
+            .unwrap();
+        // `out(v)` must modify the caller's variable through the by-reference
+        // argument slot, not the callback's copy. TJS2 only passes **local**
+        // variables by reference; a global is a property read compiled into a
+        // temporary, so the test uses a function-local variable and returns it.
+        e.exec_script(
+            "function probe() { var c = new Counter(); c.add(21); var v = 0; \
+             var ok = c.out(v); return [v, ok]; } \
+             var r = probe(); var probe_v = r[0]; var probe_ok = r[1];",
+            "test",
+        )
+        .unwrap();
+        assert_eq!(e.eval("probe_v", "test").unwrap(), TjsValue::Integer(42));
+        assert_eq!(e.eval("probe_ok", "test").unwrap(), TjsValue::Integer(1));
     }
 
     #[test]

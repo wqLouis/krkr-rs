@@ -30,7 +30,7 @@ use krkr_render::GpuPrimitives;
 use krkr_render::blend::LayerBlendPlugin;
 use krkr_render::sync::{
     BitmapAssets, FrameBlendMaterials, HostWindowResolution, SharedScene, SystemContextState,
-    sync_host_window_resolution, sync_scene,
+    WindowRedrawRequested, sync_host_window_resolution, sync_scene,
 };
 use tvp_visual::scene::{BitmapState, Rect, Scene};
 
@@ -165,6 +165,7 @@ fn game_app(shared: SharedScene, game_dir: PathBuf, font_config: Option<PathBuf>
         .init_resource::<GpuPrimitives>()
         .init_resource::<FrameBlendMaterials>()
         .init_resource::<HostWindowResolution>()
+        .init_resource::<WindowRedrawRequested>()
         .init_resource::<input_bridge::BridgeState>()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
@@ -178,12 +179,21 @@ fn game_app(shared: SharedScene, game_dir: PathBuf, font_config: Option<PathBuf>
         .add_plugins(krkr_render::menu::MenuPlugin)
         .add_systems(Startup, game_startup)
         // run_vm BEFORE sync_scene: script mutations must render the same
-        // frame, not one frame later. `sync_host_window_resolution` runs
-        // between them so a `Window.setSize`/`setZoom` this frame resizes the
-        // OS window before the scene is synced.
+        // frame, not one frame later. `consume_window_requests` drains the
+        // `bringToFront`/`update`/`resetMouseVelocity` queues that run_vm may
+        // have filled and, for `update`, asks `sync_scene` to skip its idle
+        // fast path this frame. `sync_host_window_resolution` runs between
+        // them so a `Window.setSize`/`setZoom` this frame resizes the OS
+        // window before the scene is synced.
         .add_systems(
             Update,
-            (run_vm, sync_host_window_resolution, sync_scene).chain(),
+            (
+                run_vm,
+                input_bridge::consume_window_requests,
+                sync_host_window_resolution,
+                sync_scene,
+            )
+                .chain(),
         )
         // `System.exit` / `System.terminate` from the VM → Bevy `AppExit`.
         // Runs after `run_vm` so an exit requested by this frame's script
@@ -238,11 +248,15 @@ fn headless_game_app(shared: SharedScene, game_dir: PathBuf, font_config: Option
         .init_resource::<BitmapAssets>()
         .init_resource::<GpuPrimitives>()
         .init_resource::<FrameBlendMaterials>()
+        .init_resource::<WindowRedrawRequested>()
         .add_plugins(LayerBlendPlugin)
         .add_plugins(krkr_render::menu::MenuPlugin)
         .add_plugins(MinimalPlugins)
         .add_systems(Startup, game_startup)
-        .add_systems(Update, (run_vm, sync_scene).chain());
+        .add_systems(
+            Update,
+            (run_vm, input_bridge::consume_window_requests, sync_scene).chain(),
+        );
     app
 }
 
@@ -812,11 +826,15 @@ mod tests {
 
     /// The VM is process-global and single-threaded; serialize the render
     /// tests that register an engine (they would otherwise corrupt the C++
-    /// heap when run in parallel).
-    static MENU_VM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
+    /// heap when run in parallel). Use the *shared* `tvp_visual` lock rather
+    /// than a bin-local one: the input-bridge tests in this same test binary
+    /// also register into the global VM context, and two independent locks
+    /// let a menu test and an input test run at once (observed as a sporadic
+    /// SIGSEGV).
     fn menu_vm_lock() -> std::sync::MutexGuard<'static, ()> {
-        MENU_VM_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+        tvp_visual::natives::vm_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
     }
 
     /// The demo app without a window/renderer (MinimalPlugins has `Time`, so

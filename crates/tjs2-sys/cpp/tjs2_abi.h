@@ -119,6 +119,16 @@ int tjs2_compile_script(tjs2_engine *e, const char *script,
 int tjs2_dump(tjs2_engine *e, char **out_error);
 
 /*
+ * Run the TJS2 garbage collector (reference `tTJS::DoGarbageCollection`).
+ * This is the `clIdle` half of `System.doCompact`: the reference's compact
+ * event hook calls it whenever the compact level reaches
+ * `TVP_COMPACT_LEVEL_IDLE`. Returns 0 on success; on failure returns non-zero
+ * and, if out_error is non-NULL, points it at a malloc'd UTF-8 message (free
+ * with tjs2_free_string).
+ */
+int tjs2_do_gc(tjs2_engine *e, char **out_error);
+
+/*
  * Class-name list of a retained object (reference `Scripts.getClassNames`):
  * loop `iTJSDispatch2::ClassInstanceInfo(TJS_CII_GET, n, value)` and build
  * a TJS Array of names, the last (most-derived) class first. `obj` is a
@@ -215,6 +225,21 @@ int tjs2_prop_get(void *engine, tjs2_value_id id, const char *membername,
  */
 int tjs2_prop_set(void *engine, tjs2_value_id id, const char *membername,
                   const tjs2_value *value, char **out_error);
+
+/*
+ * Write a value back into a by-reference argument of the native method call
+ * currently executing on this engine (reference native methods do
+ * `(*param[index]) = value`, e.g. `Window.getMouseVelocity`). `index` is the
+ * zero-based argument position; only valid while a native method callback is
+ * running, because the ABI snapshots the arguments into `tjs2_value` copies
+ * and this is the only way to reach the caller's original variant slot.
+ *
+ * Returns 0 on success; on failure returns non-zero with a malloc'd UTF-8
+ * message in out_error. Callers that do not need to report the failure can
+ * pass a NULL out_error.
+ */
+int tjs2_set_arg(tjs2_engine *e, int index, const tjs2_value *value,
+                 char **out_error);
 
 /*
  * Native class registration (static methods only for this milestone).

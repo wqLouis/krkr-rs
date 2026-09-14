@@ -54,7 +54,7 @@ use tvp_input::{
 };
 use tvp_visual::scene::Scene;
 
-use krkr_render::sync::SharedScene;
+use krkr_render::sync::{SharedScene, WindowRedrawRequested};
 
 use crate::VmRuntime;
 
@@ -222,6 +222,8 @@ pub(crate) fn capture_input(
     if let Some(pos) = cursor_moved.read().last() {
         let (x, y) = to_game(pos.position.x, pos.position.y);
         s.set_mouse_pos(x, y);
+        // Feed the host pointer tracker that backs `Window.getMouseVelocity`.
+        tvp_visual::natives::window::record_mouse_movement(x as f64, y as f64);
     }
 
     // Mouse buttons: press/release edges only (held state persists in the
@@ -285,6 +287,20 @@ pub(crate) fn capture_input(
     bridge.pending_touches.clear();
     for ev in touch_events.read() {
         let (x, y) = to_game(ev.position.x, ev.position.y);
+        // Feed the per-touch velocity tracker that backs
+        // `Window.getTouchVelocity`; a lifted/cancelled touch forgets it.
+        match ev.phase {
+            TouchPhase::Started | TouchPhase::Moved => {
+                tvp_visual::natives::window::record_touch_movement(
+                    ev.id as u32,
+                    x as f64,
+                    y as f64,
+                );
+            }
+            TouchPhase::Ended | TouchPhase::Canceled => {
+                tvp_visual::natives::window::clear_touch_velocity(ev.id as u32);
+            }
+        }
         bridge.pending_touches.push(TouchEvent {
             phase: ev.phase,
             id: ev.id,
@@ -522,6 +538,47 @@ fn apply_mouse_warp(windows: &mut Query<&mut Window>, shared: &SharedScene, game
     window.set_cursor_position(Some(Vec2::new(px, py)));
 }
 
+/// Consume the `tvp-visual` window request queues once per frame.
+///
+/// * `Window.bringToFront()` → focus/raise the host window. Bevy 0.19 exposes
+///   no `raise`/`set_focused` method; assigning [`Window::focused`] is the
+///   supported focus request, and the winit backend turns that change into
+///   `winit::window::Window::focus_window()` (documented as bringing the
+///   window to the foreground). A separate z-order raise is not available
+///   through Bevy 0.19, so this is the closest primitive.
+/// * `Window.update()` → set [`WindowRedrawRequested`], which
+///   [`krkr_render::sync::sync_scene`] consumes this frame to bypass its idle
+///   fast path.
+/// * `Window.resetMouseVelocity()` → clear the host mouse-velocity tracker
+///   that feeds `Window.getMouseVelocity`.
+///
+/// Every queue is drained, even though the host has a single primary window
+/// and a request's scene window id does not distinguish anything, so they can
+/// never accumulate. Run before `sync_scene` (see `main.rs`).
+pub(crate) fn consume_window_requests(
+    mut windows: Query<&mut Window>,
+    mut redraw: ResMut<WindowRedrawRequested>,
+) {
+    use tvp_visual::natives::window::{
+        clear_mouse_velocity, take_mouse_velocity_reset_requests, take_window_raise_requests,
+        take_window_update_requests,
+    };
+
+    if !take_window_raise_requests().is_empty()
+        && let Some(mut window) = windows.iter_mut().next()
+    {
+        window.focused = true;
+    }
+
+    if !take_window_update_requests().is_empty() {
+        redraw.0 = true;
+    }
+
+    if !take_mouse_velocity_reset_requests().is_empty() {
+        clear_mouse_velocity();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // System 2: tvp-input state → game window script methods
 // ---------------------------------------------------------------------------
@@ -555,6 +612,13 @@ pub(crate) fn dispatch_input(
 
     let touches = std::mem::take(&mut bridge.pending_touches);
     if events.is_empty() && touches.is_empty() {
+        return;
+    }
+    // `System.eventDisabled` is set by both games right before
+    // `System.terminate`; stop delivering input to the VM while it is set
+    // (the edge snapshot above was still updated so a later re-enable cannot
+    // replay stale edges).
+    if tvp_visual::natives::window::events_disabled() {
         return;
     }
     if std::env::var_os("KRKR_INPUT_TRACE").is_some() {

@@ -252,13 +252,13 @@ extern "C" fn layer_destroy(_engine: *mut c_void, instance: *mut c_void) {
     let inst = unsafe { instance_ref::<LayerInst>(instance) };
     if inst.constructed {
         let mut scene = context_scene_mut();
-        // The layer's font state is owned by the layer (created lazily by
-        // `layer.font`), so destroy it with the layer.
-        let font_id = scene.layer(inst.id).and_then(|l| l.font_id);
-        if let Some(font_id) = font_id {
-            scene.fonts.retain(|f| f.id != font_id);
-        }
-        scene.remove_layer(inst.id);
+        // Destruction, not `Part()`: the reference `Invalidate` severs the
+        // children and releases the `Children` array, so the TJS GC cascade
+        // destroys the whole subtree. `destroy_layer` mirrors that and also
+        // drops the subtree's owned fonts. Using `remove_layer` here kept
+        // the children alive as window roots, so a torn-down scene's images
+        // stayed on screen.
+        scene.destroy_layer(inst.id);
     }
     // Drop the layer's side-table state so a reused scene id cannot inherit
     // it. (Only the constructed path owns scene state, but the auxiliary
@@ -9940,6 +9940,39 @@ mod tests {
         assert_eq!(scene.windows.len(), 1);
     }
 
+    /// Destroying a parent's native instance must take its child subtree with
+    /// it (reference `Invalidate` + GC cascade), even while the child is still
+    /// referenced from the script. `remove_layer` alone kept the children as
+    /// window roots, which left a torn-down scene's images on screen.
+    #[test]
+    fn layer_destroy_removes_child_subtree() {
+        let env = TestEnv::new("layer-destroy-subtree");
+        env.run(
+            "var w = new Window(); \
+             var p = new Layer(w, null); \
+             var c = new Layer(w, p); \
+             var g = new Layer(w, c); \
+             var cid = c.id; var gid = g.id; \
+             p = null;",
+        )
+        .unwrap();
+        let scene = env.scene();
+        // The child/grandchild TJS objects are still alive (`c`/`g`), but the
+        // destroyed parent's subtree must be gone from the scene.
+        let cid = env.eval_int("cid") as u32;
+        let gid = env.eval_int("gid") as u32;
+        assert!(
+            scene.layer(cid).is_none(),
+            "child must be removed with its parent"
+        );
+        assert!(
+            scene.layer(gid).is_none(),
+            "grandchild must be removed with its parent"
+        );
+        let win = scene.windows.first().expect("window").id;
+        assert!(scene.window(win).unwrap().layers.is_empty());
+    }
+
     #[test]
     fn deep_script_subclass_chain_resolves_object_parent() {
         // Mimic the game's `SavedataHeader -> SelectItemGroupSprite ->
@@ -10077,6 +10110,36 @@ mod tests {
         env.run("c.parent = null;").unwrap();
         let scene = env.scene();
         assert_eq!(scene.layers[1].parent, None, "null detaches to the window");
+    }
+
+    /// `Part()` (`parent = null`) detaches a layer but keeps its child subtree
+    /// attached to it: the reference `Part` only severs the parent link
+    /// (`LayerIntf.cpp:624`). Destruction, by contrast, removes the subtree
+    /// ([`tvp_visual::scene::Scene::destroy_layer`]).
+    #[test]
+    fn part_keeps_child_subtree_attached() {
+        let env = TestEnv::new("layer-part-keeps-children");
+        env.run(
+            "var w = new Window(); \
+             var gp = new Layer(w, null); \
+             var p = new Layer(w, gp); \
+             var c = new Layer(w, p); \
+             var pid = p.id; var cid = c.id; \
+             p.parent = null;",
+        )
+        .unwrap();
+        let pid = env.eval_int("pid") as u32;
+        let cid = env.eval_int("cid") as u32;
+        let scene = env.scene();
+        assert_eq!(scene.layer(pid).unwrap().parent, None, "p detached");
+        assert_eq!(
+            scene.layer(cid).unwrap().parent,
+            Some(pid),
+            "child stays attached to the Part()-ed layer"
+        );
+        let win = scene.windows.first().expect("window").id;
+        let order = scene.window_layer_order(win);
+        assert!(order.contains(&pid) && order.contains(&cid));
     }
 
     /// Model the game's `ADVObject`: a script subclass overrides `id` with a

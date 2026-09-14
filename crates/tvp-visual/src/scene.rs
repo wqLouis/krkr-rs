@@ -634,16 +634,22 @@ impl Scene {
     /// Detach one layer — the reference `tTJSNI_BaseLayer::Part()`
     /// (`LayerIntf.cpp:624`). The layer is severed from its parent (or the
     /// window root list) and removed from the scene. Children are **not**
-    /// destroyed: the reference `Invalidate` calls `child->Part()` for each
-    /// direct child (`LayerIntf.cpp:551`), so their parent link is cleared and
-    /// they stay alive as window-level roots. The old implementation removed
-    /// the whole subtree, which silently deleted live children (focus, button
-    /// and transition layers all share a parent).
+    /// destroyed: the layer's direct children are re-parented to the window
+    /// root list and stay alive (the reference `Invalidate` calls
+    /// `child->Part()` for each direct child, `LayerIntf.cpp:551`). The old
+    /// implementation removed the whole subtree, which silently deleted live
+    /// children (focus, button and transition layers all share a parent).
+    ///
+    /// This is *detachment*, not destruction. Destroying a layer's native
+    /// instance must use [`Scene::destroy_layer`], which removes the whole
+    /// subtree the way the reference's GC cascade does. Using this function
+    /// for destruction is what left a torn-down scene's layers alive as
+    /// window roots (the "old scene images stay on screen" bug).
     pub fn remove_layer(&mut self, id: u32) {
         let Some(layer) = self.layer(id) else {
             return;
         };
-        let (win, parent) = (layer.window, layer.parent);
+        let (win, parent, font_id) = (layer.window, layer.parent, layer.font_id);
         let children = layer.children.clone();
         // `Part()`: sever this layer from its parent (or the window roots).
         if let Some(p) = parent {
@@ -666,6 +672,15 @@ impl Scene {
             }
         }
         self.layers.retain(|l| l.id != id);
+        // The removed layer owns its lazily-allocated font; drop it with the
+        // layer (a surviving child keeps its own font).
+        if let Some(font_id) = font_id {
+            self.fonts.retain(|f| f.id != font_id);
+            self.font_index.clear();
+            for (index, font) in self.fonts.iter().enumerate() {
+                self.font_index.insert(font.id, index);
+            }
+        }
         // Indices shifted: rebuild the id→index map.
         self.layer_index.clear();
         for (index, layer) in self.layers.iter().enumerate() {
@@ -678,6 +693,96 @@ impl Scene {
                 w.primary_layer = None;
             }
             if w.focused_layer == Some(id) {
+                w.focused_layer = None;
+            }
+        }
+        self.touch();
+    }
+
+    /// Destroy a layer and its **entire** child subtree — the reference
+    /// `tTJSNI_BaseLayer::Invalidate` (`LayerIntf.cpp:535`) followed by the
+    /// TJS GC cascade. `Invalidate` severs each direct child (`child->Part()`)
+    /// and releases the `Children` array; once the parent no longer holds the
+    /// children the whole subtree is destroyed with it. This is the function
+    /// `layer_destroy` must use. [`Scene::remove_layer`] remains the explicit
+    /// `Part()` detach that *keeps* the children.
+    ///
+    /// The subtree is collected through both the maintained `parent` links and
+    /// the `children` vectors, so a stale link cannot leave an orphan behind.
+    /// The removed layers' owned fonts, focus holders and primary-layer slot
+    /// are cleaned up as well.
+    pub fn destroy_layer(&mut self, id: u32) {
+        if self.layer(id).is_none() {
+            return;
+        }
+        // Merge the parent links and the maintained child lists into one
+        // adjacency map; either source alone can be stale.
+        let mut children_of: HashMap<u32, Vec<u32>> = HashMap::new();
+        for layer in &self.layers {
+            if let Some(parent) = layer.parent {
+                children_of.entry(parent).or_default().push(layer.id);
+            }
+            if !layer.children.is_empty() {
+                children_of
+                    .entry(layer.id)
+                    .or_default()
+                    .extend(layer.children.iter().copied());
+            }
+        }
+        let mut doomed: HashSet<u32> = HashSet::new();
+        let mut stack = vec![id];
+        while let Some(current) = stack.pop() {
+            if !doomed.insert(current) {
+                continue;
+            }
+            if let Some(children) = children_of.get(&current) {
+                stack.extend(children.iter().copied());
+            }
+        }
+        let window = self.layer(id).map(|layer| layer.window);
+        // Fonts are keyed by their own font id (layer.font_id), so collect the
+        // doomed layers' font ids before the layers disappear.
+        let doomed_fonts: Vec<u32> = self
+            .layers
+            .iter()
+            .filter(|layer| doomed.contains(&layer.id))
+            .filter_map(|layer| layer.font_id)
+            .collect();
+        // Drop the doomed ids from every surviving layer's child list and
+        // focus search state.
+        for layer in &mut self.layers {
+            if doomed.contains(&layer.id) {
+                continue;
+            }
+            layer.children.retain(|child| !doomed.contains(child));
+            if layer
+                .focus_work
+                .is_some_and(|focus| doomed.contains(&focus))
+            {
+                layer.focus_work = None;
+            }
+        }
+        self.layers.retain(|layer| !doomed.contains(&layer.id));
+        self.fonts.retain(|font| !doomed_fonts.contains(&font.id));
+        // Indices shifted: rebuild the id→index maps.
+        self.layer_index.clear();
+        for (index, layer) in self.layers.iter().enumerate() {
+            self.layer_index.insert(layer.id, index);
+        }
+        self.font_index.clear();
+        for (index, font) in self.fonts.iter().enumerate() {
+            self.font_index.insert(font.id, index);
+        }
+        // The reference `DetachPrimary` leaves the window without a primary,
+        // and `SeverChild`/`BlurTree` clears a removed focus holder.
+        if let Some(window) = window
+            && let Some(w) = self.window_mut(window)
+        {
+            w.layers.retain(|layer| !doomed.contains(layer));
+            if w.primary_layer.is_some_and(|p| doomed.contains(&p)) {
+                w.primary_layer = None;
+            }
+            if w.focused_layer.is_some_and(|f| doomed.contains(&f)) {
                 w.focused_layer = None;
             }
         }
@@ -1331,6 +1436,97 @@ mod tests {
         let order = scene.window_layer_order(win);
         assert!(order.contains(&child));
         assert!(order.contains(&grandchild));
+    }
+
+    /// `destroy_layer` models the reference `Invalidate` + GC cascade: the
+    /// whole subtree is removed, so no descendant survives as a window root.
+    /// This is the fix for a torn-down scene's images staying on screen.
+    #[test]
+    fn destroy_layer_removes_whole_subtree() {
+        let mut scene = Scene::default();
+        let win = scene.add_window("t", (1, 1));
+        let parent = scene.add_layer(win, None);
+        let child = scene.add_layer(win, Some(parent));
+        let grandchild = scene.add_layer(win, Some(child));
+        let unrelated = scene.add_layer(win, None);
+        scene.destroy_layer(parent);
+        assert!(scene.layer(parent).is_none());
+        assert!(scene.layer(child).is_none(), "child destroyed with parent");
+        assert!(
+            scene.layer(grandchild).is_none(),
+            "grandchild destroyed with parent"
+        );
+        assert!(scene.layer(unrelated).is_some(), "unrelated layer survives");
+        // None of the destroyed layers may reach the renderer.
+        let order = scene.window_layer_order(win);
+        assert_eq!(order, vec![unrelated]);
+    }
+
+    /// Destroying a subtree that was itself `Part()`ed out to the window root
+    /// list removes it from that list and from `window_layer_order`, leaving
+    /// the rest of the window untouched.
+    #[test]
+    fn destroy_layer_removes_detached_root_from_layer_order() {
+        let mut scene = Scene::default();
+        let win = scene.add_window("t", (1, 1));
+        let grandpa = scene.add_layer(win, None);
+        let parent = scene.add_layer(win, Some(grandpa));
+        let child = scene.add_layer(win, Some(parent));
+        // Part `parent` out to the window root list; its child comes along.
+        scene.layer_mut(grandpa).unwrap().children.clear();
+        scene.layer_mut(parent).unwrap().parent = None;
+        scene.window_mut(win).unwrap().layers.push(parent);
+        assert!(scene.window_layer_order(win).contains(&parent));
+        scene.destroy_layer(parent);
+        let order = scene.window_layer_order(win);
+        assert_eq!(order, vec![grandpa]);
+        assert!(
+            !order.contains(&child),
+            "child destroyed with the detached parent"
+        );
+        assert_eq!(scene.window(win).unwrap().layers, vec![grandpa]);
+    }
+
+    /// `destroy_layer` drops the doomed layers' lazily-allocated fonts and
+    /// clears a primary/focus holder that pointed into the subtree.
+    #[test]
+    fn destroy_layer_cleans_fonts_primary_and_focus() {
+        let mut scene = Scene::default();
+        let win = scene.add_window("t", (1, 1));
+        let primary = scene.add_layer(win, None);
+        let child = scene.add_layer(win, Some(primary));
+        let font = scene.add_font("f".into(), 12, [0; 4]);
+        scene.layer_mut(child).unwrap().font_id = Some(font);
+        scene.set_focus(child);
+        assert_eq!(scene.window(win).unwrap().primary_layer, Some(primary));
+        assert_eq!(scene.window(win).unwrap().focused_layer, Some(child));
+        scene.destroy_layer(primary);
+        assert_eq!(scene.window(win).unwrap().primary_layer, None);
+        assert_eq!(scene.window(win).unwrap().focused_layer, None);
+        assert!(scene.font(font).is_none(), "owned font destroyed");
+    }
+
+    /// Rebuilding a scene after a teardown must not surface a stale layer:
+    /// the new generation renders exactly its own layers.
+    #[test]
+    fn scene_rebuild_after_teardown_leaves_no_stale_layers() {
+        let mut scene = Scene::default();
+        let win = scene.add_window("t", (1280, 720));
+        // First scene generation: a root with nested content.
+        let old_root = scene.add_layer(win, None);
+        let old_child = scene.add_layer(win, Some(old_root));
+        let old_grandchild = scene.add_layer(win, Some(old_child));
+        scene.destroy_layer(old_root);
+        assert!(scene.layers.is_empty());
+        // New generation.
+        let new_root = scene.add_layer(win, None);
+        let new_child = scene.add_layer(win, Some(new_root));
+        let order = scene.window_layer_order(win);
+        assert_eq!(order, vec![new_root, new_child]);
+        for stale in [old_root, old_child, old_grandchild] {
+            assert!(scene.layer(stale).is_none(), "no stale layer {stale}");
+            assert!(!order.contains(&stale), "stale {stale} not rendered");
+        }
     }
 
     /// `node_visible`/`node_enabled` walk the ancestor chain.

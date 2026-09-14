@@ -35,13 +35,15 @@
 //! | `getTouchPoint` / `touchPointCount` | tracked from the native touch events |
 //! | `bringToFront` | records a host raise/focus request (see [`take_window_raise_requests`]) |
 //! | `update([type])` | forces this frame's layer `onPaint` + marks the window for an immediate host redraw (see [`take_window_update_requests`]) |
-//! | `getMouseVelocity` / `getTouchVelocity` | return `0`; the ABI cannot write back out-params (the tracker is exposed to the input bridge, see [`take_mouse_velocity_reset_requests`]) |
+//! | `getMouseVelocity` / `getTouchVelocity` | real units/second from the host pointer trackers, written through the ABI out-params (see [`record_mouse_movement`]) |
 //! | `resetMouseVelocity` | records a host velocity-reset request for the input bridge |
 //! | `addInputNotify` / `registerExEvent` | documented host-inert extras (script state / WM hook only) |
 //! | `findFullScreenCandidates` / `registerMessageReceiver` | argument-checked no-ops |
 
+use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex, OnceLock};
+use std::time::Instant;
 
 use tjs2_sys::{
     DetachedValue, NativeClassBuilder, NativeInstanceBuilder, NativeInstanceMethodDef,
@@ -184,6 +186,125 @@ static MOUSE_VELOCITY_RESET_REQUESTS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 
 fn lock_requests<T>(m: &Mutex<Vec<T>>) -> std::sync::MutexGuard<'_, Vec<T>> {
     m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+// ---------------------------------------------------------------------------
+// Host pointer-velocity trackers
+// ---------------------------------------------------------------------------
+
+/// One pointer sample: milliseconds since the tracker epoch plus game-space
+/// coordinates.
+#[derive(Clone, Copy)]
+struct VelocitySample {
+    t_ms: u64,
+    x: f64,
+    y: f64,
+}
+
+/// Sample horizon and history size, matching the reference tracker's defaults
+/// (`VelocityTracker.h`: 100 ms horizon, 20 samples).
+const VELOCITY_HORIZON_MS: u64 = 100;
+const VELOCITY_HISTORY: usize = 20;
+
+/// Process-wide epoch for the monotonic sample clock.
+static VELOCITY_EPOCH: OnceLock<Instant> = OnceLock::new();
+/// The primary window's mouse-velocity samples (the input bridge feeds this).
+static MOUSE_VELOCITY: LazyLock<Mutex<Vec<VelocitySample>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+/// Per-touch-id velocity samples (the input bridge feeds this from the touch
+/// events it already routes to the window/layer handlers).
+static TOUCH_VELOCITY: LazyLock<Mutex<HashMap<u32, Vec<VelocitySample>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn velocity_now_ms() -> u64 {
+    VELOCITY_EPOCH
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_millis() as u64
+}
+
+/// Push a sample and age out anything older than the 100 ms horizon, keeping
+/// at most [`VELOCITY_HISTORY`] entries.
+fn push_velocity_sample(samples: &mut Vec<VelocitySample>, x: f64, y: f64) {
+    let now = velocity_now_ms();
+    samples.push(VelocitySample { t_ms: now, x, y });
+    while samples.len() > 1 && now.saturating_sub(samples[0].t_ms) > VELOCITY_HORIZON_MS {
+        samples.remove(0);
+    }
+    if samples.len() > VELOCITY_HISTORY {
+        let excess = samples.len() - VELOCITY_HISTORY;
+        samples.drain(0..excess);
+    }
+}
+
+/// Finite-difference velocity over the retained samples, in units per second,
+/// with `speed = hypot(x, y)` (reference `TVPWindow.h:484`). `None` when there
+/// is not enough movement information to estimate one.
+fn compute_velocity(samples: &[VelocitySample], now: u64) -> Option<(f64, f64, f64)> {
+    // Age out on read as well: once the newest sample falls outside the
+    // horizon the pointer has stopped and the velocity is no longer known.
+    let start = samples
+        .iter()
+        .position(|s| now.saturating_sub(s.t_ms) <= VELOCITY_HORIZON_MS)?;
+    let samples = &samples[start..];
+    if samples.len() < 2 {
+        return None;
+    }
+    let first = samples[0];
+    let last = *samples.last()?;
+    let dt = last.t_ms.saturating_sub(first.t_ms) as f64 / 1000.0;
+    if dt <= 0.0 {
+        return None;
+    }
+    let vx = (last.x - first.x) / dt;
+    let vy = (last.y - first.y) / dt;
+    let speed = (vx * vx + vy * vy).sqrt();
+    Some((vx, vy, speed))
+}
+
+/// Record one cursor position for [`Window.getMouseVelocity`]. Called by the
+/// render input bridge for every `CursorMoved` event (and after a script
+/// `Mouse.setCursorPos` warp).
+pub fn record_mouse_movement(x: f64, y: f64) {
+    let mut samples = MOUSE_VELOCITY.lock().unwrap_or_else(|p| p.into_inner());
+    push_velocity_sample(&mut samples, x, y);
+}
+
+/// Clear the mouse-velocity tracker (reference
+/// `tTJSNI_Window::ResetMouseVelocity` -> `VelocityTracker::clear`). The input
+/// bridge calls this after draining
+/// [`take_mouse_velocity_reset_requests`].
+pub fn clear_mouse_velocity() {
+    MOUSE_VELOCITY
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clear();
+}
+
+/// Record one touch position for [`Window.getTouchVelocity`].
+pub fn record_touch_movement(id: u32, x: f64, y: f64) {
+    let mut map = TOUCH_VELOCITY.lock().unwrap_or_else(|p| p.into_inner());
+    push_velocity_sample(map.entry(id).or_default(), x, y);
+}
+
+/// Drop a touch's velocity history (reference `ResetTouchVelocity`).
+pub fn clear_touch_velocity(id: u32) {
+    TOUCH_VELOCITY
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&id);
+}
+
+fn mouse_velocity_now() -> Option<(f64, f64, f64)> {
+    let now = velocity_now_ms();
+    let samples = MOUSE_VELOCITY.lock().unwrap_or_else(|p| p.into_inner());
+    compute_velocity(&samples, now)
+}
+
+fn touch_velocity_now(id: u32) -> Option<(f64, f64, f64)> {
+    let now = velocity_now_ms();
+    let map = TOUCH_VELOCITY.lock().unwrap_or_else(|p| p.into_inner());
+    compute_velocity(map.get(&id)?, now)
 }
 
 /// Drain the pending `bringToFront()` requests (window ids). The host window
@@ -1297,15 +1418,20 @@ extern "C" fn window_get_touch_point(
     }
 }
 
-/// `getTouchVelocity(id, x, y, speed)` — the reference writes the velocity
-/// into its by-reference out parameters. This ABI hands the native a *copy*
-/// of the arguments, so the out values cannot be propagated; there is no
-/// velocity tracker in the headless port, so the truthful result is `0`.
+/// `getTouchVelocity(id, x, y, speed)` → bool.
+///
+/// Reference `tTJSNI_Window::GetTouchVelocity` (`WindowImpl.cpp:2229`) writes
+/// the three components into its by-reference out parameters and returns
+/// whether the tracker had enough movement information. The `tjs2-sys` ABI
+/// snapshots arguments into copies, so the write-back goes through
+/// [`Tjs2Engine::set_arg`] (the `tjs2_set_arg` entry point reaches the
+/// caller's original variant slots). The host input bridge feeds the tracker
+/// from the touch events it already routes to the window/layer handlers.
 extern "C" fn window_get_touch_velocity(
     _engine: *mut c_void,
     _instance: *mut c_void,
     argc: c_int,
-    _argv: *const Value,
+    argv: *const Value,
     out: *mut Value,
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
@@ -1313,11 +1439,24 @@ extern "C" fn window_get_touch_velocity(
     if argc < 4 {
         return error_out(out_error, "Window.getTouchVelocity requires 4 arguments");
     }
-    set_int_out(out, 0);
+    // SAFETY: argv is valid for the call.
+    let args = unsafe { super::ffi::args(argc, argv) };
+    let id = arg_i64(&args[0]).max(0) as u32;
+    let velocity = touch_velocity_now(id);
+    let (vx, vy, speed) = velocity.unwrap_or((0.0, 0.0, 0.0));
+    let engine = context_engine();
+    for (slot, component) in [(1usize, vx), (2, vy), (3, speed)] {
+        if let Err(e) = engine.set_arg(slot, &TjsValue::Real(component)) {
+            return error_out(out_error, &format!("Window.getTouchVelocity: {e}"));
+        }
+    }
+    set_int_out(out, if velocity.is_some() { 1 } else { 0 });
     0
 }
 
-/// `getMouseVelocity(x, y, speed)` — see [`window_get_touch_velocity`].
+/// `getMouseVelocity(x, y, speed)` → bool. See [`window_get_touch_velocity`]
+/// for the reference out-parameter contract; the mouse tracker is fed by the
+/// input bridge through [`record_mouse_movement`].
 extern "C" fn window_get_mouse_velocity(
     _engine: *mut c_void,
     _instance: *mut c_void,
@@ -1330,15 +1469,24 @@ extern "C" fn window_get_mouse_velocity(
     if argc < 3 {
         return error_out(out_error, "Window.getMouseVelocity requires 3 arguments");
     }
-    set_int_out(out, 0);
+    let velocity = mouse_velocity_now();
+    let (vx, vy, speed) = velocity.unwrap_or((0.0, 0.0, 0.0));
+    let engine = context_engine();
+    for (slot, component) in [(0usize, vx), (1, vy), (2, speed)] {
+        if let Err(e) = engine.set_arg(slot, &TjsValue::Real(component)) {
+            return error_out(out_error, &format!("Window.getMouseVelocity: {e}"));
+        }
+    }
+    set_int_out(out, if velocity.is_some() { 1 } else { 0 });
     0
 }
 
 /// `resetMouseVelocity()` — queue a host velocity-reset request for this
-/// window. The input bridge owns the sample history, so this clears its
-/// tracker through [`take_mouse_velocity_reset_requests`] rather than
-/// ignoring the call (reference `tTJSNI_Window::ResetMouseVelocity`,
-/// `WindowImpl.cpp:1949`).
+/// window. The host input bridge drains it through
+/// [`take_mouse_velocity_reset_requests`] and calls [`clear_mouse_velocity`]
+/// (reference `tTJSNI_Window::ResetMouseVelocity`, `WindowImpl.cpp:1949`).
+/// Queuing instead of clearing here keeps the tracker ownership in the host
+/// that actually feeds it; the request is consumed every frame.
 extern "C" fn window_reset_mouse_velocity(
     _engine: *mut c_void,
     instance: *mut c_void,
@@ -3232,6 +3380,62 @@ mod tests {
         assert_eq!(take_window_raise_requests(), vec![id]);
         assert_eq!(take_window_update_requests(), vec![(id, 1)]);
         assert_eq!(take_mouse_velocity_reset_requests(), vec![id]);
+    }
+
+    #[test]
+    fn velocity_estimator_computes_units_per_second() {
+        use super::{VelocitySample, compute_velocity};
+        // A fixed synthetic clock keeps the estimator test deterministic (the
+        // real epoch may be younger than the sample gap).
+        let now = 10_000u64;
+        // 10 game units over 50 ms = 200 units/second along x.
+        let samples = [
+            VelocitySample {
+                t_ms: now.saturating_sub(50),
+                x: 0.0,
+                y: 0.0,
+            },
+            VelocitySample {
+                t_ms: now,
+                x: 10.0,
+                y: 0.0,
+            },
+        ];
+        let (vx, vy, speed) = compute_velocity(&samples, now).expect("two fresh samples");
+        assert!((vx - 200.0).abs() < 1.0, "vx={vx}");
+        assert!(vy.abs() < 1e-9, "vy={vy}");
+        assert!((speed - 200.0).abs() < 1.0, "speed={speed}");
+        // One sample is not enough information.
+        assert!(compute_velocity(&samples[..1], now).is_none());
+        // Samples older than the 100 ms horizon are ignored (the pointer
+        // stopped, so no velocity is known).
+        let stale = [
+            VelocitySample {
+                t_ms: now.saturating_sub(500),
+                x: 0.0,
+                y: 0.0,
+            },
+            VelocitySample {
+                t_ms: now.saturating_sub(400),
+                x: 10.0,
+                y: 0.0,
+            },
+        ];
+        assert!(compute_velocity(&stale, now).is_none());
+    }
+
+    #[test]
+    fn mouse_velocity_tracker_feeds_and_resets() {
+        use super::{clear_mouse_velocity, mouse_velocity_now, record_mouse_movement};
+        clear_mouse_velocity();
+        assert!(mouse_velocity_now().is_none());
+        record_mouse_movement(0.0, 0.0);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        record_mouse_movement(10.0, 0.0);
+        assert!(mouse_velocity_now().is_some());
+        // `Window.resetMouseVelocity()` clears the tracker through the host.
+        clear_mouse_velocity();
+        assert!(mouse_velocity_now().is_none());
     }
 
     #[test]

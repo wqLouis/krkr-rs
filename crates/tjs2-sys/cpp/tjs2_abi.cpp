@@ -80,6 +80,17 @@ struct tjs2_engine {
     // tjs2_value carries no object handle, so tjs2_retain_value resolves an
     // OBJECT-typed value against this slot.
     TJS::tTJSVariant last_object;
+    // Stack of by-reference argument frames for the native method call(s)
+    // currently executing on this engine. The ABI hands the Rust callback
+    // copied tjs2_value entries, so this is the only path back to the
+    // caller's original tTJSVariant slots (tjs2_set_arg writes here). It is
+    // a stack, not a single slot, because a native callback may re-enter the
+    // VM (tjs2_call_value / tjs2_exec_script) before writing its out params.
+    struct tjs2_param_frame {
+        TJS::tTJSVariant **param;
+        tjs_int count;
+    };
+    std::vector<tjs2_param_frame> param_stack;
 };
 
 namespace {
@@ -351,6 +362,20 @@ void args_to_values(tjs2_engine *e, tjs_int numparams, tTJSVariant **param,
     }
 }
 
+// RAII push/pop of the by-reference argument frame around a Rust native
+// callback, so tjs2_set_arg can address the caller's original variants.
+// Nested (re-entrant) calls stack correctly, and the destructor pops on
+// every exit path, including a C++ exception from the callback.
+struct tjs2_param_frame_guard {
+    tjs2_engine *engine;
+    tjs2_param_frame_guard(tjs2_engine *e, TJS::tTJSVariant **p,
+                           tjs_int count)
+        : engine(e) {
+        engine->param_stack.push_back({p, count});
+    }
+    ~tjs2_param_frame_guard() { engine->param_stack.pop_back(); }
+};
+
 // Convert a tjs2_value produced by a Rust native method callback into a
 // tTJSVariant result. Strings are UTF-8 and owned by the caller for the
 // duration of the callback. Throws TJS::eTJSError for types that cannot be
@@ -482,6 +507,9 @@ tjs_error tjs2_dispatch_native_method(tjs2_native_method_dispatch *self,
         out.retained = nullptr;
 
         char *out_error = nullptr;
+        // Expose the caller's by-reference argument slots to Rust for the
+        // duration of the callback (tjs2_set_arg).
+        tjs2_param_frame_guard param_guard(e, param, numparams);
         // FFI handoff: `fn` is Rust code that must follow the ABI contract
         // (argv/out valid only during the call, out_error malloc'd).
         int rc = self->fn(e, (int)numparams,
@@ -822,6 +850,9 @@ tjs_error tjs2_dispatch_native_instance_method(
         out.retained = nullptr;
 
         char *out_error = nullptr;
+        // Expose the caller's by-reference argument slots to Rust for the
+        // duration of the callback (tjs2_set_arg).
+        tjs2_param_frame_guard param_guard(e, param, numparams);
         // FFI handoff: `fn` is Rust code that must follow the ABI contract
         // (instance/argv/out valid only during the call, out_error malloc'd).
         int rc = self->fn(e, instance, (int)numparams,
@@ -1097,6 +1128,9 @@ tjs_error tjs2_native_instance_constructor_dispatch::FuncCall(
         out.retained = nullptr;
 
         char *out_error = nullptr;
+        // Expose the caller's by-reference argument slots to Rust for the
+        // duration of the callback (tjs2_set_arg).
+        tjs2_param_frame_guard param_guard(e, param, numparams);
         int rc = fn(e, instance, (int)numparams,
                     argv.empty() ? nullptr : argv.data(), &out, &out_error,
                     (void *)objthis);
@@ -1460,6 +1494,36 @@ int tjs2_dump(tjs2_engine *e, char **out_error) {
                 std::memcpy(buf, "unknown", 8);
             *out_error = buf;
         }
+        return 1;
+    }
+}
+
+int tjs2_do_gc(tjs2_engine *e, char **out_error) {
+    if(out_error)
+        *out_error = nullptr;
+    if(!e)
+        return -1;
+    try {
+        // Reference `tTJS::DoGarbageCollection` (`tjs.cpp:495`), invoked by
+        // the `TVP_COMPACT_LEVEL_IDLE` callback in `System.doCompact`.
+        e->inner->DoGarbageCollection();
+        return 0;
+    } catch(const TJS::eTJS &err) {
+        if(out_error)
+            *out_error = make_error_message(err);
+        return 1;
+    } catch(const std::exception &err) {
+        if(out_error) {
+            std::string m = std::string("C++ exception: ") + err.what();
+            char *buf = (char *)malloc(m.size() + 1);
+            if(buf)
+                std::memcpy(buf, m.c_str(), m.size() + 1);
+            *out_error = buf;
+        }
+        return 1;
+    } catch(...) {
+        if(out_error)
+            *out_error = make_error_string("garbage collection failed");
         return 1;
     }
 }
@@ -2280,6 +2344,55 @@ int tjs2_prop_set(void *engine, tjs2_value_id id, const char *membername,
     } catch(...) {
         if(out_error)
             *out_error = make_error_string("prop_set failed");
+        return 1;
+    }
+}
+
+int tjs2_set_arg(tjs2_engine *e, int index, const tjs2_value *value,
+                 char **out_error) {
+    if(out_error)
+        *out_error = nullptr;
+    if(!e || !value) {
+        if(out_error)
+            *out_error = make_error_string("invalid out-param argument");
+        return 1;
+    }
+    if(e->param_stack.empty()) {
+        if(out_error)
+            *out_error = make_error_string(
+                "no native method call is active on this engine");
+        return 1;
+    }
+    const tjs2_engine::tjs2_param_frame &frame = e->param_stack.back();
+    if(index < 0 || index >= frame.count || !frame.param ||
+       !frame.param[index]) {
+        if(out_error)
+            *out_error = make_error_string("out-param index out of range");
+        return 1;
+    }
+    try {
+        TJS::tTJSVariant var;
+        value_to_variant(e, value, &var);
+        // `tTJSVariant::operator=` handles AddRef/Release of the old and new
+        // contents, exactly like the reference's `(*param[i]) = value`.
+        *frame.param[index] = var;
+        return 0;
+    } catch(const TJS::eTJS &err) {
+        if(out_error)
+            *out_error = make_error_message(err);
+        return 1;
+    } catch(const std::exception &err) {
+        if(out_error) {
+            std::string m = std::string("C++ exception: ") + err.what();
+            char *buf = (char *)malloc(m.size() + 1);
+            if(buf)
+                std::memcpy(buf, m.c_str(), m.size() + 1);
+            *out_error = buf;
+        }
+        return 1;
+    } catch(...) {
+        if(out_error)
+            *out_error = make_error_string("set_arg failed");
         return 1;
     }
 }
