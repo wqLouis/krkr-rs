@@ -64,18 +64,19 @@
 //! (dictionary → `key=value` lines) and [`store`](Self::store) (the full
 //! parser state, see [`state::KagParserState::store`]).
 //!
-//! # ABI limitations (what is a method, not a property)
+//! # Property surface
 //!
-//! `tjs2_register_native_class_instance` registers methods only — the C
-//! ABI has no instance-property hook. The reference's properties
-//! (`ignoreCR`, `processSpecialTags`, `curLine`, `curPos`, `curLineStr`,
-//! `debugLevel`, `macros`, `macroParams`, `mp`, `callStackDepth`,
-//! `curStorage`, `curLabel`) are therefore exposed as `getX`/`setX`
-//! methods; the script-side wrapper translates them back into TJS
-//! properties. Also, objects cannot be *passed in* either: `assign` (a
-//! reference parameter) cannot receive another parser object and is
-//! implemented as a `store`-string copy; `restore` takes the `store`
-//! string.
+//! `tjs2_register_native_class_instance` supports real instance
+//! properties, so the reference's properties (`ignoreCR`,
+//! `processSpecialTags`, `debugLevel`, `curLine`, `curPos`, `curLineStr`,
+//! `callStackDepth`, `curStorage`, `curLabel`, `macros`, `macroParams`/`mp`,
+//! `paramMacros`) are registered as TJS properties *and* as `getX`/`setX`
+//! methods where the reference has both. Objects cannot be *passed in* as
+//! arbitrary values: `assign` (a reference parameter) cannot receive
+//! another parser object and is implemented as a `store`-string copy;
+//! `restore` takes the `store` string. The dictionary getters
+//! (`macros`, `macroParams`/`mp`, `paramMacros`) return *real* TJS
+//! Dictionaries; the string setter forms remain for round-tripping.
 //!
 //! The reference fires owner-object events (`onScenarioLoad`,
 //! `onScenarioLoaded`, `onLabel`, `onScript`, `onJump`, `onCall`,
@@ -85,24 +86,44 @@
 //! `if`/`elsif`/`ignore` conditions, `emb` expressions, `&entity` values
 //! and `cond` attributes are evaluated by calling back into the VM
 //! through the context engine (`Scripts.exec`-style re-entrancy).
-//! `class X extends KAGParser` + `super.KAGParser()` cannot construct the
-//! native instance with the current ABI (no constructor member); use the
-//! wrapper class instead.
 //!
-//! KAGParserEx (`KAGParserEx.dll`) is **merged into the core `KAGParser`** in
-//! this reference: `reference/cpp/plugins/KAGParser/kagparserex.cpp` is a
-//! 225-byte placeholder whose comment says it was built into core. Its
-//! documented extensions (plugin `readme.txt`) are `multiLineTagEnabled`,
-//! parameter-macro expansion (`macroParams`/`mp`, `@pmacro`/`@erasepmacro`)
-//! and `emb`'s `escape` parameter — all implemented here. Both games set
-//! `multiLineTagEnabled` (`system/animationsequence.tjs`) and
-//! `processSpecialTags` (`system/sccontroller.tjs`).
+//! # KAGParserEx extensions
+//!
+//! `KAGParserEx` is a **real** KiriKiri plugin, shipped by games as
+//! `plugin/KAGParserEx.dll`. It replaces and extends the core `KAGParser`.
+//! The reference tree here only contains
+//! `reference/cpp/plugins/KAGParser/kagparserex.cpp` — a 225-byte
+//! placeholder whose comment claims it was "built into core" — and the
+//! reference core `reference/cpp/core/base/KAGParser.cpp` does **not**
+//! actually contain any of the Ex extensions. (The upstream source is
+//! `wamsoft/KAGParserEx`, a patched copy of `KAGParser.cpp`.)
+//!
+//! The plugin's `readme.txt` documents exactly four extensions, all
+//! implemented here:
+//!
+//! * `multiLineTagEnabled`: `\`-continued multi-line tags (parsed by the
+//!   `kag` crate through its `multiline_tags` parse option).
+//! * `paramMacros`: a Dictionary of parameter macros, plus the `@pmacro`
+//!   (`name=<macro> p1=v1 ...`) and `@erasepmacro` (`name=<macro>`) system
+//!   tags. When a tag parameter name matches a registered macro, its
+//!   `(name, value)` list is spliced in; a leading `%`/`&` in a registered
+//!   value expands at run time (escape it with a backtick to defer). The
+//!   macro `*` marker splices the caller's macro arguments in place and
+//!   keeps parameters written before it (the core `KAGParser` dropped
+//!   them).
+//! * `taglist`: every `getNextTag()` Dictionary carries a `taglist` Array
+//!   of its member names in written order (`["tagname", <attr>...]`).
+//! * `emb`'s `escape` parameter: `escape=false` splices the evaluated text
+//!   back as tags instead of literal text (default `true`).
+//!
+//! Both games set `multiLineTagEnabled` (`system/animationsequence.tjs`)
+//! and `processSpecialTags` (`system/sccontroller.tjs`); neither calls
+//! `@pmacro`/`paramMacros`/`taglist`/`emb escape` directly.
 //!
 //! Names such as `getRawTag`/`getRawTagCount`/`getTag`/`isTagAvailable`/
-//! `getParameter` belong to a *different* KAGParserEx variant: they are absent
-//! from this reference (both core and plugin) and unused by the games, so they
-//! are deliberately not registered (calling them correctly raises
-//! "Member does not exist").
+//! `getParameter` do **not** exist in KAGParserEx (neither the plugin
+//! `readme.txt` nor the upstream source defines them) and are deliberately
+//! not registered, so calling them raises "Member does not exist".
 
 use std::cell::RefCell;
 use std::ffi::{CStr, c_char, c_int, c_void};
@@ -255,15 +276,8 @@ fn tjs_escape(s: &str) -> String {
 /// ```tjs
 /// (function(){ var d = %[]; d["k"] = "v"; ...; return d; })()
 /// ```
-fn dict_literal(tagname: Option<&str>, params: &[(String, String)]) -> String {
+fn dict_literal(params: &[(String, String)]) -> String {
     let mut lit = String::from("(function(){ var d = %[]; ");
-    if let Some(name) = tagname {
-        lit.push_str("d[");
-        lit.push_str(&tjs_escape("tagname"));
-        lit.push_str("] = ");
-        lit.push_str(&tjs_escape(name));
-        lit.push_str("; ");
-    }
     for (k, v) in params {
         lit.push_str("d[");
         lit.push_str(&tjs_escape(k));
@@ -275,14 +289,12 @@ fn dict_literal(tagname: Option<&str>, params: &[(String, String)]) -> String {
     lit
 }
 
-/// Build a real TJS Dictionary from `entries` and write it into `out` as a
-/// retained object result (the `VAL_RETAINED` ABI slot the C++ side
-/// consumes as a reference). Returns Ok(()) on success; on failure returns
-/// the error string (the caller can fall back or propagate).
-fn set_dict_result(out: *mut Value, entries: &[(String, String)]) -> Result<(), String> {
+/// Evaluate a TJS expression that yields an object and write it into `out`
+/// as a retained object result (the `VAL_RETAINED` ABI slot the C++ side
+/// consumes as a reference).
+fn set_object_expr_result(out: *mut Value, expression: &str) -> Result<(), String> {
     let engine = context_engine()?;
-    let literal = dict_literal(None, entries);
-    let _ = engine.eval(&literal, "KAGParser");
+    let _ = engine.eval(expression, "KAGParser");
     match engine.retain_value_detached(&TjsValue::Object) {
         Ok(dv) => {
             // SAFETY: out is a valid result slot; the C++ side consumes the
@@ -305,34 +317,74 @@ fn set_dict_result(out: *mut Value, entries: &[(String, String)]) -> Result<(), 
     }
 }
 
-/// Build a real TJS Dictionary for a parsed tag (`tagname` key plus every
-/// attribute, preserving source order) and write it into `out`.
+/// Build a real TJS Dictionary from `entries` and write it into `out` as a
+/// retained object result.
+fn set_dict_result(out: *mut Value, entries: &[(String, String)]) -> Result<(), String> {
+    set_object_expr_result(out, &dict_literal(entries))
+}
+
+/// Build a real TJS Dictionary for a parsed tag and write it into `out`.
+///
+/// The dictionary holds `tagname` plus every attribute in source order, and
+/// the KAGParserEx `taglist` member: an **array** of the dictionary's member
+/// names in insertion order (`["tagname", <attr>...]`), which is exactly
+/// what the reference `ArgValue::getReturn` exposes so callers can process a
+/// tag's members in written order.
 fn set_tag_dict_result(
     out: *mut Value,
     name: &str,
     params: &[(String, String)],
 ) -> Result<(), String> {
-    let engine = context_engine()?;
-    let literal = dict_literal(Some(name), params);
-    let _ = engine.eval(&literal, "KAGParser");
-    match engine.retain_value_detached(&TjsValue::Object) {
-        Ok(dv) => {
-            // SAFETY: out is a valid result slot; the C++ side consumes the
-            // retention (copies + erases) before the callback returns.
-            unsafe {
-                (*out).ty = tjs2_sys::VAL_RETAINED;
-                (*out).integer = 0;
-                (*out).real = 0.0;
-                (*out).string = ptr::null();
-                (*out).array = ptr::null();
-                (*out).array_count = 0;
-                (*out).retained = dv.raw_id() as usize;
-            }
-            std::mem::forget(dv);
-            Ok(())
-        }
-        Err(e) => Err(e),
+    let mut lit = String::from("(function(){ var d = %[]; ");
+    lit.push_str("d[");
+    lit.push_str(&tjs_escape("tagname"));
+    lit.push_str("] = ");
+    lit.push_str(&tjs_escape(name));
+    lit.push_str("; ");
+    for (k, v) in params {
+        lit.push_str("d[");
+        lit.push_str(&tjs_escape(k));
+        lit.push_str("] = ");
+        lit.push_str(&tjs_escape(v));
+        lit.push_str("; ");
     }
+    // taglist: ["tagname", <attr names>...]
+    lit.push_str("d[");
+    lit.push_str(&tjs_escape("taglist"));
+    lit.push_str("] = [");
+    lit.push_str(&tjs_escape("tagname"));
+    for (k, _) in params {
+        lit.push(',');
+        lit.push_str(&tjs_escape(k));
+    }
+    lit.push_str("]; return d; })()");
+    set_object_expr_result(out, &lit)
+}
+
+/// Build a real TJS Dictionary for the `paramMacros` property: macro name →
+/// TJS Array of alternating parameter names and values (the shape the
+/// reference `ArgValue` registers and `EntryParam` reads).
+fn set_param_macros_dict_result(
+    out: *mut Value,
+    entries: &[(String, Vec<(String, String)>)],
+) -> Result<(), String> {
+    let mut lit = String::from("(function(){ var d = %[]; ");
+    for (name, list) in entries {
+        lit.push_str("d[");
+        lit.push_str(&tjs_escape(name));
+        lit.push_str("] = [");
+        for (i, (k, v)) in list.iter().enumerate() {
+            if i > 0 {
+                lit.push(',');
+            }
+            lit.push_str(&tjs_escape(k));
+            lit.push(',');
+            lit.push_str(&tjs_escape(v));
+        }
+        lit.push_str("]; ");
+    }
+    lit.push_str("return d; })()");
+    set_object_expr_result(out, &lit)
 }
 
 fn set_out_void(out: *mut Value) {
@@ -1097,6 +1149,82 @@ extern "C" fn native_set_macros(
     }
 }
 
+/// Decode the string form of a `paramMacros` dictionary: one
+/// `macroName=name1\x1fvalue1\x1fname2\x1fvalue2` line per macro (fields
+/// escaped with [`kvp::escape_field`]). Used by `setParamMacros` and the
+/// `paramMacros` property setter; the object-returning getter is preferred
+/// by script callers.
+fn decode_param_macros(s: &str) -> Vec<(String, Vec<(String, String)>)> {
+    let mut out = Vec::new();
+    for line in s.split('\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let Some(eq) = line.find('=') else { continue };
+        let name = kvp::unescape_field(&line[..eq]);
+        let value = kvp::unescape_field(&line[eq + 1..]);
+        let fields: Vec<&str> = if value.is_empty() {
+            Vec::new()
+        } else {
+            value.split('\u{1f}').collect()
+        };
+        let list = fields
+            .chunks(2)
+            .map(|pair| {
+                (
+                    pair[0].to_string(),
+                    pair.get(1).copied().unwrap_or("").to_string(),
+                )
+            })
+            .collect();
+        out.push((name, list));
+    }
+    out
+}
+
+/// `getParamMacros()`: the parameter-macro dictionary as a real TJS
+/// Dictionary of Arrays.
+extern "C" fn native_get_param_macros(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    _argc: c_int,
+    _argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let entries = unsafe { state_of(instance) }.get_param_macros_entries();
+    match set_param_macros_dict_result(out, &entries) {
+        Ok(()) => 0,
+        Err(e) => error_out(out_error, &e),
+    }
+}
+
+/// `setParamMacros(s)`: replace the parameter-macro dictionary from its
+/// string form (see [`decode_param_macros`]).
+extern "C" fn native_set_param_macros(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    if argc < 1 {
+        return error_out(out_error, "KAGParser.setParamMacros requires 1 argument");
+    }
+    // SAFETY: argv points to `argc` valid entries for the call.
+    let args = unsafe { std::slice::from_raw_parts(argv, argc as usize) };
+    let s = match param_to_string(&args[0]) {
+        Ok(s) => s,
+        Err(e) => return error_out(out_error, &e),
+    };
+    unsafe { state_of(instance) }.set_param_macros(decode_param_macros(&s));
+    set_out_void(out);
+    0
+}
+
 /// `getMacroParams()`: the top macro-args dictionary, void when none.
 extern "C" fn native_get_macro_params(
     _engine: *mut c_void,
@@ -1526,6 +1654,42 @@ extern "C" fn prop_macros_set(
     }
 }
 
+/// `paramMacros` property getter (KAGParserEx extension): a real Dictionary
+/// whose values are Arrays of alternating parameter names and values.
+extern "C" fn prop_param_macros_get(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let entries = unsafe { state_of(instance) }.get_param_macros_entries();
+    match set_param_macros_dict_result(out, &entries) {
+        Ok(()) => 0,
+        Err(e) => error_out(out_error, &e),
+    }
+}
+
+/// `paramMacros` property setter. The reference marks the property
+/// read-only (registration is normally done with `@pmacro` or by mutating
+/// the returned Dictionary), but the task surface is read/write: the value
+/// is accepted in the same string form as `setParamMacros`.
+extern "C" fn prop_param_macros_set(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    value: *const Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: value follows the trampoline contract.
+    let s = match param_to_string(unsafe { &*value }) {
+        Ok(s) => s,
+        Err(e) => return error_out(_out_error, &e),
+    };
+    unsafe { state_of(instance) }.set_param_macros(decode_param_macros(&s));
+    0
+}
+
 /// `KAGParser()` — the constructor member. The tjs2-sys constructor
 /// dispatch creates+registers the native payload on script-subclass
 /// objects (the game's `class ScController extends KAGParser` calls
@@ -1662,6 +1826,14 @@ pub fn register_kagparser(engine: &Tjs2Engine) -> Result<(), String> {
                 f: native_set_macros,
             },
             NativeInstanceMethodDef {
+                name: "getParamMacros",
+                f: native_get_param_macros,
+            },
+            NativeInstanceMethodDef {
+                name: "setParamMacros",
+                f: native_set_param_macros,
+            },
+            NativeInstanceMethodDef {
                 name: "getMacroParams",
                 f: native_get_macro_params,
             },
@@ -1741,6 +1913,15 @@ pub fn register_kagparser(engine: &Tjs2Engine) -> Result<(), String> {
                 name: "macros",
                 get: Some(prop_macros_get),
                 set: Some(prop_macros_set),
+            },
+            // KAGParserEx extension: `paramMacros` maps a parameter name to
+            // the list of parameters it expands to. The reference exposes
+            // the live Dictionary read-only; the getter returns a real
+            // Dictionary of Arrays and the setter accepts the string form.
+            NativeInstancePropertyDef {
+                name: "paramMacros",
+                get: Some(prop_param_macros_get),
+                set: Some(prop_param_macros_set),
             },
             // Reference KAGParser.cpp:2484 / :2497: `macroParams` and its
             // short alias `mp` are read-only dictionary properties (the
@@ -2471,5 +2652,97 @@ mod tests {
              var n = 0; while (p.getNextTag() !== void) n++;",
         );
         assert_eq!(env.eval_ok("n > 0"), TjsValue::Integer(1));
+    }
+
+    // --- KAGParserEx extensions (script surface) --------------------------
+
+    #[test]
+    fn taglist_member_lists_members_in_order() {
+        let _vm_lock = vm_lock();
+        let env = TestEnv::new(
+            "taglist",
+            &[ks("test.ks", "Hi [bg storage=\"a.jpg\" loop]\n")],
+        );
+        env.exec_ok(
+            "var p = new KAGParser(); p.ignoreCR = true; p.loadScenario('test.ks'); \
+             var ch = p.getNextTag(); \
+             var bg = null; var t; \
+             while ((t = p.getNextTag()) !== void) { if (t.tagname == 'bg') bg = t; }",
+        );
+        // a `ch` tag: taglist = ["tagname", "text"]
+        assert_eq!(env.eval_ok("ch.taglist.count"), TjsValue::Integer(2));
+        assert_eq!(
+            env.eval_ok("ch.taglist[0]"),
+            TjsValue::String("tagname".into())
+        );
+        assert_eq!(
+            env.eval_ok("ch.taglist[1]"),
+            TjsValue::String("text".into())
+        );
+        // a real tag: taglist = ["tagname", <attr names in order>]
+        assert_eq!(env.eval_ok("bg.taglist.count"), TjsValue::Integer(3));
+        assert_eq!(
+            env.eval_ok("bg.taglist[0]"),
+            TjsValue::String("tagname".into())
+        );
+        assert_eq!(
+            env.eval_ok("bg.taglist[1]"),
+            TjsValue::String("storage".into())
+        );
+        assert_eq!(
+            env.eval_ok("bg.taglist[2]"),
+            TjsValue::String("loop".into())
+        );
+    }
+
+    #[test]
+    fn param_macros_register_expand_and_read_back() {
+        let _vm_lock = vm_lock();
+        let env = TestEnv::new(
+            "pmacro",
+            &[ks(
+                "test.ks",
+                "@pmacro name=mybg storage=\"base.png\" effect=1\n[draw mybg]\n",
+            )],
+        );
+        env.exec_ok(
+            "var p = new KAGParser(); p.loadScenario('test.ks'); \
+             var d = null; var t; \
+             while ((t = p.getNextTag()) !== void) { if (t.tagname == 'draw') d = t; } \
+             var pm = p.paramMacros; var arr = pm['mybg'];",
+        );
+        // the parameter macro was spliced into `[draw mybg]`
+        assert_eq!(
+            env.eval_ok("d.storage"),
+            TjsValue::String("base.png".into())
+        );
+        assert_eq!(env.eval_ok("d.effect"), TjsValue::String("1".into()));
+        // `paramMacros` is a real Dictionary of Arrays
+        assert_eq!(env.eval_ok("arr.count"), TjsValue::Integer(4));
+        assert_eq!(env.eval_ok("arr[0]"), TjsValue::String("storage".into()));
+        assert_eq!(env.eval_ok("arr[1]"), TjsValue::String("base.png".into()));
+        assert_eq!(env.eval_ok("arr[2]"), TjsValue::String("effect".into()));
+        assert_eq!(env.eval_ok("arr[3]"), TjsValue::String("1".into()));
+        // getParamMacros() method agrees with the property
+        env.exec_ok("var pm2 = p.getParamMacros(); var arr2 = pm2['mybg'];");
+        assert_eq!(env.eval_ok("arr2[0]"), TjsValue::String("storage".into()));
+    }
+
+    #[test]
+    fn emb_escape_false_expands_via_vm() {
+        let _vm_lock = vm_lock();
+        let env = TestEnv::new(
+            "embescape",
+            &[ks(
+                "test.ks",
+                "*start\n[emb exp=\"'[bg storage=x]'\" escape=false]!\n",
+            )],
+        );
+        env.exec_ok(
+            "var p = new KAGParser(); p.loadScenario('test.ks'); \
+             var bg = null; var t; \
+             while ((t = p.getNextTag()) !== void) { if (t.tagname == 'bg') bg = t; }",
+        );
+        assert_eq!(env.eval_ok("bg.storage"), TjsValue::String("x".into()));
     }
 }

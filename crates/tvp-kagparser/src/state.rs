@@ -157,6 +157,8 @@ enum Special {
     EndMacro,
     MacroPop,
     EraseMacro,
+    PMacro,
+    ErasePMacro,
     Jump,
     Call,
     Return,
@@ -175,6 +177,8 @@ fn special_kind(name: &str) -> Option<Special> {
         "endmacro" => Special::EndMacro,
         "macropop" => Special::MacroPop,
         "erasemacro" => Special::EraseMacro,
+        "pmacro" => Special::PMacro,
+        "erasepmacro" => Special::ErasePMacro,
         "jump" => Special::Jump,
         "call" => Special::Call,
         "return" => Special::Return,
@@ -210,7 +214,15 @@ pub struct KagParserState {
 
     // macro machinery
     macros: BTreeMap<String, String>,
-    macro_args: Vec<BTreeMap<String, String>>,
+    /// KAGParserEx parameter macros (`paramMacros`): macro name → ordered
+    /// `(parameter, value)` pairs. Registered by `@pmacro` (or the
+    /// `paramMacros` property) and spliced into a tag whenever one of its
+    /// parameter names matches a key.
+    param_macros: BTreeMap<String, Vec<(String, String)>>,
+    /// Active macro-argument levels, innermost last. Each level is an
+    /// ordered `(name, value)` list so `*` injection and the
+    /// `macroParams` property preserve source order.
+    macro_args: Vec<Vec<(String, String)>>,
     macro_args_base: usize,
     recording_macro: bool,
     recording_macro_name: String,
@@ -253,6 +265,7 @@ impl Default for KagParserState {
             cur_label: String::new(),
             cur_page: String::new(),
             macros: BTreeMap::new(),
+            param_macros: BTreeMap::new(),
             macro_args: Vec::new(),
             macro_args_base: 0,
             recording_macro: false,
@@ -505,6 +518,7 @@ impl KagParserState {
                 Event::Tag {
                     name,
                     params,
+                    macro_entity,
                     bracket,
                     line,
                 } => {
@@ -517,13 +531,15 @@ impl KagParserState {
                                 // the recording name.
                                 self.recording_macro_name.clear();
                             }
-                            self.record_tag(name, params);
+                            self.record_tag(name, params, *macro_entity);
                         }
                         self.advance_current();
                         continue;
                     }
                     self.advance_current();
-                    if let Some(out) = self.process_tag(name, params, *bracket, *line, env)? {
+                    if let Some(out) =
+                        self.process_tag(name, params, *macro_entity, *bracket, *line, env)?
+                    {
                         return Ok(Some(out));
                     }
                 }
@@ -663,33 +679,56 @@ impl KagParserState {
         &mut self,
         name: &str,
         params: &[(String, String)],
+        macro_entity: Option<usize>,
         bracket: Bracket,
         line: usize,
         env: &mut Environ<'_>,
     ) -> Result<Option<TagOutput>, String> {
         // --- attribute resolution + cond -------------------------------
+        //
+        // KAGParserEx evaluates every attribute through `EntryParam`, which
+        // first checks the `paramMacros` dictionary and recursively splices
+        // the registered `(name, value)` list before resolving `&`/`%`.
         let mut condition = true;
         let mut resolved: Vec<(String, String)> = Vec::new();
         let process_attrs = (!self.recording_macro && self.exclude_level == -1) || name == "elsif";
-        for (k, v) in params {
-            let mut value: Option<String> = Some(v.clone());
-            if process_attrs {
-                if let Some(rest) = v.strip_prefix('&') {
-                    value = (env.eval)(rest)?.to_string_repr();
-                } else if let Some(rest) = v.strip_prefix('%') {
-                    value = self.resolve_macro_arg(rest);
+        // The `*` marker splices the caller's macro arguments at its
+        // position. These values were already resolved when the calling tag
+        // was processed, so they are inserted verbatim (no `&`/`%` re-eval).
+        let inject = macro_entity.is_some() && !self.recording_macro && self.exclude_level == -1;
+        let injected: Option<Vec<(String, String)>> = if inject {
+            self.macro_args.last().cloned()
+        } else {
+            None
+        };
+        let mut pos = 0;
+        loop {
+            if inject
+                && macro_entity == Some(pos)
+                && let Some(args) = &injected
+            {
+                for (k, v) in args {
+                    if k != "tagname" {
+                        resolved.push((k.clone(), v.clone()));
+                    }
                 }
             }
-            if k == "cond" {
-                if process_attrs {
-                    let cond_str = value.unwrap_or_default();
-                    condition = (env.eval)(&cond_str)?.truthy();
-                }
-                continue;
+            if pos >= params.len() {
+                break;
             }
-            if let Some(value) = value {
-                resolved.push((k.clone(), value));
-            }
+            let (k, v) = &params[pos];
+            let (entity, macroarg, rest) = split_value_prefix(v);
+            self.entry_param(
+                k,
+                rest,
+                entity,
+                macroarg,
+                process_attrs,
+                &mut condition,
+                &mut resolved,
+                env,
+            )?;
+            pos += 1;
         }
 
         let special = if self.process_special_tags {
@@ -809,8 +848,21 @@ impl KagParserState {
                 } else {
                     let exp = self.exp_attr(&resolved)?;
                     let text = (env.eval)(&exp)?.to_string_repr().unwrap_or_default();
+                    // `escape` defaults to true. The reference converts the
+                    // attribute variant with `operator bool`, which for a
+                    // string is `AsInteger() != 0` — so `escape=false`,
+                    // `escape=0` and a bare flag all evaluate to false.
+                    let escape = match self.attr(&resolved, "escape") {
+                        Some(v) => parse_tjs_bool(v),
+                        None => true,
+                    };
+                    let events = if escape {
+                        vec![Event::Text { text, line }]
+                    } else {
+                        parse_inline_events(&text, line)?
+                    };
                     self.splice_stack.push(Splice {
-                        events: vec![Event::Text { text, line }],
+                        events,
                         event_pos: 0,
                         char_pos: 0,
                         line_r_after,
@@ -861,8 +913,74 @@ impl KagParserState {
                 }
                 return Ok(None);
             }
+            if special == Some(Special::PMacro) {
+                // `@pmacro name=<macro> p1=v1 p2=v2 ...` stores the
+                // remaining (already resolved / spliced) parameters as the
+                // macro's parameter list, excluding `name`.
+                let name = self.attr(&resolved, "name").unwrap_or_default().to_string();
+                let list: Vec<(String, String)> = resolved
+                    .iter()
+                    .filter(|(k, _)| k != "name")
+                    .cloned()
+                    .collect();
+                self.param_macros.insert(name, list);
+                return Ok(None);
+            }
+            if special == Some(Special::ErasePMacro) {
+                let name = self.attr(&resolved, "name").unwrap_or_default();
+                if self.param_macros.remove(name).is_none() {
+                    return Err(format!("Unknown macro \"{name}\""));
+                }
+                return Ok(None);
+            }
         }
         Ok(None)
+    }
+
+    /// The reference `EntryParam`: look the attribute up in `paramMacros`
+    /// and, when found, recursively splice each registered `(name, value)`
+    /// pair (resolving a leading `&`/`%` at run time); otherwise resolve the
+    /// value and append it to `resolved` (skipping `cond`, which is
+    /// consumed). Returns whether the attribute was stored.
+    #[allow(clippy::too_many_arguments)]
+    fn entry_param(
+        &self,
+        attribname: &str,
+        value: &str,
+        entity: bool,
+        macroarg: bool,
+        process_attrs: bool,
+        condition: &mut bool,
+        resolved: &mut Vec<(String, String)>,
+        env: &mut Environ<'_>,
+    ) -> Result<bool, String> {
+        if process_attrs && let Some(macro_list) = self.param_macros.get(attribname) {
+            for (name, param) in macro_list {
+                let (entity, macroarg, rest) = split_value_prefix(param);
+                self.entry_param(name, rest, entity, macroarg, true, condition, resolved, env)?;
+            }
+            return Ok(false);
+        }
+
+        let mut value_opt: Option<String> = Some(value.to_string());
+        if process_attrs {
+            if entity {
+                value_opt = (env.eval)(value)?.to_string_repr();
+            } else if macroarg {
+                value_opt = self.resolve_macro_arg(value);
+            }
+        }
+        if attribname == "cond" {
+            if process_attrs {
+                let cond_str = value_opt.unwrap_or_default();
+                *condition = (env.eval)(&cond_str)?.truthy();
+            }
+            return Ok(false);
+        }
+        if let Some(value) = value_opt {
+            resolved.push((attribname.to_string(), value));
+        }
+        Ok(true)
     }
 
     fn exp_attr(&self, resolved: &[(String, String)]) -> Result<String, String> {
@@ -901,26 +1019,30 @@ impl KagParserState {
     // -------------------------------------------------------------------
 
     /// `%name` / `%name|default` attribute value resolution against the
-    /// top macro-args dictionary (reference attribute processing). `None`
-    /// means "no value" (the attribute is omitted).
+    /// top macro-args list (reference attribute processing). `None` means
+    /// "no value" (the attribute is omitted).
     fn resolve_macro_arg(&self, rest: &str) -> Option<String> {
         if self.macro_args.is_empty() {
             // No macro arguments: the value is kept as-is (without `%`).
             return Some(rest.to_string());
         }
         let top = self.macro_args.last().expect("checked non-empty");
+        // Later entries win (the reference writes them into a dictionary
+        // in order).
+        let lookup = |name: &str| {
+            top.iter()
+                .rev()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+        };
         match rest.split_once('|') {
-            Some((name, default)) => top.get(name).cloned().or_else(|| Some(default.to_string())),
-            None => top.get(rest).cloned(),
+            Some((name, default)) => lookup(name).or_else(|| Some(default.to_string())),
+            None => lookup(rest),
         }
     }
 
     fn push_macro_args(&mut self, params: &[(String, String)]) {
-        let mut map = BTreeMap::new();
-        for (k, v) in params {
-            map.insert(k.clone(), v.clone());
-        }
-        self.macro_args.push(map);
+        self.macro_args.push(params.to_vec());
     }
 
     fn pop_macro_args(&mut self) -> Result<(), String> {
@@ -958,9 +1080,9 @@ impl KagParserState {
         }
     }
 
-    fn record_tag(&mut self, name: &str, params: &[(String, String)]) {
+    fn record_tag(&mut self, name: &str, params: &[(String, String)], macro_entity: Option<usize>) {
         self.recording_macro_str
-            .push_str(&reconstruct_tag(name, params));
+            .push_str(&reconstruct_tag(name, params, macro_entity));
     }
 
     // -------------------------------------------------------------------
@@ -1144,6 +1266,18 @@ impl KagParserState {
                 content.clone(),
             ));
         }
+        v.push((
+            "paramMacrosCount".into(),
+            self.param_macros.len().to_string(),
+        ));
+        for (i, (name, list)) in self.param_macros.iter().enumerate() {
+            v.push((format!("paramMacros.{i}.name"), name.clone()));
+            v.push((format!("paramMacros.{i}.count"), list.len().to_string()));
+            for (j, (k, val)) in list.iter().enumerate() {
+                v.push((format!("paramMacros.{i}.{j}.name"), k.clone()));
+                v.push((format!("paramMacros.{i}.{j}.value"), val.clone()));
+            }
+        }
         v.push(("callStackCount".into(), self.call_stack.len().to_string()));
         for (i, e) in self.call_stack.iter().enumerate() {
             v.push((format!("callStack.{i}.storage"), e.storage.clone()));
@@ -1261,7 +1395,7 @@ impl KagParserState {
             let depth = v as usize;
             for i in 0..depth {
                 let prefix = format!("macroArgs.{i}.");
-                let mut map = BTreeMap::new();
+                let mut list: Vec<(String, String)> = Vec::new();
                 let mut pending_name: Option<String> = None;
                 for (k, val) in &entries {
                     if let Some(rest) = k.strip_prefix(&prefix) {
@@ -1270,11 +1404,11 @@ impl KagParserState {
                         } else if rest.strip_suffix(".value").is_some()
                             && let Some(name) = pending_name.take()
                         {
-                            map.insert(name, val.clone());
+                            list.push((name, val.clone()));
                         }
                     }
                 }
-                self.macro_args.push(map);
+                self.macro_args.push(list);
             }
         }
         if let Some(v) = get_int("macroArgStackBase") {
@@ -1291,6 +1425,29 @@ impl KagParserState {
                 }
             }
             debug_assert_eq!(self.macros.len(), n);
+        }
+
+        // parameter macros
+        self.param_macros.clear();
+        if let Some(n) = get_int("paramMacrosCount") {
+            let n = n as usize;
+            for i in 0..n {
+                let name = get(&format!("paramMacros.{i}.name"))
+                    .unwrap_or("")
+                    .to_string();
+                let count = get_int(&format!("paramMacros.{i}.count")).unwrap_or(0) as usize;
+                let mut list = Vec::with_capacity(count);
+                for j in 0..count {
+                    let k = get(&format!("paramMacros.{i}.{j}.name"))
+                        .unwrap_or("")
+                        .to_string();
+                    let val = get(&format!("paramMacros.{i}.{j}.value"))
+                        .unwrap_or("")
+                        .to_string();
+                    list.push((k, val));
+                }
+                self.param_macros.insert(name, list);
+            }
         }
 
         // call stack
@@ -1437,14 +1594,26 @@ impl KagParserState {
         Ok(())
     }
 
-    /// The top macro-args dictionary (`macroParams`/`mp`), or `None` when
-    /// no macro arguments are on the stack (the reference returns void).
+    /// The `paramMacros` dictionary as ordered
+    /// `(macro name, alternating (param, value) list)` entries (for building
+    /// a real TJS Dictionary of Arrays).
+    pub fn get_param_macros_entries(&self) -> Vec<(String, Vec<(String, String)>)> {
+        self.param_macros
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
+    /// Replace the `paramMacros` dictionary.
+    pub fn set_param_macros(&mut self, entries: Vec<(String, Vec<(String, String)>)>) {
+        self.param_macros = entries.into_iter().collect();
+    }
+
     /// The top macro-args dictionary (`macroParams`/`mp`) as ordered
     /// `Vec<(name, value)>`, or `None` when no macro arguments are on the
     /// stack (the reference returns void).
     pub fn get_macro_params_entries(&self) -> Option<Vec<(String, String)>> {
-        let top = self.macro_args.last()?;
-        Some(top.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+        self.macro_args.last().cloned()
     }
 
     /// The top macro-args dictionary as kvp lines, or `None` when empty
@@ -1497,15 +1666,21 @@ fn extract_storage_name(name: &str) -> String {
 /// Reconstruct `[name key=value ...]` from parsed events for macro
 /// recording; values that would not re-parse as-is are double-quoted with
 /// backtick escapes.
-fn reconstruct_tag(name: &str, params: &[(String, String)]) -> String {
+fn reconstruct_tag(name: &str, params: &[(String, String)], macro_entity: Option<usize>) -> String {
     let mut s = String::with_capacity(16);
     s.push('[');
     s.push_str(name);
-    for (k, v) in params {
+    for (i, (k, v)) in params.iter().enumerate() {
+        if macro_entity == Some(i) {
+            s.push_str(" *");
+        }
         s.push(' ');
         s.push_str(k);
         s.push('=');
         s.push_str(&quote_value(v));
+    }
+    if macro_entity == Some(params.len()) {
+        s.push_str(" *");
     }
     s.push(']');
     s
@@ -1536,6 +1711,64 @@ fn parse_macro_content(content: &str) -> Result<Vec<Event>, String> {
     kag::parse(content)
         .map(|s| s.events)
         .map_err(|e| format!("{MSG_SYNTAX} ({e})"))
+}
+
+/// Split a leading `&` (entity) or `%` (macro argument) prefix from a
+/// value. A backtick marker kept by [`kag::parse`] suppresses the prefix so
+/// the value stays literal (`&foo` / `%foo`).
+fn split_value_prefix(s: &str) -> (bool, bool, &str) {
+    if let Some(rest) = s.strip_prefix('`')
+        && (rest.starts_with('&') || rest.starts_with('%'))
+    {
+        return (false, false, rest);
+    }
+    if let Some(rest) = s.strip_prefix('&') {
+        return (true, false, rest);
+    }
+    if let Some(rest) = s.strip_prefix('%') {
+        return (false, true, rest);
+    }
+    (false, false, s)
+}
+
+/// Convert an attribute value to a boolean the way `tTJSVariant::operator
+/// bool` does for a string: `AsInteger() != 0`. `escape=false` is false,
+/// `escape=1` is true, and a bare flag (value `"true"`) is false.
+fn parse_tjs_bool(v: &str) -> bool {
+    v.trim().parse::<f64>().map(|n| n != 0.0).unwrap_or(false)
+}
+
+/// Parse an `emb escape=false` result as an inline tag stream. The
+/// reference splices the raw text into the current line buffer, where
+/// `LineBufferUsing` keeps a leading `@` from starting a line command and
+/// `[` starts a real tag. We reproduce the `@` rule by parsing with a
+/// sentinel prefix and stripping it from the first text event.
+fn parse_inline_events(text: &str, line: usize) -> Result<Vec<Event>, String> {
+    if text.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut src = String::with_capacity(text.len() + 1);
+    src.push('\u{0}');
+    src.push_str(text);
+    let mut events = kag::parse(&src)
+        .map(|s| s.events)
+        .map_err(|e| format!("{MSG_SYNTAX} ({e})"))?;
+    if let Some(Event::Text { text: first, .. }) = events.first_mut()
+        && let Some(rest) = first.strip_prefix('\u{0}')
+    {
+        *first = rest.to_string();
+    }
+    for e in &mut events {
+        match e {
+            Event::Label { line: l, .. }
+            | Event::Text { line: l, .. }
+            | Event::Tag { line: l, .. }
+            | Event::Directive { line: l, .. }
+            | Event::Comment { line: l, .. } => *l = line,
+        }
+    }
+    events.retain(|e| !matches!(e, Event::Text { text, .. } if text.is_empty()));
+    Ok(events)
 }
 
 fn bool_str(b: bool) -> String {
@@ -1638,6 +1871,7 @@ fn encode_events(events: &[Event]) -> String {
             Event::Tag {
                 name,
                 params,
+                macro_entity,
                 bracket,
                 ..
             } => {
@@ -1648,6 +1882,11 @@ fn encode_events(events: &[Event]) -> String {
                 out.push_str(&params.len().to_string());
                 out.push(':');
                 out.push(if *bracket == Bracket::At { 'A' } else { 'S' });
+                out.push(':');
+                match macro_entity {
+                    Some(idx) => out.push_str(&idx.to_string()),
+                    None => out.push('-'),
+                }
                 for (k, v) in params {
                     out.push(';');
                     out.push_str(&escape_event_field(k));
@@ -1774,6 +2013,17 @@ fn decode_events(s: &str) -> Vec<Event> {
                 } else {
                     Bracket::Square
                 };
+                let (marker, n3b) = if i < chars.len() && chars[i] == ':' {
+                    i += 1;
+                    read_field(&chars, i)
+                } else {
+                    (String::new(), i)
+                };
+                i = n3b;
+                let macro_entity = match marker.as_str() {
+                    "" | "-" => None,
+                    s => s.parse().ok(),
+                };
                 let mut params = Vec::new();
                 for _ in 0..count {
                     if i < chars.len() && chars[i] == ';' {
@@ -1794,6 +2044,7 @@ fn decode_events(s: &str) -> Vec<Event> {
                 events.push(Event::Tag {
                     name,
                     params,
+                    macro_entity,
                     bracket,
                     line: 0,
                 });
@@ -1849,6 +2100,7 @@ mod event_codec_tests {
                     ("storage".into(), "a=b;c".into()),
                     ("loop".into(), "true".into()),
                 ],
+                macro_entity: None,
                 bracket: Bracket::At,
                 line: 0,
             },
@@ -1864,6 +2116,7 @@ mod event_codec_tests {
                 Event::Tag {
                     name: "a".into(),
                     params: vec![("x".into(), "1".into())],
+                    macro_entity: None,
                     bracket: Bracket::At,
                     line: 0,
                 },
@@ -2404,6 +2657,7 @@ mod tests {
                     ("storage".into(), "a=b;c".into()),
                     ("loop".into(), "true".into()),
                 ],
+                macro_entity: None,
                 bracket: Bracket::At,
                 line: 0,
             },
@@ -2526,6 +2780,134 @@ mod tests {
             let (name, params) = state.next_tag(env).unwrap().unwrap();
             assert_eq!(name, "motion");
             assert!(params.iter().any(|(k, v)| k == "path" && v == "abc"));
+        });
+    }
+
+    // --- KAGParserEx: paramMacros / @pmacro / @erasepmacro -----------------
+
+    #[test]
+    fn param_macro_registration_and_expansion() {
+        // `@pmacro` registers `mybg => [storage=base.png, effect=1]`; a later
+        // `@draw mybg` has its `mybg` parameter replaced by the list.
+        let mut h = Harness::new(&[(
+            "a.ks",
+            "@pmacro name=mybg storage=\"base.png\" effect=1\n@draw mybg\n",
+        )]);
+        let tags = h.walk("a.ks");
+        assert_eq!(
+            tags,
+            vec![tag("draw", &[("storage", "base.png"), ("effect", "1")])]
+        );
+    }
+
+    #[test]
+    fn param_macro_runtime_percent_expands_against_macro_args() {
+        // A backticked `%` in the registered value is kept literal at
+        // registration and resolved when the parameter macro is spliced into
+        // a `[macro]` expansion.
+        let mut h = Harness::new(&[(
+            "a.ks",
+            "@pmacro name=pos x=`%v\n[macro name=outer]\n@draw pos\n[endmacro]\n@outer v=42\n",
+        )]);
+        let tags = h.walk("a.ks");
+        let draw = tags.iter().find(|t| t.0 == "draw").expect("draw emitted");
+        assert_eq!(draw, &tag("draw", &[("x", "42")]));
+    }
+
+    #[test]
+    fn erase_param_macro_removes_registration() {
+        let mut h = Harness::new(&[(
+            "a.ks",
+            "@pmacro name=foo a=1\n@erasepmacro name=foo\n@tag foo\n",
+        )]);
+        let tags = h.walk("a.ks");
+        assert_eq!(tags, vec![tag("tag", &[("foo", "true")])]);
+    }
+
+    #[test]
+    fn erasing_an_unknown_param_macro_is_an_error() {
+        let mut h = Harness::new(&[("a.ks", "@erasepmacro name=nope\n")]);
+        let mut no_eval: fn(&str) -> Result<EvalResult, String> = no_eval;
+        h.with_env(&mut no_eval, |state, env| {
+            state.load_scenario("a.ks", env).unwrap();
+            let err = state.next_tag(env).unwrap_err();
+            assert!(err.contains("Unknown macro \"nope\""), "{err}");
+        });
+    }
+
+    #[test]
+    fn param_macros_round_trip_through_store_and_restore() {
+        let mut h = Harness::new(&[("a.ks", "@pmacro name=foo a=1 b=2\n@draw foo\n")]);
+        let mut no_eval: fn(&str) -> Result<EvalResult, String> = no_eval;
+        h.with_env(&mut no_eval, |state, env| {
+            state.load_scenario("a.ks", env).unwrap();
+            // Walking one tag processes the `@pmacro` and returns `draw`.
+            let t = state.next_tag(env).unwrap().unwrap();
+            assert_eq!(t, tag("draw", &[("a", "1"), ("b", "2")]));
+            let saved = state.store();
+            assert!(saved.contains("paramMacrosCount=1"), "{saved}");
+            let mut fresh = KagParserState::default();
+            fresh.restore(&saved, env).unwrap();
+            assert_eq!(
+                fresh.get_param_macros_entries(),
+                state.get_param_macros_entries()
+            );
+        });
+    }
+
+    // --- KAGParserEx: the macro `*` marker --------------------------------
+
+    #[test]
+    fn star_marker_injects_macro_args_and_keeps_preceding_params() {
+        // The KAGParserEx readme example: `[tag foo=bar * baz]` invoked as
+        // `[hoge fuga=piyo]` yields `[tag foo=bar fuga=piyo baz]` (the
+        // session's `kag` crate preserves pre-`*` parameters).
+        let mut h = Harness::new(&[(
+            "a.ks",
+            "[macro name=hoge]\n[tag foo=bar * baz]\n[endmacro]\n@hoge fuga=piyo\n",
+        )]);
+        let tags = h.walk("a.ks");
+        let t = tags.iter().find(|t| t.0 == "tag").expect("tag emitted");
+        assert_eq!(
+            t,
+            &tag("tag", &[("foo", "bar"), ("fuga", "piyo"), ("baz", "true")])
+        );
+    }
+
+    // --- KAGParserEx: emb escape ------------------------------------------
+
+    #[test]
+    fn emb_escape_false_parses_returned_tags() {
+        let mut h = Harness::new(&[("a.ks", "*start\n[emb exp=\"x\" escape=false]\n")]);
+        let mut ev = |_exp: &str| Ok(EvalResult::Str("[bg storage=x]".to_string()));
+        h.with_env(&mut ev, |state, env| {
+            state.load_scenario("a.ks", env).unwrap();
+            let tags: Vec<_> = std::iter::from_fn(|| state.next_tag(env).unwrap()).collect();
+            assert!(tags.contains(&tag("bg", &[("storage", "x")])), "{tags:?}");
+        });
+    }
+
+    #[test]
+    fn emb_escape_default_keeps_text_literal() {
+        let mut h = Harness::new(&[("a.ks", "*start\n[emb exp=\"x\"]!\n")]);
+        let mut ev = |_exp: &str| Ok(EvalResult::Str("[bg]".to_string()));
+        h.with_env(&mut ev, |state, env| {
+            state.load_scenario("a.ks", env).unwrap();
+            // The default is escape=true: the `[` is a literal character,
+            // not the start of a tag.
+            let t = state.next_tag(env).unwrap().unwrap();
+            assert_eq!(t, tag("ch", &[("text", "[")]));
+        });
+    }
+
+    #[test]
+    fn emb_escape_false_keeps_at_sign_as_text() {
+        let mut h = Harness::new(&[("a.ks", "*start\n[emb exp=\"x\" escape=false]!\n")]);
+        let mut ev = |_exp: &str| Ok(EvalResult::Str("@notatag".to_string()));
+        h.with_env(&mut ev, |state, env| {
+            state.load_scenario("a.ks", env).unwrap();
+            let t = state.next_tag(env).unwrap().unwrap();
+            assert_eq!(t, tag("ch", &[("text", "@")]));
         });
     }
 }

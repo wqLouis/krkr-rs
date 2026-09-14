@@ -42,8 +42,9 @@
 //! * `&`/`%` value prefixes (TJS expression / macro argument) are preserved
 //!   verbatim — this parser does not evaluate them.
 //! * A lone `*` where an attribute name is expected is the "macro entity
-//!   all" marker; it is consumed and not stored (the reference expands macro
-//!   arguments there).
+//!   all" marker. It is not stored as a parameter; its position is kept in
+//!   the `macro_entity` field of [`Event::Tag`] so KAGParserEx can splice
+//!   the caller's macro arguments in there during expansion.
 //! * In plain text, `[[` is an escape for a literal `[`; `[` otherwise
 //!   starts an inline tag. A stray `[` with no closing `]` is a syntax
 //!   error, matching the reference `TVPKAGSyntaxError`.
@@ -118,6 +119,12 @@ pub enum Event {
         /// Ordered attribute list, `(name, value)`. Flag attributes
         /// (`name` without `=`) carry the value `"true"`.
         params: Vec<(String, String)>,
+        /// Position (index into `params`) of the KAGParserEx `*`
+        /// "macro entity all" marker, when one is present. The marker is
+        /// *not* stored as a parameter; `Some(params.len())` means it was
+        /// the last token. KAGParserEx splices the caller's macro arguments
+        /// into the result at this position.
+        macro_entity: Option<usize>,
         bracket: Bracket,
         /// 1-based source line.
         line: usize,
@@ -367,6 +374,7 @@ fn parse_line(line: &str, lineno: usize, events: &mut Vec<Event>) -> Result<()> 
         events.push(Event::Tag {
             name: tag.name,
             params: tag.params,
+            macro_entity: tag.macro_entity,
             bracket: Bracket::At,
             line: lineno,
         });
@@ -389,6 +397,7 @@ fn parse_line(line: &str, lineno: usize, events: &mut Vec<Event>) -> Result<()> 
                 events.push(Event::Tag {
                     name: tag.name,
                     params: tag.params,
+                    macro_entity: tag.macro_entity,
                     bracket: Bracket::Square,
                     line: lineno,
                 });
@@ -423,6 +432,8 @@ fn flush_text(text: &mut String, lineno: usize, events: &mut Vec<Event>) {
 struct ParsedTag {
     name: String,
     params: Vec<(String, String)>,
+    /// See the `macro_entity` field of [`Event::Tag`].
+    macro_entity: Option<usize>,
     end: usize,
 }
 
@@ -472,6 +483,7 @@ fn parse_tag(chars: &[char], start: usize, bracket: Bracket, line: usize) -> Res
 
     // --- attributes -------------------------------------------------------
     let mut params = Vec::new();
+    let mut macro_entity: Option<usize> = None;
     loop {
         while !is_end(pos) && is_ws(chars[pos]) {
             pos += 1;
@@ -489,8 +501,12 @@ fn parse_tag(chars: &[char], start: usize, bracket: Bracket, line: usize) -> Res
             break; // tag ends
         }
         if chars[pos] == '*' {
-            // "macro entity all" marker: consumed, never stored (the
-            // reference expands macro arguments here).
+            // "macro entity all" marker: remembered by position but never
+            // stored as a parameter; KAGParserEx splices the caller's macro
+            // arguments in here during expansion.
+            if macro_entity.is_none() {
+                macro_entity = Some(params.len());
+            }
             pos += 1;
             while !is_end(pos) && is_ws(chars[pos]) {
                 pos += 1;
@@ -529,7 +545,12 @@ fn parse_tag(chars: &[char], start: usize, bracket: Bracket, line: usize) -> Res
     } else {
         pos
     };
-    Ok(ParsedTag { name, params, end })
+    Ok(ParsedTag {
+        name,
+        params,
+        macro_entity,
+        end,
+    })
 }
 
 /// Parse an attribute value; `pos` must point at the `=`.
@@ -621,7 +642,14 @@ fn parse_attrib_value(
 
 /// Remove backtick escapes from a raw attribute value: `` `a `` → `a`, and
 /// a trailing backtick is dropped (reference `_GetNextTag` value unescape).
+///
+/// A backtick that escapes a *leading* `&` or `%` is kept in the result as
+/// a one-character marker (`&foo`), so the state layer can tell an escaped
+/// entity/macro-argument prefix from an active one. The reference tracks the
+/// same distinction in separate `entity`/`macroarg` flags (the core
+/// `KAGParser.cpp` sets them before stripping backticks).
 fn unescape(value: &[char]) -> String {
+    let escaped_prefix = value.first() == Some(&'`');
     let mut out = String::with_capacity(value.len());
     let mut i = 0;
     while i < value.len() {
@@ -633,6 +661,9 @@ fn unescape(value: &[char]) -> String {
         }
         out.push(value[i]);
         i += 1;
+    }
+    if escaped_prefix && matches!(out.chars().next(), Some('&' | '%')) {
+        out.insert(0, '`');
     }
     out
 }
@@ -652,6 +683,7 @@ mod tests {
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
+            macro_entity: None,
             bracket,
             line,
         }
@@ -900,9 +932,71 @@ mod tests {
     fn macro_entity_marker_is_consumed() {
         assert_eq!(
             events("[x * a=1]"),
-            vec![tag("x", &[("a", "1")], Bracket::Square, 1)]
+            vec![Event::Tag {
+                name: "x".into(),
+                params: vec![("a".into(), "1".into())],
+                macro_entity: Some(0),
+                bracket: Bracket::Square,
+                line: 1,
+            }]
         );
-        assert_eq!(events("[x *]"), vec![tag("x", &[], Bracket::Square, 1)]);
+        assert_eq!(
+            events("[x *]"),
+            vec![Event::Tag {
+                name: "x".into(),
+                params: vec![],
+                macro_entity: Some(0),
+                bracket: Bracket::Square,
+                line: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn macro_entity_marker_records_its_position() {
+        // The marker is dropped from `params` but its index (where the
+        // caller's macro arguments are spliced) is preserved.
+        assert_eq!(
+            events("[tag foo=bar * baz]"),
+            vec![Event::Tag {
+                name: "tag".into(),
+                params: vec![("foo".into(), "bar".into()), ("baz".into(), "true".into()),],
+                macro_entity: Some(1),
+                bracket: Bracket::Square,
+                line: 1,
+            }]
+        );
+        assert_eq!(
+            events("[tag * foo=bar]"),
+            vec![Event::Tag {
+                name: "tag".into(),
+                params: vec![("foo".into(), "bar".into())],
+                macro_entity: Some(0),
+                bracket: Bracket::Square,
+                line: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn escaped_entity_and_macro_prefixes_keep_their_marker() {
+        // A backticked leading `&`/`%` is kept as a marker; the state layer
+        // strips it and treats the value literally.
+        let ev = events("[x a=`&expr b=`%arg]");
+        assert_eq!(
+            ev,
+            vec![tag(
+                "x",
+                &[("a", "`&expr"), ("b", "`%arg")],
+                Bracket::Square,
+                1
+            )]
+        );
+        // A backtick escaping anything else is still fully removed.
+        assert_eq!(
+            events("[x a=`plain]"),
+            vec![tag("x", &[("a", "plain")], Bracket::Square, 1)]
+        );
     }
 
     #[test]
