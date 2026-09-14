@@ -237,13 +237,34 @@ fn format_for_name(name: &str) -> Option<ImageFormat> {
 ///    extension still decodes.
 ///
 /// A failed decode is a real error — never a placeholder image.
+/// First bytes of `bytes` as hex, for decode-failure logs.
+fn byte_magic(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .take(16)
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 pub fn decode_image(name: &str, bytes: &[u8]) -> Result<DecodedImage, BitmapError> {
     if is_tlg_name(name) {
         match decode_tlg_bytes(name, bytes) {
             Ok(decoded) => return Ok(decoded),
-            Err(e) if crate::tlg::has_tlg_magic(bytes) => return Err(e),
+            Err(e) if crate::tlg::has_tlg_magic(bytes) => {
+                log::warn!(
+                    "image decode failed (TLG): name={name:?} bytes={} magic={} reason={e}",
+                    bytes.len(),
+                    byte_magic(bytes)
+                );
+                return Err(e);
+            }
             // A mislabeled file (e.g. `x.tlg` holding a PNG): fall through.
-            Err(_) => {}
+            Err(e) => {
+                log::debug!(
+                    "image decode: {name:?} has a .tlg name but no TLG magic ({e}); sniffing content"
+                );
+            }
         }
     }
 
@@ -256,17 +277,34 @@ pub fn decode_image(name: &str, bytes: &[u8]) -> Result<DecodedImage, BitmapErro
     }
 
     if crate::tlg::has_tlg_magic(bytes) {
-        return decode_tlg_bytes(name, bytes);
+        return decode_tlg_bytes(name, bytes).inspect_err(|e| {
+            log::warn!(
+                "image decode failed (TLG by magic): name={name:?} bytes={} magic={} reason={e}",
+                bytes.len(),
+                byte_magic(bytes)
+            );
+        });
     }
-    if let Ok(fmt) = image::guess_format(bytes)
-        && let Ok(img) = image::load_from_memory_with_format(bytes, fmt)
-    {
-        return Ok(DecodedImage::from_dynamic(img));
+    match image::guess_format(bytes) {
+        Ok(fmt) => match image::load_from_memory_with_format(bytes, fmt) {
+            Ok(img) => return Ok(DecodedImage::from_dynamic(img)),
+            Err(e) => ext_error = Some(e),
+        },
+        Err(e) => {
+            if ext_error.is_none() {
+                ext_error = Some(e);
+            }
+        }
     }
 
     let message = ext_error.map_or_else(
         || "not a recognized image (no extension hint and no known magic bytes)".to_string(),
         |e| e.to_string(),
+    );
+    log::warn!(
+        "image decode failed: name={name:?} bytes={} magic={} reason={message}",
+        bytes.len(),
+        byte_magic(bytes)
     );
     Err(BitmapError::Decode(name.to_string(), message))
 }
@@ -278,6 +316,20 @@ fn decode_tlg_bytes(name: &str, bytes: &[u8]) -> Result<DecodedImage, BitmapErro
         .map_err(|e| BitmapError::Decode(name.to_string(), e))
 }
 
+/// Read an image's bytes from storage, logging a warning when the storage
+/// lookup/read fails so a missing or unreadable resource is traceable in the
+/// log even when the script swallows the resulting exception.
+fn read_storage_bytes(storage: &mut Storage, resolved: &str) -> Result<Vec<u8>, BitmapError> {
+    storage.read(resolved).map_err(|e| {
+        let err = match e {
+            engine::storage::ReadError::NotFound(n) => BitmapError::NotFound(n),
+            other => BitmapError::Read(resolved.to_string(), other.to_string()),
+        };
+        log::warn!("image storage read failed: name={resolved:?} reason={err}");
+        err
+    })
+}
+
 /// Resolve, read and decode a storage image without touching the scene.
 /// Used by the async loader's background thread, which must not mutate the
 /// scene (only the VM thread does that).
@@ -286,10 +338,7 @@ pub fn read_and_decode_from_storage(
     name: &str,
 ) -> Result<(String, DecodedImage), BitmapError> {
     let resolved = resolve_storage_name(storage, name)?;
-    let bytes = storage.read(&resolved).map_err(|e| match e {
-        engine::storage::ReadError::NotFound(n) => BitmapError::NotFound(n),
-        other => BitmapError::Read(resolved.clone(), other.to_string()),
-    })?;
+    let bytes = read_storage_bytes(storage, &resolved)?;
     let decoded = decode_image(&resolved, &bytes)?;
     Ok((resolved, decoded))
 }
@@ -371,10 +420,7 @@ pub fn load_bitmap_into_storage(
         return Ok(id);
     }
 
-    let bytes = storage.read(&resolved).map_err(|e| match e {
-        engine::storage::ReadError::NotFound(n) => BitmapError::NotFound(n),
-        other => BitmapError::Read(resolved.clone(), other.to_string()),
-    })?;
+    let bytes = read_storage_bytes(storage, &resolved)?;
 
     let decoded = decode_image(&resolved, &bytes)?;
 
@@ -409,10 +455,7 @@ pub fn load_image_header(
     name: &str,
 ) -> Result<(u32, u32, bool), BitmapError> {
     let resolved = resolve_storage_name(storage, name)?;
-    let bytes = storage.read(&resolved).map_err(|e| match e {
-        engine::storage::ReadError::NotFound(n) => BitmapError::NotFound(n),
-        other => BitmapError::Read(resolved.clone(), other.to_string()),
-    })?;
+    let bytes = read_storage_bytes(storage, &resolved)?;
     let decoded = decode_image(&resolved, &bytes)?;
     Ok((decoded.width, decoded.height, decoded.has_alpha))
 }

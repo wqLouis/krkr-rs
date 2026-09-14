@@ -191,7 +191,7 @@ fn read_video_file(name: &str) -> Result<Vec<u8>, String> {
         match Storage::mount(&dir) {
             Ok(storage) => *slot = Some((dir.clone(), Arc::new(Mutex::new(storage)))),
             Err(e) => {
-                log::debug!(
+                log::warn!(
                     "VideoOverlay: cannot mount game storage at {}: {e}",
                     dir.display()
                 );
@@ -205,6 +205,7 @@ fn read_video_file(name: &str) -> Result<Vec<u8>, String> {
             return Ok(bytes);
         }
     }
+    log::warn!("VideoOverlay.open: cannot read {name:?} from any mounted storage");
     Err(format!("VideoOverlay.open: cannot open {name:?}"))
 }
 
@@ -1620,7 +1621,7 @@ extern "C" fn vo_open(
     let decoder = match video::MovieDecoder::open(bytes) {
         Ok(decoder) => Some(decoder),
         Err(e) => {
-            log::debug!("VideoOverlay.open({file:?}): ffmpeg could not open the media: {e}");
+            log::warn!("VideoOverlay.open({file:?}): media decode failed: {e}");
             None
         }
     };

@@ -220,7 +220,10 @@ impl AudioTrack {
             }
             let result = decode_audio_arc(&bytes, &worker_name)
                 .map(Arc::new)
-                .map_err(|e| e.to_string());
+                .map_err(|e| {
+                    log::warn!("audio decode failed: {worker_name}: {e}");
+                    e.to_string()
+                });
             let _ = worker_slot.set(result);
         });
         if !ok {
@@ -536,7 +539,9 @@ pub fn open_track(
         let mut storage = storage
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let bytes = storage.read(name)?;
+        let bytes = storage.read(name).inspect_err(|e| {
+            log::warn!("audio storage read failed: name={name:?} reason={e}");
+        })?;
         // The reference `Open` transparently reads `<storagename>.sli`
         // (WaveImpl.cpp `Open`); the game's BGM loop points live there.
         let sli_bytes = storage.read(&format!("{name}.sli")).ok();

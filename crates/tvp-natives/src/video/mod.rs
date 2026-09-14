@@ -351,7 +351,7 @@ impl MovieDecoder {
             video.decoder.flush();
         }
         if let Err(e) = decoder.present_at(0) {
-            log::debug!("video: could not present the first frame: {e}");
+            log::warn!("video: could not decode/present the first frame: {e}");
         }
         Ok(decoder)
     }
