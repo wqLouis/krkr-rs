@@ -45,6 +45,12 @@ struct TimerState {
     last_now_ms: u64,
     /// How many times the timer has fired.
     count: u64,
+    /// Event delivery mode (`tTVPAsyncTriggerMode`, `EventIntf.h:312`):
+    /// `atmNormal` = 0, `atmExclusive` = 1, `atmAtIdle` = 2. The reference
+    /// `tTJSNI_BaseTimer` stores it (`TimerIntf.h:39`) and uses it to tag the
+    /// posted `onTimer` event; with no event queue the mode is retained but
+    /// does not change the synchronous dispatch performed by [`timer_poll`].
+    mode: i64,
 }
 
 /// Payload of one script-visible `Timer` object.
@@ -115,6 +121,7 @@ extern "C" fn timer_ctor(
             next_fire_ms: 0,
             last_now_ms: 0,
             count: 0,
+            mode: 0,
         },
     );
     drop(timers);
@@ -311,6 +318,49 @@ extern "C" fn timer_capacity_set(
     0
 }
 
+/// `timer.mode` — event delivery mode (`tTVPAsyncTriggerMode`, reference
+/// `TimerIntf.cpp:240`). `tTJSNI_BaseTimer` stores the raw enum value; the
+/// setter casts without validation, so any integer round-trips.
+extern "C" fn timer_mode_get(
+    _engine: *mut std::ffi::c_void,
+    instance: *mut std::ffi::c_void,
+    out: *mut tjs2_sys::Value,
+    _out_error: *mut *mut std::ffi::c_char,
+    _objthis: *mut std::ffi::c_void,
+) -> std::ffi::c_int {
+    // SAFETY: instance is a valid TimerInst.
+    let inst = unsafe { instance_ref::<TimerInst>(instance) };
+    let timers = TIMERS.lock().unwrap_or_else(|p| p.into_inner());
+    let mode = timers.get(&inst.id).map(|t| t.mode).unwrap_or(0);
+    drop(timers);
+    // SAFETY: out is a valid return slot.
+    unsafe {
+        (*out).ty = tjs2_sys::VAL_INTEGER;
+        (*out).integer = mode;
+    }
+    0
+}
+
+extern "C" fn timer_mode_set(
+    _engine: *mut std::ffi::c_void,
+    instance: *mut std::ffi::c_void,
+    value: *const tjs2_sys::Value,
+    _out_error: *mut *mut std::ffi::c_char,
+    _objthis: *mut std::ffi::c_void,
+) -> std::ffi::c_int {
+    // SAFETY: instance is a valid TimerInst; value is a valid value slot.
+    let inst = unsafe { instance_ref::<TimerInst>(instance) };
+    let v = unsafe { &*value };
+    let mut timers = TIMERS.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(t) = timers.get_mut(&inst.id) {
+        // Reference `SetMode` casts the raw integer to the enum with no
+        // validation (`TimerIntf.cpp:249`).
+        t.mode = arg_i64(v);
+    }
+    0
+}
+
+/// `timer.count` — how many times the timer has fired (read-only).
 extern "C" fn timer_count_get(
     _engine: *mut std::ffi::c_void,
     instance: *mut std::ffi::c_void,
@@ -400,6 +450,11 @@ pub(crate) fn register_timer(engine: &Tjs2Engine) -> Result<(), String> {
                 name: "count",
                 get: Some(timer_count_get),
                 set: None,
+            },
+            NativeInstancePropertyDef {
+                name: "mode",
+                get: Some(timer_mode_get),
+                set: Some(timer_mode_set),
             },
         ],
     })?;
@@ -579,5 +634,24 @@ pub(crate) fn timer_poll(engine: &Tjs2Engine, now_ms: u64) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::natives::tests::TestEnv;
+
+    /// `Timer.mode` stores the raw `tTVPAsyncTriggerMode` value and round-trips
+    /// it, like the reference `tTJSNI_BaseTimer` (`TimerIntf.cpp:240`); the
+    /// setter casts without validation.
+    #[test]
+    fn timer_mode_property_round_trips() {
+        let env = TestEnv::new("timer-mode");
+        env.run("var t = new Timer(function() {}, '');").unwrap();
+        assert_eq!(env.eval_int("t.mode"), 0, "atmNormal is the default");
+        env.run("t.mode = 2;").unwrap();
+        assert_eq!(env.eval_int("t.mode"), 2, "atmAtIdle");
+        env.run("t.mode = 9;").unwrap();
+        assert_eq!(env.eval_int("t.mode"), 9, "raw values round-trip");
     }
 }
