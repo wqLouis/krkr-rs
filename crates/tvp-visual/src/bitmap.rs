@@ -4,14 +4,23 @@
 //! `Bitmap(width, height)` / `Bitmap.load(name)` / `Bitmap.loadAsync(name)`
 //! (`reference/cpp/core/visual/BitmapIntf.cpp`,
 //! `reference/cpp/core/visual/GraphicsLoaderIntf.cpp`): game image files
-//! (`.webp` / `.png` / `.jpg` / `.jpeg` / `.bmp` / `.dib` / `.tlg` /
-//! `.tlg5` / `.tlg6`) read from game storage are decoded to RGBA8 and
-//! registered in the [`scene::Scene`] bitmap table.
+//! read from game storage are decoded to RGBA8 and registered in the
+//! [`scene::Scene`] bitmap table.
+//!
+//! Supported load formats — the reference's decodable core spellings plus
+//! the common extras enabled in `Cargo.toml`:
+//! * native TLG (via [`crate::tlg`]): `.tlg` / `.tlg5` / `.tlg6`;
+//! * `image`-crate decoders: `.png`, `.jpg` / `.jpeg` / `.jif`,
+//!   `.bmp` / `.dib`, `.webp` (lossy **and** lossless), `.gif`, `.tif` /
+//!   `.tiff`, `.tga`, `.dds`, `.pnm`, `.ico`, `.qoi`, `.hdr`, `.exr`, `.ff`.
 //!
 //! The reference routes purely by **magic bytes** in `TVPLoadGraphicRouter`
 //! (with extension-based handler lookup); we detect by extension first and
 //! fall back to magic sniffing, matching the router's effective behavior
 //! for the formats the `image` crate (plus [`crate::tlg`]) can decode.
+//! Undecodable reference handlers (`.pvr`, `.jxr`, `.bpg`) and AVIF are
+//! deliberately absent: `image`'s pure-Rust `avif` feature is encoder-only,
+//! and its AVIF decoder (`avif-native`) needs the system `dav1d` library.
 //!
 //! Bitmap contents are always straight-alpha RGBA8 in this crate (the
 //! renderer's contract); the reference's internal 0xAARRGGBB memory layout
@@ -107,13 +116,15 @@ fn normalize_storage_name(name: &str) -> String {
 ///
 /// The reference's `TVPFindGraphicLoadHandler` appends each registered
 /// extension and returns the first storage hit; the handler table is
-/// registered in the order `.pvr .jxr .bpg .webp .bmp .dib .jpeg .jpg
-/// .jif .png .tlg .tlg5 .tlg6`. Formats this crate cannot decode are
-/// omitted from the probe so a miss surfaces as a decode error instead of
-/// resolving to an unsupported file. `""` is first so an explicit
-/// extension always wins.
-const EXTENSION_PROBE: [&str; 9] = [
-    "", ".webp", ".png", ".jpg", ".jpeg", ".jif", ".bmp", ".dib", ".tlg",
+/// registered in the order (`GraphicsLoaderIntf.cpp:160-210`)
+/// `.pvr .jxr .bpg .webp .bmp .dib .jpeg .jpg .jif .png .tlg .tlg5 .tlg6`.
+/// Formats this crate cannot decode are omitted. The reference core order is
+/// preserved for the formats we support; common extras follow afterwards so
+/// a core format always wins a name collision. `""` is first so an explicit
+/// extension in the query always wins.
+const EXTENSION_PROBE: [&str; 22] = [
+    "", ".webp", ".bmp", ".dib", ".jpeg", ".jpg", ".jif", ".png", ".tlg", ".tlg5", ".tlg6", ".gif",
+    ".tif", ".tiff", ".tga", ".dds", ".pnm", ".ico", ".qoi", ".hdr", ".exr", ".ff",
 ];
 
 /// All TLG spellings the reference registers.
@@ -213,28 +224,58 @@ fn format_for_name(name: &str) -> Option<ImageFormat> {
 
 /// Decode image bytes into RGBA8.
 ///
-/// TLG (`.tlg`/`.tlg5`/`.tlg6`) is routed to [`crate::tlg::decode_tlg`];
-/// everything else goes through the `image` crate, preferring the format
-/// implied by the file extension and falling back to magic-byte sniffing
-/// (the reference itself routes purely by magic bytes in
-/// `TVPLoadGraphicRouter`). A failed TLG decode is a real error — never a
-/// placeholder image.
+/// Resolution order mirrors the reference's magic-byte router
+/// (`TVPLoadGraphicRouter`, `GraphicsLoaderIntf.cpp:50`) with the extension
+/// used as the primary handler hint:
+/// 1. an explicit TLG spelling (`.tlg`/`.tlg5`/`.tlg6`) → [`crate::tlg`];
+///    a corrupt real TLG reports its decode error, a *mislabeled* non-TLG
+///    file falls through,
+/// 2. the format implied by the extension (disambiguates weak-magic formats
+///    like TGA),
+/// 3. content detection: TLG magic first (the `image` crate cannot sniff
+///    it), then `image::guess_format`'s magic table — so a wrong or missing
+///    extension still decodes.
+///
+/// A failed decode is a real error — never a placeholder image.
 pub fn decode_image(name: &str, bytes: &[u8]) -> Result<DecodedImage, BitmapError> {
     if is_tlg_name(name) {
-        return crate::tlg::decode_tlg_with_info(bytes)
-            .map(|(img, has_alpha)| DecodedImage::from_rgba(img, has_alpha))
-            .map_err(|e| BitmapError::Decode(name.to_string(), e));
+        match decode_tlg_bytes(name, bytes) {
+            Ok(decoded) => return Ok(decoded),
+            Err(e) if crate::tlg::has_tlg_magic(bytes) => return Err(e),
+            // A mislabeled file (e.g. `x.tlg` holding a PNG): fall through.
+            Err(_) => {}
+        }
     }
-    if let Some(fmt) = format_for_name(name)
+
+    let mut ext_error = None;
+    if let Some(fmt) = format_for_name(name) {
+        match image::load_from_memory_with_format(bytes, fmt) {
+            Ok(img) => return Ok(DecodedImage::from_dynamic(img)),
+            Err(e) => ext_error = Some(e),
+        }
+    }
+
+    if crate::tlg::has_tlg_magic(bytes) {
+        return decode_tlg_bytes(name, bytes);
+    }
+    if let Ok(fmt) = image::guess_format(bytes)
         && let Ok(img) = image::load_from_memory_with_format(bytes, fmt)
     {
         return Ok(DecodedImage::from_dynamic(img));
     }
-    let fmt = image::guess_format(bytes)
-        .map_err(|e| BitmapError::Decode(name.to_string(), e.to_string()))?;
-    image::load_from_memory_with_format(bytes, fmt)
-        .map(DecodedImage::from_dynamic)
-        .map_err(|e| BitmapError::Decode(name.to_string(), e.to_string()))
+
+    let message = ext_error.map_or_else(
+        || "not a recognized image (no extension hint and no known magic bytes)".to_string(),
+        |e| e.to_string(),
+    );
+    Err(BitmapError::Decode(name.to_string(), message))
+}
+
+/// Decode bytes as TLG5/TLG6, returning RGBA8 plus the alpha descriptor.
+fn decode_tlg_bytes(name: &str, bytes: &[u8]) -> Result<DecodedImage, BitmapError> {
+    crate::tlg::decode_tlg_with_info(bytes)
+        .map(|(img, has_alpha)| DecodedImage::from_rgba(img, has_alpha))
+        .map_err(|e| BitmapError::Decode(name.to_string(), e))
 }
 
 /// Resolve, read and decode a storage image without touching the scene.
@@ -545,13 +586,77 @@ mod tests {
     }
 
     #[test]
-    fn format_for_name_maps_reference_spellings() {
+    fn format_for_name_maps_reference_spellings_and_extras() {
         assert_eq!(format_for_name("a.jpg"), Some(ImageFormat::Jpeg));
         assert_eq!(format_for_name("a.jif"), Some(ImageFormat::Jpeg));
         assert_eq!(format_for_name("a.bmp"), Some(ImageFormat::Bmp));
         assert_eq!(format_for_name("a.dib"), Some(ImageFormat::Bmp));
         assert_eq!(format_for_name("a.png"), Some(ImageFormat::Png));
+        assert_eq!(format_for_name("a.webp"), Some(ImageFormat::WebP));
+        assert_eq!(format_for_name("a.gif"), Some(ImageFormat::Gif));
+        assert_eq!(format_for_name("a.tif"), Some(ImageFormat::Tiff));
+        assert_eq!(format_for_name("a.tiff"), Some(ImageFormat::Tiff));
+        assert_eq!(format_for_name("a.tga"), Some(ImageFormat::Tga));
+        assert_eq!(format_for_name("a.dds"), Some(ImageFormat::Dds));
+        assert_eq!(format_for_name("a.pnm"), Some(ImageFormat::Pnm));
+        assert_eq!(format_for_name("a.ico"), Some(ImageFormat::Ico));
+        assert_eq!(format_for_name("a.qoi"), Some(ImageFormat::Qoi));
+        assert_eq!(format_for_name("a.hdr"), Some(ImageFormat::Hdr));
+        assert_eq!(format_for_name("a.exr"), Some(ImageFormat::OpenExr));
+        assert_eq!(format_for_name("a.ff"), Some(ImageFormat::Farbfeld));
         assert_eq!(format_for_name("a.tlg"), None, "TLG is routed separately");
+        assert_eq!(format_for_name("a.tlg5"), None, "TLG is routed separately");
+        assert_eq!(format_for_name("a.tlg6"), None, "TLG is routed separately");
+    }
+
+    #[test]
+    fn extension_probe_covers_reference_core_set() {
+        // The reference handler table order (`GraphicsLoaderIntf.cpp:160-210`)
+        // with the undecodable formats removed; every remaining core spelling
+        // must be probed.
+        for ext in [
+            ".webp", ".bmp", ".dib", ".jpeg", ".jpg", ".jif", ".png", ".tlg", ".tlg5", ".tlg6",
+        ] {
+            assert!(EXTENSION_PROBE.contains(&ext), "missing core probe {ext}");
+        }
+        for ext in [
+            ".gif", ".tif", ".tiff", ".tga", ".dds", ".pnm", ".ico", ".qoi", ".hdr", ".exr", ".ff",
+        ] {
+            assert!(EXTENSION_PROBE.contains(&ext), "missing extra probe {ext}");
+        }
+    }
+
+    #[test]
+    fn decode_image_uses_magic_when_extension_is_wrong_or_missing() {
+        // A PNG named without an extension and with a bogus extension must
+        // still decode via `guess_format`.
+        let (w, h) = (6u32, 4u32);
+        let rgba = pattern(w, h);
+        let png = {
+            use image::ImageEncoder;
+            let mut out = Vec::new();
+            image::codecs::png::PngEncoder::new(&mut out)
+                .write_image(&rgba, w, h, image::ExtendedColorType::Rgba8)
+                .unwrap();
+            out
+        };
+        let no_ext = decode_image("mystery", &png).expect("magic fallback (no extension)");
+        assert_eq!((no_ext.width, no_ext.height), (w, h));
+        let wrong_ext =
+            decode_image("mystery.dat", &png).expect("magic fallback (wrong extension)");
+        assert_eq!((wrong_ext.width, wrong_ext.height), (w, h));
+    }
+
+    #[test]
+    fn decode_image_routes_mislabeled_tlg_by_magic() {
+        // A TLG named `.tlg` and a TLG named `.png` both decode via the TLG
+        // magic (the latter proves the name is not trusted over the bytes).
+        let bytes = include_bytes!("../tests/fixtures/frm_0303a.tlg");
+        assert!(crate::tlg::has_tlg_magic(bytes));
+        for name in ["real.tlg", "mislabeled.png", "no_extension"] {
+            let decoded = decode_image(name, bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!((decoded.width, decoded.height), (280, 200), "{name}");
+        }
     }
 
     #[test]

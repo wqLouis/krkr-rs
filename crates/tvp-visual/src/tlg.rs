@@ -73,6 +73,30 @@ pub fn decode_tlg_with_info(bytes: &[u8]) -> Result<(RgbaImage, bool), String> {
     Err("not a TLG5/TLG6 image (bad magic)".into())
 }
 
+/// Content-based detection: true if `bytes` begins with a TLG5/TLG6 magic,
+/// directly or inside a TLG0.0 `sds` wrapper. Used by the image pipeline's
+/// magic-byte fallback (the `image` crate has no TLG detector), so a TLG file
+/// with a wrong or missing extension still decodes.
+pub fn has_tlg_magic(bytes: &[u8]) -> bool {
+    if bytes.len() >= 11 && bytes[..11] == SDS_MAGIC {
+        if bytes.len() < 15 {
+            return false;
+        }
+        let rawlen = i32::from_le_bytes(match bytes[11..15].try_into() {
+            Ok(b) => b,
+            Err(_) => return false,
+        });
+        if rawlen < 11 {
+            return false;
+        }
+        let start = 15usize;
+        return bytes
+            .get(start..start + 11)
+            .is_some_and(|raw| raw == TLG5_MAGIC || raw == TLG6_MAGIC);
+    }
+    bytes.len() >= 11 && (bytes[..11] == TLG5_MAGIC || bytes[..11] == TLG6_MAGIC)
+}
+
 /// Strip the optional TLG0.0 SDS wrapper, returning the raw TLG payload.
 fn strip_sds(bytes: &[u8]) -> Result<&[u8], String> {
     if bytes.len() >= 11 && bytes[..11] == SDS_MAGIC {

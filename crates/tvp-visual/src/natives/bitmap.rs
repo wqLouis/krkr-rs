@@ -1223,11 +1223,17 @@ pub(crate) fn register_bitmap(engine: &Tjs2Engine) -> Result<(), String> {
 }
 
 // NOTE: `loadHeader` and `getSaveOption` are static in the reference
-// (`BitmapIntf.cpp` `TJS_END_NATIVE_STATIC_METHOD_DECL`), i.e.
-// `Bitmap.loadHeader(name)`. The tjs2-sys ABI's instance class registration
-// has no static-member flag, so they are registered as instance methods
-// (they ignore the receiver). A follow-up ABI addition should register them
-// as `TJS_STATICMEMBER` so the static call form works too.
+// (`BitmapIntf.cpp:378` / `:403`, closed with `TJS_END_NATIVE_STATIC_METHOD_DECL`),
+// i.e. scripts call them as `Bitmap.loadHeader(name)` /
+// `Bitmap.getSaveOption(type)`. Our tjs2-sys ABI registers `Bitmap` through
+// `register_native_class_instance`, whose member table has no static-member
+// flag (static members go through the separate `register_native_class`
+// path), so they are registered as *instance* methods that ignore the
+// receiver: `new Bitmap().loadHeader(name)` works, but the reference's
+// static form fails with "native instance method called on an object that
+// is not an instance of this native class". A follow-up tjs2-sys ABI
+// addition (a `TJS_STATICMEMBER` flag on instance-class methods) is needed
+// to make the static spelling work; it cannot be done inside `tvp-visual`.
 //
 // `save` intentionally does not implement the reference's TLG/TLG5/TLG6
 // writer (there is no TLG encoder in this crate); it throws
