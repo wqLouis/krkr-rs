@@ -40,6 +40,22 @@
 //!   `setTransitionCompleteCall` fires when a non-looping stream (or a
 //!   segment loop wrap) completes.
 //!
+//! # Mixing layer (`vomMixer`)
+//!
+//! `setMixingLayer(layer)` / `resetMixingLayer()` are real. The argument is
+//! validated as a `Layer` through its `nativeId` (the reference throws
+//! `TVPSpecifyLayer` otherwise) and its `visible`/`opacity` are resolved
+//! exactly like `tTJSNI_VideoOverlay::SetMixingLayer` (`VideoOvlImpl.cpp:882`):
+//! a null or non-visible layer clears the mixing bitmap, otherwise the object
+//! is retained and its opacity remembered. While a mixing layer is set, every
+//! presented frame is composited over that layer's MainImage (read through
+//! the reference `mainImageBuffer`/`mainImageBufferPitch` plugin ABI,
+//! `LayerIntf.cpp:3005`) and the `mixingMovieBGColor` base at
+//! `mixingMovieAlpha` — the `vomMixer` output. The result is held in this
+//! native's frame buffer and is observable through `frameBytes` /
+//! `frameChecksum`; uploading it to the script `layer1` scene is still
+//! render-side (see below).
+//!
 //! # Remaining gap (layer attachment / audio device)
 //!
 //! The decoded frame is held in this native's own layer bitmap and surfaced
@@ -388,6 +404,39 @@ struct ActionOwner {
     _keepalive: DetachedValue,
 }
 
+/// One `setMixingLayer` target: the retained Layer object and the opacity it
+/// had when the call was made. The reference
+/// `tTJSNI_VideoOverlay::SetMixingLayer` (`VideoOvlImpl.cpp:882`) resolves
+/// the layer's `GetMainImage()` and `GetOpacity()/255` once and hands them to
+/// the platform video player with `SetMixingBitmap`; this mirrors that.
+struct MixingLayer {
+    /// Keeps the Layer TJS object alive while the overlay references it.
+    keepalive: DetachedValue,
+    /// Engine-internal layer id (the Layer `nativeId` property); the render
+    /// side can resolve this to the scene layer if it wants to draw it.
+    id: u32,
+    /// `opacity / 255` at call time (`0.0..=1.0`).
+    alpha: f64,
+}
+
+/// A copy of a mixing layer's MainImage RGBA pixels. The reference passes the
+/// layer's live image pointer to the video player; krkr-rs copies it once per
+/// presented frame because tvp-natives cannot hold the tvp-visual scene lock
+/// across the crate boundary.
+struct MixingBackground {
+    width: usize,
+    height: usize,
+    /// Bytes per source row (the layer bitmap's pitch, `width * 4` for a
+    /// tightly packed RGBA8 image or more when an image window is narrower
+    /// than the bitmap).
+    pitch: usize,
+    rgba: Vec<u8>,
+}
+
+/// Largest layer dimension accepted when reading a mixing bitmap; guards the
+/// raw-pointer read against a bogus `imageWidth`/`imageHeight`.
+const MAX_MIXING_DIM: i64 = 16384;
+
 struct VideoOverlayInst {
     // rectangle / visibility
     left: i64,
@@ -429,6 +478,9 @@ struct VideoOverlayInst {
     /// the first frame. Used to fire the event only when the frame advances.
     last_frame_update: i64,
     transition_call: Option<DetachedValue>,
+    /// `setMixingLayer` state; `None` means no mixing bitmap
+    /// (`resetMixingLayer` / a non-visible or null argument).
+    mixing_layer: Option<MixingLayer>,
 
     // real decoding (FFmpeg) and the presented layer bitmap
     /// Decoder for the currently-open movie (`None` for unparsed files).
@@ -482,6 +534,7 @@ impl Default for VideoOverlayInst {
             action_owner: None,
             last_frame_update: -1,
             transition_call: None,
+            mixing_layer: None,
             decoder: None,
             frame: None,
             mode: 0,
@@ -489,7 +542,7 @@ impl Default for VideoOverlayInst {
             audio_volume: 0,
             enabled_audio_stream: 0,
             enabled_video_stream: 0,
-            mixing_alpha: 0.0,
+            mixing_alpha: 1.0,
             mixing_bg: 0,
             contrast: 1.0,
             brightness: 0.0,
@@ -573,6 +626,10 @@ fn set_status(inst: &mut VideoOverlayInst, status: PlayStatus) -> Option<PlaySta
 /// Decode and store the RGBA layer bitmap for the overlay's current movie
 /// position. A no-op when the movie has no real decoder (the legacy MPEG
 /// fallback accepts metadata but cannot decode pixels).
+///
+/// When `setMixingLayer` is active the decoded movie is composited over the
+/// mixing layer's MainImage (opacity-weighted) and the `mixingMovieBGColor`
+/// base at `mixingMovieAlpha`, the reference's `vomMixer` output.
 fn present_current(inst: &mut VideoOverlayInst, now: u64) {
     if inst.decoder.is_none() {
         return;
@@ -583,10 +640,123 @@ fn present_current(inst: &mut VideoOverlayInst, now: u64) {
         .as_mut()
         .map(|decoder| decoder.present_at(position));
     match decoded {
-        Some(Ok(Some(frame))) => inst.frame = Some(frame),
+        Some(Ok(Some(mut frame))) => {
+            if let Some(layer) = inst.mixing_layer.as_ref() {
+                let background = read_mixing_background(context_engine(), layer);
+                compose_mixing(
+                    &mut frame,
+                    background.as_ref(),
+                    layer.alpha,
+                    inst.mixing_alpha,
+                    inst.mixing_bg,
+                );
+            }
+            inst.frame = Some(frame);
+        }
         Some(Ok(None)) => {}
         Some(Err(e)) => log::debug!("VideoOverlay: present at {position} ms failed: {e}"),
         None => {}
+    }
+}
+
+/// Copy a mixing layer's MainImage RGBA pixels out of the scene.
+///
+/// `mainImageBuffer` / `mainImageBufferPitch` are the reference's plugin ABI
+/// (`LayerIntf.cpp:3005`/`:3020`): the live MainImage pixel address and its
+/// row stride. The VM is single-threaded, so the getters and this copy run in
+/// one native call and the buffer cannot be resized or moved concurrently.
+fn read_mixing_background(engine: &Tjs2Engine, layer: &MixingLayer) -> Option<MixingBackground> {
+    log::trace!("VideoOverlay: reading mixing layer {} MainImage", layer.id);
+    let id = layer.keepalive.raw_id();
+    let width = match engine.get_member(id, "imageWidth") {
+        Ok(TjsValue::Integer(w)) if (1..=MAX_MIXING_DIM).contains(&w) => w as usize,
+        _ => return None,
+    };
+    let height = match engine.get_member(id, "imageHeight") {
+        Ok(TjsValue::Integer(h)) if (1..=MAX_MIXING_DIM).contains(&h) => h as usize,
+        _ => return None,
+    };
+    let addr = match engine.get_member(id, "mainImageBuffer") {
+        Ok(TjsValue::Integer(a)) if a > 0 => a as usize,
+        _ => return None,
+    };
+    let pitch = match engine.get_member(id, "mainImageBufferPitch") {
+        Ok(TjsValue::Integer(p)) if p > 0 => p as usize,
+        _ => width.checked_mul(4)?,
+    };
+    let row_bytes = width.checked_mul(4)?;
+    if pitch < row_bytes {
+        return None;
+    }
+    let len = pitch.checked_mul(height)?;
+    // SAFETY: `mainImageBuffer` returns the address of the layer's live
+    // RGBA MainImage (the reference's `GetMainImagePixelBuffer` contract).
+    // `len = pitch * height` is exactly the allocation the getter's `pitch`
+    // and `imageHeight` describe; `imageWidth <= pitch/4`, so each copied row
+    // stays inside the buffer. No VM code runs between the getters and the
+    // copy, so the buffer cannot be freed or reallocated underneath us.
+    let data = unsafe { std::slice::from_raw_parts(addr as *const u8, len) };
+    let mut rgba = Vec::with_capacity(row_bytes.checked_mul(height)?);
+    for y in 0..height {
+        let start = y.checked_mul(pitch)?;
+        rgba.extend_from_slice(&data[start..start + row_bytes]);
+    }
+    Some(MixingBackground {
+        width,
+        height,
+        pitch: row_bytes,
+        rgba,
+    })
+}
+
+/// Composite the decoded movie frame over an optional mixing-layer image and
+/// the `mixingMovieBGColor` base:
+///
+/// ```text
+/// background = layer.rgb * (layer.a * layerOpacity) + bgColor * (1 - layer.a * layerOpacity)
+/// out        = movie.rgb * (movie.a * movieAlpha) + background * (1 - movie.a * movieAlpha)
+/// ```
+///
+/// The result is opaque because the mixer produces a full display surface
+/// (`SetMixingBitmap` + `SetMixingMovieBGColor` fill the transparent areas).
+fn compose_mixing(
+    frame: &mut video::RgbaFrame,
+    background: Option<&MixingBackground>,
+    layer_opacity: f64,
+    movie_alpha: f64,
+    bg_color: i64,
+) {
+    let base_r = ((bg_color >> 16) & 0xff) as f64;
+    let base_g = ((bg_color >> 8) & 0xff) as f64;
+    let base_b = (bg_color & 0xff) as f64;
+    let layer_opacity = layer_opacity.clamp(0.0, 1.0);
+    let movie_alpha = movie_alpha.clamp(0.0, 1.0);
+    let width = frame.width as usize;
+    for y in 0..frame.height as usize {
+        for x in 0..width {
+            let i = (y * width + x) * 4;
+            let (mut br, mut bg, mut bb) = (base_r, base_g, base_b);
+            if let Some(image) = background
+                && x < image.width
+                && y < image.height
+            {
+                let j = y * image.pitch + x * 4;
+                let ba = (image.rgba[j + 3] as f64 / 255.0) * layer_opacity;
+                let inv = 1.0 - ba;
+                br = image.rgba[j] as f64 * ba + base_r * inv;
+                bg = image.rgba[j + 1] as f64 * ba + base_g * inv;
+                bb = image.rgba[j + 2] as f64 * ba + base_b * inv;
+            }
+            let ma = (frame.data[i + 3] as f64 / 255.0) * movie_alpha;
+            let inv = 1.0 - ma;
+            let blend = |src: u8, dst: f64| -> u8 {
+                (src as f64 * ma + dst * inv).round().clamp(0.0, 255.0) as u8
+            };
+            frame.data[i] = blend(frame.data[i], br);
+            frame.data[i + 1] = blend(frame.data[i + 1], bg);
+            frame.data[i + 2] = blend(frame.data[i + 2], bb);
+            frame.data[i + 3] = 255;
+        }
     }
 }
 
@@ -1716,17 +1886,97 @@ extern "C" fn vo_prepare(
     0
 }
 
-/// Shared body for every argument-less no-op method (`setMixingLayer`,
-/// `resetMixingLayer`).
-extern "C" fn vo_noop_method(
+/// Resolve a retained Layer object to the `setMixingLayer` state.
+///
+/// Reference `tTJSNI_VideoOverlay::SetMixingLayer` (`VideoOvlImpl.cpp:882`):
+/// a null layer clears the mixing bitmap; a layer that is not visible resets
+/// it; otherwise the mixing bitmap is the layer's MainImage drawn with
+/// `opacity / 255`. The reference throws `TVPSpecifyLayer` for a non-Layer
+/// object; here that is a missing `nativeId` (every real/user `Layer`
+/// carries it, including script subclasses).
+fn resolve_mixing_layer(
+    engine: &Tjs2Engine,
+    keepalive: DetachedValue,
+) -> Result<Option<MixingLayer>, String> {
+    let id = match engine.get_member(keepalive.raw_id(), "nativeId") {
+        Ok(TjsValue::Integer(id)) if id >= 0 => id as u32,
+        _ => return Err("VideoOverlay.setMixingLayer: specify layer".to_string()),
+    };
+    let visible = match engine.get_member(keepalive.raw_id(), "visible") {
+        Ok(TjsValue::Integer(v)) => v != 0,
+        Ok(TjsValue::Real(v)) => v != 0.0,
+        _ => true,
+    };
+    if !visible {
+        return Ok(None);
+    }
+    let opacity = match engine.get_member(keepalive.raw_id(), "opacity") {
+        Ok(TjsValue::Integer(o)) => o.clamp(0, 255),
+        Ok(TjsValue::Real(o)) => (o as i64).clamp(0, 255),
+        _ => 255,
+    };
+    log::debug!(
+        "VideoOverlay.setMixingLayer: layer {id}, alpha {:.3}",
+        opacity as f64 / 255.0
+    );
+    Ok(Some(MixingLayer {
+        keepalive,
+        id,
+        alpha: opacity as f64 / 255.0,
+    }))
+}
+
+/// `setMixingLayer(layer)` — install (or clear) the layer the movie is mixed
+/// over. A null/void argument and a non-visible layer both clear the mixing
+/// bitmap, matching the reference; a non-Layer object raises the reference's
+/// `TVPSpecifyLayer` error.
+extern "C" fn vo_set_mixing_layer(
     _engine: *mut c_void,
-    _instance: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let values = args(argv, argc);
+    let Some(value) = values.first() else {
+        return report_error(out_error, "VideoOverlay.setMixingLayer requires 1 argument");
+    };
+    // SAFETY: `instance` is a live VideoOverlayInst payload.
+    let inst = unsafe { &mut *(instance as *mut VideoOverlayInst) };
+    if value.ty != tjs2_sys::VAL_OBJECT || value.retained == 0 {
+        inst.mixing_layer = None;
+        set_void_out(out);
+        return 0;
+    }
+    let keepalive = match context_engine().retain_object_arg(value) {
+        Ok(dv) => dv,
+        Err(_) => return report_error(out_error, "VideoOverlay.setMixingLayer: specify layer"),
+    };
+    match resolve_mixing_layer(context_engine(), keepalive) {
+        Ok(layer) => {
+            inst.mixing_layer = layer;
+            set_void_out(out);
+            0
+        }
+        Err(e) => report_error(out_error, &e),
+    }
+}
+
+/// `resetMixingLayer()` — drop the mixing bitmap (`VideoOvlImpl.cpp:921`).
+extern "C" fn vo_reset_mixing_layer(
+    _engine: *mut c_void,
+    instance: *mut c_void,
     _argc: c_int,
     _argv: *const Value,
     out: *mut Value,
     _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `instance` is a live VideoOverlayInst payload.
+    let inst = unsafe { &mut *(instance as *mut VideoOverlayInst) };
+    inst.mixing_layer = None;
     set_void_out(out);
     0
 }
@@ -1990,11 +2240,11 @@ pub fn register_video_overlay(engine: &Tjs2Engine) -> Result<(), String> {
             },
             NativeInstanceMethodDef {
                 name: "setMixingLayer",
-                f: vo_noop_method,
+                f: vo_set_mixing_layer,
             },
             NativeInstanceMethodDef {
                 name: "resetMixingLayer",
-                f: vo_noop_method,
+                f: vo_reset_mixing_layer,
             },
             NativeInstanceMethodDef {
                 name: "setPos",
@@ -2904,5 +3154,147 @@ mod tests {
         assert_eq!(engine.eval("sat", "test").unwrap(), TjsValue::Real(0.25));
         assert_eq!(engine.eval("cmin", "test").unwrap(), TjsValue::Real(0.0));
         assert_eq!(engine.eval("smax", "test").unwrap(), TjsValue::Real(2.0));
+    }
+
+    // -- mixing layer (setMixingLayer / resetMixingLayer) -------------------
+
+    /// The mixer compositor implements the reference's movie-over-layer
+    /// formula (movie over `mixingMovieBGColor`, layer opacity-weighted).
+    #[test]
+    fn compose_mixing_matches_the_reference_formula() {
+        let _vm_lock = vm_lock();
+        // Fully opaque movie wins over an opaque layer background.
+        let mut frame = video::RgbaFrame {
+            width: 2,
+            height: 1,
+            pts_ms: 0,
+            data: vec![255, 255, 255, 255, 255, 0, 0, 255],
+        };
+        let background = MixingBackground {
+            width: 2,
+            height: 1,
+            pitch: 8,
+            rgba: vec![0, 255, 0, 255, 0, 0, 255, 255],
+        };
+        compose_mixing(&mut frame, Some(&background), 1.0, 1.0, 0x000000);
+        assert_eq!(&frame.data[0..4], &[255, 255, 255, 255]);
+        assert_eq!(&frame.data[4..8], &[255, 0, 0, 255]);
+
+        // Half movie alpha blends white over the black background.
+        let mut frame = video::RgbaFrame {
+            width: 1,
+            height: 1,
+            pts_ms: 0,
+            data: vec![255, 255, 255, 255],
+        };
+        let black = MixingBackground {
+            width: 1,
+            height: 1,
+            pitch: 4,
+            rgba: vec![0, 0, 0, 255],
+        };
+        compose_mixing(&mut frame, Some(&black), 1.0, 0.5, 0x000000);
+        assert_eq!(frame.data, vec![128, 128, 128, 255]);
+
+        // A fully transparent movie exposes the `mixingMovieBGColor` base
+        // (0xRRGGBB): 0x00ff0000 is red.
+        let mut frame = video::RgbaFrame {
+            width: 1,
+            height: 1,
+            pts_ms: 0,
+            data: vec![255, 255, 255, 0],
+        };
+        compose_mixing(&mut frame, None, 0.0, 1.0, 0x00ff_0000);
+        assert_eq!(frame.data, vec![255, 0, 0, 255]);
+
+        // A half-opacity layer contributes its image to the base colour.
+        let mut frame = video::RgbaFrame {
+            width: 1,
+            height: 1,
+            pts_ms: 0,
+            data: vec![0, 0, 0, 0],
+        };
+        let white = MixingBackground {
+            width: 1,
+            height: 1,
+            pitch: 4,
+            rgba: vec![255, 255, 255, 255],
+        };
+        compose_mixing(&mut frame, Some(&white), 0.5, 0.0, 0x000000);
+        assert_eq!(frame.data, vec![128, 128, 128, 255]);
+    }
+
+    /// `resolve_mixing_layer` mirrors the reference: a visible Layer resolves
+    /// to its id + opacity; a non-visible layer clears the bitmap; a non-Layer
+    /// object raises `TVPSpecifyLayer`.
+    #[test]
+    fn resolve_mixing_layer_matches_reference_semantics() {
+        let _vm_lock = vm_lock();
+        let engine = Tjs2Engine::new().expect("create engine");
+        engine
+            .exec_script(
+                "var shown = %[nativeId: 3, visible: 1, opacity: 128]; \
+                 var hidden = %[nativeId: 4, visible: 0, opacity: 255]; \
+                 var plain = %[foo: 1];",
+                "video_overlay_mixing",
+            )
+            .unwrap();
+
+        let RetainedValue::Object(dv) = engine.eval_retained("shown", "test").unwrap() else {
+            panic!("shown must be an object");
+        };
+        let layer = resolve_mixing_layer(&engine, dv)
+            .unwrap()
+            .expect("a visible layer resolves");
+        assert_eq!(layer.id, 3);
+        assert!((layer.alpha - 128.0 / 255.0).abs() < 1e-9);
+
+        let RetainedValue::Object(dv) = engine.eval_retained("hidden", "test").unwrap() else {
+            panic!("hidden must be an object");
+        };
+        assert!(
+            resolve_mixing_layer(&engine, dv).unwrap().is_none(),
+            "a hidden layer resets the mixing bitmap"
+        );
+
+        let RetainedValue::Object(dv) = engine.eval_retained("plain", "test").unwrap() else {
+            panic!("plain must be an object");
+        };
+        assert!(
+            resolve_mixing_layer(&engine, dv).is_err(),
+            "a non-Layer object raises TVPSpecifyLayer"
+        );
+    }
+
+    /// The layer's MainImage is read through the reference's
+    /// `mainImageBuffer`/`mainImageBufferPitch` ABI and copied row by row.
+    #[test]
+    fn read_mixing_background_copies_the_layer_main_image() {
+        let _vm_lock = vm_lock();
+        let engine = Tjs2Engine::new().expect("create engine");
+        // A 2x2 RGBA image with a 4-byte gap per row would exercise padding;
+        // here the rows are tightly packed (pitch = width * 4).
+        let pixels: Vec<u8> = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        let addr = pixels.as_ptr() as i64;
+        engine
+            .exec_script(
+                &format!(
+                    "var fake = %[nativeId: 1, visible: 1, opacity: 255, \
+                     imageWidth: 2, imageHeight: 2, \
+                     mainImageBuffer: {addr}, mainImageBufferPitch: 8];"
+                ),
+                "video_overlay_mixing",
+            )
+            .unwrap();
+        let RetainedValue::Object(dv) = engine.eval_retained("fake", "test").unwrap() else {
+            panic!("fake must be an object");
+        };
+        let layer = resolve_mixing_layer(&engine, dv).unwrap().unwrap();
+        let background = read_mixing_background(&engine, &layer).expect("image buffer");
+        assert_eq!(
+            (background.width, background.height, background.pitch),
+            (2, 2, 8)
+        );
+        assert_eq!(background.rgba, pixels);
     }
 }

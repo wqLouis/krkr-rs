@@ -13,9 +13,17 @@
 //!   `getcurrent=false` reproduces the reference's consumed-on-read push latch.
 //! * `shellExecute` — launches with the platform opener (`xdg-open` /
 //!   `open` / `cmd start`).
-//! * `system` — stub returning 0 (the reference's `_wsystem` is commented
-//!   out).
-//! * `readRegValue` — stub returning void (registry not implemented).
+//! * `system` — runs the command synchronously through the platform shell
+//!   (`/bin/sh -c` / `cmd /C`). The reference's `_wsystem` call is commented
+//!   out and it always returns 0; this port executes the command for real but
+//!   keeps the reference-visible result at 0 (the exit status is logged).
+//! * `readRegValue` — reads the portable registry substitute the reference's
+//!   active `TVPReadRegValue` path uses: a `RegisterData.tjs` *expression*
+//!   under `System.appDataPath` (with the project dir as a fallback), then
+//!   traverses it by the `/`- or `\`-separated key. The Windows registry
+//!   branch in the reference is `#if 0`-disabled, so this is the equivalent
+//!   the shipped engine actually executes (see the method docs for the
+//!   reference's inverted loop guard).
 //! * `getArgument` / `setArgument` — process-global command-line arguments
 //!   (see below).
 //! * `createAppLock` — returns true (single-process emulator: first
@@ -82,8 +90,8 @@ use tjs2_sys::{
 };
 
 use super::{
-    args, lock_ok, report_error, set_int_out, set_object_result, set_real_out, set_string_out,
-    set_void_out, value_as_bool, value_as_i64, value_as_string,
+    args, context_engine, lock_ok, report_error, set_int_out, set_object_result, set_real_out,
+    set_string_out, set_void_out, value_as_bool, value_as_i64, value_as_string,
 };
 
 /// Process-global command-line arguments, mirroring the reference's
@@ -329,39 +337,221 @@ extern "C" fn native_shell_execute(
 
 /// `System.system(command)` → int
 ///
-/// Reference: the `_wsystem` call is commented out; the method returns 0
-/// after delivering a compact event. Stub: returns 0 and executes nothing.
+/// Reference `SystemImpl.cpp:676`: the body is
+/// `int ret = 0; // _wsystem(target.c_str());` followed by a compact event;
+/// the process-spawning call is commented out, so the shipped engine always
+/// returns 0. krkr-rs executes the command for real, synchronously through
+/// the platform shell (`/bin/sh -c` on Unix, `cmd /C` on Windows); the exit
+/// status is logged but the reference-visible result stays **0**, so scripts
+/// observe exactly the value the reference would give them. This blocks the
+/// VM thread for the lifetime of the command, like C `system()`.
 extern "C" fn native_system(
     _engine: *mut c_void,
     argc: c_int,
-    _argv: *const Value,
+    argv: *const Value,
     out: *mut Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
     if argc < 1 {
         return report_error(out_error, "System.system requires 1 argument");
     }
+    let command = value_as_string(&args(argv, argc)[0]);
+    let code = run_shell_command(&command);
+    log::debug!("System.system({command:?}) exited with status {code}");
     set_int_out(out, 0);
     0
 }
 
-/// `System.readRegValue(key)` → void
+/// Run `command` through the platform shell and return its exit code.
+fn run_shell_command(command: &str) -> i32 {
+    let mut cmd = if cfg!(target_os = "windows") {
+        let mut c = Command::new("cmd");
+        c.args(["/C", command]);
+        c
+    } else {
+        let mut c = Command::new("/bin/sh");
+        c.args(["-c", command]);
+        c
+    };
+    match cmd.status() {
+        Ok(status) => status.code().unwrap_or(-1),
+        Err(e) => {
+            log::warn!("System.system: cannot run {command:?}: {e}");
+            -1
+        }
+    }
+}
+
+/// `System.readRegValue(key)` → value
 ///
-/// Reference: `TVPReadRegValue` fills the result from the Windows registry.
-/// Stub: returns void — registry access is not implemented. The argument
-/// count check matches the reference.
+/// Reference `TVPReadRegValue` (`SystemImpl.cpp:117`). The Windows registry
+/// branch is `#if 0`-disabled in this fork; the active path loads a TJS
+/// `RegisterData.tjs` expression from `System.appDataPath` and walks it with
+/// `PropGet(TJS_MEMBERMUSTEXIST)` for every `/`- or `\`-separated key
+/// segment, clearing the result on the first miss.
+///
+/// Note: the reference's active loop guard is written
+/// `while(*start && CurrentNode.Type() != tvtObject)`, which is inverted for
+/// an object root and makes the shipped function return void for every
+/// non-empty key. This port implements the clear *intent* of that code (walk
+/// the object tree, value = final node, void on any miss / empty key), which
+/// is what a `RegisterData.tjs`-driven game expects.
+///
+/// `RegisterData.tjs` is looked up under `appDataPath` (the reference's
+/// location) and then the project dir (portable fallback). Missing file,
+/// empty key and any traversal error all return void, matching
+/// `result->Clear()`.
 extern "C" fn native_read_reg_value(
     _engine: *mut c_void,
     argc: c_int,
-    _argv: *const Value,
+    argv: *const Value,
     out: *mut Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
     if argc < 1 {
         return report_error(out_error, "System.readRegValue requires 1 argument");
     }
-    set_void_out(out);
+    let key = value_as_string(&args(argv, argc)[0]);
+    match read_register_value(context_engine(), &key) {
+        Ok(Some(value)) => set_retained_value_out(value, out),
+        Ok(None) => set_void_out(out),
+        Err(e) => return report_error(out_error, &format!("System.readRegValue: {e}")),
+    }
     0
+}
+
+/// Where `RegisterData.tjs` is discovered: the reference's `appDataPath`
+/// first, then the mounted project dir as a portable fallback.
+fn register_data_file() -> Option<std::path::PathBuf> {
+    let ctx = system_context();
+    for dir in [&ctx.app_data_dir, &ctx.project_dir] {
+        let path = dir.join("RegisterData.tjs");
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// Decode a `RegisterData.tjs` byte buffer: UTF-8 BOM and UTF-16 (LE/BE)
+/// BOM first, then UTF-8. A byte stream in neither encoding is decoded
+/// lossily (invalid UTF-8 becomes U+FFFD); CP932 text is not transcoded
+/// because tvp-natives has no CP932 codec — the shipped game has no
+/// `RegisterData.tjs`, so this only affects a hypothetical CP932 one.
+fn decode_script_bytes(raw: &[u8]) -> String {
+    if raw.starts_with(&[0xef, 0xbb, 0xbf]) {
+        return String::from_utf8_lossy(&raw[3..]).into_owned();
+    }
+    if raw.starts_with(&[0xff, 0xfe]) {
+        let units: Vec<u16> = raw[2..]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        return String::from_utf16_lossy(&units);
+    }
+    if raw.starts_with(&[0xfe, 0xff]) {
+        let units: Vec<u16> = raw[2..]
+            .chunks_exact(2)
+            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .collect();
+        return String::from_utf16_lossy(&units);
+    }
+    match std::str::from_utf8(raw) {
+        Ok(s) => s.to_string(),
+        Err(_) => String::from_utf8_lossy(raw).into_owned(),
+    }
+}
+
+/// Quote one key segment as a TJS double-quoted string literal.
+fn tjs_string_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Evaluate a `RegisterData.tjs` expression and walk `key` through it.
+///
+/// Returns `Ok(None)` for an empty key, a missing file or any traversal miss
+/// (the reference's `result->Clear()`), and `Err` only when the engine itself
+/// could not be driven. Unlike the reference (which caches the parsed
+/// `RegisterData` process-wide), each call re-reads and re-evaluates the
+/// file; the method is rare and this avoids cross-engine global state.
+fn read_register_value(
+    engine: &tjs2_sys::Tjs2Engine,
+    key: &str,
+) -> Result<Option<tjs2_sys::RetainedValue>, String> {
+    if key.is_empty() {
+        return Ok(None);
+    }
+    let Some(path) = register_data_file() else {
+        return Ok(None);
+    };
+    let raw = std::fs::read(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let expression = decode_script_bytes(&raw);
+    let segments: Vec<String> = key
+        .split(['/', '\\'])
+        .filter(|s| !s.is_empty())
+        .map(tjs_string_literal)
+        .collect();
+    if segments.is_empty() {
+        return Ok(None);
+    }
+    let keys = format!("[{}]", segments.join(","));
+    // Traverse in-script so missing members yield void instead of an error;
+    // `void[key]` would throw, so check the node before indexing. This mirrors
+    // the reference's `TJS_MEMBERMUSTEXIST` walk.
+    let script = format!(
+        "(function(){{var __rd=({expression});var __o=__rd;var __k={keys};\
+         for(var __i=0;__i<__k.count;++__i){{\
+         if(__o===void||__o===null)return void;__o=__o[__k[__i]];}}\
+         return __o;}})()"
+    );
+    match engine.eval_retained(&script, "System.readRegValue") {
+        Ok(value) => Ok(Some(value)),
+        Err(e) => {
+            log::debug!("System.readRegValue({key:?}): {e}");
+            Ok(None)
+        }
+    }
+}
+
+/// Hand a retained evaluation result to the C++ side; scalars are copied and
+/// object results keep their retention (consumed by the return slot).
+fn set_retained_value_out(value: tjs2_sys::RetainedValue, out: *mut Value) {
+    use tjs2_sys::{RetainedValue, TjsValue};
+    match value {
+        RetainedValue::Value(TjsValue::Void) => set_void_out(out),
+        RetainedValue::Value(TjsValue::Integer(i)) => set_int_out(out, i),
+        RetainedValue::Value(TjsValue::Real(r)) => set_real_out(out, r),
+        RetainedValue::Value(TjsValue::String(s)) => set_string_out(out, &s),
+        // An opaque object without a handle cannot cross; report void like a
+        // cleared reference result.
+        RetainedValue::Value(TjsValue::Object | TjsValue::Retained(_)) => set_void_out(out),
+        RetainedValue::Object(dv) => {
+            // SAFETY: `out` is the valid native result slot for this call.
+            unsafe {
+                (*out).ty = tjs2_sys::VAL_RETAINED;
+                (*out).integer = 0;
+                (*out).real = 0.0;
+                (*out).string = std::ptr::null();
+                (*out).array = std::ptr::null();
+                (*out).array_count = 0;
+                (*out).retained = dv.raw_id() as usize;
+            }
+            std::mem::forget(dv);
+        }
+    }
 }
 
 /// `System.getArgument(name [, default])`
@@ -830,6 +1020,10 @@ pub fn continuous_handler_poll(engine: &tjs2_sys::Tjs2Engine) -> bool {
     // clock as the continuous handlers (reference: the video decoder's own
     // event thread; krkr-rs has no decoder thread).
     crate::video_overlay::video_overlay_poll(engine);
+    // `Trans` transition drivers (`extrans`) complete on the same clock,
+    // after the engine's own `Layer.beginTransition`/`transition_poll` had a
+    // chance to deliver `onTransitionCompleted` this frame.
+    crate::extrans::trans_poll(engine, tick);
     any
 }
 
@@ -1596,9 +1790,15 @@ mod tests {
         assert_eq!(TERMINATE_CODE.load(Ordering::SeqCst), 9);
     }
 
-    fn engine_with_system() -> tjs2_sys::Tjs2Engine {
-        let e = tjs2_sys::Tjs2Engine::new().expect("create engine");
-        register_system(&e).expect("register System");
+    fn engine_with_system() -> Box<tjs2_sys::Tjs2Engine> {
+        // Box before registering: `register_all` stores the engine address in
+        // the process-global VM context, so the allocation must stay put when
+        // the helper returns.
+        let e = Box::new(tjs2_sys::Tjs2Engine::new().expect("create engine"));
+        // `register_all` registers `System` and installs the process-global
+        // VM context that `context_engine()`-based methods
+        // (`System.readRegValue`) need, exactly like production.
+        crate::register_all(&e).expect("register all natives");
         e
     }
 
@@ -1698,6 +1898,118 @@ mod tests {
         );
         assert_eq!(assigned_message("msg.id").as_deref(), Some("hello"));
         assert!(e.eval("System.assignMessage('only-one')", "test").is_err());
+    }
+
+    /// `System.system` really runs the command through the platform shell;
+    /// the reference-visible result is always 0 (its `_wsystem` call is
+    /// commented out), so scripts see the same value as the shipped engine.
+    #[test]
+    fn system_runs_a_shell_command_and_returns_the_reference_result() {
+        let _vm_lock = crate::test_lock::vm_lock();
+        let e = engine_with_system();
+        assert_eq!(
+            e.eval("System.system('exit 0')", "test").unwrap(),
+            tjs2_sys::TjsValue::Integer(0)
+        );
+        // `exit 7` still reports the reference's 0 (the status is only logged).
+        assert_eq!(
+            e.eval("System.system('exit 7')", "test").unwrap(),
+            tjs2_sys::TjsValue::Integer(0)
+        );
+        assert!(e.eval("System.system()", "test").is_err());
+    }
+
+    /// The command actually executes (a real side effect, not a stub).
+    #[cfg(unix)]
+    #[test]
+    fn system_executes_the_command_for_real() {
+        let _vm_lock = crate::test_lock::vm_lock();
+        let e = engine_with_system();
+        let dir = std::env::temp_dir().join(format!(
+            "tvp_system_cmd_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("ran");
+        let script = format!("System.system('printf ran > {}')", marker.display());
+        assert_eq!(
+            e.eval(&script, "test").unwrap(),
+            tjs2_sys::TjsValue::Integer(0)
+        );
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "ran");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `readRegValue` loads the portable `RegisterData.tjs` expression and
+    /// traverses it by `/`- or `\`-separated key, returning the final node and
+    /// void on any miss (the reference's active `TVPReadRegValue` path).
+    #[test]
+    fn read_reg_value_traverses_register_data() {
+        let _vm_lock = crate::test_lock::vm_lock();
+        let e = engine_with_system();
+        let dir = std::env::temp_dir().join(format!(
+            "tvp_register_data_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("RegisterData.tjs"),
+            r#"%[Version: %[App: %[Name: "krkr-rs", Build: 7]], Flag: true]"#,
+        )
+        .unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        set_system_context(SystemContext {
+            project_dir: cwd,
+            app_data_dir: dir.clone(),
+            screen_size: (0, 0),
+            desktop_origin: (0, 0),
+            desktop_size: (0, 0),
+            touch_device: false,
+        });
+
+        assert_eq!(
+            e.eval("System.readRegValue('Version\\\\App\\\\Name')", "test")
+                .unwrap(),
+            tjs2_sys::TjsValue::String("krkr-rs".into())
+        );
+        assert_eq!(
+            e.eval("System.readRegValue('Version/App/Build')", "test")
+                .unwrap(),
+            tjs2_sys::TjsValue::Integer(7)
+        );
+        // A leading separator is ignored, like the reference's splitter; the
+        // top-level `Flag` is reached directly.
+        assert_eq!(
+            e.eval("System.readRegValue('/Flag')", "test").unwrap(),
+            tjs2_sys::TjsValue::Integer(1)
+        );
+        // A miss, an empty key and a missing file all read as void.
+        assert_eq!(
+            e.eval("System.readRegValue('Version/Missing')", "test")
+                .unwrap(),
+            tjs2_sys::TjsValue::Void
+        );
+        // An intermediate node is an object and is returned as one.
+        assert_eq!(
+            e.eval("System.readRegValue('Version')", "test").unwrap(),
+            tjs2_sys::TjsValue::Object
+        );
+        assert_eq!(
+            e.eval("System.readRegValue('')", "test").unwrap(),
+            tjs2_sys::TjsValue::Void
+        );
+        assert!(e.eval("System.readRegValue()", "test").is_err());
+
+        set_system_context(SystemContext::default());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

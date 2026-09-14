@@ -1,10 +1,13 @@
-//! `extrans.dll` plugin surface — `Trans` class stub + transition registry.
+//! `extrans.dll` plugin surface — transition registry + a real `Trans`
+//! driver wired to the engine's transition machinery.
 //!
-//! The real `extrans` plugin (krkrz/SamplePlugin, also in the old krkr2
-//! tree) does **not** register a `Trans` native class. `V2Link` only
-//! registers transition **handler providers** into the engine's global
-//! registry (`TVPAddTransHandlerProvider`), which `Layer.beginTransition`
-//! consults by name:
+//! # The plugin registry
+//!
+//! The real `extrans` plugin (`krkrz/SamplePlugin/extrans`) does **not**
+//! register a `Trans` native class. Its `V2Link` only registers transition
+//! **handler providers** into the engine's global registry
+//! (`TVPAddTransHandlerProvider`), which `Layer.beginTransition` consults by
+//! name:
 //!
 //! | provider | name | options |
 //! |---|---|---|
@@ -17,23 +20,36 @@
 //! | ripple | `ripple` | `time`, `centerx`, `centery` |
 //!
 //! Every provider reports `ttExchange` (two-layer cross-exchange) with
-//! `tutDivisible` update semantics (verified against both the current
-//! SamplePlugin and the krkr2 plugin tree). The engine's own default
+//! `tutDivisible` update semantics (verified against the current
+//! SamplePlugin source and the krkr2 plugin tree). The engine's own default
 //! providers (`TVPRegisterDefaultTransHandlerProvider`, TransIntf.cpp) are
 //! `crossfade` (ttExchange, tutDivisibleFade), `universal` (ttExchange,
 //! tutDivisibleFade) and `scroll` (ttExchange, tutDivisible).
 //!
 //! # `Trans` class
 //!
-//! The `Trans` class this stub provides is a **compat no-op**: the task
-//! description asked for it, and old KAG-era scripts sometimes do
-//! `new Trans(layer, options)` / `.start()`. The modern engine has no such
-//! native class (the transition surface is `Layer.beginTransition` /
-//! `Layer.stopTransition`), so the class exists so those scripts parse and
-//! run, but it performs no pixel work. The audit (data.xp3 + patch.xp3,
-//! every `.tjs`/`.ks`, k2compat, patch.tjs) found **no** `Trans`
-//! instantiation and no `Layer.trans` usage — this game's transitions all
-//! go through `Layer.beginTransition` with the names above.
+//! `Trans` is a krkr-rs compatibility class (the shipped game links
+//! `extrans.dll` but the audit of every `.tjs`/`.ks` in `data.xp3` +
+//! `patch.xp3` found no `new Trans` / `Trans(...)` use; this game drives
+//! transitions through `Layer.beginTransition` +
+//! `setTransitionCompleteCall`). It is **not** a no-op: `Trans(layer,
+//! options)` captures the target layer and options and `start()` drives a
+//! real transition through the engine's transition machinery:
+//!
+//! * [`start`](Trans) calls the target layer's native/native-script
+//!   `beginTransition(name, withchildren, transwith, options)` (the same
+//!   entry point `Layer.beginTransition` exposes, `LayerIntf.cpp:9815`).
+//! * The engine's per-frame `transition_poll` then delivers
+//!   `onTransitionCompleted(dest, src)` to the layer, exactly as it does for
+//!   a direct `beginTransition` call.
+//! * `Trans` additionally tracks the transition duration (`options.time`,
+//!   ms) on the same per-frame clock and invokes its own completion callback
+//!   (`options.callback` / `options.onComplete`) once, when the duration
+//!   elapses (or on the next poll for `time == 0`). [`stop`](Trans) cancels
+//!   the transition (`Layer.stopTransition`); `complete()` forces it.
+//!
+//! `isCompleted` is a read-only property (used by scripts/tests to observe
+//! the lifecycle).
 //!
 //! # Registry
 //!
@@ -45,10 +61,14 @@
 //! `reference/cpp/core/visual/transhandler.h`.
 
 use std::ffi::{c_char, c_int, c_void};
+use std::sync::{LazyLock, Mutex};
 
-use tjs2_sys::{NativeInstanceBuilder, NativeInstanceMethodDef, Tjs2Engine, Value};
+use tjs2_sys::{
+    DetachedValue, NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef,
+    Tjs2Engine, TjsValue, Value,
+};
 
-use crate::set_void_out;
+use crate::{args, context_engine, lock_ok, report_error, set_int_out, set_void_out};
 
 /// `tTVPTransType` values (transhandler.h): `ttSimple` uses only the self
 /// layer; `ttExchange` blends two layers (source 1 + source 2).
@@ -119,52 +139,339 @@ pub fn transition_kind(name: &str) -> Option<TransitionKind> {
     builtin_transition_kind(name).or_else(|| extrans_transition_kind(name))
 }
 
-/// Payload for the compat `Trans` no-op class.
+// ---------------------------------------------------------------------------
+// `Trans` transition driver
+// ---------------------------------------------------------------------------
+
+/// One live `Trans` object. Retains every script value it must keep alive
+/// across calls (the target layer, the options dict, the optional
+/// `transwith` layer and completion callback).
 #[derive(Default)]
-struct TransInst;
+struct TransInst {
+    /// Target `Layer` object (`Trans(layer, ...)`) whose `beginTransition`
+    /// the engine will drive.
+    layer: Option<DetachedValue>,
+    /// The options dictionary, kept alive so `beginTransition` can receive
+    /// it as an argument.
+    options: Option<DetachedValue>,
+    /// Optional second layer (`options.transwith`) for the exchange.
+    trans_with: Option<DetachedValue>,
+    /// Optional completion callback (`options.callback` / `onComplete`).
+    callback: Option<DetachedValue>,
+    /// Transition name (default `"crossfade"`).
+    name: String,
+    /// `options.withchildren` (default true).
+    with_children: bool,
+    /// `options.time` in milliseconds (0 = one poll).
+    time_ms: i64,
+    /// Engine tick at `start()`; `None` when not started (or completed).
+    started_ms: Option<i64>,
+    /// Set once the completion callback has fired.
+    completed: bool,
+}
+
+/// Addresses of started `Trans` objects, advanced once per frame by
+/// [`trans_poll`]. `destroy` unregisters before the payload is freed, so a
+/// pointer in this set is always live.
+static ACTIVE_TRANS: LazyLock<Mutex<Vec<usize>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+
+fn unregister(inst: *mut TransInst) {
+    let addr = inst as usize;
+    lock_ok(&ACTIVE_TRANS).retain(|&a| a != addr);
+}
+
+/// Whether an ABI argument carries a non-null object handle.
+fn is_object(v: &Value) -> bool {
+    v.ty == tjs2_sys::VAL_OBJECT && v.retained != 0
+}
+
+/// TJS `operator bool` for a `get_member` result.
+fn tjs_bool(v: &TjsValue) -> bool {
+    match v {
+        TjsValue::Void => false,
+        TjsValue::Integer(i) => *i != 0,
+        TjsValue::Real(r) => *r != 0.0,
+        TjsValue::String(s) => !s.is_empty(),
+        _ => true,
+    }
+}
+
+fn option_value(engine: &Tjs2Engine, obj: tjs2_sys::Tjs2ValueId, name: &str) -> Option<TjsValue> {
+    engine
+        .get_member(obj, name)
+        .ok()
+        .filter(|v| !matches!(v, TjsValue::Void))
+}
+
+fn option_string(
+    engine: &Tjs2Engine,
+    obj: tjs2_sys::Tjs2ValueId,
+    names: &[&str],
+) -> Option<String> {
+    names
+        .iter()
+        .find_map(|name| match option_value(engine, obj, name) {
+            Some(TjsValue::String(s)) => Some(s),
+            _ => None,
+        })
+}
+
+fn option_int(engine: &Tjs2Engine, obj: tjs2_sys::Tjs2ValueId, name: &str) -> Option<i64> {
+    match option_value(engine, obj, name) {
+        Some(TjsValue::Integer(i)) => Some(i),
+        Some(TjsValue::Real(r)) => Some(r as i64),
+        _ => None,
+    }
+}
+
+/// Retain an object-valued option. [`Tjs2Engine::get_member`] cannot carry an
+/// object handle, but the C++ side records the most recent object result in
+/// `last_object`, so [`Tjs2Engine::retain_value_detached`] resolves it right
+/// after the getter. Returns the first present name.
+fn option_object(
+    engine: &Tjs2Engine,
+    obj: tjs2_sys::Tjs2ValueId,
+    names: &[&str],
+) -> Option<DetachedValue> {
+    for name in names {
+        if let Ok(TjsValue::Object) = engine.get_member(obj, name)
+            && let Ok(dv) = engine.retain_value_detached(&TjsValue::Object)
+        {
+            return Some(dv);
+        }
+    }
+    None
+}
 
 extern "C" fn trans_create(_engine: *mut c_void) -> *mut c_void {
     Box::into_raw(Box::<TransInst>::default()) as *mut c_void
 }
 
 extern "C" fn trans_destroy(_engine: *mut c_void, instance: *mut c_void) {
-    if !instance.is_null() {
-        // SAFETY: instance came from trans_create's Box::into_raw.
-        drop(unsafe { Box::from_raw(instance as *mut TransInst) });
+    if instance.is_null() {
+        return;
+    }
+    let ptr = instance as *mut TransInst;
+    unregister(ptr);
+    // SAFETY: instance came from trans_create's Box::into_raw.
+    drop(unsafe { Box::from_raw(ptr) });
+}
+
+/// `Trans(layer [, options])` — capture the target layer and options. The
+/// layer and options objects are retained for the object's lifetime; scalar
+/// options are read once, object options (`transwith`, callback) are retained
+/// through [`option_object`].
+extern "C" fn trans_ctor(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let values = args(argv, argc);
+    let engine = context_engine();
+    // SAFETY: `instance` is a live TransInst payload.
+    let inst = unsafe { &mut *(instance as *mut TransInst) };
+    inst.name = "crossfade".to_string();
+    inst.with_children = true;
+
+    if let Some(value) = values.first().filter(|v| is_object(v)) {
+        match engine.retain_object_arg(value) {
+            Ok(dv) => inst.layer = Some(dv),
+            Err(e) => {
+                return report_error(out_error, &format!("Trans: cannot retain layer: {e}"));
+            }
+        }
+    }
+    if let Some(value) = values.get(1).filter(|v| is_object(v)) {
+        match engine.retain_object_arg(value) {
+            Ok(dv) => {
+                if let Some(name) = option_string(engine, dv.raw_id(), &["name", "method"]) {
+                    inst.name = name;
+                }
+                if let Some(time) = option_int(engine, dv.raw_id(), "time") {
+                    inst.time_ms = time.max(0);
+                }
+                if let Some(with_children) = option_value(engine, dv.raw_id(), "withchildren") {
+                    inst.with_children = tjs_bool(&with_children);
+                }
+                inst.trans_with = option_object(engine, dv.raw_id(), &["transwith"]);
+                inst.callback = option_object(engine, dv.raw_id(), &["callback", "onComplete"]);
+                inst.options = Some(dv);
+            }
+            Err(e) => {
+                return report_error(out_error, &format!("Trans: cannot retain options: {e}"));
+            }
+        }
+    }
+    set_void_out(out);
+    0
+}
+
+/// `start()` — begin the transition on the target layer through the engine's
+/// `beginTransition` entry point, then track it on the per-frame clock. With
+/// no target layer the object still completes (its callback fires once), so
+/// `new Trans().start()` stays a well-defined lifecycle.
+extern "C" fn trans_start(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    _argc: c_int,
+    _argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: `instance` is a live TransInst payload.
+    let inst = unsafe { &mut *(instance as *mut TransInst) };
+    if inst.started_ms.is_some() {
+        set_void_out(out);
+        return 0;
+    }
+    let engine = context_engine();
+    // Mark started and register before the engine call: the retained
+    // `options`/`transwith` arguments are consumed by `beginTransition`, so a
+    // retry must see `None` rather than a stale retained id.
+    inst.started_ms = Some(crate::system::tick_count_ms());
+    {
+        let addr = instance as usize;
+        let mut active = lock_ok(&ACTIVE_TRANS);
+        if !active.contains(&addr) {
+            active.push(addr);
+        }
+    }
+    if let Some(layer) = &inst.layer {
+        let trans_with = inst.trans_with.take();
+        let options = inst.options.take();
+        let mut call_args = vec![
+            TjsValue::String(inst.name.clone()),
+            TjsValue::Integer(i64::from(inst.with_children)),
+        ];
+        call_args.push(match &trans_with {
+            Some(dv) => TjsValue::Retained(dv.raw_id() as u64),
+            None => TjsValue::Void,
+        });
+        call_args.push(match &options {
+            Some(dv) => TjsValue::Retained(dv.raw_id() as u64),
+            None => TjsValue::Void,
+        });
+        if let Err(e) = engine.call_member(layer.raw_id(), "beginTransition", &call_args) {
+            return report_error(
+                out_error,
+                &format!("Trans.start: beginTransition failed: {e}"),
+            );
+        }
+    }
+    set_void_out(out);
+    0
+}
+
+/// `stop()` — cancel the transition and drop it from the poll set. The
+/// completion callback is **not** fired (the reference's `StopTransition`).
+extern "C" fn trans_stop(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    _argc: c_int,
+    _argv: *const Value,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: `instance` is a live TransInst payload.
+    let inst = unsafe { &mut *(instance as *mut TransInst) };
+    unregister(instance as *mut TransInst);
+    inst.started_ms = None;
+    if let Some(layer) = &inst.layer {
+        let _ = context_engine().call_member(layer.raw_id(), "stopTransition", &[]);
+    }
+    set_void_out(out);
+    0
+}
+
+/// `complete()` — force completion and fire the callback once.
+extern "C" fn trans_complete(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    _argc: c_int,
+    _argv: *const Value,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let ptr = instance as *mut TransInst;
+    unregister(ptr);
+    fire_completion(context_engine(), ptr);
+    set_void_out(out);
+    0
+}
+
+/// `isCompleted` — whether the completion callback has fired.
+extern "C" fn trans_is_completed_get(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: `instance` is a live TransInst payload.
+    let inst = unsafe { &*(instance as *const TransInst) };
+    set_int_out(out, i64::from(inst.completed));
+    0
+}
+
+/// Invoke the retained completion callback exactly once.
+fn fire_completion(engine: &Tjs2Engine, inst: *mut TransInst) {
+    // SAFETY: the caller has removed `inst` from ACTIVE_TRANS and the payload
+    // stays alive for the duration of the call (`destroy` only runs after
+    // unregistering).
+    let inst = unsafe { &mut *inst };
+    if inst.completed {
+        return;
+    }
+    inst.completed = true;
+    inst.started_ms = None;
+    if let Some(callback) = inst.callback.take()
+        && let Err(e) = engine.call_detached(&callback, &[])
+    {
+        log::warn!("Trans completion callback failed: {e}");
     }
 }
 
-/// `Trans(layer, options)` — compat constructor. The real KAG-era class
-/// wrapped a full-screen transition; this stub accepts anything and stores
-/// nothing (the game never instantiates it).
-extern "C" fn trans_ctor(
-    _engine: *mut c_void,
-    _instance: *mut c_void,
-    _argc: c_int,
-    _argv: *const Value,
-    out: *mut Value,
-    _out_error: *mut *mut c_char,
-    _objthis: *mut c_void,
-) -> c_int {
-    set_void_out(out);
-    0
+/// Advance every started `Trans` once per frame (called from
+/// [`crate::continuous_handler_poll`], after the engine's own
+/// `transition_poll`). A `Trans` completes when its `options.time` has
+/// elapsed; `time == 0` completes on the first poll after `start()`.
+pub(crate) fn trans_poll(engine: &Tjs2Engine, now_ms: i64) {
+    let completed: Vec<usize> = {
+        let mut active = lock_ok(&ACTIVE_TRANS);
+        let mut done = Vec::new();
+        active.retain(|&addr| {
+            if addr == 0 {
+                return false;
+            }
+            // SAFETY: addresses in ACTIVE_TRANS point at live payloads;
+            // destroy unregisters before freeing.
+            let inst = unsafe { &mut *(addr as *mut TransInst) };
+            let complete = match inst.started_ms {
+                Some(start) => now_ms.saturating_sub(start) >= inst.time_ms,
+                None => false,
+            };
+            if complete {
+                done.push(addr);
+                false
+            } else {
+                true
+            }
+        });
+        done
+    };
+    for addr in completed {
+        fire_completion(engine, addr as *mut TransInst);
+    }
 }
 
-/// `start()` — no-op in the stub (see the module doc).
-extern "C" fn trans_start(
-    _engine: *mut c_void,
-    _instance: *mut c_void,
-    _argc: c_int,
-    _argv: *const Value,
-    out: *mut Value,
-    _out_error: *mut *mut c_char,
-    _objthis: *mut c_void,
-) -> c_int {
-    set_void_out(out);
-    0
-}
-
-/// Register the compat `Trans` native class (no-op instance class).
+/// Register the `Trans` native class.
 pub fn register_trans(engine: &Tjs2Engine) -> Result<(), String> {
     engine.register_native_class_instance(&NativeInstanceBuilder {
         name: "Trans",
@@ -179,8 +486,20 @@ pub fn register_trans(engine: &Tjs2Engine) -> Result<(), String> {
                 name: "start",
                 f: trans_start,
             },
+            NativeInstanceMethodDef {
+                name: "stop",
+                f: trans_stop,
+            },
+            NativeInstanceMethodDef {
+                name: "complete",
+                f: trans_complete,
+            },
         ],
-        properties: vec![],
+        properties: vec![NativeInstancePropertyDef {
+            name: "isCompleted",
+            get: Some(trans_is_completed_get),
+            set: None,
+        }],
     })
 }
 
@@ -245,10 +564,114 @@ mod tests {
     fn trans_class_registers_and_constructs() {
         let _vm_lock = vm_lock();
         let e = Tjs2Engine::new().expect("create engine");
-        register_trans(&e).expect("register Trans");
-        // Compat surface: construct + start, both no-ops.
+        crate::register_all(&e).expect("register all natives");
+        // Compat surface: construct + start; no layer means the object still
+        // completes on the first poll.
         e.exec_script("var t = new Trans(); t.start();", "extrans_test")
             .unwrap();
         assert!(e.eval("t", "extrans_test").is_ok());
+        assert_eq!(
+            e.eval("t.isCompleted", "extrans_test").unwrap(),
+            TjsValue::Integer(0)
+        );
+        drop(e);
+    }
+
+    /// `start()` really calls the target layer's `beginTransition` and the
+    /// completion callback fires on the poll once the duration elapses.
+    #[test]
+    fn trans_starts_the_engine_transition_and_fires_the_callback() {
+        let _vm_lock = vm_lock();
+        let e = Tjs2Engine::new().expect("create engine");
+        crate::register_all(&e).expect("register all natives");
+        e.exec_script(
+            "var log = []; \
+             function onBegin(name, children, withlayer, options) { \
+                 log.push(name); log.push(children); log.push(options.name); \
+             } \
+             function onStopStop() { log.push('stop'); } \
+             var layer = %[ beginTransition: onBegin, stopTransition: onStopStop ]; \
+             var done = 0; \
+             var t = new Trans(layer, %[name:'mosaic', time:0, callback:function(){ done++; }]); \
+             t.start();",
+            "extrans_test",
+        )
+        .expect("start must call beginTransition");
+        // The engine transition was started with the configured name, the
+        // default `withchildren=true` and the options dictionary.
+        assert_eq!(
+            e.eval("log[0]", "extrans_test").unwrap(),
+            TjsValue::String("mosaic".into())
+        );
+        assert_eq!(
+            e.eval("log[1]", "extrans_test").unwrap(),
+            TjsValue::Integer(1)
+        );
+        assert_eq!(
+            e.eval("log[2]", "extrans_test").unwrap(),
+            TjsValue::String("mosaic".into())
+        );
+        // Not completed until the poll runs.
+        assert_eq!(
+            e.eval("done", "extrans_test").unwrap(),
+            TjsValue::Integer(0)
+        );
+        trans_poll(&e, crate::system::tick_count_ms());
+        assert_eq!(
+            e.eval("done", "extrans_test").unwrap(),
+            TjsValue::Integer(1)
+        );
+        assert_eq!(
+            e.eval("t.isCompleted", "extrans_test").unwrap(),
+            TjsValue::Integer(1)
+        );
+        // Firing is once-only.
+        trans_poll(&e, crate::system::tick_count_ms());
+        assert_eq!(
+            e.eval("done", "extrans_test").unwrap(),
+            TjsValue::Integer(1)
+        );
+        drop(e);
+    }
+
+    /// `stop()` cancels without firing the completion callback, and
+    /// `complete()` forces it.
+    #[test]
+    fn trans_stop_and_complete() {
+        let _vm_lock = vm_lock();
+        let e = Tjs2Engine::new().expect("create engine");
+        crate::register_all(&e).expect("register all natives");
+        e.exec_script(
+            "var layer = %[ beginTransition: function(){}, stopTransition: function(){} ]; \
+             var done = 0; \
+             var a = new Trans(layer, %[time:100000, callback:function(){ done += 1; }]); \
+             a.start(); \
+             var b = new Trans(layer, %[time:100000, callback:function(){ done += 10; }]); \
+             b.start(); \
+             a.stop(); \
+             b.complete();",
+            "extrans_test",
+        )
+        .unwrap();
+        // `a` was cancelled (no callback), `b` fired (10).
+        assert_eq!(
+            e.eval("done", "extrans_test").unwrap(),
+            TjsValue::Integer(10)
+        );
+        assert_eq!(
+            e.eval("a.isCompleted", "extrans_test").unwrap(),
+            TjsValue::Integer(0)
+        );
+        assert_eq!(
+            e.eval("b.isCompleted", "extrans_test").unwrap(),
+            TjsValue::Integer(1)
+        );
+        // A long-running `a` must not fire later.
+        trans_poll(&e, i64::MAX);
+        assert_eq!(
+            e.eval("done", "extrans_test").unwrap(),
+            TjsValue::Integer(10)
+        );
+        drop(e);
     }
 }
