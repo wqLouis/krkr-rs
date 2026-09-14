@@ -41,7 +41,14 @@
 //! | properties `window`, `parent` | owning Window / parent Layer **objects** (retained), or `null` at the window root |
 //! | `update()` | request this layer's script `onPaint` on the next VM poll (reference `CallOnPaint`; drives the `AffineLayer` composite) |
 //! | `onPaint()` | base no-op action (script subclasses override it and call `super.onPaint(...)`) |
-//! | `setCursorPos(x,y)` / `focus()` | no-ops (input: later) |
+//! | `setCursorPos(x,y)` | no-op (input: later) |
+//! | `focus([direction])` | sets the window's focused layer and dispatches `onFocus`/`onBlur` |
+//! | `copyRect(dx,dy,src,sx,sy,sw,sh)` | source-over blit of a `Bitmap`/`Layer` sub-rect, clipped to the bitmap and `ClipRect` (reference `CopyRect`) |
+//! | `pileRect` / `piledCopy` / `blendRect` | legacy rect copy / alpha blend / constant-alpha blend (reference `PileRect`/`PiledCopy`/`BlendRect`) |
+//! | `convertType(fromtype)` | alpha <-> additive-alpha pixel conversion (reference `ConvertLayerType`) |
+//! | `copy9Patch(src)` | derives the 9-slice margins and scales them to fill the image |
+//! | `copyToBitmapFromMainImage(bitmap)` | copies the main image into a `Bitmap` |
+//! | `drawEllipse` / `drawPie` / `drawCurve` / `drawImage*` | plugin-style GDI+ shapes and image blits |
 //! | `setCenter(x,y)`, `setAffineOffset(x,y)`, `setImagePos`, `setImageSize` | no-ops (affine: later) |
 //! | `drawText` | rasterizes into the attached scene bitmap using `tvp-text` (face/height/bold/italic/underline/strikeout/angle); a missing face logs a warning and draws nothing rather than fabricating glyphs |
 //! | `drawPolygon` / `drawRectangle` / `drawLine` / `drawLines` / `drawArc` / `drawBezier` / `drawBeziers` | rasterizes a `GdiPlus.Appearance`'s ordered fills/strokes into the attached scene bitmap (`natives::raster`) |
@@ -63,7 +70,8 @@
 //! | `setClip([l,t,w,h])` | reference `ClipRect` (no args resets to the image); respected by the pixel ops |
 //! | `onClick` / `onDoubleClick` / `onMouseDown|Up|Move|Enter|Leave|Wheel` / `onKeyDown|Up` | dispatch to the layer's action owner via `actionOwner.action(event)` (`TVP_ACTION_INVOKE`) |
 //! | `beginTransition` | queues a next-poll completion callback; interpolation remains a stub |
-//! | `pileRect`, `piledCopy`, `blendRect`, `convertType`, `setCenter`, `setAffineOffset`, `drawImage*`, `drawGlyph/String/Curve/Pie/Ellipse/Path`, `stopTransition` | no-op stubs (pixel ops: later) |
+//! | properties `focusable`, `focused`, `enabled`, `nodeVisible`, `nodeEnabled`, `nodeFocusable`, `isPrimary`, `clipLeft/Top/Width/Height`, `attention*`, `name` | focus/node/clip state (reference `LayerIntf.cpp`) |
+//! | `drawGlyph`, `drawPath`, `drawString`, `drawRectangles`, `drawCurve2/3`, `drawClosedCurve*`, `setCenter`, `setAffineOffset`, `stopTransition` | no-op stubs (pixel ops: later) |
 
 use std::collections::HashSet;
 use std::ffi::{c_char, c_int, c_void};
@@ -82,7 +90,7 @@ use tvp_text::{
 
 use super::ffi::{
     arg_bool, arg_f64, arg_i64, arg_string, error_out, instance_ref, set_int_out, set_null_out,
-    set_void_out,
+    set_string_out, set_void_out,
 };
 use super::gdiplus::{AppearanceState, BrushKind, DrawKind};
 use super::layer_ops::{self, RectI};
@@ -422,11 +430,19 @@ extern "C" fn layer_set_image_size(
     0
 }
 
-/// `copyRect(dx, dy, src, sx, sy, sw, sh)` — the game's `Button.create`
-/// passes a `Bitmap` object and copies the whole sheet into the layer's main
-/// image. Full pixel blitting is not modelled yet; we attach the source
-/// bitmap and size the image to the copied region, which renders the same
-/// for the full-sheet copy the title UI uses.
+/// `copyRect(dx, dy, src, sx, sy, sw, sh)` — copy a source region onto the
+/// layer's main image at `(dx, dy)`.
+///
+/// Reference `tTJSNI_BaseLayer::CopyRect` (`LayerIntf.cpp:4574`; native
+/// `:8793`) resolves `src` as either a `Layer` (its main image) or a
+/// `Bitmap`, clips the destination against both the main image and the
+/// layer's `ClipRect`, and blits the source rect. This is the busiest sprite
+/// path: `system/Album.tjs` `drawCompleteNumber` composes each digit from a
+/// sub-rect of a number sheet onto one layer. The destination is allocated
+/// when the layer has no image yet (the reference throws
+/// `TVPNotDrawableLayerType`; every game caller allocates first via
+/// `copyFromBitmapToMainImage`, and allocating keeps the copy from being a
+/// silent no-op).
 extern "C" fn layer_copy_rect(
     _engine: *mut c_void,
     instance: *mut c_void,
@@ -438,34 +454,623 @@ extern "C" fn layer_copy_rect(
 ) -> c_int {
     // SAFETY: argv/out/out_error are valid for the call.
     let args = unsafe { super::ffi::args(argc, argv) };
-    let Some(src_arg) = args.get(2) else {
-        return error_out(out_error, "Layer.copyRect requires a source image");
-    };
+    if args.len() < 7 {
+        return error_out(out_error, "Layer.copyRect requires 7 arguments");
+    }
+    // Resolve the source object before taking the scene lock (reading the
+    // layer's `hasImage` re-enters the scene).
     let engine = crate::natives::context_engine();
-    let bitmap_id = match resolve_object_id_arg(engine, src_arg) {
-        Ok(id) => id,
-        Err(e) => return error_out(out_error, &e),
+    let (kind, src_id) = match resolve_image_source(engine, &args[2]) {
+        Ok(v) => v,
+        Err(_) => return error_out(out_error, "Layer.copyRect expects a Layer or Bitmap"),
+    };
+    let dx = arg_i64(&args[0]) as i32;
+    let dy = arg_i64(&args[1]) as i32;
+    let sx = arg_i64(&args[3]) as i32;
+    let sy = arg_i64(&args[4]) as i32;
+    let sw = arg_i64(&args[5]);
+    let sh = arg_i64(&args[6]);
+    if sw <= 0 || sh <= 0 {
+        set_void_out(out);
+        return 0;
+    }
+    let srcrect = (
+        sx,
+        sy,
+        sx.saturating_add(sw as i32),
+        sy.saturating_add(sh as i32),
+    );
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let mut scene = context_scene_mut();
+    let Some(src_bmp) = tile_bitmap_for_source(&scene, kind, src_id) else {
+        return error_out(out_error, "Layer.copyRect: source has no image");
+    };
+    let Some(layer) = scene.layer(inst.id) else {
+        return error_out(out_error, "Layer: layer no longer exists");
+    };
+    let clip = layer_pixel_rect(layer);
+    let bitmap_id = match layer.bitmap {
+        Some(id) => id,
+        None => {
+            let w = (dx + (srcrect.2 - srcrect.0)).max(1) as u32;
+            let h = (dy + (srcrect.3 - srcrect.1)).max(1) as u32;
+            let id = scene.add_bitmap(w, h, vec![0u8; (w as usize) * (h as usize) * 4]);
+            if let Some(layer) = scene.layer_mut(inst.id) {
+                layer.bitmap = Some(id);
+                internal_set_image_size(layer, w, h);
+            }
+            id
+        }
+    };
+    if let Some(dst) = scene.bitmap_mut(bitmap_id) {
+        layer_ops::blit_over(dst, dx, dy, &src_bmp, srcrect, clip, 255, false);
+    }
+    set_void_out(out);
+    0
+}
+
+/// `copyToBitmapFromMainImage(bitmap)` — copy the layer's main image into a
+/// `Bitmap`. Reference `tTJSNI_BaseLayer::CopyFromMainImage`
+/// (`LayerIntf.cpp:2482`; native `:9893`).
+extern "C" fn layer_copy_to_bitmap_from_main_image(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    let Some(&bmp_arg) = args.first() else {
+        return error_out(
+            out_error,
+            "Layer.copyToBitmapFromMainImage requires a Bitmap",
+        );
+    };
+    let engine = context_engine();
+    let bmp_id = match resolve_object_id_arg(engine, &bmp_arg) {
+        Ok(id) if id >= 0 => id as u32,
+        _ => {
+            return error_out(
+                out_error,
+                "Layer.copyToBitmapFromMainImage expects a Bitmap",
+            );
+        }
     };
     let inst = unsafe { instance_ref::<LayerInst>(instance) };
     let mut scene = context_scene_mut();
-    // `src` may be a `Bitmap` (its id is a bitmap id) or a `Layer` (the
-    // reference accepts both: a Layer contributes its main image). Resolve
-    // the object id against the scene so a Layer source copies its bitmap.
-    let bitmap = if bitmap_id < 0 {
-        None
-    } else if scene.bitmap(bitmap_id as u32).is_some() {
-        Some(bitmap_id as u32)
-    } else if let Some(src_layer) = scene.layer(bitmap_id as u32) {
-        src_layer.bitmap
-    } else {
-        return error_out(out_error, "Layer.copyRect: no such bitmap");
+    let Some(src_id) = scene.layer(inst.id).and_then(|l| l.bitmap) else {
+        return error_out(
+            out_error,
+            "Layer.copyToBitmapFromMainImage: layer has no image",
+        );
     };
-    // The copied source region size (args 5/6) if provided, else the bitmap
-    // size; the renderer maps `image_width/height` onto the bitmap pixels.
-    let Some(layer) = scene.layer_mut(inst.id) else {
+    let Some(src) = scene.bitmap(src_id) else {
+        return error_out(out_error, "Layer.copyToBitmapFromMainImage: no such bitmap");
+    };
+    let (w, h, rgba) = (src.width, src.height, src.rgba.clone());
+    let Some(dst) = scene.bitmap_mut(bmp_id) else {
+        return error_out(
+            out_error,
+            "Layer.copyToBitmapFromMainImage: no destination bitmap",
+        );
+    };
+    dst.width = w;
+    dst.height = h;
+    dst.rgba = rgba;
+    dst.mark_dirty();
+    set_void_out(out);
+    0
+}
+
+/// `convertType(fromtype)` — reference `ConvertLayerType`
+/// (`LayerIntf.cpp:1984`; native `:9648`). Converts between the alpha and
+/// additive-alpha pixel representations (`dfAlpha` = 0, `dfAddAlpha` = 4);
+/// any other direction throws like the reference.
+extern "C" fn layer_convert_type(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    const DF_ALPHA: i32 = 0;
+    const DF_ADD_ALPHA: i32 = 4;
+    let args = unsafe { super::ffi::args(argc, argv) };
+    let Some(&arg) = args.first() else {
+        return error_out(out_error, "Layer.convertType requires a face");
+    };
+    let fromtype = arg_i64(&arg) as i32;
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let mut scene = context_scene_mut();
+    let Some(layer) = scene.layer(inst.id) else {
         return error_out(out_error, "Layer: layer no longer exists");
     };
-    layer.bitmap = bitmap;
+    let face = layer_draw_face(layer);
+    let clip = layer_pixel_rect(layer);
+    let Some(bitmap_id) = layer.bitmap else {
+        return error_out(out_error, "Layer.convertType: layer has no image");
+    };
+    if face == DF_ADD_ALPHA && fromtype == DF_ALPHA {
+        if let Some(b) = scene.bitmap_mut(bitmap_id) {
+            layer_ops::convert_alpha_to_add_alpha(b, clip);
+        }
+    } else if face == DF_ALPHA && fromtype == DF_ADD_ALPHA {
+        if let Some(b) = scene.bitmap_mut(bitmap_id) {
+            layer_ops::convert_add_alpha_to_alpha(b, clip);
+        }
+    } else {
+        return error_out(
+            out_error,
+            "Layer.convertType: cannot convert in that direction",
+        );
+    }
+    set_void_out(out);
+    0
+}
+
+/// Shared body for `pileRect`/`blendRect` (and `piledCopy` via
+/// `direct_copy`): reference `PileRect` (`LayerIntf.cpp:5112`), `BlendRect`
+/// (`:5171`) and `PiledCopy` (`:4529`). `treat_as_opaque` selects the
+/// constant-alpha `bmCopyOnAlpha` path (blendRect treats the source as a
+/// fully opaque image).
+#[allow(clippy::too_many_arguments)]
+fn layer_legacy_rect_common(
+    argc: c_int,
+    argv: *const Value,
+    instance: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    treat_as_opaque: bool,
+    direct_copy: bool,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    if args.len() < 7 {
+        return error_out(out_error, "Layer.pileRect/blendRect requires 7 arguments");
+    }
+    let engine = context_engine();
+    let (kind, src_id) = match resolve_image_source(engine, &args[2]) {
+        Ok(v) => v,
+        Err(_) => {
+            return error_out(
+                out_error,
+                "Layer.pileRect/blendRect expects a Layer or Bitmap",
+            );
+        }
+    };
+    let dx = arg_i64(&args[0]) as i32;
+    let dy = arg_i64(&args[1]) as i32;
+    let sx = arg_i64(&args[3]) as i32;
+    let sy = arg_i64(&args[4]) as i32;
+    let sw = arg_i64(&args[5]);
+    let sh = arg_i64(&args[6]);
+    let opa = if direct_copy {
+        255
+    } else {
+        args.get(7).map(arg_i64).unwrap_or(255).clamp(0, 255) as u8
+    };
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let mut scene = context_scene_mut();
+    let Some(src) = tile_bitmap_for_source(&scene, kind, src_id) else {
+        return error_out(out_error, "Layer.pileRect/blendRect: source has no image");
+    };
+    let Some(layer) = scene.layer(inst.id) else {
+        return error_out(out_error, "Layer: layer no longer exists");
+    };
+    let clip = layer_pixel_rect(layer);
+    let Some(bitmap_id) = layer.bitmap else {
+        return error_out(out_error, "Layer.pileRect/blendRect: layer has no image");
+    };
+    let srcrect = (
+        sx,
+        sy,
+        sx.saturating_add(sw as i32),
+        sy.saturating_add(sh as i32),
+    );
+    if let Some(dst) = scene.bitmap_mut(bitmap_id) {
+        if direct_copy {
+            layer_ops::blit_copy_clipped(dst, dx, dy, &src, srcrect, clip);
+        } else {
+            layer_ops::blit_over(dst, dx, dy, &src, srcrect, clip, opa, treat_as_opaque);
+        }
+    }
+    set_void_out(out);
+    0
+}
+
+/// `piledCopy(dx, dy, src, sx, sy, sw, sh)` — reference `PiledCopy`
+/// (`LayerIntf.cpp:4529`; native `:8755`). Direct copy of the source main
+/// image, ignoring draw faces.
+extern "C" fn layer_piled_copy(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    layer_legacy_rect_common(argc, argv, instance, out, out_error, false, true)
+}
+
+/// `pileRect(dx, dy, src, sx, sy, sw, sh[, opacity])` — reference `PileRect`
+/// (`LayerIntf.cpp:5112`; native `:8825`). Pixel alpha blend.
+extern "C" fn layer_pile_rect(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    layer_legacy_rect_common(argc, argv, instance, out, out_error, false, false)
+}
+
+/// `blendRect(dx, dy, src, sx, sy, sw, sh[, opacity])` — reference
+/// `BlendRect` (`LayerIntf.cpp:5171`; native `:8860`). Constant-alpha blend
+/// that treats the source as opaque.
+extern "C" fn layer_blend_rect(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    layer_legacy_rect_common(argc, argv, instance, out, out_error, true, false)
+}
+
+/// `copy9Patch(src)` — reference `Copy9Patch` (`LayerIntf.cpp:4655`; native
+/// `:8894`). Derives the 9-slice margins from the source border alpha runs
+/// and scales the image to fill the layer's main image.
+extern "C" fn layer_copy_9patch(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    let Some(src_arg) = args.first() else {
+        return error_out(out_error, "Layer.copy9Patch requires a source image");
+    };
+    let engine = context_engine();
+    let (kind, src_id) = match resolve_image_source(engine, src_arg) {
+        Ok(v) => v,
+        Err(_) => return error_out(out_error, "Layer.copy9Patch expects a Layer or Bitmap"),
+    };
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let mut scene = context_scene_mut();
+    let Some(src) = tile_bitmap_for_source(&scene, kind, src_id) else {
+        return error_out(out_error, "Layer.copy9Patch: source has no image");
+    };
+    let Some(bitmap_id) = scene.layer(inst.id).and_then(|l| l.bitmap) else {
+        return error_out(out_error, "Layer.copy9Patch: layer has no image");
+    };
+    if let Some(dst) = scene.bitmap_mut(bitmap_id) {
+        let _ = layer_ops::copy_9patch(dst, &src);
+    }
+    set_void_out(out);
+    0
+}
+
+/// `drawEllipse(app, x, y, width, height)` — the `layerExDraw` plugin's
+/// GDI+ ellipse: fill with brushes and stroke with pens via the shared
+/// appearance path.
+extern "C" fn layer_draw_ellipse(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    if args.len() < 5 {
+        return error_out(out_error, "Layer.drawEllipse requires (app, x, y, w, h)");
+    }
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let pts = raster::flatten_arc(
+        arg_f64(&args[1]),
+        arg_f64(&args[2]),
+        arg_f64(&args[3]),
+        arg_f64(&args[4]),
+        0.0,
+        360.0,
+    );
+    if pts.len() >= 2
+        && let Err(e) = draw_gdiplus_path(inst.id, &args[0], &pts, true, true)
+    {
+        return error_out(out_error, &e);
+    }
+    set_void_out(out);
+    0
+}
+
+/// `drawPie(app, x, y, width, height, startAngle, sweepAngle)` — a pie slice
+/// (center + arc), filled and stroked.
+extern "C" fn layer_draw_pie(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    if args.len() < 7 {
+        return error_out(
+            out_error,
+            "Layer.drawPie requires (app, x, y, w, h, start, sweep)",
+        );
+    }
+    let (x, y, w, h) = (
+        arg_f64(&args[1]),
+        arg_f64(&args[2]),
+        arg_f64(&args[3]),
+        arg_f64(&args[4]),
+    );
+    let mut pts = vec![(x + w / 2.0, y + h / 2.0)];
+    pts.extend(raster::flatten_arc(
+        x,
+        y,
+        w,
+        h,
+        arg_f64(&args[5]),
+        arg_f64(&args[6]),
+    ));
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    if pts.len() >= 2
+        && let Err(e) = draw_gdiplus_path(inst.id, &args[0], &pts, true, true)
+    {
+        return error_out(out_error, &e);
+    }
+    set_void_out(out);
+    0
+}
+
+/// `drawCurve(app, points)` — a cardinal (Catmull-Rom) spline through the
+/// points, stroked with the appearance pens.
+extern "C" fn layer_draw_curve(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    if args.len() < 2 {
+        return error_out(out_error, "Layer.drawCurve requires (app, points)");
+    }
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let pts = catmull_rom_path(&parse_points(context_engine(), &args[1]));
+    if pts.len() >= 2
+        && let Err(e) = draw_gdiplus_path(inst.id, &args[0], &pts, false, false)
+    {
+        return error_out(out_error, &e);
+    }
+    set_void_out(out);
+    0
+}
+
+/// Shared `drawImage*` body: resolve the source and blit it source-over onto
+/// the layer's main image, clipped to the layer `ClipRect`.
+#[allow(clippy::too_many_arguments)]
+fn layer_draw_image_common(
+    instance: *mut c_void,
+    src_arg: &Value,
+    srcrect: RectI,
+    destrect: RectI,
+    stretch: bool,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    let engine = context_engine();
+    let (kind, src_id) = match resolve_image_source(engine, src_arg) {
+        Ok(v) => v,
+        Err(_) => return error_out(out_error, "Layer.drawImage* expects a Layer or Bitmap"),
+    };
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let mut scene = context_scene_mut();
+    let Some(src) = tile_bitmap_for_source(&scene, kind, src_id) else {
+        return error_out(out_error, "Layer.drawImage*: source has no image");
+    };
+    let Some(layer) = scene.layer(inst.id) else {
+        return error_out(out_error, "Layer: layer no longer exists");
+    };
+    let clip = layer_pixel_rect(layer);
+    let Some(bitmap_id) = layer.bitmap else {
+        return error_out(out_error, "Layer.drawImage*: layer has no image");
+    };
+    if let Some(dst) = scene.bitmap_mut(bitmap_id) {
+        if stretch {
+            layer_ops::stretch_blit_mode(dst, destrect, &src, srcrect, 0, 2, 255);
+        } else {
+            layer_ops::blit_over(dst, destrect.0, destrect.1, &src, srcrect, clip, 255, false);
+        }
+    }
+    set_void_out(out);
+    0
+}
+
+/// `drawImage(dleft, dtop, src)` — 1:1 image blit.
+extern "C" fn layer_draw_image(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    if args.len() < 3 {
+        return error_out(out_error, "Layer.drawImage requires (dleft, dtop, src)");
+    }
+    let dleft = arg_i64(&args[0]) as i32;
+    let dtop = arg_i64(&args[1]) as i32;
+    let (w, h) = {
+        let engine = context_engine();
+        match resolve_image_source(engine, &args[2]) {
+            Ok((kind, id)) => {
+                let scene = context_scene_read();
+                tile_bitmap_for_source(&scene, kind, id)
+                    .map(|b| (b.width as i32, b.height as i32))
+                    .unwrap_or((0, 0))
+            }
+            Err(_) => (0, 0),
+        }
+    };
+    layer_draw_image_common(
+        instance,
+        &args[2],
+        (0, 0, w, h),
+        (dleft, dtop, dleft + w, dtop + h),
+        false,
+        out,
+        out_error,
+    )
+}
+
+/// `drawImageRect(dleft, dtop, src, sleft, stop, swidth, sheight)`.
+extern "C" fn layer_draw_image_rect(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    if args.len() < 7 {
+        return error_out(out_error, "Layer.drawImageRect requires 7 arguments");
+    }
+    let dleft = arg_i64(&args[0]) as i32;
+    let dtop = arg_i64(&args[1]) as i32;
+    let sl = arg_i64(&args[3]) as i32;
+    let st = arg_i64(&args[4]) as i32;
+    let sw = arg_i64(&args[5]) as i32;
+    let sh = arg_i64(&args[6]) as i32;
+    layer_draw_image_common(
+        instance,
+        &args[2],
+        (sl, st, sl + sw, st + sh),
+        (dleft, dtop, dleft + sw, dtop + sh),
+        false,
+        out,
+        out_error,
+    )
+}
+
+/// `drawImageStretch(dleft, dtop, dwidth, dheight, src, sleft, stop, swidth,
+/// sheight)`.
+extern "C" fn layer_draw_image_stretch(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    if args.len() < 9 {
+        return error_out(out_error, "Layer.drawImageStretch requires 9 arguments");
+    }
+    let dleft = arg_i64(&args[0]) as i32;
+    let dtop = arg_i64(&args[1]) as i32;
+    let dw = arg_i64(&args[2]) as i32;
+    let dh = arg_i64(&args[3]) as i32;
+    let sl = arg_i64(&args[5]) as i32;
+    let st = arg_i64(&args[6]) as i32;
+    let sw = arg_i64(&args[7]) as i32;
+    let sh = arg_i64(&args[8]) as i32;
+    layer_draw_image_common(
+        instance,
+        &args[4],
+        (sl, st, sl + sw, st + sh),
+        (dleft, dtop, dleft + dw, dtop + dh),
+        true,
+        out,
+        out_error,
+    )
+}
+
+/// `drawImageAffine(src, sleft, stop, swidth, sheight, affine, A, B, C, D, E,
+/// F)`.
+extern "C" fn layer_draw_image_affine(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    if args.len() < 12 {
+        return error_out(out_error, "Layer.drawImageAffine requires 12 arguments");
+    }
+    let engine = context_engine();
+    let (kind, src_id) = match resolve_image_source(engine, &args[0]) {
+        Ok(v) => v,
+        Err(_) => return error_out(out_error, "Layer.drawImageAffine expects a Layer or Bitmap"),
+    };
+    let sl = arg_i64(&args[1]) as i32;
+    let st = arg_i64(&args[2]) as i32;
+    let sw = arg_i64(&args[3]) as i32;
+    let sh = arg_i64(&args[4]) as i32;
+    let is_matrix = arg_bool(&args[5]);
+    let f = |i: usize| arg_f64(&args[i]);
+    let left = f64::from(sl);
+    let top = f64::from(st);
+    let (p0, p1, p2) = if is_matrix {
+        let (a, b, c, d, tx, ty) = (f(6), f(7), f(8), f(9), f(10), f(11));
+        let map = |x: f64, y: f64| (a * x + c * y + tx, b * x + d * y + ty);
+        (
+            map(left, top),
+            map(left + f64::from(sw), top),
+            map(left, top + f64::from(sh)),
+        )
+    } else {
+        ((f(6), f(7)), (f(8), f(9)), (f(10), f(11)))
+    };
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let mut scene = context_scene_mut();
+    let Some(src) = tile_bitmap_for_source(&scene, kind, src_id) else {
+        return error_out(out_error, "Layer.drawImageAffine: source has no image");
+    };
+    let srcrect = (sl, st, sl + sw, st + sh);
+    let Some(bitmap_id) = scene.layer(inst.id).and_then(|l| l.bitmap) else {
+        return error_out(out_error, "Layer.drawImageAffine: layer has no image");
+    };
+    if let Some(dst) = scene.bitmap_mut(bitmap_id) {
+        layer_ops::affine_blit(
+            dst,
+            p0,
+            p1,
+            p2,
+            &src,
+            srcrect,
+            0,
+            2,
+            255,
+            false,
+            [0, 0, 0, 0],
+        );
+    }
     set_void_out(out);
     0
 }
@@ -1092,6 +1697,90 @@ layer_int_prop!(
     |l: &LayerState| i64::from(l.image_top),
     |l: &mut LayerState, v: &Value| l.image_top = arg_i64(v) as i32
 );
+// Reference `Focusable`/`Enabled`: whether the layer may receive focus and
+// whether its input/attention is active.
+layer_int_prop!(
+    layer_focusable_get,
+    layer_focusable_set,
+    |l: &LayerState| i64::from(l.focusable),
+    |l: &mut LayerState, v: &Value| l.focusable = arg_bool(v)
+);
+layer_int_prop!(
+    layer_enabled_get,
+    layer_enabled_set,
+    |l: &LayerState| i64::from(l.enabled),
+    |l: &mut LayerState, v: &Value| l.enabled = arg_bool(v)
+);
+// `cached`/`imageModified` (reference flags; stored and round-tripped).
+layer_int_prop!(
+    layer_cached_get,
+    layer_cached_set,
+    |l: &LayerState| i64::from(l.cached),
+    |l: &mut LayerState, v: &Value| l.cached = arg_bool(v)
+);
+layer_int_prop!(
+    layer_image_modified_get,
+    layer_image_modified_set,
+    |l: &LayerState| i64::from(l.image_modified),
+    |l: &mut LayerState, v: &Value| l.image_modified = arg_bool(v)
+);
+// Attention anchor and participation (reference `attention*`/`useAttention`).
+layer_int_prop!(
+    layer_attention_left_get,
+    layer_attention_left_set,
+    |l: &LayerState| i64::from(l.attention_left),
+    |l: &mut LayerState, v: &Value| l.attention_left = arg_i64(v) as i32
+);
+layer_int_prop!(
+    layer_attention_top_get,
+    layer_attention_top_set,
+    |l: &LayerState| i64::from(l.attention_top),
+    |l: &mut LayerState, v: &Value| l.attention_top = arg_i64(v) as i32
+);
+layer_int_prop!(
+    layer_use_attention_get,
+    layer_use_attention_set,
+    |l: &LayerState| i64::from(l.use_attention),
+    |l: &mut LayerState, v: &Value| l.use_attention = arg_bool(v)
+);
+// Hint-system flags, IME mode, neutral color and order-mode flags (all
+// stored and round-tripped; the input/attention systems read them later).
+layer_int_prop!(
+    layer_show_parent_hint_get,
+    layer_show_parent_hint_set,
+    |l: &LayerState| i64::from(l.show_parent_hint),
+    |l: &mut LayerState, v: &Value| l.show_parent_hint = arg_bool(v)
+);
+layer_int_prop!(
+    layer_ignore_hint_sensing_get,
+    layer_ignore_hint_sensing_set,
+    |l: &LayerState| i64::from(l.ignore_hint_sensing),
+    |l: &mut LayerState, v: &Value| l.ignore_hint_sensing = arg_bool(v)
+);
+layer_int_prop!(
+    layer_ime_mode_get,
+    layer_ime_mode_set,
+    |l: &LayerState| i64::from(l.ime_mode),
+    |l: &mut LayerState, v: &Value| l.ime_mode = arg_i64(v) as i32
+);
+layer_int_prop!(
+    layer_neutral_color_get,
+    layer_neutral_color_set,
+    |l: &LayerState| l.neutral_color,
+    |l: &mut LayerState, v: &Value| l.neutral_color = arg_i64(v)
+);
+layer_int_prop!(
+    layer_absolute_order_mode_get,
+    layer_absolute_order_mode_set,
+    |l: &LayerState| i64::from(l.absolute_order_mode),
+    |l: &mut LayerState, v: &Value| l.absolute_order_mode = arg_bool(v)
+);
+layer_int_prop!(
+    layer_call_on_paint_get,
+    layer_call_on_paint_set,
+    |l: &LayerState| i64::from(l.call_on_paint),
+    |l: &mut LayerState, v: &Value| l.call_on_paint = arg_bool(v)
+);
 
 /// `opacity` — layer opacity in TJS2's 0..255 scale. The scene stores
 /// 0..1; the getter returns `round(opacity * 255)` and the setter clamps
@@ -1178,6 +1867,322 @@ extern "C" fn layer_image_height_get(
             .map_or(0, |b| b.height)
     };
     set_int_out(out, i64::from(h));
+    0
+}
+
+/// `nodeVisible` — reference `GetNodeVisible`: `visible` and every ancestor
+/// visible.
+extern "C" fn layer_node_visible_get(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let scene = context_scene_read();
+    if scene.layer(inst.id).is_none() {
+        return error_out(out_error, "Layer: layer no longer exists");
+    }
+    set_int_out(out, i64::from(scene.node_visible(inst.id)));
+    0
+}
+
+/// `nodeEnabled` — reference `GetNodeEnabled`: `enabled` and every ancestor
+/// enabled.
+extern "C" fn layer_node_enabled_get(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let scene = context_scene_read();
+    if scene.layer(inst.id).is_none() {
+        return error_out(out_error, "Layer: layer no longer exists");
+    }
+    set_int_out(out, i64::from(scene.node_enabled(inst.id)));
+    0
+}
+
+/// `nodeFocusable` — `focusable` and the node visible/enabled.
+extern "C" fn layer_node_focusable_get(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let scene = context_scene_read();
+    let Some(layer) = scene.layer(inst.id) else {
+        return error_out(out_error, "Layer: layer no longer exists");
+    };
+    let focusable = scene.node_visible(inst.id) && scene.node_enabled(inst.id) && layer.focusable;
+    set_int_out(out, i64::from(focusable));
+    0
+}
+
+/// `focused` — whether this layer holds the window's focus (reference
+/// `tTVPLayerManager::GetFocusedLayer`).
+extern "C" fn layer_focused_get(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let scene = context_scene_read();
+    let Some(layer) = scene.layer(inst.id) else {
+        return error_out(out_error, "Layer: layer no longer exists");
+    };
+    let focused = scene
+        .window(layer.window)
+        .is_some_and(|w| w.focused_layer == Some(inst.id));
+    set_int_out(out, i64::from(focused));
+    0
+}
+
+/// `isPrimary` — whether this is the window's primary layer.
+extern "C" fn layer_is_primary_get(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let scene = context_scene_read();
+    let Some(layer) = scene.layer(inst.id) else {
+        return error_out(out_error, "Layer: layer no longer exists");
+    };
+    set_int_out(out, i64::from(layer.is_primary));
+    0
+}
+
+/// Effective `ClipRect` `(left, top, width, height)` in image pixels;
+/// `None` means the whole image (initialized to the image size).
+fn effective_clip(scene: &Scene, layer: &LayerState) -> (i32, i32, i32, i32) {
+    match layer.clip {
+        Some(c) => (c.x, c.y, c.w as i32, c.h as i32),
+        None => {
+            let w = if layer.image_width > 0 {
+                layer.image_width
+            } else {
+                layer
+                    .bitmap
+                    .and_then(|id| scene.bitmap(id))
+                    .map_or(0, |b| b.width)
+            };
+            let h = if layer.image_height > 0 {
+                layer.image_height
+            } else {
+                layer
+                    .bitmap
+                    .and_then(|id| scene.bitmap(id))
+                    .map_or(0, |b| b.height)
+            };
+            (0, 0, w as i32, h as i32)
+        }
+    }
+}
+
+/// Shared getter body for `clipLeft`/`clipTop`/`clipWidth`/`clipHeight`.
+fn layer_clip_component_get(
+    instance: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    component: usize,
+) -> c_int {
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let scene = context_scene_read();
+    let Some(layer) = scene.layer(inst.id) else {
+        return error_out(out_error, "Layer: layer no longer exists");
+    };
+    let c = effective_clip(&scene, layer);
+    let value = [c.0, c.1, c.2, c.3][component];
+    set_int_out(out, i64::from(value));
+    0
+}
+
+/// Shared setter body: materialize `layer.clip` from the current effective
+/// clip and replace one component.
+fn layer_clip_component_set(instance: *mut c_void, value: *const Value, component: usize) -> c_int {
+    let v = unsafe { &*value };
+    let n = arg_i64(v) as i32;
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let mut scene = context_scene_mut();
+    let Some(layer) = scene.layer(inst.id) else {
+        return 1;
+    };
+    let mut c = effective_clip(&scene, layer);
+    match component {
+        0 => c.0 = n,
+        1 => c.1 = n,
+        2 => c.2 = n.max(0),
+        _ => c.3 = n.max(0),
+    }
+    if let Some(layer) = scene.layer_mut(inst.id) {
+        layer.clip = Some(crate::scene::Rect {
+            x: c.0,
+            y: c.1,
+            w: c.2.max(0) as u32,
+            h: c.3.max(0) as u32,
+        });
+    }
+    0
+}
+
+extern "C" fn layer_clip_left_get(
+    _e: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _o: *mut c_void,
+) -> c_int {
+    layer_clip_component_get(instance, out, out_error, 0)
+}
+extern "C" fn layer_clip_left_set(
+    _e: *mut c_void,
+    instance: *mut c_void,
+    value: *const Value,
+    _o: *mut *mut c_char,
+    _t: *mut c_void,
+) -> c_int {
+    layer_clip_component_set(instance, value, 0)
+}
+extern "C" fn layer_clip_top_get(
+    _e: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _o: *mut c_void,
+) -> c_int {
+    layer_clip_component_get(instance, out, out_error, 1)
+}
+extern "C" fn layer_clip_top_set(
+    _e: *mut c_void,
+    instance: *mut c_void,
+    value: *const Value,
+    _o: *mut *mut c_char,
+    _t: *mut c_void,
+) -> c_int {
+    layer_clip_component_set(instance, value, 1)
+}
+extern "C" fn layer_clip_width_get(
+    _e: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _o: *mut c_void,
+) -> c_int {
+    layer_clip_component_get(instance, out, out_error, 2)
+}
+extern "C" fn layer_clip_width_set(
+    _e: *mut c_void,
+    instance: *mut c_void,
+    value: *const Value,
+    _o: *mut *mut c_char,
+    _t: *mut c_void,
+) -> c_int {
+    layer_clip_component_set(instance, value, 2)
+}
+extern "C" fn layer_clip_height_get(
+    _e: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _o: *mut c_void,
+) -> c_int {
+    layer_clip_component_get(instance, out, out_error, 3)
+}
+extern "C" fn layer_clip_height_set(
+    _e: *mut c_void,
+    instance: *mut c_void,
+    value: *const Value,
+    _o: *mut *mut c_char,
+    _t: *mut c_void,
+) -> c_int {
+    layer_clip_component_set(instance, value, 3)
+}
+
+/// `layer.name` — a script label (reference `Name`).
+extern "C" fn layer_name_get(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let scene = context_scene_read();
+    let Some(layer) = scene.layer(inst.id) else {
+        return error_out(out_error, "Layer: layer no longer exists");
+    };
+    set_string_out(out, &layer.name);
+    0
+}
+
+extern "C" fn layer_name_set(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    value: *const Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let v = unsafe { &*value };
+    let name = if v.ty == tjs2_sys::VAL_STRING {
+        arg_string(v)
+    } else {
+        String::new()
+    };
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let mut scene = context_scene_mut();
+    let Some(layer) = scene.layer_mut(inst.id) else {
+        return 1;
+    };
+    layer.name = name;
+    0
+}
+
+/// `layer.hint` — the hint-system tooltip text (reference `Hint`).
+extern "C" fn layer_hint_get(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let scene = context_scene_read();
+    let Some(layer) = scene.layer(inst.id) else {
+        return error_out(out_error, "Layer: layer no longer exists");
+    };
+    set_string_out(out, &layer.hint);
+    0
+}
+
+extern "C" fn layer_hint_set(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    value: *const Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let v = unsafe { &*value };
+    let hint = if v.ty == tjs2_sys::VAL_STRING {
+        arg_string(v)
+    } else {
+        String::new()
+    };
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let mut scene = context_scene_mut();
+    let Some(layer) = scene.layer_mut(inst.id) else {
+        return 1;
+    };
+    layer.hint = hint;
     0
 }
 
@@ -1443,16 +2448,53 @@ extern "C" fn layer_set_cursor_pos(
     0
 }
 
-/// `focus()` — no-op (input is beyond milestone 3A).
+/// `focus([direction])` — reference `tTJSNI_BaseLayer::SetFocus`
+/// (`LayerIntf.cpp:3561`; native `:9726`). Gives this layer keyboard focus
+/// within its window, dispatching `onBlur` to the previous holder and
+/// `onFocus(prev, direction)` to this layer (the reference fires the events
+/// on the layer's own object).
 extern "C" fn layer_focus(
     _engine: *mut c_void,
-    _instance: *mut c_void,
-    _argc: c_int,
-    _argv: *const Value,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
     out: *mut Value,
-    _out_error: *mut *mut c_char,
+    out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    let direction = args.first().map(arg_bool).unwrap_or(false);
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let (prev, current) = {
+        let mut scene = context_scene_mut();
+        if scene.layer(inst.id).is_none() {
+            return error_out(out_error, "Layer: layer no longer exists");
+        }
+        scene.set_focus(inst.id)
+    };
+    let engine = crate::natives::context_engine();
+    if let Some(prev_id) = prev
+        && prev_id != inst.id
+    {
+        let obj = super::layer_tjs_object(prev_id);
+        if !obj.is_null()
+            && let Ok(dv) = engine.retain_object_detached(obj)
+        {
+            let _ = engine.call_member(dv.raw_id(), "onBlur", &[TjsValue::Void]);
+        }
+    }
+    if current.is_some() {
+        let obj = super::layer_tjs_object(inst.id);
+        if !obj.is_null()
+            && let Ok(dv) = engine.retain_object_detached(obj)
+        {
+            let _ = engine.call_member(
+                dv.raw_id(),
+                "onFocus",
+                &[TjsValue::Void, TjsValue::Integer(i64::from(direction))],
+            );
+        }
+    }
     set_void_out(out);
     0
 }
@@ -1898,6 +2940,30 @@ fn draw_gdiplus_path(
     Ok(())
 }
 
+/// A cardinal (Catmull-Rom) spline through `pts`, flattened to a polyline
+/// (the `layerExDraw` plugin's `drawCurve`).
+fn catmull_rom_path(pts: &[(f64, f64)]) -> Vec<(f64, f64)> {
+    if pts.len() < 2 {
+        return pts.to_vec();
+    }
+    let mut out = vec![pts[0]];
+    for i in 0..pts.len() - 1 {
+        let p0 = if i == 0 { pts[0] } else { pts[i - 1] };
+        let p1 = pts[i];
+        let p2 = pts[i + 1];
+        let p3 = if i + 2 < pts.len() {
+            pts[i + 2]
+        } else {
+            pts[i + 1]
+        };
+        let c1 = (p1.0 + (p2.0 - p0.0) / 6.0, p1.1 + (p2.1 - p0.1) / 6.0);
+        let c2 = (p2.0 - (p3.0 - p1.0) / 6.0, p2.1 - (p3.1 - p1.1) / 6.0);
+        let seg = raster::flatten_cubic(p1, c1, c2, p2, 16);
+        out.extend_from_slice(&seg[1..]);
+    }
+    out
+}
+
 /// `drawPolygon(app, points)` — closed polygon: fill with brushes, stroke
 /// with pens.
 extern "C" fn layer_draw_polygon(
@@ -2201,10 +3267,11 @@ fn fallback_text_height(text: &str, height: u32) -> u32 {
 /// Composite a string from a `.tft` pre-rendered font.
 ///
 /// The caller guarantees `text` contains only characters present in `pfont`
-/// (plus newlines/controls). Glyphs are vertically centered in the em box,
-/// matching the vector layout convention. Synthetic rotation/italic are not
-/// applied because the `.tft` bitmap is already baked for its
-/// `(face, height, bold, italic, angle)` key.
+/// (plus newlines/controls). Ink is placed at the reference baseline:
+/// `left = pen_x + OriginX`, `top = line_top + ascent − OriginY`
+/// (`PrerenderedGlyph::left/top`; `LayerBitmapImpl.cpp:279`, `:913`).
+/// Synthetic rotation/italic are not applied because the `.tft` bitmap is
+/// already baked for its `(face, height, bold, italic, angle)` key.
 #[allow(clippy::too_many_arguments)]
 fn paint_prerendered_text(
     bitmap: &mut BitmapState,
@@ -2245,8 +3312,11 @@ fn paint_prerendered_text(
         let cov = pfont.rasterize(&glyph);
         let gw = glyph.width as i32;
         let gh = glyph.height as i32;
-        let top = pen_y + (line_height - gh) / 2;
-        let left = pen_x + glyph.origin_x as i32;
+        // Reference baseline placement: `OriginY` is the distance from the
+        // baseline up to the ink top, so the `.tft` glyphs honor it instead
+        // of being centered in the em box.
+        let top = glyph.top(pen_y, ascent);
+        let left = glyph.left(pen_x);
         for dy in 0..gh {
             for dx in 0..gw {
                 let mut a = cov[(dy * gw + dx) as usize];
@@ -3099,7 +4169,13 @@ extern "C" fn layer_operate_rect(
         return error_out(out_error, "Layer.operateRect: source has no image");
     };
     if mode == 128 {
-        mode = scene.layer(src_id).map_or(2, |l| l.blend_type);
+        // `omAuto` guesses from the source layer type; a `Bitmap` source has
+        // no layer type (default ltAlpha = 2).
+        mode = if kind == Some(false) {
+            2
+        } else {
+            scene.layer(src_id).map_or(2, |l| l.blend_type)
+        };
     }
     let srcrect = (
         sx,
@@ -3161,7 +4237,12 @@ fn layer_stretch_common(
         return error_out(out_error, "Layer.stretch*: source has no image");
     };
     if mode == 128 {
-        mode = scene.layer(src_id).map_or(2, |l| l.blend_type);
+        // `omAuto` from the source layer type; `Bitmap` defaults to ltAlpha.
+        mode = if kind == Some(false) {
+            2
+        } else {
+            scene.layer(src_id).map_or(2, |l| l.blend_type)
+        };
     }
     let destrect = (
         dx,
@@ -3285,7 +4366,12 @@ fn layer_affine_common(
         return error_out(out_error, "Layer.affine*: source has no image");
     };
     if mode == 128 {
-        mode = scene.layer(src_id).map_or(2, |l| l.blend_type);
+        // `omAuto` from the source layer type; `Bitmap` defaults to ltAlpha.
+        mode = if kind == Some(false) {
+            2
+        } else {
+            scene.layer(src_id).map_or(2, |l| l.blend_type)
+        };
     }
     let srcrect = (
         sx,
@@ -3681,25 +4767,14 @@ pub(crate) fn register_layer(engine: &Tjs2Engine) -> Result<(), String> {
         "drawRectangles",
         "drawClosedCurve",
         "drawClosedCurve2",
-        "drawCurve",
         "drawCurve2",
         "drawCurve3",
-        "drawPie",
-        "drawEllipse",
         "drawPath",
         "drawString",
-        "drawImage",
-        "drawImageRect",
-        "drawImageStretch",
-        "drawImageAffine",
         "setDefaultDrawTextParam",
         "resetDrawTextParam",
         "setFontStyle",
         "getDrawWidth",
-        "pileRect",
-        "piledCopy",
-        "blendRect",
-        "convertType",
         "stopTransition",
         "releaseCapture",
         "releaseTouchCapture",
@@ -4000,6 +5075,58 @@ pub(crate) fn register_layer(engine: &Tjs2Engine) -> Result<(), String> {
             name: "focus",
             f: layer_focus,
         },
+        NativeInstanceMethodDef {
+            name: "copyToBitmapFromMainImage",
+            f: layer_copy_to_bitmap_from_main_image,
+        },
+        NativeInstanceMethodDef {
+            name: "convertType",
+            f: layer_convert_type,
+        },
+        NativeInstanceMethodDef {
+            name: "piledCopy",
+            f: layer_piled_copy,
+        },
+        NativeInstanceMethodDef {
+            name: "pileRect",
+            f: layer_pile_rect,
+        },
+        NativeInstanceMethodDef {
+            name: "blendRect",
+            f: layer_blend_rect,
+        },
+        NativeInstanceMethodDef {
+            name: "copy9Patch",
+            f: layer_copy_9patch,
+        },
+        NativeInstanceMethodDef {
+            name: "drawEllipse",
+            f: layer_draw_ellipse,
+        },
+        NativeInstanceMethodDef {
+            name: "drawPie",
+            f: layer_draw_pie,
+        },
+        NativeInstanceMethodDef {
+            name: "drawCurve",
+            f: layer_draw_curve,
+        },
+        NativeInstanceMethodDef {
+            name: "drawImage",
+            f: layer_draw_image,
+        },
+        NativeInstanceMethodDef {
+            name: "drawImageRect",
+            f: layer_draw_image_rect,
+        },
+        NativeInstanceMethodDef {
+            name: "drawImageStretch",
+            f: layer_draw_image_stretch,
+        },
+        NativeInstanceMethodDef {
+            name: "drawImageAffine",
+            f: layer_draw_image_affine,
+        },
     ];
     methods.extend(noop_stubs.into_iter().map(|name| NativeInstanceMethodDef {
         name,
@@ -4154,6 +5281,134 @@ pub(crate) fn register_layer(engine: &Tjs2Engine) -> Result<(), String> {
                 name: "parent",
                 get: Some(layer_parent_get),
                 set: Some(layer_parent_set),
+            },
+            // Focus/attention/node state (reference LayerIntf.cpp:10628,
+            // :11123, :11207, :11237, :11249).
+            NativeInstancePropertyDef {
+                name: "focusable",
+                get: Some(layer_focusable_get),
+                set: Some(layer_focusable_set),
+            },
+            NativeInstancePropertyDef {
+                name: "focused",
+                get: Some(layer_focused_get),
+                set: None,
+            },
+            NativeInstancePropertyDef {
+                name: "nodeVisible",
+                get: Some(layer_node_visible_get),
+                set: None,
+            },
+            NativeInstancePropertyDef {
+                name: "nodeEnabled",
+                get: Some(layer_node_enabled_get),
+                set: None,
+            },
+            NativeInstancePropertyDef {
+                name: "nodeFocusable",
+                get: Some(layer_node_focusable_get),
+                set: None,
+            },
+            NativeInstancePropertyDef {
+                name: "enabled",
+                get: Some(layer_enabled_get),
+                set: Some(layer_enabled_set),
+            },
+            NativeInstancePropertyDef {
+                name: "isPrimary",
+                get: Some(layer_is_primary_get),
+                set: None,
+            },
+            NativeInstancePropertyDef {
+                name: "cached",
+                get: Some(layer_cached_get),
+                set: Some(layer_cached_set),
+            },
+            NativeInstancePropertyDef {
+                name: "imageModified",
+                get: Some(layer_image_modified_get),
+                set: Some(layer_image_modified_set),
+            },
+            NativeInstancePropertyDef {
+                name: "name",
+                get: Some(layer_name_get),
+                set: Some(layer_name_set),
+            },
+            NativeInstancePropertyDef {
+                name: "attentionLeft",
+                get: Some(layer_attention_left_get),
+                set: Some(layer_attention_left_set),
+            },
+            NativeInstancePropertyDef {
+                name: "attentionTop",
+                get: Some(layer_attention_top_get),
+                set: Some(layer_attention_top_set),
+            },
+            NativeInstancePropertyDef {
+                name: "useAttention",
+                get: Some(layer_use_attention_get),
+                set: Some(layer_use_attention_set),
+            },
+            NativeInstancePropertyDef {
+                name: "clipLeft",
+                get: Some(layer_clip_left_get),
+                set: Some(layer_clip_left_set),
+            },
+            NativeInstancePropertyDef {
+                name: "clipTop",
+                get: Some(layer_clip_top_get),
+                set: Some(layer_clip_top_set),
+            },
+            NativeInstancePropertyDef {
+                name: "clipWidth",
+                get: Some(layer_clip_width_get),
+                set: Some(layer_clip_width_set),
+            },
+            NativeInstancePropertyDef {
+                name: "clipHeight",
+                get: Some(layer_clip_height_get),
+                set: Some(layer_clip_height_set),
+            },
+            // `order` is the sibling order (mapped to the scene z-order).
+            NativeInstancePropertyDef {
+                name: "order",
+                get: Some(layer_absolute_get),
+                set: Some(layer_absolute_set),
+            },
+            NativeInstancePropertyDef {
+                name: "hint",
+                get: Some(layer_hint_get),
+                set: Some(layer_hint_set),
+            },
+            NativeInstancePropertyDef {
+                name: "showParentHint",
+                get: Some(layer_show_parent_hint_get),
+                set: Some(layer_show_parent_hint_set),
+            },
+            NativeInstancePropertyDef {
+                name: "ignoreHintSensing",
+                get: Some(layer_ignore_hint_sensing_get),
+                set: Some(layer_ignore_hint_sensing_set),
+            },
+            NativeInstancePropertyDef {
+                name: "imeMode",
+                get: Some(layer_ime_mode_get),
+                set: Some(layer_ime_mode_set),
+            },
+            NativeInstancePropertyDef {
+                name: "neutralColor",
+                get: Some(layer_neutral_color_get),
+                set: Some(layer_neutral_color_set),
+            },
+            NativeInstancePropertyDef {
+                name: "absoluteOrderMode",
+                get: Some(layer_absolute_order_mode_get),
+                set: Some(layer_absolute_order_mode_set),
+            },
+            NativeInstancePropertyDef {
+                name: "callOnPaint",
+                get: Some(layer_call_on_paint_get),
+                set: Some(layer_call_on_paint_set),
             },
         ],
     })
@@ -4737,10 +5992,12 @@ mod tests {
         let scene = env.scene();
         let bitmap = scene.bitmap(scene.layers[0].bitmap.unwrap()).unwrap();
         assert!(bitmap_ink(bitmap) > 0, "prerendered glyph must paint");
-        // The 2×2 ink is centered in the 30 px line at y = 1 + (30-2)/2 = 15.
+        // The `.tft` `origin_y = 2` places the ink at the reference baseline:
+        // `top = line_top + ascent - origin_y` = 1 + 25 - 2 = 24 (the WIP
+        // change from the old centered layout; `ascent` = 30 * 0.85).
         assert!(
-            bitmap.rgba[((15 * bitmap.width + 1) * 4 + 3) as usize] > 0,
-            "prerendered ink must land at the centered glyph position"
+            bitmap.rgba[((24 * bitmap.width + 1) * 4 + 3) as usize] > 0,
+            "prerendered ink must land at the baseline (origin_y) position"
         );
     }
 

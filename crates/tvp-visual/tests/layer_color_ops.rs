@@ -611,3 +611,354 @@ fn fill_rect_still_replaces_pixels() {
     assert_eq!(pixel(&scene, 1, 1), [0, 0, 255, 255]);
     assert_eq!(pixel(&scene, 0, 0), [0, 0, 0, 0]);
 }
+
+// ---------------------------------------------------------------------------
+// `copyRect` blit (reference `tTJSNI_BaseLayer::CopyRect`,
+// `LayerIntf.cpp:4574`) and the legacy/blit siblings.
+// ---------------------------------------------------------------------------
+
+/// `copyRect` honors the destination offset and the source sub-rect instead
+/// of attaching the whole source bitmap (the old behavior).
+#[test]
+fn copy_rect_honors_dest_offset_and_source_rect() {
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var src = new Layer(w, null); var sb = new Bitmap(4, 4); src.setBitmap(sb.id); \
+         src.fillRect(0, 0, 2, 2, 0xffff0000); \
+         src.fillRect(2, 0, 2, 2, 0xff00ff00); \
+         src.fillRect(0, 2, 2, 2, 0xff0000ff); \
+         src.fillRect(2, 2, 2, 2, 0xffffffff); \
+         var dst = new Layer(w, null); dst.setSize(8, 8); var db = new Bitmap(8, 8); dst.setBitmap(db.id); \
+         dst.copyRect(3, 1, src, 2, 0, 2, 2);",
+    );
+    let scene = env.scene();
+    // Source (2,0)-(4,2) is the green quadrant, blitted at (3,1).
+    assert_eq!(pixel_index(&scene, 1, 3, 1), [0, 255, 0, 255]);
+    assert_eq!(pixel_index(&scene, 1, 4, 2), [0, 255, 0, 255]);
+    // Outside the blit the destination stays transparent.
+    assert_eq!(pixel_index(&scene, 1, 0, 0), [0, 0, 0, 0]);
+    assert_eq!(pixel_index(&scene, 1, 2, 0), [0, 0, 0, 0]);
+    assert_eq!(pixel_index(&scene, 1, 3, 0), [0, 0, 0, 0]);
+    // The red source quadrant was not part of the source rect; one row
+    // below the blit is still transparent.
+    assert_eq!(pixel_index(&scene, 1, 3, 3), [0, 0, 0, 0]);
+}
+
+/// `copyRect` clips the destination to both the bitmap bounds and the layer
+/// `ClipRect`.
+#[test]
+fn copy_rect_clips_to_dest_and_clip() {
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var src = new Layer(w, null); var sb = new Bitmap(4, 4); src.setBitmap(sb.id); \
+         src.fillRect(0, 0, 4, 4, 0xffff0000); \
+         var dst = new Layer(w, null); dst.setSize(4, 4); var db = new Bitmap(4, 4); dst.setBitmap(db.id); \
+         dst.setClip(1, 1, 2, 2); \
+         dst.copyRect(-1, -1, src, 0, 0, 4, 4);",
+    );
+    let scene = env.scene();
+    // The clip [1,3) x [1,3) keeps the (1,1) and (2,2) destination pixels.
+    assert_eq!(pixel_index(&scene, 1, 0, 0), [0, 0, 0, 0]);
+    assert_eq!(pixel_index(&scene, 1, 1, 1), [255, 0, 0, 255]);
+    assert_eq!(pixel_index(&scene, 1, 2, 2), [255, 0, 0, 255]);
+    assert_eq!(pixel_index(&scene, 1, 3, 3), [0, 0, 0, 0]);
+}
+
+/// `copyRect` accepts either a `Bitmap` or a `Layer` source.
+#[test]
+fn copy_rect_accepts_bitmap_and_layer_sources() {
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var b = new Bitmap(2, 2); \
+         var bl = new Layer(w, null); bl.setBitmap(b.id); bl.fillRect(0, 0, 2, 2, 0xff00ff00); \
+         var dst1 = new Layer(w, null); dst1.setSize(2, 2); var d1 = new Bitmap(2, 2); dst1.setBitmap(d1.id); \
+         dst1.copyRect(0, 0, b, 0, 0, 2, 2); \
+         var dst2 = new Layer(w, null); dst2.setSize(2, 2); var d2 = new Bitmap(2, 2); dst2.setBitmap(d2.id); \
+         dst2.copyRect(0, 0, bl, 0, 0, 2, 2);",
+    );
+    let scene = env.scene();
+    // Layers: bl=0, dst1=1, dst2=2.
+    assert_eq!(
+        pixel_index(&scene, 1, 0, 0),
+        [0, 255, 0, 255],
+        "Bitmap source"
+    );
+    assert_eq!(
+        pixel_index(&scene, 2, 0, 0),
+        [0, 255, 0, 255],
+        "Layer source"
+    );
+}
+
+/// `copyRect` composites with source-over alpha (`bmAlpha`), not a raw
+/// overwrite.
+#[test]
+fn copy_rect_source_over_alpha() {
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var src = new Layer(w, null); var sb = new Bitmap(1, 1); src.setBitmap(sb.id); \
+         src.fillRect(0, 0, 1, 1, 0x800000ff); \
+         var dst = new Layer(w, null); dst.setSize(1, 1); var db = new Bitmap(1, 1); dst.setBitmap(db.id); \
+         dst.fillRect(0, 0, 1, 1, 0xffff0000); \
+         dst.copyRect(0, 0, src, 0, 0, 1, 1);",
+    );
+    let scene = env.scene();
+    assert_eq!(pixel_index(&scene, 1, 0, 0), [127, 0, 128, 255]);
+}
+
+/// The `Button.create` sheet pattern: `copyRect` copies the whole sheet into
+/// the layer, then `setSize` + `setImagePos` select one pattern without
+/// cropping the sheet.
+#[test]
+fn copy_rect_button_sheet_pattern() {
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var sheet = new Bitmap(6, 2); \
+         var sl = new Layer(w, null); sl.setBitmap(sheet.id); \
+         sl.fillRect(0, 0, 2, 2, 0xffff0000); \
+         sl.fillRect(2, 0, 2, 2, 0xff00ff00); \
+         sl.fillRect(4, 0, 2, 2, 0xff0000ff); \
+         var btn = new Layer(w, null); btn.setSize(6, 2); var bb = new Bitmap(6, 2); btn.setBitmap(bb.id); \
+         btn.copyRect(0, 0, sheet, 0, 0, 6, 2); \
+         btn.setSize(2, 2); btn.setImagePos(-2, 0);",
+    );
+    let scene = env.scene();
+    let btn = &scene.layers[1];
+    assert_eq!(btn.image_left, -2, "pattern 2 selected");
+    let bmp = scene.bitmap(btn.bitmap.unwrap()).unwrap();
+    assert_eq!((bmp.width, bmp.height), (6, 2), "sheet is not cropped");
+    assert_eq!(pixel_index(&scene, 1, 0, 0), [255, 0, 0, 255]);
+    assert_eq!(pixel_index(&scene, 1, 4, 0), [0, 0, 255, 255]);
+}
+
+/// `copyToBitmapFromMainImage` copies the layer's main image into a `Bitmap`.
+#[test]
+fn copy_to_bitmap_from_main_image() {
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var l = new Layer(w, null); l.setSize(2, 2); var b = new Bitmap(2, 2); l.setBitmap(b.id); \
+         l.fillRect(0, 0, 2, 2, 0xff336699); \
+         var out = new Bitmap(2, 2); \
+         l.copyToBitmapFromMainImage(out);",
+    );
+    let scene = env.scene();
+    // `out` is the second scene bitmap (the first is the layer's own).
+    let out = scene
+        .bitmaps
+        .iter()
+        .find(|b| b.rgba[..4] == [0x33, 0x66, 0x99, 0xff]);
+    assert!(out.is_some(), "the destination bitmap received the pixels");
+    let out = out.unwrap();
+    assert_eq!((out.width, out.height), (2, 2));
+}
+
+/// `convertType` premultiplies (`dfAlpha` -> `dfAddAlpha`) and
+/// unpremultiplies in the other direction.
+#[test]
+fn convert_type_round_trips_add_alpha() {
+    let env = Env::new();
+    setup(&env);
+    env.run("l.fillRect(0, 0, 1, 1, 0x80804020); l.face = 4; l.convertType(0);");
+    let scene = env.scene();
+    assert_eq!(pixel(&scene, 0, 0), [64, 32, 16, 128], "premultiplied");
+    drop(scene);
+    env.run("l.face = 0; l.convertType(4);");
+    let scene = env.scene();
+    assert_eq!(pixel(&scene, 0, 0), [127, 63, 31, 128], "unpremultiplied");
+}
+
+/// `pileRect` source-over blends the source alpha; `blendRect` forces the
+/// source opaque and applies a constant opacity. A transparent source
+/// separates the two.
+#[test]
+fn pile_rect_and_blend_rect() {
+    let env = Env::new();
+    // Source: blue with alpha 0 (invisible).
+    env.run(
+        "var w = new Window(); \
+         var src = new Layer(w, null); var sb = new Bitmap(2, 2); src.setBitmap(sb.id); \
+         src.fillRect(0, 0, 2, 2, 0x000000ff); \
+         var d1 = new Layer(w, null); d1.setSize(2, 2); var b1 = new Bitmap(2, 2); d1.setBitmap(b1.id); \
+         d1.fillRect(0, 0, 2, 2, 0xffff0000); \
+         d1.pileRect(0, 0, src, 0, 0, 2, 2, 255); \
+         var d2 = new Layer(w, null); d2.setSize(2, 2); var b2 = new Bitmap(2, 2); d2.setBitmap(b2.id); \
+         d2.fillRect(0, 0, 2, 2, 0xffff0000); \
+         d2.blendRect(0, 0, src, 0, 0, 2, 2, 255);",
+    );
+    let scene = env.scene();
+    // Layers: src=0, d1=1, d2=2.
+    assert_eq!(
+        pixel_index(&scene, 1, 0, 0),
+        [255, 0, 0, 255],
+        "pileRect keeps a transparent source invisible"
+    );
+    assert_eq!(
+        pixel_index(&scene, 2, 0, 0),
+        [0, 0, 255, 255],
+        "blendRect treats the source as opaque"
+    );
+}
+
+/// `clipLeft`/`clipTop`/`clipWidth`/`clipHeight` expose and update the
+/// `ClipRect`.
+#[test]
+fn clip_properties_round_trip() {
+    let env = Env::new();
+    setup(&env);
+    env.run("l.setClip(1, 2, 3, 4);");
+    assert_eq!(env.eval_int("l.clipLeft"), 1);
+    assert_eq!(env.eval_int("l.clipTop"), 2);
+    assert_eq!(env.eval_int("l.clipWidth"), 3);
+    assert_eq!(env.eval_int("l.clipHeight"), 4);
+    env.run("l.clipLeft = 5; l.clipHeight = 6;");
+    assert_eq!(env.eval_int("l.clipLeft"), 5);
+    assert_eq!(env.eval_int("l.clipHeight"), 6);
+    assert_eq!(env.eval_int("l.clipWidth"), 3, "other components kept");
+}
+
+/// Focus/node/name properties: `nodeVisible`/`nodeEnabled` walk the tree,
+/// `focus()` sets `focused`, and `isPrimary` reflects the window's primary
+/// layer.
+#[test]
+fn focus_and_node_properties() {
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var parent = new Layer(w, null); parent.visible = true; \
+         var child = new Layer(w, parent); child.visible = true; child.focusable = true; \
+         child.name = 'btn';",
+    );
+    assert_eq!(
+        env.eval_int("parent.isPrimary"),
+        1,
+        "first layer is primary"
+    );
+    assert_eq!(env.eval_int("child.nodeVisible"), 1);
+    assert_eq!(env.eval_int("child.nodeEnabled"), 1);
+    assert_eq!(env.eval_int("child.nodeFocusable"), 1);
+    assert_eq!(env.eval_string("child.name"), "btn");
+    env.run("child.focus();");
+    assert_eq!(env.eval_int("child.focused"), 1);
+    env.run("parent.visible = false;");
+    assert_eq!(
+        env.eval_int("child.nodeVisible"),
+        0,
+        "hidden ancestor hides"
+    );
+}
+
+/// `drawImage`/`drawImageRect`/`drawImageStretch` copy a source Layer or
+/// Bitmap onto the layer's main image.
+#[test]
+fn draw_image_variants() {
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var src = new Layer(w, null); var sb = new Bitmap(4, 4); src.setBitmap(sb.id); \
+         src.fillRect(0, 0, 2, 2, 0xffff0000); \
+         src.fillRect(2, 2, 2, 2, 0xff00ff00); \
+         var dst = new Layer(w, null); dst.setSize(8, 8); var db = new Bitmap(8, 8); dst.setBitmap(db.id); \
+         dst.drawImage(1, 1, src); \
+         dst.drawImageRect(0, 6, src, 2, 2, 2, 2);",
+    );
+    let scene = env.scene();
+    assert_eq!(pixel_index(&scene, 1, 1, 1), [255, 0, 0, 255]);
+    // `drawImageRect(0, 6, src, 2, 2, 2, 2)` places the green source
+    // quadrant at (0, 6).
+    assert_eq!(pixel_index(&scene, 1, 0, 6), [0, 255, 0, 255]);
+    assert_eq!(pixel_index(&scene, 1, 1, 7), [0, 255, 0, 255]);
+}
+
+/// `drawEllipse` and `drawPie` rasterize the plugin's GDI+ shapes with the
+/// appearance brushes/pens.
+#[test]
+fn draw_ellipse_and_pie_paint() {
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); var l = new Layer(w, null); l.setSize(16, 16); \
+         var b = new Bitmap(16, 16); l.setBitmap(b.id); \
+         var app = new GdiPlus.Appearance(); app.addBrush(0xffff0000); \
+         l.drawEllipse(app, 0, 0, 16, 16); \
+         l.drawPie(app, 0, 0, 16, 16, 0, 90);",
+    );
+    let scene = env.scene();
+    // The ellipse/pie cover the center and the top-left quadrant.
+    assert!(
+        pixel_index(&scene, 0, 8, 8)[3] > 0,
+        "ellipse center painted"
+    );
+    assert!(pixel_index(&scene, 0, 4, 4)[3] > 0, "pie quadrant painted");
+}
+
+/// `stretchCopy` supports the full `tTVPBBStretchType` set: `stFastLanczos2`
+/// (`7`) and an unknown/out-of-range type must not throw, and must paint.
+#[test]
+fn stretch_copy_supports_lanczos_and_unknown_types() {
+    let env = Env::new();
+    for (type_id, tag) in [(7, "lanczos2"), (99, "unknown")] {
+        env.run(&format!(
+            "var w = new Window(); \
+             var src = new Layer(w, null); var sb = new Bitmap(4, 4); src.setBitmap(sb.id); \
+             src.fillRect(0, 0, 2, 2, 0xffff0000); \
+             src.fillRect(2, 0, 2, 2, 0xff00ff00); \
+             src.fillRect(0, 2, 2, 2, 0xff0000ff); \
+             src.fillRect(2, 2, 2, 2, 0xffffffff); \
+             var dst{type_id} = new Layer(w, null); dst{type_id}.setSize(4, 4); \
+             var db{type_id} = new Bitmap(4, 4); dst{type_id}.setBitmap(db{type_id}.id); \
+             dst{type_id}.stretchCopy(0, 0, 4, 4, src, 0, 0, 4, 4, {type_id});"
+        ));
+        let scene = env.scene();
+        let layer = scene.layers.iter().find(|l| l.id != 0).unwrap();
+        let bmp = scene.bitmap(layer.bitmap.unwrap()).unwrap();
+        assert!(
+            bmp.rgba.chunks_exact(4).any(|p| p[3] > 0),
+            "stretch type {type_id} ({tag}) must paint"
+        );
+        drop(scene);
+    }
+}
+
+/// `copy9Patch` detects the source margins from the border alpha runs and
+/// scales the nine regions to fill the destination.
+#[test]
+fn copy_9patch_scales_to_destination() {
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var src = new Layer(w, null); var sb = new Bitmap(12, 12); src.setBitmap(sb.id); \
+         src.fillRect(0, 0, 2, 2, 0xffffffff); \
+         src.fillRect(10, 0, 2, 2, 0xffffffff); \
+         src.fillRect(0, 10, 2, 2, 0xffffffff); \
+         src.fillRect(10, 10, 2, 2, 0xffffffff); \
+         var dst = new Layer(w, null); dst.setSize(20, 20); var db = new Bitmap(20, 20); dst.setBitmap(db.id); \
+         dst.copy9Patch(src);",
+    );
+    let scene = env.scene();
+    // The opaque frame survives; the center stays transparent.
+    assert_eq!(pixel_index(&scene, 1, 0, 0), [255, 255, 255, 255]);
+    assert_eq!(pixel_index(&scene, 1, 10, 10), [0, 0, 0, 0]);
+}
+
+/// `drawCurve` flattens a Catmull-Rom spline through the points and strokes
+/// it with the appearance pen.
+#[test]
+fn draw_curve_strokes_points() {
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); var l = new Layer(w, null); l.setSize(24, 24); \
+         var b = new Bitmap(24, 24); l.setBitmap(b.id); \
+         var pen = new GdiPlus.Appearance(); pen.addPen(0xffff0000, 2); \
+         l.drawCurve(pen, [[2, 20], [8, 4], [16, 20], [22, 4]]);",
+    );
+    let scene = env.scene();
+    assert!(
+        pixel_index(&scene, 0, 8, 4)[3] > 0,
+        "curve passes near (8,4)"
+    );
+}

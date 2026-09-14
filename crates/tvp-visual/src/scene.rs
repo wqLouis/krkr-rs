@@ -21,6 +21,9 @@ pub struct WindowState {
     pub opacity: f32,
     /// The layer scripts use as `window.primaryLayer`.
     pub primary_layer: Option<u32>,
+    /// The layer that currently holds keyboard focus in this window
+    /// (reference `tTVPLayerManager::FocusedLayer`), if any.
+    pub focused_layer: Option<u32>,
     /// Render order, back -> front.
     pub layers: Vec<u32>,
 }
@@ -83,6 +86,33 @@ pub struct LayerState {
     pub clip: Option<Rect>,
     /// `holdAlpha` — keep the alpha when drawing. Stored only for now.
     pub hold_alpha: bool,
+    /// Reference `Focusable`: whether the layer may receive focus.
+    pub focusable: bool,
+    /// Reference `Enabled`: whether the layer's input/attention is active.
+    pub enabled: bool,
+    /// Reference `Name` (script `layer.name`).
+    pub name: String,
+    /// Reference `AttentionLeft`/`AttentionTop` (attention anchor point).
+    pub attention_left: i32,
+    pub attention_top: i32,
+    /// Reference `UseAttention`: whether the layer participates in the
+    /// attention/hint system.
+    pub use_attention: bool,
+    /// Reference `Cached`: request the layer be rendered to a cache.
+    pub cached: bool,
+    /// Reference `Hint` (script `layer.hint`) and the hint-system flags.
+    pub hint: String,
+    pub show_parent_hint: bool,
+    pub ignore_hint_sensing: bool,
+    /// Reference `ImeMode` (stored) and `NeutralColor` (ARGB, stored).
+    pub ime_mode: i32,
+    pub neutral_color: i64,
+    /// Reference `AbsoluteOrderMode`/`CallOnPaint` flags.
+    pub absolute_order_mode: bool,
+    pub call_on_paint: bool,
+    /// Reference `HoldAlpha`-adjacent `ImageModified` flag: set by pixel
+    /// operations, clearable by script.
+    pub image_modified: bool,
     /// Font id (into [`Scene::fonts`]) backing `layer.font`, or `None` until
     /// the script reads `layer.font` (which lazily allocates one). `drawText`
     /// resolves the requested face from here.
@@ -211,6 +241,7 @@ impl Scene {
             visible: true,
             opacity: 1.0,
             primary_layer: None,
+            focused_layer: None,
             layers: Vec::new(),
         });
         self.touch();
@@ -274,6 +305,21 @@ impl Scene {
             face: 0,
             clip: None,
             hold_alpha: false,
+            focusable: false,
+            enabled: true,
+            name: String::new(),
+            attention_left: 0,
+            attention_top: 0,
+            use_attention: false,
+            cached: false,
+            hint: String::new(),
+            show_parent_hint: false,
+            ignore_hint_sensing: false,
+            ime_mode: 0,
+            neutral_color: 0,
+            absolute_order_mode: false,
+            call_on_paint: false,
+            image_modified: false,
             font_id: None,
             is_primary: false,
             pending_paint: false,
@@ -330,42 +376,122 @@ impl Scene {
         }
     }
 
+    /// Detach one layer — the reference `tTJSNI_BaseLayer::Part()`
+    /// (`LayerIntf.cpp:624`). The layer is severed from its parent (or the
+    /// window root list) and removed from the scene. Children are **not**
+    /// destroyed: the reference `Invalidate` calls `child->Part()` for each
+    /// direct child (`LayerIntf.cpp:551`), so their parent link is cleared and
+    /// they stay alive as window-level roots. The old implementation removed
+    /// the whole subtree, which silently deleted live children (focus, button
+    /// and transition layers all share a parent).
     pub fn remove_layer(&mut self, id: u32) {
-        let Some(root) = self.layer(id) else {
+        let Some(layer) = self.layer(id) else {
             return;
         };
-        let (win, parent) = (root.window, root.parent);
-        // Collect the whole subtree: a destroyed parent takes its children
-        // with it (the reference layer tree owns them). Descendants removed
-        // here get a no-op `remove_layer` when their own destroy runs.
-        let mut stack = vec![id];
-        let mut remove = Vec::new();
-        while let Some(cur) = stack.pop() {
-            if let Some(l) = self.layer(cur) {
-                remove.push(cur);
-                stack.extend(l.children.iter().copied());
+        let (win, parent) = (layer.window, layer.parent);
+        let children = layer.children.clone();
+        // `Part()`: sever this layer from its parent (or the window roots).
+        if let Some(p) = parent {
+            if let Some(pl) = self.layer_mut(p) {
+                pl.children.retain(|&x| x != id);
             }
+        } else if let Some(w) = self.window_mut(win) {
+            w.layers.retain(|&x| x != id);
         }
-        if let Some(w) = self.window_mut(win) {
-            w.layers.retain(|x| !remove.contains(x));
-            if let Some(p) = w.primary_layer
-                && remove.contains(&p)
+        // Sever the direct children from this layer; they become roots of
+        // the window and must remain in the scene.
+        for child in &children {
+            if let Some(cl) = self.layer_mut(*child) {
+                cl.parent = None;
+            }
+            if let Some(w) = self.window_mut(win)
+                && !w.layers.contains(child)
             {
-                w.primary_layer = None;
+                w.layers.push(*child);
             }
         }
-        if let Some(p) = parent
-            && let Some(pl) = self.layer_mut(p)
-        {
-            pl.children.retain(|x| !remove.contains(x));
-        }
-        self.layers.retain(|l| !remove.contains(&l.id));
+        self.layers.retain(|l| l.id != id);
         // Indices shifted: rebuild the id→index map.
         self.layer_index.clear();
         for (index, layer) in self.layers.iter().enumerate() {
             self.layer_index.insert(layer.id, index);
         }
+        // The reference `DetachPrimary` leaves the window without a primary,
+        // and `SeverChild` blurs a removed focus holder.
+        if let Some(w) = self.window_mut(win) {
+            if w.primary_layer == Some(id) {
+                w.primary_layer = None;
+            }
+            if w.focused_layer == Some(id) {
+                w.focused_layer = None;
+            }
+        }
         self.touch();
+    }
+
+    /// Reference `tTVPLayerManager::SetFocusTo`: give keyboard focus to
+    /// `id` within its window, clearing the previous holder. Returns
+    /// `(previous, new)`. A `None`/invalid `id` blurs the current holder.
+    pub fn set_focus(&mut self, id: u32) -> (Option<u32>, Option<u32>) {
+        let Some(layer) = self.layer(id) else {
+            return (None, None);
+        };
+        let win = layer.window;
+        let prev = self.window(win).and_then(|w| w.focused_layer);
+        if prev == Some(id) {
+            return (prev, Some(id));
+        }
+        if let Some(w) = self.window_mut(win) {
+            w.focused_layer = Some(id);
+        }
+        self.touch();
+        (prev, Some(id))
+    }
+
+    /// Clear the focused layer of `window`, returning the previous holder.
+    pub fn clear_focus(&mut self, window: u32) -> Option<u32> {
+        let prev = self.window(window).and_then(|w| w.focused_layer);
+        if let Some(w) = self.window_mut(window) {
+            w.focused_layer = None;
+        }
+        if prev.is_some() {
+            self.touch();
+        }
+        prev
+    }
+
+    /// Reference `GetNodeVisible`: `visible` and every ancestor visible.
+    pub fn node_visible(&self, id: u32) -> bool {
+        let mut cur = id;
+        loop {
+            let Some(layer) = self.layer(cur) else {
+                return false;
+            };
+            if !layer.visible {
+                return false;
+            }
+            match layer.parent {
+                Some(p) => cur = p,
+                None => return true,
+            }
+        }
+    }
+
+    /// Reference `GetNodeEnabled`: `enabled` and every ancestor enabled.
+    pub fn node_enabled(&self, id: u32) -> bool {
+        let mut cur = id;
+        loop {
+            let Some(layer) = self.layer(cur) else {
+                return false;
+            };
+            if !layer.enabled {
+                return false;
+            }
+            match layer.parent {
+                Some(p) => cur = p,
+                None => return true,
+            }
+        }
     }
 
     pub fn layer_move_to_front(&mut self, id: u32) {
@@ -761,6 +887,60 @@ mod tests {
         assert_eq!(scene.bitmap(bitmap).unwrap().id, bitmap);
         assert_eq!(scene.font(font).unwrap().id, font);
         assert_eq!(scene.window(win).unwrap().id, win);
+    }
+
+    /// `remove_layer` is `Part()`-only: it detaches the layer but keeps its
+    /// direct children alive as window roots (the old implementation deleted
+    /// the whole subtree).
+    #[test]
+    fn remove_layer_detaches_but_keeps_children() {
+        let mut scene = Scene::default();
+        let win = scene.add_window("t", (1, 1));
+        let parent = scene.add_layer(win, None);
+        let child = scene.add_layer(win, Some(parent));
+        let grandchild = scene.add_layer(win, Some(child));
+        scene.remove_layer(parent);
+        assert!(scene.layer(parent).is_none());
+        assert!(scene.layer(child).is_some(), "child survives Part()");
+        assert!(scene.layer(grandchild).is_some(), "grandchild survives");
+        assert_eq!(scene.layer(child).unwrap().parent, None);
+        assert_eq!(scene.layer(grandchild).unwrap().parent, Some(child));
+        // The child is now a root of the window and still rendered.
+        let order = scene.window_layer_order(win);
+        assert!(order.contains(&child));
+        assert!(order.contains(&grandchild));
+    }
+
+    /// `node_visible`/`node_enabled` walk the ancestor chain.
+    #[test]
+    fn node_state_walks_ancestors() {
+        let mut scene = Scene::default();
+        let win = scene.add_window("t", (1, 1));
+        let parent = scene.add_layer(win, None);
+        let child = scene.add_layer(win, Some(parent));
+        scene.layer_mut(parent).unwrap().visible = true;
+        scene.layer_mut(child).unwrap().visible = true;
+        assert!(scene.node_visible(child));
+        scene.layer_mut(parent).unwrap().visible = false;
+        assert!(!scene.node_visible(child), "hidden ancestor hides child");
+        assert!(scene.node_enabled(child));
+        scene.layer_mut(parent).unwrap().enabled = false;
+        assert!(!scene.node_enabled(child));
+    }
+
+    /// `set_focus` moves the window's focus and `remove_layer` blurs a
+    /// removed focus holder.
+    #[test]
+    fn focus_moves_and_clears_with_removal() {
+        let mut scene = Scene::default();
+        let win = scene.add_window("t", (1, 1));
+        let a = scene.add_layer(win, None);
+        let b = scene.add_layer(win, None);
+        assert_eq!(scene.set_focus(a), (None, Some(a)));
+        assert_eq!(scene.window(win).unwrap().focused_layer, Some(a));
+        assert_eq!(scene.set_focus(b), (Some(a), Some(b)));
+        scene.remove_layer(b);
+        assert_eq!(scene.window(win).unwrap().focused_layer, None);
     }
 
     /// Natives can still mutate the public `fonts`/`windows` vectors with a

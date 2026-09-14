@@ -436,7 +436,26 @@ pub(crate) fn blit_copy(
     src: &BitmapState,
     src_rect: RectI,
 ) {
-    let Some(dest_clip) = intersect(
+    blit_copy_clipped(
+        dst,
+        dx,
+        dy,
+        src,
+        src_rect,
+        (i32::MIN, i32::MIN, i32::MAX, i32::MAX),
+    );
+}
+
+/// [`blit_copy`] additionally clipped against a layer `ClipRect`.
+pub(crate) fn blit_copy_clipped(
+    dst: &mut BitmapState,
+    dx: i32,
+    dy: i32,
+    src: &BitmapState,
+    src_rect: RectI,
+    clip: RectI,
+) {
+    let Some(in_bounds) = intersect(
         dst,
         (
             dx,
@@ -445,6 +464,9 @@ pub(crate) fn blit_copy(
             dy + (src_rect.3 - src_rect.1),
         ),
     ) else {
+        return;
+    };
+    let Some(dest_clip) = intersect_rect(in_bounds, clip) else {
         return;
     };
     if src.width == 0 || src.height == 0 {
@@ -459,6 +481,55 @@ pub(crate) fn blit_copy(
             }
             let color = read_pixel(src, sx, sy);
             write_pixel(dst, x, y, color);
+        }
+    }
+    dst.mark_dirty();
+}
+
+/// `tTVPBaseBitmap::Blt` source-over (`bmAlpha`/`bmAlphaOnAlpha`): composite
+/// `src[src_rect]` onto `dst` at `(dx, dy)`, clipping the destination both to
+/// the bitmap and to the layer's `clip` rect. Each pixel is blended with the
+/// straight-alpha source-over math ([`blend_pixel`]); `opa` scales the source
+/// alpha (the reference `Blt` opacity).
+///
+/// This is the pixel work behind `Layer.copyRect` and, with a different
+/// `mode`, `operateRect`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn blit_over(
+    dst: &mut BitmapState,
+    dx: i32,
+    dy: i32,
+    src: &BitmapState,
+    src_rect: RectI,
+    clip: RectI,
+    opa: u8,
+    treat_as_opaque: bool,
+) {
+    let sw = src_rect.2 - src_rect.0;
+    let sh = src_rect.3 - src_rect.1;
+    if sw <= 0 || sh <= 0 || opa == 0 || src.width == 0 || src.height == 0 {
+        return;
+    }
+    let Some(in_bounds) = intersect(dst, (dx, dy, dx + sw, dy + sh)) else {
+        return;
+    };
+    let Some(dc) = intersect_rect(in_bounds, clip) else {
+        return;
+    };
+    for y in dc.1..dc.3 {
+        for x in dc.0..dc.2 {
+            let sx = src_rect.0 + (x - dx);
+            let sy = src_rect.1 + (y - dy);
+            if sx < 0 || sy < 0 || sx as u32 >= src.width || sy as u32 >= src.height {
+                continue;
+            }
+            let mut color = read_pixel(src, sx, sy);
+            if treat_as_opaque {
+                // `bmCopyOnAlpha`/`bmAlpha` treat the source as a fully
+                // opaque image; the constant `opa` supplies the coverage.
+                color[3] = 255;
+            }
+            blend_pixel(dst, x, y, color, 255, opa);
         }
     }
     dst.mark_dirty();
@@ -793,85 +864,150 @@ pub(crate) fn blur_bitmap_in_place(bitmap: &mut BitmapState, xradius: u32, yradi
 // Stretch / tone operations (the thumbnail pipeline)
 // ---------------------------------------------------------------------------
 
-/// Read a pixel clamped to the bitmap edges (out-of-range samples repeat the
-/// border, the usual resampler edge policy).
-fn read_pixel_clamped(bitmap: &BitmapState, x: i32, y: i32) -> [u8; 4] {
+/// Clamp a sample coordinate to `rect` (a half-open source region) or, when
+/// `rect` is empty, to the whole bitmap. The `stRefNoClip` stretch flag makes
+/// the reference sample outside the given rectangle, so callers pass the
+/// whole image as `rect` in that case.
+fn read_pixel_rect(bitmap: &BitmapState, rect: RectI, x: i32, y: i32) -> [u8; 4] {
     if bitmap.width == 0 || bitmap.height == 0 {
         return [0, 0, 0, 0];
     }
-    let x = x.clamp(0, bitmap.width as i32 - 1) as u32;
-    let y = y.clamp(0, bitmap.height as i32 - 1) as u32;
-    read_pixel(bitmap, x as i32, y as i32)
+    let (x0, y0, x1, y1) = if rect.2 > rect.0 && rect.3 > rect.1 {
+        rect
+    } else {
+        (0, 0, bitmap.width as i32, bitmap.height as i32)
+    };
+    read_pixel(bitmap, x.clamp(x0, x1 - 1), y.clamp(y0, y1 - 1))
 }
 
-/// Catmull-Rom cubic interpolation of four samples at `t` in `0..=1`.
-fn cubic(v0: f32, v1: f32, v2: f32, v3: f32, t: f32) -> f32 {
-    let a = -0.5 * v0 + 1.5 * v1 - 1.5 * v2 + 0.5 * v3;
-    let b = v0 - 2.5 * v1 + 2.0 * v2 - 0.5 * v3;
-    let c = -0.5 * v0 + 0.5 * v2;
-    a * t * t * t + b * t * t + c * t + v1
+/// The normalized sinc-based Lanczos window of order `a`.
+fn lanczos(t: f32, a: f32) -> f32 {
+    if t.abs() < 1e-6 {
+        1.0
+    } else if t.abs() >= a {
+        0.0
+    } else {
+        let pt = std::f32::consts::PI * t;
+        a * pt.sin() * (pt / a).sin() / (pt * pt)
+    }
 }
 
-/// Bilinear sample at fractional `(fx, fy)`.
-fn sample_bilinear(bitmap: &BitmapState, fx: f32, fy: f32) -> [u8; 4] {
-    let x0 = fx.floor();
-    let y0 = fy.floor();
-    let tx = fx - x0;
-    let ty = fy - y0;
-    let (x0, y0) = (x0 as i32, y0 as i32);
-    let p00 = read_pixel_clamped(bitmap, x0, y0);
-    let p10 = read_pixel_clamped(bitmap, x0 + 1, y0);
-    let p01 = read_pixel_clamped(bitmap, x0, y0 + 1);
-    let p11 = read_pixel_clamped(bitmap, x0 + 1, y0 + 1);
+/// Catmull-Rom cubic kernel (support radius 2).
+fn cubic_kernel(t: f32) -> f32 {
+    let x = t.abs();
+    if x < 1.0 {
+        1.5 * x * x * x - 2.5 * x * x + 1.0
+    } else if x < 2.0 {
+        -0.5 * x * x * x + 2.5 * x * x - 4.0 * x + 2.0
+    } else {
+        0.0
+    }
+}
+
+/// Gather samples around `(fx, fy)` with a separable kernel `k` of the given
+/// `radius` (samples to each side). Out-of-range samples clamp to `rect`
+/// (the reference edge policy).
+fn sample_kernel(
+    bitmap: &BitmapState,
+    rect: RectI,
+    fx: f32,
+    fy: f32,
+    radius: i32,
+    k: impl Fn(f32) -> f32,
+) -> [u8; 4] {
+    let cx = fx.floor() as i32;
+    let cy = fy.floor() as i32;
+    let mut acc = [0.0f32; 4];
+    let mut wsum = 0.0f32;
+    for j in -radius..=radius {
+        let wy = k(fy - (cy + j) as f32);
+        if wy == 0.0 {
+            continue;
+        }
+        for i in -radius..=radius {
+            let w = wy * k(fx - (cx + i) as f32);
+            if w == 0.0 {
+                continue;
+            }
+            let p = read_pixel_rect(bitmap, rect, cx + i, cy + j);
+            for (c, a) in acc.iter_mut().enumerate() {
+                *a += f32::from(p[c]) * w;
+            }
+            wsum += w;
+        }
+    }
+    if wsum.abs() < 1e-6 {
+        return read_pixel_rect(bitmap, rect, fx.round() as i32, fy.round() as i32);
+    }
     let mut out = [0u8; 4];
-    for (c, o) in out.iter_mut().enumerate() {
-        let top = f32::from(p00[c]) + (f32::from(p10[c]) - f32::from(p00[c])) * tx;
-        let bot = f32::from(p01[c]) + (f32::from(p11[c]) - f32::from(p01[c])) * tx;
-        *o = (top + (bot - top) * ty).round().clamp(0.0, 255.0) as u8;
+    for (c, &a) in acc.iter().enumerate() {
+        out[c] = (a / wsum).round().clamp(0.0, 255.0) as u8;
     }
     out
 }
 
-/// Bicubic (Catmull-Rom) sample at fractional `(fx, fy)`.
-fn sample_bicubic(bitmap: &BitmapState, fx: f32, fy: f32) -> [u8; 4] {
-    let x0 = fx.floor() as i32;
-    let y0 = fy.floor() as i32;
-    let tx = fx - x0 as f32;
-    let ty = fy - y0 as f32;
-    let mut out = [0u8; 4];
-    for (c, o) in out.iter_mut().enumerate() {
-        let mut rows = [0.0f32; 4];
-        for (j, row) in rows.iter_mut().enumerate() {
-            let yy = y0 - 1 + j as i32;
-            let p0 = read_pixel_clamped(bitmap, x0 - 1, yy)[c];
-            let p1 = read_pixel_clamped(bitmap, x0, yy)[c];
-            let p2 = read_pixel_clamped(bitmap, x0 + 1, yy)[c];
-            let p3 = read_pixel_clamped(bitmap, x0 + 2, yy)[c];
-            *row = cubic(
-                f32::from(p0),
-                f32::from(p1),
-                f32::from(p2),
-                f32::from(p3),
-                tx,
-            );
+/// Area-average sample (`stAreaAvg`): the mean of every source pixel whose
+/// center lies inside the destination pixel's footprint. `src` maps the
+/// destination onto the source; `rect` clamps the samples.
+fn sample_area(
+    bitmap: &BitmapState,
+    rect: RectI,
+    src: RectI,
+    dest: RectI,
+    x: i32,
+    y: i32,
+) -> [u8; 4] {
+    let dw = (dest.2 - dest.0) as f32;
+    let dh = (dest.3 - dest.1) as f32;
+    let sw = (src.2 - src.0) as f32;
+    let sh = (src.3 - src.1) as f32;
+    let sx0 = src.0 as f32 + (x as f32 - dest.0 as f32) / dw * sw;
+    let sx1 = src.0 as f32 + (x as f32 + 1.0 - dest.0 as f32) / dw * sw;
+    let sy0 = src.1 as f32 + (y as f32 - dest.1 as f32) / dh * sh;
+    let sy1 = src.1 as f32 + (y as f32 + 1.0 - dest.1 as f32) / dh * sh;
+    let ix0 = sx0.floor() as i32;
+    let ix1 = (sx1.ceil() as i32).max(ix0 + 1);
+    let iy0 = sy0.floor() as i32;
+    let iy1 = (sy1.ceil() as i32).max(iy0 + 1);
+    let mut acc = [0u32; 4];
+    let mut count = 0u32;
+    for yy in iy0..iy1 {
+        for xx in ix0..ix1 {
+            let p = read_pixel_rect(bitmap, rect, xx, yy);
+            for (c, a) in acc.iter_mut().enumerate() {
+                *a += u32::from(p[c]);
+            }
+            count += 1;
         }
-        *o = cubic(rows[0], rows[1], rows[2], rows[3], ty)
-            .round()
-            .clamp(0.0, 255.0) as u8;
+    }
+    let mut out = [0u8; 4];
+    let n = count.max(1);
+    for (c, &a) in acc.iter().enumerate() {
+        out[c] = (a / n) as u8;
     }
     out
 }
 
 /// Sample the source at dest-pixel center `(x, y)` using the mapping from the
-/// destination rect onto the source rect.
+/// destination rect onto the source rect. `stretch_type` is a
+/// `tTVPBBStretchType`: the low 16 bits select the resampler, the
+/// `stRefNoClip` (0x10000) flag lets the kernel read outside `src`. Unknown
+/// resamplers fall back to bilinear rather than throwing.
 fn stretch_sample(
     bitmap: &BitmapState,
     src: RectI,
     dest: RectI,
     x: i32,
     y: i32,
-    kind: i64,
+    stretch_type: i64,
 ) -> [u8; 4] {
+    let kind = stretch_type & 0xffff;
+    let ref_no_clip = stretch_type & 0x1_0000 != 0;
+    let rect = if ref_no_clip {
+        (0, 0, bitmap.width as i32, bitmap.height as i32)
+    } else {
+        src
+    };
     let dw = (dest.2 - dest.0) as f32;
     let dh = (dest.3 - dest.1) as f32;
     let sw = (src.2 - src.0) as f32;
@@ -880,18 +1016,53 @@ fn stretch_sample(
     let v = (y as f32 - dest.1 as f32 + 0.5) / dh;
     let fx = src.0 as f32 + u * sw - 0.5;
     let fy = src.1 as f32 + v * sh - 0.5;
+    // Area average needs the destination footprint; every other resampler
+    // is a pure kernel evaluation.
+    if kind == 14 || kind == 15 {
+        return sample_area(bitmap, rect, src, dest, x, y);
+    }
+    sample_kind(bitmap, rect, fx, fy, kind)
+}
+
+/// Apply a `tTVPBBStretchType` (low 16 bits) kernel at source position
+/// `(fx, fy)`, clamping samples to `rect`. `stAreaAvg` is handled by the
+/// caller ([`sample_area`]) because it needs the destination footprint.
+fn sample_kind(bitmap: &BitmapState, rect: RectI, fx: f32, fy: f32, kind: i64) -> [u8; 4] {
     match kind {
-        0 => {
-            // stNearest
-            let sx = (fx + 0.5).floor() as i32;
-            let sy = (fy + 0.5).floor() as i32;
-            read_pixel_clamped(bitmap, sx, sy)
-        }
-        // stCubic / stFastCubic → Catmull-Rom; the higher-quality spline
-        // kernels reduce to bicubic (no assembly pipeline needed).
-        3 | 5 => sample_bicubic(bitmap, fx, fy),
-        // stLinear / stFastLinear / everything else.
-        _ => sample_bilinear(bitmap, fx, fy),
+        // stNearest
+        0 => read_pixel_rect(
+            bitmap,
+            rect,
+            (fx + 0.5).floor() as i32,
+            (fy + 0.5).floor() as i32,
+        ),
+        // stFastLinear(1)/stLinear(2)/stSemiFastLinear(4).
+        1 | 2 | 4 => sample_kernel(bitmap, rect, fx, fy, 1, |t| (1.0 - t.abs()).max(0.0)),
+        // stCubic(3)/stFastCubic(5) and the spline kernels.
+        3 | 5 | 10..=13 => sample_kernel(bitmap, rect, fx, fy, 2, cubic_kernel),
+        // stLanczos2(6)/stFastLanczos2(7).
+        6 | 7 => sample_kernel(bitmap, rect, fx, fy, 2, |t| lanczos(t, 2.0)),
+        // stLanczos3(8)/stFastLanczos3(9).
+        8 | 9 => sample_kernel(bitmap, rect, fx, fy, 3, |t| lanczos(t, 3.0)),
+        // stAreaAvg(14)/stFastAreaAvg(15) fall back to bilinear when sampled
+        // directly (affine has no destination footprint); `stretch_sample`
+        // routes these to `sample_area`.
+        14 | 15 => sample_kernel(bitmap, rect, fx, fy, 1, |t| (1.0 - t.abs()).max(0.0)),
+        // stGaussian(16)/stFastGaussian(17).
+        16 | 17 => sample_kernel(bitmap, rect, fx, fy, 3, |t| (-t * t / 2.0).exp()),
+        // stBlackmanSinc(18)/stFastBlackmanSinc(19).
+        18 | 19 => sample_kernel(bitmap, rect, fx, fy, 3, |t| {
+            if t.abs() >= 3.0 {
+                0.0
+            } else {
+                let w = 0.42
+                    + 0.5 * (std::f32::consts::PI * t / 3.0).cos()
+                    + 0.08 * (2.0 * std::f32::consts::PI * t / 3.0).cos();
+                w * lanczos(t, 3.0)
+            }
+        }),
+        // Unknown: bilinear.
+        _ => sample_kernel(bitmap, rect, fx, fy, 1, |t| (1.0 - t.abs()).max(0.0)),
     }
 }
 
@@ -1052,6 +1223,128 @@ pub(crate) fn light_contrast(
         }
     }
     bitmap.mark_dirty();
+}
+
+/// `TVPConvertAlphaToAdditiveAlpha` (`tvpgl.cpp:1190`, via `TVPMulColor`):
+/// premultiply RGB by alpha (`(c * a) >> 8`), holding alpha. Reference
+/// `tTVPBaseBitmap::ConvertAlphaToAddAlpha` (`LayerBitmapIntf.cpp:4748`).
+pub(crate) fn convert_alpha_to_add_alpha(bitmap: &mut BitmapState, rect: RectI) {
+    let Some((x0, y0, x1, y1)) = intersect(bitmap, rect) else {
+        return;
+    };
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let mut d = read_pixel(bitmap, x, y);
+            let a = u32::from(d[3]);
+            for channel in d.iter_mut().take(3) {
+                *channel = ((u32::from(*channel) * a) >> 8) as u8;
+            }
+            write_pixel(bitmap, x, y, d);
+        }
+    }
+    bitmap.mark_dirty();
+}
+
+/// `TVPConvertAdditiveAlphaToAlpha` (`tvpgl.cpp:1143`, `TVPDivTable`):
+/// unpremultiply RGB (`min(c * 255 / a, 255)`, alpha 0 → 0), holding alpha.
+/// Reference `tTVPBaseBitmap::ConvertAddAlphaToAlpha`
+/// (`LayerBitmapIntf.cpp:4721`).
+pub(crate) fn convert_add_alpha_to_alpha(bitmap: &mut BitmapState, rect: RectI) {
+    let Some((x0, y0, x1, y1)) = intersect(bitmap, rect) else {
+        return;
+    };
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let mut d = read_pixel(bitmap, x, y);
+            let a = u32::from(d[3]);
+            if a == 0 {
+                d[0] = 0;
+                d[1] = 0;
+                d[2] = 0;
+            } else {
+                for channel in d.iter_mut().take(3) {
+                    *channel = (u32::from(*channel) * 255)
+                        .checked_div(a)
+                        .unwrap_or(0)
+                        .min(255) as u8;
+                }
+            }
+            write_pixel(bitmap, x, y, d);
+        }
+    }
+    bitmap.mark_dirty();
+}
+
+/// `Copy9Patch` (`LayerBitmapIntf.cpp:1150`): scale a source bitmap into the
+/// destination using the 9-slice `margin` (left, top, right, bottom). The
+/// corners are copied 1:1, the edges are stretched along one axis and the
+/// center on both. The reference reads the margins from a `tTVPRect`, where
+/// `right`/`bottom` are *offsets from the far edge*.
+pub(crate) fn copy_9patch(dst: &mut BitmapState, src: &BitmapState) -> Option<RectI> {
+    if dst.width == 0 || dst.height == 0 || src.width < 11 || src.height < 11 {
+        return None;
+    }
+    if dst.width < src.width - 2 || dst.height < src.height - 2 {
+        return None;
+    }
+    let w = src.width as i32;
+    let h = src.height as i32;
+    // The reference derives the margins from the alpha runs on the source's
+    // bottom row (left/right margins) and right column (top/bottom margins)
+    // (`LayerBitmapIntf.cpp:1150`).
+    let mut ml = -1;
+    let mut mr = -1;
+    for x in 1..w - 1 {
+        let a = read_pixel(src, x, h - 1)[3];
+        if ml == -1 && a == 255 {
+            ml = x - 1;
+        } else if ml != -1 && mr == -1 && a == 0 {
+            mr = w - x - 1;
+            break;
+        }
+    }
+    let mut mt = -1;
+    let mut mb = -1;
+    for y in 1..h - 1 {
+        let a = read_pixel(src, w - 1, y)[3];
+        if mt == -1 && a == 255 {
+            mt = y - 1;
+        } else if mt != -1 && mb == -1 && a == 0 {
+            mb = h - y - 1;
+            break;
+        }
+    }
+    if ml < 0 || mr < 0 || mt < 0 || mb < 0 {
+        return None;
+    }
+    let src_center = (ml, mt, w - mr, h - mb);
+    let dest_center = (ml, mt, dst.width as i32 - mr, dst.height as i32 - mb);
+    if src_center.2 < ml || src_center.3 < mt || dest_center.2 < ml || dest_center.3 < mt {
+        return None;
+    }
+    // 3-slice axes: (dest_start, dest_end, src_start, src_end) for the
+    // start margin, the stretched middle and the end margin.
+    let cols = [
+        (0, ml, 0, ml),
+        (ml, dest_center.2, ml, src_center.2),
+        (dest_center.2, dst.width as i32, src_center.2, w),
+    ];
+    let rows = [
+        (0, mt, 0, mt),
+        (mt, dest_center.3, mt, src_center.3),
+        (dest_center.3, dst.height as i32, src_center.3, h),
+    ];
+    for &(dy0, dy1, sy0, sy1) in &rows {
+        for &(dx0, dx1, sx0, sx1) in &cols {
+            let dest = (dx0, dy0, dx1, dy1);
+            let sr = (sx0, sy0, sx1, sy1);
+            if dest.2 > dest.0 && dest.3 > dest.1 && sr.2 > sr.0 && sr.3 > sr.1 {
+                stretch_blit(dst, dest, src, sr, 0);
+            }
+        }
+    }
+    dst.mark_dirty();
+    Some((ml, mt, mr, mb))
 }
 
 /// `tTJSNI_BaseLayer::LRFlip` (`LayerIntf.cpp:5910`): mirror the whole main
@@ -1407,13 +1700,11 @@ pub(crate) fn affine_blit(
             }
             let fx = src_rect.0 as f32 + (u * sw) as f32 - 0.5;
             let fy = src_rect.1 as f32 + (v * sh) as f32 - 0.5;
-            let color = if stretch_type == 0 {
-                read_pixel_clamped(src, (fx + 0.5).floor() as i32, (fy + 0.5).floor() as i32)
-            } else if stretch_type == 3 || stretch_type == 5 {
-                sample_bicubic(src, fx, fy)
-            } else {
-                sample_bilinear(src, fx, fy)
-            };
+            // Affine sampling clamps to the whole source image (the reference
+            // may interpolate across the source-rect border), and supports the
+            // same resampler set as `stretch*`.
+            let rect = (0, 0, src.width as i32, src.height as i32);
+            let color = sample_kind(src, rect, fx, fy, stretch_type & 0xffff);
             blend_pixel_mode(dst, x, y, color, opa, mode);
         }
     }

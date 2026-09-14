@@ -20,16 +20,16 @@ The checker exits non-zero when a missing member is **not** listed in `scripts/n
 | --- | ---: |
 | tracked classes | 15 |
 | reference members | 527 |
-| matched | 466 |
-| **missing** | **61** |
+| matched | 474 |
+| **missing** | **53** |
 | extra (Rust only) | 105 |
-| coverage | **88.4%** |
+| coverage | **89.9%** |
 
 ## Per-class coverage
 
 | class | ref | rust | matched | missing | extra | coverage |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `Layer` | 150 | 161 | 116 | 34 | 45 | 77.3% |
+| `Layer` | 150 | 169 | 124 | 26 | 45 | 82.7% |
 | `Bitmap` | 20 | 22 | 20 | 0 | 2 | 100.0% |
 | `Window` | 83 | 91 | 83 | 0 | 8 | 100.0% |
 | `Font` | 22 | 14 | 11 | 11 | 3 | 50.0% |
@@ -47,9 +47,9 @@ The checker exits non-zero when a missing member is **not** listed in `scripts/n
 
 ## Missing members by class
 
-### `Layer` — 34 missing
+### `Layer` — 26 missing
 
-`absoluteOrderMode`, `callOnPaint`, `children`, `getLayerAt`, `hint`, `ignoreHintSensing`, `imeMode`, `joinFocusChain`, `mainImageBuffer`, `mainImageBufferForWrite`, `mainImageBufferPitch`, `neutralColor`, `nextFocusable`, `onBeforeFocus`, `onBlur`, `onFocus`, `onKeyPress`, `onMultiTouch`, `onNodeDisabled`, `onNodeEnabled`, `onSearchNextFocusable`, `onSearchPrevFocusable`, `onTouchDown`, `onTouchMove`, `onTouchRotate`, `onTouchScaling`, `onTouchUp`, `onTransitionCompleted`, `order`, `prevFocusable`, `provinceImageBuffer`, `provinceImageBufferForWrite`, `provinceImageBufferPitch`, `showParentHint`
+`children`, `getLayerAt`, `joinFocusChain`, `mainImageBuffer`, `mainImageBufferForWrite`, `mainImageBufferPitch`, `nextFocusable`, `onBeforeFocus`, `onBlur`, `onFocus`, `onKeyPress`, `onMultiTouch`, `onNodeDisabled`, `onNodeEnabled`, `onSearchNextFocusable`, `onSearchPrevFocusable`, `onTouchDown`, `onTouchMove`, `onTouchRotate`, `onTouchScaling`, `onTouchUp`, `onTransitionCompleted`, `prevFocusable`, `provinceImageBuffer`, `provinceImageBufferForWrite`, `provinceImageBufferPitch`
 
 ### `Font` — 11 missing
 

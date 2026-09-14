@@ -20,7 +20,10 @@ use super::ffi::{
     set_string_out,
 };
 use super::{context_scene_mut, context_scene_read};
-use tvp_text::{PrerenderedFont, PrerenderedKey, map_prerendered_font, prerendered_font};
+use tvp_text::{
+    FaceRequest, PrerenderedFont, PrerenderedKey, map_prerendered_font, measure_width,
+    prerendered_font, resolve_face,
+};
 
 /// Default face name for a freshly constructed `Font` (reference's
 /// `MS Gothic`-ish default). Also the face a layer's lazily created font
@@ -350,10 +353,12 @@ extern "C" fn font_angle_set(
     0
 }
 
-/// Estimate text width using TVP's common half-width/full-width rule. When the
-/// font's properties are mapped to a pre-rendered `.tft`, use that font's
-/// baked advances instead (the message layer advances its cursor with this
-/// call, so it must match the drawn glyphs).
+/// The pixel width of `text`, measured with the reference procedure: the
+/// mapped `.tft`'s baked advances when one is installed, otherwise
+/// `tvp-text`'s `measure_width` (rounded per-glyph advances, missing glyphs
+/// as the pixel height — see `measure.rs`). The old `half_or_full` estimate
+/// is gone: the message layer advances its cursor with this call, so it must
+/// match the drawn glyphs.
 extern "C" fn font_text_width(
     _engine: *mut c_void,
     instance: *mut c_void,
@@ -369,7 +374,7 @@ extern "C" fn font_text_width(
     };
     let inst = unsafe { instance_ref::<FontInst>(instance) };
     // Snapshot the mapping key, then drop the scene lock before consulting the
-    // pre-rendered registry.
+    // pre-rendered registry or resolving the vector face.
     let key = {
         let scene = context_scene_read();
         let Some(font) = scene.fonts.iter().find(|f| f.id == inst.id) else {
@@ -383,26 +388,32 @@ extern "C" fn font_text_width(
             angle: font.angle as i32,
         }
     };
-    let height = key.height.max(1) as f64;
-    let width: f64 = if let Some(pfont) = prerendered_font(&key) {
-        text.chars()
-            .map(|c| {
-                pfont
-                    .find(c)
-                    .map(|g| g.advance() as f64)
-                    .unwrap_or_else(|| half_or_full(c, height))
+    let height = key.height.max(1) as f32;
+    // `KRKR_RS_SYSTEM_FONT` is the explicit path override (hermetic CI);
+    // otherwise the font's tracked face name, matching `drawText`.
+    let face =
+        if let Some(path) = std::env::var_os("KRKR_RS_SYSTEM_FONT").map(std::path::PathBuf::from) {
+            resolve_face(&FaceRequest::Path(path))
+        } else {
+            resolve_face(&FaceRequest::Named(key.face.clone()))
+        };
+    let pfont = prerendered_font(&key);
+    let width: f64 = match pfont {
+        Some(pfont) => text
+            .chars()
+            .map(|c| match pfont.find(c) {
+                Some(g) => f64::from(g.advance()),
+                None => face
+                    .as_ref()
+                    .map_or(0.0, |f| f64::from(measure_width(&c.to_string(), f, height))),
             })
-            .sum()
-    } else {
-        text.chars().map(|c| half_or_full(c, height)).sum()
+            .sum(),
+        None => face
+            .as_ref()
+            .map_or(0.0, |f| f64::from(measure_width(&text, f, height))),
     };
     set_real_out(out, width);
     0
-}
-
-/// TVP's default advance estimate: ASCII ≈ 0.55 em, everything else a full em.
-fn half_or_full(c: char, height: f64) -> f64 {
-    if c.is_ascii() { height * 0.55 } else { height }
 }
 
 extern "C" fn font_text_height(
