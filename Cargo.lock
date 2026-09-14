@@ -2616,7 +2616,7 @@ dependencies = [
 
 [[package]]
 name = "engine"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "kag",
  "log",
@@ -3619,7 +3619,7 @@ dependencies = [
 
 [[package]]
 name = "kag"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "thiserror 2.0.20",
 ]
@@ -3643,7 +3643,7 @@ checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 
 [[package]]
 name = "krkr-app"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "engine",
  "log",
@@ -4991,7 +4991,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "render"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "bevy",
  "engine",
@@ -5895,7 +5895,7 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tjs2-sys"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "thiserror 2.0.20",
 ]
@@ -6033,7 +6033,7 @@ checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
 
 [[package]]
 name = "tvp-archive"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "sevenz-rust",
  "tar",
@@ -6044,7 +6044,7 @@ dependencies = [
 
 [[package]]
 name = "tvp-config"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -6053,14 +6053,14 @@ dependencies = [
 
 [[package]]
 name = "tvp-input"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "tjs2-sys",
 ]
 
 [[package]]
 name = "tvp-kagparser"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "engine",
  "kag",
@@ -6071,7 +6071,7 @@ dependencies = [
 
 [[package]]
 name = "tvp-natives"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "engine",
  "ffmpeg-next",
@@ -6082,7 +6082,7 @@ dependencies = [
 
 [[package]]
 name = "tvp-scripts"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "engine",
  "flate2",
@@ -6093,7 +6093,7 @@ dependencies = [
 
 [[package]]
 name = "tvp-sound"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "engine",
  "log",
@@ -6106,7 +6106,7 @@ dependencies = [
 
 [[package]]
 name = "tvp-storages"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "encoding_rs",
  "engine",
@@ -6117,7 +6117,7 @@ dependencies = [
 
 [[package]]
 name = "tvp-streams"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "thiserror 2.0.20",
  "tvp-util",
@@ -6125,7 +6125,7 @@ dependencies = [
 
 [[package]]
 name = "tvp-text"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "ab_glyph",
  "fontdb",
@@ -6135,7 +6135,7 @@ dependencies = [
 
 [[package]]
 name = "tvp-util"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "encoding_rs",
  "md-5",
@@ -6143,7 +6143,7 @@ dependencies = [
 
 [[package]]
 name = "tvp-visual"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "engine",
  "flate2",
@@ -7188,7 +7188,7 @@ checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
 
 [[package]]
 name = "xp3"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "flate2",
  "thiserror 2.0.20",
