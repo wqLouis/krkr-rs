@@ -1762,7 +1762,7 @@ int tjs2_call_value(void *engine, tjs2_value_id id, int argc,
                                     params.empty() ? nullptr : params.data(),
                                     nullptr);
         if(TJS_FAILED(hr))
-            TJSThrowFrom_tjs_error(hr, TJS_W("")); // -> catch(eTJS) below
+            TJSThrowFrom_tjs_error(hr, nullptr); // -> catch(eTJS) below
 
         variant_to_value(e, result, out);
         if(out_error)
@@ -1846,7 +1846,7 @@ int tjs2_call_member(void *engine, tjs2_value_id id, const char *membername,
                                     params.empty() ? nullptr : params.data(),
                                     nullptr);
         if(TJS_FAILED(hr))
-            TJSThrowFrom_tjs_error(hr, TJS_W("")); // -> catch(eTJS) below
+            TJSThrowFrom_tjs_error(hr, member16.c_str()); // -> catch(eTJS) below
 
         variant_to_value(e, result, out);
         if(out_error)
