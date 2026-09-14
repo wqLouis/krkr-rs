@@ -34,6 +34,13 @@ use super::raster::blend_pixel;
 /// Half-open pixel rectangle `[x0, x1) x [y0, y1)`.
 pub(crate) type RectI = (i32, i32, i32, i32);
 
+/// `TVP_BB_COPY_MAIN` (`LayerBitmapIntf.h:127`): copy the RGB plane only
+/// (the reference `CopyColor` render method; the destination alpha is held).
+pub(crate) const COPY_MAIN: u8 = 1;
+/// `TVP_BB_COPY_MASK` (`LayerBitmapIntf.h:128`): copy the alpha plane only
+/// (the reference `CopyMask` render method; the destination RGB is held).
+pub(crate) const COPY_MASK: u8 = 2;
+
 /// Intersect `rect` with the bitmap's bounds, returning `None` when empty.
 pub(crate) fn intersect(bitmap: &BitmapState, rect: RectI) -> Option<RectI> {
     let (x0, y0, x1, y1) = rect;
@@ -504,6 +511,7 @@ pub(crate) fn blit_over(
     clip: RectI,
     opa: u8,
     treat_as_opaque: bool,
+    hold_alpha: bool,
 ) {
     let sw = src_rect.2 - src_rect.0;
     let sh = src_rect.3 - src_rect.1;
@@ -529,7 +537,70 @@ pub(crate) fn blit_over(
                 // opaque image; the constant `opa` supplies the coverage.
                 color[3] = 255;
             }
+            // The reference `Blt(..., holdAlpha)` suppresses the write to the
+            // destination alpha channel entirely; capture it first so the
+            // composite math still sees the real destination alpha.
+            let old_alpha = read_pixel(dst, x, y)[3];
             blend_pixel(dst, x, y, color, 255, opa);
+            if hold_alpha {
+                let mut d = read_pixel(dst, x, y);
+                d[3] = old_alpha;
+                write_pixel(dst, x, y, d);
+            }
+        }
+    }
+    dst.mark_dirty();
+}
+
+/// `iTVPBaseBitmap::CopyRect` with an explicit `plane` selection
+/// (`TVP_BB_COPY_MAIN` / `TVP_BB_COPY_MASK`), the primitive behind
+/// `tTJSNI_BaseLayer::CopyRect` (`LayerIntf.cpp:4574`).
+///
+/// * `COPY_MAIN` — `CopyColor`: destination RGB = source RGB, destination
+///   alpha held.
+/// * `COPY_MASK` — `CopyMask`: destination alpha = source alpha, destination
+///   RGB held.
+/// * `COPY_MAIN | COPY_MASK` — `Copy`: source-over alpha blend.
+pub(crate) fn blit_plane(
+    dst: &mut BitmapState,
+    dx: i32,
+    dy: i32,
+    src: &BitmapState,
+    src_rect: RectI,
+    clip: RectI,
+    plane: u8,
+) {
+    if plane & (COPY_MAIN | COPY_MASK) == (COPY_MAIN | COPY_MASK) {
+        blit_over(dst, dx, dy, src, src_rect, clip, 255, false, false);
+        return;
+    }
+    let sw = src_rect.2 - src_rect.0;
+    let sh = src_rect.3 - src_rect.1;
+    if sw <= 0 || sh <= 0 || src.width == 0 || src.height == 0 {
+        return;
+    }
+    let Some(in_bounds) = intersect(dst, (dx, dy, dx + sw, dy + sh)) else {
+        return;
+    };
+    let Some(dc) = intersect_rect(in_bounds, clip) else {
+        return;
+    };
+    for y in dc.1..dc.3 {
+        for x in dc.0..dc.2 {
+            let sx = src_rect.0 + (x - dx);
+            let sy = src_rect.1 + (y - dy);
+            if sx < 0 || sy < 0 || sx as u32 >= src.width || sy as u32 >= src.height {
+                continue;
+            }
+            let s = read_pixel(src, sx, sy);
+            let mut d = read_pixel(dst, x, y);
+            if plane & COPY_MAIN != 0 {
+                d[0..3].copy_from_slice(&s[0..3]);
+            }
+            if plane & COPY_MASK != 0 {
+                d[3] = s[3];
+            }
+            write_pixel(dst, x, y, d);
         }
     }
     dst.mark_dirty();
@@ -723,6 +794,7 @@ pub(crate) fn do_blur_light(
 /// SDK's `Layer.fillOperateRect`, which tiles a solid-color layer through
 /// `operateRect`. The common modes are real; the Photoshop-specific modes
 /// (`ltPs*`) reduce to source-over until the PS blend pipeline lands.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn fill_operate_rect(
     bitmap: &mut BitmapState,
     left: i32,
@@ -731,6 +803,7 @@ pub(crate) fn fill_operate_rect(
     height: u32,
     color: [u8; 4],
     mode: i64,
+    hold_alpha: bool,
 ) {
     let rect = (left, top, left + width as i32, top + height as i32);
     let Some((x0, y0, x1, y1)) = intersect(bitmap, rect) else {
@@ -744,7 +817,11 @@ pub(crate) fn fill_operate_rect(
             // ltOpaque / omOpaque
             for y in y0..y1 {
                 for x in x0..x1 {
-                    write_pixel(bitmap, x, y, color);
+                    let mut c = color;
+                    if hold_alpha {
+                        c[3] = read_pixel(bitmap, x, y)[3];
+                    }
+                    write_pixel(bitmap, x, y, c);
                 }
             }
         }
@@ -818,7 +895,13 @@ pub(crate) fn fill_operate_rect(
             // ltAlpha / ltPsNormal / ltAddAlpha / any other: source-over.
             for y in y0..y1 {
                 for x in x0..x1 {
+                    let old_alpha = read_pixel(bitmap, x, y)[3];
                     blend_pixel(bitmap, x, y, color, 255, 255);
+                    if hold_alpha {
+                        let mut d = read_pixel(bitmap, x, y);
+                        d[3] = old_alpha;
+                        write_pixel(bitmap, x, y, d);
+                    }
                 }
             }
         }
@@ -1077,6 +1160,27 @@ pub(crate) fn stretch_blit(
     src_rect: RectI,
     stretch_type: i64,
 ) {
+    stretch_blit_plane(
+        dst,
+        dest,
+        src,
+        src_rect,
+        stretch_type,
+        COPY_MAIN | COPY_MASK,
+    );
+}
+
+/// [`stretch_blit`] with an explicit `plane` selection, mirroring
+/// `tTVPBaseBitmap::StretchBlt`'s `holdAlpha` argument (which the reference
+/// `StretchCopy` uses to pick `bmCopy` with or without the alpha plane).
+pub(crate) fn stretch_blit_plane(
+    dst: &mut BitmapState,
+    dest: RectI,
+    src: &BitmapState,
+    src_rect: RectI,
+    stretch_type: i64,
+    plane: u8,
+) {
     let dw = dest.2 - dest.0;
     let dh = dest.3 - dest.1;
     let sw = src_rect.2 - src_rect.0;
@@ -1090,7 +1194,18 @@ pub(crate) fn stretch_blit(
     for y in dc.1..dc.3 {
         for x in dc.0..dc.2 {
             let color = stretch_sample(src, src_rect, dest, x, y, stretch_type);
-            write_pixel(dst, x, y, color);
+            if plane == (COPY_MAIN | COPY_MASK) {
+                write_pixel(dst, x, y, color);
+                continue;
+            }
+            let mut d = read_pixel(dst, x, y);
+            if plane & COPY_MAIN != 0 {
+                d[0..3].copy_from_slice(&color[0..3]);
+            }
+            if plane & COPY_MASK != 0 {
+                d[3] = color[3];
+            }
+            write_pixel(dst, x, y, d);
         }
     }
     dst.mark_dirty();
@@ -1560,6 +1675,7 @@ pub(crate) fn operate_rect(
     src_rect: RectI,
     mode: i64,
     opa: u8,
+    hold_alpha: bool,
 ) {
     let sw = src_rect.2 - src_rect.0;
     let sh = src_rect.3 - src_rect.1;
@@ -1572,7 +1688,13 @@ pub(crate) fn operate_rect(
     for y in dc.1..dc.3 {
         for x in dc.0..dc.2 {
             let color = read_pixel(src, src_rect.0 + (x - dx), src_rect.1 + (y - dy));
+            let old_alpha = read_pixel(dst, x, y)[3];
             blend_pixel_mode(dst, x, y, color, opa, mode);
+            if hold_alpha {
+                let mut d = read_pixel(dst, x, y);
+                d[3] = old_alpha;
+                write_pixel(dst, x, y, d);
+            }
         }
     }
     dst.mark_dirty();
@@ -1589,6 +1711,7 @@ pub(crate) fn stretch_blit_mode(
     stretch_type: i64,
     mode: i64,
     opa: u8,
+    hold_alpha: bool,
 ) {
     let dw = dest.2 - dest.0;
     let dh = dest.3 - dest.1;
@@ -1601,7 +1724,13 @@ pub(crate) fn stretch_blit_mode(
     for y in dc.1..dc.3 {
         for x in dc.0..dc.2 {
             let color = stretch_sample(src, src_rect, dest, x, y, stretch_type);
+            let old_alpha = read_pixel(dst, x, y)[3];
             blend_pixel_mode(dst, x, y, color, opa, mode);
+            if hold_alpha {
+                let mut d = read_pixel(dst, x, y);
+                d[3] = old_alpha;
+                write_pixel(dst, x, y, d);
+            }
         }
     }
     dst.mark_dirty();

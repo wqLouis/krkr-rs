@@ -29,7 +29,7 @@
 //! | `Layer(window, parent)` | create the layer; return its id |
 //! | `setPos(x, y[, w, h])` | set rect position (4 args set bounds) |
 //! | `setSize(w, h)` | set rect size |
-//! | `fillRect(x, y, w, h, color)` | solid fill (0xAARRGGBB → RGBA) |
+//! | `fillRect(x, y, w, h, color)` | solid fill (0xAARRGGBB → RGBA); dispatches on `face`/`holdAlpha` (dfMask = alpha only, dfMain+holdAlpha = RGB only) |
 //! | `loadImages(name)` | load a bitmap from storage |
 //! | `assignImages(source)` | share an image: a storage name, a `Layer` (bitmap + image rect/size), or a `Bitmap` |
 //! | `setSizeToImageSize()` | resize to the current bitmap |
@@ -43,7 +43,7 @@
 //! | `onPaint()` | base no-op action (script subclasses override it and call `super.onPaint(...)`) |
 //! | `setCursorPos(x,y)` | no-op (input: later) |
 //! | `focus([direction])` | sets the window's focused layer and dispatches `onFocus`/`onBlur` |
-//! | `copyRect(dx,dy,src,sx,sy,sw,sh)` | source-over blit of a `Bitmap`/`Layer` sub-rect, clipped to the bitmap and `ClipRect` (reference `CopyRect`) |
+//! | `copyRect(dx,dy,src,sx,sy,sw,sh)` | face-dispatched blit of a `Bitmap`/`Layer` sub-rect (dfMask = alpha only, dfMain+holdAlpha = RGB only, else source-over), clipped to the bitmap and `ClipRect` (reference `CopyRect`) |
 //! | `pileRect` / `piledCopy` / `blendRect` | legacy rect copy / alpha blend / constant-alpha blend (reference `PileRect`/`PiledCopy`/`BlendRect`) |
 //! | `convertType(fromtype)` | alpha <-> additive-alpha pixel conversion (reference `ConvertLayerType`) |
 //! | `copy9Patch(src)` | derives the 9-slice margins and scales them to fill the image |
@@ -738,6 +738,8 @@ extern "C" fn layer_copy_rect(
         return error_out(out_error, "Layer: layer no longer exists");
     };
     let clip = layer_pixel_rect(layer);
+    let face = layer_draw_face(layer);
+    let hold_alpha = layer.hold_alpha;
     // Allocate the destination MainImage (source-over copy extent) when the
     // layer has none, consistent with `hasImage = true`.
     let dest_w = (dx + (srcrect.2 - srcrect.0)).max(1) as u32;
@@ -746,7 +748,27 @@ extern "C" fn layer_copy_rect(
         return error_out(out_error, "Layer: layer no longer exists");
     };
     if let Some(dst) = scene.bitmap_mut(bitmap_id) {
-        layer_ops::blit_over(dst, dx, dy, &src_bmp, srcrect, clip, 255, false);
+        // Reference `CopyRect` plane dispatch (`LayerIntf.cpp:4594`):
+        // dfAlpha/dfAddAlpha copy main+mask (source-over); dfOpaque copies
+        // main+mask unless `holdAlpha` keeps the destination alpha; dfMask
+        // copies only the alpha plane. dfProvince targets the (unmodelled)
+        // province plane and leaves the main image alone.
+        let plane = match face {
+            DF_ALPHA | DF_ADD_ALPHA => layer_ops::COPY_MAIN | layer_ops::COPY_MASK,
+            DF_OPAQUE => {
+                if hold_alpha {
+                    layer_ops::COPY_MAIN
+                } else {
+                    layer_ops::COPY_MAIN | layer_ops::COPY_MASK
+                }
+            }
+            DF_MASK => layer_ops::COPY_MASK,
+            DF_PROVINCE => 0,
+            _ => 0,
+        };
+        if plane != 0 {
+            layer_ops::blit_plane(dst, dx, dy, &src_bmp, srcrect, clip, plane);
+        }
     }
     set_void_out(out);
     0
@@ -912,6 +934,7 @@ fn layer_legacy_rect_common(
         return error_out(out_error, "Layer: layer no longer exists");
     };
     let clip = layer_pixel_rect(layer);
+    let hold_alpha = layer.hold_alpha;
     let bitmap_id = match layer.bitmap {
         Some(id) => id,
         // KAG layers are image-capable and call pixel ops before any
@@ -938,7 +961,17 @@ fn layer_legacy_rect_common(
         if direct_copy {
             layer_ops::blit_copy_clipped(dst, dx, dy, &src, srcrect, clip);
         } else {
-            layer_ops::blit_over(dst, dx, dy, &src, srcrect, clip, opa, treat_as_opaque);
+            layer_ops::blit_over(
+                dst,
+                dx,
+                dy,
+                &src,
+                srcrect,
+                clip,
+                opa,
+                treat_as_opaque,
+                hold_alpha,
+            );
         }
     }
     set_void_out(out);
@@ -1162,9 +1195,11 @@ fn layer_draw_image_common(
     };
     if let Some(dst) = scene.bitmap_mut(bitmap_id) {
         if stretch {
-            layer_ops::stretch_blit_mode(dst, destrect, &src, srcrect, 0, 2, 255);
+            layer_ops::stretch_blit_mode(dst, destrect, &src, srcrect, 0, 2, 255, false);
         } else {
-            layer_ops::blit_over(dst, destrect.0, destrect.1, &src, srcrect, clip, 255, false);
+            layer_ops::blit_over(
+                dst, destrect.0, destrect.1, &src, srcrect, clip, 255, false, false,
+            );
         }
     }
     set_void_out(out);
@@ -1386,11 +1421,25 @@ extern "C" fn layer_fill_rect(
     if scene.layer(inst.id).is_none() {
         return error_out(out_error, "Layer: layer no longer exists");
     }
+    let face_hold = scene
+        .layer(inst.id)
+        .map(|layer| (layer_draw_face(layer), layer.hold_alpha));
     let bitmap_id = scene.layer(inst.id).and_then(|layer| layer.bitmap);
     match bitmap_id {
         Some(bitmap_id) => {
             if let Some(bitmap) = scene.bitmap_mut(bitmap_id) {
-                raster::fill_rect_replace(bitmap, x, y, w, h, color);
+                let rect = (x, y, x.saturating_add(w as i32), y.saturating_add(h as i32));
+                // Reference `FillRect` (`LayerIntf.cpp:4272`) face dispatch:
+                // dfAlpha/dfAddAlpha (and dfOpaque without `holdAlpha`) fill
+                // main+mask; dfOpaque+holdAlpha fills RGB only; dfMask fills
+                // the alpha plane with the low byte of the ARGB color.
+                match face_hold {
+                    Some((DF_MASK, _)) => layer_ops::fill_mask(bitmap, rect, color[2]),
+                    Some((DF_OPAQUE, true)) => {
+                        layer_ops::fill_color_hold_alpha(bitmap, rect, color, 255)
+                    }
+                    _ => raster::fill_rect_replace(bitmap, x, y, w, h, color),
+                }
                 bitmap.mark_dirty();
             }
         }
@@ -2074,14 +2123,16 @@ layer_int_prop!(
     |l: &mut LayerState, v: &Value| l.cursor = arg_i64(v) as i32
 );
 // `face` (`dfMain`/`dfMask`/...): the savedata header switches face around
-// `copyRect`. The renderer always draws the main image; the value round-trips.
+// `copyRect`/`fillRect`. Resolved through [`layer_draw_face`] and honored by
+// the pixel ops (see the module table).
 layer_int_prop!(
     layer_face_get,
     layer_face_set,
     |l: &LayerState| i64::from(l.face),
     |l: &mut LayerState, v: &Value| l.face = arg_i64(v) as i32
 );
-// `holdAlpha` — stored only.
+// `holdAlpha` — keep the destination alpha in the face-dispatched pixel ops
+// (`CopyRect`/`FillRect`/`StretchCopy`/...), like the reference `HoldAlpha`.
 layer_int_prop!(
     layer_hold_alpha_get,
     layer_hold_alpha_set,
@@ -3992,13 +4043,20 @@ fn paint_rule(
     }
 }
 
+/// Draw-face enum (`reference/cpp/core/visual/LayerIntf.h:59-67`):
+/// `dfAlpha=0`, `dfMain`/`dfOpaque=1`, `dfMask=2`, `dfProvince=3`,
+/// `dfAddAlpha=4`, `dfAuto=128`. `face` overrides the blend/type-derived
+/// face unless it is `dfAuto`.
+const DF_ALPHA: i32 = 0;
+const DF_OPAQUE: i32 = 1;
+const DF_MASK: i32 = 2;
+const DF_PROVINCE: i32 = 3;
+const DF_ADD_ALPHA: i32 = 4;
+const DF_AUTO: i32 = 128;
+
 /// Reference `UpdateDrawFace`: the layer's main-image draw face. `face`
 /// overrides the blend/type-derived face unless it is `dfAuto` (128).
 fn layer_draw_face(layer: &LayerState) -> i32 {
-    const DF_ALPHA: i32 = 0;
-    const DF_OPAQUE: i32 = 1;
-    const DF_ADD_ALPHA: i32 = 4;
-    const DF_AUTO: i32 = 128;
     if layer.face != DF_AUTO {
         return layer.face;
     }
@@ -4259,11 +4317,12 @@ extern "C" fn layer_fill_operate_rect(
     let mode = args.get(5).map(arg_i64).unwrap_or(13);
     let inst = unsafe { instance_ref::<LayerInst>(instance) };
     let mut scene = context_scene_mut();
+    let hold_alpha = scene.layer(inst.id).map(|l| l.hold_alpha).unwrap_or(false);
     let Some(bitmap_id) = ensure_dest_image(&mut scene, inst.id, 0, 0) else {
         return error_out(out_error, "Layer.fillOperateRect: layer no longer exists");
     };
     if let Some(bitmap) = scene.bitmap_mut(bitmap_id) {
-        layer_ops::fill_operate_rect(bitmap, left, top, width, height, color, mode);
+        layer_ops::fill_operate_rect(bitmap, left, top, width, height, color, mode, hold_alpha);
     }
     set_void_out(out);
     0
@@ -4381,6 +4440,8 @@ extern "C" fn layer_stretch_copy(
         return error_out(out_error, "Layer: layer no longer exists");
     };
     let clip = layer_pixel_rect(layer);
+    let face = layer_draw_face(layer);
+    let hold_alpha = layer.hold_alpha;
     // Allocate the destination MainImage (destination extent) when absent.
     let dest_w = destrect.2.max(1) as u32;
     let dest_h = destrect.3.max(1) as u32;
@@ -4392,7 +4453,14 @@ extern "C" fn layer_stretch_copy(
         return 0;
     };
     if let Some(dst) = scene.bitmap_mut(bitmap_id) {
-        layer_ops::stretch_blit(dst, destrect, &src_bmp, srcrect, stretch_type);
+        // `StretchCopy` (`LayerIntf.cpp:4672`) calls `StretchBlt(bmCopy)` with
+        // `HoldAlpha` only on the dfOpaque face; dfAlpha/dfAddAlpha always
+        // replace the destination alpha too.
+        let plane = match face {
+            DF_OPAQUE if hold_alpha => layer_ops::COPY_MAIN,
+            _ => layer_ops::COPY_MAIN | layer_ops::COPY_MASK,
+        };
+        layer_ops::stretch_blit_plane(dst, destrect, &src_bmp, srcrect, stretch_type, plane);
     }
     set_void_out(out);
     0
@@ -4715,8 +4783,12 @@ extern "C" fn layer_operate_rect(
     let Some(bitmap_id) = ensure_dest_image(&mut scene, inst.id, 0, 0) else {
         return error_out(out_error, "Layer.operateRect: layer no longer exists");
     };
+    let hold_alpha = scene
+        .layer(inst.id)
+        .map(|layer| layer.hold_alpha)
+        .unwrap_or(false);
     if let Some(dst) = scene.bitmap_mut(bitmap_id) {
-        layer_ops::operate_rect(dst, dx, dy, &src, srcrect, mode, opa);
+        layer_ops::operate_rect(dst, dx, dy, &src, srcrect, mode, opa, hold_alpha);
     }
     set_void_out(out);
     0
@@ -4791,8 +4863,21 @@ fn layer_stretch_common(
     let Some(bitmap_id) = ensure_dest_image(&mut scene, inst.id, dest_w, dest_h) else {
         return error_out(out_error, "Layer: layer no longer exists");
     };
+    let hold_alpha = scene
+        .layer(inst.id)
+        .map(|layer| layer.hold_alpha)
+        .unwrap_or(false);
     if let Some(dst) = scene.bitmap_mut(bitmap_id) {
-        layer_ops::stretch_blit_mode(dst, destrect, &src, srcrect, stretch_type, mode, opa);
+        layer_ops::stretch_blit_mode(
+            dst,
+            destrect,
+            &src,
+            srcrect,
+            stretch_type,
+            mode,
+            opa,
+            hold_alpha,
+        );
     }
     set_void_out(out);
     0
@@ -7604,6 +7689,142 @@ mod tests {
             bitmap.rgba.chunks_exact(4).all(|p| p[3] == 0),
             "a transparent fillRect must clear the image"
         );
+    }
+
+    /// Regression for the savedata thumbnail pipeline
+    /// (`system/systemwindow.tjs`, `LoadSaveWindow`): `copyRect` with
+    /// `face = dfMask` establishes the frame alpha, `fillRect` with
+    /// `face = dfMain` + `holdAlpha` clears the RGB while keeping that
+    /// alpha, and the final `copyRect` (still `holdAlpha`) writes the
+    /// thumbnail RGB behind the existing alpha.
+    #[test]
+    fn layer_savedata_thumbnail_uses_mask_face_and_hold_alpha() {
+        let env = TestEnv::new("layer-savedata-thumb");
+        env.run(
+            "var w = new Window(); \
+             var mask = new Bitmap(3, 3); \
+             var img = new Bitmap(3, 3); \
+             var x, y; \
+             for (y = 0; y < 3; y++) { for (x = 0; x < 3; x++) { \
+                 mask.setMaskPixel(x, y, 200); \
+                 img.setPixel(x, y, 0xff112233); \
+                 img.setMaskPixel(x, y, 255); \
+             } } \
+             var thumb = new Layer(w, null); \
+             var dst = new Bitmap(3, 3); \
+             thumb.setBitmap(dst.id); \
+             thumb.face = 2; \
+             thumb.copyRect(0, 0, mask, 0, 0, 3, 3); \
+             thumb.holdAlpha = true; \
+             thumb.face = 1; \
+             thumb.fillRect(0, 0, 3, 3, 0); \
+             thumb.copyRect(0, 0, img, 0, 0, 3, 3);",
+        )
+        .unwrap();
+        let scene = env.scene();
+        let bitmap = scene.bitmap(scene.layers[0].bitmap.unwrap()).unwrap();
+        for (x, y) in [(0u32, 0u32), (3, 0), (1, 2)] {
+            assert_eq!(
+                pixel(bitmap, x, y),
+                [0x11, 0x22, 0x33, 200],
+                "thumbnail RGB with the frame's alpha at ({x}, {y})"
+            );
+        }
+    }
+
+    /// `fillRect` with `dfMain` (1) + `holdAlpha` writes RGB only and leaves
+    /// the destination alpha untouched (reference `FillRect` -> `FillColor`).
+    #[test]
+    fn layer_fill_rect_hold_alpha_sets_rgb_only() {
+        let env = TestEnv::new("layer-fillrect-holdalpha");
+        env.run(
+            "var w = new Window(); var l = new Layer(w, null); \
+             var b = new Bitmap(2, 1); \
+             b.setMaskPixel(0, 0, 123); b.setMaskPixel(1, 0, 200); \
+             l.setBitmap(b.id); \
+             l.holdAlpha = true; l.face = 1; \
+             l.fillRect(0, 0, 2, 1, 0xffaabbcc);",
+        )
+        .unwrap();
+        let scene = env.scene();
+        let bitmap = scene.bitmap(scene.layers[0].bitmap.unwrap()).unwrap();
+        assert_eq!(pixel(bitmap, 0, 0), [0xaa, 0xbb, 0xcc, 123]);
+        assert_eq!(pixel(bitmap, 1, 0), [0xaa, 0xbb, 0xcc, 200]);
+    }
+
+    /// `copyRect` with `face = dfMask` (2) copies the alpha plane only,
+    /// holding the destination RGB (reference `CopyRect` -> `CopyMask`).
+    #[test]
+    fn layer_copy_rect_mask_face_writes_alpha_only() {
+        let env = TestEnv::new("layer-copyrect-mask");
+        env.run(
+            "var w = new Window(); var l = new Layer(w, null); \
+             var dst = new Bitmap(1, 1); dst.setPixel(0, 0, 0xffff0000); dst.setMaskPixel(0, 0, 10); \
+             var src = new Bitmap(1, 1); src.setPixel(0, 0, 0xff00ff00); src.setMaskPixel(0, 0, 222); \
+             l.setBitmap(dst.id); l.face = 2; \
+             l.copyRect(0, 0, src, 0, 0, 1, 1);",
+        )
+        .unwrap();
+        let scene = env.scene();
+        let bitmap = scene.bitmap(scene.layers[0].bitmap.unwrap()).unwrap();
+        assert_eq!(
+            pixel(bitmap, 0, 0),
+            [255, 0, 0, 222],
+            "alpha from the source, RGB held"
+        );
+    }
+
+    /// `fillRect` with `face = dfMask` (2) writes the alpha plane only,
+    /// holding the destination RGB.
+    #[test]
+    fn layer_fill_rect_mask_face_sets_alpha_only() {
+        let env = TestEnv::new("layer-fillrect-mask");
+        env.run(
+            "var w = new Window(); var l = new Layer(w, null); \
+             var b = new Bitmap(1, 1); b.setPixel(0, 0, 0xff00ff00); b.setMaskPixel(0, 0, 5); \
+             l.setBitmap(b.id); l.face = 2; \
+             l.fillRect(0, 0, 1, 1, 0xff000040);",
+        )
+        .unwrap();
+        let scene = env.scene();
+        let bitmap = scene.bitmap(scene.layers[0].bitmap.unwrap()).unwrap();
+        assert_eq!(pixel(bitmap, 0, 0), [0, 255, 0, 0x40]);
+    }
+
+    /// The default `face == dfAuto` + `holdAlpha == false` path is unchanged:
+    /// `copyRect` is a source-over alpha blend (a half-transparent source over
+    /// a transparent destination keeps its RGB and alpha).
+    #[test]
+    fn layer_copy_rect_default_face_still_blends() {
+        let env = TestEnv::new("layer-copyrect-default");
+        env.run(
+            "var w = new Window(); var l = new Layer(w, null); \
+             var src = new Bitmap(1, 1); src.setPixel(0, 0, 0xff0a141e); src.setMaskPixel(0, 0, 128); \
+             l.copyRect(0, 0, src, 0, 0, 1, 1);",
+        )
+        .unwrap();
+        let scene = env.scene();
+        let bitmap = scene.bitmap(scene.layers[0].bitmap.unwrap()).unwrap();
+        assert_eq!(pixel(bitmap, 0, 0), [0x0a, 0x14, 0x1e, 128]);
+    }
+
+    /// `stretchCopy` on the `dfOpaque` face with `holdAlpha` resamples the
+    /// source RGB and keeps the destination alpha (reference `StretchCopy`
+    /// passes `HoldAlpha` to `StretchBlt(bmCopy)`).
+    #[test]
+    fn layer_stretch_copy_hold_alpha_keeps_destination_alpha() {
+        let env = TestEnv::new("layer-stretchcopy-holdalpha");
+        env.run(
+            "var w = new Window(); var l = new Layer(w, null); \
+             var dst = new Bitmap(1, 1); dst.setMaskPixel(0, 0, 77); \
+             var src = new Bitmap(1, 1); src.setPixel(0, 0, 0xff102030); src.setMaskPixel(0, 0, 255); \
+             l.setBitmap(dst.id); l.holdAlpha = true; l.face = 1; \
+             l.stretchCopy(0, 0, 1, 1, src, 0, 0, 1, 1, 0);",
+        )
+        .unwrap();
+        let scene = env.scene();
+        let bitmap = scene.bitmap(scene.layers[0].bitmap.unwrap()).unwrap();
+        assert_eq!(pixel(bitmap, 0, 0), [0x10, 0x20, 0x30, 77]);
     }
 
     #[test]
