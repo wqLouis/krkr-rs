@@ -660,6 +660,38 @@ extern "C" fn menu_window_get(
     0
 }
 
+/// `HMENU` getter (reference `MenuItemImpl.cpp:409`): the platform menu handle
+/// a plugin would use. `tTJSNI_MenuItem::GetMenuItemHandleForPlugin()` is a
+/// stub that returns `nullptr` in this codebase (`MenuItemImpl.cpp:193`), so
+/// the faithful value is the null handle (`0`), not a fabricated handle. The
+/// property is read-only (`TJS_DENY_NATIVE_PROP_SETTER`).
+extern "C" fn menu_hmenu_get(
+    _e: *mut c_void,
+    _instance: *mut c_void,
+    out: *mut Value,
+    _err: *mut *mut c_char,
+    _obj: *mut c_void,
+) -> c_int {
+    set_int_out(out, 0);
+    0
+}
+
+/// The reference's `CreateShortCutKeyCodeTable()` (`MenuItemImpl.cpp:363`,
+/// called from `ScriptMgnIntf.cpp:535`): the `textToKeycode` dictionary and
+/// `keycodeToText` array. The `#if 0` Windows `MapVirtualKey` loop is skipped
+/// in a normal build, so only the three unconditional entries remain, with
+/// lowercase dictionary keys and original-case display names, exactly as
+/// `SetShortCutKeyCode` writes them.
+///
+/// NOTE: the reference registers these as *static* class properties
+/// (`TJS_END_NATIVE_STATIC_PROP_DECL_OUTER`), but `tjs2-sys`'s
+/// `register_native_class_instance` has no static-property parameter, so they
+/// are installed as TJS static members on the class object instead. They are
+/// functionally equivalent but not registered through the native property
+/// dispatch, which is why the parity checker does not credit them.
+const MENU_SHORTCUT_TABLES: &str = "MenuItem.textToKeycode = %['bksp'=>8,'pgup'=>33,'pgdn'=>34];\
+     MenuItem.keycodeToText = (function(){var a=[]; a[8]='BkSp'; a[33]='PgUp'; a[34]='PgDn'; return a;})();";
+
 /// Register `MenuItem` on the engine global object.
 pub fn register_menu_item(engine: &Tjs2Engine) -> Result<(), String> {
     engine.register_native_class_instance(&NativeInstanceBuilder {
@@ -757,8 +789,19 @@ pub fn register_menu_item(engine: &Tjs2Engine) -> Result<(), String> {
                 get: Some(menu_window_get),
                 set: None,
             },
+            NativeInstancePropertyDef {
+                name: "HMENU",
+                get: Some(menu_hmenu_get),
+                set: None,
+            },
         ],
-    })
+    })?;
+    // `textToKeycode` / `keycodeToText` (MenuItemImpl.cpp:422,432) as static
+    // class members; see `MENU_SHORTCUT_TABLES` for why they are not native.
+    engine
+        .exec_script(MENU_SHORTCUT_TABLES, "MenuItem.shortcutTables")
+        .map_err(|e| format!("MenuItem: failed to install shortcut tables: {e}"))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -811,5 +854,58 @@ mod tests {
             TjsValue::String("Ctrl+O".into())
         );
         assert_eq!(engine.eval("n", "menu").unwrap(), TjsValue::Integer(1));
+    }
+
+    /// `HMENU` (`MenuItemImpl.cpp:409`) reports the null plugin handle this
+    /// reference returns, and `textToKeycode` / `keycodeToText`
+    /// (`MenuItemImpl.cpp:422,432`) expose the shortcut tables.
+    #[test]
+    fn hmenu_and_shortcut_tables() {
+        let _lock = vm_lock();
+        let engine = Tjs2Engine::new().unwrap();
+        register_all(&engine).unwrap();
+        engine
+            .exec_script("var m = new MenuItem();", "menu")
+            .unwrap();
+        assert_eq!(
+            engine.eval("m.HMENU", "menu").unwrap(),
+            TjsValue::Integer(0),
+            "GetMenuItemHandleForPlugin returns null in this reference"
+        );
+        // HMENU is read-only.
+        assert!(engine.eval("m.HMENU = 1", "menu").is_err());
+
+        // The tables carry the three unconditional SetShortCutKeyCode
+        // entries (the Windows MapVirtualKey loop is `#if 0`).
+        assert_eq!(
+            engine
+                .eval("MenuItem.textToKeycode['bksp']", "menu")
+                .unwrap(),
+            TjsValue::Integer(8)
+        );
+        assert_eq!(
+            engine
+                .eval("MenuItem.textToKeycode['pgup']", "menu")
+                .unwrap(),
+            TjsValue::Integer(33)
+        );
+        assert_eq!(
+            engine
+                .eval("MenuItem.textToKeycode['pgdn']", "menu")
+                .unwrap(),
+            TjsValue::Integer(34)
+        );
+        assert_eq!(
+            engine.eval("MenuItem.keycodeToText[8]", "menu").unwrap(),
+            TjsValue::String("BkSp".into())
+        );
+        assert_eq!(
+            engine.eval("MenuItem.keycodeToText[33]", "menu").unwrap(),
+            TjsValue::String("PgUp".into())
+        );
+        assert_eq!(
+            engine.eval("MenuItem.keycodeToText[34]", "menu").unwrap(),
+            TjsValue::String("PgDn".into())
+        );
     }
 }

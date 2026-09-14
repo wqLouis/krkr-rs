@@ -41,16 +41,24 @@
 //! `G_DefaultReadEncoding`), while the default (`"UTF-8"`) keeps the port's
 //! automatic BOM → UTF-16LE → UTF-8 → CP932 detection.
 //!
-//! # Pending (need VM internals; not implemented)
+//! # Pending (need new `tjs2-sys` C-ABI entry points; not implemented)
 //!
-//! - `compileStorage` — reference `TVPCompileStorage`: compiles a storage
-//!   script to bytecode and writes it to an output stream. The C ABI exposes
-//!   no bytecode writer.
-//! - `dump` — reference `TVPDumpScriptEngine`: dumps the VM's compiled
-//!   code. The C ABI exposes no dump entry point.
-//! - `setCallMissing` / `getClassNames` — need `iTJSDispatch2::
-//!   ClassInstanceInfo` (`TJS_CII_SET_MISSING` / `TJS_CII_GET`), which the C
-//!   ABI does not expose.
+//! These four reference members (`ScriptMgnIntf.cpp:1356,1440,1474,1497`)
+//! cannot be built on the current C ABI. Each needs a small `tjs2_abi.cpp`
+//! addition (the C++ side owns the VM internals, the Rust wrapper cannot
+//! reach them):
+//!
+//! - `compileStorage` — reference `TVPCompileStorage`. Needs
+//!   `tjs2_compile_script(engine, script, output_path, isresult,
+//!   outputdebug, isexpression, name, lineofs, err)` wrapping
+//!   `tTJS::CompileScript` with a `TJSCreateBinaryStreamForWrite` output.
+//! - `dump` — reference `TVPDumpScriptEngine`. Needs `tjs2_dump(engine)`
+//!   wrapping `tTJS::Dump()`.
+//! - `getClassNames` — needs `tjs2_get_class_names(engine, obj, out, err)`
+//!   wrapping `iTJSDispatch2::ClassInstanceInfo(TJS_CII_GET, ...)` and
+//!   building a TJS Array.
+//! - `setCallMissing` — needs `tjs2_set_call_missing(engine, obj, err)`
+//!   wrapping `ClassInstanceInfo(TJS_CII_SET_MISSING, ...)`.
 //! - `dumpStringHeap` — reference `TJSDumpStringHeap()` (debug builds
 //!   only).
 //!

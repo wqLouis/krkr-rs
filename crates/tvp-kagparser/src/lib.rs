@@ -1464,6 +1464,29 @@ extern "C" fn prop_macros_get(
     }
 }
 
+/// `macroParams` / `mp` property getter (reference KAGParser.cpp:2484,2497).
+/// Both expose `GetMacroTopNoAddRef()` — the top macro-args dictionary —
+/// exactly like the `getMacroParams()` / `getMP()` methods; a parser with no
+/// active macro returns void (the reference returns a null object).
+extern "C" fn prop_macro_params_get(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    match unsafe { state_of(instance) }.get_macro_params_entries() {
+        Some(entries) => match set_dict_result(out, &entries) {
+            Ok(()) => 0,
+            Err(e) => error_out(out_error, &e),
+        },
+        None => {
+            set_out_void(out);
+            0
+        }
+    }
+}
+
 extern "C" fn prop_macros_set(
     _engine: *mut c_void,
     instance: *mut c_void,
@@ -1707,6 +1730,20 @@ pub fn register_kagparser(engine: &Tjs2Engine) -> Result<(), String> {
                 name: "macros",
                 get: Some(prop_macros_get),
                 set: Some(prop_macros_set),
+            },
+            // Reference KAGParser.cpp:2484 / :2497: `macroParams` and its
+            // short alias `mp` are read-only dictionary properties (the
+            // top macro-args dict). `getMacroParams()` / `getMP()` remain
+            // as the method forms, matching the reference which has both.
+            NativeInstancePropertyDef {
+                name: "macroParams",
+                get: Some(prop_macro_params_get),
+                set: None,
+            },
+            NativeInstancePropertyDef {
+                name: "mp",
+                get: Some(prop_macro_params_get),
+                set: None,
             },
         ],
     })
@@ -2063,8 +2100,15 @@ mod tests {
         assert_eq!(env.eval_ok("r[2].my"), TjsValue::String("10".into()));
         assert_eq!(env.eval_ok("r[4].tagname"), TjsValue::String("move".into()));
         assert_eq!(env.eval_ok("r[4].my"), TjsValue::String("99".into()));
-        // macroParams returns the top macro-args dict (empty here)
+        // macroParams returns the top macro-args dict (empty here), and the
+        // reference's `macroParams` / `mp` properties (KAGParser.cpp:2484,
+        // :2497) are aliases with the same value.
         assert_eq!(env.eval_ok("p.getMacroParams()"), TjsValue::Void);
+        assert_eq!(env.eval_ok("p.macroParams"), TjsValue::Void);
+        assert_eq!(env.eval_ok("p.mp"), TjsValue::Void);
+        // The reference registers both as read-only properties.
+        assert!(env.eval("p.macroParams = 1").is_err());
+        assert!(env.eval("p.mp = 1").is_err());
     }
 
     #[test]

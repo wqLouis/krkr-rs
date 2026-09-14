@@ -56,11 +56,15 @@
 //! calls on the same clock as the other natives. Instances are registered in
 //! a process-global active set while playing.
 //!
-//! Omitted on purpose (unused by the game, and plain object members on a
-//! native instance read as void / accept writes without throwing anyway):
-//! the reference's `contrast`/`brightness`/`hue`/`saturation` families and
-//! the event dispatcher methods `onCallbackCommand`/`onFrameUpdate` — the
-//! game assigns its own callbacks to the event names it uses.
+//! The reference's native event entry points
+//! [`onStatusChanged`](VideoOverlay)/`onCallbackCommand`/`onPeriod`/
+//! `onFrameUpdate` (`VideoOvlIntf.cpp:421-480`) are registered as fallbacks:
+//! when a script subclass does not override the event name, the native
+//! method builds the `TVP_ACTION_INVOKE` event dictionary and calls
+//! `actionOwner.action(ev)` (mirroring `Layer`/`Window`). The clock poll
+//! delivers `onStatusChanged`/`onPeriod`/`onFrameUpdate` through the member
+//! lookup, so a script override wins exactly like the reference's
+//! `TVPPostEvent(Owner, Owner, ...)`.
 
 use std::collections::HashSet;
 use std::ffi::{c_char, c_int, c_void};
@@ -70,7 +74,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use engine::Storage;
 use tjs2_sys::{
     DetachedValue, NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef,
-    Tjs2Engine, TjsValue, Value,
+    RetainedValue, Tjs2Engine, TjsValue, Value,
 };
 
 use crate::{
@@ -373,6 +377,17 @@ impl PlayStatus {
 
 /// Per-object state: rectangle/visibility, real media metadata, playback
 /// clock anchors and retained script callbacks.
+/// A retained reference to the overlay's action owner (the window object
+/// passed as the first constructor argument). The native event methods
+/// dispatch to `action_owner.action(event)`.
+struct ActionOwner {
+    /// Raw TJS object handle (re-retained per event dispatch).
+    raw: *mut c_void,
+    /// Keeps the object alive (AddRef); released when the overlay is
+    /// destroyed.
+    _keepalive: DetachedValue,
+}
+
 struct VideoOverlayInst {
     // rectangle / visibility
     left: i64,
@@ -406,6 +421,13 @@ struct VideoOverlayInst {
     // retained script state
     /// The TJS object this payload backs (valid while the object is alive).
     objthis: *mut c_void,
+    /// Reference `tTJSNI_BaseVideoOverlay::ActionOwner`: the object passed as
+    /// the first constructor argument (the window). `None` when constructed
+    /// with `null`/no object, like `new VideoOverlay(null)`.
+    action_owner: Option<ActionOwner>,
+    /// Highest frame index for which `onFrameUpdate` has fired; `-1` before
+    /// the first frame. Used to fire the event only when the frame advances.
+    last_frame_update: i64,
     transition_call: Option<DetachedValue>,
 
     // real decoding (FFmpeg) and the presented layer bitmap
@@ -457,6 +479,8 @@ impl Default for VideoOverlayInst {
             period_event_frame: -1,
             period_fired: false,
             objthis: std::ptr::null_mut(),
+            action_owner: None,
+            last_frame_update: -1,
             transition_call: None,
             decoder: None,
             frame: None,
@@ -594,6 +618,91 @@ fn fire_period(objthis: *mut c_void, reason: i64) {
     fire_member(objthis, "onPeriod", &[TjsValue::Integer(reason)]);
 }
 
+// ---------------------------------------------------------------------------
+// Action dispatch (TVP_ACTION_INVOKE)
+// ---------------------------------------------------------------------------
+
+/// One member value copied into the event dictionary the action receives.
+enum VideoEventArg {
+    Int(i64),
+    Str(String),
+}
+
+/// The TJS helper implementing `TVP_ACTION_INVOKE` (`EventIntf.h:208`): build
+/// the event dictionary `%[type, target, ...members]` and call
+/// `owner.action(ev)`. The reference's video-overlay events carry at most two
+/// members (`onCallbackCommand(command, arg)`).
+const VIDEO_OVERLAY_EVENT_DISPATCH: &str = "(function(owner,target,t,n1,v1,n2,v2){\
+    var ev=%[type:t,target:target];\n    if(n1!==void)ev[n1]=v1;\n    if(n2!==void)ev[n2]=v2;\n    return owner.action(ev);})";
+
+/// Dispatch one video-overlay event to its action owner: retain the owner and
+/// the target (`objthis`), evaluate the helper closure and invoke it with the
+/// event type plus alternating member name/value pairs. Mirrors the reference
+/// `TVP_ACTION_INVOKE_END(tTJSVariantClosure(ActionOwner))`
+/// (`VideoOvlIntf.cpp:421-480`).
+fn dispatch_video_overlay_event(
+    engine: &Tjs2Engine,
+    owner_raw: *mut c_void,
+    target: *mut c_void,
+    event_type: &str,
+    members: &[(&str, VideoEventArg)],
+) {
+    if owner_raw.is_null() || target.is_null() {
+        return;
+    }
+    let Ok(owner) = engine.retain_object_detached(owner_raw) else {
+        return;
+    };
+    let Ok(target_dv) = engine.retain_object_detached(target) else {
+        return;
+    };
+    let Ok(helper) = engine.eval_retained(VIDEO_OVERLAY_EVENT_DISPATCH, "videoOverlayEvent") else {
+        return;
+    };
+    let RetainedValue::Object(helper_dv) = helper else {
+        return;
+    };
+    let mut args: Vec<TjsValue> = vec![
+        TjsValue::Retained(owner.raw_id() as u64),
+        TjsValue::Retained(target_dv.raw_id() as u64),
+        TjsValue::String(event_type.to_string()),
+    ];
+    for i in 0..2 {
+        match members.get(i) {
+            Some((name, value)) => {
+                args.push(TjsValue::String((*name).to_string()));
+                args.push(match value {
+                    VideoEventArg::Int(v) => TjsValue::Integer(*v),
+                    VideoEventArg::Str(s) => TjsValue::String(s.clone()),
+                });
+            }
+            None => {
+                args.push(TjsValue::Void);
+                args.push(TjsValue::Void);
+            }
+        }
+    }
+    // `owner`/`target_dv` retentions are consumed by the argument copy; their
+    // drops are no-ops. Errors surface as a script `action` throw, which the
+    // VM reports elsewhere; the native method itself stays void.
+    if let Err(e) = engine.call_detached(&helper_dv, &args) {
+        log::warn!("video overlay event dispatch ({event_type}) failed: {e}");
+    }
+}
+
+fn dispatch_from_instance(
+    instance: *mut c_void,
+    objthis: *mut c_void,
+    event_type: &str,
+    members: &[(&str, VideoEventArg)],
+) {
+    // SAFETY: `instance` is a live VideoOverlayInst payload during the call.
+    let inst = unsafe { &*(instance as *const VideoOverlayInst) };
+    if let Some(owner) = &inst.action_owner {
+        dispatch_video_overlay_event(context_engine(), owner.raw, objthis, event_type, members);
+    }
+}
+
 /// Result of one playback advance: which script events are due.
 #[derive(Default)]
 struct AdvanceOutcome {
@@ -670,17 +779,32 @@ fn poll_with_now(engine: &Tjs2Engine, now: u64) {
         // SAFETY: while `addr` is in ACTIVE it points at a live payload;
         // destroy removes it first. The borrow ends before any script
         // callback runs, so a re-entrant native call cannot alias it.
-        let (outcome, objthis, transition) = {
+        let (outcome, objthis, transition, frame_update) = {
             let inst = unsafe { &mut *ptr };
             let outcome = advance_playback(inst, now);
             present_current(inst, now);
+            // Reference fires `onFrameUpdate` for every decoded frame while
+            // playing; the clock tick is the closest equivalent here. Skip
+            // repeats of the same frame so a paused/repeated tick does not
+            // spam the callback.
+            let frame_update = if inst.playing && inst.decoder.is_some() {
+                let frame = current_frame(inst, now);
+                if frame != inst.last_frame_update {
+                    inst.last_frame_update = frame;
+                    Some(frame)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             let objthis = inst.objthis;
             let transition = if outcome.transition_complete {
                 inst.transition_call.take()
             } else {
                 None
             };
-            (outcome, objthis, transition)
+            (outcome, objthis, transition, frame_update)
         };
         if outcome.finished {
             set_active(ptr, false);
@@ -690,6 +814,9 @@ fn poll_with_now(engine: &Tjs2Engine, now: u64) {
         }
         if let Some(reason) = outcome.period_reason {
             fire_period(objthis, reason);
+        }
+        if let Some(frame) = frame_update {
+            fire_member(objthis, "onFrameUpdate", &[TjsValue::Integer(frame)]);
         }
         if let Some(callback) = transition {
             let _ = engine.call_detached(&callback, &[]);
@@ -1122,14 +1249,17 @@ extern "C" fn vo_destroy(_engine: *mut c_void, instance: *mut c_void) {
     drop(unsafe { Box::from_raw(instance as *mut VideoOverlayInst) });
 }
 
-/// `new VideoOverlay(win)` / `super.VideoOverlay(...)`: accept any argument
-/// list (the stub has no window state) and remember `objthis` so the
-/// `onStatusChanged`/`onPeriod` callbacks can be invoked later.
+/// `new VideoOverlay(win)` / `super.VideoOverlay(...)`: remember `objthis` so
+/// the `on*` callbacks can be invoked later, and retain the action owner
+/// (reference `ActionOwner = param[0]`, `VideoOvlIntf.cpp:44`). The
+/// constructor's first argument is the window object; `null`/no argument
+/// leaves the action owner unset (the reference throws only when the argument
+/// is not a Window, which this headless port cannot validate).
 extern "C" fn vo_ctor(
     _engine: *mut c_void,
     instance: *mut c_void,
-    _argc: c_int,
-    _argv: *const Value,
+    argc: c_int,
+    argv: *const Value,
     out: *mut Value,
     _out_error: *mut *mut c_char,
     objthis: *mut c_void,
@@ -1138,6 +1268,133 @@ extern "C" fn vo_ctor(
     // the duration of the call.
     let inst = unsafe { &mut *(instance as *mut VideoOverlayInst) };
     inst.objthis = objthis;
+    let values = args(argv, argc);
+    if let Some(first) = values.first()
+        && first.ty == tjs2_sys::VAL_OBJECT
+        && first.retained != 0
+    {
+        let raw = first.retained as *mut c_void;
+        if let Ok(keepalive) = context_engine().retain_object_detached(raw) {
+            inst.action_owner = Some(ActionOwner {
+                raw,
+                _keepalive: keepalive,
+            });
+        }
+    }
+    set_void_out(out);
+    0
+}
+
+// ---------------------------------------------------------------------------
+// Native event entry points (`VideoOvlIntf.cpp:421-480`)
+// ---------------------------------------------------------------------------
+
+/// `onStatusChanged(status)` — fallback for a script that does not override
+/// the event: dispatch `%[type:"onStatusChanged", target:this, status:...]`
+/// to `actionOwner.action`.
+extern "C" fn vo_on_status_changed(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    objthis: *mut c_void,
+) -> c_int {
+    let values = args(argv, argc);
+    let Some(status) = values.first() else {
+        return report_error(
+            out_error,
+            "VideoOverlay.onStatusChanged requires 1 argument",
+        );
+    };
+    dispatch_from_instance(
+        instance,
+        objthis,
+        "onStatusChanged",
+        &[("status", VideoEventArg::Str(value_as_string(status)))],
+    );
+    set_void_out(out);
+    0
+}
+
+/// `onCallbackCommand(command, arg)` — reference `FireCallbackCommand`
+/// (`VideoOvlIntf.cpp:139`): dispatch the decoder callback command to the
+/// action owner.
+extern "C" fn vo_on_callback_command(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    objthis: *mut c_void,
+) -> c_int {
+    let values = args(argv, argc);
+    if values.len() < 2 {
+        return report_error(
+            out_error,
+            "VideoOverlay.onCallbackCommand requires 2 arguments",
+        );
+    }
+    dispatch_from_instance(
+        instance,
+        objthis,
+        "onCallbackCommand",
+        &[
+            ("command", VideoEventArg::Str(value_as_string(&values[0]))),
+            ("arg", VideoEventArg::Str(value_as_string(&values[1]))),
+        ],
+    );
+    set_void_out(out);
+    0
+}
+
+/// `onPeriod(reason)` — reference `FirePeriodEvent` (`VideoOvlIntf.cpp:152`).
+extern "C" fn vo_on_period(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    objthis: *mut c_void,
+) -> c_int {
+    let values = args(argv, argc);
+    let Some(reason) = values.first() else {
+        return report_error(out_error, "VideoOverlay.onPeriod requires 1 argument");
+    };
+    dispatch_from_instance(
+        instance,
+        objthis,
+        "onPeriod",
+        &[("reason", VideoEventArg::Int(value_as_i64(reason)))],
+    );
+    set_void_out(out);
+    0
+}
+
+/// `onFrameUpdate(frame)` — reference `FireFrameUpdateEvent`
+/// (`VideoOvlIntf.cpp:168`).
+extern "C" fn vo_on_frame_update(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    objthis: *mut c_void,
+) -> c_int {
+    let values = args(argv, argc);
+    let Some(frame) = values.first() else {
+        return report_error(out_error, "VideoOverlay.onFrameUpdate requires 1 argument");
+    };
+    dispatch_from_instance(
+        instance,
+        objthis,
+        "onFrameUpdate",
+        &[("frame", VideoEventArg::Int(value_as_i64(frame)))],
+    );
     set_void_out(out);
     0
 }
@@ -1771,6 +2028,22 @@ pub fn register_video_overlay(engine: &Tjs2Engine) -> Result<(), String> {
                 name: "selectAudioStream",
                 f: vo_select_audio_stream,
             },
+            NativeInstanceMethodDef {
+                name: "onStatusChanged",
+                f: vo_on_status_changed,
+            },
+            NativeInstanceMethodDef {
+                name: "onCallbackCommand",
+                f: vo_on_callback_command,
+            },
+            NativeInstanceMethodDef {
+                name: "onPeriod",
+                f: vo_on_period,
+            },
+            NativeInstanceMethodDef {
+                name: "onFrameUpdate",
+                f: vo_on_frame_update,
+            },
         ],
         properties: vec![
             NativeInstancePropertyDef {
@@ -2393,6 +2666,107 @@ mod tests {
         reset_now();
         set_video_storage(None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- native event entry points (TVP_ACTION_INVOKE) ---------------------
+
+    /// The four reference native event methods build the event dictionary
+    /// and invoke `actionOwner.action(ev)` when the script does not override
+    /// the event name (`VideoOvlIntf.cpp:421-480`).
+    #[test]
+    fn native_event_methods_dispatch_to_action_owner() {
+        let _vm_lock = vm_lock();
+        let engine = Tjs2Engine::new().expect("create engine");
+        crate::register_all(&engine).expect("register all natives");
+        engine
+            .exec_script(
+                r#"
+                // The action method mutates `this.log` (TJS dictionary-literal
+                // functions do not close over the outer script scope).
+                var owner = %[log: [], action: function(ev) {
+                    this.log.push(ev.type);
+                    if (ev.type === 'onStatusChanged') this.log.push(ev.status);
+                    if (ev.type === 'onCallbackCommand') { this.log.push(ev.command); this.log.push(ev.arg); }
+                    if (ev.type === 'onPeriod') this.log.push(ev.reason);
+                    if (ev.type === 'onFrameUpdate') this.log.push(ev.frame);
+                }];
+                var v = new VideoOverlay(owner);
+                v.onStatusChanged('play');
+                v.onCallbackCommand('cmd', 'arg');
+                v.onPeriod(1);
+                v.onFrameUpdate(7);
+                "#,
+                "video_overlay_events",
+            )
+            .expect("script runs");
+        let expect = [
+            TjsValue::String("onStatusChanged".into()),
+            TjsValue::String("play".into()),
+            TjsValue::String("onCallbackCommand".into()),
+            TjsValue::String("cmd".into()),
+            TjsValue::String("arg".into()),
+            TjsValue::String("onPeriod".into()),
+            TjsValue::Integer(1),
+            TjsValue::String("onFrameUpdate".into()),
+            TjsValue::Integer(7),
+        ];
+        assert_eq!(
+            engine.eval("owner.log.count", "test").unwrap(),
+            TjsValue::Integer(expect.len() as i64)
+        );
+        for (i, want) in expect.iter().enumerate() {
+            assert_eq!(
+                engine.eval(&format!("owner.log[{i}]"), "test").unwrap(),
+                want.clone(),
+                "owner.log[{i}]"
+            );
+        }
+    }
+
+    /// A script override of the event name wins over the native fallback,
+    /// like the reference's `TVPPostEvent` member lookup.
+    #[test]
+    fn script_override_wins_over_native_event_method() {
+        let _vm_lock = vm_lock();
+        let engine = Tjs2Engine::new().expect("create engine");
+        crate::register_all(&engine).expect("register all natives");
+        engine
+            .exec_script(
+                r#"
+                var fired = '';
+                var owner = %[acted: 0, action: function(ev) { this.acted++; }];
+                var v = new VideoOverlay(owner);
+                v.onStatusChanged = function(s) { fired = s; };
+                v.onStatusChanged('pause');
+                "#,
+                "video_overlay_override",
+            )
+            .expect("script runs");
+        assert_eq!(
+            engine.eval("fired", "test").unwrap(),
+            TjsValue::String("pause".into())
+        );
+        assert_eq!(
+            engine.eval("owner.acted", "test").unwrap(),
+            TjsValue::Integer(0)
+        );
+    }
+
+    /// Without an action owner (`new VideoOverlay(null)`) the native event
+    /// methods are safe no-ops (the reference only dispatches when
+    /// `ActionOwner.Object` is set).
+    #[test]
+    fn native_event_methods_without_action_owner_are_safe() {
+        let _vm_lock = vm_lock();
+        let engine = Tjs2Engine::new().expect("create engine");
+        crate::register_all(&engine).expect("register all natives");
+        engine
+            .exec_script(
+                "var v = new VideoOverlay(null); v.onStatusChanged('play'); \
+                 v.onCallbackCommand('a', 'b'); v.onPeriod(1); v.onFrameUpdate(2);",
+                "video_overlay_no_owner",
+            )
+            .expect("script runs");
     }
 
     // -- non-throwing surface ----------------------------------------------

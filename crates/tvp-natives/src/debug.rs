@@ -39,8 +39,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tjs2_sys::{DetachedValue, NativeClassBuilder, NativeMethodDef, NativePropertyDef, Value};
 
 use super::{
-    args, context_engine, lock_ok, report_error, set_int_out, set_string_out, set_void_out,
-    value_as_bool, value_as_i64, value_as_string,
+    args, context_engine, lock_ok, report_error, set_int_out, set_object_result, set_string_out,
+    set_void_out, value_as_bool, value_as_i64, value_as_string,
 };
 
 /// Handle of the file opened by `startLogToFile`; `message`/`notice` append
@@ -398,9 +398,40 @@ extern "C" fn prop_clear_log_file_on_error_set(
     0
 }
 
+/// `Debug.controller` getter (reference `DebugIntf.cpp:158`,
+/// `TVPCreateNativeClass_Debug`): returns the singleton `Controller` class
+/// object (the reference wraps `TVPGetControllerClass()` in a variant).
+/// Evaluating the global class object preserves its identity across reads.
+extern "C" fn prop_controller_get(
+    _e: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    match set_object_result(out, "Controller", "Debug.controller") {
+        Ok(()) => 0,
+        Err(e) => report_error(out_error, &format!("Debug.controller: {e}")),
+    }
+}
+
+/// `Debug.console` getter (reference `DebugIntf.cpp:170`): returns the
+/// singleton `Console` class object.
+extern "C" fn prop_console_get(
+    _e: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    match set_object_result(out, "Console", "Debug.console") {
+        Ok(()) => 0,
+        Err(e) => report_error(out_error, &format!("Debug.console: {e}")),
+    }
+}
+
 /// Register the `Debug` native class (methods + the logging properties).
 pub fn register_debug(engine: &tjs2_sys::Tjs2Engine) -> Result<(), String> {
     lock_ok(&LOGGING_HANDLERS).clear();
+    // `Debug.controller` / `Debug.console` return these class objects, so
+    // they must exist first.
+    super::controller_console::register_controller_console(engine)?;
     engine.register_native_class(&NativeClassBuilder {
         name: "Debug",
         properties: vec![
@@ -418,6 +449,17 @@ pub fn register_debug(engine: &tjs2_sys::Tjs2Engine) -> Result<(), String> {
                 name: "clearLogFileOnError",
                 get: Some(prop_clear_log_file_on_error_get),
                 set: Some(prop_clear_log_file_on_error_set),
+            },
+            // Reference DebugIntf.cpp:158,170: read-only class objects.
+            NativePropertyDef {
+                name: "controller",
+                get: Some(prop_controller_get),
+                set: None,
+            },
+            NativePropertyDef {
+                name: "console",
+                get: Some(prop_console_get),
+                set: None,
             },
         ],
         methods: vec![
@@ -547,5 +589,42 @@ mod tests {
             "test",
         )
         .unwrap();
+    }
+
+    /// `Debug.controller` / `Debug.console` return the `Controller` /
+    /// `Console` class objects (reference `DebugIntf.cpp:158,170`), whose
+    /// `visible` property is a no-op getter/setter in a headless port.
+    #[test]
+    fn controller_and_console_class_objects() {
+        let _vm_lock = vm_lock();
+        let e = engine();
+        assert_eq!(
+            e.eval("Debug.controller.visible", "test").unwrap(),
+            TjsValue::Integer(0)
+        );
+        assert_eq!(
+            e.eval("Debug.console.visible", "test").unwrap(),
+            TjsValue::Integer(0)
+        );
+        // The class object is stable across reads (the reference caches it
+        // in a static holder).
+        assert_eq!(
+            e.eval("Debug.controller === Debug.controller", "test")
+                .unwrap(),
+            TjsValue::Integer(1)
+        );
+        // The `visible` setter is a no-op, not an error.
+        e.exec_script(
+            "Debug.controller.visible = true; Debug.console.visible = true;",
+            "test",
+        )
+        .unwrap();
+        assert_eq!(
+            e.eval("Debug.controller.visible", "test").unwrap(),
+            TjsValue::Integer(0)
+        );
+        // `controller` / `console` themselves are read-only.
+        assert!(e.eval("Debug.controller = 1", "test").is_err());
+        assert!(e.eval("Debug.console = 1", "test").is_err());
     }
 }

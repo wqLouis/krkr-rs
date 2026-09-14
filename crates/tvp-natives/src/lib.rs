@@ -31,6 +31,7 @@
 mod async_trigger;
 mod chain_item_base;
 mod constants;
+mod controller_console;
 mod debug;
 mod extrans;
 mod menu_item;
