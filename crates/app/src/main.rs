@@ -126,6 +126,10 @@ fn register_natives(
         .as_ref()
         .set_data_dir(&storage.lock().unwrap().game_dir().display().to_string());
     tvp_natives::register_all(engine)?;
+    // `Mouse`/`Key` (the port compatibility input surface) live in
+    // `tvp-input`; register them so `load`/`run` see the same class surface
+    // as the graphical runner.
+    tvp_input::register_all(engine)?;
     tvp_kagparser::register_kagparser(engine)?;
     tvp_kagparser::set_context(Some(engine.clone()), Some(storage.clone()));
     tvp_storages::register_storages(engine)?;

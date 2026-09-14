@@ -380,6 +380,10 @@ fn register_natives(
         .as_ref()
         .set_data_dir(&storage.lock().unwrap().game_dir().display().to_string());
     tvp_natives::register_all(engine)?;
+    // `Mouse`/`Key` live in `tvp-input`; register them so scripts can reach
+    // the shared input state (and so `Mouse.getCursorPos(obj)` has the engine
+    // context it fills the object through).
+    tvp_input::register_all(engine)?;
     tvp_kagparser::register_kagparser(engine)?;
     tvp_kagparser::set_context(Some(engine.clone()), Some(storage.clone()));
     tvp_storages::register_storages(engine)?;

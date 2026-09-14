@@ -20,6 +20,7 @@ path = "src/bin/attention_harness.rs"
 engine = { path = "../engine" }
 tjs2-sys = { workspace = true }
 tvp-natives = { path = "../tvp-natives" }
+tvp-input = { path = "../tvp-input" }
 tvp-storages = { path = "../tvp-storages" }
 tvp-kagparser = { path = "../tvp-kagparser" }
 tvp-scripts = { path = "../tvp-scripts" }
