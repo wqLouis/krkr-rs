@@ -68,6 +68,7 @@
 //! `RetainedValue`); the C++ trampoline consumes that retention when it
 //! converts the native's return value.
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::io::Read;
@@ -173,9 +174,11 @@ fn context_engine() -> Result<Arc<Tjs2Engine>, String> {
 ///   system.dat uses mode 2).
 ///
 /// Returns the decoded UTF-16LE bytes (no BOM) for non-magic data unchanged.
-fn decompress_script(bytes: &[u8]) -> Result<Vec<u8>, String> {
+fn decompress_script(bytes: &[u8]) -> Result<Cow<'_, [u8]>, String> {
     if bytes.len() < 3 || bytes[0] != 0xFE || bytes[1] != 0xFE {
-        return Ok(bytes.to_vec());
+        // Borrow: an uncompressed script must not be copied. Save data is
+        // multi-megabyte, and this path runs on every load.
+        return Ok(Cow::Borrowed(bytes));
     }
     let mode = bytes[2];
     if mode == 2 {
@@ -198,7 +201,7 @@ fn decompress_script(bytes: &[u8]) -> Result<Vec<u8>, String> {
                 out.len()
             ));
         }
-        Ok(out)
+        Ok(Cow::Owned(out))
     } else if mode == 0 || mode == 1 {
         // UTF-16LE payload with a simple per-char cipher.
         if bytes.len() < 4 {
@@ -220,7 +223,7 @@ fn decompress_script(bytes: &[u8]) -> Result<Vec<u8>, String> {
             }
             out.extend_from_slice(&ch.to_le_bytes());
         }
-        Ok(out)
+        Ok(Cow::Owned(out))
     } else {
         Err(format!("FE FE unsupported mode {mode}"))
     }
@@ -233,12 +236,16 @@ fn decode_script(bytes: &[u8]) -> Result<String, String> {
         None => {
             if looks_like_utf16le(body) {
                 // BOM-less UTF-16LE (the FE FE decompressor yields this for
-                // `(const) [...]` save data).
-                let units: Vec<u16> = body
+                // `(const) [...]` save data). Decode straight into a `String`
+                // via `char::decode_utf16`: the previous version collected a
+                // `Vec<u16>` first, doubling the peak allocation for the
+                // multi-megabyte save payloads.
+                let units = body
                     .chunks_exact(2)
-                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
-                    .collect();
-                return String::from_utf16(&units).map_err(|e| e.to_string());
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]));
+                return char::decode_utf16(units)
+                    .collect::<Result<String, _>>()
+                    .map_err(|e| e.to_string());
             }
             // An explicit `Scripts.textEncoding` wins over the heuristic
             // fallback, like the reference's `G_DefaultReadEncoding`.
@@ -336,19 +343,31 @@ fn load_storage_text(name: &str, mode: &str) -> Result<String, String> {
 /// cross the ABI.
 fn execute_storage(name: &str, mode: &str, expression: bool) -> Result<RetainedValue, String> {
     let engine = context_engine()?;
+    let t_load = std::time::Instant::now();
     let text = load_storage_text(name, mode)?;
+    let load_ms = t_load.elapsed().as_millis();
     log::debug!(
         "Scripts: {} '{name}' ({} bytes)",
         if expression { "eval" } else { "exec" },
         text.len()
     );
-    if expression {
+    let t_eval = std::time::Instant::now();
+    let result = if expression {
         engine.eval_retained(&text, name).map_err(|e| e.to_string())
     } else {
         engine
             .exec_script_retained(&text, name)
             .map_err(|e| e.to_string())
+    };
+    let eval_ms = t_eval.elapsed().as_millis();
+    if load_ms + eval_ms >= 50 {
+        log::info!(
+            "Scripts: {} '{name}': read+decode {load_ms} ms, parse+eval {eval_ms} ms ({} bytes)",
+            if expression { "eval" } else { "exec" },
+            text.len()
+        );
     }
+    result
 }
 
 // ---------------------------------------------------------------------------

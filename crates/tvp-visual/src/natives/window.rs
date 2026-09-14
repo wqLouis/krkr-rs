@@ -361,6 +361,8 @@ extern "C" fn window_destroy(_engine: *mut c_void, instance: *mut c_void) {
         let mut scene = context_scene_mut();
         remove_window(&mut scene, inst.id);
     }
+    // Drop the raw TJS-object registration (see the layer counterpart).
+    super::clear_window_tjs_object(inst.id);
     // SAFETY: instance came from Box::into_raw.
     unsafe { drop(Box::from_raw(instance as *mut WindowInst)) };
 }

@@ -138,6 +138,18 @@ pub(crate) fn set_layer_tjs_object(id: u32, objthis: *mut c_void) {
         .insert(id, objthis);
 }
 
+/// Drop a layer's TJS object registration. Must be called when the layer is
+/// destroyed: the registry keeps only a **raw** pointer (no AddRef), so a
+/// stale entry would let input dispatch call into a freed object, and the map
+/// would grow for the life of the game.
+pub(crate) fn clear_layer_tjs_object(id: u32) {
+    LAYER_TJS_OBJECTS
+        .0
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&id);
+}
+
 /// Look up a layer's TJS object by scene id.
 ///
 /// Public so the render crate's input bridge can retain the object and call
@@ -160,6 +172,16 @@ pub(crate) fn set_window_tjs_object(id: u32, objthis: *mut c_void) {
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .insert(id, objthis);
+}
+
+/// Drop a window's TJS object registration (see
+/// [`clear_layer_tjs_object`]).
+pub(crate) fn clear_window_tjs_object(id: u32) {
+    WINDOW_TJS_OBJECTS
+        .0
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&id);
 }
 
 /// Look up a window's TJS object by scene id.

@@ -55,8 +55,8 @@ pub use menu_item::{
 pub use plugin_stubs::register_plugin_stubs;
 pub use plugins::register_plugins;
 pub use system::{
-    SystemContext, continuous_handler_poll, exit_on_window_close, register_system, set_key_state,
-    set_system_context, take_exit_request,
+    SystemContext, continuous_handler_poll, continuous_handlers_active, exit_on_window_close,
+    register_system, set_key_state, set_system_context, take_exit_request,
 };
 pub use video_overlay::{register_video_overlay, set_video_storage, video_overlay_poll};
 

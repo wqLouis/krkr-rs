@@ -1100,6 +1100,19 @@ fn continuous_handler_key(arg: &tjs2_sys::Value) -> (usize, usize) {
 /// `tick = TVPGetTickCount()`. A handler that raises a TJS error is
 /// removed (also matching the reference); the return value is ignored.
 /// Returns whether any remain.
+/// Whether any continuous handler is currently registered. The reference's
+/// `ContinuousEventCalling` flag means exactly this (it is set by
+/// `TVPBeginContinuousEvent` when the first handler is added and cleared by
+/// `TVPEndContinuousEvent` when the list empties), and the idle compaction is
+/// gated on it (`SystemControl.cpp:173`).
+pub fn continuous_handlers_active() -> bool {
+    CONTINUOUS_HANDLERS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .any(|slot| slot.is_some())
+}
+
 pub fn continuous_handler_poll(engine: &tjs2_sys::Tjs2Engine) -> bool {
     let tick = tick_count_ms();
     // Faithful port of `_TVPDeliverContinuousEvent` (`EventIntf.cpp:782`):

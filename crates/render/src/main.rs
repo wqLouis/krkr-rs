@@ -463,7 +463,26 @@ fn run_vm(vm: Res<VmRuntime>) {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(3000);
         static EVALED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if now_ms >= at && !EVALED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        // Optional repeat interval: with `KRKR_EVAL_EVERY_MS` set the script
+        // runs every N ms (after `at`) instead of once, so a single headless
+        // run can drive a sequence of scene changes.
+        let every = std::env::var("KRKR_EVAL_EVERY_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok());
+        static LAST_EVAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let due = match every {
+            Some(every) => {
+                now_ms >= at
+                    && now_ms.saturating_sub(LAST_EVAL.load(std::sync::atomic::Ordering::SeqCst))
+                        >= every
+            }
+            None => now_ms >= at && !EVALED.load(std::sync::atomic::Ordering::SeqCst),
+        };
+        if due {
+            if every.is_none() {
+                EVALED.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            LAST_EVAL.store(now_ms, std::sync::atomic::Ordering::SeqCst);
             match vm.engine.eval_retained(&script, "krkr-eval") {
                 Ok(_) => log::info!("KRKR_EVAL -> ok"),
                 Err(e) => log::error!("KRKR_EVAL !! {e}"),
@@ -474,6 +493,36 @@ fn run_vm(vm: Res<VmRuntime>) {
         tvp_natives::async_trigger_poll(&vm.engine);
         tvp_visual::timer_poll(&vm.engine, now_ms);
         tvp_natives::continuous_handler_poll(&vm.engine);
+        // Idle compaction — `SystemControl.cpp:173-179`: with no continuous
+        // handlers registered and more than 4 s since the last compaction,
+        // the reference delivers a compact event at the idle level, whose
+        // hook runs `tTJS::DoGarbageCollection` (`ScriptMgnIntf.cpp:376-388`).
+        // TJS2 reclaims reference **cycles** only in the GC, and the scene
+        // graph is full of them: every layer's `ActionOwner` strongly retains
+        // its window while the window's script fields reference the layers.
+        // Without this, a destroyed scene's layers — and their images, sounds
+        // and videos — are never collected, which is why the previous scene's
+        // assets stayed resident after loading a save. The reference also
+        // rehashes TJS objects every 1.5 s idle; that is a performance hint
+        // only and is not reproduced here.
+        static LAST_IDLE_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if now_ms.saturating_sub(LAST_IDLE_LOG.load(std::sync::atomic::Ordering::SeqCst)) > 4000 {
+            LAST_IDLE_LOG.store(now_ms, std::sync::atomic::Ordering::SeqCst);
+            log::info!(
+                "idle check at {now_ms} ms: continuous_handlers_active={}",
+                tvp_natives::continuous_handlers_active()
+            );
+        }
+        if !tvp_natives::continuous_handlers_active()
+            && now_ms.saturating_sub(LAST_COMPACT.load(std::sync::atomic::Ordering::SeqCst))
+                > IDLE_COMPACT_MS
+        {
+            LAST_COMPACT.store(now_ms, std::sync::atomic::Ordering::SeqCst);
+            log::info!("idle: running the TJS garbage collector at {now_ms} ms");
+            if let Err(e) = vm.engine.do_gc() {
+                log::warn!("idle garbage collection failed: {e}");
+            }
+        }
         // Sound: advance the mixer and deliver onStatusChanged /
         // onFadeCompleted to live WaveSoundBuffer objects (a panic inside a
         // script handler is caught below like the other polls).
@@ -486,6 +535,14 @@ fn run_vm(vm: Res<VmRuntime>) {
         );
     }
 }
+
+/// Idle window before the TJS garbage collector runs, matching the
+/// reference's `tick - LastCompactedTick > 4000` check
+/// (`environ/impl/SystemControl.cpp:173`).
+const IDLE_COMPACT_MS: u64 = 4000;
+
+/// Tick of the last idle compaction (see [`IDLE_COMPACT_MS`]).
+static LAST_COMPACT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Human-readable message from a `catch_unwind` panic payload.
 fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
