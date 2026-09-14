@@ -14,6 +14,18 @@ regardless of `--target` (see §2), which would make a `cargo check` result
 misleading; a real cross build is not cheap. That limitation is called out
 again in §11.
 
+> **Update (verified):** the Android cross-build of the C++ VM *has* since been
+done. With NDK r27c installed and `CXX` pointed at
+> `aarch64-linux-android21-clang++`, `cargo check -p tjs2-sys --target
+> aarch64-linux-android` **succeeds in ~19 s** — `build.rs` honours the `CXX`
+> override, so it does *not* build for the host when the override is set. Zig is
+> not an option for Android (it refuses to provide Android libc). See
+> `docs/android.md` for the current Android plan; the §1/§11 caveats below about
+> the game path being unchecked apply only to the original assessment.
+> `build.rs` is still not target-aware for the C++ **link** flags (§2): it gates
+> them on `env::consts::OS` (the host), so a Linux→Android build emits
+> desktop-only `-lc++ -lc++abi`.
+
 ---
 
 ## 0. Effort scale
@@ -31,7 +43,7 @@ again in §11.
 | Area | Android (`aarch64-linux-android`) | wasm32 (`wasm32-unknown-unknown`) | Effort |
 |---|---|---|---|
 | Cargo workspace / Bevy features | Builds with Bevy defaults; needs Android entrypoint + packaging | Builds with Bevy defaults; needs wasm entrypoint + web packaging | M |
-| C++ TJS2 VM (`tjs2-sys`) | Cross-compile with NDK (zig or NDK clang); build.rs not target-aware yet | **Hard blocker**: no C++ runtime for `wasm32-unknown-unknown`; needs Emscripten/WASI side module | L |
+| C++ TJS2 VM (`tjs2-sys`) | **Verified**: cross-compiles with the NDK clang (~19 s); zig cannot (no Android libc). build.rs still not target-aware for the C++ link flags | **Hard blocker**: no C++ runtime for `wasm32-unknown-unknown`; needs Emscripten/WASI side module | L |
 | oniguruma C lib | Cross-compile with NDK; `deps/build.zig` already target-aware | Same C++ toolchain problem | L |
 | libopus (`opusic-sys` bundled) | `opusic-sys` has explicit NDK support (`ANDROID_NDK_HOME` + cmake toolchain) | **Hard blocker**: cmake/emscripten not wired; no wasm libopus | M / L |
 | Filesystem / storage | `std::fs` works only inside app-private dirs; APK assets need `AssetManager`; scoped storage | **Hard blocker**: no synchronous fs; needs fetch/OPFS/IndexedDB + a storage trait | L |

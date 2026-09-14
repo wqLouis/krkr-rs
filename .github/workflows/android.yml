@@ -1,0 +1,116 @@
+# Android APK build for the experimental Android target (see docs/android.md).
+#
+# Triggers are deliberately narrow: this runs **only** on the dedicated
+# `android` branch and on tags, never on the default branch. The Android port is
+# an experiment, so nothing here should fire while ordinary engine work is going
+# on. Create/ push the `android` branch (or push a tag) to build it; the manual
+# `workflow_dispatch` entry is there for ad-hoc runs.
+#
+# Scope: `arm64-v8a` only, debug profile only (matching the project's
+# dev-binary rule). No release signing, no other ABIs, no emulator.
+#
+# NOTE: the `cargo ndk ... -p krkr-android` step needs the Android cdylib crate
+# (milestone M2 in docs/android.md). Until that lands, a run of this workflow
+# will fail at that step — which is the intended signal, not a broken workflow.
+name: Android
+
+on:
+  push:
+    branches:
+      - android
+    tags:
+      # Tagging is deliberate, so a tag anywhere triggers a build. Note that
+      # `v*` therefore fires on the default branch too; tag a release only when
+      # the Android port is in a state worth building.
+      - 'v*'
+      - 'android-*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Pinned exactly to what the port was verified against locally: NDK r27c
+  # compiles the vendored C++ TJS2 VM, so a version bump changes the compiler
+  # that builds the VM and must be re-verified.
+  NDK_VERSION: '27.2.12479018'
+  CARGO_NDK_VERSION: '4.1.2'
+  GRADLE_VERSION: '8.11.1'
+
+jobs:
+  apk:
+    name: Debug APK (arm64-v8a)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      # `bison` generates the TJS2 parsers; `crates/tjs2-sys/build.rs` also
+      # needs python3, which the runner image already provides.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bison
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up the Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK r27c
+        run: |
+          yes | sdkmanager --install "ndk;$NDK_VERSION"
+          # `cargo ndk` locates the toolchain through this variable.
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: android-arm64
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --version "$CARGO_NDK_VERSION" --locked
+
+      # Produces libkrkr_android.so and drops it straight into the Gradle
+      # module's jniLibs, so the APK packaging step needs no extra wiring.
+      # `cargo ndk` also supplies CC/AR/linker for the crates that compile C
+      # (blake3, opus); crates/tjs2-sys/build.rs picks up the NDK clang via its
+      # CXX override.
+      #
+      # There is no FFmpeg on Android, so the android crate must pull tvp-natives
+      # WITHOUT its default `ffmpeg` feature and use the MediaCodec backend
+      # instead (docs/android.md §6, milestone M5). If this step ever fails on
+      # `ffmpeg-next`/pkg-config, that feature wiring is what regressed.
+      - name: Build the engine for arm64-v8a
+        run: cargo ndk -t arm64-v8a -o android/app/src/main/jniLibs build -p krkr-android
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
+
+      - name: Assemble the debug APK
+        working-directory: android
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Upload the APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: krkr-rs-debug-arm64-v8a
+          path: android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 14

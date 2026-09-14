@@ -13,3 +13,16 @@
 *.swp
 .DS_Store
 __pycache__/
+
+# Android / Gradle
+/android/.gradle/
+/android/build/
+/android/app/build/
+/android/local.properties
+/android/.idea/
+/android/*.iml
+# The engine shared library is a build artifact, produced by
+# `cargo ndk -t arm64-v8a -o android/app/src/main/jniLibs build -p krkr-android`.
+# It must never be committed — it is architecture- and build-specific, and
+# regenerating it is what the Android build does.
+/android/app/src/main/jniLibs/
