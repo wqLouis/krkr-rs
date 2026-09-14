@@ -731,7 +731,7 @@ extern "C" fn layer_copy_rect(
     );
     let inst = unsafe { instance_ref::<LayerInst>(instance) };
     let mut scene = context_scene_mut();
-    let Some(src_bmp) = tile_bitmap_for_source(&scene, kind, src_id) else {
+    let Some(src_bmp) = tile_bitmap_for_source(&mut scene, kind, src_id) else {
         return error_out(out_error, "Layer.copyRect: source has no image");
     };
     let Some(layer) = scene.layer(inst.id) else {
@@ -927,7 +927,7 @@ fn layer_legacy_rect_common(
     };
     let inst = unsafe { instance_ref::<LayerInst>(instance) };
     let mut scene = context_scene_mut();
-    let Some(src) = tile_bitmap_for_source(&scene, kind, src_id) else {
+    let Some(src) = tile_bitmap_for_source(&mut scene, kind, src_id) else {
         return error_out(out_error, "Layer.pileRect/blendRect: source has no image");
     };
     let Some(layer) = scene.layer(inst.id) else {
@@ -1045,7 +1045,7 @@ extern "C" fn layer_copy_9patch(
     };
     let inst = unsafe { instance_ref::<LayerInst>(instance) };
     let mut scene = context_scene_mut();
-    let Some(src) = tile_bitmap_for_source(&scene, kind, src_id) else {
+    let Some(src) = tile_bitmap_for_source(&mut scene, kind, src_id) else {
         return error_out(out_error, "Layer.copy9Patch: source has no image");
     };
     let Some(bitmap_id) = ensure_dest_image(&mut scene, inst.id, 0, 0) else {
@@ -1180,7 +1180,7 @@ fn layer_draw_image_common(
     };
     let inst = unsafe { instance_ref::<LayerInst>(instance) };
     let mut scene = context_scene_mut();
-    let Some(src) = tile_bitmap_for_source(&scene, kind, src_id) else {
+    let Some(src) = tile_bitmap_for_source(&mut scene, kind, src_id) else {
         return error_out(out_error, "Layer.drawImage*: source has no image");
     };
     let Some(layer) = scene.layer(inst.id) else {
@@ -1226,8 +1226,8 @@ extern "C" fn layer_draw_image(
         let engine = context_engine();
         match resolve_image_source(engine, &args[2]) {
             Ok((kind, id)) => {
-                let scene = context_scene_read();
-                tile_bitmap_for_source(&scene, kind, id)
+                let mut scene = context_scene_mut();
+                tile_bitmap_for_source(&mut scene, kind, id)
                     .map(|b| (b.width as i32, b.height as i32))
                     .unwrap_or((0, 0))
             }
@@ -1351,7 +1351,7 @@ extern "C" fn layer_draw_image_affine(
     };
     let inst = unsafe { instance_ref::<LayerInst>(instance) };
     let mut scene = context_scene_mut();
-    let Some(src) = tile_bitmap_for_source(&scene, kind, src_id) else {
+    let Some(src) = tile_bitmap_for_source(&mut scene, kind, src_id) else {
         return error_out(out_error, "Layer.drawImageAffine: source has no image");
     };
     let srcrect = (sl, st, sl + sw, st + sh);
@@ -4231,10 +4231,23 @@ extern "C" fn layer_noise(
 /// from [`resolve_image_source`], which must be called **before** the scene
 /// lock is taken (it reads the layer's `hasImage` property, which re-enters
 /// the scene).
-fn tile_bitmap_for_source(scene: &Scene, kind: Option<bool>, id: u32) -> Option<BitmapState> {
+///
+/// A window's primary layer is its screen buffer: before reading it we
+/// composite the currently-visible layer tree into its MainImage (see
+/// [`layer_ops::composite_primary_layer`]).
+fn tile_bitmap_for_source(scene: &mut Scene, kind: Option<bool>, id: u32) -> Option<BitmapState> {
+    // `kind == Some(false)` is an explicit `Bitmap`; any other classification
+    // (Layer or an integer id) may name a window's primary layer.
+    if kind != Some(false) && scene.is_primary_layer(id) {
+        let _ = layer_ops::composite_primary_layer(scene, id);
+    }
     let bitmap_id = match kind {
-        // Layer object
-        Some(true) => scene.layer(id).and_then(|l| l.bitmap),
+        // Layer object. Some objects expose both a layer id and a bitmap id;
+        // fall back to the bitmap when the layer itself has no MainImage.
+        Some(true) => scene
+            .layer(id)
+            .and_then(|l| l.bitmap)
+            .or_else(|| scene.bitmap(id).map(|_| id)),
         // Bitmap object
         Some(false) => Some(id),
         // Integer id: probe the bitmap table first, then the layer table
@@ -4280,7 +4293,7 @@ extern "C" fn layer_tile_rect(
         Err(_) => return error_out(out_error, "Layer.tileRect expects a Layer or Bitmap"),
     };
     let mut scene = context_scene_mut();
-    let Some(tile) = tile_bitmap_for_source(&scene, kind, src_id) else {
+    let Some(tile) = tile_bitmap_for_source(&mut scene, kind, src_id) else {
         return error_out(out_error, "Layer.tileRect: tile has no image");
     };
     let tile_rect = (0, 0, tile.width as i32, tile.height as i32);
@@ -4433,7 +4446,7 @@ extern "C" fn layer_stretch_copy(
     );
     let inst = unsafe { instance_ref::<LayerInst>(instance) };
     let mut scene = context_scene_mut();
-    let Some(src_bmp) = tile_bitmap_for_source(&scene, kind, src_id) else {
+    let Some(src_bmp) = tile_bitmap_for_source(&mut scene, kind, src_id) else {
         return error_out(out_error, "Layer.stretchCopy: source has no image");
     };
     let Some(layer) = scene.layer(inst.id) else {
@@ -4762,7 +4775,7 @@ extern "C" fn layer_operate_rect(
     let opa = args.get(8).map(arg_i64).unwrap_or(255).clamp(0, 255) as u8;
     let inst = unsafe { instance_ref::<LayerInst>(instance) };
     let mut scene = context_scene_mut();
-    let Some(src) = tile_bitmap_for_source(&scene, kind, src_id) else {
+    let Some(src) = tile_bitmap_for_source(&mut scene, kind, src_id) else {
         return error_out(out_error, "Layer.operateRect: source has no image");
     };
     if mode == 128 {
@@ -4834,7 +4847,7 @@ fn layer_stretch_common(
     let stretch_type = args.get(type_index).map(arg_i64).unwrap_or(0);
     let inst = unsafe { instance_ref::<LayerInst>(instance) };
     let mut scene = context_scene_mut();
-    let Some(src) = tile_bitmap_for_source(&scene, kind, src_id) else {
+    let Some(src) = tile_bitmap_for_source(&mut scene, kind, src_id) else {
         return error_out(out_error, "Layer.stretch*: source has no image");
     };
     if mode == 128 {
@@ -4979,7 +4992,7 @@ fn layer_affine_common(
     };
     let inst = unsafe { instance_ref::<LayerInst>(instance) };
     let mut scene = context_scene_mut();
-    let Some(src) = tile_bitmap_for_source(&scene, kind, src_id) else {
+    let Some(src) = tile_bitmap_for_source(&mut scene, kind, src_id) else {
         return error_out(out_error, "Layer.affine*: source has no image");
     };
     if mode == 128 {
@@ -5182,7 +5195,12 @@ extern "C" fn layer_save_layer_image(
         );
     };
     let inst = unsafe { instance_ref::<LayerInst>(instance) };
-    let (scene, storage) = super::context_scene_storage();
+    let (mut scene, storage) = super::context_scene_storage();
+    // Reading the primary layer for a thumbnail must first materialize the
+    // screen buffer (the window's layer tree composite).
+    if scene.is_primary_layer(inst.id) {
+        let _ = layer_ops::composite_primary_layer(&mut scene, inst.id);
+    }
     let Some(bitmap) = scene
         .layer(inst.id)
         .and_then(|l| l.bitmap)
@@ -8447,5 +8465,164 @@ mod tests {
         assert_eq!(env.eval_int("next === b"), 1);
         assert_eq!(env.eval_string("global.seen.type"), "onSearchNextFocusable");
         assert_eq!(env.eval_int("global.seen.layer === b"), 1);
+    }
+
+    // ------------------------------------------------------------------
+    // Window primary-layer screen-buffer composite
+    //
+    // The reference primary layer is the window's screen buffer (the layer
+    // manager composites the tree into its MainImage). Reading it as an
+    // image source or saving it must composite the visible tree first.
+    // ------------------------------------------------------------------
+
+    /// Build an 8x8 window whose primary layer holds an opaque red child and
+    /// a half-alpha blue child over its right half. Scene layer order is
+    /// `primary(0)`, `red(1)`, `blue(2)`.
+    fn run_primary_composite_setup(env: &TestEnv) {
+        env.run(
+            "var w = new Window(); \
+             w.setSize(8, 8); \
+             var primary = new Layer(w, null); primary.setSize(8, 8); \
+             var red = new Layer(w, primary); \
+             red.setSize(8, 8); red.setPos(0, 0); red.visible = true; \
+             red.hasImage = true; red.fillRect(0, 0, 8, 8, 0xffff0000); \
+             var blue = new Layer(w, primary); \
+             blue.setSize(4, 8); blue.setPos(4, 0); blue.visible = true; \
+             blue.opacity = 128; blue.hasImage = true; \
+             blue.fillRect(0, 0, 4, 8, 0xff0000ff);",
+        )
+        .unwrap();
+    }
+
+    /// Read one RGBA pixel from a layer's attached bitmap.
+    fn composite_pixel(scene: &crate::scene::Scene, layer_index: usize, x: u32, y: u32) -> [u8; 4] {
+        let bitmap_id = scene.layers[layer_index]
+            .bitmap
+            .expect("layer has a bitmap");
+        let bitmap = scene.bitmap(bitmap_id).expect("bitmap exists");
+        let i = ((y * bitmap.width + x) as usize) * 4;
+        [
+            bitmap.rgba[i],
+            bitmap.rgba[i + 1],
+            bitmap.rgba[i + 2],
+            bitmap.rgba[i + 3],
+        ]
+    }
+
+    /// `piledCopy(0, 0, window.primaryLayer, ...)` reads a real screen buffer
+    /// composited from the visible children (position + opacity honoured).
+    #[test]
+    fn piled_copy_from_primary_composites_visible_layers() {
+        let env = TestEnv::new("primary-composite-piled");
+        run_primary_composite_setup(&env);
+        env.run(
+            "var dst = new Layer(w, null); dst.setSize(8, 8); dst.hasImage = true; \
+             dst.piledCopy(0, 0, primary, 0, 0, 8, 8);",
+        )
+        .unwrap();
+
+        let scene = env.scene();
+        // Layer order: primary(0), red(1), blue(2), dst(3).
+        assert_eq!(composite_pixel(&scene, 3, 0, 0), [255, 0, 0, 255]);
+        assert_eq!(composite_pixel(&scene, 3, 1, 7), [255, 0, 0, 255]);
+        // Right half: 50% blue over red.
+        assert_eq!(composite_pixel(&scene, 3, 7, 0), [127, 0, 128, 255]);
+        assert_eq!(composite_pixel(&scene, 3, 4, 7), [127, 0, 128, 255]);
+        assert!(
+            scene.layers[0].bitmap.is_some(),
+            "compositing allocates the primary MainImage"
+        );
+    }
+
+    /// `copyRect(0, 0, window.primaryLayer, ...)` takes the same
+    /// screen-buffer path as `piledCopy`.
+    #[test]
+    fn copy_rect_from_primary_composites_visible_layers() {
+        let env = TestEnv::new("primary-composite-copy");
+        run_primary_composite_setup(&env);
+        env.run(
+            "var dst = new Layer(w, null); dst.setSize(8, 8); dst.hasImage = true; \
+             dst.copyRect(0, 0, primary, 0, 0, 8, 8);",
+        )
+        .unwrap();
+
+        let scene = env.scene();
+        assert_eq!(composite_pixel(&scene, 3, 0, 0), [255, 0, 0, 255]);
+        assert_eq!(composite_pixel(&scene, 3, 7, 0), [127, 0, 128, 255]);
+    }
+
+    /// A hidden child is skipped by the composite.
+    #[test]
+    fn composite_skips_invisible_layers() {
+        let env = TestEnv::new("primary-composite-hidden");
+        run_primary_composite_setup(&env);
+        env.run("blue.visible = false;").unwrap();
+        env.run(
+            "var dst = new Layer(w, null); dst.setSize(8, 8); dst.hasImage = true; \
+             dst.piledCopy(0, 0, primary, 0, 0, 8, 8);",
+        )
+        .unwrap();
+
+        let scene = env.scene();
+        assert_eq!(composite_pixel(&scene, 3, 7, 0), [255, 0, 0, 255]);
+    }
+
+    /// `saveLayerImage` on the primary layer encodes the composited screen.
+    #[test]
+    fn save_layer_image_from_primary_writes_composite() {
+        let env = TestEnv::new("primary-composite-save");
+        run_primary_composite_setup(&env);
+        env.run("primary.saveLayerImage('thumb.png');").unwrap();
+
+        let path = env._dir.path().join("thumb.png");
+        let image = image::open(&path).expect("thumbnail encodes").to_rgba8();
+        assert_eq!((image.width(), image.height()), (8, 8));
+        assert_eq!(image.get_pixel(0, 0).0, [255, 0, 0, 255]);
+        assert_eq!(image.get_pixel(7, 7).0, [127, 0, 128, 255]);
+    }
+
+    /// An empty layer tree composites to a transparent screen buffer, not a
+    /// black one.
+    #[test]
+    fn empty_scene_composites_to_transparent() {
+        let env = TestEnv::new("primary-composite-empty");
+        env.run(
+            "var w = new Window(); w.setSize(4, 4); \
+             var primary = new Layer(w, null); primary.setSize(4, 4); \
+             var dst = new Layer(w, null); dst.setSize(4, 4); dst.hasImage = true; \
+             dst.piledCopy(0, 0, primary, 0, 0, 4, 4);",
+        )
+        .unwrap();
+
+        let scene = env.scene();
+        assert!(
+            scene.layers[0].bitmap.is_some(),
+            "the primary image is allocated even with nothing to draw"
+        );
+        let bitmap = scene
+            .bitmap(scene.layers[1].bitmap.expect("dst image"))
+            .expect("bitmap");
+        assert!(
+            bitmap.rgba.chunks_exact(4).all(|p| p[3] == 0),
+            "an empty tree must composite to transparent"
+        );
+    }
+
+    /// A `Layer`-classified source with no MainImage falls back to a bitmap
+    /// with the same numeric id (some objects expose both id spaces) instead
+    /// of reporting `source has no image`.
+    #[test]
+    fn layer_source_without_image_falls_back_to_bitmap() {
+        let mut scene = crate::scene::Scene::default();
+        let win = scene.add_window("t", (4, 4));
+        let _primary = scene.add_layer(win, None); // layer 0 (primary)
+        let source = scene.add_layer(win, None); // layer 1, no MainImage
+        let _first = scene.add_bitmap(1, 1, vec![1, 1, 1, 1]); // bitmap 0
+        let second = scene.add_bitmap(2, 2, vec![9; 16]); // bitmap 1
+        assert_eq!(second, 1);
+        let resolved = super::tile_bitmap_for_source(&mut scene, Some(true), source)
+            .expect("a Layer with no image must fall back to the colliding bitmap");
+        assert_eq!((resolved.width, resolved.height), (2, 2));
+        assert_eq!(resolved.rgba[0], 9);
     }
 }

@@ -27,7 +27,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::scene::BitmapState;
+use crate::scene::{BitmapState, Scene};
 
 use super::raster::blend_pixel;
 
@@ -571,7 +571,36 @@ pub(crate) fn blit_plane(
     plane: u8,
 ) {
     if plane & (COPY_MAIN | COPY_MASK) == (COPY_MAIN | COPY_MASK) {
-        blit_over(dst, dx, dy, src, src_rect, clip, 255, false, false);
+        // Reference `Copy` is `tTVPRenderMethod_DirectCopy`
+        // (`RenderManager.cpp:1359`): a straight copy of the source rect over
+        // the dest (RGB *and* alpha), transparent source pixels included —
+        // NOT a source-over blend. Games rely on this to make old pixels
+        // vanish when they redraw over existing content (e.g.
+        // `system/album.tjs::drawCompleteNumber` redraws the percentage
+        // digits over the previous frame; a blend leaves the old strokes).
+        let sw = src_rect.2 - src_rect.0;
+        let sh = src_rect.3 - src_rect.1;
+        if sw <= 0 || sh <= 0 || src.width == 0 || src.height == 0 {
+            return;
+        }
+        let Some(in_bounds) = intersect(dst, (dx, dy, dx + sw, dy + sh)) else {
+            return;
+        };
+        let Some(dc) = intersect_rect(in_bounds, clip) else {
+            return;
+        };
+        for y in dc.1..dc.3 {
+            for x in dc.0..dc.2 {
+                let sx = src_rect.0 + (x - dx);
+                let sy = src_rect.1 + (y - dy);
+                if sx < 0 || sy < 0 || sx as u32 >= src.width || sy as u32 >= src.height {
+                    continue;
+                }
+                let s = read_pixel(src, sx, sy);
+                write_pixel(dst, x, y, s);
+            }
+        }
+        dst.mark_dirty();
         return;
     }
     let sw = src_rect.2 - src_rect.0;
@@ -1838,4 +1867,243 @@ pub(crate) fn affine_blit(
         }
     }
     dst.mark_dirty();
+}
+
+// ---------------------------------------------------------------------------
+// Window primary-layer compositing (screenshots / save thumbnails)
+// ---------------------------------------------------------------------------
+//
+// The reference window's primary layer is its screen buffer: the layer
+// manager composites the window's layer tree into the primary's MainImage
+// while drawing (`reference/cpp/core/visual/LayerManager.cpp`),
+// and games read it back for screenshots (`ADVScreen.tjs`
+// `spr.piledCopy(0, 0, window.primaryLayer, ...)`) and save thumbnails.
+//
+// This engine renders the flat scene in Bevy, so the primary layer normally
+// has no MainImage. We allocate one on demand and composite the visible tree
+// into it with the same CPU blit/blend primitives `copyRect`/`piledCopy`
+// use, so any later read of the primary as an image source returns a real
+// screen buffer.
+
+/// One layer's contribution to the primary-layer composite.
+enum PrimaryDrawSource {
+    /// The layer's own MainImage (cloned so the primary can be borrowed
+    /// mutably while blitting).
+    Bitmap(BitmapState),
+    /// A solid fill for a bitmapless fill layer.
+    Solid([u8; 4]),
+}
+
+/// A resolved, back-to-front draw command for the primary composite. All
+/// coordinates are absolute window coordinates; `src` is in source pixels.
+struct PrimaryDraw {
+    source: PrimaryDrawSource,
+    dx: i32,
+    dy: i32,
+    src: RectI,
+    mode: i64,
+    opa: u8,
+}
+
+/// The primary MainImage size: the window's declared logical size, falling
+/// back to the primary layer's rect (then 1x1) for a degenerate window.
+fn primary_target_size(scene: &Scene, primary_id: u32, window: u32) -> Option<(u32, u32)> {
+    let (w, h) = scene.window(window)?.inner_size;
+    if w > 0 && h > 0 {
+        return Some((w, h));
+    }
+    let layer = scene.layer(primary_id)?;
+    Some((layer.rect.w.max(1), layer.rect.h.max(1)))
+}
+
+/// Make sure the primary layer owns a MainImage. Allocates a transparent
+/// buffer at the window's logical size when absent; an image the script
+/// already attached (or a previous composite) is left untouched.
+fn ensure_primary_bitmap(scene: &mut Scene, primary_id: u32, w: u32, h: u32) -> Option<u32> {
+    if let Some(bitmap_id) = scene.layer(primary_id)?.bitmap {
+        return Some(bitmap_id);
+    }
+    let bitmap_id = scene.add_bitmap(w, h, vec![0; w as usize * h as usize * 4]);
+    let layer = scene.layer_mut(primary_id)?;
+    layer.bitmap = Some(bitmap_id);
+    layer.image_left = 0;
+    layer.image_top = 0;
+    layer.image_width = w;
+    layer.image_height = h;
+    layer.clip = None;
+    layer.image_modified = true;
+    Some(bitmap_id)
+}
+
+/// Whether `id` is a (direct or indirect) child of `ancestor` in the layer
+/// tree. The window's primary layer is the screen buffer for **its** subtree
+/// (the game parents every content layer under `window.primaryLayer`); other
+/// window roots are separate trees and must not be composited into it.
+fn is_descendant(scene: &Scene, id: u32, ancestor: u32) -> bool {
+    let mut current = id;
+    for _ in 0..4096 {
+        let Some(layer) = scene.layer(current) else {
+            return false;
+        };
+        match layer.parent {
+            Some(parent) if parent == ancestor => return true,
+            Some(parent) => current = parent,
+            None => return false,
+        }
+    }
+    false
+}
+
+/// Product of the layer's and its ancestors' opacities (the reference
+/// composes a parent's opacity over its whole subtree). Bounded against a
+/// malformed parent cycle.
+fn node_opacity(scene: &Scene, id: u32) -> f32 {
+    let mut opacity = 1.0f32;
+    let mut current = Some(id);
+    for _ in 0..1024 {
+        let Some(layer) = current.and_then(|c| scene.layer(c)) else {
+            break;
+        };
+        opacity *= layer.opacity.clamp(0.0, 1.0);
+        current = layer.parent;
+    }
+    opacity
+}
+
+/// Blit one resolved bitmap draw onto the primary buffer using the same
+/// primitives `copyRect`/`piledCopy` use: an opaque full-alpha mode copies,
+/// source-over uses [`blit_over`], and the remaining modes go through
+/// [`operate_rect`].
+fn draw_primary_bitmap(dst: &mut BitmapState, draw: &PrimaryDraw, src: &BitmapState) {
+    let full = (i32::MIN, i32::MIN, i32::MAX, i32::MAX);
+    match draw.mode {
+        // ltBinder: a container layer draws nothing itself.
+        0 => {}
+        // ltOpaque at full coverage replaces pixels (including alpha).
+        1 if draw.opa == 255 => blit_copy_clipped(dst, draw.dx, draw.dy, src, draw.src, full),
+        // ltOpaque below full opacity, ltAlpha and ltPsNormal blend
+        // source-over (the opaque layer must not punch through its alpha).
+        1 | 2 | 13 => blit_over(
+            dst, draw.dx, draw.dy, src, draw.src, full, draw.opa, false, false,
+        ),
+        mode => operate_rect(dst, draw.dx, draw.dy, src, draw.src, mode, draw.opa, false),
+    }
+}
+
+/// Fill a bitmapless solid layer's rect on the primary buffer.
+fn draw_primary_solid(dst: &mut BitmapState, draw: &PrimaryDraw, color: [u8; 4]) {
+    let (sx, sy, sx1, sy1) = draw.src;
+    let dest = (draw.dx, draw.dy, draw.dx + (sx1 - sx), draw.dy + (sy1 - sy));
+    let Some((x0, y0, x1, y1)) = intersect(dst, dest) else {
+        return;
+    };
+    for y in y0..y1 {
+        for x in x0..x1 {
+            if draw.mode != 0 {
+                blend_pixel_mode(dst, x, y, color, draw.opa, draw.mode);
+            }
+        }
+    }
+    dst.mark_dirty();
+}
+
+/// Composite the window's currently-visible layer tree into its primary
+/// layer's MainImage, back-to-front. Allocates the primary image on demand
+/// at the window's logical size. Returns the primary bitmap id.
+pub(crate) fn composite_primary_layer(scene: &mut Scene, primary_id: u32) -> Option<u32> {
+    let window = scene.layer(primary_id)?.window;
+    if !scene.is_primary_layer(primary_id) {
+        return None;
+    }
+    let (target_w, target_h) = primary_target_size(scene, primary_id, window)?;
+    let bitmap_id = ensure_primary_bitmap(scene, primary_id, target_w, target_h)?;
+
+    // Resolve every visible layer to a draw command under immutable borrows,
+    // cloning the small source buffers (screenshots are rare; this avoids
+    // aliasing the primary while it is mutated).
+    let order = scene.window_layer_order(window);
+    let mut draws: Vec<PrimaryDraw> = Vec::new();
+    for id in order {
+        if id == primary_id || !is_descendant(scene, id, primary_id) || !scene.node_visible(id) {
+            continue;
+        }
+        let Some(layer) = scene.layer(id) else {
+            continue;
+        };
+        let opacity = node_opacity(scene, id);
+        let opa = (opacity * 255.0).round().clamp(0.0, 255.0) as u8;
+        if opa == 0 {
+            continue;
+        }
+        let (ax, ay) = scene.absolute_offset(id).unwrap_or((0, 0));
+        if let Some(src_id) = layer.bitmap {
+            let Some(src) = scene.bitmap(src_id).cloned() else {
+                continue;
+            };
+            if src.width == 0 || src.height == 0 {
+                continue;
+            }
+            // The image is placed at (rect + imageLeft, rect + imageTop),
+            // clipped to the layer rect and its own ClipRect. Saturating
+            // arithmetic keeps pathological script values from overflowing.
+            let img_x = ax.saturating_add(layer.image_left);
+            let img_y = ay.saturating_add(layer.image_top);
+            let img_x1 = img_x.saturating_add(src.width as i32);
+            let img_y1 = img_y.saturating_add(src.height as i32);
+            let rect_x1 = ax.saturating_add(layer.rect.w as i32);
+            let rect_y1 = ay.saturating_add(layer.rect.h as i32);
+            let (clx0, cly0, clx1, cly1) = match layer.clip {
+                Some(c) => (
+                    c.x,
+                    c.y,
+                    c.x.saturating_add(c.w as i32),
+                    c.y.saturating_add(c.h as i32),
+                ),
+                None => (0, 0, src.width as i32, src.height as i32),
+            };
+            let dx0 = img_x.saturating_add(clx0).max(img_x).max(ax);
+            let dy0 = img_y.saturating_add(cly0).max(img_y).max(ay);
+            let dx1 = img_x.saturating_add(clx1).min(img_x1).min(rect_x1);
+            let dy1 = img_y.saturating_add(cly1).min(img_y1).min(rect_y1);
+            if dx1 <= dx0 || dy1 <= dy0 {
+                continue;
+            }
+            let sx = dx0 - img_x;
+            let sy = dy0 - img_y;
+            draws.push(PrimaryDraw {
+                source: PrimaryDrawSource::Bitmap(src),
+                dx: dx0,
+                dy: dy0,
+                src: (sx, sy, sx + (dx1 - dx0), sy + (dy1 - dy0)),
+                mode: layer.blend_type,
+                opa,
+            });
+        } else if let Some(fill) = layer.fill_color {
+            draws.push(PrimaryDraw {
+                source: PrimaryDrawSource::Solid(fill),
+                dx: ax,
+                dy: ay,
+                src: (0, 0, layer.rect.w as i32, layer.rect.h as i32),
+                mode: layer.blend_type,
+                opa,
+            });
+        }
+    }
+
+    // Nothing below the primary: leave any script-attached image alone.
+    if draws.is_empty() {
+        return Some(bitmap_id);
+    }
+
+    // Clear the screen buffer, then composite back-to-front.
+    let primary = scene.bitmap_mut(bitmap_id)?;
+    primary.rgba.fill(0);
+    for draw in &draws {
+        match &draw.source {
+            PrimaryDrawSource::Bitmap(src) => draw_primary_bitmap(primary, draw, src),
+            PrimaryDrawSource::Solid(color) => draw_primary_solid(primary, draw, *color),
+        }
+    }
+    primary.mark_dirty();
+    Some(bitmap_id)
 }

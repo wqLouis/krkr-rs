@@ -380,6 +380,17 @@ impl Scene {
         self.layers.iter().find(|l| l.id == id)
     }
 
+    /// Whether `id` is the primary layer of its window (the root layer the
+    /// reference exposes as `window.primaryLayer` and whose MainImage is the
+    /// window's screen buffer).
+    pub fn is_primary_layer(&self, id: u32) -> bool {
+        let Some(layer) = self.layer(id) else {
+            return false;
+        };
+        self.window(layer.window)
+            .is_some_and(|window| window.primary_layer == Some(id))
+    }
+
     pub fn layer_mut(&mut self, id: u32) -> Option<&mut LayerState> {
         self.touch();
         let index = self
@@ -861,7 +872,7 @@ impl Scene {
 
     /// Sum of this layer's and its ancestors' `rect` offsets (absolute
     /// window position).
-    fn absolute_offset(&self, id: u32) -> Option<(i32, i32)> {
+    pub fn absolute_offset(&self, id: u32) -> Option<(i32, i32)> {
         let mut x = 0i32;
         let mut y = 0i32;
         let mut cur = Some(id);

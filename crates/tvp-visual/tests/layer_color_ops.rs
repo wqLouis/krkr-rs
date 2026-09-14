@@ -693,10 +693,11 @@ fn copy_rect_accepts_bitmap_and_layer_sources() {
     );
 }
 
-/// `copyRect` composites with source-over alpha (`bmAlpha`), not a raw
-/// overwrite.
+/// `copyRect` copies directly (`Copy` = `tTVPRenderMethod_DirectCopy`,
+/// `RenderManager.cpp:1359`): the source rect (RGB *and* alpha, including
+/// transparent pixels) overwrites the destination — not a source-over blend.
 #[test]
-fn copy_rect_source_over_alpha() {
+fn copy_rect_is_a_direct_copy() {
     let env = Env::new();
     env.run(
         "var w = new Window(); \
@@ -707,7 +708,8 @@ fn copy_rect_source_over_alpha() {
          dst.copyRect(0, 0, src, 0, 0, 1, 1);",
     );
     let scene = env.scene();
-    assert_eq!(pixel_index(&scene, 1, 0, 0), [127, 0, 128, 255]);
+    // The destination takes the source verbatim (no blending).
+    assert_eq!(pixel_index(&scene, 1, 0, 0), [0, 0, 255, 128]);
 }
 
 /// The `Button.create` sheet pattern: `copyRect` copies the whole sheet into
