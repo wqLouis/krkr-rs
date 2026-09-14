@@ -165,6 +165,12 @@ pub struct BitmapState {
     /// blit. Drawing it would replay the snapshot captured when the script
     /// last read it and leave stale imagery on screen.
     pub screen_buffer: bool,
+    /// True when a script `Bitmap` object owns this id (created or attached
+    /// through the `Bitmap` natives). A layer's MainImage may share the same
+    /// id (`Layer.assignImages(bitmap)` attaches the source id directly), so
+    /// destroying the layer must not free it while the script object can
+    /// still read it.
+    pub script_owned: bool,
 }
 
 impl BitmapState {
@@ -657,7 +663,8 @@ impl Scene {
         let Some(layer) = self.layer(id) else {
             return;
         };
-        let (win, parent, font_id) = (layer.window, layer.parent, layer.font_id);
+        let (win, parent, font_id, bitmap) =
+            (layer.window, layer.parent, layer.font_id, layer.bitmap);
         let children = layer.children.clone();
         // `Part()`: sever this layer from its parent (or the window roots).
         if let Some(p) = parent {
@@ -680,6 +687,12 @@ impl Scene {
             }
         }
         self.layers.retain(|l| l.id != id);
+        // The removed layer releases its MainImage. A bitmap still held by a
+        // surviving layer or a script `Bitmap` object is kept
+        // (see [`Scene::release_bitmap`]).
+        if let Some(bitmap) = bitmap {
+            self.release_bitmap(bitmap);
+        }
         // The removed layer owns its lazily-allocated font; drop it with the
         // layer (a surviving child keeps its own font).
         if let Some(font_id) = font_id {
@@ -756,6 +769,15 @@ impl Scene {
             .filter(|layer| doomed.contains(&layer.id))
             .filter_map(|layer| layer.font_id)
             .collect();
+        // The doomed layers' MainImages are candidates for release; a bitmap
+        // shared with a surviving layer or a script `Bitmap` stays. Collected
+        // before the layers disappear.
+        let doomed_bitmaps: Vec<u32> = self
+            .layers
+            .iter()
+            .filter(|layer| doomed.contains(&layer.id))
+            .filter_map(|layer| layer.bitmap)
+            .collect();
         // Drop the doomed ids from every surviving layer's child list and
         // focus search state.
         for layer in &mut self.layers {
@@ -771,6 +793,9 @@ impl Scene {
             }
         }
         self.layers.retain(|layer| !doomed.contains(&layer.id));
+        for bitmap in doomed_bitmaps {
+            self.release_bitmap(bitmap);
+        }
         self.fonts.retain(|font| !doomed_fonts.contains(&font.id));
         // Indices shifted: rebuild the id→index maps.
         self.layer_index.clear();
@@ -1077,9 +1102,79 @@ impl Scene {
             name: None,
             dirty: true,
             screen_buffer: false,
+            script_owned: false,
         });
         self.touch();
         id
+    }
+
+    /// Remove a bitmap unconditionally (the low-level primitive behind
+    /// [`Scene::release_bitmap`]). Keeps the id→index map consistent and
+    /// bumps [`Scene::revision`]. Returns true when the bitmap was present.
+    pub fn remove_bitmap(&mut self, id: u32) -> bool {
+        let before = self.bitmaps.len();
+        self.bitmaps.retain(|bitmap| bitmap.id != id);
+        if self.bitmaps.len() == before {
+            return false;
+        }
+        self.bitmap_index.clear();
+        for (index, bitmap) in self.bitmaps.iter().enumerate() {
+            self.bitmap_index.insert(bitmap.id, index);
+        }
+        self.touch();
+        true
+    }
+
+    /// Whether any live layer still references `id` as its MainImage.
+    pub fn bitmap_referenced_by_layer(&self, id: u32) -> bool {
+        self.layers.iter().any(|layer| layer.bitmap == Some(id))
+    }
+
+    /// Release a bitmap when the last holder is gone.
+    ///
+    /// Reference semantics: a layer's MainImage is a **reference-counted**
+    /// `tTVPBaseBitmap`; destroying the layer drops only its own reference.
+    /// In this port a bitmap id can be held by more than one owner, so
+    /// freeing is conservative — the bitmap is removed only when
+    /// * no live layer references it (`layer.bitmap == Some(id)`), and
+    /// * it is not owned by a script `Bitmap` object
+    ///   ([`BitmapState::script_owned`]).
+    ///
+    /// The decode cache never holds a scene bitmap id: [`BitmapCache`] owns
+    /// its decoded pixels directly, so a loaded layer's image is always
+    /// releasable and a re-`load` still hits the cache.
+    ///
+    /// Returns true when the bitmap was removed.
+    pub fn release_bitmap(&mut self, id: u32) -> bool {
+        let Some(bitmap) = self.bitmap(id) else {
+            return false;
+        };
+        if bitmap.script_owned {
+            return false;
+        }
+        if self.bitmap_referenced_by_layer(id) {
+            return false;
+        }
+        if self.remove_bitmap(id) {
+            log::debug!("released scene bitmap #{id}");
+            return true;
+        }
+        false
+    }
+
+    /// Release every bitmap whose last holder has gone away. Returns the
+    /// number freed. Per-layer release in [`Scene::remove_layer`] /
+    /// [`Scene::destroy_layer`] is the normal path; this sweep is for a
+    /// caller that tore a scene down through direct vec edits.
+    pub fn collect_unused_bitmaps(&mut self) -> usize {
+        let ids: Vec<u32> = self.bitmaps.iter().map(|bitmap| bitmap.id).collect();
+        let mut freed = 0;
+        for id in ids {
+            if self.release_bitmap(id) {
+                freed += 1;
+            }
+        }
+        freed
     }
 
     pub fn bitmap(&self, id: u32) -> Option<&BitmapState> {
@@ -1289,9 +1384,23 @@ impl Scene {
 }
 
 /// Bitmap cache for `Bitmap(name)` reuse, keyed by normalized storage name.
+///
+/// The cache owns its decoded pixels **independently of any scene bitmap**
+/// (the reference's `tTVPGraphicImageData` holds its own refcounted image).
+/// That means `TVPClearGraphicCache` frees the templates by simply clearing
+/// the map, and a layer's MainImage can be released when its layer is
+/// destroyed without invalidating the cache.
 #[derive(Default)]
 pub struct BitmapCache {
-    pub by_name: HashMap<String, u32>,
+    pub by_name: HashMap<String, CachedImage>,
+}
+
+/// One decode-cache template: straight-alpha RGBA8 pixels plus size.
+#[derive(Debug, Clone)]
+pub struct CachedImage {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
 }
 
 #[cfg(test)]
@@ -1513,6 +1622,143 @@ mod tests {
         assert_eq!(scene.window(win).unwrap().primary_layer, None);
         assert_eq!(scene.window(win).unwrap().focused_layer, None);
         assert!(scene.font(font).is_none(), "owned font destroyed");
+    }
+
+    /// `destroy_layer` releases the bitmaps its subtree alone held, while a
+    /// bitmap still attached to a surviving layer stays (reference
+    /// refcounted MainImage).
+    #[test]
+    fn destroy_layer_releases_layer_owned_bitmaps_but_keeps_shared() {
+        let mut scene = Scene::default();
+        let win = scene.add_window("t", (1, 1));
+        let parent = scene.add_layer(win, None);
+        let child_solo = scene.add_layer(win, Some(parent));
+        let child_shared = scene.add_layer(win, Some(parent));
+        let survivor = scene.add_layer(win, None);
+        let solo = scene.add_bitmap(2, 2, vec![0; 16]);
+        let shared = scene.add_bitmap(2, 2, vec![1; 16]);
+        scene.layer_mut(child_solo).unwrap().bitmap = Some(solo);
+        scene.layer_mut(child_shared).unwrap().bitmap = Some(shared);
+        scene.layer_mut(survivor).unwrap().bitmap = Some(shared);
+
+        scene.destroy_layer(parent);
+
+        assert!(scene.bitmap(solo).is_none(), "solo bitmap freed");
+        assert!(scene.bitmap(shared).is_some(), "shared bitmap survives");
+        assert!(scene.bitmap_referenced_by_layer(shared));
+    }
+
+    /// A whole-scene teardown releases every layer-owned bitmap — the count
+    /// the renderer then prunes from `Assets<Image>`. Only a bitmap still
+    /// referenced by a surviving layer is kept.
+    #[test]
+    fn scene_teardown_releases_all_layer_owned_bitmaps() {
+        let mut scene = Scene::default();
+        let win = scene.add_window("t", (1280, 720));
+        let root = scene.add_layer(win, None);
+        let mut owned = Vec::new();
+        for _ in 0..100 {
+            let layer = scene.add_layer(win, Some(root));
+            let bmp = scene.add_bitmap(2, 2, vec![0; 16]);
+            scene.layer_mut(layer).unwrap().bitmap = Some(bmp);
+            owned.push(bmp);
+        }
+        let shared = scene.add_bitmap(2, 2, vec![0; 16]);
+        scene.layer_mut(root).unwrap().bitmap = Some(shared);
+        let survivor = scene.add_layer(win, None);
+        scene.layer_mut(survivor).unwrap().bitmap = Some(shared);
+
+        scene.destroy_layer(root);
+
+        for bmp in &owned {
+            assert!(scene.bitmap(*bmp).is_none(), "bitmap {bmp} released");
+        }
+        assert!(scene.bitmap(shared).is_some(), "shared bitmap survives");
+        assert_eq!(
+            scene.collect_unused_bitmaps(),
+            0,
+            "every layer-owned bitmap was already released"
+        );
+    }
+
+    /// `remove_layer` (`Part()`) also releases the removed layer's own
+    /// bitmap; a child kept alive by the detach keeps its own image.
+    #[test]
+    fn remove_layer_releases_its_bitmap_and_keeps_children_images() {
+        let mut scene = Scene::default();
+        let win = scene.add_window("t", (1, 1));
+        let parent = scene.add_layer(win, None);
+        let child = scene.add_layer(win, Some(parent));
+        let other = scene.add_layer(win, None);
+        let parent_bmp = scene.add_bitmap(2, 2, vec![0; 16]);
+        let child_bmp = scene.add_bitmap(2, 2, vec![1; 16]);
+        let other_bmp = scene.add_bitmap(2, 2, vec![2; 16]);
+        scene.layer_mut(parent).unwrap().bitmap = Some(parent_bmp);
+        scene.layer_mut(child).unwrap().bitmap = Some(child_bmp);
+        scene.layer_mut(other).unwrap().bitmap = Some(other_bmp);
+
+        scene.remove_layer(parent);
+
+        assert!(scene.bitmap(parent_bmp).is_none(), "parent bitmap freed");
+        assert!(scene.bitmap(child_bmp).is_some(), "child survives Part");
+        assert!(scene.bitmap(other_bmp).is_some(), "other layer untouched");
+    }
+
+    /// A script `Bitmap` object keeps its pixels alive even after every
+    /// layer sharing the id is destroyed (the reference refcounted
+    /// MainImage).
+    #[test]
+    fn script_owned_bitmap_survives_layer_destroy() {
+        let mut scene = Scene::default();
+        let win = scene.add_window("t", (1, 1));
+        let layer = scene.add_layer(win, None);
+
+        let script = scene.add_bitmap(2, 2, vec![0; 16]);
+        scene.bitmap_mut(script).unwrap().script_owned = true;
+        scene.layer_mut(layer).unwrap().bitmap = Some(script);
+        scene.destroy_layer(layer);
+        assert!(scene.bitmap(script).is_some(), "script Bitmap survives");
+    }
+
+    /// The window primary layer's screen buffer survives while its window
+    /// lives and is freed when the primary layer is destroyed.
+    #[test]
+    fn primary_screen_buffer_survives_until_the_layer_is_destroyed() {
+        let mut scene = Scene::default();
+        let win = scene.add_window("t", (1, 1));
+        let primary = scene.add_layer(win, None);
+        assert_eq!(scene.window(win).unwrap().primary_layer, Some(primary));
+        let content = scene.add_layer(win, Some(primary));
+        let screen = scene.add_bitmap(4, 4, vec![0; 64]);
+        scene.bitmap_mut(screen).unwrap().screen_buffer = true;
+        scene.layer_mut(primary).unwrap().bitmap = Some(screen);
+        let content_bmp = scene.add_bitmap(2, 2, vec![1; 16]);
+        scene.layer_mut(content).unwrap().bitmap = Some(content_bmp);
+
+        // A sweep while the window lives must not free the screen buffer.
+        assert_eq!(scene.collect_unused_bitmaps(), 0);
+        assert!(scene.bitmap(screen).is_some());
+
+        scene.destroy_layer(primary);
+        assert!(
+            scene.bitmap(screen).is_none(),
+            "screen buffer freed with the primary layer"
+        );
+        assert!(scene.bitmap(content_bmp).is_none(), "content freed too");
+    }
+
+    /// `collect_unused_bitmaps` sweeps orphans but respects the script
+    /// protection.
+    #[test]
+    fn collect_unused_bitmaps_sweeps_orphans_only() {
+        let mut scene = Scene::default();
+        let orphan = scene.add_bitmap(1, 1, vec![0; 4]);
+        let script = scene.add_bitmap(1, 1, vec![0; 4]);
+        scene.bitmap_mut(script).unwrap().script_owned = true;
+
+        assert_eq!(scene.collect_unused_bitmaps(), 1);
+        assert!(scene.bitmap(orphan).is_none());
+        assert!(scene.bitmap(script).is_some());
     }
 
     /// Rebuilding a scene after a teardown must not surface a stale layer:

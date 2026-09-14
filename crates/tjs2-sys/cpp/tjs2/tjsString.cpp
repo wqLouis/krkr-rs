@@ -55,7 +55,11 @@ namespace TJS {
     }
 
     //---------------------------------------------------------------------------
-    tjs_int64 tTJSString::AsInteger() const { return Ptr->ToInteger(); }
+    // krkr-rs: a null `Ptr` is the empty string; `ToInteger` on it must yield
+    // 0 WITHOUT a null-`this` member call (UB under clang -O1+).
+    tjs_int64 tTJSString::AsInteger() const {
+        return Ptr ? Ptr->ToInteger() : 0;
+    }
 
     //---------------------------------------------------------------------------
     void tTJSString::Replace(const tTJSString &from, const tTJSString &to,
@@ -272,7 +276,10 @@ namespace TJS {
         tjs_char *p1 = (tjs_char *)_str.c_str() + _str.length() - 1;
         while(p0 < p1 && *p1 != '\0' && *p1 < 0x20)
             *p1-- = '\0';
-        _str.Ptr->FixLength();
+        // krkr-rs: an all-whitespace/empty input makes `_str.Ptr` null; guard
+        // the null-`this` call (UB under clang -O1+).
+        if(_str.Ptr)
+            _str.Ptr->FixLength();
         return _str;
     }
 

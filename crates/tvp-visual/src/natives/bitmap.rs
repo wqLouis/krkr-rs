@@ -127,9 +127,12 @@ extern "C" fn bitmap_create(_engine: *mut c_void) -> *mut c_void {
     Box::into_raw(Box::<BitmapInst>::default()) as *mut c_void
 }
 
-/// Release a `Bitmap` payload. Bitmaps are shared by reference in TVP (the
-/// bitmap cache and all layers referencing them keep the pixels alive), so
-/// this intentionally does not remove the bitmap from the scene.
+/// Release a `Bitmap` payload. Bitmaps are shared by reference in TVP (a
+/// layer, another script `Bitmap` or the decode cache may still hold one), so
+/// this intentionally does not remove the bitmap from the scene. It is freed
+/// only when a layer that owns it is destroyed (see
+/// `Scene::release_bitmap`); script-owned pixels deliberately outlive the
+/// script object, matching the conservative reference semantics.
 extern "C" fn bitmap_destroy(_engine: *mut c_void, instance: *mut c_void) {
     // SAFETY: instance came from Box::into_raw.
     unsafe { drop(Box::from_raw(instance as *mut BitmapInst)) };
@@ -138,6 +141,16 @@ extern "C" fn bitmap_destroy(_engine: *mut c_void, instance: *mut c_void) {
 /// Whether a callback argument is one of TJS's numeric types.
 fn is_number(v: &Value) -> bool {
     v.ty == tjs2_sys::VAL_INTEGER || v.ty == tjs2_sys::VAL_REAL
+}
+
+/// Mark a scene bitmap as owned by a script `Bitmap` object. Such a bitmap
+/// may be shared with a layer (`Layer.assignImages(bitmap)` attaches the
+/// source id directly), so destroying that layer must not free it.
+fn mark_script_owned(id: u32) {
+    let mut scene = context_scene_mut();
+    if let Some(bitmap) = scene.bitmap_mut(id) {
+        bitmap.script_owned = true;
+    }
 }
 
 /// Create a blank bitmap of the requested size, returning its scene id.
@@ -307,6 +320,7 @@ extern "C" fn bitmap_ctor(
         Ok(id) => {
             inst.set_id(id);
             inst.constructed = true;
+            mark_script_owned(id);
             apply_color_key(id, colorkey);
             set_int_out(out, i64::from(id));
             0
@@ -653,6 +667,7 @@ extern "C" fn bitmap_load(
         (id, dims.0, dims.1)
     };
     inst.set_id(id);
+    mark_script_owned(id);
     apply_color_key(id, colorkey);
     // Scene pixels are always RGBA8, so the reported bpp is 32.
     let engine = crate::natives::context_engine();
@@ -1061,13 +1076,17 @@ pub fn async_poll(engine: &Tjs2Engine) {
                 let bpp = if has_alpha { 32 } else { 24 };
                 let id = {
                     let mut scene = context_scene_mut();
-                    match shared.id.load(Ordering::Acquire) {
+                    let id = match shared.id.load(Ordering::Acquire) {
                         id if id != NO_BITMAP && scene.bitmap(id).is_some() => {
                             crate::bitmap::replace_bitmap_rgba(&mut scene, id, width, height, rgba);
                             id
                         }
                         _ => scene.add_bitmap(width, height, rgba),
+                    };
+                    if let Some(bitmap) = scene.bitmap_mut(id) {
+                        bitmap.script_owned = true;
                     }
+                    id
                 };
                 shared.id.store(id, Ordering::Release);
                 (false, String::new(), Some((width, height, bpp)))

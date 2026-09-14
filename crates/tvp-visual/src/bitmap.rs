@@ -271,6 +271,19 @@ fn byte_magic(bytes: &[u8]) -> String {
 }
 
 pub fn decode_image(name: &str, bytes: &[u8]) -> Result<DecodedImage, BitmapError> {
+    let started = std::time::Instant::now();
+    let result = decode_image_impl(name, bytes);
+    let ms = started.elapsed().as_millis();
+    if ms >= 50 {
+        log::info!(
+            "image decode: {name:?} took {ms} ms ({} bytes)",
+            bytes.len()
+        );
+    }
+    result
+}
+
+fn decode_image_impl(name: &str, bytes: &[u8]) -> Result<DecodedImage, BitmapError> {
     if is_tlg_name(name) {
         match decode_tlg_bytes(name, bytes) {
             Ok(decoded) => return Ok(decoded),
@@ -382,6 +395,10 @@ pub fn replace_bitmap_rgba(
     bmp.width = width;
     bmp.height = height;
     bmp.rgba = rgba;
+    // Only the script `Bitmap` natives call this (`copyFrom`, async poll), so
+    // the target is owned by the script object and must survive the layers
+    // that may share its id.
+    bmp.script_owned = true;
     bmp.mark_dirty();
 }
 
@@ -411,7 +428,9 @@ pub fn load_bitmap_from_storage(
 ///    copied into the new bitmap. This matches the reference, where
 ///    `TVPLoadGraphic` copies the cached image into every `Bitmap`
 ///    (`AssignToTexture`), so `Bitmap("x")` twice yields two bitmaps that
-///    can be mutated independently.
+///    can be mutated independently. The cache owns its pixels directly, so
+///    the returned bitmap can be released with its layer while a re-`load`
+///    still hits the cache.
 /// 3. `target == Some(id)` decodes and overwrites that existing bitmap in
 ///    place (the reference `Bitmap.load` replaces the current image).
 ///
@@ -432,11 +451,9 @@ pub fn load_bitmap_into_storage(
 
     // A fresh load copies from the cached template (independently owned).
     if target.is_none()
-        && let Some(&template) = cache.by_name.get(&resolved)
-        && let Some(bmp) = scene.bitmap(template)
+        && let Some(template) = cache.by_name.get(&resolved)
     {
-        let (w, h, rgba) = (bmp.width, bmp.height, bmp.rgba.clone());
-        let id = scene.add_bitmap(w, h, rgba);
+        let id = scene.add_bitmap(template.width, template.height, template.rgba.clone());
         if let Some(b) = scene.bitmap_mut(id) {
             b.name = Some(resolved);
         }
@@ -446,27 +463,32 @@ pub fn load_bitmap_into_storage(
     let bytes = read_storage_bytes(storage, &resolved)?;
 
     let decoded = decode_image(&resolved, &bytes)?;
+    let template = scene::CachedImage {
+        width: decoded.width,
+        height: decoded.height,
+        rgba: decoded.rgba,
+    };
 
     let id = match target {
         Some(tid) if scene.bitmap(tid).is_some() => {
-            let (w, h, rgba) = (decoded.width, decoded.height, decoded.rgba);
             let b = scene.bitmap_mut(tid).expect("checked above");
-            b.width = w;
-            b.height = h;
-            b.rgba = rgba;
+            b.width = template.width;
+            b.height = template.height;
+            b.rgba = template.rgba.clone();
             b.mark_dirty();
             tid
         }
-        _ => scene.add_bitmap(decoded.width, decoded.height, decoded.rgba),
+        _ => scene.add_bitmap(template.width, template.height, template.rgba.clone()),
     };
     if let Some(b) = scene.bitmap_mut(id) {
         b.name = Some(resolved.clone());
     }
-    // Only a freshly-decoded bitmap becomes the pristine cache template; an
+    // Only a fresh (non-`target`) load becomes the cache template; an
     // explicit `target` is instance-owned and must not be mutated through
-    // the cache by a later load.
+    // the cache by a later load. The cache owns its pixels independently, so
+    // clearing it frees the template without touching this scene bitmap.
     if target.is_none() {
-        cache.by_name.insert(resolved, id);
+        cache.by_name.insert(resolved, template);
     }
     Ok(id)
 }
@@ -880,6 +902,59 @@ mod tests {
         let decoded = decode_image("x.bmp", &bytes).unwrap();
         assert_eq!((decoded.width, decoded.height), (w, h));
         assert_eq!(decoded.rgba, rgba);
+    }
+
+    #[test]
+    fn decode_cache_template_survives_layer_destroy_and_reload_hits_cache() {
+        // The cache owns the decoded template independently of the scene
+        // bitmap, so destroying the layer that first loaded an image frees
+        // its bitmap while a re-load still hits the cache; clearing the cache
+        // (`System.clearGraphicCache`/`doCompact`) drops the template without
+        // touching the scene.
+        let dir = TempDir::new("cachetemplate");
+        let (w, h) = (4u32, 3u32);
+        let rgba = pattern(w, h);
+        let png = {
+            use image::ImageEncoder;
+            let mut out = Vec::new();
+            image::codecs::png::PngEncoder::new(&mut out)
+                .write_image(&rgba, w, h, image::ExtendedColorType::Rgba8)
+                .unwrap();
+            out
+        };
+        std::fs::write(dir.path().join("bg.png"), &png).unwrap();
+        let mut storage = Storage::mount(dir.path()).expect("temp dir mounts");
+        let mut scene = scene::Scene::default();
+        let win = scene.add_window("t", (16, 16));
+        let layer = scene.add_layer(win, None);
+        let mut cache = BitmapCache::default();
+
+        let first = load_bitmap_from_storage(&mut scene, &mut cache, &mut storage, "bg", None)
+            .expect("first load");
+        assert_eq!(cache.by_name.len(), 1, "decoded template cached");
+        scene.layer_mut(layer).unwrap().bitmap = Some(first);
+        scene.destroy_layer(layer);
+        assert!(
+            scene.bitmap(first).is_none(),
+            "the layer's bitmap is released"
+        );
+        assert_eq!(cache.by_name.len(), 1, "cache template outlives the layer");
+
+        let second = load_bitmap_from_storage(&mut scene, &mut cache, &mut storage, "bg", None)
+            .expect("second load");
+        assert_ne!(second, first, "cache hit copies into a fresh bitmap");
+        assert_eq!(
+            scene.bitmap(second).expect("copy exists").rgba,
+            rgba,
+            "cache hit yields correct pixels"
+        );
+
+        // `TVPClearGraphicCache`/`doCompact(clAll)` simply drops the map; a
+        // later load decodes fresh and still yields correct pixels.
+        cache.by_name.clear();
+        let third = load_bitmap_from_storage(&mut scene, &mut cache, &mut storage, "bg", None)
+            .expect("post-clear load");
+        assert_eq!(scene.bitmap(third).expect("copy exists").rgba, rgba);
     }
 
     #[test]

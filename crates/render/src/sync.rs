@@ -773,6 +773,19 @@ pub fn sync_scene(
         false
     });
 
+    // Prune GPU textures for bitmaps that no longer exist in the scene. A
+    // destroyed layer releases its MainImage (see `Scene::release_bitmap`),
+    // so the uploaded `Image` would otherwise stay resident in
+    // `Assets<Image>` (multi-MB RGBA) for the rest of the session. Bitmap ids
+    // are monotonic and never reused, so a removed id can be pruned safely.
+    bitmaps.handles.retain(|bitmap_id, handle| {
+        if scene.bitmap(*bitmap_id).is_some() {
+            return true;
+        }
+        images.remove(handle.id());
+        false
+    });
+
     let revision = scene.revision();
     drop(scene);
 
@@ -2656,6 +2669,39 @@ mod tests {
         assert!(
             app.world().get::<SceneSprite>(removed_entity).is_none(),
             "the removed entity was actually despawned"
+        );
+    }
+
+    /// Destroying a layer releases its bitmap, and the renderer drops the
+    /// uploaded GPU `Image` with it, so a scene teardown does not leave the
+    /// old textures resident in `Assets<Image>`.
+    #[test]
+    fn removing_a_layer_frees_its_bitmap_and_gpu_image() {
+        let (shared, l1, bmp) = two_layer_scene();
+        let mut app = app_with_sync(shared.clone());
+        app.update();
+
+        let image_count = |app: &mut App| app.world().resource::<Assets<Image>>().len();
+        let before = image_count(&mut app);
+        assert!(before >= 1, "the bitmap layer uploaded a texture");
+        assert!(shared.0.read().unwrap().bitmap(bmp).is_some());
+
+        shared.0.write().unwrap().remove_layer(l1);
+        app.update();
+
+        assert!(
+            shared.0.read().unwrap().bitmap(bmp).is_none(),
+            "layer-owned bitmap released with the layer"
+        );
+        assert_eq!(
+            image_count(&mut app),
+            before - 1,
+            "the freed bitmap's GPU Image was pruned"
+        );
+        assert_eq!(
+            app.world().resource::<BitmapAssets>().handles.len(),
+            0,
+            "no stale bitmap handle"
         );
     }
 

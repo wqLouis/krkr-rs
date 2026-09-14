@@ -251,6 +251,7 @@ extern "C" fn layer_destroy(_engine: *mut c_void, instance: *mut c_void) {
     // SAFETY: the trampoline passes the payload from layer_create.
     let inst = unsafe { instance_ref::<LayerInst>(instance) };
     if inst.constructed {
+        log::debug!("layer_destroy: L#{}", inst.id);
         let mut scene = context_scene_mut();
         // Destruction, not `Part()`: the reference `Invalidate` severs the
         // children and releases the `Children` array, so the TJS GC cascade
@@ -288,6 +289,9 @@ extern "C" fn layer_destroy(_engine: *mut c_void, instance: *mut c_void) {
             stack.retain(|&id| id != inst.id);
         }
     }
+    // Drop the raw TJS-object registration: the registry does not AddRef, so
+    // keeping it would let input dispatch call a freed object.
+    super::clear_layer_tjs_object(inst.id);
     // SAFETY: instance came from Box::into_raw.
     unsafe { drop(Box::from_raw(instance as *mut LayerInst)) };
 }
@@ -603,10 +607,17 @@ fn allocate_layer_image(scene: &mut Scene, layer_id: u32) {
 /// Reference `tTJSNI_BaseLayer::DeallocateImage` (`LayerIntf.cpp:2349`):
 /// drop the MainImage and the province plane.
 fn deallocate_layer_image(scene: &mut Scene, layer_id: u32) {
-    if let Some(layer) = scene.layer_mut(layer_id)
-        && layer.bitmap.take().is_some()
-    {
-        layer.image_modified = true;
+    let removed = scene.layer_mut(layer_id).and_then(|layer| {
+        let bitmap = layer.bitmap.take();
+        if bitmap.is_some() {
+            layer.image_modified = true;
+        }
+        bitmap
+    });
+    // Drop the layer's reference; the bitmap survives only while another
+    // layer or a script `Bitmap` still holds it.
+    if let Some(bitmap) = removed {
+        scene.release_bitmap(bitmap);
     }
     scene.deallocate_province_image(layer_id);
 }
@@ -7239,7 +7250,7 @@ extern "C" fn layer_load_province_image(
             Some(bitmap.rgba.chunks_exact(4).map(|p| p[0]).collect())
         }
         Some(_) => {
-            scene.bitmaps.retain(|b| b.id != temp_id);
+            scene.release_bitmap(temp_id);
             return error_out(
                 out_error,
                 "Layer.loadProvinceImage: province image size mismatch",
@@ -7247,7 +7258,7 @@ extern "C" fn layer_load_province_image(
         }
         None => None,
     };
-    scene.bitmaps.retain(|b| b.id != temp_id);
+    scene.release_bitmap(temp_id);
     if let Some(province) = province
         && let Some(layer) = scene.layer_mut(inst.id)
     {

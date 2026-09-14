@@ -413,7 +413,13 @@ namespace TJS {
             return InternalIndepend();
         }
 
-        [[nodiscard]] tjs_int GetLen() const { return Ptr->GetLength(); }
+        // krkr-rs: `Ptr == nullptr` is the representation of an empty string,
+        // so there is nothing to dereference. Calling `tTJSVariantString::GetLength`
+        // with `this == nullptr` is UB (clang >= -O1 deletes its null-`this`
+        // guard and crashes); check here instead.
+        [[nodiscard]] tjs_int GetLen() const {
+            return Ptr ? Ptr->GetLength() : 0;
+        }
 
         [[nodiscard]] tjs_int length() const { return GetLen(); }
 

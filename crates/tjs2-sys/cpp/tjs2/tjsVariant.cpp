@@ -866,8 +866,8 @@ namespace TJS {
         tTJSVariantString *s1, *s2;
         s1 = AsString();
         s2 = val2.AsString();
-        const tjs_char *p1 = *s1;
-        const tjs_char *p2 = *s2;
+        const tjs_char *p1 = TJSVariantStringChars(s1);
+        const tjs_char *p2 = TJSVariantStringChars(s2);
         if(!p1)
             p1 = TJS_W("");
         if(!p2)
@@ -894,8 +894,8 @@ namespace TJS {
         tTJSVariantString *s1, *s2;
         s1 = AsString();
         s2 = val2.AsString();
-        const tjs_char *p1 = *s1;
-        const tjs_char *p2 = *s2;
+        const tjs_char *p1 = TJSVariantStringChars(s1);
+        const tjs_char *p2 = TJSVariantStringChars(s2);
         if(!p1)
             p1 = TJS_W("");
         if(!p2)
@@ -934,8 +934,14 @@ namespace TJS {
 
     //---------------------------------------------------------------------------
     void tTJSVariant::increment() {
-        if(vt == tvtString)
-            String->ToNumber(*this);
+        // krkr-rs: null `String` is the empty string; `ToNumber` on it yields 0
+        // (a null-`this` call is UB under clang -O1+).
+        if(vt == tvtString) {
+            if(String)
+                String->ToNumber(*this);
+            else
+                *this = (tjs_int)0;
+        }
 
         if(vt == tvtReal) {
             TJSSetFPUE();
@@ -950,8 +956,13 @@ namespace TJS {
 
     //---------------------------------------------------------------------------
     void tTJSVariant::decrement() {
-        if(vt == tvtString)
-            String->ToNumber(*this);
+        // krkr-rs: null `String` is the empty string; see increment().
+        if(vt == tvtString) {
+            if(String)
+                String->ToNumber(*this);
+            else
+                *this = (tjs_int)0;
+        }
 
         if(vt == tvtReal) {
             TJSSetFPUE();
@@ -1075,7 +1086,12 @@ namespace TJS {
             return; // nothing to do
 
         if(vt == tvtString) {
-            String->ToNumber(*this);
+            // krkr-rs: null `String` is the empty string; `ToNumber` on it
+            // yields 0 (a null-`this` call is UB under clang -O1+).
+            if(String)
+                String->ToNumber(*this);
+            else
+                *this = (tjs_int)0;
             return;
         }
 
@@ -1144,7 +1160,8 @@ namespace TJS {
             tTJSVariantString *s1, *s2;
             s1 = AsString();
             s2 = rhs.AsString();
-            val.String = TJSAllocVariantString(*s1, *s2);
+            val.String = TJSAllocVariantString(
+                TJSVariantStringChars(s1), TJSVariantStringChars(s2));
             if(s1)
                 s1->Release();
             if(s2)

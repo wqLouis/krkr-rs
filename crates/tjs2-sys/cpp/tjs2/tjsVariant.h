@@ -795,7 +795,9 @@ namespace TJS {
             // returns String
             if(vt != tvtString)
                 TJSThrowVariantConvertError(*this, tvtString);
-            return *String;
+            // krkr-rs: a null `String` is the empty string; avoid a
+            // null-`this` conversion (UB under clang -O1+).
+            return String ? String->operator const tjs_char *() : nullptr;
         }
 
         TJS_METHOD_DEF(tjs_uint32 *, GetHint, ()) {
@@ -866,7 +868,10 @@ namespace TJS {
                 case tvtObject:
                     TJSThrowVariantConvertError(*this, tvtInteger);
                 case tvtString:
-                    return String->ToInteger();
+                    // krkr-rs: an empty string is stored as a null `String`;
+                    // `tTJSVariantString::ToInteger`'s null-`this` guard is UB
+                    // under clang -O1+, so return 0 here.
+                    return String ? String->ToInteger() : 0;
                 case tvtInteger:
                     return Integer;
                 case tvtReal:
@@ -886,7 +891,12 @@ namespace TJS {
                 case tvtObject:
                     TJSThrowVariantConvertError(*this, tvtInteger, tvtReal);
                 case tvtString:
-                    String->ToNumber(targ);
+                    // krkr-rs: null `String` is the empty string; `ToNumber` on
+                    // it yields 0 (see above).
+                    if(String)
+                        String->ToNumber(targ);
+                    else
+                        targ = (tjs_int)0;
                     return;
                 case tvtInteger:
                     targ = Integer;
@@ -943,7 +953,8 @@ namespace TJS {
                 case tvtObject:
                     TJSThrowVariantConvertError(*this, tvtReal);
                 case tvtString:
-                    return String->ToReal();
+                    // krkr-rs: null `String` is the empty string; yield 0.
+                    return String ? String->ToReal() : 0;
                 case tvtInteger:
                     return (tTVReal)Integer;
                 case tvtReal:
@@ -1163,7 +1174,12 @@ namespace TJS {
 
             if(vt == tvtString) {
                 tTJSVariant val;
-                String->ToNumber(val);
+                // krkr-rs: null `String` is the empty string; `ToNumber` on it
+                // yields 0 (a null-`this` call is UB under clang -O1+).
+                if(String)
+                    String->ToNumber(val);
+                else
+                    val = (tjs_int)0;
                 return val;
             }
 
@@ -1212,7 +1228,8 @@ namespace TJS {
                 tTJSVariantString *s1, *s2;
                 s1 = AsString();
                 s2 = rhs.AsString();
-                val.String = TJSAllocVariantString(*s1, *s2);
+                val.String = TJSAllocVariantString(
+                    TJSVariantStringChars(s1), TJSVariantStringChars(s2));
                 if(s1)
                     s1->Release();
                 if(s2)

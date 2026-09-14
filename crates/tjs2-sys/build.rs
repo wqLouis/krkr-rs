@@ -103,6 +103,9 @@ fn main() {
         fail("zig not found (needed to build C++ deps and compile tjs2). Install it or set ZIG.");
     };
     println!("cargo:rerun-if-env-changed=ZIG");
+    // `TJS2_OPT` selects the vendored-C++ optimisation level; changing it must
+    // trigger a rebuild of the static library.
+    println!("cargo:rerun-if-env-changed=TJS2_OPT");
 
     // Build C++ deps: fmt/spdlog/boost headers + libonig.a.
     let deps_dir = manifest_dir.join("../../deps");
@@ -218,19 +221,35 @@ fn main() {
         "-Wno-tautological-constant-out-of-range-compare".into(),
     ];
     if profile == "release" {
-        // krkr-rs: upstream tjs2 has latent UB (uninitialized register slots
-        // read by the exception-display dump, null-string handling, ...) that
-        // crashes under clang -O2. Correctness first: compile the vendored
-        // C++ at -O0 in release too (the VM is not the perf bottleneck for a
-        // VN; rendering is). Revisit once the UB is fixed upstream.
-        flags.push("-O0".into());
+        // The vendored C++ is now safe to optimise because the latent UB
+        // sites were fixed; see the optimisation-level comment below.
         flags.push("-DNDEBUG".into());
     } else {
-        flags.push("-O0".into());
         flags.push("-g".into());
         flags.push("-D_DEBUG".into());
         flags.push("-DDEBUG".into());
     }
+
+    // krkr-rs: optimisation level for the vendored C++ VM.
+    //
+    // History: upstream tjs2 reads uninitialised VM register slots in the
+    // exception-display dump and performs member calls on a null
+    // `tTJSVariantString` `this`. Both are UB that clang >= -O1 exploits
+    // (the null-`this` guards are removed, then a null string pointer is
+    // dereferenced). Both classes are now fixed in the vendored sources
+    // (`tjsInterCodeExec.cpp` zeroes the register area before the dump; the
+    // null-string call sites in `tjsString.h/.cpp`, `tjsVariant.h/.cpp` and
+    // `tjsInterCodeExec.cpp` check for the canonical null empty-string pointer
+    // first), so the whole VM runs at -O2.
+    //
+    // This matters because save loading parses/evaluates a multi-megabyte TJS
+    // literal: measured on the real game, `-O0` spends ~670 ms in parse+eval
+    // while `-O2` spends ~136 ms. Every translation unit (upstream
+    // sources, generated parsers, ABI/stream shims) uses this same level — no
+    // per-file exception is needed. If a future regression is traced to one
+    // TU, special-case its file name here. `TJS2_OPT` overrides the level for
+    // benchmarking.
+    let opt = env::var("TJS2_OPT").unwrap_or_else(|_| "-O2".to_string());
 
     // Collect all sources: upstream tjs2 + generated parsers + our shim.
     let mut sources: Vec<PathBuf> = TJS2_SOURCES.iter().map(|s| tjs2_dir.join(s)).collect();
@@ -248,6 +267,7 @@ fn main() {
         .map(|src| {
             let cc = cc.clone();
             let flags = flags.clone();
+            let opt = opt.clone();
             let obj_dir = obj_dir.clone();
             let failed = failed.clone();
             let lock = lock.clone();
@@ -261,6 +281,7 @@ fn main() {
                 let mut cmd = Command::new(&cc[0]);
                 cmd.args(&cc[1..])
                     .args(&flags)
+                    .arg(&opt)
                     .arg("-c")
                     .arg(&src)
                     .arg("-o")

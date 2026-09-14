@@ -55,15 +55,17 @@ namespace TJS {
 
             if(!TJS_strcmp(name, TJS_W("length"))) {
                 // get string length
+                // krkr-rs: `AsStringNoAddRef` yields null for the empty
+                // string; use the null-safe length helper (UB otherwise).
                 const tTJSVariantString *s = str->AsStringNoAddRef();
-                *result = tTVInteger(s->GetLength());
+                *result = tTVInteger(TJSVariantStringLength(s));
                 return;
             }
             if(name[0] >= TJS_W('0') && name[0] <= TJS_W('9')) {
                 const tTJSVariantString *valstr = str->AsStringNoAddRef();
                 const tjs_char *s = str->GetString();
                 tjs_int n = TJS_atoi(name);
-                tjs_int len = valstr->GetLength();
+                tjs_int len = TJSVariantStringLength(valstr);
                 if(n == len) {
                     *result = tTJSVariant(TJS_W(""));
                     return;
@@ -84,7 +86,7 @@ namespace TJS {
             const tTJSVariantString *valstr = str->AsStringNoAddRef();
             const tjs_char *s = str->GetString();
             tjs_int n = (tjs_int)member.AsInteger();
-            tjs_int len = valstr->GetLength();
+            tjs_int len = TJSVariantStringLength(valstr);
             if(n == len) {
                 *result = tTJSVariant(TJS_W(""));
                 return;
@@ -1522,10 +1524,11 @@ namespace TJS {
             try {
                 // TODO: verify here needs hint holding
                 hr = clo.PropGet(
-                    flags, *str, nullptr, TJS_GET_VM_REG_ADDR(ra, code[1]),
+                    flags, TJSVariantStringChars(str), nullptr,
+                    TJS_GET_VM_REG_ADDR(ra, code[1]),
                     clo.ObjThis ? clo.ObjThis : ra[-1].AsObjectNoAddRef());
                 if(TJS_FAILED(hr))
-                    TJSThrowFrom_tjs_error(hr, *str);
+                    TJSThrowFrom_tjs_error(hr, TJSVariantStringChars(str));
             } catch(...) {
                 if(str)
                     str->Release();
@@ -1581,10 +1584,11 @@ namespace TJS {
                     clo.ObjThis ? clo.ObjThis : ra[-1].AsObjectNoAddRef());
                 if(hr == TJS_E_NOTIMPL)
                     hr = clo.PropSet(
-                        flags, *str, nullptr, TJS_GET_VM_REG_ADDR(ra, code[3]),
+                        flags, TJSVariantStringChars(str), nullptr,
+                        TJS_GET_VM_REG_ADDR(ra, code[3]),
                         clo.ObjThis ? clo.ObjThis : ra[-1].AsObjectNoAddRef());
                 if(TJS_FAILED(hr))
-                    TJSThrowFrom_tjs_error(hr, *str);
+                    TJSThrowFrom_tjs_error(hr, TJSVariantStringChars(str));
             } catch(...) {
                 if(str)
                     str->Release();
@@ -1656,12 +1660,12 @@ namespace TJS {
             }
             try {
                 tjs_error hr = clo.Operation(
-                    ope, *str, nullptr,
+                    ope, TJSVariantStringChars(str), nullptr,
                     code[1] ? TJS_GET_VM_REG_ADDR(ra, code[1]) : nullptr,
                     TJS_GET_VM_REG_ADDR(ra, code[4]),
                     clo.ObjThis ? clo.ObjThis : ra[-1].AsObjectNoAddRef());
                 if(TJS_FAILED(hr))
-                    TJSThrowFrom_tjs_error(hr, *str);
+                    TJSThrowFrom_tjs_error(hr, TJSVariantStringChars(str));
             } catch(...) {
                 if(str)
                     str->Release();
@@ -1755,12 +1759,12 @@ namespace TJS {
             tjs_error hr;
             try {
                 hr = clo.Operation(
-                    ope, *str, nullptr,
+                    ope, TJSVariantStringChars(str), nullptr,
                     code[1] ? TJS_GET_VM_REG_ADDR(ra, code[1]) : nullptr,
                     nullptr,
                     clo.ObjThis ? clo.ObjThis : ra[-1].AsObjectNoAddRef());
                 if(TJS_FAILED(hr))
-                    TJSThrowFrom_tjs_error(hr, *str);
+                    TJSThrowFrom_tjs_error(hr, TJSVariantStringChars(str));
             } catch(...) {
                 if(str)
                     str->Release();
@@ -1850,7 +1854,7 @@ namespace TJS {
 
         try {
             tjs_error hr = clo.DeleteMember(
-                0, *str, nullptr,
+                0, TJSVariantStringChars(str), nullptr,
                 clo.ObjThis ? clo.ObjThis : ra[-1].AsObjectNoAddRef());
             if(code[1]) {
                 if(TJS_FAILED(hr))
@@ -1950,7 +1954,8 @@ namespace TJS {
             try {
                 // TODO: verify here needs hint holding
                 hr = clo.PropGet(
-                    flags, *str, nullptr, TJS_GET_VM_REG_ADDR(ra, code[1]),
+                    flags, TJSVariantStringChars(str), nullptr,
+                    TJS_GET_VM_REG_ADDR(ra, code[1]),
                     clo.ObjThis ? clo.ObjThis : ra[-1].AsObjectNoAddRef());
                 if(hr == TJS_S_OK) {
                     TypeOf(TJS_GET_VM_REG(ra, code[1]));
@@ -2672,7 +2677,7 @@ namespace TJS {
         // puts val's character code on val
         tTJSVariantString *str = val.AsString();
         if(str) {
-            const tjs_char *ch = (const tjs_char *)*str;
+            const tjs_char *ch = TJSVariantStringChars(str);
             val = tTVInteger(ch[0]);
             str->Release();
             return;
@@ -2696,7 +2701,8 @@ namespace TJS {
         if(str) {
             tjs_error hr;
             try {
-                hr = TJSDefaultIsInstanceOf(0, targ, (const tjs_char *)*str,
+                hr = TJSDefaultIsInstanceOf(0, targ,
+                                            TJSVariantStringChars(str),
                                             nullptr);
             } catch(...) {
                 str->Release();

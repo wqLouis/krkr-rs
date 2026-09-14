@@ -216,6 +216,20 @@ namespace TJS {
             }
         }
     };
+
+    // krkr-rs: the canonical representation of an empty TJS string is a null
+    // `tTJSVariantString *`. Calling a member function on that null pointer is
+    // UB, and clang >= -O1 deletes the null-`this` guards inside the methods
+    // (crashing the VM). Convert through these helpers instead: they check for
+    // null *before* the member call. Observable behaviour is unchanged (a null
+    // string still reads as an empty/null character pointer and length 0).
+    inline const tjs_char *TJSVariantStringChars(const tTJSVariantString *s) {
+        return s ? s->operator const tjs_char *() : nullptr;
+    }
+    inline tjs_int TJSVariantStringLength(const tTJSVariantString *s) {
+        return s ? s->GetLength() : 0;
+    }
+
     TJS_EXP_FUNC_DEF(tTJSVariantString *, TJSAllocVariantString,
                      (const tjs_char *ref1, const tjs_char *ref2));
 
