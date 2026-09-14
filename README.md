@@ -23,7 +23,7 @@ scripts, `.tjs` scripts, `.xp3` archives). The goal: run a real game end to end.
 | Graceful quit | ✅ window close + `System.exit`/`terminate` → `AppExit` |
 | Audio (BGM/SE/voice) | ✅ rodio output; real Ogg Opus/Vorbis decode (symphonia 0.6) |
 | GPU blend modes | ✅ `layer.type` → real blend states (over / add / reverse-subtract / replace) |
-| ADV scenario loop | 🔶 KAGParser natives in; needs text + hit-test verification |
+| ADV scenario loop | 🔶 runs to the first `hitret` (dialogue text rasterizes); `@update`/`@blackout` interpolation still approximate |
 
 Details and the full investigation log are in [TODO.md](TODO.md).
 
@@ -65,10 +65,14 @@ crates/
   xp3, tvp-archive      — XP3 archive parsing
   tjs2-sys              — vendored C++ TJS2 VM + FFI (zig c++ build)
   engine                — storage mount + game loader
+  tvp-config            — ConfigManager ports (global/individual/locale)
+  tvp-util              — encoding / md5 / random / path utilities
+  tvp-streams           — binary + text stream ports (tTJSBinaryStream)
   tvp-natives           — System / Debug / Plugins / MenuItem / Trans natives
   tvp-storages          — Storages natives (getFileList, stat, copy, delete)
   tvp-scripts           — Scripts natives
   tvp-kagparser         — KAGParser natives (scenario .ks parsing)
+  kag                   — pure-Rust KAG `.ks` scenario parser (no VM)
   tvp-visual            — Window / Layer / Bitmap / Font / Timer natives + Scene
   tvp-sound             — WaveSoundBuffer / SoundChannel natives + mixer + rodio output
   tvp-text              — text layout / rasterization for Layer.drawText

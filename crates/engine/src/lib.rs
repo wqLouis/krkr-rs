@@ -2,8 +2,8 @@
 //!
 //! Goal of this milestone: load a KiriKiri game — mount its storage (game
 //! directory + `.xp3` archives), discover `startup.tjs`, bootstrap the C++
-//! TJS2 VM and run the script. No rendering, no windowing; the UI layer
-//! comes later on top of Bevy.
+//! TJS2 VM and run the script. This crate does no rendering or windowing;
+//! the Bevy app lives in `crates/render`.
 //!
 //! Storage naming follows the reference engine (`TVPSearchPlacedPath`):
 //! names are normalized (lowercase, `/` separators), disk files win over

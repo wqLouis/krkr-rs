@@ -170,11 +170,9 @@ emscripten/wasm path** in that build script.
   winit API usage in our crates (grep for `winit`/`raw_window_handle` outside
   Cargo.lock returns nothing).
 
-**app (`src/main.rs`, `src/bin/attention_harness.rs`)**
+**app (`src/main.rs`)**
 - `std::env::args` (`app/src/main.rs:13`), `std::fs::create_dir_all(.../savedata)`
-  (`:113`), `std::env::temp_dir()` (`:116`); the harness spawns
-  `std::thread` (`attention_harness.rs:85-87`) and uses `process::exit`
-  (`:37,70`).
+  (`:113`), `std::env::temp_dir()` (`:116`), and `process::exit` (`:37`).
 
 **tvp-natives**
 - `System.shellExecute` uses `std::process::Command` (Linux `xdg-open`,
@@ -334,7 +332,8 @@ Current entrypoints:
 - Native binary: `crates/render/src/main.rs` (`fn main`, windowed `App` via
   `DefaultPlugins` at `:129-176`, or `MinimalPlugins` headless at
   `:178-198`). CLI-only headless tool: `crates/app/src/main.rs`
-  (`krkr-cli`) and the diagnostic `attention-harness`.
+  (`krkr-cli`); the graphical runner's `krkr-rs run <game> --headless` is the
+  diagnostic path.
 - No `#[wasm_bindgen(start)]` lib entry and no `android_main`/GameActivity
   entry exist (grep, §4).
 - `krkr_render` is already a lib (`render/src/lib.rs`) that exposes
@@ -589,8 +588,8 @@ Effort L on both.
 ### B4. Threading
 
 - No fundamental blocker: the locks are already no-ops in a single-threaded
-  environment, and the only app-spawned threads are in diagnostics
-  (`attention_harness.rs:85`) and the C++ build script (host).
+  environment, and the current entrypoints spawn no application threads (only
+  the C++ build script runs host-side).
 - **wasm**: keep Bevy single-threaded (or verify its fallback); only enable
   `wasm-threads`/SharedArrayBuffer if the audioworklet path is needed.
 - **Android**: already multi-threaded; nothing structural.

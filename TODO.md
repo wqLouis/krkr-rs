@@ -8,7 +8,7 @@ TJS2 VM → `system/Status.tjs` + `Initialize.tjs` + `k2compat/*` + all
 Bevy window renders the logo/title layers (the `AffineLayer`/`Sprite`
 `onPaint`→`assignImages` composite now promotes the inner `_image` bitmap to
 the visible parent) → **the full logo → ATTENTION → title transition
-completes** (voice-driven, verified headlessly by `attention-harness`) → the
+completes** (voice-driven, verified headlessly) → the
 title scene constructs its `SelectItem`s → input bridge dispatches mouse/key
 to the game's `onMouseDown`/`onKeyDown` with **engine-side layer hit-testing**
 (sprite sheets + `0×0` affine containers) and an aspect-correct cursor→game
@@ -72,9 +72,9 @@ so a script subclass can call `super.finalize()` (e.g. the game's
 every instance class unless it provides its own.
 
 ### E. `Layer.hitType` / `Layer.cursor` (FIXED)
-`SelectItemBase` sets `hitType = htMask` and `cursor = crDefault`; both now
-exist as Layer properties (values stored in `LayerState`, hit-testing
-semantics still pending).
+`SelectItemBase` sets `hitType = htMask` and `cursor = crDefault`; both exist
+as Layer properties (values stored in `LayerState`; input hit-testing is
+implemented — see the current-state summary).
 
 ### F. Object-valued `Layer.parent` + `Layer` member surface (FIXED)
 The title scene builds a layer hierarchy with `.parent = <Layer object>`, so
@@ -93,8 +93,8 @@ name is `krkr_render`, so the embedded asset was never found (Bevy logged
 `Path not found`). Corrected to `embedded://krkr_render/…`.
 
 After F/G the title scene constructs end-to-end with **zero TJS
-exceptions** and stays stable (`attention-harness` climbs through the logo,
-runs the ATTENTION voices, changes to scene 2, and idles cleanly).
+exceptions** and stays stable (the headless run climbs through the logo, runs
+the ATTENTION voices, changes to scene 2, and idles cleanly).
 
 ---
 
@@ -144,15 +144,16 @@ the AttentionVoice. Now the ctor retains argv[0], and `sound_poll` delivers
 BOTH `action(%[type,status])` (dict, via a new `TjsValue::Retained` ABI path)
 and `onStatusChanged(status)`.
 
-### 5. Voice files are Ogg Opus; no Opus decoder in the default registry (WORKED AROUND)
+### 5. Voice files are Ogg Opus; no Opus decoder in the default registry (FIXED)
 `voice/*.ogg` are **Ogg Opus** (`OpusHead`), while `bgm/*.ogg` are Vorbis.
 Upgraded to **symphonia 0.6.1** (decode API migrated: `probe()`/`probe`,
 `default_track(TrackType::Audio)`, `make_audio_decoder`, `copy_to_slice_interleaved`)
 and **rodio 0.22** (`DeviceSinkBuilder::open_default_sink` → `MixerDeviceSink`).
 The default codec registry still has no Opus decoder (it ships separately as
-`symphonia-adapter-libopus`, which needs the C libopus). `decode_audio` detects
-Opus and returns a ~60 ms silent buffer so the voices still drive the script
-sequencing via `onStatusChanged("stop")`. Real Opus decoding is a follow-up —
+`symphonia-adapter-libopus`, which needs the C libopus). `decode_audio`
+initially detected Opus and returned a ~60 ms silent buffer so the voices still
+drove the script sequencing via `onStatusChanged("stop")`. Real Opus decoding is
+now implemented through `symphonia-adapter-libopus` in a custom codec registry —
 see Stage 4.
 
 ### 6. Cross-thread deadlock in the sound natives (FIXED — run_vm lock)
@@ -187,15 +188,16 @@ Bevy moves the system across threads.
 
 1. **Logo → Title transition** — ✅ **CLOSED** (Sep 13). `OnceCall` chain
    runs, the ATTENTION voice sequence advances one entry per real Opus voice,
-   and `step06` calls `game.changeScene(SCENE_TITLE)`. Verified headlessly by
-   `attention-harness` (scene 0 → 2, logo closed) after fixing the Opus
+   and `step06` calls `game.changeScene(SCENE_TITLE)`. Verified headlessly
+   (scene 0 → 2, logo closed) after fixing the Opus
    decode, the reference sound ownership, the timer self-deadlock, the
    native `finalize`, and `Layer.hitType`/`cursor`.
-2. **Title screen input** — title scene constructs its `SelectItem`s (after
-   the `hitType`/`cursor` fix). Next: wire hit-testing so click→skip-logo and
-   NEW GAME / CONTINUE activate the items.
-3. **`ScController` scenario loop** — `loadScenario → getNextTag → onTag`;
-   needs `Layer.drawText` + fonts (tvp-text) + hit-testing for click-through.
+2. **Title screen input** — ✅ **CLOSED**. The title scene constructs its
+   `SelectItem`s; the render input bridge dispatches mouse/key events with
+   engine-side layer hit-testing, and NEW GAME starts the debut scenario.
+3. **`ScController` scenario loop** — `loadScenario → getNextTag → onTag`
+   runs through the debut scenario to the first `hitret`; `Layer.drawText`
+   rasterizes dialogue. `@update`/`@blackout` interpolation is still a stub.
 4. **BGM/SE/voice** — rodio output wired; **real Opus voice decode done**
    (`symphonia-adapter-libopus`); Vorbis BGM decodes for real.
 5. **Save/load** — saveStruct eval OK; `savedata/` dir created at startup;

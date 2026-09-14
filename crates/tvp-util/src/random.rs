@@ -211,11 +211,6 @@ impl Random {
         (self.next_u64() >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
     }
 
-    /// True with probability 0.5.
-    pub fn next_bool(&mut self) -> bool {
-        self.next_u32() & 1 == 1
-    }
-
     /// Drains bytes from the per-instance cache, refilling it from
     /// `get_random_bits_128` when exhausted.
     fn read_cache(&mut self, out: &mut [u8]) {

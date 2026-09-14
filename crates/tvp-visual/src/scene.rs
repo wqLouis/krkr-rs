@@ -3,7 +3,7 @@
 //! This is the **shared contract** between the natives (`crates/tvp-visual`)
 //! and the Bevy renderer (`crates/render`): natives mutate the scene under a
 //! write lock, render systems read it under a read lock. Everything is
-//! id-based; invalid ids are no-ops. See WAVE3.md.
+//! id-based; invalid ids are no-ops.
 //!
 //! No Bevy types here — this crate stays engine-agnostic.
 
@@ -28,11 +28,11 @@ pub struct WindowState {
     pub layers: Vec<u32>,
 }
 
-/// TVP drawable types used by `Layer.type`.
-///
-/// The renderer currently uses Bevy's built-in sprite pipeline. The values are
-/// kept as the native integer contract so unsupported future TVP modes can
-/// still round-trip without changing this shared model.
+/// Core TVP drawable/blend types used by `Layer.type` (the native
+/// `tTVPLayerType` values). The full 29-mode mapping lives in
+/// `render::blend`; these four are the ones the logical scene model and its
+/// tests reference directly. `blend_type` stores the raw integer contract so
+/// every mode round-trips through the shared model without changes here.
 pub const LT_OPAQUE: i64 = 1;
 pub const LT_ALPHA: i64 = 2;
 pub const LT_ADDITIVE: i64 = 3;
@@ -80,7 +80,8 @@ pub struct LayerState {
     pub hit_threshold: i32,
     /// Hit-test mode (reference `tTVPHitType`): `htMask=0` (per-pixel
     /// threshold) or `htProvince=1` (non-transparent province). Stored so
-    /// `SelectItemBase` can set it; input hit-testing reads it later.
+    /// `SelectItemBase` can set it; the render input bridge and
+    /// [`Scene::layer_at`] read it during hit-testing.
     pub hit_type: i32,
     /// Mouse-cursor id (reference `tTVPCursorType`, e.g. `crDefault=0`,
     /// `crHandPoint=-21`). Stored; the desktop cursor is not yet driven.
@@ -172,7 +173,7 @@ impl BitmapState {
     }
 }
 
-/// One font face (text rendering arrives in milestone 3B).
+/// One font face used by `Layer.drawText` (rasterized by `tvp-text`).
 #[derive(Debug, Clone)]
 pub struct FontState {
     pub id: u32,
@@ -195,13 +196,6 @@ pub struct Rect {
     pub y: i32,
     pub w: u32,
     pub h: u32,
-}
-
-/// Events natives queue for the app's update loop.
-#[derive(Debug, Clone, Copy)]
-pub enum VmEvent {
-    /// The timer with this id fired (its TJS callback must run).
-    TimerFire { timer_id: u32 },
 }
 
 /// The whole logical scene.
@@ -1032,19 +1026,6 @@ impl Scene {
             return Some(font);
         }
         self.fonts.iter().find(|f| f.id == id)
-    }
-
-    pub fn font_mut(&mut self, id: u32) -> Option<&mut FontState> {
-        self.touch();
-        let index = self
-            .font_index
-            .get(&id)
-            .copied()
-            .filter(|&index| self.fonts.get(index).is_some_and(|f| f.id == id));
-        match index {
-            Some(index) => self.fonts.get_mut(index),
-            None => self.fonts.iter_mut().find(|f| f.id == id),
-        }
     }
 
     /// All layers of a window flattened back -> front.

@@ -1,7 +1,7 @@
 //! TVP visual native classes: Window, Layer, Bitmap, Font, Timer.
 //!
-//! Instance natives backed by the logical [`crate::scene::Scene`] (see
-//! WAVE3.md). [`register_visual`] wires the scene + storage into the
+//! Instance natives backed by the logical [`crate::scene::Scene`].
+//! [`register_visual`] wires the scene + storage into the
 //! crate-global context and registers every class; the app's update loop
 //! calls [`timer_poll`] to fire due timers.
 
@@ -129,9 +129,6 @@ pub(crate) fn context_scene_mut() -> std::sync::RwLockWriteGuard<'static, Scene>
     context_scene()
 }
 
-/// Lock the shared scene for READING. Read-only natives (property getters,
-/// query methods) must use this: taking the write lock in a getter
-/// deadlocks when a caller already holds a read lock.
 /// Register a layer's TJS object (objthis) for `primaryLayer`.
 pub(crate) fn set_layer_tjs_object(id: u32, objthis: *mut c_void) {
     LAYER_TJS_OBJECTS
@@ -179,6 +176,9 @@ pub fn window_tjs_object(id: u32) -> *mut c_void {
         .unwrap_or(std::ptr::null_mut())
 }
 
+/// Lock the shared scene for READING. Read-only natives (property getters,
+/// query methods) must use this: taking the write lock in a getter
+/// deadlocks when a caller already holds a read lock.
 pub(crate) fn context_scene_read() -> std::sync::RwLockReadGuard<'static, Scene> {
     let guard = SCENE.lock().unwrap_or_else(|p| p.into_inner());
     let arc = guard
@@ -326,8 +326,9 @@ pub(crate) mod tests {
         /// Holds the Arc registered into the crate-global storage slot so
         /// the mounted dir stays alive for the test's lifetime; reads go
         /// through `write_fixture`'s disk writes + the natives' lookups.
-        #[allow(dead_code)]
-        pub storage: Arc<Mutex<engine::Storage>>,
+        /// Never read directly (hence the leading underscore); it only keeps
+        /// the registered Arc alive.
+        _storage: Arc<Mutex<engine::Storage>>,
         pub _dir: TempDir,
         pub _vm_lock: std::sync::MutexGuard<'static, ()>,
     }
@@ -359,7 +360,7 @@ pub(crate) mod tests {
             TestEnv {
                 engine,
                 scene,
-                storage,
+                _storage: storage,
                 _dir: dir,
                 _vm_lock,
             }

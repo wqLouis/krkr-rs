@@ -4,6 +4,13 @@ Target: make the KiriKiri2 `GdiPlus` plugin (Windows GDI+ vector drawing,
 exposed to scripts as `GdiPlus.Appearance` + `Layer.draw*` extensions) actually
 rasterize in the Rust port. Read-only investigation; DEV builds only.
 
+> **Status (later):** this spec has been implemented. `GdiPlus.Appearance` lives
+> in `crates/tvp-visual/src/natives/gdiplus.rs`, the `Layer.draw*` handlers
+> rasterize through `crates/tvp-visual/src/natives/raster.rs`, and the old
+> `crates/tvp-natives/src/gdiplus.rs` no-op stub has been removed. The remaining
+> approximations (hatch fill, anti-aliasing) are tracked in `TODO.md`. References
+> below to the draws being unimplemented / in `noop_stubs` are historical.
+
 Repo: `/mnt/DATA/Document/code/krkr-rs`
 Game scripts: `/tmp/gamescripts/system/*.tjs` (extracted from
 `/mnt/DATA/Games/Others/test/data.xp3`).
@@ -28,8 +35,9 @@ the script API.
   stroking with each pen. See
   `reference/.../windows/LayerExDraw.cpp:767` (`addBrush`), `:778`
   (`addPen`), `:422` (`clear`), `:1150` (`drawPath`).
-* The layer draws are currently in the `noop_stubs` list in
-  `crates/tvp-visual/src/natives/layer.rs:1767` and are silently ignored.
+* (Historical) At the time of writing the layer draws were in the
+  `noop_stubs` list and silently ignored; they are now real handlers (see the
+  status note above).
 * **Critical implementation constraint** (empirically verified, see §0):
   the tjs2 ABI does not carry object handles for object arguments. The current
   `retain_value_detached(Object)` trick resolves only the *last* object
@@ -536,8 +544,8 @@ Ordered by user-visible value per unit of risk.
 
 ## Appendix B — existing code anchors
 
-* `crates/tvp-natives/src/gdiplus.rs` — current no-op stub (constants already
-  correct).
+* (Historical) `crates/tvp-natives/src/gdiplus.rs` — the no-op stub this spec
+  replaced; it has been removed (see the status note above).
 * `crates/tvp-visual/src/natives/layer.rs:109` `argb_to_rgba`.
 * `crates/tvp-visual/src/natives/layer.rs:1358` `layer_draw_text` (bitmap
   allocation pattern to extract).

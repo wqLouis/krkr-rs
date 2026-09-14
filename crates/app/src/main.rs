@@ -1,8 +1,14 @@
-//! krkr-rs CLI — wires the TVP native classes into the engine and loads games.
+//! `krkr-cli` — headless KiriKiri2/TVP CLI (no window, no GPU).
 //!
-//!   krkr-rs load <game-dir>          register natives + run startup.tjs
-//!   krkr-rs run <game-dir> <script>  register natives + run one script
-//!   krkr-rs list <game-dir>          list mounted archives and their entries
+//!   krkr-cli load <game-dir>            register natives + run startup.tjs
+//!   krkr-cli run <game-dir> <script>    register natives + run one script
+//!   krkr-cli list <game-dir>            list mounted archives and their entries
+//!   krkr-cli extract <game-dir> <name>  write a storage entry (disk or archive) to stdout
+//!
+//! This is the headless counterpart to the graphical `krkr-rs` runner
+//! (`crates/render`): it wires up the same native class surface but never
+//! creates a Bevy app, so it is useful for CI, debugging, and inspecting or
+//! extracting game files (mount archives + read entries).
 
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex, RwLock};
@@ -24,6 +30,7 @@ fn main() -> ExitCode {
         [cmd, game] if cmd.as_str() == "load" => run_load(game),
         [cmd, game, script] if cmd.as_str() == "run" => run_script(game, script),
         [cmd, game] if cmd.as_str() == "list" => run_list(game),
+        [cmd, game, name] if cmd.as_str() == "extract" => run_extract(game, name),
         _ => {
             print_usage();
             return ExitCode::from(2);
@@ -41,12 +48,13 @@ fn main() -> ExitCode {
 
 fn print_usage() {
     eprintln!(
-        "krkr-rs — KiriKiri2 rewrite (load module)\n\
+        "krkr-cli — headless KiriKiri2/TVP CLI (the graphical runner is `krkr-rs`)\n\
          \n\
          usage:\n\
-         \x20 krkr-rs load <game-dir>          register natives + run startup.tjs\n\
-         \x20 krkr-rs run <game-dir> <script>  register natives + run one script\n\
-         \x20 krkr-rs list <game-dir>          list archives and entries\n\
+         \x20 krkr-cli load <game-dir>            register natives + run startup.tjs\n\
+         \x20 krkr-cli run <game-dir> <script>    register natives + run one script\n\
+         \x20 krkr-cli list <game-dir>            list archives and entries\n\
+         \x20 krkr-cli extract <game-dir> <name>  write a storage entry to stdout\n\
          \n\
          options:\n\
          \x20 -v, --verbose  debug logging"
@@ -101,6 +109,21 @@ fn run_list(game_dir: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Write a storage entry (a disk file or an XP3 archive member) to stdout.
+///
+/// Names are resolved like the engine: the raw name first, then the
+/// normalized (lowercased, `/`-separated) form, so both `System/AffineLayer.tjs`
+/// and `system/affinelayer.tjs` work. This replaces the old Python extraction
+/// helper for most inspection jobs.
+fn run_extract(game_dir: &str, name: &str) -> Result<(), String> {
+    let mut storage = Storage::mount(game_dir).map_err(|e| e.to_string())?;
+    let bytes = storage.read(name).map_err(|e| e.to_string())?;
+    use std::io::Write;
+    std::io::stdout()
+        .write_all(&bytes)
+        .map_err(|e| e.to_string())
 }
 
 /// Register every TVP native class and set the global contexts they read.

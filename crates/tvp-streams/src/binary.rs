@@ -29,26 +29,6 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 
 use crate::reader;
 
-/// The C++ access flags (`TJS_BS_*` in `tjs2/tjs.h`), kept as
-/// documentation of the mode letters used by `TVPCreateStream`.
-#[allow(dead_code)]
-mod access_flags {
-    /// Open for reading only.
-    pub const READ: u32 = 0;
-    /// Open for writing only (truncates).
-    pub const WRITE: u32 = 1;
-    /// Open for appending.
-    pub const APPEND: u32 = 2;
-    /// Open for reading and writing.
-    pub const UPDATE: u32 = 3;
-    /// Delete the underlying storage on close.
-    pub const DELETE_ON_CLOSE: u32 = 0x10;
-    /// Mask of the low 4 access-mode bits.
-    pub const ACCESS_MASK: u32 = 0x0f;
-    /// Mask of the high option bits.
-    pub const OPTION_MASK: u32 = 0xf0;
-}
-
 /// Byte-oriented read/write/seek stream, the Rust counterpart of the
 /// C++ `tTJSBinaryStream`.
 ///
@@ -352,11 +332,6 @@ impl MemoryStream {
     /// The internal buffer as a slice (C++ `GetInternalBuffer`).
     pub fn as_slice(&self) -> &[u8] {
         &self.data
-    }
-
-    /// The internal buffer as a mutable slice (C++ `GetInternalBuffer`).
-    pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        &mut self.data
     }
 
     /// Take the internal buffer, discarding the stream.

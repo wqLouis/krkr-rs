@@ -10,8 +10,10 @@
 //! ## Reading
 //!
 //! * BOM detection on open (order as in `checkTextEncoding`):
-//!   `EF BB BF` → UTF-8, `FF FE` → UTF-16LE, `FE FF` → UTF-16BE;
-//!   no BOM → UTF-8.
+//!   `FF FE` → UTF-16LE, `FE FF` → UTF-16BE, `EF BB BF` → UTF-8 (the
+//!   UTF-32LE BOM starts with `FF FE`, so it reports as UTF-16LE exactly
+//!   like the reference); no BOM → content sniff (valid UTF-8, else valid
+//!   CP932, else UTF-8).
 //! * The whole remaining content of the underlying stream is decoded up
 //!   front (the C++ constructor slurps the entire storage too).
 //! * UTF-8 input must be valid (a decode error is reported); UTF-16

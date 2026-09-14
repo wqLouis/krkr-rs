@@ -9,13 +9,6 @@ license.workspace = true
 name = "krkr-cli"
 path = "src/main.rs"
 
-# Diagnostic harness (TODO Stage 3.1): drives the game's timer/sound poll
-# loop headlessly (no Bevy needed) and probes the VM state every second,
-# to debug the logo→title ATTENTION transition.
-[[bin]]
-name = "attention-harness"
-path = "src/bin/attention_harness.rs"
-
 [dependencies]
 engine = { path = "../engine" }
 tjs2-sys = { workspace = true }
