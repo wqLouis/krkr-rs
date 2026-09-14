@@ -83,6 +83,28 @@ pub fn run_startup(
 
     match startup_location {
         Some(_) => {
+            // Execute the optional root `patch.tjs` *before* `startup.tjs`
+            // (reference `TVPExecuteStartupScript`, `ScriptMgnIntf.cpp:903`: it
+            // runs `TVPGetAppPath() + "patch.tjs"` when it exists). Games use
+            // it for `@set(...)` preprocessor flags — e.g. the KR game's
+            // `@set(kirikiriz=1)`, which must be set before the engine
+            // compiles the game's later system scripts (`@if(!kirikiriz) ...`).
+            // `@set` persists per-engine via `tTJS::SetPPValue`.
+            let has_patch = storage
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .game_dir()
+                .join("patch.tjs")
+                .is_file();
+            if has_patch {
+                log::info!("found patch.tjs, executing...");
+                match execute_storage_script(engine, storage, "patch.tjs") {
+                    Ok(_) => log::info!("patch.tjs executed successfully"),
+                    // The reference records a patch error but still runs
+                    // `startup.tjs`; do the same.
+                    Err(e) => log::warn!("patch.tjs failed: {e}"),
+                }
+            }
             log::info!("found {STARTUP_SCRIPT}, executing...");
             match execute_storage_script(engine, storage, STARTUP_SCRIPT) {
                 Ok(value) => {
@@ -113,7 +135,8 @@ pub fn execute_storage_script(
         let mut guard = storage.lock().unwrap_or_else(|p| p.into_inner());
         guard.read(name).map_err(|e| e.to_string())?
     };
-    let text = String::from_utf8_lossy(&source).into_owned();
+    let text = tvp_streams::text::decode_bytes(&source)
+        .map_err(|e| format!("{name}: {e}"))?;
     engine.exec_script(&text, name).map_err(|e| e.to_string())
 }
 

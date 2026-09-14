@@ -131,6 +131,16 @@ pub fn detect_bom(bytes: &[u8]) -> Option<(Encoding, usize)> {
     }
 }
 
+/// Decode a whole byte buffer into a `String`, detecting the encoding the way
+/// the reference text stream does (BOM first, then UTF-8/CP932 sniffing).
+///
+/// Scripts are stored in mixed encodings — e.g. `patch.tjs` is UTF-16LE while
+/// `startup.tjs` is often BOM-less CP932 — so the loader must not assume UTF-8.
+pub fn decode_bytes(bytes: &[u8]) -> Result<String> {
+    let (encoding, bom) = detect_encoding(bytes);
+    decode(&bytes[bom..], encoding)
+}
+
 /// Sniff a BOM-less byte sequence the way the reference's `uchardet` step
 /// does for the common cases: valid UTF-8 wins, then valid CP932 (reported as
 /// `cp932`). Anything else is treated as UTF-8 so the strict decoder reports a

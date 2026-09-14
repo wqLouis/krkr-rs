@@ -10,5 +10,6 @@ xp3 = { workspace = true }
 tjs2-sys = { workspace = true }
 kag = { path = "../kag" }
 tvp-util = { path = "../tvp-util" }
+tvp-streams = { path = "../tvp-streams" }
 log = "0.4"
 thiserror = "2"
