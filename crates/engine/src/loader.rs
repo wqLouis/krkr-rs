@@ -135,8 +135,7 @@ pub fn execute_storage_script(
         let mut guard = storage.lock().unwrap_or_else(|p| p.into_inner());
         guard.read(name).map_err(|e| e.to_string())?
     };
-    let text = tvp_streams::text::decode_bytes(&source)
-        .map_err(|e| format!("{name}: {e}"))?;
+    let text = tvp_streams::text::decode_bytes(&source).map_err(|e| format!("{name}: {e}"))?;
     engine.exec_script(&text, name).map_err(|e| e.to_string())
 }
 
