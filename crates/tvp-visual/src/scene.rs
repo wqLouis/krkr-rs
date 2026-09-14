@@ -98,6 +98,14 @@ pub struct LayerState {
     pub hold_alpha: bool,
     /// Reference `Focusable`: whether the layer may receive focus.
     pub focusable: bool,
+    /// Reference `JoinFocusChain` (`LayerIntf.h:527`, default true): whether
+    /// the layer joins the window's focus chain (`nextFocusable`/
+    /// `prevFocusable`).
+    pub join_focus_chain: bool,
+    /// Reference `FocusWork` (`LayerIntf.h:528`): the transient layer selected
+    /// by the last `nextFocusable`/`prevFocusable` search. The native
+    /// `onSearch*Focusable`/`onBeforeFocus` handlers may redirect it.
+    pub focus_work: Option<u32>,
     /// Reference `Enabled`: whether the layer's input/attention is active.
     pub enabled: bool,
     /// Reference `Name` (script `layer.name`).
@@ -319,6 +327,8 @@ impl Scene {
             clip: None,
             hold_alpha: false,
             focusable: false,
+            join_focus_chain: true,
+            focus_work: None,
             enabled: true,
             name: String::new(),
             attention_left: 0,
@@ -731,6 +741,186 @@ impl Scene {
                 Some(p) => cur = p,
                 None => return true,
             }
+        }
+    }
+
+    /// Reference `GetNodeFocusable` (`LayerIntf.h:665`): `focusable` plus
+    /// node visible/enabled at every ancestor. Manager `Mode` layers are not
+    /// modelled.
+    pub fn node_focusable(&self, id: u32) -> bool {
+        self.layer(id)
+            .is_some_and(|l| self.node_visible(id) && self.node_enabled(id) && l.focusable)
+    }
+
+    /// The layer's direct children in maintained sibling order — the order
+    /// `GetChildrenArrayObjectNoAddRef` (`LayerIntf.cpp:669`) builds the
+    /// `children` array in.
+    pub fn ordered_children(&self, layer_id: u32) -> Vec<u32> {
+        let Some(layer) = self.layer(layer_id) else {
+            return Vec::new();
+        };
+        let mut ids = layer.children.clone();
+        let maintained = ids.clone();
+        self.sort_siblings(&mut ids, &maintained);
+        ids
+    }
+
+    /// Reference `_GetNextFocusable`/`GetNextFocusable`
+    /// (`LayerIntf.cpp:3631`): the next `JoinFocusChain` focusable layer in
+    /// the window's paint order, wrapping, never returning `id` itself.
+    pub fn next_focusable(&self, id: u32) -> Option<u32> {
+        self.focusable_neighbor(id, true)
+    }
+
+    /// Reference `_GetPrevFocusable`/`GetPrevFocusable`
+    /// (`LayerIntf.cpp:3595`): the previous focusable layer, wrapping.
+    pub fn prev_focusable(&self, id: u32) -> Option<u32> {
+        self.focusable_neighbor(id, false)
+    }
+
+    fn focusable_neighbor(&self, id: u32, forward: bool) -> Option<u32> {
+        let layer = self.layer(id)?;
+        let order = self.window_layer_order(layer.window);
+        let n = order.len();
+        if n == 0 {
+            return None;
+        }
+        let start = order.iter().position(|&x| x == id)?;
+        for step in 1..n {
+            let idx = if forward {
+                (start + step) % n
+            } else {
+                (start + n - step) % n
+            };
+            let cand = order[idx];
+            let Some(candidate) = self.layer(cand) else {
+                continue;
+            };
+            if self.node_focusable(cand) && candidate.join_focus_chain {
+                return Some(cand);
+            }
+        }
+        None
+    }
+
+    /// Reference `GetMostFrontChildAt` (`LayerIntf.cpp:3363`) behind the
+    /// `getLayerAt` native: the frontmost layer at window point `(x, y)`,
+    /// where `(x, y)` is given in `layer_id`'s local coordinates. Returns
+    /// `None` when the point misses everything or the frontmost hit is
+    /// disabled and `get_disabled` is false.
+    pub fn layer_at(
+        &self,
+        layer_id: u32,
+        x: i32,
+        y: i32,
+        exclude_self: bool,
+        get_disabled: bool,
+    ) -> Option<u32> {
+        let layer = self.layer(layer_id)?;
+        let window = layer.window;
+        // Convert to window coordinates (the native `getLayerAt` adds this
+        // layer's and its non-root ancestors' offsets before hit-testing).
+        let (mut px, mut py) = (x, y);
+        let mut cur = Some(layer_id);
+        while let Some(c) = cur {
+            let l = self.layer(c)?;
+            match l.parent {
+                Some(p) => {
+                    px += l.rect.x;
+                    py += l.rect.y;
+                    cur = Some(p);
+                }
+                None => break,
+            }
+        }
+        // Front-to-back over the flattened tree; an invisible parent prunes
+        // its subtree through `node_visible`.
+        for id in self.window_layer_order(window).into_iter().rev() {
+            if exclude_self && id == layer_id {
+                continue;
+            }
+            let Some(l) = self.layer(id) else {
+                continue;
+            };
+            if !self.node_visible(id) {
+                continue;
+            }
+            let Some((ax, ay)) = self.absolute_offset(id) else {
+                continue;
+            };
+            let lx = px - ax;
+            let ly = py - ay;
+            if lx < 0 || ly < 0 || lx >= l.rect.w as i32 || ly >= l.rect.h as i32 {
+                continue;
+            }
+            if self.hit_test_layer(l, lx, ly) {
+                // A disabled topmost hit stops the search with no layer (the
+                // reference sets `*lay = nullptr` and returns true).
+                if !get_disabled && !self.node_enabled(id) {
+                    return None;
+                }
+                return Some(id);
+            }
+        }
+        None
+    }
+
+    /// Sum of this layer's and its ancestors' `rect` offsets (absolute
+    /// window position).
+    fn absolute_offset(&self, id: u32) -> Option<(i32, i32)> {
+        let mut x = 0i32;
+        let mut y = 0i32;
+        let mut cur = Some(id);
+        while let Some(c) = cur {
+            let l = self.layer(c)?;
+            x += l.rect.x;
+            y += l.rect.y;
+            cur = l.parent;
+        }
+        Some((x, y))
+    }
+
+    /// Reference `_HitTestNoVisibleCheck` (`LayerIntf.cpp:3229`). `htMask`
+    /// compares the main-image alpha against `hit_threshold` (&#8804;0 accepts
+    /// any pixel; 256 rejects everything); `htProvince` treats a non-zero
+    /// province byte as a hit. The `onHitTest` script hook is not dispatched
+    /// here.
+    fn hit_test_layer(&self, layer: &LayerState, x: i32, y: i32) -> bool {
+        match layer.hit_type {
+            // htProvince = 1
+            1 => {
+                let Some(buf) = layer.province.as_deref() else {
+                    return false;
+                };
+                let px = x - layer.image_left;
+                let py = y - layer.image_top;
+                if px < 0
+                    || py < 0
+                    || px >= layer.province_width as i32
+                    || py >= layer.province_height as i32
+                {
+                    return false;
+                }
+                buf[py as usize * layer.province_width as usize + px as usize] != 0
+            }
+            // htMask = 0
+            0 => match layer.bitmap.and_then(|id| self.bitmap(id)) {
+                Some(bmp) => {
+                    let px = x - layer.image_left;
+                    let py = y - layer.image_top;
+                    if px < 0 || py < 0 || px >= bmp.width as i32 || py >= bmp.height as i32 {
+                        return false;
+                    }
+                    if layer.hit_threshold <= 0 {
+                        return true;
+                    }
+                    let alpha = bmp.rgba[(py as usize * bmp.width as usize + px as usize) * 4 + 3];
+                    alpha as i32 >= layer.hit_threshold
+                }
+                None => layer.hit_threshold <= 0,
+            },
+            // Unknown hit types hit (the reference falls through to true).
+            _ => true,
         }
     }
 

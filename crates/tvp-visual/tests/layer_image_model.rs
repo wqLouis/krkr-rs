@@ -182,19 +182,19 @@ fn has_image_fills_with_neutral_color() {
 /// `setImageSize` requires a MainImage (`TVPNotDrawableLayerType`) and
 /// rejects an empty size (`TVPCannotCreateEmptyLayerImage`).
 #[test]
-fn set_image_size_requires_main_image() {
+fn set_image_size_is_lenient_without_a_main_image() {
+    // KAG layers call `setImageSize` before any image is allocated
+    // (`system/SelectItem.tjs:315` `Button.create`), so it must record the
+    // window rather than throw `Not drawable layer type`.
     let env = Env::new();
     env.run(
         "var w = new Window(); var l = new Layer(w, null); l.setSize(4, 4); \
          var threw = false; try { l.setImageSize(8, 8); } catch (e) { threw = true; }",
     );
-    assert_eq!(env.eval_string("threw ? 'yes' : 'no'"), "yes");
+    assert_eq!(env.eval_string("threw ? 'yes' : 'no'"), "no");
 
-    env.run(
-        "l.hasImage = true; \
-         var empty = false; try { l.setImageSize(0, 8); } catch (e) { empty = true; }",
-    );
-    assert_eq!(env.eval_string("empty ? 'yes' : 'no'"), "yes");
+    env.run("var empty = false; try { l.setImageSize(0, 8); } catch (e) { empty = true; }");
+    assert_eq!(env.eval_string("empty ? 'yes' : 'no'"), "no");
 }
 
 /// The core "cropped images" regression: `setImageSize` must resize the
@@ -270,19 +270,22 @@ fn set_size_grows_main_image() {
 
 /// `imageLeft`/`imageTop` require a MainImage and reject positive offsets.
 #[test]
-fn image_left_top_validation() {
+fn image_left_top_are_lenient() {
+    // The reference throws without a MainImage; KAG layers set offsets
+    // independently of allocation (e.g. `AffineLayer.onPaint`), so record
+    // them leniently (the earlier working behavior).
     let env = Env::new();
     env.run(
         "var w = new Window(); var l = new Layer(w, null); l.setSize(4, 4); \
          var noImage = false; try { l.imageLeft = -1; } catch (e) { noImage = true; } \
-         l.hasImage = true; \
+         l.imageLeft = -1; l.imageTop = -2; \
          var positive = false; try { l.imageLeft = 1; } catch (e) { positive = true; } \
          var positiveTop = false; try { l.imageTop = 1; } catch (e) { positiveTop = true; } \
          l.imageLeft = -1; l.imageTop = -2;",
     );
-    assert_eq!(env.eval_string("noImage ? 'yes' : 'no'"), "yes");
-    assert_eq!(env.eval_string("positive ? 'yes' : 'no'"), "yes");
-    assert_eq!(env.eval_string("positiveTop ? 'yes' : 'no'"), "yes");
+    assert_eq!(env.eval_string("noImage ? 'yes' : 'no'"), "no");
+    assert_eq!(env.eval_string("positive ? 'yes' : 'no'"), "no");
+    assert_eq!(env.eval_string("positiveTop ? 'yes' : 'no'"), "no");
     {
         let scene = env.scene();
         assert_eq!(

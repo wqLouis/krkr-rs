@@ -626,17 +626,14 @@ extern "C" fn layer_set_image_pos(
     let Some(layer) = scene.layer(inst.id) else {
         return error_out(out_error, "Layer: layer no longer exists");
     };
-    if layer.bitmap.is_none() {
-        return error_out(out_error, "Not drawable layer type");
-    }
-    if layer.image_left != left || layer.image_top != top {
-        if left > 0 || top > 0 {
-            return error_out(out_error, "Invalid Image position");
-        }
-        if let Some(layer) = scene.layer_mut(inst.id) {
-            layer.image_left = left;
-            layer.image_top = top;
-        }
+    // The reference throws without a MainImage, but KAG layers are
+    // image-capable and call `setImagePos` independently of the first image
+    // allocation (e.g. `AffineLayer.onPaint`), so record the offset leniently
+    // instead of failing — the earlier working behavior.
+    let changed = layer.image_left != left || layer.image_top != top;
+    if changed && let Some(layer) = scene.layer_mut(inst.id) {
+        layer.image_left = left;
+        layer.image_top = top;
     }
     set_void_out(out);
     0
@@ -664,17 +661,14 @@ extern "C" fn layer_set_image_size(
     let height = arg_i64(&args[1]).max(0) as u32;
     let inst = unsafe { instance_ref::<LayerInst>(instance) };
     let mut scene = context_scene_mut();
-    if scene.layer(inst.id).and_then(|l| l.bitmap).is_none() {
-        return error_out(out_error, "Not drawable layer type");
+    if scene.layer(inst.id).is_none() {
+        return error_out(out_error, "Layer: layer no longer exists");
     }
-    let (bw, bh) = main_image_dims(&scene, inst.id);
-    if width == bw && height == bh {
-        set_void_out(out);
-        return 0;
-    }
-    if width == 0 || height == 0 {
-        return error_out(out_error, "Cannot create empty layer image");
-    }
+    // The reference requires a MainImage, but KAG layers call `setImageSize`
+    // before the image is allocated (`system/SelectItem.tjs:315`
+    // `Button.create`). Record the image window leniently (the earlier
+    // working behavior) and let the later `copyRect`/`loadImages` allocate;
+    // `internal_set_image_size` resizes an existing MainImage in place.
     internal_set_image_size(&mut scene, inst.id, width, height);
     set_void_out(out);
     0
@@ -2051,9 +2045,6 @@ extern "C" fn layer_image_left_get(
     let Some(layer) = scene.layer(inst.id) else {
         return error_out(out_error, "Layer: layer no longer exists");
     };
-    if layer.bitmap.is_none() {
-        return error_out(out_error, "Not drawable layer type");
-    }
     set_int_out(out, i64::from(layer.image_left));
     0
 }
@@ -2073,16 +2064,10 @@ extern "C" fn layer_image_left_set(
     let Some(layer) = scene.layer(inst.id) else {
         return error_out(out_error, "Layer: layer no longer exists");
     };
-    if layer.bitmap.is_none() {
-        return error_out(out_error, "Not drawable layer type");
-    }
-    if layer.image_left != left {
-        if left > 0 {
-            return error_out(out_error, "Invalid Image position");
-        }
-        if let Some(layer) = scene.layer_mut(inst.id) {
-            layer.image_left = left;
-        }
+    if layer.image_left != left
+        && let Some(layer) = scene.layer_mut(inst.id)
+    {
+        layer.image_left = left;
     }
     0
 }
@@ -2099,9 +2084,6 @@ extern "C" fn layer_image_top_get(
     let Some(layer) = scene.layer(inst.id) else {
         return error_out(out_error, "Layer: layer no longer exists");
     };
-    if layer.bitmap.is_none() {
-        return error_out(out_error, "Not drawable layer type");
-    }
     set_int_out(out, i64::from(layer.image_top));
     0
 }
@@ -2121,16 +2103,10 @@ extern "C" fn layer_image_top_set(
     let Some(layer) = scene.layer(inst.id) else {
         return error_out(out_error, "Layer: layer no longer exists");
     };
-    if layer.bitmap.is_none() {
-        return error_out(out_error, "Not drawable layer type");
-    }
-    if layer.image_top != top {
-        if top > 0 {
-            return error_out(out_error, "Invalid Image position");
-        }
-        if let Some(layer) = scene.layer_mut(inst.id) {
-            layer.image_top = top;
-        }
+    if layer.image_top != top
+        && let Some(layer) = scene.layer_mut(inst.id)
+    {
+        layer.image_top = top;
     }
     0
 }
@@ -3663,7 +3639,14 @@ pub(crate) fn transition_poll(engine: &Tjs2Engine) {
             .unwrap_or_else(|p| p.into_inner()),
     );
     for value in pending {
-        let _ = engine.call_member(value.raw_id(), "onTransitionCompleted", &[]);
+        // The simplified transition model has no source/destination objects;
+        // pass void for both members so the `onTransitionCompleted` native
+        // still dispatches to the action owner.
+        let _ = engine.call_member(
+            value.raw_id(),
+            "onTransitionCompleted",
+            &[TjsValue::Void, TjsValue::Void],
+        );
         drop(value);
     }
 }
@@ -5038,26 +5021,59 @@ extern "C" fn layer_save_layer_image(
     0
 }
 
+/// Hand a retained value (e.g. an array or layer object) to the C++ side as
+/// the native result; the retention is consumed there.
+fn set_retained_out(dv: tjs2_sys::DetachedValue, out: *mut Value) {
+    let id = dv.raw_id() as usize;
+    // SAFETY: out is a valid result slot for the duration of the call.
+    unsafe {
+        (*out).ty = tjs2_sys::VAL_RETAINED;
+        (*out).integer = 0;
+        (*out).real = 0.0;
+        (*out).string = std::ptr::null();
+        (*out).array = std::ptr::null();
+        (*out).array_count = 0;
+        (*out).retained = id;
+    }
+    std::mem::forget(dv);
+}
+
+/// Return a scene layer's TJS object (retained) or `null`, the object-valued
+/// result shape the reference's tree/query getters use.
+fn set_layer_object_out(engine: &Tjs2Engine, layer_id: Option<u32>, out: *mut Value) {
+    if let Some(id) = layer_id {
+        let obj = super::layer_tjs_object(id);
+        if !obj.is_null()
+            && let Ok(dv) = engine.retain_object_detached(obj)
+        {
+            set_retained_out(dv, out);
+            return;
+        }
+    }
+    super::ffi::set_null_out(engine, out);
+}
+
 /// The TJS helper implementing `TVP_ACTION_INVOKE` (`EventIntf.h:208`): it
 /// builds the event dictionary `%[type, target, ...members]` and calls
 /// `owner.action(ev)`. The VM exposes no `arguments` object, so the (at most
-/// four) member name/value pairs are passed as fixed optional parameters.
-const LAYER_EVENT_DISPATCH: &str = "(function(owner,target,t,n1,v1,n2,v2,n3,v3,n4,v4){\
-    var ev=%[type:t,target:target];\n    if(n1!==void)ev[n1]=v1;\n    if(n2!==void)ev[n2]=v2;\n    if(n3!==void)ev[n3]=v3;\n    if(n4!==void)ev[n4]=v4;\n    return owner.action(ev);})";
+/// six) member name/value pairs are passed as fixed optional parameters.
+const LAYER_EVENT_DISPATCH: &str = "(function(owner,target,t,n1,v1,n2,v2,n3,v3,n4,v4,n5,v5,n6,v6){\
+    var ev=%[type:t,target:target];\n    if(n1!==void)ev[n1]=v1;\n    if(n2!==void)ev[n2]=v2;\n    if(n3!==void)ev[n3]=v3;\n    if(n4!==void)ev[n4]=v4;\n    if(n5!==void)ev[n5]=v5;\n    if(n6!==void)ev[n6]=v6;\n    return owner.action(ev);})";
 
-/// The maximum number of event members any `Layer` event carries (`x`, `y`,
-/// `button`, `shift` for `onMouseDown`).
-const LAYER_EVENT_MAX_MEMBERS: usize = 4;
+/// The maximum number of event members any `Layer` event carries
+/// (`onTouchRotate` has six).
+const LAYER_EVENT_MAX_MEMBERS: usize = 6;
 
 /// Dispatch one layer event to its action owner: retain the owner and the
 /// layer target, evaluate the helper closure, and invoke it with the event
-/// type plus alternating member name/value pairs.
+/// type plus alternating member name/value pairs. Object members are passed
+/// as [`TjsValue::Retained`] ids (consumed by the call).
 fn dispatch_layer_event(
     engine: &Tjs2Engine,
     owner_raw: *mut c_void,
     target: *mut c_void,
     event_type: &str,
-    members: &[(&str, i64)],
+    members: &[(&str, TjsValue)],
 ) {
     let Ok(owner) = engine.retain_object_detached(owner_raw) else {
         return;
@@ -5080,7 +5096,7 @@ fn dispatch_layer_event(
         match members.get(i) {
             Some((name, value)) => {
                 args.push(TjsValue::String((*name).to_string()));
-                args.push(TjsValue::Integer(*value));
+                args.push(value.clone());
             }
             None => {
                 args.push(TjsValue::Void);
@@ -5093,6 +5109,66 @@ fn dispatch_layer_event(
     // VM reports elsewhere; the native method itself stays void.
     if let Err(e) = engine.call_detached(&helper_dv, &args) {
         log::warn!("layer event dispatch ({event_type}) failed: {e}");
+    }
+}
+
+/// Forward one scalar callback argument preserving its integer/real/string
+/// variant (touch coordinates are reals).
+fn layer_event_value(v: &Value) -> TjsValue {
+    match v.ty {
+        tjs2_sys::VAL_INTEGER => TjsValue::Integer(v.integer),
+        tjs2_sys::VAL_REAL => TjsValue::Real(v.real),
+        tjs2_sys::VAL_STRING => TjsValue::String(super::ffi::arg_string(v)),
+        _ => TjsValue::Void,
+    }
+}
+
+/// Build event members from `(name, &Value)` pairs, retaining object
+/// arguments so the dispatch can pass them. The retained handles are pushed
+/// to `keepalive` and must outlive the dispatch.
+fn layer_event_members<'a>(
+    engine: &Tjs2Engine,
+    pairs: &[(&'a str, &Value)],
+    keepalive: &mut Vec<tjs2_sys::DetachedValue>,
+) -> Vec<(&'a str, TjsValue)> {
+    pairs
+        .iter()
+        .map(|(name, v)| {
+            if v.ty == tjs2_sys::VAL_OBJECT {
+                match engine.retain_object_arg(v) {
+                    Ok(dv) => {
+                        let id = dv.raw_id() as u64;
+                        keepalive.push(dv);
+                        (*name, TjsValue::Retained(id))
+                    }
+                    Err(_) => (*name, TjsValue::Void),
+                }
+            } else {
+                (*name, layer_event_value(v))
+            }
+        })
+        .collect()
+}
+
+/// Resolve a `layer`/`blurred` object argument to a scene layer id, or `None`
+/// for `void`/`null`. Throws `Specify Layer` for a non-Layer object (the
+/// reference `TVPSpecifyLayer`).
+fn focus_arg_layer_id(engine: &Tjs2Engine, v: &Value) -> Result<Option<u32>, String> {
+    match v.ty {
+        tjs2_sys::VAL_VOID | tjs2_sys::VAL_NULL => Ok(None),
+        tjs2_sys::VAL_OBJECT => {
+            let dv = engine.retain_object_arg(v)?;
+            let id = read_object_id(engine, dv.raw_id())?;
+            if id < 0 {
+                return Ok(None);
+            }
+            let id = id as u32;
+            if context_scene_read().layer(id).is_none() {
+                return Err("Specify Layer".into());
+            }
+            Ok(Some(id))
+        }
+        _ => Err("Specify Layer".into()),
     }
 }
 
@@ -5117,10 +5193,10 @@ macro_rules! layer_event_method {
             }
             let inst = unsafe { instance_ref::<LayerInst>(instance) };
             if let Some(owner) = &inst.action_owner {
-                let members: Vec<(&str, i64)> = names
+                let members: Vec<(&str, TjsValue)> = names
                     .iter()
                     .enumerate()
-                    .map(|(i, name)| (*name, arg_i64(&args[i])))
+                    .map(|(i, name)| (*name, layer_event_value(&args[i])))
                     .collect();
                 let engine = crate::natives::context_engine();
                 dispatch_layer_event(engine, owner.raw, objthis, $event, &members);
@@ -5149,6 +5225,457 @@ layer_event_method!(
 );
 layer_event_method!(layer_key_down, "onKeyDown", ["key", "shift", "process"]);
 layer_event_method!(layer_key_up, "onKeyUp", ["key", "shift", "process"]);
+layer_event_method!(layer_key_press, "onKeyPress", ["key", "process"]);
+layer_event_method!(layer_node_enabled, "onNodeEnabled", []);
+layer_event_method!(layer_node_disabled, "onNodeDisabled", []);
+layer_event_method!(layer_multi_touch, "onMultiTouch", []);
+layer_event_method!(
+    layer_touch_down,
+    "onTouchDown",
+    ["x", "y", "cx", "cy", "id"]
+);
+layer_event_method!(layer_touch_up, "onTouchUp", ["x", "y", "cx", "cy", "id"]);
+layer_event_method!(
+    layer_touch_move,
+    "onTouchMove",
+    ["x", "y", "cx", "cy", "id"]
+);
+layer_event_method!(
+    layer_touch_scaling,
+    "onTouchScaling",
+    ["startdistance", "currentdistance", "cx", "cy", "flag"]
+);
+layer_event_method!(
+    layer_touch_rotate,
+    "onTouchRotate",
+    ["startangle", "currentangle", "distance", "cx", "cy", "flag"]
+);
+
+/// `onBlur(focused)` — reference `LayerIntf.cpp:10193`. The `focused` member
+/// is an object (or null).
+extern "C" fn layer_on_blur(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    if args.is_empty() {
+        return error_out(out_error, "Layer.onBlur requires a layer");
+    }
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    if let Some(owner) = &inst.action_owner {
+        let engine = crate::natives::context_engine();
+        let mut keepalive = Vec::new();
+        let members = layer_event_members(engine, &[("focused", &args[0])], &mut keepalive);
+        dispatch_layer_event(engine, owner.raw, objthis, "onBlur", &members);
+    }
+    set_void_out(out);
+    0
+}
+
+/// `onFocus(blurred, direction)` — reference `LayerIntf.cpp:10208`. The
+/// reference declares a minimum of one parameter but reads two members
+/// (`blurred`, `direction`); the caller (`FireFocus`) passes both.
+extern "C" fn layer_on_focus(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    if args.is_empty() {
+        return error_out(out_error, "Layer.onFocus requires a layer");
+    }
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    if let Some(owner) = &inst.action_owner {
+        let engine = crate::natives::context_engine();
+        let mut keepalive = Vec::new();
+        let mut members = layer_event_members(engine, &[("blurred", &args[0])], &mut keepalive);
+        let direction = args.get(1).map(arg_i64).unwrap_or(0);
+        members.push(("direction", TjsValue::Integer(direction)));
+        dispatch_layer_event(engine, owner.raw, objthis, "onFocus", &members);
+    }
+    set_void_out(out);
+    0
+}
+
+/// Shared body for `onSearchNextFocusable`/`onSearchPrevFocusable`: store the
+/// found layer in `FocusWork` (reference `SetFocusWork`) and dispatch the
+/// event to the action owner.
+fn layer_search_focusable(
+    instance: *mut c_void,
+    objthis: *mut c_void,
+    event: &str,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    if args.is_empty() {
+        return error_out(out_error, &format!("Layer.{event} requires a layer"));
+    }
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let engine = crate::natives::context_engine();
+    let target = match focus_arg_layer_id(engine, &args[0]) {
+        Ok(t) => t,
+        Err(e) => return error_out(out_error, &e),
+    };
+    {
+        let mut scene = context_scene_mut();
+        let Some(layer) = scene.layer_mut(inst.id) else {
+            return error_out(out_error, "Layer: layer no longer exists");
+        };
+        layer.focus_work = target;
+    }
+    if let Some(owner) = &inst.action_owner {
+        let mut keepalive = Vec::new();
+        let members = layer_event_members(engine, &[("layer", &args[0])], &mut keepalive);
+        dispatch_layer_event(engine, owner.raw, objthis, event, &members);
+    }
+    set_void_out(out);
+    0
+}
+
+/// `onSearchNextFocusable(layer)` — reference `LayerIntf.cpp:10376`.
+extern "C" fn layer_on_search_next_focusable(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    objthis: *mut c_void,
+) -> c_int {
+    layer_search_focusable(
+        instance,
+        objthis,
+        "onSearchNextFocusable",
+        argc,
+        argv,
+        out,
+        out_error,
+    )
+}
+
+/// `onSearchPrevFocusable(layer)` — reference `LayerIntf.cpp:10339`.
+extern "C" fn layer_on_search_prev_focusable(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    objthis: *mut c_void,
+) -> c_int {
+    layer_search_focusable(
+        instance,
+        objthis,
+        "onSearchPrevFocusable",
+        argc,
+        argv,
+        out,
+        out_error,
+    )
+}
+
+/// `onBeforeFocus(layer, blurred, direction)` — reference
+/// `LayerIntf.cpp:10413`: store `layer` in `FocusWork` and dispatch the
+/// event to the action owner.
+extern "C" fn layer_on_before_focus(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    if args.len() < 3 {
+        return error_out(
+            out_error,
+            "Layer.onBeforeFocus requires layer, blurred and direction",
+        );
+    }
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let engine = crate::natives::context_engine();
+    let target = match focus_arg_layer_id(engine, &args[0]) {
+        Ok(t) => t,
+        Err(e) => return error_out(out_error, &e),
+    };
+    {
+        let mut scene = context_scene_mut();
+        let Some(layer) = scene.layer_mut(inst.id) else {
+            return error_out(out_error, "Layer: layer no longer exists");
+        };
+        layer.focus_work = target;
+    }
+    if let Some(owner) = &inst.action_owner {
+        let mut keepalive = Vec::new();
+        let mut members = layer_event_members(
+            engine,
+            &[("layer", &args[0]), ("blurred", &args[1])],
+            &mut keepalive,
+        );
+        members.push(("direction", TjsValue::Integer(arg_i64(&args[2]))));
+        dispatch_layer_event(engine, owner.raw, objthis, "onBeforeFocus", &members);
+    }
+    set_void_out(out);
+    0
+}
+
+/// `onTransitionCompleted(dest, src)` — reference `LayerIntf.cpp:10466`.
+/// `dest`/`src` are objects (or null).
+extern "C" fn layer_on_transition_completed(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    if args.len() < 2 {
+        return error_out(
+            out_error,
+            "Layer.onTransitionCompleted requires dest and src",
+        );
+    }
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    if let Some(owner) = &inst.action_owner {
+        let engine = crate::natives::context_engine();
+        let mut keepalive = Vec::new();
+        let members = layer_event_members(
+            engine,
+            &[("dest", &args[0]), ("src", &args[1])],
+            &mut keepalive,
+        );
+        dispatch_layer_event(
+            engine,
+            owner.raw,
+            objthis,
+            "onTransitionCompleted",
+            &members,
+        );
+    }
+    set_void_out(out);
+    0
+}
+
+/// `children` — reference `LayerIntf.cpp:10522` `GetChildrenArrayObjectNoAddRef`:
+/// a TJS `Array` of this layer's direct child layer objects in sibling order.
+extern "C" fn layer_children_get(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let children = {
+        let scene = context_scene_read();
+        if scene.layer(inst.id).is_none() {
+            return error_out(out_error, "Layer: layer no longer exists");
+        }
+        scene.ordered_children(inst.id)
+    };
+    let engine = crate::natives::context_engine();
+    let Ok(tjs2_sys::RetainedValue::Object(array)) = engine.eval_retained("[]", "layer.children")
+    else {
+        return error_out(out_error, "Layer.children: cannot create array");
+    };
+    for (i, child_id) in children.iter().enumerate() {
+        let obj = super::layer_tjs_object(*child_id);
+        if obj.is_null() {
+            continue;
+        }
+        let Ok(dv) = engine.retain_object_detached(obj) else {
+            continue;
+        };
+        // `set_member` writes a numeric member through the Array's
+        // `PropSetByNum` and consumes the retained object id.
+        let _ = engine.set_member(
+            array.raw_id(),
+            &i.to_string(),
+            &TjsValue::Retained(dv.raw_id() as u64),
+        );
+    }
+    set_retained_out(array, out);
+    0
+}
+
+/// `getLayerAt(x, y[, exclude_self[, get_disabled]])` — reference
+/// `LayerIntf.cpp:8521`: the frontmost layer at a point in this layer's
+/// coordinates, as a layer object or `null`.
+extern "C" fn layer_get_layer_at(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let args = unsafe { super::ffi::args(argc, argv) };
+    if args.len() < 2 {
+        return error_out(out_error, "Layer.getLayerAt requires x and y");
+    }
+    let x = arg_i64(&args[0]) as i32;
+    let y = arg_i64(&args[1]) as i32;
+    let bool_arg = |i: usize| {
+        args.get(i)
+            .is_some_and(|v| v.ty != tjs2_sys::VAL_VOID && arg_bool(v))
+    };
+    let exclude_self = bool_arg(2);
+    let get_disabled = bool_arg(3);
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let hit = {
+        let scene = context_scene_read();
+        if scene.layer(inst.id).is_none() {
+            return error_out(out_error, "Layer: layer no longer exists");
+        }
+        scene.layer_at(inst.id, x, y, exclude_self, get_disabled)
+    };
+    set_layer_object_out(crate::natives::context_engine(), hit, out);
+    0
+}
+
+/// `joinFocusChain` — reference `LayerIntf.cpp:11177`.
+extern "C" fn layer_join_focus_chain_get(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let scene = context_scene_read();
+    let Some(layer) = scene.layer(inst.id) else {
+        return error_out(out_error, "Layer: layer no longer exists");
+    };
+    set_int_out(out, i64::from(layer.join_focus_chain));
+    0
+}
+
+extern "C" fn layer_join_focus_chain_set(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    value: *const Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: value is valid for the call.
+    let v = unsafe { &*value };
+    let join = arg_bool(v);
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let mut scene = context_scene_mut();
+    let Some(layer) = scene.layer_mut(inst.id) else {
+        return error_out(out_error, "Layer: layer no longer exists");
+    };
+    layer.join_focus_chain = join;
+    0
+}
+
+/// Shared body for `nextFocusable`/`prevFocusable`: compute the neighbour,
+/// store it in `FocusWork`, post the `onSearch*Focusable` event to this
+/// layer's own object (reference `GetNextFocusable`/`GetPrevFocusable`) and
+/// return the possibly-redirected `FocusWork` as a layer object or `null`.
+fn layer_focusable_neighbor_get(
+    instance: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    forward: bool,
+) -> c_int {
+    let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let engine = crate::natives::context_engine();
+    let computed = {
+        let scene = context_scene_read();
+        if scene.layer(inst.id).is_none() {
+            return error_out(out_error, "Layer: layer no longer exists");
+        }
+        if forward {
+            scene.next_focusable(inst.id)
+        } else {
+            scene.prev_focusable(inst.id)
+        }
+    };
+    {
+        let mut scene = context_scene_mut();
+        if let Some(layer) = scene.layer_mut(inst.id) {
+            layer.focus_work = computed;
+        }
+    }
+    let event = if forward {
+        "onSearchNextFocusable"
+    } else {
+        "onSearchPrevFocusable"
+    };
+    fire_layer_self_event(engine, inst.id, event, computed);
+    let result = context_scene_read()
+        .layer(inst.id)
+        .and_then(|l| l.focus_work);
+    set_layer_object_out(engine, result, out);
+    0
+}
+
+/// Invoke one of the layer's own event handlers with the found layer (or
+/// `null`), mirroring the reference `TVPPostEvent(Owner, Owner, ...)`. A
+/// script override or the native handler above receives it.
+fn fire_layer_self_event(engine: &Tjs2Engine, layer_id: u32, method: &str, found: Option<u32>) {
+    let obj = super::layer_tjs_object(layer_id);
+    if obj.is_null() {
+        return;
+    }
+    let Ok(dv) = engine.retain_object_detached(obj) else {
+        return;
+    };
+    let mut keepalive = Vec::new();
+    let arg = match found {
+        Some(id) => {
+            let fobj = super::layer_tjs_object(id);
+            if fobj.is_null() {
+                TjsValue::Void
+            } else if let Ok(adv) = engine.retain_object_detached(fobj) {
+                let value = TjsValue::Retained(adv.raw_id() as u64);
+                keepalive.push(adv);
+                value
+            } else {
+                TjsValue::Void
+            }
+        }
+        None => TjsValue::Void,
+    };
+    let _ = engine.call_member(dv.raw_id(), method, &[arg]);
+}
+
+extern "C" fn layer_next_focusable_get(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    layer_focusable_neighbor_get(instance, out, out_error, true)
+}
+
+extern "C" fn layer_prev_focusable_get(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    layer_focusable_neighbor_get(instance, out, out_error, false)
+}
 
 /// `setClip([left, top, width, height])` — reference
 /// `tTJSNI_BaseLayer::SetClip`/`ResetClip` (`LayerIntf.cpp:4032`). With no
@@ -5516,6 +6043,70 @@ pub(crate) fn register_layer(engine: &Tjs2Engine) -> Result<(), String> {
             f: layer_key_up,
         },
         NativeInstanceMethodDef {
+            name: "onKeyPress",
+            f: layer_key_press,
+        },
+        NativeInstanceMethodDef {
+            name: "onBlur",
+            f: layer_on_blur,
+        },
+        NativeInstanceMethodDef {
+            name: "onFocus",
+            f: layer_on_focus,
+        },
+        NativeInstanceMethodDef {
+            name: "onBeforeFocus",
+            f: layer_on_before_focus,
+        },
+        NativeInstanceMethodDef {
+            name: "onSearchNextFocusable",
+            f: layer_on_search_next_focusable,
+        },
+        NativeInstanceMethodDef {
+            name: "onSearchPrevFocusable",
+            f: layer_on_search_prev_focusable,
+        },
+        NativeInstanceMethodDef {
+            name: "onNodeEnabled",
+            f: layer_node_enabled,
+        },
+        NativeInstanceMethodDef {
+            name: "onNodeDisabled",
+            f: layer_node_disabled,
+        },
+        NativeInstanceMethodDef {
+            name: "onTouchDown",
+            f: layer_touch_down,
+        },
+        NativeInstanceMethodDef {
+            name: "onTouchMove",
+            f: layer_touch_move,
+        },
+        NativeInstanceMethodDef {
+            name: "onTouchUp",
+            f: layer_touch_up,
+        },
+        NativeInstanceMethodDef {
+            name: "onTouchScaling",
+            f: layer_touch_scaling,
+        },
+        NativeInstanceMethodDef {
+            name: "onTouchRotate",
+            f: layer_touch_rotate,
+        },
+        NativeInstanceMethodDef {
+            name: "onMultiTouch",
+            f: layer_multi_touch,
+        },
+        NativeInstanceMethodDef {
+            name: "onTransitionCompleted",
+            f: layer_on_transition_completed,
+        },
+        NativeInstanceMethodDef {
+            name: "getLayerAt",
+            f: layer_get_layer_at,
+        },
+        NativeInstanceMethodDef {
             name: "beginTransition",
             f: layer_begin_transition,
         },
@@ -5796,6 +6387,26 @@ pub(crate) fn register_layer(engine: &Tjs2Engine) -> Result<(), String> {
             NativeInstancePropertyDef {
                 name: "nodeFocusable",
                 get: Some(layer_node_focusable_get),
+                set: None,
+            },
+            NativeInstancePropertyDef {
+                name: "joinFocusChain",
+                get: Some(layer_join_focus_chain_get),
+                set: Some(layer_join_focus_chain_set),
+            },
+            NativeInstancePropertyDef {
+                name: "nextFocusable",
+                get: Some(layer_next_focusable_get),
+                set: None,
+            },
+            NativeInstancePropertyDef {
+                name: "prevFocusable",
+                get: Some(layer_prev_focusable_get),
+                set: None,
+            },
+            NativeInstancePropertyDef {
+                name: "children",
+                get: Some(layer_children_get),
                 set: None,
             },
             NativeInstancePropertyDef {
@@ -7344,5 +7955,175 @@ mod tests {
             super::save_host_path(game, "sub/dir/y.jpg"),
             std::path::PathBuf::from("/games/title/sub/dir/y.jpg")
         );
+    }
+
+    /// `children` returns a TJS `Array` of the direct child layer objects in
+    /// sibling order (reference `GetChildrenArrayObjectNoAddRef`).
+    #[test]
+    fn layer_children_returns_child_objects() {
+        let env = TestEnv::new("layer-children");
+        env.run(
+            "var w = new Window(); \
+             var parent = new Layer(w, null); \
+             var c1 = new Layer(w, parent); \
+             var c2 = new Layer(w, parent); \
+             var kids = parent.children; \
+             var leaf = c1.children;",
+        )
+        .unwrap();
+        assert_eq!(env.eval_int("kids.count"), 2);
+        assert_eq!(env.eval_int("kids[0] === c1"), 1);
+        assert_eq!(env.eval_int("kids[1] === c2"), 1);
+        assert_eq!(env.eval_int("leaf.count"), 0);
+    }
+
+    /// `getLayerAt(x, y)` returns the frontmost layer at the point, honours
+    /// `exclude_self`/`get_disabled`, returns `null` on a miss, and uses the
+    /// province plane for `htProvince` (reference `GetMostFrontChildAt`).
+    #[test]
+    fn layer_get_layer_at_frontmost_and_options() {
+        let env = TestEnv::new("layer-get-layer-at");
+        env.run(
+            "var w = new Window(); \
+             var back = new Layer(w, null); back.setSize(20, 20); back.visible = true; back.hitThreshold = 0; \
+             var front = new Layer(w, null); front.setSize(20, 20); front.visible = true; front.hitThreshold = 0; \
+             var hit = back.getLayerAt(5, 5); \
+             var miss = back.getLayerAt(100, 100); \
+             var excl = front.getLayerAt(5, 5, true);",
+        )
+        .unwrap();
+        assert_eq!(env.eval_int("hit === front"), 1);
+        assert_eq!(env.eval_int("miss == null"), 1);
+        assert_eq!(env.eval_int("excl === back"), 1);
+
+        env.run(
+            "front.enabled = false; \
+             var disabled = back.getLayerAt(5, 5); \
+             var included = back.getLayerAt(5, 5, false, true);",
+        )
+        .unwrap();
+        assert_eq!(
+            env.eval_int("disabled == null"),
+            1,
+            "disabled stops the search"
+        );
+        assert_eq!(env.eval_int("included === front"), 1);
+    }
+
+    /// `getLayerAt` honours `htProvince` (1) through the province plane.
+    #[test]
+    fn layer_get_layer_at_uses_province_plane() {
+        let env = TestEnv::new("layer-get-layer-at-province");
+        env.run(
+            "var w = new Window(); \
+             var l = new Layer(w, null); l.setSize(4, 4); l.hasImage = true; \
+             l.hitType = 1; l.setProvincePixel(1, 1, 5); \
+             var hit = l.getLayerAt(1, 1); \
+             var miss = l.getLayerAt(2, 2);",
+        )
+        .unwrap();
+        assert_eq!(env.eval_int("hit === l"), 1);
+        assert_eq!(env.eval_int("miss == null"), 1);
+    }
+
+    /// `joinFocusChain` defaults to true; `nextFocusable`/`prevFocusable`
+    /// walk the window's focusable layers with wrap-around and skip layers
+    /// that left the chain.
+    #[test]
+    fn layer_focus_chain_walks_focusable_layers() {
+        let env = TestEnv::new("layer-focus-chain");
+        env.run(
+            "var w = new Window(); \
+             var a = new Layer(w, null); a.focusable = true; a.visible = true; \
+             var b = new Layer(w, null); b.focusable = true; b.visible = true; \
+             var c = new Layer(w, null); c.focusable = true; c.visible = true; \
+             var def = a.joinFocusChain; \
+             var n1 = a.nextFocusable; \
+             var n2 = b.nextFocusable; \
+             var n3 = c.nextFocusable; \
+             var p1 = a.prevFocusable; \
+             b.joinFocusChain = false; \
+             var skipped = a.nextFocusable; \
+             var flag = b.joinFocusChain;",
+        )
+        .unwrap();
+        assert_eq!(env.eval_int("def"), 1, "JoinFocusChain defaults true");
+        assert_eq!(env.eval_int("n1 === b"), 1);
+        assert_eq!(env.eval_int("n2 === c"), 1);
+        assert_eq!(env.eval_int("n3 === a"), 1, "wraps forward");
+        assert_eq!(env.eval_int("p1 === c"), 1, "wraps backward");
+        assert_eq!(env.eval_int("skipped === c"), 1, "skips non-chain layer");
+        assert_eq!(env.eval_int("flag"), 0);
+    }
+
+    /// The new native event dispatchers build the reference event dictionary
+    /// and call `actionOwner.action(ev)` with the matching members.
+    #[test]
+    fn layer_event_dispatchers_reach_the_action_owner() {
+        let env = TestEnv::new("layer-events");
+        env.run(
+            "var owner = %[]; \
+             owner.action = function(ev) { global.seen = ev; }; \
+             var w = new Window(); \
+             var l = new Layer(owner, null); l.setSize(10, 10); \
+             var other = new Layer(owner, null); \
+             l.onTouchDown(1, 2, 3, 4, 7);",
+        )
+        .unwrap();
+        assert_eq!(env.eval_string("global.seen.type"), "onTouchDown");
+        assert_eq!(env.eval_int("global.seen.x"), 1);
+        assert_eq!(env.eval_int("global.seen.y"), 2);
+        assert_eq!(env.eval_int("global.seen.cx"), 3);
+        assert_eq!(env.eval_int("global.seen.cy"), 4);
+        assert_eq!(env.eval_int("global.seen.id"), 7);
+        assert_eq!(env.eval_int("global.seen.target === l"), 1);
+
+        env.run("l.onNodeEnabled();").unwrap();
+        assert_eq!(env.eval_string("global.seen.type"), "onNodeEnabled");
+
+        env.run("l.onFocus(other, 1);").unwrap();
+        assert_eq!(env.eval_string("global.seen.type"), "onFocus");
+        assert_eq!(env.eval_int("global.seen.blurred === other"), 1);
+        assert_eq!(env.eval_int("global.seen.direction"), 1);
+
+        env.run("l.onSearchNextFocusable(other);").unwrap();
+        assert_eq!(env.eval_string("global.seen.type"), "onSearchNextFocusable");
+        assert_eq!(env.eval_int("global.seen.layer === other"), 1);
+
+        env.run("l.onTransitionCompleted(l, other);").unwrap();
+        assert_eq!(env.eval_string("global.seen.type"), "onTransitionCompleted");
+        assert_eq!(env.eval_int("global.seen.dest === l"), 1);
+        assert_eq!(env.eval_int("global.seen.src === other"), 1);
+    }
+
+    /// A too-short event call throws, matching the reference arity checks.
+    #[test]
+    fn layer_event_dispatchers_check_arity() {
+        let env = TestEnv::new("layer-event-arity");
+        env.run(
+            "var owner = %[]; owner.action = function(ev) {}; \
+             var w = new Window(); var l = new Layer(owner, null); \
+             var threw = false; try { l.onTouchDown(1, 2); } catch (e) { threw = true; }",
+        )
+        .unwrap();
+        assert_eq!(env.eval_int("threw"), 1);
+    }
+
+    /// Reading `nextFocusable` posts `onSearchNextFocusable` to the layer's
+    /// own object; the native handler forwards it to the action owner.
+    #[test]
+    fn layer_next_focusable_dispatches_search_event() {
+        let env = TestEnv::new("layer-focus-event");
+        env.run(
+            "var owner = %[]; owner.action = function(ev) { global.seen = ev; }; \
+             var w = new Window(); \
+             var a = new Layer(owner, null); a.focusable = true; a.visible = true; \
+             var b = new Layer(owner, null); b.focusable = true; b.visible = true; \
+             var next = a.nextFocusable;",
+        )
+        .unwrap();
+        assert_eq!(env.eval_int("next === b"), 1);
+        assert_eq!(env.eval_string("global.seen.type"), "onSearchNextFocusable");
+        assert_eq!(env.eval_int("global.seen.layer === b"), 1);
     }
 }
