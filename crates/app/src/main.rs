@@ -77,6 +77,15 @@ fn run_load(game_dir: &str) -> Result<(), String> {
     if let Some(err) = &report.startup_error {
         println!("startup.tjs error: {err}");
     }
+    // Debug hook: after `startup.tjs`, evaluate a TJS expression from the
+    // `KRKR_EVAL` environment variable and print the result. Useful for
+    // probing the post-startup global state without a GPU.
+    if let Ok(expr) = std::env::var("KRKR_EVAL") {
+        match engine.eval(&expr, "krkr-eval") {
+            Ok(value) => println!("KRKR_EVAL {expr} -> {value:?}"),
+            Err(e) => println!("KRKR_EVAL {expr} !! {e}"),
+        }
+    }
     Ok(())
 }
 
