@@ -38,7 +38,7 @@ use std::thread;
 use engine::Storage;
 
 use crate::decode::{
-    AudioMetadata, DecodeError, DecodedAudio, StreamDecoder, decode_audio_bytes, probe_audio,
+    AudioMetadata, DecodeError, DecodedAudio, StreamDecoder, decode_audio_arc, probe_audio_arc,
 };
 use crate::sli::{self, LoopLink, SliInfo, WaveLabel};
 
@@ -199,7 +199,7 @@ impl AudioTrack {
     /// Start decoding `bytes` fully into memory on a background worker.
     fn start_full(
         metadata: AudioMetadata,
-        bytes: Vec<u8>,
+        bytes: Arc<[u8]>,
         name: String,
         loop_info: Option<SliInfo>,
     ) -> Arc<AudioTrack> {
@@ -218,7 +218,7 @@ impl AudioTrack {
             if worker_cancel.load(Ordering::Acquire) {
                 return;
             }
-            let result = decode_audio_bytes(&bytes, &worker_name)
+            let result = decode_audio_arc(&bytes, &worker_name)
                 .map(Arc::new)
                 .map_err(|e| e.to_string());
             let _ = worker_slot.set(result);
@@ -233,7 +233,7 @@ impl AudioTrack {
     /// worker.
     fn start_stream(
         metadata: AudioMetadata,
-        bytes: Vec<u8>,
+        bytes: Arc<[u8]>,
         name: String,
         loop_info: Option<SliInfo>,
     ) -> Arc<AudioTrack> {
@@ -337,6 +337,35 @@ impl AudioTrack {
                 Some((l, r))
             }
             TrackState::Stream(ring) => ring.frame(frame),
+        }
+    }
+
+    /// Read a contiguous run of source frames starting at `start` into `out`.
+    ///
+    /// Frames that are not available yet (loading, underrun) or past the end
+    /// are left as `None`. This is the batched form of [`Self::frame`]: the
+    /// whole-file case reads its `OnceLock` once and the streaming case takes
+    /// the ring lock once, so the mixer's per-sample resampling loop does not
+    /// pay for either on every output sample.
+    pub fn read_frames(&self, start: u64, out: &mut [Option<(f32, f32)>]) {
+        match &self.state {
+            TrackState::Full(slot) => {
+                let audio = slot.get().and_then(|r| r.as_ref().ok());
+                for (i, dst) in out.iter_mut().enumerate() {
+                    let frame = start + i as u64;
+                    *dst = audio.and_then(|a| {
+                        let ch = usize::from(a.channels);
+                        if ch == 0 || frame >= a.frames() {
+                            return None;
+                        }
+                        let idx = frame as usize * ch;
+                        let l = a.samples[idx];
+                        let r = if ch >= 2 { a.samples[idx + 1] } else { l };
+                        Some((l, r))
+                    });
+                }
+            }
+            TrackState::Stream(ring) => ring.read_frames(start, out),
         }
     }
 
@@ -533,7 +562,11 @@ fn open_track_bytes_inner(
     name: &str,
     loop_info: Option<SliInfo>,
 ) -> Result<Arc<AudioTrack>, DecodeError> {
-    let metadata = probe_audio(&bytes, name)?;
+    // Share the compressed bytes by refcount: the probe, the (optional)
+    // streaming worker, and every seek re-open all borrow the same buffer
+    // instead of cloning the whole entry.
+    let bytes: Arc<[u8]> = Arc::from(bytes);
+    let metadata = probe_audio_arc(&bytes, name)?;
     // Estimate the decoded PCM size from the container metadata; fall back
     // to a generous bytes->PCM ratio when the container omits the frame
     // count. Above the cap the track streams instead of materializing.
@@ -574,8 +607,8 @@ fn open_track_bytes_inner(
 // ---------------------------------------------------------------------------
 
 /// Decode `bytes` into `ring` until EOF, cancellation, or error.
-fn run_stream(ring: Arc<StreamRing>, cancel: Arc<AtomicBool>, bytes: Vec<u8>, name: String) {
-    let mut decoder = match StreamDecoder::open(&bytes, &name) {
+fn run_stream(ring: Arc<StreamRing>, cancel: Arc<AtomicBool>, bytes: Arc<[u8]>, name: String) {
+    let mut decoder = match StreamDecoder::open_arc(&bytes, &name) {
         Ok(d) => d,
         Err(e) => {
             log::warn!("tvp-sound: streaming decode failed to open {name}: {e}");
@@ -597,7 +630,7 @@ fn run_stream(ring: Arc<StreamRing>, cancel: Arc<AtomicBool>, bytes: Vec<u8>, na
         // A seek (explicit or a loop wrap) discards the ring and restarts
         // the decoder from the beginning, then skips to the target.
         if let Some(target) = ring.take_seek() {
-            match StreamDecoder::open(&bytes, &name) {
+            match StreamDecoder::open_arc(&bytes, &name) {
                 Ok(d) => decoder = d,
                 Err(e) => {
                     log::warn!("tvp-sound: streaming reseek failed for {name}: {e}");
@@ -751,6 +784,33 @@ impl StreamRing {
             l
         };
         Some((l, r))
+    }
+
+    /// Read a contiguous run of frames starting at `start` under a single
+    /// ring lock. Frames outside the retained window are left as `None`.
+    ///
+    /// The mixer renders resampled chunks sample by sample; without this it
+    /// would take the ring mutex twice per output sample. One lock per chunk
+    /// is enough because the read is a pure snapshot (the worker only appends
+    /// and the playback position only advances).
+    fn read_frames(&self, start: u64, out: &mut [Option<(f32, f32)>]) {
+        let st = lock_ring(&self.state);
+        let end = st.base + st.len;
+        for (i, slot) in out.iter_mut().enumerate() {
+            let idx = start + i as u64;
+            *slot = if idx < st.base || idx >= end {
+                None
+            } else {
+                let off = (idx % st.cap_frames) as usize * st.channels;
+                let l = st.data[off];
+                let r = if st.channels >= 2 {
+                    st.data[off + 1]
+                } else {
+                    l
+                };
+                Some((l, r))
+            };
+        }
     }
 
     /// Drop frames strictly before `frame` and wake the worker.

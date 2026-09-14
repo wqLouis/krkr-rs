@@ -20,10 +20,19 @@
 //! `SetVolume` with the ramped value each beat, and `volume` reads it back);
 //! setting `volume` explicitly cancels the active fade.
 
+use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
 
 use crate::decode::DecodedAudio;
 use crate::source::AudioTrack;
+
+thread_local! {
+    /// Scratch buffer reused across [`Mixer::render_mix`] calls so
+    /// resampling a streaming source takes its ring lock once per chunk
+    /// instead of twice per output sample. Sized to the output chunk, so it
+    /// reaches a steady state and then stops allocating.
+    static FRAME_SCRATCH: RefCell<Vec<Option<(f32, f32)>>> = const { RefCell::new(Vec::new()) };
+}
 
 /// Volume clamp (the task's channel surface uses `0..=1`; the reference
 /// engine uses `0..=100000` — see the crate docs for the scale mapping).
@@ -443,6 +452,10 @@ pub struct Mixer {
     app_focused: bool,
     /// Whether the host window is minimized.
     app_minimized: bool,
+    /// Reused scratch for [`Mixer::render_mix_advancing`]'s per-channel
+    /// streaming watermarks, so the audio callback does not allocate a fresh
+    /// `Vec` every chunk.
+    watermarks: Vec<Option<f64>>,
 }
 
 impl Default for Mixer {
@@ -459,6 +472,7 @@ impl Default for Mixer {
             global_focus_mode: 0,
             app_focused: true,
             app_minimized: false,
+            watermarks: Vec::new(),
         }
     }
 }
@@ -578,11 +592,13 @@ impl Mixer {
         // advance below must only move over audio that was renderable for
         // this chunk; querying the watermark after the render would consume
         // frames the worker published mid-render without ever playing them.
-        let watermarks: Vec<Option<f64>> = self
-            .channels
-            .iter()
-            .map(|c| c.source.as_ref().and_then(|s| s.available_end_seconds()))
-            .collect();
+        // The scratch is reused across callbacks (no per-chunk allocation).
+        self.watermarks.clear();
+        self.watermarks.extend(
+            self.channels
+                .iter()
+                .map(|c| c.source.as_ref().and_then(|s| s.available_end_seconds())),
+        );
         self.render_mix(out, out_rate, out_channels);
         let channels = usize::from(out_channels);
         if out_rate > 0 && channels > 0 {
@@ -590,7 +606,11 @@ impl Mixer {
             if frames > 0 {
                 let dt = frames as f64 / f64::from(out_rate);
                 self.clock += dt;
-                for (c, watermark) in self.channels.iter_mut().zip(watermarks) {
+                for (c, watermark) in self
+                    .channels
+                    .iter_mut()
+                    .zip(self.watermarks.iter().copied())
+                {
                     c.advance_inner(dt, watermark);
                 }
             }
@@ -627,40 +647,61 @@ impl Mixer {
             if src_ch == 0 || src_ch > 2 {
                 continue;
             }
-            for (i, frame) in out.chunks_mut(out_ch).enumerate() {
-                // Render from the channel's current playback position; the
-                // app's clock (`advance_to`) keeps it moving. Ignoring the
-                // position made the output device replay the first buffer
-                // forever (effectively silence). `rate` preserves the
-                // reference's `frequency` control (pitch + tempo).
-                let t = c.position_seconds + i as f64 / out_rate_f * c.rate;
-                let sample_pos = (t * src_rate).max(0.0);
-                let i0 = sample_pos.floor() as u64;
-                let frac = (sample_pos - i0 as f64) as f32;
-                // A frame that is not decoded yet (loading/underrun) yields
-                // no output for this sample instead of blocking; the last
-                // frame of a complete source reuses itself (clamped), which
-                // is what the old `i1.min(total_frames - 1)` did.
-                let Some((a0, b0)) = src.frame(i0) else {
-                    continue;
-                };
-                let (a1, b1) = src.frame(i0 + 1).unwrap_or((a0, b0));
-                // Linear interpolation: source and device rates usually
-                // differ (48 kHz Vorbis/Opus on a 44.1 kHz device), and
-                // nearest-neighbour sampling there is audibly aliased.
-                let (l, r) = if src_ch == 1 {
-                    let s = a0 + (a1 - a0) * frac;
-                    (s, s)
-                } else {
-                    (a0 + (a1 - a0) * frac, b0 + (b1 - b0) * frac)
-                };
-                if out_ch == 1 {
-                    frame[0] += (l * gl + r * gr) * 0.5 * v;
-                } else {
-                    frame[0] += l * v * gl;
-                    frame[1] += r * v * gr;
-                }
+            let out_frames = out.len() / out_ch;
+            if out_frames == 0 {
+                continue;
             }
+            // Source frame indices this chunk touches. `start` is the lower
+            // bound (rate is normally positive; min/max keeps a hand-set
+            // negative rate correct) and `span` covers `i0` and `i0 + 1` for
+            // every output frame. Reading the whole window in one call means a
+            // streaming source is locked once per chunk instead of twice per
+            // sample. `rate == 0` still works (every frame maps to one `i0`).
+            let first = (c.position_seconds * src_rate).max(0.0).floor() as u64;
+            let last_t = c.position_seconds + (out_frames - 1) as f64 / out_rate_f * c.rate;
+            let last = (last_t * src_rate).max(0.0).floor() as u64;
+            let start = first.min(last);
+            let span = (first.max(last) - start + 2) as usize;
+            FRAME_SCRATCH.with(|cell| {
+                let mut buf = cell.borrow_mut();
+                buf.clear();
+                buf.resize(span, None);
+                src.read_frames(start, &mut buf);
+                for (i, frame) in out.chunks_exact_mut(out_ch).enumerate() {
+                    // Render from the channel's current playback position; the
+                    // app's clock (`advance_to`) keeps it moving. Ignoring the
+                    // position made the output device replay the first buffer
+                    // forever (effectively silence). `rate` preserves the
+                    // reference's `frequency` control (pitch + tempo).
+                    let t = c.position_seconds + i as f64 / out_rate_f * c.rate;
+                    let sample_pos = (t * src_rate).max(0.0);
+                    let i0 = sample_pos.floor() as u64;
+                    let frac = (sample_pos - i0 as f64) as f32;
+                    // A frame that is not decoded yet (loading/underrun) yields
+                    // no output for this sample instead of blocking; the last
+                    // frame of a complete source reuses itself (clamped), which
+                    // is what the old `i1.min(total_frames - 1)` did.
+                    let Some((a0, b0)) = buf[(i0 - start) as usize] else {
+                        continue;
+                    };
+                    let (a1, b1) = buf[(i0 + 1 - start) as usize].unwrap_or((a0, b0));
+                    // Linear interpolation: source and device rates usually
+                    // differ (48 kHz Vorbis/Opus on a 44.1 kHz device), and
+                    // nearest-neighbour sampling there is audibly aliased.
+                    let (l, r) = if src_ch == 1 {
+                        let s = a0 + (a1 - a0) * frac;
+                        (s, s)
+                    } else {
+                        (a0 + (a1 - a0) * frac, b0 + (b1 - b0) * frac)
+                    };
+                    if out_ch == 1 {
+                        frame[0] += (l * gl + r * gr) * 0.5 * v;
+                    } else {
+                        frame[0] += l * v * gl;
+                        frame[1] += r * v * gr;
+                    }
+                }
+            });
         }
         // Keep the summed mix in range so the device never hard-clips a
         // loud voice + BGM overlap into crackle.

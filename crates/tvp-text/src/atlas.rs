@@ -20,11 +20,46 @@
 //! KAG text sets are small and bounded in practice.
 
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use ab_glyph::{Font, PxScale, ScaleFont};
 
 use crate::font::{FontFace, glyph_id_with_fallback, px_scale_for_height, round_advance};
+
+/// FNV-1a hasher for the glyph map.
+///
+/// `char` keys are tiny integers and the map is hit for every laid-out
+/// character; the default SipHash lookup was measured at ~200 ns in a debug
+/// build and dominated `layout`. FNV-1a is several times faster on these keys
+/// and its collision behaviour is more than adequate for the few thousand
+/// glyphs a game font holds.
+struct FnvHasher(u64);
+
+const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+impl Default for FnvHasher {
+    fn default() -> Self {
+        FnvHasher(FNV_OFFSET_BASIS)
+    }
+}
+
+impl Hasher for FnvHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 ^= u64::from(byte);
+            self.0 = self.0.wrapping_mul(FNV_PRIME);
+        }
+    }
+}
+
+/// Glyph-slot map keyed by character, using the cheap [`FnvHasher`].
+type GlyphMap = HashMap<char, GlyphSlot, BuildHasherDefault<FnvHasher>>;
 
 /// Padding, in pixels, kept around every glyph inside its cell. Absorbs the
 /// +1 px that integerized bounds can exceed the font's declared metrics by,
@@ -77,7 +112,7 @@ pub struct GlyphAtlas {
     /// RGBA buffer, `width * height * 4` bytes.
     rgba: Vec<u8>,
     /// Glyph slots by character.
-    slots: HashMap<char, GlyphSlot>,
+    slots: GlyphMap,
     /// Index of the next free cell.
     next_cell: u32,
 }
@@ -148,7 +183,7 @@ impl GlyphAtlas {
             width,
             height,
             rgba,
-            slots: HashMap::new(),
+            slots: GlyphMap::default(),
             next_cell: 0,
         }
     }

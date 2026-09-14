@@ -158,10 +158,14 @@ struct DecoderSetup {
 
 /// Probe the container and build the decoder. Shared by the whole-file
 /// decode, [`probe_audio`] and [`StreamDecoder`].
-fn open_setup(bytes: &[u8], name: &str) -> Result<DecoderSetup, DecodeError> {
+fn open_setup(bytes: &Arc<[u8]>, name: &str) -> Result<DecoderSetup, DecodeError> {
     // Probe the container. The extension hint only nudges the probe; the
     // bytes themselves decide the format.
-    let mss = MediaSourceStream::new(Box::new(Cursor::new(bytes.to_vec())), Default::default());
+    //
+    // `bytes` is an `Arc<[u8]>` so the reader can share the caller's buffer
+    // by refcount instead of cloning the whole compressed entry (a BGM can be
+    // several MB, and `StreamDecoder` re-opens on every seek/loop wrap).
+    let mss = MediaSourceStream::new(Box::new(Cursor::new(Arc::clone(bytes))), Default::default());
     let mut hint = Hint::new();
     if let Some(ext) = name.rsplit('.').next()
         && !ext.is_empty()
@@ -228,6 +232,12 @@ fn open_setup(bytes: &[u8], name: &str) -> Result<DecoderSetup, DecodeError> {
 /// whole compressed entry (small) and inspects its headers, so the caller
 /// can answer `getBufferInfo()`/duration queries immediately.
 pub fn probe_audio(bytes: &[u8], name: &str) -> Result<AudioMetadata, DecodeError> {
+    probe_audio_arc(&Arc::from(bytes), name)
+}
+
+/// [`probe_audio`] over an already-`Arc`ed buffer (the async/streaming open
+/// path uses this to avoid re-copying multi-MB entries).
+pub(crate) fn probe_audio_arc(bytes: &Arc<[u8]>, name: &str) -> Result<AudioMetadata, DecodeError> {
     open_setup(bytes, name).map(|s| s.metadata)
 }
 
@@ -253,6 +263,13 @@ pub fn decode_audio(
 ///
 /// Public mainly so tests can feed fixtures without a mounted storage.
 pub fn decode_audio_bytes(bytes: &[u8], name: &str) -> Result<DecodedAudio, DecodeError> {
+    decode_audio_arc(&Arc::from(bytes), name)
+}
+
+/// [`decode_audio_bytes`] over an already-`Arc`ed buffer (used by the
+/// whole-file background decoder so the compressed bytes are not copied a
+/// second time).
+pub(crate) fn decode_audio_arc(bytes: &Arc<[u8]>, name: &str) -> Result<DecodedAudio, DecodeError> {
     let setup = match open_setup(bytes, name) {
         Ok(s) => s,
         Err(e) => {
@@ -356,6 +373,13 @@ impl StreamDecoder {
     /// Open `bytes` as a streaming decoder. `name` is used for the format
     /// hint and error messages.
     pub fn open(bytes: &[u8], name: &str) -> Result<Self, DecodeError> {
+        Self::open_arc(&Arc::from(bytes), name)
+    }
+
+    /// [`StreamDecoder::open`] over an already-`Arc`ed buffer (the streaming
+    /// worker re-opens on every seek/loop wrap, so sharing the bytes by
+    /// refcount avoids repeatedly copying the whole entry).
+    pub(crate) fn open_arc(bytes: &Arc<[u8]>, name: &str) -> Result<Self, DecodeError> {
         Ok(StreamDecoder {
             setup: open_setup(bytes, name)?,
             name: name.to_string(),
