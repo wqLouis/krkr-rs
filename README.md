@@ -112,4 +112,8 @@ Android: see [`android/README.md`](android/README.md).
 
 ## License
 
-MIT OR Apache-2.0, at your option.
+**GPL-3.0** — see [LICENSE](LICENSE).
+
+The vendored TJS2 virtual machine keeps its own upstream notice
+(`crates/tjs2-sys/cpp/tjs2/LICENSE.krkr2`, the KiriKiri BSD-style license), as
+that license requires; the GPL above covers krkr-rs's own code.

@@ -99,4 +99,8 @@ Android 构建请见 [`android/README.md`](android/README.md)。
 
 ## 许可证
 
-MIT 或 Apache-2.0，任选其一。
+**GPL-3.0** —— 见 [LICENSE](LICENSE)。
+
+仓库中内置的 TJS2 虚拟机保留其上游许可证
+（`crates/tjs2-sys/cpp/tjs2/LICENSE.krkr2`，即 KiriKiri 的 BSD 风格声明），
+这是该许可证本身的要求；上面的 GPL 适用于 krkr-rs 自己的代码。

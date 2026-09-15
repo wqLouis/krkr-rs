@@ -6,7 +6,7 @@ default-members = ["crates/render", "crates/app"]
 [workspace.package]
 version = "1.0.0"
 edition = "2024"
-license = "MIT OR Apache-2.0"
+license = "GPL-3.0-only"
 
 [workspace.dependencies]
 xp3 = { path = "crates/xp3" }
