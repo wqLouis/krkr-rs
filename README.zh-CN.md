@@ -15,92 +15,34 @@
 
 ---
 
-krkr-rs 可以直接运行**未经修改的真实 KiriKiri 游戏** —— 游戏自带的 `.xp3`
-封包、`.tjs` 脚本和 `.ks` 剧本原封不动。指向游戏目录即可开玩：
+**krkr-rs** 是一个使用 Rust 原生重写的 KiriKiri2 (TVP) 引擎，旨在 Linux 和 Android 平台上运行基于 KiriKiri2 开发的游戏。
+
+通过将原有的 C++/OpenGL/Cocos2d-x 架构替换为 **Bevy** 和 **Vulkan**，它在保持引擎高度兼容性的同时，为 Linux 和 Android 带来了现代化的渲染支持。
+
+* **原生 TJS2 虚拟机：** 直接保留上游 C++ TJS2 虚拟机并通过 Rust FFI 进行调用，确保未经修改的游戏脚本和存档能够无缝运行。
+* **Rust 核心实现：** 原生重写了归档解包、TLG5/TLG6 图像解码、自定义混合模式、字体栅格化、Ogg/Opus 音频处理以及 KAG 剧本标签解析。
+* **视频播放：** Linux 桌面端使用 FFmpeg，Android 端则接入原生 `MediaCodec`。
+* **Android 前端：** 包含一个基于 Kotlin / Material 3 的原生启动器，支持系统文件选择器，针对 `arm64-v8a` 架构构建。
+
+**快速开始**
 
 ```bash
-./target/debug/krkr-rs run "/path/to/game"
-```
-
-菜单 → 标题 → 剧本 → 对话 → 存档 → 影片，跑的都是真实游戏。游戏文件不会被修改、
-转换或重新打包。
-
-## 突破点
-
-**整个引擎是被重写的，而不是套壳。**
-
-这是一个**移植项目**，而不是凭空造轮子。原版 KiriKiri2/TVP 的 C++ 源码 ——
-[krkr2](https://github.com/2468785842/krkr2) —— 是本项目所有原生语义、文件格式与
-边界行为的参考：这些行为都是从源码中读出来并如实复现的，而不是靠猜测或自我发挥。
-krkr-rs 带来的，是在这套行为之上换了一个应用外壳：原版的 Android 平台层建立在
-**Cocos2d-x** 之上，而 krkr-rs 用 **Rust + Bevy** 替换了整套技术栈，并通过
-**Vulkan** 渲染（经由 Bevy/wgpu，因此也顺带支持 Metal、DirectX 12 与 GLES；
-同一套代码还能编译成 Android 应用）。
-
-除脚本语言本身之外，几乎所有部分都是 Rust 的原生重写 —— 每一处都对照参考实现逐项
-移植：
-
-- **封包与存储** —— 真实读取 `.xp3`，支持链式索引，实现 `Storages` /
-  `Scripts` 接口，以及游戏依赖的大小写不敏感语义。
-- **图形** —— 支持 KiriKiri 自有的 **TLG5/TLG6** 格式，以及 PNG/JPEG/WebP/BMP/GIF
-  等多种格式；完整的 `Layer` 合成模型、引擎全部混合模式、仿射图层、转场与截屏。
-- **文字** —— `.tft` 预渲染字体与真正的字体光栅化，并保持排版所依赖的基线与测量
-  行为。
-- **音频** —— Ogg Vorbis 与 Opus、`.sli` 循环、`WaveSoundBuffer` /
-  `SoundChannel`，通过平台音频栈混音与推流。
-- **影片** —— MP4/H.264/AAC：桌面端走 FFmpeg，Android 端走 **MediaCodec**。
-- **KAG 剧本语言** —— 解析器与标签、存档读档、游戏内的存读档与设置界面。
-- **输入、窗口，以及游戏会调用到的 Win32 风格接口** —— 其中包括大量通过与原版
-  逐项比对找出的原生成员，并由工具自动进行接口一致性校验。
-
-有一个刻意的例外：**TJS2 虚拟机仍然是原版 C++ 实现** —— 内置在仓库中，仅做极少
-量修补，通过一层很薄的 Rust FFI 调用。在这里，语言与脚本层面的兼容性比"用 Rust
-重写虚拟机"更重要，也正是它让未经修改的游戏能够运行。
-
-而且它并非只支持桌面：仓库中已经包含 **Android 前端** —— 一个原生 **Material 3**
-启动器，通过系统文件选择器挑选游戏目录，然后交给同一套引擎运行；使用 NDK 针对
-`arm64-v8a` 构建。
-
-## 特别鸣谢
-
-没有 **[krkr2](https://github.com/2468785842/krkr2)**（作者
-[@2468785842](https://github.com/2468785842)）就不会有 krkr-rs —— 它的
-KiriKiri2/TVP 源码是本次移植的参考实现。
-
-能够直接阅读原版实现，是"忠实重写"得以成立的前提：原生语义、文件格式与各种边界
-情况都是从它移植而来，而不是靠猜测；它的行为也正是本项目用来衡量自己的标准。
-在此向作者，以及所有让 KiriKiri 得以延续的人致以诚挚谢意。
-
-## 构建与运行
-
-```bash
+# 编译项目
 cargo build
 
-# 带窗口运行
+# 运行游戏
 ./target/debug/krkr-rs run "/path/to/game"
 
-# 无头冒烟测试（不需要窗口或 GPU，只输出一次场景信息）
+# 无头模式（Headless）冒烟测试
 ./target/debug/krkr-rs run "/path/to/game" --headless
+
 ```
 
-影片播放依赖系统的 FFmpeg 库；在无法提供 FFmpeg 的系统上可以关闭它
-（`cargo build --no-default-features`），其余功能两种配置下都能构建。
+**文档与开源许可**
 
-Android 构建请见 [`android/README.md`](android/README.md)。
+* **`docs/`** — 涵盖渲染、字体、Android NDK 构建（`docs/android.md`）及 API 对齐校验（`docs/native_parity.md`）的设计文档。
+* **开源许可：** GPL-3.0（嵌入的 TJS2 VM 保持其上游 BSD 风格许可）。
 
-## 文档
+---
 
-- [`docs/`](docs) —— 设计与调研笔记（可移植性、字体、渲染、接口一致性）。
-- [`docs/android.md`](docs/android.md) —— Android 移植：架构、决策、里程碑与待定
-  问题。
-- [`docs/native_parity.md`](docs/native_parity.md) —— 如何用工具自动校验引擎的
-  原生接口与原版一致。
-- [`TODO.md`](TODO.md) —— 已完成、接下来要做的，以及完整的调研记录。
-
-## 许可证
-
-**GPL-3.0** —— 见 [LICENSE](LICENSE)。
-
-仓库中内置的 TJS2 虚拟机保留其上游许可证
-（`crates/tjs2-sys/cpp/tjs2/LICENSE.krkr2`，即 KiriKiri 的 BSD 风格声明），
-这是该许可证本身的要求；上面的 GPL 适用于 krkr-rs 自己的代码。
+> **又及：** 目前完全没有支持 macOS 和 iOS 的计划，单纯是因为我手头既没有 Mac 也没有 iPhone，没办法进行开发和测试。（对苹果用户们说声抱歉了！）

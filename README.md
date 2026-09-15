@@ -5,7 +5,7 @@
 <h1 align="center">krkr-rs</h1>
 
 <p align="center">
-  <b>The KiriKiri2 (TVP) visual-novel engine, reimplemented in Rust + Bevy — ported
+  <b>A Rust KiriKiri2 Emulator
   from the <a href="https://github.com/2468785842/krkr2">krkr2</a> reference sources.</b>
 </p>
 
@@ -15,105 +15,34 @@
 
 ---
 
-krkr-rs plays **real, unmodified KiriKiri games** — the same `.xp3` archives,
-`.tjs` scripts and `.ks` scenarios they ship with, untouched. Point it at a game
-folder and it runs:
+**krkr-rs** is a native Rust reimplementation of the KiriKiri2 (TVP) engine, built to run games based on KiriKiri2 on Linux and Android.
+
+By replacing the original C++/OpenGL/Cocos2dx framework with **Bevy** and **Vulkan**, it brings a modern rendering pipeline to Linux and Android while preserving engine compatibility.
+
+* **Original TJS2 VM:** Uses the upstream C++ TJS2 virtual machine via a thin Rust FFI wrapper to ensure unmodified scripts and save files work seamlessly.
+* **Rust Core:** Reimplementations for archive handling, TLG5/TLG6 image decoding, custom blend modes, font rasterization, Ogg/Opus audio, and KAG scenario tags.
+* **Video Playback:** Handled via FFmpeg on desktop Linux and native `MediaCodec` on Android.
+* **Android Frontend:** Includes a native Kotlin/Material 3 launcher using the system file picker (`arm64-v8a`).
+
+**Quick Start**
 
 ```bash
-./target/debug/krkr-rs run "/path/to/game"
-```
-
-Menu → title → scenario → dialogue → saves → video, on real games. No game files
-are modified, converted, or repacked.
-
-## The breakthrough
-
-**The engine was rebuilt, not wrapped.**
-
-This is a **port**, not a clean-room project. The original KiriKiri2/TVP C++
-sources — [krkr2](https://github.com/2468785842/krkr2) — are the reference for
-every native semantic, file format and edge case here: behaviour was read out of
-them and reproduced, not guessed or reinvented. What krkr-rs brings is a
-different application around that behaviour: the original's Android platform
-layer is built on **Cocos2d-x**, and krkr-rs replaces that whole stack with
-**Rust + Bevy**, rendering through **Vulkan** (via Bevy/wgpu — which also brings
-Metal, DirectX 12 and GLES along for free, and, with the same codebase, an
-Android app).
-
-Almost everything above the scripting language is a native Rust reimplementation
-— each piece ported against its counterpart in the reference sources:
-
-- **Archives and storage** — real `.xp3` reading, chained indexes, the
-  `Storages` / `Scripts` APIs, and the case-insensitive semantics the games rely
-  on.
-- **Graphics** — KiriKiri's own **TLG5/TLG6** formats plus PNG/JPEG/WebP/BMP/GIF
-  and more, the full `Layer` compositing model, every one of the engine's blend
-  modes, affine layers, transitions and screen capture.
-- **Text** — the `.tft` pre-rendered fonts and real font rasterization, with the
-  baseline and measurement behaviour the layout code depends on.
-- **Audio** — Ogg Vorbis and Opus, `.sli` looping, `WaveSoundBuffer` /
-  `SoundChannel`, mixed and streamed through the platform's audio stack.
-- **Video** — MP4/H.264/AAC: FFmpeg on desktop, **MediaCodec** on Android.
-- **The KAG scenario language** — parser and tags, saves and loads, the in-game
-  save/load and configuration screens.
-- **Input, windows and the Win32-flavoured API surface** that the games call
-  into, including hundreds of native members discovered by diffing against the
-  original and machine-checked for parity.
-
-One deliberate exception: the **TJS2 virtual machine is the original C++ one** —
-vendored, minimally patched, and driven through a thin Rust FFI layer. Language
-and script-level compatibility matters more here than rewriting the VM, and it is
-what lets unmodified games run.
-
-And it is not desktop-only: an **Android frontend** is in the tree — a native
-**Material 3** launcher that picks a game folder through the system file picker
-and hands it to the same engine, built for `arm64-v8a` with the NDK.
-
-## With thanks
-
-krkr-rs would not exist without **[krkr2](https://github.com/2468785842/krkr2)**
-by [@2468785842](https://github.com/2468785842) — the KiriKiri2/TVP sources that
-serve as the reference for this port.
-
-Having the original implementation available to read is what makes a faithful
-rewrite possible: native semantics, file formats and edge cases were ported from
-it rather than guessed, and its behaviour is the standard this project measures
-itself against. Huge thanks to the author and to everyone who has kept KiriKiri
-alive.
-
-## Building and running
-
-```bash
+# Build
 cargo build
 
-# windowed
+# Run a game
 ./target/debug/krkr-rs run "/path/to/game"
 
-# headless smoke test (no window or GPU; dumps the scene once)
+# Headless smoke test
 ./target/debug/krkr-rs run "/path/to/game" --headless
+
 ```
 
-Movie playback uses the system FFmpeg libraries and can be disabled on systems
-that cannot provide them (`cargo build --no-default-features`); everything else
-builds either way.
+**Documentation & License**
 
-Android: see [`android/README.md`](android/README.md).
+* **`docs/`** — Design notes on rendering, fonts, NDK Android builds (`docs/android.md`), and parity verification (`docs/native_parity.md`).
+* **License:** GPL-3.0 (the vendored TJS2 VM retains its upstream BSD-style license).
 
-## Documentation
+---
 
-- [`docs/`](docs) — design notes and investigations (portability, fonts,
-  rendering, parity).
-- [`docs/android.md`](docs/android.md) — the Android port: architecture,
-  decisions, milestones, open questions.
-- [`docs/native_parity.md`](docs/native_parity.md) — how the engine's native
-  surface is machine-checked against the original.
-- [`TODO.md`](TODO.md) — what is done, what is next, and the full investigation
-  log.
-
-## License
-
-**GPL-3.0** — see [LICENSE](LICENSE).
-
-The vendored TJS2 virtual machine keeps its own upstream notice
-(`crates/tjs2-sys/cpp/tjs2/LICENSE.krkr2`, the KiriKiri BSD-style license), as
-that license requires; the GPL above covers krkr-rs's own code.
+> **P.S.** macOS and iOS support aren't planned simply because I don't own a Mac or an iPhone to build and test on. Sorry to the Apple folks!
