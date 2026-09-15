@@ -37,7 +37,7 @@ android {
         // behaviours it can be.
         targetSdk = 37
         versionCode = 1
-        versionName = "0.1.0"
+        versionName = "1.0.0"
 
         ndk {
             // arm64-v8a only, by decision (docs/android.md §1). Adding an ABI
@@ -76,16 +76,37 @@ android {
         }
     }
 
+    // Release signing comes from the **environment**, so CI can sign with a real
+    // key that never enters the repository (a keystore is the app's permanent
+    // identity — committing it would let anyone publish as this package).
+    //
+    // When those variables are absent — a local build, or a CI run without the
+    // secrets configured — release falls back to AGP's debug key below, which
+    // still produces an installable APK. That is deliberate for a sideloaded
+    // experiment: no configuration should be able to produce a *broken* build,
+    // only one signed with a throwaway key.
+    signingConfigs {
+        val storePath = System.getenv("KRKR_KEYSTORE_PATH")
+        val storePass = System.getenv("KRKR_KEYSTORE_PASSWORD")
+        val alias = System.getenv("KRKR_KEY_ALIAS")
+        val keyPass = System.getenv("KRKR_KEY_PASSWORD")
+        if (storePath != null && storePass != null && alias != null && keyPass != null) {
+            create("release") {
+                storeFile = file(storePath.replace("~", System.getProperty("user.home")))
+                storePassword = storePass
+                keyAlias = alias
+                keyPassword = keyPass
+            }
+        }
+    }
+
     buildTypes {
-        // Release, signed with the debug key so the APK is installable. This is
-        // an experimental, side-loaded app (docs/android.md §1): a real release
-        // would need its own signing key, which is deliberately out of scope.
-        //
-        // No minification: the UI is small, and R8 only adds a way for this to
-        // break in a way that is hard to debug.
+        // No minification: the UI is small, and R8 would only add a way for this
+        // to break in a manner that is hard to debug.
         getByName("release") {
             isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.findByName("release")
+                ?: signingConfigs.getByName("debug")
         }
     }
 }

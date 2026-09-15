@@ -81,6 +81,23 @@ jobs:
           # sdkmanager has just populated.
           echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
 
+      # The release signing key, base64-encoded in a secret so the keystore is
+      # never in the repository. Written to $GITHUB_ENV, so it reaches the
+      # Gradle step. Deliberately *not* an `if:` on the secret — the `secrets`
+      # context is not available there — and the absence of the secret is a
+      # normal case that the build handles (it falls back to the debug key).
+      - name: Decode the release keystore (when a secret is configured)
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            printf '%s' "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            echo "KRKR_KEYSTORE_PATH=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+            echo "Signing the release APK with the configured keystore."
+          else
+            echo "No ANDROID_KEYSTORE_BASE64 secret; the release APK will be signed with the debug key."
+          fi
+
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -111,6 +128,14 @@ jobs:
 
       - name: Assemble the release APK
         working-directory: android
+        env:
+          # `KRKR_KEYSTORE_PATH` arrives via $GITHUB_ENV from the decode step
+          # above; the rest come straight from the secrets. When any are absent
+          # the Gradle build falls back to the debug key and still produces an
+          # installable APK — see app/build.gradle.kts.
+          KRKR_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KRKR_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KRKR_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: gradle :app:assembleRelease --no-daemon --stacktrace
 
       - name: Upload the APK
