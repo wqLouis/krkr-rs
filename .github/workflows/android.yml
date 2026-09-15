@@ -1,13 +1,19 @@
 # Android APK build for the experimental Android target (see docs/android.md).
 #
-# Triggers: **a tag whose commit is on the `android` branch** — both, not either.
-# GitHub cannot express "a tag on branch X" directly (tags do not belong to
-# branches), so the workflow triggers on tags and a `gate` job verifies that the
-# tagged commit is an ancestor of `origin/android`. Pushing the branch alone, or
-# tagging a commit that is not on it, does nothing.
+# Triggers: **`android-*` tags**. The tag name carries the branch, so the
+# filter does the whole job natively — no gate job, no ancestry check:
 #
-# `workflow_dispatch` is there for ad-hoc runs; it goes through the same gate, so
-# a manual run from `android` builds and one from anywhere else does not.
+#   * a `v*` tag (an engine release on `main`) does not match, so it cannot
+#     start an Android build;
+#   * an `android-*` tag is only ever created on the `android` branch, which is
+#     the convention this trigger relies on;
+#   * pushing the branch builds nothing — only tagging does.
+#
+# That is "tagged AND android" expressed in one line, where combining
+# `branches:` with `tags:` could only ever express OR.
+#
+# `workflow_dispatch` is retained for ad-hoc runs and is not filtered: it is
+# manual, and whoever triggers it has already decided.
 #
 # Scope: `arm64-v8a` only, release build. No other ABIs, no emulator, no real
 # signing key (the APK is signed with the debug key so it installs — see
@@ -22,9 +28,9 @@ name: Android
 on:
   push:
     tags:
-      # Tagging is deliberate, so a tag anywhere is *considered* — the gate below
-      # then decides whether its commit is actually on the `android` branch.
-      - 'v*'
+      # Only Android tags. `v*` is deliberately absent: those are engine
+      # releases tagged on `main`, and matching them would build an APK for
+      # every one of them.
       - 'android-*'
   workflow_dispatch:
 
@@ -56,37 +62,8 @@ env:
   ZIG_VERSION: '0.16.0'
 
 jobs:
-  # "Tagged AND on the android branch", which GitHub's event filters cannot
-  # express on their own. Deliberately the only job that runs when the condition
-  # fails, so an unrelated tag costs a few seconds and no build minutes.
-  gate:
-    name: Check the ref is on the android branch
-    runs-on: ubuntu-latest
-    outputs:
-      on_android: ${{ steps.check.outputs.on_android }}
-    steps:
-      - name: Check out
-        uses: actions/checkout@v4
-        with:
-          # The ancestry test needs real history, not a shallow clone.
-          fetch-depth: 0
-
-      - name: Check the commit is an ancestor of origin/android
-        id: check
-        run: |
-          git fetch --no-tags origin android
-          if git merge-base --is-ancestor "$GITHUB_SHA" origin/android; then
-            echo "on_android=true" >> "$GITHUB_OUTPUT"
-            echo "$GITHUB_SHA is on the android branch — proceeding."
-          else
-            echo "on_android=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::$GITHUB_REF_NAME is not on the android branch — skipping the build."
-          fi
-
   apk:
     name: Release APK (arm64-v8a)
-    needs: gate
-    if: needs.gate.outputs.on_android == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Check out
