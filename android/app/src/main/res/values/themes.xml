@@ -1,17 +1,32 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Platform themes. The UI is drawn by Compose (Material 3), so these only need
-  to provide a sane window background, no action bar, and an edge-to-edge
-  fullscreen variant for the engine Activity. They intentionally avoid the
-  Material Components XML themes so the app needs no extra dependency.
+  The launcher's UI is drawn by Compose, so `Theme.Krkr` only needs to provide a
+  sane window background; it can stay a platform theme.
+
+  `Theme.Krkr.Fullscreen` **cannot**. It styles `KrkrGameActivity`, which
+  extends the AGDK `GameActivity` — and that derives from `AppCompatActivity`,
+  which refuses to run on anything other than a `Theme.AppCompat` descendant. A
+  platform parent there crashes on launch with
+
+      java.lang.IllegalStateException: You need to use a Theme.AppCompat theme
+      (or descendant) with this activity.
+        at androidx.appcompat.app.AppCompatDelegateImpl.createSubDecor
+        at com.google.androidgamesdk.GameActivity.onCreateSurfaceView
+
+  which is exactly what happened on a real device. Hence the AppCompat parent
+  below, and why `androidx.appcompat` is an explicit dependency even though no
+  code names it.
 -->
 <resources xmlns:tools="http://schemas.android.com/tools">
     <style name="Theme.Krkr" parent="@android:style/Theme.Material.Light.NoActionBar">
         <item name="android:windowBackground">@android:color/background_light</item>
     </style>
 
-    <style name="Theme.Krkr.Fullscreen" parent="@android:style/Theme.Material.NoActionBar.Fullscreen">
+    <!-- Parent MUST be an AppCompat theme; see the note above. -->
+    <style name="Theme.Krkr.Fullscreen" parent="Theme.AppCompat.NoActionBar">
         <item name="android:windowBackground">@android:color/black</item>
+        <item name="android:windowFullscreen">true</item>
+        <item name="android:windowNoTitle">true</item>
         <item name="android:windowLayoutInDisplayCutoutMode" tools:targetApi="o_mr1">shortEdges</item>
     </style>
 </resources>

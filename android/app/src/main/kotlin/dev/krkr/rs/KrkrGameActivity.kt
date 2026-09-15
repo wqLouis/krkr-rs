@@ -1,6 +1,10 @@
 package dev.krkr.rs
 
 import android.os.Bundle
+
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import com.google.androidgamesdk.GameActivity
 
 /**
@@ -79,6 +83,16 @@ class KrkrGameActivity : GameActivity() {
             "KrkrGameActivity.onCreate: game=${pendingGameName ?: "?"} dir=${pendingGameDir ?: "?"} stateDir=${pendingStateDir ?: "?"}",
         )
         super.onCreate(savedInstanceState)
+
+        // Immersive: the surface should be the whole screen. The theme requests
+        // fullscreen, but from targetSdk 35 Android enforces edge-to-edge and
+        // ignores that, so the system bars have to be hidden explicitly.
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        WindowInsetsControllerCompat(window, window.decorView).apply {
+            hide(WindowInsetsCompat.Type.systemBars())
+            systemBarsBehavior =
+                WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        }
     }
 
     override fun onDestroy() {
