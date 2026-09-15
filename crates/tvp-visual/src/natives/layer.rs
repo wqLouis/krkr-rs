@@ -10226,7 +10226,7 @@ mod tests {
             assert!(scene.layer(pid).is_none(), "parent removed");
             assert!(
                 scene.layer(cid).is_some(),
-                "child survives as a window root"
+                "child survives the parent's Part()"
             );
             assert_eq!(scene.layer(cid).unwrap().parent, None);
             assert_eq!(
@@ -10235,7 +10235,13 @@ mod tests {
                 "grandchild stays under the child"
             );
             let win = scene.windows.first().expect("window").id;
-            assert!(scene.window_layer_order(win).contains(&cid));
+            // Detached from the window's roots: not drawn and not hit-tested
+            // (`tTVPLayerManager::RecreateOverallOrderIndex` walks the tree from
+            // the window's `Primary` layer, `LayerManager.cpp:208`).
+            assert!(
+                !scene.window_layer_order(win).contains(&cid),
+                "a Part()ed child is not promoted to a window root"
+            );
         }
         // The script's teardown invalidates the children, breaking their
         // native self-cycle, and drops them.
@@ -11469,12 +11475,15 @@ mod tests {
         );
     }
 
-    /// `invalidate` is the reference teardown the script uses on a scene
-    /// change. It parts the layer (unregistering it) and severs its direct
-    /// children (they become window roots and stay alive); the later script
-    /// drop removes the children's records.
+    /// `invalidate` parts the layer and then each of its direct children
+    /// (reference `tTJSNI_BaseLayer::Invalidate`, `LayerIntf.cpp:535`), where
+    /// `Part()` is exactly `Parent->SeverChild(this); Parent = nullptr;`
+    /// (`LayerIntf.cpp:624`). The manager then invalidates its draw order
+    /// (`NotifyPart`, `LayerManager.cpp:197`), so neither the layer nor its
+    /// detached children are drawn or hit-tested any more. They are detached,
+    /// not destroyed: re-parenting a survivor brings it back.
     #[test]
-    fn invalidate_parts_layer_and_keeps_children() {
+    fn invalidate_detaches_children_and_stops_rendering_them() {
         let env = TestEnv::new("layer-invalidate-part");
         env.run(
             "var w = new Window(); var p = new Layer(w, null); var c = new Layer(w, p); \
@@ -11492,14 +11501,27 @@ mod tests {
         assert_eq!(
             scene.layer(cid).expect("child survives").parent,
             None,
-            "child is part'ed to a window root"
+            "child is Part()ed off its parent"
         );
         let order = scene.window_layer_order(win);
         assert!(!order.contains(&pid), "invalidated layer is not rendered");
-        assert!(order.contains(&cid), "child is still a window root");
+        assert!(
+            !order.contains(&cid),
+            "a Part()ed child is not promoted to a window root"
+        );
+        drop(scene);
+        // Detached, not destroyed: re-parenting the survivor renders it again.
+        env.run("var root = new Layer(w, null); c.parent = root;")
+            .unwrap();
+        let scene = env.scene();
+        let win = scene.windows.first().expect("window").id;
+        assert!(
+            scene.window_layer_order(win).contains(&cid),
+            "re-parenting a Part()ed child brings it back"
+        );
         drop(scene);
         // Dropping the script references collapses the records.
-        env.run("invalidate c; p = null; c = null; w = null;")
+        env.run("invalidate c; invalidate root; p = null; c = null; root = null; w = null;")
             .unwrap();
         assert_eq!(env.scene().layers.len(), 0, "subtree collapses by refcount");
     }

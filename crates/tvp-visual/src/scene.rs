@@ -681,16 +681,25 @@ impl Scene {
         } else if let Some(w) = self.window_mut(win) {
             w.layers.retain(|&x| x != id);
         }
-        // Sever the direct children from this layer; they become roots of
-        // the window and must remain in the scene.
+        // Sever the direct children too — reference `tTJSNI_BaseLayer::Invalidate`
+        // calls `child->Part()` for each of them (`LayerIntf.cpp:535`), and
+        // `Part()` is exactly `Parent->SeverChild(this); Parent = nullptr;`
+        // (`LayerIntf.cpp:624`).
+        //
+        // They must **not** be promoted to window-level layers. The reference
+        // draws precisely the tree reachable from the window's `Primary` layer
+        // (`tTVPLayerManager::RecreateOverallOrderIndex`, `LayerManager.cpp:208`),
+        // and `NotifyPart` invalidates that index — so a parted layer stops
+        // being drawn *and* hit-tested. Registering these children instead made
+        // them fresh top-level window layers, which is what left KAG's config
+        // window with its sliders and buttons stuck on screen after
+        // `invalidate _base[i]`: they were drawn at full opacity, outside the
+        // faded parent, and their scripts then saw `parent == null` and threw
+        // (`SelectItem.tjs` `onButtonLeave`/`onButtonEnter`). A script that
+        // wants such a layer back re-parents it explicitly, which restores it.
         for child in &children {
             if let Some(cl) = self.layer_mut(*child) {
                 cl.parent = None;
-            }
-            if let Some(w) = self.window_mut(win)
-                && !w.layers.contains(child)
-            {
-                w.layers.push(*child);
             }
         }
         self.layers.retain(|l| l.id != id);
@@ -1338,18 +1347,21 @@ impl Scene {
             all_children.entry(layer.parent).or_default().push(layer.id);
         }
 
-        // Root list: the maintained window order first, then any root layer
-        // created by a caller that did not update the window list. This also
-        // makes the contract robust to hand-built test scenes and stale FFI
-        // links.
-        let mut roots = window_state.layers.clone();
-        if let Some(root_children) = all_children.get(&None) {
-            for &id in root_children {
-                if !roots.contains(&id) {
-                    roots.push(id);
-                }
-            }
-        }
+        // Root list: only the layers the window actually owns. A layer whose
+        // parent was severed is deliberately **not** adopted here. The
+        // reference draws exactly the tree reachable from the window's
+        // `Primary` layer (`tTVPLayerManager::RecreateOverallOrderIndex`,
+        // `LayerManager.cpp:208`), and `NotifyPart` invalidates that index, so a
+        // `Part()`ed layer stops being drawn and hit-tested. Adopting every
+        // `parent == None` layer made detached, invalidated subtrees render
+        // again as top-level window layers — KAG's config window kept its
+        // sliders and buttons on screen after leaving the page.
+        let mut roots: Vec<u32> = window_state
+            .layers
+            .iter()
+            .copied()
+            .filter(|id| self.layer(*id).is_some_and(|l| !l.shutdown))
+            .collect();
         let root_order = roots.clone();
         self.sort_siblings(&mut roots, &root_order);
 
@@ -1358,17 +1370,17 @@ impl Scene {
         for id in roots {
             self.append_layer_subtree(window, id, &all_children, &mut order, &mut visited);
         }
-        // A malformed parent link should not hide a layer from rendering.
-        // Valid children omitted from a parent's `children` list are found by
-        // append_layer_subtree; this final pass is for cycles/invalid links.
-        let mut leftovers: Vec<u32> = window_layers
-            .into_iter()
-            .filter(|id| !visited.contains(id))
-            .collect();
-        self.sort_siblings(&mut leftovers, &[]);
-        for id in leftovers {
-            self.append_layer_subtree(window, id, &all_children, &mut order, &mut visited);
-        }
+        // No "leftovers" pass. It used to append every window layer that the
+        // root walk had not visited, on the theory that a malformed parent link
+        // should not hide a layer. But a layer is unvisited precisely when it is
+        // **not reachable from the window's roots** — which is the definition of
+        // a detached layer. Re-adding those made `Part()` a no-op for rendering:
+        // `invalidate` severed a layer's children and this pass put them back on
+        // screen (and back into hit-testing), which is why KAG's config window
+        // kept its sliders and buttons after `invalidate _base[i]`.
+        // A child that is genuinely missing from its parent's `children` list is
+        // still found: `all_children` is indexed by the layer's own `parent`
+        // field and `append_layer_subtree` merges it into the maintained list.
         order
     }
 
@@ -1565,16 +1577,34 @@ mod tests {
         assert_eq!(scene.window_layer_order(win), vec![parent, child]);
     }
 
-    /// A layer with an invalid parent and no root-list entry must still be
-    /// emitted by the final defensive pass (never silently hidden).
+    /// A layer the window does not own is **not** drawn, whatever its parent
+    /// link looks like. The reference renders exactly the tree reachable from
+    /// the window's `Primary` layer (`LayerManager.cpp:208`), so a layer outside
+    /// that tree is invisible and not hit-tested.
+    ///
+    /// This used to be a "defensive" pass that appended every unvisited layer of
+    /// the window, on the theory that a stale parent link should not hide a
+    /// layer. In practice it silently defeated `Part()` and `invalidate`: a
+    /// detached (invalidated) subtree was re-added to the draw order every
+    /// frame, which is what kept KAG's config window on screen after leaving the
+    /// settings page.
     #[test]
-    fn window_layer_order_renders_orphaned_layers_defensively() {
+    fn window_layer_order_skips_layers_the_window_does_not_own() {
         let mut scene = Scene::default();
         let win = scene.add_window("t", (1, 1));
+        let owned = scene.add_layer(win, None);
         let orphan = scene.add_layer(win, None);
-        scene.window_mut(win).unwrap().layers.clear();
+        // The window no longer owns `orphan`, as after a `Part()`.
+        scene
+            .window_mut(win)
+            .unwrap()
+            .layers
+            .retain(|&id| id != orphan);
         scene.layer_mut(orphan).unwrap().parent = Some(9999);
-        assert_eq!(scene.window_layer_order(win), vec![orphan]);
+        assert_eq!(scene.window_layer_order(win), vec![owned]);
+        // But a child of an owned layer is still reached.
+        let child = scene.add_layer(win, Some(owned));
+        assert!(scene.window_layer_order(win).contains(&child));
     }
 
     /// The `*_mut` lookups are index-accelerated but must remain correct once
@@ -1598,11 +1628,16 @@ mod tests {
         assert_eq!(scene.window(win).unwrap().id, win);
     }
 
-    /// `remove_layer` is `Part()`-only: it detaches the layer but keeps its
-    /// direct children alive as window roots (the old implementation deleted
-    /// the whole subtree).
+    /// `remove_layer` is `Part()`: it severs the layer from its parent (or the
+    /// window roots) and severs its direct children from it, but destroys
+    /// nothing. A severed layer stops being **rendered and hit-tested**: the
+    /// reference draws exactly the tree reachable from the window's `Primary`
+    /// layer (`tTVPLayerManager::RecreateOverallOrderIndex`,
+    /// `LayerManager.cpp:208`) and `NotifyPart` invalidates that index. So a
+    /// `Part()`ed child is invisible until something re-parents it — it is not
+    /// promoted to a window-level layer.
     #[test]
-    fn remove_layer_detaches_but_keeps_children() {
+    fn remove_layer_detaches_children_and_stops_rendering_them() {
         let mut scene = Scene::default();
         let win = scene.add_window("t", (1, 1));
         let parent = scene.add_layer(win, None);
@@ -1614,10 +1649,21 @@ mod tests {
         assert!(scene.layer(grandchild).is_some(), "grandchild survives");
         assert_eq!(scene.layer(child).unwrap().parent, None);
         assert_eq!(scene.layer(grandchild).unwrap().parent, Some(child));
-        // The child is now a root of the window and still rendered.
+        // Detached from the window's roots, so neither is drawn any more.
         let order = scene.window_layer_order(win);
-        assert!(order.contains(&child));
-        assert!(order.contains(&grandchild));
+        assert!(
+            !order.contains(&child),
+            "a Part()ed child is not rendered as a window root"
+        );
+        assert!(!order.contains(&grandchild));
+        // Re-parenting it to a window-level layer restores it: the subtree was
+        // detached, not destroyed.
+        let other = scene.add_layer(win, None);
+        scene.layer_mut(child).unwrap().parent = Some(other);
+        scene.layer_mut(other).unwrap().children.push(child);
+        let order = scene.window_layer_order(win);
+        assert!(order.contains(&child), "re-parented layer renders again");
+        assert!(order.contains(&grandchild), "with its subtree intact");
     }
 
     /// `destroy_layer` models the reference `Invalidate` + GC cascade: the
