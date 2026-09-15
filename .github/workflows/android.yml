@@ -1,10 +1,13 @@
 # Android APK build for the experimental Android target (see docs/android.md).
 #
-# Triggers are deliberately narrow: this runs **only** on the dedicated
-# `android` branch and on tags, never on the default branch. The Android port is
-# an experiment, so nothing here should fire while ordinary engine work is going
-# on. Create/ push the `android` branch (or push a tag) to build it; the manual
-# `workflow_dispatch` entry is there for ad-hoc runs.
+# Triggers: **a tag whose commit is on the `android` branch** — both, not either.
+# GitHub cannot express "a tag on branch X" directly (tags do not belong to
+# branches), so the workflow triggers on tags and a `gate` job verifies that the
+# tagged commit is an ancestor of `origin/android`. Pushing the branch alone, or
+# tagging a commit that is not on it, does nothing.
+#
+# `workflow_dispatch` is there for ad-hoc runs; it goes through the same gate, so
+# a manual run from `android` builds and one from anywhere else does not.
 #
 # Scope: `arm64-v8a` only, release build. No other ABIs, no emulator, no real
 # signing key (the APK is signed with the debug key so it installs — see
@@ -18,12 +21,9 @@ name: Android
 
 on:
   push:
-    branches:
-      - android
     tags:
-      # Tagging is deliberate, so a tag anywhere triggers a build. Note that
-      # `v*` therefore fires on the default branch too; tag a release only when
-      # the Android port is in a state worth building.
+      # Tagging is deliberate, so a tag anywhere is *considered* — the gate below
+      # then decides whether its commit is actually on the `android` branch.
       - 'v*'
       - 'android-*'
   workflow_dispatch:
@@ -52,8 +52,37 @@ env:
   GRADLE_VERSION: '9.7.1'
 
 jobs:
+  # "Tagged AND on the android branch", which GitHub's event filters cannot
+  # express on their own. Deliberately the only job that runs when the condition
+  # fails, so an unrelated tag costs a few seconds and no build minutes.
+  gate:
+    name: Check the ref is on the android branch
+    runs-on: ubuntu-latest
+    outputs:
+      on_android: ${{ steps.check.outputs.on_android }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          # The ancestry test needs real history, not a shallow clone.
+          fetch-depth: 0
+
+      - name: Check the commit is an ancestor of origin/android
+        id: check
+        run: |
+          git fetch --no-tags origin android
+          if git merge-base --is-ancestor "$GITHUB_SHA" origin/android; then
+            echo "on_android=true" >> "$GITHUB_OUTPUT"
+            echo "$GITHUB_SHA is on the android branch — proceeding."
+          else
+            echo "on_android=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::$GITHUB_REF_NAME is not on the android branch — skipping the build."
+          fi
+
   apk:
     name: Release APK (arm64-v8a)
+    needs: gate
+    if: needs.gate.outputs.on_android == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Check out
@@ -130,7 +159,7 @@ jobs:
       # form crates/tjs2-sys/build.rs reads and therefore falls back to a host
       # compiler. See the header of the script.
       - name: Build the engine for arm64-v8a
-        run: ./crates/android/build-android.sh --ndk "$ANDROID_NDK_HOME"
+        run: bash ./crates/android/build-android.sh --ndk "$ANDROID_NDK_HOME"
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
