@@ -254,31 +254,56 @@ run on hardware.
 
 ## 7. Packaging and CI
 
-- `cargo ndk -t arm64-v8a build -p krkr-android` produces
-  `libkrkr_android.so`; Gradle copies it into `jniLibs/arm64-v8a/` and
-  assembles the APK. Debug profile only, matching the project's dev-binary
-  rule.
-- `.github/workflows/android.yml` runs **only on the `android` branch and on
-  tags** (`v*`, `android-*`), plus manual `workflow_dispatch` — never on the
-  default branch, so ordinary engine work cannot trigger an Android build
-  (user directive: the port is experimental and should not build yet). Steps:
-  JDK 17 + Android SDK/NDK (**r27c = `27.2.12479018`**), Rust
-  `aarch64-linux-android`, `cargo-ndk` **4.1.2**, Gradle 8.11.1, `bison`; then
-  `cargo ndk -t arm64-v8a -o android/app/src/main/jniLibs build -p krkr-android`
-  and `gradle assembleDebug`, uploading the APK as an artifact. The tool
-  versions are pinned to exactly what was verified locally — the NDK version in
-  particular compiles the vendored C++ VM, so bumping it must be re-verified.
-  There is no Gradle wrapper in the repo yet (the wrapper jar is a binary); CI
-  installs a pinned Gradle instead. Committing a wrapper would be an
-  improvement once the module is stable.
-  The workflow's cargo step needs the `krkr-android` crate (M2) and will fail
-  until it exists — by design, since a run before then would be meaningless.
-- `CXX` points at the NDK's `aarch64-linux-android21-clang++` for
-  `tjs2-sys` (verified working), and `cargo-ndk` wires `CC`/`AR`/linker for
-  the rest (`blake3`, future native deps).
-- The game's own assets are **not** shipped in the APK — the user picks the
-  folder at runtime (§4), which is also the only workable model for
-  copyrighted game data.
+**Verified end to end on this machine.** From a clean tree:
+
+```bash
+ANDROID_NDK_HOME=/path/to/ndk ./crates/android/build-android.sh   # → 71 MB .so
+cd android && gradle :app:assembleRelease                        # → 94 MB APK
+```
+
+That produces `android/app/build/outputs/apk/release/app-release.apk`: 447
+entries, `native-code: 'arm64-v8a'`, `minSdk 35`, `targetSdk 37`, signed (v2
+scheme), carrying a 71 MB engine `.so` and a 13 MB `classes.dex`. The adaptive
+icon is present and correct (`aapt2 dump xmltree` shows the background colour and
+foreground the sources declare).
+
+**Release, not debug.** The workspace's release profile (`lto = "thin"`,
+`strip = "symbols"`, `codegen-units = 1`) is what makes the library packable: the
+debug build was 1.6 GB unstripped (414 MB stripped), release is 71 MB. The build
+script therefore builds release by default; `--debug` exists only for on-device
+debugging.
+
+**What a local build needs** (none of which is in the repo):
+
+- the SDK via `cmdline-tools` → `platforms;android-37.2` + `build-tools;37.0.0`.
+  Note the platform package carries a **minor version** — there is no plain
+  `platforms;android-37`.
+- the NDK **reachable under `<sdk>/ndk/<version>`**, because AGP resolves
+  `ndkVersion` there (to strip the prebuilt `.so`). Locally that is a symlink;
+  `sdkmanager --install "ndk;27.2.12479018"` does it properly in CI.
+- Gradle (9.7.1 was used) and a JDK. There is still no Gradle wrapper in the
+  repo — its jar is a binary — so CI installs a pinned Gradle instead.
+
+**AGP 9 gotchas, all three found by actually building** (see the commit that
+fixed them): the Kotlin plugin `org.jetbrains.kotlin.android` is a *hard error*
+now that AGP has built-in Kotlin support; `kotlinOptions { jvmTarget }` no longer
+resolves for the same reason; and `androidx.appcompat` must be an explicit
+dependency because `GameActivity` derives from `AppCompatActivity`.
+
+**CI.** `.github/workflows/android.yml` runs **only on the `android` branch and
+on tags** (`v*`, `android-*`), plus manual `workflow_dispatch` — never on the
+default branch, so ordinary engine work cannot trigger an Android build. It
+installs JDK 17, the SDK/NDK and `bison`, then calls the same script and runs
+`gradle assembleRelease`, uploading the APK. **It has never been triggered**, so
+the workflow itself is unverified — only the commands inside it are, having been
+run by hand here.
+
+Two deliberate choices worth restating:
+
+- `cargo-ndk` is **not** used (§2 explains why it silently produces host
+  objects), so there is nothing to install for it.
+- The game's own assets are **not** in the APK: the user picks the folder at
+  runtime (§4), which is also the only workable model for copyrighted game data.
 
 ---
 
@@ -287,16 +312,19 @@ run on hardware.
 | # | Milestone | State |
 |---|---|---|
 | M0 | C++ TJS2 VM cross-compiles for `arm64-v8a` | **verified** (19 s, NDK r27c) |
-| M1 | Whole workspace cross-checks with the FFmpeg feature off; `build.rs` made target-aware; `cargo-ndk` wiring for `blake3`/`rodio` | in progress |
-| M2 | Rust `cdylib` + `#[bevy_main] android_game_activity` entry point; engine builds an `App` from `render`; launches with a hard-coded game dir and renders the title scene | not started |
-| M3 | Compose M3 launcher + SAF picker + persisted library; hands the folder to `GameActivity` | not started |
-| M4 | Touch → mouse bridge + on-screen controls; back-button handling | not started |
-| M5 | MediaCodec video backend (replacing FFmpeg on Android) | not started |
-| M6 | CI APK build + artifact upload | not started |
+| M1 | Whole workspace cross-checks with the FFmpeg feature off; `build.rs` made target-aware | **verified** (`build-android.sh --check`) |
+| M2 | Rust `cdylib` + `#[bevy_main]` entry point; engine builds an `App` from `render` | **verified** — links and exports `android_main` |
+| M3 | Compose M3 launcher + SAF picker + persisted library; hands the folder to `GameActivity` | **compiles and packages** (never run on a device) |
+| M4 | Touch → mouse bridge | **implemented and host-tested** (on-screen controls and the back gesture still open) |
+| M5 | MediaCodec video backend (replacing FFmpeg on Android) | **compile-verified and symbol-checked**; never run on a device |
+| M6 | CI APK build + artifact upload | workflow written, never triggered |
 
-M1–M2 are the critical path: a launchable engine with a hard-coded folder proves
-the whole stack before any UI work. M3 is the "frontend" the user asked for and
-can proceed in parallel with M5.
+The whole chain now produces an installable APK from a clean tree — see §7 —
+but **nothing has been run on hardware**. What that leaves genuinely unproven is
+narrow and worth stating plainly: whether the engine starts, decodes and renders
+on a real phone; whether MediaCodec's demux/decode loop works; whether
+`memfd_create` is permitted by a device's seccomp policy; and whether touch
+delivery and coordinate mapping behave as the host tests assume.
 
 ---
 

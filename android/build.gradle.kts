@@ -4,8 +4,12 @@
 // is what supports `compileSdk = 37` in app/build.gradle.kts. They are pinned
 // rather than ranged so a CI run is reproducible; bump them together, and check
 // the AGP release notes for the `compileSdk` each one accepts.
+//
+// Note there is no `org.jetbrains.kotlin.android` plugin: since AGP 9.0 the
+// Android plugin has Kotlin support built in, and applying it is a hard error
+// ("The 'org.jetbrains.kotlin.android' plugin is no longer required for Kotlin
+// support since AGP 9.0"). The Compose compiler plugin is still separate.
 plugins {
     id("com.android.application") version "9.4.0" apply false
-    id("org.jetbrains.kotlin.android") version "2.4.20" apply false
     id("org.jetbrains.kotlin.plugin.compose") version "2.4.20" apply false
 }

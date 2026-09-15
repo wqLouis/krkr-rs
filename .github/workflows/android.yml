@@ -6,12 +6,14 @@
 # on. Create/ push the `android` branch (or push a tag) to build it; the manual
 # `workflow_dispatch` entry is there for ad-hoc runs.
 #
-# Scope: `arm64-v8a` only, debug profile only (matching the project's
-# dev-binary rule). No release signing, no other ABIs, no emulator.
+# Scope: `arm64-v8a` only, release build. No other ABIs, no emulator, no real
+# signing key (the APK is signed with the debug key so it installs — see
+# docs/android.md §1).
 #
-# NOTE: the cargo step needs the Android cdylib crate (milestone M2 in
-# docs/android.md). Until that lands, a run of this workflow will fail at that
-# step — which is the intended signal, not a broken workflow.
+# The commands here mirror a build that was run by hand and verified end to end
+# on a development machine (94 MB APK from a 71 MB engine .so). The workflow
+# itself has never been triggered, so treat the orchestration as unproven while
+the commands inside it are known-good.
 name: Android
 
 on:
@@ -39,11 +41,16 @@ env:
   # compiles the vendored C++ TJS2 VM, so a version bump changes the compiler
   # that builds the VM and must be re-verified.
   NDK_VERSION: '27.2.12479018'
-  GRADLE_VERSION: '8.11.1'
+  # The SDK platform carries a *minor* version — there is no plain
+  # `platforms;android-37`.
+  PLATFORM_VERSION: 'android-37.2'
+  BUILD_TOOLS_VERSION: '37.0.0'
+  # Gradle 9.x, because AGP 9.4 requires it.
+  GRADLE_VERSION: '9.7.1'
 
 jobs:
   apk:
-    name: Debug APK (arm64-v8a)
+    name: Release APK (arm64-v8a)
     runs-on: ubuntu-latest
     steps:
       - name: Check out
@@ -65,10 +72,13 @@ jobs:
       - name: Set up the Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install NDK r27c
+      - name: Install NDK, platform and build-tools
         run: |
           yes | sdkmanager --install "ndk;$NDK_VERSION"
-          # `crates/android/build-android.sh` reads this to locate the toolchain.
+          yes | sdkmanager --install "platforms;$PLATFORM_VERSION" "build-tools;$BUILD_TOOLS_VERSION"
+          # `crates/android/build-android.sh` reads this to locate the toolchain,
+          # and Gradle resolves `ndkVersion` under $ANDROID_SDK_ROOT/ndk, which
+          # sdkmanager has just populated.
           echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
 
       - name: Set up Rust
@@ -99,14 +109,14 @@ jobs:
         with:
           gradle-version: ${{ env.GRADLE_VERSION }}
 
-      - name: Assemble the debug APK
+      - name: Assemble the release APK
         working-directory: android
-        run: gradle assembleDebug --no-daemon --stacktrace
+        run: gradle :app:assembleRelease --no-daemon --stacktrace
 
       - name: Upload the APK
         uses: actions/upload-artifact@v4
         with:
-          name: krkr-rs-debug-arm64-v8a
-          path: android/app/build/outputs/apk/debug/*.apk
+          name: krkr-rs-release-arm64-v8a
+          path: android/app/build/outputs/apk/release/*.apk
           if-no-files-found: error
           retention-days: 14

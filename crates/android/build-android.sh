@@ -22,10 +22,17 @@
 #
 # ## Usage
 #
-#   ./crates/android/build-android.sh [--ndk <path>] [--check]
+#   ./crates/android/build-android.sh [--ndk <path>] [--check] [--debug]
 #
 # `ANDROID_NDK_HOME` is honoured if set; otherwise pass `--ndk`. `--check` runs
 # `cargo check` instead of a full build (much faster, no linking).
+#
+# The build is **release** by default. A debug build of this stack is unusable
+# for packaging — full debug info and no optimisation made the `.so` 1.6 GB —
+# whereas the workspace's release profile (`lto = "thin"`,
+# `strip = "symbols"`, `codegen-units = 1`) produces a library in the tens of
+# megabytes. `--debug` exists only for on-device debugging with a debugger
+# attached.
 set -euo pipefail
 
 # --- configuration ----------------------------------------------------------
@@ -54,16 +61,25 @@ JNI_LIBS="$ROOT/android/app/src/main/jniLibs/$ABI"
 
 NDK="${ANDROID_NDK_HOME:-}"
 MODE="build"
+# Release unless `--debug` is given; see the usage note above for why.
+PROFILE="release"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --ndk) NDK="$2"; shift 2 ;;
         --ndk=*) NDK="${1#--ndk=}"; shift ;;
         --check) MODE="check"; shift ;;
-        -h|--help) sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --debug) PROFILE="debug"; shift ;;
+        -h|--help) sed -n '2,50p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "build-android.sh: unknown argument '$1' (try --help)" >&2; exit 2 ;;
     esac
 done
+
+# cargo's profile flag and the output directory it implies.
+CARGO_PROFILE_ARGS=()
+if [[ "$PROFILE" == "release" ]]; then
+    CARGO_PROFILE_ARGS+=(--release)
+fi
 
 if [[ -z "$NDK" ]]; then
     echo "error: no NDK given." >&2
@@ -101,7 +117,7 @@ for tool in "$CC" "$CXX" "$AR"; do
     fi
 done
 
-echo "krkr-rs android: abi=$ABI target=$RUST_TARGET api=$API_LEVEL"
+echo "krkr-rs android: abi=$ABI target=$RUST_TARGET api=$API_LEVEL profile=$PROFILE"
 echo "krkr-rs android: ndk=$NDK"
 
 # --- build ------------------------------------------------------------------
@@ -112,7 +128,7 @@ echo "krkr-rs android: ndk=$NDK"
 # (docs/android.md §6); until it lands, video returns a clear "no MPEG decoder
 # in this build" error rather than failing to compile.
 cd "$ROOT"
-cargo "$MODE" --target "$RUST_TARGET" -p "$CRATE"
+cargo "$MODE" "${CARGO_PROFILE_ARGS[@]}" --target "$RUST_TARGET" -p "$CRATE"
 
 if [[ "$MODE" == "check" ]]; then
     echo "krkr-rs android: check complete (no .so produced)"
@@ -121,7 +137,7 @@ fi
 
 # --- verify and stage the shared library ------------------------------------
 
-SO="$ROOT/target/$RUST_TARGET/debug/$LIB_NAME"
+SO="$ROOT/target/$RUST_TARGET/$PROFILE/$LIB_NAME"
 if [[ ! -f "$SO" ]]; then
     echo "error: expected the engine at $SO but it is not there" >&2
     exit 1
@@ -140,10 +156,11 @@ case "$ARCH" in
 esac
 
 mkdir -p "$JNI_LIBS"
-# A debug Bevy build carries full debug info: ~1.6 GB with it, ~400 MB without.
-# The device does not need the symbols, and Gradle would copy the larger file
-# into the APK staging area on every build, so strip what gets staged. The
-# artifact in `target/` is left untouched (it is the incremental-build output).
+# The release profile already strips symbols (`strip = "symbols"`), so this is
+# a no-op there; it matters for `--debug`, where full debug info made the
+# library 1.6 GB. Gradle copies whatever is staged into the APK, so stage the
+# small one. The `target/` artifact is left untouched (it is the
+# incremental-build output).
 STRIP="$BIN/llvm-strip"
 if [[ "$MODE" == "build" && "${KEEP_DEBUG_SYMBOLS:-0}" != "1" && -x "$STRIP" ]]; then
     cp "$SO" "$JNI_LIBS/$LIB_NAME"

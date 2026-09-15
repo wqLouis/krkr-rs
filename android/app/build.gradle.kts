@@ -9,7 +9,6 @@
 
 plugins {
     id("com.android.application")
-    id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
@@ -20,6 +19,11 @@ android {
     namespace = "dev.krkr.rs"
     // Latest available platform, and the level the Kotlin/Java side compiles
     // against. `compileSdk` lives here, not in `defaultConfig`.
+    //
+    // Note the SDK names its platform packages with a minor version
+    // (`platforms;android-37.2`) — if AGP cannot resolve `37` on its own,
+    // `compileSdkMinor` picks the QPR, and the package must be installed from
+    // that same line (see .github/workflows/android.yml).
     compileSdk = 37
 
     defaultConfig {
@@ -48,14 +52,20 @@ android {
         compose = true
     }
 
+    // AGP strips the prebuilt `.so` when packaging, which needs an NDK; the
+    // build script and Gradle must agree on the revision. In CI the NDK is
+    // installed into the SDK by sdkmanager, locally it is symlinked there.
+    ndkVersion = "27.2.12479018"
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    kotlinOptions {
-        jvmTarget = "17"
-    }
+    // No `kotlinOptions { jvmTarget = … }`: AGP 9's built-in Kotlin support
+    // removed that DSL (`Unresolved reference 'kotlinOptions'`) and derives the
+    // Kotlin `jvmTarget` from `compileOptions` above, which is what keeps the
+    // two in step anyway.
 
     // The Rust build produces the `.so`; Gradle must not try to build native
     // code itself. `build-android.sh` stages the library into jniLibs, so there
@@ -67,10 +77,15 @@ android {
     }
 
     buildTypes {
-        // Debug only, matching the project's dev-binary rule. A release build
-        // would also need signing config, which is deliberately out of scope.
-        getByName("debug") {
+        // Release, signed with the debug key so the APK is installable. This is
+        // an experimental, side-loaded app (docs/android.md §1): a real release
+        // would need its own signing key, which is deliberately out of scope.
+        //
+        // No minification: the UI is small, and R8 only adds a way for this to
+        // break in a way that is hard to debug.
+        getByName("release") {
             isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
 }
@@ -82,6 +97,13 @@ dependencies {
     implementation("androidx.core:core-ktx:1.19.0")
     implementation("androidx.activity:activity-compose:1.13.0")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.11.0")
+
+    // `androidx.games:games-activity`'s GameActivity derives from
+    // AppCompatActivity, so appcompat has to be on the compile classpath even
+    // though we never reference it directly — without it the Kotlin compiler
+    // fails with "Cannot access 'androidx.appcompat.app.AppCompatActivity' which
+    // is a supertype of 'dev.krkr.rs.KrkrGameActivity'".
+    implementation("androidx.appcompat:appcompat:1.8.0")
 
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-graphics")
