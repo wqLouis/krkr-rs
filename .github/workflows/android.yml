@@ -13,7 +13,7 @@
 # The commands here mirror a build that was run by hand and verified end to end
 # on a development machine (94 MB APK from a 71 MB engine .so). The workflow
 # itself has never been triggered, so treat the orchestration as unproven while
-the commands inside it are known-good.
+# the commands inside it are known-good.
 name: Android
 
 on:
