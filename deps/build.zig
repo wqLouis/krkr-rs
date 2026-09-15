@@ -21,6 +21,18 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Cross-compiling: build.rs supplies the C compiler for the target, so it
+    // compiles oniguruma itself. In that case this build only fetches the
+    // dependencies and stages the header-only ones (fmt/spdlog/boost) plus
+    // oniguruma.h; skip building libonig.a here (zig cannot provide a libc for
+    // every cross target, e.g. Android). The default (flag absent) is
+    // unchanged.
+    const skip_onig = b.option(
+        bool,
+        "skip-onig",
+        "Only stage dependency headers; do not build libonig.a",
+    ) orelse false;
+
     // ---- headers ---------------------------------------------------------
     const fmt = b.dependency("fmt", .{});
     b.installDirectory(.{
@@ -47,6 +59,8 @@ pub fn build(b: *std.Build) void {
     const onig_header =
         b.addInstallFileWithDir(onig.path("src/oniguruma.h"), .header, "oniguruma.h");
     b.getInstallStep().dependOn(&onig_header.step);
+
+    if (skip_onig) return;
 
     // Generate `config.h` from the upstream cmake template with target-aware
     // C type sizes (oniguruma includes it unconditionally).
