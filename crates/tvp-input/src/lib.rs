@@ -569,6 +569,44 @@ impl InputState {
         true
     }
 
+    /// Set a mouse button's held state **without** registering a click.
+    ///
+    /// Used by the touch bridge's drag gesture, which holds the left button
+    /// but is not a click. The `released`/`hold` bookkeeping matches
+    /// [`InputState::set_mouse_button`]; the multi-click sequence is left
+    /// untouched, so the caller should also call
+    /// [`InputState::clear_click_sequence`] to keep the press from inheriting
+    /// an earlier tap's count. Returns false when `button` is out of range.
+    pub fn set_mouse_button_raw(&mut self, button: usize, down: bool) -> bool {
+        if button >= MOUSE_BUTTONS {
+            return false;
+        }
+        let was_down = self.mouse.buttons[button];
+        if down == was_down {
+            return true;
+        }
+        self.mouse.buttons[button] = down;
+        if down {
+            self.mouse.hold[button] = 0;
+        } else {
+            self.mouse.released[button] = true;
+            self.mouse.hold[button] = 0;
+        }
+        true
+    }
+
+    /// Forget the current multi-click sequence for `button`, so a following
+    /// real press starts counting at 1. Used with
+    /// [`InputState::set_mouse_button_raw`] so a non-click press (a touch
+    /// drag) cannot masquerade as the second click of an earlier tap.
+    pub fn clear_click_sequence(&mut self, button: usize) {
+        if button >= MOUSE_BUTTONS {
+            return;
+        }
+        self.mouse.click_count[button] = 0;
+        self.mouse.last_click_frame[button] = u64::MAX;
+    }
+
     /// Set the cursor visibility (`Mouse.isVisible`/`setVisible`).
     pub fn set_mouse_visible(&mut self, visible: bool) {
         self.mouse.visible = visible;
@@ -1121,6 +1159,44 @@ mod tests {
         // Out-of-range buttons return 0 (documented deviation).
         assert_eq!(eval_i(&e, "Mouse.getClickCount(99)"), 0);
         assert_eq!(eval_i(&e, "Mouse.getClickCount(-1)"), 0);
+    }
+
+    /// A raw press (the touch bridge's drag gesture) holds the button but is
+    /// not a click and must not continue an earlier tap's double-click
+    /// sequence.
+    #[test]
+    fn raw_mouse_press_does_not_count_as_a_click() {
+        let mut s = InputState::new();
+
+        // A real click starts a sequence (count 1).
+        s.begin_frame();
+        s.set_mouse_button(MB_LEFT, true);
+        s.end_frame();
+        assert_eq!(s.mouse_click_count(MB_LEFT), 1);
+
+        // Release, then a raw press: held, but count 0 and the sequence reset.
+        s.begin_frame();
+        s.set_mouse_button(MB_LEFT, false);
+        s.end_frame();
+        s.begin_frame();
+        assert!(s.set_mouse_button_raw(MB_LEFT, true));
+        s.clear_click_sequence(MB_LEFT);
+        s.end_frame();
+        assert!(s.is_mouse_button_down(MB_LEFT));
+        assert_eq!(s.mouse_click_count(MB_LEFT), 0);
+
+        // The next real press is a fresh single click, not a double.
+        s.begin_frame();
+        s.set_mouse_button(MB_LEFT, false);
+        s.end_frame();
+        s.begin_frame();
+        s.set_mouse_button(MB_LEFT, true);
+        s.end_frame();
+        assert_eq!(s.mouse_click_count(MB_LEFT), 1);
+
+        // Out-of-range buttons follow `set_mouse_button` (false, no panic).
+        assert!(!s.set_mouse_button_raw(99, true));
+        s.clear_click_sequence(99);
     }
 
     // -- Test 4: unknown key codes are false, not errors --------------------

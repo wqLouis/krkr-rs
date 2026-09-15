@@ -19,8 +19,8 @@
 //!   previous frame's snapshot ([`BridgeState`]), applies the cursor warp to
 //!   the Bevy `Window`, and calls the matching script methods on every
 //!   registered scene window and the layer under the cursor:
-//!   `onMouseDown/Up/Move/Wheel`, `onKeyDown/Up`, `onClick`/`onDoubleClick`
-//!   and `onTouchDown/Up/Move` — exactly the methods `system/window.tjs`'s
+//!   `onMouseDown/Up/Move/Wheel`, `onKeyDown/Up` and
+//!   `onClick`/`onDoubleClick` — exactly the methods `system/window.tjs`'s
 //!   `MainWindow` uses to feed `dispatchInputNotify`.
 //!
 //! Input source mapping:
@@ -34,10 +34,52 @@
 //! * the `shift` argument comes from `tvp_input`'s reference `TVP_SS_*` mask
 //!   (`InputState::shift_flags`), so held modifiers and mouse-button VKs
 //!   resolve identically everywhere;
-//! * touch → `onTouchDown/Up/Move` on the window and captured/hit layer
-//!   (reference `LayerManager.cpp:519-560`).
+//! * touch → the **same** mouse state, through the pure gesture classifier in
+//!   [`crate::touch_gesture`] (see below).
+//!
+//! # Touch input
+//!
+//! KiriKiri games are mouse-and-keyboard driven, so touch is bridged to
+//! mouse, not modelled as a new input source. [`capture_input`] maps Bevy's
+//! `TouchInput` events through the very same window→game transform the cursor
+//! uses, then feeds them to [`crate::touch_gesture::TouchGesture`] and applies
+//! the resulting virtual mouse actions to the shared `tvp_input` state. From
+//! there the ordinary desktop path takes over: layer hit-testing, the games'
+//! `onMouseDown/Up/Move`, `Mouse.getCursorX/Y`, `Mouse.getClickCount` and
+//! `System.getMouseButtonState` all see touch exactly as they see a mouse.
+//!
+//! The classifier's rules and thresholds (all unit-tested on the host): a short
+//! press is a **tap** (left click); a press held past 500 ms without moving
+//! beyond the slop is a **long press** (right click, KAG's menu); movement
+//! beyond 24 game pixels starts a **drag** with the left button held (a drag
+//! press is held but is
+//! *not* a click, so it never fires `onClick`); only the primary pointer is
+//! tracked, so a second finger cannot disturb it; an up without a down is
+//! ignored. A cancelled touch never clicks.
+//!
+//! Two correctness points beyond the classifier itself:
+//!
+//! * **No double-fire.** The games' `system/window.tjs` forwards its
+//!   `onTouchDown/Up/Move` handlers to `onMouseDown/Up/Move`, so dispatching
+//!   both the raw touch methods *and* the synthesized mouse events would fire
+//!   two clicks per tap. The bridge therefore does **not** call the
+//!   `onTouch*` script methods; touch is expressed solely as mouse state. A
+//!   touch device that also emits Bevy mouse events (or a physical mouse used
+//!   mid-touch) is gated off while a touch is in flight.
+//! * **Edge preservation.** `tvp-input` is sampled per frame, so a tap whose
+//!   down and up land in the same Bevy frame would collapse to "no edge". The
+//!   classifier emits an action sequence and [`apply_pending_mouse_actions`]
+//!   drains at most one button transition per frame, keeping every edge visible
+//!   to `collect_frame_events`.
+//!
+//! `Window.getTouchVelocity` is still fed from the raw samples; it is not part
+//! of the mouse bridge.
+//!
+//! Nothing here has been exercised on a touchscreen or an Android device —
+//! only the pure classifier and the action-draining helper have host tests.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashSet, VecDeque};
+use std::time::{Duration, Instant};
 
 use bevy::ecs::message::MessageReader;
 use bevy::input::ButtonInput;
@@ -54,9 +96,20 @@ use tvp_input::{
 };
 use tvp_visual::scene::Scene;
 
-use crate::sync::{SharedScene, WindowRedrawRequested};
-
 use crate::runner::VmRuntime;
+use crate::sync::{SharedScene, WindowRedrawRequested};
+use crate::touch_gesture::{
+    GestureButton, MouseAction, TouchGesture, TouchPhase as GesturePhase, TouchSample,
+};
+
+/// Move the gesture classifier's virtual buttons onto the TVP indices. Kept
+/// here (not in the pure module) so `touch_gesture` stays free of TVP types.
+fn gesture_button_to_tvp(button: GestureButton) -> usize {
+    match button {
+        GestureButton::Left => MB_LEFT,
+        GestureButton::Right => MB_RIGHT,
+    }
+}
 
 /// Fallback game resolution (the title screen's native size) used when the
 /// scene has no window yet.
@@ -111,27 +164,17 @@ pub(crate) struct BridgeState {
     /// that disconnects releases its buttons (the reference pad state is
     /// global across devices, `DInputMgn.cpp:707`).
     pad_held: HashSet<u32>,
-    /// Touch samples captured this frame, in game (primary-layer)
-    /// coordinates. `tvp-input` does not model touch (the reference carries
-    /// it on `Window` events), so the bridge buffers and dispatches them.
-    pending_touches: Vec<TouchEvent>,
-    /// Live touch id → captured layer (reference `SetTouchCapture`,
-    /// `LayerManager.cpp:519`). A touch's `Moved`/`Ended` route to the layer
-    /// that received its `onTouchDown`, even when the finger leaves it.
-    touch_captures: HashMap<u64, u32>,
-}
-
-/// One touch sample captured from Bevy, mapped to game coordinates.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct TouchEvent {
-    /// Bevy touch phase (`Started`/`Moved`/`Ended`/`Canceled`).
-    pub(crate) phase: TouchPhase,
-    /// The platform touch id (the reference `id` argument).
-    pub(crate) id: u64,
-    /// Game-space X (primary-layer coordinates).
-    pub(crate) x: i32,
-    /// Game-space Y (primary-layer coordinates).
-    pub(crate) y: i32,
+    /// The pure touch → mouse gesture classifier ([`crate::touch_gesture`]).
+    gesture: TouchGesture,
+    /// Origin of the gesture clock. Created lazily on the first touch sample;
+    /// the classifier itself takes plain [`Duration`] timestamps, so its tests
+    /// inject their own clock instead of reading `Instant::now()`.
+    gesture_origin: Option<Instant>,
+    /// Virtual mouse actions the classifier produced but the sampled
+    /// `tvp-input` state has not seen yet. [`apply_pending_mouse_actions`]
+    /// drains at most one button transition per frame, so a tap whose down and
+    /// up arrive in a single Bevy frame still yields both edges.
+    pending_mouse_actions: VecDeque<MouseAction>,
 }
 
 /// The input events one frame produced, ready to dispatch to windows.
@@ -217,22 +260,81 @@ pub(crate) fn capture_input(
     let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
     s.begin_frame();
 
+    // Touch → virtual mouse. Bevy touch events are mapped with the *same*
+    // window→game transform as the cursor (above) and classified by the pure
+    // `touch_gesture` state machine; the actions are queued and drained below.
+    // The per-touch velocity tracker that backs `Window.getTouchVelocity` is
+    // fed here too.
+    let mut touch_samples: Vec<TouchSample> = Vec::new();
+    for ev in touch_events.read() {
+        let (x, y) = to_game(ev.position.x, ev.position.y);
+        match ev.phase {
+            TouchPhase::Started | TouchPhase::Moved => {
+                tvp_visual::natives::window::record_touch_movement(
+                    ev.id as u32,
+                    x as f64,
+                    y as f64,
+                );
+            }
+            TouchPhase::Ended | TouchPhase::Canceled => {
+                tvp_visual::natives::window::clear_touch_velocity(ev.id as u32);
+            }
+        }
+        touch_samples.push(TouchSample {
+            id: ev.id,
+            phase: match ev.phase {
+                TouchPhase::Started => GesturePhase::Started,
+                TouchPhase::Moved => GesturePhase::Moved,
+                TouchPhase::Ended => GesturePhase::Ended,
+                TouchPhase::Canceled => GesturePhase::Canceled,
+            },
+            x,
+            y,
+            // Filled with the frame clock below (the classifier is clock
+            // injected; the values are equal for all samples of one frame).
+            time: Duration::ZERO,
+        });
+    }
+    // A touch is "in flight" for this frame if it produced samples or the
+    // classifier is still tracking a finger. While it is, the Bevy mouse path
+    // is gated off: a touch device must never deliver a tap twice (once
+    // synthesized from touch, once from a Bevy mouse event).
+    let touch_active = !touch_samples.is_empty() || bridge.gesture.is_active();
+    let now = match bridge.gesture_origin {
+        Some(origin) => origin.elapsed(),
+        None if touch_active => {
+            bridge.gesture_origin = Some(Instant::now());
+            Duration::ZERO
+        }
+        None => Duration::ZERO,
+    };
+    for sample in &mut touch_samples {
+        sample.time = now;
+    }
+    let actions = bridge.gesture.update(now, &touch_samples);
+    bridge.pending_mouse_actions.extend(actions);
+
     // Cursor position: the last CursorMoved of the frame, clamped to the
-    // game bounds.
-    if let Some(pos) = cursor_moved.read().last() {
-        let (x, y) = to_game(pos.position.x, pos.position.y);
+    // game bounds. Read unconditionally so unread events do not back up.
+    let last_cursor = cursor_moved
+        .read()
+        .last()
+        .map(|pos| to_game(pos.position.x, pos.position.y));
+    if !touch_active && let Some((x, y)) = last_cursor {
         s.set_mouse_pos(x, y);
         // Feed the host pointer tracker that backs `Window.getMouseVelocity`.
         tvp_visual::natives::window::record_mouse_movement(x as f64, y as f64);
     }
 
     // Mouse buttons: press/release edges only (held state persists in the
-    // state across frames).
-    for (bevy_button, tvp_button) in BUTTON_MAP {
-        if mouse_input.just_pressed(bevy_button) {
-            s.set_mouse_button(tvp_button, true);
-        } else if mouse_input.just_released(bevy_button) {
-            s.set_mouse_button(tvp_button, false);
+    // state across frames), gated while a touch is in flight (see above).
+    if !touch_active {
+        for (bevy_button, tvp_button) in BUTTON_MAP {
+            if mouse_input.just_pressed(bevy_button) {
+                s.set_mouse_button(tvp_button, true);
+            } else if mouse_input.just_released(bevy_button) {
+                s.set_mouse_button(tvp_button, false);
+            }
         }
     }
 
@@ -281,35 +383,44 @@ pub(crate) fn capture_input(
         s.add_wheel(wheel.0, wheel.1, wheel.2);
     }
 
-    // Touch: `tvp-input` does not model touch, so buffer this frame's samples
-    // in game coordinates for `dispatch_input` (the reference carries touch on
-    // `Window` events, `WindowIntf.cpp:1052-1143`).
-    bridge.pending_touches.clear();
-    for ev in touch_events.read() {
-        let (x, y) = to_game(ev.position.x, ev.position.y);
-        // Feed the per-touch velocity tracker that backs
-        // `Window.getTouchVelocity`; a lifted/cancelled touch forgets it.
-        match ev.phase {
-            TouchPhase::Started | TouchPhase::Moved => {
-                tvp_visual::natives::window::record_touch_movement(
-                    ev.id as u32,
-                    x as f64,
-                    y as f64,
-                );
-            }
-            TouchPhase::Ended | TouchPhase::Canceled => {
-                tvp_visual::natives::window::clear_touch_velocity(ev.id as u32);
-            }
-        }
-        bridge.pending_touches.push(TouchEvent {
-            phase: ev.phase,
-            id: ev.id,
-            x,
-            y,
-        });
-    }
+    // Apply the virtual mouse actions the classifier produced, including a
+    // deferred transition from an earlier frame, one button change per frame
+    // (see `apply_pending_mouse_actions`).
+    apply_pending_mouse_actions(&mut s, &mut bridge.pending_mouse_actions);
 
     s.end_frame();
+}
+
+/// Apply queued touch → mouse actions to the shared state.
+///
+/// The `tvp-input` frame protocol is sampled, and [`collect_frame_events`]
+/// recovers button edges by diffing consecutive frames. Applying a tap's press
+/// and release in the *same* frame would therefore collapse them into "no
+/// edge" and drop the click. So this drains the queue up to and including the
+/// first button transition and stops; moves that follow the transition stay
+/// queued for the next frame, where they are applied before the release.
+///
+/// Pure with respect to Bevy (it only writes [`InputState`]); the unit tests
+/// drive it directly.
+pub(crate) fn apply_pending_mouse_actions(
+    state: &mut InputState,
+    queue: &mut VecDeque<MouseAction>,
+) {
+    while let Some(action) = queue.pop_front() {
+        match action {
+            MouseAction::MoveTo { x, y } => state.set_mouse_pos(x, y),
+            MouseAction::Button { button, down } => {
+                state.set_mouse_button(gesture_button_to_tvp(button), down);
+                break;
+            }
+            MouseAction::PressWithoutClick { button } => {
+                let tvp = gesture_button_to_tvp(button);
+                state.set_mouse_button_raw(tvp, true);
+                state.clear_click_sequence(tvp);
+                break;
+            }
+        }
+    }
 }
 
 /// The game resolution to map cursor positions into: the first scene
@@ -608,8 +719,7 @@ pub(crate) fn dispatch_input(
         apply_mouse_warp(&mut windows, &shared, game);
     }
 
-    let touches = std::mem::take(&mut bridge.pending_touches);
-    if events.is_empty() && touches.is_empty() {
+    if events.is_empty() {
         return;
     }
     // `System.eventDisabled` is set by both games right before
@@ -621,14 +731,13 @@ pub(crate) fn dispatch_input(
     }
     if std::env::var_os("KRKR_INPUT_TRACE").is_some() {
         eprintln!(
-            "[input] down={:?} up={:?} moved={:?} pos={:?} wheel={:?} clicks={:?} touches={}",
+            "[input] down={:?} up={:?} moved={:?} pos={:?} wheel={:?} clicks={:?}",
             events.button_down,
             events.button_up,
             events.moved,
             events.position,
             events.wheel,
             events.click_counts,
-            touches.len(),
         );
     }
     // Plan the dispatch under the scene read lock (pure: hit-testing and
@@ -637,7 +746,7 @@ pub(crate) fn dispatch_input(
     // reads the scene again, and `sync_scene` may already be queued for the
     // write lock, so the re-entrant read blocks on the writer and the writer
     // blocks on our read.
-    let (window_ids, layer_calls, touch_calls) = {
+    let (window_ids, layer_calls) = {
         let scene = shared.0.read().expect("shared scene lock poisoned");
         let window_ids: Vec<u32> = scene
             .windows
@@ -645,21 +754,16 @@ pub(crate) fn dispatch_input(
             .filter(|w| w.visible)
             .map(|w| w.id)
             .collect();
-        (
-            window_ids,
-            plan_layer_calls(&scene, &events, &mut bridge),
-            plan_touch_calls(&scene, &touches, &mut bridge),
-        )
+        (window_ids, plan_layer_calls(&scene, &events, &mut bridge))
     };
 
     let engine = vm.engine.as_ref();
     // The reference `tTJSNI_BaseWindow::OnMouseDown` first posts the event to
     // the Window object, then forwards it to the draw device, which routes it
-    // to the layer under the cursor. Mirror both, for mouse and touch.
+    // to the layer under the cursor. Mirror both. Touch reaches this point as
+    // the same mouse edges, so there is no separate touch dispatch.
     dispatch_to_windows(engine, &window_ids, &events);
-    dispatch_touches_to_windows(engine, &window_ids, &touches);
     execute_layer_calls(engine, &layer_calls, &mut bridge);
-    execute_layer_calls(engine, &touch_calls, &mut bridge);
 }
 
 /// One planned script call to a layer: resolved and invoked after the scene
@@ -760,7 +864,9 @@ fn plan_layer_calls(
             // default / `WM_LBUTTON*`); `onClick` takes no button argument.
             // Count ≥2 fires `onDoubleClick` instead of a second `onClick`,
             // matching the Windows `WM_LBUTTONDBLCLK` sequence.
-            if b == MB_LEFT {
+            // A drag press is a `Button` with `click_counts == 0`, so it
+            // reaches `onMouseDown` but never `onClick`/`onDoubleClick`.
+            if b == MB_LEFT && events.click_counts[b] >= 1 {
                 let method = if events.click_counts[b] >= 2 {
                     "onDoubleClick"
                 } else {
@@ -807,64 +913,6 @@ fn plan_layer_calls(
     calls
 }
 
-/// Plan the layer touch dispatch, the reference
-/// `PrimaryTouchDown`/`PrimaryTouchUp`/`PrimaryTouchMove`
-/// (`LayerManager.cpp:519-560`): hit-test on down and capture the layer for
-/// that touch id, then route move/up to the captured layer (so a finger that
-/// slides off still delivers its up to the original layer). Pure: no VM calls.
-fn plan_touch_calls(
-    scene: &Scene,
-    touches: &[TouchEvent],
-    bridge: &mut BridgeState,
-) -> Vec<LayerCall> {
-    let mut calls = Vec::new();
-    let Some(win) = scene.windows.first() else {
-        return calls;
-    };
-    if !win.visible {
-        return calls;
-    }
-    for t in touches {
-        // Drop a capture whose layer disappeared or went dead.
-        if let Some(id) = bridge.touch_captures.get(&t.id).copied()
-            && (scene.layer(id).is_none() || bridge.dead_layers.contains(&id))
-        {
-            bridge.touch_captures.remove(&t.id);
-        }
-        let hit = bridge
-            .touch_captures
-            .get(&t.id)
-            .copied()
-            .or_else(|| hit_test_excluding(scene, win.id, t.x, t.y, &bridge.dead_layers));
-        if let Some(l) = hit {
-            let method = match t.phase {
-                TouchPhase::Started => "onTouchDown",
-                TouchPhase::Moved => "onTouchMove",
-                TouchPhase::Ended | TouchPhase::Canceled => "onTouchUp",
-            };
-            let (lx, ly) = layer_local(scene, l, t.x, t.y);
-            calls.push(LayerCall {
-                layer_id: l,
-                method,
-                args: vec![
-                    TjsValue::Real(lx as f64),
-                    TjsValue::Real(ly as f64),
-                    TjsValue::Real(t.x as f64),
-                    TjsValue::Real(t.y as f64),
-                    TjsValue::Integer(t.id as i64),
-                ],
-            });
-            if matches!(t.phase, TouchPhase::Started) {
-                bridge.touch_captures.insert(t.id, l);
-            }
-        }
-        if matches!(t.phase, TouchPhase::Ended | TouchPhase::Canceled) {
-            bridge.touch_captures.remove(&t.id);
-        }
-    }
-    calls
-}
-
 /// Execute the planned layer calls with no scene lock held.
 ///
 /// A layer whose script object is missing (`does not exist`) is tolerated and
@@ -908,10 +956,7 @@ fn execute_layer_calls(engine: &Tjs2Engine, calls: &[LayerCall], bridge: &mut Br
                 );
             }
         }
-        if std::env::var_os("KRKR_INPUT_TRACE").is_some()
-            && call.method != "onMouseMove"
-            && call.method != "onTouchMove"
-        {
+        if std::env::var_os("KRKR_INPUT_TRACE").is_some() && call.method != "onMouseMove" {
             eprintln!("[input] call layer #{}.{}", call.layer_id, call.method);
         }
     }
@@ -1211,7 +1256,8 @@ pub(crate) fn dispatch_to_windows(engine: &Tjs2Engine, window_ids: &[u32], event
             );
             // The native `Window.OnClick` forwards to the draw device after
             // posting the window `onClick`/`onDoubleClick` (`WindowIntf.cpp:316`).
-            if b == MB_LEFT {
+            // A drag press has `click_counts == 0` and is not a click.
+            if b == MB_LEFT && events.click_counts[b] >= 1 {
                 let method = if events.click_counts[b] >= 2 {
                     "onDoubleClick"
                 } else {
@@ -1276,47 +1322,6 @@ pub(crate) fn dispatch_to_windows(engine: &Tjs2Engine, window_ids: &[u32], event
                 &[
                     TjsValue::Integer(i64::from(k)),
                     TjsValue::Integer(i64::from(events.shift)),
-                ],
-            );
-        }
-    }
-}
-
-/// Call the three touch methods on every scene window that has a script
-/// object, mirroring `Window.OnTouchDown/Up/Move`
-/// (`WindowIntf.cpp:1052-1143`). `x,y` are game coordinates and `cx,cy` are
-/// the same (the window's client area and the game area coincide in this
-/// port); `system/window.tjs` forwards them to its mouse handlers
-/// (`system_window.tjs:324-332`).
-fn dispatch_touches_to_windows(engine: &Tjs2Engine, window_ids: &[u32], touches: &[TouchEvent]) {
-    for &win_id in window_ids {
-        let obj = tvp_visual::natives::window_tjs_object(win_id);
-        if obj.is_null() {
-            continue;
-        }
-        let Ok(dv) = engine.retain_object_detached(obj) else {
-            log::warn!(
-                "input bridge: window #{win_id} object cannot be retained; skipping its touch"
-            );
-            continue;
-        };
-        let id = dv.raw_id();
-        for t in touches {
-            let method = match t.phase {
-                TouchPhase::Started => "onTouchDown",
-                TouchPhase::Moved => "onTouchMove",
-                TouchPhase::Ended | TouchPhase::Canceled => "onTouchUp",
-            };
-            call_guarded(
-                engine,
-                id,
-                method,
-                &[
-                    TjsValue::Real(t.x as f64),
-                    TjsValue::Real(t.y as f64),
-                    TjsValue::Real(t.x as f64),
-                    TjsValue::Real(t.y as f64),
-                    TjsValue::Integer(t.id as i64),
                 ],
             );
         }
@@ -1648,10 +1653,119 @@ mod tests {
         assert_eq!(bridge.capture_layer, None);
     }
 
-    /// Touch down captures the hit layer; a following move/up that leaves the
-    /// layer still routes to it (reference `SetTouchCapture`).
+    /// Queue draining preserves button edges across frames: a tap's press and
+    /// release must never be applied in the same frame, or the sampled
+    /// `collect_frame_events` diff would see no edge at all.
     #[test]
-    fn touch_capture_routes_move_and_up_off_layer() {
+    fn pending_actions_apply_one_button_transition_per_frame() {
+        let mut state = InputState::new();
+        let mut queue = VecDeque::from(vec![
+            MouseAction::MoveTo { x: 10, y: 10 },
+            MouseAction::Button {
+                button: GestureButton::Left,
+                down: true,
+            },
+            MouseAction::MoveTo { x: 20, y: 20 },
+            MouseAction::Button {
+                button: GestureButton::Left,
+                down: false,
+            },
+        ]);
+
+        // Frame 1: the move before the press plus the press itself.
+        apply_pending_mouse_actions(&mut state, &mut queue);
+        assert_eq!((state.mouse.x, state.mouse.y), (10, 10));
+        assert!(state.is_mouse_button_down(MB_LEFT));
+        assert_eq!(queue.len(), 2, "the post-press move+release stay queued");
+
+        // Frame 2: the move then the release.
+        apply_pending_mouse_actions(&mut state, &mut queue);
+        assert_eq!((state.mouse.x, state.mouse.y), (20, 20));
+        assert!(!state.is_mouse_button_down(MB_LEFT));
+        assert!(queue.is_empty());
+    }
+
+    /// A drag press holds the left button but is not a click: it must not
+    /// produce `onClick` and must not extend a preceding tap's double-click
+    /// sequence.
+    #[test]
+    fn drag_press_holds_button_without_clicking() {
+        use tvp_visual::scene::Rect;
+        let mut scene = Scene::default();
+        let win = scene.add_window("t", (200, 200));
+        let layer = scene.add_layer(win, None);
+        {
+            let l = scene.layer_mut(layer).unwrap();
+            l.rect = Rect {
+                x: 0,
+                y: 0,
+                w: 200,
+                h: 200,
+            };
+            l.visible = true;
+            l.hit_threshold = 0;
+        }
+        let mut bridge = BridgeState::default();
+        let mut state = InputState::new();
+
+        // Start a click sequence with a real tap press on the first frame.
+        state.begin_frame();
+        state.set_mouse_button(MB_LEFT, true);
+        state.end_frame();
+        let events = collect_frame_events(&state, &mut bridge);
+        assert_eq!(events.click_counts[MB_LEFT], 1);
+        let calls = plan_layer_calls(&scene, &events, &mut bridge);
+        assert!(calls.iter().any(|c| c.method == "onClick"));
+        // Release.
+        state.begin_frame();
+        state.set_mouse_button(MB_LEFT, false);
+        state.end_frame();
+        let events = collect_frame_events(&state, &mut bridge);
+        let _ = plan_layer_calls(&scene, &events, &mut bridge);
+
+        // A drag press is raw: held, count 0, and no `onClick`.
+        state.begin_frame();
+        bridge
+            .pending_mouse_actions
+            .push_back(MouseAction::PressWithoutClick {
+                button: GestureButton::Left,
+            });
+        apply_pending_mouse_actions(&mut state, &mut bridge.pending_mouse_actions);
+        state.end_frame();
+        let events = collect_frame_events(&state, &mut bridge);
+        assert_eq!(events.button_down, vec![MB_LEFT]);
+        assert_eq!(events.click_counts[MB_LEFT], 0);
+        let calls = plan_layer_calls(&scene, &events, &mut bridge);
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.layer_id == layer && c.method == "onMouseDown")
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.method == "onClick" || c.method == "onDoubleClick"),
+            "a drag press must not click, got {:?}",
+            calls.iter().map(|c| c.method).collect::<Vec<_>>()
+        );
+
+        // The next real tap starts a fresh count of 1, not 2.
+        state.begin_frame();
+        state.set_mouse_button(MB_LEFT, false);
+        state.end_frame();
+        let _ = collect_frame_events(&state, &mut bridge);
+        state.begin_frame();
+        state.set_mouse_button(MB_LEFT, true);
+        state.end_frame();
+        let events = collect_frame_events(&state, &mut bridge);
+        assert_eq!(events.click_counts[MB_LEFT], 1);
+    }
+
+    /// A bridged tap reaches the layer as a normal left `onMouseDown` +
+    /// `onMouseUp` (with no `onTouch*`): the gesture's action queue is drained
+    /// one button transition per frame and the mouse dispatch does the rest.
+    #[test]
+    fn touch_tap_bridges_to_layer_mouse_events() {
         use tvp_visual::scene::Rect;
         let mut scene = Scene::default();
         let win = scene.add_window("t", (200, 200));
@@ -1667,50 +1781,111 @@ mod tests {
             l.visible = true;
             l.hit_threshold = 0;
         }
+
         let mut bridge = BridgeState::default();
+        let mut gesture = TouchGesture::default();
+        let mut state = InputState::new();
+        let down = Duration::ZERO;
 
-        let down = [TouchEvent {
-            phase: TouchPhase::Started,
-            id: 7,
-            x: 10,
-            y: 10,
-        }];
-        let calls = plan_touch_calls(&scene, &down, &mut bridge);
+        // Frame 1: finger down at (10, 10) — only a cursor move so far.
+        state.begin_frame();
+        bridge.pending_mouse_actions.extend(gesture.update(
+            down,
+            &[TouchSample {
+                id: 1,
+                phase: GesturePhase::Started,
+                x: 10,
+                y: 10,
+                time: down,
+            }],
+        ));
+        apply_pending_mouse_actions(&mut state, &mut bridge.pending_mouse_actions);
+        state.end_frame();
+        let events = collect_frame_events(&state, &mut bridge);
+        assert!(events.button_down.is_empty());
+
+        // Frame 2: lift before the long-press timeout — a tap. The press is
+        // applied now, the release is deferred to the next frame.
+        let up = Duration::from_millis(80);
+        state.begin_frame();
+        bridge.pending_mouse_actions.extend(gesture.update(
+            up,
+            &[TouchSample {
+                id: 1,
+                phase: GesturePhase::Ended,
+                x: 12,
+                y: 11,
+                time: up,
+            }],
+        ));
+        apply_pending_mouse_actions(&mut state, &mut bridge.pending_mouse_actions);
+        state.end_frame();
+        let events = collect_frame_events(&state, &mut bridge);
+        assert_eq!(events.button_down, vec![MB_LEFT]);
+        let calls = plan_layer_calls(&scene, &events, &mut bridge);
         assert!(
             calls
                 .iter()
-                .any(|c| c.layer_id == layer && c.method == "onTouchDown")
+                .any(|c| c.layer_id == layer && c.method == "onMouseDown"),
+            "tap must press the layer, got {:?}",
+            calls.iter().map(|c| c.method).collect::<Vec<_>>()
         );
-        assert_eq!(bridge.touch_captures.get(&7), Some(&layer));
+        assert!(
+            calls.iter().any(|c| c.method == "onClick"),
+            "tap must click, got {:?}",
+            calls.iter().map(|c| c.method).collect::<Vec<_>>()
+        );
+        assert_eq!(bridge.capture_layer, Some(layer));
 
-        // A move far outside the layer still reaches the captured layer.
-        let moved = [TouchEvent {
-            phase: TouchPhase::Moved,
-            id: 7,
-            x: 180,
-            y: 180,
-        }];
-        let calls = plan_touch_calls(&scene, &moved, &mut bridge);
+        // Frame 3: the deferred release arrives as an up edge.
+        state.begin_frame();
+        apply_pending_mouse_actions(&mut state, &mut bridge.pending_mouse_actions);
+        state.end_frame();
+        let events = collect_frame_events(&state, &mut bridge);
+        assert_eq!(events.button_up, vec![MB_LEFT]);
+        let calls = plan_layer_calls(&scene, &events, &mut bridge);
         assert!(
             calls
                 .iter()
-                .any(|c| c.layer_id == layer && c.method == "onTouchMove"),
-            "captured layer must receive onTouchMove off-layer"
+                .any(|c| c.layer_id == layer && c.method == "onMouseUp"),
+            "the capture layer must receive the up"
         );
+        assert_eq!(bridge.capture_layer, None);
+        assert!(bridge.pending_mouse_actions.is_empty());
+    }
 
-        let up = [TouchEvent {
-            phase: TouchPhase::Ended,
-            id: 7,
-            x: 180,
-            y: 180,
-        }];
-        let calls = plan_touch_calls(&scene, &up, &mut bridge);
-        assert!(
-            calls
-                .iter()
-                .any(|c| c.layer_id == layer && c.method == "onTouchUp")
+    /// A long press bridges to a right-click, which never fires `onClick`.
+    #[test]
+    fn touch_long_press_bridges_to_right_click() {
+        let mut bridge = BridgeState::default();
+        let mut gesture = TouchGesture::default();
+        let mut state = InputState::new();
+
+        state.begin_frame();
+        let _ = gesture.update(
+            Duration::ZERO,
+            &[TouchSample {
+                id: 1,
+                phase: GesturePhase::Started,
+                x: 5,
+                y: 5,
+                time: Duration::ZERO,
+            }],
         );
-        assert!(!bridge.touch_captures.contains_key(&7), "capture released");
+        state.end_frame();
+        let _ = collect_frame_events(&state, &mut bridge);
+
+        // The long-press deadline passes with no further touch samples.
+        let deadline = Duration::from_millis(500);
+        state.begin_frame();
+        bridge
+            .pending_mouse_actions
+            .extend(gesture.update(deadline, &[]));
+        apply_pending_mouse_actions(&mut state, &mut bridge.pending_mouse_actions);
+        state.end_frame();
+        let events = collect_frame_events(&state, &mut bridge);
+        assert_eq!(events.button_down, vec![MB_RIGHT]);
+        assert_eq!(events.click_counts[MB_LEFT], 0);
     }
 
     /// Layer hit-testing mirrors the reference `GetMostFrontChildAt`:
@@ -1885,10 +2060,6 @@ mod tests {
                     function onDoubleClick(x, y) {
                         global.__log += "dc:" + x + "," + y + ";";
                     }
-                    function onTouchDown(x, y, cx, cy, id) {
-                        global.__log += "td:" + int(x) + "," + int(y) + "," +
-                            int(cx) + "," + int(cy) + "," + id + ";";
-                    }
                     function onKeyDown(key, shift) {
                         global.__log += "k:" + key + "," + shift + ";";
                     }
@@ -1960,22 +2131,6 @@ mod tests {
         };
         // Nothing held on release → shift=0 for the up edges.
         assert_eq!(log, "u:320,240,0,0;ku:13,0;");
-
-        // Touch: `dispatch_touches_to_windows` posts `onTouchDown` with the
-        // game coordinates and the platform id (the `system/window.tjs`
-        // handler forwards them to `onMouseDown`).
-        engine.exec_script("global.__log = '';", "test").unwrap();
-        let touches = [TouchEvent {
-            phase: TouchPhase::Started,
-            id: 3,
-            x: 120,
-            y: 80,
-        }];
-        {
-            let window_ids: Vec<u32> = scene.read().unwrap().windows.iter().map(|w| w.id).collect();
-            dispatch_touches_to_windows(engine.as_ref(), &window_ids, &touches);
-        }
-        assert_eq!(read_log(&engine), "td:120,80,120,80,3;");
     }
 
     /// A layer whose TJS object is invalidated while the layer is still in

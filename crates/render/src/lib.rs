@@ -15,6 +15,7 @@ pub mod input_bridge;
 pub mod menu;
 pub mod runner;
 pub mod sync;
+mod touch_gesture;
 
 pub use blend::{
     LT_ADD_ALPHA, LT_ADDITIVE, LT_ALPHA, LT_BINDER, LT_DARKEN, LT_DODGE, LT_EFFECT, LT_FILTER,
