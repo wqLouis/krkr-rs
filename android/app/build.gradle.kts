@@ -86,10 +86,17 @@ android {
     // experiment: no configuration should be able to produce a *broken* build,
     // only one signed with a throwaway key.
     signingConfigs {
-        val storePath = System.getenv("KRKR_KEYSTORE_PATH")
-        val storePass = System.getenv("KRKR_KEYSTORE_PASSWORD")
-        val alias = System.getenv("KRKR_KEY_ALIAS")
-        val keyPass = System.getenv("KRKR_KEY_PASSWORD")
+        // A blank value counts as unset. GitHub Actions passes an undefined
+        // secret through as an *empty string*, so a plain `!= null` test would
+        // build a "release" config with an empty alias/password whenever one of
+        // the four secrets is missing — and signing would then fail the build.
+        // `takeIf` is inline on purpose: no helper function, so nothing here
+        // depends on the Kotlin DSL receiver scope.
+        val storePath = System.getenv("KRKR_KEYSTORE_PATH")?.takeIf { it.isNotBlank() }
+        val storePass = System.getenv("KRKR_KEYSTORE_PASSWORD")?.takeIf { it.isNotBlank() }
+        val alias = System.getenv("KRKR_KEY_ALIAS")?.takeIf { it.isNotBlank() }
+        val keyPass = System.getenv("KRKR_KEY_PASSWORD")?.takeIf { it.isNotBlank() }
+
         if (storePath != null && storePass != null && alias != null && keyPass != null) {
             create("release") {
                 storeFile = file(storePath.replace("~", System.getProperty("user.home")))
@@ -97,6 +104,16 @@ android {
                 keyAlias = alias
                 keyPassword = keyPass
             }
+        } else if (storePath != null || storePass != null || alias != null || keyPass != null) {
+            // Some but not all four: the release key was clearly intended, so say
+            // so. The build still succeeds with the debug key below, but an APK
+            // signed by that key cannot be upgraded to one signed by the release
+            // key without uninstalling first.
+            logger.warn(
+                "krkr-rs: release signing is only partially configured " +
+                    "(KRKR_KEYSTORE_PATH/PASSWORD/KEY_ALIAS/KEY_PASSWORD); " +
+                    "falling back to the debug key.",
+            )
         }
     }
 

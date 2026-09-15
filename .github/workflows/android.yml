@@ -54,6 +54,14 @@ env:
   # `platforms;android-37`.
   PLATFORM_VERSION: 'android-37.2'
   BUILD_TOOLS_VERSION: '37.0.0'
+  # AGP picks these two for itself: with `compileSdk = 37` and no explicit
+  # minor it resolves `platforms;android-37.0`, and with no `buildToolsVersion`
+  # it uses AGP's own default revision (36.0.0). They were being fetched by
+  # AGP's implicit SDK auto-download — the builds passed, but on a slow or
+  # offline runner that download is a silent dependency, so install them here.
+  # Both ids verified present in Google's repository index.
+  AGP_PLATFORM_VERSION: 'android-37.0'
+  AGP_BUILD_TOOLS_VERSION: '36.0.0'
   # Gradle 9.x, because AGP 9.4 requires it.
   GRADLE_VERSION: '9.7.1'
   # `crates/tjs2-sys/build.rs` runs `zig build` in `deps/` to fetch
@@ -96,7 +104,8 @@ jobs:
           SDKMANAGER="$(command -v sdkmanager || ls -d "$SDK_ROOT"/cmdline-tools/*/bin/sdkmanager | tail -1)"
           echo "using $SDKMANAGER"
           yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --install \
-            "ndk;$NDK_VERSION" "platforms;$PLATFORM_VERSION" "build-tools;$BUILD_TOOLS_VERSION"
+            "ndk;$NDK_VERSION" "platforms;$PLATFORM_VERSION" "build-tools;$BUILD_TOOLS_VERSION" \
+            "platforms;$AGP_PLATFORM_VERSION" "build-tools;$AGP_BUILD_TOOLS_VERSION"
           # `crates/android/build-android.sh` reads this to locate the toolchain,
           # and Gradle resolves `ndkVersion` under $SDK_ROOT/ndk, which
           # sdkmanager has just populated.
