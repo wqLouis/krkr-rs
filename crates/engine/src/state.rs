@@ -123,7 +123,26 @@ pub fn write_state_at(dir: &Path, state: State, message: Option<&str>) -> std::i
     // Same directory as the destination so the rename is atomic; the pid keeps
     // two processes from clobbering each other's temp file.
     let temp = dir.join(format!("{STATE_FILE_NAME}.tmp.{}", std::process::id()));
-    std::fs::write(&temp, json)?;
+    // Write the whole record and flush it to the backing store *before* the
+    // rename. The rename is what makes the replace atomic (a reader sees either
+    // the old file or the whole new one), but without the fsync a power loss
+    // can leave the previous `starting`/`running` visible after we already
+    // reported the new state — which the launcher then reads as a crash. A
+    // failed create/write/sync/rename leaves the previous state intact and
+    // never panics.
+    use std::io::Write as _;
+    let mut file = std::fs::File::create(&temp)?;
+    if let Err(e) = file.write_all(json.as_bytes()) {
+        drop(file);
+        let _ = std::fs::remove_file(&temp);
+        return Err(e);
+    }
+    if let Err(e) = file.sync_all() {
+        drop(file);
+        let _ = std::fs::remove_file(&temp);
+        return Err(e);
+    }
+    drop(file);
     if let Err(e) = std::fs::rename(&temp, &destination) {
         // Leave no temp file behind if the replace failed.
         let _ = std::fs::remove_file(&temp);

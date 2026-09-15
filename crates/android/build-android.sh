@@ -20,6 +20,16 @@
 # toolchain must be addressed by its *triple-prefixed* driver name, which is
 # what tells clang to produce Android code — `build.rs` passes no `--target`.
 #
+# ## 16 KB page sizes
+#
+# Android 15+ devices may use 16 KB memory pages (mandatory for new devices),
+# and the manifest sets `android:extractNativeLibs="false"`, so the loader maps
+# this `.so` straight out of the APK. NDK r27 and older link with 4 KB page
+# alignment (PT_LOAD p_align = 0x1000) by default; per Google's "Support 16 KB
+# page sizes", such a library "crashes at runtime with a segmentation fault".
+# We therefore link with 16 KB alignment and *verify* it before staging — see
+# the "16 KB page-size alignment" and "verify 16 KB page alignment" sections.
+#
 # ## Usage
 #
 #   ./crates/android/build-android.sh [--ndk <path>] [--check] [--debug]
@@ -110,6 +120,20 @@ export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$CC"
 # this; without it the Opus build fails with "Failed to find tool".
 export ANDROID_NDK_HOME="$NDK"
 
+# --- 16 KB page-size alignment ----------------------------------------------
+#
+# Pass the alignment to the Rust link via the *target-scoped* rustflags variable
+# (not the global RUSTFLAGS, which would also reach host build scripts: macOS's
+# linker rejects `-Wl,-z,...`). Both page-size flags are needed; 16384 is the
+# 16 KB page size, and it must apply to max-page-size (segment alignment) and
+# common-page-size. The value of an existing target-scoped variable — or, if
+# that is unset, a global RUSTFLAGS — is preserved: cargo treats the
+# target-scoped variable as a replacement for RUSTFLAGS, so dropping it would
+# silently discard the caller's flags.
+ALIGN_RUSTFLAGS="-C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wl,-z,common-page-size=16384"
+EXISTING_RUSTFLAGS="${CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS:-${RUSTFLAGS:-}}"
+export CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS="${EXISTING_RUSTFLAGS} ${ALIGN_RUSTFLAGS}"
+
 for tool in "$CC" "$CXX" "$AR"; do
     if [[ ! -x "$tool" ]]; then
         echo "error: missing toolchain binary: $tool" >&2
@@ -180,6 +204,34 @@ case "$ARCH" in
         exit 1
         ;;
 esac
+
+# --- verify 16 KB page alignment --------------------------------------------
+#
+# The flags above are the fix; this is the proof. `extractNativeLibs=false`
+# maps the `.so` directly out of the APK, so a PT_LOAD whose p_align is not a
+# multiple of 0x4000 (16 KB) crashes on a 16 KB-page device. Refuse to stage a
+# library that is not compliant, and refuse to guess when the tool needed to
+# check it is missing.
+if ! command -v readelf >/dev/null 2>&1; then
+    echo "error: readelf (binutils) is required to verify 16 KB page alignment" >&2
+    echo "  install binutils; refusing to stage an unverifiable $LIB_NAME" >&2
+    exit 1
+fi
+
+LOAD_ALIGNS="$(readelf -lW "$JNI_LIBS/$LIB_NAME" | awk '$1 == "LOAD" { print $NF }')"
+if [[ -z "$LOAD_ALIGNS" ]]; then
+    echo "error: no PT_LOAD segments found in $JNI_LIBS/$LIB_NAME (unexpected readelf output)" >&2
+    exit 1
+fi
+while read -r align; do
+    if (( align == 0 || align % 0x4000 != 0 )); then
+        echo "error: $LIB_NAME is not 16 KB page aligned: PT_LOAD p_align=$align" >&2
+        echo "  every p_align must be a non-zero multiple of 0x4000 (16384);" >&2
+        echo "  Android 15+ 16 KB-page devices will crash loading it." >&2
+        exit 1
+    fi
+done <<< "$LOAD_ALIGNS"
+echo "krkr-rs android: all PT_LOAD segments are 16 KB aligned"
 
 echo "krkr-rs android: staged $JNI_LIBS/$LIB_NAME ($(du -h "$JNI_LIBS/$LIB_NAME" | cut -f1))"
 echo "krkr-rs android: next, from android/: gradle assembleDebug"

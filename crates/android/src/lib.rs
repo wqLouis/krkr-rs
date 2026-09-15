@@ -87,11 +87,12 @@ fn main() {
     log::info!("krkr-rs: launching {name:?} from {}", game_dir.display());
 
     let shared = SharedScene(Arc::new(RwLock::new(Scene::default())));
-    krkr_render::runner::game_app(shared, game_dir, None).run();
-
-    // The app returned normally (window closed or `System.exit`): a clean
-    // exit, so the next launch does not look like a crash.
-    engine::state::write_state(engine::state::State::Stopped, None);
+    // `run_app` writes `stopped` for a clean or game-requested exit and
+    // `failed` for an engine/renderer failure that returned without panicking.
+    // A panic during app construction (e.g. no wgpu adapter) never reaches it
+    // and instead leaves `starting` behind, which the launcher reads as a
+    // crash; the panic hook records the reason in `krkr.log`.
+    krkr_render::runner::run_app(krkr_render::runner::game_app(shared, game_dir, None));
 }
 
 /// Read a `String` static field off the Activity class through JNI.
@@ -101,10 +102,10 @@ fn main() {
 /// native-attached thread resolves against the system class loader and would
 /// not find application classes.
 ///
-/// Returns `None` when the field is unset or any JNI step fails — every failure
-/// is logged, so a silent black screen never happens without a reason in the
-/// log. `Set`/`GetStaticField` on a class whose field is declared with Kotlin's
-/// `@JvmField` is a plain field access with no getter involved.
+/// Returns `None` when the field is unset or any JNI step fails. Every failure
+/// is reported through [`report_failure`] (stderr *and* `log`), and any Java
+/// exception left behind by a failed call is cleared, so the caller's thread is
+/// always left clean.
 fn activity_static_string(field: &str, signature: &str) -> Option<String> {
     let android_app = bevy::android::ANDROID_APP.get()?;
 
@@ -114,7 +115,7 @@ fn activity_static_string(field: &str, signature: &str) -> Option<String> {
     let vm = match unsafe { jni::JavaVM::from_raw(android_app.vm_as_ptr().cast()) } {
         Ok(vm) => vm,
         Err(e) => {
-            log::error!("krkr-rs: cannot obtain the JavaVM: {e}");
+            report_failure(format_args!("cannot obtain the JavaVM: {e}"));
             return None;
         }
     };
@@ -124,7 +125,7 @@ fn activity_static_string(field: &str, signature: &str) -> Option<String> {
     let mut env = match vm.attach_current_thread() {
         Ok(env) => env,
         Err(e) => {
-            log::error!("krkr-rs: cannot attach to the JVM: {e}");
+            report_failure(format_args!("cannot attach to the JVM: {e}"));
             return None;
         }
     };
@@ -133,7 +134,8 @@ fn activity_static_string(field: &str, signature: &str) -> Option<String> {
     let class = match env.get_object_class(&activity) {
         Ok(class) => class,
         Err(e) => {
-            log::error!("krkr-rs: cannot get the Activity class: {e}");
+            report_failure(format_args!("cannot get the Activity class: {e}"));
+            clear_pending_exception(&mut env);
             return None;
         }
     };
@@ -141,7 +143,8 @@ fn activity_static_string(field: &str, signature: &str) -> Option<String> {
     let value = match env.get_static_field(&class, field, signature) {
         Ok(value) => value,
         Err(e) => {
-            log::error!("krkr-rs: cannot read {field}: {e}");
+            report_failure(format_args!("cannot read {field}: {e}"));
+            clear_pending_exception(&mut env);
             return None;
         }
     };
@@ -149,7 +152,8 @@ fn activity_static_string(field: &str, signature: &str) -> Option<String> {
         Ok(object) if !object.is_null() => object,
         Ok(_) => return None,
         Err(e) => {
-            log::error!("krkr-rs: {field} is not an object: {e}");
+            report_failure(format_args!("{field} is not an object: {e}"));
+            clear_pending_exception(&mut env);
             return None;
         }
     };
@@ -161,8 +165,37 @@ fn activity_static_string(field: &str, signature: &str) -> Option<String> {
             (!value.is_empty()).then_some(value)
         }
         Err(e) => {
-            log::error!("krkr-rs: {field} is not a valid string: {e}");
+            report_failure(format_args!("{field} is not a valid string: {e}"));
+            clear_pending_exception(&mut env);
             None
         }
     }
+}
+
+/// Report a startup/JNI failure so it is visible even before the global logger
+/// exists.
+///
+/// The state directory is read **before** `engine::init_logging`, because the
+/// log file lives inside it (`krkr.log`), so the logger cannot be initialised
+/// first. At that point the global logger is still the no-op default and
+/// `log::error!` goes nowhere ([`engine::state::write_state`] is also a no-op
+/// while the directory is unset). `eprintln!` survives that window —
+/// android-activity forwards stderr to logcat — so every failure is reported on
+/// stderr as well as through the normal logger once it exists.
+fn report_failure(args: std::fmt::Arguments<'_>) {
+    eprintln!("krkr-rs: {args}");
+    log::error!("krkr-rs: {args}");
+}
+
+/// Clear a Java exception left pending by a failed JNI call.
+///
+/// The `jni` crate (0.21) returns [`jni::errors::Error::JavaException`] from
+/// `get_static_field`/`get_string`/… **without** calling `ExceptionClear` (see
+/// its `check_exception!` macro). Returning with one pending poisons every later
+/// JNI call on this thread — and `android_main` carries on into the Bevy app,
+/// where winit/android-activity/input all call JNI on it. Clearing here keeps
+/// the thread clean; its result is ignored because the error is already being
+/// reported.
+fn clear_pending_exception(env: &mut jni::JNIEnv<'_>) {
+    let _ = env.exception_clear();
 }

@@ -78,8 +78,75 @@ pub fn run_game(game_dir: &std::path::Path, font_config: Option<PathBuf>, headle
     }
     println!("krkr-rs: running {game_dir:?} (close the window to exit)");
     // Returns when the app exits (window closed, `System.exit`, or an exit
-    // requested by a script).
-    game_app(shared, game_dir.to_path_buf(), font_config).run();
+    // requested by a script). `run_app` also records a non-panic engine
+    // failure in the state file.
+    run_app(game_app(shared, game_dir.to_path_buf(), font_config));
+}
+
+/// Run a game app and record its terminal state.
+///
+/// Besides driving [`App::run`], this distinguishes a deliberate game exit
+/// from an engine failure so the state file does not hide the latter.
+///
+/// Renderer *initialization* failures (no GPU adapter, surface creation) panic
+/// inside Bevy (`bevy_render`'s `initialize_renderer` uses `expect`), and the
+/// panic hook already records those. But Bevy also exits with
+/// [`AppExit::Error`] **without** panicking: its render-error handler quits on
+/// a wgpu validation/device-lost error, and pipelined rendering reports a dead
+/// render thread that way. `System.exit(n)` from the game is likewise mapped to
+/// `AppExit::Error(n)` by [`poll_game_exit`], so that one is explicitly exempt:
+/// only an error the game did **not** ask for is treated as an engine failure.
+/// `write_state` is a no-op off Android, so the desktop runner only pays the
+/// log line.
+pub fn run_app(mut app: App) -> AppExit {
+    let exit = app.run();
+    match exit {
+        AppExit::Error(code) if !game_exit_requested() => {
+            let message = format!(
+                "engine exited with code {code} before the game finished \
+                 (renderer or engine failure)"
+            );
+            log::error!("krkr-rs: {message}");
+            engine::state::write_state(engine::state::State::Failed, Some(&message));
+        }
+        // Success, and the game's own (possibly non-zero) `System.exit`, are
+        // clean shutdowns: the next launch must not look like a crash.
+        _ => engine::state::write_state(engine::state::State::Stopped, None),
+    }
+    exit
+}
+
+/// The directory scripts see as `System.appDataPath`.
+///
+/// Android's [`std::env::temp_dir`] is `/data/local/tmp`, which an ordinary
+/// app cannot write, so handing it to scripts makes `System.appDataPath` fail
+/// with `EACCES`. On Android use the engine's state directory — the app's
+/// `filesDir`, already configured by the launcher and writable — and create it
+/// if it is missing. Everywhere else keep `temp_dir()`. If the directory
+/// cannot be created we warn and fall back rather than expose a path that
+/// cannot exist.
+fn app_data_dir() -> PathBuf {
+    // A runtime `cfg!` rather than `#[cfg]` so both branches are compiled (and
+    // linted/checked on the host); the fallback is only reachable on Android.
+    if cfg!(target_os = "android") {
+        match engine::state::state_dir() {
+            Some(dir) => match std::fs::create_dir_all(dir) {
+                Ok(()) => return dir.to_path_buf(),
+                Err(e) => log::warn!(
+                    "krkr-rs: cannot create app data dir {}: {e}; \
+                     falling back to {}",
+                    dir.display(),
+                    std::env::temp_dir().display()
+                ),
+            },
+            None => log::warn!(
+                "krkr-rs: no state directory configured; \
+                 falling back to {} for app data",
+                std::env::temp_dir().display()
+            ),
+        }
+    }
+    std::env::temp_dir()
 }
 
 /// The windowed game app: default plugins (window + renderer), the shared
@@ -147,6 +214,21 @@ pub fn game_app(shared: SharedScene, game_dir: PathBuf, font_config: Option<Path
     app
 }
 
+/// Set when the game itself asks to exit (`System.exit` / `System.terminate`).
+///
+/// [`poll_game_exit`] maps those to [`AppExit`], including the non-zero
+/// `AppExit::Error` for `System.exit(n)`. [`run_app`] uses this to tell that
+/// deliberate shutdown apart from an engine/renderer failure that also exits
+/// through `AppExit::Error`.
+static GAME_EXIT_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the app exited because the game asked it to rather than because of
+/// an engine failure (see [`run_app`]).
+fn game_exit_requested() -> bool {
+    GAME_EXIT_REQUESTED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Translate a TJS `System.exit` / `System.terminate` request into a Bevy
 /// [`AppExit`]. The VM request is consumed exactly once by
 /// [`tvp_natives::take_exit_request`]; `AppExit::Error` only carries a `u8`,
@@ -161,6 +243,9 @@ fn poll_game_exit(mut exit: MessageWriter<AppExit>) {
     } else {
         AppExit::from_code(code.unsigned_abs().clamp(1, u8::MAX as u32) as u8)
     };
+    // Mark this as a game-requested exit before writing it, so `run_app` does
+    // not mistake the (possibly non-zero) code for an engine failure.
+    GAME_EXIT_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
     log::info!("System.exit({code}) — shutting down the game runner");
     exit.write(app_exit);
 }
@@ -278,11 +363,14 @@ fn game_startup(
         .unwrap_or(((0, 0), GAME_SIZE));
     let system_context = tvp_natives::SystemContext {
         project_dir: config.game_dir.clone(),
-        app_data_dir: std::env::temp_dir(),
+        app_data_dir: app_data_dir(),
         screen_size: GAME_SIZE,
         desktop_origin,
         desktop_size,
-        touch_device: false,
+        // The input bridge already maps touch to mouse; this only corrects what
+        // the game is *told* so its `System.touchDevice` branch matches the
+        // device. Phones/tablets report true, desktops false.
+        touch_device: cfg!(target_os = "android"),
     };
     tvp_natives::set_system_context(system_context.clone());
     // Keep the installed context as a resource so the render bridge can keep
