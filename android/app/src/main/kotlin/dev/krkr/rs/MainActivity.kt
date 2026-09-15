@@ -105,7 +105,13 @@ class MainActivity : ComponentActivity() {
                     permissionGranted = permissionGranted.value,
                     onOpenPermissionSettings = ::openAllFilesSettings,
                     startupIssue = startupIssue.value,
-                    onDismissStartupIssue = { startupIssue.value = null },
+                    onDismissStartupIssue = {
+                        // Clear only when the report is actually dismissed:
+                        // keeping the marker means a rotation (which re-runs
+                        // reconcilePendingLaunch) cannot swallow it.
+                        EngineDiagnostics.clearLaunch(this@MainActivity)
+                        startupIssue.value = null
+                    },
                 )
             }
         }
@@ -142,40 +148,77 @@ class MainActivity : ComponentActivity() {
     /**
      * Turns the engine's state file into a dialog if it indicates a problem.
      *
-     * A pending-launch marker is consumed here. It is written before
-     * `startActivity` and survives the launcher's process being killed with the
-     * engine, which is what lets a crash be reported on the next start. Missing
-     * or unreadable state is "no information" and dismisses nothing.
+     * A pending-launch marker is written before `startActivity` and survives the
+     * launcher's process being killed with the engine, which is what lets a
+     * failure be reported on the next start. It is the only evidence that a
+     * launch was attempted, so it is cleared according to these rules:
+     *
+     *  * no marker                      -> nothing to do;
+     *  * clean exit ("stopped")         -> clear immediately, show nothing;
+     *  * engine still alive (same pid)  -> keep the marker, show nothing (a
+     *                                      later resume after a crash must still
+     *                                      be able to report);
+     *  * any Issue shown                -> keep the marker;
+     *                                      [onDismissStartupIssue] clears it, so
+     *                                      a rotation cannot swallow the report.
      */
     private fun reconcilePendingLaunch() {
         val pending = EngineDiagnostics.readLaunch(this) ?: return
-        EngineDiagnostics.clearLaunch(this)
         val state = EngineDiagnostics.readState(this)
-        LauncherLog.i("reconciling launch of \"${pending.name}\": state=${state?.state ?: "none"}")
+        val stateAge = EngineDiagnostics.stateFile(this).lastModified()
+        val markerAge = EngineDiagnostics.launchFile(this).lastModified()
+        LauncherLog.i(
+            "reconciling launch of \"${pending.name}\": state=${state?.state ?: "none"} " +
+                "(state mtime=$stateAge, marker mtime=$markerAge)",
+        )
 
-        startupIssue.value = when {
-            state == null -> null // no information — carry on
-            state.state == "failed" -> Issue(
-                title = "The game could not start",
-                message = state.message
-                    ?: "The engine reported a failure but did not leave a message.",
-                detail = LauncherLog.tail(
-                    EngineDiagnostics.engineLogFile(this),
-                    ISSUE_TAIL_LINES,
-                ),
+        // A missing state file, or one older than the marker, means the engine
+        // never reported anything for THIS launch. That is exactly the signature
+        // of a failure before the native entry point (the Activity-construction
+        // crash that used to be invisible), and a stale state left over from an
+        // earlier run must not be mistaken for this run's result.
+        if (state == null || stateAge < markerAge) {
+            startupIssue.value = Issue(
+                title = "The engine did not start",
+                message = "\"${pending.name}\" was launched but the engine never reported " +
+                    "anything. It likely failed before it could start. The log below may say why.",
+                detail = LauncherLog.tail(EngineDiagnostics.engineLogFile(this), ISSUE_TAIL_LINES),
             )
+            return
+        }
 
-            state.state == "starting" || state.state == "running" -> Issue(
-                title = "The game stopped unexpectedly",
-                message = "\"${pending.name}\" did not shut down normally. It may have crashed, " +
-                    "or Android may have killed it while it was in the background.",
-                detail = LauncherLog.tail(
-                    EngineDiagnostics.engineLogFile(this),
-                    ISSUE_TAIL_LINES,
-                ),
-            )
+        when (state.state) {
+            "failed" -> {
+                startupIssue.value = Issue(
+                    title = "The game could not start",
+                    message = state.message
+                        ?: "The engine reported a failure but did not leave a message.",
+                    detail = LauncherLog.tail(EngineDiagnostics.engineLogFile(this), ISSUE_TAIL_LINES),
+                )
+            }
 
-            else -> null // "stopped", or an unknown future state — nothing to say
+            "starting", "running" -> {
+                if (state.pid != null && state.pid == android.os.Process.myPid()) {
+                    // The engine is still alive in this very process: the
+                    // launcher was recreated while the game keeps running. Keep
+                    // the marker so a later crash is still detected.
+                    LauncherLog.i("engine still alive (pid=${state.pid}); keeping pending marker")
+                    return
+                }
+                startupIssue.value = Issue(
+                    title = "The game stopped unexpectedly",
+                    message = "\"${pending.name}\" did not shut down normally. It may have crashed, " +
+                        "or Android may have killed it while it was in the background.",
+                    detail = LauncherLog.tail(EngineDiagnostics.engineLogFile(this), ISSUE_TAIL_LINES),
+                )
+            }
+
+            else -> {
+                // "stopped", or an unknown future state: a clean exit, nothing
+                // to report. Clear the marker only here and on dismissal.
+                LauncherLog.i("launch of \"${pending.name}\" reconciled cleanly; clearing pending marker")
+                EngineDiagnostics.clearLaunch(this)
+            }
         }
     }
 }
@@ -218,13 +261,21 @@ private fun LauncherScreen(
 
         // Persist read+write: the engine reads the archives and writes saves
         // into <game>/savedata/. Without this the grant dies with the process.
-        val persistable = runCatching {
+        val persisted = runCatching {
             context.contentResolver.takePersistableUriPermission(
                 uri,
                 Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
             )
+        }.recoverCatching {
+            // A provider may have granted only one mode; asking for both then
+            // throws SecurityException and would lose even the grant that was
+            // available. Retry read-only before giving up.
+            context.contentResolver.takePersistableUriPermission(
+                uri,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION,
+            )
         }
-        if (persistable.isFailure) {
+        if (persisted.isFailure) {
             // Some providers do not offer persistable grants. The folder can
             // still be used this session, but it will not survive a restart —
             // say so rather than letting it silently disappear later.
@@ -236,15 +287,21 @@ private fun LauncherScreen(
         // a folder that cannot be addressed as a path is still added (the user
         // may mount that volume later), but we say so immediately.
         val path = SafPaths.resolve(context, uri)
-        if (library.add(GameEntry(uri, name, path))) {
-            games = library.all()
-            if (path != null) {
-                notify("Added \"$name\".")
-            } else {
-                notify("Added \"$name\", but its folder is not on a filesystem the engine can read.")
+        when (library.add(GameEntry(uri, name, path))) {
+            SaveResult.SAVED -> {
+                games = library.all()
+                if (path != null) {
+                    notify("Added \"$name\".")
+                } else {
+                    notify("Added \"$name\", but its folder is not on a filesystem the engine can read.")
+                }
             }
-        } else {
-            notify("\"$name\" is already in the library.")
+
+            SaveResult.UNCHANGED -> notify("\"$name\" is already in the library.")
+
+            SaveResult.FAILED -> notify(
+                "Could not save \"$name\" to the library. It will disappear on restart.",
+            )
         }
     }
 
@@ -278,7 +335,10 @@ private fun LauncherScreen(
         },
     ) { padding ->
         if (showLogs) {
-            LogsScreen(Modifier.fillMaxSize().padding(padding))
+            LogsScreen(
+                modifier = Modifier.fillMaxSize().padding(padding),
+                onNotify = { notify(it) },
+            )
         } else if (games.isEmpty()) {
             EmptyLibrary(
                 modifier = Modifier.fillMaxSize().padding(padding),
@@ -315,6 +375,9 @@ private fun LauncherScreen(
         }
     }
 
+    // Render at most one AlertDialog at a time, by priority: the permission
+    // gate first, then the startup issue, then the preflight issue, then the
+    // remove confirmation. Otherwise two dialogs stack and one is obscured.
     if (showPermission) {
         AlertDialog(
             onDismissRequest = { permissionDismissed = true },
@@ -334,48 +397,53 @@ private fun LauncherScreen(
                 TextButton(onClick = { permissionDismissed = true }) { Text("Not now") }
             },
         )
-    }
-
-    gameIssue?.let { issue ->
-        IssueDialog(
-            issue = issue,
-            onDismiss = { gameIssue = null },
-            onViewLogs = {
-                gameIssue = null
-                showLogs = true
-            },
-        )
-    }
-
-    startupIssue?.let { issue ->
-        IssueDialog(
-            issue = issue,
-            onDismiss = onDismissStartupIssue,
-            onViewLogs = {
-                onDismissStartupIssue()
-                showLogs = true
-            },
-        )
-    }
-
-    pendingRemoval?.let { entry ->
-        AlertDialog(
-            onDismissRequest = { pendingRemoval = null },
-            title = { Text("Remove from library?") },
-            text = {
-                Text("\"${entry.name}\" will be removed from this list. The game's files on disk are not touched.")
-            },
-            confirmButton = {
-                TextButton(onClick = {
-                    library.remove(entry.uri)
-                    games = library.all()
-                    pendingRemoval = null
-                }) { Text("Remove") }
-            },
-            dismissButton = {
-                TextButton(onClick = { pendingRemoval = null }) { Text("Cancel") }
-            },
-        )
+    } else if (startupIssue != null) {
+        startupIssue?.let { issue ->
+            IssueDialog(
+                issue = issue,
+                onDismiss = onDismissStartupIssue,
+                onViewLogs = {
+                    onDismissStartupIssue()
+                    showLogs = true
+                },
+            )
+        }
+    } else if (gameIssue != null) {
+        gameIssue?.let { issue ->
+            IssueDialog(
+                issue = issue,
+                onDismiss = { gameIssue = null },
+                onViewLogs = {
+                    gameIssue = null
+                    showLogs = true
+                },
+            )
+        }
+    } else if (pendingRemoval != null) {
+        pendingRemoval?.let { entry ->
+            AlertDialog(
+                onDismissRequest = { pendingRemoval = null },
+                title = { Text("Remove from library?") },
+                text = {
+                    Text("\"${entry.name}\" will be removed from this list. The game's files on disk are not touched.")
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        when (library.remove(entry.uri)) {
+                            SaveResult.SAVED -> games = library.all()
+                            SaveResult.FAILED -> notify(
+                                "Could not remove \"${entry.name}\"; the library file is not writable.",
+                            )
+                            SaveResult.UNCHANGED -> Unit
+                        }
+                        pendingRemoval = null
+                    }) { Text("Remove") }
+                },
+                dismissButton = {
+                    TextButton(onClick = { pendingRemoval = null }) { Text("Cancel") }
+                },
+            )
+        }
     }
 }
 
@@ -428,7 +496,7 @@ private fun IssueDialog(
  * send me this") without adb.
  */
 @Composable
-private fun LogsScreen(modifier: Modifier = Modifier) {
+private fun LogsScreen(modifier: Modifier = Modifier, onNotify: (String) -> Unit) {
     val context = LocalContext.current
     var refreshToken by remember { mutableStateOf(0) }
 
@@ -451,8 +519,18 @@ private fun LogsScreen(modifier: Modifier = Modifier) {
                 modifier = Modifier.weight(1f),
             )
             TextButton(onClick = { refreshToken++ }) { Text("Refresh") }
-            TextButton(onClick = { shareLogs(context, launcherTail, engineTail) }) { Text("Share") }
-            TextButton(onClick = { copyLogs(context, launcherTail, engineTail) }) { Text("Copy") }
+            TextButton(onClick = {
+                if (!shareLogs(context, launcherTail, engineTail)) {
+                    onNotify("Could not open the share sheet.")
+                }
+            }) { Text("Share") }
+            TextButton(onClick = {
+                if (copyLogs(context, launcherTail, engineTail)) {
+                    onNotify("Logs copied.")
+                } else {
+                    onNotify("Could not copy the logs.")
+                }
+            }) { Text("Copy") }
         }
         Spacer(Modifier.height(4.dp))
         Text(
@@ -492,8 +570,12 @@ private fun combineLogs(launcherTail: String, engineTail: String): String = buil
     appendLine(engineTail.ifBlank { "(empty)" })
 }
 
-/** Shares the logs as text, attaching a file through the app's FileProvider. */
-private fun shareLogs(context: Context, launcherTail: String, engineTail: String) {
+/**
+ * Shares the logs as text, attaching a file through the app's FileProvider.
+ * Returns false when the chooser could not be opened, so the caller can tell
+ * the user instead of failing silently.
+ */
+private fun shareLogs(context: Context, launcherTail: String, engineTail: String): Boolean {
     val text = combineLogs(launcherTail, engineTail)
     val intent = Intent(Intent.ACTION_SEND).apply {
         type = "text/plain"
@@ -515,13 +597,22 @@ private fun shareLogs(context: Context, launcherTail: String, engineTail: String
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }.onFailure { LauncherLog.w("cannot attach log file: ${it.message}") }
     }
-    runCatching { context.startActivity(Intent.createChooser(intent, "Share logs")) }
+    return runCatching { context.startActivity(Intent.createChooser(intent, "Share logs")) }
         .onFailure { LauncherLog.e("cannot share logs", it) }
+        .isSuccess
 }
 
-private fun copyLogs(context: Context, launcherTail: String, engineTail: String) {
-    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager ?: return
-    clipboard.setPrimaryClip(ClipData.newPlainText("krkr-rs logs", combineLogs(launcherTail, engineTail)))
+private fun copyLogs(context: Context, launcherTail: String, engineTail: String): Boolean {
+    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+    if (clipboard == null) {
+        LauncherLog.w("clipboard service unavailable; cannot copy logs")
+        return false
+    }
+    return runCatching {
+        clipboard.setPrimaryClip(
+            ClipData.newPlainText("krkr-rs logs", combineLogs(launcherTail, engineTail)),
+        )
+    }.onFailure { LauncherLog.e("cannot copy logs", it) }.isSuccess
 }
 
 /**
@@ -550,25 +641,48 @@ private fun launchGame(
         return
     }
 
-    // Prefer the path cached in `games.json`; re-resolve only when it is
-    // missing, which happens for a folder added while its volume was not
-    // mounted. A successful re-resolve is written back to the config.
-    val path = entry.path ?: SafPaths.resolve(context, entry.uri)?.also {
-        library.updatePath(entry.uri, it)
-    }
+    // Re-resolve on every launch. The mapping is pure string work (no I/O), and
+    // the cached path in `games.json` can go stale: a volume may be remounted
+    // under a new id, or the folder renamed or moved. Keep using the cached path
+    // while it is valid, but hold the fresh resolution ready as a fallback.
+    val cached = entry.path
+    val resolved = SafPaths.resolve(context, entry.uri)
+    var path = cached ?: resolved
     if (path == null) {
         LauncherLog.w("launch blocked: \"${entry.name}\" has no resolvable path")
         onIssue(
             Issue(
                 title = "Cannot open this folder",
-                message = "\"${entry.name}\" is not on a filesystem the engine can read. " +
-                    "This happens with cloud storage — copy the game to internal storage or an SD card.",
+                message = "\"${entry.name}\" is not in a location the engine can open by path. " +
+                    "Only folders on internal storage, an SD card, or Downloads can be used — " +
+                    "cloud storage and other document providers cannot be mapped to a path. " +
+                    "Copy the game to internal storage or an SD card.",
             ),
         )
         return
     }
 
-    val problem = GamePreflight.check(path)
+    var problem = GamePreflight.check(path)
+    if (problem != null && resolved != null && resolved != path) {
+        // The cached path stopped working. A remount or a move can change where
+        // the same URI resolves, so try the fresh path before giving up; adopt
+        // it (and remember it) only when it is genuinely a game.
+        LauncherLog.i(
+            "cached path \"$path\" failed (${problem.title}); trying resolved path \"$resolved\"",
+        )
+        val freshProblem = GamePreflight.check(resolved)
+        if (freshProblem == null) {
+            library.updatePath(entry.uri, resolved)
+            path = resolved
+            problem = null
+        } else {
+            problem = freshProblem
+        }
+    } else if (problem == null && cached == null && resolved != null) {
+        // First launch of a folder added while its volume was not mounted:
+        // remember where it resolved.
+        library.updatePath(entry.uri, resolved)
+    }
     if (problem != null) {
         LauncherLog.w("launch blocked: \"${entry.name}\" — ${problem.title} ($path)")
         onIssue(problem)

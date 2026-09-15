@@ -66,7 +66,12 @@ object EngineDiagnostics {
 
     fun engineLogFile(context: Context): File = File(context.filesDir, ENGINE_LOG)
 
-    private fun launchFile(context: Context): File = File(context.filesDir, LAUNCH_FILE)
+    /**
+     * The pending-launch marker file. Exposed so reconciliation can compare its
+     * modification time against the engine state file's (same filesystem, same
+     * clock) and tell this run's state apart from a stale leftover.
+     */
+    fun launchFile(context: Context): File = File(context.filesDir, LAUNCH_FILE)
 
     /**
      * The engine's last published state, or null when there is none we can

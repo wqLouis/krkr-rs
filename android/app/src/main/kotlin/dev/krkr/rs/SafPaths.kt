@@ -21,8 +21,10 @@ import android.provider.DocumentsContract
  * policy-clean alternative (a SAF-backed storage backend that streams through
  * `ContentResolver`) is the documented follow-up.
  *
- * Returns `null` when the volume is not one we can address by path (e.g. a
- * cloud provider, or a `DocumentsProvider` that is not a real filesystem).
+ * Only ids from known filesystem providers are trusted: the external-storage
+ * provider's `primary:...` / `XXXX-XXXX:...` ids, and the Downloads provider's
+ * `raw:/...` ids. Returns `null` for everything else (cloud storage, arbitrary
+ * `DocumentsProvider`s, or a third-party id that merely has the right shape).
  * Callers must treat `null` as "this folder cannot be used" and say so, rather
  * than silently launching the engine with a path that will not resolve.
  */
@@ -30,6 +32,21 @@ object SafPaths {
 
     /** Secondary volumes are identified by a `XXXX-XXXX` UUID under `/storage`. */
     private val VOLUME_UUID = Regex("[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}")
+
+    /**
+     * The only provider whose `documentId` may be interpreted as a volume
+     * filesystem path. Trusting the id shape alone would let a third-party or
+     * cloud provider whose id happens to look like `primary:...` be mapped to an
+     * unrelated `/storage/...` path (which, under MANAGE_EXTERNAL_STORAGE, may
+     * even exist), silently opening the wrong folder.
+     */
+    private const val EXTERNAL_STORAGE_AUTHORITY = "com.android.externalstorage.documents"
+
+    /** The Downloads provider, whose `raw:` document ids are real paths. */
+    private const val DOWNLOADS_AUTHORITY = "com.android.providers.downloads.documents"
+
+    /** Prefix of a Downloads document id that already is an absolute path. */
+    private const val RAW_PREFIX = "raw:"
 
     /**
      * Whether the app currently holds "All files access"
@@ -49,14 +66,31 @@ object SafPaths {
     /**
      * The absolute filesystem path for a SAF tree URI, or null if it cannot be
      * addressed as a path.
+     *
+     * The provider authority is checked *before* a document id is interpreted:
+     * only the external-storage provider's `primary:...` / `XXXX-XXXX:...` ids
+     * are turned into volume paths, and only the Downloads provider's
+     * `raw:/...` ids are turned into absolute paths. An id that merely has the
+     * right shape is not trusted.
      */
     fun resolve(context: Context, treeUri: Uri): String? {
+        val authority = treeUri.authority ?: return null
         val documentId = runCatching {
             DocumentsContract.getTreeDocumentId(treeUri)
         }.getOrNull() ?: return null
 
+        // Downloads emits `raw:/absolute/path` ids for files that really live on
+        // disk, so returning the path is correct rather than a false negative.
+        if (documentId.startsWith(RAW_PREFIX)) {
+            if (authority != DOWNLOADS_AUTHORITY) return null
+            val rawPath = documentId.removePrefix(RAW_PREFIX)
+            return rawPath.takeIf { it.startsWith("/") }
+        }
+
         // "<volumeId>:<relative/path>"; the relative part may be empty when the
-        // user picked a volume root.
+        // user picked a volume root. Only the external-storage provider may
+        // produce this shape.
+        if (authority != EXTERNAL_STORAGE_AUTHORITY) return null
         val separator = documentId.indexOf(':')
         if (separator < 0) return null
         val volumeId = documentId.substring(0, separator)

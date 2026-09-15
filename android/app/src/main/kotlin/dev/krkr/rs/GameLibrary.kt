@@ -25,6 +25,13 @@ data class GameEntry(
 }
 
 /**
+ * The result of a library mutation. [FAILED] is deliberately distinct from
+ * [UNCHANGED] so a failed save is never reported to the user as "already
+ * there".
+ */
+enum class SaveResult { SAVED, UNCHANGED, FAILED }
+
+/**
  * The game library, persisted as **JSON** in the app's private files directory.
  *
  * This is deliberately a plain file rather than `SharedPreferences`: it is
@@ -72,23 +79,24 @@ class GameLibrary(context: Context) {
     }
 
     /**
-     * Adds [entry] unless its folder is already present.
-     * Returns true if it was added, false if it was already there.
+     * Adds [entry] unless its folder is already present. [SaveResult.FAILED]
+     * means the entry was not persisted, so the caller must tell the user.
      */
-    fun add(entry: GameEntry): Boolean {
+    fun add(entry: GameEntry): SaveResult {
         val entries = all()
-        if (entries.any { it.key == entry.key }) return false
-        write(entries + entry)
-        return true
+        if (entries.any { it.key == entry.key }) return SaveResult.UNCHANGED
+        return if (write(entries + entry)) SaveResult.SAVED else SaveResult.FAILED
     }
 
-    /** Removes [uri]. Returns true if it was present. */
-    fun remove(uri: Uri): Boolean {
+    /**
+     * Removes [uri]. [SaveResult.FAILED] means the library file could not be
+     * written, so the removal did not actually stick.
+     */
+    fun remove(uri: Uri): SaveResult {
         val entries = all()
         val kept = entries.filterNot { it.key == uri.toString() }
-        if (kept.size == entries.size) return false
-        write(kept)
-        return true
+        if (kept.size == entries.size) return SaveResult.UNCHANGED
+        return if (write(kept)) SaveResult.SAVED else SaveResult.FAILED
     }
 
     /**
@@ -120,6 +128,11 @@ class GameLibrary(context: Context) {
 
         val games = root.optJSONArray(FIELD_GAMES) ?: return emptyList()
         val entries = ArrayList<GameEntry>(games.length())
+        // The library is user-editable, so the same tree URI can appear twice.
+        // Deduplicate while parsing: the list uses key = { it.key }, and a
+        // duplicate key crashes the LazyColumn ("Key was already used") on
+        // every start.
+        val seen = HashSet<String>()
         for (i in 0 until games.length()) {
             val obj = games.optJSONObject(i) ?: continue
             val rawUri = obj.optString(FIELD_TREE_URI)
@@ -133,12 +146,22 @@ class GameLibrary(context: Context) {
             val name = obj.optString(FIELD_NAME).takeIf { it.isNotEmpty() }
                 ?: uri.lastPathSegment
                 ?: "Game"
-            entries += GameEntry(uri, name, path)
+            val entry = GameEntry(uri, name, path)
+            if (!seen.add(entry.key)) {
+                Log.w(TAG, "skipping duplicate library entry $i: ${entry.key}")
+                continue
+            }
+            entries += entry
         }
         return entries
     }
 
-    private fun write(entries: List<GameEntry>) {
+    /**
+     * Persists [entries]. Returns true only when the file was actually
+     * replaced; a failure is logged and reported so callers cannot claim
+     * success for a save that did not happen.
+     */
+    private fun write(entries: List<GameEntry>): Boolean {
         val games = JSONArray()
         for (entry in entries) {
             val obj = JSONObject()
@@ -153,7 +176,7 @@ class GameLibrary(context: Context) {
             .put(FIELD_VERSION, SCHEMA_VERSION)
             .put(FIELD_GAMES, games)
 
-        runCatching {
+        return runCatching {
             file.parentFile?.mkdirs()
             // Atomic replace: write a sibling temp file, then rename over the
             // target. A kill mid-write leaves the previous library intact.
@@ -165,7 +188,7 @@ class GameLibrary(context: Context) {
             }
         }.onFailure { e ->
             Log.e(TAG, "cannot write $file: ${e.message}")
-        }
+        }.isSuccess
     }
 
     private companion object {

@@ -31,30 +31,32 @@ object GamePreflight {
 
     fun check(path: String): Issue? {
         val dir = File(path)
-        return when {
-            !dir.exists() -> Issue(
+        if (!dir.exists()) {
+            return Issue(
                 title = "Game folder not found",
                 message = "\"$path\" no longer exists. If the game is on a removable SD card, " +
                     "reinsert it or add the game again.",
             )
-
-            !dir.isDirectory -> Issue(
+        }
+        if (!dir.isDirectory) {
+            return Issue(
                 title = "That is not a folder",
                 message = "\"$path\" is not a directory, so there is nothing for the engine to mount.",
             )
-
-            !dir.canRead() || dir.listFiles() == null -> Issue(
-                title = "Game folder is not readable",
-                message = "The app cannot read \"$path\".\n\nThis usually means \"All files access\" " +
-                    "is off, or the folder's permission was lost. Enable All files access and try again.",
-            )
-
-            else -> notAGame(dir)
         }
+        // `canRead()` is unreliable on shared storage (it can report true while
+        // listing still fails), so call `listFiles()` exactly once and treat a
+        // null result as unreadable. The listing is then passed on so
+        // `notAGame()` cannot mistake a null listing for a readable directory.
+        val listing = dir.listFiles() ?: return Issue(
+            title = "Game folder is not readable",
+            message = "The app cannot read \"$path\".\n\nThis usually means \"All files access\" " +
+                "is off, or the folder's permission was lost. Enable All files access and try again.",
+        )
+        return notAGame(dir, listing)
     }
 
-    private fun notAGame(dir: File): Issue? {
-        val listing = dir.listFiles() ?: return null
+    private fun notAGame(dir: File, listing: Array<File>): Issue? {
         val hasStartup = File(dir, "startup.tjs").isFile
         val hasXp3 = listing.any { it.isFile && it.name.endsWith(".xp3", ignoreCase = true) }
         if (hasStartup || hasXp3) return null

@@ -1,5 +1,6 @@
 package dev.krkr.rs
 
+import android.content.Intent
 import android.os.Bundle
 
 import androidx.core.view.WindowCompat
@@ -93,6 +94,23 @@ class KrkrGameActivity : GameActivity() {
             systemBarsBehavior =
                 WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         }
+    }
+
+    /**
+     * `launchMode="singleTask"`: a second launch while an instance is alive is
+     * delivered here rather than to [onCreate], so the static fields the native
+     * side reads would otherwise keep pointing at the previous game. Refresh
+     * them from the new Intent and log that the engine is already running.
+     */
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        pendingGameDir = intent.getStringExtra(EXTRA_GAME_DIR)
+        pendingGameName = intent.getStringExtra(EXTRA_GAME_NAME)
+        pendingStateDir = filesDir.absolutePath
+        LauncherLog.i(
+            "KrkrGameActivity.onNewIntent: engine already running; game=${pendingGameName ?: "?"} dir=${pendingGameDir ?: "?"}",
+        )
     }
 
     override fun onDestroy() {

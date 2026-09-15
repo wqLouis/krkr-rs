@@ -80,8 +80,18 @@ object LauncherLog {
                 file.parentFile?.mkdirs()
                 if (file.length() > MAX_BYTES) {
                     val rotated = File(file.parentFile, ROTATED_NAME)
-                    rotated.delete()
-                    file.renameTo(rotated)
+                    // Both operations are best-effort. Check their return
+                    // values and report a failed rename to logcat only (never
+                    // via LauncherLog, which would re-enter this synchronized
+                    // append and recurse), so we do not silently pretend the
+                    // log was rotated.
+                    val deleted = rotated.delete()
+                    if (!file.renameTo(rotated)) {
+                        Log.w(
+                            TAG,
+                            "log rotation failed (delete=$deleted): cannot rename $file to $rotated",
+                        )
+                    }
                 }
                 val stamp = timeFormat.format(Date())
                 file.appendText("$stamp $level $message\n")
