@@ -50,6 +50,10 @@ env:
   BUILD_TOOLS_VERSION: '37.0.0'
   # Gradle 9.x, because AGP 9.4 requires it.
   GRADLE_VERSION: '9.7.1'
+  # `crates/tjs2-sys/build.rs` runs `zig build` in `deps/` to fetch
+  # fmt/spdlog/boost/oniguruma through the zig package manager; the NDK clang
+  # does the actual cross-compiling, but zig is still required to fetch.
+  ZIG_VERSION: '0.16.0'
 
 jobs:
   # "Tagged AND on the android branch", which GitHub's event filters cannot
@@ -142,6 +146,21 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android
+
+      # Zig is needed before the Rust build, not for compiling —
+      # `crates/tjs2-sys/build.rs` fetches its C/C++ dependencies (fmt, spdlog,
+      # boost, oniguruma) with `zig build` in `deps/`, and under the cross build
+      # it is only a fetch: the NDK clang compiles everything. Pinned, and
+      # fetched directly rather than through a third-party action, so there is
+      # one less moving part that can break for unrelated reasons.
+      - name: Install Zig
+        run: |
+          ZIG_DIR="$RUNNER_TEMP/zig"
+          mkdir -p "$ZIG_DIR"
+          curl -sSL "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz" \
+            | tar -xJ --strip-components=1 -C "$ZIG_DIR"
+          echo "$ZIG_DIR" >> "$GITHUB_PATH"
+          "$ZIG_DIR/zig" version
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
