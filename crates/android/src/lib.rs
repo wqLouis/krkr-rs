@@ -19,6 +19,18 @@
 //! That is deliberately the *only* JNI in the engine. Everything else — input,
 //! rendering, audio, storage — goes through the same platform-neutral code the
 //! desktop build uses.
+//!
+//! ## Failure is observable
+//!
+//! The same mechanism passes `KrkrGameActivity.pendingStateDir` (the app's
+//! `filesDir`). Native code uses it for two files the launcher can read:
+//! `krkr_state.json`, the startup-state file written by `engine::state`, and
+//! `krkr.log`, the capped log file written by `engine::logging` (see those
+//! modules for the exact shapes). A startup failure writes `failed` with the
+//! real error and terminates the process; a crash leaves `starting`/`running`
+//! behind because a process killed in native code cannot report anything
+//! itself. Either way the launcher regains control instead of showing an
+//! unexplained black surface.
 #![cfg(target_os = "android")]
 
 use std::path::PathBuf;
@@ -34,6 +46,9 @@ const FIELD_GAME_DIR: &str = "pendingGameDir";
 const SIG_GAME_DIR: &str = "Ljava/lang/String;";
 /// Static field on the same class holding the folder's display name (logging).
 const FIELD_GAME_NAME: &str = "pendingGameName";
+/// Static field on the same class holding the app's `filesDir`, where the
+/// state file (`krkr_state.json`) and log file (`krkr.log`) live.
+const FIELD_STATE_DIR: &str = "pendingStateDir";
 
 /// The Android entry point.
 ///
@@ -42,17 +57,29 @@ const FIELD_GAME_NAME: &str = "pendingGameName";
 /// handle is available here without any plumbing of our own.
 #[bevy_main]
 fn main() {
+    // The state directory must be known before logging starts: the log file
+    // lives in it. It is read through the same JNI helper as the game dir and
+    // is likewise written before `super.onCreate`.
+    if let Some(state_dir) = activity_static_string(FIELD_STATE_DIR, SIG_GAME_DIR) {
+        engine::state::set_state_dir(state_dir);
+    }
     engine::init_logging(false);
+    // Do not clear a previous file: a crash leaves `starting`/`running`
+    // behind so the launcher can tell it apart from a clean `stopped` exit.
+    engine::state::write_state(engine::state::State::Starting, None);
 
     let Some(game_dir) = activity_static_string(FIELD_GAME_DIR, SIG_GAME_DIR) else {
         // The launcher never starts this Activity without a folder, so this is
-        // a programming error rather than a user-facing condition. Say so
-        // loudly instead of showing a black surface with no explanation.
-        log::error!(
-            "krkr-rs: no game directory was passed by KrkrGameActivity \
+        // a programming error rather than a user-facing condition. Record it
+        // for the launcher and terminate instead of sitting on a black
+        // surface with a live process.
+        let message = format!(
+            "no game directory was passed by KrkrGameActivity \
              ({FIELD_GAME_DIR} is unset) — cannot start the engine"
         );
-        return;
+        log::error!("krkr-rs: {message}");
+        engine::state::write_state(engine::state::State::Failed, Some(&message));
+        std::process::exit(1);
     };
 
     let name = activity_static_string(FIELD_GAME_NAME, SIG_GAME_DIR).unwrap_or_default();
@@ -61,6 +88,10 @@ fn main() {
 
     let shared = SharedScene(Arc::new(RwLock::new(Scene::default())));
     krkr_render::runner::game_app(shared, game_dir, None).run();
+
+    // The app returned normally (window closed or `System.exit`): a clean
+    // exit, so the next launch does not look like a crash.
+    engine::state::write_state(engine::state::State::Stopped, None);
 }
 
 /// Read a `String` static field off the Activity class through JNI.

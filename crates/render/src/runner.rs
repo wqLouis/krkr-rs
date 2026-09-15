@@ -251,7 +251,11 @@ fn game_startup(
     let (storage, engine) = match engine::loader::prepare(&game_dir) {
         Ok(pair) => pair,
         Err(e) => {
-            log::error!("krkr-rs: cannot load game {game_dir:?}: {e}");
+            let message = format!("cannot load game {game_dir:?}: {e}");
+            log::error!("krkr-rs: {message}");
+            // Report the real reason to the launcher, then leave: a black
+            // surface with a live process is worse than a clear failure.
+            engine::state::write_state(engine::state::State::Failed, Some(&message));
             std::process::exit(1);
         }
     };
@@ -290,7 +294,9 @@ fn game_startup(
     //    scene (natives mutate it under a write lock, sync_scene renders
     //    it under a read lock).
     register_natives(&engine, &storage, &shared).unwrap_or_else(|e| {
-        log::error!("krkr-rs: native registration failed: {e}");
+        let message = format!("native registration failed: {e}");
+        log::error!("krkr-rs: {message}");
+        engine::state::write_state(engine::state::State::Failed, Some(&message));
         std::process::exit(1);
     });
 
@@ -314,7 +320,9 @@ fn game_startup(
             commands.insert_resource(StartupReport(report));
         }
         Err(e) => {
-            log::error!("krkr-rs: cannot run startup.tjs: {e}");
+            let message = format!("cannot run startup.tjs: {e}");
+            log::error!("krkr-rs: {message}");
+            engine::state::write_state(engine::state::State::Failed, Some(&message));
             std::process::exit(1);
         }
     }
@@ -332,6 +340,11 @@ fn game_startup(
         started: Instant::now(),
         audio_output,
     });
+
+    // The VM is mounted and running. A crash from here on leaves `running`
+    // behind, which is how the launcher distinguishes it from a clean exit
+    // (which writes `stopped`).
+    engine::state::write_state(engine::state::State::Running, None);
 }
 
 /// Register every TVP native class and set the global contexts they read

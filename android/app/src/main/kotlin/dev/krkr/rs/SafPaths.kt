@@ -32,6 +32,21 @@ object SafPaths {
     private val VOLUME_UUID = Regex("[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}")
 
     /**
+     * Whether the app currently holds "All files access"
+     * (`MANAGE_EXTERNAL_STORAGE`).
+     *
+     * Android never grants this automatically: the user has to enable it in
+     * system settings. Because the engine reads the game by filesystem path,
+     * nothing may be launched until this returns true, or the engine fails with
+     * `EACCES` and shows a black screen. `isExternalStorageManager` is the only
+     * way to observe the grant (the permission has no runtime prompt).
+     *
+     * Never throws: a failure to query is treated as "not granted".
+     */
+    fun hasAllFilesAccess(): Boolean =
+        runCatching { Environment.isExternalStorageManager() }.getOrDefault(false)
+
+    /**
      * The absolute filesystem path for a SAF tree URI, or null if it cannot be
      * addressed as a path.
      */

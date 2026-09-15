@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  FileProvider paths for the launcher's "Share logs" action.
+
+  `files-path` covers the log files the app writes into its private files
+  directory (`krkr-launcher.log`, `krkr.log`); `cache-path` covers the combined
+  `krkr-logs.txt` the Share action stages before handing out a content URI. Only
+  these two private directories are exposed — never shared storage.
+-->
+<paths>
+    <files-path name="files" path="." />
+    <cache-path name="cache" path="." />
+</paths>

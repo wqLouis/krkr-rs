@@ -1,7 +1,7 @@
 //! The load pipeline: mount storage → bootstrap the TJS2 VM → run
 //! `startup.tjs`.
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use tjs2_sys::{Tjs2Engine, TjsValue};
 
@@ -161,30 +161,4 @@ extern "C" fn log_cb(level: i32, msg: *const std::ffi::c_char, _user: *mut std::
         tjs2_sys::LOG_WARN => log::warn!("[tjs2] {msg}"),
         _ => log::error!("[tjs2] {msg}"),
     }
-}
-
-/// `log` facade: default to a stderr logger that prints INFO by default;
-/// consumers (the bin) can install their own logger.
-static LOGGER: OnceLock<StderrLogger> = OnceLock::new();
-
-struct StderrLogger;
-
-impl log::Log for StderrLogger {
-    fn enabled(&self, _metadata: &log::Metadata) -> bool {
-        true
-    }
-    fn log(&self, record: &log::Record) {
-        eprintln!("{}", record.args());
-    }
-    fn flush(&self) {}
-}
-
-/// Install the default stderr logger if none is set.
-pub fn init_logging(verbose: bool) {
-    let _ = log::set_logger(LOGGER.get_or_init(|| StderrLogger));
-    log::set_max_level(if verbose {
-        log::LevelFilter::Debug
-    } else {
-        log::LevelFilter::Info
-    });
 }

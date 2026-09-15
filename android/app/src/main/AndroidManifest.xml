@@ -60,5 +60,22 @@
                 android:name="android.app.lib_name"
                 android:value="krkr_android" />
         </activity>
+
+        <!--
+          Shares the launcher and engine logs (the "Logs" screen's Share
+          action). The authority is derived from the application id so a debug
+          and a release build installed side by side do not collide. Only the
+          app's own files/cache directories are exposed; see
+          res/xml/file_paths.xml.
+        -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
     </application>
 </manifest>

@@ -45,13 +45,39 @@ class KrkrGameActivity : GameActivity() {
         /** Display name of the game being launched, for logs and the title. */
         @JvmField
         var pendingGameName: String? = null
+
+        /**
+         * Where the engine writes its state file and log, as a filesystem path.
+         *
+         * The native side reads this through JNI exactly like [pendingGameDir],
+         * and writes `<this dir>/krkr_state.json` + `<this dir>/krkr.log`. It is
+         * set to `filesDir.absolutePath` in [onCreate] **before** `super.onCreate`
+         * for the same reason: `super` enters `android_main`, so the field is
+         * always populated before native code can observe it.
+         *
+         * It is intentionally not cleared in [onDestroy]: the native shutdown
+         * path may still want the directory to record a final `stopped` state,
+         * and clearing it a moment too early would lose that.
+         */
+        @JvmField
+        var pendingStateDir: String? = null
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        // The launcher normally initialises logging first, but this Activity can
+        // be restored on its own after a process death; make sure the handler and
+        // the log file are set up either way.
+        LauncherLog.init(this)
+        LauncherLog.installUncaughtExceptionHandler()
+
         // Must be set before super.onCreate(): that call loads the native
         // library and enters android_main, which reads these values.
         pendingGameDir = intent.getStringExtra(EXTRA_GAME_DIR)
         pendingGameName = intent.getStringExtra(EXTRA_GAME_NAME)
+        pendingStateDir = filesDir.absolutePath
+        LauncherLog.i(
+            "KrkrGameActivity.onCreate: game=${pendingGameName ?: "?"} dir=${pendingGameDir ?: "?"} stateDir=${pendingStateDir ?: "?"}",
+        )
         super.onCreate(savedInstanceState)
     }
 
