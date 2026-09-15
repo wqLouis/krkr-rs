@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The adaptive launcher icon's background layer (mipmap-anydpi-v26/ic_launcher.xml).
+  The logo in `icon.png` is a blue emblem on a transparent background, so a light
+  background keeps its silhouette readable. Changing this one value re-tints the
+  icon on API 26+ without regenerating any image.
+-->
+<resources>
+    <color name="ic_launcher_background">#FFFFFFFF</color>
+</resources>

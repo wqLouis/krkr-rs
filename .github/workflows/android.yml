@@ -9,9 +9,9 @@
 # Scope: `arm64-v8a` only, debug profile only (matching the project's
 # dev-binary rule). No release signing, no other ABIs, no emulator.
 #
-# NOTE: the `cargo ndk ... -p krkr-android` step needs the Android cdylib crate
-# (milestone M2 in docs/android.md). Until that lands, a run of this workflow
-# will fail at that step — which is the intended signal, not a broken workflow.
+# NOTE: the cargo step needs the Android cdylib crate (milestone M2 in
+# docs/android.md). Until that lands, a run of this workflow will fail at that
+# step — which is the intended signal, not a broken workflow.
 name: Android
 
 on:
@@ -39,7 +39,6 @@ env:
   # compiles the vendored C++ TJS2 VM, so a version bump changes the compiler
   # that builds the VM and must be re-verified.
   NDK_VERSION: '27.2.12479018'
-  CARGO_NDK_VERSION: '4.1.2'
   GRADLE_VERSION: '8.11.1'
 
 jobs:
@@ -69,7 +68,7 @@ jobs:
       - name: Install NDK r27c
         run: |
           yes | sdkmanager --install "ndk;$NDK_VERSION"
-          # `cargo ndk` locates the toolchain through this variable.
+          # `crates/android/build-android.sh` reads this to locate the toolchain.
           echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
 
       - name: Set up Rust
@@ -82,21 +81,18 @@ jobs:
         with:
           key: android-arm64
 
-      - name: Install cargo-ndk
-        run: cargo install cargo-ndk --version "$CARGO_NDK_VERSION" --locked
-
-      # Produces libkrkr_android.so and drops it straight into the Gradle
-      # module's jniLibs, so the APK packaging step needs no extra wiring.
-      # `cargo ndk` also supplies CC/AR/linker for the crates that compile C
-      # (blake3, opus); crates/tjs2-sys/build.rs picks up the NDK clang via its
-      # CXX override.
+      # Builds and stages libkrkr_android.so into the Gradle module's jniLibs.
+      # The script owns every Android-specific detail (toolchain paths, the
+      # triple-prefixed clang driver, the linker variable, ANDROID_NDK_HOME for
+      # opusic-sys's cmake) so the engine crates stay platform-neutral — and it
+      # verifies the .so really is arm64 before staging it, because a host
+      # toolchain otherwise produces a silently wrong library.
       #
-      # There is no FFmpeg on Android, so the android crate must pull tvp-natives
-      # WITHOUT its default `ffmpeg` feature and use the MediaCodec backend
-      # instead (docs/android.md §6, milestone M5). If this step ever fails on
-      # `ffmpeg-next`/pkg-config, that feature wiring is what regressed.
+      # Note: deliberately *not* `cargo ndk`, which does not provide CXX in the
+      # form crates/tjs2-sys/build.rs reads and therefore falls back to a host
+      # compiler. See the header of the script.
       - name: Build the engine for arm64-v8a
-        run: cargo ndk -t arm64-v8a -o android/app/src/main/jniLibs build -p krkr-android
+        run: ./crates/android/build-android.sh --ndk "$ANDROID_NDK_HOME"
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4

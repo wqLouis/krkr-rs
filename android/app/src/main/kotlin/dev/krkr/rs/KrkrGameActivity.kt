@@ -32,15 +32,19 @@ class KrkrGameActivity : GameActivity() {
          * `android_main` starts. Null until [onCreate] has run, so the native
          * side must treat null as a fatal configuration error rather than
          * guessing a directory.
+         *
+         * `@JvmField` (not `@JvmStatic`) is deliberate: it puts a real static
+         * **field** on this class, which is what the JNI `GetStaticField` read
+         * in `crates/android/src/lib.rs` expects. A `@JvmStatic var` in a
+         * companion would expose accessor *methods* instead, and the field
+         * would live on the companion object.
          */
-        @JvmStatic
+        @JvmField
         var pendingGameDir: String? = null
-            private set
 
         /** Display name of the game being launched, for logs and the title. */
-        @JvmStatic
+        @JvmField
         var pendingGameName: String? = null
-            private set
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {

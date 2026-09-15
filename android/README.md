@@ -35,19 +35,42 @@ is side loaded (docs/android.md §4).
 ## Building
 
 Prerequisites: Android SDK, NDK r27c, JDK 17, Rust with the `aarch64-linux-android`
-target, `cargo-ndk`, `bison` (the C++ TJS2 VM generates its parsers at build time).
+target, and `bison` (the C++ TJS2 VM generates its parsers at build time).
 
 ```bash
-# 1. the engine .so (from the repository root)
-cargo ndk -t arm64-v8a -o android/app/src/main/jniLibs build -p krkr-android
+# 1. the engine .so — the script sets the toolchain and stages the library
+ANDROID_NDK_HOME=/path/to/android-ndk-r27c ./crates/android/build-android.sh
 
 # 2. the APK
-cd android && ./gradlew assembleDebug
+cd android && gradle assembleDebug
 ```
 
-`cargo ndk` also wires `CC`/`AR`/the linker for the crates that compile C
-(`blake3`, and opus). `crates/tjs2-sys/build.rs` honours a `CXX` override, so it
-picks up the NDK clang automatically under `cargo ndk`.
+`gradle assembleDebug` rather than `./gradlew`: the repository has no Gradle
+wrapper yet (its jar is a binary), so CI installs a pinned Gradle instead.
+
+## Why a script and not `cargo ndk`
+
+All Android-specific knowledge lives in `crates/android/build-android.sh` so the
+engine crates stay platform-neutral. `cargo ndk` is deliberately **not** used: it
+does not provide `CXX` in the form `crates/tjs2-sys/build.rs` reads (it sets the
+target-scoped `CXX_<triple>`), so the build script falls back to its default
+`zig c++` — which compiles for the **host**. An Android build then contains
+x86-64 objects, and `cargo check` does not link, so it looks like it worked.
+
+```
+cargo ndk -t arm64-v8a build  →  out/obj/tjsInterCodeExec.o: ELF 64-bit … x86-64   ✗
+```
+
+The script sets `CC`/`CXX`/`AR`/the Rust linker itself, addressing the toolchain
+by its **triple-prefixed** driver name (`aarch64-linux-android21-clang++`), which
+is what makes clang emit Android code — `build.rs` passes no `--target` of its
+own. It also exports `ANDROID_NDK_HOME`, which `opusic-sys`'s build script uses to
+select the NDK's cmake toolchain, and it **verifies the produced `.so` is arm64**
+before staging it, so a host toolchain fails loudly instead of shipping a broken
+library.
+
+Zig stays the toolchain for the Linux/host build (`build.rs` defaults to
+`zig c++`); only the Android cross-build uses the NDK clang.
 
 The game's own files never ship in the APK: the user picks a folder at runtime.
 

@@ -16,6 +16,7 @@ cross-checked") is now superseded for Android — see §2 below.
 | Decision | Choice | Why |
 |---|---|---|
 | Scope | Experimental; correctness first, no schedule | User directive |
+| Platform level | **`minSdk = 35` (Android 15+), `compileSdk`/`targetSdk` = 37 (latest)** | User directive: Android 15+ is acceptable, newest platform otherwise. Native code is built at API 35 because that is the highest level NDK r27c provides a sysroot for — raising `minSdk` past 35 means raising the NDK with it. |
 | ABIs | **`arm64-v8a` only** | User directive. No `armeabi-v7a`/`x86`/`x86_64`. Emulator testing is out of scope until an x86_64 ABI is added back. |
 | UI | Kotlin + **Jetpack Compose + Material 3** | User directive: "native M3 design app ui" |
 | App shape | **Frontend-first**: a launcher app that picks a game folder, then hands off to the engine | User directive |
@@ -55,6 +56,27 @@ cross-checked") is now superseded for Android — see §2 below.
   `-lc++ -lc++abi` instead of letting the NDK clang link `libc++_static`. Must
   switch to `CARGO_CFG_TARGET_OS == "android"` (drop the explicit C++ runtime
   flags for Android). *Not yet fixed.*
+- **Zig can target Android for C, but not for C++** (zig 0.16.0, measured):
+  `zig cc -target aarch64-linux-android` works once the sysroot's include dirs
+  are given explicitly with `-isystem` (`--sysroot` is **not** honoured by the
+  `cc`/`c++` wrapper). Every `zig c++ … -std=c++17` attempt, with or without the
+  NDK's `libc++` headers and `-nostdinc++`, fails with `CacheCheckFailed`,
+  because zig cannot supply Android's C++ runtime. The TJS2 VM is C++, so the
+  Android cross-build uses the NDK clang; zig remains the toolchain for the
+  Linux/host build.
+- **`cargo ndk` must not be used for this build.** It does not set `CXX` in the
+  form `crates/tjs2-sys/build.rs` reads (it sets the target-scoped
+  `CXX_<triple>`), so the build script falls back to its default `zig c++` —
+  which targets the **host**. `cargo ndk -t arm64-v8a build` was measured
+  producing `out/obj/tjsInterCodeExec.o: ELF 64-bit … x86-64` inside an Android
+  build, and `cargo check` never links, so it appears to succeed. The working
+  invocation addresses the toolchain by its *triple-prefixed* driver name with
+  plain `cargo build --target`; `crates/android/build-android.sh` does that and
+  verifies the staged `.so` is aarch64.
+- **NDK r27c's sysroot covers API 21–35** (`usr/lib/aarch64-linux-android/`),
+  which is why the native API level is 35 and `minSdk` cannot go above it
+  without a newer NDK. The app's `compileSdk`/`targetSdk` (37) are independent
+  of that.
 
 Not yet verified (still to be cross-checked once the FFmpeg feature split
 lands): the full workspace for `aarch64-linux-android`, including `blake3`

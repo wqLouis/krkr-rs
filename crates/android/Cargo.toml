@@ -1,0 +1,28 @@
+[package]
+name = "krkr-android"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Android entry point (cdylib) for the krkr-rs engine"
+
+# The cdylib name must match `android.app.lib_name` in the manifest
+# (android/app/src/main/AndroidManifest.xml) — it is how the AGDK GameActivity
+# finds the native entry point.
+[lib]
+name = "krkr_android"
+crate-type = ["cdylib"]
+
+# Android-only crate. The whole source is `#![cfg(target_os = "android")]`, so
+# other targets build an empty cdylib instead of dragging in the Android
+# toolchain — which is why the dependencies are scoped to the target too.
+[target.'cfg(target_os = "android")'.dependencies]
+bevy = { version = "0.19", features = ["android-game-activity"] }
+engine = { path = "../engine" }
+jni = "0.21"
+log = "0.4"
+# `default-features = false` drops `render`'s `ffmpeg` feature, which forwards
+# to `tvp-natives`: Android has no system FFmpeg, so the movie path uses the
+# MediaCodec backend instead (docs/android.md §6). Until that lands, video
+# returns a clear "no MPEG decoder in this build" error.
+render = { path = "../render", default-features = false }
+tvp-visual = { path = "../tvp-visual" }
