@@ -71,8 +71,7 @@ pub fn run_startup(
     let archives_mounted = storage
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .archives()
-        .count();
+        .archive_count();
     let mut report = LoadReport {
         game_dir,
         archives_mounted,

@@ -22,6 +22,7 @@
 #include "tjsNative.h"
 #include "tjsInterface.h"
 #include "tjsDebug.h"
+#include "tjsInterCodeExec.h"
 
 #include "tjs2_abi.h"
 
@@ -1539,6 +1540,19 @@ int tjs2_do_gc(tjs2_engine *e, char **out_error) {
         // Reference `tTJS::DoGarbageCollection` (`tjs.cpp:495`), invoked by
         // the `TVP_COMPACT_LEVEL_IDLE` callback in `System.doCompact`.
         e->inner->DoGarbageCollection();
+        // `DoGarbageCollection` calls `TJSVariantArrayStackCompactNow()`, but
+        // the vendored VM's implementation of that is an empty stub (see
+        // `tjsInterCodeExec.cpp`), so the variant-array stack's stale
+        // register slots are never cleared. Those slots keep a strong
+        // reference to values from completed calls (notably `Layer` wrapper
+        // objects whose script reference was dropped), which kept their
+        // native instances alive and meant `layer_destroy` never ran across
+        // repeated scene loads. Compact the stack here, through its public
+        // `Compact()` (`InternalCompact`), so this GC pass actually releases
+        // those references. This is the teardown the reference's GC relies
+        // on: it clears every slot above the live register mark.
+        if(e->inner->GetVariantArrayStack())
+            e->inner->GetVariantArrayStack()->Compact();
         return 0;
     } catch(const TJS::eTJS &err) {
         if(out_error)
@@ -2063,6 +2077,24 @@ tjs2_value_id tjs2_retain_object(void *engine, void *obj) {
         return (tjs2_value_id)id;
     } catch(...) {
         // Never let a C++ exception (e.g. bad_alloc) cross the C ABI.
+        return nullptr;
+    }
+}
+
+// Duplicate an existing retained-value id: the variant is copied into a fresh
+// id (AddRef'ing its contents) while the original entry stays live. Used to
+// hand a cached object to a native result slot without consuming the cache
+// (e.g. the cached `Layer.font` wrapper).
+tjs2_value_id tjs2_retain_retained_id(void *engine, tjs2_value_id id) {
+    tjs2_engine *e = (tjs2_engine *)engine;
+    if(!e || !id)
+        return nullptr;
+    try {
+        auto it = e->retained.find((uintptr_t)id);
+        if(it == e->retained.end())
+            return nullptr;
+        return retain_variant(e, it->second);
+    } catch(...) {
         return nullptr;
     }
 }

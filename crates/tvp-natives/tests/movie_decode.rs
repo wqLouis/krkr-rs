@@ -9,6 +9,13 @@
 //!
 //! The test skips (rather than fails) when the reference archive or the
 //! extraction script is not present, so `cargo test` stays portable.
+//!
+//! It asserts real decoding, so it can only run when the `ffmpeg` feature is
+//! on (it is, by default). Without it `video::MovieDecoder` is the deliberate
+//! "no MPEG decoder in this build" implementation, so the whole file is gated
+//! rather than left to fail in a configuration that is expected to have no
+//! decoder at all.
+#![cfg(feature = "ffmpeg")]
 
 use std::path::PathBuf;
 use std::process::Command;

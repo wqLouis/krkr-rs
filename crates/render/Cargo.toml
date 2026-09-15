@@ -12,6 +12,12 @@ name = "krkr_render"
 name = "krkr-rs"
 path = "src/main.rs"
 
+[features]
+default = ["ffmpeg"]
+# Pass-through so `--no-default-features` also drops the tvp-natives FFmpeg
+# movie decoder (e.g. Android).
+ffmpeg = ["tvp-natives/ffmpeg"]
+
 [dependencies]
 bevy = "0.19"
 engine = { path = "../engine" }
@@ -19,7 +25,7 @@ log = "0.4"
 tjs2-sys = { workspace = true }
 tvp-kagparser = { path = "../tvp-kagparser" }
 tvp-input = { path = "../tvp-input" }
-tvp-natives = { path = "../tvp-natives" }
+tvp-natives = { path = "../tvp-natives", default-features = false }
 tvp-scripts = { path = "../tvp-scripts" }
 tvp-sound = { path = "../tvp-sound" }
 tvp-storages = { path = "../tvp-storages" }

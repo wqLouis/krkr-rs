@@ -92,6 +92,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, c_int, c_void};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 use tjs2_sys::{
@@ -231,6 +232,15 @@ pub(crate) struct LayerInst {
     /// is re-retained per dispatch; `_keepalive` keeps the object alive for
     /// the layer's lifetime.
     pub action_owner: Option<ActionOwner>,
+    /// Reference `tTJSNI_BaseLayer::FontObject` (`LayerIntf.h:909`): the
+    /// cached `Font` wrapper `Layer.font` returns. It is created lazily on
+    /// the first access and **released by `Invalidate`** (reference
+    /// `LayerIntf.cpp:552`). Caching is essential: the game's `k2compat`
+    /// writes `this.font.doUserSelect = this.k2compat_doUserSelect`, whose
+    /// closure receiver is the layer, so a fresh per-access wrapper would
+    /// form an uncollectable layer-to-font-to-layer cycle (TJS2 has no cycle
+    /// collector).
+    pub font_object: Option<tjs2_sys::DetachedValue>,
 }
 
 /// A retained reference to the layer's action owner.
@@ -241,8 +251,20 @@ pub(crate) struct ActionOwner {
     _keepalive: tjs2_sys::DetachedValue,
 }
 
+/// The number of live `Layer` native objects: incremented by `layer_create`
+/// and decremented by `layer_destroy`. Used by the `KRKR_DUMP_LAYERS` dev
+/// dump to prove that wrapper objects reach refcount 0 (and so that
+/// `layer_destroy` runs) across repeated scene loads.
+static LIVE_LAYERS: AtomicI64 = AtomicI64::new(0);
+
+/// The number of `Layer` native objects created but not yet destroyed.
+pub fn live_layer_count() -> i64 {
+    LIVE_LAYERS.load(Ordering::Relaxed)
+}
+
 /// `new Layer(...)` payload factory.
 extern "C" fn layer_create(_engine: *mut c_void) -> *mut c_void {
+    LIVE_LAYERS.fetch_add(1, Ordering::Relaxed);
     Box::into_raw(Box::<LayerInst>::default()) as *mut c_void
 }
 
@@ -270,6 +292,7 @@ extern "C" fn layer_destroy(_engine: *mut c_void, instance: *mut c_void) {
     super::clear_layer_tjs_object(inst.id);
     // SAFETY: instance came from Box::into_raw.
     unsafe { drop(Box::from_raw(instance as *mut LayerInst)) };
+    LIVE_LAYERS.fetch_sub(1, Ordering::Relaxed);
 }
 
 /// Cancel a layer's queued transition entries without firing the completion
@@ -327,6 +350,11 @@ extern "C" fn layer_invalidate(_engine: *mut c_void, instance: *mut c_void) {
     // Window destructor, which locks the scene, so do it before taking the
     // lock below.
     inst.action_owner = None;
+    // Reference `LayerIntf.cpp:552`: `Invalidate` invalidates and releases the
+    // cached `FontObject` (we simply drop the strong reference). The game's
+    // `k2compat` installs a `doUserSelect` closure on this object whose
+    // receiver is the layer, so keeping it would pin the layer forever.
+    inst.font_object = None;
     cancel_layer_transition(inst.id);
     clear_layer_side_tables(inst.id);
     if inst.constructed {
@@ -8892,15 +8920,18 @@ extern "C" fn layer_cursor_y_get(
     0
 }
 
-/// `layer.font` — a script `Font` object backed by the layer's shared
-/// [`FontState`](crate::scene::FontState).
+/// `layer.font` — the layer's cached script `Font` object (reference
+/// `tTJSNI_BaseLayer::FontObject`, `LayerIntf.h:909`).
 ///
-/// The game sets its text font with `with(layer.font){ .face = ...; .height
-/// = ... }` (see `system/MessageArea.tjs` `setFontStyle`). Callers read
-/// `layer.font` repeatedly, so every call returns a fresh, disposable wrapper
-/// **bound to the same layer-owned state** (`Font.__bind`): property writes
-/// land on the shared state, and `drawText` reads the face back from it. The
-/// first access lazily creates the state; `layer_destroy` removes it.
+/// The reference caches one `Font` object per layer: `GetFontObjectNoAddRef`
+/// creates it lazily and `Invalidate` releases it (`LayerIntf.cpp:552`).
+/// Caching is more than identity: the game's `k2compat` runs
+/// `this.font.doUserSelect = this.k2compat_doUserSelect` in a `Layer`
+/// constructor hook; the assigned closure's receiver is the layer, so a
+/// fresh wrapper per access would form a layer → font → layer reference cycle
+/// that TJS2 (which has no cycle collector) could never free, pinning the
+/// layer. The cached wrapper is dropped by [`layer_invalidate`] and
+/// [`layer_destroy`].
 extern "C" fn layer_font_get(
     _engine: *mut c_void,
     instance: *mut c_void,
@@ -8909,6 +8940,25 @@ extern "C" fn layer_font_get(
     _objthis: *mut c_void,
 ) -> c_int {
     let inst = unsafe { instance_ref::<LayerInst>(instance) };
+    let engine = crate::natives::context_engine();
+    // Cached path: return a fresh retained id for the same wrapper.
+    if let Some(dv) = &inst.font_object {
+        let id = unsafe { tjs2_sys::tjs2_retain_retained_id(engine.raw(), dv.raw_id()) };
+        if !id.is_null() {
+            // SAFETY: out is a valid result slot; the C++ side consumes the
+            // retention.
+            unsafe {
+                (*out).ty = tjs2_sys::VAL_RETAINED;
+                (*out).integer = 0;
+                (*out).real = 0.0;
+                (*out).string = std::ptr::null();
+                (*out).array = std::ptr::null();
+                (*out).array_count = 0;
+                (*out).retained = id as usize;
+            }
+            return 0;
+        }
+    }
 
     // Resolve (or lazily allocate) the layer's font state id under the scene
     // lock, then drop it before evaluating script.
@@ -8934,9 +8984,7 @@ extern "C" fn layer_font_get(
         }
     };
 
-    // Create a throwaway `Font` and rebind it to the layer's state. The
-    // wrapper is disposable; only the shared state persists.
-    let engine = crate::natives::context_engine();
+    // Create the wrapper and bind it to the layer's shared state.
     if engine.eval("new Font()", "layer.font").is_err() {
         set_void_out(out);
         return 0;
@@ -8962,8 +9010,16 @@ extern "C" fn layer_font_get(
         set_void_out(out);
         return 0;
     }
-    // SAFETY: out is a valid result slot; the C++ side consumes the
-    // retention (copies + erases) before the callback returns.
+    // Cache the wrapper for the layer's lifetime (released by invalidate).
+    let cached_id = dv.raw_id();
+    inst.font_object = Some(dv);
+    // Hand the script a separate retained id; the cache keeps its own.
+    let id = unsafe { tjs2_sys::tjs2_retain_retained_id(engine.raw(), cached_id) };
+    if id.is_null() {
+        set_void_out(out);
+        return 0;
+    }
+    // SAFETY: out is a valid result slot; the C++ side consumes the retention.
     unsafe {
         (*out).ty = tjs2_sys::VAL_RETAINED;
         (*out).integer = 0;
@@ -8971,11 +9027,8 @@ extern "C" fn layer_font_get(
         (*out).string = std::ptr::null();
         (*out).array = std::ptr::null();
         (*out).array_count = 0;
-        (*out).retained = dv.raw_id() as usize;
+        (*out).retained = id as usize;
     }
-    // The C++ conversion consumes the retention; forget the wrapper so its
-    // Drop does not release the id first (safe no-op after).
-    std::mem::forget(dv);
     0
 }
 
@@ -11351,6 +11404,69 @@ mod tests {
         env.run("var w = new Window(); var l = new Layer(w, null); l = null; w = null;")
             .unwrap();
         assert_eq!(env.scene().layers.len(), 0, "layer must be destroyed");
+    }
+
+    /// Regression for the VM register-stack retention: after a scene is
+    /// `invalidate`d and the script drops it, some `Layer` wrappers stay
+    /// referenced from stale `TJSVariantArrayStack` register slots. The
+    /// vendored VM's `DoGarbageCollection` calls an empty
+    /// `TJSVariantArrayStackCompactNow`, so its `tjs2_do_gc` wrapper must
+    /// compact the stack; the wrappers then reach refcount 0 and
+    /// `layer_destroy` runs. The scene table already collapses before the fix
+    /// — only the native wrapper refcounts leaked — so this asserts the
+    /// native object count, not the scene.
+    #[test]
+    fn gc_releases_invalidated_layer_wrappers() {
+        let env = TestEnv::new("layer-gc-release");
+        let before = super::live_layer_count();
+        env.run(
+            "var w = new Window(); var p = new Layer(w, null); var c = new Layer(w, p); \
+             invalidate c; invalidate p; c = null; p = null; w = null;",
+        )
+        .unwrap();
+        assert_eq!(env.scene().layers.len(), 0, "scene must collapse");
+        assert!(
+            super::live_layer_count() > before,
+            "the native wrappers are expected to still be pinned by the VM \
+             register stack before the idle GC runs"
+        );
+        env.engine.do_gc().expect("garbage collection");
+        assert_eq!(
+            super::live_layer_count(),
+            before,
+            "the idle GC must release the invalidated Layer wrappers"
+        );
+    }
+
+    /// Regression for the cached-`Font` cycle. The game's `k2compat` runs
+    /// `this.font.doUserSelect = this.k2compat_doUserSelect` in a `Layer`
+    /// constructor hook, so the layer's (cached) font holds a closure whose
+    /// receiver is the layer. `Invalidate` must release the cached font
+    /// (reference `LayerIntf.cpp:552`), or the layer → font → layer cycle
+    /// pins the wrapper forever (TJS2 has no cycle collector).
+    #[test]
+    fn invalidate_releases_cached_font_and_breaks_the_cycle() {
+        let env = TestEnv::new("layer-font-cache");
+        let before = super::live_layer_count();
+        env.run(
+            "Layer.k2compat_doUserSelect = function(*) { return this; } incontextof null; \
+             var w = new Window(); \
+             var l = new Layer(w, null); \
+             l.font.doUserSelect = l.k2compat_doUserSelect; \
+             invalidate l; l = null; w = null;",
+        )
+        .unwrap();
+        assert_eq!(env.scene().layers.len(), 0, "scene must collapse");
+        assert!(
+            super::live_layer_count() > before,
+            "the cached font's doUserSelect closure is expected to pin the layer"
+        );
+        env.engine.do_gc().expect("garbage collection");
+        assert_eq!(
+            super::live_layer_count(),
+            before,
+            "invalidating the layer must release the cached font"
+        );
     }
 
     /// `invalidate` is the reference teardown the script uses on a scene

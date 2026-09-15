@@ -103,7 +103,7 @@ fn run_script(game_dir: &str, script: &str) -> Result<(), String> {
 
 fn run_list(game_dir: &str) -> Result<(), String> {
     let storage = Storage::mount(game_dir).map_err(|e| e.to_string())?;
-    for (path, arc) in storage.archives() {
+    storage.for_each_archive(|path, arc| {
         println!("{}  ({} entries)", path.display(), arc.len());
         for entry in arc.entries().take(20) {
             println!(
@@ -116,7 +116,7 @@ fn run_list(game_dir: &str) -> Result<(), String> {
         if arc.len() > 20 {
             println!("    ... {} more", arc.len() - 20);
         }
-    }
+    });
     Ok(())
 }
 

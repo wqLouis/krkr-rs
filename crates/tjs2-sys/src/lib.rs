@@ -319,6 +319,9 @@ unsafe extern "C" {
     /// Retain a raw TJS object (see the C++ side). Returns a per-engine id
     /// or 0 on failure.
     pub fn tjs2_retain_object(engine: *mut Engine, obj: *mut c_void) -> Tjs2ValueId;
+    /// Duplicate an existing retained id into a fresh id (the original stays
+    /// live). Used to return a cached object without consuming the cache.
+    pub fn tjs2_retain_retained_id(engine: *mut Engine, id: Tjs2ValueId) -> Tjs2ValueId;
     /// Find the retained id of a value already in the engine's retained
     /// map, without retaining anything new (identity match: the same
     /// function object + ObjThis). Returns the null id when not found.

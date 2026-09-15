@@ -31,9 +31,9 @@
 //! | `extractStorageExt/Name/Path`, `chopStorageExt` | pure string helpers
 //!   ported from the reference (they split on `/`, `\` and the `>` archive
 //!   delimiter). |
-//! | `clearArchiveCache()` | clears the positive placed-path cache and
-//!   remounts the storage so every XP3 handle is released and lazily reopened
-//!   (reference `TVPClearArchiveCache`). |
+//! | `clearArchiveCache()` | clears the positive placed-path cache and drops
+//!   every parsed XP3 archive, keeping the mounts; the next access re-opens
+//!   only the archives it has to scan (reference `TVPClearArchiveCache`). |
 //! | `stat(name)` / `fstat(name)` | a TJS dictionary with disk size and Date
 //!   timestamps, or archive-entry size. |
 //! | `selectFile(param)` | no headless GUI dialog exists, so behaves like a
@@ -524,15 +524,15 @@ fn get_file_list(mask: &str, attr: i64) -> Vec<String> {
     // Archive entries, addressed as "arc.xp3>path".
     {
         let storage = storage.lock().unwrap();
-        for (arc_path, arc) in storage.archives() {
+        storage.for_each_archive(|arc_path, arc| {
             let Some(arc_file) = arc_path.file_name() else {
-                continue;
+                return;
             };
             let arc_file = arc_file.to_string_lossy();
             if let Some(pat) = &arc_pat
                 && !wildcard_match(pat, &arc_file)
             {
-                continue;
+                return;
             }
             for entry in arc.entries() {
                 let base = entry.name.rsplit('/').next().unwrap_or(&entry.name);
@@ -541,7 +541,7 @@ fn get_file_list(mask: &str, attr: i64) -> Vec<String> {
                     found.insert(format!("{arc_file}>{}", entry.name));
                 }
             }
-        }
+        });
     }
 
     found.into_iter().collect()
@@ -909,19 +909,14 @@ extern "C" fn native_clear_archive_cache(
 ) -> c_int {
     // Reference `TVPClearArchiveCache` (`StorageIntf.cpp:728`) clears the
     // archive-handle cache; the port's placed-path cache is the reference's
-    // `TVPAutoPathCache`, so both are dropped here. The mounted XP3 handles
-    // live in `Storage`, so remount the game directory to release and
-    // reopen them lazily (a failure keeps the current handles).
+    // `TVPAutoPathCache`, so both are dropped here. The mount list (paths +
+    // `game_dir`) stays; only the parsed archives are dropped, and the next
+    // lookup re-opens just the archives it needs. Clearing must not itself
+    // open or re-parse any archive.
     clear_placed_path_cache();
     if let Some(storage) = storage_arc() {
-        let game_dir = storage.lock().unwrap().game_dir().to_path_buf();
-        match Storage::mount(&game_dir) {
-            Ok(fresh) => {
-                *storage.lock().unwrap() = fresh;
-                log::debug!("tvp-storages: cleared archive cache (remounted {game_dir:?})");
-            }
-            Err(e) => log::warn!("tvp-storages: clearArchiveCache remount failed: {e}"),
-        }
+        storage.lock().unwrap().clear_archive_cache();
+        log::debug!("tvp-storages: cleared archive cache");
     }
     set_void_out(out);
     0
@@ -2262,8 +2257,8 @@ mod tests {
             .unwrap();
         assert_eq!(engine.eval("pos", "t").unwrap(), TjsValue::Integer(5));
         assert_eq!(std::fs::read(path.join("new.bin")).unwrap(), b"hello");
-        // `clearArchiveCache` clears the placed-path cache and remounts the
-        // storage without disturbing the mounted game.
+        // `clearArchiveCache` clears the placed-path cache and drops the
+        // parsed archives without disturbing the mounts or disk files.
         engine
             .exec_script("Storages.clearArchiveCache();", "t")
             .unwrap();

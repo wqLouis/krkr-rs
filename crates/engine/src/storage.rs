@@ -1,6 +1,7 @@
 //! Game storage: mount a game directory and its `.xp3` archives, and resolve
 //! storage names the way the reference engine does.
 
+use std::cell::{Ref, RefCell};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -85,13 +86,77 @@ fn find_disk_case_insensitive(base: &Path, relative: &str) -> Option<PathBuf> {
     descend(base, &parts)
 }
 
+/// One mounted `.xp3` archive. The path is fixed at mount time; the parsed
+/// [`Xp3Archive`] is opened on first use and dropped by
+/// [`Storage::clear_archive_cache`], so a clear costs no archive I/O. The
+/// next lookup re-opens only the archives it actually has to scan.
+struct MountedArchive {
+    path: PathBuf,
+    /// Parsed archive, or `None` before the first use / after a cache clear.
+    archive: RefCell<Option<Xp3Archive>>,
+}
+
+impl MountedArchive {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            archive: RefCell::new(None),
+        }
+    }
+
+    /// Ensure the archive is parsed, opening it on demand. Kept separate from
+    /// the borrow-returning accessors so no `Ref` is ever held across the
+    /// mutation that populates the cell.
+    fn ensure_open(&self) -> Result<(), xp3::Error> {
+        if self.archive.borrow().is_some() {
+            return Ok(());
+        }
+        match Xp3Archive::open(&self.path) {
+            Ok(arc) => {
+                log::info!("opened {} ({} entries)", self.path.display(), arc.len());
+                *self.archive.borrow_mut() = Some(arc);
+                Ok(())
+            }
+            Err(e) => {
+                log::warn!("skipping {}: {e}", self.path.display());
+                Err(e)
+            }
+        }
+    }
+
+    /// The parsed archive, opening it on demand. `None` when the file is not
+    /// a readable XP3 archive.
+    fn get(&self) -> Option<Ref<'_, Xp3Archive>> {
+        self.ensure_open().ok()?;
+        Some(Ref::map(self.archive.borrow(), |a| {
+            a.as_ref().expect("archive opened by ensure_open")
+        }))
+    }
+
+    /// Mutable access for reading, opening on demand.
+    fn get_mut(&mut self) -> Result<&mut Xp3Archive, xp3::Error> {
+        self.ensure_open()?;
+        Ok(self
+            .archive
+            .get_mut()
+            .as_mut()
+            .expect("archive opened by ensure_open"))
+    }
+
+    /// Drop the parsed archive, keeping the mount (and its path).
+    fn drop_cache(&self) {
+        *self.archive.borrow_mut() = None;
+    }
+}
+
 /// A mounted game storage: one game directory plus all `.xp3` archives
 /// found inside it.
 pub struct Storage {
     /// Absolute path of the game directory.
     pub game_dir: PathBuf,
-    /// Opened archives in sorted-name order (deterministic).
-    archives: Vec<(PathBuf, Xp3Archive)>,
+    /// Mounted archives in sorted-name order (deterministic). Each archive is
+    /// parsed lazily on first use.
+    archives: Vec<MountedArchive>,
 }
 
 /// A resolved storage location.
@@ -134,16 +199,11 @@ impl Storage {
                 .map(|e| e.eq_ignore_ascii_case("xp3"))
                 .unwrap_or(false)
             {
-                match Xp3Archive::open(&path) {
-                    Ok(arc) => {
-                        log::info!("mounted {} ({} entries)", path.display(), arc.len());
-                        archives.push((path, arc));
-                    }
-                    Err(e) => log::warn!("skipping {}: {e}", path.display()),
-                }
+                // Record the mount only; parsing happens on first use.
+                archives.push(MountedArchive::new(path));
             }
         }
-        archives.sort_by(|a, b| a.0.cmp(&b.0));
+        archives.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(Storage { game_dir, archives })
     }
 
@@ -152,9 +212,34 @@ impl Storage {
         &self.game_dir
     }
 
-    /// Iterate over the mounted archives.
-    pub fn archives(&self) -> impl Iterator<Item = (&Path, &Xp3Archive)> {
-        self.archives.iter().map(|(p, a)| (p.as_path(), a))
+    /// Number of mounted archives, whether or not they have been parsed yet.
+    pub fn archive_count(&self) -> usize {
+        self.archives.len()
+    }
+
+    /// Run `f` for every mounted archive, opening each on demand. Archives
+    /// that cannot be opened are skipped (a warning is logged by the opener).
+    ///
+    /// This replaces the old `archives()` iterator: because a parsed archive
+    /// lives behind a `RefCell`, no caller may hold a borrow across a
+    /// (lazy-open) mutation, so the borrow is confined to the closure.
+    pub fn for_each_archive(&self, mut f: impl FnMut(&Path, &Xp3Archive)) {
+        for mounted in &self.archives {
+            if let Some(archive) = mounted.get() {
+                f(&mounted.path, &archive);
+            }
+        }
+    }
+
+    /// Drop every parsed archive, keeping the mount list and `game_dir`. This
+    /// is the reference `TVPClearArchiveCache()`: the cache of *open archive
+    /// objects* is cleared (`StorageIntf.cpp:728`), and the next access
+    /// re-opens on demand through `TVPArchiveCache::Get` → `TVPOpenArchive`.
+    /// The mount/auto-path table is not touched.
+    pub fn clear_archive_cache(&self) {
+        for mounted in &self.archives {
+            mounted.drop_cache();
+        }
     }
 
     /// Resolve a storage name to a location, mirroring the reference search
@@ -174,13 +259,14 @@ impl Storage {
                 .file_name()
                 .map(|f| f.to_string_lossy())
                 .unwrap_or_default();
-            let arc = self.archives.iter().find(|(p, _)| {
-                p.file_name()
+            let mounted = self.archives.iter().find(|m| {
+                m.path
+                    .file_name()
                     .is_some_and(|f| f.eq_ignore_ascii_case(&*arc_name))
             })?;
             let rest = normalize_in_archive_name(rest);
-            if arc.1.entry(&rest).is_some() {
-                return Some(Location::Archive(arc.0.clone(), rest));
+            if mounted.get()?.entry(&rest).is_some() {
+                return Some(Location::Archive(mounted.path.clone(), rest));
             }
             return None;
         }
@@ -198,9 +284,15 @@ impl Storage {
 
         // Archives, in mount order (looked up by the storage-relative name).
         let normalized = normalize_in_archive_name(&relative);
-        for (path, arc) in &self.archives {
-            if arc.entry(&normalized).is_some() {
-                return Some(Location::Archive(path.clone(), normalized));
+        for mounted in &self.archives {
+            // Resolve per archive and stop at the first hit, so a lookup after
+            // a cache clear parses at most the archives it must walk. An
+            // archive that fails to open is skipped, not fatal.
+            let Some(archive) = mounted.get() else {
+                continue;
+            };
+            if archive.entry(&normalized).is_some() {
+                return Some(Location::Archive(mounted.path.clone(), normalized));
             }
         }
 
@@ -291,11 +383,12 @@ impl Storage {
         match self.find(name) {
             Some(Location::Disk(path)) => Ok(fs::read(path)?),
             Some(Location::Archive(arc_path, in_arc)) => {
-                let (_, arc) = self
+                let mounted = self
                     .archives
                     .iter_mut()
-                    .find(|(p, _)| *p == arc_path)
+                    .find(|m| m.path == arc_path)
                     .expect("resolved archive must be mounted");
+                let arc = mounted.get_mut()?;
                 arc.read(&in_arc).map_err(ReadError::Xp3)
             }
             None => Err(ReadError::NotFound(name.to_string())),
@@ -320,11 +413,9 @@ impl Storage {
                 })
             }
             Some(Location::Archive(archive_path, in_archive)) => {
-                let archive = self
-                    .archives
-                    .iter()
-                    .find(|(path, _)| *path == archive_path)?;
-                let entry = archive.1.entry(&in_archive)?;
+                let mounted = self.archives.iter().find(|m| m.path == archive_path)?;
+                let archive = mounted.get()?;
+                let entry = archive.entry(&in_archive)?;
                 Some(StorageMetadata {
                     size: entry.org_size,
                     modified: None,
@@ -339,6 +430,16 @@ impl Storage {
     /// True if a storage name resolves.
     pub fn exists(&self, name: &str) -> bool {
         self.find(name).is_some()
+    }
+
+    /// Number of archives whose parsed form is currently cached. Test-only:
+    /// lets the storage tests observe the lazy open/clear behavior directly.
+    #[cfg(test)]
+    fn parsed_archive_count(&self) -> usize {
+        self.archives
+            .iter()
+            .filter(|m| m.archive.borrow().is_some())
+            .count()
     }
 }
 
@@ -365,6 +466,64 @@ pub enum ReadError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a minimal raw-index XP3 archive (no compression) for the lazy
+    /// cache tests. Layout matches what [`Xp3Archive::open`] expects.
+    fn build_xp3(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut file = Vec::new();
+        file.extend_from_slice(&xp3::XP3_MAGIC);
+        file.extend_from_slice(&0u64.to_le_bytes()); // index-offset slot
+
+        let mut file_chunks: Vec<Vec<u8>> = Vec::new();
+        for (name, data) in entries {
+            let start = file.len() as u64;
+            file.extend_from_slice(data);
+
+            let units: Vec<u16> = name.encode_utf16().collect();
+            let mut info = Vec::new();
+            info.extend_from_slice(b"info");
+            info.extend_from_slice(&((22 + units.len() * 2) as u64).to_le_bytes());
+            info.extend_from_slice(&0u32.to_le_bytes()); // flags
+            info.extend_from_slice(&(data.len() as i64).to_le_bytes());
+            info.extend_from_slice(&(data.len() as i64).to_le_bytes());
+            info.extend_from_slice(&(units.len() as i16).to_le_bytes());
+            for u in &units {
+                info.extend_from_slice(&u.to_le_bytes());
+            }
+
+            let mut segm = Vec::new();
+            segm.extend_from_slice(b"segm");
+            segm.extend_from_slice(&28u64.to_le_bytes());
+            segm.extend_from_slice(&0u32.to_le_bytes()); // raw segment
+            segm.extend_from_slice(&(start as i64).to_le_bytes());
+            segm.extend_from_slice(&(data.len() as i64).to_le_bytes());
+            segm.extend_from_slice(&(data.len() as i64).to_le_bytes());
+
+            let mut aldr = Vec::new();
+            aldr.extend_from_slice(b"aldr");
+            aldr.extend_from_slice(&4u64.to_le_bytes());
+            aldr.extend_from_slice(&0u32.to_le_bytes());
+
+            let mut fc = Vec::new();
+            fc.extend_from_slice(b"File");
+            fc.extend_from_slice(&((info.len() + segm.len() + aldr.len()) as u64).to_le_bytes());
+            fc.extend_from_slice(&info);
+            fc.extend_from_slice(&segm);
+            fc.extend_from_slice(&aldr);
+            file_chunks.push(fc);
+        }
+
+        let mut index_data = Vec::new();
+        for fc in &file_chunks {
+            index_data.extend_from_slice(fc);
+        }
+        let index_ofs = file.len() as u64;
+        file.push(0u8); // raw index block
+        file.extend_from_slice(&(index_data.len() as u64).to_le_bytes());
+        file.extend_from_slice(&index_data);
+        file[11..19].copy_from_slice(&index_ofs.to_le_bytes());
+        file
+    }
 
     #[test]
     fn normalize_matches_reference() {
@@ -484,6 +643,120 @@ mod tests {
                 .unwrap()
                 .join(format!("TvpStorage-neighbour-{}.dat", std::process::id())),
         );
+    }
+
+    #[test]
+    fn clear_archive_cache_drops_parsed_archives_without_opening() {
+        let dir = TempDir::new("clear-cache");
+        fs::write(
+            dir.path().join("data.xp3"),
+            build_xp3(&[("data/inside.txt", b"hello from archive")]),
+        )
+        .unwrap();
+        let mut storage = Storage::mount(dir.path()).unwrap();
+
+        // Mounting records the path but parses nothing.
+        assert_eq!(storage.archive_count(), 1);
+        assert_eq!(storage.parsed_archive_count(), 0);
+
+        // The first lookup parses exactly the one archive it scans.
+        assert!(storage.find("data/inside.txt").is_some());
+        assert_eq!(storage.parsed_archive_count(), 1);
+        assert_eq!(
+            storage.read("data/inside.txt").unwrap(),
+            b"hello from archive"
+        );
+
+        // The clear drops the parsed archive and opens nothing itself.
+        storage.clear_archive_cache();
+        assert_eq!(storage.parsed_archive_count(), 0);
+        assert_eq!(storage.archive_count(), 1);
+
+        // ...and the name still resolves and reads after the clear.
+        assert!(storage.find("data/inside.txt").is_some());
+        assert_eq!(storage.parsed_archive_count(), 1);
+        assert_eq!(
+            storage.read("data/inside.txt").unwrap(),
+            b"hello from archive"
+        );
+    }
+
+    #[test]
+    fn clear_archive_cache_reopens_only_as_far_as_needed() {
+        // A name in the first archive must resolve after one parse; a name in
+        // the second must resolve after walking (and parsing) both.
+        let dir = TempDir::new("clear-cache-two");
+        fs::write(dir.path().join("a.xp3"), build_xp3(&[("only/a.txt", b"a")])).unwrap();
+        fs::write(dir.path().join("b.xp3"), build_xp3(&[("only/b.txt", b"b")])).unwrap();
+        let storage = Storage::mount(dir.path()).unwrap();
+        assert_eq!(storage.archive_count(), 2);
+        assert_eq!(storage.parsed_archive_count(), 0);
+
+        assert_eq!(
+            storage.find("only/a.txt"),
+            Some(Location::Archive(
+                dir.path().join("a.xp3"),
+                "only/a.txt".into()
+            ))
+        );
+        assert_eq!(storage.parsed_archive_count(), 1);
+
+        storage.clear_archive_cache();
+        assert_eq!(storage.parsed_archive_count(), 0);
+
+        assert_eq!(
+            storage.find("only/b.txt"),
+            Some(Location::Archive(
+                dir.path().join("b.xp3"),
+                "only/b.txt".into()
+            ))
+        );
+        assert_eq!(storage.parsed_archive_count(), 2);
+    }
+
+    #[test]
+    fn repeated_clear_and_lookup_cycles_stay_correct() {
+        let dir = TempDir::new("clear-cache-cycles");
+        fs::write(
+            dir.path().join("x.xp3"),
+            build_xp3(&[("n/value.txt", b"v")]),
+        )
+        .unwrap();
+        let mut storage = Storage::mount(dir.path()).unwrap();
+        for _ in 0..3 {
+            assert!(storage.exists("n/value.txt"));
+            assert_eq!(storage.read("n/value.txt").unwrap(), b"v");
+            storage.clear_archive_cache();
+            assert_eq!(storage.parsed_archive_count(), 0);
+            assert!(storage.exists("n/value.txt"));
+        }
+    }
+
+    #[test]
+    fn unreadable_archive_is_skipped_but_not_cached() {
+        // A `.xp3` that is not an XP3 must not make lookups fail; it is
+        // logged and skipped, and its failure is not cached as an open
+        // archive. Disk files and later archives still resolve.
+        let dir = TempDir::new("bad-archive");
+        fs::write(dir.path().join("a.xp3"), b"not an xp3").unwrap();
+        fs::write(
+            dir.path().join("b.xp3"),
+            build_xp3(&[("real.txt", b"real")]),
+        )
+        .unwrap();
+        fs::write(dir.path().join("disk.txt"), b"disk").unwrap();
+        let mut storage = Storage::mount(dir.path()).unwrap();
+        assert!(storage.exists("disk.txt"));
+        assert_eq!(
+            storage.find("real.txt"),
+            Some(Location::Archive(
+                dir.path().join("b.xp3"),
+                "real.txt".into()
+            ))
+        );
+        assert_eq!(storage.read("real.txt").unwrap(), b"real");
+        // Only the valid archive became cached.
+        assert_eq!(storage.parsed_archive_count(), 1);
     }
 }
 

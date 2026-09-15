@@ -43,6 +43,24 @@ cargo build --release
 The test game used during development is at `/mnt/DATA/Games/Others/test`
 (not part of this repo).
 
+## Movies and FFmpeg
+
+The `VideoOverlay` movie path (MP4/H.264 + AAC) decodes through the **system
+FFmpeg** libraries (`libavformat` / `libavcodec` / `libswscale` /
+`libswresample`), resolved via `pkg-config`. It is enabled by default through
+the `ffmpeg` feature and can be dropped with `--no-default-features` on
+systems that cannot provide FFmpeg:
+
+```bash
+cargo build --no-default-features
+```
+
+Without the feature the crate still compiles: `video::MovieDecoder` keeps the
+same API, but every constructor/method returns a descriptive error (and
+`video::init()` is a no-op), so a game that plays a movie gets a real error to
+report instead of empty frames. **Android builds currently have no movie
+decoder** — a MediaCodec-backed implementation is a follow-up.
+
 ## Development
 
 ```bash

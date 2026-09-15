@@ -190,6 +190,10 @@ char *tjs2_get_stack_trace_string(void *engine, int limit);
 /* Retain a raw TJS object (see tjs2_abi.cpp). Returns a per-engine id or NULL. */
 tjs2_value_id tjs2_retain_object(void *engine, void *obj);
 
+/* Duplicate an existing retained id into a fresh id (the original stays
+ * live). Used to return a cached object without consuming the cache. */
+tjs2_value_id tjs2_retain_retained_id(void *engine, tjs2_value_id id);
+
 /*
  * Invoke the retained value's default member (FuncCall, no membername, no
  * objthis) with argc arguments. On success returns 0 and, if out is
