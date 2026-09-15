@@ -1,110 +1,115 @@
-# krkr-rs — a KiriKiri2 (TVP) visual-novel engine in Rust + Bevy
+<p align="center">
+  <img src="icon.png" alt="krkr-rs" width="180">
+</p>
 
-krkr-rs is a from-scratch Rust rewrite of the **krkr2 / KiriKiri2** visual-novel
-engine — the engine behind thousands of Japanese visual novels (`.ks` scenario
-scripts, `.tjs` scripts, `.xp3` archives). The goal: run a real game end to end.
+<h1 align="center">krkr-rs</h1>
 
-- **Rust** — all game logic, scripting integration, and asset handling.
-- **Bevy 0.19** — rendering (window, GPU sprites, input), ECS, app lifecycle.
-- **C++ TJS2 VM** — kept as-is (vendored + minimally patched), compiled by
-  `build.rs` with `zig c++` (no cmake), statically linked via `tjs2-sys`.
+<p align="center">
+  <b>The KiriKiri2 (TVP) visual-novel engine, reimplemented in Rust + Bevy — ported
+  from the <a href="https://github.com/2468785842/krkr2">krkr2</a> reference sources.</b>
+</p>
 
-## Status
+<p align="center">
+  <b>English</b> · <a href="README.zh-CN.md">简体中文</a>
+</p>
 
-| Area | State |
-|---|---|
-| `.xp3` mounting / storage | ✅ real archives (data.xp3: 23,572 entries) |
-| `startup.tjs` execution | ✅ full init chain (k2compat, `system/*.tjs`, `begin.tjs`) |
-| Plugin surface (`Plugins.link`) | ✅ emulated as built-in natives (csvParser, fstat, windowEx, KAGParser, menu, extrans, wuvorbis) |
-| TLG5/TLG6 image decode | ✅ real KiriKiri formats (byte-identical to reference) |
-| Logo → Title scene flow | ✅ full logo → ATTENTION → title transition completes (verified headlessly) |
-| Input bridge (mouse/key → script) | ✅ wired; layer hit-testing + title menu clicks |
-| Window resizing | ✅ camera scales the 1280×720 scene (aspect-preserving) |
-| Graceful quit | ✅ window close + `System.exit`/`terminate` → `AppExit` |
-| Audio (BGM/SE/voice) | ✅ rodio output; real Ogg Opus/Vorbis decode (symphonia 0.6) |
-| GPU blend modes | ✅ `layer.type` → real blend states (over / add / reverse-subtract / replace) |
-| ADV scenario loop | 🔶 runs to the first `hitret` (dialogue text rasterizes); `@update`/`@blackout` interpolation still approximate |
+---
 
-Details and the full investigation log are in [TODO.md](TODO.md).
-
-## Quick start
+krkr-rs plays **real, unmodified KiriKiri games** — the same `.xp3` archives,
+`.tjs` scripts and `.ks` scenarios they ship with, untouched. Point it at a game
+folder and it runs:
 
 ```bash
-cargo build --release
-
-# Run a real game (windowed — needs a display/GPU):
-./target/release/krkr-rs run "/path/to/game"
-
-# Headless smoke test (no window; dumps the scene once):
-./target/release/krkr-rs run "/path/to/game" --headless
-# → must print "startup.tjs executed successfully"
+./target/debug/krkr-rs run "/path/to/game"
 ```
 
-The test game used during development is at `/mnt/DATA/Games/Others/test`
-(not part of this repo).
+Menu → title → scenario → dialogue → saves → video, on real games. No game files
+are modified, converted, or repacked.
 
-## Movies and FFmpeg
+## The breakthrough
 
-The `VideoOverlay` movie path (MP4/H.264 + AAC) decodes through the **system
-FFmpeg** libraries (`libavformat` / `libavcodec` / `libswscale` /
-`libswresample`), resolved via `pkg-config`. It is enabled by default through
-the `ffmpeg` feature and can be dropped with `--no-default-features` on
-systems that cannot provide FFmpeg:
+**The engine was rebuilt, not wrapped.**
+
+This is a **port**, not a clean-room project. The original KiriKiri2/TVP C++
+sources — [krkr2](https://github.com/2468785842/krkr2) — are the reference for
+every native semantic, file format and edge case here: behaviour was read out of
+them and reproduced, not guessed or reinvented. What krkr-rs brings is a
+different application around that behaviour: the original's Android platform
+layer is built on **Cocos2d-x**, and krkr-rs replaces that whole stack with
+**Rust + Bevy**, rendering through **Vulkan** (via Bevy/wgpu — which also brings
+Metal, DirectX 12 and GLES along for free, and, with the same codebase, an
+Android app).
+
+Almost everything above the scripting language is a native Rust reimplementation
+— each piece ported against its counterpart in the reference sources:
+
+- **Archives and storage** — real `.xp3` reading, chained indexes, the
+  `Storages` / `Scripts` APIs, and the case-insensitive semantics the games rely
+  on.
+- **Graphics** — KiriKiri's own **TLG5/TLG6** formats plus PNG/JPEG/WebP/BMP/GIF
+  and more, the full `Layer` compositing model, every one of the engine's blend
+  modes, affine layers, transitions and screen capture.
+- **Text** — the `.tft` pre-rendered fonts and real font rasterization, with the
+  baseline and measurement behaviour the layout code depends on.
+- **Audio** — Ogg Vorbis and Opus, `.sli` looping, `WaveSoundBuffer` /
+  `SoundChannel`, mixed and streamed through the platform's audio stack.
+- **Video** — MP4/H.264/AAC: FFmpeg on desktop, **MediaCodec** on Android.
+- **The KAG scenario language** — parser and tags, saves and loads, the in-game
+  save/load and configuration screens.
+- **Input, windows and the Win32-flavoured API surface** that the games call
+  into, including hundreds of native members discovered by diffing against the
+  original and machine-checked for parity.
+
+One deliberate exception: the **TJS2 virtual machine is the original C++ one** —
+vendored, minimally patched, and driven through a thin Rust FFI layer. Language
+and script-level compatibility matters more here than rewriting the VM, and it is
+what lets unmodified games run.
+
+And it is not desktop-only: an **Android frontend** is in the tree — a native
+**Material 3** launcher that picks a game folder through the system file picker
+and hands it to the same engine, built for `arm64-v8a` with the NDK.
+
+## With thanks
+
+krkr-rs would not exist without **[krkr2](https://github.com/2468785842/krkr2)**
+by [@2468785842](https://github.com/2468785842) — the KiriKiri2/TVP sources that
+serve as the reference for this port.
+
+Having the original implementation available to read is what makes a faithful
+rewrite possible: native semantics, file formats and edge cases were ported from
+it rather than guessed, and its behaviour is the standard this project measures
+itself against. Huge thanks to the author and to everyone who has kept KiriKiri
+alive.
+
+## Building and running
 
 ```bash
-cargo build --no-default-features
+cargo build
+
+# windowed
+./target/debug/krkr-rs run "/path/to/game"
+
+# headless smoke test (no window or GPU; dumps the scene once)
+./target/debug/krkr-rs run "/path/to/game" --headless
 ```
 
-Without the feature the crate still compiles: `video::MovieDecoder` keeps the
-same API, but every constructor/method returns a descriptive error (and
-`video::init()` is a no-op), so a game that plays a movie gets a real error to
-report instead of empty frames. **Android builds currently have no movie
-decoder** — a MediaCodec-backed implementation is a follow-up.
+Movie playback uses the system FFmpeg libraries and can be disabled on systems
+that cannot provide them (`cargo build --no-default-features`); everything else
+builds either way.
 
-## Development
+Android: see [`android/README.md`](android/README.md).
 
-```bash
-cargo test --workspace          # unit + integration, full parallel speed
-cargo clippy --workspace --all-targets -- -D warnings
-cargo fmt --check
-```
+## Documentation
 
-The TJS2 VM is **single-threaded**: crates that embed it serialize their own
-tests with a per-crate process-wide lock (`VM_LOCK`), so the rest of the
-workspace still runs fully parallel. `run_vm` in the render crate also holds a
-global lock because Bevy's scheduler moves systems across worker threads —
-without it the shared native state (sound streams, timer registry, continuous
-handlers) deadlocks across threads.
+- [`docs/`](docs) — design notes and investigations (portability, fonts,
+  rendering, parity).
+- [`docs/android.md`](docs/android.md) — the Android port: architecture,
+  decisions, milestones, open questions.
+- [`docs/native_parity.md`](docs/native_parity.md) — how the engine's native
+  surface is machine-checked against the original.
+- [`TODO.md`](TODO.md) — what is done, what is next, and the full investigation
+  log.
 
-## Repo layout
+## License
 
-```
-crates/
-  xp3, tvp-archive      — XP3 archive parsing
-  tjs2-sys              — vendored C++ TJS2 VM + FFI (zig c++ build)
-  engine                — storage mount + game loader
-  tvp-config            — ConfigManager ports (global/individual/locale)
-  tvp-util              — encoding / md5 / random / path utilities
-  tvp-streams           — binary + text stream ports (tTJSBinaryStream)
-  tvp-natives           — System / Debug / Plugins / MenuItem / Trans natives
-  tvp-storages          — Storages natives (getFileList, stat, copy, delete)
-  tvp-scripts           — Scripts natives
-  tvp-kagparser         — KAGParser natives (scenario .ks parsing)
-  kag                   — pure-Rust KAG `.ks` scenario parser (no VM)
-  tvp-visual            — Window / Layer / Bitmap / Font / Timer natives + Scene
-  tvp-sound             — WaveSoundBuffer / SoundChannel natives + mixer + rodio output
-  tvp-text              — text layout / rasterization for Layer.drawText
-  tvp-input             — input state bridge
-  render                — Bevy app: krkr-rs binary (windowed game runner)
-  app                   — krkr-cli binary (headless load/run/list tools)
-```
-
-## Reference material
-
-The upstream C++ sources live under `reference/` (krkr2 core + plugins) — the
-porting source of truth for native semantics. `scripts/extract_xp3.py` pulls
-files out of a game's `.xp3` to read its scripts:
-
-```bash
-./scripts/extract_xp3.py /path/to/game/data.xp3 system/Title.tjs
-```
+MIT OR Apache-2.0, at your option.
