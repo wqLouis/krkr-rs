@@ -524,17 +524,21 @@ fn signature_of(nodes: &[MenuNode], open: &[i64], popup: Option<Vec2>) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Mutex, MutexGuard};
+    use std::sync::MutexGuard;
 
     use super::*;
     use tjs2_sys::{Tjs2Engine, TjsValue};
 
     /// The VM and the menu registry are process-global; serialize the tests
-    /// that build a real `MenuItem` tree.
-    static MENU_TEST_LOCK: Mutex<()> = Mutex::new(());
-
+    /// that build a real `MenuItem` tree. Use the *shared* `tvp_visual` lock
+    /// (not a module-local one): the input-bridge tests in this same test
+    /// binary also register into the global VM context, and two independent
+    /// locks let a menu test and an input test run at once (observed as a
+    /// sporadic SIGSEGV).
     fn test_lock() -> MutexGuard<'static, ()> {
-        MENU_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+        tvp_visual::natives::vm_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
     }
 
     fn engine() -> &'static Tjs2Engine {
@@ -708,6 +712,15 @@ mod tests {
         assert!(delta_node.checked);
         assert_eq!(delta_node.shortcut, "Ctrl+D");
         assert_eq!(marker_caption(&delta_node), "\u{2713} Delta");
+
+        // Cleanup: the native menu registry is process-global; hide this
+        // test's tree so a later test in this binary does not render its rows.
+        engine
+            .exec_script(
+                "root.children[0].visible = false; root.children[1].visible = false; root.children[2].visible = false; root.children[3].visible = false;",
+                "menu-bar-cleanup",
+            )
+            .unwrap();
     }
 
     /// `popup(flags, x, y)` renders the item's submenu at the requested client

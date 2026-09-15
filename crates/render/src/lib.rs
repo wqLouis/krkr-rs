@@ -11,7 +11,9 @@
 //! sync system.
 
 pub mod blend;
+pub mod input_bridge;
 pub mod menu;
+pub mod runner;
 pub mod sync;
 
 pub use blend::{

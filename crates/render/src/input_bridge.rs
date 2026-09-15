@@ -6,8 +6,8 @@
 //! protocol each frame, and then diffuses the state into the game's script
 //! objects so the title screen's buttons become clickable.
 //!
-//! Two `Update` systems, chained and ordered *after* [`crate::run_vm`] (see
-//! `main.rs`) so they never touch the single-threaded TJS VM concurrently:
+//! Two `Update` systems, chained and ordered *after* [`crate::runner::run_vm`] (see
+//! `runner.rs`) so they never touch the single-threaded TJS VM concurrently:
 //!
 //! * [`capture_input`] drains Bevy's `ButtonInput<MouseButton>`,
 //!   `ButtonInput<KeyCode>`, `Query<&Gamepad>`, `CursorMoved`, `MouseWheel`
@@ -54,9 +54,9 @@ use tvp_input::{
 };
 use tvp_visual::scene::Scene;
 
-use krkr_render::sync::{SharedScene, WindowRedrawRequested};
+use crate::sync::{SharedScene, WindowRedrawRequested};
 
-use crate::VmRuntime;
+use crate::runner::VmRuntime;
 
 /// Fallback game resolution (the title screen's native size) used when the
 /// scene has no window yet.
@@ -175,10 +175,10 @@ impl FrameEvents {
 
 /// Drain Bevy input into the shared `tvp_input::InputState` for this frame.
 ///
-/// Runs before [`dispatch_input`] (chained in `main.rs`) and after
+/// Runs before [`dispatch_input`] (chained in `runner.rs`) and after
 /// `run_vm`, so scripts never see input mid-poll. Cursor positions are
 /// mapped from the OS window into game (primary-layer) coordinates by
-/// [`krkr_render::sync::window_to_game_transform`], which applies the same
+/// [`crate::sync::window_to_game_transform`], which applies the same
 /// aspect-preserving scale the scene camera uses.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn capture_input(
@@ -203,7 +203,7 @@ pub(crate) fn capture_input(
         .filter(|(w, h)| *w > 0.0 && *h > 0.0)
         .unwrap_or((game_w as f32, game_h as f32));
     let (scale, offset_x, offset_y) =
-        krkr_render::sync::window_to_game_transform(window_size, (game_w, game_h));
+        crate::sync::window_to_game_transform(window_size, (game_w, game_h));
     // Logical window pixels → game (primary-layer) coordinates, clamped to
     // the game bounds. The inverse of this mapping is `game_to_window_pixel`.
     let to_game = |px: f32, py: f32| -> (i32, i32) {
@@ -316,13 +316,13 @@ pub(crate) fn capture_input(
 /// window's logical rendering resolution (the primary layer's size), falling
 /// back to the title size.
 ///
-/// This must match [`krkr_render::sync::scene_projection`]'s logical size
+/// This must match [`crate::sync::scene_projection`]'s logical size
 /// exactly — the primary layer, *not* the possibly-zoomed client size — so
 /// that cursor/input coordinates stay in the coordinate space the game's
 /// layers and hit rectangles use.
 fn game_size(shared: &SharedScene) -> (u32, u32) {
     let scene = shared.0.read().expect("shared scene lock poisoned");
-    krkr_render::sync::first_window_logical_size(&scene).unwrap_or(DEFAULT_GAME_SIZE)
+    crate::sync::first_window_logical_size(&scene).unwrap_or(DEFAULT_GAME_SIZE)
 }
 
 /// Map a Bevy [`KeyCode`] to the Windows virtual-key code the game's
@@ -530,10 +530,8 @@ fn apply_mouse_warp(windows: &mut Query<&mut Window>, shared: &SharedScene, game
     if window.width() <= 0.0 || window.height() <= 0.0 {
         return;
     }
-    let transform = krkr_render::sync::window_to_game_transform(
-        (window.width(), window.height()),
-        game_size(shared),
-    );
+    let transform =
+        crate::sync::window_to_game_transform((window.width(), window.height()), game_size(shared));
     let (px, py) = game_to_window_pixel(game, transform);
     window.set_cursor_position(Some(Vec2::new(px, py)));
 }
@@ -547,14 +545,14 @@ fn apply_mouse_warp(windows: &mut Query<&mut Window>, shared: &SharedScene, game
 ///   window to the foreground). A separate z-order raise is not available
 ///   through Bevy 0.19, so this is the closest primitive.
 /// * `Window.update()` → set [`WindowRedrawRequested`], which
-///   [`krkr_render::sync::sync_scene`] consumes this frame to bypass its idle
+///   [`crate::sync::sync_scene`] consumes this frame to bypass its idle
 ///   fast path.
 /// * `Window.resetMouseVelocity()` → clear the host mouse-velocity tracker
 ///   that feeds `Window.getMouseVelocity`.
 ///
 /// Every queue is drained, even though the host has a single primary window
 /// and a request's scene window id does not distinguish anything, so they can
-/// never accumulate. Run before `sync_scene` (see `main.rs`).
+/// never accumulate. Run before `sync_scene` (see `runner.rs`).
 pub(crate) fn consume_window_requests(
     mut windows: Query<&mut Window>,
     mut redraw: ResMut<WindowRedrawRequested>,
@@ -1475,7 +1473,7 @@ mod tests {
             (1000.0, 720.0),
             (800.0, 600.0),
         ] {
-            let transform = krkr_render::sync::window_to_game_transform(window, game);
+            let transform = crate::sync::window_to_game_transform(window, game);
             let (px, py) = game_to_window_pixel((640, 360), transform);
             assert!(
                 (px - window.0 / 2.0).abs() < 1e-3 && (py - window.1 / 2.0).abs() < 1e-3,
@@ -1483,7 +1481,7 @@ mod tests {
             );
         }
         // Exact 16:9 needs no offset.
-        let transform = krkr_render::sync::window_to_game_transform((2560.0, 1440.0), game);
+        let transform = crate::sync::window_to_game_transform((2560.0, 1440.0), game);
         assert_eq!(game_to_window_pixel((0, 0), transform), (0.0, 0.0));
         assert_eq!(
             game_to_window_pixel((1280, 720), transform),
