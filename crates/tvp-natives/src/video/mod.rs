@@ -1,6 +1,10 @@
 //! Movie decoding for [`VideoOverlay`](crate::video_overlay).
 //!
-//! # With the `ffmpeg` feature (default)
+//! The backend is selected by configuration; the public API
+//! ([`MovieDecoder`], [`MovieMetadata`], [`RgbaFrame`], [`DecodedAudioPcm`])
+//! is identical in all three cases.
+//!
+//! # With the `ffmpeg` feature (desktop default)
 //!
 //! [`MovieDecoder`] is backed by the system FFmpeg libraries (`libavformat` +
 //! `libavcodec` + `libswscale` + `libswresample`). The game's movies are
@@ -11,16 +15,24 @@
 //! to tightly-packed RGBA8 on demand and decodes the whole audio track to
 //! interleaved `f32` PCM.
 //!
-//! # Without the feature (e.g. Android)
+//! # On Android without the feature
 //!
-//! When the crate is built with `--no-default-features` (or a dependent
-//! disables the feature) there is no FFmpeg to link. [`init`] is a no-op and
-//! every [`MovieDecoder`] constructor/method returns a descriptive `Err`
-//! instead of silently succeeding, so a game that tries to play a movie gets
-//! a real error it can report. The public types ([`MovieMetadata`],
-//! [`RgbaFrame`], [`DecodedAudioPcm`]) are identical in both configurations.
+//! When the crate is built for `target_os = "android"` with the `ffmpeg`
+//! feature off (the Android app does this), [`MovieDecoder`] is backed by the
+//! NDK's **MediaCodec** C API (`libmediandk`): `AMediaExtractor` demuxes the
+//! same in-memory MP4 buffer and `AMediaCodec` decodes H.264/AAC. The private
+//! `android` submodule documents exactly what is host-tested,
+//! compile-verified and still unverifiable without a device.
 //!
-//! # Shape (both configurations)
+//! # Without either decoder
+//!
+//! On any other target built with `--no-default-features` there is no decoder
+//! at all. [`init`] is a no-op and every [`MovieDecoder`]
+//! constructor/method returns a descriptive `Err` instead of silently
+//! succeeding, so a game that tries to play a movie gets a real error it can
+//! report.
+//!
+//! # Shape (all configurations)
 //!
 //! * `MovieDecoder::open` demuxes the buffer, builds the video/audio
 //!   decoders and reads [`MovieMetadata`] (`originalWidth`, `originalHeight`,
@@ -34,14 +46,24 @@
 //!
 //! Everything is confined to the VM thread: decoder contexts are not shared.
 
+//! The platform-independent YUV → RGBA conversion and timestamp rescaling
+//! live in the private `yuv` submodule and are compiled (and unit-tested) on
+//! every target.
+
+#[cfg(all(not(feature = "ffmpeg"), target_os = "android"))]
+mod android;
 #[cfg(feature = "ffmpeg")]
 mod ffmpeg;
-#[cfg(not(feature = "ffmpeg"))]
+#[cfg(all(not(feature = "ffmpeg"), not(target_os = "android")))]
 mod unsupported;
 
+mod yuv;
+
+#[cfg(all(not(feature = "ffmpeg"), target_os = "android"))]
+pub use android::MovieDecoder;
 #[cfg(feature = "ffmpeg")]
 pub use ffmpeg::MovieDecoder;
-#[cfg(not(feature = "ffmpeg"))]
+#[cfg(all(not(feature = "ffmpeg"), not(target_os = "android")))]
 pub use unsupported::MovieDecoder;
 
 #[cfg(feature = "ffmpeg")]
@@ -150,7 +172,8 @@ pub fn init() -> Result<(), String> {
 
 /// Initialize the movie decoder once per process.
 ///
-/// This build has no `ffmpeg` feature, so there is nothing to initialize and
+/// Without the `ffmpeg` feature there is nothing to initialize: MediaCodec
+/// needs no global setup and the fallback build has no decoder at all, so
 /// this always returns `Ok(())`.
 #[cfg(not(feature = "ffmpeg"))]
 pub fn init() -> Result<(), String> {
