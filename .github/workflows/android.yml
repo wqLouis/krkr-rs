@@ -29,7 +29,10 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  # `contents: write` is needed to publish the APK to a GitHub Release when the
+  # run was triggered by a tag. The default is read-only, which would make the
+  # release step fail with a confusing 403.
+  contents: write
 
 concurrency:
   group: android-${{ github.ref }}
@@ -145,3 +148,27 @@ jobs:
           path: android/app/build/outputs/apk/release/*.apk
           if-no-files-found: error
           retention-days: 14
+
+      # A tag run also becomes a GitHub Release, with the APK attached — an
+      # artifact is only reachable from the run that produced it, whereas the
+      # release is where someone who just wants the app will look. A branch run
+      # has no tag to hang a release on, so it stops at the artifact.
+      #
+      # `gh` rather than a third-party release action: fewer moving parts, and
+      # the token is already in the environment.
+      - name: Publish the APK as a GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          apk=android/app/build/outputs/apk/release/app-release.apk
+          if gh release view "$tag" >/dev/null 2>&1; then
+            # Re-running a tag build must not fail on an existing release.
+            gh release upload "$tag" "$apk" --clobber
+          else
+            gh release create "$tag" "$apk" \
+              --title "krkr-rs $tag" \
+              --notes "Android build (arm64-v8a, Android 15+) from \`$GITHUB_SHA\`." \
+              --verify-tag
+          fi
