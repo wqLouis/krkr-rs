@@ -284,19 +284,48 @@ debugging.
 - Gradle (9.7.1 was used) and a JDK. There is still no Gradle wrapper in the
   repo — its jar is a binary — so CI installs a pinned Gradle instead.
 
-**AGP 9 gotchas, all three found by actually building** (see the commit that
-fixed them): the Kotlin plugin `org.jetbrains.kotlin.android` is a *hard error*
-now that AGP has built-in Kotlin support; `kotlinOptions { jvmTarget }` no longer
-resolves for the same reason; and `androidx.appcompat` must be an explicit
-dependency because `GameActivity` derives from `AppCompatActivity`.
+**16 KB page size.** Android 15+ devices may use 16 KB pages (mandatory for
+new devices), and a library built with NDK r27 or older must be linked with
+`-Wl,-z,max-page-size=16384` or the loader rejects it. Measured symptom of
+getting this wrong: every `PT_LOAD` in the staged `.so` had `p_align = 0x1000`
+while AndroidX's own packaged library is `0x4000` — and because the manifest
+sets `extractNativeLibs=false`, the `.so` is mapped straight out of the APK,
+which is exactly the affected path. `build-android.sh` now passes the flag *and
+verifies* the staged library with `readelf`, failing loudly otherwise, so a
+non-compliant build cannot be shipped.
 
-**CI.** `.github/workflows/android.yml` runs **only on the `android` branch and
-on tags** (`v*`, `android-*`), plus manual `workflow_dispatch` — never on the
-default branch, so ordinary engine work cannot trigger an Android build. It
-installs JDK 17, the SDK/NDK and `bison`, then calls the same script and runs
-`gradle assembleRelease`, uploading the APK. **It has never been triggered**, so
-the workflow itself is unverified — only the commands inside it are, having been
-run by hand here.
+**AGP 9 gotchas, all found by actually building** (see the commits that fixed
+them): the Kotlin plugin `org.jetbrains.kotlin.android` is a *hard error* now
+that AGP has built-in Kotlin support; `kotlinOptions { jvmTarget }` no longer
+resolves for the same reason; `androidx.appcompat` must be an explicit
+dependency; and — the one that actually crashed on a device —
+`Theme.Krkr.Fullscreen` must derive from an **AppCompat** theme, because the
+AGDK `GameActivity` extends `AppCompatActivity`:
+
+```
+java.lang.IllegalStateException: You need to use a Theme.AppCompat theme
+(or descendant) with this activity.
+  at com.google.androidgamesdk.GameActivity.onCreateSurfaceView(GameActivity.java:285)
+```
+
+That throw happens inside `super.onCreate`, *before* the native library loads,
+so it is invisible to the engine and the app showed only a black screen.
+
+**CI.** `.github/workflows/android.yml` runs **only on tags** (`android-*`) and
+manual `workflow_dispatch` — never on the default branch, so ordinary engine
+work cannot trigger an Android build. It installs JDK 17, the SDK/NDK, Zig
+(the C++ dependency fetch needs it) and `bison`, calls the same script, runs
+`gradle assembleRelease`, and publishes the APK to the GitHub Release for the
+tag. It has run repeatedly; the `android-v1.0.0` release carries the built APK.
+
+**Diagnostics on a device.** Because a failure here is otherwise invisible (the
+engine's stdout/stderr is discarded, and `MANAGE_EXTERNAL_STORAGE` needs the
+user to visit a Settings page that no `requestPermissions` call can reach), the
+engine writes `<filesDir>/krkr.log` and an atomically-written
+`<filesDir>/krkr_state.json` (`starting`/`running`/`failed`/`stopped` plus the
+real error message and pid), and the launcher turns that into a dialog with the
+reason and a **Logs** screen that can copy or share it. A crash is recognised
+by a stale `starting`/`running` whose pid is no longer the current process.
 
 Two deliberate choices worth restating:
 
