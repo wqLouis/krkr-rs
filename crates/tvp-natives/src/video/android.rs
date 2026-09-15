@@ -38,11 +38,11 @@
 //!
 //! # Known deviations from the FFmpeg backend
 //!
-//! * `MovieMetadata::fps` / `total_frames` can only be populated when the
-//!   container exposes `frame-rate` / `frame-count` extractor keys; MediaCodec
-//!   has no `AVStream::nb_frames` and no `avg_frame_rate` fallback, so a
-//!   container that omits them yields `fps = 0` and a derived (or zero) frame
-//!   count, where FFmpeg might still report a value.
+//! * `MovieMetadata::fps` / `total_frames` come from a one-shot walk of the
+//!   extractor's sample table (plus the `frame-rate`/`frame-count` keys when
+//!   present), because MediaCodec has no `AVStream::nb_frames`. The walk reads
+//!   only sample timestamps, not pixels, but it is extra work the FFmpeg
+//!   backend gets for free from the stream index.
 //! * The decoded frame is the cropped display rectangle (`crop-*`), so its
 //!   dimensions can be smaller than the coded `width`/`height` where FFmpeg
 //!   uses the decoder's frame size.
@@ -341,11 +341,20 @@ impl MovieDecoder {
 
         let (video_streams, audio_streams, video_track, audio_track) =
             collect_tracks(extractor_ptr)?;
+        // MediaCodec extractors often omit `frame-rate`/`frame-count`, which
+        // FFmpeg gets from the stream index. Walk the sample table once to
+        // recover the real frame count and average frame rate.
+        let (scanned_frames, scanned_fps) = match video_track.as_ref() {
+            Some(track) => scan_video_timing(extractor_ptr, track.index),
+            None => (0, 0.0),
+        };
         let metadata = build_metadata(
             video_track.as_ref(),
             audio_track.as_ref(),
             video_streams,
             audio_streams,
+            scanned_frames,
+            scanned_fps,
         );
 
         let video = match video_track.as_ref() {
@@ -573,7 +582,7 @@ impl MovieDecoder {
                     continue;
                 }
                 if info.size > 0
-                    && let Some(slice) = output_slice(audio.codec.ptr, index, &info)
+                    && let Some(slice) = unsafe { output_slice(audio.codec.ptr, index, &info) }
                 {
                     append_pcm(slice, encoding, &mut samples);
                 }
@@ -653,7 +662,7 @@ fn decode_next_video(
             }
             if info.size > 0
                 && let Some(layout) = video.layout
-                && let Some(slice) = output_slice(video.codec.ptr, index, &info)
+                && let Some(slice) = unsafe { output_slice(video.codec.ptr, index, &info) }
             {
                 let data = yuv420_to_rgba(slice, &layout);
                 let fallback = video.last_pts_ms + video.frame_duration_ms;
@@ -768,9 +777,11 @@ fn feed_audio_sample(
 
 /// Copy the valid bytes of a dequeued output buffer (honouring `info.offset`).
 ///
-/// The returned slice borrows the codec's buffer and is only valid until the
-/// buffer is released.
-fn output_slice<'a>(
+/// # Safety
+///
+/// The caller must not release the output buffer at `index` while the
+/// returned slice is alive, and must only use it until the next codec call.
+unsafe fn output_slice<'a>(
     codec: *mut AMediaCodec,
     index: usize,
     info: &AMediaCodecBufferInfo,
@@ -926,12 +937,75 @@ fn collect_tracks(
     Ok((video_streams, audio_streams, video, audio))
 }
 
+/// Walk the video sample table once to recover the frame count and average
+/// frame rate.
+///
+/// `AMediaExtractor` exposes no `nb_frames`/`avg_frame_rate`, and the
+/// `frame-rate`/`frame-count` keys are frequently absent, so this mirrors what
+/// FFmpeg reads from the stream index. It only advances the cursor and reads
+/// sample times (no decode); the caller re-seeks before decoding.
+fn scan_video_timing(extractor: *mut AMediaExtractor, video_index: usize) -> (i64, f64) {
+    // Only the video track matters; unselecting everything else keeps the
+    // cursor stepping frame to frame.
+    let count = unsafe { AMediaExtractor_getTrackCount(extractor) };
+    for index in 0..count {
+        if index != video_index {
+            // SAFETY: valid indices from the extractor; status not actionable.
+            unsafe {
+                AMediaExtractor_unselectTrack(extractor, index);
+            }
+        }
+    }
+    // SAFETY: `video_index` is a valid track index and `selectTrack` is
+    // idempotent.
+    unsafe {
+        AMediaExtractor_selectTrack(extractor, video_index);
+    }
+    let status =
+        unsafe { AMediaExtractor_seekTo(extractor, 0, AMEDIAEXTRACTOR_SEEK_PREVIOUS_SYNC) };
+    if status != AMEDIA_OK {
+        return (0, 0.0);
+    }
+
+    let mut frames = 0i64;
+    let mut first_us = i64::MIN;
+    let mut last_us = i64::MIN;
+    // A safety cap far above any real movie; the loop also stops at EOF.
+    const MAX_SAMPLES: i64 = 10_000_000;
+    loop {
+        let time = unsafe { AMediaExtractor_getSampleTime(extractor) };
+        if time >= 0 {
+            if first_us == i64::MIN {
+                first_us = time;
+            }
+            last_us = time;
+            frames += 1;
+        }
+        // SAFETY: the extractor is live; `advance` reports EOF as `false`.
+        if !unsafe { AMediaExtractor_advance(extractor) } || frames >= MAX_SAMPLES {
+            break;
+        }
+    }
+
+    let fps = if frames > 1 && last_us > first_us {
+        (frames - 1) as f64 * 1_000_000.0 / (last_us - first_us) as f64
+    } else {
+        0.0
+    };
+    (frames, fps)
+}
+
 /// Read the container metadata that the MediaCodec NDK exposes.
+///
+/// `scanned_frames`/`scanned_fps` come from [`scan_video_timing`] and are
+/// preferred over the format keys, which are frequently absent.
 fn build_metadata(
     video: Option<&PickedTrack>,
     audio: Option<&PickedTrack>,
     video_streams: i64,
     audio_streams: i64,
+    scanned_frames: i64,
+    scanned_fps: f64,
 ) -> MovieMetadata {
     let width = video
         .and_then(|track| track_int32(track, c"width"))
@@ -941,9 +1015,14 @@ fn build_metadata(
         .and_then(|track| track_int32(track, c"height"))
         .unwrap_or(0)
         .max(0) as u32;
-    let fps = video
+    let format_fps = video
         .and_then(|track| format_f32(track.format.0, c"frame-rate"))
         .map_or(0.0, f64::from);
+    let fps = if scanned_fps > 0.0 {
+        scanned_fps
+    } else {
+        format_fps
+    };
     let duration_us = video
         .and_then(|track| format_int64(track.format.0, c"duration"))
         .unwrap_or(0);
@@ -955,7 +1034,9 @@ fn build_metadata(
     let declared_frames = video
         .and_then(|track| track_int32(track, c"frame-count"))
         .unwrap_or(0);
-    let total_frames = if declared_frames > 0 {
+    let total_frames = if scanned_frames > 0 {
+        scanned_frames
+    } else if declared_frames > 0 {
         i64::from(declared_frames)
     } else if fps > 0.0 && total_time_ms > 0 {
         (total_time_ms as f64 * fps / 1000.0).round() as i64
