@@ -5,8 +5,8 @@ Status: design sketch. Extracts decoding from `tvp-sound`, `tvp-visual` and
 
 Goal: one bottom-layer media engine that decodes images, audio and video,
 with two platform backends — **system FFmpeg on Linux** and **Android
-MediaCodec** — behind the TVP-free [`MediaEngine`](03-middle-layer-api.md#4-media-engine)
-trait. The mixer, sound object model, `.sli` loops, video-overlay events and
+MediaCodec** — behind the TVP-free stateless [`media`](03-middle-layer-api.md#4-media)
+API. The mixer, sound object model, `.sli` loops, video-overlay events and
 all script semantics stay in the middle layer.
 
 ---
@@ -16,9 +16,9 @@ all script semantics stay in the middle layer.
 | Concern | Today | Target |
 |---------|-------|--------|
 | Image decode | `tvp-visual/src/bitmap.rs::decode_image` + `tlg.rs` + `image` crate | `krkr-media` (shared `ImageDecoder`) |
-| Audio decode | `tvp-sound/src/decode.rs` (symphonia + libopus), `source.rs` policy | `krkr-media` (`FfmpegMedia` audio / `MediaCodecMedia` audio) |
+| Audio decode | `tvp-sound/src/decode.rs` (symphonia + libopus), `source.rs` policy | `krkr-media` (FFmpeg audio / MediaCodec audio) |
 | Audio mixer/model | `tvp-sound/src/mixer.rs`, `wavesound.rs`, `natives.rs`, `sli.rs` | stays L2 `krkr-engine` |
-| Audio output | `tvp-sound/src/player.rs` (rodio/cpal) | `krkr-core` `AudioOutput` |
+| Audio output | `tvp-sound/src/player.rs` (rodio/cpal) | `krkr-core` `AudioDevice` |
 | Video decode | `tvp-natives/src/video/{ffmpeg,android,yuv}.rs` | `krkr-media` (two backends) |
 | Video overlay events | `tvp-natives/src/video_overlay.rs` | stays L2 (polls the engine) |
 | Format registry | ad hoc per path | declared per backend |
@@ -38,10 +38,11 @@ krkr-media
   └─ backend/mediacodec.rs  Android: AMediaExtractor + AMediaCodec
 ```
 
-The trait is stateful by handle (`AudioStreamId`, `VideoStreamId`) so the
-middle layer can hold TVP objects that map 1:1 to engine streams. The engine
-owns a worker pool; decode never runs on the host/VM thread except for
-trivially small probes.
+The API is stateless (D9): pure free functions for image/whole-file audio
+decode, and RAII `AudioDecoder`/`VideoDecoder` values owned by L2 for
+streaming. There is no engine-side registry, no global buffer and no hidden
+cache. L2 owns the worker pool; decode never runs on the host/VM thread
+except for trivially small probes.
 
 ## 3. Image decode
 
@@ -52,8 +53,9 @@ trivially small probes.
 * `probe_image` returns dimensions/alpha/format without full decode (used by
   `loadHeader`).
 * Async decode path: the existing `AsyncTrigger`/poll machinery
-  (`tvp-visual/src/natives/bitmap.rs::loadAsync`) stays in L2 and calls the
-  engine; the engine returns a completion id.
+  (`tvp-visual/src/natives/bitmap.rs::loadAsync`) stays in L2 and owns the
+  completion table; L1 is just the pure `decode_image` call plus, if
+  needed, an L2-scheduled worker.
 * Image **save** (TLG5/TLG6, PNG) lives in `krkr-media` too, because it is a
   format concern. `Bitmap.saveLayerImage`/`save` go through it.
 * Supported formats stay the current `image` 0.25 feature list (png, jpeg,
@@ -84,34 +86,34 @@ trivially small probes.
 On Linux the current symphonia path is already the decode engine; the plan
 is to keep it and add FFmpeg audio only where symphonia lacks a codec. On
 Android the plan is `AMediaCodec` for AAC/video audio with a symphonia
-fallback for wav/ogg/mp3. The trait exposes the same `DecodedAudio`/stream
-API either way, so the mixer never learns which backend ran.
+fallback for wav/ogg/mp3. The same free functions and decoder values are
+used either way, so the mixer never learns which backend ran.
 
 ### 4.4 Long tracks
 
 The measured pain point is a whole-track decode (a 5.37 MB BGM → 8.5 s and
-~125 MB, `docs/optimization.md`). The engine keeps the streaming decoder as
-the default for long tracks and exposes the frame count so L2 can decide.
-The engine should support `seek`/loop-wrap without a full re-decode where
-the backend allows.
+~125 MB, `docs/optimization.md`). The engine provides a streaming decoder
+and exposes the frame count; **L2 chooses** whole-file vs streaming. Seeking
+and loop-wrap should not require a full re-decode where the backend allows.
 
 ## 5. Video decode
 
 ### 5.1 Interface
 
-Keep the current `MovieDecoder` semantics, generalized to handles:
+Keep the current `MovieDecoder` semantics as an RAII `VideoDecoder` value
+owned by L2, not an id-addressed table:
 
-* `open_video(bytes) -> VideoStreamId` + `VideoSpec`;
-* `present_video(id, at_ms) -> RgbaFrame` with the **backward-seek contract**
+* `open_video(bytes) -> VideoDecoder` + `spec() -> VideoSpec`;
+* `present_at(at_ms) -> RgbaFrame` with the **backward-seek contract**
   (today: seek if moving backwards more than `SEEK_TOLERANCE_MS`, otherwise
   decode forward; `ffmpeg.rs:279`);
-* `video_audio(id) -> DecodedAudio` (or a stream variant);
-* `close_video`.
+* `audio() -> DecodedAudio` (or a streaming variant);
+* dropping the value releases the codec.
 
 ### 5.2 FFmpeg backend (Linux)
 
 * `ffmpeg-next` with the existing in-memory custom `StreamIo` (no temp
-  file), so the engine reads bytes from `FileSystem` via L2.
+  file); L2 reads the bytes through `krkr-fs` and passes them in.
 * Reuse `present_at`, `next_video_frame`, `convert_video` (swscale→RGBA),
   `drain_audio` (swresample→f32) verbatim.
 * Fix the known inefficiency: audio is decoded fully at `open`
@@ -148,16 +150,18 @@ Both are L2 changes; the engine API already produces the required data.
 
 ## 6. Threading and the poll contract
 
-The engine owns its workers. Rules:
+The **L2 worker pool** owns its threads; L1 is stateless functions. Rules:
 
-* L1 never calls TJS or the scene.
+* L1 never calls TJS, the scene or a callback into L2.
 * Every long-running action is either synchronous with a small budget
-  (probes) or returns a completion handle polled by L2 on the host thread.
+  (probes) or a pure function the L2 pool runs; **L2 owns the completion
+  table** and drains it on the host thread.
 * Results are plain owned buffers (`Vec<u8>`/`Vec<f32>`), never borrowed
-  from engine state across the boundary.
-* Cancellation: dropping the last handle stops the worker
-  (today's `AudioTrack` `Drop` cancels its thread).
-* `MediaEngine` is `Send + Sync`; individual streams are `Send`.
+  across the boundary.
+* Cancellation: L2 drops the future/handle and the RAII decoder value it
+  owns; L1 holds no cancellation state.
+* Pure L1 functions are freely `Send`; RAII decoder values are owned by L2
+  and need not be `Sync`.
 
 L2 drains completions at a fixed point each frame (today: the top of
 `run_vm`, with `sound_poll`/`video_overlay_poll`/`async_poll`), before the
@@ -168,9 +172,9 @@ render list is built.
 * Missing codec/backend → a typed `MediaError::Unsupported`, surfaced to
   scripts as the current friendly TJS error ("no MPEG decoder in this
   build").
-* `MediaEngine::capabilities()` can report which formats/backends exist so
-  L2 can choose. This replaces the `#[cfg]` branches scattered in
-  `video/mod.rs`.
+* A stateless `capabilities()` free function per backend reports which
+  formats exist so L2 can choose. This replaces the `#[cfg]` branches
+  scattered in `video/mod.rs`.
 * Keep the Opus-failure silence fallback (it preserves sequencing).
 
 ## 8. Feature/target matrix
@@ -192,15 +196,17 @@ instead.
 
 ## 9. Migration steps specific to media
 
-1. Define `MediaEngine` + DTOs in `krkr-api`.
+1. Define the stateless media signatures + DTOs in `krkr-api`
+   (`03-middle-layer-api.md §4`).
 2. Move `tlg.rs`/`decode_image` into `krkr-media`; keep a thin re-export in
    `tvp-visual` so natives compile unchanged.
-3. Implement `FfmpegMedia` by wrapping the existing `video/ffmpeg.rs` and
-   `decode.rs`; implement `UnsupportedMedia`.
-4. Switch `tvp-sound::source` and `tvp-visual` bitmap loading to the engine
-   handle API.
+3. Implement the FFmpeg backend by wrapping the existing `video/ffmpeg.rs`
+   and `decode.rs` as free functions + `AudioDecoder`/`VideoDecoder` values;
+   implement the unsupported backend as pure error-returning stubs.
+4. Switch `tvp-sound::source` and `tvp-visual` bitmap loading to the
+   stateless API; **L2 gains the thread pool and completion table**.
 5. Add the video frame/PCM sinks in L2.
-6. Implement `MediaCodecMedia` by moving `video/android.rs` + `yuv.rs`.
+6. Implement the MediaCodec backend by moving `video/android.rs` + `yuv.rs`.
 7. Delete the old decode modules; the natives keep calling the engine.
 
 Each step leaves the game runnable because the wrappers preserve the current

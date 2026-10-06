@@ -9,12 +9,12 @@ No phase begins implementation until this plan is reviewed.
 
 The new architecture is introduced **alongside** the current one:
 
-* the middle-layer API traits are added first, with a **Bevy-backed
-  adapter** implementing them, so `krkr-engine` can be written against the
-  API while Bevy still renders;
-* media and FS traits get adapters that wrap today's code
+* the stateless middle-layer API is added first, with a **Bevy-backed
+  adapter** implementing its operations, so `krkr-engine` can be written
+  against the API while Bevy still renders;
+* media and FS operations get adapters that wrap today's code
   (`decode.rs`, `tlg.rs`, `engine::Storage`, `xp3`) without moving it;
-* the Vulkan core is built behind the same traits and selected by a runtime
+* the Vulkan core is built behind the same API and selected by a runtime
   flag (`--renderer vk` / `--renderer bevy`) during the overlap;
 * Bevy is deleted only after the Vulkan path reaches parity on the real
   title and the Android build.
@@ -33,22 +33,28 @@ Deliverable: `docs/migration/*` (this directory).
 
 Exit criteria: plan reviewed; open questions in §7 answered; no code change.
 
-### Phase 1 — Define the middle-layer API; extract pure helpers
+### Phase 1 — Define the stateless middle-layer API; extract pure helpers
 
 Deliverables:
-* `krkr-api`: traits + DTOs from `03-middle-layer-api.md` (signatures,
-  `BlendMode`, `RenderList`, `DecodedImage`, `AudioSpec`, `RgbaFrame`, …).
+* `krkr-api`: operation signatures + DTOs from `03-middle-layer-api.md`
+  (free functions, RAII handles, `BlendMode`, `RenderList`, `DecodedImage`,
+  `AudioSpec`, `RgbaFrame`, …).
 * Move the pure, already-tested helpers out of `render`:
   `compose_layer`, `visible_image_region`, `rect_center`,
   `window_to_game_transform`, `window_logical_size`, `host_window_resize`,
   `clamp_opacity`, `window_layer_order`, `sprite_z`, `bitmap_tint`,
   `fill_sprite_color`, and the TVP→`BlendMode` mapping.
-* Add a `MemoryFileSystem`, `NullRenderer`, `MockMediaEngine`, `MockClock`
-  so the engine can be constructed in tests without any backend.
+* Add test doubles: an in-memory `FsRoot`, `NullGpu`, a stub media backend,
+  `MockClock`, so L2 can be constructed with no window/GPU/codec/fs.
+* Add the **D9 guard**: a CI grep/test that rejects mutable statics,
+  `thread_local!`, `LazyLock`/`OnceLock`/`OnceCell`/`lazy_static!` and
+  module-level `HashMap` caches in `krkr-core`/`krkr-api`.
 
 Exit criteria:
 * helpers live in a Bevy-free crate and their existing tests pass there;
-* no behavior change in the renderer.
+* no behavior change in the renderer;
+* the D9 guard is green and two `Engine`s with independent backends can be
+  constructed in one test process.
 
 ### Phase 2 — Build the L2 layer system on the API
 
@@ -56,37 +62,40 @@ Deliverables:
 * `krkr-engine`: the `Scene`/`LayerState`/`BitmapState` model moves here
   (out of `tvp-visual`), plus the `Scene → RenderList` flattener.
 * `Engine` struct with injected backends (`03-middle-layer-api.md §8`).
-* A `BevyRenderer` adapter implementing `Renderer` by wrapping
-  `sync_scene`, so the game still runs through Bevy.
+* A Bevy-backed **platform adapter** implementing the stateless operations
+  by wrapping `sync_scene` on the L1 side, so the game still runs through
+  Bevy while L2 is written against the new API.
 * `tvp-visual` becomes the native adapter over `krkr-engine` (public
   methods preserved as shims).
 
 Exit criteria: identical rendering through the adapter; no native behavior
 change; `tvp-visual` no longer owns `Scene`.
 
-### Phase 3 — File system trait
+### Phase 3 — File system (stateless)
 
 Deliverables:
-* `krkr-fs` `StdFileSystem` + `MemoryFileSystem`.
-* `xp3::Xp3Archive` reads from a `Stream`/`Vec<u8>` (positional reads).
-* `engine::Storage` moves onto the trait (shimmed public API).
-* logging/state/savedata/native IO routed through the trait.
+* `krkr-fs`: host path root + in-memory root, positional `FileHandle`.
+* `xp3::Xp3Archive` reads positionally (no live `std::fs::File`).
+* `engine::Storage` moves onto the stateless fs functions (shimmed public
+  API); **L2 gains the namespace index and any buffering**.
+* logging/state/savedata/native IO routed through the fs functions.
 
-Exit criteria: `Storage` behaves identically against `MemoryFileSystem`
-fixtures and the real game; no `std::fs` left outside `krkr-fs` except
-tests. Decide the `cpp/streams.cpp` hook (`06-file-system.md §6`).
+Exit criteria: `Storage` behaves identically against the in-memory root and
+the real game; no `std::fs` left outside `krkr-fs` except tests. Decide the
+`cpp/streams.cpp` hook (`06-file-system.md §6`).
 
 ### Phase 4 — Media engine
 
 Deliverables:
-* `krkr-media`: `ImageDecoder` (TLG + `image`), audio decode/stream,
-  `FfmpegMedia`, `UnsupportedMedia`; `MediaCodecMedia` after Linux parity.
-* `tvp-sound` decode calls the engine; mixer/model stay.
+* `krkr-media`: `decode_image`/`probe_*` free functions (TLG + `image`),
+  `AudioDecoder`/`VideoDecoder` values, FFmpeg + unsupported backends;
+  MediaCodec after Linux parity.
+* `tvp-sound` decode calls the stateless API; mixer/model stay in L2.
+* **L2 gains the worker pool and completion table**; L1 stays stateless.
 * video frame + PCM sinks in the video overlay.
-* Async completion drain on the host thread.
 
 Exit criteria: BGM/voice/image load through the engine; video is visible and
-audible (Linux); Android compiles with `MediaCodecMedia`.
+audible (Linux); Android compiles with the MediaCodec backend.
 
 ### Phase 5 — Vulkan renderer bring-up
 
@@ -121,7 +130,7 @@ Deliverables:
   `ANativeWindow`; own swapchain lifecycle.
 * Preserve the JNI contract (`pendingGameDir`/`pendingGameName`/
   `pendingStateDir`), state file, log rotation, touch/back handling.
-* `MediaCodecMedia` video; `krkr-fs` Android paths.
+* MediaCodec video; `krkr-fs` Android roots.
 
 Exit criteria: APK builds and runs the game on device with Vulkan.
 
@@ -150,12 +159,13 @@ Exit criteria: `02-target-architecture.md §9` acceptance criteria all hold.
 | Level | What | Where |
 |-------|------|-------|
 | Unit | pure helpers, blend mapping, FS namespace, layout | L2/L1 crates |
+| **Statelessness (D9)** | grep/lint for globals + build two independent engines in one process | CI / `krkr-core` |
 | Golden image | Bevy vs Vulkan framebuffer compare per scripted scene | `krkr-render` |
 | Blend matrix | one quad per `BlendMode` over a known background | `krkr-render` |
 | Integration | `krkr-rs run <game> --headless` scene dump snapshot | `krkr-app` |
 | Parity | `scripts/native_parity.py` (100% tracked coverage) | CI |
 | Media | host-testable pure parts (YUV, TLG, decode wrappers) | `krkr-media` |
-| FS | `MemoryFileSystem` fixtures, real-game mount | `krkr-fs`/`krkr-engine` |
+| FS | in-memory `FsRoot` fixtures, real-game mount | `krkr-fs`/`krkr-engine` |
 | Android | compile + symbol checks in CI; device run manual | CI / manual |
 
 Regression rule: the headless scene dump and the native-parity report are
@@ -174,12 +184,12 @@ the two coarse "nothing broke" signals and must be checked at every phase.
 
 | # | Risk | Likelihood | Impact | Mitigation |
 |---|------|:---------:|:------:|------------|
-| R1 | **Vulkan-only excludes devices/emulators** with no/old Vulkan, or flaky drivers. | Medium | High | Keep Bevy/GL as a fallback during migration; document min Vulkan; test on real devices; consider a GLES backend behind the same `Renderer` trait later (the trait makes it possible). |
+| R1 | **Vulkan-only excludes devices/emulators** with no/old Vulkan, or flaky drivers. | Medium | High | Keep Bevy/GL as a fallback during migration; document min Vulkan; test on real devices; consider a GLES backend behind the same stateless ops later (the boundary makes it possible). |
 | R2 | Reimplementing windowing/input/IME is more work than estimated. | High | Medium | Reuse the already-pure hit-test/gesture logic; winit is already a dependency; keep `VM_RUN_LOCK` until the host loop is proven. |
 | R3 | Bevy UI menu loss causes visible regressions. | Medium | Medium | CPU-drawn menu early (Phase 6), golden-image it. |
 | R4 | sRGB/color mismatch between Bevy and Vulkan paths. | High | Medium | Pin one convention (`Rgba8UnormSrgb` + linear shader math) and add a color test to the blend matrix. |
 | R5 | CPU compositing/upload remains the bottleneck; Vulkan gains little. | Medium | Low | Sub-rect uploads, staging ring, revision fast path; GPU paths are an optimization behind the same API. |
-| R6 | API churn: `RenderList`/`MediaEngine` need changes after L2 uses them. | Medium | Medium | Phase 1 mocks exercise the API before any backend; keep DTOs additive. |
+| R6 | API churn: `RenderList`/media API need changes after L2 uses them. | Medium | Medium | Phase 1 mocks exercise the API before any backend; keep DTOs additive. |
 | R7 | Android MediaCodec is still runtime-untested. | High | Medium | Treat as compile-verified until on-device; keep FFmpeg out only on Android; test on hardware in Phase 7. |
 | R8 | `cpp/streams.cpp` `fopen` breaks Android savedata through the FS layer. | Medium | Medium | Decide the hook in Phase 3; option A (Rust callback) if savedata must route through FS. |
 | R9 | Schedule/scope creep (this is a whole-engine rewrite). | High | High | Phased exit criteria; each phase independently shippable; default branch stays Bevy until parity. |
@@ -197,14 +207,14 @@ the two coarse "nothing broke" signals and must be checked at every phase.
 4. **Crate renaming**: do the `tvp-*` crates become `krkr-*`, or do the
    `tvp-*` names stay (they mirror the reference and the TJS class names)?
 5. **Vulkan fallback**: accept Vulkan-only (D4) or keep a GLES backend
-   behind the `Renderer` trait for old devices?
+   behind the same stateless ops for old devices?
 6. **Destination-dependent blends & transitions**: implement via the GPU
    ping-pong compositor (plan) or keep them CPU-side and only blit results?
 7. **`Engine` ownership**: one process-global engine (current) vs an
    injected instance (plan). Tests want injection; the TJS VM is one-per-
    process today.
 8. **Android default**: keep SAF→path (option A) or invest in a SAF/asset
-   FS backend (option B) now that the `FileSystem` trait exists?
+   FS root (option B) now that the stateless fs surface exists?
 
 ## 8. Definition of done (architecture)
 

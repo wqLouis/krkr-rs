@@ -5,7 +5,7 @@ and the wgpu material system in `render/src/blend.rs`.
 
 Scope: replace Bevy's renderer *and* its window/input/UI substrate with a
 thin Vulkan core plus winit. The middle layer keeps the layer system; the
-renderer only consumes a flat [`RenderList`](03-middle-layer-api.md#22-the-draw-list).
+renderer only consumes a flat [`RenderList`](03-middle-layer-api.md#21-the-draw-list-l2-output).
 
 ---
 
@@ -52,6 +52,13 @@ krkr-render::Renderer
 
 The renderer is single-threaded on the host thread initially. A submission
 thread can be added later without changing the API.
+
+**Statelessness (D9).** The only L1 values are platform resources (`Gpu`,
+`Surface`, `Texture`, `Target`); they are owned by L2 and passed in
+explicitly. `PipelineCache`, descriptor caches, texture tables and the glyph
+atlas are **L2 values**: `submit(gpu, frame, &mut pipelines, &list)` takes
+the cache as a parameter. L1 has no globals, no `HashMap<Id, Resource>` and
+no lazy caches. The same `RenderList` always produces the same frame.
 
 ## 3. Pipeline set
 
@@ -174,7 +181,7 @@ Each must be replaced.
    text + highlight). Rasterize it with the existing text/glyph and fill
    code into a `BitmapState`, then draw it as ordinary layer quads. Zero new
    renderer surface, matches the reference's own UI style.
-2. **GPU text/rect draw list** — reuse `GlyphEngine` coverage + quads.
+2. **GPU text/rect draw list** — reuse glyph coverage + quads.
 3. **A retained-mode UI crate** — rejected: it re-introduces a framework
    dependency exactly like Bevy.
 
@@ -203,9 +210,10 @@ Pure helpers to lift out before the renderer swap (`sync.rs`/`scene.rs`):
 
 ## 9. Glyph rendering engine
 
-Decision (see `03-middle-layer-api.md §3`): the bottom renderer gets a
-`GlyphEngine` that rasterizes coverage into CPU buffers. L2 keeps layout and
-CPU composition, so `getPixel`/`piledCopy`/masks/province continue to work.
+Decision (see `03-middle-layer-api.md §3`): the bottom renderer exposes a
+`GlyphFace` value plus a stateless `rasterize_glyph` that produces CPU
+coverage. L2 keeps the atlas, layout and CPU composition, so
+`getPixel`/`piledCopy`/masks/province continue to work.
 An optional later phase uploads coverage to a glyph atlas and emits text as
 quads; the API does not change.
 

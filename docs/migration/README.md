@@ -59,7 +59,7 @@ that separation in Rust.
 │     • CPU pixel operations, transitions, storage namespace, config    │
 │     • sound object model + mixer, video-overlay state machine         │
 │     • exposes a minimal, TVP-free service API to L3                   │
-│     ── consumes the middle-layer API traits ──►                       │
+│     ── consumes the stateless middle-layer API ──►                    │
 ├──────────────────────────────────────────────────────────────────────┤
 │ L1  Bottom core (krkr-core)                                           │
 │     renderer (Vulkan/ash + glyph engine) · media engine               │
@@ -71,22 +71,31 @@ that separation in Rust.
 The **middle-layer API** is the contract between L2 and L1: a small set of
 abstract actions ("decode this image", "upload these pixels", "draw this
 list", "play this stream", "open this path"). L1 implements it on real
-platforms. L2 builds everything KiriKiri-specific on top of it — including
-the layer system. The bottom engine does **not** own layers; it only does
-rendering, decoding and file I/O, and does them well.
+platforms as a **stateless, functional** service. L2 builds everything
+KiriKiri-specific on top of it — including the layer system — and **owns all
+state**. The bottom engine does **not** own layers and does **not** own
+engine state; it only computes, decodes, renders and does file I/O, and does
+them well.
+
+The stateless rule is the load-bearing one (D9): L1 is a pure library over
+explicit inputs. Any persistent thing — the layer tree, caches, indices,
+decoder progress, resource lifetimes — lives in L2 and is passed into L1
+explicitly. L1 has no process-global registries, no singletons and no hidden
+lazy caches.
 
 ## 3. Decisions recorded by this plan
 
 | # | Decision | Rationale |
 |---|----------|-----------|
-| D1 | Introduce an explicit middle-layer API (traits + plain DTOs) between the engine and the platform. | Decouple semantics from backends; make both mockable and testable; enable incremental migration. |
+| D1 | Introduce an explicit, stateless middle-layer API (operations + plain DTOs) between the engine and the platform. | Decouple semantics from backends; make both mockable and testable; enable incremental migration. |
 | D2 | The **layer system lives in the middle layer**, not in the renderer. | Layer composition, opacity, pixel read-back, masks and province images are TVP semantics. A renderer that owns them can never be swappable or Vulkan-thin. |
 | D3 | Replace Bevy with **`ash` (raw Vulkan)** for rendering. | Smallest GPU workload is quads + fixed blends; we want explicit pipelines and no GL/Metal/WebGPU weight. |
 | D4 | Vulkan only; no OpenGL/Metal/WebGPU/WebGL fallback. | User requirement. Documented risk in `07-roadmap.md §6`. |
 | D5 | Media is a bottom-layer **media engine** with two backends: system **FFmpeg** on Linux, **MediaCodec** on Android. | Matches the reference (`core/movie/ffmpeg`) and current split (`tvp-natives/src/video/{ffmpeg,android}.rs`). |
-| D6 | File system is a bottom-layer trait; archive/namespace logic stays in the middle layer. | Bottom = raw path/URI byte IO; TVP's `arc.xp3>path` addressing and case rules are engine semantics. |
+| D6 | File system is a stateless bottom-layer surface; archive/namespace logic stays in the middle layer. | Bottom = raw path/URI byte IO; TVP's `arc.xp3>path` addressing and case rules are engine semantics. |
 | D7 | Strangler migration, not a big-bang rewrite. | Keep the game runnable at every step: first a Bevy-backed implementation of the new API, then swap in the Vulkan core. |
 | D8 | Keep CPU rasterization/compositing as the correctness baseline; GPU acceleration is an optimization behind the same API. | Scripts read pixels back (`getPixel`, `piledCopy`, `saveLayerImage`); the pixel-exact path must survive. |
+| D9 | **L1 is stateless and functional; all state lives in L2.** No globals, singletons, hidden caches or implicit lifetimes in the bottom core. Platform resources are RAII handles owned by L2 and passed in explicitly; pure transforms are free functions. | The current codebase already suffers from this: the de-facto layer is a pile of process-global statics and registries (`01-investigation.md §9`). Keeping L1 stateless makes it swappable, mockable and parallel-safe, and makes L2 the single owner of the game state. |
 
 ## 4. Document index
 
@@ -94,10 +103,10 @@ rendering, decoding and file I/O, and does them well.
 |-----|----------|
 | [`01-investigation.md`](01-investigation.md) | What the project is today: crate graph, coupling map, data flow, measured facts, and the concrete seams that block the target. |
 | [`02-target-architecture.md`](02-target-architecture.md) | The four-layer target, crate layout, dependency rules, ownership boundaries, and how the layer system fits. |
-| [`03-middle-layer-api.md`](03-middle-layer-api.md) | The API surface: `FileSystem`, `Renderer`, `GlyphEngine`, `MediaEngine`, `AudioOutput`, `InputSource`, `HostWindow`, DTOs. |
-| [`04-renderer-vulkan.md`](04-renderer-vulkan.md) | Bevy → `ash` design: render list, pipelines, blend mapping, offscreen compositing, glyph atlas, winit/GameActivity surface, what to delete. |
+| [`03-middle-layer-api.md`](03-middle-layer-api.md) | The stateless API surface: `fs` + `FileHandle`, `Gpu` + `Texture`/`Target`/`Surface`, `GlyphFace`, media free functions + decoders, `AudioDevice`, `InputSource`, `HostWindow`, DTOs. |
+| [`04-renderer-vulkan.md`](04-renderer-vulkan.md) | Bevy → `ash` design: render list, pipelines, blend mapping, offscreen compositing, glyph rasterization, winit/GameActivity surface, what to delete. |
 | [`05-media-engine.md`](05-media-engine.md) | Media engine: image/audio/video decode, FFmpeg vs MediaCodec backends, threading, TJS-poll semantics, migration of `tvp-sound`/`video`. |
-| [`06-file-system.md`](06-file-system.md) | Bottom FS trait + `std::fs` backend; how `Storage`/`Xp3Archive`/natives move onto it; Android SAF/AssetManager; the C++ `fopen` bypass. |
+| [`06-file-system.md`](06-file-system.md) | Stateless bottom fs surface + host/in-memory roots; how `Storage`/`Xp3Archive`/natives move onto it; Android SAF/AssetManager; the C++ `fopen` bypass. |
 | [`07-roadmap.md`](07-roadmap.md) | Phased plan, per-phase deliverables/exit criteria, risks, testing strategy, rollback, and open questions. |
 
 ## 5. Scope of this branch
@@ -119,4 +128,5 @@ Out of scope for this branch:
 2. Read `02-target-architecture.md` and push back on the layer boundaries.
 3. Read `03-middle-layer-api.md`; the API is the expensive part to change
    later.
-4. Read `07-roadmap.md`; every phase must leave a runnable game.
+4. Read `07-roadmap.md`; every phase must leave a runnable game, and D9
+   (stateless L1) is tested, not just asserted.

@@ -42,21 +42,59 @@ the boundary has leaked.
 MediaCodec, `std::fs` or any concrete backend. It talks only to the API
 traits. If it does, the backend is not swappable.
 
+**Invariant C (D9):** L1 is **stateless and functional**. It has no
+process-global mutable state, no singletons, no hidden caches and no
+implicit lifetimes. Every piece of persistent state — layer tree, caches,
+indices, decoder progress, resource ownership — is a value owned by L2 and
+either passed into L1 or exposed by L1 as an RAII handle that L2 stores.
+Pure transforms are free functions; impure operations take an explicit
+context/handle.
+
 ## 2. The middle-layer API
 
-The API is a small set of traits and plain data types. It describes
-**abstract actions**, not TVP concepts:
+The API is a small set of **stateless operations** and plain data types. It
+describes abstract actions, not TVP concepts, and it carries no engine
+state:
 
-| Trait | Abstract actions | Replaces today |
-|-------|------------------|----------------|
-| `FileSystem` | open path/URI as a byte stream, stat, list, create/write/delete/copy | `engine::Storage`, `xp3::Xp3Archive`, direct `std::fs` in natives |
-| `Renderer` | create/upload/drop textures, submit a flat draw list, present, resize, offscreen targets | `render/src/sync.rs`, `blend.rs`, wgpu |
-| `GlyphEngine` | shape/rasterize a glyph run to coverage, provide an atlas | `tvp-text` raster/atlas + CPU `paint_layout` |
-| `MediaEngine` | probe/decode image, probe/decode/stream audio, open/present video | `tvp-visual/bitmap.rs`, `tvp-sound/decode.rs`, `tvp-natives/video/*` |
-| `AudioOutput` | start/stop the OS audio device; pull frames from a callback | `tvp-sound/player.rs` (rodio/cpal) |
+| Surface | Abstract actions | Replaces today |
+|---------|------------------|----------------|
+| `fs` functions + `FileHandle` | open a path/URI, positional read/write, stat, list, create/delete/copy | `engine::Storage`, `xp3::Xp3Archive`, direct `std::fs` in natives |
+| `Gpu` + `Texture`/`Target`/`Surface` | create/upload/drop textures, submit a flat draw list, present, resize, offscreen targets | `render/src/sync.rs`, `blend.rs`, wgpu |
+| `rasterize_glyph` + `GlyphFace` | rasterize a glyph to coverage; query metrics | `tvp-text` raster/atlas + CPU `paint_layout` |
+| media free functions + `AudioDecoder`/`VideoDecoder` | probe/decode image, probe/decode/stream audio, open/present video | `tvp-visual/bitmap.rs`, `tvp-sound/decode.rs`, `tvp-natives/video/*` |
+| `AudioDevice` | start/stop the OS audio device; pull frames from a callback | `tvp-sound/player.rs` (rodio/cpal) |
 | `InputSource` | deliver input events/state produced by the host | `render/src/input_bridge.rs` event capture |
 | `HostWindow` | create/resize/title the OS window; logical↔physical mapping | Bevy `WindowPlugin`/`Window` |
 | `Clock` / `LogSink` | monotonic time, log fan-out | Bevy `Time`, `log` setup |
+
+### 2.1 The statelessness rule (D9)
+
+Concretely, in L1:
+
+* **No globals.** No `static`/`thread_local` mutable state, no `LazyLock`
+  registries, no `OnceLock` caches. (The current Rust code is full of these;
+  they are L3/L2 concerns and must not reappear in L1.)
+* **Pure transforms are free functions.** `decode_image(bytes) -> Rgba`,
+  `probe_audio(bytes) -> spec`, `yuv420_to_rgba(...)`,
+  `rasterize_glyph(face, ...) -> coverage`, resampling, etc. Same inputs,
+  same outputs, no remembered state.
+* **Platform resources are RAII handles owned by L2.** `Texture`, `Target`,
+  `Surface`, `FileHandle`, `GlyphFace`, `AudioDecoder`, `VideoDecoder`
+  own their platform resource and are stored in L2. There is no
+  renderer-side `HashMap<Id, Resource>` that L2 addresses by id; the handle
+  *is* the resource value.
+* **Caches live in L2.** The glyph atlas, decoded-image cache, storage
+  index, pipeline cache, full-vs-stream decisions and loop metadata are L2
+  values passed into L1 operations (e.g. `submit(gpu, &mut PipelineCache,
+  &list)`), not L1 internals.
+* **No policy in L1.** L1 does not choose to cache, reuse, defer or
+  prefetch; it does exactly what the call says. Any decision is L2's.
+* **No callbacks into engine state.** L1 may hand back plain owned buffers;
+  it never calls into the layer tree or TJS.
+
+This is what makes L1 mockable (`NullGpu`, an in-memory `FsRoot`, a stub media
+backend) and what keeps the two backends (FFmpeg vs MediaCodec, Bevy adapter
+vs Vulkan) from drifting into different semantics.
 
 The API deliberately does **not** contain: layers, windows-as-TVP-objects,
 bitmaps, blend types, transitions, `SoundBuffer`, `VideoOverlay`, storage
@@ -105,15 +143,14 @@ middle-layer API can be one crate so L1 implementations share the DTOs.
 
 ```
 crates/
-  # L1 — bottom core -------------------------------------------------------
-  krkr-api          trait definitions + DTOs only (no impls, no I/O)
+  # L1 — bottom core (stateless/functional, D9) ----------------------------
+  krkr-api          operation signatures + DTOs only (no impls, no state)
   krkr-core         facade that assembles the platform core
-  krkr-render       ash/Vulkan renderer + glyph engine   (impls Renderer,
-                                                           GlyphEngine)
-  krkr-media        media engine (ffmpeg | mediacodec)   (impls MediaEngine)
-  krkr-fs           file system backends                 (impls FileSystem,
-                                                           AudioOutput? no —
-                                                           see §5)
+  krkr-render       stateless Vulkan/ash ops + glyph rasterization; RAII
+                    Texture/Target/Surface/GlyphFace handles
+  krkr-media        stateless decode fns + RAII AudioDecoder/VideoDecoder
+                    (ffmpeg | mediacodec)
+  krkr-fs           stateless fs fns + RAII FileHandle
 
   # L2 — middle layer ------------------------------------------------------
   krkr-engine       layer system + TVP semantics + mixer + transitions;
@@ -152,16 +189,18 @@ so the game is runnable at every step.
 | Window/layer/bitmap/font/timer model | L2 `krkr-engine` | today `tvp-visual::scene` |
 | CPU pixel ops, masks, province, transitions | L2 `krkr-engine` | today `tvp-visual::natives::*` |
 | Text layout + CPU glyph composition | L2 `krkr-engine` | glyph *rasterization* in L1 |
-| Glyph rasterization + glyph atlas | L1 `krkr-render` (`GlyphEngine`) | may move wholly to L1 |
+| Glyph rasterization | L1 `krkr-render` | stateless: face + glyph + size → coverage |
+| Glyph atlas (cache) | L2 `krkr-engine` | L2-owned value passed into composition |
 | Sound object model, mixer, fades, `.sli` | L2 `krkr-engine` | today `tvp-sound` |
-| Audio decode (symphonia/opus) | L1 `krkr-media` | |
-| Audio device output (cpal/AAudio) | L1 `krkr-core` (`AudioOutput`) | |
+| Audio decode (symphonia/opus) | L1 `krkr-media` | stateless fns + `AudioDecoder` value owned by L2 |
+| Audio device output (cpal/AAudio) | L1 `krkr-core` (`AudioDevice`) | device value owned by L2 |
 | Image decode (TLG/image) | L1 `krkr-media` | TLG is format-specific but platform-free |
-| Video decode (ffmpeg/mediacodec) | L1 `krkr-media` | backend by target |
+| Video decode (ffmpeg/mediacodec) | L1 `krkr-media` | backend by target; `VideoDecoder` owned by L2 |
 | Storage namespace, `.xp3`, case rules | L2 `krkr-engine` | today `engine::Storage` + `xp3` |
-| Raw path/URI byte IO | L1 `krkr-fs` | |
-| Archive container parsing | L2, using `FileSystem` streams | `xp3` reworked to `Read+Seek` |
-| Vulkan device/swapchain/pipelines | L1 `krkr-render` | |
+| Raw path/URI byte IO | L1 `krkr-fs` | stateless fns over an explicit root |
+| Archive container parsing | L2, over `FileHandle` | `xp3` reworked to positional reads |
+| Vulkan device/queue | L1 `krkr-render` | `Gpu` value owned by L2, never global |
+| Pipeline cache | L2 `krkr-engine` | L2-owned value passed to `submit` |
 | Render list flattening | L2 `krkr-engine` | |
 | Input state + TVP hit-test semantics | L2 `krkr-engine` | today `tvp-input` + hit_test |
 | OS input events | L4 host → L1/L2 via `InputSource` | |
@@ -170,20 +209,23 @@ so the game is runnable at every step.
 
 ## 6. Threading model in the target
 
-The VM stays single-threaded. The new constraint is that L1 may have its own
-threads (media workers, GPU thread) and must never call into L3:
+The VM stays single-threaded. Because L1 is stateless (D9), it does not own
+worker threads either; L2 owns the thread pool and schedules stateless L1
+work onto it:
 
 * **L4 host thread**: event loop + per-frame VM drive (`timer_poll`,
   `sound_poll`, `video_overlay_poll`, `async_trigger_poll`,
   `continuous_handler_poll`) + render submission.
-* **L1 media workers**: decode-only; results are handed back through a
-  completion queue drained on the host thread.
-* **L1 GPU**: either the host thread owns the queue (simplest, matches
-  today) or a dedicated submission thread; the middle layer only hands over
-  a finished `RenderList` and texture uploads.
-* **L2**: mutated only on the host thread, exactly like today. No scene lock
-  is needed if the VM and render both run on the host thread, but the API
-  may keep a scoped lock discipline for tests.
+* **L2 worker pool**: owned by the middle layer; runs pure L1 decode/
+  rasterize functions and delivers owned buffers into an L2 completion
+  queue drained on the host thread. L1 provides no thread pool and no
+  queue.
+* **L2 GPU submission**: the host thread owns the `Gpu`/`Surface` values
+  (simplest, matches today). A dedicated submission thread can later move
+  the `Gpu` value; L1 code is unchanged either way.
+* **L2 state**: mutated only on the host thread, exactly like today. No
+  scene lock is needed if the VM and render both run on the host thread,
+  but the API may keep a scoped lock discipline for tests.
 
 `VM_RUN_LOCK` (today's workaround for Bevy's parallel scheduler) should
 **disappear** once the app loop is ours.
@@ -214,8 +256,13 @@ The migration is "done" when all of these hold:
    `tvp-*`/`tjs2-sys`/Bevy dependency.
 2. `krkr-engine` has no dependency on `bevy`, `ash`, `winit`, `ffmpeg-next`,
    `cpal`, or `std::fs` outside an explicitly allowed low-level module.
-3. The desktop CLI and the Android cdylib assemble the same `krkr-engine`
+3. **D9 is enforced:** `krkr-core` contains no mutable `static`/
+   `thread_local`, no `LazyLock`/`OnceLock`/`OnceCell` caches, no global
+   registries, and no `HashMap` keyed by an externally-supplied resource id.
+   A lint/grep test in CI guards this; the only allowed state is a value
+   returned by a constructor and stored by the caller (an RAII handle).
+4. The desktop CLI and the Android cdylib assemble the same `krkr-engine`
    and the same core, differing only in host glue.
-4. The game runs and the headless scene dump + native-parity report are
+5. The game runs and the headless scene dump + native-parity report are
    unchanged or intentionally updated.
-5. Bevy is absent from `Cargo.lock`.
+6. Bevy is absent from `Cargo.lock`.

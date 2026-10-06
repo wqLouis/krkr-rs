@@ -269,7 +269,8 @@ object semantics are implemented in a generated TJS wrapper layer.
    pure hit-test logic; replace the Bevy event source with winit events.
 5. **Media**: introduce the media engine API and move `decode_image`,
    `tvp-sound::decode`, and `video/*` behind it.
-6. **Storage**: introduce the FS trait; move `Storage`/`Xp3Archive` onto it;
+6. **Storage**: introduce the stateless FS surface; move `Storage`/`Xp3Archive`
+   onto it;
    decide how to deal with `cpp/streams.cpp` `fopen`.
 7. **Android**: replace `#[bevy_main]` with `android-activity` + owning the
    `ANativeWindow`/surface lifecycle for the Vulkan swapchain.
