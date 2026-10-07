@@ -1,0 +1,11 @@
+[package]
+name = "krkr-engine"
+description = "krkr-rs middle layer: TVP layer system state + RenderScene projection + mixer + storage namespace"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+krkr-api = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }

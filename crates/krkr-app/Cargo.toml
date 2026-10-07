@@ -1,0 +1,19 @@
+[package]
+name = "krkr-app"
+description = "krkr-rs host: winit event loop + krkr-engine + krkr-core assembly"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "krkr"
+path = "src/main.rs"
+
+[dependencies]
+krkr-api = { workspace = true }
+krkr-engine = { workspace = true }
+krkr-render = { workspace = true }
+krkr-fs = { workspace = true }
+krkr-media = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }

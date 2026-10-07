@@ -1,0 +1,9 @@
+[package]
+name = "krkr-api"
+description = "krkr-rs middle-layer API: stateless bottom objects, explicit state values, plain DTOs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
