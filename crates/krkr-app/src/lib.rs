@@ -33,10 +33,10 @@ use krkr_fs::FileSystem;
 use krkr_media::Media;
 use krkr_render::{
     PipelineConfig, RenderPipeline, RenderScene, RenderState, Surface, Texture, TextureDesc,
-    TextureFormat, begin_render_state, create_render_pipeline, create_texture, drop_texture,
-    render, resize as resize_render, upload_texture,
+    TextureFormat, begin_render_state, begin_render_state_with_display, create_render_pipeline,
+    create_texture, drop_texture, render, resize as resize_render, upload_texture,
 };
-use raw_window_handle::{RawWindowHandle, WebWindowHandle};
+use raw_window_handle::{RawDisplayHandle, RawWindowHandle, WebWindowHandle};
 
 pub use krkr_render::{BackendKind, FrameStats};
 
@@ -78,8 +78,15 @@ pub struct HostConfig {
     ///
     /// `None` selects a synthetic headless handle ([`headless_window_handle`]),
     /// which the null backend ignores. The windowed host passes the real
-    /// winit handle here so a future Vulkan surface can bind to it.
+    /// winit handle here so a Vulkan surface can bind to it.
     pub window_handle: Option<RawWindowHandle>,
+    /// Display handle (Wayland/X11/XCB connection) used with `window_handle`.
+    ///
+    /// `VK_KHR_surface` needs the platform display connection in addition to
+    /// the window handle. When this is `Some`, the host creates the surface
+    /// through `begin_render_state_with_display`; `None` uses the
+    /// window-handle-only entry point (or the null backend).
+    pub display_handle: Option<RawDisplayHandle>,
 }
 
 impl Default for HostConfig {
@@ -90,6 +97,7 @@ impl Default for HostConfig {
             application_name: "krkr-rs".to_owned(),
             validation: false,
             window_handle: None,
+            display_handle: None,
         }
     }
 }
@@ -115,6 +123,12 @@ impl HostConfig {
     /// Returns this configuration bound to a real window handle.
     pub fn with_window_handle(mut self, handle: RawWindowHandle) -> Self {
         self.window_handle = Some(handle);
+        self
+    }
+
+    /// Returns this configuration bound to a display handle.
+    pub fn with_display_handle(mut self, display: RawDisplayHandle) -> Self {
+        self.display_handle = Some(display);
         self
     }
 }
@@ -191,8 +205,18 @@ impl Host {
         let scene = Scene::default();
         let render_scene = RenderScene::with_root_node();
 
-        let handle = config.window_handle.unwrap_or_else(headless_window_handle);
-        let (surface, mut render_state) = begin_render_state(&pipeline, &handle)?;
+        let headless;
+        let handle: &RawWindowHandle = match &config.window_handle {
+            Some(handle) => handle,
+            None => {
+                headless = headless_window_handle();
+                &headless
+            }
+        };
+        let (surface, mut render_state) = match &config.display_handle {
+            Some(display) => begin_render_state_with_display(&pipeline, display, handle)?,
+            None => begin_render_state(&pipeline, handle)?,
+        };
         let surface_size = (config.surface_size.0.max(1), config.surface_size.1.max(1));
         let _ = resize_render(&pipeline, &surface, &mut render_state, surface_size)?;
 

@@ -10,10 +10,10 @@
 //!   neither a display nor a GPU.
 //! * Without `--headless` the process opens a winit window and drives
 //!   [`krkr_app::Host::step`] at roughly 60 fps.
-//! * `--backend vulkan` requests the Vulkan pipeline. Vulkan bring-up is
-//!   still a Phase 5 skeleton that returns `RenderError::Unsupported`, so a
-//!   Vulkan run fails cleanly at startup; the default `--backend null`
-//!   always works.
+//! * `--backend vulkan` requests the Vulkan pipeline. It needs a real
+//!   window with a display connection (Wayland/X11/XCB); the windowed host
+//!   passes both the window and display handle so a surface can be created.
+//!   The headless path has no display and uses `--backend null`.
 //! * `-h`/`--help` prints the usage text.
 
 use std::process::ExitCode;
@@ -25,7 +25,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::raw_window_handle::HasWindowHandle;
+use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::window::{Window, WindowId};
 
 /// Usage text printed by `-h`/`--help` and on a parse error.
@@ -194,13 +194,17 @@ fn run_windowed(cli: &Cli) -> Result<(), String> {
 }
 
 /// winit application state for the desktop host.
+///
+/// Field order matters for teardown: the Vulkan swapchain/surface must be
+/// destroyed while the window's display connection is still alive, so `host`
+/// is declared before `window` (Rust drops fields in declaration order).
 struct WindowedApp {
     /// Backend requested on the command line.
     backend: BackendKind,
-    /// The created window, if `resumed` has run.
-    window: Option<Window>,
     /// The host, created once the window handle exists.
     host: Option<Host>,
+    /// The created window, if `resumed` has run.
+    window: Option<Window>,
     /// Timestamp of the previous frame (for `dt`).
     last_frame: Instant,
     /// Timestamp at which the next frame is due.
@@ -242,10 +246,12 @@ impl ApplicationHandler for WindowedApp {
         };
 
         let handle = window.window_handle().ok().map(|handle| handle.as_raw());
+        let display = window.display_handle().ok().map(|handle| handle.as_raw());
         let config = HostConfig {
             backend: self.backend,
             surface_size: DEFAULT_SIZE,
             window_handle: handle,
+            display_handle: display,
             ..HostConfig::default()
         };
         match Host::new(config) {
