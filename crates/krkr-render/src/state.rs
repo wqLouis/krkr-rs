@@ -17,7 +17,6 @@ pub struct RenderState {
 }
 
 /// Backend-specific payload of a [`RenderState`].
-#[allow(dead_code)] // The Vulkan variant is staged for Phase 5.
 pub(crate) enum StateKind {
     /// Headless null backend.
     Null(Box<NullState>),
@@ -34,7 +33,6 @@ pub struct Surface {
 }
 
 /// Backend-specific payload of a [`Surface`].
-#[allow(dead_code)] // The Vulkan variant is staged for Phase 5.
 pub(crate) enum SurfaceKind {
     /// Headless null backend.
     Null(NullSurface),

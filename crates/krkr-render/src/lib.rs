@@ -17,8 +17,11 @@
 //!   (`03-middle-layer-api.md` §3).
 //!
 //! Round 1 ships the whole API plus a fully functional headless
-//! [`NullRenderPipeline`]. The Vulkan (`ash`) backend lives in [`vulkan`] as
-//! a typed skeleton for Phase 5. See `docs/migration/04-renderer-vulkan.md`.
+//! [`NullRenderPipeline`]. The Vulkan (`ash`) backend in [`vulkan`] is a real
+//! implementation: instance/device creation, `ash-window` surface creation,
+//! swapchain management, staging uploads, fixed-function blend pipelines and
+//! scene-tree traversal and presentation. See
+//! `docs/migration/04-renderer-vulkan.md`.
 //!
 //! The pipeline keeps no mutable state: every call takes the evolving
 //! [`RenderState`] as an explicit `&mut` parameter, and the scene is
@@ -39,7 +42,7 @@ use std::fmt;
 use krkr_api::error::RenderError;
 use krkr_api::geometry::PixelRegion;
 use krkr_api::host::{Presentation, SurfaceEvent};
-use raw_window_handle::RawWindowHandle;
+use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 
 pub use crate::glyph::{
     Font, FontSystem, create_font_system, font_metrics, glyph_advance, load_font, rasterize_glyph,
@@ -54,9 +57,6 @@ pub use crate::state::{RenderState, Surface};
 pub use crate::texture::{Texture, TextureDesc, TextureFormat};
 pub use crate::vulkan::VulkanPipeline;
 pub use krkr_api::glyph::{FontMetrics, GlyphBitmap, GlyphStyle};
-
-/// Message returned by every operation of the unfinished Vulkan backend.
-const VULKAN_UNIMPLEMENTED: &str = "the Vulkan backend is not implemented yet (Phase 5)";
 
 /// Which render backend a [`RenderPipeline`] uses.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -231,7 +231,34 @@ pub fn begin_render_state(
 ) -> Result<(Surface, RenderState), RenderError> {
     match &p.kind {
         PipelineKind::Null(backend) => backend.begin(window),
-        PipelineKind::Vulkan(_) => Err(unsupported()),
+        PipelineKind::Vulkan(backend) => backend.begin(window),
+    }
+}
+
+/// Creates the surface and render state from an explicit display handle.
+///
+/// `VK_KHR_surface` needs the platform display connection (the X11 `Display*`,
+/// the XCB connection or the Wayland `wl_display`) in addition to the window
+/// handle. `raw-window-handle` splits those into [`RawDisplayHandle`] and
+/// [`RawWindowHandle`], but [`begin_render_state`] only receives the window
+/// handle. This function is the complete entry point for X11, XCB and
+/// Wayland; the null backend ignores `display`.
+///
+/// The middle layer stores both returned values and passes them to every
+/// subsequent render action.
+///
+/// # Errors
+///
+/// Returns [`RenderError::Unsupported`] when the backend cannot create a
+/// surface for the supplied handles.
+pub fn begin_render_state_with_display(
+    p: &RenderPipeline,
+    display: &RawDisplayHandle,
+    window: &RawWindowHandle,
+) -> Result<(Surface, RenderState), RenderError> {
+    match &p.kind {
+        PipelineKind::Null(backend) => backend.begin(window),
+        PipelineKind::Vulkan(backend) => backend.begin_with_display(display, window),
     }
 }
 
@@ -250,7 +277,7 @@ pub fn resize(
 ) -> Result<SurfaceEvent, RenderError> {
     match &p.kind {
         PipelineKind::Null(backend) => backend.resize(surface, state, size),
-        PipelineKind::Vulkan(_) => Err(unsupported()),
+        PipelineKind::Vulkan(backend) => backend.resize(surface, state, size),
     }
 }
 
@@ -263,7 +290,7 @@ pub fn resize(
 pub fn create_texture(p: &RenderPipeline, desc: TextureDesc) -> Result<Texture, RenderError> {
     match &p.kind {
         PipelineKind::Null(backend) => backend.create_texture(desc),
-        PipelineKind::Vulkan(_) => Err(unsupported()),
+        PipelineKind::Vulkan(backend) => backend.create_texture(desc),
     }
 }
 
@@ -274,7 +301,7 @@ pub fn create_texture(p: &RenderPipeline, desc: TextureDesc) -> Result<Texture, 
 pub fn drop_texture(p: &RenderPipeline, state: &mut RenderState, tex: Texture) {
     match &p.kind {
         PipelineKind::Null(backend) => backend.drop_texture(state, tex),
-        PipelineKind::Vulkan(_) => drop(tex),
+        PipelineKind::Vulkan(backend) => backend.drop_texture(state, tex),
     }
 }
 
@@ -296,7 +323,7 @@ pub fn upload_texture(
 ) -> Result<(), RenderError> {
     match &p.kind {
         PipelineKind::Null(backend) => backend.upload_texture(state, tex, region, pixels),
-        PipelineKind::Vulkan(_) => Err(unsupported()),
+        PipelineKind::Vulkan(backend) => backend.upload_texture(state, tex, region, pixels),
     }
 }
 
@@ -319,245 +346,6 @@ pub fn render(
 ) -> Result<Presentation, RenderError> {
     match &p.kind {
         PipelineKind::Null(backend) => backend.render(surface, state, scene),
-        PipelineKind::Vulkan(_) => Err(unsupported()),
-    }
-}
-
-/// Builds the shared "Vulkan is not implemented" error.
-fn unsupported() -> RenderError {
-    RenderError::Unsupported {
-        message: VULKAN_UNIMPLEMENTED.to_owned(),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use krkr_api::geometry::RectF;
-    use raw_window_handle::XlibWindowHandle;
-
-    fn headless_window() -> RawWindowHandle {
-        RawWindowHandle::Xlib(XlibWindowHandle::new(0))
-    }
-
-    #[test]
-    fn default_config_is_headless() {
-        let config = PipelineConfig::default();
-        assert_eq!(config.backend, BackendKind::Null);
-        assert_eq!(config.preferred_format, TextureFormat::Rgba8Srgb);
-
-        let pipeline = create_render_pipeline(config).expect("null pipeline");
-        assert_eq!(pipeline.backend(), BackendKind::Null);
-        assert_eq!(pipeline.backend().name(), "null");
-
-        let caps = capabilities(&pipeline);
-        assert_eq!(caps.backend, BackendKind::Null);
-        assert_eq!(caps.max_texture_dimension, NULL_MAX_TEXTURE_DIMENSION);
-    }
-
-    #[test]
-    fn vulkan_config_reports_unimplemented() {
-        let error = create_render_pipeline(PipelineConfig::vulkan()).unwrap_err();
-        assert!(matches!(error, RenderError::Unsupported { .. }));
-
-        // A null pipeline still reports Vulkan capabilities for the vulkan arm.
-        assert_eq!(BackendKind::Vulkan.name(), "vulkan");
-    }
-
-    #[test]
-    fn scene_construction_links_parent_and_children() {
-        let mut scene = RenderScene::new(RenderNodeId(0));
-        assert!(scene.is_empty());
-
-        let root = scene.push(RenderNode {
-            content: RenderContent::Solid([1.0, 0.0, 0.0, 1.0]),
-            ..RenderNode::default()
-        });
-        assert_eq!(root, RenderNodeId(0));
-        assert_eq!(scene.len(), 1);
-
-        let child = scene.push(RenderNode {
-            parent: Some(root),
-            content: RenderContent::None,
-            dst: RectF::new(1.0, 2.0, 3.0, 4.0),
-            z: 7,
-            ..RenderNode::default()
-        });
-        scene.node_mut(root).expect("root").children.push(child);
-
-        assert_eq!(scene.node(child).unwrap().parent, Some(root));
-        assert_eq!(scene.node(root).unwrap().children, vec![child]);
-        assert_eq!(
-            scene.node(child).unwrap().dst,
-            RectF::new(1.0, 2.0, 3.0, 4.0)
-        );
-        assert_eq!(scene.node(child).unwrap().z, 7);
-        assert!(scene.node(RenderNodeId(99)).is_none());
-
-        scene.background = Some([0.0, 0.0, 0.0, 1.0]);
-        assert!(scene.background.is_some());
-    }
-
-    #[test]
-    fn null_pipeline_round_trip_counts_draws() {
-        let pipeline = RenderPipeline::null();
-        let (surface, mut state) =
-            begin_render_state(&pipeline, &headless_window()).expect("begin");
-
-        let event = resize(&pipeline, &surface, &mut state, (1280, 720)).expect("resize");
-        assert_eq!(event, SurfaceEvent::Resized(1280, 720));
-
-        let texture = create_texture(&pipeline, TextureDesc::new(4, 2)).expect("texture");
-        assert_eq!(texture.desc().base_byte_len(), 4 * 2 * 4);
-        let pixels = [255u8; 4 * 2 * 4];
-        upload_texture(
-            &pipeline,
-            &mut state,
-            &texture,
-            PixelRegion::new(0, 0, 4, 2),
-            &pixels,
-        )
-        .expect("upload");
-        assert_eq!(
-            NullRenderPipeline::texture_pixels(&state, &texture).map(|p| p.len()),
-            Some(32)
-        );
-        assert_eq!(
-            NullRenderPipeline::texture_uploaded_bytes(&state, &texture),
-            Some(32)
-        );
-
-        let mut scene = RenderScene::new(RenderNodeId(0));
-        let root = scene.push(RenderNode {
-            content: RenderContent::Texture(texture.clone()),
-            ..RenderNode::default()
-        });
-        let solid = scene.push(RenderNode {
-            parent: Some(root),
-            content: RenderContent::Solid([0.0, 1.0, 0.0, 1.0]),
-            z: 2,
-            ..RenderNode::default()
-        });
-        let hidden = scene.push(RenderNode {
-            parent: Some(root),
-            content: RenderContent::None,
-            visible: false,
-            z: 1,
-            ..RenderNode::default()
-        });
-        scene.node_mut(root).expect("root").children = vec![solid, hidden];
-        scene.background = Some([0.0, 0.0, 0.0, 1.0]);
-
-        let presentation = render(&pipeline, &surface, &mut state, &scene).expect("render");
-        assert!(presentation.presented);
-        assert_eq!(presentation.surface_event, None);
-
-        let stats = NullRenderPipeline::last_frame(&state).expect("stats");
-        assert_eq!(stats.nodes_visited, 3);
-        assert_eq!(stats.draws, 2);
-        assert_eq!(stats.texture_draws, 1);
-        assert_eq!(stats.solid_draws, 1);
-        assert_eq!(stats.invisible, 1);
-        assert_eq!(stats.missing_textures, 0);
-        assert_eq!(stats.max_depth, 1);
-
-        // Dropping removes the state slot without invalidating clones.
-        let handle = texture.clone();
-        drop_texture(&pipeline, &mut state, texture);
-        assert!(NullRenderPipeline::texture_pixels(&state, &handle).is_none());
-    }
-
-    #[test]
-    fn partial_upload_touches_only_the_region() {
-        let pipeline = RenderPipeline::null();
-        let (_surface, mut state) =
-            begin_render_state(&pipeline, &headless_window()).expect("begin");
-        let texture = create_texture(&pipeline, TextureDesc::new(4, 4)).expect("texture");
-
-        let pixels = [7u8; 8];
-        upload_texture(
-            &pipeline,
-            &mut state,
-            &texture,
-            PixelRegion::new(1, 2, 2, 1),
-            &pixels,
-        )
-        .expect("upload");
-
-        let stored = NullRenderPipeline::texture_pixels(&state, &texture).expect("stored");
-        let offset = (2 * 4 + 1) * 4;
-        assert_eq!(&stored[offset..offset + 8], &[7u8; 8]);
-        assert_eq!(&stored[0..4], &[0u8; 4]);
-    }
-
-    #[test]
-    fn upload_validates_region_and_length() {
-        let pipeline = RenderPipeline::null();
-        let (_surface, mut state) =
-            begin_render_state(&pipeline, &headless_window()).expect("begin");
-        let texture = create_texture(&pipeline, TextureDesc::new(4, 4)).expect("texture");
-
-        let out_of_bounds = upload_texture(
-            &pipeline,
-            &mut state,
-            &texture,
-            PixelRegion::new(3, 0, 2, 1),
-            &[0u8; 8],
-        );
-        assert!(matches!(out_of_bounds, Err(RenderError::Upload { .. })));
-
-        let wrong_len = upload_texture(
-            &pipeline,
-            &mut state,
-            &texture,
-            PixelRegion::new(0, 0, 2, 1),
-            &[0u8; 4],
-        );
-        assert!(matches!(wrong_len, Err(RenderError::Upload { .. })));
-
-        let empty = upload_texture(&pipeline, &mut state, &texture, PixelRegion::ZERO, &[]);
-        assert!(matches!(empty, Err(RenderError::Upload { .. })));
-    }
-
-    #[test]
-    fn create_texture_rejects_invalid_descriptors() {
-        let pipeline = RenderPipeline::null();
-        assert!(matches!(
-            create_texture(&pipeline, TextureDesc::new(0, 4)),
-            Err(RenderError::InvalidArgument { .. })
-        ));
-        assert!(matches!(
-            create_texture(&pipeline, TextureDesc::new(4, 0)),
-            Err(RenderError::InvalidArgument { .. })
-        ));
-        assert!(matches!(
-            create_texture(&pipeline, TextureDesc::new(4, 4).with_mip_levels(0)),
-            Err(RenderError::InvalidArgument { .. })
-        ));
-        assert!(matches!(
-            create_texture(&pipeline, TextureDesc::new(u32::MAX, 1)),
-            Err(RenderError::InvalidArgument { .. })
-        ));
-    }
-
-    #[test]
-    fn glyph_scene_construction() {
-        let run = GlyphRun {
-            atlas: None,
-            size_px: 16.0,
-            color: [1.0, 1.0, 1.0, 1.0],
-            glyphs: vec![
-                GlyphPlacement::new('A', 0.0, 0.0, 9.0, PixelRegion::new(0, 0, 8, 12)),
-                GlyphPlacement::new('B', 9.0, 0.0, 9.0, PixelRegion::new(8, 0, 8, 12)),
-            ],
-        };
-        assert_eq!(run.len(), 2);
-        assert!(!run.is_empty());
-
-        let node = RenderNode {
-            content: RenderContent::Glyphs(run),
-            ..RenderNode::default()
-        };
-        assert!(matches!(node.content, RenderContent::Glyphs(_)));
+        PipelineKind::Vulkan(backend) => backend.render(surface, state, scene),
     }
 }

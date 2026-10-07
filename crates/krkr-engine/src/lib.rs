@@ -6,19 +6,27 @@
 //! objects. See `docs/migration/02-target-architecture.md`.
 //!
 //! This crate must not depend on Bevy, wgpu, `ash`, winit, FFmpeg, cpal or any
-//! concrete backend ([`docs/migration/02-target-architecture.md`] Invariant B):
-//! it talks only to the middle-layer API ([`krkr_api`]).
+//! render/media backend ([`docs/migration/02-target-architecture.md`] Invariant
+//! B). The storage namespace is the exception described in
+//! `docs/migration/06-file-system.md`: it is built over the bottom
+//! [`krkr_fs::FileSystem`] object, while the remaining bottom services are
+//! reached through the API types ([`krkr_api`]).
 //!
 //! [`docs/migration/02-target-architecture.md`]: ../../../docs/migration/02-target-architecture.md
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod archive;
 pub mod layer_ops;
 pub mod projection;
 pub mod raster;
 pub mod scene;
+pub mod storage;
 
+pub use archive::xp3::{
+    Entry as Xp3Entry, Segment as Xp3Segment, Xp3Archive, normalize_in_archive_name,
+};
 pub use layer_ops::{
     COPY_MAIN, COPY_MASK, GammaAdjust, RectI, adjust_gamma, affine_blit, blit_copy,
     blit_copy_clipped, blit_over, blit_plane, blur_bitmap_in_place, clip_rect, colorize,
@@ -35,6 +43,9 @@ pub use raster::{
 pub use scene::{
     BitmapCache, BitmapState, CachedImage, FontState, LT_ADDITIVE, LT_ALPHA, LT_OPAQUE,
     LT_SUBTRACTIVE, LayerState, Rect, Scene, WindowState,
+};
+pub use storage::{
+    ATTR_DIRECTORY, ATTR_NORMAL, Location, MountError, ReadError, Storage, StorageMetadata,
 };
 // The four `LT_*` values above already exist in `scene`; the projection adds
 // the rest of the native set without duplicating them.

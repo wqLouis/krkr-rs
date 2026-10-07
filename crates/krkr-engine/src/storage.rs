@@ -1,0 +1,714 @@
+//! Game storage namespace (L2).
+//!
+//! A [`Storage`] value owns everything needed to resolve TVP storage names:
+//!
+//! * an immutable bottom [`FileSystem`] object (created by L1) and the game
+//!   directory it is mounted at;
+//! * the parsed [`Xp3Archive`] values mounted from that directory, each with
+//!   its L2-owned [`FileState`];
+//! * the auto search-path list.
+//!
+//! This is the middle layer described in `docs/migration/06-file-system.md`
+//! §2: the bottom layer knows nothing about `.xp3`, `arc.xp3>path`
+//! addressing, case-insensitive lookup or the auto-path list. There are no
+//! globals or process-wide caches — a `Storage` is a plain value the caller
+//! owns, and all `FileState`s live inside it.
+//!
+//! Resolution order mirrors the reference engine:
+//!
+//! 1. explicit `arc.xp3>path` addressing,
+//! 2. disk files (normalized spelling, then the script's spelling, then a
+//!    bounded component-wise case-insensitive walk),
+//! 3. mounted archives in discovery order,
+//! 4. the auto search-path list.
+
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use krkr_api::error::FsError;
+use krkr_api::fs::{FsPath, OpenMode};
+use krkr_fs::{FileState, FileSystem};
+
+use crate::archive::xp3::{self, Xp3Archive, normalize_in_archive_name};
+
+/// Windows `FILE_ATTRIBUTE_DIRECTORY` (0x10).
+pub const ATTR_DIRECTORY: i64 = 0x10;
+/// Windows `FILE_ATTRIBUTE_ARCHIVE` (0x20) — the "normal file" bit.
+pub const ATTR_NORMAL: i64 = 0x20;
+
+/// One mounted `.xp3` archive: its logical path plus the parsed index and the
+/// open handle that owns its bytes.
+struct MountedArchive {
+    /// Logical path of the archive file (as mounted).
+    path: PathBuf,
+    /// Base file name (used for `arc.xp3>path` matching and listings).
+    file_name: String,
+    /// L2-owned open handle for the archive bytes.
+    file: FileState,
+    /// Parsed index.
+    archive: Xp3Archive,
+}
+
+/// A mounted game storage: one game directory plus every `.xp3` archive found
+/// inside it.
+pub struct Storage {
+    /// Immutable bottom file-system object.
+    fs: FileSystem,
+    /// Logical mount directory.
+    game_dir: PathBuf,
+    /// Mounted archives in sorted-name order (deterministic).
+    archives: Vec<MountedArchive>,
+    /// Auto search-path prefixes (plain dirs or `arc.xp3>` prefixes).
+    auto_paths: Vec<String>,
+}
+
+/// A resolved storage location.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Location {
+    /// A file on the bottom file system.
+    Disk(PathBuf),
+    /// A file inside an archive: `(archive path, normalized in-archive name)`.
+    Archive(PathBuf, String),
+}
+
+/// Metadata returned for a resolved storage entry.
+///
+/// XP3 indexes carry the uncompressed file size but no timestamps, so archive
+/// entries have `None` for all three time fields. Disk entries use the host
+/// file-system metadata exposed by [`krkr_fs::stat`] (only the modification
+/// time is surfaced by the bottom API).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageMetadata {
+    /// Uncompressed size in bytes.
+    pub size: u64,
+    /// Last modification time, when the backend reports it.
+    pub modified: Option<SystemTime>,
+    /// Last access time, when the backend reports it.
+    pub accessed: Option<SystemTime>,
+    /// Creation time, when the backend reports it.
+    pub created: Option<SystemTime>,
+}
+
+/// Errors while mounting a game storage.
+#[derive(Debug, thiserror::Error)]
+pub enum MountError {
+    /// The mount path is not a directory.
+    #[error("not a directory: {0}")]
+    NotADirectory(String),
+    /// A bottom file-system operation failed.
+    #[error(transparent)]
+    Fs(#[from] FsError),
+    /// An archive failed to open or parse.
+    #[error("archive error: {0}")]
+    Xp3(#[from] xp3::Error),
+}
+
+/// Errors while reading or listing storage entries.
+#[derive(Debug, thiserror::Error)]
+pub enum ReadError {
+    /// The requested storage name did not resolve.
+    #[error("storage not found: {0}")]
+    NotFound(String),
+    /// A bottom file-system operation failed.
+    #[error(transparent)]
+    Fs(#[from] FsError),
+    /// An archive read failed.
+    #[error("archive error: {0}")]
+    Xp3(#[from] xp3::Error),
+}
+
+impl Storage {
+    /// Mounts a game directory, discovering and parsing every top-level
+    /// `*.xp3` archive in it.
+    ///
+    /// `fs` is the bottom file-system object; `game_dir` is the logical mount
+    /// directory (for a host root this is normally the same directory passed
+    /// to [`FileSystem::host`]). Archives that fail to parse are logged and
+    /// skipped rather than failing the mount, matching the reference engine's
+    /// resilient startup.
+    pub fn mount(fs: FileSystem, game_dir: impl Into<PathBuf>) -> Result<Self, MountError> {
+        let game_dir = game_dir.into();
+        let meta = krkr_fs::stat(&fs, &FsPath::host(&game_dir))?;
+        if !meta.is_dir {
+            return Err(MountError::NotADirectory(game_dir.display().to_string()));
+        }
+        let mut storage = Storage {
+            fs,
+            game_dir,
+            archives: Vec::new(),
+            auto_paths: Vec::new(),
+        };
+        storage.discover_archives()?;
+        Ok(storage)
+    }
+
+    /// The bottom file-system object this storage reads through.
+    pub fn file_system(&self) -> &FileSystem {
+        &self.fs
+    }
+
+    /// The game directory path.
+    pub fn game_dir(&self) -> &Path {
+        &self.game_dir
+    }
+
+    /// Number of mounted archives.
+    pub fn archive_count(&self) -> usize {
+        self.archives.len()
+    }
+
+    /// The logical paths of the mounted archives, in mount order.
+    pub fn archive_paths(&self) -> impl Iterator<Item = &Path> {
+        self.archives.iter().map(|m| m.path.as_path())
+    }
+
+    /// Runs `f` for every mounted archive and its parsed index.
+    pub fn for_each_archive(&self, mut f: impl FnMut(&Path, &Xp3Archive)) {
+        for mounted in &self.archives {
+            f(&mounted.path, &mounted.archive);
+        }
+    }
+
+    /// Discovers and mounts every top-level `*.xp3` in the game directory.
+    /// Returns the number of newly mounted archives.
+    pub fn discover_archives(&mut self) -> Result<usize, MountError> {
+        let entries = krkr_fs::list(&self.fs, &FsPath::host(&self.game_dir))?;
+        let mut paths: Vec<PathBuf> = entries
+            .into_iter()
+            .filter(|e| !e.is_dir)
+            .filter(|e| {
+                Path::new(&e.name)
+                    .extension()
+                    .is_some_and(|x| x.eq_ignore_ascii_case("xp3"))
+            })
+            .map(|e| self.game_dir.join(e.name))
+            .collect();
+        paths.sort();
+
+        let mut mounted = 0;
+        for path in paths {
+            if self.archives.iter().any(|m| m.path == path) {
+                continue;
+            }
+            match self.mount_archive(&path) {
+                Ok(()) => mounted += 1,
+                Err(e) => log::warn!("skipping {}: {e}", path.display()),
+            }
+        }
+        Ok(mounted)
+    }
+
+    /// Mounts one archive by path, parsing its index eagerly.
+    ///
+    /// The path is resolved through the bottom file system like any other
+    /// disk path. Mounting the same archive twice is a no-op.
+    pub fn mount_archive(&mut self, path: impl AsRef<Path>) -> Result<(), MountError> {
+        let path = path.as_ref().to_path_buf();
+        if self.archives.iter().any(|m| m.path == path) {
+            return Ok(());
+        }
+        let file = krkr_fs::open(&self.fs, &FsPath::host(&path), OpenMode::Read)?;
+        let archive = Xp3Archive::open(&self.fs, &file)?;
+        let file_name = path
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        log::info!("opened {} ({} entries)", path.display(), archive.len());
+        self.archives.push(MountedArchive {
+            path,
+            file_name,
+            file,
+            archive,
+        });
+        Ok(())
+    }
+
+    /// Unmounts an archive by logical path or base file name
+    /// (case-insensitively). Returns `true` if an archive was removed.
+    pub fn unmount_archive(&mut self, path: impl AsRef<Path>) -> bool {
+        let path = path.as_ref();
+        let target = path
+            .file_name()
+            .map(|f| f.to_string_lossy().to_ascii_lowercase());
+        let before = self.archives.len();
+        self.archives.retain(|m| {
+            if m.path == path {
+                return false;
+            }
+            match &target {
+                Some(name) => m.file_name.to_ascii_lowercase() != *name,
+                None => true,
+            }
+        });
+        self.archives.len() != before
+    }
+
+    /// Appends an auto search path (the `Storages.addAutoPath` semantics).
+    /// Duplicates are ignored.
+    pub fn add_auto_path(&mut self, path: impl Into<String>) {
+        let path = path.into();
+        if !self.auto_paths.contains(&path) {
+            self.auto_paths.push(path);
+        }
+    }
+
+    /// Removes an auto search path.
+    pub fn remove_auto_path(&mut self, path: &str) {
+        self.auto_paths.retain(|p| p != path);
+    }
+
+    /// Replaces the whole auto search-path list.
+    pub fn set_auto_paths(&mut self, paths: Vec<String>) {
+        self.auto_paths = paths;
+    }
+
+    /// The current auto search-path list.
+    pub fn auto_paths(&self) -> &[String] {
+        &self.auto_paths
+    }
+
+    /// Resolves a storage name to a location, mirroring the reference search
+    /// order: explicit `arc.xp3>path` → disk file (case-insensitive) → first
+    /// archive containing the normalized name → auto paths.
+    ///
+    /// Storage names are case-insensitive even when the host filesystem is
+    /// not. Only the storage-relative part is normalized; the mount prefix
+    /// keeps the real filesystem spelling, and a name that escapes the mount
+    /// never resolves.
+    pub fn find(&self, name: &str) -> Option<Location> {
+        // Explicit archive addressing: "foo.xp3>data/script.ks".
+        if let Some((arc, rest)) = name.split_once('>') {
+            // The archive part may be a bare name or a full path; match on its
+            // file name, case-insensitively.
+            let arc_name = Path::new(arc)
+                .file_name()
+                .map(|f| f.to_string_lossy())
+                .unwrap_or_default();
+            let mounted = self
+                .archives
+                .iter()
+                .find(|m| m.file_name.eq_ignore_ascii_case(&arc_name))?;
+            let rest = normalize_in_archive_name(rest);
+            if mounted.archive.entry(&rest).is_some() {
+                return Some(Location::Archive(mounted.path.clone(), rest));
+            }
+            return None;
+        }
+
+        // Resolve the storage-relative part. Absolute names must point inside
+        // the mount, and traversal components are refused, so a name can never
+        // resolve outside the game directory.
+        let relative = self.relative_disk_name(name)?;
+
+        // Disk wins over archives.
+        if let Some(location) = self.find_disk_relative(&relative) {
+            return Some(location);
+        }
+
+        // Archives, in mount order (looked up by the normalized name).
+        let normalized = normalize_in_archive_name(&relative);
+        for mounted in &self.archives {
+            if mounted.archive.entry(&normalized).is_some() {
+                return Some(Location::Archive(mounted.path.clone(), normalized));
+            }
+        }
+
+        // Auto paths: the base name joined with each registered prefix (last
+        // added wins, like the reference's hash-table Add). Archive prefixes
+        // recurse into `find`; plain dirs hit the disk.
+        let base = storage_base(&normalized);
+        for entry in self.auto_paths.iter().rev() {
+            let joined = format!("{entry}{base}");
+            if entry.contains('>') {
+                if let Some(loc) = self.find(&joined) {
+                    return Some(loc);
+                }
+            } else {
+                let dir = entry.trim_end_matches('/');
+                if !dir.is_empty() {
+                    let candidate = self.game_dir.join(dir).join(base);
+                    if krkr_fs::stat(&self.fs, &FsPath::host(&candidate)).is_ok() {
+                        return Some(Location::Disk(candidate));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// The storage-relative part of `name` (using `/` separators), or `None`
+    /// when the name is absolute and does not point inside the mount, or
+    /// contains a traversal (`..`) component.
+    pub fn relative_disk_name(&self, name: &str) -> Option<String> {
+        // Fold Windows separators so a `\`-separated storage name behaves like
+        // the reference on any host.
+        let separators = name.replace('\\', "/");
+        let path = Path::new(&separators);
+        let relative = if path.is_absolute() {
+            if self.game_dir.as_os_str().is_empty() {
+                path.to_path_buf()
+            } else {
+                path.strip_prefix(&self.game_dir).ok()?.to_path_buf()
+            }
+        } else {
+            path.to_path_buf()
+        };
+        if relative.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        }) {
+            return None;
+        }
+        Some(relative.to_string_lossy().replace('\\', "/"))
+    }
+
+    /// Resolves an existing disk file for a storage name, case-insensitively.
+    /// Returns the real on-disk path so writers can update the existing file
+    /// instead of creating a case-variant duplicate.
+    pub fn find_disk(&self, name: &str) -> Option<PathBuf> {
+        let relative = self.relative_disk_name(name)?;
+        match self.find_disk_relative(&relative)? {
+            Location::Disk(path) => Some(path),
+            Location::Archive(..) => None,
+        }
+    }
+
+    /// Disk branch of [`Self::find`], given an already-resolved relative name.
+    fn find_disk_relative(&self, relative: &str) -> Option<Location> {
+        if relative.is_empty() {
+            return None;
+        }
+        // Reference semantics: storage names are normalized to lowercase
+        // before lookup, so the lowercase spelling wins when both a lowercase
+        // and a mixed-case file exist.
+        let normalized = normalize_in_archive_name(relative);
+        let candidate = self.game_dir.join(&normalized);
+        if krkr_fs::stat(&self.fs, &FsPath::host(&candidate)).is_ok_and(|m| !m.is_dir) {
+            return Some(Location::Disk(candidate));
+        }
+        // Fast path: the exact spelling the script used.
+        if normalized != relative {
+            let exact = self.game_dir.join(relative);
+            if krkr_fs::stat(&self.fs, &FsPath::host(&exact)).is_ok_and(|m| !m.is_dir) {
+                return Some(Location::Disk(exact));
+            }
+        }
+        // Bounded, component-wise case-insensitive walk.
+        self.find_disk_case_insensitive(&normalized)
+            .map(Location::Disk)
+    }
+
+    /// Bounded component-wise case-insensitive disk walk.
+    ///
+    /// Directories are entered only when their name matches the target's next
+    /// component, so cost is bounded by the path depth rather than the size of
+    /// the tree. A file directly at the current level wins over descending.
+    fn find_disk_case_insensitive(&self, relative: &str) -> Option<PathBuf> {
+        fn descend(fs: &FileSystem, dir: &Path, parts: &[&str]) -> Option<PathBuf> {
+            let want = parts[0];
+            let entries = krkr_fs::list(fs, &FsPath::host(dir)).ok()?;
+            // Directories matching this component are searched after the
+            // direct file hit, so a file directly at this level wins.
+            let mut subdirs = Vec::new();
+            for entry in entries {
+                if !entry.name.eq_ignore_ascii_case(want) {
+                    continue;
+                }
+                let path = dir.join(&entry.name);
+                if parts.len() == 1 {
+                    if !entry.is_dir {
+                        return Some(path);
+                    }
+                } else if entry.is_dir {
+                    subdirs.push(path);
+                }
+            }
+            for subdir in subdirs {
+                if let Some(found) = descend(fs, &subdir, &parts[1..]) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+
+        let parts: Vec<&str> = relative.split('/').filter(|p| !p.is_empty()).collect();
+        if parts.is_empty() {
+            return None;
+        }
+        descend(&self.fs, &self.game_dir, &parts)
+    }
+
+    /// Reads a storage entry to bytes (disk file or archive member).
+    pub fn read(&self, name: &str) -> Result<Vec<u8>, ReadError> {
+        match self.find(name) {
+            Some(Location::Disk(path)) => read_fs_file(&self.fs, &path).map_err(ReadError::Fs),
+            Some(Location::Archive(arc_path, in_arc)) => {
+                let mounted = self
+                    .archives
+                    .iter()
+                    .find(|m| m.path == arc_path)
+                    .ok_or_else(|| ReadError::NotFound(name.to_string()))?;
+                mounted
+                    .archive
+                    .read(&self.fs, &mounted.file, &in_arc)
+                    .map_err(ReadError::Xp3)
+            }
+            None => Err(ReadError::NotFound(name.to_string())),
+        }
+    }
+
+    /// Returns metadata for a resolved storage entry.
+    ///
+    /// Disk files are read through [`krkr_fs::stat`]. For an XP3 entry, `size`
+    /// is the uncompressed size from the archive index; archive timestamps
+    /// are absent because XP3 has no timestamp fields. Names follow the same
+    /// resolution order as [`Self::find`].
+    pub fn stat(&self, name: &str) -> Option<StorageMetadata> {
+        match self.find(name) {
+            Some(Location::Disk(path)) => {
+                let meta = krkr_fs::stat(&self.fs, &FsPath::host(&path)).ok()?;
+                Some(StorageMetadata {
+                    size: meta.size,
+                    modified: meta.modified_ms.map(system_time_from_millis),
+                    accessed: None,
+                    created: None,
+                })
+            }
+            Some(Location::Archive(arc_path, in_arc)) => {
+                let mounted = self.archives.iter().find(|m| m.path == arc_path)?;
+                let entry = mounted.archive.entry(&in_arc)?;
+                Some(StorageMetadata {
+                    size: entry.org_size,
+                    modified: None,
+                    accessed: None,
+                    created: None,
+                })
+            }
+            None => None,
+        }
+    }
+
+    /// True if a storage name resolves.
+    pub fn exists(&self, name: &str) -> bool {
+        self.find(name).is_some()
+    }
+
+    /// Lists the immediate children of storage directory `dir`, merging disk
+    /// entries with archive entries. Names are normalized (`/` separators,
+    /// lowercase); directory children carry a trailing `/`. Results are sorted
+    /// and deduplicated.
+    ///
+    /// A missing or non-directory `dir` lists nothing (it does not error);
+    /// only a bottom file-system failure propagates.
+    pub fn list(&self, dir: &str) -> Result<Vec<String>, ReadError> {
+        let normalized = normalize_in_archive_name(dir);
+        let normalized = normalized.trim_end_matches('/').to_string();
+        let mut found = BTreeSet::new();
+
+        let disk_dir = if normalized.is_empty() {
+            self.game_dir.clone()
+        } else {
+            self.game_dir.join(&normalized)
+        };
+        match krkr_fs::list(&self.fs, &FsPath::host(&disk_dir)) {
+            Ok(entries) => {
+                for entry in entries {
+                    found.insert(child_name(&normalized, &entry.name, entry.is_dir));
+                }
+            }
+            Err(FsError::NotFound { .. }) | Err(FsError::NotADirectory { .. }) => {}
+            Err(e) => return Err(ReadError::Fs(e)),
+        }
+
+        let prefix = if normalized.is_empty() {
+            String::new()
+        } else {
+            format!("{normalized}/")
+        };
+        for mounted in &self.archives {
+            for entry in mounted.archive.entries() {
+                let Some(rest) = entry.name.strip_prefix(&prefix) else {
+                    continue;
+                };
+                if rest.is_empty() {
+                    continue;
+                }
+                let (head, is_dir) = match rest.split_once('/') {
+                    Some((head, _)) => (head, true),
+                    None => (rest, false),
+                };
+                found.insert(if is_dir {
+                    format!("{prefix}{head}/")
+                } else {
+                    format!("{prefix}{head}")
+                });
+            }
+        }
+
+        Ok(found.into_iter().collect())
+    }
+
+    /// `Storages.getFileList(mask, attr)`: storage names matching a wildcard
+    /// mask, merged across the disk root and every mounted archive.
+    ///
+    /// * The mask is normalized (lowercased, `\` → `/`).
+    /// * If it contains `>` it addresses archives: `arcmask>inarcmask`, where
+    ///   `arcmask` wildcard-matches the archive file name.
+    /// * The part before the last `/` is a required literal directory prefix;
+    ///   the part after is a `*`/`?` wildcard matched case-insensitively
+    ///   against the base name. Matching is **recursive under the prefix**
+    ///   (matching the reference `Storages.getFileList`): a mask with no
+    ///   `>` matches base names at any depth below the prefix, and a mask
+    ///   with no `/` matches at any depth in the whole tree.
+    /// * Disk entries are emitted as normalized relative names; archive
+    ///   entries as `arc.xp3>path`.
+    /// * `attr` filters results: `0` or [`ATTR_NORMAL`] → regular files,
+    ///   [`ATTR_DIRECTORY`] → directories (with a trailing `/`); bits OR
+    ///   together.
+    pub fn get_file_list(&self, mask: &str, attr: i64) -> Vec<String> {
+        let mask = normalize_in_archive_name(mask);
+        let (arc_pat, in_arc_mask) = match mask.split_once('>') {
+            Some((arc, rest)) => (Some(arc.to_string()), rest.to_string()),
+            None => (None, mask),
+        };
+        let (dir_prefix, base_pat) = match in_arc_mask.rsplit_once('/') {
+            Some((dir, base)) => (
+                format!("{dir}/"),
+                if base.is_empty() {
+                    "*".to_string()
+                } else {
+                    base.to_string()
+                },
+            ),
+            None => (String::new(), in_arc_mask.clone()),
+        };
+        let include_files = attr == 0 || attr & ATTR_NORMAL != 0;
+        let include_dirs = attr & ATTR_DIRECTORY != 0;
+
+        let mut found = BTreeSet::new();
+
+        // Disk entries under the game directory, recursively.
+        let mut disk = Vec::new();
+        self.collect_disk_entries(&self.game_dir, "", &mut disk);
+        for (name, is_dir) in disk {
+            let base = name.rsplit('/').next().unwrap_or(&name);
+            let prefix_ok = dir_prefix.is_empty() || name.starts_with(&dir_prefix);
+            let attr_ok = (is_dir && include_dirs) || (!is_dir && include_files);
+            if prefix_ok && attr_ok && wildcard_match(&base_pat, base) {
+                found.insert(if is_dir { format!("{name}/") } else { name });
+            }
+        }
+
+        // Archive entries, addressed as "arc.xp3>path".
+        for mounted in &self.archives {
+            if let Some(pat) = &arc_pat
+                && !wildcard_match(pat, &mounted.file_name)
+            {
+                continue;
+            }
+            for entry in mounted.archive.entries() {
+                let base = entry.name.rsplit('/').next().unwrap_or(&entry.name);
+                let prefix_ok = dir_prefix.is_empty() || entry.name.starts_with(&dir_prefix);
+                if prefix_ok && wildcard_match(&base_pat, base) {
+                    found.insert(format!("{}>{}", mounted.file_name, entry.name));
+                }
+            }
+        }
+
+        found.into_iter().collect()
+    }
+
+    /// Recursively collects disk entries as `(normalized relative name,
+    /// is_dir)`, using the bottom file system for listing.
+    fn collect_disk_entries(&self, dir: &Path, rel: &str, out: &mut Vec<(String, bool)>) {
+        let Ok(entries) = krkr_fs::list(&self.fs, &FsPath::host(dir)) else {
+            return;
+        };
+        for entry in entries {
+            let rel = if rel.is_empty() {
+                entry.name.clone()
+            } else {
+                format!("{rel}/{}", entry.name)
+            };
+            let normalized = normalize_in_archive_name(&rel);
+            let child = dir.join(&entry.name);
+            if entry.is_dir {
+                out.push((normalized, true));
+                self.collect_disk_entries(&child, &rel, out);
+            } else {
+                out.push((normalized, false));
+            }
+        }
+    }
+}
+
+/// The base storage name (the part after the last `/`).
+fn storage_base(name: &str) -> &str {
+    name.rsplit('/').next().unwrap_or(name)
+}
+
+/// Builds a listed child name from its parent prefix.
+fn child_name(parent: &str, name: &str, is_dir: bool) -> String {
+    let normalized = normalize_in_archive_name(name);
+    let full = if parent.is_empty() {
+        normalized
+    } else {
+        format!("{parent}/{normalized}")
+    };
+    if is_dir { format!("{full}/") } else { full }
+}
+
+/// Converts epoch milliseconds to a [`SystemTime`].
+fn system_time_from_millis(ms: u64) -> SystemTime {
+    UNIX_EPOCH + Duration::from_millis(ms)
+}
+
+/// Reads a whole file through the bottom positional API.
+fn read_fs_file(fs: &FileSystem, path: &Path) -> Result<Vec<u8>, FsError> {
+    let file = krkr_fs::open(fs, &FsPath::host(path), OpenMode::Read)?;
+    let size = krkr_fs::file_size(fs, &file)? as usize;
+    let mut out = vec![0u8; size];
+    let mut read = 0usize;
+    while read < size {
+        let n = krkr_fs::read_at(fs, &file, read as u64, &mut out[read..])?;
+        if n == 0 {
+            break;
+        }
+        read += n;
+    }
+    out.truncate(read);
+    Ok(out)
+}
+
+/// Case-insensitive `*`/`?` wildcard match (ASCII case folding).
+fn wildcard_match(pattern: &str, text: &str) -> bool {
+    let pat: Vec<char> = pattern.chars().collect();
+    let text: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let (mut star, mut retry) = (usize::MAX, 0usize);
+    while ti < text.len() {
+        if pi < pat.len() && (pat[pi] == '?' || pat[pi].eq_ignore_ascii_case(&text[ti])) {
+            pi += 1;
+            ti += 1;
+        } else if pi < pat.len() && pat[pi] == '*' {
+            star = pi;
+            retry = ti;
+            pi += 1;
+        } else if star != usize::MAX {
+            pi = star + 1;
+            retry += 1;
+            ti = retry;
+        } else {
+            return false;
+        }
+    }
+    while pi < pat.len() && pat[pi] == '*' {
+        pi += 1;
+    }
+    pi == pat.len()
+}

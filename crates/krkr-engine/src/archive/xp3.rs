@@ -1,0 +1,515 @@
+//! XP3 archive reader over [`krkr_fs`] positional IO.
+//!
+//! This is a port of the standalone `xp3` crate reader onto the L1
+//! [`FileState`] surface: instead of owning a live `std::fs::File`, the
+//! parser reads through a small [`FileReader`] adapter that turns positional
+//! [`read_at`] calls into the `Read + Seek` interface the original parser
+//! logic expects. The on-disk format behaviour — magic, index chaining, raw
+//! and zlib index/segment encodings, name normalization, EXE-embedded search
+//! — is preserved.
+//!
+//! The [`Xp3Archive`] value stores only parsed index metadata. Every read
+//! takes the owning [`FileSystem`] and [`FileState`] explicitly, so no file
+//! handle is hidden inside the archive and the caller (L2) keeps all state.
+//!
+//! ## Format summary
+//!
+//! * 11-byte magic: `"XP3\r\n \n\x1a\x8b\x67\x01"`.
+//! * At offset 11: 8-byte little-endian *index offset* relative to the
+//!   archive start (for EXE-embedded archives the magic is searched on
+//!   16-byte alignment and the offset is relative to the found magic).
+//! * The index block: 1 flag byte + (raw or zlib-compressed) index data.
+//!   Flag bits: low 3 = encode method (`0` raw, `1` zlib), `0x80` = continue.
+//! * Index data is a sequence of chunks `[4-byte tag][u64 LE size][data]`:
+//!   `File` chunks hold `info` / `segm` / `aldr` sub-chunks.
+//! * In-archive names are normalized: lowercased, `\` → `/`, duplicate
+//!   slashes collapsed, leading slashes dropped.
+//! * Reading a file concatenates its segments; zlib segments are inflated to
+//!   `org_size`.
+
+use std::collections::BTreeMap;
+use std::io::{self, Read, Seek, SeekFrom};
+
+use flate2::read::ZlibDecoder;
+use krkr_fs::{FileState, FileSystem, file_size, read_at};
+
+/// 11-byte XP3 magic: `"XP3\r\n \n\x1a\x8b\x67\x01"`.
+pub const XP3_MAGIC: [u8; 11] = [
+    0x58, 0x50, 0x33, // 'X','P','3'
+    0x0d, 0x0a, 0x20, 0x0a, 0x1a, // \r \n ' ' \n EOF
+    0x8b, 0x67, 0x01, // KANJI-code + version/coding
+];
+
+/// Index encode method mask (low 3 bits of the index flag byte).
+pub const INDEX_ENCODE_METHOD_MASK: u8 = 0x07;
+/// Index stored raw.
+pub const INDEX_ENCODE_RAW: u8 = 0;
+/// Index stored zlib-compressed.
+pub const INDEX_ENCODE_ZLIB: u8 = 1;
+/// Index continue bit — another index block follows.
+pub const INDEX_CONTINUE: u8 = 0x80;
+
+/// Segment encode method mask.
+pub const SEGM_ENCODE_METHOD_MASK: u32 = 0x07;
+/// Segment stored raw.
+pub const SEGM_ENCODE_RAW: u32 = 0;
+/// Segment stored zlib-compressed.
+pub const SEGM_ENCODE_ZLIB: u32 = 1;
+
+/// Errors produced while opening or reading an XP3 archive.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    /// An underlying I/O (or bottom file-system) read failed.
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    /// The file does not start with the XP3 magic (nor an MZ header
+    /// containing one).
+    #[error("not an XP3 archive")]
+    NotAnXp3,
+
+    /// The index chain exceeded the sanity limit.
+    #[error("archive index chain exceeded {0} blocks (corrupt archive?)")]
+    IndexChainTooLong(usize),
+
+    /// The index flag byte has an unknown encode method.
+    #[error("bad index flag 0x{0:02x}")]
+    BadIndexFlag(u8),
+
+    /// The index data is malformed.
+    #[error("corrupt index data: {0}")]
+    CorruptIndex(&'static str),
+
+    /// A segment uses an unknown encode method.
+    #[error("unknown segment encode method {0} (flags 0x{1:08x})")]
+    UnknownSegmentMethod(u32, u32),
+
+    /// A zlib segment failed to inflate.
+    #[error("zlib decompression failed for segment of `{0}`")]
+    Inflate(String),
+
+    /// The requested entry does not exist.
+    #[error("entry not found in archive: {0}")]
+    NotFound(String),
+
+    /// The archive has no index block.
+    #[error("archive has no index (empty?)")]
+    NoIndex,
+}
+
+/// Convenience alias for XP3 results.
+pub type Result<T> = std::result::Result<T, Error>;
+
+/// One 28-byte segment of a file inside the archive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Segment {
+    /// Encode method: [`SEGM_ENCODE_RAW`] or [`SEGM_ENCODE_ZLIB`].
+    pub flags: u32,
+    /// Absolute offset of the segment data in the archive file.
+    pub start: u64,
+    /// Uncompressed size.
+    pub org_size: u64,
+    /// Stored (compressed) size.
+    pub arc_size: u64,
+}
+
+/// A single file entry inside the archive.
+#[derive(Debug, Clone)]
+pub struct Entry {
+    /// Raw flags from the `info` chunk (bit 31 = protected).
+    pub flags: u32,
+    /// Uncompressed total size.
+    pub org_size: u64,
+    /// Total stored size (sum of segment `arc_size`).
+    pub arc_size: u64,
+    /// Name as stored in the archive (not normalized).
+    pub raw_name: String,
+    /// Normalized in-archive name (lowercase, `/` separators).
+    pub name: String,
+    /// Segments composing the file, in order.
+    pub segments: Vec<Segment>,
+    /// Adler32 hash of the name from the `aldr` chunk.
+    pub file_hash: u32,
+}
+
+/// An opened XP3 archive index.
+///
+/// The value stores the archive base offset and the parsed entry map; it does
+/// **not** hold a file handle. Reads receive the [`FileSystem`] and
+/// [`FileState`] that own the underlying bytes.
+pub struct Xp3Archive {
+    /// Base offset of the archive inside the file (non-zero for
+    /// EXE-embedded archives).
+    base: u64,
+    /// Entries keyed by normalized name.
+    entries: BTreeMap<String, Entry>,
+}
+
+impl Xp3Archive {
+    /// Parse an XP3 index from an already-open [`FileState`].
+    pub fn open(fs: &FileSystem, file: &FileState) -> Result<Self> {
+        let mut reader = FileReader { fs, file, pos: 0 };
+
+        // Read the 11-byte magic.
+        let mut magic = [0u8; 11];
+        reader.read_exact(&mut magic).map_err(|_| Error::NotAnXp3)?;
+
+        let base = if magic[..2] == *b"MZ" {
+            // EXE-embedded: search for the XP3 mark on 16-byte alignment.
+            find_xp3_offset(&mut reader)?
+        } else if magic == XP3_MAGIC {
+            0
+        } else {
+            return Err(Error::NotAnXp3);
+        };
+
+        let mut archive = Xp3Archive {
+            base,
+            entries: BTreeMap::new(),
+        };
+        archive.read_index(&mut reader)?;
+        Ok(archive)
+    }
+
+    /// Base offset of the archive data inside the file (0 for plain files).
+    pub fn base_offset(&self) -> u64 {
+        self.base
+    }
+
+    /// Number of entries.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the archive has no entries.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Iterate over all entries in normalized-name order.
+    pub fn entries(&self) -> impl Iterator<Item = &Entry> {
+        self.entries.values()
+    }
+
+    /// Look up an entry by name (normalized before lookup).
+    pub fn entry(&self, name: &str) -> Option<&Entry> {
+        self.entries.get(&normalize_in_archive_name(name))
+    }
+
+    /// Read the full contents of an entry by name.
+    pub fn read(&self, fs: &FileSystem, file: &FileState, name: &str) -> Result<Vec<u8>> {
+        let normalized = normalize_in_archive_name(name);
+        let entry = self
+            .entries
+            .get(&normalized)
+            .ok_or_else(|| Error::NotFound(name.to_string()))?;
+        self.read_entry(fs, file, entry)
+    }
+
+    /// Read the full contents of an entry.
+    pub fn read_entry(&self, fs: &FileSystem, file: &FileState, entry: &Entry) -> Result<Vec<u8>> {
+        // Note: `protected` (DRM bit) files are read normally, matching the
+        // reference emulator, which allows extracting protected storage.
+        let mut reader = FileReader { fs, file, pos: 0 };
+        let mut out = Vec::with_capacity(entry.org_size as usize);
+        for seg in &entry.segments {
+            let mut buf = vec![0u8; seg.arc_size as usize];
+            reader.seek(SeekFrom::Start(self.base + seg.start))?;
+            reader.read_exact(&mut buf)?;
+
+            let method = seg.flags & SEGM_ENCODE_METHOD_MASK;
+            match method {
+                SEGM_ENCODE_RAW => out.extend_from_slice(&buf),
+                SEGM_ENCODE_ZLIB => {
+                    let mut dec = ZlibDecoder::new(&buf[..]);
+                    let mut chunk = vec![0u8; seg.org_size as usize];
+                    dec.read_exact(&mut chunk)
+                        .map_err(|_| Error::Inflate(entry.raw_name.clone()))?;
+                    out.extend_from_slice(&chunk);
+                }
+                other => return Err(Error::UnknownSegmentMethod(other, seg.flags)),
+            }
+        }
+        debug_assert_eq!(out.len() as u64, entry.org_size);
+        Ok(out)
+    }
+
+    // -- internals ----------------------------------------------------------
+
+    /// Read the (possibly chained) index blocks, replicating the reference
+    /// engine's loop: the first index offset is read from offset 11, and after
+    /// a block with `INDEX_CONTINUE` the next offset is read from the current
+    /// position (immediately after that block's data).
+    fn read_index(&mut self, reader: &mut FileReader<'_>) -> Result<()> {
+        reader.seek(SeekFrom::Start(self.base + 11))?;
+        let mut chain = 0usize;
+        loop {
+            chain += 1;
+            if chain > 256 {
+                return Err(Error::IndexChainTooLong(chain));
+            }
+
+            let index_ofs = read_u64_le(reader)?;
+            if index_ofs == 0 {
+                if self.entries.is_empty() {
+                    return Err(Error::NoIndex);
+                }
+                break;
+            }
+
+            reader.seek(SeekFrom::Start(self.base + index_ofs))?;
+            let flag = read_u8(reader)?;
+            let data = match flag & INDEX_ENCODE_METHOD_MASK {
+                INDEX_ENCODE_RAW => {
+                    let size = read_u64_le(reader)?;
+                    read_exact_vec(reader, size)?
+                }
+                INDEX_ENCODE_ZLIB => {
+                    let compressed_size = read_u64_le(reader)?;
+                    let real_size = read_u64_le(reader)?;
+                    let compressed = read_exact_vec(reader, compressed_size)?;
+                    let mut dec = ZlibDecoder::new(&compressed[..]);
+                    let mut data = vec![0u8; real_size as usize];
+                    dec.read_exact(&mut data)
+                        .map_err(|_| Error::CorruptIndex("zlib decompression failed"))?;
+                    data
+                }
+                other => return Err(Error::BadIndexFlag(flag | other)),
+            };
+
+            self.parse_index(&data)?;
+
+            // On CONTINUE the stream is left right after this block's data,
+            // where the next index offset is stored.
+            if flag & INDEX_CONTINUE == 0 {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Parse one index block: chunks of `[4-byte tag][u64 LE size][data]`.
+    fn parse_index(&mut self, data: &[u8]) -> Result<()> {
+        let mut pos = 0usize;
+        while pos + 12 <= data.len() {
+            let tag = &data[pos..pos + 4];
+            let size = u64::from_le_bytes(data[pos + 4..pos + 12].try_into().unwrap());
+            let size = usize::try_from(size).map_err(|_| Error::CorruptIndex("chunk too large"))?;
+            pos += 12;
+            if pos + size > data.len() {
+                return Err(Error::CorruptIndex("chunk overruns index data"));
+            }
+            let payload = &data[pos..pos + size];
+            pos += size;
+
+            if tag == b"File" {
+                self.parse_file_chunk(payload)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Parse one `File` chunk: `info` / `segm` / `aldr` sub-chunks.
+    fn parse_file_chunk(&mut self, data: &[u8]) -> Result<()> {
+        let mut pos = 0usize;
+        let mut flags = 0u32;
+        let mut org_size = 0u64;
+        let mut arc_size = 0u64;
+        let mut raw_name = String::new();
+        let mut segments = Vec::new();
+        let mut file_hash = 0u32;
+
+        while pos + 12 <= data.len() {
+            let tag = &data[pos..pos + 4];
+            let size = u64::from_le_bytes(data[pos + 4..pos + 12].try_into().unwrap());
+            let size =
+                usize::try_from(size).map_err(|_| Error::CorruptIndex("sub-chunk too large"))?;
+            pos += 12;
+            if pos + size > data.len() {
+                return Err(Error::CorruptIndex("sub-chunk overruns File chunk"));
+            }
+            let payload = &data[pos..pos + size];
+            pos += size;
+
+            match tag {
+                b"info" => {
+                    if payload.len() < 22 {
+                        return Err(Error::CorruptIndex("info sub-chunk too short"));
+                    }
+                    flags = u32::from_le_bytes(payload[0..4].try_into().unwrap());
+                    org_size = u64::from_le_bytes(payload[4..12].try_into().unwrap());
+                    arc_size = u64::from_le_bytes(payload[12..20].try_into().unwrap());
+                    let name_len = i16::from_le_bytes(payload[20..22].try_into().unwrap()) as usize;
+                    let name_bytes = payload
+                        .get(22..22 + name_len * 2)
+                        .ok_or(Error::CorruptIndex("name overruns info sub-chunk"))?;
+                    let mut units = Vec::with_capacity(name_len);
+                    for c in name_bytes.chunks_exact(2) {
+                        units.push(u16::from_le_bytes([c[0], c[1]]));
+                    }
+                    raw_name = String::from_utf16_lossy(&units);
+                }
+                b"segm" => {
+                    if !payload.len().is_multiple_of(28) {
+                        return Err(Error::CorruptIndex(
+                            "segm sub-chunk size not multiple of 28",
+                        ));
+                    }
+                    for s in payload.chunks_exact(28) {
+                        segments.push(Segment {
+                            flags: u32::from_le_bytes(s[0..4].try_into().unwrap()),
+                            start: u64::from_le_bytes(s[4..12].try_into().unwrap()),
+                            org_size: u64::from_le_bytes(s[12..20].try_into().unwrap()),
+                            arc_size: u64::from_le_bytes(s[20..28].try_into().unwrap()),
+                        });
+                    }
+                }
+                b"aldr" => {
+                    if let Some(h) = payload.get(0..4) {
+                        file_hash = u32::from_le_bytes(h.try_into().unwrap());
+                    }
+                }
+                _ => { /* unknown sub-chunk: ignore */ }
+            }
+        }
+
+        let name = normalize_in_archive_name(&raw_name);
+        self.entries.insert(
+            name.clone(),
+            Entry {
+                flags,
+                org_size,
+                arc_size,
+                raw_name,
+                name,
+                segments,
+                file_hash,
+            },
+        );
+        Ok(())
+    }
+}
+
+/// Normalize an in-archive storage name the way the reference engine does:
+/// lowercase, `\` → `/`, collapse runs of `/`, and **drop leading slashes**.
+///
+/// This mirrors `tTVPArchive::NormalizeInArchiveStorageName`
+/// (`reference/cpp/core/base/StorageIntf.cpp`): the very first `/` is skipped
+/// together with any following ones.
+pub fn normalize_in_archive_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut started = false;
+    let mut prev_slash = false;
+    for c in name.chars() {
+        let c = match c {
+            'A'..='Z' => c.to_ascii_lowercase(),
+            '\\' => '/',
+            _ => c,
+        };
+        if c == '/' {
+            // Leading slashes are dropped; interior runs collapse to one.
+            if started && !prev_slash {
+                out.push('/');
+                prev_slash = true;
+            }
+        } else {
+            out.push(c);
+            started = true;
+            prev_slash = false;
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Positional reader adapter
+// ---------------------------------------------------------------------------
+
+/// Adapts a `(FileSystem, FileState)` pair to `std::io::Read + Seek`.
+///
+/// The original XP3 parser was written against a live `std::fs::File`; this
+/// adapter presents the same interface over positional [`read_at`] calls,
+/// keeping the parser logic a direct port. The private cursor is local to the
+/// adapter and is never stored in the bottom [`FileSystem`].
+struct FileReader<'a> {
+    /// Bottom file-system object owning the handle.
+    fs: &'a FileSystem,
+    /// Caller-owned open handle.
+    file: &'a FileState,
+    /// Local cursor for sequential `Read`.
+    pos: u64,
+}
+
+impl Read for FileReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = read_at(self.fs, self.file, self.pos, buf).map_err(io::Error::other)?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for FileReader<'_> {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let target: i128 = match pos {
+            SeekFrom::Start(off) => off as i128,
+            SeekFrom::End(off) => {
+                file_size(self.fs, self.file).map_err(io::Error::other)? as i128 + off as i128
+            }
+            SeekFrom::Current(off) => self.pos as i128 + off as i128,
+        };
+        self.pos = target.max(0) as u64;
+        Ok(self.pos)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Format helpers
+// ---------------------------------------------------------------------------
+
+/// Search for the XP3 magic in an EXE (MZ) file on 16-byte alignment,
+/// starting at offset 16. Returns the archive base offset.
+fn find_xp3_offset<R: Read + Seek>(reader: &mut R) -> Result<u64> {
+    const CHUNK: usize = 256 * 1024;
+    let mut offset = 16u64;
+    reader.seek(SeekFrom::Start(offset))?;
+    let mut buffer = vec![0u8; CHUNK];
+    loop {
+        let n = reader.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        let mut p = 0usize;
+        while p + 11 <= n {
+            if buffer[p..p + 11] == XP3_MAGIC {
+                return Ok(offset + p as u64);
+            }
+            p += 16;
+        }
+        // The magic may straddle the boundary; rewind 16 bytes to realign.
+        offset += n as u64;
+        if n == CHUNK {
+            offset = offset.saturating_sub(16);
+            reader.seek(SeekFrom::Start(offset))?;
+        }
+    }
+    Err(Error::NotAnXp3)
+}
+
+fn read_u8<R: Read>(r: &mut R) -> Result<u8> {
+    let mut b = [0u8; 1];
+    r.read_exact(&mut b)?;
+    Ok(b[0])
+}
+
+fn read_u64_le<R: Read>(r: &mut R) -> Result<u64> {
+    let mut b = [0u8; 8];
+    r.read_exact(&mut b)?;
+    Ok(u64::from_le_bytes(b))
+}
+
+fn read_exact_vec<R: Read>(r: &mut R, len: u64) -> Result<Vec<u8>> {
+    let len = usize::try_from(len).map_err(|_| Error::CorruptIndex("index too large"))?;
+    let mut v = vec![0u8; len];
+    r.read_exact(&mut v)?;
+    Ok(v)
+}
