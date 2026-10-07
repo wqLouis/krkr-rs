@@ -1,6 +1,7 @@
 # krkr-rs architecture migration — middle layer + Vulkan core
 
-Status: **planning only. No production code is changed on this branch.**
+Status: **design; partially implemented.** The docs are the source of truth;
+see [`07-roadmap.md`](07-roadmap.md) for what has landed.
 Branch: `migration/middle-layer-ash`
 Created from: `main` (`7ba9435 docs: removed TODO.md`)
 
@@ -48,35 +49,35 @@ that separation in Rust.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│ L4  Host / frontend            CLI (krkr-cli) · Android cdylib        │
-│     window, surface, event loop, platform lifecycle, JNI              │
+│ L4  TJS VM engine        tjs2-sys (C++ VM) + VM host, GC, bytecode    │
+│     top layer; drives the L3 natives, uses the L1 platform abstraction│
 ├──────────────────────────────────────────────────────────────────────┤
-│ L3  TJS compatibility surface  tjs2-sys + tvp-* native bindings + KAG │
-│     maps KiriKiri script API onto the middle layer                    │
+│ L3  KiriKiri compatibility  native classes + KAG + event adapter +    │
+│     static plugins; composes L2 primitives into the script API        │
 ├──────────────────────────────────────────────────────────────────────┤
-│ L2  Middle layer (krkr-engine)                                        │
-│     • the layer/window/bitmap/font model  (the "layer system")        │
-│     • CPU pixel operations, transitions, storage namespace, config    │
-│     • sound object model + mixer, video-overlay state machine         │
-│     • exposes a minimal, TVP-free service API to L3                   │
-│     ── consumes the stateless middle-layer API ──►                    │
+│ L2  Middle layer — a small, generic game engine (krkr-engine)         │
+│     the layer system (scene graph), bitmaps/sprites, audio/video,     │
+│     input, timers, VFS namespace; owns engine state; not TVP-specific │
 ├──────────────────────────────────────────────────────────────────────┤
-│ L1  Bottom core (krkr-core)                                           │
-│     renderer (Vulkan/ash + glyph engine) · media engine               │
-│     (ffmpeg | mediacodec) · file system                               │
-│     implements the middle-layer API; knows nothing about TVP/TJS      │
+│ L1  Platform core                                                     │
+│     renderer (Vulkan) · media (ffmpeg|mediacodec) · fs + XP3 parse ·  │
+│     window/host/event loop/input/clock/threads — ALL platform code,   │
+│     selected at compile time, behind one platform abstraction         │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
 The **middle-layer API** is the contract between L2 and L1: L1 creates the
 abstraction objects (`RenderPipeline`, `Media`, `FileSystem`, `FontSystem`,
-`AudioDevice`) and provides the mechanism — including the entire render
-pipeline. L2 stores every **state value** (`RenderScene`, `RenderState`,
-`SurfaceState`, `DecoderState`, `FileState`, caches, indices, the TVP layer
-system) and performs actions on those objects. L2 builds everything
-KiriKiri-specific — including the layer system — and **owns all state**. The
-bottom engine does **not** own layers and does **not** own engine state; it
-only computes, decodes, renders and does file I/O, and does them well.
+`AudioDevice`, `Platform`) and provides the mechanism — including the entire
+render pipeline and all platform code. L2 stores every **state value**
+(`RenderScene`, `RenderState`, `SurfaceState`, `DecoderState`, `FileState`,
+the layer system / scene graph, caches, indices) and performs actions on
+those objects. L2 is a **generic game engine**: it owns the engine state
+(including the layer system) but no TVP semantics. Everything
+KiriKiri-specific — the script-visible classes, KAG, masks, province,
+storage naming — is L3, composed from L2 primitives. L1 does **not** own
+layers or engine state; it only computes, decodes, renders, does file I/O
+and hosts the platform loop.
 
 The object/state split is the load-bearing rule (D9): an L1 object is a
 stateless facade over a platform capability, and every evolving thing is an
@@ -91,16 +92,20 @@ object fields.
 | # | Decision | Rationale |
 |---|----------|-----------|
 | D1 | Introduce an explicit, stateless middle-layer API (operations + plain DTOs) between the engine and the platform. | Decouple semantics from backends; make both mockable and testable; enable incremental migration. |
-| D2 | The **layer system (state and TVP semantics) lives in the middle layer**; the **render pipeline lives in the bottom layer** and consumes the scene/layer tree. | Layer composition, opacity, pixel read-back, masks and province images are TVP semantics owned by L2. Traversal, blend-state selection, batching, uploads and drawing are mechanism and belong to the swappable L1 pipeline. |
+| D2 | The **layer system (the generic scene graph) lives in L2**; the **render pipeline lives in L1** and consumes the scene tree. The **TVP semantics** layered on top (masks, province, exact property names, storage naming) are **L3**. | Game engines hold scene graphs, so the generic layer system is engine state in L2. What scripts see is KiriKiri-specific and belongs to the compat layer. Traversal, blend selection, batching and drawing are mechanism → L1. |
 | D3 | Replace Bevy with **`ash` (raw Vulkan)** for rendering. | Smallest GPU workload is quads + fixed blends; we want explicit pipelines and no GL/Metal/WebGPU weight. |
 | D4 | Vulkan only; no OpenGL/Metal/WebGPU/WebGL fallback. | User requirement. Documented risk in `07-roadmap.md §6`. |
 | D5 | Media is a bottom-layer **media engine** with two backends: system **FFmpeg** on Linux, **MediaCodec** on Android. | Matches the reference (`core/movie/ffmpeg`) and current split (`tvp-natives/src/video/{ffmpeg,android}.rs`). |
-| D6 | File system is a stateless bottom-layer surface; archive/namespace logic stays in the middle layer. | Bottom = raw path/URI byte IO; TVP's `arc.xp3>path` addressing and case rules are engine semantics. |
+| D6 (rev.) | File system **and XP3 container parsing** are stateless L1 surfaces; the **VFS namespace** and TVP `arc.xp3>path` addressing are L2/L3. | Parsing holds no state, so it belongs in L1 with raw path/URI byte IO. The namespace/state stays in L2; the TVP naming rules are L3 (see 02 §5). |
 | D7 | Strangler migration, not a big-bang rewrite. | Keep the game runnable at every step: first a Bevy-backed implementation of the new API, then swap in the Vulkan core. |
 | D8 | Keep CPU rasterization/compositing as the correctness baseline; GPU acceleration is an optimization behind the same API. | Scripts read pixels back (`getPixel`, `piledCopy`, `saveLayerImage`); the pixel-exact path must survive. |
 | D10 | The bottom layer owns an **abstract render pipeline**: L2 passes a `RenderScene` tree (layer objects) plus L1-owned `RenderState`, and L1 handles all traversal, composition, batching and drawing. | Keeps the render mechanism out of L2 and identical across the Bevy adapter and Vulkan core; L2 becomes a state store and dispatcher. |
 | D11 | **No silent fallbacks and no hardcoded limits.** The code is expected to work on valid input; where the intended behavior cannot be performed (unsupported feature, malformed/overflowing data, unrepresentable size), L1/L2 return a typed **error**. No degraded substitutes (e.g. silence in place of failed audio), no arbitrary maximum-size caps, no "guess and continue". Structural validation (rejecting an impossible header value) is an error, not a limit. | Silent degradation hides bugs and makes behavior input-dependent; arbitrary caps break valid large assets. Errors make failures explicit and testable. |
 | D9 | **L1 creates stateless abstraction objects; L2 stores all state and performs actions on those objects.** No globals, singletons, hidden caches or mutable object fields in the bottom core. Evolving state is an explicit value (`RenderScene`, `RenderState`, `DecoderState`, `FileState`, …) owned by L2; pure transforms are free functions. | Offloads the abstraction to L1 while keeping L2 the single owner of the game state. The current codebase hides engine state in process-global statics (`01-investigation.md §9`); the object/state split makes that impossible and keeps L1 swappable, mockable and parallel-safe. |
+| D12 | **Final layering:** host/window/platform code is **L1**; **L2** is a small generic game engine (layer system/scene graph, audio/video, VFS); **L3** is the KiriKiri compatibility surface; **L4** is the TJS VM. | The loop is platform code, so it lives at the bottom; the VM sits above the compat surface; higher layers stay free of platform code. |
+| D13 | Platform and backends are selected at **compile time** (`platform-linux\|platform-android`, `media-ffmpeg\|media-mediacodec`), not bundled at runtime. | Keeps `#[cfg]` inside L1 and the high layers platform-agnostic. |
+| D14 | Native plugins are **statically built into L3**; `Plugins.link` of a DLL we cannot load installs a **null plugin object** that no-ops every call and logs a warning (never throws). | Linux/Android cannot load the Windows DLLs; throwing would make games unplayable. The single documented exception to D11, and it is not silent. |
+| D15 | Game loading takes an **explicit archive list** (`--archive`, repeatable, later wins), never scans a folder; `startup.tjs` is found **inside the mounted archives**; a missing startup is a typed error. | Mirrors `TVPCheckStartupArg`/`TVPCheckArchive`; avoids fragile folder scans; works for SAF/Android. |
 
 ## 4. Document index
 
@@ -113,6 +118,8 @@ object fields.
 | [`05-media-engine.md`](05-media-engine.md) | Media engine: image/audio/video decode, FFmpeg vs MediaCodec backends, threading, TJS-poll semantics, migration of `tvp-sound`/`video`. |
 | [`06-file-system.md`](06-file-system.md) | Stateless bottom fs surface + host/in-memory roots; how `Storage`/`Xp3Archive`/natives move onto it; Android SAF/AssetManager; the C++ `fopen` bypass. |
 | [`07-roadmap.md`](07-roadmap.md) | Phased plan, per-phase deliverables/exit criteria, risks, testing strategy, rollback, and open questions. |
+| [`08-tjs-vm-and-native-plugins.md`](08-tjs-vm-and-native-plugins.md) | L4 VM host, L3 compatibility surface, the ABI constraint, static native plugins + the null-plugin object, event adaptation, frame drive. |
+| [`09-game-loading.md`](09-game-loading.md) | Archive-flag loading (no folder scan), base dir, mount precedence, startup discovery order, dynamic archives. |
 
 ## 5. Scope of this branch
 

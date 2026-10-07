@@ -1,321 +1,308 @@
 # 02 — Target architecture
 
-Status: design proposal. Nothing here is implemented yet.
-
-This document defines the layer boundaries, the crate layout, the dependency
-rules, and where each existing responsibility lands. The API details are in
-[`03-middle-layer-api.md`](03-middle-layer-api.md).
+Status: design, **revised** for the final layering (see §1.1). This document
+defines the layer boundaries, the crate layout, the dependency rules and
+where each responsibility lands. The stateless-object contract between L1
+and L2 is in [`03-middle-layer-api.md`](03-middle-layer-api.md); the TJS/VM
+compatibility split is in
+[`08-tjs-vm-and-native-plugins.md`](08-tjs-vm-and-native-plugins.md); game
+loading is in [`09-game-loading.md`](09-game-loading.md).
 
 ---
 
-## 1. Three semantic layers, four physical tiers
-
-The user's design names three semantic layers. Physically they map to four
-tiers because the host/frontend is distinct from the TJS compatibility
-surface.
+## 1. Four layers
 
 ```
-L4 Host/frontend         windowing · surface · event loop · platform lifecycle
-L3 TJS compatibility     TJS2 VM + native bindings + KAG parser
-L2 Middle layer          TVP semantics: layer system, sound/video model, mixer,
-                         storage namespace, transitions, config; exposes a
-                         minimal service API to L3
-L1 Bottom core           real implementations of the middle-layer API:
-                         Vulkan renderer + glyph engine, media engine
-                         (ffmpeg|mediacodec), file system
+┌──────────────────────────────────────────────────────────────────────┐
+│ L4  TJS VM engine                                                     │
+│     tjs2-sys (the C++ VM) + VM lifecycle, GC, bytecode, script cache. │
+│     The topmost layer. Drives the L3 native surface; uses the L1      │
+│     platform abstraction directly.                                    │
+├──────────────────────────────────────────────────────────────────────┤
+│ L3  KiriKiri compatibility surface                                    │
+│     native classes (System, Storages, Scripts, Window/Layer/Bitmap/   │
+│     Font/Timer, SoundBuffer, VideoOverlay, Plugins, …) + KAG parser.  │
+│     Implements the script API by *composing* L2 primitives; adapts    │
+│     L1 events into TJS-visible events. Thin glue, not an engine.      │
+├──────────────────────────────────────────────────────────────────────┤
+│ L2  Middle layer — a small, generic game engine                       │
+│     the most fundamental APIs for drawing and playing something:      │
+│     windows/surfaces, bitmaps/sprites, **the layer system** (a scene  │
+│     graph), audio/video playback, input stream, timers, a virtual     │
+│     file system over parsed archives. Not TVP-specific; owns state.   │
+├──────────────────────────────────────────────────────────────────────┤
+│ L1  Platform core                                                     │
+│     renderer (Vulkan) · media engine (FFmpeg|MediaCodec) · file       │
+│     system **+ archive parsing** · **window/host, event loop, input,  │
+│     clock, threads, process lifecycle** · **all platform-specific     │
+│     code**, behind one platform abstraction. Stateless objects +      │
+│     explicit state (D9). Selected at compile time (§4).               │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
-Direction of dependency is strictly downward:
+Dependency direction is strictly downward, with exactly one extra edge:
 
 ```
-L4  depends on  L3, L2, L1 (glue only)
-L3  depends on  L2
-L2  depends on  krkr-api + the L1 type crates (krkr-fs, krkr-render,
-                krkr-media) for their stateless objects / explicit state
-                values; never on a backend crate's guts directly
-L1  depends on  OS/Vulkan/FFmpeg only; no TJS, no TVP, no layers
+L4  →  L3, L1
+L3  →  L2, L1
+L2  →  L1
+L1  →  OS / Vulkan / FFmpeg / MediaCodec only
 ```
 
-> Dependency note (review finding #6): the concrete-object model means L2
-> names the L1 object/state types (`FileSystem`/`FileState`,
-> `RenderPipeline`/`RenderScene`/`RenderState`, `Media`/decoder states), so
-> `krkr-engine` depends on `krkr-fs` + `krkr-render` (+ `flate2` for the
-> XP3 zlib segments). What L2 must **not** do is reach into the backend
-> implementation: no `ash`, `winit`, `cpal`, `ffmpeg-next`, `std::fs`
-> symbols in L2. Swapping a backend means swapping the L1 crate, not
-> editing L2.
+* `L4 → L1` exists because the VM host uses the platform abstraction
+  (clock, threads, file access for bytecode/state) without going through
+  the compat surface.
+* **L1 must not depend on L2/L3/L4.** It knows nothing of layers, TVP, TJS,
+  storages or KAG.
+* **L2 must not depend on L3/L4** and must not contain TJS or TVP vocabulary.
+* **L3 may not contain platform code** (`#[cfg(target_os=…)]`, winit,
+  `android-activity`, `std::fs`, JNI); it uses L1 abstractions.
 
-**Invariant A (the important one):** L1 must compile and be testable without
-TJS, without `tvp-*`, and without knowing what a "layer" is. If it does not,
-the boundary has leaked.
+### 1.1 What changed from the earlier draft
 
-**Invariant B:** L2 must not reference Bevy, wgpu, `ash`, winit, FFmpeg,
-MediaCodec, `cpal`, `std::fs` or any concrete backend symbol directly. It
-may depend on the L1 **type** crates (`krkr-fs`, `krkr-render`, `krkr-media`)
-for their stateless objects and explicit state values, but it never calls
-backend internals. If it does, the backend is not swappable.
+| Concern | Earlier draft | Now |
+|---|---|---|
+| Host / window / event loop | top layer (old L4 `krkr-app`) | **L1** platform core |
+| Platform-specific code | spread across top and backends | **confined to L1**, one abstraction |
+| TJS VM | old L3 (`krkr-tjs`) | **L4**, above the compat surface |
+| Compat surface (native classes + KAG) | old L3 | **L3**, composing L2 |
+| L2 role | TVP semantics + layer system + all state | **a generic game engine** with fundamental APIs **including the layer system (scene graph)**; owns engine state, but no TVP semantics |
+| Archive parsing | L2 (`krkr-engine::archive`) | **L1** (stateless read+parse); L2 sees a parsed FS |
+| Native plugins | static Rust families + `Plugins.link` no-op success | **statically built into L3**, with a null-plugin object for missing DLLs (D14) |
+| Backend selection | runtime flag during migration | **compile-time features/cfg** (D13) |
 
-**Invariant C (D9):** L1 is **stateless and functional**, built as
-**stateless abstraction objects + explicit state values**. L1 creates the
-objects (`RenderPipeline`, `Media`, `FileSystem`, `FontSystem`,
-`AudioDevice`) and provides the mechanism; L2 stores every state value
-(`RenderScene`, `RenderState`, `SurfaceState`, `DecoderState`, `FileState`,
-caches, indices, decoder progress) and performs actions on the objects. L1
-has no process-global mutable state, no singletons, no hidden caches, no
-mutable fields on its objects and no implicit lifetimes. Pure transforms are
-free functions; actions take the evolving state as an explicit parameter.
+> Decision **D2 is revised**: the **layer system (the generic scene graph)
+> lives in L2** — game engines hold scene graphs — while the *TVP semantics*
+> that scripts see (masks, province, exact property names, storage naming)
+> are L3, layered on top. The render pipeline remains L1 and consumes the
+> scene tree (D10 unchanged).
 
-**Invariant D (D11):** **No silent fallbacks and no hardcoded limits.** The
-code is expected to work on valid input. When the intended behavior cannot
-be performed — an unsupported feature, malformed or overflowing data, a size
-that cannot be represented — L1/L2 return a typed **error** rather than a
-degraded substitute or an arbitrary cap. Structural validation (rejecting an
-impossible header value) is an error, not a limit. Examples: a failed Opus
-decode returns `MediaError` instead of substituting silence; an unimplemented
-`BlendMode` returns `RenderError::Unsupported` instead of falling back to
-SourceOver; a file offset that overflows `usize` returns `FsError` instead of
-being truncated or capped.
+## 2. Responsibilities
 
-## 2. The middle-layer API
+### 2.1 L1 — platform core (mechanism + host)
 
-The API is a set of **stateless abstraction objects**, **explicit state
-values**, and plain DTOs. L1 creates the objects; L2 stores the states and
-dispatches actions. The API describes platform mechanism, not TVP concepts:
+* **Stateless abstraction objects + explicit state (D9).** `RenderPipeline`,
+  `Media`, `FileSystem`, `FontSystem`, `AudioDevice`, `Platform` are
+  stateless services; every evolving value (`RenderState`, `FileState`,
+  `DecoderState`, `SurfaceState`) is defined by L1 and stored by L2.
+* **All platform code.** Windowing/surface (winit on Linux,
+  `android-activity`/NDK on Android), the event loop, input, clock, threads,
+  process lifecycle, JNI, SAF/AssetManager. Higher layers must not contain
+  `#[cfg(target_os)]`.
+* **The render pipeline.** Traversal, composition, batching, blend-state
+  selection, upload and draw of the L2 `RenderScene` (D10).
+* **The media engine.** Image/TLG decode, audio decode, video decode; the
+  Linux backend is FFmpeg and the Android backend is MediaCodec.
+* **File system + archive parsing.** Raw path/URI byte IO *and* the XP3
+  container read+parse. Parsing is pure and stateless, so it belongs here
+  (§5).
+* **Compile-time platform selection.** Exactly one platform feature is
+  active; the other platform's code is not compiled (§4).
 
-| L1 object (created by L1) | L2 state (stored by L2) | Replaces today |
-|---------------------------|-------------------------|----------------|
-| `FileSystem` | `FileState` (handle + cursor), namespace/index map | `engine::Storage`, `xp3::Xp3Archive`, direct `std::fs` in natives |
-| `RenderPipeline` | `RenderScene` tree, `RenderState`, `Surface`; glyph atlas, backend cache | `render/src/sync.rs`, `blend.rs`, wgpu |
-| `FontSystem` | `Font` values, `GlyphAtlas`, layout | `tvp-text` raster/atlas + CPU `paint_layout` |
-| `Media` | `AudioDecoderState`, `VideoDecoderState`, decoded-asset caches, worker pool + completions | `tvp-visual/bitmap.rs`, `tvp-sound/decode.rs`, `tvp-natives/video/*` |
-| `AudioDevice` | `AudioOutputState`, `Mixer` | `tvp-sound/player.rs` (rodio/cpal) |
-| — (host glue) | TVP input state, focus, gestures | `render/src/input_bridge.rs` event capture |
-| — (host glue) | window/desktop requests | Bevy `WindowPlugin`/`Window` |
-| `Clock` / `LogSink` | — | Bevy `Time`, `log` setup |
+### 2.2 L2 — the small game engine
 
-### 2.1 The object/state rule (D9)
+L2 is deliberately "the most fundamental APIs for rendering something or
+playing something", with **no TVP vocabulary**:
 
-Concretely, in L1:
+* **the layer system** — a generic scene graph (`Scene`/`Layer`/`Node`/
+  `Bitmap`/`Sprite`): surfaces/windows, child layers, draw order, opacity,
+  transforms, blend, bitmap pixel storage. Game engines hold scene graphs,
+  so this is L2; it carries no TVP semantics (masks, province images,
+  script callbacks and `arc.xp3>path` naming are L3);
+* audio playback and mixing; video playback;
+* input event stream and timers;
+* a **virtual file system** over the parsed archives that L1 hands back
+  (`mount`/`read`/`list`), with mount points and an index;
+* caches and every other evolving value (glyph atlas, decoded assets,
+  decoder progress, worker pool + completion queue).
 
-* **Objects are stateless services.** `RenderPipeline`, `Media`,
-  `FileSystem`, `FontSystem`, `AudioDevice` are created once, shared by
-  reference, and have no mutable fields and no `&mut self` that remembers
-  anything.
-* **All evolving state is an explicit value.** `RenderScene`, `RenderState`,
-  `SurfaceState`, `DecoderState`, `FileState` are defined by L1 but owned
-  and stored by L2; actions take them as `&mut` parameters
-  (`render(&self, surface, state: &mut RenderState, scene: &RenderScene)`).
-* **The render pipeline consumes the tree.** L2 does not flatten, sort,
-  batch or compute a draw list; it maintains the `RenderScene` and calls
-  `render`. L1 owns traversal, composition and drawing.
-* **No globals.** No `static`/`thread_local` mutable state, no `LazyLock`/
-  `OnceLock`/`OnceCell` caches, no process-wide registries.
-* **No `Id`-addressed tables.** L1 never resolves an integer through a
-  private map; L2 holds the state value directly.
-* **Caches live in L2.** Glyph atlas, decoded-image cache, storage index,
-  compiled pipelines, full-vs-stream decisions, loop metadata and the
-  worker pool are L2 values.
-* **No policy in L1.** L1 does not choose to cache, reuse, prefetch, defer
-  or throttle. Any decision is L2's, expressed in L2 state.
-* **No callbacks into engine state.** L1 returns plain owned buffers; it
-  never calls into the layer tree or TJS.
+L2 owns *engine* state. It projects its scene into the L1 `RenderScene` and
+calls `render`; it never builds a draw list (D10).
 
-This is what makes L1 mockable (`NullRenderPipeline`, an in-memory
-`FileSystem`, a stub `Media`) and what keeps the two backends (FFmpeg vs
-MediaCodec, Bevy adapter vs Vulkan pipeline) from drifting into different
-semantics.
+### 2.3 L3 — KiriKiri compatibility surface
 
-The API deliberately does **not** contain: layers, windows-as-TVP-objects,
-bitmaps, blend types, transitions, `SoundBuffer`, `VideoOverlay`, storage
-namespaces, `.xp3`, KAG, or TJS values.
+* The **native classes** games see (`System`, `Storages`, `Scripts`,
+  `Window`/`Layer`/`Bitmap`/`Font`/`Timer`, `SoundBuffer`, `VideoOverlay`,
+  `Plugins`, `Debug`, `AsyncTrigger`, transitions, menu, …).
+* The **KAG parser** and the KAG layer semantics.
+* The **TVP layer semantics on top of the L2 layer system**: the TJS
+  `Window`/`Layer`/`Bitmap` classes, masks, province images, screen-buffer
+  primary layers, focus/hit-test and script callbacks are implemented in
+  L3 over the generic L2 scene graph.
+* The **TVP storage semantics**: `arc.xp3>path` addressing, case rules,
+  `addAutoPath`.
+* **Event adaptation**: L1 pushes platform events; L3 turns them into the
+  TJS-visible events the VM dispatches.
+* **Native plugins** are compiled into L3 (static), with a null-plugin
+  object for DLLs we cannot load (D14, §8 of doc 08).
 
-DTOs are plain structs/enums (`ImageDesc`, `AudioSpec`, `GlyphRun`,
-`RenderNode`, `BlendMode`, `PixelRegion`, …). They must not carry
-`Arc<RwLock<…>>` or callbacks into TJS.
+L3 is **thin glue**: whenever a behaviour is a combination of primitive
+operations L2 already exposes, L3 composes it rather than adding a new L2
+feature.
 
-> The distinction from the earlier draft: an RAII handle that *contains* the
-> resource state is not enough. The object and the state are split, so L2
-> can store/serialize/inspect the state and L1 remembers nothing.
+### 2.4 L4 — TJS VM engine
 
-## 3. Where the layer system and the render pipeline live
+* `tjs2-sys` (the C++ VM) plus the VM host: creation, the log callback,
+  bytecode compilation, script cache, GC roots, `exec_script`.
+* The topmost layer. It calls into the L3 native surface and uses the L1
+  platform abstraction for its non-VM needs.
+* The **frame body** (one VM tick) lives here; the **loop** is L1 (§3).
 
-The **layer system (state and TVP semantics) is L2**; the **render pipeline
-is L1**. They meet at the `RenderScene` tree.
+## 3. Who owns the loop, and the event flow
 
-L2 owns:
+The event loop is **platform code, so it lives in L1**. L1 exposes an event
+interface; higher layers subscribe. The direction is L1 → L3 → L4:
 
-* the logical tree: `Window`/`Layer`/`Bitmap`/`Font`/`Timer` state (today's
-  `tvp-visual/src/scene.rs`/`bitmap.rs`/`tl*`), CPU pixel storage and every
-  `layer_ops.rs`/`raster.rs` operation;
-* every TVP property: masks, province images, `face`, `holdAlpha`,
-  `ImageLeft/Top/Width/Height`, focus/hit-test, script callbacks,
-  screen-buffer primary layers;
-* CPU text composition: layout + glyph coverage blitted into a `BitmapState`
-  (so `getPixel`/`piledCopy` still work);
-* the projection of its layer tree into an L1 `RenderScene` (one node per
-  drawn layer, parent links, composed opacity/z/visible, resolved texture
-  handles) and the `RenderState` (GPU/upload/cache bookkeeping).
+```
+platform event   →  L1 (winit / android-activity backend)
+                 →  L1 PlatformEvent (window, input, resize, lifecycle)
+                 →  L3 adapter  (maps PlatformEvent to TJS-visible event)
+                 →  L4 VM       (dispatches to script handlers)
+```
 
-L1 owns:
+Per frame:
 
-* traversal of the `RenderScene`, parent transforms, z-order, opacity
-  composition, clipping, blend-state selection, batching;
-* texture upload scheduling and offscreen compositing;
-* the actual Vulkan submission and presentation.
+```
+L1 tick  →  L4 VM frame body (timer_poll, sound_poll, video poll,
+            async_trigger_poll, continuous_handler_poll)
+         →  L3 → L2 (mutate engine state)
+         →  L2 projects the scene, calls L1 RenderPipeline::render
+```
 
-L2's per-frame render responsibility is a field-level sync of the tree plus
-one `render(pipeline, surface, state, scene)` call. It never computes a draw
-list and never walks the tree for rendering.
+The composition root (the `krkr` binary, the Android `cdylib`) is trivial:
+it selects the L1 platform, constructs L2/L3/L4 and starts the loop. It
+contains **no platform logic** — only wiring.
 
-### Why the reference validates this
+## 4. Compile-time platform and backend selection
 
-The C++ engine already has this split:
+We do **not** bundle every platform into one binary. Cargo features select
+what is compiled:
 
-* `reference/cpp/core/io/IFileBackend` — the file-system abstraction;
-* `reference/cpp/core/visual/RenderManager.*` +
-  `visual/impl/DrawDevice.*` — the render pipeline / draw device;
-* `reference/cpp/core/visual/LayerManager.*`/`LayerImpl.*` — the layer
-  system state;
-* `reference/cpp/core/movie/ffmpeg` — the media engine;
-* `reference/cpp/core/sound` — the sound engine.
+* platform: `platform-linux` | `platform-android` (exactly one);
+* render: `render-vulkan`;
+* media: `media-ffmpeg` (Linux) | `media-mediacodec` (Android).
 
-The Rust port collapsed all of these into Bevy-driven `render`. The target
-re-separates them, which is the stated design intent.
+`#[cfg]` and the backend crates are confined to L1. L2/L3/L4 are
+platform-agnostic and compile identically everywhere. This is what keeps
+"so much cross-platform code" out of the high layers.
 
-## 4. Proposed crate layout
+## 5. Archive parsing in L1 (revised D6)
 
-Names are proposals; the important thing is the dependency direction. The
-middle-layer API can be one crate so L1 implementations share the DTOs.
+XP3 parsing is a pure transform over bytes: it holds no state and needs no
+engine context, so it lives in **L1** alongside the file system. The
+runtime flow for a script-mounted archive (see
+[`09-game-loading.md`](09-game-loading.md)):
+
+```
+TJS script (L4)
+  → native (L3)              "mount foo.xp3"
+  → L2 Storage::mount(path)  creates an archive object
+  → L1 FileSystem open+read  reads bytes through FileState
+  → L1 parse                 stateless XP3 index/entry parse
+  → L1 returns parsed index to L2
+  → L2 registers it in the VFS namespace (state) and resolves names
+```
+
+L1 owns read+parse; **L2 owns the namespace/state** and sees only a parsed
+file system; L3 is only the script adapter. This supersedes the earlier D6
+("archive/namespace logic stays in L2"): the *namespace* stays in L2, the
+*container parse* moves to L1.
+
+## 6. Crate layout
+
+Names are provisional; the dependency direction is the contract.
 
 ```
 crates/
-  # L1 — bottom core (stateless objects + explicit state, D9) -------------
-  krkr-api          object/action signatures + state/DTO types (no impls)
-  krkr-core         facade that assembles the platform core
-  krkr-render       stateless RenderPipeline/FontSystem objects + Vulkan/
-                    glyph mechanism; defines RenderScene/RenderState/…
-  krkr-media        stateless Media object + decode actions; defines
-                    AudioDecoderState/VideoDecoderState (ffmpeg | mediacodec)
-  krkr-fs           stateless FileSystem object; defines FileState
+  # L1 — platform core ------------------------------------------------------
+  krkr-api        shared DTOs + error types (no impls)
+  krkr-fs         stateless FileSystem + FileState + XP3 read/parse
+  krkr-render     stateless RenderPipeline/FontSystem + Vulkan + glyph
+  krkr-media      stateless Media + image/audio/video decode
+                  (media-ffmpeg | media-mediacodec)
+  krkr-platform   window/surface, event loop, input, clock, threads,
+                  process lifecycle; winit | android-activity; the
+                  platform abstraction higher layers use
 
-  # L2 — middle layer ------------------------------------------------------
-  krkr-engine       layer system + TVP semantics + mixer + transitions;
-                    depends on krkr-api + the krkr-fs/krkr-render type
-                    crates (+ flate2 for XP3); no backend guts
+  # L2 — the small game engine ---------------------------------------------
+  krkr-engine     Scene/Bitmap/Sprite, mixer, timers, the VFS namespace,
+                  RenderScene projection; owns engine state
 
-  # L3 — TJS compatibility -------------------------------------------------
-  tjs2-sys          (unchanged) C++ VM FFI
-  krkr-tjs          native bindings, split by class family; replaces the
-                    current tvp-natives/tvp-visual natives/storages/scripts/
-                    input/kagparser/sound bindings; depends on krkr-engine
+  # L3 — KiriKiri compatibility --------------------------------------------
+  krkr-compat     native classes + KAG + event adapter + static plugins
+                  (absorbs today's tvp-natives/tvp-visual/tvp-storages/
+                   tvp-scripts/tvp-input/tvp-sound/tvp-text/tvp-kagparser)
 
-  # L4 — host ---------------------------------------------------------------
-  krkr-app          CLI + desktop host (winit + krkr-core)
-  krkr-android      Android cdylib host (android-activity + krkr-core)
+  # L4 — TJS VM -------------------------------------------------------------
+  krkr-vm         TJS VM host over tjs2-sys + the composition root
+  tjs2-sys        the C++ VM FFI (unchanged)
+
+  # root --------------------------------------------------------------------
+  krkr-app        thin binary: select platform, wire L1..L4, start the loop
 ```
 
-Existing crates are not all renamed at once. The machinery is:
+Existing crates are not renamed in one go. The machinery:
+* keep `tjs2-sys`, `tvp-util`, `tvp-streams` where they are unless in the way;
+* fold the `tvp-*` native families into `krkr-compat` as `plugins/*`;
+* the old `engine` loader splits: mount/discover → L2, execute → L3/L4;
+* keep the game runnable at every step (roadmap).
 
-* keep `tjs2-sys`, `kag`, `tvp-util`, `tvp-streams`, `xp3`, `tvp-config`
-  where they are unless they are in the way;
-* split `tvp-visual` into `krkr-engine` (scene/bitmap/layer_ops/text
-  composition) and `krkr-tjs` (the native adapters);
-* split `tvp-sound` into `krkr-engine` (mixer/model) and `krkr-media`
-  (decode) + `krkr-core` (output);
-* split `tvp-natives/video` into `krkr-media`;
-* fold `engine` into `krkr-engine` (it is the load/bootstrap module; it can
-  stay a submodule or a thin `krkr-loader` crate).
-
-Keep the `tvp-*` names during the transition; the roadmap stages the rename
-so the game is runnable at every step.
-
-## 5. Component ownership matrix
+## 7. Component ownership
 
 | Concern | Owner | Notes |
 |---------|-------|-------|
-| Window/layer/bitmap/font/timer model | L2 `krkr-engine` | today `tvp-visual::scene` |
-| CPU pixel ops, masks, province, transitions | L2 `krkr-engine` | today `tvp-visual::natives::*` |
-| Text layout + CPU glyph composition | L2 `krkr-engine` | glyph *rasterization* in L1 |
-| Glyph rasterization | L1 `krkr-render` (`FontSystem`) | pure: object + `Font` + glyph + size → coverage |
-| Glyph atlas (cache) | L2 `krkr-engine` | L2-owned value passed into composition |
-| Sound object model, mixer, fades, `.sli` | L2 `krkr-engine` | today `tvp-sound` |
-| Audio decode (symphonia/opus) | L1 `krkr-media` (`Media`) | actions take L2-owned `AudioDecoderState` |
-| Audio device output (cpal/AAudio) | L1 `krkr-core` (`AudioDevice`) | action takes L2-owned `AudioOutputState` |
-| Image decode (TLG/image) | L1 `krkr-media` | pure free functions; TLG is platform-free |
-| Video decode (ffmpeg/mediacodec) | L1 `krkr-media` (`Media`) | backend by target; `VideoDecoderState` owned by L2 |
-| Storage namespace, `.xp3`, case rules | L2 `krkr-engine` | today `engine::Storage` + `xp3` |
-| Raw path/URI byte IO | L1 `krkr-fs` (`FileSystem`) | actions take L2-owned `FileState` |
-| Archive container parsing | L2, over `FileState` | `xp3` reworked to positional reads |
-| Render traversal, composition, batching, draw | L1 `krkr-render` (`RenderPipeline`) | consumes the `RenderScene` tree |
-| Projection of layer tree → `RenderScene` | L2 `krkr-engine` | field copy, not a draw list |
-| Vulkan device/queue | L1 `krkr-render` (`RenderPipeline`) | stateless object, never global |
-| Compiled pipelines / `RenderState` | L2 `krkr-engine` | L1-defined value owned by L2 |
-| Input state + TVP hit-test semantics | L2 `krkr-engine` | today `tvp-input` + hit_test |
-| OS input events | L4 host → L1/L2 via `InputSource` | |
-| TJS VM and native registration | L3 `krkr-tjs` | today `tvp-*` natives |
-| KAG parsing | L3 `kag`/`krkr-tjs` | unchanged |
+| Window/surface/event loop/input/clock/threads | L1 `krkr-platform` | all platform code here |
+| Vulkan device/pipeline/draw | L1 `krkr-render` | consumes `RenderScene` |
+| Glyph rasterization | L1 `krkr-render` | pure transform |
+| Image/audio/video decode | L1 `krkr-media` | backend by compile-time feature |
+| Raw path IO + XP3 parse | L1 `krkr-fs` | stateless |
+| **Layer system (generic scene graph)**, mixer, timers, VFS namespace, caches | L2 `krkr-engine` | engine state; no TVP semantics |
+| Projection scene → `RenderScene` | L2 `krkr-engine` | field copy, not a draw list |
+| Native classes, KAG, TVP semantics, event adaptation, plugins | L3 `krkr-compat` | composes L2 |
+| VM lifecycle, bytecode, GC, frame body | L4 `krkr-vm` | top layer |
+| Composition/wiring | `krkr-app` | no platform logic |
 
-## 6. Threading model in the target
+## 8. Threading
 
-The VM stays single-threaded. Because L1 is stateless (D9), it does not own
-worker threads either; L2 owns the thread pool and schedules stateless L1
-work onto it:
+* The VM is single-threaded (L4).
+* The loop is single-threaded and owns the frame (L1 drives, L4 executes
+  the body).
+* L2 owns the worker pool; it schedules stateless L1 transforms and drains
+  completions on the loop thread.
+* No `VM_RUN_LOCK` workaround (it existed only for Bevy's parallel
+  scheduler).
 
-* **L4 host thread**: event loop + per-frame VM drive (`timer_poll`,
-  `sound_poll`, `video_overlay_poll`, `async_trigger_poll`,
-  `continuous_handler_poll`) + render submission.
-* **L2 worker pool**: owned by the middle layer; runs pure L1 transforms
-  and L1 actions over L2-owned state, and delivers owned buffers into an L2 completion
-  queue drained on the host thread. L1 provides no thread pool and no
-  queue.
-* **L2 render submission**: the host thread owns the `RenderPipeline` /
-  `RenderState` values (simplest, matches today). A dedicated submission
-  thread can later move the `RenderState`; L1 code is unchanged either way.
-* **L2 state**: mutated only on the host thread, exactly like today. No
-  scene lock is needed if the VM and render both run on the host thread,
-  but the API may keep a scoped lock discipline for tests.
+## 9. Acceptance criteria
 
-`VM_RUN_LOCK` (today's workaround for Bevy's parallel scheduler) should
-**disappear** once the app loop is ours.
+1. L1 builds with no L2/L3/L4 dependency; L2 builds with no L3/L4
+   dependency; L3 builds with no `#[cfg]`/backend/JNI symbols.
+2. The desktop and Android builds differ only in the L1 platform/backend
+   features and the trivial composition root.
+3. **D9:** L1 has no mutable statics, no `thread_local!`, no
+   `LazyLock`/`OnceLock`/`OnceCell` caches, no id-keyed registries, no
+   `&mut self` on its service objects. Guarded in CI.
+4. **D10:** L2 contains no traversal, draw-list, batching or blend-state
+   selection; its render path is "sync scene → call render".
+5. **D11:** no silent fallback and no hardcoded limit in L1/L2; the one
+   documented exception is `Plugins.link` (D14).
+6. The game runs on Linux and Android with Vulkan and no Bevy in
+   `Cargo.lock`.
+7. Loading takes an explicit archive list; no directory scan (§5, doc 09).
 
-## 7. What stays exactly as it is
+## 10. Why the reference validates this
 
-* `tjs2-sys` + `crates/tjs2-sys/cpp` (the VM) — the compatibility anchor.
-* `kag`, `tvp-util`, `tvp-streams`, `tvp-config`, `xp3` parsing logic
-  (XP3 gets a stream-source refactor, not a rewrite).
-* `tvp-text` layout/atlas algorithms (moved into L2), `tvp-visual` pixel
-  ops, `tvp-sound` mixer math, `tvp-natives/video` decoder internals.
-* `docs/fonts.md` resolution rules, `scripts/native_parity.py` and its
-  allowlist (must keep passing through the migration).
+The C++ engine already separates these concerns: `core/io/IFileBackend`
+(fs), `core/visual/RenderManager` + `visual/impl/DrawDevice` (pipeline),
+`core/visual/LayerManager`/`LayerImpl` (layer state), `core/movie/ffmpeg`
+(media), `core/sound` (sound), and the platform layer under
+`core/environ/*` (win32 / android / cocos2d). The Rust port collapsed the
+platform and host into Bevy; the target restores the separation with the
+host in L1 and the VM on top.
 
-## 8. Non-goals of the target
+## 11. Non-goals
 
-* Multi-window full support beyond what TVP needs (the primary-window
-  milestone already exists).
+* Multi-backend bundles at runtime (platform is compile-time).
 * macOS/iOS/WebGPU/WebGL backends.
-* GPU-side layer compositing or GPU text in the first milestone.
+* A WASM plugin host in the first milestone (see doc 08 §; static plugins
+  first).
 * Rewriting the C++ TJS2 VM.
-
-## 9. Architectural acceptance criteria
-
-The migration is "done" when all of these hold:
-
-1. `krkr-core` (render/media/fs) builds with `--no-default-features` and no
-   `tvp-*`/`tjs2-sys`/Bevy dependency.
-2. `krkr-engine` has no dependency on `bevy`, `ash`, `winit`, `ffmpeg-next`,
-   `cpal`, or `std::fs` outside an explicitly allowed low-level module.
-3. **D9 is enforced:** `krkr-core` contains no mutable `static`/
-   `thread_local`, no `LazyLock`/`OnceLock`/`OnceCell` caches, no global
-   registries, no `HashMap` keyed by an externally-supplied resource id,
-   and no `&mut self` methods on its service objects. A lint/grep test in
-   CI guards this; the only allowed state is a value returned by a
-   constructor and stored by the caller (an explicit state value).
-4. **D10 is enforced:** `krkr-engine` contains no render traversal,
-   draw-list construction, batching, blend-state selection or per-frame
-   entity/material code. Its render path is "sync `RenderScene`, upload
-   dirty textures, call `RenderPipeline::render`".
-5. The desktop CLI and the Android cdylib assemble the same `krkr-engine`
-   and the same core, differing only in host glue.
-6. The game runs and the headless scene dump + native-parity report are
-   unchanged or intentionally updated.
-7. Bevy is absent from `Cargo.lock`.

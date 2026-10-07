@@ -3,6 +3,31 @@
 Status: plan. Phases are ordered so the game stays runnable after each one.
 No phase begins implementation until this plan is reviewed.
 
+> **Revision note (final layering, 2026).** This roadmap was written for the
+> original layering (host on top, Bevy strangler). Two things changed since:
+> the Bevy frontends were removed and the new crates
+> (`krkr-api/fs/media/render/engine/app`) were implemented (waves 1–3), and
+> the layering was finalised in
+> [`02-target-architecture.md`](02-target-architecture.md) — host/platform
+> code and archive parsing in **L1**, **L2** a generic engine that holds the
+> layer system, **L3** the KiriKiri compat surface, **L4** the TJS VM. The
+> remaining work is:
+>
+> 1. Move the host/window/event loop out of `krkr-app` into a `krkr-platform`
+>    crate (L1), and make platform/backends compile-time features (D13).
+> 2. Move XP3 parsing from `krkr-engine` into L1; keep only the VFS
+>    namespace in L2 (D6 rev., doc 02 §5).
+> 3. Replace `Storage::mount`/`discover_archives` with explicit archive
+>    loading + the startup-discovery order (D15, doc 09).
+> 4. Introduce `krkr-compat` (L3) and `krkr-vm` (L4): port the `tvp-*`
+>    natives into L3 plugins, with the null-plugin object (D14, doc 08).
+> 5. Media video + the TJS execution path (boot `startup.tjs`).
+> 6. Android host in L1.
+> 7. Delete `tvp-*` once their replacements land.
+>
+> The phase list below is kept as the historical record of the
+> Bevy-strangler plan.
+
 ---
 
 ## 1. Strategy: strangler, not big bang

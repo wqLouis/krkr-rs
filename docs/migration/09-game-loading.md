@@ -1,0 +1,131 @@
+# 09 — Game loading
+
+Status: design. No code on this branch.
+Related: [`02-target-architecture.md`](02-target-architecture.md) §5 (archive
+parsing in L1), [`08-tjs-vm-and-native-plugins.md`](08-tjs-vm-and-native-plugins.md).
+
+---
+
+## 1. Input
+
+Higher layers do not search for the game. The composition root takes an
+explicit input and hands it to L2.
+
+CLI:
+
+```
+krkr --archive data.xp3 --archive patch.xp3 \
+     [--base-dir DIR] [--savedata-dir DIR] [key=value ...]
+```
+
+* `--archive` is **repeatable** and **order-significant** (§4).
+* A single positional `.xp3` argument is also accepted (mirrors the
+  reference `TVPCheckStartupArg`).
+* **No directory scan.** We never enumerate a folder to find `startup.tjs`
+  or `*.xp3`.
+* `key=value` arguments become command-line config
+  (`TVPSetCommandLine` semantics).
+
+Android: the same archive list arrives through Intent extras. The old
+`pendingGameDir`/`pendingGameName` contract is replaced by an archive list +
+base dir.
+
+## 2. Base directory
+
+Default: the **parent directory of the first archive**. This is the "app
+path" (`TVPGetAppPath`) used for:
+
+* the app-path-only scripts in §5 (`patch.tjs`, `AfterStartup.tjs`);
+* loose files and assets (`plugin/`, `default.ttf`, …).
+
+Disk files still win over archive entries (unchanged rule from the current
+`Storage::find`).
+
+## 3. Mounting
+
+L2 mounts the explicit archives; it does **not** call `discover_archives`.
+Each mount:
+
+```
+L2 Storage::mount_archive(path)
+  → L1 FileSystem open + read (FileState)
+  → L1 parse the XP3 container (stateless)
+  → L1 returns the parsed index to L2
+  → L2 registers it in the VFS namespace (state)
+```
+
+L1 reads *and* parses; L2 owns the namespace/state and sees only a parsed
+file system.
+
+## 4. Precedence
+
+Mount order is the given order, and **later mounts win** — so
+
+```
+--archive data.xp3 --archive patch.xp3
+```
+
+makes `patch.xp3` override `data.xp3`. This matches the reference
+auto-path table (`tTJSHashTable::AddWithHash` *overwrites* on a duplicate
+key, so the last `Add` wins). It **corrects** the current `krkr-engine`
+behaviour, which scans archives in mount order and takes the first match
+(data would incorrectly override patch).
+
+## 5. Startup discovery (L2)
+
+Reference order from `TVPExecuteStartupScript`
+(`reference/cpp/core/base/ScriptMgnIntf.cpp:900`):
+
+1. **`patch.tjs`** — **app path only, no search**
+   (`TVPGetAppPath() + "patch.tjs"`), executed if it exists. Games use it
+   for `@set(...)` preprocessor flags.
+2. **`startup.tjs`** — **searched** across the storage (disk + mounted
+   archives), via `TVPSearchPlacedPath`.
+3. **`AfterStartup.tjs`** — app path only, if it exists.
+4. If `startup.tjs` fails and `system/Initialize.tjs` exists, execute that
+   (reference compatibility fallback).
+
+If no `startup.tjs` is found (and no fallback applies), return a **typed
+error** — matching `TVPCheckArchive` returning `0` (not an archive) / `2`
+(archive without `startup.tjs`). No warn-and-continue (D11).
+
+The loader does not execute scripts; discovery is L2 (pure storage
+semantics, testable without the VM) and execution is L3/L4.
+
+## 6. Dynamic archives (script-mounted)
+
+```
+TJS script (L4)
+  → native (L3)              "mount foo.xp3"
+  → L2 Storage::mount(path)
+  → L1 open + read (FileState)
+  → L1 parse XP3 (stateless, no state held)
+  → L2 registers the parsed index in the VFS namespace
+  → later reads: L3 → L2 → L1
+```
+
+Parsing holds no state, so it is L1; L2 only ever sees a parsed file
+system; L3 is just the script adapter.
+
+**Multiple archives:** every `--archive` input is mounted at launch. Because
+the folder scan is gone, scripts may also mount more at runtime through the
+L3 native. (The reference `Storages` has no `mountArchive` — it relied on
+folder enumeration — so this native is an intentional, documented
+extension.)
+
+## 7. Reference mapping
+
+| reference | here |
+|---|---|
+| `TVPCheckStartupArg` (`environ/win32/Platform.cpp:97`): archive arg containing `startup.tjs` | `--archive` (positional accepted) |
+| `TVPCheckArchive` (`base/impl/StorageImpl.cpp:562`): `1` has startup / `2` no / `0` not archive | loader validation |
+| `TVPExecuteStartupScript` order | §5 |
+| folder scan for `*.xp3` | **removed**; explicit list only |
+
+## 8. Errors
+
+Loading is explicit and typed (D11): missing/unreadable archive, an archive
+that fails to parse, and "no `startup.tjs` found" are all errors, not
+warnings. The only tolerated case is a missing native plugin DLL, handled by
+the null-plugin object in
+[`08-tjs-vm-and-native-plugins.md`](08-tjs-vm-and-native-plugins.md) §4.2.
