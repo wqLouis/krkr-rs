@@ -34,7 +34,7 @@ krkr-media
   ├─ image/                 format sniffing, TLG5/6, image crate
   ├─ audio/                 probe, decode-all, streaming decoder
   ├─ video/                 probe, open, present_at, audio track
-  ├─ backend/ffmpeg.rs      Linux: ffmpeg-next (+ symphonia fallback)
+  ├─ backend/ffmpeg.rs      Linux: ffmpeg-next (+ symphonia for codecs it lacks)
   └─ backend/mediacodec.rs  Android: AMediaExtractor + AMediaCodec
 ```
 
@@ -85,8 +85,8 @@ except for trivially small probes.
 
 On Linux the current symphonia path is already the decode engine; the plan
 is to keep it and add FFmpeg audio only where symphonia lacks a codec. On
-Android the plan is `AMediaCodec` for AAC/video audio with a symphonia
-fallback for wav/ogg/mp3. The same free functions and decoder values are
+Android the plan is `AMediaCodec` for AAC/video audio with symphonia for
+wav/ogg/mp3. The same free functions and decoder values are
 used either way, so the mixer never learns which backend ran.
 
 ### 4.4 Long tracks
@@ -175,7 +175,8 @@ render list is built.
 * A stateless `capabilities()` free function per backend reports which
   formats exist so L2 can choose. This replaces the `#[cfg]` branches
   scattered in `video/mod.rs`.
-* Keep the Opus-failure silence fallback (it preserves sequencing).
+* No silence fallback (D11): a failed Opus decode returns `MediaError`; it is
+  never replaced by silence.
 
 ## 8. Feature/target matrix
 

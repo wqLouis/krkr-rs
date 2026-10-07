@@ -65,6 +65,17 @@ has no process-global mutable state, no singletons, no hidden caches, no
 mutable fields on its objects and no implicit lifetimes. Pure transforms are
 free functions; actions take the evolving state as an explicit parameter.
 
+**Invariant D (D11):** **No silent fallbacks and no hardcoded limits.** The
+code is expected to work on valid input. When the intended behavior cannot
+be performed — an unsupported feature, malformed or overflowing data, a size
+that cannot be represented — L1/L2 return a typed **error** rather than a
+degraded substitute or an arbitrary cap. Structural validation (rejecting an
+impossible header value) is an error, not a limit. Examples: a failed Opus
+decode returns `MediaError` instead of substituting silence; an unimplemented
+`BlendMode` returns `RenderError::Unsupported` instead of falling back to
+SourceOver; a file offset that overflows `usize` returns `FsError` instead of
+being truncated or capped.
+
 ## 2. The middle-layer API
 
 The API is a set of **stateless abstraction objects**, **explicit state
