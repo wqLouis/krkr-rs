@@ -16,6 +16,7 @@ use std::collections::{HashMap, HashSet};
 
 /// One logical window.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct WindowState {
     /// Unique window id, stable for the lifetime of the scene.
     pub id: u32,
@@ -53,6 +54,7 @@ fn dim_i32(v: u32) -> i32 {
 
 /// One logical layer (sprite surface) attached to a window.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct LayerState {
     /// Unique layer id, stable for the lifetime of the scene.
     pub id: u32,
@@ -184,6 +186,7 @@ pub struct LayerState {
 
 /// One decoded bitmap (RGBA8, straight alpha).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct BitmapState {
     /// Unique bitmap id, stable for the lifetime of the scene.
     pub id: u32,
@@ -214,6 +217,21 @@ pub struct BitmapState {
 }
 
 impl BitmapState {
+    /// Create an owned bitmap with the given dimensions and straight-alpha
+    /// RGBA8 pixels. Starts clean, unnamed and script-owned by the caller.
+    pub fn new(width: u32, height: u32, rgba: Vec<u8>) -> Self {
+        Self {
+            id: 0,
+            width,
+            height,
+            rgba,
+            name: None,
+            dirty: false,
+            screen_buffer: false,
+            script_owned: false,
+        }
+    }
+
     /// Mark pixels as changed. Native drawing operations use this instead of
     /// relying on a renderer-specific upload mechanism.
     pub fn mark_dirty(&mut self) {
@@ -229,6 +247,7 @@ impl BitmapState {
 
 /// One font face used by `Layer.drawText` (rasterized by the L1 `FontSystem`).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct FontState {
     /// Unique font id, stable for the lifetime of the scene.
     pub id: u32,
@@ -253,6 +272,7 @@ pub struct FontState {
 
 /// Rectangle in window coordinates.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Rect {
     /// Left edge in window coordinates.
     pub x: i32,
@@ -264,8 +284,16 @@ pub struct Rect {
     pub h: u32,
 }
 
+impl Rect {
+    /// Create a rectangle from its edges and size, in window coordinates.
+    pub fn new(x: i32, y: i32, w: u32, h: u32) -> Self {
+        Self { x, y, w, h }
+    }
+}
+
 /// The whole logical scene.
 #[derive(Debug, Default)]
+#[non_exhaustive]
 pub struct Scene {
     /// All windows, in creation order. Callers may edit this directly (the
     /// id lookups fall back to a linear scan).
@@ -1374,10 +1402,6 @@ impl Scene {
     /// * it is not owned by a script `Bitmap` object
     ///   ([`BitmapState::script_owned`]).
     ///
-    /// The decode cache never holds a scene bitmap id: [`BitmapCache`] owns
-    /// its decoded pixels directly, so a loaded layer's image is always
-    /// releasable and a re-`load` still hits the cache.
-    ///
     /// Returns true when the bitmap was removed.
     pub fn release_bitmap(&mut self, id: u32) -> bool {
         let Some(bitmap) = self.bitmap(id) else {
@@ -1629,28 +1653,4 @@ impl Scene {
             self.append_layer_subtree(window, child, all_children, order, visited);
         }
     }
-}
-
-/// Bitmap cache for `Bitmap(name)` reuse, keyed by normalized storage name.
-///
-/// The cache owns its decoded pixels **independently of any scene bitmap**
-/// (the reference's `tTVPGraphicImageData` holds its own refcounted image).
-/// That means `TVPClearGraphicCache` frees the templates by simply clearing
-/// the map, and a layer's MainImage can be released when its layer is
-/// destroyed without invalidating the cache.
-#[derive(Default)]
-pub struct BitmapCache {
-    /// Decoded templates keyed by normalized storage name.
-    pub by_name: HashMap<String, CachedImage>,
-}
-
-/// One decode-cache template: straight-alpha RGBA8 pixels plus size.
-#[derive(Debug, Clone)]
-pub struct CachedImage {
-    /// Width in pixels.
-    pub width: u32,
-    /// Height in pixels.
-    pub height: u32,
-    /// Straight-alpha RGBA8 pixels.
-    pub rgba: Vec<u8>,
 }

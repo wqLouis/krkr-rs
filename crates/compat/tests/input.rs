@@ -15,11 +15,18 @@ use tjs::{Tjs2Engine, TjsValue};
 
 /// Build a VM with the full compat surface installed and run `f` against it.
 ///
-/// `engine` is declared before `host`, so `host` (and its binding) drops
-/// first while the VM is still alive.
+/// `input` is declared before `host`, so `host` (and its binding) drops first
+/// while the L2 input state is still alive.
 fn with_vm(f: impl FnOnce(&Tjs2Engine, &mut CompatHost)) {
     let engine = Tjs2Engine::new().expect("create engine");
+    let mut input = Box::new(engine::input::InputState::new());
     let mut host = CompatHost::new();
+    // SAFETY: `input` outlives the host binding (it is declared after `host`,
+    // so it is dropped later), matching `attach_input`'s contract.
+    unsafe {
+        host.services_mut()
+            .attach_input(input.as_mut() as *mut engine::input::InputState);
+    }
     host.install(&engine).expect("install compat surface");
     f(&engine, &mut host);
 }

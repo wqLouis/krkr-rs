@@ -17,6 +17,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod input;
 pub mod layer_ops;
 pub mod projection;
 pub mod raster;
@@ -25,6 +26,9 @@ pub mod sound;
 pub mod startup;
 pub mod storage;
 pub mod text;
+pub mod timer;
+pub mod trans;
+pub mod video;
 
 // Archive name normalization is a shared storage-naming rule; the parser
 // itself now lives in L1 `fs::xp3`.
@@ -43,8 +47,8 @@ pub use raster::{
     flatten_cubic, stroke_polyline,
 };
 pub use scene::{
-    BitmapCache, BitmapState, CachedImage, FontState, LT_ADDITIVE, LT_ALPHA, LT_OPAQUE,
-    LT_SUBTRACTIVE, LayerState, Rect, Scene, WindowState,
+    BitmapState, FontState, LT_ADDITIVE, LT_ALPHA, LT_OPAQUE, LT_SUBTRACTIVE, LayerState, Rect,
+    Scene, WindowState,
 };
 pub use startup::{StartupError, StartupScript, StartupScripts, discover_startup};
 pub use storage::{
@@ -57,6 +61,6 @@ pub use projection::{
     LT_MULTIPLICATIVE, LT_PS_ADDITIVE, LT_PS_COLOR_BURN, LT_PS_COLOR_DODGE, LT_PS_COLOR_DODGE5,
     LT_PS_DARKEN, LT_PS_DIFFERENCE, LT_PS_DIFFERENCE5, LT_PS_EXCLUSION, LT_PS_HARD_LIGHT,
     LT_PS_LIGHTEN, LT_PS_MULTIPLICATIVE, LT_PS_NORMAL, LT_PS_OVERLAY, LT_PS_SCREEN,
-    LT_PS_SOFT_LIGHT, LT_PS_SUBTRACTIVE, LT_SCREEN, blend_mode_for, clamp_opacity, compose_layer,
-    project_scene, project_window, resolve_blend, visible_image_region,
+    LT_PS_SOFT_LIGHT, LT_PS_SUBTRACTIVE, LT_SCREEN, blend_mode_for, compose_layer, project_scene,
+    project_window, resolve_blend,
 };

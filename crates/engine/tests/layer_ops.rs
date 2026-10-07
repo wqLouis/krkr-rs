@@ -6,16 +6,7 @@
 use engine::{BitmapState, blur_bitmap_in_place, fill_rect_replace};
 
 fn bitmap(width: u32, height: u32, rgba: Vec<u8>) -> BitmapState {
-    BitmapState {
-        id: 0,
-        width,
-        height,
-        rgba,
-        name: None,
-        dirty: false,
-        screen_buffer: false,
-        script_owned: false,
-    }
+    BitmapState::new(width, height, rgba)
 }
 
 /// The original `blur_bitmap_in_place`: a 2-D clamped box sum with one final

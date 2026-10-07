@@ -46,7 +46,7 @@ flate2 = "1"
 # Video decode (Linux): maintained FFmpeg binding. Linked dynamically through
 # pkg-config (the `static` feature is deliberately *not* enabled). The media
 # crate consumes it through the optional `video-ffmpeg` feature; Android uses
-# the pure-sysroot MediaCodec stub instead (see crates/media/Cargo.toml).
+# the NDK MediaCodec backend instead (see crates/media/Cargo.toml).
 ffmpeg-next = { version = "9", default-features = false, features = [
     "format",
     "software-resampling",

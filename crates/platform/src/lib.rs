@@ -12,11 +12,22 @@
 //! the consumer (or CI job) selects it explicitly.
 //!
 //! * `platform-linux` — the real winit 0.30 backend;
-//! * `platform-android` — a stub whose [`run`] returns
-//!   [`PlatformError::NotImplemented`] until the Android backend lands.
+//! * `platform-android` — the real AAudio audio-output backend (via the
+//!   `ndk` crate, Android 8.0 / API 26+) plus stubs for the window and event
+//!   loop, whose [`run`] returns [`PlatformError::NotImplemented`].
 //!
 //! Enabling both or neither is a compile error, as is `platform-linux` on an
 //! Android target.
+//!
+//! # `unsafe` and the Android audio backend
+//!
+//! The crate is `#![deny(unsafe_code)]`, not `forbid`: the `ndk` crate wraps
+//! the AAudio C API safely, but its data callback still hands the audio buffer
+//! over as a raw `*mut c_void`, so one small private module converts that
+//! pointer into a writable slice. That is the only `unsafe` in the crate; it
+//! carries a scoped `#[allow(unsafe_code)]` and a `SAFETY:` comment on every
+//! block. Every other backend, including `platform-linux`, stays entirely
+//! safe.
 //!
 //! Because there is no default, every consumer must select exactly one
 //! feature: `platform = { features = ["platform-linux"] }` for a desktop
@@ -32,7 +43,7 @@
 //! cadence of the internal [`Ticker`]. The handler owns all engine state; L1
 //! owns the loop. See `docs/migration/02-target-architecture.md` §2.1, §3, §4.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![warn(missing_docs)]
 
 mod audio;

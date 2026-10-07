@@ -72,6 +72,13 @@ use render::{
 
 use cosmic_text::{Attrs, Buffer, Family, FontSystem as CosmicFontSystem, Metrics, Shaping};
 
+/// Maximum number of shaped layouts memoized by [`TextEngine`].
+///
+/// The layout cache is a pure memo of shaping results: it changes only how
+/// often `cosmic-text` runs, never the glyphs it returns. When the bound is
+/// reached the whole map is dropped, which keeps the cache simple and bounded.
+const MAX_LAYOUT_CACHE_ENTRIES: usize = 512;
+
 /// Errors produced by text layout, atlas composition and projection.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -109,6 +116,7 @@ pub enum TextError {
 
 /// A registered font face.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
 pub struct FontId(usize);
 
 impl FontId {
@@ -129,6 +137,7 @@ struct Face {
 
 /// Style of a run of text.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct TextStyle {
     /// Em size in pixels.
     pub size_px: f32,
@@ -136,7 +145,11 @@ pub struct TextStyle {
     pub bold: bool,
     /// Synthetic italic/oblique (applied by the L1 rasterizer).
     pub italic: bool,
-    /// Straight-alpha RGBA text colour, baked into the atlas.
+    /// Straight-alpha RGBA text colour.
+    ///
+    /// This is **not** part of the glyph-atlas cache key: the atlas stores
+    /// colour-independent coverage and the colour is applied as a per-node
+    /// tint, so recolouring reuses cached glyphs.
     pub color: [u8; 4],
 }
 
@@ -178,6 +191,7 @@ impl TextStyle {
 
 /// One glyph after shaping and layout, in the text's local coordinate space.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct LaidOutGlyph {
     /// Unicode code point of the glyph's cluster.
     pub codepoint: char,
@@ -195,6 +209,7 @@ pub struct LaidOutGlyph {
 
 /// The result of laying out one string.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
 pub struct TextLayout {
     /// Positioned glyphs in visual order.
     pub glyphs: Vec<LaidOutGlyph>,
@@ -218,10 +233,33 @@ impl TextLayout {
     }
 }
 
+/// Cache key for a shaped [`TextLayout`].
+///
+/// It covers every input that affects shaping: the face, the text, the size,
+/// the synthetic style and the wrap width. The text colour is deliberately
+/// absent because colour does not move glyphs, so recolouring a label reuses
+/// its layout.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct LayoutKey {
+    /// Registered face index.
+    font: FontId,
+    /// Source text.
+    text: String,
+    /// `size_px.to_bits()` (so the key stays `Eq`).
+    size_bits: u32,
+    /// Synthetic bold.
+    bold: bool,
+    /// Synthetic italic.
+    italic: bool,
+    /// `wrap_width.to_bits()` when wrapping takes effect.
+    wrap_bits: Option<u32>,
+}
+
 /// L2 text service: shaping/layout system plus registered faces.
 ///
 /// Created once per engine and owned by it. It keeps no globals; the glyph
 /// atlas and render state are separate explicit values.
+#[non_exhaustive]
 pub struct TextEngine {
     /// L1 stateless rasterizer service.
     render_system: FontSystem,
@@ -231,6 +269,8 @@ pub struct TextEngine {
     faces: Vec<Face>,
     /// Lowercased family name → face id, for name-based lookup.
     by_name: HashMap<String, FontId>,
+    /// Memoized shaped layouts, keyed by shaping inputs only.
+    layout_cache: HashMap<LayoutKey, TextLayout>,
 }
 
 impl TextEngine {
@@ -248,6 +288,7 @@ impl TextEngine {
             ),
             faces: Vec::new(),
             by_name: HashMap::new(),
+            layout_cache: HashMap::new(),
         }
     }
 
@@ -336,64 +377,91 @@ impl TextEngine {
             return Err(TextError::InvalidSize(style.size_px));
         }
 
-        // Split the borrow so `cosmic` can be borrowed mutably while `faces`
-        // (and the immutable `render_system`) stay borrowed.
-        let Self {
-            render_system,
-            cosmic,
-            faces,
-            ..
-        } = self;
-        let face = faces.get(font.0).ok_or(TextError::UnknownFont(font.0))?;
-
-        let metrics = render::font_metrics(render_system, &face.render, style.size_px);
-        let measured = metrics.line_height();
-        let line_height = if measured.is_finite() && measured > 0.0 {
-            measured
-        } else {
-            style.size_px * 1.2
+        let wrap = wrap_width.filter(|w| w.is_finite() && *w > 0.0);
+        let key = LayoutKey {
+            font,
+            text: text.to_owned(),
+            size_bits: style.size_px.to_bits(),
+            bold: style.bold,
+            italic: style.italic,
+            wrap_bits: wrap.map(f32::to_bits),
         };
-
-        let attributes = Attrs::new()
-            .family(Family::Name(&face.family))
-            .weight(cosmic_text::Weight::NORMAL)
-            .style(cosmic_text::Style::Normal);
-
-        let mut buffer = Buffer::new(cosmic, Metrics::new(style.size_px, line_height));
-        let width = wrap_width.filter(|w| w.is_finite() && *w > 0.0);
-        buffer.set_size(width, None);
-        buffer.set_text(text, &attributes, Shaping::Advanced, None);
-
-        let mut glyphs = Vec::new();
-        let mut max_line = 0usize;
-        let mut line_width: f32 = 0.0;
-        {
-            let mut borrowed = buffer.borrow_with(cosmic);
-            for run in borrowed.layout_runs() {
-                max_line = max_line.max(run.line_i);
-                line_width = line_width.max(run.line_w);
-                let baseline_y = run.line_y;
-                for glyph in run.glyphs {
-                    let cluster = &run.text[glyph.start..glyph.end];
-                    let codepoint = cluster.chars().next().unwrap_or('\u{FFFD}');
-                    glyphs.push(LaidOutGlyph {
-                        codepoint,
-                        font,
-                        line: run.line_i,
-                        x: glyph.x + glyph.font_size * glyph.x_offset,
-                        baseline_y,
-                        advance: glyph.w,
-                    });
-                }
-            }
+        if let Some(cached) = self.layout_cache.get(&key) {
+            return Ok(cached.clone());
         }
 
-        Ok(TextLayout {
-            glyphs,
-            width: line_width,
-            height: (max_line + 1) as f32 * line_height,
-            line_height,
-        })
+        let layout = {
+            // Split the borrow so `cosmic` can be borrowed mutably while
+            // `faces` (and the immutable `render_system`) stay borrowed.
+            let Self {
+                render_system,
+                cosmic,
+                faces,
+                ..
+            } = &mut *self;
+            let face = faces.get(font.0).ok_or(TextError::UnknownFont(font.0))?;
+
+            let metrics = render::font_metrics(render_system, &face.render, style.size_px);
+            let measured = metrics.line_height();
+            let line_height = if measured.is_finite() && measured > 0.0 {
+                measured
+            } else {
+                style.size_px * 1.2
+            };
+
+            let attributes = Attrs::new()
+                .family(Family::Name(&face.family))
+                .weight(cosmic_text::Weight::NORMAL)
+                .style(cosmic_text::Style::Normal);
+
+            let mut buffer = Buffer::new(cosmic, Metrics::new(style.size_px, line_height));
+            buffer.set_size(wrap, None);
+            buffer.set_text(text, &attributes, Shaping::Advanced, None);
+
+            let mut glyphs = Vec::new();
+            let mut max_line = 0usize;
+            let mut line_width: f32 = 0.0;
+            {
+                let mut borrowed = buffer.borrow_with(cosmic);
+                for run in borrowed.layout_runs() {
+                    max_line = max_line.max(run.line_i);
+                    line_width = line_width.max(run.line_w);
+                    let baseline_y = run.line_y;
+                    for glyph in run.glyphs {
+                        let cluster = &run.text[glyph.start..glyph.end];
+                        let codepoint = cluster.chars().next().unwrap_or('\u{FFFD}');
+                        glyphs.push(LaidOutGlyph {
+                            codepoint,
+                            font,
+                            line: run.line_i,
+                            x: glyph.x + glyph.font_size * glyph.x_offset,
+                            baseline_y,
+                            advance: glyph.w,
+                        });
+                    }
+                }
+            }
+
+            TextLayout {
+                glyphs,
+                width: line_width,
+                height: (max_line + 1) as f32 * line_height,
+                line_height,
+            }
+        };
+
+        if self.layout_cache.len() >= MAX_LAYOUT_CACHE_ENTRIES {
+            self.layout_cache.clear();
+        }
+        self.layout_cache.insert(key, layout.clone());
+        Ok(layout)
+    }
+
+    /// Returns the number of shaped layouts currently memoized.
+    ///
+    /// Used by tests and diagnostics; the value never affects rendering.
+    pub fn cached_layouts(&self) -> usize {
+        self.layout_cache.len()
     }
 }
 
@@ -405,10 +473,9 @@ impl Default for TextEngine {
 
 /// Cache key for one rasterized glyph in the atlas.
 ///
-/// The colour is part of the key because the atlas stores straight-alpha RGBA
-/// with the colour **baked in**: the existing quad pipeline tints textured
-/// quads white (`[1, 1, 1, opacity]`), so per-run colour lives in the atlas,
-/// not the draw call. Different colours therefore use different atlas cells.
+/// The atlas stores colour-independent straight-alpha coverage, so the text
+/// colour is **not** part of the key: a colour change reuses the cached
+/// coverage and applies the colour as a per-node tint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct GlyphKey {
     /// Registered face index.
@@ -421,12 +488,11 @@ struct GlyphKey {
     bold: bool,
     /// Synthetic italic.
     italic: bool,
-    /// Baked straight-alpha RGBA colour.
-    color: [u8; 4],
 }
 
 /// One glyph packed into the atlas.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct AtlasGlyph {
     /// Sub-rectangle of the atlas holding the glyph's RGBA pixels.
     pub region: PixelRegion,
@@ -453,6 +519,7 @@ impl AtlasGlyph {
 /// bilinear bleeding. Adding a new glyph uploads only its sub-rectangle with
 /// [`render::upload_texture`]; the CPU mirror is kept so the same pixels can be
 /// composited for D8 readback and re-uploaded after a render-state recreation.
+#[non_exhaustive]
 pub struct GlyphAtlas {
     /// Atlas texture handle passed to the quad pipeline.
     texture: Texture,
@@ -468,7 +535,7 @@ pub struct GlyphAtlas {
     cursor_y: u32,
     /// Tallest glyph in the current shelf.
     row_height: u32,
-    /// Rasterized glyphs, keyed by face/codepoint/size/style/colour.
+    /// Rasterized glyphs, keyed by face/codepoint/size/style.
     entries: HashMap<GlyphKey, AtlasGlyph>,
 }
 
@@ -524,8 +591,9 @@ impl GlyphAtlas {
 
     /// Rasterizes `codepoint` (if needed) and packs it into the atlas.
     ///
-    /// The glyph is cached by face, code point, size, style and colour, so a
-    /// repeated request does not re-rasterize or re-upload.
+    /// The glyph is cached by face, code point, size and style (never colour),
+    /// so a repeated request does not re-rasterize or re-upload and a colour
+    /// change reuses the cached coverage.
     ///
     /// # Errors
     ///
@@ -549,7 +617,6 @@ impl GlyphAtlas {
             size_bits: style.size_px.to_bits(),
             bold: style.bold,
             italic: style.italic,
-            color: style.color,
         };
         if let Some(entry) = self.entries.get(&key) {
             return Ok(*entry);
@@ -582,7 +649,7 @@ impl GlyphAtlas {
                         width: self.width,
                         height: self.height,
                     })?;
-            let rgba = bake_rgba(&bitmap, style.color);
+            let rgba = coverage_rgba(&bitmap);
             self.blit(x, y, bitmap.width, bitmap.height, &rgba);
             let region = PixelRegion::new(x, y, bitmap.width, bitmap.height);
             render::upload_texture(pipeline, state, &self.texture, region, &rgba)?;
@@ -622,6 +689,7 @@ impl GlyphAtlas {
                 x: glyph.x,
                 baseline_y: glyph.baseline_y,
                 opacity,
+                color: style.color,
             });
         }
         Ok(positioned)
@@ -668,6 +736,7 @@ impl GlyphAtlas {
 
 /// A glyph resolved against an atlas and placed at a pen position.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct PositionedGlyph {
     /// Atlas entry for the glyph.
     pub glyph: AtlasGlyph,
@@ -677,9 +746,23 @@ pub struct PositionedGlyph {
     pub baseline_y: f32,
     /// Composed opacity in `[0, 1]`.
     pub opacity: f32,
+    /// Straight-alpha text colour applied as a tint to the coverage.
+    pub color: [u8; 4],
 }
 
 impl PositionedGlyph {
+    /// Create a positioned glyph at `(x, baseline_y)` with the given tint and
+    /// opacity.
+    pub fn new(glyph: AtlasGlyph, x: f32, baseline_y: f32, opacity: f32, color: [u8; 4]) -> Self {
+        Self {
+            glyph,
+            x,
+            baseline_y,
+            opacity,
+            color,
+        }
+    }
+
     /// Returns the destination rectangle for the glyph's bitmap, or `None`
     /// for a zero-size glyph.
     pub fn destination(&self) -> Option<RectF> {
@@ -721,6 +804,7 @@ pub fn project_text(
             dst,
             src: positioned.glyph.region,
             opacity: clamp01(positioned.opacity),
+            color: rgba_tint(positioned.color),
             z,
             ..RenderNode::default()
         };
@@ -737,9 +821,10 @@ pub fn project_text(
 /// Composites positioned glyphs into a fresh `width × height` RGBA buffer.
 ///
 /// This is the CPU composition path used by the D8 correctness baseline
-/// (`getPixel`/readback): it reads the same [`GlyphAtlas`] pixels the GPU
-/// path uploads and applies straight-alpha source-over with each glyph's
-/// opacity. The returned buffer starts fully transparent.
+/// (`getPixel`/readback): it reads the same [`GlyphAtlas`] coverage the GPU
+/// path uploads, tints it with each glyph's colour and applies straight-alpha
+/// source-over with the glyph's opacity. The returned buffer starts fully
+/// transparent.
 pub fn compose_text_cpu(
     atlas: &GlyphAtlas,
     glyphs: &[PositionedGlyph],
@@ -777,7 +862,7 @@ pub fn compose_text_cpu(
                     atlas.pixels.get(source..source + 4),
                     out.get_mut(destination..destination + 4),
                 ) {
-                    blend_source_over(dst, src, opacity);
+                    blend_tinted_coverage(dst, src[3], positioned.color, opacity);
                 }
             }
         }
@@ -785,17 +870,41 @@ pub fn compose_text_cpu(
     out
 }
 
-/// Bakes coverage into straight-alpha RGBA with the text colour.
-fn bake_rgba(bitmap: &GlyphBitmap, color: [u8; 4]) -> Vec<u8> {
+/// Expands 8-bit coverage into straight-alpha white RGBA.
+///
+/// The atlas keeps only coverage (`alpha = coverage`, RGB white) so one cached
+/// cell can be tinted with any text colour at draw time without re-rasterizing.
+fn coverage_rgba(bitmap: &GlyphBitmap) -> Vec<u8> {
     let mut out = vec![0u8; (bitmap.width as usize) * (bitmap.height as usize) * 4];
     for (index, &coverage) in bitmap.coverage.iter().enumerate() {
-        let alpha = ((coverage as u16 * color[3] as u16) / 255) as u8;
-        out[index * 4] = color[0];
-        out[index * 4 + 1] = color[1];
-        out[index * 4 + 2] = color[2];
-        out[index * 4 + 3] = alpha;
+        out[index * 4] = 255;
+        out[index * 4 + 1] = 255;
+        out[index * 4 + 2] = 255;
+        out[index * 4 + 3] = coverage;
     }
     out
+}
+
+/// Converts a straight-alpha `[u8; 4]` colour into a `[f32; 4]` node tint.
+fn rgba_tint(color: [u8; 4]) -> [f32; 4] {
+    [
+        color[0] as f32 / 255.0,
+        color[1] as f32 / 255.0,
+        color[2] as f32 / 255.0,
+        color[3] as f32 / 255.0,
+    ]
+}
+
+/// Blends one coverage byte tinted by `color` into `dst`, scaled by `opacity`.
+///
+/// The atlas stores straight-alpha coverage (white RGB, coverage in alpha), so
+/// the tinted source pixel is `[r, g, b, coverage × a / 255]`. This reproduces
+/// exactly the pixels the previous colour-baked atlas produced, keeping the CPU
+/// `getPixel` baseline byte-for-byte stable.
+fn blend_tinted_coverage(dst: &mut [u8], coverage: u8, color: [u8; 4], opacity: f32) {
+    let alpha = ((coverage as u16 * color[3] as u16) / 255) as u8;
+    let src = [color[0], color[1], color[2], alpha];
+    blend_source_over(dst, &src, opacity);
 }
 
 /// Source-over blends one straight-alpha RGBA pixel `src` into `dst`, scaled

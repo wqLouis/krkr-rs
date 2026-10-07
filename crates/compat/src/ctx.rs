@@ -4,6 +4,8 @@ use std::cell::{Cell, RefCell};
 use std::ffi::c_char;
 use std::marker::PhantomData;
 
+use engine::input::InputState;
+use engine::timer::TimerState;
 use engine::{Scene, Storage};
 use tjs::{
     NativeClassBuilder, NativeInstanceBuilder, NativeStaticMembers, RetainedValue, Tjs2Engine,
@@ -31,6 +33,8 @@ use crate::CompatError;
 pub struct CompatServices {
     scene: Option<*mut Scene>,
     storage: Option<*mut Storage>,
+    input: Option<*mut InputState>,
+    timer: Option<*mut TimerState>,
     /// Scratch buffers for `Plugins.getList` (see `plugins_native`): the C++
     /// trampoline copies the string array immediately after the callback
     /// returns, so the buffers must outlive the call. Owned here rather than
@@ -92,6 +96,37 @@ impl CompatServices {
     /// See [`Self::scene`] for why this returns a raw pointer.
     pub fn storage(&self) -> Option<*mut Storage> {
         self.storage
+    }
+
+    /// Attach the L2 generic input state the input natives will read.
+    ///
+    /// # Safety
+    /// `input` must stay valid for as long as the binding is installed (the
+    /// VM's lifetime).
+    pub unsafe fn attach_input(&mut self, input: *mut InputState) {
+        self.input = Some(input);
+    }
+
+    /// The attached L2 input state pointer, if any.
+    ///
+    /// See [`Self::scene`] for why this returns a raw pointer.
+    pub fn input(&self) -> Option<*mut InputState> {
+        self.input
+    }
+
+    /// Attach the L2 timer registry the `Timer` native will compose.
+    ///
+    /// # Safety
+    /// `timer` must stay valid for as long as the binding is installed.
+    pub unsafe fn attach_timer(&mut self, timer: *mut TimerState) {
+        self.timer = Some(timer);
+    }
+
+    /// The attached L2 timer registry pointer, if any.
+    ///
+    /// See [`Self::scene`] for why this returns a raw pointer.
+    pub fn timer(&self) -> Option<*mut TimerState> {
+        self.timer
     }
 
     /// The mutable `Plugins.getList` scratch buffers.

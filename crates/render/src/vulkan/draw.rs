@@ -191,7 +191,7 @@ impl Recorder<'_> {
         match &node.content {
             RenderContent::None => Ok(()),
             RenderContent::Solid(color) => {
-                let tint = self.solid_tint(*color, opacity);
+                let tint = self.color_tint(*color, opacity);
                 self.draw_quad(
                     Program::Solid,
                     node.blend,
@@ -210,7 +210,10 @@ impl Recorder<'_> {
                     return Ok(());
                 }
                 let uv = uv_rect(texture.width(), texture.height(), node.src);
-                let tint = [1.0, 1.0, 1.0, opacity];
+                // The per-node tint carries the text colour (linearised for an
+                // sRGB target); the alpha is the composed opacity. Ordinary
+                // textures keep the default `[1, 1, 1, 1]`.
+                let tint = self.color_tint(node.color, opacity);
                 self.draw_quad(
                     Program::Textured,
                     node.blend,
@@ -286,8 +289,11 @@ impl Recorder<'_> {
         Ok(())
     }
 
-    /// Converts a straight-alpha solid color into a shader tint.
-    fn solid_tint(&self, color: [f32; 4], opacity: f32) -> [f32; 4] {
+    /// Converts a straight-alpha node colour into a shader tint.
+    ///
+    /// The RGB channels are linearised when the target is an sRGB surface;
+    /// the alpha carries the composed opacity.
+    fn color_tint(&self, color: [f32; 4], opacity: f32) -> [f32; 4] {
         [
             self.linearize(color[0]),
             self.linearize(color[1]),

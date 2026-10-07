@@ -223,6 +223,8 @@ fn compute_placed_path(storage: &Storage, name: &str) -> Result<String, String> 
             Ok(format!("{archive}>{in_archive}"))
         }
         Ok(None) => Ok(String::new()),
+        // `Location` is `#[non_exhaustive]`; future variants have no placed path.
+        Ok(Some(_)) => Ok(String::new()),
         Err(error) => Err(format!("Storages.getPlacedPath: {error}")),
     }
 }

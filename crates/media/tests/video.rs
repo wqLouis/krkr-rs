@@ -43,8 +43,9 @@ fn ffmpeg_available() -> bool {
 
 /// Generates the test clip, or `None` when no usable encoder is available.
 fn generate_clip() -> Option<TempClip> {
-    // The MediaCodec build has no video decoder yet, so there is nothing to
-    // exercise; skip rather than fail.
+    // The MediaCodec backend needs an Android device (there is no libmediandk
+    // to link on this host), so there is nothing to exercise here; skip
+    // rather than fail.
     if !cfg!(feature = "video-ffmpeg") || !ffmpeg_available() {
         return None;
     }

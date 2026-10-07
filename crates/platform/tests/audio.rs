@@ -100,12 +100,20 @@ fn stopping_the_null_device_rejects_further_writes() {
     ));
 }
 
+// The Android backend is real AAudio (via the `ndk` crate) and only compiles
+// for an Android target. It cannot be linked or run here (`libaaudio.so` is an
+// Android library), so the test is compiled and `#[ignore]`d. Run it on a
+// device with `cargo test -p platform --features platform-android -- --ignored`.
 #[cfg(feature = "platform-android")]
 #[test]
-fn real_open_fails_fast_on_android() {
-    let error = match AudioDevice::open(stereo()) {
-        Ok(_) => panic!("android audio must not silently succeed"),
-        Err(error) => error,
-    };
-    assert!(matches!(error, PlatformError::NotImplemented(_)));
+#[ignore = "requires an Android device with libaaudio; cannot run on the host"]
+fn real_device_opens_starts_and_stops() {
+    let (device, mut state) = AudioDevice::open(stereo()).expect("open AAudio output");
+    assert!(device.is_running(&state));
+    device
+        .write(&mut state, &[0.0, 0.0, 0.5, -0.5])
+        .expect("aligned write");
+    device.stop(&mut state);
+    assert!(!device.is_running(&state));
+    device.stop(&mut state); // idempotent
 }

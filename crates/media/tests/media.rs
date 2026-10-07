@@ -14,8 +14,10 @@ fn capabilities_advertise_the_image_and_audio_backends() {
         assert!(caps.video_formats.iter().any(|name| name == "mp4"));
         assert!(caps.streaming_video);
     } else {
-        assert!(caps.video_formats.is_empty());
-        assert!(!caps.streaming_video);
+        // MediaCodec: the Android framework demuxes/decodes these; the exact
+        // codec set is device-dependent, so the baseline list is advertised.
+        assert!(caps.video_formats.iter().any(|name| name == "mp4"));
+        assert!(caps.streaming_video);
     }
     assert!(!caps.is_empty());
 }
@@ -35,7 +37,7 @@ fn config_is_preserved_and_media_is_stateless() {
 fn video_open_rejects_non_video_data() {
     let media = Media::new();
     // The FFmpeg backend returns a typed decode/unsupported error; the
-    // MediaCodec stub returns Unsupported. Either way: never a panic, never a
-    // silent success.
+    // MediaCodec backend returns a typed decode/unsupported error too. Either
+    // way: never a panic, never a silent success.
     assert!(open_video(&media, std::sync::Arc::from(&b"not a video"[..]), None).is_err());
 }

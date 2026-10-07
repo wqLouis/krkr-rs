@@ -10,9 +10,9 @@
 //!   dynamically through pkg-config (D5). It demuxes from an in-memory
 //!   `StreamIo`, converts frames to tightly packed RGBA8 with `swscale`, and
 //!   decodes the audio track to interleaved `f32` with `swresample`.
-//! * MediaCodec (`video-mediacodec`, selected by the Android frontend) — a
-//!   typed [`MediaError::Unsupported`] stub until the `AMediaCodec` backend
-//!   lands. It links no FFmpeg.
+//! * MediaCodec (`video-mediacodec`, selected by the Android frontend) — the
+//!   NDK `AMediaExtractor`/`AMediaCodec` backend over raw `extern "C"` FFI
+//!   (`libmediandk`). It links no FFmpeg and needs no JNI.
 //!
 //! Exactly one backend must be selected; selecting none or both is a
 //! `compile_error!`. Consumers choose explicitly, so an Android build never
@@ -69,13 +69,16 @@ pub use backend::VideoDecoderState;
 
 /// How far a backwards request may lag the current frame before the decoder
 /// seeks instead of reusing it. Mirrors the reference `SEEK_TOLERANCE_MS`.
-#[cfg_attr(feature = "video-mediacodec", allow(dead_code))]
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
 pub(crate) const SEEK_TOLERANCE_MS: u64 = 500;
 
 /// Video container/codec names advertised by [`crate::capabilities`].
 ///
-/// The FFmpeg backend reports the demuxers/decoders it is built with; the
-/// MediaCodec stub reports none because every call is `Unsupported`.
+/// The FFmpeg backend reports the demuxers/decoders it is built with. The
+/// MediaCodec backend reports the baseline set the Android media framework
+/// demuxes/decodes; the exact codecs available are device-dependent, and an
+/// unavailable one surfaces as a typed [`MediaError::Unsupported`] from
+/// [`open_video`] rather than a silent fallback.
 #[cfg(feature = "video-ffmpeg")]
 pub(crate) const VIDEO_FORMATS: &[&str] = &[
     "mp4", "mov", "matroska", "webm", "avi", "mpegts", "h264", "hevc", "vp8", "vp9", "av1",
@@ -84,7 +87,10 @@ pub(crate) const VIDEO_FORMATS: &[&str] = &[
 
 /// See [`VIDEO_FORMATS`].
 #[cfg(feature = "video-mediacodec")]
-pub(crate) const VIDEO_FORMATS: &[&str] = &[];
+pub(crate) const VIDEO_FORMATS: &[&str] = &[
+    "mp4", "mov", "matroska", "webm", "mpegts", "3gp", "h264", "hevc", "vp8", "vp9", "av1",
+    "mpeg4", "aac", "mp3", "opus", "vorbis", "flac",
+];
 
 /// Whether incremental video decode is available in this build.
 #[cfg(feature = "video-ffmpeg")]
@@ -92,7 +98,7 @@ pub(crate) const STREAMING_VIDEO: bool = true;
 
 /// See [`STREAMING_VIDEO`].
 #[cfg(feature = "video-mediacodec")]
-pub(crate) const STREAMING_VIDEO: bool = false;
+pub(crate) const STREAMING_VIDEO: bool = true;
 
 /// Opens a video stream and reads its [spec](VideoSpec).
 ///

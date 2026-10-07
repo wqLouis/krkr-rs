@@ -52,6 +52,7 @@ pub const MAX_PAN: f32 = 1.0;
 
 /// Errors produced by the sound model and mixer.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum SoundError {
     /// A `.sli` side-car could not be parsed.
     #[error("invalid .sli data: {message}")]
@@ -92,6 +93,7 @@ pub enum SoundError {
 
 /// A loop-link condition (`tTVPWaveLoopLinkCondition`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LoopCondition {
     /// `Condition=no` — always taken.
     None,
@@ -128,6 +130,7 @@ impl LoopCondition {
 /// One `Link { … }` entry: playback jumps from sample `from` to sample `to`
 /// once it reaches `from` (`tTVPWaveLoopLink`).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct LoopLink {
     /// Sample granule the loop jumps *from* (the loop end).
     pub from: u64,
@@ -144,6 +147,25 @@ pub struct LoopLink {
 }
 
 impl LoopLink {
+    /// Create a loop link between two sample granules.
+    pub fn new(
+        from: u64,
+        to: u64,
+        smooth: bool,
+        condition: LoopCondition,
+        ref_value: i64,
+        cond_var: i64,
+    ) -> Self {
+        Self {
+            from,
+            to,
+            smooth,
+            condition,
+            ref_value,
+            cond_var,
+        }
+    }
+
     /// Whether this link's condition holds for `flags` (reference
     /// `GetNearestEvent` condition test). A non-degenerate link has
     /// `from > to`.
@@ -168,6 +190,7 @@ impl LoopLink {
 
 /// One `Label { … }` entry (a named sample position).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct WaveLabel {
     /// Sample granule the label sits at.
     pub position: u64,
@@ -175,8 +198,16 @@ pub struct WaveLabel {
     pub name: String,
 }
 
+impl WaveLabel {
+    /// Create a named label at a sample granule.
+    pub fn new(position: u64, name: String) -> Self {
+        Self { position, name }
+    }
+}
+
 /// Parsed `.sli` loop/label information for one audio entry.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SliInfo {
     /// All `Link` entries, in file order.
     pub links: Vec<LoopLink>,
@@ -185,6 +216,11 @@ pub struct SliInfo {
 }
 
 impl SliInfo {
+    /// Create loop/label information from its entries.
+    pub fn new(links: Vec<LoopLink>, labels: Vec<WaveLabel>) -> Self {
+        Self { links, labels }
+    }
+
     /// The first unconditional, non-degenerate loop link. `None` when the
     /// file only has conditional links or no link at all.
     pub fn active_link(&self) -> Option<&LoopLink> {
@@ -384,6 +420,7 @@ fn entities(body: &str) -> Vec<(String, String)> {
 /// `Link { Condition=… }` entries are tested against at the loop point. No
 /// global registry — the owning [`SoundBuffer`]/[`SoundChannel`] holds it.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct WaveFlags {
     values: [i32; TVP_WL_MAX_FLAGS],
 }
@@ -442,6 +479,7 @@ impl Default for WaveFlags {
 /// mono-or-stereo source. The value is cheap to clone (the PCM lives behind
 /// an [`Arc`]) and is shared by every channel that plays it.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct SoundSource {
     audio: Arc<DecodedAudio>,
     frames: u64,
@@ -587,6 +625,7 @@ impl SoundSource {
 /// A linear volume fade (`SoundBufferBaseIntf.cpp` `Fade`): ramp from
 /// `from` to `to` over `duration` seconds, after an optional `delay`.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct Fade {
     /// Volume at fade start.
     pub from: f32,
@@ -642,6 +681,7 @@ impl Fade {
 
 /// Script-visible playback status (`tTVPSoundStatus`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum Status {
     /// No source loaded.
     #[default]
@@ -665,6 +705,7 @@ impl Status {
 
 /// An event a [`SoundBuffer::poll`] observed since the previous poll.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SoundEvent {
     /// The script-visible status changed.
     StatusChanged(Status),
@@ -684,6 +725,7 @@ pub enum SoundEvent {
 /// cursor and no global channel registry. `SoundChannel` native instances in
 /// L3 are thin handles onto these.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct SoundChannel {
     id: u64,
     source: Option<Arc<SoundSource>>,
@@ -1011,6 +1053,7 @@ impl SoundChannel {
 /// be replayed without losing its flag state, and so the event surface is
 /// testable without a VM.
 #[derive(Debug, Default)]
+#[non_exhaustive]
 pub struct SoundBuffer {
     source: Option<Arc<SoundSource>>,
     flags: WaveFlags,
@@ -1153,6 +1196,7 @@ impl SoundBuffer {
 ///
 /// A `Mixer` owns all of its state; there is no process-global mixer.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct Mixer {
     channels: Vec<SoundChannel>,
     next_id: u64,
@@ -1324,6 +1368,7 @@ impl Mixer {
 
 /// Global gain settings applied on top of each channel's own gain.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub struct MixSettings {
     /// Global volume multiplier (`0..=1`).
     pub global_volume: f32,

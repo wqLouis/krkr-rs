@@ -57,6 +57,7 @@ struct MountedArchive {
 
 /// A mounted game storage: one base directory plus the explicitly mounted
 /// `.xp3` archives.
+#[non_exhaustive]
 pub struct Storage {
     /// Immutable bottom file-system object.
     fs: FileSystem,
@@ -70,6 +71,7 @@ pub struct Storage {
 
 /// A resolved storage location.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Location {
     /// A file on the bottom file system.
     Disk(PathBuf),
@@ -84,6 +86,7 @@ pub enum Location {
 /// file-system metadata exposed by [`fs::stat`] (only the modification
 /// time is surfaced by the bottom API).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct StorageMetadata {
     /// Uncompressed size in bytes.
     pub size: u64,
@@ -97,6 +100,7 @@ pub struct StorageMetadata {
 
 /// Errors while mounting a game storage.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum MountError {
     /// The mount path is not a directory.
     #[error("not a directory: {0}")]
@@ -111,6 +115,7 @@ pub enum MountError {
 
 /// Errors while reading or listing storage entries.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum StorageReadError {
     /// The requested storage name did not resolve.
     #[error("storage not found: {0}")]

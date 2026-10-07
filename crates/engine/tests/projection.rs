@@ -12,8 +12,7 @@ use engine::{
     LT_PS_COLOR_DODGE5, LT_PS_DARKEN, LT_PS_DIFFERENCE, LT_PS_DIFFERENCE5, LT_PS_EXCLUSION,
     LT_PS_HARD_LIGHT, LT_PS_LIGHTEN, LT_PS_MULTIPLICATIVE, LT_PS_NORMAL, LT_PS_OVERLAY,
     LT_PS_SCREEN, LT_PS_SOFT_LIGHT, LT_PS_SUBTRACTIVE, LT_SCREEN, LT_SUBTRACTIVE, Rect, Scene,
-    blend_mode_for, clamp_opacity, compose_layer, project_scene, project_window, resolve_blend,
-    visible_image_region,
+    blend_mode_for, compose_layer, project_scene, project_window, resolve_blend,
 };
 use render::{
     PipelineConfig, RenderContent, RenderNode, RenderNodeId, RenderScene, Texture, TextureDesc,
@@ -37,15 +36,7 @@ fn drawable_nodes(scene: &RenderScene) -> Vec<&RenderNode> {
 }
 
 fn full_window_rect(w: u32, h: u32) -> Rect {
-    Rect { x: 0, y: 0, w, h }
-}
-
-#[test]
-fn clamp_opacity_bounds() {
-    assert_eq!(clamp_opacity(-0.5), 0.0);
-    assert_eq!(clamp_opacity(0.5), 0.5);
-    assert_eq!(clamp_opacity(1.5), 1.0);
-    assert_eq!(clamp_opacity(f32::NAN), 0.0, "NaN clamps to 0");
+    Rect::new(0, 0, w, h)
 }
 
 /// Every documented native type maps to its own mode — never silently to
@@ -148,38 +139,20 @@ fn compose_layer_accumulates_position_opacity_visibility() {
     let parent = scene.add_layer(win, None);
     {
         let l = scene.layer_mut(parent).unwrap();
-        l.rect = Rect {
-            x: 100,
-            y: 40,
-            w: 200,
-            h: 100,
-        };
+        l.rect = Rect::new(100, 40, 200, 100);
         l.opacity = 0.5;
         l.visible = true;
     }
     let child = scene.add_layer(win, Some(parent));
     {
         let l = scene.layer_mut(child).unwrap();
-        l.rect = Rect {
-            x: 12,
-            y: 8,
-            w: 20,
-            h: 10,
-        };
+        l.rect = Rect::new(12, 8, 20, 10);
         l.opacity = 0.5;
         l.visible = true;
     }
 
     let composed = compose_layer(&scene, child).expect("composed");
-    assert_eq!(
-        composed.rect,
-        Rect {
-            x: 112,
-            y: 48,
-            w: 20,
-            h: 10
-        }
-    );
+    assert_eq!(composed.rect, Rect::new(112, 48, 20, 10));
     assert!((composed.opacity - 0.25).abs() < 1e-6);
     assert!(composed.visible);
 }
@@ -195,65 +168,6 @@ fn compose_layer_honours_ancestor_invisibility() {
 
     let composed = compose_layer(&scene, child).expect("composed");
     assert!(!composed.visible, "an invisible ancestor hides the child");
-}
-
-#[test]
-fn visible_image_region_selects_sprite_frame() {
-    let layer = Rect {
-        x: 100,
-        y: 100,
-        w: 32,
-        h: 32,
-    };
-    let (src, dst) = visible_image_region(layer, -32, 0, 96, 32, 96, 32).unwrap();
-    assert_eq!(src, PixelRegion::new(32, 0, 32, 32));
-    assert_eq!(dst, RectF::new(100.0, 100.0, 32.0, 32.0));
-
-    let (src, _) = visible_image_region(layer, 0, 0, 96, 32, 96, 32).unwrap();
-    assert_eq!(src, PixelRegion::new(0, 0, 32, 32));
-
-    let (src, _) = visible_image_region(layer, -64, 0, 96, 32, 96, 32).unwrap();
-    assert_eq!(src, PixelRegion::new(64, 0, 32, 32));
-}
-
-#[test]
-fn visible_image_region_selects_tbutton_sheet_cell() {
-    let layer = Rect {
-        x: 144,
-        y: 244,
-        w: 100,
-        h: 40,
-    };
-    let (src, dst) = visible_image_region(layer, -100, 0, 400, 40, 400, 40).unwrap();
-    assert_eq!(src, PixelRegion::new(100, 0, 100, 40));
-    assert_eq!(dst, RectF::new(144.0, 244.0, 100.0, 40.0));
-
-    for (pattern, expected_x) in [(0u32, 0u32), (1, 100), (2, 200), (3, 300)] {
-        let (src, _) =
-            visible_image_region(layer, -100 * pattern as i32, 0, 400, 40, 400, 40).unwrap();
-        assert_eq!(
-            src,
-            PixelRegion::new(expected_x, 0, 100, 40),
-            "pattern {pattern} must sample its own cell"
-        );
-    }
-}
-
-#[test]
-fn visible_image_region_clips_large_image() {
-    let layer = Rect {
-        x: 50,
-        y: 60,
-        w: 100,
-        h: 100,
-    };
-    let (src, dst) = visible_image_region(layer, -20, -30, 200, 200, 200, 200).unwrap();
-    assert_eq!(dst, RectF::new(50.0, 60.0, 100.0, 100.0));
-    assert_eq!(src, PixelRegion::new(20, 30, 100, 100));
-
-    // An image placed entirely outside the layer yields nothing.
-    assert!(visible_image_region(layer, -500, 0, 200, 200, 200, 200).is_none());
-    assert!(visible_image_region(layer, 0, -500, 200, 200, 200, 200).is_none());
 }
 
 /// Parent is centered at TVP (200, 90); the child is relative to its
@@ -279,12 +193,7 @@ fn hierarchy_composes_position_opacity_visibility_and_order() {
     let parent = scene.add_layer(win, None);
     {
         let l = scene.layer_mut(parent).unwrap();
-        l.rect = Rect {
-            x: 100,
-            y: 40,
-            w: 200,
-            h: 100,
-        };
+        l.rect = Rect::new(100, 40, 200, 100);
         l.opacity = 0.5;
         l.visible = true;
         l.fill_color = Some([255, 255, 255, 255]);
@@ -292,12 +201,7 @@ fn hierarchy_composes_position_opacity_visibility_and_order() {
     let child = scene.add_layer(win, Some(parent));
     {
         let l = scene.layer_mut(child).unwrap();
-        l.rect = Rect {
-            x: 12,
-            y: 8,
-            w: 20,
-            h: 10,
-        };
+        l.rect = Rect::new(12, 8, 20, 10);
         l.opacity = 0.5;
         l.visible = true;
         l.fill_color = Some([255, 255, 255, 255]);
@@ -305,12 +209,7 @@ fn hierarchy_composes_position_opacity_visibility_and_order() {
     let sibling = scene.add_layer(win, None);
     {
         let l = scene.layer_mut(sibling).unwrap();
-        l.rect = Rect {
-            x: 1,
-            y: 2,
-            w: 3,
-            h: 4,
-        };
+        l.rect = Rect::new(1, 2, 3, 4);
         l.visible = true;
         l.fill_color = Some([255, 255, 255, 255]);
     }
@@ -405,12 +304,7 @@ fn bitmap_layer_uses_texture_and_source_region() {
     {
         let l = scene.layer_mut(layer).unwrap();
         l.bitmap = Some(bmp_id);
-        l.rect = Rect {
-            x: 297,
-            y: 436,
-            w: 251,
-            h: 254,
-        };
+        l.rect = Rect::new(297, 436, 251, 254);
         l.image_width = 251;
         l.image_height = 254;
     }
@@ -432,12 +326,7 @@ fn bitmap_layer_1x1_rect_stays_1px() {
     {
         let l = scene.layer_mut(layer).unwrap();
         l.bitmap = Some(bmp_id);
-        l.rect = Rect {
-            x: 10,
-            y: 10,
-            w: 1,
-            h: 1,
-        };
+        l.rect = Rect::new(10, 10, 1, 1);
     }
 
     let projected = project_window(&scene, win, |_| Some(null_texture(64, 64)));
@@ -516,12 +405,7 @@ fn binder_is_skipped_but_children_render() {
         let l = scene.layer_mut(child).unwrap();
         l.visible = true;
         l.fill_color = Some([1, 2, 3, 255]);
-        l.rect = Rect {
-            x: 0,
-            y: 0,
-            w: 8,
-            h: 8,
-        };
+        l.rect = Rect::new(0, 0, 8, 8);
     }
 
     let projected = project_window(&scene, win, |_| None);
@@ -573,12 +457,7 @@ fn project_scene_shares_z_across_windows() {
         let layer = scene.add_layer(window, None);
         let l = scene.layer_mut(layer).unwrap();
         l.fill_color = Some([1, 2, 3, 255]);
-        l.rect = Rect {
-            x,
-            y: 0,
-            w: 16,
-            h: 16,
-        };
+        l.rect = Rect::new(x, 0, 16, 16);
     }
 
     let projected = project_scene(&scene, |_| None);
@@ -616,12 +495,7 @@ fn invisible_parent_hides_its_subtree() {
     {
         let l = scene.layer_mut(grandparent).unwrap();
         l.fill_color = Some([1, 2, 3, 255]);
-        l.rect = Rect {
-            x: 1,
-            y: 1,
-            w: 4,
-            h: 4,
-        };
+        l.rect = Rect::new(1, 1, 4, 4);
     }
     let invisible = scene.add_layer(win, Some(grandparent));
     scene.layer_mut(invisible).unwrap().visible = false;
@@ -630,12 +504,7 @@ fn invisible_parent_hides_its_subtree() {
         let l = scene.layer_mut(child).unwrap();
         l.visible = true;
         l.fill_color = Some([4, 5, 6, 255]);
-        l.rect = Rect {
-            x: 2,
-            y: 2,
-            w: 3,
-            h: 3,
-        };
+        l.rect = Rect::new(2, 2, 3, 3);
     }
 
     let projected = project_window(&scene, win, |_| None);

@@ -98,13 +98,13 @@ pub const LT_PS_EXCLUSION: i64 = 28;
 /// The old Bevy camera cleared to opaque black
 /// (`ClearColorConfig::Custom(Color::srgb(0.0, 0.0, 0.0))`), so the
 /// projection preserves that.
-pub const BACKGROUND_CLEAR: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
+pub(crate) const BACKGROUND_CLEAR: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
 
 /// Clamp an opacity to `[0, 1]`, mapping NaN to `0`.
 ///
 /// Ported from the old `sync::clamp_opacity` so window and layer opacities
 /// compose identically.
-pub fn clamp_opacity(opacity: f32) -> f32 {
+pub(crate) fn clamp_opacity(opacity: f32) -> f32 {
     if opacity.is_nan() {
         0.0
     } else {
@@ -164,6 +164,7 @@ pub fn resolve_blend(blend_type: i64, composed_alpha: f32) -> Option<BlendMode> 
 /// A layer after its ancestors' position, opacity and visibility have been
 /// composed.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub struct ComposedLayer {
     /// Absolute rectangle in window coordinates: the x/y origins accumulate
     /// through the ancestor chain while the size is the layer's own.
@@ -236,7 +237,7 @@ pub fn compose_layer(scene: &Scene, layer_id: u32) -> Option<ComposedLayer> {
 ///
 /// Ported from the old `sync::visible_image_region`.
 #[allow(clippy::too_many_arguments)]
-pub fn visible_image_region(
+pub(crate) fn visible_image_region(
     layer_rect: Rect,
     image_left: i32,
     image_top: i32,

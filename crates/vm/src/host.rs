@@ -5,6 +5,8 @@ use std::ffi::{CStr, c_char, c_int, c_void};
 use std::ptr;
 
 use compat::{CompatHost, EventAdapter, FrameBody, PluginRegistry, run_frame_body};
+use engine::input::InputState;
+use engine::timer::TimerState;
 use platform::PlatformEvent;
 use tjs::{LOG_DEBUG, LOG_ERROR, LOG_INFO, LOG_WARN, Tjs2Engine, TjsValue};
 
@@ -28,6 +30,8 @@ pub struct FrameCtx<'a> {
 /// and the L3 [`CompatHost`] that holds the native surface state.
 pub struct VmHost {
     engine: Box<Tjs2Engine>,
+    input: Box<InputState>,
+    timer: Box<TimerState>,
     compat: CompatHost,
     adapter: EventAdapter,
 }
@@ -63,10 +67,27 @@ impl VmHost {
         let engine = Box::new(Tjs2Engine::new().map_err(|err| VmError::Vm(err.to_string()))?);
         // SAFETY: the user pointer is null; the callback reads only `msg`.
         unsafe { engine.set_log_cb(Some(vm_log), ptr::null_mut()) };
+        // The L2 services the natives compose are boxed so their addresses stay
+        // stable for the binding, and they are declared after the engine / before
+        // the compat host so the L3 binding never outlives them.
+        let mut input = Box::new(InputState::new());
+        let mut timer = Box::new(TimerState::new());
         let mut compat = CompatHost::with_registry(registry);
         compat.install(&engine)?;
+        // SAFETY: `input`/`timer` live for the whole `VmHost` and no reference to
+        // them escapes past its drop; the binding is removed first.
+        unsafe {
+            compat
+                .services_mut()
+                .attach_input(input.as_mut() as *mut InputState);
+            compat
+                .services_mut()
+                .attach_timer(timer.as_mut() as *mut TimerState);
+        }
         Ok(Self {
             engine,
+            input,
+            timer,
             compat,
             adapter: EventAdapter::new(),
         })
@@ -85,6 +106,26 @@ impl VmHost {
     /// The L3 compatibility host, mutably.
     pub fn compat_mut(&mut self) -> &mut CompatHost {
         &mut self.compat
+    }
+
+    /// The L2 input state the input natives read.
+    pub fn input(&self) -> &InputState {
+        &self.input
+    }
+
+    /// The L2 input state, mutably (the host may drive it directly).
+    pub fn input_mut(&mut self) -> &mut InputState {
+        &mut self.input
+    }
+
+    /// The L2 timer registry the `Timer` native composes.
+    pub fn timer(&self) -> &TimerState {
+        &self.timer
+    }
+
+    /// The L2 timer registry, mutably.
+    pub fn timer_mut(&mut self) -> &mut TimerState {
+        &mut self.timer
     }
 
     /// Execute a TJS script.

@@ -50,17 +50,17 @@ fn tone(rate: u32, channels: u16, seconds: f64) -> Arc<SoundSource> {
 
 /// A looping tone whose `.sli` link jumps from `from_sec` back to `to_sec`.
 fn tone_with_loop(rate: u32, seconds: f64, from_sec: f64, to_sec: f64) -> Arc<SoundSource> {
-    let info = SliInfo {
-        links: vec![LoopLink {
-            from: (from_sec * f64::from(rate)) as u64,
-            to: (to_sec * f64::from(rate)) as u64,
-            smooth: false,
-            condition: LoopCondition::None,
-            ref_value: 0,
-            cond_var: 0,
-        }],
-        labels: Vec::new(),
-    };
+    let info = SliInfo::new(
+        vec![LoopLink::new(
+            (from_sec * f64::from(rate)) as u64,
+            (to_sec * f64::from(rate)) as u64,
+            false,
+            LoopCondition::None,
+            0,
+            0,
+        )],
+        Vec::new(),
+    );
     tone_with_sli(rate, 1, seconds, Some(info))
 }
 
@@ -286,27 +286,13 @@ fn sli_loop_point_wraps_into_the_loop_region() {
 fn conditional_sli_link_uses_channel_flags() {
     // A conditional link (flag 0 == 1) to 0.8s listed first, and an
     // unconditional fallback to 0.5s.
-    let info = SliInfo {
-        links: vec![
-            LoopLink {
-                from: 44100,
-                to: 35280,
-                smooth: false,
-                condition: LoopCondition::Equal,
-                ref_value: 1,
-                cond_var: 0,
-            },
-            LoopLink {
-                from: 44100,
-                to: 22050,
-                smooth: false,
-                condition: LoopCondition::None,
-                ref_value: 0,
-                cond_var: 0,
-            },
+    let info = SliInfo::new(
+        vec![
+            LoopLink::new(44100, 35280, false, LoopCondition::Equal, 1, 0),
+            LoopLink::new(44100, 22050, false, LoopCondition::None, 0, 0),
         ],
-        labels: Vec::new(),
-    };
+        Vec::new(),
+    );
     let track = tone_with_sli(44100, 1, 2.0, Some(info));
     let mut mixer = Mixer::new();
     let id = mixer.spawn_channel();
@@ -601,13 +587,10 @@ fn buffer_poll_reports_status_change() {
 
 #[test]
 fn buffer_poll_fires_sli_labels_once_per_pass() {
-    let sli = SliInfo {
-        links: Vec::new(),
-        labels: vec![WaveLabel {
-            position: 22_050, // 0.5s at 44.1 kHz
-            name: "chorus".to_string(),
-        }],
-    };
+    let sli = SliInfo::new(
+        Vec::new(),
+        vec![WaveLabel::new(22_050, "chorus".to_string())], // 0.5s at 44.1 kHz
+    );
     let mut buffer = SoundBuffer::new();
     let mut mixer = Mixer::new();
     let id = mixer.spawn_channel();

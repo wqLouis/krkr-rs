@@ -389,6 +389,7 @@ dependencies = [
 name = "compat"
 version = "1.0.0"
 dependencies = [
+ "api",
  "encoding_rs",
  "engine",
  "flate2",
@@ -1140,6 +1141,7 @@ dependencies = [
  "api",
  "ffmpeg-next",
  "image",
+ "ndk",
  "symphonia",
  "symphonia-adapter-libopus",
 ]
@@ -1655,6 +1657,7 @@ dependencies = [
  "api",
  "cpal",
  "log",
+ "ndk",
  "raw-window-handle",
  "thiserror 2.0.20",
  "winit",
@@ -2489,6 +2492,7 @@ name = "vm"
 version = "1.0.0"
 dependencies = [
  "compat",
+ "engine",
  "log",
  "platform",
  "thiserror 2.0.20",

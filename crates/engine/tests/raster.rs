@@ -9,16 +9,7 @@ use std::f64::consts::TAU;
 use engine::{BitmapState, fill_polygon, flatten_arc, flatten_cubic, stroke_polyline};
 
 fn bitmap(width: u32, height: u32) -> BitmapState {
-    BitmapState {
-        id: 0,
-        width,
-        height,
-        rgba: vec![0u8; (width * height * 4) as usize],
-        name: None,
-        dirty: false,
-        screen_buffer: false,
-        script_owned: false,
-    }
+    BitmapState::new(width, height, vec![0u8; (width * height * 4) as usize])
 }
 
 #[test]

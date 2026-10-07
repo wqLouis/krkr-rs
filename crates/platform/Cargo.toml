@@ -12,9 +12,16 @@ thiserror = { workspace = true }
 log = { workspace = true }
 winit = { workspace = true, optional = true }
 # cpal is the `platform-linux` audio output backend. It is optional so the
-# Android stub (and its tests) never pull in ALSA, and so headless hosts can
-# use the null device instead.
+# Android AAudio backend (the `ndk` crate) never pulls in ALSA, and so headless
+# hosts can use the null device instead.
 cpal = { version = "0.16", optional = true }
+
+# Android-only: safe NDK AAudio bindings (`AudioStreamBuilder`/`AudioStream`).
+# It selects the `ndk-sys` `audio` feature and links `libaaudio`; it is not in
+# the host dependency graph, so `cargo check` on Linux never needs the Android
+# NDK. On a non-Android host a typed stub keeps the public API identical.
+[target.'cfg(target_os = "android")'.dependencies]
+ndk = { version = "0.9", features = ["audio"] }
 
 [dev-dependencies]
 raw-window-handle = { workspace = true }
@@ -25,7 +32,8 @@ raw-window-handle = { workspace = true }
 # binaries depend on this crate with an explicit feature.
 default = []
 # Exactly one platform feature must be active (D13). `platform-linux` compiles
-# the real winit 0.30 backend and the cpal audio backend; `platform-android` is
-# a stub for now.
+# the real winit 0.30 backend and the cpal audio backend; `platform-android`
+# compiles the real AAudio audio backend (via `ndk`) and window/event-loop
+# stubs on Android, and a typed audio stub elsewhere.
 platform-linux = ["dep:winit", "dep:cpal"]
 platform-android = []

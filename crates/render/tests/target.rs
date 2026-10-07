@@ -152,6 +152,48 @@ fn null_offscreen_textured_quad_reads_back() {
 }
 
 #[test]
+fn null_offscreen_texture_honours_node_tint() {
+    let pipeline = RenderPipeline::null();
+    let (_surface, mut state) =
+        begin_render_state(&pipeline, &common::headless_window()).expect("begin");
+    let target = create_render_target(&pipeline, RenderTargetDesc::new(1, 1)).expect("target");
+
+    let texture = create_texture(&pipeline, render::TextureDesc::new(1, 1)).expect("texture");
+    upload_texture(
+        &pipeline,
+        &mut state,
+        &texture,
+        PixelRegion::new(0, 0, 1, 1),
+        &[200, 100, 50, 255],
+    )
+    .expect("upload");
+
+    let mut scene = RenderScene::with_root_node();
+    let root = scene.root;
+    let child = scene.push(RenderNode {
+        parent: Some(root),
+        content: RenderContent::Texture(texture),
+        dst: RectF::new(0.0, 0.0, 1.0, 1.0),
+        color: [0.5, 1.0, 0.0, 1.0],
+        ..RenderNode::default()
+    });
+    scene.node_mut(root).expect("root").children = vec![child];
+    scene.background = Some([0.0, 0.0, 0.0, 1.0]);
+
+    render_to_target(&pipeline, &mut state, &target, &scene).expect("render");
+    let mut out = [0u8; 4];
+    read_render_target(
+        &pipeline,
+        &state,
+        &target,
+        PixelRegion::new(0, 0, 1, 1),
+        &mut out,
+    )
+    .expect("read");
+    assert_eq!(out, [100, 100, 0, 255]);
+}
+
+#[test]
 fn source_over_honours_source_alpha() {
     let out = composite_one_pixel(
         BlendMode::SourceOver,

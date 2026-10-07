@@ -1722,7 +1722,14 @@ pub fn gaussian_blur(bitmap: &mut BitmapState, rect: RectI, radius: i32, sigma: 
 /// (`LayerIntf.h:76`). The Photoshop-specific modes without a C fallback in
 /// the reference reduce to source-over (the assembly pipeline is absent);
 /// `omPsHardLight` is implemented because the SDK `doBlurLight` uses it.
-pub fn blend_pixel_mode(dst: &mut BitmapState, x: i32, y: i32, src: [u8; 4], opa: u8, mode: i64) {
+pub(crate) fn blend_pixel_mode(
+    dst: &mut BitmapState,
+    x: i32,
+    y: i32,
+    src: [u8; 4],
+    opa: u8,
+    mode: i64,
+) {
     match mode {
         // omOpaque / ltOpaque: copy the source (including alpha).
         1 => write_pixel(dst, x, y, src),

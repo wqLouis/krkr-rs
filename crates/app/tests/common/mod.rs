@@ -20,12 +20,7 @@ pub fn build_solid_and_bitmap_scene(scene: &mut Scene) -> u32 {
     let background = scene.add_layer(window, None);
     if let Some(layer) = scene.layer_mut(background) {
         layer.visible = true;
-        layer.rect = Rect {
-            x: 0,
-            y: 0,
-            w: 320,
-            h: 240,
-        };
+        layer.rect = Rect::new(0, 0, 320, 240);
         layer.fill_color = Some([24, 28, 40, 255]);
         layer.blend_type = LT_OPAQUE;
     }
@@ -35,12 +30,7 @@ pub fn build_solid_and_bitmap_scene(scene: &mut Scene) -> u32 {
     let sprite = scene.add_layer(window, None);
     if let Some(layer) = scene.layer_mut(sprite) {
         layer.visible = true;
-        layer.rect = Rect {
-            x: 8,
-            y: 8,
-            w: 2,
-            h: 2,
-        };
+        layer.rect = Rect::new(8, 8, 2, 2);
         layer.bitmap = Some(bitmap);
         layer.blend_type = LT_ALPHA;
     }

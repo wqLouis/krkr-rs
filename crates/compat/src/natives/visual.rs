@@ -6,8 +6,11 @@
 //! [`engine::Scene`] attached through [`CompatServices::scene`] and keeps no
 //! engine state of its own. The old code hid that state in process globals;
 //! here the per-family **dispatch** state (the id → script-object registries
-//! and the Timer registry) lives in [`CompatServices::state`] (doc 08 §3.1),
-//! and the per-object state lives in the native instance payload.
+//! and the `Timer` callback bindings) lives in [`CompatServices::state`]
+//! (doc 08 §3.1); the generic input state and the timer schedule are L2 state
+//! ([`engine::input::InputState`], [`engine::timer::TimerState`]) attached to
+//! the services, and the per-object state lives in the native instance
+//! payload.
 //!
 //! # Architecture
 //!
@@ -29,12 +32,13 @@
 //!   `remove`, `setSize`, `setInnerSize`, `setPos`, `setMinSize`,
 //!   `setMaxSize`, `setZoom`, `showModal`, `setMaskRegion`,
 //!   `removeMaskRegion`, `hideMouseCursor`, `changeScreenMode`,
-//!   `postInputEvent`; properties `id`, `visible`, `caption`, `width`,
+//!   `postInputEvent`, `getTouchPoint`, `getTouchVelocity`; properties `id`,
+//!   `visible`, `caption`, `width`,
 //!   `height`, `innerWidth`, `innerHeight`, `minWidth`, `minHeight`,
 //!   `maxWidth`, `maxHeight`, `left`, `top`, `focusable`, `zoomNumer`,
 //!   `zoomDenom`, `fullScreen`, `mainWindow`, `focusedLayer`, `primaryLayer`,
-//!   `waitVSync`, `enableTouch`, `hintDelay`, `mouseCursorState`, `imeMode`,
-//!   `useMouseKey`, `trapKey`.
+//!   `touchPointCount`, `waitVSync`, `enableTouch`, `hintDelay`,
+//!   `mouseCursorState`, `imeMode`, `useMouseKey`, `trapKey`.
 //! * `Layer`: constructor, `setPos`, `setSize`, `setSizeToImageSize`,
 //!   `setImagePos`, `setImageSize`, `setBitmap`, `setImage`, `assignImages`,
 //!   `copyFromBitmapToMainImage`, `independMainImage`, `bringToFront`,
@@ -42,8 +46,8 @@
 //!   `getProvincePixel`, `setProvincePixel`, `fillRect`; the full property
 //!   set used by KAG (`visible`, `opacity`, `width`, `height`, `left`, `top`,
 //!   `type`, `hasImage`, the buffer/pitch properties, `absolute`/`order`,
-//!   hit/attention/clip/focus properties, `window`, `parent`, `children`,
-//!   `font`, ...).
+//!   `cursorX`/`cursorY`, hit/attention/clip/focus properties, `window`,
+//!   `parent`, `children`, `font`, ...).
 //! * `Bitmap`: constructor, `getPixel`, `setPixel`, `getMaskPixel`,
 //!   `setMaskPixel`, `independ`, `setSize`, `copyFrom`; properties `id`,
 //!   `nativeId`, `width`, `height`, `buffer`, `bufferForWrite`, `bufferPitch`,
@@ -77,23 +81,28 @@
 //! * `Window`/`Layer` input handlers (`onClick`, `onKeyDown`, ...) are not
 //!   registered: the L1→L3 event adapter (`compat::EventAdapter`) is not yet
 //!   wired to the scene, so there is nothing truthful to dispatch.
-//! * `Window.getMouseVelocity`/`getTouchVelocity`/`getTouchPoint`/
-//!   `touchPointCount` and `Layer.cursorX`/`cursorY` — need the L1 pointer
-//!   state, which is not part of the L2 service set.
+//! * `Window.getMouseVelocity` — needs the L1 pointer velocity tracker, which
+//!   is not part of the L2 service set (touch velocity *is* wired through
+//!   `Window.getTouchVelocity`).
 //!
 //! # Timer polling
 //!
 //! [`timer_poll`] is the `timer_poll` step of the documented frame body
 //! (`compat::frame::FrameBody`); the host calls it once per frame. It is a
 //! `pub` free function (like `system::continuous_handler_poll`) so the host
-//! can wire it without the natives exposing anything else.
+//! can wire it without the natives exposing anything else. It asks the L2
+//! [`engine::timer::TimerState`] registry for the due timers (the L1
+//! [`platform::Clock`] supplies `now_ms`) and dispatches `onTimer`; the
+//! dispatch itself stays in L3.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
-use std::time::Instant;
 
+use engine::input::InputState;
+use engine::timer::{TimerConfig, TimerId};
 use engine::{FontState, LayerState, Rect, Scene};
+use platform::Clock;
 use tjs::{
     DetachedValue, NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef,
     RetainedValue, Tjs2Engine, TjsValue, VAL_INTEGER, VAL_OBJECT, VAL_REAL, VAL_RETAINED, VAL_VOID,
@@ -128,8 +137,10 @@ struct ObjectRegistry {
     fonts: HashMap<u32, DetachedValue>,
 }
 
-/// One registered `Timer` (reference `tTJSNI_BaseTimer`).
-struct TimerEntry {
+/// One registered `Timer`'s L3 payload: the retained callback/owner and the
+/// TVP dispatch mode. The scheduling state (interval, enabled, fire count)
+/// lives in the L2 [`TimerState`] registry.
+struct TimerBinding {
     /// The constructor callback (a plain `Timer`'s `onTimer` invokes it).
     /// `None` while the callback is running (taken out so the state borrow is
     /// released before re-entering the VM).
@@ -137,17 +148,8 @@ struct TimerEntry {
     /// The timer object itself, for `onTimer` dispatch through its class
     /// chain (a script subclass override wins).
     owner: Option<DetachedValue>,
-    /// Interval in milliseconds (`0` is clamped to `1`).
-    interval_ms: u64,
-    /// Whether the timer fires.
-    enabled: bool,
-    /// Monotonic-clock time of the next fire.
-    next_fire_ms: u64,
-    /// How many times the timer has fired.
-    count: u64,
-    /// Reference `Capacity` (stored; one callback is delivered per interval).
-    capacity: i64,
-    /// Event delivery mode (`tTVPAsyncTriggerMode`).
+    /// Event delivery mode (`tTVPAsyncTriggerMode`), TVP-specific and
+    /// distinct from the L2 one-shot/repeat firing mode.
     mode: i64,
 }
 
@@ -156,13 +158,11 @@ struct TimerEntry {
 #[derive(Default)]
 struct VisualState {
     objects: ObjectRegistry,
-    timers: HashMap<u32, TimerEntry>,
-    next_timer: u32,
-    /// Monotonic epoch for [`Self::now_ms`].
-    epoch: Option<Instant>,
-    /// The most recent clock value seen by [`timer_poll`]; an enable/interval
-    /// change reschedules from here (the reference uses `TVPGetTickCount()`).
-    last_now_ms: u64,
+    /// L3 payload per L2 timer id.
+    timers: HashMap<TimerId, TimerBinding>,
+    /// The L1 monotonic clock that supplies `now_ms` to the L2 timer
+    /// registry.
+    clock: Clock,
     /// `Window.bringToFront` requests for the host to drain.
     bring_to_front: Vec<u32>,
     /// `Window.update` requests `(window_id, update_type)`.
@@ -173,15 +173,6 @@ struct VisualState {
     /// setters need their own so a re-entrant visual callback cannot clobber
     /// a System result mid-marshal.)
     scratch: RefCell<Vec<u8>>,
-}
-
-impl VisualState {
-    /// Milliseconds since the first call (the visual family's monotonic
-    /// clock, shared by [`timer_poll`]).
-    fn now_ms(&mut self) -> u64 {
-        let epoch = self.epoch.get_or_insert_with(Instant::now);
-        epoch.elapsed().as_millis() as u64
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -266,10 +257,10 @@ struct FontInst {
     owns_state: bool,
 }
 
-/// `Timer` payload: the timer registry id.
+/// `Timer` payload: the L2 timer registry id.
 #[derive(Default)]
 struct TimerInst {
-    id: Option<u32>,
+    id: Option<TimerId>,
 }
 
 // ---------------------------------------------------------------------------
@@ -306,6 +297,52 @@ fn scene_ref<'a>(ctx: &CompatCtx) -> Result<&'a Scene, String> {
         .ok_or_else(|| "visual: no scene attached".to_string())?;
     // SAFETY: see [`scene_mut`].
     Ok(unsafe { &*ptr })
+}
+
+/// The attached L2 generic input state, shared.
+fn input_ref<'a>(ctx: &CompatCtx) -> Result<&'a InputState, String> {
+    // SAFETY: the host keeps the attached input state alive for the binding's
+    // lifetime and the VM is single-threaded (the documented `attach_input`
+    // contract), so forming this reference is sound within the callback.
+    let ptr = unsafe { ctx.services() }
+        .input()
+        .ok_or_else(|| "visual: no input state attached".to_string())?;
+    // SAFETY: see above.
+    Ok(unsafe { &*ptr })
+}
+
+/// The window pointer position, preferring an active touch contact.
+///
+/// L2 updates the pointer only from `PointerMoved`; touch events land in the
+/// contact map. To honour the reference's "last pointer/touch position" the
+/// lowest active contact id wins when any contact exists, otherwise the
+/// pointer is used.
+fn pointer_or_touch(input: &InputState) -> (f32, f32) {
+    if input.touch_point_count() > 0 {
+        let mut ids: Vec<u64> = input.touch_contacts().map(|c| c.point.id).collect();
+        ids.sort_unstable();
+        if let Some(id) = ids.first().copied()
+            && let Some(point) = input.touch_point(id)
+        {
+            return point.pos;
+        }
+    }
+    input.pointer()
+}
+
+/// Resolve a `getTouchPoint`/`getTouchVelocity` argument that may be a
+/// contact id or a 0-based index into the contacts sorted by id.
+fn resolve_touch_id(input: &InputState, arg: i64) -> Option<u64> {
+    if arg < 0 {
+        return None;
+    }
+    let value = arg as u64;
+    if input.touch_contact(value).is_some() {
+        return Some(value);
+    }
+    let mut ids: Vec<u64> = input.touch_contacts().map(|c| c.point.id).collect();
+    ids.sort_unstable();
+    ids.get(value as usize).copied()
 }
 
 /// Write a retained script object into `out` (the C++ trampoline consumes the
@@ -1613,6 +1650,144 @@ extern "C" fn window_primary_layer_get(
     0
 }
 
+/// `Window.touchPointCount` — the number of active touch contacts.
+extern "C" fn window_touch_point_count_get(
+    engine: *mut c_void,
+    _instance: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let Ok((_resolved, ctx)) = bound(engine) else {
+        return report_error(
+            out_error,
+            "Window.touchPointCount: compat context is not bound",
+        );
+    };
+    let input = match input_ref(&ctx) {
+        Ok(input) => input,
+        Err(error) => return report_error(out_error, &error),
+    };
+    set_int(out, input.touch_point_count() as i64);
+    0
+}
+
+/// `Window.getTouchPoint(id)` — a dictionary `{ startX, startY, x, y, ID }`
+/// for the contact, matching the reference. The argument may be a contact id
+/// or a 0-based index into the contacts sorted by id.
+extern "C" fn window_get_touch_point(
+    engine: *mut c_void,
+    _instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    if argc < 1 {
+        return report_error(out_error, "Window.getTouchPoint requires 1 argument");
+    }
+    let Ok((resolved, ctx)) = bound(engine) else {
+        return report_error(
+            out_error,
+            "Window.getTouchPoint: compat context is not bound",
+        );
+    };
+    let input = match input_ref(&ctx) {
+        Ok(input) => input,
+        Err(error) => return report_error(out_error, &error),
+    };
+    let a = unsafe { args(argv, argc) };
+    let Some(id) = resolve_touch_id(input, value_as_i64(&a[0])) else {
+        return report_error(out_error, "Window.getTouchPoint: no such touch contact");
+    };
+    let Some(contact) = input.touch_contact(id) else {
+        return report_error(out_error, "Window.getTouchPoint: no such touch contact");
+    };
+    let host = resolved.engine();
+    let dict = match host.eval_retained("%[]", "Window.getTouchPoint") {
+        Ok(RetainedValue::Object(object)) => object,
+        Ok(RetainedValue::Value(_)) | Err(_) => {
+            return report_error(
+                out_error,
+                "Window.getTouchPoint: cannot build the result object",
+            );
+        }
+    };
+    let entries: [(&str, TjsValue); 5] = [
+        ("startX", TjsValue::Real(f64::from(contact.start_pos.0))),
+        ("startY", TjsValue::Real(f64::from(contact.start_pos.1))),
+        ("x", TjsValue::Real(f64::from(contact.point.pos.0))),
+        ("y", TjsValue::Real(f64::from(contact.point.pos.1))),
+        ("ID", TjsValue::Integer(contact.point.id as i64)),
+    ];
+    for (key, value) in entries {
+        if let Err(error) = host.set_member(dict.raw_id(), key, &value) {
+            return report_error(out_error, &format!("Window.getTouchPoint: {error}"));
+        }
+    }
+    set_retained_out(host, out, dict.raw_id());
+    std::mem::forget(dict);
+    0
+}
+
+/// `Window.getTouchVelocity(id)` — a dictionary `{ x, y, speed }` for the
+/// contact, or TJS `null` when it is not active. The argument may be a
+/// contact id or a 0-based index into the contacts sorted by id.
+extern "C" fn window_get_touch_velocity(
+    engine: *mut c_void,
+    _instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    if argc < 1 {
+        return report_error(out_error, "Window.getTouchVelocity requires 1 argument");
+    }
+    let Ok((resolved, ctx)) = bound(engine) else {
+        return report_error(
+            out_error,
+            "Window.getTouchVelocity: compat context is not bound",
+        );
+    };
+    let input = match input_ref(&ctx) {
+        Ok(input) => input,
+        Err(error) => return report_error(out_error, &error),
+    };
+    let a = unsafe { args(argv, argc) };
+    let Some(id) = resolve_touch_id(input, value_as_i64(&a[0])) else {
+        set_null_out(resolved.engine(), out);
+        return 0;
+    };
+    let (vx, vy) = input.touch_velocity(id).unwrap_or((0.0, 0.0));
+    let speed = input.touch_speed(id).unwrap_or(0.0);
+    let host = resolved.engine();
+    let dict = match host.eval_retained("%[]", "Window.getTouchVelocity") {
+        Ok(RetainedValue::Object(object)) => object,
+        Ok(RetainedValue::Value(_)) | Err(_) => {
+            return report_error(
+                out_error,
+                "Window.getTouchVelocity: cannot build the result object",
+            );
+        }
+    };
+    let entries: [(&str, TjsValue); 3] = [
+        ("x", TjsValue::Real(f64::from(vx))),
+        ("y", TjsValue::Real(f64::from(vy))),
+        ("speed", TjsValue::Real(f64::from(speed))),
+    ];
+    for (key, value) in entries {
+        if let Err(error) = host.set_member(dict.raw_id(), key, &value) {
+            return report_error(out_error, &format!("Window.getTouchVelocity: {error}"));
+        }
+    }
+    set_retained_out(host, out, dict.raw_id());
+    std::mem::forget(dict);
+    0
+}
+
 // ---------------------------------------------------------------------------
 // Layer
 // ---------------------------------------------------------------------------
@@ -2257,7 +2432,7 @@ extern "C" fn layer_set_clip(
         Err(error) => return report_error(out_error, &error),
     };
     if let Some(layer) = scene.layer_mut(id) {
-        layer.clip = Some(Rect { x, y, w, h });
+        layer.clip = Some(Rect::new(x, y, w, h));
     }
     set_void(out);
     0
@@ -2733,6 +2908,73 @@ layer_int_prop!(
         rect.h = value_as_i64(v).max(0) as u32;
     }
 );
+
+/// The window pointer position in `layer_id`'s coordinate space: subtract
+/// each layer's rect offset while walking up the parent chain, matching the
+/// reference `GetCursorX`/`GetCursorY`.
+fn layer_cursor_axis(
+    engine: *mut c_void,
+    instance: *mut c_void,
+    axis: &str,
+    x_axis: bool,
+) -> Result<i32, String> {
+    let inst = unsafe { &*(instance as *const LayerInst) };
+    let id = inst
+        .id
+        .ok_or_else(|| format!("Layer.{axis}: this layer is not constructed"))?;
+    let (_resolved, ctx) = bound(engine)?;
+    let scene = scene_ref(&ctx)?;
+    let input = input_ref(&ctx).map_err(|error| format!("Layer.{axis}: {error}"))?;
+    let (px, py) = pointer_or_touch(input);
+    let mut value = if x_axis { px } else { py };
+    let mut current = scene.layer(id);
+    while let Some(layer) = current {
+        if layer.parent.is_none() {
+            break;
+        }
+        value -= if x_axis {
+            layer.rect.x as f32
+        } else {
+            layer.rect.y as f32
+        };
+        current = layer.parent.and_then(|parent| scene.layer(parent));
+    }
+    Ok(value.round() as i32)
+}
+
+/// `Layer.cursorX` — the window pointer X in the layer's coordinate space.
+extern "C" fn layer_cursor_x_get(
+    engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    match layer_cursor_axis(engine, instance, "cursorX", true) {
+        Ok(value) => {
+            set_int(out, i64::from(value));
+            0
+        }
+        Err(error) => report_error(out_error, &error),
+    }
+}
+
+/// `Layer.cursorY` — the window pointer Y in the layer's coordinate space.
+extern "C" fn layer_cursor_y_get(
+    engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    match layer_cursor_axis(engine, instance, "cursorY", false) {
+        Ok(value) => {
+            set_int(out, i64::from(value));
+            0
+        }
+        Err(error) => report_error(out_error, &error),
+    }
+}
 
 /// `layer.opacity` (0..255 scale, reference `GetOpacity`/`SetOpacity`).
 extern "C" fn layer_opacity_get(
@@ -3416,10 +3658,8 @@ extern "C" fn layer_font_set(
         }
     };
     if let Some(font) = scene.fonts.iter_mut().find(|font| font.id == destination) {
-        *font = FontState {
-            id: destination,
-            ..source
-        };
+        *font = source;
+        font.id = destination;
     }
     0
 }
@@ -4288,7 +4528,7 @@ extern "C" fn font_face_set(
 }
 
 // ---------------------------------------------------------------------------
-// Timer
+// Timer (L3 adapter over the L2 `engine::timer::TimerState` registry)
 // ---------------------------------------------------------------------------
 
 extern "C" fn timer_create(_engine: *mut c_void) -> *mut c_void {
@@ -4301,20 +4541,22 @@ extern "C" fn timer_destroy(engine: *mut c_void, instance: *mut c_void) {
     }
     let inst = unsafe { &*(instance as *const TimerInst) };
     if let (Some(id), Ok((_resolved, ctx))) = (inst.id, bound(engine)) {
-        // SAFETY: the caller resolved `ctx` from the installed binding. The
-        // dropped `TimerEntry` releases the callback and owner.
-        unsafe { ctx.services() }
-            .state::<VisualState>()
-            .timers
-            .remove(&id);
+        // SAFETY: the caller resolved `ctx` from the installed binding.
+        let services = unsafe { ctx.services() };
+        if let Some(timer) = services.timer() {
+            // SAFETY: `attach_timer` guarantees the pointer stays valid.
+            let _ = unsafe { &mut *timer }.remove(id);
+        }
+        // The dropped `TimerBinding` releases the callback and owner.
+        services.state::<VisualState>().timers.remove(&id);
     }
     // SAFETY: instance came from `timer_create`'s `Box::into_raw` and is
     // freed exactly once by the VM.
     drop(unsafe { Box::from_raw(instance as *mut TimerInst) });
 }
 
-/// `Timer(callback[, actionName])` — retain the callback and the timer
-/// object. The action name is accepted and ignored.
+/// `Timer(callback[, actionName])` — retain the callback and register the L2
+/// timer. The action name is accepted and ignored.
 extern "C" fn timer_ctor(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -4341,25 +4583,25 @@ extern "C" fn timer_ctor(
         return report_error(out_error, "Timer: already constructed");
     }
     // SAFETY: the caller resolved `ctx` from the installed binding.
-    let mut state = unsafe { ctx.services() }.state::<VisualState>();
-    let id = state.next_timer;
-    state.next_timer += 1;
-    state.timers.insert(
+    let services = unsafe { ctx.services() };
+    let Some(timer_ptr) = services.timer() else {
+        return report_error(out_error, "Timer: timer registry is not attached");
+    };
+    // SAFETY: `attach_timer` guarantees the pointer stays valid.
+    let id = match unsafe { &mut *timer_ptr }.create(TimerConfig::default()) {
+        Ok(id) => id,
+        Err(error) => return report_error(out_error, &format!("Timer: {error}")),
+    };
+    services.state::<VisualState>().timers.insert(
         id,
-        TimerEntry {
+        TimerBinding {
             callback: Some(callback),
             owner,
-            interval_ms: 1000,
-            enabled: false,
-            next_fire_ms: 0,
-            count: 0,
-            capacity: 1,
             mode: 0,
         },
     );
-    drop(state);
     inst.id = Some(id);
-    set_int(out, i64::from(id));
+    set_int(out, id.value() as i64);
     0
 }
 
@@ -4406,14 +4648,13 @@ extern "C" fn timer_on_timer(
         }
     }
     if let Err(error) = result {
-        log::warn!("Timer {id}: callback failed ({error}); disabling");
+        log::warn!("Timer {id:?}: callback failed ({error}); disabling");
         // SAFETY: the caller resolved `ctx` from the installed binding.
-        if let Some(timer) = unsafe { ctx.services() }
-            .state::<VisualState>()
-            .timers
-            .get_mut(&id)
-        {
-            timer.enabled = false;
+        let services = unsafe { ctx.services() };
+        if let Some(timer) = services.timer() {
+            let now = services.state::<VisualState>().clock.now_ms();
+            // SAFETY: `attach_timer` guarantees the pointer stays valid.
+            let _ = unsafe { &mut *timer }.set_enabled(id, false, now);
         }
     }
     set_void(out);
@@ -4437,9 +4678,10 @@ extern "C" fn timer_interval_get(
         return 0;
     };
     // SAFETY: the caller resolved `ctx` from the installed binding.
-    let state = unsafe { ctx.services() }.state::<VisualState>();
-    let interval = state.timers.get(&id).map_or(0, |timer| timer.interval_ms);
-    drop(state);
+    let interval = unsafe { ctx.services() }
+        .timer()
+        .and_then(|timer| unsafe { &*timer }.interval_ms(id))
+        .unwrap_or(0);
     set_int(out, interval as i64);
     0
 }
@@ -4460,13 +4702,11 @@ extern "C" fn timer_interval_set(
         return 0;
     };
     // SAFETY: the caller resolved `ctx` from the installed binding.
-    let mut state = unsafe { ctx.services() }.state::<VisualState>();
-    let last = state.last_now_ms;
-    if let Some(timer) = state.timers.get_mut(&id) {
-        timer.interval_ms = interval;
-        if timer.enabled {
-            timer.next_fire_ms = last.saturating_add(interval);
-        }
+    let services = unsafe { ctx.services() };
+    let now = services.state::<VisualState>().clock.now_ms();
+    if let Some(timer) = services.timer() {
+        // SAFETY: `attach_timer` guarantees the pointer stays valid.
+        let _ = unsafe { &mut *timer }.set_interval(id, interval, now);
     }
     0
 }
@@ -4488,9 +4728,10 @@ extern "C" fn timer_enabled_get(
         return 0;
     };
     // SAFETY: the caller resolved `ctx` from the installed binding.
-    let state = unsafe { ctx.services() }.state::<VisualState>();
-    let enabled = state.timers.get(&id).is_some_and(|timer| timer.enabled);
-    drop(state);
+    let enabled = unsafe { ctx.services() }
+        .timer()
+        .and_then(|timer| unsafe { &*timer }.is_enabled(id))
+        .unwrap_or(false);
     set_bool(out, enabled);
     0
 }
@@ -4511,14 +4752,11 @@ extern "C" fn timer_enabled_set(
         return 0;
     };
     // SAFETY: the caller resolved `ctx` from the installed binding.
-    let mut state = unsafe { ctx.services() }.state::<VisualState>();
-    let last = state.last_now_ms;
-    if let Some(timer) = state.timers.get_mut(&id) {
-        timer.enabled = enabled;
-        if enabled {
-            // The reference reschedules on enable: fire at now + interval.
-            timer.next_fire_ms = last.saturating_add(timer.interval_ms);
-        }
+    let services = unsafe { ctx.services() };
+    let now = services.state::<VisualState>().clock.now_ms();
+    if let Some(timer) = services.timer() {
+        // SAFETY: `attach_timer` guarantees the pointer stays valid.
+        let _ = unsafe { &mut *timer }.set_enabled(id, enabled, now);
     }
     0
 }
@@ -4540,10 +4778,11 @@ extern "C" fn timer_capacity_get(
         return 0;
     };
     // SAFETY: the caller resolved `ctx` from the installed binding.
-    let state = unsafe { ctx.services() }.state::<VisualState>();
-    let capacity = state.timers.get(&id).map_or(1, |timer| timer.capacity);
-    drop(state);
-    set_int(out, capacity);
+    let capacity = unsafe { ctx.services() }
+        .timer()
+        .and_then(|timer| unsafe { &*timer }.capacity(id))
+        .unwrap_or(1);
+    set_int(out, i64::from(capacity));
     0
 }
 
@@ -4557,18 +4796,15 @@ extern "C" fn timer_capacity_set(
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Timer.capacity: compat context is not bound");
     };
-    let capacity = value_as_i64(unsafe { &*value });
+    let capacity = value_as_i64(unsafe { &*value }).clamp(1, i64::from(u32::MAX)) as u32;
     let inst = unsafe { &*(instance as *const TimerInst) };
     let Some(id) = inst.id else {
         return 0;
     };
     // SAFETY: the caller resolved `ctx` from the installed binding.
-    if let Some(timer) = unsafe { ctx.services() }
-        .state::<VisualState>()
-        .timers
-        .get_mut(&id)
-    {
-        timer.capacity = capacity;
+    if let Some(timer) = unsafe { ctx.services() }.timer() {
+        // SAFETY: `attach_timer` guarantees the pointer stays valid.
+        let _ = unsafe { &mut *timer }.set_capacity(id, capacity);
     }
     0
 }
@@ -4590,14 +4826,15 @@ extern "C" fn timer_count_get(
         return 0;
     };
     // SAFETY: the caller resolved `ctx` from the installed binding.
-    let state = unsafe { ctx.services() }.state::<VisualState>();
-    let count = state.timers.get(&id).map_or(0, |timer| timer.count);
-    drop(state);
+    let count = unsafe { ctx.services() }
+        .timer()
+        .and_then(|timer| unsafe { &*timer }.count(id))
+        .unwrap_or(0);
     set_int(out, count as i64);
     0
 }
 
-/// `timer.mode`.
+/// `timer.mode` (the TVP `tTVPAsyncTriggerMode`, kept in L3).
 extern "C" fn timer_mode_get(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -4614,9 +4851,11 @@ extern "C" fn timer_mode_get(
         return 0;
     };
     // SAFETY: the caller resolved `ctx` from the installed binding.
-    let state = unsafe { ctx.services() }.state::<VisualState>();
-    let mode = state.timers.get(&id).map_or(0, |timer| timer.mode);
-    drop(state);
+    let mode = unsafe { ctx.services() }
+        .state::<VisualState>()
+        .timers
+        .get(&id)
+        .map_or(0, |timer| timer.mode);
     set_int(out, mode);
     0
 }
@@ -4654,41 +4893,25 @@ pub fn timer_poll(ctx: &mut CompatCtx) -> Result<bool, CompatError> {
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
     let host = unsafe { ctx.engine() };
     let services = unsafe { ctx.services() };
-    let now = {
-        let mut state = services.state::<VisualState>();
-        state.last_now_ms = state.now_ms();
-        state.last_now_ms
+    let now = services.state::<VisualState>().clock.now_ms();
+    let Some(timer_ptr) = services.timer() else {
+        return Err(CompatError::Engine("timer registry is not attached".into()));
     };
-    // Snapshot the due timer ids, then fire one at a time so a callback that
-    // registers/disables timers is safe.
-    let due: Vec<u32> = {
-        let state = services.state::<VisualState>();
-        state
-            .timers
-            .iter()
-            .filter(|(_, timer)| timer.enabled && timer.next_fire_ms <= now)
-            .map(|(&id, _)| id)
-            .collect()
-    };
-    for id in due {
-        // Reschedule and count under a short borrow.
-        let (owner, interval) = {
-            let mut state = services.state::<VisualState>();
-            match state.timers.get_mut(&id) {
-                Some(timer) if timer.enabled && timer.next_fire_ms <= now => {
-                    timer.next_fire_ms = now.saturating_add(timer.interval_ms);
-                    timer.count += 1;
-                    (
-                        timer.owner.as_ref().map(DetachedValue::raw_id),
-                        timer.interval_ms,
-                    )
-                }
-                _ => continue,
-            }
-        };
+    // Advance the L2 registry; it reports the due timers and their counts.
+    // SAFETY: `attach_timer` guarantees the pointer stays valid.
+    let due = unsafe { &mut *timer_ptr }.advance(now);
+    for fire in due {
+        let id = fire.id;
         // Dispatch the object's `onTimer` member (a script subclass override
         // wins); fall back to the callback when the owner could not be
         // retained.
+        let owner = {
+            let state = services.state::<VisualState>();
+            state
+                .timers
+                .get(&id)
+                .and_then(|timer| timer.owner.as_ref().map(DetachedValue::raw_id))
+        };
         let result = match owner {
             Some(owner) => host.call_member(owner, "onTimer", &[]),
             None => {
@@ -4714,14 +4937,14 @@ pub fn timer_poll(ctx: &mut CompatCtx) -> Result<bool, CompatError> {
             }
         };
         if let Err(error) = result {
-            log::warn!("Timer {id}: onTimer failed ({error}) after {interval} ms; disabling");
-            if let Some(timer) = services.state::<VisualState>().timers.get_mut(&id) {
-                timer.enabled = false;
-            }
+            let interval = unsafe { &*timer_ptr }.interval_ms(id).unwrap_or(0);
+            log::warn!("Timer {id:?}: onTimer failed ({error}) after {interval} ms; disabling");
+            // SAFETY: the pointer is still attached.
+            let _ = unsafe { &mut *timer_ptr }.set_enabled(id, false, now);
         }
     }
-    let state = services.state::<VisualState>();
-    Ok(state.timers.values().any(|timer| timer.enabled))
+    // SAFETY: the pointer is still attached.
+    Ok(unsafe { &*timer_ptr }.any_enabled())
 }
 
 /// Drain the queued `Window.bringToFront` requests (`(window_id)`).
@@ -4828,6 +5051,14 @@ fn register_window_class(ctx: &mut CompatCtx) -> Result<(), CompatError> {
             NativeInstanceMethodDef {
                 name: "postInputEvent",
                 f: window_post_input_event,
+            },
+            NativeInstanceMethodDef {
+                name: "getTouchPoint",
+                f: window_get_touch_point,
+            },
+            NativeInstanceMethodDef {
+                name: "getTouchVelocity",
+                f: window_get_touch_velocity,
             },
         ],
         properties: vec![
@@ -4964,6 +5195,11 @@ fn register_window_class(ctx: &mut CompatCtx) -> Result<(), CompatError> {
             NativeInstancePropertyDef {
                 name: "primaryLayer",
                 get: Some(window_primary_layer_get),
+                set: None,
+            },
+            NativeInstancePropertyDef {
+                name: "touchPointCount",
+                get: Some(window_touch_point_count_get),
                 set: None,
             },
         ],
@@ -5172,6 +5408,16 @@ fn register_layer_class(ctx: &mut CompatCtx) -> Result<(), CompatError> {
                 name: "cursor",
                 get: Some(layer_cursor_get),
                 set: Some(layer_cursor_set),
+            },
+            NativeInstancePropertyDef {
+                name: "cursorX",
+                get: Some(layer_cursor_x_get),
+                set: None,
+            },
+            NativeInstancePropertyDef {
+                name: "cursorY",
+                get: Some(layer_cursor_y_get),
+                set: None,
             },
             NativeInstancePropertyDef {
                 name: "face",
@@ -5576,7 +5822,7 @@ extern "C" fn timer_id_get(
     _objthis: *mut c_void,
 ) -> c_int {
     let inst = unsafe { &*(instance as *const TimerInst) };
-    set_int(out, inst.id.map_or(0, i64::from));
+    set_int(out, inst.id.map_or(0, |id| id.value() as i64));
     0
 }
 
@@ -5589,34 +5835,42 @@ mod tests {
     use super::timer_poll;
     use crate::CompatHost;
     use engine::Scene;
+    use engine::timer::TimerState;
     use tjs::{Tjs2Engine, TjsValue};
 
-    /// A bound VM + host + attached scene.
+    /// A bound VM + host + attached scene and timer registry.
     ///
     /// Fields drop in declaration order: the host first (releasing every
-    /// retained script object), then the engine, then the scene.
+    /// retained script object), then the engine, the scene and the L2 timer
+    /// registry.
     struct Env {
         host: CompatHost,
         engine: Box<Tjs2Engine>,
         /// Kept alive for the host's raw pointer; never read directly.
         _scene: Box<Scene>,
+        /// Kept alive for the host's raw pointer; never read directly.
+        _timer: Box<TimerState>,
     }
 
     impl Env {
         fn new() -> Env {
             let engine = Box::new(Tjs2Engine::new().expect("create engine"));
             let mut scene = Box::new(Scene::default());
+            let mut timer = Box::new(TimerState::new());
             let mut host = CompatHost::new();
-            // SAFETY: the boxed scene outlives the host.
+            // SAFETY: the boxed scene and timer registry outlive the host.
             unsafe {
                 host.services_mut()
                     .attach_scene(scene.as_mut() as *mut Scene);
+                host.services_mut()
+                    .attach_timer(timer.as_mut() as *mut TimerState);
             }
             host.install(&engine).expect("install compat surface");
             Env {
                 host,
                 engine,
                 _scene: scene,
+                _timer: timer,
             }
         }
 

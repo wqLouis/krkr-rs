@@ -119,6 +119,12 @@ pub struct RenderNode {
     pub src: PixelRegion,
     /// Node opacity in `[0, 1]`.
     pub opacity: f32,
+    /// Per-node straight-alpha tint `[r, g, b, a]` applied to textured quads.
+    ///
+    /// The default `[1, 1, 1, 1]` leaves the sampled texture unchanged. L2
+    /// sets this to the text colour for glyph nodes so the glyph atlas can
+    /// cache colour-independent coverage and recolour without re-rasterising.
+    pub color: [f32; 4],
     /// Whether the node and its subtree are drawn.
     pub visible: bool,
     /// Sort key among siblings; lower values draw first.
@@ -141,6 +147,7 @@ impl Default for RenderNode {
             dst: RectF::ZERO,
             src: PixelRegion::ZERO,
             opacity: 1.0,
+            color: [1.0, 1.0, 1.0, 1.0],
             visible: true,
             z: 0,
             blend: BlendMode::default(),

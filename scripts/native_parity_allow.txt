@@ -42,8 +42,6 @@ Layer.convertType
 Layer.copy9Patch
 Layer.copyRect
 Layer.copyToBitmapFromMainImage
-Layer.cursorX
-Layer.cursorY
 Layer.doBoxBlur
 Layer.doGrayScale
 Layer.drawGlyph
@@ -249,8 +247,6 @@ Window.displayRotate
 Window.drawDevice
 Window.findFullScreenCandidates
 Window.getMouseVelocity
-Window.getTouchPoint
-Window.getTouchVelocity
 Window.layerTreeOwnerInterface
 Window.onActivate
 Window.onClick
@@ -279,6 +275,5 @@ Window.onTouchUp
 Window.registerMessageReceiver
 Window.resetMouseVelocity
 Window.stayOnTop
-Window.touchPointCount
 Window.touchRotateThreshold
 Window.touchScaleThreshold

@@ -217,7 +217,16 @@ impl<P: TextureProvider> Canvas<'_, P> {
                 }
                 let corners = quad_corners(world);
                 let uv = texture_uv(texture.width(), texture.height(), node.src);
-                let tint = [1.0, 1.0, 1.0, opacity];
+                // The per-node tint modulates the sampled texture; the RGB
+                // channels carry the text colour and the alpha is the composed
+                // opacity. Default `[1, 1, 1, 1]` leaves ordinary textures
+                // unchanged.
+                let tint = [
+                    clamp_opacity(node.color[0]),
+                    clamp_opacity(node.color[1]),
+                    clamp_opacity(node.color[2]),
+                    clamp_opacity(node.color[3]) * opacity,
+                ];
                 self.draw_quad(
                     node,
                     corners,

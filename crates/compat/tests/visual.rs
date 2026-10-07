@@ -8,38 +8,66 @@
 
 mod common;
 
+use api::host::TouchPhase;
 use common::vm_lock;
-use compat::CompatHost;
+use compat::{CompatHost, EventAdapter};
 use engine::Scene;
+use engine::input::InputState;
+use engine::timer::TimerState;
+use platform::{InputEvent, PlatformEvent};
 use tjs::{Tjs2Engine, TjsValue};
 
-/// A bound VM + host + attached scene.
+/// A bound VM + host + attached scene, timer registry and input state.
 struct Env {
-    /// Dropped first: releases every retained script object before the scene
-    /// and the engine go away.
+    /// Dropped first: releases every retained script object before the scene,
+    /// the timer registry, the input state and the engine go away.
     _host: CompatHost,
     engine: Box<Tjs2Engine>,
     scene: Box<Scene>,
+    /// Kept alive for the host's raw pointer; never read directly.
+    _timer: Box<TimerState>,
+    /// Kept alive for the host's raw pointer; never read directly.
+    _input: Box<InputState>,
 }
 
 impl Env {
     fn new() -> Env {
         let engine = Box::new(Tjs2Engine::new().expect("create engine"));
         let mut scene = Box::new(Scene::default());
+        let mut timer = Box::new(TimerState::new());
+        let mut input = Box::new(InputState::new());
         let mut host = CompatHost::new();
-        // SAFETY: the boxed scene outlives the host (it is declared after
-        // `_host`, so it is dropped later), matching `attach_scene`'s
-        // contract.
+        // SAFETY: the boxed scene, timer registry and input state outlive the
+        // host (they are declared after `_host`, so they are dropped later),
+        // matching the `attach_*` contracts.
         unsafe {
             host.services_mut()
                 .attach_scene(scene.as_mut() as *mut Scene);
+            host.services_mut()
+                .attach_timer(timer.as_mut() as *mut TimerState);
+            host.services_mut()
+                .attach_input(input.as_mut() as *mut InputState);
         }
         host.install(&engine).expect("install compat surface");
         Env {
             _host: host,
             engine,
             scene,
+            _timer: timer,
+            _input: input,
         }
+    }
+
+    /// Feed one frame of platform events through the L3 adapter into the
+    /// attached L2 input state (the same seam `VmHost` uses).
+    fn feed_input(&self, events: &[PlatformEvent]) {
+        let adapter = EventAdapter::new();
+        let mut ctx = self._host.ctx().expect("bound host");
+        adapter.begin_input_frame(&mut ctx);
+        for event in events {
+            adapter.apply_input_event(&mut ctx, event);
+        }
+        adapter.end_input_frame(&mut ctx);
     }
 
     fn run(&self, script: &str) {
@@ -63,6 +91,14 @@ impl Env {
         match self.eval_ok(expression) {
             TjsValue::Integer(value) => value,
             other => panic!("{expression:?} returned {other:?}, expected an integer"),
+        }
+    }
+
+    fn eval_real(&self, expression: &str) -> f64 {
+        match self.eval_ok(expression) {
+            TjsValue::Real(value) => value,
+            TjsValue::Integer(value) => value as f64,
+            other => panic!("{expression:?} returned {other:?}, expected a real"),
         }
     }
 }
@@ -342,4 +378,101 @@ fn missing_members_raise_instead_of_silently_stubbing() {
             "{expression:?} should report an absent member, got: {message}"
         );
     }
+}
+
+#[test]
+fn window_touch_getters_read_the_l2_input_state() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run("var w = new Window();");
+
+    env.feed_input(&[
+        PlatformEvent::Input(InputEvent::Touch {
+            id: 5,
+            phase: TouchPhase::Started,
+            x: 10.0,
+            y: 20.0,
+        }),
+        PlatformEvent::Input(InputEvent::Touch {
+            id: 5,
+            phase: TouchPhase::Moved,
+            x: 14.0,
+            y: 26.0,
+        }),
+        PlatformEvent::Input(InputEvent::Touch {
+            id: 7,
+            phase: TouchPhase::Started,
+            x: 30.0,
+            y: 40.0,
+        }),
+    ]);
+
+    assert_eq!(env.eval_int("w.touchPointCount"), 2);
+
+    // `getTouchPoint` returns the reference dictionary.
+    assert_eq!(env.eval_int("w.getTouchPoint(5).ID"), 5);
+    assert_eq!(env.eval_real("w.getTouchPoint(5).x"), 14.0);
+    assert_eq!(env.eval_real("w.getTouchPoint(5).y"), 26.0);
+    assert_eq!(env.eval_real("w.getTouchPoint(5).startX"), 10.0);
+    assert_eq!(env.eval_real("w.getTouchPoint(5).startY"), 20.0);
+    // The argument may also be a 0-based index into the contacts by id.
+    assert_eq!(env.eval_int("w.getTouchPoint(1).ID"), 7);
+    // An unknown contact is a typed TJS error, never a silent stub.
+    assert!(env.eval("w.getTouchPoint(99)").is_err());
+
+    // Velocity is the delta since the previous update.
+    assert_eq!(env.eval_real("w.getTouchVelocity(5).x"), 4.0);
+    assert_eq!(env.eval_real("w.getTouchVelocity(5).y"), 6.0);
+    assert!((env.eval_real("w.getTouchVelocity(5).speed") - 52.0_f64.sqrt()).abs() < 1e-6);
+    // A contact that never moved has zero velocity, not null.
+    assert_eq!(env.eval_real("w.getTouchVelocity(7).x"), 0.0);
+    // An unknown contact yields TJS null.
+    assert_eq!(env.eval_int("w.getTouchVelocity(99) === null"), 1);
+
+    // Ending a contact removes it from the count and lookups.
+    env.feed_input(&[PlatformEvent::Input(InputEvent::Touch {
+        id: 5,
+        phase: TouchPhase::Ended,
+        x: 14.0,
+        y: 26.0,
+    })]);
+    assert_eq!(env.eval_int("w.touchPointCount"), 1);
+    assert!(env.eval("w.getTouchPoint(5)").is_err());
+}
+
+#[test]
+fn layer_cursor_reads_the_pointer_touch_and_layer_offset() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var l = new Layer(w, null); \
+         l.setPos(10, 20); \
+         var c = new Layer(w, l); \
+         c.setPos(5, 5);",
+    );
+
+    env.feed_input(&[PlatformEvent::Input(InputEvent::PointerMoved {
+        x: 100.0,
+        y: 200.0,
+    })]);
+
+    // A root layer is window-relative.
+    assert_eq!(env.eval_int("l.cursorX"), 100);
+    assert_eq!(env.eval_int("l.cursorY"), 200);
+    // A child subtracts the parent rect offset (reference GetCursorX/Y).
+    assert_eq!(env.eval_int("c.cursorX"), 95);
+    assert_eq!(env.eval_int("c.cursorY"), 195);
+
+    // With an active touch, the cursor follows the touch (lowest id wins).
+    env.feed_input(&[PlatformEvent::Input(InputEvent::Touch {
+        id: 3,
+        phase: TouchPhase::Started,
+        x: 40.0,
+        y: 60.0,
+    })]);
+    assert_eq!(env.eval_int("l.cursorX"), 40);
+    assert_eq!(env.eval_int("l.cursorY"), 60);
+    assert_eq!(env.eval_int("c.cursorX"), 35);
+    assert_eq!(env.eval_int("c.cursorY"), 55);
 }

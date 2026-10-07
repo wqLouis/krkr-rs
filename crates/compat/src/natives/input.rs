@@ -5,32 +5,34 @@
 //!
 //! The old `tvp-input` crate kept the input state in process globals
 //! (`OnceLock<Mutex<Option<Arc<Mutex<InputState>>>>>`). This port keeps the
-//! same *behavior* but stores the state in the per-binding dispatch state
-//! ([`CompatServices::state`](crate::CompatServices::state)), exactly like
-//! `System`/`Debug` do — there is no process global here (doc 08 §3.1).
+//! same *behavior* but reads the generic L2 state
+//! ([`engine::input::InputState`]) that the host attaches through
+//! [`CompatServices::attach_input`](crate::CompatServices::attach_input) —
+//! the TVP-specific parts (the VK code table, the click-sequence constants
+//! and the `TVP_SS_*` flags) stay here (doc 08 §3.1).
 //!
 //! # Frame protocol
 //!
-//! The host owns the frame loop and feeds the state from the L1 input events:
+//! The host owns the frame loop and feeds the L2 state from the L1 input
+//! events:
 //!
 //! ```text
-//! begin_input_frame                       // clears per-frame data
+//! begin_input_frame                       // installs the TVP policy, clears per-frame data
 //!   apply_input_event(event) ...          // pointer/button/key/wheel events
 //! end_input_frame                         // commits held counters, frame += 1
 //! ```
 //!
-//! [`InputState::begin_frame`] clears the mouse release flags, the wheel
-//! accumulation, the key `released` map and `last_pressed`;
-//! [`InputState::end_frame`] bumps the held-frame counters and advances the
-//! frame index. Both are driven by the host's per-frame body.
+//! [`engine::input::InputState::begin_frame`] clears the per-frame release
+//! flags, the wheel accumulation, the released keys and `last_pressed`;
+//! [`engine::input::InputState::end_frame`] bumps the held-frame counters and
+//! advances the frame index. Both are driven by the host's per-frame body.
 //!
 //! # Host wiring
 //!
 //! The L1→L3 event path is [`crate::EventAdapter`]: `map` maps a
 //! [`platform::PlatformEvent`] to a TJS-visible event and `dispatch` delivers
-//! it. The input *state* side of that path is
-//! [`apply_event`] / [`InputState::apply_event`], reachable through the
-//! inherent methods on [`crate::EventAdapter`] defined below
+//! it. The input *state* side of that path is reachable through the inherent
+//! methods on [`crate::EventAdapter`] defined below
 //! ([`crate::EventAdapter::begin_input_frame`],
 //! [`crate::EventAdapter::apply_input_event`],
 //! [`crate::EventAdapter::end_input_frame`]). The eventual `dispatch`
@@ -57,10 +59,10 @@
 // call site exists — the same "documented seam" policy `system.rs` uses.
 #![allow(dead_code)]
 
-use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
 
-use platform::{InputEvent, MouseButton, PlatformEvent};
+use engine::input::InputState;
+use platform::{MouseButton, PlatformEvent};
 use tjs::{
     NativeClassBuilder, NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef,
     NativeMethodDef, NativePropertyDef, TjsValue, VAL_OBJECT, Value,
@@ -220,349 +222,24 @@ pub const MOUSE_CLICK_SEQUENCE_FRAMES: u64 = 30;
 pub const MOUSE_CLICK_MAX_MOVE: i32 = 4;
 
 // ---------------------------------------------------------------------------
-// Input state
+// TVP input semantics over the L2 state
 // ---------------------------------------------------------------------------
 
-/// Mouse state shared with the host.
-#[derive(Debug, Clone)]
-pub struct MouseState {
-    /// Cursor X (physical window pixels).
-    pub x: i32,
-    /// Cursor Y (physical window pixels).
-    pub y: i32,
-    /// Accumulated wheel deltas `(x, y, z)` since the last `begin_frame`.
-    pub wheel: (i32, i32, i32),
-    /// Per-button held state, indexed by [`MB_LEFT`]..[`MB_X2`].
-    pub buttons: [bool; MOUSE_BUTTONS],
-    /// Per-button "released this frame" flags, cleared by `begin_frame`.
-    pub released: [bool; MOUSE_BUTTONS],
-    /// Per-button consecutive frames held, bumped by `end_frame`.
-    pub hold: [u32; MOUSE_BUTTONS],
-    /// Per-button presses in the current multi-click sequence.
-    pub click_count: [u32; MOUSE_BUTTONS],
-    /// Frame index of the last press of the sequence (`u64::MAX` = never).
-    pub last_click_frame: [u64; MOUSE_BUTTONS],
-    /// Cursor position of the last press of the sequence.
-    pub last_click_pos: [(i32, i32); MOUSE_BUTTONS],
-    /// Cursor visibility.
-    pub visible: bool,
-    /// Pending OS-cursor warp from `Mouse.setCursorPos`, consumed by the host.
-    pub warp_request: Option<(i32, i32)>,
-}
-
-impl Default for MouseState {
-    fn default() -> Self {
-        Self {
-            x: 0,
-            y: 0,
-            wheel: (0, 0, 0),
-            buttons: [false; MOUSE_BUTTONS],
-            released: [false; MOUSE_BUTTONS],
-            hold: [0; MOUSE_BUTTONS],
-            click_count: [0; MOUSE_BUTTONS],
-            last_click_frame: [u64::MAX; MOUSE_BUTTONS],
-            last_click_pos: [(0, 0); MOUSE_BUTTONS],
-            visible: true,
-            warp_request: None,
-        }
+/// The generic L2 mouse button for a TVP button index
+/// ([`MB_LEFT`]..[`MB_X2`]); `None` for an out-of-range index.
+pub fn mouse_button(index: usize) -> Option<MouseButton> {
+    match index {
+        MB_LEFT => Some(MouseButton::Left),
+        MB_RIGHT => Some(MouseButton::Right),
+        MB_MIDDLE => Some(MouseButton::Middle),
+        MB_X1 => Some(MouseButton::Back),
+        MB_X2 => Some(MouseButton::Forward),
+        _ => None,
     }
-}
-
-/// Keyboard state shared with the host, in Windows virtual-key space.
-#[derive(Debug, Clone, Default)]
-pub struct KeyState {
-    /// keycode → consecutive frames held (present while the key is down).
-    pub pressed: HashMap<u32, u32>,
-    /// keycode → held-frame count at release (one-frame lifetime).
-    pub released: HashMap<u32, u32>,
-    /// keycode → repeat count for held keys.
-    pub repeat: HashMap<u32, u32>,
-    /// Keycodes that transitioned to down since the last `begin_frame`.
-    pub last_pressed: Vec<u32>,
-}
-
-/// The shared input state, stored in
-/// [`CompatServices`](crate::CompatServices) dispatch state.
-#[derive(Debug, Clone, Default)]
-pub struct InputState {
-    /// Mouse state.
-    pub mouse: MouseState,
-    /// Keyboard/gamepad state.
-    pub keys: KeyState,
-    /// Monotonic frame counter, advanced by [`InputState::end_frame`].
-    pub frame: u64,
-}
-
-impl InputState {
-    /// Create a fresh, empty input state.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Begin a new frame: clear the per-frame mouse release flags, the wheel
-    /// deltas, the key `released` map and `last_pressed`.
-    pub fn begin_frame(&mut self) {
-        self.mouse.released = [false; MOUSE_BUTTONS];
-        self.mouse.wheel = (0, 0, 0);
-        self.keys.released.clear();
-        self.keys.last_pressed.clear();
-    }
-
-    /// End the current frame: bump the held counters and advance the frame.
-    pub fn end_frame(&mut self) {
-        for (code, count) in self.keys.pressed.iter_mut() {
-            *count += 1;
-            self.keys.repeat.insert(*code, *count);
-        }
-        for (button, held) in self.mouse.buttons.iter().enumerate() {
-            if *held {
-                self.mouse.hold[button] += 1;
-            }
-        }
-        self.frame += 1;
-    }
-
-    /// Set the absolute cursor position.
-    pub fn set_mouse_pos(&mut self, x: i32, y: i32) {
-        self.mouse.x = x;
-        self.mouse.y = y;
-    }
-
-    /// `Mouse.setCursorPos`: move the logical cursor and queue a host warp.
-    pub fn warp_mouse_pos(&mut self, x: i32, y: i32) {
-        self.mouse.x = x;
-        self.mouse.y = y;
-        self.mouse.warp_request = Some((x, y));
-    }
-
-    /// Take (and clear) the pending OS-cursor warp, if any.
-    pub fn take_mouse_warp(&mut self) -> Option<(i32, i32)> {
-        self.mouse.warp_request.take()
-    }
-
-    /// Accumulate wheel deltas for this frame.
-    pub fn add_wheel(&mut self, x: i32, y: i32, z: i32) {
-        self.mouse.wheel.0 += x;
-        self.mouse.wheel.1 += y;
-        self.mouse.wheel.2 += z;
-    }
-
-    /// Set a mouse button's held state, advancing the multi-click sequence on
-    /// a rising edge. Out-of-range indices are ignored (returns false).
-    pub fn set_mouse_button(&mut self, button: usize, down: bool) -> bool {
-        if button >= MOUSE_BUTTONS {
-            return false;
-        }
-        let was_down = self.mouse.buttons[button];
-        if down == was_down {
-            return true;
-        }
-        self.mouse.buttons[button] = down;
-        if down {
-            self.mouse.hold[button] = 0;
-            let last_frame = self.mouse.last_click_frame[button];
-            let (lx, ly) = self.mouse.last_click_pos[button];
-            let close_in_time = last_frame != u64::MAX
-                && self.frame.saturating_sub(last_frame) <= MOUSE_CLICK_SEQUENCE_FRAMES;
-            let close_in_space = (self.mouse.x - lx).abs() <= MOUSE_CLICK_MAX_MOVE
-                && (self.mouse.y - ly).abs() <= MOUSE_CLICK_MAX_MOVE;
-            if close_in_time && close_in_space {
-                self.mouse.click_count[button] = self.mouse.click_count[button].saturating_add(1);
-            } else {
-                self.mouse.click_count[button] = 1;
-            }
-            self.mouse.last_click_frame[button] = self.frame;
-            self.mouse.last_click_pos[button] = (self.mouse.x, self.mouse.y);
-        } else {
-            self.mouse.released[button] = true;
-            self.mouse.hold[button] = 0;
-        }
-        true
-    }
-
-    /// Set a mouse button's held state **without** registering a click (the
-    /// touch-drag gesture). Returns false for an out-of-range index.
-    pub fn set_mouse_button_raw(&mut self, button: usize, down: bool) -> bool {
-        if button >= MOUSE_BUTTONS {
-            return false;
-        }
-        let was_down = self.mouse.buttons[button];
-        if down == was_down {
-            return true;
-        }
-        self.mouse.buttons[button] = down;
-        if down {
-            self.mouse.hold[button] = 0;
-        } else {
-            self.mouse.released[button] = true;
-            self.mouse.hold[button] = 0;
-        }
-        true
-    }
-
-    /// Forget the current multi-click sequence for `button`.
-    pub fn clear_click_sequence(&mut self, button: usize) {
-        if button >= MOUSE_BUTTONS {
-            return;
-        }
-        self.mouse.click_count[button] = 0;
-        self.mouse.last_click_frame[button] = u64::MAX;
-    }
-
-    /// Set the cursor visibility.
-    pub fn set_mouse_visible(&mut self, visible: bool) {
-        self.mouse.visible = visible;
-    }
-
-    /// Record that `code` went down this frame (a repeated down is a no-op).
-    pub fn set_key_down(&mut self, code: u32) {
-        if self.keys.pressed.contains_key(&code) {
-            return;
-        }
-        self.keys.pressed.insert(code, 0);
-        self.keys.last_pressed.push(code);
-    }
-
-    /// Record that `code` went up this frame.
-    pub fn set_key_up(&mut self, code: u32) {
-        if let Some(held) = self.keys.pressed.remove(&code) {
-            self.keys.released.insert(code, held);
-        }
-        self.keys.repeat.remove(&code);
-    }
-
-    /// Whether `code` is currently held.
-    pub fn is_key_down(&self, code: u32) -> bool {
-        self.keys.pressed.contains_key(&code)
-    }
-
-    /// Whether `code` was released this frame.
-    pub fn is_key_released(&self, code: u32) -> bool {
-        self.keys.released.contains_key(&code)
-    }
-
-    /// Frames `code` has been held (0 when not held).
-    pub fn key_repeat(&self, code: u32) -> u32 {
-        self.keys.repeat.get(&code).copied().unwrap_or(0)
-    }
-
-    /// Whether `button` is currently held.
-    pub fn is_mouse_button_down(&self, button: usize) -> bool {
-        self.mouse.buttons.get(button).copied().unwrap_or(false)
-    }
-
-    /// Whether `button` was released this frame.
-    pub fn is_mouse_button_released(&self, button: usize) -> bool {
-        self.mouse.released.get(button).copied().unwrap_or(false)
-    }
-
-    /// Frames `button` has been held (0 for an out-of-range button).
-    pub fn mouse_button_repeat(&self, button: usize) -> u32 {
-        if !self.mouse.buttons.get(button).copied().unwrap_or(false) {
-            return 0;
-        }
-        self.mouse.hold.get(button).copied().unwrap_or(0)
-    }
-
-    /// Whether virtual-key `code` is held: mouse-button VKs resolve to the
-    /// mouse state, [`VK_PADANY`] is true while any pad button is held.
-    pub fn vk_pressed(&self, code: u32) -> bool {
-        if let Some(b) = mouse_button_from_vk(code) {
-            return self.mouse.buttons[b];
-        }
-        if code == VK_PADANY {
-            return PAD_CODES
-                .iter()
-                .any(|&c| self.keys.pressed.contains_key(&c));
-        }
-        self.keys.pressed.contains_key(&code)
-    }
-
-    /// Whether virtual-key `code` was released this frame (same mapping as
-    /// [`InputState::vk_pressed`]).
-    pub fn vk_released(&self, code: u32) -> bool {
-        if let Some(b) = mouse_button_from_vk(code) {
-            return self.mouse.released[b];
-        }
-        if code == VK_PADANY {
-            return PAD_CODES
-                .iter()
-                .any(|&c| self.keys.released.contains_key(&c));
-        }
-        self.keys.released.contains_key(&code)
-    }
-
-    /// Held-frame count for virtual-key `code` (`VK_PADANY` = longest pad).
-    pub fn vk_repeat(&self, code: u32) -> u32 {
-        if let Some(b) = mouse_button_from_vk(code) {
-            return self.mouse_button_repeat(b);
-        }
-        if code == VK_PADANY {
-            return PAD_CODES
-                .iter()
-                .map(|&c| self.keys.repeat.get(&c).copied().unwrap_or(0))
-                .max()
-                .unwrap_or(0);
-        }
-        self.keys.repeat.get(&code).copied().unwrap_or(0)
-    }
-
-    /// The reference `TVP_SS_*` shift mask for the currently held state.
-    pub fn shift_flags(&self) -> u32 {
-        let mut flags = 0;
-        if self.vk_pressed(VK_SHIFT) {
-            flags |= TVP_SS_SHIFT;
-        }
-        if self.vk_pressed(VK_MENU) {
-            flags |= TVP_SS_ALT;
-        }
-        if self.vk_pressed(VK_CONTROL) {
-            flags |= TVP_SS_CTRL;
-        }
-        if self.is_mouse_button_down(MB_LEFT) {
-            flags |= TVP_SS_LEFT;
-        }
-        if self.is_mouse_button_down(MB_RIGHT) {
-            flags |= TVP_SS_RIGHT;
-        }
-        if self.is_mouse_button_down(MB_MIDDLE) {
-            flags |= TVP_SS_MIDDLE;
-        }
-        flags
-    }
-
-    /// Presses in the current multi-click sequence for `button`
-    /// (`Mouse.getClickCount`); 0 once the sequence times out.
-    pub fn mouse_click_count(&self, button: usize) -> u32 {
-        if button >= MOUSE_BUTTONS {
-            return 0;
-        }
-        let last = self.mouse.last_click_frame[button];
-        if last == u64::MAX || self.frame.saturating_sub(last) > MOUSE_CLICK_SEQUENCE_FRAMES {
-            0
-        } else {
-            self.mouse.click_count[button]
-        }
-    }
-
-    /// Apply one raw L1 platform event to the state.
-    pub fn apply_event(&mut self, event: &PlatformEvent) {
-        apply_event(self, event);
-    }
-
-    /// Apply one raw L1 input event to the state.
-    pub fn apply_input(&mut self, event: &InputEvent) {
-        apply_input(self, event);
-    }
-}
-
-/// Round a logical coordinate to the TJS integer the event carries.
-fn coordinate(value: f32) -> i32 {
-    value.round() as i32
 }
 
 /// The TVP mouse-button index for a platform button, if it has one.
-fn platform_button_index(button: MouseButton) -> Option<usize> {
+pub fn button_index_of(button: MouseButton) -> Option<usize> {
     match button {
         MouseButton::Left => Some(MB_LEFT),
         MouseButton::Right => Some(MB_RIGHT),
@@ -575,43 +252,85 @@ fn platform_button_index(button: MouseButton) -> Option<usize> {
     }
 }
 
-/// Apply one raw input event (the state side of [`crate::EventAdapter`]).
+/// Borrow the L2 input state attached to `ctx`'s services.
 ///
-/// The platform key `code` is used directly as the Windows virtual-key code;
-/// the final physical-key → `VK_*` mapping belongs to the L1 host bridge,
-/// consistent with [`crate::EventAdapter`], which forwards `code` unchanged.
-pub fn apply_input(state: &mut InputState, event: &InputEvent) {
-    match event {
-        InputEvent::PointerMoved { x, y } => {
-            state.set_mouse_pos(coordinate(*x), coordinate(*y));
-        }
-        InputEvent::MouseButton { button, pressed } => {
-            if let Some(index) = platform_button_index(*button) {
-                state.set_mouse_button(index, *pressed);
-            }
-        }
-        InputEvent::Wheel { delta } => {
-            state.add_wheel(0, coordinate(*delta), 0);
-        }
-        InputEvent::Key { code, pressed } => {
-            if *pressed {
-                state.set_key_down(*code);
-            } else {
-                state.set_key_up(*code);
-            }
-        }
-        // Text/IME, touch and every future event are ignored by the state
-        // until their handlers land (`InputEvent` is `#[non_exhaustive]`).
-        _ => {}
-    }
+/// # Safety
+/// The caller must be inside a native callback for a bound engine whose
+/// services have the input state attached (the
+/// [`CompatServices::attach_input`](crate::CompatServices::attach_input)
+/// contract). The returned borrow is tied to `ctx` and never outlives the
+/// callback.
+unsafe fn input_state(ctx: &CompatCtx) -> Option<&InputState> {
+    // SAFETY: the caller upholds the attach contract.
+    unsafe { ctx.services().input().map(|ptr| &*ptr) }
 }
 
-/// Apply one raw L1 platform event to the input state, ignoring the
-/// lifecycle events the input surface does not track.
-pub fn apply_event(state: &mut InputState, event: &PlatformEvent) {
-    if let PlatformEvent::Input(input) = event {
-        apply_input(state, input);
+/// Whether virtual-key `code` is held: mouse-button VKs resolve to the
+/// generic mouse state, [`VK_PADANY`] is true while any pad button is held.
+pub fn vk_pressed(state: &InputState, code: u32) -> bool {
+    if let Some(index) = mouse_button_from_vk(code) {
+        return mouse_button(index).is_some_and(|button| state.is_button_down(button));
     }
+    if code == VK_PADANY {
+        return PAD_CODES.iter().any(|&c| state.is_key_down(c));
+    }
+    state.is_key_down(code)
+}
+
+/// Whether virtual-key `code` was released this frame (same mapping as
+/// [`vk_pressed`]).
+pub fn vk_released(state: &InputState, code: u32) -> bool {
+    if let Some(index) = mouse_button_from_vk(code) {
+        return mouse_button(index).is_some_and(|button| state.is_button_released(button));
+    }
+    if code == VK_PADANY {
+        return PAD_CODES.iter().any(|&c| state.is_key_released(c));
+    }
+    state.is_key_released(code)
+}
+
+/// Held-frame count for virtual-key `code` (`VK_PADANY` = longest pad).
+pub fn vk_repeat(state: &InputState, code: u32) -> u32 {
+    if let Some(index) = mouse_button_from_vk(code) {
+        return mouse_button(index).map_or(0, |button| state.button_hold_frames(button));
+    }
+    if code == VK_PADANY {
+        return PAD_CODES
+            .iter()
+            .map(|&c| state.key_hold_frames(c))
+            .max()
+            .unwrap_or(0);
+    }
+    state.key_hold_frames(code)
+}
+
+/// The reference `TVP_SS_*` shift mask for the currently held state.
+pub fn shift_flags(state: &InputState) -> u32 {
+    let mut flags = 0;
+    if vk_pressed(state, VK_SHIFT) {
+        flags |= TVP_SS_SHIFT;
+    }
+    if vk_pressed(state, VK_MENU) {
+        flags |= TVP_SS_ALT;
+    }
+    if vk_pressed(state, VK_CONTROL) {
+        flags |= TVP_SS_CTRL;
+    }
+    if state.is_button_down(MouseButton::Left) {
+        flags |= TVP_SS_LEFT;
+    }
+    if state.is_button_down(MouseButton::Right) {
+        flags |= TVP_SS_RIGHT;
+    }
+    if state.is_button_down(MouseButton::Middle) {
+        flags |= TVP_SS_MIDDLE;
+    }
+    flags
+}
+
+/// The reference `Mouse.getClickCount` value for TVP button `index`.
+pub fn mouse_click_count(state: &InputState, index: usize) -> u32 {
+    mouse_button(index).map_or(0, |button| state.button_click_count(button))
 }
 
 // ---------------------------------------------------------------------------
@@ -619,20 +338,28 @@ pub fn apply_event(state: &mut InputState, event: &PlatformEvent) {
 // ---------------------------------------------------------------------------
 
 impl crate::EventAdapter {
-    /// Clear the per-frame input state. Call once at the top of the frame,
-    /// before draining events.
+    /// Clear the per-frame L2 input state and install the TVP click-sequence
+    /// window. Call once at the top of the frame, before draining events.
     pub fn begin_input_frame(&self, ctx: &mut CompatCtx) {
         // SAFETY: a `CompatCtx` is only created for a bound, live engine.
         let services = unsafe { ctx.services() };
-        services.state::<InputState>().begin_frame();
+        if let Some(input) = services.input() {
+            // SAFETY: `attach_input` guarantees the pointer stays valid while
+            // the binding is installed.
+            let input = unsafe { &mut *input };
+            input.set_click_sequence(MOUSE_CLICK_SEQUENCE_FRAMES, MOUSE_CLICK_MAX_MOVE as f32);
+            input.begin_frame();
+        }
     }
 
-    /// Apply one raw L1 platform event to the script-visible input state.
+    /// Apply one raw L1 platform event to the script-visible L2 input state.
     pub fn apply_input_event(&self, ctx: &mut CompatCtx, event: &PlatformEvent) {
         // SAFETY: a `CompatCtx` is only created for a bound, live engine.
         let services = unsafe { ctx.services() };
-        let mut state = services.state::<InputState>();
-        apply_event(&mut state, event);
+        if let (Some(input), PlatformEvent::Input(raw)) = (services.input(), event) {
+            // SAFETY: `attach_input` guarantees the pointer stays valid.
+            unsafe { &mut *input }.apply(raw);
+        }
     }
 
     /// Commit the input frame: bump the held counters and advance the frame
@@ -640,7 +367,10 @@ impl crate::EventAdapter {
     pub fn end_input_frame(&self, ctx: &mut CompatCtx) {
         // SAFETY: a `CompatCtx` is only created for a bound, live engine.
         let services = unsafe { ctx.services() };
-        services.state::<InputState>().end_frame();
+        if let Some(input) = services.input() {
+            // SAFETY: `attach_input` guarantees the pointer stays valid.
+            unsafe { &mut *input }.end_frame();
+        }
     }
 }
 
@@ -937,11 +667,11 @@ extern "C" fn native_get_cursor_pos(
     };
     let ctx = resolved.ctx();
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
-    let services = unsafe { ctx.services() };
-    let (x, y) = {
-        let state = services.state::<InputState>();
-        (state.mouse.x, state.mouse.y)
+    let Some(input) = (unsafe { input_state(&ctx) }) else {
+        return report_error(out_error, "Mouse.getCursorPos: input state is not attached");
     };
+    let (px, py) = input.pointer();
+    let (x, y) = (px.round() as i32, py.round() as i32);
     // SAFETY: the trampoline guarantees `argc` valid `Value` entries.
     let a = unsafe { args(argv, argc) };
     if let Some(obj) = a.first().filter(|v| v.ty == VAL_OBJECT) {
@@ -975,7 +705,10 @@ extern "C" fn native_get_cursor_x(
     };
     let ctx = resolved.ctx();
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
-    let x = unsafe { ctx.services() }.state::<InputState>().mouse.x;
+    let Some(input) = (unsafe { input_state(&ctx) }) else {
+        return report_error(out_error, "Mouse.getCursorX: input state is not attached");
+    };
+    let x = input.pointer().0.round() as i32;
     set_int(out, i64::from(x));
     0
 }
@@ -993,7 +726,10 @@ extern "C" fn native_get_cursor_y(
     };
     let ctx = resolved.ctx();
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
-    let y = unsafe { ctx.services() }.state::<InputState>().mouse.y;
+    let Some(input) = (unsafe { input_state(&ctx) }) else {
+        return report_error(out_error, "Mouse.getCursorY: input state is not attached");
+    };
+    let y = input.pointer().1.round() as i32;
     set_int(out, i64::from(y));
     0
 }
@@ -1017,9 +753,12 @@ extern "C" fn native_set_cursor_pos(
     let x = value_as_i64(&a[0]) as i32;
     let y = value_as_i64(&a[1]) as i32;
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
-    unsafe { ctx.services() }
-        .state::<InputState>()
-        .warp_mouse_pos(x, y);
+    let Some(ptr) = (unsafe { ctx.services() }).input() else {
+        return report_error(out_error, "Mouse.setCursorPos: input state is not attached");
+    };
+    // SAFETY: `attach_input` guarantees the pointer stays valid for the
+    // binding's lifetime.
+    unsafe { &mut *ptr }.warp_pointer(x as f32, y as f32);
     set_void(out);
     0
 }
@@ -1037,11 +776,10 @@ extern "C" fn native_get_wheel_rot(
     };
     let ctx = resolved.ctx();
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
-    let y = unsafe { ctx.services() }
-        .state::<InputState>()
-        .mouse
-        .wheel
-        .1;
+    let Some(input) = (unsafe { input_state(&ctx) }) else {
+        return report_error(out_error, "Mouse.getWheelRot: input state is not attached");
+    };
+    let y = input.wheel().round() as i32;
     set_int(out, i64::from(y));
     0
 }
@@ -1059,12 +797,11 @@ extern "C" fn native_get_wheel_rot_x(
     };
     let ctx = resolved.ctx();
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
-    let x = unsafe { ctx.services() }
-        .state::<InputState>()
-        .mouse
-        .wheel
-        .0;
-    set_int(out, i64::from(x));
+    let Some(_input) = (unsafe { input_state(&ctx) }) else {
+        return report_error(out_error, "Mouse.getWheelRotX: input state is not attached");
+    };
+    // The generic wheel is vertical-only; the X axis is always zero.
+    set_int(out, 0);
     0
 }
 
@@ -1081,11 +818,10 @@ extern "C" fn native_get_wheel_rot_y(
     };
     let ctx = resolved.ctx();
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
-    let y = unsafe { ctx.services() }
-        .state::<InputState>()
-        .mouse
-        .wheel
-        .1;
+    let Some(input) = (unsafe { input_state(&ctx) }) else {
+        return report_error(out_error, "Mouse.getWheelRotY: input state is not attached");
+    };
+    let y = input.wheel().round() as i32;
     set_int(out, i64::from(y));
     0
 }
@@ -1103,12 +839,11 @@ extern "C" fn native_get_wheel_rot_z(
     };
     let ctx = resolved.ctx();
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
-    let z = unsafe { ctx.services() }
-        .state::<InputState>()
-        .mouse
-        .wheel
-        .2;
-    set_int(out, i64::from(z));
+    let Some(_input) = (unsafe { input_state(&ctx) }) else {
+        return report_error(out_error, "Mouse.getWheelRotZ: input state is not attached");
+    };
+    // The generic wheel is vertical-only; the Z axis is always zero.
+    set_int(out, 0);
     0
 }
 
@@ -1125,11 +860,10 @@ extern "C" fn native_is_visible(
     };
     let ctx = resolved.ctx();
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
-    let visible = unsafe { ctx.services() }
-        .state::<InputState>()
-        .mouse
-        .visible;
-    set_bool(out, visible);
+    let Some(input) = (unsafe { input_state(&ctx) }) else {
+        return report_error(out_error, "Mouse.isVisible: input state is not attached");
+    };
+    set_bool(out, input.pointer_visible());
     0
 }
 
@@ -1150,9 +884,11 @@ extern "C" fn native_set_visible(
     let ctx = resolved.ctx();
     let visible = value_as_bool(&unsafe { args(argv, argc) }[0]);
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
-    unsafe { ctx.services() }
-        .state::<InputState>()
-        .set_mouse_visible(visible);
+    let Some(ptr) = (unsafe { ctx.services() }).input() else {
+        return report_error(out_error, "Mouse.setVisible: input state is not attached");
+    };
+    // SAFETY: `attach_input` guarantees the pointer stays valid.
+    unsafe { &mut *ptr }.set_pointer_visible(visible);
     set_void(out);
     0
 }
@@ -1173,10 +909,13 @@ extern "C" fn native_get_pressed(
     };
     let ctx = resolved.ctx();
     let a = unsafe { args(argv, argc) };
-    let pressed = {
-        let state = unsafe { ctx.services() }.state::<InputState>();
-        button_index(&a[0]).is_some_and(|b| state.mouse.buttons[b])
+    // SAFETY: a `CompatCtx` is only created for a bound, live engine.
+    let Some(input) = (unsafe { input_state(&ctx) }) else {
+        return report_error(out_error, "Mouse.getPressed: input state is not attached");
     };
+    let pressed = button_index(&a[0])
+        .and_then(mouse_button)
+        .is_some_and(|button| input.is_button_down(button));
     set_bool(out, pressed);
     0
 }
@@ -1197,10 +936,13 @@ extern "C" fn native_get_released(
     };
     let ctx = resolved.ctx();
     let a = unsafe { args(argv, argc) };
-    let released = {
-        let state = unsafe { ctx.services() }.state::<InputState>();
-        button_index(&a[0]).is_some_and(|b| state.mouse.released[b])
+    // SAFETY: a `CompatCtx` is only created for a bound, live engine.
+    let Some(input) = (unsafe { input_state(&ctx) }) else {
+        return report_error(out_error, "Mouse.getReleased: input state is not attached");
     };
+    let released = button_index(&a[0])
+        .and_then(mouse_button)
+        .is_some_and(|button| input.is_button_released(button));
     set_bool(out, released);
     0
 }
@@ -1221,10 +963,13 @@ extern "C" fn native_get_repeat(
     };
     let ctx = resolved.ctx();
     let a = unsafe { args(argv, argc) };
-    let repeat = {
-        let state = unsafe { ctx.services() }.state::<InputState>();
-        button_index(&a[0]).map_or(0, |b| state.mouse_button_repeat(b))
+    // SAFETY: a `CompatCtx` is only created for a bound, live engine.
+    let Some(input) = (unsafe { input_state(&ctx) }) else {
+        return report_error(out_error, "Mouse.getRepeat: input state is not attached");
     };
+    let repeat = button_index(&a[0])
+        .and_then(mouse_button)
+        .map_or(0, |button| input.button_hold_frames(button));
     set_int(out, i64::from(repeat));
     0
 }
@@ -1248,10 +993,16 @@ extern "C" fn native_get_click_count(
     };
     let ctx = resolved.ctx();
     let a = unsafe { args(argv, argc) };
-    let count = {
-        let state = unsafe { ctx.services() }.state::<InputState>();
-        button_index(&a[0]).map_or(0, |b| state.mouse_click_count(b))
+    // SAFETY: a `CompatCtx` is only created for a bound, live engine.
+    let Some(input) = (unsafe { input_state(&ctx) }) else {
+        return report_error(
+            out_error,
+            "Mouse.getClickCount: input state is not attached",
+        );
     };
+    let count = button_index(&a[0])
+        .and_then(mouse_button)
+        .map_or(0, |button| input.button_click_count(button));
     set_int(out, i64::from(count));
     0
 }
@@ -1277,10 +1028,10 @@ extern "C" fn native_key_get_pressed(
     let ctx = resolved.ctx();
     let code = key_code_arg(&unsafe { args(argv, argc) }[0]);
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
-    let pressed = unsafe { ctx.services() }
-        .state::<InputState>()
-        .vk_pressed(code);
-    set_bool(out, pressed);
+    let Some(input) = (unsafe { input_state(&ctx) }) else {
+        return report_error(out_error, "Key.getPressed: input state is not attached");
+    };
+    set_bool(out, vk_pressed(input, code));
     0
 }
 
@@ -1301,10 +1052,10 @@ extern "C" fn native_key_get_released(
     let ctx = resolved.ctx();
     let code = key_code_arg(&unsafe { args(argv, argc) }[0]);
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
-    let released = unsafe { ctx.services() }
-        .state::<InputState>()
-        .vk_released(code);
-    set_bool(out, released);
+    let Some(input) = (unsafe { input_state(&ctx) }) else {
+        return report_error(out_error, "Key.getReleased: input state is not attached");
+    };
+    set_bool(out, vk_released(input, code));
     0
 }
 
@@ -1325,10 +1076,10 @@ extern "C" fn native_key_get_repeat(
     let ctx = resolved.ctx();
     let code = key_code_arg(&unsafe { args(argv, argc) }[0]);
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
-    let repeat = unsafe { ctx.services() }
-        .state::<InputState>()
-        .vk_repeat(code);
-    set_int(out, i64::from(repeat));
+    let Some(input) = (unsafe { input_state(&ctx) }) else {
+        return report_error(out_error, "Key.getRepeat: input state is not attached");
+    };
+    set_int(out, i64::from(vk_repeat(input, code)));
     0
 }
 
@@ -1582,7 +1333,7 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
 }
 
 // ---------------------------------------------------------------------------
-// Unit tests for the pure state / event mapping (no VM needed)
+// Unit tests for the TVP input helpers (no VM needed)
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -1590,113 +1341,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn apply_event_maps_pointer_button_wheel_and_key() {
-        let mut state = InputState::new();
-        state.begin_frame();
-        state.apply_event(&PlatformEvent::Input(InputEvent::PointerMoved {
-            x: 3.4,
-            y: -2.6,
-        }));
-        state.apply_event(&PlatformEvent::Input(InputEvent::MouseButton {
-            button: MouseButton::Left,
-            pressed: true,
-        }));
-        state.apply_event(&PlatformEvent::Input(InputEvent::Wheel { delta: 120.0 }));
-        state.apply_event(&PlatformEvent::Input(InputEvent::Key {
-            code: 0x0D,
-            pressed: true,
-        }));
-        state.end_frame();
-
-        assert_eq!((state.mouse.x, state.mouse.y), (3, -3));
-        assert!(state.is_mouse_button_down(MB_LEFT));
-        assert_eq!(state.mouse.wheel, (0, 120, 0));
-        assert!(state.is_key_down(0x0D));
-        assert_eq!(state.key_repeat(0x0D), 1);
-
-        // A release is visible for exactly one frame.
-        state.begin_frame();
-        state.apply_event(&PlatformEvent::Input(InputEvent::MouseButton {
-            button: MouseButton::Left,
-            pressed: false,
-        }));
-        state.apply_event(&PlatformEvent::Input(InputEvent::Key {
-            code: 0x0D,
-            pressed: false,
-        }));
-        state.end_frame();
-        assert!(state.is_mouse_button_released(MB_LEFT));
-        assert!(state.is_key_released(0x0D));
-
-        state.begin_frame();
-        state.end_frame();
-        assert!(!state.is_mouse_button_released(MB_LEFT));
-        assert!(!state.is_key_released(0x0D));
-    }
-
-    #[test]
-    fn lifecycle_and_unknown_events_are_ignored() {
-        let mut state = InputState::new();
-        state.apply_event(&PlatformEvent::Resized(1, 2));
-        state.apply_event(&PlatformEvent::Focused(true));
-        state.apply_event(&PlatformEvent::CloseRequested);
-        assert_eq!(state.frame, 0);
-        assert!(state.mouse.visible);
-    }
-
-    #[test]
-    fn click_sequence_counts_and_times_out() {
-        let mut state = InputState::new();
-        state.begin_frame();
-        state.set_mouse_pos(10, 10);
-        state.set_mouse_button(MB_LEFT, true);
-        state.end_frame();
-        assert_eq!(state.mouse_click_count(MB_LEFT), 1);
-
-        state.begin_frame();
-        state.set_mouse_button(MB_LEFT, false);
-        state.set_mouse_button(MB_LEFT, true);
-        state.end_frame();
-        assert_eq!(state.mouse_click_count(MB_LEFT), 2);
-
-        // Move far: a new sequence.
-        state.begin_frame();
-        state.set_mouse_button(MB_LEFT, false);
-        state.set_mouse_pos(500, 500);
-        state.set_mouse_button(MB_LEFT, true);
-        state.end_frame();
-        assert_eq!(state.mouse_click_count(MB_LEFT), 1);
-
-        for _ in 0..=MOUSE_CLICK_SEQUENCE_FRAMES {
-            state.begin_frame();
-            state.end_frame();
-        }
-        assert_eq!(state.mouse_click_count(MB_LEFT), 0);
-    }
-
-    #[test]
     fn vk_lookup_resolves_mouse_and_pad_any() {
         let mut state = InputState::new();
         state.begin_frame();
-        state.set_mouse_button(MB_LEFT, true);
-        state.set_key_down(VK_PAD1);
-        state.set_key_down(VK_PADUP);
+        state.set_button(MouseButton::Left, true);
+        state.set_key(VK_PAD1, true);
+        state.set_key(VK_PADUP, true);
         state.end_frame();
 
-        assert!(state.vk_pressed(VK_LBUTTON));
-        assert!(!state.vk_pressed(VK_RBUTTON));
-        assert!(state.vk_pressed(VK_PADANY));
-        assert_eq!(state.vk_repeat(VK_PADANY), 1);
-        assert!(state.shift_flags() & TVP_SS_LEFT != 0);
+        assert!(vk_pressed(&state, VK_LBUTTON));
+        assert!(!vk_pressed(&state, VK_RBUTTON));
+        assert!(vk_pressed(&state, VK_PADANY));
+        assert_eq!(vk_repeat(&state, VK_PADANY), 1);
+        assert!(shift_flags(&state) & TVP_SS_LEFT != 0);
     }
 
     #[test]
     fn unknown_codes_are_false_not_errors() {
         let state = InputState::new();
-        assert!(!state.vk_pressed(0x9999));
-        assert!(!state.vk_released(0x9999));
-        assert_eq!(state.vk_repeat(0x9999), 0);
-        assert_eq!(state.mouse_click_count(99), 0);
+        assert!(!vk_pressed(&state, 0x9999));
+        assert!(!vk_released(&state, 0x9999));
+        assert_eq!(vk_repeat(&state, 0x9999), 0);
+        assert_eq!(mouse_click_count(&state, 99), 0);
     }
 
     #[test]
@@ -1705,5 +1371,31 @@ mod tests {
         assert_eq!(key_code("kLButton"), Some(0x01));
         assert_eq!(key_code("kPadAny"), Some(0x1DF));
         assert_eq!(key_code("kNoSuchKey"), None);
+    }
+
+    #[test]
+    fn mouse_button_index_round_trips() {
+        for index in 0..MOUSE_BUTTONS {
+            let button = mouse_button(index).expect("in range");
+            assert_eq!(button_index_of(button), Some(index));
+        }
+        assert!(mouse_button(MOUSE_BUTTONS).is_none());
+    }
+
+    #[test]
+    fn tvp_policy_drives_the_generic_click_sequence() {
+        let mut state = InputState::new();
+        state.set_click_sequence(MOUSE_CLICK_SEQUENCE_FRAMES, MOUSE_CLICK_MAX_MOVE as f32);
+        state.begin_frame();
+        state.set_pointer(10.0, 10.0);
+        state.set_button(MouseButton::Left, true);
+        state.end_frame();
+        assert_eq!(mouse_click_count(&state, MB_LEFT), 1);
+
+        state.begin_frame();
+        state.set_button(MouseButton::Left, false);
+        state.set_button(MouseButton::Left, true);
+        state.end_frame();
+        assert_eq!(mouse_click_count(&state, MB_LEFT), 2);
     }
 }

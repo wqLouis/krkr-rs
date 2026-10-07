@@ -9,9 +9,8 @@
 //!
 //! # Backends
 //!
-//! * the real backend is cpal on `platform-linux`;
-//! * `platform-android` is a stub that fails fast with
-//!   [`PlatformError::NotImplemented`] (D11: no silent fallback);
+//! * the real backend is cpal on `platform-linux` and AAudio (via the `ndk`
+//!   crate) on `platform-android`;
 //! * [`AudioDevice::null`] is a mock that validates and discards samples, so
 //!   headless hosts and tests need no audio hardware.
 
@@ -69,7 +68,6 @@ impl AudioDevice {
     /// [`AudioError::DeviceUnavailable`] when there is no output device,
     /// [`AudioError::Unsupported`] when no matching stream format exists, and
     /// [`AudioError::Open`]/[`AudioError::Stream`] when the backend fails.
-    /// The Android backend returns [`PlatformError::NotImplemented`].
     pub fn open(spec: AudioSpec) -> Result<(Self, AudioOutputState), PlatformError> {
         validate_spec(spec)?;
         let (backend, state) = backend::open(spec)?;

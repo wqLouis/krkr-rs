@@ -120,6 +120,10 @@ object fields.
 | [`07-roadmap.md`](07-roadmap.md) | Phased plan, per-phase deliverables/exit criteria, risks, testing strategy, rollback, and open questions. |
 | [`08-tjs-vm-and-native-plugins.md`](08-tjs-vm-and-native-plugins.md) | L4 VM host, L3 compatibility surface, the ABI constraint, static native plugins + the null-plugin object, event adaptation, frame drive. |
 | [`09-game-loading.md`](09-game-loading.md) | Archive-flag loading (no folder scan), base dir, mount precedence, startup discovery order, dynamic archives. |
+| [`10-performance-opportunities.md`](10-performance-opportunities.md) | Forward-looking perf backlog per layer (GPU glyph runs, advanced blends, MSDF, coverage-only glyph cache, hw video decode, …), with the D8 correctness rule. |
+| [`11-android-backends.md`](11-android-backends.md) | AAudio + NDK MediaCodec design and official references; the `ndk`-crate strategy for backends we cannot run here. |
+| [`12-tjs-rust-port-audit.md`](12-tjs-rust-port-audit.md) | TJS2 C++→Rust port audit: dependency inventory, component map, risks (regex/string/class semantics), phased strategy, recommendation. |
+| [`13-l2-api-stability.md`](13-l2-api-stability.md) | The L2 API freeze: dependency rule, stability policy (`#[non_exhaustive]`, typed errors, no raw pointers, no TVP constants), the stable surface, known debt, and the proposed API-diff guard. |
 
 ## 5. Scope of this branch
 

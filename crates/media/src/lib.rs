@@ -26,12 +26,21 @@
 //!   [`VideoDecoderState`]. On Linux the FFmpeg backend (D13
 //!   `video-ffmpeg`) demuxes in memory, converts frames to tightly packed
 //!   RGBA8 and decodes the audio track; on Android the `video-mediacodec`
-//!   feature selects a typed [`api::error::MediaError::Unsupported`] stub. Exactly one
-//!   backend must be selected (see [`video`]).
+//!   feature selects the NDK backend (`ndk` + a raw `AMediaExtractor` shim).
+//!   Exactly one backend must be selected (see [`video`]).
 //! * **YUV** — the pure `yuv420_to_rgba` conversion ported from
 //!   `tvp-natives/src/video/yuv.rs`.
+//!
+//! # Safety lint
+//!
+//! Outside Android there is no raw FFI in this crate, so `unsafe_code` is set
+//! to `forbid`. Android needs one raw `AMediaExtractor` shim (the `ndk` crate
+//! does not expose the extractor); `forbid` cannot be locally relaxed, so the
+//! crate uses `deny` there and the shim module carries the single scoped
+//! `#[allow(unsafe_code)]`.
 
-#![forbid(unsafe_code)]
+#![cfg_attr(not(target_os = "android"), forbid(unsafe_code))]
+#![cfg_attr(target_os = "android", deny(unsafe_code))]
 #![warn(missing_docs)]
 
 pub mod audio;
@@ -100,19 +109,6 @@ impl Media {
 /// middle-layer API).
 pub fn create_media(config: MediaConfig) -> Media {
     Media::with_config(config)
-}
-
-/// Builds the typed "not implemented in this build" error used by the
-/// audio/video scaffolds.
-///
-/// This is the value the middle layer surfaces to scripts as the friendly
-/// "no decoder in this build" failure. Only the MediaCodec stub needs it
-/// today, so it is compiled in only for that backend.
-#[cfg(feature = "video-mediacodec")]
-pub(crate) fn unsupported(feature: &str) -> api::error::MediaError {
-    api::error::MediaError::Unsupported {
-        message: format!("{feature} is not implemented in this build"),
-    }
 }
 
 /// Reports which formats this backend can decode.

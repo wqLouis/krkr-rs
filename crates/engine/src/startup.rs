@@ -24,6 +24,7 @@ use crate::storage::{Location, Storage, StorageReadError};
 /// `patch` and `after_startup` are resolved at the app path only;
 /// `startup` is the searched bootstrap script (or the fallback).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct StartupScripts {
     /// `patch.tjs` next to the archives, when it exists (app path only).
     pub patch: Option<Location>,
@@ -36,6 +37,7 @@ pub struct StartupScripts {
 
 /// The bootstrap script selected by startup discovery.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum StartupScript {
     /// `startup.tjs`, located by searching the disk and mounted archives.
     Startup(Location),
@@ -59,6 +61,7 @@ impl StartupScript {
 
 /// Errors from startup discovery.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum StartupError {
     /// Neither `startup.tjs` nor `system/Initialize.tjs` exists.
     #[error("no startup script: neither startup.tjs nor system/Initialize.tjs was found")]
