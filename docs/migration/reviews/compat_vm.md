@@ -1,16 +1,16 @@
-# L3/L4 review — `krkr-compat` (compatibility surface) and `krkr-vm` (VM host)
+# L3/L4 review — `compat` (compatibility surface) and `vm` (VM host)
 
-Scope: `crates/krkr-compat/` (plugin architecture, null plugin, `CompatCtx`/
-binding, event adapter, frame body), `crates/krkr-vm/` (VM host), and the
-recently added `tjs2_prop_set_default` ABI (`crates/tjs2-sys/cpp/tjs2_abi.{h,cpp}`,
-`crates/tjs2-sys/src/lib.rs`). Read against
+Scope: `crates/compat/` (plugin architecture, null plugin, `CompatCtx`/
+binding, event adapter, frame body), `crates/vm/` (VM host), and the
+recently added `tjs2_prop_set_default` ABI (`crates/tjs/cpp/tjs2_abi.{h,cpp}`,
+`crates/tjs/src/lib.rs`). Read against
 `docs/migration/02-target-architecture.md` (§1–§3, §6–§9),
 `docs/migration/03-middle-layer-api.md` and
 `docs/migration/08-tjs-vm-and-native-plugins.md` (§3–§6, D14).
 
 Method: source read-only. Only `cargo check` was run, as permitted:
 
-* `cargo check -p krkr-vm --all-targets` — clean, no warnings.
+* `cargo check -p vm --all-targets` — clean, no warnings.
 
 No `build`/`run`/`test` was executed.
 
@@ -36,11 +36,11 @@ correct (verified against `tjs2_prop_set`).
 
 ## 1. `CompatCtx` is a safe, `Copy + Send + Sync`, lifetime-free handle — Critical
 
-`crates/krkr-compat/src/ctx.rs:77-78` defines
+`crates/compat/src/ctx.rs:77-78` defines
 `pub struct CompatCtx { engine: usize, services: usize }` with
-`#[derive(Clone, Copy)]`, and `crates/krkr-compat/src/ctx.rs:95,102,113`
+`#[derive(Clone, Copy)]`, and `crates/compat/src/ctx.rs:95,102,113`
 expose **safe** `engine()`, `services()` and `unsafe services_mut()` that
-dereference those addresses. `crates/krkr-compat/src/host.rs:77-79`
+dereference those addresses. `crates/compat/src/host.rs:77-79`
 `CompatHost::ctx()` is a safe `pub fn` that returns one of these even when the
 host is not installed (`host.rs:42-43` initialise `engine: 0,
 services_ptr: 0`).
@@ -51,7 +51,7 @@ Two concrete UB paths from safe code:
    deref) with no `unsafe`.
 2. `let ctx = host.ctx(); std::thread::spawn(move || ctx.engine().eval(..))`
    compiles because `usize` is `Send + Sync`; the VM is explicitly
-   single-threaded (`tjs2-sys/src/lib.rs:432-437`), so this corrupts the C++
+   single-threaded (`tjs/src/lib.rs:432-437`), so this corrupts the C++
    VM. The same handle also outlives the engine (nothing ties its lifetime to
    the binding), making use-after-free possible.
 
@@ -70,7 +70,7 @@ been bound", but a safe fn cannot rely on a caller honouring prose.
 
 ## 2. The null plugin recompiles/re-evaluates a closure on every member access — High
 
-`crates/krkr-compat/src/null_plugin.rs:149-167` (`ignore_absent_member`)
+`crates/compat/src/null_plugin.rs:149-167` (`ignore_absent_member`)
 calls `host.eval_retained("(function(){})", "null_plugin")` for **every**
 absent member read and every absent method call, then retains the result and
 sets it as the property default. `null_missing` invokes it on each access.
@@ -87,7 +87,7 @@ object; that justifies re-*retaining* a value, not re-*evaluating* one.
 Fix: create the no-op function once (e.g. when `NullPlugin` is registered, or
 on first use) and cache its retained id/handle in L3 state (`CompatServices`
 or the `NullPlugin` payload); on each access duplicate the cached id with
-`tjs2_retain_retained_id` (already exposed in `tjs2-sys`) and pass that as
+`tjs2_retain_retained_id` (already exposed in `tjs`) and pass that as
 the `TjsValue::Retained` value. The duplicate is what `value_to_variant`
 consumes, so the cache stays live.
 
@@ -95,7 +95,7 @@ consumes, so the cache stays live.
 
 ## 3. `PluginRegistry::unlink` is not an unlink and breaks `link → unlink → link` — High
 
-`crates/krkr-compat/src/plugin.rs:130-137` only removes the normalized name
+`crates/compat/src/plugin.rs:130-137` only removes the normalized name
 from the `linked` set. It does not unregister the built-in's native classes
 and does not remove the null object's script global. Because `activate`
 (`plugin.rs:107-128`) re-runs `plugin.register(ctx)` whenever the name is not
@@ -117,7 +117,7 @@ reports success.
 
 ## 4. `thread_local! ARRAY_OUT` is a second hidden global — High
 
-`crates/krkr-compat/src/plugins_native.rs:18-24` defines a process-wide
+`crates/compat/src/plugins_native.rs:18-24` defines a process-wide
 (per-thread) `ARRAY_OUT` scratch used by `Plugins.getList`. Doc 08 §3.1 says
 there is exactly **one** process-wide binding and that it "holds dispatch
 state, never game state"; the review constraint repeats "no hidden globals
@@ -134,18 +134,18 @@ undocumented beside `binding.rs`.
 
 ## 5. L3 redeclares `PlatformEvent` instead of consuming L1's — High
 
-`crates/krkr-compat/src/event.rs:17` defines a fresh `pub enum PlatformEvent`
+`crates/compat/src/event.rs:17` defines a fresh `pub enum PlatformEvent`
 (`KeyDown`/`PointerMove`/…), even though L1 already owns
-`krkr_platform::PlatformEvent` (`crates/krkr-platform/src/event.rs:13`) and
-`krkr_platform::InputEvent` (`crates/krkr-platform/src/input.rs:33`). Doc 02
+`platform::PlatformEvent` (`crates/platform/src/event.rs:13`) and
+`platform::InputEvent` (`crates/platform/src/input.rs:33`). Doc 02
 §3 and doc 08 §5 are explicit: the event loop/type is L1 and L3 only *maps*
-it. `VmHost::tick` (`crates/krkr-vm/src/host.rs:116-124`) consumes the L3
-type, and `krkr-vm` even depends on `krkr-platform` (`Cargo.toml:11`)
+it. `VmHost::tick` (`crates/vm/src/host.rs:116-124`) consumes the L3
+type, and `vm` even depends on `platform` (`Cargo.toml:11`)
 without using it. The two enums already disagree (L1's `InputEvent::Key`
 carries an opaque `u32`; L3's `KeyDown` carries an `i64` + string).
 
-Fix: delete `krkr_compat::PlatformEvent`; have `EventAdapter::map` accept
-`krkr_platform::PlatformEvent` (and/or `InputEvent`) and produce `TjsEvent`,
+Fix: delete `compat::PlatformEvent`; have `EventAdapter::map` accept
+`platform::PlatformEvent` (and/or `InputEvent`) and produce `TjsEvent`,
 and have `VmHost::tick` take the L1 type. Keep the TJS mapping in L3; keep
 the platform enum in L1.
 
@@ -169,7 +169,7 @@ test with mixed case.
 
 ## 7. `CompatServices` hands out `&Scene`/`&Storage` from raw pointers via a safe seam — Medium
 
-`crates/krkr-compat/src/ctx.rs:20-30` stores `Option<*mut Scene>` /
+`crates/compat/src/ctx.rs:20-30` stores `Option<*mut Scene>` /
 `Option<*mut Storage>`, attached with `unsafe fn attach_scene/attach_storage`,
 and `ctx.rs:52-64` return `Option<&Scene>` / `Option<&Storage>`. Nothing ties
 that shared borrow to the L2 owner, so L2 can legitimately mutate the scene
@@ -200,12 +200,12 @@ id is a documented no-op (`tjs2_abi.cpp:2119-2125`).
 What is missing: there is no test for `set_default_member` /
 `tjs2_prop_set_default` anywhere (`grep` finds only the definition and the
 FFI binding), and the safe wrapper `Tjs2Engine::set_default_member`
-(`tjs2-sys/src/lib.rs:1420-1434`) does not document that a
+(`tjs/src/lib.rs:1420-1434`) does not document that a
 `TjsValue::Retained` value is consumed **even if `PropSet` fails after
 conversion** (the entry is erased before the `PropSet` call). A caller that
 reuses the id after an error would find it gone.
 
-Fix: add a `tjs2-sys` test that sets a default member and reads it back,
+Fix: add a `tjs` test that sets a default member and reads it back,
 including the error path; document the consume-on-conversion-failure
 contract on `set_default_member` (and `set_member`, which has the same
 behaviour).
@@ -227,13 +227,13 @@ normalized set for membership/link checks.
 
 ## 10. `run_frame_body` omits the projection/render tail of the documented body — Medium
 
-`crates/krkr-compat/src/frame.rs:50-56` enforces only the five polls. Doc 08
+`crates/compat/src/frame.rs:50-56` enforces only the five polls. Doc 08
 §6 lists the body as `timer → sound → video → async_trigger →
 continuous_handler → L2 projects the scene → L1 RenderPipeline::render`.
 Because `FrameBody`/`run_frame_body` is described as *the* enforcement point,
 and neither projection nor render appears anywhere in the trait, the seam
 silently drops the last two steps and `VmHost::tick` returns after the
-polls (`krkr-vm/src/host.rs:116-124`). When the visual natives land, this
+polls (`vm/src/host.rs:116-124`). When the visual natives land, this
 ordering will be enforced by convention rather than by the function that
 claims to enforce it.
 
@@ -245,10 +245,10 @@ the host drives the render after `run_frame_body`.
 
 ## 11. Dead error variants and unused dependencies — Low
 
-`CompatError::Engine` and `CompatError::Unsupported` (`krkr-compat/src/lib.rs:60-68`)
-are never constructed. `krkr-compat/Cargo.toml:10-13` depends on `krkr-fs`,
-`krkr-render` and `krkr-media` (and `krkr-api`), and `krkr-vm/Cargo.toml:10-12`
-depends on `krkr-api` and `krkr-platform`, but no source file references any
+`CompatError::Engine` and `CompatError::Unsupported` (`compat/src/lib.rs:60-68`)
+are never constructed. `compat/Cargo.toml:10-13` depends on `fs`,
+`render` and `media` (and `api`), and `vm/Cargo.toml:10-12`
+depends on `api` and `platform`, but no source file references any
 of them (`grep` is empty). Declaring L2/L1 dependencies the code does not use
 weakens the dependency-direction signal.
 
@@ -259,12 +259,12 @@ Fix: drop the unused deps and error variants, or use them (e.g. the L1
 
 ## 12. Minor marshalling nits — Low
 
-* `native_util::args` (`krkr-compat/src/native_util.rs:18-24`) returns
+* `native_util::args` (`compat/src/native_util.rs:18-24`) returns
   `&'a [Value]` with a caller-chosen lifetime decoupled from the input, which
   lets a caller store a slice past the callback; the lifetime should be tied
   to the borrow.
 * `value_to_ffi` narrows the retained id `u64` to `usize`
-  (`tjs2-sys/src/lib.rs:1684-1695`); harmless on 64-bit, truncating on 32-bit
+  (`tjs/src/lib.rs:1684-1695`); harmless on 64-bit, truncating on 32-bit
   (Android armeabi-v7a).
 * `tjs_string_literal` (`null_plugin.rs:218-233`) escapes `\ ' \n \r` but not
   other control characters (tab, NUL), so an unusual plugin name could break

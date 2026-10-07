@@ -15,11 +15,11 @@ all script semantics stay in the middle layer.
 
 | Concern | Today | Target |
 |---------|-------|--------|
-| Image decode | `tvp-visual/src/bitmap.rs::decode_image` + `tlg.rs` + `image` crate | `krkr-media` (shared `ImageDecoder`) |
-| Audio decode | `tvp-sound/src/decode.rs` (symphonia + libopus), `source.rs` policy | `krkr-media` (FFmpeg audio / MediaCodec audio) |
-| Audio mixer/model | `tvp-sound/src/mixer.rs`, `wavesound.rs`, `natives.rs`, `sli.rs` | stays L2 `krkr-engine` |
+| Image decode | `tvp-visual/src/bitmap.rs::decode_image` + `tlg.rs` + `image` crate | `media` (shared `ImageDecoder`) |
+| Audio decode | `tvp-sound/src/decode.rs` (symphonia + libopus), `source.rs` policy | `media` (FFmpeg audio / MediaCodec audio) |
+| Audio mixer/model | `tvp-sound/src/mixer.rs`, `wavesound.rs`, `natives.rs`, `sli.rs` | stays L2 `engine` |
 | Audio output | `tvp-sound/src/player.rs` (rodio/cpal) | `krkr-core` `AudioDevice` |
-| Video decode | `tvp-natives/src/video/{ffmpeg,android,yuv}.rs` | `krkr-media` (two backends) |
+| Video decode | `tvp-natives/src/video/{ffmpeg,android,yuv}.rs` | `media` (two backends) |
 | Video overlay events | `tvp-natives/src/video_overlay.rs` | stays L2 (polls the engine) |
 | Format registry | ad hoc per path | declared per backend |
 
@@ -30,7 +30,7 @@ MediaCodec. This is the least disruptive of the three bottom components.
 ## 2. Engine shape
 
 ```
-krkr-media
+media
   ├─ image/                 format sniffing, TLG5/6, image crate
   ├─ audio/                 probe, decode-all, streaming decoder
   ├─ video/                 probe, open, present_at, audio track
@@ -47,7 +47,7 @@ except for trivially small probes.
 ## 3. Image decode
 
 * Move `tvp-visual/src/tlg.rs` and the `decode_image` dispatch into
-  `krkr-media`. TLG is a pure format and has no platform dependency.
+  `media`. TLG is a pure format and has no platform dependency.
 * Keep the current order: extension hint → magic sniff (`image::guess_format`)
   → decode. TLG by extension and by `TLG` magic.
 * `probe_image` returns dimensions/alpha/format without full decode (used by
@@ -56,7 +56,7 @@ except for trivially small probes.
   (`tvp-visual/src/natives/bitmap.rs::loadAsync`) stays in L2 and owns the
   completion table; L1 is just the pure `decode_image` call plus, if
   needed, an L2-scheduled worker.
-* Image **save** (TLG5/TLG6, PNG) lives in `krkr-media` too, because it is a
+* Image **save** (TLG5/TLG6, PNG) lives in `media` too, because it is a
   format concern. `Bitmap.saveLayerImage`/`save` go through it.
 * Supported formats stay the current `image` 0.25 feature list (png, jpeg,
   webp, bmp, gif, tiff, tga, dds, pnm, ico, qoi, hdr, exr, ff); AVIF/pvr/jxr
@@ -113,7 +113,7 @@ Keep the current `MovieDecoder` semantics as an L1-defined
 ### 5.2 FFmpeg backend (Linux)
 
 * `ffmpeg-next` with the existing in-memory custom `StreamIo` (no temp
-  file); L2 reads the bytes through `krkr-fs` and passes them in.
+  file); L2 reads the bytes through `fs` and passes them in.
 * Reuse `present_at`, `next_video_frame`, `convert_video` (swscale→RGBA),
   `drain_audio` (swresample→f32) verbatim.
 * Fix the known inefficiency: audio is decoded fully at `open`
@@ -197,9 +197,9 @@ instead.
 
 ## 9. Migration steps specific to media
 
-1. Define the stateless media signatures + DTOs in `krkr-api`
+1. Define the stateless media signatures + DTOs in `api`
    (`03-middle-layer-api.md §4`).
-2. Move `tlg.rs`/`decode_image` into `krkr-media`; keep a thin re-export in
+2. Move `tlg.rs`/`decode_image` into `media`; keep a thin re-export in
    `tvp-visual` so natives compile unchanged.
 3. Implement the FFmpeg backend by wrapping the existing `video/ffmpeg.rs`
    and `decode.rs` as free functions + `AudioDecoderState`/

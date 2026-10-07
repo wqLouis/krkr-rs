@@ -1,36 +1,23 @@
 [workspace]
 resolver = "2"
 members = [
-    # legacy compatibility anchors + algorithm sources (migrated from)
-    "crates/xp3",
-    "crates/tjs2-sys",
-    "crates/engine",
-    "crates/kag",
-    "crates/tvp-util",
-    "crates/tvp-streams",
-    "crates/tvp-natives",
-    "crates/tvp-storages",
-    "crates/tvp-scripts",
-    "crates/tvp-config",
-    "crates/tvp-visual",
-    "crates/tvp-text",
-    "crates/tvp-kagparser",
-    "crates/tvp-input",
-    "crates/tvp-sound",
+    # The C++ TJS2 VM — the compatibility anchor and the only legacy crate
+    # the new architecture still links.
+    "crates/tjs",
     # new architecture (D9/D10)
-    "crates/krkr-api",
-    "crates/krkr-fs",
-    "crates/krkr-media",
-    "crates/krkr-render",
-    "crates/krkr-engine",
-    "crates/krkr-platform",
-    "crates/krkr-compat",
-    "crates/krkr-vm",
-    "crates/krkr-app",
+    "crates/api",
+    "crates/fs",
+    "crates/media",
+    "crates/render",
+    "crates/engine",
+    "crates/platform",
+    "crates/compat",
+    "crates/vm",
+    "crates/app",
     # dev-only shared test helper (not part of the runtime architecture)
-    "crates/krkr-testkit",
+    "crates/testkit",
 ]
-default-members = ["crates/krkr-app"]
+default-members = ["crates/app"]
 
 [workspace.package]
 version = "1.0.0"
@@ -38,18 +25,17 @@ edition = "2024"
 license = "GPL-3.0-only"
 
 [workspace.dependencies]
-xp3 = { path = "crates/xp3" }
-tjs2-sys = { path = "crates/tjs2-sys" }
-krkr-api = { path = "crates/krkr-api" }
-krkr-fs = { path = "crates/krkr-fs" }
-krkr-media = { path = "crates/krkr-media" }
-krkr-render = { path = "crates/krkr-render" }
-krkr-engine = { path = "crates/krkr-engine" }
-krkr-platform = { path = "crates/krkr-platform" }
-krkr-compat = { path = "crates/krkr-compat" }
-krkr-vm = { path = "crates/krkr-vm" }
+tjs = { path = "crates/tjs" }
+api = { path = "crates/api" }
+fs = { path = "crates/fs" }
+media = { path = "crates/media" }
+render = { path = "crates/render" }
+engine = { path = "crates/engine" }
+platform = { path = "crates/platform" }
+compat = { path = "crates/compat" }
+vm = { path = "crates/vm" }
 # dev-only test helper; consumed through [dev-dependencies] only
-krkr-testkit = { path = "crates/krkr-testkit" }
+testkit = { path = "crates/testkit" }
 thiserror = "2"
 log = "0.4"
 ash = "0.38"

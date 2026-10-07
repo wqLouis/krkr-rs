@@ -1,0 +1,21 @@
+[package]
+name = "compat"
+description = "krkr-rs L3 KiriKiri compatibility surface: native classes + KAG + event adapter + static plugins"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+engine = { workspace = true }
+tjs = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+
+# D13: `platform` has no default platform feature, so each target selects
+# exactly one. L3 uses only the platform-agnostic event types; it still needs a
+# backend feature to compile the L1 crate.
+[target.'cfg(target_os = "linux")'.dependencies]
+platform = { workspace = true, features = ["platform-linux"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+platform = { workspace = true, features = ["platform-android"] }

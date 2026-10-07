@@ -1,7 +1,7 @@
 # Linux CI for the new architecture.
 #
 # Compiling the whole workspace needs the gitignored `reference/` krkr2
-# checkout (see `crates/tjs2-sys/build.rs`), so this job runs the checks that
+# checkout (see `crates/tjs/build.rs`), so this job runs the checks that
 # need no external checkout: formatting and the D9 stateless guard. A full
 # clippy/test job can be added once the reference checkout is available to CI.
 name: CI
@@ -39,6 +39,6 @@ jobs:
         run: cargo fmt --all -- --check
 
       # D9: the bottom core (L1) has no globals/caches/hidden state. The script
-      # covers krkr-api/fs/media/render and krkr-platform.
+      # covers api/fs/media/render and platform.
       - name: D9 stateless guard
         run: bash scripts/check-stateless.sh

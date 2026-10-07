@@ -6,20 +6,20 @@ No phase begins implementation until this plan is reviewed.
 > **Revision note (final layering, 2026).** This roadmap was written for the
 > original layering (host on top, Bevy strangler). Two things changed since:
 > the Bevy frontends were removed and the new crates
-> (`krkr-api/fs/media/render/engine/app`) were implemented (waves 1–3), and
+> (`api/fs/media/render/engine/app`) were implemented (waves 1–3), and
 > the layering was finalised in
 > [`02-target-architecture.md`](02-target-architecture.md) — host/platform
 > code and archive parsing in **L1**, **L2** a generic engine that holds the
 > layer system, **L3** the KiriKiri compat surface, **L4** the TJS VM. The
 > remaining work is:
 >
-> 1. Move the host/window/event loop out of `krkr-app` into a `krkr-platform`
+> 1. Move the host/window/event loop out of `app` into a `platform`
 >    crate (L1), and make platform/backends compile-time features (D13).
-> 2. Move XP3 parsing from `krkr-engine` into L1; keep only the VFS
+> 2. Move XP3 parsing from `engine` into L1; keep only the VFS
 >    namespace in L2 (D6 rev., doc 02 §5).
 > 3. Replace `Storage::mount`/`discover_archives` with explicit archive
 >    loading + the startup-discovery order (D15, doc 09).
-> 4. Introduce `krkr-compat` (L3) and `krkr-vm` (L4): port the `tvp-*`
+> 4. Introduce `compat` (L3) and `vm` (L4): port the `tvp-*`
 >    natives into L3 plugins, with the null-plugin object (D14, doc 08).
 > 5. Media video + the TJS execution path (boot `startup.tjs`).
 > 6. Android host in L1.
@@ -35,7 +35,7 @@ No phase begins implementation until this plan is reviewed.
 The new architecture is introduced **alongside** the current one:
 
 * the stateless middle-layer API is added first, with a **Bevy-backed
-  adapter** implementing its operations, so `krkr-engine` can be written
+  adapter** implementing its operations, so `engine` can be written
   against the API while Bevy still renders;
 * media and FS operations get adapters that wrap today's code
   (`decode.rs`, `tlg.rs`, `engine::Storage`, `xp3`) without moving it;
@@ -61,7 +61,7 @@ Exit criteria: plan reviewed; open questions in §7 answered; no code change.
 ### Phase 1 — Define the stateless middle-layer API; extract pure helpers
 
 Deliverables:
-* `krkr-api`: object/action signatures + state/DTO types from
+* `api`: object/action signatures + state/DTO types from
   `03-middle-layer-api.md` (stateless `RenderPipeline`/`Media`/`FileSystem`,
   explicit `RenderScene`/`RenderState`/`DecoderState`/`FileState`,
   `BlendMode`, `DecodedImage`, `AudioSpec`, `RgbaFrame`, …).
@@ -74,7 +74,7 @@ Deliverables:
   `MockClock`, so L2 can be constructed with no window/GPU/codec/fs.
 * Add the **D9 guard**: a CI grep/test that rejects mutable statics,
   `thread_local!`, `LazyLock`/`OnceLock`/`OnceCell`/`lazy_static!` and
-  module-level `HashMap` caches in `krkr-core`/`krkr-api`.
+  module-level `HashMap` caches in `krkr-core`/`api`.
 
 Exit criteria:
 * helpers live in a Bevy-free crate and their existing tests pass there;
@@ -85,7 +85,7 @@ Exit criteria:
 ### Phase 2 — Build the L2 layer system on the API
 
 Deliverables:
-* `krkr-engine`: the `Scene`/`LayerState`/`BitmapState` model moves here
+* `engine`: the `Scene`/`LayerState`/`BitmapState` model moves here
   (out of `tvp-visual`), plus the **`Scene → RenderScene` projection** (a
   field-level sync, not a draw list).
 * `Engine` struct with injected stateless objects and stored state values
@@ -93,7 +93,7 @@ Deliverables:
 * A Bevy-backed **platform adapter** implementing the stateless operations
   by wrapping the current `sync_scene` on the L1 side, so the game still
   runs through Bevy while L2 is written against the new API.
-* `tvp-visual` becomes the native adapter over `krkr-engine` (public
+* `tvp-visual` becomes the native adapter over `engine` (public
   methods preserved as shims).
 
 Exit criteria: identical rendering through the adapter; no native behavior
@@ -103,7 +103,7 @@ traversal code.
 ### Phase 3 — File system (stateless)
 
 Deliverables:
-* `krkr-fs`: stateless `FileSystem` object + in-memory root, positional
+* `fs`: stateless `FileSystem` object + in-memory root, positional
   `FileState`.
 * `xp3::Xp3Archive` reads positionally (no live `std::fs::File`).
 * `engine::Storage` moves onto the stateless fs functions (shimmed public
@@ -111,13 +111,13 @@ Deliverables:
 * logging/state/savedata/native IO routed through the fs functions.
 
 Exit criteria: `Storage` behaves identically against the in-memory root and
-the real game; no `std::fs` left outside `krkr-fs` except tests. Decide the
+the real game; no `std::fs` left outside `fs` except tests. Decide the
 `cpp/streams.cpp` hook (`06-file-system.md §6`).
 
 ### Phase 4 — Media engine
 
 Deliverables:
-* `krkr-media`: `decode_image`/`probe_*` free functions (TLG + `image`),
+* `media`: `decode_image`/`probe_*` free functions (TLG + `image`),
   `AudioDecoderState`/`VideoDecoderState` values, FFmpeg + unsupported
   backends; MediaCodec after Linux parity.
 * `tvp-sound` decode calls the stateless API; mixer/model stay in L2.
@@ -130,7 +130,7 @@ visible and audible (Linux); Android compiles with the MediaCodec backend.
 ### Phase 5 — Vulkan render pipeline bring-up
 
 Deliverables:
-* `krkr-render` `RenderPipeline`: `ash` device/swapchain/pipelines, tree
+* `render` `RenderPipeline`: `ash` device/swapchain/pipelines, tree
   traversal/composition, texture upload (sub-rect), `RenderScene`
   submission, `SourceOver`/fixed-function blends.
 * Golden-image test harness (Bevy vs Vulkan framebuffer compare).
@@ -161,7 +161,7 @@ Deliverables:
   `ANativeWindow`; own swapchain lifecycle.
 * Preserve the JNI contract (`pendingGameDir`/`pendingGameName`/
   `pendingStateDir`), state file, log rotation, touch/back handling.
-* MediaCodec video; `krkr-fs` Android roots.
+* MediaCodec video; `fs` Android roots.
 
 Exit criteria: APK builds and runs the game on device with Vulkan.
 
@@ -191,12 +191,12 @@ Exit criteria: `02-target-architecture.md §9` acceptance criteria all hold.
 |-------|------|-------|
 | Unit | pure helpers, blend mapping, FS namespace, layout | L2/L1 crates |
 | **Statelessness (D9)** | grep/lint for globals + build two independent engines in one process | CI / `krkr-core` |
-| Golden image | Bevy vs Vulkan framebuffer compare per scripted scene | `krkr-render` |
-| Blend matrix | one quad per `BlendMode` over a known background | `krkr-render` |
-| Integration | `krkr-rs run <game> --headless` scene dump snapshot | `krkr-app` |
+| Golden image | Bevy vs Vulkan framebuffer compare per scripted scene | `render` |
+| Blend matrix | one quad per `BlendMode` over a known background | `render` |
+| Integration | `krkr-rs run <game> --headless` scene dump snapshot | `app` |
 | Parity | `scripts/native_parity.py` (100% tracked coverage) | CI |
-| Media | host-testable pure parts (YUV, TLG, decode wrappers) | `krkr-media` |
-| FS | in-memory `FileSystem` fixtures, real-game mount | `krkr-fs`/`krkr-engine` |
+| Media | host-testable pure parts (YUV, TLG, decode wrappers) | `media` |
+| FS | in-memory `FileSystem` fixtures, real-game mount | `fs`/`engine` |
 | Android | compile + symbol checks in CI; device run manual | CI / manual |
 
 Regression rule: the headless scene dump and the native-parity report are
@@ -228,9 +228,9 @@ the two coarse "nothing broke" signals and must be checked at every phase.
 
 ## 7. Open questions for review
 
-1. **Glyph engine placement**: `krkr-render` vs a standalone `krkr-glyph`
+1. **Glyph engine placement**: `render` vs a standalone `krkr-glyph`
    crate vs `krkr-core`. The `FontSystem`/`Font` objects have no GPU
-   dependency. (Plan: `krkr-render` initially.)
+   dependency. (Plan: `render` initially.)
 2. **`RenderScene` ownership**: does L2 keep a *parallel* `RenderScene`
    projected from the TVP layer tree each frame (plan: simple field copy),
    or do the L2 layer nodes embed a `RenderNode` so there is one tree and no
@@ -260,7 +260,7 @@ The migration is complete when, on both Linux and Android:
   in `02-target-architecture.md`, and the render pipeline consumes the
   `RenderScene` tree, verified by the dependency acceptance tests in
   `02-target-architecture.md §9`;
-* `krkr-engine` contains no render traversal, draw-list or batching code;
+* `engine` contains no render traversal, draw-list or batching code;
 * the old Bevy renderer, wgpu materials, and the `VM_RUN_LOCK` workaround
   are deleted;
 * documentation (`README`, `docs/portability.md`, `docs/android.md`,

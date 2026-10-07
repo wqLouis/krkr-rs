@@ -49,13 +49,13 @@ that separation in Rust.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│ L4  TJS VM engine        tjs2-sys (C++ VM) + VM host, GC, bytecode    │
+│ L4  TJS VM engine        tjs (C++ VM) + VM host, GC, bytecode    │
 │     top layer; drives the L3 natives, uses the L1 platform abstraction│
 ├──────────────────────────────────────────────────────────────────────┤
 │ L3  KiriKiri compatibility  native classes + KAG + event adapter +    │
 │     static plugins; composes L2 primitives into the script API        │
 ├──────────────────────────────────────────────────────────────────────┤
-│ L2  Middle layer — a small, generic game engine (krkr-engine)         │
+│ L2  Middle layer — a small, generic game engine (engine)         │
 │     the layer system (scene graph), bitmaps/sprites, audio/video,     │
 │     input, timers, VFS namespace; owns engine state; not TVP-specific │
 ├──────────────────────────────────────────────────────────────────────┤

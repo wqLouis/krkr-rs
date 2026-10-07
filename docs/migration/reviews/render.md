@@ -1,13 +1,13 @@
-# Render layer code review — `crates/krkr-render`
+# Render layer code review — `crates/render`
 
-Scope: `crates/krkr-render/src/{lib,scene,state,texture,null,glyph}.rs` and
+Scope: `crates/render/src/{lib,scene,state,texture,null,glyph}.rs` and
 `src/vulkan/{mod,device,swapchain,pipelines,texture,draw,shaders}.rs`.
 
 Read against the intended design:
 `docs/migration/04-renderer-vulkan.md` and `docs/migration/03-middle-layer-api.md`
 (§0 model, §2 render pipeline, §3 glyph), with cross-checks against the L2
-projection (`crates/krkr-engine/src/projection.rs`,
-`crates/krkr-app/src/lib.rs`) and `crates/krkr-api/src/{geometry,blend,error}.rs`.
+projection (`crates/engine/src/projection.rs`,
+`crates/app/src/lib.rs`) and `crates/api/src/{geometry,blend,error}.rs`.
 
 Method: source read-only. No `cargo`/build/test was run. Line references are
 `path:line` from the repository root.
@@ -53,7 +53,7 @@ synchronization.
 
 ### 1.1 The projection matrix flips the scene vertically — **High**
 
-`crates/krkr-render/src/vulkan/draw.rs:398-414`:
+`crates/render/src/vulkan/draw.rs:398-414`:
 
 ```rust
 let b = -2.0 / extent.height.max(1) as f32;
@@ -65,7 +65,7 @@ b * affine.ty + 1.0,
 With the identity affine this produces `ndc_y = -2·y/h + 1`. In Vulkan, NDC
 `y = -1` is the **top** of the framebuffer (the viewport has positive height,
 `mod.rs:545-552`), whereas L2 explicitly uses a **y-down** convention
-(`crates/krkr-engine/src/raster.rs:8`, and `dst` from
+(`crates/engine/src/raster.rs:8`, and `dst` from
 `visible_image_region`/`projection.rs:400-430` is top-left based). The mapping
 therefore puts world `y = 0` at the framebuffer bottom. The correct y-down
 mapping is `ndc_y = +2·y/h - 1`.
@@ -84,7 +84,7 @@ this (there is no GPU test).
 
 ### 1.2 `begin_render_state` leaks the device/surface on late errors — **High**
 
-`crates/krkr-render/src/vulkan/mod.rs:257` (`create_frames(...)?`), `:259-271`
+`crates/render/src/vulkan/mod.rs:257` (`create_frames(...)?`), `:259-271`
 (the `render_finished` collect), and `:274` (`create_upload_resources(...)?`)
 all early-return with `?` **after** the device, swapchain, pipelines and surface
 were created. Unlike the two cleanup blocks at `:195-205` and `:240-250`, these
@@ -305,7 +305,7 @@ forbidden here, but these two catch most of the remaining risk.
    source alpha (`ONE`/`ZERO`, `pipelines.rs:194-203`) and `Multiply` multiplies
    color (`DST_COLOR`/`ZERO`, `:228-236`). L2 currently compensates by degrading
    `Replace` to `SourceOver` below full opacity
-   (`crates/krkr-engine/src/projection.rs:190-193`), but L1 is supposed to own
+   (`crates/engine/src/projection.rs:190-193`), but L1 is supposed to own
    composition (§2.5). This needs the signed-off blend-matrix tests
    (`04-renderer-vulkan.md §11.2`).
 
@@ -382,7 +382,7 @@ item (with a test) rather than an implicit gap:
   are absent. Validate against `07-roadmap.md §6`.
 - **Platform surface entry point** — `begin_render_state` derives a display
   handle only for Android/Win32 (`mod.rs:946-953`), so the Linux/X11/Wayland
-  path must use `begin_render_state_with_display`. `crates/krkr-app/src/lib.rs`
+  path must use `begin_render_state_with_display`. `crates/app/src/lib.rs`
   calls the former, so the app cannot create a Vulkan surface on Linux as
   written. Consider a single `begin_render_state(display, window)` (or have the
   host always pass both).
@@ -393,46 +393,46 @@ item (with a test) rather than an implicit gap:
 
 ## 6. Top 10 recommended changes
 
-1. **Fix the vertical flip (and align the scissor).** `crates/krkr-render/src/vulkan/draw.rs:400` —
+1. **Fix the vertical flip (and align the scissor).** `crates/render/src/vulkan/draw.rs:400` —
    use `b = 2.0 / height` and `-b·ty - 1` so world y-down maps to Vulkan NDC
    (`y=0` → `-1`); re-check `rect_to_scissor` at `:335`. Add a golden-image test.
-2. **Fix error-path leaks in `begin_with_display`.** `crates/krkr-render/src/vulkan/mod.rs:257`,
+2. **Fix error-path leaks in `begin_with_display`.** `crates/render/src/vulkan/mod.rs:257`,
    `:259`, `:274` — guard `create_frames`, the `render_finished` collect, and
    `create_upload_resources` with an RAII teardown.
 3. **Reject mismatched `Surface`/`RenderState` and tie their lifetimes.**
-   `crates/krkr-render/src/vulkan/mod.rs:452` (render) and `:331` (resize) —
+   `crates/render/src/vulkan/mod.rs:452` (render) and `:331` (resize) —
    compare against `vstate.surface`; give `Surface` ownership or a lifetime tie.
-4. **Make the acquired-image semaphore error-safe.** `crates/krkr-render/src/vulkan/mod.rs:494-516` —
+4. **Make the acquired-image semaphore error-safe.** `crates/render/src/vulkan/mod.rs:494-516` —
    any failure after `acquire_next_image` must consume or recreate
    `image_available`.
 5. **Replace per-upload staging alloc + fence wait with a persistent ring /
-   batched uploads.** `crates/krkr-render/src/vulkan/texture.rs:225-340`.
+   batched uploads.** `crates/render/src/vulkan/texture.rs:225-340`.
 6. **Recreate `render_finished` semaphores per swapchain generation.**
-   `crates/krkr-render/src/vulkan/mod.rs:922-939` — do not reuse semaphores that
+   `crates/render/src/vulkan/mod.rs:922-939` — do not reuse semaphores that
    a `present` may have signalled.
-7. **Cache memory properties and use `1u32`.** `crates/krkr-render/src/vulkan/texture.rs:503-512`.
+7. **Cache memory properties and use `1u32`.** `crates/render/src/vulkan/texture.rs:503-512`.
 8. **Stop cloning+sorting children every node every frame.**
-   `crates/krkr-render/src/vulkan/draw.rs:122` and `crates/krkr-render/src/null.rs:334` —
+   `crates/render/src/vulkan/draw.rs:122` and `crates/render/src/null.rs:334` —
    iterate borrowed and sort only when dirty/unsorted.
 9. **Narrow the public construction surface and honor or remove
-   `preferred_format`.** `crates/krkr-render/src/lib.rs:58`, `:89`, `:156`,
-   `:177`; `crates/krkr-render/src/vulkan/mod.rs:121`.
-10. **Fix the remaining partial-creation leaks.** `crates/krkr-render/src/vulkan/texture.rs:107`
+   `preferred_format`.** `crates/render/src/lib.rs:58`, `:89`, `:156`,
+   `:177`; `crates/render/src/vulkan/mod.rs:121`.
+10. **Fix the remaining partial-creation leaks.** `crates/render/src/vulkan/texture.rs:107`
     (image after `find_memory_type`), `:243` (staging buffer after `map_memory`),
     `:362` (`create_staging_buffer`), and
-    `crates/krkr-render/src/vulkan/pipelines.rs:353` (`create_unit_quad`).
+    `crates/render/src/vulkan/pipelines.rs:353` (`create_unit_quad`).
 
 ### Honourable mentions
 
 - Make `GpuCapabilities` truthful across backends
-  (`crates/krkr-render/src/null.rs:69-70` vs
-  `crates/krkr-render/src/vulkan/mod.rs:142-144`).
+  (`crates/render/src/null.rs:69-70` vs
+  `crates/render/src/vulkan/mod.rs:142-144`).
 - Add `#[non_exhaustive]` to `PipelineConfig`/`GpuCapabilities`/`BackendKind`
-  (`crates/krkr-render/src/lib.rs:66`, `:83`, `:119`) and
+  (`crates/render/src/lib.rs:66`, `:83`, `:119`) and
   `#![deny(unsafe_op_in_unsafe_fn)]` + `clippy::undocumented_unsafe_blocks`.
 - Replace the pointer-identity `Texture` key with a monotonic id
-  (`crates/krkr-render/src/texture.rs:130-134`).
+  (`crates/render/src/texture.rs:130-134`).
 - Route all Vulkan failures through `device::result_error`
-  (`crates/krkr-render/src/vulkan/device.rs:305`).
+  (`crates/render/src/vulkan/device.rs:305`).
 - Add the compile-time push-constant size assertion
-  (`crates/krkr-render/src/vulkan/draw.rs:23`).
+  (`crates/render/src/vulkan/draw.rs:23`).

@@ -1,21 +1,16 @@
 [package]
 name = "engine"
-description = "krkr-rs load module: mount game storages, bootstrap the TJS2 VM, run startup.tjs"
+description = "krkr-rs middle layer: TVP layer system state + RenderScene projection + mixer + storage namespace"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-xp3 = { workspace = true }
-tjs2-sys = { workspace = true }
-kag = { path = "../kag" }
-tvp-util = { path = "../tvp-util" }
-tvp-streams = { path = "../tvp-streams" }
-log = "0.4"
-thiserror = "2"
+api = { workspace = true }
+fs = { workspace = true }
+render = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
 
-# Android has no usable stderr: route logging to logcat instead. Scoped to
-# the target so the desktop build stays exactly as it was (stderr only) and
-# does not compile a JNI/logcat dependency.
-[target.'cfg(target_os = "android")'.dependencies]
-android_logger = "0.15"
+[dev-dependencies]
+testkit = { workspace = true }

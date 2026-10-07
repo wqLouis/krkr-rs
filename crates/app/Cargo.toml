@@ -1,0 +1,24 @@
+[package]
+name = "app"
+description = "krkr-rs host: L2 engine host + L1 render assembly (platform loop in platform)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "krkr"
+path = "src/main.rs"
+
+[dependencies]
+api = { workspace = true }
+engine = { workspace = true }
+# D13: select the platform explicitly; platform has no default feature.
+# The desktop binary builds the Linux backend. An Android frontend must depend
+# on `platform` with `features = ["platform-android"]` instead.
+platform = { workspace = true, features = ["platform-linux"] }
+render = { workspace = true }
+fs = { workspace = true }
+media = { workspace = true }
+raw-window-handle = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }

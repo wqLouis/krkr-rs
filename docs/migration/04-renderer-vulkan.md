@@ -43,7 +43,7 @@ Likely helper crates (to be confirmed before implementation):
 L4 host (winit / android-activity)
    │  frame boundary
    ▼
-krkr-render::RenderPipeline   (`&self`, stateless)
+render::RenderPipeline   (`&self`, stateless)
    ├─ Device       — instance, physical/logical device, queues, allocator
    ├─ Pipeline set — shader programs + blend/attachment state
    ├─ Traversal    — walks the L2-owned RenderScene tree
@@ -201,8 +201,8 @@ handling becomes a small immediate-mode state machine fed by `InputState`.
 |-------|------|
 | `render/src/sync.rs` (`sync_scene`, `BitmapAssets`, `GpuPrimitives`, `FrameBlendMaterials`) | replaced by the L2 `RenderScene` projection + L1 `RenderPipeline` |
 | `render/src/blend.rs` (`LayerBlendMaterial`, wgpu `BlendState`, WGSL) | TVP→`BlendMode` mapping kept in L2; wgpu `BlendState` re-expressed as Vulkan state in L1 |
-| `render/src/main.rs` demo harness | keep as a `krkr-render` example once the new API exists |
-| `render/src/runner.rs` Bevy `App` wiring | replaced by `krkr-app` loop |
+| `render/src/main.rs` demo harness | keep as a `render` example once the new API exists |
+| `render/src/runner.rs` Bevy `App` wiring | replaced by `app` loop |
 | `render/src/input_bridge.rs` Bevy event reads | split: event source → host; logic → L2 |
 | `render/src/menu.rs` Bevy UI | reimplemented as CPU-drawn menu |
 | `render/src/touch_gesture.rs` | moved to L2 (already pure) |
@@ -251,5 +251,5 @@ already measured as fast on the warm path (`docs/font_crates.md`).
 2. **Blend matrix tests**: one quad per `BlendMode` over a known background,
    signed off against the reference formulas.
 3. **Surface lifecycle tests**: resize, minimize, device-lost simulation.
-4. **No-Bevy build**: `cargo tree -p krkr-render` contains neither `bevy`
+4. **No-Bevy build**: `cargo tree -p render` contains neither `bevy`
    nor `wgpu`.

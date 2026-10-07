@@ -1,11 +1,11 @@
-# Review — `krkr-fs` (L1 fs + XP3) and `krkr-engine` (L2 VFS + startup)
+# Review — `fs` (L1 fs + XP3) and `engine` (L2 VFS + startup)
 
 Scope:
 
-- `crates/krkr-fs/` — the stateless `FileSystem` / `FileState` service, the
+- `crates/fs/` — the stateless `FileSystem` / `FileState` service, the
   host and in-memory backends, and the XP3 read+parse moved into L1.
-- `crates/krkr-engine/src/storage.rs` — the L2 storage namespace / VFS.
-- `crates/krkr-engine/src/startup.rs` — startup-script discovery.
+- `crates/engine/src/storage.rs` — the L2 storage namespace / VFS.
+- `crates/engine/src/startup.rs` — startup-script discovery.
 - their integration tests under `tests/` (no inline test modules).
 
 Reviewed against:
@@ -15,8 +15,8 @@ Reviewed against:
   startup order, typed errors);
 - `docs/migration/06-file-system.md` (the L1/L2 split).
 
-Method: read-only, plus `cargo check -p krkr-fs --all-targets` and
-`cargo check -p krkr-engine --all-targets` (both clean). No tests were run.
+Method: read-only, plus `cargo check -p fs --all-targets` and
+`cargo check -p engine --all-targets` (both clean). No tests were run.
 
 Severity legend: **Critical** (breaks an invariant / exploitable) · **High**
 (likely bug or clear design break) · **Medium** (correctness or cost risk) ·
@@ -50,7 +50,7 @@ still has a hardcoded chain cap and silently accepts structurally incomplete
 
 ### 1.1 `read_index` has a hardcoded `chain > 256` cap and no cycle detection — High
 
-`crates/krkr-fs/src/xp3.rs:299-305`
+`crates/fs/src/xp3.rs:299-305`
 
 ```rust
 let mut chain = 0usize;
@@ -80,7 +80,7 @@ reference.
 
 ### 1.2 `parse_file_chunk` silently defaults missing required sub-chunks — High
 
-`crates/krkr-fs/src/xp3.rs:377-452`
+`crates/fs/src/xp3.rs:377-452`
 
 `parse_file_chunk` initializes `flags/org_size/arc_size/raw_name/segments/
 file_hash` to defaults and only fills them when it happens to see the
@@ -105,12 +105,12 @@ entry.
 
 ### 1.3 `Storage::find` swallows every `FsError` and returns `Option` — High
 
-`crates/krkr-engine/src/storage.rs:277-340` (disk probes at `:391`,
+`crates/engine/src/storage.rs:277-340` (disk probes at `:391`,
 `:397`, `:411-434`), consumed by `read` `:447`, `stat` `:473`, `exists`,
-and `discover_startup` at `crates/krkr-engine/src/startup.rs:84-89`.
+and `discover_startup` at `crates/engine/src/startup.rs:84-89`.
 
-`find_disk_relative` uses `krkr_fs::stat(...).is_ok_and(|m| !m.is_dir)` and
-`find_disk_case_insensitive` uses `krkr_fs::list(...).ok()?`. Every error —
+`find_disk_relative` uses `fs::stat(...).is_ok_and(|m| !m.is_dir)` and
+`find_disk_case_insensitive` uses `fs::list(...).ok()?`. Every error —
 `PermissionDenied`, `Io`, an unrepresentable path — is collapsed into `None`.
 `Storage::read` then maps the result to `StorageReadError::NotFound`, and
 `discover_startup` turns a permission failure reading `startup.tjs` into
@@ -131,7 +131,7 @@ error instead of returning `NoStartupScript`.
 
 ### 1.4 `read_entry` trusts `entry.org_size`; mismatch is only a `debug_assert` — Medium
 
-`crates/krkr-fs/src/xp3.rs:242-283`
+`crates/fs/src/xp3.rs:242-283`
 
 `expected` is computed from the segment sizes (raw → `arc_size`, zlib →
 `org_size`) and `out.len()` is guaranteed to equal `expected`, but the code
@@ -147,11 +147,11 @@ also makes the `org_size`/`arc_size` fields on `Entry` trustworthy.)
 
 ### 1.5 Auto-path disk lookup ignores `is_dir` and case-insensitive resolution — Medium
 
-`crates/krkr-engine/src/storage.rs:329-334`
+`crates/engine/src/storage.rs:329-334`
 
 ```rust
 let candidate = self.game_dir.join(dir).join(base);
-if krkr_fs::stat(&self.fs, &FsPath::host(&candidate)).is_ok() {
+if fs::stat(&self.fs, &FsPath::host(&candidate)).is_ok() {
     return Some(Location::Disk(candidate));
 }
 ```
@@ -168,7 +168,7 @@ relative name) so behaviour is uniform.
 
 ### 1.6 `unmount_archive` falls back to base-name matching and can remove the wrong archive(s) — Medium
 
-`crates/krkr-engine/src/storage.rs:227-247`
+`crates/engine/src/storage.rs:227-247`
 
 When the supplied path has a `file_name()`, the `retain` predicate removes
 **every** mounted archive whose `file_name` matches case-insensitively, even if
@@ -183,7 +183,7 @@ than silently removing all matches.
 
 ### 1.7 `find_xp3_offset` only overlaps full-chunk reads — Medium
 
-`crates/krkr-fs/src/xp3.rs:542-566`
+`crates/fs/src/xp3.rs:542-566`
 
 The 16-byte rewind that catches a magic straddling a read boundary runs only
 when `n == CHUNK` (`:561`). `read_at` on the host backend may legitimately
@@ -196,7 +196,7 @@ simple `Vec<u8>` carry buffer is clearer than seek arithmetic.
 
 ### 1.8 `Xp3Archive::open` erases non-EOF errors while reading the magic — Medium
 
-`crates/krkr-fs/src/xp3.rs:177-179`
+`crates/fs/src/xp3.rs:177-179`
 
 ```rust
 reader
@@ -216,10 +216,10 @@ run the rest through the existing `Xp3Error::from(io::Error)` conversion so
 
 ### 1.9 `collect_disk_entries` silently swallows all list errors — Medium
 
-`crates/krkr-engine/src/storage.rs:630-641` (via `get_file_list`)
+`crates/engine/src/storage.rs:630-641` (via `get_file_list`)
 
 ```rust
-let Ok(entries) = krkr_fs::list(&self.fs, &FsPath::host(dir)) else {
+let Ok(entries) = fs::list(&self.fs, &FsPath::host(dir)) else {
     return;
 };
 ```
@@ -237,7 +237,7 @@ error.
 
 ### 1.10 `find`/`exists` cannot resolve directories — Medium
 
-`crates/krkr-engine/src/storage.rs:363-364`, `:370-371`, `:411-434`
+`crates/engine/src/storage.rs:363-364`, `:370-371`, `:411-434`
 
 Both the direct and the case-insensitive disk probes require `!is_dir`, so
 `Storage::find("savedata")`/`Storage::exists("savedata")` are `false` even when
@@ -254,22 +254,22 @@ resolved location. Do not leave `exists` implying the reference semantics while
 
 ## 2. Smaller observations (not ranked)
 
-- `crates/krkr-fs/src/xp3.rs:352-373` and `:377-395`: the chunk loops stop on
+- `crates/fs/src/xp3.rs:352-373` and `:377-395`: the chunk loops stop on
   `data.len().saturating_sub(pos) >= 12`, so trailing bytes (a truncated chunk
   header or payload) are silently dropped. The reference also stops searching,
   but D11 argues for a `CorruptIndex` when `pos != data.len()` after the loop.
-- `crates/krkr-fs/src/lib.rs:209-213`: `lock()` recovers from a poisoned mutex
+- `crates/fs/src/lib.rs:209-213`: `lock()` recovers from a poisoned mutex
   and keeps using the `MemoryStore`. This is documented, but it can observe a
   half-applied mutation after a panic. A typed error (or `expect`) would be
   more honest for a test/wasm backend.
-- `crates/krkr-fs/src/xp3.rs:283` compared with `Storage::stat`
+- `crates/fs/src/xp3.rs:283` compared with `Storage::stat`
   (`storage.rs:488`) is the only place the two size notions can diverge; see
   1.4.
 - Tests: there is no test for a chained (`INDEX_CONTINUE`) index, a `File`
   chunk missing `segm`/`info`/`aldr`, or an `org_size`/segment-sum mismatch —
   the exact cases behind 1.1, 1.2 and 1.4. The `xp3_builder` helper is also
-  duplicated verbatim in `crates/krkr-fs/tests/common/` and
-  `crates/krkr-engine/tests/common/`.
+  duplicated verbatim in `crates/fs/tests/common/` and
+  `crates/engine/tests/common/`.
 - `docs/migration/06-file-system.md:44-52` still says the middle layer owns the
   archive containers (`xp3`), which contradicts the revised D6 in
   `02-target-architecture.md` §5 and doc 09. Update doc 06 so the design and
@@ -283,7 +283,7 @@ resolved location. Do not leave `exists` implying the reference semantics while
 
 ## 3. What is correct (spot checks)
 
-- D6: `Xp3Archive` (`krkr-fs/src/xp3.rs:159-165`) stores only `base` + the
+- D6: `Xp3Archive` (`fs/src/xp3.rs:159-165`) stores only `base` + the
   `BTreeMap`; reads take `&FileState` and use positional `read_at`; no handle
   or cursor is hidden in L1. L2 (`MountedArchive`) owns every `FileState`.
 - D15 precedence: `find` iterates `archives.iter().rev()` (`storage.rs:312`),

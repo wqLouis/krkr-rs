@@ -35,10 +35,10 @@ cross-checked") is now superseded for Android — see §2 below.
 
 - **The C++ TJS2 VM cross-compiles for Android.** Zig cannot do it (it refuses
   to provide Android libc: `unable to provide libc for target
-  aarch64-linux.5.10...android.29`), but `crates/tjs2-sys/build.rs` already
+  aarch64-linux.5.10...android.29`), but `crates/tjs/build.rs` already
   honours a `CXX` override, so pointing it at the NDK's
   `aarch64-linux-android21-clang++` and running
-  `cargo check -p tjs2-sys --target aarch64-linux-android` **succeeds in ~19 s**
+  `cargo check -p tjs --target aarch64-linux-android` **succeeds in ~19 s**
   (NDK r27c, bison + python present). This was the single largest unknown and
   it is now a known-good path. `docs/portability.md` §2/§11's statement that
   the full path "was not cross-checked because build.rs compiles for the host
@@ -50,7 +50,7 @@ cross-checked") is now superseded for Android — see §2 below.
   (→ `bevy_internal/android-game-activity` → `bevy_winit` →
   `winit/android-game-activity`) and the `android-native-activity`
   alternative (`bevy_winit-0.19.1/Cargo.toml:43-44`).
-- **`tjs2-sys/build.rs` is not target-aware** (`:332`): it gates the C++
+- **`tjs/build.rs` is not target-aware** (`:332`): it gates the C++
   runtime link flags on `env::consts::OS`, which in a build script is the
   **host** OS. A Linux→Android build therefore emits desktop-only
   `-lc++ -lc++abi` instead of letting the NDK clang link `libc++_static`. Must
@@ -65,7 +65,7 @@ cross-checked") is now superseded for Android — see §2 below.
   Android cross-build uses the NDK clang; zig remains the toolchain for the
   Linux/host build.
 - **`cargo ndk` must not be used for this build.** It does not set `CXX` in the
-  form `crates/tjs2-sys/build.rs` reads (it sets the target-scoped
+  form `crates/tjs/build.rs` reads (it sets the target-scoped
   `CXX_<triple>`), so the build script falls back to its default `zig c++` —
   which targets the **host**. `cargo ndk -t arm64-v8a build` was measured
   producing `out/obj/tjsInterCodeExec.o: ELF 64-bit … x86-64` inside an Android

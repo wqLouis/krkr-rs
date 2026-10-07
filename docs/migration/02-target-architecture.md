@@ -15,7 +15,7 @@ loading is in [`09-game-loading.md`](09-game-loading.md).
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
 │ L4  TJS VM engine                                                     │
-│     tjs2-sys (the C++ VM) + VM lifecycle, GC, bytecode, script cache. │
+│     tjs (the C++ VM) + VM lifecycle, GC, bytecode, script cache. │
 │     The topmost layer. Drives the L3 native surface; uses the L1      │
 │     platform abstraction directly.                                    │
 ├──────────────────────────────────────────────────────────────────────┤
@@ -62,12 +62,12 @@ L1  →  OS / Vulkan / FFmpeg / MediaCodec only
 
 | Concern | Earlier draft | Now |
 |---|---|---|
-| Host / window / event loop | top layer (old L4 `krkr-app`) | **L1** platform core |
+| Host / window / event loop | top layer (old L4 `app`) | **L1** platform core |
 | Platform-specific code | spread across top and backends | **confined to L1**, one abstraction |
 | TJS VM | old L3 (`krkr-tjs`) | **L4**, above the compat surface |
 | Compat surface (native classes + KAG) | old L3 | **L3**, composing L2 |
 | L2 role | TVP semantics + layer system + all state | **a generic game engine** with fundamental APIs **including the layer system (scene graph)**; owns engine state, but no TVP semantics |
-| Archive parsing | L2 (`krkr-engine::archive`) | **L1** (stateless read+parse); L2 sees a parsed FS |
+| Archive parsing | L2 (`engine::archive`) | **L1** (stateless read+parse); L2 sees a parsed FS |
 | Native plugins | static Rust families + `Plugins.link` no-op success | **statically built into L3**, with a null-plugin object for missing DLLs (D14) |
 | Backend selection | runtime flag during migration | **compile-time features/cfg** (D13) |
 
@@ -142,7 +142,7 @@ feature.
 
 ### 2.4 L4 — TJS VM engine
 
-* `tjs2-sys` (the C++ VM) plus the VM host: creation, the log callback,
+* `tjs` (the C++ VM) plus the VM host: creation, the log callback,
   bytecode compilation, script cache, GC roots, `exec_script`.
 * The topmost layer. It calls into the L3 native surface and uses the L1
   platform abstraction for its non-VM needs.
@@ -215,35 +215,35 @@ Names are provisional; the dependency direction is the contract.
 ```
 crates/
   # L1 — platform core ------------------------------------------------------
-  krkr-api        shared DTOs + error types (no impls)
-  krkr-fs         stateless FileSystem + FileState + XP3 read/parse
-  krkr-render     stateless RenderPipeline/FontSystem + Vulkan + glyph
-  krkr-media      stateless Media + image/audio/video decode
+  api        shared DTOs + error types (no impls)
+  fs         stateless FileSystem + FileState + XP3 read/parse
+  render     stateless RenderPipeline/FontSystem + Vulkan + glyph
+  media      stateless Media + image/audio/video decode
                   (media-ffmpeg | media-mediacodec)
-  krkr-platform   window/surface, event loop, input, clock, threads,
+  platform   window/surface, event loop, input, clock, threads,
                   process lifecycle; winit | android-activity; the
                   platform abstraction higher layers use
 
   # L2 — the small game engine ---------------------------------------------
-  krkr-engine     Scene/Bitmap/Sprite, mixer, timers, the VFS namespace,
+  engine     Scene/Bitmap/Sprite, mixer, timers, the VFS namespace,
                   RenderScene projection; owns engine state
 
   # L3 — KiriKiri compatibility --------------------------------------------
-  krkr-compat     native classes + KAG + event adapter + static plugins
+  compat     native classes + KAG + event adapter + static plugins
                   (absorbs today's tvp-natives/tvp-visual/tvp-storages/
                    tvp-scripts/tvp-input/tvp-sound/tvp-text/tvp-kagparser)
 
   # L4 — TJS VM -------------------------------------------------------------
-  krkr-vm         TJS VM host over tjs2-sys + the composition root
-  tjs2-sys        the C++ VM FFI (unchanged)
+  vm         TJS VM host over tjs + the composition root
+  tjs        the C++ VM FFI (unchanged)
 
   # root --------------------------------------------------------------------
-  krkr-app        thin binary: select platform, wire L1..L4, start the loop
+  app        thin binary: select platform, wire L1..L4, start the loop
 ```
 
 Existing crates are not renamed in one go. The machinery:
-* keep `tjs2-sys`, `tvp-util`, `tvp-streams` where they are unless in the way;
-* fold the `tvp-*` native families into `krkr-compat` as `plugins/*`;
+* keep `tjs`, `tvp-util`, `tvp-streams` where they are unless in the way;
+* fold the `tvp-*` native families into `compat` as `plugins/*`;
 * the old `engine` loader splits: mount/discover → L2, execute → L3/L4;
 * keep the game runnable at every step (roadmap).
 
@@ -251,16 +251,16 @@ Existing crates are not renamed in one go. The machinery:
 
 | Concern | Owner | Notes |
 |---------|-------|-------|
-| Window/surface/event loop/input/clock/threads | L1 `krkr-platform` | all platform code here |
-| Vulkan device/pipeline/draw | L1 `krkr-render` | consumes `RenderScene` |
-| Glyph rasterization | L1 `krkr-render` | pure transform |
-| Image/audio/video decode | L1 `krkr-media` | backend by compile-time feature |
-| Raw path IO + XP3 parse | L1 `krkr-fs` | stateless |
-| **Layer system (generic scene graph)**, mixer, timers, VFS namespace, caches | L2 `krkr-engine` | engine state; no TVP semantics |
-| Projection scene → `RenderScene` | L2 `krkr-engine` | field copy, not a draw list |
-| Native classes, KAG, TVP semantics, event adaptation, plugins | L3 `krkr-compat` | composes L2 |
-| VM lifecycle, bytecode, GC, frame body | L4 `krkr-vm` | top layer |
-| Composition/wiring | `krkr-app` | no platform logic |
+| Window/surface/event loop/input/clock/threads | L1 `platform` | all platform code here |
+| Vulkan device/pipeline/draw | L1 `render` | consumes `RenderScene` |
+| Glyph rasterization | L1 `render` | pure transform |
+| Image/audio/video decode | L1 `media` | backend by compile-time feature |
+| Raw path IO + XP3 parse | L1 `fs` | stateless |
+| **Layer system (generic scene graph)**, mixer, timers, VFS namespace, caches | L2 `engine` | engine state; no TVP semantics |
+| Projection scene → `RenderScene` | L2 `engine` | field copy, not a draw list |
+| Native classes, KAG, TVP semantics, event adaptation, plugins | L3 `compat` | composes L2 |
+| VM lifecycle, bytecode, GC, frame body | L4 `vm` | top layer |
+| Composition/wiring | `app` | no platform logic |
 
 ## 8. Threading
 

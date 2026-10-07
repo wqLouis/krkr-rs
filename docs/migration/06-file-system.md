@@ -15,11 +15,11 @@ keep their current surface.
 
 | Concern | Today | Target |
 |---------|-------|--------|
-| Game mount + namespace (`arc.xp3>path`, disk-over-archive, case rules, auto-path) | `engine/src/storage.rs` (concrete `PathBuf`/`fs`) | L2 `krkr-engine::storage` over the `FileSystem` object |
-| XP3 container parsing + segment read | `crates/xp3/src/archive.rs` (owns `std::fs::File`, seek/read) | L1 `krkr-fs::xp3`, a stateless parse + positional read over a `FileState`; L2 registers the parsed index |
-| Raw host path IO | `std::fs` scattered in `engine`, `tvp-storages`, `tvp-visual`, `tvp-natives`, `engine::logging`, `engine::state` | L1 `krkr-fs` (`FileSystem` + `FileState`) |
+| Game mount + namespace (`arc.xp3>path`, disk-over-archive, case rules, auto-path) | `engine/src/storage.rs` (concrete `PathBuf`/`fs`) | L2 `engine::storage` over the `FileSystem` object |
+| XP3 container parsing + segment read | `crates/xp3/src/archive.rs` (owns `std::fs::File`, seek/read) | L1 `fs::xp3`, a stateless parse + positional read over a `FileState`; L2 registers the parsed index |
+| Raw host path IO | `std::fs` scattered in `engine`, `tvp-storages`, `tvp-visual`, `tvp-natives`, `engine::logging`, `engine::state` | L1 `fs` (`FileSystem` + `FileState`) |
 | Stream abstraction | `tvp-streams::binary::BinaryStream` (exists, unused by storage) | L2 wrapper over a `FileState` + cursor |
-| TJS `Array.save/load/saveStruct` | C++ `std::fopen` in `tjs2-sys/cpp/streams.cpp` | unresolved; see §6 |
+| TJS `Array.save/load/saveStruct` | C++ `std::fopen` in `tjs/cpp/streams.cpp` | unresolved; see §6 |
 | Android SAF / APK assets | SAF→path + `MANAGE_EXTERNAL_STORAGE` (option A, `docs/android.md §4`) | optional `Uri` root |
 
 The read path today has **no abstraction** (`docs/portability.md`); this is
@@ -27,14 +27,14 @@ the largest structural change of the three bottom components.
 
 ## 2. Boundaries
 
-### Bottom (`krkr-fs`) owns
+### Bottom (`fs`) owns
 
 * the stateless `FileSystem` object (backend kind + base);
 * stateless functions: open, stat, exists, list, create dirs, remove, copy,
   rename;
 * the `FileState` value: the open handle **and** the logical cursor;
 * positional `read_at`/`write_at`, `size`, `flush` over a `FileState`;
-* the XP3 container read + parse (`krkr-fs::xp3`): given the bytes through a
+* the XP3 container read + parse (`fs::xp3`): given the bytes through a
   `FileState`, it returns only parsed index metadata (base offset + entry
   map) and reads segments through positional `read_at`. It holds no file
   handle and no cursor of its own;
@@ -45,7 +45,7 @@ It knows **nothing** about namespace resolution, caches or which archive a
 name belongs to. It never keeps a table of open files; L2 stores each
 `FileState`.
 
-### Middle (`krkr-engine`) owns
+### Middle (`engine`) owns
 
 * storage namespaces: game dir + mounted archives, disk-wins ordering;
 * `arc.xp3>path` addressing and the specific-archive prefix;
@@ -59,11 +59,11 @@ name belongs to. It never keeps a table of open files; L2 stores each
   `deleteFile`, `copyFile`, save-data writes.
 
 > **D6 note.** The XP3 container is read and parsed in L1
-> (`krkr-fs::xp3`), because parsing is a stateless transform over bytes.
+> (`fs::xp3`), because parsing is a stateless transform over bytes.
 > L2 only owns the resulting parsed index and the open handles. The middle
 > layer therefore does **not** own the `xp3` container; this corrects the
 > earlier sketch in this document and is the contract implemented by
-> `krkr-engine::storage` and `docs/migration/09-game-loading.md`.
+> `engine::storage` and `docs/migration/09-game-loading.md`.
 
 ### Natives (`krkr-tjs`) keep
 
@@ -155,7 +155,7 @@ All of them become testable with the in-memory root.
 
 ## 6. The C++ `fopen` bypass
 
-`tjs2-sys/cpp/streams.cpp` implements TJS `Array.save/load/saveStruct` with
+`tjs/cpp/streams.cpp` implements TJS `Array.save/load/saveStruct` with
 `std::fopen` directly, bypassing Rust storage. This is the one IO path the
 stateless fs surface cannot reach. Options:
 
@@ -197,12 +197,12 @@ L2-owned index state.
 
 ## 9. Migration steps specific to FS
 
-1. Define the stateless `FileSystem`/`FileState` API in `krkr-api`
+1. Define the stateless `FileSystem`/`FileState` API in `api`
    (`03-middle-layer-api.md §1`).
 2. Implement the host path root + the in-memory root.
-3. Read + parse XP3 in L1 `krkr-fs::xp3` over positional reads, returning
+3. Read + parse XP3 in L1 `fs::xp3` over positional reads, returning
    only parsed index metadata; L2 owns the `FileState`s and any buffering.
-4. Move `engine::Storage` into L2 `krkr-engine` on top of the fs functions;
+4. Move `engine::Storage` into L2 `engine` on top of the fs functions;
    keep the current public API as a shim for natives.
 5. Route logging/state/savedata/native file IO through the fs functions.
 6. Add Android/SAF roots only if/when APK assets or SAF streaming are needed.

@@ -1,0 +1,38 @@
+//! Integration tests for the crate-level `Media` object and capabilities.
+
+use api::error::MediaError;
+use media::{Media, MediaConfig, capabilities, create_media, open_video};
+
+#[test]
+fn capabilities_advertise_the_image_and_audio_backends() {
+    let media = Media::new();
+    let caps = capabilities(&media);
+    assert!(caps.image_formats.iter().any(|name| name == "png"));
+    assert!(caps.image_formats.iter().any(|name| name == "tlg6"));
+    assert!(caps.audio_formats.iter().any(|name| name == "wav"));
+    assert!(caps.audio_formats.iter().any(|name| name == "opus"));
+    assert!(caps.video_formats.is_empty());
+    assert!(caps.streaming_audio);
+    assert!(!caps.streaming_video);
+    assert!(!caps.is_empty());
+}
+
+#[test]
+fn config_is_preserved_and_media_is_stateless() {
+    let config = MediaConfig::new();
+    let media = Media::with_config(config.clone());
+    assert_eq!(media.config(), &config);
+    // The default config is identical for every object; clones are independent.
+    let other = create_media(MediaConfig::default());
+    assert_eq!(media, other);
+    assert_eq!(media, media.clone());
+}
+
+#[test]
+fn video_scaffold_reports_unsupported() {
+    let media = Media::new();
+    assert!(matches!(
+        open_video(&media, std::sync::Arc::from(&[][..]), None),
+        Err(MediaError::Unsupported { .. })
+    ));
+}

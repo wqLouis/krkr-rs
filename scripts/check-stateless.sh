@@ -15,16 +15,16 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT" || exit 1
 
-# Bottom-core crates. The middle layer (krkr-engine) is allowed to own state,
-# so it is intentionally excluded. krkr-platform is L1 and must be stateless
+# Bottom-core crates. The middle layer (engine) is allowed to own state,
+# so it is intentionally excluded. platform is L1 and must be stateless
 # too: only its *values* (the frame pacer, the clock) carry state, never a
 # process-global.
 CRATES=(
-  "crates/krkr-api"
-  "crates/krkr-fs"
-  "crates/krkr-media"
-  "crates/krkr-render"
-  "crates/krkr-platform"
+  "crates/api"
+  "crates/fs"
+  "crates/media"
+  "crates/render"
+  "crates/platform"
 )
 
 # Forbidden patterns (extended regex, matched against .rs sources).
@@ -42,9 +42,9 @@ PATTERNS=(
 # *value* types (RenderScene, the platform `Ticker`, `InputState`, …) are
 # deliberately not services and are not listed here.
 SERVICES=(
-  "crates/krkr-render:RenderPipeline"
-  "crates/krkr-fs:FileSystem"
-  "crates/krkr-media:Media"
+  "crates/render:RenderPipeline"
+  "crates/fs:FileSystem"
+  "crates/media:Media"
 )
 
 fail=0

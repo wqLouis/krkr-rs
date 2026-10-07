@@ -347,7 +347,7 @@ built against.
 
 ```
 ┌────────────────────────── Linux native krkr-rs (Rust/Bevy, x86_64 ELF) ─────────────────────────┐
-│  tvp-sound / tvp-visual / tjs2-sys …                                                             │
+│  tvp-sound / tvp-visual / tjs …                                                             │
 │  PluginSidecar (Rust):                                                                           │
 │    DecoderClient ─── control: 127.0.0.1:PORT (TCP)  ───┐                                         │
 │                   └─ data:   /tmp/krkr-host-<pid>.pcm (mmap ring) ──┐                            │
@@ -551,8 +551,8 @@ Concretely:
   `TJSDoVariantOperation`, `TVPGetScriptDispatch`, `TVPExecuteExpression` are
   used by **every** non-`wuvorbis` plugin. The host must be able to hold
   `iTJSDispatch2` objects, execute expressions, and invoke the plugin's
-  registered callbacks. That is the krkr-rs `tjs2-sys` C++ VM
-  (`crates/tjs2-sys/build.rs` compiles the whole reference `cpp/core/tjs2/*`).
+  registered callbacks. That is the krkr-rs `tjs` C++ VM
+  (`crates/tjs/build.rs` compiles the whole reference `cpp/core/tjs2/*`).
 * **A storage layer is mandatory** for `fstat`, `KAGParserEx`, `layerExDraw`
   (`TVPCreateIStream`, `TVPCreateTextStreamForRead`, `TVPNormalizeStorageName`,
   `TVPGetPlacedPath`, `TVPGetLocalName`, `TVPExtractStorageName`,
@@ -618,7 +618,7 @@ process; it does not make 32-bit code callable from a 64-bit address space. So:
 ### 7.2 What is buildable today
 
 * The **C++ TJS2 VM** is already built via `zig c++` in
-  `crates/tjs2-sys/build.rs` (the `zig build` deps step stages oniguruma, fmt
+  `crates/tjs/build.rs` (the `zig build` deps step stages oniguruma, fmt
   and spdlog). Zig 0.16 can emit COFF for `x86-windows-gnu`
   (verified), so the VM is cross-compilable in principle. In practice the
   build.rs must pass a Windows target through to *both* the `zig build` deps step
@@ -752,7 +752,7 @@ equivalent to porting/running the whole engine under Wine.
 | ncbind registration macros | `reference/cpp/core/plugin/ncbind.hpp:2157,2248-2266` |
 | wuvorbis decoder call pattern | `reference/cpp/core/sound/VorbisWaveDecoder.cpp:32,217,221` |
 | krkr-rs current plugin handling | `crates/tvp-natives/src/plugins.rs:62-140`; `plugin_stubs.rs:1-25`; `crates/tvp-storages/src/csv_parser.rs`; `crates/tvp-kagparser/src/lib.rs`; `crates/tvp-visual/src/natives/gdiplus.rs`; `crates/tvp-visual/src/natives/window.rs` |
-| TJS2 VM build | `crates/tjs2-sys/build.rs` |
+| TJS2 VM build | `crates/tjs/build.rs` |
 | Bevy 0.19 | `crates/render/Cargo.toml` |
 | zig cross-compiles i386 PE | §1.1 and §5.5 command output |
 | wine/Rust-target absent | §1.1 environment |

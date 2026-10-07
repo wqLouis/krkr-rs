@@ -67,7 +67,7 @@ Mount order is the given order, and **later mounts win** — so
 
 makes `patch.xp3` override `data.xp3`. This matches the reference
 auto-path table (`tTJSHashTable::AddWithHash` *overwrites* on a duplicate
-key, so the last `Add` wins). It **corrects** the current `krkr-engine`
+key, so the last `Add` wins). It **corrects** the current `engine`
 behaviour, which scans archives in mount order and takes the first match
 (data would incorrectly override patch).
 

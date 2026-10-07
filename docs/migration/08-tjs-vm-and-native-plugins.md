@@ -9,10 +9,10 @@ Related: [`02-target-architecture.md`](02-target-architecture.md) (layers),
 ## 1. Placement
 
 ```
-L4  krkr-vm       TJS VM host over tjs2-sys              (topmost)
-L3  krkr-compat   native classes + KAG + event adapter + plugins
-L2  krkr-engine   generic game engine (layer system, audio, VFS)
-L1  krkr-platform window/host, fs + archive parse, render, media
+L4  vm       TJS VM host over tjs              (topmost)
+L3  compat   native classes + KAG + event adapter + plugins
+L2  engine   generic game engine (layer system, audio, VFS)
+L1  platform window/host, fs + archive parse, render, media
 ```
 
 The VM is **not** the host. The event loop is platform code and lives in
@@ -20,7 +20,7 @@ The VM is **not** the host. The event loop is platform code and lives in
 the C++ VM and the L2/L1 engine. Nothing above L1 contains platform
 `#[cfg]`.
 
-## 2. L4 — the VM host (`krkr-vm`)
+## 2. L4 — the VM host (`vm`)
 
 Owns:
 
@@ -43,12 +43,12 @@ impl VmHost {
 }
 ```
 
-## 3. L3 — the compatibility surface (`krkr-compat`)
+## 3. L3 — the compatibility surface (`compat`)
 
 Sub-parts:
 
 1. **binding glue** — marshalling TJS values ↔ Rust and registering classes
-   through the `tjs2-sys` `NativeClassBuilder`;
+   through the `tjs` `NativeClassBuilder`;
 2. **native classes** — the KiriKiri-visible object model (`System`,
    `Storages`, `Scripts`, `Window`/`Layer`/`Bitmap`/`Font`/`Timer`,
    `SoundBuffer`, `VideoOverlay`, `Plugins`, `Debug`, `AsyncTrigger`,
@@ -65,10 +65,10 @@ screen-buffer primary layers, storage naming) on top of it.
 
 ### 3.1 The ABI constraint — the one allowed global
 
-The C++ ABI hands native callbacks only the raw `tjs2_engine*`; `tjs2-sys`
+The C++ ABI hands native callbacks only the raw `tjs2_engine*`; `tjs`
 exposes **no user-data slot**. The old `tvp-*` code worked around this with
 process-global `LazyLock<Mutex<…>>` contexts. We keep exactly **one**
-process-wide binding — an engine → context table in `krkr-compat` — because
+process-wide binding — an engine → context table in `compat` — because
 the ABI forces it. It is L3 (never L1), it holds *dispatch* state (a
 reference to the L2 session/engine), never game state, and it is documented
 here. **D9 (no globals) still holds for L1.**
@@ -124,7 +124,7 @@ milestone.
 ## 5. Event adaptation (L1 → L3 → L4)
 
 ```
-platform event   →  L1 krkr-platform (winit / android-activity)
+platform event   →  L1 platform (winit / android-activity)
                  →  L1 PlatformEvent
                  →  L3 adapter (map to a TJS-visible event)
                  →  L4 VM (dispatch to script handlers)
@@ -147,15 +147,15 @@ timer_poll → sound_poll → video poll
 
 | today | target |
 |---|---|
-| `tvp-natives` (system/debug/trans/menu/video/plugins) | `krkr-compat/plugins/*` |
-| `tvp-storages` | `krkr-compat/plugins/storages.rs` (over the L2 VFS) |
-| `tvp-scripts` | `krkr-compat/plugins/scripts.rs` |
-| `tvp-input` | `krkr-compat` adapter + L1 events |
-| `tvp-visual` scene/bitmap | L2 `krkr-engine` (generic layer system) |
-| `tvp-visual` natives | `krkr-compat/plugins/visual/*` |
-| `tvp-text` | L1 raster (`krkr-render`) + L2/L3 layout/composition |
-| `tvp-sound` | L2 model + L1 `krkr-media`/audio device |
-| `tvp-kagparser` + `kag` | `krkr-compat/kag` |
+| `tvp-natives` (system/debug/trans/menu/video/plugins) | `compat/plugins/*` |
+| `tvp-storages` | `compat/plugins/storages.rs` (over the L2 VFS) |
+| `tvp-scripts` | `compat/plugins/scripts.rs` |
+| `tvp-input` | `compat` adapter + L1 events |
+| `tvp-visual` scene/bitmap | L2 `engine` (generic layer system) |
+| `tvp-visual` natives | `compat/plugins/visual/*` |
+| `tvp-text` | L1 raster (`render`) + L2/L3 layout/composition |
+| `tvp-sound` | L2 model + L1 `media`/audio device |
+| `tvp-kagparser` + `kag` | `compat/kag` |
 
 ## 8. Testing
 

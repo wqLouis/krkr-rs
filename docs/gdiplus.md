@@ -58,7 +58,7 @@ the script API.
 
 ## 0. Critical constraint: object arguments have no handle in the ABI
 
-`crates/tjs2-sys/cpp/tjs2_abi.cpp:74-81` documents it: *"tjs2_value carries no
+`crates/tjs/cpp/tjs2_abi.cpp:74-81` documents it: *"tjs2_value carries no
 object handle, so tjs2_retain_value resolves an OBJECT-typed value against the
 engine's most recent object-valued result."* `variant_to_value_one`
 (`tjs2_abi.cpp:~230`) sets `e->last_object = var` for every `tvtObject`
@@ -82,7 +82,7 @@ the handle.
 
 Reuse the currently unused `retained` field for `VAL_OBJECT` arguments:
 
-1. In `crates/tjs2-sys/cpp/tjs2_abi.cpp`, `variant_to_value_one`, `case
+1. In `crates/tjs/cpp/tjs2_abi.cpp`, `variant_to_value_one`, `case
    tvtObject:` set the object handle in addition to `last_object`:
    ```cpp
    case tvtObject:
@@ -93,7 +93,7 @@ Reuse the currently unused `retained` field for `VAL_OBJECT` arguments:
    ```
    (`retained` is pointer-sized / `usize` in Rust, written as `nullptr` for
    non-object args, so this is unambiguous for `VAL_OBJECT`.)
-2. In `crates/tjs2-sys/src/lib.rs`, add a convenience accessor next to the
+2. In `crates/tjs/src/lib.rs`, add a convenience accessor next to the
    `Value` struct (around line 150):
    ```rust
    impl Value {
@@ -374,7 +374,7 @@ Methods:
 
 `Appearance` is registered in `tvp-natives`, but `Layer.draw*` lives in
 `tvp-visual`. Cargo graph (verified):
-`tvp-natives → tjs2-sys` only; `tvp-visual → tjs2-sys, engine, tvp-text`;
+`tvp-natives → tjs` only; `tvp-visual → tjs, engine, tvp-text`;
 `render → tvp-natives + tvp-visual`. Neither depends on the other, so no Rust
 type can be shared today.
 
@@ -470,9 +470,9 @@ enables it, so it is lower priority than `drawMark`.
 Ordered by user-visible value per unit of risk.
 
 0. **ABI: object handles for object args** (§0). Prerequisite for everything.
-   * `crates/tjs2-sys/cpp/tjs2_abi.cpp` `variant_to_value_one` (~line 230):
+   * `crates/tjs/cpp/tjs2_abi.cpp` `variant_to_value_one` (~line 230):
      set `out->retained` to `AsObjectNoAddRef()` for `tvtObject`.
-   * `crates/tjs2-sys/src/lib.rs`: `Value::object_handle()` helper.
+   * `crates/tjs/src/lib.rs`: `Value::object_handle()` helper.
    * Add a probe/unit test for `l.draw(app, [[...]])` resolving both handles.
    * Risk: low; no struct-layout change.
 
@@ -531,8 +531,8 @@ Ordered by user-visible value per unit of risk.
 
 | file | change |
 |------|--------|
-| `crates/tjs2-sys/cpp/tjs2_abi.cpp` | set `out->retained` object handle for `tvtObject` args |
-| `crates/tjs2-sys/src/lib.rs` | `Value::object_handle()` helper |
+| `crates/tjs/cpp/tjs2_abi.cpp` | set `out->retained` object handle for `tvtObject` args |
+| `crates/tjs/src/lib.rs` | `Value::object_handle()` helper |
 | `crates/tvp-natives/src/lib.rs` | remove gdiplus module/registration (`:36`,`:49`,`:133`) |
 | `crates/tvp-natives/src/gdiplus.rs` | **move** to tvp-visual |
 | `crates/tvp-visual/src/natives/gdiplus.rs` | new real Appearance + registry |

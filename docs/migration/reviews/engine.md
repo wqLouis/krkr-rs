@@ -1,12 +1,12 @@
-# Review — `krkr-engine` and `krkr-app`
+# Review — `engine` and `app`
 
-Scope: `crates/krkr-engine/` (layer system state, `layer_ops`, `raster`,
-`projection`, `storage`, `archive/xp3`) and `crates/krkr-app/` (winit host +
+Scope: `crates/engine/` (layer system state, `layer_ops`, `raster`,
+`projection`, `storage`, `archive/xp3`) and `crates/app/` (winit host +
 CLI). Reviewed against:
 
 - `docs/migration/02-target-architecture.md` (D9/D10, Invariants A/B/C)
 - `docs/migration/03-middle-layer-api.md` (the L2/L1 contract)
-- the sibling new crates `krkr-api`, `krkr-fs`, `krkr-media`
+- the sibling new crates `api`, `fs`, `media`
 
 Method: read-only. No build/test/cargo was run.
 
@@ -24,9 +24,9 @@ The crates are in good shape: `#![forbid(unsafe_code)]` and
 split (state in `Scene`/`Storage`/`Xp3Archive`, actions on `FileSystem`/
 `RenderPipeline` values) is respected, and the code is unusually well
 documented with reference citations. The main problems are (a) the
-`krkr-engine` dependency graph contradicts architecture §4, (b) unchecked
+`engine` dependency graph contradicts architecture §4, (b) unchecked
 `i32`/`u32` pixel arithmetic and untrusted-size allocations that the sibling
-`krkr-media` crate already defends against, and (c) avoidable per-frame
+`media` crate already defends against, and (c) avoidable per-frame
 allocation in `projection`/`Host::step`.
 
 ---
@@ -35,37 +35,37 @@ allocation in `projection`/`Host::step`.
 
 ### 1.1 Dependency graph contradicts `02-target-architecture.md` §4 — High
 
-`02` §4 states `krkr-engine` "depends on `krkr-api` only". The actual
-`crates/krkr-engine/Cargo.toml` depends on `krkr-api`, **`krkr-fs`**,
-**`krkr-render`** and **`flate2`**; `projection.rs:32` imports
-`krkr_render::{RenderContent, RenderNode, RenderScene, Texture}` and
-`storage.rs:31` imports `krkr_fs::{FileState, FileSystem}`.
+`02` §4 states `engine` "depends on `api` only". The actual
+`crates/engine/Cargo.toml` depends on `api`, **`fs`**,
+**`render`** and **`flate2`**; `projection.rs:32` imports
+`render::{RenderContent, RenderNode, RenderScene, Texture}` and
+`storage.rs:31` imports `fs::{FileState, FileSystem}`.
 
 There is a real tension in the design: `03-middle-layer-api.md` §2.2 defines
-`RenderScene`/`RenderState`/`Surface` in L1 (`krkr-render`), which forces L2 to
+`RenderScene`/`RenderState`/`Surface` in L1 (`render`), which forces L2 to
 depend on the L1 crate. The crate docs (`lib.rs:8-13`) call out only the
-`krkr-fs` exception, not `krkr-render`/`flate2`.
+`fs` exception, not `render`/`flate2`.
 
 Recommendation: pick one and make it consistent — either move the
-render tree/state/DTO types into `krkr-api` so `krkr-engine` truly depends on
-`krkr-api` only, or amend `02` §4 to state that L2 depends on the L1 *type*
-crates (`krkr-fs`, `krkr-render`) but not on their backends. `flate2` in L2
+render tree/state/DTO types into `api` so `engine` truly depends on
+`api` only, or amend `02` §4 to state that L2 depends on the L1 *type*
+crates (`fs`, `render`) but not on their backends. `flate2` in L2
 (used by `archive/xp3.rs:33`) is also a concrete codec dependency that
 Invariant B's spirit discourages; at minimum document it.
 
-### 1.2 No `krkr-core`; `krkr-app` assembles L1 directly — Medium
+### 1.2 No `krkr-core`; `app` assembles L1 directly — Medium
 
 Acceptance criterion 1 (`02` §9) and criterion 5 reference a `krkr-core`
-facade, and the `krkr-app` doc (`lib.rs:1-22`) describes itself as L4. The
-crate instead depends on `krkr-render`/`krkr-fs`/`krkr-media` directly
-(`krkr-app/Cargo.toml`). This is workable for now but means the desktop and
+facade, and the `app` doc (`lib.rs:1-22`) describes itself as L4. The
+crate instead depends on `render`/`fs`/`media` directly
+(`app/Cargo.toml`). This is workable for now but means the desktop and
 future Android hosts each wire L1 themselves. Flagging so the roadmap's
 "krkr-core" step is not silently dropped.
 
 ### 1.3 Error-type naming diverges from the sibling crates — Low
 
-`krkr-api` names domain errors `FsError`, `MediaError`, `RenderError`,
-`GlyphError`, `AudioError`. In `krkr-engine` the archive parser exports a bare
+`api` names domain errors `FsError`, `MediaError`, `RenderError`,
+`GlyphError`, `AudioError`. In `engine` the archive parser exports a bare
 `Error` with a module-local `Result<T>` alias (`archive/xp3.rs:64-74`), while
 the same crate defines `MountError`/`ReadError` (`storage.rs:98-116`).
 Recommend `Xp3Error` (or `ArchiveError`) to match, and `ReadError` →
@@ -75,7 +75,7 @@ Recommend `Xp3Error` (or `ArchiveError`) to match, and `ReadError` →
 
 `FileReader` converts every `FsError` to `io::Error::other`
 (`archive/xp3.rs:444-464`), and `Error::Io(#[from] std::io::Error)` then
-re-wraps it as an opaque string. This conflicts with `krkr-api/error.rs`'s
+re-wraps it as an opaque string. This conflicts with `api/error.rs`'s
 "owned, backend-agnostic, matchable" model and loses `FsError::NotFound` etc.
 Add `Error::Fs(#[from] FsError)` and let `FileReader` carry the original
 `FsError` (e.g. a `last_error` slot or a custom `Read` error enum).
@@ -112,7 +112,7 @@ resampling, and window-primary compositing; `scene.rs` is 1549 lines mixing
 the model, tree traversal/sorting and the bitmap cache. Consider splitting
 along those seams (`layer_ops/{blit,tone,resample}.rs`, `scene/{model,tree}.rs`).
 
-### 1.9 `krkr-app` matches the sibling host style — OK
+### 1.9 `app` matches the sibling host style — OK
 
 `HostConfig` builder methods, `StepReport`, typed `HostError`, and the
 hand-rolled `Cli::parse` (`main.rs:64-95`) are consistent with the no-extra-deps
@@ -148,7 +148,7 @@ buffer API, so every full copy is deliberate.
 
 `archive/xp3.rs:227, 229, 238, 285` and `storage.rs:674` convert sizes with
 `as usize` (truncating on 32-bit targets). Use `usize::try_from(...)` plus a
-cap, matching `krkr-media/src/tlg.rs:184-190`.
+cap, matching `media/src/tlg.rs:184-190`.
 
 ### 2.5 `unwrap()` in the archive parser — Low
 
@@ -162,7 +162,7 @@ more robust and removes the last `unwrap`s from library paths.
 `lib.rs:22-59` re-exports essentially every function, type and constant. This
 is defensible for an L2 crate consumed by L3 natives, but it makes the public
 surface effectively "everything" and weakens semver discipline. Consider
-`pub mod` access (callers already use `krkr_engine::scene::...` in tests) and
+`pub mod` access (callers already use `engine::scene::...` in tests) and
 re-export only the intended entry points.
 
 ### 2.7 Raw pointer addresses as safe `usize` returns — Medium
@@ -223,10 +223,10 @@ already-computed values, keyed by `layer.parent`, with no per-node
 
 ### 3.3 `Host::step` rebuilds the whole `RenderScene` every frame — High
 
-`krkr-app/src/lib.rs:216-218`: `let projected = project_scene(...);
+`app/src/lib.rs:216-218`: `let projected = project_scene(...);
 self.render_scene = projected;` drops and reallocates every `RenderNode`,
 its `children: Vec`, and the arena each frame, even when nothing changed.
-`RenderScene`/`RenderNode` derive `Clone` (`krkr-render/src/scene.rs:29,157`),
+`RenderScene`/`RenderNode` derive `Clone` (`render/src/scene.rs:29,157`),
 and `Scene::revision()` already exists for exactly this. Keep one persistent
 `render_scene`, `clear()` the arena (retaining capacity) and rebuild only when
 `scene.revision()` changed — or better, do a field-level sync (D10's stated
@@ -307,7 +307,7 @@ or compute in `i64` and clamp once.
 `:229` `vec![0u8; seg.arc_size as usize]`, `:238` `vec![0u8; seg.org_size as
 usize]`, `:285` `vec![0u8; real_size as usize]`, and `:525` `vec![0u8; len]`
 allocate sizes taken directly from the archive index with **no cap and no
-`checked_mul`**. `krkr-media/src/tlg.rs:51-52, 184-190` already caps
+`checked_mul`**. `media/src/tlg.rs:51-52, 184-190` already caps
 (`MAX_DIM`, `MAX_PIXEL_BYTES`, `checked_mul`); the engine should do the same
 (and reject `org_size == 0`-with-segments / absurd totals). A malformed or
 hostile `.xp3` can OOM the process.
@@ -339,7 +339,7 @@ hostile `.xp3` can OOM the process.
 - `ensure_primary_bitmap` (`layer_ops.rs:1926`):
   `vec![0; w as usize * h as usize * 4]` from the window's declared logical
   size.
-Guard both with `checked_mul` and a sane cap, as `krkr-media` does.
+Guard both with `checked_mul` and a sane cap, as `media` does.
 
 ### 4.6 Unbounded loop/count from script geometry — Medium
 
@@ -354,7 +354,7 @@ Guard both with `checked_mul` and a sane cap, as `krkr-media` does.
 ### 4.7 `file_size as usize` + unbounded read buffer — Medium
 
 `storage::read_fs_file` (`storage.rs:673-683`): `let size =
-krkr_fs::file_size(fs, &file)? as usize; let mut out = vec![0u8; size];`.
+fs::file_size(fs, &file)? as usize; let mut out = vec![0u8; size];`.
 Truncates on 32-bit and trusts the host file size. Use `try_from` and a cap.
 
 ### 4.8 Unchecked `i32` accumulation — Low/Medium
@@ -370,20 +370,20 @@ Use `saturating_*`.
 
 `Scene::add_bitmap` (`scene.rs:1219`) trusts `rgba.len() == width*height*4`,
 and `layer_ops` indexes `bitmap.rgba` directly. Only `Host::sync_dirty_bitmaps`
-(`krkr-app/src/lib.rs:326-352`) validates before upload. An early
+(`app/src/lib.rs:326-352`) validates before upload. An early
 `debug_assert_eq!`/`checked_mul` in `add_bitmap` would fail fast at the source.
 
 ### 4.10 D9/D10 stateless invariants — PASS, with two notes
 
 - No `static`/`thread_local`/`LazyLock`/`OnceLock`/`OnceCell`, no
   `&mut self` service objects, no `unsafe`; `#![forbid(unsafe_code)]` in both
-  crates (`krkr-engine/src/lib.rs:17`, `krkr-app/src/lib.rs:22`). ✔
+  crates (`engine/src/lib.rs:17`, `app/src/lib.rs:22`). ✔
 - All evolving state lives in caller-owned values (`Scene`, `Storage`,
-  `Xp3Archive`, `Host`) and is passed explicitly to `krkr_fs`/`krkr_render`
+  `Xp3Archive`, `Host`) and is passed explicitly to `fs`/`render`
   actions. `archive/xp3.rs` correctly stores no file handle; its
   `FileReader.pos` cursor is a local adapter field. ✔
 - The only `HashMap` keyed by an externally supplied id is `Host.textures:
-  HashMap<u32, Texture>` (`krkr-app/src/lib.rs:154`), which is L2/L4 state
+  HashMap<u32, Texture>` (`app/src/lib.rs:154`), which is L2/L4 state
   holding L1 handles — allowed (D9 forbids it on L1, not L2). It is mirrored by
   the explicit `Scene` bitmap table, so it is a derived index, not a hidden
   cache. Acceptable, but worth a one-line comment.
@@ -405,10 +405,10 @@ and `layer_ops` indexes `bitmap.rgba` directly. Only `Host::sync_dirty_bitmaps`
 
 ## 5. Cross-cutting observations
 
-- **Defensive caps are inconsistent between L1 crates.** `krkr-media` caps
-  image dimensions/bytes and uses `checked_mul`; `krkr-engine`'s XP3/province/
+- **Defensive caps are inconsistent between L1 crates.** `media` caps
+  image dimensions/bytes and uses `checked_mul`; `engine`'s XP3/province/
   primary paths do not. A shared `checked_dims(w, h, bpp)` helper in
-  `krkr-api` (or at least duplicated) would align them.
+  `api` (or at least duplicated) would align them.
 - **Saturating arithmetic is applied ad hoc.** `fill_rect_replace` and
   `composite_primary_layer` are careful; the blit/transform paths are not.
   Pick one policy (saturating everywhere coordinates are derived from scripts)
@@ -424,7 +424,7 @@ and `layer_ops` indexes `bitmap.rgba` directly. Only `Host::sync_dirty_bitmaps`
 
 1. **Cap and `checked_mul`/`checked_add` every XP3 index size and read
    allocation** (`archive/xp3.rs:227,229,238,285,310,338,525`), mirroring
-   `krkr-media/src/tlg.rs:51-52,184-190`. *(High, security/robustness)*
+   `media/src/tlg.rs:51-52,184-190`. *(High, security/robustness)*
 2. **Make all script-derived coordinate arithmetic saturating or `i64`** in
    `layer_ops.rs:468-469,519,584,609,717,735,835,1709,1999` and
    `projection.rs:249-252`, matching `raster.rs:66-72`. *(High, correctness)*
@@ -435,13 +435,13 @@ and `layer_ops` indexes `bitmap.rgba` directly. Only `Host::sync_dirty_bitmaps`
    parent-first projection pass, and cache `window_layer_order`
    (`scene.rs:1393`) per `Scene::revision`. *(High, perf)*
 5. **Reuse the `RenderScene` arena in `Host::step`** and skip reprojection
-   when `Scene::revision()` is unchanged (`krkr-app/src/lib.rs:216-218`).
+   when `Scene::revision()` is unchanged (`app/src/lib.rs:216-218`).
    *(High, perf)*
 6. **Resolve the dependency/architecture conflict:** either move
-   `RenderScene`/`RenderState`/`Surface`/DTOs into `krkr-api` so
-   `krkr-engine` depends on `krkr-api` only, or amend
+   `RenderScene`/`RenderState`/`Surface`/DTOs into `api` so
+   `engine` depends on `api` only, or amend
    `docs/migration/02-target-architecture.md` §4 to allow the L1 type crates
-   (`krkr-fs`, `krkr-render`) and document `flate2`. *(High, design)*
+   (`fs`, `render`) and document `flate2`. *(High, design)*
 7. **Use `u64` accumulators in `blur_bitmap_in_place` and `sample_area`**
    (`layer_ops.rs:957,962,1083`) and `checked_mul`+cap for
    `resize_province_image`/`ensure_primary_bitmap`

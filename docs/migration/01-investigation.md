@@ -21,7 +21,7 @@ move in `02-target-architecture.md`.
 | `render` | Bevy app, scene→GPU sync, input bridge, menu, runner | 9.0k | **yes** |
 | `tvp-sound` | decode + mixer + sound natives (symphonia/rodio/cpal) | 6.7k | no |
 | `tvp-kagparser` | KAGParser native | 5.9k | no |
-| `tjs2-sys` | C++ TJS2 VM FFI (build.rs compiles the C++ VM) | 4.7k (+C++) | no |
+| `tjs` | C++ TJS2 VM FFI (build.rs compiles the C++ VM) | 4.7k (+C++) | no |
 | `tvp-text` | font discovery, glyph atlas, layout, `.tft` | 2.7k | no |
 | `tvp-storages` | Storages native over `engine::Storage` | 2.6k | no |
 | `tvp-input` | input state + Mouse/Key natives | 2.3k | no |
@@ -76,7 +76,7 @@ Key execution facts:
 
 * **The VM is single-threaded.** All native calls run under a process-wide
   `static VM_RUN_LOCK` (`render/src/runner.rs`) because Bevy's scheduler may
-  run systems on worker threads. `tjs2-sys` makes the handle `Send`/`Sync`
+  run systems on worker threads. `tjs` makes the handle `Send`/`Sync`
   with `unsafe impl` but documents single-thread ownership.
 * **The scene is the current de-facto middle layer.** `SharedScene =
   Arc<RwLock<Scene>>` (`render/src/sync.rs`), defined in
@@ -234,7 +234,7 @@ layer: the GPU only ever sees flat quads; the semantics are CPU-side.
 * Direct `std::fs` in natives: `Storages` list/delete/copy/flush,
   `Debug.startLogToFile`, `System.readRegValue`, bitmap/layer save, logging
   and state files.
-* **Out-of-band C++ IO**: `tjs2-sys/cpp/streams.cpp` uses `std::fopen` for
+* **Out-of-band C++ IO**: `tjs/cpp/streams.cpp` uses `std::fopen` for
   TJS `Array.save/load/saveStruct`, bypassing Rust storage entirely.
 * Platform reality (from `docs/android.md`, `docs/portability.md`):
   Android uses SAF-to-path + `MANAGE_EXTERNAL_STORAGE` (option A); a real
