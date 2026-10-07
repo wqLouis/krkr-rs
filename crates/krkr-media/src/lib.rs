@@ -19,18 +19,19 @@
 //!
 //! * **Images** — the native TLG5/TLG6 decoder (ported from
 //!   `tvp-visual/src/tlg.rs`) and `image`-crate formats, with header probing.
+//! * **Audio** — symphonia whole-file/streaming decode (wav, pcm, ogg,
+//!   vorbis, flac, mp3) plus the Ogg Opus adapter, with header-only probing
+//!   and an explicit caller-owned [`AudioDecoderState`].
 //! * **YUV** — the pure `yuv420_to_rgba` conversion ported from
 //!   `tvp-natives/src/video/yuv.rs`.
 //!
 //! # What is scaffolded
 //!
-//! * **Audio** — [`probe_audio`], [`decode_audio`], [`open_audio`],
-//!   [`read_audio`] and [`seek_audio`] return [`MediaError::Unsupported`].
 //! * **Video** — [`open_video`], [`present_video`] and [`video_audio`]
 //!   return [`MediaError::Unsupported`].
 //!
 //! The signatures and state types are final; a later task fills in the
-//! symphonia/FFmpeg/MediaCodec backends without changing the API.
+//! FFmpeg/MediaCodec video backends without changing the API.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -120,9 +121,12 @@ pub fn capabilities(m: &Media) -> MediaCapabilities {
             .iter()
             .map(|name| (*name).to_string())
             .collect(),
-        audio_formats: Vec::new(),
+        audio_formats: audio::AUDIO_FORMATS
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect(),
         video_formats: Vec::new(),
-        streaming_audio: false,
+        streaming_audio: true,
         streaming_video: false,
     }
 }
@@ -132,14 +136,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn capabilities_advertises_only_the_image_backend() {
+    fn capabilities_advertise_the_image_and_audio_backends() {
         let media = Media::new();
         let caps = capabilities(&media);
         assert!(caps.image_formats.iter().any(|name| name == "png"));
         assert!(caps.image_formats.iter().any(|name| name == "tlg6"));
-        assert!(caps.audio_formats.is_empty());
+        assert!(caps.audio_formats.iter().any(|name| name == "wav"));
+        assert!(caps.audio_formats.iter().any(|name| name == "opus"));
         assert!(caps.video_formats.is_empty());
-        assert!(!caps.streaming_audio);
+        assert!(caps.streaming_audio);
         assert!(!caps.streaming_video);
         assert!(!caps.is_empty());
     }
@@ -158,20 +163,8 @@ mod tests {
     }
 
     #[test]
-    fn audio_and_video_scaffolds_report_unsupported() {
+    fn video_scaffold_reports_unsupported() {
         let media = Media::new();
-        assert!(matches!(
-            probe_audio(&media, b"", None),
-            Err(MediaError::Unsupported { .. })
-        ));
-        assert!(matches!(
-            decode_audio(&media, b"", None),
-            Err(MediaError::Unsupported { .. })
-        ));
-        assert!(matches!(
-            open_audio(&media, std::sync::Arc::from(&[][..]), None),
-            Err(MediaError::Unsupported { .. })
-        ));
         assert!(matches!(
             open_video(&media, std::sync::Arc::from(&[][..]), None),
             Err(MediaError::Unsupported { .. })

@@ -11,7 +11,10 @@
 //!   [`begin_render_state`] and stored by the middle layer;
 //! * the [`Texture`] object and its upload/drop actions;
 //! * the single [`render`] action, which performs all traversal,
-//!   composition, batching and drawing.
+//!   composition, batching and drawing;
+//! * the stateless [`FontSystem`] and [`Font`] values with the pure
+//!   [`rasterize_glyph`], [`glyph_advance`] and [`font_metrics`] functions
+//!   (`03-middle-layer-api.md` §3).
 //!
 //! Round 1 ships the whole API plus a fully functional headless
 //! [`NullRenderPipeline`]. The Vulkan (`ash`) backend lives in [`vulkan`] as
@@ -24,6 +27,7 @@
 
 #![warn(missing_docs)]
 
+pub mod glyph;
 mod null;
 pub mod scene;
 mod state;
@@ -37,6 +41,9 @@ use krkr_api::geometry::PixelRegion;
 use krkr_api::host::{Presentation, SurfaceEvent};
 use raw_window_handle::RawWindowHandle;
 
+pub use crate::glyph::{
+    Font, FontSystem, create_font_system, font_metrics, glyph_advance, load_font, rasterize_glyph,
+};
 pub use crate::null::{
     FrameStats, MAX_TRAVERSAL_DEPTH, NULL_MAX_TEXTURE_DIMENSION, NullRenderPipeline,
 };
@@ -46,6 +53,7 @@ pub use crate::scene::{
 pub use crate::state::{RenderState, Surface};
 pub use crate::texture::{Texture, TextureDesc, TextureFormat};
 pub use crate::vulkan::VulkanPipeline;
+pub use krkr_api::glyph::{FontMetrics, GlyphBitmap, GlyphStyle};
 
 /// Message returned by every operation of the unfinished Vulkan backend.
 const VULKAN_UNIMPLEMENTED: &str = "the Vulkan backend is not implemented yet (Phase 5)";

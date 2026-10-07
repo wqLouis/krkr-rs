@@ -15,6 +15,7 @@
 #![warn(missing_docs)]
 
 pub mod layer_ops;
+pub mod projection;
 pub mod raster;
 pub mod scene;
 
@@ -34,4 +35,14 @@ pub use raster::{
 pub use scene::{
     BitmapCache, BitmapState, CachedImage, FontState, LT_ADDITIVE, LT_ALPHA, LT_OPAQUE,
     LT_SUBTRACTIVE, LayerState, Rect, Scene, WindowState,
+};
+// The four `LT_*` values above already exist in `scene`; the projection adds
+// the rest of the native set without duplicating them.
+pub use projection::{
+    ComposedLayer, LT_ADD_ALPHA, LT_BINDER, LT_DARKEN, LT_DODGE, LT_EFFECT, LT_FILTER, LT_LIGHTEN,
+    LT_MULTIPLICATIVE, LT_PS_ADDITIVE, LT_PS_COLOR_BURN, LT_PS_COLOR_DODGE, LT_PS_COLOR_DODGE5,
+    LT_PS_DARKEN, LT_PS_DIFFERENCE, LT_PS_DIFFERENCE5, LT_PS_EXCLUSION, LT_PS_HARD_LIGHT,
+    LT_PS_LIGHTEN, LT_PS_MULTIPLICATIVE, LT_PS_NORMAL, LT_PS_OVERLAY, LT_PS_SCREEN,
+    LT_PS_SOFT_LIGHT, LT_PS_SUBTRACTIVE, LT_SCREEN, blend_mode_for, clamp_opacity, compose_layer,
+    project_scene, project_window, resolve_blend, visible_image_region,
 };

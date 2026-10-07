@@ -708,6 +708,7 @@ name = "krkr-engine"
 version = "1.0.0"
 dependencies = [
  "krkr-api",
+ "krkr-render",
  "log",
  "thiserror 2.0.20",
 ]
@@ -729,6 +730,8 @@ dependencies = [
  "image",
  "krkr-api",
  "log",
+ "symphonia 0.6.1",
+ "symphonia-adapter-libopus",
  "thiserror 2.0.20",
 ]
 
@@ -736,6 +739,7 @@ dependencies = [
 name = "krkr-render"
 version = "1.0.0"
 dependencies = [
+ "ab_glyph",
  "ash",
  "krkr-api",
  "log",
