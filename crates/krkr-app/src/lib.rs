@@ -1,7 +1,7 @@
-//! krkr-rs host assembly: owns the bottom objects, the middle-layer state
-//! values and the per-frame loop.
+//! krkr-rs host assembly: owns the middle-layer state values and the
+//! per-frame step, wired to the L1 platform by the `krkr` binary.
 //!
-//! [`Host`] is the desktop/headless frontend (L4) described in
+//! [`Host`] is the engine-driving frontend described in
 //! `docs/migration/02-target-architecture.md` §1 and
 //! `docs/migration/03-middle-layer-api.md` §8. It owns the stateless bottom
 //! objects ([`RenderPipeline`], [`FileSystem`], [`Media`]) together with all
@@ -36,7 +36,7 @@ use krkr_render::{
     TextureFormat, begin_render_state, begin_render_state_with_display, create_render_pipeline,
     create_texture, drop_texture, render, resize as resize_render, upload_texture,
 };
-use raw_window_handle::{RawDisplayHandle, RawWindowHandle, WebWindowHandle};
+use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 
 pub use krkr_render::{BackendKind, FrameStats};
 
@@ -76,9 +76,10 @@ pub struct HostConfig {
     pub validation: bool,
     /// Window handle used to create the surface.
     ///
-    /// `None` selects a synthetic headless handle ([`headless_window_handle`]),
-    /// which the null backend ignores. The windowed host passes the real
-    /// winit handle here so a Vulkan surface can bind to it.
+    /// `None` selects a synthetic headless handle
+    /// ([`krkr_platform::headless_window_handle`]), which the null backend
+    /// ignores. The windowed host passes the real platform window handle
+    /// here so a Vulkan surface can bind to it.
     pub window_handle: Option<RawWindowHandle>,
     /// Display handle (Wayland/X11/XCB connection) used with `window_handle`.
     ///
@@ -133,17 +134,7 @@ impl HostConfig {
     }
 }
 
-/// Returns a synthetic window handle for headless surface creation.
-///
-/// The null backend accepts and ignores any handle, so the headless host
-/// needs no display or native window. The returned value describes a
-/// zero-sized Web canvas, a variant that exists on every target in
-/// `raw-window-handle` 0.6.
-pub fn headless_window_handle() -> RawWindowHandle {
-    RawWindowHandle::Web(WebWindowHandle::new(0))
-}
-
-/// The assembled host: bottom objects, middle-layer state and frame loop.
+/// The assembled host: bottom objects, middle-layer state and frame step.
 ///
 /// See the crate documentation for the ownership model. The fields are
 /// deliberately private; callers reach the middle-layer state through
@@ -209,7 +200,7 @@ impl Host {
         let handle: &RawWindowHandle = match &config.window_handle {
             Some(handle) => handle,
             None => {
-                headless = headless_window_handle();
+                headless = krkr_platform::headless_window_handle();
                 &headless
             }
         };

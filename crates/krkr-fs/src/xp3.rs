@@ -1,4 +1,4 @@
-//! XP3 archive reader over [`krkr_fs`] positional IO.
+//! XP3 archive reader — L1 stateless container parsing.
 //!
 //! This is a port of the standalone `xp3` crate reader onto the L1
 //! [`FileState`] surface: instead of owning a live `std::fs::File`, the
@@ -11,6 +11,9 @@
 //! The [`Xp3Archive`] value stores only parsed index metadata. Every read
 //! takes the owning [`FileSystem`] and [`FileState`] explicitly, so no file
 //! handle is hidden inside the archive and the caller (L2) keeps all state.
+//! Parsing holds no state of its own: given the bytes through a `FileState`
+//! it returns a parsed index, per `docs/migration/02-target-architecture.md`
+//! §5 and `docs/migration/09-game-loading.md`.
 //!
 //! ## Format summary
 //!
@@ -32,7 +35,8 @@ use std::io::{self, Read, Seek, SeekFrom};
 
 use flate2::read::ZlibDecoder;
 use krkr_api::error::FsError;
-use krkr_fs::{FileState, FileSystem, file_size, read_at};
+
+use crate::{FileState, FileSystem, file_size, read_at};
 
 /// 11-byte XP3 magic: `"XP3\r\n \n\x1a\x8b\x67\x01"`.
 pub const XP3_MAGIC: [u8; 11] = [

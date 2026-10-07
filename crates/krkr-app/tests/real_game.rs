@@ -24,7 +24,19 @@ fn game_dir() -> Option<String> {
 }
 
 fn mount(dir: &str) -> Storage {
-    Storage::mount(FileSystem::host(dir), dir).expect("mount game")
+    // The loader takes an explicit archive list (doc 09); a test harness may
+    // scan the directory, but the engine itself never does.
+    let mut archives: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .expect("list game directory")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("xp3"))
+        })
+        .collect();
+    archives.sort();
+    Storage::mount_archives(FileSystem::host(dir), dir, archives).expect("mount game")
 }
 
 #[test]

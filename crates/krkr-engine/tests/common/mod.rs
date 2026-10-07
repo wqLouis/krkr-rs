@@ -34,8 +34,16 @@ pub fn write_mem(fs: &FileSystem, path: &str, data: &[u8]) {
     krkr_fs::flush(fs, &file).expect("flush memory file");
 }
 
-/// Mounts an in-memory file system populated with `files` at `/`.
+/// Mounts an in-memory file system populated with `files` at `/`, with no
+/// archives mounted. The loader never scans for archives, so callers that
+/// need one must name it explicitly via [`mount_memory_with_archives`].
 pub fn mount_memory(files: &[(&str, &[u8])]) -> Storage {
+    mount_memory_with_archives(files, &[])
+}
+
+/// Mounts an in-memory file system populated with `files` at `/`, then mounts
+/// each path in `archives` in order (later archives win).
+pub fn mount_memory_with_archives(files: &[(&str, &[u8])], archives: &[&str]) -> Storage {
     let fs = memory_with(files);
-    Storage::mount(fs, "/").expect("mount")
+    Storage::mount_archives(fs, "/", archives).expect("mount")
 }

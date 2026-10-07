@@ -1021,11 +1021,11 @@ dependencies = [
  "krkr-engine",
  "krkr-fs",
  "krkr-media",
+ "krkr-platform",
  "krkr-render",
  "log",
  "raw-window-handle",
  "thiserror 2.0.20",
- "winit",
 ]
 
 [[package]]
@@ -1058,7 +1058,9 @@ dependencies = [
 name = "krkr-fs"
 version = "1.0.0"
 dependencies = [
+ "flate2",
  "krkr-api",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

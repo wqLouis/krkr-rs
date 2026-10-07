@@ -1,12 +1,16 @@
 //! Integration tests for XP3 archive name normalization and index hardening.
 //!
-//! Relocated from the inline `#[cfg(test)]` module in `src/archive/xp3.rs`.
+//! Relocated from the inline `#[cfg(test)]` module of the former
+//! `krkr-engine/src/archive/xp3.rs`; the parser now lives in L1 `krkr-fs`.
 
 use krkr_api::error::FsError;
 use krkr_api::fs::{FsPath, OpenMode};
-use krkr_engine::archive::xp3::{XP3_MAGIC, Xp3Archive, Xp3Error};
-use krkr_engine::normalize_in_archive_name;
+use krkr_fs::xp3::{XP3_MAGIC, Xp3Archive, Xp3Error, normalize_in_archive_name};
 use krkr_fs::{FileState, FileSystem};
+
+#[path = "common/xp3_builder.rs"]
+mod xp3_builder;
+use xp3_builder::build_xp3;
 
 #[test]
 fn normalize_names() {
@@ -141,4 +145,39 @@ fn fs_errors_are_recovered_through_the_io_adapter() {
         matches!(xp3_error, Xp3Error::Fs(ref e) if *e == fs_error),
         "typed FsError was not preserved: {xp3_error:?}"
     );
+}
+
+/// A valid archive parses and reads both raw and zlib segments, and lookup
+/// normalizes the requested name.
+#[test]
+fn parses_and_reads_valid_archive() {
+    let xp3 = build_xp3(&[
+        ("plain.bin", b"raw bytes", false),
+        ("dir/Packed.bin", b"zlib compressed payload", true),
+    ]);
+    let (fs, file) = fs_with(&xp3);
+    let archive = Xp3Archive::open(&fs, &file).expect("open archive");
+
+    assert_eq!(archive.len(), 2);
+    assert!(!archive.is_empty());
+    assert_eq!(archive.entry("plain.bin").unwrap().org_size, 9);
+    assert_eq!(archive.read(&fs, &file, "plain.bin").unwrap(), b"raw bytes");
+    assert_eq!(
+        archive.read(&fs, &file, r"DIR\PACKED.BIN").unwrap(),
+        b"zlib compressed payload"
+    );
+    assert!(matches!(
+        archive.read(&fs, &file, "missing.bin"),
+        Err(Xp3Error::NotFound(_))
+    ));
+}
+
+/// A non-XP3 file is a typed `NotAnXp3` error, not an I/O surprise.
+#[test]
+fn rejects_non_xp3_bytes() {
+    let (fs, file) = fs_with(b"not an archive at all");
+    assert!(matches!(
+        Xp3Archive::open(&fs, &file),
+        Err(Xp3Error::NotAnXp3)
+    ));
 }

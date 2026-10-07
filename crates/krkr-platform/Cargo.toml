@@ -8,11 +8,13 @@ license.workspace = true
 [dependencies]
 krkr-api = { workspace = true }
 raw-window-handle = { workspace = true }
-winit = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
+winit = { workspace = true, optional = true }
 
 [features]
 default = ["platform-linux"]
-platform-linux = []
+# Exactly one platform feature must be active (D13). `platform-linux` compiles
+# the real winit 0.30 backend; `platform-android` is a stub for now.
+platform-linux = ["dep:winit"]
 platform-android = []

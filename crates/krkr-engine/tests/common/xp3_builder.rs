@@ -1,22 +1,21 @@
 //! Minimal in-memory XP3 archive builder shared by the integration tests.
 //!
-//! Builds the exact raw-index byte layout that
-//! [`krkr_engine::archive::xp3::Xp3Archive::open`] expects, so tests can mount
-//! synthetic archives without shipping binary fixtures.
+//! Builds the exact raw-index byte layout that [`krkr_fs::xp3::Xp3Archive`]
+//! expects, so tests can mount synthetic archives without shipping binary
+//! fixtures.
 
 use std::io::Write;
 
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
 
-use krkr_engine::archive::xp3::{SEGM_ENCODE_RAW, SEGM_ENCODE_ZLIB, XP3_MAGIC};
+use krkr_fs::xp3::{SEGM_ENCODE_RAW, SEGM_ENCODE_ZLIB, XP3_MAGIC};
 
 /// Build a minimal raw-index XP3 archive in memory.
 ///
 /// Each entry is `(name, data, zlib)`: `zlib` selects a zlib-compressed
 /// segment, otherwise the segment is stored raw. The index itself is always
-/// stored raw. Layout matches what
-/// [`krkr_engine::archive::xp3::Xp3Archive::open`] expects.
+/// stored raw. Layout matches what [`krkr_fs::xp3::Xp3Archive`] expects.
 pub fn build_xp3(entries: &[(&str, &[u8], bool)]) -> Vec<u8> {
     let mut file = Vec::new();
     file.extend_from_slice(&XP3_MAGIC);

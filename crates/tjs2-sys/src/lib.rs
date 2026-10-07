@@ -363,6 +363,15 @@ unsafe extern "C" {
         value: *const Value,
         out_error: *mut *mut c_char,
     ) -> c_int;
+    /// Write the default member of a retained object value (`PropSet` with a
+    /// NULL member name). A native `missing` handler uses this to supply the
+    /// value for an absent member.
+    fn tjs2_prop_set_default(
+        engine: *mut Engine,
+        id: Tjs2ValueId,
+        value: *const Value,
+        out_error: *mut *mut c_char,
+    ) -> c_int;
     /// Write a value back into a by-reference argument of the native method
     /// call currently executing on this engine (reference native methods do
     /// `(*param[index]) = value`).
@@ -1394,6 +1403,28 @@ name), and none was available"
         // name/value (including any string storage in `strings`) follow the
         // ABI contract for the duration of the call.
         let rc = unsafe { tjs2_prop_set(self.inner, id, name.as_ptr(), &ffi, &mut error) };
+        if rc != 0 {
+            return Err(unsafe { take_error_string(error) });
+        }
+        Ok(())
+    }
+
+    /// Write the **default member** of a retained object value (`PropSet`
+    /// with a NULL member name).
+    ///
+    /// Used by the null-plugin `missing` handler: the VM passes a
+    /// `tTJSSimpleGetSetProperty` as the handler's third argument and reads
+    /// its default member back, so setting it is what lets an absent member
+    /// be *called*. Same value/error conventions as [`Self::set_member`].
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn set_default_member(&self, id: Tjs2ValueId, value: &TjsValue) -> Result<(), String> {
+        let mut strings = Vec::new();
+        let ffi = value_to_ffi(value, &mut strings)?;
+        let mut error: *mut c_char = ptr::null_mut();
+        // SAFETY: self.inner is a live engine and id is a live retained id;
+        // value (including any string storage in `strings`) follows the ABI
+        // contract for the duration of the call.
+        let rc = unsafe { tjs2_prop_set_default(self.inner, id, &ffi, &mut error) };
         if rc != 0 {
             return Err(unsafe { take_error_string(error) });
         }

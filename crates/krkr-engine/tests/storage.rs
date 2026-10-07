@@ -9,8 +9,8 @@ use std::path::PathBuf;
 use krkr_engine::{ATTR_DIRECTORY, ATTR_NORMAL, Location, normalize_in_archive_name};
 
 mod common;
-use common::mount_memory;
 use common::xp3_builder::build_xp3;
+use common::{mount_memory, mount_memory_with_archives};
 
 #[test]
 fn normalize_matches_reference() {
@@ -28,7 +28,10 @@ fn normalize_matches_reference() {
 #[test]
 fn disk_wins_over_archive() {
     let xp3 = build_xp3(&[("data/winner.txt", b"from archive", false)]);
-    let storage = mount_memory(&[("data.xp3", &xp3), ("data/winner.txt", b"from disk")]);
+    let storage = mount_memory_with_archives(
+        &[("data.xp3", &xp3), ("data/winner.txt", b"from disk")],
+        &["data.xp3"],
+    );
 
     assert_eq!(
         storage.find("data/winner.txt"),
@@ -43,7 +46,7 @@ fn archive_is_used_when_no_disk_file() {
         ("data/inside.txt", b"hello from archive", false),
         ("data/other.txt", b"other", false),
     ]);
-    let storage = mount_memory(&[("data.xp3", &xp3)]);
+    let storage = mount_memory_with_archives(&[("data.xp3", &xp3)], &["data.xp3"]);
 
     assert_eq!(
         storage.find("data/inside.txt"),
@@ -64,7 +67,7 @@ fn archive_is_used_when_no_disk_file() {
 fn arc_xp3_path_targets_one_archive() {
     let a = build_xp3(&[("shared.txt", b"from a", false)]);
     let b = build_xp3(&[("shared.txt", b"from b", false)]);
-    let storage = mount_memory(&[("a.xp3", &a), ("b.xp3", &b)]);
+    let storage = mount_memory_with_archives(&[("a.xp3", &a), ("b.xp3", &b)], &["a.xp3", "b.xp3"]);
 
     assert_eq!(
         storage.read("a.xp3>shared.txt").unwrap(),
@@ -113,7 +116,7 @@ fn archive_reads_raw_and_zlib_segments() {
         ("plain.bin", b"raw bytes", false),
         ("packed.bin", b"zlib compressed payload", true),
     ]);
-    let storage = mount_memory(&[("packed.xp3", &xp3)]);
+    let storage = mount_memory_with_archives(&[("packed.xp3", &xp3)], &["packed.xp3"]);
 
     assert_eq!(storage.read("plain.bin").unwrap(), b"raw bytes");
     assert_eq!(
@@ -125,7 +128,7 @@ fn archive_reads_raw_and_zlib_segments() {
 #[test]
 fn mount_and_unmount_archive() {
     let a = build_xp3(&[("only/a.txt", b"a", false)]);
-    let mut storage = mount_memory(&[("a.xp3", &a)]);
+    let mut storage = mount_memory_with_archives(&[("a.xp3", &a)], &["a.xp3"]);
     assert_eq!(storage.archive_count(), 1);
     assert!(storage.exists("only/a.txt"));
 
@@ -140,7 +143,10 @@ fn list_merges_disk_and_archives() {
         ("assets/arc_only.dat", b"arc", false),
         ("assets/sub/nested.dat", b"nested", false),
     ]);
-    let storage = mount_memory(&[("data.xp3", &xp3), ("assets/disk_only.dat", b"disk")]);
+    let storage = mount_memory_with_archives(
+        &[("data.xp3", &xp3), ("assets/disk_only.dat", b"disk")],
+        &["data.xp3"],
+    );
 
     let listed = storage.list("assets").unwrap();
     assert_eq!(
@@ -156,12 +162,15 @@ fn list_merges_disk_and_archives() {
 #[test]
 fn get_file_list_wildcards_and_attrs() {
     let xp3 = build_xp3(&[("scripts/arc.tjs", b"x", false)]);
-    let storage = mount_memory(&[
-        ("data.xp3", &xp3),
-        ("scripts/disk.tjs", b"y"),
-        ("scripts/sub/nested.tjs", b"n"),
-        ("scripts/readme.txt", b"z"),
-    ]);
+    let storage = mount_memory_with_archives(
+        &[
+            ("data.xp3", &xp3),
+            ("scripts/disk.tjs", b"y"),
+            ("scripts/sub/nested.tjs", b"n"),
+            ("scripts/readme.txt", b"z"),
+        ],
+        &["data.xp3"],
+    );
 
     let mut tjs = storage.get_file_list("scripts/*.tjs", ATTR_NORMAL);
     tjs.sort();
@@ -187,7 +196,7 @@ fn get_file_list_wildcards_and_attrs() {
 #[test]
 fn auto_path_resolves_base_name() {
     let xp3 = build_xp3(&[("config.tjs", b"cfg", false)]);
-    let mut storage = mount_memory(&[("data.xp3", &xp3)]);
+    let mut storage = mount_memory_with_archives(&[("data.xp3", &xp3)], &["data.xp3"]);
     storage.add_auto_path("data.xp3>");
 
     assert_eq!(
@@ -205,9 +214,45 @@ fn auto_path_resolves_base_name() {
 fn reads_a_large_but_valid_archive_entry() {
     let payload: Vec<u8> = (0..2 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
     let xp3 = build_xp3(&[("data/large.bin", &payload, true)]);
-    let storage = mount_memory(&[("data.xp3", &xp3)]);
+    let storage = mount_memory_with_archives(&[("data.xp3", &xp3)], &["data.xp3"]);
 
     let read = storage.read("data/large.bin").unwrap();
     assert_eq!(read.len(), payload.len());
     assert_eq!(read, payload);
+}
+
+/// Precedence: later-mounted archives override earlier ones, so
+/// `--archive data.xp3 --archive patch.xp3` lets `patch.xp3` win.
+#[test]
+fn later_mounted_archive_wins() {
+    let data = build_xp3(&[("shared.txt", b"from data", false)]);
+    let patch = build_xp3(&[("shared.txt", b"from patch", false)]);
+    let files = [
+        ("data.xp3", data.as_slice()),
+        ("patch.xp3", patch.as_slice()),
+    ];
+
+    let storage = mount_memory_with_archives(&files, &["data.xp3", "patch.xp3"]);
+    assert_eq!(storage.read("shared.txt").unwrap(), b"from patch");
+    assert_eq!(
+        storage.find("shared.txt"),
+        Some(Location::Archive(
+            PathBuf::from("/patch.xp3"),
+            "shared.txt".into()
+        ))
+    );
+
+    let storage = mount_memory_with_archives(&files, &["patch.xp3", "data.xp3"]);
+    assert_eq!(storage.read("shared.txt").unwrap(), b"from data");
+}
+
+/// Mounting never enumerates the game directory: an archive present on disk
+/// is ignored until the caller names it explicitly.
+#[test]
+fn mounting_does_not_scan_for_archives() {
+    let xp3 = build_xp3(&[("inside.txt", b"archive", false)]);
+    let storage = mount_memory(&[("data.xp3", &xp3)]);
+
+    assert_eq!(storage.archive_count(), 0);
+    assert!(!storage.exists("inside.txt"));
 }

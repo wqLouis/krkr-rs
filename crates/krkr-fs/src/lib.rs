@@ -23,7 +23,9 @@
 //!   [`FileState`].
 //!
 //! The storage namespace, `.xp3` addressing and case-insensitive resolution
-//! are deliberately absent: they belong to the middle layer.
+//! are deliberately absent: they belong to the middle layer. The XP3
+//! container read + parse itself is a stateless transform over bytes, so it
+//! lives here in [`xp3`].
 //!
 //! The public operations live in the private [`ops`] module and are
 //! re-exported here, so their `krkr_fs::…` paths are stable while the crate
@@ -41,6 +43,9 @@ use krkr_api::fs::OpenMode;
 mod host;
 mod memory;
 mod ops;
+
+/// Stateless XP3 container read + parse over positional IO.
+pub mod xp3;
 
 pub use ops::{
     copy, create_dir_all, exists, file_size, flush, list, open, read_at, read_seq, remove_file,

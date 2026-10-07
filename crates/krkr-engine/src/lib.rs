@@ -17,16 +17,16 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-pub mod archive;
 pub mod layer_ops;
 pub mod projection;
 pub mod raster;
 pub mod scene;
+pub mod startup;
 pub mod storage;
 
-pub use archive::xp3::{
-    Entry as Xp3Entry, Segment as Xp3Segment, Xp3Archive, normalize_in_archive_name,
-};
+// Archive name normalization is a shared storage-naming rule; the parser
+// itself now lives in L1 `krkr_fs::xp3`.
+pub use krkr_fs::xp3::normalize_in_archive_name;
 pub use layer_ops::{
     COPY_MAIN, COPY_MASK, GammaAdjust, RectI, adjust_gamma, affine_blit, blit_copy,
     blit_copy_clipped, blit_over, blit_plane, blur_bitmap_in_place, clip_rect, colorize,
@@ -44,6 +44,7 @@ pub use scene::{
     BitmapCache, BitmapState, CachedImage, FontState, LT_ADDITIVE, LT_ALPHA, LT_OPAQUE,
     LT_SUBTRACTIVE, LayerState, Rect, Scene, WindowState,
 };
+pub use startup::{StartupError, StartupScript, StartupScripts, discover_startup};
 pub use storage::{
     ATTR_DIRECTORY, ATTR_NORMAL, Location, MountError, Storage, StorageMetadata, StorageReadError,
 };

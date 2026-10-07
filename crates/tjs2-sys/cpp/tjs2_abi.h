@@ -231,6 +231,19 @@ int tjs2_prop_set(void *engine, tjs2_value_id id, const char *membername,
                   const tjs2_value *value, char **out_error);
 
 /*
+ * Write the **default member** of a retained object value (PropSet with a
+ * NULL member name). A native `missing` handler uses this to supply the
+ * value for an absent member: the VM passes a `tTJSSimpleGetSetProperty` as
+ * the handler's third argument, and `CallGetMissing` reads that object's
+ * default member back, so setting it is what lets an absent member be
+ * *called* rather than merely read.
+ *
+ * Same value/error conventions as tjs2_prop_set.
+ */
+int tjs2_prop_set_default(void *engine, tjs2_value_id id,
+                          const tjs2_value *value, char **out_error);
+
+/*
  * Write a value back into a by-reference argument of the native method call
  * currently executing on this engine (reference native methods do
  * `(*param[index]) = value`, e.g. `Window.getMouseVelocity`). `index` is the

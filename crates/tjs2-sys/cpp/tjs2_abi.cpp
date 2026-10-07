@@ -2414,6 +2414,59 @@ int tjs2_prop_set(void *engine, tjs2_value_id id, const char *membername,
     }
 }
 
+int tjs2_prop_set_default(void *engine, tjs2_value_id id,
+                          const tjs2_value *value, char **out_error) {
+    tjs2_engine *e = (tjs2_engine *)engine;
+    if(!e || !id || !value) {
+        if(out_error)
+            *out_error = make_error_string("invalid retained value");
+        return 1;
+    }
+    try {
+        // Validate the target before converting the value: conversion can
+        // consume a TJS2_VAL_RETAINED entry, so re-resolve afterwards.
+        if(e->retained.find((uintptr_t)id) == e->retained.end()) {
+            if(out_error)
+                *out_error = make_error_string("invalid retained value");
+            return 1;
+        }
+        TJS::tTJSVariant var;
+        value_to_variant(e, value, &var);
+        auto it = e->retained.find((uintptr_t)id);
+        if(it == e->retained.end()) {
+            if(out_error)
+                *out_error = make_error_string("invalid retained value");
+            return 1;
+        }
+        TJS::tTJSVariantClosure clo =
+            it->second.AsObjectClosureNoAddRef(); // throws if not an object
+        tjs_error hr =
+            clo.PropSet(TJS_MEMBERENSURE, nullptr, nullptr, &var, nullptr);
+        if(TJS_FAILED(hr))
+            TJSThrowFrom_tjs_error(hr, nullptr); // -> catch below
+        if(out_error)
+            *out_error = nullptr;
+        return 0;
+    } catch(const TJS::eTJS &err) {
+        if(out_error)
+            *out_error = make_error_message(err);
+        return 1;
+    } catch(const std::exception &err) {
+        if(out_error) {
+            std::string m = std::string("C++ exception: ") + err.what();
+            char *buf = (char *)malloc(m.size() + 1);
+            if(buf)
+                std::memcpy(buf, m.c_str(), m.size() + 1);
+            *out_error = buf;
+        }
+        return 1;
+    } catch(...) {
+        if(out_error)
+            *out_error = make_error_string("prop_set_default failed");
+        return 1;
+    }
+}
+
 int tjs2_set_arg(tjs2_engine *e, int index, const tjs2_value *value,
                  char **out_error) {
     if(out_error)

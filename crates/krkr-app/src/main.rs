@@ -1,4 +1,4 @@
-//! `krkr` CLI: headless frame runner and winit desktop host.
+//! `krkr` CLI: headless frame runner and windowed desktop frontend.
 //!
 //! ```text
 //! krkr --headless [--frames N] [--backend null|vulkan]
@@ -8,8 +8,10 @@
 //! * `--headless` runs an empty scene for `N` frames (default 120) through
 //!   [`krkr_app::Host`] and prints the null backend [`FrameStats`]. It needs
 //!   neither a display nor a GPU.
-//! * Without `--headless` the process opens a winit window and drives
-//!   [`krkr_app::Host::step`] at roughly 60 fps.
+//! * Without `--headless` the process opens a window through the L1
+//!   [`krkr_platform`] event loop and drives [`krkr_app::Host::step`] at
+//!   roughly 60 fps. This binary is the composition root: it wires the L1
+//!   platform to the L2 engine host and contains no platform logic.
 //! * `--backend vulkan` requests the Vulkan pipeline. It needs a real
 //!   window with a display connection (Wayland/X11/XCB); the windowed host
 //!   passes both the window and display handle so a surface can be created.
@@ -17,16 +19,9 @@
 //! * `-h`/`--help` prints the usage text.
 
 use std::process::ExitCode;
-use std::time::{Duration, Instant};
 
 use krkr_app::{BackendKind, FrameStats, Host, HostConfig, StepReport};
-
-use winit::application::ApplicationHandler;
-use winit::dpi::LogicalSize;
-use winit::event::WindowEvent;
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
-use winit::window::{Window, WindowId};
+use krkr_platform::{EventHandler, Flow, PlatformConfig, PlatformEvent, PlatformWindow};
 
 /// Usage text printed by `-h`/`--help` and on a parse error.
 const USAGE: &str = "\
@@ -50,8 +45,6 @@ NOTE: --backend vulkan currently returns RenderError::Unsupported; the Vulkan
 const DEFAULT_FRAMES: u32 = 120;
 /// Default window/surface size in pixels.
 const DEFAULT_SIZE: (u32, u32) = (1280, 720);
-/// Target frame pacing for the windowed loop (~60 fps).
-const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
 /// Parsed command line.
 #[derive(Clone, Debug)]
@@ -183,131 +176,82 @@ fn run_headless(cli: &Cli) -> Result<(), String> {
     Ok(())
 }
 
-/// Opens a winit window and drives [`Host::step`] at roughly 60 fps.
+/// Opens a window through the L1 platform and drives [`Host::step`].
 fn run_windowed(cli: &Cli) -> Result<(), String> {
-    let event_loop = EventLoop::new().map_err(|error| error.to_string())?;
-    event_loop.set_control_flow(ControlFlow::Wait);
-    let mut app = WindowedApp::new(cli.backend);
-    event_loop
-        .run_app(&mut app)
-        .map_err(|error| error.to_string())
+    let config = PlatformConfig {
+        title: "krkr-rs".to_owned(),
+        size: DEFAULT_SIZE,
+        ..PlatformConfig::default()
+    };
+    krkr_platform::run(config, DesktopApp::new(cli.backend)).map_err(|error| error.to_string())
 }
 
-/// winit application state for the desktop host.
+/// The composition root's bridge from L1 platform events to the L2 host.
 ///
 /// Field order matters for teardown: the Vulkan swapchain/surface must be
-/// destroyed while the window's display connection is still alive, so `host`
-/// is declared before `window` (Rust drops fields in declaration order).
-struct WindowedApp {
+/// destroyed while the window's display connection is still alive. The
+/// platform owns the window and drops it after the handler (and therefore
+/// `host`) is dropped, so `host` is declared here without owning the window.
+struct DesktopApp {
     /// Backend requested on the command line.
     backend: BackendKind,
     /// The host, created once the window handle exists.
     host: Option<Host>,
-    /// The created window, if `resumed` has run.
-    window: Option<Window>,
-    /// Timestamp of the previous frame (for `dt`).
-    last_frame: Instant,
-    /// Timestamp at which the next frame is due.
-    next_frame: Instant,
 }
 
-impl WindowedApp {
-    /// Creates an app that has not yet received `resumed`.
+impl DesktopApp {
+    /// Creates a handler that has not yet received `resumed`.
     fn new(backend: BackendKind) -> Self {
-        let now = Instant::now();
         Self {
             backend,
-            window: None,
             host: None,
-            last_frame: now,
-            next_frame: now,
         }
     }
 }
 
-impl ApplicationHandler for WindowedApp {
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_some() {
-            return;
-        }
-        let attributes = Window::default_attributes()
-            .with_title("krkr-rs")
-            .with_inner_size(LogicalSize::new(
-                f64::from(DEFAULT_SIZE.0),
-                f64::from(DEFAULT_SIZE.1),
-            ));
-        let window = match event_loop.create_window(attributes) {
-            Ok(window) => window,
-            Err(error) => {
-                eprintln!("krkr: failed to create window: {error}");
-                event_loop.exit();
-                return;
-            }
-        };
-
-        let handle = window.window_handle().ok().map(|handle| handle.as_raw());
-        let display = window.display_handle().ok().map(|handle| handle.as_raw());
+impl EventHandler for DesktopApp {
+    fn resumed(&mut self, window: &PlatformWindow) -> Flow {
         let config = HostConfig {
             backend: self.backend,
             surface_size: DEFAULT_SIZE,
-            window_handle: handle,
-            display_handle: display,
+            window_handle: window.raw_window_handle(),
+            display_handle: window.raw_display_handle(),
             ..HostConfig::default()
         };
         match Host::new(config) {
             Ok(host) => {
                 self.host = Some(host);
+                Flow::Continue
             }
             Err(error) => {
                 eprintln!("krkr: failed to create host: {error}");
-                event_loop.exit();
-                return;
+                Flow::Exit
             }
         }
-
-        self.window = Some(window);
-        self.next_frame = Instant::now();
     }
 
-    fn window_event(
-        &mut self,
-        event_loop: &ActiveEventLoop,
-        _window_id: WindowId,
-        event: WindowEvent,
-    ) {
+    fn event(&mut self, event: PlatformEvent) -> Flow {
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::Resized(size) => {
-                let size = (size.width.max(1), size.height.max(1));
+            PlatformEvent::Resized(width, height) => {
                 if let Some(host) = self.host.as_mut()
-                    && let Err(error) = host.resize(size)
+                    && let Err(error) = host.resize((width, height))
                 {
                     eprintln!("krkr: resize failed: {error}");
+                    return Flow::Exit;
                 }
+                Flow::Continue
             }
-            WindowEvent::RedrawRequested => {
-                let now = Instant::now();
-                let dt_ms = now.saturating_duration_since(self.last_frame).as_secs_f32() * 1000.0;
-                self.last_frame = now;
-                if let Some(host) = self.host.as_mut()
-                    && let Err(error) = host.step(dt_ms)
-                {
-                    eprintln!("krkr: frame failed: {error}");
-                    event_loop.exit();
-                }
-            }
-            _ => {}
+            _ => Flow::Continue,
         }
     }
 
-    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        let now = Instant::now();
-        if now >= self.next_frame {
-            self.next_frame = now + FRAME_INTERVAL;
-            if let Some(window) = self.window.as_ref() {
-                window.request_redraw();
-            }
+    fn frame(&mut self, dt_ms: f32) -> Flow {
+        if let Some(host) = self.host.as_mut()
+            && let Err(error) = host.step(dt_ms)
+        {
+            eprintln!("krkr: frame failed: {error}");
+            return Flow::Exit;
         }
-        event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_frame));
+        Flow::Continue
     }
 }

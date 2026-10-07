@@ -7,3 +7,5 @@ license.workspace = true
 
 [dependencies]
 krkr-api = { workspace = true }
+thiserror = { workspace = true }
+flate2 = { workspace = true }

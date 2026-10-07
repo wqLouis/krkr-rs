@@ -2,24 +2,30 @@
 //!
 //! A [`Storage`] value owns everything needed to resolve TVP storage names:
 //!
-//! * an immutable bottom [`FileSystem`] object (created by L1) and the game
+//! * an immutable bottom [`FileSystem`] object (created by L1) and the base
 //!   directory it is mounted at;
-//! * the parsed [`Xp3Archive`] values mounted from that directory, each with
-//!   its L2-owned [`FileState`];
+//! * the parsed [`Xp3Archive`] values explicitly mounted by the caller, each
+//!   with its L2-owned [`FileState`];
 //! * the auto search-path list.
 //!
 //! This is the middle layer described in `docs/migration/06-file-system.md`
-//! §2: the bottom layer knows nothing about `.xp3`, `arc.xp3>path`
-//! addressing, case-insensitive lookup or the auto-path list. There are no
-//! globals or process-wide caches — a `Storage` is a plain value the caller
-//! owns, and all `FileState`s live inside it.
+//! §2 and `docs/migration/09-game-loading.md`: the bottom layer knows nothing
+//! about `.xp3`, `arc.xp3>path` addressing, case-insensitive lookup or the
+//! auto-path list. There are no globals or process-wide caches — a `Storage`
+//! is a plain value the caller owns, and all `FileState`s live inside it.
+//! The XP3 container read + parse itself is L1 (`krkr_fs::xp3`); this layer
+//! only owns the namespace.
+//!
+//! Loading is explicit: the caller supplies the archive list and the loader
+//! never enumerates the game directory. See [`Storage::mount_archives`] /
+//! [`Storage::mount_archive`].
 //!
 //! Resolution order mirrors the reference engine:
 //!
 //! 1. explicit `arc.xp3>path` addressing,
 //! 2. disk files (normalized spelling, then the script's spelling, then a
 //!    bounded component-wise case-insensitive walk),
-//! 3. mounted archives in discovery order,
+//! 3. mounted archives, later mounts first (later-mounted wins),
 //! 4. the auto search-path list.
 
 use std::collections::BTreeSet;
@@ -28,9 +34,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use krkr_api::error::FsError;
 use krkr_api::fs::{FsPath, OpenMode};
+use krkr_fs::xp3::{self, Xp3Archive, normalize_in_archive_name};
 use krkr_fs::{FileState, FileSystem};
-
-use crate::archive::xp3::{self, Xp3Archive, normalize_in_archive_name};
 
 /// Windows `FILE_ATTRIBUTE_DIRECTORY` (0x10).
 pub const ATTR_DIRECTORY: i64 = 0x10;
@@ -50,14 +55,14 @@ struct MountedArchive {
     archive: Xp3Archive,
 }
 
-/// A mounted game storage: one game directory plus every `.xp3` archive found
-/// inside it.
+/// A mounted game storage: one base directory plus the explicitly mounted
+/// `.xp3` archives.
 pub struct Storage {
     /// Immutable bottom file-system object.
     fs: FileSystem,
-    /// Logical mount directory.
+    /// Base (app) directory used for disk assets.
     game_dir: PathBuf,
-    /// Mounted archives in sorted-name order (deterministic).
+    /// Mounted archives in mount order; later entries take precedence.
     archives: Vec<MountedArchive>,
     /// Auto search-path prefixes (plain dirs or `arc.xp3>` prefixes).
     auto_paths: Vec<String>,
@@ -119,28 +124,44 @@ pub enum StorageReadError {
 }
 
 impl Storage {
-    /// Mounts a game directory, discovering and parsing every top-level
-    /// `*.xp3` archive in it.
+    /// Creates a storage rooted at `base_dir` and mounts each archive in
+    /// `archives`, in order.
     ///
-    /// `fs` is the bottom file-system object; `game_dir` is the logical mount
-    /// directory (for a host root this is normally the same directory passed
-    /// to [`FileSystem::host`]). Archives that fail to parse are logged and
-    /// skipped rather than failing the mount, matching the reference engine's
-    /// resilient startup.
-    pub fn mount(fs: FileSystem, game_dir: impl Into<PathBuf>) -> Result<Self, MountError> {
-        let game_dir = game_dir.into();
-        let meta = krkr_fs::stat(&fs, &FsPath::host(&game_dir))?;
-        if !meta.is_dir {
-            return Err(MountError::NotADirectory(game_dir.display().to_string()));
+    /// Loading is explicit: the caller supplies the archive list (from the
+    /// command line or Android Intent extras), and the loader never scans the
+    /// folder. Later archives take precedence over earlier ones, so
+    /// `--archive data.xp3 --archive patch.xp3` lets `patch.xp3` override
+    /// `data.xp3`.
+    ///
+    /// `fs` is the bottom file-system object; `base_dir` is the app path used
+    /// for disk assets. A missing or unparseable archive is a typed error, not
+    /// a warning (`docs/migration/09-game-loading.md` §8).
+    pub fn mount_archives(
+        fs: FileSystem,
+        base_dir: impl Into<PathBuf>,
+        archives: impl IntoIterator<Item = impl AsRef<Path>>,
+    ) -> Result<Self, MountError> {
+        let mut storage = Self::with_base_dir(fs, base_dir.into())?;
+        for path in archives {
+            storage.mount_archive(path)?;
         }
-        let mut storage = Storage {
+        Ok(storage)
+    }
+
+    /// Creates an empty storage rooted at `base_dir`, validating that the
+    /// base path exists and is a directory. No archives are mounted; use
+    /// [`Self::mount_archive`] to add them explicitly.
+    fn with_base_dir(fs: FileSystem, base_dir: PathBuf) -> Result<Self, MountError> {
+        let meta = krkr_fs::stat(&fs, &FsPath::host(&base_dir))?;
+        if !meta.is_dir {
+            return Err(MountError::NotADirectory(base_dir.display().to_string()));
+        }
+        Ok(Storage {
             fs,
-            game_dir,
+            game_dir: base_dir,
             archives: Vec::new(),
             auto_paths: Vec::new(),
-        };
-        storage.discover_archives()?;
-        Ok(storage)
+        })
     }
 
     /// The bottom file-system object this storage reads through.
@@ -170,41 +191,18 @@ impl Storage {
         }
     }
 
-    /// Discovers and mounts every top-level `*.xp3` in the game directory.
-    /// Returns the number of newly mounted archives.
-    pub fn discover_archives(&mut self) -> Result<usize, MountError> {
-        let entries = krkr_fs::list(&self.fs, &FsPath::host(&self.game_dir))?;
-        let mut paths: Vec<PathBuf> = entries
-            .into_iter()
-            .filter(|e| !e.is_dir)
-            .filter(|e| {
-                Path::new(&e.name)
-                    .extension()
-                    .is_some_and(|x| x.eq_ignore_ascii_case("xp3"))
-            })
-            .map(|e| self.game_dir.join(e.name))
-            .collect();
-        paths.sort();
-
-        let mut mounted = 0;
-        for path in paths {
-            if self.archives.iter().any(|m| m.path == path) {
-                continue;
-            }
-            match self.mount_archive(&path) {
-                Ok(()) => mounted += 1,
-                Err(e) => log::warn!("skipping {}: {e}", path.display()),
-            }
-        }
-        Ok(mounted)
-    }
-
     /// Mounts one archive by path, parsing its index eagerly.
     ///
-    /// The path is resolved through the bottom file system like any other
-    /// disk path. Mounting the same archive twice is a no-op.
+    /// The path is resolved against the storage base directory (absolute
+    /// paths are used as given) and opened through the bottom file system.
+    /// Mounting the same archive twice is a no-op.
     pub fn mount_archive(&mut self, path: impl AsRef<Path>) -> Result<(), MountError> {
-        let path = path.as_ref().to_path_buf();
+        let raw = path.as_ref();
+        let path = if raw.is_absolute() {
+            raw.to_path_buf()
+        } else {
+            self.game_dir.join(raw)
+        };
         if self.archives.iter().any(|m| m.path == path) {
             return Ok(());
         }
@@ -288,6 +286,7 @@ impl Storage {
             let mounted = self
                 .archives
                 .iter()
+                .rev()
                 .find(|m| m.file_name.eq_ignore_ascii_case(&arc_name))?;
             let rest = normalize_in_archive_name(rest);
             if mounted.archive.entry(&rest).is_some() {
@@ -306,9 +305,10 @@ impl Storage {
             return Some(location);
         }
 
-        // Archives, in mount order (looked up by the normalized name).
+        // Archives, later mounts first (later-mounted wins — see
+        // `mount_archives`). Looked up by the normalized name.
         let normalized = normalize_in_archive_name(&relative);
-        for mounted in &self.archives {
+        for mounted in self.archives.iter().rev() {
             if mounted.archive.entry(&normalized).is_some() {
                 return Some(Location::Archive(mounted.path.clone(), normalized));
             }
