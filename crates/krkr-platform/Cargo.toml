@@ -1,0 +1,18 @@
+[package]
+name = "krkr-platform"
+description = "krkr-rs L1 platform core: window/surface, event loop, input, clock, threads (all platform-specific code)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+krkr-api = { workspace = true }
+raw-window-handle = { workspace = true }
+winit = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+
+[features]
+default = ["platform-linux"]
+platform-linux = []
+platform-android = []

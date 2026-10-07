@@ -1029,6 +1029,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "krkr-compat"
+version = "1.0.0"
+dependencies = [
+ "krkr-api",
+ "krkr-engine",
+ "krkr-fs",
+ "krkr-media",
+ "krkr-render",
+ "log",
+ "thiserror 2.0.20",
+ "tjs2-sys",
+]
+
+[[package]]
 name = "krkr-engine"
 version = "1.0.0"
 dependencies = [
@@ -1058,6 +1072,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "krkr-platform"
+version = "1.0.0"
+dependencies = [
+ "krkr-api",
+ "log",
+ "raw-window-handle",
+ "thiserror 2.0.20",
+ "winit",
+]
+
+[[package]]
 name = "krkr-render"
 version = "1.0.0"
 dependencies = [
@@ -1068,6 +1093,18 @@ dependencies = [
  "log",
  "raw-window-handle",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "krkr-vm"
+version = "1.0.0"
+dependencies = [
+ "krkr-api",
+ "krkr-compat",
+ "krkr-platform",
+ "log",
+ "thiserror 2.0.20",
+ "tjs2-sys",
 ]
 
 [[package]]

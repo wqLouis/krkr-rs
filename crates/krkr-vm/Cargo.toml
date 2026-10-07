@@ -1,0 +1,14 @@
+[package]
+name = "krkr-vm"
+description = "krkr-rs L4 TJS VM host over tjs2-sys: lifecycle, bytecode, GC roots, frame body"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+krkr-api = { workspace = true }
+krkr-compat = { workspace = true }
+krkr-platform = { workspace = true }
+tjs2-sys = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }

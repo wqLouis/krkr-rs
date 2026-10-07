@@ -1,0 +1,16 @@
+[package]
+name = "krkr-compat"
+description = "krkr-rs L3 KiriKiri compatibility surface: native classes + KAG + event adapter + static plugins"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+krkr-api = { workspace = true }
+krkr-engine = { workspace = true }
+krkr-fs = { workspace = true }
+krkr-render = { workspace = true }
+krkr-media = { workspace = true }
+tjs2-sys = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }

@@ -23,6 +23,9 @@ members = [
     "crates/krkr-media",
     "crates/krkr-render",
     "crates/krkr-engine",
+    "crates/krkr-platform",
+    "crates/krkr-compat",
+    "crates/krkr-vm",
     "crates/krkr-app",
 ]
 default-members = ["crates/krkr-app"]
@@ -40,6 +43,9 @@ krkr-fs = { path = "crates/krkr-fs" }
 krkr-media = { path = "crates/krkr-media" }
 krkr-render = { path = "crates/krkr-render" }
 krkr-engine = { path = "crates/krkr-engine" }
+krkr-platform = { path = "crates/krkr-platform" }
+krkr-compat = { path = "crates/krkr-compat" }
+krkr-vm = { path = "crates/krkr-vm" }
 thiserror = "2"
 log = "0.4"
 ash = "0.38"
