@@ -1,6 +1,0 @@
-# Native parity allowlist: reference members that are known-missing.
-# One entry per line: Class.member
-# Regenerate after intentional additions with:
-#   python3 scripts/native_parity.py --update-allow
-# The checker fails when a missing member is not listed here.
-

@@ -46,7 +46,7 @@ The new architecture is introduced **alongside** the current one:
 
 Every phase must leave:
 * `cargo test` green,
-* `scripts/native_parity.py` green,
+* the native-parity report green (the script was removed with the legacy crates; restore from `main` when the natives are ported),
 * `krkr-rs run <game> --headless` producing the same scene dump,
 * the windowed game playable.
 
@@ -194,7 +194,7 @@ Exit criteria: `02-target-architecture.md §9` acceptance criteria all hold.
 | Golden image | Bevy vs Vulkan framebuffer compare per scripted scene | `render` |
 | Blend matrix | one quad per `BlendMode` over a known background | `render` |
 | Integration | `krkr-rs run <game> --headless` scene dump snapshot | `app` |
-| Parity | `scripts/native_parity.py` (100% tracked coverage) | CI |
+| Parity | the native-parity report (100% tracked coverage; script removed with the legacy crates) | CI |
 | Media | host-testable pure parts (YUV, TLG, decode wrappers) | `media` |
 | FS | in-memory `FileSystem` fixtures, real-game mount | `fs`/`engine` |
 | Android | compile + symbol checks in CI; device run manual | CI / manual |

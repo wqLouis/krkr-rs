@@ -161,5 +161,5 @@ timer_poll → sound_poll → video poll
 
 * Marshalling and the null-plugin object are unit-testable with no window.
 * The VM host is exercised with small script fixtures.
-* Native parity (`scripts/native_parity.py`) keeps the class/method coverage
+* Native parity (the report script, removed with the legacy crates) keeps the class/method coverage
   tracked through the move.
