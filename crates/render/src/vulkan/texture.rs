@@ -111,7 +111,7 @@ impl StagingBuffer {
 }
 
 /// Returns the Vulkan format used for a [`TextureFormat`].
-fn image_format(format: TextureFormat) -> vk::Format {
+pub(crate) fn image_format(format: TextureFormat) -> vk::Format {
     match format {
         TextureFormat::Rgba8Srgb => vk::Format::R8G8B8A8_SRGB,
         TextureFormat::Rgba8Unorm => vk::Format::R8G8B8A8_UNORM,
@@ -512,7 +512,7 @@ fn transition_image(
 }
 
 /// Records `record` into a one-time command buffer and submits it.
-fn record_and_submit<F>(
+pub(crate) fn record_and_submit<F>(
     device: &ash::Device,
     queue: vk::Queue,
     command_pool: vk::CommandPool,

@@ -1,6 +1,5 @@
 //! Integration tests for the crate-level `Media` object and capabilities.
 
-use api::error::MediaError;
 use media::{Media, MediaConfig, capabilities, create_media, open_video};
 
 #[test]
@@ -11,9 +10,13 @@ fn capabilities_advertise_the_image_and_audio_backends() {
     assert!(caps.image_formats.iter().any(|name| name == "tlg6"));
     assert!(caps.audio_formats.iter().any(|name| name == "wav"));
     assert!(caps.audio_formats.iter().any(|name| name == "opus"));
-    assert!(caps.video_formats.is_empty());
-    assert!(caps.streaming_audio);
-    assert!(!caps.streaming_video);
+    if cfg!(feature = "video-ffmpeg") {
+        assert!(caps.video_formats.iter().any(|name| name == "mp4"));
+        assert!(caps.streaming_video);
+    } else {
+        assert!(caps.video_formats.is_empty());
+        assert!(!caps.streaming_video);
+    }
     assert!(!caps.is_empty());
 }
 
@@ -29,10 +32,10 @@ fn config_is_preserved_and_media_is_stateless() {
 }
 
 #[test]
-fn video_scaffold_reports_unsupported() {
+fn video_open_rejects_non_video_data() {
     let media = Media::new();
-    assert!(matches!(
-        open_video(&media, std::sync::Arc::from(&[][..]), None),
-        Err(MediaError::Unsupported { .. })
-    ));
+    // The FFmpeg backend returns a typed decode/unsupported error; the
+    // MediaCodec stub returns Unsupported. Either way: never a panic, never a
+    // silent success.
+    assert!(open_video(&media, std::sync::Arc::from(&b"not a video"[..]), None).is_err());
 }

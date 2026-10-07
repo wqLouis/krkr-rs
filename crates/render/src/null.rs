@@ -3,7 +3,9 @@
 //! The null backend accepts the entire render API and tracks scene traversal
 //! and texture uploads in [`RenderState`], but never touches a GPU or a
 //! window. It exists so the middle layer and the test suite can run without
-//! a device.
+//! a device. It also ships a real CPU software rasterizer for offscreen
+//! render targets, which is the D8 correctness baseline for
+//! destination-dependent blends and pixel readback.
 
 use std::collections::HashMap;
 
@@ -12,6 +14,8 @@ use api::geometry::PixelRegion;
 use api::host::{Presentation, SurfaceEvent};
 use raw_window_handle::RawWindowHandle;
 
+use crate::cpu::{CpuTexture, TextureProvider};
+use crate::render_target::{RenderTarget, RenderTargetDesc};
 use crate::scene::{
     RenderContent, RenderNode, RenderNodeId, RenderScene, child_sort_key, children_are_sorted,
 };
@@ -51,8 +55,9 @@ pub struct FrameStats {
 
 /// Stateless headless render pipeline.
 ///
-/// It is the test double for the Vulkan pipeline: every render action is
-/// accepted and only CPU-side bookkeeping happens.
+/// It is the test double for the Vulkan pipeline: presentation frames are
+/// accepted with CPU-side bookkeeping only, while offscreen render targets
+/// are composited by a real CPU software rasterizer.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NullRenderPipeline;
 
@@ -68,10 +73,12 @@ impl NullRenderPipeline {
             backend: BackendKind::Null,
             max_texture_dimension: NULL_MAX_TEXTURE_DIMENSION,
             preferred_format: TextureFormat::Rgba8Srgb,
-            // The null backend performs no rendering, so it truthfully reports
-            // no hardware composition capabilities.
-            supports_destination_dependent_blend: false,
-            supports_offscreen_targets: false,
+            // The null backend ships a real CPU software rasterizer for
+            // offscreen targets, so it can evaluate destination-dependent
+            // blends (and read pixels back) without a GPU. This is the D8
+            // CPU-correctness baseline, not a silently-degraded GPU path.
+            supports_destination_dependent_blend: true,
+            supports_offscreen_targets: true,
             supports_glyph_atlas: false,
         }
     }
@@ -123,6 +130,81 @@ impl NullRenderPipeline {
     ) -> Result<(), RenderError> {
         let null = null_state_mut(state)?;
         upload_into(null, tex, region, pixels)
+    }
+
+    /// Creates an offscreen render-target handle after validating its
+    /// descriptor.
+    pub fn create_render_target(
+        &self,
+        desc: RenderTargetDesc,
+    ) -> Result<RenderTarget, RenderError> {
+        validate_target_desc(&desc)?;
+        Ok(RenderTarget::new(desc))
+    }
+
+    /// Releases the CPU storage associated with `target`.
+    pub fn destroy_render_target(&self, state: &mut RenderState, target: RenderTarget) {
+        if let StateKind::Null(null) = &mut state.kind {
+            null.render_targets.remove(&target.key());
+        }
+    }
+
+    /// Renders `scene` into the CPU storage of `target`.
+    pub fn render_to_target(
+        &self,
+        state: &mut RenderState,
+        target: &RenderTarget,
+        scene: &RenderScene,
+    ) -> Result<(), RenderError> {
+        let null = null_state_mut(state)?;
+        let NullState {
+            render_targets,
+            textures,
+            ..
+        } = null;
+        if let std::collections::hash_map::Entry::Vacant(entry) = render_targets.entry(target.key())
+        {
+            let desc = *target.desc();
+            let total = usize::try_from(desc.byte_len()).map_err(|_| RenderError::OutOfMemory {
+                message: "render target is too large for the host address space".to_owned(),
+            })?;
+            entry.insert(NullRenderTarget {
+                desc,
+                pixels: vec![0; total],
+            });
+        }
+        let image =
+            render_targets
+                .get_mut(&target.key())
+                .ok_or_else(|| RenderError::Framebuffer {
+                    message: "render target is not owned by this render state".to_owned(),
+                })?;
+        crate::cpu::render_scene(
+            image.desc.width,
+            image.desc.height,
+            &mut image.pixels,
+            scene.background,
+            scene,
+            textures,
+        )
+    }
+
+    /// Copies a sub-rectangle of `target` into `out`.
+    pub fn read_render_target(
+        &self,
+        state: &RenderState,
+        target: &RenderTarget,
+        region: PixelRegion,
+        out: &mut [u8],
+    ) -> Result<(), RenderError> {
+        let null = null_state(state)?;
+        let image =
+            null.render_targets
+                .get(&target.key())
+                .ok_or_else(|| RenderError::Framebuffer {
+                    message: "render target is not owned by this render state".to_owned(),
+                })?;
+        read_region(&image.desc, &image.pixels, region, out)
     }
 
     /// Traverses `scene` and records per-frame counters.
@@ -187,8 +269,28 @@ pub(crate) struct NullState {
     pub(crate) frame_index: u64,
     /// CPU storage per texture identity.
     pub(crate) textures: HashMap<u64, NullImage>,
+    /// CPU storage per offscreen render-target identity.
+    pub(crate) render_targets: HashMap<u64, NullRenderTarget>,
     /// Counters from the most recent frame.
     pub(crate) last_frame: Option<FrameStats>,
+}
+
+/// CPU-side image storage for one offscreen render target.
+#[derive(Debug)]
+pub(crate) struct NullRenderTarget {
+    pub(crate) desc: RenderTargetDesc,
+    pub(crate) pixels: Vec<u8>,
+}
+
+impl TextureProvider for HashMap<u64, NullImage> {
+    fn texture(&self, key: u64) -> Option<CpuTexture<'_>> {
+        self.get(&key).map(|image| CpuTexture {
+            pixels: &image.pixels,
+            width: image.desc.width,
+            height: image.desc.height,
+            format: image.desc.format,
+        })
+    }
 }
 
 /// CPU-side image storage for one texture.
@@ -208,6 +310,83 @@ fn null_state_mut(state: &mut RenderState) -> Result<&mut NullState, RenderError
             message: "the null backend received a Vulkan render state".to_owned(),
         }),
     }
+}
+
+/// Borrows the null payload immutably, rejecting a mismatched backend.
+fn null_state(state: &RenderState) -> Result<&NullState, RenderError> {
+    match &state.kind {
+        StateKind::Null(null) => Ok(null),
+        StateKind::Vulkan(_) => Err(RenderError::InvalidArgument {
+            message: "the null backend received a Vulkan render state".to_owned(),
+        }),
+    }
+}
+
+/// Validates a render-target descriptor against the null backend's limits.
+fn validate_target_desc(desc: &RenderTargetDesc) -> Result<(), RenderError> {
+    if desc.is_empty() {
+        return Err(RenderError::InvalidArgument {
+            message: "render-target dimensions must be non-zero".to_owned(),
+        });
+    }
+    if desc.width > NULL_MAX_TEXTURE_DIMENSION || desc.height > NULL_MAX_TEXTURE_DIMENSION {
+        return Err(RenderError::InvalidArgument {
+            message: format!(
+                "render-target dimensions exceed the {NULL_MAX_TEXTURE_DIMENSION} pixel limit"
+            ),
+        });
+    }
+    if !desc.format.has_alpha() {
+        return Err(RenderError::InvalidArgument {
+            message: "an offscreen render target must use an alpha-capable RGBA8 format".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Copies `region` from `pixels` into `out`.
+fn read_region(
+    desc: &RenderTargetDesc,
+    pixels: &[u8],
+    region: PixelRegion,
+    out: &mut [u8],
+) -> Result<(), RenderError> {
+    let bytes_per_pixel = desc.format.bytes_per_pixel() as usize;
+    if region.is_empty() {
+        return Err(RenderError::Framebuffer {
+            message: "readback region is empty".to_owned(),
+        });
+    }
+    if region.right() > desc.width || region.bottom() > desc.height {
+        return Err(RenderError::Framebuffer {
+            message: format!(
+                "readback region {}x{}+{}+{} exceeds the {}x{} target",
+                region.width, region.height, region.x, region.y, desc.width, desc.height
+            ),
+        });
+    }
+    let expected = (region.area() as usize)
+        .checked_mul(bytes_per_pixel)
+        .ok_or_else(|| RenderError::Framebuffer {
+            message: "readback size overflows the host address space".to_owned(),
+        })?;
+    if out.len() != expected {
+        return Err(RenderError::Framebuffer {
+            message: format!(
+                "readback buffer is {} bytes, expected {expected}",
+                out.len()
+            ),
+        });
+    }
+    let row_bytes = region.width as usize * bytes_per_pixel;
+    let stride = desc.width as usize * bytes_per_pixel;
+    for row in 0..region.height as usize {
+        let source = (region.y as usize + row) * stride + region.x as usize * bytes_per_pixel;
+        let destination = row * row_bytes;
+        out[destination..destination + row_bytes]
+            .copy_from_slice(&pixels[source..source + row_bytes]);
+    }
+    Ok(())
 }
 
 /// Rejects a surface created by a different backend.

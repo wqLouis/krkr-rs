@@ -18,7 +18,11 @@ engine = { workspace = true }
 platform = { workspace = true, features = ["platform-linux"] }
 render = { workspace = true }
 fs = { workspace = true }
-media = { workspace = true }
+# D13: the desktop binary selects the FFmpeg video backend explicitly rather
+# than relying on `media`'s default, so the Android frontend's
+# `default-features = false, features = ["video-mediacodec"]` counterpart is
+# documented at the call site too.
+media = { workspace = true, features = ["video-ffmpeg"] }
 raw-window-handle = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }

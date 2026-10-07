@@ -43,6 +43,7 @@ mod draw;
 mod pipelines;
 mod shaders;
 mod swapchain;
+mod target;
 mod texture;
 
 use std::collections::HashMap;
@@ -57,6 +58,7 @@ use api::error::RenderError;
 use api::geometry::PixelRegion;
 use api::host::{Presentation, SurfaceEvent};
 
+use crate::render_target::{RenderTarget, RenderTargetDesc};
 use crate::scene::RenderScene;
 use crate::state::{RenderState, StateKind, Surface, SurfaceKind};
 use crate::texture::{Texture, TextureDesc};
@@ -147,7 +149,9 @@ impl VulkanPipeline {
             max_texture_dimension: self.max_texture_dimension,
             preferred_format: self.preferred_format,
             supports_destination_dependent_blend: false,
-            supports_offscreen_targets: false,
+            // Offscreen targets are a real GPU path: colour-only render pass,
+            // per-format pipelines and `vkCmdCopyImageToBuffer` readback.
+            supports_offscreen_targets: true,
             // GPU glyph runs and mask clips are not implemented; a scene that
             // uses them fails with `RenderError::Unsupported` rather than
             // rendering incorrectly.
@@ -324,6 +328,8 @@ impl VulkanPipeline {
             render_finished,
             frame_in_flight: 0,
             textures: HashMap::new(),
+            offscreen: HashMap::new(),
+            render_targets: HashMap::new(),
             staging: texture::StagingBuffer::default(),
             upload_pool,
             upload_command,
@@ -451,6 +457,137 @@ impl VulkanPipeline {
             gpu,
             region,
             pixels,
+        )
+    }
+
+    /// Creates an offscreen render-target handle after validating its
+    /// descriptor.
+    pub(crate) fn create_render_target(
+        &self,
+        desc: RenderTargetDesc,
+    ) -> Result<RenderTarget, RenderError> {
+        validate_target_desc(&desc, self.max_texture_dimension)?;
+        Ok(RenderTarget::new(desc))
+    }
+
+    /// Releases the GPU resources and state slot for `target`.
+    pub(crate) fn destroy_render_target(&self, state: &mut RenderState, target: RenderTarget) {
+        let StateKind::Vulkan(vstate) = &mut state.kind else {
+            return;
+        };
+        let Some(gpu) = vstate.render_targets.remove(&target.key()) else {
+            return;
+        };
+        let device = vstate.device.clone();
+        // SAFETY: wait for in-flight work before freeing the image.
+        unsafe {
+            let _ = device.device_wait_idle();
+        }
+        gpu.destroy(&device);
+    }
+
+    /// Renders `scene` into the offscreen `target`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RenderError::InvalidArgument`] for a mismatched backend and
+    /// [`RenderError::Unsupported`] when the scene needs a feature the Vulkan
+    /// backend does not implement.
+    pub(crate) fn render_to_target(
+        &self,
+        state: &mut RenderState,
+        target: &RenderTarget,
+        scene: &RenderScene,
+    ) -> Result<(), RenderError> {
+        let StateKind::Vulkan(vstate) = &mut state.kind else {
+            return Err(RenderError::InvalidArgument {
+                message: "the Vulkan backend received a null render state".to_owned(),
+            });
+        };
+        let format = target.desc().format;
+        let key = target.key();
+        let vstate = &mut **vstate;
+        let VulkanState {
+            device,
+            graphics_queue,
+            upload_pool,
+            upload_command,
+            upload_fence,
+            offscreen,
+            render_targets,
+            textures,
+            ..
+        } = vstate;
+
+        if let std::collections::hash_map::Entry::Vacant(entry) = offscreen.entry(format) {
+            entry.insert(target::OffscreenPass::create(
+                device,
+                &self.memory_properties,
+                format,
+            )?);
+        }
+        let pass = offscreen
+            .get(&format)
+            .ok_or_else(|| RenderError::Framebuffer {
+                message: "offscreen pipeline state disappeared".to_owned(),
+            })?;
+        if let std::collections::hash_map::Entry::Vacant(entry) = render_targets.entry(key) {
+            entry.insert(target::VulkanRenderTarget::create(
+                device,
+                &self.memory_properties,
+                pass,
+                *target.desc(),
+            )?);
+        }
+        let gpu = render_targets
+            .get(&key)
+            .ok_or_else(|| RenderError::Framebuffer {
+                message: "render-target state disappeared".to_owned(),
+            })?;
+        target::render(
+            device,
+            *graphics_queue,
+            *upload_pool,
+            *upload_command,
+            *upload_fence,
+            gpu,
+            pass,
+            textures,
+            scene,
+        )
+    }
+
+    /// Copies a sub-rectangle of an offscreen `target` into `out`.
+    pub(crate) fn read_render_target(
+        &self,
+        state: &RenderState,
+        target: &RenderTarget,
+        region: PixelRegion,
+        out: &mut [u8],
+    ) -> Result<(), RenderError> {
+        let StateKind::Vulkan(vstate) = &state.kind else {
+            return Err(RenderError::InvalidArgument {
+                message: "the Vulkan backend received a null render state".to_owned(),
+            });
+        };
+        let gpu =
+            vstate
+                .render_targets
+                .get(&target.key())
+                .ok_or_else(|| RenderError::Framebuffer {
+                    message: "render target has not been rendered yet".to_owned(),
+                })?;
+        validate_readback(target.desc(), region, out.len())?;
+        target::read(
+            &vstate.device,
+            &self.memory_properties,
+            vstate.graphics_queue,
+            vstate.upload_pool,
+            vstate.upload_command,
+            vstate.upload_fence,
+            gpu,
+            region,
+            out,
         )
     }
 
@@ -731,6 +868,10 @@ pub(crate) struct VulkanState {
     pub(crate) frame_in_flight: usize,
     /// GPU textures keyed by [`Texture`] identity.
     pub(crate) textures: HashMap<u64, texture::VulkanTexture>,
+    /// Per-format offscreen render passes and their pipelines.
+    pub(crate) offscreen: HashMap<TextureFormat, target::OffscreenPass>,
+    /// GPU offscreen targets keyed by [`RenderTarget`] identity.
+    pub(crate) render_targets: HashMap<u64, target::VulkanRenderTarget>,
     /// Persistent staging buffer reused by every upload.
     pub(crate) staging: texture::StagingBuffer,
     /// Pool and command buffer used for one-time uploads.
@@ -758,6 +899,12 @@ impl Drop for VulkanState {
             let descriptor_pool = self.pipelines.descriptor_pool;
             for texture in self.textures.values() {
                 texture.destroy(&self.device, descriptor_pool);
+            }
+            for target in self.render_targets.values() {
+                target.destroy(&self.device);
+            }
+            for pass in self.offscreen.values() {
+                pass.destroy(&self.device);
             }
             self.pipelines.destroy(&self.device);
             self.swapchain.destroy(&self.device, &self.swapchain_loader);
@@ -1126,7 +1273,7 @@ fn display_for_window(window: &RawWindowHandle) -> Option<RawDisplayHandle> {
 }
 
 /// Returns `true` when `format` applies the sRGB transfer function on write.
-fn format_is_srgb(format: vk::Format) -> bool {
+pub(crate) fn format_is_srgb(format: vk::Format) -> bool {
     matches!(
         format,
         vk::Format::B8G8R8A8_SRGB
@@ -1138,7 +1285,7 @@ fn format_is_srgb(format: vk::Format) -> bool {
 }
 
 /// Converts the scene background into a render-pass clear color.
-fn clear_value(background: Option<[f32; 4]>, srgb: bool) -> [f32; 4] {
+pub(crate) fn clear_value(background: Option<[f32; 4]>, srgb: bool) -> [f32; 4] {
     let [r, g, b, a] = background.unwrap_or([0.0, 0.0, 0.0, 1.0]);
     if srgb {
         [
@@ -1150,6 +1297,54 @@ fn clear_value(background: Option<[f32; 4]>, srgb: bool) -> [f32; 4] {
     } else {
         [r, g, b, a]
     }
+}
+
+/// Validates an offscreen render-target descriptor against the device limit.
+fn validate_target_desc(desc: &RenderTargetDesc, max_dimension: u32) -> Result<(), RenderError> {
+    if desc.is_empty() {
+        return Err(RenderError::InvalidArgument {
+            message: "render-target dimensions must be non-zero".to_owned(),
+        });
+    }
+    if desc.width > max_dimension || desc.height > max_dimension {
+        return Err(RenderError::InvalidArgument {
+            message: format!("render-target dimensions exceed the {max_dimension} pixel limit"),
+        });
+    }
+    if !desc.format.has_alpha() {
+        return Err(RenderError::InvalidArgument {
+            message: "an offscreen render target must use an alpha-capable RGBA8 format".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Validates a readback region and output length against `desc`.
+fn validate_readback(
+    desc: &RenderTargetDesc,
+    region: PixelRegion,
+    len: usize,
+) -> Result<(), RenderError> {
+    if region.is_empty() {
+        return Err(RenderError::Framebuffer {
+            message: "readback region is empty".to_owned(),
+        });
+    }
+    if region.right() > desc.width || region.bottom() > desc.height {
+        return Err(RenderError::Framebuffer {
+            message: format!(
+                "readback region {}x{}+{}+{} exceeds the {}x{} target",
+                region.width, region.height, region.x, region.y, desc.width, desc.height
+            ),
+        });
+    }
+    let expected = region.area() as usize * desc.format.bytes_per_pixel() as usize;
+    if len != expected {
+        return Err(RenderError::Framebuffer {
+            message: format!("readback buffer is {len} bytes, expected {expected}"),
+        });
+    }
+    Ok(())
 }
 
 /// Validates a texture descriptor against the device limit.

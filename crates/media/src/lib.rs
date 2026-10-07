@@ -22,16 +22,14 @@
 //! * **Audio** — symphonia whole-file/streaming decode (wav, pcm, ogg,
 //!   vorbis, flac, mp3) plus the Ogg Opus adapter, with header-only probing
 //!   and an explicit caller-owned [`AudioDecoderState`].
+//! * **Video** — the `present_video`/`video_audio` surface over an explicit
+//!   [`VideoDecoderState`]. On Linux the FFmpeg backend (D13
+//!   `video-ffmpeg`) demuxes in memory, converts frames to tightly packed
+//!   RGBA8 and decodes the audio track; on Android the `video-mediacodec`
+//!   feature selects a typed [`api::error::MediaError::Unsupported`] stub. Exactly one
+//!   backend must be selected (see [`video`]).
 //! * **YUV** — the pure `yuv420_to_rgba` conversion ported from
 //!   `tvp-natives/src/video/yuv.rs`.
-//!
-//! # What is scaffolded
-//!
-//! * **Video** — [`open_video`], [`present_video`] and [`video_audio`]
-//!   return [`MediaError::Unsupported`].
-//!
-//! The signatures and state types are final; a later task fills in the
-//! FFmpeg/MediaCodec video backends without changing the API.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -48,7 +46,6 @@ pub use image_decode::{decode_image, probe_image};
 pub use video::{VideoDecoderState, open_video, present_video, video_audio};
 pub use yuv::{CropRect, Yuv420Layout, YuvSampling, micros_to_millis, yuv420_to_rgba};
 
-use api::error::MediaError;
 use api::media::MediaCapabilities;
 
 /// Immutable configuration for a [`Media`] object.
@@ -56,7 +53,7 @@ use api::media::MediaCapabilities;
 /// The media engine currently exposes no configurable options. In
 /// particular there is no size limit to configure: a decode that cannot be
 /// performed (malformed, overflowing, or unsupported data) returns a typed
-/// [`MediaError`] rather than a substituted value. This type stays
+/// [`api::error::MediaError`] rather than a substituted value. This type stays
 /// `#[non_exhaustive]` so options can be added without an API break.
 #[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -109,9 +106,11 @@ pub fn create_media(config: MediaConfig) -> Media {
 /// audio/video scaffolds.
 ///
 /// This is the value the middle layer surfaces to scripts as the friendly
-/// "no decoder in this build" failure.
-pub(crate) fn unsupported(feature: &str) -> MediaError {
-    MediaError::Unsupported {
+/// "no decoder in this build" failure. Only the MediaCodec stub needs it
+/// today, so it is compiled in only for that backend.
+#[cfg(feature = "video-mediacodec")]
+pub(crate) fn unsupported(feature: &str) -> api::error::MediaError {
+    api::error::MediaError::Unsupported {
         message: format!("{feature} is not implemented in this build"),
     }
 }
@@ -132,8 +131,11 @@ pub fn capabilities(m: &Media) -> MediaCapabilities {
             .iter()
             .map(|name| (*name).to_string())
             .collect(),
-        video_formats: Vec::new(),
+        video_formats: video::VIDEO_FORMATS
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect(),
         streaming_audio: true,
-        streaming_video: false,
+        streaming_video: video::STREAMING_VIDEO,
     }
 }

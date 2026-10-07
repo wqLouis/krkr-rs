@@ -5,8 +5,24 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# D13: exactly one video backend is selected at compile time. The default is
+# the desktop FFmpeg backend. An Android frontend must turn the default off and
+# select the stub instead:
+#
+#     media = { workspace = true, default-features = false, features = ["video-mediacodec"] }
+#
+# Selecting neither (or both) is a hard `compile_error!` in src/video/mod.rs.
+default = ["video-ffmpeg"]
+# Linux/desktop: system FFmpeg via `ffmpeg-next` (linked dynamically, D5).
+video-ffmpeg = ["dep:ffmpeg-next"]
+# Android: typed `Unsupported` stub until the AMediaCodec backend lands.
+video-mediacodec = []
+
 [dependencies]
 api = { workspace = true }
+# Optional so the Android build never links libav*. Enabled by `video-ffmpeg`.
+ffmpeg-next = { workspace = true, optional = true }
 symphonia = { version = "0.6", default-features = false, features = ["wav", "pcm", "ogg", "vorbis", "flac", "mp3"] }
 symphonia-adapter-libopus = "0.3"
 image = { version = "0.25", default-features = false, features = [

@@ -10,6 +10,9 @@
 //! * the explicit [`RenderState`] value and [`Surface`] handle, created by
 //!   [`begin_render_state`] and stored by the middle layer;
 //! * the [`Texture`] object and its upload/drop actions;
+//! * the [`RenderTarget`] object and its create/render/readback actions,
+//!   which provide offscreen compositing and pixel readback (the primitive
+//!   behind destination-dependent blends and `Bitmap.getPixel`);
 //! * the single [`render`] action, which performs all traversal,
 //!   composition, batching and drawing;
 //! * the stateless [`FontSystem`] and [`Font`] values with the pure
@@ -20,7 +23,10 @@
 //! [`NullRenderPipeline`]. The Vulkan (`ash`) backend in [`vulkan`] is a real
 //! implementation: instance/device creation, `ash-window` surface creation,
 //! swapchain management, staging uploads, fixed-function blend pipelines and
-//! scene-tree traversal and presentation. See
+//! scene-tree traversal and presentation. Offscreen render targets are
+//! available on both backends: the null backend composites them with a CPU
+//! software rasterizer (the D8 correctness baseline) and the Vulkan backend
+//! renders into a real device image and copies it back. See
 //! `docs/migration/04-renderer-vulkan.md`.
 //!
 //! The pipeline keeps no mutable state: every call takes the evolving
@@ -31,8 +37,10 @@
 #![warn(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+mod cpu;
 pub mod glyph;
 mod null;
+pub mod render_target;
 pub mod scene;
 mod state;
 pub mod texture;
@@ -51,6 +59,7 @@ pub use crate::glyph::{
 pub use crate::null::{
     FrameStats, MAX_TRAVERSAL_DEPTH, NULL_MAX_TEXTURE_DIMENSION, NullRenderPipeline,
 };
+pub use crate::render_target::{RenderTarget, RenderTargetDesc};
 pub use crate::scene::{
     Clip, GlyphPlacement, GlyphRun, RenderContent, RenderNode, RenderNodeId, RenderScene,
 };
@@ -318,6 +327,80 @@ pub fn upload_texture(
     match &p.kind {
         PipelineKind::Null(backend) => backend.upload_texture(state, tex, region, pixels),
         PipelineKind::Vulkan(backend) => backend.upload_texture(state, tex, region, pixels),
+    }
+}
+
+/// Creates an offscreen RGBA8 render target whose resource will live in
+/// `state`.
+///
+/// Offscreen targets are the primitive behind destination-dependent blends
+/// and pixel readback ([`read_render_target`]).
+///
+/// # Errors
+///
+/// Returns [`RenderError::InvalidArgument`] for an empty, oversized or
+/// non-RGBA8 descriptor, and [`RenderError::Unsupported`] for an unimplemented
+/// backend.
+pub fn create_render_target(
+    p: &RenderPipeline,
+    desc: RenderTargetDesc,
+) -> Result<RenderTarget, RenderError> {
+    match &p.kind {
+        PipelineKind::Null(backend) => backend.create_render_target(desc),
+        PipelineKind::Vulkan(backend) => backend.create_render_target(desc),
+    }
+}
+
+/// Releases the render-state slot associated with `target`.
+pub fn destroy_render_target(p: &RenderPipeline, state: &mut RenderState, target: RenderTarget) {
+    match &p.kind {
+        PipelineKind::Null(backend) => backend.destroy_render_target(state, target),
+        PipelineKind::Vulkan(backend) => backend.destroy_render_target(state, target),
+    }
+}
+
+/// Renders `scene` into the offscreen `target` instead of a presentation
+/// surface.
+///
+/// The target's pixels are read back with [`read_render_target`].
+///
+/// # Errors
+///
+/// Returns [`RenderError::InvalidArgument`] for a mismatched state/target and
+/// [`RenderError::Unsupported`] for an unimplemented backend.
+pub fn render_to_target(
+    p: &RenderPipeline,
+    state: &mut RenderState,
+    target: &RenderTarget,
+    scene: &RenderScene,
+) -> Result<(), RenderError> {
+    match &p.kind {
+        PipelineKind::Null(backend) => backend.render_to_target(state, target, scene),
+        PipelineKind::Vulkan(backend) => backend.render_to_target(state, target, scene),
+    }
+}
+
+/// Copies a sub-rectangle of `target` into the caller-owned buffer `out`.
+///
+/// `out` receives tightly packed, row-major pixels in the target's format and
+/// must be exactly `region.area() * bytes_per_pixel` long.
+///
+/// # Errors
+///
+/// Returns [`RenderError::Framebuffer`] when `region` is out of bounds or
+/// `out` is the wrong size, [`RenderError::InvalidArgument`] for a mismatched
+/// state/target, and [`RenderError::Unsupported`] for an unimplemented
+/// backend.
+pub fn read_render_target(
+    p: &RenderPipeline,
+    state: &RenderState,
+    target: &RenderTarget,
+    region: PixelRegion,
+    out: &mut [u8],
+) -> Result<(), RenderError> {
+    match &p.kind {
+        PipelineKind::Null(backend) => backend.read_render_target(state, target, region, out),
+        PipelineKind::Vulkan(backend) => backend.read_render_target(state, target, region, out),
     }
 }
 
