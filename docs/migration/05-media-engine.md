@@ -39,8 +39,8 @@ krkr-media
 ```
 
 The API is stateless (D9): pure free functions for image/whole-file audio
-decode, and RAII `AudioDecoder`/`VideoDecoder` values owned by L2 for
-streaming. There is no engine-side registry, no global buffer and no hidden
+decode, and L1-defined `AudioDecoderState`/`VideoDecoderState` values owned
+by L2 for streaming. There is no engine-side registry, no global buffer and no hidden
 cache. L2 owns the worker pool; decode never runs on the host/VM thread
 except for trivially small probes.
 
@@ -100,15 +100,15 @@ and loop-wrap should not require a full re-decode where the backend allows.
 
 ### 5.1 Interface
 
-Keep the current `MovieDecoder` semantics as an RAII `VideoDecoder` value
-owned by L2, not an id-addressed table:
+Keep the current `MovieDecoder` semantics as an L1-defined
+`VideoDecoderState` value stored by L2, not an id-addressed table:
 
-* `open_video(bytes) -> VideoDecoder` + `spec() -> VideoSpec`;
-* `present_at(at_ms) -> RgbaFrame` with the **backward-seek contract**
-  (today: seek if moving backwards more than `SEEK_TOLERANCE_MS`, otherwise
-  decode forward; `ffmpeg.rs:279`);
-* `audio() -> DecodedAudio` (or a streaming variant);
-* dropping the value releases the codec.
+* `open_video(bytes) -> (VideoSpec, VideoDecoderState)`;
+* `present_video(state, at_ms) -> RgbaFrame` with the **backward-seek
+  contract** (today: seek if moving backwards more than `SEEK_TOLERANCE_MS`,
+  otherwise decode forward; `ffmpeg.rs:279`);
+* `video_audio(state) -> DecodedAudio` (or a streaming variant);
+* dropping the state releases the codec.
 
 ### 5.2 FFmpeg backend (Linux)
 
@@ -201,8 +201,9 @@ instead.
 2. Move `tlg.rs`/`decode_image` into `krkr-media`; keep a thin re-export in
    `tvp-visual` so natives compile unchanged.
 3. Implement the FFmpeg backend by wrapping the existing `video/ffmpeg.rs`
-   and `decode.rs` as free functions + `AudioDecoder`/`VideoDecoder` values;
-   implement the unsupported backend as pure error-returning stubs.
+   and `decode.rs` as free functions + `AudioDecoderState`/
+   `VideoDecoderState` values; implement the unsupported backend as pure
+   error-returning stubs.
 4. Switch `tvp-sound::source` and `tvp-visual` bitmap loading to the
    stateless API; **L2 gains the thread pool and completion table**.
 5. Add the video frame/PCM sinks in L2.

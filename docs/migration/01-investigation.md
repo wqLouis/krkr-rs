@@ -260,7 +260,8 @@ object semantics are implemented in a generated TJS wrapper layer.
 ## 10. The concrete seams the migration must cut
 
 1. **Scene → GPU sync** (`render/src/sync.rs`): replace with a
-   `RenderList` built by the middle layer and consumed by the Vulkan core.
+   `RenderScene` tree maintained by the middle layer and consumed by the L1
+   `RenderPipeline`.
 2. **Bevy app/loop** (`render/src/runner.rs`, `main.rs`): replace with a
    winit event loop + fixed-step VM drive.
 3. **Bevy UI menu** (`render/src/menu.rs`): needs an owned replacement

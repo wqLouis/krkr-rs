@@ -3,11 +3,11 @@
 Status: design sketch. Extracts raw byte IO into the bottom core and moves
 the TVP storage namespace on top of it.
 
-Goal: stateless bottom-layer file-system functions over an explicit root
-that know about paths, URIs, handles, stat and listing — and nothing about
-`.xp3`, `arc.xp3>path` addressing, case-insensitive search or TJS. The
-middle layer keeps TVP's storage semantics (including all cursor/index
-state); the natives keep their current surface.
+Goal: a **stateless `FileSystem` object** plus an explicit **`FileState`**
+value. L1 knows about paths, URIs, handles, stat and listing — and nothing
+about `.xp3`, `arc.xp3>path` addressing, case-insensitive search or TJS. The
+middle layer stores the `FileState`s and the namespace index; the natives
+keep their current surface.
 
 ---
 
@@ -15,39 +15,41 @@ state); the natives keep their current surface.
 
 | Concern | Today | Target |
 |---------|-------|--------|
-| Game mount + namespace (`arc.xp3>path`, disk-over-archive, case rules, auto-path) | `engine/src/storage.rs` (concrete `PathBuf`/`fs`) | L2 `krkr-engine::storage` over the fs functions |
-| XP3 container parsing + segment read | `crates/xp3/src/archive.rs` (owns `std::fs::File`, seek/read) | L2, reading a `FileHandle` from `krkr-fs` |
-| Raw host path IO | `std::fs` scattered in `engine`, `tvp-storages`, `tvp-visual`, `tvp-natives`, `engine::logging`, `engine::state` | L1 `krkr-fs` (stateless fns) |
-| Stream abstraction | `tvp-streams::binary::BinaryStream` (exists, unused by storage) | aligned with `FileHandle`; the sequential cursor moves to L2 |
+| Game mount + namespace (`arc.xp3>path`, disk-over-archive, case rules, auto-path) | `engine/src/storage.rs` (concrete `PathBuf`/`fs`) | L2 `krkr-engine::storage` over the `FileSystem` object |
+| XP3 container parsing + segment read | `crates/xp3/src/archive.rs` (owns `std::fs::File`, seek/read) | L2, reading a `FileState` from `krkr-fs` |
+| Raw host path IO | `std::fs` scattered in `engine`, `tvp-storages`, `tvp-visual`, `tvp-natives`, `engine::logging`, `engine::state` | L1 `krkr-fs` (`FileSystem` + `FileState`) |
+| Stream abstraction | `tvp-streams::binary::BinaryStream` (exists, unused by storage) | L2 wrapper over a `FileState` + cursor |
 | TJS `Array.save/load/saveStruct` | C++ `std::fopen` in `tjs2-sys/cpp/streams.cpp` | unresolved; see §6 |
-| Android SAF / APK assets | SAF→path + `MANAGE_EXTERNAL_STORAGE` (option A, `docs/android.md §4`) | optional `Uri` backend |
+| Android SAF / APK assets | SAF→path + `MANAGE_EXTERNAL_STORAGE` (option A, `docs/android.md §4`) | optional `Uri` root |
 
-The read path today has **no trait** (`docs/portability.md`); this is the
-largest structural change of the three bottom components.
+The read path today has **no abstraction** (`docs/portability.md`); this is
+the largest structural change of the three bottom components.
 
 ## 2. Boundaries
 
-### Bottom (`krkr-fs`) knows
+### Bottom (`krkr-fs`) owns
 
-* locate/open a path or URI in read/write/append mode and return a
-  `FileHandle`;
-* **positional** `read_at`/`write_at`, `size`, `flush` on a handle;
-* stat, exists, list a directory, create dirs, remove, copy, rename;
+* the stateless `FileSystem` object (backend kind + base);
+* stateless functions: open, stat, exists, list, create dirs, remove, copy,
+  rename;
+* the `FileState` value: the open handle **and** the logical cursor;
+* positional `read_at`/`write_at`, `size`, `flush` over a `FileState`;
 * the host path dialect (Linux `PathBuf`, Android `PathBuf` for app-private
   dirs and resolved external paths, Android content/asset `Uri`).
 
-It knows **nothing** about cursors, buffering policy, caches, namespace
-resolution or which archive a name belongs to. All of that is L2 state.
+It knows **nothing** about namespace resolution, caches or which archive a
+name belongs to. It never keeps a table of open files; L2 stores each
+`FileState`.
 
-### Middle (`krkr-engine`) knows
+### Middle (`krkr-engine`) owns
 
 * storage namespaces: game dir + mounted archives, disk-wins ordering;
 * `arc.xp3>path` addressing and the specific-archive prefix;
 * normalization (lowercase, `/` separators) and the recursive
   case-insensitive walk that makes Windows-authored games work on Linux;
-* the auto-search-path list (`engine/src/storage.rs` global);
+* the auto-search-path list and the mount index (name → source);
 * archive containers (`xp3`, and optionally the unused `tvp-archive`
-  zip/7z/tar readers), built over `FileHandle`s;
+  zip/7z/tar readers), built over `FileState`s;
 * `Storages` native semantics: `stat`, `getFileList`, `open`, `fstat`,
   `deleteFile`, `copyFile`, save-data writes.
 
@@ -56,26 +58,38 @@ resolution or which archive a name belongs to. All of that is L2 state.
 The exact same method surface and error strings; only their implementation
 calls the middle layer instead of touching `std::fs`.
 
-## 3. Handles, not streams
+## 3. Object + state, not streams
 
-The bottom layer is positional by design (D9). `open` returns an RAII
-`FileHandle`; L2 owns the sequential cursor and calls `read_at(offset, buf)`.
+The bottom layer is positional by design (D9). `open` returns an explicit
+`FileState`; L2 stores it and owns the sequential cursor.
 
 ```rust
-pub fn open(root: &FsRoot, path: &FsPath, mode: OpenMode) -> Result<FileHandle, FsError>;
+/// Stateless root object; carries only configuration (backend + base).
+#[derive(Clone)]
+pub struct FileSystem { /* host root | in-memory root | URI root */ }
 
-impl FileHandle {
-    pub fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError>;
-    pub fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<usize, FsError>;
-    pub fn size(&self) -> Result<u64, FsError>;
-    pub fn flush(&mut self) -> Result<(), FsError>;
-}
+pub fn create_file_system(config: FsConfig) -> FileSystem;
+
+pub fn open(fs: &FileSystem, path: &FsPath, mode: OpenMode) -> Result<FileState, FsError>;
+
+/// Open handle + logical cursor. Bottom-defined, L2-owned.
+pub struct FileState { /* fd/asset handle + cursor */ }
+
+pub fn read_at(fs: &FileSystem, file: &FileState, offset: u64, buf: &mut [u8])
+    -> Result<usize, FsError>;
+pub fn write_at(fs: &FileSystem, file: &FileState, offset: u64, buf: &[u8])
+    -> Result<usize, FsError>;
+pub fn file_size(fs: &FileSystem, file: &FileState) -> Result<u64, FsError>;
+pub fn flush(fs: &FileSystem, file: &FileState) -> Result<(), FsError>;
+/// Sequential convenience: reads at the cursor and advances L2's state.
+pub fn read_seq(fs: &FileSystem, file: &mut FileState, buf: &mut [u8])
+    -> Result<usize, FsError>;
 ```
 
 The existing `tvp-streams::binary::BinaryStream` (`binary.rs:57`) remains the
-**sequential** stream the scripts see; it becomes a thin L2 wrapper that
-remembers an offset and delegates to `read_at`. There is only one vtable in
-L1 (`FileHandle`), not two.
+**sequential** stream the scripts see; it becomes an L2 value wrapping a
+`FileState` + offset. There is only one byte-IO mechanism in L1, and no
+open-file registry.
 
 `Xp3Archive` must be reworked to parse over positional reads (or a buffered
 `Vec<u8>`) instead of a live `std::fs::File`. This is the prerequisite that
@@ -110,18 +124,18 @@ web target is ever revisited (`docs/portability.md`).
 
 The plan keeps the current Android decision (SAF for picking, resolved path
 for reading, `MANAGE_EXTERNAL_STORAGE`) as the default, because it already
-works and `option B` is a large JNI-per-read undertaking. The stateless fs
+works and option B is a large JNI-per-read undertaking. The stateless fs
 surface makes option B *possible* without a second rewrite.
 
 ## 5. Save data, logging and state files
 
 These are not game-storage reads but still OS IO:
 
-* logging sink (`engine/src/logging.rs`, rotating `krkr.log`) → fs
-  functions or a dedicated `LogSink` writer;
-* state file (`engine/src/state.rs`, `krkr_state.json`) → fs functions;
-* savedata (`savedata/`) → fs functions;
-* `Debug.startLogToFile` → fs functions.
+* logging sink (`engine/src/logging.rs`, rotating `krkr.log`) → the
+  `FileSystem` object or a dedicated `LogSink` writer;
+* state file (`engine/src/state.rs`, `krkr_state.json`) → `FileSystem`;
+* savedata (`savedata/`) → `FileSystem`;
+* `Debug.startLogToFile` → `FileSystem`.
 
 All of them become testable with the in-memory root.
 
@@ -163,14 +177,14 @@ L2-owned index state.
 * **Android**: host path root for app-private dirs and the resolved game
   path; state/log paths come from the JNI `pendingStateDir`; `System.appDataPath`
   falls back to the state dir (`runner.rs app_data_dir`).
-* **wasm** (not planned): a `fetch`-backed in-memory mount plus OPFS saves
-  would implement the same functions; the in-memory `FsRoot` is the
-  stepping stone.
+* **wasm** (not planned): a `fetch`-backed in-memory root plus OPFS saves
+  would implement the same functions; the in-memory root is the stepping
+  stone.
 
 ## 9. Migration steps specific to FS
 
-1. Define the stateless fs functions + `FsRoot`/`FileHandle` in `krkr-api`
-   (`03-middle-layer-api.md §1`) and align `tvp-streams` with `FileHandle`.
+1. Define the stateless `FileSystem`/`FileState` API in `krkr-api`
+   (`03-middle-layer-api.md §1`).
 2. Implement the host path root + the in-memory root.
 3. Rework `xp3::Xp3Archive` to read positionally; L2 owns any buffering.
 4. Move `engine::Storage` into L2 `krkr-engine` on top of the fs functions;

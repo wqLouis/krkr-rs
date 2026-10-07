@@ -36,15 +36,16 @@ Exit criteria: plan reviewed; open questions in §7 answered; no code change.
 ### Phase 1 — Define the stateless middle-layer API; extract pure helpers
 
 Deliverables:
-* `krkr-api`: operation signatures + DTOs from `03-middle-layer-api.md`
-  (free functions, RAII handles, `BlendMode`, `RenderList`, `DecodedImage`,
-  `AudioSpec`, `RgbaFrame`, …).
+* `krkr-api`: object/action signatures + state/DTO types from
+  `03-middle-layer-api.md` (stateless `RenderPipeline`/`Media`/`FileSystem`,
+  explicit `RenderScene`/`RenderState`/`DecoderState`/`FileState`,
+  `BlendMode`, `DecodedImage`, `AudioSpec`, `RgbaFrame`, …).
 * Move the pure, already-tested helpers out of `render`:
   `compose_layer`, `visible_image_region`, `rect_center`,
   `window_to_game_transform`, `window_logical_size`, `host_window_resize`,
   `clamp_opacity`, `window_layer_order`, `sprite_z`, `bitmap_tint`,
   `fill_sprite_color`, and the TVP→`BlendMode` mapping.
-* Add test doubles: an in-memory `FsRoot`, `NullGpu`, a stub media backend,
+* Add test doubles: an in-memory `FileSystem`, `NullRenderPipeline`, a stub media backend,
   `MockClock`, so L2 can be constructed with no window/GPU/codec/fs.
 * Add the **D9 guard**: a CI grep/test that rejects mutable statics,
   `thread_local!`, `LazyLock`/`OnceLock`/`OnceCell`/`lazy_static!` and
@@ -60,21 +61,25 @@ Exit criteria:
 
 Deliverables:
 * `krkr-engine`: the `Scene`/`LayerState`/`BitmapState` model moves here
-  (out of `tvp-visual`), plus the `Scene → RenderList` flattener.
-* `Engine` struct with injected backends (`03-middle-layer-api.md §8`).
+  (out of `tvp-visual`), plus the **`Scene → RenderScene` projection** (a
+  field-level sync, not a draw list).
+* `Engine` struct with injected stateless objects and stored state values
+  (`03-middle-layer-api.md §8`).
 * A Bevy-backed **platform adapter** implementing the stateless operations
-  by wrapping `sync_scene` on the L1 side, so the game still runs through
-  Bevy while L2 is written against the new API.
+  by wrapping the current `sync_scene` on the L1 side, so the game still
+  runs through Bevy while L2 is written against the new API.
 * `tvp-visual` becomes the native adapter over `krkr-engine` (public
   methods preserved as shims).
 
 Exit criteria: identical rendering through the adapter; no native behavior
-change; `tvp-visual` no longer owns `Scene`.
+change; `tvp-visual` no longer owns `Scene`; L2 contains no draw-list or
+traversal code.
 
 ### Phase 3 — File system (stateless)
 
 Deliverables:
-* `krkr-fs`: host path root + in-memory root, positional `FileHandle`.
+* `krkr-fs`: stateless `FileSystem` object + in-memory root, positional
+  `FileState`.
 * `xp3::Xp3Archive` reads positionally (no live `std::fs::File`).
 * `engine::Storage` moves onto the stateless fs functions (shimmed public
   API); **L2 gains the namespace index and any buffering**.
@@ -88,20 +93,21 @@ the real game; no `std::fs` left outside `krkr-fs` except tests. Decide the
 
 Deliverables:
 * `krkr-media`: `decode_image`/`probe_*` free functions (TLG + `image`),
-  `AudioDecoder`/`VideoDecoder` values, FFmpeg + unsupported backends;
-  MediaCodec after Linux parity.
+  `AudioDecoderState`/`VideoDecoderState` values, FFmpeg + unsupported
+  backends; MediaCodec after Linux parity.
 * `tvp-sound` decode calls the stateless API; mixer/model stay in L2.
 * **L2 gains the worker pool and completion table**; L1 stays stateless.
 * video frame + PCM sinks in the video overlay.
 
-Exit criteria: BGM/voice/image load through the engine; video is visible and
-audible (Linux); Android compiles with the MediaCodec backend.
+Exit criteria: BGM/voice/image load through the stateless API; video is
+visible and audible (Linux); Android compiles with the MediaCodec backend.
 
-### Phase 5 — Vulkan renderer bring-up
+### Phase 5 — Vulkan render pipeline bring-up
 
 Deliverables:
-* `krkr-render`: `ash` device/swapchain/pipelines, texture upload
-  (sub-rect), `RenderList` submission, `SourceOver`/fixed-function blends.
+* `krkr-render` `RenderPipeline`: `ash` device/swapchain/pipelines, tree
+  traversal/composition, texture upload (sub-rect), `RenderScene`
+  submission, `SourceOver`/fixed-function blends.
 * Golden-image test harness (Bevy vs Vulkan framebuffer compare).
 * `--renderer vk` runtime selection while Bevy remains the default.
 
@@ -165,7 +171,7 @@ Exit criteria: `02-target-architecture.md §9` acceptance criteria all hold.
 | Integration | `krkr-rs run <game> --headless` scene dump snapshot | `krkr-app` |
 | Parity | `scripts/native_parity.py` (100% tracked coverage) | CI |
 | Media | host-testable pure parts (YUV, TLG, decode wrappers) | `krkr-media` |
-| FS | in-memory `FsRoot` fixtures, real-game mount | `krkr-fs`/`krkr-engine` |
+| FS | in-memory `FileSystem` fixtures, real-game mount | `krkr-fs`/`krkr-engine` |
 | Android | compile + symbol checks in CI; device run manual | CI / manual |
 
 Regression rule: the headless scene dump and the native-parity report are
@@ -189,7 +195,7 @@ the two coarse "nothing broke" signals and must be checked at every phase.
 | R3 | Bevy UI menu loss causes visible regressions. | Medium | Medium | CPU-drawn menu early (Phase 6), golden-image it. |
 | R4 | sRGB/color mismatch between Bevy and Vulkan paths. | High | Medium | Pin one convention (`Rgba8UnormSrgb` + linear shader math) and add a color test to the blend matrix. |
 | R5 | CPU compositing/upload remains the bottleneck; Vulkan gains little. | Medium | Low | Sub-rect uploads, staging ring, revision fast path; GPU paths are an optimization behind the same API. |
-| R6 | API churn: `RenderList`/media API need changes after L2 uses them. | Medium | Medium | Phase 1 mocks exercise the API before any backend; keep DTOs additive. |
+| R6 | API churn: `RenderScene`/media API need changes after L2 uses them. | Medium | Medium | Phase 1 mocks exercise the API before any backend; keep DTOs additive. |
 | R7 | Android MediaCodec is still runtime-untested. | High | Medium | Treat as compile-verified until on-device; keep FFmpeg out only on Android; test on hardware in Phase 7. |
 | R8 | `cpp/streams.cpp` `fopen` breaks Android savedata through the FS layer. | Medium | Medium | Decide the hook in Phase 3; option A (Rust callback) if savedata must route through FS. |
 | R9 | Schedule/scope creep (this is a whole-engine rewrite). | High | High | Phased exit criteria; each phase independently shippable; default branch stays Bevy until parity. |
@@ -198,8 +204,12 @@ the two coarse "nothing broke" signals and must be checked at every phase.
 ## 7. Open questions for review
 
 1. **Glyph engine placement**: `krkr-render` vs a standalone `krkr-glyph`
-   crate vs `krkr-core`. It has no GPU dependency. (Plan: `krkr-render`
-   initially.)
+   crate vs `krkr-core`. The `FontSystem`/`Font` objects have no GPU
+   dependency. (Plan: `krkr-render` initially.)
+2. **`RenderScene` ownership**: does L2 keep a *parallel* `RenderScene`
+   projected from the TVP layer tree each frame (plan: simple field copy),
+   or do the L2 layer nodes embed a `RenderNode` so there is one tree and no
+   copy? The latter couples TVP state to the L1 type but avoids a sync pass.
 2. **GPU text ever?** If yes, does L2 keep CPU composition as the source of
    truth (recommended) or switch `MainImage` to a GPU texture with
    read-back? The latter breaks cheap pixel access.
@@ -221,9 +231,11 @@ the two coarse "nothing broke" signals and must be checked at every phase.
 The migration is complete when, on both Linux and Android:
 
 * the game runs on the Vulkan core with no Bevy dependency;
-* the layer system, media, and file system sit in the layers defined in
-  `02-target-architecture.md`, verified by the dependency acceptance tests
-  in `02-target-architecture.md §9`;
+* the layer system state, media, and file system sit in the layers defined
+  in `02-target-architecture.md`, and the render pipeline consumes the
+  `RenderScene` tree, verified by the dependency acceptance tests in
+  `02-target-architecture.md §9`;
+* `krkr-engine` contains no render traversal, draw-list or batching code;
 * the old Bevy renderer, wgpu materials, and the `VM_RUN_LOCK` workaround
   are deleted;
 * documentation (`README`, `docs/portability.md`, `docs/android.md`,

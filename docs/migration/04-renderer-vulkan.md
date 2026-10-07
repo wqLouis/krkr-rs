@@ -1,11 +1,14 @@
-# 04 — Renderer: Bevy → `ash` (Vulkan)
+# 04 — Render pipeline: Bevy → `ash` (Vulkan)
 
 Status: design sketch. Supersedes the Bevy projection in `render/src/sync.rs`
 and the wgpu material system in `render/src/blend.rs`.
 
 Scope: replace Bevy's renderer *and* its window/input/UI substrate with a
-thin Vulkan core plus winit. The middle layer keeps the layer system; the
-renderer only consumes a flat [`RenderList`](03-middle-layer-api.md#21-the-draw-list-l2-output).
+thin Vulkan core plus winit. The middle layer keeps the layer-system state
+and passes a `RenderScene` tree plus a `RenderState` value; the bottom
+`RenderPipeline` consumes the tree and owns all traversal, composition,
+batching and drawing. See
+[`03-middle-layer-api.md`](03-middle-layer-api.md#2-render-pipeline).
 
 ---
 
@@ -40,25 +43,29 @@ Likely helper crates (to be confirmed before implementation):
 L4 host (winit / android-activity)
    │  frame boundary
    ▼
-krkr-render::Renderer
+krkr-render::RenderPipeline   (`&self`, stateless)
    ├─ Device       — instance, physical/logical device, queues, allocator
-   ├─ Swapchain    — surface format, present mode, extent, images, views
-   ├─ Uploads      — staging buffers → images (dirty regions)
-   ├─ Pipelines    — one per (a) blend mode family, (b) source kind, (c) clip state
-   ├─ Descriptors  — one set per (texture, sampler) or a bindless-ish pool
-   ├─ Targets      — offscreen images for destination-dependent blends
+   ├─ Pipeline set — shader programs + blend/attachment state
+   ├─ Traversal    — walks the L2-owned RenderScene tree
+   ├─ Composition  — parent transforms, opacity, z, clip, blend selection
+   ├─ Uploads      — scheduling of dirty textures into RenderState
    └─ Frame        — acquire → record → submit → present
+
+L2 stores the mutable side: RenderScene tree · RenderState (swapchain,
+staging, compiled pipelines, texture table, atlas uploads, targets)
 ```
 
-The renderer is single-threaded on the host thread initially. A submission
-thread can be added later without changing the API.
+The render pipeline is single-threaded on the host thread initially. A
+submission thread can be added later without changing the API.
 
-**Statelessness (D9).** The only L1 values are platform resources (`Gpu`,
-`Surface`, `Texture`, `Target`); they are owned by L2 and passed in
-explicitly. `PipelineCache`, descriptor caches, texture tables and the glyph
-atlas are **L2 values**: `submit(gpu, frame, &mut pipelines, &list)` takes
-the cache as a parameter. L1 has no globals, no `HashMap<Id, Resource>` and
-no lazy caches. The same `RenderList` always produces the same frame.
+**Object/state split (D9).** The only L1 object is the stateless
+`RenderPipeline`; the device lives inside it as immutable mechanism. Every
+mutable render thing is in the L2-owned `RenderState` (swapchain, staging,
+compiled pipelines, texture table, offscreen targets, atlas uploads) and the
+L2-owned `RenderScene` tree. `render(&self, surface, &mut state, &scene)`
+mutates only the state the caller passed. L1 has no globals, no
+`HashMap<Id, Resource>` and no lazy caches. The same tree + state produces
+the same frame.
 
 ## 3. Pipeline set
 
@@ -99,9 +106,9 @@ Difference/5, Exclusion, Overlay, HardLight, SoftLight) need to read the
 destination. The current code punts (source-over + warning). The Vulkan core
 implements them by rendering to an offscreen target:
 
-1. L2 requests `BlendMode::DestinationDependent(mode)` for a quad that must
-   composite over existing content (a layer with a destination-dependent
-   `Layer.type`).
+1. L2 marks a node `RenderNode.blend = BlendMode::DestinationDependent(mode)`
+   when it must composite over existing content (a layer with a
+   destination-dependent `Layer.type`).
 2. The renderer:
    * copies the current target content for the quad's `dst` region into a
      sampled image (or keeps the target already bound as a sampled texture),
@@ -117,10 +124,10 @@ which today are a completion-callback stub.
 
 ## 5. Texture upload and caching
 
-* L2 owns `BitmapState` (CPU RGBA) and dirty flags.
-* On `Renderer::update_texture`, the renderer writes the dirty region into a
+* L2 owns `BitmapState` (CPU RGBA) and its dirty flags.
+* On `upload_texture`, the pipeline writes the dirty region into a
   `VK_IMAGE_USAGE_TRANSFER_DST` image via a staging buffer. A persistent
-  staging ring avoids per-upload allocation.
+  staging ring (in `RenderState`) avoids per-upload allocation.
 * Sub-rect uploads (`PixelRegion`) are supported from day one: `drawText`
   and raster ops only touch part of a bitmap (`render/src/sync.rs` currently
   always uploads the whole buffer).
@@ -138,7 +145,7 @@ which today are a completion-callback stub.
 
 * `begin_frame` acquires a swapchain image; `end_frame` presents.
 * `winit` reports `Resized`/`ScaleFactorChanged`; L4 forwards the new
-  surface size to `Renderer::resize`, which recreates the swapchain
+  surface size to `RenderPipeline::resize`, which recreates the swapchain
   (including `OUT_OF_DATE`/`SUBOPTIMAL`/minimized handling).
 * The letterboxed game projection is L2's job: the middle layer computes the
   `dst` rects in framebuffer pixels from the logical window size. The
@@ -192,7 +199,7 @@ handling becomes a small immediate-mode state machine fed by `InputState`.
 
 | Today | Fate |
 |-------|------|
-| `render/src/sync.rs` (`sync_scene`, `BitmapAssets`, `GpuPrimitives`, `FrameBlendMaterials`) | replaced by L2 `RenderList` builder + `krkr-render` |
+| `render/src/sync.rs` (`sync_scene`, `BitmapAssets`, `GpuPrimitives`, `FrameBlendMaterials`) | replaced by the L2 `RenderScene` projection + L1 `RenderPipeline` |
 | `render/src/blend.rs` (`LayerBlendMaterial`, wgpu `BlendState`, WGSL) | TVP→`BlendMode` mapping kept in L2; wgpu `BlendState` re-expressed as Vulkan state in L1 |
 | `render/src/main.rs` demo harness | keep as a `krkr-render` example once the new API exists |
 | `render/src/runner.rs` Bevy `App` wiring | replaced by `krkr-app` loop |
@@ -211,9 +218,9 @@ Pure helpers to lift out before the renderer swap (`sync.rs`/`scene.rs`):
 ## 9. Glyph rendering engine
 
 Decision (see `03-middle-layer-api.md §3`): the bottom renderer exposes a
-`GlyphFace` value plus a stateless `rasterize_glyph` that produces CPU
-coverage. L2 keeps the atlas, layout and CPU composition, so
-`getPixel`/`piledCopy`/masks/province continue to work.
+`FontSystem` object, immutable `Font` values and a stateless `rasterize_glyph`
+that produces CPU coverage. L2 keeps the atlas, layout and CPU composition,
+so `getPixel`/`piledCopy`/masks/province continue to work.
 An optional later phase uploads coverage to a glyph atlas and emits text as
 quads; the API does not change.
 

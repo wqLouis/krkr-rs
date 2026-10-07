@@ -1,112 +1,129 @@
-# 03 — Middle-layer API (stateless / functional)
+# 03 — Middle-layer API (stateless objects + explicit state)
 
 Status: design sketch. Signatures are illustrative Rust; no code is written
 on this branch.
 
 This is the contract between the middle layer (L2) and the bottom core (L1).
-It is deliberately small and TVP-free, and it is **stateless**: L1 computes,
-L2 remembers. See
-[`02-target-architecture.md`](02-target-architecture.md) §2.1 for the rule
-and §5 for ownership.
+The bottom layer creates the **abstraction objects**; the middle layer stores
+every **state value** and performs actions on those objects. For rendering,
+L2 only maintains the **scene/layer object tree** and hands it to the L1
+**render pipeline**, which does all traversal, composition and drawing. See
+[`02-target-architecture.md`](02-target-architecture.md) §2.1 and §3.
 
 ---
 
-## 0. Principle 0 — stateless and functional (D9)
+## 0. Model — stateless objects, explicit state
 
-L1 is a pure library over explicit inputs. All persistent state lives in L2.
+### 0.1 Division of labour
 
-### 0.1 What "stateless" forbids in L1
+```
+L1  creates and owns  ·  the abstraction objects (services)
+                        RenderPipeline · FileSystem · Media · FontSystem
+                        AudioDevice · Clock · Texture
+    handles             ·  all mechanism: Vulkan, FFmpeg/MediaCodec, font
+                        rasterization, path IO, scene-tree traversal
+    stores              ·  NO state
 
-* **No globals.** No mutable `static`/`thread_local`, no `LazyLock`,
-  `OnceLock`, `OnceCell`, `lazy_static`, no process-wide registries or
-  singletons, no `Mutex<HashMap<...>>` caches.
-* **No hidden state between calls.** A function's output depends only on its
-  arguments and the explicit resource values passed to it.
-* **No `Id`-addressed resource tables.** L1 does not keep
-  `HashMap<u64, Texture>` and let L2 pass a raw id. If L2 owns a resource, it
-  owns the RAII value (`Texture`, `FileHandle`, `AudioDecoder`, …), not an
-  integer that L1 resolves.
-* **No policy.** L1 does not decide to cache, reuse, prefetch, coalesce,
-  defer, or throttle. Those are L2 decisions.
-* **No engine knowledge.** No layers, no TVP types, no TJS, no scene.
+L2  stores              ·  every state value:
+                        the layer system / RenderScene tree, RenderState,
+                        SurfaceState, FileState, DecoderState, GlyphAtlas,
+                        Mixer, caches, indexes, positions
+    performs            ·  actions on the L1 objects, passing the state:
+                        render_pipeline.render(&mut state, &scene)
+                        media.read_audio(&mut dec_state, out)
+                        fs.read_at(&mut file_state, off, buf)
+```
 
-### 0.2 What L1 is allowed to hold
+An L1 object is a **facade over a platform capability** with no mutable
+state of its own. Its methods are `&self` and take evolving state as an
+explicit `&mut` parameter. The state is a bottom-defined value
+(`RenderState`, `SurfaceState`, `DecoderState`, …) that L2 owns and stores.
 
-Platform state that cannot be avoided is encapsulated in an **RAII value the
-caller owns**:
+### 0.2 What L1 must not do
 
-* `Gpu` — instance/device/queue/allocator; created once by L2 and passed by
-  reference to every operation;
-* `Surface` — the window's swapchain; owned by L2 (the host);
-* `Texture`/`Target` — GPU images; owned by L2;
-* `FileHandle` — an open file/asset; owned by L2;
-* `GlyphFace` — a parsed font; owned by L2;
-* `AudioDecoder`/`VideoDecoder` — codec contexts; owned by L2;
-* `AudioDevice` — the OS output stream; owned by L2.
-
-The distinction is: these are *resources*, not *engine state*. L1 does not
-remember anything across calls beyond what the value itself contains, and
-the value's lifetime is managed by L2.
+* **No globals.** No mutable `static`/`thread_local`, `LazyLock`,
+  `OnceLock`, `OnceCell`, `lazy_static`, no process-wide registries, no
+  `Mutex<HashMap<...>>` caches.
+* **No mutable fields on objects.** No `&mut self` that remembers anything
+  for a later call. If something evolves, it is a state value, not an
+  object field.
+* **No hidden state between calls.** Output depends only on the object's
+  immutable configuration, the arguments, and the passed-in state.
+* **No `Id`-addressed tables.** L1 never resolves an integer id through a
+  private map; L2 holds the state value directly.
+* **No policy.** L1 does not cache, reuse, prefetch, coalesce, defer or
+  throttle. Those are L2 decisions expressed in L2 state.
+* **No TVP/TJS knowledge.** No script objects, no focus/hit-test, no
+  storage naming. The render pipeline knows drawable structure and blend
+  semantics, not what a KAG layer means.
 
 ### 0.3 Shape rules
 
-1. **Pure transforms are free functions.** `decode_image(bytes)`,
-   `probe_audio(bytes)`, `yuv420_to_rgba(...)`, `rasterize_glyph(...)`,
-   resampling, blend math. Inputs → output, no `self`.
-2. **Impure operations take the resource explicitly.** `submit(&mut gpu,
-   &mut cache, &list)`, `read_at(&file, offset, buf)`,
-   `read_frames(&mut decoder, out)`.
-3. **Caches and atlases are parameters, not globals.** `submit(gpu,
-   &mut pipelines, &list)`; `compose_text(atlas, glyphs)`.
-4. **All DTOs are plain owned/`Copy` data.** No `Arc<RwLock<…>>` crossing
-   the boundary, no callbacks into L2 from L1.
-5. **Errors are values.** Typed errors per domain; no panics for
-   unsupported input.
+1. **Bottom-created objects are stateless services.** `RenderPipeline`,
+   `FileSystem`, `Media`, `FontSystem`, `AudioDevice`.
+2. **All evolving state is an explicit value** (`RenderScene`, `RenderState`,
+   `SurfaceState`, `FileState`, `DecoderState`, …), defined by L1, owned and
+   stored by L2.
+3. **Actions take state as a parameter.** `render(&self, state: &mut
+   RenderState, scene: &RenderScene, …)`.
+4. **The render pipeline consumes the scene tree.** L2 does not flatten or
+   batch; it maintains the tree and passes it. Traversal, z-order,
+   composition, batching, uploads and draw are L1.
+5. **Pure transforms are free functions.** `decode_image(bytes)`,
+   `yuv420_to_rgba(...)`, `rasterize_glyph(font, ...)`, resampling math.
+6. **Caches are L2 state, passed in.** Glyph atlas, decoded assets,
+   compiled pipelines, resolved faces live in L2.
+7. **No callbacks into L2 from L1.** L1 returns owned data; L2 polls.
+8. **Errors are values.** Typed per domain; no panics on bad input.
 
-### 0.4 Why this is worth the discipline
+### 0.4 Why offload the render pipeline to L1
 
-* **Mockable.** `NullGpu`, an in-memory `FsRoot`, a stub media backend make L2 testable
-  with no window, GPU, codec or filesystem.
-* **Parallel-safe.** Stateless L1 functions can run on an L2-owned thread
-  pool with no locking and no hidden races.
-* **Backend-consistent.** The Bevy adapter, the Vulkan core, FFmpeg and
-  MediaCodec all implement the same pure operations, so semantics cannot
-  drift into a cache.
-* **The current pain disappears.** Today the "middle layer" is a pile of
-  `static ENGINE`/`SCENE`/`GLOBAL_MIXER` registries
-  (`01-investigation.md §9`). L1 must not reproduce that pattern.
+* L2 no longer owns a `Scene → RenderScene` projection, blend mapping, sprite
+  positioning, clipping, batching or upload scheduling — those move to L1
+  and are shared by every backend.
+* The Bevy adapter and the Vulkan core both consume the same `RenderScene`
+  tree, so the two renderers cannot drift in composition semantics.
+* L2 stays a **state store + dispatcher**: it mutates the layer tree from
+  script calls and calls `render`.
+* "Could two engines run in one process?" stays **yes**: objects are
+  immutable services, all state is local to the caller.
+
+The current codebase does the opposite: it hides engine state in
+process-global statics (`01-investigation.md §9`) and re-derives the tree
+into Bevy entities every frame.
 
 ---
 
 ## 1. File system
 
-Stateless functions over an explicit root; the open handle is an RAII value.
+`FileSystem` is a stateless root object; `FileState` is the open handle plus
+the cursor, stored by L2.
 
 ```rust
-/// Explicit backend/root configuration. Cheap to clone; carries no open
-/// files and no indexes (an index would be L2 state).
 #[derive(Clone)]
-pub struct FsRoot { /* backend kind + base */ }
+pub struct FileSystem { /* host root | in-memory root | URI root */ }
 
-pub fn open(root: &FsRoot, path: &FsPath, mode: OpenMode) -> Result<FileHandle, FsError>;
-pub fn stat(root: &FsRoot, path: &FsPath) -> Result<FileStat, FsError>;
-pub fn exists(root: &FsRoot, path: &FsPath) -> bool;
-pub fn list(root: &FsRoot, path: &FsPath) -> Result<Vec<DirEntry>, FsError>;
-pub fn create_dir_all(root: &FsRoot, path: &FsPath) -> Result<(), FsError>;
-pub fn remove_file(root: &FsRoot, path: &FsPath) -> Result<(), FsError>;
-pub fn copy(root: &FsRoot, from: &FsPath, to: &FsPath) -> Result<(), FsError>;
-pub fn rename(root: &FsRoot, from: &FsPath, to: &FsPath) -> Result<(), FsError>;
+pub fn create_file_system(config: FsConfig) -> FileSystem;
 
-/// Open file/asset. Positional by design: the caller (L2) owns all cursor
-/// state, so the handle need not be sequential and reads can be parallel.
-pub struct FileHandle { /* fd / asset handle */ }
+pub fn open(fs: &FileSystem, path: &FsPath, mode: OpenMode) -> Result<FileState, FsError>;
+pub fn stat(fs: &FileSystem, path: &FsPath) -> Result<FileStat, FsError>;
+pub fn exists(fs: &FileSystem, path: &FsPath) -> bool;
+pub fn list(fs: &FileSystem, path: &FsPath) -> Result<Vec<DirEntry>, FsError>;
+pub fn create_dir_all(fs: &FileSystem, path: &FsPath) -> Result<(), FsError>;
+pub fn remove_file(fs: &FileSystem, path: &FsPath) -> Result<(), FsError>;
+pub fn copy(fs: &FileSystem, from: &FsPath, to: &FsPath) -> Result<(), FsError>;
+pub fn rename(fs: &FileSystem, from: &FsPath, to: &FsPath) -> Result<(), FsError>;
 
-impl FileHandle {
-    pub fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError>;
-    pub fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<usize, FsError>;
-    pub fn size(&self) -> Result<u64, FsError>;
-    pub fn flush(&mut self) -> Result<(), FsError>;
-}
+pub struct FileState { /* fd/asset handle + logical cursor */ }
+
+pub fn read_at(fs: &FileSystem, file: &FileState, offset: u64, buf: &mut [u8])
+    -> Result<usize, FsError>;
+pub fn write_at(fs: &FileSystem, file: &FileState, offset: u64, buf: &[u8])
+    -> Result<usize, FsError>;
+pub fn file_size(fs: &FileSystem, file: &FileState) -> Result<u64, FsError>;
+pub fn flush(fs: &FileSystem, file: &FileState) -> Result<(), FsError>;
+pub fn read_seq(fs: &FileSystem, file: &mut FileState, buf: &mut [u8])
+    -> Result<usize, FsError>;
 
 pub enum FsPath {
     Host(PathBuf),   // Linux, Android app-private dirs
@@ -114,108 +131,101 @@ pub enum FsPath {
 }
 ```
 
-* Cursor/stream state is **L2's**: a `tvp-streams` sequential stream is a
-  thin L2 wrapper that remembers a `u64` offset and calls `read_at`
-  (`06-file-system.md §3`).
+* The cursor is inside `FileState`, which L2 stores.
 * The storage namespace, `arc.xp3>path` addressing, case-insensitive walk
-  and the mount index all stay in L2.
-* Test backends: an in-memory `FsRoot` kind and mocks; no global
-  registry.
+  and mount index are L2 state; L1 has no namespace.
+* `tvp-streams::binary::BinaryStream` becomes an L2 value wrapping a
+  `FileState` + offset.
 
-> `tvp-streams::binary::BinaryStream` is the existing trait that fits here;
-> the plan is to align it with `FileHandle` rather than keep two stream
-> abstractions.
+## 2. Render pipeline
 
-## 2. Renderer
+### 2.1 The abstraction
 
-`Gpu` is the explicit platform value (device/queue/allocator). Everything
-else — pipelines, descriptor caches, atlases, texture tables — is L2 state
-passed in or owned as an RAII handle.
+L1 provides one stateless `RenderPipeline` object. It owns the entire render
+mechanism: scene-tree traversal, parent transforms, z-order, opacity
+composition, clipping, blend-state selection, batching, texture upload
+scheduling, offscreen compositing and presentation.
+
+L2 provides a `RenderScene` tree (its layer system, flattened into drawable
+nodes) plus a `RenderState` value (GPU resource bookkeeping). It mutates the
+tree from script calls and, once per frame, calls `render`. It never computes
+a draw list.
 
 ```rust
-/// Created once by L2; never a global.
-pub struct Gpu { /* instance, physical/logical device, queue, allocator */ }
+/// Stateless render service. Created once, shared by reference.
+pub struct RenderPipeline { /* device, swapchain mechanism, shader lib */ }
 
-impl Gpu {
-    pub fn new(config: GpuConfig) -> Result<Self, RenderError>;
-    pub fn capabilities(&self) -> GpuCapabilities;
+pub fn create_render_pipeline(config: PipelineConfig)
+    -> Result<RenderPipeline, RenderError>;
+pub fn capabilities(p: &RenderPipeline) -> GpuCapabilities;
+
+/// L1-owned render state value, stored/reused by L2.
+pub struct RenderState {
+    /* swapchain, frame-in-flight, staging, compiled pipelines, texture
+       uploads, offscreen targets, glyph atlas uploads */
 }
 
-/// Swapchain; owned by the host (L2/L4).
-pub struct Surface { /* vk surface, swapchain, images */ }
-
-pub fn create_surface(
-    gpu: &mut Gpu,
-    window: &RawWindowHandle,
-    size: (u32, u32),
-) -> Result<Surface, RenderError>;
-
-pub fn resize_surface(
-    gpu: &mut Gpu,
-    surface: &mut Surface,
+pub fn begin_render_state(p: &RenderPipeline, window: &RawWindowHandle)
+    -> Result<(Surface, RenderState), RenderError>;
+pub fn resize(
+    p: &RenderPipeline,
+    surface: &Surface,
+    state: &mut RenderState,
     size: (u32, u32),
 ) -> Result<SurfaceEvent, RenderError>;
-
-/// GPU images; owned by L2, one per live bitmap / effect target.
-pub struct Texture { /* vk image + view + memory */ }
-pub struct Target { /* vk image usable as sampled + color attachment */ }
-
-pub fn create_texture(gpu: &mut Gpu, desc: TextureDesc) -> Result<Texture, RenderError>;
-pub fn drop_texture(gpu: &mut Gpu, tex: Texture);
-pub fn upload_texture(
-    gpu: &mut Gpu,
-    tex: &Texture,
-    region: PixelRegion,
-    pixels: &[u8],
-) -> Result<(), RenderError>;
-
-pub fn create_target(gpu: &mut Gpu, desc: TextureDesc) -> Result<Target, RenderError>;
-pub fn drop_target(gpu: &mut Gpu, target: Target);
-
-/// Pipelines live in an L2-owned cache; `submit` fills it lazily.
-#[derive(Default)]
-pub struct PipelineCache { /* owned by L2 */ }
-
-pub fn begin_frame(
-    gpu: &mut Gpu,
-    surface: &mut Surface,
-) -> Result<Frame, RenderError>;
-
-/// Pure over `list`: the same list draws the same thing. Any persistent
-/// cache is the caller's `PipelineCache`.
-pub fn submit(
-    gpu: &mut Gpu,
-    frame: &mut Frame,
-    pipelines: &mut PipelineCache,
-    list: &RenderList,
-) -> Result<(), RenderError>;
-
-pub fn end_frame(
-    gpu: &mut Gpu,
-    surface: &mut Surface,
-    frame: Frame,
-) -> Result<Presentation, RenderError>;
 ```
 
-### 2.1 The draw list (L2 output)
+### 2.2 The abstract scene/layer object tree
+
+The tree is defined by L1 (so the pipeline can consume it) and owned by L2
+(so the middle layer keeps all state). It carries drawable structure and
+blend semantics only — no TVP properties.
 
 ```rust
-pub struct RenderList {
-    pub target: TargetRef,          // Swapchain | Target(&Target)
-    pub clear: Option<[f32; 4]>,
-    pub quads: Vec<DrawQuad>,
+pub struct RenderScene {
+    pub root: RenderNodeId,
+    pub nodes: Vec<RenderNode>,          // arena; L2 owns it
+    pub background: Option<[f32; 4]>,
 }
 
-pub struct DrawQuad {
-    pub source: QuadSource,         // Texture(&Texture) | Solid
-    pub src: PixelRegion,           // texel sub-rect
-    pub dst: RectF,                 // framebuffer pixels
-    pub transform: Option<Affine2>, // rotation/scale
+pub struct RenderNodeId(pub u32);
+
+pub struct RenderNode {
+    pub parent: Option<RenderNodeId>,
+    pub children: Vec<RenderNodeId>,
+    pub content: RenderContent,
+    /// Node-local transform (translate/scale/rotate/pivot).
+    pub transform: Transform2D,
+    /// Destination rect in the parent's coordinate space.
+    pub dst: RectF,
+    /// Source sub-rect for textures (sprite-sheet frames, clipping).
+    pub src: PixelRegion,
     pub opacity: f32,
-    pub tint: [f32; 4],
+    pub visible: bool,
+    pub z: i32,
     pub blend: BlendMode,
-    pub clip: Option<PixelRegion>,
-    pub z: f32,
+    pub clip: Option<Clip>,
+    /// `holdAlpha` / main-vs-province selection hook (TVP face).
+    pub hold_alpha: bool,
+}
+
+pub enum RenderContent {
+    None,                       // container only (e.g. ltBinder)
+    Solid([f32; 4]),            // flat fill
+    Texture(Texture),           // L1-created texture object
+    Glyphs(GlyphRun),           // optional GPU text path
+}
+
+pub struct Transform2D {
+    pub translate: (f32, f32),
+    pub scale: (f32, f32),
+    pub rotation: f32,          // radians
+    pub pivot: (f32, f32),
+}
+
+pub enum Clip {
+    Rect(RectF),
+    Mask(Texture),              // alpha mask
 }
 
 pub enum BlendMode {
@@ -229,157 +239,176 @@ pub enum DstBlend {
 }
 ```
 
-* Flattening is L2's job. The TVP `LT_*` numbering never reaches L1; L2 maps it.
-* `BlendMode` is a closed enum, not an integer, so both backends (Bevy
-  adapter and Vulkan core) implement the same set.
-* Destination-dependent blends need an offscreen `Target` and a
-  destination-sampling pipeline variant; that is an L1 detail triggered by
-  the enum, not a policy cache.
+### 2.3 Textures
 
-## 3. Glyph engine
-
-Rasterization is a pure function over a font handle. The **atlas is an L2
-cache**, because caching is a decision.
+Textures are L1 objects referenced by `RenderContent::Texture`; L2 stores the
+handle and streams pixel updates into `RenderState`.
 
 ```rust
-/// Parsed face; RAII value owned by L2.
-pub struct GlyphFace { /* ttf-parser/ab_glyph/swash face */ }
+pub struct Texture { /* immutable image + view */ }
 
-pub fn load_face(bytes: &[u8], index: u32) -> Result<GlyphFace, GlyphError>;
+pub fn create_texture(p: &RenderPipeline, desc: TextureDesc) -> Result<Texture, RenderError>;
+pub fn drop_texture(p: &RenderPipeline, state: &mut RenderState, tex: Texture);
+pub fn upload_texture(
+    p: &RenderPipeline,
+    state: &mut RenderState,
+    tex: &Texture,
+    region: PixelRegion,
+    pixels: &[u8],
+) -> Result<(), RenderError>;
+```
 
-/// Pure: no atlas, no cache, no state beyond the face.
+### 2.4 The render action
+
+```rust
+pub fn render(
+    p: &RenderPipeline,
+    surface: &Surface,
+    state: &mut RenderState,
+    scene: &RenderScene,
+) -> Result<Presentation, RenderError>;
+```
+
+This single call replaces `sync_scene` + `LayerBlendMaterial` + `Sprite`
+placement + `window_layer_order` + `visible_image_region` + every per-frame
+entity/material operation. L2's only render responsibility is to keep the
+tree current.
+
+### 2.5 What L2 still owns semantically
+
+The TVP layer system is an L2 structure **on top of** the render tree:
+
+* every `LayerState`/`WindowState` property (masks, province, focus,
+  hit-test, callbacks, `ImageLeft/Top/Width/Height`, `mainImage`,
+  `provinceImage`, `face`, `holdAlpha`, `type`, …);
+* CPU pixel operations (`layer_ops.rs`, `raster.rs`, TLG decode, text
+  composition) and the `MainImage` screen-buffer read-back;
+* the projection from the L2 layer tree into `RenderScene` nodes (one node
+  per drawn layer, parent links, composed opacity/z/visible, resolved
+  texture handle). This is a field copy, not a draw-list computation.
+
+`BlendMode` is a closed enum: L2 maps its `LT_*` numbering to it (today's
+`blend_mode_for`), and one L1 shader set implements it for every backend.
+
+## 3. Glyph / font
+
+`FontSystem` is the stateless abstraction; `Font` is immutable parsed data;
+the atlas is L2 state.
+
+```rust
+pub struct FontSystem { /* font library / rasterizer backend */ }
+pub fn create_font_system() -> FontSystem;
+
+pub struct Font { /* parsed face, index */ }
+pub fn load_font(fs: &FontSystem, bytes: &[u8], index: u32) -> Result<Font, GlyphError>;
+
 pub fn rasterize_glyph(
-    face: &mut GlyphFace,
+    fs: &FontSystem,
+    font: &Font,
     glyph: char,
     size_px: f32,
     style: GlyphStyle,
 ) -> Result<GlyphBitmap, GlyphError>;
 
-pub fn glyph_advance(
-    face: &GlyphFace,
-    glyph: char,
-    size_px: f32,
-    style: GlyphStyle,
-) -> f32;
-
-pub fn font_metrics(face: &GlyphFace, size_px: f32) -> FontMetrics;
+pub fn glyph_advance(fs: &FontSystem, font: &Font, glyph: char, size_px: f32,
+    style: GlyphStyle) -> f32;
+pub fn font_metrics(fs: &FontSystem, font: &Font, size_px: f32) -> FontMetrics;
 
 pub struct GlyphBitmap {
-    pub width: u32,
-    pub height: u32,
+    pub width: u32, pub height: u32,
     pub coverage: Vec<u8>,   // 8-bit coverage, row-major
-    pub bearing_x: f32,
-    pub bearing_y: f32,
-    pub advance: f32,
+    pub bearing_x: f32, pub bearing_y: f32, pub advance: f32,
 }
 ```
 
-L2 owns the `GlyphAtlas` (today's `tvp-text/src/atlas.rs`), the layout
-engine, and the font-config resolution (`fonts.json`). `paint_layout`
-composites coverage into the layer's `BitmapState`, so `getPixel`/`piledCopy`
-keep working. An optional later phase uploads atlas cells as textures and
-emits text quads through the same `RenderList`; the rasterization API does
-not change.
+L2 stores the `GlyphAtlas`, `Font` values, layout engine and `fonts.json`
+resolution. `paint_layout` composites coverage into the layer's
+`BitmapState` and the result is uploaded as a normal texture, so
+`getPixel`/`piledCopy` keep working. A later GPU text path emits
+`RenderContent::Glyphs`; the API does not change.
 
 ## 4. Media
 
-### 4.1 Pure decode functions
-
-Image and whole-file audio decode need no context and are free functions:
+`Media` is the stateless backend object. Pure decodes are free functions;
+streaming state is bottom-defined and L2-owned.
 
 ```rust
-pub fn probe_image(bytes: &[u8], hint: Option<&str>) -> Result<ImageInfo, MediaError>;
-pub fn decode_image(bytes: &[u8], hint: Option<&str>) -> Result<DecodedImage, MediaError>;
+pub struct Media { /* backend configuration */ }
+pub fn create_media(config: MediaConfig) -> Media;
 
-pub fn probe_audio(bytes: &[u8], hint: Option<&str>) -> Result<AudioSpec, MediaError>;
-pub fn decode_audio(bytes: &[u8], hint: Option<&str>) -> Result<DecodedAudio, MediaError>;
+// --- pure image / whole-file audio ---------------------------------------
+pub fn probe_image(m: &Media, bytes: &[u8], hint: Option<&str>) -> Result<ImageInfo, MediaError>;
+pub fn decode_image(m: &Media, bytes: &[u8], hint: Option<&str>) -> Result<DecodedImage, MediaError>;
+
+pub fn probe_audio(m: &Media, bytes: &[u8], hint: Option<&str>) -> Result<AudioSpec, MediaError>;
+pub fn decode_audio(m: &Media, bytes: &[u8], hint: Option<&str>) -> Result<DecodedAudio, MediaError>;
 
 pub fn yuv420_to_rgba(/* layout */) -> Vec<u8>;
+
+// --- streaming audio ------------------------------------------------------
+pub struct AudioDecoderState { /* codec context + decode position */ }
+
+pub fn open_audio(m: &Media, bytes: Arc<[u8]>, hint: Option<&str>)
+    -> Result<(AudioSpec, AudioDecoderState), MediaError>;
+pub fn read_audio(m: &Media, state: &mut AudioDecoderState, out: &mut [f32])
+    -> Result<usize, MediaError>;
+pub fn seek_audio(m: &Media, state: &mut AudioDecoderState, frame: u64)
+    -> Result<(), MediaError>;
+
+// --- video ----------------------------------------------------------------
+pub struct VideoDecoderState { /* demuxer/codec context, current frame, audio */ }
+
+pub fn open_video(m: &Media, bytes: Arc<[u8]>, hint: Option<&str>)
+    -> Result<(VideoSpec, VideoDecoderState), MediaError>;
+pub fn present_video(m: &Media, state: &mut VideoDecoderState, at_ms: u64)
+    -> Result<RgbaFrame, MediaError>;
+pub fn video_audio(m: &Media, state: &VideoDecoderState) -> Result<DecodedAudio, MediaError>;
 ```
 
-### 4.2 Streaming/video: RAII decoder values
+* The codec context, decode position and current frame live in
+  `AudioDecoderState`/`VideoDecoderState` — stored by L2, never by `Media`.
+* Backends: FFmpeg on Linux, MediaCodec on Android; selection is by `cfg`
+  and the object/state API is identical.
+* Backend capability query is a stateless free function
+  (`capabilities(m: &Media)`).
 
-Streaming needs a codec context; that context is an RAII value owned by L2,
-and every operation takes it explicitly. There is no L1-side stream registry.
+### 4.1 What stays in L2
 
-```rust
-pub struct AudioDecoder { /* symphonia/ffmpeg/libopus context */ }
-
-pub fn open_audio(
-    bytes: Arc<[u8]>,
-    hint: Option<&str>,
-) -> Result<AudioDecoder, MediaError>;
-
-impl AudioDecoder {
-    pub fn spec(&self) -> AudioSpec;
-    /// Advance the decoder; `out` receives interleaved f32. Progress lives
-    /// in the decoder value, which L2 owns — not in an L1 table.
-    pub fn read_frames(&mut self, out: &mut [f32]) -> Result<usize, MediaError>;
-    pub fn seek(&mut self, frame: u64) -> Result<(), MediaError>;
-}
-
-pub struct VideoDecoder { /* ffmpeg / mediacodec context */ }
-
-pub fn open_video(
-    bytes: Arc<[u8]>,
-    hint: Option<&str>,
-) -> Result<VideoDecoder, MediaError>;
-
-impl VideoDecoder {
-    pub fn spec(&self) -> VideoSpec;
-    pub fn present_at(&mut self, at_ms: u64) -> Result<RgbaFrame, MediaError>;
-    pub fn audio(&mut self) -> Result<DecodedAudio, MediaError>;
-}
-```
-
-### 4.3 Formats and backends
-
-* Image: TLG5/6 + `image` formats; one implementation shared by backends.
-* Audio: symphonia + libopus; FFmpeg/MediaCodec only where symphonia lacks
-  a codec.
-* Video: `ffmpeg` on Linux, `mediacodec` on Android.
-* Backend selection is by `cfg`, and the selected backend must not change
-  the API or introduce caching. `MediaError::Unsupported` replaces the
-  scattered `#[cfg]` capability branches.
-
-### 4.4 What stays in L2
-
-* the mixer and `WaveSoundBuffer`/`SoundBuffer`/`SoundChannel` state;
+* mixer and `WaveSoundBuffer`/`SoundBuffer`/`SoundChannel` state;
 * `.sli` loop/label handling and fades;
-* the whole-file-vs-stream decision and the `Arc<[u8]>` byte sharing;
-* the video overlay state machine, timing anchors and event delivery;
-* the decoded-image/audio caches.
+* the whole-file-vs-stream decision and `Arc<[u8]>` byte sharing;
+* the video-overlay state machine, timing anchors, event delivery;
+* decoded-asset and image caches.
 
 ## 5. Audio device
 
-The device is an RAII value; the mixer is L2. L1 just moves samples.
+`AudioDevice` is the stateless abstraction; `AudioOutputState` is the OS
+stream state stored by L2.
 
 ```rust
-pub struct AudioDevice { /* cpal/AAudio stream + guard */ }
+pub struct AudioDevice { /* immutable device config */ }
+pub struct AudioOutputState { /* stream, callback slot, running flag */ }
 
-impl AudioDevice {
-    pub fn open(spec: AudioSpec) -> Result<Self, AudioError>;
-}
+pub fn open_audio_device(spec: AudioSpec)
+    -> Result<(AudioDevice, AudioOutputState), AudioError>;
 
-/// `pull` is L2-owned state; L1 calls it from the audio callback and writes
-/// nothing of its own.
 pub fn start(
-    device: &mut AudioDevice,
-    mut pull: impl FnMut(&mut [f32]) + Send + 'static,
+    dev: &AudioDevice,
+    state: &mut AudioOutputState,
+    pull: impl FnMut(&mut [f32]) + Send + 'static,
 ) -> Result<(), AudioError>;
 
-pub fn stop(device: &mut AudioDevice);
-pub fn is_running(device: &AudioDevice) -> bool;
+pub fn stop(dev: &AudioDevice, state: &mut AudioOutputState);
+pub fn is_running(state: &AudioOutputState) -> bool;
 ```
 
-* `open`/`start`/`stop` run on the host thread because the stream may be
-  `!Send` (today's `MainThreadOutputGuard`).
-* Headless mode has no `AudioDevice`; L2 advances the mixer from the frame
-  clock (`advance(dt)`), exactly as today.
+* `open`/`start`/`stop` run on the host thread (the stream may be `!Send`).
+* Headless: no `AudioDevice`; L2 advances the mixer from the frame clock.
 
 ## 6. Input and host window
 
-Host-produced, passed to L2 as plain snapshots.
+Host-produced; passed to L2 as plain snapshots. The host owns window state,
+L2 owns the input/TVP state.
 
 ```rust
 pub struct InputState {
@@ -416,7 +445,6 @@ pub fn now_ms(clock: &impl Clock) -> u64;
 
 pub trait LogSink { fn log(&self, record: &LogRecord); }
 
-/// Injected at startup instead of read from process globals.
 pub struct ProcessEnv {
     pub project_dir: PathBuf,
     pub app_data_dir: PathBuf,
@@ -426,56 +454,67 @@ pub struct ProcessEnv {
 }
 ```
 
-## 8. The engine (L2) owns everything
-
-L1 has no engine object; L2 does. This is the same as
-`02-target-architecture.md`, restated around the stateless API:
+## 8. L2 is the state store and dispatcher
 
 ```rust
 pub struct Engine {
-    // L2 state — all of it.
-    scene: Scene,
+    // ---- L1 stateless objects (shared services) ----
+    pipeline: RenderPipeline,
+    media: Media,
+    fs: FileSystem,
+    fonts: FontSystem,
+    audio: Option<AudioDevice>,
+
+    // ---- L2 state (all of it) ----
+    scene: Scene,                // TVP layer system (all properties)
+    render_scene: RenderScene,   // L1 tree, projected from `scene`
+    render_state: RenderState,   // L1 GPU state, owned by L2
+    surface: Surface,
     mixer: Mixer,
     glyph_atlas: GlyphAtlas,
-    pipelines: PipelineCache,
-    bitmaps: HashMap<BitmapId, Texture>,   // L2 owns the handles
-    decoders: HashMap<SoundId, AudioDecoder>,
-    storage: Storage,                       // namespace over FsRoot
-    // platform values owned by L2, not globally reachable
-    gpu: Gpu,
-    surface: Surface,
-    audio: Option<AudioDevice>,
-    pool: WorkerPool,                       // L2-owned
+    decoders: HashMap<SoundId, AudioDecoderState>,
+    video: HashMap<VideoId, VideoDecoderState>,
+    open_files: HashMap<FileId, FileState>,
+    storage_index: StorageIndex, // namespace, arc.xp3>path
+    pool: WorkerPool,            // L2-owned threads + completions
 }
 
 impl Engine {
-    pub fn tick(&mut self, dt_ms: f32);
-    pub fn render(&mut self);               // builds RenderList, calls submit
+    pub fn tick(&mut self, dt_ms: f32);   // mutate L2 state from scripts
+    pub fn render(&mut self);             // project tree, call pipeline.render
     pub fn install_natives(&self, vm: &Tjs2Engine);
 }
 ```
 
-Tests construct `Engine` with `NullGpu`, an in-memory `FsRoot`, pure stubs and
-`MockClock`. No `static` is involved.
+`Engine::render` is: sync dirty `scene` fields into `render_scene`, upload
+dirty bitmaps into `render_state`, then a single `render(pipeline, surface,
+render_state, render_scene)`. No draw-list construction in L2.
 
-## 9. Enforcing D9
+Tests construct `Engine` with a `NullRenderPipeline`, an in-memory
+`FileSystem`, a stub `Media`, `SystemClock` and no window/codec.
 
-* A CI check greps `krkr-core` for forbidden constructs
-  (`static mut`, `thread_local!`, `LazyLock`, `OnceLock`, `lazy_static!`,
-  `OnceCell`) and for `pub fn` returning an integer id that indexes a
-  module-level table.
-* Every L1 function is unit-testable with plain inputs; an integration test
-  constructs two independent `Gpu`/backend values in one process (if L1 had
-  globals, this would fail or alias).
-* Review rule: "could two engines run in one process?" For L1 the answer
-  must be **yes**.
+## 9. Enforcing the model
+
+* A CI check greps `krkr-core` for forbidden constructs (`static mut`,
+  `thread_local!`, `LazyLock`, `OnceLock`, `lazy_static!`, `OnceCell`) and
+  for `&mut self` methods on the L1 service objects.
+* An integration test constructs **two independent `RenderPipeline`/`Media`/
+  `FileSystem` objects and two `Engine`s** in one process; if L1 had globals
+  or object state, this would alias or fail.
+* Review rule: "could two engines run in one process?" Must be **yes**.
+* Review rule: "does this object remember anything?" If yes, move it to a
+  state value.
+* Review rule for rendering: "does L2 compute a draw list or traverse the
+  tree?" If yes, the pipeline is not doing its job.
 
 ## 10. What the API intentionally leaves out
 
 * Storage namespaces / `.xp3` / auto-path search (L2).
 * TVP `Layer.type` numbering (L2 maps to `BlendMode`).
+* TVP layer properties, masks, province, focus/hit-test, script callbacks
+  (L2, on top of `RenderScene`).
 * `.sli` loop metadata, fade scheduling, 3D attenuation (L2 mixer).
-* Glyph atlas, decoded-asset caches, pipeline caches (L2).
+* Glyph atlas, decoded-asset caches, compiled pipelines (L2 state).
 * Video-overlay event model (`onFrameUpdate`/`onPeriod`) (L2).
 * KAG, TJS values, exceptions, object registries (L3).
 * Window menus and UI (L4 or L2-drawn, see `04-renderer-vulkan.md §7`).
