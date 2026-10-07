@@ -12,3 +12,14 @@
 //!
 //! No engine state lives here. See `docs/migration/03-middle-layer-api.md`
 //! for the full design.
+
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
+pub mod blend;
+pub mod error;
+pub mod fs;
+pub mod geometry;
+pub mod glyph;
+pub mod host;
+pub mod media;
