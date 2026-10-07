@@ -1,8 +1,8 @@
 //! krkr-rs **L1 platform core**.
 //!
-//! Owns the window/surface, the event loop, input, the clock, threads and
-//! the process lifecycle — i.e. *all* platform-specific code — behind one
-//! platform abstraction. Higher layers (L2 engine, L3 compatibility, L4 VM)
+//! Owns the window/surface, the event loop, input, the clock, audio output,
+//! threads and the process lifecycle — i.e. *all* platform-specific code —
+//! behind one platform abstraction. Higher layers (L2 engine, L3 compatibility, L4 VM)
 //! consume this and contain no `#[cfg(target_os = ...)]`.
 //!
 //! # Compile-time platform selection (D13)
@@ -35,6 +35,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod audio;
 mod clock;
 mod event;
 mod input;
@@ -65,11 +66,13 @@ pub use crate::android::{PlatformWindow, run};
 #[cfg(all(feature = "platform-linux", not(feature = "platform-android")))]
 pub use crate::linux::{PlatformWindow, run};
 
+pub use crate::audio::{AudioDevice, AudioOutputState};
 pub use crate::clock::{Clock, Ticker};
 pub use crate::event::PlatformEvent;
 pub use crate::input::{InputEvent, MouseButton};
 pub use crate::window::headless_window_handle;
 
+use api::error::AudioError;
 use std::time::Duration;
 
 /// Errors from the platform layer.
@@ -82,6 +85,9 @@ pub enum PlatformError {
     /// A window could not be created.
     #[error("window: {0}")]
     Window(String),
+    /// Audio output failed.
+    #[error(transparent)]
+    Audio(#[from] AudioError),
     /// The raw window/display handle could not be obtained.
     ///
     /// A higher layer must treat this as fatal rather than substituting a

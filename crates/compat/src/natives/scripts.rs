@@ -20,14 +20,12 @@
 //! | `dump()` | dump every live script block through the engine log |
 //! | `textEncoding` | get/set the fallback text decoder (default `"UTF-8"`) |
 //!
-//! `mode` honors only the reference's `oN` byte offset. Script decoding
-//! supports UTF-8 (with/without BOM) and UTF-16 (BOM or the BOM-less LE
-//! heuristic); a configured `textEncoding` that is not a UTF variant is
-//! rejected with a typed error. The reference's CP932 fallback and the
-//! `FE FE` cipher / zlib container are **deferred**: `compat` does not depend
-//! on the encoding or flate2 crates, so an undecodable script raises a typed
-//! error instead of producing mojibake (D11). The `context` argument is
-//! likewise ignored with a warning.
+//! `mode` honors only the reference's `oN` byte offset. Script decoding goes
+//! through [`crate::text::decode_text`], which handles the `FE FE` cipher /
+//! zlib container, a UTF-8/UTF-16 BOM, an explicit `textEncoding` override,
+//! then UTF-8 and CP932. An undecodable script raises a typed error instead
+//! of producing mojibake (D11). The `context` argument is likewise ignored
+//! with a warning.
 
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::ptr;
@@ -185,74 +183,6 @@ fn mode_offset(mode: &str) -> Option<usize> {
     None
 }
 
-/// Heuristic: even-length payload with a high ratio of zero high bytes →
-/// BOM-less UTF-16LE.
-fn looks_like_utf16le(bytes: &[u8]) -> bool {
-    if bytes.len() < 4 || !bytes.len().is_multiple_of(2) {
-        return false;
-    }
-    let mut high_zeros = 0usize;
-    for chunk in bytes.chunks_exact(2) {
-        if chunk[1] == 0 {
-            high_zeros += 1;
-        }
-    }
-    high_zeros * 4 >= bytes.len() / 2
-}
-
-/// Decode a UTF-16LE byte payload.
-fn decode_utf16le(bytes: &[u8]) -> Result<String, String> {
-    let units = bytes
-        .chunks_exact(2)
-        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]));
-    char::decode_utf16(units)
-        .collect::<Result<String, _>>()
-        .map_err(|error| error.to_string())
-}
-
-/// Decode a UTF-16BE byte payload.
-fn decode_utf16be(bytes: &[u8]) -> Result<String, String> {
-    let units = bytes
-        .chunks_exact(2)
-        .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]));
-    char::decode_utf16(units)
-        .collect::<Result<String, _>>()
-        .map_err(|error| error.to_string())
-}
-
-/// Decode script bytes the way the reference text stream does, minus the
-/// unavailable CP932 and `FE FE` container support. A leading BOM (or the
-/// BOM-less UTF-16LE heuristic) wins; otherwise a configured non-UTF
-/// `textEncoding` is rejected rather than ignored.
-fn decode_script(bytes: &[u8], encoding: Option<&str>) -> Result<String, String> {
-    if let Some(rest) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
-        return String::from_utf8(rest.to_vec()).map_err(|error| error.to_string());
-    }
-    if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
-        return decode_utf16le(rest);
-    }
-    if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
-        return decode_utf16be(rest);
-    }
-    if looks_like_utf16le(bytes) {
-        return decode_utf16le(bytes);
-    }
-    if let Some(encoding) = encoding
-        && !encoding.is_empty()
-        && !encoding.eq_ignore_ascii_case("utf-8")
-        && !encoding.eq_ignore_ascii_case("utf8")
-    {
-        return Err(format!(
-            "configured text encoding '{encoding}' is not supported by the compat surface"
-        ));
-    }
-    String::from_utf8(bytes.to_vec()).map_err(|_| {
-        "script is not valid UTF-8 (CP932 and the FE FE container are not yet \
-         supported by the compat surface)"
-            .to_string()
-    })
-}
-
 /// The configured `Scripts.textEncoding`, if the host/script set one.
 fn configured_encoding(services: &CompatServices) -> Option<String> {
     services.state::<ScriptsState>().text_encoding.clone()
@@ -272,7 +202,7 @@ fn load_storage_text(
         Some(offset) => &bytes[offset.min(bytes.len())..],
         None => &bytes[..],
     };
-    decode_script(bytes, encoding).map_err(|error| format!("Scripts: '{name}': {error}"))
+    crate::text::decode_text(bytes, encoding).map_err(|error| format!("Scripts: '{name}': {error}"))
 }
 
 /// Read `name` through storage and run it as a script (`expression == false`)

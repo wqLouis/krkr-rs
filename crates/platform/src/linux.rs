@@ -322,3 +322,204 @@ fn native_key_code(native: NativeKeyCode) -> u32 {
     };
     raw | NATIVE_KEY_FLAG
 }
+/// Audio output over cpal (the `platform-linux` backend).
+///
+/// The public object/state API lives in [`crate::audio`]; this module provides
+/// the real backend. The stream's data callback drains a software queue that
+/// [`write`] fills, so the object stays stateless and the queue lives in the
+/// caller-owned state value.
+pub(crate) mod audio {
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex, MutexGuard};
+
+    use api::error::AudioError;
+    use api::media::AudioSpec;
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    use cpal::{FromSample, SampleFormat, SampleRate, SizedSample, StreamConfig};
+
+    use crate::PlatformError;
+
+    /// Immutable description of the stream format chosen at open time.
+    pub(crate) struct Backend {
+        config: StreamConfig,
+    }
+
+    /// The OS output stream plus the software queue its callback drains.
+    pub(crate) struct StreamState {
+        stream: Option<cpal::Stream>,
+        queue: Arc<Mutex<VecDeque<f32>>>,
+        running: bool,
+    }
+
+    /// Opens the default output device and starts a stream for `spec`.
+    pub(crate) fn open(spec: AudioSpec) -> Result<(Backend, StreamState), PlatformError> {
+        let host = open_host()?;
+        let device = host
+            .default_output_device()
+            .ok_or_else(|| AudioError::DeviceUnavailable {
+                message: "no default output device".to_owned(),
+            })?;
+        let supported = choose_config(&device, spec)?;
+        let config = supported.config();
+        let queue = Arc::new(Mutex::new(VecDeque::new()));
+        let stream = build_stream(
+            &device,
+            &config,
+            supported.sample_format(),
+            Arc::clone(&queue),
+        )?;
+        stream.play().map_err(|error| AudioError::Stream {
+            message: error.to_string(),
+        })?;
+        Ok((
+            Backend { config },
+            StreamState {
+                stream: Some(stream),
+                queue,
+                running: true,
+            },
+        ))
+    }
+
+    /// Queues `pcm` for playback, keeping at most two seconds buffered.
+    pub(crate) fn write(
+        dev: &Backend,
+        state: &mut StreamState,
+        pcm: &[f32],
+    ) -> Result<(), PlatformError> {
+        if !state.running {
+            return Err(AudioError::NotRunning.into());
+        }
+        let channels = usize::from(dev.config.channels).max(1);
+        let capacity = dev.config.sample_rate.0 as usize * channels * 2;
+        let mut queue = lock_queue(&state.queue);
+        let overflow = (queue.len() + pcm.len()).saturating_sub(capacity);
+        if overflow > 0 {
+            let drop_count = overflow.min(queue.len());
+            queue.drain(..drop_count);
+        }
+        queue.extend(pcm.iter().copied());
+        Ok(())
+    }
+
+    /// Pauses the stream and releases the OS resources (idempotent).
+    pub(crate) fn stop(_dev: &Backend, state: &mut StreamState) {
+        if let Some(stream) = state.stream.take() {
+            let _ = stream.pause();
+        }
+        state.running = false;
+    }
+
+    /// Whether the stream is playing.
+    pub(crate) fn is_running(state: &StreamState) -> bool {
+        state.running
+    }
+
+    /// Returns the first available cpal host without panicking.
+    fn open_host() -> Result<cpal::Host, PlatformError> {
+        let id = cpal::available_hosts().into_iter().next().ok_or_else(|| {
+            AudioError::DeviceUnavailable {
+                message: "no cpal audio host is available".to_owned(),
+            }
+        })?;
+        cpal::host_from_id(id).map_err(|error| {
+            AudioError::DeviceUnavailable {
+                message: format!("audio host {id:?} is unavailable: {error}"),
+            }
+            .into()
+        })
+    }
+
+    /// Picks a supported config whose channels and sample rate match `spec`.
+    fn choose_config(
+        device: &cpal::Device,
+        spec: AudioSpec,
+    ) -> Result<cpal::SupportedStreamConfig, PlatformError> {
+        let wanted = SampleRate(spec.sample_rate);
+        let configs = device
+            .supported_output_configs()
+            .map_err(|error| AudioError::Open {
+                message: error.to_string(),
+            })?;
+        for range in configs {
+            if range.channels() == spec.channels
+                && let Some(config) = range.try_with_sample_rate(wanted)
+            {
+                return Ok(config);
+            }
+        }
+        Err(AudioError::Unsupported {
+            message: format!(
+                "no {} Hz / {} channel output format on the default device",
+                spec.sample_rate, spec.channels
+            ),
+        }
+        .into())
+    }
+
+    /// Builds the stream, dispatching on the device's sample format.
+    fn build_stream(
+        device: &cpal::Device,
+        config: &StreamConfig,
+        format: SampleFormat,
+        queue: Arc<Mutex<VecDeque<f32>>>,
+    ) -> Result<cpal::Stream, PlatformError> {
+        match format {
+            SampleFormat::F32 => build_typed::<f32>(device, config, queue),
+            SampleFormat::I16 => build_typed::<i16>(device, config, queue),
+            SampleFormat::U16 => build_typed::<u16>(device, config, queue),
+            SampleFormat::I32 => build_typed::<i32>(device, config, queue),
+            SampleFormat::U32 => build_typed::<u32>(device, config, queue),
+            SampleFormat::I8 => build_typed::<i8>(device, config, queue),
+            SampleFormat::U8 => build_typed::<u8>(device, config, queue),
+            SampleFormat::I64 => build_typed::<i64>(device, config, queue),
+            SampleFormat::U64 => build_typed::<u64>(device, config, queue),
+            SampleFormat::F64 => build_typed::<f64>(device, config, queue),
+            other => Err(AudioError::Unsupported {
+                message: format!("unsupported sample format: {other}"),
+            }
+            .into()),
+        }
+    }
+
+    /// Builds a typed stream whose callback converts queued `f32` to `T`.
+    fn build_typed<T>(
+        device: &cpal::Device,
+        config: &StreamConfig,
+        queue: Arc<Mutex<VecDeque<f32>>>,
+    ) -> Result<cpal::Stream, PlatformError>
+    where
+        T: SizedSample + FromSample<f32>,
+    {
+        let channels = usize::from(config.channels).max(1);
+        device
+            .build_output_stream(
+                config,
+                move |data: &mut [T], _info: &cpal::OutputCallbackInfo| {
+                    let mut queue = lock_queue(&queue);
+                    for frame in data.chunks_mut(channels) {
+                        for sample in frame.iter_mut() {
+                            let value = queue.pop_front().unwrap_or(0.0);
+                            *sample = T::from_sample(value);
+                        }
+                    }
+                },
+                |error| log::error!("audio output stream error: {error}"),
+                None,
+            )
+            .map_err(|error| {
+                AudioError::Open {
+                    message: error.to_string(),
+                }
+                .into()
+            })
+    }
+
+    /// Locks the queue, recovering the data if a callback ever poisoned it.
+    fn lock_queue(queue: &Mutex<VecDeque<f32>>) -> MutexGuard<'_, VecDeque<f32>> {
+        match queue.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+}

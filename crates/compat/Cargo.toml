@@ -10,6 +10,11 @@ engine = { workspace = true }
 tjs = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
+flate2 = { workspace = true }
+encoding_rs = "0.8"
+
+[dev-dependencies]
+fs = { workspace = true }
 
 # D13: `platform` has no default platform feature, so each target selects
 # exactly one. L3 uses only the platform-agnostic event types; it still needs a

@@ -359,6 +359,39 @@ impl Scene {
         }
     }
 
+    /// Destroy a window and **every** layer belonging to it — the reference
+    /// `tTJSNI_BaseWindow::Invalidate` (`WindowIntf.cpp:175`) followed by the
+    /// script object's destruction. Each layer's whole subtree is removed
+    /// through [`Scene::destroy_layer`], so the layers' owned bitmaps and
+    /// fonts are released and any surviving sibling references are cleaned
+    /// up. Returns true when the window was present.
+    ///
+    /// This is the L2 primitive behind `Window.close()`; the reference keeps
+    /// no window list beyond the native objects, but the scene owns the
+    /// records, so removing them here keeps the model from leaking.
+    pub fn remove_window(&mut self, id: u32) -> bool {
+        if self.window(id).is_none() {
+            return false;
+        }
+        // Collect first: `destroy_layer` mutates the layer table.
+        let layer_ids: Vec<u32> = self
+            .layers
+            .iter()
+            .filter(|layer| layer.window == id)
+            .map(|layer| layer.id)
+            .collect();
+        for layer_id in layer_ids {
+            self.destroy_layer(layer_id);
+        }
+        self.windows.retain(|window| window.id != id);
+        self.window_index.clear();
+        for (index, window) in self.windows.iter().enumerate() {
+            self.window_index.insert(window.id, index);
+        }
+        self.touch();
+        true
+    }
+
     /// Add a layer. `parent == None` attaches to the window directly.
     pub fn add_layer(&mut self, window: u32, parent: Option<u32>) -> u32 {
         // A parent belongs to the same window; invalid/cross-window ids fall
@@ -1255,6 +1288,58 @@ impl Scene {
         });
         self.touch();
         id
+    }
+
+    /// Resize a bitmap in place, preserving the overlapping top-left region
+    /// and filling any expansion with `fill` (RGBA) — the reference
+    /// `iTVPBaseBitmap::SetSizeWithFill` (`LayerBitmapIntf.cpp:122`).
+    /// Dimensions are clamped to at least 1, matching the reference
+    /// `tTVPBaseTexture` constructor. Marks the bitmap dirty. Returns true
+    /// when the bitmap was present and resized.
+    pub fn resize_bitmap(&mut self, id: u32, width: u32, height: u32, fill: [u8; 4]) -> bool {
+        let width = width.max(1);
+        let height = height.max(1);
+        let Some(old) = self.bitmap(id) else {
+            return false;
+        };
+        if old.width == width && old.height == height {
+            return true;
+        }
+        let old_w = old.width as usize;
+        let old_h = old.height as usize;
+        let copy_w = old_w.min(width as usize);
+        let copy_h = old_h.min(height as usize);
+        let Some(bytes) = (width as usize).checked_mul(height as usize) else {
+            return false;
+        };
+        let Some(pixels) = bytes.checked_mul(4) else {
+            return false;
+        };
+        let mut rgba: Vec<u8> = Vec::new();
+        if rgba.try_reserve_exact(pixels).is_err() {
+            return false;
+        }
+        rgba.resize(pixels, 0);
+        for chunk in rgba.chunks_exact_mut(4) {
+            chunk.copy_from_slice(&fill);
+        }
+        // Copy the overlapping region row by row (the row pitch changes).
+        let Some(source) = self.bitmap(id) else {
+            return false;
+        };
+        for y in 0..copy_h {
+            let src = &source.rgba[y * old_w * 4..(y * old_w + copy_w) * 4];
+            let dst = &mut rgba[y * width as usize * 4..(y * width as usize + copy_w) * 4];
+            dst.copy_from_slice(src);
+        }
+        let Some(bitmap) = self.bitmap_mut(id) else {
+            return false;
+        };
+        bitmap.width = width;
+        bitmap.height = height;
+        bitmap.rgba = rgba;
+        bitmap.mark_dirty();
+        true
     }
 
     /// Remove a bitmap unconditionally (the low-level primitive behind

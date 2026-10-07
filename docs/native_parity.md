@@ -20,20 +20,20 @@ The checker exits non-zero when a missing member is **not** listed in `scripts/n
 | --- | ---: |
 | tracked classes | 15 |
 | reference members | 527 |
-| matched | 101 |
-| **missing** | **426** |
-| extra (Rust only) | 28 |
-| coverage | **19.2%** |
+| matched | 249 |
+| **missing** | **278** |
+| extra (Rust only) | 575 |
+| coverage | **47.2%** |
 
 ## Per-class coverage
 
 | class | ref | rust | matched | missing | extra | coverage |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `Layer` | 150 | 0 | 0 | 150 | 0 | 0.0% |
-| `Bitmap` | 20 | 0 | 0 | 20 | 0 | 0.0% |
-| `Window` | 83 | 0 | 0 | 83 | 0 | 0.0% |
-| `Font` | 22 | 0 | 0 | 22 | 0 | 0.0% |
-| `Timer` | 6 | 0 | 0 | 6 | 0 | 0.0% |
+| `Layer` | 150 | 139 | 75 | 75 | 64 | 50.0% |
+| `Bitmap` | 20 | 139 | 15 | 5 | 124 | 75.0% |
+| `Window` | 83 | 139 | 43 | 40 | 96 | 51.8% |
+| `Font` | 22 | 139 | 9 | 13 | 130 | 40.9% |
+| `Timer` | 6 | 139 | 6 | 0 | 133 | 100.0% |
 | `System` | 50 | 40 | 40 | 10 | 0 | 80.0% |
 | `Debug` | 13 | 11 | 11 | 2 | 0 | 84.6% |
 | `Plugins` | 3 | 4 | 3 | 0 | 1 | 100.0% |
@@ -47,25 +47,21 @@ The checker exits non-zero when a missing member is **not** listed in `scripts/n
 
 ## Missing members by class
 
-### `Layer` — 150 missing
+### `Layer` — 75 missing
 
-`Layer`, `absolute`, `absoluteOrderMode`, `adjustGamma`, `affineBlend`, `affineCopy`, `affinePile`, `assignImages`, `attentionLeft`, `attentionTop`, `beginTransition`, `blendRect`, `bringToBack`, `bringToFront`, `cached`, `callOnPaint`, `children`, `clipHeight`, `clipLeft`, `clipTop`, `clipWidth`, `colorRect`, `convertType`, `copy9Patch`, `copyFromBitmapToMainImage`, `copyRect`, `copyToBitmapFromMainImage`, `cursor`, `cursorX`, `cursorY`, `doBoxBlur`, `doGrayScale`, `drawGlyph`, `drawText`, `dump`, `enabled`, `face`, `fillRect`, `flipLR`, `flipUD`, `focus`, `focusNext`, `focusPrev`, `focusable`, `focused`, `font`, `gaussianBlur`, `getLayerAt`, `getMainPixel`, `getMaskPixel`, `getProvincePixel`, `hasImage`, `height`, `hint`, `hitThreshold`, `hitType`, `holdAlpha`, `ignoreHintSensing`, `imageHeight`, `imageLeft`, `imageModified`, `imageTop`, `imageWidth`, `imeMode`, `independMainImage`, `independProvinceImage`, `isPrimary`, `joinFocusChain`, `left`, `light`, `loadImages`, `loadProvinceImage`, `mainImageBuffer`, `mainImageBufferForWrite`, `mainImageBufferPitch`, `moveBefore`, `moveBehind`, `name`, `neutralColor`, `nextFocusable`, `nodeEnabled`, `nodeFocusable`, `nodeVisible`, `onBeforeFocus`, `onBlur`, `onClick`, `onDoubleClick`, `onFocus`, `onHitTest`, `onKeyDown`, `onKeyPress`, `onKeyUp`, `onMouseDown`, `onMouseEnter`, `onMouseLeave`, `onMouseMove`, `onMouseUp`, `onMouseWheel`, `onMultiTouch`, `onNodeDisabled`, `onNodeEnabled`, `onPaint`, `onSearchNextFocusable`, `onSearchPrevFocusable`, `onTouchDown`, `onTouchMove`, `onTouchRotate`, `onTouchScaling`, `onTouchUp`, `onTransitionCompleted`, `opacity`, `operateAffine`, `operateRect`, `operateStretch`, `order`, `parent`, `pileRect`, `piledCopy`, `prevFocusable`, `provinceImageBuffer`, `provinceImageBufferForWrite`, `provinceImageBufferPitch`, `releaseCapture`, `releaseTouchCapture`, `removeMode`, `saveLayerImage`, `setAttentionPos`, `setClip`, `setCursorPos`, `setImagePos`, `setImageSize`, `setMainPixel`, `setMaskPixel`, `setMode`, `setPos`, `setProvincePixel`, `setSize`, `setSizeToImageSize`, `showParentHint`, `stopTransition`, `stretchBlend`, `stretchCopy`, `stretchPile`, `top`, `type`, `update`, `useAttention`, `visible`, `width`, `window`
+`adjustGamma`, `affineBlend`, `affineCopy`, `affinePile`, `beginTransition`, `blendRect`, `bringToBack`, `colorRect`, `convertType`, `copy9Patch`, `copyRect`, `copyToBitmapFromMainImage`, `cursorX`, `cursorY`, `doBoxBlur`, `doGrayScale`, `drawGlyph`, `drawText`, `dump`, `flipLR`, `flipUD`, `focusNext`, `focusPrev`, `gaussianBlur`, `getMainPixel`, `independProvinceImage`, `light`, `loadImages`, `loadProvinceImage`, `moveBefore`, `moveBehind`, `onBeforeFocus`, `onBlur`, `onClick`, `onDoubleClick`, `onFocus`, `onHitTest`, `onKeyDown`, `onKeyPress`, `onKeyUp`, `onMouseDown`, `onMouseEnter`, `onMouseLeave`, `onMouseMove`, `onMouseUp`, `onMouseWheel`, `onMultiTouch`, `onNodeDisabled`, `onNodeEnabled`, `onPaint`, `onSearchNextFocusable`, `onSearchPrevFocusable`, `onTouchDown`, `onTouchMove`, `onTouchRotate`, `onTouchScaling`, `onTouchUp`, `onTransitionCompleted`, `operateAffine`, `operateRect`, `operateStretch`, `pileRect`, `piledCopy`, `releaseCapture`, `releaseTouchCapture`, `removeMode`, `saveLayerImage`, `setAttentionPos`, `setCursorPos`, `setMainPixel`, `setMode`, `stopTransition`, `stretchBlend`, `stretchCopy`, `stretchPile`
 
-### `Bitmap` — 20 missing
+### `Bitmap` — 5 missing
 
-`Bitmap`, `buffer`, `bufferForWrite`, `bufferPitch`, `copyFrom`, `getMaskPixel`, `getPixel`, `getSaveOption`, `height`, `independ`, `load`, `loadAsync`, `loadHeader`, `loading`, `onLoaded`, `save`, `setMaskPixel`, `setPixel`, `setSize`, `width`
+`getSaveOption`, `load`, `loadAsync`, `loadHeader`, `save`
 
-### `Window` — 83 missing
+### `Window` — 40 missing
 
-`HWND`, `Window`, `add`, `borderStyle`, `bringToFront`, `caption`, `close`, `displayOrientation`, `displayRotate`, `drawDevice`, `enableTouch`, `findFullScreenCandidates`, `focusable`, `focusedLayer`, `fullScreen`, `getMouseVelocity`, `getTouchPoint`, `getTouchVelocity`, `height`, `hideMouseCursor`, `hintDelay`, `imeMode`, `innerHeight`, `innerWidth`, `layerTreeOwnerInterface`, `left`, `mainWindow`, `maxHeight`, `maxWidth`, `minHeight`, `minWidth`, `mouseCursorState`, `onActivate`, `onClick`, `onCloseQuery`, `onDeactivate`, `onDisplayRotate`, `onDoubleClick`, `onFileDrop`, `onKeyDown`, `onKeyPress`, `onKeyUp`, `onMouseDown`, `onMouseEnter`, `onMouseLeave`, `onMouseMove`, `onMouseUp`, `onMouseWheel`, `onMultiTouch`, `onPopupHide`, `onResize`, `onTouchDown`, `onTouchMove`, `onTouchRotate`, `onTouchScaling`, `onTouchUp`, `postInputEvent`, `primaryLayer`, `registerMessageReceiver`, `remove`, `removeMaskRegion`, `resetMouseVelocity`, `setInnerSize`, `setMaskRegion`, `setMaxSize`, `setMinSize`, `setPos`, `setSize`, `setZoom`, `showModal`, `stayOnTop`, `top`, `touchPointCount`, `touchRotateThreshold`, `touchScaleThreshold`, `trapKey`, `update`, `useMouseKey`, `visible`, `waitVSync`, `width`, `zoomDenom`, `zoomNumer`
+`HWND`, `borderStyle`, `displayOrientation`, `displayRotate`, `drawDevice`, `findFullScreenCandidates`, `getMouseVelocity`, `getTouchPoint`, `getTouchVelocity`, `layerTreeOwnerInterface`, `onActivate`, `onClick`, `onCloseQuery`, `onDeactivate`, `onDisplayRotate`, `onDoubleClick`, `onFileDrop`, `onKeyDown`, `onKeyPress`, `onKeyUp`, `onMouseDown`, `onMouseEnter`, `onMouseLeave`, `onMouseMove`, `onMouseUp`, `onMouseWheel`, `onMultiTouch`, `onPopupHide`, `onResize`, `onTouchDown`, `onTouchMove`, `onTouchRotate`, `onTouchScaling`, `onTouchUp`, `registerMessageReceiver`, `resetMouseVelocity`, `stayOnTop`, `touchPointCount`, `touchRotateThreshold`, `touchScaleThreshold`
 
-### `Font` — 22 missing
+### `Font` — 13 missing
 
-`Font`, `angle`, `bold`, `defaultFaceName`, `doUserSelect`, `face`, `faceIsFileName`, `getEscHeightX`, `getEscHeightY`, `getEscWidthX`, `getEscWidthY`, `getGlyphDrawRect`, `getList`, `getTextHeight`, `getTextWidth`, `height`, `italic`, `mapPrerenderedFont`, `rasterizer`, `strikeout`, `underline`, `unmapPrerenderedFont`
-
-### `Timer` — 6 missing
-
-`Timer`, `capacity`, `enabled`, `interval`, `mode`, `onTimer`
+`defaultFaceName`, `doUserSelect`, `getEscHeightX`, `getEscHeightY`, `getEscWidthX`, `getEscWidthY`, `getGlyphDrawRect`, `getList`, `getTextHeight`, `getTextWidth`, `mapPrerenderedFont`, `rasterizer`, `unmapPrerenderedFont`
 
 ### `System` — 10 missing
 
@@ -98,6 +94,26 @@ The checker exits non-zero when a missing member is **not** listed in `scripts/n
 ## Extra members by class
 
 Rust registrations with no reference counterpart; usually intentional engine internals.
+
+### `Layer` — 64 extra
+
+`Bitmap`, `Font`, `Timer`, `Window`, `__bind`, `add`, `angle`, `bold`, `buffer`, `bufferForWrite`, `bufferPitch`, `capacity`, `caption`, `changeScreenMode`, `close`, `color`, `copyFrom`, `count`, `enableTouch`, `faceIsFileName`, `focusedLayer`, `fullScreen`, `getPixel`, `hideMouseCursor`, `hintDelay`, `id`, `independ`, `innerHeight`, `innerWidth`, `interval`, `italic`, `loading`, `mainWindow`, `maxHeight`, `maxWidth`, `minHeight`, `minWidth`, `mode`, `mouseCursorState`, `moveToFront`, `nativeId`, `onLoaded`, `onTimer`, `postInputEvent`, `primaryLayer`, `remove`, `removeMaskRegion`, `setBitmap`, `setImage`, `setInnerSize`, `setMaskRegion`, `setMaxSize`, `setMinSize`, `setParentId`, `setPixel`, `setZoom`, `showModal`, `strikeout`, `trapKey`, `underline`, `useMouseKey`, `waitVSync`, `zoomDenom`, `zoomNumer`
+
+### `Bitmap` — 124 extra
+
+`Font`, `Layer`, `Timer`, `Window`, `__bind`, `absolute`, `absoluteOrderMode`, `add`, `angle`, `assignImages`, `attentionLeft`, `attentionTop`, `bold`, `bringToFront`, `cached`, `callOnPaint`, `capacity`, `caption`, `changeScreenMode`, `children`, `clipHeight`, `clipLeft`, `clipTop`, `clipWidth`, `close`, `color`, `copyFromBitmapToMainImage`, `count`, `cursor`, `enableTouch`, `enabled`, `face`, `faceIsFileName`, `fillRect`, `focus`, `focusable`, `focused`, `focusedLayer`, `font`, `fullScreen`, `getLayerAt`, `getProvincePixel`, `hasImage`, `hideMouseCursor`, `hint`, `hintDelay`, `hitThreshold`, `hitType`, `holdAlpha`, `id`, `ignoreHintSensing`, `imageHeight`, `imageLeft`, `imageModified`, `imageTop`, `imageWidth`, `imeMode`, `independMainImage`, `innerHeight`, `innerWidth`, `interval`, `isPrimary`, `italic`, `joinFocusChain`, `left`, `mainImageBuffer`, `mainImageBufferForWrite`, `mainImageBufferPitch`, `mainWindow`, `maxHeight`, `maxWidth`, `minHeight`, `minWidth`, `mode`, `mouseCursorState`, `moveToFront`, `name`, `nativeId`, `neutralColor`, `nextFocusable`, `nodeEnabled`, `nodeFocusable`, `nodeVisible`, `onTimer`, `opacity`, `order`, `parent`, `postInputEvent`, `prevFocusable`, `primaryLayer`, `provinceImageBuffer`, `provinceImageBufferForWrite`, `provinceImageBufferPitch`, `remove`, `removeMaskRegion`, `setBitmap`, `setClip`, `setImage`, `setImagePos`, `setImageSize`, `setInnerSize`, `setMaskRegion`, `setMaxSize`, `setMinSize`, `setParentId`, `setPos`, `setProvincePixel`, `setSizeToImageSize`, `setZoom`, `showModal`, `showParentHint`, `strikeout`, `top`, `trapKey`, `type`, `underline`, `update`, `useAttention`, `useMouseKey`, `visible`, `waitVSync`, `window`, `zoomDenom`, `zoomNumer`
+
+### `Window` — 96 extra
+
+`Bitmap`, `Font`, `Layer`, `Timer`, `__bind`, `absolute`, `absoluteOrderMode`, `angle`, `assignImages`, `attentionLeft`, `attentionTop`, `bold`, `buffer`, `bufferForWrite`, `bufferPitch`, `cached`, `callOnPaint`, `capacity`, `changeScreenMode`, `children`, `clipHeight`, `clipLeft`, `clipTop`, `clipWidth`, `color`, `copyFrom`, `copyFromBitmapToMainImage`, `count`, `cursor`, `enabled`, `face`, `faceIsFileName`, `fillRect`, `focus`, `focused`, `font`, `getLayerAt`, `getMaskPixel`, `getPixel`, `getProvincePixel`, `hasImage`, `hint`, `hitThreshold`, `hitType`, `holdAlpha`, `id`, `ignoreHintSensing`, `imageHeight`, `imageLeft`, `imageModified`, `imageTop`, `imageWidth`, `independ`, `independMainImage`, `interval`, `isPrimary`, `italic`, `joinFocusChain`, `loading`, `mainImageBuffer`, `mainImageBufferForWrite`, `mainImageBufferPitch`, `mode`, `moveToFront`, `name`, `nativeId`, `neutralColor`, `nextFocusable`, `nodeEnabled`, `nodeFocusable`, `nodeVisible`, `onLoaded`, `onTimer`, `opacity`, `order`, `parent`, `prevFocusable`, `provinceImageBuffer`, `provinceImageBufferForWrite`, `provinceImageBufferPitch`, `setBitmap`, `setClip`, `setImage`, `setImagePos`, `setImageSize`, `setMaskPixel`, `setParentId`, `setPixel`, `setProvincePixel`, `setSizeToImageSize`, `showParentHint`, `strikeout`, `type`, `underline`, `useAttention`, `window`
+
+### `Font` — 130 extra
+
+`Bitmap`, `Layer`, `Timer`, `Window`, `__bind`, `absolute`, `absoluteOrderMode`, `add`, `assignImages`, `attentionLeft`, `attentionTop`, `bringToFront`, `buffer`, `bufferForWrite`, `bufferPitch`, `cached`, `callOnPaint`, `capacity`, `caption`, `changeScreenMode`, `children`, `clipHeight`, `clipLeft`, `clipTop`, `clipWidth`, `close`, `color`, `copyFrom`, `copyFromBitmapToMainImage`, `count`, `cursor`, `enableTouch`, `enabled`, `fillRect`, `focus`, `focusable`, `focused`, `focusedLayer`, `font`, `fullScreen`, `getLayerAt`, `getMaskPixel`, `getPixel`, `getProvincePixel`, `hasImage`, `hideMouseCursor`, `hint`, `hintDelay`, `hitThreshold`, `hitType`, `holdAlpha`, `id`, `ignoreHintSensing`, `imageHeight`, `imageLeft`, `imageModified`, `imageTop`, `imageWidth`, `imeMode`, `independ`, `independMainImage`, `innerHeight`, `innerWidth`, `interval`, `isPrimary`, `joinFocusChain`, `left`, `loading`, `mainImageBuffer`, `mainImageBufferForWrite`, `mainImageBufferPitch`, `mainWindow`, `maxHeight`, `maxWidth`, `minHeight`, `minWidth`, `mode`, `mouseCursorState`, `moveToFront`, `name`, `nativeId`, `neutralColor`, `nextFocusable`, `nodeEnabled`, `nodeFocusable`, `nodeVisible`, `onLoaded`, `onTimer`, `opacity`, `order`, `parent`, `postInputEvent`, `prevFocusable`, `primaryLayer`, `provinceImageBuffer`, `provinceImageBufferForWrite`, `provinceImageBufferPitch`, `remove`, `removeMaskRegion`, `setBitmap`, `setClip`, `setImage`, `setImagePos`, `setImageSize`, `setInnerSize`, `setMaskPixel`, `setMaskRegion`, `setMaxSize`, `setMinSize`, `setParentId`, `setPixel`, `setPos`, `setProvincePixel`, `setSize`, `setSizeToImageSize`, `setZoom`, `showModal`, `showParentHint`, `top`, `trapKey`, `type`, `update`, `useAttention`, `useMouseKey`, `visible`, `waitVSync`, `width`, `window`, `zoomDenom`, `zoomNumer`
+
+### `Timer` — 133 extra
+
+`Bitmap`, `Font`, `Layer`, `Window`, `__bind`, `absolute`, `absoluteOrderMode`, `add`, `angle`, `assignImages`, `attentionLeft`, `attentionTop`, `bold`, `bringToFront`, `buffer`, `bufferForWrite`, `bufferPitch`, `cached`, `callOnPaint`, `caption`, `changeScreenMode`, `children`, `clipHeight`, `clipLeft`, `clipTop`, `clipWidth`, `close`, `color`, `copyFrom`, `copyFromBitmapToMainImage`, `count`, `cursor`, `enableTouch`, `face`, `faceIsFileName`, `fillRect`, `focus`, `focusable`, `focused`, `focusedLayer`, `font`, `fullScreen`, `getLayerAt`, `getMaskPixel`, `getPixel`, `getProvincePixel`, `hasImage`, `height`, `hideMouseCursor`, `hint`, `hintDelay`, `hitThreshold`, `hitType`, `holdAlpha`, `id`, `ignoreHintSensing`, `imageHeight`, `imageLeft`, `imageModified`, `imageTop`, `imageWidth`, `imeMode`, `independ`, `independMainImage`, `innerHeight`, `innerWidth`, `isPrimary`, `italic`, `joinFocusChain`, `left`, `loading`, `mainImageBuffer`, `mainImageBufferForWrite`, `mainImageBufferPitch`, `mainWindow`, `maxHeight`, `maxWidth`, `minHeight`, `minWidth`, `mouseCursorState`, `moveToFront`, `name`, `nativeId`, `neutralColor`, `nextFocusable`, `nodeEnabled`, `nodeFocusable`, `nodeVisible`, `onLoaded`, `opacity`, `order`, `parent`, `postInputEvent`, `prevFocusable`, `primaryLayer`, `provinceImageBuffer`, `provinceImageBufferForWrite`, `provinceImageBufferPitch`, `remove`, `removeMaskRegion`, `setBitmap`, `setClip`, `setImage`, `setImagePos`, `setImageSize`, `setInnerSize`, `setMaskPixel`, `setMaskRegion`, `setMaxSize`, `setMinSize`, `setParentId`, `setPixel`, `setPos`, `setProvincePixel`, `setSize`, `setSizeToImageSize`, `setZoom`, `showModal`, `showParentHint`, `strikeout`, `top`, `trapKey`, `type`, `underline`, `update`, `useAttention`, `useMouseKey`, `visible`, `waitVSync`, `width`, `window`, `zoomDenom`, `zoomNumer`
 
 ### `Plugins` — 1 extra
 

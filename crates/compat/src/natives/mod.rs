@@ -9,12 +9,18 @@
 //! they were written against the pre-layer engine and hid state in process
 //! globals, so they are not copied. Families are added here as they land.
 
+pub mod async_trigger;
 pub mod constants;
 pub mod debug;
+pub mod input;
 pub mod kag;
+pub mod menu_item;
 pub mod scripts;
 pub mod storages;
 pub mod system;
+pub mod trans;
+pub mod video;
+pub mod visual;
 
 use crate::{CompatCtx, CompatError};
 
@@ -26,5 +32,11 @@ pub fn register_all(ctx: &mut CompatCtx) -> Result<(), CompatError> {
     storages::register(ctx)?;
     scripts::register(ctx)?;
     kag::register(ctx)?;
+    visual::register(ctx)?;
+    input::register(ctx)?;
+    trans::register(ctx)?;
+    async_trigger::register(ctx)?;
+    menu_item::register(ctx)?;
+    video::register(ctx)?;
     Ok(())
 }

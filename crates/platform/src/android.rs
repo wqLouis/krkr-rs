@@ -56,3 +56,45 @@ pub fn run<H: EventHandler>(_config: PlatformConfig, _handler: H) -> Result<(), 
         "android event loop".to_owned(),
     ))
 }
+/// Audio output backend (Android stub).
+///
+/// The types exist so [`crate::audio`] compiles identically on every target,
+/// but no stream can be opened until the Android backend lands.
+#[allow(dead_code)]
+pub(crate) mod audio {
+    use api::media::AudioSpec;
+
+    use crate::PlatformError;
+
+    /// Immutable stream-description placeholder.
+    pub(crate) struct Backend;
+
+    /// Stream-state placeholder.
+    pub(crate) struct StreamState;
+
+    /// Always fails: Android audio output is not implemented yet.
+    pub(crate) fn open(_spec: AudioSpec) -> Result<(Backend, StreamState), PlatformError> {
+        Err(PlatformError::NotImplemented(
+            "android audio output".to_owned(),
+        ))
+    }
+
+    /// Always fails: Android audio output is not implemented yet.
+    pub(crate) fn write(
+        _dev: &Backend,
+        _state: &mut StreamState,
+        _pcm: &[f32],
+    ) -> Result<(), PlatformError> {
+        Err(PlatformError::NotImplemented(
+            "android audio output".to_owned(),
+        ))
+    }
+
+    /// No-op in the stub.
+    pub(crate) fn stop(_dev: &Backend, _state: &mut StreamState) {}
+
+    /// Always `false` in the stub.
+    pub(crate) fn is_running(_state: &StreamState) -> bool {
+        false
+    }
+}

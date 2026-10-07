@@ -108,11 +108,16 @@ impl VmHost {
     /// ordered polls (doc 08 §6).
     pub fn tick(&mut self, frame: FrameCtx<'_>) -> Result<(), VmError> {
         let mut ctx = self.compat.ctx()?;
+        // The input state is per-frame: clear it, fold in every raw event,
+        // then commit so held/repeat counters advance exactly once (doc 08 §6).
+        self.adapter.begin_input_frame(&mut ctx);
         for event in frame.events {
+            self.adapter.apply_input_event(&mut ctx, event);
             if let Some(mapped) = self.adapter.map(event) {
                 self.adapter.dispatch(&mut ctx, &mapped)?;
             }
         }
+        self.adapter.end_input_frame(&mut ctx);
         run_frame_body(frame.body, &mut ctx)?;
         Ok(())
     }

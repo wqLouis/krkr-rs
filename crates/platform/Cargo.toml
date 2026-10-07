@@ -11,6 +11,10 @@ raw-window-handle = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
 winit = { workspace = true, optional = true }
+# cpal is the `platform-linux` audio output backend. It is optional so the
+# Android stub (and its tests) never pull in ALSA, and so headless hosts can
+# use the null device instead.
+cpal = { version = "0.16", optional = true }
 
 [dev-dependencies]
 raw-window-handle = { workspace = true }
@@ -21,6 +25,7 @@ raw-window-handle = { workspace = true }
 # binaries depend on this crate with an explicit feature.
 default = []
 # Exactly one platform feature must be active (D13). `platform-linux` compiles
-# the real winit 0.30 backend; `platform-android` is a stub for now.
-platform-linux = ["dep:winit"]
+# the real winit 0.30 backend and the cpal audio backend; `platform-android` is
+# a stub for now.
+platform-linux = ["dep:winit", "dep:cpal"]
 platform-android = []

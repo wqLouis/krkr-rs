@@ -36,6 +36,7 @@ compat = { path = "crates/compat" }
 vm = { path = "crates/vm" }
 # dev-only test helper; consumed through [dev-dependencies] only
 testkit = { path = "crates/testkit" }
+cosmic-text = { version = "0.19", default-features = false, features = ["std"] }
 thiserror = "2"
 log = "0.4"
 ash = "0.38"

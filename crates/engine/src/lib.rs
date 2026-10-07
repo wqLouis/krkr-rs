@@ -21,8 +21,10 @@ pub mod layer_ops;
 pub mod projection;
 pub mod raster;
 pub mod scene;
+pub mod sound;
 pub mod startup;
 pub mod storage;
+pub mod text;
 
 // Archive name normalization is a shared storage-naming rule; the parser
 // itself now lives in L1 `fs::xp3`.

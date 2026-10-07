@@ -137,7 +137,7 @@ impl KagEnv {
             // SAFETY: the host keeps an attached storage alive for the whole
             // VM lifetime (see `CompatServices::attach_storage`).
             let bytes = unsafe { &*ptr }.read(name).map_err(|e| e.to_string())?;
-            decode_script(&bytes)
+            crate::text::decode_text(&bytes, None)
         });
         let label: Option<LabelClosure> = if owner.is_null() {
             None
@@ -174,49 +174,6 @@ fn make_env(engine: *mut c_void, owner: *mut c_void) -> Result<KagEnv, String> {
     let host = resolve_host(engine)?;
     let storage = resolve_storage(engine)?;
     Ok(KagEnv::new(host, storage, owner))
-}
-
-/// Decode scenario bytes the way the reference text stream does: honor a
-/// UTF-8/UTF-16 BOM, else UTF-8. CP932 lives outside this layer on the new
-/// stack, so a non-UTF-8 file is decoded lossily and logged (D11 keeps the
-/// failure visible).
-fn decode_script(bytes: &[u8]) -> Result<String, String> {
-    if let Some(rest) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
-        return String::from_utf8(rest.to_vec()).map_err(|e| e.to_string());
-    }
-    if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
-        return decode_utf16(rest, true);
-    }
-    if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
-        return decode_utf16(rest, false);
-    }
-    match std::str::from_utf8(bytes) {
-        Ok(text) => Ok(text.to_string()),
-        Err(_) => {
-            log::warn!(
-                "KAGParser: scenario is not valid UTF-8 (CP932 decoding is not available in \
-                 this layer); decoding lossily"
-            );
-            Ok(String::from_utf8_lossy(bytes).into_owned())
-        }
-    }
-}
-
-fn decode_utf16(bytes: &[u8], little_endian: bool) -> Result<String, String> {
-    if !bytes.len().is_multiple_of(2) {
-        return Err("KAGParser: odd-length UTF-16 scenario".to_string());
-    }
-    let units: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|pair| {
-            if little_endian {
-                u16::from_le_bytes([pair[0], pair[1]])
-            } else {
-                u16::from_be_bytes([pair[0], pair[1]])
-            }
-        })
-        .collect();
-    String::from_utf16(&units).map_err(|e| e.to_string())
 }
 
 // ---------------------------------------------------------------------------

@@ -9,8 +9,10 @@ license.workspace = true
 api = { workspace = true }
 fs = { workspace = true }
 render = { workspace = true }
+cosmic-text = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
 
 [dev-dependencies]
 testkit = { workspace = true }
+raw-window-handle = { workspace = true }

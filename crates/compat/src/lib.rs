@@ -42,11 +42,15 @@ mod natives;
 mod null_plugin;
 mod plugin;
 mod plugins_native;
+mod text;
 
 pub use ctx::{CompatCtx, CompatServices};
 pub use event::{EventAdapter, EventValue, TjsEvent};
 pub use frame::{FrameBody, run_frame_body};
 pub use host::CompatHost;
+// The built-in `Timer` poll: an L4 [`FrameBody`] forwards its `timer_poll`
+// step here (the visual natives' registry lives in this crate).
+pub use natives::visual::timer_poll;
 pub use plugin::{NativePlugin, PluginOutcome, PluginRegistry, normalize_plugin_name, plugin_stem};
 
 /// Errors from the compatibility surface.
