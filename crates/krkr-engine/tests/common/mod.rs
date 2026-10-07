@@ -10,8 +10,6 @@ use krkr_api::fs::{FsPath, OpenMode};
 use krkr_engine::Storage;
 use krkr_fs::FileSystem;
 
-pub mod xp3_builder;
-
 /// Creates an in-memory file-system root with the given files.
 pub fn memory_with(files: &[(&str, &[u8])]) -> FileSystem {
     let fs = FileSystem::memory();

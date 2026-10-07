@@ -27,6 +27,8 @@ members = [
     "crates/krkr-compat",
     "crates/krkr-vm",
     "crates/krkr-app",
+    # dev-only shared test helper (not part of the runtime architecture)
+    "crates/krkr-testkit",
 ]
 default-members = ["crates/krkr-app"]
 
@@ -46,6 +48,8 @@ krkr-engine = { path = "crates/krkr-engine" }
 krkr-platform = { path = "crates/krkr-platform" }
 krkr-compat = { path = "crates/krkr-compat" }
 krkr-vm = { path = "crates/krkr-vm" }
+# dev-only test helper; consumed through [dev-dependencies] only
+krkr-testkit = { path = "crates/krkr-testkit" }
 thiserror = "2"
 log = "0.4"
 ash = "0.38"

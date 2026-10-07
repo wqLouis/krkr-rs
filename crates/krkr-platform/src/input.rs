@@ -9,6 +9,7 @@ use krkr_api::host::TouchPhase;
 
 /// A mouse button, independent of the platform event type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum MouseButton {
     /// The primary (usually left) button.
     Left,
@@ -26,16 +27,20 @@ pub enum MouseButton {
 
 /// A single raw input event.
 ///
-/// Coordinates are in logical window coordinates. The `code` carried by
-/// [`InputEvent::Key`] is an opaque, stable-within-a-build platform physical
-/// key identifier; L3 owns the mapping to TJS key codes.
+/// All coordinates are in **physical window pixels** — the same space as
+/// [`crate::PlatformEvent::Resized`] and `PlatformWindow::size` — so a higher
+/// layer can hit-test without knowing the display scale factor. Use
+/// `PlatformWindow::scale_factor` if a logical position is needed. The `code`
+/// carried by [`InputEvent::Key`] is an opaque, stable-within-a-build platform
+/// physical key identifier; L3 owns the mapping to TJS key codes.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum InputEvent {
     /// The pointer moved to the given position.
     PointerMoved {
-        /// Horizontal logical coordinate.
+        /// Horizontal physical coordinate.
         x: f32,
-        /// Vertical logical coordinate.
+        /// Vertical physical coordinate.
         y: f32,
     },
     /// The pointer left the window.
@@ -49,7 +54,7 @@ pub enum InputEvent {
     },
     /// A vertical wheel scroll.
     Wheel {
-        /// Lines (or pixels) scrolled; positive is down.
+        /// Physical pixels (or lines) scrolled; positive is down.
         delta: f32,
     },
     /// A physical key changed state.
@@ -67,9 +72,9 @@ pub enum InputEvent {
         id: u64,
         /// Current phase of the contact.
         phase: TouchPhase,
-        /// Horizontal logical coordinate.
+        /// Horizontal physical coordinate.
         x: f32,
-        /// Vertical logical coordinate.
+        /// Vertical physical coordinate.
         y: f32,
     },
 }

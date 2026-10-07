@@ -12,8 +12,14 @@ thiserror = { workspace = true }
 log = { workspace = true }
 winit = { workspace = true, optional = true }
 
+[dev-dependencies]
+raw-window-handle = { workspace = true }
+
 [features]
-default = ["platform-linux"]
+# No default platform: each consumer (or CI job) must select exactly one, so a
+# platform can never be silently compiled for the wrong target (D13). The
+# binaries depend on this crate with an explicit feature.
+default = []
 # Exactly one platform feature must be active (D13). `platform-linux` compiles
 # the real winit 0.30 backend; `platform-android` is a stub for now.
 platform-linux = ["dep:winit"]

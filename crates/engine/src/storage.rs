@@ -499,17 +499,17 @@ mod tests {
             segm.extend_from_slice(&(data.len() as i64).to_le_bytes());
             segm.extend_from_slice(&(data.len() as i64).to_le_bytes());
 
-            let mut aldr = Vec::new();
-            aldr.extend_from_slice(b"aldr");
-            aldr.extend_from_slice(&4u64.to_le_bytes());
-            aldr.extend_from_slice(&0u32.to_le_bytes());
+            let mut adlr = Vec::new();
+            adlr.extend_from_slice(b"adlr");
+            adlr.extend_from_slice(&4u64.to_le_bytes());
+            adlr.extend_from_slice(&0u32.to_le_bytes());
 
             let mut fc = Vec::new();
             fc.extend_from_slice(b"File");
-            fc.extend_from_slice(&((info.len() + segm.len() + aldr.len()) as u64).to_le_bytes());
+            fc.extend_from_slice(&((info.len() + segm.len() + adlr.len()) as u64).to_le_bytes());
             fc.extend_from_slice(&info);
             fc.extend_from_slice(&segm);
-            fc.extend_from_slice(&aldr);
+            fc.extend_from_slice(&adlr);
             file_chunks.push(fc);
         }
 

@@ -43,7 +43,7 @@ mod plugin;
 mod plugins_native;
 
 pub use ctx::{CompatCtx, CompatServices};
-pub use event::{EventAdapter, EventValue, PlatformEvent, TjsEvent};
+pub use event::{EventAdapter, EventValue, TjsEvent};
 pub use frame::{FrameBody, run_frame_body};
 pub use host::CompatHost;
 pub use plugin::{NativePlugin, PluginOutcome, PluginRegistry, normalize_plugin_name, plugin_stem};
@@ -54,12 +54,9 @@ pub enum CompatError {
     /// A native class could not be registered.
     #[error("native registration: {0}")]
     Register(String),
-    /// An engine (L2) operation failed.
+    /// An engine (L2) operation failed, or the host is not installed yet.
     #[error("engine: {0}")]
     Engine(String),
-    /// The compatibility surface is not implemented yet.
-    #[error("unsupported: {0}")]
-    Unsupported(String),
 }
 
 /// Register the built-in compatibility surface on the VM: the `Plugins`

@@ -3,9 +3,9 @@
 use krkr_app::{Host, HostConfig};
 use krkr_engine::scene::{LT_ALPHA, LT_OPAQUE, Rect, Scene};
 
-/// Creates a headless [`Host`] using the default configuration.
+/// Creates a headless [`Host`] using the explicit headless configuration.
 pub fn headless_host() -> Host {
-    Host::new(HostConfig::default()).expect("headless host")
+    Host::new(HostConfig::headless()).expect("headless host")
 }
 
 /// Populates `scene` with a minimal two-layer scene: an opaque solid fill

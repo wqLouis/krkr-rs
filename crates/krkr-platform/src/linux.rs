@@ -32,26 +32,45 @@ pub struct PlatformWindow {
 }
 
 impl PlatformWindow {
-    /// Returns the raw window handle, if the backend has one yet.
-    pub fn raw_window_handle(&self) -> Option<RawWindowHandle> {
+    /// Returns the raw window handle the render backend binds to.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlatformError::Handle`] if the backend does not currently
+    /// expose a handle. Callers must propagate this (D11) rather than
+    /// substituting a synthetic handle.
+    pub fn raw_window_handle(&self) -> Result<RawWindowHandle, PlatformError> {
         self.window
             .window_handle()
-            .ok()
             .map(|handle| handle.as_raw())
+            .map_err(|error| PlatformError::Handle(error.to_string()))
     }
 
-    /// Returns the raw display handle (Wayland/X11/XCB connection), if any.
-    pub fn raw_display_handle(&self) -> Option<RawDisplayHandle> {
+    /// Returns the raw display handle (Wayland/X11/XCB connection).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlatformError::Handle`] if the backend does not currently
+    /// expose a display handle. A Vulkan surface needs it, so this is fatal.
+    pub fn raw_display_handle(&self) -> Result<RawDisplayHandle, PlatformError> {
         self.window
             .display_handle()
-            .ok()
             .map(|handle| handle.as_raw())
+            .map_err(|error| PlatformError::Handle(error.to_string()))
     }
 
     /// Returns the surface size in physical pixels (at least 1×1).
     pub fn size(&self) -> (u32, u32) {
         let size = self.window.inner_size();
         (size.width.max(1), size.height.max(1))
+    }
+
+    /// Returns the current display scale factor (DPI scale).
+    ///
+    /// Input coordinates and sizes are physical, so this is only needed by a
+    /// higher layer that wants to convert to logical units itself.
+    pub fn scale_factor(&self) -> f64 {
+        self.window.scale_factor()
     }
 
     /// Requests that the window redraw its contents.
@@ -82,6 +101,14 @@ pub fn run<H: EventHandler>(config: PlatformConfig, handler: H) -> Result<(), Pl
 }
 
 /// The winit `ApplicationHandler` that drives the higher-layer `EventHandler`.
+///
+/// # Field order (teardown)
+///
+/// `handler` is declared **before** `window`: Rust drops fields in declaration
+/// order, so the higher layer (which owns the GPU surface/swapchain) is
+/// dropped while the window's display connection is still alive. Reordering
+/// these two fields would tear down the display connection first and is a
+/// use-after-free risk for a Vulkan surface — keep `handler` above `window`.
 struct AppLoop<H: EventHandler> {
     config: PlatformConfig,
     handler: H,
@@ -115,29 +142,32 @@ impl<H: EventHandler> AppLoop<H> {
 
 impl<H: EventHandler> ApplicationHandler for AppLoop<H> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_some() {
-            return;
+        // On a re-resume (Android suspend/resume, desktop backends that emit
+        // it again) the window already exists, but the handler must still be
+        // notified so a higher layer can recreate its surface. Only the
+        // window creation itself is guarded.
+        if self.window.is_none() {
+            let attributes = Window::default_attributes()
+                .with_title(self.config.title.as_str())
+                .with_inner_size(LogicalSize::new(
+                    f64::from(self.config.size.0),
+                    f64::from(self.config.size.1),
+                ));
+            let window = match event_loop.create_window(attributes) {
+                Ok(window) => window,
+                Err(error) => {
+                    self.fail(event_loop, PlatformError::Window(error.to_string()));
+                    return;
+                }
+            };
+
+            let now = Instant::now();
+            self.last_frame = now;
+            self.ticker = Ticker::new(self.config.frame_interval, now);
+            self.window = Some(PlatformWindow { window });
         }
-        let attributes = Window::default_attributes()
-            .with_title(self.config.title.as_str())
-            .with_inner_size(LogicalSize::new(
-                f64::from(self.config.size.0),
-                f64::from(self.config.size.1),
-            ));
-        let window = match event_loop.create_window(attributes) {
-            Ok(window) => window,
-            Err(error) => {
-                self.fail(event_loop, PlatformError::Window(error.to_string()));
-                return;
-            }
-        };
 
-        let now = Instant::now();
-        self.last_frame = now;
-        self.ticker = Ticker::new(self.config.frame_interval, now);
-        self.window = Some(PlatformWindow { window });
-
-        let window = self.window.as_ref().expect("window just created");
+        let window = self.window.as_ref().expect("window exists after creation");
         if self.handler.resumed(window) == Flow::Exit {
             event_loop.exit();
         }
@@ -151,6 +181,8 @@ impl<H: EventHandler> ApplicationHandler for AppLoop<H> {
     ) {
         let flow = match event {
             WindowEvent::CloseRequested => {
+                // A close request is authoritative: the loop always stops, so
+                // a higher layer can only observe it, not veto it.
                 let _ = self.handler.event(PlatformEvent::CloseRequested);
                 event_loop.exit();
                 return;
@@ -169,7 +201,7 @@ impl<H: EventHandler> ApplicationHandler for AppLoop<H> {
                 self.last_frame = now;
                 self.handler.frame(dt_ms)
             }
-            other => match map_input(&other) {
+            other => match map_input(other) {
                 Some(input) => self.handler.event(PlatformEvent::Input(input)),
                 None => Flow::Continue,
             },
@@ -194,11 +226,13 @@ impl<H: EventHandler> ApplicationHandler for AppLoop<H> {
     }
 }
 
-/// Translates a winit window event into a raw [`InputEvent`].
+/// Translates an owned winit window event into a raw [`InputEvent`].
 ///
-/// Returns `None` for events that carry no raw input (resize, redraw, …),
-/// which are handled as [`PlatformEvent`]s instead.
-fn map_input(event: &WindowEvent) -> Option<InputEvent> {
+/// Taking the event by value avoids cloning the IME payload. Returns `None`
+/// for events that carry no raw input (resize, redraw, …), which are handled
+/// as [`PlatformEvent`]s instead. Coordinates are copied verbatim as physical
+/// pixels (see [`crate::input`]).
+fn map_input(event: WindowEvent) -> Option<InputEvent> {
     match event {
         WindowEvent::CursorMoved { position, .. } => Some(InputEvent::PointerMoved {
             x: position.x as f32,
@@ -206,12 +240,12 @@ fn map_input(event: &WindowEvent) -> Option<InputEvent> {
         }),
         WindowEvent::CursorLeft { .. } => Some(InputEvent::PointerLeft),
         WindowEvent::MouseInput { state, button, .. } => Some(InputEvent::MouseButton {
-            button: map_button(*button),
-            pressed: *state == ElementState::Pressed,
+            button: map_button(button),
+            pressed: state == ElementState::Pressed,
         }),
         WindowEvent::MouseWheel { delta, .. } => Some(InputEvent::Wheel {
             delta: match delta {
-                MouseScrollDelta::LineDelta(_, y) => *y,
+                MouseScrollDelta::LineDelta(_, y) => y,
                 MouseScrollDelta::PixelDelta(position) => position.y as f32,
             },
         }),
@@ -219,7 +253,7 @@ fn map_input(event: &WindowEvent) -> Option<InputEvent> {
             code: key_code(event.physical_key),
             pressed: event.state == ElementState::Pressed,
         }),
-        WindowEvent::Ime(Ime::Commit(text)) => Some(InputEvent::Text(text.clone())),
+        WindowEvent::Ime(Ime::Commit(text)) => Some(InputEvent::Text(text)),
         WindowEvent::Touch(touch) => Some(InputEvent::Touch {
             id: touch.id,
             phase: map_touch_phase(touch.phase),
@@ -255,8 +289,12 @@ fn map_touch_phase(phase: WinitTouchPhase) -> krkr_api::host::TouchPhase {
 /// Returns the opaque platform key identifier for a physical key.
 ///
 /// Known keys use the winit `KeyCode` discriminant; unidentified keys use the
-/// native code. The value is only meaningful inside the running process;
-/// mapping it to a TJS key code is L3's job.
+/// native code with [`NATIVE_KEY_FLAG`] set, so the two ranges cannot collide.
+///
+/// The value is only meaningful inside the running process and within a build
+/// of winit (the `KeyCode` discriminants are not a stable ABI). Mapping it to
+/// a TJS key code is L3's job; if L3 needs a cross-build-stable id, an explicit
+/// L1 key enum should replace this cast.
 fn key_code(physical: PhysicalKey) -> u32 {
     match physical {
         PhysicalKey::Code(code) => code as u32,
@@ -264,9 +302,15 @@ fn key_code(physical: PhysicalKey) -> u32 {
     }
 }
 
+/// High bit marking native (platform-specific) key codes.
+///
+/// Keeps them disjoint from the winit `KeyCode` discriminants returned by
+/// [`key_code`] for known keys.
+const NATIVE_KEY_FLAG: u32 = 0x8000_0000;
+
 /// Converts a native key code to the opaque identifier.
 fn native_key_code(native: NativeKeyCode) -> u32 {
-    match native {
+    let raw = match native {
         NativeKeyCode::Android(code) => code,
         NativeKeyCode::MacOS(code) => u32::from(code),
         NativeKeyCode::Windows(code) => u32::from(code),
@@ -275,5 +319,6 @@ fn native_key_code(native: NativeKeyCode) -> u32 {
             log::debug!("platform: unrecognized native key code");
             u32::MAX
         }
-    }
+    };
+    raw | NATIVE_KEY_FLAG
 }

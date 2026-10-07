@@ -1,7 +1,10 @@
 //! Integration tests for the platform event value types.
 
+use std::time::Duration;
+
 use krkr_api::host::TouchPhase;
 use krkr_platform::{InputEvent, MouseButton, PlatformEvent};
+use raw_window_handle::RawWindowHandle;
 
 #[test]
 fn platform_events_are_comparable_values() {
@@ -10,6 +13,19 @@ fn platform_events_are_comparable_values() {
         PlatformEvent::Resized(640, 360)
     );
     assert_ne!(PlatformEvent::CloseRequested, PlatformEvent::Focused(true));
+}
+
+#[test]
+fn headless_handle_is_an_explicit_synthetic_canvas() {
+    let handle = krkr_platform::headless_window_handle();
+    assert!(matches!(handle, RawWindowHandle::Web(_)));
+}
+
+#[test]
+fn platform_config_default_has_a_sane_frame_interval() {
+    let config = krkr_platform::PlatformConfig::default();
+    assert_eq!(config.size, (1280, 720));
+    assert!(config.frame_interval > Duration::ZERO);
 }
 
 #[test]

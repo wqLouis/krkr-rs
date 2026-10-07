@@ -43,7 +43,7 @@ pub struct Entry {
     pub name: String,
     /// Segments composing the file, in order.
     pub segments: Vec<Segment>,
-    /// Adler32 hash of the name from the `aldr` chunk.
+    /// Adler32 hash of the name from the `adlr` chunk.
     pub file_hash: u32,
 }
 
@@ -231,7 +231,7 @@ impl Xp3Archive {
         Ok(())
     }
 
-    /// Parse one `File` chunk: `info` / `segm` / `aldr` sub-chunks.
+    /// Parse one `File` chunk: `info` / `segm` / `adlr` sub-chunks.
     fn parse_file_chunk(&mut self, data: &[u8]) -> Result<()> {
         let mut pos = 0usize;
         let mut flags = 0u32;
@@ -286,7 +286,7 @@ impl Xp3Archive {
                         });
                     }
                 }
-                b"aldr" => {
+                b"adlr" => {
                     // SAFETY: length checked by the match guard below.
                     if let Some(h) = payload.get(0..4) {
                         file_hash = u32::from_le_bytes(h.try_into().unwrap());

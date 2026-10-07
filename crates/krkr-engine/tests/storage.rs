@@ -1,15 +1,15 @@
 //! Integration tests for the game storage namespace (`Storage`).
 //!
 //! Relocated from the inline `#[cfg(test)]` module in `src/storage.rs`. The
-//! synthetic XP3 builder now lives in `tests/common/xp3_builder.rs`; the
+//! synthetic XP3 builder lives in the `krkr-testkit` dev crate; the
 //! in-memory file-system helpers live in `tests/common/mod.rs`.
 
 use std::path::PathBuf;
 
 use krkr_engine::{ATTR_DIRECTORY, ATTR_NORMAL, Location, normalize_in_archive_name};
+use krkr_testkit::build_xp3;
 
 mod common;
-use common::xp3_builder::build_xp3;
 use common::{mount_memory, mount_memory_with_archives};
 
 #[test]
@@ -34,7 +34,7 @@ fn disk_wins_over_archive() {
     );
 
     assert_eq!(
-        storage.find("data/winner.txt"),
+        storage.find("data/winner.txt").unwrap(),
         Some(Location::Disk(PathBuf::from("/data/winner.txt")))
     );
     assert_eq!(storage.read("data/winner.txt").unwrap(), b"from disk");
@@ -49,7 +49,7 @@ fn archive_is_used_when_no_disk_file() {
     let storage = mount_memory_with_archives(&[("data.xp3", &xp3)], &["data.xp3"]);
 
     assert_eq!(
-        storage.find("data/inside.txt"),
+        storage.find("data/inside.txt").unwrap(),
         Some(Location::Archive(
             PathBuf::from("/data.xp3"),
             "data/inside.txt".into()
@@ -59,8 +59,8 @@ fn archive_is_used_when_no_disk_file() {
         storage.read("data/inside.txt").unwrap(),
         b"hello from archive"
     );
-    assert!(storage.exists("data/inside.txt"));
-    assert_eq!(storage.stat("data/inside.txt").unwrap().size, 18);
+    assert!(storage.exists("data/inside.txt").unwrap());
+    assert_eq!(storage.stat("data/inside.txt").unwrap().unwrap().size, 18);
 }
 
 #[test]
@@ -78,7 +78,7 @@ fn arc_xp3_path_targets_one_archive() {
         b"from b".to_vec()
     );
     // A specific archive miss does not fall through to the other archive.
-    assert!(!storage.exists("a.xp3>missing.txt"));
+    assert!(!storage.exists("a.xp3>missing.txt").unwrap());
 }
 
 #[test]
@@ -86,7 +86,7 @@ fn mixed_case_disk_name_resolves() {
     let storage = mount_memory(&[("savedata/savemng.dat", b"save data")]);
     for name in ["savedata/saveMng.dat", "SAVEDATA/SAVEMNG.DAT"] {
         assert!(
-            storage.find(name).is_some(),
+            storage.find(name).unwrap().is_some(),
             "{name} must resolve case-insensitively"
         );
         assert_eq!(storage.read(name).unwrap(), b"save data");
@@ -96,9 +96,9 @@ fn mixed_case_disk_name_resolves() {
 #[test]
 fn traversal_does_not_resolve() {
     let storage = mount_memory(&[("escape.dat", b"in")]);
-    assert!(storage.find("../escape.dat").is_none());
-    assert!(storage.find("savedata/../../escape.dat").is_none());
-    assert!(!storage.exists("/outside.dat"));
+    assert!(storage.find("../escape.dat").unwrap().is_none());
+    assert!(storage.find("savedata/../../escape.dat").unwrap().is_none());
+    assert!(!storage.exists("/outside.dat").unwrap());
 }
 
 #[test]
@@ -130,11 +130,11 @@ fn mount_and_unmount_archive() {
     let a = build_xp3(&[("only/a.txt", b"a", false)]);
     let mut storage = mount_memory_with_archives(&[("a.xp3", &a)], &["a.xp3"]);
     assert_eq!(storage.archive_count(), 1);
-    assert!(storage.exists("only/a.txt"));
+    assert!(storage.exists("only/a.txt").unwrap());
 
     assert!(storage.unmount_archive("a.xp3"));
     assert_eq!(storage.archive_count(), 0);
-    assert!(!storage.exists("only/a.txt"));
+    assert!(!storage.exists("only/a.txt").unwrap());
 }
 
 #[test]
@@ -172,7 +172,7 @@ fn get_file_list_wildcards_and_attrs() {
         &["data.xp3"],
     );
 
-    let mut tjs = storage.get_file_list("scripts/*.tjs", ATTR_NORMAL);
+    let mut tjs = storage.get_file_list("scripts/*.tjs", ATTR_NORMAL).unwrap();
     tjs.sort();
     assert_eq!(
         tjs,
@@ -183,10 +183,10 @@ fn get_file_list_wildcards_and_attrs() {
         ]
     );
 
-    let dirs = storage.get_file_list("scripts/", ATTR_DIRECTORY);
+    let dirs = storage.get_file_list("scripts/", ATTR_DIRECTORY).unwrap();
     assert!(dirs.contains(&"scripts/sub/".to_string()), "{dirs:?}");
 
-    let arc_entries = storage.get_file_list("*.xp3>scripts/*.tjs", 0);
+    let arc_entries = storage.get_file_list("*.xp3>scripts/*.tjs", 0).unwrap();
     assert!(
         arc_entries.contains(&"data.xp3>scripts/arc.tjs".to_string()),
         "{arc_entries:?}"
@@ -200,7 +200,7 @@ fn auto_path_resolves_base_name() {
     storage.add_auto_path("data.xp3>");
 
     assert_eq!(
-        storage.find("config.tjs"),
+        storage.find("config.tjs").unwrap(),
         Some(Location::Archive(
             PathBuf::from("/data.xp3"),
             "config.tjs".into()
@@ -235,7 +235,7 @@ fn later_mounted_archive_wins() {
     let storage = mount_memory_with_archives(&files, &["data.xp3", "patch.xp3"]);
     assert_eq!(storage.read("shared.txt").unwrap(), b"from patch");
     assert_eq!(
-        storage.find("shared.txt"),
+        storage.find("shared.txt").unwrap(),
         Some(Location::Archive(
             PathBuf::from("/patch.xp3"),
             "shared.txt".into()
@@ -254,5 +254,40 @@ fn mounting_does_not_scan_for_archives() {
     let storage = mount_memory(&[("data.xp3", &xp3)]);
 
     assert_eq!(storage.archive_count(), 0);
-    assert!(!storage.exists("inside.txt"));
+    assert!(!storage.exists("inside.txt").unwrap());
+}
+
+/// `find` is file-only, but `exists` reports directories as existing, matching
+/// `TVPIsExistentStorage` (review 1.10).
+#[test]
+fn directories_exist_but_do_not_find() {
+    let storage = mount_memory(&[("savedata/keep.dat", b"x")]);
+
+    assert_eq!(storage.find("savedata").unwrap(), None);
+    assert!(storage.exists("savedata").unwrap());
+    assert!(storage.exists("SAVEDATA").unwrap());
+    assert!(!storage.exists("missing-dir").unwrap());
+}
+
+/// Unmounting by a bare name must not remove every archive that shares it, and
+/// an exact path removes exactly one archive (review 1.6).
+#[test]
+fn unmount_archive_does_not_remove_same_named_archives() {
+    let a = build_xp3(&[("a.bin", b"a", false)]);
+    let b = build_xp3(&[("b.bin", b"b", false)]);
+    let mut storage = mount_memory_with_archives(
+        &[("one/data.xp3", &a), ("two/data.xp3", &b)],
+        &["one/data.xp3", "two/data.xp3"],
+    );
+    assert_eq!(storage.archive_count(), 2);
+
+    // Ambiguous bare base name: nothing is removed.
+    assert!(!storage.unmount_archive("data.xp3"));
+    assert_eq!(storage.archive_count(), 2);
+
+    // Exact path removes only that archive.
+    assert!(storage.unmount_archive("two/data.xp3"));
+    assert_eq!(storage.archive_count(), 1);
+    assert!(storage.exists("a.bin").unwrap());
+    assert!(!storage.exists("b.bin").unwrap());
 }

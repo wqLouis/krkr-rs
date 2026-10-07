@@ -15,12 +15,12 @@
 //!   Flag bits: low 3 = encode method (`0` raw, `1` zlib), `0x80` =
 //!   continue (chain to another index block).
 //! * Index data is a sequence of chunks `[4-byte tag][u32 LE size][data]`:
-//!   - `File` chunks hold per-entry `info` / `segm` / `aldr` sub-chunks
+//!   - `File` chunks hold per-entry `info` / `segm` / `adlr` sub-chunks
 //!   - `info`: `u32 flags`, `i64 org_size`, `i64 arc_size`,
 //!     `i16 name_len` (UTF-16 code units), name (UTF-16LE)
 //!   - `segm`: 28-byte segments: `u32 flags`, `i64 start` (absolute in
 //!     archive), `i64 org_size`, `i64 arc_size`
-//!   - `aldr`: `u32` name hash (adler32 of the normalized name)
+//!   - `adlr`: `u32` name hash (adler32 of the normalized name)
 //! * In-archive names are normalized: lowercased, `\` → `/`, duplicate
 //!   slashes collapsed. Entries are stably sorted by normalized name.
 //! * Reading a file concatenates its segments; zlib-flagged segments are

@@ -6,9 +6,9 @@
 //! (app path) → `system/Initialize.tjs` fallback.
 
 use krkr_engine::{Location, StartupError, StartupScript, discover_startup};
+use krkr_testkit::build_xp3;
 
 mod common;
-use common::xp3_builder::build_xp3;
 use common::{mount_memory, mount_memory_with_archives};
 
 #[test]

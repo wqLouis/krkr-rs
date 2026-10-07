@@ -37,6 +37,11 @@ impl FrameBody for Recorder {
         self.order.push("continuous");
         Ok(())
     }
+
+    fn project_and_render(&mut self, _ctx: &mut CompatCtx) -> Result<(), CompatError> {
+        self.order.push("present");
+        Ok(())
+    }
 }
 
 #[test]
@@ -61,6 +66,6 @@ fn exec_eval_and_tick() {
 
     assert_eq!(
         recorder.order,
-        ["timer", "sound", "video", "async", "continuous"]
+        ["timer", "sound", "video", "async", "continuous", "present"]
     );
 }

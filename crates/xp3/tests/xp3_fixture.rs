@@ -83,7 +83,7 @@ impl Builder {
         let parts = vec![
             info_chunk(flags, org_size, arc_size, name),
             segm_chunk(&segments),
-            aldr_chunk(hash),
+            adlr_chunk(hash),
         ];
         self.file_chunks.push(file_chunk(&parts));
     }
@@ -182,10 +182,10 @@ fn segm_chunk(segments: &[Seg]) -> Vec<u8> {
     chunk
 }
 
-/// `aldr` sub-chunk: u32 hash.
-fn aldr_chunk(hash: u32) -> Vec<u8> {
+/// `adlr` sub-chunk: u32 hash.
+fn adlr_chunk(hash: u32) -> Vec<u8> {
     let mut chunk = Vec::new();
-    chunk.extend_from_slice(b"aldr");
+    chunk.extend_from_slice(b"adlr");
     chunk.extend_from_slice(&4u64.to_le_bytes());
     chunk.extend_from_slice(&hash.to_le_bytes());
     chunk

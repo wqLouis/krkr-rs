@@ -150,10 +150,7 @@ fn main() -> ExitCode {
 
 /// Runs an empty scene offscreen and prints the final frame stats.
 fn run_headless(cli: &Cli) -> Result<(), String> {
-    let config = HostConfig {
-        backend: cli.backend,
-        ..HostConfig::default()
-    };
+    let config = HostConfig::headless().with_backend(cli.backend);
     let mut host = Host::new(config).map_err(|error| error.to_string())?;
 
     println!(
@@ -178,20 +175,18 @@ fn run_headless(cli: &Cli) -> Result<(), String> {
 
 /// Opens a window through the L1 platform and drives [`Host::step`].
 fn run_windowed(cli: &Cli) -> Result<(), String> {
-    let config = PlatformConfig {
-        title: "krkr-rs".to_owned(),
-        size: DEFAULT_SIZE,
-        ..PlatformConfig::default()
-    };
+    let mut config = PlatformConfig::default();
+    config.title = "krkr-rs".to_owned();
+    config.size = DEFAULT_SIZE;
     krkr_platform::run(config, DesktopApp::new(cli.backend)).map_err(|error| error.to_string())
 }
 
 /// The composition root's bridge from L1 platform events to the L2 host.
 ///
-/// Field order matters for teardown: the Vulkan swapchain/surface must be
-/// destroyed while the window's display connection is still alive. The
-/// platform owns the window and drops it after the handler (and therefore
-/// `host`) is dropped, so `host` is declared here without owning the window.
+/// The platform owns the window and drops the handler before the window (see
+/// `krkr_platform`'s loop), so the Vulkan surface owned by the host is
+/// destroyed while the display connection is still alive. The field order of
+/// this struct is therefore irrelevant to teardown.
 struct DesktopApp {
     /// Backend requested on the command line.
     backend: BackendKind,
@@ -211,13 +206,28 @@ impl DesktopApp {
 
 impl EventHandler for DesktopApp {
     fn resumed(&mut self, window: &PlatformWindow) -> Flow {
-        let config = HostConfig {
-            backend: self.backend,
-            surface_size: DEFAULT_SIZE,
-            window_handle: window.raw_window_handle(),
-            display_handle: window.raw_display_handle(),
-            ..HostConfig::default()
+        // D11: a missing handle is fatal, never replaced by a synthetic one.
+        let window_handle = match window.raw_window_handle() {
+            Ok(handle) => handle,
+            Err(error) => {
+                eprintln!("krkr: cannot obtain the window handle: {error}");
+                return Flow::Exit;
+            }
         };
+        let display_handle = match window.raw_display_handle() {
+            Ok(handle) => handle,
+            Err(error) => {
+                eprintln!("krkr: cannot obtain the display handle: {error}");
+                return Flow::Exit;
+            }
+        };
+        let mut config = HostConfig::default();
+        config.backend = self.backend;
+        // Create the host at the window's real physical size rather than at
+        // the requested logical default, so the initial swapchain matches.
+        config.surface_size = window.size();
+        config.window_handle = Some(window_handle);
+        config.display_handle = Some(display_handle);
         match Host::new(config) {
             Ok(host) => {
                 self.host = Some(host);
@@ -241,6 +251,11 @@ impl EventHandler for DesktopApp {
                 }
                 Flow::Continue
             }
+            // winit follows a scale-factor change with a `Resized` carrying
+            // the new physical size, which is the event that resizes the
+            // surface; the DPI value itself needs no host action because input
+            // and sizes are physical.
+            PlatformEvent::ScaleFactorChanged(_scale) => Flow::Continue,
             _ => Flow::Continue,
         }
     }

@@ -1268,6 +1268,32 @@ name), and none was available"
         })
     }
 
+    /// Duplicate an existing retained id into a fresh id, leaving the
+    /// original live (C++ `tjs2_retain_retained_id`).
+    ///
+    /// Used to hand a cached object to a consuming call (e.g. the null
+    /// plugin's default-member write) without invalidating the cache. The
+    /// returned [`DetachedValue`] releases the duplicate when dropped; if the
+    /// consuming call already consumed it, that release is a safe no-op.
+    ///
+    /// `id` must be a live retained id owned by a caller-held handle.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn duplicate_retained(&self, id: Tjs2ValueId) -> Result<DetachedValue, String> {
+        if id.is_null() {
+            return Err("cannot duplicate a null retained id".into());
+        }
+        // SAFETY: self.inner is a live engine and `id` is a live retained id
+        // (the caller's handle keeps it alive for the call).
+        let duplicate = unsafe { tjs2_retain_retained_id(self.inner, id) };
+        if duplicate.is_null() {
+            return Err("failed to duplicate retained id".into());
+        }
+        Ok(DetachedValue {
+            engine: self.inner,
+            id: duplicate,
+        })
+    }
+
     /// Find the retained id of a script value already retained on this
     /// engine, without creating a new entry (identity match: same closure
     /// object + ObjThis). Returns `None` when the value is not retained.
@@ -1387,6 +1413,11 @@ name), and none was available"
     /// script property setter is invoked. `value` may be a scalar/string, an
     /// octet, null, or a [`TjsValue::Retained`] id (the retention is consumed
     /// by the write).
+    ///
+    /// **Consumption contract:** a [`TjsValue::Retained`] id is consumed by
+    /// the conversion *before* `PropSet` runs, so it is gone even when this
+    /// call returns `Err` (unless the target itself was invalid, in which
+    /// case conversion never happens). Do not reuse the id after a call.
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn set_member(
         &self,
@@ -1416,6 +1447,11 @@ name), and none was available"
     /// `tTJSSimpleGetSetProperty` as the handler's third argument and reads
     /// its default member back, so setting it is what lets an absent member
     /// be *called*. Same value/error conventions as [`Self::set_member`].
+    ///
+    /// **Consumption contract:** like [`Self::set_member`], a
+    /// [`TjsValue::Retained`] id is consumed by the conversion before the
+    /// `PropSet` runs, so it is gone even on error (unless the target was
+    /// invalid and conversion never happened).
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn set_default_member(&self, id: Tjs2ValueId, value: &TjsValue) -> Result<(), String> {
         let mut strings = Vec::new();
@@ -1684,14 +1720,18 @@ fn value_to_ffi(v: &TjsValue, strings: &mut Vec<CString>) -> Result<Value, Strin
         TjsValue::Retained(id) => {
             // Pass a retained value id; the C++ side copies the retained
             // variant into the argument slot (VAL_RETAINED path in
-            // `value_to_variant`), consuming the retention.
+            // `value_to_variant`), consuming the retention. Checked so a
+            // 64-bit id cannot silently truncate on a 32-bit target (Android
+            // armeabi-v7a).
+            let retained = usize::try_from(*id)
+                .map_err(|_| "retained id does not fit in usize on this platform".to_string())?;
             out.ty = VAL_RETAINED;
             out.integer = 0;
             out.real = 0.0;
             out.string = ptr::null();
             out.array = ptr::null();
             out.array_count = 0;
-            out.retained = *id as usize;
+            out.retained = retained;
         }
     }
     Ok(out)

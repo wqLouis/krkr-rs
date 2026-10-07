@@ -9,3 +9,6 @@ license.workspace = true
 krkr-api = { workspace = true }
 thiserror = { workspace = true }
 flate2 = { workspace = true }
+
+[dev-dependencies]
+krkr-testkit = { workspace = true }

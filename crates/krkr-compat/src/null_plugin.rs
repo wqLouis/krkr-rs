@@ -84,8 +84,10 @@ extern "C" fn null_ctor(
     _out_error: *mut *mut c_char,
     objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: the trampoline guarantees `argc` valid `Value` entries.
+    let argv = unsafe { args(argv, argc) };
     if !instance.is_null()
-        && let Some(name) = args(argv, argc).first()
+        && let Some(name) = argv.first()
     {
         // SAFETY: instance is the live payload of this constructor call.
         let state = unsafe { &*(instance as *const NullPluginState) };
@@ -116,7 +118,8 @@ extern "C" fn null_missing(
     _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    let argv = args(argv, argc);
+    // SAFETY: the trampoline guarantees `argc` valid `Value` entries.
+    let argv = unsafe { args(argv, argc) };
     let get_or_set = argv.first().map(|value| value.integer).unwrap_or(0);
     let member = argv.get(1).map(value_as_string).unwrap_or_default();
     let name = if instance.is_null() {
@@ -146,23 +149,31 @@ extern "C" fn null_missing(
 /// Install a no-op callable as the default member of the property object the
 /// VM passed to `missing`, so an absent member can be *called* (doc 08
 /// §4.2). Failure is non-fatal: the access has already been logged.
+///
+/// The no-op closure is created once at install time
+/// (`CompatServices::ensure_noop_closure`); here we only *duplicate* the
+/// cached retention, so the hot path never re-enters the VM and never
+/// clobbers the engine's "last object" slot.
 fn ignore_absent_member(engine: *mut c_void, prop: Option<&Value>) {
     let Some(prop) = prop else { return };
     let Some(resolved) = binding::resolve(engine as *mut Engine) else {
         return;
     };
     let host = resolved.engine();
-    // A fresh no-op closure per access: the property object is a temporary
-    // `CallGetMissing` creates, so its default member must be set every time.
-    let Ok(noop) = host.eval_retained("(function(){})", "null_plugin") else {
+    let ctx = resolved.ctx();
+    // SAFETY: `resolved` comes from the installed binding, and
+    // `ensure_noop_closure` ran during install.
+    let Some(cached) = (unsafe { ctx.services() }).noop_closure_id() else {
         return;
     };
-    let RetainedValue::Object(noop) = noop else {
+    let Ok(noop) = host.duplicate_retained(cached) else {
         return;
     };
     let Ok(prop) = host.retain_object_arg(prop) else {
         return;
     };
+    // `set_default_member` consumes the duplicate; the `DetachedValue` drop
+    // is then a documented no-op.
     let _ = host.set_default_member(prop.raw_id(), &TjsValue::Retained(noop.raw_id() as u64));
 }
 
@@ -192,7 +203,8 @@ pub(crate) fn register_hook(ctx: &mut CompatCtx) -> Result<(), CompatError> {
 /// under the plugin stem and return the retained object.
 ///
 /// The caller owns the returned retention; the script global also keeps the
-/// object alive.
+/// object alive. `plugin_name` keeps the script's original casing so the
+/// global is `windowEx`, not `windowex` (doc 08 §4.2).
 pub(crate) fn install(
     ctx: &mut CompatCtx,
     plugin_name: &str,
@@ -203,10 +215,11 @@ pub(crate) fn install(
     // `eval_retained` compiles an *expression*, so the assignment yields the
     // object itself (an `exec_script` statement would yield void).
     let script = format!("global[{stem_lit}] = new {NULL_PLUGIN_CLASS}({name_lit})");
-    // SAFETY: `ctx.engine()` is the bound, live engine; the expression
-    // creates the object and assigns the global. It retains the object
-    // result for the caller.
-    match ctx.engine().eval_retained(&script, "null_plugin") {
+    // SAFETY: `ctx` is the bound, live engine; the expression creates the
+    // object and assigns the global. It retains the object result for the
+    // caller.
+    let engine = unsafe { ctx.engine() };
+    match engine.eval_retained(&script, "null_plugin") {
         Ok(RetainedValue::Object(object)) => Ok(object),
         Ok(RetainedValue::Value(_)) => Err(CompatError::Register(
             "null plugin: the constructor did not return an object".into(),
@@ -215,7 +228,26 @@ pub(crate) fn install(
     }
 }
 
+/// Remove a null plugin's script global (`Plugins.unlink`). The object's
+/// native class cannot be unregistered, but clearing the global makes it
+/// unreachable from script; a later `link` re-installs it.
+pub(crate) fn remove(ctx: &mut CompatCtx, plugin_name: &str) -> Result<(), CompatError> {
+    let stem = crate::plugin_stem(plugin_name);
+    let stem_lit = tjs_string_literal(&stem);
+    let script = format!("global[{stem_lit}] = void");
+    // SAFETY: `ctx` is the bound, live engine.
+    let engine = unsafe { ctx.engine() };
+    engine
+        .eval(&script, "null_plugin")
+        .map(|_| ())
+        .map_err(|err| CompatError::Register(err.to_string()))
+}
+
 /// Quote a string as a TJS single-quoted literal.
+///
+/// Control characters are emitted as four-digit `\xHHHH` escapes: the lexer
+/// consumes up to `sizeof(tjs_char)*2` hex digits, so a fixed width keeps a
+/// following hex digit from being absorbed into the escape.
 fn tjs_string_literal(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 2);
     out.push('\'');
@@ -225,7 +257,9 @@ fn tjs_string_literal(value: &str) -> String {
             '\'' => out.push_str("\\'"),
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
-            _ => out.push(ch),
+            '\t' => out.push_str("\\t"),
+            ch if ch.is_control() => out.push_str(&format!("\\x{:04x}", ch as u32)),
+            ch => out.push(ch),
         }
     }
     out.push('\'');

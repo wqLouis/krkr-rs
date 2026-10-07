@@ -72,10 +72,14 @@ impl CompatHost {
 
     /// A dispatch context handle for the bound VM.
     ///
-    /// Returns a handle even before [`Self::install`]; it is only valid once
-    /// an engine has been bound.
-    pub fn ctx(&self) -> CompatCtx {
-        CompatCtx::from_raw(self.engine, self.services_ptr)
+    /// Returns [`CompatError::Engine`] before [`Self::install`], so the
+    /// handle can never dereference the null addresses of an unbound host.
+    pub fn ctx(&self) -> Result<CompatCtx, CompatError> {
+        if !self.bound {
+            return Err(CompatError::Engine("compat host is not installed".into()));
+        }
+        // SAFETY: `bound` guarantees both stored addresses are live.
+        Ok(unsafe { CompatCtx::from_raw(self.engine, self.services_ptr) })
     }
 
     /// Register the built-in compat classes and install the binding.
@@ -89,11 +93,16 @@ impl CompatHost {
         }
         let engine_addr = engine as *const Tjs2Engine as usize;
         let services_ptr = &mut *self.services as *mut CompatServices as usize;
-        let mut ctx = CompatCtx::from_raw(engine_addr, services_ptr);
+        // SAFETY: the engine and the boxed services outlive this scope (and
+        // the binding stores their stable addresses only after success).
+        let mut ctx = unsafe { CompatCtx::from_raw(engine_addr, services_ptr) };
         // Register the native surface first, then bind: registration does
         // not need the binding, and a failure leaves no half-installed table.
         crate::install(&mut ctx)?;
         binding::install(engine, services_ptr as *mut CompatServices, &self.registry)?;
+        // Create the null-plugin no-op closure once, before any native
+        // callback can run, so the `missing` handler never re-enters the VM.
+        self.services.ensure_noop_closure(engine);
         self.engine = engine_addr;
         self.services_ptr = services_ptr;
         self.bound = true;
@@ -106,6 +115,9 @@ impl CompatHost {
             binding::uninstall();
             self.bound = false;
         }
+        // Drop the per-install no-op cache id so a later re-install against a
+        // different engine creates a fresh one.
+        self.services.clear_noop_closure();
     }
 }
 

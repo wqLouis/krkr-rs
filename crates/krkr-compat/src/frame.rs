@@ -44,6 +44,16 @@ pub trait FrameBody {
     fn continuous_handler_poll(&mut self, _ctx: &mut CompatCtx) -> Result<(), CompatError> {
         Ok(())
     }
+
+    /// The tail of the body: L2 projects the scene and L1 renders it.
+    ///
+    /// It is a single step here because L3 owns neither the projection (L2)
+    /// nor the render pipeline (L1); the migrated host delegates both from
+    /// this hook so [`run_frame_body`] remains the one place the documented
+    /// order is enforced.
+    fn project_and_render(&mut self, _ctx: &mut CompatCtx) -> Result<(), CompatError> {
+        Ok(())
+    }
 }
 
 /// Run the frame body in the documented order, stopping at the first error.
@@ -53,5 +63,6 @@ pub fn run_frame_body(body: &mut dyn FrameBody, ctx: &mut CompatCtx) -> Result<(
     body.video_poll(ctx)?;
     body.async_trigger_poll(ctx)?;
     body.continuous_handler_poll(ctx)?;
+    body.project_and_render(ctx)?;
     Ok(())
 }

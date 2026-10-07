@@ -6,9 +6,15 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-krkr-api = { workspace = true }
 krkr-compat = { workspace = true }
-krkr-platform = { workspace = true }
 tjs2-sys = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
+
+# D13: `krkr-platform` has no default platform feature; select exactly one per
+# target (L4 consumes only the platform-agnostic event types).
+[target.'cfg(target_os = "linux")'.dependencies]
+krkr-platform = { workspace = true, features = ["platform-linux"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+krkr-platform = { workspace = true, features = ["platform-android"] }

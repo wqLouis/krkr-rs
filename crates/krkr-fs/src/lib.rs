@@ -205,9 +205,19 @@ pub(crate) enum FileHandle {
     },
 }
 
-/// Locks `mutex`, recovering from poisoning so one panic cannot brick IO.
+/// Locks `mutex`, treating poisoning as a bug rather than recovering.
+///
+/// A poisoned mutex means a previous operation panicked while holding the
+/// lock, so the protected `MemoryStore` may be half-mutated. Silently
+/// recovering with `into_inner()` would let IO observe that inconsistent
+/// state; the only honest response is to fail loudly instead.
+///
+/// # Panics
+///
+/// Panics if the mutex is poisoned by a prior panic while the lock was held.
+/// This is a bug, not a recoverable IO condition.
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .expect("MemoryStore mutex poisoned: a previous operation panicked while holding the lock")
 }

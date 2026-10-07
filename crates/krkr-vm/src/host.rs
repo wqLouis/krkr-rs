@@ -4,9 +4,8 @@
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::ptr;
 
-use krkr_compat::{
-    CompatHost, EventAdapter, FrameBody, PlatformEvent, PluginRegistry, run_frame_body,
-};
+use krkr_compat::{CompatHost, EventAdapter, FrameBody, PluginRegistry, run_frame_body};
+use krkr_platform::PlatformEvent;
 use tjs2_sys::{LOG_DEBUG, LOG_ERROR, LOG_INFO, LOG_WARN, Tjs2Engine, TjsValue};
 
 use crate::VmError;
@@ -108,7 +107,7 @@ impl VmHost {
     /// Run one frame body: adapt/deliver platform events, then run the
     /// ordered polls (doc 08 §6).
     pub fn tick(&mut self, frame: FrameCtx<'_>) -> Result<(), VmError> {
-        let mut ctx = self.compat.ctx();
+        let mut ctx = self.compat.ctx()?;
         for event in frame.events {
             if let Some(mapped) = self.adapter.map(event) {
                 self.adapter.dispatch(&mut ctx, &mapped)?;

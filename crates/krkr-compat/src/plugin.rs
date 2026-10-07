@@ -35,6 +35,24 @@ pub enum PluginOutcome {
     Null,
 }
 
+/// What a linked name resolves to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LinkedKind {
+    Builtin,
+    Null,
+}
+
+/// One entry of the `Plugins.getList` list.
+#[derive(Clone, Debug)]
+struct LinkedEntry {
+    /// The name the script passed, case preserved (`getList` and the null
+    /// global both use it).
+    name: String,
+    /// The normalized base name used for built-in lookup.
+    key: String,
+    kind: LinkedKind,
+}
+
 /// Holds the built-in plugins and activates them by name.
 ///
 /// `link` is idempotent: a name that was already activated is not registered
@@ -44,7 +62,14 @@ pub enum PluginOutcome {
 /// (every member access logs a warning).
 pub struct PluginRegistry {
     plugins: Vec<Box<dyn NativePlugin>>,
-    linked: Mutex<BTreeSet<String>>,
+    /// The linked names in insertion order, so `Plugins.getList` preserves
+    /// both the script's order and the original casing.
+    linked: Mutex<Vec<LinkedEntry>>,
+    /// Built-ins whose native classes are already on the VM. The ABI cannot
+    /// unregister a class, so this survives `unlink`: a later `link` of the
+    /// same built-in skips `register` instead of hitting the duplicate-class
+    /// rejection.
+    registered: Mutex<BTreeSet<String>>,
 }
 
 impl Default for PluginRegistry {
@@ -58,7 +83,8 @@ impl PluginRegistry {
     pub fn new() -> Self {
         Self {
             plugins: Vec::new(),
-            linked: Mutex::new(BTreeSet::new()),
+            linked: Mutex::new(Vec::new()),
+            registered: Mutex::new(BTreeSet::new()),
         }
     }
 
@@ -89,13 +115,14 @@ impl PluginRegistry {
         self.plugin(name).is_some()
     }
 
-    /// The names that have been linked so far (in `Plugins.getList` order).
+    /// The names that have been linked so far, in insertion order and with
+    /// the script's original casing (`Plugins.getList` order).
     pub fn linked(&self) -> Vec<String> {
         self.linked
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .iter()
-            .cloned()
+            .map(|entry| entry.name.clone())
             .collect()
     }
 
@@ -106,33 +133,55 @@ impl PluginRegistry {
     /// [`crate::install`]).
     pub fn activate(&self, name: &str, ctx: &mut CompatCtx) -> Result<PluginOutcome, CompatError> {
         let key = normalize_plugin_name(name);
-        if self.is_linked(&key) {
-            return Ok(if self.is_builtin(&key) {
-                PluginOutcome::Builtin
-            } else {
-                PluginOutcome::Null
+        if let Some(kind) = self.linked_kind(&key) {
+            return Ok(match kind {
+                LinkedKind::Builtin => PluginOutcome::Builtin,
+                LinkedKind::Null => PluginOutcome::Null,
             });
         }
         if let Some(plugin) = self.plugin(&key) {
-            plugin.register(ctx)?;
-            self.mark_linked(&key);
+            {
+                let mut registered = self
+                    .registered
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                if !registered.contains(&key) {
+                    plugin.register(ctx)?;
+                    registered.insert(key.clone());
+                }
+            }
+            self.push_linked(name, &key, LinkedKind::Builtin);
             Ok(PluginOutcome::Builtin)
         } else {
-            // Drop the returned retention: the null object is also installed
-            // as a script global, which keeps it alive.
-            let _object = null_plugin::install(ctx, &key)?;
-            self.mark_linked(&key);
+            // Install the null object under the script's original name (the
+            // stem is derived inside `null_plugin::install`).
+            null_plugin::install(ctx, name)?;
+            self.push_linked(name, &key, LinkedKind::Null);
             Ok(PluginOutcome::Null)
         }
     }
 
-    /// Forget a linked name (the `Plugins.unlink` behavior).
-    pub fn unlink(&self, name: &str) {
+    /// Unlink a name and report whether it had been linked.
+    ///
+    /// Built-in classes stay registered on the VM (the ABI cannot remove
+    /// them); only the `getList` entry is dropped, and a later `link` is
+    /// idempotent. A null plugin's script global is cleared best-effort.
+    pub fn unlink(&self, name: &str, ctx: &mut CompatCtx) -> bool {
         let key = normalize_plugin_name(name);
-        self.linked
+        let mut linked = self
+            .linked
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .remove(&key);
+            .unwrap_or_else(|poison| poison.into_inner());
+        let Some(pos) = linked.iter().position(|entry| entry.key == key) else {
+            return false;
+        };
+        let entry = linked.remove(pos);
+        drop(linked);
+        if entry.kind == LinkedKind::Null {
+            // Best-effort: a failure only leaves the harmless global behind.
+            let _ = null_plugin::remove(ctx, &entry.name);
+        }
+        true
     }
 
     /// Run every built-in plugin's per-frame hook.
@@ -143,18 +192,24 @@ impl PluginRegistry {
         Ok(())
     }
 
-    fn is_linked(&self, key: &str) -> bool {
+    fn linked_kind(&self, key: &str) -> Option<LinkedKind> {
         self.linked
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
-            .contains(key)
+            .iter()
+            .find(|entry| entry.key == key)
+            .map(|entry| entry.kind)
     }
 
-    fn mark_linked(&self, key: &str) {
+    fn push_linked(&self, name: &str, key: &str, kind: LinkedKind) {
         self.linked
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
-            .insert(key.to_string());
+            .push(LinkedEntry {
+                name: name.to_string(),
+                key: key.to_string(),
+                kind,
+            });
     }
 }
 

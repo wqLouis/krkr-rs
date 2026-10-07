@@ -1032,11 +1032,8 @@ dependencies = [
 name = "krkr-compat"
 version = "1.0.0"
 dependencies = [
- "krkr-api",
  "krkr-engine",
- "krkr-fs",
- "krkr-media",
- "krkr-render",
+ "krkr-platform",
  "log",
  "thiserror 2.0.20",
  "tjs2-sys",
@@ -1046,10 +1043,10 @@ dependencies = [
 name = "krkr-engine"
 version = "1.0.0"
 dependencies = [
- "flate2",
  "krkr-api",
  "krkr-fs",
  "krkr-render",
+ "krkr-testkit",
  "log",
  "thiserror 2.0.20",
 ]
@@ -1060,6 +1057,7 @@ version = "1.0.0"
 dependencies = [
  "flate2",
  "krkr-api",
+ "krkr-testkit",
  "thiserror 2.0.20",
 ]
 
@@ -1098,10 +1096,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "krkr-testkit"
+version = "1.0.0"
+dependencies = [
+ "flate2",
+ "krkr-fs",
+]
+
+[[package]]
 name = "krkr-vm"
 version = "1.0.0"
 dependencies = [
- "krkr-api",
  "krkr-compat",
  "krkr-platform",
  "log",

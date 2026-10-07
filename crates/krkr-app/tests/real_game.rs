@@ -66,9 +66,9 @@ fn decodes_real_images_and_probes_audio() {
     let media = Media::new();
 
     // Images: TLG is the KiriKiri native format.
-    let mut images = storage.get_file_list("*.tlg", 0);
+    let mut images = storage.get_file_list("*.tlg", 0).expect("list images");
     if images.is_empty() {
-        images = storage.get_file_list("*.png", 0);
+        images = storage.get_file_list("*.png", 0).expect("list pngs");
     }
     assert!(!images.is_empty(), "game should ship some images");
     let mut decoded = 0usize;
@@ -86,9 +86,9 @@ fn decodes_real_images_and_probes_audio() {
     assert!(decoded > 0);
 
     // Audio: Ogg/Opus voices and BGM.
-    let mut audio = storage.get_file_list("*.ogg", 0);
+    let mut audio = storage.get_file_list("*.ogg", 0).expect("list ogg");
     if audio.is_empty() {
-        audio = storage.get_file_list("*.opus", 0);
+        audio = storage.get_file_list("*.opus", 0).expect("list opus");
     }
     assert!(!audio.is_empty(), "game should ship some audio");
     let bytes = storage.read(&audio[0]).expect("read audio");

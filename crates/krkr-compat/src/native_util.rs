@@ -14,12 +14,17 @@ use tjs2_sys::{VAL_INTEGER, VAL_VOID, Value, tjs2_malloc};
 ///
 /// Returns an empty slice for a null pointer or a non-positive count (the
 /// C++ side passes a null `argv` when a method is called with no arguments).
-pub(crate) fn args<'a>(argv: *const Value, argc: c_int) -> &'a [Value] {
+///
+/// # Safety
+/// `argv` must point to `argc` valid [`Value`] entries that stay valid for
+/// the returned slice's use (i.e. for the duration of the callback). The
+/// returned lifetime is chosen by the caller, so a safe wrapper cannot
+/// enforce it — hence this is `unsafe`.
+pub(crate) unsafe fn args<'a>(argv: *const Value, argc: c_int) -> &'a [Value] {
     if argc <= 0 || argv.is_null() {
         return &[];
     }
-    // SAFETY: the C++ trampoline guarantees `argc` valid `Value` entries at
-    // `argv` for the duration of the callback.
+    // SAFETY: the caller upholds the validity contract above.
     unsafe { slice::from_raw_parts(argv, argc as usize) }
 }
 

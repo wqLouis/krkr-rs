@@ -46,10 +46,15 @@ pub use krkr_render::{BackendKind, FrameStats};
 /// error is currently a transparent render error. It exists as its own type
 /// so file-system/media errors can be added without changing signatures.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum HostError {
     /// A bottom-layer render action failed.
     #[error(transparent)]
     Render(#[from] RenderError),
+    /// The host configuration is invalid (for example, a non-headless host
+    /// with no window handle).
+    #[error("host config: {0}")]
+    Config(String),
 }
 
 /// Outcome of one [`Host::step`].
@@ -64,7 +69,11 @@ pub struct StepReport {
 }
 
 /// Immutable configuration for [`Host::new`].
+///
+/// The type is `#[non_exhaustive]`: start from [`HostConfig::default`] or
+/// [`HostConfig::headless`] and assign the fields you need.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct HostConfig {
     /// Render backend to create.
     pub backend: BackendKind,
@@ -74,12 +83,19 @@ pub struct HostConfig {
     pub application_name: String,
     /// Whether backend validation should be enabled.
     pub validation: bool,
+    /// Whether the host runs offscreen with no native window.
+    ///
+    /// When `true` the host uses [`krkr_platform::headless_window_handle`]
+    /// and requires the null backend. When `false`, [`window_handle`]
+    /// must be `Some`; a real backend with no handle is an error (D11).
+    ///
+    /// [`window_handle`]: HostConfig::window_handle
+    pub headless: bool,
     /// Window handle used to create the surface.
     ///
-    /// `None` selects a synthetic headless handle
-    /// ([`krkr_platform::headless_window_handle`]), which the null backend
-    /// ignores. The windowed host passes the real platform window handle
-    /// here so a Vulkan surface can bind to it.
+    /// Required unless [`HostConfig::headless`] is set. The windowed host
+    /// passes the real platform window handle here so a Vulkan surface can
+    /// bind to it.
     pub window_handle: Option<RawWindowHandle>,
     /// Display handle (Wayland/X11/XCB connection) used with `window_handle`.
     ///
@@ -97,6 +113,7 @@ impl Default for HostConfig {
             surface_size: (1280, 720),
             application_name: "krkr-rs".to_owned(),
             validation: false,
+            headless: false,
             window_handle: None,
             display_handle: None,
         }
@@ -104,9 +121,15 @@ impl Default for HostConfig {
 }
 
 impl HostConfig {
-    /// Returns the default headless configuration.
+    /// Returns the default offscreen configuration.
+    ///
+    /// This is [`Default`] with [`headless`](HostConfig::headless) set, so a
+    /// host can be created without a window or display handle.
     pub fn headless() -> Self {
-        Self::default()
+        Self {
+            headless: true,
+            ..Self::default()
+        }
     }
 
     /// Returns this configuration with a different backend.
@@ -196,13 +219,21 @@ impl Host {
         let scene = Scene::default();
         let render_scene = RenderScene::with_root_node();
 
-        let headless;
-        let handle: &RawWindowHandle = match &config.window_handle {
-            Some(handle) => handle,
-            None => {
-                headless = krkr_platform::headless_window_handle();
-                &headless
+        let headless_handle;
+        let handle: &RawWindowHandle = if config.headless {
+            if config.backend != BackendKind::Null {
+                return Err(HostError::Config(
+                    "headless hosts require the null backend".to_owned(),
+                ));
             }
+            headless_handle = krkr_platform::headless_window_handle();
+            &headless_handle
+        } else {
+            config.window_handle.as_ref().ok_or_else(|| {
+                HostError::Config(
+                    "no window handle; set `headless` for an offscreen host".to_owned(),
+                )
+            })?
         };
         let (surface, mut render_state) = match &config.display_handle {
             Some(display) => begin_render_state_with_display(&pipeline, display, handle)?,
@@ -252,7 +283,7 @@ impl Host {
             &mut self.render_state,
             &self.render_scene,
         )?;
-        self.frame_index = self.frame_index.wrapping_add(1);
+        self.frame_index = self.frame_index.saturating_add(1);
 
         Ok(StepReport {
             frame_index: self.frame_index,

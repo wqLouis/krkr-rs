@@ -24,13 +24,13 @@
 //! * The index block: 1 flag byte + (raw or zlib-compressed) index data.
 //!   Flag bits: low 3 = encode method (`0` raw, `1` zlib), `0x80` = continue.
 //! * Index data is a sequence of chunks `[4-byte tag][u64 LE size][data]`:
-//!   `File` chunks hold `info` / `segm` / `aldr` sub-chunks.
+//!   `File` chunks hold `info` / `segm` / `adlr` sub-chunks.
 //! * In-archive names are normalized: lowercased, `\` → `/`, duplicate
 //!   slashes collapsed, leading slashes dropped.
 //! * Reading a file concatenates its segments; zlib segments are inflated to
 //!   `org_size`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read, Seek, SeekFrom};
 
 use flate2::read::ZlibDecoder;
@@ -78,10 +78,6 @@ pub enum Xp3Error {
     /// containing one).
     #[error("not an XP3 archive")]
     NotAnXp3,
-
-    /// The index chain exceeded the sanity limit.
-    #[error("archive index chain exceeded {0} blocks (corrupt archive?)")]
-    IndexChainTooLong(usize),
 
     /// The index flag byte has an unknown encode method.
     #[error("bad index flag 0x{0:02x}")]
@@ -150,7 +146,7 @@ pub struct Entry {
     pub name: String,
     /// Segments composing the file, in order.
     pub segments: Vec<Segment>,
-    /// Adler32 hash of the name from the `aldr` chunk.
+    /// Adler32 hash of the name from the `adlr` chunk.
     pub file_hash: u32,
 }
 
@@ -171,16 +167,34 @@ impl Xp3Archive {
     /// Parse an XP3 index from an already-open [`FileState`].
     pub fn open(fs: &FileSystem, file: &FileState) -> Result<Self> {
         let mut reader = FileReader { fs, file, pos: 0 };
+        Self::open_reader(&mut reader)
+    }
 
-        // Read the 11-byte magic.
+    /// Parse an XP3 index from any byte stream.
+    ///
+    /// This is the reusable entry point behind [`open`](Self::open). The
+    /// stream is read from its current position; for an EXE-embedded archive
+    /// the 16-byte-aligned magic is located within it and the returned base
+    /// offset is relative to that magic. It is generic over [`Read`] +
+    /// [`Seek`] so callers other than the L1 [`FileState`] surface (for
+    /// example an EXE/APK wrapper or a positional adapter) can parse an
+    /// archive without materializing a full [`FileState`].
+    pub fn open_reader<R: Read + Seek>(reader: &mut R) -> Result<Self> {
+        // Read the 11-byte magic. A file shorter than the magic is simply not
+        // an XP3 archive; a genuine read failure is preserved as its typed
+        // error instead of being erased into `NotAnXp3`.
         let mut magic = [0u8; 11];
-        reader
-            .read_exact(&mut magic)
-            .map_err(|_| Xp3Error::NotAnXp3)?;
+        reader.read_exact(&mut magic).map_err(|error| {
+            if error.kind() == io::ErrorKind::UnexpectedEof {
+                Xp3Error::NotAnXp3
+            } else {
+                Xp3Error::from(error)
+            }
+        })?;
 
         let base = if magic[..2] == *b"MZ" {
             // EXE-embedded: search for the XP3 mark on 16-byte alignment.
-            find_xp3_offset(&mut reader)?
+            find_xp3_offset(reader)?
         } else if magic == XP3_MAGIC {
             0
         } else {
@@ -191,7 +205,7 @@ impl Xp3Archive {
             base,
             entries: BTreeMap::new(),
         };
-        archive.read_index(&mut reader)?;
+        archive.read_index(reader)?;
         Ok(archive)
     }
 
@@ -280,7 +294,14 @@ impl Xp3Archive {
                 other => return Err(Xp3Error::UnknownSegmentMethod(other, seg.flags)),
             }
         }
-        debug_assert_eq!(out.len() as u64, entry.org_size);
+        // The entry header's `org_size` must agree with what the segments
+        // actually compose; otherwise `stat` would report one size and `read`
+        // return another. This is a real check, not a debug assertion.
+        if out.len() as u64 != entry.org_size {
+            return Err(Xp3Error::CorruptIndex(
+                "segment sizes disagree with info.org_size",
+            ));
+        }
         Ok(out)
     }
 
@@ -290,19 +311,17 @@ impl Xp3Archive {
     /// engine's loop: the first index offset is read from offset 11, and after
     /// a block with `INDEX_CONTINUE` the next offset is read from the current
     /// position (immediately after that block's data).
-    fn read_index(&mut self, reader: &mut FileReader<'_>) -> Result<()> {
+    fn read_index<R: Read + Seek>(&mut self, reader: &mut R) -> Result<()> {
         let start = self
             .base
             .checked_add(11)
             .ok_or(Xp3Error::CorruptIndex("index offset overflow"))?;
         reader.seek(SeekFrom::Start(start))?;
-        let mut chain = 0usize;
+        // No arbitrary chain bound (D11): a real chain is finite. Termination
+        // and corruption detection come from remembering every resolved index
+        // offset and rejecting a repeat as a cycle.
+        let mut visited: BTreeSet<u64> = BTreeSet::new();
         loop {
-            chain += 1;
-            if chain > 256 {
-                return Err(Xp3Error::IndexChainTooLong(chain));
-            }
-
             let index_ofs = read_u64_le(reader)?;
             if index_ofs == 0 {
                 if self.entries.is_empty() {
@@ -311,11 +330,14 @@ impl Xp3Archive {
                 break;
             }
 
-            let start = self
+            let block = self
                 .base
                 .checked_add(index_ofs)
                 .ok_or(Xp3Error::CorruptIndex("index offset overflow"))?;
-            reader.seek(SeekFrom::Start(start))?;
+            if !visited.insert(block) {
+                return Err(Xp3Error::CorruptIndex("index chain cycle"));
+            }
+            reader.seek(SeekFrom::Start(block))?;
             let flag = read_u8(reader)?;
             let data = match flag & INDEX_ENCODE_METHOD_MASK {
                 INDEX_ENCODE_RAW => {
@@ -370,10 +392,15 @@ impl Xp3Archive {
                 self.parse_file_chunk(payload)?;
             }
         }
+        // A truncated chunk header or payload leaves trailing bytes; a
+        // structurally complete index consumes every byte exactly.
+        if pos != data.len() {
+            return Err(Xp3Error::CorruptIndex("trailing bytes in index data"));
+        }
         Ok(())
     }
 
-    /// Parse one `File` chunk: `info` / `segm` / `aldr` sub-chunks.
+    /// Parse one `File` chunk: `info` / `segm` / `adlr` sub-chunks.
     fn parse_file_chunk(&mut self, data: &[u8]) -> Result<()> {
         let mut pos = 0usize;
         let mut flags = 0u32;
@@ -382,6 +409,9 @@ impl Xp3Archive {
         let mut raw_name = String::new();
         let mut segments = Vec::new();
         let mut file_hash = 0u32;
+        let mut seen_info = false;
+        let mut seen_segm = false;
+        let mut seen_adlr = false;
 
         while data.len().saturating_sub(pos) >= 12 {
             let tag = &data[pos..pos + 4];
@@ -400,6 +430,10 @@ impl Xp3Archive {
 
             match tag {
                 b"info" => {
+                    if seen_info {
+                        return Err(Xp3Error::CorruptIndex("duplicate info sub-chunk"));
+                    }
+                    seen_info = true;
                     if payload.len() < 22 {
                         return Err(Xp3Error::CorruptIndex("info sub-chunk too short"));
                     }
@@ -421,6 +455,13 @@ impl Xp3Archive {
                     raw_name = String::from_utf16_lossy(&units);
                 }
                 b"segm" => {
+                    if seen_segm {
+                        return Err(Xp3Error::CorruptIndex("duplicate segm sub-chunk"));
+                    }
+                    seen_segm = true;
+                    if payload.is_empty() {
+                        return Err(Xp3Error::CorruptIndex("empty segm sub-chunk"));
+                    }
                     if !payload.len().is_multiple_of(28) {
                         return Err(Xp3Error::CorruptIndex(
                             "segm sub-chunk size not multiple of 28",
@@ -435,13 +476,27 @@ impl Xp3Archive {
                         });
                     }
                 }
-                b"aldr" => {
+                b"adlr" => {
+                    if seen_adlr {
+                        return Err(Xp3Error::CorruptIndex("duplicate adlr sub-chunk"));
+                    }
+                    seen_adlr = true;
                     if let Some(h) = payload.get(0..4) {
                         file_hash = u32::from_le_bytes(h.try_into().unwrap());
                     }
                 }
                 _ => { /* unknown sub-chunk: ignore */ }
             }
+        }
+
+        // A `File` chunk is only a valid entry when all three required
+        // sub-chunks are present exactly once; silently defaulting them would
+        // create an addressable entry with a bogus size or no data.
+        if pos != data.len() {
+            return Err(Xp3Error::CorruptIndex("trailing bytes in File chunk"));
+        }
+        if !seen_info || !seen_segm || !seen_adlr {
+            return Err(Xp3Error::CorruptIndex("File chunk missing info/segm/adlr"));
         }
 
         let name = normalize_in_archive_name(&raw_name);
@@ -539,29 +594,45 @@ impl Seek for FileReader<'_> {
 
 /// Search for the XP3 magic in an EXE (MZ) file on 16-byte alignment,
 /// starting at offset 16. Returns the archive base offset.
+///
+/// The scan is robust to short reads: it carries the trailing bytes of each
+/// window into the next one, so an 11-byte magic that straddles a read
+/// boundary is still found regardless of how the backend chops the stream.
 fn find_xp3_offset<R: Read + Seek>(reader: &mut R) -> Result<u64> {
     const CHUNK: usize = 256 * 1024;
-    let mut offset = 16u64;
-    reader.seek(SeekFrom::Start(offset))?;
-    let mut buffer = vec![0u8; CHUNK];
+    const OVERLAP: usize = XP3_MAGIC.len() - 1;
+    // Candidate absolute offsets are multiples of 16 from 16 onward.
+    let mut abs = 16u64;
+    reader.seek(SeekFrom::Start(abs))?;
+    let mut carry: Vec<u8> = Vec::new();
     loop {
-        let n = reader.read(&mut buffer)?;
+        let mut fresh = vec![0u8; CHUNK];
+        let n = reader.read(&mut fresh)?;
         if n == 0 {
             break;
         }
-        let mut p = 0usize;
-        while p + 11 <= n {
-            if buffer[p..p + 11] == XP3_MAGIC {
-                return Ok(offset + p as u64);
+        fresh.truncate(n);
+
+        // `carry` holds the bytes immediately before `abs`, so the window
+        // starts at `start_abs`.
+        let start_abs = abs - carry.len() as u64;
+        let mut window = std::mem::take(&mut carry);
+        window.extend_from_slice(&fresh);
+
+        // First candidate offset in the window aligned to a multiple of 16.
+        let rem = (start_abs % 16) as usize;
+        let mut p = if rem == 0 { 0 } else { 16 - rem };
+        while p + XP3_MAGIC.len() <= window.len() {
+            if window[p..p + XP3_MAGIC.len()] == XP3_MAGIC {
+                return Ok(start_abs + p as u64);
             }
             p += 16;
         }
-        // The magic may straddle the boundary; rewind 16 bytes to realign.
-        offset += n as u64;
-        if n == CHUNK {
-            offset = offset.saturating_sub(16);
-            reader.seek(SeekFrom::Start(offset))?;
-        }
+
+        // Carry the tail so a magic across the boundary is not lost.
+        let keep = OVERLAP.min(window.len());
+        carry.extend_from_slice(&window[window.len() - keep..]);
+        abs += n as u64;
     }
     Err(Xp3Error::NotAnXp3)
 }

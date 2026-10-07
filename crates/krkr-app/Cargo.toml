@@ -12,7 +12,10 @@ path = "src/main.rs"
 [dependencies]
 krkr-api = { workspace = true }
 krkr-engine = { workspace = true }
-krkr-platform = { workspace = true }
+# D13: select the platform explicitly; krkr-platform has no default feature.
+# The desktop binary builds the Linux backend. An Android frontend must depend
+# on `krkr-platform` with `features = ["platform-android"]` instead.
+krkr-platform = { workspace = true, features = ["platform-linux"] }
 krkr-render = { workspace = true }
 krkr-fs = { workspace = true }
 krkr-media = { workspace = true }

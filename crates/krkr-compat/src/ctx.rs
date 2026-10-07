@@ -1,7 +1,14 @@
 //! The L3 registration/dispatch context and its explicit L2 service handles.
 
+use std::cell::{Cell, RefCell};
+use std::ffi::c_char;
+use std::marker::PhantomData;
+
 use krkr_engine::{Scene, Storage};
-use tjs2_sys::{NativeClassBuilder, NativeInstanceBuilder, NativeStaticMembers, Tjs2Engine};
+use tjs2_sys::{
+    NativeClassBuilder, NativeInstanceBuilder, NativeStaticMembers, RetainedValue, Tjs2Engine,
+    Tjs2ValueId,
+};
 
 use crate::CompatError;
 
@@ -16,10 +23,28 @@ use crate::CompatError;
 /// process-wide binding (doc 08 §3.1) is lifetime-free: the host owns the
 /// services for the lifetime of the VM and the binding only stores addresses.
 /// Callers must keep the attached values alive as long as the binding.
+///
+/// The scratch/cache fields are the L3 *dispatch* state the binding points
+/// at; keeping them here (rather than in a second hidden global) preserves
+/// the "exactly one process-wide binding" rule of doc 08 §3.1.
 #[derive(Default)]
 pub struct CompatServices {
     scene: Option<*mut Scene>,
     storage: Option<*mut Storage>,
+    /// Scratch buffers for `Plugins.getList` (see `plugins_native`): the C++
+    /// trampoline copies the string array immediately after the callback
+    /// returns, so the buffers must outlive the call. Owned here rather than
+    /// in a thread-local so the only process-wide state stays the documented
+    /// binding.
+    linked_array: RefCell<(Vec<*const c_char>, Vec<Vec<u8>>)>,
+    /// The cached no-op closure the null-plugin `missing` handler installs as
+    /// a property default. It is created once at install time and *duplicated*
+    /// per access, so a member read never re-enters the VM.
+    ///
+    /// Stored as a raw id (rather than a `DetachedValue`) so dropping the host
+    /// never dereferences the engine: the engine owns the C++ retention and
+    /// frees it when it is destroyed.
+    noop_closure: Cell<Tjs2ValueId>,
 }
 
 impl CompatServices {
@@ -45,22 +70,61 @@ impl CompatServices {
         self.storage = Some(storage);
     }
 
-    /// The attached scene graph, if any.
+    /// The attached scene graph pointer, if any.
     ///
-    /// # Safety
-    /// The scene must still be alive (see [`Self::attach_scene`]).
-    pub unsafe fn scene(&self) -> Option<&Scene> {
-        // SAFETY: the caller upholds the lifetime contract of attach_scene.
-        self.scene.map(|p| unsafe { &*p })
+    /// This hands out the raw pointer rather than a `&Scene`: the services
+    /// container does not track the lifetime of the L2 owner, so forming a
+    /// shared reference here would be a safe aliasing hazard. Callers
+    /// dereference under their own `unsafe` contract (see
+    /// [`Self::attach_scene`]).
+    pub fn scene(&self) -> Option<*mut Scene> {
+        self.scene
     }
 
-    /// The attached storage namespace, if any.
+    /// The attached storage namespace pointer, if any.
     ///
-    /// # Safety
-    /// The storage must still be alive (see [`Self::attach_storage`]).
-    pub unsafe fn storage(&self) -> Option<&Storage> {
-        // SAFETY: the caller upholds the lifetime contract of attach_storage.
-        self.storage.map(|p| unsafe { &*p })
+    /// See [`Self::scene`] for why this returns a raw pointer.
+    pub fn storage(&self) -> Option<*mut Storage> {
+        self.storage
+    }
+
+    /// The mutable `Plugins.getList` scratch buffers.
+    pub(crate) fn linked_array_scratch(
+        &self,
+    ) -> std::cell::RefMut<'_, (Vec<*const c_char>, Vec<Vec<u8>>)> {
+        self.linked_array.borrow_mut()
+    }
+
+    /// Create and cache the no-op closure the null plugin hands back for
+    /// absent member reads/calls. Idempotent; call once the engine is bound.
+    pub(crate) fn ensure_noop_closure(&self, engine: &Tjs2Engine) {
+        if !self.noop_closure.get().is_null() {
+            return;
+        }
+        if let Ok(RetainedValue::Object(object)) =
+            engine.eval_retained("(function(){})", "null_plugin")
+        {
+            let id = object.raw_id();
+            // The engine owns the C++ retention and frees it at destruction;
+            // deliberately leak the Rust handle so dropping the host can never
+            // touch the engine.
+            std::mem::forget(object);
+            self.noop_closure.set(id);
+        }
+    }
+
+    /// The cached no-op closure id, if [`Self::ensure_noop_closure`] created
+    /// one.
+    pub(crate) fn noop_closure_id(&self) -> Option<Tjs2ValueId> {
+        let id = self.noop_closure.get();
+        if id.is_null() { None } else { Some(id) }
+    }
+
+    /// Forget the cached no-op closure id. Does not touch the engine: the
+    /// engine owns the C++ retention and frees it at destruction, so this is
+    /// safe to call during teardown even if the engine is already gone.
+    pub(crate) fn clear_noop_closure(&self) {
+        self.noop_closure.set(std::ptr::null_mut());
     }
 }
 
@@ -72,12 +136,23 @@ impl CompatServices {
 /// process-wide binding (see the `binding` module) resolves the raw engine
 /// back to this context as plain addresses. `CompatCtx` therefore stores two
 /// `usize`s — the address of the Rust [`Tjs2Engine`] and of the
-/// [`CompatServices`] — and reconstructs references on demand. It is a copy
-/// handle, not an owner.
-#[derive(Clone, Copy)]
+/// [`CompatServices`] — and reconstructs references on demand.
+///
+/// It is **not** a safe value handle:
+///
+/// * it is `!Send + !Sync` (`PhantomData<*mut ()>`) because the VM is
+///   single-threaded;
+/// * it is not `Copy`/`Clone`, so it cannot be duplicated into an unbounded
+///   lifetime;
+/// * the raw accessors ([`Self::engine`], [`Self::services`],
+///   [`Self::services_mut`]) are `unsafe`: the caller must uphold the
+///   "bound and alive" contract. The safe registration helpers on this type
+///   rely on that invariant.
 pub struct CompatCtx {
     engine: usize,
     services: usize,
+    /// `!Send + !Sync`: the VM must stay on one thread.
+    _nosend: PhantomData<*mut ()>,
 }
 
 impl CompatCtx {
@@ -87,21 +162,29 @@ impl CompatCtx {
     /// `engine` must be the address of a live [`Tjs2Engine`] and `services`
     /// the address of a live [`CompatServices`]; both must outlive the
     /// returned handle's use.
-    pub(crate) fn from_raw(engine: usize, services: usize) -> Self {
-        Self { engine, services }
+    pub(crate) unsafe fn from_raw(engine: usize, services: usize) -> Self {
+        Self {
+            engine,
+            services,
+            _nosend: PhantomData,
+        }
     }
 
     /// The VM the compat surface is installed on.
-    pub fn engine(&self) -> &Tjs2Engine {
-        // SAFETY: the binding only ever stores the address of the live host
-        // engine (doc 08 §3.1).
+    ///
+    /// # Safety
+    /// The binding must currently be installed and the engine alive.
+    pub unsafe fn engine(&self) -> &Tjs2Engine {
+        // SAFETY: the caller upholds the bound/alive contract above.
         unsafe { &*(self.engine as *const Tjs2Engine) }
     }
 
     /// The L2 services attached by the host.
-    pub fn services(&self) -> &CompatServices {
-        // SAFETY: the binding only ever stores the address of the live
-        // `CompatServices` owned by the host.
+    ///
+    /// # Safety
+    /// The binding must currently be installed and the services alive.
+    pub unsafe fn services(&self) -> &CompatServices {
+        // SAFETY: the caller upholds the bound/alive contract above.
         unsafe { &*(self.services as *const CompatServices) }
     }
 
@@ -118,7 +201,8 @@ impl CompatCtx {
     /// Register a static native class, mapping the `tjs2-sys` error string
     /// into a [`CompatError`].
     pub fn register_class(&self, builder: &NativeClassBuilder<'_>) -> Result<(), CompatError> {
-        self.engine()
+        // SAFETY: a `CompatCtx` is only created for a bound, live engine.
+        unsafe { self.engine() }
             .register_native_class(builder)
             .map_err(CompatError::Register)
     }
@@ -128,7 +212,8 @@ impl CompatCtx {
         &self,
         builder: &NativeInstanceBuilder<'_>,
     ) -> Result<(), CompatError> {
-        self.engine()
+        // SAFETY: a `CompatCtx` is only created for a bound, live engine.
+        unsafe { self.engine() }
             .register_native_class_instance(builder)
             .map_err(CompatError::Register)
     }
@@ -138,7 +223,8 @@ impl CompatCtx {
         &self,
         members: &NativeStaticMembers<'_>,
     ) -> Result<(), CompatError> {
-        self.engine()
+        // SAFETY: a `CompatCtx` is only created for a bound, live engine.
+        unsafe { self.engine() }
             .register_native_static_members(members)
             .map_err(CompatError::Register)
     }

@@ -41,6 +41,32 @@ fn ticker_reset_rebases_the_deadline() {
 }
 
 #[test]
+fn ticker_normalizes_a_zero_interval() {
+    let start = Instant::now();
+    let mut ticker = Ticker::new(Duration::ZERO, start);
+
+    assert!(ticker.poll(start));
+    assert!(
+        ticker.deadline() > start,
+        "a zero interval must be raised to a positive minimum"
+    );
+}
+
+#[test]
+fn ticker_accepts_a_huge_interval_without_panicking() {
+    let start = Instant::now();
+    let mut ticker = Ticker::new(Duration::MAX, start);
+
+    assert!(ticker.poll(start));
+    assert!(ticker.deadline() >= start);
+    let later = start + Duration::from_secs(1);
+    assert!(
+        !ticker.poll(later),
+        "a clamped large interval is not due yet"
+    );
+}
+
+#[test]
 fn clock_reports_monotonic_milliseconds() {
     let clock = Clock::new();
     let first = clock.now_ms();

@@ -17,7 +17,7 @@
 use krkr_api::error::FsError;
 use krkr_api::fs::FsPath;
 
-use crate::storage::{Location, Storage};
+use crate::storage::{Location, Storage, StorageReadError};
 
 /// The resolved sequence of startup scripts.
 ///
@@ -67,6 +67,12 @@ pub enum StartupError {
     /// A bottom file-system operation failed while probing the app path.
     #[error(transparent)]
     Fs(#[from] FsError),
+
+    /// Storage resolution failed while searching for the bootstrap script
+    /// (for example a permission or I/O error). A plain miss is
+    /// [`StartupError::NoStartupScript`], never this variant.
+    #[error(transparent)]
+    Storage(#[from] StorageReadError),
 }
 
 /// Discovers the startup scripts for `storage` without executing anything.
@@ -81,9 +87,9 @@ pub fn discover_startup(storage: &Storage) -> Result<StartupScripts, StartupErro
     let patch = app_path_file(storage, "patch.tjs")?;
     let after_startup = app_path_file(storage, "AfterStartup.tjs")?;
 
-    let startup = match storage.find("startup.tjs") {
+    let startup = match storage.find("startup.tjs")? {
         Some(location) => StartupScript::Startup(location),
-        None => match storage.find("system/Initialize.tjs") {
+        None => match storage.find("system/Initialize.tjs")? {
             Some(location) => StartupScript::Initialize(location),
             None => return Err(StartupError::NoStartupScript),
         },

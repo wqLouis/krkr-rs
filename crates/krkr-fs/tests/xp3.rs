@@ -3,14 +3,13 @@
 //! Relocated from the inline `#[cfg(test)]` module of the former
 //! `krkr-engine/src/archive/xp3.rs`; the parser now lives in L1 `krkr-fs`.
 
+use std::io::{Read, Seek, SeekFrom};
+
 use krkr_api::error::FsError;
 use krkr_api::fs::{FsPath, OpenMode};
 use krkr_fs::xp3::{XP3_MAGIC, Xp3Archive, Xp3Error, normalize_in_archive_name};
 use krkr_fs::{FileState, FileSystem};
-
-#[path = "common/xp3_builder.rs"]
-mod xp3_builder;
-use xp3_builder::build_xp3;
+use krkr_testkit::build_xp3;
 
 #[test]
 fn normalize_names() {
@@ -87,6 +86,9 @@ fn archive_with_oversized_segment() -> Vec<u8> {
     body.extend_from_slice(b"segm");
     body.extend_from_slice(&(segm.len() as u64).to_le_bytes());
     body.extend_from_slice(&segm);
+    body.extend_from_slice(b"adlr");
+    body.extend_from_slice(&4u64.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
 
     let mut file_chunk = Vec::new();
     file_chunk.extend_from_slice(b"File");
@@ -180,4 +182,324 @@ fn rejects_non_xp3_bytes() {
         Xp3Archive::open(&fs, &file),
         Err(Xp3Error::NotAnXp3)
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Structural-hardening tests: chained indexes, cycles, required sub-chunks and
+// size agreement. These back the review fixes 1.1, 1.2 and 1.4.
+// ---------------------------------------------------------------------------
+
+/// Build a raw `info` sub-chunk payload.
+fn info_payload(name: &str, org_size: u64, arc_size: u64) -> Vec<u8> {
+    let units: Vec<u16> = name.encode_utf16().collect();
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&0u32.to_le_bytes()); // flags
+    payload.extend_from_slice(&org_size.to_le_bytes());
+    payload.extend_from_slice(&arc_size.to_le_bytes());
+    payload.extend_from_slice(&(units.len() as i16).to_le_bytes());
+    for unit in &units {
+        payload.extend_from_slice(&unit.to_le_bytes());
+    }
+    payload
+}
+
+/// Build a raw `segm` sub-chunk payload holding one 28-byte segment.
+fn segm_payload(flags: u32, start: u64, org_size: u64, arc_size: u64) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&flags.to_le_bytes());
+    payload.extend_from_slice(&start.to_le_bytes());
+    payload.extend_from_slice(&org_size.to_le_bytes());
+    payload.extend_from_slice(&arc_size.to_le_bytes());
+    payload
+}
+
+/// Wrap `tag` + `payload` in the `[tag][u64 size][data]` sub-chunk framing.
+fn sub_chunk(tag: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(tag);
+    out.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+
+/// Build a single-entry raw `File` chunk expecting `data` at `start`.
+fn file_chunk_raw(name: &str, org_size: u64, arc_size: u64, start: u64) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&sub_chunk(b"info", &info_payload(name, org_size, arc_size)));
+    body.extend_from_slice(&sub_chunk(
+        b"segm",
+        &segm_payload(0, start, org_size, arc_size),
+    ));
+    body.extend_from_slice(&sub_chunk(b"adlr", &0u32.to_le_bytes()));
+
+    let mut chunk = Vec::new();
+    chunk.extend_from_slice(b"File");
+    chunk.extend_from_slice(&(body.len() as u64).to_le_bytes());
+    chunk.extend_from_slice(&body);
+    chunk
+}
+
+/// Wrap a `File` chunk body (the `info`/`segm`/`adlr` concatenation) in a
+/// single-entry raw-index archive.
+fn archive_with_file_body(body: &[u8]) -> Vec<u8> {
+    let mut chunk = Vec::new();
+    chunk.extend_from_slice(b"File");
+    chunk.extend_from_slice(&(body.len() as u64).to_le_bytes());
+    chunk.extend_from_slice(body);
+    archive_with_index_data(&chunk)
+}
+
+/// Wrap arbitrary raw index data in an archive whose first index block is raw.
+fn archive_with_index_data(index_data: &[u8]) -> Vec<u8> {
+    let mut file = Vec::new();
+    file.extend_from_slice(&XP3_MAGIC);
+    file.extend_from_slice(&0u64.to_le_bytes()); // index offset, patched below
+    let index_ofs = file.len() as u64;
+    file.push(0u8); // raw index flag
+    file.extend_from_slice(&(index_data.len() as u64).to_le_bytes());
+    file.extend_from_slice(index_data);
+    file[11..19].copy_from_slice(&index_ofs.to_le_bytes());
+    file
+}
+
+/// Build a two-block chained archive: the first raw index block carries
+/// `INDEX_CONTINUE` and is followed by the next offset and a second block.
+fn build_xp3_chained(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut file = Vec::new();
+    file.extend_from_slice(&XP3_MAGIC);
+    file.extend_from_slice(&0u64.to_le_bytes());
+
+    let mut chunks = Vec::new();
+    for (name, data) in entries {
+        let start = file.len() as u64;
+        file.extend_from_slice(data);
+        chunks.push(file_chunk_raw(
+            name,
+            data.len() as u64,
+            data.len() as u64,
+            start,
+        ));
+    }
+
+    let mid = chunks.len() / 2;
+    let data1: Vec<u8> = chunks[..mid].iter().flatten().copied().collect();
+    let data2: Vec<u8> = chunks[mid..].iter().flatten().copied().collect();
+
+    let idx1 = file.len() as u64;
+    let mut block1 = Vec::new();
+    block1.push(0x80u8); // raw + INDEX_CONTINUE
+    block1.extend_from_slice(&(data1.len() as u64).to_le_bytes());
+    block1.extend_from_slice(&data1);
+
+    let next_slot = idx1 + block1.len() as u64;
+    let idx2 = next_slot + 8;
+
+    file.extend_from_slice(&block1);
+    file.extend_from_slice(&idx2.to_le_bytes());
+    file.push(0x00u8); // raw, terminal
+    file.extend_from_slice(&(data2.len() as u64).to_le_bytes());
+    file.extend_from_slice(&data2);
+
+    file[11..19].copy_from_slice(&idx1.to_le_bytes());
+    file
+}
+
+/// Build an archive whose single `INDEX_CONTINUE` block points back at itself,
+/// forming a cycle.
+fn build_xp3_cycle(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut file = Vec::new();
+    file.extend_from_slice(&XP3_MAGIC);
+    file.extend_from_slice(&0u64.to_le_bytes());
+
+    let mut data = Vec::new();
+    for (name, bytes) in entries {
+        let start = file.len() as u64;
+        file.extend_from_slice(bytes);
+        data.extend_from_slice(&file_chunk_raw(
+            name,
+            bytes.len() as u64,
+            bytes.len() as u64,
+            start,
+        ));
+    }
+
+    let idx1 = file.len() as u64;
+    file.push(0x80u8); // raw + INDEX_CONTINUE
+    file.extend_from_slice(&(data.len() as u64).to_le_bytes());
+    file.extend_from_slice(&data);
+    // The "next" offset points back at this block: a cycle.
+    file.extend_from_slice(&idx1.to_le_bytes());
+
+    file[11..19].copy_from_slice(&idx1.to_le_bytes());
+    file
+}
+
+/// A valid two-block `INDEX_CONTINUE` chain parses and reads (review 1.1).
+#[test]
+fn chained_index_continue_blocks_are_followed() {
+    let xp3 = build_xp3_chained(&[("first.bin", b"first"), ("second.bin", b"second")]);
+    let (fs, file) = fs_with(&xp3);
+    let archive = Xp3Archive::open(&fs, &file).expect("open chained archive");
+    assert_eq!(archive.len(), 2);
+    assert_eq!(archive.read(&fs, &file, "first.bin").unwrap(), b"first");
+    assert_eq!(archive.read(&fs, &file, "second.bin").unwrap(), b"second");
+}
+
+/// A cyclic index chain is a typed corruption error, not an infinite loop and
+/// not an arbitrary "chain too long" cap (review 1.1).
+#[test]
+fn index_chain_cycle_is_rejected() {
+    let xp3 = build_xp3_cycle(&[("loop.bin", b"loop")]);
+    let (fs, file) = fs_with(&xp3);
+    assert!(matches!(
+        Xp3Archive::open(&fs, &file),
+        Err(Xp3Error::CorruptIndex("index chain cycle"))
+    ));
+}
+
+/// A `File` chunk missing its `segm` sub-chunk is rejected (review 1.2).
+#[test]
+fn file_chunk_missing_segm_is_rejected() {
+    let mut body = Vec::new();
+    body.extend_from_slice(&sub_chunk(b"info", &info_payload("a.bin", 3, 3)));
+    body.extend_from_slice(&sub_chunk(b"adlr", &0u32.to_le_bytes()));
+    let (fs, file) = fs_with(&archive_with_file_body(&body));
+    assert!(matches!(
+        Xp3Archive::open(&fs, &file),
+        Err(Xp3Error::CorruptIndex(_))
+    ));
+}
+
+/// A `File` chunk missing its `info` sub-chunk is rejected rather than
+/// inserting an entry named `""` (review 1.2).
+#[test]
+fn file_chunk_missing_info_is_rejected() {
+    let mut body = Vec::new();
+    body.extend_from_slice(&sub_chunk(b"segm", &segm_payload(0, 0, 3, 3)));
+    body.extend_from_slice(&sub_chunk(b"adlr", &0u32.to_le_bytes()));
+    let (fs, file) = fs_with(&archive_with_file_body(&body));
+    assert!(matches!(
+        Xp3Archive::open(&fs, &file),
+        Err(Xp3Error::CorruptIndex(_))
+    ));
+}
+
+/// An empty `segm` payload is rejected instead of producing a zero-segment
+/// entry whose `stat` size disagrees with an empty `read` (review 1.2).
+#[test]
+fn file_chunk_empty_segm_is_rejected() {
+    let mut body = Vec::new();
+    body.extend_from_slice(&sub_chunk(b"info", &info_payload("a.bin", 3, 3)));
+    body.extend_from_slice(&sub_chunk(b"segm", &[]));
+    body.extend_from_slice(&sub_chunk(b"adlr", &0u32.to_le_bytes()));
+    let (fs, file) = fs_with(&archive_with_file_body(&body));
+    assert!(matches!(
+        Xp3Archive::open(&fs, &file),
+        Err(Xp3Error::CorruptIndex(_))
+    ));
+}
+
+/// `info.org_size` that disagrees with the segment sum is a real read error,
+/// not a debug-only assertion (review 1.4).
+#[test]
+fn org_size_mismatch_is_rejected_on_read() {
+    let mut file = Vec::new();
+    file.extend_from_slice(&XP3_MAGIC);
+    file.extend_from_slice(&0u64.to_le_bytes());
+    let start = file.len() as u64;
+    file.extend_from_slice(b"hello"); // five stored bytes
+    let chunk = file_chunk_raw("a.bin", 99, 5, start);
+    let index_ofs = file.len() as u64;
+    file.push(0u8);
+    file.extend_from_slice(&(chunk.len() as u64).to_le_bytes());
+    file.extend_from_slice(&chunk);
+    file[11..19].copy_from_slice(&index_ofs.to_le_bytes());
+
+    let (fs, file) = fs_with(&file);
+    let archive = Xp3Archive::open(&fs, &file).expect("index is structurally valid");
+    assert!(matches!(
+        archive.read(&fs, &file, "a.bin"),
+        Err(Xp3Error::CorruptIndex(_))
+    ));
+}
+
+/// Trailing bytes after the last complete index chunk are corruption, not
+/// silently dropped (D11).
+#[test]
+fn trailing_index_bytes_are_rejected() {
+    let (fs, file) = fs_with(&archive_with_index_data(&[0u8; 4]));
+    assert!(matches!(
+        Xp3Archive::open(&fs, &file),
+        Err(Xp3Error::CorruptIndex(_))
+    ));
+}
+
+/// An EXE-embedded archive (MZ header + 16-byte-aligned magic) is located and
+/// read correctly, exercising the rewritten `find_xp3_offset`.
+#[test]
+fn exe_embedded_archive_is_found() {
+    let xp3 = build_xp3(&[("embedded.bin", b"payload", false)]);
+    let mut exe = vec![0u8; 64];
+    exe[0] = b'M';
+    exe[1] = b'Z';
+    exe.extend_from_slice(&xp3);
+
+    let (fs, file) = fs_with(&exe);
+    let archive = Xp3Archive::open(&fs, &file).expect("find embedded archive");
+    assert_eq!(archive.base_offset(), 64);
+    assert_eq!(
+        archive.read(&fs, &file, "embedded.bin").unwrap(),
+        b"payload"
+    );
+}
+
+/// A `Read + Seek` wrapper that never returns more than `max` bytes from a
+/// single `read`, forcing every stream boundary through the parser.
+struct StingyReader<'a> {
+    data: &'a [u8],
+    pos: usize,
+    max: usize,
+}
+
+impl Read for StingyReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let remaining = self.data.len().saturating_sub(self.pos);
+        let n = buf.len().min(self.max).min(remaining);
+        buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+impl Seek for StingyReader<'_> {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        let target: i128 = match pos {
+            SeekFrom::Start(off) => off as i128,
+            SeekFrom::End(off) => self.data.len() as i128 + off as i128,
+            SeekFrom::Current(off) => self.pos as i128 + off as i128,
+        };
+        self.pos = target.max(0) as usize;
+        Ok(self.pos as u64)
+    }
+}
+
+/// A short read must not hide an 11-byte magic that straddles the boundary
+/// (review 1.7). `StingyReader` hands back at most three bytes at a time, so
+/// the magic never arrives whole in one `read`.
+#[test]
+fn short_read_straddle_finds_embedded_archive() {
+    let xp3 = build_xp3(&[("embedded.bin", b"payload", false)]);
+    let mut exe = vec![0u8; 64];
+    exe[0] = b'M';
+    exe[1] = b'Z';
+    exe.extend_from_slice(&xp3);
+
+    let mut reader = StingyReader {
+        data: &exe,
+        pos: 0,
+        max: 3,
+    };
+    let archive = Xp3Archive::open_reader(&mut reader).expect("short-read straddle");
+    assert_eq!(archive.base_offset(), 64);
+    assert_eq!(archive.len(), 1);
 }

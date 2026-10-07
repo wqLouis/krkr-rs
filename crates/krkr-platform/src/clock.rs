@@ -7,6 +7,18 @@
 
 use std::time::{Duration, Instant};
 
+/// Smallest frame interval the ticker will honor.
+///
+/// A zero interval would make [`Ticker::poll`] return `true` on every wake and
+/// busy-loop the event loop, so it is normalized up to this value.
+const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(1);
+
+/// Largest frame interval the ticker will honor.
+///
+/// Clamping keeps `now + interval` far from the `Instant` overflow so the
+/// deadline arithmetic stays well-defined for a pathological configuration.
+const MAX_FRAME_INTERVAL: Duration = Duration::from_secs(3600);
+
 /// A monotonic wall-clock source.
 ///
 /// The clock is created once and reports the milliseconds elapsed since then.
@@ -62,9 +74,13 @@ pub struct Ticker {
 
 impl Ticker {
     /// Creates a ticker whose first frame is due at `now`.
+    ///
+    /// `interval` is clamped into `[1 ms, 1 h]`: a zero interval would make
+    /// the loop busy-spin and an absurdly large one could overflow the
+    /// deadline arithmetic.
     pub fn new(interval: Duration, now: Instant) -> Self {
         Self {
-            interval,
+            interval: interval.clamp(MIN_FRAME_INTERVAL, MAX_FRAME_INTERVAL),
             next: now,
         }
     }
@@ -83,9 +99,11 @@ impl Ticker {
     ///
     /// The deadline advances by one interval from `now` (not from the previous
     /// deadline), so a late wake-up does not cause a burst of catch-up frames.
+    /// The addition is checked; a (practically unreachable) overflow leaves
+    /// the deadline at `now` rather than panicking.
     pub fn poll(&mut self, now: Instant) -> bool {
         if now >= self.next {
-            self.next = now + self.interval;
+            self.next = now.checked_add(self.interval).unwrap_or(now);
             true
         } else {
             false

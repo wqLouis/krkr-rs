@@ -13,4 +13,4 @@ thiserror = { workspace = true }
 log = { workspace = true }
 
 [dev-dependencies]
-flate2 = { workspace = true }
+krkr-testkit = { workspace = true }

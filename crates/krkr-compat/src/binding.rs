@@ -63,7 +63,9 @@ impl Resolved {
 
     /// A context handle for registration and native dispatch.
     pub(crate) fn ctx(&self) -> CompatCtx {
-        CompatCtx::from_raw(self.engine, self.services)
+        // SAFETY: `Resolved` is only produced by `resolve` for the installed
+        // binding, whose engine and services outlive the binding.
+        unsafe { CompatCtx::from_raw(self.engine, self.services) }
     }
 }
 

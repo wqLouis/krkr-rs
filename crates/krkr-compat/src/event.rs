@@ -1,78 +1,16 @@
 //! L1 → L3 event adaptation (doc 08 §5).
 //!
-//! L1 owns the event loop and will push a platform event; L3 maps it to the
-//! TJS-visible event the VM dispatches to script handlers. This module is the
-//! adapter **skeleton**: [`PlatformEvent`] is the abstract input the host
-//! feeds in (it will become `krkr_platform`'s event type), [`EventAdapter::map`]
-//! is the pure mapping and [`EventAdapter::dispatch`] is the delivery seam
-//! that the focus/KAG machinery fills in.
+//! L1 owns the event loop and pushes [`krkr_platform::PlatformEvent`]s; L3
+//! maps them to the TJS-visible event the VM dispatches to script handlers.
+//! [`EventAdapter::map`] is the pure mapping and [`EventAdapter::dispatch`]
+//! is the delivery seam that the focus/KAG machinery fills in.
+//!
+//! L3 does **not** redeclare the platform event type: the event loop/type is
+//! L1 (doc 02 §3, doc 08 §5) and only the TJS mapping lives here.
+
+use krkr_platform::{InputEvent, MouseButton, PlatformEvent};
 
 use crate::{CompatCtx, CompatError};
-
-/// An abstract platform event pushed by L1.
-///
-/// This is a placeholder for `krkr_platform`'s event type: the adapter is
-/// written against this abstract surface so L3 stays platform-free.
-#[derive(Clone, Debug, PartialEq)]
-pub enum PlatformEvent {
-    /// A key was pressed. `code` is the platform key code, `key` its name.
-    KeyDown {
-        /// Platform key code.
-        code: i64,
-        /// Key name (e.g. `"Enter"`).
-        key: String,
-    },
-    /// A key was released.
-    KeyUp {
-        /// Platform key code.
-        code: i64,
-        /// Key name.
-        key: String,
-    },
-    /// The pointer moved.
-    PointerMove {
-        /// X in logical pixels.
-        x: i32,
-        /// Y in logical pixels.
-        y: i32,
-    },
-    /// A pointer button was pressed.
-    PointerDown {
-        /// X in logical pixels.
-        x: i32,
-        /// Y in logical pixels.
-        y: i32,
-        /// TVP mouse button code (`mbLeft`, `mbRight`, `mbMiddle`).
-        button: i64,
-    },
-    /// A pointer button was released.
-    PointerUp {
-        /// X in logical pixels.
-        x: i32,
-        /// Y in logical pixels.
-        y: i32,
-        /// TVP mouse button code.
-        button: i64,
-    },
-    /// The wheel moved.
-    Wheel {
-        /// Wheel delta (positive = up/away).
-        delta: i32,
-    },
-    /// The surface was resized.
-    Resize {
-        /// New width in pixels.
-        width: u32,
-        /// New height in pixels.
-        height: u32,
-    },
-    /// The window gained focus.
-    FocusGained,
-    /// The window lost focus.
-    FocusLost,
-    /// The user requested the window be closed.
-    CloseRequested,
-}
 
 /// A TJS-visible event: the handler name and its dictionary members.
 #[derive(Clone, Debug, PartialEq)]
@@ -96,7 +34,7 @@ pub enum EventValue {
     Bool(bool),
 }
 
-/// Maps abstract platform events to TJS-visible events and delivers them.
+/// Maps L1 platform events to TJS-visible events and delivers them.
 #[derive(Default)]
 pub struct EventAdapter;
 
@@ -110,66 +48,62 @@ impl EventAdapter {
     /// the script surface ignores.
     pub fn map(&self, event: &PlatformEvent) -> Option<TjsEvent> {
         match event {
-            PlatformEvent::KeyDown { code, key } => Some(TjsEvent {
-                name: "onKeyDown",
-                members: vec![
-                    ("code", EventValue::Int(*code)),
-                    ("key", EventValue::Str(key.clone())),
-                ],
-            }),
-            PlatformEvent::KeyUp { code, key } => Some(TjsEvent {
-                name: "onKeyUp",
-                members: vec![
-                    ("code", EventValue::Int(*code)),
-                    ("key", EventValue::Str(key.clone())),
-                ],
-            }),
-            PlatformEvent::PointerMove { x, y } => Some(TjsEvent {
-                name: "onMouseMove",
-                members: vec![
-                    ("x", EventValue::Int(i64::from(*x))),
-                    ("y", EventValue::Int(i64::from(*y))),
-                ],
-            }),
-            PlatformEvent::PointerDown { x, y, button } => Some(TjsEvent {
-                name: "onMouseDown",
-                members: vec![
-                    ("x", EventValue::Int(i64::from(*x))),
-                    ("y", EventValue::Int(i64::from(*y))),
-                    ("button", EventValue::Int(*button)),
-                ],
-            }),
-            PlatformEvent::PointerUp { x, y, button } => Some(TjsEvent {
-                name: "onMouseUp",
-                members: vec![
-                    ("x", EventValue::Int(i64::from(*x))),
-                    ("y", EventValue::Int(i64::from(*y))),
-                    ("button", EventValue::Int(*button)),
-                ],
-            }),
-            PlatformEvent::Wheel { delta } => Some(TjsEvent {
-                name: "onMouseWheel",
-                members: vec![("delta", EventValue::Int(i64::from(*delta)))],
-            }),
-            PlatformEvent::Resize { width, height } => Some(TjsEvent {
+            PlatformEvent::Resized(width, height) => Some(TjsEvent {
                 name: "onResize",
                 members: vec![
                     ("width", EventValue::Int(i64::from(*width))),
                     ("height", EventValue::Int(i64::from(*height))),
                 ],
             }),
-            PlatformEvent::FocusGained => Some(TjsEvent {
-                name: "onFocus",
-                members: Vec::new(),
-            }),
-            PlatformEvent::FocusLost => Some(TjsEvent {
-                name: "onBlur",
-                members: Vec::new(),
-            }),
+            // The scale factor has no KAG handler; L2 tracks it if needed.
+            PlatformEvent::ScaleFactorChanged(_) => None,
             PlatformEvent::CloseRequested => Some(TjsEvent {
                 name: "onClose",
                 members: Vec::new(),
             }),
+            PlatformEvent::Focused(true) => Some(TjsEvent {
+                name: "onFocus",
+                members: Vec::new(),
+            }),
+            PlatformEvent::Focused(false) => Some(TjsEvent {
+                name: "onBlur",
+                members: Vec::new(),
+            }),
+            PlatformEvent::Input(input) => self.map_input(input),
+            // `PlatformEvent` is `#[non_exhaustive]`; new lifecycle events
+            // without a script handler are ignored.
+            _ => None,
+        }
+    }
+
+    /// Map one raw input event to the TJS-visible event.
+    fn map_input(&self, input: &InputEvent) -> Option<TjsEvent> {
+        match input {
+            InputEvent::PointerMoved { x, y } => Some(TjsEvent {
+                name: "onMouseMove",
+                members: vec![
+                    ("x", EventValue::Int(coordinate(*x))),
+                    ("y", EventValue::Int(coordinate(*y))),
+                ],
+            }),
+            // The window-level pointer-leave is not a KAG event.
+            InputEvent::PointerLeft => None,
+            InputEvent::MouseButton { button, pressed } => Some(TjsEvent {
+                name: if *pressed { "onMouseDown" } else { "onMouseUp" },
+                members: vec![("button", EventValue::Int(mouse_button_code(*button)))],
+            }),
+            InputEvent::Wheel { delta } => Some(TjsEvent {
+                name: "onMouseWheel",
+                members: vec![("delta", EventValue::Int(coordinate(*delta)))],
+            }),
+            InputEvent::Key { code, pressed } => Some(TjsEvent {
+                name: if *pressed { "onKeyDown" } else { "onKeyUp" },
+                members: vec![("code", EventValue::Int(i64::from(*code)))],
+            }),
+            // Text/IME and touch dispatch land with the KAG migration.
+            InputEvent::Text(_) | InputEvent::Touch { .. } => None,
+            // `InputEvent` is `#[non_exhaustive]`.
+            _ => None,
         }
     }
 
@@ -180,12 +114,35 @@ impl EventAdapter {
     /// KAG migration. Until then the adapter logs the event so the wiring is
     /// observable and never operates by accident.
     pub fn dispatch(&self, ctx: &mut CompatCtx, event: &TjsEvent) -> Result<(), CompatError> {
+        // SAFETY: `ctx` is resolved from the installed binding.
+        let engine = unsafe { ctx.engine() };
         log::debug!(
             "event adapter: dispatching {} ({} member(s)) on engine {:p}",
             event.name,
             event.members.len(),
-            ctx.engine().raw(),
+            engine.raw(),
         );
         Ok(())
+    }
+}
+
+/// Round a logical coordinate to the TJS integer the event dictionary
+/// carries.
+fn coordinate(value: f32) -> i64 {
+    i64::from(value.round() as i32)
+}
+
+/// The TVP mouse-button code (`mbLeft` = 0 … `mbX2` = 4).
+fn mouse_button_code(button: MouseButton) -> i64 {
+    match button {
+        MouseButton::Left => 0,
+        MouseButton::Right => 1,
+        MouseButton::Middle => 2,
+        MouseButton::Back => 3,
+        MouseButton::Forward => 4,
+        MouseButton::Other(code) => i64::from(code),
+        // `MouseButton` is `#[non_exhaustive]`; an unknown button has no TVP
+        // code.
+        _ => -1,
     }
 }
