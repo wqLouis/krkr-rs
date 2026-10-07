@@ -45,6 +45,12 @@ pub struct CompatServices {
     /// never dereferences the engine: the engine owns the C++ retention and
     /// frees it when it is destroyed.
     noop_closure: Cell<Tjs2ValueId>,
+    /// Per-family L3 dispatch state, keyed by type. Natives that need state
+    /// that outlives a callback (the `System` command line, the `Debug` log
+    /// ring, timer/sound/input registries, ...) stash it here instead of in a
+    /// process global, so the single documented binding stays the only
+    /// process-wide state (doc 08 §3.1).
+    states: RefCell<std::collections::HashMap<std::any::TypeId, Box<dyn std::any::Any>>>,
 }
 
 impl CompatServices {
@@ -125,6 +131,24 @@ impl CompatServices {
     /// safe to call during teardown even if the engine is already gone.
     pub(crate) fn clear_noop_closure(&self) {
         self.noop_closure.set(std::ptr::null_mut());
+    }
+
+    /// Borrow (creating if absent) the per-family dispatch state of type `T`.
+    ///
+    /// This is the extension point that keeps native-family state out of
+    /// process globals: a family defines its own state type, defaults it, and
+    /// reads it back here. `T` is keyed by [`std::any::TypeId`].
+    pub fn state<T: Default + 'static>(&self) -> std::cell::RefMut<'_, T> {
+        use std::any::{Any, TypeId};
+        let mut map = self.states.borrow_mut();
+        map.entry(TypeId::of::<T>())
+            .or_insert_with(|| Box::new(T::default()) as Box<dyn Any>);
+        std::cell::RefMut::map(map, |map| {
+            map.get_mut(&TypeId::of::<T>())
+                .expect("state entry was just inserted")
+                .downcast_mut::<T>()
+                .expect("state is keyed by TypeId")
+        })
     }
 }
 

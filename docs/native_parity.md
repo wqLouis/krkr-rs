@@ -20,10 +20,10 @@ The checker exits non-zero when a missing member is **not** listed in `scripts/n
 | --- | ---: |
 | tracked classes | 15 |
 | reference members | 527 |
-| matched | 3 |
-| **missing** | **524** |
-| extra (Rust only) | 1 |
-| coverage | **0.6%** |
+| matched | 101 |
+| **missing** | **426** |
+| extra (Rust only) | 28 |
+| coverage | **19.2%** |
 
 ## Per-class coverage
 
@@ -34,15 +34,15 @@ The checker exits non-zero when a missing member is **not** listed in `scripts/n
 | `Window` | 83 | 0 | 0 | 83 | 0 | 0.0% |
 | `Font` | 22 | 0 | 0 | 22 | 0 | 0.0% |
 | `Timer` | 6 | 0 | 0 | 6 | 0 | 0.0% |
-| `System` | 50 | 0 | 0 | 50 | 0 | 0.0% |
-| `Debug` | 13 | 0 | 0 | 13 | 0 | 0.0% |
+| `System` | 50 | 40 | 40 | 10 | 0 | 80.0% |
+| `Debug` | 13 | 11 | 11 | 2 | 0 | 84.6% |
 | `Plugins` | 3 | 4 | 3 | 0 | 1 | 100.0% |
 | `VideoOverlay` | 70 | 0 | 0 | 70 | 0 | 0.0% |
 | `AsyncTrigger` | 6 | 0 | 0 | 6 | 0 | 0.0% |
 | `MenuItem` | 22 | 0 | 0 | 22 | 0 | 0.0% |
-| `Storages` | 13 | 0 | 0 | 13 | 0 | 0.0% |
-| `Scripts` | 11 | 0 | 0 | 11 | 0 | 0.0% |
-| `KAGParser` | 25 | 0 | 0 | 25 | 0 | 0.0% |
+| `Storages` | 13 | 15 | 11 | 2 | 4 | 84.6% |
+| `Scripts` | 11 | 11 | 11 | 0 | 0 | 100.0% |
+| `KAGParser` | 25 | 48 | 25 | 0 | 23 | 100.0% |
 | `WaveSoundBuffer` | 33 | 0 | 0 | 33 | 0 | 0.0% |
 
 ## Missing members by class
@@ -67,13 +67,13 @@ The checker exits non-zero when a missing member is **not** listed in `scripts/n
 
 `Timer`, `capacity`, `enabled`, `interval`, `mode`, `onTimer`
 
-### `System` — 50 missing
+### `System` — 10 missing
 
-`System`, `addContinuousHandler`, `appDataPath`, `assignMessage`, `clearGraphicCache`, `createAppLock`, `createUUID`, `dataPath`, `desktopHeight`, `desktopLeft`, `desktopTop`, `desktopWidth`, `doCompact`, `drawThreadNum`, `dumpHeap`, `eventDisabled`, `exeBits`, `exeName`, `exePath`, `exit`, `exitOnNoWindowStartup`, `exitOnWindowClose`, `getArgument`, `getKeyState`, `getTickCount`, `graphicCacheLimit`, `inform`, `inputString`, `nullpo`, `osBits`, `osName`, `personalPath`, `platformName`, `processorNum`, `readRegValue`, `removeContinuousHandler`, `savedGamesPath`, `screenHeight`, `screenWidth`, `setArgument`, `shellExecute`, `showVersion`, `system`, `terminate`, `title`, `toActualColor`, `touchDevice`, `touchImages`, `versionInformation`, `versionString`
+`appDataPath`, `clearGraphicCache`, `desktopHeight`, `desktopLeft`, `desktopTop`, `desktopWidth`, `getKeyState`, `shellExecute`, `system`, `touchDevice`
 
-### `Debug` — 13 missing
+### `Debug` — 2 missing
 
-`Debug`, `addLoggingHandler`, `clearLogFileOnError`, `console`, `controller`, `getLastLog`, `logAsError`, `logLocation`, `logToFileOnError`, `message`, `notice`, `removeLoggingHandler`, `startLogToFile`
+`console`, `controller`
 
 ### `VideoOverlay` — 70 missing
 
@@ -87,17 +87,9 @@ The checker exits non-zero when a missing member is **not** listed in `scripts/n
 
 `HMENU`, `MenuItem`, `add`, `caption`, `checked`, `children`, `enabled`, `fireClick`, `group`, `index`, `insert`, `keycodeToText`, `onClick`, `parent`, `popup`, `radio`, `remove`, `root`, `shortcut`, `textToKeycode`, `visible`, `window`
 
-### `Storages` — 13 missing
+### `Storages` — 2 missing
 
-`addAutoPath`, `chopStorageExt`, `clearArchiveCache`, `extractStorageExt`, `extractStorageName`, `extractStoragePath`, `getFullPath`, `getLocalName`, `getPlacedPath`, `isExistentStorage`, `removeAutoPath`, `searchCD`, `selectFile`
-
-### `Scripts` — 11 missing
-
-`Scripts`, `compileStorage`, `dump`, `eval`, `evalStorage`, `exec`, `execStorage`, `getClassNames`, `getTraceString`, `setCallMissing`, `textEncoding`
-
-### `KAGParser` — 25 missing
-
-`KAGParser`, `assign`, `callLabel`, `callStackDepth`, `clear`, `clearCallStack`, `curLabel`, `curLine`, `curLineStr`, `curPos`, `curStorage`, `debugLevel`, `getNextTag`, `goToLabel`, `ignoreCR`, `interrupt`, `loadScenario`, `macroParams`, `macros`, `mp`, `popMacroArgs`, `processSpecialTags`, `resetInterrupt`, `restore`, `store`
+`searchCD`, `selectFile`
 
 ### `WaveSoundBuffer` — 33 missing
 
@@ -110,6 +102,14 @@ Rust registrations with no reference counterpart; usually intentional engine int
 ### `Plugins` — 1 extra
 
 `Plugins`
+
+### `Storages` — 4 extra
+
+`Storages`, `fstat`, `getFileList`, `stat`
+
+### `KAGParser` — 23 extra
+
+`getCallStackDepth`, `getCurLabel`, `getCurLine`, `getCurLineStr`, `getCurPos`, `getCurStorage`, `getDebugLevel`, `getIgnoreCR`, `getMP`, `getMacroParams`, `getMacros`, `getMultiLineTagEnabled`, `getParamMacros`, `getProcessSpecialTags`, `multiLineTagEnabled`, `paramMacros`, `setCurStorage`, `setDebugLevel`, `setIgnoreCR`, `setMacros`, `setMultiLineTagEnabled`, `setParamMacros`, `setProcessSpecialTags`
 
 ## Reference classes not registered in Rust
 

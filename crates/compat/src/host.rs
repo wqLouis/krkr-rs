@@ -85,6 +85,11 @@ impl CompatHost {
     /// Register the built-in compat classes and install the binding.
     ///
     /// Fails if a binding is already installed (there is exactly one VM).
+    ///
+    /// The binding stores the **address** of `engine`, so `engine` must stay
+    /// at a stable address for as long as the binding is installed: keep it
+    /// behind a `Box` (as [`crate::Host`] and `vm`'s host do) and do not move
+    /// the value afterwards.
     pub fn install(&mut self, engine: &Tjs2Engine) -> Result<(), CompatError> {
         if self.bound {
             return Err(CompatError::Register(

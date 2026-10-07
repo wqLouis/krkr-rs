@@ -38,6 +38,7 @@ mod event;
 mod frame;
 mod host;
 mod native_util;
+mod natives;
 mod null_plugin;
 mod plugin;
 mod plugins_native;
@@ -66,5 +67,6 @@ pub enum CompatError {
 /// responsibility (class registration rejects duplicates).
 pub fn install(ctx: &mut CompatCtx) -> Result<(), CompatError> {
     null_plugin::register_hook(ctx)?;
+    natives::register_all(ctx)?;
     plugins_native::register(ctx)
 }
