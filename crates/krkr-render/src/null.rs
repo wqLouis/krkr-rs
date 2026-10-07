@@ -12,7 +12,9 @@ use krkr_api::geometry::PixelRegion;
 use krkr_api::host::{Presentation, SurfaceEvent};
 use raw_window_handle::RawWindowHandle;
 
-use crate::scene::{RenderContent, RenderNode, RenderNodeId, RenderScene};
+use crate::scene::{
+    RenderContent, RenderNode, RenderNodeId, RenderScene, child_sort_key, children_are_sorted,
+};
 use crate::state::{RenderState, StateKind, Surface, SurfaceKind};
 use crate::texture::{Texture, TextureDesc};
 use crate::{BackendKind, GpuCapabilities, TextureFormat};
@@ -66,9 +68,11 @@ impl NullRenderPipeline {
             backend: BackendKind::Null,
             max_texture_dimension: NULL_MAX_TEXTURE_DIMENSION,
             preferred_format: TextureFormat::Rgba8Srgb,
-            supports_destination_dependent_blend: true,
-            supports_offscreen_targets: true,
-            supports_glyph_atlas: true,
+            // The null backend performs no rendering, so it truthfully reports
+            // no hardware composition capabilities.
+            supports_destination_dependent_blend: false,
+            supports_offscreen_targets: false,
+            supports_glyph_atlas: false,
         }
     }
 
@@ -182,7 +186,7 @@ pub(crate) struct NullState {
     /// Number of frames rendered through this state.
     pub(crate) frame_index: u64,
     /// CPU storage per texture identity.
-    pub(crate) textures: HashMap<usize, NullImage>,
+    pub(crate) textures: HashMap<u64, NullImage>,
     /// Counters from the most recent frame.
     pub(crate) last_frame: Option<FrameStats>,
 }
@@ -331,10 +335,17 @@ fn visit(
         return;
     }
     count_content(null, node, stats);
-    let mut children = node.children.clone();
-    children.sort_by_key(|child| scene.node(*child).map_or(0, |node| node.z));
-    for child in children {
-        visit(null, scene, child, depth + 1, stats);
+    // Draw in sibling `z` order, borrowing the usual already-sorted list.
+    if children_are_sorted(scene, &node.children) {
+        for &child in &node.children {
+            visit(null, scene, child, depth + 1, stats);
+        }
+    } else {
+        let mut children = node.children.clone();
+        children.sort_by_key(|child| child_sort_key(scene, *child));
+        for child in children {
+            visit(null, scene, child, depth + 1, stats);
+        }
     }
 }
 

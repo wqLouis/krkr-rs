@@ -53,3 +53,41 @@ fn frame_index_and_elapsed_advance() {
     assert_eq!(host.frame_index(), 3);
     assert!((host.elapsed_ms() - 30.0).abs() < f64::EPSILON);
 }
+
+#[test]
+fn unchanged_revision_reuses_arena_and_mutation_reprojects() {
+    let mut host = headless_host();
+    build_solid_and_bitmap_scene(host.scene_mut());
+
+    // The first frame always projects, whatever the revision.
+    host.step(16.0).expect("step");
+    let projected_len = host.render_scene().nodes.len();
+    let projected_ptr = host.render_scene().nodes.as_ptr();
+    let projected_capacity = host.render_scene().nodes.capacity();
+    assert!(projected_len > 1, "expected projected nodes");
+    let snapshot = host.render_scene().clone();
+
+    // A frame with an unchanged revision reuses the persistent arena: the
+    // node buffer keeps its identity/capacity and the projection is untouched.
+    host.step(16.0).expect("step");
+    assert_eq!(host.render_scene().nodes.len(), projected_len);
+    assert_eq!(host.render_scene().nodes.as_ptr(), projected_ptr);
+    assert_eq!(host.render_scene().nodes.capacity(), projected_capacity);
+    assert_eq!(host.render_scene(), &snapshot);
+
+    // A direct field edit does not bump `Scene::revision`, so the projection
+    // is deliberately skipped (the documented over-approximation contract):
+    // an unchanged revision must not rebuild the render scene.
+    host.scene_mut().layers[0].rect.w = 123;
+    host.step(16.0).expect("step");
+    assert_eq!(host.render_scene(), &snapshot);
+
+    // Any `*_mut` accessor bumps the revision, so the next frame reprojects
+    // and the new layer geometry reaches the render tree.
+    let background = host.scene().layers[0].id;
+    if let Some(layer) = host.scene_mut().layer_mut(background) {
+        layer.rect.w = 160;
+    }
+    host.step(16.0).expect("step");
+    assert_ne!(host.render_scene(), &snapshot);
+}

@@ -45,6 +45,12 @@ pub const LT_ADDITIVE: i64 = 3;
 /// TVP `ltSubtractive` drawable/blend type (`Layer.type`).
 pub const LT_SUBTRACTIVE: i64 = 4;
 
+/// Clamp a `u32` pixel dimension to a non-negative `i32` (a plain `as i32`
+/// would wrap for sizes above `i32::MAX`).
+fn dim_i32(v: u32) -> i32 {
+    v.min(i32::MAX as u32) as i32
+}
+
 /// One logical layer (sprite surface) attached to a window.
 #[derive(Debug, Clone)]
 pub struct LayerState {
@@ -498,7 +504,8 @@ impl Scene {
         let Some(bitmap_id) = self.layer(layer_id).and_then(|l| l.bitmap) else {
             return 0;
         };
-        self.bitmap(bitmap_id).map_or(0, |b| b.width * 4)
+        self.bitmap(bitmap_id)
+            .map_or(0, |b| b.width.saturating_mul(4))
     }
 
     /// Bytes per row of the layer's ProvinceImage (`width` bytes, 8bpp), or 0
@@ -640,7 +647,17 @@ impl Scene {
         }
         let old_w = layer.province_width;
         let old_h = layer.province_height;
-        let mut buf = vec![0u8; w as usize * h as usize].into_boxed_slice();
+        let Some(bytes) = (w as usize).checked_mul(h as usize) else {
+            return;
+        };
+        // A plane this large is structurally impossible to allocate; leave
+        // the existing plane untouched rather than panicking.
+        let mut raw = Vec::new();
+        if raw.try_reserve_exact(bytes).is_err() {
+            return;
+        }
+        raw.resize(bytes, 0);
+        let mut buf = raw.into_boxed_slice();
         if let Some(old) = layer.province.take() {
             let copy_w = old_w.min(w) as usize;
             let copy_h = old_h.min(h) as usize;
@@ -693,7 +710,12 @@ impl Scene {
         };
         let (w, h) = (layer.province_width, layer.province_height);
         let in_clip = match layer.clip {
-            Some(c) => x >= c.x && y >= c.y && x < c.x + c.w as i32 && y < c.y + c.h as i32,
+            Some(c) => {
+                x >= c.x
+                    && y >= c.y
+                    && x < c.x.saturating_add(dim_i32(c.w))
+                    && y < c.y.saturating_add(dim_i32(c.h))
+            }
             None => true,
         };
         if !in_clip || x < 0 || y < 0 || x >= w as i32 || y >= h as i32 {
@@ -946,7 +968,8 @@ impl Scene {
 
     /// Reference `tTVPLayerManager::SetFocusTo`: give keyboard focus to
     /// `id` within its window, clearing the previous holder. Returns
-    /// `(previous, new)`. A `None`/invalid `id` blurs the current holder.
+    /// `(previous, new)`. An invalid `id` returns `(None, None)` and leaves
+    /// the current holder unchanged; use [`Scene::clear_focus`] to blur it.
     pub fn set_focus(&mut self, id: u32) -> (Option<u32>, Option<u32>) {
         let Some(layer) = self.layer(id) else {
             return (None, None);
@@ -1091,8 +1114,8 @@ impl Scene {
             let l = self.layer(c)?;
             match l.parent {
                 Some(p) => {
-                    px += l.rect.x;
-                    py += l.rect.y;
+                    px = px.saturating_add(l.rect.x);
+                    py = py.saturating_add(l.rect.y);
                     cur = Some(p);
                 }
                 None => break,
@@ -1138,8 +1161,8 @@ impl Scene {
         let mut cur = Some(id);
         while let Some(c) = cur {
             let l = self.layer(c)?;
-            x += l.rect.x;
-            y += l.rect.y;
+            x = x.saturating_add(l.rect.x);
+            y = y.saturating_add(l.rect.y);
             cur = l.parent;
         }
         Some((x, y))
@@ -1157,8 +1180,8 @@ impl Scene {
                 let Some(buf) = layer.province.as_deref() else {
                     return false;
                 };
-                let px = x - layer.image_left;
-                let py = y - layer.image_top;
+                let px = x.saturating_sub(layer.image_left);
+                let py = y.saturating_sub(layer.image_top);
                 if px < 0
                     || py < 0
                     || px >= layer.province_width as i32
@@ -1171,8 +1194,8 @@ impl Scene {
             // htMask = 0
             0 => match layer.bitmap.and_then(|id| self.bitmap(id)) {
                 Some(bmp) => {
-                    let px = x - layer.image_left;
-                    let py = y - layer.image_top;
+                    let px = x.saturating_sub(layer.image_left);
+                    let py = y.saturating_sub(layer.image_top);
                     if px < 0 || py < 0 || px >= bmp.width as i32 || py >= bmp.height as i32 {
                         return false;
                     }

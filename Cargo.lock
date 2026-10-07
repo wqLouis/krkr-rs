@@ -1045,21 +1045,16 @@ name = "krkr-fs"
 version = "1.0.0"
 dependencies = [
  "krkr-api",
- "log",
- "thiserror 2.0.20",
 ]
 
 [[package]]
 name = "krkr-media"
 version = "1.0.0"
 dependencies = [
- "flate2",
  "image",
  "krkr-api",
- "log",
  "symphonia 0.6.1",
  "symphonia-adapter-libopus",
- "thiserror 2.0.20",
 ]
 
 [[package]]

@@ -147,3 +147,15 @@ fn garbage_is_a_decode_error_not_a_panic() {
         Err(MediaError::Decode { .. })
     ));
 }
+
+#[test]
+fn large_images_decode_without_a_configured_size_cap() {
+    // A 40000-pixel-wide PNG (well past any arbitrary safety cap) must decode:
+    // the engine has no size policy and reports errors instead of faking data.
+    let width = 40_000u32;
+    let rgba = pattern(width, 1);
+    let png = encode_png(width, 1, &rgba);
+    let media = Media::new();
+    let decoded = decode_image(&media, &png, Some("wide.png")).expect("large PNG must decode");
+    assert_eq!((decoded.width, decoded.height), (width, 1));
+}

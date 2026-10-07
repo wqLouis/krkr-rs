@@ -29,6 +29,8 @@ pub(crate) struct InstanceBundle {
     pub(crate) physical_device: vk::PhysicalDevice,
     /// `maxImageDimension2D` reported by the selected device.
     pub(crate) max_texture_dimension: u32,
+    /// Cached memory-type properties of the selected device.
+    pub(crate) memory_properties: vk::PhysicalDeviceMemoryProperties,
     /// Whether validation was requested and enabled.
     pub(crate) validation: bool,
 }
@@ -158,13 +160,15 @@ pub(crate) fn create_instance(config: &PipelineConfig) -> Result<InstanceBundle,
         }
     })?;
 
-    let (physical_device, max_texture_dimension) = select_physical_device(&instance)?;
+    let (physical_device, max_texture_dimension, memory_properties) =
+        select_physical_device(&instance)?;
 
     Ok(InstanceBundle {
         entry,
         instance,
         physical_device,
         max_texture_dimension,
+        memory_properties,
         validation,
     })
 }
@@ -175,14 +179,19 @@ pub(crate) fn create_instance(config: &PipelineConfig) -> Result<InstanceBundle,
 /// `VK_KHR_swapchain` device extension or a graphics queue is rejected.
 fn select_physical_device(
     instance: &ash::Instance,
-) -> Result<(vk::PhysicalDevice, u32), RenderError> {
+) -> Result<(vk::PhysicalDevice, u32, vk::PhysicalDeviceMemoryProperties), RenderError> {
     let devices = unsafe { instance.enumerate_physical_devices() }.map_err(|error| {
         RenderError::Unsupported {
             message: format!("failed to enumerate Vulkan physical devices: {error}"),
         }
     })?;
 
-    let mut best: Option<(u32, vk::PhysicalDevice, u32)> = None;
+    let mut best: Option<(
+        u32,
+        vk::PhysicalDevice,
+        u32,
+        vk::PhysicalDeviceMemoryProperties,
+    )> = None;
     for physical_device in devices {
         let properties = unsafe { instance.get_physical_device_properties(physical_device) };
         let type_rank = match properties.device_type {
@@ -205,16 +214,20 @@ fn select_physical_device(
         }
 
         let max_dimension = properties.limits.max_image_dimension2_d.max(1);
-        let candidate = (type_rank, physical_device, max_dimension);
+        let memory_properties =
+            unsafe { instance.get_physical_device_memory_properties(physical_device) };
+        let candidate = (type_rank, physical_device, max_dimension, memory_properties);
         if best.as_ref().is_none_or(|current| candidate.0 > current.0) {
             best = Some(candidate);
         }
     }
 
-    best.map(|(_, device, max_dimension)| (device, max_dimension))
-        .ok_or_else(|| RenderError::Unsupported {
-            message: "no Vulkan device supports VK_KHR_swapchain and a graphics queue".to_owned(),
-        })
+    best.map(|(_, device, max_dimension, memory_properties)| {
+        (device, max_dimension, memory_properties)
+    })
+    .ok_or_else(|| RenderError::Unsupported {
+        message: "no Vulkan device supports VK_KHR_swapchain and a graphics queue".to_owned(),
+    })
 }
 
 /// Returns `true` when `physical_device` exposes the named device extension.

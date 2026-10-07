@@ -4,6 +4,11 @@
 //! consumed by the middle layer (L2). The middle layer owns the semantic
 //! input state (focus, hit-testing, gestures); the host only captures raw
 //! device input and window/process facts.
+//!
+//! The module also declares the small host-facing traits the snapshots flow
+//! through ([`InputSource`], [`HostWindow`], [`Clock`], [`LogSink`]). They are
+//! contracts only: the L4 host glue implements them and `krkr-api` provides
+//! no implementation of its own.
 
 use std::path::PathBuf;
 
@@ -165,4 +170,81 @@ pub struct Presentation {
     pub presented: bool,
     /// A surface change the caller must react to, if any.
     pub surface_event: Option<SurfaceEvent>,
+}
+
+/// A source of raw per-frame input snapshots.
+///
+/// Implemented by L4 host glue and consumed by L2. Each call returns a fresh
+/// snapshot; the trait carries no engine state of its own.
+pub trait InputSource {
+    /// Returns the raw input captured since the previous frame.
+    fn state(&self) -> InputState;
+}
+
+/// The presentation window as exposed to the middle layer.
+///
+/// Implemented by L4 host glue. L2 uses it to query and adjust the logical
+/// surface; all platform windowing details stay behind the trait.
+pub trait HostWindow {
+    /// Returns the logical (DPI-independent) window size.
+    fn logical_size(&self) -> (u32, u32);
+
+    /// Sets the logical window size.
+    fn set_logical_size(&mut self, size: (u32, u32));
+
+    /// Sets the window title.
+    fn set_title(&mut self, title: &str);
+
+    /// Requests that the window redraw its contents.
+    fn request_redraw(&mut self);
+
+    /// Enables or disables fullscreen mode.
+    fn set_fullscreen(&mut self, on: bool);
+}
+
+/// A monotonic wall-clock source.
+///
+/// Implemented by the host so the middle layer (and tests) can observe time
+/// without owning a platform timer.
+pub trait Clock {
+    /// Returns the current time in milliseconds.
+    fn now_ms(&self) -> u64;
+}
+
+/// Severity of a [`LogRecord`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LogLevel {
+    /// A fatal or otherwise non-recoverable failure.
+    Error,
+    /// A recoverable problem worth surfacing.
+    Warn,
+    /// A normal informational event.
+    Info,
+    /// Detailed diagnostic information.
+    Debug,
+    /// Very detailed tracing information.
+    Trace,
+}
+
+/// A single structured log record.
+///
+/// This is a backend-agnostic value: L2 produces records and the host
+/// decides how they are formatted and stored.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogRecord {
+    /// Severity of the record.
+    pub level: LogLevel,
+    /// Subsystem or module that produced the record.
+    pub target: String,
+    /// Human-readable message.
+    pub message: String,
+}
+
+/// A destination for structured log records.
+///
+/// Implemented by L4 host glue (stderr, logcat, a rotating file, …) and
+/// called by L2. The sink owns all formatting, filtering and storage policy.
+pub trait LogSink {
+    /// Delivers one record to the sink.
+    fn log(&self, record: &LogRecord);
 }

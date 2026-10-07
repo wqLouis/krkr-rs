@@ -115,6 +115,12 @@ fn read_pixel(bitmap: &BitmapState, x: i32, y: i32) -> [u8; 4] {
     }
 }
 
+/// Clamp a `u32` pixel dimension to a non-negative `i32` (a plain `as i32`
+/// would wrap for sizes above `i32::MAX`).
+fn dim_i32(v: u32) -> i32 {
+    v.min(i32::MAX as u32) as i32
+}
+
 /// `FillColorOnAlpha`: source-over a constant color that **considers the
 /// destination alpha**, exactly like `TVPConstColorAlphaBlend_d`.
 ///
@@ -465,8 +471,8 @@ pub fn blit_copy_clipped(
         (
             dx,
             dy,
-            dx + (src_rect.2 - src_rect.0),
-            dy + (src_rect.3 - src_rect.1),
+            dx.saturating_add(src_rect.2.saturating_sub(src_rect.0)),
+            dy.saturating_add(src_rect.3.saturating_sub(src_rect.1)),
         ),
     ) else {
         return;
@@ -511,12 +517,13 @@ pub fn blit_over(
     treat_as_opaque: bool,
     hold_alpha: bool,
 ) {
-    let sw = src_rect.2 - src_rect.0;
-    let sh = src_rect.3 - src_rect.1;
+    let sw = src_rect.2.saturating_sub(src_rect.0);
+    let sh = src_rect.3.saturating_sub(src_rect.1);
     if sw <= 0 || sh <= 0 || opa == 0 || src.width == 0 || src.height == 0 {
         return;
     }
-    let Some(in_bounds) = intersect(dst, (dx, dy, dx + sw, dy + sh)) else {
+    let Some(in_bounds) = intersect(dst, (dx, dy, dx.saturating_add(sw), dy.saturating_add(sh)))
+    else {
         return;
     };
     let Some(dc) = intersect_rect(in_bounds, clip) else {
@@ -576,12 +583,14 @@ pub fn blit_plane(
         // vanish when they redraw over existing content (e.g.
         // `system/album.tjs::drawCompleteNumber` redraws the percentage
         // digits over the previous frame; a blend leaves the old strokes).
-        let sw = src_rect.2 - src_rect.0;
-        let sh = src_rect.3 - src_rect.1;
+        let sw = src_rect.2.saturating_sub(src_rect.0);
+        let sh = src_rect.3.saturating_sub(src_rect.1);
         if sw <= 0 || sh <= 0 || src.width == 0 || src.height == 0 {
             return;
         }
-        let Some(in_bounds) = intersect(dst, (dx, dy, dx + sw, dy + sh)) else {
+        let Some(in_bounds) =
+            intersect(dst, (dx, dy, dx.saturating_add(sw), dy.saturating_add(sh)))
+        else {
             return;
         };
         let Some(dc) = intersect_rect(in_bounds, clip) else {
@@ -601,12 +610,13 @@ pub fn blit_plane(
         dst.mark_dirty();
         return;
     }
-    let sw = src_rect.2 - src_rect.0;
-    let sh = src_rect.3 - src_rect.1;
+    let sw = src_rect.2.saturating_sub(src_rect.0);
+    let sh = src_rect.3.saturating_sub(src_rect.1);
     if sw <= 0 || sh <= 0 || src.width == 0 || src.height == 0 {
         return;
     }
-    let Some(in_bounds) = intersect(dst, (dx, dy, dx + sw, dy + sh)) else {
+    let Some(in_bounds) = intersect(dst, (dx, dy, dx.saturating_add(sw), dy.saturating_add(sh)))
+    else {
         return;
     };
     let Some(dc) = intersect_rect(in_bounds, clip) else {
@@ -679,18 +689,26 @@ pub fn tile_rect(
                 sh += dy;
                 dy = 0;
             }
-            if dx + sw > width as i32 {
-                sw = width as i32 - dx;
+            if dx.saturating_add(sw) > dim_i32(width) {
+                sw = dim_i32(width) - dx;
             }
-            if dy + sh > height as i32 {
-                sh = height as i32 - dy;
+            if dy.saturating_add(sh) > dim_i32(height) {
+                sh = dim_i32(height) - dy;
             }
             if sw > 0 && sh > 0 {
                 // Clip the tile against the destination bitmap too.
-                let dest_x = left + dx;
-                let dest_y = top + dy;
-                let src_rect = (sx, sy, sx + sw, sy + sh);
-                let Some(dc) = intersect(dst, (dest_x, dest_y, dest_x + sw, dest_y + sh)) else {
+                let dest_x = left.saturating_add(dx);
+                let dest_y = top.saturating_add(dy);
+                let src_rect = (sx, sy, sx.saturating_add(sw), sy.saturating_add(sh));
+                let Some(dc) = intersect(
+                    dst,
+                    (
+                        dest_x,
+                        dest_y,
+                        dest_x.saturating_add(sw),
+                        dest_y.saturating_add(sh),
+                    ),
+                ) else {
                     tx += tw;
                     continue;
                 };
@@ -714,7 +732,15 @@ fn composite_normal(dst: &mut BitmapState, dx: i32, dy: i32, src: &BitmapState, 
     if src.width == 0 || src.height == 0 {
         return;
     }
-    let Some(dc) = intersect(dst, (dx, dy, dx + src.width as i32, dy + src.height as i32)) else {
+    let Some(dc) = intersect(
+        dst,
+        (
+            dx,
+            dy,
+            dx.saturating_add(dim_i32(src.width)),
+            dy.saturating_add(dim_i32(src.height)),
+        ),
+    ) else {
         return;
     };
     for y in dc.1..dc.3 {
@@ -732,7 +758,15 @@ fn composite_hard_light(dst: &mut BitmapState, dx: i32, dy: i32, src: &BitmapSta
     if src.width == 0 || src.height == 0 {
         return;
     }
-    let Some(dc) = intersect(dst, (dx, dy, dx + src.width as i32, dy + src.height as i32)) else {
+    let Some(dc) = intersect(
+        dst,
+        (
+            dx,
+            dy,
+            dx.saturating_add(dim_i32(src.width)),
+            dy.saturating_add(dim_i32(src.height)),
+        ),
+    ) else {
         return;
     };
     for y in dc.1..dc.3 {
@@ -772,6 +806,10 @@ pub fn do_drop_shadow(
     if bitmap.width == 0 || bitmap.height == 0 {
         return;
     }
+    // `original` supplies the top layer and the shadow's alpha source;
+    // `shadow` is the recoloured, blurred buffer. `bitmap` itself is the work
+    // buffer, so only two full-buffer copies are made (the old code made
+    // three).
     let original = bitmap.clone();
     // Shadow = original alpha, RGB replaced by the shadow color, then blurred.
     let mut shadow = bitmap.clone();
@@ -781,11 +819,9 @@ pub fn do_drop_shadow(
         chunk[2] = shadow_color[2];
     }
     blur_bitmap_in_place(&mut shadow, blur, blur);
-    // work = original with the offset shadow, then the original on top.
-    let mut work = original.clone();
-    composite_normal(&mut work, dx, dy, &shadow, shadow_opacity);
-    composite_normal(&mut work, 0, 0, &original, 255);
-    bitmap.rgba = work.rgba;
+    // Original with the offset shadow, then the original on top.
+    composite_normal(bitmap, dx, dy, &shadow, shadow_opacity);
+    composite_normal(bitmap, 0, 0, &original, 255);
     bitmap.mark_dirty();
 }
 
@@ -832,7 +868,12 @@ pub fn fill_operate_rect(
     mode: i64,
     hold_alpha: bool,
 ) {
-    let rect = (left, top, left + width as i32, top + height as i32);
+    let rect = (
+        left,
+        top,
+        left.saturating_add(dim_i32(width)),
+        top.saturating_add(dim_i32(height)),
+    );
     let Some((x0, y0, x1, y1)) = intersect(bitmap, rect) else {
         return;
     };
@@ -936,37 +977,107 @@ pub fn fill_operate_rect(
     bitmap.mark_dirty();
 }
 
-/// A local box blur over the whole bitmap (the same kernel the layer effect
-/// path uses). Keeping the reference blur identical avoids a second, subtly
-/// different kernel.
+/// The horizontal box sum for one row: `out[x]` receives the sum of
+/// `rgba[y][max(0, x-rx) ..= min(w-1, x+rx)]` (four channels). Uses a sliding
+/// running sum, so the row costs `O(w)`.
+fn horizontal_box_sum(rgba: &[u8], w: usize, y: usize, rx: usize, out: &mut [[u64; 4]]) {
+    let base = y * w * 4;
+    let src = &rgba[base..base + w * 4];
+    let mut running = [0u64; 4];
+    for x in 0..=rx.min(w - 1) {
+        let i = x * 4;
+        for c in 0..4 {
+            running[c] += u64::from(src[i + c]);
+        }
+    }
+    for (x, slot) in out.iter_mut().enumerate() {
+        *slot = running;
+        // Slide to `x + 1`: the left edge moves off `x - rx` (when it has
+        // entered) and the right edge moves onto `x + 1 + rx` (when it is
+        // still inside the row).
+        if x >= rx {
+            let i = (x - rx) * 4;
+            for c in 0..4 {
+                running[c] -= u64::from(src[i + c]);
+            }
+        }
+        let add = x.saturating_add(1).saturating_add(rx);
+        if add < w {
+            let i = add * 4;
+            for c in 0..4 {
+                running[c] += u64::from(src[i + c]);
+            }
+        }
+    }
+}
+
+/// A local **separable running-sum box blur** over the whole bitmap (the same
+/// clamped-window kernel the reference layer effect path uses).
+///
+/// This is `O(w · h)` rather than the old `O(w · h · (2rx+1) · (2ry+1))`
+/// recomputation, and it reads the source in place into one scratch output
+/// buffer (no full `rgba.clone()`). The two passes keep *sums* rather than
+/// averages, so the final single integer division reproduces the old result
+/// exactly, including at the clamped edges where the window is smaller.
 pub fn blur_bitmap_in_place(bitmap: &mut BitmapState, xradius: u32, yradius: u32) {
     if bitmap.width == 0 || bitmap.height == 0 || (xradius == 0 && yradius == 0) {
         return;
     }
-    let source = bitmap.rgba.clone();
-    for y in 0..bitmap.height {
-        for x in 0..bitmap.width {
-            let x0 = x.saturating_sub(xradius);
-            let x1 = x.saturating_add(xradius).min(bitmap.width - 1);
-            let y0 = y.saturating_sub(yradius);
-            let y1 = y.saturating_add(yradius).min(bitmap.height - 1);
-            let mut sums = [0u32; 4];
-            let mut count = 0u32;
-            for sy in y0..=y1 {
-                for sx in x0..=x1 {
-                    let i = ((sy * bitmap.width + sx) * 4) as usize;
-                    for (channel, sum) in sums.iter_mut().enumerate() {
-                        *sum += u32::from(source[i + channel]);
-                    }
-                    count += 1;
-                }
-            }
-            let i = ((y * bitmap.width + x) * 4) as usize;
-            for (channel, &sum) in sums.iter().enumerate() {
-                bitmap.rgba[i + channel] = (sum / count) as u8;
+    let w = bitmap.width as usize;
+    let h = bitmap.height as usize;
+    // A radius wider than the image already covers the whole axis; clamping
+    // keeps the sums and indices small without changing the result.
+    let rx = (xradius as usize).min(w - 1);
+    let ry = (yradius as usize).min(h - 1);
+
+    let mut out = vec![0u8; bitmap.rgba.len()];
+    let mut row = vec![[0u64; 4]; w];
+    let mut acc = vec![[0u64; 4]; w];
+    let window = |x: usize, r: usize| -> u64 {
+        x.saturating_add(r).min(w - 1) as u64 - x.saturating_sub(r) as u64 + 1
+    };
+
+    // Seed the sliding column accumulator with the first row window.
+    for y in 0..=ry {
+        horizontal_box_sum(&bitmap.rgba, w, y, rx, &mut row);
+        for (a, r) in acc.iter_mut().zip(row.iter()) {
+            for c in 0..4 {
+                a[c] += r[c];
             }
         }
     }
+
+    for y in 0..h {
+        let y0 = y.saturating_sub(ry);
+        let cy = y.saturating_add(ry).min(h - 1) as u64 - y0 as u64 + 1;
+        let base = y * w * 4;
+        for (x, acc_x) in acc.iter().enumerate() {
+            let count = window(x, rx) * cy;
+            let i = base + x * 4;
+            for c in 0..4 {
+                out[i + c] = (acc_x[c] / count).min(255) as u8;
+            }
+        }
+        // Slide to `y + 1`.
+        if y >= ry {
+            horizontal_box_sum(&bitmap.rgba, w, y - ry, rx, &mut row);
+            for (a, r) in acc.iter_mut().zip(row.iter()) {
+                for c in 0..4 {
+                    a[c] -= r[c];
+                }
+            }
+        }
+        let add = y.saturating_add(1).saturating_add(ry);
+        if add < h {
+            horizontal_box_sum(&bitmap.rgba, w, add, rx, &mut row);
+            for (a, r) in acc.iter_mut().zip(row.iter()) {
+                for c in 0..4 {
+                    a[c] += r[c];
+                }
+            }
+        }
+    }
+    std::mem::swap(&mut bitmap.rgba, &mut out);
     bitmap.mark_dirty();
 }
 
@@ -1079,13 +1190,13 @@ fn sample_area(
     let ix1 = (sx1.ceil() as i32).max(ix0 + 1);
     let iy0 = sy0.floor() as i32;
     let iy1 = (sy1.ceil() as i32).max(iy0 + 1);
-    let mut acc = [0u32; 4];
-    let mut count = 0u32;
+    let mut acc = [0u64; 4];
+    let mut count = 0u64;
     for yy in iy0..iy1 {
         for xx in ix0..ix1 {
             let p = read_pixel_rect(bitmap, rect, xx, yy);
             for (c, a) in acc.iter_mut().enumerate() {
-                *a += u32::from(p[c]);
+                *a += u64::from(p[c]);
             }
             count += 1;
         }
@@ -1701,12 +1812,12 @@ pub fn operate_rect(
     opa: u8,
     hold_alpha: bool,
 ) {
-    let sw = src_rect.2 - src_rect.0;
-    let sh = src_rect.3 - src_rect.1;
+    let sw = src_rect.2.saturating_sub(src_rect.0);
+    let sh = src_rect.3.saturating_sub(src_rect.1);
     if sw <= 0 || sh <= 0 {
         return;
     }
-    let Some(dc) = intersect(dst, (dx, dy, dx + sw, dy + sh)) else {
+    let Some(dc) = intersect(dst, (dx, dy, dx.saturating_add(sw), dy.saturating_add(sh))) else {
         return;
     };
     for y in dc.1..dc.3 {
@@ -1827,11 +1938,24 @@ pub fn affine_blit(
         .map(|c| c.1)
         .fold(f64::NEG_INFINITY, f64::max)
         .ceil() as i32;
-    let Some(dc) = intersect(dst, (min_x, min_y, max_x + 1, max_y + 1)) else {
+    let Some(dc) = intersect(
+        dst,
+        (
+            min_x,
+            min_y,
+            max_x.saturating_add(1),
+            max_y.saturating_add(1),
+        ),
+    ) else {
         return;
     };
     if clear {
-        let clip = (min_x, min_y, max_x + 1, max_y + 1);
+        let clip = (
+            min_x,
+            min_y,
+            max_x.saturating_add(1),
+            max_y.saturating_add(1),
+        );
         if let Some(cc) = intersect(dst, clip) {
             for y in cc.1..cc.3 {
                 for x in cc.0..cc.2 {
@@ -1923,7 +2047,16 @@ fn ensure_primary_bitmap(scene: &mut Scene, primary_id: u32, w: u32, h: u32) -> 
         }
         return Some(bitmap_id);
     }
-    let bitmap_id = scene.add_bitmap(w, h, vec![0; w as usize * h as usize * 4]);
+    let bytes = (w as usize)
+        .checked_mul(h as usize)
+        .and_then(|pixels| pixels.checked_mul(4))?;
+    // A buffer this large is structurally impossible to allocate.
+    let mut rgba = Vec::new();
+    if rgba.try_reserve_exact(bytes).is_err() {
+        return None;
+    }
+    rgba.resize(bytes, 0);
+    let bitmap_id = scene.add_bitmap(w, h, rgba);
     if let Some(bitmap) = scene.bitmap_mut(bitmap_id) {
         bitmap.screen_buffer = true;
     }
@@ -1996,7 +2129,12 @@ fn draw_primary_bitmap(dst: &mut BitmapState, draw: &PrimaryDraw, src: &BitmapSt
 /// Fill a bitmapless solid layer's rect on the primary buffer.
 fn draw_primary_solid(dst: &mut BitmapState, draw: &PrimaryDraw, color: [u8; 4]) {
     let (sx, sy, sx1, sy1) = draw.src;
-    let dest = (draw.dx, draw.dy, draw.dx + (sx1 - sx), draw.dy + (sy1 - sy));
+    let dest = (
+        draw.dx,
+        draw.dy,
+        draw.dx.saturating_add(sx1.saturating_sub(sx)),
+        draw.dy.saturating_add(sy1.saturating_sub(sy)),
+    );
     let Some((x0, y0, x1, y1)) = intersect(dst, dest) else {
         return;
     };

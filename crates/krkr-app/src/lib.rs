@@ -144,8 +144,14 @@ pub struct Host {
     media: Media,
     /// TVP layer system owned by the host.
     scene: Scene,
-    /// Projected render tree, rebuilt by [`Host::step`].
+    /// Projected render tree, rebuilt in place by [`Host::step`] only when the
+    /// [`Scene`] revision changes.
     render_scene: RenderScene,
+    /// [`Scene::revision`] value that `render_scene` was projected from.
+    ///
+    /// `None` until the first projection, so the first [`Host::step`] (and any
+    /// forced redraw) always projects.
+    render_scene_revision: Option<u64>,
     /// Presentation surface for `render_state`.
     surface: Surface,
     /// GPU/staging/texture bookkeeping owned by the host.
@@ -196,6 +202,7 @@ impl Host {
             media,
             scene,
             render_scene,
+            render_scene_revision: None,
             surface,
             render_state,
             textures: HashMap::new(),
@@ -209,9 +216,10 @@ impl Host {
     /// Advances the host by one frame and presents it.
     ///
     /// This performs the projection seam in order: dirty bitmaps are synced
-    /// to textures, the layer tree is projected into a fresh [`RenderScene`],
-    /// and the pipeline renders it in a single call. `dt_ms` is accumulated
-    /// into [`Host::elapsed_ms`] for callers that animate.
+    /// to textures, the layer tree is projected into the persistent
+    /// [`RenderScene`] (skipped while [`Scene::revision`] is unchanged), and
+    /// the pipeline renders it in a single call. `dt_ms` is accumulated into
+    /// [`Host::elapsed_ms`] for callers that animate.
     ///
     /// # Errors
     ///
@@ -221,9 +229,7 @@ impl Host {
         self.sync_dirty_bitmaps();
         self.prune_stale_textures();
 
-        let textures = &self.textures;
-        let projected = project_scene(&self.scene, |bitmap| textures.get(&bitmap).cloned());
-        self.render_scene = projected;
+        self.reproject_render_scene();
 
         render(
             &self.pipeline,
@@ -238,6 +244,33 @@ impl Host {
             elapsed_ms: self.elapsed_ms,
             stats: self.last_frame(),
         })
+    }
+
+    /// Rebuilds [`Host::render_scene`] from the layer tree when it is stale.
+    ///
+    /// The projection is skipped while [`Scene::revision`] is unchanged, so a
+    /// static scene does not reallocate the render tree every frame. A
+    /// rebuild reuses the existing arena: [`RenderScene::nodes`] is cleared
+    /// (retaining its capacity) and refilled, so the persistent allocation is
+    /// kept and only the projected nodes' own allocations are touched. The
+    /// revision is `None` until the first projection, so the first frame (and
+    /// any forced redraw) always projects.
+    fn reproject_render_scene(&mut self) {
+        let revision = self.scene.revision();
+        if self.render_scene_revision == Some(revision) {
+            return;
+        }
+
+        let textures = &self.textures;
+        let projected = project_scene(&self.scene, |bitmap| textures.get(&bitmap).cloned());
+
+        // Reuse the arena instead of replacing the whole `RenderScene`.
+        self.render_scene.nodes.clear();
+        self.render_scene.root = projected.root;
+        self.render_scene.background = projected.background;
+        self.render_scene.nodes.extend(projected.nodes);
+
+        self.render_scene_revision = Some(revision);
     }
 
     /// Replaces the stored raw input snapshot.

@@ -25,7 +25,7 @@
 //! and layers whose texture is missing (with no solid fill fallback) are
 //! skipped, matching `sync_scene`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use krkr_api::blend::{BlendMode, DstBlend};
 use krkr_api::geometry::{PixelRegion, RectF};
@@ -186,10 +186,13 @@ pub struct ComposedLayer {
 pub fn compose_layer(scene: &Scene, layer_id: u32) -> Option<ComposedLayer> {
     let mut chain = Vec::new();
     let mut current = Some(layer_id);
-    let mut visited = HashSet::new();
     let window = scene.layer(layer_id)?.window;
+    // A simple ancestor chain cannot be longer than the number of layers in
+    // the scene, so a depth cap detects cycles without allocating a
+    // `HashSet` per call.
+    let max_depth = scene.layers.len();
     while let Some(id) = current {
-        if !visited.insert(id) {
+        if chain.len() >= max_depth {
             break;
         }
         let layer = scene.layer(id)?;
@@ -242,12 +245,14 @@ pub fn visible_image_region(
     bmp_w: u32,
     bmp_h: u32,
 ) -> Option<(PixelRegion, RectF)> {
-    let img_x = layer_rect.x + image_left;
-    let img_y = layer_rect.y + image_top;
+    let img_x = layer_rect.x.saturating_add(image_left);
+    let img_y = layer_rect.y.saturating_add(image_top);
+    let layer_x1 = layer_rect.x.saturating_add(dim_i32(layer_rect.w));
+    let layer_y1 = layer_rect.y.saturating_add(dim_i32(layer_rect.h));
     let vx0 = img_x.max(layer_rect.x);
     let vy0 = img_y.max(layer_rect.y);
-    let vx1 = (img_x + image_width as i32).min(layer_rect.x + layer_rect.w as i32);
-    let vy1 = (img_y + image_height as i32).min(layer_rect.y + layer_rect.h as i32);
+    let vx1 = img_x.saturating_add(dim_i32(image_width)).min(layer_x1);
+    let vy1 = img_y.saturating_add(dim_i32(image_height)).min(layer_y1);
     if vx1 <= vx0 || vy1 <= vy0 {
         return None;
     }
@@ -304,6 +309,12 @@ fn is_screen_buffer_layer(scene: &Scene, layer_id: u32) -> bool {
         .is_some_and(|bitmap| bitmap.screen_buffer)
 }
 
+/// Clamp a `u32` pixel dimension to a non-negative `i32` (a plain `as i32`
+/// would wrap for sizes above `i32::MAX`).
+fn dim_i32(v: u32) -> i32 {
+    v.min(i32::MAX as u32) as i32
+}
+
 /// The dimensions a bitmap presents to the projection, at least 1×1.
 fn bitmap_dims(scene: &Scene, layer: &LayerState) -> (u32, u32) {
     layer
@@ -312,45 +323,20 @@ fn bitmap_dims(scene: &Scene, layer: &LayerState) -> (u32, u32) {
         .map_or((1, 1), |bitmap| (bitmap.width.max(1), bitmap.height.max(1)))
 }
 
-/// Find the nearest ancestor layer that already has a projected node.
-///
-/// Because the window's layers are visited parent-first, a drawn parent is
-/// always present in `drawn`. Skipped ancestors (screen buffers, binders,
-/// empty layers) are simply passed over. Cross-window links are rejected.
-fn nearest_drawn_parent(
-    scene: &Scene,
-    layer: &LayerState,
-    drawn: &HashMap<u32, RenderNodeId>,
-) -> Option<RenderNodeId> {
-    let window = layer.window;
-    let mut current = layer.parent;
-    let mut visited = HashSet::new();
-    while let Some(id) = current {
-        if !visited.insert(id) {
-            return None;
-        }
-        let parent = scene.layer(id)?;
-        if parent.window != window {
-            return None;
-        }
-        if let Some(node) = drawn.get(&id) {
-            return Some(*node);
-        }
-        current = parent.parent;
-    }
-    None
-}
-
 /// Mutable bookkeeping shared while appending several windows to one scene.
 #[derive(Default)]
 struct ProjectionState {
-    /// `layer.id` → projected node, so children can link to a drawn parent.
-    drawn: HashMap<u32, RenderNodeId>,
     /// Monotonic sibling sort key across all windows of the scene.
     next_z: i32,
 }
 
 /// Append one window's drawn layers to `out`.
+///
+/// `Scene::window_layer_order` is parent-first, so a single forward pass
+/// composes every layer's ancestor position/opacity/visibility (via
+/// [`ComposedLayer`]) and resolves its nearest drawn ancestor. The old code
+/// rebuilt that information per layer with a `Vec` and a `HashSet` walk; this
+/// version allocates only two maps per window.
 fn append_window<F>(
     scene: &Scene,
     window: u32,
@@ -368,101 +354,141 @@ fn append_window<F>(
     }
     let win_opacity = clamp_opacity(window_state.opacity);
 
+    // Per-window composition state, keyed by layer id. Both maps only ever
+    // hold this window's layers, so a cross-window `parent` link simply misses
+    // and stops the chain exactly like the old ancestor walk.
+    let mut composed: HashMap<u32, ComposedLayer> = HashMap::new();
+    // Maps a layer id to the node its children should link to (its own node
+    // when drawn, otherwise its nearest drawn ancestor).
+    let mut nearest: HashMap<u32, RenderNodeId> = HashMap::new();
+
     for layer_id in scene.window_layer_order(window) {
         let Some(layer) = scene.layer(layer_id) else {
             continue;
         };
-        // A primary layer's synthesized screen buffer is never drawable.
-        if is_screen_buffer_layer(scene, layer_id) {
-            continue;
-        }
-        let Some(composed) = compose_layer(scene, layer_id) else {
-            continue;
-        };
-        if !composed.visible {
-            continue;
-        }
-        let opacity = win_opacity * composed.opacity;
-        let Some(blend) = resolve_blend(layer.blend_type, opacity) else {
-            // `ltBinder`: a container, not a drawable layer. Its children are
-            // separate nodes and still render.
-            continue;
-        };
 
-        // A bitmap layer draws its texture; a fill layer draws its solid
-        // colour; a layer with neither draws nothing.
-        let resolved_texture = if let Some(id) = layer.bitmap {
-            texture(id)
-        } else {
-            None
-        };
-        let content = match resolved_texture {
-            Some(handle) => RenderContent::Texture(handle),
-            None => match layer.fill_color {
-                Some(fill) => RenderContent::Solid(solid_color(fill)),
-                None => continue,
-            },
-        };
+        let mut node_composed = layer
+            .parent
+            .and_then(|parent| composed.get(&parent).copied())
+            .unwrap_or(ComposedLayer {
+                rect: Rect::default(),
+                opacity: 1.0,
+                visible: true,
+            });
+        node_composed.rect.x = node_composed.rect.x.saturating_add(layer.rect.x);
+        node_composed.rect.y = node_composed.rect.y.saturating_add(layer.rect.y);
+        node_composed.rect.w = layer.rect.w;
+        node_composed.rect.h = layer.rect.h;
+        node_composed.opacity *= clamp_opacity(layer.opacity);
+        node_composed.visible &= layer.visible;
+        composed.insert(layer_id, node_composed);
 
-        // A texture's destination/source come from the image placement model;
-        // a solid fill covers the whole layer rect with no source region.
-        let (dst, src) = match &content {
-            RenderContent::Texture(_) => {
-                let (bmp_w, bmp_h) = bitmap_dims(scene, layer);
-                let img_w = if layer.image_width > 0 {
-                    layer.image_width
-                } else {
-                    bmp_w
-                };
-                let img_h = if layer.image_height > 0 {
-                    layer.image_height
-                } else {
-                    bmp_h
-                };
-                match visible_image_region(
-                    composed.rect,
-                    layer.image_left,
-                    layer.image_top,
-                    img_w,
-                    img_h,
-                    bmp_w,
-                    bmp_h,
-                ) {
-                    Some((src, dst)) => (dst, src),
-                    // Fully clipped away: the layer draws nothing.
-                    None => continue,
-                }
+        // The nearest drawn ancestor's node, or the root.
+        let parent_node = layer
+            .parent
+            .and_then(|parent| nearest.get(&parent).copied())
+            .unwrap_or(out.root);
+
+        // Build the node only when the layer actually draws. Every `break`
+        // means "skipped": the layer still passes `parent_node` on to its
+        // children through `nearest` below.
+        let node = 'layer: {
+            if is_screen_buffer_layer(scene, layer_id) {
+                break 'layer None;
             }
-            _ => (
-                RectF::new(
-                    composed.rect.x as f32,
-                    composed.rect.y as f32,
-                    composed.rect.w as f32,
-                    composed.rect.h as f32,
+            if !node_composed.visible {
+                break 'layer None;
+            }
+            let opacity = win_opacity * node_composed.opacity;
+            let Some(blend) = resolve_blend(layer.blend_type, opacity) else {
+                // `ltBinder`: a container, not a drawable layer. Its children
+                // are separate nodes and still render.
+                break 'layer None;
+            };
+
+            // A bitmap layer draws its texture; a fill layer draws its solid
+            // colour; a layer with neither draws nothing.
+            let resolved_texture = if let Some(id) = layer.bitmap {
+                texture(id)
+            } else {
+                None
+            };
+            let content = match resolved_texture {
+                Some(handle) => RenderContent::Texture(handle),
+                None => match layer.fill_color {
+                    Some(fill) => RenderContent::Solid(solid_color(fill)),
+                    None => break 'layer None,
+                },
+            };
+
+            // A texture's destination/source come from the image placement
+            // model; a solid fill covers the whole layer rect with no source
+            // region.
+            let (dst, src) = match &content {
+                RenderContent::Texture(_) => {
+                    let (bmp_w, bmp_h) = bitmap_dims(scene, layer);
+                    let img_w = if layer.image_width > 0 {
+                        layer.image_width
+                    } else {
+                        bmp_w
+                    };
+                    let img_h = if layer.image_height > 0 {
+                        layer.image_height
+                    } else {
+                        bmp_h
+                    };
+                    match visible_image_region(
+                        node_composed.rect,
+                        layer.image_left,
+                        layer.image_top,
+                        img_w,
+                        img_h,
+                        bmp_w,
+                        bmp_h,
+                    ) {
+                        Some((src, dst)) => (dst, src),
+                        // Fully clipped away: the layer draws nothing.
+                        None => break 'layer None,
+                    }
+                }
+                _ => (
+                    RectF::new(
+                        node_composed.rect.x as f32,
+                        node_composed.rect.y as f32,
+                        node_composed.rect.w as f32,
+                        node_composed.rect.h as f32,
+                    ),
+                    PixelRegion::ZERO,
                 ),
-                PixelRegion::ZERO,
-            ),
+            };
+
+            Some(RenderNode {
+                parent: Some(parent_node),
+                content,
+                dst,
+                src,
+                opacity,
+                visible: true,
+                z: state.next_z,
+                blend,
+                hold_alpha: layer.hold_alpha,
+                ..RenderNode::default()
+            })
         };
 
-        let parent = nearest_drawn_parent(scene, layer, &state.drawn).unwrap_or(out.root);
-        let node = RenderNode {
-            parent: Some(parent),
-            content,
-            dst,
-            src,
-            opacity,
-            visible: true,
-            z: state.next_z,
-            blend,
-            hold_alpha: layer.hold_alpha,
-            ..RenderNode::default()
-        };
-        let id = out.push(node);
-        if let Some(parent_node) = out.node_mut(parent) {
-            parent_node.children.push(id);
+        match node {
+            Some(node) => {
+                let id = out.push(node);
+                if let Some(parent_node) = out.node_mut(parent_node) {
+                    parent_node.children.push(id);
+                }
+                nearest.insert(layer_id, id);
+                state.next_z = state.next_z.saturating_add(1);
+            }
+            None => {
+                nearest.insert(layer_id, parent_node);
+            }
         }
-        state.drawn.insert(layer_id, id);
-        state.next_z = state.next_z.saturating_add(1);
     }
 }
 

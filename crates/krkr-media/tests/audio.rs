@@ -74,23 +74,14 @@ fn seek_reopens_and_lands_on_the_requested_frame() {
 }
 
 #[test]
-fn opus_fallback_produces_silent_samples() {
+fn undecodable_opus_returns_an_error() {
     let media = Media::new();
+    // An Ogg Opus signature with no valid stream: probing/decoding must fail
+    // with a typed error, never substitute silence.
     let fake_opus = b"OggS\x00\x00\x00\x00OpusHead\x00\x00\x00\x00";
-    let decoded = decode_audio(&media, fake_opus, Some("voice.opus")).expect("fallback");
-    assert_eq!(decoded.spec.sample_rate, 48_000);
-    assert_eq!(decoded.spec.channels, 2);
-    assert_eq!(decoded.frame_count(), 2_880);
-    assert_eq!(decoded.spec.duration_ms(), Some(60));
-
-    let (spec, mut state) =
-        open_audio(&media, Arc::from(fake_opus.as_slice()), Some("voice.opus")).expect("open");
-    assert_eq!(spec.sample_rate, 48_000);
-    // The fallback state yields ~60 ms of silence; a full read must be zeroed.
-    let mut chunk = vec![1.0f32; 64];
-    let written = read_audio(&media, &mut state, &mut chunk).expect("read fallback");
-    assert!(written > 0);
-    assert!(chunk[..written].iter().all(|&sample| sample == 0.0));
+    assert!(probe_audio(&media, fake_opus, Some("voice.opus")).is_err());
+    assert!(decode_audio(&media, fake_opus, Some("voice.opus")).is_err());
+    assert!(open_audio(&media, Arc::from(fake_opus.as_slice()), Some("voice.opus")).is_err());
 }
 
 #[test]

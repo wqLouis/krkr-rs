@@ -45,7 +45,7 @@ pub use scene::{
     LT_SUBTRACTIVE, LayerState, Rect, Scene, WindowState,
 };
 pub use storage::{
-    ATTR_DIRECTORY, ATTR_NORMAL, Location, MountError, ReadError, Storage, StorageMetadata,
+    ATTR_DIRECTORY, ATTR_NORMAL, Location, MountError, Storage, StorageMetadata, StorageReadError,
 };
 // The four `LT_*` values above already exist in `scene`; the projection adds
 // the rest of the native set without duplicating them.

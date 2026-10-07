@@ -76,7 +76,7 @@ fn backend_mismatch_is_an_error() {
     let host = FileSystem::host(dir.clone());
     assert!(matches!(
         read_at(&host, &file, 0, &mut [0u8; 1]),
-        Err(FsError::Unsupported { .. })
+        Err(FsError::InvalidState { .. })
     ));
     let _ = std::fs::remove_dir_all(&dir);
 }

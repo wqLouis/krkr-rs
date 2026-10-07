@@ -8,12 +8,25 @@
 use thiserror::Error;
 
 /// Errors from the bottom file-system surface.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum FsError {
     /// An underlying I/O operation failed.
     #[error("file-system I/O error: {message}")]
     Io {
         /// Human-readable description of the failure.
+        message: String,
+    },
+    /// The handle or backend was used in a state that does not permit the
+    /// requested operation.
+    ///
+    /// Unlike [`FsError::Io`], this reports a bad call (for example reading
+    /// from a handle opened write-only, or using a file handle that belongs
+    /// to a different backend) rather than a failure of the underlying I/O
+    /// device.
+    #[error("invalid file-system state: {message}")]
+    InvalidState {
+        /// Human-readable description of the state error.
         message: String,
     },
     /// The requested path or entry does not exist.
@@ -63,6 +76,7 @@ pub enum FsError {
 }
 
 /// Errors from the bottom media decode engine.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum MediaError {
     /// An underlying I/O or container read failed.
@@ -80,7 +94,8 @@ pub enum MediaError {
     /// Decoding failed.
     #[error("failed to decode media ({format}): {message}")]
     Decode {
-        /// Format/codec name, or an empty string when unknown.
+        /// Detected format/codec/container name, or an empty string when it
+        /// could not be determined. Call-site hints belong in `message`.
         format: String,
         /// Human-readable description of the failure.
         message: String,
@@ -109,6 +124,7 @@ pub enum MediaError {
 }
 
 /// Errors from the bottom render pipeline.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum RenderError {
     /// The render backend cannot provide the requested capability.
@@ -162,6 +178,7 @@ pub enum RenderError {
 }
 
 /// Errors from the bottom font/glyph rasterizer.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum GlyphError {
     /// Font parsing or loading failed.
@@ -197,6 +214,7 @@ pub enum GlyphError {
 }
 
 /// Errors from the bottom audio device output.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum AudioError {
     /// The audio backend cannot provide the requested capability.

@@ -2,11 +2,12 @@
 //!
 //! Two programs are compiled: a textured quad and a solid quad. Each is
 //! instantiated once per fixed-function blend mode, so a draw only selects a
-//! pipeline and never rebuilds state. Destination-dependent blend modes fall
-//! back to [`BlendMode::SourceOver`] (see
-//! [`blend_state`](self::blend_state_for)); the dedicated destination-sampling
-//! shader path described in `docs/migration/04-renderer-vulkan.md` §4 is not
-//! implemented yet.
+//! pipeline and never rebuilds state. Destination-dependent blend modes need
+//! a shader that samples the destination, which this backend does not
+//! implement; [`PipelineSet::pipeline_for`] reports them as
+//! [`RenderError::Unsupported`] instead of silently degrading to source-over
+//! (D11). See `docs/migration/04-renderer-vulkan.md` §4 for the deferred
+//! dedicated path.
 
 use ash::vk;
 
@@ -51,13 +52,26 @@ pub(crate) struct PipelineSet {
 impl PipelineSet {
     /// Returns the pipeline for `program` and `mode`.
     ///
-    /// Destination-dependent modes resolve to the source-over pipeline.
-    pub(crate) fn pipeline_for(&self, program: Program, mode: BlendMode) -> vk::Pipeline {
-        let slot = blend_slot(mode);
-        match program {
+    /// # Errors
+    ///
+    /// Returns [`RenderError::Unsupported`] for a destination-dependent blend
+    /// mode, which requires a destination-sampling shader this backend does
+    /// not implement.
+    pub(crate) fn pipeline_for(
+        &self,
+        program: Program,
+        mode: BlendMode,
+    ) -> Result<vk::Pipeline, RenderError> {
+        let slot = blend_slot(mode).ok_or_else(|| RenderError::Unsupported {
+            message: format!(
+                "blend mode {mode:?} requires destination sampling, which the Vulkan backend \
+                 does not implement"
+            ),
+        })?;
+        Ok(match program {
             Program::Textured => self.textured[slot],
             Program::Solid => self.solid[slot],
-        }
+        })
     }
 
     /// Destroys every resource owned by the set.
@@ -84,15 +98,58 @@ impl PipelineSet {
 /// Builds all pipelines and the shared descriptor/sampler/quad resources.
 pub(crate) fn create(
     device: &ash::Device,
-    instance: &ash::Instance,
-    physical_device: vk::PhysicalDevice,
+    memory_properties: &vk::PhysicalDeviceMemoryProperties,
     render_pass: vk::RenderPass,
 ) -> Result<PipelineSet, RenderError> {
     let descriptor_set_layout = create_descriptor_set_layout(device)?;
-    let pipeline_layout = create_pipeline_layout(device, descriptor_set_layout)?;
-    let descriptor_pool = create_descriptor_pool(device)?;
-    let sampler = create_sampler(device)?;
-    let (vertex_buffer, vertex_memory) = create_unit_quad(device, instance, physical_device)?;
+
+    let pipeline_layout = match create_pipeline_layout(device, descriptor_set_layout) {
+        Ok(layout) => layout,
+        Err(error) => {
+            // SAFETY: the layout was created here and nothing else uses it.
+            unsafe { device.destroy_descriptor_set_layout(descriptor_set_layout, None) };
+            return Err(error);
+        }
+    };
+
+    let descriptor_pool = match create_descriptor_pool(device) {
+        Ok(pool) => pool,
+        Err(error) => {
+            // SAFETY: both handles were created here and nothing else uses them.
+            unsafe {
+                device.destroy_pipeline_layout(pipeline_layout, None);
+                device.destroy_descriptor_set_layout(descriptor_set_layout, None);
+            }
+            return Err(error);
+        }
+    };
+
+    let sampler = match create_sampler(device) {
+        Ok(sampler) => sampler,
+        Err(error) => {
+            // SAFETY: all three handles were created here and are unused.
+            unsafe {
+                device.destroy_descriptor_pool(descriptor_pool, None);
+                device.destroy_pipeline_layout(pipeline_layout, None);
+                device.destroy_descriptor_set_layout(descriptor_set_layout, None);
+            }
+            return Err(error);
+        }
+    };
+
+    let (vertex_buffer, vertex_memory) = match create_unit_quad(device, memory_properties) {
+        Ok(quad) => quad,
+        Err(error) => {
+            // SAFETY: all four handles were created here and are unused.
+            unsafe {
+                device.destroy_sampler(sampler, None);
+                device.destroy_descriptor_pool(descriptor_pool, None);
+                device.destroy_pipeline_layout(pipeline_layout, None);
+                device.destroy_descriptor_set_layout(descriptor_set_layout, None);
+            }
+            return Err(error);
+        }
+    };
 
     let vertex_module = create_shader_module(device, shaders::QUAD_VERT)?;
     let textured_fragment = create_shader_module(device, shaders::TEXTURED_FRAG)?;
@@ -166,18 +223,21 @@ pub(crate) fn create(
 }
 
 /// Maps a [`BlendMode`] to its fixed-function pipeline slot.
-fn blend_slot(mode: BlendMode) -> usize {
+///
+/// Destination-dependent modes have no slot; `None` tells
+/// [`PipelineSet::pipeline_for`] to report them as unsupported.
+fn blend_slot(mode: BlendMode) -> Option<usize> {
     match mode {
-        BlendMode::SourceOver => 0,
-        BlendMode::Replace => 1,
-        BlendMode::Additive => 2,
-        BlendMode::Subtractive => 3,
-        BlendMode::AddAlpha => 4,
-        BlendMode::Multiply => 5,
-        BlendMode::Screen => 6,
-        // Destination-dependent modes are deferred and fall back to
-        // source-over. The hardware blend state cannot read the destination.
-        BlendMode::DestinationDependent(_) => 0,
+        BlendMode::SourceOver => Some(0),
+        BlendMode::Replace => Some(1),
+        BlendMode::Additive => Some(2),
+        BlendMode::Subtractive => Some(3),
+        BlendMode::AddAlpha => Some(4),
+        BlendMode::Multiply => Some(5),
+        BlendMode::Screen => Some(6),
+        // These modes must read the destination color, so the fixed-function
+        // blend state cannot express them.
+        BlendMode::DestinationDependent(_) => None,
     }
 }
 
@@ -331,8 +391,7 @@ fn create_sampler(device: &ash::Device) -> Result<vk::Sampler, RenderError> {
 /// shader maps it through the per-node push constant matrix.
 fn create_unit_quad(
     device: &ash::Device,
-    instance: &ash::Instance,
-    physical_device: vk::PhysicalDevice,
+    memory_properties: &vk::PhysicalDeviceMemoryProperties,
 ) -> Result<(vk::Buffer, vk::DeviceMemory), RenderError> {
     const VERTICES: [f32; 8] = [0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0];
     let size = std::mem::size_of_val(&VERTICES) as vk::DeviceSize;
@@ -350,12 +409,18 @@ fn create_unit_quad(
 
     // SAFETY: `buffer` was just created by `device`.
     let requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
-    let memory_type = find_memory_type(
-        instance,
-        physical_device,
+    let memory_type = match find_memory_type(
+        memory_properties,
         requirements.memory_type_bits,
         vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-    )?;
+    ) {
+        Ok(memory_type) => memory_type,
+        Err(error) => {
+            // SAFETY: `buffer` is owned here and not used elsewhere yet.
+            unsafe { device.destroy_buffer(buffer, None) };
+            return Err(error);
+        }
+    };
 
     let allocate_info = vk::MemoryAllocateInfo::default()
         .allocation_size(requirements.size)
@@ -363,6 +428,8 @@ fn create_unit_quad(
     // SAFETY: `allocate_info` is valid; the memory is freed with the buffer in
     // `PipelineSet::destroy`.
     let memory = unsafe { device.allocate_memory(&allocate_info, None) }.map_err(|error| {
+        // SAFETY: `buffer` is owned here.
+        unsafe { device.destroy_buffer(buffer, None) };
         RenderError::OutOfMemory {
             message: format!("failed to allocate unit-quad memory: {error}"),
         }
@@ -381,10 +448,19 @@ fn create_unit_quad(
     }
 
     // SAFETY: the memory is host-visible and not currently in use by the GPU.
-    let mapped = unsafe { device.map_memory(memory, 0, size, vk::MemoryMapFlags::empty()) }
-        .map_err(|error| RenderError::OutOfMemory {
-            message: format!("failed to map unit-quad memory: {error}"),
-        })?;
+    let mapped = match unsafe { device.map_memory(memory, 0, size, vk::MemoryMapFlags::empty()) } {
+        Ok(mapped) => mapped,
+        Err(error) => {
+            // SAFETY: both handles are owned here and unused elsewhere yet.
+            unsafe {
+                device.destroy_buffer(buffer, None);
+                device.free_memory(memory, None);
+            }
+            return Err(RenderError::OutOfMemory {
+                message: format!("failed to map unit-quad memory: {error}"),
+            });
+        }
+    };
     // SAFETY: `mapped` points at `size` writable bytes owned by `memory`.
     unsafe {
         std::ptr::copy_nonoverlapping(VERTICES.as_ptr(), mapped.cast::<f32>(), VERTICES.len());

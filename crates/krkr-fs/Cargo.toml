@@ -7,5 +7,3 @@ license.workspace = true
 
 [dependencies]
 krkr-api = { workspace = true }
-thiserror = { workspace = true }
-log = { workspace = true }

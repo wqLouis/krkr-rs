@@ -220,3 +220,21 @@ impl RenderScene {
         self.nodes.len()
     }
 }
+
+/// Sort key used to order siblings for drawing: lower `z` draws first.
+///
+/// Kept here so the null and Vulkan backends cannot drift in ordering
+/// semantics.
+pub(crate) fn child_sort_key(scene: &RenderScene, child: RenderNodeId) -> i32 {
+    scene.node(child).map_or(0, |node| node.z)
+}
+
+/// Returns `true` when `children` are already in nondecreasing `z` order.
+///
+/// Drawing can iterate the borrowed slice directly in that common case,
+/// avoiding a clone and sort of every node's children on every frame.
+pub(crate) fn children_are_sorted(scene: &RenderScene, children: &[RenderNodeId]) -> bool {
+    children
+        .windows(2)
+        .all(|pair| child_sort_key(scene, pair[0]) <= child_sort_key(scene, pair[1]))
+}

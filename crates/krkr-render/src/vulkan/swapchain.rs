@@ -9,6 +9,8 @@ use ash::vk;
 
 use krkr_api::error::RenderError;
 
+use crate::texture::TextureFormat;
+
 /// Immutable-per-format render pass plus its framebuffers.
 pub(crate) struct SwapchainState {
     /// Swapchain handle.
@@ -70,25 +72,26 @@ impl SwapchainState {
 /// Builds the swapchain for `surface`.
 ///
 /// `requested` is the desired pixel size; it is only used when the surface
-/// reports a free extent (`current_extent == u32::MAX`). When `old` is
-/// supplied its format, present mode and render pass are reused so the
-/// swapchain can be recreated without touching the graphics pipelines.
+/// reports a free extent (`current_extent == u32::MAX`). `preferred_format`
+/// biases the first format choice. When `old` is supplied its format, present
+/// mode and render pass are reused so the swapchain can be recreated without
+/// touching the graphics pipelines.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn create(
     device: &ash::Device,
-    _instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
     surface_loader: &ash::khr::surface::Instance,
     swapchain_loader: &ash::khr::swapchain::Device,
     surface: vk::SurfaceKHR,
     requested: (u32, u32),
+    preferred_format: TextureFormat,
     old: Option<&SwapchainState>,
 ) -> Result<SwapchainState, RenderError> {
     // A partially built state has a null render pass; treat it as "no old
     // swapchain" so a retry rebuilds everything from scratch.
     let old = old.filter(|state| state.render_pass != vk::RenderPass::null());
-    // SAFETY: `physical_device` and `surface` belong to `instance`; the
-    // queries are read-only.
+    // SAFETY: `physical_device` and `surface` belong to the pipeline's
+    // instance; the queries are read-only.
     let capabilities = unsafe {
         surface_loader.get_physical_device_surface_capabilities(physical_device, surface)
     }
@@ -106,8 +109,10 @@ pub(crate) fn create(
             .map_err(|error| RenderError::Framebuffer {
                 message: format!("failed to query surface formats: {error}"),
             })?;
-            choose_surface_format(&formats).ok_or_else(|| RenderError::Unsupported {
-                message: "the presentation surface exposes no color format".to_owned(),
+            choose_surface_format(&formats, preferred_format).ok_or_else(|| {
+                RenderError::Unsupported {
+                    message: "the presentation surface exposes no color format".to_owned(),
+                }
             })?
         }
     };
@@ -338,16 +343,32 @@ fn create_image_view(
     })
 }
 
-/// Picks an 8-bit sRGB surface format, preferring BGRA (the common desktop
-/// layout). Falls back to the first advertised format.
-fn choose_surface_format(formats: &[vk::SurfaceFormatKHR]) -> Option<vk::SurfaceFormatKHR> {
-    let preferred = [
-        vk::Format::B8G8R8A8_SRGB,
-        vk::Format::R8G8B8A8_SRGB,
-        vk::Format::B8G8R8A8_UNORM,
-        vk::Format::R8G8B8A8_UNORM,
-    ];
-    for format in preferred {
+/// Picks an 8-bit surface format, preferring the requested [`TextureFormat`]
+/// when the surface advertises it.
+///
+/// `Rgba8Srgb` (the default) prefers BGRA (the common desktop layout), while
+/// `Rgba8Unorm` prefers the closest linear layout. `R8Unorm` has no colour
+/// surface equivalent and falls back to the sRGB order. Falls back to the
+/// first advertised format when none of the preferred layouts is available.
+fn choose_surface_format(
+    formats: &[vk::SurfaceFormatKHR],
+    preferred: TextureFormat,
+) -> Option<vk::SurfaceFormatKHR> {
+    let order = match preferred {
+        TextureFormat::Rgba8Unorm => [
+            vk::Format::R8G8B8A8_UNORM,
+            vk::Format::B8G8R8A8_UNORM,
+            vk::Format::R8G8B8A8_SRGB,
+            vk::Format::B8G8R8A8_SRGB,
+        ],
+        TextureFormat::Rgba8Srgb | TextureFormat::R8Unorm => [
+            vk::Format::B8G8R8A8_SRGB,
+            vk::Format::R8G8B8A8_SRGB,
+            vk::Format::B8G8R8A8_UNORM,
+            vk::Format::R8G8B8A8_UNORM,
+        ],
+    };
+    for format in order {
         if let Some(found) = formats.iter().find(|candidate| candidate.format == format) {
             return Some(*found);
         }

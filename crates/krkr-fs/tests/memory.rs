@@ -62,6 +62,76 @@ fn memory_positional_write_extends_with_zeros() {
 }
 
 #[test]
+fn memory_write_at_rejects_overflowing_offsets() {
+    let fs = FileSystem::memory();
+    create_dir_all(&fs, &FsPath::host("/d")).unwrap();
+    let file = open(&fs, &FsPath::host("/d/a"), OpenMode::Write).unwrap();
+
+    // `offset + buf.len()` overflows `u64`: a typed error, never a panic.
+    assert!(matches!(
+        write_at(&fs, &file, u64::MAX, b"ab"),
+        Err(FsError::Unsupported { .. })
+    ));
+    assert!(matches!(
+        write_at(&fs, &file, u64::MAX - 1, b"ab"),
+        Err(FsError::Unsupported { .. })
+    ));
+
+    // The rejected writes must not have extended the file.
+    assert_eq!(file_size(&fs, &file).unwrap(), 0);
+}
+
+#[cfg(target_pointer_width = "32")]
+#[test]
+fn memory_write_at_rejects_unrepresentable_offset() {
+    let fs = FileSystem::memory();
+    create_dir_all(&fs, &FsPath::host("/d")).unwrap();
+    let file = open(&fs, &FsPath::host("/d/a"), OpenMode::Write).unwrap();
+
+    // An offset beyond `usize::MAX` on 32-bit targets (where a raw
+    // `offset as usize` would silently truncate to a low position).
+    assert!(matches!(
+        write_at(&fs, &file, 1u64 << 32, b"x"),
+        Err(FsError::Unsupported { .. })
+    ));
+    assert_eq!(file_size(&fs, &file).unwrap(), 0);
+}
+
+#[test]
+fn memory_write_at_allows_large_valid_offset() {
+    let fs = FileSystem::memory();
+    create_dir_all(&fs, &FsPath::host("/d")).unwrap();
+    let file = open(&fs, &FsPath::host("/d/a"), OpenMode::Write).unwrap();
+
+    // No arbitrary size cap: a large (but representable and allocatable)
+    // file is allowed to grow.
+    let offset: u64 = 64 * 1024 * 1024;
+    assert_eq!(write_at(&fs, &file, offset, b"end").unwrap(), 3);
+    assert_eq!(file_size(&fs, &file).unwrap(), offset + 3);
+    drop(file);
+
+    let file = open(&fs, &FsPath::host("/d/a"), OpenMode::Read).unwrap();
+    let mut buf = [0u8; 3];
+    assert_eq!(read_at(&fs, &file, offset, &mut buf).unwrap(), 3);
+    assert_eq!(&buf, b"end");
+}
+
+#[test]
+fn memory_read_at_huge_offset_is_eof() {
+    let fs = FileSystem::memory();
+    create_dir_all(&fs, &FsPath::host("/d")).unwrap();
+    let file = open(&fs, &FsPath::host("/d/a"), OpenMode::Write).unwrap();
+    write_at(&fs, &file, 0, b"abcd").unwrap();
+    drop(file);
+
+    let file = open(&fs, &FsPath::host("/d/a"), OpenMode::Read).unwrap();
+    let mut buf = [0u8; 4];
+    // Must not panic nor wrap to offset 0 on 32-bit targets.
+    assert_eq!(read_at(&fs, &file, u64::MAX, &mut buf).unwrap(), 0);
+    assert_eq!(read_at(&fs, &file, 1u64 << 40, &mut buf).unwrap(), 0);
+}
+
+#[test]
 fn memory_seek_positions_cursor() {
     let fs = FileSystem::memory();
     create_dir_all(&fs, &FsPath::host("/d")).unwrap();
@@ -74,6 +144,23 @@ fn memory_seek_positions_cursor() {
     assert_eq!(seek(&fs, &mut file, SeekFrom::Current(1)).unwrap(), 3);
     assert_eq!(seek(&fs, &mut file, SeekFrom::End(-1)).unwrap(), 3);
     assert!(seek(&fs, &mut file, SeekFrom::Current(-10)).is_err());
+}
+
+#[test]
+fn memory_seek_past_u64_max_is_an_error() {
+    let fs = FileSystem::memory();
+    create_dir_all(&fs, &FsPath::host("/d")).unwrap();
+    let file = open(&fs, &FsPath::host("/d/a"), OpenMode::Write).unwrap();
+    write_at(&fs, &file, 0, b"abcd").unwrap();
+    drop(file);
+
+    let mut file = open(&fs, &FsPath::host("/d/a"), OpenMode::Read).unwrap();
+    assert_eq!(
+        seek(&fs, &mut file, SeekFrom::Start(u64::MAX)).unwrap(),
+        u64::MAX
+    );
+    // Previously `target as u64` would silently wrap here.
+    assert!(seek(&fs, &mut file, SeekFrom::Current(1)).is_err());
 }
 
 #[test]

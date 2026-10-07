@@ -101,12 +101,12 @@ pub enum MountError {
     Fs(#[from] FsError),
     /// An archive failed to open or parse.
     #[error("archive error: {0}")]
-    Xp3(#[from] xp3::Error),
+    Xp3(#[from] xp3::Xp3Error),
 }
 
 /// Errors while reading or listing storage entries.
 #[derive(Debug, thiserror::Error)]
-pub enum ReadError {
+pub enum StorageReadError {
     /// The requested storage name did not resolve.
     #[error("storage not found: {0}")]
     NotFound(String),
@@ -115,7 +115,7 @@ pub enum ReadError {
     Fs(#[from] FsError),
     /// An archive read failed.
     #[error("archive error: {0}")]
-    Xp3(#[from] xp3::Error),
+    Xp3(#[from] xp3::Xp3Error),
 }
 
 impl Storage {
@@ -444,21 +444,23 @@ impl Storage {
     }
 
     /// Reads a storage entry to bytes (disk file or archive member).
-    pub fn read(&self, name: &str) -> Result<Vec<u8>, ReadError> {
+    pub fn read(&self, name: &str) -> Result<Vec<u8>, StorageReadError> {
         match self.find(name) {
-            Some(Location::Disk(path)) => read_fs_file(&self.fs, &path).map_err(ReadError::Fs),
+            Some(Location::Disk(path)) => {
+                read_fs_file(&self.fs, &path).map_err(StorageReadError::Fs)
+            }
             Some(Location::Archive(arc_path, in_arc)) => {
                 let mounted = self
                     .archives
                     .iter()
                     .find(|m| m.path == arc_path)
-                    .ok_or_else(|| ReadError::NotFound(name.to_string()))?;
+                    .ok_or_else(|| StorageReadError::NotFound(name.to_string()))?;
                 mounted
                     .archive
                     .read(&self.fs, &mounted.file, &in_arc)
-                    .map_err(ReadError::Xp3)
+                    .map_err(StorageReadError::Xp3)
             }
-            None => Err(ReadError::NotFound(name.to_string())),
+            None => Err(StorageReadError::NotFound(name.to_string())),
         }
     }
 
@@ -505,7 +507,7 @@ impl Storage {
     ///
     /// A missing or non-directory `dir` lists nothing (it does not error);
     /// only a bottom file-system failure propagates.
-    pub fn list(&self, dir: &str) -> Result<Vec<String>, ReadError> {
+    pub fn list(&self, dir: &str) -> Result<Vec<String>, StorageReadError> {
         let normalized = normalize_in_archive_name(dir);
         let normalized = normalized.trim_end_matches('/').to_string();
         let mut found = BTreeSet::new();
@@ -522,7 +524,7 @@ impl Storage {
                 }
             }
             Err(FsError::NotFound { .. }) | Err(FsError::NotADirectory { .. }) => {}
-            Err(e) => return Err(ReadError::Fs(e)),
+            Err(e) => return Err(StorageReadError::Fs(e)),
         }
 
         let prefix = if normalized.is_empty() {
@@ -671,8 +673,15 @@ fn system_time_from_millis(ms: u64) -> SystemTime {
 /// Reads a whole file through the bottom positional API.
 fn read_fs_file(fs: &FileSystem, path: &Path) -> Result<Vec<u8>, FsError> {
     let file = krkr_fs::open(fs, &FsPath::host(path), OpenMode::Read)?;
-    let size = krkr_fs::file_size(fs, &file)? as usize;
-    let mut out = vec![0u8; size];
+    let size = krkr_fs::file_size(fs, &file)?;
+    let size = usize::try_from(size).map_err(|_| FsError::Io {
+        message: "file size does not fit in usize".to_string(),
+    })?;
+    let mut out = Vec::new();
+    out.try_reserve_exact(size).map_err(|_| FsError::Io {
+        message: "file size cannot be allocated".to_string(),
+    })?;
+    out.resize(size, 0);
     let mut read = 0usize;
     while read < size {
         let n = krkr_fs::read_at(fs, &file, read as u64, &mut out[read..])?;

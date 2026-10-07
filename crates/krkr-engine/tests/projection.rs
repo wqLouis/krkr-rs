@@ -605,3 +605,41 @@ fn hold_alpha_is_carried_through() {
     assert_eq!(nodes.len(), 1);
     assert!(nodes[0].hold_alpha);
 }
+
+/// Visibility is inherited (`GetNodeVisible = parent_visible && visible`), so
+/// an invisible parent hides its whole subtree.
+#[test]
+fn invisible_parent_hides_its_subtree() {
+    let mut scene = Scene::default();
+    let win = scene.add_window("t", (64, 64));
+    let grandparent = scene.add_layer(win, None);
+    {
+        let l = scene.layer_mut(grandparent).unwrap();
+        l.fill_color = Some([1, 2, 3, 255]);
+        l.rect = Rect {
+            x: 1,
+            y: 1,
+            w: 4,
+            h: 4,
+        };
+    }
+    let invisible = scene.add_layer(win, Some(grandparent));
+    scene.layer_mut(invisible).unwrap().visible = false;
+    let child = scene.add_layer(win, Some(invisible));
+    {
+        let l = scene.layer_mut(child).unwrap();
+        l.visible = true;
+        l.fill_color = Some([4, 5, 6, 255]);
+        l.rect = Rect {
+            x: 2,
+            y: 2,
+            w: 3,
+            h: 3,
+        };
+    }
+
+    let projected = project_window(&scene, win, |_| None);
+    let nodes = drawable_nodes(&projected);
+    assert_eq!(nodes.len(), 1, "an invisible parent hides its subtree");
+    assert_eq!(nodes[0].dst, RectF::new(1.0, 1.0, 4.0, 4.0));
+}

@@ -42,6 +42,74 @@ impl VulkanTexture {
     }
 }
 
+/// Persistent host-visible staging buffer reused by every upload.
+///
+/// The buffer grows geometrically and is only recreated (after the GPU is
+/// idle) when an upload needs more space, removing the per-upload allocation
+/// and destruction of the original implementation.
+pub(crate) struct StagingBuffer {
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    capacity: vk::DeviceSize,
+}
+
+impl Default for StagingBuffer {
+    fn default() -> Self {
+        Self {
+            buffer: vk::Buffer::null(),
+            memory: vk::DeviceMemory::null(),
+            capacity: 0,
+        }
+    }
+}
+
+impl StagingBuffer {
+    /// Destroys the staging buffer and its memory, if any.
+    pub(crate) fn destroy(&self, device: &ash::Device) {
+        if self.buffer == vk::Buffer::null() {
+            return;
+        }
+        // SAFETY: both handles were created by `device` and the caller
+        // guarantees no in-flight work still references them.
+        unsafe {
+            device.destroy_buffer(self.buffer, None);
+            device.free_memory(self.memory, None);
+        }
+    }
+
+    /// Grows the buffer to hold at least `size` bytes.
+    ///
+    /// `fence` must guard the previous upload that used this buffer; it is
+    /// waited on before the old buffer is destroyed. The caller guarantees the
+    /// fence is the upload fence and that a failure to wait is an error.
+    fn reserve(
+        &mut self,
+        device: &ash::Device,
+        memory_properties: &vk::PhysicalDeviceMemoryProperties,
+        fence: vk::Fence,
+        size: vk::DeviceSize,
+    ) -> Result<(), RenderError> {
+        if self.capacity >= size {
+            return Ok(());
+        }
+        // SAFETY: the fence guards the previous upload that used this buffer;
+        // it is signalled once that upload completes.
+        unsafe { device.wait_for_fences(&[fence], true, u64::MAX) }.map_err(|error| {
+            RenderError::Upload {
+                message: format!("failed to wait for the upload fence: {error}"),
+            }
+        })?;
+
+        let capacity = size.next_power_of_two().max(64);
+        let (buffer, memory) = create_staging_buffer(device, memory_properties, capacity)?;
+        self.destroy(device);
+        self.buffer = buffer;
+        self.memory = memory;
+        self.capacity = capacity;
+        Ok(())
+    }
+}
+
 /// Returns the Vulkan format used for a [`TextureFormat`].
 fn image_format(format: TextureFormat) -> vk::Format {
     match format {
@@ -70,8 +138,7 @@ fn component_mapping(format: TextureFormat) -> vk::ComponentMapping {
 /// Creates the GPU image, view and descriptor set for `desc`.
 pub(crate) fn create_texture(
     device: &ash::Device,
-    instance: &ash::Instance,
-    physical_device: vk::PhysicalDevice,
+    memory_properties: &vk::PhysicalDeviceMemoryProperties,
     descriptor_set_layout: vk::DescriptorSetLayout,
     descriptor_pool: vk::DescriptorPool,
     sampler: vk::Sampler,
@@ -104,12 +171,18 @@ pub(crate) fn create_texture(
 
     // SAFETY: `image` was just created by `device`.
     let requirements = unsafe { device.get_image_memory_requirements(image) };
-    let memory_type = find_memory_type(
-        instance,
-        physical_device,
+    let memory_type = match find_memory_type(
+        memory_properties,
         requirements.memory_type_bits,
         vk::MemoryPropertyFlags::DEVICE_LOCAL,
-    )?;
+    ) {
+        Ok(memory_type) => memory_type,
+        Err(error) => {
+            // SAFETY: `image` is owned here and not used elsewhere yet.
+            unsafe { device.destroy_image(image, None) };
+            return Err(error);
+        }
+    };
     let allocate_info = vk::MemoryAllocateInfo::default()
         .allocation_size(requirements.size)
         .memory_type_index(memory_type);
@@ -224,32 +297,33 @@ pub(crate) fn create_texture(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn upload(
     device: &ash::Device,
-    instance: &ash::Instance,
-    physical_device: vk::PhysicalDevice,
+    memory_properties: &vk::PhysicalDeviceMemoryProperties,
     queue: vk::Queue,
     command_pool: vk::CommandPool,
     command_buffer: vk::CommandBuffer,
     fence: vk::Fence,
+    staging: &mut StagingBuffer,
     texture: &mut VulkanTexture,
     region: PixelRegion,
     pixels: &[u8],
 ) -> Result<(), RenderError> {
     let staging_size = pixels.len() as vk::DeviceSize;
-    let (staging_buffer, staging_memory) =
-        create_staging_buffer(device, instance, physical_device, staging_size.max(1))?;
+    staging.reserve(device, memory_properties, fence, staging_size.max(1))?;
 
-    // SAFETY: the staging memory is host-visible and not in use.
+    // SAFETY: the staging memory is host-visible and not in use; `reserve`
+    // guarantees the buffer holds at least `staging_size` bytes.
     let mapped =
-        unsafe { device.map_memory(staging_memory, 0, staging_size, vk::MemoryMapFlags::empty()) }
+        unsafe { device.map_memory(staging.memory, 0, staging_size, vk::MemoryMapFlags::empty()) }
             .map_err(|error| RenderError::Upload {
                 message: format!("failed to map the staging buffer: {error}"),
             })?;
     // SAFETY: `mapped` aliases `staging_size` writable bytes.
     unsafe {
         std::ptr::copy_nonoverlapping(pixels.as_ptr(), mapped.cast::<u8>(), pixels.len());
-        device.unmap_memory(staging_memory);
+        device.unmap_memory(staging.memory);
     }
 
+    let staging_buffer = staging.buffer;
     let (old_layout, src_access, src_stage) = if texture.uploaded {
         (
             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
@@ -327,23 +401,20 @@ pub(crate) fn upload(
         },
     );
 
-    // SAFETY: the fence has been waited on, so the staging buffer is free.
-    unsafe {
-        device.destroy_buffer(staging_buffer, None);
-        device.free_memory(staging_memory, None);
-    }
-
-    if result.is_ok() {
-        texture.uploaded = true;
-    }
+    // SAFETY: the fence has been waited on, so the staging buffer is free and
+    // persists for the next upload.
+    // A failure that unwound a recorded (or partially recorded) upload may
+    // have left the image mid-transition. Force the next upload to start from
+    // `UNDEFINED` instead of assuming the sampled layout, and keep the
+    // texture unrenderable until it is re-uploaded.
+    texture.uploaded = result.is_ok();
     result
 }
 
 /// Creates a host-visible, host-coherent staging buffer.
 fn create_staging_buffer(
     device: &ash::Device,
-    instance: &ash::Instance,
-    physical_device: vk::PhysicalDevice,
+    memory_properties: &vk::PhysicalDeviceMemoryProperties,
     size: vk::DeviceSize,
 ) -> Result<(vk::Buffer, vk::DeviceMemory), RenderError> {
     let buffer_info = vk::BufferCreateInfo::default()
@@ -359,12 +430,18 @@ fn create_staging_buffer(
 
     // SAFETY: `buffer` was just created by `device`.
     let requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
-    let memory_type = find_memory_type(
-        instance,
-        physical_device,
+    let memory_type = match find_memory_type(
+        memory_properties,
         requirements.memory_type_bits,
         vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-    )?;
+    ) {
+        Ok(memory_type) => memory_type,
+        Err(error) => {
+            // SAFETY: `buffer` is owned here and not used elsewhere yet.
+            unsafe { device.destroy_buffer(buffer, None) };
+            return Err(error);
+        }
+    };
     let allocate_info = vk::MemoryAllocateInfo::default()
         .allocation_size(requirements.size)
         .memory_type_index(memory_type);
@@ -455,11 +532,6 @@ where
                 message: format!("failed to wait for the upload fence: {error}"),
             })?;
         device
-            .reset_fences(&[fence])
-            .map_err(|error| RenderError::Upload {
-                message: format!("failed to reset the upload fence: {error}"),
-            })?;
-        device
             .reset_command_pool(command_pool, vk::CommandPoolResetFlags::empty())
             .map_err(|error| RenderError::Upload {
                 message: format!("failed to reset the upload command pool: {error}"),
@@ -475,12 +547,19 @@ where
 
     record(command_buffer);
 
-    // SAFETY: the command buffer is recording and was begun above.
+    // SAFETY: the command buffer is recording and was begun above. The fence
+    // is reset only immediately before the submit so an earlier error leaves
+    // it signalled and the frame slot reusable.
     unsafe {
         device
             .end_command_buffer(command_buffer)
             .map_err(|error| RenderError::Upload {
                 message: format!("failed to end the upload command buffer: {error}"),
+            })?;
+        device
+            .reset_fences(&[fence])
+            .map_err(|error| RenderError::Upload {
+                message: format!("failed to reset the upload fence: {error}"),
             })?;
         let command_buffers = [command_buffer];
         let submit = vk::SubmitInfo::default().command_buffers(&command_buffers);
@@ -501,15 +580,12 @@ where
 
 /// Finds a memory type satisfying `properties` among `type_bits`.
 pub(crate) fn find_memory_type(
-    instance: &ash::Instance,
-    physical_device: vk::PhysicalDevice,
+    memory_properties: &vk::PhysicalDeviceMemoryProperties,
     type_bits: u32,
     properties: vk::MemoryPropertyFlags,
 ) -> Result<u32, RenderError> {
-    let memory_properties =
-        unsafe { instance.get_physical_device_memory_properties(physical_device) };
     for index in 0..memory_properties.memory_type_count {
-        let supported = type_bits & (1 << index) != 0;
+        let supported = type_bits & (1u32 << index) != 0;
         if supported
             && memory_properties.memory_types[index as usize]
                 .property_flags

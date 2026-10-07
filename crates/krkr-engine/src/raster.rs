@@ -102,6 +102,28 @@ fn point_in_polygon(x: f64, y: f64, pts: &[(f64, f64)]) -> bool {
     inside
 }
 
+/// Intersect an inclusive pixel box with the bitmap's bounds. Returns an
+/// empty box (`min > max`) when there is nothing to draw.
+fn clamp_bounds(
+    bitmap: &BitmapState,
+    min_x: i32,
+    min_y: i32,
+    max_x: i32,
+    max_y: i32,
+) -> (i32, i32, i32, i32) {
+    if bitmap.width == 0 || bitmap.height == 0 {
+        return (0, 0, -1, -1);
+    }
+    let max_px = bitmap.width.saturating_sub(1).min(i32::MAX as u32) as i32;
+    let max_py = bitmap.height.saturating_sub(1).min(i32::MAX as u32) as i32;
+    (
+        min_x.max(0),
+        min_y.max(0),
+        max_x.min(max_px),
+        max_y.min(max_py),
+    )
+}
+
 /// Integer bounding box (`min_x, min_y, max_x, max_y`) of a point set, or
 /// `None` when there is nothing to fill.
 fn bounds(pts: &[(f64, f64)]) -> Option<(i32, i32, i32, i32)> {
@@ -144,6 +166,10 @@ pub fn fill_polygon(bitmap: &mut BitmapState, pts: &[(f64, f64)], color: [u8; 4]
     let Some((min_x, min_y, max_x, max_y)) = bounds(pts) else {
         return;
     };
+    let (min_x, min_y, max_x, max_y) = clamp_bounds(bitmap, min_x, min_y, max_x, max_y);
+    if min_x > max_x || min_y > max_y {
+        return;
+    }
     let samples = (AA * AA) as u32;
     for py in min_y..=max_y {
         for px in min_x..=max_x {
@@ -189,6 +215,10 @@ pub fn fill_polygon_hatch(
     let Some((min_x, min_y, max_x, max_y)) = bounds(pts) else {
         return;
     };
+    let (min_x, min_y, max_x, max_y) = clamp_bounds(bitmap, min_x, min_y, max_x, max_y);
+    if min_x > max_x || min_y > max_y {
+        return;
+    }
     let samples = (AA * AA) as u32;
     for py in min_y..=max_y {
         for px in min_x..=max_x {
@@ -259,11 +289,20 @@ pub fn stroke_polyline(
         return;
     }
     let half = width.max(1.0) / 2.0;
+    let max_px = bitmap.width.saturating_sub(1).min(i32::MAX as u32) as i32;
+    let max_py = bitmap.height.saturating_sub(1).min(i32::MAX as u32) as i32;
     let mut segment = |a: (f64, f64), b: (f64, f64)| {
         let min_x = (a.0.min(b.0) - half - 1.0).floor() as i32;
         let min_y = (a.1.min(b.1) - half - 1.0).floor() as i32;
         let max_x = (a.0.max(b.0) + half + 1.0).ceil() as i32;
         let max_y = (a.1.max(b.1) + half + 1.0).ceil() as i32;
+        let min_x = min_x.max(0);
+        let min_y = min_y.max(0);
+        let max_x = max_x.min(max_px);
+        let max_y = max_y.min(max_py);
+        if min_x > max_x || min_y > max_y {
+            return;
+        }
         for py in min_y..=max_y {
             for px in min_x..=max_x {
                 let d = dist_point_segment((px as f64 + 0.5, py as f64 + 0.5), a, b);
@@ -294,6 +333,18 @@ pub fn flatten_arc(
     start_deg: f64,
     sweep_deg: f64,
 ) -> Vec<(f64, f64)> {
+    // Non-finite geometry has no finite polyline; reject it rather than
+    // iterating an unbounded/saturated step count. A large but finite sweep
+    // is allowed and determines its own (finite) step count.
+    if !x.is_finite()
+        || !y.is_finite()
+        || !w.is_finite()
+        || !h.is_finite()
+        || !start_deg.is_finite()
+        || !sweep_deg.is_finite()
+    {
+        return Vec::new();
+    }
     let (cx, cy) = (x + w / 2.0, y + h / 2.0);
     let (rx, ry) = (w / 2.0, h / 2.0);
     let steps = ((sweep_deg.abs() / 4.0).ceil() as usize).max(2);

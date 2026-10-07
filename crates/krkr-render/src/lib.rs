@@ -29,6 +29,7 @@
 //! process.
 
 #![warn(missing_docs)]
+#![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod glyph;
 mod null;
@@ -55,8 +56,9 @@ pub use crate::scene::{
 };
 pub use crate::state::{RenderState, Surface};
 pub use crate::texture::{Texture, TextureDesc, TextureFormat};
-pub use crate::vulkan::VulkanPipeline;
 pub use krkr_api::glyph::{FontMetrics, GlyphBitmap, GlyphStyle};
+
+use crate::vulkan::VulkanPipeline;
 
 /// Which render backend a [`RenderPipeline`] uses.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -171,14 +173,6 @@ impl RenderPipeline {
 impl Default for RenderPipeline {
     fn default() -> Self {
         Self::null()
-    }
-}
-
-impl From<NullRenderPipeline> for RenderPipeline {
-    fn from(backend: NullRenderPipeline) -> Self {
-        Self {
-            kind: PipelineKind::Null(backend),
-        }
     }
 }
 

@@ -22,17 +22,17 @@
 //! migration note.
 
 use std::io::Cursor;
-use std::path::Path;
 
 use image::{DynamicImage, ImageDecoder, ImageFormat};
 use krkr_api::error::MediaError;
 use krkr_api::media::{DecodedImage, ImageInfo};
 
 use crate::Media;
+use crate::hint::extension_of;
 use crate::tlg;
 
-/// All TLG spellings the reference registers.
-const TLG_EXTENSIONS: [&str; 3] = [".tlg", ".tlg5", ".tlg6"];
+/// TLG spellings the reference registers (extension without the dot).
+const TLG_EXTENSIONS: [&str; 3] = ["tlg", "tlg5", "tlg6"];
 
 /// Image format names advertised by [`crate::capabilities`].
 pub(crate) const IMAGE_FORMATS: [&str; 16] = [
@@ -45,24 +45,11 @@ pub(crate) const IMAGE_FORMATS: [&str; 16] = [
 /// Accepts a full storage name (`"frm/bg01.tlg5"`) or a bare extension
 /// (`"tlg6"` / `".tlg6"`), so callers may pass whichever they have.
 fn is_tlg_hint(hint: Option<&str>) -> bool {
-    let Some(hint) = hint else {
-        return false;
-    };
-    let lower = hint.to_ascii_lowercase();
-    TLG_EXTENSIONS.iter().any(|ext| lower.ends_with(ext))
-        || matches!(lower.as_str(), "tlg" | "tlg5" | "tlg6")
-}
-
-/// Extracts the lowercase extension from a filename or bare-extension hint.
-fn extension_of(hint: &str) -> Option<String> {
-    if let Some(ext) = Path::new(hint).extension().and_then(|e| e.to_str()) {
-        return Some(ext.to_ascii_lowercase());
-    }
-    let bare = hint.strip_prefix('.').unwrap_or(hint);
-    if !bare.is_empty() && !bare.contains(['/', '\\', '.']) {
-        return Some(bare.to_ascii_lowercase());
-    }
-    None
+    hint.and_then(extension_of).is_some_and(|ext| {
+        TLG_EXTENSIONS
+            .iter()
+            .any(|tlg| ext.eq_ignore_ascii_case(tlg))
+    })
 }
 
 /// The `image` crate format implied by an extension hint, mapping the
@@ -70,12 +57,19 @@ fn extension_of(hint: &str) -> Option<String> {
 /// decoders. TLG spellings return `None` because they are routed separately.
 fn format_for_hint(hint: Option<&str>) -> Option<ImageFormat> {
     let ext = extension_of(hint?)?;
-    match ext.as_str() {
-        "jif" => Some(ImageFormat::Jpeg),
-        "dib" => Some(ImageFormat::Bmp),
-        "tlg" | "tlg5" | "tlg6" => None,
-        other => ImageFormat::from_extension(other),
+    if ext.eq_ignore_ascii_case("jif") {
+        return Some(ImageFormat::Jpeg);
     }
+    if ext.eq_ignore_ascii_case("dib") {
+        return Some(ImageFormat::Bmp);
+    }
+    if TLG_EXTENSIONS
+        .iter()
+        .any(|tlg| ext.eq_ignore_ascii_case(tlg))
+    {
+        return None;
+    }
+    ImageFormat::from_extension(ext)
 }
 
 /// Stable, lowercase name for an `image` crate format.
@@ -182,6 +176,11 @@ fn probe_with_format(bytes: &[u8], format: ImageFormat) -> Result<ImageInfo, Str
     })
 }
 
+/// Decodes a specific `image`-crate format.
+fn decode_with_format(bytes: &[u8], format: ImageFormat) -> Result<DynamicImage, String> {
+    image::load_from_memory_with_format(bytes, format).map_err(|error| error.to_string())
+}
+
 /// Decodes image bytes into tightly packed RGBA8.
 ///
 /// Dispatch matches the reference [[`format_for_hint`]] router (see the
@@ -207,9 +206,9 @@ pub fn decode_image(
 
     let mut last_error: Option<String> = None;
     if let Some(format) = format_for_hint(hint) {
-        match image::load_from_memory_with_format(bytes, format) {
+        match decode_with_format(bytes, format) {
             Ok(image) => return Ok(decoded_from_dynamic(image)),
-            Err(error) => last_error = Some(error.to_string()),
+            Err(error) => last_error = Some(error),
         }
     }
 
@@ -218,11 +217,11 @@ pub fn decode_image(
     }
 
     match image::guess_format(bytes) {
-        Ok(format) => match image::load_from_memory_with_format(bytes, format) {
+        Ok(format) => match decode_with_format(bytes, format) {
             Ok(image) => Ok(decoded_from_dynamic(image)),
             Err(error) => Err(MediaError::Decode {
                 format: format_name(format),
-                message: error.to_string(),
+                message: error,
             }),
         },
         Err(error) => Err(MediaError::Decode {

@@ -5,20 +5,24 @@
 //! siblings by `z` and selects a pipeline + blend state per node. It never
 //! asks the middle layer for a draw list.
 //!
-//! Mask clips, GPU glyph runs and destination-dependent blend modes are
-//! deferred: a mask clip is ignored, a glyph run draws its atlas as a single
-//! textured quad, and destination-dependent modes fall back to source-over.
+//! Per D11 there are no silent fallbacks: a node whose composition needs a
+//! feature this backend does not implement (a mask clip, a GPU glyph run or a
+//! destination-dependent blend mode) makes the frame fail with a typed
+//! [`RenderError::Unsupported`](krkr_api::error::RenderError::Unsupported).
 
 use std::collections::HashMap;
 
 use ash::vk;
 
+use krkr_api::error::RenderError;
 use krkr_api::geometry::{Affine2, RectF};
 
 use super::pipelines::{PipelineSet, Program};
 use super::texture::VulkanTexture;
 use crate::MAX_TRAVERSAL_DEPTH;
-use crate::scene::{Clip, RenderContent, RenderNode, RenderNodeId, RenderScene};
+use crate::scene::{
+    Clip, RenderContent, RenderNode, RenderNodeId, RenderScene, child_sort_key, children_are_sorted,
+};
 
 /// Push-constant block shared with the shaders (96 bytes).
 #[repr(C)]
@@ -32,19 +36,29 @@ struct PushConstants {
     uv_rect: [f32; 4],
 }
 
+/// The push-constant block shared with the shaders must match the size the
+/// pipeline layout reserves.
+const _: () = assert!(std::mem::size_of::<PushConstants>() as u32 == super::PUSH_CONSTANT_SIZE);
+
 /// Records all visible content of `scene` into `command`.
 ///
 /// The caller has already begun the render pass and set the viewport.
+///
+/// # Errors
+///
+/// Returns [`RenderError::Unsupported`] when the scene uses a feature the
+/// Vulkan backend does not implement (mask clips, GPU glyph runs or
+/// destination-dependent blend modes).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record_scene(
     device: &ash::Device,
     command: vk::CommandBuffer,
     pipelines: &PipelineSet,
-    textures: &HashMap<usize, VulkanTexture>,
+    textures: &HashMap<u64, VulkanTexture>,
     scene: &RenderScene,
     extent: vk::Extent2D,
     srgb: bool,
-) {
+) -> Result<(), RenderError> {
     let mut recorder = Recorder {
         device,
         command,
@@ -67,7 +81,7 @@ pub(crate) fn record_scene(
         offset: vk::Offset2D { x: 0, y: 0 },
         extent,
     };
-    recorder.visit(scene.root, &Affine2::IDENTITY, 1.0, full_scissor, 0);
+    recorder.visit(scene.root, &Affine2::IDENTITY, 1.0, full_scissor, 0)
 }
 
 /// Command-recording traversal state.
@@ -75,7 +89,7 @@ struct Recorder<'a> {
     device: &'a ash::Device,
     command: vk::CommandBuffer,
     pipelines: &'a PipelineSet,
-    textures: &'a HashMap<usize, VulkanTexture>,
+    textures: &'a HashMap<u64, VulkanTexture>,
     scene: &'a RenderScene,
     extent: vk::Extent2D,
     srgb: bool,
@@ -92,19 +106,19 @@ impl Recorder<'_> {
         parent_opacity: f32,
         scissor: vk::Rect2D,
         depth: u32,
-    ) {
+    ) -> Result<(), RenderError> {
         if depth > MAX_TRAVERSAL_DEPTH {
-            return;
+            return Ok(());
         }
         let Some(node) = self.scene.node(id) else {
-            return;
+            return Ok(());
         };
         if !node.visible {
-            return;
+            return Ok(());
         }
         let opacity = parent_opacity * clamp_opacity(node.opacity);
         if opacity <= 0.0 {
-            return;
+            return Ok(());
         }
 
         // `transform` positions the node's local space (and therefore its
@@ -112,38 +126,70 @@ impl Recorder<'_> {
         // them separate means a zero-sized container (for example the scene
         // root) does not collapse its children.
         let (node_space, content_space) = node_spaces(node, parent_transform);
-        let scissor = self.scissor_for(node, &node_space, scissor);
+        let scissor = self.scissor_for(node, &node_space, scissor)?;
         if scissor.extent.width == 0 || scissor.extent.height == 0 {
-            return;
+            return Ok(());
         }
 
-        self.draw(node, &content_space, opacity, scissor);
+        self.draw(node, &content_space, opacity, scissor)?;
 
-        let mut children = node.children.clone();
-        children.sort_by_key(|child| self.scene.node(*child).map_or(0, |node| node.z));
-        for child in children {
-            self.visit(child, &node_space, opacity, scissor, depth + 1);
+        // Draw in sibling `z` order. L2 appends children already in increasing
+        // `z`, so the borrowed fast path is the common case; only clone and
+        // sort when the caller actually left the list unordered.
+        if children_are_sorted(self.scene, &node.children) {
+            for &child in &node.children {
+                self.visit(child, &node_space, opacity, scissor, depth + 1)?;
+            }
+        } else {
+            let mut children = node.children.clone();
+            children.sort_by_key(|child| child_sort_key(self.scene, *child));
+            for child in children {
+                self.visit(child, &node_space, opacity, scissor, depth + 1)?;
+            }
         }
+        Ok(())
     }
 
     /// Intersects the node's clip (if any) with the inherited scissor.
     ///
-    /// Only rectangular clips are implemented; a mask clip is ignored and the
-    /// inherited scissor is kept.
-    fn scissor_for(&self, node: &RenderNode, world: &Affine2, current: vk::Rect2D) -> vk::Rect2D {
+    /// # Errors
+    ///
+    /// Returns [`RenderError::Unsupported`] for a mask clip, which the Vulkan
+    /// backend does not implement.
+    fn scissor_for(
+        &self,
+        node: &RenderNode,
+        world: &Affine2,
+        current: vk::Rect2D,
+    ) -> Result<vk::Rect2D, RenderError> {
         let bounds = match &node.clip {
             Some(Clip::Rect(rect)) => world_bounds(world, rect),
-            Some(Clip::Mask(_)) => return current,
-            None => return current,
+            Some(Clip::Mask(_)) => {
+                return Err(RenderError::Unsupported {
+                    message: "mask clips are not implemented by the Vulkan backend".to_owned(),
+                });
+            }
+            None => return Ok(current),
         };
         let clip = rect_to_scissor(bounds, self.extent);
-        intersect_scissor(current, clip)
+        Ok(intersect_scissor(current, clip))
     }
 
     /// Draws the node's payload, if it has one.
-    fn draw(&mut self, node: &RenderNode, world: &Affine2, opacity: f32, scissor: vk::Rect2D) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RenderError::Unsupported`] for a GPU glyph run or a
+    /// destination-dependent blend mode.
+    fn draw(
+        &mut self,
+        node: &RenderNode,
+        world: &Affine2,
+        opacity: f32,
+        scissor: vk::Rect2D,
+    ) -> Result<(), RenderError> {
         match &node.content {
-            RenderContent::None => {}
+            RenderContent::None => Ok(()),
             RenderContent::Solid(color) => {
                 let tint = self.solid_tint(*color, opacity);
                 self.draw_quad(
@@ -154,14 +200,14 @@ impl Recorder<'_> {
                     [0.0, 0.0, 1.0, 1.0],
                     None,
                     scissor,
-                );
+                )
             }
             RenderContent::Texture(texture) => {
                 let Some(gpu) = self.textures.get(&texture.key()) else {
-                    return;
+                    return Ok(());
                 };
                 if !gpu.uploaded {
-                    return;
+                    return Ok(());
                 }
                 let uv = uv_rect(texture.width(), texture.height(), node.src);
                 let tint = [1.0, 1.0, 1.0, opacity];
@@ -173,36 +219,11 @@ impl Recorder<'_> {
                     uv,
                     Some(gpu.descriptor_set),
                     scissor,
-                );
+                )
             }
-            RenderContent::Glyphs(run) => {
-                // Best-effort GPU text: draw the atlas as one quad over the
-                // node's destination. Per-glyph placement is deferred.
-                let Some(atlas) = &run.atlas else {
-                    return;
-                };
-                let Some(gpu) = self.textures.get(&atlas.key()) else {
-                    return;
-                };
-                if !gpu.uploaded {
-                    return;
-                }
-                let tint = [
-                    self.linearize(run.color[0]),
-                    self.linearize(run.color[1]),
-                    self.linearize(run.color[2]),
-                    run.color[3] * opacity,
-                ];
-                self.draw_quad(
-                    Program::Textured,
-                    node.blend,
-                    world,
-                    tint,
-                    [0.0, 0.0, 1.0, 1.0],
-                    Some(gpu.descriptor_set),
-                    scissor,
-                );
-            }
+            RenderContent::Glyphs(_) => Err(RenderError::Unsupported {
+                message: "GPU glyph runs are not implemented by the Vulkan backend".to_owned(),
+            }),
         }
     }
 
@@ -217,8 +238,8 @@ impl Recorder<'_> {
         uv_rect: [f32; 4],
         descriptor: Option<vk::DescriptorSet>,
         scissor: vk::Rect2D,
-    ) {
-        let pipeline = self.pipelines.pipeline_for(program, blend);
+    ) -> Result<(), RenderError> {
+        let pipeline = self.pipelines.pipeline_for(program, blend)?;
         // SAFETY: the command buffer is recording and every handle is live.
         unsafe {
             if self.bound_pipeline != Some(pipeline) {
@@ -262,6 +283,7 @@ impl Recorder<'_> {
             self.device.cmd_set_scissor(self.command, 0, &[scissor]);
             self.device.cmd_draw(self.command, 4, 1, 0, 0);
         }
+        Ok(())
     }
 
     /// Converts a straight-alpha solid color into a shader tint.
@@ -395,9 +417,13 @@ fn uv_rect(width: u32, height: u32, src: krkr_api::geometry::PixelRegion) -> [f3
 }
 
 /// Builds the column-major matrix mapping the unit quad to NDC.
+///
+/// L2 uses a y-down world convention (y = 0 is the top edge). Vulkan NDC has
+/// y = -1 at the top of the framebuffer, so world `y` maps to
+/// `ndc_y = 2*y/height - 1`.
 fn to_ndc(affine: &Affine2, extent: vk::Extent2D) -> [f32; 16] {
     let a = 2.0 / extent.width.max(1) as f32;
-    let b = -2.0 / extent.height.max(1) as f32;
+    let b = 2.0 / extent.height.max(1) as f32;
     [
         a * affine.m11,
         b * affine.m21,
@@ -412,7 +438,7 @@ fn to_ndc(affine: &Affine2, extent: vk::Extent2D) -> [f32; 16] {
         1.0,
         0.0,
         a * affine.tx - 1.0,
-        b * affine.ty + 1.0,
+        b * affine.ty - 1.0,
         0.0,
         1.0,
     ]

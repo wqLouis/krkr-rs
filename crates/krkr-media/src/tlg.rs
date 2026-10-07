@@ -47,19 +47,11 @@ const TLG6_H_BLOCK_SIZE: usize = 8;
 const TLG6_GOLOMB_N_COUNT: usize = 4;
 /// Number of entries in the Golomb bit-length table (4 × 2 × 128).
 const TLG6_GOLOMB_TABLE_LEN: usize = 1024;
-/// Cap on decoded image dimensions (defensive; real TLG files are small).
-const MAX_DIM: usize = 1 << 15;
-const MAX_PIXEL_BYTES: usize = 1 << 28;
-
-/// Decode TLG5/TLG6 bytes into an RGBA8 image.
-pub fn decode_tlg(bytes: &[u8]) -> Result<RgbaImage, String> {
-    decode_tlg_with_info(bytes).map(|(img, _)| img)
-}
 
 /// Decode TLG5/TLG6 bytes into an RGBA8 image plus whether the file stores
 /// an alpha plane (the color count byte: 3 = opaque, 4 = alpha). The
 /// descriptor is used by `loadHeader`/`load` to report `bpp`.
-pub fn decode_tlg_with_info(bytes: &[u8]) -> Result<(RgbaImage, bool), String> {
+pub(crate) fn decode_tlg_with_info(bytes: &[u8]) -> Result<(RgbaImage, bool), String> {
     let raw = strip_sds(bytes)?;
     if raw.len() >= 12 && raw[..11] == TLG5_MAGIC {
         let colors = raw[11];
@@ -120,8 +112,8 @@ pub(crate) fn probe_tlg(bytes: &[u8]) -> Result<TlgHeader, String> {
         }
         let (width, height) = read_dims(raw, 12, 16)?;
         return Ok(TlgHeader {
-            width,
-            height,
+            width: width as u32,
+            height: height as u32,
             has_alpha: colors >= 4,
             format: "tlg5",
         });
@@ -133,8 +125,8 @@ pub(crate) fn probe_tlg(bytes: &[u8]) -> Result<TlgHeader, String> {
         }
         let (width, height) = read_dims(raw, 15, 19)?;
         return Ok(TlgHeader {
-            width,
-            height,
+            width: width as u32,
+            height: height as u32,
             has_alpha: colors >= 4,
             format: "tlg6",
         });
@@ -143,13 +135,13 @@ pub(crate) fn probe_tlg(bytes: &[u8]) -> Result<TlgHeader, String> {
 }
 
 /// Read and validate a `(width, height)` pair encoded at `woff`/`hoff`.
-fn read_dims(raw: &[u8], woff: usize, hoff: usize) -> Result<(u32, u32), String> {
+fn read_dims(raw: &[u8], woff: usize, hoff: usize) -> Result<(usize, usize), String> {
     let width = read_i32(raw, woff)?;
     let height = read_i32(raw, hoff)?;
     let w = usize::try_from(width).map_err(|_| "TLG: negative image width".to_string())?;
     let h = usize::try_from(height).map_err(|_| "TLG: negative image height".to_string())?;
     check_dims(w, h)?;
-    Ok((w as u32, h as u32))
+    Ok((w, h))
 }
 
 /// Strip the optional TLG0.0 SDS wrapper, returning the raw TLG payload.
@@ -181,14 +173,10 @@ fn check_dims(w: usize, h: usize) -> Result<(), String> {
     if w == 0 || h == 0 {
         return Err("TLG: zero image dimensions".into());
     }
-    if w > MAX_DIM || h > MAX_DIM {
-        return Err("TLG: image dimensions too large".into());
-    }
+    // No size policy: the only rejection is arithmetic overflow. A large but
+    // well-formed image is decoded (or fails on allocation).
     let pixels = w.checked_mul(h).ok_or("TLG: image size overflow")?;
-    let bytes = pixels.checked_mul(4).ok_or("TLG: image size overflow")?;
-    if bytes > MAX_PIXEL_BYTES {
-        return Err("TLG: image too large".into());
-    }
+    pixels.checked_mul(4).ok_or("TLG: image size overflow")?;
     Ok(())
 }
 
@@ -201,17 +189,25 @@ fn decode_tlg5(raw: &[u8]) -> Result<RgbaImage, String> {
     if colors != 3 && colors != 4 {
         return Err(format!("TLG5: unsupported color count {colors}"));
     }
-    let width = read_i32(raw, 12)? as usize;
-    let height = read_i32(raw, 16)? as usize;
-    let blockheight = read_i32(raw, 20)? as usize;
-    check_dims(width, height)?;
-    if blockheight == 0 {
-        return Err("TLG5: zero block height".into());
+    let (width, height) = read_dims(raw, 12, 16)?;
+    let blockheight = read_i32(raw, 20)?;
+    let blockheight =
+        usize::try_from(blockheight).map_err(|_| "TLG5: negative block height".to_string())?;
+    if blockheight == 0 || blockheight > height {
+        return Err("TLG5: invalid block height".into());
     }
     let blockcount = (height - 1) / blockheight + 1;
-    let mut pos = 24 + blockcount * 4; // skip the block-size table
+    let mut pos = 24usize
+        .checked_add(
+            blockcount
+                .checked_mul(4)
+                .ok_or("TLG5: block table size overflow")?,
+        )
+        .ok_or("TLG5: block table size overflow")?;
 
-    let block_elems = blockheight * width;
+    let block_elems = blockheight
+        .checked_mul(width)
+        .ok_or("TLG5: block size overflow")?;
     let mut text = [0u8; 4096]; // LZSS window, shared across blocks
     let mut r = 0usize;
     let mut outbufs: Vec<Vec<u8>> = vec![vec![0u8; block_elems]; colors];
@@ -304,9 +300,7 @@ fn decode_tlg6(raw: &[u8]) -> Result<RgbaImage, String> {
             return Err("TLG6: nonzero reserved header byte".into());
         }
     }
-    let width = read_i32(raw, 15)? as usize;
-    let height = read_i32(raw, 19)? as usize;
-    check_dims(width, height)?;
+    let (width, height) = read_dims(raw, 15, 19)?;
     // max_bit_length (offset 23) is only used for allocation in the
     // reference; we read bit pools per chunk instead.
 
@@ -318,12 +312,17 @@ fn decode_tlg6(raw: &[u8]) -> Result<RgbaImage, String> {
     // Per-block filter/method map, LZSS-compressed with a fixed initial
     // dictionary (32×16 pattern, reference `TLG6InitializeColorFilterCompressor`).
     let mut pos = 27usize;
-    let ft_size = read_i32(raw, pos)? as usize;
+    let ft_size = read_i32(raw, pos)?;
     pos += 4;
+    let ft_size =
+        usize::try_from(ft_size).map_err(|_| "TLG6: negative filter-type size".to_string())?;
+    let ft_end = pos
+        .checked_add(ft_size)
+        .ok_or("TLG6: filter-type size overflow")?;
     let ft_bytes = raw
-        .get(pos..pos + ft_size)
+        .get(pos..ft_end)
         .ok_or("TLG6: truncated filter-type data")?;
-    pos += ft_size;
+    pos = ft_end;
     let mut ft_text = [0u8; 4096];
     for i in 0..32usize {
         for j in 0..16usize {

@@ -488,3 +488,47 @@ fn revision_tracks_mutations_but_not_dirty_clear() {
         "remove_layer bumps revision"
     );
 }
+
+/// `resize_province_image` uses checked arithmetic and a fallible allocation:
+/// a size that cannot be represented/allocated leaves the existing plane
+/// untouched, while a large-but-valid plane is allowed.
+#[test]
+fn resize_province_image_handles_large_sizes() {
+    let mut scene = Scene::default();
+    let win = scene.add_window("t", (1, 1));
+    let layer = scene.add_layer(win, None);
+    scene.resize_province_image(layer, 4, 3);
+    assert_eq!(scene.province_image_pitch(layer), 4);
+
+    // A large but valid plane (1024×1024 = 1 MiB) is accepted.
+    scene.resize_province_image(layer, 1024, 1024);
+    assert_eq!(scene.province_image_pitch(layer), 1024);
+    assert!(
+        scene
+            .with_province_pixels(layer, |p| p.len() == 1024 * 1024)
+            .unwrap()
+    );
+
+    // A structurally impossible size is a no-op; the existing plane stays.
+    scene.resize_province_image(layer, u32::MAX, u32::MAX);
+    assert_eq!(scene.province_image_pitch(layer), 1024);
+    assert!(
+        scene
+            .with_province_pixels(layer, |p| p.len() == 1024 * 1024)
+            .unwrap()
+    );
+}
+
+/// An invalid `set_focus` id leaves the current holder untouched (the doc
+/// previously claimed it blurred the holder).
+#[test]
+fn set_focus_invalid_id_leaves_holder() {
+    let mut scene = Scene::default();
+    let win = scene.add_window("t", (1, 1));
+    let a = scene.add_layer(win, None);
+    assert_eq!(scene.set_focus(a), (None, Some(a)));
+    assert_eq!(scene.set_focus(9999), (None, None));
+    assert_eq!(scene.window(win).unwrap().focused_layer, Some(a));
+    assert_eq!(scene.clear_focus(win), Some(a));
+    assert_eq!(scene.window(win).unwrap().focused_layer, None);
+}

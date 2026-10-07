@@ -22,11 +22,12 @@
 //! * a per-frame command buffer and sync objects, and full scene traversal
 //!   with transforms, opacity, scissor clipping and `z` ordering.
 //!
-//! Deferred (reported or documented, never panicking):
+//! Deferred (reported as [`RenderError::Unsupported`], never silently
+//! degraded, per D11):
 //!
-//! * destination-dependent blend modes fall back to `SourceOver`;
-//! * mask clips are ignored (a rectangular clip uses the scissor);
-//! * GPU glyph runs draw their atlas as a single quad;
+//! * destination-dependent blend modes;
+//! * mask clips (a rectangular clip uses the scissor);
+//! * GPU glyph runs (per-glyph placement is not implemented);
 //! * only mip level 0 is uploaded (no mip generation).
 //!
 //! # Safety
@@ -79,6 +80,10 @@ pub struct VulkanPipeline {
     physical_device: vk::PhysicalDevice,
     /// `maxImageDimension2D` of the selected device.
     max_texture_dimension: u32,
+    /// Cached memory-type properties of the selected device.
+    memory_properties: vk::PhysicalDeviceMemoryProperties,
+    /// Preferred swapchain format requested by the caller.
+    preferred_format: TextureFormat,
 }
 
 /// Owns the Vulkan loader and instance, destroying the instance and then
@@ -118,7 +123,7 @@ impl VulkanPipeline {
     ///
     /// Returns [`RenderError::Unsupported`] when no Vulkan loader or suitable
     /// device is available.
-    pub fn new(config: &crate::PipelineConfig) -> Result<Self, RenderError> {
+    pub(crate) fn new(config: &crate::PipelineConfig) -> Result<Self, RenderError> {
         let bundle = device::create_instance(config)?;
         if bundle.validation {
             log::info!("Vulkan validation layer VK_LAYER_KHRONOS_validation enabled");
@@ -130,6 +135,8 @@ impl VulkanPipeline {
             }),
             physical_device: bundle.physical_device,
             max_texture_dimension: bundle.max_texture_dimension,
+            memory_properties: bundle.memory_properties,
+            preferred_format: config.preferred_format,
         })
     }
 
@@ -138,10 +145,13 @@ impl VulkanPipeline {
         GpuCapabilities {
             backend: BackendKind::Vulkan,
             max_texture_dimension: self.max_texture_dimension,
-            preferred_format: TextureFormat::Rgba8Srgb,
+            preferred_format: self.preferred_format,
             supports_destination_dependent_blend: false,
             supports_offscreen_targets: false,
-            supports_glyph_atlas: true,
+            // GPU glyph runs and mask clips are not implemented; a scene that
+            // uses them fails with `RenderError::Unsupported` rather than
+            // rendering incorrectly.
+            supports_glyph_atlas: false,
         }
     }
 
@@ -215,12 +225,12 @@ impl VulkanPipeline {
 
         let swapchain = match swapchain::create(
             &device_bundle.device,
-            &self.instance_guard.instance,
             self.physical_device,
             &surface_loader,
             &swapchain_loader,
             surface,
             (0, 0),
+            self.preferred_format,
             None,
         ) {
             Ok(swapchain) => swapchain,
@@ -237,8 +247,7 @@ impl VulkanPipeline {
 
         let pipelines = match pipelines::create(
             &device_bundle.device,
-            &self.instance_guard.instance,
-            self.physical_device,
+            &self.memory_properties,
             swapchain.render_pass,
         ) {
             Ok(pipelines) => pipelines,
@@ -254,29 +263,52 @@ impl VulkanPipeline {
             }
         };
 
-        let frames = create_frames(&device_bundle.device, device_bundle.queue_family_index)?;
+        // From here on the guard owns teardown: any `?` below destroys the
+        // device, surface, swapchain, pipelines and whatever else was built.
+        let mut teardown = BeginTeardown {
+            device: &device_bundle.device,
+            surface_loader: &surface_loader,
+            swapchain_loader: &swapchain_loader,
+            surface,
+            swapchain: &swapchain,
+            pipelines: &pipelines,
+            frames: Vec::new(),
+            render_finished: Vec::new(),
+            upload: None,
+            armed: true,
+        };
+
+        teardown.frames = create_frames(&device_bundle.device, device_bundle.queue_family_index)?;
         let image_count = swapchain.images.len().max(1);
-        let render_finished: Vec<vk::Semaphore> = (0..image_count)
-            .map(|_| {
-                // SAFETY: `device_bundle.device` is live.
-                unsafe {
-                    device_bundle
-                        .device
-                        .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
-                }
-            })
-            .collect::<Result<_, _>>()
+        for _ in 0..image_count {
+            // SAFETY: `device_bundle.device` is live.
+            let semaphore = unsafe {
+                device_bundle
+                    .device
+                    .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+            }
             .map_err(|error| RenderError::Unsupported {
                 message: format!("failed to create presentation semaphores: {error}"),
             })?;
+            teardown.render_finished.push(semaphore);
+        }
 
         let (upload_pool, upload_command, upload_fence) =
             create_upload_resources(&device_bundle.device, device_bundle.queue_family_index)?;
+        // Copy the handles into the guard so a late failure frees them; ash
+        // handles are cheap `Copy` values.
+        teardown.upload = Some((upload_pool, upload_fence));
+
+        // Success: transfer ownership to the state and disarm the guard.
+        teardown.armed = false;
+        let frames = std::mem::take(&mut teardown.frames);
+        let render_finished = std::mem::take(&mut teardown.render_finished);
+        drop(teardown);
 
         let surface_size = (swapchain.extent.width, swapchain.extent.height);
 
         let state = VulkanState {
-            instance_guard: self.instance_guard.clone(),
+            _instance_guard: self.instance_guard.clone(),
             physical_device: self.physical_device,
             device: device_bundle.device,
             graphics_queue: device_bundle.graphics_queue,
@@ -284,6 +316,7 @@ impl VulkanPipeline {
             surface_loader,
             swapchain_loader,
             surface,
+            preferred_format: self.preferred_format,
             swapchain,
             pipelines,
             frames,
@@ -291,6 +324,7 @@ impl VulkanPipeline {
             render_finished,
             frame_in_flight: 0,
             textures: HashMap::new(),
+            staging: texture::StagingBuffer::default(),
             upload_pool,
             upload_command,
             upload_fence,
@@ -333,13 +367,15 @@ impl VulkanPipeline {
             }
         };
 
+        if surface_handle != vstate.surface {
+            return Err(RenderError::InvalidArgument {
+                message: "the surface does not belong to this render state".to_owned(),
+            });
+        }
+
         vstate.surface_size = size;
         let device = vstate.device.clone();
-        // SAFETY: the caller must not have frames in flight; recreate waits
-        // for the device to become idle before touching the swapchain.
-        unsafe { device.device_wait_idle() }.map_err(|error| {
-            device::result_error("failed to idle the device before resizing", error)
-        })?;
+        // `recreate_swapchain` idles the device before touching the swapchain.
         recreate_swapchain(&device, vstate, surface_handle)?;
         Ok(SurfaceEvent::Resized(
             vstate.swapchain.extent.width,
@@ -389,8 +425,7 @@ impl VulkanPipeline {
         if !vstate.textures.contains_key(&key) {
             let gpu = texture::create_texture(
                 &vstate.device,
-                &vstate.instance_guard.instance,
-                vstate.physical_device,
+                &self.memory_properties,
                 vstate.pipelines.descriptor_set_layout,
                 vstate.pipelines.descriptor_pool,
                 vstate.pipelines.sampler,
@@ -407,12 +442,12 @@ impl VulkanPipeline {
             })?;
         texture::upload(
             &vstate.device,
-            &vstate.instance_guard.instance,
-            vstate.physical_device,
+            &self.memory_properties,
             vstate.graphics_queue,
             vstate.upload_pool,
             vstate.upload_command,
             vstate.upload_fence,
+            &mut vstate.staging,
             gpu,
             region,
             pixels,
@@ -439,6 +474,12 @@ impl VulkanPipeline {
                 message: "the Vulkan backend received a null render state".to_owned(),
             });
         };
+
+        if surface_handle != vstate.surface {
+            return Err(RenderError::InvalidArgument {
+                message: "the surface does not belong to this render state".to_owned(),
+            });
+        }
 
         if !vstate.swapchain_ready || vstate.swapchain.images.is_empty() {
             return Ok(Presentation {
@@ -491,100 +532,111 @@ impl VulkanPipeline {
             }
         };
 
-        if vstate.images_in_flight[image_index as usize] != vk::Fence::null() {
-            let image_fence = vstate.images_in_flight[image_index as usize];
-            // SAFETY: the fence guards this swapchain image.
-            unsafe { device.wait_for_fences(&[image_fence], true, u64::MAX) }.map_err(|error| {
-                device::result_error("failed to wait for a swapchain image", error)
-            })?;
-        }
-
-        // SAFETY: the fence/image are idle and the pool is not in use.
-        unsafe {
-            device
-                .reset_fences(&[in_flight])
-                .map_err(|error| device::result_error("failed to reset the frame fence", error))?;
-            device
-                .reset_command_pool(command_pool, vk::CommandPoolResetFlags::empty())
-                .map_err(|error| {
-                    device::result_error("failed to reset the frame command pool", error)
-                })?;
-        }
-
-        let begin_info = vk::CommandBufferBeginInfo::default()
-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        // SAFETY: the command buffer is reset and idle.
-        unsafe { device.begin_command_buffer(command_buffer, &begin_info) }.map_err(|error| {
-            device::result_error("failed to begin the frame command buffer", error)
-        })?;
-
-        let render_area = vk::Rect2D {
-            offset: vk::Offset2D { x: 0, y: 0 },
-            extent,
-        };
-        let srgb = format_is_srgb(format);
-        let clear = clear_value(scene.background, srgb);
-        let clear_values = [vk::ClearValue {
-            color: vk::ClearColorValue { float32: clear },
-        }];
-        let framebuffer = framebuffers_for(vstate, image_index)?;
-        let render_pass_begin = vk::RenderPassBeginInfo::default()
-            .render_pass(render_pass)
-            .framebuffer(framebuffer)
-            .render_area(render_area)
-            .clear_values(&clear_values);
-
-        // SAFETY: the command buffer is recording; the render pass and
-        // framebuffer are compatible and live.
-        unsafe {
-            device.cmd_begin_render_pass(
-                command_buffer,
-                &render_pass_begin,
-                vk::SubpassContents::INLINE,
-            );
-            let viewport = vk::Viewport {
-                x: 0.0,
-                y: 0.0,
-                width: extent.width as f32,
-                height: extent.height as f32,
-                min_depth: 0.0,
-                max_depth: 1.0,
-            };
-            device.cmd_set_viewport(command_buffer, 0, &[viewport]);
-        }
-
-        draw::record_scene(
-            &device,
-            command_buffer,
-            &vstate.pipelines,
-            &vstate.textures,
-            scene,
-            extent,
-            srgb,
-        );
-
-        // SAFETY: the render pass and command buffer are recording.
-        unsafe {
-            device.cmd_end_render_pass(command_buffer);
-            device.end_command_buffer(command_buffer).map_err(|error| {
-                device::result_error("failed to end the frame command buffer", error)
-            })?;
-        }
-
-        let wait_semaphores = [image_available];
-        let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+        // `image_available` is signalled by the acquire above. Until the submit
+        // succeeds it is neither waited on nor safe to reuse, so any error in
+        // this block must recreate it (see `recreate_acquired_semaphore`).
         let signal_semaphores = [vstate.render_finished[image_index as usize]];
-        let command_buffers = [command_buffer];
-        let submit = vk::SubmitInfo::default()
-            .wait_semaphores(&wait_semaphores)
-            .wait_dst_stage_mask(&wait_stages)
-            .command_buffers(&command_buffers)
-            .signal_semaphores(&signal_semaphores);
+        let record_result: Result<(), RenderError> = (|| {
+            if vstate.images_in_flight[image_index as usize] != vk::Fence::null() {
+                let image_fence = vstate.images_in_flight[image_index as usize];
+                // SAFETY: the fence guards this swapchain image.
+                unsafe { device.wait_for_fences(&[image_fence], true, u64::MAX) }.map_err(
+                    |error| device::result_error("failed to wait for a swapchain image", error),
+                )?;
+            }
 
-        // SAFETY: all handles are live; the fence is reset and unsignalled.
-        unsafe { device.queue_submit(graphics_queue, &[submit], in_flight) }
-            .map_err(|error| device::result_error("failed to submit the frame", error))?;
-        vstate.images_in_flight[image_index as usize] = in_flight;
+            // SAFETY: the fence/image are idle and the pool is not in use.
+            unsafe {
+                device.reset_fences(&[in_flight]).map_err(|error| {
+                    device::result_error("failed to reset the frame fence", error)
+                })?;
+                device
+                    .reset_command_pool(command_pool, vk::CommandPoolResetFlags::empty())
+                    .map_err(|error| {
+                        device::result_error("failed to reset the frame command pool", error)
+                    })?;
+            }
+
+            let begin_info = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            // SAFETY: the command buffer is reset and idle.
+            unsafe { device.begin_command_buffer(command_buffer, &begin_info) }.map_err(
+                |error| device::result_error("failed to begin the frame command buffer", error),
+            )?;
+
+            let render_area = vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent,
+            };
+            let srgb = format_is_srgb(format);
+            let clear = clear_value(scene.background, srgb);
+            let clear_values = [vk::ClearValue {
+                color: vk::ClearColorValue { float32: clear },
+            }];
+            let framebuffer = framebuffers_for(vstate, image_index)?;
+            let render_pass_begin = vk::RenderPassBeginInfo::default()
+                .render_pass(render_pass)
+                .framebuffer(framebuffer)
+                .render_area(render_area)
+                .clear_values(&clear_values);
+
+            // SAFETY: the command buffer is recording; the render pass and
+            // framebuffer are compatible and live.
+            unsafe {
+                device.cmd_begin_render_pass(
+                    command_buffer,
+                    &render_pass_begin,
+                    vk::SubpassContents::INLINE,
+                );
+                let viewport = vk::Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: extent.width as f32,
+                    height: extent.height as f32,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                };
+                device.cmd_set_viewport(command_buffer, 0, &[viewport]);
+            }
+
+            draw::record_scene(
+                &device,
+                command_buffer,
+                &vstate.pipelines,
+                &vstate.textures,
+                scene,
+                extent,
+                srgb,
+            )?;
+
+            // SAFETY: the render pass and command buffer are recording.
+            unsafe {
+                device.cmd_end_render_pass(command_buffer);
+                device.end_command_buffer(command_buffer).map_err(|error| {
+                    device::result_error("failed to end the frame command buffer", error)
+                })?;
+            }
+
+            let wait_semaphores = [image_available];
+            let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+            let command_buffers = [command_buffer];
+            let submit = vk::SubmitInfo::default()
+                .wait_semaphores(&wait_semaphores)
+                .wait_dst_stage_mask(&wait_stages)
+                .command_buffers(&command_buffers)
+                .signal_semaphores(&signal_semaphores);
+
+            // SAFETY: all handles are live; the fence is reset and unsignalled.
+            unsafe { device.queue_submit(graphics_queue, &[submit], in_flight) }
+                .map_err(|error| device::result_error("failed to submit the frame", error))?;
+            vstate.images_in_flight[image_index as usize] = in_flight;
+            Ok(())
+        })();
+
+        if let Err(error) = record_result {
+            recreate_acquired_semaphore(&device, vstate, frame_index);
+            return Err(error);
+        }
 
         let swapchains = [swapchain];
         let image_indices = [image_index];
@@ -646,8 +698,9 @@ pub(crate) struct VulkanFrame {
 /// Mutable Vulkan state owned by the middle layer.
 pub(crate) struct VulkanState {
     /// Clone of the owning instance guard (handle only, not a separate owner
-    /// beyond the reference count).
-    pub(crate) instance_guard: Arc<InstanceGuard>,
+    /// beyond the reference count). Kept solely so the instance outlives every
+    /// device/surface handle in this state.
+    pub(crate) _instance_guard: Arc<InstanceGuard>,
     /// Selected physical device.
     pub(crate) physical_device: vk::PhysicalDevice,
     /// Logical device.
@@ -662,6 +715,8 @@ pub(crate) struct VulkanState {
     pub(crate) swapchain_loader: ash::khr::swapchain::Device,
     /// The surface this state presents to (also owned by `Surface`).
     pub(crate) surface: vk::SurfaceKHR,
+    /// Preferred swapchain format requested when the pipeline was created.
+    pub(crate) preferred_format: TextureFormat,
     /// Swapchain, render pass and framebuffers.
     pub(crate) swapchain: swapchain::SwapchainState,
     /// Compiled pipelines and descriptor resources.
@@ -675,7 +730,9 @@ pub(crate) struct VulkanState {
     /// Index of the next frame slot.
     pub(crate) frame_in_flight: usize,
     /// GPU textures keyed by [`Texture`] identity.
-    pub(crate) textures: HashMap<usize, texture::VulkanTexture>,
+    pub(crate) textures: HashMap<u64, texture::VulkanTexture>,
+    /// Persistent staging buffer reused by every upload.
+    pub(crate) staging: texture::StagingBuffer,
     /// Pool and command buffer used for one-time uploads.
     pub(crate) upload_pool: vk::CommandPool,
     /// Persistent upload command buffer.
@@ -706,15 +763,62 @@ impl Drop for VulkanState {
             self.swapchain.destroy(&self.device, &self.swapchain_loader);
             self.swapchain.destroy_render_pass(&self.device);
             for frame in &self.frames {
-                self.device.destroy_fence(frame.in_flight, None);
-                self.device.destroy_semaphore(frame.image_available, None);
-                self.device.destroy_command_pool(frame.command_pool, None);
+                destroy_frame(&self.device, frame);
             }
             for semaphore in &self.render_finished {
                 self.device.destroy_semaphore(*semaphore, None);
             }
+            self.staging.destroy(&self.device);
             self.device.destroy_command_pool(self.upload_pool, None);
             self.device.destroy_fence(self.upload_fence, None);
+            self.surface_loader.destroy_surface(self.surface, None);
+            self.device.destroy_device(None);
+        }
+    }
+}
+
+/// RAII teardown for the resources created during `begin_with_display`.
+///
+/// The guard borrows the swapchain and pipelines, which live in the caller's
+/// scope until ownership transfers to [`VulkanState`]. It also owns the frames
+/// and presentation semaphores created later. Disarming it before the
+/// successful return prevents double teardown on `Drop`.
+struct BeginTeardown<'a> {
+    device: &'a ash::Device,
+    surface_loader: &'a ash::khr::surface::Instance,
+    swapchain_loader: &'a ash::khr::swapchain::Device,
+    surface: vk::SurfaceKHR,
+    swapchain: &'a swapchain::SwapchainState,
+    pipelines: &'a pipelines::PipelineSet,
+    frames: Vec<VulkanFrame>,
+    render_finished: Vec<vk::Semaphore>,
+    upload: Option<(vk::CommandPool, vk::Fence)>,
+    armed: bool,
+}
+
+impl Drop for BeginTeardown<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // SAFETY: nothing has been submitted, so no GPU work references these
+        // handles. They are destroyed in reverse creation order, and the
+        // surface is destroyed before the device.
+        unsafe {
+            let _ = self.device.device_wait_idle();
+            if let Some((pool, fence)) = self.upload.take() {
+                self.device.destroy_command_pool(pool, None);
+                self.device.destroy_fence(fence, None);
+            }
+            for frame in &self.frames {
+                destroy_frame(self.device, frame);
+            }
+            for semaphore in &self.render_finished {
+                self.device.destroy_semaphore(*semaphore, None);
+            }
+            self.pipelines.destroy(self.device);
+            self.swapchain.destroy(self.device, self.swapchain_loader);
+            self.swapchain.destroy_render_pass(self.device);
             self.surface_loader.destroy_surface(self.surface, None);
             self.device.destroy_device(None);
         }
@@ -733,6 +837,25 @@ fn framebuffers_for(state: &VulkanState, image_index: u32) -> Result<vk::Framebu
         })
 }
 
+/// Destroys the fences, semaphore and command pool owned by one frame slot.
+///
+/// Null handles are skipped so a partially built frame can be torn down safely.
+fn destroy_frame(device: &ash::Device, frame: &VulkanFrame) {
+    // SAFETY: all handles were created by `device`; the caller guarantees the
+    // GPU is idle. `destroy_*` accepts null handles as a no-op.
+    unsafe {
+        if frame.in_flight != vk::Fence::null() {
+            device.destroy_fence(frame.in_flight, None);
+        }
+        if frame.image_available != vk::Semaphore::null() {
+            device.destroy_semaphore(frame.image_available, None);
+        }
+        if frame.command_pool != vk::CommandPool::null() {
+            device.destroy_command_pool(frame.command_pool, None);
+        }
+    }
+}
+
 /// Creates the per-frame command pools, buffers, fences and semaphores.
 fn create_frames(
     device: &ash::Device,
@@ -740,75 +863,90 @@ fn create_frames(
 ) -> Result<Vec<VulkanFrame>, RenderError> {
     let mut frames = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
     for _ in 0..MAX_FRAMES_IN_FLIGHT {
-        let pool_info = vk::CommandPoolCreateInfo::default()
-            .queue_family_index(queue_family_index)
-            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
-        // SAFETY: `device` is live and the pool info is valid.
-        let command_pool =
-            unsafe { device.create_command_pool(&pool_info, None) }.map_err(|error| {
-                RenderError::Unsupported {
-                    message: format!("failed to create a frame command pool: {error}"),
-                }
-            })?;
-
-        let allocate_info = vk::CommandBufferAllocateInfo::default()
-            .command_pool(command_pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
-        // SAFETY: the pool was just created.
-        let command_buffers = unsafe { device.allocate_command_buffers(&allocate_info) };
-        let command_buffer = match command_buffers {
-            Ok(mut buffers) if !buffers.is_empty() => buffers.remove(0),
-            Ok(_) => {
-                // SAFETY: the pool is owned here; nothing uses it.
-                unsafe { device.destroy_command_pool(command_pool, None) };
-                return Err(RenderError::OutOfMemory {
-                    message: "the command pool returned no command buffer".to_owned(),
-                });
-            }
+        match create_frame(device, queue_family_index) {
+            Ok(frame) => frames.push(frame),
             Err(error) => {
-                // SAFETY: the pool is owned here.
-                unsafe { device.destroy_command_pool(command_pool, None) };
-                return Err(RenderError::OutOfMemory {
-                    message: format!("failed to allocate a frame command buffer: {error}"),
-                });
-            }
-        };
-
-        // SAFETY: `device` is live.
-        let fence = unsafe {
-            device.create_fence(
-                &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
-                None,
-            )
-        };
-        let image_available =
-            unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) };
-        match (fence, image_available) {
-            (Ok(in_flight), Ok(image_available)) => frames.push(VulkanFrame {
-                command_pool,
-                command_buffer,
-                in_flight,
-                image_available,
-            }),
-            (fence, image_available) => {
-                if let Ok(fence) = fence {
-                    // SAFETY: owned here.
-                    unsafe { device.destroy_fence(fence, None) };
+                // The frames already created are owned here; free them before
+                // returning so a late failure does not leak GPU objects.
+                for frame in &frames {
+                    destroy_frame(device, frame);
                 }
-                if let Ok(semaphore) = image_available {
-                    // SAFETY: owned here.
-                    unsafe { device.destroy_semaphore(semaphore, None) };
-                }
-                // SAFETY: owned here.
-                unsafe { device.destroy_command_pool(command_pool, None) };
-                return Err(RenderError::Unsupported {
-                    message: "failed to create frame synchronisation objects".to_owned(),
-                });
+                return Err(error);
             }
         }
     }
     Ok(frames)
+}
+
+/// Creates one frame slot's command pool, buffer, fence and semaphore.
+fn create_frame(device: &ash::Device, queue_family_index: u32) -> Result<VulkanFrame, RenderError> {
+    let pool_info = vk::CommandPoolCreateInfo::default()
+        .queue_family_index(queue_family_index)
+        .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+    // SAFETY: `device` is live and the pool info is valid.
+    let command_pool =
+        unsafe { device.create_command_pool(&pool_info, None) }.map_err(|error| {
+            RenderError::Unsupported {
+                message: format!("failed to create a frame command pool: {error}"),
+            }
+        })?;
+
+    let allocate_info = vk::CommandBufferAllocateInfo::default()
+        .command_pool(command_pool)
+        .level(vk::CommandBufferLevel::PRIMARY)
+        .command_buffer_count(1);
+    // SAFETY: the pool was just created.
+    let command_buffers = unsafe { device.allocate_command_buffers(&allocate_info) };
+    let command_buffer = match command_buffers {
+        Ok(mut buffers) if !buffers.is_empty() => buffers.remove(0),
+        Ok(_) => {
+            // SAFETY: the pool is owned here; nothing uses it.
+            unsafe { device.destroy_command_pool(command_pool, None) };
+            return Err(RenderError::OutOfMemory {
+                message: "the command pool returned no command buffer".to_owned(),
+            });
+        }
+        Err(error) => {
+            // SAFETY: the pool is owned here.
+            unsafe { device.destroy_command_pool(command_pool, None) };
+            return Err(RenderError::OutOfMemory {
+                message: format!("failed to allocate a frame command buffer: {error}"),
+            });
+        }
+    };
+
+    // SAFETY: `device` is live.
+    let fence = unsafe {
+        device.create_fence(
+            &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
+            None,
+        )
+    };
+    let image_available =
+        unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) };
+    match (fence, image_available) {
+        (Ok(in_flight), Ok(image_available)) => Ok(VulkanFrame {
+            command_pool,
+            command_buffer,
+            in_flight,
+            image_available,
+        }),
+        (fence, image_available) => {
+            if let Ok(fence) = fence {
+                // SAFETY: owned here.
+                unsafe { device.destroy_fence(fence, None) };
+            }
+            if let Ok(semaphore) = image_available {
+                // SAFETY: owned here.
+                unsafe { device.destroy_semaphore(semaphore, None) };
+            }
+            // SAFETY: owned here.
+            unsafe { device.destroy_command_pool(command_pool, None) };
+            Err(RenderError::Unsupported {
+                message: "failed to create frame synchronisation objects".to_owned(),
+            })
+        }
+    }
 }
 
 /// Creates the reusable upload command buffer and a signalled fence.
@@ -889,12 +1027,12 @@ fn recreate_swapchain(
     let requested = state.surface_size;
     let new_swapchain = swapchain::create(
         device,
-        &state.instance_guard.instance,
         state.physical_device,
         &state.surface_loader,
         &state.swapchain_loader,
         surface,
         requested,
+        state.preferred_format,
         Some(&state.swapchain),
     );
 
@@ -902,7 +1040,10 @@ fn recreate_swapchain(
         Ok(new_swapchain) => {
             let old = std::mem::replace(&mut state.swapchain, new_swapchain);
             old.destroy(device, &state.swapchain_loader);
-            rebuild_image_sync(state, device)?;
+            if let Err(error) = rebuild_image_sync(state, device) {
+                state.swapchain_ready = false;
+                return Err(error);
+            }
             state.swapchain_ready = true;
             Ok(())
         }
@@ -916,29 +1057,60 @@ fn recreate_swapchain(
 
 /// Rebuilds the per-image fences and semaphores after a swapchain change.
 ///
-/// Semaphores are only recreated when the image count changes; otherwise the
-/// existing set is reused to avoid destroying a semaphore the presentation
-/// engine may still be consuming.
+/// The presentation semaphores are always recreated: a `queue_present` on the
+/// previous generation may have signalled one, and a binary semaphore that is
+/// already signalled must not be signalled again. The device is idle here, so
+/// destroying and recreating them is safe.
 fn rebuild_image_sync(state: &mut VulkanState, device: &ash::Device) -> Result<(), RenderError> {
     let image_count = state.swapchain.images.len().max(1);
-    if state.render_finished.len() != image_count {
-        for semaphore in &state.render_finished {
-            // SAFETY: owned here and the GPU is idle.
-            unsafe { device.destroy_semaphore(*semaphore, None) };
-        }
-        state.render_finished.clear();
-        for _ in 0..image_count {
-            // SAFETY: `device` is live.
-            let semaphore =
-                unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }
-                    .map_err(|error| RenderError::Unsupported {
-                        message: format!("failed to create presentation semaphores: {error}"),
-                    })?;
-            state.render_finished.push(semaphore);
-        }
+    for semaphore in state.render_finished.drain(..) {
+        // SAFETY: owned here and the GPU is idle.
+        unsafe { device.destroy_semaphore(semaphore, None) };
+    }
+    for _ in 0..image_count {
+        // SAFETY: `device` is live.
+        let semaphore =
+            unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }.map_err(
+                |error| RenderError::Unsupported {
+                    message: format!("failed to create presentation semaphores: {error}"),
+                },
+            )?;
+        state.render_finished.push(semaphore);
     }
     state.images_in_flight = vec![vk::Fence::null(); image_count];
     Ok(())
+}
+
+/// Recreates a frame's `image_available` semaphore after an error unwound
+/// between `acquire_next_image` and a successful submit.
+///
+/// The acquire signalled the old semaphore, so it can no longer be reused.
+/// Destroying it is safe because no queue operation is waiting on it. If the
+/// replacement cannot be created the swapchain is marked unusable so the slot
+/// is never touched again.
+fn recreate_acquired_semaphore(device: &ash::Device, state: &mut VulkanState, frame_index: usize) {
+    let recreated = {
+        let Some(frame) = state.frames.get_mut(frame_index) else {
+            return;
+        };
+        // SAFETY: the acquire signalled this semaphore and nothing waits on it.
+        unsafe {
+            device.destroy_semaphore(frame.image_available, None);
+            match device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) {
+                Ok(semaphore) => {
+                    frame.image_available = semaphore;
+                    true
+                }
+                Err(_) => {
+                    frame.image_available = vk::Semaphore::null();
+                    false
+                }
+            }
+        }
+    };
+    if !recreated {
+        state.swapchain_ready = false;
+    }
 }
 
 /// Derives a platform display handle from a window handle when the platform

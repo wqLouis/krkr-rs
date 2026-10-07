@@ -19,14 +19,12 @@ fn capabilities_advertise_the_image_and_audio_backends() {
 
 #[test]
 fn config_is_preserved_and_media_is_stateless() {
-    let config = MediaConfig {
-        allow_large_images: true,
-    };
+    let config = MediaConfig::new();
     let media = Media::with_config(config.clone());
     assert_eq!(media.config(), &config);
-    // Two independent objects do not alias.
+    // The default config is identical for every object; clones are independent.
     let other = create_media(MediaConfig::default());
-    assert_ne!(media, other);
+    assert_eq!(media, other);
     assert_eq!(media, media.clone());
 }
 

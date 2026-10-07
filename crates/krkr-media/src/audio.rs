@@ -23,14 +23,12 @@
 //!
 //! The default symphonia codecs are registered (`wav`/`pcm`, `ogg`/`vorbis`,
 //! `flac`, `mp3`) plus the separately shipped
-//! [`symphonia_adapter_libopus::OpusDecoder`]. When an Ogg Opus stream
-//! cannot be opened or yields no samples, the reference's silent fallback is
-//! preserved: a short (~60 ms) silent buffer is returned instead of an
-//! error, so voice sequencing still observes a play→stop transition.
+//! [`symphonia_adapter_libopus::OpusDecoder`]. A stream that cannot be
+//! probed or decoded returns a typed [`MediaError`]; no silence or other
+//! placeholder is substituted.
 
 use std::fmt;
 use std::io::Cursor;
-use std::path::Path;
 use std::sync::Arc;
 
 use krkr_api::error::MediaError;
@@ -40,44 +38,14 @@ use symphonia::core::codecs::registry::CodecRegistry;
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::{FormatOptions, FormatReader, TrackType};
-use symphonia::core::io::MediaSourceStream;
+use symphonia::core::io::{MediaSource, MediaSourceStream};
 use symphonia::core::meta::MetadataOptions;
 
 use crate::Media;
+use crate::hint::extension_of;
 
 /// Audio format/codec names advertised by [`crate::capabilities`].
 pub(crate) const AUDIO_FORMATS: [&str; 7] = ["wav", "pcm", "ogg", "vorbis", "flac", "mp3", "opus"];
-
-/// Sample rate of the Opus-failure silent fallback.
-const SILENT_RATE: u32 = 48_000;
-/// Channel count of the Opus-failure silent fallback.
-const SILENT_CHANNELS: u16 = 2;
-/// Duration of the Opus-failure silent fallback in milliseconds.
-const SILENT_MS: u64 = 60;
-
-/// Frames in the Opus-failure silent fallback.
-fn silent_frames() -> u64 {
-    (u64::from(SILENT_RATE) / 1000) * SILENT_MS
-}
-
-/// Interleaved samples of the Opus-failure silent fallback.
-fn silent_samples() -> Vec<f32> {
-    vec![0.0; silent_frames() as usize * usize::from(SILENT_CHANNELS)]
-}
-
-/// [`AudioSpec`] of the Opus-failure silent fallback.
-fn silent_spec() -> AudioSpec {
-    AudioSpec {
-        sample_rate: SILENT_RATE,
-        channels: SILENT_CHANNELS,
-        total_frames: Some(silent_frames()),
-    }
-}
-
-/// Whole-file decode of the Opus-failure silent fallback.
-fn silent_audio() -> DecodedAudio {
-    DecodedAudio::new(silent_spec(), silent_samples())
-}
 
 /// Bottom-defined state for an incremental audio decode.
 ///
@@ -93,8 +61,8 @@ fn silent_audio() -> DecodedAudio {
 pub struct AudioDecoderState {
     /// Current stream format, refined from the first decoded packet.
     spec: AudioSpec,
-    /// Opened format reader + decoder; `None` for the silent fallback.
-    setup: Option<DecoderSetup>,
+    /// Opened format reader + decoder.
+    setup: Option<DecoderSetup<'static>>,
     /// Compressed bytes, retained for [`seek_audio`] reseeks.
     bytes: Arc<[u8]>,
     /// Original hint, retained for [`seek_audio`] reseeks.
@@ -109,8 +77,6 @@ pub struct AudioDecoderState {
     position_frames: u64,
     /// Set once the reader is exhausted.
     eof: bool,
-    /// Template for the silent fallback; `Some` only in fallback states.
-    fallback: Option<Vec<f32>>,
 }
 
 impl fmt::Debug for AudioDecoderState {
@@ -120,21 +86,24 @@ impl fmt::Debug for AudioDecoderState {
             .field("position_frames", &self.position_frames)
             .field("skip_frames", &self.skip_frames)
             .field("eof", &self.eof)
-            .field("fallback", &self.fallback.is_some())
             .finish_non_exhaustive()
     }
 }
 
 /// An opened format reader + decoder, before any packet is consumed.
-struct DecoderSetup {
-    format: Box<dyn FormatReader>,
+///
+/// The reader borrows its byte source for `'a`; the streaming state stores a
+/// `'static` reader (backed by an `Arc<[u8]>`), while whole-file
+/// probe/decode use a `&[u8]`-backed reader that never escapes the call.
+struct DecoderSetup<'a> {
+    format: Box<dyn FormatReader + 'a>,
     decoder: Box<dyn AudioDecoder>,
     track_id: u32,
 }
 
 /// Everything [`open_setup`] produces: the decoder plus the probed [`AudioSpec`].
-struct OpenedAudio {
-    format: Box<dyn FormatReader>,
+struct OpenedAudio<'a> {
+    format: Box<dyn FormatReader + 'a>,
     decoder: Box<dyn AudioDecoder>,
     track_id: u32,
     spec: AudioSpec,
@@ -143,27 +112,6 @@ struct OpenedAudio {
 /// Returns the hint used in error messages.
 fn display_name(hint: Option<&str>) -> &str {
     hint.filter(|name| !name.is_empty()).unwrap_or("<audio>")
-}
-
-/// Extracts a lowercase container-extension hint from a storage name or a
-/// bare extension (`"wav"` / `".wav"`).
-fn extension_of(hint: &str) -> Option<String> {
-    if let Some(ext) = Path::new(hint).extension().and_then(|ext| ext.to_str()) {
-        return Some(ext.to_ascii_lowercase());
-    }
-    let bare = hint.strip_prefix('.').unwrap_or(hint);
-    if !bare.is_empty() && !bare.contains(['/', '\\', '.']) {
-        return Some(bare.to_ascii_lowercase());
-    }
-    None
-}
-
-/// Returns `true` when the bytes look like an Ogg Opus stream.
-///
-/// Opus carries a separate decoder adapter and gets the silent fallback; the
-/// sniff is used both to select the fallback and to describe it in logs.
-fn is_opus(bytes: &[u8]) -> bool {
-    bytes.starts_with(b"OggS") && bytes.windows(8).any(|window| window == b"OpusHead")
 }
 
 /// Builds a fresh codec registry with the default codecs plus the Opus
@@ -181,16 +129,20 @@ fn build_codec_registry() -> CodecRegistry {
 
 /// Probes the container and builds the decoder without consuming samples.
 ///
-/// Shared by [`probe_audio`], [`decode_audio`] and [`open_audio`]. The
-/// extension hint only nudges the probe; the bytes always decide the format.
-/// The caller's buffer is shared by refcount so multi-MB entries are never
-/// copied.
-fn open_setup(bytes: &Arc<[u8]>, hint: Option<&str>) -> Result<OpenedAudio, MediaError> {
+/// Shared by [`probe_audio`], [`decode_audio`], [`open_audio`] and
+/// [`seek_audio`]. The extension hint only nudges the probe; the bytes always
+/// decide the format. `source` may be a borrowed `Cursor<&[u8]>` (whole-file
+/// probe/decode) or an owned `Cursor<Arc<[u8]>>` (the streaming state), so no
+/// whole-buffer copy is needed on any path.
+fn open_setup<'a, S>(source: S, hint: Option<&str>) -> Result<OpenedAudio<'a>, MediaError>
+where
+    S: MediaSource + 'a,
+{
     let name = display_name(hint);
-    let mss = MediaSourceStream::new(Box::new(Cursor::new(Arc::clone(bytes))), Default::default());
+    let mss = MediaSourceStream::new(Box::new(source), Default::default());
     let mut symphonia_hint = Hint::new();
     if let Some(ext) = hint.and_then(extension_of) {
-        symphonia_hint.with_extension(&ext);
+        symphonia_hint.with_extension(ext);
     }
     let format = symphonia::default::get_probe()
         .probe(
@@ -200,8 +152,8 @@ fn open_setup(bytes: &Arc<[u8]>, hint: Option<&str>) -> Result<OpenedAudio, Medi
             MetadataOptions::default(),
         )
         .map_err(|error| MediaError::Decode {
-            format: name.to_string(),
-            message: format!("{error}"),
+            format: String::new(),
+            message: format!("{name}: {error}"),
         })?;
 
     let track = format
@@ -254,85 +206,84 @@ fn open_setup(bytes: &Arc<[u8]>, hint: Option<&str>) -> Result<OpenedAudio, Medi
     })
 }
 
-/// Builds a fallback state that yields the ~60 ms silent buffer once.
-fn fallback_state(bytes: Arc<[u8]>, hint: Option<String>) -> AudioDecoderState {
-    let samples = silent_samples();
-    AudioDecoderState {
-        spec: silent_spec(),
-        setup: None,
-        bytes,
-        hint,
-        pending: samples.clone(),
-        pending_offset: 0,
-        skip_frames: 0,
-        position_frames: 0,
-        eof: false,
-        fallback: Some(samples),
-    }
-}
-
 /// Probes an audio stream for its [spec](AudioSpec) without decoding samples.
 ///
 /// `hint` is the storage name or extension the caller used to find `bytes`;
 /// it only steers backend selection and is never trusted over the content.
-///
-/// If the bytes are an Ogg Opus stream that cannot be opened, the reference's
-/// silent fallback spec (~60 ms, 48 kHz stereo) is returned so the middle
-/// layer can still sequence the sound instead of failing outright.
+/// A stream that cannot be probed returns a typed [`MediaError`].
 pub fn probe_audio(m: &Media, bytes: &[u8], hint: Option<&str>) -> Result<AudioSpec, MediaError> {
     let _ = m;
-    let bytes: Arc<[u8]> = Arc::from(bytes);
-    match open_setup(&bytes, hint) {
-        Ok(opened) => Ok(opened.spec),
-        Err(error) => {
-            if is_opus(&bytes) {
-                log::warn!(
-                    "probe_audio: {}: Opus probe failed ({error}); reporting the silent fallback spec",
-                    display_name(hint)
-                );
-                Ok(silent_spec())
-            } else {
-                Err(error)
-            }
-        }
-    }
+    open_setup(Cursor::new(bytes), hint).map(|opened| opened.spec)
 }
 
 /// Decodes a whole audio file into interleaved `f32` samples.
 ///
 /// The result carries the probed [`AudioSpec`]; the samples are interleaved
-/// per channel (`interleaved[frame * channels + channel]`). A failed Ogg
-/// Opus decode returns the ~60 ms silent fallback instead of an error so the
-/// sequencing contract is preserved.
+/// per channel (`interleaved[frame * channels + channel]`). A stream that
+/// cannot be decoded returns a typed [`MediaError`] — no silence is
+/// substituted.
 pub fn decode_audio(
     m: &Media,
     bytes: &[u8],
     hint: Option<&str>,
 ) -> Result<DecodedAudio, MediaError> {
-    let (spec, mut state) = open_audio(m, Arc::from(bytes), hint)?;
-    let channels = usize::from(spec.channels.max(1)).max(1);
+    let _ = m;
+    let opened = open_setup(Cursor::new(bytes), hint)?;
+    decode_all(opened, hint)
+}
+
+/// Drains every packet of an opened stream into interleaved `f32` samples.
+///
+/// Used by [`decode_audio`], which decodes straight from the caller's
+/// borrowed buffer (via a `Cursor<&[u8]>` reader) and therefore never needs
+/// an [`AudioDecoderState`] or an owned copy of the compressed bytes.
+fn decode_all(opened: OpenedAudio<'_>, hint: Option<&str>) -> Result<DecodedAudio, MediaError> {
+    let OpenedAudio {
+        format,
+        decoder,
+        track_id,
+        mut spec,
+    } = opened;
+    let mut setup = DecoderSetup {
+        format,
+        decoder,
+        track_id,
+    };
+    let name = display_name(hint);
     let mut samples: Vec<f32> = Vec::new();
-    let mut chunk = vec![0.0f32; 4096 * channels];
+    let mut pending: Vec<f32> = Vec::new();
+    let mut pending_offset = 0usize;
+    let mut skip_frames = 0u64;
+
     loop {
-        match read_audio(m, &mut state, &mut chunk) {
-            Ok(0) => break,
-            Ok(written) => samples.extend_from_slice(&chunk[..written]),
-            Err(MediaError::EndOfStream) => break,
+        if pending_offset < pending.len() {
+            samples.extend_from_slice(&pending[pending_offset..]);
+            pending.clear();
+            pending_offset = 0;
+            continue;
+        }
+        match decode_packet_into(
+            &mut spec,
+            &mut setup,
+            &mut pending,
+            &mut pending_offset,
+            &mut skip_frames,
+            name,
+        ) {
+            Ok(true) => {}
+            Ok(false) => break,
             Err(error) => return Err(error),
         }
     }
 
     if samples.is_empty() {
-        if is_opus(bytes) || state.fallback.is_some() {
-            return Ok(silent_audio());
-        }
         return Err(MediaError::Decode {
-            format: display_name(hint).to_string(),
-            message: "no audio data decoded".to_string(),
+            format: String::new(),
+            message: format!("{name}: no audio data decoded"),
         });
     }
 
-    Ok(DecodedAudio::new(state.spec, samples))
+    Ok(DecodedAudio::new(spec, samples))
 }
 
 /// Opens an audio stream for incremental decoding.
@@ -342,8 +293,7 @@ pub fn decode_audio(
 /// by `Arc` so the caller can keep the compressed buffer alive (and so
 /// [`seek_audio`] can restart the reader without re-copying it).
 ///
-/// A failed Ogg Opus open yields a fallback state that returns ~60 ms of
-/// silence once and then reports [`MediaError::EndOfStream`].
+/// A stream that cannot be opened returns a typed [`MediaError`].
 pub fn open_audio(
     m: &Media,
     bytes: Arc<[u8]>,
@@ -351,40 +301,24 @@ pub fn open_audio(
 ) -> Result<(AudioSpec, AudioDecoderState), MediaError> {
     let _ = m;
     let hint_owned = hint.map(str::to_string);
-    match open_setup(&bytes, hint) {
-        Ok(opened) => {
-            let spec = opened.spec;
-            let state = AudioDecoderState {
-                spec,
-                setup: Some(DecoderSetup {
-                    format: opened.format,
-                    decoder: opened.decoder,
-                    track_id: opened.track_id,
-                }),
-                bytes,
-                hint: hint_owned,
-                pending: Vec::new(),
-                pending_offset: 0,
-                skip_frames: 0,
-                position_frames: 0,
-                eof: false,
-                fallback: None,
-            };
-            Ok((spec, state))
-        }
-        Err(error) => {
-            if is_opus(&bytes) {
-                log::warn!(
-                    "open_audio: {}: Opus open failed ({error}); using the silent fallback",
-                    display_name(hint)
-                );
-                let state = fallback_state(bytes, hint_owned);
-                Ok((state.spec, state))
-            } else {
-                Err(error)
-            }
-        }
-    }
+    let opened = open_setup(Cursor::new(Arc::clone(&bytes)), hint)?;
+    let spec = opened.spec;
+    let state = AudioDecoderState {
+        spec,
+        setup: Some(DecoderSetup {
+            format: opened.format,
+            decoder: opened.decoder,
+            track_id: opened.track_id,
+        }),
+        bytes,
+        hint: hint_owned,
+        pending: Vec::new(),
+        pending_offset: 0,
+        skip_frames: 0,
+        position_frames: 0,
+        eof: false,
+    };
+    Ok((spec, state))
 }
 
 /// Decodes the next chunk of interleaved `f32` samples into `out`.
@@ -444,18 +378,39 @@ pub fn read_audio(
 /// Returns `Ok(false)` at end of stream and `Ok(true)` when samples were
 /// staged (possibly zero samples from a corrupt packet, which is skipped).
 fn decode_next_packet(state: &mut AudioDecoderState) -> Result<bool, MediaError> {
-    let name = display_name(state.hint.as_deref()).to_string();
     let AudioDecoderState {
         spec,
         setup,
         pending,
         pending_offset,
         skip_frames,
+        hint,
         ..
     } = state;
     let Some(setup) = setup.as_mut() else {
         return Ok(false);
     };
+    let name = display_name(hint.as_deref());
+    decode_packet_into(spec, setup, pending, pending_offset, skip_frames, name)
+}
+
+/// Decodes one packet of `setup` into `pending`, honouring a pending seek
+/// skip. Shared by the streaming path ([`decode_next_packet`]) and the
+/// whole-file path ([`decode_all`]).
+///
+/// Returns `Ok(false)` at end of stream and `Ok(true)` when samples were
+/// staged (possibly zero samples from a corrupt packet, which is skipped).
+/// `name` is the caller's display hint; the detected container name is
+/// reported in [`MediaError::Decode::format`].
+fn decode_packet_into(
+    spec: &mut AudioSpec,
+    setup: &mut DecoderSetup<'_>,
+    pending: &mut Vec<f32>,
+    pending_offset: &mut usize,
+    skip_frames: &mut u64,
+    name: &str,
+) -> Result<bool, MediaError> {
+    let format = setup.format.format_info().short_name;
 
     loop {
         let packet = match setup.format.next_packet() {
@@ -469,8 +424,8 @@ fn decode_next_packet(state: &mut AudioDecoderState) -> Result<bool, MediaError>
             Err(SymphoniaError::ResetRequired) => return Ok(false),
             Err(error) => {
                 return Err(MediaError::Decode {
-                    format: name,
-                    message: format!("{error}"),
+                    format: format.to_string(),
+                    message: format!("{name}: {error}"),
                 });
             }
         };
@@ -509,8 +464,8 @@ fn decode_next_packet(state: &mut AudioDecoderState) -> Result<bool, MediaError>
             Err(SymphoniaError::DecodeError(_)) => continue,
             Err(error) => {
                 return Err(MediaError::Decode {
-                    format: name,
-                    message: format!("{error}"),
+                    format: format.to_string(),
+                    message: format!("{name}: {error}"),
                 });
             }
         }
@@ -522,12 +477,12 @@ fn decode_next_packet(state: &mut AudioDecoderState) -> Result<bool, MediaError>
 /// The reader is reopened from the retained compressed bytes (the reference
 /// `StreamDecoder` behaviour on seek/loop wrap), then decoded frames are
 /// discarded until `frame` is reached. The decode position is updated
-/// immediately; the silent-fallback path emulates the seek within its buffer.
+/// immediately. A stream that cannot be reopened returns a typed
+/// [`MediaError`].
 pub fn seek_audio(m: &Media, state: &mut AudioDecoderState, frame: u64) -> Result<(), MediaError> {
     let _ = m;
-    let bytes = Arc::clone(&state.bytes);
     let hint = state.hint.clone();
-    match open_setup(&bytes, hint.as_deref()) {
+    match open_setup(Cursor::new(Arc::clone(&state.bytes)), hint.as_deref()) {
         Ok(opened) => {
             state.spec = opened.spec;
             state.setup = Some(DecoderSetup {
@@ -540,26 +495,8 @@ pub fn seek_audio(m: &Media, state: &mut AudioDecoderState, frame: u64) -> Resul
             state.skip_frames = frame;
             state.position_frames = frame;
             state.eof = false;
-            state.fallback = None;
             Ok(())
         }
-        Err(error) => {
-            if is_opus(&bytes) {
-                let template = silent_samples();
-                let channels = usize::from(SILENT_CHANNELS);
-                let offset = (frame as usize * channels).min(template.len());
-                state.spec = silent_spec();
-                state.setup = None;
-                state.pending = template.clone();
-                state.pending_offset = offset;
-                state.skip_frames = 0;
-                state.position_frames = frame;
-                state.eof = false;
-                state.fallback = Some(template);
-                Ok(())
-            } else {
-                Err(error)
-            }
-        }
+        Err(error) => Err(error),
     }
 }

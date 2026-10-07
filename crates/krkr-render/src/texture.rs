@@ -8,6 +8,14 @@
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Monotonic source of [`Texture`] identities.
+///
+/// Using a counter instead of the backing allocation address removes the ABA
+/// hazard where a dropped-and-freed handle could be replaced by a new one at
+/// the same address and silently reuse a stale GPU texture.
+static NEXT_TEXTURE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Storage format of a [`Texture`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -102,6 +110,7 @@ pub struct Texture {
 /// Shared, immutable contents of a [`Texture`] handle.
 #[derive(Debug)]
 struct TextureInner {
+    id: u64,
     desc: TextureDesc,
 }
 
@@ -109,7 +118,10 @@ impl Texture {
     /// Creates a new texture handle from a validated descriptor.
     pub(crate) fn new(desc: TextureDesc) -> Self {
         Self {
-            inner: Arc::new(TextureInner { desc }),
+            inner: Arc::new(TextureInner {
+                id: NEXT_TEXTURE_ID.fetch_add(1, Ordering::Relaxed),
+                desc,
+            }),
         }
     }
 
@@ -129,8 +141,8 @@ impl Texture {
     }
 
     /// Returns a process-unique key for the handle's backing allocation.
-    pub(crate) fn key(&self) -> usize {
-        Arc::as_ptr(&self.inner) as usize
+    pub(crate) fn key(&self) -> u64 {
+        self.inner.id
     }
 }
 

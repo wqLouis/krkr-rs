@@ -31,6 +31,7 @@ use std::collections::BTreeMap;
 use std::io::{self, Read, Seek, SeekFrom};
 
 use flate2::read::ZlibDecoder;
+use krkr_api::error::FsError;
 use krkr_fs::{FileState, FileSystem, file_size, read_at};
 
 /// 11-byte XP3 magic: `"XP3\r\n \n\x1a\x8b\x67\x01"`.
@@ -58,10 +59,16 @@ pub const SEGM_ENCODE_ZLIB: u32 = 1;
 
 /// Errors produced while opening or reading an XP3 archive.
 #[derive(Debug, thiserror::Error)]
-pub enum Error {
-    /// An underlying I/O (or bottom file-system) read failed.
+pub enum Xp3Error {
+    /// An underlying I/O read failed.
     #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
+    Io(std::io::Error),
+
+    /// A bottom file-system read failed. Carried through the `Read`/`Seek`
+    /// adapter so `FsError::NotFound` and friends stay matchable instead of
+    /// being erased into an opaque I/O string.
+    #[error(transparent)]
+    Fs(#[from] FsError),
 
     /// The file does not start with the XP3 magic (nor an MZ header
     /// containing one).
@@ -98,7 +105,18 @@ pub enum Error {
 }
 
 /// Convenience alias for XP3 results.
-pub type Result<T> = std::result::Result<T, Error>;
+pub type Result<T> = std::result::Result<T, Xp3Error>;
+
+impl From<std::io::Error> for Xp3Error {
+    /// Recover a [`FsError`] wrapped by [`FileReader`] before falling back to
+    /// the opaque I/O variant.
+    fn from(error: std::io::Error) -> Self {
+        match error.get_ref().and_then(|e| e.downcast_ref::<FsError>()) {
+            Some(fs) => Xp3Error::Fs(fs.clone()),
+            None => Xp3Error::Io(error),
+        }
+    }
+}
 
 /// One 28-byte segment of a file inside the archive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,7 +170,9 @@ impl Xp3Archive {
 
         // Read the 11-byte magic.
         let mut magic = [0u8; 11];
-        reader.read_exact(&mut magic).map_err(|_| Error::NotAnXp3)?;
+        reader
+            .read_exact(&mut magic)
+            .map_err(|_| Xp3Error::NotAnXp3)?;
 
         let base = if magic[..2] == *b"MZ" {
             // EXE-embedded: search for the XP3 mark on 16-byte alignment.
@@ -160,7 +180,7 @@ impl Xp3Archive {
         } else if magic == XP3_MAGIC {
             0
         } else {
-            return Err(Error::NotAnXp3);
+            return Err(Xp3Error::NotAnXp3);
         };
 
         let mut archive = Xp3Archive {
@@ -202,7 +222,7 @@ impl Xp3Archive {
         let entry = self
             .entries
             .get(&normalized)
-            .ok_or_else(|| Error::NotFound(name.to_string()))?;
+            .ok_or_else(|| Xp3Error::NotFound(name.to_string()))?;
         self.read_entry(fs, file, entry)
     }
 
@@ -211,23 +231,49 @@ impl Xp3Archive {
         // Note: `protected` (DRM bit) files are read normally, matching the
         // reference emulator, which allows extracting protected storage.
         let mut reader = FileReader { fs, file, pos: 0 };
-        let mut out = Vec::with_capacity(entry.org_size as usize);
+        // Size the output from the segments' own declared sizes rather than
+        // the entry header. The sum is checked for overflow and the
+        // allocation is fallible, so a structurally invalid size is an error
+        // rather than an unbounded allocation (no arbitrary maximum).
+        let expected = entry.segments.iter().try_fold(0u64, |total, seg| {
+            let size = if seg.flags & SEGM_ENCODE_METHOD_MASK == SEGM_ENCODE_ZLIB {
+                seg.org_size
+            } else {
+                seg.arc_size
+            };
+            total
+                .checked_add(size)
+                .ok_or(Xp3Error::CorruptIndex("entry size overflow"))
+        })?;
+        let expected = usize::try_from(expected)
+            .map_err(|_| Xp3Error::CorruptIndex("entry size does not fit usize"))?;
+        let mut out = Vec::new();
+        out.try_reserve_exact(expected)
+            .map_err(|_| Xp3Error::CorruptIndex("entry size cannot be allocated"))?;
         for seg in &entry.segments {
-            let mut buf = vec![0u8; seg.arc_size as usize];
-            reader.seek(SeekFrom::Start(self.base + seg.start))?;
+            let arc_len = usize::try_from(seg.arc_size)
+                .map_err(|_| Xp3Error::CorruptIndex("segment too large"))?;
+            let mut buf = alloc_zeroed(arc_len, "segment too large")?;
+            let start = self
+                .base
+                .checked_add(seg.start)
+                .ok_or(Xp3Error::CorruptIndex("segment offset overflow"))?;
+            reader.seek(SeekFrom::Start(start))?;
             reader.read_exact(&mut buf)?;
 
             let method = seg.flags & SEGM_ENCODE_METHOD_MASK;
             match method {
                 SEGM_ENCODE_RAW => out.extend_from_slice(&buf),
                 SEGM_ENCODE_ZLIB => {
+                    let org_len = usize::try_from(seg.org_size)
+                        .map_err(|_| Xp3Error::CorruptIndex("segment too large"))?;
                     let mut dec = ZlibDecoder::new(&buf[..]);
-                    let mut chunk = vec![0u8; seg.org_size as usize];
+                    let mut chunk = alloc_zeroed(org_len, "segment too large")?;
                     dec.read_exact(&mut chunk)
-                        .map_err(|_| Error::Inflate(entry.raw_name.clone()))?;
+                        .map_err(|_| Xp3Error::Inflate(entry.raw_name.clone()))?;
                     out.extend_from_slice(&chunk);
                 }
-                other => return Err(Error::UnknownSegmentMethod(other, seg.flags)),
+                other => return Err(Xp3Error::UnknownSegmentMethod(other, seg.flags)),
             }
         }
         debug_assert_eq!(out.len() as u64, entry.org_size);
@@ -241,23 +287,31 @@ impl Xp3Archive {
     /// a block with `INDEX_CONTINUE` the next offset is read from the current
     /// position (immediately after that block's data).
     fn read_index(&mut self, reader: &mut FileReader<'_>) -> Result<()> {
-        reader.seek(SeekFrom::Start(self.base + 11))?;
+        let start = self
+            .base
+            .checked_add(11)
+            .ok_or(Xp3Error::CorruptIndex("index offset overflow"))?;
+        reader.seek(SeekFrom::Start(start))?;
         let mut chain = 0usize;
         loop {
             chain += 1;
             if chain > 256 {
-                return Err(Error::IndexChainTooLong(chain));
+                return Err(Xp3Error::IndexChainTooLong(chain));
             }
 
             let index_ofs = read_u64_le(reader)?;
             if index_ofs == 0 {
                 if self.entries.is_empty() {
-                    return Err(Error::NoIndex);
+                    return Err(Xp3Error::NoIndex);
                 }
                 break;
             }
 
-            reader.seek(SeekFrom::Start(self.base + index_ofs))?;
+            let start = self
+                .base
+                .checked_add(index_ofs)
+                .ok_or(Xp3Error::CorruptIndex("index offset overflow"))?;
+            reader.seek(SeekFrom::Start(start))?;
             let flag = read_u8(reader)?;
             let data = match flag & INDEX_ENCODE_METHOD_MASK {
                 INDEX_ENCODE_RAW => {
@@ -269,12 +323,14 @@ impl Xp3Archive {
                     let real_size = read_u64_le(reader)?;
                     let compressed = read_exact_vec(reader, compressed_size)?;
                     let mut dec = ZlibDecoder::new(&compressed[..]);
-                    let mut data = vec![0u8; real_size as usize];
+                    let real_len = usize::try_from(real_size)
+                        .map_err(|_| Xp3Error::CorruptIndex("index too large"))?;
+                    let mut data = alloc_zeroed(real_len, "index too large")?;
                     dec.read_exact(&mut data)
-                        .map_err(|_| Error::CorruptIndex("zlib decompression failed"))?;
+                        .map_err(|_| Xp3Error::CorruptIndex("zlib decompression failed"))?;
                     data
                 }
-                other => return Err(Error::BadIndexFlag(flag | other)),
+                other => return Err(Xp3Error::BadIndexFlag(flag | other)),
             };
 
             self.parse_index(&data)?;
@@ -291,16 +347,20 @@ impl Xp3Archive {
     /// Parse one index block: chunks of `[4-byte tag][u64 LE size][data]`.
     fn parse_index(&mut self, data: &[u8]) -> Result<()> {
         let mut pos = 0usize;
-        while pos + 12 <= data.len() {
+        while data.len().saturating_sub(pos) >= 12 {
             let tag = &data[pos..pos + 4];
             let size = u64::from_le_bytes(data[pos + 4..pos + 12].try_into().unwrap());
-            let size = usize::try_from(size).map_err(|_| Error::CorruptIndex("chunk too large"))?;
+            let size =
+                usize::try_from(size).map_err(|_| Xp3Error::CorruptIndex("chunk too large"))?;
             pos += 12;
-            if pos + size > data.len() {
-                return Err(Error::CorruptIndex("chunk overruns index data"));
+            let end = pos
+                .checked_add(size)
+                .ok_or(Xp3Error::CorruptIndex("chunk size overflow"))?;
+            if end > data.len() {
+                return Err(Xp3Error::CorruptIndex("chunk overruns index data"));
             }
-            let payload = &data[pos..pos + size];
-            pos += size;
+            let payload = &data[pos..end];
+            pos = end;
 
             if tag == b"File" {
                 self.parse_file_chunk(payload)?;
@@ -319,30 +379,37 @@ impl Xp3Archive {
         let mut segments = Vec::new();
         let mut file_hash = 0u32;
 
-        while pos + 12 <= data.len() {
+        while data.len().saturating_sub(pos) >= 12 {
             let tag = &data[pos..pos + 4];
             let size = u64::from_le_bytes(data[pos + 4..pos + 12].try_into().unwrap());
             let size =
-                usize::try_from(size).map_err(|_| Error::CorruptIndex("sub-chunk too large"))?;
+                usize::try_from(size).map_err(|_| Xp3Error::CorruptIndex("sub-chunk too large"))?;
             pos += 12;
-            if pos + size > data.len() {
-                return Err(Error::CorruptIndex("sub-chunk overruns File chunk"));
+            let end = pos
+                .checked_add(size)
+                .ok_or(Xp3Error::CorruptIndex("sub-chunk size overflow"))?;
+            if end > data.len() {
+                return Err(Xp3Error::CorruptIndex("sub-chunk overruns File chunk"));
             }
-            let payload = &data[pos..pos + size];
-            pos += size;
+            let payload = &data[pos..end];
+            pos = end;
 
             match tag {
                 b"info" => {
                     if payload.len() < 22 {
-                        return Err(Error::CorruptIndex("info sub-chunk too short"));
+                        return Err(Xp3Error::CorruptIndex("info sub-chunk too short"));
                     }
                     flags = u32::from_le_bytes(payload[0..4].try_into().unwrap());
                     org_size = u64::from_le_bytes(payload[4..12].try_into().unwrap());
                     arc_size = u64::from_le_bytes(payload[12..20].try_into().unwrap());
-                    let name_len = i16::from_le_bytes(payload[20..22].try_into().unwrap()) as usize;
+                    let name_len = i16::from_le_bytes(payload[20..22].try_into().unwrap());
+                    if name_len < 0 {
+                        return Err(Xp3Error::CorruptIndex("negative name length"));
+                    }
+                    let name_len = name_len as usize;
                     let name_bytes = payload
                         .get(22..22 + name_len * 2)
-                        .ok_or(Error::CorruptIndex("name overruns info sub-chunk"))?;
+                        .ok_or(Xp3Error::CorruptIndex("name overruns info sub-chunk"))?;
                     let mut units = Vec::with_capacity(name_len);
                     for c in name_bytes.chunks_exact(2) {
                         units.push(u16::from_le_bytes([c[0], c[1]]));
@@ -351,7 +418,7 @@ impl Xp3Archive {
                 }
                 b"segm" => {
                     if !payload.len().is_multiple_of(28) {
-                        return Err(Error::CorruptIndex(
+                        return Err(Xp3Error::CorruptIndex(
                             "segm sub-chunk size not multiple of 28",
                         ));
                     }
@@ -492,7 +559,7 @@ fn find_xp3_offset<R: Read + Seek>(reader: &mut R) -> Result<u64> {
             reader.seek(SeekFrom::Start(offset))?;
         }
     }
-    Err(Error::NotAnXp3)
+    Err(Xp3Error::NotAnXp3)
 }
 
 fn read_u8<R: Read>(r: &mut R) -> Result<u8> {
@@ -508,8 +575,19 @@ fn read_u64_le<R: Read>(r: &mut R) -> Result<u64> {
 }
 
 fn read_exact_vec<R: Read>(r: &mut R, len: u64) -> Result<Vec<u8>> {
-    let len = usize::try_from(len).map_err(|_| Error::CorruptIndex("index too large"))?;
-    let mut v = vec![0u8; len];
+    let len = usize::try_from(len).map_err(|_| Xp3Error::CorruptIndex("index too large"))?;
+    let mut v = alloc_zeroed(len, "index too large")?;
     r.read_exact(&mut v)?;
+    Ok(v)
+}
+
+/// Allocate a zeroed `Vec` of exactly `len` bytes without imposing a size
+/// limit: an unrepresentable or unallocatable size is reported as a corrupt
+/// index rather than panicking.
+fn alloc_zeroed(len: usize, what: &'static str) -> Result<Vec<u8>> {
+    let mut v = Vec::new();
+    v.try_reserve_exact(len)
+        .map_err(|_| Xp3Error::CorruptIndex(what))?;
+    v.resize(len, 0);
     Ok(v)
 }

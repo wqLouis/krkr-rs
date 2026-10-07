@@ -198,3 +198,16 @@ fn auto_path_resolves_base_name() {
         ))
     );
 }
+
+/// A large-but-valid archive entry still reads end-to-end: no size cap is
+/// imposed, only genuine overflow/invalid data is rejected.
+#[test]
+fn reads_a_large_but_valid_archive_entry() {
+    let payload: Vec<u8> = (0..2 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+    let xp3 = build_xp3(&[("data/large.bin", &payload, true)]);
+    let storage = mount_memory(&[("data.xp3", &xp3)]);
+
+    let read = storage.read("data/large.bin").unwrap();
+    assert_eq!(read.len(), payload.len());
+    assert_eq!(read, payload);
+}

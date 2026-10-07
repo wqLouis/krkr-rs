@@ -37,8 +37,9 @@
 #![warn(missing_docs)]
 
 pub mod audio;
+mod hint;
 pub mod image_decode;
-pub mod tlg;
+pub(crate) mod tlg;
 pub mod video;
 pub mod yuv;
 
@@ -52,14 +53,20 @@ use krkr_api::media::MediaCapabilities;
 
 /// Immutable configuration for a [`Media`] object.
 ///
-/// This is plain, copyable configuration — not evolving state. It is stored
-/// by value in [`Media`] and never mutated.
+/// The media engine currently exposes no configurable options. In
+/// particular there is no size limit to configure: a decode that cannot be
+/// performed (malformed, overflowing, or unsupported data) returns a typed
+/// [`MediaError`] rather than a substituted value. This type stays
+/// `#[non_exhaustive]` so options can be added without an API break.
+#[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct MediaConfig {
-    /// Reserved: when `true`, image probing/decoding may accept images whose
-    /// declared dimensions exceed the built-in safety cap. The current
-    /// decoders ignore this flag and always enforce the cap.
-    pub allow_large_images: bool,
+pub struct MediaConfig {}
+
+impl MediaConfig {
+    /// Creates the default (currently empty) configuration.
+    pub fn new() -> Self {
+        Self::default()
+    }
 }
 
 /// Stateless media backend object.
