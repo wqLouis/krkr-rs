@@ -35,7 +35,7 @@ The contract consistently spells constructors `create_*(config)`
 - `krkr-media`: `create_media(config)` (`crates/krkr-media/src/lib.rs:97`)
 
 but each crate also exposes a second, non-contract constructor style:
-`FileSystem::host`/`memory`/`from_config` (`lib.rs:102`, `:112`, `:123`) and
+`FileSystem::host`/`memory`/`from_config` (`lib.rs:92`, `:102`, `:111`) and
 `Media::new`/`with_config` (`krkr-media/src/lib.rs:80`, `:85`).
 
 Pick one canonical spelling per object (`create_*` per the contract) and make
@@ -68,8 +68,8 @@ Issues:
 
 - **No `#[non_exhaustive]`** on `FsError` (`error.rs:12`), `MediaError` (`:67`),
   `RenderError` (`:113`), `GlyphError` (`:166`), `AudioError` (`:201`), nor on
-  the public config enums/structs (`FsConfig` at `krkr-fs/src/lib.rs:78`,
-  `MediaConfig` at `krkr-media/src/lib.rs:55`). Adding a variant/field is
+  the public config enums/structs (`FsConfig` at `krkr-fs/src/lib.rs:63`,
+  `MediaConfig` at `krkr-media/src/lib.rs:58`). Adding a variant/field is
   therefore a breaking change for every matcher. Add `#[non_exhaustive]`
   before the API freezes.
 - **`MediaError::Decode.format` has two meanings.** In `image_decode.rs` it is
@@ -84,7 +84,7 @@ Issues:
   (`krkr-fs/src/lib.rs:503`, `:545`). `MediaError` has a proper `InvalidState`;
   `FsError` has none. Add an `InvalidState`/`InvalidArgument` variant and use
   it, so L2 can distinguish a bad call from a disk error.
-- `backend_mismatch()` returns `Unsupported` (`krkr-fs/src/lib.rs:922`).
+- `backend_mismatch()` returns `Unsupported` (`krkr-fs/src/lib.rs:920`).
   A `FileState` from a different `FileSystem` is an argument/state error, not
   a backend capability error.
 
@@ -132,7 +132,7 @@ D9 compliance is generally strong:
   `LazyLock` (`krkr-media/src/tlg.rs:834-889`) — exactly the D9 intent.
 
 The one literal exception is the in-memory backend: `FileSystem` embeds
-`Arc<Mutex<MemoryStore>>` (`krkr-fs/src/lib.rs:63-71`, `:83`, `:126`). This is
+`Arc<Mutex<MemoryStore>>` (`krkr-fs/src/lib.rs:52-55`, `:81-84`, `:104`). This is
 mutable state reachable from the object and shared across clones, so "the object
 remembers nothing" is false for that backend, and `FileSystem` is `Sync` by
 virtue of a lock. The design docs call it a "resource, not per-file state"
@@ -189,7 +189,7 @@ library code should still avoid the panic-shaped forms:
   Replace with `if let Some(bytes) = guard.files.remove(&src)` to remove the
   panic entirely.
 - `crates/krkr-media/src/tlg.rs:572` — `unreachable!()` in `color_filter` is
-  guarded by the `code >= 16` check at `:505`, so it is correct; a `debug_assert!`
+  guarded by the `code >= 16` check at `:504`, so it is correct; a `debug_assert!`
   plus a defined fallback would be more defensive, but this is acceptable.
 
 ### 2.2 `as` casts that should be `From`/`TryFrom` — Medium
@@ -267,7 +267,7 @@ Narrowing/truncating casts that are actual bugs or need checking:
   `Clone` (`audio.rs:154-166`) — correct for a resource handle.
 - Public API breadth: `krkr-media` exposes both `pub mod tlg;` and a root
   re-export, so `decode_tlg_with_info`, `has_tlg_magic`, and the whole TLG
-  module are part of the public surface (`krkr-media/src/lib.rs:42-48`).
+  module are part of the public surface (`krkr-media/src/lib.rs:39-43`, `:45-48`).
   These are implementation details of the image dispatcher, not contract API.
   Make `tlg` `pub(crate)` and re-export only `decode_image`/`probe_image` (and
   `yuv` if L2/MovieCodec needs it). Medium — minimal API is a stated goal.
@@ -317,7 +317,7 @@ No action.
     `det.abs() <= f32::EPSILON` is scale-dependent; a matrix with scale `1e-3`
     has `det = 1e-6` and is rejected as singular. Use a relative check tied to
     the matrix magnitude (or test `1/det` finiteness). Low but real.
-12. **Narrow the public `tlg` module** — `krkr-media/src/lib.rs:44`.
+12. **Narrow the public `tlg` module** — `krkr-media/src/lib.rs:41`.
 13. **Split `krkr-fs/src/lib.rs`** into backend modules.
 
 ---
@@ -398,7 +398,7 @@ float→int casts saturate) — acceptable but worth an explicit bound.
 `crates/krkr-media/src/image_decode.rs:210`, `:221` call
 `image::load_from_memory_with_format`, and `:173` builds an `ImageReader`
 without setting `Limits`. `MediaConfig::allow_large_images`
-(`krkr-media/src/lib.rs:55-63`) is documented as "reserved / ignored", and it
+(`krkr-media/src/lib.rs:58-63`) is documented as "reserved / ignored", and it
 is never read (`grep allow_large_images` finds only the declaration and the
 test). The `image` crate 0.25 does apply a default `max_alloc` of 512 MiB with
 no width/height limit (`image-0.25.10/src/io/limits.rs:49-55`), so this is not
@@ -430,8 +430,8 @@ path; consider a max-pixels check or returning `Result`.
   can be shared by the L2 worker pool.
 - The lock discipline avoids re-entrancy: every helper that needs the store
   takes `&MemoryStore` rather than re-locking (`ensure_memory_parent`,
-  `is_dir`, `parent_is` — `krkr-fs/src/lib.rs:396-408`, `:857-868`). Good.
-- `lock()` recovers from poisoning (`:924-931`), so one panicking reader does
+  `is_dir`, `parent_is` — `krkr-fs/src/lib.rs:205`, `:855`, `:876`). Good.
+- `lock()` recovers from poisoning (`:927-931`), so one panicking reader does
   not brick the store. Note the trade-off: after a poison, a partially applied
   `write_at`/`rename` may be visible, because the `Vec`/`BTreeMap` operations
   are not transactional. Acceptable, but worth a comment.
@@ -460,7 +460,7 @@ path; consider a max-pixels check or returning `Result`.
   flooring (`yuv.rs:180-182`); fine for non-negative PTS but worth a note if
   negative timestamps ever appear.
 - `VideoDecoderState` is an empty `#[non_exhaustive]` struct
-  (`video.rs:40-42`); correct as a scaffold, but `#[derive(Clone, PartialEq, Eq)]`
+  (`video.rs:33`); correct as a scaffold, but `#[derive(Clone, PartialEq, Eq)]`
   on an uninhabited API type is noise — drop the derives until it has fields.
 
 ---
@@ -472,8 +472,8 @@ path; consider a max-pixels check or returning `Result`.
    panic/abort and the 32-bit truncation write. *(Critical)*
 2. **Validate TLG5 `blockheight`** — `crates/krkr-media/src/tlg.rs:206-214`.
    Require `blockheight <= height`. *(High)*
-3. **Check TLG6 `ft_size`/SDS conversions with `usize::try_from` +
-   `checked_add`** — `crates/krkr-media/src/tlg.rs:321-327`. *(High)*
+3. **Check TLG6 `ft_size` with `usize::try_from` + `checked_add`**
+   — `crates/krkr-media/src/tlg.rs:321-327`. *(High)*
 4. **Bound image decoding consistently and wire `allow_large_images`** —
    `crates/krkr-media/src/image_decode.rs:173`, `:210`, `:221`; either
    implement the flag via `ImageReader::limits(...)` or delete it and declare
@@ -489,9 +489,9 @@ path; consider a max-pixels check or returning `Result`.
 9. **Consistency pass:** `#[non_exhaustive]` on error/config enums, unify
    `MediaError::Decode.format` semantics, add `FsError::InvalidState`, and
    provide the promised host traits or note their deferral —
-   `crates/krkr-api/src/error.rs:12-232`, `crates/krkr-fs/src/lib.rs:78`,
-   `crates/krkr-media/src/lib.rs:55`, `crates/krkr-api/src/host.rs`. *(Medium)*
+   `crates/krkr-api/src/error.rs:12-232`, `crates/krkr-fs/src/lib.rs:63`,
+   `crates/krkr-media/src/lib.rs:58`, `crates/krkr-api/src/host.rs`. *(Medium)*
 10. **Deduplicate and de-allocate the hint/extension helpers, shrink the public
     TLG surface, and split `krkr-fs/src/lib.rs`** —
     `crates/krkr-media/src/image_decode.rs:47,57`, `crates/krkr-media/src/audio.rs:150`,
-    `crates/krkr-media/src/lib.rs:44`, `crates/krkr-fs/src/lib.rs`. *(Low–Medium)*
+    `crates/krkr-media/src/lib.rs:41`, `crates/krkr-fs/src/lib.rs`. *(Low–Medium)*
