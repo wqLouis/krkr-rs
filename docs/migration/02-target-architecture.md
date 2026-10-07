@@ -30,17 +30,30 @@ Direction of dependency is strictly downward:
 ```
 L4  depends on  L3, L2, L1 (glue only)
 L3  depends on  L2
-L2  depends on  the middle-layer API (L1 traits), never on L1 impls
+L2  depends on  krkr-api + the L1 type crates (krkr-fs, krkr-render,
+                krkr-media) for their stateless objects / explicit state
+                values; never on a backend crate's guts directly
 L1  depends on  OS/Vulkan/FFmpeg only; no TJS, no TVP, no layers
 ```
+
+> Dependency note (review finding #6): the concrete-object model means L2
+> names the L1 object/state types (`FileSystem`/`FileState`,
+> `RenderPipeline`/`RenderScene`/`RenderState`, `Media`/decoder states), so
+> `krkr-engine` depends on `krkr-fs` + `krkr-render` (+ `flate2` for the
+> XP3 zlib segments). What L2 must **not** do is reach into the backend
+> implementation: no `ash`, `winit`, `cpal`, `ffmpeg-next`, `std::fs`
+> symbols in L2. Swapping a backend means swapping the L1 crate, not
+> editing L2.
 
 **Invariant A (the important one):** L1 must compile and be testable without
 TJS, without `tvp-*`, and without knowing what a "layer" is. If it does not,
 the boundary has leaked.
 
 **Invariant B:** L2 must not reference Bevy, wgpu, `ash`, winit, FFmpeg,
-MediaCodec, `std::fs` or any concrete backend. It talks only to the API
-traits. If it does, the backend is not swappable.
+MediaCodec, `cpal`, `std::fs` or any concrete backend symbol directly. It
+may depend on the L1 **type** crates (`krkr-fs`, `krkr-render`, `krkr-media`)
+for their stateless objects and explicit state values, but it never calls
+backend internals. If it does, the backend is not swappable.
 
 **Invariant C (D9):** L1 is **stateless and functional**, built as
 **stateless abstraction objects + explicit state values**. L1 creates the
@@ -176,7 +189,8 @@ crates/
 
   # L2 — middle layer ------------------------------------------------------
   krkr-engine       layer system + TVP semantics + mixer + transitions;
-                    depends on krkr-api only
+                    depends on krkr-api + the krkr-fs/krkr-render type
+                    crates (+ flate2 for XP3); no backend guts
 
   # L3 — TJS compatibility -------------------------------------------------
   tjs2-sys          (unchanged) C++ VM FFI
