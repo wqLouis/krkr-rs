@@ -31,3 +31,6 @@ __pycache__/
 # It must never be committed — it is architecture- and build-specific, and
 # regenerating it is what the Android build does.
 /android/app/src/main/jniLibs/
+
+# Stray runtime data from an unrelated tool (not part of this project)
+/config/

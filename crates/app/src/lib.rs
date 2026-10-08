@@ -22,6 +22,8 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod image_codec;
+
 use std::collections::HashMap;
 
 use api::error::RenderError;
@@ -38,6 +40,7 @@ use render::{
     create_texture, drop_texture, render, resize as resize_render, upload_texture,
 };
 
+pub use image_codec::{install_image_codec, install_image_codec_on};
 pub use render::{BackendKind, FrameStats};
 
 /// Errors surfaced by [`Host`].

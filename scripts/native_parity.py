@@ -77,13 +77,24 @@ UNTRACKED_REFERENCE_CLASSES = {"Controller", "Console"}
 # registration block (needed when one file registers several classes).
 RUST_CLASS_MAP: "OrderedDict[str, list[tuple[str, str | None]]]" = OrderedDict(
     [
-        ("Layer", [("crates/compat/src/natives/visual.rs", None)]),
-        ("Bitmap", [("crates/compat/src/natives/visual.rs", None)]),
-        ("Window", [("crates/compat/src/natives/visual.rs", None)]),
-        ("Font", [("crates/compat/src/natives/visual.rs", None)]),
-        ("Timer", [("crates/compat/src/natives/visual.rs", None)]),
+        (
+            "Layer",
+            [
+                ("crates/compat/src/natives/visual/layer/mod.rs", None),
+                ("crates/compat/src/natives/visual/layer/pixels.rs", None),
+                ("crates/compat/src/natives/visual/layer/events.rs", None),
+                ("crates/compat/src/natives/visual/layer/focus.rs", None),
+                ("crates/compat/src/natives/visual/layer/order.rs", None),
+                ("crates/compat/src/natives/visual/layer/transitions.rs", None),
+                ("crates/compat/src/natives/visual/layer/util.rs", None),
+            ],
+        ),
+        ("Bitmap", [("crates/compat/src/natives/visual/bitmap.rs", None)]),
+        ("Window", [("crates/compat/src/natives/visual/window.rs", None)]),
+        ("Font", [("crates/compat/src/natives/visual/font.rs", None)]),
+        ("Timer", [("crates/compat/src/natives/visual/timer.rs", None)]),
         ("System", [("crates/compat/src/natives/system.rs", None)]),
-        ("Debug", [("crates/compat/src/natives/debug.rs", None)]),
+        ("Debug", [("crates/compat/src/natives/debug.rs", "Debug")]),
         ("Plugins", [("crates/compat/src/plugins_native.rs", None)]),
         ("VideoOverlay", [("crates/compat/src/natives/video.rs", None)]),
         ("AsyncTrigger", [("crates/compat/src/natives/async_trigger.rs", None)]),
@@ -99,6 +110,24 @@ RUST_CLASS_MAP: "OrderedDict[str, list[tuple[str, str | None]]]" = OrderedDict(
             ],
         ),
         ("WaveSoundBuffer", [("crates/compat/src/natives/sound.rs", None)]),
+        # Classes tracked so the metric reflects the *whole* reference surface;
+        # a not-yet-created Rust file contributes 0 (port progress).
+        ("Pad", [("crates/compat/src/natives/input.rs", "Pad")]),
+        ("Rect", [("crates/compat/src/natives/rect.rs", None)]),
+        ("Clipboard", [("crates/compat/src/natives/clipboard.rs", None)]),
+        ("ImageFunction", [("crates/compat/src/natives/image_function.rs", None)]),
+        (
+            "BitmapLayerTreeOwner",
+            [("crates/compat/src/natives/tree_owner.rs", None)],
+        ),
+        (
+            "CDDASoundBuffer",
+            [("crates/compat/src/natives/cdda_midi.rs", "CDDASoundBuffer")],
+        ),
+        (
+            "MIDISoundBuffer",
+            [("crates/compat/src/natives/cdda_midi.rs", "MIDISoundBuffer")],
+        ),
     ]
 )
 
@@ -113,10 +142,6 @@ RUST_ONLY_CLASS_MAP: "OrderedDict[str, list[tuple[str, str | None]]]" = OrderedD
         (
             "SoundChannel",
             [("crates/compat/src/natives/sound.rs", "SoundChannel")],
-        ),
-        (
-            "GdiPlusAppearance",
-            [("crates/compat/src/natives/visual.rs", "GdiPlusAppearance")],
         ),
         ("ChainItemBase", [("crates/compat/src/natives/trans.rs", None)]),
         ("Trans", [("crates/compat/src/natives/trans.rs", None)]),
@@ -424,16 +449,21 @@ def _extract_members(
     end: int,
     *,
     bare: bool = False,
+    exclude: "set[int] | None" = None,
 ) -> set[str]:
     """Collect member names from string literals inside ``[start, end)``.
 
     With ``bare=False`` only literals whose preceding code reads ``name:`` or
     ``method(``/``property(``/``getter(`` are considered.  With ``bare=True``
     every literal in the range is taken as a member (used for stub arrays).
+    Literal offsets in ``exclude`` (the builder's own ``name:`` field) are
+    skipped so a class builder's name is not miscounted as a member.
     """
     members: set[str] = set()
     for start_off, (end_off, content, quote) in strings.items():
         if not (start <= start_off < end):
+            continue
+        if exclude and start_off in exclude:
             continue
         if bare:
             members.add(content)
@@ -522,9 +552,15 @@ def _builder_spans(
     code: str,
     strings: dict[int, tuple[int, str, int]],
     raw: str,
-) -> list[tuple[int, int, str]]:
-    """Return ``(start, end, class_name)`` for every native class builder."""
-    spans: list[tuple[int, int, str]] = []
+) -> list[tuple[int, int, str, "int | None"]]:
+    """Return ``(start, end, class_name, name_literal_off)`` per builder.
+
+    The builder's own ``name:`` literal offset is returned so it can be
+    excluded from member extraction: it is the class object (the constructor),
+    not a script-callable member.  ``main`` drops the class-name entry from
+    both the reference and Rust sets for the same reason.
+    """
+    spans: list[tuple[int, int, str, "int | None"]] = []
     consts = _const_strings(code, strings)
     for m in re.finditer(
         r"Native(?:Instance|Class)Builder\s*\{|NativeStaticMembers\s*\{", code
@@ -537,17 +573,46 @@ def _builder_spans(
         name_text = raw[open_pos:end]
         first = re.search(r"\b(?:class_)?name\s*:\s*", name_text)
         cls = None
+        name_lit = None
         if first:
             rest = name_text[first.end() :]
             m_str = re.match(r'"([^"]+)"', rest)
             m_id = re.match(r"([A-Za-z_]\w*)", rest)
             if m_str:
                 cls = m_str.group(1)
+                name_lit = open_pos + first.end() + m_str.start(0)
             elif m_id:
                 cls = consts.get(m_id.group(1))
         if cls:
-            spans.append((open_pos, end, cls))
+            spans.append((open_pos, end, cls, name_lit))
     return spans
+
+
+def _def_function_members(
+    code: str,
+    strings: dict[int, tuple[int, str, int]],
+    raw: str,
+) -> set[str]:
+    """Members declared by ``fn ...() -> Vec<Native*MethodDef/PropertyDef>``.
+
+    Handles both ``NativeInstanceMethodDef { name: "x", .. }`` and the
+    shorthand ``d("x", f)`` / ``m("x", ..)`` helper calls, so a class split
+    into submodules (``visual/layer/pixels.rs`` etc.) is still attributed.
+    """
+    members: set[str] = set()
+    for m in re.finditer(
+        r"fn\s+[A-Za-z_]\w*\s*\([^)]*\)\s*->\s*[^{;]*"
+        r"Native(?:Instance|Static)?(?:Method|Property)Def",
+        code,
+    ):
+        open_pos = code.find("{", m.end())
+        if open_pos == -1:
+            continue
+        end = _match_brace(code, open_pos)
+        members |= _extract_members(code, strings, open_pos, end)
+        for lit in re.finditer(r'\b[A-Za-z_]\w*\s*\(\s*"([^"]+)"', raw[open_pos:end]):
+            members.add(lit.group(1))
+    return members
 
 
 def parse_rust_file(path: Path) -> dict[str, set[str]]:
@@ -572,8 +637,14 @@ def parse_rust_file(path: Path) -> dict[str, set[str]]:
         extends.setdefault(m.group(1), set()).add(m.group(2))
 
     result: dict[str, set[str]] = {}
-    for start, end, cls in _builder_spans(code, strings, raw):
-        members = _extract_members(code, strings, start, end)
+    for start, end, cls, name_lit in _builder_spans(code, strings, raw):
+        members = _extract_members(
+            code,
+            strings,
+            start,
+            end,
+            exclude={name_lit} if name_lit is not None else set(),
+        )
         builder = code[start:end]
 
         # External method/property lists: `methods: system_properties()`,
@@ -601,6 +672,33 @@ def parse_rust_file(path: Path) -> dict[str, set[str]]:
                 members |= _resolve_variable(code, strings, ident)
 
         result.setdefault(cls, set()).update(members)
+
+    # Helper functions returning a def vector (`fn method_defs() -> Vec<..>`),
+    # collected under ``__defs__`` so a class mapped with ``builder=None``
+    # unions them (used when a class is split across files).
+    result.setdefault("__defs__", set()).update(
+        _def_function_members(code, strings, raw)
+    )
+
+    # Builder factory whose class name is a parameter, e.g.
+    # `fn instance_builder(name, ..) -> NativeInstanceBuilder { .. }` called as
+    # `instance_builder("CDDASoundBuffer", ..)`: attribute the builder's
+    # members to each literal class name at the call site.
+    for m in re.finditer(
+        r"fn\s+([A-Za-z_]\w*)\s*\([^)]*\)\s*->\s*Native(?:Instance|Class)Builder",
+        code,
+    ):
+        fname = m.group(1)
+        open_pos = code.find("{", m.end())
+        if open_pos == -1:
+            continue
+        end = _match_brace(code, open_pos)
+        bmembers = _extract_members(code, strings, open_pos, end)
+        for call in re.finditer(
+            r"\b" + re.escape(fname) + r"\s*\(\s*\"([^\"]+)\"", raw
+        ):
+            result.setdefault(call.group(1), set()).update(bmembers)
+
     return result
 
 
@@ -621,6 +719,13 @@ def parse_rust() -> tuple[dict[str, set[str]], dict[str, list[str]]]:
     for cls, specs in {**RUST_CLASS_MAP, **RUST_ONLY_CLASS_MAP}.items():
         members: set[str] = set()
         sources: list[str] = []
+        existing = [rel for rel, _ in specs if (REPO_ROOT / rel).is_file()]
+        if not existing:
+            raise SystemExit(
+                "native_parity: none of the mapped path(s) for "
+                f"{cls} exist: {[rel for rel, _ in specs]} — the file was "
+                "renamed/moved; update RUST_CLASS_MAP."
+            )
         for rel, builder in specs:
             parsed = get_file(rel)
             sources.append(rel + (f"#{builder}" if builder else ""))
@@ -831,6 +936,17 @@ def main(argv: list[str] | None = None) -> int:
 
     ref = parse_reference()
     rust, rust_sources = parse_rust()
+
+    # The constructor (reference `TJS_END_NATIVE_CONSTRUCTOR_DECL(X)`, Rust
+    # `NativeInstanceBuilder { name: "X" }` / class builder name) is the class
+    # object, not a script-callable member, and some classes register it while
+    # others do not.  Drop the class-name entry from both sides so the diff is
+    # about real members only.
+    for cls in set(RUST_CLASS_MAP) | set(RUST_ONLY_CLASS_MAP):
+        if cls in ref:
+            ref[cls].discard(cls)
+        if cls in rust:
+            rust[cls].discard(cls)
 
     missing_by_class: dict[str, set[str]] = {}
     extra_by_class: dict[str, set[str]] = {}

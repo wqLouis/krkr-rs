@@ -27,6 +27,8 @@
 //! reference `layerExImage::reset` rebases its buffer on the clip), so the
 //! callers pass the already-clipped region.
 
+use api::blend::{BlendMode, DstBlend};
+
 use crate::raster::blend_pixel;
 use crate::scene::{BitmapState, Rect, Scene};
 
@@ -2031,6 +2033,40 @@ struct PrimaryDraw {
     opa: u8,
 }
 
+/// The operation-mode number [`blend_pixel_mode`] uses for the generic
+/// [`BlendMode`] stored on a layer.
+///
+/// A `tTVPBlendOperationMode` shares the native `tTVPLayerType` numbering
+/// (`omOpaque == ltOpaque == 1`, …), so each generic mode maps to the type
+/// whose behaviour it names — preferring the original (non-`ltPs`) type where
+/// one exists. The primary-layer composite is the only caller that starts
+/// from the typed L2 blend; the `operate*` family receives an explicit native
+/// operation mode from L3.
+const fn blend_operation_mode(blend: BlendMode) -> i64 {
+    match blend {
+        BlendMode::Replace => 1,     // omOpaque / ltOpaque
+        BlendMode::SourceOver => 2,  // omAlpha / ltAlpha
+        BlendMode::Additive => 3,    // omAdditive / ltAdditive
+        BlendMode::Subtractive => 4, // omSubtractive / ltSubtractive
+        BlendMode::Multiply => 5,    // omMultiplicative / ltMultiplicative
+        BlendMode::AddAlpha => 12,   // omAddAlpha / ltAddAlpha
+        BlendMode::Screen => 11,     // omScreen / ltScreen
+        BlendMode::DestinationDependent(kind) => match kind {
+            DstBlend::ColorDodge => 8,   // omDodge / ltDodge
+            DstBlend::ColorDodge5 => 22, // omPsColorDodge5 / ltPsColorDodge5
+            DstBlend::ColorBurn => 23,   // omPsColorBurn / ltPsColorBurn
+            DstBlend::Darken => 9,       // omDarken / ltDarken
+            DstBlend::Lighten => 10,     // omLighten / ltLighten
+            DstBlend::Difference => 26,  // omPsDifference / ltPsDifference
+            DstBlend::Difference5 => 27, // omPsDifference5 / ltPsDifference5
+            DstBlend::Exclusion => 28,   // omPsExclusion / ltPsExclusion
+            DstBlend::Overlay => 18,     // omPsOverlay / ltPsOverlay
+            DstBlend::HardLight => 19,   // omPsHardLight / ltPsHardLight
+            DstBlend::SoftLight => 20,   // omPsSoftLight / ltPsSoftLight
+        },
+    }
+}
+
 /// The primary MainImage size: the window's declared logical size, falling
 /// back to the primary layer's rect (then 1x1) for a degenerate window.
 fn primary_target_size(scene: &Scene, primary_id: u32, window: u32) -> Option<(u32, u32)> {
@@ -2215,7 +2251,7 @@ pub fn composite_primary_layer(scene: &mut Scene, primary_id: u32) -> Option<u32
                 dx: dx0,
                 dy: dy0,
                 src: (sx, sy, sx + (dx1 - dx0), sy + (dy1 - dy0)),
-                mode: layer.blend_type,
+                mode: blend_operation_mode(layer.blend),
                 opa,
             });
         } else if let Some(fill) = layer.fill_color {
@@ -2224,7 +2260,7 @@ pub fn composite_primary_layer(scene: &mut Scene, primary_id: u32) -> Option<u32
                 dx: ax,
                 dy: ay,
                 src: (0, 0, layer.rect.w as i32, layer.rect.h as i32),
-                mode: layer.blend_type,
+                mode: blend_operation_mode(layer.blend),
                 opa,
             });
         }

@@ -1,7 +1,8 @@
 //! Shared helpers for the `app` integration tests.
 
+use api::blend::BlendMode;
 use app::{Host, HostConfig};
-use engine::scene::{LT_ALPHA, LT_OPAQUE, Rect, Scene};
+use engine::scene::{Rect, Scene};
 
 /// Creates a headless [`Host`] using the explicit headless configuration.
 pub fn headless_host() -> Host {
@@ -22,7 +23,7 @@ pub fn build_solid_and_bitmap_scene(scene: &mut Scene) -> u32 {
         layer.visible = true;
         layer.rect = Rect::new(0, 0, 320, 240);
         layer.fill_color = Some([24, 28, 40, 255]);
-        layer.blend_type = LT_OPAQUE;
+        layer.set_blend(BlendMode::Replace);
     }
 
     // Small bitmap sprite blended over the fill.
@@ -32,7 +33,7 @@ pub fn build_solid_and_bitmap_scene(scene: &mut Scene) -> u32 {
         layer.visible = true;
         layer.rect = Rect::new(8, 8, 2, 2);
         layer.bitmap = Some(bitmap);
-        layer.blend_type = LT_ALPHA;
+        layer.set_blend(BlendMode::SourceOver);
     }
 
     window

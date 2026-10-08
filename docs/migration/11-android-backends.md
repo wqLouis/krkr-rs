@@ -1,6 +1,7 @@
 # Android backends (AAudio + MediaCodec) — design & references
 
-Status: **design + reference doc for untestable-on-this-host backends.** We
+Status: **design + reference doc for untestable-on-this-host backends.** **Android
+is a first-class host target (D18); Windows is emulated, not a host.** We
 cannot build or run Android here, so this file pins the behaviour to the
 official Android documentation and defines exactly how the L1 backends map onto
 our existing, already-tested API surface. Both backends are **compile-time

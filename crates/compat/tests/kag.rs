@@ -1060,7 +1060,7 @@ fn native_go_to_label_error_and_macros_object() {
 
     let value = engine
         .eval(
-            "(function(){ var p = new KAGParser(); return p.getMacros(); })()",
+            "(function(){ var p = new KAGParser(); return p.macros; })()",
             "kag_test",
         )
         .expect("script");
@@ -1068,7 +1068,7 @@ fn native_go_to_label_error_and_macros_object() {
 
     let value = engine
         .eval(
-            "(function(){ var p = new KAGParser(); return p.getCurLineStr(); })()",
+            "(function(){ var p = new KAGParser(); return p.curLineStr; })()",
             "kag_test",
         )
         .expect("script");

@@ -163,3 +163,100 @@ timer_poll → sound_poll → video poll
 * The VM host is exercised with small script fixtures.
 * Native parity (the report script, removed with the legacy crates) keeps the class/method coverage
   tracked through the move.
+
+## 9. Native class structure: share the implementation, register the real surface
+
+The C++ reference gives each class a **distinct** member set (`Layer` 150,
+`Window` 83, `Bitmap` 20, `Font` 22, `Timer` 6) even though they share a large
+common implementation (the `tTVPBaseBitmap` / native-base node). Our first port
+mirrored the *code* but registered the **union** of the visual members on every
+class (~144 each) — a 5× source duplication **and** a compatibility deviation
+(scripts can call e.g. `Bitmap.changeScreenMode`, which the reference does not
+expose). That over-registration is what inflates the parity "extra" column.
+
+Target design (do **not** mirror the C++ classes one-to-one):
+
+* **One shared implementation** for the common node behavior. The L2 `Scene`
+  accessors already are that implementation; keep the L3 dispatch functions and
+  macros shared rather than copied per class.
+* **Register each class's real surface**, per `docs/native_parity.md`, not the
+  union. Where two classes genuinely share a member, share the Rust function /
+  macro — never the registration list.
+* Optionally express the common surface once as a **TJS base class** and
+  `extends` it (the ABI already supports `class X extends Y`). The reference does
+  not use TJS inheritance for these classes, so prefer per-class registration
+  unless a base class proves cleaner.
+* Consequence: the parity "extra" column becomes truthful (today ~567 of 613
+  extras are this over-registration) and the L3 source shrinks substantially.
+
+This also lets classes that perform the *same action* share one implementation
+rather than each re-wrapping the C++ shape — the guiding rule is "model the
+script-visible behavior, not the C++ class tree".
+
+### Shared behavior structs (the concrete pattern)
+
+The way to do this is a **shared behavior struct** that each native class
+*composes* instead of re-implementing:
+
+* **Audio:** one `Audio` core owns buffering, volume/pan, loop, fades, the
+  play/pause/stop state machine and the event queue. That core already exists as
+  the L2 `engine::sound::{SoundSource, SoundBuffer, SoundChannel, Mixer}` model.
+  `WaveSoundBuffer`, `CDDASoundBuffer`, `MIDISoundBuffer` are then thin L3
+  classes that differ only in how the source is obtained (file decode / CD track
+  / MIDI sequence — a host seam) and in which members they register. One
+  implementation, several thin registrations.
+* **Visual nodes:** one node core — the L2 `Scene` + `LayerState`/`BitmapState`
+  accessors — is the shared behavior; `Window`/`Layer`/`Bitmap`/`Font`/`Timer`
+  are thin classes that register only their own surface and delegate to it.
+* **General rule:** put the reusable behavior in the **lowest** layer that can
+  own it without TVP specifics (usually L2); the L3 class is a thin adapter that
+  registers the script surface and calls the shared struct. When a struct is
+  genuinely TVP-specific it still lives **once** in L3 and is composed by the
+  classes that need it (e.g. the `Timer`/`AsyncTrigger` registries, the KAG
+  parser).
+
+### L3 must stay thin (D16)
+
+L3 is a VM↔engine adapter, **not a second engine**:
+
+* Every native member should reduce to *marshal args → one L2 call → marshal the
+  result*. If a member contains real logic (loops, state machines, blending,
+  timing, scheduling), that logic belongs in L2 unless it is genuinely
+  TVP-specific.
+* Express the marshalling **declaratively**. The `layer_int_prop!`-style macros
+  (one line per member) are the model; generalizing them across the families so
+  a member is a table entry — not a hand-written 40-line trampoline — is the
+  single biggest lever on L3's size.
+* Audit signal: if an L3 file is larger than the L2 module it wraps, the
+  abstraction is leaking upward. Current suspects: `visual/layer.rs` (2.4k),
+  `system.rs` (2.2k), `video.rs` (2.2k), `sound.rs` (2.0k).
+* **Genericity test (don't over-abstract either).** When moving behavior into
+  L2 it must be expressible with **no TVP vocabulary**. If the only way to place
+  something in L2 is to name a TVP concept — an `lt*` blend type, a VK key code,
+  a `.sli` field, the `0..100000` volume scale, a KAG tag — it stays in L3. L2 is
+  a generic engine (layer/scene graph, audio, video, VFS, timers), **not** a TVP
+  compatibility layer. A TVP-shaped L2 API is just as wrong as a fat L3.
+
+### Follow-up refactors (D16)
+
+1. **Sound:** move the `.sli` format (`parse_sli`/`SliInfo`/`WaveLabel`/
+   `LoopLink`) and the `TVP_*` constants out of `engine::sound`; L2 keeps only a
+   generic loop/label model that L3 populates.
+2. **Layer:** `LayerState.blend` is the renderer's generic
+   `api::blend::BlendMode` (done); the native `lt*` numbering and the
+   int↔enum mapping live in L3 (`natives/visual/layer/blend.rs`).
+3. **Menu:** do **not** add a menu-specific L2 model. The menu is just another
+   use of the engine's existing **generic tree** (the node / parent / children
+   structure the layer system already provides); the L3 `MenuItem` tree is built
+   on those primitives, with `HMENU`/`keycodeToText` staying in L3. General rule:
+   L2 exposes a few *generic* primitives (tree/node, layer, sound, video, VFS,
+   timer); L3 composes them — we do **not** add an L2 abstraction per TVP
+   concept.
+4. **Prune** native members the reference does not expose (in progress).
+5. **Declarative marshalling:** generalize the `*_prop!`/`*_method!` macros across
+   the families so a member is a table entry, not a hand-written trampoline.
+6. **Win32 emulation shim (D18):** the Windows-native members
+   (`Window.HWND`/`drawDevice`/`registerMessageReceiver`, the `System` Win32
+   members, the message loop) must return **emulated** values/handles — a
+   synthetic `HWND`, an emulated draw device, an emulated message receiver — not
+   typed errors, so a game that probes Win32 sees a plausible Windows.

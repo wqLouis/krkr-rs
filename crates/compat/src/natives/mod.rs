@@ -10,15 +10,21 @@
 //! globals, so they are not copied. Families are added here as they land.
 
 pub mod async_trigger;
+pub mod cdda_midi;
+pub mod clipboard;
 pub mod constants;
 pub mod debug;
+pub mod image_function;
 pub mod input;
 pub mod kag;
 pub mod menu_item;
+pub mod rect;
 pub mod scripts;
+pub mod sound;
 pub mod storages;
 pub mod system;
 pub mod trans;
+pub mod tree_owner;
 pub mod video;
 pub mod visual;
 
@@ -34,9 +40,15 @@ pub fn register_all(ctx: &mut CompatCtx) -> Result<(), CompatError> {
     kag::register(ctx)?;
     visual::register(ctx)?;
     input::register(ctx)?;
+    sound::register(ctx)?;
+    cdda_midi::register(ctx)?;
     trans::register(ctx)?;
     async_trigger::register(ctx)?;
     menu_item::register(ctx)?;
     video::register(ctx)?;
+    rect::register(ctx)?;
+    image_function::register(ctx)?;
+    clipboard::register(ctx)?;
+    tree_owner::register(ctx)?;
     Ok(())
 }

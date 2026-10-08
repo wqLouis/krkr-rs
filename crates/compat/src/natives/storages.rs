@@ -16,32 +16,41 @@
 //! | `isExistentStorage(name)` | whether the name resolves to a file or directory in the mounted storage/auto paths |
 //! | `extractStorageExt/Name/Path`, `chopStorageExt` | pure string helpers over `/`, `\` and the `>` archive delimiter |
 //! | `clearArchiveCache()` | clears the L3 placed-path cache (the L2 mounts are parsed eagerly) |
-//! | `getFileList(mask[, attr])` | `Storage::get_file_list` result as a TJS `Array` |
 //! | `getLocalName(name)` | absolute disk path for a disk file; raises for archive-only names; name unchanged otherwise |
-//! | `stat(name)` / `fstat(name)` | a TJS dictionary with size and Date timestamps |
 //!
 //! Per-family state (the placed-path cache and the string/array output
 //! scratch buffers) lives in [`CompatServices::state`], so the only
 //! process-wide state remains the documented engine → context binding.
 //!
+//! # Host-facts seam (D11)
+//!
+//! `searchCD` (locate a CD by volume label) and `selectFile` (the file
+//! chooser) are genuine host operations with no L2 counterpart. They compose
+//! the closure seam installed through [`CompatHost`](crate::CompatHost)
+//! ([`set_search_cd`](crate::CompatHost::set_search_cd) and
+//! [`set_select_file`](crate::CompatHost::set_select_file)); when the matching
+//! fact is unset the member raises a typed error rather than returning a
+//! fabricated value.
+//!
 //! Deferred: `open` (the binary-stream object) and the `copyFile` /
-//! `deleteFile` / `selectFile` / `selectDirectory` / `searchCD` members of the
-//! reference. They need host/GUI facilities that do not exist in the L2 API
-//! yet; they are simply not registered, so a script calling them gets the
-//! ordinary TJS "member does not exist" error rather than a silent fallback.
+//! `deleteFile` / `selectDirectory` members of the reference. They need
+//! host/GUI facilities that do not exist in the L2 API yet; they are simply
+//! not registered, so a script calling them gets the ordinary TJS "member does
+//! not exist" error rather than a silent fallback. (The `getLocalName` skip
+//! was an earlier omission and is now implemented.)
 
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
 use std::ptr;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use engine::{Location, Storage, StorageMetadata};
+use engine::{Location, Storage};
 use tjs::{
-    Engine, NativeClassBuilder, NativeMethodDef, RetainedValue, VAL_ARRAY, VAL_INTEGER,
-    VAL_RETAINED, VAL_STRING, Value,
+    Engine, NativeClassBuilder, NativeMethodDef, Tjs2Engine, Tjs2ValueId, TjsValue, VAL_OBJECT,
+    VAL_STRING, Value,
 };
 
 use crate::binding;
+use crate::host::{host_search_cd, host_select_file};
 use crate::native_util::{args, report_error, set_bool, set_void, value_as_string};
 use crate::{CompatCtx, CompatError, CompatServices};
 
@@ -125,14 +134,6 @@ struct PlacedCache(HashMap<String, String>);
 #[derive(Default)]
 struct StringScratch(Vec<u8>);
 
-/// Scratch buffers for a `VAL_ARRAY` result; the pointers must outlive the
-/// call, so the buffers live in the per-family dispatch state.
-#[derive(Default)]
-struct ArrayScratch {
-    ptrs: Vec<*const c_char>,
-    bytes: Vec<Vec<u8>>,
-}
-
 /// Write a string result into `out` using the shared scratch buffer.
 fn set_string_out(out: *mut Value, services: &CompatServices, s: &str) {
     let mut scratch = services.state::<StringScratch>();
@@ -150,53 +151,6 @@ fn set_string_out(out: *mut Value, services: &CompatServices, s: &str) {
             (*out).array_count = 0;
             (*out).retained = 0;
         }
-    }
-}
-
-/// Write a `VAL_ARRAY` result into `out` using the shared scratch buffers.
-fn set_array_out(out: *mut Value, services: &CompatServices, values: &[String]) {
-    let mut scratch = services.state::<ArrayScratch>();
-    scratch.bytes.clear();
-    scratch.ptrs.clear();
-    for value in values {
-        let mut bytes = value.as_bytes().to_vec();
-        bytes.push(0);
-        scratch.bytes.push(bytes);
-    }
-    let mut ptrs = Vec::with_capacity(scratch.bytes.len());
-    for bytes in &scratch.bytes {
-        ptrs.push(bytes.as_ptr() as *const c_char);
-    }
-    scratch.ptrs = ptrs;
-    if !out.is_null() {
-        // SAFETY: the trampoline passes a valid out slot for the call.
-        unsafe {
-            (*out).ty = VAL_ARRAY;
-            (*out).integer = 0;
-            (*out).real = 0.0;
-            (*out).string = ptr::null();
-            (*out).array = scratch.ptrs.as_ptr();
-            (*out).array_count = scratch.ptrs.len() as c_int;
-            (*out).retained = 0;
-        }
-    }
-}
-
-/// Write a retained id into `out` (`VAL_RETAINED`); the C++ side consumes the
-/// retention while converting the native result.
-fn set_retained_out(out: *mut Value, id: usize) {
-    if out.is_null() {
-        return;
-    }
-    // SAFETY: the trampoline passes a valid out slot for the call.
-    unsafe {
-        (*out).ty = VAL_RETAINED;
-        (*out).integer = 0;
-        (*out).real = 0.0;
-        (*out).string = ptr::null();
-        (*out).array = ptr::null();
-        (*out).array_count = 0;
-        (*out).retained = id;
     }
 }
 
@@ -516,40 +470,6 @@ extern "C" fn native_clear_archive_cache(
     0
 }
 
-extern "C" fn native_get_file_list(
-    engine: *mut c_void,
-    argc: c_int,
-    argv: *const Value,
-    out: *mut Value,
-    out_error: *mut *mut c_char,
-) -> c_int {
-    let resolved = resolve_or_return!(engine, out_error, "getFileList");
-    let ctx = resolved.ctx();
-    // SAFETY: `resolve_or_return!` only succeeds for the installed, live binding.
-    let services = unsafe { ctx.services() };
-    // SAFETY: the trampoline guarantees `argc` valid `Value` entries.
-    let args = unsafe { args(argv, argc) };
-    let Some(mask) = args.first() else {
-        return report_error(out_error, "Storages.getFileList requires a mask");
-    };
-    let mask = value_as_string(mask);
-    let attr = args
-        .get(1)
-        .and_then(|value| (value.ty == VAL_INTEGER).then_some(value.integer))
-        .unwrap_or(0);
-    let Some(storage) = attached_storage(services) else {
-        return report_error(out_error, "Storages.getFileList: no storage attached");
-    };
-    // SAFETY: the host keeps the attached storage alive for the VM lifetime.
-    match unsafe { &*storage }.get_file_list(&mask, attr) {
-        Ok(names) => {
-            set_array_out(out, services, &names);
-            0
-        }
-        Err(error) => report_error(out_error, &format!("Storages.getFileList: {error}")),
-    }
-}
-
 extern "C" fn native_get_local_name(
     engine: *mut c_void,
     argc: c_int,
@@ -596,93 +516,126 @@ extern "C" fn native_get_local_name(
     }
 }
 
-/// Convert a host timestamp to the seconds representation the reference uses.
-fn unix_seconds(time: SystemTime) -> Option<i64> {
-    match time.duration_since(UNIX_EPOCH) {
-        Ok(duration) => i64::try_from(duration.as_secs()).ok(),
-        Err(error) => i64::try_from(error.duration().as_secs())
-            .ok()
-            .map(|seconds| -seconds),
+/// Read an optional string property from a retained parameter object.
+fn member_string(host: &Tjs2Engine, id: Tjs2ValueId, name: &str) -> Option<String> {
+    match host.get_member(id, name) {
+        Ok(TjsValue::String(value)) => Some(value),
+        Ok(TjsValue::Integer(value)) => Some(value.to_string()),
+        Ok(TjsValue::Real(value)) => Some(value.to_string()),
+        _ => None,
     }
 }
 
-/// Build the TJS dictionary expression the `stat`/`fstat` natives evaluate.
-fn stat_dictionary_script(metadata: &StorageMetadata) -> String {
-    let mut script = format!(
-        "(function(){{ var d = %[]; d[\"size\"] = {};",
-        metadata.size
-    );
-    for (name, value) in [
-        ("mtime", metadata.modified),
-        ("ctime", metadata.created),
-        ("atime", metadata.accessed),
-    ] {
-        if let Some(seconds) = value.and_then(unix_seconds) {
-            script.push_str(&format!(" d[\"{name}\"] = new Date({seconds});"));
-        }
+/// Read an optional boolean property from a retained parameter object.
+fn member_bool(host: &Tjs2Engine, id: Tjs2ValueId, name: &str) -> bool {
+    match host.get_member(id, name) {
+        Ok(TjsValue::Integer(value)) => value != 0,
+        Ok(TjsValue::Real(value)) => value != 0.0,
+        Ok(TjsValue::String(value)) => !value.is_empty(),
+        Ok(TjsValue::Void | TjsValue::Object | TjsValue::Retained(_)) | Err(_) => false,
     }
-    script.push_str(" return d; })()");
-    script
 }
 
-extern "C" fn native_stat(
+/// `Storages.searchCD(label)` → string
+///
+/// Delegates to the host's disc search and returns the drive letter (or `""`
+/// when no disc matches). Without the installed seam the member raises a typed
+/// error (D11).
+extern "C" fn native_search_cd(
     engine: *mut c_void,
     argc: c_int,
     argv: *const Value,
     out: *mut Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
-    let resolved = resolve_or_return!(engine, out_error, "stat");
+    if argc < 1 {
+        return report_error(out_error, "Storages.searchCD requires 1 argument");
+    }
+    let label = value_as_string(&unsafe { args(argv, argc) }[0]);
+    let resolved = resolve_or_return!(engine, out_error, "searchCD");
     let ctx = resolved.ctx();
     // SAFETY: `resolve_or_return!` only succeeds for the installed, live binding.
     let services = unsafe { ctx.services() };
-    // SAFETY: the trampoline guarantees `argc` valid `Value` entries.
-    let args = unsafe { args(argv, argc) };
-    let Some(name) = args.first() else {
-        return report_error(out_error, "Storages.stat requires 1 argument");
-    };
-    let name = value_as_string(name);
-    let Some(storage) = attached_storage(services) else {
-        return report_error(out_error, "Storages.stat: no storage attached");
-    };
-    // SAFETY: the host keeps the attached storage alive for the VM lifetime.
-    let metadata = match unsafe { &*storage }.stat(&name) {
-        Ok(Some(metadata)) => metadata,
-        Ok(None) => {
-            return report_error(
-                out_error,
-                &format!("Storages.stat: storage not found: {name}"),
-            );
-        }
-        Err(error) => return report_error(out_error, &format!("Storages.stat: {error}")),
-    };
-    let expression = stat_dictionary_script(&metadata);
-    match resolved
-        .engine()
-        .eval_retained(&expression, "Storages.stat")
-    {
-        Ok(RetainedValue::Object(object)) => {
-            set_retained_out(out, object.raw_id() as usize);
-            // The C++ trampoline consumes the retention when it converts the
-            // native result, so the guard must not release it first.
-            std::mem::forget(object);
+    match host_search_cd(services, &label) {
+        Some(Ok(drive)) => {
+            set_string_out(out, services, &drive);
             0
         }
-        Ok(RetainedValue::Value(_)) => {
-            report_error(out_error, "Storages.stat: unexpected scalar result")
-        }
-        Err(error) => report_error(out_error, &format!("Storages.stat: {error}")),
+        Some(Err(error)) => report_error(out_error, &format!("Storages.searchCD: {error}")),
+        None => report_error(
+            out_error,
+            "Storages.searchCD: the host disc-search seam is not installed",
+        ),
     }
 }
 
-extern "C" fn native_fstat(
+/// `Storages.selectFile(params)` → bool
+///
+/// Extracts the chooser fields from the parameter object and delegates to the
+/// host's file chooser. On success the selected storage name is written back
+/// to `params.name` and the member returns true; a cancel returns false.
+/// Without the installed seam the member raises a typed error (D11).
+extern "C" fn native_select_file(
     engine: *mut c_void,
     argc: c_int,
     argv: *const Value,
     out: *mut Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
-    native_stat(engine, argc, argv, out, out_error)
+    if argc < 1 {
+        return report_error(out_error, "Storages.selectFile requires 1 argument");
+    }
+    let a = unsafe { args(argv, argc) };
+    if a[0].ty != VAL_OBJECT {
+        return report_error(
+            out_error,
+            "Storages.selectFile: the parameter object is required",
+        );
+    }
+    let resolved = resolve_or_return!(engine, out_error, "selectFile");
+    let ctx = resolved.ctx();
+    // SAFETY: `resolve_or_return!` only succeeds for the installed, live binding.
+    let services = unsafe { ctx.services() };
+    let host = resolved.engine();
+    let params = match host.retain_object_arg(&a[0]) {
+        Ok(params) => params,
+        Err(error) => {
+            return report_error(out_error, &format!("Storages.selectFile: {error}"));
+        }
+    };
+    let id = params.raw_id();
+    let title = member_string(host, id, "title");
+    let initial_dir = member_string(host, id, "initialDir");
+    let name = member_string(host, id, "name");
+    let default_ext = member_string(host, id, "defaultExt");
+    let filter = member_string(host, id, "filter");
+    let save = member_bool(host, id, "save");
+    match host_select_file(
+        services,
+        title.as_deref(),
+        initial_dir.as_deref(),
+        name.as_deref(),
+        default_ext.as_deref(),
+        filter.as_deref(),
+        save,
+    ) {
+        Some(Ok(Some(selected))) => {
+            if let Err(error) = host.set_member(id, "name", &TjsValue::String(selected)) {
+                return report_error(out_error, &format!("Storages.selectFile: {error}"));
+            }
+            set_bool(out, true);
+            0
+        }
+        Some(Ok(None)) => {
+            set_bool(out, false);
+            0
+        }
+        Some(Err(error)) => report_error(out_error, &format!("Storages.selectFile: {error}")),
+        None => report_error(
+            out_error,
+            "Storages.selectFile: the host file-chooser seam is not installed",
+        ),
+    }
 }
 
 /// Register the `Storages` native class (static members only).
@@ -731,20 +684,16 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
                 f: native_clear_archive_cache,
             },
             NativeMethodDef {
-                name: "getFileList",
-                f: native_get_file_list,
-            },
-            NativeMethodDef {
                 name: "getLocalName",
                 f: native_get_local_name,
             },
             NativeMethodDef {
-                name: "stat",
-                f: native_stat,
+                name: "searchCD",
+                f: native_search_cd,
             },
             NativeMethodDef {
-                name: "fstat",
-                f: native_fstat,
+                name: "selectFile",
+                f: native_select_file,
             },
         ],
         properties: vec![],

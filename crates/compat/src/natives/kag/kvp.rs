@@ -1,8 +1,7 @@
 //! String encodings for the dictionary-shaped data the parser keeps as
-//! strings: the `store`/`restore` save container, the macro bodies, and the
-//! legacy string-form `getMacros`/`getMacroParams` setters. The native's
-//! object-shaped results (`getNextTag`, `macros`, `paramMacros`) are real
-//! TJS Dictionaries, not strings, so this codec is no longer on that path.
+//! strings: the `store`/`restore` save container and the macro bodies. The
+//! native's object-shaped results (`getNextTag`, `macros`, `macroParams`) are
+//! real TJS Dictionaries, not strings, so this codec is no longer on that path.
 //!
 //! # The line format
 //!

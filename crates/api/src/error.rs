@@ -100,6 +100,14 @@ pub enum MediaError {
         /// Human-readable description of the failure.
         message: String,
     },
+    /// Encoding failed.
+    #[error("failed to encode media ({format}): {message}")]
+    Encode {
+        /// Target format name (for example `png`, `bmp`, `jpg`).
+        format: String,
+        /// Human-readable description of the failure.
+        message: String,
+    },
     /// The format or codec is not supported by this backend.
     #[error("unsupported media format or codec: {message}")]
     Unsupported {

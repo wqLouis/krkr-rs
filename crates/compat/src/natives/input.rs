@@ -50,7 +50,10 @@
 //!
 //! `Pad`: the reference's read-only property stub (`text`, `fileName`,
 //! `color`, `visible`, `title`, the font properties, `readOnly`, …); the
-//! reference setters are accepted and ignored.
+//! reference setters are accepted and ignored. `Pad` is the reference's
+//! *text editor* placeholder (`reference/cpp/core/utils/PadIntf.cpp`); it is
+//! not a gamepad class. Gamepad input reaches scripts as `VK_PAD*` keys in
+//! the L2 [`InputState`], through `Key`/`System`.
 
 // This module exposes the full reference input surface (key-code lookup,
 // `TVP_SS_*` shift flags, pad codes, the cursor-warp / raw-button state API).
@@ -1087,12 +1090,79 @@ extern "C" fn native_key_get_repeat(
 // `Pad` natives (reference read-only property stub)
 // ---------------------------------------------------------------------------
 
-/// Per-object `Pad` payload (the reference `tTJSNI_Pad` carries no data
-/// either; the class is a fixed read-only stub).
-#[derive(Default)]
+/// Per-object `Pad` payload: the reference's fixed, read-only values.
+///
+/// The reference `tTJSNI_Pad` delegates to a native editor form; the port owns
+/// the (default) values on the instance so a future host editor backend can
+/// replace them without changing the script surface. There is no process
+/// global.
 struct PadState {
-    /// Keeps the allocation non-zero-sized.
-    _private: u8,
+    text: String,
+    file_name: String,
+    color: i64,
+    visible: bool,
+    title: String,
+    font_color: i64,
+    font_height: i64,
+    font_size: i64,
+    font_bold: bool,
+    font_italic: bool,
+    font_underline: bool,
+    font_strike_out: bool,
+    font_face: String,
+    read_only: bool,
+    word_wrap: bool,
+    opacity: i64,
+    show_status_bar: bool,
+    show_scroll_bars: bool,
+    status_text: String,
+    border_style: i64,
+    width: i64,
+    height: i64,
+    top: i64,
+    left: i64,
+}
+
+impl Default for PadState {
+    /// The reference `Pad` defaults (`PadIntf.cpp`).
+    fn default() -> Self {
+        Self {
+            text: String::new(),
+            file_name: String::new(),
+            color: 0,
+            visible: false,
+            title: String::new(),
+            font_color: 0,
+            font_height: 10,
+            font_size: 10,
+            font_bold: false,
+            font_italic: false,
+            font_underline: false,
+            font_strike_out: false,
+            font_face: String::new(),
+            read_only: true,
+            word_wrap: false,
+            opacity: 255,
+            show_status_bar: false,
+            show_scroll_bars: false,
+            status_text: String::new(),
+            border_style: 0,
+            width: 100,
+            height: 100,
+            top: 0,
+            left: 0,
+        }
+    }
+}
+
+/// Borrow the `Pad` payload for the object a callback was invoked on.
+///
+/// # Safety
+/// `instance` must be the live payload the VM passed to the callback; the
+/// dispatcher only routes `Pad` member access to a `Pad` instance.
+unsafe fn pad_state(instance: *mut c_void) -> &'static PadState {
+    // SAFETY: the caller upholds the live-payload contract.
+    unsafe { &*(instance as *const PadState) }
 }
 
 extern "C" fn pad_create(_engine: *mut c_void) -> *mut c_void {
@@ -1106,7 +1176,7 @@ extern "C" fn pad_destroy(_engine: *mut c_void, instance: *mut c_void) {
     }
 }
 
-/// `new Pad()` constructor: no state to initialize.
+/// `new Pad()` constructor: the payload already holds the reference defaults.
 extern "C" fn pad_ctor(
     _engine: *mut c_void,
     _instance: *mut c_void,
@@ -1131,102 +1201,217 @@ extern "C" fn pad_noop_set(
     0
 }
 
-/// Generate an integer/bool `Pad` property getter with a fixed value.
-macro_rules! pad_get_int {
-    ($getter:ident, $value:expr) => {
-        extern "C" fn $getter(
-            _engine: *mut c_void,
-            _instance: *mut c_void,
-            out: *mut Value,
-            _out_error: *mut *mut c_char,
-            _objthis: *mut c_void,
-        ) -> c_int {
-            set_int(out, $value);
-            0
-        }
-    };
-}
-
-/// Generate a string `Pad` property getter with a fixed value.
+/// Generate a string `Pad` getter reading its per-object field.
 macro_rules! pad_get_str {
-    ($getter:ident, $value:literal) => {
+    ($getter:ident, $field:ident, $name:literal) => {
         extern "C" fn $getter(
             engine: *mut c_void,
-            _instance: *mut c_void,
+            instance: *mut c_void,
             out: *mut Value,
             out_error: *mut *mut c_char,
             _objthis: *mut c_void,
         ) -> c_int {
             let Some(resolved) = resolve(engine) else {
-                return report_error(out_error, "Pad: compat context is not bound");
+                return report_error(
+                    out_error,
+                    concat!("Pad.", $name, ": compat context is not bound"),
+                );
             };
             let ctx = resolved.ctx();
-            set_string_out(&ctx, out, $value);
+            let state = unsafe { pad_state(instance) };
+            set_string_out(&ctx, out, &state.$field);
             0
         }
     };
 }
 
-pad_get_str!(pad_get_text, "");
-pad_get_str!(pad_get_file_name, "");
-pad_get_int!(pad_get_color, 0);
-pad_get_int!(pad_get_visible, 0);
-pad_get_str!(pad_get_title, "");
-pad_get_int!(pad_get_font_color, 0);
-pad_get_int!(pad_get_font_height, 10);
-pad_get_int!(pad_get_font_size, 10);
-pad_get_int!(pad_get_font_bold, 0);
-pad_get_int!(pad_get_font_italic, 0);
-pad_get_int!(pad_get_font_underline, 0);
-pad_get_int!(pad_get_font_strike_out, 0);
-pad_get_str!(pad_get_font_face, "");
-pad_get_int!(pad_get_read_only, 1);
-pad_get_int!(pad_get_word_wrap, 0);
-pad_get_int!(pad_get_opacity, 255);
-pad_get_int!(pad_get_show_status_bar, 0);
-pad_get_int!(pad_get_show_scroll_bars, 0);
-pad_get_str!(pad_get_status_text, "");
-pad_get_int!(pad_get_border_style, 0);
-pad_get_int!(pad_get_width, 100);
-pad_get_int!(pad_get_height, 100);
-pad_get_int!(pad_get_top, 0);
-pad_get_int!(pad_get_left, 0);
+/// Generate an integer `Pad` getter reading its per-object field.
+macro_rules! pad_get_int {
+    ($getter:ident, $field:ident) => {
+        extern "C" fn $getter(
+            _engine: *mut c_void,
+            instance: *mut c_void,
+            out: *mut Value,
+            _out_error: *mut *mut c_char,
+            _objthis: *mut c_void,
+        ) -> c_int {
+            let state = unsafe { pad_state(instance) };
+            set_int(out, state.$field);
+            0
+        }
+    };
+}
+
+/// Generate a boolean `Pad` getter reading its per-object field.
+macro_rules! pad_get_bool {
+    ($getter:ident, $field:ident) => {
+        extern "C" fn $getter(
+            _engine: *mut c_void,
+            instance: *mut c_void,
+            out: *mut Value,
+            _out_error: *mut *mut c_char,
+            _objthis: *mut c_void,
+        ) -> c_int {
+            let state = unsafe { pad_state(instance) };
+            set_bool(out, state.$field);
+            0
+        }
+    };
+}
+
+pad_get_str!(pad_get_text, text, "text");
+pad_get_str!(pad_get_file_name, file_name, "fileName");
+pad_get_int!(pad_get_color, color);
+pad_get_bool!(pad_get_visible, visible);
+pad_get_str!(pad_get_title, title, "title");
+pad_get_int!(pad_get_font_color, font_color);
+pad_get_int!(pad_get_font_height, font_height);
+pad_get_int!(pad_get_font_size, font_size);
+pad_get_bool!(pad_get_font_bold, font_bold);
+pad_get_bool!(pad_get_font_italic, font_italic);
+pad_get_bool!(pad_get_font_underline, font_underline);
+pad_get_bool!(pad_get_font_strike_out, font_strike_out);
+pad_get_str!(pad_get_font_face, font_face, "fontFace");
+pad_get_bool!(pad_get_read_only, read_only);
+pad_get_bool!(pad_get_word_wrap, word_wrap);
+pad_get_int!(pad_get_opacity, opacity);
+pad_get_bool!(pad_get_show_status_bar, show_status_bar);
+pad_get_bool!(pad_get_show_scroll_bars, show_scroll_bars);
+pad_get_str!(pad_get_status_text, status_text, "statusText");
+pad_get_int!(pad_get_border_style, border_style);
+pad_get_int!(pad_get_width, width);
+pad_get_int!(pad_get_height, height);
+pad_get_int!(pad_get_top, top);
+pad_get_int!(pad_get_left, left);
 
 /// The `Pad` instance property list.
+///
+/// Written as explicit [`NativeInstancePropertyDef`] literals (rather than a
+/// helper closure) so `scripts/native_parity.py` can see every member; the
+/// order matches the reference `PadIntf.cpp`.
 fn pad_properties() -> Vec<NativeInstancePropertyDef> {
-    let mut props = Vec::new();
-    let mut push = |name: &'static str, get| {
-        props.push(NativeInstancePropertyDef {
-            name,
-            get: Some(get),
+    vec![
+        NativeInstancePropertyDef {
+            name: "text",
+            get: Some(pad_get_text),
             set: Some(pad_noop_set),
-        });
-    };
-    push("text", pad_get_text);
-    push("fileName", pad_get_file_name);
-    push("color", pad_get_color);
-    push("visible", pad_get_visible);
-    push("title", pad_get_title);
-    push("fontColor", pad_get_font_color);
-    push("fontHeight", pad_get_font_height);
-    push("fontSize", pad_get_font_size);
-    push("fontBold", pad_get_font_bold);
-    push("fontItalic", pad_get_font_italic);
-    push("fontUnderline", pad_get_font_underline);
-    push("fontStrikeOut", pad_get_font_strike_out);
-    push("fontFace", pad_get_font_face);
-    push("readOnly", pad_get_read_only);
-    push("wordWrap", pad_get_word_wrap);
-    push("opacity", pad_get_opacity);
-    push("showStatusBar", pad_get_show_status_bar);
-    push("showScrollBars", pad_get_show_scroll_bars);
-    push("statusText", pad_get_status_text);
-    push("borderStyle", pad_get_border_style);
-    push("width", pad_get_width);
-    push("height", pad_get_height);
-    push("top", pad_get_top);
-    push("left", pad_get_left);
-    props
+        },
+        NativeInstancePropertyDef {
+            name: "fileName",
+            get: Some(pad_get_file_name),
+            set: Some(pad_noop_set),
+        },
+        NativeInstancePropertyDef {
+            name: "color",
+            get: Some(pad_get_color),
+            set: Some(pad_noop_set),
+        },
+        NativeInstancePropertyDef {
+            name: "visible",
+            get: Some(pad_get_visible),
+            set: Some(pad_noop_set),
+        },
+        NativeInstancePropertyDef {
+            name: "title",
+            get: Some(pad_get_title),
+            set: Some(pad_noop_set),
+        },
+        NativeInstancePropertyDef {
+            name: "fontColor",
+            get: Some(pad_get_font_color),
+            set: Some(pad_noop_set),
+        },
+        NativeInstancePropertyDef {
+            name: "fontHeight",
+            get: Some(pad_get_font_height),
+            set: Some(pad_noop_set),
+        },
+        NativeInstancePropertyDef {
+            name: "fontSize",
+            get: Some(pad_get_font_size),
+            set: Some(pad_noop_set),
+        },
+        NativeInstancePropertyDef {
+            name: "fontBold",
+            get: Some(pad_get_font_bold),
+            set: Some(pad_noop_set),
+        },
+        NativeInstancePropertyDef {
+            name: "fontItalic",
+            get: Some(pad_get_font_italic),
+            set: Some(pad_noop_set),
+        },
+        NativeInstancePropertyDef {
+            name: "fontUnderline",
+            get: Some(pad_get_font_underline),
+            set: Some(pad_noop_set),
+        },
+        NativeInstancePropertyDef {
+            name: "fontStrikeOut",
+            get: Some(pad_get_font_strike_out),
+            set: Some(pad_noop_set),
+        },
+        NativeInstancePropertyDef {
+            name: "fontFace",
+            get: Some(pad_get_font_face),
+            set: Some(pad_noop_set),
+        },
+        NativeInstancePropertyDef {
+            name: "readOnly",
+            get: Some(pad_get_read_only),
+            set: Some(pad_noop_set),
+        },
+        NativeInstancePropertyDef {
+            name: "wordWrap",
+            get: Some(pad_get_word_wrap),
+            set: Some(pad_noop_set),
+        },
+        NativeInstancePropertyDef {
+            name: "opacity",
+            get: Some(pad_get_opacity),
+            set: Some(pad_noop_set),
+        },
+        NativeInstancePropertyDef {
+            name: "showStatusBar",
+            get: Some(pad_get_show_status_bar),
+            set: Some(pad_noop_set),
+        },
+        NativeInstancePropertyDef {
+            name: "showScrollBars",
+            get: Some(pad_get_show_scroll_bars),
+            set: Some(pad_noop_set),
+        },
+        NativeInstancePropertyDef {
+            name: "statusText",
+            get: Some(pad_get_status_text),
+            set: Some(pad_noop_set),
+        },
+        NativeInstancePropertyDef {
+            name: "borderStyle",
+            get: Some(pad_get_border_style),
+            set: Some(pad_noop_set),
+        },
+        NativeInstancePropertyDef {
+            name: "width",
+            get: Some(pad_get_width),
+            set: Some(pad_noop_set),
+        },
+        NativeInstancePropertyDef {
+            name: "height",
+            get: Some(pad_get_height),
+            set: Some(pad_noop_set),
+        },
+        NativeInstancePropertyDef {
+            name: "top",
+            get: Some(pad_get_top),
+            set: Some(pad_noop_set),
+        },
+        NativeInstancePropertyDef {
+            name: "left",
+            get: Some(pad_get_left),
+            set: Some(pad_noop_set),
+        },
+    ]
 }
 
 // ---------------------------------------------------------------------------

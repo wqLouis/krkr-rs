@@ -1,10 +1,10 @@
 //! krkr-rs bottom media engine.
 //!
-//! Stateless [`Media`] object, pure image [`decode_image`]/[`probe_image`]
-//! functions, and explicit [`AudioDecoderState`]/[`VideoDecoderState`] values
-//! owned by the middle layer. Backends: FFmpeg (Linux) and MediaCodec
-//! (Android) for audio/video, plus the platform-free TLG5/TLG6 image decoder.
-//! See `docs/migration/05-media-engine.md` and
+//! Stateless [`Media`] object, pure image [`decode_image`]/[`probe_image`]/
+//! [`encode_image`] functions, and explicit [`AudioDecoderState`]/
+//! [`VideoDecoderState`] values owned by the middle layer. Backends: FFmpeg
+//! (Linux) and MediaCodec (Android) for audio/video, plus the platform-free
+//! TLG5/TLG6 image decoder. See `docs/migration/05-media-engine.md` and
 //! `docs/migration/03-middle-layer-api.md` §4.
 //!
 //! # D9: stateless objects, explicit state
@@ -18,7 +18,8 @@
 //! # What is implemented
 //!
 //! * **Images** — the native TLG5/TLG6 decoder (ported from
-//!   `tvp-visual/src/tlg.rs`) and `image`-crate formats, with header probing.
+//!   `tvp-visual/src/tlg.rs`) and `image`-crate formats, with header probing
+//!   and PNG/BMP/JPEG encoding.
 //! * **Audio** — symphonia whole-file/streaming decode (wav, pcm, ogg,
 //!   vorbis, flac, mp3) plus the Ogg Opus adapter, with header-only probing
 //!   and an explicit caller-owned [`AudioDecoderState`].
@@ -46,12 +47,14 @@
 pub mod audio;
 mod hint;
 pub mod image_decode;
+pub mod image_encode;
 pub(crate) mod tlg;
 pub mod video;
 pub mod yuv;
 
 pub use audio::{AudioDecoderState, decode_audio, open_audio, probe_audio, read_audio, seek_audio};
 pub use image_decode::{decode_image, probe_image};
+pub use image_encode::encode_image;
 pub use video::{VideoDecoderState, open_video, present_video, video_audio};
 pub use yuv::{CropRect, Yuv420Layout, YuvSampling, micros_to_millis, yuv420_to_rgba};
 

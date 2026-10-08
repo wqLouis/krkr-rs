@@ -71,8 +71,8 @@
 //!   keyed by `*name`, and `GoToLabel`/`CallLabel` receive `*`-prefixed
 //!   names).
 //! * The KAGParserEx *multi-line tag* extension is available opt-in through
-//!   [`ParseOptions::multiline_tags`] (the `multiLineTagEnabled` property);
-//!   [`parse`] leaves it off, matching the base parser.
+//!   [`ParseOptions::multiline_tags`]; [`parse`] leaves it off, matching the
+//!   base parser.
 //! * Duplicate labels: the reference suffixes duplicates (`name:2`, …) for
 //!   jump disambiguation; this module records the first occurrence in
 //!   [`Scenario::labels`].

@@ -18,7 +18,7 @@
 //! dictionary is created with `%[]` and populated through
 //! `Tjs2Engine::set_member`, so no scenario text is evaluated as TJS — only
 //! the `taglist` array literal is built from escaped attribute names.
-//! `macros`, `paramMacros` and `macroParams` likewise return real
+//! `macros` and `macroParams` likewise return real
 //! Dictionaries.
 //!
 //! # No process globals
@@ -307,31 +307,6 @@ fn set_tag_result(
         "taglist",
         &TjsValue::Retained(taglist.raw_id() as u64),
     )?;
-    set_retained_object(out, dict);
-    Ok(())
-}
-
-/// Build the `paramMacros` dictionary: macro name → array of alternating
-/// parameter names and values.
-fn set_param_macros_result(
-    engine: &Tjs2Engine,
-    out: *mut Value,
-    entries: &[(String, Vec<(String, String)>)],
-) -> Result<(), String> {
-    let dict = retained_object(engine, "%[]")?;
-    for (name, list) in entries {
-        let mut items: Vec<String> = Vec::with_capacity(list.len() * 2);
-        for (key, value) in list {
-            items.push(key.clone());
-            items.push(value.clone());
-        }
-        let array = retained_object(engine, &array_literal(&items))?;
-        engine.set_member(
-            dict.raw_id(),
-            name,
-            &TjsValue::Retained(array.raw_id() as u64),
-        )?;
-    }
     set_retained_object(out, dict);
     Ok(())
 }
@@ -698,87 +673,6 @@ extern "C" fn native_reset_interrupt(
 // property-style accessors (methods)
 // ---------------------------------------------------------------------------
 
-macro_rules! get_int_method {
-    ($name:ident, $method:ident) => {
-        extern "C" fn $name(
-            _engine: *mut c_void,
-            instance: *mut c_void,
-            _argc: c_int,
-            _argv: *const Value,
-            out: *mut Value,
-            _out_error: *mut *mut c_char,
-            _objthis: *mut c_void,
-        ) -> c_int {
-            set_int(out, unsafe { state_of(instance) }.$method() as i64);
-            0
-        }
-    };
-}
-
-macro_rules! get_string_method {
-    ($name:ident, $method:ident) => {
-        extern "C" fn $name(
-            engine: *mut c_void,
-            instance: *mut c_void,
-            _argc: c_int,
-            _argv: *const Value,
-            out: *mut Value,
-            out_error: *mut *mut c_char,
-            _objthis: *mut c_void,
-        ) -> c_int {
-            let s = unsafe { state_of(instance) }.$method().to_string();
-            match with_services(engine, |services| set_string_result(services, out, &s)) {
-                Ok(()) => 0,
-                Err(e) => report_error(out_error, &e),
-            }
-        }
-    };
-}
-
-macro_rules! get_bool_method {
-    ($name:ident, $method:ident) => {
-        extern "C" fn $name(
-            _engine: *mut c_void,
-            instance: *mut c_void,
-            _argc: c_int,
-            _argv: *const Value,
-            out: *mut Value,
-            _out_error: *mut *mut c_char,
-            _objthis: *mut c_void,
-        ) -> c_int {
-            set_int(out, i64::from(unsafe { state_of(instance) }.$method()));
-            0
-        }
-    };
-}
-
-macro_rules! set_bool_method {
-    ($name:ident, $method:ident, $msg:literal) => {
-        extern "C" fn $name(
-            _engine: *mut c_void,
-            instance: *mut c_void,
-            argc: c_int,
-            argv: *const Value,
-            out: *mut Value,
-            out_error: *mut *mut c_char,
-            _objthis: *mut c_void,
-        ) -> c_int {
-            if argc < 1 {
-                return report_error(out_error, $msg);
-            }
-            // SAFETY: the trampoline guarantees `argc` valid `Value` entries.
-            match param_to_bool(&unsafe { args(argv, argc) }[0]) {
-                Ok(v) => {
-                    unsafe { state_of(instance) }.$method(v);
-                    set_void(out);
-                    0
-                }
-                Err(e) => report_error(out_error, &e),
-            }
-        }
-    };
-}
-
 macro_rules! prop_get_int {
     ($name:ident, $method:ident) => {
         extern "C" fn $name(
@@ -848,197 +742,6 @@ macro_rules! prop_get_string {
     };
 }
 
-get_int_method!(native_get_cur_line, get_cur_line);
-get_int_method!(native_get_cur_pos, get_cur_pos);
-get_int_method!(native_get_call_stack_depth, get_call_stack_depth);
-get_string_method!(native_get_cur_line_str, get_cur_line_str);
-get_string_method!(native_get_cur_storage, get_storage_name);
-get_string_method!(native_get_cur_label, get_cur_label);
-get_bool_method!(native_get_ignore_cr, get_ignore_cr);
-get_bool_method!(native_get_process_special_tags, get_process_special_tags);
-get_bool_method!(
-    native_get_multi_line_tag_enabled,
-    get_multi_line_tag_enabled
-);
-
-set_bool_method!(
-    native_set_ignore_cr,
-    set_ignore_cr,
-    "KAGParser.setIgnoreCR requires 1 argument"
-);
-set_bool_method!(
-    native_set_process_special_tags,
-    set_process_special_tags,
-    "KAGParser.setProcessSpecialTags requires 1 argument"
-);
-set_bool_method!(
-    native_set_multi_line_tag_enabled,
-    set_multi_line_tag_enabled,
-    "KAGParser.setMultiLineTagEnabled requires 1 argument"
-);
-
-extern "C" fn native_get_debug_level(
-    _engine: *mut c_void,
-    instance: *mut c_void,
-    _argc: c_int,
-    _argv: *const Value,
-    out: *mut Value,
-    _out_error: *mut *mut c_char,
-    _objthis: *mut c_void,
-) -> c_int {
-    set_int(out, unsafe { state_of(instance) }.get_debug_level() as i64);
-    0
-}
-
-extern "C" fn native_set_debug_level(
-    _engine: *mut c_void,
-    instance: *mut c_void,
-    argc: c_int,
-    argv: *const Value,
-    out: *mut Value,
-    out_error: *mut *mut c_char,
-    _objthis: *mut c_void,
-) -> c_int {
-    if argc < 1 {
-        return report_error(out_error, "KAGParser.setDebugLevel requires 1 argument");
-    }
-    // SAFETY: the trampoline guarantees `argc` valid `Value` entries.
-    let level = match param_to_string(&unsafe { args(argv, argc) }[0])
-        .and_then(|s| s.parse::<i32>().map_err(|e| e.to_string()))
-    {
-        Ok(level) => level,
-        Err(e) => return report_error(out_error, &e),
-    };
-    unsafe { state_of(instance) }.set_debug_level(level);
-    set_void(out);
-    0
-}
-
-/// `getMacros()` — a real Dictionary.
-extern "C" fn native_get_macros(
-    engine: *mut c_void,
-    instance: *mut c_void,
-    _argc: c_int,
-    _argv: *const Value,
-    out: *mut Value,
-    out_error: *mut *mut c_char,
-    _objthis: *mut c_void,
-) -> c_int {
-    let host = match resolve_host(engine) {
-        Ok(host) => host,
-        Err(e) => return report_error(out_error, &e),
-    };
-    let entries = unsafe { state_of(instance) }.get_macros_entries();
-    match retain_dict(host, &entries) {
-        Ok(dict) => {
-            set_retained_object(out, dict);
-            0
-        }
-        Err(e) => report_error(out_error, &e),
-    }
-}
-
-/// `setMacros(kvpString)`.
-extern "C" fn native_set_macros(
-    _engine: *mut c_void,
-    instance: *mut c_void,
-    argc: c_int,
-    argv: *const Value,
-    out: *mut Value,
-    out_error: *mut *mut c_char,
-    _objthis: *mut c_void,
-) -> c_int {
-    if argc < 1 {
-        return report_error(out_error, "KAGParser.setMacros requires 1 argument");
-    }
-    // SAFETY: the trampoline guarantees `argc` valid `Value` entries.
-    let s = match param_to_string(&unsafe { args(argv, argc) }[0]) {
-        Ok(s) => s,
-        Err(e) => return report_error(out_error, &e),
-    };
-    match unsafe { state_of(instance) }.set_macros(&s) {
-        Ok(()) => {
-            set_void(out);
-            0
-        }
-        Err(e) => report_error(out_error, &e),
-    }
-}
-
-/// Decode the string form of a `paramMacros` dictionary: one
-/// `macroName=name1\x1fvalue1...` line per macro.
-fn decode_param_macros(s: &str) -> Vec<(String, Vec<(String, String)>)> {
-    let mut out = Vec::new();
-    for line in s.split('\n') {
-        if line.is_empty() {
-            continue;
-        }
-        let Some(eq) = line.find('=') else { continue };
-        let name = kvp::unescape_field(&line[..eq]);
-        let value = kvp::unescape_field(&line[eq + 1..]);
-        let fields: Vec<&str> = if value.is_empty() {
-            Vec::new()
-        } else {
-            value.split('\u{1f}').collect()
-        };
-        let list = fields
-            .chunks(2)
-            .map(|pair| {
-                (
-                    pair[0].to_string(),
-                    pair.get(1).copied().unwrap_or("").to_string(),
-                )
-            })
-            .collect();
-        out.push((name, list));
-    }
-    out
-}
-
-/// `getParamMacros()` — a real Dictionary of Arrays.
-extern "C" fn native_get_param_macros(
-    engine: *mut c_void,
-    instance: *mut c_void,
-    _argc: c_int,
-    _argv: *const Value,
-    out: *mut Value,
-    out_error: *mut *mut c_char,
-    _objthis: *mut c_void,
-) -> c_int {
-    let host = match resolve_host(engine) {
-        Ok(host) => host,
-        Err(e) => return report_error(out_error, &e),
-    };
-    let entries = unsafe { state_of(instance) }.get_param_macros_entries();
-    match set_param_macros_result(host, out, &entries) {
-        Ok(()) => 0,
-        Err(e) => report_error(out_error, &e),
-    }
-}
-
-/// `setParamMacros(kvpString)`.
-extern "C" fn native_set_param_macros(
-    _engine: *mut c_void,
-    instance: *mut c_void,
-    argc: c_int,
-    argv: *const Value,
-    out: *mut Value,
-    out_error: *mut *mut c_char,
-    _objthis: *mut c_void,
-) -> c_int {
-    if argc < 1 {
-        return report_error(out_error, "KAGParser.setParamMacros requires 1 argument");
-    }
-    // SAFETY: the trampoline guarantees `argc` valid `Value` entries.
-    let s = match param_to_string(&unsafe { args(argv, argc) }[0]) {
-        Ok(s) => s,
-        Err(e) => return report_error(out_error, &e),
-    };
-    unsafe { state_of(instance) }.set_param_macros(decode_param_macros(&s));
-    set_void(out);
-    0
-}
-
 /// `getMacroParams()` — the top macro-args dictionary, or void.
 extern "C" fn native_get_macro_params(
     engine: *mut c_void,
@@ -1068,48 +771,6 @@ extern "C" fn native_get_macro_params(
     }
 }
 
-/// `getMP()` — alias of `getMacroParams`.
-extern "C" fn native_get_mp(
-    engine: *mut c_void,
-    instance: *mut c_void,
-    _argc: c_int,
-    _argv: *const Value,
-    out: *mut Value,
-    out_error: *mut *mut c_char,
-    _objthis: *mut c_void,
-) -> c_int {
-    native_get_macro_params(
-        engine,
-        instance,
-        0,
-        ptr::null(),
-        out,
-        out_error,
-        ptr::null_mut(),
-    )
-}
-
-/// `setCurStorage(name)` — like `loadScenario`.
-extern "C" fn native_set_cur_storage(
-    engine: *mut c_void,
-    instance: *mut c_void,
-    argc: c_int,
-    argv: *const Value,
-    out: *mut Value,
-    out_error: *mut *mut c_char,
-    _objthis: *mut c_void,
-) -> c_int {
-    native_load_scenario(
-        engine,
-        instance,
-        argc,
-        argv,
-        out,
-        out_error,
-        ptr::null_mut(),
-    )
-}
-
 // ---------------------------------------------------------------------------
 // native properties
 // ---------------------------------------------------------------------------
@@ -1118,8 +779,6 @@ prop_get_bool!(prop_ignore_cr_get, get_ignore_cr);
 prop_set_bool!(prop_ignore_cr_set, set_ignore_cr);
 prop_get_bool!(prop_process_special_tags_get, get_process_special_tags);
 prop_set_bool!(prop_process_special_tags_set, set_process_special_tags);
-prop_get_bool!(prop_multi_line_tag_enabled_get, get_multi_line_tag_enabled);
-prop_set_bool!(prop_multi_line_tag_enabled_set, set_multi_line_tag_enabled);
 prop_get_int!(prop_debug_level_get, get_debug_level);
 prop_get_int!(prop_cur_line_get, get_cur_line);
 prop_get_int!(prop_cur_pos_get, get_cur_pos);
@@ -1175,15 +834,18 @@ extern "C" fn prop_macros_get(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    native_get_macros(
-        engine,
-        instance,
-        0,
-        ptr::null(),
-        out,
-        out_error,
-        ptr::null_mut(),
-    )
+    let host = match resolve_host(engine) {
+        Ok(host) => host,
+        Err(e) => return report_error(out_error, &e),
+    };
+    let entries = unsafe { state_of(instance) }.get_macros_entries();
+    match retain_dict(host, &entries) {
+        Ok(dict) => {
+            set_retained_object(out, dict);
+            0
+        }
+        Err(e) => report_error(out_error, &e),
+    }
 }
 
 extern "C" fn prop_macros_set(
@@ -1206,40 +868,6 @@ extern "C" fn prop_macros_set(
         Ok(()) => 0,
         Err(e) => report_error(out_error, &e),
     }
-}
-
-extern "C" fn prop_param_macros_get(
-    engine: *mut c_void,
-    instance: *mut c_void,
-    out: *mut Value,
-    out_error: *mut *mut c_char,
-    _objthis: *mut c_void,
-) -> c_int {
-    native_get_param_macros(
-        engine,
-        instance,
-        0,
-        ptr::null(),
-        out,
-        out_error,
-        ptr::null_mut(),
-    )
-}
-
-extern "C" fn prop_param_macros_set(
-    _engine: *mut c_void,
-    instance: *mut c_void,
-    value: *const Value,
-    out_error: *mut *mut c_char,
-    _objthis: *mut c_void,
-) -> c_int {
-    // SAFETY: value follows the trampoline contract.
-    let s = match param_to_string(unsafe { &*value }) {
-        Ok(s) => s,
-        Err(e) => return report_error(out_error, &e),
-    };
-    unsafe { state_of(instance) }.set_param_macros(decode_param_macros(&s));
-    0
 }
 
 extern "C" fn prop_macro_params_get(
@@ -1324,90 +952,6 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
                 name: "resetInterrupt",
                 f: native_reset_interrupt,
             },
-            NativeInstanceMethodDef {
-                name: "getCurLine",
-                f: native_get_cur_line,
-            },
-            NativeInstanceMethodDef {
-                name: "getCurPos",
-                f: native_get_cur_pos,
-            },
-            NativeInstanceMethodDef {
-                name: "getCurLineStr",
-                f: native_get_cur_line_str,
-            },
-            NativeInstanceMethodDef {
-                name: "getIgnoreCR",
-                f: native_get_ignore_cr,
-            },
-            NativeInstanceMethodDef {
-                name: "setIgnoreCR",
-                f: native_set_ignore_cr,
-            },
-            NativeInstanceMethodDef {
-                name: "getProcessSpecialTags",
-                f: native_get_process_special_tags,
-            },
-            NativeInstanceMethodDef {
-                name: "setProcessSpecialTags",
-                f: native_set_process_special_tags,
-            },
-            NativeInstanceMethodDef {
-                name: "getMultiLineTagEnabled",
-                f: native_get_multi_line_tag_enabled,
-            },
-            NativeInstanceMethodDef {
-                name: "setMultiLineTagEnabled",
-                f: native_set_multi_line_tag_enabled,
-            },
-            NativeInstanceMethodDef {
-                name: "getDebugLevel",
-                f: native_get_debug_level,
-            },
-            NativeInstanceMethodDef {
-                name: "setDebugLevel",
-                f: native_set_debug_level,
-            },
-            NativeInstanceMethodDef {
-                name: "getMacros",
-                f: native_get_macros,
-            },
-            NativeInstanceMethodDef {
-                name: "setMacros",
-                f: native_set_macros,
-            },
-            NativeInstanceMethodDef {
-                name: "getParamMacros",
-                f: native_get_param_macros,
-            },
-            NativeInstanceMethodDef {
-                name: "setParamMacros",
-                f: native_set_param_macros,
-            },
-            NativeInstanceMethodDef {
-                name: "getMacroParams",
-                f: native_get_macro_params,
-            },
-            NativeInstanceMethodDef {
-                name: "getMP",
-                f: native_get_mp,
-            },
-            NativeInstanceMethodDef {
-                name: "getCallStackDepth",
-                f: native_get_call_stack_depth,
-            },
-            NativeInstanceMethodDef {
-                name: "getCurStorage",
-                f: native_get_cur_storage,
-            },
-            NativeInstanceMethodDef {
-                name: "setCurStorage",
-                f: native_set_cur_storage,
-            },
-            NativeInstanceMethodDef {
-                name: "getCurLabel",
-                f: native_get_cur_label,
-            },
         ],
         properties: vec![
             NativeInstancePropertyDef {
@@ -1419,11 +963,6 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
                 name: "processSpecialTags",
                 get: Some(prop_process_special_tags_get),
                 set: Some(prop_process_special_tags_set),
-            },
-            NativeInstancePropertyDef {
-                name: "multiLineTagEnabled",
-                get: Some(prop_multi_line_tag_enabled_get),
-                set: Some(prop_multi_line_tag_enabled_set),
             },
             NativeInstancePropertyDef {
                 name: "debugLevel",
@@ -1464,11 +1003,6 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
                 name: "macros",
                 get: Some(prop_macros_get),
                 set: Some(prop_macros_set),
-            },
-            NativeInstancePropertyDef {
-                name: "paramMacros",
-                get: Some(prop_param_macros_get),
-                set: Some(prop_param_macros_set),
             },
             NativeInstancePropertyDef {
                 name: "macroParams",

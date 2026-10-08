@@ -111,3 +111,18 @@ fn alloc_error_string(msg: &str) -> *mut c_char {
         buf as *mut c_char
     }
 }
+
+/// Serialize unit tests that create a TJS VM.
+///
+/// The `tjs` engine keeps process-wide C++ globals and `compat` installs a
+/// single process-wide engine → context binding, so two `#[cfg(test)]`
+/// modules that create an engine concurrently race. Integration tests use the
+/// per-binary `common::vm_lock`; this is the in-crate counterpart for module
+/// unit tests. It is a no-op outside `cfg(test)`.
+#[cfg(test)]
+pub(crate) fn test_vm_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}

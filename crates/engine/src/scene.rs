@@ -14,6 +14,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use api::blend::BlendMode;
+
 /// One logical window.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -36,15 +38,6 @@ pub struct WindowState {
     /// Render order, back -> front.
     pub layers: Vec<u32>,
 }
-
-/// TVP `ltOpaque` drawable/blend type (`Layer.type`).
-pub const LT_OPAQUE: i64 = 1;
-/// TVP `ltAlpha` drawable/blend type (`Layer.type`; the scene default).
-pub const LT_ALPHA: i64 = 2;
-/// TVP `ltAdditive` drawable/blend type (`Layer.type`).
-pub const LT_ADDITIVE: i64 = 3;
-/// TVP `ltSubtractive` drawable/blend type (`Layer.type`).
-pub const LT_SUBTRACTIVE: i64 = 4;
 
 /// Clamp a `u32` pixel dimension to a non-negative `i32` (a plain `as i32`
 /// would wrap for sizes above `i32::MAX`).
@@ -72,9 +65,11 @@ pub struct LayerState {
     pub visible: bool,
     /// Layer opacity in `0.0..=1.0`.
     pub opacity: f32,
-    /// TVP drawable/blend type (`ltAlpha` by default). Kept in the scene so
-    /// the `RenderScene` projection does not lose `Layer.type` updates.
-    pub blend_type: i64,
+    /// Generic blend behaviour ([`BlendMode::SourceOver`] by default). This is
+    /// the render pipeline's complete blend vocabulary, so the `RenderScene`
+    /// projection does not lose `Layer.type` updates. L3 owns the native
+    /// `tTVPLayerType` numbering and maps it onto these modes.
+    pub blend: BlendMode,
     /// Z order among sibling layers of the same window.
     pub z_order: i32,
     /// Solid fill (RGBA, straight alpha) used when there is no bitmap.
@@ -182,6 +177,13 @@ pub struct LayerState {
     /// The record stays in the table only until the script reference drops
     /// and [`Scene::destroy_layer`] removes it.
     pub shutdown: bool,
+}
+
+impl LayerState {
+    /// Sets the layer's blend using the render pipeline's generic vocabulary.
+    pub fn set_blend(&mut self, blend: BlendMode) {
+        self.blend = blend;
+    }
 }
 
 /// One decoded bitmap (RGBA8, straight alpha).
@@ -441,7 +443,7 @@ impl Scene {
             rect: Rect::default(),
             visible: false,
             opacity: 1.0,
-            blend_type: LT_ALPHA,
+            blend: BlendMode::SourceOver,
             z_order: 0,
             fill_color: None,
             image_left: 0,

@@ -5,7 +5,8 @@
 //! `patch.tjs` (app path) → `startup.tjs` (search) → `AfterStartup.tjs`
 //! (app path) → `system/Initialize.tjs` fallback.
 
-use engine::{Location, StartupError, StartupScript, discover_startup};
+use engine::startup::StartupScript;
+use engine::{Location, StartupError, discover_startup};
 use testkit::build_xp3;
 
 mod common;

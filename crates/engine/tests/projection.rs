@@ -6,14 +6,7 @@
 
 use api::blend::{BlendMode, DstBlend};
 use api::geometry::{PixelRegion, RectF};
-use engine::{
-    LT_ADD_ALPHA, LT_ADDITIVE, LT_ALPHA, LT_BINDER, LT_DARKEN, LT_DODGE, LT_EFFECT, LT_FILTER,
-    LT_LIGHTEN, LT_MULTIPLICATIVE, LT_OPAQUE, LT_PS_ADDITIVE, LT_PS_COLOR_BURN, LT_PS_COLOR_DODGE,
-    LT_PS_COLOR_DODGE5, LT_PS_DARKEN, LT_PS_DIFFERENCE, LT_PS_DIFFERENCE5, LT_PS_EXCLUSION,
-    LT_PS_HARD_LIGHT, LT_PS_LIGHTEN, LT_PS_MULTIPLICATIVE, LT_PS_NORMAL, LT_PS_OVERLAY,
-    LT_PS_SCREEN, LT_PS_SOFT_LIGHT, LT_PS_SUBTRACTIVE, LT_SCREEN, LT_SUBTRACTIVE, Rect, Scene,
-    blend_mode_for, compose_layer, project_scene, project_window, resolve_blend,
-};
+use engine::{Rect, Scene, compose_layer, project_scene, project_window, resolve_blend};
 use render::{
     PipelineConfig, RenderContent, RenderNode, RenderNodeId, RenderScene, Texture, TextureDesc,
     create_render_pipeline, create_texture,
@@ -39,96 +32,52 @@ fn full_window_rect(w: u32, h: u32) -> Rect {
     Rect::new(0, 0, w, h)
 }
 
-/// Every documented native type maps to its own mode — never silently to
-/// source-over except for the truly unknown / out-of-range values.
+/// `resolve_blend` passes every generic mode through unchanged at full
+/// opacity, so the projection keeps the blend L3 decoded from `Layer.type`.
 #[test]
-fn blend_mode_mapping_is_total() {
-    let expected = [
-        (LT_OPAQUE, BlendMode::Replace),
-        (LT_ALPHA, BlendMode::SourceOver),
-        (LT_ADDITIVE, BlendMode::Additive),
-        (LT_SUBTRACTIVE, BlendMode::Subtractive),
-        (LT_MULTIPLICATIVE, BlendMode::Multiply),
-        (
-            LT_DODGE,
-            BlendMode::DestinationDependent(DstBlend::ColorDodge),
-        ),
-        (LT_DARKEN, BlendMode::DestinationDependent(DstBlend::Darken)),
-        (
-            LT_LIGHTEN,
-            BlendMode::DestinationDependent(DstBlend::Lighten),
-        ),
-        (LT_SCREEN, BlendMode::Screen),
-        (LT_ADD_ALPHA, BlendMode::AddAlpha),
-        (LT_PS_NORMAL, BlendMode::SourceOver),
-        (LT_PS_ADDITIVE, BlendMode::Additive),
-        (LT_PS_SUBTRACTIVE, BlendMode::Subtractive),
-        (LT_PS_MULTIPLICATIVE, BlendMode::Multiply),
-        (LT_PS_SCREEN, BlendMode::Screen),
-        (
-            LT_PS_OVERLAY,
-            BlendMode::DestinationDependent(DstBlend::Overlay),
-        ),
-        (
-            LT_PS_HARD_LIGHT,
-            BlendMode::DestinationDependent(DstBlend::HardLight),
-        ),
-        (
-            LT_PS_SOFT_LIGHT,
-            BlendMode::DestinationDependent(DstBlend::SoftLight),
-        ),
-        (
-            LT_PS_COLOR_DODGE,
-            BlendMode::DestinationDependent(DstBlend::ColorDodge),
-        ),
-        (
-            LT_PS_COLOR_DODGE5,
-            BlendMode::DestinationDependent(DstBlend::ColorDodge5),
-        ),
-        (
-            LT_PS_COLOR_BURN,
-            BlendMode::DestinationDependent(DstBlend::ColorBurn),
-        ),
-        (
-            LT_PS_LIGHTEN,
-            BlendMode::DestinationDependent(DstBlend::Lighten),
-        ),
-        (
-            LT_PS_DARKEN,
-            BlendMode::DestinationDependent(DstBlend::Darken),
-        ),
-        (
-            LT_PS_DIFFERENCE,
-            BlendMode::DestinationDependent(DstBlend::Difference),
-        ),
-        (
-            LT_PS_DIFFERENCE5,
-            BlendMode::DestinationDependent(DstBlend::Difference5),
-        ),
-        (
-            LT_PS_EXCLUSION,
-            BlendMode::DestinationDependent(DstBlend::Exclusion),
-        ),
+fn resolve_blend_passes_generic_modes_through() {
+    let modes = [
+        BlendMode::SourceOver,
+        BlendMode::Additive,
+        BlendMode::Subtractive,
+        BlendMode::AddAlpha,
+        BlendMode::Multiply,
+        BlendMode::Screen,
+        BlendMode::DestinationDependent(DstBlend::ColorDodge),
+        BlendMode::DestinationDependent(DstBlend::ColorDodge5),
+        BlendMode::DestinationDependent(DstBlend::ColorBurn),
+        BlendMode::DestinationDependent(DstBlend::Darken),
+        BlendMode::DestinationDependent(DstBlend::Lighten),
+        BlendMode::DestinationDependent(DstBlend::Difference),
+        BlendMode::DestinationDependent(DstBlend::Difference5),
+        BlendMode::DestinationDependent(DstBlend::Exclusion),
+        BlendMode::DestinationDependent(DstBlend::Overlay),
+        BlendMode::DestinationDependent(DstBlend::HardLight),
+        BlendMode::DestinationDependent(DstBlend::SoftLight),
     ];
-    for (native, mode) in expected {
-        assert_eq!(blend_mode_for(native), Some(mode), "type {native}");
+    for mode in modes {
+        assert_eq!(resolve_blend(mode, 1.0), mode, "mode {mode:?}");
     }
-    // Effect/filter are callbacks, not blends.
-    assert_eq!(blend_mode_for(LT_EFFECT), Some(BlendMode::SourceOver));
-    assert_eq!(blend_mode_for(LT_FILTER), Some(BlendMode::SourceOver));
-    // A binder is skipped entirely.
-    assert_eq!(blend_mode_for(LT_BINDER), None);
-    // Garbage values degrade safely.
-    assert_eq!(blend_mode_for(-1), Some(BlendMode::SourceOver));
-    assert_eq!(blend_mode_for(9999), Some(BlendMode::SourceOver));
+    assert_eq!(resolve_blend(BlendMode::Replace, 1.0), BlendMode::Replace);
 }
 
 #[test]
 fn opaque_degrades_below_full_opacity() {
-    assert_eq!(resolve_blend(LT_OPAQUE, 1.0), Some(BlendMode::Replace));
-    assert_eq!(resolve_blend(LT_OPAQUE, 0.5), Some(BlendMode::SourceOver));
-    assert_eq!(resolve_blend(LT_ALPHA, 0.5), Some(BlendMode::SourceOver));
-    assert_eq!(resolve_blend(LT_BINDER, 1.0), None);
+    assert_eq!(resolve_blend(BlendMode::Replace, 1.0), BlendMode::Replace);
+    assert_eq!(
+        resolve_blend(BlendMode::Replace, 0.5),
+        BlendMode::SourceOver
+    );
+    assert_eq!(
+        resolve_blend(BlendMode::SourceOver, 0.5),
+        BlendMode::SourceOver
+    );
+    // Only `Replace` is opacity-sensitive; every other mode passes through.
+    assert_eq!(resolve_blend(BlendMode::Multiply, 0.5), BlendMode::Multiply);
+    assert_eq!(
+        resolve_blend(BlendMode::DestinationDependent(DstBlend::Overlay), 0.5),
+        BlendMode::DestinationDependent(DstBlend::Overlay)
+    );
 }
 
 #[test]
@@ -390,17 +339,16 @@ fn screen_buffer_primary_layer_is_not_drawn() {
 }
 
 #[test]
-fn binder_is_skipped_but_children_render() {
+fn empty_layer_is_skipped_but_children_render() {
     let mut scene = Scene::default();
     let win = scene.add_window("t", (64, 64));
-    let binder = scene.add_layer(win, None);
+    let parent = scene.add_layer(win, None);
     {
-        let l = scene.layer_mut(binder).unwrap();
-        l.blend_type = LT_BINDER;
-        l.fill_color = Some([9, 9, 9, 255]);
+        // No bitmap and no fill colour: the layer draws nothing itself.
+        let l = scene.layer_mut(parent).unwrap();
         l.rect = full_window_rect(64, 64);
     }
-    let child = scene.add_layer(win, Some(binder));
+    let child = scene.add_layer(win, Some(parent));
     {
         let l = scene.layer_mut(child).unwrap();
         l.visible = true;
@@ -410,9 +358,9 @@ fn binder_is_skipped_but_children_render() {
 
     let projected = project_window(&scene, win, |_| None);
     let nodes = drawable_nodes(&projected);
-    assert_eq!(nodes.len(), 1, "the binder is not a node");
+    assert_eq!(nodes.len(), 1, "the empty layer is not a node");
     assert_eq!(nodes[0].dst, RectF::new(0.0, 0.0, 8.0, 8.0));
-    // The binder has no node, so the child links to the root.
+    // The parent has no node, so the child links to the root.
     assert_eq!(nodes[0].parent, Some(projected.root));
 }
 

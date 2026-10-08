@@ -5,8 +5,9 @@
 //! destination pixels. The reference behaviour is the transition handlers in
 //! `reference/cpp/core/visual/TransIntf.cpp`.
 
+use engine::BitmapState;
+use engine::layer_ops::RectI;
 use engine::trans::{PHASE_MAX, RuleMask, ScrollFrom, ScrollStay, Trans, TransError, TransKind};
-use engine::{BitmapState, RectI};
 
 fn bitmap(width: u32, height: u32, pixel: [u8; 4]) -> BitmapState {
     BitmapState::new(

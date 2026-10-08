@@ -1,6 +1,8 @@
 # TJS2 engine: C++ → Rust port audit
 
-Status: **audit + feasibility, no code changed.** Question: can we reimplement
+Status: **audit + feasibility, no code changed.** **Deferred by D17**: the Rust
+port is not a first priority; the C++ VM stays until a real game runs
+end-to-end. Question: can we reimplement
 the TJS2 scripting VM (currently the vendored C++ in `crates/tjs/cpp/tjs2`)
 in pure Rust, so the build collapses to `cargo build` and the C/C++/bison/zig
 "dev deps" disappear?

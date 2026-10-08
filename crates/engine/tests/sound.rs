@@ -4,15 +4,15 @@
 //! Headless by construction: the mixer never opens a device, so every test
 //! here drives playback with `Mixer::advance`/`advance_to` and renders into
 //! a caller-owned buffer. The reference behaviour is `main`'s
-//! `crates/tvp-sound/src/{mixer,sli,waveflags}.rs`.
+//! `crates/tvp-sound/src/{mixer,waveflags}.rs`.
 
 use std::f64::consts::PI;
 use std::sync::Arc;
 
 use api::media::{AudioSpec, DecodedAudio};
 use engine::sound::{
-    LoopCondition, LoopLink, MAX_VOLUME, Mixer, SliInfo, SoundBuffer, SoundError, SoundSource,
-    Status, TVP_WL_MAX_FLAGS, WaveFlags, WaveLabel, mix_source, parse_sli,
+    LOOP_FLAG_COUNT, LoopCondition, LoopFlags, LoopInfo, LoopLink, MAX_LOOP_FLAG_VALUE, MAX_VOLUME,
+    Mixer, SoundBuffer, SoundError, SoundLabel, SoundSource, Status, mix_source,
 };
 
 fn out_spec(sample_rate: u32, channels: u16) -> AudioSpec {
@@ -23,8 +23,13 @@ fn out_spec(sample_rate: u32, channels: u16) -> AudioSpec {
     }
 }
 
-/// A 440 Hz sine tone as a decoded source, optionally with `.sli` info.
-fn tone_with_sli(rate: u32, channels: u16, seconds: f64, sli: Option<SliInfo>) -> Arc<SoundSource> {
+/// A 440 Hz sine tone as a decoded source, optionally with loop info.
+fn tone_with_loops(
+    rate: u32,
+    channels: u16,
+    seconds: f64,
+    info: Option<LoopInfo>,
+) -> Arc<SoundSource> {
     let frames = (rate as f64 * seconds) as usize;
     let mut interleaved = Vec::with_capacity(frames * usize::from(channels));
     for f in 0..frames {
@@ -39,18 +44,18 @@ fn tone_with_sli(rate: u32, channels: u16, seconds: f64, sli: Option<SliInfo>) -
         total_frames: Some(frames as u64),
     };
     Arc::new(
-        SoundSource::with_sli(Arc::new(DecodedAudio::new(spec, interleaved)), sli)
+        SoundSource::with_loops(Arc::new(DecodedAudio::new(spec, interleaved)), info)
             .expect("valid source"),
     )
 }
 
 fn tone(rate: u32, channels: u16, seconds: f64) -> Arc<SoundSource> {
-    tone_with_sli(rate, channels, seconds, None)
+    tone_with_loops(rate, channels, seconds, None)
 }
 
-/// A looping tone whose `.sli` link jumps from `from_sec` back to `to_sec`.
+/// A looping tone whose loop link jumps from `from_sec` back to `to_sec`.
 fn tone_with_loop(rate: u32, seconds: f64, from_sec: f64, to_sec: f64) -> Arc<SoundSource> {
-    let info = SliInfo::new(
+    let info = LoopInfo::new(
         vec![LoopLink::new(
             (from_sec * f64::from(rate)) as u64,
             (to_sec * f64::from(rate)) as u64,
@@ -61,7 +66,7 @@ fn tone_with_loop(rate: u32, seconds: f64, from_sec: f64, to_sec: f64) -> Arc<So
         )],
         Vec::new(),
     );
-    tone_with_sli(rate, 1, seconds, Some(info))
+    tone_with_loops(rate, 1, seconds, Some(info))
 }
 
 #[test]
@@ -252,7 +257,7 @@ fn render_resamples_48k_to_44k_at_correct_pitch() {
 }
 
 #[test]
-fn sli_loop_point_wraps_into_the_loop_region() {
+fn loop_info_wraps_into_the_loop_region() {
     let mut mixer = Mixer::new();
     let id = mixer.spawn_channel();
     // 2.0s track, loop from sample 1.0s back to 0.5s.
@@ -283,17 +288,17 @@ fn sli_loop_point_wraps_into_the_loop_region() {
 }
 
 #[test]
-fn conditional_sli_link_uses_channel_flags() {
+fn conditional_loop_link_uses_channel_flags() {
     // A conditional link (flag 0 == 1) to 0.8s listed first, and an
     // unconditional fallback to 0.5s.
-    let info = SliInfo::new(
+    let info = LoopInfo::new(
         vec![
             LoopLink::new(44100, 35280, false, LoopCondition::Equal, 1, 0),
             LoopLink::new(44100, 22050, false, LoopCondition::None, 0, 0),
         ],
         Vec::new(),
     );
-    let track = tone_with_sli(44100, 1, 2.0, Some(info));
+    let track = tone_with_loops(44100, 1, 2.0, Some(info));
     let mut mixer = Mixer::new();
     let id = mixer.spawn_channel();
     mixer.channel(id).unwrap().play(track);
@@ -430,46 +435,17 @@ fn global_focus_mode_mutes_by_host_state() {
 }
 
 #[test]
-fn wave_flags_clamp_and_reset() {
-    let mut flags = WaveFlags::new();
-    assert_eq!(flags.count(), TVP_WL_MAX_FLAGS);
+fn loop_flags_clamp_and_reset() {
+    let mut flags = LoopFlags::new();
+    assert_eq!(flags.count(), LOOP_FLAG_COUNT);
     flags.set(0, 12_345);
-    assert_eq!(flags.get(0), 9999, "clamped to TVP_WL_MAX_FLAG_VALUE");
+    assert_eq!(flags.get(0), MAX_LOOP_FLAG_VALUE, "clamped to the max");
     flags.set(1, -5);
     assert_eq!(flags.get(1), 0, "clamped up to 0");
     flags.set(99, 1); // out of range ignored
     assert_eq!(flags.get(99), 0);
     flags.reset();
     assert_eq!(flags.get(0), 0);
-}
-
-#[test]
-fn parse_sli_v2_and_old() {
-    let text = b"#2.00\n# Sound Loop Information\nLink { From=6821039; To=1242931; Smooth=False; Condition=no; RefValue=0; CondVar=0; }\n";
-    let info = parse_sli(text).expect("parse v2");
-    assert_eq!(info.links.len(), 1);
-    let link = info.active_link().expect("active link");
-    assert_eq!(link.from, 6_821_039);
-    assert_eq!(link.to, 1_242_931);
-    assert_eq!(link.condition, LoopCondition::None);
-
-    let info = parse_sli(b"LoopStart=1000\nLoopLength=500\n").expect("parse old");
-    let link = info.active_link().unwrap();
-    assert_eq!(link.from, 1500);
-    assert_eq!(link.to, 1000);
-
-    // Labels and conditions round-trip.
-    let text = b"#2.00\nLabel { Position=42; Name='chorus'; }\nLink { From=100; To=10; Smooth=True; Condition=eq; RefValue=1; CondVar=2; }\n";
-    let info = parse_sli(text).expect("parse labels");
-    assert_eq!(info.labels.len(), 1);
-    assert_eq!(info.labels[0].position, 42);
-    assert_eq!(info.labels[0].name, "chorus");
-    assert_eq!(info.links[0].condition, LoopCondition::Equal);
-    assert!(info.active_link().is_none(), "conditional is not default");
-
-    // Empty/comment-only files are empty, not errors.
-    assert!(parse_sli(b"").unwrap().links.is_empty());
-    assert!(parse_sli(b"# comment\n").unwrap().links.is_empty());
 }
 
 #[test]
@@ -586,15 +562,15 @@ fn buffer_poll_reports_status_change() {
 }
 
 #[test]
-fn buffer_poll_fires_sli_labels_once_per_pass() {
-    let sli = SliInfo::new(
+fn buffer_poll_fires_loop_labels_once_per_pass() {
+    let loops = LoopInfo::new(
         Vec::new(),
-        vec![WaveLabel::new(22_050, "chorus".to_string())], // 0.5s at 44.1 kHz
+        vec![SoundLabel::new(22_050, "chorus".to_string())], // 0.5s at 44.1 kHz
     );
     let mut buffer = SoundBuffer::new();
     let mut mixer = Mixer::new();
     let id = mixer.spawn_channel();
-    buffer.open(tone_with_sli(44100, 1, 1.0, Some(sli)));
+    buffer.open(tone_with_loops(44100, 1, 1.0, Some(loops)));
     buffer.play_on(mixer.channel(id).unwrap()).unwrap();
     // Establish the status baseline.
     let _ = buffer.poll(mixer.channel(id).unwrap());

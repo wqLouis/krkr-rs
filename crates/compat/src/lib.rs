@@ -51,6 +51,15 @@ pub use host::CompatHost;
 // The built-in `Timer` poll: an L4 [`FrameBody`] forwards its `timer_poll`
 // step here (the visual natives' registry lives in this crate).
 pub use natives::visual::timer_poll;
+// The built-in `VideoOverlay` poll: an L4 [`FrameBody`] forwards its `video_poll`
+// step here; `video_advance` is exposed for hosts that drive it directly.
+pub use natives::video::{video_advance, video_poll};
+// The built-in `WaveSoundBuffer` poll, plus the host seam that installs the L1
+// media audio decoder (L3 never links a codec).
+pub use natives::sound::{AudioDecoder, set_audio_decoder, sound_poll};
+// The built-in `AsyncTrigger` poll: an L4 [`FrameBody`] forwards its
+// `async_trigger_poll` step here (deferred script callbacks).
+pub use natives::async_trigger::async_trigger_poll;
 pub use plugin::{NativePlugin, PluginOutcome, PluginRegistry, normalize_plugin_name, plugin_stem};
 
 /// Errors from the compatibility surface.

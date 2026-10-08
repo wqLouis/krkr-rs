@@ -1,16 +1,16 @@
 //! L2 sound model and software mixer.
 //!
 //! Behavioral reference: `main`'s
-//! `crates/tvp-sound/src/{mixer,source,wavesound,sli,waveflags}.rs`. This is
+//! `crates/tvp-sound/src/{mixer,source,wavesound,waveflags}.rs`. This is
 //! the **state** half of sound, re-expressed as explicit L2 values (D9):
 //!
 //! * [`SoundSource`] — caller-supplied decoded PCM plus its [`AudioSpec`]
-//!   and optional `.sli` loop information. It owns no decoder; L1 `media`
+//!   and optional generic loop information. It owns no decoder; L1 `media`
 //!   produces the buffer and L2 wraps it.
 //! * [`SoundChannel`] — one playback voice: play/stop/pause, loop, pan,
 //!   volume/volume2, playback rate, 3D position and linear fades.
-//! * [`SoundBuffer`] — the script-object half (`WaveSoundBuffer`): the loaded
-//!   source, its [`WaveFlags`], and `.sli` label/status event tracking.
+//! * [`SoundBuffer`] — the script-object half: the loaded source, its
+//!   [`LoopFlags`], and label/status event tracking.
 //! * [`Mixer`] — a clock-driven collection of channels plus the
 //!   [`Mixer::mix`] action that renders the caller's output buffer.
 //!
@@ -32,17 +32,11 @@ use std::sync::Arc;
 
 use api::media::{AudioSpec, DecodedAudio};
 
-/// Script volume/pan scale used by the reference `WaveSoundBuffer` natives
-/// (`0..=100000`). The mixer works in `0..=1`; L3 divides by this when
-/// crossing the script boundary.
-pub const TVP_VOLUME_SCALE: f64 = 100_000.0;
+/// Number of conditional loop-flag slots the engine tracks.
+pub const LOOP_FLAG_COUNT: usize = 16;
 
-/// Number of conditional loop flags the reference tracks
-/// (`TVP_WL_MAX_FLAGS`).
-pub const TVP_WL_MAX_FLAGS: usize = 16;
-
-/// Maximum value of a conditional loop flag (`TVP_WL_MAX_FLAG_VALUE`).
-pub const TVP_WL_MAX_FLAG_VALUE: i32 = 9999;
+/// Maximum value a conditional loop flag can hold.
+pub const MAX_LOOP_FLAG_VALUE: i32 = 9999;
 
 /// Maximum channel volume (`0..=1`).
 pub const MAX_VOLUME: f32 = 1.0;
@@ -54,12 +48,6 @@ pub const MAX_PAN: f32 = 1.0;
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum SoundError {
-    /// A `.sli` side-car could not be parsed.
-    #[error("invalid .sli data: {message}")]
-    Sli {
-        /// Human-readable description of the failure.
-        message: String,
-    },
     /// An audio specification is unusable.
     #[error("invalid audio specification: {message}")]
     InvalidSpec {
@@ -88,47 +76,31 @@ pub enum SoundError {
 }
 
 // ---------------------------------------------------------------------------
-// `.sli` loop information (ported from tvp-sound/src/sli.rs)
+// Generic loop information
 // ---------------------------------------------------------------------------
 
-/// A loop-link condition (`tTVPWaveLoopLinkCondition`).
+/// How a loop link's condition compares a flag against a reference value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum LoopCondition {
-    /// `Condition=no` — always taken.
+    /// Always taken.
     None,
-    /// `Condition=eq` — taken when flag `CondVar == RefValue`.
+    /// Taken when the flag equals the reference value.
     Equal,
-    /// `Condition=ne`.
+    /// Taken when the flag differs from the reference value.
     NotEqual,
-    /// `Condition=gt`.
+    /// Taken when the flag is greater than the reference value.
     Greater,
-    /// `Condition=ge`.
+    /// Taken when the flag is greater than or equal to the reference value.
     GreaterOrEqual,
-    /// `Condition=lt`.
+    /// Taken when the flag is less than the reference value.
     Lesser,
-    /// `Condition=le`.
+    /// Taken when the flag is less than or equal to the reference value.
     LesserOrEqual,
 }
 
-impl LoopCondition {
-    /// Parse the reference condition spelling (case-insensitive).
-    fn parse(text: &str) -> Option<Self> {
-        match text.trim().to_ascii_lowercase().as_str() {
-            "no" | "" => Some(LoopCondition::None),
-            "eq" => Some(LoopCondition::Equal),
-            "ne" => Some(LoopCondition::NotEqual),
-            "gt" => Some(LoopCondition::Greater),
-            "ge" => Some(LoopCondition::GreaterOrEqual),
-            "lt" => Some(LoopCondition::Lesser),
-            "le" => Some(LoopCondition::LesserOrEqual),
-            _ => None,
-        }
-    }
-}
-
-/// One `Link { … }` entry: playback jumps from sample `from` to sample `to`
-/// once it reaches `from` (`tTVPWaveLoopLink`).
+/// A loop link: playback jumps from sample `from` to sample `to` once it
+/// reaches `from`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct LoopLink {
@@ -136,7 +108,7 @@ pub struct LoopLink {
     pub from: u64,
     /// Sample granule the loop jumps *to* (the loop start).
     pub to: u64,
-    /// Whether the reference would crossfade the seam (`Smooth=True`).
+    /// Whether the seam should be crossfaded.
     pub smooth: bool,
     /// Flag condition guarding the link.
     pub condition: LoopCondition,
@@ -166,9 +138,8 @@ impl LoopLink {
         }
     }
 
-    /// Whether this link's condition holds for `flags` (reference
-    /// `GetNearestEvent` condition test). A non-degenerate link has
-    /// `from > to`.
+    /// Whether this link's condition holds for `flags`. A non-degenerate
+    /// link has `from > to`.
     pub fn matches(&self, flags: &[i32]) -> bool {
         let value = if self.cond_var >= 0 {
             flags.get(self.cond_var as usize).copied().unwrap_or(0)
@@ -188,50 +159,52 @@ impl LoopLink {
     }
 }
 
-/// One `Label { … }` entry (a named sample position).
+/// A named sample position.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct WaveLabel {
+pub struct SoundLabel {
     /// Sample granule the label sits at.
     pub position: u64,
     /// Label name.
     pub name: String,
 }
 
-impl WaveLabel {
+impl SoundLabel {
     /// Create a named label at a sample granule.
     pub fn new(position: u64, name: String) -> Self {
         Self { position, name }
     }
 }
 
-/// Parsed `.sli` loop/label information for one audio entry.
+/// Generic loop/label information for one audio entry, in file order.
+///
+/// This is the engine-side model only. Format-specific readers live in the
+/// compatibility layer and populate it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct SliInfo {
-    /// All `Link` entries, in file order.
+pub struct LoopInfo {
+    /// All loop links, in file order.
     pub links: Vec<LoopLink>,
-    /// All `Label` entries, in file order.
-    pub labels: Vec<WaveLabel>,
+    /// All labels, in file order.
+    pub labels: Vec<SoundLabel>,
 }
 
-impl SliInfo {
+impl LoopInfo {
     /// Create loop/label information from its entries.
-    pub fn new(links: Vec<LoopLink>, labels: Vec<WaveLabel>) -> Self {
+    pub fn new(links: Vec<LoopLink>, labels: Vec<SoundLabel>) -> Self {
         Self { links, labels }
     }
 
-    /// The first unconditional, non-degenerate loop link. `None` when the
-    /// file only has conditional links or no link at all.
+    /// The first unconditional, non-degenerate loop link. `None` when there
+    /// are only conditional links or no link at all.
     pub fn active_link(&self) -> Option<&LoopLink> {
         self.links
             .iter()
             .find(|l| l.condition == LoopCondition::None && l.from > l.to)
     }
 
-    /// The first non-degenerate link whose condition holds for `flags`
-    /// (reference `GetNearestEvent`; the game files have a single link, so
-    /// file order suffices).
+    /// The first non-degenerate link whose condition holds for `flags`. The
+    /// game files have a single link, so file order suffices.
     pub fn active_link_with_flags(&self, flags: &[i32]) -> Option<&LoopLink> {
         self.links
             .iter()
@@ -239,203 +212,32 @@ impl SliInfo {
     }
 }
 
-/// Parse `.sli` bytes. A leading UTF-8 BOM is tolerated.
-///
-/// Returns [`SoundError::Sli`] only when the text is not one of the two
-/// supported formats; an empty/whitespace/comment-only file yields an empty
-/// [`SliInfo`].
-pub fn parse_sli(bytes: &[u8]) -> Result<SliInfo, SoundError> {
-    let text = String::from_utf8_lossy(bytes);
-    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
-    let trimmed = text.trim_start();
-    if trimmed.is_empty() {
-        return Ok(SliInfo::default());
-    }
-    if trimmed.starts_with('#') && !trimmed.starts_with("#2.") {
-        return Ok(SliInfo::default());
-    }
-    if !trimmed.starts_with('#') {
-        return parse_old(trimmed);
-    }
-    parse_v2(trimmed)
-}
-
-fn sli_error(message: impl Into<String>) -> SoundError {
-    SoundError::Sli {
-        message: message.into(),
-    }
-}
-
-/// Old format: `LoopStart=<n>` / `LoopLength=<n>`.
-fn parse_old(text: &str) -> Result<SliInfo, SoundError> {
-    let find = |key: &str| -> Option<&str> {
-        text.find(key).map(|i| {
-            let rest = &text[i + key.len()..];
-            let end = rest
-                .find(|c: char| !c.is_ascii_digit())
-                .unwrap_or(rest.len());
-            &rest[..end]
-        })
-    };
-    let length: u64 = find("LoopLength=")
-        .ok_or_else(|| sli_error("sli: missing LoopLength"))?
-        .parse()
-        .map_err(|_| sli_error("sli: invalid LoopLength"))?;
-    let start: u64 = find("LoopStart=")
-        .ok_or_else(|| sli_error("sli: missing LoopStart"))?
-        .parse()
-        .map_err(|_| sli_error("sli: invalid LoopStart"))?;
-    Ok(SliInfo {
-        links: vec![LoopLink {
-            from: start.saturating_add(length),
-            to: start,
-            smooth: false,
-            condition: LoopCondition::None,
-            ref_value: 0,
-            cond_var: 0,
-        }],
-        labels: Vec::new(),
-    })
-}
-
-/// v2.00 format: `Link { … }` / `Label { … }` blocks.
-fn parse_v2(text: &str) -> Result<SliInfo, SoundError> {
-    let mut info = SliInfo::default();
-    let bytes = text.as_bytes();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        let c = bytes[i] as char;
-        if c == '#' {
-            while i < bytes.len() && bytes[i] != b'\n' {
-                i += 1;
-            }
-            continue;
-        }
-        if c.is_ascii_whitespace() {
-            i += 1;
-            continue;
-        }
-        let start = i;
-        while i < bytes.len() && (bytes[i] as char).is_ascii_alphabetic() {
-            i += 1;
-        }
-        let word = &text[start..i];
-        if word.eq_ignore_ascii_case("Link") || word.eq_ignore_ascii_case("Label") {
-            while i < bytes.len() && (bytes[i] as char).is_ascii_whitespace() {
-                i += 1;
-            }
-            if i >= bytes.len() || bytes[i] != b'{' {
-                return Err(sli_error(format!("sli: expected '{{' after {word}")));
-            }
-            let body_start = i + 1;
-            let Some(rel_end) = text[body_start..].find('}') else {
-                return Err(sli_error(format!("sli: unterminated {word} block")));
-            };
-            let body = &text[body_start..body_start + rel_end];
-            i = body_start + rel_end + 1;
-            if word.eq_ignore_ascii_case("Link") {
-                info.links.push(parse_link(body)?);
-            } else {
-                info.labels.push(parse_label(body));
-            }
-        } else {
-            return Err(sli_error(format!("sli: unexpected token '{word}'")));
-        }
-    }
-    Ok(info)
-}
-
-/// Parse one `key=value;` block body into a [`LoopLink`].
-fn parse_link(body: &str) -> Result<LoopLink, SoundError> {
-    let mut link = LoopLink {
-        from: 0,
-        to: 0,
-        smooth: false,
-        condition: LoopCondition::None,
-        ref_value: 0,
-        cond_var: 0,
-    };
-    for (key, value) in entities(body) {
-        match key.to_ascii_lowercase().as_str() {
-            "from" => link.from = value.trim().parse().unwrap_or(0),
-            "to" => link.to = value.trim().parse().unwrap_or(0),
-            "smooth" => link.smooth = value.trim().eq_ignore_ascii_case("true"),
-            "condition" => {
-                link.condition = LoopCondition::parse(&value)
-                    .ok_or_else(|| sli_error(format!("sli: unknown Condition '{value}'")))?
-            }
-            "refvalue" => link.ref_value = value.trim().parse().unwrap_or(0),
-            "condvar" => link.cond_var = value.trim().parse().unwrap_or(0),
-            _ => {}
-        }
-    }
-    Ok(link)
-}
-
-/// Parse one `key=value;` block body into a [`WaveLabel`].
-fn parse_label(body: &str) -> WaveLabel {
-    let mut label = WaveLabel {
-        position: 0,
-        name: String::new(),
-    };
-    for (key, value) in entities(body) {
-        match key.to_ascii_lowercase().as_str() {
-            "position" => label.position = value.trim().parse().unwrap_or(0),
-            "name" => {
-                let v = value.trim();
-                label.name = v.trim_matches(|c| c == '\'' || c == '"').to_string();
-            }
-            _ => {}
-        }
-    }
-    label
-}
-
-/// Split a `key=value; key=value;` body into pairs (`GetEntityToken`).
-fn entities(body: &str) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    for part in body.split(';') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        if let Some(eq) = part.find('=') {
-            let key = part[..eq].trim().to_string();
-            let value = part[eq + 1..].trim().to_string();
-            if !key.is_empty() {
-                out.push((key, value));
-            }
-        }
-    }
-    out
-}
-
 // ---------------------------------------------------------------------------
-// WaveFlags
+// LoopFlags
 // ---------------------------------------------------------------------------
 
-/// The conditional-loop flag surface behind `WaveSoundBuffer.flags`.
+/// The conditional-loop flag surface behind `SoundBuffer.flags`.
 ///
-/// A plain explicit-state value: 16 numeric slots that `.sli`
-/// `Link { Condition=… }` entries are tested against at the loop point. No
-/// global registry — the owning [`SoundBuffer`]/[`SoundChannel`] holds it.
+/// A plain explicit-state value: [`LOOP_FLAG_COUNT`] numeric slots that
+/// conditional [`LoopLink`]s are tested against at the loop point. No global
+/// registry — the owning [`SoundBuffer`]/[`SoundChannel`] holds it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct WaveFlags {
-    values: [i32; TVP_WL_MAX_FLAGS],
+pub struct LoopFlags {
+    values: [i32; LOOP_FLAG_COUNT],
 }
 
-impl WaveFlags {
+impl LoopFlags {
     /// A fresh flag set with every slot at `0`.
     pub const fn new() -> Self {
         Self {
-            values: [0; TVP_WL_MAX_FLAGS],
+            values: [0; LOOP_FLAG_COUNT],
         }
     }
 
-    /// Number of flag slots (always [`TVP_WL_MAX_FLAGS`]).
+    /// Number of flag slots (always [`LOOP_FLAG_COUNT`]).
     pub const fn count(&self) -> usize {
-        TVP_WL_MAX_FLAGS
+        LOOP_FLAG_COUNT
     }
 
     /// Read flag `index` (`0` when out of range).
@@ -443,26 +245,26 @@ impl WaveFlags {
         self.values.get(index).copied().unwrap_or(0)
     }
 
-    /// Write flag `index`, clamped to `0..=TVP_WL_MAX_FLAG_VALUE`. An
+    /// Write flag `index`, clamped to `0..=MAX_LOOP_FLAG_VALUE`. An
     /// out-of-range index is ignored.
     pub fn set(&mut self, index: usize, value: i32) {
         if let Some(slot) = self.values.get_mut(index) {
-            *slot = value.clamp(0, TVP_WL_MAX_FLAG_VALUE);
+            *slot = value.clamp(0, MAX_LOOP_FLAG_VALUE);
         }
     }
 
-    /// Clear every flag (`WaveFlags.reset`).
+    /// Clear every flag.
     pub fn reset(&mut self) {
-        self.values = [0; TVP_WL_MAX_FLAGS];
+        self.values = [0; LOOP_FLAG_COUNT];
     }
 
     /// The raw flag array, for [`LoopLink::matches`].
-    pub fn as_slice(&self) -> &[i32; TVP_WL_MAX_FLAGS] {
+    pub fn as_slice(&self) -> &[i32] {
         &self.values
     }
 }
 
-impl Default for WaveFlags {
+impl Default for LoopFlags {
     fn default() -> Self {
         Self::new()
     }
@@ -473,7 +275,7 @@ impl Default for WaveFlags {
 // ---------------------------------------------------------------------------
 
 /// A playable decoded PCM source: caller-supplied interleaved `f32` samples
-/// plus their [`AudioSpec`] and optional `.sli` loop information.
+/// plus their [`AudioSpec`] and optional generic loop information.
 ///
 /// Construction validates the buffer so the mixer can assume a consistent,
 /// mono-or-stereo source. The value is cheap to clone (the PCM lives behind
@@ -483,7 +285,7 @@ impl Default for WaveFlags {
 pub struct SoundSource {
     audio: Arc<DecodedAudio>,
     frames: u64,
-    sli: Option<SliInfo>,
+    info: Option<LoopInfo>,
 }
 
 impl SoundSource {
@@ -492,11 +294,14 @@ impl SoundSource {
     /// Fails with a typed error when the spec is unusable or the buffer
     /// length disagrees with `sample_rate`/`channels`.
     pub fn new(audio: Arc<DecodedAudio>) -> Result<Self, SoundError> {
-        Self::with_sli(audio, None)
+        Self::with_loops(audio, None)
     }
 
-    /// Like [`Self::new`], attaching parsed `.sli` loop information.
-    pub fn with_sli(audio: Arc<DecodedAudio>, sli: Option<SliInfo>) -> Result<Self, SoundError> {
+    /// Like [`Self::new`], attaching generic loop/label information.
+    pub fn with_loops(
+        audio: Arc<DecodedAudio>,
+        info: Option<LoopInfo>,
+    ) -> Result<Self, SoundError> {
         let spec = audio.spec;
         if spec.sample_rate == 0 {
             return Err(SoundError::InvalidSpec {
@@ -519,7 +324,11 @@ impl SoundSource {
                 channels: spec.channels,
             });
         }
-        Ok(Self { audio, frames, sli })
+        Ok(Self {
+            audio,
+            frames,
+            info,
+        })
     }
 
     /// The decoded buffer.
@@ -566,26 +375,26 @@ impl SoundSource {
         }
     }
 
-    /// The attached `.sli` information, when a side-car was present.
-    pub fn sli(&self) -> Option<&SliInfo> {
-        self.sli.as_ref()
+    /// The attached loop information, when one was supplied.
+    pub fn loops(&self) -> Option<&LoopInfo> {
+        self.info.as_ref()
     }
 
-    /// The first unconditional, non-degenerate `.sli` loop link.
+    /// The first unconditional, non-degenerate loop link.
     pub fn loop_link(&self) -> Option<&LoopLink> {
-        self.sli.as_ref().and_then(SliInfo::active_link)
+        self.info.as_ref().and_then(LoopInfo::active_link)
     }
 
-    /// The first `.sli` loop link whose condition holds for `flags`.
+    /// The first loop link whose condition holds for `flags`.
     pub fn loop_link_with_flags(&self, flags: &[i32]) -> Option<&LoopLink> {
-        self.sli
+        self.info
             .as_ref()
-            .and_then(|s| s.active_link_with_flags(flags))
+            .and_then(|info| info.active_link_with_flags(flags))
     }
 
-    /// The `.sli` labels, in file order (empty when no sidebar).
-    pub fn labels(&self) -> &[WaveLabel] {
-        self.sli.as_ref().map_or(&[], |s| &s.labels)
+    /// The labels, in file order (empty when none were supplied).
+    pub fn labels(&self) -> &[SoundLabel] {
+        self.info.as_ref().map_or(&[], |info| &info.labels)
     }
 
     /// Read one sample frame as `(left, right)` (mono duplicated).
@@ -679,7 +488,7 @@ impl Fade {
 // Status and events
 // ---------------------------------------------------------------------------
 
-/// Script-visible playback status (`tTVPSoundStatus`).
+/// Script-visible playback status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum Status {
@@ -711,7 +520,7 @@ pub enum SoundEvent {
     StatusChanged(Status),
     /// An active fade completed (`onFadeCompleted`).
     FadeCompleted,
-    /// The playhead crossed a `.sli` label (`onLabel`).
+    /// The playhead crossed a label (`onLabel`).
     Label(String),
 }
 
@@ -736,7 +545,7 @@ pub struct SoundChannel {
     rate: f64,
     pan: f32,
     pos: [f32; 3],
-    flags: WaveFlags,
+    flags: LoopFlags,
     looping: bool,
     position_seconds: f64,
     done: bool,
@@ -756,7 +565,7 @@ impl SoundChannel {
             rate: 1.0,
             pan: 0.0,
             pos: [0.0; 3],
-            flags: WaveFlags::new(),
+            flags: LoopFlags::new(),
             looping: false,
             position_seconds: 0.0,
             done: false,
@@ -895,13 +704,13 @@ impl SoundChannel {
         self.pos = [x, y, z];
     }
 
-    /// The conditional loop flags consulted for `.sli` link selection.
-    pub fn flags(&self) -> &WaveFlags {
+    /// The conditional loop flags consulted for loop-link selection.
+    pub fn flags(&self) -> &LoopFlags {
         &self.flags
     }
 
     /// Mutable access to the conditional loop flags.
-    pub fn flags_mut(&mut self) -> &mut WaveFlags {
+    pub fn flags_mut(&mut self) -> &mut LoopFlags {
         &mut self.flags
     }
 
@@ -931,7 +740,7 @@ impl SoundChannel {
         self.effective_volume() * self.volume2 * self.spatial_attenuation()
     }
 
-    /// DirectSound3D default-distance attenuation for [`Self::pos`].
+    /// Default-distance 3D attenuation for [`Self::pos`].
     ///
     /// The default listener sits at the origin with minimum distance 1,
     /// maximum distance `1e9` and rolloff 1, so the gain is
@@ -994,7 +803,7 @@ impl SoundChannel {
             return became_done;
         }
         let rate = self.rate.max(0.0);
-        // The `.sli` loop link loops `To..From` instead of the whole file.
+        // The loop link loops `To..From` instead of the whole file.
         let loop_bounds = if self.looping {
             self.source.as_ref().and_then(|s| {
                 let sr = f64::from(s.sample_rate().max(1));
@@ -1042,10 +851,10 @@ impl SoundChannel {
 }
 
 // ---------------------------------------------------------------------------
-// Sound object (WaveSoundBuffer)
+// Sound object
 // ---------------------------------------------------------------------------
 
-/// The script-object half of a `WaveSoundBuffer`: the loaded source, its
+/// The script-object half of a sound buffer: the loaded source, its
 /// conditional loop flags, and the label/status bookkeeping the per-frame
 /// poll needs.
 ///
@@ -1056,8 +865,8 @@ impl SoundChannel {
 #[non_exhaustive]
 pub struct SoundBuffer {
     source: Option<Arc<SoundSource>>,
-    flags: WaveFlags,
-    labels: Vec<WaveLabel>,
+    flags: LoopFlags,
+    labels: Vec<SoundLabel>,
     next_label: usize,
     last_sample: f64,
     status: Status,
@@ -1098,17 +907,17 @@ impl SoundBuffer {
     }
 
     /// The conditional loop flags.
-    pub fn flags(&self) -> &WaveFlags {
+    pub fn flags(&self) -> &LoopFlags {
         &self.flags
     }
 
     /// Mutable access to the conditional loop flags.
-    pub fn flags_mut(&mut self) -> &mut WaveFlags {
+    pub fn flags_mut(&mut self) -> &mut LoopFlags {
         &mut self.flags
     }
 
-    /// The loaded `.sli` labels.
-    pub fn labels(&self) -> &[WaveLabel] {
+    /// The loaded labels.
+    pub fn labels(&self) -> &[SoundLabel] {
         &self.labels
     }
 
@@ -1137,7 +946,7 @@ impl SoundBuffer {
     }
 
     /// Observe `channel` and return the events since the previous poll:
-    /// status changes, a completed fade, and `.sli` labels the playhead
+    /// status changes, a completed fade, and labels the playhead
     /// crossed. Clears the channel's `fade_finished` flag.
     ///
     /// The caller (L3) dispatches these to the script object; the model stops

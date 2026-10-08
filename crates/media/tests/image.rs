@@ -4,7 +4,7 @@ mod common;
 
 use api::error::MediaError;
 use common::{encode_png, pattern, test_image};
-use media::{Media, decode_image, probe_image};
+use media::{Media, decode_image, encode_image, probe_image};
 
 /// Encodes an RGBA8 buffer as JPEG in memory.
 fn encode_jpeg(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
@@ -67,6 +67,43 @@ fn reference_extension_spellings_decode() {
             "hint {hint:?}"
         );
     }
+}
+
+#[test]
+fn encode_image_round_trips_supported_formats() {
+    let media = Media::new();
+    let (width, height) = (8u32, 6u32);
+    let rgba = pattern(width, height);
+
+    // PNG and BMP keep the alpha channel exactly, so the round trip is
+    // byte-for-byte. The reference BMP spellings are accepted too.
+    for hint in ["png", ".bmp", "dib"] {
+        let encoded = encode_image(&media, width, height, &rgba, hint).expect("encode");
+        let decoded = decode_image(&media, &encoded, Some(hint)).expect("decode");
+        assert_eq!((decoded.width, decoded.height), (width, height), "{hint}");
+        assert_eq!(decoded.rgba, rgba, "hint {hint:?} must be lossless");
+    }
+
+    // JPEG drops alpha and is lossy, so only the geometry is asserted. Both
+    // the `jpg` and `jpeg` hints must produce a decodable stream.
+    for hint in ["jpg", "jpeg"] {
+        let encoded = encode_image(&media, width, height, &rgba, hint).expect("encode jpeg");
+        let decoded = decode_image(&media, &encoded, Some(hint)).expect("decode jpeg");
+        assert_eq!((decoded.width, decoded.height), (width, height), "{hint}");
+    }
+}
+
+#[test]
+fn encode_image_rejects_unknown_targets_and_bad_buffers() {
+    let media = Media::new();
+    assert!(matches!(
+        encode_image(&media, 2, 2, &[0; 16], "tlg6"),
+        Err(MediaError::Unsupported { .. })
+    ));
+    assert!(matches!(
+        encode_image(&media, 2, 2, &[0; 15], "png"),
+        Err(MediaError::InvalidData { .. })
+    ));
 }
 
 #[test]

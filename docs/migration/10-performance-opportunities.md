@@ -1,6 +1,7 @@
 # Performance opportunities (new layered architecture)
 
-Status: **forward-looking backlog.** This complements the historical audits
+Status: **forward-looking backlog.** **Deferred by D22** until a real game runs
+end-to-end — correctness first, then invest. This complements the historical audits
 [`../optimization.md`](../optimization.md) and [`../performance.md`](../performance.md),
 which measured the *old* Bevy/tvp-* tree and are kept only as a record. Numbers
 here are not measured yet; they are the places we know we can win, ordered by

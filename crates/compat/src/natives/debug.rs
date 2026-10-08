@@ -10,13 +10,18 @@
 //! Methods: `message`, `notice`, `startLogToFile`, `logAsError`,
 //! `addLoggingHandler`, `removeLoggingHandler`, `getLastLog`.
 //!
-//! Properties: `logLocation`, `logToFileOnError`, `clearLogFileOnError`.
+//! Properties: `logLocation`, `logToFileOnError`, `clearLogFileOnError`,
+//! `controller`, `console`.
 //!
-//! # Deliberately deferred
+//! # `controller` / `console`
 //!
-//! `controller` and `console` return the reference's `Controller`/`Console`
-//! singleton class objects, which have not been ported to `compat` yet; they
-//! are not registered rather than returning a wrong object (D11).
+//! The reference returns the `Controller`/`Console` singleton class objects,
+//! whose only member is the `visible` flag (a no-op in the reference UI too).
+//! The port registers both as instance classes backed by the existing
+//! [`DebugState`] visibility fields and returns a lazily created, cached
+//! singleton from each property — no second state store, no process global.
+//! A script that writes `Debug.console.visible` therefore sees the same value
+//! through every reference to the object.
 //!
 //! # Log flow
 //!
@@ -34,8 +39,9 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 
 use tjs::{
-    DetachedValue, NativeClassBuilder, NativeMethodDef, NativePropertyDef, TjsValue, VAL_OBJECT,
-    Value,
+    DetachedValue, NativeClassBuilder, NativeInstanceBuilder, NativeInstanceMethodDef,
+    NativeInstancePropertyDef, NativeMethodDef, NativePropertyDef, RetainedValue, Tjs2Engine,
+    TjsValue, VAL_OBJECT, VAL_RETAINED, Value,
 };
 
 use super::system::{resolve, set_string_out, value_as_bool, value_as_i64};
@@ -70,6 +76,14 @@ struct DebugState {
     clear_log_file_on_error: bool,
     /// Retained `addLoggingHandler` callbacks.
     handlers: Vec<LoggingHandler>,
+    /// Lazily created `Debug.console` singleton.
+    console: Option<DetachedValue>,
+    /// Lazily created `Debug.controller` singleton.
+    controller: Option<DetachedValue>,
+    /// `Console.visible` (a no-op in the reference UI).
+    console_visible: bool,
+    /// `Controller.visible` (a no-op in the reference UI).
+    controller_visible: bool,
 }
 
 /// Join the callback arguments with `", "`, mirroring the reference's
@@ -369,6 +383,252 @@ extern "C" fn native_remove_logging_handler(
 }
 
 // ---------------------------------------------------------------------------
+// Debug.controller / Debug.console
+// ---------------------------------------------------------------------------
+
+/// Which `Debug` singleton property is being read.
+#[derive(Clone, Copy)]
+enum DebugWindow {
+    Console,
+    Controller,
+}
+
+impl DebugWindow {
+    /// The TJS property name (`console` / `controller`).
+    fn member(self) -> &'static str {
+        match self {
+            DebugWindow::Console => "console",
+            DebugWindow::Controller => "controller",
+        }
+    }
+
+    /// The registered native class name.
+    fn class(self) -> &'static str {
+        match self {
+            DebugWindow::Console => "Console",
+            DebugWindow::Controller => "Controller",
+        }
+    }
+}
+
+/// Duplicate a cached object into `out`; the C++ trampoline consumes the
+/// retention while converting the native result.
+fn set_object_out(host: &Tjs2Engine, out: *mut Value, object: Option<&DetachedValue>) {
+    let Some(object) = object else {
+        set_void(out);
+        return;
+    };
+    match host.duplicate_retained(object.raw_id()) {
+        Ok(duplicate) => {
+            if !out.is_null() {
+                // SAFETY: the trampoline passes a valid out slot for the call.
+                unsafe {
+                    (*out).ty = VAL_RETAINED;
+                    (*out).integer = 0;
+                    (*out).real = 0.0;
+                    (*out).string = std::ptr::null();
+                    (*out).array = std::ptr::null();
+                    (*out).array_count = 0;
+                    (*out).retained = duplicate.raw_id() as usize;
+                }
+            }
+            // The C++ conversion consumed the retention.
+            std::mem::forget(duplicate);
+        }
+        Err(error) => {
+            log::warn!("Debug: could not duplicate a singleton object: {error}");
+            set_void(out);
+        }
+    }
+}
+
+/// Return the lazily created `Debug.console` / `Debug.controller` singleton.
+fn debug_window_property(
+    engine: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    which: DebugWindow,
+) -> c_int {
+    let Some(resolved) = resolve(engine) else {
+        return report_error(
+            out_error,
+            &format!("Debug.{}: compat context is not bound", which.member()),
+        );
+    };
+    let ctx = resolved.ctx();
+    let host = resolved.engine();
+    // SAFETY: a `CompatCtx` is only created for a bound, live engine.
+    let services = unsafe { ctx.services() };
+    let cached = {
+        let state = services.state::<DebugState>();
+        match which {
+            DebugWindow::Console => state.console.is_some(),
+            DebugWindow::Controller => state.controller.is_some(),
+        }
+    };
+    if !cached {
+        let class = which.class();
+        let object = match host.eval_retained(&format!("new {class}()"), "Debug") {
+            Ok(RetainedValue::Object(object)) => object,
+            Ok(RetainedValue::Value(_)) => {
+                return report_error(
+                    out_error,
+                    &format!("Debug.{}: unexpected scalar result", which.member()),
+                );
+            }
+            Err(error) => {
+                return report_error(out_error, &format!("Debug.{}: {error}", which.member()));
+            }
+        };
+        let mut state = services.state::<DebugState>();
+        match which {
+            DebugWindow::Console => state.console = Some(object),
+            DebugWindow::Controller => state.controller = Some(object),
+        }
+    }
+    let state = services.state::<DebugState>();
+    let object = match which {
+        DebugWindow::Console => state.console.as_ref(),
+        DebugWindow::Controller => state.controller.as_ref(),
+    };
+    set_object_out(host, out, object);
+    0
+}
+
+/// The `Console`/`Controller` native-instance payload.
+///
+/// The reference classes carry no state beyond `visible`; the visibility
+/// flags live in [`DebugState`] so the `Debug.*` singletons and any
+/// script-created instance observe the same value.
+#[derive(Default)]
+struct DebugWindowState {
+    /// Keeps the allocation non-zero-sized (all state is in [`DebugState`]).
+    _private: u8,
+}
+
+extern "C" fn debug_window_create(_engine: *mut c_void) -> *mut c_void {
+    Box::into_raw(Box::new(DebugWindowState::default())) as *mut c_void
+}
+
+extern "C" fn debug_window_destroy(_engine: *mut c_void, instance: *mut c_void) {
+    if !instance.is_null() {
+        // SAFETY: `instance` came from `debug_window_create` and is released once.
+        drop(unsafe { Box::from_raw(instance as *mut DebugWindowState) });
+    }
+}
+
+extern "C" fn debug_window_ctor(
+    _engine: *mut c_void,
+    _instance: *mut c_void,
+    _argc: c_int,
+    _argv: *const Value,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    set_void(out);
+    0
+}
+
+/// Shared body of the `Console.visible` / `Controller.visible` getters.
+fn debug_visible_get(
+    engine: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    class: &str,
+    pick: impl FnOnce(&DebugState) -> bool,
+) -> c_int {
+    let Some(resolved) = resolve(engine) else {
+        return report_error(
+            out_error,
+            &format!("{class}.visible: compat context is not bound"),
+        );
+    };
+    let ctx = resolved.ctx();
+    // SAFETY: a `CompatCtx` is only created for a bound, live engine.
+    let value = {
+        let state = unsafe { ctx.services() }.state::<DebugState>();
+        pick(&state)
+    };
+    set_bool(out, value);
+    0
+}
+
+/// Shared body of the `Console.visible` / `Controller.visible` setters.
+fn debug_visible_set(
+    engine: *mut c_void,
+    value: *const Value,
+    out_error: *mut *mut c_char,
+    class: &str,
+    set: impl FnOnce(&mut DebugState, bool),
+) -> c_int {
+    let Some(resolved) = resolve(engine) else {
+        return report_error(
+            out_error,
+            &format!("{class}.visible: compat context is not bound"),
+        );
+    };
+    if value.is_null() {
+        return report_error(out_error, &format!("{class}.visible: missing value"));
+    }
+    // SAFETY: the trampoline passes a valid value slot for the call.
+    let flag = value_as_bool(unsafe { &*value });
+    let ctx = resolved.ctx();
+    // SAFETY: a `CompatCtx` is only created for a bound, live engine.
+    let mut state = unsafe { ctx.services() }.state::<DebugState>();
+    set(&mut state, flag);
+    0
+}
+
+extern "C" fn console_visible_get(
+    engine: *mut c_void,
+    _instance: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    debug_visible_get(engine, out, out_error, "Console", |state| {
+        state.console_visible
+    })
+}
+
+extern "C" fn console_visible_set(
+    engine: *mut c_void,
+    _instance: *mut c_void,
+    value: *const Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    debug_visible_set(engine, value, out_error, "Console", |state, flag| {
+        state.console_visible = flag;
+    })
+}
+
+extern "C" fn controller_visible_get(
+    engine: *mut c_void,
+    _instance: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    debug_visible_get(engine, out, out_error, "Controller", |state| {
+        state.controller_visible
+    })
+}
+
+extern "C" fn controller_visible_set(
+    engine: *mut c_void,
+    _instance: *mut c_void,
+    value: *const Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    debug_visible_set(engine, value, out_error, "Controller", |state, flag| {
+        state.controller_visible = flag;
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Debug properties
 // ---------------------------------------------------------------------------
 
@@ -497,6 +757,24 @@ extern "C" fn prop_clear_log_file_on_error_set(
     0
 }
 
+/// `Debug.console` — the singleton `Console` object.
+extern "C" fn prop_console(
+    engine: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    debug_window_property(engine, out, out_error, DebugWindow::Console)
+}
+
+/// `Debug.controller` — the singleton `Controller` object.
+extern "C" fn prop_controller(
+    engine: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    debug_window_property(engine, out, out_error, DebugWindow::Controller)
+}
+
 // ---------------------------------------------------------------------------
 // Registration
 // ---------------------------------------------------------------------------
@@ -551,6 +829,56 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
                 get: Some(prop_clear_log_file_on_error_get),
                 set: Some(prop_clear_log_file_on_error_set),
             },
+            NativePropertyDef {
+                name: "controller",
+                get: Some(prop_controller),
+                set: None,
+            },
+            NativePropertyDef {
+                name: "console",
+                get: Some(prop_console),
+                set: None,
+            },
         ],
-    })
+    })?;
+    register_debug_window_classes(ctx)
+}
+
+/// Register the nested `Controller` and `Console` classes.
+///
+/// The reference exposes them only through `Debug.controller`/`Debug.console`,
+/// but registering them also lets a script write `new Console()`. Each owns no
+/// state; the `visible` flag lives in [`DebugState`].
+fn register_debug_window_classes(ctx: &mut CompatCtx) -> Result<(), CompatError> {
+    ctx.register_instance(&NativeInstanceBuilder {
+        name: "Controller",
+        create: debug_window_create,
+        destroy: debug_window_destroy,
+        invalidate: None,
+        methods: vec![NativeInstanceMethodDef {
+            name: "Controller",
+            f: debug_window_ctor,
+        }],
+        properties: vec![NativeInstancePropertyDef {
+            name: "visible",
+            get: Some(controller_visible_get),
+            set: Some(controller_visible_set),
+        }],
+    })?;
+    ctx.register_instance(&NativeInstanceBuilder {
+        name: "Console",
+        create: debug_window_create,
+        destroy: debug_window_destroy,
+        invalidate: None,
+        methods: vec![NativeInstanceMethodDef {
+            name: "Console",
+            f: debug_window_ctor,
+        }],
+        properties: vec![NativeInstancePropertyDef {
+            name: "visible",
+            get: Some(console_visible_get),
+            set: Some(console_visible_set),
+        }],
+    })?;
+    Ok(())
 }

@@ -6,7 +6,8 @@
 
 use std::f64::consts::TAU;
 
-use engine::{BitmapState, fill_polygon, flatten_arc, flatten_cubic, stroke_polyline};
+use engine::BitmapState;
+use engine::raster::{fill_polygon, flatten_arc, flatten_cubic, stroke_polyline};
 
 fn bitmap(width: u32, height: u32) -> BitmapState {
     BitmapState::new(width, height, vec![0u8; (width * height * 4) as usize])

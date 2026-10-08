@@ -318,3 +318,88 @@ fn pad_is_a_read_only_property_stub() {
         assert_eq!(eval_i(e, "global.__pad.width"), 100);
     });
 }
+
+#[test]
+fn pad_registers_every_reference_member_with_its_default() {
+    let _lock = vm_lock();
+    with_vm(|e, _host| {
+        e.exec_script("global.__pad = new Pad();", "test")
+            .expect("construct Pad");
+
+        // Integer/bool members (`PadIntf.cpp` getter defaults).
+        for (name, expected) in [
+            ("color", 0),
+            ("visible", 0),
+            ("fontColor", 0),
+            ("fontHeight", 10),
+            ("fontSize", 10),
+            ("fontBold", 0),
+            ("fontItalic", 0),
+            ("fontUnderline", 0),
+            ("fontStrikeOut", 0),
+            ("readOnly", 1),
+            ("wordWrap", 0),
+            ("opacity", 255),
+            ("showStatusBar", 0),
+            ("showScrollBars", 0),
+            ("borderStyle", 0),
+            ("width", 100),
+            ("height", 100),
+            ("top", 0),
+            ("left", 0),
+        ] {
+            assert_eq!(
+                eval_i(e, &format!("global.__pad.{name}")),
+                expected,
+                "Pad.{name}"
+            );
+        }
+
+        // String members default to the empty string.
+        for name in ["text", "fileName", "title", "fontFace", "statusText"] {
+            assert_eq!(
+                e.eval(&format!("global.__pad.{name}"), "test").unwrap(),
+                TjsValue::String(String::new()),
+                "Pad.{name}"
+            );
+        }
+
+        // Every reference setter is accepted and ignored (no TJS error, no
+        // change to the stored default).
+        for (name, value) in [
+            ("text", "\"x\""),
+            ("fileName", "\"x\""),
+            ("color", "1"),
+            ("visible", "true"),
+            ("title", "\"x\""),
+            ("fontColor", "1"),
+            ("fontHeight", "42"),
+            ("fontSize", "42"),
+            ("fontBold", "true"),
+            ("fontItalic", "true"),
+            ("fontUnderline", "true"),
+            ("fontStrikeOut", "true"),
+            ("fontFace", "\"x\""),
+            ("readOnly", "false"),
+            ("wordWrap", "true"),
+            ("opacity", "1"),
+            ("showStatusBar", "true"),
+            ("showScrollBars", "true"),
+            ("statusText", "\"x\""),
+            ("borderStyle", "1"),
+            ("width", "5"),
+            ("height", "5"),
+            ("top", "5"),
+            ("left", "5"),
+        ] {
+            e.exec_script(&format!("global.__pad.{name} = {value};"), "test")
+                .unwrap_or_else(|err| panic!("Pad.{name} setter must be a no-op: {err}"));
+        }
+        assert_eq!(eval_i(e, "global.__pad.width"), 100);
+        assert_eq!(eval_i(e, "global.__pad.readOnly"), 1);
+        assert_eq!(
+            e.eval("global.__pad.text", "test").unwrap(),
+            TjsValue::String(String::new())
+        );
+    });
+}

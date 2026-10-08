@@ -12,12 +12,14 @@ thiserror = { workspace = true }
 log = { workspace = true }
 flate2 = { workspace = true }
 encoding_rs = "0.8"
+# The media DTOs (`VideoSpec`/`RgbaFrame`) cross the L3 host seam; the `media`
+# decoder itself is never linked here (decoded frames are supplied by the
+# host). The touch tests also name `api::host::TouchPhase` directly (the
+# `platform` re-export only covers `InputEvent`/`MouseButton`).
+api = { workspace = true }
 
 [dev-dependencies]
 fs = { workspace = true }
-# The touch tests build raw input DTOs, which name `api::host::TouchPhase`
-# directly (the `platform` re-export only covers `InputEvent`/`MouseButton`).
-api = { workspace = true }
 
 # D13: `platform` has no default platform feature, so each target selects
 # exactly one. L3 uses only the platform-agnostic event types; it still needs a

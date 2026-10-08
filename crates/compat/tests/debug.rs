@@ -165,3 +165,59 @@ fn start_log_to_file_appends_messages() {
     assert!(written.contains("world"), "log: {written:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn console_and_controller_are_singletons_with_a_visible_flag() {
+    let _lock = vm_lock();
+    with_vm(|e| {
+        // Each property returns a stable singleton object; the two differ.
+        assert_eq!(
+            e.eval("Debug.console === Debug.console", "t").unwrap(),
+            TjsValue::Integer(1)
+        );
+        assert_eq!(
+            e.eval("Debug.controller === Debug.controller", "t")
+                .unwrap(),
+            TjsValue::Integer(1)
+        );
+        assert_eq!(
+            e.eval("Debug.console === Debug.controller", "t").unwrap(),
+            TjsValue::Integer(0)
+        );
+        // `visible` defaults to false and is independent per object.
+        assert_eq!(
+            e.eval("Debug.console.visible", "t").unwrap(),
+            TjsValue::Integer(0)
+        );
+        assert_eq!(
+            e.eval("Debug.controller.visible", "t").unwrap(),
+            TjsValue::Integer(0)
+        );
+        e.exec_script("Debug.console.visible = true;", "t").unwrap();
+        assert_eq!(
+            e.eval("Debug.console.visible", "t").unwrap(),
+            TjsValue::Integer(1)
+        );
+        assert_eq!(
+            e.eval("Debug.controller.visible", "t").unwrap(),
+            TjsValue::Integer(0)
+        );
+        e.exec_script("Debug.controller.visible = true;", "t")
+            .unwrap();
+        assert_eq!(
+            e.eval("Debug.controller.visible", "t").unwrap(),
+            TjsValue::Integer(1)
+        );
+        // A script-created instance shares the DebugState visibility flags.
+        e.exec_script("var c = new Console(); c.visible = false;", "t")
+            .unwrap();
+        assert_eq!(
+            e.eval("Debug.console.visible", "t").unwrap(),
+            TjsValue::Integer(0)
+        );
+        assert_eq!(
+            e.eval("Debug.controller.visible", "t").unwrap(),
+            TjsValue::Integer(1)
+        );
+    });
+}

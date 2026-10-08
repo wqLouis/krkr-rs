@@ -6,7 +6,8 @@
 
 use std::path::PathBuf;
 
-use engine::{ATTR_DIRECTORY, ATTR_NORMAL, Location, normalize_in_archive_name};
+use engine::storage::{ATTR_DIRECTORY, ATTR_NORMAL};
+use engine::{Location, normalize_in_archive_name};
 use testkit::build_xp3;
 
 mod common;

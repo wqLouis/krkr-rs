@@ -13,32 +13,39 @@
 //! `createAppLock`, `exit`, `terminate`, `dumpHeap`, `nullpo`, `showVersion`,
 //! `inputString`, `toActualColor`, `createUUID`, `assignMessage`,
 //! `doCompact`, `readRegValue`, `touchImages`, `addContinuousHandler`,
-//! `removeContinuousHandler`.
+//! `removeContinuousHandler`, `getKeyState`, `shellExecute`, `system`,
+//! `clearGraphicCache`.
 //!
 //! Properties: `exePath`, `dataPath`, `personalPath`, `savedGamesPath`,
 //! `exeName`, `title`, `eventDisabled`, `screenWidth`, `screenHeight`,
 //! `versionString`, `versionInformation`, `platformName`, `osName`,
 //! `processorNum`, `exeBits`, `osBits`, `graphicCacheLimit`,
-//! `exitOnWindowClose`, `exitOnNoWindowStartup`, `drawThreadNum`.
+//! `exitOnWindowClose`, `exitOnNoWindowStartup`, `drawThreadNum`,
+//! `appDataPath`, `desktopLeft`, `desktopTop`, `desktopWidth`,
+//! `desktopHeight`, `touchDevice`.
 //!
-//! # Deliberately deferred
+//! # Composition
 //!
-//! These members need a subsystem that is not exposed through L2 yet, so they
-//! are **not registered** (calling them raises a TJS "member not found",
-//! never a silent stub):
+//! `getKeyState` reads the attached L2 [`engine::input::InputState`]
+//! (TVP virtual-key codes and pad/`VK_PADANY` semantics are the same as the
+//! `Key` class); `touchDevice` derives its touch-capability bits from the
+//! active contacts in the same L2 state; `clearGraphicCache` releases every
+//! unreferenced bitmap in the attached L2 [`engine::Scene`]
+//! ([`engine::Scene::collect_unused_bitmaps`]) — the L2 counterpart of the
+//! reference's
+//! graphic cache.
 //!
-//! * `getKeyState` — needs the L1 input state, which is not part of the L2
-//!   service set;
-//! * `shellExecute`, `system` — need the L1 platform opener/shell;
-//! * `getDisplayMonitors`, `getMonitorInfo` — need the L1 desktop/monitor
-//!   geometry;
-//! * `appDataPath`, `desktopLeft`, `desktopTop`, `desktopWidth`,
-//!   `desktopHeight`, `touchDevice` — likewise desktop/device properties;
-//! * `clearGraphicCache` — needs the visual bitmap-cache L2/L3 service, which
-//!   has not landed.
+//! # Host-facts seam (D11)
 //!
-//! They are documented here rather than registered so scripts get a typed
-//! "member not found" error instead of a value that lies (D11).
+//! `appDataPath`, `desktopLeft`/`Top`/`Width`/`Height`, `shellExecute` and
+//! `system` are genuine host facts with no L2 counterpart. They compose the
+//! closure seam installed through [`CompatHost`](crate::CompatHost)
+//! ([`set_app_data_path`](crate::CompatHost::set_app_data_path),
+//! [`set_desktop_rect`](crate::CompatHost::set_desktop_rect),
+//! [`set_shell_execute`](crate::CompatHost::set_shell_execute) and
+//! [`set_system_command`](crate::CompatHost::set_system_command)); when the
+//! matching fact is unset the member raises a typed error and never returns a
+//! silent default.
 //!
 //! # Command-line arguments
 //!
@@ -48,7 +55,7 @@
 //! value-less entry reads back as `"yes"`. The vector lives in
 //! [`SystemState`], not a process global.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, c_int, c_void};
 use std::path::Path;
 use std::time::Instant;
@@ -59,7 +66,9 @@ use tjs::{
 };
 
 use crate::binding;
+use crate::host::{host_app_data_path, host_desktop_rect, host_shell_execute, host_system};
 use crate::native_util::{args, report_error, set_bool, set_int, set_void, value_as_string};
+use crate::natives::input::vk_pressed;
 use crate::{CompatCtx, CompatError, CompatServices};
 
 // ---------------------------------------------------------------------------
@@ -109,6 +118,10 @@ struct SystemState {
     current_continuous: Option<(usize, usize)>,
     /// Set when `removeContinuousHandler` targets the running handler.
     remove_current_continuous: bool,
+    /// Virtual-key codes already observed by a `getKeyState` query since they
+    /// went down (the reference scancode `0x10` "pressed since last query"
+    /// bit).
+    key_query_seen: HashSet<u32>,
 }
 
 impl Default for SystemState {
@@ -129,6 +142,7 @@ impl Default for SystemState {
             continuous: Vec::new(),
             current_continuous: None,
             remove_current_continuous: false,
+            key_query_seen: HashSet::new(),
         }
     }
 }
@@ -943,6 +957,183 @@ extern "C" fn native_remove_continuous_handler(
     0
 }
 
+/// Reference `tTVPTouchDevice` capability bits (`ScriptMgnIntf.cpp`).
+const TD_INTEGRATED_TOUCH: u32 = 0x0000_0001;
+const TD_MULTI_INPUT: u32 = 0x0000_0040;
+const TD_DIGITIZER_READY: u32 = 0x0000_0080;
+const TD_MOUSE: u32 = 0x0000_0100;
+const TD_MOUSE_WHEEL: u32 = 0x0000_0200;
+
+/// Release every bitmap the attached L2 scene no longer references (the
+/// reference `TVPClearGraphicCache`). Returns the number freed; a missing
+/// scene has no cache and frees nothing.
+fn clear_graphic_cache(services: &CompatServices) -> usize {
+    let Some(ptr) = services.scene() else {
+        return 0;
+    };
+    // SAFETY: the host keeps the attached scene alive for the binding's
+    // lifetime, and the VM is single-threaded.
+    unsafe { &mut *ptr }.collect_unused_bitmaps()
+}
+
+/// `System.getKeyState(code [, getcurrent])` → int
+///
+/// Reads the attached L2 [`engine::input::InputState`] through the same
+/// virtual-key mapping the `Key` class uses (mouse-button VKs and the
+/// `VK_PADANY` pseudo-code included). With `getcurrent` true (the default) it
+/// reports whether the key is currently held; with false it reports whether
+/// the key went down since the previous query for the same code. Both forms
+/// consume the pending edge, mirroring the reference scancode bit handling.
+extern "C" fn native_get_key_state(
+    engine: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    if argc < 1 {
+        return report_error(out_error, "System.getKeyState requires 1 argument");
+    }
+    let a = unsafe { args(argv, argc) };
+    let code = value_as_i64(&a[0]) as u32;
+    let getcurrent = if argc >= 2 {
+        value_as_bool(&a[1])
+    } else {
+        true
+    };
+    let Some(resolved) = resolve(engine) else {
+        return report_error(out_error, "System.getKeyState: compat context is not bound");
+    };
+    let ctx = resolved.ctx();
+    // SAFETY: a `CompatCtx` is only created for a bound, live engine.
+    let services = unsafe { ctx.services() };
+    let Some(input_ptr) = services.input() else {
+        return report_error(out_error, "System.getKeyState: input state is not attached");
+    };
+    // SAFETY: `attach_input` guarantees the pointer stays valid while the
+    // binding is installed, and the VM is single-threaded.
+    let input = unsafe { &*input_ptr };
+    let held = vk_pressed(input, code);
+    let newly = {
+        let mut state = services.state::<SystemState>();
+        if held {
+            state.key_query_seen.insert(code)
+        } else {
+            state.key_query_seen.remove(&code);
+            false
+        }
+    };
+    set_bool(out, if getcurrent { held } else { newly });
+    0
+}
+
+/// `System.shellExecute(target [, param])` → bool
+///
+/// Delegates to the host's platform shell. Without the installed seam the
+/// member raises a typed error (D11).
+extern "C" fn native_shell_execute(
+    engine: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    if argc < 1 {
+        return report_error(out_error, "System.shellExecute requires 1 argument");
+    }
+    let a = unsafe { args(argv, argc) };
+    let target = value_as_string(&a[0]);
+    let param = if argc >= 2 {
+        value_as_string(&a[1])
+    } else {
+        String::new()
+    };
+    let Some(resolved) = resolve(engine) else {
+        return report_error(
+            out_error,
+            "System.shellExecute: compat context is not bound",
+        );
+    };
+    let ctx = resolved.ctx();
+    // SAFETY: a `CompatCtx` is only created for a bound, live engine.
+    let services = unsafe { ctx.services() };
+    match host_shell_execute(services, &target, &param) {
+        Some(Ok(ok)) => {
+            set_bool(out, ok);
+            0
+        }
+        Some(Err(error)) => report_error(out_error, &format!("System.shellExecute: {error}")),
+        None => report_error(
+            out_error,
+            "System.shellExecute: the host shell seam is not installed",
+        ),
+    }
+}
+
+/// `System.system(target)` → int
+///
+/// The reference delivers a maximum-level compact event (which clears the
+/// graphic cache) and then returns the (commented-out) shell status. This port
+/// releases the L2 scene's unreferenced bitmaps and delegates the command to
+/// the host seam; without the seam it raises a typed error (D11).
+extern "C" fn native_system(
+    engine: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    if argc < 1 {
+        return report_error(out_error, "System.system requires 1 argument");
+    }
+    let target = value_as_string(&unsafe { args(argv, argc) }[0]);
+    let Some(resolved) = resolve(engine) else {
+        return report_error(out_error, "System.system: compat context is not bound");
+    };
+    let ctx = resolved.ctx();
+    // SAFETY: a `CompatCtx` is only created for a bound, live engine.
+    let services = unsafe { ctx.services() };
+    match host_system(services, &target) {
+        Some(Ok(code)) => {
+            clear_graphic_cache(services);
+            set_int(out, i64::from(code));
+            0
+        }
+        Some(Err(error)) => report_error(out_error, &format!("System.system: {error}")),
+        None => report_error(
+            out_error,
+            "System.system: the host command seam is not installed",
+        ),
+    }
+}
+
+/// `System.clearGraphicCache()` → void
+///
+/// Releases every bitmap the attached L2 [`engine::Scene`] no longer
+/// references — the L2 counterpart of the reference's `TVPClearGraphicCache`.
+/// With no scene attached there is no cache, so the call is a no-op.
+extern "C" fn native_clear_graphic_cache(
+    engine: *mut c_void,
+    _argc: c_int,
+    _argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    let Some(resolved) = resolve(engine) else {
+        return report_error(
+            out_error,
+            "System.clearGraphicCache: compat context is not bound",
+        );
+    };
+    let ctx = resolved.ctx();
+    // SAFETY: a `CompatCtx` is only created for a bound, live engine.
+    let services = unsafe { ctx.services() };
+    let freed = clear_graphic_cache(services);
+    log::debug!("System.clearGraphicCache: released {freed} unused bitmap(s)");
+    set_void(out);
+    0
+}
+
 // ---------------------------------------------------------------------------
 // System properties
 // ---------------------------------------------------------------------------
@@ -1450,6 +1641,146 @@ extern "C" fn prop_draw_thread_num_set(
     0
 }
 
+/// Report a `System` string host fact, raising a typed error when the seam is
+/// unset or the provider fails.
+fn host_string_property(
+    engine: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    member: &str,
+    read: impl FnOnce(&CompatServices) -> Option<Result<String, String>>,
+) -> c_int {
+    let Some(resolved) = resolve(engine) else {
+        return report_error(
+            out_error,
+            &format!("System.{member}: compat context is not bound"),
+        );
+    };
+    let ctx = resolved.ctx();
+    // SAFETY: a `CompatCtx` is only created for a bound, live engine.
+    let services = unsafe { ctx.services() };
+    match read(services) {
+        Some(Ok(value)) => {
+            set_string_out(&ctx, out, &value);
+            0
+        }
+        Some(Err(error)) => report_error(out_error, &format!("System.{member}: {error}")),
+        None => report_error(
+            out_error,
+            &format!("System.{member}: the host fact is not installed"),
+        ),
+    }
+}
+
+/// Report one field of the `System.desktop*` host rectangle.
+fn host_desktop_property(
+    engine: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    member: &str,
+    pick: impl FnOnce((i32, i32, u32, u32)) -> i64,
+) -> c_int {
+    let Some(resolved) = resolve(engine) else {
+        return report_error(
+            out_error,
+            &format!("System.{member}: compat context is not bound"),
+        );
+    };
+    let ctx = resolved.ctx();
+    // SAFETY: a `CompatCtx` is only created for a bound, live engine.
+    let services = unsafe { ctx.services() };
+    match host_desktop_rect(services) {
+        Some(Ok(rect)) => {
+            set_int(out, pick(rect));
+            0
+        }
+        Some(Err(error)) => report_error(out_error, &format!("System.{member}: {error}")),
+        None => report_error(
+            out_error,
+            &format!("System.{member}: the host fact is not installed"),
+        ),
+    }
+}
+
+extern "C" fn prop_app_data_path(
+    engine: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    host_string_property(engine, out, out_error, "appDataPath", host_app_data_path)
+}
+
+extern "C" fn prop_desktop_left(
+    engine: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    host_desktop_property(engine, out, out_error, "desktopLeft", |rect| {
+        i64::from(rect.0)
+    })
+}
+
+extern "C" fn prop_desktop_top(
+    engine: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    host_desktop_property(engine, out, out_error, "desktopTop", |rect| {
+        i64::from(rect.1)
+    })
+}
+
+extern "C" fn prop_desktop_width(
+    engine: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    host_desktop_property(engine, out, out_error, "desktopWidth", |rect| {
+        i64::from(rect.2)
+    })
+}
+
+extern "C" fn prop_desktop_height(
+    engine: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    host_desktop_property(engine, out, out_error, "desktopHeight", |rect| {
+        i64::from(rect.3)
+    })
+}
+
+/// `System.touchDevice` → the reference `tTVPTouchDevice` bitfield.
+///
+/// The base `tdMouse | tdMouseWheel` capability matches this fork's active
+/// reference path; the touch/pen bits are added while the attached L2 input
+/// state has an active touch contact (the only touch signal the generic input
+/// state carries). Without the L2 input state the member raises a typed error.
+extern "C" fn prop_touch_device(
+    engine: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    let Some(resolved) = resolve(engine) else {
+        return report_error(out_error, "System.touchDevice: compat context is not bound");
+    };
+    let ctx = resolved.ctx();
+    // SAFETY: a `CompatCtx` is only created for a bound, live engine.
+    let services = unsafe { ctx.services() };
+    let Some(input_ptr) = services.input() else {
+        return report_error(out_error, "System.touchDevice: input state is not attached");
+    };
+    // SAFETY: `attach_input` guarantees the pointer stays valid while the
+    // binding is installed, and the VM is single-threaded.
+    let input = unsafe { &*input_ptr };
+    let mut flags = TD_MOUSE | TD_MOUSE_WHEEL;
+    if input.touch_point_count() > 0 {
+        flags |= TD_INTEGRATED_TOUCH | TD_MULTI_INPUT | TD_DIGITIZER_READY;
+    }
+    set_int(out, i64::from(flags));
+    0
+}
+
 // ---------------------------------------------------------------------------
 // Reference algorithms (colors, UUID, RegisterData traversal)
 // ---------------------------------------------------------------------------
@@ -1718,6 +2049,22 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
                 name: "removeContinuousHandler",
                 f: native_remove_continuous_handler,
             },
+            NativeMethodDef {
+                name: "getKeyState",
+                f: native_get_key_state,
+            },
+            NativeMethodDef {
+                name: "shellExecute",
+                f: native_shell_execute,
+            },
+            NativeMethodDef {
+                name: "system",
+                f: native_system,
+            },
+            NativeMethodDef {
+                name: "clearGraphicCache",
+                f: native_clear_graphic_cache,
+            },
         ],
         properties: vec![
             NativePropertyDef {
@@ -1819,6 +2166,36 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
                 name: "drawThreadNum",
                 get: Some(prop_draw_thread_num_get),
                 set: Some(prop_draw_thread_num_set),
+            },
+            NativePropertyDef {
+                name: "appDataPath",
+                get: Some(prop_app_data_path),
+                set: None,
+            },
+            NativePropertyDef {
+                name: "desktopLeft",
+                get: Some(prop_desktop_left),
+                set: None,
+            },
+            NativePropertyDef {
+                name: "desktopTop",
+                get: Some(prop_desktop_top),
+                set: None,
+            },
+            NativePropertyDef {
+                name: "desktopWidth",
+                get: Some(prop_desktop_width),
+                set: None,
+            },
+            NativePropertyDef {
+                name: "desktopHeight",
+                get: Some(prop_desktop_height),
+                set: None,
+            },
+            NativePropertyDef {
+                name: "touchDevice",
+                get: Some(prop_touch_device),
+                set: None,
             },
         ],
     })

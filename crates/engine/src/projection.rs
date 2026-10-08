@@ -18,80 +18,20 @@
 //! * [`compose_layer`] accumulates ancestor position, opacity and visibility;
 //! * [`visible_image_region`] resolves `Layer.rect` + `ImageLeft/Top/Width/
 //!   Height` into a destination [`RectF`] and a source [`PixelRegion`];
-//! * [`blend_mode_for`] maps the native `Layer.type` (`LT_*`) numbering onto
-//!   the closed [`BlendMode`] enum (`ltBinder` maps to `None`: skip).
+//! * [`resolve_blend`] passes the layer's generic [`BlendMode`] through to
+//!   the render node (downgrading an opaque `Replace` below full opacity).
 //!
-//! Screen-buffer primary layers, hidden/empty layers, `ltBinder` containers
-//! and layers whose texture is missing (with no solid fill fallback) are
-//! skipped, matching `sync_scene`.
+//! Screen-buffer primary layers, hidden/empty layers and layers whose texture
+//! is missing (with no solid fill fallback) are skipped, matching
+//! `sync_scene`.
 
 use std::collections::HashMap;
 
-use api::blend::{BlendMode, DstBlend};
+use api::blend::BlendMode;
 use api::geometry::{PixelRegion, RectF};
 use render::{RenderContent, RenderNode, RenderNodeId, RenderScene, Texture};
 
-use crate::scene::{LT_ADDITIVE, LT_ALPHA, LT_OPAQUE, LT_SUBTRACTIVE, LayerState, Rect, Scene};
-
-// ---------------------------------------------------------------------------
-// Native `tTVPLayerType` values (`reference/cpp/core/visual/drawable.h:20`).
-//
-// `crate::scene` already exports the four original types (`LT_OPAQUE`,
-// `LT_ALPHA`, `LT_ADDITIVE`, `LT_SUBTRACTIVE`); the remaining
-// Photoshop-style values live here so [`blend_mode_for`] is total over the
-// documented range without duplicating the public constants.
-// ---------------------------------------------------------------------------
-
-/// `ltBinder` — a container that draws nothing (`Blt` returns "no action").
-pub const LT_BINDER: i64 = 0;
-/// `ltMultiplicative` — multiply blend.
-pub const LT_MULTIPLICATIVE: i64 = 5;
-/// `ltEffect` — layer-effect callback, not a bitmap blend.
-pub const LT_EFFECT: i64 = 6;
-/// `ltFilter` — layer-filter callback, not a bitmap blend.
-pub const LT_FILTER: i64 = 7;
-/// `ltDodge` — colour dodge.
-pub const LT_DODGE: i64 = 8;
-/// `ltDarken` — per-channel minimum.
-pub const LT_DARKEN: i64 = 9;
-/// `ltLighten` — per-channel maximum.
-pub const LT_LIGHTEN: i64 = 10;
-/// `ltScreen` — screen blend.
-pub const LT_SCREEN: i64 = 11;
-/// `ltAddAlpha` — additive with an explicit alpha channel.
-pub const LT_ADD_ALPHA: i64 = 12;
-/// `ltPsNormal` — Photoshop-style normal (plain source-over).
-pub const LT_PS_NORMAL: i64 = 13;
-/// `ltPsAdditive`.
-pub const LT_PS_ADDITIVE: i64 = 14;
-/// `ltPsSubtractive`.
-pub const LT_PS_SUBTRACTIVE: i64 = 15;
-/// `ltPsMultiplicative`.
-pub const LT_PS_MULTIPLICATIVE: i64 = 16;
-/// `ltPsScreen`.
-pub const LT_PS_SCREEN: i64 = 17;
-/// `ltPsOverlay`.
-pub const LT_PS_OVERLAY: i64 = 18;
-/// `ltPsHardLight`.
-pub const LT_PS_HARD_LIGHT: i64 = 19;
-/// `ltPsSoftLight`.
-pub const LT_PS_SOFT_LIGHT: i64 = 20;
-/// `ltPsColorDodge`.
-pub const LT_PS_COLOR_DODGE: i64 = 21;
-/// `ltPsColorDodge5` — the legacy KiriKiri approximation.
-pub const LT_PS_COLOR_DODGE5: i64 = 22;
-/// `ltPsColorBurn`.
-pub const LT_PS_COLOR_BURN: i64 = 23;
-/// `ltPsLighten`.
-pub const LT_PS_LIGHTEN: i64 = 24;
-/// `ltPsDarken`.
-pub const LT_PS_DARKEN: i64 = 25;
-/// `ltPsDifference`.
-pub const LT_PS_DIFFERENCE: i64 = 26;
-/// `ltPsDifference5` — the legacy KiriKiri approximation.
-pub const LT_PS_DIFFERENCE5: i64 = 27;
-/// `ltPsExclusion`.
-pub const LT_PS_EXCLUSION: i64 = 28;
+use crate::scene::{LayerState, Rect, Scene};
 
 /// Background clear colour used when a projected scene has no explicit one.
 ///
@@ -112,52 +52,17 @@ pub(crate) fn clamp_opacity(opacity: f32) -> f32 {
     }
 }
 
-/// Map a native TVP `Layer.type` value to the render pipeline's blend mode.
-///
-/// This is total over the documented `tTVPLayerType` range: every known type
-/// maps to its own mode and only truly unknown/out-of-range values degrade to
-/// [`BlendMode::SourceOver`]. `ltBinder` returns `None` because a binder is a
-/// container the reference never blits (its children are separate layers).
-///
-/// Ported from the old `render/src/blend.rs::blend_mode_for`.
-pub const fn blend_mode_for(blend_type: i64) -> Option<BlendMode> {
-    Some(match blend_type {
-        LT_BINDER => return None,
-        LT_OPAQUE => BlendMode::Replace,
-        LT_ALPHA | LT_PS_NORMAL => BlendMode::SourceOver,
-        LT_ADDITIVE | LT_PS_ADDITIVE => BlendMode::Additive,
-        LT_SUBTRACTIVE | LT_PS_SUBTRACTIVE => BlendMode::Subtractive,
-        LT_ADD_ALPHA => BlendMode::AddAlpha,
-        LT_MULTIPLICATIVE | LT_PS_MULTIPLICATIVE => BlendMode::Multiply,
-        LT_SCREEN | LT_PS_SCREEN => BlendMode::Screen,
-        // `ltDodge` uses the same colour-dodge math as `ltPsColorDodge`.
-        LT_DODGE | LT_PS_COLOR_DODGE => BlendMode::DestinationDependent(DstBlend::ColorDodge),
-        LT_PS_COLOR_DODGE5 => BlendMode::DestinationDependent(DstBlend::ColorDodge5),
-        LT_PS_COLOR_BURN => BlendMode::DestinationDependent(DstBlend::ColorBurn),
-        LT_DARKEN | LT_PS_DARKEN => BlendMode::DestinationDependent(DstBlend::Darken),
-        LT_LIGHTEN | LT_PS_LIGHTEN => BlendMode::DestinationDependent(DstBlend::Lighten),
-        LT_PS_DIFFERENCE => BlendMode::DestinationDependent(DstBlend::Difference),
-        LT_PS_DIFFERENCE5 => BlendMode::DestinationDependent(DstBlend::Difference5),
-        LT_PS_EXCLUSION => BlendMode::DestinationDependent(DstBlend::Exclusion),
-        LT_PS_OVERLAY => BlendMode::DestinationDependent(DstBlend::Overlay),
-        LT_PS_HARD_LIGHT => BlendMode::DestinationDependent(DstBlend::HardLight),
-        LT_PS_SOFT_LIGHT => BlendMode::DestinationDependent(DstBlend::SoftLight),
-        // `ltEffect`/`ltFilter` are layer-effect callbacks, not bitmap blend
-        // functions; a plain source-over composite matches the reference.
-        LT_EFFECT | LT_FILTER => BlendMode::SourceOver,
-        _ => BlendMode::SourceOver,
-    })
-}
-
 /// Resolve the effective blend mode for a layer.
 ///
-/// Like the old `render_path_for`, an `ltOpaque` layer only *replaces* the
-/// destination at full opacity; below that it must still blend and therefore
-/// degrades to [`BlendMode::SourceOver`]. Returns `None` for `ltBinder`.
-pub fn resolve_blend(blend_type: i64, composed_alpha: f32) -> Option<BlendMode> {
-    match blend_mode_for(blend_type)? {
-        BlendMode::Replace if clamp_opacity(composed_alpha) < 1.0 => Some(BlendMode::SourceOver),
-        mode => Some(mode),
+/// L2 stores the render pipeline's generic [`BlendMode`] directly, so the
+/// resolved mode is the stored one unchanged — except that an opaque
+/// [`BlendMode::Replace`] only actually *replaces* the destination at full
+/// opacity; below that it must still blend and therefore degrades to
+/// [`BlendMode::SourceOver`].
+pub fn resolve_blend(blend: BlendMode, composed_alpha: f32) -> BlendMode {
+    match blend {
+        BlendMode::Replace if clamp_opacity(composed_alpha) < 1.0 => BlendMode::SourceOver,
+        mode => mode,
     }
 }
 
@@ -401,11 +306,7 @@ fn append_window<F>(
                 break 'layer None;
             }
             let opacity = win_opacity * node_composed.opacity;
-            let Some(blend) = resolve_blend(layer.blend_type, opacity) else {
-                // `ltBinder`: a container, not a drawable layer. Its children
-                // are separate nodes and still render.
-                break 'layer None;
-            };
+            let blend = resolve_blend(layer.blend, opacity);
 
             // A bitmap layer draws its texture; a fill layer draws its solid
             // colour; a layer with neither draws nothing.

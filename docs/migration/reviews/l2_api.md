@@ -719,3 +719,205 @@ CI. Given the 65-type/29-constant surface and the F-09 flat re-export, a
 snapshot is the only way to make "unreviewed L2 change" impossible; the current
 doc-only contract has already drifted (e.g. `BitmapCache` and
 `visible_image_region` are public but absent from §3).
+
+---
+
+## 5. Follow-up simplifications (recommended, prioritized)
+
+Added after the **constants + re-export structure** pass. That pass already
+landed the cheap whole-surface reductions, so several earlier counts in this
+audit are stale:
+
+- crate-root re-exports cut **99 → 20** (the flat `layer_ops`/`raster` blocks
+  and every `LT_*` re-export are gone); the curated root is
+  `normalize_in_archive_name`, `{Scene,WindowState,LayerState,BitmapState,FontState,Rect}`,
+  `{Storage,Location,StorageMetadata,MountError,StorageReadError}`,
+  `{StartupError,discover_startup}` and
+  `{project_scene,project_window,compose_layer,ComposedLayer,blend_mode_for,resolve_blend}`.
+- all 29 `LT_*` values (`scene` 4 + `projection` 25) are now `pub(crate)`;
+  no `LT_*` is public. L2 gained a generic `scene::LayerBlend` enum with
+  `LayerState::set_blend`/`blend`, and the app now uses that instead of the
+  TVP constants.
+- `#[non_exhaustive]` is now present on 63 items (F-03/F-04/F-05 done).
+- `BitmapCache`/`CachedImage` are gone and `clamp_opacity`,
+  `visible_image_region`, `BACKGROUND_CLEAR`, `blend_pixel_mode` are already
+  `pub(crate)` (F-08 done).
+
+What remains is *method-level* reduction. Each item states the exact external
+references it would break. The sound and video natives are still stubs
+(`crates/compat/src/natives/sound.rs` has an empty `register`, and there is no
+video native yet), so this is by far the cheapest window to reshape those two
+families before L3 grows a real caller.
+
+### S-0 — Replace `LayerState.blend_type: i64` with a generic typed L2 blend — **top priority (layering)**
+
+**Where**: `crates/engine/src/scene.rs:77` (`pub blend_type: i64`); the L3
+writer `crates/compat/src/natives/visual.rs:2698-2699`
+(`l.blend_type = value_as_i64(v)`); the L2 reader `blend_mode_for(l.blend_type)`
+(`crates/engine/src/projection.rs:123`).
+
+**Problem**: `blend_type` is a raw TVP `Layer.type` integer that L3 stores into
+L2 state, so L2 holds another layer's vocabulary — the layering rule "a layer
+owns its own vocabulary" is broken at the *field type*, not just at the crate
+root. This pass closed the root leak (all `LT_*` are `pub(crate)`; L2 now has
+the generic `scene::LayerBlend` + `LayerState::set_blend`/`blend`), but
+`i64` remains the wire type between L2 and L3.
+
+**Fix**: change `blend_type` to the generic `LayerBlend` (extend the enum to
+the full native set, or keep the four core variants plus an opaque extended
+representation), make `blend_mode_for` take `LayerBlend`/`BlendMode` instead of
+`i64`, and move the `i64 ↔ LayerBlend` mapping into L3
+(`crates/compat/src/natives/visual.rs`, which already owns the TVP table in
+`constants.rs`). The `LT_*` constants can then be deleted from L2 entirely.
+
+**L3/L4 breakage**: L3 `visual.rs:2698-2699` is the only site that names
+`blend_type`; it becomes `LayerBlend::from_native(value_as_i64(v))` on write
+and `blend.as_native()` on read (2 lines). Grep shows no other L3/L4 or app
+site. App is already migrated to `LayerState::set_blend`, so it is unaffected
+by the field type change. L4: none.
+
+### S-1 — Regroup the `sound` family (~97 public `fn`s) — **largest reduction, 0 L3/L4 refs today**
+
+`crates/engine/src/sound.rs` currently exposes 97 public functions spread over
+`SoundSource` (15), `SoundChannel` (~30), `SoundBuffer` (10), `Mixer` (~15),
+`WaveFlags` (5), `Fade` (4), plus `parse_sli`, `mix`, `mix_source`. The same
+concept (`volume`, `rate`, `pan`, `position`, fade, flags) exists on several
+types with slightly different names.
+
+Recommended reductions, in order:
+
+1. **One parameter block per channel.** Replace the scalar getter/setter flock
+   (`volume`/`set_volume`, `volume2`/`set_volume2`, `rate`/`set_rate`,
+   `pan`/`set_pan`, `pos`/`set_pos`, `looping`/`set_looping`,
+   `flags`/`flags_mut`, `fade`, `set_position`, `position_seconds`) with
+   `ChannelParams { volume, volume2, rate, pan, pos, looping, flags, … }` +
+   `SoundChannel::params()/set_params()`. `effective_volume`, `output_gain`,
+   `spatial_attenuation` become `pub(crate)` derivations.
+2. **Collapse `SoundBuffer` into `SoundChannel`.** `open`, `close`,
+   `apply_flags_to`, `play_on`, `poll`, `labels`, `flags`, `status` are the
+   buffer-ducking path; fold them into `SoundChannel::load(source, flags)` +
+   `poll`, and make `SoundBuffer` `pub(crate)`.
+3. **One mixer settings block.** Fold `global_volume`, `global_focus_mode`,
+   `set_app_focused`, `set_app_minimized`, `focus_gain`, `clock` into
+   `MixerSettings`/`Mixer::settings()`. Keep public only `channels`,
+   `spawn_channel`, `remove_channel`, `channel`, `channel_ref`, `mix`,
+   `mix_source`, `mix_advancing`, `advance`.
+4. **Trim read-only helpers.** `SoundSource::{spec,sample_rate,channels,frames,
+   is_empty,sli,loop_link_with_flags,labels,has_ended_at,playback_ended}` and
+   `SoundChannel::{is_done,active_fade,fade_finished,duration_seconds}` are
+   0-reference derivations; keep the ones a TJS property needs and make the
+   rest `pub(crate)`.
+5. **Constants:** `TVP_VOLUME_SCALE`, `TVP_WL_MAX_FLAGS`,
+   `TVP_WL_MAX_FLAG_VALUE` → `pub(crate)`; `WaveFlags::as_slice -> &[i32]`
+   (F-15). L3 already owns the numeric TVP table
+   (`crates/compat/src/natives/constants.rs`).
+6. **Rename** `Status` → `SoundStatus` and `advance` → `advance_seconds`
+   (F-11/F-18).
+
+**L3/L4 breakage**: **none today.** `grep -r engine::sound crates/compat/src
+crates/vm/src crates/app/src` = 0 hits; the only L3 entry point is the empty
+`natives/sound.rs` stub. L4 names no sound type. Cost is engine's own
+`sound.rs`, `tests/sound.rs` and the new native implementation — best absorbed
+while the native is still empty.
+
+### S-2 — Make `scene` internal-only helpers `pub(crate)` — **0 L3/L4/app refs**
+
+`Scene` exposes 55 public functions; many are engine bookkeeping. Verified
+zero external references (`compat/src`, `vm/src`, `app/src`):
+
+`node_visible`, `node_enabled`, `node_focusable`, `next_focusable`,
+`prev_focusable`, `absolute_offset`, `collect_unused_bitmaps`,
+`bitmap_referenced_by_layer`, `invalidate_layer`, `invalidate_window`,
+`destroy_layer`, `remove_bitmap`, `allocate_province_image`.
+
+Also move `Scene::revision` behind an opaque revision token if the L3 bitmap
+cache (currently 1 use) can key on a `Scene`-provided value instead of the raw
+`u64`. **Do not** privatise `with_main_image_pixels{,_mut}` /
+`with_province_pixels{,_mut}`: those are the F-06 migration target for L3's
+4 raw-address sites.
+
+Keep public (L3 uses them): `add_window/window/window_mut/remove_window`,
+`add_layer/layer/layer_mut/remove_layer`, `set_focus/clear_focus`,
+`ordered_children/window_layer_order/layer_move_to_front`, `layer_at`,
+`is_primary_layer`, `add_bitmap/resize_bitmap/release_bitmap`,
+`add_font/font`, `set_bitmap_clean`, and the province
+pitch/get/set/pixel-buffer pair.
+
+**L3/L4 breakage**: none for the listed set (grep-verified); L4 uses no `Scene`
+method. Engine's own `tests/scene.rs` would need module-path imports only.
+
+### S-3 — Make `input` internal-only helpers `pub(crate)` — **0 L3/L4 refs**
+
+`InputState` exposes 39 public functions. Zero external references:
+`frame`, `pointer_inside`, `set_button_raw`, `take_warp_request`,
+`button_state`, `button_last_click_pos`, `clear_click_sequence`,
+`add_wheel`, `last_pressed`, `held_keys`, `released_keys`, `text_input`.
+
+Keep public (L3 uses them): `begin_frame/end_frame`, `apply`, `pointer`,
+`set_pointer`, `pointer_visible/set_pointer_visible`, `warp_pointer`,
+`set_button`, `is_button_down/is_button_released`, `button_hold_frames`,
+`button_click_count`, `wheel`, `set_key`, `is_key_down/is_key_released`,
+`key_hold_frames`, and all `touch_*` accessors.
+
+**L3/L4 breakage**: none today. L3 uses the public set via
+`natives/input.rs` and `visual.rs`; L4 names only the `InputState` type
+(`crates/vm/src/host.rs:8`). Engine `tests/input.rs` needs a module-path
+import for the retained items.
+
+### S-4 — Consolidate the `video` control surface (do it while the native is a stub)
+
+`VideoOverlay` exposes 37 public methods but L3 (which has no video native yet)
+references only `open`, `close`, `rewind`, `poll`, `advance`. Most of the rest
+*are* the eventual TJS surface, so do not blanket-privatise; instead:
+
+1. Collapse the geometry quartet `bounds`/`set_bounds`/`set_position`/`set_size`
+   to `VideoBounds` + a single `set_bounds` (or keep `set_position`/`set_size`
+   `pub(crate)` behind it).
+2. Make the not-yet-needed event/segment controls `pub(crate)`:
+   `period_event`/`set_period_event`/`cancel_period_event`,
+   `segment_loop`/`set_segment_loop`/`cancel_segment_loop`, `prepare`,
+   `rewind`.
+3. Fold pure helpers `is_open`, `is_playing`, `spec`, `total_frames`,
+   `current_frame_pts_ms`, `pending_events` into `status`/`frame`/`poll`
+   returns instead of separate public getters.
+
+**L3/L4 breakage**: none today (only the 5 methods above are referenced, all
+retained). Timing matters: land before the video native, or the same methods
+become load-bearing.
+
+### S-5 — `advance`/unit naming harmonisation (F-11)
+
+Rename `TimerState::advance` → `advance_to_ms`, `SoundChannel::advance` →
+`advance_seconds`, `Mixer::advance`/`advance_to` → `advance_seconds` /
+`advance_to_seconds`, `VideoOverlay::advance` → `advance_ms`; suffix every
+position getter/setter with its unit.
+
+**L3/L4 breakage**: L3 `crates/compat/src/natives/visual.rs:4904`
+(`TimerState::advance`). Sound/video/trans renames have **0** L3 refs. L4 names
+only the `TimerState`/`InputState` types (`crates/vm/src/host.rs:8-9`).
+
+### S-6 — Structural (not method-level) follow-ups
+
+These are the remaining §5/F-01/F-02/F-14 items; list them here so the two
+large L1-leak fixes are not lost behind the method cleanups:
+
+- **`engine::text` opaque rasterizer** (F-01): `GlyphAtlas::new/glyph/
+  rasterize_layout/texture`, `TextEngine::face/font_metrics`,
+  `project_text` name `render::{RenderPipeline,RenderState,Texture,Font,
+  FontMetrics,RenderScene,RenderNodeId}`. 0 L3/L4/app refs → zero breakage.
+- **`engine::storage` opaque backend** (F-02): wrap `fs::FileSystem`/
+  `Xp3Archive`/`Xp3Error` behind `StorageBackend`/`ArchiveInfo`; keep
+  `normalize_in_archive_name`. Breakage: app/compat **tests** only.
+- **`projection` L1 coupling** (F-14): opaque `ProjectedScene`/`TextureHandle`.
+  Breakage: app `crates/app/src/lib.rs:30,199-210` only.
+- **§6 public-API snapshot**: still not checked in; add it before S-1/S-2 so
+  each reduction is an explicit, reviewable diff.
+
+### Suggested order
+
+1. S-0 (typed `LayerState.blend_type`) — completes the layering fix started in
+   this pass; L3-only (2 lines) plus deleting L2's `LT_*`.
+2. §6 snapshot + S-1 (sound) — biggest reduction, zero current callers.
+3. S-2 (scene) + S-3 (input) — zero-reference helpers.
+4. S-4 (video) + S-5 (units) — before the sound/video natives land.
+5. S-6 (text/storage/projection) — design-sized, zero-to-app-only breakage.

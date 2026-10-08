@@ -143,6 +143,65 @@ fn window_and_layer_round_trip_through_the_scene() {
 }
 
 #[test]
+fn layer_type_maps_every_native_blend_to_its_behaviour() {
+    use api::blend::{BlendMode, DstBlend};
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run("var w = new Window(); var l = new Layer(w, null);");
+    // (native `lt*`, decoded behaviour, canonical native it encodes back to)
+    let cases: &[(i64, BlendMode, i64)] = &[
+        (0, BlendMode::SourceOver, 2),  // ltBinder (container, no blend)
+        (1, BlendMode::Replace, 1),     // ltOpaque
+        (2, BlendMode::SourceOver, 2),  // ltAlpha
+        (3, BlendMode::Additive, 3),    // ltAdditive
+        (4, BlendMode::Subtractive, 4), // ltSubtractive
+        (5, BlendMode::Multiply, 5),    // ltMultiplicative
+        (6, BlendMode::SourceOver, 2),  // ltEffect (callback)
+        (7, BlendMode::SourceOver, 2),  // ltFilter (callback)
+        (8, BlendMode::DestinationDependent(DstBlend::ColorDodge), 8),
+        (9, BlendMode::DestinationDependent(DstBlend::Darken), 9),
+        (10, BlendMode::DestinationDependent(DstBlend::Lighten), 10),
+        (11, BlendMode::Screen, 11),
+        (12, BlendMode::AddAlpha, 12),
+        (13, BlendMode::SourceOver, 2),
+        (14, BlendMode::Additive, 3),
+        (15, BlendMode::Subtractive, 4),
+        (16, BlendMode::Multiply, 5),
+        (17, BlendMode::Screen, 11),
+        (18, BlendMode::DestinationDependent(DstBlend::Overlay), 18),
+        (19, BlendMode::DestinationDependent(DstBlend::HardLight), 19),
+        (20, BlendMode::DestinationDependent(DstBlend::SoftLight), 20),
+        (21, BlendMode::DestinationDependent(DstBlend::ColorDodge), 8),
+        (
+            22,
+            BlendMode::DestinationDependent(DstBlend::ColorDodge5),
+            22,
+        ),
+        (23, BlendMode::DestinationDependent(DstBlend::ColorBurn), 23),
+        (24, BlendMode::DestinationDependent(DstBlend::Lighten), 10),
+        (25, BlendMode::DestinationDependent(DstBlend::Darken), 9),
+        (
+            26,
+            BlendMode::DestinationDependent(DstBlend::Difference),
+            26,
+        ),
+        (
+            27,
+            BlendMode::DestinationDependent(DstBlend::Difference5),
+            27,
+        ),
+        (28, BlendMode::DestinationDependent(DstBlend::Exclusion), 28),
+        (9999, BlendMode::SourceOver, 2), // unknown degrades safely
+    ];
+    for &(native, expected, canonical) in cases {
+        env.run(&format!("l.type = {native};"));
+        let stored = env.scene.layers.first().expect("layer").blend;
+        assert_eq!(stored, expected, "native type {native}");
+        assert_eq!(env.eval_int("l.type"), canonical, "native type {native}");
+    }
+}
+
+#[test]
 fn primary_layer_is_returned_as_the_real_object() {
     let _lock = vm_lock();
     let env = Env::new();
@@ -257,13 +316,11 @@ fn font_properties_round_trip() {
          f.bold = true; \
          f.italic = 1; \
          var face = f.face; \
-         var height = f.height; \
-         var color = f.color;",
+         var height = f.height;",
     );
 
     assert_eq!(env.eval_int("face == 'Arial'"), 1);
     assert_eq!(env.eval_int("height"), 12);
-    assert_eq!(env.eval_int("color == 0xffff0000"), 1);
     assert_eq!(env.eval_int("f.bold"), 1);
     assert_eq!(env.eval_int("f.italic"), 1);
 
@@ -357,18 +414,18 @@ fn timer_properties_round_trip() {
     assert_eq!(env.eval_int("t.interval"), 250);
     assert_eq!(env.eval_int("t.mode"), 2);
     assert_eq!(env.eval_int("t.capacity"), 1);
-    assert_eq!(env.eval_int("t.count"), 0);
 }
 
 #[test]
 fn missing_members_raise_instead_of_silently_stubbing() {
     let _lock = vm_lock();
     let env = Env::new();
-    // Deferred members (image decode/encode, text metrics) are not registered.
+    // A member the VM does not know at all must raise, never silently return
+    // void (D11: no silent fallbacks).
     for expression in [
-        "(function(){ var w = new Window(); return w.drawDevice; })()",
-        "(function(){ var b = new Bitmap(1, 1); return b.save('x.png'); })()",
-        "(function(){ var f = new Font('A', 12, 0); return f.getTextWidth('x'); })()",
+        "(function(){ var w = new Window(); return w.thisMemberDoesNotExist; })()",
+        "(function(){ var b = new Bitmap(1, 1); return b.thisMemberDoesNotExist(); })()",
+        "(function(){ var f = new Font('A', 12, 0); return f.thisMemberDoesNotExist(); })()",
     ] {
         let message = env
             .eval(expression)

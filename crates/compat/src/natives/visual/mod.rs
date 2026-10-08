@@ -1,0 +1,203 @@
+//! Visual native classes: `Window`, `Layer`, `Bitmap`, `Font`, `Timer`.
+//!
+//! Behavioral reference: `main`'s `crates/tvp-visual/src/natives/*` (window.rs,
+//! layer.rs, bitmap.rs, font.rs, timer.rs) and the old `scene.rs`. This is a
+//! reimplementation on the layered API: every class composes the L2
+//! [`engine::Scene`] attached through [`CompatServices::scene`] and keeps no
+//! engine state of its own. The old code hid that state in process globals;
+//! here the per-family **dispatch** state (the id → script-object registries
+//! and the `Timer` callback bindings) lives in [`CompatServices::state`]
+//! (doc 08 §3.1); the generic input state and the timer schedule are L2 state
+//! ([`engine::input::InputState`], [`engine::timer::TimerState`]) attached to
+//! the services, and the per-object state lives in the native instance
+//! payload.
+//!
+//! # Architecture
+//!
+//! The native class is constructed by `new Window()` / `new Layer(...)` /
+//! ...; the **class-name method** (`Window`, `Layer`, ...) is the constructor
+//! hook and returns the new scene id (the reference wrappers use it). The
+//! instance payload holds the scene id; all persistent state is read and
+//! written through the L2 [`Scene`] API, so the model is never duplicated.
+//!
+//! Cross-object properties (`Window.primaryLayer`, `Layer.parent`,
+//! `Layer.window`, `Layer.children`, ...) return real TJS objects. The mapping
+//! scene id → retained script object is the [`ObjectRegistry`] in
+//! [`VisualState`]; each class registers its `objthis` at construction and
+//! removes it on destroy.
+//!
+//! # Implemented
+//!
+//! * `Window`: constructor, `close`, `bringToFront`, `update`, `add`,
+//!   `remove`, `setSize`, `setInnerSize`, `setPos`, `setMinSize`,
+//!   `setMaxSize`, `setZoom`, `showModal`, `setMaskRegion`,
+//!   `removeMaskRegion`, `hideMouseCursor`,
+//!   `postInputEvent`, `getTouchPoint`, `getTouchVelocity`; properties `id`,
+//!   `visible`, `caption`, `width`,
+//!   `height`, `innerWidth`, `innerHeight`, `minWidth`, `minHeight`,
+//!   `maxWidth`, `maxHeight`, `left`, `top`, `focusable`, `zoomNumer`,
+//!   `zoomDenom`, `fullScreen`, `mainWindow`, `focusedLayer`, `primaryLayer`,
+//!   `touchPointCount`, `waitVSync`, `enableTouch`, `hintDelay`,
+//!   `mouseCursorState`, `imeMode`, `useMouseKey`, `trapKey`.
+//! * `Layer`: constructor, `setPos`, `setSize`, `setSizeToImageSize`,
+//!   `setImagePos`, `setImageSize`, `assignImages`,
+//!   `copyFromBitmapToMainImage`, `independMainImage`, `bringToFront`,
+//!   `getLayerAt`, `focus`, `update`, `setClip`,
+//!   `getProvincePixel`, `setProvincePixel`, `fillRect`; the full property
+//!   set used by KAG (`visible`, `opacity`, `width`, `height`, `left`, `top`,
+//!   `type`, `hasImage`, the buffer/pitch properties, `absolute`/`order`,
+//!   `cursorX`/`cursorY`, hit/attention/clip/focus properties, `window`,
+//!   `parent`, `children`, `font`, ...).
+//! * `Bitmap`: constructor, `getPixel`, `setPixel`, `getMaskPixel`,
+//!   `setMaskPixel`, `independ`, `setSize`, `copyFrom`; properties `id`,
+//!   `nativeId`, `width`, `height`, `buffer`, `bufferForWrite`, `bufferPitch`,
+//!   `loading`.
+//! * `Font`: constructor, `__bind`; properties `id`, `face`, `height`,
+//!   `color`, `bold`, `italic`, `strikeout`, `underline`, `angle`,
+//!   `faceIsFileName`.
+//! * `Timer`: constructor, `onTimer`; properties `id`, `interval`, `enabled`,
+//!   `capacity`, `count`, `mode`; [`timer_poll`] fires due timers through the
+//!   object's `onTimer` member (so a script subclass override runs).
+//!
+//! # Deliberately deferred
+//!
+//! These members need a subsystem that is not exposed through the L2/L3
+//! service set yet. They are **not registered** (calling them raises a TJS
+//! "member not found", never a silent stub):
+//!
+//! * `Bitmap.load` / `Bitmap.loadAsync` / `Bitmap.loadHeader`, `Layer.loadImages`,
+//!   `Layer.saveLayerImage`, `Bitmap.save` — no image decoder/encoder is
+//!   exposed through L2. L1 owns those; when a decode service lands these
+//!   become thin wrappers.
+//! * `Font.getTextWidth` / `getTextHeight` / `getEsc*` / `getGlyphDrawRect`
+//!   and `Layer.drawText` — no font rasterizer/metrics service is exposed
+//!   through L2 (L1 `render`), so text measurement cannot be made truthful.
+//! * `Layer` drawing primitives (`drawLine`, `drawPolygon`, `copyRect`,
+//!   `stretchCopy`, `affineCopy`, `doBoxBlur`, `colorize`, `noise`, the
+//!   `operate*`/`piled*`/`blend*` families, `copy9Patch`, ...) — L2
+//!   [`engine::layer_ops`]/[`engine::raster`] already implement the math, but
+//!   wiring the ~40 methods here is a mechanical follow-up rather than a
+//!   missing primitive; only `fillRect` is wired now.
+//! * `Window`/`Layer` input handlers (`onClick`, `onKeyDown`, ...) are not
+//!   registered: the L1→L3 event adapter (`compat::EventAdapter`) is not yet
+//!   wired to the scene, so there is nothing truthful to dispatch.
+//! * `Window.getMouseVelocity` — needs the L1 pointer velocity tracker, which
+//!   is not part of the L2 service set (touch velocity *is* wired through
+//!   `Window.getTouchVelocity`).
+//!
+//! # Timer polling
+//!
+//! [`timer_poll`] is the `timer_poll` step of the documented frame body
+//! (`compat::frame::FrameBody`); the host calls it once per frame. It is a
+//! `pub` free function (like `system::continuous_handler_poll`) so the host
+//! can wire it without the natives exposing anything else. It asks the L2
+//! [`engine::timer::TimerState`] registry for the due timers (the L1
+//! [`platform::Clock`] supplies `now_ms`) and dispatches `onTimer`; the
+//! dispatch itself stays in L3.
+
+use crate::{CompatCtx, CompatError};
+
+mod bitmap;
+mod common;
+mod font;
+mod layer;
+mod timer;
+mod window;
+
+pub use timer::timer_poll;
+// These drains are part of the visual module surface but are not re-exported
+// at the crate root; the original definitions carried `#[allow(dead_code)]`
+// for the same reason.
+#[allow(unused_imports)]
+pub use window::{take_bring_to_front_requests, take_update_requests};
+
+/// Register the visual classes.
+pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
+    window::register_window_class(ctx)?;
+    layer::register_layer_class(ctx)?;
+    bitmap::register_bitmap_class(ctx)?;
+    font::register_font_class(ctx)?;
+    timer::register_timer_class(ctx)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::timer_poll;
+    use crate::CompatHost;
+    use engine::Scene;
+    use engine::timer::TimerState;
+    use tjs::{Tjs2Engine, TjsValue};
+
+    /// A bound VM + host + attached scene and timer registry.
+    ///
+    /// Fields drop in declaration order: the host first (releasing every
+    /// retained script object), then the engine, the scene and the L2 timer
+    /// registry.
+    struct Env {
+        host: CompatHost,
+        engine: Box<Tjs2Engine>,
+        /// Kept alive for the host's raw pointer; never read directly.
+        _scene: Box<Scene>,
+        /// Kept alive for the host's raw pointer; never read directly.
+        _timer: Box<TimerState>,
+    }
+
+    impl Env {
+        fn new() -> Env {
+            let engine = Box::new(Tjs2Engine::new().expect("create engine"));
+            let mut scene = Box::new(Scene::default());
+            let mut timer = Box::new(TimerState::new());
+            let mut host = CompatHost::new();
+            // SAFETY: the boxed scene and timer registry outlive the host.
+            unsafe {
+                host.services_mut()
+                    .attach_scene(scene.as_mut() as *mut Scene);
+                host.services_mut()
+                    .attach_timer(timer.as_mut() as *mut TimerState);
+            }
+            host.install(&engine).expect("install compat surface");
+            Env {
+                host,
+                engine,
+                _scene: scene,
+                _timer: timer,
+            }
+        }
+
+        fn eval_int(&self, expression: &str) -> i64 {
+            match self.engine.eval(expression, "timer-test") {
+                Ok(TjsValue::Integer(value)) => value,
+                other => panic!("{expression:?} returned {other:?}, expected an integer"),
+            }
+        }
+    }
+
+    #[test]
+    fn timer_poll_fires_the_callback() {
+        let _lock = crate::native_util::test_vm_lock();
+        let env = Env::new();
+        env.engine
+            .exec_script(
+                "var hits = 0; \
+                 var t = new Timer(function() { hits++; }, ''); \
+                 t.interval = 1; \
+                 t.enabled = true;",
+                "timer-test",
+            )
+            .expect("define timer");
+
+        // `timer_poll` is the frame body's timer step; poll until the 1 ms
+        // timer has fired (it is enabled on the first poll, then due after
+        // the interval).
+        for _ in 0..200 {
+            let mut ctx = env.host.ctx().expect("bound host");
+            timer_poll(&mut ctx).expect("timer poll");
+            if env.eval_int("hits") >= 1 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(env.eval_int("hits") >= 1, "the timer callback never ran");
+    }
+}

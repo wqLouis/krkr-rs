@@ -1559,16 +1559,6 @@ impl KagParserState {
         self.process_special_tags = v;
     }
 
-    /// `multiLineTagEnabled` (KAGParserEx extension): join `\`-continued
-    /// tag lines (see [`ParseOptions::multiline_tags`]).
-    pub fn get_multi_line_tag_enabled(&self) -> bool {
-        self.multi_line_tag_enabled
-    }
-
-    pub fn set_multi_line_tag_enabled(&mut self, v: bool) {
-        self.multi_line_tag_enabled = v;
-    }
-
     pub fn get_debug_level(&self) -> i32 {
         self.debug_level
     }
@@ -1611,21 +1601,6 @@ impl KagParserState {
             self.macros.insert(k, v);
         }
         Ok(())
-    }
-
-    /// The `paramMacros` dictionary as ordered
-    /// `(macro name, alternating (param, value) list)` entries (for building
-    /// a real TJS Dictionary of Arrays).
-    pub fn get_param_macros_entries(&self) -> Vec<(String, Vec<(String, String)>)> {
-        self.param_macros
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
-    }
-
-    /// Replace the `paramMacros` dictionary.
-    pub fn set_param_macros(&mut self, entries: Vec<(String, Vec<(String, String)>)>) {
-        self.param_macros = entries.into_iter().collect();
     }
 
     /// The top macro-args dictionary (`macroParams`/`mp`) as ordered

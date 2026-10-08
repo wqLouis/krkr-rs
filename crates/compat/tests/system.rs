@@ -7,8 +7,10 @@
 
 mod common;
 
+use api::host::TouchPhase;
 use common::vm_lock;
-use compat::CompatHost;
+use compat::{CompatHost, EventAdapter};
+use platform::{InputEvent, PlatformEvent};
 use tjs::{Tjs2Engine, TjsValue};
 
 /// Build a VM with the full compat surface installed and run `f` against it.
@@ -21,6 +23,53 @@ fn with_vm(f: impl FnOnce(&Tjs2Engine)) {
     let mut host = CompatHost::new();
     host.install(&engine).expect("install compat surface");
     f(&engine);
+}
+
+/// Build a VM + host and hand both to `f`, with no L2 input attached.
+fn with_host(f: impl FnOnce(&Tjs2Engine, &CompatHost)) {
+    let engine = Tjs2Engine::new().expect("create engine");
+    let mut host = CompatHost::new();
+    host.install(&engine).expect("install compat surface");
+    f(&engine, &host);
+}
+
+/// Build a VM + host with the L2 input state attached.
+///
+/// `input` is declared before `host`, so `host` (and its binding) drops first
+/// while the input state is still alive.
+fn with_input(f: impl FnOnce(&Tjs2Engine, &mut CompatHost)) {
+    let engine = Tjs2Engine::new().expect("create engine");
+    let mut input = Box::new(engine::input::InputState::new());
+    let mut host = CompatHost::new();
+    // SAFETY: `input` outlives the host binding.
+    unsafe {
+        host.services_mut()
+            .attach_input(input.as_mut() as *mut engine::input::InputState);
+    }
+    host.install(&engine).expect("install compat surface");
+    f(&engine, &mut host);
+}
+
+/// Feed one frame of platform events through the input adapter seam.
+fn input_frame(
+    adapter: &EventAdapter,
+    host: &mut CompatHost,
+    events: impl IntoIterator<Item = PlatformEvent>,
+) {
+    let mut ctx = host.ctx().expect("bound context");
+    adapter.begin_input_frame(&mut ctx);
+    for event in events {
+        adapter.apply_input_event(&mut ctx, &event);
+    }
+    adapter.end_input_frame(&mut ctx);
+}
+
+/// Evaluate `expression` and return its integer result.
+fn eval_int(engine: &Tjs2Engine, expression: &str) -> i64 {
+    match engine.eval(expression, "t").expect("eval succeeds") {
+        TjsValue::Integer(value) => value,
+        other => panic!("expected Integer for {expression:?}, got {other:?}"),
+    }
 }
 
 #[test]
@@ -324,7 +373,8 @@ fn noop_members_do_not_throw() {
         e.exec_script(
             "System.dumpHeap(); System.nullpo(); System.showVersion(); \
              System.doCompact(); System.doCompact(5); \
-             System.touchImages([]); System.touchImages([], 100, 5);",
+             System.touchImages([]); System.touchImages([], 100, 5); \
+             System.clearGraphicCache();",
             "t",
         )
         .unwrap();
@@ -358,4 +408,152 @@ fn exit_and_terminate_record_without_throwing() {
         // terminate takes an optional code
         assert_eq!(e.eval("System.terminate()", "t").unwrap(), TjsValue::Void);
     });
+}
+
+#[test]
+fn host_fact_members_raise_typed_errors_when_unset() {
+    let _lock = vm_lock();
+    with_host(|e, _host| {
+        for expression in [
+            "System.appDataPath",
+            "System.desktopLeft",
+            "System.desktopTop",
+            "System.desktopWidth",
+            "System.desktopHeight",
+            "System.shellExecute('target')",
+            "System.system('target')",
+        ] {
+            let error = e
+                .eval(expression, "t")
+                .expect_err("the unset host fact must raise")
+                .to_string();
+            assert!(
+                error.contains("host"),
+                "{expression:?} should name the missing host seam, got: {error}"
+            );
+        }
+        // Arity is still checked before the seam is consulted.
+        assert!(e.eval("System.shellExecute()", "t").is_err());
+        assert!(e.eval("System.system()", "t").is_err());
+    });
+}
+
+#[test]
+fn host_facts_seam_serves_the_system_members() {
+    let _lock = vm_lock();
+    with_host(|e, host| {
+        host.set_app_data_path(|| Ok("/home/user/.local/share/game/".to_string()));
+        host.set_desktop_rect(|| Ok((-1920, 0, 3840, 1080)));
+        host.set_shell_execute(|target, param| Ok(target == "open" && param == "p"));
+        host.set_system_command(|target| Ok(if target == "ok" { 0 } else { 7 }));
+
+        assert_eq!(
+            e.eval("System.appDataPath", "t").unwrap(),
+            TjsValue::String("/home/user/.local/share/game/".into())
+        );
+        assert_eq!(eval_int(e, "System.desktopLeft"), -1920);
+        assert_eq!(eval_int(e, "System.desktopTop"), 0);
+        assert_eq!(eval_int(e, "System.desktopWidth"), 3840);
+        assert_eq!(eval_int(e, "System.desktopHeight"), 1080);
+        assert_eq!(eval_int(e, "System.shellExecute('open', 'p')"), 1);
+        assert_eq!(eval_int(e, "System.shellExecute('other')"), 0);
+        assert_eq!(eval_int(e, "System.system('ok')"), 0);
+        assert_eq!(eval_int(e, "System.system('other')"), 7);
+    });
+}
+
+#[test]
+fn get_key_state_reads_the_l2_input_state() {
+    let _lock = vm_lock();
+    with_input(|e, host| {
+        let adapter = EventAdapter::new();
+        input_frame(
+            &adapter,
+            host,
+            [PlatformEvent::Input(InputEvent::Key {
+                code: 0x0D, // VK_RETURN
+                pressed: true,
+            })],
+        );
+        // The "pressed since the previous query" edge fires exactly once.
+        assert_eq!(eval_int(e, "System.getKeyState(Key.kReturn, false)"), 1);
+        assert_eq!(eval_int(e, "System.getKeyState(Key.kReturn, false)"), 0);
+        // The current-state query reports the held key.
+        assert_eq!(eval_int(e, "System.getKeyState(Key.kReturn)"), 1);
+
+        input_frame(
+            &adapter,
+            host,
+            [PlatformEvent::Input(InputEvent::Key {
+                code: 0x0D,
+                pressed: false,
+            })],
+        );
+        assert_eq!(eval_int(e, "System.getKeyState(Key.kReturn)"), 0);
+        assert!(e.eval("System.getKeyState()", "t").is_err());
+    });
+}
+
+#[test]
+fn get_key_state_without_input_raises_a_typed_error() {
+    let _lock = vm_lock();
+    with_vm(|e| {
+        let error = e
+            .eval("System.getKeyState(Key.kReturn)", "t")
+            .expect_err("missing input state must raise")
+            .to_string();
+        assert!(error.contains("input state"), "unexpected error: {error}");
+    });
+}
+
+#[test]
+fn touch_device_requires_input_and_reports_capability_flags() {
+    let _lock = vm_lock();
+    // Without the L2 input state the property is a typed error.
+    with_vm(|e| {
+        let error = e
+            .eval("System.touchDevice", "t")
+            .expect_err("missing input state must raise")
+            .to_string();
+        assert!(error.contains("input state"), "unexpected error: {error}");
+    });
+    // The base flag set matches the reference's active path.
+    with_input(|e, host| {
+        assert_eq!(eval_int(e, "System.touchDevice"), 0x300);
+        // An active touch contact adds the touch/pen capability bits.
+        let adapter = EventAdapter::new();
+        input_frame(
+            &adapter,
+            host,
+            [PlatformEvent::Input(InputEvent::Touch {
+                id: 1,
+                phase: TouchPhase::Started,
+                x: 10.0,
+                y: 20.0,
+            })],
+        );
+        assert_eq!(
+            eval_int(e, "System.touchDevice"),
+            0x300 | 0x01 | 0x40 | 0x80
+        );
+    });
+}
+
+#[test]
+fn clear_graphic_cache_releases_unused_bitmaps() {
+    let _lock = vm_lock();
+    let mut scene = engine::Scene::default();
+    let bitmap = scene.add_bitmap(2, 2, vec![0u8; 16]);
+    let engine = Tjs2Engine::new().expect("create engine");
+    let mut host = CompatHost::new();
+    // SAFETY: `scene` outlives the binding installed below.
+    unsafe { host.services_mut().attach_scene(&mut scene) };
+    host.install(&engine).expect("install compat surface");
+
+    assert!(scene.bitmap(bitmap).is_some());
+    assert_eq!(
+        engine.eval("System.clearGraphicCache()", "t").unwrap(),
+        TjsValue::Void
+    );
+    assert!(scene.bitmap(bitmap).is_none());
 }
