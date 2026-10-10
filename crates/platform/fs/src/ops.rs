@@ -222,17 +222,18 @@ pub fn copy(fs: &FileSystem, from: &FsPath, to: &FsPath) -> Result<(), FsError> 
                 });
             }
             ensure_memory_parent(&guard, &dst)?;
-            // Move the payload instead of cloning it. `src == dst` still
-            // resolves to removing and re-inserting the same bytes.
-            match guard.files.remove(&src) {
-                Some(bytes) => {
-                    guard.files.insert(dst, bytes);
-                    Ok(())
-                }
-                None => Err(FsError::NotFound {
-                    path: src.display().to_string(),
-                }),
+            // `copy` preserves the source; copying a file onto itself is a
+            // no-op.
+            if src == dst {
+                return Ok(());
             }
+            let Some(bytes) = guard.files.get(&src).cloned() else {
+                return Err(FsError::NotFound {
+                    path: src.display().to_string(),
+                });
+            };
+            guard.files.insert(dst, bytes);
+            Ok(())
         }
     }
 }

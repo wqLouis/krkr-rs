@@ -257,6 +257,33 @@ fn memory_missing_and_directory_errors_are_typed() {
     ));
 }
 
+/// `copy` leaves the source in place and produces an independent destination,
+/// matching `std::fs::copy`.
+#[test]
+fn memory_copy_preserves_source() {
+    let fs = FileSystem::memory();
+    create_dir_all(&fs, &FsPath::host("/d")).unwrap();
+    let file = open(&fs, &FsPath::host("/d/a"), OpenMode::Write).unwrap();
+    write_at(&fs, &file, 0, b"data").unwrap();
+    drop(file);
+
+    copy(&fs, &FsPath::host("/d/a"), &FsPath::host("/d/b")).unwrap();
+    assert!(
+        exists(&fs, &FsPath::host("/d/a")),
+        "copy removed the source"
+    );
+    assert_eq!(stat(&fs, &FsPath::host("/d/b")).unwrap().size, 4);
+
+    // The destination is an independent buffer.
+    let file = open(&fs, &FsPath::host("/d/b"), OpenMode::Write).unwrap();
+    write_at(&fs, &file, 0, b"XXXX").unwrap();
+    drop(file);
+    let file = open(&fs, &FsPath::host("/d/a"), OpenMode::Read).unwrap();
+    let mut buf = [0u8; 4];
+    read_at(&fs, &file, 0, &mut buf).unwrap();
+    assert_eq!(&buf, b"data");
+}
+
 #[test]
 fn memory_roots_are_independent() {
     let a = FileSystem::memory();

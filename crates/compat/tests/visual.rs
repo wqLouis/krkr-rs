@@ -230,6 +230,24 @@ fn primary_layer_is_returned_as_the_real_object() {
 }
 
 #[test]
+fn primary_layer_without_a_layer_raises() {
+    let _lock = vm_lock();
+    let env = Env::new();
+
+    // `Window.primaryLayer` raises `TVPWindowHasNoLayer` when the window has
+    // no primary layer (`reference/cpp/core/visual/WindowIntf.cpp:1793-1794`).
+    env.run("var w = new Window();");
+    assert!(
+        env.eval("w.primaryLayer").is_err(),
+        "a fresh window has no primary layer"
+    );
+
+    // Once a layer is attached it becomes the primary layer and is returned.
+    env.run("var l = new Layer(w, null);");
+    assert_eq!(env.eval_int("w.primaryLayer === l"), 1);
+}
+
+#[test]
 fn focus_and_children_round_trip() {
     let _lock = vm_lock();
     let env = Env::new();

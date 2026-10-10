@@ -502,10 +502,8 @@ impl Xp3Archive {
                     org_size = u64::from_le_bytes(prefix(&payload[4..12]));
                     arc_size = u64::from_le_bytes(prefix(&payload[12..20]));
                     let name_len = i16::from_le_bytes(prefix(&payload[20..22]));
-                    if name_len < 0 {
-                        return Err(Xp3Error::CorruptIndex("negative name length"));
-                    }
-                    let name_len = name_len as usize;
+                    let name_len = usize::try_from(name_len)
+                        .map_err(|_| Xp3Error::CorruptIndex("negative name length"))?;
                     let name_bytes = payload
                         .get(22..22 + name_len * 2)
                         .ok_or(Xp3Error::CorruptIndex("name overruns info sub-chunk"))?;
@@ -647,7 +645,10 @@ impl Seek for FileReader<'_> {
             }
             SeekFrom::Current(off) => self.pos as i128 + off as i128,
         };
-        self.pos = target.max(0) as u64;
+        let target = u64::try_from(target.max(0)).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "seek target is out of range")
+        })?;
+        self.pos = target;
         Ok(self.pos)
     }
 }

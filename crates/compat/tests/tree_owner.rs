@@ -135,8 +135,15 @@ fn constructor_exposes_the_full_surface_and_identity() {
         );
     }
 
-    // The value properties read as the documented types.
-    assert_eq!(env.eval_int("owner.primaryLayer === null"), 1);
+    // The value properties read as the documented types. `primaryLayer`
+    // raises when no primary layer has been attached
+    // (`reference/cpp/core/visual/BitmapLayerTreeOwner.cpp:622-624`).
+    assert!(
+        env.engine
+            .eval("owner.primaryLayer", "tree-owner-test")
+            .is_err(),
+        "a fresh tree owner has no primary layer"
+    );
     assert_eq!(env.eval_int("owner.focusedLayer === null"), 1);
     assert_eq!(env.eval_int("owner.width"), 320);
     assert_eq!(env.eval_int("owner.height"), 240);

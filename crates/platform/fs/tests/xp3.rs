@@ -149,6 +149,24 @@ fn fs_errors_are_recovered_through_the_io_adapter() {
     );
 }
 
+/// A real bottom-layer read failure while reading entry bytes reaches the
+/// caller as the original typed `FsError`, not an opaque I/O error.
+#[test]
+fn adapter_read_failure_preserves_fs_error() {
+    let xp3 = build_xp3(&[("gone.bin", b"payload", false)]);
+    let (fs, file) = fs_with(&xp3);
+    let archive = Xp3Archive::open(&fs, &file).expect("open archive");
+    // The index is parsed; removing the backing storage makes the entry-data
+    // read fail with `FsError::NotFound`.
+    fs::remove_file(&fs, &FsPath::host("/bad.xp3")).expect("remove backing file");
+
+    let err = archive.read(&fs, &file, "gone.bin").unwrap_err();
+    assert!(
+        matches!(err, Xp3Error::Fs(FsError::NotFound { .. })),
+        "typed FsError was not preserved: {err:?}"
+    );
+}
+
 /// A valid archive parses and reads both raw and zlib segments, and lookup
 /// normalizes the requested name.
 #[test]

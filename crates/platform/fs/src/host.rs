@@ -137,6 +137,11 @@ fn path_to_string(path: &FsPath) -> String {
 }
 
 /// Maps a `std::io::Error` into the typed [`FsError`].
+///
+/// Every `ErrorKind` that has a matching [`FsError`] variant is preserved so
+/// the caller can distinguish "missing", "denied", "is/not a directory" and
+/// the other concrete conditions; only an otherwise unclassified kind falls
+/// back to [`FsError::Io`].
 pub(crate) fn io_error(path: &str, err: std::io::Error) -> FsError {
     match err.kind() {
         ErrorKind::NotFound => FsError::NotFound {
@@ -148,8 +153,60 @@ pub(crate) fn io_error(path: &str, err: std::io::Error) -> FsError {
         ErrorKind::AlreadyExists => FsError::AlreadyExists {
             path: path.to_owned(),
         },
+        ErrorKind::IsADirectory => FsError::IsADirectory {
+            path: path.to_owned(),
+        },
+        ErrorKind::NotADirectory => FsError::NotADirectory {
+            path: path.to_owned(),
+        },
+        ErrorKind::Unsupported => FsError::Unsupported {
+            operation: format!("{path}: {err}"),
+        },
         _ => FsError::Io {
             message: format!("{path}: {err}"),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Error, ErrorKind};
+
+    use api::error::FsError;
+
+    use super::io_error;
+
+    /// Every `ErrorKind` covered by an `FsError` variant is preserved, and an
+    /// unclassified kind falls back to `FsError::Io`.
+    #[test]
+    fn io_error_preserves_typed_kinds() {
+        assert!(matches!(
+            io_error("/p", Error::from(ErrorKind::NotFound)),
+            FsError::NotFound { .. }
+        ));
+        assert!(matches!(
+            io_error("/p", Error::from(ErrorKind::PermissionDenied)),
+            FsError::PermissionDenied { .. }
+        ));
+        assert!(matches!(
+            io_error("/p", Error::from(ErrorKind::AlreadyExists)),
+            FsError::AlreadyExists { .. }
+        ));
+        assert!(matches!(
+            io_error("/p", Error::from(ErrorKind::IsADirectory)),
+            FsError::IsADirectory { .. }
+        ));
+        assert!(matches!(
+            io_error("/p", Error::from(ErrorKind::NotADirectory)),
+            FsError::NotADirectory { .. }
+        ));
+        assert!(matches!(
+            io_error("/p", Error::from(ErrorKind::Unsupported)),
+            FsError::Unsupported { .. }
+        ));
+        assert!(matches!(
+            io_error("/p", Error::from(ErrorKind::Other)),
+            FsError::Io { .. }
+        ));
     }
 }

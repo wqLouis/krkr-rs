@@ -64,6 +64,24 @@ fn host_stat_list_mkdir_remove_copy_rename() {
 }
 
 #[test]
+fn host_parent_file_yields_not_a_directory() {
+    let dir = temp_dir("host-notdir");
+    let fs = FileSystem::host(dir.clone());
+
+    let file = open(&fs, &FsPath::host("blocker"), OpenMode::Write).unwrap();
+    write_at(&fs, &file, 0, b"x").unwrap();
+    drop(file);
+
+    // Creating a directory below a regular file fails with the typed
+    // `NotADirectory`, not an opaque I/O error.
+    assert!(matches!(
+        create_dir_all(&fs, &FsPath::host("blocker/sub")),
+        Err(FsError::NotADirectory { .. })
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn backend_mismatch_is_an_error() {
     let mem = FileSystem::memory();
     create_dir_all(&mem, &FsPath::host("/d")).unwrap();

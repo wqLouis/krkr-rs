@@ -1010,7 +1010,10 @@ extern "C" fn window_focused_layer_set(
     0
 }
 
-/// `Window.primaryLayer` — the window's primary layer object, or `null`.
+/// `Window.primaryLayer` — the window's primary layer object.
+///
+/// Raises when the window has no primary layer; `null` only when the primary
+/// layer has no owner object.
 extern "C" fn window_primary_layer_get(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -1033,9 +1036,10 @@ extern "C" fn window_primary_layer_get(
         Ok(scene) => scene,
         Err(error) => return report_error(out_error, &error),
     };
-    let primary = scene.window(id).and_then(|w| w.primary_layer);
-    let object = primary
-        .and_then(|layer| duplicate_object(&ctx, resolved.engine(), ObjectKind::Layer, layer));
+    let Some(primary) = scene.window(id).and_then(|w| w.primary_layer) else {
+        return report_error(out_error, "Window has no layer");
+    };
+    let object = duplicate_object(&ctx, resolved.engine(), ObjectKind::Layer, primary);
     set_object_out(resolved.engine(), out, object.as_ref());
     0
 }

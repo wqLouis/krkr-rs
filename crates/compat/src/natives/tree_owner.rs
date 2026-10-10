@@ -733,7 +733,10 @@ extern "C" fn focused_layer_set(
     0
 }
 
-/// `primaryLayer` getter — the primary layer object, or `null`.
+/// `primaryLayer` getter — the primary layer object.
+///
+/// Raises when no primary layer has been attached; the reference returns
+/// `null` only when the primary layer has no owner object.
 extern "C" fn primary_layer_get(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -752,10 +755,10 @@ extern "C" fn primary_layer_get(
         .primary
         .as_ref()
         .map(DetachedValue::raw_id);
-    match stored {
-        Some(id) => emit_retained(resolved.engine(), out, id),
-        None => set_null(resolved.engine(), out),
-    }
+    let Some(id) = stored else {
+        return report_error(out_error, "Not have primary layer");
+    };
+    emit_retained(resolved.engine(), out, id);
     0
 }
 
