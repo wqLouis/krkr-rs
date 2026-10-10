@@ -1,6 +1,6 @@
 # 09 — Game loading
 
-Status: design. No code on this branch.
+Status: implemented.
 Related: [`02-target-architecture.md`](02-target-architecture.md) §5 (archive
 parsing in L1), [`08-tjs-vm-and-native-plugins.md`](08-tjs-vm-and-native-plugins.md).
 
@@ -14,15 +14,24 @@ explicit input and hands it to L2.
 CLI:
 
 ```
-krkr --archive data.xp3 --archive patch.xp3 \
-     [--base-dir DIR] [--savedata-dir DIR] [key=value ...]
+krkr --archive data.xp3 --archive patch.xp3 [--base-dir DIR] [GAME]
 ```
 
-* `--archive` is **repeatable** and **order-significant** (§4).
-* A single positional `.xp3` argument is also accepted (mirrors the
-  reference `TVPCheckStartupArg`).
-* **No directory scan.** We never enumerate a folder to find `startup.tjs`
-  or `*.xp3`.
+* `--archive` is **repeatable** and **order-significant** (§4). It stays
+  authoritative and is mounted in addition to a positional archive.
+* One positional argument `GAME` is accepted, mirroring the reference
+  `TVPCheckStartupArg` (`reference/cpp/core/environ/win32/Platform.cpp:93`):
+  * a **file** is mounted as an archive (`TVPCheckArchive`,
+    `reference/cpp/core/base/impl/StorageImpl.cpp:562`);
+  * a **directory** becomes the app path; its loose `startup.tjs` decides
+    bootability (the reference `TVPListDir` branch).
+* **No directory scan.** There is no default folder scan for `*.xp3` in the
+  reference: win32 `TVPCheckStartupArg` only inspects `argv[1]`, and the
+  Linux/macOS/Android implementations return `false` outright
+  (`environ/linux/Platform.cpp:285`, `environ/apple/macos/platform.mm:208`,
+  `environ/android/AndroidUtils.cpp:695`). We never enumerate a folder for
+  `*.xp3`; a `startup.tjs` inside a mounted archive is found by the normal
+  storage search (§5), not by a scan.
 * `key=value` arguments become command-line config
   (`TVPSetCommandLine` semantics).
 
@@ -32,11 +41,17 @@ base dir.
 
 ## 2. Base directory
 
-Default: the **parent directory of the first archive**. This is the "app
-path" (`TVPGetAppPath`) used for:
+Default: the **parent directory of the first archive** (the reference
+`TVPGetAppPath` convention). `--base-dir DIR` (or a positional game
+directory) overrides it, and it is resolved to an absolute path, so the app
+path is the same from any working directory. This is the "app path"
+(`TVPGetAppPath`) used for:
 
 * the app-path-only scripts in §5 (`patch.tjs`, `AfterStartup.tjs`);
-* loose files and assets (`plugin/`, `default.ttf`, …).
+* loose files and assets (`plugin/`, `default.ttf`, …);
+* the root every relative `--archive` path resolves against, so
+  `--base-dir /path/to/game --archive data.xp3` mounts
+  `/path/to/game/data.xp3`.
 
 Disk files still win over archive entries (unchanged rule from the current
 `Storage::find`).
@@ -117,15 +132,38 @@ extension.)
 
 | reference | here |
 |---|---|
-| `TVPCheckStartupArg` (`environ/win32/Platform.cpp:97`): archive arg containing `startup.tjs` | `--archive` (positional accepted) |
+| `TVPCheckStartupArg` (`environ/win32/Platform.cpp:93`): `argv[1]` is an archive containing `startup.tjs`, or a directory containing a loose `startup.tjs` | positional `GAME` argument; `--archive` for explicit lists |
 | `TVPCheckArchive` (`base/impl/StorageImpl.cpp:562`): `1` has startup / `2` no / `0` not archive | loader validation |
 | `TVPExecuteStartupScript` order | §5 |
-| folder scan for `*.xp3` | **removed**; explicit list only |
+| folder scan for `*.xp3` | **none in the reference**; explicit list plus positional `argv[1]` only |
 
 ## 8. Errors
 
-Loading is explicit and typed (D11): missing/unreadable archive, an archive
-that fails to parse, and "no `startup.tjs` found" are all errors, not
-warnings. The only tolerated case is a missing native plugin DLL, handled by
-the null-plugin object in
+Loading is explicit and typed (D11): a base directory that does not exist, a
+missing or unreadable archive, an archive that fails to parse, and "no
+`startup.tjs` found" are all errors, not warnings. The only tolerated case is
+a missing native plugin DLL, handled by the null-plugin object in
 [`08-tjs-vm-and-native-plugins.md`](08-tjs-vm-and-native-plugins.md) §4.2.
+
+## 9. Implementation
+
+* **L2** — [`Storage::mount_archives`] mounts an explicit, ordered archive
+  list; [`Storage::startup_plan`] resolves §5 into a `StartupPlan`
+  (`patch`/`startup`/`fallback`/`after`) with pure storage lookups. `patch.tjs`
+  and `AfterStartup.tjs` are app-path only (disk, `find_disk`); `startup.tjs`
+  and `system/Initialize.tjs` are searched (`exists`).
+* **L3** — `compat::exec_storage(engine, storage, name)` is the core of
+  `Scripts.execStorage` without the native wrapper.
+* **L4** — `app::GameHost::open(host, archives, base_dir)` mounts the list,
+  binds the VM, and runs §5's order: `patch.tjs` (non-fatal), `startup.tjs`
+  with the `system/Initialize.tjs` fallback, then `AfterStartup.tjs`
+  (non-fatal).
+* **CLI** — `krkr [--archive XP3 ...] [--base-dir DIR] [GAME]`. The base
+  directory defaults to the first archive's parent (else the current
+  directory); a positional directory sets it, a positional file is mounted as
+  an archive. **Nothing scans a folder for `*.xp3`.** The `boot_game` test
+  derives an archive list from `KRKR_TEST_GAME` for convenience only; the
+  product path never does.
+
+[`Storage::mount_archives`]: ../../crates/engine/src/storage.rs
+[`Storage::startup_plan`]: ../../crates/engine/src/storage.rs

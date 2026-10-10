@@ -1,6 +1,6 @@
 # Platform / host code review — `platform` (L1), `app` (composition root)
 
-Scope: `crates/platform/` (L1 platform core) and `crates/app/`
+Scope: `crates/platform/platform/` (L1 platform core) and `crates/app/`
 (composition root), with their tests (`platform/tests/*`,
 `app/tests/*`) and the D9 guard `scripts/check-stateless.sh`.
 
@@ -73,12 +73,12 @@ touches a window handle); move the host tests to `crates/engine/tests`.
 
 ## 2. Silent fallback on missing raw handles, and a fabricated headless handle — High (D11)
 
-`crates/platform/src/linux.rs:36-41` and `:44-49` collapse the
+`crates/platform/platform/src/linux.rs:36-41` and `:44-49` collapse the
 `HasWindowHandle`/`HasDisplayHandle` `Result` to `Option` with `.ok()`,
 dropping the `HandleError`. The consumer then treats the absence as
 "headless": `crates/app/src/lib.rs:199-206` substitutes
 `platform::headless_window_handle()`, and
-`crates/platform/src/window.rs:11-13` fabricates
+`crates/platform/platform/src/window.rs:11-13` fabricates
 `RawWindowHandle::Web(WebWindowHandle::new(0))` on **every** target. Because
 `crates/app/src/main.rs:217-218` passes those `Option`s straight
 through, a handle lookup failure on a real window silently produces a
@@ -95,7 +95,7 @@ real backend with no handle must be an error.
 
 ## 3. Input coordinates are physical but documented/typed as logical — High
 
-`crates/platform/src/input.rs:29-31, 36-39, 70-73` state the
+`crates/platform/platform/src/input.rs:29-31, 36-39, 70-73` state the
 coordinates are "logical window coordinates", but `map_input` copies the
 winit values verbatim, and all of them are **physical** pixels:
 `CursorMoved.position` (`linux.rs:200-206`), `MouseScrollDelta::PixelDelta`
@@ -115,14 +115,14 @@ scale the mapping uses (see finding 7).
 
 ## 4. D13 Android platform selection is not actually enforced — High
 
-`crates/platform/Cargo.toml:12-15` defaults to `platform-linux`, and
+`crates/platform/platform/Cargo.toml:12-15` defaults to `platform-linux`, and
 nothing overrides it: both consumers depend on it with default features
 (`crates/app/Cargo.toml:15`, `crates/vm/Cargo.toml:11`), and no
 CI file passes `--no-default-features --features platform-android`
 (`.github/workflows/` has only `android.yml`, which does not cargo-build
 these crates). Building for `aarch64-linux-android` therefore compiles the
 real `linux.rs`/winit backend. The `compile_error!` guards
-(`crates/platform/src/lib.rs:35-40`) only catch *neither* and *both* —
+(`crates/platform/platform/src/lib.rs:35-40`) only catch *neither* and *both* —
 not "the wrong platform for this target". The Android stub's `run` returning
 `Unsupported` (`src/android.rs:35-42`) is unreachable unless the caller
 remembers the right flags.
@@ -147,20 +147,20 @@ therefore not applied to the L1 crate the criterion names — L1 includes
 check that `03-middle-layer-api.md` §9 promises. No workflow invokes the
 script at all. (The crate is currently clean — `rg` for
 `static mut`/`thread_local!`/`LazyLock`/`OnceLock`/`OnceCell` in
-`crates/platform/src` finds nothing — so this is a guard gap, not an
+`crates/platform/platform/src` finds nothing — so this is a guard gap, not an
 existing violation.)
 
-Fix: add `"crates/platform"` to `CRATES`; add the `&mut self` pattern
+Fix: add `"crates/platform/platform"` to `CRATES`; add the `&mut self` pattern
 or a targeted check; add a Linux CI job that runs
 `scripts/check-stateless.sh` and `cargo check -p platform -p app
 --all-targets`.
 
 ## 6. `resumed` is not re-delivered on re-resume — Medium
 
-`crates/platform/src/linux.rs:117-120` returns early whenever the
+`crates/platform/platform/src/linux.rs:117-120` returns early whenever the
 window already exists, so `EventHandler::resumed` is never called a second
 time. That contradicts the trait contract at
-`crates/platform/src/lib.rs:111-115` ("On platforms with a
+`crates/platform/platform/src/lib.rs:111-115` ("On platforms with a
 suspend/resume lifecycle this may be called again after a resume; the
 handler must be idempotent"). On Android the second `resumed` is exactly
 when a higher layer must recreate its surface.
@@ -174,8 +174,8 @@ requirement; or, if re-delivery is not intended, narrow the trait doc.
 Three unit/lifecycle inconsistencies around the same boundary:
 
 * `PlatformConfig.size` is documented "in pixels"
-  (`crates/platform/src/lib.rs:78-79`) but is passed to
-  `LogicalSize` (`crates/platform/src/linux.rs:123-126`), so on a
+  (`crates/platform/platform/src/lib.rs:78-79`) but is passed to
+  `LogicalSize` (`crates/platform/platform/src/linux.rs:123-126`), so on a
   HiDPI display the created window is `size * scale` physical pixels.
 * `DesktopApp::resumed` creates the host at `surface_size: DEFAULT_SIZE`
   (`crates/app/src/main.rs:216`), not at the window's actual physical
@@ -195,7 +195,7 @@ the render backend is expected to self-resize.
 ## 8. Unvalidated `Ticker`/`PlatformConfig` input — Medium
 
 `Ticker::poll` sets `self.next = now + self.interval`
-(`crates/platform/src/clock.rs:79-84`). For a pathological
+(`crates/platform/platform/src/clock.rs:79-84`). For a pathological
 `PlatformConfig::frame_interval` this panics on `Instant` overflow, and
 `frame_interval = Duration::ZERO` makes `about_to_wait` request a redraw on
 every wake (busy loop). `PlatformConfig` has public fields
@@ -212,7 +212,7 @@ freezes.
 
 The Vulkan surface must be destroyed while the window's display connection
 is still alive. That ordering is provided only by the field declaration
-order of `AppLoop` — `handler` (`crates/platform/src/linux.rs:85-88`)
+order of `AppLoop` — `handler` (`crates/platform/platform/src/linux.rs:85-88`)
 is declared before `window`, so it drops first. The explanatory comment is
 on `DesktopApp` (`crates/app/src/main.rs:189-195`), which owns no
 window and whose field order (`backend`, `host`) is irrelevant; a future
@@ -224,27 +224,27 @@ before the window. Correct or remove the `DesktopApp` comment.
 
 ## 10. Test coverage and minor idioms — Low
 
-* Tests cover only value equality (`crates/platform/tests/events.rs`)
+* Tests cover only value equality (`crates/platform/platform/tests/events.rs`)
   and the `Ticker`/`Clock` happy path (`tests/clock.rs`). There is no test
   for `headless_window_handle`, the `Ticker` boundaries (exact deadline,
   zero/huge interval), or the feature-selection guard; the event loop itself
   is untestable as written (winit is hard-wired in `AppLoop`). Consider
   extracting the `Ticker`-driven decision (`poll` + `request_redraw`) so the
   lifecycle can be unit-tested.
-* `crates/platform/src/linux.rs:222` clones the owned `Ime::Commit`
+* `crates/platform/platform/src/linux.rs:222` clones the owned `Ime::Commit`
   text (`text.clone()`); because `window_event` already owns `event`,
   `map_input` could take it by value and avoid the allocation.
 * `crates/app/src/lib.rs:255` uses `frame_index.wrapping_add(1)`,
   masking an overflow that `saturating_add` (or no wrapping) would surface.
-* `crates/platform/src/linux.rs:153-157` discards the handler's
+* `crates/platform/platform/src/linux.rs:153-157` discards the handler's
   `Flow` on `CloseRequested`; a handler cannot veto/confirm close. Fine if
   intended, but the API otherwise advertises veto via `Flow`.
-* `crates/platform/src/linux.rs:260-265` casts winit `KeyCode` to
+* `crates/platform/platform/src/linux.rs:260-265` casts winit `KeyCode` to
   `u32`; the discriminant is not a stable key identifier across winit
   releases and can collide with `NativeKeyCode` values (`:268-278`), which
   L3 must map to TJS key codes. If L3 needs a stable id, define an explicit
   mapping enum in L1 instead of relying on the cast.
-* `crates/platform/src/lib.rs:68-70`: `PlatformError::Unsupported`
+* `crates/platform/platform/src/lib.rs:68-70`: `PlatformError::Unsupported`
   says "platform backend not compiled in" but the Android stub uses it to
   mean "host not implemented yet"; the message will mislead the CLI user.
 

@@ -61,22 +61,22 @@ decode, text layout, the WGSL blend material (WebGL2-compatible, §9).
 ## 2. Workspace layout and dependencies
 
 Workspace `Cargo.toml`:
-- Members: 19 crates (`Cargo.toml:3`); `default-members = ["crates/render", "crates/app"]`
+- Members: 19 crates (`Cargo.toml:3`); `default-members = ["crates/platform/render", "crates/app"]`
   (`Cargo.toml:4`).
 - Release profile uses thin LTO + `codegen-units = 1` (`Cargo.toml:12-15`) —
   irrelevant to cross-compilation, but note `lto` interacts with `opusic-sys`'s
   cmake LTO handling (see §6).
 
 Bevy:
-- `crates/render/Cargo.toml:16` → `bevy = "0.19"` with **default features**
+- `crates/platform/render/Cargo.toml:16` → `bevy = "0.19"` with **default features**
   (no `default-features = false`).
 - Bevy 0.19.1 defaults are `default = ["2d", "3d", "ui", "audio"]`
   (`bevy 0.19.1` manifest, `[features]`). `default_platform` includes
   `multi_threaded`, `bevy_winit`, `bevy_gilrs`, `webgl2`, `x11`, `wayland`,
   `sysinfo_plugin`, `default_font` (same manifest). So the current app pulls
   Winit, the render stack, and Bevy audio/rodio.
-- `crates/render/Cargo.toml` also declares `crates/render/src/main.rs` as the
-  `krkr-rs` bin and exports a `render` lib (`crates/render/src/lib.rs`).
+- `crates/platform/render/Cargo.toml` also declares `crates/platform/render/src/main.rs` as the
+  `krkr-rs` bin and exports a `render` lib (`crates/platform/render/src/lib.rs`).
 
 Crates that are hard to cross-compile (contain or depend on native code):
 - `crates/tjs` — C++ TJS2 VM + libonig (§3).
@@ -341,7 +341,7 @@ Cross-compile needs:
 ## 8. Entrypoints and build tooling
 
 Current entrypoints:
-- Native binary: `crates/render/src/main.rs` (`fn main`, windowed `App` via
+- Native binary: `crates/platform/render/src/main.rs` (`fn main`, windowed `App` via
   `DefaultPlugins` at `:129-176`, or `MinimalPlugins` headless at
   `:178-198`). CLI-only headless tool: `crates/app/src/main.rs`
   (`krkr-cli`); the graphical runner's `krkr-rs run <game> --headless` is the
@@ -467,13 +467,13 @@ Failed:
 Ordered so that each step is independently testable. Files/crates to touch are
 named, with why.
 
-1. **Trim Bevy features** (`crates/render/Cargo.toml:16`). Pick an explicit 2D
+1. **Trim Bevy features** (`crates/platform/render/Cargo.toml:16`). Pick an explicit 2D
    feature set (`default-features = false`, keep `bevy_winit`, `bevy_render`,
    `bevy_sprite`, `bevy_asset`, `bevy_audio`/audio format features, `png`, and
    the Android activity feature). Why: drop `3d`, `ui`, `bevy_gilrs`,
    `sysinfo_plugin`, desktop-only `x11`/`wayland`, and reduce the dependency
    surface before touching the VM/audio. Effort S.
-2. **Add an Android entrypoint** (new `crates/render/src/main.rs` branch or a
+2. **Add an Android entrypoint** (new `crates/platform/render/src/main.rs` branch or a
    new `src/bin/android.rs`/`src/android.rs`). Use `#[cfg(target_os =
    "android")]` + a `android_main` (or Bevy's GameActivity plugin) that builds
    the same `App` as `game_app` (`render/src/main.rs:129-176`). Replace
@@ -512,7 +512,7 @@ named, with why.
 
 ## 12. Prioritized task list — wasm32 ("runs in a browser")
 
-1. **Scaffold the web target** (`crates/render`): add a `#[wasm_bindgen(start)]`
+1. **Scaffold the web target** (`crates/platform/render`): add a `#[wasm_bindgen(start)]`
    lib entry that builds the same `App` as `game_app`; add `index.html` and a
    bundler config (Trunk or wasm-pack); install `wasm-bindgen-cli` matching the
    crate version. Keep the native `main.rs` behind `#[cfg(not(target_arch =

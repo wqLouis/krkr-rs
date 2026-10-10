@@ -1,6 +1,6 @@
 # Core layer code review — `api`, `fs`, `media`
 
-Scope: `crates/api/`, `crates/fs/`, `crates/media/`.
+Scope: `crates/platform/api/`, `crates/platform/fs/`, `crates/platform/media/`.
 Read against `docs/migration/02-target-architecture.md` (D9/D10, layer/system
 boundaries) and `docs/migration/03-middle-layer-api.md` (the contract), plus
 `05-media-engine.md` and `06-file-system.md`.
@@ -31,8 +31,8 @@ consistency/dependency issues.
 The contract consistently spells constructors `create_*(config)`
 (`03-middle-layer-api.md:79`, `:289`, `:316`), and the crates do provide them:
 
-- `fs`: `create_file_system(config)` (`crates/fs/src/lib.rs:159`)
-- `media`: `create_media(config)` (`crates/media/src/lib.rs:97`)
+- `fs`: `create_file_system(config)` (`crates/platform/fs/src/lib.rs:159`)
+- `media`: `create_media(config)` (`crates/platform/media/src/lib.rs:97`)
 
 but each crate also exposes a second, non-contract constructor style:
 `FileSystem::host`/`memory`/`from_config` (`lib.rs:92`, `:102`, `:111`) and
@@ -53,14 +53,14 @@ throughout, or methods throughout — not a mix.
 `media` is cleanly split (`audio`, `image_decode`, `tlg`, `video`,
 `yuv`), matching `05-media-engine.md §2`. `fs` is a single 931-line
 `lib.rs` that mixes the public surface, both backend internals, the in-memory
-store, and platform `#[cfg]` shims (`crates/fs/src/lib.rs:1-931`). This is
+store, and platform `#[cfg]` shims (`crates/platform/fs/src/lib.rs:1-931`). This is
 the largest single file in the reviewed set and the least navigable. Split it
 into `lib.rs` + `host.rs` + `memory.rs` (or `backend/{host,memory}.rs`) as the
 media crate does. Not functional, but it will matter as the surface grows.
 
 ### 1.3 Error types — Medium/Low
 
-Good: every domain error lives in one place, `crates/api/src/error.rs`,
+Good: every domain error lives in one place, `crates/platform/api/src/error.rs`,
 uses `thiserror`, and derives `Clone, Debug, PartialEq, Eq`. Errors carry
 owned, backend-agnostic strings, matching `03-middle-layer-api.md §0.3(8)`.
 
@@ -106,12 +106,12 @@ greps krkr-core for forbidden constructs" acceptance check
 
 Unused dependencies are declared in `Cargo.toml`:
 
-- `crates/fs/Cargo.toml:10` `thiserror` — never referenced in `src/`
+- `crates/platform/fs/Cargo.toml:10` `thiserror` — never referenced in `src/`
   (errors are defined in `api`).
-- `crates/fs/Cargo.toml:11` `log` — never referenced in `src/`.
-- `crates/media/Cargo.toml:10` `thiserror` — never referenced in `src/`.
-- `crates/media/Cargo.toml:12` `flate2` — never referenced in `src/`
-  (`grep flate2 crates/media/src` returns nothing).
+- `crates/platform/fs/Cargo.toml:11` `log` — never referenced in `src/`.
+- `crates/platform/media/Cargo.toml:10` `thiserror` — never referenced in `src/`.
+- `crates/platform/media/Cargo.toml:12` `flate2` — never referenced in `src/`
+  (`grep flate2 crates/platform/media/src` returns nothing).
 
 `media` also pulls `symphonia` twice in the tree: `media` requests
 `0.6` (`Cargo.toml:13`) while `rodio` (via the legacy `tvp-sound`) still pulls
@@ -180,15 +180,15 @@ it when a backend needs it.
 No `unwrap()` on user data. The three occurrences are provably guarded, but
 library code should still avoid the panic-shaped forms:
 
-- `crates/media/src/tlg.rs:176` — `try_into().unwrap()` on a slice that
+- `crates/platform/media/src/tlg.rs:176` — `try_into().unwrap()` on a slice that
   `bytes.get(off..off + 4)` already proved is 4 bytes. Fine logically, but the
   `.get(...).ok_or(...)?` immediately above can carry the exact-size guarantee:
   use `let b: [u8; 4] = bytes[off..off + 4].try_into().map_err(|_| "unexpected end of data")?;`
   or `.expect("4-byte slice")`.
-- `crates/fs/src/lib.rs:450` — `guard.files.remove(&src).expect("checked file exists")`.
+- `crates/platform/fs/src/lib.rs:450` — `guard.files.remove(&src).expect("checked file exists")`.
   Replace with `if let Some(bytes) = guard.files.remove(&src)` to remove the
   panic entirely.
-- `crates/media/src/tlg.rs:572` — `unreachable!()` in `color_filter` is
+- `crates/platform/media/src/tlg.rs:572` — `unreachable!()` in `color_filter` is
   guarded by the `code >= 16` check at `:504`, so it is correct; a `debug_assert!`
   plus a defined fallback would be more defensive, but this is acceptable.
 
@@ -221,35 +221,35 @@ Narrowing/truncating casts that are actual bugs or need checking:
 
 ### 2.3 Unnecessary clones / allocations — Medium
 
-- `crates/fs/src/lib.rs:405` — `copy` clones the whole file payload
+- `crates/platform/fs/src/lib.rs:405` — `copy` clones the whole file payload
   (`guard.files.get(&src).cloned()`) then inserts it. Use
   `if let Some(bytes) = guard.files.remove(&src) { ... insert(dst, bytes) }`
   (check `src == dst` / `dst` dir first, then move). For a multi-MB copy this
   doubles peak memory and a full memcpy for no reason.
-- `crates/media/src/audio.rs:284` and `:312` — `probe_audio`/`decode_audio`
+- `crates/platform/media/src/audio.rs:284` and `:312` — `probe_audio`/`decode_audio`
   do `Arc::from(bytes)`, which **copies the entire compressed buffer** into a
   new allocation, contradicting the module doc "the caller's buffer is shared
   by refcount so multi-MB entries are never copied" (`audio.rs:176-178`).
   `open_setup` only needs a `MediaSourceStream`; it can take `&[u8]` and build
   `Cursor::new(bytes)` directly (the `Arc` is only needed by the streaming
   state for reseeks).
-- `crates/media/src/image_decode.rs:47` — `hint.to_ascii_lowercase()`
+- `crates/platform/media/src/image_decode.rs:47` — `hint.to_ascii_lowercase()`
   allocates a `String` per probe/decode call. Use `eq_ignore_ascii_case` /
   `ends_with` on a lowercased comparison, or at minimum `make_ascii_lowercase`
   on a stack `[u8; N]`.
-- `crates/media/src/image_decode.rs:57` and `audio.rs:150` — the identical
+- `crates/platform/media/src/image_decode.rs:57` and `audio.rs:150` — the identical
   `extension_of` helper allocates a `String` each call and is duplicated
   verbatim across modules. Move one copy to a shared private module and return
   `Option<&str>` where possible.
-- `crates/media/src/lib.rs:117-131` — `capabilities()` allocates three
+- `crates/platform/media/src/lib.rs:117-131` — `capabilities()` allocates three
   `Vec<String>` every call from `&'static [&'static str]` tables. Either return
   `Vec<&'static str>` (change the DTO) or have L2 cache the report; it is a
   cold call, but the allocation is pure waste.
-- `crates/media/src/audio.rs:165-167` — `is_opus` scans the *entire*
+- `crates/platform/media/src/audio.rs:165-167` — `is_opus` scans the *entire*
   buffer with `bytes.windows(8).any(...)`. Ogg `OpusHead` lives in the first
   Ogg page; scan only the first ~1 KiB (or the first page), both for speed and
   to avoid false positives on payload that happens to contain the string.
-- `crates/media/src/audio.rs:369` — `let name = display_name(...).to_string();`
+- `crates/platform/media/src/audio.rs:369` — `let name = display_name(...).to_string();`
   per `decode_next_packet` call allocates a `String` in the decode loop; only
   needed on the error path, so format lazily.
 
@@ -327,7 +327,7 @@ No action.
 ### 4.1 Integer overflow / truncation
 
 **Critical — `write_at` unbounded/overflowing allocation (in-memory backend)**
-`crates/fs/src/lib.rs:538-568`:
+`crates/platform/fs/src/lib.rs:538-568`:
 
 ```rust
 let start = offset as usize;
@@ -353,7 +353,7 @@ enormous zero fill). Note this also means the memory backend cannot emulate a
 sparse file the way the host backend can.
 
 **High — TLG5 `blockheight` unchecked**
-`crates/media/src/tlg.rs:206-219`:
+`crates/platform/media/src/tlg.rs:206-219`:
 
 ```rust
 let blockheight = read_i32(raw, 20)? as usize;
@@ -372,14 +372,14 @@ require `blockheight != 0 && blockheight <= height` (then
 `blockheight * width <= MAX_PIXEL_BYTES / 4` is already guaranteed).
 
 **High — TLG6 `ft_size` unchecked**
-`crates/media/src/tlg.rs:321-327`: `read_i32(raw, pos)? as usize`
+`crates/platform/media/src/tlg.rs:321-327`: `read_i32(raw, pos)? as usize`
 followed by `raw.get(pos..pos + ft_size)`. A negative `ft_size` becomes huge
 and `pos + ft_size` overflows (panic), and a large positive one drives
 `Vec::with_capacity(x_block_count * y_block_count)` at `:330` only after the
 slice check; still, use `usize::try_from` and `checked_add`.
 
 **Medium — `seek` wraps past `u64::MAX`**
-`crates/fs/src/lib.rs:624-636`: `target` is computed in `i128` and the
+`crates/platform/fs/src/lib.rs:624-636`: `target` is computed in `i128` and the
 negative case is checked, but `target as u64` silently wraps if
 `file_size + off` exceeds `u64::MAX` (e.g. `SeekFrom::End(i64::MAX)` on a large
 file). Use `u64::try_from(target).map_err(...)`.
@@ -395,7 +395,7 @@ float→int casts saturate) — acceptable but worth an explicit bound.
 ### 4.2 Unbounded allocations from untrusted sizes
 
 **High — image decode relies solely on `image`'s default cap; config flag is dead**
-`crates/media/src/image_decode.rs:210`, `:221` call
+`crates/platform/media/src/image_decode.rs:210`, `:221` call
 `image::load_from_memory_with_format`, and `:173` builds an `ImageReader`
 without setting `Limits`. `MediaConfig::allow_large_images`
 (`media/src/lib.rs:58-63`) is documented as "reserved / ignored", and it
@@ -467,31 +467,31 @@ path; consider a max-pixels check or returning `Result`.
 
 ## 5. Top 10 recommended changes
 
-1. **Fix `write_at` (memory backend) offset handling** — `crates/fs/src/lib.rs:560-567`.
+1. **Fix `write_at` (memory backend) offset handling** — `crates/platform/fs/src/lib.rs:560-567`.
    `usize::try_from`, `checked_add`, and a size policy. Prevents a
    panic/abort and the 32-bit truncation write. *(Critical)*
-2. **Validate TLG5 `blockheight`** — `crates/media/src/tlg.rs:206-214`.
+2. **Validate TLG5 `blockheight`** — `crates/platform/media/src/tlg.rs:206-214`.
    Require `blockheight <= height`. *(High)*
 3. **Check TLG6 `ft_size` with `usize::try_from` + `checked_add`**
-   — `crates/media/src/tlg.rs:321-327`. *(High)*
+   — `crates/platform/media/src/tlg.rs:321-327`. *(High)*
 4. **Bound image decoding consistently and wire `allow_large_images`** —
-   `crates/media/src/image_decode.rs:173`, `:210`, `:221`; either
+   `crates/platform/media/src/image_decode.rs:173`, `:210`, `:221`; either
    implement the flag via `ImageReader::limits(...)` or delete it and declare
    the real cap. *(High)*
 5. **Remove the whole-buffer copies in `probe_audio`/`decode_audio`** and make
-   `open_setup` take `&[u8]` — `crates/media/src/audio.rs:183`, `:284`,
+   `open_setup` take `&[u8]` — `crates/platform/media/src/audio.rs:183`, `:284`,
    `:312`. *(Medium)*
-6. **Use `u64::try_from` for `seek`'s target** — `crates/fs/src/lib.rs:635`. *(Medium)*
+6. **Use `u64::try_from` for `seek`'s target** — `crates/platform/fs/src/lib.rs:635`. *(Medium)*
 7. **Remove unused dependencies** (`thiserror`, `log` in `fs`;
-   `thiserror`, `flate2` in `media`) — `crates/fs/Cargo.toml:10-11`,
-   `crates/media/Cargo.toml:10,12`. *(Medium)*
-8. **Move instead of clone in `copy`** — `crates/fs/src/lib.rs:405`. *(Medium)*
+   `thiserror`, `flate2` in `media`) — `crates/platform/fs/Cargo.toml:10-11`,
+   `crates/platform/media/Cargo.toml:10,12`. *(Medium)*
+8. **Move instead of clone in `copy`** — `crates/platform/fs/src/lib.rs:405`. *(Medium)*
 9. **Consistency pass:** `#[non_exhaustive]` on error/config enums, unify
    `MediaError::Decode.format` semantics, add `FsError::InvalidState`, and
    provide the promised host traits or note their deferral —
-   `crates/api/src/error.rs:12-232`, `crates/fs/src/lib.rs:63`,
-   `crates/media/src/lib.rs:58`, `crates/api/src/host.rs`. *(Medium)*
+   `crates/platform/api/src/error.rs:12-232`, `crates/platform/fs/src/lib.rs:63`,
+   `crates/platform/media/src/lib.rs:58`, `crates/platform/api/src/host.rs`. *(Medium)*
 10. **Deduplicate and de-allocate the hint/extension helpers, shrink the public
     TLG surface, and split `fs/src/lib.rs`** —
-    `crates/media/src/image_decode.rs:47,57`, `crates/media/src/audio.rs:150`,
-    `crates/media/src/lib.rs:41`, `crates/fs/src/lib.rs`. *(Low–Medium)*
+    `crates/platform/media/src/image_decode.rs:47,57`, `crates/platform/media/src/audio.rs:150`,
+    `crates/platform/media/src/lib.rs:41`, `crates/platform/fs/src/lib.rs`. *(Low–Medium)*

@@ -753,7 +753,7 @@ equivalent to porting/running the whole engine under Wine.
 | wuvorbis decoder call pattern | `reference/cpp/core/sound/VorbisWaveDecoder.cpp:32,217,221` |
 | krkr-rs current plugin handling | `crates/tvp-natives/src/plugins.rs:62-140`; `plugin_stubs.rs:1-25`; `crates/tvp-storages/src/csv_parser.rs`; `crates/tvp-kagparser/src/lib.rs`; `crates/tvp-visual/src/natives/gdiplus.rs`; `crates/tvp-visual/src/natives/window.rs` |
 | TJS2 VM build | `crates/tjs/build.rs` |
-| Bevy 0.19 | `crates/render/Cargo.toml` |
+| Bevy 0.19 | `crates/platform/render/Cargo.toml` |
 | zig cross-compiles i386 PE | §1.1 and §5.5 command output |
 | wine/Rust-target absent | §1.1 environment |
 

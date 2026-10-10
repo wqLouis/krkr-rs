@@ -29,7 +29,7 @@ must be validated on a device.
 | Our API | AAudio |
 |---|---|
 | `AudioDevice::open(spec)` | `AAudio_createStreamBuilder` → set direction/sample-rate/channel-count/format/sharing-mode/performance-mode/buffer-capacity → `AAudioStreamBuilder_openStream` → `AAudioStreamBuilder_delete`. Store the `AAudioStream` in `AudioOutputState`. |
-| `AudioOutputState` queue | A callback (`AAudioStream_dataCallback`, `AAudioStreamBuilder_setDataCallback`) drains an `Arc<Mutex<VecDeque<f32>>>` held by the state; the callback writes into `audioData`. Use `AAUDIO_PERFORMANCE_MODE_LOW_LATENCY`. |
+| `AudioOutputState` queue | An `AudioQueue` held by the state — the same buffer policy as the Linux backend (150 ms pre-fill gate before playback starts, 2 s cap dropping oldest-first, per-channel zero-order hold on underrun) — and the `AAudioStream_dataCallback` drains it into `audioData`. Use `AAUDIO_PERFORMANCE_MODE_LOW_LATENCY`. |
 | `AudioDevice::write(state, pcm)` | Push to the queue (preferred, callback-driven) or `AAudioStream_write` for a blocking/non-blocking push. |
 | `AudioDevice::stop` | `AAudioStream_requestStop` → `AAudioStream_close`. |
 | `AudioDevice::is_running` | Track in the state; AAudio state transitions are async and use `AAudioStream_waitForStateChange`. |

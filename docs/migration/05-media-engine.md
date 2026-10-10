@@ -190,7 +190,7 @@ render list is built.
 | JNI for decode | n/a | none (libmediandk) |
 
 Cargo features mirror the current `ffmpeg` pass-through
-(`crates/render/Cargo.toml`, `crates/app/Cargo.toml`,
+(`crates/platform/render/Cargo.toml`, `crates/app/Cargo.toml`,
 `crates/tvp-natives/Cargo.toml`): the media engine's `ffmpeg` feature is
 enabled for desktop and off on Android, where `mediacodec` is enabled
 instead.

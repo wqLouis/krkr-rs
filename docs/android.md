@@ -102,7 +102,7 @@ crates/android/                   Rust cdylib (package `krkr-android`)
   src/lib.rs                      #[bevy_main] android_main; reads the game
                                   dir from the Activity (JNI/intent extras),
                                   builds the Bevy app from `render`
-crates/render/                    shared app assembly (refactored so the
+crates/platform/render/                    shared app assembly (refactored so the
                                   desktop bin and the Android cdylib build the
                                   same App)
 crates/tvp-natives/src/video/

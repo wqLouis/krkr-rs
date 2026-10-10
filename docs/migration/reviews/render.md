@@ -1,13 +1,13 @@
-# Render layer code review — `crates/render`
+# Render layer code review — `crates/platform/render`
 
-Scope: `crates/render/src/{lib,scene,state,texture,null,glyph}.rs` and
+Scope: `crates/platform/render/src/{lib,scene,state,texture,null,glyph}.rs` and
 `src/vulkan/{mod,device,swapchain,pipelines,texture,draw,shaders}.rs`.
 
 Read against the intended design:
 `docs/migration/04-renderer-vulkan.md` and `docs/migration/03-middle-layer-api.md`
 (§0 model, §2 render pipeline, §3 glyph), with cross-checks against the L2
 projection (`crates/engine/src/projection.rs`,
-`crates/app/src/lib.rs`) and `crates/api/src/{geometry,blend,error}.rs`.
+`crates/app/src/lib.rs`) and `crates/platform/api/src/{geometry,blend,error}.rs`.
 
 Method: source read-only. No `cargo`/build/test was run. Line references are
 `path:line` from the repository root.
@@ -53,7 +53,7 @@ synchronization.
 
 ### 1.1 The projection matrix flips the scene vertically — **High**
 
-`crates/render/src/vulkan/draw.rs:398-414`:
+`crates/platform/render/src/vulkan/draw.rs:398-414`:
 
 ```rust
 let b = -2.0 / extent.height.max(1) as f32;
@@ -84,7 +84,7 @@ this (there is no GPU test).
 
 ### 1.2 `begin_render_state` leaks the device/surface on late errors — **High**
 
-`crates/render/src/vulkan/mod.rs:257` (`create_frames(...)?`), `:259-271`
+`crates/platform/render/src/vulkan/mod.rs:257` (`create_frames(...)?`), `:259-271`
 (the `render_finished` collect), and `:274` (`create_upload_resources(...)?`)
 all early-return with `?` **after** the device, swapchain, pipelines and surface
 were created. Unlike the two cleanup blocks at `:195-205` and `:240-250`, these
@@ -393,46 +393,46 @@ item (with a test) rather than an implicit gap:
 
 ## 6. Top 10 recommended changes
 
-1. **Fix the vertical flip (and align the scissor).** `crates/render/src/vulkan/draw.rs:400` —
+1. **Fix the vertical flip (and align the scissor).** `crates/platform/render/src/vulkan/draw.rs:400` —
    use `b = 2.0 / height` and `-b·ty - 1` so world y-down maps to Vulkan NDC
    (`y=0` → `-1`); re-check `rect_to_scissor` at `:335`. Add a golden-image test.
-2. **Fix error-path leaks in `begin_with_display`.** `crates/render/src/vulkan/mod.rs:257`,
+2. **Fix error-path leaks in `begin_with_display`.** `crates/platform/render/src/vulkan/mod.rs:257`,
    `:259`, `:274` — guard `create_frames`, the `render_finished` collect, and
    `create_upload_resources` with an RAII teardown.
 3. **Reject mismatched `Surface`/`RenderState` and tie their lifetimes.**
-   `crates/render/src/vulkan/mod.rs:452` (render) and `:331` (resize) —
+   `crates/platform/render/src/vulkan/mod.rs:452` (render) and `:331` (resize) —
    compare against `vstate.surface`; give `Surface` ownership or a lifetime tie.
-4. **Make the acquired-image semaphore error-safe.** `crates/render/src/vulkan/mod.rs:494-516` —
+4. **Make the acquired-image semaphore error-safe.** `crates/platform/render/src/vulkan/mod.rs:494-516` —
    any failure after `acquire_next_image` must consume or recreate
    `image_available`.
 5. **Replace per-upload staging alloc + fence wait with a persistent ring /
-   batched uploads.** `crates/render/src/vulkan/texture.rs:225-340`.
+   batched uploads.** `crates/platform/render/src/vulkan/texture.rs:225-340`.
 6. **Recreate `render_finished` semaphores per swapchain generation.**
-   `crates/render/src/vulkan/mod.rs:922-939` — do not reuse semaphores that
+   `crates/platform/render/src/vulkan/mod.rs:922-939` — do not reuse semaphores that
    a `present` may have signalled.
-7. **Cache memory properties and use `1u32`.** `crates/render/src/vulkan/texture.rs:503-512`.
+7. **Cache memory properties and use `1u32`.** `crates/platform/render/src/vulkan/texture.rs:503-512`.
 8. **Stop cloning+sorting children every node every frame.**
-   `crates/render/src/vulkan/draw.rs:122` and `crates/render/src/null.rs:334` —
+   `crates/platform/render/src/vulkan/draw.rs:122` and `crates/platform/render/src/null.rs:334` —
    iterate borrowed and sort only when dirty/unsorted.
 9. **Narrow the public construction surface and honor or remove
-   `preferred_format`.** `crates/render/src/lib.rs:58`, `:89`, `:156`,
-   `:177`; `crates/render/src/vulkan/mod.rs:121`.
-10. **Fix the remaining partial-creation leaks.** `crates/render/src/vulkan/texture.rs:107`
+   `preferred_format`.** `crates/platform/render/src/lib.rs:58`, `:89`, `:156`,
+   `:177`; `crates/platform/render/src/vulkan/mod.rs:121`.
+10. **Fix the remaining partial-creation leaks.** `crates/platform/render/src/vulkan/texture.rs:107`
     (image after `find_memory_type`), `:243` (staging buffer after `map_memory`),
     `:362` (`create_staging_buffer`), and
-    `crates/render/src/vulkan/pipelines.rs:353` (`create_unit_quad`).
+    `crates/platform/render/src/vulkan/pipelines.rs:353` (`create_unit_quad`).
 
 ### Honourable mentions
 
 - Make `GpuCapabilities` truthful across backends
-  (`crates/render/src/null.rs:69-70` vs
-  `crates/render/src/vulkan/mod.rs:142-144`).
+  (`crates/platform/render/src/null.rs:69-70` vs
+  `crates/platform/render/src/vulkan/mod.rs:142-144`).
 - Add `#[non_exhaustive]` to `PipelineConfig`/`GpuCapabilities`/`BackendKind`
-  (`crates/render/src/lib.rs:66`, `:83`, `:119`) and
+  (`crates/platform/render/src/lib.rs:66`, `:83`, `:119`) and
   `#![deny(unsafe_op_in_unsafe_fn)]` + `clippy::undocumented_unsafe_blocks`.
 - Replace the pointer-identity `Texture` key with a monotonic id
-  (`crates/render/src/texture.rs:130-134`).
+  (`crates/platform/render/src/texture.rs:130-134`).
 - Route all Vulkan failures through `device::result_error`
-  (`crates/render/src/vulkan/device.rs:305`).
+  (`crates/platform/render/src/vulkan/device.rs:305`).
 - Add the compile-time push-constant size assertion
-  (`crates/render/src/vulkan/draw.rs:23`).
+  (`crates/platform/render/src/vulkan/draw.rs:23`).

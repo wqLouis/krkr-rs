@@ -11,7 +11,7 @@ move in `02-target-architecture.md`.
 
 ## 1. Workspace at a glance
 
-20 workspace members (`Cargo.toml:3`), `default-members = ["crates/render",
+20 workspace members (`Cargo.toml:3`), `default-members = ["crates/platform/render",
 "crates/app"]` (`Cargo.toml:4`). Approximate size (LOC in `src/`):
 
 | crate | role | LOC | Bevy? |
@@ -37,7 +37,7 @@ move in `02-target-architecture.md`.
 | `app` | `krkr-cli` binary (headless/CLI) | 0.2k | no |
 
 **Bevy is confined to two crates**: `render` (`bevy = "0.19"` with default
-features, `crates/render/Cargo.toml`) and `android` (`bevy` with
+features, `crates/platform/render/Cargo.toml`) and `android` (`bevy` with
 `android-game-activity`, `crates/android/Cargo.toml`). This is the good news
 for migration: the semantic crates are already engine-agnostic.
 
@@ -91,7 +91,7 @@ Key execution facts:
 
 ## 3. Where Bevy is actually used
 
-By subsystem (all in `crates/render` unless noted):
+By subsystem (all in `crates/platform/render` unless noted):
 
 | Subsystem | Bevy surface | Representative files |
 |-----------|--------------|----------------------|

@@ -310,7 +310,7 @@ Attach/allocate a bitmap exactly like `Layer.drawText` already does
    (`layer.rs:1752-1768`) and add real handlers to the `methods` vec next to
    `drawText` (`layer.rs:1907`).
 
-Why not a vector-shape list rendered by `crates/render/src/sync.rs`:
+Why not a vector-shape list rendered by `crates/platform/render/src/sync.rs`:
 
 * The renderer already uploads any dirty `BitmapState`
   (`render/src/sync.rs:98-140`, `:357-362`) and composites layers as sprites;
@@ -540,7 +540,7 @@ Ordered by user-visible value per unit of risk.
 | `crates/tvp-visual/src/natives/layer.rs` | real draw handlers, `ensure_layer_bitmap`, drop stubs (`:1752-1768`, `:1907`) |
 | `crates/tvp-visual/src/natives/raster.rs` | new CPU shape rasterizer |
 | `crates/tvp-visual/src/scene.rs` | none (BitmapState sufficient) |
-| `crates/render/src/sync.rs` | none (dirty-bitmap upload already works) |
+| `crates/platform/render/src/sync.rs` | none (dirty-bitmap upload already works) |
 
 ## Appendix B — existing code anchors
 
@@ -553,7 +553,7 @@ Ordered by user-visible value per unit of risk.
 * `crates/tvp-visual/src/natives/layer.rs:1767` `noop_stubs`.
 * `crates/tvp-visual/src/natives/layer.rs:1950` stub registration loop.
 * `crates/tvp-visual/src/scene.rs:90` `BitmapState` (`rgba`, `dirty`).
-* `crates/render/src/sync.rs:98` per-bitmap texture upload.
+* `crates/platform/render/src/sync.rs:98` per-bitmap texture upload.
 * `reference/cpp/plugins/layerex_draw/windows/LayerExDraw.cpp:422/767/778/1150/1204-1450`
   — Appearance + draw semantics.
 * `reference/cpp/plugins/layerex_draw/manual.tjs:686-826` — API signatures.

@@ -136,8 +136,8 @@ undocumented beside `binding.rs`.
 
 `crates/compat/src/event.rs:17` defines a fresh `pub enum PlatformEvent`
 (`KeyDown`/`PointerMove`/…), even though L1 already owns
-`platform::PlatformEvent` (`crates/platform/src/event.rs:13`) and
-`platform::InputEvent` (`crates/platform/src/input.rs:33`). Doc 02
+`platform::PlatformEvent` (`crates/platform/platform/src/event.rs:13`) and
+`platform::InputEvent` (`crates/platform/platform/src/input.rs:33`). Doc 02
 §3 and doc 08 §5 are explicit: the event loop/type is L1 and L3 only *maps*
 it. `VmHost::tick` (`crates/vm/src/host.rs:116-124`) consumes the L3
 type, and `vm` even depends on `platform` (`Cargo.toml:11`)

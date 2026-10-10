@@ -1,6 +1,6 @@
 # Native surface parity
 
-> **Generated** by `scripts/native_parity.py` on 2026-10-08 — do not edit by hand.
+> **Generated** by `scripts/native_parity.py` on 2026-10-10 — do not edit by hand.
 
 Machine-diff of the reference C++ native class surface (`reference/cpp/core/**/*.cpp`) against the native classes the Rust engine registers. A *missing* member exists in the reference but is not registered by Rust; an *extra* member is registered by Rust but has no reference counterpart (engine-internal helpers such as `id` and `nativeId` are expected here).
 
@@ -22,18 +22,18 @@ The checker exits non-zero when a missing member is **not** listed in `scripts/n
 | reference members | 636 |
 | matched | 636 |
 | **missing** | **0** |
-| extra (Rust only) | 8 |
+| extra (Rust only) | 0 |
 | coverage | **100.0%** |
 
 ## Per-class coverage
 
 | class | ref | rust | matched | missing | extra | coverage |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `Layer` | 149 | 151 | 149 | 0 | 2 | 100.0% |
-| `Bitmap` | 19 | 21 | 19 | 0 | 2 | 100.0% |
-| `Window` | 82 | 83 | 82 | 0 | 1 | 100.0% |
-| `Font` | 21 | 23 | 21 | 0 | 2 | 100.0% |
-| `Timer` | 5 | 6 | 5 | 0 | 1 | 100.0% |
+| `Layer` | 149 | 149 | 149 | 0 | 0 | 100.0% |
+| `Bitmap` | 19 | 19 | 19 | 0 | 0 | 100.0% |
+| `Window` | 82 | 82 | 82 | 0 | 0 | 100.0% |
+| `Font` | 21 | 21 | 21 | 0 | 0 | 100.0% |
+| `Timer` | 5 | 5 | 5 | 0 | 0 | 100.0% |
 | `System` | 49 | 49 | 49 | 0 | 0 | 100.0% |
 | `Debug` | 12 | 12 | 12 | 0 | 0 | 100.0% |
 | `Plugins` | 3 | 3 | 3 | 0 | 0 | 100.0% |
@@ -59,26 +59,7 @@ _None for tracked classes._
 
 Rust registrations with no reference counterpart; usually intentional engine internals.
 
-### `Layer` — 2 extra
-
-`id`, `nativeId`
-
-### `Bitmap` — 2 extra
-
-`id`, `nativeId`
-
-### `Window` — 1 extra
-
-`id`
-
-### `Font` — 2 extra
-
-`__bind`, `id`
-
-### `Timer` — 1 extra
-
-`id`
-
+_None for tracked classes._
 ## Reference classes not registered in Rust
 
 | class | reference members |
@@ -96,5 +77,3 @@ These builders have no native C++ counterpart in `reference/cpp/core` (TJS-level
 | --- | ---: | --- |
 | `SoundBuffer` | 0 | `crates/compat/src/natives/sound.rs#SoundBuffer` |
 | `SoundChannel` | 0 | `crates/compat/src/natives/sound.rs#SoundChannel` |
-| `ChainItemBase` | 0 | `crates/compat/src/natives/trans.rs` |
-| `Trans` | 0 | `crates/compat/src/natives/trans.rs` |

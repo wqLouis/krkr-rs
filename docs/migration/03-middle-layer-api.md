@@ -89,7 +89,7 @@ explicit `&mut` parameter. The state is a bottom-defined value
   immutable services, all state is local to the caller.
 
 The current codebase does the opposite: it hides engine state in
-process-global statics (`01-investigation.md §9`) and re-derives the tree
+process-global statics (`history/01-investigation.md §9`) and re-derives the tree
 into Bevy entities every frame.
 
 ---
@@ -480,11 +480,38 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn tick(&mut self, dt_ms: f32);   // mutate L2 state from scripts
+    /// The whole frame (D26): advance timers — invoking their stored
+    /// callbacks — mixer and video from `now`, run `hooks.before_render()`,
+    /// project, render. Public and *deterministic*: tests and headless runs
+    /// drive it directly with a virtual clock, so nothing sleeps.
+    pub fn frame(&mut self, now_ms: u64, hooks: &mut dyn GameFrame);
+    /// Sugar over `frame`: platform event pump + `SystemClock`.
+    pub fn run(&mut self, clock: impl Clock, hooks: &mut dyn GameFrame);
     pub fn render(&mut self);             // project tree, call pipeline.render
     pub fn install_natives(&self, vm: &Tjs2Engine);
 }
+
+/// Declared in L2, implemented by L3/L4, wired by the composition root.
+/// This is L2's only upward edge: it never names L3 or L4.
+pub trait GameFrame {
+    /// L4 `vm.tick` plus L3's KiriKiri event dispatch (async triggers,
+    /// continuous handlers).
+    fn before_render(&mut self);
+}
 ```
+
+The timer is the template for what L2 keeps (D27): no config struct, no mode
+enum, no fire list to hand upward —
+
+```rust
+create_interval(interval_ms, callback) -> TimerId
+set_interval(id, interval_ms)
+set_enabled(id, enabled)
+remove(id)
+```
+
+all state stays private to `Engine`, and the pump (`advance(now)`) is internal
+to `frame`.
 
 `Engine::render` is: sync dirty `scene` fields into `render_scene`, upload
 dirty bitmaps into `render_state`, then a single `render(pipeline, surface,

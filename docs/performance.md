@@ -138,7 +138,7 @@ rasterization dominates. Reverted to keep the diff minimal; not worth the risk.
 
 The brief lists `crates/tvp-visual/src/raster.rs`, but the code lives at
 `crates/tvp-visual/src/natives/raster.rs`, which is outside this pass's edit
-scope. Findings are reported in §4.1 instead. `crates/render/src/blend.rs`
+scope. Findings are reported in §4.1 instead. `crates/platform/render/src/blend.rs`
 was inspected and needed no change (§2).
 
 ---
@@ -172,13 +172,13 @@ was inspected and needed no change (§2).
 
 ### 4.2 Files owned by other agents (reported, not edited)
 
-5. **`crates/render/src/sync.rs` — RGBA clone on upload.** `upload_bitmap`
+5. **`crates/platform/render/src/sync.rs` — RGBA clone on upload.** `upload_bitmap`
    still does `bitmap.rgba.clone()` into `Image::new` on every dirty upload.
    Moving the buffer (`std::mem::take` + refill, or uploading a sub-rect and
    only re-copying the changed region) removes a full-screen memcpy on every
    `drawText`/raster/transition repaint. High value for `@update`/`@blackout`
    and dialogue redraws.
-6. **`crates/render/src/sync.rs` — `compose_layer` per-layer allocations.**
+6. **`crates/platform/render/src/sync.rs` — `compose_layer` per-layer allocations.**
    It allocates a `Vec` (ancestor chain) and a `HashSet` (cycle guard) for
    every layer on every mutating sync. Reuse scratch buffers held in
    `FrameBlendMaterials`, or bound ancestor depth with a fixed loop, to remove
@@ -198,7 +198,7 @@ was inspected and needed no change (§2).
    rebuilds a `fontdb::Database` and calls `load_system_fonts()` on first use
    (~200–270 ms once per process). Warm it on a worker at startup and/or cache
    the `fontdb::Database`; low effort, removes a first-text stall.
-10. **`crates/render/src/blend.rs` — warning lock (low priority).**
+10. **`crates/platform/render/src/blend.rs` — warning lock (low priority).**
     `warn_dst_dependent_once` uses a global `Mutex<HashSet>`. It is only
     reached for destination-dependent blend modes; if a game starts using
     them heavily, replace it with an `AtomicU32` bitmask keyed by mode so

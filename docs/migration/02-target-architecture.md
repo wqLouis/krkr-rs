@@ -160,18 +160,82 @@ platform event   →  L1 (winit / android-activity backend)
                  →  L4 VM       (dispatches to script handlers)
 ```
 
-Per frame:
+Per frame (D26 — **L2 owns it**):
 
 ```
-L1 tick  →  L4 VM frame body (timer_poll, sound_poll, video poll,
-            async_trigger_poll, continuous_handler_poll)
-         →  L3 → L2 (mutate engine state)
-         →  L2 projects the scene, calls L1 RenderPipeline::render
+L2 Engine::frame(now_ms)
+  ├─ advance timers   → invoke their registered callbacks (script dispatch)
+  ├─ advance mixer, video from the frame clock
+  ├─ GameFrame::before_render()  ← L4 vm.tick + L3 KiriKiri event dispatch
+  │                                (async triggers, continuous handlers)
+  ├─ project `scene` into L1 `RenderScene`
+  └─ call L1 RenderPipeline::render
 ```
 
 The composition root (the `krkr` binary, the Android `cdylib`) is trivial:
 it selects the L1 platform, constructs L2/L3/L4 and starts the loop. It
 contains **no platform logic** — only wiring.
+
+### Frame ownership (D26)
+
+L2 **is** the runtime: it owns the frame clock and the frame entry point.
+
+```rust
+impl Engine {
+    /// The whole frame. Public and *deterministic* — tests and headless runs
+    /// drive it directly with a virtual clock (no sleeps, no real time).
+    pub fn frame(&mut self, now_ms: u64, hooks: &mut dyn GameFrame);
+
+    /// Sugar over `frame`: platform event pump + `SystemClock` + render.
+    pub fn run(&mut self, clock: impl Clock, hooks: &mut dyn GameFrame);
+}
+
+/// Declared in L2, implemented by L3/L4, wired by the composition root.
+/// This is the only upward edge; L2 never names L3 or L4.
+pub trait GameFrame {
+    /// L4 `vm.tick` plus L3's KiriKiri event dispatch (async triggers,
+    /// continuous handlers).
+    fn before_render(&mut self);
+}
+```
+
+Consequences of owning it:
+
+* `TimerState::advance(now)` becomes **private** — time enters in exactly one
+  place, and the timer's public surface is `create_interval(interval_ms,
+  callback)` · `set_interval` · `set_enabled` · `remove` (D27).
+* L2 subsystems stop being *handed* time from above; nothing above L2 owns a
+  `dt`.
+* The mixer advances from the frame clock that `03-middle-layer-api.md` §5
+  already assumes L2 has.
+* **Re-entrancy:** callbacks mutate L2 state (they create layers, change
+  intervals), so a frame **collects due work first, then invokes** — the
+  advance is never re-entered mid-iteration.
+
+**Why L2 and not elsewhere.** L1 is stateless and a loop *is* state (time,
+frame count, ordering, pending work), so L1 is out. Putting the loop above L2
+leaves nobody responsible for `advance → project → render` — it degrades into a
+convention shared between two files, which is exactly how the drift below
+happened — and it keeps a second clock above L2, competing with the frame clock
+L2 already needs.
+
+### Implementation status: not built yet
+
+The code has no `Engine` object. `crates/engine` is a set of independent state
+structs; the clock lives in `app::GameHost::step(dt_ms, events)` (which returns
+a `StepReport`); `compat::run_frame_body` orchestrates
+`timer_poll → sound_poll → video_poll → … → project → render` and hands time to
+each subsystem. That is legal by the dependency rule (L3 → L2 → L1) but it is
+not D26.
+
+It drifted because the strangler migration (`07-roadmap.md` §1) built the frame
+around the first real per-frame requirement — the script event loop; D10 split
+"who projects" from "who renders" without naming an owner for that seam;
+`--frames N` and headless runs needed a deterministic `StepReport`, putting `now`
+in L4; and no lint guards frame ownership (`check-stateless.sh` covers D9, the
+parity scripts cover surface, Cargo covers dependency direction).
+
+**Schedule:** `07-roadmap.md` Phase 9.
 
 ## 4. Compile-time platform and backend selection
 
@@ -306,3 +370,115 @@ host in L1 and the VM on top.
 * A WASM plugin host in the first milestone (see doc 08 §; static plugins
   first).
 * Rewriting the C++ TJS2 VM.
+
+## 12. L2 API stability (merged from `13-l2-api-stability.md`)
+
+Goal: **freeze the `engine` (L2) public API** so we can optimise everything
+below it (L1: Vulkan batching, GPU glyph runs, advanced blends, hw video decode,
+XP3 caches, …) without ever touching L3 again. L1 changes must be invisible above
+the `engine` boundary.
+
+See [`02-target-architecture.md`](02-target-architecture.md) for the layer rules
+and [`07-roadmap.md`](07-roadmap.md) §9 for the
+optimisations this freeze is meant to protect.
+
+### 12.1. Dependency rule (what L3 may use)
+
+- **L3 (`compat`) may depend on `api`, `engine`, `platform` (event/DTO types
+  only) and `tjs`.** It must **not** call `render`, `media`, or `fs` directly —
+  those are L1 and reach the game only *through* `engine`. (Verified today:
+  `compat`'s non-dev deps are `api`, `engine`, `platform`, `tjs`, `thiserror`,
+  `log`, `flate2`, `encoding_rs`.)
+- **L1 changes must not change any `engine` type, signature, or documented
+  behaviour.** If an optimisation needs a new L2 concept, that is an *additive*
+  L2 change (§3), reviewed as such.
+
+### 12.2. Stability policy
+
+1. **Additive-only.** New functions/methods/variants are fine; removing or
+   changing an existing public item requires an explicit decision entry (a `Dxx`
+   in [`README.md`](README.md)).
+2. **`#[non_exhaustive]` on public enums and option/state structs**, so we can
+   add variants/fields later without a breaking change. (Most `engine` types
+   currently lack it — see §5.)
+3. **Explicit state, not methods on hidden globals** (D9). Public state values
+   implement `Default`/`new`; mutators take `&mut self`.
+4. **Typed errors** (D11). Each family owns one `#[non_exhaustive]` error enum
+   (`TextError`, `SoundError`, `TimerError`, `VideoError`, `TransError`, …); no
+   silent fallbacks, no hardcoded caps.
+5. **No raw pointers or `usize` addresses in the stable surface.** Opaque handle
+   newtypes, not `*mut`/`usize` (a TJS `buffer` property may *report* an address
+   as a number, but the L2 API must not be built on raw pointers).
+6. **No TVP-specific constants in L2.** `LT_*`, `TVP_*`, VK codes, `tTVP*` enums
+   are KiriKiri semantics = **L3**. L2 keeps only generic concepts (`BlendMode`,
+   generic flags). (Debt: `projection.rs` `LT_*`, `scene.rs` `LT_OPAQUE/ALPHA/…`,
+   `sound.rs` `TVP_*`.)
+7. **No cross-layer constants or vocabulary.** A layer owns its constants and
+   types; an **upper layer must not import a lower layer's constant or type**.
+   If an upper layer needs a value, it defines its own and the lower layer
+   abstracts the concept behind a generic API. A constant consumed by more than
+   one layer means the abstraction has leaked — fix the abstraction, not the
+   import. (Corollary: L2's `LT_*`/`TVP_*` are `pub(crate)` at most; L3 owns the
+   public TVP table. The one deliberate exception is the host-facing render
+   seam — `RenderScene`/`Texture` — which the composition root, not L3, uses.)
+7. **Docs on every public item** (`#![warn(missing_docs)]` is on); state
+   invariants and units (physical px vs logical, ms vs frames) are documented.
+
+### 12.3. The stable L2 surface (per module)
+
+| Module | Stable public surface | Notes |
+|---|---|---|
+| `scene` | `Scene` + its methods; `WindowState`, `LayerState`, `BitmapState`, `FontState`, `Rect` | The layer system. Fields are currently `pub`; they should become accessor-backed (§5). |
+| `projection` | `project_window`, `project_scene`, `ComposedLayer`, `compose_layer`, `resolve_blend` | The native `lt*` blend numbering lives in L3 (`natives/visual/layer/blend.rs`). |
+| `layer_ops` / `raster` | the pixel operations (`blit_*`, `fill_*`, `blur_*`, `affine_blit`, `fill_polygon`, …) | Pure transforms over `BitmapState`. `GammaAdjust` fields are public-by-design (a plain parameter block). |
+| `storage` | `Storage` + `mount_archives`/`mount_archive`/`find`/`read`/`stat`/`exists`/`get_file_list`/`add_auto_path`/`extract…`; `discover_startup` | The VFS namespace + TVP addressing. |
+| `startup` | `discover_startup` | |
+| `sound` | `Mixer`, `SoundSource`, `SoundChannel`, `SoundBuffer`, `LoopInfo`, `LoopFlags`, `SoundLabel`, `LoopLink`, `mix`/`mix_source` | Pure PCM state; L1 device consumes. The `.sli` parser and the TVP `0..100000` scale live in L3. |
+| `text` | `TextEngine`, `GlyphAtlas`, `TextLayout`, `PositionedGlyph`, `TextStyle`, `project_text`, `compose_text_cpu`, `TextError` | L1 raster/atlas swap must not change this. |
+| `input` | `InputState`, `ButtonState`, `KeyState`, `TouchContact` | Generic; no VK codes. |
+| `timer` | `TimerState`, `TimerId`, `TimerConfig`, `TimerMode`, `TimerFire`, `TimerError` | Generic firing; TVP dispatch mode stays L3. |
+| `video` | `VideoOverlay` + enums (`PlayStatus`, `VideoEvent`, `OverlayBinding`, `VideoBounds`, `PeriodReason`, `VideoError`) | Consumes frames from the caller; no codec dep. |
+| `trans` | `Trans`, `TransKind`, `TransStep`, `RuleMask`, `TransError` | Over `layer_ops`. |
+
+### 12.4. What the freeze protects
+
+The optimisations in `07-roadmap.md` §9 are all *below* this
+surface:
+
+- GPU glyph runs / MSDF → implemented in `render` + the L2 `text` internals; the
+  `text` API is unchanged.
+- `VK_EXT_blend_operation_advanced` → `render` blend selection; `BlendMode` and
+  `resolve_blend` are unchanged.
+- hw video decode / streaming `video_audio` → `media` + the L2 `video` internals;
+  `VideoOverlay` is unchanged.
+- coverage-cache/tint (done), layout cache (done) → `text` internals only.
+- XP3 decompress cache / mmap → `fs` + `engine::storage` internals; the `Storage`
+  API is unchanged.
+
+### 12.5. Known debt to stabilise (tracked)
+
+1. **Public state fields** on `WindowState`/`LayerState`/`BitmapState`
+   (`scene.rs`) — make private + accessors, or mark `#[non_exhaustive]` and treat
+   as read-mostly. L3 currently reads/writes some directly.
+2. **Raw `usize` handles**: `main_image_pixel_buffer*` / `province_image_pixel_buffer*`
+   return addresses for the TJS `buffer`/`bufferForWrite` properties. Either keep
+   them documented as *opaque addresses* (never dereferenced in Rust) or expose a
+   safe `with_*_pixels` only.
+3. **TVP constants in L2** (`LT_*` in `projection.rs`/`scene.rs`, `TVP_*` in
+   `sound.rs`) — move to L3 or wrap behind `compat` names.
+4. **`#[non_exhaustive]`** missing on ~all public enums/structs — add it so future
+   growth is additive.
+5. **Naming**: settle `SoundChannel` vs `Channel`, `VideoOverlay` methods vs the
+   reference `vo_*`, etc.
+
+### 12.6. Guard (decided: D21)
+
+Decision (D21): use option **(a) a checked-in `cargo public-api` snapshot** of
+`-p engine`. It is the cheapest and CI-friendly, and it freezes L2 so L1 can be
+optimized underneath.
+
+Options considered, in
+order of effort: (a) a checked-in `cargo public-api` snapshot of `-p engine`;
+(b) a nightly `rustdoc --output-format json` snapshot diff; (c) a
+`docs/migration/l2-api-snapshot.txt` regenerated by a script and diffed. Until
+then, this document is the contract and §5 is the debt list.

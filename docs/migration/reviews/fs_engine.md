@@ -2,7 +2,7 @@
 
 Scope:
 
-- `crates/fs/` — the stateless `FileSystem` / `FileState` service, the
+- `crates/platform/fs/` — the stateless `FileSystem` / `FileState` service, the
   host and in-memory backends, and the XP3 read+parse moved into L1.
 - `crates/engine/src/storage.rs` — the L2 storage namespace / VFS.
 - `crates/engine/src/startup.rs` — startup-script discovery.
@@ -50,7 +50,7 @@ still has a hardcoded chain cap and silently accepts structurally incomplete
 
 ### 1.1 `read_index` has a hardcoded `chain > 256` cap and no cycle detection — High
 
-`crates/fs/src/xp3.rs:299-305`
+`crates/platform/fs/src/xp3.rs:299-305`
 
 ```rust
 let mut chain = 0usize;
@@ -80,7 +80,7 @@ reference.
 
 ### 1.2 `parse_file_chunk` silently defaults missing required sub-chunks — High
 
-`crates/fs/src/xp3.rs:377-452`
+`crates/platform/fs/src/xp3.rs:377-452`
 
 `parse_file_chunk` initializes `flags/org_size/arc_size/raw_name/segments/
 file_hash` to defaults and only fills them when it happens to see the
@@ -131,7 +131,7 @@ error instead of returning `NoStartupScript`.
 
 ### 1.4 `read_entry` trusts `entry.org_size`; mismatch is only a `debug_assert` — Medium
 
-`crates/fs/src/xp3.rs:242-283`
+`crates/platform/fs/src/xp3.rs:242-283`
 
 `expected` is computed from the segment sizes (raw → `arc_size`, zlib →
 `org_size`) and `out.len()` is guaranteed to equal `expected`, but the code
@@ -183,7 +183,7 @@ than silently removing all matches.
 
 ### 1.7 `find_xp3_offset` only overlaps full-chunk reads — Medium
 
-`crates/fs/src/xp3.rs:542-566`
+`crates/platform/fs/src/xp3.rs:542-566`
 
 The 16-byte rewind that catches a magic straddling a read boundary runs only
 when `n == CHUNK` (`:561`). `read_at` on the host backend may legitimately
@@ -196,7 +196,7 @@ simple `Vec<u8>` carry buffer is clearer than seek arithmetic.
 
 ### 1.8 `Xp3Archive::open` erases non-EOF errors while reading the magic — Medium
 
-`crates/fs/src/xp3.rs:177-179`
+`crates/platform/fs/src/xp3.rs:177-179`
 
 ```rust
 reader
@@ -254,21 +254,21 @@ resolved location. Do not leave `exists` implying the reference semantics while
 
 ## 2. Smaller observations (not ranked)
 
-- `crates/fs/src/xp3.rs:352-373` and `:377-395`: the chunk loops stop on
+- `crates/platform/fs/src/xp3.rs:352-373` and `:377-395`: the chunk loops stop on
   `data.len().saturating_sub(pos) >= 12`, so trailing bytes (a truncated chunk
   header or payload) are silently dropped. The reference also stops searching,
   but D11 argues for a `CorruptIndex` when `pos != data.len()` after the loop.
-- `crates/fs/src/lib.rs:209-213`: `lock()` recovers from a poisoned mutex
+- `crates/platform/fs/src/lib.rs:209-213`: `lock()` recovers from a poisoned mutex
   and keeps using the `MemoryStore`. This is documented, but it can observe a
   half-applied mutation after a panic. A typed error (or `expect`) would be
   more honest for a test/wasm backend.
-- `crates/fs/src/xp3.rs:283` compared with `Storage::stat`
+- `crates/platform/fs/src/xp3.rs:283` compared with `Storage::stat`
   (`storage.rs:488`) is the only place the two size notions can diverge; see
   1.4.
 - Tests: there is no test for a chained (`INDEX_CONTINUE`) index, a `File`
   chunk missing `segm`/`info`/`aldr`, or an `org_size`/segment-sum mismatch —
   the exact cases behind 1.1, 1.2 and 1.4. The `xp3_builder` helper is also
-  duplicated verbatim in `crates/fs/tests/common/` and
+  duplicated verbatim in `crates/platform/fs/tests/common/` and
   `crates/engine/tests/common/`.
 - `docs/migration/06-file-system.md:44-52` still says the middle layer owns the
   archive containers (`xp3`), which contradicts the revised D6 in

@@ -1,8 +1,8 @@
 # L2 (`crates/engine`) public-API stability audit
 
 Audit of the `engine` (L2) public surface against
-[`../13-l2-api-stability.md`](../13-l2-api-stability.md) (§1 dependency rule,
-§2 stability policy, §3 stable surface, §5 debt).
+[`../02-target-architecture.md`](../02-target-architecture.md) §12
+(§12.1 dependency rule, §12.2 stability policy, §12.3 stable surface, §12.5 debt).
 
 * **Method**: read-only review of `crates/engine/src/*.rs`; `cargo check -p
   engine -p compat -p vm -p app` (passes; only pre-existing warnings). No
@@ -251,7 +251,7 @@ No L3/L4 source names an `engine` error type (`grep` over `crates/compat/src`,
 | Rectangle shape | `Rect{x,y,w,h}` scene.rs:256 vs `VideoBounds{left,top,width,height}` video.rs:116 |
 | Status type | `sound::Status` (unload/stop/play) sound.rs:645 vs `video::PlayStatus` (unload/stop/play/pause) video.rs:50 |
 | Channel type | `SoundChannel` sound.rs:687 (doc §5 debt: settle `SoundChannel` vs `Channel`) |
-| Input type collision | `engine::input::InputState` (engine) vs `api::host::InputState` (`crates/api/src/host.rs:123`); app imports the `api` one (`app/src/lib.rs:29`) |
+| Input type collision | `engine::input::InputState` (engine) vs `api::host::InputState` (`crates/platform/api/src/host.rs:123`); app imports the `api` one (`app/src/lib.rs:29`) |
 | Integer width for enum-coded fields | `LayerState::blend_type: i64` scene.rs:75 vs `hit_type/face/cursor/ime_mode: i32` scene.rs:109-154 |
 | Physical vs logical px | `InputState::pointer` "physical window pixels" input.rs:223; `WindowState::inner_size` "Game logical size in pixels" scene.rs:25; `touch_velocity` "physical pixels" input.rs:504; `Rect` "window coordinates" scene.rs:256 |
 
