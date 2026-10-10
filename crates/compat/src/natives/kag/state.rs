@@ -55,17 +55,27 @@ pub enum EvalResult {
     Integer(i64),
     Real(f64),
     Str(String),
+    /// An object result. The object reference itself does not cross the
+    /// [`Environ`] boundary, so the eval hook carries the string form derived
+    /// from the already-evaluated object (`TJSObjectToString`) and the
+    /// reference `operator bool` (`Object != nullptr`, so TJS `null` is
+    /// false).
+    Object {
+        text: String,
+        truthy: bool,
+    },
 }
 
 impl EvalResult {
     /// TJS `operator bool` semantics: void → false, numbers → non-zero,
-    /// strings → non-empty.
+    /// strings → non-empty, objects → not null.
     pub fn truthy(&self) -> bool {
         match self {
             EvalResult::Void => false,
             EvalResult::Integer(i) => *i != 0,
             EvalResult::Real(r) => *r != 0.0,
             EvalResult::Str(s) => !s.is_empty(),
+            EvalResult::Object { truthy, .. } => *truthy,
         }
     }
 
@@ -77,6 +87,7 @@ impl EvalResult {
             EvalResult::Integer(i) => Some(i.to_string()),
             EvalResult::Real(r) => Some(format_real(*r)),
             EvalResult::Str(s) => Some(s.clone()),
+            EvalResult::Object { text, .. } => Some(text.clone()),
         }
     }
 }

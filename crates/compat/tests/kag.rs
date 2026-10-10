@@ -1335,3 +1335,51 @@ fn native_object_valued_exp_is_truthy() {
     // (`reference/cpp/core/base/KAGParser.cpp:2168-2171`).
     assert_eq!(value, TjsValue::String("A".to_string()));
 }
+
+#[test]
+fn native_object_valued_exp_is_evaluated_once() {
+    let _lock = common::vm_lock();
+    let env = common::Env::with_storage();
+    // The array literal has a side effect (it increments the global counter);
+    // a single evaluation must leave the counter at 1.
+    std::fs::write(
+        env.game_dir()
+            .expect("mounted game dir")
+            .join("scenario.ks"),
+        b"*start\n@if exp=\"[global.kagEvalCount = global.kagEvalCount + 1]\"\nA\n@endif\n",
+    )
+    .expect("write scenario.ks");
+
+    let value = env
+        .eval(
+            "(function(){ global.kagEvalCount = 0; var p = new KAGParser(); \
+             p.loadScenario('scenario.ks'); var out = ''; while (true) { \
+             var t = p.getNextTag(); if (!t) break; \
+             if (t.tagname == 'ch') out += t.text; } \
+             return out + '|' + global.kagEvalCount; })()",
+        )
+        .expect("script");
+    // Deriving the object's string form must not re-evaluate the expression
+    // that produced it (`reference/cpp/core/base/KAGParser.cpp:2138-2141`).
+    assert_eq!(value, TjsValue::String("A|1".to_string()));
+}
+
+#[test]
+fn eval_result_object_carries_truthiness_and_string_form() {
+    // `operator bool` is `Object != nullptr` and the string path uses
+    // `ToString` (`reference/cpp/core/base/KAGParser.cpp:2138-2141`,
+    // `:2168-2171`).
+    let truthy = EvalResult::Object {
+        text: "abc".to_owned(),
+        truthy: true,
+    };
+    assert!(truthy.truthy());
+    assert_eq!(truthy.to_string_repr().as_deref(), Some("abc"));
+
+    // TJS `null` is an object with `truthy == false`.
+    let null = EvalResult::Object {
+        text: "null".to_owned(),
+        truthy: false,
+    };
+    assert!(!null.truthy());
+}

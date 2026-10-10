@@ -118,38 +118,56 @@ struct KagEnv {
     label: Option<LabelClosure>,
 }
 
+/// A TJS closure that yields an object's string form (`'' + v`, the VM's
+/// `TJSObjectToString` path).
+const OBJECT_TO_STRING_SRC: &str = "(function(v){ return '' + v; })";
+
+/// The string form of an already-evaluated TJS object. The object is passed
+/// to a helper closure as a retained argument, so the expression that produced
+/// it is never evaluated a second time.
+fn object_to_string(engine: &Tjs2Engine, object: &DetachedValue) -> Result<String, String> {
+    let helper = match engine.eval_retained(OBJECT_TO_STRING_SRC, "KAGParser.to_string") {
+        Ok(RetainedValue::Object(helper)) => helper,
+        Ok(RetainedValue::Value(value)) => {
+            return Err(format!("KAGParser: object-to-string helper is {value:?}"));
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    let argument = engine.duplicate_retained(object.raw_id())?;
+    match engine.call_detached(&helper, &[TjsValue::Retained(argument.raw_id() as u64)]) {
+        Ok(TjsValue::String(text)) => Ok(text),
+        Ok(other) => Err(format!("KAGParser: object string form is {other:?}")),
+        Err(error) => Err(error),
+    }
+}
+
 impl KagEnv {
     fn new(engine: &'static Tjs2Engine, storage: Option<*mut Storage>, owner: *mut c_void) -> Self {
         let eval: EvalFn = Box::new(move |exp: &str| -> Result<EvalResult, String> {
-            match engine.eval(exp, "KAGParser") {
-                Ok(TjsValue::Void) => Ok(EvalResult::Void),
-                Ok(TjsValue::Integer(i)) => Ok(EvalResult::Integer(i)),
-                Ok(TjsValue::Real(r)) => Ok(EvalResult::Real(r)),
-                Ok(TjsValue::String(s)) => Ok(EvalResult::Str(s)),
-                Ok(TjsValue::Object) | Ok(TjsValue::Retained(_)) => {
-                    // The reference converts an object result with `ToString`
-                    // on the string path and `operator bool` (`Object !=
-                    // nullptr`) on the condition path
-                    // (`reference/cpp/core/base/KAGParser.cpp:2138-2141`,
-                    // `:2168-2171`). Retain the value the eval just produced
-                    // (the safe surface reports TJS `null` as `Object` too) so
-                    // the null case -- an object with no dispatch target -- can
-                    // be told apart from a real object.
-                    let object = engine
-                        .retain_value_detached(&TjsValue::Object)
-                        .map_err(|error| error.to_string())?;
-                    if engine.class_names(object.raw_id()).is_err() {
-                        return Ok(EvalResult::Void);
-                    }
-                    // Concatenating the object in the VM yields the
-                    // `TJSObjectToString` debug text the reference stores.
-                    match engine.eval(&format!("'' + ({exp})"), "KAGParser") {
-                        Ok(TjsValue::String(text)) => Ok(EvalResult::Str(text)),
-                        Ok(_) => Err("KAGParser: object result was not a string".to_string()),
-                        Err(error) => Err(error.to_string()),
-                    }
+            // Evaluate the expression exactly once; the object arm carries
+            // everything later consumers need, so a side effect cannot run
+            // twice.
+            let value = engine
+                .eval_retained(exp, "KAGParser")
+                .map_err(|error| error.to_string())?;
+            match value {
+                RetainedValue::Value(TjsValue::Void) => Ok(EvalResult::Void),
+                RetainedValue::Value(TjsValue::Integer(i)) => Ok(EvalResult::Integer(i)),
+                RetainedValue::Value(TjsValue::Real(r)) => Ok(EvalResult::Real(r)),
+                RetainedValue::Value(TjsValue::String(s)) => Ok(EvalResult::Str(s)),
+                RetainedValue::Value(TjsValue::Object | TjsValue::Retained(_)) => {
+                    Err("KAGParser: eval produced an unretained object".to_string())
                 }
-                Err(e) => Err(e.to_string()),
+                RetainedValue::Object(object) => {
+                    // An object is stringified on the string path and tested
+                    // with `operator bool` (`Object != nullptr`) on the
+                    // condition path. `class_names` fails for TJS `null` (an
+                    // object with no dispatch target), so it tells null apart
+                    // from a real object.
+                    let truthy = engine.class_names(object.raw_id()).is_ok();
+                    let text = object_to_string(engine, &object)?;
+                    Ok(EvalResult::Object { text, truthy })
+                }
             }
         });
         let load: LoadFn = Box::new(move |name: &str| {
