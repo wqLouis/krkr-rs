@@ -150,10 +150,22 @@ them by number** (§6); this section is for you to know them.
   docs. Keep `// SAFETY:`, non-obvious invariants, and reference citations
   **in tests**. Tests are exempt from the jargon rule.
 - **D32 — only the Android backend may be stubbed.** L3 has no stubs and no
-  approximations: every member either behaves like the reference or raises
-  because the reference raises. Android is the one backend no script can
-  observe. `#[allow(dead_code)]` is banned (one exception:
+  *script-observable* approximations: every member either behaves like the
+  reference or raises because the reference raises. Android is the one backend
+  no script can observe. `#[allow(dead_code)]` is banned (one exception:
   `crates/compat/tests/common/mod.rs`).
+- **D33 — L1 may change the `engine` signatures it names.** `engine` depends on
+  the L1 type crates (`api`, `fs`, `render`) and its public API may use their
+  types (`RenderScene`, `FileState`, `FontMetrics`, …). An L1 type change that
+  flows into an `engine` signature is accepted. The L2 surface is frozen by
+  review and audit, not by a snapshot (the `cargo public-api` guard is dropped).
+- **D34 — rendering picks the more efficient path when it looks near-identical;
+  script-observable semantics stay exactly reference.** Pixel rasterization
+  (hatch/gradient fills, GPU composition, transitions) may approximate
+  efficiently if the visible output is close. Every value a script can observe
+  — member getters/setters, return values, raised errors, `typeof`, string and
+  number conversions — must match `reference/cpp/**` exactly. This is the
+  boundary of D32's ban.
 
 ---
 
