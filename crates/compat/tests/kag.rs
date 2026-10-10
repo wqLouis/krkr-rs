@@ -878,7 +878,7 @@ fn records_and_expands_a_macro() {
     assert_eq!(ch_text(&tags), "Hi");
     assert!(
         state
-            .get_macros_entries()
+            .macros_entries()
             .iter()
             .any(|(name, _)| name == "greet")
     );
@@ -921,7 +921,7 @@ fn call_and_return_resume_after_the_call() {
     let mut eval = |_e: &str| Ok(EvalResult::Void);
     let tags = collect(&mut state, &mut eval);
     assert_eq!(ch_text(&tags), "BAC");
-    assert_eq!(state.get_call_stack_depth(), 0);
+    assert_eq!(state.call_stack_depth(), 0);
 }
 
 #[test]
@@ -949,9 +949,9 @@ fn store_and_restore_round_trip() {
         fire_label: None,
     };
     restored.restore(&saved, &mut env2).unwrap();
-    assert_eq!(restored.get_storage_name(), "t.ks");
-    assert_eq!(restored.get_cur_label(), "*start");
-    assert_eq!(restored.get_cur_line(), state.get_cur_line());
+    assert_eq!(restored.storage_name(), "t.ks");
+    assert_eq!(restored.cur_label(), "*start");
+    assert_eq!(restored.cur_line(), state.cur_line());
 }
 
 #[test]
@@ -963,8 +963,8 @@ fn clear_empties_the_scenario_but_keeps_properties() {
     let mut eval = |_e: &str| Ok(EvalResult::Void);
     let tags = collect(&mut state, &mut eval);
     assert!(tags.is_empty());
-    assert!(state.get_storage_name().is_empty());
-    assert!(state.get_ignore_cr());
+    assert!(state.storage_name().is_empty());
+    assert!(state.ignore_cr());
 }
 
 #[test]
@@ -976,6 +976,48 @@ fn emb_splices_an_evaluated_string() {
     let mut eval = |e: &str| eval_literal(e);
     let tags = collect(&mut state, &mut eval);
     assert_eq!(ch_text(&tags), "XY");
+}
+
+#[test]
+fn state_accessors_and_call_label() {
+    let mut state = KagParserState::default();
+    state
+        .load_scenario_text("t.ks", "*start\nA\n*sub\nB\n")
+        .unwrap();
+    // A real-valued evaluator also exercises `EvalResult::Real`.
+    let mut eval = |_e: &str| Ok(EvalResult::Real(1.0));
+    let mut load = |_name: &str| Err("unexpected storage load".to_string());
+    let mut env = Environ {
+        eval: &mut eval,
+        load_storage: &mut load,
+        fire_label: None,
+    };
+
+    // `CallLabel`: push the call stack and jump to the label.
+    state.call_label("*sub", &mut env).unwrap();
+    assert_eq!(state.call_stack_depth(), 1);
+
+    // Accessors exposed to the native layer.
+    let _ = state.cur_pos();
+    assert!(!state.cur_line_str().is_empty());
+    state.set_process_special_tags(false);
+    assert!(!state.process_special_tags());
+    state.set_process_special_tags(true);
+    assert!(state.process_special_tags());
+
+    // A fresh state has no macro-argument level to pop.
+    assert!(state.pop_macro_args_public().is_err());
+
+    state.clear_call_stack();
+    assert_eq!(state.call_stack_depth(), 0);
+
+    // Remaining native-facing accessors.
+    state.set_debug_level(2);
+    assert_eq!(state.debug_level(), 2);
+    assert!(state.macros_entries().is_empty());
+    assert!(state.macro_params_entries().is_none());
+    state.interrupt();
+    state.reset_interrupt();
 }
 
 // ---------------------------------------------------------------------------
@@ -1073,4 +1115,198 @@ fn native_go_to_label_error_and_macros_object() {
         )
         .expect("script");
     assert_eq!(value, TjsValue::String(String::new()));
+}
+
+// ---------------------------------------------------------------------------
+// reference surface: store / restore / assign / property semantics
+// (reference/cpp/core/base/KAGParser.cpp:2213-2560)
+// ---------------------------------------------------------------------------
+
+/// Evaluate `script` on a fresh bound VM (the native tests each build their
+/// own engine under the shared `vm_lock`).
+fn eval_native(script: &str) -> Result<TjsValue, String> {
+    let _lock = common::vm_lock();
+    let engine = Tjs2Engine::new().expect("create engine");
+    let mut host = compat::CompatHost::new();
+    host.install(&engine).expect("install compat surface");
+    engine.eval(script, "kag_test").map_err(|e| e.to_string())
+}
+
+#[test]
+fn native_store_returns_the_reference_dictionary_shape() {
+    // `Store()` returns a dictionary with the reference top-level members
+    // plus the nested `macros`, `macroArgs` and `callStack` containers
+    // (KAGParser.cpp:469-636).
+    let value = eval_native(
+        "(function(){ var p = new KAGParser(); var d = p.store(); \
+         return typeof d.macros + ',' + typeof d.macroArgs + ',' + typeof d.callStack \
+         + ',' + typeof d.data + ',' + d.curLine + ',' + d.ExcludeLevel \
+         + ',' + d.storageName.length + ',' + d.macroArgs.count + ',' + d.callStack.count; })()",
+    )
+    .expect("script");
+    assert_eq!(
+        value,
+        TjsValue::String("Object,Object,Object,String,0,-1,0,0,0".to_string())
+    );
+}
+
+#[test]
+fn native_store_restore_round_trips_state() {
+    let value = eval_native(
+        "(function(){ var p = new KAGParser(); p.debugLevel = 3; \
+         var d = p.store(); var q = new KAGParser(); q.restore(d); \
+         return q.debugLevel; })()",
+    )
+    .expect("script");
+    assert_eq!(value, TjsValue::Integer(3));
+}
+
+#[test]
+fn native_restore_imports_a_reference_format_dictionary() {
+    // The reference `Restore` member names (KAGParser.cpp:723-906): scalars,
+    // the nested `macros` dictionary and the `macroArgs` array (with its
+    // `count` and the matching `macroArgStackDepth` check at 768-769).
+    let value = eval_native(
+        "(function(){ var p = new KAGParser(); \
+         var d = %[ curLine: 4, ExcludeLevel: 2, macroArgStackDepth: 1, \
+                    macros: %[ greet: 'Hello' ], \
+                    macroArgs: [%[ a: '1' ]], \
+                    callStack: [] ]; \
+         p.restore(d); \
+         return p.curLine + ',' + p.macros['greet'] + ',' + p.mp['a'] \
+         + ',' + p.store().ExcludeLevel; })()",
+    )
+    .expect("script");
+    assert_eq!(value, TjsValue::String("4,Hello,1,2".to_string()));
+
+    // `TVPKAGMalformedSaveData` when the depth does not match the array
+    // (KAGParser.cpp:51, 768-769).
+    let error = eval_native(
+        "(function(){ var p = new KAGParser(); \
+         p.restore(%[ macroArgs: [%[ a: '1' ]] ]); })()",
+    )
+    .expect_err("a mismatched macroArgStackDepth must raise");
+    assert!(error.contains("Malformed savedata"), "unexpected: {error}");
+}
+
+#[test]
+fn native_assign_copies_a_parser_and_rejects_non_parsers() {
+    let value = eval_native(
+        "(function(){ var a = new KAGParser(); a.debugLevel = 2; \
+         var b = new KAGParser(); b.assign(a); return b.debugLevel; })()",
+    )
+    .expect("script");
+    assert_eq!(value, TjsValue::Integer(2));
+
+    // `TVPKAGSpecifyKAGParser` for a non-parser argument
+    // (KAGParser.cpp:59-60, 2281-2287).
+    for expression in [
+        "(function(){ var p = new KAGParser(); p.assign(5); })()",
+        "(function(){ var p = new KAGParser(); p.assign(%[]); })()",
+        "(function(){ var p = new KAGParser(); p.assign(); })()",
+    ] {
+        let error = eval_native(expression).expect_err(&format!("{expression:?} must raise"));
+        assert!(
+            error.contains("Please specify KAGParser object") || error.contains("requires 1"),
+            "unexpected: {error}"
+        );
+    }
+}
+
+#[test]
+fn native_macros_property_is_read_only_and_stable() {
+    // `TJS_DENY_NATIVE_PROP_SETTER` (KAGParser.cpp:2482).
+    let error = eval_native("(function(){ var p = new KAGParser(); p.macros = %[]; })()")
+        .expect_err("the macros property must be read-only");
+    assert!(!error.is_empty());
+
+    // `GetMacrosNoAddRef` hands the same dictionary out on every read
+    // (KAGParser.cpp:2471-2481) — identity is stable while unchanged.
+    let value = eval_native(
+        "(function(){ var p = new KAGParser(); return p.macros === p.macros ? 1 : 0; })()",
+    )
+    .expect("script");
+    assert_eq!(value, TjsValue::Integer(1));
+
+    // `mp` is `null` on an empty macro-argument stack (the null
+    // `tTJSVariant(params, params)` at KAGParser.cpp:2499-2501, fed by
+    // `GetMacroTopNoAddRef` returning nullptr at 2191-2196).
+    let value =
+        eval_native("(function(){ var p = new KAGParser(); return p.mp === null ? 1 : 0; })()")
+            .expect("script");
+    assert_eq!(value, TjsValue::Integer(1));
+}
+
+#[test]
+fn native_debug_level_uses_the_reference_integer_conversion() {
+    // `SetDebugLevel((tTVPKAGDebugLevel)(tjs_int)(*param))`
+    // (KAGParser.cpp:2464): reals truncate, objects raise.
+    let value = eval_native(
+        "(function(){ var p = new KAGParser(); p.debugLevel = 2.7; return p.debugLevel; })()",
+    )
+    .expect("script");
+    assert_eq!(value, TjsValue::Integer(2));
+
+    let error = eval_native("(function(){ var p = new KAGParser(); p.debugLevel = %[]; })()")
+        .expect_err("an object must not silently become a debug level");
+    assert!(!error.is_empty());
+}
+
+#[test]
+fn state_reference_store_accessors_round_trip() {
+    // The native `store()` dictionary is fed from these accessors
+    // (`natives/kag/mod.rs:build_store_dict`); pin them at the state level.
+    let mut state = KagParserState::default();
+    state
+        .load_scenario_text("t.ks", "*start\nA\n*sub\nB\n")
+        .unwrap();
+    let mut eval = |_e: &str| Ok(EvalResult::Void);
+    let mut load = |_n: &str| Err("unexpected storage load".to_string());
+    let mut env = Environ {
+        eval: &mut eval,
+        load_storage: &mut load,
+        fire_label: None,
+    };
+
+    assert_eq!(state.storage_short_name(), state.storage_name());
+    assert_eq!(state.exclude_level(), -1);
+    assert!(state.exclude_level_stack().is_empty());
+    assert!(state.if_level_executed_stack().is_empty());
+    assert_eq!(state.macro_args_depth(), 0);
+    assert!(state.macro_args_entries().is_empty());
+
+    // A pushed call-stack entry maps onto the reference `tCallStackData`
+    // fields (KAGParser.cpp:546-634).
+    state.call_label("*sub", &mut env).unwrap();
+    let snapshots = state.call_stack_snapshots();
+    assert_eq!(snapshots.len(), 1);
+    // The entry maps onto the reference `tCallStackData` fields
+    // (KAGParser.cpp:595-634): the return storage, the stacks (encoded like
+    // `StoreIntStackToDic`) and the macro-argument base.
+    assert_eq!(snapshots[0].storage, state.storage_name());
+    assert_eq!(
+        snapshots[0].exclude_level_stack,
+        state::encode_int_stack(state.exclude_level_stack())
+    );
+    assert_eq!(
+        snapshots[0].if_level_executed_stack,
+        state::encode_bool_stack(state.if_level_executed_stack())
+    );
+    assert_eq!(snapshots[0].macro_arg_stack_base, state.macro_args_base());
+    assert_eq!(snapshots[0].macro_arg_stack_depth, state.macro_args_depth());
+    assert_eq!(snapshots[0].exclude_level, state.exclude_level());
+    assert_eq!(snapshots[0].if_level, state.if_level());
+    let _ = state.if_level();
+    let _ = state.macro_args_base();
+    let _ = (
+        &snapshots[0].label,
+        snapshots[0].offset,
+        &snapshots[0].org_line_str,
+        snapshots[0].pos,
+    );
+
+    // The stack encodings match the reference `StoreIntStackToDic` /
+    // `StoreBoolStackToDic` formats (KAGParser.cpp:637-659, 704-722).
+    assert_eq!(state::encode_int_stack(&[1, 256]), "0000000100000100");
+    assert_eq!(state::encode_bool_stack(&[true, false, true]), "101");
 }

@@ -1,4 +1,4 @@
-//! `BitmapLayerTreeOwner` — the layer-tree event owner (doc 08).
+//! `BitmapLayerTreeOwner` — the layer-tree event owner.
 //!
 //! Behavioral reference: `reference/cpp/core/visual/BitmapLayerTreeOwner.cpp`
 //! and its base `tTVPLayerTreeOwner` (`LayerTreeOwnerImpl.cpp`). The reference
@@ -253,20 +253,10 @@ fn member_i64(host: &Tjs2Engine, id: Tjs2ValueId, member: &str) -> Option<i64> {
     }
 }
 
-/// Resolve a script object argument to its scene id via `nativeId`/`id`.
-fn scene_id_of(host: &Tjs2Engine, value: &Value) -> Option<u32> {
-    if value.ty != VAL_OBJECT || value.object_handle().is_null() {
-        return None;
-    }
-    let object = host.retain_object_arg(value).ok()?;
-    for member in ["nativeId", "id"] {
-        if let Some(id) = member_i64(host, object.raw_id(), member)
-            && id >= 0
-        {
-            return Some(id as u32);
-        }
-    }
-    None
+/// The scene id of a retained object as a native `Layer`, or `Ok(None)` when
+/// it is not a `Layer`.
+fn scene_id_of(host: &Tjs2Engine, object: Tjs2ValueId) -> Result<Option<u32>, String> {
+    CompatCtx::native_instance_id(host, object, &["Layer"])
 }
 
 /// The attached scene's window size, if the window exists.
@@ -681,16 +671,31 @@ extern "C" fn focused_layer_set(
     let (retained, scene_id) = if value.ty == VAL_VOID {
         (None, None)
     } else if value.ty == VAL_OBJECT && !value.object_handle().is_null() {
-        let scene_id = scene_id_of(host, value);
-        match host.retain_object_arg(value) {
-            Ok(object) => (Some(object), scene_id),
+        let object = match host.retain_object_arg(value) {
+            Ok(object) => object,
             Err(error) => {
                 return report_error(
                     out_error,
                     &format!("BitmapLayerTreeOwner.focusedLayer: {error}"),
                 );
             }
-        }
+        };
+        let scene_id = match scene_id_of(host, object.raw_id()) {
+            Ok(Some(id)) => Some(id),
+            Ok(None) => {
+                return report_error(
+                    out_error,
+                    "BitmapLayerTreeOwner.focusedLayer: the value is not a Layer",
+                );
+            }
+            Err(error) => {
+                return report_error(
+                    out_error,
+                    &format!("BitmapLayerTreeOwner.focusedLayer: {error}"),
+                );
+            }
+        };
+        (Some(object), scene_id)
     } else {
         (None, None)
     };
@@ -704,7 +709,7 @@ extern "C" fn focused_layer_set(
             unsafe { &mut *ptr }.set_focus(id);
         }
     } else {
-        // Clearing: blur the previously focused layer in its own window.
+        // Clearing: blur the layer that had focus in its own window.
         // SAFETY: `instance` is the live payload the VM passed to the callback.
         let previous = unsafe { &*(instance as *const TreeOwnerInst) }.focused_id;
         if let Some(previous) = previous {

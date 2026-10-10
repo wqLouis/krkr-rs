@@ -35,10 +35,14 @@ use media::{Media, decode_image, encode_image, probe_image};
 /// Saved names may contain sub-directories (`"shots/out.png"`); missing
 /// parents are created. An unknown save type is a typed encoder error
 /// surfaced to the script, never a silently skipped write.
-pub fn install_image_codec(host: &CompatHost, storage: &Storage) {
+///
+/// `media` is the same stateless L1 backend the composition root passes to
+/// [`install_audio_decoder`](crate::install_audio_decoder); the closures own
+/// a clone of it.
+pub fn install_image_codec(host: &CompatHost, media: &Media, storage: &Storage) {
     let fs = storage.file_system().clone();
     let base = storage.game_dir().to_path_buf();
-    install_image_codec_on(host, fs, base);
+    install_image_codec_on(host, media, fs, base);
 }
 
 /// Installs the `media` image codec with an explicit write target.
@@ -46,11 +50,10 @@ pub fn install_image_codec(host: &CompatHost, storage: &Storage) {
 /// [`install_image_codec`] derives `(fs, base)` from a [`Storage`]; this
 /// lower-level entry point is for hosts that keep the output elsewhere
 /// (for example a dedicated screenshot directory).
-pub fn install_image_codec_on(host: &CompatHost, fs: FileSystem, base: PathBuf) {
-    let media = Media::new();
+pub fn install_image_codec_on(host: &CompatHost, media: &Media, fs: FileSystem, base: PathBuf) {
     let decode_media = media.clone();
     let probe_media = media.clone();
-    let save_media = media;
+    let save_media = media.clone();
 
     host.set_image_codec(
         move |bytes, hint| {

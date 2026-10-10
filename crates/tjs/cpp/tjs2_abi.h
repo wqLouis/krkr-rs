@@ -143,6 +143,24 @@ int tjs2_get_class_names(tjs2_engine *e, tjs2_value_id obj, tjs2_value *out,
                          char **out_error);
 
 /*
+ * Enumerate the members of a retained object (reference
+ * `Scripts.getObjectKeys` / `ScriptsAdd::_getKeys`): walk the object's
+ * `iTJSDispatch2::EnumMembers` with `TJS_IGNOREPROP | TJS_ENUM_NO_VALUE`
+ * (the flags the reference uses), skipping hidden members, and return the
+ * names as a TJS Array of strings. Class objects are enumerated together
+ * with their inherited / static members, so the result is the object's
+ * whole observable member surface. `obj` is a retained object id (see
+ * tjs2_retain_value / tjs2_retain_object).
+ *
+ * Returns 0 on success and, if out is non-NULL, fills it with a
+ * TJS2_VAL_RETAINED id for the new Array (release it with
+ * tjs2_release_value, or consume it through a native's return slot). On
+ * failure returns non-zero with a malloc'd UTF-8 message in *out_error.
+ */
+int tjs2_enum_members(tjs2_engine *e, tjs2_value_id obj, tjs2_value *out,
+                      char **out_error);
+
+/*
  * Enable the "missing" member handler on a retained object (reference
  * `Scripts.setCallMissing`): `ClassInstanceInfo(TJS_CII_SET_MISSING, 0,
  * "missing")` so an unknown member routes to the object's `missing`
@@ -151,6 +169,56 @@ int tjs2_get_class_names(tjs2_engine *e, tjs2_value_id obj, tjs2_value *out,
  */
 int tjs2_set_call_missing(tjs2_engine *e, tjs2_value_id obj,
                           char **out_error);
+
+/*
+ * Resolve a retained object to the Rust payload pointer of an
+ * instance-based native class — the C++ equivalent of the reference's
+ * `objthis->NativeInstanceSupport(TJS_NIS_GETINSTANCE, classid, &native)`
+ * + `GetNativePtr()` lookup that TJS_GET_NATIVE_INSTANCE performs in method
+ * bodies (the same mechanism tjs2_dispatch_native_instance_method uses),
+ * exposed so Rust can map "script object" -> "our native payload" without
+ * the script-visible `id` / `nativeId` helper properties.
+ *
+ * `obj` is a retained object id (see tjs2_retain_value /
+ * tjs2_retain_object). `class_name_utf8` is the UTF-8 name the class was
+ * registered with via tjs2_register_native_class_instance — the class
+ * *name*, not a numeric class id: numeric ids are allocated inside the VM
+ * (TJSRegisterNativeClass) and are never exposed to Rust, while the name is
+ * exactly what Rust supplies at registration.
+ *
+ * Returns the payload pointer on a hit, or NULL when there is none:
+ *   - `e`, `obj` or `class_name_utf8` is NULL, `obj` is not a live
+ *     retained id, or the retained value is not an object;
+ *   - the object is TJS `null` (an object value with no object pointer);
+ *   - `class_name_utf8` does not name a class registered with
+ *     tjs2_register_native_class_instance on this engine (names of
+ *     static-only or builtin classes resolve to NULL too — their objects
+ *     carry no Rust payload, and their VM-native instances must not be
+ *     mistaken for ours);
+ *   - the object is not an instance of that class: a plain script object,
+ *     an instance of another native class, or the class object itself
+ *     (class objects have no native instance registered under their own
+ *     class id);
+ *   - the instance exists but its payload was released: the object was
+ *     invalidated (reference `Invalidate`; GetNativePtr() returns NULL
+ *     afterwards) or the create callback produced no payload.
+ * NULL is therefore an ordinary, non-error outcome; this entry point never
+ * raises a TJS error and never lets a C++ exception cross the ABI.
+ *
+ * Ownership: the payload stays owned by the engine (allocated by the
+ * tjs2_native_create_instance_fn callback, freed exactly once by
+ * tjs2_native_destroy_instance_fn when the object dies); this call borrows
+ * the pointer and never transfers ownership — callers must not free it.
+ *
+ * Validity: the pointer is valid only while the object stays alive (keep
+ * the retained id live) and is not invalidated — i.e. exactly while
+ * `GetNativePtr()` would keep returning it (see the tjs2_native_instance
+ * contract: `valid && !invalidated`). Once the object is invalidated or
+ * released, a previously returned pointer must be discarded; query again
+ * after any doubt. It must not outlive tjs2_destroy.
+ */
+void *tjs2_get_native_instance(tjs2_engine *e, tjs2_value_id obj,
+                               const char *class_name_utf8);
 
 /* Free a string returned via out_error. */
 void tjs2_free_string(char *s);
@@ -178,6 +246,12 @@ tjs2_value_id tjs2_retain_value(void *engine, const tjs2_value *v);
 /* Release a retained value. Idempotent: releasing an unknown or NULL id is
  * a safe no-op. */
 void tjs2_release_value(void *engine, tjs2_value_id id);
+
+/* Invalidate the retained object value (the reference `invalidate obj;`
+ * statement): calls the object's `iTJSDispatch2::Invalidate` so its script
+ * `finalize` runs. Returns 0 on success, non-zero on an unknown id or a
+ * script exception. The retention is *not* released. */
+int tjs2_invalidate_retained(void *engine, tjs2_value_id id);
 
 /* Diagnostic: number of entries currently in the retained-value map (used by
  * the test suite to detect retention leaks). */
@@ -229,6 +303,28 @@ int tjs2_prop_get(void *engine, tjs2_value_id id, const char *membername,
  */
 int tjs2_prop_set(void *engine, tjs2_value_id id, const char *membername,
                   const tjs2_value *value, char **out_error);
+
+/*
+ * Delete a named property from a retained object value (reference
+ * `iTJSDispatch2::DeleteMember`, tjsObject.h:472; the `tTJSCustomObject`
+ * implementation is tjsObject.cpp:1537-1552 over `DeleteByName`,
+ * tjsObject.cpp:759). `flag` is 0 and `objthis` is the dispatch object
+ * itself — the same values the VM's own `delete` operator passes
+ * (tjsInterCodeExec.cpp:1826) — so the member is removed from the object's
+ * own table, not from a superclass.
+ *
+ * An absent member is the reference's `TJS_E_MEMBERNOTFOUND`
+ * (tjsObject.cpp:1546), which the `delete` operator surfaces as the boolean
+ * `false` rather than a thrown exception (tjsInterCodeExec.cpp:1829-1833);
+ * this entry point reports it as a typed failure, the same way a member read
+ * reports it. A retained id that is not a live object (null, released, or a
+ * non-object value such as TJS `null`) is also a typed failure.
+ *
+ * Same error convention as tjs2_prop_get: returns 0 on success; on failure
+ * returns non-zero with a malloc'd UTF-8 message in out_error.
+ */
+int tjs2_prop_delete(tjs2_engine *e, tjs2_value_id obj,
+                     const char *membername_utf8, char **out_error);
 
 /*
  * Write the **default member** of a retained object value (PropSet with a
@@ -417,6 +513,51 @@ int tjs2_register_native_static_members(
     tjs2_engine *e, const char *class_name_utf8,
     const tjs2_native_method *methods, int count,
     const tjs2_native_property *properties, int prop_count);
+
+/*
+ * Attach instance members **without a native payload** to an already-existing
+ * class, including a TJS2 builtin such as `Array` / `Dictionary` (reference
+ * `NCB_ATTACH_CLASS` / `NCB_ATTACH_FUNCTION` in the plugin Binder). Unlike
+ * tjs2_native_instance_method_fn, the callbacks receive no opaque `instance`
+ * pointer: only `objthis`, the object the member was invoked on.
+ *
+ * A `Class` registered by tjs2_register_native_class[_instance] receives the
+ * members as ordinary (non-static) instance members. Any other name is looked
+ * up on the VM global object as a builtin class object (the same lookup
+ * `NCB_ATTACH_CLASS` performs) and the members are PropSet onto it, so they
+ * are reachable from every instance of that class. Properties work the same
+ * way and use the objthis get/set callbacks.
+ *
+ * `class_name_utf8` must name a class already reachable on this engine.
+ * Returns 0 on success; non-zero on failure (unknown class, invalid
+ * arguments, a class member that could not be added, or an exception while
+ * registering).
+ */
+typedef int (*tjs2_native_objthis_method_fn)(void *engine, void *objthis,
+                                             int argc, const tjs2_value *argv,
+                                             tjs2_value *out,
+                                             char **out_error);
+typedef struct tjs2_native_objthis_method {
+    const char *name;                  /* UTF-8, method name on the class */
+    tjs2_native_objthis_method_fn fn;  /* Rust callback */
+} tjs2_native_objthis_method;
+
+typedef int (*tjs2_native_objthis_property_get_fn)(void *engine, void *objthis,
+                                                   tjs2_value *out,
+                                                   char **out_error);
+typedef int (*tjs2_native_objthis_property_set_fn)(void *engine, void *objthis,
+                                                   const tjs2_value *value,
+                                                   char **out_error);
+typedef struct tjs2_native_objthis_property {
+    const char *name; /* UTF-8, property name on the class */
+    tjs2_native_objthis_property_get_fn get; /* may be NULL */
+    tjs2_native_objthis_property_set_fn set; /* may be NULL */
+} tjs2_native_objthis_property;
+
+int tjs2_register_native_instance_members(
+    tjs2_engine *e, const char *class_name_utf8,
+    const tjs2_native_objthis_method *methods, int count,
+    const tjs2_native_objthis_property *properties, int prop_count);
 
 /* Allocate with malloc; used to build error strings on the Rust side.
  * Pair with tjs2_free_string. */

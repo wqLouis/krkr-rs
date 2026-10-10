@@ -1,11 +1,27 @@
 //! Dev-only helpers shared by the krkr-rs integration tests.
 //!
-//! This crate exists so the synthetic XP3 archive builder is not duplicated
-//! verbatim across `fs` and `engine`. It is never a runtime
+//! This crate exists so synthetic fixtures and process-global test helpers are
+//! not duplicated across integration-test binaries. It is never a runtime
 //! dependency; the crates that need it pull it in under `[dev-dependencies]`.
+//!
+//! The modules are:
+//! - [`media_fixtures`]: synthetic image, audio, and TLG byte builders.
+//! - [`render`]: a headless window handle for the null render backend.
+//! - [`vm`]: a process-global lock serializing TJS VM tests.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+
+pub mod media_fixtures;
+pub mod render;
+pub mod vm;
+
+pub use media_fixtures::{
+    SDS_MAGIC, TLG5_MAGIC, TLG6_MAGIC, encode_png, encode_tlg5, encode_tlg6, pattern, test_image,
+    tiny_wav_mono,
+};
+pub use render::headless_window;
+pub use vm::vm_lock;
 
 use std::io::Write;
 

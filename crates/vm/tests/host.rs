@@ -1,9 +1,7 @@
 //! Integration tests for the L4 VM host.
 
-mod common;
-
-use common::vm_lock;
 use compat::{CompatCtx, CompatError, FrameBody};
+use testkit::vm_lock;
 use tjs::TjsValue;
 use vm::{FrameCtx, VmHost};
 

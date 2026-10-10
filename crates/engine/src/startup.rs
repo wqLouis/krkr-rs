@@ -1,6 +1,6 @@
 //! Startup-script discovery (L2).
 //!
-//! Pure storage discovery, per `docs/migration/09-game-loading.md` §5. This
+//! Pure storage discovery. This
 //! module locates the scripts but never executes them, so it is testable
 //! without the TJS VM. The reference order is:
 //!
@@ -12,7 +12,7 @@
 //!
 //! Discovering none of `startup.tjs` / `system/Initialize.tjs` is a typed
 //! error ([`StartupError::NoStartupScript`]), never a warn-and-continue
-//! (D11).
+//!.
 
 use api::error::FsError;
 use api::fs::FsPath;

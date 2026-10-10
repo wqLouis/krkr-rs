@@ -1,7 +1,7 @@
 //! String encodings for the dictionary-shaped data the parser keeps as
 //! strings: the `store`/`restore` save container and the macro bodies. The
 //! native's object-shaped results (`getNextTag`, `macros`, `macroParams`) are
-//! real TJS Dictionaries, not strings, so this codec is no longer on that path.
+//! real TJS Dictionaries, not strings, so they do not use this codec.
 //!
 //! # The line format
 //!
@@ -14,8 +14,6 @@
 //! lossless for arbitrary text. Scenario tag content never contains raw
 //! newlines (the parser splits lines first), but macro bodies and saved
 //! state can, so escaping is applied everywhere for uniformity.
-
-#![allow(dead_code)]
 
 /// Escape one field: `\` → `\\`, newline → `\n`, CR → `\r`.
 pub fn escape_field(s: &str) -> String {
@@ -78,18 +76,4 @@ pub fn decode_dict(s: &str) -> Vec<(String, String)> {
         entries.push((unescape_field(&line[..eq]), unescape_field(&line[eq + 1..])));
     }
     entries
-}
-
-/// Encode a tag dictionary: the tag name on the first line, then
-/// `key=value` lines for each attribute (in source order). This is the
-/// `getNextTag` return format.
-pub fn encode_tag(tagname: &str, params: &[(String, String)]) -> String {
-    let mut out = escape_field(tagname);
-    for (k, v) in params {
-        out.push('\n');
-        out.push_str(&escape_field(k));
-        out.push('=');
-        out.push_str(&escape_field(v));
-    }
-    out
 }

@@ -215,10 +215,15 @@ fn primary_layer_is_returned_as_the_real_object() {
 
     // `primaryLayer` is the *same* object as `l`, not a fresh wrapper.
     assert_eq!(env.eval_int("p.name == 'primary'"), 1);
-    assert_eq!(env.eval_int("p.id == l.id"), 1);
+    assert_eq!(env.eval_int("p === l"), 1);
     // And `l.window` points back at the window.
-    assert_eq!(env.eval_int("l.window.id == w.id"), 1);
+    assert_eq!(env.eval_int("l.window === w"), 1);
     assert_eq!(env.eval_int("p.isPrimary"), 1);
+    // The reference `Layer`/`Window` member lists register no `id`
+    // (`reference/cpp/core/visual/LayerIntf.cpp:8283`,
+    // `reference/cpp/core/visual/WindowIntf.cpp:731`), so reading one raises.
+    assert!(env.eval("l.id").is_err(), "Layer has no `id` member");
+    assert!(env.eval("w.id").is_err(), "Window has no `id` member");
 
     let primary = env.scene.windows[0].primary_layer.expect("primary layer");
     assert_eq!(primary, env.scene.layers[0].id);
@@ -245,16 +250,15 @@ fn focus_and_children_round_trip() {
     assert_eq!(env.eval_int("child.parent.name == 'parent'"), 1);
     assert_eq!(env.eval_int("child.focused"), 1);
 
-    // `Window.add` reparents a root layer under the primary layer.
-    env.run("var extra = new Layer(w, null); extra.name = 'extra'; w.add(extra);");
-    assert_eq!(env.eval_int("extra.parent.name == 'parent'"), 1);
-
-    // `Window.remove` parts it: the L2 `Part()` detaches it and removes the
-    // layer record (the script object remains but is inert).
-    env.run("var extraId = extra.id; w.remove(extra);");
-    let extra_id = env.eval_int("extraId") as u32;
-    assert!(env.scene.layer(extra_id).is_none());
-    assert_eq!(env.scene.layers.len(), 2);
+    // `Window.add` registers an object whose lifetime is tied to the window
+    // (reference `tTJSNI_BaseWindow::ObjectVector`); it does **not** reparent
+    // layers. `Window.remove` unregisters it. Neither touches the layer tree.
+    env.run(
+        "var extra = new Layer(w, null); extra.name = 'extra'; \
+         w.add(extra); w.add(extra); w.remove(extra);",
+    );
+    assert_eq!(env.eval_int("extra.parent == null"), 1);
+    assert_eq!(env.scene.layers.len(), 3);
 }
 
 #[test]
@@ -411,7 +415,7 @@ fn timer_properties_round_trip() {
     );
 
     assert_eq!(env.eval_int("enabled0"), 0);
-    assert_eq!(env.eval_int("t.interval"), 250);
+    assert_eq!(env.eval_real("t.interval"), 250.0);
     assert_eq!(env.eval_int("t.mode"), 2);
     assert_eq!(env.eval_int("t.capacity"), 1);
 }
@@ -532,4 +536,69 @@ fn layer_cursor_reads_the_pointer_touch_and_layer_offset() {
     assert_eq!(env.eval_int("l.cursorY"), 60);
     assert_eq!(env.eval_int("c.cursorX"), 35);
     assert_eq!(env.eval_int("c.cursorY"), 55);
+}
+
+#[test]
+fn draw_device_classes_are_attached_to_window() {
+    let _lock = vm_lock();
+    let env = Env::new();
+
+    // The reference attaches both classes to the `Window` class object
+    // (`ScriptMgnIntf.cpp`), so `new Window.X()` is the documented
+    // construction.
+    env.run(
+        "var b = new Window.BasicDrawDevice(); \
+         var p = new Window.PassThroughDrawDevice();",
+    );
+
+    // `name` plus the drawer defaults match the reference constructors
+    // (`BasicDrawDevice.h`: dtDrawDib; `PassThroughDrawDevice.cpp`: dtNone).
+    assert_eq!(env.eval_int("b.name == 'BasicDrawDevice'"), 1);
+    assert_eq!(env.eval_int("p.name == 'PassThroughDrawDevice'"), 1);
+    assert_eq!(env.eval_int("b.drawer"), 1);
+    assert_eq!(env.eval_int("b.preferredDrawer"), 1);
+    assert_eq!(env.eval_int("p.drawer"), 0);
+    assert_eq!(env.eval_int("p.preferredDrawer"), 0);
+
+    // The `TVP_REGISTER_PTDD_ENUM` constants are class-qualified in the
+    // reference docs (`Window.PassThroughDrawDevice.dtNone`).
+    assert_eq!(env.eval_int("Window.BasicDrawDevice.dtNone"), 0);
+    assert_eq!(env.eval_int("Window.BasicDrawDevice.dtDrawDib"), 1);
+    assert_eq!(env.eval_int("Window.PassThroughDrawDevice.dtDBGDI"), 2);
+    assert_eq!(env.eval_int("Window.PassThroughDrawDevice.dtDBDD"), 3);
+    assert_eq!(env.eval_int("Window.PassThroughDrawDevice.dtDBD3D"), 4);
+}
+
+#[test]
+fn draw_device_state_round_trips_and_interface_is_typed() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var p = new Window.PassThroughDrawDevice(); \
+         p.preferredDrawer = Window.PassThroughDrawDevice.dtDBD3D; \
+         p.recreate(); \
+         p.lockTouchSize(640, 480);",
+    );
+
+    // The preference is stored verbatim; `recreate` selects the software
+    // drawer (`dtDrawDib`) exactly like the reference `EnsureDrawer`.
+    assert_eq!(env.eval_int("p.preferredDrawer"), 4);
+    assert_eq!(env.eval_int("p.drawer"), 1);
+
+    // `lockTouchSize` requires both arguments.
+    assert!(env.eval("p.lockTouchSize(640)").is_err());
+
+    // Basic `recreate` is a compiled-out no-op in the reference.
+    env.run("var b = new Window.BasicDrawDevice(); b.recreate();");
+    assert_eq!(env.eval_int("b.drawer"), 1);
+
+    // There is no host `iTVPDrawDevice`, so `interface` raises (D11); the
+    // error names the class so the absence stays discoverable.
+    let message = env.eval("p.interface").expect_err("interface should raise");
+    assert!(
+        message.contains("PassThroughDrawDevice.interface"),
+        "unexpected interface error: {message}"
+    );
+    // `drawer` is read-only.
+    assert!(env.eval("b.drawer = 3").is_err());
 }

@@ -1,18 +1,17 @@
 //! `KAGParser` native class and the `.ks` scenario parser.
 //!
-//! Behavioral reference: `main`'s `crates/tvp-kagparser/src/*` and the pure
+//! Behavioral reference: `crates/tvp-kagparser/src/*` and the pure
 //! `crates/kag` parser. The [`parser`] half is a dependency-free transform
 //! (no VM, no engine); [`state`] is the pull state machine; [`kvp`] holds
 //! the string codecs used by macro storage and `store`/`restore`; this
 //! module is the thin native adapter that registers `KAGParser` on the VM
 //! and marshals script values.
 //!
-//! # Object results (improvement over the old native)
+//! # Object results
 //!
-//! The reference `getNextTag` could only return a *string encoding* of the
-//! tag dictionary because the old ABI had no object result. On the new
-//! stack `tjs` can retain an object and the C++ trampoline consumes a
-//! `VAL_RETAINED` result, so `getNextTag` now returns a **real TJS
+//! The reference `getNextTag` returns a *string encoding* of the
+//! tag dictionary. `tjs` can retain an object and the C++ trampoline consumes a
+//! `VAL_RETAINED` result, so `getNextTag` returns a **real TJS
 //! Dictionary** (`tagname` plus every attribute plus `taglist`, an array of
 //! member names in source order, matching the reference's `ArgValue`). The
 //! dictionary is created with `%[]` and populated through
@@ -40,12 +39,13 @@ use std::ptr;
 use engine::Storage;
 use tjs::{
     DetachedValue, Engine, NativeInstanceBuilder, NativeInstanceMethodDef,
-    NativeInstancePropertyDef, RetainedValue, Tjs2Engine, TjsValue, VAL_INTEGER, VAL_REAL,
-    VAL_RETAINED, VAL_STRING, VAL_VOID, Value,
+    NativeInstancePropertyDef, RetainedValue, Tjs2Engine, Tjs2ValueId, TjsValue, VAL_INTEGER,
+    VAL_OBJECT, VAL_REAL, VAL_RETAINED, VAL_STRING, VAL_VOID, Value,
 };
 
 use crate::binding;
 use crate::native_util::{args, report_error, set_int, set_void};
+use crate::natives::system::{try_value_as_i64, value_as_bool};
 use crate::{CompatCtx, CompatError, CompatServices};
 use state::{Environ, EvalResult, KagParserState, LabelCallback};
 
@@ -335,47 +335,97 @@ fn param_to_string(v: &Value) -> Result<String, String> {
     }
 }
 
-/// Convert a native argument to a boolean like `param->operator bool()`.
-fn param_to_bool(v: &Value) -> Result<bool, String> {
-    match v.ty {
-        VAL_INTEGER => Ok(v.integer != 0),
-        VAL_REAL => Ok(v.real != 0.0),
-        VAL_STRING => {
-            if v.string.is_null() {
-                Ok(false)
-            } else {
-                // SAFETY: argv strings are NUL-terminated UTF-8 for the call.
-                Ok(!unsafe { CStr::from_ptr(v.string) }.to_bytes().is_empty())
-            }
-        }
-        VAL_VOID => Ok(false),
-        _ => Err("KAGParser: argument cannot be converted to a boolean".to_string()),
-    }
+/// Convert a native argument to a boolean like the reference
+/// `param->operator bool()` (`tjsVariant.h:913-935`): strings are
+/// `AsInteger() != 0`, void and `null` are false, objects are `Object !=
+/// nullptr`. The reference conversion never fails, so neither does this.
+fn param_to_bool(v: &Value) -> bool {
+    value_as_bool(v)
 }
 
 // ---------------------------------------------------------------------------
 // instance payload
 // ---------------------------------------------------------------------------
 
+/// The native instance payload: the parser state plus the cached `macros` /
+/// `macroParams` dictionary objects.
+///
+/// The reference hands the *same* dictionary object out on every read
+/// (`GetMacrosNoAddRef` / `GetMacroTopNoAddRef`, `KAGParser.cpp:2471-2508`)
+/// and releases those dictionaries at `Invalidate`
+/// (`KAGParser.cpp:373-391`), so the cache lives with the payload and the
+/// `invalidate` hook drops it.
+struct KagParserInstance {
+    state: KagParserState,
+    /// The cached `macros` dictionary (identity-stable while unchanged).
+    macros_dict: Option<DetachedValue>,
+    /// The content last published through `macros_dict`.
+    macros_snapshot: Vec<(String, String)>,
+    /// The cached `macroParams`/`mp` dictionary (identity-stable while
+    /// unchanged).
+    macro_args_dict: Option<DetachedValue>,
+    /// The content last published through `macro_args_dict`.
+    macro_args_snapshot: Vec<(String, String)>,
+}
+
+impl KagParserInstance {
+    fn new() -> Self {
+        Self {
+            state: KagParserState::default(),
+            macros_dict: None,
+            macros_snapshot: Vec::new(),
+            macro_args_dict: None,
+            macro_args_snapshot: Vec::new(),
+        }
+    }
+}
+
 extern "C" fn kagparser_create(_engine: *mut c_void) -> *mut c_void {
-    Box::into_raw(Box::new(KagParserState::default())) as *mut c_void
+    Box::into_raw(Box::new(KagParserInstance::new())) as *mut c_void
 }
 
 extern "C" fn kagparser_destroy(_engine: *mut c_void, instance: *mut c_void) {
     if !instance.is_null() {
         // SAFETY: instance came from kagparser_create (Box::into_raw) and is
         // released exactly once by the VM.
-        drop(unsafe { Box::from_raw(instance as *mut KagParserState) });
+        drop(unsafe { Box::from_raw(instance as *mut KagParserInstance) });
     }
 }
 
-/// The parser payload for the object a method was called on.
+/// The parser state for the object a method was called on.
 ///
 /// # Safety
 /// `instance` must be the live payload the VM passed to the callback.
 unsafe fn state_of(instance: *mut c_void) -> &'static mut KagParserState {
     // SAFETY: the dispatcher verified the object is a KAGParser instance.
-    unsafe { &mut *(instance as *mut KagParserState) }
+    &mut unsafe { &mut *(instance as *mut KagParserInstance) }.state
+}
+
+/// The full payload for the object a method was called on.
+///
+/// # Safety
+/// `instance` must be the live payload the VM passed to the callback.
+unsafe fn instance_of(instance: *mut c_void) -> &'static mut KagParserInstance {
+    // SAFETY: the dispatcher verified the object is a KAGParser instance.
+    unsafe { &mut *(instance as *mut KagParserInstance) }
+}
+
+/// Reference `tTJSNI_KAGParser::Invalidate` (`KAGParser.cpp:373-391`):
+/// release the cached `Macros`/argument dictionaries, clear the macro-argument
+/// stack and the scenario buffer, and drop `Owner`. This payload retains no
+/// objects across calls, so clearing the parser state and the two cached
+/// dictionaries releases everything the reference releases and leaves no
+/// walk state to fire callbacks from.
+extern "C" fn kagparser_invalidate(_engine: *mut c_void, instance: *mut c_void) {
+    if instance.is_null() {
+        return;
+    }
+    let instance = unsafe { instance_of(instance) };
+    instance.macros_dict = None;
+    instance.macros_snapshot.clear();
+    instance.macro_args_dict = None;
+    instance.macro_args_snapshot.clear();
+    instance.state.clear();
 }
 
 /// `KAGParser()` — constructor member (empty; the payload already exists for
@@ -521,7 +571,46 @@ extern "C" fn native_call_label(
     }
 }
 
-/// `assign(storeString)` — copy state from a `store()` string.
+/// Retain an object-valued member of a retained object (the reference
+/// `PropGet` + variant copy). `get_member` records the object as the most
+/// recent object result, which `retain_value_detached` resolves against.
+fn retain_object_member(
+    host: &Tjs2Engine,
+    object: Tjs2ValueId,
+    key: &str,
+) -> Option<DetachedValue> {
+    if !matches!(host.get_member(object, key), Ok(TjsValue::Object)) {
+        return None;
+    }
+    host.retain_value_detached(&TjsValue::Object).ok()
+}
+
+/// A scalar member in its string form (reference `ttstr str = val;`).
+fn scalar_member(host: &Tjs2Engine, object: Tjs2ValueId, key: &str) -> Option<String> {
+    match host.get_member(object, key) {
+        Ok(TjsValue::String(value)) => Some(value),
+        Ok(TjsValue::Integer(value)) => Some(value.to_string()),
+        Ok(TjsValue::Real(value)) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+/// A dictionary/array element count — the reference reads the `count` member
+/// of `macroArgs` / `callStack` (`KAGParser.cpp:752`, `776`).
+fn object_count(host: &Tjs2Engine, object: Tjs2ValueId) -> Result<i64, String> {
+    match host.get_member(object, "count")? {
+        TjsValue::Integer(count) => Ok(count),
+        TjsValue::Real(count) => Ok(count as i64),
+        other => Err(format!("KAGParser: count is not numeric ({other:?})")),
+    }
+}
+
+/// `assign(src)` — copy another parser's state (reference
+/// `_this->Assign(*src)` after the `NativeInstanceSupport(ClassID_KAGParser)`
+/// check, `KAGParser.cpp:2273-2295`): a non-object or a non-`KAGParser`
+/// object raises the reference `TVPKAGSpecifyKAGParser`
+/// (`KAGParser.cpp:59-60`), and a live parser is copied wholesale
+/// (`operator=`, `KAGParser.cpp:395-466`).
 extern "C" fn native_assign(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -531,15 +620,36 @@ extern "C" fn native_assign(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    native_restore(
-        engine,
-        instance,
-        argc,
-        argv,
-        out,
-        out_error,
-        ptr::null_mut(),
-    )
+    if argc < 1 {
+        return report_error(out_error, "KAGParser.assign requires 1 argument");
+    }
+    let host = match resolve_host(engine) {
+        Ok(host) => host,
+        Err(e) => return report_error(out_error, &e),
+    };
+    // SAFETY: the trampoline guarantees `argc` valid `Value` entries.
+    let value = &unsafe { args(argv, argc) }[0];
+    const UNSPECIFIED: &str = "KAGParser.assign: Please specify KAGParser object.";
+    if value.ty != VAL_OBJECT || value.object_handle().is_null() {
+        return report_error(out_error, UNSPECIFIED);
+    }
+    let object = match host.retain_object_arg(value) {
+        Ok(object) => object,
+        Err(e) => return report_error(out_error, &e),
+    };
+    let payload = match host.native_instance_payload(object.raw_id(), "KAGParser") {
+        Ok(Some(payload)) => payload,
+        Ok(None) => return report_error(out_error, UNSPECIFIED),
+        Err(e) => return report_error(out_error, &e),
+    };
+    // SAFETY: the payload is the engine-owned `KagParserInstance`
+    // allocated by `kagparser_create`; it stays valid while `object` holds
+    // the retained id and the single-threaded VM runs. Self-assignment
+    // clones the state before overwriting, so it is safe too.
+    let source = unsafe { &*(payload.as_ptr() as *const KagParserInstance) };
+    *unsafe { state_of(instance) } = source.state.clone();
+    set_void(out);
+    0
 }
 
 /// `clear()`.
@@ -557,7 +667,12 @@ extern "C" fn native_clear(
     0
 }
 
-/// `store()` — serialize the parser state as a string.
+/// `store()` — serialize the parser state into a **dictionary** (reference
+/// `tTJSNI_KAGParser::Store`, `KAGParser.cpp:469-636`): the reference
+/// top-level members (`storageName`, `curLine`, `ExcludeLevel`, ... plus the
+/// nested `macros`, `macroArgs` and `callStack` containers) and the lossless
+/// emulator snapshot under `data`, which [`native_restore`] prefers for an
+/// exact round-trip.
 extern "C" fn native_store(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -567,14 +682,138 @@ extern "C" fn native_store(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    let s = unsafe { state_of(instance) }.store();
-    match with_services(engine, |services| set_string_result(services, out, &s)) {
-        Ok(()) => 0,
+    let host = match resolve_host(engine) {
+        Ok(host) => host,
+        Err(e) => return report_error(out_error, &e),
+    };
+    let state = unsafe { state_of(instance) };
+    match build_store_dict(host, state) {
+        Ok(dict) => {
+            set_retained_object(out, dict);
+            0
+        }
         Err(e) => report_error(out_error, &e),
     }
 }
 
-/// `restore(storeString)`.
+/// Build the reference `Store()` dictionary for the current state.
+fn build_store_dict(host: &Tjs2Engine, state: &KagParserState) -> Result<DetachedValue, String> {
+    let dict = retained_object(host, "%[]")?;
+    let raw = dict.raw_id();
+    // The lossless emulator snapshot (preferred by `restore`).
+    host.set_member(raw, "data", &TjsValue::String(state.store()))?;
+    // Reference top-level members (`KAGParser.cpp:616-634` and the cur*
+    // block below it).
+    for (key, value) in [
+        (
+            "storageName",
+            TjsValue::String(state.storage_name().to_string()),
+        ),
+        (
+            "storageShortName",
+            TjsValue::String(state.storage_short_name().to_string()),
+        ),
+        ("curLabel", TjsValue::String(state.cur_label().to_string())),
+        ("curLine", TjsValue::Integer(state.cur_line() as i64)),
+        ("curPos", TjsValue::Integer(state.cur_pos() as i64)),
+        (
+            "ExcludeLevel",
+            TjsValue::Integer(i64::from(state.exclude_level())),
+        ),
+        ("IfLevel", TjsValue::Integer(i64::from(state.if_level()))),
+        (
+            "ExcludeLevelStack",
+            TjsValue::String(state::encode_int_stack(state.exclude_level_stack())),
+        ),
+        (
+            "IfLevelExecutedStack",
+            TjsValue::String(state::encode_bool_stack(state.if_level_executed_stack())),
+        ),
+        (
+            "macroArgStackBase",
+            TjsValue::Integer(state.macro_args_base() as i64),
+        ),
+        (
+            "macroArgStackDepth",
+            TjsValue::Integer(state.macro_args_depth() as i64),
+        ),
+    ] {
+        host.set_member(raw, key, &value)?;
+    }
+    // `macros` dictionary (`KAGParser.cpp:506-520`).
+    let macros = retain_dict(host, &state.macros_entries())?;
+    host.set_member(raw, "macros", &TjsValue::Retained(macros.raw_id() as u64))?;
+    drop(macros);
+    // `macroArgs`: an array of dictionaries (`KAGParser.cpp:521-544`).
+    let levels = retained_object(host, "[]")?;
+    for (index, level) in state.macro_args_entries().iter().enumerate() {
+        let level_dict = retain_dict(host, level)?;
+        host.set_member(
+            levels.raw_id(),
+            &index.to_string(),
+            &TjsValue::Retained(level_dict.raw_id() as u64),
+        )?;
+        drop(level_dict);
+    }
+    host.set_member(
+        raw,
+        "macroArgs",
+        &TjsValue::Retained(levels.raw_id() as u64),
+    )?;
+    drop(levels);
+    // `callStack`: an array of dictionaries (`KAGParser.cpp:546-634`).
+    let stack = retained_object(host, "[]")?;
+    for (index, entry) in state.call_stack_snapshots().iter().enumerate() {
+        let entry_dict = retained_object(host, "%[]")?;
+        let entry_raw = entry_dict.raw_id();
+        for (key, value) in [
+            ("storage", TjsValue::String(entry.storage.clone())),
+            ("label", TjsValue::String(entry.label.clone())),
+            ("offset", TjsValue::Integer(entry.offset as i64)),
+            ("orgLineStr", TjsValue::String(entry.org_line_str.clone())),
+            ("pos", TjsValue::Integer(entry.pos as i64)),
+            (
+                "macroArgStackBase",
+                TjsValue::Integer(entry.macro_arg_stack_base as i64),
+            ),
+            (
+                "macroArgStackDepth",
+                TjsValue::Integer(entry.macro_arg_stack_depth as i64),
+            ),
+            (
+                "ExcludeLevel",
+                TjsValue::Integer(i64::from(entry.exclude_level)),
+            ),
+            ("IfLevel", TjsValue::Integer(i64::from(entry.if_level))),
+            (
+                "ExcludeLevelStack",
+                TjsValue::String(entry.exclude_level_stack.clone()),
+            ),
+            (
+                "IfLevelExecutedStack",
+                TjsValue::String(entry.if_level_executed_stack.clone()),
+            ),
+        ] {
+            host.set_member(entry_raw, key, &value)?;
+        }
+        host.set_member(
+            stack.raw_id(),
+            &index.to_string(),
+            &TjsValue::Retained(entry_raw as u64),
+        )?;
+        drop(entry_dict);
+    }
+    host.set_member(raw, "callStack", &TjsValue::Retained(stack.raw_id() as u64))?;
+    drop(stack);
+    Ok(dict)
+}
+
+/// `restore(dict)` — restore from a `store()` dictionary (reference
+/// `tTJSNI_KAGParser::Restore(iTJSDispatch2*)`, `KAGParser.cpp:723-906`).
+/// The reference takes an **object**, raising on a non-object argument
+/// (`AsObjectNoAddRef`, `tjsVariant.h:686-694`); our own snapshots round-trip
+/// losslessly through the `data` member, and reference-format dictionaries
+/// are imported through [`dict_to_entries`].
 extern "C" fn native_restore(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -587,22 +826,152 @@ extern "C" fn native_restore(
     if argc < 1 {
         return report_error(out_error, "KAGParser.restore requires 1 argument");
     }
+    let host = match resolve_host(engine) {
+        Ok(host) => host,
+        Err(e) => return report_error(out_error, &e),
+    };
     // SAFETY: the trampoline guarantees `argc` valid `Value` entries.
-    let s = match param_to_string(&unsafe { args(argv, argc) }[0]) {
-        Ok(s) => s,
+    let value = &unsafe { args(argv, argc) }[0];
+    if value.ty != VAL_OBJECT || value.object_handle().is_null() {
+        return report_error(
+            out_error,
+            "KAGParser.restore: please specify the dictionary returned by store()",
+        );
+    }
+    let object = match host.retain_object_arg(value) {
+        Ok(object) => object,
         Err(e) => return report_error(out_error, &e),
     };
     let mut env = match make_env(engine, ptr::null_mut()) {
         Ok(env) => env,
         Err(e) => return report_error(out_error, &e),
     };
-    match unsafe { state_of(instance) }.restore(&s, &mut env.environ()) {
-        Ok(()) => {
-            set_void(out);
-            0
-        }
-        Err(e) => report_error(out_error, &e),
+    let state = unsafe { state_of(instance) };
+    match host.get_member(object.raw_id(), "data") {
+        // The emulator's own snapshot: exact round-trip.
+        Ok(TjsValue::String(snapshot)) => match state.restore(&snapshot, &mut env.environ()) {
+            Ok(()) => {
+                set_void(out);
+                0
+            }
+            Err(e) => report_error(out_error, &e),
+        },
+        // A reference-format dictionary (or anything else): import it.
+        _ => match dict_to_entries(host, object.raw_id()) {
+            Ok(entries) => match state.restore_decoded(entries, &mut env.environ()) {
+                Ok(()) => {
+                    set_void(out);
+                    0
+                }
+                Err(e) => report_error(out_error, &e),
+            },
+            Err(e) => report_error(out_error, &e),
+        },
     }
+}
+
+/// Convert a reference-format save dictionary into the emulator's ordered
+/// entries for `KagParserState::restore_decoded`, mapping the member names
+/// the reference reads (`KAGParser.cpp:723-906`) onto the state's keys.
+fn dict_to_entries(host: &Tjs2Engine, dict: Tjs2ValueId) -> Result<Vec<(String, String)>, String> {
+    let mut entries: Vec<(String, String)> = Vec::new();
+    let scalar = |src: &str, dst: &str, entries: &mut Vec<(String, String)>| {
+        if let Some(value) = scalar_member(host, dict, src) {
+            entries.push((dst.to_string(), value));
+        }
+    };
+    // Top-level scalars (`KAGParser.cpp:857-906`); `curPos` maps onto the
+    // emulator's character index, the closest member of its walk model.
+    scalar("storageName", "storageName", &mut entries);
+    scalar("storageShortName", "storageShortName", &mut entries);
+    scalar("curLabel", "curLabel", &mut entries);
+    scalar("curLine", "curLine", &mut entries);
+    scalar("curPos", "charIndex", &mut entries);
+    scalar("ignoreCR", "ignoreCR", &mut entries);
+    scalar("processSpecialTags", "processSpecialTags", &mut entries);
+    scalar("multiLineTagEnabled", "multiLineTagEnabled", &mut entries);
+    scalar("debugLevel", "debugLevel", &mut entries);
+    scalar("ExcludeLevel", "excludeLevel", &mut entries);
+    scalar("IfLevel", "ifLevel", &mut entries);
+    scalar("ExcludeLevelStack", "excludeLevelStack", &mut entries);
+    scalar("IfLevelExecutedStack", "ifLevelExecutedStack", &mut entries);
+    scalar("macroArgStackBase", "macroArgStackBase", &mut entries);
+
+    // `macroArgs` (`KAGParser.cpp:740-769`), including the reference's
+    // `TVPKAGMalformedSaveData` depth check (`KAGParser.cpp:51`).
+    let explicit_depth = host
+        .get_member(dict, "macroArgStackDepth")
+        .ok()
+        .and_then(|value| match value {
+            TjsValue::Integer(v) => Some(v),
+            TjsValue::Real(v) => Some(v as i64),
+            _ => None,
+        });
+    if let Some(levels) = retain_object_member(host, dict, "macroArgs") {
+        let count = object_count(host, levels.raw_id())?;
+        if explicit_depth.unwrap_or(0) != count {
+            return Err("Malformed savedata, data may damaged.".to_string());
+        }
+        entries.push(("macroArgStackDepth".to_string(), count.to_string()));
+        for index in 0..count {
+            let Some(level) = retain_object_member(host, levels.raw_id(), &index.to_string())
+            else {
+                continue;
+            };
+            for (ordinal, key) in host.enum_members(level.raw_id())?.iter().enumerate() {
+                let value = scalar_member(host, level.raw_id(), key).unwrap_or_default();
+                entries.push((format!("macroArgs.{index}.{ordinal}.name"), key.clone()));
+                entries.push((format!("macroArgs.{index}.{ordinal}.value"), value));
+            }
+            drop(level);
+        }
+        drop(levels);
+    }
+
+    // `macros` (`KAGParser.cpp:727-735`).
+    if let Some(macros) = retain_object_member(host, dict, "macros") {
+        let names = host.enum_members(macros.raw_id())?;
+        entries.push(("macrosCount".to_string(), names.len().to_string()));
+        for name in &names {
+            let body = scalar_member(host, macros.raw_id(), name).unwrap_or_default();
+            entries.push((format!("macros.{}", kvp::escape_field(name)), body));
+        }
+        drop(macros);
+    }
+
+    // `callStack` (`KAGParser.cpp:774-855`): map the reference entry keys
+    // onto the emulator's; `lineBuffer`/`lineBufferUsing` have no counterpart
+    // and are skipped (`orgLineStr` → `orgSig`, `pos` → `charIndex`).
+    if let Some(stack) = retain_object_member(host, dict, "callStack") {
+        let count = object_count(host, stack.raw_id())?;
+        entries.push(("callStackCount".to_string(), count.to_string()));
+        for index in 0..count {
+            let Some(entry) = retain_object_member(host, stack.raw_id(), &index.to_string()) else {
+                continue;
+            };
+            let prefix = format!("callStack.{index}.");
+            for (src, dst) in [
+                ("storage", "storage"),
+                ("label", "label"),
+                ("offset", "offset"),
+                ("orgLineStr", "orgSig"),
+                ("pos", "charIndex"),
+                ("macroArgStackBase", "macroArgStackBase"),
+                ("macroArgStackDepth", "macroArgStackDepth"),
+                ("ExcludeLevel", "excludeLevel"),
+                ("IfLevel", "ifLevel"),
+                ("ExcludeLevelStack", "excludeLevelStack"),
+                ("IfLevelExecutedStack", "ifLevelExecutedStack"),
+            ] {
+                if let Some(value) = scalar_member(host, entry.raw_id(), src) {
+                    entries.push((format!("{prefix}{dst}"), value));
+                }
+            }
+            drop(entry);
+        }
+        drop(stack);
+    }
+    Ok(entries)
 }
 
 /// `clearCallStack()`.
@@ -709,17 +1078,13 @@ macro_rules! prop_set_bool {
             _engine: *mut c_void,
             instance: *mut c_void,
             value: *const Value,
-            out_error: *mut *mut c_char,
+            _out_error: *mut *mut c_char,
             _objthis: *mut c_void,
         ) -> c_int {
             // SAFETY: value follows the trampoline contract.
-            match param_to_bool(unsafe { &*value }) {
-                Ok(v) => {
-                    unsafe { state_of(instance) }.$method(v);
-                    0
-                }
-                Err(e) => report_error(out_error, &e),
-            }
+            let v = param_to_bool(unsafe { &*value });
+            unsafe { state_of(instance) }.$method(v);
+            0
         }
     };
 }
@@ -742,7 +1107,47 @@ macro_rules! prop_get_string {
     };
 }
 
-/// `getMacroParams()` — the top macro-args dictionary, or void.
+/// Publish `entries` through a cached dictionary: reuse the cached object
+/// while the content is unchanged — the reference hands the same dictionary
+/// out on every read (`GetMacrosNoAddRef` / `GetMacroTopNoAddRef`,
+/// `KAGParser.cpp:2474`, `2487-2501`) — and rebuild it when the content
+/// changed. The reference mutates its dictionary in place instead, but a TJS
+/// `Dictionary` cannot be cleared through an instance member (`clear` and
+/// `assign` are `TJS_STATICMEMBER`s, `tjsDictionary.cpp:235-245`, `186-211`,
+/// so instance lookup misses them — which is why the reference itself fetches
+/// `DicClear` from the *class object* at `KAGParser.cpp:336-344`) and the C
+/// ABI has no explicit-`objthis` invocation for the class-fetched method.
+fn publish_cached_dict(
+    host: &Tjs2Engine,
+    cache: &mut Option<DetachedValue>,
+    snapshot: &mut Vec<(String, String)>,
+    entries: &[(String, String)],
+) -> Result<(), String> {
+    if cache.is_some() && snapshot.as_slice() == entries {
+        return Ok(());
+    }
+    *cache = Some(retain_dict(host, entries)?);
+    *snapshot = entries.to_vec();
+    Ok(())
+}
+
+/// Write TJS `null` into `out` (the reference hands a null pointer through
+/// `tTJSVariant(params, params)`, `KAGParser.cpp:2499-2501`).
+fn set_null_result(host: &Tjs2Engine, out: *mut Value) {
+    if out.is_null() {
+        return;
+    }
+    match host.eval_retained("null", "KAGParser.null") {
+        Ok(RetainedValue::Object(null)) => {
+            set_retained_object(out, null);
+        }
+        _ => set_void(out),
+    }
+}
+
+/// `getMacroParams()` — the top macro-args dictionary, or `null` when the
+/// stack is empty (reference `GetMacroTopNoAddRef`, `KAGParser.cpp:2191-2196`
+/// + the null `tTJSVariant` at `2499-2501`).
 extern "C" fn native_get_macro_params(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -756,36 +1161,45 @@ extern "C" fn native_get_macro_params(
         Ok(host) => host,
         Err(e) => return report_error(out_error, &e),
     };
-    match unsafe { state_of(instance) }.get_macro_params_entries() {
-        Some(entries) => match retain_dict(host, &entries) {
-            Ok(dict) => {
-                set_retained_object(out, dict);
-                0
-            }
-            Err(e) => report_error(out_error, &e),
-        },
-        None => {
-            set_void(out);
-            0
-        }
+    let instance = unsafe { instance_of(instance) };
+    let Some(entries) = instance.state.macro_params_entries() else {
+        set_null_result(host, out);
+        return 0;
+    };
+    if let Err(e) = publish_cached_dict(
+        host,
+        &mut instance.macro_args_dict,
+        &mut instance.macro_args_snapshot,
+        entries,
+    ) {
+        return report_error(out_error, &e);
     }
+    let Some(dict) = instance.macro_args_dict.as_ref() else {
+        set_void(out);
+        return 0;
+    };
+    match host.duplicate_retained(dict.raw_id()) {
+        Ok(duplicate) => set_retained_object(out, duplicate),
+        Err(e) => return report_error(out_error, &e),
+    }
+    0
 }
 
 // ---------------------------------------------------------------------------
 // native properties
 // ---------------------------------------------------------------------------
 
-prop_get_bool!(prop_ignore_cr_get, get_ignore_cr);
+prop_get_bool!(prop_ignore_cr_get, ignore_cr);
 prop_set_bool!(prop_ignore_cr_set, set_ignore_cr);
-prop_get_bool!(prop_process_special_tags_get, get_process_special_tags);
+prop_get_bool!(prop_process_special_tags_get, process_special_tags);
 prop_set_bool!(prop_process_special_tags_set, set_process_special_tags);
-prop_get_int!(prop_debug_level_get, get_debug_level);
-prop_get_int!(prop_cur_line_get, get_cur_line);
-prop_get_int!(prop_cur_pos_get, get_cur_pos);
-prop_get_int!(prop_call_stack_depth_get, get_call_stack_depth);
-prop_get_string!(prop_cur_line_str_get, get_cur_line_str);
-prop_get_string!(prop_cur_storage_get, get_storage_name);
-prop_get_string!(prop_cur_label_get, get_cur_label);
+prop_get_int!(prop_debug_level_get, debug_level);
+prop_get_int!(prop_cur_line_get, cur_line);
+prop_get_int!(prop_cur_pos_get, cur_pos);
+prop_get_int!(prop_call_stack_depth_get, call_stack_depth);
+prop_get_string!(prop_cur_line_str_get, cur_line_str);
+prop_get_string!(prop_cur_storage_get, storage_name);
+prop_get_string!(prop_cur_label_get, cur_label);
 
 extern "C" fn prop_debug_level_set(
     _engine: *mut c_void,
@@ -795,10 +1209,11 @@ extern "C" fn prop_debug_level_set(
     _objthis: *mut c_void,
 ) -> c_int {
     // SAFETY: value follows the trampoline contract.
-    let level = match param_to_string(unsafe { &*value })
-        .and_then(|s| s.parse::<i32>().map_err(|e| e.to_string()))
-    {
-        Ok(level) => level,
+    // `SetDebugLevel((tTVPKAGDebugLevel)(tjs_int)(*param))` uses the
+    // reference `operator tjs_int` → `AsInteger` conversion, which truncates
+    // reals and raises on objects (`tjsVariant.h:933-935`).
+    let level = match try_value_as_i64(unsafe { &*value }) {
+        Ok(level) => level as i32,
         Err(e) => return report_error(out_error, &e),
     };
     unsafe { state_of(instance) }.set_debug_level(level);
@@ -838,36 +1253,25 @@ extern "C" fn prop_macros_get(
         Ok(host) => host,
         Err(e) => return report_error(out_error, &e),
     };
-    let entries = unsafe { state_of(instance) }.get_macros_entries();
-    match retain_dict(host, &entries) {
-        Ok(dict) => {
-            set_retained_object(out, dict);
-            0
-        }
-        Err(e) => report_error(out_error, &e),
+    let instance = unsafe { instance_of(instance) };
+    let entries = instance.state.macros_entries();
+    if let Err(e) = publish_cached_dict(
+        host,
+        &mut instance.macros_dict,
+        &mut instance.macros_snapshot,
+        &entries,
+    ) {
+        return report_error(out_error, &e);
     }
-}
-
-extern "C" fn prop_macros_set(
-    _engine: *mut c_void,
-    instance: *mut c_void,
-    value: *const Value,
-    out_error: *mut *mut c_char,
-    _objthis: *mut c_void,
-) -> c_int {
-    // SAFETY: value follows the trampoline contract.
-    let s = match param_to_string(unsafe { &*value }) {
-        Ok(s) => s,
-        Err(e) => return report_error(out_error, &e),
+    let Some(dict) = instance.macros_dict.as_ref() else {
+        set_void(out);
+        return 0;
     };
-    log::warn!(
-        "KAGParser: macros property is read-only in the reference \
-         (assign incontextof macros); treating `p.macros = ...` as setMacros"
-    );
-    match unsafe { state_of(instance) }.set_macros(&s) {
-        Ok(()) => 0,
-        Err(e) => report_error(out_error, &e),
+    match host.duplicate_retained(dict.raw_id()) {
+        Ok(duplicate) => set_retained_object(out, duplicate),
+        Err(e) => return report_error(out_error, &e),
     }
+    0
 }
 
 extern "C" fn prop_macro_params_get(
@@ -898,7 +1302,7 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
         name: "KAGParser",
         create: kagparser_create,
         destroy: kagparser_destroy,
-        invalidate: None,
+        invalidate: Some(kagparser_invalidate),
         methods: vec![
             NativeInstanceMethodDef {
                 name: "KAGParser",
@@ -1002,7 +1406,8 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
             NativeInstancePropertyDef {
                 name: "macros",
                 get: Some(prop_macros_get),
-                set: Some(prop_macros_set),
+                // `TJS_DENY_NATIVE_PROP_SETTER` (`KAGParser.cpp:2482`).
+                set: None,
             },
             NativeInstancePropertyDef {
                 name: "macroParams",

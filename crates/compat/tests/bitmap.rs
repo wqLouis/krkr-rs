@@ -165,6 +165,13 @@ fn load_populates_the_bitmap_and_returns_metainfo() {
 
     env.run("var b = new Bitmap(1, 1); var meta = b.load('images/test.img');");
 
+    // The reference `Bitmap` member list registers no `id`/`nativeId`
+    // (`reference/cpp/core/visual/BitmapIntf.cpp:227`), so reading them raises.
+    assert!(env.eval("b.id").is_err(), "Bitmap has no `id` member");
+    assert!(
+        env.eval("b.nativeId").is_err(),
+        "Bitmap has no `nativeId` member"
+    );
     assert_eq!(env.eval_int("b.width"), 2);
     assert_eq!(env.eval_int("b.height"), 2);
     // Straight-alpha RGBA (1, 2, 3, 255) reads back as ARGB 0xff010203.

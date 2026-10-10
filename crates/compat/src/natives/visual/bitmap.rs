@@ -25,6 +25,14 @@ struct BitmapInst {
     loading: bool,
 }
 
+/// The scene id a `Bitmap` payload carries — the reader behind the VM's
+/// native-instance lookup (`native_instance_payload("Bitmap")`), replacing
+/// the removed `id`/`nativeId` script members for engine call sites.
+pub(super) fn bitmap_payload_id(payload: *mut c_void) -> Option<u32> {
+    // SAFETY: `native_instance_payload("Bitmap")` only hands out Bitmap payloads.
+    unsafe { &*(payload as *const BitmapInst) }.id
+}
+
 // ---------------------------------------------------------------------------
 // Host-supplied image codec (the L1 `media` seam)
 // ---------------------------------------------------------------------------
@@ -45,7 +53,7 @@ type SaveFn = dyn Fn(&str, &str, u32, u32, &[u8]) -> Result<(), String>;
 /// L3 (`compat`) never links the L1 `media` codec; the L4 host installs the
 /// decode/probe/save closures through [`crate::CompatHost::set_image_codec`],
 /// exactly like the `WaveSoundBuffer` audio decoder seam. A member whose
-/// closure is missing raises a typed error (D11) instead of fabricating a
+/// closure is missing raises a typed error instead of fabricating a
 /// result.
 #[derive(Default)]
 struct BitmapCodec {
@@ -61,7 +69,7 @@ impl crate::CompatHost {
     /// `Bitmap.loadHeader` and `save` backs `Bitmap.save`. Only the L4 host
     /// links the L1 `media` crate; the integration tests install a synthetic
     /// codec here. A member whose closure is absent raises a typed error
-    /// (D11) instead of fabricating a result.
+    /// instead of fabricating a result.
     pub fn set_image_codec(
         &self,
         decode: impl Fn(&[u8], Option<&str>) -> Result<DecodedImage, String> + 'static,
@@ -84,7 +92,10 @@ const IMAGE_EXTENSION_PROBE: [&str; 21] = [
 
 /// Read `name` through the attached L2 [`Storage`], probing the common image
 /// extensions when the name itself does not resolve.
-fn read_image_from_storage(storage: &Storage, name: &str) -> Result<(String, Vec<u8>), String> {
+pub(crate) fn read_image_from_storage(
+    storage: &Storage,
+    name: &str,
+) -> Result<(String, Vec<u8>), String> {
     let mut candidates: Vec<String> = Vec::with_capacity(IMAGE_EXTENSION_PROBE.len() + 1);
     candidates.push(name.to_string());
     candidates.extend(
@@ -103,7 +114,7 @@ fn read_image_from_storage(storage: &Storage, name: &str) -> Result<(String, Vec
 }
 
 /// Decode image bytes through the installed host decoder.
-fn decode_image(
+pub(crate) fn decode_image(
     services: &CompatServices,
     name: &str,
     bytes: &[u8],
@@ -126,7 +137,13 @@ fn probe_image(services: &CompatServices, name: &str, bytes: &[u8]) -> Result<Im
 
 /// Overwrite an existing scene bitmap's pixels in place, reusing its id (the
 /// reference `Bitmap.load` replaces the current image).
-fn replace_bitmap_pixels(scene: &mut Scene, id: u32, width: u32, height: u32, rgba: Vec<u8>) {
+pub(crate) fn replace_bitmap_pixels(
+    scene: &mut Scene,
+    id: u32,
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+) {
     scene.resize_bitmap(id, width, height, [0, 0, 0, 0]);
     if let Some(bitmap) = scene.bitmap_mut(id) {
         bitmap.width = width;
@@ -138,14 +155,14 @@ fn replace_bitmap_pixels(scene: &mut Scene, id: u32, width: u32, height: u32, rg
 }
 
 /// `TVP_clNone`: no color key.
-const COLOR_KEY_NONE: u32 = 0x1fff_ffff;
+pub(crate) const COLOR_KEY_NONE: u32 = 0x1fff_ffff;
 /// `TVP_clAdapt`: the most frequent color on the first scanline.
 const COLOR_KEY_ADAPT: u32 = 0x01ff_ffff;
 
 /// Apply the reference color-key transparency to a decoded RGBA8 image
 /// (`TVPMakeAlphaFromKey`): matching pixels become transparent, all others
 /// opaque.
-fn apply_color_key(rgba: &mut [u8], width: u32, keyidx: u32) {
+pub(crate) fn apply_color_key(rgba: &mut [u8], width: u32, keyidx: u32) {
     if keyidx == COLOR_KEY_NONE {
         return;
     }
@@ -566,10 +583,13 @@ extern "C" fn bitmap_copy_from(
     let Ok((resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Bitmap.copyFrom: compat context is not bound");
     };
-    let source_id = match resolve_object_id(resolved.engine(), &unsafe { args(argv, argc) }[0]) {
+    let source_id = match resolve_object_id(
+        resolved.engine(),
+        &unsafe { args(argv, argc) }[0],
+        &["Bitmap"],
+    ) {
         Ok(id) if id >= 0 => id as u32,
-        Ok(_) => return report_error(out_error, "Bitmap.copyFrom: not a Bitmap object"),
-        Err(error) => return report_error(out_error, &error),
+        _ => return report_error(out_error, "Bitmap.copyFrom: not a Bitmap object"),
     };
     let inst = unsafe { &*(instance as *const BitmapInst) };
     let Some(id) = inst.id else {
@@ -602,7 +622,7 @@ extern "C" fn bitmap_copy_from(
 /// `Bitmap.save(name[, type[, meta]])` — encode this bitmap and write it
 /// through the installed host saver. The L2 [`Storage`] API is read-only, so
 /// the host owns the write; without an installed encoder the member raises a
-/// typed error (D11).
+/// typed error.
 extern "C" fn bitmap_save(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -892,18 +912,6 @@ extern "C" fn bitmap_independ(
 
 // --- Bitmap properties -----------------------------------------------------
 
-extern "C" fn bitmap_id_get(
-    _engine: *mut c_void,
-    instance: *mut c_void,
-    out: *mut Value,
-    _out_error: *mut *mut c_char,
-    _objthis: *mut c_void,
-) -> c_int {
-    let inst = unsafe { &*(instance as *const BitmapInst) };
-    set_int(out, inst.id.map_or(0, i64::from));
-    0
-}
-
 /// `bitmap.width`.
 extern "C" fn bitmap_width_get(
     engine: *mut c_void,
@@ -1181,16 +1189,6 @@ pub(super) fn register_bitmap_class(ctx: &mut CompatCtx) -> Result<(), CompatErr
             },
         ],
         properties: vec![
-            NativeInstancePropertyDef {
-                name: "id",
-                get: Some(bitmap_id_get),
-                set: None,
-            },
-            NativeInstancePropertyDef {
-                name: "nativeId",
-                get: Some(bitmap_id_get),
-                set: None,
-            },
             NativeInstancePropertyDef {
                 name: "width",
                 get: Some(bitmap_width_get),

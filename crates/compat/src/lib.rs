@@ -5,20 +5,20 @@
 //! native plugins. It implements the script API by *composing* L2
 //! primitives; it owns no engine state and contains no platform code.
 //!
-//! This wave lays out the plugin/VM architecture:
+//! The plugin/VM architecture:
 //!
 //! * [`NativePlugin`] / [`PluginRegistry`] — the statically built-in plugin
 //!   set and activation by name;
 //! * the **null plugin object** (the `null_plugin` module) for DLLs we
-//!   cannot load (doc 08 §4.2, D14);
+//!   cannot load;
 //! * [`CompatCtx`] / [`CompatServices`] — the explicit L2 service handles
 //!   natives register against;
 //! * [`CompatHost`] — owns the dispatch state and installs the one
-//!   process-wide engine → context binding the C ABI forces (doc 08 §3.1);
+//!   process-wide engine → context binding the C ABI forces;
 //! * [`EventAdapter`] — the L1 → L3 → L4 event mapping skeleton;
 //! * [`FrameBody`] / [`run_frame_body`] — the ordered per-frame poll body.
 //!
-//! # The one process-wide binding (doc 08 §3.1)
+//! # The one process-wide binding
 //!
 //! The C++ ABI hands native callbacks only the raw `tjs2_engine*` and
 //! `tjs` exposes no user-data slot. `compat` therefore keeps
@@ -27,8 +27,6 @@
 //! [`Tjs2Engine`](tjs::Tjs2Engine), the [`CompatServices`] and the
 //! [`PluginRegistry`]. It is L3-only (never L1), holds dispatch state and
 //! never game state, and is installed/removed by [`CompatHost`].
-//!
-//! See `docs/migration/08-tjs-vm-and-native-plugins.md`.
 
 #![warn(missing_docs)]
 
@@ -56,11 +54,36 @@ pub use natives::visual::timer_poll;
 pub use natives::video::{video_advance, video_poll};
 // The built-in `WaveSoundBuffer` poll, plus the host seam that installs the L1
 // media audio decoder (L3 never links a codec).
-pub use natives::sound::{AudioDecoder, set_audio_decoder, sound_poll};
+pub use natives::sound::{AudioDecoder, add_audio_decoder, sound_poll, sound_render};
+// The disc-sound host seam that installs the L1 media audio decoder for
+// `CDDASoundBuffer`/`MIDISoundBuffer` (mirrors [`add_audio_decoder`]).
+pub use natives::cdda_midi::set_disc_audio_decoder;
+// The built-in `System` poll and the host's exit-request drain: an L4
+// [`FrameBody`] forwards its `continuous_handler_poll` step here and the frame
+// loop consumes `take_exit_request`.
+pub use natives::system::{continuous_handler_poll, take_exit_request};
+// The core of `Scripts.execStorage` without the native wrapper: the
+// composition root runs the startup sequence through this.
+pub use natives::scripts::exec_storage;
 // The built-in `AsyncTrigger` poll: an L4 [`FrameBody`] forwards its
 // `async_trigger_poll` step here (deferred script callbacks).
 pub use natives::async_trigger::async_trigger_poll;
+// The tree-owner / frame-body hand-offs: the frame body's `project_and_render`
+// step advances layer transitions and drains the host's window/capture
+// requests.
+pub use natives::visual::{
+    advance_transitions, paint_poll, take_bring_to_front_requests, take_capture_releases,
+    take_update_requests,
+};
 pub use plugin::{NativePlugin, PluginOutcome, PluginRegistry, normalize_plugin_name, plugin_stem};
+
+/// The DLL names of every ported plugin (the `Plugins.link` targets).
+///
+/// A host or test can link them all to expose the full plugin surface; the
+/// product leaves linking to the game.
+pub fn builtin_plugin_names() -> impl Iterator<Item = &'static str> {
+    natives::plugins::BUILTIN_PLUGINS.iter().map(|def| def.name)
+}
 
 /// Errors from the compatibility surface.
 #[derive(Debug, thiserror::Error)]

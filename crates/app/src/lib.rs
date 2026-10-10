@@ -1,9 +1,7 @@
 //! krkr-rs host assembly: owns the middle-layer state values and the
 //! per-frame step, wired to the L1 platform by the `krkr` binary.
 //!
-//! [`Host`] is the engine-driving frontend described in
-//! `docs/migration/02-target-architecture.md` §1 and
-//! `docs/migration/03-middle-layer-api.md` §8. It owns the stateless bottom
+//! [`Host`] is the engine-driving frontend. It owns the stateless bottom
 //! objects ([`RenderPipeline`], [`FileSystem`], [`Media`]) together with all
 //! of the evolving middle-layer state:
 //!
@@ -15,13 +13,19 @@
 //!
 //! There are no globals, statics or hidden caches: every value is a local
 //! field of [`Host`] and is passed to the bottom objects explicitly. Two
-//! hosts can therefore run in the same process. The per-frame work is the
-//! projection seam from `02-target-architecture.md` §3: sync dirty bitmaps,
-//! upload textures, project the tree and make one `render` call.
+//! hosts can therefore run in the same process. The per-frame work is one
+//! projection pass: sync dirty bitmaps, upload textures, project the tree and
+//! make one `render` call.
 
-#![forbid(unsafe_code)]
+// The composition root installs the VM's raw-pointer binding to the L2 scene
+// and storage (`compat::CompatServices::attach_scene`/`attach_storage`), which
+// is inherently `unsafe`. That wiring is the crate's only `unsafe`, confined
+// to `game` and covered by SAFETY comments; every other module is safe.
+#![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+mod audio;
+mod game;
 mod image_codec;
 
 use std::collections::HashMap;
@@ -40,6 +44,8 @@ use render::{
     create_texture, drop_texture, render, resize as resize_render, upload_texture,
 };
 
+pub use audio::install_audio_decoder;
+pub use game::{GameError, GameHost};
 pub use image_codec::{install_image_codec, install_image_codec_on};
 pub use render::{BackendKind, FrameStats};
 
@@ -90,7 +96,7 @@ pub struct HostConfig {
     ///
     /// When `true` the host uses [`platform::headless_window_handle`]
     /// and requires the null backend. When `false`, [`window_handle`]
-    /// must be `Some`; a real backend with no handle is an error (D11).
+    /// must be `Some`; a real backend with no handle is an error.
     ///
     /// [`window_handle`]: HostConfig::window_handle
     pub headless: bool,
@@ -191,6 +197,13 @@ pub struct Host {
     textures: HashMap<u32, Texture>,
     /// Latest raw input snapshot.
     input: InputState,
+    /// Whether the host runs offscreen with no window (from
+    /// [`HostConfig::headless`]).
+    ///
+    /// The game host reads this at open time to pick the L1 audio backend:
+    /// a headless host cannot assume an audio server exists and opens the
+    /// null device (see `audio` module docs).
+    headless: bool,
     /// Frames rendered so far.
     frame_index: u64,
     /// Simulated time advanced through [`Host::step`].
@@ -256,6 +269,7 @@ impl Host {
             render_state,
             textures: HashMap::new(),
             input: InputState::default(),
+            headless: config.headless,
             frame_index: 0,
             elapsed_ms: 0.0,
             surface_size,
@@ -385,6 +399,14 @@ impl Host {
     /// Returns the latest raw input snapshot.
     pub fn input(&self) -> &InputState {
         &self.input
+    }
+
+    /// Whether this host runs offscreen with no window.
+    ///
+    /// Mirrors [`HostConfig::headless`]: the game host uses it to select the
+    /// L1 null audio backend instead of opening a real device.
+    pub fn is_headless(&self) -> bool {
+        self.headless
     }
 
     /// Returns the current surface size in pixels.

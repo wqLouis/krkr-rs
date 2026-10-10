@@ -32,11 +32,6 @@
 //! * `%`-directive lines are skipped silently (the `parser` module parses
 //!   them as control lines; the reference would emit them as text).
 
-// The port keeps the reference's full method/helper surface (including the
-// string-form macro accessors and the `MSG_MALFORMED_SAVE` message), so some
-// items are unused by the native adapter.
-#![allow(dead_code)]
-
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::parser::{Bracket, Event};
@@ -52,7 +47,6 @@ pub const MSG_CALL_STACK_UNDERFLOW: &str =
     "'return' is not matched to any 'call' ( 'return' is unexpected )";
 pub const MSG_RETURN_LOST_SYNC: &str = "Lost return position due to the scenario file changed.";
 pub const MSG_LABEL_IN_MACRO: &str = "Label in macro 'iscript' is illegal.";
-pub const MSG_MALFORMED_SAVE: &str = "Malformed savedata, data may damaged.";
 
 /// The result of evaluating a TJS expression through [`Environ::eval`].
 #[derive(Debug, Clone, PartialEq)]
@@ -129,6 +123,37 @@ struct Splice {
     line_r_after: bool,
 }
 
+/// The reference `tCallStackData` fields the native `store()` dictionary
+/// carries (`KAGParser.cpp:546-634`). `lineBuffer` / `lineBufferUsing` have
+/// no counterpart in this walk model and are omitted rather than invented.
+/// The stack fields use the reference encodings (`StoreIntStackToDic` /
+/// `StoreBoolStackToDic`).
+#[derive(Debug, Clone)]
+pub struct CallStackSnapshot {
+    /// The scenario storage the call returns to.
+    pub storage: String,
+    /// The label the call returns to.
+    pub label: String,
+    /// The walk offset the call returns to.
+    pub offset: usize,
+    /// The original line text at the call site.
+    pub org_line_str: String,
+    /// The position within that line at the call site.
+    pub pos: usize,
+    /// The macro-argument stack base at the call site.
+    pub macro_arg_stack_base: usize,
+    /// The macro-argument stack depth at the call site.
+    pub macro_arg_stack_depth: usize,
+    /// The exclude level at the call site.
+    pub exclude_level: i32,
+    /// The if level at the call site.
+    pub if_level: i32,
+    /// The exclude-level stack, reference hex-encoded.
+    pub exclude_level_stack: String,
+    /// The if-executed stack, reference `"01"`-encoded.
+    pub if_level_executed_stack: String,
+}
+
 /// One call-stack entry (the reference's `tCallStackData`).
 #[derive(Debug, Clone, Default, PartialEq)]
 struct CallStackEntry {
@@ -196,7 +221,11 @@ pub type TagOutput = (String, Vec<(String, String)>);
 
 /// The KAGParser native instance state: the parsed scenario, the walk
 /// position, and the macro/conditional/call machinery.
-#[derive(Debug)]
+///
+/// `Clone` supports the reference `assign` copy
+/// (`tTJSNI_KAGParser::operator=`, `KAGParser.cpp:395-466`), which copies
+/// the whole walk state between two parser instances.
+#[derive(Debug, Clone)]
 pub struct KagParserState {
     // scenario
     events: Vec<Event>,
@@ -1344,7 +1373,17 @@ impl KagParserState {
     /// Restore state from a [`Self::store`] string (the reference
     /// `Restore`). Re-loads the scenario from storage like the reference.
     pub fn restore(&mut self, s: &str, env: &mut Environ<'_>) -> Result<(), String> {
-        let entries = kvp::decode_dict(s);
+        self.restore_decoded(kvp::decode_dict(s), env)
+    }
+
+    /// The body of [`Self::restore`] over already-decoded ordered entries;
+    /// the native `restore(dict)` uses this with entries converted from a
+    /// reference-format dictionary (`KAGParser.cpp:723-...`).
+    pub fn restore_decoded(
+        &mut self,
+        entries: Vec<(String, String)>,
+        env: &mut Environ<'_>,
+    ) -> Result<(), String> {
         let get = |k: &str| -> Option<&str> {
             entries
                 .iter()
@@ -1408,7 +1447,9 @@ impl KagParserState {
         }
 
         // macro args (name/value pairs are written consecutively, so a
-        // single ordered pass pairs them up)
+        // single ordered pass pairs them up; the argument name is the *value*
+        // of the `.name` entry — `store` writes
+        // `macroArgs.{i}.{j}.name = <arg name>` at `state.rs:1306`)
         self.macro_args.clear();
         if let Some(v) = get_int("macroArgStackDepth") {
             let depth = v as usize;
@@ -1418,9 +1459,9 @@ impl KagParserState {
                 let mut pending_name: Option<String> = None;
                 for (k, val) in &entries {
                     if let Some(rest) = k.strip_prefix(&prefix) {
-                        if let Some(name) = rest.strip_suffix(".name") {
-                            pending_name = Some(kvp::unescape_field(name));
-                        } else if rest.strip_suffix(".value").is_some()
+                        if rest.ends_with(".name") {
+                            pending_name = Some(val.clone());
+                        } else if rest.ends_with(".value")
                             && let Some(name) = pending_name.take()
                         {
                             list.push((name, val.clone()));
@@ -1528,22 +1569,22 @@ impl KagParserState {
     // properties)
     // -------------------------------------------------------------------
 
-    pub fn get_cur_line(&self) -> usize {
+    pub fn cur_line(&self) -> usize {
         self.cur_line
     }
 
-    pub fn get_cur_pos(&self) -> usize {
+    pub fn cur_pos(&self) -> usize {
         self.current_char_pos()
     }
 
-    pub fn get_cur_line_str(&self) -> String {
+    pub fn cur_line_str(&self) -> &str {
         self.raw_lines
             .get(self.cur_line.saturating_sub(1))
-            .cloned()
+            .map(String::as_str)
             .unwrap_or_default()
     }
 
-    pub fn get_ignore_cr(&self) -> bool {
+    pub fn ignore_cr(&self) -> bool {
         self.ignore_cr
     }
 
@@ -1551,7 +1592,7 @@ impl KagParserState {
         self.ignore_cr = v;
     }
 
-    pub fn get_process_special_tags(&self) -> bool {
+    pub fn process_special_tags(&self) -> bool {
         self.process_special_tags
     }
 
@@ -1559,7 +1600,7 @@ impl KagParserState {
         self.process_special_tags = v;
     }
 
-    pub fn get_debug_level(&self) -> i32 {
+    pub fn debug_level(&self) -> i32 {
         self.debug_level
     }
 
@@ -1567,53 +1608,90 @@ impl KagParserState {
         self.debug_level = v;
     }
 
-    pub fn get_storage_name(&self) -> &str {
+    pub fn storage_name(&self) -> &str {
         &self.storage_name
     }
 
-    pub fn get_cur_label(&self) -> &str {
+    pub fn storage_short_name(&self) -> &str {
+        &self.storage_short_name
+    }
+
+    pub fn exclude_level(&self) -> i32 {
+        self.exclude_level
+    }
+
+    pub fn if_level(&self) -> i32 {
+        self.if_level
+    }
+
+    pub fn exclude_level_stack(&self) -> &[i32] {
+        &self.exclude_level_stack
+    }
+
+    pub fn if_level_executed_stack(&self) -> &[bool] {
+        &self.if_level_executed_stack
+    }
+
+    pub fn macro_args_base(&self) -> usize {
+        self.macro_args_base
+    }
+
+    pub fn macro_args_depth(&self) -> usize {
+        self.macro_args.len()
+    }
+
+    /// Every macro-argument level as ordered `(name, value)` lists (the
+    /// reference `MacroArgs` vector of dictionaries).
+    pub fn macro_args_entries(&self) -> &[Vec<(String, String)>] {
+        &self.macro_args
+    }
+
+    /// The call stack in the reference `tCallStackData` field set
+    /// (`KAGParser.cpp:595-634`) for the native `store()` dictionary.
+    pub fn call_stack_snapshots(&self) -> Vec<CallStackSnapshot> {
+        self.call_stack
+            .iter()
+            .map(|entry| CallStackSnapshot {
+                storage: entry.storage.clone(),
+                label: entry.label.clone(),
+                offset: entry.offset,
+                // `tCallStackData::OrgLineStr` ↔ our original line string.
+                org_line_str: entry.org_sig.clone(),
+                // `tCallStackData::Pos` ↔ our position within that line.
+                pos: entry.char_index,
+                macro_arg_stack_base: entry.macro_args_base,
+                macro_arg_stack_depth: entry.macro_args_depth,
+                exclude_level: entry.exclude_level,
+                if_level: entry.if_level,
+                exclude_level_stack: encode_int_stack(&entry.exclude_level_stack),
+                if_level_executed_stack: encode_bool_stack(&entry.if_level_executed_stack),
+            })
+            .collect()
+    }
+
+    pub fn cur_label(&self) -> &str {
         &self.cur_label
     }
 
-    pub fn get_call_stack_depth(&self) -> usize {
+    pub fn call_stack_depth(&self) -> usize {
         self.call_stack.len()
     }
 
     /// The macros dictionary as an ordered `Vec<(name, body)>` (for
     /// building a real TJS Dictionary result).
-    pub fn get_macros_entries(&self) -> Vec<(String, String)> {
+    pub fn macros_entries(&self) -> Vec<(String, String)> {
         self.macros
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect()
     }
 
-    /// Serialize the macros dictionary as `name=body` kvp lines (kept for
-    /// `store()`/string round-trips).
-    pub fn get_macros(&self) -> String {
-        kvp::encode_dict(&self.get_macros_entries())
-    }
-
-    pub fn set_macros(&mut self, s: &str) -> Result<(), String> {
-        let entries = kvp::decode_dict(s);
-        self.macros.clear();
-        for (k, v) in entries {
-            self.macros.insert(k, v);
-        }
-        Ok(())
-    }
-
     /// The top macro-args dictionary (`macroParams`/`mp`) as ordered
     /// `Vec<(name, value)>`, or `None` when no macro arguments are on the
-    /// stack (the reference returns void).
-    pub fn get_macro_params_entries(&self) -> Option<Vec<(String, String)>> {
-        self.macro_args.last().cloned()
-    }
-
-    /// The top macro-args dictionary as kvp lines, or `None` when empty
-    /// (kept for callers that need the string form).
-    pub fn get_macro_params(&self) -> Option<String> {
-        Some(kvp::encode_dict(&self.get_macro_params_entries()?))
+    /// stack (the reference then reports `null`, `KAGParser.cpp:2191-2196` +
+    /// `2499-2501`).
+    pub fn macro_params_entries(&self) -> Option<&[(String, String)]> {
+        self.macro_args.last().map(Vec::as_slice)
     }
 
     pub fn interrupt(&mut self) {
@@ -1769,8 +1847,9 @@ fn bool_str(b: bool) -> String {
     if b { "1".to_string() } else { "0".to_string() }
 }
 
-/// Hex-encode an int stack like the reference `StoreIntStackToDic`.
-fn encode_int_stack(stack: &[i32]) -> String {
+/// Hex-encode an int stack like the reference `StoreIntStackToDic`
+/// (`KAGParser.cpp:637-659`).
+pub fn encode_int_stack(stack: &[i32]) -> String {
     let hex = b"0123456789abcdef";
     let mut out = String::with_capacity(stack.len() * 8);
     for &v in stack {
@@ -1806,7 +1885,9 @@ fn decode_int_stack(s: &str) -> Vec<i32> {
 
 /// Encode a bool stack as "01" characters (reference
 /// `StoreBoolStackToDic`).
-fn encode_bool_stack(stack: &[bool]) -> String {
+/// Encode a bool stack like the reference `StoreBoolStackToDic`
+/// (`KAGParser.cpp:704-722`).
+pub fn encode_bool_stack(stack: &[bool]) -> String {
     stack.iter().map(|&b| if b { '1' } else { '0' }).collect()
 }
 

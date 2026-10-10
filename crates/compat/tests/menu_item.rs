@@ -5,35 +5,48 @@
 //! shared [`common::vm_lock`] (the engine → context binding is process-wide).
 //! The tests exercise the script-visible surface: construction, the tree
 //! operations, the item flags (including the radio group), traversal, click
-//! dispatch and the static shortcut tables. The two members that need a
-//! platform menu (`HMENU`, `popup`) are asserted to raise the explicit typed
-//! error rather than silently default.
+//! dispatch — gated on an ancestor `Window` and that window's `visible`, like
+//! the reference `OnClick` — and the static shortcut tables. The two members
+//! that need a platform menu (`HMENU`, `popup`) are asserted to raise the
+//! explicit typed error rather than silently default.
 
 mod common;
 
 use common::vm_lock;
 use compat::CompatHost;
+use engine::Scene;
 use tjs::{Tjs2Engine, TjsValue};
 
-/// A bound VM + host.
+/// A bound VM + host + attached L2 scene.
 ///
 /// The engine is boxed and the host is declared **before** it so that (a) the
 /// binding's stored engine address stays valid when `Env` is moved (the `Box`
 /// keeps the `Tjs2Engine` on the heap) and (b) the host's `Drop` removes the
-/// process-wide binding before the VM is destroyed.
+/// process-wide binding before the VM is destroyed. The scene is boxed and
+/// declared last so the host's raw pointer to it stays valid for the whole
+/// lifetime of the binding; it backs the native `Window` the click-dispatch
+/// tests attach to their menu trees.
 struct Env {
     _host: CompatHost,
     engine: Box<Tjs2Engine>,
+    _scene: Box<Scene>,
 }
 
 impl Env {
     fn new() -> Env {
         let engine = Box::new(Tjs2Engine::new().expect("create engine"));
+        let mut scene = Box::new(Scene::default());
         let mut host = CompatHost::new();
+        // SAFETY: the boxed scene outlives the binding installed below.
+        unsafe {
+            host.services_mut()
+                .attach_scene(scene.as_mut() as *mut Scene);
+        }
         host.install(&engine).expect("install compat surface");
         Env {
             _host: host,
             engine,
+            _scene: scene,
         }
     }
 
@@ -151,10 +164,16 @@ fn insert_remove_and_index_move() {
     );
     assert_eq!(env.eval_int("root.children[0] === a"), 1);
 
+    // Reference: `tTJSNI_MenuItem::SetIndex` is an empty body on this
+    // platform — it never reorders the parent's children, and the getter
+    // keeps reporting the actual position
+    // (`reference/cpp/core/visual/impl/MenuItemImpl.cpp:209-214`).
     env.run("a.index = 2;");
-    assert_eq!(env.eval_int("a.index"), 2);
-    assert_eq!(env.eval_int("root.children[0] === b"), 1);
-    assert_eq!(env.eval_int("root.children[2] === a"), 1);
+    assert_eq!(env.eval_int("a.index"), 0);
+    assert_eq!(env.eval_int("root.children[0] === a"), 1);
+    assert_eq!(env.eval_int("root.children[1] === b"), 1);
+    assert_eq!(env.eval_int("root.children[2] === c"), 1);
+    assert_eq!(env.eval_int("root.children.length"), 3);
 
     env.run("root.remove(b);");
     assert_eq!(env.eval_int("root.children.length"), 2);
@@ -185,15 +204,23 @@ fn children_array_is_cached_and_refreshed() {
     assert_eq!(env.eval_int("kids.length"), 2);
 }
 
+/// Reference: `OnClick` first checks the enabled chain and then requires a
+/// `Window` somewhere in the ancestor chain whose `CanDeliverEvents()` holds
+/// (`reference/cpp/core/visual/MenuItemIntf.cpp:196-213`), so the item is
+/// attached to a root that carries a native `Window` (the scene starts its
+/// windows visible) before the click is expected to deliver.
 #[test]
 fn fire_click_honours_enabled_and_script_on_click() {
     let _lock = vm_lock();
     let env = Env::new();
     env.run(
-        "var n = 0; \
+        "var w = new Window(); \
+         var root = new MenuItem(null, w); \
+         var n = 0; \
          var m = new MenuItem(null, 'Open'); \
          m.onClick = function() { n += 1; }; \
          m.shortcut = 'Ctrl+O'; \
+         root.add(m); \
          m.enabled = false; \
          m.fireClick(); \
          m.enabled = true; \
@@ -204,13 +231,19 @@ fn fire_click_honours_enabled_and_script_on_click() {
     assert_eq!(env.eval_int("n"), 1);
 }
 
+/// Reference: a disabled item (or one under a disabled ancestor) returns
+/// before the event is posted (`reference/cpp/core/visual/MenuItemIntf.cpp:196-199`),
+/// *given* the window the reference `OnClick` additionally demands — the
+/// tree below carries its `Window` on the root ancestor
+/// (`reference/cpp/core/visual/MenuItemIntf.cpp:200-211`).
 #[test]
 fn fire_click_is_blocked_by_a_disabled_ancestor() {
     let _lock = vm_lock();
     let env = Env::new();
     env.run(
-        "var n = 0; \
-         var root = new MenuItem(); \
+        "var w = new Window(); \
+         var n = 0; \
+         var root = new MenuItem(null, w); \
          var child = new MenuItem(null, 'Child'); \
          child.onClick = function() { n += 1; }; \
          root.add(child); \
@@ -222,15 +255,59 @@ fn fire_click_is_blocked_by_a_disabled_ancestor() {
     assert_eq!(env.eval_int("n"), 1);
 }
 
+/// Reference: `OnClick` walks `this` → `Parent` looking for a `Window` and
+/// returns silently when none carries one (`reference/cpp/core/visual/MenuItemIntf.cpp:202-209`);
+/// when one does, it must itself be deliverable — visible
+/// (`reference/cpp/core/visual/MenuItemIntf.cpp:210-211`). So a window-less
+/// tree never delivers, an attached-but-invisible window never delivers,
+/// and making the window visible lets the same click through.
+#[test]
+fn fire_click_requires_a_visible_ancestor_window() {
+    let _lock = vm_lock();
+    let env = Env::new();
+
+    // No window anywhere in the chain: the enabled click is dropped.
+    env.run(
+        "var n = 0; \
+         var plain = new MenuItem(null, 'Plain'); \
+         plain.onClick = function() { n += 1; }; \
+         plain.fireClick();",
+    );
+    assert_eq!(env.eval_int("n"), 0);
+
+    // Attaching a window is not enough while it is invisible.
+    env.run(
+        "var w = new Window(); \
+         var root = new MenuItem(null, w); \
+         root.add(plain); \
+         w.visible = false; \
+         plain.fireClick();",
+    );
+    assert_eq!(env.eval_int("n"), 0);
+
+    // The visible window finally delivers.
+    env.run("w.visible = true; plain.fireClick();");
+    assert_eq!(env.eval_int("n"), 1);
+}
+
+/// Reference: the click reaches the object's `onClick`, whose native default
+/// dispatches `owner.action(event)` — so the action owner observes the
+/// `onClick` event when the item is deliverable
+/// (`reference/cpp/core/visual/MenuItemIntf.cpp:196-213`,
+/// `reference/cpp/core/visual/MenuItemIntf.cpp:305-316`). The item is built
+/// on a root that carries a native `Window`, as the reference requires.
 #[test]
 fn action_owner_receives_the_on_click_event() {
     let _lock = vm_lock();
     let env = Env::new();
     env.run(
-        "var fired = 0; \
+        "var w = new Window(); \
+         var root = new MenuItem(null, w); \
+         var fired = 0; \
          var seen = ''; \
          var owner = %[ action: function(ev) { fired = fired + 1; seen = '' + ev.type; } ]; \
-         var m = new MenuItem(owner, 'Dispatch'); \
+         var m = new MenuItem(owner, w); \
+         root.add(m); \
          m.fireClick();",
     );
     assert_eq!(env.eval_int("fired"), 1);
@@ -240,52 +317,77 @@ fn action_owner_receives_the_on_click_event() {
     env.run(
         "var fired2 = 0; \
          var owner2 = %[ action: function(ev) { fired2 = fired2 + 1; } ]; \
-         var m2 = new MenuItem(owner2, 'Disabled'); \
+         var m2 = new MenuItem(owner2, w); \
+         root.add(m2); \
          m2.enabled = false; \
          m2.fireClick();",
     );
     assert_eq!(env.eval_int("fired2"), 0);
 }
 
+/// Reference: the constructor takes a native `Window` (or nothing) as its
+/// second argument and throws `TVPSpecifyWindow` for any other object
+/// (`reference/cpp/core/visual/MenuItemIntf.cpp:42-73`); `window` then hands
+/// back exactly that object, and an item built without one reports `null`.
 #[test]
 fn window_property_returns_the_attached_object() {
     let _lock = vm_lock();
     let env = Env::new();
     env.run(
-        "var w = %[id: 7]; \
+        "var w = new Window(); \
          var root = new MenuItem(null, w); \
          var detached = new MenuItem(null, 'x');",
     );
     assert_eq!(env.eval_int("root.window === w"), 1);
     assert_eq!(env.eval_int("detached.window === null"), 1);
+
+    // A plain object is not a `Window`: the reference raises TVPSpecifyWindow
+    // (`reference/cpp/core/visual/MenuItemIntf.cpp:61-70`).
+    let error = env.error("new MenuItem(null, %[id: 7])");
+    assert!(
+        error.contains("Window"),
+        "the constructor must reject a non-Window object, got {error:?}"
+    );
 }
 
+/// Reference: `CreateShortCutKeyCodeTable` builds both static tables with
+/// the `MapVirtualKey` loop `#if 0`-disabled, so exactly the three
+/// unconditional entries `BkSp`/`PgUp`/`PgDn` survive
+/// (`reference/cpp/core/visual/impl/MenuItemImpl.cpp:363-395`). Every other
+/// key/code pair is absent: a missing dictionary member reads back as void
+/// (`reference/cpp/core/tjs2/tjsDictionary.cpp:732-745`) and an out-of-range
+/// array index likewise (`reference/cpp/core/tjs2/tjsArray.cpp:1383-1390`).
 #[test]
 fn shortcut_tables_round_trip_and_are_read_only() {
     let _lock = vm_lock();
     let env = Env::new();
 
-    // Reference entries survive on both static tables.
+    // The three unconditional entries survive on both static tables.
     assert_eq!(env.eval_int("MenuItem.textToKeycode['bksp']"), 8);
+    assert_eq!(env.eval_int("MenuItem.textToKeycode['pgup']"), 33);
+    assert_eq!(env.eval_int("MenuItem.textToKeycode['pgdn']"), 34);
     assert_eq!(env.eval_str("MenuItem.keycodeToText[8]"), "BkSp");
-    for (key, code) in [
-        ("a", 65),
-        ("z", 90),
-        ("f1", 112),
-        ("f12", 123),
-        ("enter", 13),
-        ("esc", 27),
-        ("pgup", 33),
-        ("pgdn", 34),
-    ] {
+    assert_eq!(env.eval_str("MenuItem.keycodeToText[33]"), "PgUp");
+    assert_eq!(env.eval_str("MenuItem.keycodeToText[34]"), "PgDn");
+    // The value list is a sparse array sized by the highest entry (34 + 1).
+    assert_eq!(env.eval_int("MenuItem.keycodeToText.count"), 35);
+
+    // Nothing else exists — the `MapVirtualKey`/`GetKeyNameText` loop that
+    // used to fill these slots is `#if 0` upstream.
+    for key in ["a", "z", "enter", "esc", "f1", "f12"] {
         assert_eq!(
-            env.eval_int(&format!("MenuItem.textToKeycode['{key}']")),
-            code,
-            "textToKeycode[{key}]"
+            env.eval(&format!("MenuItem.textToKeycode['{key}']")),
+            Ok(TjsValue::Void),
+            "textToKeycode[{key}] must not exist"
         );
     }
-    assert_eq!(env.eval_str("MenuItem.keycodeToText[65]"), "A");
-    assert_eq!(env.eval_str("MenuItem.keycodeToText[123]"), "F12");
+    for code in [13, 27, 65, 112, 123] {
+        assert_eq!(
+            env.eval(&format!("MenuItem.keycodeToText[{code}]")),
+            Ok(TjsValue::Void),
+            "keycodeToText[{code}] must not exist"
+        );
+    }
 
     // Read-only static properties.
     assert!(env.eval("MenuItem.textToKeycode = %[]").is_err());

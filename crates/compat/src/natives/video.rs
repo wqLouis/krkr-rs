@@ -17,7 +17,7 @@
 //! carry — exactly the established per-family pattern
 //! ([`CompatServices::state`]).
 //!
-//! # No decoder (D9/D11)
+//! # No decoder
 //!
 //! L3 does **not** link `media`/FFmpeg: decoded frames are supplied by the
 //! host. A host installs a [`VideoSource`] through
@@ -181,7 +181,8 @@ impl VideoSlot {
 struct LayerRef {
     /// Keeps the script object alive while the overlay references it.
     keepalive: DetachedValue,
-    /// The scene layer id (`nativeId`), used for the L2 binding.
+    /// The scene layer id (the VM native-instance lookup of the `Layer`
+    /// class), used for the L2 binding.
     id: u32,
 }
 
@@ -284,36 +285,18 @@ fn set_null_out(host: &Tjs2Engine, out: *mut Value) {
     set_void(out);
 }
 
-/// Resolve a script object argument to a scene id by reading its `nativeId`
-/// then `id` member (the reference wrappers expose both).
+/// Resolve a script object argument to a scene id. An object argument is
+/// resolved through the VM's native-instance lookup for the `Window` class
+/// (the owning-window argument of the constructor).
 fn object_id(host: &Tjs2Engine, value: &Value) -> Result<i64, String> {
-    match value.ty {
-        VAL_INTEGER => Ok(value.integer),
-        VAL_REAL => Ok(value.real as i64),
-        VAL_OBJECT => {
-            let object = host.retain_object_arg(value)?;
-            let mut last_error = None;
-            for member in ["nativeId", "id"] {
-                match host.get_member(object.raw_id(), member) {
-                    Ok(TjsValue::Integer(v)) => return Ok(v),
-                    Ok(TjsValue::Real(v)) => return Ok(v as i64),
-                    Ok(_) => {}
-                    Err(error) => last_error = Some(error),
-                }
-            }
-            match last_error {
-                Some(error) => Err(error),
-                None => Ok(-1),
-            }
-        }
-        _ => Ok(-1),
-    }
+    CompatCtx::resolve_object_id(host, value, &["Window"])
 }
 
 /// Resolve a `layer1`/`layer2`/`setMixingLayer` argument to a [`LayerRef`].
 ///
-/// A null/void/non-object argument clears the slot; any other object must be a
-/// Layer (a non-negative `nativeId`), matching the reference `TVPSpecifyLayer`.
+/// A null/void/non-object argument clears the slot; any other object must be
+/// a native `Layer`, resolved through the VM's native-instance lookup with no
+/// member fallback. A non-Layer object raises `TVPSpecifyLayer`.
 fn resolve_layer_ref(host: &Tjs2Engine, value: &Value) -> Result<Option<LayerRef>, String> {
     if value.ty != VAL_OBJECT || value.object_handle().is_null() {
         return Ok(None);
@@ -321,13 +304,12 @@ fn resolve_layer_ref(host: &Tjs2Engine, value: &Value) -> Result<Option<LayerRef
     let keepalive = host
         .retain_object_arg(value)
         .map_err(|_| "VideoOverlay: specify layer".to_string())?;
-    let id = match host.get_member(keepalive.raw_id(), "nativeId") {
-        Ok(TjsValue::Integer(id)) if id >= 0 => id as u32,
-        Ok(TjsValue::Real(id)) if id >= 0.0 => id as u32,
-        _ => return Err("VideoOverlay: specify layer".to_string()),
-    };
+    let id = CompatCtx::native_instance_id(host, keepalive.raw_id(), &["Layer"])
+        .map_err(|error| format!("VideoOverlay: specify layer: {error}"))?
+        .ok_or_else(|| "VideoOverlay: specify layer".to_string())?;
     Ok(Some(LayerRef { keepalive, id }))
 }
+
 /// Read a boolean member, defaulting to `true` when absent (the reference
 /// `Layer.visible` default).
 fn member_is_true(host: &Tjs2Engine, id: Tjs2ValueId, name: &str) -> bool {
@@ -532,12 +514,16 @@ extern "C" fn video_ctor(
         return report_error(out_error, "VideoOverlay: object is not constructed");
     };
     let values = unsafe { args(argv, argc) };
-    let window = values.first().and_then(|value| {
-        object_id(resolved.engine(), value)
-            .ok()
-            .filter(|id| *id >= 0)
-            .map(|id| id as u32)
-    });
+    let window = match values.first() {
+        Some(value) if value.ty == VAL_OBJECT && !value.object_handle().is_null() => {
+            match object_id(resolved.engine(), value) {
+                Ok(id) if id >= 0 => Some(id as u32),
+                Ok(_) => None,
+                Err(error) => return report_error(out_error, &format!("VideoOverlay: {error}")),
+            }
+        }
+        _ => None,
+    };
     let services = unsafe { ctx.services() };
     let mut state = services.state::<VideoState>();
     let Some(slot) = state.overlays.get_mut(&id) else {
@@ -1696,7 +1682,6 @@ fn dispatch_events(host: &Tjs2Engine, objthis: *mut c_void, events: &[VideoEvent
 ///
 /// The host re-exports this (with [`video_poll`]) from the crate root; until
 /// then it is unreachable from outside the crate.
-#[allow(dead_code)]
 pub fn video_advance(ctx: &CompatCtx, dt_ms: f64) -> Result<(), CompatError> {
     let host = unsafe { ctx.engine() };
     let services = unsafe { ctx.services() };
@@ -1737,7 +1722,6 @@ pub fn video_advance(ctx: &CompatCtx, dt_ms: f64) -> Result<(), CompatError> {
 ///
 /// The host re-exports this from the crate root; until then it is unreachable
 /// from outside the crate.
-#[allow(dead_code)]
 pub fn video_poll(ctx: &mut CompatCtx) -> Result<(), CompatError> {
     let services = unsafe { ctx.services() };
     let now = services.state::<VideoState>().clock.now_ms();

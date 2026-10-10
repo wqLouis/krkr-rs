@@ -9,7 +9,7 @@ use engine::input::InputState;
 use engine::timer::TimerId;
 use platform::Clock;
 use tjs::{
-    DetachedValue, RetainedValue, Tjs2Engine, TjsValue, VAL_INTEGER, VAL_OBJECT, VAL_REAL,
+    DetachedValue, RetainedValue, Tjs2Engine, Tjs2ValueId, VAL_INTEGER, VAL_OBJECT, VAL_REAL,
     VAL_RETAINED, Value,
 };
 
@@ -41,27 +41,102 @@ pub(crate) struct ObjectRegistry {
     pub(crate) fonts: HashMap<u32, DetachedValue>,
 }
 
-/// One registered `Timer`'s L3 payload: the retained callback/owner and the
-/// TVP dispatch mode. The scheduling state (interval, enabled, fire count)
-/// lives in the L2 [`TimerState`] registry.
-pub(crate) struct TimerBinding {
-    /// The constructor callback (a plain `Timer`'s `onTimer` invokes it).
-    /// `None` while the callback is running (taken out so the state borrow is
-    /// released before re-entering the VM).
-    pub(crate) callback: Option<DetachedValue>,
-    /// The timer object itself, for `onTimer` dispatch through its class
-    /// chain (a script subclass override wins).
-    pub(crate) owner: Option<DetachedValue>,
-    /// Event delivery mode (`tTVPAsyncTriggerMode`), TVP-specific and
-    /// distinct from the L2 one-shot/repeat firing mode.
-    pub(crate) mode: i64,
+/// One object registered with a window through `Window.add`, mirroring the
+/// reference `tTJSNI_BaseWindow::ObjectVector`. The window holds the retained
+/// closure and invalidates it when the window is destroyed (breaking
+/// window↔object reference cycles).
+pub(crate) struct WindowObject {
+    /// Identity of the registered closure: the raw `iTJSDispatch2*` object
+    /// pointer and the closure receiver (`0` for a plain object). Used to
+    /// make a repeated `Window.add` of the same closure a no-op, like the
+    /// reference `std::find` over `ObjectVector`.
+    pub(crate) identity: (usize, usize),
+    /// The retained value, released after invalidation.
+    pub(crate) value: DetachedValue,
 }
+
+/// One registered `Timer`'s L3 payload: the retained action owner, the timer
+/// object, the script-visible reference fields (`tTJSNI_BaseTimer`) and L3's
+/// mirror of the L2 schedule. The L2 `TimerState` registry holds only what
+/// "wait, then call" needs — the integer-millisecond interval, the armed
+/// deadline and the dispatch callback — so every script-visible readback
+/// (interval, capacity, mode, enabled) is served from here, never from L2.
+pub(crate) struct TimerBinding {
+    /// The constructor's `param[0]` retained as the reference's
+    /// `ActionOwner` (`TimerIntf.cpp:51`, `param[0]->AsObjectClosure()`).
+    /// `None` when the argument was not an object: the reference stores an
+    /// empty closure then and its native `onTimer` skips the invocation
+    /// (`if(obj.Object)`, `TimerIntf.cpp:161`), so such a timer is accepted
+    /// silently and never called back. Taken out across the VM call so the
+    /// state borrow is released while the action runs.
+    pub(crate) action_owner: Option<DetachedValue>,
+    /// The timer object itself (`Owner`, `TimerIntf.cpp:52`), for `onTimer`
+    /// dispatch through its class chain (a script subclass override wins).
+    pub(crate) owner: Option<DetachedValue>,
+    /// The reference `ActionName` (`TimerIntf.cpp:48-49`), stored verbatim:
+    /// it defaults to `TVPActionName == "action"` (`EventIntf.cpp:740`) and
+    /// is overwritten only when the script passes a non-void second
+    /// argument. An empty name dispatches the owner itself instead of a
+    /// member (`TimerIntf.cpp:165`).
+    pub(crate) action_name: String,
+    /// Event delivery mode (`tTVPAsyncTriggerMode`, `EventIntf.h:312`),
+    /// TVP-specific event priority — unrelated to when the timer fires.
+    pub(crate) mode: i64,
+    /// The script-visible `Capacity` (reference `tTJSNI_BaseTimer::Capacity`,
+    /// `TimerIntf.h:63`), stored **verbatim** as the script wrote it —
+    /// `0` and negatives survive, the getter reports them back
+    /// (`TimerIntf.cpp:222-236`) — default [`DEFAULT_TIMER_CAPACITY`]
+    /// (`TVP_DEFAULT_TIMER_CAPACITY`). Only the sign is re-read, to decide
+    /// whether L2 is armed at all: a negative capacity makes the reference
+    /// post no `onTimer` event at all (`TimerIntf.cpp:76-84`), while `0` is
+    /// its "no limit" sentinel (`TimerIntf.cpp:77`) and any positive value
+    /// only bounds the *queued* events — under synchronous dispatch the
+    /// queue is always empty, so neither stops delivery.
+    pub(crate) capacity: i64,
+    /// The script-visible `enabled`, stored **verbatim** as the script wrote
+    /// it (the reference getter reports what `SetEnabled` stored,
+    /// `TimerIntf.cpp:204-216`): a timer the script enabled reports `true`
+    /// even while L3 keeps it *unarmed* in L2, because the reference's
+    /// "armed and enabled yet never posts" states — `capacity < 0`
+    /// (`TimerIntf.cpp:76-84`) and `interval <= 0` (`TimerImpl.cpp:125`) —
+    /// are expressed by not arming the L2 schedule at all. The getter reads
+    /// this field, never L2.
+    pub(crate) enabled: bool,
+    /// Whether L2 currently has this timer armed — L3's mirror of the
+    /// schedule it pushed (L2 has no introspection). Maintained
+    /// exclusively by `timer.rs`'s schedule sync: armed iff `enabled &&
+    /// capacity >= 0 && interval > 0`, and `timer_poll` reports "any timer
+    /// still enabled" from this.
+    pub(crate) armed: bool,
+    /// The reference `Interval` in sub-millisecond fixed point
+    /// (`TVP_SUBMILLI_FRAC_BITS = 16`, `TimerIntf.h:18`): the exact
+    /// `tjs_uint64` the reference setter stores (`TimerIntf.cpp:196-197`),
+    /// so the getter reproduces the reference readback
+    /// (`TimerIntf.cpp:186-188`) *including* wrapped negatives (a script
+    /// `interval = -1` reads back `2^48 - 1`). The L2 registry keeps integer
+    /// milliseconds derived from this value instead (see `timer.rs`).
+    ///
+    /// Initial value: the reference constructor default interval of 1000 ms
+    /// (`TimerImpl.cpp:363`) expressed in sub-ms units, so the reference
+    /// getter conversion reports `1000.0` — matching the L2 default interval
+    /// (1000 ms, pushed whenever L3 arms the timer) and the pinned
+    /// `timer_behavior::interval_defaults_roundtrip_and_reports_a_real`.
+    pub(crate) interval_units: u64,
+}
+
+/// The reference `TVP_DEFAULT_TIMER_CAPACITY = 6`
+/// (`reference/cpp/core/utils/TimerIntf.cpp:17,32`), script-visible and
+/// stored verbatim (negatives included) — hence `i64`, not `u32`.
+pub(crate) const DEFAULT_TIMER_CAPACITY: i64 = 6;
 
 /// `VisualState` — the visual family's dispatch state, keyed by type inside
 /// [`CompatServices::state`](crate::CompatServices::state).
 #[derive(Default)]
 pub(crate) struct VisualState {
     pub(crate) objects: ObjectRegistry,
+    /// Window scene id → objects registered through `Window.add`, in
+    /// registration order (reference `ObjectVector`).
+    pub(crate) window_objects: HashMap<u32, Vec<WindowObject>>,
     /// L3 payload per L2 timer id.
     pub(crate) timers: HashMap<TimerId, TimerBinding>,
     /// The L1 monotonic clock that supplies `now_ms` to the L2 timer
@@ -262,29 +337,95 @@ pub(crate) fn duplicate_object(
     host.duplicate_retained(raw).ok()
 }
 
-/// Resolve a script object argument to a scene id by reading its `nativeId`
-/// then `id` member (the reference wrappers expose both).
-pub(crate) fn resolve_object_id(host: &Tjs2Engine, value: &Value) -> Result<i64, String> {
+/// The scene id reader for one of the classes whose native-instance payload
+/// carries it, keyed by the name L3 registers the class with (`Window`,
+/// `Layer`, `Bitmap`, `Font`).
+fn payload_id_reader(class: &str) -> Option<fn(*mut c_void) -> Option<u32>> {
+    match class {
+        "Window" => Some(super::window::window_payload_id),
+        "Layer" => Some(super::layer::layer_payload_id),
+        "Bitmap" => Some(super::bitmap::bitmap_payload_id),
+        "Font" => Some(super::font::font_payload_id),
+        _ => None,
+    }
+}
+
+/// The scene id of `object` as an instance of one of `classes` (the first
+/// class that matches wins), resolved through the VM's native-instance
+/// lookup — the reference `NativeInstanceSupport(TJS_NIS_GETINSTANCE,
+/// classid)` behind `TJS_GET_NATIVE_INSTANCE`.
+///
+/// `Ok(None)` is an ordinary miss (the `tjs2_get_native_instance` NULL
+/// contract): TJS `null`, a plain script object, an instance of another
+/// native class, or an instance whose payload carries no scene id yet —
+/// never an error. A `classes` entry that is not one of the
+/// scene-id-bearing class names is a caller mistake and returns `Err`.
+fn native_instance_id(
+    host: &Tjs2Engine,
+    object: Tjs2ValueId,
+    classes: &[&str],
+) -> Result<Option<u32>, String> {
+    for class in classes {
+        let reader = payload_id_reader(class)
+            .ok_or_else(|| format!("native_instance_id: unknown class {class:?}"))?;
+        if let Some(payload) = host.native_instance_payload(object, class)?
+            && let Some(id) = reader(payload.as_ptr())
+        {
+            return Ok(Some(id));
+        }
+    }
+    Ok(None)
+}
+
+/// Resolve a script object argument to a scene id.
+///
+/// Integers and reals pass through unchanged; anything that is neither an
+/// object nor a number keeps the `-1` fallback. A non-null object is resolved
+/// through [`native_instance_id`] for each expected class in `classes` — the
+/// reference object → native-instance mechanism. An object that matches none
+/// of `classes` is a typed error, never a silent sentinel: the reference
+/// `NativeInstanceSupport(TJS_NIS_GETINSTANCE, classid)` rejects it.
+pub(crate) fn resolve_object_id(
+    host: &Tjs2Engine,
+    value: &Value,
+    classes: &[&str],
+) -> Result<i64, String> {
     match value.ty {
         VAL_INTEGER => Ok(value.integer),
         VAL_REAL => Ok(value.real as i64),
         VAL_OBJECT => {
             let object = host.retain_object_arg(value)?;
-            let mut last_error = None;
-            for member in ["nativeId", "id"] {
-                match host.get_member(object.raw_id(), member) {
-                    Ok(TjsValue::Integer(v)) => return Ok(v),
-                    Ok(TjsValue::Real(v)) => return Ok(v as i64),
-                    Ok(_) => {}
-                    Err(error) => last_error = Some(error),
-                }
-            }
-            match last_error {
-                Some(error) => Err(error),
-                None => Ok(-1),
+            match native_instance_id(host, object.raw_id(), classes)? {
+                Some(id) => Ok(i64::from(id)),
+                None => Err(format!("expected a native {} object", classes.join("/"))),
             }
         }
         _ => Ok(-1),
+    }
+}
+
+impl CompatCtx {
+    /// Cross-family entry point for [`resolve_object_id`]: the object →
+    /// scene-id resolution through the VM native-instance lookup, used by
+    /// the `video` and plugin natives, which cannot name this module directly.
+    pub(crate) fn resolve_object_id(
+        host: &Tjs2Engine,
+        value: &Value,
+        classes: &[&str],
+    ) -> Result<i64, String> {
+        super::common::resolve_object_id(host, value, classes)
+    }
+
+    /// Cross-family entry point for [`native_instance_id`]: the scene id of
+    /// a retained object as an instance of one of `classes` via
+    /// [`Tjs2Engine::native_instance_payload`], `Ok(None)` on an ordinary
+    /// miss (the reference `TJS_GET_NATIVE_INSTANCE` lookup).
+    pub(crate) fn native_instance_id(
+        host: &Tjs2Engine,
+        object: Tjs2ValueId,
+        classes: &[&str],
+    ) -> Result<Option<u32>, String> {
+        super::common::native_instance_id(host, object, classes)
     }
 }
 
@@ -348,6 +489,5 @@ pub(crate) fn reparent_layer(scene: &mut Scene, layer_id: u32, new_parent: Optio
     }
 }
 
-// `set_real` is used by future real-valued properties; keep it available.
-#[allow(dead_code)]
-const _: fn(*mut Value, f64) = set_real;
+// `set_real` is consumed by the real-valued properties (`Timer.interval`,
+// `Font.angle`, `Window.touchScaleThreshold`, ...); no keep-alive needed.

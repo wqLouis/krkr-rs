@@ -26,14 +26,14 @@
 //! a relative position by `dt * play_rate`: the two are equivalent for a
 //! monotonically increasing clock, and a relative step is directly testable.
 //!
-//! # Events (D9: explicit state)
+//! # Events (explicit state)
 //!
 //! Play/pause/stop, loop wraps, period events and stream completion are
 //! reported as [`VideoEvent`]s queued on the overlay and drained by
 //! [`VideoOverlay::poll`]. L3 dispatches them to the script `on*` members;
 //! this layer stops at the event list so it is testable without a VM.
 //!
-//! # Errors (D11)
+//! # Errors
 //!
 //! An unusable [`VideoSpec`] (non-positive/NaN `fps`, missing frame count),
 //! a playback command on a closed overlay, an invalid segment range, an

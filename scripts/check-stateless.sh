@@ -20,11 +20,11 @@ cd "$ROOT" || exit 1
 # too: only its *values* (the frame pacer, the clock) carry state, never a
 # process-global.
 CRATES=(
-  "crates/api"
-  "crates/fs"
-  "crates/media"
-  "crates/render"
-  "crates/platform"
+  "crates/platform/api"
+  "crates/platform/fs"
+  "crates/platform/media"
+  "crates/platform/render"
+  "crates/platform/platform"
 )
 
 # Forbidden patterns (extended regex, matched against .rs sources).
@@ -42,9 +42,9 @@ PATTERNS=(
 # *value* types (RenderScene, the platform `Ticker`, `InputState`, …) are
 # deliberately not services and are not listed here.
 SERVICES=(
-  "crates/render:RenderPipeline"
-  "crates/fs:FileSystem"
-  "crates/media:Media"
+  "crates/platform/render:RenderPipeline"
+  "crates/platform/fs:FileSystem"
+  "crates/platform/media:Media"
 )
 
 fail=0

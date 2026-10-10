@@ -1,6 +1,6 @@
 //! `System` native class.
 //!
-//! Behavioral reference: `main`'s `crates/tvp-natives/src/system.rs` (itself a
+//! Behavioral reference: `crates/tvp-natives/src/system.rs` (itself a
 //! port of `reference/cpp/core/base/impl/SystemImpl.cpp`). This is a
 //! reimplementation on the layered API: the class composes the L2
 //! [`engine::Storage`] and [`engine::Scene`] services, the `tjs` VM and the
@@ -35,7 +35,7 @@
 //! reference's
 //! graphic cache.
 //!
-//! # Host-facts seam (D11)
+//! # Host-facts seam
 //!
 //! `appDataPath`, `desktopLeft`/`Top`/`Width`/`Height`, `shellExecute` and
 //! `system` are genuine host facts with no L2 counterpart. They compose the
@@ -62,7 +62,8 @@ use std::time::Instant;
 
 use tjs::{
     DetachedValue, Engine, NativeClassBuilder, NativeMethodDef, NativePropertyDef, RetainedValue,
-    TjsValue, VAL_INTEGER, VAL_REAL, VAL_RETAINED, VAL_STRING, VAL_VOID, Value,
+    TjsValue, VAL_ARRAY, VAL_INTEGER, VAL_NULL, VAL_OBJECT, VAL_OCTET, VAL_REAL, VAL_RETAINED,
+    VAL_STRING, VAL_VOID, Value,
 };
 
 use crate::binding;
@@ -159,9 +160,6 @@ struct StringScratch(Vec<u8>);
 /// Returns the code recorded by the most recent call and clears it so a
 /// request is reported **exactly once**; the host's frame loop polls this and
 /// maps it to its own exit path.
-// The host's frame loop wires this in when the migrated host lands; until
-// then it is only a documented seam.
-#[allow(dead_code)]
 #[must_use]
 pub fn take_exit_request(services: &CompatServices) -> Option<i32> {
     services.state::<SystemState>().exit_request.take()
@@ -175,7 +173,6 @@ pub fn take_exit_request(services: &CompatServices) -> Option<i32> {
 /// and a newly registered handler is delivered in the same pass. The
 /// per-engine state borrow is released across each callback so a re-entrant
 /// `System` call cannot panic on the `RefCell`.
-#[allow(dead_code)]
 pub fn continuous_handler_poll(ctx: &mut CompatCtx) -> Result<bool, CompatError> {
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
     let engine = unsafe { ctx.engine() };
@@ -231,6 +228,14 @@ pub fn continuous_handler_poll(ctx: &mut CompatCtx) -> Result<bool, CompatError>
 // Marshalling helpers
 // ---------------------------------------------------------------------------
 
+/// Whether `System.eventDisabled` currently suppresses immediate events
+/// (reference `TVPGetSystemEventDisabledState`, `EventImpl.cpp:100-102`).
+/// `TVPPostEvent` drops immediate events while it is set
+/// (`EventIntf.cpp:210-224`).
+pub(crate) fn system_events_disabled(services: &CompatServices) -> bool {
+    services.state::<SystemState>().event_disabled
+}
+
 /// Resolve the installed engine → context binding for a native callback.
 ///
 /// `None` means the binding is not installed; callers turn that into a typed
@@ -255,25 +260,199 @@ impl EngineBinding {
     }
 }
 
-/// TJS `operator bool` coercion: integers/reals are non-zero, strings are
-/// non-empty, void is false, objects are true.
+/// TJS `operator bool` coercion (`tjs2/tjsVariant.h:913-935`): integers and
+/// reals are non-zero, strings are `AsInteger() != 0` (so `"0"` and
+/// non-numeric text are *false*, unlike a non-empty check), void is false,
+/// `null` — a `tvtObject` with a null pointer (`tjs2_abi.cpp:525-527`) — is
+/// false, and any other object is `Object != nullptr`, i.e. true.
 pub(crate) fn value_as_bool(v: &Value) -> bool {
     match v.ty {
         VAL_INTEGER => v.integer != 0,
         VAL_REAL => v.real != 0.0,
-        VAL_STRING => !value_as_string(v).is_empty(),
-        VAL_VOID => false,
+        VAL_STRING => tjs_string_to_integer(&value_as_string(v)) != 0,
+        VAL_VOID | VAL_NULL => false,
         _ => true,
     }
 }
 
-/// TJS `AsInteger` coercion.
+/// TJS `AsInteger` coercion (`tjs2/tjsVariant.h:862-877`).
+///
+/// Objects (including `null` and arrays) raise a conversion error in the
+/// reference — use [`try_value_as_i64`] where that error must surface. The
+/// loose form keeps returning `0` for them so call sites that only ever see
+/// script scalars stay unchanged.
 pub(crate) fn value_as_i64(v: &Value) -> i64 {
     match v.ty {
         VAL_INTEGER => v.integer,
         VAL_REAL => v.real as i64,
-        VAL_STRING => value_as_string(v).parse().unwrap_or(0),
+        VAL_STRING => tjs_string_to_integer(&value_as_string(v)),
         _ => 0,
+    }
+}
+
+/// [`value_as_i64`] with the reference's error behaviour: `AsInteger` on an
+/// object, `null` or an octet raises `TJSThrowVariantConvertError`
+/// (`tjs2/tjsVariant.h:865-866`, `874`), so a strict call site turns those
+/// into a typed callback error instead of a silent `0`.
+pub(crate) fn try_value_as_i64(v: &Value) -> Result<i64, String> {
+    match v.ty {
+        VAL_INTEGER | VAL_REAL | VAL_STRING | VAL_VOID => Ok(value_as_i64(v)),
+        VAL_NULL => Err("value is null, not an integer".into()),
+        VAL_OBJECT | VAL_ARRAY => Err("value is an object, not an integer".into()),
+        VAL_OCTET => Err("value is an octet, not an integer".into()),
+        _ => Err("value cannot be converted to an integer".into()),
+    }
+}
+
+/// The reference `TJSStringToInteger` (`tjs2/tjsVariant.cpp:301-307`): parse
+/// the leading number token of `str` with the lexer's number grammar
+/// (`tjs2/tjsLex.cpp:611-743`) and integer-ise it — an optional sign (plus
+/// following spaces), the `true`/`false` keywords, `0x`/`0b`/leading-zero
+/// octal forms, and decimal integer/real literals (including `e` exponents).
+/// Anything unparsable yields `0`; trailing garbage (`"12abc"`) is ignored.
+fn tjs_string_to_integer(s: &str) -> i64 {
+    let bytes = s.as_bytes();
+    let mut pos = 0usize;
+    let mut negative = false;
+    if pos < bytes.len() && (bytes[pos] == b'+' || bytes[pos] == b'-') {
+        negative = bytes[pos] == b'-';
+        pos += 1;
+        // The lexer skips spaces after the sign (`TJSSkipSpace`,
+        // `tjsLex.cpp:720-730`).
+        while pos < bytes.len() && bytes[pos] == b' ' {
+            pos += 1;
+        }
+    }
+    let rest = &s[pos..];
+    let apply_sign = |value: i64| {
+        if negative {
+            value.wrapping_neg()
+        } else {
+            value
+        }
+    };
+    // Keyword forms (`tjsLex.cpp:614-634`), matched like `TJSStringMatch`
+    // (case-sensitive, and not followed by an alphabetic character or `_`).
+    let word_follows = |after: &str| {
+        after
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_alphabetic() || c == '_')
+    };
+    for (keyword, value) in [
+        ("true", 1i64),
+        ("false", 0i64),
+        // `NaN`/`Infinity` are real literals; the reference's
+        // `(tTVInteger)` cast of them is platform-dependent and yields the
+        // integer-indefinite value on its primary (x86) target.
+        ("NaN", i64::MIN),
+        ("Infinity", i64::MIN),
+    ] {
+        if let Some(after) = rest.strip_prefix(keyword)
+            && !word_follows(after)
+        {
+            return apply_sign(value);
+        }
+    }
+    let digits = rest.as_bytes();
+    // `0x`/`0X` hexadecimal (`tjsLex.cpp:626-630`).
+    if digits.len() >= 2 && digits[0] == b'0' && (digits[1] == b'x' || digits[1] == b'X') {
+        return apply_sign(parse_radix(&rest[2..], 16));
+    }
+    // `0b`/`0B` binary (`tjsLex.cpp:632-636`).
+    if digits.len() >= 2 && digits[0] == b'0' && (digits[1] == b'b' || digits[1] == b'B') {
+        return apply_sign(parse_radix(&rest[2..], 2));
+    }
+    // A leading zero that is neither `0x`, `0b`, `0.` nor `0e` is octal
+    // (`tjsLex.cpp:638-655`).
+    if digits.first() == Some(&b'0') && digits.len() > 1 {
+        match digits[1] {
+            b'.' | b'e' | b'E' => {}
+            b'p' | b'P' => return 0,
+            _ => return apply_sign(parse_radix(rest, 8)),
+        }
+    }
+    // Decimal integer or real (`tjsLex.cpp:686-698`).
+    apply_sign(parse_decimal(rest))
+}
+
+/// Parse leading digits of `s` in `radix` (reference
+/// `TJSParseNonDecimalNumber`), accumulating with the reference's wrapping
+/// 64-bit arithmetic (`tjsLex.cpp:288-310`); `0` when no digit parses.
+fn parse_radix(s: &str, radix: u32) -> i64 {
+    let mut value: i64 = 0;
+    let mut any = false;
+    for c in s.chars() {
+        let Some(digit) = c.to_digit(radix) else {
+            break;
+        };
+        any = true;
+        value = value
+            .wrapping_mul(i64::from(radix))
+            .wrapping_add(i64::from(digit));
+    }
+    if any { value } else { 0 }
+}
+
+/// Parse a leading decimal number token (`TJSExtractNumber` +
+/// `TJSParseDecimalInteger`/`TJSParseDecimalReal`, `tjsLex.cpp:382-429` and
+/// `447-470`): digits with at most one `.` and at most one `e`/`E` exponent
+/// (optional spaces and sign after the exponent marker). A token with a
+/// point or exponent is real and truncates towards zero via `as i64`.
+fn parse_decimal(s: &str) -> i64 {
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    let mut seen_point = false;
+    let mut seen_exp = false;
+    let mut end = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c.is_ascii_digit() {
+            i += 1;
+            end = i;
+        } else if c == b'.' && !seen_point && !seen_exp {
+            seen_point = true;
+            i += 1;
+        } else if (c == b'e' || c == b'E') && !seen_exp {
+            seen_exp = true;
+            i += 1;
+            while i < bytes.len() && bytes[i] == b' ' {
+                i += 1;
+            }
+            if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
+                i += 1;
+            }
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+                end = i;
+            }
+        } else {
+            break;
+        }
+    }
+    if end == 0 {
+        return 0;
+    }
+    let token = &s[..end];
+    if seen_point || seen_exp {
+        // Re-slicing to `end` keeps a valid `f64` literal; a dangling `e`
+        // exponent marker without digits (`"1e"`) falls back to the mantissa
+        // prefix, matching `strtod`'s behaviour in
+        // `TJSParseDecimalReal` (`tjsLex.cpp:472-509`).
+        token
+            .parse::<f64>()
+            .or_else(|_| match token.find(['e', 'E']) {
+                Some(exp) if exp > 0 => token[..exp].parse::<f64>().map_err(|_| ()),
+                _ => Err(()),
+            })
+            .map_or(0, |real| real as i64)
+    } else {
+        token
+            .bytes()
+            .filter(u8::is_ascii_digit)
+            .fold(0i64, |value, digit| {
+                value.wrapping_mul(10).wrapping_add(i64::from(digit - b'0'))
+            })
     }
 }
 
@@ -503,33 +682,14 @@ extern "C" fn native_get_argument(
     };
     let ctx = resolved.ctx();
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
+    // The reference `getArgument` takes **one** argument and clears the
+    // result on a miss (`SystemImpl.cpp:709-726`) — there is no default
+    // parameter; any second argument is ignored.
     match get_command_line(unsafe { ctx.services() }, &name) {
         Some(value) => {
             set_string_out(&ctx, out, &value);
             0
         }
-        None if argc >= 2 => match a[1].ty {
-            VAL_STRING => {
-                set_string_out(&ctx, out, &value_as_string(&a[1]));
-                0
-            }
-            VAL_INTEGER => {
-                set_int(out, a[1].integer);
-                0
-            }
-            VAL_REAL => {
-                set_real(out, a[1].real);
-                0
-            }
-            VAL_VOID => {
-                set_void(out);
-                0
-            }
-            _ => report_error(
-                out_error,
-                "System.getArgument: object default value is not supported",
-            ),
-        },
         None => {
             set_void(out);
             0
@@ -586,7 +746,12 @@ fn record_exit(
     out: *mut Value,
 ) -> Option<String> {
     let code = if argc >= 1 {
-        value_as_i64(&unsafe { args(argv, argc) }[0])
+        // `numparams > 0 ? param[0]->AsInteger() : 0` (`SystemIntf.cpp:111`,
+        // `123`) — the strict conversion raises on objects.
+        match try_value_as_i64(&unsafe { args(argv, argc) }[0]) {
+            Ok(code) => code,
+            Err(error) => return Some(error),
+        }
     } else {
         0
     };
@@ -730,14 +895,13 @@ extern "C" fn native_to_actual_color(
 /// `System.createUUID()` → string (RFC-4122 v4)
 extern "C" fn native_create_uuid(
     engine: *mut c_void,
-    argc: c_int,
+    _argc: c_int,
     _argv: *const Value,
     out: *mut Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
-    if argc != 0 {
-        return report_error(out_error, "System.createUUID takes no arguments");
-    }
+    // The reference `createUUID` body has no `numparams` check
+    // (`SystemIntf.cpp:259-286`) — extra arguments are ignored.
     let Some(resolved) = resolve(engine) else {
         return report_error(out_error, "System.createUUID: compat context is not bound");
     };
@@ -783,17 +947,43 @@ extern "C" fn native_assign_message(
 
 /// `System.touchImages(storages[, limit[, timeout]])` → void
 ///
-/// The reference pre-caches images; krkr-rs caches per layer on demand, so
-/// this only validates the argument count and does nothing.
+/// `System.touchImages(storages[, limit[, timeout]])` → void
+///
+/// The reference requires an object first argument and converts the optional
+/// `limit`/`timeout` (`SystemIntf.cpp:224-256`); the pre-caching itself has no
+/// L2 counterpart (the port caches per layer on demand), so only the
+/// reference's argument validation is reproduced.
 extern "C" fn native_touch_images(
     _engine: *mut c_void,
     argc: c_int,
-    _argv: *const Value,
+    argv: *const Value,
     out: *mut Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
     if argc < 1 {
         return report_error(out_error, "System.touchImages requires 1 argument");
+    }
+    let a = unsafe { args(argv, argc) };
+    // The reference requires an array object (`AsObjectClosureNoAddRef` +
+    // `PropGetByNum` walk, `SystemIntf.cpp:224-245` — a non-object raises the
+    // conversion error) and converts the optional `limit`/`timeout` with
+    // `(tjs_int64)*param[i]` when present and non-void, which raises on
+    // objects. The image pre-caching itself has no L2 counterpart (the port
+    // caches per layer on demand), so only the reference's argument
+    // validation is reproduced.
+    if a[0].ty == VAL_NULL || a[0].ty != VAL_OBJECT {
+        return report_error(
+            out_error,
+            "System.touchImages: the first argument must be an array",
+        );
+    }
+    for (index, name) in [(1, "limit"), (2, "timeout")] {
+        if let Some(value) = a.get(index)
+            && value.ty != VAL_VOID
+            && let Err(error) = try_value_as_i64(value)
+        {
+            return report_error(out_error, &format!("System.touchImages {name}: {error}"));
+        }
     }
     set_void(out);
     0
@@ -812,10 +1002,17 @@ extern "C" fn native_do_compact(
     out: *mut Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
-    let level = unsafe { args(argv, argc) }
-        .first()
-        .map(value_as_i64)
-        .unwrap_or(100);
+    let level = match unsafe { args(argv, argc) }.first() {
+        // `if(numparams >= 1 && param[0]->Type() != tvtVoid) level =
+        // (tjs_int)*param[0]` (`SystemIntf.cpp:306-311`): absent/void keeps
+        // `TVP_COMPACT_LEVEL_MAX` (100), the strict conversion raises on
+        // objects.
+        Some(value) if value.ty != VAL_VOID => match try_value_as_i64(value) {
+            Ok(level) => level,
+            Err(error) => return report_error(out_error, &error),
+        },
+        _ => 100,
+    };
     let Some(resolved) = resolve(engine) else {
         return report_error(out_error, "System.doCompact: compat context is not bound");
     };
@@ -877,6 +1074,14 @@ extern "C" fn native_add_continuous_handler(
     if a.is_empty() {
         return report_error(out_error, "System.addContinuousHandler requires 1 argument");
     }
+    // Reference `param[0]->AsObjectClosureNoAddRef()`
+    // (`SystemIntf.cpp:167-180`): TJS `null` stores an empty closure that the
+    // delivery loop skips (`EventIntf.cpp:816`) — a silent success — while
+    // any other non-object raises the conversion error.
+    if a[0].ty == VAL_NULL {
+        set_void(out);
+        return 0;
+    }
     let Some(resolved) = resolve(engine) else {
         return report_error(
             out_error,
@@ -926,6 +1131,18 @@ extern "C" fn native_remove_continuous_handler(
         return report_error(
             out_error,
             "System.removeContinuousHandler requires 1 argument",
+        );
+    }
+    // Same conversion contract as `addContinuousHandler`
+    // (`SystemIntf.cpp:183-197`): `null` matches an empty slot and no-ops.
+    if a[0].ty == VAL_NULL {
+        set_void(out);
+        return 0;
+    }
+    if a[0].ty != VAL_OBJECT {
+        return report_error(
+            out_error,
+            "System.removeContinuousHandler: argument is not an object",
         );
     }
     let Some(resolved) = resolve(engine) else {
@@ -995,9 +1212,18 @@ extern "C" fn native_get_key_state(
         return report_error(out_error, "System.getKeyState requires 1 argument");
     }
     let a = unsafe { args(argv, argc) };
-    let code = value_as_i64(&a[0]) as u32;
+    // `(tjs_int)*param[0]` raises on objects (`SystemImpl.cpp:639-642`).
+    let code = match try_value_as_i64(&a[0]) {
+        Ok(code) => code as u32,
+        Err(error) => return report_error(out_error, &error),
+    };
     let getcurrent = if argc >= 2 {
-        value_as_bool(&a[1])
+        // `0 != (tjs_int)*param[1]` (`SystemImpl.cpp:644-646`) — void is 0
+        // (false), objects raise.
+        match try_value_as_i64(&a[1]) {
+            Ok(value) => value != 0,
+            Err(error) => return report_error(out_error, &error),
+        }
     } else {
         true
     };
@@ -1030,7 +1256,7 @@ extern "C" fn native_get_key_state(
 /// `System.shellExecute(target [, param])` → bool
 ///
 /// Delegates to the host's platform shell. Without the installed seam the
-/// member raises a typed error (D11).
+/// member raises a typed error.
 extern "C" fn native_shell_execute(
     engine: *mut c_void,
     argc: c_int,
@@ -1075,7 +1301,7 @@ extern "C" fn native_shell_execute(
 /// The reference delivers a maximum-level compact event (which clears the
 /// graphic cache) and then returns the (commented-out) shell status. This port
 /// releases the L2 scene's unreferenced bitmaps and delegates the command to
-/// the host seam; without the seam it raises a typed error (D11).
+/// the host seam; without the seam it raises a typed error.
 extern "C" fn native_system(
     engine: *mut c_void,
     argc: c_int,
@@ -1500,12 +1726,22 @@ extern "C" fn prop_graphic_cache_limit_set(
         return report_error(out_error, "System.graphicCacheLimit: missing value");
     }
     // SAFETY: the trampoline passes a valid value slot for the call.
-    let limit = value_as_i64(unsafe { &*value });
+    // `TVPSetGraphicCacheLimit((tjs_int)*param)` (`SystemIntf.cpp:366-369`):
+    // the strict conversion raises on objects, and the write immediately
+    // shrinks the cache — the port releases every unreferenced bitmap, the
+    // same purge `clearGraphicCache` runs.
+    let limit = match try_value_as_i64(unsafe { &*value }) {
+        Ok(limit) => limit,
+        Err(error) => return report_error(out_error, &error),
+    };
     let ctx = resolved.ctx();
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
-    unsafe { ctx.services() }
-        .state::<SystemState>()
-        .graphic_cache_limit = limit;
+    let services = unsafe { ctx.services() };
+    {
+        let mut state = services.state::<SystemState>();
+        state.graphic_cache_limit = limit;
+    }
+    clear_graphic_cache(services);
     0
 }
 
@@ -1544,7 +1780,12 @@ extern "C" fn prop_exit_on_window_close_set(
         return report_error(out_error, "System.exitOnWindowClose: missing value");
     }
     // SAFETY: the trampoline passes a valid value slot for the call.
-    let flag = value_as_bool(unsafe { &*value });
+    // `0 != (tjs_int)*param` (`SystemIntf.cpp:399-402`) — the strict
+    // conversion raises on objects.
+    let flag = match try_value_as_i64(unsafe { &*value }) {
+        Ok(value) => value != 0,
+        Err(error) => return report_error(out_error, &error),
+    };
     let ctx = resolved.ctx();
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
     unsafe { ctx.services() }
@@ -1588,7 +1829,11 @@ extern "C" fn prop_exit_on_no_window_startup_set(
         return report_error(out_error, "System.exitOnNoWindowStartup: missing value");
     }
     // SAFETY: the trampoline passes a valid value slot for the call.
-    let flag = value_as_bool(unsafe { &*value });
+    // `0 != (tjs_int)*param` (`SystemIntf.cpp:457-460`).
+    let flag = match try_value_as_i64(unsafe { &*value }) {
+        Ok(value) => value != 0,
+        Err(error) => return report_error(out_error, &error),
+    };
     let ctx = resolved.ctx();
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
     unsafe { ctx.services() }
@@ -1632,7 +1877,11 @@ extern "C" fn prop_draw_thread_num_set(
         return report_error(out_error, "System.drawThreadNum: missing value");
     }
     // SAFETY: the trampoline passes a valid value slot for the call.
-    let n = value_as_i64(unsafe { &*value });
+    // `TVPDrawThreadNum = (tjs_int)*param` (`SystemIntf.cpp:413-416`).
+    let n = match try_value_as_i64(unsafe { &*value }) {
+        Ok(n) => n,
+        Err(error) => return report_error(out_error, &error),
+    };
     let ctx = resolved.ctx();
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
     unsafe { ctx.services() }
@@ -2198,5 +2447,36 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
                 set: None,
             },
         ],
-    })
+    })?;
+    // Reference: the `System` class object carries default *data* members
+    // `exceptionHandler`, `onActivate` and `onDeactivate`, all `null`
+    // (`PropSet` at the end of the class constructor,
+    // `base/SystemIntf.cpp:477-484`), so `System.onActivate` reads as `null`
+    // before a script assigns one and `MEMBERMUSTEXIST` lookups succeed
+    // (`SystemIntf.cpp:58-77`).
+    // SAFETY: a `CompatCtx` is only created for a bound, live engine.
+    let host = unsafe { ctx.engine() };
+    if let (Ok(RetainedValue::Object(class)), Ok(RetainedValue::Object(null))) = (
+        host.eval_retained("System", "System.defaults"),
+        host.eval_retained("null", "System.defaults"),
+    ) {
+        for name in ["exceptionHandler", "onActivate", "onDeactivate"] {
+            match host.duplicate_retained(null.raw_id()) {
+                Ok(value) => {
+                    let id = value.raw_id() as u64;
+                    if let Err(error) =
+                        host.set_member(class.raw_id(), name, &TjsValue::Retained(id))
+                    {
+                        log::warn!("System: default member {name}: {error}");
+                    }
+                    drop(value);
+                }
+                Err(error) => {
+                    log::warn!("System: default member {name}: {error}");
+                    break;
+                }
+            }
+        }
+    }
+    Ok(())
 }

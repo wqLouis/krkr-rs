@@ -10,14 +10,14 @@
 //! * `hasFormat(format)` — the reference static method (`cbfText == 1`);
 //! * `asText` — the reference static text property (get/set).
 //!
-//! # The host seam (D11)
+//! # The host seam
 //!
 //! L3 owns no window system: the L1/L4 host owns the real clipboard and
 //! installs a [`ClipboardBackend`] through
 //! [`CompatHost::set_clipboard_backend`](crate::CompatHost::set_clipboard_backend).
 //! The backend lives in [`CompatServices::state`], never in a process global.
 //! When no backend is installed every member raises a **typed** TJS error; the
-//! native never fabricates a `false`/void/empty value (D11). This differs
+//! native never fabricates a `false`/void/empty value. This differs
 //! deliberately from the reference's non-platform stub, which returns
 //! `false`/no-text — the layered port refuses to guess when the host has not
 //! installed a clipboard.
@@ -37,7 +37,7 @@ use std::ffi::{c_char, c_int, c_void};
 use tjs::{NativeClassBuilder, NativeMethodDef, NativePropertyDef, Value};
 
 use crate::native_util::{args, report_error, set_bool, set_void, value_as_string};
-use crate::natives::system::{resolve, set_string_out, value_as_i64};
+use crate::natives::system::{resolve, set_string_out, try_value_as_i64};
 use crate::{CompatCtx, CompatError, CompatServices};
 
 /// The clipboard format selector used by `Clipboard.hasFormat`.
@@ -83,7 +83,7 @@ pub trait ClipboardBackend {
 
     /// The clipboard text, or `None` when it holds no text
     /// (`TVPClipboardGetText`). `None` maps to the reference's void `asText`.
-    fn get_text(&self) -> Option<String>;
+    fn text(&self) -> Option<String>;
 
     /// Replace the clipboard text (`TVPClipboardSetText`).
     fn set_text(&self, text: &str);
@@ -91,7 +91,7 @@ pub trait ClipboardBackend {
 
 /// Adapter that lets a host install three plain closures as a backend.
 ///
-/// Every `(has_format, get_text, set_text)` tuple of closures implements
+/// Every `(has_format, text, set_text)` tuple of closures implements
 /// [`ClipboardBackend`], so a host can call
 /// [`CompatHost::set_clipboard_backend`](crate::CompatHost::set_clipboard_backend)
 /// without naming the trait; a platform host may instead implement the trait
@@ -106,7 +106,7 @@ where
         (self.0)(format.code())
     }
 
-    fn get_text(&self) -> Option<String> {
+    fn text(&self) -> Option<String> {
         (self.1)()
     }
 
@@ -142,7 +142,18 @@ extern "C" fn native_has_format(
     if argc < 1 {
         return report_error(out_error, "Clipboard.hasFormat requires 1 argument");
     }
-    let format = ClipboardFormat::from_code(value_as_i64(&unsafe { args(argv, argc) }[0]));
+    // `(tjs_int)*param[0]` raises on objects (`tjsVariant.h:933-935`).
+    let code = match try_value_as_i64(&unsafe { args(argv, argc) }[0]) {
+        Ok(code) => code,
+        Err(error) => return report_error(out_error, &error),
+    };
+    let format = ClipboardFormat::from_code(code);
+    let Some(format) = format else {
+        // The reference `switch(format)` `default` returns false without
+        // consulting the platform (`utils/impl/ClipboardImpl.cpp:11-13`).
+        set_bool(out, false);
+        return 0;
+    };
     let Some(resolved) = resolve(engine) else {
         return report_error(
             out_error,
@@ -160,11 +171,7 @@ extern "C" fn native_has_format(
                 "Clipboard.hasFormat: no clipboard backend is installed",
             );
         };
-        match format {
-            Some(format) => backend.has_format(format),
-            // Unknown formats have no representation (reference default).
-            None => false,
-        }
+        backend.has_format(format)
     };
     set_bool(out, has);
     0
@@ -190,7 +197,7 @@ extern "C" fn prop_as_text_get(
                 "Clipboard.asText: no clipboard backend is installed",
             );
         };
-        backend.get_text()
+        backend.text()
     };
     match text {
         Some(text) => set_string_out(&ctx, out, &text),

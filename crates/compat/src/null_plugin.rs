@@ -1,10 +1,10 @@
-//! The null plugin object (doc 08 §4.2, D14).
+//! The null plugin object (doc 08 §4.2).
 //!
 //! Linux and Android cannot load the Windows plugin DLLs the games name.
 //! `Plugins.link(name)` therefore either activates a built-in emulation or
 //! installs a **null plugin object** that accepts every member access, does
 //! nothing, logs a warning and **never throws**. This is the single
-//! documented exception to D11 (no silent fallback) — and it is not silent.
+//! documented exception to the no-silent-fallback rule — and it is not silent.
 //!
 //! # Mechanism and the ABI limitation
 //!
@@ -21,10 +21,12 @@
 //! returns `true`. [`install`] creates one instance per missing plugin,
 //! installs it as a script global under the plugin's stem
 //! (`Plugins.link("windowEx.dll")` → `global.windowEx`) and keeps it alive.
-//! The global install is best-effort (a later wave can refine the namespace)
-//! and replaces any global of the same name; real plugin emulations register
-//! their own classes, so the null object is only a namespace handle for the
-//! plugin we could not load.
+//! The install **never replaces an existing binding**: a `global[stem]` that
+//! already holds a native class or a script value is kept (a real
+//! binding is never clobbered by the null path), the link is still recorded,
+//! and [`remove`] then leaves that binding alone. Real plugin emulations
+//! register their own classes, so the null object is only a namespace handle
+//! for the plugin we could not load.
 //!
 //! ## What this catches, and what it cannot
 //!
@@ -42,10 +44,7 @@
 use std::cell::RefCell;
 use std::ffi::{c_char, c_int, c_void};
 
-use tjs::{
-    DetachedValue, Engine, NativeInstanceBuilder, NativeInstanceMethodDef, RetainedValue, TjsValue,
-    Value,
-};
+use tjs::{Engine, NativeInstanceBuilder, NativeInstanceMethodDef, RetainedValue, TjsValue, Value};
 
 use crate::binding;
 use crate::native_util::{args, set_bool, set_void, value_as_string};
@@ -199,28 +198,59 @@ pub(crate) fn register_hook(ctx: &mut CompatCtx) -> Result<(), CompatError> {
     })
 }
 
-/// Create a null plugin object for `plugin_name`, install it as a global
-/// under the plugin stem and return the retained object.
+/// Create a null plugin object for `plugin_name` and install it as a script
+/// global under the plugin stem — unless that global already exists.
 ///
-/// The caller owns the returned retention; the script global also keeps the
-/// object alive. `plugin_name` keeps the script's original casing so the
-/// global is `windowEx`, not `windowex` (doc 08 §4.2).
-pub(crate) fn install(
-    ctx: &mut CompatCtx,
-    plugin_name: &str,
-) -> Result<DetachedValue, CompatError> {
+/// Returns `Ok(true)` when the null object became `global[stem]` (the caller
+/// records this so [`remove`] knows the link owns the binding) and
+/// `Ok(false)` when an existing binding was kept: a native class or script
+/// global that happens to share the stem is **never clobbered** —
+/// a real binding must not be silently replaced by the null path. The link
+/// is recorded either way, and [`remove`] only clears globals whose link
+/// installed them.
+///
+/// The probe uses `typeof` because it is the one read that cannot raise for
+/// an absent member: the VM maps a failed property lookup to the string
+/// `"undefined"` (`VM_TYPEOFI` → `TypeOfMemberIndirect`), whereas a plain
+/// read of an absent `global[stem]` raises member-not-found. A member that
+/// exists but holds `void` counts as absent too (a script may clear it by
+/// hand; [`remove`]'s `delete` leaves no member at all). `plugin_name` keeps
+/// the script's original casing so the global is `windowEx`, not `windowex`
+/// (doc 08 §4.2).
+pub(crate) fn install(ctx: &mut CompatCtx, plugin_name: &str) -> Result<bool, CompatError> {
     let stem = crate::plugin_stem(plugin_name);
     let stem_lit = tjs_string_literal(&stem);
     let name_lit = tjs_string_literal(plugin_name);
+    // SAFETY: `ctx` is the bound, live engine.
+    let engine = unsafe { ctx.engine() };
+    let kind = engine
+        .eval(&format!("typeof global[{stem_lit}]"), "null_plugin")
+        .map_err(|err| CompatError::Register(err.to_string()))?;
+    let TjsValue::String(kind) = kind else {
+        return Err(CompatError::Register(format!(
+            "null plugin: typeof global[{stem:?}] did not yield a type name"
+        )));
+    };
+    if kind != "undefined" && kind != "void" {
+        log::warn!(
+            "null plugin {plugin_name:?}: global {stem:?} already holds a value of type \
+             {kind}; keeping it instead of installing the null object"
+        );
+        return Ok(false);
+    }
     // `eval_retained` compiles an *expression*, so the assignment yields the
     // object itself (an `exec_script` statement would yield void).
     let script = format!("global[{stem_lit}] = new {NULL_PLUGIN_CLASS}({name_lit})");
     // SAFETY: `ctx` is the bound, live engine; the expression creates the
-    // object and assigns the global. It retains the object result for the
-    // caller.
-    let engine = unsafe { ctx.engine() };
+    // object and assigns the global, which keeps it alive.
     match engine.eval_retained(&script, "null_plugin") {
-        Ok(RetainedValue::Object(object)) => Ok(object),
+        Ok(RetainedValue::Object(object)) => {
+            // Only the script global holds the object from here on; release
+            // the retention this expression produced.
+            drop(object);
+            log::debug!("null plugin {plugin_name:?}: installed global {stem:?}");
+            Ok(true)
+        }
         Ok(RetainedValue::Value(_)) => Err(CompatError::Register(
             "null plugin: the constructor did not return an object".into(),
         )),
@@ -228,17 +258,57 @@ pub(crate) fn install(
     }
 }
 
-/// Remove a null plugin's script global (`Plugins.unlink`). The object's
-/// native class cannot be unregistered, but clearing the global makes it
-/// unreachable from script; a later `link` re-installs it.
+/// Remove a null plugin's script global (`Plugins.unlink`), but only when it
+/// still is the null object this module installed.
+///
+/// The caller passes only the links that actually installed their global (a
+/// link that kept a pre-existing binding never calls here), and the guard
+/// below re-verifies the binding before deleting: a global a script wrote
+/// over — or an object without a class chain, e.g. a function the script put
+/// in our place — is left untouched. The object's native class cannot be
+/// unregistered either way; a later `link` re-installs the null object when
+/// the stem is free again.
 pub(crate) fn remove(ctx: &mut CompatCtx, plugin_name: &str) -> Result<(), CompatError> {
     let stem = crate::plugin_stem(plugin_name);
     let stem_lit = tjs_string_literal(&stem);
-    let script = format!("global[{stem_lit}] = void");
     // SAFETY: `ctx` is the bound, live engine.
     let engine = unsafe { ctx.engine() };
+    // `typeof` never raises for an absent member (see `install`).
+    let kind = engine
+        .eval(&format!("typeof global[{stem_lit}]"), "null_plugin")
+        .map_err(|err| CompatError::Register(err.to_string()))?;
+    let TjsValue::String(kind) = kind else {
+        return Err(CompatError::Register(format!(
+            "null plugin: typeof global[{stem:?}] did not yield a type name"
+        )));
+    };
+    match kind.as_str() {
+        // Nothing there: already removed, or cleared by a script.
+        "undefined" | "void" => return Ok(()),
+        // Only an object can be the null instance we installed.
+        "Object" => {}
+        scalar => {
+            log::debug!(
+                "null plugin {plugin_name:?}: global {stem:?} now holds a {scalar}; leaving it"
+            );
+            return Ok(());
+        }
+    }
+    // `instanceof` takes a class-name string (reference `IsInstanceOf`) and
+    // can raise `TJS_E_NOTIMPL` for objects without a class chain — a
+    // function the script put where our instance was, where the reference's
+    // `IsInstanceOf` simply reports false. The guard therefore runs in a
+    // try/catch (the same pattern as the saveStruct serializer): a raised
+    // check leaves the binding alone rather than deleting someone else's
+    // global.
+    let class_lit = tjs_string_literal(NULL_PLUGIN_CLASS);
+    let script = format!(
+        "try {{ if (global[{stem_lit}] instanceof {class_lit}) delete global[{stem_lit}]; }} catch (e) {{}}"
+    );
+    // SAFETY: `ctx` is the bound, live engine; `exec_script` compiles
+    // statements (unlike `eval`, which compiles expressions only).
     engine
-        .eval(&script, "null_plugin")
+        .exec_script(&script, "null_plugin")
         .map(|_| ())
         .map_err(|err| CompatError::Register(err.to_string()))
 }

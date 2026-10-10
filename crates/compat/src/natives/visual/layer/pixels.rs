@@ -13,13 +13,16 @@
 
 use std::ffi::{c_char, c_int, c_void};
 
-use api::blend::BlendMode;
+use api::blend::{BlendMode, DstBlend};
 use engine::layer_ops::{self, GammaAdjust, RectI};
 use engine::{BitmapState, Scene};
 use tjs::{NativeInstanceMethodDef, Tjs2Engine, Value};
 
+use super::super::bitmap::{
+    COLOR_KEY_NONE, apply_color_key, decode_image, read_image_from_storage, replace_bitmap_pixels,
+};
 use super::super::common::scene_mut;
-use super::super::common::{argb_to_rgba, rgba_to_argb};
+use super::super::common::{argb_to_rgba, rgba_to_argb, set_null_out};
 use super::LayerInst;
 use super::util::{
     self, clip_dest_src, layer_clip, main_bitmap, normalize_rect, operation_mode_from_layer_type,
@@ -33,12 +36,15 @@ use crate::natives::system::value_as_i64;
 const OM_OPAQUE: i64 = 1;
 const OM_ALPHA: i64 = 2;
 const OM_AUTO: i64 = 128;
-/// Draw faces (`tTVPDrawFace`).
+/// Draw faces (`tTVPDrawFace`, `reference/cpp/core/visual/LayerIntf.h:59-68`).
 const DF_ALPHA: i32 = 0;
 const DF_OPAQUE: i32 = 1;
 const DF_MASK: i32 = 2;
 const DF_PROVINCE: i32 = 3;
 const DF_ADD_ALPHA: i32 = 4;
+/// `dfAuto` — the face is chosen automatically from the layer type
+/// (`LayerIntf.h:67`).
+const DF_AUTO: i32 = 128;
 
 // ---------------------------------------------------------------------------
 // Small geometry helpers
@@ -141,6 +147,69 @@ fn dest_info(scene: &Scene, id: u32, method: &str) -> Result<(u32, bool), String
         .bitmap
         .ok_or_else(|| format!("Layer.{method}: this layer has no main image"))?;
     Ok((bitmap, layer.hold_alpha))
+}
+
+/// The layer's effective draw face — the port of the reference
+/// `UpdateDrawFace` (`reference/cpp/core/visual/LayerIntf.cpp:1525-1620`):
+/// when `face == dfAuto` the face is derived from the layer type, otherwise
+/// the stored face is used verbatim.
+fn draw_face(scene: &Scene, id: u32) -> i32 {
+    let Some(layer) = scene.layer(id) else {
+        return DF_ALPHA;
+    };
+    if layer.face != DF_AUTO {
+        return layer.face;
+    }
+    blend_face(layer.blend)
+}
+
+/// `UpdateDrawFace`'s type→face table for `Face == dfAuto`
+/// (`LayerIntf.cpp:1529-1618`), read on the port's canonical native
+/// spelling of the generic blend (`blend::to_native`):
+/// `ltAlpha`/`ltPs*` → `dfAlpha`, `ltAddAlpha` → `dfAddAlpha`,
+/// `ltOpaque` and every other non-PS type → `dfOpaque`. The port collapses
+/// each PS/original pair into one generic blend, so a PS-only type resolves
+/// to `dfAlpha` while a collapsed pair takes the original spelling's face —
+/// exactly the reference face for every type the canonical encoder emits.
+const fn blend_face(blend: BlendMode) -> i32 {
+    match blend {
+        BlendMode::Replace => DF_OPAQUE,
+        BlendMode::SourceOver => DF_ALPHA,
+        BlendMode::Additive => DF_OPAQUE,
+        BlendMode::Subtractive => DF_OPAQUE,
+        BlendMode::Multiply => DF_OPAQUE,
+        BlendMode::Screen => DF_OPAQUE,
+        BlendMode::AddAlpha => DF_ADD_ALPHA,
+        BlendMode::DestinationDependent(
+            DstBlend::ColorDodge | DstBlend::Darken | DstBlend::Lighten,
+        ) => DF_OPAQUE,
+        BlendMode::DestinationDependent(
+            DstBlend::ColorDodge5
+            | DstBlend::ColorBurn
+            | DstBlend::Difference
+            | DstBlend::Difference5
+            | DstBlend::Exclusion
+            | DstBlend::Overlay
+            | DstBlend::HardLight
+            | DstBlend::SoftLight,
+        ) => DF_ALPHA,
+    }
+}
+
+/// `GetBltMethodFromOperationModeAndDrawFace`
+/// (`reference/cpp/core/visual/LayerIntf.cpp:4118-4271`): the face-sensitive
+/// modes `omAlpha` / `omAddAlpha` / `omOpaque` only know the `dfAlpha`,
+/// `dfAddAlpha` and `dfOpaque` faces — any other destination face makes the
+/// reference raise `TVPNotDrawableFaceType`. The face-independent modes
+/// (additive, subtractive, … , every `omPs*`) accept any face.
+fn check_operate_face(mode: i64, face: i32) -> Result<(), String> {
+    const FACE_SENSITIVE: [i64; 3] = [OM_ALPHA, OM_OPAQUE, super::blend::LT_ADD_ALPHA];
+    if FACE_SENSITIVE.contains(&mode) && !matches!(face, DF_ALPHA | DF_OPAQUE | DF_ADD_ALPHA) {
+        return Err(format!(
+            "Layer: the operation mode {mode} cannot draw on draw face {face}"
+        ));
+    }
+    Ok(())
 }
 
 /// Resolve an `omAuto` operation mode against the source layer's blend.
@@ -265,7 +334,8 @@ extern "C" fn layer_operate_rect(
     let result: Result<(), String> = (|| {
         let dx = value_as_i64(&a[0]) as i32;
         let dy = value_as_i64(&a[1]) as i32;
-        let (src_id, src_type) = resolve_source_bitmap(&ctx, host.engine(), &a[2], "operateRect")?;
+        let (src_id, src_type) =
+            resolve_source_bitmap(&ctx, host.engine(), &a[2], "operateRect", false)?;
         let sx = value_as_i64(&a[3]) as i32;
         let sy = value_as_i64(&a[4]) as i32;
         let sw = value_as_i64(&a[5]) as i32;
@@ -274,11 +344,15 @@ extern "C" fn layer_operate_rect(
         let opa = opt_i64(a, 8, 255).clamp(0, 255) as u8;
         let scene = scene_mut(&ctx)?;
         let (dst, hold_alpha) = dest_info(scene, id, "operateRect")?;
+        let face = draw_face(scene, id);
         let clip = layer_clip(scene, id);
         let src_rect = (sx, sy, sx.saturating_add(sw), sy.saturating_add(sh));
         let Some((dx, dy, src_rect)) = clip_dest_src(dx, dy, src_rect, clip) else {
             return Ok(());
         };
+        // Reference order: clip first (`LayerIntf.cpp:5232-5234`), then the
+        // mode/face validation (`LayerIntf.cpp:5235-5242`).
+        check_operate_face(mode, face)?;
         with_two_bitmaps(scene, dst, src_id, |d, s| {
             layer_ops::operate_rect(d, dx, dy, s, src_rect, mode, opa, hold_alpha);
         })?;
@@ -327,7 +401,7 @@ extern "C" fn layer_operate_stretch(
         let dw = value_as_i64(&a[2]) as i32;
         let dh = value_as_i64(&a[3]) as i32;
         let (src_id, src_type) =
-            resolve_source_bitmap(&ctx, host.engine(), &a[4], "operateStretch")?;
+            resolve_source_bitmap(&ctx, host.engine(), &a[4], "operateStretch", false)?;
         let sx = value_as_i64(&a[5]) as i32;
         let sy = value_as_i64(&a[6]) as i32;
         let sw = value_as_i64(&a[7]) as i32;
@@ -337,11 +411,15 @@ extern "C" fn layer_operate_stretch(
         let stretch_type = opt_i64(a, 11, 0);
         let scene = scene_mut(&ctx)?;
         let (dst, hold_alpha) = dest_info(scene, id, "operateStretch")?;
+        let face = draw_face(scene, id);
         let clip = layer_clip(scene, id);
         let dst_rect = normalize_rect((dx, dy, dx.saturating_add(dw), dy.saturating_add(dh)));
         let Some(dest) = layer_ops::intersect_rect(dst_rect, clip) else {
             return Ok(());
         };
+        // Reference order: clip first (`LayerIntf.cpp:5387-5390`), then the
+        // mode/face validation (`LayerIntf.cpp:5392-5399`).
+        check_operate_face(mode, face)?;
         let src_rect = (sx, sy, sx.saturating_add(sw), sy.saturating_add(sh));
         let src_trimmed = scale_rect(src_rect, dst_rect, dest);
         with_two_bitmaps(scene, dst, src_id, |d, s| {
@@ -381,7 +459,16 @@ fn affine_op(
     if argc < 12 {
         return Err(format!("Layer.{method} requires 12 arguments"));
     }
-    let (src_id, src_type) = resolve_source_bitmap(ctx, host, &a[0], method)?;
+    // Reference source classes: `affineCopy`/`operateAffine` accept Layer or
+    // Bitmap (`LayerIntf.cpp:9227-9251`, `9423-9447`), `affinePile` and
+    // `affineBlend` only a Layer (`LayerIntf.cpp:9299-9316`, `9361-9378`).
+    let (src_id, src_type) = resolve_source_bitmap(
+        ctx,
+        host,
+        &a[0],
+        method,
+        matches!(kind, AffineKind::Pile | AffineKind::Blend),
+    )?;
     let sx = value_as_i64(&a[1]) as i32;
     let sy = value_as_i64(&a[2]) as i32;
     let sw = value_as_i64(&a[3]) as i32;
@@ -415,6 +502,25 @@ fn affine_op(
     };
     let scene = scene_mut(ctx)?;
     let (dst, layer_hold_alpha) = dest_info(scene, id, method)?;
+    // Reference face gates: `AffineCopy` requires `dfAlpha`/`dfAddAlpha`/
+    // `dfOpaque` (`LayerIntf.cpp:4733-4786`), `AffinePile`/`AffineBlend`
+    // require `dfAlpha`/`dfOpaque` (`LayerIntf.cpp:5427-5431`),
+    // `OperateAffine` validates the mode/face pair
+    // (`LayerIntf.cpp:5626-5638`).
+    let face = draw_face(scene, id);
+    match kind {
+        AffineKind::Copy => {
+            if !matches!(face, DF_ALPHA | DF_ADD_ALPHA | DF_OPAQUE) {
+                return Err(format!("Layer.{method}: unsupported draw face {face}"));
+            }
+        }
+        AffineKind::Pile | AffineKind::Blend => {
+            if !matches!(face, DF_ALPHA | DF_OPAQUE) {
+                return Err(format!("Layer.{method}: unsupported draw face {face}"));
+            }
+        }
+        AffineKind::Operate => check_operate_face(mode, face)?,
+    }
     let clip = layer_clip(scene, id);
     let neutral_color = {
         let color = scene.layer(id).map_or(0, |l| l.neutral_color);
@@ -507,7 +613,16 @@ fn stretch_op(
     method: &str,
     kind: StretchKind,
 ) -> Result<(), String> {
-    let (src_id, _src_type) = resolve_source_bitmap(ctx, host, &a[4], method)?;
+    // Reference source classes: `stretchCopy` accepts Layer or Bitmap
+    // (`LayerIntf.cpp:9002-9027`), `stretchPile`/`stretchBlend` only a Layer
+    // (`LayerIntf.cpp:9057-9070`, `9104-9117`).
+    let (src_id, _src_type) = resolve_source_bitmap(
+        ctx,
+        host,
+        &a[4],
+        method,
+        matches!(kind, StretchKind::Pile | StretchKind::Blend),
+    )?;
     let dx = value_as_i64(&a[0]) as i32;
     let dy = value_as_i64(&a[1]) as i32;
     let dw = value_as_i64(&a[2]) as i32;
@@ -518,7 +633,16 @@ fn stretch_op(
     let sh = value_as_i64(&a[8]) as i32;
     let scene = scene_mut(ctx)?;
     let (dst, layer_hold_alpha) = dest_info(scene, id, method)?;
-    let face = scene.layer(id).map_or(DF_ALPHA, |l| l.face);
+    let face = draw_face(scene, id);
+    // Reference face gates: `StretchPile`/`StretchBlend` require
+    // `dfAlpha`/`dfOpaque` *before* clipping (`LayerIntf.cpp:5264-5281`,
+    // `5319-5336`); `StretchCopy` validates after the clip intersection
+    // (`LayerIntf.cpp:4677-4710`) and lands in its own arm below.
+    if matches!(kind, StretchKind::Pile | StretchKind::Blend)
+        && !matches!(face, DF_ALPHA | DF_OPAQUE)
+    {
+        return Err(format!("Layer.{method}: unsupported draw face {face}"));
+    }
     let clip = layer_clip(scene, id);
     let dst_rect = normalize_rect((dx, dy, dx.saturating_add(dw), dy.saturating_add(dh)));
     let Some(dest) = layer_ops::intersect_rect(dst_rect, clip) else {
@@ -528,6 +652,12 @@ fn stretch_op(
     let src_trimmed = scale_rect(src_rect, dst_rect, dest);
     match kind {
         StretchKind::Copy => {
+            // `StretchCopy` throws `TVPNotDrawableFaceType` for every face
+            // outside `dfAlpha`/`dfAddAlpha`/`dfOpaque`
+            // (`LayerIntf.cpp:4683-4710`).
+            if !matches!(face, DF_ALPHA | DF_ADD_ALPHA | DF_OPAQUE) {
+                return Err(format!("Layer.{method}: unsupported draw face {face}"));
+            }
             let stretch_type = opt_i64(a, 9, 0);
             let plane = if face == DF_OPAQUE && layer_hold_alpha {
                 layer_ops::COPY_MAIN
@@ -541,12 +671,11 @@ fn stretch_op(
         StretchKind::Pile | StretchKind::Blend => {
             let opa = opt_i64(a, 9, 255).clamp(0, 255) as u8;
             let stretch_type = opt_i64(a, 10, 0);
-            let mode = if kind_is_blend(&kind) && face == DF_OPAQUE {
+            // `StretchBlend` on `dfOpaque` treats the source as opaque
+            // (`bmCopy`, `LayerIntf.cpp:5347-5353`); everything else piles
+            // source-over style.
+            let mode = if matches!(kind, StretchKind::Blend) && face == DF_OPAQUE {
                 OM_OPAQUE
-            } else if kind_is_blend(&kind) {
-                // `bmCopyOnAlpha` treats the source as opaque; the L2
-                // source-over primitive is the closest available.
-                OM_ALPHA
             } else {
                 OM_ALPHA
             };
@@ -565,10 +694,6 @@ fn stretch_op(
         }
     }
     Ok(())
-}
-
-fn kind_is_blend(kind: &StretchKind) -> bool {
-    matches!(kind, StretchKind::Blend)
 }
 
 macro_rules! stretch_method {
@@ -637,7 +762,16 @@ fn rect_op(
     method: &str,
     kind: RectKind,
 ) -> Result<(), String> {
-    let (src_id, _src_type) = resolve_source_bitmap(ctx, host, &a[2], method)?;
+    // Reference source classes: `copyRect` accepts Layer or Bitmap
+    // (`LayerIntf.cpp:8779-8811`); `pileRect`, `blendRect` and `piledCopy`
+    // only a Layer (`LayerIntf.cpp:8752-8767`, `8822-8840`, `8858-8876`).
+    let (src_id, _src_type) = resolve_source_bitmap(
+        ctx,
+        host,
+        &a[2],
+        method,
+        matches!(kind, RectKind::Pile | RectKind::Blend | RectKind::PiledCopy),
+    )?;
     let dx = value_as_i64(&a[0]) as i32;
     let dy = value_as_i64(&a[1]) as i32;
     let sx = value_as_i64(&a[3]) as i32;
@@ -646,7 +780,7 @@ fn rect_op(
     let sh = value_as_i64(&a[6]) as i32;
     let scene = scene_mut(ctx)?;
     let (dst, hold_alpha) = dest_info(scene, id, method)?;
-    let face = scene.layer(id).map_or(DF_ALPHA, |l| l.face);
+    let face = draw_face(scene, id);
     let clip = layer_clip(scene, id);
     let src_rect = (sx, sy, sx.saturating_add(sw), sy.saturating_add(sh));
     let opa = opt_i64(a, 7, 255).clamp(0, 255) as u8;
@@ -696,7 +830,10 @@ fn rect_op(
             DF_PROVINCE => {
                 clear_province_region(scene, id, (dx, dy, sx, sy, sw, sh));
             }
-            _ => return Err(format!("Layer.{method}: unsupported draw face {face}")),
+            // Reference `CopyRect` has no `default:` case — any other face
+            // (including a resolved-away `dfAuto`) falls through silently
+            // (`reference/cpp/core/visual/LayerIntf.cpp:4574-4657`).
+            _ => {}
         },
         RectKind::Pile => {
             if face != DF_ALPHA && face != DF_OPAQUE {
@@ -838,7 +975,7 @@ extern "C" fn layer_copy_9patch(
     let Ok((host, ctx)) = super::bound(engine) else {
         return report_error(out_error, "Layer.copy9Patch: compat context is not bound");
     };
-    let (src_id, _) = match resolve_source_bitmap(&ctx, host.engine(), &a[0], "copy9Patch") {
+    let (src_id, _) = match resolve_source_bitmap(&ctx, host.engine(), &a[0], "copy9Patch", false) {
         Ok(v) => v,
         Err(error) => return report_error(out_error, &error),
     };
@@ -894,7 +1031,7 @@ extern "C" fn layer_color_rect(
         let opa = opt_i64(a, 5, 255).clamp(-255, 255) as i32;
         let scene = scene_mut(&ctx)?;
         let (dst, _hold_alpha) = dest_info(scene, id, "colorRect")?;
-        let face = scene.layer(id).map_or(DF_ALPHA, |l| l.face);
+        let face = draw_face(scene, id);
         let clip = layer_clip(scene, id);
         let Some(dest) =
             layer_ops::intersect_rect((x, y, x.saturating_add(w), y.saturating_add(h)), clip)
@@ -937,7 +1074,10 @@ extern "C" fn layer_color_rect(
             }
             DF_OPAQUE => layer_ops::fill_color_hold_alpha(bitmap, dest, color, opa),
             DF_MASK => layer_ops::fill_mask(bitmap, dest, color[2]),
-            _ => return Err(format!("Layer.colorRect: unsupported draw face {face}")),
+            // Reference `ColorRect` switches on the resolved face with no
+            // `default:` (`reference/cpp/core/visual/LayerIntf.cpp:4338-4411`):
+            // an out-of-vocabulary face falls through silently.
+            _ => {}
         }
         Ok(())
     })();
@@ -1007,7 +1147,7 @@ extern "C" fn layer_convert_type(
         let fromtype = value_as_i64(&a[0]) as i32;
         let scene = scene_mut(&ctx)?;
         let (dst, _) = dest_info(scene, id, "convertType")?;
-        let face = scene.layer(id).map_or(DF_ALPHA, |l| l.face);
+        let face = draw_face(scene, id);
         let clip = layer_clip(scene, id);
         let bitmap = scene
             .bitmap_mut(dst)
@@ -1160,7 +1300,7 @@ extern "C" fn layer_do_box_blur(
         }
         let scene = scene_mut(&ctx)?;
         let (dst, _) = dest_info(scene, id, "doBoxBlur")?;
-        let face = scene.layer(id).map_or(DF_ALPHA, |l| l.face);
+        let face = draw_face(scene, id);
         let clip = layer_clip(scene, id);
         let bitmap = scene
             .bitmap_mut(dst)
@@ -1241,7 +1381,7 @@ extern "C" fn layer_adjust_gamma(
         };
         let scene = scene_mut(&ctx)?;
         let (dst, _) = dest_info(scene, id, "adjustGamma")?;
-        let face = scene.layer(id).map_or(DF_ALPHA, |l| l.face);
+        let face = draw_face(scene, id);
         let clip = layer_clip(scene, id);
         let bitmap = scene
             .bitmap_mut(dst)
@@ -1296,15 +1436,30 @@ extern "C" fn layer_gaussian_blur(
         if radius <= 0 {
             return Err("Layer.gaussianBlur: radius must be positive".into());
         }
-        let sigma = if a.get(1).is_some_and(|v| v.ty != tjs::VAL_VOID) {
-            value_as_f64(&a[1]) as f32
-        } else {
-            (radius as f32 / 2.5).max(1.0)
+        let sigma = match a.get(1) {
+            Some(v) if v.ty != tjs::VAL_VOID => value_as_f64(v) as f32,
+            // Reference: a *present* but `void` second argument keeps the
+            // `1.0f` default; only a *missing* argument derives
+            // `max(1.0f, radius / 2.5f)`
+            // (`reference/cpp/core/visual/LayerIntf.cpp:9584-9597`).
+            Some(_) => 1.0,
+            None => (radius as f32 / 2.5).max(1.0),
         };
         if sigma <= 0.0 {
             return Err("Layer.gaussianBlur: sigma must be positive".into());
         }
         let scene = scene_mut(&ctx)?;
+        let has_image = scene
+            .layer(id)
+            .ok_or_else(|| "Layer.gaussianBlur: this layer no longer exists".to_string())?
+            .bitmap
+            .is_some();
+        if !has_image {
+            // Reference `ApplyGaussianBlur` logs and returns without an
+            // error when the layer cannot have or does not have an image
+            // (`reference/cpp/core/visual/LayerIntf.cpp:5749-5755`).
+            return Ok(());
+        }
         let (dst, _) = dest_info(scene, id, "gaussianBlur")?;
         let clip = layer_clip(scene, id);
         let bitmap = scene
@@ -1392,6 +1547,17 @@ extern "C" fn layer_light(
         let brightness = opt_i64(a, 0, 0) as i32;
         let contrast = opt_i64(a, 1, 0) as i32;
         let scene = scene_mut(&ctx)?;
+        let has_image = scene
+            .layer(id)
+            .ok_or_else(|| "Layer.light: this layer no longer exists".to_string())?
+            .bitmap
+            .is_some();
+        if !has_image {
+            // Reference `ApplyLightContrast` logs and returns without an
+            // error when the layer cannot have or does not have an image
+            // (`reference/cpp/core/visual/LayerIntf.cpp:1006-1025`).
+            return Ok(());
+        }
         let (dst, _) = dest_info(scene, id, "light")?;
         let clip = layer_clip(scene, id);
         let bitmap = scene
@@ -1575,7 +1741,10 @@ extern "C" fn layer_set_mask_pixel(
     };
     let x = value_as_i64(&a[0]) as i32;
     let y = value_as_i64(&a[1]) as i32;
-    let mask = value_as_i64(&a[2]).clamp(0, 255) as u8;
+    // Reference `SetPointMask` stores `(mask & 0xff)`
+    // (`reference/cpp/core/visual/LayerBitmapIntf.cpp:210-220`), so the
+    // script value is truncated to its low eight bits, not clamped.
+    let mask = value_as_i64(&a[2]) as u8;
     let scene = match scene_mut(&ctx) {
         Ok(s) => s,
         Err(error) => return report_error(out_error, &error),
@@ -1690,11 +1859,15 @@ extern "C" fn layer_copy_to_bitmap_from_main_image(
         );
     };
     let result: Result<(), String> = (|| {
-        let dst_id = super::super::common::resolve_object_id(host.engine(), &a[0])?;
-        if dst_id < 0 {
-            return Err("Layer.copyToBitmapFromMainImage: the argument is not a Bitmap".into());
-        }
-        let dst_id = dst_id as u32;
+        let dst_id =
+            match super::super::common::resolve_object_id(host.engine(), &a[0], &["Bitmap"]) {
+                Ok(id) if id >= 0 => id as u32,
+                _ => {
+                    return Err(
+                        "Layer.copyToBitmapFromMainImage: the argument is not a Bitmap".into(),
+                    );
+                }
+            };
         let scene = scene_mut(&ctx)?;
         let src_id = main_bitmap(scene, id, "copyToBitmapFromMainImage")?;
         let (width, height, rgba) = {
@@ -1772,51 +1945,167 @@ extern "C" fn layer_dump(
 // Deferred members (typed errors, never silent stubs)
 // ---------------------------------------------------------------------------
 
-/// `loadImages(name [, key])` — needs an L1 image decoder, which is not part
-/// of the L2/L3 service set yet.
+/// `loadImages(name [, key])` — load the layer's main image (reference
+/// `tTJSNI_BaseLayer::LoadImages`). The bytes are read through the attached
+/// storage (probing image extensions), decoded by the host image codec, and
+/// installed as the layer's bitmap with the image size set. Returns void:
+/// the codec reports no per-format metainfo, so the reference's optional
+/// metainfo dictionary is absent.
 extern "C" fn layer_load_images(
-    _engine: *mut c_void,
-    _instance: *mut c_void,
+    engine: *mut c_void,
+    instance: *mut c_void,
     argc: c_int,
     argv: *const Value,
-    _out: *mut Value,
+    out: *mut Value,
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    let name = unsafe { args(argv, argc) }
-        .first()
-        .map(crate::native_util::value_as_string)
-        .unwrap_or_default();
-    report_error(
-        out_error,
-        &format!(
-            "Layer.loadImages({name:?}): the L1 image decoder is not exposed through the \
-             L2/L3 service set yet"
-        ),
-    )
+    if argc < 1 {
+        return report_error(out_error, "Layer.loadImages requires 1 argument");
+    }
+    let inst = unsafe { &*(instance as *const LayerInst) };
+    let Some(id) = inst.id else {
+        return report_error(out_error, "Layer.loadImages: this layer is not constructed");
+    };
+    let Ok((host, ctx)) = super::bound(engine) else {
+        return report_error(out_error, "Layer.loadImages: compat context is not bound");
+    };
+    let a = unsafe { args(argv, argc) };
+    let name = crate::native_util::value_as_string(&a[0]);
+    let colorkey = a
+        .get(1)
+        .filter(|value| value.ty != tjs::VAL_VOID)
+        .map_or(COLOR_KEY_NONE, |value| value_as_i64(value) as u32);
+    match load_layer_image(&ctx, id, &name, colorkey) {
+        Ok(()) => {
+            // The reference returns the graphic metainfo, which is `null`
+            // when the format carries none (the common case). Returning
+            // `void` would make the game's `ret != null` guard pass and then
+            // fault on `ret.mode`.
+            set_null_out(host.engine(), out);
+            0
+        }
+        Err(error) => report_error(out_error, &format!("Layer.loadImages: {error}")),
+    }
 }
 
-/// `loadProvinceImage(name)` — same decoder deferral as `loadImages`.
+/// Reads, decodes and installs `name` as the layer's main image, reusing the
+/// layer's existing bitmap so repeated loads do not leak scene bitmaps.
+fn load_layer_image(
+    ctx: &CompatCtx,
+    layer_id: u32,
+    name: &str,
+    colorkey: u32,
+) -> Result<(), String> {
+    log::debug!("load_layer_image: layer {layer_id} <- {name:?}");
+    let services = unsafe { ctx.services() };
+    let storage = services
+        .storage()
+        .ok_or_else(|| "no storage attached".to_string())?;
+    // SAFETY: `attach_storage` guarantees the pointer stays valid.
+    let (resolved, bytes) = read_image_from_storage(unsafe { &*storage }, name)?;
+    let image = decode_image(services, &resolved, &bytes)?;
+    if !image.is_consistent() {
+        return Err("the decoded image is malformed".to_string());
+    }
+    let (width, height) = (image.width, image.height);
+    let mut rgba = image.rgba;
+    apply_color_key(&mut rgba, width, colorkey);
+    let scene = scene_mut(ctx)?;
+    if scene.layer(layer_id).is_none() {
+        return Err("the layer no longer exists".to_string());
+    }
+    match scene.layer(layer_id).and_then(|layer| layer.bitmap) {
+        Some(id) => replace_bitmap_pixels(scene, id, width, height, rgba),
+        None => {
+            let id = scene.add_bitmap(width, height, rgba);
+            if let Some(layer) = scene.layer_mut(layer_id) {
+                layer.bitmap = Some(id);
+            }
+        }
+    }
+    if let Some(layer) = scene.layer_mut(layer_id) {
+        layer.image_width = width;
+        layer.image_height = height;
+        layer.image_modified = true;
+    }
+    Ok(())
+}
+
+/// `loadProvinceImage(name)` — load an 8-bit province (mask) plane matching
+/// the main image's size (reference `tTJSNI_BaseLayer::LoadProvinceImage`).
 extern "C" fn layer_load_province_image(
-    _engine: *mut c_void,
-    _instance: *mut c_void,
+    engine: *mut c_void,
+    instance: *mut c_void,
     argc: c_int,
     argv: *const Value,
-    _out: *mut Value,
+    out: *mut Value,
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    let name = unsafe { args(argv, argc) }
-        .first()
-        .map(crate::native_util::value_as_string)
-        .unwrap_or_default();
-    report_error(
-        out_error,
-        &format!(
-            "Layer.loadProvinceImage({name:?}): the L1 image decoder is not exposed through \
-             the L2/L3 service set yet"
-        ),
-    )
+    if argc < 1 {
+        return report_error(out_error, "Layer.loadProvinceImage requires 1 argument");
+    }
+    let inst = unsafe { &*(instance as *const LayerInst) };
+    let Some(id) = inst.id else {
+        return report_error(
+            out_error,
+            "Layer.loadProvinceImage: this layer is not constructed",
+        );
+    };
+    let Ok((_host, ctx)) = super::bound(engine) else {
+        return report_error(
+            out_error,
+            "Layer.loadProvinceImage: compat context is not bound",
+        );
+    };
+    let a = unsafe { args(argv, argc) };
+    let name = crate::native_util::value_as_string(&a[0]);
+    match load_layer_province(&ctx, id, &name) {
+        Ok(()) => {
+            set_void(out);
+            0
+        }
+        Err(error) => report_error(out_error, &format!("Layer.loadProvinceImage: {error}")),
+    }
+}
+
+/// Reads and installs `name` as the layer's province plane. The decoded image
+/// must match the main image's size (reference `TVPProvinceSizeMismatch`);
+/// its red channel becomes the 8-bit province value.
+fn load_layer_province(ctx: &CompatCtx, layer_id: u32, name: &str) -> Result<(), String> {
+    let services = unsafe { ctx.services() };
+    let storage = services
+        .storage()
+        .ok_or_else(|| "no storage attached".to_string())?;
+    // SAFETY: `attach_storage` guarantees the pointer stays valid.
+    let (resolved, bytes) = read_image_from_storage(unsafe { &*storage }, name)?;
+    let image = decode_image(services, &resolved, &bytes)?;
+    if !image.is_consistent() {
+        return Err("the decoded province image is malformed".to_string());
+    }
+    let scene = scene_mut(ctx)?;
+    let (main_w, main_h) = scene
+        .layer(layer_id)
+        .and_then(|layer| layer.bitmap)
+        .and_then(|id| scene.bitmap(id))
+        .map(|bitmap| (bitmap.width, bitmap.height))
+        .ok_or_else(|| "the layer has no main image".to_string())?;
+    if image.width != main_w || image.height != main_h {
+        return Err(format!(
+            "the province image is {}x{} but the main image is {main_w}x{main_h}",
+            image.width, image.height,
+        ));
+    }
+    let plane: Vec<u8> = image.rgba.chunks_exact(4).map(|pixel| pixel[0]).collect();
+    scene.resize_province_image(layer_id, main_w, main_h);
+    if let Some(layer) = scene.layer_mut(layer_id)
+        && let Some(province) = layer.province.as_mut()
+    {
+        province.copy_from_slice(&plane);
+        layer.image_modified = true;
+    }
+    Ok(())
 }
 
 /// `saveLayerImage(name [, type])` — needs an L1 image encoder, which is not
@@ -1832,8 +2121,7 @@ extern "C" fn layer_save_layer_image(
 ) -> c_int {
     report_error(
         out_error,
-        "Layer.saveLayerImage: the L1 image encoder is not exposed through the L2/L3 \
-         service set yet",
+        "Layer.saveLayerImage: the image encoder is not exposed by the host services",
     )
 }
 
@@ -1853,7 +2141,7 @@ extern "C" fn layer_draw_text(
     }
     report_error(
         out_error,
-        "Layer.drawText: the font rasterizer is not exposed through the L2/L3 service set yet",
+        "Layer.drawText: the font rasterizer is not exposed by the host services",
     )
 }
 
@@ -1872,8 +2160,7 @@ extern "C" fn layer_draw_glyph(
     }
     report_error(
         out_error,
-        "Layer.drawGlyph: the font rasterizer / glyph cache is not exposed through the \
-         L2/L3 service set yet",
+        "Layer.drawGlyph: the font rasterizer / glyph cache is not exposed by the host services",
     )
 }
 

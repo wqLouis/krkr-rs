@@ -1,15 +1,13 @@
 //! Input native classes: `Mouse`, `Key`, `Pad`.
 //!
-//! Behavioral reference: `main`'s `crates/tvp-input/src/{lib.rs,mouse.rs,key.rs}`
+//! Behavioral reference: `crates/tvp-input/src/{lib.rs,mouse.rs,key.rs}`
 //! and the reference `Pad` class (`reference/cpp/core/utils/PadIntf.cpp`).
 //!
-//! The old `tvp-input` crate kept the input state in process globals
-//! (`OnceLock<Mutex<Option<Arc<Mutex<InputState>>>>>`). This port keeps the
-//! same *behavior* but reads the generic L2 state
+//! The input state is the generic L2 state
 //! ([`engine::input::InputState`]) that the host attaches through
 //! [`CompatServices::attach_input`](crate::CompatServices::attach_input) —
 //! the TVP-specific parts (the VK code table, the click-sequence constants
-//! and the `TVP_SS_*` flags) stay here (doc 08 §3.1).
+//! and the `TVP_SS_*` flags) stay here.
 //!
 //! # Frame protocol
 //!
@@ -54,13 +52,6 @@
 //! *text editor* placeholder (`reference/cpp/core/utils/PadIntf.cpp`); it is
 //! not a gamepad class. Gamepad input reaches scripts as `VK_PAD*` keys in
 //! the L2 [`InputState`], through `Key`/`System`.
-
-// This module exposes the full reference input surface (key-code lookup,
-// `TVP_SS_*` shift flags, pad codes, the cursor-warp / raw-button state API).
-// Several members are consumed by the host input bridge and frame loop that
-// land with the migrated host, so they are intentionally present before every
-// call site exists — the same "documented seam" policy `system.rs` uses.
-#![allow(dead_code)]
 
 use std::ffi::{c_char, c_int, c_void};
 
@@ -126,8 +117,6 @@ pub fn mouse_button_from_vk(vk: u32) -> Option<usize> {
 // Gamepad virtual-key codes (reference `VK_PAD*`, tvpinputdefs.h)
 // ---------------------------------------------------------------------------
 
-/// First KiriKiri pad virtual-key code (`VK_PAD_FIRST`).
-pub const VK_PAD_FIRST: u32 = 0x1B0;
 /// Gamepad "left" code (`VK_PADLEFT`).
 pub const VK_PADLEFT: u32 = 0x1B5;
 /// Gamepad "up" code (`VK_PADUP`).
@@ -158,8 +147,6 @@ pub const VK_PAD9: u32 = 0x1C8;
 pub const VK_PAD10: u32 = 0x1C9;
 /// "Any pad button held" pseudo-code (`VK_PADANY`).
 pub const VK_PADANY: u32 = 0x1DF;
-/// Last KiriKiri pad virtual-key code (`VK_PAD_LAST`).
-pub const VK_PAD_LAST: u32 = 0x1DF;
 
 /// Every concrete pad button code (d-pad + pad buttons 1..10), in reference
 /// order. [`VK_PADANY`] is a query pseudo-code, not a button.
@@ -201,16 +188,6 @@ pub mod shift_state {
     pub const TVP_SS_RIGHT: u32 = 0x10;
     /// Middle mouse button held.
     pub const TVP_SS_MIDDLE: u32 = 0x20;
-    /// Event is the second click of a double-click.
-    pub const TVP_SS_DOUBLE: u32 = 0x40;
-    /// Event is an auto-repeat.
-    pub const TVP_SS_REPEAT: u32 = 0x80;
-
-    /// Whether any mouse-button bit is set
-    /// (`TVPIsAnyMouseButtonPressedInShiftStateFlags`).
-    pub fn any_mouse_button_pressed(state: u32) -> bool {
-        state & (TVP_SS_LEFT | TVP_SS_RIGHT | TVP_SS_MIDDLE | TVP_SS_DOUBLE) != 0
-    }
 }
 
 use shift_state::{
@@ -237,20 +214,6 @@ pub fn mouse_button(index: usize) -> Option<MouseButton> {
         MB_MIDDLE => Some(MouseButton::Middle),
         MB_X1 => Some(MouseButton::Back),
         MB_X2 => Some(MouseButton::Forward),
-        _ => None,
-    }
-}
-
-/// The TVP mouse-button index for a platform button, if it has one.
-pub fn button_index_of(button: MouseButton) -> Option<usize> {
-    match button {
-        MouseButton::Left => Some(MB_LEFT),
-        MouseButton::Right => Some(MB_RIGHT),
-        MouseButton::Middle => Some(MB_MIDDLE),
-        MouseButton::Back => Some(MB_X1),
-        MouseButton::Forward => Some(MB_X2),
-        // `MouseButton` is `#[non_exhaustive]`; an unknown/raw button has no
-        // TVP index.
         _ => None,
     }
 }
@@ -391,14 +354,6 @@ macro_rules! key_code_table {
         /// The `Key` class key-code constants: TJS constant name → Windows
         /// virtual-key code, in declaration order.
         pub const KEY_CODE_TABLE: &[(&str, u32)] = &[ $(($tjs, $code)),* ];
-
-        /// Look up the Windows virtual-key code for a TJS `Key.kXXX` name.
-        pub fn key_code(name: &str) -> Option<u32> {
-            KEY_CODE_TABLE
-                .iter()
-                .find(|(n, _)| *n == name)
-                .map(|(_, code)| *code)
-        }
 
         /// Property definitions for every constant: get-only properties
         /// returning the virtual-key code.
@@ -1003,9 +958,7 @@ extern "C" fn native_get_click_count(
             "Mouse.getClickCount: input state is not attached",
         );
     };
-    let count = button_index(&a[0])
-        .and_then(mouse_button)
-        .map_or(0, |button| input.button_click_count(button));
+    let count = button_index(&a[0]).map_or(0, |index| mouse_click_count(input, index));
     set_int(out, i64::from(count));
     0
 }
@@ -1093,7 +1046,7 @@ extern "C" fn native_key_get_repeat(
 /// Per-object `Pad` payload: the reference's fixed, read-only values.
 ///
 /// The reference `tTJSNI_Pad` delegates to a native editor form; the port owns
-/// the (default) values on the instance so a future host editor backend can
+/// the (default) values on the instance so a host editor backend can
 /// replace them without changing the script surface. There is no process
 /// global.
 struct PadState {
@@ -1552,17 +1505,22 @@ mod tests {
 
     #[test]
     fn key_code_table_has_reference_values() {
-        assert_eq!(key_code("kReturn"), Some(0x0D));
-        assert_eq!(key_code("kLButton"), Some(0x01));
-        assert_eq!(key_code("kPadAny"), Some(0x1DF));
-        assert_eq!(key_code("kNoSuchKey"), None);
+        let find = |name: &str| {
+            KEY_CODE_TABLE
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, code)| *code)
+        };
+        assert_eq!(find("kReturn"), Some(0x0D));
+        assert_eq!(find("kLButton"), Some(0x01));
+        assert_eq!(find("kPadAny"), Some(0x1DF));
+        assert_eq!(find("kNoSuchKey"), None);
     }
 
     #[test]
-    fn mouse_button_index_round_trips() {
+    fn mouse_button_indices_map_to_platform_buttons() {
         for index in 0..MOUSE_BUTTONS {
-            let button = mouse_button(index).expect("in range");
-            assert_eq!(button_index_of(button), Some(index));
+            assert!(mouse_button(index).is_some(), "index {index} is not mapped");
         }
         assert!(mouse_button(MOUSE_BUTTONS).is_none());
     }

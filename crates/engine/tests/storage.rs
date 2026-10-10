@@ -7,11 +7,11 @@
 use std::path::PathBuf;
 
 use engine::storage::{ATTR_DIRECTORY, ATTR_NORMAL};
-use engine::{Location, normalize_in_archive_name};
+use engine::{Location, Storage, normalize_in_archive_name};
 use testkit::build_xp3;
 
 mod common;
-use common::{mount_memory, mount_memory_with_archives};
+use common::{memory_with, mount_memory, mount_memory_with_archives};
 
 #[test]
 fn normalize_matches_reference() {
@@ -161,7 +161,7 @@ fn list_merges_disk_and_archives() {
 }
 
 #[test]
-fn get_file_list_wildcards_and_attrs() {
+fn file_list_wildcards_and_attrs() {
     let xp3 = build_xp3(&[("scripts/arc.tjs", b"x", false)]);
     let storage = mount_memory_with_archives(
         &[
@@ -173,7 +173,7 @@ fn get_file_list_wildcards_and_attrs() {
         &["data.xp3"],
     );
 
-    let mut tjs = storage.get_file_list("scripts/*.tjs", ATTR_NORMAL).unwrap();
+    let mut tjs = storage.file_list("scripts/*.tjs", ATTR_NORMAL).unwrap();
     tjs.sort();
     assert_eq!(
         tjs,
@@ -184,10 +184,10 @@ fn get_file_list_wildcards_and_attrs() {
         ]
     );
 
-    let dirs = storage.get_file_list("scripts/", ATTR_DIRECTORY).unwrap();
+    let dirs = storage.file_list("scripts/", ATTR_DIRECTORY).unwrap();
     assert!(dirs.contains(&"scripts/sub/".to_string()), "{dirs:?}");
 
-    let arc_entries = storage.get_file_list("*.xp3>scripts/*.tjs", 0).unwrap();
+    let arc_entries = storage.file_list("*.xp3>scripts/*.tjs", 0).unwrap();
     assert!(
         arc_entries.contains(&"data.xp3>scripts/arc.tjs".to_string()),
         "{arc_entries:?}"
@@ -247,8 +247,27 @@ fn later_mounted_archive_wins() {
     assert_eq!(storage.read("shared.txt").unwrap(), b"from data");
 }
 
+/// The base directory is the app path for disk assets **and** the root a
+/// relative archive path resolves against, so `--base-dir /game` finds
+/// `/game/data.xp3` whatever the process working directory is.
+///
+/// Reference: the app path is a single directory used for both archive lookup
+/// and loose assets (`TVPGetAppPath`,
+/// `reference/cpp/core/base/impl/StorageImpl.cpp:505`).
+#[test]
+fn archive_resolves_relative_to_base_dir() {
+    let xp3 = build_xp3(&[("startup.tjs", b"// startup", false)]);
+    let fs = memory_with(&[("game/data.xp3", &xp3)]);
+    let storage = Storage::mount_archives(fs, "/game", ["data.xp3"]).expect("mount");
+
+    assert_eq!(storage.archive_count(), 1);
+    assert!(storage.exists("startup.tjs").unwrap());
+}
+
 /// Mounting never enumerates the game directory: an archive present on disk
-/// is ignored until the caller names it explicitly.
+/// is ignored until the caller names it explicitly. The reference has no
+/// `*.xp3` folder scan either — `TVPCheckStartupArg` only inspects `argv[1]`
+/// (`reference/cpp/core/environ/win32/Platform.cpp:93`).
 #[test]
 fn mounting_does_not_scan_for_archives() {
     let xp3 = build_xp3(&[("inside.txt", b"archive", false)]);
@@ -291,4 +310,63 @@ fn unmount_archive_does_not_remove_same_named_archives() {
     assert_eq!(storage.archive_count(), 1);
     assert!(storage.exists("a.bin").unwrap());
     assert!(!storage.exists("b.bin").unwrap());
+}
+
+/// `Storage` owns the XP3 extraction filter and hands it to every archive
+/// read; installing and clearing it changes the bytes a `read` returns while
+/// `find`/`stat` stay filter-free.
+#[test]
+fn xp3_extraction_filter_decrypts_archive_reads() {
+    use std::cell::RefCell;
+
+    let key = 0x5Au8;
+    let plain = b"decrypted archive payload".to_vec();
+    let cipher: Vec<u8> = plain.iter().map(|byte| byte ^ key).collect();
+    let xp3 = build_xp3(&[("secret.bin", &cipher, false)]);
+    let mut storage = mount_memory_with_archives(&[("data.xp3", &xp3)], &["data.xp3"]);
+
+    // No filter: the stored bytes come back unchanged.
+    assert_eq!(storage.read("secret.bin").unwrap(), cipher);
+
+    let seen = std::rc::Rc::new(RefCell::new(Vec::new()));
+    let seen_in_filter = std::rc::Rc::clone(&seen);
+    storage.set_xp3_extraction_filter(Some(Box::new(
+        move |file_hash: u32,
+              offset: u64,
+              buffer: &mut [u8],
+              file_name: &str,
+              archive_name: &str,
+              file_size: u64| {
+            seen_in_filter.borrow_mut().push((
+                file_hash,
+                offset,
+                file_name.to_string(),
+                archive_name.to_string(),
+                file_size,
+            ));
+            for byte in buffer.iter_mut() {
+                *byte ^= key;
+            }
+        },
+    )));
+
+    assert_eq!(storage.read("secret.bin").unwrap(), plain);
+    let seen = seen.borrow();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].0, 0, "build_xp3 writes a zero adlr hash");
+    assert_eq!(seen[0].1, 0);
+    assert_eq!(seen[0].2, "secret.bin");
+    assert_eq!(seen[0].3, "data.xp3");
+    assert_eq!(seen[0].4, plain.len() as u64);
+    drop(seen);
+
+    // Metadata is read from the index and is unaffected by the filter.
+    assert_eq!(
+        storage.stat("secret.bin").unwrap().unwrap().size,
+        plain.len() as u64
+    );
+
+    // Clearing the filter restores the raw read.
+    storage.set_xp3_extraction_filter(None);
+    assert_eq!(storage.read("secret.bin").unwrap(), cipher);
 }

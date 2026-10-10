@@ -3,29 +3,43 @@
 //! L3 links no decoder, so the tests install a host [`VideoSource`] through
 //! [`CompatHost::set_video_source`] — the same seam an L4 host uses — and then
 //! drive the script surface against the L2 [`engine::video::VideoOverlay`]
-//! state. The class is a standalone native (it does not derive from `Layer`),
-//! so no scene is attached.
+//! state. The class is a standalone native (it does not derive from `Layer`);
+//! a scene is attached only so the `Layer` fixtures exist for the layer-ref
+//! arguments.
 
 mod common;
 
 use api::media::{RgbaFrame, VideoSpec};
 use common::vm_lock;
 use compat::CompatHost;
+use engine::Scene;
 use tjs::{Tjs2Engine, TjsValue};
 
-/// A bound VM + host. The host is declared first so it drops before the engine
-/// (releasing every retained script object while the engine is alive).
+/// A bound VM + host + attached scene. The host is declared first so it drops
+/// before the engine (releasing every retained script object while the engine
+/// is alive) and the scene.
 struct Env {
     host: CompatHost,
     engine: Box<Tjs2Engine>,
+    _scene: Box<Scene>,
 }
 
 impl Env {
     fn new() -> Env {
         let engine = Box::new(Tjs2Engine::new().expect("create engine"));
+        let mut scene = Box::new(Scene::default());
         let mut host = CompatHost::new();
+        // SAFETY: the boxed scene outlives the host (declared after it).
+        unsafe {
+            host.services_mut()
+                .attach_scene(scene.as_mut() as *mut Scene);
+        }
         host.install(&engine).expect("install compat surface");
-        Env { host, engine }
+        Env {
+            host,
+            engine,
+            _scene: scene,
+        }
     }
 
     /// Install the host-decoded source: a 640x360 @ 30 fps stream with audio,
@@ -240,45 +254,69 @@ fn invalid_loop_and_rate_raise() {
     assert_eq!(env.eval_int("caught"), 3);
 }
 
-/// `layer1`/`layer2` store the Layer object and return it; a non-Layer object
-/// raises `TVPSpecifyLayer`.
+/// `layer1`/`layer2` store a real Layer object and return it; a null clears
+/// the slot and any non-Layer object raises (no member fallback).
+///
+/// Reference: the setters resolve the argument with
+/// `NativeInstanceSupport(TJS_NIS_GETINSTANCE, tTJSNC_Layer::ClassID)` and
+/// throw `TVPSpecifyLayer` otherwise
+/// (`reference/cpp/core/visual/VideoOvlIntf.cpp:756-768`).
 #[test]
 fn layer_refs_round_trip_and_validate() {
     let _lock = vm_lock();
     let env = Env::new();
     env.run(
-        "var v = new VideoOverlay(null); \
-         var l = %[nativeId: 7]; \
+        "var w = new Window(); \
+         var l = new Layer(w, null); \
+         var v = new VideoOverlay(null); \
          v.layer1 = l; var same1 = (v.layer1 === l); \
          v.layer2 = l; var same2 = (v.layer2 === l); \
          v.layer1 = null; var cleared = (v.layer1 === null); \
          var thrown = 0; \
-         try { v.layer1 = %[foo: 1]; } catch (e) { thrown = 1; }",
+         try { v.layer1 = %[nativeId: 7]; } catch (e) { thrown = 1; } \
+         var thrown2 = 0; \
+         try { v.layer1 = %[foo: 1]; } catch (e) { thrown2 = 1; }",
     );
+    // Reference: the getter returns the assigned object, the setter's
+    // `NativeInstanceSupport` lookup rejects the dictionary, and a null
+    // argument clears the slot (`VideoOvlIntf.cpp:756-768`).
     assert_eq!(env.eval_int("same1"), 1);
     assert_eq!(env.eval_int("same2"), 1);
     assert_eq!(env.eval_int("cleared"), 1);
     assert_eq!(env.eval_int("thrown"), 1);
+    assert_eq!(env.eval_int("thrown2"), 1);
 }
 
 /// `setMixingLayer`/`resetMixingLayer` accept a visible Layer, ignore a
 /// non-visible one, and reject a non-Layer object.
+///
+/// Reference: `setMixingLayer` resolves the argument with
+/// `NativeInstanceSupport(TJS_NIS_GETINSTANCE, tTJSNC_Layer::ClassID)` and
+/// throws `TVPSpecifyLayer` otherwise
+/// (`reference/cpp/core/visual/VideoOvlIntf.cpp:385-398`), then reads the
+/// layer's `visible`/`opacity`.
 #[test]
 fn mixing_layer_selection_matches_the_reference() {
     let _lock = vm_lock();
     let env = Env::new();
     env.run(
-        "var v = new VideoOverlay(null); \
-         var shown = %[nativeId: 3, visible: 1, opacity: 128]; \
-         var hidden = %[nativeId: 4, visible: 0, opacity: 255]; \
+        "var w = new Window(); \
+         var shown = new Layer(w, null); shown.visible = true; shown.opacity = 128; \
+         var hidden = new Layer(w, null); hidden.visible = false; hidden.opacity = 255; \
+         var v = new VideoOverlay(null); \
          v.setMixingLayer(shown); \
          v.setMixingLayer(hidden); \
          v.resetMixingLayer(); \
          v.setMixingLayer(null); \
          var thrown = 0; \
-         try { v.setMixingLayer(%[foo: 1]); } catch (e) { thrown = 1; }",
+         try { v.setMixingLayer(%[foo: 1]); } catch (e) { thrown = 1; } \
+         var thrown2 = 0; \
+         try { v.setMixingLayer(%[nativeId: 3, visible: 1]); } catch (e) { thrown2 = 1; }",
     );
+    // Reference: a non-Layer object raises `TVPSpecifyLayer`
+    // (`VideoOvlIntf.cpp:385-398`), with no `nativeId` member fallback.
     assert_eq!(env.eval_int("thrown"), 1);
+    assert_eq!(env.eval_int("thrown2"), 1);
 }
 
 /// The backend passthrough members (mode, streams, mixing colors) round-trip.

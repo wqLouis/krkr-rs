@@ -15,7 +15,7 @@ use std::ffi::{c_char, c_int, c_void};
 use engine::Scene;
 use tjs::{NativeInstanceMethodDef, Value};
 
-use super::super::common::{resolve_object_id, scene_mut, scene_ref};
+use super::super::common::{resolve_object_id, scene_mut};
 use super::{LayerExtras, LayerInst, bound};
 use crate::native_util::{args, report_error, set_void};
 
@@ -56,11 +56,25 @@ fn bring_to_back(scene: &mut Scene, id: u32) -> Result<(), String> {
 }
 
 /// Move `id` immediately `before`/`after` the sibling `target`.
+///
+/// Reference `tTJSNI_BaseLayer::MoveBefore` / `MoveBehind`
+/// (`reference/cpp/core/visual/LayerIntf.cpp:1356-1397`):
+/// * both start with `CheckZOrderMoveRule`
+///   (`LayerIntf.cpp:1282-1291`), which throws
+///   `TVPCannotMoveNextToSelfOrNotSiblings` when `lay == this` or the two
+///   are not siblings — a self-move is an **error**, never a silent no-op;
+/// * `MoveBefore(lay)` places `this` *directly in front of* `lay`
+///   (`ChildChangeOrder(this, lay)` / `(this, lay + 1)` ends `this` at the
+///   higher, front-side index);
+/// * `MoveBehind(lay)` places `id` *directly behind* `lay`
+///   (`(this, lay - 1)` / `(this, lay)`).
 fn move_relative(scene: &mut Scene, id: u32, target: u32, before: bool) -> Result<(), String> {
-    if id == target {
-        return Ok(());
-    }
     let method = if before { "moveBefore" } else { "moveBehind" };
+    if id == target {
+        return Err(format!(
+            "Layer.{method}: cannot move a layer next to itself or a non-sibling"
+        ));
+    }
     let (window, parent) = scene
         .layer(id)
         .map(|l| (l.window, l.parent))
@@ -70,7 +84,7 @@ fn move_relative(scene: &mut Scene, id: u32, target: u32, before: bool) -> Resul
         .is_some_and(|t| t.window == window && t.parent == parent);
     if !target_ok {
         return Err(format!(
-            "Layer.{method}: the argument is not a sibling of this layer"
+            "Layer.{method}: cannot move a layer next to itself or a non-sibling"
         ));
     }
     {
@@ -81,7 +95,9 @@ fn move_relative(scene: &mut Scene, id: u32, target: u32, before: bool) -> Resul
             .iter()
             .position(|&x| x == target)
             .ok_or_else(|| format!("Layer.{method}: the sibling no longer exists"))?;
-        let index = if before { index } else { index + 1 };
+        // `moveBefore` → in front of the target (one past it); `moveBehind`
+        // → directly behind it (its own slot).
+        let index = if before { index + 1 } else { index };
         list.insert(index, id);
     }
     renumber_siblings(scene, id);
@@ -174,7 +190,7 @@ fn move_from_script(
             &format!("Layer.{method}: compat context is not bound"),
         );
     };
-    let target = match resolve_object_id(host.engine(), &a[0]) {
+    let target = match resolve_object_id(host.engine(), &a[0], &["Layer"]) {
         Ok(value) if value >= 0 => value as u32,
         _ => {
             return report_error(
@@ -208,7 +224,39 @@ fn is_ancestor_or_self(scene: &Scene, ancestor: u32, node: u32) -> bool {
     false
 }
 
+/// The first focusable node of `root`'s subtree, depth-first — the port of
+/// `tTJSNI_BaseLayer::SearchFirstFocusable`
+/// (`reference/cpp/core/visual/LayerIntf.cpp:3574-3593`): test the node
+/// itself, then recurse into the children in order.
+fn first_focusable_subtree(scene: &Scene, root: u32) -> Option<u32> {
+    fn walk(scene: &Scene, id: u32, budget: usize) -> Option<u32> {
+        if budget == 0 {
+            return None;
+        }
+        let layer = scene.layer(id)?;
+        if scene.node_focusable(id) && layer.join_focus_chain {
+            return Some(id);
+        }
+        layer
+            .children
+            .clone()
+            .into_iter()
+            .find_map(|child| walk(scene, child, budget - 1))
+    }
+    walk(scene, root, scene.layers.len() + 1)
+}
+
 /// `setMode()`.
+///
+/// Reference `tTVPLayerManager::SetModeTo`
+/// (`reference/cpp/core/visual/LayerManager.cpp:834-867`):
+/// 1. the *current* (top) modal layer blocks an ancestor-or-self of itself;
+/// 2. an invisible layer is forced visible first;
+/// 3. a parent-invisible or disabled layer throws;
+/// 4. focus moves to the first focusable node of the new modal's subtree
+///    (`SetFocusTo(layer->SearchFirstFocusable(), true)`), clearing focus
+///    when the subtree has none;
+/// 5. only then is the layer pushed onto the modal stack.
 extern "C" fn layer_set_mode(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -226,43 +274,45 @@ extern "C" fn layer_set_mode(
         return report_error(out_error, "Layer.setMode: compat context is not bound");
     };
     let result: Result<(), String> = (|| {
-        // Validate against the modal stack without holding the scene borrow.
-        {
+        // Validate against the *top* of the modal stack without holding the
+        // scene borrow (`LayerManager.cpp:840-843`).
+        let current = {
             // SAFETY: the caller resolved `ctx` from the installed binding.
             let extras = unsafe { ctx.services() }.state::<LayerExtras>();
-            if extras.modes.contains(&id) {
-                return Err("Layer.setMode: this layer is already modal".into());
-            }
-        }
+            extras.modes.last().copied()
+        };
         let scene = scene_mut(&ctx)?;
         if scene.layer(id).is_none() {
             return Err("Layer.setMode: this layer no longer exists".into());
         }
-        let modes = {
-            // SAFETY: the caller resolved `ctx` from the installed binding.
-            let extras = unsafe { ctx.services() }.state::<LayerExtras>();
-            extras.modes.clone()
-        };
-        for modal in modes {
-            if scene
-                .layer(modal)
-                .is_some_and(|_| is_ancestor_or_self(scene, id, modal))
-            {
-                return Err(
-                    "Layer.setMode: cannot set mode to an ancestor of a modal layer".into(),
-                );
-            }
+        if let Some(current) = current
+            && scene.layer(current).is_some()
+            && is_ancestor_or_self(scene, id, current)
+        {
+            return Err("Layer.setMode: cannot set mode to an ancestor of a modal layer".into());
         }
         if !scene.node_visible(id)
             && let Some(layer) = scene.layer_mut(id)
         {
             layer.visible = true;
         }
-        if !scene.node_enabled(id) {
-            return Err("Layer.setMode: cannot set mode to a disabled layer".into());
+        // After forcing the layer itself visible, `GetNodeVisible` is exactly
+        // `GetParentVisible`; the reference throws on a hidden ancestor or on
+        // the layer's **own** disabled flag (`LayerManager.cpp:847-850`).
+        if !scene.node_visible(id) || !scene.layer(id).is_some_and(|l| l.enabled) {
+            return Err(
+                "Layer.setMode: cannot set mode to a disabled or parent-hidden layer".into(),
+            );
         }
-        if scene.node_focusable(id) {
-            scene.set_focus(id);
+        match first_focusable_subtree(scene, id) {
+            Some(target) => {
+                scene.set_focus(target);
+            }
+            None => {
+                if let Some(window) = scene.layer(id).map(|l| l.window) {
+                    scene.clear_focus(window);
+                }
+            }
         }
         {
             // SAFETY: the caller resolved `ctx` from the installed binding.
@@ -322,29 +372,6 @@ extern "C" fn layer_remove_mode(
     }
     set_void(out);
     0
-}
-
-/// The current modal layer ids (reference `ModalLayerVector`).
-#[allow(dead_code)]
-pub(crate) fn modal_layers(ctx: &crate::CompatCtx) -> Vec<u32> {
-    // SAFETY: the caller resolved `ctx` from the installed binding.
-    unsafe { ctx.services() }
-        .state::<LayerExtras>()
-        .modes
-        .clone()
-}
-
-/// The sibling ids (front → back maintained order) — used by tests and the
-/// tree owner.
-#[allow(dead_code)]
-pub(crate) fn sibling_order(ctx: &crate::CompatCtx, id: u32) -> Option<Vec<u32>> {
-    let scene = scene_ref(ctx).ok()?;
-    scene.layer(id)?;
-    let layer = scene.layer(id)?;
-    Some(match layer.parent {
-        Some(parent) => scene.layer(parent)?.children.clone(),
-        None => scene.window(layer.window)?.layers.clone(),
-    })
 }
 
 fn d(name: &'static str, f: tjs::NativeInstanceMethodFn) -> NativeInstanceMethodDef {

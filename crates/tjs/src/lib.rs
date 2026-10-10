@@ -154,6 +154,58 @@ pub struct NativeInstanceProperty {
     pub set: Option<NativeInstancePropertySetFn>,
 }
 
+/// An instance member implemented in Rust that receives **no native payload**:
+/// like [`NativeMethodFn`], plus `objthis` — the raw TJS object the member
+/// was invoked on. Used by
+/// [`Tjs2Engine::register_native_instance_members`] to attach members to an
+/// already-existing class, including a TJS2 builtin such as `Array` /
+/// `Dictionary` (reference `NCB_ATTACH_CLASS` / `NCB_ATTACH_FUNCTION`).
+///
+/// `objthis` is owned by the VM and only valid for the duration of the call;
+/// unlike [`NativeInstanceMethodFn`] there is no per-class opaque payload.
+pub type NativeObjThisMethodFn = extern "C" fn(
+    engine: *mut c_void,
+    objthis: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+) -> c_int;
+
+/// C-side mirror of `tjs2_native_objthis_method` (cpp/tjs2_abi.h).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct NativeObjThisMethod {
+    pub name: *const c_char,
+    pub f: NativeObjThisMethodFn,
+}
+
+/// Getter half of an objthis-only instance property (no native payload).
+pub type NativeObjThisPropertyGetFn = extern "C" fn(
+    engine: *mut c_void,
+    objthis: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+) -> c_int;
+
+/// Setter half of an objthis-only instance property (no native payload).
+/// `value` is valid only during the call.
+pub type NativeObjThisPropertySetFn = extern "C" fn(
+    engine: *mut c_void,
+    objthis: *mut c_void,
+    value: *const Value,
+    out_error: *mut *mut c_char,
+) -> c_int;
+
+/// C-side mirror of `tjs2_native_objthis_property` (cpp/tjs2_abi.h).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct NativeObjThisProperty {
+    pub name: *const c_char,
+    pub get: Option<NativeObjThisPropertyGetFn>,
+    pub set: Option<NativeObjThisPropertySetFn>,
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct Value {
@@ -275,6 +327,14 @@ unsafe extern "C" {
         out: *mut Value,
         out_error: *mut *mut c_char,
     ) -> c_int;
+    /// Member names of a retained object, as a retained TJS Array of strings
+    /// (reference `Scripts.getObjectKeys` / `ScriptsAdd::_getKeys`).
+    pub fn tjs2_enum_members(
+        e: *mut Engine,
+        obj: Tjs2ValueId,
+        out: *mut Value,
+        out_error: *mut *mut c_char,
+    ) -> c_int;
     /// Enable the `missing` member handler on a retained object (reference
     /// `Scripts.setCallMissing`).
     pub fn tjs2_set_call_missing(
@@ -282,6 +342,15 @@ unsafe extern "C" {
         obj: Tjs2ValueId,
         out_error: *mut *mut c_char,
     ) -> c_int;
+    /// Resolve a retained object to the Rust payload of an instance-based
+    /// native class (NativeInstanceSupport(TJS_NIS_GETINSTANCE) +
+    /// GetNativePtr()). Returns null when there is none — see
+    /// cpp/tjs2_abi.h for the full NULL/validity contract.
+    fn tjs2_get_native_instance(
+        e: *mut Engine,
+        obj: Tjs2ValueId,
+        class_name: *const c_char,
+    ) -> *mut c_void;
     pub fn tjs2_free_string(s: *mut c_char);
     fn tjs2_register_native_class_ex(
         e: *mut Engine,
@@ -313,6 +382,17 @@ unsafe extern "C" {
         properties: *const NativeProperty,
         prop_count: c_int,
     ) -> c_int;
+    /// Attach instance members (no native payload) to an already-existing
+    /// class, including a TJS2 builtin such as `Array` / `Dictionary`
+    /// (reference `NCB_ATTACH_CLASS` / `NCB_ATTACH_FUNCTION`).
+    fn tjs2_register_native_instance_members(
+        e: *mut Engine,
+        class_name: *const c_char,
+        methods: *const NativeObjThisMethod,
+        count: c_int,
+        properties: *const NativeObjThisProperty,
+        prop_count: c_int,
+    ) -> c_int;
     /// Opaque, per-engine id of a retained script value (mirror of
     /// `tjs2_value_id` in cpp/tjs2_abi.h).
     fn tjs2_retain_value(engine: *mut Engine, v: *const Value) -> Tjs2ValueId;
@@ -331,6 +411,8 @@ unsafe extern "C" {
     pub fn tjs2_get_stack_trace_string(engine: *mut Engine, limit: c_int) -> *mut c_char;
     /// Release a retained value. Idempotent on the C++ side.
     fn tjs2_release_value(engine: *mut Engine, id: Tjs2ValueId);
+    /// Invalidate a retained object value (runs its script `finalize`).
+    fn tjs2_invalidate_retained(engine: *mut Engine, id: Tjs2ValueId) -> c_int;
     /// Number of entries currently in the engine's retained-value map
     /// (diagnostic; the test suite uses it to prove retentions are consumed
     /// or released).
@@ -361,6 +443,14 @@ unsafe extern "C" {
         id: Tjs2ValueId,
         membername: *const c_char,
         value: *const Value,
+        out_error: *mut *mut c_char,
+    ) -> c_int;
+    /// Delete a named property from a retained object value (`DeleteMember`,
+    /// reference `iTJSDispatch2::DeleteMember`, `tjsObject.h:472`).
+    fn tjs2_prop_delete(
+        engine: *mut Engine,
+        id: Tjs2ValueId,
+        membername: *const c_char,
         out_error: *mut *mut c_char,
     ) -> c_int;
     /// Write the default member of a retained object value (`PropSet` with a
@@ -407,8 +497,8 @@ unsafe extern "C" {}
 // Diagnostic helper implemented in cpp/streams.cpp: decode a whole text
 // stream (honoring the mode's `oN` offset and the `FE FE` crypt container)
 // into a malloc'd UTF-8 string (free with [`tjs2_free_string`]). Returns 0
-// on success. Used by the stream tests below.
-#[allow(dead_code)]
+// on success. Used only by the stream tests below, so it is compiled for tests.
+#[cfg(test)]
 unsafe extern "C" {
     fn tjs2_read_text_stream_all(
         path_utf8: *const c_char,
@@ -619,6 +709,36 @@ pub struct NativeStaticMembers<'a> {
     pub class_name: &'a str,
     pub methods: Vec<NativeMethodDef>,
     pub properties: Vec<NativePropertyDef>,
+}
+
+/// Definition of one objthis-only instance method to attach to an existing
+/// class (see [`Tjs2Engine::register_native_instance_members`]).
+pub struct NativeObjThisMethodDef {
+    pub name: &'static str,
+    pub f: NativeObjThisMethodFn,
+}
+
+/// Definition of one objthis-only instance property to attach to an existing
+/// class. Both `get` and `set` are optional, with the same semantics as
+/// [`NativeInstancePropertyDef`].
+pub struct NativeObjThisPropertyDef {
+    pub name: &'static str,
+    pub get: Option<NativeObjThisPropertyGetFn>,
+    pub set: Option<NativeObjThisPropertySetFn>,
+}
+
+/// Instance members (no native payload) to attach to an already-existing
+/// class, including a TJS2 builtin such as `Array` / `Dictionary` (reference
+/// `NCB_ATTACH_CLASS` / `NCB_ATTACH_FUNCTION`). The members receive `objthis`
+/// — the object they were invoked on — but no per-class opaque payload, so
+/// they can be added to a builtin class object that the VM created itself.
+///
+/// The VM is single-threaded: register members only from the thread that
+/// owns the engine, and after the class itself exists.
+pub struct NativeInstanceMembers<'a> {
+    pub class_name: &'a str,
+    pub methods: Vec<NativeObjThisMethodDef>,
+    pub properties: Vec<NativeObjThisPropertyDef>,
 }
 
 impl Tjs2Engine {
@@ -1073,6 +1193,92 @@ impl Tjs2Engine {
         Ok(())
     }
 
+    /// Attach instance members (without a native payload) to an
+    /// already-existing class, including a TJS2 builtin such as `Array` /
+    /// `Dictionary` (reference `NCB_ATTACH_CLASS` / `NCB_ATTACH_FUNCTION`).
+    ///
+    /// A class registered through [`Self::register_native_class`] /
+    /// [`Self::register_native_class_instance`] receives the members as
+    /// ordinary (non-static) instance members. Any other name is looked up on
+    /// the VM global object as a builtin class object and the members are
+    /// attached to it, so they become callable on every instance of that
+    /// class. Unlike [`NativeInstanceMethodDef`], the callbacks receive only
+    /// `objthis` — the object the member was invoked on — and no per-class
+    /// opaque payload.
+    ///
+    /// The VM is single-threaded: register members only from the thread that
+    /// owns the engine, and after the class itself exists.
+    pub fn register_native_instance_members(
+        &self,
+        members: &NativeInstanceMembers,
+    ) -> Result<(), String> {
+        let class_name = CString::new(members.class_name)
+            .map_err(|_| format!("class name contains a NUL byte: {:?}", members.class_name))?;
+        let method_names: Vec<CString> = members
+            .methods
+            .iter()
+            .map(|m| {
+                CString::new(m.name)
+                    .map_err(|_| format!("method name contains a NUL byte: {:?}", m.name))
+            })
+            .collect::<Result<_, _>>()?;
+        let c_methods: Vec<NativeObjThisMethod> = members
+            .methods
+            .iter()
+            .zip(&method_names)
+            .map(|(m, n)| NativeObjThisMethod {
+                name: n.as_ptr(),
+                f: m.f,
+            })
+            .collect();
+        let property_names: Vec<CString> = members
+            .properties
+            .iter()
+            .map(|p| {
+                CString::new(p.name)
+                    .map_err(|_| format!("property name contains a NUL byte: {:?}", p.name))
+            })
+            .collect::<Result<_, _>>()?;
+        let c_properties: Vec<NativeObjThisProperty> = members
+            .properties
+            .iter()
+            .zip(&property_names)
+            .map(|(p, n)| NativeObjThisProperty {
+                name: n.as_ptr(),
+                get: p.get,
+                set: p.set,
+            })
+            .collect();
+        // SAFETY: self.inner is a valid engine; the names and arrays are
+        // valid for the call. The C++ side copies what it needs during
+        // registration.
+        let rc = unsafe {
+            tjs2_register_native_instance_members(
+                self.inner,
+                class_name.as_ptr(),
+                if c_methods.is_empty() {
+                    ptr::null()
+                } else {
+                    c_methods.as_ptr()
+                },
+                c_methods.len() as c_int,
+                if c_properties.is_empty() {
+                    ptr::null()
+                } else {
+                    c_properties.as_ptr()
+                },
+                c_properties.len() as c_int,
+            )
+        };
+        if rc != 0 {
+            return Err(format!(
+                "failed to register instance members on class '{}' (error {rc})",
+                members.class_name
+            ));
+        }
+        Ok(())
+    }
+
     /// Retain a script value so it stays alive and callable across engine
     /// calls (see [`ValueId`] for the lifetime/release contract).
     ///
@@ -1294,6 +1500,26 @@ name), and none was available"
         })
     }
 
+    /// Invalidate a retained object value (the reference `invalidate obj;`
+    /// statement): invokes the object's `iTJSDispatch2::Invalidate`, running
+    /// its script `finalize`. Returns an error string on an unknown id or a
+    /// script exception. The retention is **not** released; the owning
+    /// [`DetachedValue`] still releases it when dropped.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn invalidate_retained(&self, id: Tjs2ValueId) -> Result<(), String> {
+        if id.is_null() {
+            return Err("cannot invalidate a null retained id".into());
+        }
+        // SAFETY: self.inner is a live engine and `id` is a live retained id
+        // owned by the caller's handle.
+        let rc = unsafe { tjs2_invalidate_retained(self.inner, id) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err("tjs2_invalidate_retained failed".into())
+        }
+    }
+
     /// Find the retained id of a script value already retained on this
     /// engine, without creating a new entry (identity match: same closure
     /// object + ObjThis). Returns `None` when the value is not retained.
@@ -1440,6 +1666,38 @@ name), and none was available"
         Ok(())
     }
 
+    /// Delete a named property from a retained object value
+    /// (`iTJSDispatch2::DeleteMember`, reference `tjsObject.h:472`;
+    /// `tTJSCustomObject::DeleteMember`, `tjsObject.cpp:1537-1552`, over
+    /// `DeleteByName`, `tjsObject.cpp:759`).
+    ///
+    /// This is the removal path for members [`Self::set_member`] created and
+    /// for the class-name globals the native registration entry points publish.
+    /// The reference reaches the same VM operation through its `delete`
+    /// operator, which passes flag 0 and the dispatch object itself
+    /// (`tjsInterCodeExec.cpp:1826`); only the object's own member table is
+    /// affected.
+    ///
+    /// An absent member is reported here as a typed error: the VM returns
+    /// `TJS_E_MEMBERNOTFOUND` (`tjsObject.cpp:1546`), which the `delete`
+    /// operator turns into the boolean `false` rather than an exception
+    /// (`tjsInterCodeExec.cpp:1829-1833`). A [`Tjs2ValueId`] that is not a
+    /// live object (null, released, or a non-object value such as TJS `null`)
+    /// is likewise a typed error.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn delete_member(&self, id: Tjs2ValueId, membername: &str) -> Result<(), String> {
+        let name = std::ffi::CString::new(membername)
+            .map_err(|_| "member name contains a NUL byte".to_string())?;
+        let mut error: *mut c_char = ptr::null_mut();
+        // SAFETY: self.inner is a live engine and id is a live retained id;
+        // name follows the ABI contract for the duration of the call.
+        let rc = unsafe { tjs2_prop_delete(self.inner, id, name.as_ptr(), &mut error) };
+        if rc != 0 {
+            return Err(unsafe { take_error_string(error) });
+        }
+        Ok(())
+    }
+
     /// Write the **default member** of a retained object value (`PropSet`
     /// with a NULL member name).
     ///
@@ -1528,6 +1786,67 @@ name), and none was available"
         })
     }
 
+    /// Member names of a retained object, sorted and de-duplicated
+    /// (reference `Scripts.getObjectKeys` / `ScriptsAdd::_getKeys`).
+    ///
+    /// Uses the VM's `EnumMembers` with `TJS_IGNOREPROP | TJS_ENUM_NO_VALUE`
+    /// and skips hidden members, so the result is the object's observable
+    /// member surface: for a class object this includes its registered (static
+    /// and instance) members, and for an instance its instance members. `obj`
+    /// must be a live retained object id.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn enum_members(&self, obj: Tjs2ValueId) -> Result<Vec<String>, String> {
+        let mut out = Value {
+            ty: VAL_VOID,
+            integer: 0,
+            real: 0.0,
+            string: ptr::null(),
+            array: ptr::null(),
+            array_count: 0,
+            retained: 0,
+        };
+        let mut error: *mut c_char = ptr::null_mut();
+        // SAFETY: self.inner is a live engine and obj is a live retained id.
+        let rc = unsafe { tjs2_enum_members(self.inner, obj, &mut out, &mut error) };
+        if rc != 0 {
+            return Err(unsafe { take_error_string(error) });
+        }
+        if out.ty != VAL_RETAINED || out.retained == 0 {
+            return Err("tjs2_enum_members returned no retained array".into());
+        }
+        // Hold the returned array in an RAII handle so it is released even if
+        // reading an element fails; only the names escape.
+        let array = DetachedValue {
+            engine: self.inner,
+            id: out.retained as Tjs2ValueId,
+        };
+        let count = match self.get_member(array.raw_id(), "count")? {
+            TjsValue::Integer(value) => value,
+            TjsValue::Real(value) => value as i64,
+            other => {
+                return Err(format!(
+                    "enum_members: array count is not numeric ({other:?})"
+                ));
+            }
+        };
+        let mut members = Vec::with_capacity(count.max(0) as usize);
+        for index in 0..count {
+            match self.get_member(array.raw_id(), &index.to_string())? {
+                TjsValue::String(name) => members.push(name),
+                TjsValue::Integer(value) => members.push(value.to_string()),
+                TjsValue::Real(value) => members.push(value.to_string()),
+                other => {
+                    return Err(format!(
+                        "enum_members: member name is not a string ({other:?})"
+                    ));
+                }
+            }
+        }
+        members.sort();
+        members.dedup();
+        Ok(members)
+    }
+
     /// Enable the `missing` member handler on a retained object (reference
     /// `Scripts.setCallMissing`): after this call an access to an absent
     /// member invokes the object's `missing` method.
@@ -1541,6 +1860,55 @@ name), and none was available"
             return Err(unsafe { take_error_string(error) });
         }
         Ok(())
+    }
+
+    /// Resolve a retained script object to the payload pointer of an
+    /// instance-based native class (reference
+    /// `iTJSDispatch2::NativeInstanceSupport(TJS_NIS_GETINSTANCE, classid)`
+    /// and `GetNativePtr()` — the lookup behind TJS_GET_NATIVE_INSTANCE and
+    /// the instance method/property dispatchers).
+    ///
+    /// `class_name` must be the name the class was registered with via
+    /// [`Self::register_native_class_instance`]; `obj` is a live retained
+    /// object id (from [`Self::retain_value_detached`],
+    /// [`Self::retain_object_arg`], [`Self::eval_retained`], …).
+    ///
+    /// Returns `Ok(Some(payload))` when `obj` is a live instance of that
+    /// class. Returns `Ok(None)` — an ordinary miss, never an error — when
+    /// the object is TJS `null`, a plain script object, the class object
+    /// itself, an instance of a different native class, an invalidated
+    /// instance, a retained id that is not an object, or when
+    /// `class_name` is not an instance-capable class registered on this
+    /// engine (static-only and builtin class names never carry a Rust
+    /// payload). A NUL byte in `class_name` and a null `obj` id are
+    /// caller mistakes and return `Err`.
+    ///
+    /// # Ownership and validity
+    ///
+    /// The payload stays owned by the engine (freed by the class's destroy
+    /// callback when the object dies); this only borrows the pointer — do
+    /// not free it. The pointer is valid only while the object is kept
+    /// alive by its retained id **and** has not been invalidated (exactly
+    /// the `GetNativePtr()` / `IsValid()` contract in `tjs2_abi.cpp`):
+    /// discard it once the id is released or the object is invalidated,
+    /// and never let it outlive the engine.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn native_instance_payload(
+        &self,
+        obj: Tjs2ValueId,
+        class_name: &str,
+    ) -> Result<Option<ptr::NonNull<c_void>>, String> {
+        if obj.is_null() {
+            return Err("native_instance_payload: null retained id".into());
+        }
+        let name = std::ffi::CString::new(class_name)
+            .map_err(|_| "native_instance_payload: class name contains a NUL byte".to_string())?;
+        // SAFETY: self.inner is a live engine, obj is a live retained id
+        // (its validity is owned by the caller's ValueId/DetachedValue),
+        // and name is a valid NUL-terminated string for the call. The C++
+        // side only reads the payload pointer; it never hands out ownership.
+        let payload = unsafe { tjs2_get_native_instance(self.inner, obj, name.as_ptr()) };
+        Ok(ptr::NonNull::new(payload))
     }
 
     /// Invoke a retained detached value (see [`Self::retain_value_detached`]).

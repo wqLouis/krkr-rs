@@ -5,12 +5,12 @@ members = [
     # the new architecture still links.
     "crates/tjs",
     # new architecture (D9/D10)
-    "crates/api",
-    "crates/fs",
-    "crates/media",
-    "crates/render",
+    "crates/platform/api",
+    "crates/platform/fs",
+    "crates/platform/media",
+    "crates/platform/render",
     "crates/engine",
-    "crates/platform",
+    "crates/platform/platform",
     "crates/compat",
     "crates/vm",
     "crates/app",
@@ -26,12 +26,12 @@ license = "GPL-3.0-only"
 
 [workspace.dependencies]
 tjs = { path = "crates/tjs" }
-api = { path = "crates/api" }
-fs = { path = "crates/fs" }
-media = { path = "crates/media" }
-render = { path = "crates/render" }
+api = { path = "crates/platform/api" }
+fs = { path = "crates/platform/fs" }
+media = { path = "crates/platform/media" }
+render = { path = "crates/platform/render" }
 engine = { path = "crates/engine" }
-platform = { path = "crates/platform" }
+platform = { path = "crates/platform/platform" }
 compat = { path = "crates/compat" }
 vm = { path = "crates/vm" }
 # dev-only test helper; consumed through [dev-dependencies] only
@@ -39,6 +39,7 @@ testkit = { path = "crates/testkit" }
 cosmic-text = { version = "0.19", default-features = false, features = ["std"] }
 thiserror = "2"
 log = "0.4"
+env_logger = "0.11"
 ash = "0.38"
 raw-window-handle = "0.6"
 winit = "0.30"
@@ -46,7 +47,7 @@ flate2 = "1"
 # Video decode (Linux): maintained FFmpeg binding. Linked dynamically through
 # pkg-config (the `static` feature is deliberately *not* enabled). The media
 # crate consumes it through the optional `video-ffmpeg` feature; Android uses
-# the NDK MediaCodec backend instead (see crates/media/Cargo.toml).
+# the NDK MediaCodec backend instead (see crates/platform/media/Cargo.toml).
 ffmpeg-next = { version = "9", default-features = false, features = [
     "format",
     "software-resampling",

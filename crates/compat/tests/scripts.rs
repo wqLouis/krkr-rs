@@ -163,11 +163,18 @@ fn text_encoding_property_round_trips_through_dispatch_state() {
         env.eval_ok("Scripts.textEncoding"),
         TjsValue::String("no-such-encoding".into())
     );
-    // The empty string restores the automatic decoder.
+    // The `sjis` alias maps to `cp932` (reference
+    // `TVPSetDefaultReadEncoding`, `base/TextStream.cpp:418-430`).
+    env.eval_ok("Scripts.textEncoding = 'SJIS'");
+    assert_eq!(
+        env.eval_ok("Scripts.textEncoding"),
+        TjsValue::String("cp932".into())
+    );
+    // Any other spelling — including the empty string — is stored verbatim.
     env.eval_ok("Scripts.textEncoding = ''");
     assert_eq!(
         env.eval_ok("Scripts.textEncoding"),
-        TjsValue::String("UTF-8".into())
+        TjsValue::String("".into())
     );
 }
 

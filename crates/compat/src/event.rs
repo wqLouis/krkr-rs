@@ -1,12 +1,12 @@
-//! L1 → L3 event adaptation (doc 08 §5).
+//! L1 → L3 event adaptation.
 //!
 //! L1 owns the event loop and pushes [`platform::PlatformEvent`]s; L3
 //! maps them to the TJS-visible event the VM dispatches to script handlers.
 //! [`EventAdapter::map`] is the pure mapping and [`EventAdapter::dispatch`]
-//! is the delivery seam that the focus/KAG machinery fills in.
+//! is the delivery seam.
 //!
 //! L3 does **not** redeclare the platform event type: the event loop/type is
-//! L1 (doc 02 §3, doc 08 §5) and only the TJS mapping lives here.
+//! L1 and only the TJS mapping lives here.
 
 use platform::{InputEvent, MouseButton, PlatformEvent};
 
@@ -100,7 +100,7 @@ impl EventAdapter {
                 name: if *pressed { "onKeyDown" } else { "onKeyUp" },
                 members: vec![("code", EventValue::Int(i64::from(*code)))],
             }),
-            // Text/IME and touch dispatch land with the KAG migration.
+            // Text/IME and touch events have no script mapping.
             InputEvent::Text(_) | InputEvent::Touch { .. } => None,
             // `InputEvent` is `#[non_exhaustive]`.
             _ => None,
@@ -109,9 +109,7 @@ impl EventAdapter {
 
     /// Deliver a mapped event to the VM.
     ///
-    /// This is the delivery seam: the focus object / KAG layer lookup that
-    /// turns `event.name` and its members into a script call lands with the
-    /// KAG migration. Until then the adapter logs the event so the wiring is
+    /// This is the delivery seam: it logs the event so the wiring is
     /// observable and never operates by accident.
     pub fn dispatch(&self, ctx: &mut CompatCtx, event: &TjsEvent) -> Result<(), CompatError> {
         // SAFETY: `ctx` is resolved from the installed binding.

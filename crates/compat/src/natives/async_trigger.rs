@@ -6,7 +6,7 @@
 //!
 //! `AsyncTrigger` is a **deferred-callback** class: `trigger()` only
 //! *schedules* a handler, and the frame body fires it later at the
-//! [`async_trigger_poll`] step (doc 08 §6). No VM call is made from inside
+//! [`async_trigger_poll`] step. No VM call is made from inside
 //! `trigger()`, so a handler can never re-enter the VM through the native
 //! call that scheduled it.
 //!
@@ -24,28 +24,44 @@
 //!   an omitted/void name defaults to `"action"`, mirroring `TVPActionName`
 //!   (`EventIntf.cpp:740`).
 //! * `cached` defaults to **true** (`tTJSNI_AsyncTrigger` ctor,
-//!   `EventIntf.cpp:1001`). While a fire is scheduled, another `trigger()`
-//!   coalesces it (one pending entry per object). With `cached = false` each
-//!   `trigger()` schedules its own fire, like the reference event queue.
-//!   Changing `cached` cancels the scheduled fires (`SetCached`).
+//!   `EventIntf.cpp:1003-1011`) and, like the reference's native-instance
+//!   members, survives `invalidate` (only `Owner`/`ActionOwner` are released
+//!   at `EventIntf.cpp:1032-1040`). While a fire is scheduled, another
+//!   `trigger()` cancels it and re-posts it — the reference `Trigger()` does
+//!   `TVPCancelSourceEvents(Owner)` before `TVPPostEvent` when `Cached` is
+//!   set (`EventIntf.cpp:1043-1060`), so the re-triggered fire moves to the
+//!   end of the queue. With `cached = false` each `trigger()` queues its own
+//!   fire. Changing `cached` cancels the scheduled fires (`SetCached`,
+//!   `EventIntf.cpp:1072-1079`).
 //! * `mode` (`atmNormal` = 0, `atmExclusive` = 1, `atmAtIdle` = 2) is stored
 //!   and delivered uniformly at the poll. Changing it cancels the scheduled
-//!   fires (`SetMode`).
+//!   fires (`SetMode`, `EventIntf.cpp:1082-1089`).
 //! * `cancel()` drops every scheduled fire (`Cancel`).
-//! * `onFire()` invokes the retained action; [`async_trigger_poll`] dispatches
-//!   the object's `onFire` member, so a script subclass override wins.
+//! * `onFire()` invokes the retained action with the reference
+//!   `TVP_ACTION_INVOKE_*` event dictionary `{type: "onFire", target:
+//!   <the trigger>}` (`EventIntf.h:208-237`, `EventIntf.cpp:709-739`);
+//!   [`async_trigger_poll`] dispatches the object's `onFire` member with the
+//!   posted-event convention (zero arguments, `EventIntf.cpp:96-110`), so a
+//!   script subclass override wins.
+//! * After `invalidate`, `trigger`/`cancel` are silent no-ops — the
+//!   reference guards them with `if(Owner)` and `Owner` is cleared at
+//!   invalidation (`EventIntf.cpp:1036-1037`, `1044`, `1065`).
 
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
 
 use tjs::{
     DetachedValue, NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef,
-    Tjs2Engine, VAL_VOID, Value,
+    RetainedValue, Tjs2Engine, TjsValue, VAL_VOID, Value,
 };
 
 use crate::native_util::{args, report_error, set_bool, set_int, set_void, value_as_string};
 use crate::natives::system::{resolve, value_as_bool, value_as_i64};
 use crate::{CompatCtx, CompatError, CompatServices};
+
+/// The action-event `type` the reference passes to the action
+/// (`TVP_ACTION_INVOKE_BEGIN(0, "onFire", objthis)`, `EventIntf.cpp:1139`).
+const EVENT_TYPE: &str = "onFire";
 
 /// The reference `TVPActionName`, the default action member (`EventIntf.cpp:740`).
 const DEFAULT_ACTION_NAME: &str = "action";
@@ -65,14 +81,15 @@ struct AsyncTriggerBinding {
     /// The object itself, for `onFire` dispatch through its class chain so a
     /// script subclass override wins.
     owner: Option<DetachedValue>,
-    /// Reference `Cached`: while set, one pending fire per object.
-    cached: bool,
-    /// Reference `tTVPAsyncTriggerMode` (`atmNormal`/`atmExclusive`/`atmAtIdle`).
-    mode: i64,
 }
 
 /// The `AsyncTrigger` registry: one entry per live object plus the FIFO of
 /// scheduled fires. Lives in [`CompatServices::state`] keyed by type.
+///
+/// `Cached` and `Mode` are deliberately *not* kept here: the reference holds
+/// them as native-instance members that outlive `Invalidate` (only `Owner` /
+/// `ActionOwner` are released, `EventIntf.cpp:1032-1040`), so they live in
+/// [`AsyncTriggerInst`].
 #[derive(Default)]
 struct AsyncTriggerState {
     /// Monotonic id source; never reused.
@@ -84,7 +101,7 @@ struct AsyncTriggerState {
     pending: Vec<AsyncTriggerId>,
 }
 
-/// Typed `AsyncTrigger` failures (D11: no silent fallbacks).
+/// Typed `AsyncTrigger` failures.
 #[derive(Debug, thiserror::Error)]
 enum AsyncTriggerError {
     /// The native instance was not constructed (no registry entry).
@@ -96,6 +113,9 @@ enum AsyncTriggerError {
     /// The retained action raised while firing.
     #[error("AsyncTrigger action failed: {0}")]
     Action(String),
+    /// The action event dictionary could not be built.
+    #[error("AsyncTrigger action event: {0}")]
+    Event(String),
 }
 
 impl AsyncTriggerState {
@@ -114,9 +134,6 @@ impl AsyncTriggerState {
                 action: Some(action),
                 action_name,
                 owner,
-                // Reference ctor: `Cached = true`, `Mode = atmNormal`.
-                cached: true,
-                mode: 0,
             },
         );
         id
@@ -129,16 +146,6 @@ impl AsyncTriggerState {
             .ok_or(AsyncTriggerError::UnknownTrigger(id))
     }
 
-    /// The entry for `id`, mutably, or [`AsyncTriggerError::UnknownTrigger`].
-    fn binding_mut(
-        &mut self,
-        id: AsyncTriggerId,
-    ) -> Result<&mut AsyncTriggerBinding, AsyncTriggerError> {
-        self.triggers
-            .get_mut(&id)
-            .ok_or(AsyncTriggerError::UnknownTrigger(id))
-    }
-
     /// Remove `id` and drop every scheduled fire for it.
     fn remove(&mut self, id: AsyncTriggerId) -> Result<(), AsyncTriggerError> {
         self.binding(id)?;
@@ -147,51 +154,39 @@ impl AsyncTriggerState {
         Ok(())
     }
 
-    /// Schedule `id`'s `onFire`. A `cached` object coalesces while a fire is
-    /// already pending; an uncached one queues each call.
-    fn trigger(&mut self, id: AsyncTriggerId) -> Result<(), AsyncTriggerError> {
-        let cached = self.binding(id)?.cached;
-        if !(cached && self.pending.contains(&id)) {
-            self.pending.push(id);
+    /// Schedule `id`'s `onFire`; returns `false` when the entry is gone (an
+    /// invalidated object), which the reference treats as a silent no-op
+    /// (`Trigger()`'s `if(Owner)` guard, `EventIntf.cpp:1044`).
+    ///
+    /// A `cached` object first drops its own scheduled fires and then
+    /// re-queues, mirroring the reference `TVPCancelSourceEvents(Owner)` +
+    /// `TVPPostEvent` pair (`EventIntf.cpp:1047-1058`): the re-triggered fire
+    /// moves to the end of the queue. An uncached object queues each call.
+    fn trigger(&mut self, id: AsyncTriggerId, cached: bool) -> bool {
+        if !self.triggers.contains_key(&id) {
+            return false;
         }
-        Ok(())
+        if cached {
+            self.pending.retain(|pending| *pending != id);
+        }
+        self.pending.push(id);
+        true
     }
 
-    /// Drop every scheduled fire for `id` (reference `Cancel`).
-    fn cancel(&mut self, id: AsyncTriggerId) -> Result<(), AsyncTriggerError> {
-        self.binding(id)?;
+    /// Drop every scheduled fire for `id` (reference `Cancel`,
+    /// `EventIntf.cpp:1064-1069`); `false` when the entry is gone, which the
+    /// reference also treats as a silent no-op (`if(Owner)` guard).
+    fn cancel(&mut self, id: AsyncTriggerId) -> bool {
+        let known = self.triggers.contains_key(&id);
         self.pending.retain(|pending| *pending != id);
-        Ok(())
+        known
     }
 
-    /// Set `cached`, cancelling scheduled fires on a change (reference
-    /// `SetCached`).
-    fn set_cached(&mut self, id: AsyncTriggerId, cached: bool) -> Result<(), AsyncTriggerError> {
-        let changed = {
-            let binding = self.binding_mut(id)?;
-            let changed = binding.cached != cached;
-            binding.cached = cached;
-            changed
-        };
-        if changed {
-            self.pending.retain(|pending| *pending != id);
-        }
-        Ok(())
-    }
-
-    /// Set `mode`, cancelling scheduled fires on a change (reference
-    /// `SetMode`).
-    fn set_mode(&mut self, id: AsyncTriggerId, mode: i64) -> Result<(), AsyncTriggerError> {
-        let changed = {
-            let binding = self.binding_mut(id)?;
-            let changed = binding.mode != mode;
-            binding.mode = mode;
-            changed
-        };
-        if changed {
-            self.pending.retain(|pending| *pending != id);
-        }
-        Ok(())
+    /// Drop every scheduled fire for `id` — the reference `Cancel()` half of
+    /// `SetCached`/`SetMode` (`EventIntf.cpp:1076`, `1086`), valid for any
+    /// entry state (a gone entry has no pending fires anyway).
+    fn cancel_pending(&mut self, id: AsyncTriggerId) {
+        self.pending.retain(|pending| *pending != id);
     }
 
     /// Take the fires scheduled for this poll, leaving the queue empty.
@@ -204,10 +199,32 @@ impl AsyncTriggerState {
     }
 }
 
-/// The `AsyncTrigger` native instance payload: its registry handle.
-#[derive(Default)]
+/// The `AsyncTrigger` native instance payload: its registry handle plus the
+/// reference native-instance members `Cached` / `Mode`.
+///
+/// Both live here rather than in the registry entry because the reference
+/// keeps writing/reading them after `Invalidate` — `Invalidate` only clears
+/// `Owner`/`ActionOwner` (`EventIntf.cpp:1032-1040`) — and the constructor
+/// defaults (`Cached = true`, `Mode = atmNormal`, `EventIntf.cpp:1003-1011`)
+/// apply to the instance from construction on.
 struct AsyncTriggerInst {
+    /// The registry handle, `None` until the constructor succeeded.
     id: Option<AsyncTriggerId>,
+    /// Reference `Cached` — while set, one pending fire per object.
+    cached: bool,
+    /// Reference `tTVPAsyncTriggerMode` (`atmNormal`/`atmExclusive`/`atmAtIdle`).
+    mode: i64,
+}
+
+impl Default for AsyncTriggerInst {
+    fn default() -> Self {
+        Self {
+            id: None,
+            // Reference ctor: `Cached = true`, `Mode = atmNormal`.
+            cached: true,
+            mode: 0,
+        }
+    }
 }
 
 /// Resolve the installed binding for a native callback.
@@ -218,21 +235,27 @@ fn bound(engine: *mut c_void) -> Result<(&'static Tjs2Engine, CompatCtx), String
     Ok((resolved.engine(), ctx))
 }
 
-/// The registry handle of a constructed instance (D11 instead of a silent
+/// The registry handle of a constructed instance (instead of a silent
 /// default).
 fn instance_id(inst: &AsyncTriggerInst) -> Result<AsyncTriggerId, AsyncTriggerError> {
     inst.id.ok_or(AsyncTriggerError::NotConstructed)
 }
 
-/// Invoke the action retained for `id` (the reference `onFire` body).
+/// Invoke the action retained for `id` (the reference `onFire` body,
+/// `EventIntf.cpp:1132-1147`).
 ///
 /// The action is taken out of the registry across the VM call, releasing the
 /// state borrow so a re-entrant `trigger`/`cancel` sees consistent state, then
-/// restored. A missing entry or an action already firing is a no-op.
+/// restored. A missing entry or an action already firing is a no-op (the
+/// reference checks `if(obj.Object)`). The action receives the reference
+/// `TVP_ACTION_INVOKE_*` event dictionary `{type: "onFire", target:
+/// <objthis>}` (`EventIntf.h:208-237`); `objthis` may be null for the
+/// poll's owner-less fallback, in which case `target` is omitted.
 fn invoke_action(
     host: &Tjs2Engine,
     services: &CompatServices,
     id: AsyncTriggerId,
+    objthis: *mut c_void,
 ) -> Result<(), AsyncTriggerError> {
     let (action, action_name) = {
         let mut state = services.state::<AsyncTriggerState>();
@@ -244,16 +267,53 @@ fn invoke_action(
     let Some(action) = action else {
         return Ok(());
     };
+    let event = action_event(host, objthis)?;
+    let event_id = event.raw_id() as u64;
     let result = match action_name {
-        Some(name) => host.call_member(action.raw_id(), &name, &[]),
-        None => host.call_detached(&action, &[]),
+        Some(name) => host.call_member(action.raw_id(), &name, &[TjsValue::Retained(event_id)]),
+        None => host.call_detached(&action, &[TjsValue::Retained(event_id)]),
     };
-    // Restore the action unless the object was destroyed meanwhile (in which
-    // case dropping the handle releases the retention).
+    // The call consumed the event retention (`value_to_variant`'s
+    // `TJS2_VAL_RETAINED` path erases the map entry); `DetachedValue`'s drop
+    // is the idempotent release. Restore the action unless the object was
+    // destroyed meanwhile (in which case dropping the handle releases the
+    // retention).
+    drop(event);
     if let Some(binding) = services.state::<AsyncTriggerState>().triggers.get_mut(&id) {
         binding.action = Some(action);
     }
     result.map(|_| ()).map_err(AsyncTriggerError::Action)
+}
+
+/// Build the reference action event dictionary `{type, target}` for a native
+/// `onFire` invocation (`TVPCreateEventObject`, `EventIntf.cpp:709-739`).
+fn action_event(
+    host: &Tjs2Engine,
+    objthis: *mut c_void,
+) -> Result<DetachedValue, AsyncTriggerError> {
+    let event = match host.eval_retained("%[]", "AsyncTrigger.onFire") {
+        Ok(RetainedValue::Object(event)) => event,
+        Ok(RetainedValue::Value(_)) | Err(_) => {
+            return Err(AsyncTriggerError::Event(
+                "failed to create the action event dictionary".into(),
+            ));
+        }
+    };
+    if let Err(error) =
+        host.set_member(event.raw_id(), "type", &TjsValue::String(EVENT_TYPE.into()))
+    {
+        return Err(AsyncTriggerError::Event(error));
+    }
+    if !objthis.is_null()
+        && let Ok(target) = host.retain_object_detached(objthis)
+    {
+        // The retention is consumed when the variant copy is built; a failure
+        // leaves it to `DetachedValue`'s idempotent release.
+        let target_id = target.raw_id() as u64;
+        let _ = host.set_member(event.raw_id(), "target", &TjsValue::Retained(target_id));
+        drop(target);
+    }
+    Ok(event)
 }
 
 extern "C" fn async_trigger_create(_engine: *mut c_void) -> *mut c_void {
@@ -329,6 +389,23 @@ extern "C" fn async_trigger_ctor(
     0
 }
 
+/// Reference `tTJSNI_AsyncTrigger::Invalidate` (`EventIntf.cpp:1032-1039`):
+/// cancel the source events and drop `Owner` / `ActionOwner`. Removing the
+/// registry entry does all three at once — it releases the retained action
+/// and owner and drops every scheduled fire — and the later `destroy` removal
+/// of the (already gone) entry is a safe no-op.
+extern "C" fn async_trigger_invalidate(engine: *mut c_void, instance: *mut c_void) {
+    if instance.is_null() {
+        return;
+    }
+    let inst = unsafe { &*(instance as *const AsyncTriggerInst) };
+    if let (Some(id), Ok((_host, ctx))) = (inst.id, bound(engine)) {
+        // SAFETY: the caller resolved `ctx` from the installed binding.
+        let services = unsafe { ctx.services() };
+        let _ = services.state::<AsyncTriggerState>().remove(id);
+    }
+}
+
 /// `trigger()` — schedule the action for the next [`async_trigger_poll`].
 extern "C" fn async_trigger_trigger(
     engine: *mut c_void,
@@ -352,8 +429,14 @@ extern "C" fn async_trigger_trigger(
     };
     // SAFETY: the caller resolved `ctx` from the installed binding.
     let services = unsafe { ctx.services() };
-    if let Err(error) = services.state::<AsyncTriggerState>().trigger(id) {
-        return report_error(out_error, &format!("AsyncTrigger.trigger: {error}"));
+    // An invalidated object has no registry entry: the reference's
+    // `Trigger()` guards on `Owner`, which `Invalidate` clears
+    // (`EventIntf.cpp:1036-1037`, `1044`) — a silent no-op, not an error.
+    if !services
+        .state::<AsyncTriggerState>()
+        .trigger(id, inst.cached)
+    {
+        log::debug!("AsyncTrigger.trigger: {id:?} was invalidated; no-op");
     }
     set_void(out);
     0
@@ -382,8 +465,10 @@ extern "C" fn async_trigger_cancel(
     };
     // SAFETY: the caller resolved `ctx` from the installed binding.
     let services = unsafe { ctx.services() };
-    if let Err(error) = services.state::<AsyncTriggerState>().cancel(id) {
-        return report_error(out_error, &format!("AsyncTrigger.cancel: {error}"));
+    // Reference `Cancel()` guards on `Owner` (`EventIntf.cpp:1064-1069`):
+    // an invalidated object silently ignores `cancel()`.
+    if !services.state::<AsyncTriggerState>().cancel(id) {
+        log::debug!("AsyncTrigger.cancel: {id:?} was invalidated; no-op");
     }
     set_void(out);
     0
@@ -397,7 +482,9 @@ extern "C" fn async_trigger_on_fire(
     _argv: *const Value,
     out: *mut Value,
     out_error: *mut *mut c_char,
-    _objthis: *mut c_void,
+    // The reference event dictionary's `target` is `objthis`
+    // (`TVP_ACTION_INVOKE_BEGIN(0, "onFire", objthis)`, `EventIntf.cpp:1141`).
+    objthis: *mut c_void,
 ) -> c_int {
     let Ok((host, ctx)) = bound(engine) else {
         return report_error(
@@ -412,7 +499,10 @@ extern "C" fn async_trigger_on_fire(
     };
     // SAFETY: the caller resolved `ctx` from the installed binding.
     let services = unsafe { ctx.services() };
-    if let Err(error) = invoke_action(host, services, id) {
+    // The reference native body always invokes the action (guarded only by
+    // `if(obj.Object)`, `EventIntf.cpp:1134`); an invalidated object has no
+    // retained action left, which `invoke_action` treats as the same no-op.
+    if let Err(error) = invoke_action(host, services, id, objthis) {
         log::warn!("AsyncTrigger.onFire: {error}");
     }
     set_void(out);
@@ -420,6 +510,11 @@ extern "C" fn async_trigger_on_fire(
 }
 
 /// `cached` (reference `Cached`, defaults to true).
+///
+/// Read from the instance payload: the reference reads the native-instance
+/// member even after `Invalidate` (`EventIntf.cpp:1032-1040` only clears
+/// `Owner`/`ActionOwner`), so an invalidated-but-alive object still reports
+/// what the script last wrote.
 extern "C" fn async_trigger_cached_get(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -427,26 +522,14 @@ extern "C" fn async_trigger_cached_get(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    let Ok((_host, ctx)) = bound(engine) else {
+    if bound(engine).is_err() {
         return report_error(
             out_error,
             "AsyncTrigger.cached: compat context is not bound",
         );
-    };
+    }
     let inst = unsafe { &*(instance as *const AsyncTriggerInst) };
-    // SAFETY: the caller resolved `ctx` from the installed binding.
-    let services = unsafe { ctx.services() };
-    let cached = inst
-        .id
-        .and_then(|id| {
-            services
-                .state::<AsyncTriggerState>()
-                .binding(id)
-                .ok()
-                .map(|b| b.cached)
-        })
-        .unwrap_or(true);
-    set_bool(out, cached);
+    set_bool(out, inst.cached);
     0
 }
 
@@ -464,20 +547,25 @@ extern "C" fn async_trigger_cached_set(
         );
     };
     let cached = value_as_bool(unsafe { &*value });
-    let inst = unsafe { &*(instance as *const AsyncTriggerInst) };
+    let inst = unsafe { &mut *(instance as *mut AsyncTriggerInst) };
     let id = match instance_id(inst) {
         Ok(id) => id,
         Err(error) => return report_error(out_error, &format!("AsyncTrigger.cached: {error}")),
     };
-    // SAFETY: the caller resolved `ctx` from the installed binding.
-    let services = unsafe { ctx.services() };
-    if let Err(error) = services.state::<AsyncTriggerState>().set_cached(id, cached) {
-        return report_error(out_error, &format!("AsyncTrigger.cached: {error}"));
+    // Reference `SetCached`: only a change cancels (`EventIntf.cpp:1072-1079`).
+    let changed = inst.cached != cached;
+    inst.cached = cached;
+    if changed {
+        // SAFETY: the caller resolved `ctx` from the installed binding.
+        unsafe { ctx.services() }
+            .state::<AsyncTriggerState>()
+            .cancel_pending(id);
     }
     0
 }
 
-/// `mode` (reference `tTVPAsyncTriggerMode`).
+/// `mode` (reference `tTVPAsyncTriggerMode`) — stored on the instance so it
+/// survives `Invalidate`, like the reference's native-instance member.
 extern "C" fn async_trigger_mode_get(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -485,23 +573,11 @@ extern "C" fn async_trigger_mode_get(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    let Ok((_host, ctx)) = bound(engine) else {
+    if bound(engine).is_err() {
         return report_error(out_error, "AsyncTrigger.mode: compat context is not bound");
-    };
+    }
     let inst = unsafe { &*(instance as *const AsyncTriggerInst) };
-    // SAFETY: the caller resolved `ctx` from the installed binding.
-    let services = unsafe { ctx.services() };
-    let mode = inst
-        .id
-        .and_then(|id| {
-            services
-                .state::<AsyncTriggerState>()
-                .binding(id)
-                .ok()
-                .map(|b| b.mode)
-        })
-        .unwrap_or(0);
-    set_int(out, mode);
+    set_int(out, inst.mode);
     0
 }
 
@@ -516,15 +592,19 @@ extern "C" fn async_trigger_mode_set(
         return report_error(out_error, "AsyncTrigger.mode: compat context is not bound");
     };
     let mode = value_as_i64(unsafe { &*value });
-    let inst = unsafe { &*(instance as *const AsyncTriggerInst) };
+    let inst = unsafe { &mut *(instance as *mut AsyncTriggerInst) };
     let id = match instance_id(inst) {
         Ok(id) => id,
         Err(error) => return report_error(out_error, &format!("AsyncTrigger.mode: {error}")),
     };
-    // SAFETY: the caller resolved `ctx` from the installed binding.
-    let services = unsafe { ctx.services() };
-    if let Err(error) = services.state::<AsyncTriggerState>().set_mode(id, mode) {
-        return report_error(out_error, &format!("AsyncTrigger.mode: {error}"));
+    // Reference `SetMode`: only a change cancels (`EventIntf.cpp:1082-1089`).
+    let changed = inst.mode != mode;
+    inst.mode = mode;
+    if changed {
+        // SAFETY: the caller resolved `ctx` from the installed binding.
+        unsafe { ctx.services() }
+            .state::<AsyncTriggerState>()
+            .cancel_pending(id);
     }
     0
 }
@@ -532,7 +612,7 @@ extern "C" fn async_trigger_mode_set(
 /// Fire every scheduled `AsyncTrigger` (`FrameBody::async_trigger_poll`).
 ///
 /// The frame body calls this once per frame, after the media polls and before
-/// the continuous handlers (doc 08 §6). Each scheduled object's `onFire`
+/// the continuous handlers. Each scheduled object's `onFire`
 /// member is dispatched, so a script subclass override runs; when the object
 /// could not be retained the action is invoked directly. The pending list is
 /// taken before any VM call, so a `trigger()` issued from inside a handler is
@@ -550,7 +630,11 @@ pub fn async_trigger_poll(ctx: &mut CompatCtx) -> Result<(), CompatError> {
             .and_then(|binding| binding.owner.as_ref().map(DetachedValue::raw_id));
         let result: Result<(), String> = match owner {
             Some(owner) => host.call_member(owner, "onFire", &[]).map(|_| ()),
-            None => invoke_action(host, services, id).map_err(|error| error.to_string()),
+            // Reference-equivalent fallback for an owner that could not be
+            // retained: run the native `onFire` body, i.e. the action with
+            // its event dictionary (no `target`, the object is unavailable).
+            None => invoke_action(host, services, id, std::ptr::null_mut())
+                .map_err(|error| error.to_string()),
         };
         if let Err(error) = result {
             log::warn!("AsyncTrigger {id:?}: onFire failed ({error})");
@@ -565,7 +649,7 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
         name: "AsyncTrigger",
         create: async_trigger_create,
         destroy: async_trigger_destroy,
-        invalidate: None,
+        invalidate: Some(async_trigger_invalidate),
         methods: vec![
             NativeInstanceMethodDef {
                 name: "AsyncTrigger",

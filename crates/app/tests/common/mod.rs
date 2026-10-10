@@ -23,7 +23,7 @@ pub fn build_solid_and_bitmap_scene(scene: &mut Scene) -> u32 {
         layer.visible = true;
         layer.rect = Rect::new(0, 0, 320, 240);
         layer.fill_color = Some([24, 28, 40, 255]);
-        layer.set_blend(BlendMode::Replace);
+        layer.blend = BlendMode::Replace;
     }
 
     // Small bitmap sprite blended over the fill.
@@ -33,7 +33,7 @@ pub fn build_solid_and_bitmap_scene(scene: &mut Scene) -> u32 {
         layer.visible = true;
         layer.rect = Rect::new(8, 8, 2, 2);
         layer.bitmap = Some(bitmap);
-        layer.set_blend(BlendMode::SourceOver);
+        layer.blend = BlendMode::SourceOver;
     }
 
     window

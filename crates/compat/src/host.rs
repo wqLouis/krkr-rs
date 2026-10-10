@@ -8,7 +8,7 @@ use crate::ctx::CompatCtx;
 use crate::{CompatError, CompatServices, PluginRegistry};
 
 /// Owns the L3 dispatch state ([`CompatServices`] and [`PluginRegistry`]) and
-/// installs the single process-wide binding (doc 08 §3.1) against a VM.
+/// Installs the single process-wide binding against a VM.
 ///
 /// The two state values are boxed so their addresses stay stable when the
 /// host is moved; the binding stores raw addresses and therefore relies on
@@ -61,7 +61,7 @@ impl CompatHost {
     /// L3 owns no decoder, so `VideoOverlay.open` reads its metadata from here
     /// and the frame body presents these frames at the current position. A
     /// host that has not installed a source makes `open` raise a TJS error
-    /// (D11) instead of fabricating metadata.
+    /// instead of fabricating metadata.
     pub fn set_video_source(
         &self,
         spec: api::media::VideoSpec,
@@ -74,9 +74,9 @@ impl CompatHost {
     ///
     /// L3 owns no window system, so the host installs the real clipboard
     /// operations here. Any `ClipboardBackend` is accepted; a host with three
-    /// plain closures can pass a `(has_format, get_text, set_text)` tuple,
+    /// plain closures can pass a `(has_format, text, set_text)` tuple,
     /// which implements the trait. Without a backend every `Clipboard` member
-    /// raises a typed TJS error (D11) instead of fabricating an empty value.
+    /// raises a typed TJS error instead of fabricating an empty value.
     pub fn set_clipboard_backend<B>(&self, backend: B)
     where
         B: crate::natives::clipboard::ClipboardBackend + 'static,
@@ -173,7 +173,7 @@ impl Drop for CompatHost {
 /// opening a file with the OS shell, running a system command, locating a CD
 /// by volume label, and showing the file chooser. L3 owns no platform code, so
 /// the host installs one closure per fact through [`CompatHost`]; until a fact
-/// is installed its member raises a typed TJS error (D11) rather than
+/// is installed its member raises a typed TJS error rather than
 /// returning a fabricated value.
 ///
 /// The `select_file` closure receives the optional fields the compatibility

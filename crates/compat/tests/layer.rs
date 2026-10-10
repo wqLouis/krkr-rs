@@ -179,6 +179,10 @@ fn all_missing_members_are_registered() {
 fn event_handlers_are_assignable_and_default_to_noop() {
     let _lock = vm_lock();
     let env = Env::new();
+    // The handler argument counts are the reference `TVP_ACTION_INVOKE_BEGIN`
+    // counts: `onMouseMove`/`onKeyDown` take 3 and `onTouchUp` takes 5
+    // (`reference/cpp/core/visual/LayerIntf.cpp:10038-10053`,
+    // `10102-10119`, `10252-10271`).
     env.run(
         "var w = new Window(); \
          var l = new Layer(w, null); \
@@ -186,12 +190,12 @@ fn event_handlers_are_assignable_and_default_to_noop() {
          l.onClick = function() { n += 1; }; \
          l.onClick(); \
          l.onPaint(); \
-         l.onMouseMove();",
+         l.onMouseMove(0, 0, false);",
     );
     assert_eq!(env.eval_int("n"), 1);
     // The un-overridden handlers are callable no-ops.
-    assert!(env.eval("l.onKeyDown()").is_ok());
-    assert!(env.eval("l.onTouchUp()").is_ok());
+    assert!(env.eval("l.onKeyDown(0, 0, false)").is_ok());
+    assert!(env.eval("l.onTouchUp(0, 0, 0, 0, 0)").is_ok());
 }
 
 #[test]
@@ -288,8 +292,14 @@ fn stretches_and_affine_run_without_error() {
     let _lock = vm_lock();
     let env = Env::new();
     layer_with_image(&env, 4, 4);
+    // `stretchCopy`/`affineCopy`/`operateStretch`/`operateAffine` accept a
+    // Layer or a Bitmap, but `stretchPile`/`stretchBlend`/`affinePile`/
+    // `affineBlend` accept only a Layer (`reference/cpp/core/visual/
+    // LayerIntf.cpp:9002-9027`, `9057-9070`, `9104-9117`, `9227-9251`,
+    // `9299-9316`, `9361-9378`, `9154-9225`, `9423-9508`), so use a Layer
+    // source for every call.
     env.run(
-        "var src = new Bitmap(2, 2); src.setPixel(0, 0, 0xffffffff); \
+        "var src = new Layer(w, null); src.setImageSize(2, 2); src.setMainPixel(0, 0, 0xffffffff); \
          l.stretchCopy(0, 0, 4, 4, src, 0, 0, 2, 2, 0); \
          l.stretchPile(0, 0, 4, 4, src, 0, 0, 2, 2, 200, 0); \
          l.stretchBlend(0, 0, 4, 4, src, 0, 0, 2, 2, 200, 0); \
@@ -395,6 +405,9 @@ fn attention_cursor_and_capture_members_are_effects() {
 fn sibling_order_members_reorder_the_children() {
     let _lock = vm_lock();
     let env = Env::new();
+    // `BringToBack` sets order 0 (`reference/cpp/core/visual/LayerIntf.cpp:
+    // 1416-1423`); `MoveBefore` places the layer directly in front of the
+    // target and `MoveBehind` directly behind it (`LayerIntf.cpp:1356-1397`).
     env.run(
         "var w = new Window(); \
          var a = new Layer(w, null); a.name = 'a'; \
@@ -402,7 +415,7 @@ fn sibling_order_members_reorder_the_children() {
          var c = new Layer(w, null); c.name = 'c'; \
          a.bringToBack(); \
          c.moveBefore(a); \
-         b.moveBehind(c);",
+         b.moveBehind(a);",
     );
     let window = env.scene.windows.first().expect("one window");
     let names: Vec<&str> = window
@@ -410,7 +423,7 @@ fn sibling_order_members_reorder_the_children() {
         .iter()
         .map(|id| env.scene.layer(*id).map(|l| l.name.as_str()).unwrap_or("?"))
         .collect();
-    assert_eq!(names, vec!["c", "b", "a"]);
+    assert_eq!(names, vec!["b", "a", "c"]);
 }
 
 #[test]
@@ -443,6 +456,34 @@ fn transitions_begin_and_stop() {
     assert!(env.eval("b.stopTransition()").is_ok());
 }
 
+/// Every `extrans.dll` provider name resolves to a real L2 transition.
+///
+/// The shipped game links `extrans.dll` and drives `mosaic` (and sometimes
+/// `universal`/`scroll`/`crossfade`) through `beginTransition`; before the
+/// port these names raised "unsupported transition".
+#[test]
+fn extrans_transitions_begin_and_stop() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    for name in [
+        "wave",
+        "mosaic",
+        "turn",
+        "rotatezoom",
+        "rotatevanish",
+        "rotateswap",
+        "ripple",
+    ] {
+        env.run(&format!(
+            "var w = new Window(); \
+             var a = new Layer(w, null); a.setImageSize(64, 64); \
+             var b = new Layer(w, null); b.setImageSize(64, 64); \
+             b.beginTransition({name:?}, true, a, %[time: 300]);"
+        ));
+        env.run("b.stopTransition();");
+    }
+}
+
 #[test]
 fn unsupported_transitions_and_media_helpers_raise_typed_errors() {
     let _lock = vm_lock();
@@ -457,6 +498,16 @@ fn unsupported_transitions_and_media_helpers_raise_typed_errors() {
           var b = new Layer(w,null); b.setImageSize(2,2); b.beginTransition('nope', true, a, null); })()",
         "(function(){ var w = new Window(); var a = new Layer(w,null); a.setImageSize(2,2); \
           var b = new Layer(w,null); b.setImageSize(2,2); b.beginTransition('universal', true, a, null); })()",
+        // The extrans providers are implemented; their option validation is
+        // the reference's own (`StartTransition`), surfaced as a typed error.
+        "(function(){ var w = new Window(); var a = new Layer(w,null); a.setImageSize(2,2); \
+          var b = new Layer(w,null); b.setImageSize(2,2); \
+          b.beginTransition('ripple', true, a, %[time:300, rwidth:17]); })()",
+        "(function(){ var w = new Window(); var a = new Layer(w,null); a.setImageSize(2,2); \
+          var b = new Layer(w,null); b.setImageSize(2,2); \
+          b.beginTransition('wave', true, a, %[time:300, wavetype:9]); })()",
+        // `loadImages`/`loadProvinceImage` are implemented but need the L2
+        // storage attached; without it they raise a typed error.
         "(function(){ var w = new Window(); var l = new Layer(w,null); l.loadImages('x.png'); })()",
         "(function(){ var w = new Window(); var l = new Layer(w,null); l.loadProvinceImage('x.png'); })()",
         "(function(){ var w = new Window(); var l = new Layer(w,null); l.saveLayerImage('x.png'); })()",
@@ -470,7 +521,10 @@ fn unsupported_transitions_and_media_helpers_raise_typed_errors() {
         assert!(
             message.contains("not exposed")
                 || message.contains("unsupported")
-                || message.contains("not constructed"),
+                || message.contains("not constructed")
+                || message.contains("no storage attached")
+                || message.contains("requires a `rule` image")
+                || message.contains("invalid transition option"),
             "{expression:?} should be a typed error, got: {message}"
         );
     }

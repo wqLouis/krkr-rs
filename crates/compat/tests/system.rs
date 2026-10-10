@@ -99,10 +99,13 @@ fn arguments_round_trip_with_reference_prefix_semantics() {
             e.eval("System.getArgument('-argcheck')", "t").unwrap(),
             TjsValue::String("x".into())
         );
-        // A strict prefix of a stored name does not match.
+        // A strict prefix of a stored name does not match — and the
+        // reference has **no default parameter**: the second argument is
+        // ignored and a miss clears the result
+        // (`reference/cpp/core/base/impl/SystemImpl.cpp:709-726`).
         assert_eq!(
             e.eval("System.getArgument('-arg', 'dflt')", "t").unwrap(),
-            TjsValue::String("dflt".into())
+            TjsValue::Void
         );
         // `setArgument` rewrites the full-name entry.
         e.exec_script("System.setArgument('-argcheck', 'y');", "t")
@@ -111,14 +114,20 @@ fn arguments_round_trip_with_reference_prefix_semantics() {
             e.eval("System.getArgument('-argcheck')", "t").unwrap(),
             TjsValue::String("y".into())
         );
-        // A miss returns void, or the type-preserving default.
+        // A hit still returns the stored value when an extra argument tags
+        // along (`reference/cpp/core/base/impl/SystemImpl.cpp:715-722`).
+        assert_eq!(
+            e.eval("System.getArgument('-argcheck', 7)", "t").unwrap(),
+            TjsValue::String("y".into())
+        );
+        // A miss returns void — with or without a would-be default.
         assert_eq!(
             e.eval("System.getArgument('-missing')", "t").unwrap(),
             TjsValue::Void
         );
         assert_eq!(
             e.eval("System.getArgument('-missing', 7)", "t").unwrap(),
-            TjsValue::Integer(7)
+            TjsValue::Void
         );
         assert!(e.eval("System.setArgument('only-one')", "t").is_err());
         assert!(e.eval("System.getArgument()", "t").is_err());
@@ -142,6 +151,9 @@ fn to_actual_color_maps_system_colors_and_passes_rgb() {
     });
 }
 
+/// Reference: `createUUID` has no `numparams` check — an argument is
+/// simply ignored and another RFC-4122 v4 string comes back
+/// (`reference/cpp/core/base/SystemIntf.cpp:259-286`).
 #[test]
 fn create_uuid_has_rfc4122_shape_and_is_unique() {
     let _lock = vm_lock();
@@ -164,7 +176,15 @@ fn create_uuid_has_rfc4122_shape_and_is_unique() {
             other => panic!("expected string, got {other:?}"),
         };
         assert_ne!(first, second);
-        assert!(e.eval("System.createUUID(1)", "t").is_err());
+        // The reference ignores the extra argument instead of raising
+        // (`reference/cpp/core/base/SystemIntf.cpp:259-286`).
+        let third = match e.eval("System.createUUID(1)", "t").unwrap() {
+            TjsValue::String(s) => s,
+            other => panic!("expected string, got {other:?}"),
+        };
+        assert_eq!(third.len(), 36, "uuid: {third}");
+        assert_ne!(third, first);
+        assert_ne!(third, second);
     });
 }
 

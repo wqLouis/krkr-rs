@@ -37,6 +37,8 @@ Usage
     python3 scripts/native_parity.py --update-allow  # refresh the allowlist
     python3 scripts/native_parity.py --no-doc        # skip docs/native_parity.md
     python3 scripts/native_parity.py --quiet         # only print failures
+    python3 scripts/native_parity.py --runtime target/runtime_surface.json \
+        --no-doc                                     # check the live VM surface
 
 Do not hand-edit ``docs/native_parity.md``: it is generated.
 """
@@ -46,6 +48,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import glob
+import json
 import os
 import re
 import sys
@@ -143,8 +146,6 @@ RUST_ONLY_CLASS_MAP: "OrderedDict[str, list[tuple[str, str | None]]]" = OrderedD
             "SoundChannel",
             [("crates/compat/src/natives/sound.rs", "SoundChannel")],
         ),
-        ("ChainItemBase", [("crates/compat/src/natives/trans.rs", None)]),
-        ("Trans", [("crates/compat/src/natives/trans.rs", None)]),
     ]
 )
 
@@ -314,6 +315,59 @@ def parse_reference() -> dict[str, set[str]]:
             classes.setdefault(cls, set()).add(name)
 
     return classes
+
+
+# ---------------------------------------------------------------------------
+# Runtime surface comparison
+# ---------------------------------------------------------------------------
+
+def load_runtime_surface(path: "str | Path") -> dict[str, set[str]]:
+    """Load a ``runtime_surface.json`` dump produced by the compat test.
+
+    Accepts either the wrapped form ``{"classes": {...}}`` or a bare
+    ``{class: [members]}`` mapping.  Returns ``{class: set(members)}``.
+    """
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    classes = data.get("classes", data) if isinstance(data, dict) else data
+    if not isinstance(classes, dict):
+        raise SystemExit(f"native_parity: invalid runtime surface: {path}")
+    return {str(name): {str(m) for m in members} for name, members in classes.items()}
+
+
+def runtime_candidates(ref_class: str, runtime: dict[str, set[str]]) -> list[str]:
+    """Runtime class keys that can carry ``ref_class``.
+
+    Exact match first, then any dotted key whose last segment is the class
+    name (``Motion.Rect`` for ``Rect``, ``Math.RandomGenerator`` for
+    ``RandomGenerator``).
+    """
+    candidates = [ref_class]
+    suffix = "." + ref_class
+    candidates += [name for name in runtime if name.endswith(suffix)]
+    return [name for name in candidates if name in runtime]
+
+
+def runtime_missing_by_class(
+    ref: dict[str, set[str]],
+    runtime: dict[str, set[str]],
+    aliases: "dict[str, str] | None" = None,
+) -> dict[str, set[str]]:
+    """Reference members absent from the runtime dump, keyed by reference class.
+
+    A reference class matches its exact runtime key and any dotted runtime key
+    ending in ``.<class>``; the runtime members of all matches are unioned
+    before the diff, so a class reachable both top-level and under a namespace
+    is covered.
+    """
+    aliases = aliases or {}
+    missing: dict[str, set[str]] = {}
+    for cls, members in ref.items():
+        target = aliases.get(cls, cls)
+        available: set[str] = set()
+        for key in runtime_candidates(target, runtime):
+            available |= runtime[key]
+        missing[cls] = {m for m in members if m not in available}
+    return missing
 
 
 # ---------------------------------------------------------------------------
@@ -563,7 +617,9 @@ def _builder_spans(
     spans: list[tuple[int, int, str, "int | None"]] = []
     consts = _const_strings(code, strings)
     for m in re.finditer(
-        r"Native(?:Instance|Class)Builder\s*\{|NativeStaticMembers\s*\{", code
+        r"Native(?:Instance|Class)Builder\s*\{"
+        r"|Native(?:Static|Instance)Members\s*\{",
+        code,
     ):
         open_pos = code.index("{", m.start())
         end = _match_brace(code, open_pos)
@@ -632,7 +688,9 @@ def parse_rust_file(path: Path) -> dict[str, set[str]]:
     # builder that actually uses that list.
     extends: dict[str, set[str]] = {}
     for m in re.finditer(
-        r"([A-Za-z_]\w*)\s*\.extend\(\s*([A-Za-z_]\w*)\s*\.into_iter\s*\(", code
+        r"([A-Za-z_]\w*)\s*\.extend\(\s*([A-Za-z_]\w*)\s*"
+        r"(?:\.into_iter\s*)?\(",
+        code,
     ):
         extends.setdefault(m.group(1), set()).add(m.group(2))
 
@@ -664,6 +722,9 @@ def parse_rust_file(path: Path) -> dict[str, set[str]]:
         for receiver, idents in extends.items():
             if re.search(r"\b" + re.escape(receiver) + r"\b", builder):
                 refs.extend(("var", ident) for ident in idents)
+                # `.extend(helper())` where ``helper`` is a ``fn`` returning a
+                # def vector (e.g. ``methods.extend(method_defs())``).
+                refs.extend(("fn", ident) for ident in idents)
 
         for kind, ident in refs:
             if kind == "fn":
@@ -919,6 +980,37 @@ def build_report(
 # ---------------------------------------------------------------------------
 
 
+def _check_runtime(args: argparse.Namespace) -> int:
+    """Compare the parsed reference surface against a runtime surface dump.
+
+    This is a report, not a gate: missing members are printed and the process
+    exits 0, because the dump is the ground truth for the whole reference
+    surface (including classes the source mode does not track).
+    """
+    runtime = load_runtime_surface(args.runtime)
+    ref = parse_reference()
+    # The class-name constructor is the class object, not a callable member.
+    for cls, members in ref.items():
+        members.discard(cls)
+        members -= IGNORED_REFERENCE_MEMBERS
+    missing_by_class = runtime_missing_by_class(ref, runtime)
+    total_ref = sum(len(m) for m in ref.values())
+    total_missing = sum(len(m) for m in missing_by_class.values())
+    print(
+        f"native_parity(runtime): {len(ref)} reference classes, "
+        f"{total_ref} reference members, {total_missing} missing at runtime"
+    )
+    if not args.quiet:
+        for cls in sorted(missing_by_class):
+            miss = missing_by_class[cls]
+            if not miss:
+                continue
+            print(f"  {cls}: {len(miss)} missing")
+            for member in sorted(miss):
+                print(f"    - {cls}.{member}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
@@ -932,7 +1024,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--quiet", action="store_true", help="only print failures/stale warnings"
     )
+    parser.add_argument(
+        "--runtime",
+        metavar="PATH",
+        help="compare the parsed reference surface against a runtime_surface.json "
+        "dump instead of the Rust source (report only; does not touch the allowlist)",
+    )
     args = parser.parse_args(argv)
+
+    if args.runtime:
+        return _check_runtime(args)
 
     ref = parse_reference()
     rust, rust_sources = parse_rust()

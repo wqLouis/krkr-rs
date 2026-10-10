@@ -1,4 +1,4 @@
-//! Disc-format sound classes `CDDASoundBuffer` and `MIDISoundBuffer` (doc 08 §9).
+//! Disc-format sound classes `CDDASoundBuffer` and `MIDISoundBuffer`.
 //!
 //! The two classes expose the reference `SoundBuffer` surface — `open`,
 //! `play`, `stop`, `fade`, `stopFade`, `position`, `volume`, `volume2`,
@@ -10,7 +10,7 @@
 //!
 //! * `CDDASoundBuffer.open` is the reference's CD track selection. This port
 //!   has no CD-DA device, so it raises a typed
-//!   [`DiscSoundError::CdTrackSelection`] (D11) rather than silently doing
+//!   [`DiscSoundError::CdTrackSelection`] rather than silently doing
 //!   nothing.
 //! * `MIDISoundBuffer.open` uses the shared generic file path (the L2
 //!   [`Storage`](engine::Storage) plus a host decoder, exactly like
@@ -18,12 +18,12 @@
 //!   [`DiscSoundError::NoDecoder`].
 //! * `MIDISoundBuffer.midiOut` is a static method that would push raw bytes to
 //!   the MIDI output device; there is no such device here, so it raises a
-//!   typed [`DiscSoundError::MidiOut`] (D11).
+//!   typed [`DiscSoundError::MidiOut`].
 //!
 //! `volume`/`volume2` cross the script boundary on the TVP `0..=100000` scale
 //! ([`TVP_VOLUME_SCALE`]); the L2 mixer stays in `0..=1`. Every live object,
 //! its mixer channel and the shared [`Mixer`] live in
-//! [`CompatServices::state`] — there is no process global (D9).
+//! [`CompatServices::state`] — there is no process global.
 
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
@@ -60,7 +60,7 @@ impl Kind {
     }
 }
 
-/// Format-specific features this port cannot perform (D11: a typed error,
+/// Format-specific features this port cannot perform (a typed error,
 /// never a silent default).
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 enum DiscSoundError {
@@ -156,8 +156,7 @@ struct DiscSoundInst {
 /// The L4 host, which links the L1 `media` crate, calls this once at startup;
 /// the `compat` integration tests leave it unset, and `MIDISoundBuffer.open`
 /// then reports a typed error. Mirrors
-/// [`set_audio_decoder`](crate::set_audio_decoder) for `WaveSoundBuffer`.
-#[allow(dead_code)]
+/// [`add_audio_decoder`](crate::add_audio_decoder) for `WaveSoundBuffer`.
 pub fn set_disc_audio_decoder(services: &CompatServices, decoder: AudioDecoder) {
     services.state::<DiscSoundState>().decoder = Some(decoder);
 }
@@ -628,12 +627,18 @@ extern "C" fn disc_stop_fade(
 extern "C" fn disc_on_status_changed(
     engine: *mut c_void,
     _instance: *mut c_void,
-    _argc: c_int,
+    argc: c_int,
     _argv: *const Value,
     out: *mut Value,
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // Reference `TVP_ACTION_INVOKE_BEGIN(1, "onStatusChanged", objthis)`
+    // requires one argument when the member is invoked directly
+    // (`CDDAIntf.cpp:137-149`, `MIDIIntf.cpp:138-150`).
+    if argc < 1 {
+        return report_error(out_error, "onStatusChanged: 1 argument required");
+    }
     if bound(engine).is_err() {
         return report_error(
             out_error,
@@ -837,7 +842,7 @@ extern "C" fn disc_paused_set(
 /// `MIDISoundBuffer.midiOut(data)`: push raw MIDI bytes to the output device.
 ///
 /// There is no MIDI output device in this port, so the call is a typed
-/// deferral (D11) rather than a silent no-op.
+/// deferral rather than a silent no-op.
 extern "C" fn midi_out(
     engine: *mut c_void,
     argc: c_int,

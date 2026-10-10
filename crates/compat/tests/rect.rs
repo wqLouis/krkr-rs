@@ -176,15 +176,38 @@ fn included_and_included_pos_use_half_open_edges() {
     });
 }
 
+/// Reference: the binary methods convert their argument with
+/// `param[0]->AsObjectClosureNoAddRef()`, which **throws** for a non-object
+/// (`reference/cpp/core/tjs2/tjsVariant.h:728-736`) — so `clip(5)` and
+/// `intersects('x')` raise — while TJS `null` *is* an object variant (a null
+/// dispatch), so `if(clo.Object)` skips it silently and the call returns
+/// `TJS_S_OK` with the receiver untouched
+/// (`reference/cpp/core/visual/RectItf.cpp:125-138`; the guard itself is
+/// `RectItf.cpp:117-128`).
 #[test]
-fn non_object_argument_is_a_void_no_op() {
+fn non_object_argument_raises_while_null_is_a_void_no_op() {
     let _lock = vm_lock();
     with_vm(|e| {
         run(e, "var a = new Rect(1, 2, 3, 4);");
-        // The reference only fills the result when the argument is an object.
-        assert_eq!(e.eval("a.clip(5)", "test").unwrap(), TjsValue::Void);
-        assert_eq!(e.eval("a.intersects('x')", "test").unwrap(), TjsValue::Void);
+        // A non-object argument is the reference's conversion throw.
+        assert!(
+            e.eval("a.clip(5)", "test").is_err(),
+            "clip(5) must raise like the reference"
+        );
+        assert!(
+            e.eval("a.intersects('x')", "test").is_err(),
+            "intersects('x') must raise like the reference"
+        );
+        // `null` is the silent skip: void result, receiver untouched.
+        assert_eq!(e.eval("a.clip(null)", "test").unwrap(), TjsValue::Void);
+        assert_eq!(
+            e.eval("a.intersects(null)", "test").unwrap(),
+            TjsValue::Void
+        );
         assert_eq!(eval_i(e, "a.left"), 1);
+        assert_eq!(eval_i(e, "a.top"), 2);
+        assert_eq!(eval_i(e, "a.right"), 3);
+        assert_eq!(eval_i(e, "a.bottom"), 4);
     });
 }
 

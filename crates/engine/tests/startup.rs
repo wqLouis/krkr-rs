@@ -90,3 +90,37 @@ fn patch_and_after_are_app_path_only() {
         StartupScript::Startup(Location::Archive("/data.xp3".into(), "startup.tjs".into()))
     );
 }
+
+/// The searched `startup.tjs` resolves disk-first, so a loose file wins over
+/// the copy inside a mounted archive (reference `TVPSearchPlacedPath`).
+#[test]
+fn disk_startup_wins_over_archive() {
+    let xp3 = build_xp3(&[("startup.tjs", b"// archived", false)]);
+    let storage = mount_memory_with_archives(
+        &[("data.xp3", &xp3), ("startup.tjs", b"// disk")],
+        &["data.xp3"],
+    );
+
+    let scripts = discover_startup(&storage).expect("discover");
+    assert_eq!(
+        scripts.startup,
+        StartupScript::Startup(Location::Disk("/startup.tjs".into()))
+    );
+}
+
+/// `startup.tjs` is preferred over the `system/Initialize.tjs` fallback when
+/// both exist (reference `TVPExecuteStartupScript`,
+/// `reference/cpp/core/base/ScriptMgnIntf.cpp:900`).
+#[test]
+fn startup_wins_over_initialize_fallback() {
+    let storage = mount_memory(&[
+        ("startup.tjs", b"// startup"),
+        ("system/Initialize.tjs", b"// init"),
+    ]);
+
+    let scripts = discover_startup(&storage).expect("discover");
+    assert_eq!(
+        scripts.startup,
+        StartupScript::Startup(Location::Disk("/startup.tjs".into()))
+    );
+}

@@ -26,8 +26,12 @@ media = { workspace = true, features = ["video-ffmpeg"] }
 raw-window-handle = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
+# The composition root owns the process logger (`RUST_LOG`, default `info`).
+env_logger = { workspace = true }
 # The composition root installs the L3 compat host seams (image codec, etc.).
 compat = { workspace = true }
+# The composition root also drives the L4 VM host (boot + frame body).
+vm = { workspace = true }
 
 [dev-dependencies]
 tjs = { workspace = true }

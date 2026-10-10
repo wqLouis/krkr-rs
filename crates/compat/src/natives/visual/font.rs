@@ -1,6 +1,6 @@
 //! The visual `Font` native class.
 //!
-//! # Text metrics (D11)
+//! # Text metrics
 //!
 //! `getTextWidth`/`getTextHeight`, the `getEsc*` rotation variants and
 //! `getGlyphDrawRect` are backed by the L2 [`engine::text::TextEngine`]
@@ -20,7 +20,7 @@ use engine::FontState;
 use engine::text::{FontId, TextEngine, TextStyle};
 use tjs::{
     NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef, NativeMethodDef,
-    NativePropertyDef, NativeStaticMembers, Tjs2Engine, Value,
+    NativePropertyDef, NativeStaticMembers, Tjs2Engine, Tjs2ValueId, Value,
 };
 
 use super::common::{
@@ -32,12 +32,20 @@ use crate::natives::system::{value_as_bool, value_as_i64};
 use crate::{CompatCtx, CompatError};
 
 /// `Font` payload: the scene font id. `owns_state` is true while this object
-/// created the font itself (`new Font(...)`) and is false after `__bind`
-/// repoints it at a layer-owned font.
+/// created the font itself (`new Font(...)`) and is false once it is bound to
+/// a layer-owned font (the `Layer.font` wrapper).
 #[derive(Default)]
 struct FontInst {
     id: Option<u32>,
     owns_state: bool,
+}
+
+/// The scene id a `Font` payload carries — the reader behind the VM's
+/// native-instance lookup (`native_instance_payload("Font")`), replacing
+/// the removed `id` script member for engine call sites.
+pub(super) fn font_payload_id(payload: *mut c_void) -> Option<u32> {
+    // SAFETY: `native_instance_payload("Font")` only hands out Font payloads.
+    unsafe { &*(payload as *const FontInst) }.id
 }
 
 /// Explicit `Font` dispatch state, keyed by type inside
@@ -91,13 +99,27 @@ fn measured_font(engine: *mut c_void, instance: *mut c_void) -> Result<MeasuredF
 /// The reference resolves a face name through its enumerated font map. Compat
 /// has no enumeration seam, so the only truthful source is the attached
 /// storage: `face` is tried as a storage name and parsed by the L2 text
-/// engine. Anything else is a typed error (D11).
+/// engine. Anything else is a typed error.
 fn ensure_face(
     ctx: &CompatCtx,
     state: &mut FontMetricsState,
     face: &str,
 ) -> Result<FontId, String> {
     if let Some(id) = state.faces.get(face).copied() {
+        return Ok(id);
+    }
+    // A face registered through `System.addFont` is resolved by family name
+    // (or the storage name it was read from) before falling back to storage.
+    // SAFETY: the caller resolved `ctx` from the installed binding.
+    let registered = unsafe { ctx.services() }
+        .state::<crate::natives::plugins::add_font::registry::FontRegistry>()
+        .lookup(face);
+    if let Some((bytes, index, _)) = registered {
+        let id = state
+            .engine
+            .add_font(&bytes, index)
+            .map_err(|error| format!("Font: face '{face}' is not a usable font: {error}"))?;
+        state.faces.insert(face.to_string(), id);
         return Ok(id);
     }
     // SAFETY: the caller resolved `ctx` from the installed binding.
@@ -110,7 +132,7 @@ fn ensure_face(
     let bytes = storage.read(face).map_err(|error| {
         format!(
             "Font: face '{face}' is not registered with the text engine and cannot be read 
-             from storage ({error}); no font enumeration/loading seam is exposed through L2 (D11)"
+             from storage ({error}); no font enumeration/loading seam is exposed by the host services"
         )
     })?;
     let id = state
@@ -240,48 +262,49 @@ extern "C" fn font_ctor(
     0
 }
 
-/// `Font.__bind(id)` — repoint this wrapper at a layer-owned font state.
-extern "C" fn font_bind(
-    engine: *mut c_void,
-    instance: *mut c_void,
-    argc: c_int,
-    argv: *const Value,
-    out: *mut Value,
-    out_error: *mut *mut c_char,
-    objthis: *mut c_void,
-) -> c_int {
-    if argc < 1 {
-        return report_error(out_error, "Font.__bind requires a font id");
-    }
-    let Ok((resolved, ctx)) = bound(engine) else {
-        return report_error(out_error, "Font.__bind: compat context is not bound");
-    };
-    let id = value_as_i64(&unsafe { args(argv, argc) }[0]).max(0) as u32;
-    let inst = unsafe { &mut *(instance as *mut FontInst) };
-    let scene = match scene_mut(&ctx) {
-        Ok(scene) => scene,
-        Err(error) => return report_error(out_error, &error),
-    };
-    if scene.font(id).is_none() {
-        return report_error(out_error, "Font.__bind: font id does not exist");
-    }
-    if inst.owns_state
-        && let Some(old) = inst.id.take()
-        && old != id
+/// Point an existing `Font` object at a scene font id, taking ownership of
+/// the wrapper's previous font. The `Layer.font` getter uses this to bind the
+/// wrapper it creates to the layer-owned font state.
+pub(super) fn bind_font_object(
+    host: &Tjs2Engine,
+    ctx: &CompatCtx,
+    object: Tjs2ValueId,
+    font_id: u32,
+) -> Result<(), String> {
+    let payload = host
+        .native_instance_payload(object, "Font")?
+        .ok_or_else(|| "Font: the wrapper is not a Font instance".to_string())?;
+    // SAFETY: `native_instance_payload("Font")` only hands out `Font` payloads
+    // and `object` keeps the payload alive for the call.
+    let inst = unsafe { &mut *(payload.as_ptr() as *mut FontInst) };
+    let owned = inst.owns_state;
+    let previous = inst.id.replace(font_id);
+    inst.owns_state = false;
+    // SAFETY: the caller resolved `ctx` from the installed binding.
+    let services = unsafe { ctx.services() };
+    if owned
+        && let Some(previous) = previous
+        && previous != font_id
     {
-        scene.fonts.retain(|font| font.id != old);
-        // SAFETY: the caller resolved `ctx` from the installed binding.
-        unsafe { ctx.services() }
+        services
             .state::<VisualState>()
             .objects
             .fonts
-            .remove(&old);
+            .remove(&previous);
+        if let Some(scene) = services.scene() {
+            // SAFETY: the scene is live for the binding's lifetime.
+            let scene = unsafe { &mut *scene };
+            scene.fonts.retain(|font| font.id != previous);
+        }
     }
-    inst.id = Some(id);
-    inst.owns_state = false;
-    register_font(&ctx, resolved.engine(), id, objthis);
-    set_void(out);
-    0
+    if let Ok(retained) = host.duplicate_retained(object) {
+        services
+            .state::<VisualState>()
+            .objects
+            .fonts
+            .insert(font_id, retained);
+    }
+    Ok(())
 }
 
 // --- Font properties -------------------------------------------------------
@@ -326,9 +349,9 @@ fn with_font_write(
     Ok(())
 }
 
+/// Define a read/write `Font` integer property.
 macro_rules! font_int_prop {
     ($get:ident, $set:ident, $getter:expr, $setter:expr) => {
-        #[allow(dead_code)]
         extern "C" fn $get(
             engine: *mut c_void,
             instance: *mut c_void,
@@ -344,7 +367,6 @@ macro_rules! font_int_prop {
                 Err(error) => report_error(out_error, &error),
             }
         }
-        #[allow(dead_code)]
         extern "C" fn $set(
             engine: *mut c_void,
             instance: *mut c_void,
@@ -361,12 +383,6 @@ macro_rules! font_int_prop {
     };
 }
 
-font_int_prop!(
-    font_id_get,
-    font_id_set,
-    |f: &FontState| i64::from(f.id),
-    |_f: &mut FontState, _v: &Value| {}
-);
 font_int_prop!(
     font_height_get,
     font_height_set,
@@ -585,7 +601,7 @@ extern "C" fn font_get_esc_height_y(
 
 /// `font.getGlyphDrawRect(text)` — the reference returns the rasterized
 /// glyphs' bounding rectangle. `engine::text` exposes layout positions but
-/// not per-glyph bitmap bounds, so this is a typed error (D11) rather than a
+/// not per-glyph bitmap bounds, so this is a typed error rather than a
 /// fabricated rectangle.
 extern "C" fn font_get_glyph_draw_rect(
     _engine: *mut c_void,
@@ -604,7 +620,7 @@ extern "C" fn font_get_glyph_draw_rect(
     }
     report_error(
         out_error,
-        "Font.getGlyphDrawRect: engine::text does not expose per-glyph draw rectangles (D11)",
+        "Font.getGlyphDrawRect: engine::text does not expose per-glyph draw rectangles",
     )
 }
 
@@ -627,12 +643,12 @@ extern "C" fn font_do_user_select(
     }
     report_error(
         out_error,
-        "Font.doUserSelect: no host font-selection UI is exposed through L2 (D11)",
+        "Font.doUserSelect: no host font-selection UI is exposed",
     )
 }
 
 /// `font.getList(flags)` — the reference returns the enumerated font faces.
-/// Compat has no font-enumeration seam, so this is a typed error (D11).
+/// Compat has no font-enumeration seam, so this is a typed error.
 extern "C" fn font_get_list(
     _engine: *mut c_void,
     _instance: *mut c_void,
@@ -647,14 +663,14 @@ extern "C" fn font_get_list(
     }
     report_error(
         out_error,
-        "Font.getList: no platform/L2 font enumeration is exposed (D11)",
+        "Font.getList: no font enumeration service is exposed",
     )
 }
 
 /// `font.mapPrerenderedFont(storage)` — record the prerendered-font storage
 /// for this font. The reference maps the font to a prerendered font object;
 /// without a prerendered-font subsystem the registration is explicit state
-/// (D9) and never affects metrics silently.
+/// and never affects metrics silently.
 extern "C" fn font_map_prerendered_font(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -733,7 +749,7 @@ extern "C" fn font_rasterizer_get(
 }
 
 /// `Font.rasterizer` (set) — only index `0`, the single L1 `render`
-/// rasterizer, is available; anything else is a typed error (D11).
+/// rasterizer, is available; anything else is a typed error.
 extern "C" fn font_rasterizer_set(
     engine: *mut c_void,
     value: *const Value,
@@ -743,7 +759,7 @@ extern "C" fn font_rasterizer_set(
     if index != 0 {
         return report_error(
             out_error,
-            "Font.rasterizer: only rasterizer 0 (the L1 render rasterizer) is available",
+            "Font.rasterizer: only rasterizer 0 (the platform render rasterizer) is available",
         );
     }
     let Ok((_resolved, ctx)) = bound(engine) else {
@@ -755,7 +771,7 @@ extern "C" fn font_rasterizer_set(
 
 /// `Font.defaultFaceName` (get) — the reference returns the platform default
 /// face from its font enumeration. Compat has no enumeration seam, so this is
-/// a typed error (D11) rather than a hardcoded name.
+/// a typed error rather than a hardcoded name.
 extern "C" fn font_default_face_name_get(
     _engine: *mut c_void,
     _out: *mut Value,
@@ -763,7 +779,7 @@ extern "C" fn font_default_face_name_get(
 ) -> c_int {
     report_error(
         out_error,
-        "Font.defaultFaceName: no platform/L2 font enumeration is exposed (D11)",
+        "Font.defaultFaceName: no font enumeration service is exposed",
     )
 }
 
@@ -787,10 +803,6 @@ pub(super) fn register_font_class(ctx: &mut CompatCtx) -> Result<(), CompatError
             NativeInstanceMethodDef {
                 name: "Font",
                 f: font_ctor,
-            },
-            NativeInstanceMethodDef {
-                name: "__bind",
-                f: font_bind,
             },
             NativeInstanceMethodDef {
                 name: "getTextWidth",
@@ -838,11 +850,6 @@ pub(super) fn register_font_class(ctx: &mut CompatCtx) -> Result<(), CompatError
             },
         ],
         properties: vec![
-            NativeInstancePropertyDef {
-                name: "id",
-                get: Some(font_id_get),
-                set: None,
-            },
             NativeInstancePropertyDef {
                 name: "face",
                 get: Some(font_face_get),

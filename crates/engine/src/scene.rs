@@ -9,8 +9,7 @@
 //! The module is deliberately backend-free and Bevy-free. It knows nothing
 //! about rendering, script objects or native registration: the L1
 //! `RenderPipeline` consumes a projected scene tree elsewhere, and the L3
-//! `compat` native adapter calls into these operations. See
-//! `docs/migration/02-target-architecture.md` §3 and §5.
+//! `compat` native adapter calls into these operations.
 
 use std::collections::{HashMap, HashSet};
 
@@ -171,19 +170,16 @@ pub struct LayerState {
     /// bitmap onto the visible outer layer, so this flag is what makes the
     /// intro logo and every `Sprite`/`AffineLayer` render.
     pub pending_paint: bool,
-    /// Reference `tTJSNI_BaseLayer::Shutdown`: set by `Invalidate`
-    /// (`LayerIntf.cpp:516`). A shut-down layer is inert — hit-testing,
-    /// input dispatch, `onPaint` polling and rendering must not touch it.
-    /// The record stays in the table only until the script reference drops
-    /// and [`Scene::destroy_layer`] removes it.
+    /// Reference `tTJSNI_BaseLayer::Shutdown` (`LayerIntf.cpp:516`). A shut-down
+    /// layer is inert — hit-testing, input dispatch, `onPaint` polling and
+    /// rendering must not touch it.
+    ///
+    /// [`Scene::invalidate_layer`] marks the layer here **before** unregistering
+    /// it (the record then leaves [`Scene::layers`] immediately, so a stale id
+    /// becomes a typed miss); the flag also survives on any record a caller
+    /// marks directly, and every consumer — [`Scene::node_visible`],
+    /// [`Scene::layer_at`], [`Scene::window_layer_order`] — skips it.
     pub shutdown: bool,
-}
-
-impl LayerState {
-    /// Sets the layer's blend using the render pipeline's generic vocabulary.
-    pub fn set_blend(&mut self, blend: BlendMode) {
-        self.blend = blend;
-    }
 }
 
 /// One decoded bitmap (RGBA8, straight alpha).
@@ -210,9 +206,8 @@ pub struct BitmapState {
     /// blit. Drawing it would replay the snapshot captured when the script
     /// last read it and leave stale imagery on screen.
     pub screen_buffer: bool,
-    /// True when a script `Bitmap` object owns this id (created or attached
-    /// through the `Bitmap` natives). A layer's MainImage may share the same
-    /// id (`Layer.assignImages(bitmap)` attaches the source id directly), so
+    /// True when a script `Bitmap` object owns this id (created through the
+    /// `Bitmap` natives). A layer's MainImage can reference such a bitmap, so
     /// destroying the layer must not free it while the script object can
     /// still read it.
     pub script_owned: bool,
@@ -750,7 +745,7 @@ impl Scene {
 
     /// Reference `GetProvincePixel` (`LayerIntf.cpp:2973`): 0 when the plane is
     /// absent or the coordinate is outside it.
-    pub fn get_province_pixel(&self, layer_id: u32, x: i32, y: i32) -> i32 {
+    pub fn province_pixel(&self, layer_id: u32, x: i32, y: i32) -> i32 {
         let Some(layer) = self.layer(layer_id) else {
             return 0;
         };
@@ -1062,34 +1057,57 @@ impl Scene {
     }
 
     /// Reference `GetNodeVisible`: `visible` and every ancestor visible.
+    /// A [`LayerState::shutdown`] layer is inert and reports `false`.
+    ///
+    /// A missing id or a corrupted/cyclic parent chain is a typed miss
+    /// (`false`), never a hang — the walk is bounded by the layer count, the
+    /// same defensive contract [`Scene::window_layer_order`] documents.
     pub fn node_visible(&self, id: u32) -> bool {
         let mut cur = id;
+        let mut steps = 0usize;
         loop {
             let Some(layer) = self.layer(cur) else {
                 return false;
             };
-            if !layer.visible {
+            if layer.shutdown || !layer.visible {
                 return false;
             }
             match layer.parent {
-                Some(p) => cur = p,
+                Some(p) => {
+                    steps += 1;
+                    if steps > self.layers.len() {
+                        return false;
+                    }
+                    cur = p;
+                }
                 None => return true,
             }
         }
     }
 
     /// Reference `GetNodeEnabled`: `enabled` and every ancestor enabled.
+    /// A [`LayerState::shutdown`] layer is inert and reports `false`.
+    ///
+    /// Bounded like [`Scene::node_visible`]: a corrupted parent chain reports
+    /// "not enabled" instead of looping forever.
     pub fn node_enabled(&self, id: u32) -> bool {
         let mut cur = id;
+        let mut steps = 0usize;
         loop {
             let Some(layer) = self.layer(cur) else {
                 return false;
             };
-            if !layer.enabled {
+            if layer.shutdown || !layer.enabled {
                 return false;
             }
             match layer.parent {
-                Some(p) => cur = p,
+                Some(p) => {
+                    steps += 1;
+                    if steps > self.layers.len() {
+                        return false;
+                    }
+                    cur = p;
+                }
                 None => return true,
             }
         }
@@ -1173,12 +1191,19 @@ impl Scene {
         // layer's and its non-root ancestors' offsets before hit-testing).
         let (mut px, mut py) = (x, y);
         let mut cur = Some(layer_id);
+        // Bounded like [`Self::node_visible`]: a cyclic parent chain is a
+        // typed miss, not a hang in the input path.
+        let mut steps = 0usize;
         while let Some(c) = cur {
             let l = self.layer(c)?;
             match l.parent {
                 Some(p) => {
                     px = px.saturating_add(l.rect.x);
                     py = py.saturating_add(l.rect.y);
+                    steps += 1;
+                    if steps > self.layers.len() {
+                        return None;
+                    }
                     cur = Some(p);
                 }
                 None => break,
@@ -1217,15 +1242,21 @@ impl Scene {
     }
 
     /// Sum of this layer's and its ancestors' `rect` offsets (absolute
-    /// window position).
+    /// window position). Bounded like [`Self::node_visible`]; a stale id or a
+    /// corrupted parent chain is a typed miss (`None`).
     pub fn absolute_offset(&self, id: u32) -> Option<(i32, i32)> {
         let mut x = 0i32;
         let mut y = 0i32;
         let mut cur = Some(id);
+        let mut steps = 0usize;
         while let Some(c) = cur {
             let l = self.layer(c)?;
             x = x.saturating_add(l.rect.x);
             y = y.saturating_add(l.rect.y);
+            steps += 1;
+            if steps > self.layers.len() {
+                return None;
+            }
             cur = l.parent;
         }
         Some((x, y))
@@ -1529,19 +1560,17 @@ impl Scene {
             return Vec::new();
         };
 
-        // One pass over this window's layers builds both the id list (in
-        // insertion order) and a `parent → all children` index. The old
-        // implementation re-scanned the entire layer table for every layer,
-        // which made this O(n²); the index makes it a single O(n) pass plus
-        // the sibling sorts below.
+        // One pass over this window's layers builds the `parent → all
+        // children` index (shutdown layers excluded, so they can never be
+        // discovered during the walk below). The old implementation re-scanned
+        // the entire layer table for every layer, which made this O(n²); the
+        // index makes it a single O(n) pass plus the sibling sorts below.
         let mut all_children: HashMap<Option<u32>, Vec<u32>> = HashMap::new();
-        let mut window_layers: Vec<u32> = Vec::new();
         for layer in self
             .layers
             .iter()
             .filter(|l| l.window == window && !l.shutdown)
         {
-            window_layers.push(layer.id);
             all_children.entry(layer.parent).or_default().push(layer.id);
         }
 

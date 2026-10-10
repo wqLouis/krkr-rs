@@ -69,6 +69,14 @@ struct tjs2_engine {
     // native_class_names (used for duplicate registration checks).
     std::vector<TJS::iTJSDispatch2 *> native_classes;
     std::vector<std::string> native_class_names;
+    // Instance-capable classes registered with
+    // tjs2_register_native_class_instance: UTF-8 name -> the process-wide
+    // class id their objects register a tjs2_native_instance under. Only
+    // that registration path creates tjs2_native_instance payloads, so
+    // tjs2_get_native_instance may only static_cast native instances looked
+    // up under these ids (never a builtin class id such as ClassID_Array,
+    // whose native instance is a different C++ type).
+    std::unordered_map<std::string, tjs_int32> native_instance_class_ids;
     // Retained values: id -> variant. Each variant holds its own reference
     // (tTJSVariant copy/assign semantics AddRef object contents), so the
     // value stays callable until the id is erased. Erasing (or destroying
@@ -101,10 +109,53 @@ std::u16string utf8_to_u16(const char *s) {
     return boost::locale::conv::utf_to_utf<char16_t>(s);
 }
 
-// Convert tjs_char -> UTF-8 std::string.
+// Convert tjs_char (UTF-16 code units on this build) -> UTF-8 std::string.
+//
+// This must NOT go through ttstr::AsStdString(): that narrows via
+// TJS_wcstombs -> utf8_wctomb (tjsConfig.cpp), which encodes each UTF-16
+// code unit on its own. A surrogate pair — every non-BMP character, e.g.
+// U+1F600 — would then be emitted as CESU-8 (two 3-byte sequences encoding
+// lone surrogates), which is invalid UTF-8 at the Rust boundary and gets
+// mangled into replacement characters by String::from_utf8_lossy. Decode
+// surrogate pairs here and emit proper 4-byte UTF-8; an unpaired surrogate
+// becomes U+FFFD, like any other lossy UTF-16 -> UTF-8 conversion.
 std::string u16_to_utf8(const tjs_char *s) {
-    ttstr tmp(s);
-    return tmp.AsStdString();
+    std::string out;
+    if(!s)
+        return out;
+    out.reserve(std::char_traits<tjs_char>::length(s));
+    for(const tjs_char *p = s; *p; ++p) {
+        uint32_t cp = static_cast<uint32_t>(*p);
+        if(cp >= 0xD800 && cp <= 0xDBFF) {
+            // High surrogate: combine with a following low surrogate
+            // (peeking at most one char; p[1] is at worst the terminator).
+            uint32_t low = static_cast<uint32_t>(p[1]);
+            if(low >= 0xDC00 && low <= 0xDFFF) {
+                cp = 0x10000u + ((cp - 0xD800u) << 10) + (low - 0xDC00u);
+                ++p;
+            } else {
+                cp = 0xFFFD; // unpaired high surrogate
+            }
+        } else if(cp >= 0xDC00 && cp <= 0xDFFF) {
+            cp = 0xFFFD; // unpaired low surrogate
+        }
+        if(cp < 0x80) {
+            out.push_back(static_cast<char>(cp));
+        } else if(cp < 0x800) {
+            out.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+            out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        } else if(cp < 0x10000) {
+            out.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+            out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+            out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        } else {
+            out.push_back(static_cast<char>(0xF0 | (cp >> 18)));
+            out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+            out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+            out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        }
+    }
+    return out;
 }
 
 // Copy the value of a tTJSVariant into a tjs2_value; string results are
@@ -139,7 +190,9 @@ void variant_to_value(tjs2_engine *e, const TJS::tTJSVariant &v,
         case tvtString: {
             out->type = TJS2_VAL_STRING;
             ttstr s(v);
-            e->last_string = s.AsStdString();
+            // Not AsStdString(): that produces CESU-8 for non-BMP characters
+            // (see u16_to_utf8 above).
+            e->last_string = u16_to_utf8(s.c_str());
             out->string = e->last_string.c_str();
             break;
         }
@@ -186,7 +239,19 @@ void variant_to_value(tjs2_engine *e, const TJS::tTJSVariant &v,
 // generic message on unexpected error types).
 char *make_error_message(const TJS::eTJS &e) {
     try {
-        std::string msg = e.getMessage().AsStdString();
+        std::string msg = u16_to_utf8(e.getMessage().c_str());
+        // Script errors carry the block name and source line; surface them so
+        // a host-side failure names the failing script, not just the message.
+        if(const auto *se = dynamic_cast<const TJS::eTJSScriptError *>(&e)) {
+            try {
+                std::string where = u16_to_utf8(se->GetBlockName());
+                where += "(";
+                where += std::to_string(se->GetSourceLine());
+                where += ")";
+                msg = where + ": " + msg;
+            } catch(...) {
+            }
+        }
         char *buf = (char *)malloc(msg.size() + 1);
         if(!buf)
             return nullptr;
@@ -294,7 +359,9 @@ void variant_to_value_one(tjs2_engine *e, const TJS::tTJSVariant &var,
         case tvtString: {
             out->type = TJS2_VAL_STRING;
             ttstr s(var);
-            storage = s.AsStdString();
+            // Not AsStdString(): that produces CESU-8 for non-BMP characters
+            // (see u16_to_utf8 above).
+            storage = u16_to_utf8(s.c_str());
             out->string = storage.c_str();
             break;
         }
@@ -668,6 +735,223 @@ tjs_error tjs2_dispatch_native_property_set(tjs2_native_property_dispatch *self,
             std::string msg = out_error
                                   ? out_error
                                   : "native property set reported an error";
+            if(out_error)
+                tjs2_free_string(out_error);
+            throw TJS::eTJSError(ttstr(utf8_to_u16(msg.c_str()).c_str()));
+        }
+        return TJS_S_OK;
+    }
+    TJS_CONVERT_TO_TJS_EXCEPTION
+}
+
+// ---------------------------------------------------------------------------
+// objthis-only member dispatch (NCB_ATTACH_CLASS / NCB_ATTACH_FUNCTION)
+// ---------------------------------------------------------------------------
+//
+// Members attached to an existing class by
+// tjs2_register_native_instance_members. Unlike the instance dispatch below,
+// the Rust callbacks receive no native-instance payload: they get `objthis`,
+// the object the member was invoked on. `objthis` may be an object of a
+// builtin class (Array, Dictionary, WaveSoundBuffer, ...) whose class object
+// the registration found through the global object.
+
+class tjs2_objthis_method_dispatch;
+
+// Forward declaration: the dispatch class below calls this from its FuncCall
+// body (compiled as if right after the class).
+tjs_error tjs2_dispatch_objthis_method(tjs2_objthis_method_dispatch *self,
+                                       tTJSVariant *result,
+                                       tjs_int numparams,
+                                       tTJSVariant **param,
+                                       iTJSDispatch2 *objthis);
+
+// A per-method dispatch object carrying the engine and the Rust callback.
+// FuncCall forwards the call, passing objthis through unchanged; it does not
+// need a class id because there is no per-object payload to look up.
+class tjs2_objthis_method_dispatch : public TJS::tTJSNativeClassMethod {
+    typedef TJS::tTJSNativeClassMethod inherited;
+
+public:
+    tjs2_engine *engine;
+    tjs2_native_objthis_method_fn fn;
+
+    tjs2_objthis_method_dispatch(tjs2_engine *e,
+                                 tjs2_native_objthis_method_fn f)
+        : inherited(nullptr), engine(e), fn(f) {}
+
+    tjs_error FuncCall(tjs_uint32 flag, const tjs_char *membername,
+                       tjs_uint32 *hint, tTJSVariant *result,
+                       tjs_int numparams, tTJSVariant **param,
+                       iTJSDispatch2 *objthis) override {
+        if(membername)
+            return inherited::FuncCall(flag, membername, hint, result,
+                                       numparams, param, objthis);
+        return tjs2_dispatch_objthis_method(this, result, numparams, param,
+                                            objthis);
+    }
+};
+
+// Dispatch an objthis-only method call to the Rust callback and convert the
+// result back into a tTJSVariant (same marshalling as the static dispatch).
+tjs_error tjs2_dispatch_objthis_method(tjs2_objthis_method_dispatch *self,
+                                       tTJSVariant *result,
+                                       tjs_int numparams,
+                                       tTJSVariant **param,
+                                       iTJSDispatch2 *objthis) {
+    tjs2_engine *e = self->engine;
+    try {
+        if(result)
+            result->Clear();
+
+        std::vector<tjs2_value> argv;
+        std::vector<std::string> arg_storage;
+        args_to_values(e, numparams, param, argv, arg_storage);
+
+        tjs2_value out;
+        out.type = TJS2_VAL_VOID;
+        out.integer = 0;
+        out.real = 0.0;
+        out.string = nullptr;
+        out.array = nullptr;
+        out.array_count = 0;
+        out.retained = nullptr;
+
+        char *out_error = nullptr;
+        // Expose the caller's by-reference argument slots to Rust for the
+        // duration of the callback (tjs2_set_arg).
+        tjs2_param_frame_guard param_guard(e, param, numparams);
+        // FFI handoff: `fn` is Rust code that must follow the ABI contract
+        // (objthis/argv/out valid only during the call, out_error malloc'd).
+        int rc = self->fn(e, (void *)objthis, (int)numparams,
+                          argv.empty() ? nullptr : argv.data(), &out,
+                          &out_error);
+
+        if(rc != 0) {
+            std::string msg =
+                out_error ? out_error
+                          : "native instance member reported an error";
+            if(out_error)
+                tjs2_free_string(out_error);
+            throw TJS::eTJSError(ttstr(utf8_to_u16(msg.c_str()).c_str()));
+        }
+
+        if(result) {
+            value_to_variant(e, &out, result);
+        } else {
+            // The VM discarded the result (bare statement): release any
+            // retained value instead of leaking the map entry.
+            consume_retained_if_discarded(e, out);
+        }
+        return TJS_S_OK;
+    }
+    TJS_CONVERT_TO_TJS_EXCEPTION
+}
+
+class tjs2_objthis_property_dispatch;
+
+tjs_error tjs2_dispatch_objthis_property_get(
+    tjs2_objthis_property_dispatch *self, tTJSVariant *result,
+    iTJSDispatch2 *objthis);
+tjs_error tjs2_dispatch_objthis_property_set(
+    tjs2_objthis_property_dispatch *self, const tTJSVariant *param,
+    iTJSDispatch2 *objthis);
+
+// A per-property dispatch object, mirroring the static property dispatch but
+// passing objthis to the Rust callbacks instead of the class object.
+class tjs2_objthis_property_dispatch : public TJS::tTJSNativeClassProperty {
+    typedef TJS::tTJSNativeClassProperty inherited;
+
+public:
+    tjs2_engine *engine;
+    tjs2_native_objthis_property_get_fn get; // may be nullptr (write-only)
+    tjs2_native_objthis_property_set_fn set; // may be nullptr (read-only)
+
+    tjs2_objthis_property_dispatch(tjs2_engine *e,
+                                   tjs2_native_objthis_property_get_fn g,
+                                   tjs2_native_objthis_property_set_fn s)
+        : inherited(nullptr, nullptr), engine(e), get(g), set(s) {}
+
+    tjs_error PropGet(tjs_uint32 flag, const tjs_char *membername,
+                      tjs_uint32 *hint, tTJSVariant *result,
+                      iTJSDispatch2 *objthis) override {
+        if(membername)
+            return inherited::PropGet(flag, membername, hint, result, objthis);
+        return tjs2_dispatch_objthis_property_get(this, result, objthis);
+    }
+
+    tjs_error PropSet(tjs_uint32 flag, const tjs_char *membername,
+                      tjs_uint32 *hint, const tTJSVariant *param,
+                      iTJSDispatch2 *objthis) override {
+        if(membername)
+            return inherited::PropSet(flag, membername, hint, param, objthis);
+        return tjs2_dispatch_objthis_property_set(this, param, objthis);
+    }
+};
+
+tjs_error tjs2_dispatch_objthis_property_get(
+    tjs2_objthis_property_dispatch *self, tTJSVariant *result,
+    iTJSDispatch2 *objthis) {
+    tjs2_engine *e = self->engine;
+    try {
+        if(result)
+            result->Clear();
+
+        if(!self->get)
+            return TJS_S_OK; // write-only: reading returns void
+
+        tjs2_value out;
+        out.type = TJS2_VAL_VOID;
+        out.integer = 0;
+        out.real = 0.0;
+        out.string = nullptr;
+        out.array = nullptr;
+        out.array_count = 0;
+        out.retained = nullptr;
+
+        char *out_error = nullptr;
+        int rc = self->get(e, (void *)objthis, &out, &out_error);
+
+        if(rc != 0) {
+            std::string msg =
+                out_error ? out_error
+                          : "native instance property get reported an error";
+            if(out_error)
+                tjs2_free_string(out_error);
+            throw TJS::eTJSError(ttstr(utf8_to_u16(msg.c_str()).c_str()));
+        }
+
+        if(result) {
+            value_to_variant(e, &out, result);
+        } else {
+            consume_retained_if_discarded(e, out);
+        }
+        return TJS_S_OK;
+    }
+    TJS_CONVERT_TO_TJS_EXCEPTION
+}
+
+tjs_error tjs2_dispatch_objthis_property_set(
+    tjs2_objthis_property_dispatch *self, const tTJSVariant *param,
+    iTJSDispatch2 *objthis) {
+    tjs2_engine *e = self->engine;
+    try {
+        if(!self->set)
+            return TJS_E_ACCESSDENYED;
+
+        tjs2_value value;
+        std::string storage;
+        variant_to_value_one(e, *param, &value, storage);
+
+        char *out_error = nullptr;
+        int rc = self->set(e, (void *)objthis, &value, &out_error);
+        // The write argument is no longer needed for handle-less object
+        // resolution (see the parameter-frame guard).
+        e->last_object.Clear();
+
+        if(rc != 0) {
+            std::string msg =
+                out_error ? out_error
+                          : "native instance property set reported an error";
             if(out_error)
                 tjs2_free_string(out_error);
             throw TJS::eTJSError(ttstr(utf8_to_u16(msg.c_str()).c_str()));
@@ -1224,8 +1508,11 @@ public:
 
     void Print(const tjs_char *msg) override {
         if(e_->log_cb) {
+            // Console output (script `print`, and the VM's per-exception
+            // disassembly dump) is diagnostic: DEBUG, so a default `info` run
+            // stays quiet and `RUST_LOG=debug` shows it.
             std::string s = u16_to_utf8(msg);
-            e_->log_cb(TJS2_LOG_INFO, s.c_str(), e_->log_user);
+            e_->log_cb(TJS2_LOG_DEBUG, s.c_str(), e_->log_user);
         }
     }
 };
@@ -1297,6 +1584,39 @@ static TJS::iTJSDispatch2 *resolve_retained_object(tjs2_engine *e,
 // ---------------------------------------------------------------------------
 // C ABI
 // ---------------------------------------------------------------------------
+
+// EnumMembers callback (reference `DictMemberGetCaller` in scriptsEx.cpp):
+// each call receives param[0] = member name, param[1] = member flags;
+// TJS_ENUM_NO_VALUE suppresses param[2] (the value), so the collector only
+// needs the name. Hidden members are dropped, matching Scripts.getObjectKeys.
+class enum_member_collector : public TJS::tTJSDispatch {
+public:
+    explicit enum_member_collector(TJS::iTJSDispatch2 *array) : array_(array) {}
+
+    tjs_error FuncCall(tjs_uint32 flag, const tjs_char *membername,
+                       tjs_uint32 *hint, TJS::tTJSVariant *result,
+                       tjs_int numparams, TJS::tTJSVariant **param,
+                       TJS::iTJSDispatch2 *objthis) override {
+        (void)flag;
+        (void)membername;
+        (void)hint;
+        (void)objthis;
+        if(numparams > 1) {
+            tTVInteger member_flags = param[1]->AsInteger();
+            if(!(member_flags & TJS_HIDDENMEMBER)) {
+                static tjs_uint add_hint = 0;
+                array_->FuncCall(0, TJS_W("add"), &add_hint, nullptr, 1,
+                                 &param[0], array_);
+            }
+        }
+        if(result)
+            *result = true;
+        return TJS_S_OK;
+    }
+
+private:
+    TJS::iTJSDispatch2 *array_;
+};
 
 extern "C" {
 
@@ -1574,6 +1894,38 @@ int tjs2_do_gc(tjs2_engine *e, char **out_error) {
     }
 }
 
+// Resolve a retained object to the Rust payload of an instance-based native
+// class: the same NativeInstanceSupport(TJS_NIS_GETINSTANCE, classid) ->
+// GetNativePtr() lookup the instance method/property dispatchers perform
+// (tjs2_dispatch_native_instance_method), except a miss is reported as NULL
+// instead of a TJS error. See tjs2_abi.h for the full contract.
+void *tjs2_get_native_instance(tjs2_engine *e, tjs2_value_id obj,
+                               const char *class_name_utf8) {
+    if(!e || !obj || !class_name_utf8)
+        return nullptr;
+    try {
+        TJS::iTJSDispatch2 *target = resolve_retained_object(e, obj);
+        if(!target)
+            return nullptr; // unknown id, non-object value, or TJS null
+        auto cls =
+            e->native_instance_class_ids.find(std::string(class_name_utf8));
+        if(cls == e->native_instance_class_ids.end())
+            return nullptr; // not an instance-capable class of this engine
+        TJS::iTJSNativeInstance *native = nullptr;
+        tjs_error hr = target->NativeInstanceSupport(TJS_NIS_GETINSTANCE,
+                                                      cls->second, &native);
+        if(TJS_FAILED(hr) || !native)
+            return nullptr; // not an instance (or the class object itself)
+        // Same static_cast as the dispatchers: every native instance
+        // registered under this class id is a tjs2_native_instance.
+        // GetNativePtr() is null once the instance was invalidated.
+        return static_cast<tjs2_native_instance *>(native)->GetNativePtr();
+    } catch(...) {
+        // Never let a C++ exception cross the C ABI.
+        return nullptr;
+    }
+}
+
 int tjs2_get_class_names(tjs2_engine *e, tjs2_value_id obj, tjs2_value *out,
                          char **out_error) {
     if(out_error)
@@ -1608,6 +1960,76 @@ int tjs2_get_class_names(tjs2_engine *e, tjs2_value_id obj, tjs2_value *out,
                 array->PropSetByNum(TJS_MEMBERENSURE, num, &val, array);
                 num++;
             }
+        } catch(...) {
+            array->Release();
+            throw;
+        }
+        TJS::tTJSVariant var(array, array);
+        array->Release();
+        out->type = TJS2_VAL_RETAINED;
+        out->integer = 0;
+        out->real = 0.0;
+        out->string = nullptr;
+        out->array = nullptr;
+        out->array_count = 0;
+        out->retained = retain_variant(e, var);
+        return 0;
+    } catch(const TJS::eTJS &err) {
+        if(out_error)
+            *out_error = make_error_message(err);
+        return 1;
+    } catch(const std::exception &err) {
+        if(out_error) {
+            std::string m = std::string("C++ exception: ") + err.what();
+            char *buf = (char *)malloc(m.size() + 1);
+            if(buf)
+                std::memcpy(buf, m.c_str(), m.size() + 1);
+            *out_error = buf;
+        }
+        return 1;
+    } catch(...) {
+        if(out_error) {
+            char *buf = (char *)malloc(8);
+            if(buf)
+                std::memcpy(buf, "unknown", 8);
+            *out_error = buf;
+        }
+        return 1;
+    }
+}
+
+int tjs2_enum_members(tjs2_engine *e, tjs2_value_id obj, tjs2_value *out,
+                      char **out_error) {
+    if(out_error)
+        *out_error = nullptr;
+    if(!e || !obj || !out) {
+        if(out_error)
+            *out_error = make_error_string("invalid object argument");
+        return -1;
+    }
+    try {
+        TJS::iTJSDispatch2 *dsp = resolve_retained_object(e, obj);
+        if(!dsp) {
+            if(out_error)
+                *out_error = make_error_string("invalid retained object");
+            return 1;
+        }
+        // Reference ScriptsAdd::_getKeys: EnumMembers with
+        // TJS_IGNOREPROP | TJS_ENUM_NO_VALUE. The class object enumerates its
+        // own members plus the inherited ones reachable through its class
+        // chain, which is exactly the observable script surface.
+        TJS::iTJSDispatch2 *array = TJS::TJSCreateArrayObject();
+        if(!array) {
+            if(out_error)
+                *out_error = make_error_string("failed to create the member array");
+            return 1;
+        }
+        try {
+            enum_member_collector collector(array);
+            TJS::tTJSVariantClosure closure(&collector,
+                                            (TJS::iTJSDispatch2 *)nullptr);
+            dsp->EnumMembers(TJS_IGNOREPROP | TJS_ENUM_NO_VALUE, &closure,
+                             nullptr);
         } catch(...) {
             array->Release();
             throw;
@@ -1894,6 +2316,7 @@ int tjs2_register_native_class_instance(
         cls->AddRef();
         e->native_classes.push_back(cls);
         e->native_class_names.push_back(name8);
+        e->native_instance_class_ids.emplace(name8, classid);
         TJS::tTJSVariant val(cls);
         holder.dispose();
         tjs_error hr = global->PropSet(TJS_MEMBERENSURE | TJS_IGNOREPROP,
@@ -1951,6 +2374,107 @@ int tjs2_register_native_static_members(
             auto *dsp = new tjs2_native_property_dispatch(e, p.get, p.set);
             cls->RegisterNCM(pname16.c_str(), dsp, clsname.c_str(),
                              TJS::nitProperty, TJS_STATICMEMBER);
+        }
+        return 0;
+    } catch(...) {
+        return -4;
+    }
+}
+
+int tjs2_register_native_instance_members(
+    tjs2_engine *e, const char *class_name_utf8,
+    const tjs2_native_objthis_method *methods, int count,
+    const tjs2_native_objthis_property *properties, int prop_count) {
+    if(!e || !class_name_utf8 || count < 0 || (count > 0 && !methods) ||
+       prop_count < 0 || (prop_count > 0 && !properties))
+        return -1;
+    try {
+        std::string name8(class_name_utf8);
+        std::u16string name16 = utf8_to_u16(class_name_utf8);
+        ttstr clsname(name16.c_str());
+
+        // If the class is one we registered, add the members as ordinary
+        // (non-static) instance members: tTJSNativeClass::FuncCall copies
+        // them onto every created object. This mirrors
+        // tjs2_register_native_static_members without TJS_STATICMEMBER.
+        TJS::tTJSNativeClass *cls = nullptr;
+        for(size_t i = 0; i < e->native_class_names.size(); i++) {
+            if(e->native_class_names[i] == name8) {
+                cls = static_cast<TJS::tTJSNativeClass *>(
+                    e->native_classes[i]);
+                break;
+            }
+        }
+        if(cls) {
+            for(int i = 0; i < count; i++) {
+                const tjs2_native_objthis_method &m = methods[i];
+                if(!m.name || !m.fn)
+                    return -3;
+                std::u16string mname16 = utf8_to_u16(m.name);
+                auto *dsp = new tjs2_objthis_method_dispatch(e, m.fn);
+                cls->RegisterNCM(mname16.c_str(), dsp, clsname.c_str(),
+                                 TJS::nitMethod);
+            }
+            for(int i = 0; i < prop_count; i++) {
+                const tjs2_native_objthis_property &p = properties[i];
+                if(!p.name || (!p.get && !p.set))
+                    return -3;
+                std::u16string pname16 = utf8_to_u16(p.name);
+                auto *dsp =
+                    new tjs2_objthis_property_dispatch(e, p.get, p.set);
+                cls->RegisterNCM(pname16.c_str(), dsp, clsname.c_str(),
+                                 TJS::nitProperty);
+            }
+            return 0;
+        }
+
+        // Otherwise it is a builtin: find the class object through the VM
+        // global object (the same lookup NCB_ATTACH_CLASS performs in its
+        // GetGlobalObject, ncbind.hpp) and PropSet the members onto it. The
+        // class object is owned by the global object, so no reference is
+        // taken or released here; the PropSet context is the class object
+        // itself, so a non-static member lands on the class and is reachable
+        // from its instances.
+        iTJSDispatch2 *global = e->inner->GetGlobalNoAddRef();
+        if(!global)
+            return -2;
+        TJS::tTJSVariant class_val;
+        tjs_error hr =
+            global->PropGet(0, name16.c_str(), nullptr, &class_val, global);
+        if(TJS_FAILED(hr))
+            return -2;
+        iTJSDispatch2 *classobj = class_val.AsObjectNoAddRef();
+        if(!classobj)
+            return -2;
+
+        // Wrap the dispatch in a variant (AddRef), drop the creation
+        // reference, and PropSet it onto the class object: the same pattern
+        // as ncbAttachTJS2Class::RegistVariant (ncbind.hpp).
+        for(int i = 0; i < count; i++) {
+            const tjs2_native_objthis_method &m = methods[i];
+            if(!m.name || !m.fn)
+                return -3;
+            std::u16string mname16 = utf8_to_u16(m.name);
+            auto *dsp = new tjs2_objthis_method_dispatch(e, m.fn);
+            TJS::tTJSVariant mval(static_cast<TJS::iTJSDispatch2 *>(dsp));
+            dsp->Release();
+            hr = classobj->PropSet(TJS_MEMBERENSURE, mname16.c_str(), nullptr,
+                                   &mval, classobj);
+            if(TJS_FAILED(hr))
+                return -6;
+        }
+        for(int i = 0; i < prop_count; i++) {
+            const tjs2_native_objthis_property &p = properties[i];
+            if(!p.name || (!p.get && !p.set))
+                return -3;
+            std::u16string pname16 = utf8_to_u16(p.name);
+            auto *dsp = new tjs2_objthis_property_dispatch(e, p.get, p.set);
+            TJS::tTJSVariant pval(static_cast<TJS::iTJSDispatch2 *>(dsp));
+            dsp->Release();
+            hr = classobj->PropSet(TJS_MEMBERENSURE, pname16.c_str(), nullptr,
+                                   &pval, classobj);
+            if(TJS_FAILED(hr))
+                return -6;
         }
         return 0;
     } catch(...) {
@@ -2118,6 +2642,28 @@ void tjs2_release_value(void *engine, tjs2_value_id id) {
     try {
         e->retained.erase((uintptr_t)id);
     } catch(...) {
+    }
+}
+
+// Invalidate a retained object value (the reference `invalidate obj;`
+// statement): invokes the object's iTJSDispatch2::Invalidate so its script
+// `finalize` runs. Returns 0 on success, 1 on an unknown id or an exception.
+// The retention is left in place; release it with tjs2_release_value.
+int tjs2_invalidate_retained(void *engine, tjs2_value_id id) {
+    tjs2_engine *e = (tjs2_engine *)engine;
+    if(!e || !id)
+        return 1;
+    try {
+        auto it = e->retained.find((uintptr_t)id);
+        if(it == e->retained.end())
+            return 1;
+        TJS::tTJSVariantClosure clo = it->second.AsObjectClosureNoAddRef();
+        if(!clo.Object)
+            return 1;
+        clo.Invalidate(0, nullptr, nullptr, nullptr);
+        return 0;
+    } catch(...) {
+        return 1;
     }
 }
 
@@ -2410,6 +2956,65 @@ int tjs2_prop_set(void *engine, tjs2_value_id id, const char *membername,
     } catch(...) {
         if(out_error)
             *out_error = make_error_string("prop_set failed");
+        return 1;
+    }
+}
+
+// Delete a named property from a retained object value (reference
+// `iTJSDispatch2::DeleteMember`, tjsObject.h:472; the tTJSCustomObject
+// implementation tjsObject.cpp:1537-1552 delegates to DeleteByName at
+// tjsObject.cpp:759). Flag 0 and objthis = the dispatch object match the
+// VM's own `delete` operator (tjsInterCodeExec.cpp:1826), so only the
+// object's own member table is affected. An absent member is the reference's
+// TJS_E_MEMBERNOTFOUND (tjsObject.cpp:1546), which the `delete` operator
+// turns into the boolean `false` rather than an exception
+// (tjsInterCodeExec.cpp:1829-1833); this entry point reports it as a typed
+// failure. Same error convention as tjs2_prop_get.
+int tjs2_prop_delete(tjs2_engine *e, tjs2_value_id obj,
+                     const char *membername_utf8, char **out_error) {
+    if(!e || !obj || !membername_utf8) {
+        if(out_error)
+            *out_error = make_error_string("invalid retained value");
+        return 1;
+    }
+    try {
+        auto it = e->retained.find((uintptr_t)obj);
+        if(it == e->retained.end()) {
+            if(out_error)
+                *out_error = make_error_string("invalid retained value");
+            return 1;
+        }
+        std::u16string member16 = utf8_to_u16(membername_utf8);
+        // AsObjectNoAddRef throws for a non-object; TJS `null` is an object
+        // value with no object pointer, so it comes back as null here.
+        TJS::iTJSDispatch2 *dsp = it->second.AsObjectNoAddRef();
+        if(!dsp) {
+            if(out_error)
+                *out_error = make_error_string("not an object");
+            return 1;
+        }
+        tjs_error hr = dsp->DeleteMember(0, member16.c_str(), nullptr, dsp);
+        if(TJS_FAILED(hr))
+            TJSThrowFrom_tjs_error(hr, member16.c_str()); // -> catch below
+        if(out_error)
+            *out_error = nullptr;
+        return 0;
+    } catch(const TJS::eTJS &err) {
+        if(out_error)
+            *out_error = make_error_message(err);
+        return 1;
+    } catch(const std::exception &err) {
+        if(out_error) {
+            std::string m = std::string("C++ exception: ") + err.what();
+            char *buf = (char *)malloc(m.size() + 1);
+            if(buf)
+                std::memcpy(buf, m.c_str(), m.size() + 1);
+            *out_error = buf;
+        }
+        return 1;
+    } catch(...) {
+        if(out_error)
+            *out_error = make_error_string("prop_delete failed");
         return 1;
     }
 }

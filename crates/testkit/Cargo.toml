@@ -9,3 +9,5 @@ publish = false
 [dependencies]
 fs = { workspace = true }
 flate2 = { workspace = true }
+image = { version = "0.25", default-features = false, features = ["png"] }
+raw-window-handle = { workspace = true }

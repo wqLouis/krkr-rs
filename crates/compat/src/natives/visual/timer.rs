@@ -1,16 +1,58 @@
 //! The visual `Timer` native class and its frame poll.
+//!
+//! Behavioral reference: `reference/cpp/core/utils/TimerIntf.cpp` and
+//! `reference/cpp/core/utils/impl/TimerImpl.cpp`.
+//!
+//! The L3 glue owns exactly what `tTJSNI_BaseTimer` owns: the retained
+//! action owner / action name, the script-visible `interval` (sub-ms fixed
+//! point), `capacity`, `mode` and `enabled` — all stored verbatim in the
+//! [`TimerBinding`] and never read back from L2 — plus the dispatch seam.
+//! Scheduling is L2 (`engine::timer::TimerState`): the constructor registers
+//! a callback that performs the `onTimer` dispatch on every fire, and L3
+//! decides whether the timer is armed *at all*. The reference's two "armed
+//! and enabled yet never fires" cases — a negative `Capacity` posting
+//! nothing (`TimerIntf.cpp:76-84`) and a zero interval being skipped by the
+//! timer thread (`TimerImpl.cpp:125`) — are expressed by **not arming** the
+//! L2 timer while the binding keeps reporting the script's `enabled`.
 
 use std::ffi::{c_char, c_int, c_void};
 
-use engine::timer::{TimerConfig, TimerId};
+use engine::timer::{TimerCallback, TimerId, TimerState};
 use tjs::{
-    DetachedValue, NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef, Value,
+    DetachedValue, NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef,
+    RetainedValue, Tjs2Engine, TjsValue, VAL_INTEGER, VAL_REAL, VAL_STRING, VAL_VOID, Value,
 };
 
-use super::common::{TimerBinding, VisualState, bound};
-use crate::native_util::{args, report_error, set_bool, set_int, set_void};
+use super::common::{DEFAULT_TIMER_CAPACITY, TimerBinding, VisualState, bound, set_real};
+use crate::native_util::{args, report_error, set_bool, set_int, set_void, value_as_string};
 use crate::natives::system::{value_as_bool, value_as_i64};
-use crate::{CompatCtx, CompatError};
+use crate::{CompatCtx, CompatError, CompatServices};
+
+/// The reference `TVPActionName` — the default action member
+/// (`EventIntf.cpp:740`, stored at `TimerIntf.cpp:34`).
+const DEFAULT_ACTION_NAME: &str = "action";
+
+/// `TVP_SUBMILLI_FRAC_BITS` (`TimerIntf.h:18`): `interval` is stored as
+/// integer sub-millisecond fixed point. The reference setter scales the
+/// script value by `1 << 16` (`TimerIntf.cpp:196-197`) and the getter
+/// converts back with `1.0 / (1 << 16)` (`TimerIntf.cpp:186-188`).
+const SUBMILLI_FRAC_BITS: u32 = 16;
+
+/// `1 << TVP_SUBMILLI_FRAC_BITS` as the setter/getter scale factor. A power
+/// of two, so both directions are exact in `f64`.
+const SUBMILLI_SCALE: f64 = 65536.0;
+
+/// The script-visible default `interval`: the reference constructor default
+/// of 1000 ms (`TimerImpl.cpp:363`) held in the same sub-ms fixed-point
+/// storage the setter writes, so the getter's reference conversion
+/// (`TimerIntf.cpp:186-188`) reports `1000.0` — matching
+/// [`DEFAULT_INTERVAL_MS`].
+const DEFAULT_INTERVAL_UNITS: u64 = 1000 << SUBMILLI_FRAC_BITS;
+
+/// The L2 counterpart of [`DEFAULT_INTERVAL_UNITS`]: the reference default
+/// interval of 1000 ms (`TimerImpl.cpp:363`) in whole milliseconds — the
+/// interval the constructor registers its callback with.
+const DEFAULT_INTERVAL_MS: u64 = 1000;
 
 /// `Timer` payload: the L2 timer registry id.
 #[derive(Default)]
@@ -31,6 +73,7 @@ extern "C" fn timer_destroy(engine: *mut c_void, instance: *mut c_void) {
         return;
     }
     let inst = unsafe { &*(instance as *const TimerInst) };
+    log::debug!("Timer destroyed: {:?}", inst.id);
     if let (Some(id), Ok((_resolved, ctx))) = (inst.id, bound(engine)) {
         // SAFETY: the caller resolved `ctx` from the installed binding.
         let services = unsafe { ctx.services() };
@@ -38,7 +81,8 @@ extern "C" fn timer_destroy(engine: *mut c_void, instance: *mut c_void) {
             // SAFETY: `attach_timer` guarantees the pointer stays valid.
             let _ = unsafe { &mut *timer }.remove(id);
         }
-        // The dropped `TimerBinding` releases the callback and owner.
+        // The dropped `TimerBinding` releases the action owner and the
+        // retained timer object.
         services.state::<VisualState>().timers.remove(&id);
     }
     // SAFETY: instance came from `timer_create`'s `Box::into_raw` and is
@@ -46,8 +90,26 @@ extern "C" fn timer_destroy(engine: *mut c_void, instance: *mut c_void) {
     drop(unsafe { Box::from_raw(instance as *mut TimerInst) });
 }
 
-/// `Timer(callback[, actionName])` — retain the callback and register the L2
-/// timer. The action name is accepted and ignored.
+/// `Timer(actionOwner[, actionName])` — retain the action owner and register
+/// the L2 timer.
+///
+/// Reference `tTJSNI_BaseTimer::Construct` (`TimerIntf.cpp:34-51`):
+/// * `numparams < 1` raises `TJS_E_BADPARAMCOUNT` (`TimerIntf.cpp:41-42`) —
+///   a missing argument is an error, our message text may differ;
+/// * a second argument replaces the `TVPActionName == "action"` default only
+///   when it is present and not void (`TimerIntf.cpp:48-49`); `""` selects
+///   the "call the owner itself" dispatch;
+/// * `param[0]` becomes the action owner *unconditionally*
+///   (`param[0]->AsObjectClosure()`, `TimerIntf.cpp:51`) — a non-object
+///   (e.g. `new Timer(42)`) yields an empty closure that is silently never
+///   invoked, so it must not raise here.
+///
+/// The L2 timer starts at the reference defaults (`TimerImpl.cpp:361-366`):
+/// interval 1000 ms, **disabled** — `create_interval` arms by contract, so
+/// the constructor disarms it again and only a script `enabled = true`
+/// arms it for real. `Capacity` is kept in the binding only: it bounds
+/// *queued* `onTimer` events (`TimerIntf.cpp:69-92`), never fires, so it
+/// never narrows the schedule.
 extern "C" fn timer_ctor(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -58,16 +120,30 @@ extern "C" fn timer_ctor(
     objthis: *mut c_void,
 ) -> c_int {
     if argc < 1 {
-        return report_error(out_error, "Timer: constructor requires a callback");
+        return report_error(out_error, "Timer: constructor requires an action owner");
     }
     let Ok((resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Timer: compat context is not bound");
     };
     let host = resolved.engine();
-    let callback = match host.retain_object_arg(&unsafe { args(argv, argc) }[0]) {
-        Ok(callback) => callback,
-        Err(error) => return report_error(out_error, &format!("Timer: {error}")),
+    let argv = unsafe { args(argv, argc) };
+    let Some(first) = argv.first() else {
+        return report_error(out_error, "Timer: constructor requires an action owner");
     };
+    // Reference `ActionOwner = param[0]->AsObjectClosure()`
+    // (`TimerIntf.cpp:51`): any value is accepted; a value that is not an
+    // object becomes an empty closure the native `onTimer` never invokes
+    // (`if(obj.Object)`, `TimerIntf.cpp:161`), so a failed retain stores
+    // `None` instead of raising `retain_object_arg: value is not an object`.
+    let action_owner = host.retain_object_arg(first).ok();
+    // Reference `if(numparams >= 2 && param[1]->Type() != tvtVoid)
+    // ActionName = *param[1]` (`TimerIntf.cpp:48-49`).
+    let action_name = match argv.get(1) {
+        Some(value) if value.ty != VAL_VOID => value_as_string(value),
+        _ => DEFAULT_ACTION_NAME.to_string(),
+    };
+    // `Owner = tjs_obj` (`TimerIntf.cpp:52`): the timer object itself, used
+    // to dispatch `onTimer` through the class chain.
     let owner = host.retain_object_detached(objthis).ok();
     let inst = unsafe { &mut *(instance as *mut TimerInst) };
     if inst.id.is_some() {
@@ -78,26 +154,246 @@ extern "C" fn timer_ctor(
     let Some(timer_ptr) = services.timer() else {
         return report_error(out_error, "Timer: timer registry is not attached");
     };
-    // SAFETY: `attach_timer` guarantees the pointer stays valid.
-    let id = match unsafe { &mut *timer_ptr }.create(TimerConfig::default()) {
-        Ok(id) => id,
-        Err(error) => return report_error(out_error, &format!("Timer: {error}")),
+    // The reference constructs the timer disabled with a 1000 ms interval
+    // (`TimerImpl.cpp:361-366`). `create_interval` arms by contract, so the
+    // fresh timer is disarmed immediately; the binding starts `enabled =
+    // false`, and only a script `enabled = true` arms it (through the
+    // schedule sync).
+    let id = {
+        // SAFETY: `attach_timer` guarantees the pointer stays valid.
+        let timer = unsafe { &mut *timer_ptr };
+        let id = match timer.create_interval(DEFAULT_INTERVAL_MS, timer_callback(engine)) {
+            Ok(id) => id,
+            Err(error) => return report_error(out_error, &format!("Timer: {error}")),
+        };
+        if let Err(error) = timer.set_enabled(id, false) {
+            return report_error(out_error, &format!("Timer: {error}"));
+        }
+        id
     };
     services.state::<VisualState>().timers.insert(
         id,
         TimerBinding {
-            callback: Some(callback),
+            action_owner,
             owner,
+            action_name,
             mode: 0,
+            capacity: DEFAULT_TIMER_CAPACITY,
+            interval_units: DEFAULT_INTERVAL_UNITS,
+            enabled: false,
+            armed: false,
         },
     );
     inst.id = Some(id);
-    set_int(out, id.value() as i64);
+    set_void(out);
     0
 }
 
-/// The native `onTimer` method: invoke the constructor callback. A script
-/// subclass that overrides `onTimer` never reaches here.
+/// Reference `tTJSNI_Timer::Invalidate` (`TimerImpl.cpp:378-382`) plus
+/// `tTJSNI_BaseTimer::Invalidate` (`TimerIntf.cpp:53-60`): remove the timer
+/// from the thread, cancel the queued events and drop `Owner` /
+/// `ActionOwner`.
+///
+/// Our dispatch holds the subclass instance (`owner`) and the action owner
+/// as strong retentions, so removing the registry entry does all three at
+/// once: the entry's drop releases both retentions, the L2 timer is
+/// unregistered so it never ticks again, and an action still running on the
+/// stack finds no entry to be restored into after `invalidate` returns (no
+/// resurrection). The native payload itself stays allocated and is freed
+/// exactly once by `timer_destroy` when the object dies (the ABI runs
+/// `Invalidate` before the destructor).
+extern "C" fn timer_invalidate(engine: *mut c_void, instance: *mut c_void) {
+    if instance.is_null() {
+        return;
+    }
+    let inst = unsafe { &*(instance as *const TimerInst) };
+    let (Some(id), Ok((_resolved, ctx))) = (inst.id, bound(engine)) else {
+        return;
+    };
+    // SAFETY: the caller resolved `ctx` from the installed binding.
+    let services = unsafe { ctx.services() };
+    // Reference `CancelEvents()` + `Owner`/`ActionOwner` release: the entry's
+    // drop releases both retentions, so `timer_poll` has nothing to dispatch.
+    services.state::<VisualState>().timers.remove(&id);
+    // Reference `tTVPTimerThread::Remove(this)`: the timer must not tick
+    // again, and `timer_poll` must stop reporting an armed timer.
+    if let Some(timer) = services.timer() {
+        // SAFETY: `attach_timer` guarantees the pointer stays valid.
+        let _ = unsafe { &mut *timer }.remove(id);
+    }
+}
+
+/// Build the L2 callback that performs the reference-faithful `onTimer`
+/// dispatch for a timer registered by [`timer_ctor`].
+///
+/// The closure captures only the engine pointer the ABI handed the
+/// constructor: the binding key is the [`TimerId`] it receives on every
+/// fire, and the retained owner / action live in the [`TimerBinding`],
+/// resolved through `bound(engine)` at fire time — so a timer invalidated
+/// or destroyed after collection finds no binding and dispatches nothing.
+fn timer_callback(engine: *mut c_void) -> TimerCallback {
+    Box::new(move |id| {
+        // SAFETY: `engine` is the live pointer the native ABI passed to this
+        // timer's constructor; L2 only invokes callbacks from `timer_poll`,
+        // which requires the same bound context, so `bound` resolves it the
+        // same way every other native does.
+        let Ok((resolved, ctx)) = bound(engine) else {
+            log::warn!("Timer {id:?}: compat context is not bound; fire dropped");
+            return;
+        };
+        let host = resolved.engine();
+        // SAFETY: the caller resolved `ctx` from the installed binding.
+        let services = unsafe { ctx.services() };
+        dispatch_on_timer(host, services, id);
+    })
+}
+
+/// Dispatch `id`'s `onTimer` — always the object's `onTimer` **member**
+/// (`EventIntf.cpp:104`: `Target->FuncCall(0, "onTimer", ...)`), so a script
+/// subclass override wins; the native member then invokes the constructor's
+/// action owner (see [`invoke_action`]). Fall back to the action owner
+/// itself when the timer object could not be retained at construction (the
+/// reference always has `Owner`, so this only covers the port's retention
+/// failure).
+///
+/// Delivery failures are logged and never disable the timer — the reference
+/// has no disable-on-error path in `TimerIntf.cpp`/`TimerImpl.cpp`.
+fn dispatch_on_timer(host: &Tjs2Engine, services: &CompatServices, id: TimerId) {
+    let owner = {
+        let state = services.state::<VisualState>();
+        state
+            .timers
+            .get(&id)
+            .and_then(|timer| timer.owner.as_ref().map(DetachedValue::raw_id))
+    };
+    log::debug!("timer {id:?}: dispatching (owner {})", owner.is_some());
+    let result: Result<(), String> = match owner {
+        Some(owner) => host.call_member(owner, "onTimer", &[]).map(|_| ()),
+        None => invoke_action(host, services, id, std::ptr::null_mut()),
+    };
+    if let Err(error) = result {
+        // Reference: `onTimer` returns `TJS_S_OK` whatever happened
+        // (`TimerIntf.cpp:169`) and no reference code path disables a timer
+        // because its callback failed — keep delivering.
+        log::warn!("Timer {id:?}: onTimer dispatch failed ({error}); the timer stays enabled");
+    }
+}
+
+/// Build the reference action event dictionary `{type: "onTimer", target:
+/// <objthis>}` for a native `onTimer` invocation (`TVPCreateEventObject`,
+/// `EventIntf.cpp:709-739`, built by `TVP_ACTION_INVOKE_BEGIN`,
+/// `EventIntf.h:208-215`).
+///
+/// `objthis` may be null when the timer object itself could not be
+/// retained (a port-only situation; the reference always has it), in which
+/// case `target` is omitted.
+fn action_event(host: &Tjs2Engine, objthis: *mut c_void) -> Result<DetachedValue, String> {
+    let event = match host.eval_retained("%[]", "Timer.onTimer") {
+        Ok(RetainedValue::Object(event)) => event,
+        Ok(RetainedValue::Value(value)) => {
+            return Err(format!("event dictionary came back as {value:?}"));
+        }
+        Err(error) => return Err(format!("event dictionary creation failed: {error}")),
+    };
+    host.set_member(event.raw_id(), "type", &TjsValue::String("onTimer".into()))?;
+    if !objthis.is_null() {
+        // The retention is consumed while the variant copy is built; on
+        // failure it is left to `DetachedValue`'s idempotent release.
+        if let Ok(target) = host.retain_object_detached(objthis) {
+            let target_id = target.raw_id() as u64;
+            let _ = host.set_member(event.raw_id(), "target", &TjsValue::Retained(target_id));
+            drop(target);
+        }
+    }
+    Ok(event)
+}
+
+/// Invoke the retained action for `id` exactly like the reference native
+/// `Timer.onTimer` (`TimerIntf.cpp:156-171` with `TVP_ACTION_INVOKE_*`,
+/// `EventIntf.h:208-237`):
+///
+/// * a non-empty action name is a **member call on the action owner** —
+///   `owner.<name>(event)` — defaulting to `"action"`
+///   (`TVPActionName`, `EventIntf.cpp:740`);
+/// * the empty name calls the owner itself — `owner(event)`
+///   (`TimerIntf.cpp:165` passes a null member name);
+/// * both receive the `{type: "onTimer", target: <timer>}` event dictionary
+///   as their single argument.
+///
+/// The action is taken out of the registry across the VM call (releasing
+/// the state borrow so a re-entrant poll/construct sees consistent state)
+/// and restored afterwards unless the object was invalidated or destroyed
+/// meanwhile (the entry's drop then releases it). A missing entry and a
+/// non-object constructor argument (`None` action owner — the reference's
+/// `if(obj.Object)` guard at `TimerIntf.cpp:161`) are silent no-ops.
+///
+/// Dispatch failures are returned to the caller *for logging only*: the
+/// reference never inspects the `FuncCall` result (`EventIntf.h:231-234`),
+/// so a failed member lookup — a plain function has no `action` member, and
+/// the VM's `MEMBERNOTFOUND` is discarded — or a throwing callback must
+/// neither raise out of the delivery seam nor disable the timer. Nothing in
+/// `TimerIntf.cpp`/`TimerImpl.cpp` links a delivery error to `SetEnabled`.
+fn invoke_action(
+    host: &Tjs2Engine,
+    services: &CompatServices,
+    id: TimerId,
+    objthis: *mut c_void,
+) -> Result<(), String> {
+    let (action, action_name) = {
+        let mut state = services.state::<VisualState>();
+        match state.timers.get_mut(&id) {
+            Some(binding) => (binding.action_owner.take(), binding.action_name.clone()),
+            None => return Ok(()),
+        }
+    };
+    let Some(action) = action else {
+        // Reference `if(obj.Object)` (`TimerIntf.cpp:161`): an empty
+        // `AsObjectClosure()` (a non-object ctor argument) never invokes.
+        return Ok(());
+    };
+    let restore = |action: DetachedValue| {
+        if let Some(binding) = services.state::<VisualState>().timers.get_mut(&id) {
+            binding.action_owner = Some(action);
+        } else {
+            drop(action);
+        }
+    };
+    let event = match action_event(host, objthis) {
+        Ok(event) => event,
+        Err(error) => {
+            restore(action);
+            return Err(error);
+        }
+    };
+    // The event dictionary crosses the call as `TjsValue::Retained`; the
+    // C++ side consumes that retention while copying the argument, so
+    // dropping `event` afterwards is an idempotent no-op.
+    let event_id = event.raw_id() as u64;
+    let result = if action_name.is_empty() {
+        // Empty action name: `FuncCall(0, nullptr, ...)` invokes the owner
+        // itself — `owner(event)` (`TimerIntf.cpp:165`).
+        host.call_detached(&action, &[TjsValue::Retained(event_id)])
+    } else {
+        // Non-empty name: a member call on the owner — `owner.<name>(event)`.
+        host.call_member(
+            action.raw_id(),
+            &action_name,
+            &[TjsValue::Retained(event_id)],
+        )
+    };
+    drop(event);
+    restore(action);
+    result.map(|_| ())
+}
+
+/// The native `onTimer` method: dispatch the constructor's action owner the
+/// way `tTJSNC_Timer::onTimer` does (`TimerIntf.cpp:156-171`). A script
+/// subclass that overrides `onTimer` never reaches here (the override wins
+/// the class-chain lookup in [`dispatch_on_timer`]).
+///
+/// The reference returns `TJS_S_OK` unconditionally (`TimerIntf.cpp:169`) —
+/// the `FuncCall` result is discarded — so this never raises and never
+/// disables the timer; dispatch failures are logged.
 extern "C" fn timer_on_timer(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -105,7 +401,7 @@ extern "C" fn timer_on_timer(
     _argv: *const Value,
     out: *mut Value,
     out_error: *mut *mut c_char,
-    _objthis: *mut c_void,
+    objthis: *mut c_void,
 ) -> c_int {
     let Ok((resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Timer.onTimer: compat context is not bound");
@@ -113,46 +409,134 @@ extern "C" fn timer_on_timer(
     let host = resolved.engine();
     let inst = unsafe { &*(instance as *const TimerInst) };
     let Some(id) = inst.id else {
-        return report_error(out_error, "Timer.onTimer: this timer is not constructed");
-    };
-    // Take the callback out so the state borrow is released across the call
-    // (the callback may register/disable timers).
-    let callback = {
-        // SAFETY: the caller resolved `ctx` from the installed binding.
-        let mut state = unsafe { ctx.services() }.state::<VisualState>();
-        state
-            .timers
-            .get_mut(&id)
-            .and_then(|timer| timer.callback.take())
-    };
-    let Some(callback) = callback else {
+        // `Construct` never completed (`TimerIntf.cpp:34-51`), so the
+        // reference's `ActionOwner` is null and `onTimer` is a no-op that
+        // still returns `TJS_S_OK`.
+        log::debug!("Timer.onTimer: the timer is not constructed; nothing to dispatch");
         set_void(out);
         return 0;
     };
-    let result = host.call_detached(&callback, &[]);
-    {
-        // SAFETY: the caller resolved `ctx` from the installed binding.
-        let mut state = unsafe { ctx.services() }.state::<VisualState>();
-        match state.timers.get_mut(&id) {
-            Some(timer) => timer.callback = Some(callback),
-            None => drop(callback),
-        }
-    }
-    if let Err(error) = result {
-        log::warn!("Timer {id:?}: callback failed ({error}); disabling");
-        // SAFETY: the caller resolved `ctx` from the installed binding.
-        let services = unsafe { ctx.services() };
-        if let Some(timer) = services.timer() {
-            let now = services.state::<VisualState>().clock.now_ms();
-            // SAFETY: `attach_timer` guarantees the pointer stays valid.
-            let _ = unsafe { &mut *timer }.set_enabled(id, false, now);
-        }
+    // SAFETY: the caller resolved `ctx` from the installed binding.
+    let services = unsafe { ctx.services() };
+    if let Err(error) = invoke_action(host, services, id, objthis) {
+        log::warn!("Timer {id:?}: action dispatch failed ({error}); the timer stays enabled");
     }
     set_void(out);
     0
 }
 
-/// `timer.interval` (ms).
+// ---------------------------------------------------------------------------
+// Schedule sync: the binding decides, L2 executes
+// ---------------------------------------------------------------------------
+
+/// The binding's interval in whole L2 milliseconds, rounded **up** so the
+/// L2 deadline is never shorter than the reference's, or `None` when the
+/// fixed-point value is not strictly positive as a `tjs_int64`.
+///
+/// `0` and wrapped negatives are not representable in L2 (the reference
+/// thread skips a zero interval outright, `TimerImpl.cpp:125`, and a
+/// wrapped value would be an ~8775-year interval): in both cases L3 keeps
+/// the timer *unarmed* while the binding keeps reporting the script's
+/// values verbatim.
+fn armable_interval_ms(interval_units: u64) -> Option<u64> {
+    let signed = interval_units as i64;
+    (signed > 0).then(|| interval_ms_ceil(interval_units))
+}
+
+/// `ceil(units / 65536)` — the sub-ms fixed point rounded up to ms.
+fn interval_ms_ceil(interval_units: u64) -> u64 {
+    interval_units.div_ceil(1 << SUBMILLI_FRAC_BITS)
+}
+
+/// Push `interval_ms` into L2 (no-op when the binding's value is not
+/// representable, i.e. `None`).
+fn push_interval(timer: &mut TimerState, id: TimerId, interval_ms: Option<u64>) {
+    let Some(interval_ms) = interval_ms else {
+        return;
+    };
+    if let Err(error) = timer.set_interval(id, interval_ms) {
+        log::warn!("Timer {id:?}: set_interval({interval_ms}) failed ({error})");
+    }
+}
+
+/// Arm or disarm `id` in L2, logging a (cannot-happen) typed error instead
+/// of unwinding out of a property setter.
+fn push_enabled(timer: &mut TimerState, id: TimerId, enabled: bool) {
+    if let Err(error) = timer.set_enabled(id, enabled) {
+        log::warn!("Timer {id:?}: set_enabled({enabled}) failed ({error})");
+    }
+}
+
+/// Reconcile the L2 schedule with `id`'s binding after a script write.
+///
+/// * `want` is whether the reference-equivalent state calls for an armed L2
+///   timer: `enabled && capacity >= 0 && interval > 0`. The reference's two
+///   never-post cases — a negative `Capacity` (`TimerIntf.cpp:76-84`) and a
+///   non-positive interval (`TimerImpl.cpp:125`) — keep the timer *unarmed*
+///   in L2 while the binding still reports `enabled = true`; writing a
+///   valid value arms it for real.
+/// * A transition into armed injects `now` and pushes the binding's current
+///   interval first, so the first fire is one interval after the write —
+///   the reference's `NextTick = GetTickCount() + Interval`
+///   (`TimerImpl.cpp:274-276`).
+/// * A transition out just drops the L2 deadline.
+/// * `rearm_interval` (set by the `interval` setter) additionally re-arms an
+///   already-armed timer from `now`, like `tTVPTimerThread::SetInterval`
+///   (`TimerImpl.cpp:294-301`) — cancelling that round's pending fire. A
+///   capacity or enabled write that changes nothing leaves a pending fire
+///   untouched (`SetCapacity` only stores).
+fn sync_schedule(services: &CompatServices, id: TimerId, now: u64, rearm_interval: bool) {
+    let (want, interval_ms, was_armed) = {
+        let state = services.state::<VisualState>();
+        let Some(binding) = state.timers.get(&id) else {
+            // The binding vanished re-entrantly (teardown during the write):
+            // there is nothing left to schedule.
+            return;
+        };
+        let interval_ms = armable_interval_ms(binding.interval_units);
+        let want = binding.enabled && binding.capacity >= 0 && interval_ms.is_some();
+        (want, interval_ms, binding.armed)
+    };
+    let Some(timer_ptr) = services.timer() else {
+        log::debug!("Timer {id:?}: no timer registry is attached; the schedule write is dropped");
+        return;
+    };
+    // SAFETY: `attach_timer` guarantees the pointer stays valid. The block
+    // below never invokes a callback (no script runs here), so no
+    // `VisualState` borrow is held across it either.
+    let timer = unsafe { &mut *timer_ptr };
+    match (was_armed, want) {
+        (false, true) => {
+            // Arm for real: inject the write's timestamp, push the binding's
+            // interval (L2 may never have seen the current value), then arm.
+            timer.set_now(now);
+            push_interval(timer, id, interval_ms);
+            push_enabled(timer, id, true);
+        }
+        (true, false) => push_enabled(timer, id, false),
+        // Staying armed: only an `interval` write re-arms from `now`.
+        (true, true) if rearm_interval => {
+            timer.set_now(now);
+            push_interval(timer, id, interval_ms);
+        }
+        // Staying disarmed: the binding's interval is pushed at the next
+        // arming, so L2 needs nothing now.
+        _ => {}
+    }
+    if was_armed != want {
+        let mut state = services.state::<VisualState>();
+        if let Some(binding) = state.timers.get_mut(&id) {
+            binding.armed = want;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Properties
+// ---------------------------------------------------------------------------
+
+/// `timer.interval` — the reference fixed-point readback converted to a
+/// double (`TimerIntf.cpp:186-188`): always a TJS `Real`.
 extern "C" fn timer_interval_get(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -164,19 +548,44 @@ extern "C" fn timer_interval_get(
         return report_error(out_error, "Timer.interval: compat context is not bound");
     };
     let inst = unsafe { &*(instance as *const TimerInst) };
-    let Some(id) = inst.id else {
-        set_int(out, 0);
-        return 0;
+    let units = match inst.id {
+        Some(id) => {
+            // SAFETY: the caller resolved `ctx` from the installed binding.
+            unsafe { ctx.services() }
+                .state::<VisualState>()
+                .timers
+                .get(&id)
+                .map_or(DEFAULT_INTERVAL_UNITS, |timer| timer.interval_units)
+        }
+        None => DEFAULT_INTERVAL_UNITS,
     };
-    // SAFETY: the caller resolved `ctx` from the installed binding.
-    let interval = unsafe { ctx.services() }
-        .timer()
-        .and_then(|timer| unsafe { &*timer }.interval_ms(id))
-        .unwrap_or(0);
-    set_int(out, interval as i64);
+    // Reference getter: `GetInterval() * (1.0 / (1 << 16))`
+    // (`TimerIntf.cpp:186-188`). The u64 → f64 conversion rounds to the
+    // nearest representable double exactly like the C++ one: for the wrapped
+    // `interval = -1` storage `2^64 - 65535` it lands on `2^64 - 65536`, so
+    // the readback is `(2^64 - 65536) / 65536 = 2^48 - 1 =
+    // 281474976710655.0`, not a hardcoded magic number.
+    set_real(out, units as f64 * (1.0 / SUBMILLI_SCALE));
     0
 }
 
+/// `timer.interval = v` — the reference fixed-point setter
+/// (`TimerIntf.cpp:196-197`) plus the L2 schedule update.
+///
+/// The script value is stored **verbatim** in the binding (scaled by
+/// `1 << 16` through `(tjs_int64)(v * 65536 + 0.5)` and reinterpreted as
+/// the reference's `tjs_uint64`, so negatives wrap just like in C++) and
+/// read back through the reference getter conversion. The schedule sync then
+/// derives L2's state from it:
+///
+/// * `> 0` on an armed timer → `ceil(units / 65536)` ms applied through
+///   `set_interval`, which re-arms from *this write's* timestamp like
+///   `tTVPTimerThread::SetInterval` (`TimerImpl.cpp:294-301`);
+/// * `<= 0` → the timer is **disarmed** instead: the reference thread skips
+///   a zero interval entirely (`TimerImpl.cpp:125`) and a negative value
+///   wraps to a ~8775-year interval, so in both cases the timer is "armed
+///   and enabled yet never fires" — expressed here by not arming the engine while
+///   the binding keeps reporting the script's `enabled`.
 extern "C" fn timer_interval_set(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -187,22 +596,54 @@ extern "C" fn timer_interval_set(
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Timer.interval: compat context is not bound");
     };
-    let interval = value_as_i64(unsafe { &*value }).max(1) as u64;
+    let requested = value_as_f64(unsafe { &*value });
     let inst = unsafe { &*(instance as *const TimerInst) };
     let Some(id) = inst.id else {
         return 0;
     };
     // SAFETY: the caller resolved `ctx` from the installed binding.
     let services = unsafe { ctx.services() };
+    // Reference setter (`TimerIntf.cpp:196-197`):
+    //   double interval = (double)*param * (1 << TVP_SUBMILLI_FRAC_BITS);
+    //   SetInterval((tjs_int64)(interval + 0.5));
+    // with `SetInterval` taking a `tjs_uint64` (`TimerImpl.h:30`), i.e. the
+    // signed result is reinterpreted modulo 2^64. Rust's `f64 as i64` cast
+    // saturates where the C++ cast is undefined for out-of-range operands
+    // (x86 yields `i64::MIN`); every in-range value — including `-1`,
+    // which stores `2^64 - 65535` — converts identically.
+    let units = ((requested * SUBMILLI_SCALE) + 0.5) as i64 as u64;
     let now = services.state::<VisualState>().clock.now_ms();
-    if let Some(timer) = services.timer() {
-        // SAFETY: `attach_timer` guarantees the pointer stays valid.
-        let _ = unsafe { &mut *timer }.set_interval(id, interval, now);
+    {
+        let mut state = services.state::<VisualState>();
+        let Some(binding) = state.timers.get_mut(&id) else {
+            return 0;
+        };
+        // Verbatim: no clamping, no normalisation — the getter's reference
+        // conversion reproduces exactly this storage.
+        binding.interval_units = units;
     }
+    sync_schedule(services, id, now, true);
     0
 }
 
-/// `timer.enabled`.
+/// TJS `(double)*param` coercion for the interval setter
+/// (`TimerIntf.cpp:196`): reals pass through, integers widen, numeric
+/// strings parse (`0.0` for anything else, like `AsReal` on a non-numeric
+/// variant).
+fn value_as_f64(v: &Value) -> f64 {
+    match v.ty {
+        VAL_REAL => v.real,
+        VAL_INTEGER => v.integer as f64,
+        VAL_STRING => value_as_string(v).parse().unwrap_or(0.0),
+        _ => 0.0,
+    }
+}
+
+/// `timer.enabled` — what the script set (`TimerIntf.cpp:204-208`), read
+/// back **verbatim** from the binding: a timer the script enabled reports
+/// `true` even while the never-post conditions keep L2 un-armed, because
+/// the reference's `Enabled` is independent of what the timer thread does
+/// with it.
 extern "C" fn timer_enabled_get(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -214,19 +655,25 @@ extern "C" fn timer_enabled_get(
         return report_error(out_error, "Timer.enabled: compat context is not bound");
     };
     let inst = unsafe { &*(instance as *const TimerInst) };
-    let Some(id) = inst.id else {
-        set_bool(out, false);
-        return 0;
+    let enabled = match inst.id {
+        Some(id) => {
+            // SAFETY: the caller resolved `ctx` from the installed binding.
+            unsafe { ctx.services() }
+                .state::<VisualState>()
+                .timers
+                .get(&id)
+                .is_some_and(|binding| binding.enabled)
+        }
+        None => false,
     };
-    // SAFETY: the caller resolved `ctx` from the installed binding.
-    let enabled = unsafe { ctx.services() }
-        .timer()
-        .and_then(|timer| unsafe { &*timer }.is_enabled(id))
-        .unwrap_or(false);
     set_bool(out, enabled);
     0
 }
 
+/// `timer.enabled = v` — store the script value verbatim and re-derive the
+/// L2 arming (the schedule sync disarms unless `capacity >= 0` and the
+/// interval is positive, so `enabled = true` on a never-post timer changes
+/// the binding only).
 extern "C" fn timer_enabled_set(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -240,19 +687,32 @@ extern "C" fn timer_enabled_set(
     let enabled = value_as_bool(unsafe { &*value });
     let inst = unsafe { &*(instance as *const TimerInst) };
     let Some(id) = inst.id else {
+        log::debug!("Timer.enabled -> {enabled} but the instance has no id");
         return 0;
     };
     // SAFETY: the caller resolved `ctx` from the installed binding.
     let services = unsafe { ctx.services() };
     let now = services.state::<VisualState>().clock.now_ms();
-    if let Some(timer) = services.timer() {
-        // SAFETY: `attach_timer` guarantees the pointer stays valid.
-        let _ = unsafe { &mut *timer }.set_enabled(id, enabled, now);
+    {
+        let mut state = services.state::<VisualState>();
+        let Some(binding) = state.timers.get_mut(&id) else {
+            return 0;
+        };
+        binding.enabled = enabled;
     }
+    sync_schedule(services, id, now, false);
+    let armed = services
+        .state::<VisualState>()
+        .timers
+        .get(&id)
+        .map(|binding| binding.armed);
+    log::debug!("Timer {id:?}: enabled -> {enabled} (engine armed: {armed:?})");
     0
 }
 
-/// `timer.capacity`.
+/// `timer.capacity` — the script-visible reference `Capacity` (default 6),
+/// read back **verbatim** including `0` and negatives
+/// (`TimerIntf.cpp:222-236`, `TimerIntf.h:63`).
 extern "C" fn timer_capacity_get(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -265,18 +725,31 @@ extern "C" fn timer_capacity_get(
     };
     let inst = unsafe { &*(instance as *const TimerInst) };
     let Some(id) = inst.id else {
-        set_int(out, 1);
+        set_int(out, DEFAULT_TIMER_CAPACITY);
         return 0;
     };
     // SAFETY: the caller resolved `ctx` from the installed binding.
     let capacity = unsafe { ctx.services() }
-        .timer()
-        .and_then(|timer| unsafe { &*timer }.capacity(id))
-        .unwrap_or(1);
-    set_int(out, i64::from(capacity));
+        .state::<VisualState>()
+        .timers
+        .get(&id)
+        .map_or(DEFAULT_TIMER_CAPACITY, |timer| timer.capacity);
+    set_int(out, capacity);
     0
 }
 
+/// `timer.capacity = n` — store the script value verbatim and re-derive the
+/// L2 arming.
+///
+/// Reference `SetCapacity` only stores the value (`TimerIntf.cpp:234-236`);
+/// it is interpreted at fire time (`TimerIntf.cpp:69-92`), where a
+/// **negative** capacity makes `more = cap - queued <= 0`, so no `onTimer`
+/// is ever posted while the timer itself keeps running — expressed here by
+/// *disarming* L2 while the binding keeps reporting `enabled = true`. `0`
+/// is the reference "no limit" sentinel (`TimerIntf.cpp:77`) and every
+/// positive value merely bounds the *queued* events (empty under
+/// synchronous dispatch), so neither stops delivery: writing one arms the
+/// timer for real if the script enabled it.
 extern "C" fn timer_capacity_set(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -287,16 +760,24 @@ extern "C" fn timer_capacity_set(
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Timer.capacity: compat context is not bound");
     };
-    let capacity = value_as_i64(unsafe { &*value }).clamp(1, i64::from(u32::MAX)) as u32;
+    // Verbatim: no `clamp` — a negative script value must survive for the
+    // getter (`TimerIntf.cpp:233` stores `*param` as written).
+    let requested = value_as_i64(unsafe { &*value });
     let inst = unsafe { &*(instance as *const TimerInst) };
     let Some(id) = inst.id else {
         return 0;
     };
     // SAFETY: the caller resolved `ctx` from the installed binding.
-    if let Some(timer) = unsafe { ctx.services() }.timer() {
-        // SAFETY: `attach_timer` guarantees the pointer stays valid.
-        let _ = unsafe { &mut *timer }.set_capacity(id, capacity);
+    let services = unsafe { ctx.services() };
+    let now = services.state::<VisualState>().clock.now_ms();
+    {
+        let mut state = services.state::<VisualState>();
+        let Some(binding) = state.timers.get_mut(&id) else {
+            return 0;
+        };
+        binding.capacity = requested;
     }
+    sync_schedule(services, id, now, false);
     0
 }
 
@@ -352,65 +833,39 @@ extern "C" fn timer_mode_set(
     0
 }
 
-/// Fire every due timer (`FrameBody::timer_poll`). Returns whether any timer
-/// remains enabled (the `system::continuous_handler_poll` convention).
-#[allow(dead_code)]
+/// Fire every due timer (`FrameBody::timer_poll`): advance the L2 registry
+/// to the clock's `now_ms` — its callbacks dispatch `onTimer` themselves
+/// (see [`timer_callback`]) — and return whether any timer remains **armed**
+/// (the `system::continuous_handler_poll` convention): a timer the script
+/// disabled or that the reference would never post (negative capacity,
+/// non-positive interval) does not keep the frame loop polling.
+///
+/// Delivery failures inside the callbacks are logged by
+/// [`dispatch_on_timer`] and never disable the timer — the reference has no
+/// disable-on-error path in `TimerIntf.cpp`/`TimerImpl.cpp`.
 pub fn timer_poll(ctx: &mut CompatCtx) -> Result<bool, CompatError> {
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
-    let host = unsafe { ctx.engine() };
     let services = unsafe { ctx.services() };
+    // The clock borrow ends at this statement — before any callback can
+    // re-enter `state::<VisualState>()`.
     let now = services.state::<VisualState>().clock.now_ms();
     let Some(timer_ptr) = services.timer() else {
         return Err(CompatError::Engine("timer registry is not attached".into()));
     };
-    // Advance the L2 registry; it reports the due timers and their counts.
-    // SAFETY: `attach_timer` guarantees the pointer stays valid.
-    let due = unsafe { &mut *timer_ptr }.advance(now);
-    for fire in due {
-        let id = fire.id;
-        // Dispatch the object's `onTimer` member (a script subclass override
-        // wins); fall back to the callback when the owner could not be
-        // retained.
-        let owner = {
-            let state = services.state::<VisualState>();
-            state
-                .timers
-                .get(&id)
-                .and_then(|timer| timer.owner.as_ref().map(DetachedValue::raw_id))
-        };
-        let result = match owner {
-            Some(owner) => host.call_member(owner, "onTimer", &[]),
-            None => {
-                let callback = {
-                    let mut state = services.state::<VisualState>();
-                    state
-                        .timers
-                        .get_mut(&id)
-                        .and_then(|timer| timer.callback.take())
-                };
-                match callback {
-                    Some(callback) => {
-                        let result = host.call_detached(&callback, &[]);
-                        let mut state = services.state::<VisualState>();
-                        match state.timers.get_mut(&id) {
-                            Some(timer) => timer.callback = Some(callback),
-                            None => drop(callback),
-                        }
-                        result
-                    }
-                    None => continue,
-                }
-            }
-        };
-        if let Err(error) = result {
-            let interval = unsafe { &*timer_ptr }.interval_ms(id).unwrap_or(0);
-            log::warn!("Timer {id:?}: onTimer failed ({error}) after {interval} ms; disabling");
-            // SAFETY: the pointer is still attached.
-            let _ = unsafe { &mut *timer_ptr }.set_enabled(id, false, now);
-        }
+    // SAFETY: `attach_timer` guarantees the pointer stays valid; the
+    // callbacks invoked inside `advance` re-enter through the same handle
+    // strictly sequentially (the single-threaded attach contract).
+    let fired = unsafe { &mut *timer_ptr }.advance(now);
+    if fired > 0 {
+        log::debug!("timer_poll: {fired} timer(s) fired at {now}");
     }
-    // SAFETY: the pointer is still attached.
-    Ok(unsafe { &*timer_ptr }.any_enabled())
+    // L3 mirrors what it pushed to L2 (`TimerBinding::armed`).
+    let any_armed = services
+        .state::<VisualState>()
+        .timers
+        .values()
+        .any(|binding| binding.armed);
+    Ok(any_armed)
 }
 
 pub(super) fn register_timer_class(ctx: &mut CompatCtx) -> Result<(), CompatError> {
@@ -418,7 +873,7 @@ pub(super) fn register_timer_class(ctx: &mut CompatCtx) -> Result<(), CompatErro
         name: "Timer",
         create: timer_create,
         destroy: timer_destroy,
-        invalidate: None,
+        invalidate: Some(timer_invalidate),
         methods: vec![
             NativeInstanceMethodDef {
                 name: "Timer",
@@ -429,12 +884,11 @@ pub(super) fn register_timer_class(ctx: &mut CompatCtx) -> Result<(), CompatErro
                 f: timer_on_timer,
             },
         ],
+        // Exactly the reference member set: constructor, `onTimer` and the
+        // four properties (`TimerIntf.cpp:137-259`). No `id`, no `count`,
+        // no `action`, no `cancel` — a compatible emulator exposes nothing
+        // beyond the reference surface.
         properties: vec![
-            NativeInstancePropertyDef {
-                name: "id",
-                get: Some(timer_id_get),
-                set: None,
-            },
             NativeInstancePropertyDef {
                 name: "interval",
                 get: Some(timer_interval_get),
@@ -457,16 +911,4 @@ pub(super) fn register_timer_class(ctx: &mut CompatCtx) -> Result<(), CompatErro
             },
         ],
     })
-}
-
-extern "C" fn timer_id_get(
-    _engine: *mut c_void,
-    instance: *mut c_void,
-    out: *mut Value,
-    _out_error: *mut *mut c_char,
-    _objthis: *mut c_void,
-) -> c_int {
-    let inst = unsafe { &*(instance as *const TimerInst) };
-    set_int(out, inst.id.map_or(0, |id| id.value() as i64));
-    0
 }

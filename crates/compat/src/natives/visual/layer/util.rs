@@ -8,7 +8,7 @@ use api::blend::BlendMode;
 use engine::input::InputState;
 use engine::layer_ops::RectI;
 use engine::{BitmapState, Scene};
-use tjs::{RetainedValue, Tjs2Engine, TjsValue, VAL_OBJECT, VAL_REAL, VAL_VOID, Value};
+use tjs::{RetainedValue, Tjs2Engine, TjsValue, VAL_OBJECT, VAL_REAL, VAL_STRING, VAL_VOID, Value};
 
 use super::super::common::{VisualState, resolve_object_id, scene_ref};
 use crate::CompatCtx;
@@ -23,12 +23,69 @@ pub(super) fn opt_i64(a: &[Value], index: usize, default: i64) -> i64 {
 }
 
 /// TJS numeric coercion.
+///
+/// Port of `tTJSVariant::AsReal`
+/// (`reference/cpp/core/tjs2/tjsVariant.h:937-956`): integers and reals
+/// convert directly, `void` is `0.0`, and a **string parses like a number**
+/// (`String->ToReal()`, `tjsVariant.cpp:1006-1013` — the lexer's number
+/// grammar followed by `TJSStringToReal`, so the leading numeric token wins
+/// and trailing garbage is ignored). Objects would raise
+/// `TJSThrowVariantConvertError` in the reference; this loose form keeps
+/// returning `0.0`, mirroring [`crate::natives::system::value_as_i64`].
 pub(super) fn value_as_f64(v: &Value) -> f64 {
     match v.ty {
         tjs::VAL_INTEGER => v.integer as f64,
         VAL_REAL => v.real,
+        VAL_STRING => string_to_real(&crate::native_util::value_as_string(v)),
         _ => 0.0,
     }
+}
+
+/// The reference `TJSStringToReal` behaviour: parse the leading numeric
+/// token of `s` (sign, digits, fraction, exponent) and ignore the rest;
+/// anything unparsable yields `0.0`.
+fn string_to_real(s: &str) -> f64 {
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
+        i += 1;
+    }
+    let mut seen_digit = false;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+        seen_digit = true;
+    }
+    if i < bytes.len() && bytes[i] == b'.' {
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+            seen_digit = true;
+        }
+    }
+    if seen_digit && i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
+        let save = i;
+        i += 1;
+        if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
+            i += 1;
+        }
+        let mut exp_digit = false;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+            exp_digit = true;
+        }
+        if !exp_digit {
+            i = save;
+        }
+    }
+    if !seen_digit {
+        return 0.0;
+    }
+    // The slice is a well-formed float literal by construction; a failure
+    // (e.g. exponent overflow) still parses as an infinite/`f64` value.
+    s[..i].trim().parse::<f64>().unwrap_or(0.0)
 }
 
 /// TJS numeric coercion for a real-valued default.
@@ -45,14 +102,6 @@ pub(super) fn opt_bool(a: &[Value], index: usize, default: bool) -> bool {
         Some(v) if v.ty != VAL_VOID => value_as_bool(v),
         _ => default,
     }
-}
-
-/// The whole bitmap as a half-open `RectI`.
-#[allow(dead_code)]
-pub(super) fn full_rect(bitmap: &BitmapState) -> RectI {
-    let w = bitmap.width.min(i32::MAX as u32) as i32;
-    let h = bitmap.height.min(i32::MAX as u32) as i32;
-    (0, 0, w, h)
 }
 
 /// Normalise a rectangle so `right >= left` and `bottom >= top`.
@@ -163,16 +212,74 @@ pub(super) fn main_bitmap(scene: &Scene, layer_id: u32, method: &str) -> Result<
         .ok_or_else(|| format!("Layer.{method}: this layer has no main image"))
 }
 
+/// The scene id of `value` when it is a native instance of `class` — the
+/// strict object→class check the reference performs with
+/// `TJS_NIS_GETINSTANCE` before any legacy member fallback
+/// (`reference/cpp/core/visual/LayerIntf.cpp:8745-8752`). `None` for a
+/// non-object, a plain script object or an instance of another class.
+fn native_class_id(host: &Tjs2Engine, value: &Value, class: &str) -> Result<Option<u32>, String> {
+    if value.ty != VAL_OBJECT {
+        return Ok(None);
+    }
+    let object = host.retain_object_arg(value)?;
+    let Some(payload) = host.native_instance_payload(object.raw_id(), class)? else {
+        return Ok(None);
+    };
+    let id = match class {
+        "Layer" => super::layer_payload_id(payload.as_ptr()),
+        "Bitmap" => super::super::bitmap::bitmap_payload_id(payload.as_ptr()),
+        _ => None,
+    };
+    Ok(id)
+}
+
 /// Resolve a `Layer` or `Bitmap` script argument to a scene bitmap id, plus
 /// the source layer's generic blend when the argument is a `Layer` (needed
 /// for the `omAuto` operation-mode default).
+///
+/// `layer_only` reproduces the reference split between
+/// `TVPSpecifyLayer` (`LayerIntf.cpp:8740-8756`: `pileRect`, `blendRect`,
+/// `piledCopy`, `stretchPile`, `stretchBlend`, `affinePile`, `affineBlend`
+/// accept **only** a Layer object) and `TVPSpecifyLayerOrBitmap`
+/// (`LayerIntf.cpp:8796-8831`: `copyRect`, `operateRect`, … also accept a
+/// `Bitmap`): a `Bitmap` argument for a Layer-only member is an error, not
+/// a silent success.
 pub(super) fn resolve_source_bitmap(
     ctx: &CompatCtx,
     host: &Tjs2Engine,
     value: &Value,
     method: &str,
+    layer_only: bool,
 ) -> Result<(u32, Option<BlendMode>), String> {
-    let id = resolve_object_id(host, value)?;
+    // The reference resolves an object argument by native class, Layer first
+    // and then Bitmap (`LayerIntf.cpp:8796-8831`). The native-instance check
+    // runs before the legacy id path so a Bitmap whose scene id collides with
+    // a Layer is never mistaken for one.
+    if let Some(layer_id) = native_class_id(host, value, "Layer")? {
+        let scene = scene_ref(ctx)?;
+        let layer = scene
+            .layer(layer_id)
+            .ok_or_else(|| format!("Layer.{method}: the source layer no longer exists"))?;
+        let bitmap = layer
+            .bitmap
+            .ok_or_else(|| format!("Layer.{method}: the source layer has no main image"))?;
+        return Ok((bitmap, Some(layer.blend)));
+    }
+    if let Some(bitmap_id) = native_class_id(host, value, "Bitmap")? {
+        if layer_only {
+            return Err(format!("Layer.{method}: the source must be a Layer object"));
+        }
+        let scene = scene_ref(ctx)?;
+        if scene.bitmap(bitmap_id).is_none() {
+            return Err(format!(
+                "Layer.{method}: the source bitmap {bitmap_id} does not exist"
+            ));
+        }
+        return Ok((bitmap_id, None));
+    }
+    // Legacy form: a numeric scene id or a plain script object carrying its
+    // own `nativeId`/`id` member.
+    let id = resolve_object_id(host, value, &["Layer", "Bitmap"])?;
     if id < 0 {
         return Err(format!(
             "Layer.{method}: the source is not a Layer or Bitmap object"
@@ -194,6 +301,9 @@ pub(super) fn resolve_source_bitmap(
             .bitmap
             .ok_or_else(|| format!("Layer.{method}: the source layer has no main image"))?;
         return Ok((bitmap, Some(layer.blend)));
+    }
+    if layer_only {
+        return Err(format!("Layer.{method}: the source must be a Layer object"));
     }
     if scene.bitmap(id).is_none() {
         return Err(format!(
@@ -235,43 +345,6 @@ pub(super) fn with_two_bitmaps<R>(
     }
 }
 
-/// Snapshot the alpha plane of `rect` (used to emulate the reference
-/// `hold_alpha` for operations whose L2 primitive has no `hold_alpha`
-/// argument).
-#[allow(dead_code)]
-pub(super) fn snapshot_alpha(bitmap: &BitmapState, rect: RectI) -> Vec<u8> {
-    let Some(r) = engine::layer_ops::intersect(bitmap, rect) else {
-        return Vec::new();
-    };
-    let width = bitmap.width as usize;
-    let mut out = Vec::with_capacity(((r.2 - r.0) * (r.3 - r.1)) as usize);
-    for y in r.1..r.3 {
-        for x in r.0..r.2 {
-            out.push(bitmap.rgba[(y as usize * width + x as usize) * 4 + 3]);
-        }
-    }
-    out
-}
-
-/// Restore an alpha snapshot taken by [`snapshot_alpha`].
-#[allow(dead_code)]
-pub(super) fn restore_alpha(bitmap: &mut BitmapState, rect: RectI, saved: &[u8]) {
-    let Some(r) = engine::layer_ops::intersect(bitmap, rect) else {
-        return;
-    };
-    let width = bitmap.width as usize;
-    let mut index = 0;
-    for y in r.1..r.3 {
-        for x in r.0..r.2 {
-            if let Some(&alpha) = saved.get(index) {
-                bitmap.rgba[(y as usize * width + x as usize) * 4 + 3] = alpha;
-            }
-            index += 1;
-        }
-    }
-    bitmap.mark_dirty();
-}
-
 /// Map a source layer's generic [`BlendMode`] to the operation mode the
 /// reference `GetOperationModeFromType` produces.
 ///
@@ -307,17 +380,6 @@ pub(super) fn set_rect_ltrb_out(
     out: *mut Value,
     rect: Option<(i32, i32, i32, i32)>,
 ) {
-    let Some((left, top, right, bottom)) = rect else {
-        crate::native_util::set_void(out);
-        return;
-    };
-    set_rect_fields(host, out, left, top, right, bottom);
-}
-
-/// Marshal a half-open `[left, right) x [top, bottom)` rectangle into a fresh
-/// `Rect` object.
-#[allow(dead_code)]
-pub(super) fn set_region_out(host: &Tjs2Engine, out: *mut Value, rect: Option<RectI>) {
     let Some((left, top, right, bottom)) = rect else {
         crate::native_util::set_void(out);
         return;
@@ -365,10 +427,4 @@ fn set_rect_fields(
     }
     set_retained_out(out, object.raw_id());
     std::mem::forget(object);
-}
-
-/// Whether a script value is a non-null object (used for optional Rect args).
-#[allow(dead_code)]
-pub(super) fn is_object(value: &Value) -> bool {
-    value.ty == VAL_OBJECT && !value.object_handle().is_null()
 }

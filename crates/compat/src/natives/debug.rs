@@ -1,6 +1,6 @@
 //! `Debug` native class.
 //!
-//! Behavioral reference: `main`'s `crates/tvp-natives/src/debug.rs` (itself a
+//! Behavioral reference: `crates/tvp-natives/src/debug.rs` (itself a
 //! port of `reference/cpp/core/utils/DebugIntf.cpp`). This is a
 //! reimplementation on the layered API: all logging state lives in
 //! [`CompatServices::state`], never in a process global.
@@ -25,11 +25,16 @@
 //!
 //! # Log flow
 //!
-//! `message`/`notice` write to the `log` crate (`message` at `info!` — or
-//! `error!` while [`logAsError`] is true — `notice` at `debug!`), append to the
-//! file opened by `startLogToFile`, push to an in-memory ring buffer (cap 100)
-//! read by `getLastLog`, and dispatch the string to every retained
-//! `addLoggingHandler` callback. The handlers are matched by closure identity,
+//! `message`/`notice` write to the `log` crate (`message` at `info!`,
+//! `notice` at `debug!`), push to an in-memory ring buffer (the reference's
+//! `TVPLogMaxLines + 100` cap, `DebugIntf.cpp:43`, `376`), append to the file
+//! opened by `startLogToFile` — when a `logLocation` is configured — and
+//! dispatch the line to every retained `addLoggingHandler` callback. Like the
+//! reference (`TVPAddLog`, `DebugIntf.cpp:331-393`), the file and the
+//! handlers see `" " + line` while the ring buffer stores the raw line, and
+//! `getLastLog` formats `Time + ' ' + Log + "\r\n"` per entry
+//! (`DebugIntf.cpp:419-459`, `TJS_TEXT_OUT_CRLF` from
+//! `core/CMakeLists.txt:39`). The handlers are matched by closure identity,
 //! so `removeLoggingHandler` retires exactly the callback it names and a
 //! duplicate registration is ignored.
 
@@ -41,15 +46,38 @@ use std::io::Write;
 use tjs::{
     DetachedValue, NativeClassBuilder, NativeInstanceBuilder, NativeInstanceMethodDef,
     NativeInstancePropertyDef, NativeMethodDef, NativePropertyDef, RetainedValue, Tjs2Engine,
-    TjsValue, VAL_OBJECT, VAL_RETAINED, Value,
+    TjsValue, VAL_NULL, VAL_OBJECT, VAL_RETAINED, Value,
 };
 
-use super::system::{resolve, set_string_out, value_as_bool, value_as_i64};
+use super::system::{resolve, set_string_out, try_value_as_i64, value_as_bool};
 use crate::native_util::{args, report_error, set_bool, set_void, value_as_string};
+use crate::natives::storages::normalize_storage_name;
 use crate::{CompatCtx, CompatError, CompatServices};
 
-/// Maximum number of entries kept in the `getLastLog` ring buffer.
-const LOG_BUFFER_CAP: usize = 100;
+/// The reference `TVPLogMaxLines` (`utils/DebugIntf.cpp:43`).
+const TVP_LOG_MAX_LINES: usize = 2048;
+
+/// Maximum number of entries kept in the `getLastLog` ring buffer — the
+/// reference evicts once the deque reaches `TVPLogMaxLines + 100`
+/// (`utils/DebugIntf.cpp:376`).
+const LOG_BUFFER_CAP: usize = TVP_LOG_MAX_LINES + 100;
+
+/// How many of the oldest entries are dropped at once once the buffer reaches
+/// `LOG_BUFFER_CAP` (`DebugIntf.cpp:373-379`).
+const LOG_EVICT_BATCH: usize = 100;
+
+/// The lines `TVPStartLogToFile` rolls back into the file
+/// (`TVPLogToFileRollBack`, `utils/DebugIntf.cpp:48`, `497`).
+const LOG_TO_FILE_ROLLBACK: usize = 100;
+
+/// The reference `TVPSeparatorCRLF` written when the log stream opens
+/// (`base/MsgIntfInc.h:160-164`).
+const LOG_OPEN_SEPARATOR: &str = "\r\n\r\n\r\n=========================================================\r\n=========================================================\r\n";
+
+/// The reference dashed separator written by `TVPStartLogToFile`
+/// (`utils/DebugIntf.cpp:489-496`).
+const LOG_START_SEPARATOR: &str =
+    "\r\n------------------------------------------------------------\r\n";
 
 /// One retained `addLoggingHandler` callback: the closure plus its
 /// `(Object, ObjThis)` identity, so removal matches exactly.
@@ -64,11 +92,19 @@ struct LoggingHandler {
 struct DebugState {
     /// File opened by `startLogToFile`; `message`/`notice` append to it.
     log_file: Option<File>,
-    /// Ring buffer of recent `message`/`notice` strings.
-    log_buffer: VecDeque<String>,
-    /// When true, `message` logs at `error!` instead of `info!`.
-    log_as_error: bool,
-    /// `Debug.logLocation`.
+    /// The reference `TVPLoggingToFile` flag — set even when no location is
+    /// configured (the reference opens no stream then, `DebugIntf.cpp:241-244`).
+    logging_to_file: bool,
+    /// The reference `OpenFailed`: stop retrying an unopenable log file until
+    /// the location changes (`DebugIntf.cpp:234-236`, `293-295`).
+    log_open_failed: bool,
+    /// Ring buffer of recent `(time, line)` entries as `TVPAddLog` stores them
+    /// (`DebugIntf.cpp:356`).
+    log_buffer: VecDeque<(String, String)>,
+    /// The accumulated "important" log (`notice` → `TVPImportantLogs`,
+    /// `DebugIntf.cpp:358-363`), flushed by `startLogToFile`.
+    important_log: String,
+    /// `Debug.logLocation` (reference `TVPLogLocation`, default empty).
     log_location: String,
     /// `Debug.logToFileOnError`.
     log_to_file_on_error: bool,
@@ -93,27 +129,146 @@ fn join_args(a: &[Value]) -> String {
     parts.join(", ")
 }
 
-/// Push `text` into the ring buffer, dropping the oldest entry past the cap.
-fn push_log(services: &CompatServices, text: &str) {
-    let mut state = services.state::<DebugState>();
-    if state.log_buffer.len() >= LOG_BUFFER_CAP {
-        state.log_buffer.pop_front();
-    }
-    state.log_buffer.push_back(text.to_string());
+/// Epoch seconds now, floored at the epoch if the clock predates 1970.
+fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
 }
 
-/// Append `text` to the file opened by `startLogToFile`, if any.
+/// `HH:MM:SS` of the current time. The fields are UTC because `std` has no
+/// local-time API; the tests cross-check them against `gmtime_r`.
+fn log_timestamp() -> String {
+    let secs = now_epoch_secs() % 86_400;
+    format!(
+        "{:02}:{:02}:{:02}",
+        secs / 3600,
+        (secs % 3600) / 60,
+        secs % 60
+    )
+}
+
+/// Weekday and month names as `asctime` spells them.
+const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// Epoch days to `(year, month, day, weekday)`, weekday 0 = Sunday.
+fn civil_from_days(days: i64) -> (i64, u32, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let day = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let year = if month <= 2 { y + 1 } else { y };
+    let weekday = (days + 4).rem_euclid(7); // 1970-01-01 was a Thursday
+    (year, month as u32, day as u32, weekday as u32)
+}
+
+/// `asctime`-shaped `Www Mmm dd hh:mm:ss yyyy` for the log-file opener.
+fn log_date_time() -> String {
+    let secs = now_epoch_secs();
+    let (year, month, day, weekday) = civil_from_days((secs / 86_400) as i64);
+    let tod = secs % 86_400;
+    format!(
+        "{} {} {:>2} {:02}:{:02}:{:02} {}",
+        WEEKDAYS[weekday as usize],
+        MONTHS[(month - 1) as usize],
+        day,
+        tod / 3600,
+        (tod % 3600) / 60,
+        tod % 60,
+        year
+    )
+}
+
+/// Push `text` into the ring buffer with its reference timestamp, then drop
+/// the oldest entries a hundred at a time while the buffer is at or over its
+/// cap, so it holds between `TVP_LOG_MAX_LINES` and `LOG_BUFFER_CAP - 1`
+/// entries (`tTVPLogDeque`, `DebugIntf.cpp:373-379`).
+fn push_log(services: &CompatServices, text: &str) {
+    let timestamp = log_timestamp();
+    let mut state = services.state::<DebugState>();
+    state.log_buffer.push_back((timestamp, text.to_string()));
+    while state.log_buffer.len() >= LOG_BUFFER_CAP {
+        state.log_buffer.drain(..LOG_EVICT_BATCH);
+    }
+}
+
+/// Open (or reopen) the reference log stream: `{location}/krkr.console.log`
+/// (`tTVPLogStreamHolder::Open`, `DebugIntf.cpp:240-296`) — an empty
+/// `logLocation` means no stream at all (`DebugIntf.cpp:241-244`), and a
+/// failed open is remembered so later lines do not retry
+/// (`DebugIntf.cpp:234-236`). On success the reference writes its separator
+/// and a `Logging to ... started on ...` header (`DebugIntf.cpp:267-290`);
+/// the UTF-16 `ff fe` BOM is omitted because this port's stream is UTF-8.
+fn open_log_file(state: &mut DebugState, truncate: bool) {
+    if state.log_open_failed {
+        return;
+    }
+    if state.log_location.is_empty() {
+        state.log_file = None;
+        state.log_open_failed = true;
+        return;
+    }
+    let mut native = state.log_location.clone();
+    if !native.ends_with('/') {
+        native.push('/');
+    }
+    let filename = format!("{native}/krkr.console.log");
+    let opened = if truncate {
+        File::create(&filename)
+    } else {
+        OpenOptions::new().create(true).append(true).open(&filename)
+    };
+    match opened {
+        Ok(mut file) => {
+            let header = format!(
+                "{LOG_OPEN_SEPARATOR}Logging to {filename} started on {}\r\n",
+                log_date_time()
+            );
+            let _ = file.write_all(header.as_bytes());
+            let _ = file.flush();
+            state.log_file = Some(file);
+        }
+        Err(e) => {
+            log::warn!("Debug: failed to open {filename:?}: {e}");
+            state.log_file = None;
+            state.log_open_failed = true;
+        }
+    }
+}
+
+/// Append `text` to the log file the way `TVPLogStreamHolder.Log` does
+/// (`DebugIntf.cpp:312-340`): the stored line is prefixed with a space
+/// (`TVPAddLog`'s `buf`, `DebugIntf.cpp:377-391` — the timestamp copy there is
+/// commented out) and the line ends with `\r\n`. The stream opens lazily on
+/// the first line while logging is enabled.
 fn write_log_file(services: &CompatServices, text: &str) {
     let mut state = services.state::<DebugState>();
+    if !state.logging_to_file {
+        return;
+    }
+    if state.log_file.is_none() && !state.log_open_failed {
+        open_log_file(&mut state, false);
+    }
     if let Some(file) = state.log_file.as_mut() {
-        let _ = writeln!(file, "{text}");
+        let _ = write!(file, " {text}\r\n");
         let _ = file.flush();
     }
 }
 
 /// Dispatch `text` to every registered logging handler. The handler list is
 /// moved out of the state while the callbacks run so a handler that itself
-/// logs cannot borrow the state re-entrantly.
+/// logs cannot borrow the state re-entrantly. Like the reference
+/// (`_TVPDeliverLoggingEvent` fed by `TVPOnLog(buf)`,
+/// `DebugIntf.cpp:122-147`, `386`), the handler receives `" " + line` as its
+/// single argument.
 fn dispatch_logging_handlers(ctx: &CompatCtx, text: &str) {
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
     let services = unsafe { ctx.services() };
@@ -127,7 +282,8 @@ fn dispatch_logging_handlers(ctx: &CompatCtx, text: &str) {
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
     let engine = unsafe { ctx.engine() };
     for handler in &handlers {
-        if let Err(e) = engine.call_detached(&handler.value, &[TjsValue::String(text.to_string())])
+        if let Err(e) =
+            engine.call_detached(&handler.value, &[TjsValue::String(format!(" {text}"))])
         {
             log::debug!("Debug logging handler failed: {e}");
         }
@@ -159,13 +315,8 @@ extern "C" fn native_message(
     let services = unsafe { ctx.services() };
     push_log(services, &text);
     write_log_file(services, &text);
-    let as_error = services.state::<DebugState>().log_as_error;
     dispatch_logging_handlers(&ctx, &text);
-    if as_error {
-        log::error!("{text}");
-    } else {
-        log::info!("{text}");
-    }
+    log::info!("{text}");
     set_void(out);
     0
 }
@@ -188,6 +339,16 @@ extern "C" fn native_notice(
     let ctx = resolved.ctx();
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
     let services = unsafe { ctx.services() };
+    // `TVPAddImportantLog` also accumulates `Time ! line` into
+    // `TVPImportantLogs` (`DebugIntf.cpp:358-363`), which `startLogToFile`
+    // flushes into the file.
+    {
+        let mut state = services.state::<DebugState>();
+        let timestamp = log_timestamp();
+        state
+            .important_log
+            .push_str(&format!("{timestamp} ! {text}\r\n"));
+    }
     push_log(services, &text);
     write_log_file(services, &text);
     dispatch_logging_handlers(&ctx, &text);
@@ -196,11 +357,53 @@ extern "C" fn native_notice(
     0
 }
 
-/// `Debug.startLogToFile(filename)` → void
-///
-/// Opens `filename` in append mode; subsequent `message`/`notice` calls also
-/// write there. A second call while already logging is ignored (reference
-/// behavior); an open failure logs a warning and leaves logging off.
+/// The shared body of `TVPStartLogToFile(clear)` (`DebugIntf.cpp:471-506`):
+/// ignored while already logging, optionally truncates the stream, then
+/// flushes the accumulated important log, the dashed separator and the last
+/// `TVPLogToFileRollBack` lines.
+fn start_log_file(services: &CompatServices, clear: bool) {
+    let mut state = services.state::<DebugState>();
+    // `if(TVPLoggingToFile) return;` runs *before* the clear
+    // (`DebugIntf.cpp:478-481`).
+    if state.logging_to_file {
+        return;
+    }
+    if clear {
+        // `TVPLogStreamHolder.Clear()`: close and reopen truncated
+        // (`DebugIntf.cpp:303-310`).
+        state.log_file = None;
+        state.log_open_failed = false;
+        open_log_file(&mut state, true);
+    }
+    state.logging_to_file = true;
+    if state.log_file.is_none() {
+        open_log_file(&mut state, false);
+    }
+    let important = std::mem::take(&mut state.important_log);
+    let rollback: Vec<(String, String)> = state
+        .log_buffer
+        .iter()
+        .rev()
+        .take(LOG_TO_FILE_ROLLBACK)
+        .rev()
+        .cloned()
+        .collect();
+    if let Some(file) = state.log_file.as_mut() {
+        if !important.is_empty() {
+            let _ = write!(file, "{important}\r\n");
+        }
+        let _ = write!(file, "{LOG_START_SEPARATOR}");
+        for (time, line) in &rollback {
+            let _ = write!(file, "{time} {line}\r\n");
+        }
+        let _ = write!(file, "\r\n");
+        let _ = file.flush();
+    }
+}
+
+/// `Debug.startLogToFile([clear])` → void — reference `TVPStartLogToFile`
+/// (`DebugIntf.cpp:471-506`): an **optional boolean**, no filename — the
+/// file is `{logLocation}/krkr.console.log`.
 extern "C" fn native_start_log_to_file(
     engine: *mut c_void,
     argc: c_int,
@@ -208,10 +411,9 @@ extern "C" fn native_start_log_to_file(
     out: *mut Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
-    if argc < 1 {
-        return report_error(out_error, "Debug.startLogToFile requires 1 argument");
-    }
-    let filename = value_as_string(&unsafe { args(argv, argc) }[0]);
+    // `if(numparams >= 1) clear = param[0]->operator bool();`
+    // (`DebugIntf.cpp:625-628`).
+    let clear = argc >= 1 && value_as_bool(&unsafe { args(argv, argc) }[0]);
     let Some(resolved) = resolve(engine) else {
         return report_error(
             out_error,
@@ -220,39 +422,36 @@ extern "C" fn native_start_log_to_file(
     };
     let ctx = resolved.ctx();
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
-    let services = unsafe { ctx.services() };
-    let already_open = services.state::<DebugState>().log_file.is_some();
-    if already_open {
-        set_void(out);
-        return 0;
-    }
-    match OpenOptions::new().create(true).append(true).open(&filename) {
-        Ok(file) => services.state::<DebugState>().log_file = Some(file),
-        Err(e) => log::warn!("Debug.startLogToFile: failed to open {filename:?}: {e}"),
-    }
+    start_log_file(unsafe { ctx.services() }, clear);
     set_void(out);
     0
 }
 
-/// `Debug.logAsError([flag])` → void (flag defaults to true).
+/// `Debug.logAsError()` → void — reference `TVPOnError`
+/// (`DebugIntf.cpp:508-513`): start the error log file when
+/// `logToFileOnError` is set, with `clearLogFileOnError` as its clear flag.
+/// The reference method takes no arguments, so any passed arguments are
+/// ignored.
 extern "C" fn native_log_as_error(
     engine: *mut c_void,
-    argc: c_int,
-    argv: *const Value,
+    _argc: c_int,
+    _argv: *const Value,
     out: *mut Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
-    let flag = if argc >= 1 {
-        value_as_bool(&unsafe { args(argv, argc) }[0])
-    } else {
-        true
-    };
     let Some(resolved) = resolve(engine) else {
         return report_error(out_error, "Debug.logAsError: compat context is not bound");
     };
     let ctx = resolved.ctx();
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
-    unsafe { ctx.services() }.state::<DebugState>().log_as_error = flag;
+    let services = unsafe { ctx.services() };
+    let (auto, clear) = {
+        let state = services.state::<DebugState>();
+        (state.log_to_file_on_error, state.clear_log_file_on_error)
+    };
+    if auto {
+        start_log_file(services, clear);
+    }
     set_void(out);
     0
 }
@@ -268,10 +467,17 @@ extern "C" fn native_get_last_log(
     out: *mut Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
+    // Reference `lines = TVPLogMaxLines + 100` by default, `(tjs_uint)`
+    // truncation of `param[0]->AsInteger()` otherwise (`DebugIntf.cpp:1454-1457`):
+    // reals truncate, strings parse, objects raise, and a negative value wraps
+    // to a huge unsigned count (clamped to the buffer below).
     let lines = if argc >= 1 {
-        value_as_i64(&unsafe { args(argv, argc) }[0]).max(0) as usize
+        match try_value_as_i64(&unsafe { args(argv, argc) }[0]) {
+            Ok(value) => value as u32 as usize,
+            Err(error) => return report_error(out_error, &error),
+        }
     } else {
-        1
+        TVP_LOG_MAX_LINES + 100
     };
     let Some(resolved) = resolve(engine) else {
         return report_error(out_error, "Debug.getLastLog: compat context is not bound");
@@ -281,20 +487,24 @@ extern "C" fn native_get_last_log(
     let services = unsafe { ctx.services() };
     let text = {
         let state = services.state::<DebugState>();
-        let lines = lines.min(state.log_buffer.len());
-        if lines == 0 {
-            String::new()
-        } else {
-            let entries: Vec<&str> = state
-                .log_buffer
-                .iter()
-                .rev()
-                .take(lines)
-                .rev()
-                .map(String::as_str)
-                .collect();
-            entries.join("\n")
+        // Reference `TVPGetLastLog` (`DebugIntf.cpp:419-459`): every entry is
+        // `Time + ' ' + Log + "\r\n"` (`TJS_TEXT_OUT_CRLF`,
+        // `core/CMakeLists.txt:39`) — including a trailing separator after the
+        // last entry; `n == 0` yields the empty string.
+        let mut text = String::new();
+        for (time, line) in state
+            .log_buffer
+            .iter()
+            .rev()
+            .take(lines.min(state.log_buffer.len()))
+            .rev()
+        {
+            text.push_str(time);
+            text.push(' ');
+            text.push_str(line);
+            text.push_str("\r\n");
         }
+        text
     };
     set_string_out(&ctx, out, &text);
     0
@@ -312,9 +522,19 @@ extern "C" fn native_add_logging_handler(
         return report_error(out_error, "Debug.addLoggingHandler requires 1 argument");
     }
     let a = unsafe { args(argv, argc) };
-    if a[0].ty != VAL_OBJECT {
+    // Reference `param[0]->AsObjectClosureNoAddRef()`
+    // (`DebugIntf.cpp:645-648`): TJS `null` is an empty closure that is
+    // stored but never invoked (a silent success); any other non-object
+    // raises the conversion error.
+    if a[0].ty == VAL_NULL {
         set_void(out);
         return 0;
+    }
+    if a[0].ty != VAL_OBJECT {
+        return report_error(
+            out_error,
+            "Debug.addLoggingHandler: argument is not an object",
+        );
     }
     let Some(resolved) = resolve(engine) else {
         return report_error(
@@ -358,9 +578,16 @@ extern "C" fn native_remove_logging_handler(
         return report_error(out_error, "Debug.removeLoggingHandler requires 1 argument");
     }
     let a = unsafe { args(argv, argc) };
-    if a[0].ty != VAL_OBJECT {
+    // Same conversion contract as `addLoggingHandler` (`DebugIntf.cpp:660-663`).
+    if a[0].ty == VAL_NULL {
         set_void(out);
         return 0;
+    }
+    if a[0].ty != VAL_OBJECT {
+        return report_error(
+            out_error,
+            "Debug.removeLoggingHandler: argument is not an object",
+        );
     }
     let Some(resolved) = resolve(engine) else {
         return report_error(
@@ -662,10 +889,23 @@ extern "C" fn prop_log_location_set(
         return report_error(out_error, "Debug.logLocation: missing value");
     }
     // SAFETY: the trampoline passes a valid value slot for the call.
-    let location = value_as_string(unsafe { &*value });
+    // Reference `TVPSetLogLocation`: `TVPLogLocation =
+    // TVPNormalizeStorageName(loc)` then `TVPLogStreamHolder.Reopen()`
+    // (`DebugIntf.cpp:518-532`) — the stream closes and the next line reopens
+    // it at the new location. The reference also clears the location when it
+    // has no locally accessible form and re-checks the `-forcelog` command
+    // line; neither has a host seam here.
+    let location = normalize_storage_name(&value_as_string(unsafe { &*value }));
     let ctx = resolved.ctx();
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
-    unsafe { ctx.services() }.state::<DebugState>().log_location = location;
+    {
+        let mut state = unsafe { ctx.services() }.state::<DebugState>();
+        state.log_location = location;
+        // `Reopen()` (`DebugIntf.cpp:230-232`): close the stream; a failed
+        // open may be retried at the new location.
+        state.log_file = None;
+        state.log_open_failed = false;
+    }
     0
 }
 

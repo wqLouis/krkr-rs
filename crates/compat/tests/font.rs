@@ -254,7 +254,11 @@ fn font_prerendered_registration_round_trips() {
     env.run("f.unmapPrerenderedFont();");
     // The font stays usable after unmapping (the registration is dispatch
     // state, not the font's existence).
-    assert_eq!(env.eval_int("f.id >= 0"), 1);
+    assert_eq!(env.eval_int("f.face == 'Ghost'"), 1);
+    assert_eq!(env.eval_int("f.height"), 16);
+    // The reference `Font` member list registers no `id`
+    // (`reference/cpp/core/visual/LayerIntf.cpp:11820`), so reading it raises.
+    env.error("f.id");
 }
 
 #[test]

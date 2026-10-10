@@ -1,7 +1,7 @@
 //! `Storages` native class (L3) over the L2 [`engine::Storage`] namespace.
 //!
-//! This is a reimplementation on the middle-layer API, not a port of the old
-//! `tvp-storages` process-global crate. The mounted namespace is the one the
+//! This is a reimplementation on the middle-layer API. The mounted namespace
+//! is the one the
 //! host attached through [`CompatServices::storage`]; all archive/namespace
 //! policy (`arc.xp3>path`, case folding, the auto search paths) lives in
 //! [`engine::Storage`] and is never duplicated here.
@@ -22,7 +22,7 @@
 //! scratch buffers) lives in [`CompatServices::state`], so the only
 //! process-wide state remains the documented engine → context binding.
 //!
-//! # Host-facts seam (D11)
+//! # Host-facts seam
 //!
 //! `searchCD` (locate a CD by volume label) and `selectFile` (the file
 //! chooser) are genuine host operations with no L2 counterpart. They compose
@@ -36,8 +36,7 @@
 //! `deleteFile` / `selectDirectory` members of the reference. They need
 //! host/GUI facilities that do not exist in the L2 API yet; they are simply
 //! not registered, so a script calling them gets the ordinary TJS "member does
-//! not exist" error rather than a silent fallback. (The `getLocalName` skip
-//! was an earlier omission and is now implemented.)
+//! not exist" error rather than a silent fallback.
 
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
@@ -71,8 +70,9 @@ fn validate_auto_path(method: &str, path: &str) -> Result<String, String> {
 
 /// Normalize a storage name the way `TVPNormalizeStorageName` does for the
 /// common case: ASCII-lowercase and `\` → `/` (media prefixes are out of
-/// scope).
-fn normalize_storage_name(name: &str) -> String {
+/// scope). Shared with the `Debug.logLocation` setter, which applies the same
+/// reference normalization (`utils/DebugIntf.cpp:519`).
+pub(crate) fn normalize_storage_name(name: &str) -> String {
     name.chars()
         .map(|c| {
             if c == '\\' {
@@ -540,7 +540,7 @@ fn member_bool(host: &Tjs2Engine, id: Tjs2ValueId, name: &str) -> bool {
 ///
 /// Delegates to the host's disc search and returns the drive letter (or `""`
 /// when no disc matches). Without the installed seam the member raises a typed
-/// error (D11).
+/// error.
 extern "C" fn native_search_cd(
     engine: *mut c_void,
     argc: c_int,
@@ -574,7 +574,7 @@ extern "C" fn native_search_cd(
 /// Extracts the chooser fields from the parameter object and delegates to the
 /// host's file chooser. On success the selected storage name is written back
 /// to `params.name` and the member returns true; a cancel returns false.
-/// Without the installed seam the member raises a typed error (D11).
+/// Without the installed seam the member raises a typed error.
 extern "C" fn native_select_file(
     engine: *mut c_void,
     argc: c_int,

@@ -1,0 +1,18 @@
+[package]
+name = "render"
+description = "krkr-rs bottom render pipeline: stateless RenderPipeline over ash/Vulkan + glyph rasterization"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+api = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+ash = { workspace = true }
+raw-window-handle = { workspace = true }
+ab_glyph = "0.2"
+ash-window = "0.13"
+
+[dev-dependencies]
+testkit = { workspace = true }

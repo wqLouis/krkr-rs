@@ -24,8 +24,8 @@ struct Env {
     /// the timer registry, the input state and the engine go away.
     _host: CompatHost,
     engine: Box<Tjs2Engine>,
-    #[allow(dead_code)]
-    scene: Box<Scene>,
+    /// Kept alive for the host's raw pointer; never read directly.
+    _scene: Box<Scene>,
     /// Kept alive for the host's raw pointer; never read directly.
     _timer: Box<TimerState>,
     /// Kept alive for the host's raw pointer; never read directly.
@@ -53,7 +53,7 @@ impl Env {
         Env {
             _host: host,
             engine,
-            scene,
+            _scene: scene,
             _timer: timer,
             _input: input,
         }
@@ -279,7 +279,14 @@ fn layer_tree_owner_interface_is_the_window_object() {
     // The reference returns the `iTVPLayerTreeOwner` implemented by the
     // window; L3 hands back the owner object itself (no raw address).
     assert_eq!(env.eval_int("w.layerTreeOwnerInterface === w"), 1);
-    assert_eq!(env.eval_int("w.layerTreeOwnerInterface.id == w.id"), 1);
+    // The reference `Window` member list registers no `id`
+    // (`reference/cpp/core/visual/WindowIntf.cpp:731`), so reading it raises
+    // on both aliases of the same object.
+    assert!(
+        env.eval("w.layerTreeOwnerInterface.id").is_err(),
+        "layerTreeOwnerInterface has no `id` member"
+    );
+    assert!(env.eval("w.id").is_err(), "Window has no `id` member");
     // It is read-only, matching the reference `TJS_DENY_NATIVE_PROP_SETTER`.
     assert!(env.eval("w.layerTreeOwnerInterface = null").is_err());
 }

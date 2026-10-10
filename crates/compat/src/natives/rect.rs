@@ -11,21 +11,25 @@
 //!
 //! Cross-object methods (`clip`, `union`, `intersects`, `included`, `equal`,
 //! the one-argument copy constructor) receive another *script object*, not
-//! another payload: the C ABI hands the callee only the dispatch handle of
-//! each object argument, and there is no cross-object native-instance
-//! lookup. They therefore read the argument's script-visible `left`/`top`/
-//! `right`/`bottom` members, exactly as the other L3 object-argument helpers
-//! (`resolve_object_id` in `visual.rs`/`video.rs`) resolve their targets.
+//! another payload: they resolve the argument through the engine's
+//! cross-object native-instance lookup
+//! ([`Tjs2Engine::native_instance_payload`]), which is the exact counterpart
+//! of the reference's `NativeInstanceSupport(TJS_NIS_GETINSTANCE,
+//! tTJSNC_Rect::ClassID, ...)` (`visual/RectItf.cpp:14`, `135`, …): only a
+//! live native `Rect` is accepted, `null` follows the reference
+//! `clo.Object == nullptr` branch, and a plain script object — even one with
+//! `left`/`top`/`right`/`bottom` members — is the reference's
+//! `TJS_E_INVALIDPARAM` error rather than a duck-typed success.
 
 use std::ffi::{c_char, c_int, c_void};
 
 use tjs::{
     NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef, Tjs2Engine,
-    TjsValue, VAL_OBJECT, Value,
+    VAL_NULL, VAL_OBJECT, Value,
 };
 
 use crate::native_util::{args, report_error, set_bool, set_int, set_void};
-use crate::natives::system::{resolve, value_as_i64};
+use crate::natives::system::{resolve, try_value_as_i64};
 use crate::{CompatCtx, CompatError};
 
 // ---------------------------------------------------------------------------
@@ -184,35 +188,56 @@ unsafe fn payload(instance: *mut c_void) -> &'static mut RectData {
 
 /// Resolve a script argument to another rectangle's edges.
 ///
-/// Returns `Ok(None)` when `value` is not an object: the reference binary
-/// methods leave their result unset (void) for a non-object argument rather
-/// than raising. An object without numeric `left`/`top`/`right`/`bottom`
-/// members is the Rust counterpart of the reference's failed
-/// `NativeInstanceSupport` lookup and becomes a typed error.
+/// Reference semantics (`visual/RectItf.cpp`):
+///
+/// * `null` (a `tvtObject` with a null pointer, `tjs2_abi.cpp:525-527`)
+///   yields `Ok(None)`: the binary methods reach `if(clo.Object)` and skip
+///   silently (`RectItf.cpp:129-131`), while the copy constructor reports
+///   `TJS_E_INVALIDPARAM` (`RectItf.cpp:12-13`) — the callers split on it.
+/// * A non-object argument is the reference's `AsObjectClosureNoAddRef`
+///   conversion throw (`tjsVariant.h:728-736`) — a typed error.
+/// * An object argument must be a live native `Rect`
+///   (`NativeInstanceSupport`); anything else — including a plain dictionary
+///   that happens to carry `left`/`top`/`right`/`bottom` — is the
+///   reference's `TJS_E_INVALIDPARAM` (`RectItf.cpp:14-16`).
 fn rect_arg(host: &Tjs2Engine, value: &Value) -> Result<Option<RectData>, String> {
-    if value.ty != VAL_OBJECT || value.object_handle().is_null() {
+    if value.ty == VAL_NULL {
         return Ok(None);
+    }
+    if value.ty != VAL_OBJECT || value.object_handle().is_null() {
+        return Err("Rect: argument is not a Rect object".into());
     }
     let object = host
         .retain_object_arg(value)
         .map_err(|error| format!("Rect: argument cannot be retained: {error}"))?;
-    let field = |name: &str| match host.get_member(object.raw_id(), name) {
-        Ok(TjsValue::Integer(v)) => Ok(v as i32),
-        Ok(TjsValue::Real(v)) => Ok(v as i32),
-        Ok(_) => Err(format!("Rect: argument member {name} is not numeric")),
-        Err(error) => Err(format!("Rect: argument member {name}: {error}")),
+    let payload = host
+        .native_instance_payload(object.raw_id(), "Rect")
+        .map_err(|error| format!("Rect: argument lookup failed: {error}"))?;
+    let Some(payload) = payload else {
+        return Err("Rect: argument is not a Rect object".into());
     };
-    Ok(Some(RectData {
-        left: field("left")?,
-        top: field("top")?,
-        right: field("right")?,
-        bottom: field("bottom")?,
-    }))
+    // SAFETY: the payload is the engine-owned `RectData` allocated by
+    // `rect_create`; it stays valid while `object` holds the retained id and
+    // the single-threaded VM runs (no re-entry between the lookup and this
+    // copy).
+    Ok(Some(unsafe { *(payload.as_ptr() as *const RectData) }))
 }
 
 // ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
+
+/// `AsInteger`-strict numeric argument read: converts like the reference
+/// `operator tjs_int` (`tjsVariant.h:933-935`), which raises on objects
+/// instead of silently reading `0`, and reports the typed callback error.
+macro_rules! rect_int_arg {
+    ($out_error:expr, $what:expr, $value:expr) => {
+        match try_value_as_i64($value) {
+            Ok(value) => value as i32,
+            Err(error) => return report_error($out_error, &format!("Rect.{}: {error}", $what)),
+        }
+    };
+}
 
 /// Allocate the default (all-zero) `Rect` payload.
 extern "C" fn rect_create(_engine: *mut c_void) -> *mut c_void {
@@ -230,7 +255,10 @@ extern "C" fn rect_destroy(_engine: *mut c_void, instance: *mut c_void) {
 /// `new Rect()` / `new Rect(src)` / `new Rect(left, top, right, bottom)`.
 ///
 /// Argument counts other than 0, 1 and 4 are ignored, matching the
-/// reference `Construct` (the fresh payload keeps its all-zero default).
+/// reference `Construct` (the fresh payload keeps its all-zero default,
+/// `visual/RectItf.cpp:7-32`). Numeric arguments use the reference
+/// `operator tjs_int` → `AsInteger` conversion, which raises on objects
+/// (`tjsVariant.h:862-877`) instead of silently reading `0`.
 extern "C" fn rect_ctor(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -253,16 +281,35 @@ extern "C" fn rect_ctor(
         // Copy constructor: `new Rect(src)`.
         1 => match rect_arg(resolved.engine(), &arguments[0]) {
             Ok(Some(source)) => *data = source,
-            Ok(None) => return report_error(out_error, "Rect: argument is not a Rect object"),
-            Err(error) => return report_error(out_error, &error),
+            // `null` and non-Rect objects are the reference's
+            // `TJS_E_INVALIDPARAM` (`RectItf.cpp:12-16`); non-objects are
+            // its conversion throw.
+            Ok(None) | Err(_) => {
+                return report_error(out_error, "Rect: argument is not a Rect object");
+            }
         },
         // `new Rect(left, top, right, bottom)`.
         4 => {
+            let edges = [
+                try_value_as_i64(&arguments[0]),
+                try_value_as_i64(&arguments[1]),
+                try_value_as_i64(&arguments[2]),
+                try_value_as_i64(&arguments[3]),
+            ];
+            let mut values = [0_i32; 4];
+            for (index, edge) in edges.into_iter().enumerate() {
+                match edge {
+                    Ok(value) => values[index] = value as i32,
+                    Err(error) => {
+                        return report_error(out_error, &format!("Rect: edge {index}: {error}"));
+                    }
+                }
+            }
             *data = RectData {
-                left: value_as_i64(&arguments[0]) as i32,
-                top: value_as_i64(&arguments[1]) as i32,
-                right: value_as_i64(&arguments[2]) as i32,
-                bottom: value_as_i64(&arguments[3]) as i32,
+                left: values[0],
+                top: values[1],
+                right: values[2],
+                bottom: values[3],
             };
         }
         _ => {}
@@ -278,7 +325,9 @@ extern "C" fn rect_ctor(
 /// Shared body of the binary rectangle methods.
 ///
 /// `op` receives the receiver payload and the resolved argument rectangle.
-/// A non-object argument is the reference no-op that yields void.
+/// `null` matches the reference's silent `if(clo.Object)` skip (void
+/// result); every other failed resolution raises like the reference
+/// (`AsObjectClosureNoAddRef` throw / `TJS_E_INVALIDPARAM`).
 fn binary_rect_op(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -341,8 +390,8 @@ extern "C" fn rect_set_size(
     if arguments.len() < 2 {
         return report_error(out_error, "Rect.setSize: 2 arguments required");
     }
-    let width = value_as_i64(&arguments[0]) as i32;
-    let height = value_as_i64(&arguments[1]) as i32;
+    let width = rect_int_arg!(out_error, "setSize", &arguments[0]);
+    let height = rect_int_arg!(out_error, "setSize", &arguments[1]);
     // SAFETY: `instance` is the live receiver payload.
     unsafe { payload(instance) }.set_size(width, height);
     set_void(out);
@@ -364,8 +413,8 @@ extern "C" fn rect_set_offset(
     if arguments.len() < 2 {
         return report_error(out_error, "Rect.setOffset: 2 arguments required");
     }
-    let x = value_as_i64(&arguments[0]) as i32;
-    let y = value_as_i64(&arguments[1]) as i32;
+    let x = rect_int_arg!(out_error, "setOffset", &arguments[0]);
+    let y = rect_int_arg!(out_error, "setOffset", &arguments[1]);
     // SAFETY: `instance` is the live receiver payload.
     unsafe { payload(instance) }.set_offsets(x, y);
     set_void(out);
@@ -387,8 +436,8 @@ extern "C" fn rect_add_offset(
     if arguments.len() < 2 {
         return report_error(out_error, "Rect.addOffset: 2 arguments required");
     }
-    let x = value_as_i64(&arguments[0]) as i32;
-    let y = value_as_i64(&arguments[1]) as i32;
+    let x = rect_int_arg!(out_error, "addOffset", &arguments[0]);
+    let y = rect_int_arg!(out_error, "addOffset", &arguments[1]);
     // SAFETY: `instance` is the live receiver payload.
     unsafe { payload(instance) }.add_offsets(x, y);
     set_void(out);
@@ -428,10 +477,10 @@ extern "C" fn rect_set(
     }
     // SAFETY: `instance` is the live receiver payload.
     *unsafe { payload(instance) } = RectData {
-        left: value_as_i64(&arguments[0]) as i32,
-        top: value_as_i64(&arguments[1]) as i32,
-        right: value_as_i64(&arguments[2]) as i32,
-        bottom: value_as_i64(&arguments[3]) as i32,
+        left: rect_int_arg!(out_error, "set", &arguments[0]),
+        top: rect_int_arg!(out_error, "set", &arguments[1]),
+        right: rect_int_arg!(out_error, "set", &arguments[2]),
+        bottom: rect_int_arg!(out_error, "set", &arguments[3]),
     };
     set_void(out);
     0
@@ -527,8 +576,8 @@ extern "C" fn rect_included_pos(
     if arguments.len() < 2 {
         return report_error(out_error, "Rect.includedPos: 2 arguments required");
     }
-    let x = value_as_i64(&arguments[0]) as i32;
-    let y = value_as_i64(&arguments[1]) as i32;
+    let x = rect_int_arg!(out_error, "includedPos", &arguments[0]);
+    let y = rect_int_arg!(out_error, "includedPos", &arguments[1]);
     // SAFETY: `instance` is the live receiver payload.
     set_bool(out, unsafe { payload(instance) }.contains_pos(x, y));
     0
@@ -562,14 +611,14 @@ macro_rules! rect_edge_setter {
             _engine: *mut c_void,
             instance: *mut c_void,
             value: *const Value,
-            _out_error: *mut *mut c_char,
+            out_error: *mut *mut c_char,
             _objthis: *mut c_void,
         ) -> c_int {
-            // SAFETY: `instance` is the live receiver payload and `value` is
-            // the valid setter argument for this call.
+            // SAFETY: `value` is the valid setter argument for this call.
             let value = unsafe { &*value };
+            let edge = rect_int_arg!(out_error, stringify!($field), value);
             // SAFETY: `instance` is the live receiver payload.
-            unsafe { payload(instance) }.$field = value_as_i64(value) as i32;
+            unsafe { payload(instance) }.$field = edge;
             0
         }
     };
@@ -602,12 +651,13 @@ extern "C" fn rect_set_width(
     _engine: *mut c_void,
     instance: *mut c_void,
     value: *const Value,
-    _out_error: *mut *mut c_char,
+    out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `value` is the valid setter argument for this call.
+    let width = rect_int_arg!(out_error, "width", unsafe { &*value });
     // SAFETY: `instance` is the live receiver payload.
-    let data = unsafe { payload(instance) };
-    data.set_width(value_as_i64(unsafe { &*value }) as i32);
+    unsafe { payload(instance) }.set_width(width);
     0
 }
 
@@ -629,12 +679,13 @@ extern "C" fn rect_set_height(
     _engine: *mut c_void,
     instance: *mut c_void,
     value: *const Value,
-    _out_error: *mut *mut c_char,
+    out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `value` is the valid setter argument for this call.
+    let height = rect_int_arg!(out_error, "height", unsafe { &*value });
     // SAFETY: `instance` is the live receiver payload.
-    let data = unsafe { payload(instance) };
-    data.set_height(value_as_i64(unsafe { &*value }) as i32);
+    unsafe { payload(instance) }.set_height(height);
     0
 }
 

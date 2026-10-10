@@ -1,4 +1,4 @@
-//! The ordered per-frame poll body (doc 08 §6).
+//! The ordered per-frame poll body.
 //!
 //! L1 drives the tick; L4 runs the frame body. The order is fixed:
 //!
@@ -9,8 +9,8 @@
 //! ```
 //!
 //! This module defines the L3-side seam ([`FrameBody`]) and the single
-//! function that enforces the order ([`run_frame_body`]); the migrated
-//! natives implement the individual polls.
+//! function that enforces the order ([`run_frame_body`]); the natives
+//! implement the individual polls.
 
 use crate::{CompatCtx, CompatError};
 
@@ -48,7 +48,7 @@ pub trait FrameBody {
     /// The tail of the body: L2 projects the scene and L1 renders it.
     ///
     /// It is a single step here because L3 owns neither the projection (L2)
-    /// nor the render pipeline (L1); the migrated host delegates both from
+    /// nor the render pipeline (L1); the host delegates both from
     /// this hook so [`run_frame_body`] remains the one place the documented
     /// order is enforced.
     fn project_and_render(&mut self, _ctx: &mut CompatCtx) -> Result<(), CompatError> {

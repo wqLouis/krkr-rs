@@ -16,8 +16,8 @@
 //! window) needed to hand the *real* objects back from `parent`, `root`,
 //! `children` and `window`.
 //!
-//! Members that genuinely need a platform menu are **deferred explicitly**
-//! (D11), not silently defaulted:
+//! Members that genuinely need a platform menu raise a typed error rather
+//! than defaulting silently:
 //!
 //! | member | behavior |
 //! |---|---|
@@ -34,12 +34,17 @@
 //!
 //! `fireClick()` activates the item: it first walks the ancestor chain and
 //! does nothing when any ancestor is disabled (`CanDeliverEvents`,
-//! `MenuItemImpl.cpp`), then invokes the object's `onClick` member — a script
-//! override when one was assigned, otherwise the native `onClick` method. The
-//! native method is the reference's default handler and dispatches the
-//! `onClick` event to the constructor's action owner via `owner.action(ev)`
-//! (falling back to `owner.onClick()` / calling the owner directly for owners
-//! that predate the action protocol).
+//! `impl/MenuItemImpl.cpp:143-156`), then requires a `Window` in the
+//! ancestor chain and that window's `visible` state
+//! (`tTJSNI_BaseMenuItem::OnClick`, `MenuItemIntf.cpp:196-217` — a
+//! window-less tree never delivers), then invokes the object's `onClick`
+//! member (a script override wins, otherwise the native default), and finally
+//! runs the reference `TVPDoSaveSystemVariables` hack
+//! (`impl/SystemImpl.cpp:520-541`). The native `onClick` is the reference's
+//! default event handler and dispatches **only** `owner.action(ev)` with the
+//! reference event dictionary (`MenuItemIntf.cpp:305-316`); a missing or
+//! failing `action` member is ignored exactly like the reference's unchecked
+//! `FuncCall`.
 
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
@@ -48,14 +53,14 @@ use std::ptr;
 use tjs::{
     DetachedValue, NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef,
     NativePropertyDef, NativeStaticMembers, RetainedValue, Tjs2Engine, Tjs2ValueId, TjsValue,
-    VAL_OBJECT, VAL_RETAINED, Value,
+    VAL_NULL, VAL_OBJECT, VAL_RETAINED, Value,
 };
 
 use crate::native_util::{args, report_error, set_bool, set_int, set_void, value_as_string};
-use crate::natives::system::{resolve, set_string_out, value_as_bool, value_as_i64};
+use crate::natives::system::{resolve, set_string_out, try_value_as_i64, value_as_bool};
 use crate::{CompatCtx, CompatError, CompatServices};
 
-/// Platform-menu operations that have no backing on this build (D11).
+/// Platform-menu operations that have no backing on this build.
 ///
 /// Raising this instead of fabricating a handle keeps the deferral explicit
 /// and testable: a script can tell "this build has no OS menu" apart from
@@ -299,7 +304,7 @@ fn insert_child(
 }
 
 /// Whether an item and every one of its ancestors is enabled
-/// (`CanDeliverEvents`, `MenuItemImpl.cpp`).
+/// (`CanDeliverEvents`, `impl/MenuItemImpl.cpp:143-156`).
 fn can_deliver(state: &MenuState, id: u64) -> bool {
     let mut current = Some(id);
     while let Some(id) = current {
@@ -312,6 +317,50 @@ fn can_deliver(state: &MenuState, id: u64) -> bool {
         current = node.parent;
     }
     true
+}
+
+/// The nearest `Window` in the item's ancestor chain — the reference walks
+/// `this` → `Parent` until one carries a `Window` (`MenuItemIntf.cpp:200-207`).
+fn window_chain(state: &MenuState, id: u64) -> Option<Tjs2ValueId> {
+    let mut current = Some(id);
+    while let Some(id) = current {
+        let node = state.nodes.get(&id)?;
+        if let Some(window) = node.window.as_ref() {
+            return Some(window.raw_id());
+        }
+        current = node.parent;
+    }
+    None
+}
+
+/// The reference `Window->CanDeliverEvents()` half of `OnClick`
+/// (`impl/WindowImpl.cpp:1154-1158`: form exists, visible, enabled). The
+/// closest observable member on our `Window` is `visible`; an unreadable
+/// member counts as not deliverable, like a null form.
+fn window_can_deliver(host: &Tjs2Engine, window: Tjs2ValueId) -> bool {
+    match host.get_member(window, "visible") {
+        Ok(TjsValue::Integer(visible)) => visible != 0,
+        Ok(TjsValue::Real(visible)) => visible != 0.0,
+        Ok(_) => false,
+        Err(error) => {
+            log::debug!("MenuItem: window.visible is not readable ({error})");
+            false
+        }
+    }
+}
+
+/// Reference `TVPDoSaveSystemVariables` (`impl/SystemImpl.cpp:520-541`):
+/// after a delivered click, call the script global `kag`'s
+/// `saveSystemVariables()` when present. Every failure is swallowed, like
+/// the reference's `catch(...)`.
+fn do_save_system_variables(host: &Tjs2Engine) {
+    let kag = match host.eval_retained("kag", "MenuItem.saveSystemVariables") {
+        Ok(RetainedValue::Object(kag)) => kag,
+        _ => return,
+    };
+    if let Err(error) = host.call_member(kag.raw_id(), "saveSystemVariables", &[]) {
+        log::debug!("MenuItem: kag.saveSystemVariables: {error}");
+    }
 }
 
 /// The item's position within its parent's child list (0 for a root).
@@ -377,6 +426,85 @@ extern "C" fn menu_item_destroy(engine: *mut c_void, instance: *mut c_void) {
     drop(unsafe { Box::from_raw(instance as *mut MenuItemInst) });
 }
 
+/// Reference `tTJSNI_BaseMenuItem::Invalidate` (`MenuItemIntf.cpp:75-107`):
+/// cancel pending events, **cascade-invalidate every child object**
+/// (`item->Owner->Invalidate(...)` + `item->Owner->Release()`), clear
+/// `Children`, drop `Window` / `Parent` / `ChildrenArray` and release
+/// `ActionOwner`.
+///
+/// The VM runs this hook both for `invalidate obj` and right before object
+/// destruction (`tTJSCustomObject::Finalize` → `Invalidate`,
+/// `tjsObject.cpp:377-399`), so a destroyed parent cascades into its subtree
+/// exactly like an invalidated one. The retained `object`, `action_owner`,
+/// `window` and `children_array` are taken here and dropped *outside* the
+/// state borrow: releasing the last reference to a script object can run
+/// destructors (including this object's) that re-enter the state. Dropping
+/// `object` also breaks the script/native reference cycle — the reference
+/// keeps only a raw `Owner` pointer (`MenuItemIntf.cpp:103`), never a strong
+/// self-reference.
+extern "C" fn menu_item_invalidate(engine: *mut c_void, instance: *mut c_void) {
+    if instance.is_null() {
+        return;
+    }
+    let inst = unsafe { &*(instance as *const MenuItemInst) };
+    let Some(id) = inst.id else {
+        return;
+    };
+    let Ok((resolved, ctx)) = bound(engine) else {
+        return;
+    };
+    // SAFETY: the caller resolved `ctx` from the installed binding.
+    let services = unsafe { ctx.services() };
+    // Phase 1 (state borrow held): take the retained values and unlink.
+    // `Parent = nullptr` while *staying* in the parent's child list matches
+    // `MenuItemIntf.cpp:102-104` (the parent's `Release` of this item's object
+    // happens when the parent cascades or dies — here the child's own strong
+    // ref takes that role).
+    let (taken, children) = {
+        let mut state = services.state::<MenuState>();
+        let Some(node) = state.nodes.get_mut(&id) else {
+            return;
+        };
+        let children = node.children.clone();
+        node.children.clear();
+        node.children_dirty = true;
+        node.parent = None;
+        (
+            (
+                node.object.take(),
+                node.action_owner.take(),
+                node.window.take(),
+                node.children_array.take(),
+            ),
+            children,
+        )
+    };
+    // Phase 2: cascade — `item->Owner->Invalidate(...)` for every child; the
+    // child's own hook runs, which recurses through the subtree. Children
+    // without a retained object were invalidated before.
+    let child_objects: Vec<Tjs2ValueId> = {
+        let state = services.state::<MenuState>();
+        children
+            .iter()
+            .filter_map(|child| {
+                state
+                    .nodes
+                    .get(child)
+                    .and_then(|node| node.object.as_ref())
+                    .map(|object| object.raw_id())
+            })
+            .collect()
+    };
+    for raw in child_objects {
+        if let Err(error) = resolved.engine().invalidate_retained(raw) {
+            log::debug!("MenuItem.invalidate: child invalidate failed: {error}");
+        }
+    }
+    // Phase 3: dropping the retentions may run destructors (they re-enter
+    // `menu_item_destroy`), so no state borrow may be held here.
+    drop(taken);
+}
+
 // ---------------------------------------------------------------------------
 // Members
 // ---------------------------------------------------------------------------
@@ -407,14 +535,57 @@ extern "C" fn menu_item_ctor(
     }
     let values = unsafe { args(argv, argc) };
 
-    let action_owner = values
-        .first()
-        .filter(|value| value.ty == VAL_OBJECT && !value.object_handle().is_null())
-        .and_then(|value| host.retain_object_arg(value).ok());
+    // Reference `tTJSNI_BaseMenuItem::Construct` (`MenuItemIntf.cpp:42-73`):
+    // `param[0]->AsObjectClosure()` throws on a non-object
+    // (`tjsVariant.h:719-726`), TJS `null` is a valid null closure, and an
+    // omitted first argument is tolerated because `tTJSNI_MenuItem::Construct`
+    // ignores the base's `BADPARAMCOUNT` (`impl/MenuItemImpl.cpp:106-107`).
+    let action_owner = match values.first() {
+        None => None,
+        Some(value) if value.ty == VAL_NULL => None,
+        Some(value) if value.ty == VAL_OBJECT && !value.object_handle().is_null() => {
+            match host.retain_object_arg(value) {
+                Ok(owner) => Some(owner),
+                Err(error) => {
+                    return report_error(
+                        out_error,
+                        &format!("MenuItem: cannot retain the action owner: {error}"),
+                    );
+                }
+            }
+        }
+        Some(_) => {
+            return report_error(out_error, "MenuItem: the action owner is not an object");
+        }
+    };
     let (window, caption) = match values.get(1) {
         Some(second) if second.ty == VAL_OBJECT && !second.object_handle().is_null() => {
-            (host.retain_object_arg(second).ok(), String::new())
+            let object = match host.retain_object_arg(second) {
+                Ok(object) => object,
+                Err(error) => {
+                    return report_error(
+                        out_error,
+                        &format!("MenuItem: cannot retain the window: {error}"),
+                    );
+                }
+            };
+            // The reference requires a native `Window` instance here and
+            // throws `TVPSpecifyWindow` otherwise (`MenuItemIntf.cpp:61-70`).
+            match host.native_instance_payload(object.raw_id(), "Window") {
+                Ok(Some(_)) => (Some(object), String::new()),
+                Ok(None) => {
+                    return report_error(
+                        out_error,
+                        "MenuItem: the second argument is not a Window",
+                    );
+                }
+                Err(error) => {
+                    return report_error(out_error, &format!("MenuItem: window lookup: {error}"));
+                }
+            }
         }
+        // `if(!Window && numparams >= 2) Caption = *param[1]`
+        // (`impl/MenuItemImpl.cpp:121-126`).
         Some(second) => (None, value_as_string(second)),
         None => (None, String::new()),
     };
@@ -447,7 +618,12 @@ extern "C" fn menu_item_ctor(
     0
 }
 
-/// `add(item)` — append an item (reference `tTJSNI_MenuItem::Add`).
+/// `add(item)` — append an item (reference `tTJSNI_MenuItem::Add`,
+/// `impl/MenuItemImpl.cpp:159-165`).
+///
+/// `ObjectVector::Add` rejects duplicates (`MenuItemIntf.h:32-39`): adding an
+/// item that is already a child of this parent is a no-op that keeps its
+/// position.
 extern "C" fn menu_item_add(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -474,6 +650,10 @@ extern "C" fn menu_item_add(
     let Some(child) = item_id_from_arg(&state, value) else {
         return report_error(out_error, "MenuItem.add expects a MenuItem");
     };
+    if state.nodes.get(&child).and_then(|node| node.parent) == Some(id) {
+        set_void(out);
+        return 0;
+    }
     let index = state.nodes.get(&id).map_or(0, |node| node.children.len());
     if let Err(error) = insert_child(&mut state, id, child, index) {
         return report_error(out_error, &error);
@@ -510,7 +690,18 @@ extern "C" fn menu_item_insert(
     let Some(child) = item_id_from_arg(&state, &values[0]) else {
         return report_error(out_error, "MenuItem.insert expects a MenuItem");
     };
-    let index = value_as_i64(&values[1]).max(0) as usize;
+    // `tjs_int index = *param[1]` raises on objects (`operator tjs_int` →
+    // `AsInteger`, `tjsVariant.h:933-935`).
+    let index = match try_value_as_i64(&values[1]) {
+        Ok(index) => index.max(0) as usize,
+        Err(error) => return report_error(out_error, &error),
+    };
+    // Duplicates are rejected by `ObjectVector::Add` (`MenuItemIntf.h:32-39`):
+    // inserting an item that is already a child keeps its position.
+    if state.nodes.get(&child).and_then(|node| node.parent) == Some(id) {
+        set_void(out);
+        return 0;
+    }
     if let Err(error) = insert_child(&mut state, id, child, index) {
         return report_error(out_error, &error);
     }
@@ -552,7 +743,7 @@ extern "C" fn menu_item_remove(
 
 /// `popup(flags, x, y)` — the reference opens a native popup (`TrackPopup`,
 /// `MenuItemImpl.cpp`). This build has no OS menu, so it raises a typed error
-/// (D11) instead of pretending the popup opened.
+/// instead of pretending the popup opened.
 extern "C" fn menu_item_popup(
     _engine: *mut c_void,
     _instance: *mut c_void,
@@ -571,9 +762,12 @@ extern "C" fn menu_item_popup(
     )
 }
 
-/// `fireClick()` — activate the item. Disabled items (or items under a
-/// disabled ancestor) do nothing; otherwise the object's `onClick` member runs
-/// (a script override when present, the native default otherwise).
+/// `fireClick()` — activate the item (reference `OnClick`,
+/// `MenuItemIntf.cpp:196-217`): disabled items (or items under a disabled
+/// ancestor) do nothing; delivery additionally requires a `Window` in the
+/// ancestor chain whose `visible` state allows events; then the object's
+/// `onClick` member runs (a script override when present, the native default
+/// otherwise) and the reference `TVPDoSaveSystemVariables` hack follows.
 extern "C" fn menu_item_fire_click(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -602,27 +796,53 @@ extern "C" fn menu_item_fire_click(
             .get(&id)
             .and_then(|node| node.object.as_ref())
             .map(|object| object.raw_id());
-        (object, can_deliver(&state, id))
+        // `if(!CanDeliverEvents()) return;` (`MenuItemIntf.cpp:198-199`).
+        let enabled = can_deliver(&state, id);
+        // `while(!item->Window) { if(!item->Parent) break; ... }` +
+        // `if(!item->Window) return;` (`MenuItemIntf.cpp:200-208`).
+        let window = enabled.then(|| window_chain(&state, id)).flatten();
+        (object, window)
     };
-    if deliver {
-        let host = resolved.engine();
-        if let Some(raw) = object
-            && let Ok(self_obj) = host.duplicate_retained(raw)
-        {
-            // Call the member: a script override runs directly, otherwise the
-            // native `onClick` dispatches to the action owner. The state
-            // borrow is already released, so the callback may re-enter.
-            if let Err(error) = host.call_member(self_obj.raw_id(), "onClick", &[]) {
-                log::warn!("MenuItem.fireClick: onClick handler failed: {error}");
-            }
+    let Some(window) = deliver else {
+        set_void(out);
+        return 0;
+    };
+    let host = resolved.engine();
+    // `if(!item->Window->CanDeliverEvents()) return;`
+    // (`MenuItemIntf.cpp:210-211`).
+    if !window_can_deliver(host, window) {
+        set_void(out);
+        return 0;
+    }
+    // The reference delivers the click through `TVPPostEvent(...,
+    // TVP_EPT_IMMEDIATE, ...)`, which drops the event while
+    // `System.eventDisabled` is set (`EventIntf.cpp:210-224`) — but
+    // `TVPDoSaveSystemVariables()` still runs afterwards
+    // (`MenuItemIntf.cpp:215-216`).
+    let events_disabled = crate::natives::system::system_events_disabled(services);
+    if !events_disabled
+        && let Some(raw) = object
+        && let Ok(self_obj) = host.duplicate_retained(raw)
+    {
+        // Call the member: a script override runs directly, otherwise the
+        // native `onClick` dispatches to the action owner. The state borrow
+        // is already released, so the callback may re-enter.
+        if let Err(error) = host.call_member(self_obj.raw_id(), "onClick", &[]) {
+            log::warn!("MenuItem.fireClick: onClick handler failed: {error}");
         }
+    }
+    if object.is_some() {
+        // Reference `TVPDoSaveSystemVariables()` (`MenuItemIntf.cpp:215`).
+        do_save_system_variables(host);
     }
     set_void(out);
     0
 }
 
-/// `onClick()` — the reference default handler (`MenuItemIntf.cpp`): dispatch
-/// an `onClick` event to the constructor's action owner.
+/// `onClick()` — the reference default event handler
+/// (`MenuItemIntf.cpp:305-316`): dispatch `owner.action(event)` and nothing
+/// else. The event dictionary and the reference's unchecked `FuncCall` mean a
+/// missing or failing `action` member is silently ignored.
 extern "C" fn menu_item_on_click(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -630,7 +850,9 @@ extern "C" fn menu_item_on_click(
     _argv: *const Value,
     out: *mut Value,
     out_error: *mut *mut c_char,
-    _objthis: *mut c_void,
+    // The event dictionary's `target` is `objthis` (`TVP_ACTION_INVOKE_BEGIN
+    // (0, "onClick", objthis)`, `MenuItemIntf.cpp:310`).
+    objthis: *mut c_void,
 ) -> c_int {
     let Ok((resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "MenuItem.onClick: compat context is not bound");
@@ -649,41 +871,39 @@ extern "C" fn menu_item_on_click(
     if let Some(raw) = owner
         && let Ok(owner) = host.duplicate_retained(raw)
     {
-        dispatch_click_action(host, &owner);
+        dispatch_click_action(host, &owner, objthis);
     }
     set_void(out);
     0
 }
 
-/// Dispatch the reference `owner.action(event)` invocation, with fallbacks for
-/// owners that predate the action protocol.
-fn dispatch_click_action(host: &Tjs2Engine, owner: &DetachedValue) {
-    if let Some(event) = eval_object(host, "%[]", "MenuItem.onClickEvent") {
-        let _ = host.set_member(event.raw_id(), "type", &TjsValue::String("onClick".into()));
-        let event_id = event.raw_id();
-        match host.call_member(
-            owner.raw_id(),
-            "action",
-            &[TjsValue::Retained(event_id as u64)],
-        ) {
-            Ok(_) => {
-                // The argument copy consumed the retention.
-                std::mem::forget(event);
-                return;
-            }
-            Err(_) => {
-                // The id may or may not have been consumed; forget it rather
-                // than risk a double release.
-                std::mem::forget(event);
-            }
-        }
-    }
-    if host.call_member(owner.raw_id(), "onClick", &[]).is_ok() {
+/// Dispatch the reference `owner.action(event)` invocation
+/// (`TVP_ACTION_INVOKE_BEGIN(0, "onClick", objthis)` +
+/// `TVP_ACTION_INVOKE_END(obj)`, `EventIntf.h:208-237`,
+/// `MenuItemIntf.cpp:310-312`): the event carries `type` and `target`, and
+/// only the `action` member is invoked — there are no fallback members, just
+/// the reference's unchecked `FuncCall` result.
+fn dispatch_click_action(host: &Tjs2Engine, owner: &DetachedValue, objthis: *mut c_void) {
+    let Some(event) = eval_object(host, "%[]", "MenuItem.onClickEvent") else {
         return;
+    };
+    let _ = host.set_member(event.raw_id(), "type", &TjsValue::String("onClick".into()));
+    if !objthis.is_null()
+        && let Ok(target) = host.retain_object_detached(objthis)
+    {
+        // The retention is consumed when the variant copy is built; the drop
+        // below is the idempotent release either way.
+        let target_id = target.raw_id() as u64;
+        let _ = host.set_member(event.raw_id(), "target", &TjsValue::Retained(target_id));
+        drop(target);
     }
-    if let Err(error) = host.call_detached(owner, &[]) {
-        log::debug!("MenuItem.onClick: action owner is not callable: {error}");
+    let event_id = event.raw_id() as u64;
+    if let Err(error) = host.call_member(owner.raw_id(), "action", &[TjsValue::Retained(event_id)])
+    {
+        // The reference ignores the `FuncCall` result of `TVP_ACTION_INVOKE_END`.
+        log::debug!("MenuItem.onClick: action owner dispatch failed: {error}");
     }
+    drop(event);
 }
 
 // ---------------------------------------------------------------------------
@@ -949,7 +1169,11 @@ extern "C" fn menu_group_set(
     let Some(id) = inst.id else {
         return report_error(out_error, "MenuItem.group: this item is not constructed");
     };
-    let group = value_as_i64(unsafe { &*value });
+    let group = match try_value_as_i64(unsafe { &*value }) {
+        // `SetGroup((tjs_int)*param)` (`MenuItemIntf.cpp:399`).
+        Ok(group) => group,
+        Err(error) => return report_error(out_error, &error),
+    };
     // SAFETY: the caller resolved `ctx` from the installed binding.
     let mut state = unsafe { ctx.services() }.state::<MenuState>();
     if let Some(node) = state.nodes.get_mut(&id) {
@@ -958,9 +1182,8 @@ extern "C" fn menu_group_set(
     0
 }
 
-/// `index`: the position within the parent's child list. The setter moves the
-/// item (the reference `SetIndex` is a platform no-op; the logical tree can
-/// honor it), clamping to the valid range.
+/// `index`: the position within the parent's child list (`GetIndex`,
+/// `impl/MenuItemImpl.cpp:198-206`).
 extern "C" fn menu_index_get(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -985,6 +1208,10 @@ extern "C" fn menu_index_get(
     0
 }
 
+/// `index = n` — the reference `SetIndex` is a platform no-op
+/// (`impl/MenuItemImpl.cpp:209-214`): the write is accepted and does not move
+/// the item; `(tjs_int)(*param)` still raises on an object argument
+/// (`MenuItemIntf.cpp:546`).
 extern "C" fn menu_index_set(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -992,38 +1219,15 @@ extern "C" fn menu_index_set(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    let Ok((_resolved, ctx)) = bound(engine) else {
+    let Ok((_resolved, _ctx)) = bound(engine) else {
         return report_error(out_error, "MenuItem.index: compat context is not bound");
     };
     let inst = unsafe { &*(instance as *const MenuItemInst) };
-    let Some(id) = inst.id else {
+    if inst.id.is_none() {
         return report_error(out_error, "MenuItem.index: this item is not constructed");
-    };
-    let target = value_as_i64(unsafe { &*value }).max(0) as usize;
-    // SAFETY: the caller resolved `ctx` from the installed binding.
-    let mut state = unsafe { ctx.services() }.state::<MenuState>();
-    let Some(parent) = state.nodes.get(&id).and_then(|node| node.parent) else {
-        return 0;
-    };
-    let Some(current) = state
-        .nodes
-        .get(&parent)
-        .and_then(|node| node.children.iter().position(|&child| child == id))
-    else {
-        return 0;
-    };
-    let len = state
-        .nodes
-        .get(&parent)
-        .map_or(0, |node| node.children.len());
-    if len == 0 {
-        return 0;
     }
-    let target = target.min(len - 1);
-    if let Some(node) = state.nodes.get_mut(&parent) {
-        let child = node.children.remove(current);
-        node.children.insert(target, child);
-        node.children_dirty = true;
+    if let Err(error) = try_value_as_i64(unsafe { &*value }) {
+        return report_error(out_error, &error);
     }
     0
 }
@@ -1236,7 +1440,7 @@ fn refresh_children_array(
 }
 
 /// `HMENU` — a native menu handle a plugin could use. This build has no OS
-/// menu, so it raises a typed error (D11) instead of inventing a handle.
+/// menu, so it raises a typed error instead of inventing a handle.
 extern "C" fn menu_hmenu_get(
     _engine: *mut c_void,
     _instance: *mut c_void,
@@ -1254,75 +1458,11 @@ extern "C" fn menu_hmenu_get(
 // Static shortcut tables
 // ---------------------------------------------------------------------------
 
-/// `(display name, virtual keycode)` pairs. The reference installs the three
-/// unconditional `SetShortCutKeyCode` entries plus the `#if 0` Windows
-/// `MapVirtualKey` loop; this covers the same common keys so
-/// `textToKeycode`/`keycodeToText` round-trip.
-const SHORTCUT_KEYS: &[(&str, i64)] = &[
-    ("BkSp", 8),
-    ("Tab", 9),
-    ("Enter", 13),
-    ("Esc", 27),
-    ("Space", 32),
-    ("PgUp", 33),
-    ("PgDn", 34),
-    ("End", 35),
-    ("Home", 36),
-    ("Left", 37),
-    ("Up", 38),
-    ("Right", 39),
-    ("Down", 40),
-    ("Ins", 45),
-    ("Del", 46),
-    ("0", 48),
-    ("1", 49),
-    ("2", 50),
-    ("3", 51),
-    ("4", 52),
-    ("5", 53),
-    ("6", 54),
-    ("7", 55),
-    ("8", 56),
-    ("9", 57),
-    ("A", 65),
-    ("B", 66),
-    ("C", 67),
-    ("D", 68),
-    ("E", 69),
-    ("F", 70),
-    ("G", 71),
-    ("H", 72),
-    ("I", 73),
-    ("J", 74),
-    ("K", 75),
-    ("L", 76),
-    ("M", 77),
-    ("N", 78),
-    ("O", 79),
-    ("P", 80),
-    ("Q", 81),
-    ("R", 82),
-    ("S", 83),
-    ("T", 84),
-    ("U", 85),
-    ("V", 86),
-    ("W", 87),
-    ("X", 88),
-    ("Y", 89),
-    ("Z", 90),
-    ("F1", 112),
-    ("F2", 113),
-    ("F3", 114),
-    ("F4", 115),
-    ("F5", 116),
-    ("F6", 117),
-    ("F7", 118),
-    ("F8", 119),
-    ("F9", 120),
-    ("F10", 121),
-    ("F11", 122),
-    ("F12", 123),
-];
+/// `(display name, virtual keycode)` pairs — the reference
+/// `CreateShortCutKeyCodeTable` (`impl/MenuItemImpl.cpp:363-395`): the
+/// `MapVirtualKey` loop is `#if 0`-disabled, so only the three
+/// unconditional `SetShortCutKeyCode` entries exist.
+const SHORTCUT_KEYS: &[(&str, i64)] = &[("BkSp", 8), ("PgUp", 33), ("PgDn", 34)];
 
 /// Build the initializer for `MenuItem.textToKeycode` (lowercased keys keep
 /// the original-case display strings in the value list).
@@ -1428,7 +1568,7 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
         name: "MenuItem",
         create: menu_item_create,
         destroy: menu_item_destroy,
-        invalidate: None,
+        invalidate: Some(menu_item_invalidate),
         methods: vec![
             NativeInstanceMethodDef {
                 name: "MenuItem",

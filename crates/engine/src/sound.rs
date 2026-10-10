@@ -2,7 +2,7 @@
 //!
 //! Behavioral reference: `main`'s
 //! `crates/tvp-sound/src/{mixer,source,wavesound,waveflags}.rs`. This is
-//! the **state** half of sound, re-expressed as explicit L2 values (D9):
+//! the **state** half of sound, re-expressed as explicit L2 values:
 //!
 //! * [`SoundSource`] — caller-supplied decoded PCM plus its [`AudioSpec`]
 //!   and optional generic loop information. It owns no decoder; L1 `media`
@@ -22,7 +22,7 @@
 //! `platform`) later pulls [`Mixer::mix`] into its own callback. Two
 //! independent [`Mixer`] values in one process never interact.
 //!
-//! # Errors (D11)
+//! # Errors
 //!
 //! Invalid PCM/spec values are rejected when a [`SoundSource`] is built, and
 //! an invalid output spec is a typed [`SoundError`] rather than silent

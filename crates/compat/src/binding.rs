@@ -1,9 +1,8 @@
-//! The one process-wide engine → context binding (doc 08 §3.1).
+//! The one process-wide engine → context binding.
 //!
 //! The C++ ABI hands native callbacks only the raw `tjs2_engine*`, and
-//! `tjs` exposes **no user-data slot**. The old `tvp-*` code worked
-//! around this with process-global contexts; the target architecture keeps
-//! exactly **one** process-wide binding — this table — and documents it.
+//! `tjs` exposes **no user-data slot**, so this table keeps exactly **one**
+//! process-wide binding and documents it.
 //!
 //! It is L3 (never L1), it holds *dispatch* state (the Rust [`Tjs2Engine`],
 //! the L2 [`CompatServices`] and the [`PluginRegistry`]) and **never game

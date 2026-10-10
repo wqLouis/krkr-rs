@@ -38,9 +38,8 @@
 //! `drawText` and `drawGlyph` are registered (the reference surface is
 //! complete) but return a typed callback error: they need the L1 font
 //! rasterizer / glyph cache, which is *not* exposed through the L2/L3 service
-//! set yet. A registered method that raises a clear error is the D11
-//! counterpart of the visual family's deliberately unregistered text members
-//! (doc 08 §3: no silent stub).
+//! set yet. A registered method that raises a clear error is the
+//! counterpart of the visual family's deliberately unregistered text members.
 
 use std::ffi::{c_char, c_int, c_void};
 
@@ -48,11 +47,12 @@ use engine::layer_ops::{self, GammaAdjust, RectI};
 use engine::{BitmapState, Scene, raster};
 use tjs::{
     NativeInstanceBuilder, NativeInstanceMethodDef, NativeMethodDef, NativeStaticMembers,
-    RetainedValue, Tjs2Engine, TjsValue, VAL_INTEGER, VAL_OBJECT, VAL_REAL, VAL_VOID, Value,
+    RetainedValue, Tjs2Engine, TjsValue, VAL_INTEGER, VAL_NULL, VAL_OBJECT, VAL_REAL, VAL_STRING,
+    VAL_VOID, Value,
 };
 
-use crate::native_util::{args, report_error, set_void};
-use crate::natives::system::{EngineBinding, resolve, value_as_bool, value_as_i64};
+use crate::native_util::{args, report_error, set_void, value_as_string};
+use crate::natives::system::{EngineBinding, resolve, try_value_as_i64, value_as_bool};
 use crate::{CompatCtx, CompatError};
 
 // ---------------------------------------------------------------------------
@@ -194,11 +194,13 @@ fn argb_to_rgba(color: i64) -> [u8; 4] {
     ]
 }
 
-/// TJS `AsInteger` coercion with the reference's `tvtVoid` default.
-fn opt_i64(a: &[Value], index: usize, default: i64) -> i64 {
+/// TJS `AsInteger` coercion with the reference's `tvtVoid` default — the
+/// optional arguments convert with `(tjs_int)*param[i]`
+/// (`ImageFunction.cpp:244-264` etc.), which raises on objects.
+fn opt_i64(a: &[Value], index: usize, default: i64) -> Result<i64, String> {
     match a.get(index) {
-        Some(v) if v.ty != VAL_VOID => value_as_i64(v),
-        _ => default,
+        Some(v) if v.ty != VAL_VOID => try_value_as_i64(v),
+        _ => Ok(default),
     }
 }
 
@@ -210,46 +212,42 @@ fn opt_bool(a: &[Value], index: usize, default: bool) -> bool {
     }
 }
 
-/// TJS numeric coercion for a real-valued default.
-fn opt_f64(a: &[Value], index: usize, default: f64) -> f64 {
+/// TJS real coercion with the reference's `tvtVoid` default — `AsReal`
+/// raises on objects (`tjsVariant.h:891-901`).
+fn opt_f64(a: &[Value], index: usize, default: f64) -> Result<f64, String> {
     match a.get(index) {
-        Some(v) if v.ty != VAL_VOID => value_as_f64(v),
-        _ => default,
+        Some(v) if v.ty != VAL_VOID => match v.ty {
+            VAL_REAL => Ok(v.real),
+            VAL_INTEGER => Ok(v.integer as f64),
+            VAL_STRING => Ok(value_as_string(v).parse::<f64>().unwrap_or(0.0)),
+            _ => Err(format!("ImageFunction: argument {index} is not a number")),
+        },
+        _ => Ok(default),
     }
 }
 
-/// TJS numeric coercion.
-fn value_as_f64(v: &Value) -> f64 {
+/// TJS real coercion for the required affine-matrix arguments — the reference
+/// assigns the variants to the `tjs_real` matrix fields
+/// (`mat.a = *param[2]`, `ImageFunction.cpp:273-278`), whose `AsReal`
+/// raises on objects (`tjsVariant.h:891-901`).
+fn try_value_as_f64(v: &Value) -> Result<f64, String> {
     match v.ty {
-        VAL_INTEGER => v.integer as f64,
-        VAL_REAL => v.real,
-        _ => 0.0,
+        VAL_INTEGER => Ok(v.integer as f64),
+        VAL_REAL => Ok(v.real),
+        VAL_STRING => Ok(value_as_string(v).parse::<f64>().unwrap_or(0.0)),
+        _ => Err("ImageFunction: argument is not a number".to_string()),
     }
 }
 
 /// Resolve a script value (a `Bitmap` object, or a raw id) to a scene bitmap
-/// id. `Ok(None)` means the value is not an object with an `id`/`nativeId`.
+/// id. `Ok(None)` means the value is not a native `Bitmap`.
 fn resolve_bitmap_id(host: &Tjs2Engine, value: &Value) -> Result<Option<u32>, String> {
     match value.ty {
         VAL_INTEGER if value.integer >= 0 => Ok(Some(value.integer as u32)),
         VAL_REAL if value.real >= 0.0 => Ok(Some(value.real as u32)),
-        VAL_OBJECT => {
-            let object = host.retain_object_arg(value).map_err(|error| {
-                format!("ImageFunction: the Bitmap argument is invalid: {error}")
-            })?;
-            let mut last_error = None;
-            for member in ["nativeId", "id"] {
-                match host.get_member(object.raw_id(), member) {
-                    Ok(TjsValue::Integer(v)) if v >= 0 => return Ok(Some(v as u32)),
-                    Ok(TjsValue::Real(v)) if v >= 0.0 => return Ok(Some(v as u32)),
-                    Ok(_) => {}
-                    Err(error) => last_error = Some(error),
-                }
-            }
-            match last_error {
-                Some(error) => Err(format!("ImageFunction: cannot read the Bitmap id: {error}")),
-                None => Ok(None),
-            }
+        VAL_OBJECT if !value.object_handle().is_null() => {
+            let object = host.retain_object_arg(value)?;
+            CompatCtx::native_instance_id(host, object.raw_id(), &["Bitmap"])
         }
         _ => Ok(None),
     }
@@ -257,38 +255,56 @@ fn resolve_bitmap_id(host: &Tjs2Engine, value: &Value) -> Result<Option<u32>, St
 
 /// Resolve a required `Bitmap` argument.
 fn bitmap_arg(host: &Tjs2Engine, value: &Value, method: &str) -> Result<u32, String> {
+    // Reference: `param[0]->AsObjectClosureNoAddRef()` raises for a
+    // non-object and `if(!dst) return TJS_E_INVALIDPARAM` rejects `null`
+    // (`ImageFunction.cpp:533-548` and each method's identical preamble) —
+    // raw integer ids are not accepted.
+    if value.ty != VAL_OBJECT || value.object_handle().is_null() {
+        return Err(format!(
+            "ImageFunction.{method}: the argument is not a Bitmap object"
+        ));
+    }
     resolve_bitmap_id(host, value)?
         .ok_or_else(|| format!("ImageFunction.{method}: the argument is not a Bitmap object"))
 }
 
 /// Read an optional `Rect` argument as a half-open `RectI`. `None` is the
-/// reference's `nullptr`/absent default.
+/// reference default: a non-object argument is skipped by the
+/// `param[i]->Type() == tvtObject` guards and `null` by `if(clo.Object)`
+/// (`ImageFunction.cpp:216-235`); an object that is not a native `Rect` is
+/// the reference's `TJS_E_INVALIDPARAM` (`ImageFunction.cpp:220-224`).
 fn read_rect(host: &Tjs2Engine, value: Option<&Value>) -> Result<Option<RectI>, String> {
     let Some(value) = value else {
         return Ok(None);
     };
-    if value.ty != VAL_OBJECT || value.object_handle().is_null() {
+    if value.ty == VAL_NULL || value.ty != VAL_OBJECT || value.object_handle().is_null() {
         return Ok(None);
     }
     let object = host
         .retain_object_arg(value)
         .map_err(|error| format!("ImageFunction: the Rect argument is invalid: {error}"))?;
-    let field = |name: &str| -> Result<i32, String> {
-        match host.get_member(object.raw_id(), name) {
-            Ok(TjsValue::Integer(v)) => Ok(v as i32),
-            Ok(TjsValue::Real(v)) => Ok(v as i32),
-            Ok(_) => Err(format!(
-                "ImageFunction: the Rect member {name} is not numeric"
-            )),
-            Err(error) => Err(format!("ImageFunction: the Rect member {name}: {error}")),
-        }
+    let Some(payload) = host
+        .native_instance_payload(object.raw_id(), "Rect")
+        .map_err(|error| format!("ImageFunction: the Rect argument is invalid: {error}"))?
+    else {
+        return Err("ImageFunction: the Rect argument is not a Rect object".to_string());
     };
-    Ok(Some((
-        field("left")?,
-        field("top")?,
-        field("right")?,
-        field("bottom")?,
-    )))
+    // SAFETY: the payload is the engine-owned `RectData` allocated by the
+    // `Rect` class's create callback; it stays valid while `object` holds the
+    // retained id and the single-threaded VM runs.
+    let rect = unsafe { *(payload.as_ptr() as *const RectPayload) };
+    Ok(Some((rect.left, rect.top, rect.right, rect.bottom)))
+}
+
+/// The engine-owned `Rect` payload layout (the `Rect` native instance from
+/// `natives::rect.rs`, four `tjs_int` edges).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RectPayload {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
 }
 
 /// The whole bitmap as a half-open `RectI`.
@@ -588,14 +604,14 @@ extern "C" fn image_operate_rect(
         }
         let host = resolved.engine();
         let dst_id = bitmap_arg(host, &a[0], "operateRect")?;
-        let dx = value_as_i64(&a[1]) as i32;
-        let dy = value_as_i64(&a[2]) as i32;
+        let dx = try_value_as_i64(&a[1])? as i32;
+        let dy = try_value_as_i64(&a[2])? as i32;
         let src_id = bitmap_arg(host, &a[3], "operateRect")?;
         let src_rect = read_rect(host, a.get(4))?;
         let clip = read_rect(host, a.get(5))?;
-        let mode = opt_i64(a, 6, OM_ALPHA);
-        let face = opt_i64(a, 7, DF_ALPHA);
-        let opa = opt_i64(a, 8, 255).clamp(0, 255) as u8;
+        let mode = opt_i64(a, 6, OM_ALPHA)?;
+        let face = opt_i64(a, 7, DF_ALPHA)?;
+        let opa = opt_i64(a, 8, 255)?.clamp(0, 255) as u8;
         let hda = opt_bool(a, 9, false);
 
         let scene = scene_mut(ctx)?;
@@ -651,10 +667,10 @@ extern "C" fn image_operate_stretch(
         let dst_rect = read_rect(host, a.get(2))?;
         let src_rect = read_rect(host, a.get(3))?;
         let clip = read_rect(host, a.get(4))?;
-        let mode = opt_i64(a, 5, OM_ALPHA);
-        let face = opt_i64(a, 6, DF_ALPHA);
-        let opa = opt_i64(a, 7, 255).clamp(0, 255) as u8;
-        let stretch_type = opt_i64(a, 8, 0);
+        let mode = opt_i64(a, 5, OM_ALPHA)?;
+        let face = opt_i64(a, 6, DF_ALPHA)?;
+        let opa = opt_i64(a, 7, 255)?.clamp(0, 255) as u8;
+        let stretch_type = opt_i64(a, 8, 0)?;
         let hda = opt_bool(a, 9, false);
         // `typeopt` (index 10) only selects the cubic sub-kernel in the
         // reference; the L2 resampler picks it from `stretch_type`.
@@ -714,20 +730,20 @@ extern "C" fn image_operate_affine(
         let dst_id = bitmap_arg(host, &a[0], "operateAffine")?;
         let src_id = bitmap_arg(host, &a[1], "operateAffine")?;
         let coords = [
-            value_as_f64(&a[2]),
-            value_as_f64(&a[3]),
-            value_as_f64(&a[4]),
-            value_as_f64(&a[5]),
-            value_as_f64(&a[6]),
-            value_as_f64(&a[7]),
+            try_value_as_f64(&a[2])?,
+            try_value_as_f64(&a[3])?,
+            try_value_as_f64(&a[4])?,
+            try_value_as_f64(&a[5])?,
+            try_value_as_f64(&a[6])?,
+            try_value_as_f64(&a[7])?,
         ];
         let src_rect = read_rect(host, a.get(8))?;
         let clip = read_rect(host, a.get(9))?;
         let affine = opt_bool(a, 10, true);
-        let mode = opt_i64(a, 11, OM_ALPHA);
-        let face = opt_i64(a, 12, DF_ALPHA);
-        let opa = opt_i64(a, 13, 255).clamp(0, 255) as u8;
-        let stretch_type = opt_i64(a, 14, 0);
+        let mode = opt_i64(a, 11, OM_ALPHA)?;
+        let face = opt_i64(a, 12, DF_ALPHA)?;
+        let opa = opt_i64(a, 13, 255)?.clamp(0, 255) as u8;
+        let stretch_type = opt_i64(a, 14, 0)?;
         let hda = opt_bool(a, 15, false);
 
         let scene = scene_mut(ctx)?;
@@ -886,15 +902,15 @@ extern "C" fn image_adjust_gamma(
             return Ok(None);
         }
         let data = GammaAdjust {
-            r_gamma: opt_f64(a, 1, 1.0),
-            r_floor: opt_i64(a, 2, 0) as i32,
-            r_ceil: opt_i64(a, 3, 255) as i32,
-            g_gamma: opt_f64(a, 4, 1.0),
-            g_floor: opt_i64(a, 5, 0) as i32,
-            g_ceil: opt_i64(a, 6, 255) as i32,
-            b_gamma: opt_f64(a, 7, 1.0),
-            b_floor: opt_i64(a, 8, 0) as i32,
-            b_ceil: opt_i64(a, 9, 255) as i32,
+            r_gamma: opt_f64(a, 1, 1.0)?,
+            r_floor: opt_i64(a, 2, 0)? as i32,
+            r_ceil: opt_i64(a, 3, 255)? as i32,
+            g_gamma: opt_f64(a, 4, 1.0)?,
+            g_floor: opt_i64(a, 5, 0)? as i32,
+            g_ceil: opt_i64(a, 6, 255)? as i32,
+            b_gamma: opt_f64(a, 7, 1.0)?,
+            b_floor: opt_i64(a, 8, 0)? as i32,
+            b_ceil: opt_i64(a, 9, 255)? as i32,
         };
         let clip = read_rect(host, a.get(10))?;
         let isaddalpha = opt_bool(a, 11, false);
@@ -932,8 +948,8 @@ extern "C" fn image_do_box_blur(
         }
         let host = resolved.engine();
         let dst_id = bitmap_arg(host, &a[0], "doBoxBlur")?;
-        let xblur = opt_i64(a, 1, 1) as i32;
-        let yblur = opt_i64(a, 2, 1) as i32;
+        let xblur = opt_i64(a, 1, 1)? as i32;
+        let yblur = opt_i64(a, 2, 1)? as i32;
         let clip = read_rect(host, a.get(3))?;
         let isalpha = opt_bool(a, 4, true);
 
@@ -1008,7 +1024,7 @@ extern "C" fn image_fill_rect(
         }
         let host = resolved.engine();
         let dst_id = bitmap_arg(host, &a[0], "fillRect")?;
-        let color = argb_to_rgba(value_as_i64(&a[1]));
+        let color = argb_to_rgba(try_value_as_i64(&a[1])?);
         let rect = read_rect(host, a.get(2))?;
         let isalpha = opt_bool(a, 3, true);
         let clip = read_rect(host, a.get(4))?;
@@ -1060,10 +1076,10 @@ extern "C" fn image_color_rect(
         }
         let host = resolved.engine();
         let dst_id = bitmap_arg(host, &a[0], "colorRect")?;
-        let color = argb_to_rgba(value_as_i64(&a[1]));
-        let opa = opt_i64(a, 2, 255) as i32;
+        let color = argb_to_rgba(try_value_as_i64(&a[1])?);
+        let opa = opt_i64(a, 2, 255)? as i32;
         let rect = read_rect(host, a.get(3))?;
-        let face = normalize_color_face(opt_i64(a, 4, DF_ALPHA));
+        let face = normalize_color_face(opt_i64(a, 4, DF_ALPHA)?);
         let clip = read_rect(host, a.get(5))?;
 
         let scene = scene_mut(ctx)?;
@@ -1115,7 +1131,7 @@ extern "C" fn image_color_rect(
 /// Registered but not implemented: the L1 font rasterizer / glyph cache is
 /// not exposed through the L2/L3 service set yet (the same reason the visual
 /// `Layer.drawText` is deliberately unregistered). Returning an explicit
-/// error keeps the reference surface complete without a silent stub (D11).
+/// error keeps the reference surface complete without a silent stub.
 extern "C" fn image_draw_text(
     engine: *mut c_void,
     argc: c_int,
@@ -1128,8 +1144,7 @@ extern "C" fn image_draw_text(
             return Err("ImageFunction.drawText requires 6 arguments".into());
         }
         Err(
-            "ImageFunction.drawText: the font rasterizer is not exposed through the L2/L3 \
-             service set yet"
+            "ImageFunction.drawText: the font rasterizer is not exposed by the host services"
                 .into(),
         )
     })
@@ -1151,8 +1166,8 @@ extern "C" fn image_draw_glyph(
             return Err("ImageFunction.drawGlyph requires 5 arguments".into());
         }
         Err(
-            "ImageFunction.drawGlyph: the font rasterizer / glyph cache is not exposed through \
-             the L2/L3 service set yet"
+            "ImageFunction.drawGlyph: the font rasterizer / glyph cache is not exposed by the \
+             host services"
                 .into(),
         )
     })

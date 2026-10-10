@@ -20,7 +20,7 @@
 //! end_frame              // bump held counters, frame += 1
 //! ```
 //!
-//! [`InputState`] owns no global and no clock: all state is explicit (D9).
+//! [`InputState`] owns no global and no clock: all state is explicit.
 
 #![allow(clippy::cast_precision_loss)]
 

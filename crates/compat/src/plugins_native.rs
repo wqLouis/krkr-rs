@@ -3,8 +3,8 @@
 //! `link(name)` activates a built-in plugin emulation or installs the [null
 //! plugin object](crate::null_plugin); `unlink(name)` forgets a linked name;
 //! `getList()` returns the linked names. This mirrors the reference
-//! `Plugins` class (static members only) with the null-plugin behavior from
-//! doc 08 §4.2 wired in.
+//! `Plugins` class (static members only) with the null-plugin behavior wired
+//! in.
 
 use std::ffi::{c_char, c_int, c_void};
 
@@ -74,8 +74,11 @@ extern "C" fn native_link(
             0
         }
         Ok(PluginOutcome::Null) => {
+            // `null_plugin::install` has already logged the outcome: the
+            // null object was installed as `global[stem]`, or an existing
+            // binding at that stem was kept (never clobbered).
             log::warn!(
-                "Plugins.link({name:?}): no built-in emulation; installed a null plugin object"
+                "Plugins.link({name:?}): no built-in emulation; null plugin path (doc 08 §4.2)"
             );
             set_void(out);
             0

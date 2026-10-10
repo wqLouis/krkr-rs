@@ -10,12 +10,13 @@ use tjs::{
 };
 
 use super::common::{
-    ObjectKind, VisualState, bound, duplicate_object, input_ref, reparent_layer, resolve_object_id,
+    ObjectKind, VisualState, WindowObject, bound, duplicate_object, input_ref, resolve_object_id,
     scene_mut, scene_ref, set_null_out, set_object_out, set_real, set_retained_out,
 };
 use crate::native_util::{args, report_error, set_bool, set_int, set_void, value_as_string};
 use crate::natives::system::{set_string_out, value_as_bool, value_as_i64};
 use crate::{CompatCtx, CompatError};
+use tjs::VAL_OBJECT;
 
 /// `Window` payload: the scene id plus the window properties the L2
 /// [`engine::WindowState`] does not model (there is no OS chrome).
@@ -140,13 +141,23 @@ extern "C" fn window_destroy(engine: *mut c_void, instance: *mut c_void) {
         return;
     }
     let inst = unsafe { &*(instance as *const WindowInst) };
-    if let (Some(id), Ok((_resolved, ctx))) = (inst.id, bound(engine)) {
-        // SAFETY: the caller resolved `ctx` from the installed binding.
-        unsafe { ctx.services() }
-            .state::<VisualState>()
-            .objects
-            .windows
-            .remove(&id);
+    if let (Some(id), Ok((resolved, ctx))) = (inst.id, bound(engine)) {
+        let registered = {
+            // SAFETY: the caller resolved `ctx` from the installed binding.
+            let mut state = unsafe { ctx.services() }.state::<VisualState>();
+            state.objects.windows.remove(&id);
+            state.window_objects.remove(&id)
+        };
+        // Invalidate every object registered through `Window.add` (reference
+        // `ObjectVector`); the retained values are released when `registered`
+        // drops, breaking the window→object references.
+        if let Some(registered) = registered {
+            for entry in &registered {
+                if let Err(error) = resolved.engine().invalidate_retained(entry.value.raw_id()) {
+                    log::warn!("Window: invalidate failed: {error}");
+                }
+            }
+        }
     }
     // SAFETY: instance came from `window_create`'s `Box::into_raw` and is
     // freed exactly once by the VM.
@@ -286,7 +297,10 @@ extern "C" fn window_update(
     0
 }
 
-/// `Window.add(layer)` — attach a layer under `primaryLayer`.
+/// `Window.add(obj)` — register an object whose lifetime is tied to the
+/// window (reference `tTJSNI_BaseWindow::Add` / `ObjectVector`). The window
+/// retains `obj` and invalidates it when the window is destroyed; adding the
+/// same closure twice is a no-op.
 extern "C" fn window_add(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -303,30 +317,35 @@ extern "C" fn window_add(
         return report_error(out_error, "Window.add: compat context is not bound");
     };
     let a = unsafe { args(argv, argc) };
-    let layer_id = match resolve_object_id(resolved.engine(), &a[0]) {
-        Ok(id) if id >= 0 => id as u32,
-        Ok(_) => return report_error(out_error, "Window.add: not a Layer object"),
+    if a[0].ty != VAL_OBJECT {
+        return report_error(out_error, "Window.add requires an object argument");
+    }
+    // Identity is the raw object pointer plus the closure receiver (the
+    // reference compares `tTJSVariantClosure`s).
+    let identity = (a[0].retained, a[0].array as usize);
+    let value = match resolved.engine().retain_object_arg(&a[0]) {
+        Ok(value) => value,
         Err(error) => return report_error(out_error, &error),
     };
     let inst = unsafe { &*(instance as *const WindowInst) };
     let Some(window) = inst.id else {
         return report_error(out_error, "Window.add: this window is not constructed");
     };
-    let scene = match scene_mut(&ctx) {
-        Ok(scene) => scene,
-        Err(error) => return report_error(out_error, &error),
-    };
-    let primary = scene
-        .window(window)
-        .and_then(|w| w.primary_layer)
-        .filter(|&primary| primary != layer_id);
-    reparent_layer(scene, layer_id, primary);
+    // SAFETY: the caller resolved `ctx` from the installed binding.
+    let mut registered = unsafe { ctx.services() }.state::<VisualState>();
+    let entries = registered.window_objects.entry(window).or_default();
+    if entries.iter().any(|entry| entry.identity == identity) {
+        set_void(out);
+        return 0;
+    }
+    entries.push(WindowObject { identity, value });
     set_void(out);
     0
 }
 
-/// `Window.remove(layer)` — part a layer from this window (`Part()`
-/// detachment; the children stay alive).
+/// `Window.remove(obj)` — unregister a `Window.add`ed object (reference
+/// `tTJSNI_BaseWindow::Remove`). Dropping the retained value also breaks the
+/// window→object reference.
 extern "C" fn window_remove(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -339,25 +358,22 @@ extern "C" fn window_remove(
     if argc < 1 {
         return report_error(out_error, "Window.remove requires 1 argument");
     }
-    let Ok((resolved, ctx)) = bound(engine) else {
+    let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Window.remove: compat context is not bound");
     };
     let a = unsafe { args(argv, argc) };
-    let layer_id = match resolve_object_id(resolved.engine(), &a[0]) {
-        Ok(id) if id >= 0 => id as u32,
-        Ok(_) => return report_error(out_error, "Window.remove: not a Layer object"),
-        Err(error) => return report_error(out_error, &error),
-    };
+    if a[0].ty != VAL_OBJECT {
+        return report_error(out_error, "Window.remove requires an object argument");
+    }
+    let identity = (a[0].retained, a[0].array as usize);
     let inst = unsafe { &*(instance as *const WindowInst) };
     let Some(window) = inst.id else {
         return report_error(out_error, "Window.remove: this window is not constructed");
     };
-    let scene = match scene_mut(&ctx) {
-        Ok(scene) => scene,
-        Err(error) => return report_error(out_error, &error),
-    };
-    if scene.layer(layer_id).is_some_and(|l| l.window == window) {
-        scene.remove_layer(layer_id);
+    // SAFETY: the caller resolved `ctx` from the installed binding.
+    let mut registered = unsafe { ctx.services() }.state::<VisualState>();
+    if let Some(entries) = registered.window_objects.get_mut(&window) {
+        entries.retain(|entry| entry.identity != identity);
     }
     set_void(out);
     0
@@ -589,19 +605,12 @@ extern "C" fn window_post_input_event(
 
 // --- Window properties -----------------------------------------------------
 
-extern "C" fn window_id_get(
-    _engine: *mut c_void,
-    instance: *mut c_void,
-    out: *mut Value,
-    _out_error: *mut *mut c_char,
-    _objthis: *mut c_void,
-) -> c_int {
-    let inst = unsafe { &*(instance as *const WindowInst) };
-    match inst.id {
-        Some(id) => set_int(out, i64::from(id)),
-        None => set_int(out, 0),
-    }
-    0
+/// The scene id a `Window` payload carries — the reader behind the VM's
+/// native-instance lookup (`native_instance_payload("Window")`), replacing
+/// the removed `id` script member for engine call sites.
+pub(super) fn window_payload_id(payload: *mut c_void) -> Option<u32> {
+    // SAFETY: `native_instance_payload("Window")` only hands out Window payloads.
+    unsafe { &*(payload as *const WindowInst) }.id
 }
 
 extern "C" fn window_visible_get(
@@ -956,9 +965,10 @@ extern "C" fn window_focused_layer_set(
         return 0;
     };
     let value = unsafe { &*value };
-    let layer_id = match resolve_object_id(resolved.engine(), value) {
+    let layer_id = match resolve_object_id(resolved.engine(), value, &["Layer"]) {
         Ok(id) if id >= 0 => Some(id as u32),
-        _ => None,
+        Ok(_) => None,
+        Err(error) => return report_error(out_error, &format!("Window.focusedLayer: {error}")),
     };
     let scene = match scene_mut(&ctx) {
         Ok(scene) => scene,
@@ -1266,7 +1276,7 @@ extern "C" fn window_reset_mouse_velocity(
 
 // --- Window host facts -----------------------------------------------------
 
-/// `Window.HWND` — Win32-only. D11: an absent host fact is a typed error, not
+/// `Window.HWND` — Win32-only. An absent host fact is a typed error, not
 /// a silent `0`.
 extern "C" fn window_hwnd_get(
     _engine: *mut c_void,
@@ -1281,9 +1291,10 @@ extern "C" fn window_hwnd_get(
     )
 }
 
-/// `Window.drawDevice` — no L2 draw-device object is exposed. D11: typed
-/// error instead of a fabricated object. The wording also keeps the legacy
-/// "absent member" guard truthful: the host object really does not exist.
+/// `Window.drawDevice` — no L2 draw-device object is exposed, so this is a
+/// typed error instead of a fabricated object. The wording also keeps the
+/// legacy "absent member" guard truthful: the host object really does not
+/// exist.
 extern "C" fn window_draw_device_get(
     _engine: *mut c_void,
     _instance: *mut c_void,
@@ -1311,8 +1322,8 @@ extern "C" fn window_draw_device_set(
     )
 }
 
-/// `Window.displayOrientation` — no display is attached to the L2 scene.
-/// D11: typed error instead of a hardcoded SM_* value.
+/// `Window.displayOrientation` — no display is attached to the L2 scene, so
+/// this is a typed error instead of a hardcoded SM_* value.
 extern "C" fn window_display_orientation_get(
     _engine: *mut c_void,
     _instance: *mut c_void,
@@ -1326,8 +1337,8 @@ extern "C" fn window_display_orientation_get(
     )
 }
 
-/// `Window.displayRotate` — no display is attached to the L2 scene. D11:
-/// typed error instead of a hardcoded `0`.
+/// `Window.displayRotate` — no display is attached to the L2 scene, so this
+/// is a typed error instead of a hardcoded `0`.
 extern "C" fn window_display_rotate_get(
     _engine: *mut c_void,
     _instance: *mut c_void,
@@ -1341,8 +1352,8 @@ extern "C" fn window_display_rotate_get(
     )
 }
 
-/// `Window.registerMessageReceiver(mode, recv, handler)` — Win32-only. D11:
-/// typed error, never a silent no-op.
+/// `Window.registerMessageReceiver(mode, recv, handler)` — Win32-only, so
+/// this is a typed error, never a silent no-op.
 extern "C" fn window_register_message_receiver(
     _engine: *mut c_void,
     _instance: *mut c_void,
@@ -1365,8 +1376,8 @@ extern "C" fn window_register_message_receiver(
 }
 
 /// `Window.findFullScreenCandidates(...)` — the reference body is disabled
-/// (`#if 0`); no L2 platform display list is exposed. D11: typed error rather
-/// than returning fabricated candidates.
+/// (`#if 0`); no L2 platform display list is exposed, so this is a typed
+/// error rather than returning fabricated candidates.
 extern "C" fn window_find_full_screen_candidates(
     _engine: *mut c_void,
     _instance: *mut c_void,
@@ -1483,13 +1494,11 @@ extern "C" fn window_touch_rotate_threshold_set(
 }
 
 /// Drain the queued `Window.bringToFront` requests (`(window_id)`).
-#[allow(dead_code)]
 pub fn take_bring_to_front_requests(services: &crate::CompatServices) -> Vec<u32> {
     std::mem::take(&mut services.state::<VisualState>().bring_to_front)
 }
 
 /// Drain the queued `Window.update` requests (`(window_id, update_type)`).
-#[allow(dead_code)]
 pub fn take_update_requests(services: &crate::CompatServices) -> Vec<(u32, i32)> {
     std::mem::take(&mut services.state::<VisualState>().update_requests)
 }
@@ -1691,11 +1700,6 @@ pub(super) fn register_window_class(ctx: &mut CompatCtx) -> Result<(), CompatErr
             },
         ],
         properties: vec![
-            NativeInstancePropertyDef {
-                name: "id",
-                get: Some(window_id_get),
-                set: None,
-            },
             NativeInstancePropertyDef {
                 name: "visible",
                 get: Some(window_visible_get),

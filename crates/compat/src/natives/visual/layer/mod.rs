@@ -27,9 +27,12 @@ mod pixels;
 mod transitions;
 mod util;
 
+pub use focus::take_capture_releases;
+pub use transitions::advance_transitions;
+
 /// Per-layer L3 state that has no home in the L2 [`engine::Scene`] yet: the
 /// active transition, the modal-layer stack and the pending capture-release
-/// requests the layer-tree owner drains.
+/// requests the frame body drains.
 ///
 /// Keyed by [`std::any::TypeId`] in [`CompatServices::state`](crate::CompatServices::state),
 /// never a process global.
@@ -46,17 +49,25 @@ struct LayerExtras {
 }
 
 /// One active layer transition (`beginTransition`).
-#[allow(dead_code)]
 struct LayerTransition {
     trans: engine::trans::Trans,
+    /// The `transwith` layer the destination is being blended into (the
+    /// reference's transition source).
     source: u32,
-    with_children: bool,
 }
 
 #[derive(Default)]
 struct LayerInst {
     id: Option<u32>,
     font_object: Option<DetachedValue>,
+}
+
+/// The scene id a `Layer` payload carries — the reader behind the VM's
+/// native-instance lookup (`native_instance_payload("Layer")`), replacing
+/// the removed `id`/`nativeId` script members for engine call sites.
+pub(super) fn layer_payload_id(payload: *mut c_void) -> Option<u32> {
+    // SAFETY: `native_instance_payload("Layer")` only hands out Layer payloads.
+    unsafe { &*(payload as *const LayerInst) }.id
 }
 
 /// The window pointer position, preferring an active touch contact.
@@ -239,9 +250,11 @@ extern "C" fn layer_ctor(
         Some(value)
             if value.ty == VAL_OBJECT || value.ty == VAL_INTEGER || value.ty == VAL_REAL =>
         {
-            resolve_object_id(resolved.engine(), value)
-                .ok()
-                .filter(|&id| id >= 0)
+            match resolve_object_id(resolved.engine(), value, &["Window"]) {
+                Ok(id) if id >= 0 => Some(id),
+                Ok(_) => None,
+                Err(error) => return report_error(out_error, &format!("Layer: {error}")),
+            }
         }
         _ => None,
     };
@@ -249,10 +262,13 @@ extern "C" fn layer_ctor(
     // scene borrow so the getter cannot re-enter the VM while `&mut Scene` is
     // held.
     let parent = match a.get(1) {
-        Some(value) if value.ty == VAL_OBJECT => resolve_object_id(resolved.engine(), value)
-            .ok()
-            .filter(|&id| id >= 0)
-            .map(|id| id as u32),
+        Some(value) if value.ty == VAL_OBJECT => {
+            match resolve_object_id(resolved.engine(), value, &["Layer"]) {
+                Ok(id) if id >= 0 => Some(id as u32),
+                Ok(_) => None,
+                Err(error) => return report_error(out_error, &format!("Layer: {error}")),
+            }
+        }
         Some(value) if value.ty == VAL_INTEGER && value.integer >= 0 => Some(value.integer as u32),
         _ => None,
     };
@@ -274,6 +290,7 @@ extern "C" fn layer_ctor(
     };
     let id = scene.add_layer(window, parent);
     inst.id = Some(id);
+    log::debug!("Layer created: id={id} parent={parent:?}");
     register_layer(&ctx, resolved.engine(), id, objthis);
     set_int(out, i64::from(id));
     0
@@ -475,62 +492,117 @@ extern "C" fn layer_set_image_size(
     0
 }
 
-/// Shared body of `Layer.assignImages`.
-fn layer_attach_bitmap(
-    engine: *mut c_void,
-    instance: *mut c_void,
-    argc: c_int,
-    argv: *const Value,
-    out: *mut Value,
-    out_error: *mut *mut c_char,
-    method: &str,
-) -> c_int {
-    if argc < 1 {
-        return report_error(
-            out_error,
-            &format!("Layer.{method} requires a Bitmap argument"),
-        );
+/// Copy `source`'s MainImage and ProvinceImage into `dest`, following the
+/// reference `tTJSNI_BaseLayer::AssignImages` (`LayerIntf.cpp:2394-2432`):
+/// a present source image is assigned into ours, an absent one deallocates
+/// ours (`DeallocateImage`/`DeallocateProvinceImage`, `:2349-2378`); the
+/// main image fields are adopted and the clip reset
+/// (`InternalSetImageSize`/`ResetClip`, `:2419-2430`); `ImageModified` is
+/// set. The reference's trailing `Update(false)` is a plain repaint, which
+/// the projection already performs every frame; `pending_paint` is reserved
+/// for the `onPaint` dispatch (`CallOnPaint`, set by `UpdateByScript`), so
+/// this member must not re-arm it.
+fn assign_images(scene: &mut Scene, dest: u32, source: u32) {
+    // A source whose layer record is gone (a shut-down object) has nothing to
+    // copy; leave the destination untouched rather than treating the missing
+    // image as an empty one and deallocating it.
+    if scene.layer(source).is_none() {
+        return;
     }
-    let Ok((resolved, ctx)) = bound(engine) else {
-        return report_error(
-            out_error,
-            &format!("Layer.{method}: compat context is not bound"),
-        );
-    };
-    let bitmap_id = match resolve_object_id(resolved.engine(), &unsafe { args(argv, argc) }[0]) {
-        Ok(id) if id >= 0 => id as u32,
-        Ok(_) => return report_error(out_error, &format!("Layer.{method}: not a Bitmap object")),
-        Err(error) => return report_error(out_error, &error),
-    };
-    let inst = unsafe { &*(instance as *const LayerInst) };
-    let Some(id) = inst.id else {
-        return report_error(
-            out_error,
-            &format!("Layer.{method}: this layer is not constructed"),
-        );
-    };
-    let scene = match scene_mut(&ctx) {
-        Ok(scene) => scene,
-        Err(error) => return report_error(out_error, &error),
-    };
-    let Some((width, height)) = scene.bitmap(bitmap_id).map(|b| (b.width, b.height)) else {
-        return report_error(
-            out_error,
-            &format!("Layer.{method}: the bitmap does not exist"),
-        );
-    };
-    if let Some(layer) = scene.layer_mut(id) {
-        layer.bitmap = Some(bitmap_id);
-        layer.image_left = 0;
-        layer.image_top = 0;
-        layer.image_width = width;
-        layer.image_height = height;
+    // Snapshot the source before touching the destination: the two may share
+    // a bitmap id, and the copy must reflect the pre-write source.
+    let src_main = scene
+        .layer(source)
+        .and_then(|layer| layer.bitmap)
+        .and_then(|id| scene.bitmap(id))
+        .map(|bitmap| (bitmap.width, bitmap.height, bitmap.rgba.clone()));
+    let src_image = scene.layer(source).map(|layer| {
+        (
+            layer.image_left,
+            layer.image_top,
+            layer.image_width,
+            layer.image_height,
+        )
+    });
+    let src_province = scene.layer(source).map(|layer| {
+        (
+            layer.province.clone(),
+            layer.province_width,
+            layer.province_height,
+        )
+    });
+
+    // MainImage (`LayerIntf.cpp:2399-2408`). Reuse the destination's own
+    // bitmap, but never overwrite one owned by a script `Bitmap` object
+    // (`script_owned`, e.g. a PSD-placed image): the reference's MainImage is
+    // layer-private, so adopt a fresh copy instead of corrupting the script's.
+    if let Some((width, height, rgba)) = src_main {
+        let reusable = scene
+            .layer(dest)
+            .and_then(|layer| layer.bitmap)
+            .filter(|id| scene.bitmap(*id).is_some_and(|bitmap| !bitmap.script_owned));
+        match reusable {
+            Some(bitmap_id) => {
+                scene.resize_bitmap(bitmap_id, width, height, [0, 0, 0, 0]);
+                if let Some(bitmap) = scene.bitmap_mut(bitmap_id) {
+                    bitmap.rgba = rgba;
+                    bitmap.dirty = true;
+                }
+            }
+            None => {
+                let bitmap_id = scene.add_bitmap(width, height, rgba);
+                if let Some(layer) = scene.layer_mut(dest) {
+                    layer.bitmap = Some(bitmap_id);
+                }
+            }
+        }
+    } else {
+        // `DeallocateImage` (`LayerIntf.cpp:2349-2356`); release the old
+        // bitmap like the `hasImage = false` setter, which keeps a shared or
+        // script-owned bitmap alive when another holder remains.
+        let removed = scene.layer_mut(dest).and_then(|layer| layer.bitmap.take());
+        if let Some(bitmap) = removed {
+            scene.release_bitmap(bitmap);
+        }
+    }
+
+    // ProvinceImage (`LayerIntf.cpp:2410-2417`).
+    match src_province {
+        Some((plane, width, height)) => {
+            if let Some(layer) = scene.layer_mut(dest) {
+                layer.province = plane;
+                layer.province_width = width;
+                layer.province_height = height;
+            }
+        }
+        None => scene.deallocate_province_image(dest),
+    }
+
+    // `InternalSetImageSize` + `ImageModified` + `ResetClip`
+    // (`LayerIntf.cpp:2419-2430`).
+    let has_main = scene
+        .layer(dest)
+        .is_some_and(|layer| layer.bitmap.is_some());
+    if let Some(layer) = scene.layer_mut(dest) {
+        if has_main {
+            if let Some((left, top, width, height)) = src_image {
+                layer.image_left = left;
+                layer.image_top = top;
+                layer.image_width = width;
+                layer.image_height = height;
+            }
+            layer.clip = None;
+        }
         layer.image_modified = true;
     }
-    set_void(out);
-    0
 }
 
+/// `Layer.assignImages(srcLayer)` — copy the source layer's images into this
+/// layer (reference `tTJSNI_BaseLayer::AssignImages`,
+/// `LayerIntf.cpp:2394-2432`). The argument is resolved only through the
+/// Layer native instance, so a non-object, `null`, or a non-Layer object
+/// raises `TVPSpecifyLayer` (`LayerIntf.cpp:9860-9882`); a missing argument
+/// is `TJS_E_BADPARAMCOUNT` (`:9860-9861`).
 extern "C" fn layer_assign_images(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -540,7 +612,38 @@ extern "C" fn layer_assign_images(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    layer_attach_bitmap(engine, instance, argc, argv, out, out_error, "assignImages")
+    if argc < 1 {
+        return report_error(out_error, "Layer.assignImages requires 1 argument");
+    }
+    let Ok((resolved, ctx)) = bound(engine) else {
+        return report_error(out_error, "Layer.assignImages: compat context is not bound");
+    };
+    // Reference `param[0]->AsObjectClosureNoAddRef()` throws for a
+    // non-object, then `NativeInstanceSupport(TJS_NIS_GETINSTANCE,
+    // Layer::ClassID)` and `TVPSpecifyLayer` reject the rest
+    // (`LayerIntf.cpp:9863-9875`).
+    let value = &unsafe { args(argv, argc) }[0];
+    if value.ty != VAL_OBJECT {
+        return report_error(out_error, "Layer.assignImages: not a Layer object");
+    }
+    let source = match resolve_object_id(resolved.engine(), value, &["Layer"]) {
+        Ok(id) if id >= 0 => id as u32,
+        _ => return report_error(out_error, "Layer.assignImages: not a Layer object"),
+    };
+    let inst = unsafe { &*(instance as *const LayerInst) };
+    let Some(id) = inst.id else {
+        return report_error(
+            out_error,
+            "Layer.assignImages: this layer is not constructed",
+        );
+    };
+    let scene = match scene_mut(&ctx) {
+        Ok(scene) => scene,
+        Err(error) => return report_error(out_error, &error),
+    };
+    assign_images(scene, id, source);
+    set_void(out);
+    0
 }
 
 /// `Layer.copyFromBitmapToMainImage(bitmap)` — copy the source pixels into
@@ -566,10 +669,15 @@ extern "C" fn layer_copy_from_bitmap_to_main_image(
             "Layer.copyFromBitmapToMainImage: compat context is not bound",
         );
     };
-    let bitmap_id = match resolve_object_id(resolved.engine(), &unsafe { args(argv, argc) }[0]) {
+    let bitmap_id = match resolve_object_id(
+        resolved.engine(),
+        &unsafe { args(argv, argc) }[0],
+        &["Bitmap"],
+    ) {
         Ok(id) if id >= 0 => id as u32,
-        Ok(_) => return report_error(out_error, "Layer.copyFromBitmapToMainImage: not a Bitmap"),
-        Err(error) => return report_error(out_error, &error),
+        _ => {
+            return report_error(out_error, "Layer.copyFromBitmapToMainImage: not a Bitmap");
+        }
     };
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
@@ -698,10 +806,11 @@ extern "C" fn layer_set_parent_id(
         if value.ty == VAL_VOID {
             None
         } else {
-            resolve_object_id(resolved.engine(), value)
-                .ok()
-                .filter(|&id| id >= 0)
-                .map(|id| id as u32)
+            match resolve_object_id(resolved.engine(), value, &["Layer"]) {
+                Ok(id) if id >= 0 => Some(id as u32),
+                Ok(_) => None,
+                Err(error) => return report_error(out_error, &format!("Layer.parent: {error}")),
+            }
         }
     } else {
         None
@@ -773,6 +882,46 @@ extern "C" fn layer_update(
     0
 }
 
+/// Fire `onPaint` for every layer whose `pending_paint` flag is set — the
+/// per-draw `tTJSNI_BaseLayer::BeforeCompletion` step
+/// (`reference/cpp/core/visual/LayerIntf.cpp:6401-6402`): the flag is cleared
+/// and the event is posted to the layer object, so a script override runs.
+///
+/// This is what makes `AffineLayer` render: its `onPaint` copies the hidden
+/// inner `_image` layer onto the visible outer layer and syncs the outer
+/// size (`system/affinelayer.tjs:_image`/`super.assignImages(_image)`), and
+/// nothing else composites it. The frame body calls this before the draw, so
+/// a layer whose `update()` (or `setSize*`/`loadImages`, which call it) armed
+/// the flag gets its composed bitmap rendered in the same frame.
+///
+/// The clear happens **before** the call, like the reference, so a re-entrant
+/// `update()` from inside `onPaint` persists to the next frame's dispatch.
+pub fn paint_poll(ctx: &CompatCtx) -> Result<(), String> {
+    let ids: Vec<u32> = scene_ref(ctx)?
+        .layers
+        .iter()
+        .filter(|layer| layer.pending_paint)
+        .map(|layer| layer.id)
+        .collect();
+    if ids.is_empty() {
+        return Ok(());
+    }
+    // SAFETY: the caller resolved `ctx` from the installed binding.
+    let host = unsafe { ctx.engine() };
+    for id in ids {
+        if let Some(layer) = scene_mut(ctx)?.layer_mut(id) {
+            layer.pending_paint = false;
+        }
+        let Some(target) = duplicate_object(ctx, host, ObjectKind::Layer, id) else {
+            continue;
+        };
+        if let Err(error) = host.call_member(target.raw_id(), "onPaint", &[]) {
+            log::warn!("Layer {id}: onPaint handler failed: {error}");
+        }
+    }
+    Ok(())
+}
+
 /// `Layer.setClip(left, top, width, height)`.
 extern "C" fn layer_set_clip(
     engine: *mut c_void,
@@ -842,7 +991,7 @@ extern "C" fn layer_get_province_pixel(
         Ok(scene) => scene,
         Err(error) => return report_error(out_error, &error),
     };
-    set_int(out, i64::from(scene.get_province_pixel(id, x, y)));
+    set_int(out, i64::from(scene.province_pixel(id, x, y)));
     0
 }
 
@@ -1020,10 +1169,9 @@ fn with_layer_write(
     Ok(())
 }
 
-/// Define a read/write layer property over an `i64`/bool field.
-macro_rules! layer_int_prop {
-    ($get:ident, $set:ident, $getter:expr, $setter:expr) => {
-        #[allow(dead_code)]
+/// Define a read-only `Layer` integer property (getter only, no setter).
+macro_rules! layer_int_get {
+    ($get:ident, $getter:expr) => {
         extern "C" fn $get(
             engine: *mut c_void,
             instance: *mut c_void,
@@ -1039,7 +1187,27 @@ macro_rules! layer_int_prop {
                 Err(error) => report_error(out_error, &error),
             }
         }
-        #[allow(dead_code)]
+    };
+}
+
+/// Define a read/write layer property over an `i64`/bool field.
+macro_rules! layer_int_prop {
+    ($get:ident, $set:ident, $getter:expr, $setter:expr) => {
+        extern "C" fn $get(
+            engine: *mut c_void,
+            instance: *mut c_void,
+            out: *mut Value,
+            out_error: *mut *mut c_char,
+            _objthis: *mut c_void,
+        ) -> c_int {
+            match with_layer_read(engine, instance, $getter) {
+                Ok(value) => {
+                    set_int(out, value);
+                    0
+                }
+                Err(error) => report_error(out_error, &error),
+            }
+        }
         extern "C" fn $set(
             engine: *mut c_void,
             instance: *mut c_void,
@@ -1061,7 +1229,11 @@ layer_int_prop!(
     layer_visible_get,
     layer_visible_set,
     |l: &LayerState| i64::from(l.visible),
-    |l: &mut LayerState, v: &Value| l.visible = value_as_bool(v)
+    |l: &mut LayerState, v: &Value| {
+        let visible = value_as_bool(v);
+        log::debug!("Layer {} .visible -> {visible}", l.id);
+        l.visible = visible;
+    }
 );
 layer_int_prop!(
     layer_type_get,
@@ -1092,12 +1264,6 @@ layer_int_prop!(
     layer_height_set,
     |l: &LayerState| i64::from(l.rect.h),
     |l: &mut LayerState, v: &Value| l.rect.h = value_as_i64(v).max(0) as u32
-);
-layer_int_prop!(
-    layer_id_get,
-    layer_id_set,
-    |l: &LayerState| i64::from(l.id),
-    |_l: &mut LayerState, _v: &Value| {}
 );
 layer_int_prop!(
     layer_absolute_get,
@@ -1147,18 +1313,12 @@ layer_int_prop!(
     |l: &LayerState| i64::from(l.image_top),
     |l: &mut LayerState, v: &Value| l.image_top = value_as_i64(v) as i32
 );
-layer_int_prop!(
-    layer_image_width_get,
-    layer_image_width_set,
-    |l: &LayerState| i64::from(l.image_width),
-    |_l: &mut LayerState, _v: &Value| {}
-);
-layer_int_prop!(
-    layer_image_height_get,
-    layer_image_height_set,
-    |l: &LayerState| i64::from(l.image_height),
-    |_l: &mut LayerState, _v: &Value| {}
-);
+layer_int_get!(layer_image_width_get, |l: &LayerState| i64::from(
+    l.image_width
+));
+layer_int_get!(layer_image_height_get, |l: &LayerState| i64::from(
+    l.image_height
+));
 layer_int_prop!(
     layer_focusable_get,
     layer_focusable_set,
@@ -1976,11 +2136,7 @@ fn boxed_font_object(
         }
         Err(error) => return report_error(out_error, &format!("Layer.font: {error}")),
     };
-    if let Err(error) = host.call_member(
-        wrapper.raw_id(),
-        "__bind",
-        &[TjsValue::Integer(i64::from(font_id))],
-    ) {
+    if let Err(error) = super::font::bind_font_object(host, ctx, wrapper.raw_id(), font_id) {
         return report_error(out_error, &format!("Layer.font: {error}"));
     }
     inst.font_object = Some(wrapper);
@@ -1999,9 +2155,10 @@ extern "C" fn layer_font_set(
     let Ok((resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Layer.font: compat context is not bound");
     };
-    let source_id = match resolve_object_id(resolved.engine(), unsafe { &*value }) {
+    let source_id = match resolve_object_id(resolved.engine(), unsafe { &*value }, &["Font"]) {
         Ok(id) if id >= 0 => id as u32,
-        _ => return 0,
+        Ok(_) => return report_error(out_error, "Layer.font: the value is not a Font"),
+        Err(error) => return report_error(out_error, &format!("Layer.font: {error}")),
     };
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(layer_id) = inst.id else {
@@ -2118,16 +2275,6 @@ pub(super) fn register_layer_class(ctx: &mut CompatCtx) -> Result<(), CompatErro
         invalidate: None,
         methods,
         properties: vec![
-            NativeInstancePropertyDef {
-                name: "id",
-                get: Some(layer_id_get),
-                set: None,
-            },
-            NativeInstancePropertyDef {
-                name: "nativeId",
-                get: Some(layer_id_get),
-                set: None,
-            },
             NativeInstancePropertyDef {
                 name: "font",
                 get: Some(layer_font_get),

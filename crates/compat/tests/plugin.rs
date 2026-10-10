@@ -151,3 +151,46 @@ fn link_installs_null_object_for_unknown_plugin() {
         .expect("unlink");
     assert!(host.registry().linked().is_empty());
 }
+
+/// Table completeness: every DLL the shipped game links
+/// plus the reference `NCB_MODULE_NAME` aliases of ported plugins must
+/// resolve to a built-in — anything else would take the null path and
+/// shadow the real emulation.
+///
+/// Verified against `reference/cpp/plugins/**` (`NCB_MODULE_NAME` and the
+/// `CMakeLists.txt` source list): `layerExMovie.cpp` → `layerExMovie.dll`,
+/// `layerExPerspective.cpp` → `perspective.dll`, `steamPlugin.cpp` →
+/// `krkrsteam.dll`, `steam_api.cpp` → `steam_api.dll`,
+/// `DrawDeviceForSteam.cpp` → `DrawDeviceForSteam.dll`.
+#[test]
+fn builtin_table_covers_the_games_links_and_reference_aliases() {
+    let registry = PluginRegistry::builtin();
+    for name in [
+        // The nine links in the shipped game's `system/*.tjs`.
+        "csvParser.dll",
+        "extrans.dll",
+        "fstat.dll",
+        "getSample.dll",
+        "KAGParserEx.dll",
+        "layerExDraw.dll",
+        "win32dialog.dll",
+        "windowEx.dll",
+        "wuvorbis.dll",
+        // Reference aliases of ported plugins.
+        "layerExMovie.dll",
+        "perspective.dll",
+        "krkrsteam.dll",
+        "steam_api.dll",
+        "DrawDeviceForSteam.dll",
+        // Case and path forms scripts actually pass.
+        "CSVParser.DLL",
+        r"C:\game\plugin\WindowEx.dll",
+    ] {
+        assert!(
+            registry.is_builtin(name),
+            "{name} must resolve to a built-in"
+        );
+    }
+    assert!(!registry.is_builtin("not_a_real_plugin.dll"));
+    assert!(!registry.is_builtin("AlphaMovie.dll"));
+}

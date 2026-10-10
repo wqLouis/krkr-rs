@@ -6,7 +6,7 @@
 //! drawing. This module is the single seam between the two: it is a **pure
 //! field copy** that turns one window (or a whole scene) into a
 //! [`RenderScene`] with one [`RenderNode`] per *drawn* layer. It is not a
-//! draw list: no batching, sorting or traversal happens here (D10).
+//! draw list: no batching, sorting or traversal happens here.
 //!
 //! The projection is a pure function over caller-owned state. It holds no
 //! globals, caches or locks; the texture table is supplied by the caller
@@ -268,6 +268,11 @@ fn append_window<F>(
     // when drawn, otherwise its nearest drawn ancestor).
     let mut nearest: HashMap<u32, RenderNodeId> = HashMap::new();
 
+    // Why layers produced no node — a scene that renders almost nothing is
+    // invisible from the outside (`RUST_LOG=debug` reports it).
+    let (mut drawn, mut screen_buffer, mut hidden, mut empty, mut clipped) =
+        (0usize, 0usize, 0usize, 0usize, 0usize);
+
     for layer_id in scene.window_layer_order(window) {
         let Some(layer) = scene.layer(layer_id) else {
             continue;
@@ -300,9 +305,11 @@ fn append_window<F>(
         // children through `nearest` below.
         let node = 'layer: {
             if is_screen_buffer_layer(scene, layer_id) {
+                screen_buffer += 1;
                 break 'layer None;
             }
             if !node_composed.visible {
+                hidden += 1;
                 break 'layer None;
             }
             let opacity = win_opacity * node_composed.opacity;
@@ -319,7 +326,10 @@ fn append_window<F>(
                 Some(handle) => RenderContent::Texture(handle),
                 None => match layer.fill_color {
                     Some(fill) => RenderContent::Solid(solid_color(fill)),
-                    None => break 'layer None,
+                    None => {
+                        empty += 1;
+                        break 'layer None;
+                    }
                 },
             };
 
@@ -350,7 +360,22 @@ fn append_window<F>(
                     ) {
                         Some((src, dst)) => (dst, src),
                         // Fully clipped away: the layer draws nothing.
-                        None => break 'layer None,
+                        None => {
+                            clipped += 1;
+                            log::debug!(
+                                "projection: layer {layer_id} clipped away: rect={:?} \
+                                 image=({},{}) {}x{} bitmap={}x{} parent={:?}",
+                                node_composed.rect,
+                                layer.image_left,
+                                layer.image_top,
+                                img_w,
+                                img_h,
+                                bmp_w,
+                                bmp_h,
+                                layer.parent
+                            );
+                            break 'layer None;
+                        }
                     }
                 }
                 _ => (
@@ -380,6 +405,7 @@ fn append_window<F>(
 
         match node {
             Some(node) => {
+                drawn += 1;
                 let id = out.push(node);
                 if let Some(parent_node) = out.node_mut(parent_node) {
                     parent_node.children.push(id);
@@ -392,6 +418,12 @@ fn append_window<F>(
             }
         }
     }
+
+    log::debug!(
+        "projection: window {window}: drew {drawn} layer(s); skipped screen_buffer={screen_buffer} \
+         hidden={hidden} empty={empty} clipped={clipped} of {}",
+        scene.window_layer_order(window).len()
+    );
 }
 
 /// Project a single window's layer subtree into a fresh [`RenderScene`].

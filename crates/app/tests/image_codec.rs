@@ -66,7 +66,7 @@ fn bitmap_save_writes_a_decodable_file_through_the_app_installed_codec() {
     let engine = Box::new(Tjs2Engine::new().expect("create engine"));
     let mut scene = Box::new(Scene::default());
     let mut host = CompatHost::new();
-    install_image_codec(&host, &storage);
+    install_image_codec(&host, &Media::new(), &storage);
     // SAFETY: the boxed scene/storage outlive `host` (they are declared after
     // it and drop later), and `host.install` only stores their addresses.
     unsafe {

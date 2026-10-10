@@ -19,3 +19,6 @@ platform = { workspace = true, features = ["platform-linux"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 platform = { workspace = true, features = ["platform-android"] }
+
+[dev-dependencies]
+testkit = { workspace = true }

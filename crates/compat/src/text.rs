@@ -1,7 +1,7 @@
 //! Script text decoding: BOM detection, UTF-8/UTF-16, CP932, and the
 //! KiriKiri `FE FE` XOR/bit-swap container with an optional zlib payload.
 //!
-//! Behavioral references on `main`:
+//! Behavioral references:
 //!
 //! * `crates/tvp-streams/src/text.rs` (`decode_bytes`): BOM detection and the
 //!   UTF-8-then-CP932 content sniff.
@@ -10,7 +10,7 @@
 //!   `crates/tjs2-sys/cpp/streams.cpp`: the `FE FE` container (modes 0/1 are
 //!   UTF-16LE ciphers, mode 2 is zlib over UTF-16LE).
 //!
-//! The decoder is strict (D11): an undecodable payload is a typed error, never
+//! The decoder is strict: an undecodable payload is a typed error, never
 //! a lossy U+FFFD substitution.
 
 use std::io::Read;

@@ -49,12 +49,10 @@
 //!   `cursorX`/`cursorY`, hit/attention/clip/focus properties, `window`,
 //!   `parent`, `children`, `font`, ...).
 //! * `Bitmap`: constructor, `getPixel`, `setPixel`, `getMaskPixel`,
-//!   `setMaskPixel`, `independ`, `setSize`, `copyFrom`; properties `id`,
-//!   `nativeId`, `width`, `height`, `buffer`, `bufferForWrite`, `bufferPitch`,
-//!   `loading`.
-//! * `Font`: constructor, `__bind`; properties `id`, `face`, `height`,
-//!   `color`, `bold`, `italic`, `strikeout`, `underline`, `angle`,
-//!   `faceIsFileName`.
+//!   `setMaskPixel`, `independ`, `setSize`, `copyFrom`; properties `width`,
+//!   `height`, `buffer`, `bufferForWrite`, `bufferPitch`, `loading`.
+//! * `Font`: constructor; properties `face`, `height`, `color`, `bold`,
+//!   `italic`, `strikeout`, `underline`, `angle`, `faceIsFileName`.
 //! * `Timer`: constructor, `onTimer`; properties `id`, `interval`, `enabled`,
 //!   `capacity`, `count`, `mode`; [`timer_poll`] fires due timers through the
 //!   object's `onTimer` member (so a script subclass override runs).
@@ -99,21 +97,24 @@ use crate::{CompatCtx, CompatError};
 
 mod bitmap;
 mod common;
+mod draw_device;
 mod font;
 mod layer;
 mod timer;
 mod window;
 
 pub use timer::timer_poll;
-// These drains are part of the visual module surface but are not re-exported
-// at the crate root; the original definitions carried `#[allow(dead_code)]`
-// for the same reason.
-#[allow(unused_imports)]
+// The tree-owner / frame-body hand-offs: the L4 frame body drains the host
+// requests and advances transitions from its `project_and_render` step.
+pub use layer::{advance_transitions, paint_poll, take_capture_releases};
 pub use window::{take_bring_to_front_requests, take_update_requests};
 
 /// Register the visual classes.
 pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
     window::register_window_class(ctx)?;
+    // The draw-device classes are attached to the `Window` class object, so
+    // `Window` must exist first.
+    draw_device::register_draw_devices(ctx)?;
     layer::register_layer_class(ctx)?;
     bitmap::register_bitmap_class(ctx)?;
     font::register_font_class(ctx)?;

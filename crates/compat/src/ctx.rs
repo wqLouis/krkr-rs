@@ -8,27 +8,35 @@ use engine::input::InputState;
 use engine::timer::TimerState;
 use engine::{Scene, Storage};
 use tjs::{
-    NativeClassBuilder, NativeInstanceBuilder, NativeStaticMembers, RetainedValue, Tjs2Engine,
-    Tjs2ValueId,
+    NativeClassBuilder, NativeInstanceBuilder, NativeInstanceMembers, NativeStaticMembers,
+    RetainedValue, Tjs2Engine, Tjs2ValueId,
 };
 
 use crate::CompatError;
+
+/// One per-family dispatch-state cell. The map's `RefCell` borrow is released
+/// before the cell is borrowed, so two different families' states can be
+/// borrowed at once (nested access). The box keeps each cell's address stable
+/// for the whole `CompatServices` lifetime.
+type StateCell = RefCell<Box<dyn std::any::Any>>;
+/// The per-family dispatch-state map, keyed by [`std::any::TypeId`].
+type StateMap = RefCell<std::collections::HashMap<std::any::TypeId, Box<StateCell>>>;
 
 /// Explicit handles to the L2 services the native classes compose.
 ///
 /// L3 never reaches into L2 state through a global: the host attaches the
 /// services it wants exposed and the natives read them through
 /// [`CompatCtx::services`]. The set starts minimal — registration itself
-/// needs only the VM — and grows as the `tvp-*` families migrate (doc 08 §7).
+/// needs only the VM.
 ///
 /// The handles are raw pointers rather than borrows because the single
-/// process-wide binding (doc 08 §3.1) is lifetime-free: the host owns the
+/// process-wide binding is lifetime-free: the host owns the
 /// services for the lifetime of the VM and the binding only stores addresses.
 /// Callers must keep the attached values alive as long as the binding.
 ///
 /// The scratch/cache fields are the L3 *dispatch* state the binding points
 /// at; keeping them here (rather than in a second hidden global) preserves
-/// the "exactly one process-wide binding" rule of doc 08 §3.1.
+/// the "exactly one process-wide binding" rule.
 #[derive(Default)]
 pub struct CompatServices {
     scene: Option<*mut Scene>,
@@ -53,8 +61,8 @@ pub struct CompatServices {
     /// that outlives a callback (the `System` command line, the `Debug` log
     /// ring, timer/sound/input registries, ...) stash it here instead of in a
     /// process global, so the single documented binding stays the only
-    /// process-wide state (doc 08 §3.1).
-    states: RefCell<std::collections::HashMap<std::any::TypeId, Box<dyn std::any::Any>>>,
+    /// process-wide state.
+    states: StateMap,
 }
 
 impl CompatServices {
@@ -175,14 +183,27 @@ impl CompatServices {
     /// reads it back here. `T` is keyed by [`std::any::TypeId`].
     pub fn state<T: Default + 'static>(&self) -> std::cell::RefMut<'_, T> {
         use std::any::{Any, TypeId};
-        let mut map = self.states.borrow_mut();
-        map.entry(TypeId::of::<T>())
-            .or_insert_with(|| Box::new(T::default()) as Box<dyn Any>);
-        std::cell::RefMut::map(map, |map| {
-            map.get_mut(&TypeId::of::<T>())
-                .expect("state entry was just inserted")
-                .downcast_mut::<T>()
-                .expect("state is keyed by TypeId")
+        use std::cell::{RefCell, RefMut};
+        // Ensure the entry exists, then take a stable pointer to its cell. Each
+        // entry is boxed and never removed or replaced, so its address stays
+        // valid for the whole `&self` lifetime and the map borrow can be
+        // released before the entry is borrowed. That lets one state be borrowed
+        // while another already is (nested access); the previous single-`RefCell`
+        // map panicked with `RefCell already borrowed`.
+        let cell: *const RefCell<Box<dyn Any>> = {
+            let mut map = self.states.borrow_mut();
+            let entry = map
+                .entry(TypeId::of::<T>())
+                .or_insert_with(|| Box::new(RefCell::new(Box::new(T::default()) as Box<dyn Any>)));
+            &**entry
+        };
+        // SAFETY: entries are boxed (stable address) and never removed or
+        // replaced, so `cell` remains valid while `&self` is alive. The borrow
+        // flags are still enforced by the entry's `RefCell`, so aliasing `&mut T`
+        // of the same type panics exactly as it must.
+        let cell: &RefCell<Box<dyn Any>> = unsafe { &*cell };
+        RefMut::map(cell.borrow_mut(), |any| {
+            any.downcast_mut::<T>().expect("state is keyed by TypeId")
         })
     }
 }
@@ -267,6 +288,28 @@ impl CompatCtx {
     }
 
     /// Register an instance native class.
+    ///
+    /// # Where the members land (override semantics)
+    ///
+    /// The members are registered **on the class** (`RegisterNCM`, the
+    /// reference `TJS_BEGIN_NATIVE_MEMBERS` shape) — this call never copies
+    /// them onto live objects. Two instance shapes then coexist:
+    ///
+    /// * `new Timer()` (the native class creates the object): the class's
+    ///   `FuncCall` copies every non-static member onto the new object as an
+    ///   own property (reference `tjsNative.cpp:305-375`).
+    /// * `class OnceTimer extends Timer { function onTimer() {...} }` (a
+    ///   script subclass creates the object): object creation registers the
+    ///   **script** members as own properties (reference `VM_REGMEMBER`,
+    ///   `tjsInterCodeGen.cpp:704-715`) *after* the extends chain is wired,
+    ///   while the native members stay reachable through the class chain.
+    ///
+    /// Either way a script-defined member shadows the native default. That
+    /// is why every dispatch seam in this crate resolves the member **on the
+    /// object** (`Tjs2Engine::call_member`, e.g. `Timer.onTimer`,
+    /// `AsyncTrigger.onFire`, `MenuItem.onClick`,
+    /// `Layer.onTransitionCompleted`) instead of invoking our native
+    /// callback directly — verified by `tests/extend_dispatch.rs`.
     pub fn register_instance(
         &self,
         builder: &NativeInstanceBuilder<'_>,
@@ -286,5 +329,39 @@ impl CompatCtx {
         unsafe { self.engine() }
             .register_native_static_members(members)
             .map_err(CompatError::Register)
+    }
+
+    /// Attach instance members (no native payload) to an already-existing
+    /// class, including a TJS2 builtin such as `Array` / `Dictionary`
+    /// (reference `NCB_ATTACH_CLASS` / `NCB_ATTACH_FUNCTION`).
+    ///
+    /// Like [`Self::register_instance`], the members land on the class (or,
+    /// for a builtin, the class object looked up on the VM global), so a
+    /// script-defined member of an instance or subclass still shadows them.
+    pub fn register_instance_members(
+        &self,
+        members: &NativeInstanceMembers<'_>,
+    ) -> Result<(), CompatError> {
+        // SAFETY: a `CompatCtx` is only created for a bound, live engine.
+        unsafe { self.engine() }
+            .register_native_instance_members(members)
+            .map_err(CompatError::Register)
+    }
+
+    /// Delete a named member from a retained object, mapping the `tjs` error
+    /// string into a [`CompatError`].
+    ///
+    /// Registration publishes class-name globals but has no way to undo a
+    /// member write; this is the removal path for the reference's
+    /// `NCB_REGISTER_SUBCLASS_DELAY(X)` shape, whose class is published only
+    /// for the duration of the delay (reference
+    /// `cpp/core/plugin/ncbind.hpp:1963-1970`). An absent member and a
+    /// non-object id are reported as [`CompatError::Engine`].
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn delete_member(&self, id: Tjs2ValueId, membername: &str) -> Result<(), CompatError> {
+        // SAFETY: a `CompatCtx` is only created for a bound, live engine.
+        unsafe { self.engine() }
+            .delete_member(id, membername)
+            .map_err(CompatError::Engine)
     }
 }

@@ -29,7 +29,7 @@
 //!   (and bypass) the L1 rasterizer we already have and still leave bidi/line
 //!   breaking unimplemented.
 //! * `glyphon` is a `wgpu` text integration. It would pull `wgpu` into L2,
-//!   violating the architecture's "no render backend in the middle layer"
+//!   keeps the engine free of any render backend
 //!   invariant, while our backend is `ash`/Vulkan.
 //! * `vello` is a GPU 2D *renderer*, not a layout engine; it would replace the
 //!   quad pipeline rather than feed it.
@@ -38,7 +38,7 @@
 //! and `fontconfig` default features keeps its dependency surface small and
 //! free of system-library linkage; fonts are loaded explicitly by the caller.
 //!
-//! ## CPU and GPU coexistence (D8 `getPixel`)
+//! ## CPU and GPU coexistence (`getPixel`)
 //!
 //! The same rasterized coverage feeds two consumers:
 //!
@@ -48,12 +48,12 @@
 //!   into an RGBA buffer, which is what a script-visible `getPixel`/readback
 //!   must query.
 //!
-//! Both read the identical [`GlyphAtlas`] pixels, so the D8 correctness
+//! Both read the identical [`GlyphAtlas`] pixels, so the correctness
 //! baseline and the accelerated display agree. The CPU path is not a fallback
 //! for a missing GPU: it is the authoritative, deterministic compositor; the
 //! GPU path is the visual presentation of the same data.
 //!
-//! ## State (D9)
+//! ## State
 //!
 //! Everything here is explicit caller-owned state: [`TextEngine`] holds the
 //! shaping system and the registered faces, and [`GlyphAtlas`] holds the
@@ -98,7 +98,7 @@ pub enum TextError {
     /// The glyph atlas has no free cell for the requested bitmap.
     ///
     /// This is never silently worked around: the caller must grow or recreate
-    /// the atlas (D11).
+    /// the atlas.
     #[error("glyph atlas ({width}x{height}) has no room for the glyph")]
     AtlasFull {
         /// Atlas width in pixels.
@@ -278,7 +278,7 @@ impl TextEngine {
     ///
     /// System font discovery is intentionally disabled: only faces added with
     /// [`TextEngine::add_font`] are available, which keeps rendering
-    /// deterministic and free of host-specific font state (D11).
+    /// deterministic and free of host-specific font state.
     pub fn new() -> Self {
         Self {
             render_system: render::create_font_system(),
@@ -463,6 +463,40 @@ impl TextEngine {
     pub fn cached_layouts(&self) -> usize {
         self.layout_cache.len()
     }
+
+    /// Rasterizes one glyph of `font` for `style`, returning its 8-bit
+    /// coverage and pen bearings.
+    ///
+    /// This is the CPU half of the text pipeline without the atlas: it exists
+    /// for consumers that composite glyph coverage directly into a bitmap
+    /// (the compat `Layer.drawString` path) instead of uploading a texture.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TextError::UnknownFont`] or [`TextError::InvalidSize`] for an
+    /// unregistered face or a bad size, and [`TextError::Glyph`] when the L1
+    /// rasterizer rejects the glyph.
+    pub fn rasterize_glyph(
+        &self,
+        font: FontId,
+        codepoint: char,
+        style: &TextStyle,
+    ) -> Result<GlyphBitmap, TextError> {
+        if !(style.size_px.is_finite() && style.size_px > 0.0) {
+            return Err(TextError::InvalidSize(style.size_px));
+        }
+        let face = self
+            .faces
+            .get(font.0)
+            .ok_or(TextError::UnknownFont(font.0))?;
+        Ok(render::rasterize_glyph(
+            &self.render_system,
+            &face.render,
+            codepoint,
+            style.size_px,
+            style.glyph_style(),
+        )?)
+    }
 }
 
 impl Default for TextEngine {
@@ -518,7 +552,7 @@ impl AtlasGlyph {
 /// Glyphs are packed left-to-right, top-to-bottom, one pixel apart to avoid
 /// bilinear bleeding. Adding a new glyph uploads only its sub-rectangle with
 /// [`render::upload_texture`]; the CPU mirror is kept so the same pixels can be
-/// composited for D8 readback and re-uploaded after a render-state recreation.
+/// composited for CPU readback and re-uploaded after a render-state recreation.
 #[non_exhaustive]
 pub struct GlyphAtlas {
     /// Atlas texture handle passed to the quad pipeline.
@@ -820,7 +854,7 @@ pub fn project_text(
 
 /// Composites positioned glyphs into a fresh `width × height` RGBA buffer.
 ///
-/// This is the CPU composition path used by the D8 correctness baseline
+/// This is the CPU composition path used by the correctness baseline
 /// (`getPixel`/readback): it reads the same [`GlyphAtlas`] coverage the GPU
 /// path uploads, tints it with each glyph's colour and applies straight-alpha
 /// source-over with the glyph's opacity. The returned buffer starts fully

@@ -8,8 +8,7 @@
 //!   with its L2-owned [`FileState`];
 //! * the auto search-path list.
 //!
-//! This is the middle layer described in `docs/migration/06-file-system.md`
-//! §2 and `docs/migration/09-game-loading.md`: the bottom layer knows nothing
+//! This is the middle layer: the bottom layer knows nothing
 //! about `.xp3`, `arc.xp3>path` addressing, case-insensitive lookup or the
 //! auto-path list. There are no globals or process-wide caches — a `Storage`
 //! is a plain value the caller owns, and all `FileState`s live inside it.
@@ -34,7 +33,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use api::error::FsError;
 use api::fs::{FsPath, OpenMode};
-use fs::xp3::{self, Xp3Archive, normalize_in_archive_name};
+use fs::xp3::{self, Xp3Archive, Xp3ExtractionFilter, normalize_in_archive_name};
 use fs::{FileState, FileSystem};
 
 /// Windows `FILE_ATTRIBUTE_DIRECTORY` (0x10).
@@ -67,6 +66,10 @@ pub struct Storage {
     archives: Vec<MountedArchive>,
     /// Auto search-path prefixes (plain dirs or `arc.xp3>` prefixes).
     auto_paths: Vec<String>,
+    /// Installed per-segment XP3 extraction filter, if any. The closure is
+    /// owned here (L2 owns the state) and handed to the stateless L1 reader as
+    /// a borrow for the duration of each read; it is never stored in L1.
+    xp3_extraction_filter: Option<Box<Xp3ExtractionFilter<'static>>>,
 }
 
 /// A resolved storage location.
@@ -128,6 +131,36 @@ pub enum StorageReadError {
     Xp3(#[from] xp3::Xp3Error),
 }
 
+/// The searched startup script (reference `TVPStartupScriptName`).
+pub const STARTUP_SCRIPT: &str = "startup.tjs";
+/// The compatibility fallback run when `startup.tjs` is absent or fails
+/// (reference `system/Initialize.tjs`).
+pub const INITIALIZE_SCRIPT: &str = "system/Initialize.tjs";
+/// `patch.tjs`, app-path only (reference `TVPExecuteStartupScript`).
+pub const PATCH_SCRIPT: &str = "patch.tjs";
+/// `AfterStartup.tjs`, app-path only (reference `TVPExecuteStartupScript`).
+pub const AFTER_STARTUP_SCRIPT: &str = "AfterStartup.tjs";
+
+/// The startup scripts resolved against a [`Storage`] (reference
+/// `TVPExecuteStartupScript`).
+///
+/// `patch.tjs` and `AfterStartup.tjs` are **app-path only** (disk, no archive
+/// search); `startup.tjs` and the `system/Initialize.tjs` fallback are
+/// searched across disk and mounted archives. The caller decides whether to
+/// run the fallback from whether `startup.tjs` succeeds.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct StartupPlan {
+    /// `patch.tjs`, executed first when present (app-path only).
+    pub patch: Option<String>,
+    /// `startup.tjs`, the main searched startup script.
+    pub startup: Option<String>,
+    /// `system/Initialize.tjs`, run when `startup.tjs` is absent or fails.
+    pub fallback: Option<String>,
+    /// `AfterStartup.tjs`, executed last when present (app-path only).
+    pub after: Option<String>,
+}
+
 impl Storage {
     /// Creates a storage rooted at `base_dir` and mounts each archive in
     /// `archives`, in order.
@@ -140,7 +173,7 @@ impl Storage {
     ///
     /// `fs` is the bottom file-system object; `base_dir` is the app path used
     /// for disk assets. A missing or unparseable archive is a typed error, not
-    /// a warning (`docs/migration/09-game-loading.md` §8).
+    /// a warning.
     pub fn mount_archives(
         fs: FileSystem,
         base_dir: impl Into<PathBuf>,
@@ -166,6 +199,7 @@ impl Storage {
             game_dir: base_dir,
             archives: Vec::new(),
             auto_paths: Vec::new(),
+            xp3_extraction_filter: None,
         })
     }
 
@@ -286,14 +320,15 @@ impl Storage {
         self.auto_paths.retain(|p| p != path);
     }
 
-    /// Replaces the whole auto search-path list.
-    pub fn set_auto_paths(&mut self, paths: Vec<String>) {
-        self.auto_paths = paths;
-    }
-
-    /// The current auto search-path list.
-    pub fn auto_paths(&self) -> &[String] {
-        &self.auto_paths
+    /// Installs the per-segment XP3 extraction filter (the `xp3filter` seam).
+    ///
+    /// L2 owns the state; the stateless L1 reader receives the closure as a
+    /// borrow on every read. Passing `None` removes any installed filter. The
+    /// closure is invoked once per decoded segment with `(file_hash, offset,
+    /// buffer, file_name, archive_name, file_size)` and may rewrite `buffer`
+    /// in place.
+    pub fn set_xp3_extraction_filter(&mut self, filter: Option<Box<Xp3ExtractionFilter<'static>>>) {
+        self.xp3_extraction_filter = filter;
     }
 
     /// Resolves a storage name to a location, mirroring the reference search
@@ -303,7 +338,7 @@ impl Storage {
     /// A name that simply does not resolve is `Ok(None)`. A genuine
     /// file-system failure while probing (permission denied, I/O, an
     /// unrepresentable path) is propagated as [`StorageReadError::Fs`]; it is
-    /// never collapsed into "not found" (D11).
+    /// never collapsed into "not found".
     ///
     /// Storage names are case-insensitive even when the host filesystem is
     /// not. Only the storage-relative part is normalized; the mount prefix
@@ -546,7 +581,13 @@ impl Storage {
                     .ok_or_else(|| StorageReadError::NotFound(name.to_string()))?;
                 mounted
                     .archive
-                    .read(&self.fs, &mounted.file, &in_arc)
+                    .read_with_filter(
+                        &self.fs,
+                        &mounted.file,
+                        &in_arc,
+                        &mounted.file_name,
+                        self.xp3_extraction_filter.as_deref(),
+                    )
                     .map_err(StorageReadError::Xp3)
             }
             None => Err(StorageReadError::NotFound(name.to_string())),
@@ -598,7 +639,7 @@ impl Storage {
     ///
     /// This matches `TVPIsExistentStorage`, which reports directories as
     /// existing; [`Self::find`] itself is file-only. A file-system failure
-    /// while probing propagates (D11).
+    /// while probing propagates.
     pub fn exists(&self, name: &str) -> Result<bool, StorageReadError> {
         if self.find(name)?.is_some() {
             return Ok(true);
@@ -607,6 +648,36 @@ impl Storage {
             return Ok(false);
         };
         Ok(self.find_disk_dir(&relative)?.is_some())
+    }
+
+    /// Resolve the startup script sequence against this storage (reference
+    /// `TVPExecuteStartupScript`).
+    ///
+    /// Pure storage lookups: `patch.tjs` and `AfterStartup.tjs` are app-path
+    /// only (disk, no archive search, matching `TVPIsExistentStorageNoSearch`),
+    /// while `startup.tjs` and the `system/Initialize.tjs` fallback are
+    /// searched across disk and archives.
+    ///
+    /// # Errors
+    ///
+    /// A file-system failure while probing propagates.
+    pub fn startup_plan(&self) -> Result<StartupPlan, StorageReadError> {
+        Ok(StartupPlan {
+            patch: self.app_path_file(PATCH_SCRIPT)?,
+            startup: self
+                .exists(STARTUP_SCRIPT)?
+                .then(|| STARTUP_SCRIPT.to_owned()),
+            fallback: self
+                .exists(INITIALIZE_SCRIPT)?
+                .then(|| INITIALIZE_SCRIPT.to_owned()),
+            after: self.app_path_file(AFTER_STARTUP_SCRIPT)?,
+        })
+    }
+
+    /// The app-path-only file `name` when it exists on disk (reference
+    /// `TVPIsExistentStorageNoSearch`).
+    fn app_path_file(&self, name: &str) -> Result<Option<String>, StorageReadError> {
+        Ok(self.find_disk(name)?.map(|_| name.to_owned()))
     }
 
     /// Lists the immediate children of storage directory `dir`, merging disk
@@ -684,7 +755,7 @@ impl Storage {
     ///
     /// A genuine file-system failure while walking the disk tree propagates;
     /// only a missing or non-directory subtree is treated as empty.
-    pub fn get_file_list(&self, mask: &str, attr: i64) -> Result<Vec<String>, StorageReadError> {
+    pub fn file_list(&self, mask: &str, attr: i64) -> Result<Vec<String>, StorageReadError> {
         let mask = normalize_in_archive_name(mask);
         let (arc_pat, in_arc_mask) = match mask.split_once('>') {
             Some((arc, rest)) => (Some(arc.to_string()), rest.to_string()),

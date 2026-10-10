@@ -1,8 +1,8 @@
 //! `Scripts` native class (L3): storage-backed script execution helpers.
 //!
 //! Reimplemented over [`engine::Storage`] and the `tjs` engine handle exposed
-//! by [`CompatCtx::engine`]. The reference is the old `tvp-scripts` crate;
-//! this port keeps only the parts the new ABI supports and owns no state
+//! by [`CompatCtx::engine`]. The reference is the `tvp-scripts` crate;
+//! this port keeps only the parts the ABI supports and owns no state
 //! outside [`CompatServices::state`].
 //!
 //! Script-visible members:
@@ -24,7 +24,7 @@
 //! through [`crate::text::decode_text`], which handles the `FE FE` cipher /
 //! zlib container, a UTF-8/UTF-16 BOM, an explicit `textEncoding` override,
 //! then UTF-8 and CP932. An undecodable script raises a typed error instead
-//! of producing mojibake (D11). The `context` argument is likewise ignored
+//! of producing mojibake. The `context` argument is likewise ignored
 //! with a warning.
 
 use std::ffi::{CStr, c_char, c_int, c_void};
@@ -33,17 +33,24 @@ use std::ptr;
 use engine::Storage;
 use tjs::{
     Engine, NativeClassBuilder, NativeMethodDef, NativePropertyDef, RetainedValue, Tjs2Engine,
-    TjsValue, VAL_INTEGER, VAL_REAL, VAL_RETAINED, VAL_STRING, VAL_VOID, Value,
+    TjsValue, VAL_REAL, VAL_RETAINED, VAL_STRING, VAL_VOID, Value,
 };
 
 use crate::binding;
 use crate::native_util::{args, report_error, set_int, set_void, value_as_string};
+use crate::natives::system::try_value_as_i64;
 use crate::{CompatCtx, CompatError, CompatServices};
 
 /// Per-family dispatch state: the `Scripts.textEncoding` override.
 #[derive(Default)]
 struct ScriptsState {
-    /// `None` keeps the automatic decoder and reports `"UTF-8"`.
+    /// The explicit read-encoding spelling, when a script set one. The
+    /// *default* is the reference's `G_DefaultReadEncoding = "UTF-8"`
+    /// (`base/TextStream.cpp:17`), but in the reference that value is only
+    /// the last-resort fallback of `checkTextEncoding` — BOM and charset
+    /// detection run first (`TextStream.cpp:21-66`, `141`) — so an unset
+    /// property maps to `None` (the automatic decoder) rather than a forced
+    /// UTF-8 override.
     text_encoding: Option<String>,
 }
 
@@ -150,12 +157,30 @@ fn attached_storage(services: &CompatServices) -> Option<*mut Storage> {
 }
 
 /// Interpret a value the way the reference's `(tjs_int)*param[i]` conversion
-/// does for boolean flags.
-fn truthy(value: &Value) -> bool {
-    match value.ty {
-        VAL_INTEGER => value.integer != 0,
-        VAL_REAL => value.real != 0.0,
-        _ => false,
+/// does for boolean flags (`tjsVariant.h:862-877`): reals truncate, strings
+/// parse, objects raise.
+fn truthy(value: &Value) -> Result<bool, String> {
+    try_value_as_i64(value).map(|value| value != 0)
+}
+
+/// An optional boolean flag argument: absent or `void` is false, present
+/// values convert like the reference `(tjs_int)*param[i]`.
+fn flag_arg(arguments: &[Value], index: usize) -> Result<bool, String> {
+    match arguments.get(index) {
+        Some(value) => truthy(value),
+        None => Ok(false),
+    }
+}
+
+/// The reference `TVPSetDefaultReadEncoding` spelling rules
+/// (`base/TextStream.cpp:418-430`): the `sjis` aliases map to `cp932`,
+/// `utf8`/`utf-8` to `UTF-8`, and any other spelling — including the empty
+/// string — is stored verbatim.
+fn reference_read_encoding(encoding: &str) -> String {
+    match encoding.to_ascii_lowercase().as_str() {
+        "sjis" | "shiftjis" | "shift_jis" | "shift-jis" => "cp932".to_string(),
+        "utf8" | "utf-8" => "UTF-8".to_string(),
+        _ => encoding.to_string(),
     }
 }
 
@@ -183,9 +208,16 @@ fn mode_offset(mode: &str) -> Option<usize> {
     None
 }
 
-/// The configured `Scripts.textEncoding`, if the host/script set one.
+/// The configured `Scripts.textEncoding`, if it selects a decoder. An unset
+/// property keeps the automatic decoder — the reference's `G_DefaultReadEncoding`
+/// is only the fallback after BOM/detection (`base/TextStream.cpp:141`) — and
+/// the empty spelling means auto-detection as well.
 fn configured_encoding(services: &CompatServices) -> Option<String> {
-    services.state::<ScriptsState>().text_encoding.clone()
+    services
+        .state::<ScriptsState>()
+        .text_encoding
+        .clone()
+        .filter(|encoding| !encoding.is_empty())
 }
 
 /// Read storage `name`, apply the mode's `oN` offset and decode the text.
@@ -225,6 +257,17 @@ fn execute_storage(
             .exec_script_retained(&text, name)
             .map_err(|error| error.to_string())
     }
+}
+
+/// Execute storage `name` as a script through `engine`: the core of
+/// `Scripts.execStorage` without the native wrapper. The composition root
+/// uses this to run the startup sequence.
+///
+/// # Errors
+///
+/// Returns the storage read, text decode, or script error as a string.
+pub fn exec_storage(engine: &Tjs2Engine, storage: &Storage, name: &str) -> Result<(), String> {
+    execute_storage(engine, storage, name, "", false, None).map(|_| ())
 }
 
 /// Resolve the process-wide binding for a callback's raw engine pointer.
@@ -267,6 +310,7 @@ extern "C" fn native_exec_storage(
     };
     let name = value_as_string(name);
     let mode = arguments.get(1).map(value_as_string).unwrap_or_default();
+    log::debug!("Scripts.execStorage: {name:?} mode={mode:?}");
     if arguments.get(2).is_some_and(|value| value.ty != VAL_VOID) {
         log::warn!("Scripts.execStorage: the execution-context argument is ignored");
     }
@@ -413,9 +457,18 @@ extern "C" fn native_compile_storage(
     }
     let name = value_as_string(&arguments[0]);
     let output = value_as_string(&arguments[1]);
-    let isresult = arguments.get(2).map(truthy).unwrap_or(false);
-    let outputdebug = arguments.get(3).map(truthy).unwrap_or(false);
-    let isexpression = arguments.get(4).map(truthy).unwrap_or(false);
+    let isresult = match flag_arg(arguments, 2) {
+        Ok(flag) => flag,
+        Err(error) => return report_error(out_error, &format!("Scripts.compileStorage: {error}")),
+    };
+    let outputdebug = match flag_arg(arguments, 3) {
+        Ok(flag) => flag,
+        Err(error) => return report_error(out_error, &format!("Scripts.compileStorage: {error}")),
+    };
+    let isexpression = match flag_arg(arguments, 4) {
+        Ok(flag) => flag,
+        Err(error) => return report_error(out_error, &format!("Scripts.compileStorage: {error}")),
+    };
     let encoding = configured_encoding(services);
     let Some(storage) = attached_storage(services) else {
         return report_error(out_error, "Scripts.compileStorage: no storage attached");
@@ -459,6 +512,13 @@ extern "C" fn native_set_call_missing(
     let Some(object) = arguments.first() else {
         return report_error(out_error, "Scripts.setCallMissing requires 1 argument");
     };
+    // Reference `setCallMissing`: `AsObjectNoAddRef` yields a null pointer for
+    // TJS `null` and `if(dsp)` skips it silently (`ScriptMgnIntf.cpp:1478-1492`);
+    // a non-object raises the conversion error.
+    if object.ty == tjs::VAL_NULL {
+        set_void(out);
+        return 0;
+    }
     let engine = resolved.engine();
     let object = match engine.retain_object_arg(object) {
         Ok(object) => object,
@@ -525,10 +585,19 @@ extern "C" fn native_get_trace_string(
     let services = unsafe { ctx.services() };
     // SAFETY: the trampoline guarantees `argc` valid `Value` entries.
     let arguments = unsafe { args(argv, argc) };
-    let limit = arguments
-        .first()
-        .and_then(|value| (value.ty == VAL_INTEGER).then_some(value.integer as i32))
-        .unwrap_or(0);
+    // Reference `limit = *param[0]` when present and non-void: the
+    // `operator tjs_int` conversion truncates reals, parses strings and
+    // raises on objects (`KAGParser`-style `AsInteger`,
+    // `tjsVariant.h:933-935`; `ScriptMgnIntf.cpp:1453-1456`).
+    let limit = match arguments.first() {
+        Some(value) if value.ty != VAL_VOID => match try_value_as_i64(value) {
+            Ok(limit) => limit as i32,
+            Err(error) => {
+                return report_error(out_error, &format!("Scripts.getTraceString: {error}"));
+            }
+        },
+        _ => 0,
+    };
     // SAFETY: the engine is live and the returned string is malloc'd.
     let pointer = unsafe { tjs::tjs2_get_stack_trace_string(resolved.engine().raw(), limit) };
     if pointer.is_null() {
@@ -578,6 +647,9 @@ extern "C" fn native_text_encoding_get(
     let ctx = resolved.ctx();
     // SAFETY: `resolve` succeeded for the installed, live binding.
     let services = unsafe { ctx.services() };
+    // The unset default reports the reference's `G_DefaultReadEncoding`
+    // (`TextStream.cpp:17`); a script-set spelling is reported verbatim
+    // (through the `sjis`/`utf8` alias normalization).
     let value = services
         .state::<ScriptsState>()
         .text_encoding
@@ -604,8 +676,7 @@ extern "C" fn native_text_encoding_set(
         // SAFETY: the trampoline passes a valid value slot.
         value_as_string(unsafe { &*value })
     };
-    services.state::<ScriptsState>().text_encoding =
-        if name.is_empty() { None } else { Some(name) };
+    services.state::<ScriptsState>().text_encoding = Some(reference_read_encoding(&name));
     0
 }
 
