@@ -4,10 +4,11 @@
 //! The tests exercise the script-visible surface that does not need an L1
 //! codec or a CD/MIDI device: construction, the property round-trips
 //! (including the `0..=100000` volume scale), the shared playback methods on
-//! an unloaded buffer and the typed deferrals (CD track selection, `midiOut`
-//! and the missing decoder). The generic `open` → decode path needs a host
-//! decoder, which an integration test cannot install, so only its typed error
-//! paths are covered here — mirroring `tests/sound.rs`.
+//! an unloaded buffer, the disabled-feature no-ops (`CDDASoundBuffer.open`
+//! and `MIDISoundBuffer.midiOut`) and the typed missing-decoder error. The
+//! generic `open` → decode path needs a host decoder, which an integration
+//! test cannot install, so only its typed error paths are covered here —
+//! mirroring `tests/sound.rs`.
 
 mod common;
 
@@ -116,17 +117,17 @@ fn properties_round_trip_on_the_script_scale() {
 }
 
 #[test]
-fn cdda_open_is_a_typed_cd_track_deferral() {
+fn cdda_open_is_a_no_op_when_cdda_is_disabled() {
     let _lock = vm_lock();
     let env = Env::new();
     env.run("var s = new CDDASoundBuffer();");
 
-    let message = env.error("s.open('D:')");
-    assert!(
-        message.contains("CD track selection"),
-        "unexpected message: {message}"
-    );
-    // The failed open leaves the buffer unloaded rather than lying.
+    // reference/cpp/core/sound/CDDAIntf.cpp:62-73: `ENABLE_CDDA` is undefined
+    // (no `#define` anywhere in reference/), so the `_this->Open(...)` body is
+    // compiled out and the method falls through to `return TJS_S_OK` (void).
+    assert_eq!(env.eval_ok("s.open('D:')"), TjsValue::Void);
+    // reference/cpp/core/sound/CDDAIntf.cpp:68-70: no `Open()` runs, so the
+    // buffer stays unloaded.
     assert_eq!(env.eval_ok("s.status"), TjsValue::String("unload".into()));
     assert_eq!(env.eval_int("s.totalTime"), 0);
 }
@@ -145,15 +146,15 @@ fn midi_open_without_storage_reports_a_typed_error() {
 }
 
 #[test]
-fn midi_out_is_a_typed_device_deferral() {
+fn midi_out_is_a_no_op_when_midi_is_disabled() {
     let _lock = vm_lock();
     let env = Env::new();
 
-    let message = env.error("MIDISoundBuffer.midiOut(0)");
-    assert!(
-        message.contains("MIDI output device"),
-        "unexpected message: {message}"
-    );
+    // reference/cpp/core/sound/win32/MIDIImpl.cpp:978-993: `TVP_ENABLE_MIDI`
+    // is undefined (no `#define` anywhere in reference/), so the
+    // `TVPMIDIOutData` body is compiled out and the method returns `TJS_S_OK`
+    // (void) after the arity check.
+    assert_eq!(env.eval_ok("MIDISoundBuffer.midiOut(0)"), TjsValue::Void);
 }
 
 #[test]

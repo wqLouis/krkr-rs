@@ -328,28 +328,23 @@ fn steam_api_is_an_empty_constructor_only_class() {
 /// read-only `interface` property (`DrawDeviceForSteam.cpp:412-415`) whose
 /// getter returns the main window's raw draw-device pointer reinterpreted as
 /// `tjs_int64` (`DrawDeviceForSteam.cpp:21-24`). krkr-rs has no host
-/// draw-device object — the core `Window.drawDevice` reports the same typed
-/// failure (`natives/visual/window.rs`) — so the port raises a typed D11
-/// error naming the member instead of fabricating a pointer value.
+/// draw-device object, so the getter reports the stable native payload
+/// address as a non-zero synthetic pointer.
 #[test]
-fn draw_device_for_steam_is_registered_with_a_typed_interface_error() {
+fn draw_device_for_steam_interface_is_a_synthetic_pointer() {
     let _lock = vm_lock();
     let env = Env::new();
 
     // The proxy is instantiable...
     env.run("var d = new DrawDeviceForSteam();");
-    // ... and `interface` reports that the host has no draw-device object
-    // instead of fabricating a pointer (the same contract as Window.drawDevice).
-    let message = env.error("d.interface");
-    assert!(
-        message.contains("DrawDeviceForSteam.interface"),
-        "unexpected message: {message}"
+    // ... and `interface` returns the wrapped draw-device pointer as an
+    // integer (`DrawDeviceForSteam.cpp:21-24`).
+    let interface = env.eval_int("d.interface");
+    assert_ne!(
+        interface, 0,
+        "interface must be a non-zero synthetic pointer"
     );
-    assert!(
-        message.contains("draw-device"),
-        "unexpected message: {message}"
-    );
-    // A second, instance-level write attempt must not silently succeed either:
+    assert_eq!(env.eval_int("d.interface"), interface);
     // `interface` is registered as a getter-only property
     // (`DrawDeviceForSteam.cpp:414`, null setter via `ncbind.hpp:1727`).
     assert!(env.eval("d.interface = 1").is_err());
@@ -411,9 +406,7 @@ fn every_reference_member_is_registered() {
         "steam_api must not expose a version member"
     );
     env.run("var d = new DrawDeviceForSteam();");
-    // `interface` raises, but the member is registered (the error names it).
-    assert!(
-        env.error("d.interface").contains("interface"),
-        "DrawDeviceForSteam.interface missing"
-    );
+    // `interface` is registered and returns a synthetic pointer
+    // (`DrawDeviceForSteam.cpp:412-415`).
+    assert_ne!(env.eval_int("d.interface"), 0);
 }

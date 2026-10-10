@@ -7,8 +7,9 @@
 //! operations, the item flags (including the radio group), traversal, click
 //! dispatch — gated on an ancestor `Window` and that window's `visible`, like
 //! the reference `OnClick` — and the static shortcut tables. The two members
-//! that need a platform menu (`HMENU`, `popup`) are asserted to raise the
-//! explicit typed error rather than silently default.
+//! that the desktop build backs with a platform menu (`HMENU`, `popup`) report
+//! reference-shaped values from the logical tree: a synthetic non-zero
+//! `HMENU` and the `popup` success value `1`.
 
 mod common;
 
@@ -395,21 +396,43 @@ fn shortcut_tables_round_trip_and_are_read_only() {
 }
 
 #[test]
-fn hmenu_and_popup_raise_the_typed_platform_error() {
+fn hmenu_is_a_stable_synthetic_handle_and_popup_reports_success() {
     let _lock = vm_lock();
     let env = Env::new();
-    env.run("var m = new MenuItem();");
+    env.run("var m = new MenuItem(); var other = new MenuItem();");
 
-    let hmenu = env.error("m.HMENU");
-    assert!(
-        hmenu.contains("platform menu"),
-        "HMENU error should name the deferral, got {hmenu:?}"
+    // Reference `HMENU` getter: the native menu handle is read back as an
+    // integer
+    // (`reference/cpp/core/visual/impl/MenuItemImpl.cpp:409-413`). This build
+    // has no OS menu, so the getter reports a synthetic non-zero handle.
+    let hmenu = env.eval_int("m.HMENU");
+    assert!(hmenu != 0, "HMENU must be a non-zero integer, got {hmenu}");
+
+    // Reference `HMENU` getter
+    // (`reference/cpp/core/visual/impl/MenuItemImpl.cpp:409-413`): repeated
+    // reads of one item's handle return the same value.
+    assert_eq!(
+        env.eval_int("m.HMENU"),
+        hmenu,
+        "HMENU must be stable across reads"
     );
-    let popup = env.error("m.popup(0, 10, 20)");
-    assert!(
-        popup.contains("platform menu"),
-        "popup error should name the deferral, got {popup:?}"
+
+    // Reference `HMENU` getter
+    // (`reference/cpp/core/visual/impl/MenuItemImpl.cpp:409-413`): distinct
+    // items carry distinct handles.
+    assert_ne!(
+        env.eval_int("other.HMENU"),
+        hmenu,
+        "each item must have its own HMENU"
     );
-    // Reference arity check comes first.
+
+    // Reference `TrackPopup` returns `1`
+    // (`reference/cpp/core/visual/impl/MenuItemImpl.cpp:309-315`) and the
+    // `popup` native method returns that result
+    // (`reference/cpp/core/visual/MenuItemIntf.cpp:285-299`).
+    assert_eq!(env.eval_int("m.popup(0, 10, 20)"), 1);
+
+    // Reference `popup` arity check comes first
+    // (`reference/cpp/core/visual/MenuItemIntf.cpp:289-290`).
     assert!(env.error("m.popup()").contains("requires flags"));
 }

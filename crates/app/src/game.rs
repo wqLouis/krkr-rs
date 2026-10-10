@@ -85,6 +85,10 @@ impl FrameBody for Polls {
 
     #[allow(unsafe_code)]
     fn project_and_render(&mut self, ctx: &mut CompatCtx) -> Result<(), CompatError> {
+        // The movie frame body advances its overlays and copies the current
+        // frame into the layer before the transition step composites it
+        // (reference `layerExMovie::OnContinuousCallback`).
+        compat::movie_poll(ctx, self.dt_ms)?;
         // The frame body owns the per-frame transition step; the remaining
         // hand-offs are host drains that the render host consumes after this
         // poll returns.

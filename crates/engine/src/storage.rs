@@ -66,10 +66,14 @@ pub struct Storage {
     archives: Vec<MountedArchive>,
     /// Auto search-path prefixes (plain dirs or `arc.xp3>` prefixes).
     auto_paths: Vec<String>,
-    /// Installed per-segment XP3 extraction filter, if any. The closure is
-    /// owned here (L2 owns the state) and handed to the stateless L1 reader as
-    /// a borrow for the duration of each read; it is never stored in L1.
-    xp3_extraction_filter: Option<Box<Xp3ExtractionFilter<'static>>>,
+    /// The per-segment XP3 extraction filter (the `xp3filter` seam), if any.
+    ///
+    /// L2 owns the state; the stateless L1 reader receives the closure as a
+    /// borrow on every read, and it is never stored in L1. `None` means no
+    /// filter. The closure is invoked once per decoded segment with
+    /// `(file_hash, offset, buffer, file_name, archive_name, file_size)` and
+    /// may rewrite `buffer` in place.
+    pub xp3_extraction_filter: Option<Box<Xp3ExtractionFilter<'static>>>,
 }
 
 /// A resolved storage location.
@@ -318,17 +322,6 @@ impl Storage {
     /// Removes an auto search path.
     pub fn remove_auto_path(&mut self, path: &str) {
         self.auto_paths.retain(|p| p != path);
-    }
-
-    /// Installs the per-segment XP3 extraction filter (the `xp3filter` seam).
-    ///
-    /// L2 owns the state; the stateless L1 reader receives the closure as a
-    /// borrow on every read. Passing `None` removes any installed filter. The
-    /// closure is invoked once per decoded segment with `(file_hash, offset,
-    /// buffer, file_name, archive_name, file_size)` and may rewrite `buffer`
-    /// in place.
-    pub fn set_xp3_extraction_filter(&mut self, filter: Option<Box<Xp3ExtractionFilter<'static>>>) {
-        self.xp3_extraction_filter = filter;
     }
 
     /// Resolves a storage name to a location, mirroring the reference search

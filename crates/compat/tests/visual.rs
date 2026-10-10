@@ -570,7 +570,7 @@ fn draw_device_classes_are_attached_to_window() {
 }
 
 #[test]
-fn draw_device_state_round_trips_and_interface_is_typed() {
+fn draw_device_state_round_trips_and_interface_is_a_synthetic_pointer() {
     let _lock = vm_lock();
     let env = Env::new();
     env.run(
@@ -592,13 +592,16 @@ fn draw_device_state_round_trips_and_interface_is_typed() {
     env.run("var b = new Window.BasicDrawDevice(); b.recreate();");
     assert_eq!(env.eval_int("b.drawer"), 1);
 
-    // There is no host `iTVPDrawDevice`, so `interface` raises (D11); the
-    // error names the class so the absence stays discoverable.
-    let message = env.eval("p.interface").expect_err("interface should raise");
-    assert!(
-        message.contains("PassThroughDrawDevice.interface"),
-        "unexpected interface error: {message}"
+    // Reference (`PassThroughDrawDevice.cpp:532-544`): `interface` is
+    // `reinterpret_cast<tjs_int64>(GetDevice())`, the native draw-device
+    // pointer as an integer. This host has no draw-device object, so the
+    // getter reports the stable native payload address instead.
+    let interface = env.eval_int("p.interface");
+    assert_ne!(
+        interface, 0,
+        "interface must be a non-zero synthetic pointer"
     );
+    assert_eq!(env.eval_int("p.interface"), interface);
     // `drawer` is read-only.
     assert!(env.eval("b.drawer = 3").is_err());
 }

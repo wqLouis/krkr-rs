@@ -6,9 +6,9 @@
 //! for an existing class, so the small flag set is kept per-object in
 //! [`MenuItemExState`] keyed by the `objthis` pointer.
 //!
-//! The platform menu (`HMENU`) is unavailable off Windows, so `popupEx` (like
-//! the reference's own stub) accepts its arguments and returns void; the
-//! bitmap properties report the reference's `BMT_BMP`/`BMT_SYS` values
+//! `popupEx` is the reference's empty `TJS_S_OK` stub
+//! (`windowEx.cpp:1185-1188`), so it accepts its arguments and returns void;
+//! the bitmap properties report the reference's `BMT_BMP`/`BMT_SYS` values
 //! (`-1`/`0`).
 
 use std::collections::HashMap;
@@ -65,8 +65,8 @@ fn with_flags<T>(
 // ---------------------------------------------------------------------------
 
 /// `MenuItem.popupEx(flags, x?, y?, hwnd?, rect?, menulist?)` — the reference
-/// implementation is a stub because it needs a platform `HMENU`. Accept any
-/// arguments and return void.
+/// body is an empty `TJS_S_OK` stub (`reference/cpp/plugins/windowEx.cpp:1185-1188`).
+/// Accept any arguments and return void.
 extern "C" fn menu_popup_ex(
     engine: *mut c_void,
     _objthis: *mut c_void,

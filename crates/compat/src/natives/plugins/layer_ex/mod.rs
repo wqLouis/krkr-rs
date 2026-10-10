@@ -45,6 +45,7 @@ use crate::natives::system::resolve;
 use crate::{CompatCtx, CompatError};
 
 pub use crate::natives::video::VideoSource;
+pub use movie::{movie_poll, set_movie_source};
 
 /// The per-class native payload shared by the three extension classes. The
 /// reference `layerExBase` caches the owning layer's geometry; the port reads
@@ -579,13 +580,6 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
         methods,
         properties,
     })?;
-
-    // The movie frame body is driven directly by the host (the analogue of
-    // the reference `TVPAddContinuousEventHook`). Reference the entry points
-    // so they stay linked even though the private `natives` module does not
-    // re-export them.
-    let _ = movie::movie_poll as fn(&CompatCtx, f64) -> Result<(), CompatError>;
-    let _ = movie::set_movie_source as fn(&CompatCtx, Box<dyn VideoSource>);
     Ok(())
 }
 

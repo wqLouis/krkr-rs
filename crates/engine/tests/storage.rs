@@ -330,7 +330,7 @@ fn xp3_extraction_filter_decrypts_archive_reads() {
 
     let seen = std::rc::Rc::new(RefCell::new(Vec::new()));
     let seen_in_filter = std::rc::Rc::clone(&seen);
-    storage.set_xp3_extraction_filter(Some(Box::new(
+    storage.xp3_extraction_filter = Some(Box::new(
         move |file_hash: u32,
               offset: u64,
               buffer: &mut [u8],
@@ -348,7 +348,7 @@ fn xp3_extraction_filter_decrypts_archive_reads() {
                 *byte ^= key;
             }
         },
-    )));
+    ));
 
     assert_eq!(storage.read("secret.bin").unwrap(), plain);
     let seen = seen.borrow();
@@ -367,6 +367,6 @@ fn xp3_extraction_filter_decrypts_archive_reads() {
     );
 
     // Clearing the filter restores the raw read.
-    storage.set_xp3_extraction_filter(None);
+    storage.xp3_extraction_filter = None;
     assert_eq!(storage.read("secret.bin").unwrap(), cipher);
 }

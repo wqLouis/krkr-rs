@@ -5,8 +5,8 @@ use std::ffi::{c_char, c_int, c_void};
 
 use engine::input::InputState;
 use tjs::{
-    NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef, RetainedValue,
-    Tjs2Engine, TjsValue, Value,
+    DetachedValue, NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef,
+    RetainedValue, Tjs2Engine, TjsValue, Value,
 };
 
 use super::common::{
@@ -47,6 +47,13 @@ struct WindowInst {
     /// Reference `tTVPWindow` defaults (`TVPWindow.h`: `5`, `5`).
     touch_scale_threshold: f64,
     touch_rotate_threshold: f64,
+    /// The `Window.drawDevice` object (reference `DrawDeviceObject`,
+    /// `WindowIntf.h:190-194`). The window installs a default
+    /// `BasicDrawDevice` at construction.
+    draw_device: Option<DetachedValue>,
+    /// `Window.registerMessageReceiver` entries as `(proc, userdata)`
+    /// (reference `tTVPWMRRegMode` register/unregister).
+    message_receivers: Vec<(i64, i64)>,
 }
 
 impl Default for WindowInst {
@@ -77,6 +84,8 @@ impl Default for WindowInst {
             stay_on_top: false,
             touch_scale_threshold: 5.0,
             touch_rotate_threshold: 5.0,
+            draw_device: None,
+            message_receivers: Vec::new(),
         }
     }
 }
@@ -191,6 +200,21 @@ extern "C" fn window_ctor(
     let id = scene.add_window(String::new(), (1280, 720));
     inst.id = Some(id);
     register_window(&ctx, resolved.engine(), id, objthis);
+    // Install the default draw device: the reference constructs a
+    // `BasicDrawDevice` for every window (`WindowIntf.cpp:150-166`). The
+    // constructor must not fail when the default cannot be created.
+    match resolved
+        .engine()
+        .eval_retained("new Window.BasicDrawDevice()", "Window")
+    {
+        Ok(RetainedValue::Object(object)) => inst.draw_device = Some(object),
+        Ok(RetainedValue::Value(_)) => {
+            log::warn!("Window: the default draw device is not an object")
+        }
+        Err(error) => {
+            log::warn!("Window: could not create the default draw device: {error}")
+        }
+    }
     set_int(out, i64::from(id));
     0
 }
@@ -1291,35 +1315,73 @@ extern "C" fn window_hwnd_get(
     )
 }
 
-/// `Window.drawDevice` — no L2 draw-device object is exposed, so this is a
-/// typed error instead of a fabricated object. The wording also keeps the
-/// legacy "absent member" guard truthful: the host object really does not
-/// exist.
+/// `Window.drawDevice` — the stored draw-device object, or `null` when none
+/// was installed (reference `WindowImpl.cpp:2300-2316` returns
+/// `GetDrawDeviceObject()`).
 extern "C" fn window_draw_device_get(
-    _engine: *mut c_void,
-    _instance: *mut c_void,
-    _out: *mut Value,
+    engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    report_error(
-        out_error,
-        "Window.drawDevice: the host draw-device object does not exist on this host",
-    )
+    let Ok((resolved, _ctx)) = bound(engine) else {
+        return report_error(out_error, "Window.drawDevice: compat context is not bound");
+    };
+    let inst = unsafe { &*(instance as *const WindowInst) };
+    let host = resolved.engine();
+    match inst.draw_device.as_ref() {
+        Some(object) => set_object_out(host, out, Some(object)),
+        None => set_null_out(host, out),
+    }
+    0
 }
 
-/// `Window.drawDevice = value` — see [`window_draw_device_get`].
+/// `Window.drawDevice = value` — store a draw-device object (reference
+/// `WindowImpl.cpp:2300-2316` calls `SetDrawDeviceObject`, which reads the
+/// object's `interface`, `WindowIntf.cpp:255-292`). A non-object value is
+/// ignored; an object whose `interface` cannot be read or is zero raises.
 extern "C" fn window_draw_device_set(
-    _engine: *mut c_void,
-    _instance: *mut c_void,
-    _value: *const Value,
+    engine: *mut c_void,
+    instance: *mut c_void,
+    value: *const Value,
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    report_error(
-        out_error,
-        "Window.drawDevice: the host draw-device object does not exist on this host",
-    )
+    let value = unsafe { &*value };
+    if value.ty != VAL_OBJECT {
+        return 0;
+    }
+    let Ok((resolved, _ctx)) = bound(engine) else {
+        return report_error(out_error, "Window.drawDevice: compat context is not bound");
+    };
+    let host = resolved.engine();
+    let object = match host.retain_object_arg(value) {
+        Ok(object) => object,
+        Err(_) => {
+            return report_error(
+                out_error,
+                "Window.drawDevice: cannot retrieve the interface from the draw device",
+            );
+        }
+    };
+    match host.get_member(object.raw_id(), "interface") {
+        Ok(TjsValue::Integer(interface)) if interface != 0 => {
+            let inst = unsafe { &mut *(instance as *mut WindowInst) };
+            // The reference invalidates the previous device object before
+            // storing the new one (`WindowIntf.cpp:255-292`).
+            if let Some(previous) = inst.draw_device.replace(object)
+                && let Err(error) = host.invalidate_retained(previous.raw_id())
+            {
+                log::warn!("Window.drawDevice: invalidate failed: {error}");
+            }
+            0
+        }
+        Ok(_) | Err(_) => report_error(
+            out_error,
+            "Window.drawDevice: cannot retrieve the interface from the draw device",
+        ),
+    }
 }
 
 /// `Window.displayOrientation` — no display is attached to the L2 scene, so
@@ -1352,14 +1414,40 @@ extern "C" fn window_display_rotate_get(
     )
 }
 
-/// `Window.registerMessageReceiver(mode, recv, handler)` — Win32-only, so
-/// this is a typed error, never a silent no-op.
+/// Apply one `registerMessageReceiver` call: mode `0` (`wrmRegister`) pushes
+/// the `(proc, userdata)` pair, mode `1` (`wrmUnregister`) removes the first
+/// matching pair, and any other mode is a no-op (reference `WindowImpl.h:20`,
+/// `WindowImpl.cpp:2150-2163`).
+fn apply_message_receiver_mode(
+    receivers: &mut Vec<(i64, i64)>,
+    mode: i64,
+    proc: i64,
+    userdata: i64,
+) {
+    match mode {
+        0 => receivers.push((proc, userdata)),
+        1 => {
+            if let Some(index) = receivers
+                .iter()
+                .position(|entry| *entry == (proc, userdata))
+            {
+                receivers.remove(index);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `Window.registerMessageReceiver(mode, recv, handler)` — record the
+/// registration (reference `WindowImpl.cpp:2150-2163`, which forwards to the
+/// platform form, `WindowImpl.cpp:1461-1467`). Fewer than three arguments
+/// raises; a bound context never raises.
 extern "C" fn window_register_message_receiver(
     _engine: *mut c_void,
-    _instance: *mut c_void,
+    instance: *mut c_void,
     argc: c_int,
-    _argv: *const Value,
-    _out: *mut Value,
+    argv: *const Value,
+    out: *mut Value,
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
@@ -1369,10 +1457,14 @@ extern "C" fn window_register_message_receiver(
             "Window.registerMessageReceiver requires 3 arguments",
         );
     }
-    report_error(
-        out_error,
-        "Window.registerMessageReceiver: Win32 message receivers are not available on this host",
-    )
+    let a = unsafe { args(argv, argc) };
+    let mode = value_as_i64(&a[0]);
+    let proc = value_as_i64(&a[1]);
+    let userdata = value_as_i64(&a[2]);
+    let inst = unsafe { &mut *(instance as *mut WindowInst) };
+    apply_message_receiver_mode(&mut inst.message_receivers, mode, proc, userdata);
+    set_void(out);
+    0
 }
 
 /// `Window.findFullScreenCandidates(...)` — the reference body is disabled
@@ -1882,4 +1974,26 @@ pub(super) fn register_window_class(ctx: &mut CompatCtx) -> Result<(), CompatErr
             },
         ],
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{WindowInst, apply_message_receiver_mode};
+
+    #[test]
+    fn message_receiver_modes_update_the_list() {
+        let mut inst = WindowInst::default();
+        // Mode 0 (`wrmRegister`) appends the `(proc, userdata)` pair.
+        apply_message_receiver_mode(&mut inst.message_receivers, 0, 1, 2);
+        apply_message_receiver_mode(&mut inst.message_receivers, 0, 3, 4);
+        assert_eq!(inst.message_receivers, vec![(1, 2), (3, 4)]);
+
+        // Mode 1 (`wrmUnregister`) removes the first matching pair.
+        apply_message_receiver_mode(&mut inst.message_receivers, 1, 1, 2);
+        assert_eq!(inst.message_receivers, vec![(3, 4)]);
+
+        // Any other mode leaves the list unchanged.
+        apply_message_receiver_mode(&mut inst.message_receivers, 9, 5, 6);
+        assert_eq!(inst.message_receivers, vec![(3, 4)]);
+    }
 }

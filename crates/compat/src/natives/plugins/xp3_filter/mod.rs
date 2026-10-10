@@ -13,7 +13,7 @@
 //!   ([`fs::xp3::Xp3ExtractionFilter`]); the filter is passed in and never
 //!   stored there.
 //! * L2 (`engine::Storage`) owns the installed filter and hands it to L1 on
-//!   every archive read ([`engine::Storage::set_xp3_extraction_filter`]).
+//!   every archive read ([`engine::Storage::xp3_extraction_filter`]).
 //! * L3 (this module) registers the `Storages` members, retains the TJS
 //!   closures in [`CompatServices::state`], and installs an L2 filter that
 //!   marshals each decoded segment to the retained TJS closure. The content
@@ -179,7 +179,7 @@ fn install_storage_filter(ctx: &CompatCtx) {
         },
     );
     // SAFETY: the host keeps the attached storage alive for the VM lifetime.
-    unsafe { &mut *storage }.set_xp3_extraction_filter(Some(filter));
+    unsafe { &mut *storage }.xp3_extraction_filter = Some(filter);
 }
 
 /// Read `<app>/xp3filter.tjs` through the storage namespace and execute it.

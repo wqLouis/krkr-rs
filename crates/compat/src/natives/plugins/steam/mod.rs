@@ -25,10 +25,10 @@
 //! any other state is exposed to TJS).
 //!
 //! `DrawDeviceForSteam` is a transparent wrapper around the main window's draw
-//! device whose `interface` property returns that device. This port has no
-//! host draw-device object (the core `Window.drawDevice` reports the same
-//! thing), so the `interface` getter raises a typed error rather than
-//! fabricating a pointer — the "no silent stub" rule.
+//! device whose `interface` property returns that device as an integer
+//! (`DrawDeviceForSteam.cpp:21-24,412-415`). This port has no host
+//! draw-device object, so the getter reports the stable native payload
+//! address as a non-zero synthetic pointer.
 
 use std::ffi::{c_char, c_int, c_void};
 use std::ptr;
@@ -459,8 +459,9 @@ extern "C" fn steam_api_ctor(
 // ---------------------------------------------------------------------------
 
 /// `DrawDeviceForSteam`'s instance payload. The reference proxy stores the
-/// wrapped draw device; this host has no draw-device object, so the payload is
-/// an empty marker and [`draw_device_interface_get`] reports that.
+/// wrapped draw device; this host has no draw-device object, so the payload
+/// is an empty marker whose address [`draw_device_interface_get`] reports
+/// as a synthetic pointer.
 struct DrawDeviceForSteamInst;
 
 /// Allocate a `DrawDeviceForSteam` proxy.
@@ -491,20 +492,21 @@ extern "C" fn draw_device_ctor(
     0
 }
 
-/// `DrawDeviceForSteam.interface` — the reference returns the wrapped draw
-/// device. No host draw-device object exists in this port, so this is a typed
-/// error (the same contract as the core `Window.drawDevice`).
+/// `DrawDeviceForSteam.interface` — the reference returns
+/// `reinterpret_cast<tjs_int64>(TVPMainWindow->GetDrawDevice())`
+/// (`DrawDeviceForSteam.cpp:21-24`, registered at
+/// `DrawDeviceForSteam.cpp:412-415`). This host has no draw-device object,
+/// so the getter reports the stable native payload address as a non-zero
+/// synthetic pointer.
 extern "C" fn draw_device_interface_get(
     _engine: *mut c_void,
-    _instance: *mut c_void,
-    _out: *mut Value,
-    out_error: *mut *mut c_char,
+    instance: *mut c_void,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    report_error(
-        out_error,
-        "DrawDeviceForSteam.interface: the host draw-device object does not exist on this host",
-    )
+    set_int(out, instance as i64);
+    0
 }
 
 // ---------------------------------------------------------------------------

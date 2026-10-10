@@ -173,7 +173,7 @@ fn start_movie(
             .slots
             .get_mut(&layer_id)
             .ok_or_else(|| "Layer.startMovie: no movie opened".to_string())?;
-        slot.overlay.set_looping(looping);
+        slot.overlay.looping = looping;
         slot.overlay
             .play()
             .map_err(|error| format!("Layer.startMovie: {error}"))?;
@@ -339,7 +339,7 @@ pub fn movie_poll(ctx: &CompatCtx, dt_ms: f64) -> Result<(), CompatError> {
                     _ => {}
                 }
             }
-            if ended && !slot.overlay.looping() {
+            if ended && !slot.overlay.looping {
                 // Reference `onEnded` posts `stopMovie` for a non-looping
                 // movie (`reference/cpp/plugins/layerExMovie.cpp:281-289`),
                 // which stops playback, releases the overlay through

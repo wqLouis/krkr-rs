@@ -159,18 +159,6 @@ pub struct OverlayBinding {
     pub visible: bool,
 }
 
-impl OverlayBinding {
-    /// Create an overlay binding.
-    pub fn new(layer: Option<u32>, window: Option<u32>, alpha: f32, visible: bool) -> Self {
-        Self {
-            layer,
-            window,
-            alpha,
-            visible,
-        }
-    }
-}
-
 impl Default for OverlayBinding {
     fn default() -> Self {
         Self {
@@ -254,13 +242,15 @@ pub struct VideoOverlay {
     playing: bool,
     position_ms: i64,
     play_rate: f64,
-    looping: bool,
+    /// Whether whole-stream looping is enabled.
+    pub looping: bool,
     segment_start: i64,
     segment_end: i64,
     period_event_frame: i64,
     period_fired: bool,
     visible: bool,
-    bounds: VideoBounds,
+    /// The overlay rectangle in window coordinates.
+    pub bounds: VideoBounds,
     binding: OverlayBinding,
     frame: Option<RgbaFrame>,
     last_frame_update: i64,
@@ -511,16 +501,6 @@ impl VideoOverlay {
 
     // -- loop / segment loop ----------------------------------------------
 
-    /// Whether whole-stream looping is enabled.
-    pub fn looping(&self) -> bool {
-        self.looping
-    }
-
-    /// Enable or disable whole-stream looping.
-    pub fn set_looping(&mut self, looping: bool) {
-        self.looping = looping;
-    }
-
     /// The configured segment loop as `(start, end)` frames, when set.
     pub fn segment_loop(&self) -> Option<(i64, i64)> {
         if self.segment_start >= 0 || self.segment_end >= 0 {
@@ -531,7 +511,7 @@ impl VideoOverlay {
     }
 
     /// Configure a segment loop (`setSegmentLoop`). The loop is only honoured
-    /// while [`Self::set_looping`] is also enabled, matching the reference.
+    /// while [`Self::looping`] is also enabled, matching the reference.
     ///
     /// # Errors
     ///
@@ -585,16 +565,6 @@ impl VideoOverlay {
     pub fn set_visible(&mut self, visible: bool) {
         self.visible = visible;
         self.binding.visible = visible;
-    }
-
-    /// The overlay rectangle.
-    pub fn bounds(&self) -> VideoBounds {
-        self.bounds
-    }
-
-    /// Replace the overlay rectangle (`setBounds`).
-    pub fn set_bounds(&mut self, bounds: VideoBounds) {
-        self.bounds = bounds;
     }
 
     /// Move the overlay rectangle (`setPos`).

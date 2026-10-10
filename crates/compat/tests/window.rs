@@ -242,20 +242,11 @@ fn absent_host_facts_raise_typed_errors() {
 
     for (expression, needle) in [
         ("w.HWND", "no Win32 window handle"),
-        ("w.drawDevice", "the host draw-device object does not exist"),
-        (
-            "w.drawDevice = null",
-            "the host draw-device object does not exist",
-        ),
         ("w.displayOrientation", "no display is attached"),
         ("w.displayRotate", "no display is attached"),
         (
             "w.findFullScreenCandidates(1, 2, 3, 4, 5)",
             "no platform display-list service",
-        ),
-        (
-            "w.registerMessageReceiver(0, 0, 0)",
-            "Win32 message receivers",
         ),
     ] {
         let message = env.eval_err(expression);
@@ -267,7 +258,69 @@ fn absent_host_facts_raise_typed_errors() {
 
     // Argument-count validation stays a typed error too.
     assert!(env.eval("w.findFullScreenCandidates(1, 2, 3, 4)").is_err());
-    assert!(env.eval("w.registerMessageReceiver(0, 0)").is_err());
+    // Reference `WindowImpl.cpp:2150-2154`: fewer than three
+    // `registerMessageReceiver` arguments is `TJS_E_BADPARAMCOUNT`.
+    assert!(env.eval("w.registerMessageReceiver(0, 1)").is_err());
+}
+
+#[test]
+fn draw_device_installs_a_default_and_round_trips() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    // Reference `WindowIntf.cpp:150-166`: constructing a window installs a
+    // default `BasicDrawDevice` object.
+    env.run("var w = new Window();");
+
+    // Reference `WindowImpl.cpp:2300-2316`: the getter returns the stored
+    // draw-device object; the default is a non-null object whose `interface`
+    // is the non-zero native payload pointer (`BasicDrawDevice.cpp:886-896`).
+    env.run("var d = w.drawDevice; var iface = d.interface;");
+    assert_eq!(env.eval_int("d !== null"), 1);
+    assert_ne!(env.eval_int("iface"), 0);
+    assert_eq!(
+        env.eval_int("w.drawDevice.interface"),
+        env.eval_int("iface")
+    );
+
+    // Reference `WindowIntf.cpp:255-292` via `WindowImpl.cpp:2300-2316`: a
+    // replacement object whose `interface` is non-zero is stored, and the
+    // getter returns it.
+    env.run(
+        "var pd = new Window.PassThroughDrawDevice(); \
+         var pdIface = pd.interface; \
+         w.drawDevice = pd;",
+    );
+    assert_eq!(env.eval_int("w.drawDevice === pd"), 1);
+    assert_eq!(
+        env.eval_int("w.drawDevice.interface"),
+        env.eval_int("pdIface")
+    );
+    assert_ne!(env.eval_int("pdIface"), 0);
+}
+
+#[test]
+fn register_message_receiver_registers_and_unregisters() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run("var w = new Window();");
+
+    // Reference `WindowImpl.cpp:2150-2163`: mode `0` (`wrmRegister`,
+    // `WindowImpl.h:20`) and mode `1` (`wrmUnregister`) both return void.
+    assert_eq!(
+        env.eval_ok("w.registerMessageReceiver(0, 1, 2)"),
+        TjsValue::Void
+    );
+    assert_eq!(
+        env.eval_ok("w.registerMessageReceiver(1, 1, 2)"),
+        TjsValue::Void
+    );
+    // An unknown mode is accepted silently (the reference cast
+    // `(tTVPWMRRegMode)((tjs_int)*param[0])` has no validation,
+    // `WindowImpl.cpp:2156-2159`).
+    assert_eq!(
+        env.eval_ok("w.registerMessageReceiver(7, 1, 2)"),
+        TjsValue::Void
+    );
 }
 
 #[test]

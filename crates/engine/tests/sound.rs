@@ -97,7 +97,7 @@ fn loop_wraps_position() {
     let mut mixer = Mixer::new();
     let id = mixer.spawn_channel();
     mixer.channel(id).unwrap().play(tone(44100, 2, 1.0));
-    mixer.channel(id).unwrap().set_looping(true);
+    mixer.channel(id).unwrap().looping = true;
     mixer.advance(1.2);
     let channel = mixer.channel_ref(id).unwrap();
     assert!(channel.is_playing(), "looping channel keeps playing");
@@ -265,7 +265,7 @@ fn loop_info_wraps_into_the_loop_region() {
         .channel(id)
         .unwrap()
         .play(tone_with_loop(44100, 2.0, 1.0, 0.5));
-    mixer.channel(id).unwrap().set_looping(true);
+    mixer.channel(id).unwrap().looping = true;
 
     // Cross the loop end (1.0s) by 0.1s -> 0.5 + 0.1 = 0.6s.
     mixer.advance(1.1);
@@ -302,7 +302,7 @@ fn conditional_loop_link_uses_channel_flags() {
     let mut mixer = Mixer::new();
     let id = mixer.spawn_channel();
     mixer.channel(id).unwrap().play(track);
-    mixer.channel(id).unwrap().set_looping(true);
+    mixer.channel(id).unwrap().looping = true;
 
     // Flag clear -> fallback link to 0.5s.
     mixer.advance(1.1);
@@ -414,19 +414,19 @@ fn spatial_attenuation_matches_directsound_defaults() {
 fn global_focus_mode_mutes_by_host_state() {
     let mut mixer = Mixer::new();
     assert_eq!(mixer.focus_gain(), 1.0);
-    mixer.set_app_minimized(true);
+    mixer.app_minimized = true;
     assert_eq!(mixer.focus_gain(), 1.0);
     mixer.set_global_focus_mode(1);
     assert_eq!(mixer.focus_gain(), 0.0);
-    mixer.set_app_minimized(false);
+    mixer.app_minimized = false;
     assert_eq!(mixer.focus_gain(), 1.0);
     mixer.set_global_focus_mode(2);
-    mixer.set_app_focused(false);
+    mixer.app_focused = false;
     assert_eq!(mixer.focus_gain(), 0.0);
-    mixer.set_app_focused(true);
-    mixer.set_app_minimized(true);
+    mixer.app_focused = true;
+    mixer.app_minimized = true;
     assert_eq!(mixer.focus_gain(), 0.0);
-    mixer.set_app_minimized(false);
+    mixer.app_minimized = false;
     assert_eq!(mixer.focus_gain(), 1.0);
     mixer.set_global_focus_mode(9);
     assert_eq!(mixer.global_focus_mode(), 2);

@@ -24,9 +24,9 @@ fn pointer_wheel_and_visibility_track_events() {
     state.begin_frame();
     assert_eq!(state.wheel(), 0.0);
 
-    assert!(state.pointer_visible());
-    state.set_pointer_visible(false);
-    assert!(!state.pointer_visible());
+    assert!(state.pointer_visible);
+    state.pointer_visible = false;
+    assert!(!state.pointer_visible);
     state.apply(&InputEvent::PointerLeft);
     assert!(!state.pointer_inside());
 }

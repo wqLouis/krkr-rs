@@ -106,7 +106,8 @@ pub struct TouchContact {
 pub struct InputState {
     pointer: (f32, f32),
     pointer_inside: bool,
-    pointer_visible: bool,
+    /// Whether the pointer is visible.
+    pub pointer_visible: bool,
     warp_request: Option<(f32, f32)>,
     buttons: HashMap<MouseButton, ButtonState>,
     wheel: f32,
@@ -237,16 +238,6 @@ impl InputState {
     /// Whether the pointer is currently inside the window.
     pub fn pointer_inside(&self) -> bool {
         self.pointer_inside
-    }
-
-    /// Whether the pointer is visible.
-    pub fn pointer_visible(&self) -> bool {
-        self.pointer_visible
-    }
-
-    /// Set the pointer visibility.
-    pub fn set_pointer_visible(&mut self, visible: bool) {
-        self.pointer_visible = visible;
     }
 
     /// Move the logical pointer and queue a host cursor warp

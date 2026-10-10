@@ -262,19 +262,20 @@ fn draw_device_constants_are_class_qualified() {
 }
 
 /// Reference: `interface` returns the raw native device pointer as an
-/// integer (`reference/cpp/core/visual/impl/BasicDrawDevice.cpp:879-887`,
-/// `PassThroughDrawDevice.cpp:501-511`). This host has no `iTVPDrawDevice`
-/// pointer, so the port raises a typed error instead of fabricating one
-/// (same choice as `Window.drawDevice.interface`). The reference
-/// *value* is not reproducible here; the raising behaviour is pinned.
+/// integer (`reference/cpp/core/visual/impl/BasicDrawDevice.cpp:886-896`,
+/// `PassThroughDrawDevice.cpp:532-544`). The native payload address is the
+/// port's stable stand-in for that pointer.
 #[test]
-fn interface_getter_raises_a_typed_error() {
+fn interface_getter_is_a_synthetic_pointer() {
     let _lock = vm_lock();
     let env = Env::new();
-    let message = env
-        .eval("new Window.BasicDrawDevice().interface")
-        .expect_err("the port must raise, not fabricate a pointer");
-    println!("observed `interface` error: {message}");
+    env.run("var d = new Window.BasicDrawDevice();");
+    let interface = env.eval_int("d.interface");
+    assert_ne!(
+        interface, 0,
+        "interface must be a non-zero synthetic pointer"
+    );
+    assert_eq!(env.eval_int("d.interface"), interface);
 }
 
 /// Reference: `Invalidate()` runs `Device->Destruct()` and clears the

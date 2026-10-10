@@ -1936,7 +1936,7 @@ channel_int_getter!(sound_total_time_get, "totalTime", |object, _channel| {
 });
 
 channel_int_getter!(sound_looping_get, "looping", |_object, channel| {
-    i64::from(channel.looping())
+    i64::from(channel.looping)
 });
 
 channel_int_getter!(sound_volume_get, "volume", |_object, channel| {
@@ -2314,7 +2314,7 @@ extern "C" fn sound_position_set(
 }
 
 channel_setter!(sound_looping_set, "looping", value, out_error, |channel| {
-    channel.set_looping(value_as_bool(unsafe { &*value }));
+    channel.looping = value_as_bool(unsafe { &*value });
 });
 
 channel_setter!(sound_volume_set, "volume", value, out_error, |channel| {

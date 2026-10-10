@@ -8,9 +8,7 @@
 //! (`VideoOverlayInst`/`advance_playback`) and the reference `VideoOverlay`.
 
 use api::media::{RgbaFrame, VideoSpec};
-use engine::video::{
-    OverlayBinding, PeriodReason, PlayStatus, VideoBounds, VideoError, VideoEvent, VideoOverlay,
-};
+use engine::video::{PeriodReason, PlayStatus, VideoBounds, VideoError, VideoEvent, VideoOverlay};
 
 fn spec(fps: f32, frames: u64) -> VideoSpec {
     VideoSpec {
@@ -129,7 +127,7 @@ fn play_restarts_a_finished_non_looping_stream() {
 fn looping_wraps_to_the_start() {
     let mut v = VideoOverlay::new();
     v.open(spec(30.0, 30)).unwrap();
-    v.set_looping(true);
+    v.looping = true;
     v.play().unwrap();
     v.poll();
     v.advance(1500.0);
@@ -145,7 +143,7 @@ fn segment_loop_wraps_inside_the_segment() {
     v.open(spec(30.0, 300)).unwrap();
     v.set_segment_loop(10, 19).unwrap();
     assert_eq!(v.segment_loop(), Some((10, 19)));
-    v.set_looping(true);
+    v.looping = true;
     v.play().unwrap();
     v.poll();
     v.advance(700.0); // frame 21 is past the segment end 19
@@ -248,16 +246,17 @@ fn overlay_binding_and_rectangle() {
     v.bind_layer(4);
     v.bind_window(2);
     v.set_binding_alpha(2.0); // clamped
-    assert_eq!(
-        v.binding(),
-        OverlayBinding::new(Some(4), Some(2), 1.0, true)
-    );
+    let binding = v.binding();
+    assert_eq!(binding.layer, Some(4));
+    assert_eq!(binding.window, Some(2));
+    assert_eq!(binding.alpha, 1.0);
+    assert!(binding.visible);
 
-    v.set_bounds(VideoBounds::new(1, 2, 3, 4));
-    assert_eq!(v.bounds(), VideoBounds::new(1, 2, 3, 4));
+    v.bounds = VideoBounds::new(1, 2, 3, 4);
+    assert_eq!(v.bounds, VideoBounds::new(1, 2, 3, 4));
     v.set_position(9, 8);
     v.set_size(7, 6);
-    assert_eq!(v.bounds(), VideoBounds::new(9, 8, 7, 6));
+    assert_eq!(v.bounds, VideoBounds::new(9, 8, 7, 6));
 
     v.set_visible(false);
     assert!(!v.visible());

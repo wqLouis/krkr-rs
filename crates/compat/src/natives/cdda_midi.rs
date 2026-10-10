@@ -8,17 +8,16 @@
 //! [`engine::sound`] model) with two **thin adapters**: the class only
 //! decides how a source is obtained and whether it owns the `midiOut` static.
 //!
-//! * `CDDASoundBuffer.open` is the reference's CD track selection. This port
-//!   has no CD-DA device, so it raises a typed
-//!   [`DiscSoundError::CdTrackSelection`] rather than silently doing
-//!   nothing.
+//! * `CDDASoundBuffer.open` is the reference's CD track selection, whose body
+//!   is compiled out when `ENABLE_CDDA` is undefined; the call is a no-op that
+//!   returns void and leaves the buffer unloaded.
 //! * `MIDISoundBuffer.open` uses the shared generic file path (the L2
 //!   [`Storage`](engine::Storage) plus a host decoder, exactly like
 //!   `WaveSoundBuffer`); with no decoder installed it raises a typed
 //!   [`DiscSoundError::NoDecoder`].
 //! * `MIDISoundBuffer.midiOut` is a static method that would push raw bytes to
-//!   the MIDI output device; there is no such device here, so it raises a
-//!   typed [`DiscSoundError::MidiOut`].
+//!   the MIDI output device; its body is compiled out when `TVP_ENABLE_MIDI`
+//!   is undefined, so it returns void after the arity check.
 //!
 //! `volume`/`volume2` cross the script boundary on the TVP `0..=100000` scale
 //! ([`TVP_VOLUME_SCALE`]); the L2 mixer stays in `0..=1`. Every live object,
@@ -60,17 +59,10 @@ impl Kind {
     }
 }
 
-/// Format-specific features this port cannot perform (a typed error,
-/// never a silent default).
+/// Failures raised while servicing a disc-sound call (always surfaced as a
+/// typed error, never a silent default).
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 enum DiscSoundError {
-    /// `CDDASoundBuffer.open` is the reference's CD track selection; there is
-    /// no CD-DA device in this port.
-    #[error("CD track selection is not supported: this port has no CD-DA device")]
-    CdTrackSelection,
-    /// `MIDISoundBuffer.midiOut` needs a MIDI output device.
-    #[error("the MIDI output device is not available in this port")]
-    MidiOut,
     /// L3 links no codec and no host decoder was installed.
     #[error("no audio decoder is installed")]
     NoDecoder,
@@ -277,7 +269,7 @@ fn install_source(
             channel.stop();
             channel.set_position(0.0);
         }
-        channel.set_looping(false);
+        channel.looping = false;
         Ok(())
     })
     .ok_or(DiscSoundError::NotConstructed)?
@@ -488,18 +480,20 @@ extern "C" fn disc_open(
         "open",
         out_error,
         |_ctx, services, id, kind| {
-            let result = match kind {
-                // `CDDASoundBuffer.open` *is* CD track selection; the port has
-                // no CD-DA device.
-                Kind::Cdda => Err(DiscSoundError::CdTrackSelection),
-                Kind::Midi => load(services, id, &name),
-            };
-            match result {
-                Ok(()) => {
+            match kind {
+                // `ENABLE_CDDA` is undefined: `open` returns void without
+                // loading the buffer.
+                Kind::Cdda => {
                     set_void(out);
                     0
                 }
-                Err(error) => report_error(out_error, &class_error(kind, "open", error)),
+                Kind::Midi => match load(services, id, &name) {
+                    Ok(()) => {
+                        set_void(out);
+                        0
+                    }
+                    Err(error) => report_error(out_error, &class_error(kind, "open", error)),
+                },
             }
         }
     )
@@ -740,7 +734,7 @@ disc_channel_int_getter!(disc_total_time_get, "totalTime", |object, _channel| {
 });
 
 disc_channel_int_getter!(disc_looping_get, "looping", |_object, channel| {
-    i64::from(channel.looping())
+    i64::from(channel.looping)
 });
 
 disc_channel_int_getter!(disc_volume_get, "volume", |_object, channel| {
@@ -802,7 +796,7 @@ disc_channel_setter!(disc_position_set, "position", value, out_error, |channel| 
 });
 
 disc_channel_setter!(disc_looping_set, "looping", value, out_error, |channel| {
-    channel.set_looping(value_as_bool(unsafe { &*value }));
+    channel.looping = value_as_bool(unsafe { &*value });
 });
 
 disc_channel_setter!(disc_volume_set, "volume", value, out_error, |channel| {
@@ -841,13 +835,13 @@ extern "C" fn disc_paused_set(
 
 /// `MIDISoundBuffer.midiOut(data)`: push raw MIDI bytes to the output device.
 ///
-/// There is no MIDI output device in this port, so the call is a typed
-/// deferral rather than a silent no-op.
+/// With `TVP_ENABLE_MIDI` undefined the body is a no-op: after the arity
+/// check the call returns void.
 extern "C" fn midi_out(
     engine: *mut c_void,
     argc: c_int,
     argv: *const Value,
-    _out: *mut Value,
+    out: *mut Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
     if bound(engine).is_err() {
@@ -859,10 +853,8 @@ extern "C" fn midi_out(
     if unsafe { args(argv, argc) }.is_empty() {
         return report_error(out_error, "MIDISoundBuffer.midiOut(data)");
     }
-    report_error(
-        out_error,
-        &class_error(Kind::Midi, "midiOut", DiscSoundError::MidiOut),
-    )
+    set_void(out);
+    0
 }
 
 // ---------------------------------------------------------------------------

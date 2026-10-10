@@ -18,9 +18,10 @@
 //! no draw-device backend, so the device state — the current and preferred
 //! drawer type plus the locked source size — lives in the native instance
 //! payload and the script-visible members round-trip it. The `interface`
-//! property would be the raw `iTVPDrawDevice *`: there is no such pointer on
-//! this host, so it raises a typed error, exactly like
-//! `Window.drawDevice` and `DrawDeviceForSteam.interface` do today.
+//! property is the raw `iTVPDrawDevice *` reinterpreted as an integer
+//! (`BasicDrawDevice.cpp:886-896`, `PassThroughDrawDevice.cpp:532-544`);
+//! with no draw-device object on this host, the getter reports the stable
+//! native payload address as a non-zero synthetic pointer.
 
 use std::ffi::{c_char, c_int, c_void};
 
@@ -219,24 +220,20 @@ extern "C" fn pass_through_draw_device_lock_touch_size(
 // Properties
 // ---------------------------------------------------------------------------
 
-/// `interface` — the reference returns the native `iTVPDrawDevice *`. This
-/// host has no such object, so the getter raises a typed error instead
-/// of fabricating a pointer.
+/// `interface` — the reference returns `reinterpret_cast<tjs_int64>(
+/// _this->GetDevice())`, the native `iTVPDrawDevice *` as an integer
+/// (`BasicDrawDevice.cpp:886-896`, `PassThroughDrawDevice.cpp:532-544`).
+/// This host has no draw-device object, so the getter reports the stable
+/// native payload address as a non-zero synthetic pointer.
 extern "C" fn draw_device_interface_get(
     _engine: *mut c_void,
     instance: *mut c_void,
-    _out: *mut Value,
-    out_error: *mut *mut c_char,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    let inst = unsafe { &*(instance as *const DrawDeviceInst) };
-    report_error(
-        out_error,
-        &format!(
-            "{}.interface: the host draw-device object does not exist on this host",
-            inst.kind.class_name()
-        ),
-    )
+    set_int(out, instance as i64);
+    0
 }
 
 /// `name` — the reference parser attributes the `TVP_REGISTER_PTDD_ENUM`

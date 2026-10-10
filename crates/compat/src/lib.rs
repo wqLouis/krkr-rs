@@ -75,6 +75,10 @@ pub use natives::visual::{
     advance_transitions, paint_poll, take_bring_to_front_requests, take_capture_releases,
     take_update_requests,
 };
+// The `LayerExMovie` frame body: an L4 [`FrameBody`] forwards its per-frame
+// movie step here, and `set_movie_source` installs the host's decoded source
+// (the analogue of the reference `TVPAddContinuousEventHook`).
+pub use natives::plugins::layer_ex::{movie_poll, set_movie_source};
 pub use plugin::{NativePlugin, PluginOutcome, PluginRegistry, normalize_plugin_name, plugin_stem};
 
 /// The DLL names of every ported plugin (the `Plugins.link` targets).

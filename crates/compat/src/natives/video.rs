@@ -779,7 +779,7 @@ extern "C" fn vo_set_bounds(
         value_as_i64(&values[3]).max(0) as u32,
     );
     with_slot!(engine, instance, out_error, _ctx, slot, {
-        slot.overlay.set_bounds(bounds);
+        slot.overlay.bounds = bounds;
         set_void(out);
         0
     })
@@ -1043,7 +1043,7 @@ extern "C" fn vo_left_get(
     _objthis: *mut c_void,
 ) -> c_int {
     with_slot!(engine, instance, out_error, _ctx, slot, {
-        set_int(out, i64::from(slot.overlay.bounds().left));
+        set_int(out, i64::from(slot.overlay.bounds.left));
         0
     })
 }
@@ -1056,7 +1056,7 @@ extern "C" fn vo_left_set(
     _objthis: *mut c_void,
 ) -> c_int {
     with_slot!(engine, instance, out_error, _ctx, slot, {
-        let top = slot.overlay.bounds().top;
+        let top = slot.overlay.bounds.top;
         slot.overlay
             .set_position(value_as_i64(unsafe { &*value }) as i32, top);
         0
@@ -1071,7 +1071,7 @@ extern "C" fn vo_top_get(
     _objthis: *mut c_void,
 ) -> c_int {
     with_slot!(engine, instance, out_error, _ctx, slot, {
-        set_int(out, i64::from(slot.overlay.bounds().top));
+        set_int(out, i64::from(slot.overlay.bounds.top));
         0
     })
 }
@@ -1084,7 +1084,7 @@ extern "C" fn vo_top_set(
     _objthis: *mut c_void,
 ) -> c_int {
     with_slot!(engine, instance, out_error, _ctx, slot, {
-        let left = slot.overlay.bounds().left;
+        let left = slot.overlay.bounds.left;
         slot.overlay
             .set_position(left, value_as_i64(unsafe { &*value }) as i32);
         0
@@ -1099,7 +1099,7 @@ extern "C" fn vo_width_get(
     _objthis: *mut c_void,
 ) -> c_int {
     with_slot!(engine, instance, out_error, _ctx, slot, {
-        set_int(out, i64::from(slot.overlay.bounds().width));
+        set_int(out, i64::from(slot.overlay.bounds.width));
         0
     })
 }
@@ -1112,7 +1112,7 @@ extern "C" fn vo_width_set(
     _objthis: *mut c_void,
 ) -> c_int {
     with_slot!(engine, instance, out_error, _ctx, slot, {
-        let height = slot.overlay.bounds().height;
+        let height = slot.overlay.bounds.height;
         slot.overlay
             .set_size(value_as_i64(unsafe { &*value }).max(0) as u32, height);
         0
@@ -1127,7 +1127,7 @@ extern "C" fn vo_height_get(
     _objthis: *mut c_void,
 ) -> c_int {
     with_slot!(engine, instance, out_error, _ctx, slot, {
-        set_int(out, i64::from(slot.overlay.bounds().height));
+        set_int(out, i64::from(slot.overlay.bounds.height));
         0
     })
 }
@@ -1140,7 +1140,7 @@ extern "C" fn vo_height_set(
     _objthis: *mut c_void,
 ) -> c_int {
     with_slot!(engine, instance, out_error, _ctx, slot, {
-        let width = slot.overlay.bounds().width;
+        let width = slot.overlay.bounds.width;
         slot.overlay
             .set_size(width, value_as_i64(unsafe { &*value }).max(0) as u32);
         0
@@ -1235,7 +1235,7 @@ extern "C" fn vo_loop_get(
     _objthis: *mut c_void,
 ) -> c_int {
     with_slot!(engine, instance, out_error, _ctx, slot, {
-        set_bool(out, slot.overlay.looping());
+        set_bool(out, slot.overlay.looping);
         0
     })
 }
@@ -1248,7 +1248,7 @@ extern "C" fn vo_loop_set(
     _objthis: *mut c_void,
 ) -> c_int {
     with_slot!(engine, instance, out_error, _ctx, slot, {
-        slot.overlay.set_looping(value_as_bool(unsafe { &*value }));
+        slot.overlay.looping = value_as_bool(unsafe { &*value });
         0
     })
 }

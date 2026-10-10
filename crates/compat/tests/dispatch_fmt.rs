@@ -728,10 +728,10 @@ fn psb_root_read_through_with_is_an_object_and_read_only() {
 // ---------------------------------------------------------------------------
 
 /// `steam` registers `DrawDeviceForSteam.interface` as a getter-only
-/// instance property (`crates/compat/src/natives/plugins/steam/mod.rs:649-662`);
-/// the getter reads the `instance` payload and raises the typed
-/// "host draw-device" error when the host has none
-/// (`steam/mod.rs:497-513`). Reference `reference/cpp/plugins/steam`.
+/// instance property (`crates/compat/src/natives/plugins/steam/mod.rs:660-661`);
+/// the getter reports the stable native payload address as a non-zero
+/// synthetic pointer (`steam/mod.rs:501-509`). Reference
+/// `reference/cpp/plugins/steam`.
 #[test]
 fn steam_draw_device_interface_is_an_instance_property() {
     let _lock = vm_lock();
@@ -748,14 +748,11 @@ fn steam_draw_device_interface_is_an_instance_property() {
          var host = new Host();",
     );
 
-    // No host draw device is attached, so both the direct read and the
-    // `with`-read reach the same typed failure from the instance getter.
-    let direct = env.error("target.interface");
-    let via = env.error("host.readThrough(target)");
-    assert!(
-        direct.contains("draw-device"),
-        "unexpected message: {direct}"
-    );
+    // Both the direct read and the `with`-read reach the same instance
+    // getter and return the same non-zero synthetic pointer.
+    let direct = env.eval_int("target.interface");
+    let via = env.eval_int("host.readThrough(target)");
+    assert_ne!(direct, 0, "interface must be a non-zero synthetic pointer");
     assert_eq!(direct, via, "the with-read must reach the instance getter");
 
     // `interface` is getter-only on a direct instance.

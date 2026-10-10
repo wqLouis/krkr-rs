@@ -821,7 +821,7 @@ extern "C" fn native_is_visible(
     let Some(input) = (unsafe { input_state(&ctx) }) else {
         return report_error(out_error, "Mouse.isVisible: input state is not attached");
     };
-    set_bool(out, input.pointer_visible());
+    set_bool(out, input.pointer_visible);
     0
 }
 
@@ -846,7 +846,7 @@ extern "C" fn native_set_visible(
         return report_error(out_error, "Mouse.setVisible: input state is not attached");
     };
     // SAFETY: `attach_input` guarantees the pointer stays valid.
-    unsafe { &mut *ptr }.set_pointer_visible(visible);
+    unsafe { &mut *ptr }.pointer_visible = visible;
     set_void(out);
     0
 }

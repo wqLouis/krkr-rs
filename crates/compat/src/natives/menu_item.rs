@@ -16,13 +16,13 @@
 //! window) needed to hand the *real* objects back from `parent`, `root`,
 //! `children` and `window`.
 //!
-//! Members that genuinely need a platform menu raise a typed error rather
-//! than defaulting silently:
+//! The two members the desktop build backs with a platform menu report
+//! reference-shaped values from the logical tree instead:
 //!
 //! | member | behavior |
 //! |---|---|
-//! | `HMENU` | raises a typed [`MenuError::NoPlatformMenu`]; there is no `HMENU` to return |
-//! | `popup(flags,x,y)` | raises the same typed error; there is no OS popup to open |
+//! | `HMENU` | a stable, non-zero synthetic handle derived from the item id (`impl/MenuItemImpl.cpp:409-413`) |
+//! | `popup(flags,x,y)` | the reference success value `1` (`impl/MenuItemImpl.cpp:309-315`) |
 //!
 //! Everything else is pure logical state: the tree operations (`add`,
 //! `insert`, `remove`, `index`), the item flags (`caption`, `checked`,
@@ -59,21 +59,6 @@ use tjs::{
 use crate::native_util::{args, report_error, set_bool, set_int, set_void, value_as_string};
 use crate::natives::system::{resolve, set_string_out, try_value_as_i64, value_as_bool};
 use crate::{CompatCtx, CompatError, CompatServices};
-
-/// Platform-menu operations that have no backing on this build.
-///
-/// Raising this instead of fabricating a handle keeps the deferral explicit
-/// and testable: a script can tell "this build has no OS menu" apart from
-/// "the item has no menu".
-#[derive(Debug, thiserror::Error)]
-enum MenuError {
-    /// `HMENU` / `popup` need a native menu the build cannot provide.
-    #[error(
-        "MenuItem.{member}: no platform menu host is available on this build; \
-         the logical menu tree exists but there is no OS menu to address"
-    )]
-    NoPlatformMenu { member: &'static str },
-}
 
 // ---------------------------------------------------------------------------
 // Per-family dispatch state (never a process global)
@@ -741,25 +726,25 @@ extern "C" fn menu_item_remove(
     0
 }
 
-/// `popup(flags, x, y)` — the reference opens a native popup (`TrackPopup`,
-/// `MenuItemImpl.cpp`). This build has no OS menu, so it raises a typed error
-/// instead of pretending the popup opened.
+/// `popup(flags, x, y)` — the reference `TrackPopup` opens a native popup
+/// and returns `1` (`impl/MenuItemImpl.cpp:309-315`); the `popup` native
+/// method returns that result after its arity check
+/// (`MenuItemIntf.cpp:285-299`). This build has no OS popup, so a valid call
+/// reports the same success value and only the arity check can fail.
 extern "C" fn menu_item_popup(
     _engine: *mut c_void,
     _instance: *mut c_void,
     argc: c_int,
     _argv: *const Value,
-    _out: *mut Value,
+    out: *mut Value,
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
     if argc < 3 {
         return report_error(out_error, "MenuItem.popup requires flags, x and y");
     }
-    report_error(
-        out_error,
-        &MenuError::NoPlatformMenu { member: "popup" }.to_string(),
-    )
+    set_int(out, 1);
+    0
 }
 
 /// `fireClick()` — activate the item (reference `OnClick`,
@@ -1439,19 +1424,37 @@ fn refresh_children_array(
     Ok(())
 }
 
-/// `HMENU` — a native menu handle a plugin could use. This build has no OS
-/// menu, so it raises a typed error instead of inventing a handle.
+/// Synthetic `HMENU` base. The desktop getter casts the native menu handle to
+/// an integer (`impl/MenuItemImpl.cpp:409-413`); the high bytes spell "MENU"
+/// and keep every derived handle non-zero.
+const MENU_HANDLE_BASE: i64 = 0x4D45_4E55_0000_0000;
+
+/// `HMENU` — the native menu handle a plugin can address. The reference reads
+/// the platform handle back as an integer
+/// (`impl/MenuItemImpl.cpp:409-413`); this build has no OS menu, so it reports
+/// a stable, non-zero synthetic handle derived from the node id.
 extern "C" fn menu_hmenu_get(
-    _engine: *mut c_void,
-    _instance: *mut c_void,
-    _out: *mut Value,
+    engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    report_error(
-        out_error,
-        &MenuError::NoPlatformMenu { member: "HMENU" }.to_string(),
-    )
+    let Ok((_resolved, ctx)) = bound(engine) else {
+        return report_error(out_error, "MenuItem.HMENU: compat context is not bound");
+    };
+    let inst = unsafe { &*(instance as *const MenuItemInst) };
+    let Some(id) = inst.id else {
+        return report_error(out_error, "MenuItem.HMENU: this item is not constructed");
+    };
+    // SAFETY: the caller resolved `ctx` from the installed binding.
+    let services = unsafe { ctx.services() };
+    let live = services.state::<MenuState>().nodes.contains_key(&id);
+    if !live {
+        return report_error(out_error, "MenuItem.HMENU: this item is not constructed");
+    }
+    set_int(out, MENU_HANDLE_BASE + id as i64);
+    0
 }
 
 // ---------------------------------------------------------------------------

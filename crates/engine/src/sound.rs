@@ -546,7 +546,8 @@ pub struct SoundChannel {
     pan: f32,
     pos: [f32; 3],
     flags: LoopFlags,
-    looping: bool,
+    /// Whether the source loops.
+    pub looping: bool,
     position_seconds: f64,
     done: bool,
     fade: Option<Fade>,
@@ -712,16 +713,6 @@ impl SoundChannel {
     /// Mutable access to the conditional loop flags.
     pub fn flags_mut(&mut self) -> &mut LoopFlags {
         &mut self.flags
-    }
-
-    /// Whether the source loops.
-    pub fn looping(&self) -> bool {
-        self.looping
-    }
-
-    /// Set whether the source loops.
-    pub fn set_looping(&mut self, looping: bool) {
-        self.looping = looping;
     }
 
     /// The per-buffer volume: the fade's ramped value while a fade is active,
@@ -1012,8 +1003,10 @@ pub struct Mixer {
     clock: f64,
     global_volume: f32,
     global_focus_mode: i32,
-    app_focused: bool,
-    app_minimized: bool,
+    /// Whether the host window is currently active.
+    pub app_focused: bool,
+    /// Whether the host window is currently minimized.
+    pub app_minimized: bool,
 }
 
 impl Default for Mixer {
@@ -1107,16 +1100,6 @@ impl Mixer {
     /// Set the global focus mode, clamped to `0..=2`.
     pub fn set_global_focus_mode(&mut self, mode: i32) {
         self.global_focus_mode = mode.clamp(0, 2);
-    }
-
-    /// Feed the host window's active state.
-    pub fn set_app_focused(&mut self, focused: bool) {
-        self.app_focused = focused;
-    }
-
-    /// Feed the host window's minimized state.
-    pub fn set_app_minimized(&mut self, minimized: bool) {
-        self.app_minimized = minimized;
     }
 
     /// The focus mute gain (`1.0` audible, `0.0` muted).
