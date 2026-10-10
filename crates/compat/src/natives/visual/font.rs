@@ -4,10 +4,10 @@
 //!
 //! `getTextWidth`/`getTextHeight`, the `getEsc*` rotation variants and
 //! `getGlyphDrawRect` are backed by the L2 [`engine::text::TextEngine`]
-//! (cosmic-text shaping) rather than by a per-character extent sum. The
-//! compat layer has no font-enumeration/loading seam, so a face is registered
-//! lazily from the attached [`engine::Storage`] on first use: the face string
-//! is read as a storage name. A face that cannot be resolved that way is a
+//! (cosmic-text shaping) rather than by a per-character extent sum. A face is
+//! resolved through the `System.addFont` registry, then the attached
+//! [`engine::Storage`] (the face string read as a storage name), then the
+//! host's installed system fonts. A face that cannot be resolved at all is a
 //! typed error, never a fabricated metric. `getGlyphDrawRect` additionally
 //! needs per-glyph bitmap bounds, which `engine::text` does not expose, so it
 //! is a typed error; the same is true of `defaultFaceName`/`getList` (no font
@@ -94,13 +94,13 @@ fn measured_font(engine: *mut c_void, instance: *mut c_void) -> Result<MeasuredF
     })
 }
 
-/// Resolve `face` to an L2 [`FontId`], loading it from the attached storage on
-/// first use.
+/// Resolve `face` to an L2 [`FontId`], registering it on first use.
 ///
-/// The reference resolves a face name through its enumerated font map. Compat
-/// has no enumeration seam, so the only truthful source is the attached
-/// storage: `face` is tried as a storage name and parsed by the L2 text
-/// engine. Anything else is a typed error.
+/// The reference resolves a face name through the font map enumerated from
+/// the game's own fonts and the system faces. The port tries the same sources
+/// in order: the `System.addFont` registry, the attached storage (the face
+/// string read as a storage name), then the host's installed system fonts.
+/// Only a face none of those provides is a typed error.
 fn ensure_face(
     ctx: &CompatCtx,
     state: &mut FontMetricsState,
@@ -110,7 +110,8 @@ fn ensure_face(
         return Ok(id);
     }
     // A face registered through `System.addFont` is resolved by family name
-    // (or the storage name it was read from) before falling back to storage.
+    // (or the storage name it was read from) before the storage read and the
+    // system-font fallback.
     // SAFETY: the caller resolved `ctx` from the installed binding.
     let registered = unsafe { ctx.services() }
         .state::<crate::natives::plugins::add_font::registry::FontRegistry>()
@@ -123,19 +124,31 @@ fn ensure_face(
         state.faces.insert(face.to_string(), id);
         return Ok(id);
     }
+    // The game's own font files are tried first; the host's installed system
+    // fonts are the final fallback for a face the game did not ship.
     // SAFETY: the caller resolved `ctx` from the installed binding.
-    let storage = unsafe { ctx.services() }
-        .storage()
-        .ok_or_else(|| format!("Font: no storage attached to load face '{face}'"))?;
+    let storage = unsafe { ctx.services() }.storage();
+    let Some(storage) = storage else {
+        return Err(format!("Font: no storage attached to load face '{face}'"));
+    };
     // SAFETY: the host keeps the attached storage alive for the binding's
     // lifetime (the `attach_storage` contract).
     let storage = unsafe { &*storage };
-    let bytes = storage.read(face).map_err(|error| {
-        format!(
-            "Font: face '{face}' is not registered with the text engine and cannot be read 
-             from storage ({error}); no font enumeration/loading seam is exposed by the host services"
-        )
-    })?;
+    let bytes = match storage.read(face) {
+        Ok(bytes) => bytes,
+        Err(storage_error) => {
+            return match state.engine.load_system_font(face) {
+                Ok(id) => {
+                    state.faces.insert(face.to_string(), id);
+                    Ok(id)
+                }
+                Err(system_error) => Err(format!(
+                    "Font: face '{face}' is not registered with the text engine, cannot be read \
+                     from storage ({storage_error}), and no system font provides it ({system_error})"
+                )),
+            };
+        }
+    };
     let id = state
         .engine
         .add_font(&bytes, 0)

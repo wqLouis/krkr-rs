@@ -328,8 +328,9 @@ fn native_key_code(native: NativeKeyCode) -> u32 {
 /// the real backend. The stream's data callback drains a software
 /// [`AudioQueue`] that [`write`] fills, so the object stays stateless and the
 /// queue lives in the caller-owned state value. The stream is **not** started
-/// until the queue reaches the pre-fill target, and an underrun repeats the
-/// last sample rather than injecting a hard zero (both policies live in
+/// until the queue reaches the pre-fill target, and an underrun holds the last
+/// sample while fading it to silence, then fades the resumed audio back in,
+/// rather than stepping to a hard zero (both policies live in
 /// [`crate::audio_queue`]).
 pub(crate) mod audio {
     use std::sync::{Arc, Mutex, MutexGuard};

@@ -399,6 +399,9 @@ struct DesktopApp {
     game: Option<GameInput>,
     /// The running host, created once the window handle exists.
     running: Option<Running>,
+    /// Input and focus events received since the last frame, delivered to
+    /// the VM.
+    pending_events: Vec<PlatformEvent>,
 }
 
 /// What the windowed loop is driving.
@@ -422,12 +425,12 @@ impl Running {
         }
     }
 
-    /// Advances and presents one frame.
-    fn step(&mut self, dt_ms: f32) -> Result<(), String> {
+    /// Advances and presents one frame, delivering `events` to the VM.
+    fn step(&mut self, dt_ms: f32, events: &[PlatformEvent]) -> Result<(), String> {
         match self {
             Running::Empty(host) => host.step(dt_ms).map(|_| ()).map_err(|e| e.to_string()),
             Running::Game(game) => {
-                game.step(dt_ms, &[]).map_err(|e| e.to_string())?;
+                game.step(dt_ms, events).map_err(|e| e.to_string())?;
                 Ok(())
             }
         }
@@ -441,6 +444,7 @@ impl DesktopApp {
             backend,
             game,
             running: None,
+            pending_events: Vec::new(),
         }
     }
 }
@@ -509,18 +513,30 @@ impl EventHandler for DesktopApp {
             // surface; the DPI value itself needs no host action because input
             // and sizes are physical.
             PlatformEvent::ScaleFactorChanged(_scale) => Flow::Continue,
-            PlatformEvent::CloseRequested | PlatformEvent::Focused(_) | PlatformEvent::Input(_) => {
+            // Input and focus are buffered and delivered to the VM frame
+            // body on the next frame, where the L3 event adapter folds them
+            // into the L2 input state and dispatches the TJS events
+            // (`onFocus`/`onBlur`). `ScaleFactorChanged` is informational
+            // (winit follows it with `Resized`) and the adapter ignores it.
+            PlatformEvent::Input(input) => {
+                self.pending_events.push(PlatformEvent::Input(input));
                 Flow::Continue
             }
+            PlatformEvent::Focused(focused) => {
+                self.pending_events.push(PlatformEvent::Focused(focused));
+                Flow::Continue
+            }
+            PlatformEvent::CloseRequested => Flow::Exit,
         }
     }
 
     fn frame(&mut self, dt_ms: f32) -> Flow {
-        if let Some(running) = self.running.as_mut()
-            && let Err(error) = running.step(dt_ms)
-        {
-            eprintln!("krkr: frame failed: {error}");
-            return Flow::Exit;
+        if let Some(running) = self.running.as_mut() {
+            let events = std::mem::take(&mut self.pending_events);
+            if let Err(error) = running.step(dt_ms, &events) {
+                eprintln!("krkr: frame failed: {error}");
+                return Flow::Exit;
+            }
         }
         Flow::Continue
     }

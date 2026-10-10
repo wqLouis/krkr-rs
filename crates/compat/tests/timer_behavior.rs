@@ -1436,3 +1436,119 @@ fn a_peer_disabled_from_a_callback_is_cancelled_before_it_fires() {
 
     assert_no_problems(problems);
 }
+
+/// The timer's action owner is invoked through
+/// `tTJSVariantClosure::FuncCall(..., objthis = nullptr)`, which resolves the
+/// receiver as `ObjThis ? ObjThis : Object` — the closure's own `ObjThis`
+/// wins (`reference/cpp/core/tjs2/tjsVariant.h:219-228`; the reference's
+/// `Timer.onTimer` passes `nullptr`, `reference/cpp/core/utils/TimerIntf.cpp:
+/// 156-171`). A method captured as the action owner therefore runs with the
+/// object it was read from as `this`.
+///
+/// This is the real-game `GameSceneManager` shape: the callback is the
+/// `onWaitSceneChange` method, and `this._param` (a class member) must resolve
+/// on the same object the constructor initialised. A method reference kept its
+/// `ObjThis` across the native constructor argument marshalling, so the
+/// member is the assigned `Dictionary`.
+#[test]
+fn timer_action_owner_runs_with_the_object_it_was_read_from() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    let mut problems = Vec::new();
+
+    env.run(
+        "class SceneManager { \
+             var _param; \
+             var _timer; \
+             function SceneManager() { \
+                 _param = %[]; \
+                 _timer = new Timer(onWait, ''); \
+             } \
+             function onWait() { \
+                 thisIsManager = (this === m) ? 1 : 0; \
+                 paramIsObject = (typeof _param == 'Object') ? 1 : 0; \
+                 (Dictionary.assign incontextof _param)(%[a:1]); \
+                 (Dictionary.clear incontextof _param)(); \
+                 paramStillObject = (typeof _param == 'Object') ? 1 : 0; \
+             } \
+         } \
+         var thisIsManager = -1; var paramIsObject = -1; var paramStillObject = -1; \
+         var m = new SceneManager(); \
+         m._timer.onTimer();",
+    );
+    check(
+        &mut problems,
+        "the action owner runs with the object it was read from as `this`",
+        env.eval_int("thisIsManager"),
+        1,
+    );
+    check(
+        &mut problems,
+        "`_param` resolves on that object (the assigned Dictionary)",
+        env.eval_int("paramIsObject"),
+        1,
+    );
+    // Reference: `incontextof` rebinds the class-fetched static method's
+    // `ObjThis` (`reference/cpp/core/tjs2/tjsInterCodeExec.cpp:1282-1286`);
+    // the member is unchanged by the call.
+    check(
+        &mut problems,
+        "`(Dictionary.clear incontextof _param)()` leaves `_param` an object",
+        env.eval_int("paramStillObject"),
+        1,
+    );
+
+    assert_no_problems(problems);
+}
+
+/// A throwing callback must not corrupt the retained action owner: the
+/// reference keeps the timer enabled (`TimerIntf.cpp:156-171` returns
+/// `TJS_S_OK` and no reference path links a delivery error to `SetEnabled`),
+/// and the callback is still the same closure with the same `ObjThis` on the
+/// next fire (`tjsVariant.h:219-228`).
+///
+/// This pins the audit's open question — whether `tjs2_call_value` preserves
+/// the callback's receiver across an exception — with a run: the second fire
+/// sees the member on the original object, not `void`.
+#[test]
+fn throwing_action_owner_keeps_its_receiver_on_the_next_fire() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    let mut problems = Vec::new();
+
+    env.run(
+        "class Thrower { \
+             var _param; \
+             var _timer; \
+             var _first; \
+             function Thrower() { \
+                 _param = %[]; \
+                 _first = true; \
+                 _timer = new Timer(onWait, ''); \
+             } \
+             function onWait() { \
+                 if (_first) { _first = false; throw 'boom'; } \
+                 thisIsThrower = (this === t) ? 1 : 0; \
+                 paramIsObject = (typeof _param == 'Object') ? 1 : 0; \
+             } \
+         } \
+         var thisIsThrower = -1; var paramIsObject = -1; \
+         var t = new Thrower(); \
+         t._timer.onTimer(); \
+         t._timer.onTimer();",
+    );
+    check(
+        &mut problems,
+        "the receiver survives the first callback's exception",
+        env.eval_int("thisIsThrower"),
+        1,
+    );
+    check(
+        &mut problems,
+        "`_param` still resolves on the receiver after an exception",
+        env.eval_int("paramIsObject"),
+        1,
+    );
+
+    assert_no_problems(problems);
+}

@@ -289,3 +289,42 @@ fn font_properties_round_trip() {
     assert_eq!(font.height, 12);
     assert!(font.bold && font.italic && font.strikeout && font.underline);
 }
+
+/// Reference: `TVPFindFont` searches the enumerated font map that
+/// `TVPInitFontNames` fills with the system faces
+/// (`reference/cpp/core/visual/FontImpl.cpp:159-164,277-285`), and
+/// `TVPCreateFontStream` falls back to the default face when the requested
+/// name is absent (`FontImpl.cpp:160-164`). A face the game did not ship and
+/// the storage does not hold must therefore resolve through the engine's
+/// system-font fallback rather than raise. A host with no Japanese-capable
+/// system font has no default face either, so the test skips that case
+/// instead of failing spuriously.
+#[test]
+fn font_metrics_fall_back_to_a_system_face() {
+    let _lock = vm_lock();
+    let Some((dir, _name)) = test_font() else {
+        return;
+    };
+    // A storage that holds a font under a different name does not satisfy the
+    // requested family, forcing the system-font fallback.
+    let storage = Storage::mount_archives(
+        FileSystem::host(&dir),
+        dir.clone(),
+        std::iter::empty::<&str>(),
+    )
+    .expect("mount font directory");
+    let env = Env::new(Some(storage));
+    env.run("var f = new Font('this-family-is-not-installed', 24, 0xffffffff);");
+
+    match env.eval("f.getTextWidth('Hello')") {
+        Ok(TjsValue::Integer(width)) => {
+            assert!(
+                width > 0,
+                "the system fallback should shape real text, got {width}"
+            );
+        }
+        Ok(other) => panic!("expected an integer width, got {other:?}"),
+        Err(message) if message.contains("no system font provides it") => {}
+        Err(message) => panic!("unexpected error: {message}"),
+    }
+}

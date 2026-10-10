@@ -70,6 +70,7 @@ use render::{
     RenderScene, RenderState, Texture, TextureDesc, TextureFormat,
 };
 
+use cosmic_text::fontdb;
 use cosmic_text::{Attrs, Buffer, Family, FontSystem as CosmicFontSystem, Metrics, Shaping};
 
 /// Maximum number of shaped layouts memoized by [`TextEngine`].
@@ -78,6 +79,17 @@ use cosmic_text::{Attrs, Buffer, Family, FontSystem as CosmicFontSystem, Metrics
 /// often `cosmic-text` runs, never the glyphs it returns. When the bound is
 /// reached the whole map is dropped, which keeps the cache simple and bounded.
 const MAX_LAYOUT_CACHE_ENTRIES: usize = 512;
+
+/// Preferred Japanese-capable CJK sans face used when a requested family is
+/// not installed on the host.
+const NOTO_SANS_CJK_JP: &str = "Noto Sans CJK JP";
+
+/// Well-known Noto CJK collection paths, tried when the family query misses.
+const KNOWN_JP_PATHS: &[&str] = &[
+    "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/local/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+];
 
 /// Errors produced by text layout, atlas composition and projection.
 #[derive(Debug, thiserror::Error)]
@@ -94,6 +106,13 @@ pub enum TextError {
     InvalidFont {
         /// Human-readable description of the failure.
         message: String,
+    },
+    /// No installed system font provides the requested family and no
+    /// Japanese-capable CJK fallback is available either.
+    #[error("no system font provides family '{family}'")]
+    FontNotFound {
+        /// Requested family name.
+        family: String,
     },
     /// The glyph atlas has no free cell for the requested bitmap.
     ///
@@ -269,6 +288,10 @@ pub struct TextEngine {
     faces: Vec<Face>,
     /// Lowercased family name → face id, for name-based lookup.
     by_name: HashMap<String, FontId>,
+    /// Lazily built host font database used by [`TextEngine::load_system_font`].
+    /// It is kept separate from the shaping database so that only explicitly
+    /// resolved faces participate in layout.
+    system_fonts: Option<fontdb::Database>,
     /// Memoized shaped layouts, keyed by shaping inputs only.
     layout_cache: HashMap<LayoutKey, TextLayout>,
 }
@@ -276,9 +299,10 @@ pub struct TextEngine {
 impl TextEngine {
     /// Creates an empty text engine with no registered faces.
     ///
-    /// System font discovery is intentionally disabled: only faces added with
-    /// [`TextEngine::add_font`] are available, which keeps rendering
-    /// deterministic and free of host-specific font state.
+    /// The shaping database starts empty: only faces added with
+    /// [`TextEngine::add_font`] or resolved with
+    /// [`TextEngine::load_system_font`] are available, which keeps rendering
+    /// deterministic and free of unrelated host font state.
     pub fn new() -> Self {
         Self {
             render_system: render::create_font_system(),
@@ -288,6 +312,7 @@ impl TextEngine {
             ),
             faces: Vec::new(),
             by_name: HashMap::new(),
+            system_fonts: None,
             layout_cache: HashMap::new(),
         }
     }
@@ -334,6 +359,40 @@ impl TextEngine {
     /// Looks up a face registered under `family` (case-insensitive).
     pub fn font_id(&self, family: &str) -> Option<FontId> {
         self.by_name.get(&family.to_lowercase()).copied()
+    }
+
+    /// Resolves `family` against the host's installed fonts, registers the
+    /// matched face and returns its id.
+    ///
+    /// The family is matched case-insensitively, including the localized
+    /// family names in the font's name table. When nothing matches, the
+    /// Japanese-capable CJK fallback is used (`Noto Sans CJK JP`, then the
+    /// well-known Noto CJK collection paths). Only the resolved face is
+    /// loaded into the shaping database, so layout never picks up an
+    /// unrelated system font.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TextError::FontNotFound`] when neither `family` nor the CJK
+    /// fallback is installed, and propagates [`TextError::Glyph`] /
+    /// [`TextError::InvalidFont`] when the matched data cannot be registered.
+    pub fn load_system_font(&mut self, family: &str) -> Result<FontId, TextError> {
+        if let Some(id) = self.font_id(family) {
+            return Ok(id);
+        }
+        let system = self.system_fonts.get_or_insert_with(load_system_database);
+        let named = find_family(system, family).or_else(|| find_family(system, NOTO_SANS_CJK_JP));
+        let matched = named.or_else(|| load_known_jp_path(system));
+        let source =
+            matched.and_then(|id| system.with_face_data(id, |data, index| (data.to_vec(), index)));
+        let Some((bytes, index)) = source else {
+            return Err(TextError::FontNotFound {
+                family: family.to_string(),
+            });
+        };
+        let id = self.add_font(&bytes, index)?;
+        self.by_name.entry(family.to_lowercase()).or_insert(id);
+        Ok(id)
     }
 
     /// Returns the L1 face for `id`, if registered.
@@ -503,6 +562,56 @@ impl Default for TextEngine {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Builds the host font database used by [`TextEngine::load_system_font`].
+fn load_system_database() -> fontdb::Database {
+    let mut db = fontdb::Database::new();
+    db.load_system_fonts();
+    db
+}
+
+/// Finds the face whose family name equals `family` case-insensitively.
+///
+/// The exact-name CSS query runs first so the best weight/style match for the
+/// family is chosen; the scan then covers case differences and the localized
+/// family names the query's exact comparison misses.
+fn find_family(db: &fontdb::Database, family: &str) -> Option<fontdb::ID> {
+    let query = fontdb::Query {
+        families: &[fontdb::Family::Name(family)],
+        weight: fontdb::Weight::NORMAL,
+        stretch: fontdb::Stretch::Normal,
+        style: fontdb::Style::Normal,
+    };
+    if let Some(id) = db.query(&query) {
+        return Some(id);
+    }
+    let wanted = family.to_lowercase();
+    db.faces().find_map(|face| {
+        face.families
+            .iter()
+            .any(|(name, _)| name.to_lowercase() == wanted)
+            .then_some(face.id)
+    })
+}
+
+/// Loads the well-known Noto CJK collections and returns the first face whose
+/// family name contains `JP` (the matching face inside a shared `.ttc`).
+fn load_known_jp_path(db: &mut fontdb::Database) -> Option<fontdb::ID> {
+    for path in KNOWN_JP_PATHS {
+        if !std::path::Path::new(path).is_file() {
+            continue;
+        }
+        let ids = db.load_font_source(fontdb::Source::File(std::path::PathBuf::from(*path)));
+        let matched = ids.into_iter().find(|id| {
+            db.face(*id)
+                .is_some_and(|face| face.families.iter().any(|(name, _)| name.contains("JP")))
+        });
+        if let Some(id) = matched {
+            return Some(id);
+        }
+    }
+    None
 }
 
 /// Cache key for one rasterized glyph in the atlas.
@@ -973,5 +1082,87 @@ fn clamp01(value: f32) -> f32 {
         0.0
     } else {
         value.clamp(0.0, 1.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// System fonts tried by the tests; a missing font skips rather than
+    /// fails.
+    const TEST_FONT_PATHS: &[&str] = &[
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+    ];
+
+    /// Reads the first available test font, if any.
+    fn load_test_font() -> Option<Vec<u8>> {
+        TEST_FONT_PATHS
+            .iter()
+            .find_map(|path| std::fs::read(path).ok())
+    }
+
+    /// Reference: `TVPInternalEnumFonts` keys the enumerated font map by every
+    /// localized `TT_NAME_ID_FONT_FAMILY` entry (Japanese, Chinese, Korean,
+    /// English), not only the English family name
+    /// (`reference/cpp/core/visual/FontImpl.cpp:82-124`) and `TVPFindFont`
+    /// matches the requested name against that map
+    /// (`FontImpl.cpp:277-285`). The port's family lookup must therefore find
+    /// a face by any of its family names; the match is case-insensitive.
+    #[test]
+    fn find_family_matches_localized_names_case_insensitively() {
+        let Some(bytes) = load_test_font() else {
+            return;
+        };
+        let mut db = fontdb::Database::new();
+        db.load_font_data(bytes);
+        // Pick a family spelling that actually has case to fold, so the test
+        // exercises the case-insensitive scan rather than the exact query.
+        let Some(family) = db.faces().find_map(|face| {
+            face.families
+                .iter()
+                .map(|(name, _)| name.clone())
+                .find(|name| name.chars().any(|c| c.is_ascii_uppercase()))
+        }) else {
+            return;
+        };
+        let lowercased = family.to_lowercase();
+
+        let check = |lookup: &str| {
+            let id = find_family(&db, lookup).expect("family must match");
+            let face = db.face(id).expect("matched face exists");
+            assert!(
+                face.families
+                    .iter()
+                    .any(|(name, _)| name.to_lowercase() == lowercased),
+                "the matched face does not carry the requested family"
+            );
+        };
+        check(&family);
+        check(&lowercased);
+    }
+
+    /// Reference: `TVPFindFont` returns the matching face from the enumerated
+    /// font map, and `TVPCreateFontStream` falls back to the default face when
+    /// the requested name is absent (`reference/cpp/core/visual/FontImpl.cpp:
+    /// 159-164,277-285`). `load_system_font` therefore resolves an unknown
+    /// family to the Japanese-capable fallback when the host has one, and
+    /// reports [`TextError::FontNotFound`] when it has none.
+    #[test]
+    fn load_system_font_resolves_unknown_family_or_reports_absence() {
+        let mut engine = TextEngine::new();
+        match engine.load_system_font("this-family-is-not-installed") {
+            Ok(id) => {
+                let layout = engine
+                    .layout(id, "A", &TextStyle::new(24.0), None)
+                    .expect("the fallback face must shape");
+                assert!(!layout.is_empty());
+            }
+            Err(TextError::FontNotFound { .. }) => {}
+            Err(error) => panic!("unexpected error: {error}"),
+        }
     }
 }

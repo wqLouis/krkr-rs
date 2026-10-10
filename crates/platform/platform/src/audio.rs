@@ -8,8 +8,9 @@
 //! so two devices can coexist and no global or static is involved.
 //!
 //! The queue policy itself (a 100–250 ms pre-fill before the stream starts,
-//! oldest-first dropping past the two-second cap, and a per-channel hold on
-//! underrun) is shared by every backend and lives in `audio_queue`.
+//! oldest-first dropping past the two-second cap, and a shared-gain fade in
+//! and out of the per-channel hold on underrun) is shared by every backend and
+//! lives in `audio_queue`.
 //!
 //! # Backends
 //!

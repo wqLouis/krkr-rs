@@ -2,10 +2,11 @@
 //!
 //! The reference asks the active [`FontRasterizer`] for each character's
 //! advance (`GetTextExtent`) and for the ascent (`GetAscentHeight`). Compat
-//! has exactly one rasterizer and no font enumeration, so those metrics come
-//! from the L2 [`engine::text::TextEngine`] (cosmic-text shaping); a face is
-//! loaded from the attached [`engine::Storage`] on first use, exactly like the
-//! visual `Font` native.
+//! has exactly one rasterizer, so those metrics come from the L2
+//! [`engine::text::TextEngine`] (cosmic-text shaping); a face is resolved
+//! through the `System.addFont` registry, the attached [`engine::Storage`],
+//! then the host's installed system fonts, exactly like the visual `Font`
+//! native.
 //!
 //! [`FontRasterizer`]: https://github.com/khronos/kirikiri
 #![allow(unsafe_code)]
@@ -32,13 +33,12 @@ pub(super) fn text_engine(ctx: &CompatCtx) -> std::cell::RefMut<'_, TextRenderEn
     unsafe { ctx.services() }.state::<TextRenderEngine>()
 }
 
-/// Resolve `face` to an L2 [`FontId`], loading it from the attached storage on
-/// first use.
+/// Resolve `face` to an L2 [`FontId`], registering it on first use.
 ///
-/// Compat has no font enumeration/loading seam, so the only truthful source is
-/// the attached storage: `face` is tried as a storage name and parsed by the
-/// L2 text engine. Anything else is a typed error, never a fabricated
-/// metric.
+/// The face is tried through the `System.addFont` registry, the attached
+/// storage (the face string read as a storage name), then the host's
+/// installed system fonts. A face none of those provides is a typed error,
+/// never a fabricated metric.
 pub(super) fn ensure_face(
     ctx: &CompatCtx,
     state: &mut TextRenderEngine,
@@ -48,7 +48,8 @@ pub(super) fn ensure_face(
         return Ok(id);
     }
     // A face registered through `System.addFont` is resolved by family name
-    // (or the storage name it was read from) before falling back to storage.
+    // (or the storage name it was read from) before the storage read and the
+    // system-font fallback.
     // SAFETY: `ctx` was resolved from the installed binding.
     let registered = unsafe { ctx.services() }
         .state::<crate::natives::plugins::add_font::registry::FontRegistry>()
@@ -61,19 +62,33 @@ pub(super) fn ensure_face(
         state.faces.insert(face.to_string(), id);
         return Ok(id);
     }
+    // The game's own font files are tried first; the host's installed system
+    // fonts are the final fallback for a face the game did not ship.
     // SAFETY: `ctx` was resolved from the installed binding.
-    let storage = unsafe { ctx.services() }
-        .storage()
-        .ok_or_else(|| format!("TextRender: no storage attached to load face '{face}'"))?;
+    let storage = unsafe { ctx.services() }.storage();
+    let Some(storage) = storage else {
+        return Err(format!(
+            "TextRender: no storage attached to load face '{face}'"
+        ));
+    };
     // SAFETY: the host keeps the attached storage alive for the binding's
     // lifetime (the `attach_storage` contract).
     let storage = unsafe { &*storage };
-    let bytes = storage.read(face).map_err(|error| {
-        format!(
-            "TextRender: face '{face}' is not registered with the text engine and cannot be read \
-             from storage ({error}); no font enumeration/loading service is exposed"
-        )
-    })?;
+    let bytes = match storage.read(face) {
+        Ok(bytes) => bytes,
+        Err(storage_error) => {
+            return match state.engine.load_system_font(face) {
+                Ok(id) => {
+                    state.faces.insert(face.to_string(), id);
+                    Ok(id)
+                }
+                Err(system_error) => Err(format!(
+                    "TextRender: face '{face}' is not registered with the text engine, cannot be read \
+                     from storage ({storage_error}), and no system font provides it ({system_error})"
+                )),
+            };
+        }
+    };
     let id = state
         .engine
         .add_font(&bytes, 0)
