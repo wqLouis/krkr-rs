@@ -1366,7 +1366,7 @@ extern "C" fn window_draw_device_set(
             );
         }
     };
-    match host.get_member(object.raw_id(), "interface") {
+    match host.member(object.raw_id(), "interface") {
         Ok(TjsValue::Integer(interface)) if interface != 0 => {
             let inst = unsafe { &mut *(instance as *mut WindowInst) };
             // The reference invalidates the previous device object before

@@ -527,12 +527,12 @@ extern "C" fn player_set_motion(
                 && matches!(result, TjsValue::Object)
                 && let Ok(returned) = unsafe { ctx.engine() }.retain_value_detached(&result)
             {
-                if let Ok(chara) = unsafe { ctx.engine() }.get_member(returned.raw_id(), "chara")
+                if let Ok(chara) = unsafe { ctx.engine() }.member(returned.raw_id(), "chara")
                     && let Some(chara) = readback_string(chara)
                 {
                     inst.chara = chara;
                 }
-                if let Ok(motion) = unsafe { ctx.engine() }.get_member(returned.raw_id(), "motion")
+                if let Ok(motion) = unsafe { ctx.engine() }.member(returned.raw_id(), "motion")
                     && let Some(motion) = readback_string(motion)
                 {
                     motion_value = motion;
@@ -737,7 +737,7 @@ mp_method_void!(
                 .iter_mut()
                 .zip(["m11", "m21", "m12", "m22", "m14", "m24"])
             {
-                if let Ok(value) = unsafe { ctx.engine() }.get_member(object.raw_id(), name)
+                if let Ok(value) = unsafe { ctx.engine() }.member(object.raw_id(), name)
                     && !matches!(value, TjsValue::Void)
                 {
                     *slot = tjs_value_as_f64(&value);

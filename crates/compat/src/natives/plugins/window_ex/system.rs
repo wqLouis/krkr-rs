@@ -97,7 +97,7 @@ fn metrics_lookup(engine: &Tjs2Engine, key: &str, what: &str) -> Result<Option<i
     let Some(dict) = existing else {
         return Ok(None);
     };
-    let found = match engine.get_member(dict.raw_id(), key) {
+    let found = match engine.member(dict.raw_id(), key) {
         Ok(TjsValue::Integer(value)) => Some(value),
         Ok(TjsValue::Real(value)) => Some(value as i64),
         _ => None,

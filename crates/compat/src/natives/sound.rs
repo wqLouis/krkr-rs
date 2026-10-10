@@ -640,19 +640,19 @@ fn collect_vocoder_configs(
     filters: Tjs2ValueId,
     vocoders: &HashMap<usize, VocoderConfig>,
 ) -> Vec<VocoderConfig> {
-    let count = match host.get_member(filters, "count") {
+    let count = match host.member(filters, "count") {
         Ok(TjsValue::Integer(count)) => count,
         _ => return Vec::new(),
     };
     let mut configs = Vec::new();
     for index in 0..count {
-        let Ok(TjsValue::Object) = host.get_member(filters, &index.to_string()) else {
+        let Ok(TjsValue::Object) = host.member(filters, &index.to_string()) else {
             continue;
         };
         let Ok(element) = host.retain_value_detached(&TjsValue::Object) else {
             continue;
         };
-        if let Ok(TjsValue::Integer(handle)) = host.get_member(element.raw_id(), "interface")
+        if let Ok(TjsValue::Integer(handle)) = host.member(element.raw_id(), "interface")
             && let Some(config) = vocoders.get(&(handle as usize))
         {
             configs.push(*config);

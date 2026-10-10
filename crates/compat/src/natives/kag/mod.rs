@@ -572,14 +572,14 @@ extern "C" fn native_call_label(
 }
 
 /// Retain an object-valued member of a retained object (the reference
-/// `PropGet` + variant copy). `get_member` records the object as the most
+/// `PropGet` + variant copy). `member` records the object as the most
 /// recent object result, which `retain_value_detached` resolves against.
 fn retain_object_member(
     host: &Tjs2Engine,
     object: Tjs2ValueId,
     key: &str,
 ) -> Option<DetachedValue> {
-    if !matches!(host.get_member(object, key), Ok(TjsValue::Object)) {
+    if !matches!(host.member(object, key), Ok(TjsValue::Object)) {
         return None;
     }
     host.retain_value_detached(&TjsValue::Object).ok()
@@ -587,7 +587,7 @@ fn retain_object_member(
 
 /// A scalar member in its string form (reference `ttstr str = val;`).
 fn scalar_member(host: &Tjs2Engine, object: Tjs2ValueId, key: &str) -> Option<String> {
-    match host.get_member(object, key) {
+    match host.member(object, key) {
         Ok(TjsValue::String(value)) => Some(value),
         Ok(TjsValue::Integer(value)) => Some(value.to_string()),
         Ok(TjsValue::Real(value)) => Some(value.to_string()),
@@ -598,7 +598,7 @@ fn scalar_member(host: &Tjs2Engine, object: Tjs2ValueId, key: &str) -> Option<St
 /// A dictionary/array element count — the reference reads the `count` member
 /// of `macroArgs` / `callStack` (`KAGParser.cpp:752`, `776`).
 fn object_count(host: &Tjs2Engine, object: Tjs2ValueId) -> Result<i64, String> {
-    match host.get_member(object, "count")? {
+    match host.member(object, "count")? {
         TjsValue::Integer(count) => Ok(count),
         TjsValue::Real(count) => Ok(count as i64),
         other => Err(format!("KAGParser: count is not numeric ({other:?})")),
@@ -847,7 +847,7 @@ extern "C" fn native_restore(
         Err(e) => return report_error(out_error, &e),
     };
     let state = unsafe { state_of(instance) };
-    match host.get_member(object.raw_id(), "data") {
+    match host.member(object.raw_id(), "data") {
         // The emulator's own snapshot: exact round-trip.
         Ok(TjsValue::String(snapshot)) => match state.restore(&snapshot, &mut env.environ()) {
             Ok(()) => {
@@ -899,14 +899,14 @@ fn dict_to_entries(host: &Tjs2Engine, dict: Tjs2ValueId) -> Result<Vec<(String, 
 
     // `macroArgs` (`KAGParser.cpp:740-769`), including the reference's
     // `TVPKAGMalformedSaveData` depth check (`KAGParser.cpp:51`).
-    let explicit_depth = host
-        .get_member(dict, "macroArgStackDepth")
-        .ok()
-        .and_then(|value| match value {
-            TjsValue::Integer(v) => Some(v),
-            TjsValue::Real(v) => Some(v as i64),
-            _ => None,
-        });
+    let explicit_depth =
+        host.member(dict, "macroArgStackDepth")
+            .ok()
+            .and_then(|value| match value {
+                TjsValue::Integer(v) => Some(v),
+                TjsValue::Real(v) => Some(v as i64),
+                _ => None,
+            });
     if let Some(levels) = retain_object_member(host, dict, "macroArgs") {
         let count = object_count(host, levels.raw_id())?;
         if explicit_depth.unwrap_or(0) != count {

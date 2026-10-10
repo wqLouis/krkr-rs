@@ -50,7 +50,7 @@ pub(crate) fn is_emote_instance(ctx: &crate::CompatCtx, objthis: *mut c_void) ->
     };
     // SAFETY: `target` keeps the id valid for this call.
     matches!(
-        unsafe { ctx.engine() }.get_member(target.raw_id(), "getRot"),
+        unsafe { ctx.engine() }.member(target.raw_id(), "getRot"),
         Ok(value) if !matches!(value, TjsValue::Void)
     )
 }

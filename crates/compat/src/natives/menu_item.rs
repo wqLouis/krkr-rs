@@ -323,7 +323,7 @@ fn window_chain(state: &MenuState, id: u64) -> Option<Tjs2ValueId> {
 /// closest observable member on our `Window` is `visible`; an unreadable
 /// member counts as not deliverable, like a null form.
 fn window_can_deliver(host: &Tjs2Engine, window: Tjs2ValueId) -> bool {
-    match host.get_member(window, "visible") {
+    match host.member(window, "visible") {
         Ok(TjsValue::Integer(visible)) => visible != 0,
         Ok(TjsValue::Real(visible)) => visible != 0.0,
         Ok(_) => false,

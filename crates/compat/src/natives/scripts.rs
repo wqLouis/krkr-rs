@@ -561,7 +561,7 @@ extern "C" fn native_get_class_names(
             );
         }
     };
-    match engine.get_class_names(object.raw_id()) {
+    match engine.class_names(object.raw_id()) {
         Ok(names) => {
             set_retained_out(out, names.raw_id() as usize);
             // The C++ trampoline consumes the retention.

@@ -595,7 +595,7 @@ fn is_null(
 
 /// The `count` property of a TJS `Array`.
 fn array_count(engine: &Tjs2Engine, array: &DetachedValue) -> Result<i64, JsonError> {
-    match engine.get_member(array.raw_id(), "count")? {
+    match engine.member(array.raw_id(), "count")? {
         TjsValue::Integer(value) => Ok(value),
         TjsValue::Real(value) => Ok(value as i64),
         other => Err(JsonError::Engine(format!(
@@ -611,10 +611,10 @@ fn class_names_contain(
     object: &DetachedValue,
     class: &str,
 ) -> Result<bool, JsonError> {
-    let names = engine.get_class_names(object.raw_id())?;
+    let names = engine.class_names(object.raw_id())?;
     let count = array_count(engine, &names)?;
     for index in 0..count {
-        if let TjsValue::String(name) = engine.get_member(names.raw_id(), &index.to_string())?
+        if let TjsValue::String(name) = engine.member(names.raw_id(), &index.to_string())?
             && name == class
         {
             return Ok(true);
@@ -633,7 +633,7 @@ fn class_names_contain(
 fn is_attached_method(engine: &Tjs2Engine, value: &TjsOwned) -> Result<bool, JsonError> {
     match value {
         TjsOwned::Object(object) => {
-            let names = engine.get_class_names(object.raw_id())?;
+            let names = engine.class_names(object.raw_id())?;
             Ok(array_count(engine, &names)? == 0)
         }
         _ => Ok(false),
@@ -662,7 +662,7 @@ fn enumerate_members(
     let mut entries = Vec::new();
     let mut index = 0;
     while index + 1 < count {
-        let key = match engine.get_member(flat.raw_id(), &index.to_string())? {
+        let key = match engine.member(flat.raw_id(), &index.to_string())? {
             TjsValue::String(value) => value,
             TjsValue::Integer(value) => value.to_string(),
             TjsValue::Real(value) => value.to_string(),
@@ -672,7 +672,7 @@ fn enumerate_members(
                 )));
             }
         };
-        let value = engine.get_member(flat.raw_id(), &(index + 1).to_string())?;
+        let value = engine.member(flat.raw_id(), &(index + 1).to_string())?;
         let owned = owned_from_tjs(engine, services, value)?;
         if !is_attached_method(engine, &owned)? {
             entries.push((key, owned));
@@ -741,7 +741,7 @@ impl<'a> JsonWriter<'a> {
                 self.out.push(',');
                 self.newline();
             }
-            let value = self.engine.get_member(array.raw_id(), &index.to_string())?;
+            let value = self.engine.member(array.raw_id(), &index.to_string())?;
             self.write_value(&owned_from_tjs(self.engine, self.services, value)?)?;
         }
         self.indent -= 1;

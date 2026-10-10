@@ -1610,7 +1610,7 @@ name), and none was available"
     /// one of its script-visible properties — e.g. `Layer.parent = <Layer>`
     /// reads the right-hand object's `id`.
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
-    pub fn get_member(&self, id: Tjs2ValueId, membername: &str) -> Result<TjsValue, String> {
+    pub fn member(&self, id: Tjs2ValueId, membername: &str) -> Result<TjsValue, String> {
         let name = std::ffi::CString::new(membername)
             .map_err(|_| "member name contains a NUL byte".to_string())?;
         let mut out = Value {
@@ -1760,7 +1760,7 @@ name), and none was available"
     /// `VAL_RETAINED` native result (the trampoline consumes it), or drop it
     /// to release the reference. `obj` must be a live retained object id.
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
-    pub fn get_class_names(&self, obj: Tjs2ValueId) -> Result<DetachedValue, String> {
+    pub fn class_names(&self, obj: Tjs2ValueId) -> Result<DetachedValue, String> {
         let mut out = Value {
             ty: VAL_VOID,
             integer: 0,
@@ -1820,7 +1820,7 @@ name), and none was available"
             engine: self.inner,
             id: out.retained as Tjs2ValueId,
         };
-        let count = match self.get_member(array.raw_id(), "count")? {
+        let count = match self.member(array.raw_id(), "count")? {
             TjsValue::Integer(value) => value,
             TjsValue::Real(value) => value as i64,
             other => {
@@ -1831,7 +1831,7 @@ name), and none was available"
         };
         let mut members = Vec::with_capacity(count.max(0) as usize);
         for index in 0..count {
-            match self.get_member(array.raw_id(), &index.to_string())? {
+            match self.member(array.raw_id(), &index.to_string())? {
                 TjsValue::String(name) => members.push(name),
                 TjsValue::Integer(value) => members.push(value.to_string()),
                 TjsValue::Real(value) => members.push(value.to_string()),
@@ -3129,12 +3129,9 @@ var ra = a.get(); var rb = b.get();",
         let RetainedValue::Object(dv) = r else {
             panic!("exec_script_retained must return an object")
         };
+        assert_eq!(e.member(dv.raw_id(), "a").unwrap(), TjsValue::Integer(1));
         assert_eq!(
-            e.get_member(dv.raw_id(), "a").unwrap(),
-            TjsValue::Integer(1)
-        );
-        assert_eq!(
-            e.get_member(dv.raw_id(), "b").unwrap(),
+            e.member(dv.raw_id(), "b").unwrap(),
             TjsValue::String("x".into())
         );
         drop(dv);
@@ -4200,15 +4197,12 @@ var ra = a.get(); var rb = b.get();",
             .unwrap();
         e.set_member(id.raw_id(), "r", &TjsValue::Real(1.5))
             .unwrap();
+        assert_eq!(e.member(id.raw_id(), "x").unwrap(), TjsValue::Integer(42));
         assert_eq!(
-            e.get_member(id.raw_id(), "x").unwrap(),
-            TjsValue::Integer(42)
-        );
-        assert_eq!(
-            e.get_member(id.raw_id(), "name").unwrap(),
+            e.member(id.raw_id(), "name").unwrap(),
             TjsValue::String("hi".into())
         );
-        assert_eq!(e.get_member(id.raw_id(), "r").unwrap(), TjsValue::Real(1.5));
+        assert_eq!(e.member(id.raw_id(), "r").unwrap(), TjsValue::Real(1.5));
         // The writes are visible to the script's own reference to the object.
         e.exec_script("var got = o.x; var gotname = o.name;", "test")
             .unwrap();
@@ -4232,7 +4226,7 @@ var ra = a.get(); var rb = b.get();",
         e.set_member(id.raw_id(), "value", &TjsValue::Integer(7))
             .unwrap();
         assert_eq!(
-            e.get_member(id.raw_id(), "value").unwrap(),
+            e.member(id.raw_id(), "value").unwrap(),
             TjsValue::Integer(7)
         );
         e.exec_script("var got = c.value;", "test").unwrap();
@@ -4662,7 +4656,7 @@ var ra = a.get(); var rb = b.get();",
         // A native instance registers its class name at construction
         // (tTJSNativeClass::FuncCall -> ClassInstanceInfo(TJS_CII_ADD)).
         let names = e
-            .get_class_names(obj.raw_id())
+            .class_names(obj.raw_id())
             .expect("getClassNames must succeed");
 
         // Expose the returned array to the script for inspection: the
@@ -4692,7 +4686,7 @@ var ra = a.get(); var rb = b.get();",
         let e = Tjs2Engine::new().unwrap();
         let v = e.eval("41", "test").unwrap();
         let id = e.retain_value_detached(&v).unwrap();
-        let err = match e.get_class_names(id.raw_id()) {
+        let err = match e.class_names(id.raw_id()) {
             Ok(_) => panic!("a scalar must not have class names"),
             Err(e) => e,
         };
@@ -5055,15 +5049,15 @@ var ra = a.get(); var rb = b.get();",
             RetainedValue::Value(v) => panic!("struct eval returned a scalar: {v:?}"),
         };
         assert_eq!(
-            e.get_member(retained.raw_id(), "0").unwrap(),
+            e.member(retained.raw_id(), "0").unwrap(),
             TjsValue::String("Round Trip".into())
         );
         assert_eq!(
-            e.get_member(retained.raw_id(), "1").unwrap(),
+            e.member(retained.raw_id(), "1").unwrap(),
             TjsValue::String("05_12".into())
         );
         assert_eq!(
-            e.get_member(retained.raw_id(), "2").unwrap(),
+            e.member(retained.raw_id(), "2").unwrap(),
             TjsValue::Integer(42)
         );
         let _ = std::fs::remove_file(&path);

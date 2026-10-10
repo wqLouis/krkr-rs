@@ -3,7 +3,7 @@
 //! The reference attaches a set of object/collection helpers to the
 //! `Scripts` class (most of them `TJS_STATICMEMBER`) and binds `rehash` to
 //! the VM's `TJSDoRehash`. This port composes the L2 [`Tjs2Engine`] member
-//! API (`get_member` / `set_member` / `call_member` / `retain_*`) rather than
+//! API (`member` / `set_member` / `call_member` / `retain_*`) rather than
 //! reimplementing a script interpreter, and exposes the collection-oriented
 //! helpers as static members of `Scripts` only, matching the reference.
 //!
@@ -362,7 +362,7 @@ fn is_instance_of(
     target: &DetachedValue,
     class: &str,
 ) -> Result<bool, String> {
-    let names = engine.get_class_names(target.raw_id())?;
+    let names = engine.class_names(target.raw_id())?;
     Ok(keys_of(engine, &names)?.iter().any(|name| name == class))
 }
 
@@ -373,7 +373,7 @@ fn is_instance_of(
 /// The `count` property of a real TJS array (never falls back to
 /// enumeration).
 fn array_count(engine: &Tjs2Engine, array: &DetachedValue) -> Result<i64, String> {
-    match engine.get_member(array.raw_id(), "count")? {
+    match engine.member(array.raw_id(), "count")? {
         TjsValue::Integer(value) => Ok(value),
         TjsValue::Real(value) => Ok(value as i64),
         other => Err(format!(
@@ -399,7 +399,7 @@ fn enumerate_flat(engine: &Tjs2Engine, target: &DetachedValue) -> Result<Detache
 
 /// Read the key at even index `index` of a flattened `assign` array.
 fn read_key(engine: &Tjs2Engine, flat: &DetachedValue, index: i64) -> Result<String, String> {
-    match engine.get_member(flat.raw_id(), &index.to_string())? {
+    match engine.member(flat.raw_id(), &index.to_string())? {
         TjsValue::String(value) => Ok(value),
         TjsValue::Integer(value) => Ok(value.to_string()),
         TjsValue::Real(value) => Ok(value.to_string()),
@@ -417,7 +417,7 @@ fn read_key(engine: &Tjs2Engine, flat: &DetachedValue, index: i64) -> Result<Str
 fn is_attached_method(engine: &Tjs2Engine, value: &Owned) -> Result<bool, String> {
     match value {
         Owned::Object(object) => {
-            let names = engine.get_class_names(object.raw_id())?;
+            let names = engine.class_names(object.raw_id())?;
             Ok(keys_of(engine, &names)?.is_empty())
         }
         _ => Ok(false),
@@ -442,7 +442,7 @@ fn enumerate_entries(
     let mut index = 0;
     while index + 1 < count {
         let key = read_key(engine, &flat, index)?;
-        let value = engine.get_member(flat.raw_id(), &(index + 1).to_string())?;
+        let value = engine.member(flat.raw_id(), &(index + 1).to_string())?;
         let owned = owned_from_tjs(engine, value)?;
         if !is_attached_method(engine, &owned)? {
             entries.push((key, owned));
@@ -473,7 +473,7 @@ fn object_keys(engine: &Tjs2Engine, target: &DetachedValue) -> Result<DetachedVa
 /// `Array` exposes a `count` property; `Dictionary` and other objects do not,
 /// so fall back to the `EnumMembers`-backed enumeration.
 fn object_count(engine: &Tjs2Engine, target: &DetachedValue) -> Result<i64, String> {
-    if let Ok(value) = engine.get_member(target.raw_id(), "count") {
+    if let Ok(value) = engine.member(target.raw_id(), "count") {
         match value {
             TjsValue::Integer(value) => return Ok(value),
             TjsValue::Real(value) => return Ok(value as i64),
@@ -568,9 +568,9 @@ fn equal_arrays(
         return Ok(false);
     }
     for index in 0..x_count {
-        let x_value = engine.get_member(x.raw_id(), &index.to_string())?;
+        let x_value = engine.member(x.raw_id(), &index.to_string())?;
         let x_owned = owned_from_tjs(engine, x_value)?;
-        let y_value = engine.get_member(y.raw_id(), &index.to_string())?;
+        let y_value = engine.member(y.raw_id(), &index.to_string())?;
         let y_owned = owned_from_tjs(engine, y_value)?;
         if !equal_struct(engine, services, x_owned, y_owned, loose)? {
             return Ok(false);
@@ -597,11 +597,11 @@ fn equal_dicts(
         }
         let keys_array = object_keys(engine, x)?;
         for key in keys_of(engine, &keys_array)? {
-            let Ok(y_value) = engine.get_member(y.raw_id(), &key) else {
+            let Ok(y_value) = engine.member(y.raw_id(), &key) else {
                 continue;
             };
             let y_owned = owned_from_tjs(engine, y_value)?;
-            let x_value = engine.get_member(x.raw_id(), &key)?;
+            let x_value = engine.member(x.raw_id(), &key)?;
             let x_owned = owned_from_tjs(engine, x_value)?;
             if !equal_struct(engine, services, x_owned, y_owned, true)? {
                 return Ok(false);
@@ -616,9 +616,9 @@ fn equal_dicts(
             return Ok(false);
         }
         for key in keys_of(engine, &x_keys)? {
-            let x_value = engine.get_member(x.raw_id(), &key)?;
+            let x_value = engine.member(x.raw_id(), &key)?;
             let x_owned = owned_from_tjs(engine, x_value)?;
-            let y_value = engine.get_member(y.raw_id(), &key)?;
+            let y_value = engine.member(y.raw_id(), &key)?;
             let y_owned = owned_from_tjs(engine, y_value)?;
             if !equal_struct(engine, services, x_owned, y_owned, false)? {
                 return Ok(false);
@@ -645,7 +645,7 @@ fn foreach(
     if is_instance_of(engine, target, "Array")? {
         let count = object_count(engine, target)?;
         for index in 0..count {
-            let value = engine.get_member(target.raw_id(), &index.to_string())?;
+            let value = engine.member(target.raw_id(), &index.to_string())?;
             let owned = owned_from_tjs(engine, value)?;
             let result = call_callback(engine, &function, Owned::Integer(index), owned, &extra)?;
             if let Some(result) = result {
@@ -719,7 +719,7 @@ fn clone_owned(
                 // `clone` (`TJS_E_MEMBERNOTFOUND`) and a non-callable member
                 // are error codes the reference compares away; only a thrown
                 // script exception propagates, as it does here.
-                match engine.get_member(object.raw_id(), "clone") {
+                match engine.member(object.raw_id(), "clone") {
                     Err(_) => Ok(Owned::Object(object)),
                     Ok(TjsValue::Object) => {
                         engine.call_member(object.raw_id(), "clone", &[])?;
@@ -742,7 +742,7 @@ fn clone_array(
     let copy = new_object(engine, "[]")?;
     let count = object_count(engine, source)?;
     for index in 0..count {
-        let value = engine.get_member(source.raw_id(), &index.to_string())?;
+        let value = engine.member(source.raw_id(), &index.to_string())?;
         let owned = owned_from_tjs(engine, value)?;
         let cloned = clone_owned(engine, services, owned)?;
         let argument = cloned.to_tjs_for_call(engine)?;
@@ -760,7 +760,7 @@ fn clone_dict(
     let copy = new_object(engine, "%[]")?;
     let keys_array = object_keys(engine, source)?;
     for key in keys_of(engine, &keys_array)? {
-        let value = engine.get_member(source.raw_id(), &key)?;
+        let value = engine.member(source.raw_id(), &key)?;
         let owned = owned_from_tjs(engine, value)?;
         let cloned = clone_owned(engine, services, owned)?;
         let argument = cloned.to_tjs_for_call(engine)?;
@@ -830,7 +830,7 @@ fn safe_eval_storage(
     let shortname = storage_name(&name);
     match engine.eval_retained(&wrapped, &shortname) {
         Ok(RetainedValue::Object(object)) => {
-            let value = engine.get_member(object.raw_id(), "0")?;
+            let value = engine.member(object.raw_id(), "0")?;
             owned_from_tjs(engine, value)
         }
         Ok(RetainedValue::Value(_)) => Ok(Owned::Void),
@@ -1033,7 +1033,7 @@ fn run_prop_get(
         }
         // Flag 0 on a dictionary: the read below returns void.
     }
-    let value = engine.get_member(target.raw_id(), key)?;
+    let value = engine.member(target.raw_id(), key)?;
     owned_from_tjs(engine, value)
 }
 

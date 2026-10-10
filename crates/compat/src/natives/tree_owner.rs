@@ -246,7 +246,7 @@ fn eval_object(host: &Tjs2Engine, expression: &str, what: &str) -> Option<Detach
 
 /// Read a numeric member of a retained object.
 fn member_i64(host: &Tjs2Engine, id: Tjs2ValueId, member: &str) -> Option<i64> {
-    match host.get_member(id, member) {
+    match host.member(id, member) {
         Ok(TjsValue::Integer(v)) => Some(v),
         Ok(TjsValue::Real(v)) => Some(v as i64),
         _ => None,

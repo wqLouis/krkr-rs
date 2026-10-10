@@ -315,7 +315,7 @@ extern "C" fn array_save2(
         Ok(object) => object,
         Err(error) => return report_error(out_error, &format!("Array.save2: {error}")),
     };
-    let count = match host.get_member(object.raw_id(), "count") {
+    let count = match host.member(object.raw_id(), "count") {
         Ok(TjsValue::Integer(count)) => count,
         Ok(other) => {
             return report_error(
@@ -327,7 +327,7 @@ extern "C" fn array_save2(
     };
     let mut content = String::new();
     for index in 0..count {
-        let value = match host.get_member(object.raw_id(), &index.to_string()) {
+        let value = match host.member(object.raw_id(), &index.to_string()) {
             Ok(value) => value,
             Err(error) => {
                 return report_error(out_error, &format!("Array.save2: element {index}: {error}"));

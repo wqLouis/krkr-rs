@@ -154,7 +154,7 @@ pub(crate) fn objthis_int(
     name: &str,
 ) -> Result<i64, String> {
     let object = retain_objthis(engine, objthis)?;
-    match engine.get_member(object.raw_id(), name) {
+    match engine.member(object.raw_id(), name) {
         Ok(TjsValue::Integer(value)) => Ok(value),
         Ok(TjsValue::Real(value)) => Ok(value as i64),
         Ok(_) => Ok(0),
@@ -289,7 +289,7 @@ pub(crate) fn objthis_has_member(engine: &Tjs2Engine, objthis: *mut c_void, name
     let Ok(object) = retain_objthis(engine, objthis) else {
         return false;
     };
-    engine.get_member(object.raw_id(), name).is_ok()
+    engine.member(object.raw_id(), name).is_ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -321,7 +321,7 @@ pub(crate) struct Tokened<V> {
 /// Read the identity token `objthis` carries, if any.
 fn state_token(engine: &Tjs2Engine, objthis: *mut c_void) -> Option<i64> {
     let object = retain_objthis(engine, objthis).ok()?;
-    match engine.get_member(object.raw_id(), STATE_TOKEN) {
+    match engine.member(object.raw_id(), STATE_TOKEN) {
         Ok(TjsValue::Integer(token)) => Some(token),
         _ => None,
     }
@@ -382,12 +382,12 @@ pub(crate) fn arg_has_class(engine: &Tjs2Engine, value: &Value, name: &str) -> b
         Ok(object) => object,
         Err(_) => return false,
     };
-    let names = match engine.get_class_names(object.raw_id()) {
+    let names = match engine.class_names(object.raw_id()) {
         Ok(names) => names,
         Err(_) => return false,
     };
     for index in 0..64 {
-        match engine.get_member(names.raw_id(), &index.to_string()) {
+        match engine.member(names.raw_id(), &index.to_string()) {
             Ok(TjsValue::String(found)) => {
                 if found == name || found == format!("{name}Instance") {
                     return true;

@@ -40,7 +40,7 @@ fn dump_path() -> PathBuf {
 
 /// Retain the object an engine member resolves to, if any.
 fn retain_member(engine: &Tjs2Engine, obj: Tjs2ValueId, name: &str) -> Option<DetachedValue> {
-    match engine.get_member(obj, name) {
+    match engine.member(obj, name) {
         Ok(TjsValue::Object) => engine.retain_value_detached(&TjsValue::Object).ok(),
         _ => None,
     }
@@ -69,10 +69,7 @@ fn is_nested_class(engine: &Tjs2Engine, child: &DetachedValue, path: &str) -> bo
     let name = path.rsplit('.').next().unwrap_or(path);
     // A dictionary reports a missing key as `void`, so require a real object
     // member (the class-name constructor is a function).
-    matches!(
-        engine.get_member(child.raw_id(), name),
-        Ok(TjsValue::Object)
-    )
+    matches!(engine.member(child.raw_id(), name), Ok(TjsValue::Object))
 }
 
 /// Record `key` -> members of the class object, plus the members of a

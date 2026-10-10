@@ -565,7 +565,7 @@ fn options_number(host: &tjs::Tjs2Engine, options: Option<&Value>, names: &[&str
     }
     let object = host.retain_object_arg(value).ok()?;
     for name in names {
-        match host.get_member(object.raw_id(), name) {
+        match host.member(object.raw_id(), name) {
             Ok(TjsValue::Real(number)) => return Some(number),
             Ok(TjsValue::Integer(number)) => return Some(number as f64),
             _ => {}
@@ -580,7 +580,7 @@ fn options_text(host: &tjs::Tjs2Engine, options: Option<&Value>, name: &str) -> 
         return None;
     }
     let object = host.retain_object_arg(value).ok()?;
-    match host.get_member(object.raw_id(), name) {
+    match host.member(object.raw_id(), name) {
         Ok(TjsValue::String(text)) => Some(text),
         _ => None,
     }

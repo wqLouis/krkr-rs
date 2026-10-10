@@ -48,9 +48,7 @@ fn delete_member_removes_a_global_member() {
         .set_member(global.raw_id(), "AbiDeleteProbe", &TjsValue::Integer(41))
         .unwrap();
     assert_eq!(
-        engine
-            .get_member(global.raw_id(), "AbiDeleteProbe")
-            .unwrap(),
+        engine.member(global.raw_id(), "AbiDeleteProbe").unwrap(),
         TjsValue::Integer(41),
         "the member must be readable before the delete"
     );
@@ -61,11 +59,11 @@ fn delete_member_removes_a_global_member() {
 
     // Reading now hits the VM's missing-member path: `tTJSCustomObject::
     // PropGet` returns TJS_E_MEMBERNOTFOUND (tjsObject.cpp:1309) once
-    // DeleteByName removed the slot (tjsObject.cpp:759). Our `get_member`
+    // DeleteByName removed the slot (tjsObject.cpp:759). Our `member`
     // surfaces that as a typed error, so the deleted member is no longer
     // readable.
     let read_err = engine
-        .get_member(global.raw_id(), "AbiDeleteProbe")
+        .member(global.raw_id(), "AbiDeleteProbe")
         .expect_err("the deleted member must no longer be readable");
     assert!(
         !read_err.is_empty(),
@@ -96,7 +94,7 @@ fn delete_member_removes_a_member_from_a_dictionary() {
     // clears the result and returns success
     // (`crates/tjs/cpp/tjs2/tjsDictionary.cpp:739-743`).
     assert_eq!(
-        engine.get_member(dict.raw_id(), "k").unwrap(),
+        engine.member(dict.raw_id(), "k").unwrap(),
         TjsValue::Void,
         "the deleted dictionary member reads back as void"
     );

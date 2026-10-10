@@ -333,7 +333,7 @@ pub(super) fn value_as_usize(value: &Value) -> Option<usize> {
 }
 
 fn read_number_member(host: &Tjs2Engine, id: Tjs2ValueId, name: &str) -> Result<f64, String> {
-    match host.get_member(id, name) {
+    match host.member(id, name) {
         Ok(TjsValue::Integer(value)) => Ok(value as f64),
         Ok(TjsValue::Real(value)) => Ok(value),
         Ok(TjsValue::String(value)) => value
@@ -350,7 +350,7 @@ fn read_point_object(
     what: &str,
 ) -> Result<(f64, f64), String> {
     let is_array = matches!(
-        host.get_member(object.raw_id(), "count"),
+        host.member(object.raw_id(), "count"),
         Ok(TjsValue::Integer(count)) if count >= 2
     );
     if is_array {
@@ -371,7 +371,7 @@ fn read_rect_object(
     what: &str,
 ) -> Result<(f64, f64, f64, f64), String> {
     let is_array = matches!(
-        host.get_member(object.raw_id(), "count"),
+        host.member(object.raw_id(), "count"),
         Ok(TjsValue::Integer(count)) if count >= 4
     );
     if is_array {
@@ -435,7 +435,7 @@ pub(super) fn read_point_member(
     id: Tjs2ValueId,
     name: &str,
 ) -> Result<Option<(f64, f64)>, String> {
-    match host.get_member(id, name) {
+    match host.member(id, name) {
         Ok(TjsValue::Object) => {
             let object = host
                 .retain_value_detached(&TjsValue::Object)
@@ -452,7 +452,7 @@ pub(super) fn read_rect_member(
     id: Tjs2ValueId,
     name: &str,
 ) -> Result<Option<(f64, f64, f64, f64)>, String> {
-    match host.get_member(id, name) {
+    match host.member(id, name) {
         Ok(TjsValue::Object) => {
             let object = host
                 .retain_value_detached(&TjsValue::Object)
@@ -477,7 +477,7 @@ pub(super) fn read_points(
     let array = host
         .retain_object_arg(value)
         .map_err(|error| format!("{what}: {error}"))?;
-    let count = match host.get_member(array.raw_id(), "count") {
+    let count = match host.member(array.raw_id(), "count") {
         Ok(TjsValue::Integer(count)) if count >= 0 => count as usize,
         Ok(TjsValue::Real(count)) if count >= 0.0 => count as usize,
         _ => return Err(format!("{what}: the argument is not an array")),
@@ -485,7 +485,7 @@ pub(super) fn read_points(
     let mut out = Vec::with_capacity(count.min(1 << 20));
     for index in 0..count {
         let element = host
-            .get_member(array.raw_id(), &index.to_string())
+            .member(array.raw_id(), &index.to_string())
             .map_err(|error| format!("{what}: element {index}: {error}"))?;
         match element {
             TjsValue::Object => {
@@ -514,7 +514,7 @@ pub(super) fn read_rects(
     let array = host
         .retain_object_arg(value)
         .map_err(|error| format!("{what}: {error}"))?;
-    let count = match host.get_member(array.raw_id(), "count") {
+    let count = match host.member(array.raw_id(), "count") {
         Ok(TjsValue::Integer(count)) if count >= 0 => count as usize,
         Ok(TjsValue::Real(count)) if count >= 0.0 => count as usize,
         _ => return Err(format!("{what}: the argument is not an array")),
@@ -522,7 +522,7 @@ pub(super) fn read_rects(
     let mut out = Vec::with_capacity(count.min(1 << 20));
     for index in 0..count {
         let element = host
-            .get_member(array.raw_id(), &index.to_string())
+            .member(array.raw_id(), &index.to_string())
             .map_err(|error| format!("{what}: element {index}: {error}"))?;
         match element {
             TjsValue::Object => {
@@ -548,7 +548,7 @@ pub(super) fn read_handle(engine: *mut c_void, value: &Value, what: &str) -> Res
     let object = host
         .retain_object_arg(value)
         .map_err(|error| format!("{what}: {error}"))?;
-    match host.get_member(object.raw_id(), "__handle") {
+    match host.member(object.raw_id(), "__handle") {
         Ok(TjsValue::Integer(handle)) if handle > 0 => Ok(handle as usize),
         Ok(TjsValue::Real(handle)) if handle > 0.0 => Ok(handle as usize),
         _ => Err(format!(

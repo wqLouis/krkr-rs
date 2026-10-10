@@ -218,7 +218,7 @@ fn object_id(host: &Tjs2Engine, value: &Value) -> Result<Option<Tjs2ValueId>, St
 /// Read a Dictionary member, treating a missing member and TJS `void` alike
 /// (the reference `getprop` macro).
 fn member(host: &Tjs2Engine, id: Tjs2ValueId, name: &str) -> Option<TjsValue> {
-    match host.get_member(id, name) {
+    match host.member(id, name) {
         Ok(TjsValue::Void) | Err(_) => None,
         Ok(value) => Some(value),
     }

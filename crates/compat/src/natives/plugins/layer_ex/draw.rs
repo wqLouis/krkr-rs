@@ -712,7 +712,7 @@ fn read_matrix(engine: *mut c_void, value: &Value, what: &str) -> Result<Mat, St
         .retain_object_arg(value)
         .map_err(|error| format!("{what}: the matrix argument is not an object: {error}"))?;
     let number = |name: &str| -> Result<f64, String> {
-        match host.get_member(object.raw_id(), name) {
+        match host.member(object.raw_id(), name) {
             Ok(TjsValue::Integer(v)) => Ok(v as f64),
             Ok(TjsValue::Real(v)) => Ok(v),
             Ok(_) => Err(format!("{what}: the matrix member {name} is not numeric")),
@@ -720,7 +720,7 @@ fn read_matrix(engine: *mut c_void, value: &Value, what: &str) -> Result<Mat, St
         }
     };
     let is_array = matches!(
-        host.get_member(object.raw_id(), "count"),
+        host.member(object.raw_id(), "count"),
         Ok(TjsValue::Integer(count)) if count >= 6
     );
     if is_array {

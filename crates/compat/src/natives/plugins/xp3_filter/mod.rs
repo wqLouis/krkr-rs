@@ -356,8 +356,8 @@ fn content_context(
     let Ok(array) = engine.retain_value_detached(&TjsValue::Object) else {
         return TjsValue::Void;
     };
-    let _ = engine.get_member(array.raw_id(), "0");
-    match engine.get_member(array.raw_id(), "1") {
+    let _ = engine.member(array.raw_id(), "0");
+    match engine.member(array.raw_id(), "1") {
         Ok(TjsValue::Object) => match engine.retain_value_detached(&TjsValue::Object) {
             Ok(object) => {
                 let ctx = TjsValue::Retained(object.raw_id() as u64);
@@ -410,7 +410,7 @@ fn apply_extraction_filter(
     drop(pass);
     call?;
     for (index, byte) in buffer.iter_mut().enumerate() {
-        match engine.get_member(array.raw_id(), &index.to_string())? {
+        match engine.member(array.raw_id(), &index.to_string())? {
             TjsValue::Integer(value) => *byte = value as u8,
             TjsValue::Real(value) => *byte = value as u8,
             _ => {}
@@ -549,7 +549,7 @@ extern "C" fn array_xor(
     let end = offset.saturating_add(length);
     for index in offset..end {
         let name = index.to_string();
-        let current = match resolved.engine().get_member(object.raw_id(), &name) {
+        let current = match resolved.engine().member(object.raw_id(), &name) {
             Ok(TjsValue::Integer(value)) => value as u8,
             Ok(TjsValue::Real(value)) => value as u8,
             _ => 0,

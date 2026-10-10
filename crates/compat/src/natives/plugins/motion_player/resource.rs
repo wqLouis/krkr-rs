@@ -163,7 +163,7 @@ extern "C" fn resource_ctor(
                 "_proceedingKeyList",
             ] {
                 let defined = engine_ref
-                    .get_member(window.raw_id(), name)
+                    .member(window.raw_id(), name)
                     .is_ok_and(|value| !matches!(value, TjsValue::Void));
                 if !defined {
                     let Ok(dictionary) = eval_object(&ctx, "%[]") else {

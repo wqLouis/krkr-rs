@@ -121,7 +121,7 @@ fn argb_value(value: &Value) -> Result<[u8; 4], String> {
 /// through the same helper `value_as_i64` uses, other types fall back to
 /// `default`.
 fn member_i64(host: &Tjs2Engine, id: tjs::Tjs2ValueId, name: &str, default: i64) -> i64 {
-    match host.get_member(id, name) {
+    match host.member(id, name) {
         Ok(TjsValue::Integer(value)) => value,
         Ok(TjsValue::Real(value)) => value as i64,
         Ok(TjsValue::String(value)) => {
@@ -143,7 +143,7 @@ fn member_i64(host: &Tjs2Engine, id: tjs::Tjs2ValueId, name: &str, default: i64)
 }
 
 fn member_f64(host: &Tjs2Engine, id: tjs::Tjs2ValueId, name: &str, default: f64) -> f64 {
-    match host.get_member(id, name) {
+    match host.member(id, name) {
         Ok(TjsValue::Integer(value)) => value as f64,
         Ok(TjsValue::Real(value)) => value,
         _ => default,
@@ -176,7 +176,7 @@ fn gradient_line(rect: (f64, f64, f64, f64), angle_deg: f64) -> ((f64, f64), (f6
 /// present but non-numeric members read as 0 through `getRealValue`'s
 /// `AsReal` conversion.
 fn member_angle(host: &Tjs2Engine, id: tjs::Tjs2ValueId, name: &str) -> Option<f64> {
-    match host.get_member(id, name) {
+    match host.member(id, name) {
         Ok(TjsValue::Integer(value)) => Some(value as f64),
         Ok(TjsValue::Real(value)) => Some(value),
         Ok(TjsValue::String(value)) => Some(value.parse().unwrap_or(0.0)),

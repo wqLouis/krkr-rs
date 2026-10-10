@@ -300,7 +300,7 @@ impl PlayerInst {
             return None;
         };
         // SAFETY: a `CompatCtx` is only created for a bound, live engine.
-        match unsafe { ctx.engine() }.get_member(project.raw_id(), "__motionSnapshot") {
+        match unsafe { ctx.engine() }.member(project.raw_id(), "__motionSnapshot") {
             Ok(TjsValue::Integer(value)) => Some(value as u64),
             _ => None,
         }
@@ -632,25 +632,25 @@ impl PlayerInst {
             return;
         };
         let engine = unsafe { ctx.engine() };
-        if let Ok(TjsValue::String(chara)) = engine.get_member(object.raw_id(), "chara") {
+        if let Ok(TjsValue::String(chara)) = engine.member(object.raw_id(), "chara") {
             self.chara = chara;
         }
-        if let Ok(TjsValue::String(key)) = engine.get_member(object.raw_id(), "motionKey") {
+        if let Ok(TjsValue::String(key)) = engine.member(object.raw_id(), "motionKey") {
             self.motion_key = key;
         }
-        if let Ok(TjsValue::Real(x)) = engine.get_member(object.raw_id(), "x") {
+        if let Ok(TjsValue::Real(x)) = engine.member(object.raw_id(), "x") {
             self.coord.x.set(x as f32);
         }
-        if let Ok(TjsValue::Real(y)) = engine.get_member(object.raw_id(), "y") {
+        if let Ok(TjsValue::Real(y)) = engine.member(object.raw_id(), "y") {
             self.coord.y.set(y as f32);
         }
-        if let Ok(TjsValue::Real(scale)) = engine.get_member(object.raw_id(), "scale") {
+        if let Ok(TjsValue::Real(scale)) = engine.member(object.raw_id(), "scale") {
             self.scale.set(scale as f32);
         }
-        if let Ok(TjsValue::Real(rotate)) = engine.get_member(object.raw_id(), "rotate") {
+        if let Ok(TjsValue::Real(rotate)) = engine.member(object.raw_id(), "rotate") {
             self.rotate.set(rotate as f32);
         }
-        if let Ok(TjsValue::Integer(color)) = engine.get_member(object.raw_id(), "color") {
+        if let Ok(TjsValue::Integer(color)) = engine.member(object.raw_id(), "color") {
             self.color = ColorAnimator::from_packed(color as u32);
         }
     }

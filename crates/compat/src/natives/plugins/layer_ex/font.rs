@@ -95,21 +95,21 @@ pub(super) fn read_font(host: &Tjs2Engine, value: &Value, what: &str) -> Result<
     let object = host
         .retain_object_arg(value)
         .map_err(|error| format!("{what}: the font argument is not an object: {error}"))?;
-    let family = match host.get_member(object.raw_id(), "familyName") {
+    let family = match host.member(object.raw_id(), "familyName") {
         Ok(TjsValue::String(value)) => value,
         _ => String::new(),
     };
-    let em_size = match host.get_member(object.raw_id(), "emSize") {
+    let em_size = match host.member(object.raw_id(), "emSize") {
         Ok(TjsValue::Integer(value)) => value as f64,
         Ok(TjsValue::Real(value)) => value,
         _ => 12.0,
     };
-    let style = match host.get_member(object.raw_id(), "style") {
+    let style = match host.member(object.raw_id(), "style") {
         Ok(TjsValue::Integer(value)) => value as i32,
         Ok(TjsValue::Real(value)) => value as i32,
         _ => 0,
     };
-    let force_self_path_draw = match host.get_member(object.raw_id(), "forceSelfPathDraw") {
+    let force_self_path_draw = match host.member(object.raw_id(), "forceSelfPathDraw") {
         Ok(TjsValue::Integer(value)) => value != 0,
         Ok(TjsValue::Real(value)) => value != 0.0,
         _ => false,

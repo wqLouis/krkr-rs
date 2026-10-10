@@ -316,7 +316,7 @@ impl CsvParserInst {
         // `TJS_S_OK` plus a cleared (void) result
         // (`crates/tjs/cpp/tjs2/tjsDictionary.cpp:732-745`), so a void or a
         // failed lookup both mean there is no callback to drive.
-        match host.get_member(target, "doLine") {
+        match host.member(target, "doLine") {
             Ok(TjsValue::Void) | Err(_) => return Ok(()),
             Ok(_) => {}
         }

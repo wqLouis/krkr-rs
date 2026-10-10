@@ -313,7 +313,7 @@ fn resolve_layer_ref(host: &Tjs2Engine, value: &Value) -> Result<Option<LayerRef
 /// Read a boolean member, defaulting to `true` when absent (the reference
 /// `Layer.visible` default).
 fn member_is_true(host: &Tjs2Engine, id: Tjs2ValueId, name: &str) -> bool {
-    match host.get_member(id, name) {
+    match host.member(id, name) {
         Ok(TjsValue::Integer(v)) => v != 0,
         Ok(TjsValue::Real(v)) => v != 0.0,
         _ => true,
@@ -322,7 +322,7 @@ fn member_is_true(host: &Tjs2Engine, id: Tjs2ValueId, name: &str) -> bool {
 
 /// Read a numeric member, or `None` when it is absent.
 fn member_as_f64(host: &Tjs2Engine, id: Tjs2ValueId, name: &str) -> Option<f64> {
-    match host.get_member(id, name) {
+    match host.member(id, name) {
         Ok(TjsValue::Integer(v)) => Some(v as f64),
         Ok(TjsValue::Real(v)) => Some(v),
         _ => None,

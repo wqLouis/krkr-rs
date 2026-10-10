@@ -518,7 +518,7 @@ extern "C" fn native_get_local_name(
 
 /// Read an optional string property from a retained parameter object.
 fn member_string(host: &Tjs2Engine, id: Tjs2ValueId, name: &str) -> Option<String> {
-    match host.get_member(id, name) {
+    match host.member(id, name) {
         Ok(TjsValue::String(value)) => Some(value),
         Ok(TjsValue::Integer(value)) => Some(value.to_string()),
         Ok(TjsValue::Real(value)) => Some(value.to_string()),
@@ -528,7 +528,7 @@ fn member_string(host: &Tjs2Engine, id: Tjs2ValueId, name: &str) -> Option<Strin
 
 /// Read an optional boolean property from a retained parameter object.
 fn member_bool(host: &Tjs2Engine, id: Tjs2ValueId, name: &str) -> bool {
-    match host.get_member(id, name) {
+    match host.member(id, name) {
         Ok(TjsValue::Integer(value)) => value != 0,
         Ok(TjsValue::Real(value)) => value != 0.0,
         Ok(TjsValue::String(value)) => !value.is_empty(),

@@ -307,7 +307,7 @@ fn build_time_dict(
 /// converts between seconds and milliseconds
 /// (`reference/cpp/plugins/fstat/main.cpp:135-148,215-218`).
 fn restore_date_filetime(engine: &Tjs2Engine, dict: Tjs2ValueId, member: &str) -> Option<i64> {
-    let value = engine.get_member(dict, member).ok()?;
+    let value = engine.member(dict, member).ok()?;
     if !matches!(value, TjsValue::Object) {
         return None;
     }
