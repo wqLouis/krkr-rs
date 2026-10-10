@@ -25,6 +25,17 @@ from pathlib import Path
 
 FN = re.compile(r"\bfn\s+([A-Za-z_][A-Za-z0-9_]*)")
 STUB_MARKERS = ("unimplemented!", "todo!")
+# Phrases that mark a deliberate no-op / deferral, whether raised or logged.
+STUB_PHRASES = (
+    "not implemented",
+    "not exposed",
+    "not supported",
+    "no font enumeration",
+    "no host",
+    "is not wired",
+    "is not available",
+    "cannot be exposed",
+)
 DOC_PREFIXES = ("///", "//!", "#[", "//")
 DOC_CONTEXT = 6
 
@@ -76,9 +87,17 @@ def classify(body: str, loc: int) -> str:
         for line in inner.splitlines()
         if line.strip() and not line.strip().startswith("//")
     ]
+    lowered = body.lower()
     if any(marker in body for marker in STUB_MARKERS):
         return "STUB"
-    if "report_error(" in body and len(stmts) <= 8:
+    # A callback that mostly raises is a deferral candidate.
+    if "report_error(" in body and len(stmts) <= 10:
+        return "STUB?"
+    # A no-op that logs (or raises) a deferral phrase instead of raising.
+    if any(phrase in lowered for phrase in STUB_PHRASES) and len(stmts) <= 12:
+        return "STUB?"
+    # A callback that only warns and returns a fixed value.
+    if "log::warn!" in body and len(stmts) <= 6:
         return "STUB?"
     if not stmts or all(line.rstrip(";") in ("0", "()", "None", "false", "true") for line in stmts):
         return "EMPTY?"
