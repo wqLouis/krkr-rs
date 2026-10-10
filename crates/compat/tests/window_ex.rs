@@ -98,19 +98,13 @@ impl Env {
     }
 
     /// Run `assign` (a statement list), then read `read` back through its
-    /// getter.
-    ///
-    /// [`Self::eval`] compiles a **single expression**: the reference's
-    /// `EvalExpression` runs the lexer in expression mode, which appends a
-    /// `;` and, when a result is needed, returns the first token as
-    /// `return` (`reference/cpp/core/tjs2/tjsScriptBlock.cpp:198-243`,
-    /// `reference/cpp/core/tjs2/tjsLex.cpp:1006-1008,1676-1679`). Mixing an
-    /// assignment and a following read in one string therefore yields the
-    /// assignment's value and leaves the read unreachable; only separate
-    /// executions reach the getter.
+    /// getter, via the shared [`common::eval_then`] (see it for why one
+    /// string cannot do both).
     fn assign_then(&self, assign: &str, read: &str) -> i64 {
-        self.run(assign);
-        self.eval_int(read)
+        match common::eval_then(&self.engine, assign, read) {
+            Ok(TjsValue::Integer(value)) => value,
+            other => panic!("{read:?} returned {other:?}, expected an integer"),
+        }
     }
 
     fn eval_str(&self, expression: &str) -> String {

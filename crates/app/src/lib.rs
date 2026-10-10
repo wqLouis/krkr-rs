@@ -27,6 +27,7 @@
 mod audio;
 mod game;
 mod image_codec;
+mod window_ex;
 
 use std::collections::HashMap;
 
@@ -48,6 +49,7 @@ pub use audio::install_audio_decoder;
 pub use game::{GameError, GameHost};
 pub use image_codec::{install_image_codec, install_image_codec_on};
 pub use render::{BackendKind, FrameStats};
+pub use window_ex::install_window_ex_facts;
 
 /// Errors surfaced by [`Host`].
 ///

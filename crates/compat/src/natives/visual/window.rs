@@ -1300,19 +1300,20 @@ extern "C" fn window_reset_mouse_velocity(
 
 // --- Window host facts -----------------------------------------------------
 
-/// `Window.HWND` — Win32-only. An absent host fact is a typed error, not
-/// a silent `0`.
+/// `Window.HWND` — the native instance pointer itself, cast to an integer
+/// (reference `WindowImpl.cpp:2288-2298`):
+/// `*result = (tTVInteger)(tjs_intptr_t)_this;`. The
+/// `GetWindowHandleForPlugin()` call is commented out in the reference, so
+/// this is the instance pointer, not an OS handle.
 extern "C" fn window_hwnd_get(
     _engine: *mut c_void,
-    _instance: *mut c_void,
-    _out: *mut Value,
-    out_error: *mut *mut c_char,
+    instance: *mut c_void,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    report_error(
-        out_error,
-        "Window.HWND: no Win32 window handle is available on this host",
-    )
+    set_int(out, instance as i64);
+    0
 }
 
 /// `Window.drawDevice` — the stored draw-device object, or `null` when none
@@ -1384,34 +1385,30 @@ extern "C" fn window_draw_device_set(
     }
 }
 
-/// `Window.displayOrientation` — no display is attached to the L2 scene, so
-/// this is a typed error instead of a hardcoded SM_* value.
+/// `Window.displayOrientation` — `orientLandscape` (reference
+/// `TVPWindow.h:138`, enum `TVPWindow.h:25-28`:
+/// `orientUnknown = 0, orientPortrait = 1, orientLandscape = 2`).
 extern "C" fn window_display_orientation_get(
     _engine: *mut c_void,
     _instance: *mut c_void,
-    _out: *mut Value,
-    out_error: *mut *mut c_char,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    report_error(
-        out_error,
-        "Window.displayOrientation: no display is attached to this host",
-    )
+    set_int(out, 2);
+    0
 }
 
-/// `Window.displayRotate` — no display is attached to the L2 scene, so this
-/// is a typed error instead of a hardcoded `0`.
+/// `Window.displayRotate` — `0` (reference `TVPWindow.h:137`).
 extern "C" fn window_display_rotate_get(
     _engine: *mut c_void,
     _instance: *mut c_void,
-    _out: *mut Value,
-    out_error: *mut *mut c_char,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    report_error(
-        out_error,
-        "Window.displayRotate: no display is attached to this host",
-    )
+    set_int(out, 0);
+    0
 }
 
 /// Apply one `registerMessageReceiver` call: mode `0` (`wrmRegister`) pushes
@@ -1467,15 +1464,15 @@ extern "C" fn window_register_message_receiver(
     0
 }
 
-/// `Window.findFullScreenCandidates(...)` — the reference body is disabled
-/// (`#if 0`); no L2 platform display list is exposed, so this is a typed
-/// error rather than returning fabricated candidates.
+/// `Window.findFullScreenCandidates(...)` — the reference validates five
+/// arguments and otherwise returns `TJS_S_OK` with no result; its body is
+/// disabled (`#if 0`) (reference `WindowImpl.cpp:2129-2148`).
 extern "C" fn window_find_full_screen_candidates(
     _engine: *mut c_void,
     _instance: *mut c_void,
     argc: c_int,
     _argv: *const Value,
-    _out: *mut Value,
+    out: *mut Value,
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
@@ -1485,10 +1482,8 @@ extern "C" fn window_find_full_screen_candidates(
             "Window.findFullScreenCandidates requires 5 arguments",
         );
     }
-    report_error(
-        out_error,
-        "Window.findFullScreenCandidates: no platform display-list service is attached",
-    )
+    set_void(out);
+    0
 }
 
 /// `Window.layerTreeOwnerInterface` — the window object itself is the layer

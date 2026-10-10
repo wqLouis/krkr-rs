@@ -1479,3 +1479,20 @@ fn assign_images_copies_a_layer_and_deallocates_on_an_imageless_source() {
         "a missing argument must raise BADPARAMCOUNT"
     );
 }
+
+/// Reference: `tTVPLayerManager::AttachPrimary` forces a window's first layer
+/// visible (`reference/cpp/core/visual/LayerManager.cpp:161-172`), while a
+/// later layer keeps the default hidden state. The shared
+/// [`common::non_primary_layer`] encodes that trap: it creates the window and
+/// a throwaway primary layer so the layer it returns genuinely starts hidden.
+#[test]
+fn non_primary_layer_starts_hidden() {
+    let _lock = vm_lock();
+    let mut env = Env::new();
+    let layer = common::non_primary_layer(&mut env.scene);
+    assert!(
+        !env.scene.layer(layer).expect("layer state").visible,
+        "the returned layer must start hidden"
+    );
+    assert!(!env.scene.is_primary_layer(layer));
+}

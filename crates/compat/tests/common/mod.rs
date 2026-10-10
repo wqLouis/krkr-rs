@@ -111,6 +111,12 @@ impl Env {
         self._game_dir.as_ref()
     }
 
+    /// The VM the harness is bound to (for the shared [`eval_then`]
+    /// helper, which takes the engine rather than an [`Env`]).
+    pub fn engine(&self) -> &Tjs2Engine {
+        &self.engine
+    }
+
     pub fn run(&self, script: &str) {
         self.engine
             .exec_script(script, "compat-test")
@@ -162,6 +168,44 @@ impl Env {
         let mut ctx = self._host.ctx().expect("bound compat context");
         compat::async_trigger_poll(&mut ctx).expect("async trigger poll");
     }
+}
+
+/// Execute `write` as a statement list, then evaluate `read` separately.
+///
+/// [`Tjs2Engine::eval`] compiles its input in **expression mode**: the lexer
+/// appends a `;` and, when a result is needed, rewrites the first token as a
+/// `return`, so a statement before the trailing expression never runs
+/// (`reference/cpp/core/tjs2/tjsScriptBlock.cpp:198-243`,
+/// `reference/cpp/core/tjs2/tjsLex.cpp:1006-1008,1676-1679`). A getter that
+/// must observe a preceding assignment therefore needs the assignment run
+/// through `exec_script` and the read evaluated afterwards. This is the
+/// shared form of the local `assign_then` helper in `tests/window_ex.rs`.
+pub fn eval_then(
+    engine: &tjs::Tjs2Engine,
+    write: &str,
+    read: &str,
+) -> Result<tjs::TjsValue, String> {
+    engine
+        .exec_script(write, "compat-test")
+        .map_err(|error| error.to_string())?;
+    engine
+        .eval(read, "compat-test")
+        .map_err(|error| error.to_string())
+}
+
+/// Add a window plus one throwaway primary layer, then return a fresh
+/// non-primary layer.
+///
+/// [`Scene::add_layer`] promotes a window's first layer to the primary layer
+/// and forces it visible, mirroring the reference
+/// `tTVPLayerManager::AttachPrimary`
+/// (`reference/cpp/core/visual/LayerManager.cpp:161-172`). A test that
+/// expects a newly created layer to read back hidden must add this throwaway
+/// layer first, so the layer under test is not the force-visible primary.
+pub fn non_primary_layer(scene: &mut Scene) -> u32 {
+    let window = scene.add_window("compat-non-primary", (1, 1));
+    scene.add_layer(window, None);
+    scene.add_layer(window, None)
 }
 
 /// A unique temporary directory under the system temp dir.

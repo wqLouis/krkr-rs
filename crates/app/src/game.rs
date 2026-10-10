@@ -165,11 +165,13 @@ impl GameHost {
                 .attach_storage(storage.as_ref() as *const Storage as *mut Storage);
         }
 
-        // Install the L1 codec seams the compat natives compose. Both clone
-        // their backend, so the locals may drop here.
+        // Install the seams the compat natives compose: the L1 codecs and the
+        // emulated Windows host facts. The codecs clone their backend, so the
+        // `media` local may drop here.
         let media = media::Media::new();
         crate::install_audio_decoder(vm.compat(), &media);
         crate::install_image_codec(vm.compat(), &media, &storage);
+        crate::install_window_ex_facts(vm.compat(), host.surface_size());
 
         let plan = storage.startup_plan()?;
         run_startup(&vm, &storage, &plan)?;

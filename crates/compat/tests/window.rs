@@ -88,11 +88,6 @@ impl Env {
             .unwrap_or_else(|error| panic!("eval {expression:?} failed: {error}"))
     }
 
-    fn eval_err(&self, expression: &str) -> String {
-        self.eval(expression)
-            .expect_err(&format!("{expression:?} should raise"))
-    }
-
     fn eval_int(&self, expression: &str) -> i64 {
         match self.eval_ok(expression) {
             TjsValue::Integer(value) => value,
@@ -235,28 +230,36 @@ fn host_fact_properties_round_trip() {
 }
 
 #[test]
-fn absent_host_facts_raise_typed_errors() {
+fn win32_host_facts_return_plausible_values() {
     let _lock = vm_lock();
     let env = Env::new();
-    env.run("var w = new Window();");
+    env.run("var w = new Window(); var h1 = w.HWND; var h2 = w.HWND;");
 
-    for (expression, needle) in [
-        ("w.HWND", "no Win32 window handle"),
-        ("w.displayOrientation", "no display is attached"),
-        ("w.displayRotate", "no display is attached"),
-        (
-            "w.findFullScreenCandidates(1, 2, 3, 4, 5)",
-            "no platform display-list service",
-        ),
-    ] {
-        let message = env.eval_err(expression);
-        assert!(
-            message.contains(needle),
-            "{expression:?} should report {needle:?}, got: {message}"
-        );
-    }
+    // Reference `WindowImpl.cpp:2288-2298`: `*result =
+    // (tTVInteger)(tjs_intptr_t)_this;` — the native instance pointer, which
+    // is non-zero and stable across reads (the getter does not mutate it).
+    let hwnd = env.eval_int("w.HWND");
+    assert_ne!(hwnd, 0, "Window.HWND must be a non-zero instance pointer");
+    assert_eq!(env.eval_int("h1"), hwnd);
+    assert_eq!(env.eval_int("h2"), hwnd);
 
-    // Argument-count validation stays a typed error too.
+    // Reference `TVPWindow.h:138` returns `orientLandscape`, which is `2`
+    // (`TVPWindow.h:25-28`: `orientUnknown = 0, orientPortrait = 1,
+    // orientLandscape = 2`).
+    assert_eq!(env.eval_int("w.displayOrientation"), 2);
+
+    // Reference `TVPWindow.h:137`: `GetDisplayRotate()` returns `0`.
+    assert_eq!(env.eval_int("w.displayRotate"), 0);
+
+    // Reference `WindowImpl.cpp:2129-2148`: the body is `#if 0`, so a
+    // five-argument call returns `TJS_S_OK` with no result (void).
+    assert_eq!(
+        env.eval_ok("w.findFullScreenCandidates(0, 0, 0, 0, 0)"),
+        TjsValue::Void
+    );
+
+    // Reference `WindowImpl.cpp:2130-2131`: fewer than five arguments is
+    // `TJS_E_BADPARAMCOUNT`, which stays a typed arity error.
     assert!(env.eval("w.findFullScreenCandidates(1, 2, 3, 4)").is_err());
     // Reference `WindowImpl.cpp:2150-2154`: fewer than three
     // `registerMessageReceiver` arguments is `TJS_E_BADPARAMCOUNT`.
