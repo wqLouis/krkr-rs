@@ -7,6 +7,7 @@
 //! plain value holders; their math is the pure geometry already available in
 //! [`api::geometry`], so this module only marshals the TJS properties to and
 //! from it.
+#![allow(unsafe_code)]
 
 use std::ffi::{c_char, c_int, c_void};
 

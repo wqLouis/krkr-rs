@@ -34,6 +34,7 @@
 
 #![warn(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]
+#![deny(unsafe_code)]
 
 mod cpu;
 pub mod glyph;

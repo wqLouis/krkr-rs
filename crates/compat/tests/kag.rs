@@ -801,7 +801,7 @@ fn walks_text_tags_and_line_ends() {
 #[test]
 fn ignore_cr_suppresses_line_ends() {
     let mut state = KagParserState::default();
-    state.set_ignore_cr(true);
+    state.ignore_cr = true;
     state.load_scenario_text("t.ks", "Hi\n").unwrap();
     let mut eval = |_e: &str| Ok(EvalResult::Void);
     let tags = collect(&mut state, &mut eval);
@@ -958,13 +958,13 @@ fn store_and_restore_round_trip() {
 fn clear_empties_the_scenario_but_keeps_properties() {
     let mut state = KagParserState::default();
     state.load_scenario_text("t.ks", "*start\nA\n").unwrap();
-    state.set_ignore_cr(true);
+    state.ignore_cr = true;
     state.clear();
     let mut eval = |_e: &str| Ok(EvalResult::Void);
     let tags = collect(&mut state, &mut eval);
     assert!(tags.is_empty());
     assert!(state.storage_name().is_empty());
-    assert!(state.ignore_cr());
+    assert!(state.ignore_cr);
 }
 
 #[test]
@@ -1000,10 +1000,10 @@ fn state_accessors_and_call_label() {
     // Accessors exposed to the native layer.
     let _ = state.cur_pos();
     assert!(!state.cur_line_str().is_empty());
-    state.set_process_special_tags(false);
-    assert!(!state.process_special_tags());
-    state.set_process_special_tags(true);
-    assert!(state.process_special_tags());
+    state.process_special_tags = false;
+    assert!(!state.process_special_tags);
+    state.process_special_tags = true;
+    assert!(state.process_special_tags);
 
     // A fresh state has no macro-argument level to pop.
     assert!(state.pop_macro_args_public().is_err());
@@ -1012,8 +1012,8 @@ fn state_accessors_and_call_label() {
     assert_eq!(state.call_stack_depth(), 0);
 
     // Remaining native-facing accessors.
-    state.set_debug_level(2);
-    assert_eq!(state.debug_level(), 2);
+    state.debug_level = 2;
+    assert_eq!(state.debug_level, 2);
     assert!(state.macros_entries().is_empty());
     assert!(state.macro_params_entries().is_none());
     state.interrupt();

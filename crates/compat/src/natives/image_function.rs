@@ -40,6 +40,7 @@
 //! rasterizer / glyph cache, which is *not* exposed through the L2/L3 service
 //! set yet. A registered method that raises a clear error is the
 //! counterpart of the visual family's deliberately unregistered text members.
+#![allow(unsafe_code)]
 
 use std::ffi::{c_char, c_int, c_void};
 

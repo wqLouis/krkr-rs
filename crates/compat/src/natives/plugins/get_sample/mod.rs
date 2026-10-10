@@ -31,6 +31,7 @@
 //! `getVisBuffer` itself is the L2 playback state's own method: this plugin
 //! never reaches into the `sound` module, it invokes the object's script-visible
 //! method exactly like the reference `objthis->FuncCall(0, "getVisBuffer", …)`.
+#![allow(unsafe_code)]
 
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};

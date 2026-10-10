@@ -6,6 +6,7 @@
 //! SeparateLayerAdaptor/D3DAdaptor/SourceCache/ObjSource)`),
 //! `SeparateLayerAdaptor.cpp`, `D3DAdaptor.cpp`, `SourceCache.cpp` and
 //! `HitTestInternal.h`.
+#![allow(unsafe_code)]
 
 use std::ffi::c_void;
 

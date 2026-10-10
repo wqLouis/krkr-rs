@@ -58,6 +58,7 @@
 //! instance payload; nothing lives in a process global. Encoding values for
 //! TJS builds real TJS `Dictionary`/`Array` objects through the engine, so a
 //! game script sees the same shapes as the reference `toTJSVal` conversions.
+#![allow(unsafe_code)]
 
 mod container;
 mod decompress;

@@ -7,6 +7,7 @@
 //!
 //! L3 does **not** redeclare the platform event type: the event loop/type is
 //! L1 and only the TJS mapping lives here.
+#![allow(unsafe_code)]
 
 use platform::{InputEvent, MouseButton, PlatformEvent};
 

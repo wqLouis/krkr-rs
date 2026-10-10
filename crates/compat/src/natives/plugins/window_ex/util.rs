@@ -6,6 +6,7 @@
 //! readers the `Window` members need (an objthis-only member receives no
 //! native payload, so it resolves a property through the retained object
 //! handle the VM marshalled).
+#![allow(unsafe_code)]
 
 use std::ffi::{c_char, c_int, c_void};
 use std::ptr;

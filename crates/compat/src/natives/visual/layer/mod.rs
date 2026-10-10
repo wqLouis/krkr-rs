@@ -1,4 +1,5 @@
 //! The visual `Layer` native class.
+#![allow(unsafe_code)]
 
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};

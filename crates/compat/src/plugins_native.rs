@@ -5,6 +5,7 @@
 //! `getList()` returns the linked names. This mirrors the reference
 //! `Plugins` class (static members only) with the null-plugin behavior wired
 //! in.
+#![allow(unsafe_code)]
 
 use std::ffi::{c_char, c_int, c_void};
 

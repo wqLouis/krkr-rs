@@ -45,6 +45,7 @@
 //! reference event dictionary (`MenuItemIntf.cpp:305-316`); a missing or
 //! failing `action` member is ignored exactly like the reference's unchecked
 //! `FuncCall`.
+#![allow(unsafe_code)]
 
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};

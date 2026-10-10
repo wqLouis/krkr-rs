@@ -23,6 +23,7 @@
 //! global.
 //!
 //! [`FontRasterizer`]: https://github.com/khronos/kirikiri
+#![allow(unsafe_code)]
 
 mod layout;
 mod metrics;

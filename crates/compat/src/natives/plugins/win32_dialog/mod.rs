@@ -39,6 +39,7 @@
 //! exception thrown from the script body.
 //!
 //! [`System.inform`]: crate::natives::system
+#![allow(unsafe_code)]
 
 use std::ffi::{CString, c_char, c_int, c_void};
 use std::ptr;

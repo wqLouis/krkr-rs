@@ -36,6 +36,7 @@
 //! annotated with the invariant that makes it sound. The instance is shared
 //! through an [`Arc`] guard, so the pipeline and state may be dropped in any
 //! order.
+#![allow(unsafe_code)]
 
 mod device;
 mod draw;

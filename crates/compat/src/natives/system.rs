@@ -54,6 +54,7 @@
 //! matched entry's next character must be `=` or the end of the string. A
 //! value-less entry reads back as `"yes"`. The vector lives in
 //! [`SystemState`], not a process global.
+#![allow(unsafe_code)]
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, c_int, c_void};

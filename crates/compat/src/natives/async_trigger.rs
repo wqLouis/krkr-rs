@@ -46,6 +46,7 @@
 //! * After `invalidate`, `trigger`/`cancel` are silent no-ops — the
 //!   reference guards them with `if(Owner)` and `Owner` is cleared at
 //!   invalidation (`EventIntf.cpp:1036-1037`, `1044`, `1065`).
+#![allow(unsafe_code)]
 
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};

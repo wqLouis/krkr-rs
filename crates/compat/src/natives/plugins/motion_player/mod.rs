@@ -27,6 +27,7 @@
 //! main.cpp:128,427,565,588`). The remaining classes are registered through
 //! the global-publishing ABI and their global is deleted right after they are
 //! aliased into `Motion`, so they exist only as `Motion.*`.
+#![allow(unsafe_code)]
 
 #[macro_use]
 mod macros;

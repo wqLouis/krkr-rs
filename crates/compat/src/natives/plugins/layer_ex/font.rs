@@ -7,6 +7,7 @@
 //! (the same shaping service the visual `Font` native uses) and rasterizes
 //! glyphs with the L1 glyph rasterizer exposed by the text engine. A face
 //! that cannot be loaded is a typed error, never a fabricated metric.
+#![allow(unsafe_code)]
 
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};

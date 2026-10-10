@@ -22,6 +22,7 @@
 //! per-layer `LayerExDraw` transform/record state), kept in
 //! [`CompatServices::state`](crate::CompatServices::state) rather than in a
 //! process global.
+#![allow(unsafe_code)]
 
 mod appearance;
 mod base;

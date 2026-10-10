@@ -37,6 +37,7 @@
 //! where the reference `getDirList` returns an empty array
 //! (`StorageImpl.cpp:222-247` does nothing when `opendir` fails, and the
 //! `catch` at `dirlist.cpp:48-50` only rethrows other exceptions).
+#![allow(unsafe_code)]
 
 use crate::{CompatCtx, CompatError};
 

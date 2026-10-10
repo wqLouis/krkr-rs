@@ -24,6 +24,7 @@
 //! definition lives on the VM, so a game that later assigns
 //! `drawFFTGraph = function(...) {...}` keeps working exactly as it does on
 //! the reference.
+#![allow(unsafe_code)]
 
 use crate::{CompatCtx, CompatError};
 

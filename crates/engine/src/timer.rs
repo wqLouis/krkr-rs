@@ -23,14 +23,15 @@
 //!
 //! * [`TimerState::advance`] takes `now_ms` from the L1 clock and *delivers*
 //!   — this is the frame's event-pump step;
-//! * [`TimerState::set_now`] injects the current time *without* delivering.
-//!   L3's property setters call it before (re-)arming so a schedule write
+//! * assigning [`TimerState::now_ms`] injects the current time *without*
+//!   delivering.
+//!   L3's property setters write it before (re-)arming so a schedule write
 //!   between two polls lands on the write's own timestamp, exactly like the
 //!   reference deriving `NextTick` from `GetTickCount()` at
 //!   `SetEnabled`/`SetInterval` time.
 //!
 //! Both keep the registry fully deterministic for tests: time only ever
-//! enters through these two methods.
+//! enters through these two paths.
 //!
 //! # Re-entrancy
 //!
@@ -127,7 +128,7 @@ struct TimerEntry {
 /// Timers are keyed by a monotonic [`TimerId`]; iteration is ordered, so
 /// due callbacks are delivered in creation order. The registry owns no
 /// global and no clock: time enters only through
-/// [`TimerState::set_now`] / [`TimerState::advance`].
+/// [`TimerState::now_ms`] / [`TimerState::advance`].
 #[derive(Default)]
 #[non_exhaustive]
 pub struct TimerState {
@@ -137,8 +138,8 @@ pub struct TimerState {
     /// The next id to hand out.
     next_id: u64,
     /// The most recently injected time: the last `advance(now_ms)`, or the
-    /// last `set_now(now_ms)`. Every (re-)arm point is measured from here.
-    now_ms: u64,
+    /// last write to this field. Every (re-)arm point is measured from here.
+    pub now_ms: u64,
 }
 
 impl TimerState {
@@ -147,19 +148,8 @@ impl TimerState {
         Self::default()
     }
 
-    /// Inject the current time **without** delivering anything.
-    ///
-    /// This is the time source for schedule writes between two polls:
-    /// arming ([`TimerState::create_interval`], [`TimerState::set_enabled`]`(true)`)
-    /// and an interval change on an armed timer ([`TimerState::set_interval`])
-    /// all derive their deadline from here, and no callback ever runs as a
-    /// side effect — delivery happens exclusively in [`TimerState::advance`].
-    pub fn set_now(&mut self, now_ms: u64) {
-        self.now_ms = now_ms;
-    }
-
     /// Register `callback` to wake every `interval_ms`, first fire one
-    /// interval from the injected now ([`TimerState::set_now`] or the last
+    /// interval from the injected now ([`TimerState::now_ms`] or the last
     /// [`TimerState::advance`]).
     ///
     /// The timer is created **armed**: it fires at `now + interval_ms` and
@@ -236,7 +226,7 @@ impl TimerState {
     /// Arm or disarm `id`.
     ///
     /// Enabling arms the timer at `now + interval_ms`, measured from the
-    /// injected now — call [`TimerState::set_now`] first when arming outside
+    /// injected now — write [`TimerState::now_ms`] first when arming outside
     /// [`TimerState::advance`]. Disabling drops the pending deadline, and
     /// the next enable re-arms from then. Both cancel a fire that a running
     /// [`TimerState::advance`] has collected but not yet delivered.

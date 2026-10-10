@@ -105,7 +105,7 @@ fn disarming_mid_flight_gates_delivery_and_rearming_starts_fresh() {
     // fresh schedule from the injected now — no backlog of missed fires,
     // then the ordinary cadence with the same callback.
     timers.set_interval(id, 5).expect("store");
-    timers.set_now(20_000);
+    timers.now_ms = 20_000;
     timers.set_enabled(id, true).expect("re-arm");
     assert_eq!(timers.advance(20_004), 0);
     assert_eq!(timers.advance(20_005), 1);

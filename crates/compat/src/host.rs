@@ -1,5 +1,6 @@
 //! The L3 host: owns the dispatch state and installs the process-wide
 //! binding against a VM.
+#![allow(unsafe_code)]
 
 use tjs::Tjs2Engine;
 

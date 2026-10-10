@@ -11,6 +11,7 @@
 //! The list mirrors `TVPInitTJSScript` (`base/ScriptMgnIntf.cpp:58-364`)
 //! one-to-one: all 411 scalar constants plus the `imageTagLayerType`
 //! dictionary (the script's only non-scalar member, `ScriptMgnIntf.cpp:331`)
+#![allow(unsafe_code)]
 
 use crate::{CompatCtx, CompatError};
 

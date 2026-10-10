@@ -125,6 +125,7 @@
 //!   construct without arguments, and stores `None` — the reference's empty
 //!   closure — so the event forwarders stay silent, exactly like
 //!   `new WaveSoundBuffer(null)` does.
+#![allow(unsafe_code)]
 
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};

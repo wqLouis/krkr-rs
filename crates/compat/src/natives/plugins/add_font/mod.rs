@@ -26,6 +26,7 @@
 //! [`registry::FontRegistry::lookup`] before falling back to reading the face
 //! string as a storage name, so a face registered by `System.addFont`
 //! resolves by family name or by the storage name it was read from.
+#![allow(unsafe_code)]
 
 /// The face registry shared with in-crate text consumers.
 pub(crate) mod registry;

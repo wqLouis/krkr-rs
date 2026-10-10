@@ -37,6 +37,7 @@
 //! `core/CMakeLists.txt:39`). The handlers are matched by closure identity,
 //! so `removeLoggingHandler` retires exactly the callback it names and a
 //! duplicate registration is ignored.
+#![allow(unsafe_code)]
 
 use std::collections::VecDeque;
 use std::ffi::{c_char, c_int, c_void};

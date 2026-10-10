@@ -24,6 +24,7 @@
 //! applied by [`super::sound_play`] to the decoded source through the
 //! `WaveSoundBuffer.filters` chain, so `pitch` and `time` actually alter the
 //! rendered audio rather than only round-tripping.
+#![allow(unsafe_code)]
 
 use std::f64::consts::PI;
 use std::ffi::{c_char, c_int, c_void};

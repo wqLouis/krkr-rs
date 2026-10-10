@@ -5,6 +5,7 @@
 //! the Rust instance payload and translate the result back into the raw
 //! `tjs2_value` ABI slot. Keeping the unsafe pointer code here lets the
 //! per-member callbacks stay one-line closures.
+#![allow(unsafe_code)]
 
 use std::ffi::{c_char, c_int, c_void};
 use std::ptr;

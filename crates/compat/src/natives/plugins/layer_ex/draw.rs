@@ -10,6 +10,7 @@
 //!
 //! All pixel work goes through the L2 [`engine::layer_ops`] blits and the L1
 //! [`engine::raster`] compositor; there is no second GPU path.
+#![allow(unsafe_code)]
 
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};

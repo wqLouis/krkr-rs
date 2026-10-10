@@ -37,6 +37,7 @@
 //! host/GUI facilities that do not exist in the L2 API yet; they are simply
 //! not registered, so a script calling them gets the ordinary TJS "member does
 //! not exist" error rather than a silent fallback.
+#![allow(unsafe_code)]
 
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};

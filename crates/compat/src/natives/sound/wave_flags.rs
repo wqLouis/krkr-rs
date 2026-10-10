@@ -22,6 +22,7 @@
 //! numeric family with the `TVP_DEFINE_FLAG_PROP(N)` macro and the native
 //! parity checker records that macro's parameter (`N`) as a member, so the
 //! runtime surface must expose that spelling to stay at zero missing.
+#![allow(unsafe_code)]
 
 use std::ffi::{c_char, c_int, c_void};
 

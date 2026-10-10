@@ -7,6 +7,7 @@
 //! and the clip rectangle, and drives `Layer.update`. The port registers it
 //! as an instance class bound to a layer (optionally at construction) and
 //! reads the values live from the L2 scene.
+#![allow(unsafe_code)]
 
 use std::ffi::{c_char, c_int, c_void};
 

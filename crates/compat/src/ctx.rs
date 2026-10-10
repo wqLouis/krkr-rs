@@ -1,4 +1,5 @@
 //! The L3 registration/dispatch context and its explicit L2 service handles.
+#![allow(unsafe_code)]
 
 use std::cell::{Cell, RefCell};
 use std::ffi::c_char;

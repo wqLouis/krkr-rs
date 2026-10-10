@@ -8,6 +8,7 @@
 //! visual `Font` native.
 //!
 //! [`FontRasterizer`]: https://github.com/khronos/kirikiri
+#![allow(unsafe_code)]
 
 use std::collections::HashMap;
 

@@ -52,6 +52,7 @@
 //! *text editor* placeholder (`reference/cpp/core/utils/PadIntf.cpp`); it is
 //! not a gamepad class. Gamepad input reaches scripts as `VK_PAD*` keys in
 //! the L2 [`InputState`], through `Key`/`System`.
+#![allow(unsafe_code)]
 
 use std::ffi::{c_char, c_int, c_void};
 

@@ -18,6 +18,7 @@
 //! the `onStartMovie` / `onStopMovie` / `onUpdateMovie` callbacks. The
 //! callbacks are registered as no-op native methods so a script can override
 //! them on the layer instance (the reference reads the script members).
+#![allow(unsafe_code)]
 
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};

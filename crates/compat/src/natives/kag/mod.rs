@@ -28,6 +28,7 @@
 //! (`crate::binding`) used to resolve the VM and its attached
 //! [`engine::Storage`]. The `out.string` scratch buffer is kept in
 //! [`CompatServices`] state, not a thread-local.
+#![allow(unsafe_code)]
 
 mod kvp;
 mod parser;
@@ -1057,8 +1058,8 @@ macro_rules! prop_get_int {
     };
 }
 
-macro_rules! prop_get_bool {
-    ($name:ident, $method:ident) => {
+macro_rules! prop_get_int_field {
+    ($name:ident, $field:ident) => {
         extern "C" fn $name(
             _engine: *mut c_void,
             instance: *mut c_void,
@@ -1066,14 +1067,29 @@ macro_rules! prop_get_bool {
             _out_error: *mut *mut c_char,
             _objthis: *mut c_void,
         ) -> c_int {
-            set_int(out, i64::from(unsafe { state_of(instance) }.$method()));
+            set_int(out, unsafe { state_of(instance) }.$field as i64);
+            0
+        }
+    };
+}
+
+macro_rules! prop_get_bool {
+    ($name:ident, $field:ident) => {
+        extern "C" fn $name(
+            _engine: *mut c_void,
+            instance: *mut c_void,
+            out: *mut Value,
+            _out_error: *mut *mut c_char,
+            _objthis: *mut c_void,
+        ) -> c_int {
+            set_int(out, i64::from(unsafe { state_of(instance) }.$field));
             0
         }
     };
 }
 
 macro_rules! prop_set_bool {
-    ($name:ident, $method:ident) => {
+    ($name:ident, $field:ident) => {
         extern "C" fn $name(
             _engine: *mut c_void,
             instance: *mut c_void,
@@ -1083,7 +1099,7 @@ macro_rules! prop_set_bool {
         ) -> c_int {
             // SAFETY: value follows the trampoline contract.
             let v = param_to_bool(unsafe { &*value });
-            unsafe { state_of(instance) }.$method(v);
+            unsafe { state_of(instance) }.$field = v;
             0
         }
     };
@@ -1190,10 +1206,10 @@ extern "C" fn native_get_macro_params(
 // ---------------------------------------------------------------------------
 
 prop_get_bool!(prop_ignore_cr_get, ignore_cr);
-prop_set_bool!(prop_ignore_cr_set, set_ignore_cr);
+prop_set_bool!(prop_ignore_cr_set, ignore_cr);
 prop_get_bool!(prop_process_special_tags_get, process_special_tags);
-prop_set_bool!(prop_process_special_tags_set, set_process_special_tags);
-prop_get_int!(prop_debug_level_get, debug_level);
+prop_set_bool!(prop_process_special_tags_set, process_special_tags);
+prop_get_int_field!(prop_debug_level_get, debug_level);
 prop_get_int!(prop_cur_line_get, cur_line);
 prop_get_int!(prop_cur_pos_get, cur_pos);
 prop_get_int!(prop_call_stack_depth_get, call_stack_depth);
@@ -1216,7 +1232,7 @@ extern "C" fn prop_debug_level_set(
         Ok(level) => level as i32,
         Err(e) => return report_error(out_error, &e),
     };
-    unsafe { state_of(instance) }.set_debug_level(level);
+    unsafe { state_of(instance) }.debug_level = level;
     0
 }
 

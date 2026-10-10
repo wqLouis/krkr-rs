@@ -6,6 +6,7 @@
 //! are created per caller in
 //! [`begin`](super::VulkanPipeline::begin_with_display), because present-queue
 //! selection needs the window surface.
+#![allow(unsafe_code)]
 
 use std::ffi::{CStr, CString, c_char};
 

@@ -9,6 +9,7 @@
 //! feature this backend does not implement (a mask clip, a GPU glyph run or a
 //! destination-dependent blend mode) makes the frame fail with a typed
 //! [`RenderError::Unsupported`](api::error::RenderError::Unsupported).
+#![allow(unsafe_code)]
 
 use std::collections::HashMap;
 

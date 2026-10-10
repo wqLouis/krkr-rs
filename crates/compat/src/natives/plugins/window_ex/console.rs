@@ -13,6 +13,7 @@
 //! count, and `setPlacement` only validates its argument count and type
 //! (`windowEx.cpp:1290-1331`). Nothing is stored, so this module keeps no
 //! state.
+#![allow(unsafe_code)]
 
 use std::ffi::{c_char, c_int, c_void};
 

@@ -10,6 +10,7 @@
 //! frame body.
 
 #![warn(missing_docs)]
+#![deny(unsafe_code)]
 
 mod host;
 

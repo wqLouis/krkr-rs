@@ -40,6 +40,7 @@
 //! * **Unknown class names** (`new SomePluginClass()`) are global lookups,
 //!   not member accesses on the null object, so they are not caught.
 //!
+#![allow(unsafe_code)]
 
 use std::cell::RefCell;
 use std::ffi::{c_char, c_int, c_void};

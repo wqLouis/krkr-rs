@@ -23,6 +23,7 @@
 //! ([`TVP_VOLUME_SCALE`]); the L2 mixer stays in `0..=1`. Every live object,
 //! its mixer channel and the shared [`Mixer`] live in
 //! [`CompatServices::state`] — there is no process global.
+#![allow(unsafe_code)]
 
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};

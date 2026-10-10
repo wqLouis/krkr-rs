@@ -35,6 +35,7 @@
 //!
 //! The reference emits signed 16-bit samples; [`DecodedAudio`] stores
 //! interleaved `f32`, so every sample is scaled by `1 / 32768`.
+#![allow(unsafe_code)]
 
 use api::media::{AudioSpec, DecodedAudio};
 use engine::sound::{LoopInfo, SoundSource};

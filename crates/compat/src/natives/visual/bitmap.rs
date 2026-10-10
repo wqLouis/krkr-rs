@@ -1,4 +1,5 @@
 //! The visual `Bitmap` native class.
+#![allow(unsafe_code)]
 
 use std::ffi::{c_char, c_int, c_void};
 use std::rc::Rc;

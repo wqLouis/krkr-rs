@@ -29,6 +29,7 @@
 //! The recursive helpers operate on retained object ids and read/write
 //! members through [`Tjs2Engine`], so script subclass overrides win and no
 //! TJS source is generated from script data.
+#![allow(unsafe_code)]
 
 use super::md5::md5_hex;
 

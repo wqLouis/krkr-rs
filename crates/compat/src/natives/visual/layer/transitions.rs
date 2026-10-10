@@ -14,6 +14,7 @@
 //! dispatch it by name on the destination layer object, so a script
 //! subclass override wins — the reference fires it as a synchronous event
 //! at the destination's owner (`LayerIntf.cpp:8000-8015`).
+#![allow(unsafe_code)]
 
 use std::ffi::{c_char, c_int, c_void};
 

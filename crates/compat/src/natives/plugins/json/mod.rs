@@ -53,6 +53,7 @@
 //! non-`Array` object is serialized as a dictionary, exactly like the
 //! reference. A non-finite real (TJS `NaN`/`Infinity`) is a typed error
 //! because it has no JSON representation.
+#![allow(unsafe_code)]
 
 use std::ffi::{c_char, c_int, c_void};
 use std::path::{Path, PathBuf};

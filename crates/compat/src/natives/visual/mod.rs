@@ -92,6 +92,7 @@
 //! [`engine::timer::TimerState`] registry for the due timers (the L1
 //! [`platform::Clock`] supplies `now_ms`) and dispatches `onTimer`; the
 //! dispatch itself stays in L3.
+#![allow(unsafe_code)]
 
 use crate::{CompatCtx, CompatError};
 

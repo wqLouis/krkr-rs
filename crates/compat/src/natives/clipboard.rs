@@ -31,6 +31,7 @@
 //!   reference's `switch` default), without consulting the backend.
 //! * `asText` reads as **void** when the backend reports no text, matching the
 //!   reference's "returns void if the clipboard does not have text data".
+#![allow(unsafe_code)]
 
 use std::ffi::{c_char, c_int, c_void};
 

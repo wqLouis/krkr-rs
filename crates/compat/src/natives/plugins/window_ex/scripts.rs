@@ -8,6 +8,7 @@
 //! The override reproduces the core `Scripts.eval` behavior (evaluate the
 //! expression, optional name, ignore the unmarshallable `lineofs`/`context`
 //! arguments) and adds the conditional log line.
+#![allow(unsafe_code)]
 
 use std::ffi::{c_char, c_int, c_void};
 

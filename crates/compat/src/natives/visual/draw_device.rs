@@ -22,6 +22,7 @@
 //! (`BasicDrawDevice.cpp:886-896`, `PassThroughDrawDevice.cpp:532-544`);
 //! with no draw-device object on this host, the getter reports the stable
 //! native payload address as a non-zero synthetic pointer.
+#![allow(unsafe_code)]
 
 use std::ffi::{c_char, c_int, c_void};
 

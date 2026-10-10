@@ -9,6 +9,7 @@
 //! ([`Scene::window_layer_order`]) reflects the new order. The modal stack
 //! lives in [`LayerExtras`](super::LayerExtras) because the L2 node
 //! visibility/enabled predicates do not model modes yet.
+#![allow(unsafe_code)]
 
 use std::ffi::{c_char, c_int, c_void};
 

@@ -26,6 +26,7 @@
 //! then UTF-8 and CP932. An undecodable script raises a typed error instead
 //! of producing mojibake. The `context` argument is likewise ignored
 //! with a warning.
+#![allow(unsafe_code)]
 
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::ptr;

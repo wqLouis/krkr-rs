@@ -25,6 +25,7 @@
 //! the constructor `target`) lives in the per-instance payload; there are no
 //! process globals. The class is registered on the VM global object, so a game
 //! `startup.tjs` doing `new CSVParser()` works.
+#![allow(unsafe_code)]
 
 use std::ffi::{c_char, c_int, c_void};
 

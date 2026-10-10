@@ -1,7 +1,8 @@
 //! Integration tests for the L2 timer registry (`engine::timer`).
 //!
-//! The registry is clock-free: time enters only through `set_now` (inject
-//! without delivering) and `advance` (inject and deliver), so every test is
+//! The registry is clock-free: time enters only through the [`TimerState::now_ms`]
+//! field (inject without delivering) and `advance` (inject and deliver), so every
+//! test is
 //! deterministic. The contract under test: a timer repeats by construction
 //! until removed or disabled, due callbacks run in creation order exactly
 //! once per advance, callbacks may re-enter the registry (create timers,
@@ -35,7 +36,7 @@ fn create_interval_fires_one_interval_from_now_then_repeats() {
     let mut timers = TimerState::new();
     let log = Rc::new(RefCell::new(Vec::new()));
 
-    timers.set_now(1_000);
+    timers.now_ms = 1_000;
     let id = timers.create_interval(10, recorder(&log)).expect("create");
 
     // Not due before the first deadline, due exactly on it.
@@ -66,7 +67,7 @@ fn disabling_drops_the_deadline_and_reabling_arms_from_now() {
     assert_eq!(timers.advance(1_000_000), 0, "a disarmed timer never fires");
 
     // Re-enabling arms from the injected now, not from any stale deadline.
-    timers.set_now(5_000);
+    timers.now_ms = 5_000;
     timers.set_enabled(id, true).expect("enable");
     assert_eq!(timers.advance(5_009), 0);
     assert_eq!(timers.advance(5_010), 1);
@@ -75,7 +76,7 @@ fn disabling_drops_the_deadline_and_reabling_arms_from_now() {
     // Disabling keeps the callback: a later enable fires again.
     timers.set_enabled(id, false).expect("disable");
     assert_eq!(timers.advance(10_000), 0);
-    timers.set_now(20_000);
+    timers.now_ms = 20_000;
     timers.set_enabled(id, true).expect("enable");
     assert_eq!(timers.advance(20_010), 1);
     assert_eq!(hits.get(), 2);
@@ -91,7 +92,7 @@ fn set_interval_rearms_an_armed_timer_from_now_and_stores_while_disarmed() {
 
     // The re-arm origin is the injected now (L3's property-write
     // timestamp), not the previous deadline and not the last poll.
-    timers.set_now(200);
+    timers.now_ms = 200;
     timers.set_interval(id, 20).expect("set interval");
     assert_eq!(timers.advance(219), 0);
     assert_eq!(timers.advance(220), 1);
@@ -101,7 +102,7 @@ fn set_interval_rearms_an_armed_timer_from_now_and_stores_while_disarmed() {
     timers.set_enabled(id, false).expect("disable");
     timers.set_interval(id, 5).expect("store");
     assert_eq!(timers.advance(10_000), 0);
-    timers.set_now(300);
+    timers.now_ms = 300;
     timers.set_enabled(id, true).expect("enable");
     assert_eq!(timers.advance(304), 0);
     assert_eq!(timers.advance(305), 1);
@@ -130,7 +131,7 @@ fn a_repeating_timer_fires_until_it_is_removed() {
 #[test]
 fn due_callbacks_run_in_creation_order() {
     let mut timers = TimerState::new();
-    timers.set_now(500);
+    timers.now_ms = 500;
     let log = Rc::new(RefCell::new(Vec::new()));
     let first = timers.create_interval(10, recorder(&log)).expect("first");
     let second = timers.create_interval(10, recorder(&log)).expect("second");
@@ -180,14 +181,14 @@ fn zero_intervals_and_stale_ids_are_typed_errors() {
 }
 
 #[test]
-fn set_now_injects_time_without_delivering() {
+fn now_ms_injects_time_without_delivering() {
     let mut timers = TimerState::new();
     let (callback, hits) = counter();
     let id = timers.create_interval(10, callback).expect("create");
 
-    // `set_now` past the deadline must neither fire nor reschedule: only
+    // `now_ms` past the deadline must neither fire nor reschedule: only
     // `advance` delivers, and the deadline is untouched.
-    timers.set_now(1_000_000);
+    timers.now_ms = 1_000_000;
     assert_eq!(timers.advance(9), 0);
     assert_eq!(timers.advance(10), 1);
     assert_eq!(hits.get(), 1);
@@ -351,7 +352,7 @@ fn a_peer_disabled_from_a_callback_is_cancelled_before_it_fires() {
     assert_eq!(log.borrow().len(), 2);
 
     // Re-enabling the peer brings it back into the rounds.
-    timers.set_now(30);
+    timers.now_ms = 30;
     timers.set_enabled(peer, true).expect("re-enable peer");
     assert_eq!(timers.advance(40), 2);
     assert_eq!(*log.borrow(), vec![0u64, 0u64, 0u64, 1u64]);

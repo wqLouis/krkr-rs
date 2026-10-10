@@ -12,6 +12,7 @@
 //! needs per-glyph bitmap bounds, which `engine::text` does not expose, so it
 //! is a typed error; the same is true of `defaultFaceName`/`getList` (no font
 //! enumeration) and `doUserSelect` (no host font-selection UI).
+#![allow(unsafe_code)]
 
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};

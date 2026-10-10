@@ -6,6 +6,7 @@
 //! store per VM engine in the compat service state, so a `Player` and the
 //! manager it was built from observe the same data without smuggling a
 //! pointer through the constructor argument.
+#![allow(unsafe_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;

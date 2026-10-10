@@ -49,6 +49,7 @@
 //! `TemporaryFiles` follows the reference's implementation (which validates
 //! but does not record entries): its native payload is a unit value. The
 //! reference's `~TemporaryFiles` has nothing to release either.
+#![allow(unsafe_code)]
 
 use super::md5::md5_hex;
 

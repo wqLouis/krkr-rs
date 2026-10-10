@@ -10,6 +10,7 @@
 //! The two capture-release methods have no L2 capture model yet, so they queue
 //! a request in [`LayerExtras`](super::LayerExtras) for the frame body to
 //! drain — explicit state, never a silent no-op.
+#![allow(unsafe_code)]
 
 use std::ffi::{c_char, c_int, c_void};
 

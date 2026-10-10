@@ -11,6 +11,7 @@
 //! [`PlayerInst::draw`] writes the root transform onto the target layer and
 //! rasterises the visible shape nodes with [`engine::raster`] rather than
 //! re-implementing the D3D renderer.
+#![allow(unsafe_code)]
 
 use std::collections::HashMap;
 use std::sync::Arc;

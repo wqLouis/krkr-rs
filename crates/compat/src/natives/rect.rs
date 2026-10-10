@@ -20,6 +20,7 @@
 //! `clo.Object == nullptr` branch, and a plain script object — even one with
 //! `left`/`top`/`right`/`bottom` members — is the reference's
 //! `TJS_E_INVALIDPARAM` error rather than a duck-typed success.
+#![allow(unsafe_code)]
 
 use std::ffi::{c_char, c_int, c_void};
 

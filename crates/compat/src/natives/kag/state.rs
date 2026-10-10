@@ -273,10 +273,16 @@ pub struct KagParserState {
 
     // flags
     interrupted: bool,
-    ignore_cr: bool,
-    process_special_tags: bool,
+    /// Whether line-end `r eol=true` tags are suppressed (`ignoreCR`).
+    pub ignore_cr: bool,
+    /// Whether KAG control tags (`if`, `macro`, `jump`, …) are executed by
+    /// the parser instead of being returned as output
+    /// (`processSpecialTags`).
+    pub process_special_tags: bool,
     multi_line_tag_enabled: bool,
-    debug_level: i32,
+    /// Reference debug level (`debugLevel`), one of the `tTVPKAGDebugLevel`
+    /// values.
+    pub debug_level: i32,
 }
 
 impl Default for KagParserState {
@@ -1582,30 +1588,6 @@ impl KagParserState {
             .get(self.cur_line.saturating_sub(1))
             .map(String::as_str)
             .unwrap_or_default()
-    }
-
-    pub fn ignore_cr(&self) -> bool {
-        self.ignore_cr
-    }
-
-    pub fn set_ignore_cr(&mut self, v: bool) {
-        self.ignore_cr = v;
-    }
-
-    pub fn process_special_tags(&self) -> bool {
-        self.process_special_tags
-    }
-
-    pub fn set_process_special_tags(&mut self, v: bool) {
-        self.process_special_tags = v;
-    }
-
-    pub fn debug_level(&self) -> i32 {
-        self.debug_level
-    }
-
-    pub fn set_debug_level(&mut self, v: i32) {
-        self.debug_level = v;
     }
 
     pub fn storage_name(&self) -> &str {

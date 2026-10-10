@@ -7,6 +7,7 @@
 //! pens stroke. The port keeps that model and rasterizes the supported paint
 //! kinds (solid, hatch, linear gradient); texture and path-gradient brushes
 //! raise a typed error instead of silently drawing nothing.
+#![allow(unsafe_code)]
 
 use std::ffi::{c_char, c_int, c_void};
 

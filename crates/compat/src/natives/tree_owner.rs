@@ -47,6 +47,7 @@
 //! * `fireDisplayRotate` / `fireRecheckInputState` have no layer handler in
 //!   the reference either; they resolve to a runtime lookup and report
 //!   "not consumed".
+#![allow(unsafe_code)]
 
 use std::ffi::{c_char, c_int, c_void};
 

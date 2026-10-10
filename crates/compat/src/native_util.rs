@@ -3,6 +3,7 @@
 //! The C ABI hands native callbacks a `argc`/`argv` pair, an out slot and an
 //! error slot; these helpers convert the common cases without repeating the
 //! unsafe pointer code in every native.
+#![allow(unsafe_code)]
 
 use std::ffi::{CStr, c_char, c_int};
 use std::ptr;

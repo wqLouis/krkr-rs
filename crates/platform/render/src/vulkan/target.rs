@@ -9,6 +9,7 @@
 //! [`crate::create_render_target`] has no [`crate::RenderState`]; the resource
 //! is keyed by the handle identity and lives in the caller-owned
 //! [`super::VulkanState`].
+#![allow(unsafe_code)]
 
 use std::collections::HashMap;
 

@@ -10,6 +10,7 @@
 //! The display-monitor, cursor, system-metric, environment and icon facts are
 //! host facts: they go through the [`crate::host`](super::host) closure seam
 //! and raise a typed error until the host installs one.
+#![allow(unsafe_code)]
 
 use std::ffi::{c_char, c_int, c_void};
 

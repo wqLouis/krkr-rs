@@ -10,6 +10,7 @@
 //! (`windowEx.cpp:1185-1188`), so it accepts its arguments and returns void;
 //! the bitmap properties report the reference's `BMT_BMP`/`BMT_SYS` values
 //! (`-1`/`0`).
+#![allow(unsafe_code)]
 
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};

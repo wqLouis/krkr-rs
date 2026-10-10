@@ -3,6 +3,7 @@
 //! These are the small marshalling / geometry / borrow routines every method
 //! group needs. They live here (rather than in a process global) so the
 //! `Layer` code stays a thin adapter over the L2 [`engine::Scene`].
+#![allow(unsafe_code)]
 
 use api::blend::BlendMode;
 use engine::input::InputState;

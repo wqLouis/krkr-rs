@@ -47,6 +47,7 @@
 //! storage's game directory (an absolute name is used as-is) and write the
 //! raw `tjs_char` stream the reference's `tTVPStringStream` produces: UTF-16LE
 //! with no BOM or crypt container.
+#![allow(unsafe_code)]
 
 use std::ffi::{c_char, c_int, c_void};
 use std::path::{Path, PathBuf};

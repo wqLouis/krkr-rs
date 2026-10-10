@@ -14,6 +14,7 @@
 //! nothing (`TimerIntf.cpp:76-84`) and a zero interval being skipped by the
 //! timer thread (`TimerImpl.cpp:125`) — are expressed by **not arming** the
 //! L2 timer while the binding keeps reporting the script's `enabled`.
+#![allow(unsafe_code)]
 
 use std::ffi::{c_char, c_int, c_void};
 
@@ -509,14 +510,14 @@ fn sync_schedule(services: &CompatServices, id: TimerId, now: u64, rearm_interva
         (false, true) => {
             // Arm for real: inject the write's timestamp, push the binding's
             // interval (L2 may never have seen the current value), then arm.
-            timer.set_now(now);
+            timer.now_ms = now;
             push_interval(timer, id, interval_ms);
             push_enabled(timer, id, true);
         }
         (true, false) => push_enabled(timer, id, false),
         // Staying armed: only an `interval` write re-arms from `now`.
         (true, true) if rearm_interval => {
-            timer.set_now(now);
+            timer.now_ms = now;
             push_interval(timer, id, interval_ms);
         }
         // Staying disarmed: the binding's interval is pushed at the next

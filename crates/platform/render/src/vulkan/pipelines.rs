@@ -6,6 +6,7 @@
 //! a shader that samples the destination, which this backend does not
 //! implement; [`PipelineSet::pipeline_for`] reports them as
 //! [`RenderError::Unsupported`] instead of silently degrading to source-over.
+#![allow(unsafe_code)]
 
 use ash::vk;
 

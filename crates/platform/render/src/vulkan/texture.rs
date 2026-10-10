@@ -4,6 +4,7 @@
 //! GPU image is allocated lazily on the first upload and cached in the state's
 //! texture table. Every upload leaves the image in
 //! `SHADER_READ_ONLY_OPTIMAL`, which is the layout the pipelines sample.
+#![allow(unsafe_code)]
 
 use ash::vk;
 

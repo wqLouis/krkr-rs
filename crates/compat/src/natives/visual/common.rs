@@ -1,4 +1,5 @@
 //! Shared helpers, dispatch state and value utilities for the visual natives.
+#![allow(unsafe_code)]
 
 use std::cell::RefCell;
 use std::collections::HashMap;

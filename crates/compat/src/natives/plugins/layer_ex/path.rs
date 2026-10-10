@@ -13,6 +13,7 @@
 //! is flattened to a polyline as it is added, using the L2
 //! [`engine::raster`] flattening primitives, so `Layer.drawPath` can fill
 //! and stroke it with the existing CPU rasterizer.
+#![allow(unsafe_code)]
 
 use std::ffi::{c_char, c_int, c_void};
 

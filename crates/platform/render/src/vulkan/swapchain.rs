@@ -4,6 +4,7 @@
 //! / `VK_SUBOPTIMAL_KHR`. The surface format, present mode and render pass are
 //! pinned once (the first time the swapchain is built) and reused on every
 //! recreation, so the compiled pipelines never have to be rebuilt.
+#![allow(unsafe_code)]
 
 use ash::vk;
 

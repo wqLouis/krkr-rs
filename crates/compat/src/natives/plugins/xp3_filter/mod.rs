@@ -57,6 +57,7 @@
 //! extraction filter; its `[ret, ctx]` return value contributes `ctx` (the
 //! `ret` flag is ignored because the L1 read is always eager, which is what
 //! `ret == 1` would have forced).
+#![allow(unsafe_code)]
 
 use std::ffi::{c_char, c_int, c_void};
 

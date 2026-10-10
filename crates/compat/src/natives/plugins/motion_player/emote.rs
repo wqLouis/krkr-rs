@@ -6,6 +6,7 @@
 //! [`super::player`] surface (the class is registered with the same callbacks
 //! plus the EmotePlayer shell members), which is exactly the inherited shape.
 //! `D3DEmoteModule` is a standalone settings object.
+#![allow(unsafe_code)]
 
 use std::ffi::c_void;
 

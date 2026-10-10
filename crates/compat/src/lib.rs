@@ -29,6 +29,7 @@
 //! never game state, and is installed/removed by [`CompatHost`].
 
 #![warn(missing_docs)]
+#![deny(unsafe_code)]
 
 mod binding;
 mod ctx;

@@ -22,6 +22,7 @@
 //! namespace has no media-provider seam, so that part is not ported (the PSD
 //! class surface is complete). The reference's `loadMemory`/`loadStream` are
 //! plain C++ helpers rather than TJS members, so they are not registered.
+#![allow(unsafe_code)]
 
 use std::ffi::{c_char, c_int, c_void};
 

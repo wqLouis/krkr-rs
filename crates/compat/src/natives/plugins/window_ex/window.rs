@@ -14,6 +14,7 @@
 //! `maximize`, `showRestore`, the window icon, `focusMenuByKey`, `bringTo`,
 //! `sendToBack`) are accepted; host facts (the cursor and system metrics)
 //! live on `System` and raise a typed error until installed.
+#![allow(unsafe_code)]
 
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};

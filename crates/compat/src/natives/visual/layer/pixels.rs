@@ -10,6 +10,7 @@
 //! (`ColorRect` 4338, `CopyRect` 4574, `OperateRect` 5224, `DoBoxBlur` 5691,
 //! `AdjustGamma` 5715, `ApplyGaussianBlur` 5749, `DoGrayScale` 5898,
 //! `LRFlip` 5910, `UDFlip` 5925, ...).
+#![allow(unsafe_code)]
 
 use std::ffi::{c_char, c_int, c_void};
 

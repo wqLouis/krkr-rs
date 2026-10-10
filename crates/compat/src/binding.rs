@@ -12,6 +12,7 @@
 //!
 //! The table stores plain `usize` addresses so it needs no `unsafe impl
 //! Send`/`Sync`: the addresses are only dereferenced on the single VM thread.
+#![allow(unsafe_code)]
 
 use std::sync::{LazyLock, Mutex, MutexGuard};
 

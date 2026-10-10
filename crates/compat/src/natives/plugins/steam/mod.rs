@@ -29,6 +29,7 @@
 //! (`DrawDeviceForSteam.cpp:21-24,412-415`). This port has no host
 //! draw-device object, so the getter reports the stable native payload
 //! address as a non-zero synthetic pointer.
+#![allow(unsafe_code)]
 
 use std::ffi::{c_char, c_int, c_void};
 use std::ptr;

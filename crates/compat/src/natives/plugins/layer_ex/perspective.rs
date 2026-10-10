@@ -19,6 +19,7 @@
 //! where `(x1,y1)` is the destination top-left, `(x2,y2)` the top-right,
 //! `(x3,y3)` the bottom-left and `(x4,y4)` the bottom-right corner, and the
 //! source rectangle is `[sleft, sleft+swidth) x [stop, stop+sheight)`.
+#![allow(unsafe_code)]
 
 use std::ffi::{c_char, c_int, c_void};
 
