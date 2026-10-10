@@ -337,7 +337,9 @@ pub fn movie_poll(ctx: &CompatCtx, dt_ms: f64) -> Result<(), CompatError> {
                 match event {
                     VideoEvent::FrameUpdate(_) => dispatch.push((layer_id, "onUpdateMovie")),
                     VideoEvent::TransitionComplete => ended = true,
-                    _ => {}
+                    // Status changes and period events have no movie callback
+                    // (the reference `layerExMovie` only handles update/end).
+                    VideoEvent::StatusChanged(_) | VideoEvent::Period(_) => {}
                 }
             }
             if ended && !slot.overlay.looping {

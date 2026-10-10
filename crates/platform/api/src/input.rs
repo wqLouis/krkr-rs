@@ -14,7 +14,6 @@ use crate::host::TouchPhase;
 
 /// A mouse button, independent of the platform event type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[non_exhaustive]
 pub enum MouseButton {
     /// The primary (usually left) button.
     Left,
@@ -38,7 +37,6 @@ pub enum MouseButton {
 /// carried by [`InputEvent::Key`] is an opaque, stable-within-a-build platform
 /// physical key identifier; L3 owns the mapping to TJS key codes.
 #[derive(Clone, Debug, PartialEq)]
-#[non_exhaustive]
 pub enum InputEvent {
     /// The pointer moved to the given position.
     PointerMoved {

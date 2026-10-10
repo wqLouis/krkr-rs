@@ -848,7 +848,6 @@ fn drain_status_now(host: &Tjs2Engine, services: &CompatServices, id: u64) {
                             .pending
                             .push(("onLabel", vec![TjsValue::String(name)]));
                     }
-                    _ => {}
                 }
             }
         }
@@ -2687,7 +2686,6 @@ fn advance_and_dispatch(ctx: &mut CompatCtx, dt: f64) -> Result<(), CompatError>
                     SoundEvent::Label(name) => {
                         dispatches.push((owner, "onLabel", vec![TjsValue::String(name)]));
                     }
-                    _ => {}
                 }
             }
         }

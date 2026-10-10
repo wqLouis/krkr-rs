@@ -508,7 +508,9 @@ impl EventHandler for DesktopApp {
             // surface; the DPI value itself needs no host action because input
             // and sizes are physical.
             PlatformEvent::ScaleFactorChanged(_scale) => Flow::Continue,
-            _ => Flow::Continue,
+            PlatformEvent::CloseRequested | PlatformEvent::Focused(_) | PlatformEvent::Input(_) => {
+                Flow::Continue
+            }
         }
     }
 

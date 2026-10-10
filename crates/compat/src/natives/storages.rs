@@ -178,8 +178,6 @@ fn compute_placed_path(storage: &Storage, name: &str) -> Result<String, String> 
             Ok(format!("{archive}>{in_archive}"))
         }
         Ok(None) => Ok(String::new()),
-        // `Location` is `#[non_exhaustive]`; future variants have no placed path.
-        Ok(Some(_)) => Ok(String::new()),
         Err(error) => Err(format!("Storages.getPlacedPath: {error}")),
     }
 }
@@ -507,7 +505,7 @@ extern "C" fn native_get_local_name(
                     "Storages.getLocalName: \"{name}\" is inside an archive and has no local name"
                 ),
             ),
-            Ok(_) => {
+            Ok(Some(Location::Disk(..))) | Ok(None) => {
                 set_string_out(out, services, &name);
                 0
             }

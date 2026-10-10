@@ -208,7 +208,8 @@ impl InputState {
 
     /// Apply one raw L1 input event to the state.
     ///
-    /// Unknown finite variants (the enum is `#[non_exhaustive]`) are ignored.
+    /// The match lists every [`InputEvent`] variant explicitly; there is no
+    /// catch-all.
     pub fn apply(&mut self, event: &InputEvent) {
         match event {
             InputEvent::PointerMoved { x, y } => self.set_pointer(*x, *y),
@@ -218,7 +219,6 @@ impl InputState {
             InputEvent::Key { code, pressed } => self.set_key(*code, *pressed),
             InputEvent::Text(text) => self.text_input.push_str(text),
             InputEvent::Touch { id, phase, x, y } => self.apply_touch(*id, *phase, *x, *y),
-            _ => {}
         }
     }
 

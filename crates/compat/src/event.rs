@@ -71,9 +71,6 @@ impl EventAdapter {
                 members: Vec::new(),
             }),
             PlatformEvent::Input(input) => self.map_input(input),
-            // `PlatformEvent` is `#[non_exhaustive]`; new lifecycle events
-            // without a script handler are ignored.
-            _ => None,
         }
     }
 
@@ -103,8 +100,6 @@ impl EventAdapter {
             }),
             // Text/IME and touch events have no script mapping.
             InputEvent::Text(_) | InputEvent::Touch { .. } => None,
-            // `InputEvent` is `#[non_exhaustive]`.
-            _ => None,
         }
     }
 
@@ -140,8 +135,5 @@ fn mouse_button_code(button: MouseButton) -> i64 {
         MouseButton::Back => 3,
         MouseButton::Forward => 4,
         MouseButton::Other(code) => i64::from(code),
-        // `MouseButton` is `#[non_exhaustive]`; an unknown button has no TVP
-        // code.
-        _ => -1,
     }
 }

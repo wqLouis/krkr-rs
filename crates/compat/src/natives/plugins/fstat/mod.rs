@@ -150,8 +150,6 @@ fn local_path(storage: &Storage, name: &str) -> Result<PathBuf, String> {
                 .ok_or_else(|| format!("Cannot get local name from {name}"))?;
             Ok(storage.game_dir().join(relative))
         }
-        // `Location` is `#[non_exhaustive]`; future variants have no local path.
-        Ok(Some(_)) => Err(format!("Cannot get local name from {name}")),
         Err(error) => Err(error.to_string()),
     }
 }
@@ -161,7 +159,7 @@ fn local_path(storage: &Storage, name: &str) -> Result<PathBuf, String> {
 fn placed_local(storage: &Storage, name: &str) -> Option<PathBuf> {
     match storage.find(name) {
         Ok(Some(Location::Disk(path))) => Some(path),
-        _ => None,
+        Ok(Some(Location::Archive(..))) | Ok(None) | Err(_) => None,
     }
 }
 
@@ -415,7 +413,7 @@ extern "C" fn storages_fstat(
                 Err(error) => report_error(out_error, &format!("Storages.fstat: {error}")),
             }
         }
-        Ok(_) => {
+        Ok(Some(Location::Disk(..))) | Ok(None) => {
             let path = match local_path(storage, &name) {
                 Ok(path) => path,
                 Err(error) => {

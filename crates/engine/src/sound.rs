@@ -514,7 +514,6 @@ impl Status {
 
 /// An event a [`SoundBuffer::poll`] observed since the previous poll.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum SoundEvent {
     /// The script-visible status changed.
     StatusChanged(Status),

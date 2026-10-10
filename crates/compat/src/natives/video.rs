@@ -1631,9 +1631,6 @@ fn dispatch_events_with(sink: &dyn EventSink, objthis: *mut c_void, events: &[Vi
             // No registered `setTransitionCompleteCall` in the 70-member
             // surface: the host observes the completion through the queue.
             VideoEvent::TransitionComplete => continue,
-            // `VideoEvent` is `#[non_exhaustive]`: ignore events added later
-            // rather than failing to compile.
-            _ => continue,
         };
         if let Err(error) = sink.call_member(objthis, member, &args) {
             log::warn!("VideoOverlay: {member} failed: {error}");

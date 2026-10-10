@@ -101,7 +101,6 @@ impl PeriodReason {
 
 /// An event produced by the video-overlay state machine.
 #[derive(Debug, Clone, PartialEq)]
-#[non_exhaustive]
 pub enum VideoEvent {
     /// The script-visible status changed.
     StatusChanged(PlayStatus),

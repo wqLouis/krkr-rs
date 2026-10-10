@@ -10,7 +10,6 @@ use crate::input::InputEvent;
 
 /// A normalized platform window/lifecycle event.
 #[derive(Clone, Debug, PartialEq)]
-#[non_exhaustive]
 pub enum PlatformEvent {
     /// The window was resized to the given physical size in pixels.
     Resized(u32, u32),

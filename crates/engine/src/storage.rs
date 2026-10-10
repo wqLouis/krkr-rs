@@ -78,7 +78,6 @@ pub struct Storage {
 
 /// A resolved storage location.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum Location {
     /// A file on the bottom file system.
     Disk(PathBuf),
@@ -445,7 +444,8 @@ impl Storage {
         };
         Ok(match self.find_disk_relative(&relative)? {
             Some(Location::Disk(path)) => Some(path),
-            _ => None,
+            Some(Location::Archive(..)) => None,
+            None => None,
         })
     }
 
