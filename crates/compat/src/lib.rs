@@ -41,6 +41,7 @@ mod natives;
 mod null_plugin;
 mod plugin;
 mod plugins_native;
+mod resource;
 mod text;
 
 pub use ctx::{CompatCtx, CompatServices};

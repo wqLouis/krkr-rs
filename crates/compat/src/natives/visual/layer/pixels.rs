@@ -23,7 +23,9 @@ use super::super::bitmap::{
     COLOR_KEY_NONE, apply_color_key, decode_image, read_image_from_storage, replace_bitmap_pixels,
 };
 use super::super::common::scene_mut;
-use super::super::common::{argb_to_rgba, rgba_to_argb, set_null_out};
+use super::super::common::{
+    DEFAULT_FONT_FACE, DEFAULT_FONT_HEIGHT, argb_to_rgba, rgba_to_argb, set_null_out,
+};
 use super::LayerInst;
 use super::util::{
     self, clip_dest_src, layer_clip, main_bitmap, normalize_rect, operation_mode_from_layer_type,
@@ -32,6 +34,7 @@ use super::util::{
 use crate::CompatCtx;
 use crate::native_util::{args, report_error, set_int, set_void};
 use crate::natives::system::value_as_i64;
+use crate::resource::{TextDrawParams, draw_text_into_bitmap, glyph_text, resource_state};
 
 /// Operation modes (`tTVPBlendOperationMode`).
 const OM_OPAQUE: i64 = 1;
@@ -2109,60 +2112,271 @@ fn load_layer_province(ctx: &CompatCtx, layer_id: u32, name: &str) -> Result<(),
     Ok(())
 }
 
-/// `saveLayerImage(name [, type])` — needs an L1 image encoder, which is not
-/// part of the L2/L3 service set yet.
+/// `saveLayerImage(name [, type])` — encode the layer's main image through
+/// the host image codec and write it through the attached storage.
 extern "C" fn layer_save_layer_image(
-    _engine: *mut c_void,
-    _instance: *mut c_void,
-    _argc: c_int,
-    _argv: *const Value,
-    _out: *mut Value,
+    engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    report_error(
-        out_error,
-        "Layer.saveLayerImage: the image encoder is not exposed by the host services",
-    )
+    if argc < 1 {
+        return report_error(out_error, "Layer.saveLayerImage requires a name");
+    }
+    let a = unsafe { args(argv, argc) };
+    let name = crate::native_util::value_as_string(&a[0]);
+    let type_name = match a.get(1) {
+        Some(value) if value.ty != tjs::VAL_VOID => {
+            let text = crate::native_util::value_as_string(value);
+            if text.is_empty() {
+                "bmp".to_string()
+            } else {
+                text
+            }
+        }
+        _ => "bmp".to_string(),
+    };
+    let inst = unsafe { &*(instance as *const LayerInst) };
+    let Some(id) = inst.id else {
+        return report_error(
+            out_error,
+            "Layer.saveLayerImage: this layer is not constructed",
+        );
+    };
+    let Ok((_host, ctx)) = super::bound(engine) else {
+        return report_error(
+            out_error,
+            "Layer.saveLayerImage: compat context is not bound",
+        );
+    };
+    let result: Result<(), String> = (|| {
+        let scene = scene_mut(&ctx)?;
+        let bitmap_id = scene
+            .layer(id)
+            .and_then(|layer| layer.bitmap)
+            .ok_or_else(|| "unsupported layer type (no main image)".to_string())?;
+        let bitmap = scene
+            .bitmap(bitmap_id)
+            .ok_or_else(|| "Layer.saveLayerImage: this layer has no main image".to_string())?;
+        let (width, height, rgba) = (bitmap.width, bitmap.height, bitmap.rgba.clone());
+        resource_state(&ctx).save_image(&name, &type_name, width, height, &rgba)
+    })();
+    match result {
+        Ok(()) => {
+            set_void(out);
+            0
+        }
+        Err(error) => report_error(out_error, &format!("Layer.saveLayerImage: {error}")),
+    }
 }
 
-/// `drawText(...)` — needs the L1 font rasterizer, which is not part of the
-/// L2/L3 service set yet.
+/// `drawText(...)` — draw a text run into the layer's main image.
 extern "C" fn layer_draw_text(
-    _engine: *mut c_void,
-    _instance: *mut c_void,
+    engine: *mut c_void,
+    instance: *mut c_void,
     argc: c_int,
-    _argv: *const Value,
-    _out: *mut Value,
+    argv: *const Value,
+    out: *mut Value,
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    if argc < 4 {
-        return report_error(out_error, "Layer.drawText requires 4 arguments");
-    }
-    report_error(
-        out_error,
-        "Layer.drawText: the font rasterizer is not exposed by the host services",
+    layer_draw_text_common(
+        engine, instance, argc, argv, out, out_error, "drawText", false,
     )
 }
 
-/// `drawGlyph(...)` — same font-rasterizer deferral as `drawText`.
+/// `drawGlyph(...)` — draw the glyph's text into the layer's main image.
 extern "C" fn layer_draw_glyph(
-    _engine: *mut c_void,
-    _instance: *mut c_void,
+    engine: *mut c_void,
+    instance: *mut c_void,
     argc: c_int,
-    _argv: *const Value,
-    _out: *mut Value,
+    argv: *const Value,
+    out: *mut Value,
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    if argc < 4 {
-        return report_error(out_error, "Layer.drawGlyph requires 4 arguments");
-    }
-    report_error(
+    layer_draw_text_common(
+        engine,
+        instance,
+        argc,
+        argv,
+        out,
         out_error,
-        "Layer.drawGlyph: the font rasterizer / glyph cache is not exposed by the host services",
+        "drawGlyph",
+        true,
     )
+}
+
+/// Shared body of `drawText`/`drawGlyph` (the glyph argument only differs in
+/// how the text is extracted).
+#[allow(clippy::too_many_arguments)]
+fn layer_draw_text_common(
+    engine: *mut c_void,
+    instance: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    method: &str,
+    glyph: bool,
+) -> c_int {
+    if argc < 4 {
+        return report_error(out_error, &format!("Layer.{method} requires 4 arguments"));
+    }
+    let a = unsafe { args(argv, argc) };
+    let inst = unsafe { &*(instance as *const LayerInst) };
+    let Some(id) = inst.id else {
+        return report_error(
+            out_error,
+            &format!("Layer.{method}: this layer is not constructed"),
+        );
+    };
+    let Ok((host, ctx)) = super::bound(engine) else {
+        return report_error(
+            out_error,
+            &format!("Layer.{method}: compat context is not bound"),
+        );
+    };
+    let text = if glyph {
+        match glyph_text(host.engine(), &a[2]) {
+            Some(text) => text,
+            None => {
+                return report_error(
+                    out_error,
+                    &format!("Layer.{method}: unsupported glyph argument"),
+                );
+            }
+        }
+    } else {
+        crate::native_util::value_as_string(&a[2])
+    };
+    let result: Result<(), String> = (|| {
+        let x = value_as_i64(&a[0]) as i32;
+        let y = value_as_i64(&a[1]) as i32;
+        let mut color = argb_to_rgba(value_as_i64(&a[3]));
+        color[3] = 255;
+        let opacity = opt_i64(a, 4, 255).clamp(0, 255) as i32;
+        let antialias = opt_bool(a, 5, true);
+        let shadow_level = opt_i64(a, 6, 0) as i32;
+        let mut shadow_color = argb_to_rgba(opt_i64(a, 7, 0));
+        shadow_color[3] = 255;
+        let shadow_width = opt_i64(a, 8, 0) as i32;
+        let shadow_offset = (opt_i64(a, 9, 0) as i32, opt_i64(a, 10, 0) as i32);
+        let params = TextDrawParams {
+            text: &text,
+            x,
+            y,
+            color,
+            opacity,
+            antialias,
+            shadow_level,
+            shadow_color,
+            shadow_width,
+            shadow_offset,
+        };
+        let (bitmap_id, face, size_px, bold, italic, angle, clip) = {
+            let scene = scene_mut(&ctx)?;
+            let bitmap_id = ensure_layer_bitmap(scene, id, method)?;
+            let layer = scene
+                .layer(id)
+                .ok_or_else(|| format!("Layer.{method}: this layer no longer exists"))?;
+            let font = layer.font_id.and_then(|font_id| scene.font(font_id));
+            let face = font
+                .map(|font| font.face.clone())
+                .filter(|face| !face.is_empty())
+                .unwrap_or_else(|| DEFAULT_FONT_FACE.to_string());
+            let size_px = font
+                .map(|font| font.height.unsigned_abs() as f32)
+                .filter(|size| *size > 0.0)
+                .unwrap_or(DEFAULT_FONT_HEIGHT as f32);
+            let bold = font.is_some_and(|font| font.bold);
+            let italic = font.is_some_and(|font| font.italic);
+            let angle = font.map_or(0.0, |font| font.angle);
+            let clip = layer_clip(scene, id);
+            (bitmap_id, face, size_px, bold, italic, angle, clip)
+        };
+        let ink = {
+            let mut resolver = resource_state(&ctx);
+            let scene = scene_mut(&ctx)?;
+            let bitmap = scene
+                .bitmap_mut(bitmap_id)
+                .ok_or_else(|| format!("Layer.{method}: this layer has no main image"))?;
+            draw_text_into_bitmap(
+                &mut resolver,
+                &ctx,
+                bitmap,
+                &face,
+                size_px,
+                bold,
+                italic,
+                angle,
+                clip,
+                &params,
+            )?
+        };
+        if ink.is_some() {
+            let scene = scene_mut(&ctx)?;
+            if let Some(layer) = scene.layer_mut(id) {
+                layer.image_modified = true;
+            }
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            set_void(out);
+            0
+        }
+        Err(error) => report_error(out_error, &error),
+    }
+}
+
+/// Ensure the layer has a main-image bitmap, allocating a transparent one
+/// sized from the layer rectangle when it does not. Returns the bitmap id.
+fn ensure_layer_bitmap(scene: &mut Scene, layer_id: u32, method: &str) -> Result<u32, String> {
+    if let Some(id) = scene.layer(layer_id).and_then(|layer| layer.bitmap) {
+        return Ok(id);
+    }
+    let (width, height, fill) = {
+        let layer = scene
+            .layer(layer_id)
+            .ok_or_else(|| format!("Layer.{method}: this layer no longer exists"))?;
+        (
+            layer.rect.w,
+            layer.rect.h,
+            argb_to_rgba(layer.neutral_color),
+        )
+    };
+    if width == 0 || height == 0 {
+        return Err(format!(
+            "Layer.{method}: unsupported layer type (no main image)"
+        ));
+    }
+    let Some(pixels) = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|count| count.checked_mul(4))
+    else {
+        return Err(format!("Layer.{method}: the layer rectangle is too large"));
+    };
+    let mut rgba = Vec::new();
+    if rgba.try_reserve_exact(pixels).is_err() {
+        return Err(format!("Layer.{method}: the layer rectangle is too large"));
+    }
+    rgba.resize(pixels, 0);
+    for chunk in rgba.chunks_exact_mut(4) {
+        chunk.copy_from_slice(&fill);
+    }
+    let id = scene.add_bitmap(width, height, rgba);
+    if let Some(layer) = scene.layer_mut(layer_id) {
+        layer.bitmap = Some(id);
+        layer.image_width = width;
+        layer.image_height = height;
+        layer.image_modified = true;
+    }
+    Ok(id)
 }
 
 // ---------------------------------------------------------------------------

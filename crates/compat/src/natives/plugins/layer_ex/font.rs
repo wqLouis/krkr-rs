@@ -57,38 +57,20 @@ pub(super) fn text_state(ctx: &CompatCtx) -> std::cell::RefMut<'_, TextState> {
     unsafe { ctx.services() }.state::<TextState>()
 }
 
-/// Resolve `family` to an L2 [`FontId`], loading it from the attached storage
-/// on first use (compat has no font-enumeration seam).
+/// Resolve `family` to an L2 [`FontId`], loading it on first use.
+///
+/// The resolution logic is shared with the visual `Font` native through
+/// [`crate::resource::resolve_face`] (`System.addFont` registry, attached
+/// storage, installed system fonts, then the default-face fallback).
 pub(super) fn ensure_face(
     ctx: &CompatCtx,
     state: &mut TextState,
     family: &str,
 ) -> Result<FontId, String> {
-    if let Some(id) = state.faces.get(family).copied() {
-        return Ok(id);
-    }
     if family.is_empty() {
         return Err("FontInfo: the family name is empty".to_string());
     }
-    // SAFETY: the host keeps the attached storage alive for the binding's
-    // lifetime (the `attach_storage` contract).
-    let storage = unsafe { ctx.services() }
-        .storage()
-        .ok_or_else(|| format!("FontInfo: no storage attached to load face '{family}'"))?;
-    // SAFETY: see above.
-    let storage = unsafe { &*storage };
-    let bytes = storage.read(family).map_err(|error| {
-        format!(
-            "FontInfo: face '{family}' is not registered and cannot be read from storage \
-             ({error}); no font-enumeration service is exposed"
-        )
-    })?;
-    let id = state
-        .engine
-        .add_font(&bytes, 0)
-        .map_err(|error| format!("FontInfo: face '{family}' is not a usable font: {error}"))?;
-    state.faces.insert(family.to_string(), id);
-    Ok(id)
+    crate::resource::resolve_face(ctx, &mut state.engine, &mut state.faces, family)
 }
 
 /// Read a `FontInfo` argument's public properties.

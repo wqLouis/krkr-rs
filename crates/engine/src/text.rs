@@ -70,6 +70,9 @@ use render::{
     RenderScene, RenderState, Texture, TextureDesc, TextureFormat,
 };
 
+use crate::BitmapState;
+use crate::layer_ops::{RectI, intersect_rect};
+
 use cosmic_text::fontdb;
 use cosmic_text::{Attrs, Buffer, Family, FontSystem as CosmicFontSystem, Metrics, Shaping};
 
@@ -380,17 +383,62 @@ impl TextEngine {
         if let Some(id) = self.font_id(family) {
             return Ok(id);
         }
+        let (bytes, index) = self.system_face_bytes(family, true)?;
+        self.finish_system_face(family, &bytes, index)
+    }
+
+    /// Resolves `family` against the host's installed fonts without the CJK
+    /// fallback, registers the matched face and returns its id.
+    ///
+    /// This is the exact-family query a comma-separated candidate list needs:
+    /// a candidate that is not installed must not silently resolve to the
+    /// Japanese fallback before the next candidate is tried.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TextError::FontNotFound`] when no installed face carries
+    /// `family`, and propagates the registration errors of
+    /// [`TextEngine::add_font`].
+    pub fn load_system_font_exact(&mut self, family: &str) -> Result<FontId, TextError> {
+        if let Some(id) = self.font_id(family) {
+            return Ok(id);
+        }
+        let (bytes, index) = self.system_face_bytes(family, false)?;
+        self.finish_system_face(family, &bytes, index)
+    }
+
+    /// Reads the bytes and collection index of the system face matching
+    /// `family`. With `fallback`, a missing family falls back to the
+    /// Japanese-capable CJK face.
+    fn system_face_bytes(
+        &mut self,
+        family: &str,
+        fallback: bool,
+    ) -> Result<(Vec<u8>, u32), TextError> {
         let system = self.system_fonts.get_or_insert_with(load_system_database);
-        let named = find_family(system, family).or_else(|| find_family(system, NOTO_SANS_CJK_JP));
-        let matched = named.or_else(|| load_known_jp_path(system));
-        let source =
-            matched.and_then(|id| system.with_face_data(id, |data, index| (data.to_vec(), index)));
-        let Some((bytes, index)) = source else {
-            return Err(TextError::FontNotFound {
-                family: family.to_string(),
-            });
+        let matched = if fallback {
+            let named =
+                find_family(system, family).or_else(|| find_family(system, NOTO_SANS_CJK_JP));
+            named.or_else(|| load_known_jp_path(system))
+        } else {
+            find_family(system, family)
         };
-        let id = self.add_font(&bytes, index)?;
+        matched
+            .and_then(|id| system.with_face_data(id, |data, index| (data.to_vec(), index)))
+            .ok_or_else(|| TextError::FontNotFound {
+                family: family.to_string(),
+            })
+    }
+
+    /// Registers a system face already read from the font database and
+    /// aliases `family` to it.
+    fn finish_system_face(
+        &mut self,
+        family: &str,
+        bytes: &[u8],
+        index: u32,
+    ) -> Result<FontId, TextError> {
+        let id = self.add_font(bytes, index)?;
         self.by_name.entry(family.to_lowercase()).or_insert(id);
         Ok(id)
     }
@@ -398,6 +446,20 @@ impl TextEngine {
     /// Returns the L1 face for `id`, if registered.
     pub fn face(&self, id: FontId) -> Option<&Font> {
         self.faces.get(id.0).map(|face| &face.render)
+    }
+
+    /// Returns the family name registered for `id`, if the face has one.
+    pub fn family_name(&self, id: FontId) -> Option<&str> {
+        self.faces
+            .get(id.0)
+            .map(|face| face.family.as_str())
+            .filter(|family| !family.is_empty())
+    }
+
+    /// Returns the first registered face, the fallback for a face that cannot
+    /// be resolved.
+    pub fn default_font(&self) -> Option<FontId> {
+        (!self.faces.is_empty()).then_some(FontId(0))
     }
 
     /// Returns the L1 metrics of `id` at `size_px`.
@@ -555,6 +617,47 @@ impl TextEngine {
             style.size_px,
             style.glyph_style(),
         )?)
+    }
+
+    /// Returns the bounding rectangle of the rasterized `text` in the text's
+    /// local coordinate space (origin at the pen start), or `None` when the
+    /// run has no ink.
+    ///
+    /// This is the union of each shaped glyph's bitmap box, the quantity
+    /// `Font.getGlyphDrawRect` reports.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the layout and rasterization errors of
+    /// [`TextEngine::layout`] / [`TextEngine::rasterize_glyph`].
+    pub fn glyph_draw_rect(
+        &mut self,
+        font: FontId,
+        text: &str,
+        style: &TextStyle,
+        wrap_width: Option<f32>,
+    ) -> Result<Option<RectI>, TextError> {
+        let layout = self.layout(font, text, style, wrap_width)?;
+        let mut ink: Option<RectI> = None;
+        for glyph in &layout.glyphs {
+            let mask = self.rasterize_glyph(glyph.font, glyph.codepoint, style)?;
+            if mask.is_empty() {
+                continue;
+            }
+            let left = (glyph.x + mask.bearing_x).round() as i32;
+            let top = (glyph.baseline_y - mask.bearing_y).round() as i32;
+            let rect = (
+                left,
+                top,
+                left.saturating_add(mask.width as i32),
+                top.saturating_add(mask.height as i32),
+            );
+            ink = Some(match ink {
+                None => rect,
+                Some(previous) => union_rect(previous, rect),
+            });
+        }
+        Ok(ink)
     }
 }
 
@@ -1011,6 +1114,120 @@ pub fn compose_text_cpu(
         }
     }
     out
+}
+
+/// Composites one laid-out run of text directly into `bitmap`, source-over.
+///
+/// Unlike [`compose_text_cpu`], this needs no [`GlyphAtlas`] or render
+/// pipeline: it rasterizes each glyph through the L1 rasterizer and blends the
+/// tinted coverage into the existing bitmap in place. That is the CPU path a
+/// script-visible `Layer.drawText`/`ImageFunction.drawText` needs, since those
+/// natives run without a renderer.
+///
+/// `origin` is the pen start in bitmap coordinates. `angle` rotates each
+/// glyph's rasterized box around `origin`, in radians. `clip` is a half-open
+/// pixel rectangle intersected with the bitmap bounds. `opacity` is `0..=255`.
+///
+/// Returns the union of the drawn glyph rectangles, or `None` when nothing had
+/// ink.
+///
+/// # Errors
+///
+/// Returns [`TextError::UnknownFont`], [`TextError::InvalidSize`] or
+/// [`TextError::Glyph`] for an unregistered face, a bad size or a
+/// rasterization failure.
+#[allow(clippy::too_many_arguments)]
+pub fn compose_text_into(
+    engine: &TextEngine,
+    layout: &TextLayout,
+    style: &TextStyle,
+    origin: (f32, f32),
+    angle: f32,
+    bitmap: &mut BitmapState,
+    clip: RectI,
+    opacity: u8,
+    antialias: bool,
+) -> Result<Option<RectI>, TextError> {
+    if !(style.size_px.is_finite() && style.size_px > 0.0) {
+        return Err(TextError::InvalidSize(style.size_px));
+    }
+    let (sin, cos) = angle.sin_cos();
+    let opacity = f32::from(opacity) / 255.0;
+    let mut ink: Option<RectI> = None;
+    for glyph in &layout.glyphs {
+        let mask = engine.rasterize_glyph(glyph.font, glyph.codepoint, style)?;
+        if mask.is_empty() || !mask.is_consistent() {
+            continue;
+        }
+        let local_x = glyph.x + mask.bearing_x;
+        let local_y = glyph.baseline_y - mask.bearing_y;
+        let (rot_x, rot_y) = if angle == 0.0 {
+            (local_x, local_y)
+        } else {
+            (local_x * cos - local_y * sin, local_x * sin + local_y * cos)
+        };
+        let dest_x = (origin.0 + rot_x).round() as i32;
+        let dest_y = (origin.1 + rot_y).round() as i32;
+        let rect = (
+            dest_x,
+            dest_y,
+            dest_x.saturating_add(mask.width as i32),
+            dest_y.saturating_add(mask.height as i32),
+        );
+        let Some(drawn) = clip_glyph_rect(bitmap, clip, rect) else {
+            continue;
+        };
+        for row in 0..mask.height as i32 {
+            for column in 0..mask.width as i32 {
+                let index = row as usize * mask.width as usize + column as usize;
+                let mut coverage = mask.coverage.get(index).copied().unwrap_or(0);
+                if !antialias {
+                    coverage = if coverage >= 128 { 255 } else { 0 };
+                }
+                if coverage == 0 {
+                    continue;
+                }
+                let x = dest_x + column;
+                let y = dest_y + row;
+                if x < drawn.0 || y < drawn.1 || x >= drawn.2 || y >= drawn.3 {
+                    continue;
+                }
+                if let Some(offset) = bitmap.pixel_offset(x as u32, y as u32) {
+                    blend_tinted_coverage(
+                        &mut bitmap.rgba[offset..offset + 4],
+                        coverage,
+                        style.color,
+                        opacity,
+                    );
+                }
+            }
+        }
+        ink = Some(match ink {
+            None => drawn,
+            Some(previous) => union_rect(previous, drawn),
+        });
+    }
+    if ink.is_some() {
+        bitmap.mark_dirty();
+    }
+    Ok(ink)
+}
+
+/// Intersects `rect` with `clip` and the bitmap's own bounds.
+fn clip_glyph_rect(bitmap: &BitmapState, clip: RectI, rect: RectI) -> Option<RectI> {
+    let bounds = (
+        0,
+        0,
+        bitmap.width.min(i32::MAX as u32) as i32,
+        bitmap.height.min(i32::MAX as u32) as i32,
+    );
+    let clipped = intersect_rect(rect, clip)?;
+    intersect_rect(clipped, bounds)
+}
+
+/// The smallest rectangle covering both `a` and `b`.
+fn union_rect(a: RectI, b: RectI) -> RectI {
+    (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3))
 }
 
 /// Expands 8-bit coverage into straight-alpha white RGBA.

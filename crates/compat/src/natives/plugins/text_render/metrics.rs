@@ -35,66 +35,15 @@ pub(super) fn text_engine(ctx: &CompatCtx) -> std::cell::RefMut<'_, TextRenderEn
 
 /// Resolve `face` to an L2 [`FontId`], registering it on first use.
 ///
-/// The face is tried through the `System.addFont` registry, the attached
-/// storage (the face string read as a storage name), then the host's
-/// installed system fonts. A face none of those provides is a typed error,
-/// never a fabricated metric.
+/// The resolution logic is shared with the visual `Font` native through
+/// [`crate::resource::resolve_face`] (`System.addFont` registry, attached
+/// storage, installed system fonts, then the default-face fallback).
 pub(super) fn ensure_face(
     ctx: &CompatCtx,
     state: &mut TextRenderEngine,
     face: &str,
 ) -> Result<FontId, String> {
-    if let Some(id) = state.faces.get(face).copied() {
-        return Ok(id);
-    }
-    // A face registered through `System.addFont` is resolved by family name
-    // (or the storage name it was read from) before the storage read and the
-    // system-font fallback.
-    // SAFETY: `ctx` was resolved from the installed binding.
-    let registered = unsafe { ctx.services() }
-        .state::<crate::natives::plugins::add_font::registry::FontRegistry>()
-        .lookup(face);
-    if let Some((bytes, index, _)) = registered {
-        let id = state
-            .engine
-            .add_font(&bytes, index)
-            .map_err(|error| format!("TextRender: face '{face}' is not a usable font: {error}"))?;
-        state.faces.insert(face.to_string(), id);
-        return Ok(id);
-    }
-    // The game's own font files are tried first; the host's installed system
-    // fonts are the final fallback for a face the game did not ship.
-    // SAFETY: `ctx` was resolved from the installed binding.
-    let storage = unsafe { ctx.services() }.storage();
-    let Some(storage) = storage else {
-        return Err(format!(
-            "TextRender: no storage attached to load face '{face}'"
-        ));
-    };
-    // SAFETY: the host keeps the attached storage alive for the binding's
-    // lifetime (the `attach_storage` contract).
-    let storage = unsafe { &*storage };
-    let bytes = match storage.read(face) {
-        Ok(bytes) => bytes,
-        Err(storage_error) => {
-            return match state.engine.load_system_font(face) {
-                Ok(id) => {
-                    state.faces.insert(face.to_string(), id);
-                    Ok(id)
-                }
-                Err(system_error) => Err(format!(
-                    "TextRender: face '{face}' is not registered with the text engine, cannot be read \
-                     from storage ({storage_error}), and no system font provides it ({system_error})"
-                )),
-            };
-        }
-    };
-    let id = state
-        .engine
-        .add_font(&bytes, 0)
-        .map_err(|error| format!("TextRender: face '{face}' is not a usable font: {error}"))?;
-    state.faces.insert(face.to_string(), id);
-    Ok(id)
+    crate::resource::resolve_face(ctx, &mut state.engine, &mut state.faces, face)
 }
 
 /// The face the reference's `"user"` placeholder resolves to: the newest font

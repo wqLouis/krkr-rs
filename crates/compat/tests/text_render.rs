@@ -469,22 +469,23 @@ fn text_render_parser_errors_are_typed() {
     );
 }
 
-/// The reference pulls per-character extents from the process-wide
-/// rasterizer (`reference/cpp/plugins/TextRender.cpp:874-880`); compat has
-/// no font enumeration, so an unresolvable face raises a typed error (D11)
-/// rather than fabricating a metric — the port's documented seam, pinned
-/// here so it cannot become silent.
+/// `updateFont` hands `m_state.face` to the process-wide rasterizer
+/// (`reference/cpp/plugins/TextRender.cpp:1033-1045`), whose font manager
+/// forces a fallback face when the requested one is unknown — the reference
+/// notes this itself — so an unresolvable face never raises. The port
+/// resolves the fallback through the shared L3 resource resolver.
 #[test]
-fn text_render_metric_failure_is_a_typed_error() {
+fn text_render_unknown_face_falls_back_to_the_default() {
     let _lock = vm_lock();
-    // No storage and no scene font: the default "user" face cannot resolve.
-    let env = Env::new(None);
-    env.run("var t = new TextRenderBase(); t.setRenderSize(100, 100);");
-    let message = env.error("t.render('A', 0, 0, 0, false)");
-    assert!(
-        message.contains("no storage attached"),
-        "unexpected message: {message}"
+    let Some((env, name)) = Env::with_font() else {
+        return;
+    };
+    env.run(&format!("var f = new Font('{name}', 24, 0xffffffff);"));
+    env.run(
+        "var t = new TextRenderBase(); t.setRenderSize(100, 100); \
+         t.face = 'definitely-not-a-font-face';",
     );
+    assert_eq!(env.eval_int("t.render('A', 0, 0, 0, false)"), 1);
 }
 
 /// `updateFont` hands `m_state.face` (default `"user"`) to the active

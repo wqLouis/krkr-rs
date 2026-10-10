@@ -262,9 +262,14 @@ extern "C" fn layer_release_capture(
             "Layer.releaseCapture: compat context is not bound",
         );
     };
-    // SAFETY: the caller resolved `ctx` from the installed binding.
-    let mut state = unsafe { ctx.services() }.state::<LayerExtras>();
-    state.release_capture.push(id);
+    {
+        // SAFETY: the caller resolved `ctx` from the installed binding.
+        let mut state = unsafe { ctx.services() }.state::<LayerExtras>();
+        state.release_capture.push(id);
+    }
+    // The release drops the adapter's mouse-capture state as well as queuing
+    // the tree-owner notification.
+    crate::event::release_mouse_capture(&ctx);
     set_void(out);
     0
 }

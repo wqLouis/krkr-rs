@@ -20,9 +20,10 @@
 //!   [`engine::BitmapState`], running [`engine::layer_ops::blur_bitmap_in_place`]
 //!   on it and blitting it back.
 //!
-//! The class owns no engine state and keeps nothing in globals, so it defines
-//! no [`crate::CompatServices::state`] payload: every persistent byte lives in
-//! the L2 [`engine::Scene`] the host attached.
+//! The class owns no engine state and keeps nothing in globals: every
+//! persistent byte lives in the L2 [`engine::Scene`] the host attached, and
+//! the text faces and host image codec come from the shared
+//! [`crate::resource::ResourceResolver`].
 //!
 //! # Rectangle arguments and results
 //!
@@ -33,13 +34,11 @@
 //! object. The rectangle convention is the reference's half-open
 //! `[left, right) x [top, bottom)`.
 //!
-//! # Deferred members
+//! # Text drawing
 //!
-//! `drawText` and `drawGlyph` are registered (the reference surface is
-//! complete) but return a typed callback error: they need the L1 font
-//! rasterizer / glyph cache, which is *not* exposed through the L2/L3 service
-//! set yet. A registered method that raises a clear error is the
-//! counterpart of the visual family's deliberately unregistered text members.
+//! `drawText` reads the face and style from the `Font` argument and
+//! rasterizes into the destination bitmap; `drawGlyph` extracts the glyph's
+//! text and draws it with the resolver's default face.
 #![allow(unsafe_code)]
 
 use std::ffi::{c_char, c_int, c_void};
@@ -54,6 +53,7 @@ use tjs::{
 
 use crate::native_util::{args, report_error, set_void, value_as_string};
 use crate::natives::system::{EngineBinding, resolve, try_value_as_i64, value_as_bool};
+use crate::resource::{TextDrawParams, draw_text_into_bitmap, glyph_text, resource_state};
 use crate::{CompatCtx, CompatError};
 
 // ---------------------------------------------------------------------------
@@ -1127,12 +1127,19 @@ extern "C" fn image_color_rect(
     })
 }
 
+/// Resolve a required `Font` argument to its scene font id.
+fn font_arg(host: &Tjs2Engine, value: &Value, method: &str) -> Result<u32, String> {
+    if value.ty != VAL_OBJECT || value.object_handle().is_null() {
+        return Err(format!(
+            "ImageFunction.{method}: the argument is not a Font object"
+        ));
+    }
+    let object = host.retain_object_arg(value)?;
+    CompatCtx::native_instance_id(host, object.raw_id(), &["Font"])?
+        .ok_or_else(|| format!("ImageFunction.{method}: the argument is not a Font object"))
+}
+
 /// `ImageFunction.drawText(bmp, font, x, y, text, color, ...)`.
-///
-/// Registered but not implemented: the L1 font rasterizer / glyph cache is
-/// not exposed through the L2/L3 service set yet (the same reason the visual
-/// `Layer.drawText` is deliberately unregistered). Returning an explicit
-/// error keeps the reference surface complete without a silent stub.
 extern "C" fn image_draw_text(
     engine: *mut c_void,
     argc: c_int,
@@ -1140,21 +1147,81 @@ extern "C" fn image_draw_text(
     out: *mut Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
-    run(engine, argc, argv, out, out_error, |_resolved, _ctx, a| {
+    run(engine, argc, argv, out, out_error, |resolved, ctx, a| {
         if a.len() < 6 {
             return Err("ImageFunction.drawText requires 6 arguments".into());
         }
-        Err(
-            "ImageFunction.drawText: the font rasterizer is not exposed by the host services"
-                .into(),
+        let host = resolved.engine();
+        let dst_id = bitmap_arg(host, &a[0], "drawText")?;
+        let font_id = font_arg(host, &a[1], "drawText")?;
+        let x = try_value_as_i64(&a[2])? as i32;
+        let y = try_value_as_i64(&a[3])? as i32;
+        let text = value_as_string(&a[4]);
+        let mut color = argb_to_rgba(try_value_as_i64(&a[5])?);
+        color[3] = 255;
+        let opacity = opt_i64(a, 6, 255)?.clamp(0, 255) as i32;
+        let antialias = opt_bool(a, 7, true);
+        let shadow_level = opt_i64(a, 9, 0)? as i32;
+        let mut shadow_color = argb_to_rgba(opt_i64(a, 10, 0)?);
+        shadow_color[3] = 255;
+        let shadow_width = opt_i64(a, 11, 0)? as i32;
+        let shadow_offset = (opt_i64(a, 12, 0)? as i32, opt_i64(a, 13, 0)? as i32);
+        let clip = read_rect(host, a.get(15))?;
+
+        let (face, size_px, bold, italic, angle) = {
+            let scene = scene_mut(ctx)?;
+            let font = scene
+                .font(font_id)
+                .ok_or_else(|| format!("ImageFunction.drawText: no font {font_id}"))?;
+            (
+                font.face.clone(),
+                font.height.unsigned_abs() as f32,
+                font.bold,
+                font.italic,
+                font.angle,
+            )
+        };
+        let params = TextDrawParams {
+            text: &text,
+            x,
+            y,
+            color,
+            opacity,
+            antialias,
+            shadow_level,
+            shadow_color,
+            shadow_width,
+            shadow_offset,
+        };
+        let mut resolver = resource_state(ctx);
+        let scene = scene_mut(ctx)?;
+        let Some(bitmap) = scene.bitmap_mut(dst_id) else {
+            return Err(format!("ImageFunction.drawText: no bitmap {dst_id}"));
+        };
+        let clip = clip.unwrap_or_else(|| {
+            (
+                0,
+                0,
+                bitmap.width.min(i32::MAX as u32) as i32,
+                bitmap.height.min(i32::MAX as u32) as i32,
+            )
+        });
+        draw_text_into_bitmap(
+            &mut resolver,
+            ctx,
+            bitmap,
+            &face,
+            size_px,
+            bold,
+            italic,
+            angle,
+            clip,
+            &params,
         )
     })
 }
 
 /// `ImageFunction.drawGlyph(bmp, x, y, glyph, color, ...)`.
-///
-/// Registered but not implemented for the same reason as
-/// [`image_draw_text`].
 extern "C" fn image_draw_glyph(
     engine: *mut c_void,
     argc: c_int,
@@ -1162,14 +1229,71 @@ extern "C" fn image_draw_glyph(
     out: *mut Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
-    run(engine, argc, argv, out, out_error, |_resolved, _ctx, a| {
+    run(engine, argc, argv, out, out_error, |resolved, ctx, a| {
         if a.len() < 5 {
             return Err("ImageFunction.drawGlyph requires 5 arguments".into());
         }
-        Err(
-            "ImageFunction.drawGlyph: the font rasterizer / glyph cache is not exposed by the \
-             host services"
-                .into(),
+        let host = resolved.engine();
+        let dst_id = bitmap_arg(host, &a[0], "drawGlyph")?;
+        let Some(text) = glyph_text(host, &a[3]) else {
+            return Err("ImageFunction.drawGlyph: unsupported glyph argument".into());
+        };
+        if text.is_empty() {
+            return Ok(None);
+        }
+        let x = try_value_as_i64(&a[1])? as i32;
+        let y = try_value_as_i64(&a[2])? as i32;
+        let mut color = argb_to_rgba(try_value_as_i64(&a[4])?);
+        color[3] = 255;
+        let opacity = opt_i64(a, 5, 255)?.clamp(0, 255) as i32;
+        let antialias = opt_bool(a, 6, true);
+        let shadow_level = opt_i64(a, 8, 0)? as i32;
+        let mut shadow_color = argb_to_rgba(opt_i64(a, 9, 0)?);
+        shadow_color[3] = 255;
+        let shadow_width = opt_i64(a, 10, 0)? as i32;
+        let shadow_offset = (opt_i64(a, 11, 0)? as i32, opt_i64(a, 12, 0)? as i32);
+        let clip = read_rect(host, a.get(14))?;
+
+        let mut resolver = resource_state(ctx);
+        let face = resolver.default_face_name(ctx);
+        if face.is_empty() {
+            return Err("ImageFunction.drawGlyph: no font is registered".into());
+        }
+        let params = TextDrawParams {
+            text: &text,
+            x,
+            y,
+            color,
+            opacity,
+            antialias,
+            shadow_level,
+            shadow_color,
+            shadow_width,
+            shadow_offset,
+        };
+        let scene = scene_mut(ctx)?;
+        let Some(bitmap) = scene.bitmap_mut(dst_id) else {
+            return Err(format!("ImageFunction.drawGlyph: no bitmap {dst_id}"));
+        };
+        let clip = clip.unwrap_or_else(|| {
+            (
+                0,
+                0,
+                bitmap.width.min(i32::MAX as u32) as i32,
+                bitmap.height.min(i32::MAX as u32) as i32,
+            )
+        });
+        draw_text_into_bitmap(
+            &mut resolver,
+            ctx,
+            bitmap,
+            &face,
+            16.0,
+            false,
+            false,
+            0.0,
+            clip,
+            &params,
         )
     })
 }

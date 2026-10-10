@@ -5,20 +5,20 @@
 //! `getTextWidth`/`getTextHeight`, the `getEsc*` rotation variants and
 //! `getGlyphDrawRect` are backed by the L2 [`engine::text::TextEngine`]
 //! (cosmic-text shaping) rather than by a per-character extent sum. A face is
-//! resolved through the `System.addFont` registry, then the attached
-//! [`engine::Storage`] (the face string read as a storage name), then the
-//! host's installed system fonts. A face that cannot be resolved at all is a
-//! typed error, never a fabricated metric. `getGlyphDrawRect` additionally
-//! needs per-glyph bitmap bounds, which `engine::text` does not expose, so it
-//! is a typed error; the same is true of `defaultFaceName`/`getList` (no font
-//! enumeration) and `doUserSelect` (no host font-selection UI).
+//! resolved through the shared [`crate::resource::ResourceResolver`]: the
+//! `System.addFont` registry, then the attached [`engine::Storage`] (the face
+//! string read as a storage name), then the host's installed system fonts,
+//! with the reference's default-face fallback for an unresolved name.
+//! `defaultFaceName`/`getList` report the resolver's registered faces;
+//! `doUserSelect` still needs a host font-selection UI and raises a typed
+//! error.
 #![allow(unsafe_code)]
 
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
 
 use engine::FontState;
-use engine::text::{FontId, TextEngine, TextStyle};
+use engine::text::TextStyle;
 use tjs::{
     NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef, NativeMethodDef,
     NativePropertyDef, NativeStaticMembers, Tjs2Engine, Tjs2ValueId, Value,
@@ -52,17 +52,15 @@ pub(super) fn font_payload_id(payload: *mut c_void) -> Option<u32> {
 /// Explicit `Font` dispatch state, keyed by type inside
 /// [`CompatServices::state`](crate::CompatServices::state).
 ///
-/// * `engine` is the L2 shaping/layout service the measurement methods use;
-///   `faces` memoizes the compat face string → registered [`FontId`] mapping
-///   so a face is only loaded once.
 /// * `prerendered` is the `mapPrerenderedFont` registration (scene font id →
 ///   storage name); the reference keeps the same font → prerendered-font map.
 /// * `rasterizer` is the active rasterizer index. Compat has exactly one
 ///   rasterizer, index `0` (the L1 `render` glyph rasterizer).
+///
+/// The shaping/layout engine and the face cache live in the shared
+/// [`crate::resource::ResourceResolver`].
 #[derive(Default)]
 struct FontMetricsState {
-    engine: TextEngine,
-    faces: HashMap<String, FontId>,
     prerendered: HashMap<u32, String>,
     rasterizer: i64,
 }
@@ -94,69 +92,6 @@ fn measured_font(engine: *mut c_void, instance: *mut c_void) -> Result<MeasuredF
     })
 }
 
-/// Resolve `face` to an L2 [`FontId`], registering it on first use.
-///
-/// The reference resolves a face name through the font map enumerated from
-/// the game's own fonts and the system faces. The port tries the same sources
-/// in order: the `System.addFont` registry, the attached storage (the face
-/// string read as a storage name), then the host's installed system fonts.
-/// Only a face none of those provides is a typed error.
-fn ensure_face(
-    ctx: &CompatCtx,
-    state: &mut FontMetricsState,
-    face: &str,
-) -> Result<FontId, String> {
-    if let Some(id) = state.faces.get(face).copied() {
-        return Ok(id);
-    }
-    // A face registered through `System.addFont` is resolved by family name
-    // (or the storage name it was read from) before the storage read and the
-    // system-font fallback.
-    // SAFETY: the caller resolved `ctx` from the installed binding.
-    let registered = unsafe { ctx.services() }
-        .state::<crate::natives::plugins::add_font::registry::FontRegistry>()
-        .lookup(face);
-    if let Some((bytes, index, _)) = registered {
-        let id = state
-            .engine
-            .add_font(&bytes, index)
-            .map_err(|error| format!("Font: face '{face}' is not a usable font: {error}"))?;
-        state.faces.insert(face.to_string(), id);
-        return Ok(id);
-    }
-    // The game's own font files are tried first; the host's installed system
-    // fonts are the final fallback for a face the game did not ship.
-    // SAFETY: the caller resolved `ctx` from the installed binding.
-    let storage = unsafe { ctx.services() }.storage();
-    let Some(storage) = storage else {
-        return Err(format!("Font: no storage attached to load face '{face}'"));
-    };
-    // SAFETY: the host keeps the attached storage alive for the binding's
-    // lifetime (the `attach_storage` contract).
-    let storage = unsafe { &*storage };
-    let bytes = match storage.read(face) {
-        Ok(bytes) => bytes,
-        Err(storage_error) => {
-            return match state.engine.load_system_font(face) {
-                Ok(id) => {
-                    state.faces.insert(face.to_string(), id);
-                    Ok(id)
-                }
-                Err(system_error) => Err(format!(
-                    "Font: face '{face}' is not registered with the text engine, cannot be read \
-                     from storage ({storage_error}), and no system font provides it ({system_error})"
-                )),
-            };
-        }
-    };
-    let id = state
-        .engine
-        .add_font(&bytes, 0)
-        .map_err(|error| format!("Font: face '{face}' is not a usable font: {error}"))?;
-    state.faces.insert(face.to_string(), id);
-    Ok(id)
-}
-
 /// Lay `text` out with the instance's face/size/style and return
 /// `(width, height, angle)`.
 ///
@@ -169,12 +104,12 @@ fn measure_text(
 ) -> Result<(f64, f64, f64), String> {
     let font = measured_font(engine, instance)?;
     let (_resolved, ctx) = bound(engine)?;
-    let mut state = font_state(&ctx);
-    let id = ensure_face(&ctx, &mut state, &font.face)?;
+    let mut resolver = crate::resource::resource_state(&ctx);
+    let id = resolver.resolve_face(&ctx, &font.face)?;
     let mut style = TextStyle::new(font.size_px);
     style.bold = font.bold;
     style.italic = font.italic;
-    let layout = state
+    let layout = resolver
         .engine
         .layout(id, text, &style, None)
         .map_err(|error| format!("Font: text layout failed: {error}"))?;
@@ -613,16 +548,14 @@ extern "C" fn font_get_esc_height_y(
     }
 }
 
-/// `font.getGlyphDrawRect(text)` — the reference returns the rasterized
-/// glyphs' bounding rectangle. `engine::text` exposes layout positions but
-/// not per-glyph bitmap bounds, so this is a typed error rather than a
-/// fabricated rectangle.
+/// `font.getGlyphDrawRect(text)` — the rasterized glyphs' bounding rectangle
+/// in the text's local coordinate space.
 extern "C" fn font_get_glyph_draw_rect(
-    _engine: *mut c_void,
-    _instance: *mut c_void,
+    engine: *mut c_void,
+    instance: *mut c_void,
     argc: c_int,
-    _argv: *const Value,
-    _out: *mut Value,
+    argv: *const Value,
+    out: *mut Value,
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
@@ -632,10 +565,35 @@ extern "C" fn font_get_glyph_draw_rect(
             "Font.getGlyphDrawRect requires a string argument",
         );
     }
-    report_error(
-        out_error,
-        "Font.getGlyphDrawRect: engine::text does not expose per-glyph draw rectangles",
-    )
+    let text = value_as_string(&unsafe { args(argv, argc) }[0]);
+    let font = match measured_font(engine, instance) {
+        Ok(font) => font,
+        Err(error) => return report_error(out_error, &error),
+    };
+    let Ok((resolved, ctx)) = bound(engine) else {
+        return report_error(
+            out_error,
+            "Font.getGlyphDrawRect: compat context is not bound",
+        );
+    };
+    let result = {
+        let mut resolver = crate::resource::resource_state(&ctx);
+        let id = match resolver.resolve_face(&ctx, &font.face) {
+            Ok(id) => id,
+            Err(error) => return report_error(out_error, &error),
+        };
+        let mut style = TextStyle::new(font.size_px);
+        style.bold = font.bold;
+        style.italic = font.italic;
+        resolver.engine.glyph_draw_rect(id, &text, &style, None)
+    };
+    match result {
+        Ok(rect) => {
+            set_glyph_rect_out(resolved.engine(), out, rect.unwrap_or((0, 0, 0, 0)));
+            0
+        }
+        Err(error) => report_error(out_error, &format!("Font.getGlyphDrawRect: {error}")),
+    }
 }
 
 /// `font.doUserSelect(flags, caption, prompt, samplestring)` — the reference
@@ -661,24 +619,29 @@ extern "C" fn font_do_user_select(
     )
 }
 
-/// `font.getList(flags)` — the reference returns the enumerated font faces.
-/// Compat has no font-enumeration seam, so this is a typed error.
+/// `font.getList(flags)` — the registered face family names as a TJS array
+/// (reference `LayerIntf.cpp:11958-11985`).
 extern "C" fn font_get_list(
-    _engine: *mut c_void,
+    engine: *mut c_void,
     _instance: *mut c_void,
     argc: c_int,
     _argv: *const Value,
-    _out: *mut Value,
+    out: *mut Value,
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
     if argc < 1 {
         return report_error(out_error, "Font.getList requires a flags argument");
     }
-    report_error(
-        out_error,
-        "Font.getList: no font enumeration service is exposed",
-    )
+    let Ok((_resolved, ctx)) = bound(engine) else {
+        return report_error(out_error, "Font.getList: compat context is not bound");
+    };
+    let names = {
+        let mut resolver = crate::resource::resource_state(&ctx);
+        resolver.face_names(&ctx)
+    };
+    set_string_array_out(&ctx, out, &names);
+    0
 }
 
 /// `font.mapPrerenderedFont(storage)` — record the prerendered-font storage
@@ -749,6 +712,86 @@ extern "C" fn font_unmap_prerendered_font(
 
 // --- Font static members ---------------------------------------------------
 
+/// Marshal a glyph bounding rectangle into a fresh `Rect` object.
+fn set_glyph_rect_out(host: &Tjs2Engine, out: *mut Value, rect: (i32, i32, i32, i32)) {
+    if out.is_null() {
+        return;
+    }
+    let (left, top, right, bottom) = rect;
+    let object = match host.eval_retained("new Rect()", "Font.rect") {
+        Ok(tjs::RetainedValue::Object(object)) => object,
+        Ok(tjs::RetainedValue::Value(_)) => {
+            log::warn!("Font: `new Rect()` did not return an object");
+            set_void(out);
+            return;
+        }
+        Err(error) => {
+            log::warn!("Font: cannot create the result Rect: {error}");
+            set_void(out);
+            return;
+        }
+    };
+    for (name, value) in [
+        ("left", left),
+        ("top", top),
+        ("right", right),
+        ("bottom", bottom),
+    ] {
+        if let Err(error) = host.set_member(
+            object.raw_id(),
+            name,
+            &tjs::TjsValue::Integer(i64::from(value)),
+        ) {
+            log::warn!("Font: cannot set the result Rect.{name}: {error}");
+            set_void(out);
+            return;
+        }
+    }
+    // SAFETY: the trampoline passes a valid out slot for the call.
+    unsafe {
+        (*out).ty = tjs::VAL_RETAINED;
+        (*out).integer = 0;
+        (*out).real = 0.0;
+        (*out).string = std::ptr::null();
+        (*out).array = std::ptr::null();
+        (*out).array_count = 0;
+        (*out).retained = object.raw_id() as usize;
+    }
+    std::mem::forget(object);
+}
+
+/// Write a TJS string array into `out` (the `Font.getList` result).
+fn set_string_array_out(ctx: &CompatCtx, out: *mut Value, values: &[String]) {
+    // SAFETY: the caller resolved `ctx` from the installed binding.
+    let services = unsafe { ctx.services() };
+    let mut slot = services.linked_array_scratch();
+    slot.1.clear();
+    slot.0.clear();
+    for value in values {
+        let mut bytes = value.as_bytes().to_vec();
+        bytes.push(0);
+        slot.1.push(bytes);
+    }
+    let pointers: Vec<*const c_char> = slot
+        .1
+        .iter()
+        .map(|bytes| bytes.as_ptr() as *const c_char)
+        .collect();
+    slot.0 = pointers;
+    if !out.is_null() {
+        // SAFETY: the trampoline passes a valid out slot for the call.
+        unsafe {
+            (*out).ty = tjs::VAL_ARRAY;
+            (*out).integer = 0;
+            (*out).real = 0.0;
+            (*out).string = std::ptr::null();
+            (*out).array = slot.0.as_ptr();
+            (*out).array_count = slot.0.len() as c_int;
+            (*out).retained = 0;
+        }
+    }
+}
+
 /// `Font.rasterizer` (get) — the active rasterizer index.
 extern "C" fn font_rasterizer_get(
     engine: *mut c_void,
@@ -783,18 +826,25 @@ extern "C" fn font_rasterizer_set(
     0
 }
 
-/// `Font.defaultFaceName` (get) — the reference returns the platform default
-/// face from its font enumeration. Compat has no enumeration seam, so this is
-/// a typed error rather than a hardcoded name.
+/// `Font.defaultFaceName` (get) — the default face name, or the empty string
+/// when no face is registered (reference `LayerIntf.cpp:12177`).
 extern "C" fn font_default_face_name_get(
-    _engine: *mut c_void,
-    _out: *mut Value,
+    engine: *mut c_void,
+    out: *mut Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
-    report_error(
-        out_error,
-        "Font.defaultFaceName: no font enumeration service is exposed",
-    )
+    let Ok((_resolved, ctx)) = bound(engine) else {
+        return report_error(
+            out_error,
+            "Font.defaultFaceName: compat context is not bound",
+        );
+    };
+    let name = {
+        let mut resolver = crate::resource::resource_state(&ctx);
+        resolver.default_face_name(&ctx)
+    };
+    set_visual_string_out(&ctx, out, &name);
+    0
 }
 
 /// `Font.defaultFaceName` (set) — the reference deliberately ignores writes

@@ -2,7 +2,6 @@
 #![allow(unsafe_code)]
 
 use std::ffi::{c_char, c_int, c_void};
-use std::rc::Rc;
 
 use api::media::{DecodedImage, ImageInfo};
 use engine::{Scene, Storage, StorageReadError};
@@ -17,6 +16,7 @@ use super::common::{
 };
 use crate::native_util::{args, report_error, set_bool, set_int, set_void, value_as_string};
 use crate::natives::system::value_as_i64;
+use crate::resource::ResourceResolver;
 use crate::{CompatCtx, CompatError, CompatServices};
 
 /// `Bitmap` payload: the scene bitmap id plus the async-load flag.
@@ -38,17 +38,6 @@ pub(super) fn bitmap_payload_id(payload: *mut c_void) -> Option<u32> {
 // Host-supplied image codec (the L1 `media` seam)
 // ---------------------------------------------------------------------------
 
-/// Host-supplied image decoder: the L1 `media::decode_image` call behind
-/// `Bitmap.load`. `hint` is the resolved storage name.
-type DecodeFn = dyn Fn(&[u8], Option<&str>) -> Result<DecodedImage, String>;
-/// Host-supplied header prober: the L1 `media::probe_image` call behind
-/// `Bitmap.loadHeader`.
-type ProbeFn = dyn Fn(&[u8], Option<&str>) -> Result<ImageInfo, String>;
-/// Host-supplied image saver: encodes the bitmap and writes it to the named
-/// storage. The L2 [`Storage`] API has no write path, so the host owns both
-/// the encode and the write.
-type SaveFn = dyn Fn(&str, &str, u32, u32, &[u8]) -> Result<(), String>;
-
 /// The per-engine image-codec seam.
 ///
 /// L3 (`compat`) never links the L1 `media` codec; the L4 host installs the
@@ -56,13 +45,6 @@ type SaveFn = dyn Fn(&str, &str, u32, u32, &[u8]) -> Result<(), String>;
 /// exactly like the `WaveSoundBuffer` audio decoder seam. A member whose
 /// closure is missing raises a typed error instead of fabricating a
 /// result.
-#[derive(Default)]
-struct BitmapCodec {
-    decode: Option<Rc<DecodeFn>>,
-    probe: Option<Rc<ProbeFn>>,
-    save: Option<Rc<SaveFn>>,
-}
-
 impl crate::CompatHost {
     /// Install the host image codec the `Bitmap` natives compose.
     ///
@@ -77,10 +59,9 @@ impl crate::CompatHost {
         probe: impl Fn(&[u8], Option<&str>) -> Result<ImageInfo, String> + 'static,
         save: impl Fn(&str, &str, u32, u32, &[u8]) -> Result<(), String> + 'static,
     ) {
-        let mut codec = self.services().state::<BitmapCodec>();
-        codec.decode = Some(Rc::new(decode));
-        codec.probe = Some(Rc::new(probe));
-        codec.save = Some(Rc::new(save));
+        self.services()
+            .state::<ResourceResolver>()
+            .set_codec(decode, probe, save);
     }
 }
 
@@ -120,20 +101,16 @@ pub(crate) fn decode_image(
     name: &str,
     bytes: &[u8],
 ) -> Result<DecodedImage, String> {
-    let decoder = services.state::<BitmapCodec>().decode.clone();
-    let Some(decoder) = decoder else {
-        return Err("no image decoder is installed".to_string());
-    };
-    decoder(bytes, Some(name))
+    services
+        .state::<ResourceResolver>()
+        .decode(bytes, Some(name))
 }
 
 /// Probe image bytes through the installed host prober.
 fn probe_image(services: &CompatServices, name: &str, bytes: &[u8]) -> Result<ImageInfo, String> {
-    let prober = services.state::<BitmapCodec>().probe.clone();
-    let Some(prober) = prober else {
-        return Err("no image header prober is installed".to_string());
-    };
-    prober(bytes, Some(name))
+    services
+        .state::<ResourceResolver>()
+        .probe(bytes, Some(name))
 }
 
 /// Overwrite an existing scene bitmap's pixels in place, reusing its id (the
@@ -666,10 +643,7 @@ extern "C" fn bitmap_save(
         return report_error(out_error, "Bitmap.save: this bitmap is not constructed");
     };
     let services = unsafe { ctx.services() };
-    let saver = services.state::<BitmapCodec>().save.clone();
-    let Some(saver) = saver else {
-        return report_error(out_error, "Bitmap.save: no image encoder is installed");
-    };
+    let resolver = services.state::<ResourceResolver>();
     let scene = match scene_ref(&ctx) {
         Ok(scene) => scene,
         Err(error) => return report_error(out_error, &format!("Bitmap.save: {error}")),
@@ -678,7 +652,7 @@ extern "C" fn bitmap_save(
         return report_error(out_error, "Bitmap.save: this bitmap no longer exists");
     };
     let (width, height, rgba) = (bitmap.width, bitmap.height, bitmap.rgba.clone());
-    match saver(&name, &type_name, width, height, &rgba) {
+    match resolver.save_image(&name, &type_name, width, height, &rgba) {
         Ok(()) => {
             set_void(out);
             0

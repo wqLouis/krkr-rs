@@ -59,29 +59,13 @@
 //!
 //! # Deliberately deferred
 //!
-//! These members need a subsystem that is not exposed through the L2/L3
-//! service set yet. They are **not registered** (calling them raises a TJS
-//! "member not found", never a silent stub):
+//! These members are **not registered** (calling them raises a TJS "member
+//! not found", never a silent stub):
 //!
-//! * `Bitmap.load` / `Bitmap.loadAsync` / `Bitmap.loadHeader`, `Layer.loadImages`,
-//!   `Layer.saveLayerImage`, `Bitmap.save` — no image decoder/encoder is
-//!   exposed through L2. L1 owns those; when a decode service lands these
-//!   become thin wrappers.
-//! * `Font.getTextWidth` / `getTextHeight` / `getEsc*` / `getGlyphDrawRect`
-//!   and `Layer.drawText` — no font rasterizer/metrics service is exposed
-//!   through L2 (L1 `render`), so text measurement cannot be made truthful.
-//! * `Layer` drawing primitives (`drawLine`, `drawPolygon`, `copyRect`,
-//!   `stretchCopy`, `affineCopy`, `doBoxBlur`, `colorize`, `noise`, the
-//!   `operate*`/`piled*`/`blend*` families, `copy9Patch`, ...) — L2
-//!   [`engine::layer_ops`]/[`engine::raster`] already implement the math, but
-//!   wiring the ~40 methods here is a mechanical follow-up rather than a
-//!   missing primitive; only `fillRect` is wired now.
-//! * `Window`/`Layer` input handlers (`onClick`, `onKeyDown`, ...) are not
-//!   registered: the L1→L3 event adapter (`compat::EventAdapter`) is not yet
-//!   wired to the scene, so there is nothing truthful to dispatch.
-//! * `Window.getMouseVelocity` — needs the L1 pointer velocity tracker, which
-//!   is not part of the L2 service set (touch velocity *is* wired through
-//!   `Window.getTouchVelocity`).
+//! * `Layer.colorize` / `Layer.noise` and the remaining `operate*`/`blend*`
+//!   pile variants — L2 [`engine::layer_ops`] already implements the math
+//!   (`colorize`, `noise`, `operate_rect`, ...); wiring them here is a
+//!   mechanical follow-up rather than a missing primitive.
 //!
 //! # Timer polling
 //!
@@ -98,6 +82,7 @@ use crate::{CompatCtx, CompatError};
 
 mod bitmap;
 mod common;
+pub(crate) use common::{ObjectKind, duplicate_object};
 mod draw_device;
 mod font;
 mod layer;

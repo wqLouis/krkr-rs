@@ -1,13 +1,13 @@
-//! Integration tests for the `Font` native class text metrics and the
-//! deferred members.
+//! Integration tests for the `Font` native class text metrics.
 //!
 //! The measurement methods are backed by the L2 [`engine::text`] text engine.
-//! Compat has no font-enumeration/loading seam, so a face is loaded from the
-//! attached [`engine::Storage`] on first use; the positive cases mount a
+//! A face is resolved through the shared resource resolver (the `System.addFont`
+//! registry, the attached [`engine::Storage`], the host's installed system
+//! fonts, then the default-face fallback); the positive cases mount a
 //! directory holding a system font and skip when no usable font is present
-//! (mirroring the L2/ L1 text tests). Deferred members (`getList`,
-//! `defaultFaceName`, `doUserSelect`, `getGlyphDrawRect`) must raise a typed
-//! error, never fabricate a value.
+//! (mirroring the L2/L1 text tests). `getList`, `defaultFaceName` and
+//! `getGlyphDrawRect` report the resolver's registered faces; only
+//! `doUserSelect` remains deferred (no host font-selection UI).
 //!
 //! The tests serialize on the shared VM lock because the engine → context
 //! binding is process-wide and single.
@@ -187,47 +187,92 @@ fn font_metrics_use_the_l2_text_engine() {
 }
 
 #[test]
-fn font_metrics_without_a_font_source_raise_typed_errors() {
+fn font_metrics_without_a_font_source_do_not_fabricate_a_metric() {
     let _lock = vm_lock();
     let env = Env::new(None);
     env.run("var f = new Font('Ghost', 16, 0);");
 
-    // The L2 text engine has no registered face and there is no storage to
-    // load one from: a typed error, not a zero/fabricated metric.
-    let message = env.error("f.getTextWidth('x')");
+    // There is no storage to load a face from. A host with no matching
+    // installed font raises a typed error rather than returning a fabricated
+    // metric; a host whose CJK fallback matches resolves it. Either is a
+    // valid, non-fabricated outcome.
+    match env.eval("f.getTextWidth('x')") {
+        Ok(TjsValue::Integer(width)) => assert!(width > 0, "fallback width should be positive"),
+        Ok(other) => panic!("unexpected result: {other:?}"),
+        Err(message) => assert!(!message.is_empty(), "empty error message"),
+    }
+}
+
+#[test]
+fn font_glyph_draw_rect_returns_the_rasterized_bounds() {
+    let Some((dir, name)) = test_font() else {
+        return;
+    };
+    let _lock = vm_lock();
+    let storage = Storage::mount_archives(
+        FileSystem::host(&dir),
+        dir.clone(),
+        std::iter::empty::<&str>(),
+    )
+    .expect("mount font directory");
+    let env = Env::new(Some(storage));
+    env.run(&format!("var f = new Font('{name}', 24, 0xffffffff);"));
+
+    // Reference: `FreeTypeFontRasterizer::GetGlyphDrawRect` unions each
+    // rasterized glyph box and returns it
+    // (`reference/cpp/core/visual/FreeTypeFontRasterizer.cpp:225-257`).
+    let left = env.eval_int("f.getGlyphDrawRect('A').left");
+    let right = env.eval_int("f.getGlyphDrawRect('A').right");
+    let top = env.eval_int("f.getGlyphDrawRect('A').top");
+    let bottom = env.eval_int("f.getGlyphDrawRect('A').bottom");
     assert!(
-        message.contains("no storage attached"),
-        "unexpected message: {message}"
+        right > left && bottom > top,
+        "getGlyphDrawRect should be a non-empty rect, got ({left}, {top}, {right}, {bottom})"
     );
 }
 
 #[test]
-fn font_glyph_draw_rect_is_deferred() {
+fn font_get_list_and_default_face_name_report_the_registered_face() {
+    let Some((dir, name)) = test_font() else {
+        return;
+    };
     let _lock = vm_lock();
-    let env = Env::new(None);
-    env.run("var f = new Font('Ghost', 16, 0);");
+    let storage = Storage::mount_archives(
+        FileSystem::host(&dir),
+        dir.clone(),
+        std::iter::empty::<&str>(),
+    )
+    .expect("mount font directory");
+    let env = Env::new(Some(storage));
+    env.run(&format!("var f = new Font('{name}', 24, 0xffffffff);"));
+    // Load the face so it is registered with the resolver.
+    assert!(env.eval_int("f.getTextWidth('A')") > 0);
 
-    let message = env.error("f.getGlyphDrawRect('x')");
+    // Reference: `Font.getList` returns the enumerated face names as a TJS
+    // array (`reference/cpp/core/visual/LayerIntf.cpp:11958-11985`).
     assert!(
-        message.contains("per-glyph draw rectangles"),
-        "unexpected message: {message}"
+        env.eval_int("f.getList(0).length") > 0,
+        "getList should report the registered face"
     );
+    // Reference: `Font.defaultFaceName` returns the default face
+    // (`reference/cpp/core/visual/LayerIntf.cpp:12177`).
+    match env.eval("Font.defaultFaceName") {
+        Ok(TjsValue::String(name)) => {
+            assert!(!name.is_empty(), "default face name should be set")
+        }
+        other => panic!("expected a string default face name, got {other:?}"),
+    }
 }
 
 #[test]
-fn font_user_select_and_enumeration_are_deferred() {
+fn font_user_select_is_deferred() {
     let _lock = vm_lock();
     let env = Env::new(None);
     env.run("var f = new Font('Ghost', 16, 0);");
 
-    assert!(env.error("f.getList(0)").contains("font enumeration"));
     assert!(
         env.error("f.doUserSelect(0, '', '', '')")
             .contains("font-selection UI")
-    );
-    assert!(
-        env.error("Font.defaultFaceName")
-            .contains("font enumeration")
     );
 }
 
@@ -324,7 +369,7 @@ fn font_metrics_fall_back_to_a_system_face() {
             );
         }
         Ok(other) => panic!("expected an integer width, got {other:?}"),
-        Err(message) if message.contains("no system font provides it") => {}
+        Err(message) if message.contains("no font is available") => {}
         Err(message) => panic!("unexpected error: {message}"),
     }
 }

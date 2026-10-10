@@ -8,7 +8,7 @@
 mod common;
 
 use api::host::TouchPhase;
-use common::vm_lock;
+use common::{Env, vm_lock};
 use compat::{CompatHost, EventAdapter};
 use platform::{InputEvent, PlatformEvent};
 use tjs::{Tjs2Engine, TjsValue};
@@ -303,10 +303,13 @@ fn properties_round_trip() {
 fn version_and_environment_properties() {
     let _lock = vm_lock();
     with_vm(|e| {
-        assert!(matches!(
+        // TVPGetVersionString() -> "major.minor.release.build"; the emulated
+        // KiriKiri version is 2.32.2.426 (`reference/cpp/core/base/MsgIntf.cpp:173-177`,
+        // `reference/cpp/core/base/impl/MsgImpl.cpp:23-27`).
+        assert_eq!(
             e.eval("System.versionString", "t").unwrap(),
-            TjsValue::String(s) if !s.is_empty()
-        ));
+            TjsValue::String("2.32.2.426".into())
+        );
         assert!(matches!(
             e.eval("System.versionInformation", "t").unwrap(),
             TjsValue::String(s) if s.contains("krkr-rs")
@@ -332,10 +335,6 @@ fn version_and_environment_properties() {
             e.eval("System.osBits", "t").unwrap(),
             TjsValue::Integer((std::mem::size_of::<usize>() * 8) as i64)
         );
-        assert_eq!(
-            e.eval("System.exeName", "t").unwrap(),
-            TjsValue::String("krkr-rs".into())
-        );
     });
 }
 
@@ -349,7 +348,22 @@ fn storage_backed_paths_are_typed_errors_without_storage() {
         assert!(e.eval("System.dataPath", "t").is_err());
         assert!(e.eval("System.personalPath", "t").is_err());
         assert!(e.eval("System.savedGamesPath", "t").is_err());
+        assert!(e.eval("System.exeName", "t").is_err());
     });
+}
+
+#[test]
+fn exe_name_is_the_project_directory_with_a_trailing_separator() {
+    let _lock = vm_lock();
+    let env = Env::with_storage();
+    let dir = env.game_dir().expect("game dir");
+    // TVPNormalizeStorageName(ExePath()), where ExePath() is the project
+    // directory (`reference/cpp/core/base/impl/SystemImpl.cpp:838-847`,
+    // `reference/cpp/core/environ/Application.cpp:92`).
+    assert_eq!(
+        env.eval("System.exeName").unwrap(),
+        TjsValue::String(format!("{}/", dir.display()))
+    );
 }
 
 #[test]

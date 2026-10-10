@@ -18,6 +18,7 @@ use engine::Storage;
 use engine::input::InputState;
 use engine::timer::TimerState;
 use fs::FileSystem;
+use platform::PlatformEvent;
 use tjs::{Tjs2Engine, TjsValue};
 
 fn lock() -> &'static Mutex<()> {
@@ -167,6 +168,22 @@ impl Env {
     pub fn poll_async(&self) {
         let mut ctx = self._host.ctx().expect("bound compat context");
         compat::async_trigger_poll(&mut ctx).expect("async trigger poll");
+    }
+
+    /// Feed one frame's platform events through the L3 adapter and deliver
+    /// each mapped event to the script handler the adapter resolves (the
+    /// [`compat::EventAdapter::dispatch`] seam the VM host's `tick` uses).
+    pub fn dispatch_events(&self, events: &[PlatformEvent]) {
+        let adapter = compat::EventAdapter::new();
+        let mut ctx = self._host.ctx().expect("bound compat context");
+        adapter.begin_input_frame(&mut ctx);
+        for event in events {
+            adapter.apply_input_event(&mut ctx, event);
+            if let Some(mapped) = adapter.map(event) {
+                adapter.dispatch(&mut ctx, &mapped).expect("dispatch event");
+            }
+        }
+        adapter.end_input_frame(&mut ctx);
     }
 }
 

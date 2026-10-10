@@ -1444,6 +1444,10 @@ extern "C" fn prop_saved_games_path(
     saved_games_path_prop(engine, out, out_error, "savedGamesPath")
 }
 
+/// `System.exeName` — the project directory with a trailing separator, as the
+/// reference returns `TVPNormalizeStorageName(ExePath())`
+/// (`reference/cpp/core/base/impl/SystemImpl.cpp:838-847`,
+/// `reference/cpp/core/environ/Application.cpp:92`).
 extern "C" fn prop_exe_name(
     engine: *mut c_void,
     out: *mut Value,
@@ -1453,8 +1457,13 @@ extern "C" fn prop_exe_name(
         return report_error(out_error, "System.exeName: compat context is not bound");
     };
     let ctx = resolved.ctx();
-    set_string_out(&ctx, out, "krkr-rs");
-    0
+    match project_dir(&ctx) {
+        Some(dir) => {
+            set_string_out(&ctx, out, &dir_with_separator(&dir));
+            0
+        }
+        None => report_error(out_error, "System.exeName: storage is not attached"),
+    }
 }
 
 extern "C" fn prop_title_get(
@@ -1574,6 +1583,10 @@ extern "C" fn prop_screen_height(
     0
 }
 
+/// The KiriKiri version this port reports (`TVPGetVersionString`,
+/// `reference/cpp/core/base/MsgIntf.cpp:173-177`).
+const EMULATED_KIRIKIRI_VERSION: &str = "2.32.2.426";
+
 extern "C" fn prop_version_string(
     engine: *mut c_void,
     out: *mut Value,
@@ -1586,7 +1599,7 @@ extern "C" fn prop_version_string(
         );
     };
     let ctx = resolved.ctx();
-    set_string_out(&ctx, out, &format!("{}.0", env!("CARGO_PKG_VERSION")));
+    set_string_out(&ctx, out, EMULATED_KIRIKIRI_VERSION);
     0
 }
 
