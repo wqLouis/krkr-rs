@@ -623,3 +623,23 @@ fn draw_device_state_round_trips_and_interface_is_a_synthetic_pointer() {
     // `drawer` is read-only.
     assert!(env.eval("b.drawer = 3").is_err());
 }
+
+#[test]
+fn default_draw_device_creation_failure_raises_internal_error() {
+    let _lock = vm_lock();
+    let env = Env::new();
+
+    // The window constructor builds a default `BasicDrawDevice` and throws
+    // `TVPInternalError` (`Internal error`) when `CreateNew` fails
+    // (`reference/cpp/core/visual/WindowIntf.cpp:150-156`). The port resolves
+    // the registered `Window.BasicDrawDevice` class member, so replacing it
+    // with a non-constructor forces the failure the reference reports.
+    env.run("Window.BasicDrawDevice = 5;");
+    let error = env
+        .eval("new Window()")
+        .expect_err("a Window whose default draw device cannot be created must raise");
+    assert!(
+        error.contains("Internal error"),
+        "unexpected error: {error}"
+    );
+}

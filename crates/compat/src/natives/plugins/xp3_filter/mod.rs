@@ -23,20 +23,19 @@
 //!
 //! # Script load timing
 //!
-//! The reference reads `<app>/xp3filter.tjs` from a post-registration
-//! callback and executes it in a **dedicated sub-engine** whose global scope
-//! holds only `Debug`/`System`/`Storages` (`xp3filter.cpp:394-421`), so
-//! nothing the filter script declares is visible to the game script. The
-//! port's [`CompatHost`](crate::CompatHost) installs the engine → context
-//! binding *after* native registration and the shared engine cannot expose a
-//! second global, so this module (a) loads the script eagerly when the
-//! binding is already live (registration harnesses that bind first),
-//! otherwise deferring it to the first archive read, and (b) wraps the
-//! source in a named local function so its declarations stay local to the
-//! filter script — the same isolation the sub-engine provides for top-level
-//! `function`/`var`. A function *expression* cannot host the wrapper: TJS2
-//! does not bind a `function` declaration inside an anonymous function body
-//! (the name resolves neither locally nor on `global`).
+//! The reference reads `<app>/xp3filter.tjs` in a post-registration callback
+//! and executes it in a **dedicated sub-engine** whose global scope holds only
+//! `Debug`/`System`/`Storages` (`xp3filter.cpp:552-559`, `:394-421`), so
+//! nothing the filter script declares is visible to the game script. The port
+//! reads the source during native registration (a read failure is returned to
+//! [`CompatHost`](crate::CompatHost) as a registration error), and executes it
+//! on the first archive read, once the engine → context binding the setters
+//! need is live. The shared engine cannot expose a second global, so the
+//! source is wrapped in a named local function: its declarations stay local to
+//! the filter script — the same isolation the sub-engine provides for
+//! top-level `function`/`var`. A function *expression* cannot host the
+//! wrapper: TJS2 does not bind a `function` declaration inside an anonymous
+//! function body (the name resolves neither locally nor on `global`).
 //! Residual difference: the filter script still resolves free names against
 //! the game's global scope (a second engine would have to be created per
 //! read, which the cross-engine call seam does not allow), and an explicit
@@ -80,15 +79,20 @@ const FILTER_SCRIPT: &str = "xp3filter.tjs";
 ///
 /// The retained closures are `DetachedValue`s so the plugin never holds a
 /// borrow of the engine; the `script_loaded` flag makes the deferred
-/// `xp3filter.tjs` load a one-shot.
+/// `xp3filter.tjs` execution a one-shot.
 #[derive(Default)]
 struct Xp3FilterState {
     /// The retained `setXP3ArchiveExtractionFilter` closure.
     extraction: Option<DetachedValue>,
     /// The retained `setXP3ArchiveContentFilter` closure.
     content: Option<DetachedValue>,
-    /// Whether `xp3filter.tjs` has been read (or a filter was installed
-    /// programmatically), so the deferred load never clobbers it.
+    /// The `xp3filter.tjs` source read during registration, awaiting
+    /// execution on the first archive read (the reference reads in the
+    /// post-registration callback and executes in the decoder on first use,
+    /// `reference/cpp/plugins/xp3filter.cpp:552-559`, `:418`).
+    pending_script: Option<String>,
+    /// Whether `xp3filter.tjs` has been executed (or a filter was installed
+    /// programmatically), so the deferred execution never clobbers it.
     script_loaded: bool,
 }
 
@@ -126,18 +130,26 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
 
     install_storage_filter(ctx);
 
-    // Eagerly load the script when the engine → context binding is already
-    // live (unit-test and direct-registration harnesses). The host installs
-    // the binding after registration, so the normal path defers the load to
-    // the first archive read (see `ensure_script_loaded`).
+    // Read the configuration script during registration, matching the
+    // reference `PostRegistCallback` (`reference/cpp/plugins/xp3filter.cpp:552-559`):
+    // a read failure rethrows. The script is executed on the first archive
+    // read, once the engine → context binding is live (the reference's
+    // `AddXP3Decoder`, `:418`), because the setters need that binding.
+    // SAFETY: the caller holds the live services.
+    let services = unsafe { ctx.services() };
+    match read_filter_script(services) {
+        Ok(Some(text)) => services.state::<Xp3FilterState>().pending_script = Some(text),
+        Ok(None) => {}
+        Err(error) => return Err(CompatError::Register(format!("xp3_filter: {error}"))),
+    }
+
+    // A harness that registers with the binding already installed can execute
+    // immediately.
     // SAFETY: registration runs on the bound, live engine.
     if binding::resolve(unsafe { ctx.engine() }.raw()).is_some() {
-        // SAFETY: the caller holds the live services.
-        let services = unsafe { ctx.services() };
         // SAFETY: the same bound, live engine.
-        load_filter_script(unsafe { ctx.engine() }, services)
+        execute_pending_script(unsafe { ctx.engine() }, services)
             .map_err(|error| CompatError::Register(format!("xp3_filter: {error}")))?;
-        services.state::<Xp3FilterState>().script_loaded = true;
     }
     Ok(())
 }
@@ -183,7 +195,26 @@ fn install_storage_filter(ctx: &CompatCtx) {
     unsafe { &mut *storage }.xp3_extraction_filter = Some(filter);
 }
 
-/// Read `<app>/xp3filter.tjs` through the storage namespace and execute it.
+/// Read and decode `<app>/xp3filter.tjs` through the storage namespace.
+///
+/// A missing script is not an error (the reference only loads it when
+/// present); any other read failure is returned so registration can report it
+/// (`reference/cpp/plugins/xp3filter.cpp:553-559`).
+fn read_filter_script(services: &CompatServices) -> Result<Option<String>, String> {
+    let Some(storage) = services.storage() else {
+        return Ok(None);
+    };
+    // SAFETY: the host keeps the attached storage alive for the binding.
+    let storage = unsafe { &*storage };
+    let bytes = match storage.read(FILTER_SCRIPT) {
+        Ok(bytes) => bytes,
+        Err(StorageReadError::NotFound(_)) => return Ok(None),
+        Err(error) => return Err(format!("could not read {FILTER_SCRIPT}: {error}")),
+    };
+    crate::text::decode_text(&bytes, None).map(Some)
+}
+
+/// Execute the `xp3filter.tjs` source read at registration.
 ///
 /// The source is wrapped in a named function declaration, called, and the
 /// wrapper deleted so top-level declarations stay local to the filter script,
@@ -192,24 +223,7 @@ fn install_storage_filter(ctx: &CompatCtx) {
 /// *expression* wrapper cannot be used: the VM does not bind `function`
 /// declarations inside an anonymous function body, so the script's helpers
 /// would be unreachable.
-///
-/// A missing script is not an error (the reference only loads it when
-/// present); any other failure is returned so registration can report it.
-fn load_filter_script(engine: &Tjs2Engine, services: &CompatServices) -> Result<(), String> {
-    let Some(storage) = services.storage() else {
-        return Ok(());
-    };
-    // SAFETY: the host keeps the attached storage alive for the binding.
-    let storage = unsafe { &*storage };
-    let bytes = match storage.read(FILTER_SCRIPT) {
-        Ok(bytes) => bytes,
-        Err(StorageReadError::NotFound(_)) => return Ok(()),
-        Err(error) => return Err(format!("could not read {FILTER_SCRIPT}: {error}")),
-    };
-    let text = crate::text::decode_text(&bytes, None)?;
-    // A named declaration, unlike an anonymous function expression, binds the
-    // script's top-level `function`/`var` names in its body. Delete the
-    // wrapper afterwards so it does not become a game-visible global.
+fn execute_filter_script(engine: &Tjs2Engine, text: &str) -> Result<(), String> {
     let wrapped = format!(
         "function __krkr_rs_xp3_filter_script__() {{\n{text}\n}}\n\
          __krkr_rs_xp3_filter_script__();\n\
@@ -221,8 +235,22 @@ fn load_filter_script(engine: &Tjs2Engine, services: &CompatServices) -> Result<
         .map_err(|error| error.to_string())
 }
 
-/// Deferred, one-shot `xp3filter.tjs` load used when registration ran before
-/// the binding was installed.
+/// Execute the script read during registration, exactly once. A `None` means
+/// the application shipped no `xp3filter.tjs` (the reference only loads it
+/// when present).
+fn execute_pending_script(engine: &Tjs2Engine, services: &CompatServices) -> Result<(), String> {
+    // Take the source out before matching: a `match` scrutinee temporary
+    // lives for the whole match, so binding it first drops the state borrow
+    // before the script runs and may re-enter a setter.
+    let pending = services.state::<Xp3FilterState>().pending_script.take();
+    match pending {
+        Some(text) => execute_filter_script(engine, &text),
+        None => Ok(()),
+    }
+}
+
+/// Deferred, one-shot `xp3filter.tjs` execution triggered by the first archive
+/// read (the engine → context binding is live by then).
 fn ensure_script_loaded(engine: &Tjs2Engine, services: &CompatServices) {
     {
         let state = services.state::<Xp3FilterState>();
@@ -232,7 +260,10 @@ fn ensure_script_loaded(engine: &Tjs2Engine, services: &CompatServices) {
     }
     // Mark first so a recursive archive read cannot loop back into the load.
     services.state::<Xp3FilterState>().script_loaded = true;
-    if let Err(error) = load_filter_script(engine, services) {
+    if let Err(error) = execute_pending_script(engine, services) {
+        // The reference executes the script in `AddXP3Decoder` on the first
+        // read; the L2 filter callback has no error channel, so an execution
+        // failure is reported here.
         log::warn!("xp3_filter: {error}");
     }
 }

@@ -179,7 +179,7 @@ fn focused_layer_setter_mirrors_into_the_scene() {
 }
 
 #[test]
-fn primary_layer_sizes_the_tree_and_round_trips() {
+fn primary_layer_is_read_only_and_the_tree_falls_back_to_the_window() {
     let _lock = vm_lock();
     let env = Env::new();
 
@@ -188,13 +188,27 @@ fn primary_layer_sizes_the_tree_and_round_trips() {
          w.setSize(320, 240); \
          var l = new Layer(w, null); \
          l.setSize(100, 77); \
-         var owner = new BitmapLayerTreeOwner(); \
-         owner.primaryLayer = l;",
+         var owner = new BitmapLayerTreeOwner();",
     );
 
-    assert_eq!(env.eval_int("owner.primaryLayer === l"), 1);
-    assert_eq!(env.eval_int("owner.width"), 100);
-    assert_eq!(env.eval_int("owner.height"), 77);
+    // `TJS_DENY_NATIVE_PROP_SETTER` denies writes to `primaryLayer`
+    // (`reference/cpp/core/visual/BitmapLayerTreeOwner.cpp:633`).
+    assert!(
+        env.engine
+            .eval("owner.primaryLayer = l", "tree-owner-test")
+            .is_err(),
+        "primaryLayer must be read-only"
+    );
+    // The port never attaches a primary layer from script, so the getter
+    // raises and the tree bounds fall back to the owner's window.
+    assert!(
+        env.engine
+            .eval("owner.primaryLayer", "tree-owner-test")
+            .is_err(),
+        "a tree owner with no primary layer raises"
+    );
+    assert_eq!(env.eval_int("owner.width"), 320);
+    assert_eq!(env.eval_int("owner.height"), 240);
 }
 
 #[test]

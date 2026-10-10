@@ -1310,3 +1310,28 @@ fn state_reference_store_accessors_round_trip() {
     assert_eq!(state::encode_int_stack(&[1, 256]), "0000000100000100");
     assert_eq!(state::encode_bool_stack(&[true, false, true]), "101");
 }
+
+#[test]
+fn native_object_valued_exp_is_truthy() {
+    let _lock = common::vm_lock();
+    let env = common::Env::with_storage();
+    std::fs::write(
+        env.game_dir()
+            .expect("mounted game dir")
+            .join("scenario.ks"),
+        b"*start\n@if exp=\"[]\"\nA\n@endif\n",
+    )
+    .expect("write scenario.ks");
+
+    let value = env
+        .eval(
+            "(function(){ var p = new KAGParser(); p.loadScenario('scenario.ks'); \
+             var out = ''; while (true) { var t = p.getNextTag(); if (!t) break; \
+             if (t.tagname == 'ch') out += t.text; } return out; })()",
+        )
+        .expect("script");
+    // An object expression is truthy (`operator bool` is `Object != nullptr`),
+    // so the `@if` branch runs
+    // (`reference/cpp/core/base/KAGParser.cpp:2168-2171`).
+    assert_eq!(value, TjsValue::String("A".to_string()));
+}

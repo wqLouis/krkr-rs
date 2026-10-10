@@ -120,16 +120,37 @@ struct KagEnv {
 
 impl KagEnv {
     fn new(engine: &'static Tjs2Engine, storage: Option<*mut Storage>, owner: *mut c_void) -> Self {
-        let eval: EvalFn = Box::new(move |exp: &str| match engine.eval(exp, "KAGParser") {
-            Ok(TjsValue::Void) => Ok(EvalResult::Void),
-            Ok(TjsValue::Integer(i)) => Ok(EvalResult::Integer(i)),
-            Ok(TjsValue::Real(r)) => Ok(EvalResult::Real(r)),
-            Ok(TjsValue::String(s)) => Ok(EvalResult::Str(s)),
-            Ok(TjsValue::Object) | Ok(TjsValue::Retained(_)) => {
-                log::warn!("KAGParser: expression {exp:?} returned an object; treating as void");
-                Ok(EvalResult::Void)
+        let eval: EvalFn = Box::new(move |exp: &str| -> Result<EvalResult, String> {
+            match engine.eval(exp, "KAGParser") {
+                Ok(TjsValue::Void) => Ok(EvalResult::Void),
+                Ok(TjsValue::Integer(i)) => Ok(EvalResult::Integer(i)),
+                Ok(TjsValue::Real(r)) => Ok(EvalResult::Real(r)),
+                Ok(TjsValue::String(s)) => Ok(EvalResult::Str(s)),
+                Ok(TjsValue::Object) | Ok(TjsValue::Retained(_)) => {
+                    // The reference converts an object result with `ToString`
+                    // on the string path and `operator bool` (`Object !=
+                    // nullptr`) on the condition path
+                    // (`reference/cpp/core/base/KAGParser.cpp:2138-2141`,
+                    // `:2168-2171`). Retain the value the eval just produced
+                    // (the safe surface reports TJS `null` as `Object` too) so
+                    // the null case -- an object with no dispatch target -- can
+                    // be told apart from a real object.
+                    let object = engine
+                        .retain_value_detached(&TjsValue::Object)
+                        .map_err(|error| error.to_string())?;
+                    if engine.class_names(object.raw_id()).is_err() {
+                        return Ok(EvalResult::Void);
+                    }
+                    // Concatenating the object in the VM yields the
+                    // `TJSObjectToString` debug text the reference stores.
+                    match engine.eval(&format!("'' + ({exp})"), "KAGParser") {
+                        Ok(TjsValue::String(text)) => Ok(EvalResult::Str(text)),
+                        Ok(_) => Err("KAGParser: object result was not a string".to_string()),
+                        Err(error) => Err(error.to_string()),
+                    }
+                }
+                Err(e) => Err(e.to_string()),
             }
-            Err(e) => Err(e.to_string()),
         });
         let load: LoadFn = Box::new(move |name: &str| {
             let Some(ptr) = storage else {

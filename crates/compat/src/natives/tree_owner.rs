@@ -34,11 +34,12 @@
 //!
 //! # Deliberately deferred
 //!
-//! * `primaryLayer` is the reference-property but its setter is denied there.
-//!   The port exposes an assignable setter because the L2 id→script-object
-//!   registry lives in a private sibling module that this file cannot name;
-//!   without it the getter could never return a scene layer. When it is unset
-//!   the getter returns TJS `null`.
+//! * `primaryLayer` is read-only, matching the reference's
+//!   `TJS_DENY_NATIVE_PROP_SETTER`
+//!   (`reference/cpp/core/visual/BitmapLayerTreeOwner.cpp:617-635`). The
+//!   primary layer is established by the layer manager in the reference;
+//!   the port has no such wiring yet, so the getter raises until a primary
+//!   layer is attached.
 //! * The owner-notification `on*` hooks that the reference posts from layer
 //!   resize/image/attention/IME/cursor/hint changes are assignable no-ops
 //!   here: those layer-manager notifications are not part of the L2 service
@@ -762,49 +763,6 @@ extern "C" fn primary_layer_get(
     0
 }
 
-/// `primaryLayer = layer` — retain the primary layer (`null`/void clears it).
-///
-/// See the module docs: the reference denies this setter; the port exposes it
-/// because the L2 id→object registry is not reachable from this module.
-extern "C" fn primary_layer_set(
-    engine: *mut c_void,
-    instance: *mut c_void,
-    value: *const Value,
-    out_error: *mut *mut c_char,
-    _objthis: *mut c_void,
-) -> c_int {
-    let Some(resolved) = resolve(engine) else {
-        return report_error(
-            out_error,
-            "BitmapLayerTreeOwner.primaryLayer: compat context is not bound",
-        );
-    };
-    if value.is_null() {
-        return report_error(
-            out_error,
-            "BitmapLayerTreeOwner.primaryLayer: missing value",
-        );
-    }
-    // SAFETY: the trampoline passes a valid value slot for the call.
-    let value = unsafe { &*value };
-    let retained = if value.ty == VAL_OBJECT && !value.object_handle().is_null() {
-        match resolved.engine().retain_object_arg(value) {
-            Ok(object) => Some(object),
-            Err(error) => {
-                return report_error(
-                    out_error,
-                    &format!("BitmapLayerTreeOwner.primaryLayer: {error}"),
-                );
-            }
-        }
-    } else {
-        None
-    };
-    // SAFETY: `instance` is the live payload the VM passed to the callback.
-    unsafe { &mut *(instance as *mut TreeOwnerInst) }.primary = retained;
-    0
-}
-
 /// `layerTreeOwnerInterface` — the owner script object itself.
 extern "C" fn layer_tree_owner_interface_get(
     engine: *mut c_void,
@@ -1087,7 +1045,7 @@ fn tree_owner_properties() -> Vec<NativeInstancePropertyDef> {
         NativeInstancePropertyDef {
             name: "primaryLayer",
             get: Some(primary_layer_get),
-            set: Some(primary_layer_set),
+            set: None,
         },
         NativeInstancePropertyDef {
             name: "layerTreeOwnerInterface",

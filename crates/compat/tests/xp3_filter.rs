@@ -1,11 +1,11 @@
 //! End-to-end tests for the `xp3_filter` plugin.
 //!
 //! Each test writes a real `xp3filter.tjs` into a temporary game directory,
-//! installs the full compat surface (which defers loading the script to the
-//! first archive read), mounts a synthetic XP3 archive whose contents are
-//! XOR-encrypted, and reads a member back through the `Storages` native. The
-//! byte-for-byte comparison proves the game script's closure ran on the
-//! archive bytes.
+//! installs the full compat surface (which reads the script during
+//! registration and executes it on the first archive read), mounts a synthetic
+//! XP3 archive whose contents are XOR-encrypted, and reads a member back
+//! through the `Storages` native. The byte-for-byte comparison proves the game
+//! script's closure ran on the archive bytes.
 //!
 //! The process-wide engine → context binding is single, so every test holds
 //! the shared VM lock.
@@ -328,6 +328,44 @@ fn content_filter_runs_without_an_extraction_filter() {
             .eval("global.__content_arg_types", "xp3-filter-test")
             .expect("content argument types"),
         tjs::TjsValue::String("String,String,Integer".into())
+    );
+}
+
+// A read failure while loading `xp3filter.tjs` rethrows during registration
+// (`reference/cpp/plugins/xp3filter.cpp:553-559`); the port reports it as a
+// `CompatError::Register` from `CompatHost::install`.
+#[test]
+#[cfg(unix)]
+fn unreadable_filter_script_fails_registration() {
+    let _lock = vm_lock();
+    let dir = GameDir::new();
+    // A self-referential symlink resolves but cannot be read, so the read
+    // fails with an I/O error rather than the `NotFound` the reference treats
+    // as "no filter script".
+    std::os::unix::fs::symlink("xp3filter.tjs", dir.path().join("xp3filter.tjs"))
+        .expect("create symlink loop");
+    let mut storage = Box::new(
+        Storage::mount_archives(
+            FileSystem::host(dir.path()),
+            dir.path().to_path_buf(),
+            std::iter::empty::<&str>(),
+        )
+        .expect("mount storage"),
+    );
+    let engine = Box::new(Tjs2Engine::new().expect("create engine"));
+    let mut host = CompatHost::new();
+    // SAFETY: `storage` is boxed and outlives the binding, which `host`
+    // removes on drop.
+    unsafe {
+        host.services_mut()
+            .attach_storage(storage.as_mut() as *mut Storage);
+    }
+    let error = host
+        .install(&engine)
+        .expect_err("an unreadable xp3filter.tjs must fail registration");
+    assert!(
+        error.to_string().contains("xp3filter.tjs"),
+        "unexpected error: {error}"
     );
 }
 

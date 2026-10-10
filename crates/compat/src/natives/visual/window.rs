@@ -202,18 +202,19 @@ extern "C" fn window_ctor(
     inst.id = Some(id);
     register_window(&ctx, resolved.engine(), id, objthis);
     // Install the default draw device: the reference constructs a
-    // `BasicDrawDevice` for every window (`WindowIntf.cpp:150-166`). The
-    // constructor must not fail when the default cannot be created.
+    // `BasicDrawDevice` for every window and throws `TVPInternalError` when
+    // `CreateNew` fails (`reference/cpp/core/visual/WindowIntf.cpp:150-156`).
+    // `Window.BasicDrawDevice` is a registered class member, so this path is
+    // reached when that member's `new` raises (e.g. a host removed the
+    // member). A failed constructor destroys the half-built instance, so
+    // `window_destroy` still removes the scene window and its registry entry.
     match resolved
         .engine()
         .eval_retained("new Window.BasicDrawDevice()", "Window")
     {
         Ok(RetainedValue::Object(object)) => inst.draw_device = Some(object),
-        Ok(RetainedValue::Value(_)) => {
-            log::warn!("Window: the default draw device is not an object")
-        }
-        Err(error) => {
-            log::warn!("Window: could not create the default draw device: {error}")
+        Ok(RetainedValue::Value(_)) | Err(_) => {
+            return report_error(out_error, "Internal error");
         }
     }
     set_int(out, i64::from(id));
