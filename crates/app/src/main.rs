@@ -43,8 +43,9 @@ OPTIONS:
     --frames N             Headless frames to run (default 120).
     --backend null|vulkan  Render backend (default: null).
     --archive XP3          Mount an XP3 archive (repeatable, later wins).
+                           With none, every *.xp3 under the base directory mounts.
     --base-dir DIR         App path (default: first archive's parent).
-    GAME                   Game directory (loose startup.tjs) or an XP3 file.
+    GAME                   Game directory (recursively scanned for *.xp3) or an XP3 file.
     -h, --help             Print this help.
 ";
 

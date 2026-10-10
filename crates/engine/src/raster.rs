@@ -194,14 +194,56 @@ pub fn fill_polygon(bitmap: &mut BitmapState, pts: &[(f64, f64)], color: [u8; 4]
     }
 }
 
-/// Whether a hatch pixel is foreground for the given GDI+ hatch style.
+/// The hatch pattern repeats over an 8×8 cell.
+const HATCH_TILE: i32 = 8;
+
+/// Whether pixel `(x, y)` is foreground for the given GDI+ hatch style.
 ///
-/// Only the game's `HatchStyleDiagonalBrick` (= 38) matters; the reference's
-/// cross-platform build falls through to a forward-diagonal pattern for it,
-/// so this approximates every style with a diagonal stripe. Colors are the
-/// only thing that has to look right for the debug "missing image" box.
-fn hatch_on(x: i32, y: i32, _style: i32) -> bool {
-    (x - y).rem_euclid(8) < 3
+/// The reference builds an 8×8 tile from integer rectangles and diagonal
+/// bands; this reproduces the named cases with integer tests so the CPU
+/// sampler stays allocation-free and a future GPU path can evaluate the same
+/// cell. Styles the reference leaves to its forward-diagonal `default` arm
+/// share that pattern; `HatchStyleDiagonalBrick` (38) gets a distinct brick
+/// because the Windows engine gives it its own brush and the game uses it.
+/// Coordinates are layer-local pixels and may be negative.
+pub fn hatch_foreground(style: i32, x: i32, y: i32) -> bool {
+    let px = x.rem_euclid(HATCH_TILE);
+    let py = y.rem_euclid(HATCH_TILE);
+    // Reduce the diagonals into the cell so the sums/differences cannot
+    // overflow on extreme coordinates; all are taken modulo the 8×8 tile.
+    let diag = (px - py).rem_euclid(HATCH_TILE);
+    let anti = (px + py).rem_euclid(HATCH_TILE);
+    match style {
+        // Horizontal / vertical line through the middle of the cell.
+        0 => py == 4,
+        1 => px == 4,
+        // Forward (`\`) / backward (`/`) diagonal.
+        2 => diag == 0,
+        3 => anti == 0,
+        // Cross / diagonal cross.
+        4 => px == 4 || py == 4,
+        5 => diag == 0 || anti == 0,
+        // 5 percent: a single dot per cell.
+        6 => px == 0 && py == 0,
+        // 50 percent: an every-other-pixel grid.
+        12 => px % 2 == 0 && py % 2 == 0,
+        // Zig zag: a horizontal line on every other row.
+        36 => py % 2 == 0,
+        // Diagonal brick: courses run along `\` with staggered `/` head
+        // joints, so the mortar reads as a brick wall on the diagonal.
+        38 => {
+            let course = diag / 4;
+            diag % 4 == 0 || anti == course * 4
+        }
+        // Weave: two-wide bands every four pixels in both directions.
+        40 => px % 4 < 2 || py % 4 < 2,
+        // Dotted grid: a dot every four pixels.
+        43 => px % 4 == 0 && py % 4 == 0,
+        // Small grid: a line every two pixels in both directions.
+        48 => px % 2 == 0 || py % 2 == 0,
+        // The reference forward-diagonal default, and every other style.
+        _ => diag == 0,
+    }
 }
 
 /// Fill a closed polygon with a two-color hatch approximation.
@@ -228,7 +270,7 @@ pub fn fill_polygon_hatch(
                     let x = px as f64 + (sx as f64 + 0.5) / AA as f64;
                     let y = py as f64 + (sy as f64 + 0.5) / AA as f64;
                     if point_in_polygon(x, y, pts) {
-                        if hatch_on(px, py, style) {
+                        if hatch_foreground(style, px, py) {
                             fore_hits += 1;
                         } else {
                             back_hits += 1;
@@ -376,4 +418,71 @@ pub fn flatten_cubic(
             )
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{fill_polygon_hatch, hatch_foreground};
+    use crate::scene::BitmapState;
+
+    /// `createHatchPattern` (`reference/cpp/plugins/layerex_draw/blend2d/
+    /// LayerExDraw.cpp:637-730`) fills each 8×8 cell with a foreground
+    /// pattern over a foreground/background pair; the Windows `HatchBrush`
+    /// (`reference/cpp/plugins/layerex_draw/windows/LayerExDraw.cpp:640-647`)
+    /// gives `HatchStyleDiagonalBrick` (38) its own pattern, distinct from
+    /// the forward diagonal (2).
+    #[test]
+    fn hatch_cell_paints_fore_and_back_and_brick_differs() {
+        let cell = |style: i32| -> Vec<bool> {
+            let mut out = Vec::new();
+            for y in 0..8 {
+                for x in 0..8 {
+                    out.push(hatch_foreground(style, x, y));
+                }
+            }
+            out
+        };
+
+        let forward = cell(2);
+        assert!(
+            forward.iter().any(|on| *on),
+            "the forward diagonal paints foreground"
+        );
+        assert!(
+            forward.iter().any(|on| !*on),
+            "the forward diagonal paints background"
+        );
+        assert_ne!(
+            forward,
+            cell(38),
+            "the brick tile differs from the forward diagonal"
+        );
+    }
+
+    /// A hatch fill blends both tile colors into the bitmap.
+    #[test]
+    fn fill_polygon_hatch_paints_two_colors() {
+        let mut bitmap = BitmapState::new(8, 8, vec![0u8; 8 * 8 * 4]);
+        fill_polygon_hatch(
+            &mut bitmap,
+            &[(0.0, 0.0), (8.0, 0.0), (8.0, 8.0), (0.0, 8.0)],
+            2,
+            [255, 0, 0, 255],
+            [0, 0, 255, 255],
+        );
+        let mut red = 0;
+        let mut blue = 0;
+        for y in 0..8 {
+            for x in 0..8 {
+                let i = bitmap.pixel_offset(x, y).expect("pixel in range");
+                if bitmap.rgba[i..i + 4] == [255, 0, 0, 255] {
+                    red += 1;
+                }
+                if bitmap.rgba[i..i + 4] == [0, 0, 255, 255] {
+                    blue += 1;
+                }
+            }
+        }
+        assert!(red > 0 && blue > 0, "the hatch fill paints both colors");
+    }
 }

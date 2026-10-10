@@ -11,6 +11,7 @@
 
 use std::ffi::{c_char, c_int, c_void};
 
+use engine::raster::hatch_foreground;
 use tjs::{
     NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef, Tjs2Engine,
     TjsValue, Value,
@@ -56,12 +57,6 @@ pub(super) struct AppearanceData {
     pub(super) infos: Vec<DrawInfo>,
 }
 
-/// A hatch pixel's foreground/background selection. Mirrors the L2 raster
-/// hatch approximation (a forward-diagonal stripe).
-fn hatch_on(x: i32, y: i32) -> bool {
-    (x - y).rem_euclid(8) < 3
-}
-
 fn lerp_channel(a: u8, b: u8, t: f64) -> u8 {
     (a as f64 + (b as f64 - a as f64) * t)
         .round()
@@ -72,8 +67,8 @@ fn lerp_channel(a: u8, b: u8, t: f64) -> u8 {
 pub(super) fn paint_color_at(paint: &Paint, x: f64, y: f64) -> [u8; 4] {
     match paint {
         Paint::Solid(color) => *color,
-        Paint::Hatch { fore, back, .. } => {
-            if hatch_on(x.floor() as i32, y.floor() as i32) {
+        Paint::Hatch { fore, back, style } => {
+            if hatch_foreground(*style, x.floor() as i32, y.floor() as i32) {
                 *fore
             } else {
                 *back

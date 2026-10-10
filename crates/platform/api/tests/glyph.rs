@@ -19,6 +19,7 @@ fn font_metrics_line_height() {
         descent: 4.0,
         line_gap: 2.0,
         units_per_em: 1000.0,
+        ..FontMetrics::default()
     };
     assert_eq!(metrics.line_height(), 18.0);
 }

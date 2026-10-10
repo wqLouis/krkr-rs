@@ -146,11 +146,17 @@ impl GameHost {
         // fast if none exists; a headless host gets the null backend.
         let audio = AudioOutput::open(host.is_headless())?;
         let mut host = Box::new(host);
-        let storage = Box::new(Storage::mount_archives(
-            FileSystem::host(base_dir.clone()),
-            &base_dir,
-            archives,
-        )?);
+        let fs = FileSystem::host(base_dir.clone());
+        // A directory-only launch (no explicit `--archive`) mounts every
+        // `*.xp3` found under the base directory
+        // (`engine::storage::discover_archives`), so the CLI and the Android
+        // launcher can take the game folder instead of each archive.
+        let archives = if archives.is_empty() {
+            engine::storage::discover_archives(&fs, &base_dir)?
+        } else {
+            archives
+        };
+        let storage = Box::new(Storage::mount_archives(fs, &base_dir, archives)?);
         let mut vm = VmHost::with_default()?;
         // SAFETY: `storage` and `host` are declared after `vm` in the returned
         // struct and therefore outlive it; the boxed `host` keeps the scene

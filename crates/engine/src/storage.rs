@@ -16,8 +16,10 @@
 //! only owns the namespace.
 //!
 //! Loading is explicit: the caller supplies the archive list and the loader
-//! never enumerates the game directory. See [`Storage::mount_archives`] /
-//! [`Storage::mount_archive`].
+//! never enumerates the game directory, with one documented exception —
+//! [`discover_archives`], a folder scan a caller opts into by passing only a
+//! directory (the ergonomic path for the CLI and the Android launcher).
+//! See [`Storage::mount_archives`] / [`Storage::mount_archive`].
 //!
 //! Resolution order mirrors the reference engine:
 //!
@@ -835,6 +837,65 @@ impl Storage {
         }
         Ok(())
     }
+}
+
+/// Recursively discovers every `*.xp3` under `base_dir`, in mount order.
+///
+/// This is a documented extension to the reference (D15 / doc 09): the
+/// reference never scans a folder, but a game directory is the ergonomic
+/// input for both the desktop CLI and the Android launcher. The order is
+/// deterministic — file name (case-insensitive), then shallower directories
+/// first, then full path — so `patch.xp3` overrides `data.xp3`, a numbered
+/// `patch2.xp3` overrides `patch.xp3`, and a root archive overrides a nested
+/// one of the same name (later mounts win). Symbolic-link directories are
+/// not followed (the listing reports the link, not its target), so a link
+/// cycle cannot recurse forever.
+///
+/// # Errors
+///
+/// A missing or non-directory subtree contributes nothing; any other listing
+/// failure is returned rather than silently truncating the scan.
+pub fn discover_archives(
+    file_system: &FileSystem,
+    base_dir: &Path,
+) -> Result<Vec<PathBuf>, StorageReadError> {
+    let mut found = Vec::new();
+    discover_archives_inner(file_system, base_dir, &mut found)?;
+    found.sort_by_cached_key(|path| archive_sort_key(path));
+    Ok(found)
+}
+
+fn discover_archives_inner(
+    file_system: &FileSystem,
+    dir: &Path,
+    out: &mut Vec<PathBuf>,
+) -> Result<(), StorageReadError> {
+    let entries = match fs::list(file_system, &FsPath::host(dir)) {
+        Ok(entries) => entries,
+        Err(FsError::NotFound { .. }) | Err(FsError::NotADirectory { .. }) => return Ok(()),
+        Err(error) => return Err(StorageReadError::Fs(error)),
+    };
+    for entry in entries {
+        let child = dir.join(&entry.name);
+        if entry.is_dir {
+            discover_archives_inner(file_system, &child, out)?;
+        } else if entry.name.to_ascii_lowercase().ends_with(".xp3") {
+            out.push(child);
+        }
+    }
+    Ok(())
+}
+
+/// The deterministic archive-discovery sort key: file name (case-insensitive),
+/// then depth reversed so a shallower path sorts last (and therefore mounts
+/// last and wins), then the full path.
+fn archive_sort_key(path: &Path) -> (String, std::cmp::Reverse<usize>, PathBuf) {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    let depth = path.components().count();
+    (name, std::cmp::Reverse(depth), path.to_path_buf())
 }
 
 /// The base storage name (the part after the last `/`).

@@ -4,7 +4,7 @@
 //! synthetic XP3 builder lives in the `testkit` dev crate; the
 //! in-memory file-system helpers live in `tests/common/mod.rs`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use engine::storage::{ATTR_DIRECTORY, ATTR_NORMAL};
 use engine::{Location, Storage, normalize_in_archive_name};
@@ -24,6 +24,42 @@ fn normalize_matches_reference() {
         "data/bg/title.jpg"
     );
     assert_eq!(normalize_in_archive_name("/leading"), "leading");
+}
+
+#[test]
+fn discover_archives_orders_by_name_then_shallower_last() {
+    let fs = memory_with(&[
+        ("game/data.xp3", b""),
+        ("game/patch.xp3", b""),
+        ("game/sub/extra.xp3", b""),
+        ("game/sub/patch.xp3", b""),
+        ("game/readme.txt", b""),
+        ("game/UPPER.XP3", b""),
+    ]);
+    let found = engine::storage::discover_archives(&fs, Path::new("/game")).expect("discover");
+    let names: Vec<String> = found
+        .iter()
+        .map(|path| {
+            path.strip_prefix("/game")
+                .unwrap_or(path)
+                .display()
+                .to_string()
+        })
+        .collect();
+    // Name (case-insensitive) is the primary key; among equal names the
+    // shallower path sorts last (and therefore mounts last and wins). So
+    // `patch.xp3` overrides `data.xp3`, and the root `patch.xp3` overrides
+    // `sub/patch.xp3`; a non-`.xp3` file is ignored.
+    assert_eq!(
+        names,
+        [
+            "data.xp3",
+            "sub/extra.xp3",
+            "sub/patch.xp3",
+            "patch.xp3",
+            "UPPER.XP3",
+        ]
+    );
 }
 
 #[test]

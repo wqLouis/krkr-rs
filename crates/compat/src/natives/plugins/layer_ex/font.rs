@@ -331,22 +331,21 @@ fn metrics(ctx: &CompatCtx, data: &FontData) -> Metrics {
         return zero;
     };
     // Reference `FontInfo::updateSizeParams`
-    // (`reference/cpp/plugins/layerex_draw/windows/LayerExDraw.cpp:362-381`):
-    // `ascent`/`descent` are the cell metrics and `lineSpacing` is
-    // `otmTextMetrics.tmHeight`, which equals `tmAscent + tmDescent` (Win32
-    // cell metrics), so the three stay consistent here. The two *Leading
-    // values need `OUTLINETEXTMETRIC.otmAscent`/`otmDescent` (the highest /
-    // lowest glyph-box extents), which the L2 text engine does not expose —
-    // they stay at their approximation (line gap / zero) rather than
-    // fabricating a metric.
-    let ascent = font_metrics.ascent as f64;
-    let descent = font_metrics.descent as f64;
-    let line_gap = font_metrics.line_gap as f64;
+    // (`reference/cpp/plugins/layerex_draw/windows/LayerExDraw.cpp:373-379`):
+    // `ascent`/`descent` are the Windows cell metrics `tmAscent`/`tmDescent`,
+    // the two leading values are the cell metrics minus the font's maximum
+    // glyph-box extents (`otmAscent`/`otmDescent`), and `lineSpacing` is
+    // `tmHeight`, i.e. `tmAscent + tmDescent`. A face without OS/2 metrics
+    // leaves all five at zero.
+    let ascent = font_metrics.win_ascent as f64;
+    let descent = font_metrics.win_descent as f64;
+    let otm_ascent = font_metrics.otm_ascent as f64;
+    let otm_descent = font_metrics.otm_descent as f64;
     Metrics {
         ascent,
         descent,
-        ascent_leading: line_gap,
-        descent_leading: 0.0,
+        ascent_leading: ascent - otm_ascent,
+        descent_leading: descent + otm_descent,
         line_spacing: ascent + descent,
     }
 }

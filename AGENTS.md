@@ -303,8 +303,7 @@ Two-sided tests:
     body (no IIFE wrappers); use a named function, call it, delete it.
 11. `Layer.id`/`nativeId`, `Bitmap.id`, `Window.id`, `Font.id` do not exist by
     design; identify through real members or the L2 `Scene`.
-12. `--base-dir`/`--archive` loading is explicit; there is **no** folder scan
-    for `*.xp3` in the reference (D15).
+12. Loading is explicit (`--archive`, repeatable; later wins). There is **no** folder scan in the reference (D15), but D35 adds one opt-in exception: a directory-only launch (`--base-dir`/positional dir, no `--archive`) mounts every `*.xp3` found recursively (`engine::storage::discover_archives`).
 
 ---
 

@@ -49,6 +49,20 @@ pub fn create_font_system() -> FontSystem {
 pub struct Font {
     face: FontVec,
     collection_index: u32,
+    os2: Option<Os2Metrics>,
+}
+
+/// The OS/2 metrics the outline-text-metric interface reads, in design units.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Os2Metrics {
+    /// `usWinAscent`.
+    win_ascent: u16,
+    /// `usWinDescent`, taken as its magnitude the way the platform does.
+    win_descent: u16,
+    /// `sTypoAscender`.
+    typo_ascent: i16,
+    /// `sTypoDescender`.
+    typo_descent: i16,
 }
 
 impl Font {
@@ -85,6 +99,16 @@ impl fmt::Debug for Font {
 /// `index` is out of range.
 pub fn load_font(fs: &FontSystem, bytes: &[u8], index: u32) -> Result<Font, GlyphError> {
     let _ = fs;
+    let parsed =
+        ttf_parser::Face::parse(bytes, index).map_err(|error| GlyphError::InvalidFont {
+            message: error.to_string(),
+        })?;
+    let os2 = parsed.tables().os2.map(|table| Os2Metrics {
+        win_ascent: table.windows_ascender() as u16,
+        win_descent: table.windows_descender().unsigned_abs(),
+        typo_ascent: table.typographic_ascender(),
+        typo_descent: table.typographic_descender(),
+    });
     let face = FontVec::try_from_vec_and_index(bytes.to_vec(), index).map_err(|error| {
         GlyphError::InvalidFont {
             message: error.to_string(),
@@ -93,6 +117,7 @@ pub fn load_font(fs: &FontSystem, bytes: &[u8], index: u32) -> Result<Font, Glyp
     Ok(Font {
         face,
         collection_index: index,
+        os2,
     })
 }
 
@@ -231,7 +256,8 @@ pub fn glyph_advance(
 ///
 /// `descent` is reported as a positive distance below the baseline, matching
 /// [`FontMetrics`]; `units_per_em` falls back to `1000` when the face does not
-/// expose it. A non-positive or non-finite `size_px` yields
+/// expose it. The outline metrics come from the face's OS/2 table and stay
+/// zero for a face without one. A non-positive or non-finite `size_px` yields
 /// [`FontMetrics::default`].
 pub fn font_metrics(fs: &FontSystem, font: &Font, size_px: f32) -> FontMetrics {
     let _ = fs;
@@ -240,12 +266,27 @@ pub fn font_metrics(fs: &FontSystem, font: &Font, size_px: f32) -> FontMetrics {
     }
     let scale = px_scale_for_height(font.face(), size_px);
     let scaled = font.face().as_scaled(scale);
-    FontMetrics {
+    let units_per_em = font.face().units_per_em().unwrap_or(1000.0);
+    let mut metrics = FontMetrics {
         ascent: scaled.ascent(),
         descent: -scaled.descent(),
         line_gap: scaled.line_gap(),
-        units_per_em: font.face().units_per_em().unwrap_or(1000.0),
+        units_per_em,
+        ..FontMetrics::default()
+    };
+    if let Some(os2) = font.os2 {
+        let px_per_unit = size_px / units_per_em;
+        metrics.otm_ascent = f32::from(os2.typo_ascent) * px_per_unit;
+        metrics.otm_descent = f32::from(os2.typo_descent) * px_per_unit;
+        if os2.win_ascent == 0 && os2.win_descent == 0 {
+            metrics.win_ascent = metrics.ascent;
+            metrics.win_descent = metrics.descent;
+        } else {
+            metrics.win_ascent = f32::from(os2.win_ascent) * px_per_unit;
+            metrics.win_descent = f32::from(os2.win_descent) * px_per_unit;
+        }
     }
+    metrics
 }
 
 /// Converts an em size in pixels into an `ab_glyph` [`PxScale`].

@@ -2108,6 +2108,7 @@ dependencies = [
  "raw-window-handle",
  "testkit",
  "thiserror 2.0.20",
+ "ttf-parser",
 ]
 
 [[package]]

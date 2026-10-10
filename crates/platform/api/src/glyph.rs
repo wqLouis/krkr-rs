@@ -72,9 +72,14 @@ impl GlyphBitmap {
 }
 
 /// Scaled metrics for a font at a given pixel size.
+///
+/// `ascent`/`descent`/`line_gap` describe the face's typographic line box and
+/// feed layout. `otm_ascent`/`otm_descent` are the font's maximum glyph-box
+/// extents and `win_ascent`/`win_descent` are its Windows cell metrics; both
+/// pairs are what the outline-text-metric interface reports.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct FontMetrics {
-    /// Distance above the baseline, in pixels.
+    /// Distance above the baseline, in pixels (the face ascender).
     pub ascent: f32,
     /// Distance below the baseline, in pixels (typically positive).
     pub descent: f32,
@@ -82,6 +87,22 @@ pub struct FontMetrics {
     pub line_gap: f32,
     /// Font design units per em.
     pub units_per_em: f32,
+    /// `OUTLINETEXTMETRIC.otmAscent`, in pixels: the maximum ascent above the
+    /// baseline. Zero when the face carries no OS/2 metrics.
+    pub otm_ascent: f32,
+    /// `OUTLINETEXTMETRIC.otmDescent`, in pixels: the maximum descent below the
+    /// baseline; negative for a face with OS/2 metrics, zero otherwise.
+    pub otm_descent: f32,
+    /// `OUTLINETEXTMETRIC.otmTextMetrics.tmAscent`, in pixels: the Windows
+    /// cell ascent above the baseline. Falls back to [`FontMetrics::ascent`]
+    /// when the face's OS/2 Windows cell metrics are both zero, and is zero
+    /// when the face carries no OS/2 table.
+    pub win_ascent: f32,
+    /// `OUTLINETEXTMETRIC.otmTextMetrics.tmDescent`, in pixels: the Windows
+    /// cell descent below the baseline, positive. Falls back to
+    /// [`FontMetrics::descent`] when the face's OS/2 Windows cell metrics are
+    /// both zero, and is zero when the face carries no OS/2 table.
+    pub win_descent: f32,
 }
 
 impl FontMetrics {

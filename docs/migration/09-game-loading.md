@@ -31,7 +31,10 @@ krkr --archive data.xp3 --archive patch.xp3 [--base-dir DIR] [GAME]
   (`environ/linux/Platform.cpp:285`, `environ/apple/macos/platform.mm:208`,
   `environ/android/AndroidUtils.cpp:695`). We never enumerate a folder for
   `*.xp3`; a `startup.tjs` inside a mounted archive is found by the normal
-  storage search (§5), not by a scan.
+  storage search (§5), not by a scan. *(Amended by D35: a directory-only
+  launch — `--base-dir`/positional directory with no `--archive` — opts into a
+  recursive `*.xp3` scan (`engine::storage::discover_archives`) as a documented
+  ergonomic extension; explicit `--archive` entries suppress it.)*
 * `key=value` arguments become command-line config
   (`TVPSetCommandLine` semantics).
 
@@ -56,10 +59,20 @@ path is the same from any working directory. This is the "app path"
 Disk files still win over archive entries (unchanged rule from the current
 `Storage::find`).
 
+**Directory scan (D35).** When no `--archive` is given, the base directory is
+recursively scanned for `*.xp3` and those archives are mounted, so a game
+folder is a complete input (`krkr --base-dir /path/to/game`, or
+`krkr /path/to/game`). `engine::storage::discover_archives` orders them by
+file name (case-insensitive), then shallower-first, so `patch.xp3` overrides
+`data.xp3` and a root archive overrides a nested one of the same name; the
+scan is followed by `Storage::mount_archives`, whose later-wins rule applies.
+Explicit `--archive` entries are mounted instead of the scan (the explicit
+list is authoritative). Symbolic-link directories are not followed.
+
 ## 3. Mounting
 
-L2 mounts the explicit archives; it does **not** call `discover_archives`.
-Each mount:
+L2 mounts the resolved archive list: the explicit `--archive` entries, or the
+result of `discover_archives` (D35) when none are given. Each mount:
 
 ```
 L2 Storage::mount_archive(path)

@@ -418,7 +418,7 @@ fn appearance_supports_solid_and_hatch_brushes() {
 
     // A hatch brush paints both fore and back colours.
     env.run(
-        "app.addBrush(%[type: 1, hatchStyle: 0, foreColor: 0xFFFF0000, backColor: 0xFF0000FF], 0, 0); \
+        "app.addBrush(%[type: 1, hatchStyle: 2, foreColor: 0xFFFF0000, backColor: 0xFF0000FF], 0, 0); \
          dst.drawRectangle(app, 0, 0, 4, 4);",
     );
     let mut red = 0;
@@ -598,6 +598,57 @@ fn font_info_properties_work() {
     env.run("f.familyName = 'Other'; f.emSize = 12; f.style = 1; f.forceSelfPathDraw = true;");
     assert_eq!(env.eval_int("f.forceSelfPathDraw == 1"), 1);
     assert_eq!(env.eval_int("f.style == 1"), 1);
+}
+
+/// The five `FontInfo` metrics follow `FontInfo::updateSizeParams`
+/// (`reference/cpp/plugins/layerex_draw/windows/LayerExDraw.cpp:373-379`):
+/// `ascent`/`descent` are the Windows cell metrics, `lineSpacing` is their
+/// sum (`tmHeight`), and the leading values are the cell metrics minus the
+/// font's maximum glyph-box extents. The host font decides the absolute
+/// numbers, so the test compares against the same L1 metrics the plugin reads
+/// instead of hard-coding values.
+#[test]
+fn fontinfo_metrics_follow_the_reference_formulas() {
+    let Some((dir, name)) = test_font() else {
+        return;
+    };
+    let bytes = std::fs::read(dir.join(&name)).expect("read the test font");
+    let mut engine = engine::text::TextEngine::new();
+    let id = engine.add_font(&bytes, 0).expect("register the test font");
+    let l1 = engine.font_metrics(id, 16.0).expect("font metrics");
+
+    let _lock = vm_lock();
+    let storage = Storage::mount_archives(
+        FileSystem::host(&dir),
+        dir.clone(),
+        std::iter::empty::<&str>(),
+    )
+    .expect("mount font directory");
+    let env = FontEnv::new(Some(storage));
+    env.run(&format!("var f = new FontInfo('{name}', 16, 0);"));
+
+    let ascent = env.eval_real("f.ascent");
+    let descent = env.eval_real("f.descent");
+    let ascent_leading = env.eval_real("f.ascentLeading");
+    let descent_leading = env.eval_real("f.descentLeading");
+    let line_spacing = env.eval_real("f.lineSpacing");
+
+    assert!(ascent > 0.0, "the face should expose cell metrics");
+    // tmHeight == tmAscent + tmDescent.
+    assert_eq!(line_spacing, ascent + descent);
+    // tmAscent/tmDescent are the OS/2 Windows cell metrics.
+    assert_eq!(ascent, f64::from(l1.win_ascent));
+    assert_eq!(descent, f64::from(l1.win_descent));
+    // ascentLeading = tmAscent - otmAscent; descentLeading = tmDescent +
+    // otmDescent (`otmDescent` is negative).
+    assert_eq!(
+        ascent_leading,
+        f64::from(l1.win_ascent) - f64::from(l1.otm_ascent)
+    );
+    assert_eq!(
+        descent_leading,
+        f64::from(l1.win_descent) + f64::from(l1.otm_descent)
+    );
 }
 
 #[test]
