@@ -302,3 +302,87 @@ pub(crate) fn children_are_sorted(scene: &RenderScene, children: &[RenderNodeId]
         .windows(2)
         .all(|pair| child_sort_key(scene, pair[0]) <= child_sort_key(scene, pair[1]))
 }
+
+/// Returns `(node_space, content_space)` for `node` under `parent`.
+///
+/// `node_space` places the node's children in the target space: the node's own
+/// transform is applied first, then the inherited `parent` transform.
+/// `content_space` additionally maps the unit quad onto the node's `dst`
+/// rectangle in logical space before `node_space` moves it to the target, so a
+/// presentation transform scales the rectangle's origin and extent together.
+pub(crate) fn node_spaces(node: &RenderNode, parent: &Affine2) -> (Affine2, Affine2) {
+    let node_space = node.transform.to_affine().then(parent);
+    let content_space = place_rect(&node.dst).then(&node_space);
+    (node_space, content_space)
+}
+
+/// Maps the unit quad onto `rect` in the parent's coordinate space.
+fn place_rect(rect: &RectF) -> Affine2 {
+    Affine2 {
+        m11: rect.width,
+        m12: 0.0,
+        m21: 0.0,
+        m22: rect.height,
+        tx: rect.x,
+        ty: rect.y,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_close(actual: (f32, f32), expected: (f32, f32)) {
+        assert!(
+            (actual.0 - expected.0).abs() < 1e-3 && (actual.1 - expected.1).abs() < 1e-3,
+            "expected {expected:?}, got {actual:?}"
+        );
+    }
+
+    #[test]
+    fn presentation_view_scales_the_dst_origin_and_extent() {
+        // A 4:3 design shown in a 16:9 frame letterboxes with a uniform
+        // scale and a centred horizontal offset (cocos2d SHOW_ALL).
+        // reference/cpp/core/environ/cocos2d/AppDelegate.cpp:73-75
+        // docs/migration/04-renderer-vulkan.md §6.1
+        let view = ViewTransform {
+            scale: (1.8, 1.8),
+            offset: (240.0, 0.0),
+        };
+        let node = RenderNode {
+            dst: RectF::new(100.0, 50.0, 200.0, 100.0),
+            ..RenderNode::default()
+        };
+        let (_node_space, content) = node_spaces(&node, &view.to_affine());
+        assert_close(content.transform_point((0.0, 0.0)), (420.0, 90.0));
+        assert_close(content.transform_point((1.0, 1.0)), (780.0, 270.0));
+    }
+
+    #[test]
+    fn node_transform_is_applied_before_the_parent() {
+        // reference/cpp/core/environ/cocos2d/MainScene.cpp:436-441
+        let parent = Affine2::scale(2.0, 2.0);
+        let node = RenderNode {
+            transform: Transform2D {
+                translate: (10.0, 0.0),
+                ..Transform2D::IDENTITY
+            },
+            dst: RectF::new(0.0, 0.0, 1.0, 1.0),
+            ..RenderNode::default()
+        };
+        let (node_space, content) = node_spaces(&node, &parent);
+        assert_close(node_space.transform_point((0.0, 0.0)), (20.0, 0.0));
+        assert_close(content.transform_point((0.0, 0.0)), (20.0, 0.0));
+    }
+
+    #[test]
+    fn identity_parent_leaves_the_dst_rect_untouched() {
+        let node = RenderNode {
+            dst: RectF::new(7.0, 11.0, 13.0, 17.0),
+            ..RenderNode::default()
+        };
+        let (_node_space, content) = node_spaces(&node, &Affine2::IDENTITY);
+        assert_close(content.transform_point((0.0, 0.0)), (7.0, 11.0));
+        assert_close(content.transform_point((1.0, 1.0)), (20.0, 28.0));
+    }
+}

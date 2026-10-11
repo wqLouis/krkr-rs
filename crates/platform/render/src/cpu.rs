@@ -20,7 +20,8 @@ use api::geometry::{Affine2, PixelRegion, RectF};
 
 use crate::MAX_TRAVERSAL_DEPTH;
 use crate::scene::{
-    Clip, RenderContent, RenderNode, RenderNodeId, RenderScene, child_sort_key, children_are_sorted,
+    Clip, RenderContent, RenderNode, RenderNodeId, RenderScene, child_sort_key,
+    children_are_sorted, node_spaces,
 };
 use crate::texture::TextureFormat;
 
@@ -538,25 +539,6 @@ fn sample_texture(view: &CpuTexture<'_>, u: f64, v: f64, tint: [f32; 4]) -> [f32
             out[3] * tint[3],
         ],
         TextureFormat::R8Unorm => out,
-    }
-}
-
-/// Returns `(node_space, content_space)` for `node` under `parent`.
-fn node_spaces(node: &RenderNode, parent: &Affine2) -> (Affine2, Affine2) {
-    let node_space = parent.then(&node.transform.to_affine());
-    let content_space = node_space.then(&place_rect(&node.dst));
-    (node_space, content_space)
-}
-
-/// Maps the unit quad onto `rect` in the parent's coordinate space.
-fn place_rect(rect: &RectF) -> Affine2 {
-    Affine2 {
-        m11: rect.width,
-        m12: 0.0,
-        m21: 0.0,
-        m22: rect.height,
-        tx: rect.x,
-        ty: rect.y,
     }
 }
 

@@ -22,7 +22,8 @@ use super::pipelines::{PipelineSet, Program};
 use super::texture::VulkanTexture;
 use crate::MAX_TRAVERSAL_DEPTH;
 use crate::scene::{
-    Clip, RenderContent, RenderNode, RenderNodeId, RenderScene, child_sort_key, children_are_sorted,
+    Clip, RenderContent, RenderNode, RenderNodeId, RenderScene, child_sort_key,
+    children_are_sorted, node_spaces,
 };
 
 /// Push-constant block shared with the shaders (96 bytes).
@@ -314,28 +315,6 @@ impl Recorder<'_> {
         } else {
             channel
         }
-    }
-}
-
-/// Returns `(node_space, content_space)` for `node` under `parent`.
-///
-/// `node_space` is where the node's children live; `content_space` additionally
-/// maps the unit quad onto the node's `dst` rectangle.
-fn node_spaces(node: &RenderNode, parent: &Affine2) -> (Affine2, Affine2) {
-    let node_space = parent.then(&node.transform.to_affine());
-    let content_space = node_space.then(&place_rect(&node.dst));
-    (node_space, content_space)
-}
-
-/// Maps the unit quad onto `rect` in the parent's coordinate space.
-fn place_rect(rect: &RectF) -> Affine2 {
-    Affine2 {
-        m11: rect.width,
-        m12: 0.0,
-        m21: 0.0,
-        m22: rect.height,
-        tx: rect.x,
-        ty: rect.y,
     }
 }
 
