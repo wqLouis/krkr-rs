@@ -1,7 +1,11 @@
-//! Reference-behaviour parity tests for the `LayerEx*` plugin family:
-//! `LayerExBase`, `LayerExPerspective`, `LayerExMovie` and the GDI+
-//! `LayerExDraw` value types (`PointF`/`RectF`/`FontInfo`/`Appearance`/
-//! `Path`).
+//! Reference-behaviour parity tests for the `layerExDraw` plugin family:
+//! the GDI+ `GdiPlus` namespace value types
+//! (`GdiPlus.PointF`/`GdiPlus.RectF`/`GdiPlus.Font`/`GdiPlus.Appearance`/
+//! `GdiPlus.Path`) and the `Layer.perspectiveCopy` / movie members.
+//!
+//! `LayerExBase` / `LayerExMovie` / `LayerExPerspective` are not TJS classes
+//! in the reference (`reference/cpp/plugins/layerExPerspective.cpp:255-296`),
+//! so they are absent from the script surface.
 //!
 //! Every test states the **KiriKiri (reference C++) expectation** with a
 //! `reference/cpp/**` citation above the assertion it pins, exactly like
@@ -25,14 +29,9 @@
 //!   reference-exact.
 //! * The reference `RectF.Union` is the *static* `static bool
 //!   Union(RectF &ret, const RectF &a, const RectF &b)`
-//!   (`reference/cpp/plugins/layerex_draw/windows/main.cpp:210`), which NCB
-//!   registers with `TJS_STATICMEMBER`; a static class member is not copied
-//!   onto instances (`reference/cpp/core/tjs2/tjsNative.cpp:347-365`). The
-//!   port's earlier *instance* `Union` (`geom.rs`'s `rect_union`, asserted
-//!   by `crates/compat/tests/layer_ex.rs:366`) is shadowed by that static
-//!   member and is not reference surface; that stale assertion is outside
-//!   this file's edit scope and must be changed to the class-level form
-//!   pinned below.
+//!   (`reference/cpp/plugins/layerex_draw/windows/main.cpp:210`), registered
+//!   with `TJS_STATICMEMBER`, so it is reachable only as
+//!   `GdiPlus.RectF.Union`.
 
 mod common;
 
@@ -157,6 +156,59 @@ fn two_layers(env: &Env) {
 }
 
 // ---------------------------------------------------------------------------
+// GdiPlus namespace shape (gdiplus.rs)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn gdiplus_namespace_matches_the_reference_shape() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    // `NCB_REGISTER_CLASS(GdiPlus)` publishes exactly one global class object
+    // (`reference/cpp/plugins/layerex_draw/blend2d/LayerExDraw.cpp:3463`).
+    assert_eq!(env.eval_int("typeof GdiPlus == 'Object'"), 1);
+    // `NCB_SUBCLASS` attaches a class as a member of the enclosing class
+    // object and never publishes it globally
+    // (`reference/cpp/core/plugin/ncbind.hpp:1792-1799,1963-1990`).
+    for name in ["PointF", "RectF", "Path", "Appearance", "Font"] {
+        let expression = format!("typeof GdiPlus.{name} == 'Object'");
+        assert_eq!(env.eval_int(&expression), 1, "GdiPlus.{name} must exist");
+    }
+    // C++ `FontInfo` is script-visible as `GdiPlus.Font`
+    // (`reference/cpp/plugins/layerex_draw/blend2d/LayerExDraw.cpp:3648`);
+    // the bare registration globals must be gone.
+    for name in ["PointF", "RectF", "Path", "Appearance", "FontInfo"] {
+        // A bare `typeof <absent>` raises in this VM; a `global.` member read
+        // reports absence as `"undefined"`.
+        let expression = format!("typeof global.{name} == 'undefined'");
+        assert_eq!(env.eval_int(&expression), 1, "{name} must not be global");
+    }
+    // `LayerExBase` / `LayerExMovie` / `LayerExPerspective` are internal
+    // native-instance bases, not TJS classes
+    // (`reference/cpp/plugins/layerExPerspective.cpp:255-296`).
+    for name in ["LayerExBase", "LayerExMovie", "LayerExPerspective"] {
+        let expression = format!("typeof global.{name} == 'undefined'");
+        assert_eq!(env.eval_int(&expression), 1, "{name} must not exist");
+    }
+}
+
+#[test]
+fn gdiplus_publishes_the_reference_enum_constants() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    // `ENUM(n)` is `Variant(#n, (int)n)`
+    // (`reference/cpp/plugins/layerex_draw/blend2d/LayerExDraw.cpp:3461`);
+    // the values come from the blend2d enum definitions
+    // (`reference/cpp/plugins/layerex_draw/blend2d/LayerExDraw.hpp:65-262`).
+    assert_eq!(env.eval_int("GdiPlus.Ok"), 0);
+    assert_eq!(env.eval_int("GdiPlus.ProfileNotFound"), 21);
+    assert_eq!(env.eval_int("GdiPlus.BrushTypeHatchFill"), 1);
+    assert_eq!(env.eval_int("GdiPlus.HatchStyleDiagonalBrick"), 38);
+    assert_eq!(env.eval_int("GdiPlus.SmoothingModeInvalid"), -1);
+    assert_eq!(env.eval_int("GdiPlus.LineCapDiamondAnchor"), 19);
+    assert_eq!(env.eval_int("GdiPlus.TextRenderingHintClearTypeGridFit"), 5);
+}
+
+// ---------------------------------------------------------------------------
 // PointF (geom.rs)
 // ---------------------------------------------------------------------------
 
@@ -168,10 +220,10 @@ fn pointf_constructor_requires_two_arguments() {
     // registers `NCB_CONSTRUCTOR((REAL, REAL))`; NCB rejects a call below
     // the declared parameter count (`reference/cpp/core/plugin/ncbind.hpp:1178`).
     assert!(
-        env.try_run("new PointF(1);").is_err(),
-        "`new PointF(1)` must raise"
+        env.try_run("new GdiPlus.PointF(1);").is_err(),
+        "`new GdiPlus.PointF(1)` must raise"
     );
-    env.run("var p = new PointF(1, 2);");
+    env.run("var p = new GdiPlus.PointF(1, 2);");
     assert_eq!(env.eval_real("p.x"), 1.0);
     assert_eq!(env.eval_real("p.y"), 2.0);
 }
@@ -183,7 +235,7 @@ fn pointf_components_are_settable_reals() {
     // reference/cpp/plugins/layerex_draw/blend2d/LayerExDraw.hpp:341-342
     // (`PointF(tjs_real _x, tjs_real _y)`) and main.cpp:135-136 register
     // `x`/`y` as `REAL` member properties.
-    env.run("var p = new PointF(1.5, 2.5); p.x = 3; p.y = 4.5;");
+    env.run("var p = new GdiPlus.PointF(1.5, 2.5); p.x = 3; p.y = 4.5;");
     assert_eq!(env.eval_real("p.x"), 3.0);
     assert_eq!(env.eval_real("p.y"), 4.5);
 }
@@ -195,18 +247,18 @@ fn pointf_equals_compares_components_exactly() {
     // reference/cpp/plugins/layerex_draw/blend2d/LayerExDraw.hpp:344
     // (`bool Equals(PointF tgt) { return x == tgt.x && y == tgt.y; }`).
     assert_eq!(
-        env.eval_int("(new PointF(1, 2)).Equals(new PointF(1, 2))"),
+        env.eval_int("(new GdiPlus.PointF(1, 2)).Equals(new GdiPlus.PointF(1, 2))"),
         1
     );
     assert_eq!(
-        env.eval_int("(new PointF(1, 2)).Equals(new PointF(1, 3))"),
+        env.eval_int("(new GdiPlus.PointF(1, 2)).Equals(new GdiPlus.PointF(1, 3))"),
         0
     );
     // A non-object argument converts to the default `PointF()` (0, 0)
     // (`reference/cpp/plugins/layerex_draw/windows/main.cpp:98-100`).
-    assert_eq!(env.eval_int("(new PointF(0, 0)).Equals(5)"), 1);
+    assert_eq!(env.eval_int("(new GdiPlus.PointF(0, 0)).Equals(5)"), 1);
     // NCB requires the one parameter (`reference/cpp/core/plugin/ncbind.hpp:1178`).
-    assert!(env.try_run("(new PointF(1, 2)).Equals();").is_err());
+    assert!(env.try_run("(new GdiPlus.PointF(1, 2)).Equals();").is_err());
 }
 
 // ---------------------------------------------------------------------------
@@ -220,8 +272,8 @@ fn rectf_constructor_requires_four_arguments() {
     // reference/cpp/plugins/layerex_draw/windows/main.cpp:181-182
     // (`NCB_CONSTRUCTOR((REAL, REAL, REAL, REAL))`) with the NCB minimum
     // check (`reference/cpp/core/plugin/ncbind.hpp:1178`).
-    assert!(env.try_run("new RectF(1, 2, 3);").is_err());
-    env.run("var r = new RectF(1, 2, 3, 4);");
+    assert!(env.try_run("new GdiPlus.RectF(1, 2, 3);").is_err());
+    env.run("var r = new GdiPlus.RectF(1, 2, 3, 4);");
     assert_eq!(env.eval_real("r.x"), 1.0);
     assert_eq!(env.eval_real("r.y"), 2.0);
     assert_eq!(env.eval_real("r.width"), 3.0);
@@ -235,7 +287,7 @@ fn rectf_derived_edges_and_location() {
     // reference/cpp/plugins/layerex_draw/blend2d/LayerExDraw.hpp:363-367:
     // `GetLeft/GetTop/GetRight/GetBottom` and `GetLocation` are read-only
     // members (`windows/main.cpp:189-192`).
-    env.run("var r = new RectF(1, 2, 3, 4);");
+    env.run("var r = new GdiPlus.RectF(1, 2, 3, 4);");
     assert_eq!(env.eval_real("r.left"), 1.0);
     assert_eq!(env.eval_real("r.top"), 2.0);
     assert_eq!(env.eval_real("r.right"), 4.0);
@@ -250,16 +302,16 @@ fn rectf_clone_and_equals_copy_the_components() {
     let env = Env::new();
     // reference/cpp/plugins/layerex_draw/blend2d/LayerExDraw.hpp:369-373
     // (`Clone`/`Equals`), registered at `windows/main.cpp:193,199`.
-    env.run("var r = new RectF(1, 2, 3, 4); var c = r.Clone();");
+    env.run("var r = new GdiPlus.RectF(1, 2, 3, 4); var c = r.Clone();");
     assert_eq!(
         env.eval_int("c.x == 1 && c.y == 2 && c.width == 3 && c.height == 4"),
         1
     );
     assert_eq!(env.eval_int("r.Equals(c)"), 1);
-    assert_eq!(env.eval_int("r.Equals(new RectF(0, 0, 0, 0))"), 0);
+    assert_eq!(env.eval_int("r.Equals(new GdiPlus.RectF(0, 0, 0, 0))"), 0);
     // A non-object argument converts to the default `RectF()`
     // (`reference/cpp/plugins/layerex_draw/windows/main.cpp:171-173`).
-    assert_eq!(env.eval_int("(new RectF(0, 0, 0, 0)).Equals(5)"), 1);
+    assert_eq!(env.eval_int("(new GdiPlus.RectF(0, 0, 0, 0)).Equals(5)"), 1);
 }
 
 #[test]
@@ -269,7 +321,7 @@ fn rectf_inflate_and_offset_mutate_in_place() {
     // reference/cpp/plugins/layerex_draw/blend2d/LayerExDraw.hpp:373-388:
     // `Inflate` grows by `(width, height)` on every side and `Offset` shifts
     // the origin.
-    env.run("var r = new RectF(1, 2, 3, 4); r.Inflate(1, 1);");
+    env.run("var r = new GdiPlus.RectF(1, 2, 3, 4); r.Inflate(1, 1);");
     assert_eq!(env.eval_real("r.x"), 0.0);
     assert_eq!(env.eval_real("r.y"), 1.0);
     assert_eq!(env.eval_real("r.width"), 5.0);
@@ -280,7 +332,7 @@ fn rectf_inflate_and_offset_mutate_in_place() {
     // `InflatePoint(point)` is `Inflate(point.x, point.y)`
     // (`reference/cpp/plugins/layerex_draw/blend2d/LayerExDraw.hpp:379`,
     // registered at `windows/main.cpp:201-202`).
-    env.run("var q = new RectF(1, 1, 2, 2); q.InflatePoint(new PointF(1, 2));");
+    env.run("var q = new GdiPlus.RectF(1, 1, 2, 2); q.InflatePoint(new GdiPlus.PointF(1, 2));");
     assert_eq!(env.eval_real("q.x"), 0.0);
     assert_eq!(env.eval_real("q.y"), -1.0);
     assert_eq!(env.eval_real("q.width"), 4.0);
@@ -293,11 +345,23 @@ fn rectf_intersection_and_empty_predicates() {
     let env = Env::new();
     // reference/cpp/plugins/layerex_draw/blend2d/LayerExDraw.hpp:380-384
     // (`IntersectsWith` / `IsEmptyArea`), registered at `windows/main.cpp:203-204`.
-    env.run("var r = new RectF(0, 0, 2, 2);");
-    assert_eq!(env.eval_int("r.IntersectsWith(new RectF(1, 1, 2, 2))"), 1);
-    assert_eq!(env.eval_int("r.IntersectsWith(new RectF(5, 5, 1, 1))"), 0);
-    assert_eq!(env.eval_int("(new RectF(0, 0, 0, 1)).IsEmptyArea()"), 1);
-    assert_eq!(env.eval_int("(new RectF(0, 0, 1, 1)).IsEmptyArea()"), 0);
+    env.run("var r = new GdiPlus.RectF(0, 0, 2, 2);");
+    assert_eq!(
+        env.eval_int("r.IntersectsWith(new GdiPlus.RectF(1, 1, 2, 2))"),
+        1
+    );
+    assert_eq!(
+        env.eval_int("r.IntersectsWith(new GdiPlus.RectF(5, 5, 1, 1))"),
+        0
+    );
+    assert_eq!(
+        env.eval_int("(new GdiPlus.RectF(0, 0, 0, 1)).IsEmptyArea()"),
+        1
+    );
+    assert_eq!(
+        env.eval_int("(new GdiPlus.RectF(0, 0, 1, 1)).IsEmptyArea()"),
+        0
+    );
 }
 
 #[test]
@@ -310,10 +374,10 @@ fn rectf_static_union_writes_the_target_and_returns_true() {
     // first argument is overwritten with the bounding rectangle and the call
     // returns `true` (TJS integer 1).
     env.run(
-        "var ret = new RectF(0, 0, 0, 0); \
-         var a = new RectF(1, 2, 3, 4); \
-         var b = new RectF(5, 6, 7, 8); \
-         var ok = RectF.Union(ret, a, b);",
+        "var ret = new GdiPlus.RectF(0, 0, 0, 0); \
+         var a = new GdiPlus.RectF(1, 2, 3, 4); \
+         var b = new GdiPlus.RectF(5, 6, 7, 8); \
+         var ok = GdiPlus.RectF.Union(ret, a, b);",
     );
     assert_eq!(env.eval_int("ok"), 1);
     assert_eq!(env.eval_real("ret.x"), 1.0);
@@ -333,8 +397,8 @@ fn fontinfo_constructor_requires_three_arguments() {
     // reference/cpp/plugins/layerex_draw/windows/main.cpp:583-584 registers
     // `NCB_CONSTRUCTOR((const tjs_char *, REAL, INT))`; NCB rejects a
     // shorter call (`reference/cpp/core/plugin/ncbind.hpp:1178`).
-    assert!(env.try_run("new FontInfo('A', 12);").is_err());
-    env.run("var f = new FontInfo('A', 12, 1);");
+    assert!(env.try_run("new GdiPlus.Font('A', 12);").is_err());
+    env.run("var f = new GdiPlus.Font('A', 12, 1);");
     assert_eq!(env.eval_real("f.emSize"), 12.0);
     assert_eq!(env.eval_int("f.style"), 1);
 }
@@ -346,7 +410,7 @@ fn fontinfo_property_types() {
     // `getStyle` returns `INT` and `getEmSize` returns `REAL`
     // (`reference/cpp/plugins/layerex_draw/windows/LayerExDraw.hpp:77-84`,
     // registered at `windows/main.cpp:585-587`).
-    env.run("var f = new FontInfo('A', 12.5, 3);");
+    env.run("var f = new GdiPlus.Font('A', 12.5, 3);");
     assert!(matches!(env.eval_ok("f.style"), TjsValue::Integer(3)));
     assert!(matches!(env.eval_ok("f.emSize"), TjsValue::Real(_)));
     // `forceSelfPathDraw` defaults to `false`
@@ -367,7 +431,7 @@ fn fontinfo_metrics_are_reals() {
     // (`reference/cpp/plugins/layerex_draw/windows/LayerExDraw.cpp:384-405`,
     // registered as read-only at `windows/main.cpp:588-592`). With no face
     // registered they read as 0 rather than fabricating a metric.
-    env.run("var f = new FontInfo('GhostFamily', 16, 0);");
+    env.run("var f = new GdiPlus.Font('GhostFamily', 16, 0);");
     for member in [
         "ascent",
         "descent",
@@ -397,14 +461,14 @@ fn appearance_mutators_require_their_declared_arity() {
     // (`reference/cpp/plugins/layerex_draw/windows/LayerExDraw.cpp:767,778`
     // and `reference/cpp/core/plugin/ncbind.hpp:1178`).
     assert!(
-        env.try_run("(new Appearance()).addBrush(0xFFFF0000);")
+        env.try_run("(new GdiPlus.Appearance()).addBrush(0xFFFF0000);")
             .is_err()
     );
     assert!(
-        env.try_run("(new Appearance()).addPen(0xFFFF0000, 1);")
+        env.try_run("(new GdiPlus.Appearance()).addPen(0xFFFF0000, 1);")
             .is_err()
     );
-    env.run("var app = new Appearance(); app.addBrush(0xFFFF0000, 0, 0); app.addPen(0xFF00FF00, 1, 0, 0);");
+    env.run("var app = new GdiPlus.Appearance(); app.addBrush(0xFFFF0000, 0, 0); app.addPen(0xFF00FF00, 1, 0, 0);");
 }
 
 #[test]
@@ -416,7 +480,7 @@ fn appearance_clear_empties_the_draw_list() {
     // `Appearance::clear` drops every brush/pen
     // (`reference/cpp/plugins/layerex_draw/windows/LayerExDraw.cpp:422-426`).
     env.run(
-        "var app = new Appearance(); \
+        "var app = new GdiPlus.Appearance(); \
          app.addBrush(0xFFFF0000, 0, 0); \
          app.clear(); \
          dst.clear(0); \
@@ -434,19 +498,19 @@ fn appearance_color_arguments_follow_create_dictionary_defaults() {
 
     // A non-object colour is cast with `Color((tjs_int)colorOrBrush)`
     // (`reference/cpp/plugins/layerex_draw/windows/LayerExDraw.cpp:626-637`).
-    env.run("dst.clear(0); var app = new Appearance(); app.addBrush(0xFFFF0000, 0, 0); dst.drawRectangle(app, 0, 0, 4, 4);");
+    env.run("dst.clear(0); var app = new GdiPlus.Appearance(); app.addBrush(0xFFFF0000, 0, 0); dst.drawRectangle(app, 0, 0, 4, 4);");
     assert_eq!(env.pixel(dst, 1, 1), [255, 0, 0, 255]);
 
     // A string goes through `TJSStringToInteger`, so a hex spelling parses
     // (`reference/cpp/core/tjs2/tjsVariant.cpp:301-307`).
-    env.run("dst.clear(0); var app2 = new Appearance(); app2.addBrush('0xFFFF0000', 0, 0); dst.drawRectangle(app2, 0, 0, 4, 4);");
+    env.run("dst.clear(0); var app2 = new GdiPlus.Appearance(); app2.addBrush('0xFFFF0000', 0, 0); dst.drawRectangle(app2, 0, 0, 4, 4);");
     assert_eq!(env.pixel(dst, 1, 1), [255, 0, 0, 255]);
 
     // A dictionary/array without a `type` member reads the defaults: solid
     // white (`type` defaults to `BrushTypeSolidColor`, `color` to
     // `0xFFFFFFFF`, `reference/cpp/plugins/layerex_draw/windows/
     // LayerExDraw.cpp:633-638`).
-    env.run("dst.clear(0); var app3 = new Appearance(); app3.addBrush([], 0, 0); dst.drawRectangle(app3, 0, 0, 4, 4);");
+    env.run("dst.clear(0); var app3 = new GdiPlus.Appearance(); app3.addBrush([], 0, 0); dst.drawRectangle(app3, 0, 0, 4, 4);");
     assert_eq!(env.pixel(dst, 1, 1), [255, 255, 255, 255]);
 }
 
@@ -463,7 +527,7 @@ fn path_primitives_require_their_declared_arity() {
     // against its declared signature (`blend2d/LayerExDraw.hpp:944-977`),
     // so NCB requires the full parameter count
     // (`reference/cpp/core/plugin/ncbind.hpp:1178`).
-    env.run("var p = new Path();");
+    env.run("var p = new GdiPlus.Path();");
     for script in [
         "p.drawLine(1, 2, 3);",
         "p.drawRectangle(1, 2, 3);",
@@ -489,9 +553,9 @@ fn path_rectangle_and_polygon_fill_the_closed_area() {
     // (`reference/cpp/plugins/layerex_draw/blend2d/LayerExDraw.cpp:1429-1437`)
     // and `Layer.drawPath` fills it with the appearance.
     env.run(
-        "var p = new Path(); \
+        "var p = new GdiPlus.Path(); \
          p.drawRectangle(1, 1, 2, 2); \
-         var app = new Appearance(); \
+         var app = new GdiPlus.Appearance(); \
          app.addBrush(0xFF00FF00, 0, 0); \
          dst.drawPath(app, p);",
     );
@@ -502,9 +566,9 @@ fn path_rectangle_and_polygon_fill_the_closed_area() {
     // (`reference/cpp/plugins/layerex_draw/blend2d/LayerExDraw.cpp:1405-1425`).
     env.run(
         "dst.clear(0); \
-         var q = new Path(); \
+         var q = new GdiPlus.Path(); \
          q.drawPolygon([[0, 0], [4, 0], [2, 4]]); \
-         var app2 = new Appearance(); \
+         var app2 = new GdiPlus.Appearance(); \
          app2.addBrush(0xFFFF0000, 0, 0); \
          dst.drawPath(app2, q);",
     );
@@ -523,9 +587,9 @@ fn path_invalid_bezier_chain_adds_nothing() {
     // the call still succeeds but draws nothing.
     env.run(
         "dst.clear(0); \
-         var p = new Path(); \
+         var p = new GdiPlus.Path(); \
          p.drawBeziers([[0, 0], [1, 1], [2, 0]]); \
-         var app = new Appearance(); \
+         var app = new GdiPlus.Appearance(); \
          app.addBrush(0xFFFF0000, 0, 0); \
          dst.drawPath(app, p);",
     );
@@ -533,49 +597,7 @@ fn path_invalid_bezier_chain_adds_nothing() {
 }
 
 // ---------------------------------------------------------------------------
-// LayerExBase (base.rs)
-// ---------------------------------------------------------------------------
-
-#[test]
-fn layer_ex_base_reads_and_sets_clip() {
-    let _lock = vm_lock();
-    let env = Env::new();
-    two_layers(&env);
-    env.run("var b = new LayerExBase(src);");
-    // `layerExBase` caches `imageLeft/imageTop/imageWidth/imageHeight` and the
-    // clip members from the layer
-    // (`reference/cpp/plugins/layerExBase.hpp:62-98`); no clip set reads 0.
-    assert_eq!(env.eval_int("b.imageWidth"), 4);
-    assert_eq!(env.eval_int("b.imageHeight"), 4);
-    assert_eq!(env.eval_int("b.clipWidth"), 0);
-    // The clip setters funnel through `SetClip`
-    // (`reference/cpp/core/visual/LayerIntf.cpp:4042-4079`): left/top clamp
-    // to 0 and right/bottom clamp to the MainImage bounds.
-    env.run("b.clipLeft = 1; b.clipTop = 1; b.clipWidth = 2; b.clipHeight = 2;");
-    assert_eq!(env.eval_int("b.clipLeft"), 1);
-    assert_eq!(env.eval_int("b.clipTop"), 1);
-    assert_eq!(env.eval_int("b.clipWidth"), 2);
-    assert_eq!(env.eval_int("b.clipHeight"), 2);
-    // A width that runs past the image clamps to the image bounds.
-    env.run("b.clipLeft = 0; b.clipWidth = 100;");
-    assert_eq!(env.eval_int("b.clipWidth"), 4);
-}
-
-#[test]
-fn layer_ex_base_update_requires_zero_or_four_arguments() {
-    let _lock = vm_lock();
-    let env = Env::new();
-    two_layers(&env);
-    env.run("var b = new LayerExBase(src);");
-    // Reference `Layer.update` (`reference/cpp/core/visual/LayerIntf.cpp:
-    // 9663-9686`): no argument updates the whole image, four arguments the
-    // rectangle, and 1-3 arguments raise `TJS_E_BADPARAMCOUNT` (`:9674-9676`).
-    env.run("b.update(); b.update(0, 0, 1, 1);");
-    assert!(env.try_run("b.update(0, 0, 1);").is_err());
-}
-
-// ---------------------------------------------------------------------------
-// LayerExPerspective (perspective.rs)
+// Layer.perspectiveCopy (perspective.rs)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -624,26 +646,6 @@ fn perspective_copy_maps_the_source_quad() {
     assert_eq!(env.pixel(dst, 0, 0), [0, 0, 0, 0]);
 }
 
-#[test]
-fn perspective_class_constructor_rejects_a_plain_object() {
-    let _lock = vm_lock();
-    let env = Env::new();
-    // The extension binds to a `Layer` through the native-instance lookup
-    // (the reference `TJS_GET_NATIVE_INSTANCE`, used by
-    // `reference/cpp/plugins/layerExPerspective.cpp:171-176` to reject a
-    // non-Layer source); a plain object is not a Layer, so binding it would
-    // be a silent fallback and must raise instead.
-    assert!(
-        env.try_run("new LayerExPerspective({});").is_err(),
-        "a plain object is not a Layer"
-    );
-    // A real Layer still binds and exposes the base geometry members.
-    two_layers(&env);
-    env.run("var p = new LayerExPerspective(dst);");
-    assert_eq!(env.eval_int("p.imageWidth"), 4);
-    assert_eq!(env.eval_int("p.imageHeight"), 4);
-}
-
 // ---------------------------------------------------------------------------
 // Movie surface (movie.rs)
 // ---------------------------------------------------------------------------
@@ -683,39 +685,6 @@ fn movie_callbacks_are_layer_members() {
     assert_eq!(env.eval_int("dst.onUpdateMovie()"), 9);
 }
 
-#[test]
-fn movie_class_exposes_the_base_surface() {
-    let _lock = vm_lock();
-    let env = Env::new();
-    two_layers(&env);
-    // `NCB_ATTACH_CLASS_WITH_HOOK(layerExMovie, Layer)`
-    // (`reference/cpp/plugins/layerExMovie.cpp:337-342`) attaches
-    // `openMovie`/`startMovie`/`stopMovie`/`isPlayingMovie`; the port also
-    // exposes the class itself with the shared base geometry members.
-    env.run("var m = new LayerExMovie(dst);");
-    assert_eq!(env.eval_int("m.imageWidth"), 4);
-    assert_eq!(env.eval_int("m.imageHeight"), 4);
-    assert_eq!(env.eval_int("m.isPlayingMovie()"), 0);
-}
-
-#[test]
-fn movie_class_constructor_rejects_a_plain_object() {
-    let _lock = vm_lock();
-    let env = Env::new();
-    // `layerExMovie` derives from `layerExBase_GL`, whose constructor resolves
-    // the receiver with the native-instance lookup and throws `Not Layer`
-    // otherwise (`reference/cpp/plugins/layerExBase.hpp:152-158`, attached at
-    // `reference/cpp/plugins/layerExMovie.cpp:337-342`); a plain object is not
-    // a Layer, so binding it would be a silent fallback and must raise.
-    assert!(
-        env.try_run("new LayerExMovie({});").is_err(),
-        "a plain object is not a Layer"
-    );
-    two_layers(&env);
-    env.run("var m = new LayerExMovie(dst);");
-    assert_eq!(env.eval_int("m.imageWidth"), 4);
-}
-
 // ---------------------------------------------------------------------------
 // Record lifecycle (record.rs, driven through the Layer members)
 // ---------------------------------------------------------------------------
@@ -732,7 +701,7 @@ fn record_lifecycle_round_trips_through_a_file() {
     // `setRecord(true)` creates the recording; `getRecord()` reports it
     // (`reference/cpp/plugins/layerex_draw/windows/LayerExDraw.cpp:1770-1781`).
     env.run(
-        "var app = new Appearance(); \
+        "var app = new GdiPlus.Appearance(); \
          app.addBrush(0xFFFF0000, 0, 0); \
          dst.record = true; \
          dst.drawRectangle(app, 0, 0, 2, 2);",

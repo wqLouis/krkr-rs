@@ -1,5 +1,9 @@
-//! Integration tests for the `LayerEx*` plugin family
-//! (`LayerExBase`/`LayerExPerspective`/`LayerExMovie`).
+//! Integration tests for the `layerExDraw` plugin family: the `GdiPlus`
+//! namespace and the `Layer.perspectiveCopy` / movie members.
+//!
+//! `LayerExBase` / `LayerExMovie` / `LayerExPerspective` are not TJS classes
+//! in the reference (`reference/cpp/plugins/layerExPerspective.cpp:255-296`),
+//! so they are absent from the script surface.
 //!
 //! The tests attach a caller-owned L2 [`Scene`] to a [`CompatHost`] and drive
 //! the TJS surface — the same seam the app uses — so the pixel work is
@@ -110,51 +114,6 @@ fn two_layers(env: &Env) {
     );
 }
 
-/// Reference: `LayerExBase` binds its layer argument with
-/// `NativeInstanceSupport(TJS_NIS_GETINSTANCE, tTJSNC_Layer::ClassID)` and
-/// throws "Not Layer" otherwise
-/// (`reference/cpp/plugins/layerExBase.hpp:153-156`). A plain object carrying
-/// a `nativeId` is not a Layer.
-#[test]
-fn layer_ex_base_rejects_a_plain_object() {
-    let _lock = vm_lock();
-    let env = Env::new();
-    let error = env
-        .eval("new LayerExBase(%[nativeId: 3])")
-        .expect_err("a plain object must not bind as a Layer");
-    assert!(
-        error.contains("native Layer"),
-        "unexpected message: {error}"
-    );
-}
-
-#[test]
-fn layer_ex_base_class_reads_the_bound_layer() {
-    let _lock = vm_lock();
-    let env = Env::new();
-    two_layers(&env);
-    // The reference `Layer` member list registers no `id`
-    // (`reference/cpp/core/visual/LayerIntf.cpp:8283`), so reading it raises.
-    assert!(env.eval("src.id").is_err(), "Layer has no `id` member");
-    env.run("var b = new LayerExBase(src);");
-    assert_eq!(env.eval_int("b.imageWidth"), 4);
-    assert_eq!(env.eval_int("b.imageHeight"), 4);
-    assert_eq!(env.eval_int("b.imageLeft"), 0);
-    assert_eq!(env.eval_int("b.imageTop"), 0);
-    assert_eq!(env.eval_int("b.mainImageBufferPitch"), 16);
-    assert_ne!(env.eval_int("b.mainImageBufferForWrite"), 0);
-    // No clip was set, matching `Layer.clipWidth`/`clipHeight` of 0.
-    assert_eq!(env.eval_int("b.clipWidth"), 0);
-    assert_eq!(env.eval_int("b.clipHeight"), 0);
-    // The base methods exist and are callable.
-    env.run("b.redraw(); b.update(); b.reset();");
-    // Setting the clip is reflected in the base properties.
-    env.run("b.clipLeft = 1; b.clipTop = 1; b.clipWidth = 2; b.clipHeight = 2;");
-    assert_eq!(env.eval_int("b.clipLeft"), 1);
-    assert_eq!(env.eval_int("b.clipWidth"), 2);
-    assert_eq!(env.eval_int("b.clipHeight"), 2);
-}
-
 #[test]
 fn perspective_copy_identity_copies_the_source() {
     let _lock = vm_lock();
@@ -181,17 +140,6 @@ fn perspective_copy_maps_to_a_smaller_quad() {
     // Outside the quad stays untouched.
     assert_eq!(env.pixel(dst, 0, 0), [0, 0, 0, 0]);
     assert_eq!(env.pixel(dst, 3, 3), [0, 0, 0, 0]);
-}
-
-#[test]
-fn perspective_copy_class_method_uses_the_bound_layer() {
-    let _lock = vm_lock();
-    let env = Env::new();
-    two_layers(&env);
-    let dst = env.layer_id("dst");
-    env.run("var p = new LayerExPerspective(dst);");
-    env.run("p.perspectiveCopy(src, 0, 0, 4, 4, 0, 0, 4, 0, 0, 4, 4, 4);");
-    assert_eq!(env.pixel(dst, 2, 2), [255, 0, 0, 255]);
 }
 
 #[test]
@@ -241,20 +189,6 @@ fn movie_callbacks_are_layer_members() {
     assert_eq!(env.eval_int("dst.onStartMovie()"), 7);
     assert_eq!(env.eval_int("dst.onStopMovie()"), 8);
     assert_eq!(env.eval_int("dst.onUpdateMovie()"), 9);
-}
-
-#[test]
-fn movie_class_surface_is_registered() {
-    let _lock = vm_lock();
-    let env = Env::new();
-    two_layers(&env);
-    env.run("var m = new LayerExMovie(dst);");
-    assert_eq!(env.eval_int("m.isPlayingMovie()"), 0);
-    env.run("m.onStartMovie = function() { return 42; };");
-    assert_eq!(env.eval_int("m.onStartMovie()"), 42);
-    // The class also exposes the base geometry surface.
-    assert_eq!(env.eval_int("m.imageWidth"), 4);
-    assert_eq!(env.eval_int("m.imageHeight"), 4);
 }
 
 // ---------------------------------------------------------------------------
@@ -360,13 +294,13 @@ fn pointf_and_rectf_value_types_work() {
     let env = Env::new();
     two_layers(&env);
     env.run(
-        "var p = new PointF(1.5, 2.5); \
-         var q = new PointF(1.5, 2.5); \
-         var r = new RectF(1, 2, 3, 4);",
+        "var p = new GdiPlus.PointF(1.5, 2.5); \
+         var q = new GdiPlus.PointF(1.5, 2.5); \
+         var r = new GdiPlus.RectF(1, 2, 3, 4);",
     );
     assert_eq!(env.eval_int("p.x == 1.5 && p.y == 2.5"), 1);
     assert_eq!(env.eval_int("p.Equals(q)"), 1);
-    assert_eq!(env.eval_int("p.Equals(new PointF(0, 0))"), 0);
+    assert_eq!(env.eval_int("p.Equals(new GdiPlus.PointF(0, 0))"), 0);
 
     assert_eq!(env.eval_int("r.left == 1 && r.top == 2"), 1);
     assert_eq!(env.eval_int("r.right == 4 && r.bottom == 6"), 1);
@@ -378,8 +312,14 @@ fn pointf_and_rectf_value_types_work() {
         1
     );
     assert_eq!(env.eval_int("r.Clone().x == 1"), 1);
-    assert_eq!(env.eval_int("r.IntersectsWith(new RectF(0, 0, 10, 10))"), 1);
-    assert_eq!(env.eval_int("r.IntersectsWith(new RectF(9, 9, 1, 1))"), 0);
+    assert_eq!(
+        env.eval_int("r.IntersectsWith(new GdiPlus.RectF(0, 0, 10, 10))"),
+        1
+    );
+    assert_eq!(
+        env.eval_int("r.IntersectsWith(new GdiPlus.RectF(9, 9, 1, 1))"),
+        0
+    );
     // `Union` is the class-level static
     // `static bool Union(RectF &ret, const RectF &a, const RectF &b)`
     // (`reference/cpp/plugins/layerex_draw/blend2d/LayerExDraw.hpp:389-397`,
@@ -387,10 +327,10 @@ fn pointf_and_rectf_value_types_work() {
     // written through the first argument rather than returned by an instance
     // call.
     env.run(
-        "var ret = new RectF(0, 0, 0, 0); \
-         var ua = new RectF(0, 0, 1, 1); \
-         var ub = new RectF(2, 2, 1, 1); \
-         RectF.Union(ret, ua, ub);",
+        "var ret = new GdiPlus.RectF(0, 0, 0, 0); \
+         var ua = new GdiPlus.RectF(0, 0, 1, 1); \
+         var ub = new GdiPlus.RectF(2, 2, 1, 1); \
+         GdiPlus.RectF.Union(ret, ua, ub);",
     );
     assert_eq!(env.eval_int("ret.width == 3 && ret.height == 3"), 1);
 
@@ -407,7 +347,7 @@ fn appearance_supports_solid_and_hatch_brushes() {
     two_layers(&env);
     let dst = env.layer_id("dst");
     env.run(
-        "var app = new Appearance(); \
+        "var app = new GdiPlus.Appearance(); \
          app.addBrush(0xFFFF0000, 0, 0); \
          dst.drawRectangle(app, 0, 0, 4, 4);",
     );
@@ -444,9 +384,9 @@ fn path_value_type_builds_and_draws() {
     two_layers(&env);
     let dst = env.layer_id("dst");
     env.run(
-        "var p = new Path(); \
+        "var p = new GdiPlus.Path(); \
          p.drawRectangle(1, 1, 2, 2); \
-         var app = new Appearance(); \
+         var app = new GdiPlus.Appearance(); \
          app.addBrush(0xFF00FF00, 0, 0); \
          dst.drawPath(app, p);",
     );
@@ -455,7 +395,7 @@ fn path_value_type_builds_and_draws() {
 
     // The remaining Path members are callable and mutate the path.
     env.run(
-        "var q = new Path(); \
+        "var q = new GdiPlus.Path(); \
          q.startFigure(); q.drawLine(0, 0, 3, 3); q.closeFigure(); \
          q.drawArc(0, 0, 4, 4, 0, 90); \
          q.drawPie(0, 0, 4, 4, 0, 90); \
@@ -469,7 +409,7 @@ fn path_value_type_builds_and_draws() {
          q.drawEllipse(0, 0, 4, 4); \
          q.drawLines([[0,0],[1,1],[2,0]]); \
          q.drawPolygon([[0,0],[2,0],[1,2]]); \
-         q.drawRectangles([new RectF(0,0,1,1), [1,1,2,2]]);",
+         q.drawRectangles([new GdiPlus.RectF(0,0,1,1), [1,1,2,2]]);",
     );
     env.run("dst.drawPath(app, q);");
 }
@@ -485,7 +425,7 @@ fn layer_clear_and_strokes_work() {
 
     env.run(
         "dst.clear(0); \
-         var app = new Appearance(); \
+         var app = new GdiPlus.Appearance(); \
          app.addPen(0xFF00FF00, 1, 0, 0); \
          dst.drawLine(app, 0, 2, 4, 2);",
     );
@@ -502,7 +442,7 @@ fn layer_draws_other_shapes() {
     two_layers(&env);
     let dst = env.layer_id("dst");
     env.run(
-        "var app = new Appearance(); \
+        "var app = new GdiPlus.Appearance(); \
          app.addBrush(0xFFFF0000, 0, 0); \
          dst.drawEllipse(app, 0, 0, 4, 4); \
          dst.drawPolygon(app, [[0,0],[4,0],[2,4]]); \
@@ -524,7 +464,7 @@ fn layer_transforms_apply_to_drawing() {
     two_layers(&env);
     let dst = env.layer_id("dst");
     env.run(
-        "var app = new Appearance(); \
+        "var app = new GdiPlus.Appearance(); \
          app.addBrush(0xFFFF0000, 0, 0); \
          dst.translateTransform(2, 2); \
          dst.drawRectangle(app, 0, 0, 2, 2);",
@@ -562,7 +502,7 @@ fn layer_records_and_replays() {
     let record_path = std::env::temp_dir().join("krkr_layer_ex_record.kexr");
     let record_path_str = record_path.to_string_lossy().replace('\\', "\\\\");
     env.run(
-        "var app = new Appearance(); \
+        "var app = new GdiPlus.Appearance(); \
          app.addBrush(0xFFFF0000, 0, 0); \
          dst.record = true; \
          dst.drawRectangle(app, 0, 0, 2, 2);",
@@ -591,7 +531,7 @@ fn font_info_properties_work() {
     let _lock = vm_lock();
     let env = Env::new();
     two_layers(&env);
-    env.run("var f = new FontInfo('Ghost', 20, 3);");
+    env.run("var f = new GdiPlus.Font('Ghost', 20, 3);");
     assert_eq!(env.eval_int("f.emSize == 20"), 1);
     assert_eq!(env.eval_int("f.style == 3"), 1);
     assert_eq!(env.eval_int("f.forceSelfPathDraw == 0"), 1);
@@ -625,7 +565,7 @@ fn fontinfo_metrics_follow_the_reference_formulas() {
     )
     .expect("mount font directory");
     let env = FontEnv::new(Some(storage));
-    env.run(&format!("var f = new FontInfo('{name}', 16, 0);"));
+    env.run(&format!("var f = new GdiPlus.Font('{name}', 16, 0);"));
 
     let ascent = env.eval_real("f.ascent");
     let descent = env.eval_real("f.descent");
@@ -667,7 +607,7 @@ fn layer_measures_and_draws_text_with_a_font() {
     // Build the script with the font file name embedded safely.
     let script = format!(
         "var w = new Window(); var dst = new Layer(w, null); \
-         dst.setImageSize(64, 32); var f = new FontInfo('{name}', 16, 0);"
+         dst.setImageSize(64, 32); var f = new GdiPlus.Font('{name}', 16, 0);"
     );
     env.run(&script);
     env.run("var measured = dst.measureString(f, 'Hello');");
@@ -677,7 +617,7 @@ fn layer_measures_and_draws_text_with_a_font() {
     assert!(env.eval_real("inner.width") > 0.0);
 
     env.run(
-        "var app = new Appearance(); \
+        "var app = new GdiPlus.Appearance(); \
          app.addBrush(0xFFFF0000, 0, 0); \
          dst.drawString(f, app, 0, 12, 'Hello');",
     );

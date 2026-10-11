@@ -1,33 +1,34 @@
-//! The `LayerEx*` plugin family: `LayerExBase`, `LayerExPerspective`,
-//! `LayerExMovie` and the GDI+ `LayerExDraw` drawing extension.
+//! The `layerExDraw` plugin family: the `GdiPlus` namespace and the
+//! `Layer.draw*` / `perspectiveCopy` / movie members.
 //!
 //! Behavioral references:
 //!
-//! * `reference/cpp/plugins/LayerExBase.{h,cpp}` / `layerExBase.hpp` — the
-//!   shared layer-extension base class that caches a layer's geometry and
-//!   main-image buffer and drives `Layer.update`.
 //! * `reference/cpp/plugins/layerExPerspective.cpp` — `perspectiveCopy`,
 //!   attached to `Layer`.
-//! * `reference/cpp/plugins/layerExMovie.cpp` — the movie layer
+//! * `reference/cpp/plugins/layerExMovie.cpp` — the movie members
 //!   (`openMovie`/`startMovie`/`stopMovie`/`isPlayingMovie` plus the
-//!   `onStartMovie`/`onStopMovie`/`onUpdateMovie` callbacks).
-//! * `reference/cpp/plugins/layerex_draw/` — the GDI+ `LayerExDraw` extension
-//!   (`Appearance`/`Path`/`PointF`/`RectF`/`FontInfo` value types and the
+//!   `onStartMovie`/`onStopMovie`/`onUpdateMovie` callbacks), attached to
+//!   `Layer`.
+//! * `reference/cpp/plugins/layerex_draw/` — the GDI+ `GdiPlus` namespace
+//!   (`PointF`/`RectF`/`Path`/`Font`/`Appearance` value types and the
 //!   `Layer.draw*` / transform / record members).
 //!
-//! The port composes the L2 [`engine::layer_ops`] / [`engine::raster`]
-//! primitives for the pixel work and the L2 [`engine::Scene`] /
-//! [`engine::LayerState`] for layer state; the classes own only the dispatch
-//! state that has no home in L2 (the `LayerExMovie` playback slots and the
-//! per-layer `LayerExDraw` transform/record state), kept in
+//! `layerExBase` is an internal native-instance base and is not a TJS class
+//! (`reference/cpp/plugins/layerExPerspective.cpp:255-296`); `LayerExMovie`
+//! and `LayerExPerspective` are likewise not classes, only `Layer` member
+//! sets. The port composes the L2 [`engine::layer_ops`] /
+//! [`engine::raster`] primitives for the pixel work and the L2
+//! [`engine::Scene`] / [`engine::LayerState`] for layer state; the extension
+//! owns only the dispatch state that has no home in L2 (the movie playback
+//! slots and the per-layer draw transform/record state), kept in
 //! [`CompatServices::state`](crate::CompatServices::state) rather than in a
 //! process global.
 #![allow(unsafe_code)]
 
 mod appearance;
-mod base;
 mod draw;
 mod font;
+mod gdiplus;
 mod geom;
 mod movie;
 mod path;
@@ -47,15 +48,6 @@ use crate::{CompatCtx, CompatError};
 
 pub use crate::natives::video::VideoSource;
 pub use movie::{movie_poll, set_movie_source};
-
-/// The per-class native payload shared by the three extension classes. The
-/// reference `layerExBase` caches the owning layer's geometry; the port reads
-/// it live from the L2 scene, so the payload only has to remember *which*
-/// layer the extension instance is bound to.
-#[derive(Default)]
-pub(super) struct BaseInst {
-    pub(super) layer: Option<u32>,
-}
 
 /// Resolve the installed engine → context binding for a native callback.
 pub(super) fn bound(
@@ -99,24 +91,6 @@ pub(super) fn argb_to_rgba(color: i64) -> [u8; 4] {
     ]
 }
 
-/// Resolve a script object argument to a scene id. An object argument is
-/// resolved through the VM's native-instance lookup for the `Layer` and
-/// `Bitmap` classes (reference `TJS_GET_NATIVE_INSTANCE`); an object of
-/// another class is an error.
-pub(super) fn resolve_id(host: &Tjs2Engine, value: &Value) -> Result<i64, String> {
-    crate::CompatCtx::resolve_object_id(host, value, &["Layer", "Bitmap"])
-}
-
-/// The scene id bound to a native-instance payload.
-pub(super) fn inst_layer(instance: *const c_void) -> Option<u32> {
-    if instance.is_null() {
-        return None;
-    }
-    // SAFETY: every `LayerEx*` class payload is a `BaseInst`.
-    let inst = unsafe { &*(instance as *const BaseInst) };
-    inst.layer
-}
-
 /// The scene id of an objthis-only `Layer` member, via the VM's
 /// native-instance lookup (a `Layer` object's `id`/`nativeId` script members
 /// no longer exist). `Ok(None)` means the object is not a `Layer`.
@@ -129,36 +103,6 @@ pub(super) fn layer_from_objthis(
     }
     let object = host.retain_object_detached(objthis)?;
     crate::CompatCtx::native_instance_id(host, object.raw_id(), &["Layer"])
-}
-
-/// Read the bound layer (from a class payload) out of the attached scene.
-pub(super) fn read_layer<'a>(
-    engine: *mut c_void,
-    instance: *const c_void,
-    method: &str,
-) -> Result<(u32, &'a Scene), String> {
-    let id = inst_layer(instance).ok_or_else(|| format!("{method}: no layer bound"))?;
-    let (_resolved, ctx) = bound(engine)?;
-    let scene = scene_ref(&ctx)?;
-    if scene.layer(id).is_none() {
-        return Err(format!("{method}: the layer no longer exists"));
-    }
-    Ok((id, scene))
-}
-
-/// Mutably read the bound layer (from a class payload) out of the scene.
-pub(super) fn read_layer_mut<'a>(
-    engine: *mut c_void,
-    instance: *const c_void,
-    method: &str,
-) -> Result<(u32, &'a mut Scene), String> {
-    let id = inst_layer(instance).ok_or_else(|| format!("{method}: no layer bound"))?;
-    let (_resolved, ctx) = bound(engine)?;
-    let scene = scene_mut(&ctx)?;
-    if scene.layer(id).is_none() {
-        return Err(format!("{method}: the layer no longer exists"));
-    }
-    Ok((id, scene))
 }
 
 /// Mark a layer as needing a repaint (the reference `layerExBase::redraw`
@@ -300,13 +244,13 @@ fn eval_object(host: &Tjs2Engine, expression: &str, what: &str) -> Result<Detach
     }
 }
 
-/// Build a fresh `PointF` object.
+/// Build a fresh `GdiPlus.PointF` object.
 pub(super) fn new_pointf(host: &Tjs2Engine, x: f64, y: f64) -> Result<DetachedValue, String> {
-    let expression = format!("new PointF({}, {})", finite(x), finite(y));
-    eval_object(host, &expression, "LayerEx.new PointF")
+    let expression = format!("new GdiPlus.PointF({}, {})", finite(x), finite(y));
+    eval_object(host, &expression, "LayerEx.new GdiPlus.PointF")
 }
 
-/// Build a fresh `RectF` object.
+/// Build a fresh `GdiPlus.RectF` object.
 pub(super) fn new_rectf(
     host: &Tjs2Engine,
     x: f64,
@@ -315,13 +259,13 @@ pub(super) fn new_rectf(
     h: f64,
 ) -> Result<DetachedValue, String> {
     let expression = format!(
-        "new RectF({}, {}, {}, {})",
+        "new GdiPlus.RectF({}, {}, {}, {})",
         finite(x),
         finite(y),
         finite(w),
         finite(h)
     );
-    eval_object(host, &expression, "LayerEx.new RectF")
+    eval_object(host, &expression, "LayerEx.new GdiPlus.RectF")
 }
 
 /// TJS numeric coercion to a non-negative `usize`.
@@ -558,16 +502,9 @@ pub(super) fn read_handle(engine: *mut c_void, value: &Value, what: &str) -> Res
     }
 }
 
-/// Register the `LayerExBase`/`LayerExPerspective`/`LayerExMovie` classes and
-/// the `Layer` extension members.
+/// Register the `GdiPlus` namespace and the `Layer` extension members.
 pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
-    base::register_class(ctx)?;
-    perspective::register_class(ctx)?;
-    movie::register_class(ctx)?;
-    geom::register_classes(ctx)?;
-    path::register_class(ctx)?;
-    appearance::register_class(ctx)?;
-    font::register_class(ctx)?;
+    gdiplus::register(ctx)?;
 
     // `Layer`-instance members. The reference attaches them with
     // `NCB_ATTACH_CLASS_WITH_HOOK` (movie), `Layer.perspectiveCopy`

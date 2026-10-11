@@ -24,14 +24,11 @@
 use std::ffi::{c_char, c_int, c_void};
 
 use engine::{BitmapState, layer_ops};
-use tjs::{
-    NativeInstanceBuilder, NativeInstanceMethodDef, NativeObjThisMethodDef, Tjs2Engine, VAL_OBJECT,
-    Value,
-};
+use tjs::{NativeObjThisMethodDef, Tjs2Engine, VAL_OBJECT, Value};
 
-use super::{BaseInst, bound, layer_from_objthis, read_layer, resolve_id, scene_mut};
+use super::{bound, layer_from_objthis, scene_mut};
+use crate::CompatCtx;
 use crate::native_util::{args, report_error, set_void};
-use crate::{CompatCtx, CompatError};
 
 // ---------------------------------------------------------------------------
 // Projective sampling
@@ -346,102 +343,4 @@ pub(super) fn layer_method_defs() -> Vec<NativeObjThisMethodDef> {
         name: "perspectiveCopy",
         f: layer_perspective_copy,
     }]
-}
-
-// ---------------------------------------------------------------------------
-// Class surface
-// ---------------------------------------------------------------------------
-
-extern "C" fn create(_engine: *mut c_void) -> *mut c_void {
-    Box::into_raw(Box::new(BaseInst::default())) as *mut c_void
-}
-
-extern "C" fn destroy(_engine: *mut c_void, instance: *mut c_void) {
-    if instance.is_null() {
-        return;
-    }
-    // SAFETY: every payload came from `create`'s `Box::into_raw`.
-    drop(unsafe { Box::from_raw(instance as *mut BaseInst) });
-}
-
-extern "C" fn ctor(
-    engine: *mut c_void,
-    instance: *mut c_void,
-    argc: c_int,
-    argv: *const Value,
-    out: *mut Value,
-    out_error: *mut *mut c_char,
-    _objthis: *mut c_void,
-) -> c_int {
-    let Ok((resolved, _ctx)) = bound(engine) else {
-        return report_error(out_error, "LayerExPerspective: compat context is not bound");
-    };
-    let a = unsafe { args(argv, argc) };
-    let inst = unsafe { &mut *(instance as *mut BaseInst) };
-    // `LayerExPerspective(layer)` binds a `Layer` argument; an object of
-    // another class is rejected through the native-instance lookup
-    // (`resolve_id`, the reference `TJS_GET_NATIVE_INSTANCE`), never
-    // silently left unbound.
-    if let Some(value) = a.first() {
-        match resolve_id(resolved.engine(), value) {
-            Ok(id) if id >= 0 => inst.layer = Some(id as u32),
-            Ok(_) => {}
-            Err(error) => {
-                return report_error(out_error, &format!("LayerExPerspective: {error}"));
-            }
-        }
-    }
-    set_void(out);
-    0
-}
-
-extern "C" fn perspective_copy_method(
-    engine: *mut c_void,
-    instance: *mut c_void,
-    argc: c_int,
-    argv: *const Value,
-    out: *mut Value,
-    out_error: *mut *mut c_char,
-    _objthis: *mut c_void,
-) -> c_int {
-    let Ok((resolved, ctx)) = bound(engine) else {
-        return report_error(
-            out_error,
-            "LayerExPerspective.perspectiveCopy: compat context is not bound",
-        );
-    };
-    let (id, _scene) = match read_layer(engine, instance, "LayerExPerspective.perspectiveCopy") {
-        Ok(value) => value,
-        Err(error) => return report_error(out_error, &error),
-    };
-    let a = unsafe { args(argv, argc) };
-    if let Err(error) = perspective_copy(&ctx, resolved.engine(), id, a) {
-        return report_error(out_error, &error);
-    }
-    set_void(out);
-    0
-}
-
-/// Register the `LayerExPerspective` class (the base surface plus
-/// `perspectiveCopy`).
-pub(super) fn register_class(ctx: &mut CompatCtx) -> Result<(), CompatError> {
-    let mut methods = vec![
-        NativeInstanceMethodDef {
-            name: "LayerExPerspective",
-            f: ctor,
-        },
-        NativeInstanceMethodDef {
-            name: "perspectiveCopy",
-            f: perspective_copy_method,
-        },
-    ];
-    methods.extend(super::base::method_defs());
-    ctx.register_instance(&NativeInstanceBuilder {
-        name: "LayerExPerspective",
-        create,
-        destroy,
-        invalidate: None,
-        methods,
-        properties: super::base::property_defs(),
-    })
 }
