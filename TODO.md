@@ -148,6 +148,52 @@ Sources: `/tmp/kag-render-audit.md`, `/tmp/kag-compat-audit.md`, `/tmp/kag-flow-
   `onPaint → affineCopy`. Any layer transform the script sets without repainting is
   lost.
 
+### Core native behaviour (`audit-core-natives`)
+
+One bug class dominates: **the port raises where the reference is inert and
+returns a benign value.** D32 says a member behaves like the reference or raises
+*because the reference raises*; inventing an error breaks a script that the
+reference lets run. For the `#if 0` members below the reconstruction cannot show
+the real Windows side effect, but the reference still returns a value — so match
+that and log a warning (the null-plugin precedent), never raise.
+
+* [ ] **C1 (P0)** `System.system(t)` raises; the reference returns `0` and runs
+  nothing (`SystemImpl.cpp:674-691`) — `system.rs:1306`.
+* [ ] **C2 (P0)** `System.shellExecute` raises; the reference always returns `true`
+  (`SystemImpl.cpp:77-88`) — `system.rs:1261`.
+* [ ] **C3 (P0)** `Storages.searchCD` raises; the reference returns `""`
+  (`StorageImpl.cpp:1232-1246`) — `storages.rs:543`.
+* [ ] **C4 (P0)** `Storages.selectFile` raises; the reference returns `false` with no
+  picker (`FileSelector.cpp:100,378-399`) — `storages.rs:577`. A real picker is the
+  platform dialog layer's job (§4).
+* [ ] **C5 (P0)** `Font.doUserSelect` raises; the reference returns `0`
+  (`LayerIntf.cpp:11931-11956`) — `font.rs:616`.
+* [ ] **C6 (P0)** `Font.rasterizer = n` raises for `n != 0`; the reference ignores an
+  out-of-range value (`LayerBitmapImpl.cpp:94-101`) — `font.rs:825`.
+* [ ] **C7 (P0)** `Scripts.exec`/`eval` drop the `context` (the `this`) and
+  `lineofs` arguments (`ScriptMgnIntf.cpp:1385-1438`) — `scripts.rs:378,409`.
+* [ ] **C8 (P0)** `Scripts.execStorage`/`evalStorage` drop `context` and the non-`o`
+  mode (encoding), and use the full storage name as the block name where the
+  reference uses `TVPExtractStorageName` — `scripts.rs:293,334,196`.
+* [ ] **C9 (P1)** `System.exitOnNoWindowStartup` defaults to `false`; the reference
+  defaults `true` (`SysInitImpl.cpp:383`).
+* [ ] **C10 (P1)** `System.assignMessage` always returns `true` and the override map
+  is never read.
+* [ ] **C11 (P1)** `Font.getList` ignores `flags`.
+* [ ] **C12 (P2)** `System.inform` always returns `0` (the reference returns a button
+  index); `System.versionInformation` text is port-specific; `System.touchDevice`
+  invents touch bits (the reference is always `0x300`); `Bitmap.save` ignores `meta`
+  and coerces `""` to `bmp`; `Bitmap.loadHeader` raises where the reference returns
+  void; `Plugins.getList` rejects arguments the reference accepts;
+  `Debug.logLocation` does not clear unreachable locations or honour `-forcelog`.
+* [x] **C13** `Storages.addAutoPath` (P2-2b) is **stale** — L3 already enforces the
+  trailing delimiter; only the raised text differs from
+  `TVPMissingPathDelimiterAtLast` (`StorageIntf.cpp:924-927`).
+* [ ] **C14 (coverage gap)** `native_parity` machine-checks only core `.cpp`; the
+  runtime surface also carries `fstat`/`dirlist`/`xp3_filter`/`scriptsEx`/`windowEx`
+  members whose behaviour no audit has checked. Their references live under
+  `reference/cpp/plugins/**` and need a separate pass.
+
 ### Text / fonts (render audit R4/R6 + the text-render diagnosis)
 
 * [x] **TEXT-1** the `drawText` shadow now convolves each character's coverage with
