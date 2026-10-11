@@ -565,6 +565,14 @@ Verify current state first; several were fixed in the last wave.
 
 * **L2 owns the frame** — `Engine::frame`/`Engine::run`/`GameFrame` designed, not built (`docs/migration/02 §3`, `07 Phase 9`). The current L3 clock is `platform::Clock`, a wall clock: a headless run of N frames reaches real time only by accident, which is why timer tests need care.
 * **TJS VM Rust port** — deferred (`08 §10.7`).
+* **`streams.cpp`: thin C++ adapter over a Rust implementation** — deferred. It is
+  the only port-authored C++ besides the ABI boundary, and it is C++ only because
+  it implements the VM's vtable interfaces (`tTJSBinaryStream`,
+  `iTJSTextReadStream`/`iTJSTextWriteStream`, `crates/tjs/cpp/streams.cpp:283,421,538`).
+  Every memory-safety defect found in the save path was in this file, so reducing
+  those classes to forwarding shims and moving the container and crypt logic into
+  Rust removes the whole class. The vendored VM under `tjs2/` stays C++: it is the
+  behaviour oracle.
 * **L2 API snapshot + CI build step** — `cargo public-api` decided, unwired; CI runs only `cargo fmt --check` + the stateless guard, so the surface lock is a local gate.
 * **Windowed audio on a real device** — owed.
 

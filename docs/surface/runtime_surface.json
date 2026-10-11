@@ -756,6 +756,8 @@
       "macroParams",
       "macros",
       "mp",
+      "multiLineTagEnabled",
+      "paramMacros",
       "popMacroArgs",
       "processSpecialTags",
       "resetInterrupt",

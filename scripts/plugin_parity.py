@@ -867,6 +867,30 @@ def _all_builder_spans(
         elif m_id:
             cls = consts.get(m_id.group(1))
         spans.append((open_pos, end, cls, name_lit))
+
+    # ``register_builtin_static_members(engine, "Class", &[..], &[..])``.
+    # The reference attaches a class's members with a per-member static flag on
+    # one ``NCB_ATTACH_CLASS`` call, so those members carry the objthis
+    # signatures and are passed as a slice rather than a ``Native*Members``
+    # block. The second argument names the class; the member ``name:``
+    # literals sit in the slice.
+    for m in re.finditer(r"\bregister_builtin_static_members\s*\(", code):
+        arg_start = m.end()
+        arg_end = _scan_paren(code, arg_start)
+        args = _split_top_level(raw[arg_start:arg_end])
+        if len(args) < 4:
+            continue
+        # A leading comment lands in the first split, so take the first
+        # argument that opens with a string literal rather than assuming a
+        # position.
+        nm = None
+        for arg in args:
+            nm = re.match(r'\s*"([^"]+)"', arg)
+            if nm:
+                break
+        if not nm:
+            continue
+        spans.append((arg_start, arg_end, nm.group(1), None))
     return spans
 
 
