@@ -155,6 +155,13 @@ Sources: `/tmp/kag-render-audit.md`, `/tmp/kag-compat-audit.md`, `/tmp/kag-flow-
   Nothing to add.
 * [ ] **R8 (P2)** `Layer.hasImage` reports false on a fresh layer where the reference
   reports true (`:2497`); it is R1's observable face.
+* [ ] **R8b (P2)** `hasImage = true` must raise `TVPLayerCannotHaveImage` when the
+  layer's type cannot carry an image (`LayerIntf.cpp:2489-2493`). The port collapses
+  `ltBinder`/`ltEffect`/`ltFilter` — the only `CanHaveImage == false` types — into
+  the generic `BlendMode::SourceOver`, and `engine::LayerState` has no
+  `can_have_image` field, so this needs engine state plus the layer-type mapping.
+  The observable parts of `SetHasImage` (`true` allocates, `false` deallocates, so
+  destination-rect ops behave as the reference) are implemented and tested.
 * [ ] **R9 (P1, new)** the **normal projection ignores `Layer.face`**. The subtree
   renderer now selects main/alpha/mask/province, but steady-state projection always
   draws the main image and `RenderNode` has no face field, so a `dfProvince` or

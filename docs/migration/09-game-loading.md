@@ -63,11 +63,14 @@ Disk files still win over archive entries (unchanged rule from the current
 recursively scanned for `*.xp3` and those archives are mounted, so a game
 folder is a complete input (`krkr --base-dir /path/to/game`, or
 `krkr /path/to/game`). `engine::storage::discover_archives` orders them by
-file name (case-insensitive), then shallower-first, so `patch.xp3` overrides
-`data.xp3` and a root archive overrides a nested one of the same name; the
-scan is followed by `Storage::mount_archives`, whose later-wins rule applies.
-Explicit `--archive` entries are mounted instead of the scan (the explicit
-list is authoritative). Symbolic-link directories are not followed.
+file name (case-insensitive, numeric-aware, so `patch@r1071` sorts after
+`patch@r996`), then a deeper path before a shallower one, so a root archive
+mounts last and overrides a nested one of the same name; the scan is followed
+by `Storage::mount_discovered_archives`, whose later-wins rule applies. A
+scanned archive that cannot be read or parsed is skipped with a warning; an
+explicit `--archive` entry that cannot be read is an error (§8). Explicit
+`--archive` entries are mounted instead of the scan (the explicit list is
+authoritative). Symbolic-link directories are not followed.
 
 ## 3. Mounting
 
@@ -154,14 +157,20 @@ extension.)
 
 Loading is explicit and typed (D11): a base directory that does not exist, a
 missing or unreadable archive, an archive that fails to parse, and "no
-`startup.tjs` found" are all errors, not warnings. The only tolerated case is
-a missing native plugin DLL, handled by the null-plugin object in
-[`08-tjs-vm-and-native-plugins.md`](08-tjs-vm-and-native-plugins.md) §4.2.
+`startup.tjs` found" are all errors, not warnings. Two cases are deliberately
+tolerated, and each announces itself: a missing native plugin DLL is handled by
+the null-plugin object in
+[`08-tjs-vm-and-native-plugins.md`](08-tjs-vm-and-native-plugins.md) §4.2, and a
+scanned archive (§2) that cannot be read or parsed is skipped with `warn!` so
+one stray file in the folder cannot stop an otherwise playable mount. An
+explicit `--archive` entry is never skipped.
 
 ## 9. Implementation
 
 * **L2** — [`Storage::mount_archives`] mounts an explicit, ordered archive
-  list; [`Storage::startup_plan`] resolves §5 into a `StartupPlan`
+  list and reports a bad member as a typed error; [`Storage::mount_discovered_archives`]
+  mounts a scanned list and skips a bad member with `warn!`;
+  [`Storage::startup_plan`] resolves §5 into a `StartupPlan`
   (`patch`/`startup`/`fallback`/`after`) with pure storage lookups. `patch.tjs`
   and `AfterStartup.tjs` are app-path only (disk, `find_disk`); `startup.tjs`
   and `system/Initialize.tjs` are searched (`exists`).
@@ -179,4 +188,5 @@ a missing native plugin DLL, handled by the null-plugin object in
   product path never does.
 
 [`Storage::mount_archives`]: ../../crates/engine/src/storage.rs
+[`Storage::mount_discovered_archives`]: ../../crates/engine/src/storage.rs
 [`Storage::startup_plan`]: ../../crates/engine/src/storage.rs
