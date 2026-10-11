@@ -266,12 +266,22 @@ and the stub in others — each needs an explicit oracle decision.
   (`window.rs:1958`) and `main.rs:529` consumes `CloseRequested` and exits, so L3
   never fires it; `Window.close()` removes the window outright. The reference runs
   `OnCloseQueryCalled` with a veto (`TVPWindow.cpp:790-880`).
-* [ ] **M4 (P1)** `MIDISoundBuffer.open`/`play` actually load and play
-  (`cdda_midi.rs:229,491`); the reference guards them with `TVP_ENABLE_MIDI`, which
-  is defined nowhere in the tree, so they must be inert (CDDA is already correct).
-* [ ] **M5 (P1)** `getVisBuffer` is a stub returning 0 (`sound.rs:1597`); the
-  reference fills `dest` and returns a count, and `useVisBuffer = true` allocates a
-  live buffer (`reference/cpp/core/sound/win32/WaveImpl.cpp:3401-3556`).
+* [x] **M4 (P1)** `MIDISoundBuffer`/`CDDASoundBuffer` now match the **disabled**
+  build the reference compiles (both feature macros are defined nowhere in the
+  tree): every method is an arity-checked no-op and the per-class property values
+  are pinned — `volume` is `void` on CDDA but `0` on MIDI, `volume2` is `0` on
+  both, `status` is `"unload"` on both. Note this corrected the belief that CDDA
+  was already right: only its `open` was (`270f080`); its shared getters still
+  reported `100000`/`0` where the reference leaves them `void`.
+* [~] **M5 (P1)** `getVisBuffer` implemented against the channel's decoded source
+  (`reference/cpp/core/sound/win32/WaveImpl.cpp:3401-3474`), including the
+  `useVisBuffer`/device/decoder/playing/channel-count guards and the reference’s
+  `32767` vs `32768/channels` scaling. Residual: the reference reads a device
+  **ring**, so a `sampleAhead` past the decoded end yields silence rather than the
+  ring’s contents (the plugin’s default `ahead` is 0, where it is exact).
+* [ ] **M5b (D32)** the `set_disc_audio_decoder` seam is now meaningless (the disc
+  classes are inert) but is still exported from `crates/compat/src/lib.rs`. Delete
+  the function and the re-export.
 * [ ] **M6 (P1)** `onMouseWheel`'s delta is `±1`; the reference posts `±120`
   (`event.rs:167-175` vs `TVPWindow.cpp:109-115`).
 * [ ] **M7 (P1)** `VideoOverlay` frames are never composited — `layer1`/`mode`/
@@ -279,14 +289,16 @@ and the stub in others — each needs an explicit oracle decision.
   layer-ex movie path.
 * [ ] **M8 (P1)** `Layer.openMovie`/`startMovie` raise where the reference logs and
   returns (`layerExMovie.cpp:160-227`), changing what a `try/catch` observes.
-* [ ] **M9 (P2)** window-level `onMouseEnter`/`onMouseLeave`/`onDoubleClick` are
+* [~] **M9 (P2)** window-level `onMouseEnter`/`onMouseLeave`/`onDoubleClick` are
   synthesized with no reference poster; `onMouseDown` does not first run
   `PrimaryMouseMove` and `onMouseUp` does not re-check the layer under the cursor
   (`LayerManager.cpp:374-419`); the `Mouse`/`Key` native classes and
   `Mouse.getWheelRot*` are **port-only** (the reference registers neither — and
-  `natives/input.rs` is absent from `native_parity`'s map); `PlayStatus` lacks
-  `"ready"`; coordinates are physical rather than the reference's primary-layer
-  node space (latent while `setZoom` is inert).
+  `natives/input.rs` is absent from `native_parity`'s map, the same blindness
+  `plugin_parity` has for post-registration globals); `PlayStatus` was missing
+  `"ready"` (`VideoOvlIntf.cpp:73,84`) — assigned to the video agent, which owns
+  `engine/src/video.rs`; coordinates are physical rather than the reference's
+  primary-layer node space (latent while `setZoom` is inert).
 
 ### File system / XP3 (`audit-fs-xp3`)
 
