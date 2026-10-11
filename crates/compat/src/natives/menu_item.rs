@@ -21,7 +21,7 @@
 //!
 //! | member | behavior |
 //! |---|---|
-//! | `HMENU` | a stable, non-zero synthetic handle derived from the item id (`impl/MenuItemImpl.cpp:409-413`) |
+//! | `HMENU` | `0`: `GetMenuItemHandleForPlugin` returns `nullptr` (`impl/MenuItemImpl.cpp:193-196`), cast by the getter (`:409-413`) |
 //! | `popup(flags,x,y)` | the reference success value `1` (`impl/MenuItemImpl.cpp:309-315`) |
 //!
 //! Everything else is pure logical state: the tree operations (`add`,
@@ -1425,36 +1425,21 @@ fn refresh_children_array(
     Ok(())
 }
 
-/// Synthetic `HMENU` base. The desktop getter casts the native menu handle to
-/// an integer (`impl/MenuItemImpl.cpp:409-413`); the high bytes spell "MENU"
-/// and keep every derived handle non-zero.
-const MENU_HANDLE_BASE: i64 = 0x4D45_4E55_0000_0000;
-
-/// `HMENU` — the native menu handle a plugin can address. The reference reads
-/// the platform handle back as an integer
-/// (`impl/MenuItemImpl.cpp:409-413`); this build has no OS menu, so it reports
-/// a stable, non-zero synthetic handle derived from the node id.
+/// `HMENU` — the native menu handle a plugin can address. The reference
+/// `GetMenuItemHandleForPlugin` returns `nullptr` unconditionally
+/// (`impl/MenuItemImpl.cpp:193-196`), so the getter's integer cast
+/// (`impl/MenuItemImpl.cpp:409-413`) reports `0` for every item.
 extern "C" fn menu_hmenu_get(
     engine: *mut c_void,
-    instance: *mut c_void,
+    _instance: *mut c_void,
     out: *mut Value,
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    let Ok((_resolved, ctx)) = bound(engine) else {
+    if bound(engine).is_err() {
         return report_error(out_error, "MenuItem.HMENU: compat context is not bound");
-    };
-    let inst = unsafe { &*(instance as *const MenuItemInst) };
-    let Some(id) = inst.id else {
-        return report_error(out_error, "MenuItem.HMENU: this item is not constructed");
-    };
-    // SAFETY: the caller resolved `ctx` from the installed binding.
-    let services = unsafe { ctx.services() };
-    let live = services.state::<MenuState>().nodes.contains_key(&id);
-    if !live {
-        return report_error(out_error, "MenuItem.HMENU: this item is not constructed");
     }
-    set_int(out, MENU_HANDLE_BASE + id as i64);
+    set_int(out, 0);
     0
 }
 

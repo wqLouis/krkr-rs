@@ -8,8 +8,9 @@
 //! dispatch — gated on an ancestor `Window` and that window's `visible`, like
 //! the reference `OnClick` — and the static shortcut tables. The two members
 //! that the desktop build backs with a platform menu (`HMENU`, `popup`) report
-//! reference-shaped values from the logical tree: a synthetic non-zero
-//! `HMENU` and the `popup` success value `1`.
+//! reference-shaped values from the logical tree: `HMENU` is `0` (the reference
+//! `GetMenuItemHandleForPlugin` returns `nullptr`) and `popup` returns the
+//! success value `1`.
 
 mod common;
 
@@ -396,35 +397,18 @@ fn shortcut_tables_round_trip_and_are_read_only() {
 }
 
 #[test]
-fn hmenu_is_a_stable_synthetic_handle_and_popup_reports_success() {
+fn hmenu_is_zero_and_popup_reports_success() {
     let _lock = vm_lock();
     let env = Env::new();
     env.run("var m = new MenuItem(); var other = new MenuItem();");
 
-    // Reference `HMENU` getter: the native menu handle is read back as an
-    // integer
-    // (`reference/cpp/core/visual/impl/MenuItemImpl.cpp:409-413`). This build
-    // has no OS menu, so the getter reports a synthetic non-zero handle.
-    let hmenu = env.eval_int("m.HMENU");
-    assert!(hmenu != 0, "HMENU must be a non-zero integer, got {hmenu}");
-
-    // Reference `HMENU` getter
-    // (`reference/cpp/core/visual/impl/MenuItemImpl.cpp:409-413`): repeated
-    // reads of one item's handle return the same value.
-    assert_eq!(
-        env.eval_int("m.HMENU"),
-        hmenu,
-        "HMENU must be stable across reads"
-    );
-
-    // Reference `HMENU` getter
-    // (`reference/cpp/core/visual/impl/MenuItemImpl.cpp:409-413`): distinct
-    // items carry distinct handles.
-    assert_ne!(
-        env.eval_int("other.HMENU"),
-        hmenu,
-        "each item must have its own HMENU"
-    );
+    // Reference `HMENU` getter: the property casts the native menu handle to
+    // an integer (`reference/cpp/core/visual/impl/MenuItemImpl.cpp:409-413`).
+    // `GetMenuItemHandleForPlugin` returns `nullptr` unconditionally
+    // (`reference/cpp/core/visual/impl/MenuItemImpl.cpp:193-196`), so every
+    // item reports `0`.
+    assert_eq!(env.eval_int("m.HMENU"), 0);
+    assert_eq!(env.eval_int("other.HMENU"), 0);
 
     // Reference `TrackPopup` returns `1`
     // (`reference/cpp/core/visual/impl/MenuItemImpl.cpp:309-315`) and the
