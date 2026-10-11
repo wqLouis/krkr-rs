@@ -211,6 +211,43 @@ Sources: `/tmp/kag-render-audit.md`, `/tmp/kag-compat-audit.md`, `/tmp/kag-flow-
   disagree on `DiagonalBrick` (style 38, which `advscreen.tjs:3033` uses). Pick and
   record the oracle — it also decides the `LayerExFont` leading metrics.
 
+### Plugin-family natives (`audit-plugin-natives`)
+
+`native_parity` checks only core `.cpp`, and `plugin_parity` is blind to every
+**post-registration global**, so this surface has no parity coverage at all:
+`dirlist`'s `getDirList`, `fftgraph`'s `drawFFTGraph`, `fstat`'s
+`FILE_ATTRIBUTE_*`, `motionplayer`'s `ShortCutInitial*`, and the whole real
+`WIN32Dialog` surface. 100% parity is not coverage.
+
+Several vendored plugin sources are **stubs or reconstructions**, so "match the
+reference" is undefined for them: `json/jsonPlugin.cpp` is a self-labelled demo
+that returns its input strings, `win32dialog.cpp` is 12 lines (`messageBox`
+only), `windowEx.cpp`'s `System` returns `TJS_S_OK` without writing a result, and
+`psbfile` has `TODO` bodies. The port implements the *real* plugin in some cases
+and the stub in others — each needs an explicit oracle decision.
+
+* [ ] **PN1 (P1)** `motion_player` is missing the `ShortCutInitial*` globals.
+* [ ] **PN2 (P1)** `xp3_filter`: the buffer object is an `Array` carrying only
+  `xor`; the reference's `CBinaryAccessor` also has `ptr`/`count` and its
+  operators, and the content filter runs **per entry**, not per segment.
+* [ ] **PN3 (P1, oracle)** decide the `json` oracle (see above) and record it.
+* [ ] **PN4 (P2)** `fstat`: raise/validation paths, `moveFile` deleting on
+  failure, and the `getDisplayName`/`copyFileNoNormalize` archive handling.
+* [ ] **PN5 (P2)** `dirlist`: `getDirList` raises instead of returning `[]` for a
+  missing directory, and there is no `S_IFREG|S_IFDIR` filter.
+* [ ] **PN6 (P2)** `scripts_ex`: `safeEvalStorage` drops `context` and the mode;
+  `storage_name` misses `>`; `getObjectCount` returns a hard zero for arrays.
+* [ ] **PN7 (P2)** `windowEx`'s `System` oracle; the `layer_ex` `Appearance`
+  argument defaults (LOP-4); a dead filter in `save_struct`; the `psd://`/`psb://`
+  seams.
+* [ ] **PN8 (P3)** `windowEx` writable `ncht*`; the `steam` synthetic
+  `interface`; teach `scripts/plugin_parity.py` to see post-registration globals.
+* [x] **PN9 (do not "fix")** reference-stub members that must stay as they are:
+  `Point::contains`, `setMaxTextureSize`, `TextRenderBase.newline`/`setKeyWait`,
+  and the `fstat` no-op returns.
+* [ ] **PN10 (P0, deferred)** the real `WIN32Dialog` surface — the platform dialog
+  layer (§4).
+
 ### Input / audio / video (`audit-media-input`)
 
 * [ ] **M1 (P0)** the key code handed to scripts is the winit `KeyCode`
@@ -258,11 +295,8 @@ anomaly (`/mnt/DATA/Games/Others/doinaka_brother`) is a title-specific
 encrypted-name DRM variant, **not** a parse bug — do not "fix" it in the storage
 layer.
 
-* [ ] **F5 (P1)** the extraction/content filter is handed `entry.raw_name`
-  (`crates/platform/fs/src/xp3.rs:353-359`); the reference passes the
-  **normalized** name (`XP3Archive.cpp:996-1002`, `:435-437`, opened with
-  `normalizeName=true`), so a name-dependent `xp3filter.tjs` decrypts the wrong
-  bytes. The tests miss it because their names are same-case ASCII.
+* [x] **F5 (P1)** the filter now receives the **normalized** name
+  (`crates/platform/fs/src/xp3.rs:361`) — landed with the fs/XP3 batch.
 * [ ] **F1 (P1)** `Storage::mount_archives` aborts on the first bad `*.xp3`
   discovered by `app/src/game.rs:152-159` (`engine/storage.rs:182-191`); the
   reference opens archives lazily and defensively (`StorageIntf.cpp:704-724`,
