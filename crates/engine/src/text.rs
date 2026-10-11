@@ -128,6 +128,22 @@ pub enum TextError {
         /// Atlas height in pixels.
         height: u32,
     },
+    /// A coverage mask's byte count does not match its dimensions.
+    #[error("coverage mask {width}x{height} has {len} bytes")]
+    InvalidCoverage {
+        /// Declared mask width.
+        width: u32,
+        /// Declared mask height.
+        height: u32,
+        /// Number of coverage bytes supplied.
+        len: usize,
+    },
+    /// A coverage convolution would produce a mask too large to allocate.
+    #[error("blurring coverage by {blur_width} pixels overflows the mask size")]
+    MaskTooLarge {
+        /// Requested blur width in pixels.
+        blur_width: i32,
+    },
     /// The L1 glyph rasterizer failed.
     #[error(transparent)]
     Glyph(#[from] api::error::GlyphError),
@@ -252,6 +268,83 @@ impl TextLayout {
     /// Returns the number of positioned glyphs.
     pub fn len(&self) -> usize {
         self.glyphs.len()
+    }
+}
+
+/// An 8-bit single-channel coverage mask with the position of its top-left
+/// corner in a text's local coordinate space.
+///
+/// `coverage` holds exactly `width * height` row-major bytes, where `0` is
+/// fully transparent and `255` fully covered. The constructor enforces that
+/// invariant, so a mask is always internally consistent.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct CoverageMask {
+    x: f32,
+    y: f32,
+    width: u32,
+    height: u32,
+    coverage: Vec<u8>,
+}
+
+impl CoverageMask {
+    /// Creates a coverage mask from a positioned buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TextError::InvalidCoverage`] when `coverage.len()` is not
+    /// exactly `width * height`.
+    pub fn new(
+        x: f32,
+        y: f32,
+        width: u32,
+        height: u32,
+        coverage: Vec<u8>,
+    ) -> Result<Self, TextError> {
+        if coverage.len() as u64 != u64::from(width) * u64::from(height) {
+            return Err(TextError::InvalidCoverage {
+                width,
+                height,
+                len: coverage.len(),
+            });
+        }
+        Ok(Self {
+            x,
+            y,
+            width,
+            height,
+            coverage,
+        })
+    }
+
+    /// The mask's left edge in text-local pixels.
+    pub const fn x(&self) -> f32 {
+        self.x
+    }
+
+    /// The mask's top edge in text-local pixels.
+    pub const fn y(&self) -> f32 {
+        self.y
+    }
+
+    /// The mask width in pixels.
+    pub const fn width(&self) -> u32 {
+        self.width
+    }
+
+    /// The mask height in pixels.
+    pub const fn height(&self) -> u32 {
+        self.height
+    }
+
+    /// The row-major `width * height` coverage bytes.
+    pub fn coverage(&self) -> &[u8] {
+        &self.coverage
+    }
+
+    /// Returns `true` when the mask has no pixels.
+    pub const fn is_empty(&self) -> bool {
+        self.width == 0 || self.height == 0
     }
 }
 
@@ -1116,6 +1209,216 @@ pub fn compose_text_cpu(
     out
 }
 
+/// Rasterizes every glyph of `layout` into its own 8-bit coverage mask,
+/// positioned in the text's local coordinate space.
+///
+/// Each glyph keeps its own mask (rather than one mask for the whole run) so
+/// a caller can blur or transform one character without bleeding into its
+/// neighbours.
+///
+/// When `antialias` is false the glyph coverage is thresholded to fully
+/// transparent or fully opaque, matching the aliased coverage the CPU
+/// compositor blends.
+///
+/// # Errors
+///
+/// Propagates [`TextEngine::rasterize_glyph`]'s errors.
+pub fn rasterize_text_coverage(
+    engine: &TextEngine,
+    layout: &TextLayout,
+    style: &TextStyle,
+    antialias: bool,
+) -> Result<Vec<CoverageMask>, TextError> {
+    let mut masks = Vec::with_capacity(layout.glyphs.len());
+    for glyph in &layout.glyphs {
+        let bitmap = engine.rasterize_glyph(glyph.font, glyph.codepoint, style)?;
+        if bitmap.is_empty() || !bitmap.is_consistent() {
+            continue;
+        }
+        let mut coverage = bitmap.coverage;
+        if !antialias {
+            for value in &mut coverage {
+                *value = if *value >= 128 { 255 } else { 0 };
+            }
+        }
+        masks.push(CoverageMask::new(
+            glyph.x + bitmap.bearing_x,
+            glyph.baseline_y - bitmap.bearing_y,
+            bitmap.width,
+            bitmap.height,
+            coverage,
+        )?);
+    }
+    Ok(masks)
+}
+
+/// Blurs a positioned 8-bit coverage mask with the reference character-blur
+/// kernel.
+///
+/// `blur_width == 0` keeps the mask's size and scales every byte by
+/// `blur_level / 256`; `blur_level == 255 && blur_width == 0` is the sharp
+/// no-op. A nonzero width expands the mask by `abs(blur_width)` transparent
+/// pixels on every side and convolves the source with the cone kernel.
+///
+/// # Errors
+///
+/// Returns [`TextError::MaskTooLarge`] when the expanded mask cannot be
+/// allocated.
+pub fn blur_coverage(
+    mask: &CoverageMask,
+    blur_level: u8,
+    blur_width: i32,
+) -> Result<CoverageMask, TextError> {
+    if blur_level == 255 && blur_width == 0 {
+        return Ok(mask.clone());
+    }
+    if blur_width == 0 {
+        let coverage = mask
+            .coverage
+            .iter()
+            .map(|&src| mul_coverage(src, blur_level))
+            .collect();
+        return CoverageMask::new(mask.x, mask.y, mask.width, mask.height, coverage);
+    }
+
+    let bw = blur_width.unsigned_abs();
+    let pad = bw
+        .checked_mul(2)
+        .ok_or(TextError::MaskTooLarge { blur_width })?;
+    let width = mask
+        .width
+        .checked_add(pad)
+        .ok_or(TextError::MaskTooLarge { blur_width })?;
+    let height = mask
+        .height
+        .checked_add(pad)
+        .ok_or(TextError::MaskTooLarge { blur_width })?;
+    let len = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or(TextError::MaskTooLarge { blur_width })?;
+    let mut dest = Vec::new();
+    dest.try_reserve_exact(len)
+        .map_err(|_| TextError::MaskTooLarge { blur_width })?;
+    dest.resize(len, 0);
+
+    // The integer cone radius and normalisation.
+    let bw_i = i64::from(bw);
+    let mut lvsum_total: i64 = 0;
+    for oy in -bw_i..=bw_i {
+        for ox in -bw_i..=bw_i {
+            let distance = i64::from(fast_int_hypot(ox as i32, oy as i32));
+            if distance <= bw_i {
+                lvsum_total += bw_i - distance + 1;
+            }
+        }
+    }
+    let lvsum = if lvsum_total != 0 {
+        (1i64 << 18) / lvsum_total
+    } else {
+        1i64 << 18
+    };
+
+    let source_width = mask.width as usize;
+    for oy in -bw_i..=bw_i {
+        for ox in -bw_i..=bw_i {
+            let distance = i64::from(fast_int_hypot(ox as i32, oy as i32));
+            if distance > bw_i {
+                continue;
+            }
+            let weight = ((bw_i - distance + 1) * lvsum * i64::from(blur_level)) >> 8;
+            if weight == 0 {
+                continue;
+            }
+            for sy in 0..mask.height as usize {
+                let row = (sy as i64 + bw_i + oy) * i64::from(width);
+                for sx in 0..source_width {
+                    let index = (row + sx as i64 + bw_i + ox) as usize;
+                    let add = (i64::from(mask.coverage[sy * source_width + sx]) * weight) >> 18;
+                    if add == 0 {
+                        continue;
+                    }
+                    let value = i64::from(dest[index]) + add;
+                    dest[index] = value.min(255) as u8;
+                }
+            }
+        }
+    }
+
+    CoverageMask::new(
+        mask.x - blur_width as f32,
+        mask.y - blur_width as f32,
+        width,
+        height,
+        dest,
+    )
+}
+
+/// Scales one coverage byte by `level / 256`, saturating at `255`.
+fn mul_coverage(src: u8, level: u8) -> u8 {
+    ((u32::from(src) * u32::from(level)) >> 8).min(255) as u8
+}
+
+/// The integer hypotenuse approximation, reproduced bit for bit.
+fn fast_int_hypot(lx: i32, ly: i32) -> u32 {
+    let lx = lx.unsigned_abs();
+    let ly = ly.unsigned_abs();
+    let (len1, len2) = if lx >= ly { (lx, ly) } else { (ly, lx) };
+    let t = len2 + (len2 >> 1);
+    len1 - (len1 >> 5) - (len1 >> 7) + (t >> 2) + (t >> 6)
+}
+
+/// Composites a positioned coverage mask into `bitmap`, source-over, tinted
+/// with `color` and scaled by `opacity` (`0..=255`).
+///
+/// Returns the clipped destination rectangle that received ink, or `None`
+/// when the mask falls entirely outside `clip` or `bitmap`.
+#[allow(clippy::too_many_arguments)]
+pub fn blit_coverage_into(
+    bitmap: &mut BitmapState,
+    clip: RectI,
+    mask: &CoverageMask,
+    dest_x: i32,
+    dest_y: i32,
+    color: [u8; 4],
+    opacity: u8,
+) -> Option<RectI> {
+    if mask.is_empty() {
+        return None;
+    }
+    let rect = (
+        dest_x,
+        dest_y,
+        dest_x.saturating_add(mask.width as i32),
+        dest_y.saturating_add(mask.height as i32),
+    );
+    let drawn = clip_glyph_rect(bitmap, clip, rect)?;
+    let opacity = f32::from(opacity) / 255.0;
+    for row in 0..mask.height as i32 {
+        for column in 0..mask.width as i32 {
+            let index = row as usize * mask.width as usize + column as usize;
+            let coverage = mask.coverage[index];
+            if coverage == 0 {
+                continue;
+            }
+            let x = dest_x + column;
+            let y = dest_y + row;
+            if x < drawn.0 || y < drawn.1 || x >= drawn.2 || y >= drawn.3 {
+                continue;
+            }
+            if let Some(offset) = bitmap.pixel_offset(x as u32, y as u32) {
+                blend_tinted_coverage(
+                    &mut bitmap.rgba[offset..offset + 4],
+                    coverage,
+                    color,
+                    opacity,
+                );
+            }
+        }
+    }
+    bitmap.mark_dirty();
+    Some(drawn)
+}
+
 /// Composites one laid-out run of text directly into `bitmap`, source-over.
 ///
 /// Unlike [`compose_text_cpu`], this needs no [`GlyphAtlas`] or render
@@ -1152,63 +1455,24 @@ pub fn compose_text_into(
         return Err(TextError::InvalidSize(style.size_px));
     }
     let (sin, cos) = angle.sin_cos();
-    let opacity = f32::from(opacity) / 255.0;
+    let masks = rasterize_text_coverage(engine, layout, style, antialias)?;
     let mut ink: Option<RectI> = None;
-    for glyph in &layout.glyphs {
-        let mask = engine.rasterize_glyph(glyph.font, glyph.codepoint, style)?;
-        if mask.is_empty() || !mask.is_consistent() {
-            continue;
-        }
-        let local_x = glyph.x + mask.bearing_x;
-        let local_y = glyph.baseline_y - mask.bearing_y;
+    for mask in &masks {
         let (rot_x, rot_y) = if angle == 0.0 {
-            (local_x, local_y)
+            (mask.x, mask.y)
         } else {
-            (local_x * cos - local_y * sin, local_x * sin + local_y * cos)
+            (mask.x * cos - mask.y * sin, mask.x * sin + mask.y * cos)
         };
         let dest_x = (origin.0 + rot_x).round() as i32;
         let dest_y = (origin.1 + rot_y).round() as i32;
-        let rect = (
-            dest_x,
-            dest_y,
-            dest_x.saturating_add(mask.width as i32),
-            dest_y.saturating_add(mask.height as i32),
-        );
-        let Some(drawn) = clip_glyph_rect(bitmap, clip, rect) else {
-            continue;
-        };
-        for row in 0..mask.height as i32 {
-            for column in 0..mask.width as i32 {
-                let index = row as usize * mask.width as usize + column as usize;
-                let mut coverage = mask.coverage.get(index).copied().unwrap_or(0);
-                if !antialias {
-                    coverage = if coverage >= 128 { 255 } else { 0 };
-                }
-                if coverage == 0 {
-                    continue;
-                }
-                let x = dest_x + column;
-                let y = dest_y + row;
-                if x < drawn.0 || y < drawn.1 || x >= drawn.2 || y >= drawn.3 {
-                    continue;
-                }
-                if let Some(offset) = bitmap.pixel_offset(x as u32, y as u32) {
-                    blend_tinted_coverage(
-                        &mut bitmap.rgba[offset..offset + 4],
-                        coverage,
-                        style.color,
-                        opacity,
-                    );
-                }
-            }
+        if let Some(drawn) =
+            blit_coverage_into(bitmap, clip, mask, dest_x, dest_y, style.color, opacity)
+        {
+            ink = Some(match ink {
+                None => drawn,
+                Some(previous) => union_rect(previous, drawn),
+            });
         }
-        ink = Some(match ink {
-            None => drawn,
-            Some(previous) => union_rect(previous, drawn),
-        });
-    }
-    if ink.is_some() {
-        bitmap.mark_dirty();
     }
     Ok(ink)
 }

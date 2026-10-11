@@ -23,6 +23,7 @@ use common::vm_lock;
 use compat::CompatHost;
 use engine::Scene;
 use engine::Storage;
+use engine::text::{CoverageMask, blur_coverage};
 use fs::FileSystem;
 use tjs::{Tjs2Engine, TjsValue};
 
@@ -686,16 +687,69 @@ fn text_render_get_characters_only_populates_the_reference_ranges() {
     assert_eq!(env.eval_int("t.getCharacters(1, 2).count"), 0);
 }
 
+/// `tTVPCharacterData::Blur` expands the bitmap by `abs(blurwidth)` on every
+/// side and runs `TVPChBlurCopy65`, whose kernel is
+/// `weight = ((bw - len + 1) * lvsum * blurlevel) >> 8` with
+/// `lvsum = (1<<18) / SUM(bw - len + 1)`, the reference `fast_int_hypot`
+/// length and the accumulation `dest[i] = min(255, dest[i] + (src[i] * weight >> 18))`
+/// (`reference/cpp/core/visual/CharacterData.cpp:118-160`,
+/// `reference/cpp/core/visual/tvpgl.cpp:10738-10813`).
+///
+/// For a single fully covered pixel, `bw = 1` gives `lvsum = 26214`, the
+/// centre weight `52223` and the rim weight `26111`; with `blurlevel = 255`
+/// the expanded 3x3 mask is therefore a cone with a `50` centre and `25` rim.
+#[test]
+fn blur_coverage_matches_the_reference_cone_kernel() {
+    let source = CoverageMask::new(0.0, 0.0, 1, 1, vec![255]).expect("consistent mask");
+    let blurred = blur_coverage(&source, 255, 1).expect("the blur fits");
+    assert_eq!((blurred.width(), blurred.height()), (3, 3));
+    assert_eq!(blurred.coverage(), &[25, 25, 25, 25, 50, 25, 25, 25, 25]);
+
+    // A partially covered source scales every contribution through the same
+    // integer truncation.
+    let source = CoverageMask::new(0.0, 0.0, 1, 1, vec![128]).expect("consistent mask");
+    let blurred = blur_coverage(&source, 255, 1).expect("the blur fits");
+    assert_eq!(blurred.coverage(), &[12, 12, 12, 12, 25, 12, 12, 12, 12]);
+
+    // A two-pixel source exercises the neighbour accumulation: each interior
+    // destination sums the centre weight (50) and a rim weight (25).
+    let source = CoverageMask::new(0.0, 0.0, 2, 1, vec![255, 255]).expect("consistent mask");
+    let blurred = blur_coverage(&source, 255, 1).expect("the blur fits");
+    assert_eq!((blurred.width(), blurred.height()), (4, 3));
+    assert_eq!(
+        blurred.coverage(),
+        &[25, 50, 50, 25, 25, 75, 75, 25, 25, 50, 50, 25]
+    );
+}
+
+/// Reference: with `blurwidth == 0` the mask keeps its size and every byte is
+/// scaled by `blurlevel / 256` through `TVPChBlurMulCopy65`
+/// (`reference/cpp/core/visual/CharacterData.cpp:118-160`,
+/// `reference/cpp/core/visual/tvpgl.cpp:10645-10680`). `blurlevel == 255 &&
+/// blurwidth == 0` is the sharp no-op that reuses the main character data
+/// unchanged.
+#[test]
+fn blur_coverage_zero_width_scales_and_the_sharp_case_is_a_no_op() {
+    let source = CoverageMask::new(0.0, 0.0, 2, 1, vec![200, 100]).expect("consistent mask");
+
+    let scaled = blur_coverage(&source, 128, 0).expect("the blur fits");
+    assert_eq!((scaled.width(), scaled.height()), (2, 1));
+    assert_eq!(scaled.coverage(), &[100, 50]);
+
+    let sharp = blur_coverage(&source, 255, 0).expect("the blur fits");
+    assert_eq!((sharp.width(), sharp.height()), (2, 1));
+    assert_eq!(sharp.coverage(), source.coverage());
+}
+
 /// `tTVPNativeBaseBitmap::DrawTextSingle` draws a shadow only when
 /// `shadowlevel` is nonzero (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:1168-1178`),
 /// and a nonzero `shadowwidth` widens the shadow bitmap by that many pixels
 /// on every side (`reference/cpp/core/visual/CharacterData.cpp:118-160`). A
-/// white run with a near-black shadow must therefore leave near-black,
-/// opaque pixels on the background around the glyph; without the spread the
-/// white main pass covers the same pixels and only the antialiased edge is
-/// visible (white text disappears on a white background).
+/// white run with a near-black shadow must therefore leave near-black pixels
+/// on the transparent background around the glyph; the later white main pass
+/// covers the glyph itself, so any dark pixel can only come from the shadow.
 #[test]
-fn layer_draw_text_spreads_its_shadow_beyond_the_glyph() {
+fn layer_draw_text_zero_offset_shadow_leaves_a_dark_halo() {
     let _lock = vm_lock();
     let Some((env, name)) = Env::with_font() else {
         return;
@@ -706,7 +760,7 @@ fn layer_draw_text_spreads_its_shadow_beyond_the_glyph() {
          l.setImageSize(96, 96); \
          l.font.face = '{name}'; \
          l.font.height = 40; \
-         l.drawText(24, 24, 'A', 0x00ffffff, 255, true, 3024, 0x00202020, 3, 0, 0);"
+         l.drawText(24, 24, 'A', 0x00ffffff, 255, true, 255, 0x00202020, 3, 0, 0);"
     ));
 
     let layer = env._scene.layers.last().expect("the layer exists");
@@ -714,14 +768,21 @@ fn layer_draw_text_spreads_its_shadow_beyond_the_glyph() {
         ._scene
         .bitmap(layer.bitmap.expect("the layer has a main image"))
         .expect("the bitmap exists");
-    // The white glyph's interior is repainted by the later main pass, so any
-    // non-transparent near-black pixel can only come from the spread shadow.
+    let dark: Vec<[u8; 4]> = bitmap
+        .rgba
+        .chunks_exact(4)
+        .filter(|pixel| pixel[3] > 0 && pixel[0] < 64 && pixel[1] < 64 && pixel[2] < 64)
+        .map(|pixel| [pixel[0], pixel[1], pixel[2], pixel[3]])
+        .collect();
     assert!(
-        bitmap
-            .rgba
-            .chunks_exact(4)
-            .any(|pixel| pixel[3] > 0 && pixel[0] < 64 && pixel[1] < 64 && pixel[2] < 64),
-        "the shadow should leave dark pixels around the white glyph"
+        !dark.is_empty(),
+        "the zero-offset shadow should leave dark pixels around the white glyph"
+    );
+    // The cone fades to the rim, so the halo contains partially covered
+    // pixels rather than a flat, fully opaque stamp.
+    assert!(
+        dark.iter().any(|pixel| pixel[3] < 255),
+        "the shadow halo should fade rather than be a flat opaque stamp"
     );
 }
 

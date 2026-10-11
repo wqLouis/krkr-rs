@@ -15,7 +15,10 @@ use std::rc::Rc;
 
 use api::media::{DecodedImage, ImageInfo};
 use engine::layer_ops::RectI;
-use engine::text::{FontId, TextEngine, TextStyle, compose_text_into};
+use engine::text::{
+    FontId, TextEngine, TextStyle, blit_coverage_into, blur_coverage, compose_text_into,
+    rasterize_text_coverage,
+};
 use engine::{BitmapState, StorageReadError};
 use tjs::{Tjs2Engine, TjsValue, Value};
 
@@ -295,55 +298,45 @@ pub(crate) fn draw_text_into_bitmap(
     let angle = (angle_tenths * std::f64::consts::PI / 1800.0) as f32;
     let opacity = params.opacity.clamp(0, 255) as u8;
     let mut ink: Option<RectI> = None;
-    // A shadow exists only when `shadowlevel` is nonzero
-    // (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:1168-1178`). A
-    // nonzero `shadowwidth` blurs the shadow and widens its bitmap by that
-    // many pixels on every side (`CharacterData.cpp:118-160`), so the shadow
-    // is stamped over a disk of that radius; a zero width is one offset copy.
+    // A shadow exists only when `shadowlevel` is nonzero; `shadowwidth` is
+    // the blur radius the shadow coverage is expanded by.
     if params.shadow_level != 0 {
-        let mut shadow_style = style;
-        shadow_style.color = [
-            params.shadow_color[0],
-            params.shadow_color[1],
-            params.shadow_color[2],
-            255,
-        ];
-        // `shadowlevel` scales the blurred coverage; the reference saturates
-        // it at full opacity (`TVPChBlurCopy65`,
-        // `reference/cpp/core/visual/tvpgl.cpp:10770-10813`).
-        let level = params.shadow_level.clamp(0, 255) as u16;
-        let shadow_opacity = ((u16::from(opacity) * level) / 255) as u8;
+        // Each character's own coverage is blurred with the cone kernel and
+        // drawn once at the text opacity, before the main pass.
+        let level = params.shadow_level.clamp(0, 255) as u8;
+        let masks = rasterize_text_coverage(&resolver.engine, &layout, &style, params.antialias)
+            .map_err(|error| format!("shadow rasterization failed: {error}"))?;
         let base = (
             (params.x + params.shadow_offset.0) as f32,
             (params.y + params.shadow_offset.1) as f32,
         );
-        let radius = params.shadow_width.max(0);
-        let radius_sq = i64::from(radius) * i64::from(radius);
-        for dy in -radius..=radius {
-            for dx in -radius..=radius {
-                let (dx, dy) = (i64::from(dx), i64::from(dy));
-                if dx * dx + dy * dy > radius_sq {
-                    continue;
-                }
-                let origin = (base.0 + dx as f32, base.1 + dy as f32);
-                if let Some(rect) = compose_text_into(
-                    &resolver.engine,
-                    &layout,
-                    &shadow_style,
-                    origin,
-                    angle,
-                    bitmap,
-                    clip,
-                    shadow_opacity,
-                    params.antialias,
+        let (sin, cos) = angle.sin_cos();
+        for mask in &masks {
+            let blurred = blur_coverage(mask, level, params.shadow_width)
+                .map_err(|error| format!("shadow blur failed: {error}"))?;
+            let (rot_x, rot_y) = if angle == 0.0 {
+                (blurred.x(), blurred.y())
+            } else {
+                (
+                    blurred.x() * cos - blurred.y() * sin,
+                    blurred.x() * sin + blurred.y() * cos,
                 )
-                .map_err(|error| format!("text composition failed: {error}"))?
-                {
-                    ink = Some(match ink {
-                        None => rect,
-                        Some(previous) => union(previous, rect),
-                    });
-                }
+            };
+            let dest_x = (base.0 + rot_x).round() as i32;
+            let dest_y = (base.1 + rot_y).round() as i32;
+            if let Some(rect) = blit_coverage_into(
+                bitmap,
+                clip,
+                &blurred,
+                dest_x,
+                dest_y,
+                params.shadow_color,
+                opacity,
+            ) {
+                ink = Some(match ink {
+                    None => rect,
+                    Some(previous) => union(previous, rect),
+                });
             }
         }
     }
