@@ -17,9 +17,10 @@
 //! * L3 (this module) registers the `Storages` members, retains the TJS
 //!   closures in [`CompatServices::state`], and installs an L2 filter that
 //!   marshals each decoded segment to the retained TJS closure. The content
-//!   filter runs first, exactly like the reference's
-//!   `TVPXP3ArchiveContentFilterWrapper` (`xp3filter.cpp:465-491`), and it
-//!   runs whether or not an extraction filter is installed.
+//!   filter runs once per archive entry, exactly like the reference's
+//!   `TVPXP3ArchiveContentFilterWrapper` (`xp3filter.cpp:465-491`,
+//!   `XP3Archive.cpp:563-572`), and it runs whether or not an extraction
+//!   filter is installed.
 //!
 //! # Script load timing
 //!
@@ -47,10 +48,17 @@
 //! The reference passes a `CBinaryAccessor` whose indexed accessors and
 //! `xor` method rewrite the segment in place. The VM's C ABI cannot expose a
 //! borrowed byte slice as a native object, so the port marshals the segment
-//! as a TJS `Array` of byte values and attaches the reference `xor` helper as
-//! an own member of that object, calls the closure, then copies the array
-//! back into the segment. The closure receives the reference's argument list:
-//! `(file_hash, offset, buffer, buffer_size, file_name, ctx)`.
+//! as a TJS `Array` of byte values and attaches the reference `ptr`/`count`
+//! members and `xor` helper as own members of that object, calls the closure,
+//! then copies the array back into the segment. The closure receives the
+//! reference's argument list:
+//! `(file_hash, offset, buffer, buffer_size, file_name, ctx)`. The `Array`'s
+//! native indexed access already applies the reference's indexed operators
+//! (`^=`, `+=`, ...) to individual bytes; the one surface the port cannot
+//! reproduce is the `CBinaryAccessor` cursor being added to the index inside
+//! a native `[]` access (`PropGetByNum`/`OperationByNum`, `xp3filter.cpp:
+//! 162-197`), which would require a custom dispatch method the C ABI does
+//! not expose.
 //!
 //! The content filter is invoked once per archive entry read before the
 //! extraction filter; its `[ret, ctx]` return value contributes `ctx` (the
@@ -76,9 +84,13 @@ const FILTER_SCRIPT: &str = "xp3filter.tjs";
 /// The script `xor(offset, length, value)` helper attached to every
 /// marshalled buffer, matching the reference `CBinaryAccessor::FuncXor`
 /// (`reference/cpp/plugins/xp3filter.cpp:266-297`). Attaching it to the
-/// per-call buffer object keeps the method off the core `Array` class.
+/// per-call buffer object keeps the method off the core `Array` class. The
+/// reference adds the buffer's `ptr` cursor to `offset` (`:258-260`), so the
+/// helper reads `this.ptr`.
 const BUFFER_XOR_HELPER: &str = "(function(offset, length, value) { \
-     for (var i = 0; i < length; i++) this[offset + i] = this[offset + i] ^ value; \
+     var base = this.ptr; \
+     if (base === void) base = 0; \
+     for (var i = 0; i < length; i++) this[base + offset + i] = this[base + offset + i] ^ value; \
      })";
 
 /// Per-install XP3 filter dispatch state, kept in
@@ -104,6 +116,29 @@ struct Xp3FilterState {
     /// Whether `xp3filter.tjs` has been executed (or a filter was installed
     /// programmatically), so the deferred execution never clobbers it.
     script_loaded: bool,
+    /// The content filter's context for the entry currently being decoded.
+    /// The reference calls the content filter once per entry
+    /// (`reference/cpp/core/archive/xp3/XP3Archive.cpp:563-565`) and passes
+    /// the stored `ctx` to every extraction-filter chunk.
+    entry: Option<EntryContext>,
+}
+
+/// The per-entry result of the content filter, kept for every decoded
+/// segment of the entry.
+struct EntryContext {
+    /// Entry name the context was built for.
+    file_name: String,
+    /// Logical archive name the context was built for.
+    archive_name: String,
+    /// Entry's total uncompressed size.
+    file_size: u64,
+    /// The scalar `ctx` value when the content filter returned a non-object
+    /// (or no filter is installed).
+    value: TjsValue,
+    /// A retained object `ctx`, kept alive while the entry is decoded.
+    owner: Option<DetachedValue>,
+    /// Whether the last decoded segment ended the entry.
+    complete: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -335,27 +370,42 @@ fn dispatch_extraction_filter(engine_ptr: usize, services_ptr: usize, request: F
 
     ensure_script_loaded(engine, services);
 
-    // Take the closures out for the duration of the call so a re-entrant
-    // setter cannot panic the state `RefCell`; put them back afterwards
-    // unless the setter replaced them.
-    let (extraction, content) = {
+    // Take the closures and the cached entry out for the duration of the call
+    // so a re-entrant setter cannot panic the state `RefCell`; put them back
+    // afterwards unless the setter replaced them.
+    let (extraction, content, mut entry) = {
         let mut state = services.state::<Xp3FilterState>();
-        (state.extraction.take(), state.content.take())
+        (
+            state.extraction.take(),
+            state.content.take(),
+            state.entry.take(),
+        )
     };
 
-    let mut ctx_object = None;
-    let ctx = match content.as_ref() {
-        Some(content) => content_context(
+    // The content filter runs once, when the reference opens the entry's
+    // stream (`reference/cpp/core/archive/xp3/XP3Archive.cpp:563-565`), so a
+    // fresh context is built only at the first segment of an entry.
+    let start_new = entry.as_ref().is_none_or(|entry| {
+        offset == 0
+            && (entry.complete
+                || entry.file_name != file_name
+                || entry.archive_name != archive_name
+                || entry.file_size != file_size)
+    });
+    if start_new {
+        entry = Some(build_entry_context(
             engine,
-            content,
+            content.as_ref(),
             file_name,
             archive_name,
             file_size,
-            &mut ctx_object,
-        ),
-        None => TjsValue::Void,
-    };
+        ));
+    }
+    if let Some(entry) = entry.as_mut() {
+        entry.complete = offset.saturating_add(buffer.len() as u64) >= file_size;
+    }
     if let Some(extraction) = extraction.as_ref()
+        && let Some(entry) = entry.as_ref()
         && let Err(error) = apply_extraction_filter(
             engine,
             services,
@@ -366,24 +416,13 @@ fn dispatch_extraction_filter(engine_ptr: usize, services_ptr: usize, request: F
                 file_name,
             },
             buffer,
-            ctx,
+            entry,
         )
     {
         log::warn!("xp3_filter: filter for `{file_name}` failed: {error}");
     }
-    // `ctx_object` is consumed by the call; dropping it here releases it only
-    // if the call never happened.
-    drop(ctx_object);
-    restore_filters(services, extraction, content);
-}
-
-/// Put the temporarily-taken closures back, without clobbering a replacement
-/// the re-entrant call installed.
-fn restore_filters(
-    services: &CompatServices,
-    extraction: Option<DetachedValue>,
-    content: Option<DetachedValue>,
-) {
+    // Put the temporarily-taken closures and the entry back, without
+    // clobbering a replacement the re-entrant call installed.
     let mut state = services.state::<Xp3FilterState>();
     if state.extraction.is_none() {
         state.extraction = extraction;
@@ -391,47 +430,63 @@ fn restore_filters(
     if state.content.is_none() {
         state.content = content;
     }
+    if state.entry.is_none() {
+        state.entry = entry;
+    }
 }
 
-/// Call the content filter and extract its `ctx` result.
+/// Call the content filter once for a freshly opened entry and extract its
+/// `ctx` result.
 ///
 /// The reference reads `[ret, ctx]` only when the filter returns an object;
-/// `ret` is ignored because the L1 read already fetches the whole entry.
-fn content_context(
+/// `ret` is ignored because the L1 read already fetches the whole entry
+/// (`reference/cpp/plugins/xp3filter.cpp:480-490`).
+fn build_entry_context(
     engine: &Tjs2Engine,
-    content: &DetachedValue,
+    content: Option<&DetachedValue>,
     file_name: &str,
     archive_name: &str,
     file_size: u64,
-    object_out: &mut Option<DetachedValue>,
-) -> TjsValue {
+) -> EntryContext {
+    let mut context = EntryContext {
+        file_name: file_name.to_string(),
+        archive_name: archive_name.to_string(),
+        file_size,
+        value: TjsValue::Void,
+        owner: None,
+        complete: false,
+    };
+    let Some(content) = content else {
+        return context;
+    };
     let args = [
         TjsValue::String(file_name.to_string()),
         TjsValue::String(archive_name.to_string()),
         TjsValue::Integer(file_size as i64),
     ];
     let Ok(result) = engine.call_detached(content, &args) else {
-        return TjsValue::Void;
+        log::warn!("xp3_filter: content filter for `{file_name}` raised");
+        return context;
     };
     if !matches!(result, TjsValue::Object) {
-        return TjsValue::Void;
+        return context;
     }
     let Ok(array) = engine.retain_value_detached(&TjsValue::Object) else {
-        return TjsValue::Void;
+        log::warn!("xp3_filter: content filter for `{file_name}` returned an unreadable object");
+        return context;
     };
-    let _ = engine.member(array.raw_id(), "0");
     match engine.member(array.raw_id(), "1") {
-        Ok(TjsValue::Object) => match engine.retain_value_detached(&TjsValue::Object) {
-            Ok(object) => {
-                let ctx = TjsValue::Retained(object.raw_id() as u64);
-                *object_out = Some(object);
-                ctx
+        Ok(TjsValue::Object) => {
+            if let Ok(object) = engine.retain_value_detached(&TjsValue::Object) {
+                context.owner = Some(object);
+            } else {
+                log::warn!("xp3_filter: content filter ctx object could not be retained");
             }
-            Err(_) => TjsValue::Void,
-        },
-        Ok(other) => other,
-        Err(_) => TjsValue::Void,
+        }
+        Ok(other) => context.value = other,
+        Err(error) => log::warn!("xp3_filter: content filter ctx read failed: {error}"),
     }
+    context
 }
 
 /// The archive position and name an extraction filter call receives
@@ -442,15 +497,15 @@ struct FilterCall<'a> {
     file_name: &'a str,
 }
 
-/// Marshal `buffer` to a TJS `Array`, attach the buffer `xor` helper, call
-/// `filter`, and copy the array back.
+/// Marshal `buffer` to a TJS `Array`, attach the reference buffer surface,
+/// call `filter`, and copy the array back.
 fn apply_extraction_filter(
     engine: &Tjs2Engine,
     services: &CompatServices,
     filter: &DetachedValue,
     call: FilterCall<'_>,
     buffer: &mut [u8],
-    ctx: TjsValue,
+    entry: &EntryContext,
 ) -> Result<(), String> {
     let array = match engine.eval_retained("[]", "xp3_filter") {
         Ok(RetainedValue::Object(array)) => array,
@@ -466,6 +521,11 @@ fn apply_extraction_filter(
             &TjsValue::Integer(i64::from(*byte)),
         )?;
     }
+    // The reference `CBinaryAccessor` publishes `ptr` (a writable cursor) and
+    // `count` (`reference/cpp/plugins/xp3filter.cpp:178-214`). The `Array`'s
+    // own `count` already reports the number of marshalled bytes; `ptr`
+    // becomes an own member so the filter script can move the cursor.
+    engine.set_member(array.raw_id(), "ptr", &TjsValue::Integer(0))?;
     // Attach the reference `CBinaryAccessor::xor` helper as an own member of
     // the marshalled buffer (`reference/cpp/plugins/xp3filter.cpp:266-297`),
     // so the filter script can call `buffer.xor(offset, length, value)`
@@ -484,6 +544,16 @@ fn apply_extraction_filter(
         "xor",
         &TjsValue::Retained(helper.raw_id() as u64),
     )?;
+    // A retained `ctx` object is consumed by the call, so duplicate it into a
+    // fresh retention for every segment; a scalar `ctx` passes by value.
+    let ctx_dup = match entry.owner.as_ref() {
+        Some(owner) => Some(engine.duplicate_retained(owner.raw_id())?),
+        None => None,
+    };
+    let ctx = match ctx_dup.as_ref() {
+        Some(dup) => TjsValue::Retained(dup.raw_id() as u64),
+        None => entry.value.clone(),
+    };
     // Pass a duplicate retention: the call consumes the argument's retained
     // id, while `array` stays live for the read-back.
     let pass = engine.duplicate_retained(array.raw_id())?;
@@ -497,6 +567,7 @@ fn apply_extraction_filter(
     ];
     let call = engine.call_detached(filter, &args);
     drop(pass);
+    drop(ctx_dup);
     call?;
     for (index, byte) in buffer.iter_mut().enumerate() {
         match engine.member(array.raw_id(), &index.to_string())? {

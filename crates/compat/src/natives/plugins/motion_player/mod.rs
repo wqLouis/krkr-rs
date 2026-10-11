@@ -340,6 +340,12 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
         emote::register_d3d_emote_module(ctx)?;
     }
 
+    // The post-registration callback defines two empty dictionaries on the
+    // global object when they are unset, because an encrypted
+    // `keybinder.tjs` dereferences them unconditionally
+    // (`reference/cpp/plugins/motionplayer/main.cpp:534-544`).
+    install_shortcut_globals(ctx);
+
     // Keep the `Motion` and global objects alive while aliasing the
     // subclasses and deleting their registration globals.
     let (motion_handle, global_handle) = {
@@ -405,6 +411,32 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
         }
     }
     Ok(())
+}
+
+/// Define `global.ShortCutInitialPadKeyMap` and
+/// `global.ShortCutInitialGamePadKeyMap` as empty dictionaries when unset.
+///
+/// The reference runs `global.X === void ? (global.X = %[]) : void` for each
+/// name and swallows any exception
+/// (`reference/cpp/plugins/motionplayer/main.cpp:536-543`).
+fn install_shortcut_globals(ctx: &CompatCtx) {
+    if !global_exists(ctx, "ShortCutInitialPadKeyMap") {
+        // SAFETY: a `CompatCtx` is only created for a bound, live engine.
+        if let Err(error) = unsafe { ctx.engine() }
+            .exec_script("global.ShortCutInitialPadKeyMap = %[];", "motion_player")
+        {
+            log::warn!("motion_player: cannot define ShortCutInitialPadKeyMap: {error}");
+        }
+    }
+    if !global_exists(ctx, "ShortCutInitialGamePadKeyMap") {
+        // SAFETY: a `CompatCtx` is only created for a bound, live engine.
+        if let Err(error) = unsafe { ctx.engine() }.exec_script(
+            "global.ShortCutInitialGamePadKeyMap = %[];",
+            "motion_player",
+        ) {
+            log::warn!("motion_player: cannot define ShortCutInitialGamePadKeyMap: {error}");
+        }
+    }
 }
 
 /// Install the class-static `Player.useD3D` probe object.

@@ -66,7 +66,7 @@ use tjs::{
 };
 
 use crate::native_util::{args, report_error, set_bool, set_int, set_void, value_as_string};
-use crate::natives::system::{resolve, set_string_out, value_as_bool, value_as_i64};
+use crate::natives::system::{EngineBinding, resolve, set_string_out, value_as_bool, value_as_i64};
 use crate::{CompatCtx, CompatError};
 
 /// The global constants the reference installs from its post-registration
@@ -141,6 +141,12 @@ fn normalize_name(name: &str) -> String {
 /// `reference/cpp/core/base/MsgIntfInc.h:35`,
 /// `reference/cpp/core/base/StorageIntf.cpp:546-550`).
 fn local_path(storage: &Storage, name: &str) -> Result<PathBuf, String> {
+    // `TVPGetLocallyAccessibleName` returns an empty name for any name that
+    // carries the archive delimiter (`reference/cpp/core/base/StorageIntf.cpp:
+    // 554-559`), so `TVPGetLocalName` raises for it.
+    if name.contains('>') {
+        return Err(format!("Cannot get local name from {name}"));
+    }
     match storage.find(name) {
         Ok(Some(Location::Disk(path))) => Ok(path),
         Ok(Some(Location::Archive(_, _))) => Err(format!("Cannot get local name from {name}")),
@@ -164,8 +170,13 @@ fn placed_local(storage: &Storage, name: &str) -> Option<PathBuf> {
 }
 
 /// Resolve a name against the game directory after normalization (`to` /
-/// `copyFile` semantics).
+/// `copyFile` semantics). A name that names an in-archive member has no
+/// locally accessible form, so it yields `None`
+/// (`reference/cpp/core/base/StorageIntf.cpp:554-559`).
 fn normalized_local(storage: &Storage, name: &str) -> Option<PathBuf> {
+    if name.contains(TVP_ARCHIVE_DELIMITER) {
+        return None;
+    }
     let normalized = normalize_name(name);
     storage
         .relative_disk_name(&normalized)
@@ -178,6 +189,73 @@ fn raw_local(storage: &Storage, name: &str) -> Option<PathBuf> {
     storage
         .relative_disk_name(name)
         .map(|relative| storage.game_dir().join(relative))
+}
+
+/// The reference archive delimiter (`TVPArchiveDelimiter`, `>`).
+const TVP_ARCHIVE_DELIMITER: char = '>';
+
+/// The reference `TVPGetLocalName` without the storage search: reject an
+/// in-archive name and otherwise resolve against the game directory without
+/// consulting mounted archives (`copyFileNoNormalize` semantics,
+/// `reference/cpp/plugins/fstat/main.cpp:800-810`).
+fn local_name_no_search(storage: &Storage, name: &str) -> Result<PathBuf, String> {
+    if name.contains(TVP_ARCHIVE_DELIMITER) {
+        return Err(format!("Cannot get local name from {name}"));
+    }
+    raw_local(storage, name).ok_or_else(|| format!("Cannot get local name from {name}"))
+}
+
+/// Validate a directory name the way the reference `changeDirectory` does:
+/// the name must end in `/`, and it must have a locally accessible form
+/// (`reference/cpp/plugins/fstat/main.cpp:683-693`).
+fn change_directory(storage: &Storage, dir: &str) -> Result<(), String> {
+    if !dir.ends_with('/') {
+        return Err("'/' must be specified at the end of given directory name.".to_string());
+    }
+    local_path(storage, &normalize_name(dir)).map(|_| ())
+}
+
+/// Validate a file-attribute member's first argument the way the reference
+/// does: `TVPNormalizeStorageName` then `TVPGetLocalName`, which raises for
+/// an in-archive or otherwise non-local name
+/// (`reference/cpp/plugins/fstat/main.cpp:700-735`).
+fn validate_local_name(
+    resolved: &EngineBinding,
+    argv: *const Value,
+    argc: c_int,
+    out_error: *mut *mut c_char,
+    method: &str,
+) -> Result<(), c_int> {
+    let ctx = resolved.ctx();
+    // SAFETY: only succeeds for the installed, live binding.
+    let services = unsafe { ctx.services() };
+    let storage = match services.storage() {
+        Some(storage) => storage,
+        None => {
+            return Err(report_error(
+                out_error,
+                &format!("Storages.{method}: no storage attached"),
+            ));
+        }
+    };
+    // SAFETY: the host keeps the attached storage alive for the VM lifetime.
+    let storage = unsafe { &*storage };
+    // SAFETY: the trampoline guarantees `argc` valid `Value` entries.
+    let arguments = unsafe { args(argv, argc) };
+    let Some(name) = arguments.first() else {
+        return Err(report_error(
+            out_error,
+            &format!("Storages.{method}: missing file name"),
+        ));
+    };
+    let name = value_as_string(name);
+    if let Err(error) = local_path(storage, &normalize_name(&name)) {
+        return Err(report_error(
+            out_error,
+            &format!("Storages.{method}: {error}"),
+        ));
+    }
+    Ok(())
 }
 
 /// Evaluate a small object expression (`%[]`, `[]`, `new Date()`) and retain
@@ -756,17 +834,25 @@ extern "C" fn storages_move_file(
     let to = value_as_string(&argv[1]);
     let moved = match (local_path(storage, &from), local_path(storage, &to)) {
         (Ok(source), Ok(dest)) if source.is_file() => {
-            match std::fs::copy(&source, &dest).and_then(|_| std::fs::remove_file(&source)) {
-                Ok(()) => true,
-                Err(error) => {
-                    log::warn!(
-                        "Storages.moveFile: {} -> {} failed: {error}",
-                        source.display(),
-                        dest.display()
-                    );
-                    false
-                }
+            let copied = std::fs::copy(&source, &dest);
+            // The reference deletes the source unconditionally after the copy
+            // attempt, so a failed copy still removes it
+            // (`reference/cpp/plugins/fstat/main.cpp:419-432`).
+            if let Err(error) = &copied {
+                log::warn!(
+                    "Storages.moveFile: {} -> {} failed: {error}",
+                    source.display(),
+                    dest.display()
+                );
             }
+            let removed = std::fs::remove_file(&source);
+            if let Err(error) = removed {
+                log::warn!(
+                    "Storages.moveFile: cannot delete {}: {error}",
+                    source.display()
+                );
+            }
+            copied.is_ok()
         }
         _ => false,
     };
@@ -1105,77 +1191,101 @@ fn storages_create_directory_impl(
     0
 }
 
-/// `Storages.changeDirectory(dir)` — the reference logs and reports success.
+/// `Storages.changeDirectory(dir)` — the reference validates the trailing
+/// `/`, normalizes the name and requires a locally accessible form, then
+/// reports success (`reference/cpp/plugins/fstat/main.cpp:683-693`).
 extern "C" fn storages_change_directory(
     engine: *mut c_void,
     argc: c_int,
-    _argv: *const Value,
+    argv: *const Value,
     out: *mut Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
-    let _resolved = resolve_or_return!(engine, out_error, "changeDirectory");
-    if argc < 1 {
+    let resolved = resolve_or_return!(engine, out_error, "changeDirectory");
+    let ctx = resolved.ctx();
+    // SAFETY: only succeeds for the installed, live binding.
+    let services = unsafe { ctx.services() };
+    let storage = require_storage!(services, out_error, "changeDirectory");
+    // SAFETY: the host keeps the attached storage alive for the VM lifetime.
+    let storage = unsafe { &*storage };
+    // SAFETY: the trampoline guarantees `argc` valid `Value` entries.
+    let argv = unsafe { args(argv, argc) };
+    let Some(dir) = argv.first() else {
         return report_error(out_error, "Storages.changeDirectory requires 1 argument");
+    };
+    let dir = value_as_string(dir);
+    if let Err(error) = change_directory(storage, &dir) {
+        return report_error(out_error, &format!("Storages.changeDirectory: {error}"));
     }
     log::warn!("Storages.changeDirectory: not implemented by the reference; returning true");
     set_bool(out, true);
     0
 }
 
-/// `Storages.setFileAttributes(filename, attr)` — reference no-op.
-///
-/// Both parameters are mandatory (`ncbind.hpp:1178` arity check against
-/// `setFileAttributes(ttstr, DWORD)`, `reference/cpp/plugins/fstat/main.cpp:700`).
+/// `Storages.setFileAttributes(filename, attr)` — reference no-op after the
+/// name is normalized and required to be locally accessible
+/// (`reference/cpp/plugins/fstat/main.cpp:700-706`).
 extern "C" fn storages_set_file_attributes(
     engine: *mut c_void,
     argc: c_int,
-    _argv: *const Value,
+    argv: *const Value,
     out: *mut Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
-    let _resolved = resolve_or_return!(engine, out_error, "setFileAttributes");
+    let resolved = resolve_or_return!(engine, out_error, "setFileAttributes");
     if argc < 2 {
         return report_error(out_error, "Storages.setFileAttributes requires 2 arguments");
+    }
+    if let Err(code) = validate_local_name(&resolved, argv, argc, out_error, "setFileAttributes") {
+        return code;
     }
     log::warn!("Storages.setFileAttributes: not implemented by the reference; returning true");
     set_bool(out, true);
     0
 }
 
-/// `Storages.resetFileAttributes(filename, attr)` — reference no-op.
-///
-/// Both parameters are mandatory (`ncbind.hpp:1178`,
-/// `reference/cpp/plugins/fstat/main.cpp:713`).
+/// `Storages.resetFileAttributes(filename, attr)` — reference no-op after the
+/// name is normalized and required to be locally accessible
+/// (`reference/cpp/plugins/fstat/main.cpp:713-719`).
 extern "C" fn storages_reset_file_attributes(
     engine: *mut c_void,
     argc: c_int,
-    _argv: *const Value,
+    argv: *const Value,
     out: *mut Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
-    let _resolved = resolve_or_return!(engine, out_error, "resetFileAttributes");
+    let resolved = resolve_or_return!(engine, out_error, "resetFileAttributes");
     if argc < 2 {
         return report_error(
             out_error,
             "Storages.resetFileAttributes requires 2 arguments",
         );
     }
+    if let Err(code) = validate_local_name(&resolved, argv, argc, out_error, "resetFileAttributes")
+    {
+        return code;
+    }
     log::warn!("Storages.resetFileAttributes: not implemented by the reference; returning true");
     set_bool(out, true);
     0
 }
 
-/// `Storages.getFileAttributes(filename)` — reference no-op returning `0`.
+/// `Storages.getFileAttributes(filename)` — reference no-op returning `0`
+/// after the name is normalized and required to be locally accessible
+/// (`reference/cpp/plugins/fstat/main.cpp:728-735`).
 extern "C" fn storages_get_file_attributes(
     engine: *mut c_void,
     argc: c_int,
-    _argv: *const Value,
+    argv: *const Value,
     out: *mut Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
-    let _resolved = resolve_or_return!(engine, out_error, "getFileAttributes");
+    let resolved = resolve_or_return!(engine, out_error, "getFileAttributes");
     if argc < 1 {
         return report_error(out_error, "Storages.getFileAttributes requires 1 argument");
+    }
+    if let Err(code) = validate_local_name(&resolved, argv, argc, out_error, "getFileAttributes") {
+        return code;
     }
     log::warn!("Storages.getFileAttributes: not implemented by the reference; returning 0");
     set_int(out, 0);
@@ -1295,8 +1405,18 @@ fn storages_copy_file_impl(
     let source = placed_local(storage, &from);
     let dest = if normalize {
         normalized_local(storage, &to)
+    } else if to.is_empty() {
+        None
     } else {
-        raw_local(storage, &to)
+        // `copyFileNoNormalize` resolves `to` through `TVPGetLocalName`
+        // without an auto-path search, which raises for an in-archive target
+        // (`reference/cpp/plugins/fstat/main.cpp:800-810`).
+        match local_name_no_search(storage, &to) {
+            Ok(path) => Some(path),
+            Err(error) => {
+                return report_error(out_error, &format!("Storages.{method}: {error}"));
+            }
+        }
     };
     let copied = match (source, dest) {
         (Some(source), Some(dest)) => match std::fs::copy(&source, &dest) {
@@ -1377,11 +1497,19 @@ extern "C" fn storages_get_display_name(
         return report_error(out_error, "Storages.getDisplayName requires 1 argument");
     };
     let name = value_as_string(name);
-    let display = local_path(storage, &name)
-        .ok()
-        .filter(|path| path.exists())
-        .and_then(|path| path.file_name().map(|n| n.to_string_lossy().into_owned()))
-        .unwrap_or_default();
+    let path = match local_path(storage, &normalize_name(&name)) {
+        Ok(path) => path,
+        Err(error) => {
+            return report_error(out_error, &format!("Storages.getDisplayName: {error}"));
+        }
+    };
+    let display = if path.exists() {
+        path.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     set_string_out(&ctx, out, &display);
     0
 }
@@ -1548,14 +1676,31 @@ extern "C" fn storages_current_path_get(
 }
 
 /// `Storages.currentPath` setter — the reference forwards to
-/// `changeDirectory`, which is a no-op on non-Windows hosts.
+/// `changeDirectory`, so a name without the trailing `/` raises and an
+/// in-archive name raises `TVPCannotGetLocalName`
+/// (`reference/cpp/plugins/fstat/main.cpp:909-915`).
 extern "C" fn storages_current_path_set(
     engine: *mut c_void,
-    _value: *const Value,
-    _out_error: *mut *mut c_char,
+    value: *const Value,
+    out_error: *mut *mut c_char,
 ) -> c_int {
-    let resolved = resolve_or_return!(engine, _out_error, "currentPath");
-    let _ = resolved;
+    let resolved = resolve_or_return!(engine, out_error, "currentPath");
+    let ctx = resolved.ctx();
+    // SAFETY: only succeeds for the installed, live binding.
+    let services = unsafe { ctx.services() };
+    let storage = require_storage!(services, out_error, "currentPath");
+    // SAFETY: the host keeps the attached storage alive for the VM lifetime.
+    let storage = unsafe { &*storage };
+    let path = if value.is_null() {
+        String::new()
+    } else {
+        // SAFETY: the trampoline passes a valid value slot for the property
+        // write.
+        value_as_string(unsafe { &*value })
+    };
+    if let Err(error) = change_directory(storage, &path) {
+        return report_error(out_error, &format!("Storages.currentPath: {error}"));
+    }
     log::warn!("Storages.currentPath: changeDirectory is not implemented by the reference");
     0
 }

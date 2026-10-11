@@ -887,3 +887,89 @@ fn current_path_write_is_the_reference_no_op() {
     env.run("Storages.currentPath = 'C:/elsewhere/';");
     assert_eq!(env.string("Storages.currentPath"), before);
 }
+
+/// Reference: `changeDirectory`, `setFileAttributes`, `resetFileAttributes`
+/// and `getFileAttributes` normalize the name and require a locally
+/// accessible form (`TVPGetLocalName`), so an in-archive name raises
+/// `TVPCannotGetLocalName`; `changeDirectory` additionally requires the
+/// trailing `/` (`reference/cpp/plugins/fstat/main.cpp:683-735`). The
+/// `currentPath` setter forwards to `changeDirectory` (`main.cpp:915`).
+#[test]
+fn change_directory_and_attributes_validate_the_local_name() {
+    let _lock = vm_lock();
+    let mut env = Env::new();
+    env.dir.as_ref().unwrap().write("a.txt", b"a");
+    env.mount_xp3(&[("inside.txt", b"x", false)]);
+
+    let message = env.error("Storages.changeDirectory('data')");
+    assert!(
+        message.contains("'/' must be specified at the end of given directory name."),
+        "unexpected message: {message}"
+    );
+    assert!(env.bool("Storages.changeDirectory('folder/')"));
+
+    assert!(
+        env.error("Storages.changeDirectory('data.xp3>inside.txt/')")
+            .contains("Cannot get local name"),
+        "changeDirectory must reject an in-archive name"
+    );
+
+    let message = env.error("Storages.currentPath = 'data';");
+    assert!(
+        message.contains("'/' must be specified at the end of given directory name."),
+        "unexpected message: {message}"
+    );
+
+    for call in [
+        "Storages.setFileAttributes('data.xp3>inside.txt', 1)",
+        "Storages.resetFileAttributes('data.xp3>inside.txt', 1)",
+        "Storages.getFileAttributes('data.xp3>inside.txt')",
+    ] {
+        assert!(
+            env.error(call).contains("Cannot get local name"),
+            "{call} must reject an in-archive name"
+        );
+    }
+}
+
+/// Reference: `moveFile` calls `TVPDeleteFile` on the source
+/// **unconditionally** after the copy attempt, so a failed copy still removes
+/// the source (`reference/cpp/plugins/fstat/main.cpp:417-437`); the return
+/// value is the copy result.
+#[test]
+fn move_file_deletes_the_source_even_when_the_copy_fails() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.dir.as_ref().unwrap().write("src.txt", b"payload");
+
+    // The destination's parent directory does not exist, so the copy fails.
+    assert!(!env.bool("Storages.moveFile('src.txt', 'missing/dst.txt')"));
+    assert!(
+        !env.dir.as_ref().unwrap().path().join("src.txt").exists(),
+        "the reference deletes the source even when the copy fails"
+    );
+}
+
+/// Reference: `getDisplayName` calls `TVPGetLocalName`, which raises for an
+/// in-archive name (`reference/cpp/plugins/fstat/main.cpp:826-834`), while
+/// `copyFileNoNormalize` deliberately routes its `to` name through
+/// `TVPGetLocalName` so an archive target raises (`main.cpp:800-810`).
+/// `copyFile` (normalized) returns `false` for the same target instead
+/// (`main.cpp:774-781`).
+#[test]
+fn archive_display_and_copy_names_follow_the_reference() {
+    let _lock = vm_lock();
+    let mut env = Env::new();
+    env.dir.as_ref().unwrap().write("a.txt", b"a");
+    env.mount_xp3(&[("inside.txt", b"x", false)]);
+
+    assert!(
+        env.error("Storages.getDisplayName('data.xp3>inside.txt')")
+            .contains("Cannot get local name")
+    );
+    assert!(
+        env.error("Storages.copyFileNoNormalize('a.txt', 'data.xp3>inside.txt', false)")
+            .contains("Cannot get local name")
+    );
+    assert!(!env.bool("Storages.copyFile('a.txt', 'data.xp3>inside.txt')"));
+}

@@ -122,40 +122,9 @@ pub(super) fn layer_clip(scene: &Scene, id: u32) -> engine::layer_ops::RectI {
 }
 
 /// Ensure `layer_id` owns a MainImage of at least `w` x `h`, preserving
-/// content and filling the expansion with the layer's neutral color. Mirrors
-/// the reference `AllocateImage` / the `Layer.setImageSize` path.
+/// content and filling the expansion with the layer's neutral color.
 pub(super) fn ensure_layer_image(scene: &mut Scene, layer_id: u32, w: u32, h: u32) {
-    let w = w.max(1);
-    let h = h.max(1);
-    let existing = scene.layer(layer_id).and_then(|l| l.bitmap);
-    match existing {
-        Some(bitmap_id) => {
-            let fill = scene
-                .layer(layer_id)
-                .map(|l| argb_to_rgba(l.neutral_color))
-                .unwrap_or([0, 0, 0, 0]);
-            scene.resize_bitmap(bitmap_id, w, h, fill);
-        }
-        None => {
-            let Some(len) = (w as usize)
-                .checked_mul(h as usize)
-                .and_then(|n| n.checked_mul(4))
-            else {
-                return;
-            };
-            let bitmap_id = scene.add_bitmap(w, h, vec![0u8; len]);
-            if let Some(layer) = scene.layer_mut(layer_id) {
-                layer.bitmap = Some(bitmap_id);
-                layer.image_left = 0;
-                layer.image_top = 0;
-                layer.image_width = w;
-                layer.image_height = h;
-                layer.rect.w = w;
-                layer.rect.h = h;
-                layer.image_modified = true;
-            }
-        }
-    }
+    scene.ensure_layer_image(layer_id, w, h);
 }
 
 // ---------------------------------------------------------------------------

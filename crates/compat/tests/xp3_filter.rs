@@ -84,6 +84,62 @@ fn build_xp3(entries: &[(&str, &[u8])]) -> Vec<u8> {
     file
 }
 
+/// Build a raw-index XP3 archive holding one entry composed of several raw
+/// segments (for the per-entry content-filter contract).
+fn build_xp3_segments(name: &str, segments: &[&[u8]]) -> Vec<u8> {
+    let mut file = Vec::new();
+    file.extend_from_slice(&XP3_MAGIC);
+    file.extend_from_slice(&0u64.to_le_bytes());
+
+    let mut starts = Vec::new();
+    for stored in segments {
+        starts.push(file.len() as u64);
+        file.extend_from_slice(stored);
+    }
+    let total: usize = segments.iter().map(|stored| stored.len()).sum();
+
+    let mut segm = Vec::new();
+    segm.extend_from_slice(b"segm");
+    segm.extend_from_slice(&((segments.len() as u64) * 28).to_le_bytes());
+    for (stored, start) in segments.iter().zip(&starts) {
+        segm.extend_from_slice(&SEGM_ENCODE_RAW.to_le_bytes());
+        segm.extend_from_slice(&(*start as i64).to_le_bytes());
+        segm.extend_from_slice(&(stored.len() as i64).to_le_bytes());
+        segm.extend_from_slice(&(stored.len() as i64).to_le_bytes());
+    }
+
+    let units: Vec<u16> = name.encode_utf16().collect();
+    let mut info = Vec::new();
+    info.extend_from_slice(b"info");
+    info.extend_from_slice(&((22 + units.len() * 2) as u64).to_le_bytes());
+    info.extend_from_slice(&0u32.to_le_bytes());
+    info.extend_from_slice(&(total as i64).to_le_bytes());
+    info.extend_from_slice(&(total as i64).to_le_bytes());
+    info.extend_from_slice(&(units.len() as i16).to_le_bytes());
+    for unit in &units {
+        info.extend_from_slice(&unit.to_le_bytes());
+    }
+
+    let mut adlr = Vec::new();
+    adlr.extend_from_slice(b"adlr");
+    adlr.extend_from_slice(&4u64.to_le_bytes());
+    adlr.extend_from_slice(&0x1234_5678u32.to_le_bytes());
+
+    let mut chunk = Vec::new();
+    chunk.extend_from_slice(b"File");
+    chunk.extend_from_slice(&((info.len() + segm.len() + adlr.len()) as u64).to_le_bytes());
+    chunk.extend_from_slice(&info);
+    chunk.extend_from_slice(&segm);
+    chunk.extend_from_slice(&adlr);
+
+    let index_ofs = file.len() as u64;
+    file.push(0u8);
+    file.extend_from_slice(&(chunk.len() as u64).to_le_bytes());
+    file.extend_from_slice(&chunk);
+    file[11..19].copy_from_slice(&index_ofs.to_le_bytes());
+    file
+}
+
 // ---------------------------------------------------------------------------
 // Test environment
 // ---------------------------------------------------------------------------
@@ -470,5 +526,120 @@ fn array_class_has_no_xor_helper() {
             .eval("typeof [].xor", "xp3-filter-test")
             .expect("typeof [].xor"),
         tjs::TjsValue::String("undefined".into())
+    );
+}
+
+// The reference `CBinaryAccessor` publishes `ptr` (a writable cursor) and
+// `count` (`reference/cpp/plugins/xp3filter.cpp:178-214`); the marshalled
+// buffer must expose both, with `count` matching the segment size.
+#[test]
+fn buffer_accessor_reports_ptr_and_count() {
+    let _lock = vm_lock();
+    let key = 0x5Au8;
+    let plain = b"count and ptr";
+    let cipher = xor(plain, key);
+    let script = format!(
+        "function xp3extract(file_hash, offset, buffer, buffer_size, file_name, ctx) {{\n\
+         \x20\x20global.__count = buffer.count;\n\
+         \x20\x20global.__ptr = buffer.ptr;\n\
+         \x20\x20buffer.xor(0, buffer_size, {key});\n\
+         }}\n\
+         Storages.setXP3ArchiveExtractionFilter(xp3extract);\n"
+    );
+
+    let mut env = Env::new(&script);
+    env.write("data.xp3", &build_xp3(&[("secret.txt", &cipher)]));
+    env.mount("data.xp3");
+
+    assert_eq!(env.export("secret.txt", "out.bin"), plain);
+    assert_eq!(
+        env.engine
+            .eval("global.__count", "xp3-filter-test")
+            .expect("count"),
+        tjs::TjsValue::Integer(cipher.len() as i64)
+    );
+    assert_eq!(
+        env.engine
+            .eval("global.__ptr", "xp3-filter-test")
+            .expect("ptr"),
+        tjs::TjsValue::Integer(0)
+    );
+}
+
+// `CBinaryAccessor::FuncXor` adds the cursor to the offset
+// (`reference/cpp/plugins/xp3filter.cpp:258-260`), and `ptr` supports the
+// reference `+=` operator (`Operation`, `:96-116`), so moving the cursor by
+// one and xor-ing `buffer_size - 1` bytes leaves the first byte untouched.
+#[test]
+fn buffer_xor_honours_the_ptr_cursor() {
+    let _lock = vm_lock();
+    let key = 0x66u8;
+    let plain = b"cursor based decryption";
+    let cipher = xor(plain, key);
+    let script = format!(
+        "function xp3extract(file_hash, offset, buffer, buffer_size, file_name, ctx) {{\n\
+         \x20\x20buffer.ptr = 0;\n\
+         \x20\x20buffer.ptr += 1;\n\
+         \x20\x20buffer.xor(0, buffer_size - 1, {key});\n\
+         }}\n\
+         Storages.setXP3ArchiveExtractionFilter(xp3extract);\n"
+    );
+
+    let mut env = Env::new(&script);
+    env.write("data.xp3", &build_xp3(&[("secret.txt", &cipher)]));
+    env.mount("data.xp3");
+
+    let exported = env.export("secret.txt", "out.bin");
+    assert_eq!(
+        exported[0], cipher[0],
+        "the byte at the cursor stays ciphered"
+    );
+    assert_eq!(
+        &exported[1..],
+        &plain[1..],
+        "bytes after the cursor decrypt"
+    );
+}
+
+// The reference runs the content filter once, when the entry stream is
+// opened (`reference/cpp/core/archive/xp3/XP3Archive.cpp:563-565`), so a
+// multi-segment entry must invoke it exactly once even though the extraction
+// filter runs for every segment.
+#[test]
+fn content_filter_runs_once_per_entry() {
+    let _lock = vm_lock();
+    let key = 0x11u8;
+    let part1 = b"first part ";
+    let part2 = b"second part";
+    let cipher1 = xor(part1, key);
+    let cipher2 = xor(part2, key);
+    let script = format!(
+        "global.__content_calls = 0;\n\
+         function xp3content(filepath, archivename, filesize) {{\n\
+         \x20\x20global.__content_calls = global.__content_calls + 1;\n\
+         \x20\x20return [0, {key}];\n\
+         }}\n\
+         function xp3extract(file_hash, offset, buffer, buffer_size, file_name, ctx) {{\n\
+         \x20\x20for (var i = 0; i < buffer_size; i++) buffer[i] = buffer[i] ^ ctx;\n\
+         }}\n\
+         Storages.setXP3ArchiveContentFilter(xp3content);\n\
+         Storages.setXP3ArchiveExtractionFilter(xp3extract);\n"
+    );
+
+    let mut env = Env::new(&script);
+    env.write(
+        "data.xp3",
+        &build_xp3_segments("multi.txt", &[&cipher1, &cipher2]),
+    );
+    env.mount("data.xp3");
+
+    let mut plain = part1.to_vec();
+    plain.extend_from_slice(part2);
+    assert_eq!(env.export("multi.txt", "out.bin"), plain);
+    assert_eq!(
+        env.engine
+            .eval("global.__content_calls", "xp3-filter-test")
+            .expect("content call counter"),
+        tjs::TjsValue::Integer(1)
     );
 }

@@ -708,3 +708,27 @@ fn resource_manager_loads_and_unloads_a_psb_module() {
         "void"
     );
 }
+
+/// Reference: the `PostRegistCallback` defines `global.ShortCutInitialPadKeyMap`
+/// and `global.ShortCutInitialGamePadKeyMap` as empty dictionaries when they
+/// are unset, because an encrypted `keybinder.tjs` dereferences them
+/// (`reference/cpp/plugins/motionplayer/main.cpp:534-544`).
+#[test]
+fn shortcut_initial_globals_are_defined() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    assert_eq!(
+        env.eval_str("typeof global.ShortCutInitialPadKeyMap"),
+        "Object",
+        "ShortCutInitialPadKeyMap must be a dictionary global"
+    );
+    assert_eq!(
+        env.eval_str("typeof global.ShortCutInitialGamePadKeyMap"),
+        "Object",
+        "ShortCutInitialGamePadKeyMap must be a dictionary global"
+    );
+    // The globals are ordinary writable members (the reference uses
+    // `PropSet`), so a game can replace them.
+    env.run("global.ShortCutInitialPadKeyMap = 1;");
+    assert_eq!(env.eval_int("global.ShortCutInitialPadKeyMap"), 1);
+}

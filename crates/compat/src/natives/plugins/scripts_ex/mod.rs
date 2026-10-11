@@ -810,9 +810,10 @@ fn safe_eval_storage(
     };
     let name = value_as_string(name);
     let mode = arguments.get(1).map(value_as_string).unwrap_or_default();
-    if arguments.get(2).is_some_and(|value| value.ty != VAL_VOID) {
-        log::warn!("Scripts.safeEvalStorage: the execution-context argument is ignored");
-    }
+    let context = arguments
+        .get(2)
+        .filter(|value| value.ty != VAL_VOID)
+        .map_or(ptr::null_mut(), |value| value.object_handle());
     let Some(storage) = services.storage() else {
         return Err("scripts_ex: safeEvalStorage: no storage attached".into());
     };
@@ -829,7 +830,7 @@ fn safe_eval_storage(
         .map_err(|error| format!("scripts_ex: safeEvalStorage '{name}': {error}"))?;
     let wrapped = format!("(const)[{text}]");
     let shortname = storage_name(&name);
-    match engine.eval_retained(&wrapped, &shortname) {
+    match engine.eval_retained_with_context(&wrapped, &shortname, context, 0) {
         Ok(RetainedValue::Object(object)) => {
             let value = engine.member(object.raw_id(), "0")?;
             owned_from_tjs(engine, value)
@@ -862,9 +863,14 @@ fn mode_offset(mode: &str) -> Option<usize> {
     None
 }
 
-/// Base name of a storage path (reference `TVPExtractStorageName`).
+/// Base name of a storage path (reference `TVPExtractStorageName`), which
+/// splits on `/`, `\` and the archive delimiter `>`
+/// (`reference/cpp/core/base/StorageIntf.cpp:809-830`).
 fn storage_name(name: &str) -> String {
-    name.rsplit(['/', '\\']).next().unwrap_or(name).to_string()
+    name.rsplit(['/', '\\', '>'])
+        .next()
+        .unwrap_or(name)
+        .to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -1468,4 +1474,19 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
             .map_err(|error| CompatError::Register(format!("scripts_ex: {name}: {error}")))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::storage_name;
+
+    /// Reference `TVPExtractStorageName` splits on `/`, `\` and the archive
+    /// delimiter `>` (`reference/cpp/core/base/StorageIntf.cpp:809-830`).
+    #[test]
+    fn storage_name_splits_on_the_archive_delimiter() {
+        assert_eq!(storage_name("arc.xp3>dir/file.tjs"), "file.tjs");
+        assert_eq!(storage_name("arc.xp3>member.tjs"), "member.tjs");
+        assert_eq!(storage_name("dir/file.tjs"), "file.tjs");
+        assert_eq!(storage_name("dir\\file.tjs"), "file.tjs");
+    }
 }

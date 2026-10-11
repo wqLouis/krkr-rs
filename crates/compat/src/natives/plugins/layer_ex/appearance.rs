@@ -366,13 +366,24 @@ fn strict_real(value: &Value) -> Result<f64, String> {
     }
 }
 
+/// Convert an optional `ox`/`oy` argument: an omitted argument arrives as
+/// `void` and converts to `0` (ncbind default-argument passing,
+/// `reference/cpp/core/plugin/ncbind.hpp:963`).
+fn optional_real(value: Option<&Value>) -> Result<f64, String> {
+    match value {
+        Some(value) => strict_real(value),
+        None => Ok(0.0),
+    }
+}
+
 /// `addBrush(colorOrBrush, ox, oy)`.
 ///
 /// Reference arity: `void Appearance::addBrush(tTJSVariant, REAL ox = 0,
 /// REAL oy = 0)` (`reference/cpp/plugins/layerex_draw/windows/LayerExDraw.cpp:
-/// 767`, blend2d `LayerExDraw.hpp:921`) registered with `NCB_METHOD`, so NCB
-/// rejects calls below the declared parameter count with
-/// `TJS_E_BADPARAMCOUNT` (`reference/cpp/core/plugin/ncbind.hpp:1178`).
+/// 767`, blend2d `LayerExDraw.hpp:921`). A default argument is not part of a C++
+/// member-pointer type, so ncbind's `ArgsCount` is the full parameter count and
+/// a short call is rejected before the void-default path
+/// (`reference/cpp/core/plugin/ncbind.hpp:921,1178`).
 extern "C" fn add_brush(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -391,7 +402,7 @@ extern "C" fn add_brush(
         Ok(paint) => paint,
         Err(error) => return report_error(out_error, &error),
     };
-    let (ox, oy) = match (strict_real(&a[1]), strict_real(&a[2])) {
+    let (ox, oy) = match (optional_real(a.get(1)), optional_real(a.get(2))) {
         (Ok(ox), Ok(oy)) => (ox, oy),
         _ => return report_error(out_error, "Appearance.addBrush: ox and oy must be numbers"),
     };
@@ -407,11 +418,13 @@ extern "C" fn add_brush(
     0
 }
 
-/// `addPen(colorOrBrush, widthOrOption, ox, oy)` — reference arity 4
-/// (`windows/LayerExDraw.cpp:778`, blend2d `LayerExDraw.hpp:930-931`);
-/// `widthOrOption` is either a number (`pen->SetWidth((REAL)(tjs_real)
-/// widthOrOption)`, `:789-791` — `void` is width 0) or a dictionary whose
-/// `width` member defaults to 1.0 (`:793-796`).
+/// `addPen(colorOrBrush, widthOrOption, ox, oy)` — reference arity 4; the
+/// declared `ox`/`oy` defaults do not lower ncbind's `ArgsCount`
+/// (`reference/cpp/core/plugin/ncbind.hpp:921,1178`;
+/// `windows/LayerExDraw.cpp:778`, blend2d `LayerExDraw.hpp:930-931`);
+/// `widthOrOption` is either a number
+/// (`pen->SetWidth((REAL)(tjs_real) widthOrOption)`, `:789-791` — `void` is
+/// width 0) or a dictionary whose `width` member defaults to 1.0 (`:793-796`).
 extern "C" fn add_pen(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -452,7 +465,7 @@ extern "C" fn add_pen(
         }
         _ => return report_error(out_error, "Appearance.addPen: width must be a number"),
     };
-    let (ox, oy) = match (strict_real(&a[2]), strict_real(&a[3])) {
+    let (ox, oy) = match (optional_real(a.get(2)), optional_real(a.get(3))) {
         (Ok(ox), Ok(oy)) => (ox, oy),
         _ => return report_error(out_error, "Appearance.addPen: ox and oy must be numbers"),
     };

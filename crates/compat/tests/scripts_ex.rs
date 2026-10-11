@@ -542,3 +542,20 @@ fn builtin_array_and_dictionary_members_still_work() {
     assert_eq!(env.int("array[3]"), 4);
     assert_eq!(env.int("dictionaryCount"), 2);
 }
+
+/// Reference: `safeEvalStorage(name, mode, context)` evaluates the wrapped
+/// expression with the third argument as its execution context
+/// (`tTJSVariantClosure`/`TVPExecuteExpression(..., context, ...)`,
+/// `reference/cpp/plugins/scriptsEx.cpp:921-956`). A content expression that
+/// reads `this` therefore resolves against that context.
+#[test]
+fn safe_eval_storage_evaluates_under_the_context_argument() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.write_storage("context.tjs", "this.answer");
+    env.run(
+        "var context = %[answer: 42]; \
+         var value = Scripts.safeEvalStorage('context.tjs', '', context);",
+    );
+    assert_eq!(env.int("value"), 42);
+}
