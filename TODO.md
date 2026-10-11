@@ -148,6 +148,45 @@ Sources: `/tmp/kag-render-audit.md`, `/tmp/kag-compat-audit.md`, `/tmp/kag-flow-
   `onPaint → affineCopy`. Any layer transform the script sets without repainting is
   lost.
 
+### L2 pixel-op math (`audit-layer-ops`)
+
+* [ ] **LOP-1 (P0)** `do_gray_scale` computes `19*R + 183*G + 54*B`
+  (`crates/engine/src/layer_ops.rs:1356`); the reference `TVPDoGrayScale_c` is
+  `54*R + 183*G + 19*B` (`reference/cpp/core/visual/tvpgl.cpp:10350`). Pure red
+  gives 18 instead of 53 — every `doGrayScale` is wrong.
+* [ ] **LOP-2 (P1)** `do_box_blur` blurs the wrong channels: it holds alpha when the
+  face is not `dfAlpha` and holds RGB when it is. The reference blurs **all four**
+  channels and, for `dfAlpha`, additionally unpremultiplies RGB by the blurred
+  alpha (`LayerIntf.cpp:5691`, `tvpgl.cpp:10005,10108`).
+* [ ] **LOP-3 (P1, D11)** the operation-mode table silently source-overs about 20
+  modes through a `_ =>` arm (`layer_ops.rs:1808`): `omAddAlpha` (12), the `omPs*`
+  family (14-28) and `omDodge` (8). The reference maps each to its own `TVP*Blend`
+  (`LayerIntf.cpp:4118`, `RenderManager.cpp:2396`). Replace the `_ =>` with an
+  exhaustive match so a new mode is a compile error.
+* [ ] **LOP-4 (P1)** `Appearance.addBrush`/`addPen` require 3/4 arguments; the
+  reference defaults `ox = 0, oy = 0` (`reference/cpp/plugins/layerex_draw/blend2d/LayerExDraw.hpp:162,171`)
+  and ncbind passes a missing argument as `void` (`ncbind.hpp:963`), so valid calls
+  raise — `layer_ex/appearance.rs:386,425`.
+* [ ] **LOP-5 (P1)** `fillRect`'s bitmap path ignores `ClipRect`/`DrawFace`/
+  `HoldAlpha` (`layer/mod.rs:1133-1143`); the reference intersects the clip and
+  dispatches by face (`LayerIntf.cpp:4272`). Distinct from R3's imageless path.
+* [ ] **LOP-6 (P1)** `copy9Patch` derives its geometry from the bottom/right
+  `margin` instead of the top/left `scale` and does not abort when `scale` is
+  missing (`layer_ops.rs:1542`; `LayerBitmapIntf.cpp:1198-1250`).
+* [ ] **LOP-7 (P2)** `convertType`/`light`/`gaussianBlur` act on `ClipRect`; the
+  reference acts on the whole image (`LayerIntf.cpp:1984,1006,5749`). The vendored
+  `ApplyLightContrast`/`ApplyGaussianBlur` look reconstructed (Chinese design
+  commentary, an invented `max(1, radius/2.5)`), so this is probable but unverified.
+* [ ] **LOP-8 (P2)** `piledCopy` copies the MainImage instead of `Complete()`-ing the
+  source subtree (`LayerIntf.cpp:4529`); hatch `Percent50` paints 25% instead of a
+  checkerboard (`raster.rs:209`); `fill_color_on_add_alpha` lacks the `opa == 255`
+  `FillARGB` branch (`LayerBitmapIntf.cpp:453`); `affineCopy` holds alpha on
+  `dfAlpha` where the reference uses `hda = false`.
+* [ ] **LOP-9 (oracle choice)** the vendored Windows `LayerExDraw` uses GDI+
+  `HatchBrush` while the blend2d build has its own `createHatchPattern`, and they
+  disagree on `DiagonalBrick` (style 38, which `advscreen.tjs:3033` uses). Pick and
+  record the oracle — it also decides the `LayerExFont` leading metrics.
+
 ### Core native behaviour (`audit-core-natives`)
 
 One bug class dominates: **the port raises where the reference is inert and
