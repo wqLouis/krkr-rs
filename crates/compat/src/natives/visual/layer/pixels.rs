@@ -143,14 +143,14 @@ fn restore_alpha_inside_clip(dst: &mut BitmapState, before: &BitmapState, clip: 
 }
 
 /// The destination bitmap + `HoldAlpha` flag of a layer.
-fn dest_info(scene: &Scene, id: u32, method: &str) -> Result<(u32, bool), String> {
-    let layer = scene
-        .layer(id)
-        .ok_or_else(|| format!("Layer.{method}: this layer no longer exists"))?;
-    let bitmap = layer
-        .bitmap
-        .ok_or_else(|| format!("Layer.{method}: this layer has no main image"))?;
-    Ok((bitmap, layer.hold_alpha))
+///
+/// The main image is allocated on demand from the layer rectangle when it is
+/// absent (the reference `AllocateImage`, reached through `SetType`/
+/// `SetHasImage`); a layer whose rectangle is empty has no image and raises.
+fn dest_info(scene: &mut Scene, id: u32, method: &str) -> Result<(u32, bool), String> {
+    let bitmap = ensure_layer_bitmap(scene, id, method)?;
+    let hold_alpha = scene.layer(id).is_some_and(|layer| layer.hold_alpha);
+    Ok((bitmap, hold_alpha))
 }
 
 /// The layer's effective draw face — the port of the reference

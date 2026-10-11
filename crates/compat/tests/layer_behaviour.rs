@@ -1080,6 +1080,27 @@ fn layer_only_members_reject_a_bitmap_source() {
     }
 }
 
+/// A layer the script has only sized (`setSize`) has no main image yet. The
+/// reference creates it through `AllocateImage` once the layer is drawable
+/// (`reference/cpp/core/visual/LayerIntf.cpp:2330-2338`), and every image
+/// operation then requires it (`CopyRect`, `LayerIntf.cpp:4580-4586`); KAG
+/// sizes a thumbnail layer and immediately copies into it
+/// (`system/SystemWindow.tjs:45-51`). The port allocates the image on demand
+/// from the layer rectangle, so `setSize` + `copyRect` works instead of
+/// raising "this layer has no main image".
+#[test]
+fn copy_rect_allocates_a_layer_sized_but_not_yet_imaged() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var src = new Layer(w, null); src.setImageSize(2, 2); \
+         var dst = new Layer(w, null); dst.setSize(2, 2); \
+         dst.copyRect(0, 0, src, 0, 0, 2, 2);",
+    );
+    env.assert_script("dst.hasImage == 1");
+}
+
 /// Reference: with `omAuto` (the default) `operateRect` replaces the mode
 /// by the source layer's `GetOperationModeFromType()`
 /// (`reference/cpp/core/visual/LayerIntf.cpp:8996-8999`), which shares the
