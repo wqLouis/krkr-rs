@@ -49,7 +49,8 @@ mod md5;
 ///
 /// `aliases` are additional DLL names whose classes the same `register`
 /// installs (`layerExDraw.dll`, `layerExMovie.dll` and `perspective.dll` are
-/// one `layerEx` port), so linking several of them registers once. Names and
+/// one `layerEx` port, and `KAGParser.dll`/`KAGParserEx.dll` are one
+/// `KAGParser` port), so linking several of them registers once. Names and
 /// aliases match the reference `NCB_MODULE_NAME` strings under
 /// `reference/cpp/plugins` (plus the CMake source list); `extrans.dll` and
 /// `wuvorbis.dll` have no sources in that tree — their link-time surface was
@@ -113,7 +114,7 @@ pub const BUILTIN_PLUGINS: &[BuiltinPluginDef] = &[
     },
     BuiltinPluginDef {
         name: "KAGParserEx.dll",
-        aliases: &[],
+        aliases: &["KAGParser.dll"],
         register: crate::natives::kag::register,
     },
     BuiltinPluginDef {

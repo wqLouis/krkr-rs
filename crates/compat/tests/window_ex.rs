@@ -1071,11 +1071,14 @@ fn system_host_facts_raise_d11_until_installed() {
 
 /// Reference: with a provider installed the members return the host's
 /// values — the shapes come from the reference code paths the seam
-/// replaces: an array of monitor rectangles for `getDisplayMonitors`
-/// (`reference/cpp/plugins/windowEx.cpp:1424-1428`), an integer metric
-/// (`windowEx.cpp:1478-1481`, uppercased at `windowEx.cpp:1458`), a string
-/// environment value (`windowEx.cpp:1485-1494`), and the `tjs_uint32`
-/// CPU-feature integer (`windowEx.cpp:1527`).
+/// replaces: an array of monitor dictionaries for `getDisplayMonitors`
+/// (`reference/cpp/plugins/windowEx.cpp:1424-1428`, stubbed so the shipped
+/// `k2compat/k2compat_deskinfo.tjs` and `k2compat/k2compat_scrinfo.tjs` are
+/// the shape's oracle), a dictionary for `getMonitorInfo`
+/// (`windowEx.cpp:1430-1435`), an integer metric (`windowEx.cpp:1478-1481`,
+/// uppercased at `windowEx.cpp:1458`), a string environment value
+/// (`windowEx.cpp:1485-1494`), and the `tjs_uint32` CPU-feature integer
+/// (`windowEx.cpp:1527`).
 #[test]
 fn system_host_facts_work_once_installed() {
     let _lock = vm_lock();
@@ -1110,10 +1113,31 @@ fn system_host_facts_work_once_installed() {
     env.host().set_window_ex_cpu_type(|| Ok(0x2));
 
     assert_eq!(env.eval_int("System.getDisplayMonitors().count"), 2);
-    assert_eq!(env.eval_int("System.getDisplayMonitors()[0].left"), 0);
-    assert_eq!(env.eval_int("System.getDisplayMonitors()[1].right"), 3840);
+    // The shipped deskinfo shim iterates `list[i][ref1][ref2]` with
+    // `ref1` in {"work","monitor"} and `ref2` in {"x","y","w","h"},
+    // selecting the `list[i].primary` entry
+    // (`k2compat/k2compat_deskinfo.tjs:22-25,43-46`); scrinfo reads
+    // `monitor.w`/`monitor.h` (`k2compat/k2compat_scrinfo.tjs:5-6`). The
+    // vendored `windowEx.cpp:1424-1435` stub cannot settle the shape, so the
+    // shipped scripts are the oracle: `monitor` is the full bounds and
+    // `work` the work-area bounds, each derived from the L1 monitor tuple.
+    assert_eq!(env.eval_int("System.getDisplayMonitors()[0].monitor.x"), 0);
+    assert_eq!(env.eval_int("System.getDisplayMonitors()[0].monitor.y"), 0);
+    assert_eq!(
+        env.eval_int("System.getDisplayMonitors()[1].monitor.w"),
+        1920
+    );
+    assert_eq!(
+        env.eval_int("System.getDisplayMonitors()[0].monitor.h"),
+        1080
+    );
+    assert_eq!(env.eval_int("System.getDisplayMonitors()[0].work.x"), 0);
+    assert_eq!(env.eval_int("System.getDisplayMonitors()[0].work.y"), 0);
+    assert_eq!(env.eval_int("System.getDisplayMonitors()[1].work.w"), 1920);
+    assert_eq!(env.eval_int("System.getDisplayMonitors()[0].work.h"), 1040);
     assert_eq!(env.eval_int("System.getDisplayMonitors()[0].primary"), 1);
-    assert_eq!(env.eval_int("System.getMonitorInfo(0).workBottom"), 1040);
+    assert_eq!(env.eval_int("System.getMonitorInfo(0).work.y"), 0);
+    assert_eq!(env.eval_int("System.getMonitorInfo(0).monitor.h"), 1080);
     assert_eq!(env.eval_int("System.getCursorPos().x"), 123);
     assert_eq!(env.eval_int("System.getCursorPos().y"), 456);
     env.eval_void("System.setCursorPos(7, 9)");
@@ -1135,4 +1159,19 @@ fn system_host_facts_work_once_installed() {
     // A provider error becomes a typed TJS error.
     let error = env.eval_err("System.getSystemMetrics('SM_CYCAPTION')");
     assert!(error.contains("unknown metric"), "unexpected: {error}");
+}
+
+/// The shipped `k2compat` hook treats every DLL whose stem starts with
+/// `kagparser` as the one `KAGParser` plugin (`k2compat/k2compat.tjs:113-114`)
+/// and delay-links `KAGParser.dll` as the same class as `KAGParserEx.dll`
+/// (`k2compat/k2compat.tjs:243-248`); the Ex plugin is built from the base
+/// parser sources (`reference/cpp/plugins/KAGParser/readme.txt:1,117-127`).
+/// Both names must therefore resolve to the built-in emulation rather than
+/// falling through to the null-plugin object.
+#[test]
+fn kagparser_dll_aliases_the_kagparser_ex_builtin() {
+    let registry = compat::PluginRegistry::builtin();
+    assert!(registry.is_builtin("KAGParserEx.dll"));
+    assert!(registry.is_builtin("KAGParser.dll"));
+    assert!(registry.is_builtin("kagparser.DLL"));
 }

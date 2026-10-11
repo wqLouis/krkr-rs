@@ -10,6 +10,13 @@
 //! The display-monitor, cursor, system-metric, environment and icon facts are
 //! host facts: they go through the [`crate::host`](super::host) closure seam
 //! and raise a typed error until the host installs one.
+//!
+//! Each monitor returned by `getDisplayMonitors`/`getMonitorInfo` is a
+//! dictionary carrying `primary`, `monitor` and `work`, where `monitor` and
+//! `work` are `{x, y, w, h}` sub-dictionaries. The vendored
+//! `reference/cpp/plugins/windowEx.cpp:1424-1435` stubs both bodies, so the
+//! shipped `k2compat/k2compat_deskinfo.tjs` and
+//! `k2compat/k2compat_scrinfo.tjs` are the shape's oracle.
 #![allow(unsafe_code)]
 
 use std::ffi::{c_char, c_int, c_void};
@@ -106,27 +113,62 @@ fn metrics_lookup(engine: &Tjs2Engine, key: &str, what: &str) -> Result<Option<i
     Ok(found.filter(|value| *value >= 0))
 }
 
-/// Write one monitor tuple into a dictionary object.
+/// Write an `{x, y, w, h}` rectangle into a dictionary object.
+fn write_rect(
+    engine: &Tjs2Engine,
+    dict: tjs::Tjs2ValueId,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+) -> Result<(), String> {
+    for (key, value) in [
+        ("x", TjsValue::Integer(i64::from(x))),
+        ("y", TjsValue::Integer(i64::from(y))),
+        ("w", TjsValue::Integer(i64::from(w))),
+        ("h", TjsValue::Integer(i64::from(h))),
+    ] {
+        engine.set_member(dict, key, &value)?;
+    }
+    Ok(())
+}
+
+/// Write one monitor tuple into a dictionary object as the nested shape the
+/// shipped `k2compat/k2compat_deskinfo.tjs:22-25` and `:43-46` read: a
+/// `primary` flag plus `monitor` and `work` sub-dictionaries, each
+/// `{x, y, w, h}`. The work rectangle is derived from the L1 work bounds and
+/// the monitor rectangle from the full bounds.
 fn write_monitor(
     engine: &Tjs2Engine,
     dict: tjs::Tjs2ValueId,
     monitor: MonitorRect,
 ) -> Result<(), String> {
     let (left, top, right, bottom, wl, wt, wr, wb, primary) = monitor;
-    let entries: [(&str, TjsValue); 9] = [
-        ("left", TjsValue::Integer(i64::from(left))),
-        ("top", TjsValue::Integer(i64::from(top))),
-        ("right", TjsValue::Integer(i64::from(right))),
-        ("bottom", TjsValue::Integer(i64::from(bottom))),
-        ("workLeft", TjsValue::Integer(i64::from(wl))),
-        ("workTop", TjsValue::Integer(i64::from(wt))),
-        ("workRight", TjsValue::Integer(i64::from(wr))),
-        ("workBottom", TjsValue::Integer(i64::from(wb))),
-        ("primary", TjsValue::Integer(i64::from(primary))),
-    ];
-    for (key, value) in entries {
-        engine.set_member(dict, key, &value)?;
+    let monitor_w = right
+        .checked_sub(left)
+        .ok_or("windowEx monitor rectangle: width overflows")?;
+    let monitor_h = bottom
+        .checked_sub(top)
+        .ok_or("windowEx monitor rectangle: height overflows")?;
+    let work_w = wr
+        .checked_sub(wl)
+        .ok_or("windowEx work rectangle: width overflows")?;
+    let work_h = wb
+        .checked_sub(wt)
+        .ok_or("windowEx work rectangle: height overflows")?;
+    for (key, x, y, w, h) in [
+        ("monitor", left, top, monitor_w, monitor_h),
+        ("work", wl, wt, work_w, work_h),
+    ] {
+        let sub = super::util::make_dict(engine, "windowEx monitor rectangle")?;
+        write_rect(engine, sub.raw_id(), x, y, w, h)?;
+        let id = sub.raw_id();
+        // The write consumes the retention; forget the guard first so an
+        // error path cannot release it twice.
+        std::mem::forget(sub);
+        engine.set_member(dict, key, &TjsValue::Retained(id as u64))?;
     }
+    engine.set_member(dict, "primary", &TjsValue::Integer(i64::from(primary)))?;
     Ok(())
 }
 
