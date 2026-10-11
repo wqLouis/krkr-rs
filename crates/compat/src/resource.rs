@@ -295,7 +295,12 @@ pub(crate) fn draw_text_into_bitmap(
     let angle = (angle_tenths * std::f64::consts::PI / 1800.0) as f32;
     let opacity = params.opacity.clamp(0, 255) as u8;
     let mut ink: Option<RectI> = None;
-    if params.shadow_level != 0 || params.shadow_width != 0 {
+    // A shadow exists only when `shadowlevel` is nonzero
+    // (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:1168-1178`). A
+    // nonzero `shadowwidth` blurs the shadow and widens its bitmap by that
+    // many pixels on every side (`CharacterData.cpp:118-160`), so the shadow
+    // is stamped over a disk of that radius; a zero width is one offset copy.
+    if params.shadow_level != 0 {
         let mut shadow_style = style;
         shadow_style.color = [
             params.shadow_color[0],
@@ -303,24 +308,43 @@ pub(crate) fn draw_text_into_bitmap(
             params.shadow_color[2],
             255,
         ];
-        let origin = (
+        // `shadowlevel` scales the blurred coverage; the reference saturates
+        // it at full opacity (`TVPChBlurCopy65`,
+        // `reference/cpp/core/visual/tvpgl.cpp:10770-10813`).
+        let level = params.shadow_level.clamp(0, 255) as u16;
+        let shadow_opacity = ((u16::from(opacity) * level) / 255) as u8;
+        let base = (
             (params.x + params.shadow_offset.0) as f32,
             (params.y + params.shadow_offset.1) as f32,
         );
-        if let Some(rect) = compose_text_into(
-            &resolver.engine,
-            &layout,
-            &shadow_style,
-            origin,
-            angle,
-            bitmap,
-            clip,
-            opacity,
-            params.antialias,
-        )
-        .map_err(|error| format!("text composition failed: {error}"))?
-        {
-            ink = Some(rect);
+        let radius = params.shadow_width.max(0);
+        let radius_sq = i64::from(radius) * i64::from(radius);
+        for dy in -radius..=radius {
+            for dx in -radius..=radius {
+                let (dx, dy) = (i64::from(dx), i64::from(dy));
+                if dx * dx + dy * dy > radius_sq {
+                    continue;
+                }
+                let origin = (base.0 + dx as f32, base.1 + dy as f32);
+                if let Some(rect) = compose_text_into(
+                    &resolver.engine,
+                    &layout,
+                    &shadow_style,
+                    origin,
+                    angle,
+                    bitmap,
+                    clip,
+                    shadow_opacity,
+                    params.antialias,
+                )
+                .map_err(|error| format!("text composition failed: {error}"))?
+                {
+                    ink = Some(match ink {
+                        None => rect,
+                        Some(previous) => union(previous, rect),
+                    });
+                }
+            }
         }
     }
     let origin = (params.x as f32, params.y as f32);

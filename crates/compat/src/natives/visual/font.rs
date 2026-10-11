@@ -193,7 +193,11 @@ extern "C" fn font_ctor(
     let height = a
         .get(1)
         .map(value_as_i64)
-        .unwrap_or(i64::from(DEFAULT_FONT_HEIGHT)) as i32;
+        .unwrap_or(i64::from(DEFAULT_FONT_HEIGHT))
+        .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+    // A negative height is normalized to positive (`SetFontHeight`,
+    // `reference/cpp/core/visual/LayerIntf.cpp:5962-5969`).
+    let height = height.saturating_abs();
     let color = a.get(2).map(value_as_i64).unwrap_or(DEFAULT_FONT_COLOR);
     let inst = unsafe { &mut *(instance as *mut FontInst) };
     if inst.id.is_some() {
@@ -336,7 +340,12 @@ font_int_prop!(
     font_height_get,
     font_height_set,
     |f: &FontState| i64::from(f.height),
-    |f: &mut FontState, v: &Value| f.height = value_as_i64(v) as i32
+    |f: &mut FontState, v: &Value| {
+        // A negative height is normalized to positive
+        // (`reference/cpp/core/visual/LayerIntf.cpp:5962-5969`).
+        let height = value_as_i64(v).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+        f.height = height.saturating_abs();
+    }
 );
 font_int_prop!(
     font_bold_get,
@@ -366,8 +375,14 @@ font_int_prop!(
     font_angle_get,
     font_angle_set,
     |f: &FontState| f.angle.round() as i64,
-    |f: &mut FontState, v: &Value| f.angle = value_as_i64(v) as f64
+    |f: &mut FontState, v: &Value| f.angle = normalize_angle(value_as_i64(v)) as f64
 );
+
+/// Normalize an angle in tenths of a degree to `0..3600`, the reference's
+/// `SetFontAngle` (`reference/cpp/core/visual/LayerIntf.cpp:5975-5988`).
+fn normalize_angle(angle: i64) -> i64 {
+    angle.rem_euclid(3600)
+}
 font_int_prop!(
     font_face_is_file_name_get,
     font_face_is_file_name_set,

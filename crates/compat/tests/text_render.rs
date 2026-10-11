@@ -685,3 +685,66 @@ fn text_render_get_characters_only_populates_the_reference_ranges() {
     // …any other range stays empty.
     assert_eq!(env.eval_int("t.getCharacters(1, 2).count"), 0);
 }
+
+/// `tTVPNativeBaseBitmap::DrawTextSingle` draws a shadow only when
+/// `shadowlevel` is nonzero (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:1168-1178`),
+/// and a nonzero `shadowwidth` widens the shadow bitmap by that many pixels
+/// on every side (`reference/cpp/core/visual/CharacterData.cpp:118-160`). A
+/// white run with a near-black shadow must therefore leave near-black,
+/// opaque pixels on the background around the glyph; without the spread the
+/// white main pass covers the same pixels and only the antialiased edge is
+/// visible (white text disappears on a white background).
+#[test]
+fn layer_draw_text_spreads_its_shadow_beyond_the_glyph() {
+    let _lock = vm_lock();
+    let Some((env, name)) = Env::with_font() else {
+        return;
+    };
+    env.run(&format!(
+        "var w = new Window(); \
+         var l = new Layer(w, null); \
+         l.setImageSize(96, 96); \
+         l.font.face = '{name}'; \
+         l.font.height = 40; \
+         l.drawText(24, 24, 'A', 0x00ffffff, 255, true, 3024, 0x00202020, 3, 0, 0);"
+    ));
+
+    let layer = env._scene.layers.last().expect("the layer exists");
+    let bitmap = env
+        ._scene
+        .bitmap(layer.bitmap.expect("the layer has a main image"))
+        .expect("the bitmap exists");
+    // The white glyph's interior is repainted by the later main pass, so any
+    // non-transparent near-black pixel can only come from the spread shadow.
+    assert!(
+        bitmap
+            .rgba
+            .chunks_exact(4)
+            .any(|pixel| pixel[3] > 0 && pixel[0] < 64 && pixel[1] < 64 && pixel[2] < 64),
+        "the shadow should leave dark pixels around the white glyph"
+    );
+}
+
+/// `tTJSNI_BaseLayer::SetFontHeight` normalizes a negative height to positive
+/// (`reference/cpp/core/visual/LayerIntf.cpp:5962-5969`), an invariant KAG's
+/// message layout relies on when it derives the text baseline from
+/// `font.height` (`system/messagearea.tjs`).
+#[test]
+fn font_height_normalizes_negative_values() {
+    let _lock = vm_lock();
+    let env = Env::new(None);
+    env.run("var f = new Font('Ghost', 16, 0); f.height = -30;");
+    assert_eq!(env.eval_int("f.height"), 30);
+}
+
+/// `tTJSNI_BaseLayer::SetFontAngle` reduces the angle modulo 3600 into
+/// `0..3600` (`reference/cpp/core/visual/LayerIntf.cpp:5975-5988`).
+#[test]
+fn font_angle_normalizes_modulo_a_full_turn() {
+    let _lock = vm_lock();
+    let env = Env::new(None);
+    env.run("var f = new Font('Ghost', 16, 0); f.angle = -10;");
+    assert_eq!(env.eval_int("f.angle"), 3590);
+    env.run("f.angle = 4000;");
+    assert_eq!(env.eval_int("f.angle"), 400);
+}
