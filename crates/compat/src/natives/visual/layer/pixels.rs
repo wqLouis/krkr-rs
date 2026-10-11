@@ -29,7 +29,8 @@ use super::super::common::{
 use super::LayerInst;
 use super::util::{
     self, clip_dest_src, layer_clip, main_bitmap, normalize_rect, operation_mode_from_layer_type,
-    opt_bool, opt_f64, opt_i64, resolve_source_bitmap, scale_rect, value_as_f64, with_two_bitmaps,
+    opt_bool, opt_f64, opt_i64, resolve_source_bitmap, resolve_source_layer, scale_rect,
+    value_as_f64, with_two_bitmaps,
 };
 use crate::CompatCtx;
 use crate::native_util::{args, report_error, set_int, set_void};
@@ -790,6 +791,13 @@ fn rect_op(
         method,
         matches!(kind, RectKind::Pile | RectKind::Blend | RectKind::PiledCopy),
     )?;
+    // `piledCopy` reads the source layer's composited subtree, so it also
+    // needs the layer id. Resolve it before the mutable scene borrow.
+    let piled_src_layer = if matches!(kind, RectKind::PiledCopy) {
+        Some(resolve_source_layer(ctx, host, &a[2], method)?)
+    } else {
+        None
+    };
     let dx = value_as_i64(&a[0]) as i32;
     let dy = value_as_i64(&a[1]) as i32;
     let sx = value_as_i64(&a[3]) as i32;
@@ -806,7 +814,14 @@ fn rect_op(
     let opa = opt_i64(a, 7, 255).clamp(0, 255) as u8;
     match kind {
         RectKind::PiledCopy => {
-            with_two_bitmaps(scene, dst, src_id, |d, s| {
+            // Copy the source layer's own MainImage composited with its
+            // visible children, not its bare MainImage. A layer with no own
+            // image is already rejected by the resolution above.
+            let src_layer = piled_src_layer
+                .ok_or_else(|| format!("Layer.{method}: the source must be a Layer object"))?;
+            let content = layer_ops::render_layer_subtree(scene, src_layer)
+                .ok_or_else(|| format!("Layer.{method}: cannot compose the source layer"))?;
+            with_two_bitmaps(scene, dst, content, |d, s| {
                 layer_ops::blit_plane(
                     d,
                     dx,

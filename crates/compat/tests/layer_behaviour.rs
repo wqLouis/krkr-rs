@@ -1149,6 +1149,41 @@ fn copy_rect_works_on_a_set_size_layer() {
     assert_eq!(env.eval_int("dst.getMainPixel(0, 0)"), 0x123456);
 }
 
+/// Reference: `tTJSNI_BaseLayer::PiledCopy` copies `src->Complete(rect)`
+/// (`reference/cpp/core/visual/LayerIntf.cpp:4545-4550`), the source layer's
+/// own MainImage composited with its visible children — the same `Complete`
+/// the renderer uses (`LayerIntf.cpp:7673-7755`). The KAG save path captures
+/// `window.primaryLayer` (`system/advscreen.tjs:6205`), whose own image is
+/// filled opaque black (`system/window.tjs:53-63`) while the visible scene
+/// lives in child layers, so copying only the bare MainImage yields an
+/// all-black thumbnail.
+#[test]
+fn piled_copy_composites_the_source_layer_subtree() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var primary = new Layer(w, null); \
+         primary.setImageSize(2, 2); \
+         primary.fillRect(0, 0, 2, 2, 0xff000000); \
+         var child = new Layer(w, primary); \
+         child.setImageSize(2, 2); \
+         child.fillRect(0, 0, 2, 2, 0xffff0000); \
+         child.visible = true; \
+         var spr = new Layer(w, null); \
+         spr.setSize(2, 2); \
+         spr.piledCopy(0, 0, primary, 0, 0, 2, 2); \
+         var thumb = new Layer(w, null); \
+         thumb.setSize(1, 1); \
+         thumb.stretchCopy(0, 0, thumb.width, thumb.height, spr, 0, 0, spr.width, spr.height, 3);",
+    );
+    // The child's red is composited over the primary's opaque black, and the
+    // 2x2 screenshot downscales to the same red (`system/advscreen.tjs:7405-7436`).
+    assert_eq!(env.eval_int("spr.getMainPixel(0, 0)"), 0xff0000);
+    assert_eq!(env.eval_int("spr.getMainPixel(1, 1)"), 0xff0000);
+    assert_eq!(env.eval_int("thumb.getMainPixel(0, 0)"), 0xff0000);
+}
+
 /// Reference: `FillRect` intersects the requested rectangle with `ClipRect`
 /// and fills only that intersection inside `MainImage`
 /// (`reference/cpp/core/visual/LayerIntf.cpp:4272-4320`). Two overlapping

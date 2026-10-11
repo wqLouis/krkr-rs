@@ -314,6 +314,43 @@ pub(super) fn resolve_source_bitmap(
     Ok((id, None))
 }
 
+/// Resolve a `Layer` script argument to its scene layer id; a `Bitmap` or
+/// any other object is an error. `PiledCopy` needs the layer itself because
+/// it reads the layer's composited subtree, not its bare MainImage.
+pub(super) fn resolve_source_layer(
+    ctx: &CompatCtx,
+    host: &Tjs2Engine,
+    value: &Value,
+    method: &str,
+) -> Result<u32, String> {
+    if let Some(layer_id) = native_class_id(host, value, "Layer")? {
+        if scene_ref(ctx)?.layer(layer_id).is_none() {
+            return Err(format!("Layer.{method}: the source layer no longer exists"));
+        }
+        return Ok(layer_id);
+    }
+    if native_class_id(host, value, "Bitmap")?.is_some() {
+        return Err(format!("Layer.{method}: the source must be a Layer object"));
+    }
+    let id = resolve_object_id(host, value, &["Layer", "Bitmap"])?;
+    if id < 0 {
+        return Err(format!(
+            "Layer.{method}: the source is not a Layer or Bitmap object"
+        ));
+    }
+    let id = id as u32;
+    let is_layer = {
+        // SAFETY: the caller resolved `ctx` from the installed binding.
+        let services = unsafe { ctx.services() };
+        let state = services.state::<VisualState>();
+        state.objects.layers.contains_key(&id)
+    };
+    if is_layer || scene_ref(ctx)?.layer(id).is_some() {
+        return Ok(id);
+    }
+    Err(format!("Layer.{method}: the source must be a Layer object"))
+}
+
 /// Borrow the destination and source bitmaps of an operation simultaneously
 /// (`dst` and `src` may be the same bitmap, in which case the source is
 /// snapshotted so the blend reads stable pixels).
