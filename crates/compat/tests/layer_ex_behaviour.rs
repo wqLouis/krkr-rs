@@ -1234,3 +1234,36 @@ fn gdiplus_private_font_error_paths() {
     assert!(env.try_run("GdiPlus.addPrivateFont();").is_err());
     assert!(env.try_run("GdiPlus.getFontList();").is_err());
 }
+
+// ---------------------------------------------------------------------------
+// Bitmap(name) constructor
+// ---------------------------------------------------------------------------
+
+/// The KAG config/album/messageframe widgets build their checkbox, radio and
+/// slider images with `new Bitmap("FRM_...")` and copy the result into a
+/// child layer (`patch__configwindow.tjs` `setup()`). The reference
+/// `tTJSNI_Bitmap::Construct` loads a string first argument through
+/// `Bitmap.Load` (`reference/cpp/core/visual/BitmapIntf.cpp:19-43`), so the
+/// destination layer's main image adopts the decoded size; a constructor that
+/// ignores the name leaves a 1x1 image and the widget invisible.
+#[test]
+fn bitmap_name_constructor_loads_the_storage_image() {
+    let _lock = vm_lock();
+    let env = Env::build(Some(image_storage()), true);
+
+    env.run(
+        "var bmp = new Bitmap('images/test.img'); \
+         var w = new Window(); \
+         var widget = new Layer(w, null); \
+         widget.name = 'widget'; \
+         widget.copyFromBitmapToMainImage(bmp);",
+    );
+
+    // The synthetic decoder returns a 2x2 image (see `DECODED_RGBA`).
+    let id = env.layer_id("widget");
+    let layer = env.scene.layer(id).expect("widget layer");
+    assert_eq!(layer.image_width, 2);
+    assert_eq!(layer.image_height, 2);
+    assert_eq!(env.pixel(id, 0, 0), [1, 2, 3, 255]);
+    assert_eq!(env.pixel(id, 1, 1), [10, 11, 12, 255]);
+}

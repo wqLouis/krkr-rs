@@ -216,14 +216,12 @@ fn save_option_expression(type_name: &str) -> Option<&'static str> {
     }
 }
 
-/// Perform a synchronous storage load into bitmap `id`, returning the image
-/// size. Shared by `load` and `loadAsync`.
-fn load_into_bitmap(
+/// Decode the storage image `name` into RGBA8, applying the color key.
+fn decode_storage_image(
     ctx: &CompatCtx,
-    id: u32,
     name: &str,
     colorkey: u32,
-) -> Result<(u32, u32), String> {
+) -> Result<(u32, u32, Vec<u8>), String> {
     let services = unsafe { ctx.services() };
     let storage = services
         .storage()
@@ -237,9 +235,34 @@ fn load_into_bitmap(
     let (width, height) = (image.width, image.height);
     let mut rgba = image.rgba;
     apply_color_key(&mut rgba, width, colorkey);
+    Ok((width, height, rgba))
+}
+
+/// Load `name` into bitmap `id`, allocating the scene bitmap when the payload
+/// is still the reference's empty initial bitmap. Returns `(id, width,
+/// height)`. Shared by the constructor, `load` and `loadAsync`.
+fn load_into_bitmap(
+    ctx: &CompatCtx,
+    id: Option<u32>,
+    name: &str,
+    colorkey: u32,
+) -> Result<(u32, u32, u32), String> {
+    let (width, height, rgba) = decode_storage_image(ctx, name, colorkey)?;
     let scene = scene_mut(ctx)?;
-    replace_bitmap_pixels(scene, id, width, height, rgba);
-    Ok((width, height))
+    let id = match id {
+        Some(id) => {
+            replace_bitmap_pixels(scene, id, width, height, rgba);
+            id
+        }
+        None => {
+            let id = scene.add_bitmap(width, height, rgba);
+            if let Some(bitmap) = scene.bitmap_mut(id) {
+                bitmap.script_owned = true;
+            }
+            id
+        }
+    };
+    Ok((id, width, height))
 }
 
 /// See `register_window`.
@@ -286,7 +309,11 @@ extern "C" fn bitmap_destroy(engine: *mut c_void, instance: *mut c_void) {
     drop(unsafe { Box::from_raw(instance as *mut BitmapInst) });
 }
 
-/// `Bitmap([width, height])` — create a bitmap and return its id.
+/// `Bitmap(name[, colorkey])` / `Bitmap(width, height[, bpp])` — the reference
+/// `tTJSNI_Bitmap::Construct`: a string first argument loads a storage image,
+/// two or more numeric arguments size a new image, no argument makes the
+/// reference's 32x32 transparent white initial bitmap, and a lone non-string
+/// argument leaves the bitmap null until `load` fills it.
 extern "C" fn bitmap_ctor(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -300,26 +327,63 @@ extern "C" fn bitmap_ctor(
         return report_error(out_error, "Bitmap: compat context is not bound");
     };
     let a = unsafe { args(argv, argc) };
-    let width = a.first().map(value_as_i64).unwrap_or(1).max(1) as u32;
-    let height = a.get(1).map(value_as_i64).unwrap_or(1).max(1) as u32;
     let inst = unsafe { &mut *(instance as *mut BitmapInst) };
     if inst.id.is_some() {
         return report_error(out_error, "Bitmap: this bitmap is already constructed");
     }
-    let scene = match scene_mut(&ctx) {
-        Ok(scene) => scene,
-        Err(error) => return report_error(out_error, &error),
+    let id = if a.first().is_some_and(|value| value.ty == tjs::VAL_STRING) {
+        let name = value_as_string(&a[0]);
+        if name.is_empty() {
+            return report_error(out_error, "Bitmap: the storage name is empty");
+        }
+        let colorkey = a
+            .get(1)
+            .filter(|value| value.ty != VAL_VOID)
+            .map_or(COLOR_KEY_NONE, |value| value_as_i64(value) as u32);
+        match load_into_bitmap(&ctx, None, &name, colorkey) {
+            Ok((id, _width, _height)) => id,
+            Err(error) => return report_error(out_error, &format!("Bitmap: {error}")),
+        }
+    } else if a.len() > 1 {
+        let width = value_as_i64(&a[0]) as u32;
+        let height = value_as_i64(&a[1]) as u32;
+        let Some(pixels) = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|count| count.checked_mul(4))
+        else {
+            return report_error(out_error, "Bitmap: the requested size is too large");
+        };
+        let scene = match scene_mut(&ctx) {
+            Ok(scene) => scene,
+            Err(error) => return report_error(out_error, &error),
+        };
+        let id = scene.add_bitmap(width, height, vec![0u8; pixels]);
+        if let Some(bitmap) = scene.bitmap_mut(id) {
+            bitmap.script_owned = true;
+        }
+        id
+    } else if argc == 0 {
+        // The reference's initial bitmap: a 32x32 transparent white rectangle
+        // (`TVPGetInitialBitmap`, LayerIntf.cpp:104-110).
+        const SIZE: u32 = 32;
+        let scene = match scene_mut(&ctx) {
+            Ok(scene) => scene,
+            Err(error) => return report_error(out_error, &error),
+        };
+        let id = scene.add_bitmap(
+            SIZE,
+            SIZE,
+            [255u8, 255, 255, 0].repeat((SIZE * SIZE) as usize),
+        );
+        if let Some(bitmap) = scene.bitmap_mut(id) {
+            bitmap.script_owned = true;
+        }
+        id
+    } else {
+        // A single non-string argument leaves `Bitmap` null: constructed, no image.
+        set_int(out, 0);
+        return 0;
     };
-    let Some(pixels) = (width as usize)
-        .checked_mul(height as usize)
-        .and_then(|count| count.checked_mul(4))
-    else {
-        return report_error(out_error, "Bitmap: the requested size is too large");
-    };
-    let id = scene.add_bitmap(width, height, vec![0u8; pixels]);
-    if let Some(bitmap) = scene.bitmap_mut(id) {
-        bitmap.script_owned = true;
-    }
     inst.id = Some(id);
     register_bitmap(&ctx, resolved.engine(), id, objthis);
     set_int(out, i64::from(id));
@@ -344,8 +408,7 @@ extern "C" fn bitmap_get_pixel(
     let y = value_as_i64(&a[1]) as i32;
     let inst = unsafe { &*(instance as *const BitmapInst) };
     let Some(id) = inst.id else {
-        set_int(out, 0);
-        return 0;
+        return report_error(out_error, "Bitmap.getPixel: this bitmap has no image");
     };
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Bitmap.getPixel: compat context is not bound");
@@ -377,7 +440,7 @@ extern "C" fn bitmap_set_pixel(
     let color = argb_to_rgba(value_as_i64(&a[2]));
     let inst = unsafe { &*(instance as *const BitmapInst) };
     let Some(id) = inst.id else {
-        return 0;
+        return report_error(out_error, "Bitmap.setPixel: this bitmap has no image");
     };
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Bitmap.setPixel: compat context is not bound");
@@ -409,8 +472,7 @@ extern "C" fn bitmap_get_mask_pixel(
     let y = value_as_i64(&a[1]) as i32;
     let inst = unsafe { &*(instance as *const BitmapInst) };
     let Some(id) = inst.id else {
-        set_int(out, 0);
-        return 0;
+        return report_error(out_error, "Bitmap.getMaskPixel: this bitmap has no image");
     };
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(
@@ -445,7 +507,7 @@ extern "C" fn bitmap_set_mask_pixel(
     let alpha = value_as_i64(&a[2]).clamp(0, 255) as u8;
     let inst = unsafe { &*(instance as *const BitmapInst) };
     let Some(id) = inst.id else {
-        return 0;
+        return report_error(out_error, "Bitmap.setMaskPixel: this bitmap has no image");
     };
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(
@@ -529,9 +591,12 @@ extern "C" fn bitmap_set_size(
     let a = unsafe { args(argv, argc) };
     let width = value_as_i64(&a[0]).max(0) as u32;
     let height = value_as_i64(&a[1]).max(0) as u32;
+    if width == 0 || height == 0 {
+        return report_error(out_error, "Bitmap.setSize: cannot create empty layer image");
+    }
     let inst = unsafe { &*(instance as *const BitmapInst) };
     let Some(id) = inst.id else {
-        return report_error(out_error, "Bitmap.setSize: this bitmap is not constructed");
+        return report_error(out_error, "Bitmap.setSize: this bitmap has no image");
     };
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Bitmap.setSize: compat context is not bound");
@@ -571,7 +636,7 @@ extern "C" fn bitmap_copy_from(
     };
     let inst = unsafe { &*(instance as *const BitmapInst) };
     let Some(id) = inst.id else {
-        return report_error(out_error, "Bitmap.copyFrom: this bitmap is not constructed");
+        return report_error(out_error, "Bitmap.copyFrom: this bitmap has no image");
     };
     let scene = match scene_mut(&ctx) {
         Ok(scene) => scene,
@@ -640,7 +705,7 @@ extern "C" fn bitmap_save(
         return report_error(out_error, "Bitmap.save: currently async load bitmap");
     }
     let Some(id) = id else {
-        return report_error(out_error, "Bitmap.save: this bitmap is not constructed");
+        return report_error(out_error, "Bitmap.save: this bitmap has no image");
     };
     let services = unsafe { ctx.services() };
     let resolver = services.state::<ResourceResolver>();
@@ -670,7 +735,7 @@ extern "C" fn bitmap_load(
     argv: *const Value,
     out: *mut Value,
     out_error: *mut *mut c_char,
-    _objthis: *mut c_void,
+    objthis: *mut c_void,
 ) -> c_int {
     if argc < 1 {
         return report_error(out_error, "Bitmap.load requires a storage name");
@@ -694,13 +759,16 @@ extern "C" fn bitmap_load(
     if loading {
         return report_error(out_error, "Bitmap.load: currently async load bitmap");
     }
-    let Some(id) = id else {
-        return report_error(out_error, "Bitmap.load: this bitmap is not constructed");
-    };
-    let (width, height) = match load_into_bitmap(&ctx, id, &name, colorkey) {
+    let had_image = id.is_some();
+    let (id, width, height) = match load_into_bitmap(&ctx, id, &name, colorkey) {
         Ok(size) => size,
         Err(error) => return report_error(out_error, &format!("Bitmap.load: {error}")),
     };
+    if !had_image {
+        // SAFETY: the payload is owned by the VM for the duration of the call.
+        unsafe { (*(instance as *mut BitmapInst)).id = Some(id) };
+        register_bitmap(&ctx, resolved.engine(), id, objthis);
+    }
     let host = resolved.engine();
     match metainfo_object(host, width, height, 32) {
         Ok(object) => {
@@ -738,26 +806,28 @@ extern "C" fn bitmap_load_async(
     if name.is_empty() {
         return report_error(out_error, "Bitmap.loadAsync: the storage name is empty");
     }
-    let id = {
+    let (id, had_image) = {
         let inst = unsafe { &mut *(instance as *mut BitmapInst) };
         if inst.loading {
             return report_error(out_error, "Bitmap.loadAsync: currently async load bitmap");
         }
-        let Some(id) = inst.id else {
-            return report_error(
-                out_error,
-                "Bitmap.loadAsync: this bitmap is not constructed",
-            );
-        };
+        let id = inst.id;
         inst.loading = true;
-        id
+        (id, id.is_some())
     };
     let result = load_into_bitmap(&ctx, id, &name, COLOR_KEY_NONE);
     // SAFETY: the payload outlives the call and no other reference is live.
     unsafe { (*(instance as *mut BitmapInst)).loading = false };
+    if let Ok((new_id, _width, _height)) = &result
+        && !had_image
+    {
+        // SAFETY: the payload is owned by the VM for the duration of the call.
+        unsafe { (*(instance as *mut BitmapInst)).id = Some(*new_id) };
+        register_bitmap(&ctx, resolved.engine(), *new_id, objthis);
+    }
     let host = resolved.engine();
     let (meta, error_flag, message) = match result {
-        Ok((width, height)) => match metainfo_object(host, width, height, 32) {
+        Ok((_id, width, height)) => match metainfo_object(host, width, height, 32) {
             Ok(object) => (Some(object), 0, String::new()),
             Err(error) => (None, 1, error),
         },
@@ -940,8 +1010,7 @@ fn bitmap_dimension_get(
 ) -> c_int {
     let inst = unsafe { &*(instance as *const BitmapInst) };
     let Some(id) = inst.id else {
-        set_int(out, 0);
-        return 0;
+        return report_error(out_error, "Bitmap: this bitmap has no image");
     };
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Bitmap: compat context is not bound");
@@ -969,7 +1038,7 @@ fn bitmap_dimension_set(
 ) -> c_int {
     let inst = unsafe { &*(instance as *const BitmapInst) };
     let Some(id) = inst.id else {
-        return 0;
+        return report_error(out_error, "Bitmap: this bitmap has no image");
     };
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Bitmap: compat context is not bound");

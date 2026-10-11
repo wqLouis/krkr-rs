@@ -336,3 +336,67 @@ fn typed_errors_when_the_codec_is_absent() {
         other => panic!("expected the load error message, got {other:?}"),
     }
 }
+
+#[test]
+fn the_name_constructor_loads_the_storage_image() {
+    let _lock = vm_lock();
+    let env = Env::new(true);
+
+    env.run("var b = new Bitmap('images/test.img');");
+
+    // reference/cpp/core/visual/BitmapIntf.cpp:20-27: a string first argument
+    // loads the named storage image.
+    assert_eq!(env.eval_int("b.width"), 2);
+    assert_eq!(env.eval_int("b.height"), 2);
+    assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0xff01_0203);
+    assert_eq!(env.eval_int("b.getPixel(1, 1)"), 0xff0a_0b0c);
+}
+
+#[test]
+fn the_size_constructor_allocates_a_transparent_bitmap() {
+    let _lock = vm_lock();
+    let env = Env::new(true);
+
+    env.run("var b = new Bitmap(4, 3);");
+
+    // reference/cpp/core/visual/BitmapIntf.cpp:28-36: two numeric arguments
+    // size a new all-zero image.
+    assert_eq!(env.eval_int("b.width"), 4);
+    assert_eq!(env.eval_int("b.height"), 3);
+    assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0);
+    assert_eq!(env.eval_int("b.getMaskPixel(0, 0)"), 0);
+}
+
+#[test]
+fn the_empty_constructor_makes_the_initial_bitmap() {
+    let _lock = vm_lock();
+    let env = Env::new(true);
+
+    env.run("var b = new Bitmap();");
+
+    // reference/cpp/core/visual/LayerIntf.cpp:104-110: the initial bitmap is a
+    // 32x32 transparent white rectangle.
+    assert_eq!(env.eval_int("b.width"), 32);
+    assert_eq!(env.eval_int("b.height"), 32);
+    assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0x00ff_ffff);
+    assert_eq!(env.eval_int("b.getMaskPixel(0, 0)"), 0);
+}
+
+#[test]
+fn a_single_numeric_argument_leaves_the_bitmap_null() {
+    let _lock = vm_lock();
+    let env = Env::new(true);
+
+    env.run("var b = new Bitmap(5);");
+
+    // reference/cpp/core/visual/BitmapIntf.cpp:37-43: a lone non-string
+    // argument takes neither branch, so the image stays null and every member
+    // that needs one raises `TVPNotDrawableLayerType`.
+    assert!(env.eval("b.width").is_err(), "a null bitmap has no width");
+    assert!(env.eval("b.getPixel(0, 0)").is_err());
+    assert!(env.eval("b.save('out.bmp')").is_err());
+    // The buffer members report absence instead
+    // (reference/cpp/core/visual/BitmapIntf.cpp:194-210).
+    assert_eq!(env.eval_int("b.buffer"), 0);
+    assert_eq!(env.eval_int("b.bufferPitch"), 0);
+}
