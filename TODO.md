@@ -128,11 +128,28 @@ Sources: `/tmp/kag-render-audit.md`, `/tmp/kag-compat-audit.md`, `/tmp/kag-flow-
   landed `a63b9fb`.
 * [ ] **R3 (P1)** `fillRect` must fill only `rect ∩ ClipRect` inside `MainImage`
   (`:4272-4320`); the port-only `layer.fill_color` must go.
-* [~] **R4 (P1)** prerendered `.tft` fonts (`:11790-11796`, `:11716-11746`).
+* [x] **R4 (P1)** prerendered `.tft` fonts — implemented. The format was
+  established from `reference/cpp/core/visual/PrerenderedFont.{h,cpp}` **and** a
+  real extracted `font/スーラ12.tft` (36-byte header, `ChIndex` sorted UTF-16,
+  20-byte packed descriptors, version-0/1 RLE coverage, `min(b*4, 255)` upscale),
+  not invented. `mapPrerenderedFont`/`unmapPrerenderedFont` now load and validate,
+  a missing/malformed storage raises (`TVPCannotFindStorage`/
+  `TVPPrerenderedFontMappingFailed`), and the draw and metric paths use the mapped
+  glyphs. The reference only consults the map through a layer-bound font
+  (`tTJSNI_Font::GetTextWidth` checks `if(Layer)`), which the port mirrors with
+  `owns_state`. Known omission: the port's key is
+  `(face, height, bold, italic, angle)` where the reference's `tTVPFont` also folds
+  in underline/strikeout/fontfile — no game impact (`PRFont.tjs` has them false).
 * [ ] **R5 (P2)** `setImageSize` must shrink the rect and clamp `ImageLeft/Top`
   (`:2623-2640`); `setImagePos` must reject out-of-range positions (`:2506-2523`).
-* [~] **R6 (P2)** `Font.getTextWidth`/`getTextHeight` must apply `angle`
-  (`:11716-11746`).
+* [x] **R6 (P2)** — **corrected by the implementing agent, and it was my error**:
+  the reference does **not** rotate `getTextWidth`/`getTextHeight`.
+  `GetTextWidthDirect` is an unrotated extent sum and `GetTextHeight` is
+  `abs(Font.Height)` (`LayerIntf.cpp:11702-11731`); only `getEsc*` multiply by
+  `cos/sin(angle·π/1800)` (`:11734-11746`), which the port already did. The real
+  divergence in that range was `measure_text` returning the shaped block height
+  instead of `abs(Font.Height)` — now fixed. Adding rotation to the plain getters
+  would have been a new divergence.
 * [x] **R7 (P2)** `System.stayOnTop` — **verified not a reference member** (only
   `Window.stayOnTop`, `WindowIntf.cpp:1608`); the script writes a dynamic member.
   Nothing to add.
@@ -320,14 +337,14 @@ that and log a warning (the null-plugin precedent), never raise.
 * [x] **TEXT-2** `Font.height` must normalize a negative value to positive
   (`LayerIntf.cpp:5962-5969`) and `Font.angle` must normalize modulo 3600
   (`:5975-5988`). Landed `3313271`.
-* [ ] **TEXT-3 (D32)** `Font.faceIsFileName` is still a no-op stub returning 0
-  (`font.rs:387-390`). It needs per-font state in the engine's font record.
-  `resolve_face` already tries the storage for a file-name face, so the reader is
-  the missing half.
-* [ ] **TEXT-4 (D11)** in `crates/engine/src/text.rs`, when `resolve_face` falls
-  back to `default_font()` on a host whose faces carry no glyph for the text,
-  `compose_text_into` skips the empty masks and the run renders blank with no
-  error. Choose a fallback that can cover the text or raise a typed error.
+* [x] **TEXT-3** `Font.faceIsFileName` — implemented: stored per font id in
+  `FontMetricsState.face_is_file_name`, cleaned up on destroy, get/set round-trip
+  (`LayerIntf.cpp:11677-11693`).
+* [x] **TEXT-4** the silent blank text — `rasterize_text_coverage` now raises
+  `TextError::Glyph(GlyphError::MissingGlyph)` when a run's non-whitespace
+  characters all rasterize to empty coverage (whitespace/controls still yield
+  nothing legitimately), covering the `resolve_face → default_font()` case
+  (`FreeTypeFontRasterizer.cpp:185-194`).
 
 ### KAG parser (`kag-compat-audit` §B)
 
