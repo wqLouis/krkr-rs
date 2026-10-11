@@ -177,7 +177,7 @@ Legend: **instance** = Rust uses the `instance` payload (C++ derived it from `ob
 | `plugins/layer_ex/movie.rs:525` | `layer_method_defs()` objthis | `objthis` | needs‑test | movie hooks | — |
 | `plugins/get_sample/mod.rs:518` | `getSample`/`setDefaultCounts`/`sampleValue`… | `objthis` (map keyed by `objthis as usize`, `:127`) | **suspect** | `WaveIntf.cpp` get‑sample | `with(buf){ .sampleCount = 4 }` |
 | `plugins/save_struct/mod.rs:501,520` | `save2`/`saveStruct2`/`toStructString` on `Array`/`Dictionary` | `objthis` | needs‑test (method; arg is `this`) | `ncbin` `saveStruct` | `with(arr){ .saveStruct2(); }` |
-| `plugins/window_ex/window.rs:961` | `disableResize`/`disableMove`/`enableNCMouseEvent`/`exSystemMenu` | `objthis` -> per‑objthis window flags | **suspect** | `WindowIntf.cpp` | `with(w){ .disableResize = true }` |
+| `plugins/window_ex/window.rs` | `disableResize`/`enableNCMouseEvent`/`exSystemMenu` | `objthis` -> per‑objthis window flags | **suspect** | `WindowIntf.cpp` | `with(w){ .disableResize = true }` |
 | `plugins/window_ex/menu_item.rs:319` | objthis properties | `objthis` | suspect | `MenuItemIntf.cpp` | `with(item){ .checked = true }` |
 | `plugins/window_ex/pad.rs:36`, `console.rs:108` | objthis properties/methods | `objthis` | needs‑test | `PadIntf.cpp`/`ConsoleIntf.cpp` | — |
 | `plugins/csv_parser/mod.rs:680` | instance class + objthis fallback (`:298-301`) | mixed | needs‑test | `CSVParserIntf.cpp` | — |
