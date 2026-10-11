@@ -349,7 +349,7 @@ static void write_u64le(TJS::tTJSBinaryStream &stream, uint64_t v) {
     uint8_t buf[8];
     for(int i = 0; i < 8; i++)
         buf[i] = (uint8_t)(v >> (i * 8));
-    stream.Write(buf, 8);
+    stream.WriteBuffer(buf, 8);
 }
 
 // UTF-8 -> UTF-16 helper.
@@ -437,7 +437,7 @@ public:
 
         std::vector<uint8_t> raw((size_t)size);
         if(size > 0)
-            stream.Read(raw.data(), (tjs_uint)size);
+            stream.ReadBuffer(raw.data(), (tjs_uint)size);
 
         if(raw.size() >= 3 && raw[0] == 0xFE && raw[1] == 0xFE) {
             uint8_t m = raw[2];
@@ -470,6 +470,10 @@ public:
                 size_t payload = 5 + 16;
                 if(compressed > raw.size() - payload)
                     return;
+                if(uncompressed == 0)
+                    return;
+                if(uncompressed % sizeof(char16_t) != 0)
+                    return; // a UTF-16 payload is an even number of bytes
                 std::vector<uint8_t> out((size_t)uncompressed);
                 uLongf dest_len = (uLongf)uncompressed;
                 int ret = uncompress(out.data(), &dest_len, raw.data() + payload,
@@ -540,14 +544,21 @@ class TextWriteStream : public TJS::iTJSTextWriteStream {
     z_stream zs;
     bool zs_init;
     bool compression_failed;
+    bool finalized;
     int64_t compression_size_position;
     std::vector<Bytef> compression_buffer;
 
     void write_raw(const void *ptr, size_t size) {
         if(crypt_mode != 2) {
-            stream->Write(ptr, (tjs_uint)size);
+            stream->WriteBuffer(ptr, (tjs_uint)size);
             return;
         }
+        if(!zs_init) {
+            compression_failed = true;
+            return;
+        }
+        if(compression_failed)
+            return;
         zs.next_in = (Bytef *)ptr;
         zs.avail_in = (uInt)size;
         while(zs.avail_in > 0) {
@@ -557,11 +568,50 @@ class TextWriteStream : public TJS::iTJSTextWriteStream {
                 return;
             }
             if(zs.avail_out == 0) {
-                stream->Write(compression_buffer.data(), COMPRESSION_BUFFER_SIZE);
+                stream->WriteBuffer(compression_buffer.data(),
+                                    COMPRESSION_BUFFER_SIZE);
                 zs.next_out = compression_buffer.data();
                 zs.avail_out = COMPRESSION_BUFFER_SIZE;
             }
         }
+    }
+
+    // Closes the zlib stream and patches the two size placeholders. Called
+    // once, from Destruct(), before the object is deleted.
+    void finalize() {
+        if(finalized)
+            return;
+        finalized = true;
+        if(!zs_init)
+            return;
+        try {
+            if(!compression_failed) {
+                int result = 0;
+                do {
+                    result = deflate(&zs, Z_FINISH);
+                    if(result != Z_OK && result != Z_STREAM_END) {
+                        compression_failed = true;
+                        break;
+                    }
+                    stream->WriteBuffer(compression_buffer.data(),
+                                        COMPRESSION_BUFFER_SIZE - zs.avail_out);
+                    zs.next_out = compression_buffer.data();
+                    zs.avail_out = COMPRESSION_BUFFER_SIZE;
+                } while(result != Z_STREAM_END);
+
+                if(!compression_failed) {
+                    stream->SetPosition((tjs_uint64)compression_size_position);
+                    write_u64le(*stream, zs.total_out);
+                    write_u64le(*stream, zs.total_in);
+                }
+            }
+        } catch(...) {
+            deflateEnd(&zs);
+            zs_init = false;
+            throw;
+        }
+        deflateEnd(&zs);
+        zs_init = false;
     }
 
 public:
@@ -571,6 +621,7 @@ public:
           zs(),
           zs_init(false),
           compression_failed(false),
+          finalized(false),
           compression_size_position(0),
           compression_buffer(COMPRESSION_BUFFER_SIZE) {
         long long v = 0;
@@ -594,10 +645,10 @@ public:
 
         // Crypt signature: written for every active crypt mode (0/1/2).
         uint8_t sig[3] = {0xFE, 0xFE, (uint8_t)crypt_mode};
-        stream->Write(sig, 3);
+        stream->WriteBuffer(sig, 3);
         // Now the text stream writes unicode text.
         uint8_t bom[2] = {0xFF, 0xFE};
-        stream->Write(bom, 2);
+        stream->WriteBuffer(bom, 2);
 
         if(crypt_mode == 2) {
             zs.zalloc = Z_NULL;
@@ -613,7 +664,7 @@ public:
             zs.next_out = compression_buffer.data();
             zs.avail_out = COMPRESSION_BUFFER_SIZE;
 
-            // Compression sizes (dummy placeholders, patched in dtor).
+            // Compression size placeholders, patched by finalize().
             compression_size_position = (int64_t)stream->GetPosition();
             write_u64le(*stream, 0);
             write_u64le(*stream, 0);
@@ -621,30 +672,10 @@ public:
     }
 
     ~TextWriteStream() override {
-        if(!stream || !stream->ok())
-            return;
-        if(zs_init && !compression_failed) {
-            int result = 0;
-            do {
-                result = deflate(&zs, Z_FINISH);
-                if(result != Z_OK && result != Z_STREAM_END) {
-                    compression_failed = true;
-                    break;
-                }
-                stream->Write(compression_buffer.data(),
-                              COMPRESSION_BUFFER_SIZE - zs.avail_out);
-                zs.next_out = compression_buffer.data();
-                zs.avail_out = COMPRESSION_BUFFER_SIZE;
-            } while(result != Z_STREAM_END);
-
-            if(!compression_failed) {
-                stream->SetPosition((tjs_uint64)compression_size_position);
-                write_u64le(*stream, zs.total_out);
-                write_u64le(*stream, zs.total_in);
-            }
-        }
-        if(zs_init)
+        if(zs_init) {
             deflateEnd(&zs);
+            zs_init = false;
+        }
     }
 
     void Write(const TJS::tTJSString &targ) override {
@@ -666,7 +697,15 @@ public:
         write_raw(buf.data(), (size_t)len * sizeof(char16_t));
     }
 
-    void Destruct() override { delete this; }
+    void Destruct() override {
+        try {
+            finalize();
+        } catch(...) {
+            delete this;
+            throw;
+        }
+        delete this;
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -721,7 +760,7 @@ void tjs2_wire_stream_factories() {
 }
 
 // ---------------------------------------------------------------------------
-// Diagnostic/test helper (declared in crates/tjs2-sys/src/lib.rs)
+// Diagnostic/test helper (declared in crates/tjs/src/lib.rs)
 // ---------------------------------------------------------------------------
 
 // Read a whole text stream (honoring the mode's `oN` offset and the `FE FE`
