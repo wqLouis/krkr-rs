@@ -87,9 +87,7 @@ impl Inner {
 
     /// Decode the frame at `at_ms` for `path`, opening the stream if needed.
     fn frame(&mut self, path: &str, at_ms: i64) -> Option<RgbaFrame> {
-        if self.open(path).is_none() {
-            return None;
-        }
+        self.open(path)?;
         let media = self.media.clone();
         let stream = self.streams.get_mut(path)?;
         let at = at_ms.max(0) as u64;

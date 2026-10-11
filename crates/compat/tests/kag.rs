@@ -1086,26 +1086,27 @@ fn on_script_fires_for_an_inline_block() {
         storage = st.to_string();
         start = line;
     };
-    let mut env = Environ {
-        eval: &mut eval,
-        load_storage: &mut load,
-        fire_label: None,
-        fire_script: Some(&mut fire_script),
-        fire_jump: None,
-        fire_call: None,
-        fire_return: None,
-        fire_scenario_load: None,
-        fire_scenario_loaded: None,
-    };
     let mut tags = Vec::new();
-    loop {
-        match state.next_tag(&mut env) {
-            Ok(Some(tag)) => tags.push(tag),
-            Ok(None) => break,
-            Err(e) => panic!("next_tag error: {e}"),
+    {
+        let mut env = Environ {
+            eval: &mut eval,
+            load_storage: &mut load,
+            fire_label: None,
+            fire_script: Some(&mut fire_script),
+            fire_jump: None,
+            fire_call: None,
+            fire_return: None,
+            fire_scenario_load: None,
+            fire_scenario_loaded: None,
+        };
+        loop {
+            match state.next_tag(&mut env) {
+                Ok(Some(tag)) => tags.push(tag),
+                Ok(None) => break,
+                Err(e) => panic!("next_tag error: {e}"),
+            }
         }
     }
-    drop(env);
     assert!(tags.is_empty());
     assert_eq!(script, "var x = 1;\r\n");
     assert_eq!(storage, "t.ks");

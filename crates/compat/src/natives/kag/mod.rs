@@ -1624,10 +1624,13 @@ fn retain_param_macros_dict(
 /// non-array value is an error (no silent fallback). The count and elements
 /// are read through TJS helpers (see [`PARAM_MACRO_COUNT_SRC`] and
 /// [`PARAM_MACRO_ELEMENT_SRC`]) so no object crosses the ABI.
+/// One `paramMacros` entry: the macro name and its `[name, value, ...]` pairs.
+type ParamMacroEntry = (String, Vec<(String, String)>);
+
 fn read_param_macros_dict(
     host: &Tjs2Engine,
     dict: Tjs2ValueId,
-) -> Result<Vec<(String, Vec<(String, String)>)>, String> {
+) -> Result<Vec<ParamMacroEntry>, String> {
     let view = host.duplicate_retained(dict)?;
     let names = crate::natives::plugins::scripts_ex::data_member_names(host, &view)?;
     let count_helper = retained_object(host, PARAM_MACRO_COUNT_SRC)?;

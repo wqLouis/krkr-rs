@@ -167,24 +167,25 @@ fn push_le32(out: &mut Vec<u8>, value: u32) {
 /// the high coordinate (`* 42`).
 fn dither_table() -> [[[[u8; 256]; 4]; 4]; 3] {
     let mut table = [[[[0u8; 256]; 4]; 4]; 3];
+    let [low, mid, high] = &mut table;
     for j in 0..4usize {
         for i in 0..4usize {
             let v1 = f64::from(DITHER_4X4[j][i]) / 16.0;
             let v2 = f64::from(DITHER_4X4[(j + 1) % 2][(i + 1) % 2]) / 16.0;
             let v3 = f64::from(DITHER_4X4[j][(i + 1) % 2]) / 16.0;
-            for n in 0..256usize {
+            for (n, level) in high[i][j].iter_mut().enumerate() {
                 let nt = n as f64 / 255.0;
 
                 // 256 levels -> 6 levels (the red and blue coordinates).
                 let main5 = (nt * 5.0) as i32;
                 let frac5 = nt * 5.0 - f64::from(main5);
-                table[2][i][j][n] = ((main5 + i32::from(v1 < frac5)) * (6 * 7)) as u8;
-                table[0][i][j][n] = (main5 + i32::from(v2 < frac5)) as u8;
+                *level = ((main5 + i32::from(v1 < frac5)) * (6 * 7)) as u8;
+                low[i][j][n] = (main5 + i32::from(v2 < frac5)) as u8;
 
                 // 256 levels -> 7 levels (the green coordinate).
                 let main6 = (nt * 6.0) as i32;
                 let frac6 = nt * 6.0 - f64::from(main6);
-                table[1][i][j][n] = ((main6 + i32::from(v3 < frac6)) * 6) as u8;
+                mid[i][j][n] = ((main6 + i32::from(v3 < frac6)) * 6) as u8;
             }
         }
     }

@@ -357,7 +357,7 @@ fn or_nearest(
         if nearest {
             monitors
                 .iter()
-                .min_by_key(|monitor| distance(*monitor))
+                .min_by_key(|monitor| distance(monitor))
                 .copied()
         } else {
             None
