@@ -585,6 +585,17 @@ Verify current state first; several were fixed in the last wave.
 * **`unsafe_code` lint** — `forbid` where there is no `unsafe`, `deny(unsafe_code)` + a file-level `allow` where the FFI lives.
 * **`get_`-prefixed public API left:** `Tjs2Engine::get_member`, `get_class_names`; `Scene::get_province_pixel`.
 * **Verify no decision-number tags returned** to plugin sources: `grep -rn "//.*\bD[0-9]\+\b" crates/compat/src`.
+* **A dead "primary screen buffer" subsystem.** `layer_ops::composite_primary_layer`
+  (`crates/engine/src/layer_ops.rs:2185`) is called only from
+  `crates/engine/tests/layer_ops.rs:136`; it is the sole production setter of
+  `BitmapState::screen_buffer` (`:2091`, `:2113`), which
+  `projection.rs:290-295,414-415` then consults through
+  `is_screen_buffer_layer`. A screenshot is the reference's `Complete` composite
+  (`LayerIntf.cpp:4545-4550`, `:7673-7755`) — the `piledCopy` subtree render — so
+  this alternate design was superseded and nothing reaches it. Decide whether to
+  delete it and its projection branch, or to wire it to the path that needs a
+  screen buffer; `docs/migration/reviews/engine.md:215,289` and
+  `history/01-investigation.md:177` record why it existed.
 
 ## 12. Traps that cost real time — read before triaging anything
 
