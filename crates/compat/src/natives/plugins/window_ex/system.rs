@@ -30,7 +30,7 @@ use crate::native_util::{args, report_error, set_bool, set_int, set_void, value_
 use crate::{CompatCtx, CompatError};
 
 use super::host;
-use super::util::{as_bool, resolve, set_retained_out, set_string_out};
+use super::util::{as_bool, as_integer, is_object, resolve, set_retained_out, set_string_out};
 
 /// The monitor rectangle tuple shared with the host seam.
 type MonitorRect = (i32, i32, i32, i32, i32, i32, i32, i32, bool);
@@ -172,18 +172,14 @@ fn write_monitor(
     Ok(())
 }
 
-/// Build a dictionary holding one monitor, or return the typed error.
+/// Build a dictionary holding one monitor.
 fn monitor_dict_out(
     resolved: &crate::binding::Resolved,
     out: *mut Value,
     out_error: *mut *mut c_char,
-    monitor: Result<MonitorRect, String>,
+    monitor: MonitorRect,
     what: &str,
 ) -> c_int {
-    let monitor = match monitor {
-        Ok(monitor) => monitor,
-        Err(error) => return report_error(out_error, &format!("{what}: {error}")),
-    };
     let engine = resolved.engine();
     let dict = match super::util::make_dict(engine, what) {
         Ok(dict) => dict,
@@ -221,6 +217,214 @@ fn point_dict_out(
     set_retained_out(out, dict.raw_id());
     std::mem::forget(dict);
     0
+}
+
+// ---------------------------------------------------------------------------
+// `getMonitorInfo` argument forms
+// ---------------------------------------------------------------------------
+
+/// The monitor lookup `System.getMonitorInfo` performs, mirroring the Win32
+/// `MonitorFrom*` calls the shipped Windows `windowEx.dll` makes.
+enum MonitorTarget {
+    /// No arguments: the primary monitor.
+    Primary,
+    /// `MonitorFromPoint(flag, x, y)`.
+    Point { nearest: bool, x: i32, y: i32 },
+    /// `MonitorFromWindow`/`MonitorFromRect`: `rect` is `(left, top, right,
+    /// bottom)`.
+    Rect {
+        nearest: bool,
+        rect: (i32, i32, i32, i32),
+    },
+}
+
+/// Map the `getMonitorInfo` script arguments onto a [`MonitorTarget`].
+///
+/// The shipped Windows plugin accepts `()`, `(flag, window)`, `(flag, x, y)`
+/// and `(flag, x, y, w, h)`, and rejects every other count with
+/// `TJS_E_BADPARAMCOUNT`. The first argument is the `MonitorFrom*` fallback
+/// flag: truthy selects `MONITOR_DEFAULTTONEAREST`, falsy
+/// `MONITOR_DEFAULTTONULL`.
+fn monitor_target(
+    resolved: &crate::binding::Resolved,
+    arguments: &[Value],
+) -> Result<MonitorTarget, String> {
+    let engine = resolved.engine();
+    match arguments.len() {
+        0 => Ok(MonitorTarget::Primary),
+        2 => {
+            let nearest = as_bool(&arguments[0])?;
+            if !is_object(&arguments[1]) {
+                return Err("the window argument must be an object".into());
+            }
+            let left = window_member(engine, &arguments[1], "left")?;
+            let top = window_member(engine, &arguments[1], "top")?;
+            let width = window_member(engine, &arguments[1], "width")?;
+            let height = window_member(engine, &arguments[1], "height")?;
+            let right = left
+                .checked_add(width)
+                .ok_or("window right edge overflows")?;
+            let bottom = top
+                .checked_add(height)
+                .ok_or("window bottom edge overflows")?;
+            Ok(MonitorTarget::Rect {
+                nearest,
+                rect: (left, top, right, bottom),
+            })
+        }
+        3 => Ok(MonitorTarget::Point {
+            nearest: as_bool(&arguments[0])?,
+            x: as_i32(as_integer(&arguments[1])?, "x")?,
+            y: as_i32(as_integer(&arguments[2])?, "y")?,
+        }),
+        5 => {
+            let nearest = as_bool(&arguments[0])?;
+            let x = as_i32(as_integer(&arguments[1])?, "x")?;
+            let y = as_i32(as_integer(&arguments[2])?, "y")?;
+            let width = as_i32(as_integer(&arguments[3])?, "width")?;
+            let height = as_i32(as_integer(&arguments[4])?, "height")?;
+            let right = x
+                .checked_add(width)
+                .ok_or("rectangle right edge overflows")?;
+            let bottom = y
+                .checked_add(height)
+                .ok_or("rectangle bottom edge overflows")?;
+            Ok(MonitorTarget::Rect {
+                nearest,
+                rect: (x, y, right, bottom),
+            })
+        }
+        _ => Err("requires 0, 2, 3 or 5 arguments".into()),
+    }
+}
+
+/// Read an integer member from a window argument.
+fn window_member(engine: &Tjs2Engine, value: &Value, name: &str) -> Result<i32, String> {
+    let object = engine
+        .retain_object_arg(value)
+        .map_err(|error| format!("windowEx: {error}"))?;
+    let integer = match engine.member(object.raw_id(), name) {
+        Ok(TjsValue::Integer(value)) => value,
+        Ok(TjsValue::Real(value)) => value as i64,
+        Ok(_) | Err(_) => 0,
+    };
+    as_i32(integer, name)
+}
+
+/// Narrow a script integer to the 32-bit coordinates the reference uses.
+fn as_i32(value: i64, what: &str) -> Result<i32, String> {
+    i32::try_from(value).map_err(|_| format!("{what} is out of range"))
+}
+
+/// Resolve a [`MonitorTarget`] against the host's monitor list the way the
+/// Win32 `MonitorFrom*` functions do.
+fn resolve_monitor(target: MonitorTarget, monitors: &[MonitorRect]) -> Option<MonitorRect> {
+    match target {
+        MonitorTarget::Primary => monitors.iter().find(|monitor| monitor.8).copied(),
+        MonitorTarget::Point { nearest, x, y } => {
+            let found = monitors
+                .iter()
+                .find(|monitor| contains(monitor, x, y))
+                .copied();
+            or_nearest(found, nearest, monitors, |monitor| {
+                point_distance_sq(monitor, x, y)
+            })
+        }
+        MonitorTarget::Rect { nearest, rect } => {
+            let found = monitors
+                .iter()
+                .filter_map(|monitor| {
+                    let area = intersection_area(monitor, rect);
+                    (area > 0).then_some((area, monitor))
+                })
+                .max_by_key(|(area, _)| *area)
+                .map(|(_, monitor)| *monitor);
+            or_nearest(found, nearest, monitors, |monitor| {
+                rect_distance_sq(monitor, rect)
+            })
+        }
+    }
+}
+
+/// Keep `found`, or fall back to the nearest candidate when `nearest`.
+fn or_nearest(
+    found: Option<MonitorRect>,
+    nearest: bool,
+    monitors: &[MonitorRect],
+    distance: impl Fn(&MonitorRect) -> i64,
+) -> Option<MonitorRect> {
+    found.or_else(|| {
+        if nearest {
+            monitors
+                .iter()
+                .min_by_key(|monitor| distance(*monitor))
+                .copied()
+        } else {
+            None
+        }
+    })
+}
+
+/// Whether `(x, y)` lies inside a monitor's full bounds.
+fn contains(monitor: &MonitorRect, x: i32, y: i32) -> bool {
+    x >= monitor.0 && x < monitor.2 && y >= monitor.1 && y < monitor.3
+}
+
+/// The squared distance from `(x, y)` to a monitor's full bounds.
+fn point_distance_sq(monitor: &MonitorRect, x: i32, y: i32) -> i64 {
+    let dx = axis_distance(i64::from(x), i64::from(monitor.0), i64::from(monitor.2));
+    let dy = axis_distance(i64::from(y), i64::from(monitor.1), i64::from(monitor.3));
+    dx * dx + dy * dy
+}
+
+/// The area of the intersection of a monitor's full bounds with `rect`.
+fn intersection_area(monitor: &MonitorRect, rect: (i32, i32, i32, i32)) -> i64 {
+    let left = i64::from(monitor.0).max(i64::from(rect.0));
+    let top = i64::from(monitor.1).max(i64::from(rect.1));
+    let right = i64::from(monitor.2).min(i64::from(rect.2));
+    let bottom = i64::from(monitor.3).min(i64::from(rect.3));
+    let width = (right - left).max(0);
+    let height = (bottom - top).max(0);
+    width * height
+}
+
+/// The squared distance between a monitor's full bounds and `rect`.
+fn rect_distance_sq(monitor: &MonitorRect, rect: (i32, i32, i32, i32)) -> i64 {
+    let dx = interval_distance(
+        i64::from(monitor.0),
+        i64::from(monitor.2),
+        i64::from(rect.0),
+        i64::from(rect.2),
+    );
+    let dy = interval_distance(
+        i64::from(monitor.1),
+        i64::from(monitor.3),
+        i64::from(rect.1),
+        i64::from(rect.3),
+    );
+    dx * dx + dy * dy
+}
+
+/// The gap between `point` and the interval `[min, max]` (zero when inside).
+fn axis_distance(point: i64, min: i64, max: i64) -> i64 {
+    if point < min {
+        min - point
+    } else if point > max {
+        point - max
+    } else {
+        0
+    }
+}
+
+/// The gap between the intervals `[a_min, a_max]` and `[b_min, b_max]`.
+fn interval_distance(a_min: i64, a_max: i64, b_min: i64, b_max: i64) -> i64 {
+    if a_max < b_min {
+        b_min - a_max
+    } else if b_max < a_min {
+        a_min - b_max
+    } else {
+        0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -280,26 +484,32 @@ extern "C" fn sys_get_monitor_info(
     };
     // SAFETY: the trampoline guarantees `argc` valid `Value` entries.
     let arguments = unsafe { args(argv, argc) };
-    let index = arguments
-        .first()
-        .map(|value| {
-            if value.ty == tjs::VAL_INTEGER {
-                value.integer
-            } else {
-                0
-            }
-        })
-        .unwrap_or(0);
+    let target = match monitor_target(&resolved, arguments) {
+        Ok(target) => target,
+        Err(error) => return report_error(out_error, &format!("System.getMonitorInfo: {error}")),
+    };
     let ctx = resolved.ctx();
     // SAFETY: `resolve` only succeeds for the installed, live binding.
     let services = unsafe { ctx.services() };
-    let Some(result) = host::monitor_info(services, index) else {
+    let Some(result) = host::display_monitors(services) else {
         return report_error(
             out_error,
-            "System.getMonitorInfo: no host monitor-info provider is installed",
+            "System.getMonitorInfo: no host display-monitor provider is installed",
         );
     };
-    monitor_dict_out(&resolved, out, out_error, result, "System.getMonitorInfo")
+    let monitors = match result {
+        Ok(monitors) => monitors,
+        Err(error) => return report_error(out_error, &format!("System.getMonitorInfo: {error}")),
+    };
+    match resolve_monitor(target, &monitors) {
+        Some(monitor) => {
+            monitor_dict_out(&resolved, out, out_error, monitor, "System.getMonitorInfo")
+        }
+        None => {
+            set_void(out);
+            0
+        }
+    }
 }
 
 extern "C" fn sys_get_cursor_pos(

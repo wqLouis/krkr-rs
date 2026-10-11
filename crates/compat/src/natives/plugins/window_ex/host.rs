@@ -16,7 +16,8 @@
 //!
 //! * a monitor rectangle is
 //!   `(left, top, right, bottom, work_left, work_top, work_right, work_bottom, primary)`;
-//! * `getMonitorInfo` receives a 0-based monitor index;
+//! * `getMonitorInfo` resolves its monitor from the `getDisplayMonitors`
+//!   list (the primary, or the monitor for a window, point or rectangle);
 //! * `readEnvValue` returns `None` for an unset variable;
 //! * `expandEnvString` performs `%NAME%` expansion.
 
@@ -27,8 +28,6 @@ use crate::{CompatHost, CompatServices};
 type MonitorRect = (i32, i32, i32, i32, i32, i32, i32, i32, bool);
 /// `getDisplayMonitors` provider signature.
 type DisplayMonitorsFn = dyn Fn() -> Result<Vec<MonitorRect>, String>;
-/// `getMonitorInfo(index)` provider signature.
-type MonitorInfoFn = dyn Fn(i64) -> Result<MonitorRect, String>;
 /// `getCursorPos` provider signature.
 type CursorPosFn = dyn Fn() -> Result<(i32, i32), String>;
 /// `setCursorPos(x, y)` provider signature.
@@ -58,7 +57,6 @@ type IsBreathingFn = dyn Fn() -> Result<bool, String>;
 #[derive(Default)]
 pub(crate) struct WindowExHost {
     display_monitors: Option<Box<DisplayMonitorsFn>>,
-    monitor_info: Option<Box<MonitorInfoFn>>,
     cursor_pos: Option<Box<CursorPosFn>>,
     set_cursor_pos: Option<Box<SetCursorPosFn>>,
     system_metrics: Option<Box<SystemMetricsFn>>,
@@ -73,20 +71,13 @@ pub(crate) struct WindowExHost {
 }
 
 impl CompatHost {
-    /// Install the `System.getDisplayMonitors()` provider.
+    /// Install the `System.getDisplayMonitors()` provider, the monitor list
+    /// `System.getMonitorInfo` also selects from.
     pub fn set_window_ex_display_monitors(
         &self,
         f: impl Fn() -> Result<Vec<MonitorRect>, String> + 'static,
     ) {
         self.services().state::<WindowExHost>().display_monitors = Some(Box::new(f));
-    }
-
-    /// Install the `System.getMonitorInfo(index)` provider.
-    pub fn set_window_ex_monitor_info(
-        &self,
-        f: impl Fn(i64) -> Result<MonitorRect, String> + 'static,
-    ) {
-        self.services().state::<WindowExHost>().monitor_info = Some(Box::new(f));
     }
 
     /// Install the `System.getCursorPos()` provider.
@@ -161,18 +152,6 @@ pub(crate) fn display_monitors(
         .display_monitors
         .as_ref()
         .map(|f| f())
-}
-
-/// Call the installed `getMonitorInfo` provider, if any.
-pub(crate) fn monitor_info(
-    services: &CompatServices,
-    index: i64,
-) -> Option<Result<MonitorRect, String>> {
-    services
-        .state::<WindowExHost>()
-        .monitor_info
-        .as_ref()
-        .map(|f| f(index))
 }
 
 /// Call the installed `getCursorPos` provider, if any.

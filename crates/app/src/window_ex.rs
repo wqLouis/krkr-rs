@@ -15,18 +15,11 @@ type MonitorRect = (i32, i32, i32, i32, i32, i32, i32, i32, bool);
 ///
 /// `surface_size` is the render surface the primary monitor covers. An
 /// unknown system-metric name yields `0` and an unset environment variable
-/// yields no value; only a monitor index other than `0` errors.
+/// yields no value.
 pub fn install_window_ex_facts(host: &CompatHost, surface_size: (u32, u32)) {
     let primary = primary_monitor(surface_size);
 
     host.set_window_ex_display_monitors(move || Ok(vec![primary]));
-    host.set_window_ex_monitor_info(move |index| {
-        if index == 0 {
-            Ok(primary)
-        } else {
-            Err(format!("monitor index {index} does not exist"))
-        }
-    });
     host.set_window_ex_cursor_pos(|| Ok((0, 0)));
     host.set_window_ex_set_cursor_pos(|_x, _y| Ok(()));
     host.set_window_ex_system_metrics(move |name| Ok(system_metric(name, surface_size)));

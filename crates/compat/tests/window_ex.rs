@@ -1048,7 +1048,7 @@ fn system_host_facts_raise_d11_until_installed() {
     let env = Env::new();
     for expression in [
         "System.getDisplayMonitors()",
-        "System.getMonitorInfo(0)",
+        "System.getMonitorInfo()",
         "System.getCursorPos()",
         "System.getSystemMetrics('SM_CXSCREEN')",
         "System.readEnvValue('PATH')",
@@ -1088,13 +1088,6 @@ fn system_host_facts_work_once_installed() {
             (0, 0, 1920, 1080, 0, 0, 1920, 1040, true),
             (1920, 0, 3840, 1080, 1920, 0, 3840, 1040, false),
         ])
-    });
-    env.host().set_window_ex_monitor_info(|index| {
-        if index == 0 {
-            Ok((0, 0, 1920, 1080, 0, 0, 1920, 1040, true))
-        } else {
-            Err("no such monitor".into())
-        }
     });
     env.host().set_window_ex_cursor_pos(|| Ok((123, 456)));
     env.host().set_window_ex_set_cursor_pos(|x, y| {
@@ -1136,8 +1129,8 @@ fn system_host_facts_work_once_installed() {
     assert_eq!(env.eval_int("System.getDisplayMonitors()[1].work.w"), 1920);
     assert_eq!(env.eval_int("System.getDisplayMonitors()[0].work.h"), 1040);
     assert_eq!(env.eval_int("System.getDisplayMonitors()[0].primary"), 1);
-    assert_eq!(env.eval_int("System.getMonitorInfo(0).work.y"), 0);
-    assert_eq!(env.eval_int("System.getMonitorInfo(0).monitor.h"), 1080);
+    assert_eq!(env.eval_int("System.getMonitorInfo().work.y"), 0);
+    assert_eq!(env.eval_int("System.getMonitorInfo().monitor.h"), 1080);
     assert_eq!(env.eval_int("System.getCursorPos().x"), 123);
     assert_eq!(env.eval_int("System.getCursorPos().y"), 456);
     env.eval_void("System.setCursorPos(7, 9)");
@@ -1159,6 +1152,73 @@ fn system_host_facts_work_once_installed() {
     // A provider error becomes a typed TJS error.
     let error = env.eval_err("System.getSystemMetrics('SM_CYCAPTION')");
     assert!(error.contains("unknown metric"), "unexpected: {error}");
+}
+
+/// The shipped deskinfo shim calls
+/// `System.getMonitorInfo(true, global.Window.mainWindow)` and reads
+/// `mon[ref1][ref2]` (`k2compat/k2compat_deskinfo.tjs:43-46`). The shipped
+/// Windows `windowEx.dll` accepts `()`, `(flag, window)`, `(flag, x, y)` and
+/// `(flag, x, y, w, h)`, rejecting other counts as `TJS_E_BADPARAMCOUNT`; its
+/// first argument is the `MonitorFrom*` fallback flag, truthy for
+/// `MONITOR_DEFAULTTONEAREST` and falsy for `MONITOR_DEFAULTTONULL` (verified
+/// by disassembling the shipped binary; the vendored
+/// `reference/cpp/plugins/windowEx.cpp:1430-1435` is a stub). The port
+/// resolves the selection from the `getDisplayMonitors` list, so the shim's
+/// window lookup reads the nested `work`/`monitor` shape.
+#[test]
+fn get_monitor_info_uses_the_flag_and_window_calling_convention() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.host().set_window_ex_display_monitors(|| {
+        Ok(vec![
+            (0, 0, 1920, 1080, 0, 0, 1920, 1040, true),
+            (1920, 0, 3840, 1080, 1920, 0, 3840, 1040, false),
+        ])
+    });
+    env.run(
+        "var w = new Window(); \
+         w.left = 2000; w.top = 100; w.width = 400; w.height = 300;",
+    );
+    // `(flag, window)`: the window lies on the second monitor.
+    assert_eq!(
+        env.eval_int("System.getMonitorInfo(true, w).monitor.x"),
+        1920
+    );
+    assert_eq!(
+        env.eval_int("System.getMonitorInfo(true, w).monitor.w"),
+        1920
+    );
+    assert_eq!(env.eval_int("System.getMonitorInfo(true, w).work.h"), 1040);
+    // `(flag, x, y)`: a point on the first monitor.
+    assert_eq!(
+        env.eval_int("System.getMonitorInfo(true, 10, 20).monitor.x"),
+        0
+    );
+    // `(flag, x, y, w, h)`: a rectangle on the second monitor.
+    assert_eq!(
+        env.eval_int("System.getMonitorInfo(true, 2000, 100, 100, 100).monitor.x"),
+        1920
+    );
+    // The flag is `MONITOR_DEFAULTTONULL` when falsy: an off-screen probe
+    // finds no monitor and returns void rather than the nearest one.
+    assert_eq!(
+        env.eval_ok("System.getMonitorInfo(false, 10000, 10000)"),
+        TjsValue::Void
+    );
+    // The flag is `MONITOR_DEFAULTTONEAREST` when truthy.
+    assert_eq!(
+        env.eval_int("System.getMonitorInfo(true, 10000, 10000).monitor.x"),
+        1920
+    );
+    // Unknown argument counts raise (the reference `TJS_E_BADPARAMCOUNT`).
+    assert!(
+        env.eval_err("System.getMonitorInfo(true)")
+            .contains("requires")
+    );
+    assert!(
+        env.eval_err("System.getMonitorInfo(true, 1, 2, 3)")
+            .contains("requires")
+    );
 }
 
 /// The shipped `k2compat` hook treats every DLL whose stem starts with
