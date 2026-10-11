@@ -21,18 +21,42 @@ How it works (short version)
   ``ctx.register_instance(&NativeInstanceBuilder { name: "X", .. })`` and
   attached members by ``ctx.register_static_members(&NativeStaticMembers {
   class_name: "X", .. })`` / ``ctx.register_instance_members(&
-  NativeInstanceMembers { class_name: "X", .. })``.
+  NativeInstanceMembers { class_name: "X", .. })``.  Data members written
+  directly onto a class object (``set_member(<class>.raw_id(), "name", value)``
+  on a variable bound from ``eval_retained("<Class>")``) are recognised too:
+  the reference registers them with ``Variant(_, TJS_STATICMEMBER)`` rather
+  than an accessor property (the ``Scripts.pf*`` flags, the ``GdiPlus``
+  constants).
 * Missing = reference - rust.  A *plugin extra* is a member registered in a
   plugin file with no reference counterpart; core-native members and members
   inherited from a shared registration table (``EmotePlayer`` gets ``Player``'s
   table) are not extras.  Coverage is ``matched / reference``.
 
+Namespace structure
+-------------------
+``NCB_REGISTER_CLASS(Ns)`` publishes ``global.Ns``; the ``NCB_SUBCLASS``
+family inside that block attaches the mapped class as a static member named
+``Ns.name``, while ``NCB_REGISTER_SUBCLASS`` alone publishes nothing.  The
+checker models that relation:
+
+* a missing namespace class object (``GdiPlus``) or attached class
+  (``GdiPlus.Image``) is an allowlistable ratchet gap, keyed ``Class`` /
+  ``Namespace.Name`` like a member;
+* hard, non-allowlistable failures are the wrong-level cases — a class the
+  reference only nests exposed as a top-level global (a Rust port that aliases
+  the class into the namespace and ``delete_member``s the global is accepted),
+  and a top-level class a plugin file registers that the reference never
+  publishes at all (``LayerExMovie``, ``LayerExPerspective``).  Namespaces,
+  nested classes, core natives and TJS-script classes (``WIN32Dialog``) are
+  excluded from the latter.
+
 Ratchet
 -------
 ``scripts/plugin_parity_allow.txt`` lists the currently accepted missing
-members (one ``Class.member`` per line).  The checker fails when a *new*
-missing member appears.  When an allowlisted member becomes implemented it is
-reported as stale so the list can shrink.
+surface: members (``Class.member``), nested classes (``GdiPlus.Image``) and
+namespace objects (``GdiPlus``).  The checker fails when a *new* missing entry
+appears.  When an allowlisted entry becomes implemented it is reported as
+stale so the list can shrink.
 
 Usage
 -----
@@ -53,6 +77,7 @@ import datetime
 import glob
 import re
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -73,10 +98,11 @@ DOC_PATH = REPO_ROOT / "docs" / "plugin_parity.md"
 REFERENCE_GLOBS = ("**/*.cpp", "**/*.hpp", "**/*.h")
 
 # Reference classes that are GDI+ rendering internals rather than game-script
-# surface.  ``GdiPlus`` carries ~150 ``ENUM(...)`` drawing constants plus the
-# ``GdipWrapper<...>`` bridge classes; those are intentionally not part of the
-# parity metric.
-EXCLUDED_REFERENCE_CLASSES = {"GdiPlus"}
+# surface.  ``GdiPlus`` is *not* excluded: it is a real script namespace
+# (``NCB_REGISTER_CLASS(GdiPlus)`` with ``NCB_SUBCLASS`` attachments) and the
+# namespace-object guard below relies on modelling it.  The set is kept so a
+# future genuine exclusion has a home.
+EXCLUDED_REFERENCE_CLASSES: set[str] = set()
 
 # ``Debug.console`` is a dotted target: the Rust port attaches the members to
 # the native ``Console`` class, so map the reference spelling onto it.
@@ -86,13 +112,6 @@ CLASS_ALIASES = {"Debug.console": "Console"}
 # different name.  ``Motion.Rect`` is registered as ``MotionRect`` in Rust
 # because the core VM already owns a ``Rect`` class.
 RUST_CLASS_ALIASES = {"MotionRect": "Rect"}
-
-# Reference C++ helper structs that back a Rust class but are never registered
-# through an ncbind macro (the plugin registers the members on ``Layer`` or not
-# at all).  Map Rust class -> (file relative to the plugin dir, struct name).
-HELPER_STRUCT_CLASSES = {
-    "LayerExBase": ("layerExBase.hpp", "layerExBase"),
-}
 
 # Synthetic class for ``NCB_REGISTER_FUNCTION`` (truly global functions).
 GLOBAL_CLASS = "__global__"
@@ -113,6 +132,26 @@ EXCLUDED_REFERENCE_MACROS = [
     "NCB_TYPECONV_* (boxing/convertor wiring)",
     "NCB_GDIP_* (GDI+ rendering internals)",
 ]
+
+
+@dataclass
+class ReferenceModel:
+    """The reference plugin surface split by how it becomes script-visible.
+
+    ``classes`` is the script-visible surface: top-level classes plus
+    namespace-attached classes under their dotted spelling (``Motion.Point``,
+    ``GdiPlus.Appearance``).  ``nested_by_ns`` records the ``NCB_SUBCLASS``
+    attachment relation (namespace -> public name -> internal class) and
+    ``namespace_objects`` the namespaces that carry one; ``published_top_level``
+    is the set of names the reference publishes as a global class, which the
+    port-level class guard compares against.
+    """
+
+    classes: dict[str, set[str]]
+    impl_classes: dict[str, set[str]]
+    nested_by_ns: dict[str, dict[str, str]] = field(default_factory=dict)
+    namespace_objects: set[str] = field(default_factory=set)
+    published_top_level: set[str] = field(default_factory=set)
 
 
 # ---------------------------------------------------------------------------
@@ -245,14 +284,83 @@ def _split_call_args(src: str, open_paren: int) -> tuple[list[str], int]:
     return args, n
 
 
-def _collect_class_spans(src: str) -> list[tuple[int, int, str, "str | None"]]:
-    """Return ``(start, end, class_name, impl_name)`` for every class block.
+# Subclass attachments inside a namespace block.  ``NCB_SUBCLASS_NAME`` and
+# ``NCB_GDIP_SUBCLASS`` are file-local spellings of ``NCB_SUBCLASS``
+# (``#define``d in ``layerex_draw``); ``SubClass`` is the raw container call.
+_SUBCLASS_CALL_RE = re.compile(
+    r"\bNCB_SUBCLASS(?:_NAME)?\s*\("
+    r"|\bNCB_GDIP_SUBCLASS\s*\("
+    r"|\bSubClass\s*\("
+)
+
+_SCRIPT_CLASS_RE = re.compile(r"\bclass\s+([A-Za-z_]\w*)")
+
+
+def _cpp_name_literal(text: str) -> "str | None":
+    """The TJS name in ``TJS_W("X")`` / ``X`` / ``"X"``."""
+    m = re.search(r'TJS_W\s*\(\s*"([^"]+)"\s*\)', text)
+    if m:
+        return m.group(1)
+    m = re.fullmatch(r'"?([A-Za-z_]\w*)"?', text.strip())
+    return m.group(1) if m else None
+
+
+def _subclass_attachments(body: str) -> list[tuple[str, str]]:
+    """``(public_name, internal_class)`` attachments in a class body.
+
+    ``NCB_SUBCLASS(name, cls)`` publishes ``Ns.name`` backed by ``cls``;
+    ``NCB_SUBCLASS_NAME(name)`` is ``NCB_SUBCLASS(name, name)`` and
+    ``NCB_GDIP_SUBCLASS(Class)`` is ``NCB_SUBCLASS(Class, GdipWrapper<Class>)``.
+    ``SubClass(TJS_W("name"), TypeWrap<T>())`` is the raw container call.
+    """
+    out: list[tuple[str, str]] = []
+    for m in _SUBCLASS_CALL_RE.finditer(body):
+        macro = m.group(0).strip().rstrip("(").strip()
+        args, _ = _split_call_args(body, m.end() - 1)
+        if not args:
+            continue
+        public = _cpp_name_literal(args[0])
+        if not public:
+            continue
+        if macro == "NCB_GDIP_SUBCLASS":
+            internal = f"GdipWrapper<{public}>"
+        elif macro == "NCB_SUBCLASS_NAME":
+            internal = public
+        else:
+            internal = _cpp_name_literal(args[1]) if len(args) >= 2 else public
+        out.append((public, internal or public))
+    return out
+
+
+def _script_class_names(src: str) -> set[str]:
+    """TJS classes declared inside ``TVPExecuteScript`` string arguments.
+
+    ``win32dialog.cpp`` publishes ``WIN32Dialog`` from a script string rather
+    than an ncbind macro, so the port-only-class guard must count it as
+    reference-published.
+    """
+    names: set[str] = set()
+    for m in re.finditer(r"\bTVPExecuteScript\s*\(", src):
+        args, _ = _split_call_args(src, m.end() - 1)
+        for arg in args:
+            names.update(_SCRIPT_CLASS_RE.findall(arg))
+    return names
+
+
+def _collect_class_spans(
+    src: str,
+) -> list[tuple[int, int, str, "str | None", str]]:
+    """Return ``(start, end, class_name, impl_name, kind)`` for every block.
 
     ``impl_name`` is the implementation class of an ``NCB_ATTACH_CLASS*`` block
-    (the first argument).  A Rust port may be named after the implementation
-    rather than the TJS target, so it is tracked separately.
+    (the first argument).  ``kind`` is ``"top"`` for a class the reference
+    publishes globally, ``"nested"`` for an ``NCB_REGISTER_SUBCLASS*`` class
+    (script-visible only when a namespace block attaches it) and ``"attach"``
+    for ``NCB_ATTACH_CLASS*`` (members attach to an existing class).  A Rust
+    port may be named after the implementation rather than the TJS target, so
+    the implementation name is tracked separately.
     """
-    spans: list[tuple[int, int, str, "str | None"]] = []
+    spans: list[tuple[int, int, str, "str | None", str]] = []
     for m in _BLOCK_RE.finditer(src):
         macro = m.group(1)
         args, close = _split_call_args(src, m.end() - 1)
@@ -266,59 +374,43 @@ def _collect_class_spans(src: str) -> list[tuple[int, int, str, "str | None"]]:
         if macro in _ATTACH_MACROS:
             impl = args[0] if args else None
             cls = args[1] if len(args) >= 2 else None
+            kind = "attach"
         else:
             cls = args[0] if args else None
+            kind = "top" if macro.startswith("NCB_REGISTER_CLASS") else "nested"
         if cls:
-            spans.append((m.start(), end, _normalize_class(cls), impl))
+            spans.append((m.start(), end, _normalize_class(cls), impl, kind))
 
     for m in _TJS_MEMBERS_RE.finditer(src):
         end_m = _TJS_END_MEMBERS_RE.search(src, m.end())
         end = end_m.start() if end_m else len(src)
-        spans.append((m.start(), end, _normalize_class(m.group(1)), None))
+        spans.append((m.start(), end, _normalize_class(m.group(1)), None, "top"))
     return spans
 
 
 def _innermost(
-    spans: list[tuple[int, int, str, "str | None"]], pos: int
-) -> "tuple[int, int, str, str | None] | None":
+    spans: list[tuple[int, int, str, "str | None", str]], pos: int
+) -> "tuple[int, int, str, str | None, str] | None":
     containing = [s for s in spans if s[0] < pos < s[1]]
     if not containing:
         return None
     return min(containing, key=lambda s: s[1] - s[0])
 
 
+def _visible_span_class(
+    span: tuple[int, int, str, "str | None", str],
+    nested_visible: dict[str, str],
+) -> str:
+    """The script-visible class name for a member's innermost span."""
+    _, _, cls, _, kind = span
+    if kind == "nested":
+        return nested_visible.get(cls, cls)
+    return cls
+
+
 def _canon_class(name: str) -> str:
     """Canonicalise a C++ implementation name to the Rust class spelling."""
     return name[:1].upper() + name[1:] if name else name
-
-
-def _helper_struct_members(path: Path, struct_name: str) -> set[str]:
-    """Members of a C++ helper struct that no ncbind macro ever registers.
-
-    ``LayerExBase`` is the only such case: the reference exposes its members on
-    ``Layer`` through ``ObjectCache``, while the Rust port models it as its own
-    class.  Public method declarations and the ``TJS_W("...")`` property
-    names in the constructor initialiser list form the surface.
-    """
-    if not path.is_file():
-        return set()
-    raw = path.read_text(encoding="utf-8", errors="replace")
-    src = _blank_directives(np._strip_cpp_comments(np._preprocess_cpp(raw)))
-    m = re.search(r"\bstruct\s+" + re.escape(struct_name) + r"\b", src)
-    if not m:
-        return set()
-    brace = src.find("{", m.end())
-    if brace == -1:
-        return set()
-    body = src[brace : np._match_brace(src, brace)]
-    members = set(re.findall(r'TJS_W\("([^"]+)"\)', body))
-    for mm in re.finditer(
-        r"\b(?:virtual\s+)?(?:void|bool|int|tjs_int|tjs_real|"
-        r"GeometryT|BufferT|PitchT|DispatchT|StringT)\s+([a-z_]\w*)\s*\(",
-        body,
-    ):
-        members.add(mm.group(1))
-    return members
 
 
 def _iter_reference_files() -> list[Path]:
@@ -342,49 +434,88 @@ def _iter_reference_files() -> list[Path]:
     return files
 
 
-def parse_reference() -> tuple[dict[str, set[str]], dict[str, set[str]]]:
-    """Return ``(classes, impl_classes)``.
+def parse_reference() -> ReferenceModel:
+    """Return the reference plugin surface as a :class:`ReferenceModel`.
 
-    ``impl_classes`` maps an ``NCB_ATTACH_CLASS*`` implementation class (or the
-    file stem of a manual ``addMethod`` registration) to its members, so a Rust
-    class named after the implementation is matched to the plugin surface.
+    Class blocks are classified top-level vs. ``NCB_REGISTER_SUBCLASS``
+    (nested).  The ``NCB_SUBCLASS``/``SubClass`` attachments inside a
+    top-level block map their internal classes onto the dotted
+    ``Namespace.name`` surface, so a class is compared at the place the
+    reference actually exposes it.  ``impl_classes`` maps an
+    ``NCB_ATTACH_CLASS*`` implementation class (or the file stem of a manual
+    ``addMethod`` registration) to its members, so a Rust class named after the
+    implementation is matched to the plugin surface.
     """
     classes: dict[str, set[str]] = {}
     impl_classes: dict[str, set[str]] = {}
+    nested_by_ns: dict[str, dict[str, str]] = {}
+    namespace_objects: set[str] = set()
+    published_top_level: set[str] = set()
+
+    files: list[tuple[Path, str, list[tuple[int, int, str, "str | None", str]]]] = []
     for fp in _iter_reference_files():
         raw = fp.read_text(encoding="utf-8", errors="replace")
         src = _blank_directives(np._strip_cpp_comments(np._preprocess_cpp(raw)))
-        spans = _collect_class_spans(src)
+        files.append((fp, src, _collect_class_spans(src)))
 
+    # Namespace nesting first: a namespace may attach a nested class defined
+    # earlier in the same translation unit.
+    for _fp, src, spans in files:
+        for start, end, cls, _impl, kind in spans:
+            if kind == "top":
+                published_top_level.add(cls)
+                subs = _subclass_attachments(src[start:end])
+                if subs:
+                    namespace_objects.add(cls)
+                    nested_by_ns.setdefault(cls, {}).update(dict(subs))
+            elif kind == "attach" and cls:
+                published_top_level.add(cls)
+        published_top_level |= _script_class_names(src)
+
+    nested_visible: dict[str, str] = {}
+    for ns, mapping in nested_by_ns.items():
+        for public, internal in mapping.items():
+            nested_visible[internal] = f"{ns}.{public}"
+
+    for fp, src, spans in files:
         for regex in _MEMBER_RES:
             for m in regex.finditer(src):
                 span = _innermost(spans, m.start())
-                if span is None or span[2] in EXCLUDED_REFERENCE_CLASSES:
+                if span is None:
                     continue
-                classes.setdefault(span[2], set()).add(m.group(1))
+                visible = _visible_span_class(span, nested_visible)
+                if visible in EXCLUDED_REFERENCE_CLASSES:
+                    continue
+                classes.setdefault(visible, set()).add(m.group(1))
                 if span[3]:
                     impl_classes.setdefault(span[3], set()).add(m.group(1))
 
         for m in _CONSTRUCTOR_RE.finditer(src):
             span = _innermost(spans, m.start())
-            if span is None or span[2] in EXCLUDED_REFERENCE_CLASSES:
+            if span is None:
                 continue
-            classes.setdefault(span[2], set()).add(span[2])
+            visible = _visible_span_class(span, nested_visible)
+            if visible in EXCLUDED_REFERENCE_CLASSES:
+                continue
+            classes.setdefault(visible, set()).add(visible)
 
         for m in _ATTACH_FUNCTION_RE.finditer(src):
             cls = _normalize_class(m.group(2))
             if cls not in EXCLUDED_REFERENCE_CLASSES:
                 classes.setdefault(cls, set()).add(m.group(1))
+                published_top_level.add(cls)
         for m in _ATTACH_FUNCTION_TAG_RE.finditer(src):
             cls = _normalize_class(m.group(3))
             if cls not in EXCLUDED_REFERENCE_CLASSES:
                 classes.setdefault(cls, set()).add(m.group(1))
+                published_top_level.add(cls)
         for m in _REGISTER_FUNCTION_RE.finditer(src):
             classes.setdefault(GLOBAL_CLASS, set()).add(m.group(1))
         for m in _TJS_CREATE_CLASS_RE.finditer(src):
             cls = _normalize_class(m.group(1))
             if cls not in EXCLUDED_REFERENCE_CLASSES:
                 classes.setdefault(cls, set())
+                published_top_level.add(cls)
 
         # Manual ``addMethod(dispatch, TJS_W("name"), ..)`` registrations: the
         # target class is the class named in the nearest previous ``PropGet``.
@@ -401,14 +532,16 @@ def parse_reference() -> tuple[dict[str, set[str]], dict[str, set[str]]]:
                 cls = _normalize_class(target)
                 if cls not in EXCLUDED_REFERENCE_CLASSES:
                     classes.setdefault(cls, set()).add(name)
+                    published_top_level.add(cls)
             impl_classes.setdefault(fp.stem, set()).add(name)
 
-    for rust_cls, (rel, struct_name) in HELPER_STRUCT_CLASSES.items():
-        members = _helper_struct_members(REFERENCE_DIR / rel, struct_name)
-        if members:
-            classes.setdefault(rust_cls, set()).update(members)
-
-    return classes, impl_classes
+    return ReferenceModel(
+        classes=classes,
+        impl_classes=impl_classes,
+        nested_by_ns=nested_by_ns,
+        namespace_objects=namespace_objects,
+        published_top_level=published_top_level,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -661,6 +794,192 @@ def _all_builder_spans(
     return spans
 
 
+# ``for (public, internal, keep) in [ ("a", "b", bool), ... ]``: the port
+# registers each class globally and then aliases it into a namespace object.
+_ALIAS_LOOP_RE = re.compile(r"\bfor\s*\([^)]*\)\s+in\s*\[", re.S)
+_ALIAS_TUPLE_RE = re.compile(
+    r'\(\s*"([^"]+)"\s*,\s*"([^"]+)"\s*,\s*(true|false)\s*\)'
+)
+
+
+def _rust_aliases(code: str, raw: str) -> list[tuple[str, str, bool]]:
+    """``(public, internal, keeps_global)`` namespace-alias tables in one file.
+
+    A namespace alias table is a ``for (...) in [ ("a", "b", bool), ... ]``
+    loop whose body also deletes the registration global
+    (``delete_member(global, internal)``); each tuple maps the namespace's
+    public member name to the class's global registration name.
+    """
+    out: list[tuple[str, str, bool]] = []
+    for m in _ALIAS_LOOP_RE.finditer(code):
+        bracket = m.end() - 1
+        arr_end = np._match_bracket(code, bracket)
+        brace = code.find("{", arr_end)
+        if brace == -1:
+            continue
+        body_end = np._match_brace(code, brace)
+        if "delete_member" not in code[brace:body_end]:
+            continue
+        for tm in _ALIAS_TUPLE_RE.finditer(raw[bracket + 1 : arr_end]):
+            out.append((tm.group(1), tm.group(2), tm.group(3) == "true"))
+    return out
+
+
+def _class_registration_names(
+    code: str, raw: str, strings: dict[int, tuple[int, str, int]]
+) -> set[str]:
+    """Class names registered by a ``Native*Builder { name: ... }`` block.
+
+    ``NativeStaticMembers``/``NativeInstanceMembers`` use ``class_name:`` and
+    only *attach* members to a class that already exists, so they are not a
+    class registration.
+    """
+    names: set[str] = set()
+    consts = np._const_strings(code, strings)
+    for m in re.finditer(r"Native(?:Instance|Class)Builder\s*\{", code):
+        open_pos = code.index("{", m.start())
+        end = np._match_brace(code, open_pos)
+        seg = raw[open_pos:end]
+        nm = re.search(r'\bname\s*:\s*"([^"]+)"', seg)
+        if nm:
+            names.add(nm.group(1))
+            continue
+        nm = re.search(r"\bname\s*:\s*([A-Za-z_]\w*)", seg)
+        if nm and nm.group(1) in consts:
+            names.add(consts[nm.group(1)])
+    return names
+
+
+def _class_object_bindings(code: str, raw: str) -> dict[str, set[str]]:
+    """Variables holding a class object returned by ``eval_retained("X")``.
+
+    Recognises ``let x = match engine.eval_retained("X", ..) { ..
+    RetainedValue::Object(x) .. }`` and ``let Ok(RetainedValue::Object(x)) =
+    engine.eval_retained("X", ..)``.  Only string-literal class names are
+    resolved: ``eval_retained(internal, ..)`` reads a variable and is left to
+    the namespace-alias logic.
+    """
+    bindings: dict[str, set[str]] = {}
+    for m in re.finditer(r'eval_retained\s*\(\s*"([^"]+)"', raw):
+        cls = m.group(1)
+        # A class name is an identifier (possibly dotted); ``global`` and
+        # literals such as ``%[]`` name an object, not a class.
+        if cls == "global" or not re.fullmatch(r"[A-Za-z_][\w.]*", cls):
+            continue
+        p = m.start()
+        # Backward: a `let` binding in the initialiser pattern (not the match
+        # arm, which sits after the call).
+        let_pos = code.rfind("let", 0, p)
+        if let_pos != -1:
+            eq = code.find("=", let_pos)
+            if let_pos < eq < p:
+                for bm in re.finditer(
+                    r"RetainedValue::Object\s*\(\s*([A-Za-z_]\w*)\s*\)",
+                    code[let_pos:eq],
+                ):
+                    bindings.setdefault(bm.group(1), set()).add(cls)
+        # Forward: the match-arm binding `Ok(RetainedValue::Object(x)) => x`.
+        paren = code.find("(", p)
+        close = _scan_paren(code, paren + 1)
+        stmt_end = _scan_to_semicolon(code, close + 1)
+        for bm in re.finditer(
+            r"RetainedValue::Object\s*\(\s*([A-Za-z_]\w*)\s*\)",
+            code[close:stmt_end],
+        ):
+            bindings.setdefault(bm.group(1), set()).add(cls)
+    return bindings
+
+
+def _loop_var_strings(code: str, raw: str, var: str) -> set[str]:
+    """String-literal members a ``for`` loop binds to ``var``.
+
+    Handles a tuple array such as ``const PF: &[(&str, i64)] = &[("a", 1), ..]``
+    iterated by ``for &(name, value) in PF`` (taking the element position the
+    binding occupies) and a plain ``&[&str]`` array.
+    """
+    out: set[str] = set()
+    for m in re.finditer(r"\bfor\s+([^;{]+?)\s+in\s+([A-Za-z_]\w*)", code):
+        names = re.findall(r"[A-Za-z_]\w*", m.group(1))
+        if var not in names:
+            continue
+        idx = names.index(var)
+        arr = m.group(2)
+        init = re.search(
+            r"\b(?:const|static|let)\s+(?:mut\s+)?" + re.escape(arr) + r"\b[^=;]*?=",
+            code,
+        )
+        if not init:
+            continue
+        bracket = code.find("[", init.end())
+        if bracket == -1:
+            continue
+        end = np._match_bracket(code, bracket)
+        for element in _split_top_level(raw[bracket + 1 : end]):
+            if element.startswith("(") and element.endswith(")"):
+                fields = _split_top_level(element[1:-1])
+                chunk = fields[idx] if idx < len(fields) else ""
+            else:
+                chunk = element
+            lit = re.search(r'"([^"]*)"', chunk)
+            if lit:
+                out.add(lit.group(1))
+    return out
+
+
+def _rust_data_members(
+    code: str, raw: str, bindings: dict[str, set[str]]
+) -> dict[str, set[str]]:
+    """Members written with ``set_member(<class>.raw_id(), "name", value)``.
+
+    The reference registers these as data members (``Variant(_,
+    TJS_STATICMEMBER)``), not accessor properties, so they have no builder
+    definition.  Only calls whose receiver is a variable bound from
+    ``eval_retained("<Class>")`` are attributed; a ``Retained`` value is
+    namespace-alias wiring and stays with the namespace logic.
+    """
+    out: dict[str, set[str]] = {}
+    for m in re.finditer(r"\bset_member\s*\(", code):
+        args, _ = _split_call_args(raw, m.end() - 1)
+        if len(args) < 3:
+            continue
+        rm = re.search(r"([A-Za-z_]\w*)\s*\.\s*raw_id\s*\(", args[0])
+        if not rm:
+            continue
+        var = rm.group(1)
+        if var not in bindings:
+            continue
+        if "Retained" in args[2]:
+            continue
+        name_arg = args[1].strip()
+        lm = re.fullmatch(r'"([^"]*)"', name_arg)
+        if lm:
+            names = {lm.group(1)}
+        else:
+            nm = re.fullmatch(r"&?\s*([A-Za-z_]\w*)", name_arg)
+            if not nm:
+                continue
+            names = _loop_var_strings(code, raw, nm.group(1)) or _string_locals(
+                code, raw, nm.group(1)
+            )
+        if not names:
+            continue
+        for cls in bindings[var]:
+            out.setdefault(cls, set()).update(names)
+    return out
+
+
+def _string_locals(code: str, raw: str, var: str) -> set[str]:
+    """String literals a local binding ``let var = "..."`` holds."""
+    out: set[str] = set()
+    for m in re.finditer(
+        r"\blet\s+(?:mut\s+)?" + re.escape(var) + r"\b[^=;]*=\s*", code
+    ):
+        lit = re.match(r'"([^"]*)"', raw[m.end() : m.end() + 200])
+        if lit:
+            out.add(lit.group(1))
+    return out
+
+
 def _iter_rust_files() -> list[Path]:
     if not RUST_NATIVES_DIR.is_dir():
         raise SystemExit(
@@ -812,6 +1131,15 @@ def _parse_rust_file(
         for cls in result:
             result[cls] |= macro_members
 
+    # Data members written directly onto a class object with ``set_member``
+    # (reference ``Variant(_, TJS_STATICMEMBER)``): the ``Scripts.pf*`` flags
+    # and the ``GdiPlus`` enum constants.  Added last so the loop/array
+    # handling above sees only the builder classes.
+    bindings = _class_object_bindings(code, raw)
+    if bindings:
+        for cls, names in _rust_data_members(code, raw, bindings).items():
+            result.setdefault(cls, set()).update(names)
+
     return result, dynamic
 
 
@@ -853,14 +1181,21 @@ def parse_rust() -> tuple[
     dict[str, set[str]],
     dict[str, set[str]],
     list[tuple[set[str], set[str], "str | None"]],
+    list[tuple[str, str, bool]],
+    set[str],
+    set[str],
 ]:
-    """Return ``(members, sources, plugin_only, core_members, dynamic_groups)``.
+    """Return ``(members, sources, plugin_only, core_members, dynamic_groups,
+    aliases, plugin_classes, core_classes)``.
 
     ``plugin_only`` holds the members registered by a plugin file that no core
     file also registers; those are the only candidates for a *plugin* extra.
     ``dynamic_groups`` describes each shared registration table as
     ``(classes, base_members, primary_class)`` so inherited members can be
-    identified (``EmotePlayer`` inherits ``Player``'s table).
+    identified (``EmotePlayer`` inherits ``Player``'s table).  ``aliases`` is the
+    union of the ``set_member``/``delete_member`` namespace tables;
+    ``plugin_classes``/``core_classes`` are the class names actually registered
+    by a plugin / core file (member attachments excluded).
     """
     files: list[tuple[Path, str, str, dict[int, tuple[int, str, int]], dict[str, set[str]]]] = []
     global_defs: dict[tuple[str, str], set[str]] = {}
@@ -876,11 +1211,18 @@ def parse_rust() -> tuple[
     sources: dict[str, list[str]] = {}
     plugin_members: dict[str, set[str]] = {}
     core_members: dict[str, set[str]] = {}
+    aliases: list[tuple[str, str, bool]] = []
+    plugin_classes: set[str] = set()
+    core_classes: set[str] = set()
     dynamic: list[tuple[str, int, "int | None", set[str], set[str], Path]] = []
     for path, raw, code, strings, local in files:
         res, dyn = _parse_rust_file(path, raw, code, strings, local, global_defs)
         rel = str(path.relative_to(REPO_ROOT))
-        target = plugin_members if _is_plugin_file(path) else core_members
+        is_plugin = _is_plugin_file(path)
+        target = plugin_members if is_plugin else core_members
+        registered = _class_registration_names(code, raw, strings)
+        (plugin_classes if is_plugin else core_classes).update(registered)
+        aliases.extend(_rust_aliases(code, raw))
         for cls, mset in res.items():
             members.setdefault(cls, set()).update(mset)
             sources.setdefault(cls, []).append(rel)
@@ -930,7 +1272,16 @@ def parse_rust() -> tuple[
         cls: set(mset) - core_members.get(cls, set())
         for cls, mset in plugin_members.items()
     }
-    return members, sources, plugin_only, core_members, groups
+    return (
+        members,
+        sources,
+        plugin_only,
+        core_members,
+        groups,
+        aliases,
+        plugin_classes,
+        core_classes,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -952,11 +1303,12 @@ def read_allowlist(path: Path) -> set[str]:
 
 def write_allowlist(path: Path, entries: set[str]) -> None:
     header = (
-        "# Plugin parity allowlist: reference members that are known-missing.\n"
-        "# One entry per line: Class.member\n"
+        "# Plugin parity allowlist: reference surface that is known-missing.\n"
+        "# One entry per line: Class.member, a class (`GdiPlus.Image`), or a\n"
+        "# namespace object (`GdiPlus`).\n"
         "# Regenerate after intentional additions with:\n"
         "#   python3 scripts/plugin_parity.py --update-allow\n"
-        "# The checker fails when a missing member is not listed here.\n"
+        "# The checker fails when a missing entry is not listed here.\n"
         "\n"
     )
     body = "\n".join(sorted(entries))
@@ -971,7 +1323,13 @@ def build_report(
     extra_by_class: dict[str, set[str]],
     core_by_class: dict[str, set[str]],
     tracked: list[str],
+    structure_missing: "set[str] | None" = None,
+    wrong_level_failures: "list[str] | None" = None,
+    port_only_failures: "list[str] | None" = None,
 ) -> str:
+    structure_missing = structure_missing or set()
+    wrong_level_failures = wrong_level_failures or []
+    port_only_failures = port_only_failures or []
     total_ref = sum(len(ref.get(c, ())) for c in tracked)
     total_matched = sum(len(ref.get(c, set()) & rust.get(c, set())) for c in tracked)
     total_missing = sum(len(missing_by_class.get(c, ())) for c in tracked)
@@ -1040,6 +1398,34 @@ def build_report(
             f"{len(missing_by_class.get(cls, ()))} | "
             f"{len(extra_by_class.get(cls, ()))} | {cov} |"
         )
+    lines.append("")
+
+    lines.append("## Namespace structure")
+    lines.append("")
+    lines.append(
+        "The reference publishes a class object with ``NCB_REGISTER_CLASS`` and "
+        "attaches classes inside it with ``NCB_SUBCLASS`` (script name "
+        "``Namespace.name``); ``NCB_REGISTER_SUBCLASS`` alone never publishes a "
+        "global. A missing namespace object or nested class is an allowlistable "
+        "ratchet gap (like a missing member). A nested class exposed as a bare "
+        "global, or a top-level class the reference never publishes, is a hard "
+        "failure: that is the registration bug class."
+    )
+    lines.append("")
+    lines.append("### Missing namespace / nested classes (allowlistable)")
+    lines.append("")
+    if not structure_missing:
+        lines.append("_None._")
+    else:
+        lines.append(", ".join(f"`{e}`" for e in sorted(structure_missing)))
+    lines.append("")
+    lines.append("### Wrong-level classes (hard failures)")
+    lines.append("")
+    if not wrong_level_failures and not port_only_failures:
+        lines.append("_None._")
+    else:
+        for line in wrong_level_failures + port_only_failures:
+            lines.append(f"- {line}")
     lines.append("")
 
     lines.append("## Missing members by class")
@@ -1132,9 +1518,25 @@ def build_report(
         "renames it to avoid colliding with the core `Rect` class)."
     )
     lines.append(
-        "- `LayerExBase` has no registered TJS class in the reference; its "
-        "surface comes from the public methods and `TJS_W(\"...\")` property "
-        "names of the `layerExBase` helper struct."
+        "- `layerExBase` is not modelled as a class: it is an internal C++ base "
+        "whose names (`imageWidth`, `clipLeft`, `update`, ...) are read from the "
+        "`Layer` object (`reference/cpp/plugins/layerExBase.hpp:84-91`) and are "
+        "part of the core `Layer` surface, which `native_parity.py` covers. "
+        "`LayerExMovie`/`LayerExPerspective` are `NCB_ATTACH_CLASS` "
+        "implementations, not published classes."
+    )
+    lines.append(
+        "- `NCB_SUBCLASS`/`NCB_SUBCLASS_NAME`/`NCB_GDIP_SUBCLASS`/`SubClass` "
+        "inside a `NCB_REGISTER_CLASS` block are modelled as `Namespace.name` "
+        "classes. A Rust port that registers the class globally and then "
+        "`set_member`s it into the namespace and `delete_member`s the global "
+        "(`motion_player`) is recognised as the nested class."
+    )
+    lines.append(
+        "- A plugin file that registers a class the reference never publishes "
+        "at all (`LayerExMovie`, `LayerExPerspective`, a bare `LayerExBase`) is "
+        "a hard failure, as is a nested class leaking to the top level. A "
+        "missing namespace object or nested class is an allowlistable ratchet gap."
     )
     lines.append("")
     lines.append("## Documented exclusions")
@@ -1147,13 +1549,22 @@ def build_report(
     for macro in EXCLUDED_REFERENCE_MACROS:
         lines.append(f"- `{macro}`")
     lines.append("")
-    lines.append(
-        "Reference classes in `"
-        + "`, `".join(sorted(EXCLUDED_REFERENCE_CLASSES))
-        + "` are skipped entirely (GDI+ rendering internals). `Debug.console` "
-        "targets are reported as the Rust class `Console`. The `finalize` "
-        "lifecycle hook is ignored on both sides."
-    )
+    if EXCLUDED_REFERENCE_CLASSES:
+        lines.append(
+            "Reference classes in `"
+            + "`, `".join(sorted(EXCLUDED_REFERENCE_CLASSES))
+            + "` are skipped entirely. `Debug.console` targets are reported as "
+            "the Rust class `Console`. The `finalize` lifecycle hook is "
+            "ignored on both sides."
+        )
+    else:
+        lines.append(
+            "No reference classes are excluded: `GdiPlus` and its ``ENUM`` "
+            "constants are part of the reference surface and are checked like "
+            "any other namespace. `Debug.console` targets are reported as the "
+            "Rust class `Console`. The `finalize` lifecycle hook is ignored on "
+            "both sides."
+        )
     lines.append("")
     return "\n".join(lines)
 
@@ -1163,18 +1574,107 @@ def build_report(
 # ---------------------------------------------------------------------------
 
 
+def _missing_structure_entries(
+    reference: ReferenceModel, present: set[str]
+) -> set[str]:
+    """Allowlistable keys for a missing namespace or nested class.
+
+    A reference ``NCB_REGISTER_CLASS`` namespace and every class attached to it
+    with ``NCB_SUBCLASS`` are part of the surface, but an unimplemented one is
+    a ratchet gap like a missing member, so it is keyed ``Class`` /
+    ``Namespace.Name`` and handled by ``--update-allow``.  The wrong-level
+    checks below stay hard.
+    """
+    missing: set[str] = set()
+    for ns in reference.namespace_objects:
+        if ns not in present:
+            missing.add(ns)
+    for ns, mapping in reference.nested_by_ns.items():
+        for public in mapping:
+            dotted = f"{ns}.{public}"
+            if dotted not in present:
+                missing.add(dotted)
+    return missing
+
+
+def _wrong_level_failures(
+    reference: ReferenceModel,
+    top_level: set[str],
+    aliased: set[str],
+) -> list[str]:
+    """Hard failures for a class exposed at the wrong level.
+
+    A class the reference only nests (``NCB_SUBCLASS``) must not be a bare
+    global; a port that registered it globally and aliased it into the
+    namespace (``aliased``) is correct.  This is the registration bug class
+    the guard exists for, so it is never allowlistable.
+    """
+    failures: list[str] = []
+    for ns in sorted(reference.nested_by_ns):
+        for public, internal in sorted(reference.nested_by_ns[ns].items()):
+            candidates = {
+                public,
+                internal,
+                RUST_CLASS_ALIASES.get(internal, internal),
+            }
+            if any(c in aliased for c in candidates):
+                continue
+            bare = sorted(c for c in candidates if c in top_level)
+            if bare:
+                failures.append(
+                    f"extra top-level class: `{bare[0]}` is reference-nested as "
+                    f"`{ns}.{public}` but the port registers it as a global "
+                    f"class"
+                )
+    return failures
+
+
+def _port_only_class_failures(
+    reference: ReferenceModel,
+    plugin_classes: set[str],
+    core_classes: set[str],
+    aliased: set[str],
+) -> list[str]:
+    """Port-only top-level classes the reference never publishes.
+
+    A class registered by a plugin file is a violation when the reference never
+    publishes it: not through ``NCB_REGISTER_CLASS``/``NCB_ATTACH_*``, not as a
+    namespace (``Motion``), not nested under one (``Motion.Point``), and not a
+    TJS-script class (``WIN32Dialog``).  Core natives and classes the port
+    correctly aliases into a namespace are excluded.
+    """
+    published = reference.published_top_level | reference.namespace_objects
+    nested_names = {p for m in reference.nested_by_ns.values() for p in m}
+    nested_internal = {i for m in reference.nested_by_ns.values() for i in m.values()}
+    failures: list[str] = []
+    for cls in sorted(plugin_classes):
+        if cls in core_classes or cls in published:
+            continue
+        if cls in nested_names or cls in nested_internal:
+            continue
+        if cls in aliased or cls == GLOBAL_CLASS:
+            continue
+        failures.append(
+            f"port-only top-level class: the reference never publishes `{cls}` "
+            f"as a TJS class"
+        )
+    return failures
+
+
 def _check_runtime(args: argparse.Namespace) -> int:
     """Compare the parsed reference plugin surface against a runtime dump.
 
     Report only: the dump is the ground truth for the whole reference surface,
-    so missing members are printed and the process exits 0.
+    so missing members are printed and the process exits 0.  The namespace
+    structure is checked too so a missing ``Namespace.name`` is visible.
     """
     runtime = np.load_runtime_surface(args.runtime)
-    ref, impl_classes = parse_reference()
+    reference = parse_reference()
+    ref = reference.classes
     # Reference members attached to an implementation class
     # (``layerExMovie`` -> ``LayerExMovie``): match them to the runtime class
     # with the same canonicalised name.
-    for impl, impl_members in impl_classes.items():
+    for impl, impl_members in reference.impl_classes.items():
         canon = _canon_class(impl)
         for runtime_cls in runtime:
             if _canon_class(runtime_cls) == canon:
@@ -1198,6 +1698,53 @@ def _check_runtime(args: argparse.Namespace) -> int:
             print(f"  {cls}: {len(miss)} missing")
             for member in sorted(miss):
                 print(f"    - {cls}.{member}")
+
+    top_level = {name for name in runtime if "." not in name}
+    # The dump holds the live VM surface, so a core native such as `Rect` or
+    # `Font` is a bare global even though the reference only reaches it as
+    # `Motion.Rect`/`GdiPlus.Font`.  Restrict the top-level check to the
+    # classes the port registered from plugin files, matching the source run.
+    (
+        _members,
+        _sources,
+        _plugin_only,
+        _core_members,
+        _groups,
+        source_aliases,
+        plugin_classes,
+        core_classes,
+    ) = parse_rust()
+    alias_visible = {
+        f"{ns}.{public}"
+        for public, _internal, keeps in source_aliases
+        if not keeps
+        for ns in reference.nested_by_ns
+        if public in reference.nested_by_ns[ns]
+    }
+    structure_missing = _missing_structure_entries(reference, set(runtime))
+    if structure_missing:
+        print(
+            f"plugin_parity(runtime): {len(structure_missing)} namespace/nested "
+            "class(es) missing (allowlistable):"
+        )
+        for entry in sorted(structure_missing):
+            print(f"  - {entry}")
+    wrong_level = _wrong_level_failures(
+        reference, plugin_classes & top_level, alias_visible
+    )
+    wrong_level += _port_only_class_failures(
+        reference,
+        plugin_classes & set(runtime),
+        core_classes,
+        alias_visible,
+    )
+    if wrong_level:
+        print(
+            f"plugin_parity(runtime): {len(wrong_level)} wrong-level "
+            "divergence(s):"
+        )
+        for line in wrong_level:
+            print(f"  - {line}")
     return 0
 
 
@@ -1226,8 +1773,19 @@ def main(argv: list[str] | None = None) -> int:
     if args.runtime:
         return _check_runtime(args)
 
-    ref, impl_classes = parse_reference()
-    rust, rust_sources, plugin_only, core_members, dynamic_groups = parse_rust()
+    reference = parse_reference()
+    ref = reference.classes
+    impl_classes = reference.impl_classes
+    (
+        rust,
+        rust_sources,
+        plugin_only,
+        core_members,
+        dynamic_groups,
+        aliases,
+        plugin_classes,
+        core_classes,
+    ) = parse_rust()
 
     # Rust classes that are the port of a reference class under another name
     # (``Motion.Rect`` -> ``MotionRect``).  Drop the alias's own name from the
@@ -1241,6 +1799,37 @@ def main(argv: list[str] | None = None) -> int:
             plugin_only[dst].discard(src_name)
         if src_name in rust_sources:
             rust_sources.setdefault(dst, []).extend(rust_sources.pop(src_name))
+
+    # The reference attaches a subclass inside a namespace with ``NCB_SUBCLASS``;
+    # it is script-visible only as ``Namespace.name``.  The port emulates that by
+    # registering the class globally and then aliasing it into the namespace
+    # object and deleting the global.  Move those members onto the dotted class
+    # so ``Motion.Point`` matches and the bare global is not an extra.
+    alias_visible: dict[str, str] = {}
+    for public, internal, keeps_global in aliases:
+        if keeps_global:
+            continue
+        ns = next(
+            (n for n, mapping in reference.nested_by_ns.items() if public in mapping),
+            None,
+        )
+        if ns is None:
+            continue
+        dotted = f"{ns}.{public}"
+        internal_key = RUST_CLASS_ALIASES.get(internal, internal)
+        moved = set(plugin_only.get(internal_key, ())) | set(
+            plugin_only.get(public, ())
+        )
+        rust.setdefault(dotted, set()).update(moved)
+        alias_visible[public] = dotted
+        alias_visible[internal] = dotted
+        alias_visible[internal_key] = dotted
+        plugin_only.pop(internal_key, None)
+        plugin_only.pop(public, None)
+        if internal_key not in core_members:
+            rust.pop(internal_key, None)
+        if public not in core_members:
+            rust.pop(public, None)
 
     # Reference members attached to an implementation class (``layerExMovie``)
     # or a manual ``addMethod`` registration; match them to the Rust class that
@@ -1285,11 +1874,15 @@ def main(argv: list[str] | None = None) -> int:
         )
         core_by_class[cls] = core_members.get(cls, set()) - r
 
+    # A missing namespace object or nested class is a ratchet gap, not a
+    # wrong-level registration; key it like a member so ``--update-allow``
+    # accepts it (``GdiPlus`` / ``GdiPlus.Image``).
+    structure_missing = _missing_structure_entries(reference, set(rust))
     all_missing = {
         f"{cls}.{member}"
         for cls, missing in missing_by_class.items()
         for member in missing
-    }
+    } | structure_missing
 
     allow = read_allowlist(ALLOWLIST_PATH)
     if args.update_allow:
@@ -1303,6 +1896,17 @@ def main(argv: list[str] | None = None) -> int:
     new_missing = sorted(all_missing - allow)
     stale = sorted(allow - all_missing)
 
+    # Wrong-level guards stay hard and are not allowlistable: a nested class
+    # may not be a bare global, and a plugin may not register a top-level class
+    # the reference never publishes.
+    top_level_plugin = set(plugin_classes) | set(plugin_only)
+    wrong_level_failures = _wrong_level_failures(
+        reference, top_level_plugin, set(alias_visible)
+    )
+    port_only_failures = _port_only_class_failures(
+        reference, set(plugin_classes), set(core_classes), set(alias_visible)
+    )
+
     if not args.no_doc:
         DOC_PATH.parent.mkdir(parents=True, exist_ok=True)
         DOC_PATH.write_text(
@@ -1314,6 +1918,9 @@ def main(argv: list[str] | None = None) -> int:
                 extra_by_class,
                 core_by_class,
                 tracked,
+                structure_missing,
+                wrong_level_failures,
+                port_only_failures,
             ),
             encoding="utf-8",
         )
@@ -1344,6 +1951,24 @@ def main(argv: list[str] | None = None) -> int:
         for entry in stale:
             print(f"  - {entry}")
 
+    if wrong_level_failures:
+        print(
+            f"plugin_parity: {len(wrong_level_failures)} wrong-level class "
+            "failure(s) — these are the registration bug class:",
+            file=sys.stderr,
+        )
+        for line in wrong_level_failures:
+            print(f"  - {line}", file=sys.stderr)
+
+    if port_only_failures:
+        print(
+            f"plugin_parity: {len(port_only_failures)} port-only top-level "
+            "class(es) the reference never publishes:",
+            file=sys.stderr,
+        )
+        for line in port_only_failures:
+            print(f"  - {line}", file=sys.stderr)
+
     if new_missing:
         print(
             f"plugin_parity: {len(new_missing)} new missing member(s) not in "
@@ -1356,6 +1981,8 @@ def main(argv: list[str] | None = None) -> int:
             "plugin_parity: run with --update-allow only after reviewing these.",
             file=sys.stderr,
         )
+        return 1
+    if wrong_level_failures or port_only_failures:
         return 1
     return 0
 

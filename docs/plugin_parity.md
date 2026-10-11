@@ -1,6 +1,6 @@
 # Plugin surface parity
 
-> **Generated** by `scripts/plugin_parity.py` on 2026-10-09 — do not edit by hand.
+> **Generated** by `scripts/plugin_parity.py` on 2026-10-11 — do not edit by hand.
 
 Machine-diff of the reference KiriKiri plugin surface (`reference/cpp/plugins/**`) against the plugin classes the Rust engine registers (`crates/compat/src/natives/plugins/**`). A *missing* member exists in the reference but is not registered by Rust. An *extra* is a genuine plugin-surface addition: a member registered by a plugin file that the reference class does not have. Core natives (`natives/*.rs`) and members inherited from a shared registration table are counted separately.
 
@@ -18,61 +18,60 @@ The checker exits non-zero when a missing member is **not** listed in `scripts/p
 
 | metric | value |
 | --- | ---: |
-| tracked classes | 54 |
-| reference members | 828 |
-| matched | 828 |
-| **missing** | **0** |
-| extra (genuine plugin additions) | 68 |
+| tracked classes | 53 |
+| reference members | 969 |
+| matched | 967 |
+| **missing** | **2** |
+| extra (genuine plugin additions) | 34 |
 | core members (not plugin extras) | 336 |
-| coverage | **100.0%** |
+| coverage | **99.8%** |
 
 ## Per-class coverage
 
 | class | ref | rust | matched | missing | extra | coverage |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `Appearance` | 3 | 4 | 3 | 0 | 1 | 100.0% |
-| `Array` | 3 | 4 | 3 | 0 | 1 | 100.0% |
+| `Array` | 3 | 3 | 3 | 0 | 0 | 100.0% |
 | `AsyncTrigger` | 0 | 5 | 0 | 0 | 0 | n/a |
 | `BitmapLayerTreeOwner` | 0 | 36 | 0 | 0 | 0 | n/a |
 | `CSVParser` | 6 | 6 | 6 | 0 | 0 | 100.0% |
-| `Circle` | 5 | 5 | 5 | 0 | 0 | 100.0% |
 | `Clipboard` | 0 | 2 | 0 | 0 | 0 | n/a |
 | `Console` | 7 | 8 | 7 | 0 | 0 | 100.0% |
 | `Controller` | 0 | 1 | 0 | 0 | 0 | n/a |
-| `D3DAdaptor` | 15 | 15 | 15 | 0 | 0 | 100.0% |
 | `D3DEmoteModule` | 9 | 10 | 9 | 0 | 1 | 100.0% |
 | `D3DEmotePlayer` | 87 | 181 | 87 | 0 | 0 | 100.0% |
 | `Debug` | 0 | 12 | 0 | 0 | 0 | n/a |
 | `Dictionary` | 2 | 2 | 2 | 0 | 0 | 100.0% |
 | `DrawDeviceForSteam` | 1 | 1 | 1 | 0 | 0 | 100.0% |
-| `EmotePlayer` | 88 | 181 | 88 | 0 | 0 | 100.0% |
-| `FontInfo` | 9 | 9 | 9 | 0 | 0 | 100.0% |
+| `GdiPlus` | 157 | 155 | 155 | 2 | 0 | 98.7% |
+| `GdiPlus.Appearance` | 3 | 5 | 3 | 0 | 0 | 100.0% |
+| `GdiPlus.Font` | 9 | 10 | 9 | 0 | 0 | 100.0% |
+| `GdiPlus.Path` | 17 | 19 | 17 | 0 | 0 | 100.0% |
+| `GdiPlus.PointF` | 3 | 4 | 3 | 0 | 0 | 100.0% |
+| `GdiPlus.RectF` | 18 | 19 | 18 | 0 | 0 | 100.0% |
 | `ImageFunction` | 0 | 12 | 0 | 0 | 0 | n/a |
 | `Key` | 0 | 4 | 0 | 0 | 0 | n/a |
 | `Layer` | 48 | 51 | 48 | 0 | 3 | 100.0% |
-| `LayerExBase` | 11 | 13 | 11 | 0 | 2 | 100.0% |
-| `LayerExMovie` | 4 | 20 | 4 | 0 | 16 | 100.0% |
-| `LayerExPerspective` | 1 | 14 | 1 | 0 | 13 | 100.0% |
-| `LayerGetter` | 27 | 27 | 27 | 0 | 0 | 100.0% |
 | `MIDISoundBuffer` | 0 | 1 | 0 | 0 | 0 | n/a |
 | `MenuItem` | 15 | 36 | 15 | 0 | 0 | 100.0% |
 | `Motion` | 23 | 23 | 23 | 0 | 0 | 100.0% |
+| `Motion.Circle` | 5 | 6 | 5 | 0 | 0 | 100.0% |
+| `Motion.D3DAdaptor` | 15 | 16 | 15 | 0 | 0 | 100.0% |
+| `Motion.EmotePlayer` | 88 | 181 | 88 | 0 | 0 | 100.0% |
+| `Motion.LayerGetter` | 27 | 28 | 27 | 0 | 0 | 100.0% |
+| `Motion.ObjSource` | 0 | 1 | 0 | 0 | 0 | n/a |
+| `Motion.Point` | 4 | 5 | 4 | 0 | 0 | 100.0% |
+| `Motion.Quad` | 3 | 4 | 3 | 0 | 0 | 100.0% |
+| `Motion.Rect` | 6 | 6 | 6 | 0 | 0 | 100.0% |
+| `Motion.ResourceManager` | 9 | 10 | 9 | 0 | 0 | 100.0% |
+| `Motion.SeparateLayerAdaptor` | 5 | 6 | 5 | 0 | 0 | 100.0% |
+| `Motion.SourceCache` | 3 | 4 | 3 | 0 | 0 | 100.0% |
 | `Mouse` | 0 | 14 | 0 | 0 | 0 | n/a |
-| `ObjSource` | 0 | 0 | 0 | 0 | 0 | n/a |
 | `PSBFile` | 2 | 2 | 2 | 0 | 0 | 100.0% |
 | `PSD` | 59 | 59 | 59 | 0 | 0 | 100.0% |
 | `Pad` | 1 | 25 | 1 | 0 | 0 | 100.0% |
-| `Path` | 17 | 18 | 17 | 0 | 1 | 100.0% |
 | `Player` | 141 | 141 | 141 | 0 | 0 | 100.0% |
-| `Point` | 4 | 4 | 4 | 0 | 0 | 100.0% |
-| `PointF` | 3 | 3 | 3 | 0 | 0 | 100.0% |
-| `Quad` | 3 | 3 | 3 | 0 | 0 | 100.0% |
-| `Rect` | 6 | 25 | 6 | 0 | 0 | 100.0% |
-| `RectF` | 18 | 18 | 18 | 0 | 0 | 100.0% |
-| `ResourceManager` | 9 | 9 | 9 | 0 | 0 | 100.0% |
+| `Rect` | 0 | 25 | 0 | 0 | 0 | n/a |
 | `Scripts` | 24 | 33 | 24 | 0 | 0 | 100.0% |
-| `SeparateLayerAdaptor` | 5 | 5 | 5 | 0 | 0 | 100.0% |
-| `SourceCache` | 3 | 3 | 3 | 0 | 0 | 100.0% |
 | `Steam` | 23 | 23 | 23 | 0 | 0 | 100.0% |
 | `Storages` | 30 | 45 | 30 | 0 | 2 | 100.0% |
 | `System` | 16 | 64 | 16 | 0 | 0 | 100.0% |
@@ -85,20 +84,27 @@ The checker exits non-zero when a missing member is **not** listed in `scripts/p
 | `open` | 0 | 13 | 0 | 0 | 0 | n/a |
 | `steam_api` | 0 | 0 | 0 | 0 | 0 | n/a |
 
+## Namespace structure
+
+The reference publishes a class object with ``NCB_REGISTER_CLASS`` and attaches classes inside it with ``NCB_SUBCLASS`` (script name ``Namespace.name``); ``NCB_REGISTER_SUBCLASS`` alone never publishes a global. A missing namespace object or nested class is an allowlistable ratchet gap (like a missing member). A nested class exposed as a bare global, or a top-level class the reference never publishes, is a hard failure: that is the registration bug class.
+
+### Missing namespace / nested classes (allowlistable)
+
+`GdiPlus.Image`, `GdiPlus.Matrix`
+
+### Wrong-level classes (hard failures)
+
+_None._
+
 ## Missing members by class
 
-_None for tracked classes._
+### `GdiPlus` — 2 missing
+
+`addPrivateFont`, `getFontList`
+
 ## Extra members by class
 
 Genuine plugin-surface additions: members registered in a plugin file that the reference class does not have. Core natives and members inherited from a shared registration table (``EmotePlayer`` gets ``Player``'s table) are excluded.
-
-### `Appearance` — 1 extra
-
-`__handle`
-
-### `Array` — 1 extra
-
-`xor`
 
 ### `D3DEmoteModule` — 1 extra
 
@@ -107,22 +113,6 @@ Genuine plugin-surface additions: members registered in a plugin file that the r
 ### `Layer` — 3 extra
 
 `onStartMovie`, `onStopMovie`, `onUpdateMovie`
-
-### `LayerExBase` — 2 extra
-
-`imageLeft`, `imageTop`
-
-### `LayerExMovie` — 16 extra
-
-`clipHeight`, `clipLeft`, `clipTop`, `clipWidth`, `imageHeight`, `imageLeft`, `imageTop`, `imageWidth`, `mainImageBufferForWrite`, `mainImageBufferPitch`, `onStartMovie`, `onStopMovie`, `onUpdateMovie`, `redraw`, `reset`, `update`
-
-### `LayerExPerspective` — 13 extra
-
-`clipHeight`, `clipLeft`, `clipTop`, `clipWidth`, `imageHeight`, `imageLeft`, `imageTop`, `imageWidth`, `mainImageBufferForWrite`, `mainImageBufferPitch`, `redraw`, `reset`, `update`
-
-### `Path` — 1 extra
-
-`__handle`
 
 ### `Storages` — 2 extra
 
@@ -177,6 +167,7 @@ Plugin classes Rust registers that have no reference counterpart reachable throu
 | `Key` | 4 | `crates/compat/src/natives/input.rs` |
 | `MIDISoundBuffer` | 1 | `crates/compat/src/natives/cdda_midi.rs` |
 | `Mouse` | 14 | `crates/compat/src/natives/input.rs` |
+| `Rect` | 25 | `crates/compat/src/natives/plugins/motion_player/adaptors.rs`, `crates/compat/src/natives/rect.rs` |
 | `VideoOverlay` | 69 | `crates/compat/src/natives/video.rs` |
 | `WIN32Dialog` | 1 | `crates/compat/src/natives/plugins/win32_dialog/mod.rs` |
 | `open` | 13 | `crates/compat/src/natives/cdda_midi.rs` |
@@ -186,7 +177,9 @@ Plugin classes Rust registers that have no reference counterpart reachable throu
 - Core native classes (`Storages`, `System`, `Scripts`, ...) are read from `crates/compat/src/natives/*.rs` as well as the plugin tree, so plugin registrations that attach to a core class are matched.
 - `NCB_ATTACH_CLASS*` members are also recorded under the C++ implementation class and matched to a Rust class with the canonicalised name (`layerExMovie` -> `LayerExMovie`). Manual `addMethod(dispatch, TJS_W("name"), ...)` registrations are read the same way.
 - `MotionRect` is compared against the reference `Rect` (the Rust port renames it to avoid colliding with the core `Rect` class).
-- `LayerExBase` has no registered TJS class in the reference; its surface comes from the public methods and `TJS_W("...")` property names of the `layerExBase` helper struct.
+- `layerExBase` is not modelled as a class: it is an internal C++ base whose names (`imageWidth`, `clipLeft`, `update`, ...) are read from the `Layer` object (`reference/cpp/plugins/layerExBase.hpp:84-91`) and are part of the core `Layer` surface, which `native_parity.py` covers. `LayerExMovie`/`LayerExPerspective` are `NCB_ATTACH_CLASS` implementations, not published classes.
+- `NCB_SUBCLASS`/`NCB_SUBCLASS_NAME`/`NCB_GDIP_SUBCLASS`/`SubClass` inside a `NCB_REGISTER_CLASS` block are modelled as `Namespace.name` classes. A Rust port that registers the class globally and then `set_member`s it into the namespace and `delete_member`s the global (`motion_player`) is recognised as the nested class.
+- A plugin file that registers a class the reference never publishes at all (`LayerExMovie`, `LayerExPerspective`, a bare `LayerExBase`) is a hard failure, as is a nested class leaking to the top level. A missing namespace object or nested class is an allowlistable ratchet gap.
 
 ## Documented exclusions
 
@@ -201,4 +194,4 @@ The following macros are not script surface and are intentionally not parsed as 
 - `NCB_TYPECONV_* (boxing/convertor wiring)`
 - `NCB_GDIP_* (GDI+ rendering internals)`
 
-Reference classes in `GdiPlus` are skipped entirely (GDI+ rendering internals). `Debug.console` targets are reported as the Rust class `Console`. The `finalize` lifecycle hook is ignored on both sides.
+No reference classes are excluded: `GdiPlus` and its ``ENUM`` constants are part of the reference surface and are checked like any other namespace. `Debug.console` targets are reported as the Rust class `Console`. The `finalize` lifecycle hook is ignored on both sides.

@@ -1,6 +1,11 @@
-# Plugin parity allowlist: reference members that are known-missing.
-# One entry per line: Class.member
+# Plugin parity allowlist: reference surface that is known-missing.
+# One entry per line: Class.member, a class (`GdiPlus.Image`), or a
+# namespace object (`GdiPlus`).
 # Regenerate after intentional additions with:
 #   python3 scripts/plugin_parity.py --update-allow
-# The checker fails when a missing member is not listed here.
+# The checker fails when a missing entry is not listed here.
 
+GdiPlus.Image
+GdiPlus.Matrix
+GdiPlus.addPrivateFont
+GdiPlus.getFontList
