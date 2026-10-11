@@ -4,7 +4,8 @@
 //!
 //! `getTextWidth`/`getTextHeight`, the `getEsc*` rotation variants and
 //! `getGlyphDrawRect` are backed by the L2 [`engine::text::TextEngine`]
-//! (cosmic-text shaping) rather than by a per-character extent sum. A face is
+//! (cosmic-text shaping); a font mapped with `mapPrerenderedFont` reads the
+//! `.tft` per-character `Inc` metrics instead. A face is
 //! resolved through the shared [`crate::resource::ResourceResolver`]: the
 //! `System.addFont` registry, then the attached [`engine::Storage`] (the face
 //! string read as a storage name), then the host's installed system fonts,
@@ -18,7 +19,7 @@ use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
 
 use engine::FontState;
-use engine::text::TextStyle;
+use engine::text::{FontId, TextEngine, TextError, TextStyle};
 use tjs::{
     NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef, NativeMethodDef,
     NativePropertyDef, NativeStaticMembers, Tjs2Engine, Tjs2ValueId, Value,
@@ -30,6 +31,7 @@ use super::common::{
 };
 use crate::native_util::{args, report_error, set_int, set_void, value_as_string};
 use crate::natives::system::{value_as_bool, value_as_i64};
+use crate::resource::{PrerenderedFont, PrerenderedKey};
 use crate::{CompatCtx, CompatError};
 
 /// `Font` payload: the scene font id. `owns_state` is true while this object
@@ -52,16 +54,16 @@ pub(super) fn font_payload_id(payload: *mut c_void) -> Option<u32> {
 /// Explicit `Font` dispatch state, keyed by type inside
 /// [`CompatServices::state`](crate::CompatServices::state).
 ///
-/// * `prerendered` is the `mapPrerenderedFont` registration (scene font id →
-///   storage name); the reference keeps the same font → prerendered-font map.
+/// * `face_is_file_name` is the per-font `Font.faceIsFileName` flag, keyed by
+///   scene font id (the reference keeps it in `tTVPFont.Flags`).
 /// * `rasterizer` is the active rasterizer index. Compat has exactly one
 ///   rasterizer, index `0` (the L1 `render` glyph rasterizer).
 ///
-/// The shaping/layout engine and the face cache live in the shared
-/// [`crate::resource::ResourceResolver`].
+/// The shaping/layout engine, the face cache and the pre-rendered-font map
+/// live in the shared [`crate::resource::ResourceResolver`].
 #[derive(Default)]
 struct FontMetricsState {
-    prerendered: HashMap<u32, String>,
+    face_is_file_name: HashMap<u32, bool>,
     rasterizer: i64,
 }
 
@@ -76,6 +78,7 @@ fn font_state(ctx: &CompatCtx) -> std::cell::RefMut<'_, FontMetricsState> {
 struct MeasuredFont {
     face: String,
     size_px: f32,
+    height: i32,
     bold: bool,
     italic: bool,
     angle: f64,
@@ -86,34 +89,92 @@ fn measured_font(engine: *mut c_void, instance: *mut c_void) -> Result<MeasuredF
     with_font_read(engine, instance, |f| MeasuredFont {
         face: f.face.clone(),
         size_px: f.height.unsigned_abs() as f32,
+        height: f.height.unsigned_abs() as i32,
         bold: f.bold,
         italic: f.italic,
         angle: f.angle,
     })
 }
 
+/// The pre-rendered-font map key for this `Font` instance.
+fn font_prerendered_key(
+    engine: *mut c_void,
+    instance: *mut c_void,
+) -> Result<PrerenderedKey, String> {
+    let font = measured_font(engine, instance)?;
+    Ok(PrerenderedKey {
+        face: font.face,
+        height: font.height,
+        bold: font.bold,
+        italic: font.italic,
+        angle: font.angle.round() as i32,
+    })
+}
+
 /// Lay `text` out with the instance's face/size/style and return
 /// `(width, height, angle)`.
 ///
-/// The angle is the font's rotation in the reference's tenths-of-a-degree
-/// units and is returned unchanged for the `getEsc*` callers.
+/// A mapped pre-rendered font supplies the width (the sum of its `Inc`
+/// values) and the height (`abs(Font.Height)`); the reference's
+/// `getTextWidth`/`getTextHeight` are otherwise the rasterizer's shaped width
+/// and `abs(Font.Height)` (`reference/cpp/core/visual/LayerIntf.cpp:11702-11731`,
+/// `reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:1435-1473`). The angle
+/// is returned unchanged for the `getEsc*` callers, which apply the rotation.
 fn measure_text(
     engine: *mut c_void,
     instance: *mut c_void,
     text: &str,
 ) -> Result<(f64, f64, f64), String> {
     let font = measured_font(engine, instance)?;
+    // The reference only consults the pre-rendered font through a layer-bound
+    // font; a standalone `new Font()` measures directly
+    // (`reference/cpp/core/visual/LayerIntf.cpp:11716-11731`). `owns_state`
+    // is true for `new Font()` and false for the `Layer.font` wrapper.
+    let standalone = unsafe { &*(instance as *const FontInst) }.owns_state;
     let (_resolved, ctx) = bound(engine)?;
     let mut resolver = crate::resource::resource_state(&ctx);
     let id = resolver.resolve_face(&ctx, &font.face)?;
     let mut style = TextStyle::new(font.size_px);
     style.bold = font.bold;
     style.italic = font.italic;
+    let key = PrerenderedKey {
+        face: font.face.clone(),
+        height: font.height,
+        bold: font.bold,
+        italic: font.italic,
+        angle: font.angle.round() as i32,
+    };
+    if !standalone && let Some(prerendered) = resolver.prerendered_for(&key) {
+        let width = prerendered_text_width(&resolver.engine, id, &prerendered, text, &style)
+            .map_err(|error| format!("Font: text layout failed: {error}"))?;
+        return Ok((width, f64::from(font.height), font.angle));
+    }
     let layout = resolver
         .engine
         .layout(id, text, &style, None)
         .map_err(|error| format!("Font: text layout failed: {error}"))?;
-    Ok((layout.width as f64, layout.height as f64, font.angle))
+    Ok((layout.width as f64, f64::from(font.height), font.angle))
+}
+
+/// The pre-rendered text width: the sum of each UTF-16 unit's `Inc`, falling
+/// back to the rasterizer advance for a unit the `.tft` does not carry
+/// (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:1435-1473`).
+fn prerendered_text_width(
+    engine: &TextEngine,
+    font: FontId,
+    prerendered: &PrerenderedFont,
+    text: &str,
+    style: &TextStyle,
+) -> Result<f64, TextError> {
+    let mut width: i64 = 0;
+    for unit in text.encode_utf16() {
+        if let Some(item) = prerendered.find_code_unit(unit) {
+            width = width.saturating_add(i64::from(item.inc));
+        } else if let Some(ch) = char::from_u32(u32::from(unit)) {
+            width = width.saturating_add(engine.glyph_advance(font, ch, style)?.round() as i64);
+        }
+    }
+    Ok(width as f64)
 }
 
 /// The reference's rotation conversion: the font angle is in tenths of a
@@ -157,6 +218,10 @@ extern "C" fn font_destroy(engine: *mut c_void, instance: *mut c_void) {
         // SAFETY: the caller resolved `ctx` from the installed binding.
         let services = unsafe { ctx.services() };
         services.state::<VisualState>().objects.fonts.remove(&id);
+        services
+            .state::<FontMetricsState>()
+            .face_is_file_name
+            .remove(&id);
         if inst.owns_state {
             let scene = services.scene();
             if let Some(scene) = scene {
@@ -383,12 +448,65 @@ font_int_prop!(
 fn normalize_angle(angle: i64) -> i64 {
     angle.rem_euclid(3600)
 }
-font_int_prop!(
-    font_face_is_file_name_get,
-    font_face_is_file_name_set,
-    |_f: &FontState| 0,
-    |_f: &mut FontState, _v: &Value| {}
-);
+
+/// `font.faceIsFileName` (get) — the reference stores it in `Font.Flags`
+/// (`tTJSNI_Font::GetFontFaceIsFileName`,
+/// `reference/cpp/core/visual/LayerIntf.cpp:11688-11693`).
+extern "C" fn font_face_is_file_name_get(
+    engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let inst = unsafe { &*(instance as *const FontInst) };
+    let Some(id) = inst.id else {
+        return report_error(
+            out_error,
+            "Font.faceIsFileName: this font is not constructed",
+        );
+    };
+    let Ok((_resolved, ctx)) = bound(engine) else {
+        return report_error(
+            out_error,
+            "Font.faceIsFileName: compat context is not bound",
+        );
+    };
+    let flag = font_state(&ctx)
+        .face_is_file_name
+        .get(&id)
+        .copied()
+        .unwrap_or(false);
+    set_int(out, i64::from(flag));
+    0
+}
+
+/// `font.faceIsFileName` (set) — see [`font_face_is_file_name_get`].
+extern "C" fn font_face_is_file_name_set(
+    engine: *mut c_void,
+    instance: *mut c_void,
+    value: *const Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let inst = unsafe { &*(instance as *const FontInst) };
+    let Some(id) = inst.id else {
+        return report_error(
+            out_error,
+            "Font.faceIsFileName: this font is not constructed",
+        );
+    };
+    let Ok((_resolved, ctx)) = bound(engine) else {
+        return report_error(
+            out_error,
+            "Font.faceIsFileName: compat context is not bound",
+        );
+    };
+    font_state(&ctx)
+        .face_is_file_name
+        .insert(id, value_as_bool(unsafe { &*value }));
+    0
+}
 
 /// `font.face`.
 extern "C" fn font_face_get(
@@ -425,7 +543,8 @@ extern "C" fn font_face_set(
 
 // --- Font text metrics -----------------------------------------------------
 
-/// `font.getTextWidth(text)` — shaped width in pixels.
+/// `font.getTextWidth(text)` — the pre-rendered `Inc` sum or shaped width in
+/// pixels.
 extern "C" fn font_get_text_width(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -448,7 +567,8 @@ extern "C" fn font_get_text_width(
     }
 }
 
-/// `font.getTextHeight(text)` — shaped block height in pixels.
+/// `font.getTextHeight(text)` — `abs(Font.Height)` in pixels
+/// (`reference/cpp/core/visual/LayerIntf.cpp:11724-11731`).
 extern "C" fn font_get_text_height(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -659,10 +779,10 @@ extern "C" fn font_get_list(
     0
 }
 
-/// `font.mapPrerenderedFont(storage)` — record the prerendered-font storage
-/// for this font. The reference maps the font to a prerendered font object;
-/// without a prerendered-font subsystem the registration is explicit state
-/// and never affects metrics silently.
+/// `font.mapPrerenderedFont(storage)` — load the storage and map this font
+/// value to it. A missing or malformed storage raises, matching the reference
+/// `tTJSNI_Font::MapPrerenderedFont` → `TVPMapPrerenderedFont`
+/// (`reference/cpp/core/visual/LayerIntf.cpp:11790-11796`).
 extern "C" fn font_map_prerendered_font(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -680,19 +800,26 @@ extern "C" fn font_map_prerendered_font(
     }
     let storage = value_as_string(&unsafe { args(argv, argc) }[0]);
     let inst = unsafe { &*(instance as *const FontInst) };
-    let Some(id) = inst.id else {
+    if inst.id.is_none() {
         return report_error(
             out_error,
             "Font.mapPrerenderedFont: this font is not constructed",
         );
-    };
+    }
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(
             out_error,
             "Font.mapPrerenderedFont: compat context is not bound",
         );
     };
-    font_state(&ctx).prerendered.insert(id, storage);
+    let key = match font_prerendered_key(engine, instance) {
+        Ok(key) => key,
+        Err(error) => return report_error(out_error, &error),
+    };
+    let mut resolver = crate::resource::resource_state(&ctx);
+    if let Err(error) = resolver.map_prerendered(&ctx, key, &storage) {
+        return report_error(out_error, &error);
+    }
     set_void(out);
     0
 }
@@ -708,19 +835,23 @@ extern "C" fn font_unmap_prerendered_font(
     _objthis: *mut c_void,
 ) -> c_int {
     let inst = unsafe { &*(instance as *const FontInst) };
-    let Some(id) = inst.id else {
+    if inst.id.is_none() {
         return report_error(
             out_error,
             "Font.unmapPrerenderedFont: this font is not constructed",
         );
-    };
+    }
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(
             out_error,
             "Font.unmapPrerenderedFont: compat context is not bound",
         );
     };
-    font_state(&ctx).prerendered.remove(&id);
+    let key = match font_prerendered_key(engine, instance) {
+        Ok(key) => key,
+        Err(error) => return report_error(out_error, &error),
+    };
+    crate::resource::resource_state(&ctx).unmap_prerendered(&key);
     set_void(out);
     0
 }

@@ -712,6 +712,34 @@ impl TextEngine {
         )?)
     }
 
+    /// Returns the rasterizer's pen advance for one character.
+    ///
+    /// This is the per-character extent the pre-rendered-font width sums in
+    /// for a character the `.tft` does not carry
+    /// (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:1435-1473`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TextError::UnknownFont`] when `font` is not registered.
+    pub fn glyph_advance(
+        &self,
+        font: FontId,
+        codepoint: char,
+        style: &TextStyle,
+    ) -> Result<f32, TextError> {
+        let face = self
+            .faces
+            .get(font.0)
+            .ok_or(TextError::UnknownFont(font.0))?;
+        Ok(render::glyph_advance(
+            &self.render_system,
+            &face.render,
+            codepoint,
+            style.size_px,
+            style.glyph_style(),
+        ))
+    }
+
     /// Returns the bounding rectangle of the rasterized `text` in the text's
     /// local coordinate space (origin at the pen start), or `None` when the
     /// run has no ink.
@@ -1249,7 +1277,28 @@ pub fn rasterize_text_coverage(
             coverage,
         )?);
     }
+    // A run whose non-whitespace characters all rasterize to no ink means the
+    // resolved face cannot render them; report a typed error instead of
+    // compositing nothing (`reference/cpp/core/visual/FreeTypeFontRasterizer.cpp:185-194`).
+    if masks.is_empty()
+        && let Some(glyph) = layout
+            .glyphs
+            .iter()
+            .find(|glyph| requires_ink(glyph.codepoint))
+    {
+        return Err(TextError::Glyph(api::error::GlyphError::MissingGlyph {
+            codepoint: glyph.codepoint as u32,
+        }));
+    }
     Ok(masks)
+}
+
+/// Whether a codepoint is expected to leave ink.
+///
+/// Whitespace and control characters legitimately rasterize to nothing; any
+/// other character with no coverage means the resolved face cannot render it.
+fn requires_ink(codepoint: char) -> bool {
+    !codepoint.is_whitespace() && !codepoint.is_control()
 }
 
 /// Blurs a positioned 8-bit coverage mask with the reference character-blur
@@ -1645,5 +1694,55 @@ mod tests {
             Err(TextError::FontNotFound { .. }) => {}
             Err(error) => panic!("unexpected error: {error}"),
         }
+    }
+
+    /// Reference: `FreeTypeFontRasterizer::GetBitmap` falls back to the face's
+    /// default and first glyph and raises `TVPFontRasterizeError` when none of
+    /// them can be rendered
+    /// (`reference/cpp/core/visual/FreeTypeFontRasterizer.cpp:185-194`). A run
+    /// whose non-whitespace characters all rasterize to no ink must therefore
+    /// report a typed error rather than composite nothing.
+    #[test]
+    fn a_blank_run_for_a_non_whitespace_character_is_a_typed_error() {
+        let Some(bytes) = load_test_font() else {
+            return;
+        };
+        let mut engine = TextEngine::new();
+        let Ok(id) = engine.add_font(&bytes, 0) else {
+            return;
+        };
+        let style = TextStyle::new(24.0);
+        // Pick a codepoint the face maps to a glyph with no outline, so the
+        // rasterizer returns an empty mask for a character that should ink.
+        let chosen = ['\u{2800}', '\u{200B}', '\u{2060}', '\u{FEFF}', '\u{FFFC}']
+            .into_iter()
+            .find(|ch| {
+                requires_ink(*ch)
+                    && engine
+                        .rasterize_glyph(id, *ch, &style)
+                        .is_ok_and(|bitmap| bitmap.is_empty())
+            });
+        let Some(codepoint) = chosen else {
+            return;
+        };
+        let layout = TextLayout {
+            glyphs: vec![LaidOutGlyph {
+                codepoint,
+                font: id,
+                line: 0,
+                x: 0.0,
+                baseline_y: 0.0,
+                advance: 0.0,
+            }],
+            width: 0.0,
+            height: 0.0,
+            line_height: 0.0,
+        };
+        let error = rasterize_text_coverage(&engine, &layout, &style, true)
+            .expect_err("an inked-less non-whitespace run must not render blank");
+        assert!(matches!(
+            error,
+            TextError::Glyph(api::error::GlyphError::MissingGlyph { .. })
+        ));
     }
 }

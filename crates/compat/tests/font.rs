@@ -51,6 +51,40 @@ fn test_font() -> Option<(PathBuf, String)> {
     None
 }
 
+/// Builds a version-1 `.tft` for `chars`, each a `2x2` coverage whose four
+/// literal bytes are `0x10, 0x20, 0x30, 0x3F` and whose descriptor `inc` is
+/// `inc`.
+fn build_tft(chars: &[u16], inc: i16) -> Vec<u8> {
+    let header = 36usize;
+    let ch_index_offset = header;
+    let index_offset = ch_index_offset + chars.len() * 2;
+    let data_offset = index_offset + chars.len() * 20;
+    let mut bytes = vec![0u8; data_offset];
+    bytes[..22].copy_from_slice(b"TVP pre-rendered font\x1a");
+    bytes[22] = 1;
+    bytes[23] = 2;
+    bytes[24..28].copy_from_slice(&(chars.len() as u32).to_le_bytes());
+    bytes[28..32].copy_from_slice(&(ch_index_offset as u32).to_le_bytes());
+    bytes[32..36].copy_from_slice(&(index_offset as u32).to_le_bytes());
+    for (i, ch) in chars.iter().enumerate() {
+        bytes[ch_index_offset + i * 2..ch_index_offset + i * 2 + 2]
+            .copy_from_slice(&ch.to_le_bytes());
+    }
+    for i in 0..chars.len() {
+        let at = index_offset + i * 20;
+        let offset = (data_offset + i * 4) as u32;
+        bytes[at..at + 4].copy_from_slice(&offset.to_le_bytes());
+        bytes[at + 4..at + 6].copy_from_slice(&2u16.to_le_bytes());
+        bytes[at + 6..at + 8].copy_from_slice(&2u16.to_le_bytes());
+        bytes[at + 12..at + 14].copy_from_slice(&3i16.to_le_bytes());
+        bytes[at + 16..at + 18].copy_from_slice(&inc.to_le_bytes());
+    }
+    for _ in chars {
+        bytes.extend_from_slice(&[0x10, 0x20, 0x30, 0x3F]);
+    }
+    bytes
+}
+
 /// A bound VM + host + attached scene and optional storage. Fields drop in
 /// declaration order, so `_host` (which owns the process-wide binding) drops
 /// before the engine/scene/storage its raw pointers reference.
@@ -184,6 +218,11 @@ fn font_metrics_use_the_l2_text_engine() {
         env.eval_real("f.getEscHeightY('Hello')").abs() < 1.0,
         "getEscHeightY should vanish at 90 degrees"
     );
+    // The reference `getTextWidth`/`getTextHeight` are unrotated; only the
+    // `getEsc*` variants apply the angle
+    // (`reference/cpp/core/visual/LayerIntf.cpp:11716-11746`).
+    assert_eq!(env.eval_int("f.getTextWidth('Hello')"), width);
+    assert_eq!(env.eval_int("f.getTextHeight('Hello')"), 24);
 }
 
 #[test]
@@ -292,18 +331,108 @@ fn font_rasterizer_is_the_single_l1_rasterizer() {
 }
 
 #[test]
-fn font_prerendered_registration_round_trips() {
+fn font_map_prerendered_font_raises_for_a_missing_storage() {
     let _lock = vm_lock();
     let env = Env::new(None);
-    env.run("var f = new Font('Ghost', 16, 0); f.mapPrerenderedFont('font.prn');");
-    env.run("f.unmapPrerenderedFont();");
-    // The font stays usable after unmapping (the registration is dispatch
-    // state, not the font's existence).
-    assert_eq!(env.eval_int("f.face == 'Ghost'"), 1);
+    env.run("var f = new Font('Ghost', 16, 0);");
+    // Reference: `tTVPPrerenderedFont` raises `TVPCannotFindStorage` when the
+    // storage cannot be placed (`reference/cpp/core/visual/PrerenderedFont.cpp:9-13`,
+    // `reference/cpp/core/base/StorageIntf.cpp:1135-1140`).
+    let message = env.error("f.mapPrerenderedFont('missing.tft')");
+    assert!(
+        message.contains("Cannot find storage"),
+        "unexpected message: {message}"
+    );
+    // The font itself stays usable.
     assert_eq!(env.eval_int("f.height"), 16);
     // The reference `Font` member list registers no `id`
     // (`reference/cpp/core/visual/LayerIntf.cpp:11820`), so reading it raises.
     env.error("f.id");
+}
+
+/// Reference: `tTVPNativeBaseBitmap::GetTextSize` sums each character's
+/// pre-rendered `Inc` and reports `abs(Font.Height)` as the height
+/// (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:1435-1473`).
+#[test]
+fn font_prerendered_metrics_use_the_mapped_inc_and_height() {
+    let _lock = vm_lock();
+    let Some((font_dir, font_name)) = test_font() else {
+        return;
+    };
+    let font_bytes = std::fs::read(font_dir.join(&font_name)).expect("read test font");
+    let env = common::Env::with_storage();
+    let game_dir = env.game_dir().expect("game dir").clone();
+    // The face string is read from storage, so the test does not depend on the
+    // host's installed fonts.
+    std::fs::write(game_dir.join("Pre"), &font_bytes).expect("write face");
+    std::fs::write(
+        game_dir.join("sample.tft"),
+        build_tft(&[b'A' as u16, b'B' as u16], 100),
+    )
+    .expect("write tft");
+    env.run(
+        "var w = new Window(); \
+         var l = new Layer(w, null); \
+         var f = new Font('Pre', 12, 0); \
+         f.mapPrerenderedFont('sample.tft'); \
+         l.font.face = 'Pre'; \
+         l.font.height = 12; \
+         l.font.bold = false; \
+         l.font.italic = false; \
+         l.font.angle = 0;",
+    );
+
+    // Reference: `tTVPNativeBaseBitmap::GetTextSize` sums each character's
+    // pre-rendered `Inc` and reports `abs(Font.Height)` as the height
+    // (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:1435-1473`).
+    assert_eq!(env.eval_int("l.font.getTextWidth('AB')"), 200);
+    assert_eq!(env.eval_int("l.font.getTextHeight('AB')"), 12);
+    // At angle 0 the escape projection equals the pre-rendered width
+    // (`reference/cpp/core/visual/LayerIntf.cpp:11734-11740`).
+    assert!((env.eval_real("l.font.getEscWidthX('AB')") - 200.0).abs() < 1.0);
+
+    // The reference only consults the pre-rendered font through a layer-bound
+    // font; a standalone `new Font().getTextWidth` measures directly
+    // (`reference/cpp/core/visual/LayerIntf.cpp:11716-11722`).
+    assert_ne!(env.eval_int("f.getTextWidth('AB')"), 200);
+}
+
+/// Reference: `tTVPNativeBaseBitmap::DrawTextMultiple` uses the mapped
+/// pre-rendered coverage for each character
+/// (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:1285-1433`).
+#[test]
+fn layer_draw_text_uses_a_mapped_prerendered_font() {
+    let _lock = vm_lock();
+    let Some((font_dir, font_name)) = test_font() else {
+        return;
+    };
+    let font_bytes = std::fs::read(font_dir.join(&font_name)).expect("read test font");
+    let env = common::Env::with_storage();
+    let game_dir = env.game_dir().expect("game dir").clone();
+    std::fs::write(game_dir.join("Pre"), &font_bytes).expect("write face");
+    std::fs::write(game_dir.join("sample.tft"), build_tft(&[b'A' as u16], 7)).expect("write tft");
+    env.run(
+        "var w = new Window(); \
+         var l = new Layer(w, null); \
+         l.setImageSize(64, 64); \
+         var f = new Font('Pre', 12, 0); \
+         f.mapPrerenderedFont('sample.tft'); \
+         l.font.face = 'Pre'; \
+         l.font.height = 12; \
+         l.font.bold = false; \
+         l.font.italic = false; \
+         l.font.angle = 0; \
+         l.drawText(4, 4, 'A', 0x00ffffff, 255);",
+    );
+    let layer = env.scene.layers.last().expect("the layer exists");
+    let bitmap = env
+        .scene
+        .bitmap(layer.bitmap.expect("the layer has a main image"))
+        .expect("the bitmap exists");
+    assert!(
+        bitmap.rgba.chunks_exact(4).any(|pixel| pixel[3] != 0),
+        "drawText should use the mapped pre-rendered coverage"
+    );
 }
 
 #[test]
@@ -317,7 +446,8 @@ fn font_properties_round_trip() {
          f.italic = 1; \
          f.strikeout = true; \
          f.underline = 1; \
-         f.angle = 450;",
+         f.angle = 450; \
+         f.faceIsFileName = true;",
     );
 
     assert_eq!(env.eval_int("f.face == 'Arial'"), 1);
@@ -327,6 +457,10 @@ fn font_properties_round_trip() {
     assert_eq!(env.eval_int("f.strikeout"), 1);
     assert_eq!(env.eval_int("f.underline"), 1);
     assert_eq!(env.eval_int("f.angle"), 450);
+    // Reference: `Font.faceIsFileName` round-trips through the font value's
+    // `TVP_TF_FONTFILE` flag (`reference/cpp/core/visual/LayerIntf.cpp:11677-11693`).
+    assert_eq!(env.eval_int("f.faceIsFileName"), 1);
+    env.run("f.faceIsFileName = false;");
     assert_eq!(env.eval_int("f.faceIsFileName"), 0);
 
     let font = env.scene.fonts.first().expect("one font");
