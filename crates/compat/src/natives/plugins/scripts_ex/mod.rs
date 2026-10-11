@@ -60,6 +60,7 @@ const TJS_STATICMEMBER: i64 = 0x0001_0000;
 // The vendored VM exports `TJS::TJSDoRehash()` with Itanium C++ linkage; the
 // C ABI has no entry for it, but it is part of the statically linked VM and
 // is exactly the function the reference binds `rehash` to.
+// SAFETY: `TJSDoRehash` is exported by the statically linked vendored VM under this Itanium C++ mangled name and its signature matches the declaration below.
 unsafe extern "C" {
     #[link_name = "_ZN3TJS11TJSDoRehashEv"]
     fn tjs_do_rehash();
@@ -408,31 +409,12 @@ fn read_key(engine: &Tjs2Engine, flat: &DetachedValue, index: i64) -> Result<Str
     }
 }
 
-/// Whether a member value is one of the plugin methods the ABI attaches to
-/// every `Array`/`Dictionary` instance.
+/// Enumerate `target`'s own members (reference `EnumMembers`).
 ///
-/// The attached callbacks are bare dispatch objects: unlike data objects
-/// (arrays, dictionaries, script classes) they report no class-name chain.
-/// The reference keeps methods on the class and never enumerates them, so
-/// such opaque objects are skipped by the enumeration helpers.
-fn is_attached_method(engine: &Tjs2Engine, value: &Owned) -> Result<bool, String> {
-    match value {
-        Owned::Object(object) => {
-            let names = engine.class_names(object.raw_id())?;
-            Ok(keys_of(engine, &names)?.is_empty())
-        }
-        _ => Ok(false),
-    }
-}
-
-/// Enumerate `target`'s own **data** members (reference `EnumMembers`).
-///
-/// The ABI attaches plugin instance members to every `Array`/`Dictionary`
-/// instance as own members, so a plain `assign` flattening would expose the
-/// attached methods (`clone`, `foreach`, `saveStruct2`, ...) as dictionary
-/// entries. The reference keeps methods on the class (never on the instance),
-/// so function-valued members are filtered here to match the reference's
-/// observable member set.
+/// The builtin `Array.assign` flattening runs the object's `EnumMembers`, so
+/// the result is exactly the reference's own-member walk. Plugin methods live
+/// on their class objects and are not copied onto instances, so they do not
+/// appear here.
 fn enumerate_entries(
     engine: &Tjs2Engine,
     target: &DetachedValue,
@@ -444,20 +426,17 @@ fn enumerate_entries(
     while index + 1 < count {
         let key = read_key(engine, &flat, index)?;
         let value = engine.member(flat.raw_id(), &(index + 1).to_string())?;
-        let owned = owned_from_tjs(engine, value)?;
-        if !is_attached_method(engine, &owned)? {
-            entries.push((key, owned));
-        }
+        entries.push((key, owned_from_tjs(engine, value)?));
         index += 2;
     }
     Ok(entries)
 }
 
-/// The own **data** member names of `target`, in enumeration order.
+/// The own member names of `target`, in enumeration order.
 ///
-/// A raw `EnumMembers` reports the plugin members the ABI attaches to every
-/// `Array`/`Dictionary` instance; the reference keeps methods on the class,
-/// where `EnumMembers` never reports them (`reference/cpp/plugins/scriptsEx.cpp:320-345`).
+/// The reference enumerates with `EnumMembers`
+/// (`reference/cpp/plugins/scriptsEx.cpp:320-345`); [`enumerate_entries`] runs
+/// that same walk through `Array.assign`.
 pub(crate) fn data_member_names(
     engine: &Tjs2Engine,
     target: &DetachedValue,
@@ -918,8 +897,8 @@ fn get_object_keys(
 /// commented out) and falls back to `tTJSCustomObject::GetCount`, which
 /// reports the object's own-member count (`tjsObject.cpp:1431-1442`) — `0`
 /// for an array whose elements live in the native `Items` vector. Every
-/// other object counts its own data members (the ABI-attached plugin methods
-/// are filtered out, exactly as the reference never sees class members).
+/// other object counts its own data members, exactly as the reference never
+/// sees class members.
 fn get_object_count(
     engine: &Tjs2Engine,
     _services: &CompatServices,

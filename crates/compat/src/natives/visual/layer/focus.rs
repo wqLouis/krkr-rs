@@ -46,6 +46,7 @@ fn focus_neighbor(
     method: &str,
     forward: bool,
 ) -> c_int {
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `focus_neighbor`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         return report_error(
@@ -145,7 +146,9 @@ extern "C" fn layer_set_attention_pos(
     if argc < 2 {
         return report_error(out_error, "Layer.setAttentionPos requires 2 arguments");
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_set_attention_pos`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         return report_error(
@@ -192,7 +195,9 @@ extern "C" fn layer_set_cursor_pos(
     if argc < 2 {
         return report_error(out_error, "Layer.setCursorPos requires 2 arguments");
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_set_cursor_pos`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         return report_error(
@@ -249,6 +254,7 @@ extern "C" fn layer_release_capture(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_release_capture`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         return report_error(
@@ -291,7 +297,9 @@ extern "C" fn layer_release_touch_capture(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_release_touch_capture`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         return report_error(

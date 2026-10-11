@@ -284,6 +284,7 @@ fn copy_frame(ctx: &CompatCtx, slot: &MovieSlot) {
 /// `layerExMovie::OnContinuousCallback`). It is a free function (like
 /// `compat::video_poll`) so a host can drive it directly.
 pub fn movie_poll(ctx: &CompatCtx, dt_ms: f64) -> Result<(), CompatError> {
+    // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `movie_poll`.
     let host = unsafe { ctx.engine() };
     // SAFETY: the caller holds a live, bound context.
     let services = unsafe { ctx.services() };
@@ -377,6 +378,7 @@ extern "C" fn layer_open_movie(
         Err(error) => return report_error(out_error, &format!("Layer.openMovie: {error}")),
     };
     remember_layer_object(&ctx, resolved.engine(), id, objthis);
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     let filename = value_string(&a[0]);
     let alpha = a.get(1).is_some_and(crate::natives::system::value_as_bool);
@@ -412,6 +414,7 @@ extern "C" fn layer_start_movie(
         Err(error) => return report_error(out_error, &format!("Layer.startMovie: {error}")),
     };
     remember_layer_object(&ctx, resolved.engine(), id, objthis);
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     let looping = a.first().is_some_and(crate::natives::system::value_as_bool);
     if let Err(error) = start_movie(&ctx, resolved.engine(), id, looping) {

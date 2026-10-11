@@ -626,6 +626,7 @@ extern "C" fn native_inform(
     if argc < 1 {
         return report_error(out_error, "System.inform requires 1 argument");
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     let text = value_as_string(&a[0]);
     let caption = if argc >= 2 && a[1].ty != VAL_VOID {
@@ -701,6 +702,7 @@ extern "C" fn native_get_argument(
     if argc < 1 {
         return report_error(out_error, "System.getArgument requires 1 argument");
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     let name = value_as_string(&a[0]);
     let Some(resolved) = resolve(engine) else {
@@ -734,6 +736,7 @@ extern "C" fn native_set_argument(
     if argc < 2 {
         return report_error(out_error, "System.setArgument requires 2 arguments");
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     let name = value_as_string(&a[0]);
     let value = value_as_string(&a[1]);
@@ -774,6 +777,7 @@ fn record_exit(
     let code = if argc >= 1 {
         // `numparams > 0 ? param[0]->AsInteger() : 0` (`SystemIntf.cpp:111`,
         // `123`) — the strict conversion raises on objects.
+        // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
         match try_value_as_i64(&unsafe { args(argv, argc) }[0]) {
             Ok(code) => code,
             Err(error) => return Some(error),
@@ -884,6 +888,7 @@ extern "C" fn native_input_string(
     if argc < 3 {
         return report_error(out_error, "System.inputString requires 3 arguments");
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     let caption = value_as_string(&a[0]);
     let prompt = value_as_string(&a[1]);
@@ -908,6 +913,7 @@ extern "C" fn native_to_actual_color(
     if argc < 1 {
         return report_error(out_error, "System.toActualColor requires 1 argument");
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let color = value_as_i64(&unsafe { args(argv, argc) }[0]) as u32;
     let actual = if color & 0xff00_0000 != 0 {
         color_to_actual(color)
@@ -956,6 +962,7 @@ extern "C" fn native_assign_message(
     if argc < 2 {
         return report_error(out_error, "System.assignMessage requires 2 arguments");
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     let id = value_as_string(&a[0]);
     let message = value_as_string(&a[1]);
@@ -992,6 +999,7 @@ extern "C" fn native_touch_images(
     if argc < 1 {
         return report_error(out_error, "System.touchImages requires 1 argument");
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     // The reference requires an array object (`AsObjectClosureNoAddRef` +
     // `PropGetByNum` walk, `SystemIntf.cpp:224-245` — a non-object raises the
@@ -1031,6 +1039,7 @@ extern "C" fn native_do_compact(
     out: *mut Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let level = match unsafe { args(argv, argc) }.first() {
         // `if(numparams >= 1 && param[0]->Type() != tvtVoid) level =
         // (tjs_int)*param[0]` (`SystemIntf.cpp:306-311`): absent/void keeps
@@ -1070,6 +1079,7 @@ extern "C" fn native_read_reg_value(
     if argc < 1 {
         return report_error(out_error, "System.readRegValue requires 1 argument");
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let key = value_as_string(&unsafe { args(argv, argc) }[0]);
     let Some(resolved) = resolve(engine) else {
         return report_error(
@@ -1099,6 +1109,7 @@ extern "C" fn native_add_continuous_handler(
     out: *mut Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     if a.is_empty() {
         return report_error(out_error, "System.addContinuousHandler requires 1 argument");
@@ -1155,6 +1166,7 @@ extern "C" fn native_remove_continuous_handler(
     out: *mut Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     if a.is_empty() {
         return report_error(
@@ -1237,6 +1249,7 @@ extern "C" fn native_get_key_state(
     if argc < 1 {
         return report_error(out_error, "System.getKeyState requires 1 argument");
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     // `(tjs_int)*param[0]` raises on objects (`SystemImpl.cpp:639-642`).
     let code = match try_value_as_i64(&a[0]) {
@@ -1297,6 +1310,7 @@ extern "C" fn native_shell_execute(
     }
     // The reference converts both arguments (`ttstr`), so a conversion error
     // still propagates, but then discards them.
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     let _target = value_as_string(&a[0]);
     if argc >= 2 {
@@ -1324,6 +1338,7 @@ extern "C" fn native_system(
     if argc < 1 {
         return report_error(out_error, "System.system requires 1 argument");
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let _target = value_as_string(&unsafe { args(argv, argc) }[0]);
     let Some(resolved) = resolve(engine) else {
         return report_error(out_error, "System.system: compat context is not bound");

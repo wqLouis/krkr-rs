@@ -325,6 +325,7 @@ extern "C" fn async_trigger_destroy(engine: *mut c_void, instance: *mut c_void) 
     if instance.is_null() {
         return;
     }
+    // SAFETY: `instance` is the live `AsyncTriggerInst` payload the VM allocated for this script object; no `&mut` to it is live in `async_trigger_destroy`.
     let inst = unsafe { &*(instance as *const AsyncTriggerInst) };
     if let (Some(id), Ok((_host, ctx))) = (inst.id, bound(engine)) {
         // SAFETY: the caller resolved `ctx` from the installed binding.
@@ -355,6 +356,7 @@ extern "C" fn async_trigger_ctor(
     let Ok((host, ctx)) = bound(engine) else {
         return report_error(out_error, "AsyncTrigger: compat context is not bound");
     };
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let callback = match host.retain_object_arg(&unsafe { args(argv, argc) }[0]) {
         Ok(callback) => callback,
         Err(error) => {
@@ -367,6 +369,7 @@ extern "C" fn async_trigger_ctor(
     // The optional second argument selects the member to invoke; empty means
     // "invoke the object itself", omitted/void keeps the `TVPActionName`
     // default.
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let action_name = match unsafe { args(argv, argc) }.get(1) {
         Some(value) if value.ty != VAL_VOID => {
             let name = value_as_string(value);
@@ -376,6 +379,7 @@ extern "C" fn async_trigger_ctor(
     };
     // The object retains itself so the poll can dispatch its `onFire` member.
     let owner = host.retain_object_detached(objthis).ok();
+    // SAFETY: `instance` is the live `AsyncTriggerInst` payload the VM allocated for this script object; `async_trigger_ctor` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut AsyncTriggerInst) };
     if inst.id.is_some() {
         return report_error(out_error, "AsyncTrigger: already constructed");
@@ -399,6 +403,7 @@ extern "C" fn async_trigger_invalidate(engine: *mut c_void, instance: *mut c_voi
     if instance.is_null() {
         return;
     }
+    // SAFETY: `instance` is the live `AsyncTriggerInst` payload the VM allocated for this script object; no `&mut` to it is live in `async_trigger_invalidate`.
     let inst = unsafe { &*(instance as *const AsyncTriggerInst) };
     if let (Some(id), Ok((_host, ctx))) = (inst.id, bound(engine)) {
         // SAFETY: the caller resolved `ctx` from the installed binding.
@@ -423,6 +428,7 @@ extern "C" fn async_trigger_trigger(
             "AsyncTrigger.trigger: compat context is not bound",
         );
     };
+    // SAFETY: `instance` is the live `AsyncTriggerInst` payload the VM allocated for this script object; no `&mut` to it is live in `async_trigger_trigger`.
     let inst = unsafe { &*(instance as *const AsyncTriggerInst) };
     let id = match instance_id(inst) {
         Ok(id) => id,
@@ -459,6 +465,7 @@ extern "C" fn async_trigger_cancel(
             "AsyncTrigger.cancel: compat context is not bound",
         );
     };
+    // SAFETY: `instance` is the live `AsyncTriggerInst` payload the VM allocated for this script object; no `&mut` to it is live in `async_trigger_cancel`.
     let inst = unsafe { &*(instance as *const AsyncTriggerInst) };
     let id = match instance_id(inst) {
         Ok(id) => id,
@@ -493,6 +500,7 @@ extern "C" fn async_trigger_on_fire(
             "AsyncTrigger.onFire: compat context is not bound",
         );
     };
+    // SAFETY: `instance` is the live `AsyncTriggerInst` payload the VM allocated for this script object; no `&mut` to it is live in `async_trigger_on_fire`.
     let inst = unsafe { &*(instance as *const AsyncTriggerInst) };
     let id = match instance_id(inst) {
         Ok(id) => id,
@@ -529,6 +537,7 @@ extern "C" fn async_trigger_cached_get(
             "AsyncTrigger.cached: compat context is not bound",
         );
     }
+    // SAFETY: `instance` is the live `AsyncTriggerInst` payload the VM allocated for this script object; no `&mut` to it is live in `async_trigger_cached_get`.
     let inst = unsafe { &*(instance as *const AsyncTriggerInst) };
     set_bool(out, inst.cached);
     0
@@ -547,7 +556,9 @@ extern "C" fn async_trigger_cached_set(
             "AsyncTrigger.cached: compat context is not bound",
         );
     };
+    // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
     let cached = value_as_bool(unsafe { &*value });
+    // SAFETY: `instance` is the live `AsyncTriggerInst` payload the VM allocated for this script object; `async_trigger_cached_set` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut AsyncTriggerInst) };
     let id = match instance_id(inst) {
         Ok(id) => id,
@@ -577,6 +588,7 @@ extern "C" fn async_trigger_mode_get(
     if bound(engine).is_err() {
         return report_error(out_error, "AsyncTrigger.mode: compat context is not bound");
     }
+    // SAFETY: `instance` is the live `AsyncTriggerInst` payload the VM allocated for this script object; no `&mut` to it is live in `async_trigger_mode_get`.
     let inst = unsafe { &*(instance as *const AsyncTriggerInst) };
     set_int(out, inst.mode);
     0
@@ -592,7 +604,9 @@ extern "C" fn async_trigger_mode_set(
     let Ok((_host, ctx)) = bound(engine) else {
         return report_error(out_error, "AsyncTrigger.mode: compat context is not bound");
     };
+    // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
     let mode = value_as_i64(unsafe { &*value });
+    // SAFETY: `instance` is the live `AsyncTriggerInst` payload the VM allocated for this script object; `async_trigger_mode_set` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut AsyncTriggerInst) };
     let id = match instance_id(inst) {
         Ok(id) => id,

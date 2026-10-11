@@ -259,6 +259,7 @@ extern "C" fn ctor(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     if a.len() < 3 {
         return report_error(out_error, "FontInfo requires 3 arguments");
@@ -271,6 +272,7 @@ extern "C" fn ctor(
         Ok(value) => value,
         Err(error) => return report_error(out_error, &format!("FontInfo: style: {error}")),
     };
+    // SAFETY: `instance` is the live `FontInst` payload the VM allocated for this script object; `ctor` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut FontInst) };
     inst.data.family = crate::native_util::value_as_string(&a[0]);
     inst.data.em_size = em_size;
@@ -342,6 +344,7 @@ extern "C" fn em_size_get(
     _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `instance` is the live `FontInst` payload the VM allocated for this script object; no `&mut` to it is live in `em_size_get`.
     let inst = unsafe { &*(instance as *const FontInst) };
     set_real(out, inst.data.em_size);
     0
@@ -354,11 +357,13 @@ extern "C" fn em_size_set(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
     let raw = unsafe { &*value };
     let em_size = match strict_real(raw) {
         Ok(value) => value,
         Err(error) => return report_error(out_error, &format!("FontInfo.emSize: {error}")),
     };
+    // SAFETY: `instance` is the live `FontInst` payload the VM allocated for this script object; `em_size_set` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut FontInst) };
     inst.data.em_size = em_size;
     0
@@ -375,6 +380,7 @@ extern "C" fn style_get(
     _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `instance` is the live `FontInst` payload the VM allocated for this script object; no `&mut` to it is live in `style_get`.
     let inst = unsafe { &*(instance as *const FontInst) };
     crate::native_util::set_int(out, i64::from(inst.data.style));
     0
@@ -390,11 +396,13 @@ extern "C" fn style_set(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
     let raw = unsafe { &*value };
     let style = match crate::natives::system::try_value_as_i64(raw) {
         Ok(value) => value,
         Err(error) => return report_error(out_error, &format!("FontInfo.style: {error}")),
     };
+    // SAFETY: `instance` is the live `FontInst` payload the VM allocated for this script object; `style_set` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut FontInst) };
     inst.data.style = style as i32;
     0
@@ -407,6 +415,7 @@ extern "C" fn force_self_path_get(
     _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `instance` is the live `FontInst` payload the VM allocated for this script object; no `&mut` to it is live in `force_self_path_get`.
     let inst = unsafe { &*(instance as *const FontInst) };
     crate::native_util::set_bool(out, inst.data.force_self_path_draw);
     0
@@ -419,7 +428,9 @@ extern "C" fn force_self_path_set(
     _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `instance` is the live `FontInst` payload the VM allocated for this script object; `force_self_path_set` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut FontInst) };
+    // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
     inst.data.force_self_path_draw = crate::natives::system::value_as_bool(unsafe { &*value });
     0
 }
@@ -431,6 +442,7 @@ extern "C" fn family_name_get(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `instance` is the live `FontInst` payload the VM allocated for this script object; no `&mut` to it is live in `family_name_get`.
     let inst = unsafe { &*(instance as *const FontInst) };
     if let Err(error) = super::set_string_out(engine, out, &inst.data.family) {
         return report_error(out_error, &error);
@@ -445,7 +457,9 @@ extern "C" fn family_name_set(
     _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `instance` is the live `FontInst` payload the VM allocated for this script object; `family_name_set` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut FontInst) };
+    // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
     inst.data.family = crate::native_util::value_as_string(unsafe { &*value });
     0
 }
@@ -462,6 +476,7 @@ macro_rules! font_metric_getter {
             let Ok((_host, ctx)) = super::bound(engine) else {
                 return report_error(out_error, "FontInfo: compat context is not bound");
             };
+            // SAFETY: `instance` is the live `FontInst` payload the VM allocated for this script object; no `&mut` to it is live during this callback.
             let inst = unsafe { &*(instance as *const FontInst) };
             let m = metrics(&ctx, &inst.data);
             set_real(out, m.$field);
@@ -613,6 +628,7 @@ extern "C" fn add_private_font(
     out: *mut Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     if a.is_empty() {
         return report_error(out_error, "GdiPlus.addPrivateFont requires 1 argument");
@@ -647,6 +663,7 @@ extern "C" fn get_font_list(
     out: *mut Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     if a.is_empty() {
         return report_error(out_error, "GdiPlus.getFontList requires 1 argument");

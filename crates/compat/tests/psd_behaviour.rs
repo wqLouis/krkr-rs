@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 
 use common::vm_lock;
 use compat::CompatHost;
-use engine::Storage;
+use engine::{Scene, Storage};
 use fs::FileSystem;
 use tjs::{Tjs2Engine, TjsValue};
 
@@ -63,6 +63,7 @@ struct Env {
     // the boxed engine/storage it points at are freed.
     _host: CompatHost,
     engine: Box<Tjs2Engine>,
+    scene: Box<Scene>,
     _storage: Box<Storage>,
     _dir: GameDir,
 }
@@ -79,14 +80,20 @@ impl Env {
             .expect("mount storage"),
         );
         let engine = Box::new(Tjs2Engine::new().expect("create engine"));
+        let mut scene = Box::new(Scene::default());
         let mut host = CompatHost::new();
-        // SAFETY: `storage` is boxed and outlives the binding, which `_host`
-        // removes on drop.
-        unsafe { host.services_mut().attach_storage(&mut *storage) };
+        // SAFETY: `scene` and `storage` are boxed and outlive the binding,
+        // which `_host` removes on drop.
+        unsafe {
+            host.services_mut()
+                .attach_scene(scene.as_mut() as *mut Scene);
+            host.services_mut().attach_storage(&mut *storage);
+        }
         host.install(&engine).expect("install compat surface");
         Env {
             _host: host,
             engine,
+            scene,
             _storage: storage,
             _dir: dir,
         }
@@ -669,4 +676,36 @@ fn odd_length_image_resources_are_padded_to_even() {
 
     env.run("var psd = new PSD(); var ok = psd.load('odd.psd');");
     assert_eq!(env.int("ok"), 1);
+}
+
+// The image `getLayerData` writes belongs to the layer: the reference writes
+// it through the layer's own `mainImageBufferForWrite`
+// (`reference/cpp/plugins/psdfile/psdclass.cpp:380-385`), so destroying the
+// layer releases it and no script `Bitmap` object ever owns it. A stale
+// `script_owned` claim leaves the pixels in the scene until it is dropped.
+#[test]
+fn get_layer_data_bitmap_is_released_with_its_layer() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.write("layered.psd", &layered_psd());
+    env.run(
+        "var psd = new PSD(); psd.load('layered.psd'); \
+         var w = new Window(); w.setSize(8, 8); \
+         var l = new Layer(w, null); \
+         psd.getLayerData(l, 0);",
+    );
+
+    let layer_id = env.scene.layers[0].id;
+    let bitmap_id = env
+        .scene
+        .layer(layer_id)
+        .and_then(|layer| layer.bitmap)
+        .expect("the layer has a MainImage");
+    assert!(env.scene.bitmap(bitmap_id).is_some());
+
+    env.run("invalidate l; l = null;");
+    assert!(
+        env.scene.bitmap(bitmap_id).is_none(),
+        "the layer-owned PSD image is released when its layer dies"
+    );
 }

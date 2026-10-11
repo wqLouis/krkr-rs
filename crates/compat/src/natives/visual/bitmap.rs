@@ -11,8 +11,7 @@ use tjs::{
 };
 
 use super::common::{
-    VisualState, argb_to_rgba, bound, resolve_object_id, rgba_to_argb, scene_mut, scene_ref,
-    set_retained_out,
+    argb_to_rgba, bound, resolve_object_id, rgba_to_argb, scene_mut, scene_ref, set_retained_out,
 };
 use crate::native_util::{args, report_error, set_bool, set_int, set_void, value_as_string};
 use crate::natives::system::value_as_i64;
@@ -222,6 +221,7 @@ fn decode_storage_image(
     name: &str,
     colorkey: u32,
 ) -> Result<(u32, u32, Vec<u8>), String> {
+    // SAFETY: `ctx` is only created for a bound, live engine, so its service pointer is valid for `decode_storage_image`.
     let services = unsafe { ctx.services() };
     let storage = services
         .storage()
@@ -265,24 +265,6 @@ fn load_into_bitmap(
     Ok((id, width, height))
 }
 
-/// See `register_window`.
-fn register_bitmap(ctx: &CompatCtx, host: &Tjs2Engine, id: u32, objthis: *mut c_void) {
-    if objthis.is_null() {
-        return;
-    }
-    match host.retain_object_detached(objthis) {
-        // SAFETY: the caller resolved `ctx` from the installed binding.
-        Ok(object) => {
-            unsafe { ctx.services() }
-                .state::<VisualState>()
-                .objects
-                .bitmaps
-                .insert(id, object);
-        }
-        Err(error) => log::warn!("Bitmap: could not retain the script object: {error}"),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Bitmap
 // ---------------------------------------------------------------------------
@@ -291,19 +273,31 @@ extern "C" fn bitmap_create(_engine: *mut c_void) -> *mut c_void {
     Box::into_raw(Box::new(BitmapInst::default())) as *mut c_void
 }
 
+/// Release the scene image this `Bitmap` owns. A layer still referencing the
+/// image keeps it alive (`Scene::release_script_bitmap`). Idempotent, so it
+/// is safe to run from both the invalidate and the destroy hook.
+extern "C" fn bitmap_release_image(engine: *mut c_void, instance: *mut c_void) {
+    if instance.is_null() {
+        return;
+    }
+    // SAFETY: `instance` is the live `BitmapInst` payload the VM allocated for this script object; no `&mut` to it is live here.
+    let inst = unsafe { &*(instance as *const BitmapInst) };
+    let Some(id) = inst.id else {
+        return;
+    };
+    let Ok((_resolved, ctx)) = bound(engine) else {
+        return;
+    };
+    if let Ok(scene) = scene_mut(&ctx) {
+        scene.release_script_bitmap(id);
+    }
+}
+
 extern "C" fn bitmap_destroy(engine: *mut c_void, instance: *mut c_void) {
     if instance.is_null() {
         return;
     }
-    let inst = unsafe { &*(instance as *const BitmapInst) };
-    if let (Some(id), Ok((_resolved, ctx))) = (inst.id, bound(engine)) {
-        // SAFETY: the caller resolved `ctx` from the installed binding.
-        unsafe { ctx.services() }
-            .state::<VisualState>()
-            .objects
-            .bitmaps
-            .remove(&id);
-    }
+    bitmap_release_image(engine, instance);
     // SAFETY: instance came from `bitmap_create`'s `Box::into_raw` and is
     // freed exactly once by the VM.
     drop(unsafe { Box::from_raw(instance as *mut BitmapInst) });
@@ -321,12 +315,14 @@ extern "C" fn bitmap_ctor(
     argv: *const Value,
     out: *mut Value,
     out_error: *mut *mut c_char,
-    objthis: *mut c_void,
+    _objthis: *mut c_void,
 ) -> c_int {
-    let Ok((resolved, ctx)) = bound(engine) else {
+    let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Bitmap: compat context is not bound");
     };
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
+    // SAFETY: `instance` is the live `BitmapInst` payload the VM allocated for this script object; `bitmap_ctor` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut BitmapInst) };
     if inst.id.is_some() {
         return report_error(out_error, "Bitmap: this bitmap is already constructed");
@@ -385,7 +381,6 @@ extern "C" fn bitmap_ctor(
         return 0;
     };
     inst.id = Some(id);
-    register_bitmap(&ctx, resolved.engine(), id, objthis);
     set_int(out, i64::from(id));
     0
 }
@@ -403,9 +398,11 @@ extern "C" fn bitmap_get_pixel(
     if argc < 2 {
         return report_error(out_error, "Bitmap.getPixel requires 2 arguments");
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     let x = value_as_i64(&a[0]) as i32;
     let y = value_as_i64(&a[1]) as i32;
+    // SAFETY: `instance` is the live `BitmapInst` payload the VM allocated for this script object; no `&mut` to it is live in `bitmap_get_pixel`.
     let inst = unsafe { &*(instance as *const BitmapInst) };
     let Some(id) = inst.id else {
         return report_error(out_error, "Bitmap.getPixel: this bitmap has no image");
@@ -434,10 +431,12 @@ extern "C" fn bitmap_set_pixel(
     if argc < 3 {
         return report_error(out_error, "Bitmap.setPixel requires 3 arguments");
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     let x = value_as_i64(&a[0]) as i32;
     let y = value_as_i64(&a[1]) as i32;
     let color = argb_to_rgba(value_as_i64(&a[2]));
+    // SAFETY: `instance` is the live `BitmapInst` payload the VM allocated for this script object; no `&mut` to it is live in `bitmap_set_pixel`.
     let inst = unsafe { &*(instance as *const BitmapInst) };
     let Some(id) = inst.id else {
         return report_error(out_error, "Bitmap.setPixel: this bitmap has no image");
@@ -467,9 +466,11 @@ extern "C" fn bitmap_get_mask_pixel(
     if argc < 2 {
         return report_error(out_error, "Bitmap.getMaskPixel requires 2 arguments");
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     let x = value_as_i64(&a[0]) as i32;
     let y = value_as_i64(&a[1]) as i32;
+    // SAFETY: `instance` is the live `BitmapInst` payload the VM allocated for this script object; no `&mut` to it is live in `bitmap_get_mask_pixel`.
     let inst = unsafe { &*(instance as *const BitmapInst) };
     let Some(id) = inst.id else {
         return report_error(out_error, "Bitmap.getMaskPixel: this bitmap has no image");
@@ -501,10 +502,12 @@ extern "C" fn bitmap_set_mask_pixel(
     if argc < 3 {
         return report_error(out_error, "Bitmap.setMaskPixel requires 3 arguments");
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     let x = value_as_i64(&a[0]) as i32;
     let y = value_as_i64(&a[1]) as i32;
     let alpha = value_as_i64(&a[2]).clamp(0, 255) as u8;
+    // SAFETY: `instance` is the live `BitmapInst` payload the VM allocated for this script object; no `&mut` to it is live in `bitmap_set_mask_pixel`.
     let inst = unsafe { &*(instance as *const BitmapInst) };
     let Some(id) = inst.id else {
         return report_error(out_error, "Bitmap.setMaskPixel: this bitmap has no image");
@@ -588,12 +591,14 @@ extern "C" fn bitmap_set_size(
     if argc < 2 {
         return report_error(out_error, "Bitmap.setSize requires 2 arguments");
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     let width = value_as_i64(&a[0]).max(0) as u32;
     let height = value_as_i64(&a[1]).max(0) as u32;
     if width == 0 || height == 0 {
         return report_error(out_error, "Bitmap.setSize: cannot create empty layer image");
     }
+    // SAFETY: `instance` is the live `BitmapInst` payload the VM allocated for this script object; no `&mut` to it is live in `bitmap_set_size`.
     let inst = unsafe { &*(instance as *const BitmapInst) };
     let Some(id) = inst.id else {
         return report_error(out_error, "Bitmap.setSize: this bitmap has no image");
@@ -628,12 +633,14 @@ extern "C" fn bitmap_copy_from(
     };
     let source_id = match resolve_object_id(
         resolved.engine(),
+        // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
         &unsafe { args(argv, argc) }[0],
         &["Bitmap"],
     ) {
         Ok(id) if id >= 0 => id as u32,
         _ => return report_error(out_error, "Bitmap.copyFrom: not a Bitmap object"),
     };
+    // SAFETY: `instance` is the live `BitmapInst` payload the VM allocated for this script object; no `&mut` to it is live in `bitmap_copy_from`.
     let inst = unsafe { &*(instance as *const BitmapInst) };
     let Some(id) = inst.id else {
         return report_error(out_error, "Bitmap.copyFrom: this bitmap has no image");
@@ -716,6 +723,7 @@ extern "C" fn bitmap_save(
     let Ok((resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Bitmap.save: compat context is not bound");
     };
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     let name = value_as_string(&a[0]);
     if name.is_empty() {
@@ -745,6 +753,7 @@ extern "C" fn bitmap_save(
         _ => type_name,
     };
     let (id, loading) = {
+        // SAFETY: `instance` is the live `BitmapInst` payload the VM allocated for this script object; no `&mut` to it is live in `bitmap_save`.
         let inst = unsafe { &*(instance as *const BitmapInst) };
         (inst.id, inst.loading)
     };
@@ -754,6 +763,7 @@ extern "C" fn bitmap_save(
     let Some(id) = id else {
         return report_error(out_error, "Bitmap.save: this bitmap has no image");
     };
+    // SAFETY: `ctx` is only created for a bound, live engine, so its service pointer is valid for `bitmap_save`.
     let services = unsafe { ctx.services() };
     let resolver = services.state::<ResourceResolver>();
     let scene = match scene_ref(&ctx) {
@@ -782,7 +792,7 @@ extern "C" fn bitmap_load(
     argv: *const Value,
     out: *mut Value,
     out_error: *mut *mut c_char,
-    objthis: *mut c_void,
+    _objthis: *mut c_void,
 ) -> c_int {
     if argc < 1 {
         return report_error(out_error, "Bitmap.load requires a storage name");
@@ -790,6 +800,7 @@ extern "C" fn bitmap_load(
     let Ok((resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Bitmap.load: compat context is not bound");
     };
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     let name = value_as_string(&a[0]);
     if name.is_empty() {
@@ -800,6 +811,7 @@ extern "C" fn bitmap_load(
         .filter(|value| value.ty != VAL_VOID)
         .map_or(COLOR_KEY_NONE, |value| value_as_i64(value) as u32);
     let (id, loading) = {
+        // SAFETY: `instance` is the live `BitmapInst` payload the VM allocated for this script object; no `&mut` to it is live in `bitmap_load`.
         let inst = unsafe { &*(instance as *const BitmapInst) };
         (inst.id, inst.loading)
     };
@@ -814,7 +826,6 @@ extern "C" fn bitmap_load(
     if !had_image {
         // SAFETY: the payload is owned by the VM for the duration of the call.
         unsafe { (*(instance as *mut BitmapInst)).id = Some(id) };
-        register_bitmap(&ctx, resolved.engine(), id, objthis);
     }
     let host = resolved.engine();
     match metainfo_object(host, width, height, 32) {
@@ -848,12 +859,14 @@ extern "C" fn bitmap_load_async(
     let Ok((resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Bitmap.loadAsync: compat context is not bound");
     };
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     let name = value_as_string(&a[0]);
     if name.is_empty() {
         return report_error(out_error, "Bitmap.loadAsync: the storage name is empty");
     }
     let (id, had_image) = {
+        // SAFETY: `instance` is the live `BitmapInst` payload the VM allocated for this script object; `bitmap_load_async` is its only live accessor.
         let inst = unsafe { &mut *(instance as *mut BitmapInst) };
         if inst.loading {
             return report_error(out_error, "Bitmap.loadAsync: currently async load bitmap");
@@ -870,7 +883,6 @@ extern "C" fn bitmap_load_async(
     {
         // SAFETY: the payload is owned by the VM for the duration of the call.
         unsafe { (*(instance as *mut BitmapInst)).id = Some(*new_id) };
-        register_bitmap(&ctx, resolved.engine(), *new_id, objthis);
     }
     let host = resolved.engine();
     let (meta, error_flag, message) = match result {
@@ -919,14 +931,17 @@ extern "C" fn bitmap_load_header(
     let Ok((resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Bitmap.loadHeader: compat context is not bound");
     };
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let name = value_as_string(&unsafe { args(argv, argc) }[0]);
     if name.is_empty() {
         return report_error(out_error, "Bitmap.loadHeader: the storage name is empty");
     }
+    // SAFETY: `ctx` is only created for a bound, live engine, so its service pointer is valid for `bitmap_load_header`.
     let services = unsafe { ctx.services() };
     let Some(storage) = services.storage() else {
         return report_error(out_error, "Bitmap.loadHeader: no storage attached");
     };
+    // SAFETY: `storage` is the attached L2 storage the host keeps alive for the VM lifetime.
     let (resolved_name, bytes) = match read_image_from_storage(unsafe { &*storage }, &name) {
         Ok(found) => found,
         Err(error) => return report_error(out_error, &format!("Bitmap.loadHeader: {error}")),
@@ -973,6 +988,7 @@ extern "C" fn bitmap_get_save_option(
             "Bitmap.getSaveOption: compat context is not bound",
         );
     };
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let type_name = value_as_string(&unsafe { args(argv, argc) }[0]);
     let host = resolved.engine();
     match save_option_expression(&type_name) {
@@ -1062,6 +1078,7 @@ fn bitmap_dimension_get(
     out_error: *mut *mut c_char,
     width: bool,
 ) -> c_int {
+    // SAFETY: `instance` is the live `BitmapInst` payload the VM allocated for this script object; no `&mut` to it is live in `bitmap_dimension_get`.
     let inst = unsafe { &*(instance as *const BitmapInst) };
     let Some(id) = inst.id else {
         return report_error(out_error, "Bitmap: this bitmap has no image");
@@ -1090,6 +1107,7 @@ fn bitmap_dimension_set(
     out_error: *mut *mut c_char,
     width: bool,
 ) -> c_int {
+    // SAFETY: `instance` is the live `BitmapInst` payload the VM allocated for this script object; no `&mut` to it is live in `bitmap_dimension_set`.
     let inst = unsafe { &*(instance as *const BitmapInst) };
     let Some(id) = inst.id else {
         return report_error(out_error, "Bitmap: this bitmap has no image");
@@ -1097,6 +1115,7 @@ fn bitmap_dimension_set(
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Bitmap: compat context is not bound");
     };
+    // SAFETY: `value` is the valid `Value` the caller holds for this call.
     let requested = value_as_i64(unsafe { &*value }).max(0) as u32;
     let scene = match scene_mut(&ctx) {
         Ok(scene) => scene,
@@ -1123,6 +1142,7 @@ extern "C" fn bitmap_buffer_get(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `instance` is the live `BitmapInst` payload the VM allocated for this script object; no `&mut` to it is live in `bitmap_buffer_get`.
     let inst = unsafe { &*(instance as *const BitmapInst) };
     let Some(id) = inst.id else {
         set_int(out, 0);
@@ -1148,6 +1168,7 @@ extern "C" fn bitmap_buffer_for_write_get(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `instance` is the live `BitmapInst` payload the VM allocated for this script object; no `&mut` to it is live in `bitmap_buffer_for_write_get`.
     let inst = unsafe { &*(instance as *const BitmapInst) };
     let Some(id) = inst.id else {
         set_int(out, 0);
@@ -1182,6 +1203,7 @@ extern "C" fn bitmap_buffer_pitch_get(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `instance` is the live `BitmapInst` payload the VM allocated for this script object; no `&mut` to it is live in `bitmap_buffer_pitch_get`.
     let inst = unsafe { &*(instance as *const BitmapInst) };
     let Some(id) = inst.id else {
         set_int(out, 0);
@@ -1211,6 +1233,7 @@ extern "C" fn bitmap_loading_get(
     _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `instance` is the live `BitmapInst` payload the VM allocated for this script object; no `&mut` to it is live in `bitmap_loading_get`.
     let inst = unsafe { &*(instance as *const BitmapInst) };
     set_bool(out, inst.loading);
     0
@@ -1235,7 +1258,7 @@ pub(super) fn register_bitmap_class(ctx: &mut CompatCtx) -> Result<(), CompatErr
         name: "Bitmap",
         create: bitmap_create,
         destroy: bitmap_destroy,
-        invalidate: None,
+        invalidate: Some(bitmap_release_image),
         methods: vec![
             NativeInstanceMethodDef {
                 name: "Bitmap",

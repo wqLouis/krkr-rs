@@ -97,12 +97,6 @@ impl Env {
             .unwrap_or_else(|error| panic!("exec {script:?} failed: {error}"));
     }
 
-    fn try_eval(&self, expression: &str) -> Result<TjsValue, String> {
-        self.engine
-            .eval(expression, "scripts-ex-test")
-            .map_err(|e| e.to_string())
-    }
-
     fn eval(&self, expression: &str) -> TjsValue {
         self.engine
             .eval(expression, "scripts-ex-test")
@@ -561,9 +555,7 @@ fn safe_eval_storage_evaluates_a_const_literal_storage() {
     env.write_storage("data.tjs", "42");
     // `safeEvalStorage` wraps the storage in `(const)[...]` and returns
     // element 0 (`reference/cpp/plugins/scriptsEx.cpp:909-960`).
-    env.run(
-        "var value = Scripts.safeEvalStorage('data.tjs');",
-    );
+    env.run("var value = Scripts.safeEvalStorage('data.tjs');");
     assert_eq!(env.int("value"), 42);
 }
 
@@ -576,9 +568,7 @@ fn safe_eval_storage_rejects_a_non_constant_storage() {
     let _lock = vm_lock();
     let env = Env::new();
     env.write_storage("code.tjs", "this.answer");
-    let error = env.error(
-        "Scripts.safeEvalStorage('code.tjs', '', %[answer: 42]);",
-    );
+    let error = env.error("Scripts.safeEvalStorage('code.tjs', '', %[answer: 42]);");
     assert!(error.contains("syntax error"), "{error}");
 }
 

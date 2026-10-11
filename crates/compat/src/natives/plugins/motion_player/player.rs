@@ -525,6 +525,7 @@ impl PlayerInst {
         node: &MotionNode,
     ) -> Result<DetachedValue, String> {
         let object = eval_object(ctx, "%[]")?;
+        // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `layer_getter_object`.
         let engine = unsafe { ctx.engine() };
         let set = |key: &str, value: TjsValue| -> Result<(), String> {
             engine
@@ -591,6 +592,7 @@ impl PlayerInst {
 
     pub(crate) fn serialize(&self, ctx: &CompatCtx) -> Result<RetainedValue, String> {
         let object = eval_object(ctx, "%[]")?;
+        // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `serialize`.
         let engine = unsafe { ctx.engine() };
         let set = |key: &str, value: TjsValue| -> Result<(), String> {
             engine
@@ -632,6 +634,7 @@ impl PlayerInst {
         let StoredValue::Object(object) = value else {
             return;
         };
+        // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `unserialize`.
         let engine = unsafe { ctx.engine() };
         if let Ok(TjsValue::String(chara)) = engine.member(object.raw_id(), "chara") {
             self.chara = chara;
@@ -658,6 +661,7 @@ impl PlayerInst {
 
     pub(crate) fn build_info_list(&self, ctx: &CompatCtx) -> Result<RetainedValue, String> {
         let array = eval_object(ctx, "[]")?;
+        // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `build_info_list`.
         let engine = unsafe { ctx.engine() };
         for (index, label) in self.playing_timelines.iter().enumerate() {
             let entry = eval_object(ctx, "%[]")?;
@@ -699,6 +703,7 @@ impl PlayerInst {
         let Some(target_id) = target.object_id() else {
             return Ok(());
         };
+        // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `draw`.
         let engine = unsafe { ctx.engine() };
         // The reference resolves the draw target only through
         // `NativeInstanceSupport(TJS_NIS_GETINSTANCE, tTJSNC_Layer::ClassID)`
@@ -785,6 +790,7 @@ fn install_object(
     key: &str,
     object: DetachedValue,
 ) -> Result<(), String> {
+    // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `install_object`.
     let engine = unsafe { ctx.engine() };
     let id = object.raw_id() as usize as u64;
     engine

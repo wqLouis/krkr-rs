@@ -51,6 +51,7 @@ pub(crate) fn is_emote_instance(ctx: &crate::CompatCtx, objthis: *mut c_void) ->
     };
     // SAFETY: `target` keeps the id valid for this call.
     matches!(
+        // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `is_emote_instance`.
         unsafe { ctx.engine() }.member(target.raw_id(), "getRot"),
         Ok(value) if !matches!(value, TjsValue::Void)
     )
@@ -203,6 +204,7 @@ pub(crate) fn set_real_member<T>(
         match unsafe { &*value }.ty {
             VAL_REAL => unsafe { (*value).real },
             VAL_INTEGER => unsafe { (*value).integer as f64 },
+            // SAFETY: `value` is the valid `Value` the caller holds for this call.
             VAL_STRING => value_as_string(unsafe { &*value }).parse().unwrap_or(0.0),
             _ => 0.0,
         }
@@ -573,6 +575,7 @@ pub(crate) fn eval_object(
     ctx: &crate::CompatCtx,
     expression: &str,
 ) -> Result<tjs::DetachedValue, String> {
+    // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `eval_object`.
     match unsafe { ctx.engine() }.eval_retained(expression, "motion_player") {
         Ok(tjs::RetainedValue::Object(value)) => Ok(value),
         Ok(_) => Err("motionplayer: expression did not yield an object".into()),

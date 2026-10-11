@@ -121,6 +121,7 @@ extern "C" fn disc_open(
     }
     // `if(numparams < 1) return TJS_E_BADPARAMCOUNT;`
     // (`CDDAIntf.cpp:62-73`, `MIDIIntf.cpp:62-74`).
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     if unsafe { args(argv, argc) }.is_empty() {
         return report_error(out_error, "open: a storage name or CD track is required");
     }
@@ -174,6 +175,7 @@ extern "C" fn disc_fade(
     }
     // `if(numparams < 2) return TJS_E_BADPARAMCOUNT;`
     // (`CDDAIntf.cpp:99-119`, `MIDIIntf.cpp:100-120`).
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     if unsafe { args(argv, argc) }.len() < 2 {
         return report_error(out_error, "fade(to, timeMs[, delayMs])");
     }
@@ -432,6 +434,7 @@ extern "C" fn midi_out(
     out: *mut Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     if unsafe { args(argv, argc) }.is_empty() {
         return report_error(out_error, "MIDISoundBuffer.midiOut(data)");
     }

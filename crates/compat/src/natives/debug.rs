@@ -307,6 +307,7 @@ extern "C" fn native_message(
     if argc < 1 {
         return report_error(out_error, "Debug.message requires 1 argument");
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let text = join_args(unsafe { args(argv, argc) });
     let Some(resolved) = resolve(engine) else {
         return report_error(out_error, "Debug.message: compat context is not bound");
@@ -333,6 +334,7 @@ extern "C" fn native_notice(
     if argc < 1 {
         return report_error(out_error, "Debug.notice requires 1 argument");
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let text = join_args(unsafe { args(argv, argc) });
     let Some(resolved) = resolve(engine) else {
         return report_error(out_error, "Debug.notice: compat context is not bound");
@@ -414,6 +416,7 @@ extern "C" fn native_start_log_to_file(
 ) -> c_int {
     // `if(numparams >= 1) clear = param[0]->operator bool();`
     // (`DebugIntf.cpp:625-628`).
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let clear = argc >= 1 && value_as_bool(&unsafe { args(argv, argc) }[0]);
     let Some(resolved) = resolve(engine) else {
         return report_error(
@@ -473,6 +476,7 @@ extern "C" fn native_get_last_log(
     // reals truncate, strings parse, objects raise, and a negative value wraps
     // to a huge unsigned count (clamped to the buffer below).
     let lines = if argc >= 1 {
+        // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
         match try_value_as_i64(&unsafe { args(argv, argc) }[0]) {
             Ok(value) => value as u32 as usize,
             Err(error) => return report_error(out_error, &error),
@@ -522,6 +526,7 @@ extern "C" fn native_add_logging_handler(
     if argc < 1 {
         return report_error(out_error, "Debug.addLoggingHandler requires 1 argument");
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     // Reference `param[0]->AsObjectClosureNoAddRef()`
     // (`DebugIntf.cpp:645-648`): TJS `null` is an empty closure that is
@@ -578,6 +583,7 @@ extern "C" fn native_remove_logging_handler(
     if argc < 1 {
         return report_error(out_error, "Debug.removeLoggingHandler requires 1 argument");
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     // Same conversion contract as `addLoggingHandler` (`DebugIntf.cpp:660-663`).
     if a[0].ty == VAL_NULL {

@@ -1937,23 +1937,50 @@ fn open_does_not_decode_the_whole_file() {
     assert!(env.eval_real("s.sampleValue") > 0.0);
 }
 
-/// Reference: the filter chain is rebuilt and applied when the buffer starts
-/// (`reference/cpp/core/sound/win32/WaveImpl.cpp:2916-2930`). The phase-vocoder
-/// DSP processes one PCM buffer, so a streaming source is materialized for the
-/// chain while remaining incremental for ordinary playback.
+/// Reference: `StartPlay` resets the filter chain and the decode thread pulls
+/// hop-sized buffers from it (`reference/cpp/core/sound/win32/WaveImpl.cpp:2916-2930`,
+/// `reference/cpp/core/sound/PhaseVocoderFilter.cpp:277-370`). The phase
+/// vocoder is a streaming filter, so a filtered source stays incremental and
+/// its decoder is read only as far as the rendered frames need: the retained
+/// footprint does not grow with the file length.
 #[test]
-fn phase_vocoder_materializes_a_streaming_source() {
+fn phase_vocoder_streams_a_streaming_source() {
     let _lock = vm_lock();
     let (env, reads) = streaming_env();
+    // 10 s of source, decoded one quarter-second window at a time.
+    let total_chunks = 10 * TONE_RATE as usize / (TONE_RATE as usize / 4);
+    set_sound_render_driven(env._host.services(), true);
 
     env.run(
         "var s = new WaveSoundBuffer(); s.open('tone.wav'); \
          var pv = new WaveSoundBuffer.PhaseVocoder(); pv.time = 2.0; \
          s.filters.add(pv); s.play();",
     );
-    assert!(
-        reads.load(Ordering::Relaxed) > 0,
-        "the filter chain materializes the stream"
+    assert_eq!(
+        reads.load(Ordering::Relaxed),
+        0,
+        "building the filter chain must decode nothing"
     );
     assert_eq!(env.eval_ok("s.status"), TjsValue::String("play".into()));
+
+    // The first rendered window pulls only the input hops it needs.
+    assert!(env.peak() > 0.0, "the filtered ramp must be audible");
+    let after_first = reads.load(Ordering::Relaxed);
+    assert!(
+        after_first > 0 && after_first * 4 < total_chunks,
+        "the filter must stream, not materialize: {after_first} decoder reads \
+         for {total_chunks} windows of source"
+    );
+
+    // Rendering further output advances through the source proportionally;
+    // the decoder never races ahead to the end of the file.
+    for _ in 0..8 {
+        env.peak();
+    }
+    let after_more = reads.load(Ordering::Relaxed);
+    assert!(
+        after_more * 4 < total_chunks,
+        "the decoder must stay far behind the file length: {after_more} of \
+         {total_chunks} windows"
+    );
 }

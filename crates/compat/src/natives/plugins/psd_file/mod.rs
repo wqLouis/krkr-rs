@@ -247,6 +247,7 @@ fn set_retained_out(out: *mut Value, object: DetachedValue) {
 
 /// The attached L2 scene, mutably.
 fn scene_mut<'a>(ctx: &CompatCtx) -> Result<&'a mut Scene, String> {
+    // SAFETY: `ctx` is only created for a bound, live engine, so its service pointer is valid for `scene_mut`.
     let ptr = unsafe { ctx.services() }
         .scene()
         .ok_or_else(|| "PSD: no scene attached".to_string())?;
@@ -317,7 +318,10 @@ fn ensure_bitmap(scene: &mut Scene, layer_id: u32, width: u32, height: u32) -> O
     }
 }
 
-/// Copy `pixels` into the layer's bitmap, resizing it first.
+/// Copy `pixels` into the layer's bitmap, resizing it first. The image is the
+/// layer's MainImage: the reference writes it through
+/// `mainImageBufferForWrite` (`reference/cpp/plugins/psdfile/psdclass.cpp:380-385`),
+/// so the layer owns it and no script `Bitmap` object claims it.
 fn write_layer_pixels(scene: &mut Scene, layer_id: u32, width: u32, height: u32, pixels: Vec<u8>) {
     let Some(bitmap_id) = ensure_bitmap(scene, layer_id, width, height) else {
         return;
@@ -326,7 +330,6 @@ fn write_layer_pixels(scene: &mut Scene, layer_id: u32, width: u32, height: u32,
         bitmap.width = width;
         bitmap.height = height;
         bitmap.rgba = pixels;
-        bitmap.script_owned = true;
         bitmap.mark_dirty();
     }
     if let Some(layer) = scene.layer_mut(layer_id) {
@@ -461,6 +464,7 @@ extern "C" fn psd_ctor(
 /// Read a PSD file through the attached L2 storage, falling back to the host
 /// file system (the reference's placed-path lookup then local read).
 fn read_psd_bytes(ctx: &CompatCtx, filename: &str) -> Result<Vec<u8>, String> {
+    // SAFETY: `ctx` is only created for a bound, live engine, so its service pointer is valid for `read_psd_bytes`.
     let services = unsafe { ctx.services() };
     if let Some(storage) = services.storage() {
         // SAFETY: the host keeps the attached storage alive for the binding's

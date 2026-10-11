@@ -226,7 +226,9 @@ extern "C" fn ctor(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
+    // SAFETY: `instance` is the live `MatrixInst` payload the VM allocated for this script object; `ctor` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut MatrixInst) };
     if a.is_empty() {
         *inst = MatrixInst::default();
@@ -273,6 +275,7 @@ macro_rules! offset_getter {
             _out_error: *mut *mut c_char,
             _objthis: *mut c_void,
         ) -> c_int {
+            // SAFETY: `instance` is the live `MatrixInst` payload the VM allocated for this script object; no `&mut` to it is live during this callback.
             let inst = unsafe { &*(instance as *const MatrixInst) };
             set_real(out, inst.$field);
             0
@@ -296,6 +299,7 @@ extern "C" fn equals(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     if a.is_empty() {
         return report_error(out_error, "GdiPlus.Matrix.Equals requires 1 argument");
@@ -310,6 +314,7 @@ extern "C" fn equals(
         }
         Err(error) => return report_error(out_error, &error),
     };
+    // SAFETY: `instance` is the live `MatrixInst` payload the VM allocated for this script object; no `&mut` to it is live in `equals`.
     let inst = unsafe { &*(instance as *const MatrixInst) };
     set_bool(out, inst.core == other);
     0
@@ -327,6 +332,7 @@ extern "C" fn set_elements(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     if a.len() < 6 {
         return report_error(out_error, "GdiPlus.Matrix.SetElements requires 6 arguments");
@@ -340,6 +346,7 @@ extern "C" fn set_elements(
             }
         }
     }
+    // SAFETY: `instance` is the live `MatrixInst` payload the VM allocated for this script object; `set_elements` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut MatrixInst) };
     inst.core = Mat {
         m11: values[0],
@@ -380,6 +387,7 @@ extern "C" fn invert_method(
     _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `instance` is the live `MatrixInst` payload the VM allocated for this script object; `invert_method` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut MatrixInst) };
     match invert(&inst.core) {
         Some(inverse) => {
@@ -402,6 +410,7 @@ extern "C" fn is_identity(
     _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `instance` is the live `MatrixInst` payload the VM allocated for this script object; no `&mut` to it is live in `is_identity`.
     let inst = unsafe { &*(instance as *const MatrixInst) };
     set_bool(out, inst.core == Mat::IDENTITY);
     0
@@ -417,6 +426,7 @@ extern "C" fn is_invertible(
     _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `instance` is the live `MatrixInst` payload the VM allocated for this script object; no `&mut` to it is live in `is_invertible`.
     let inst = unsafe { &*(instance as *const MatrixInst) };
     set_bool(out, invert(&inst.core).is_some());
     0
@@ -435,6 +445,7 @@ extern "C" fn multiply(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     if a.len() < 2 {
         return report_error(out_error, "GdiPlus.Matrix.Multiply requires 2 arguments");
@@ -451,6 +462,7 @@ extern "C" fn multiply(
         Ok(order) => order,
         Err(error) => return report_error(out_error, &error),
     };
+    // SAFETY: `instance` is the live `MatrixInst` payload the VM allocated for this script object; `multiply` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut MatrixInst) };
     inst.core = if order == MATRIX_ORDER_PREPEND {
         inst.core.mul(&other)
@@ -472,6 +484,7 @@ extern "C" fn reset(
     _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `instance` is the live `MatrixInst` payload the VM allocated for this script object; `reset` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut MatrixInst) };
     *inst = MatrixInst::default();
     set_void(out);
@@ -490,6 +503,7 @@ extern "C" fn rotate(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     if a.len() < 2 {
         return report_error(out_error, "GdiPlus.Matrix.Rotate requires 2 arguments");
@@ -503,6 +517,7 @@ extern "C" fn rotate(
         Err(error) => return report_error(out_error, &error),
     };
     let rad = (angle * std::f64::consts::PI / 180.0) as f32;
+    // SAFETY: `instance` is the live `MatrixInst` payload the VM allocated for this script object; `rotate` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut MatrixInst) };
     inst.rotation += f64::from(rad);
     if order == MATRIX_ORDER_PREPEND {
@@ -529,6 +544,7 @@ extern "C" fn rotate_at(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     if a.len() < 3 {
         return report_error(out_error, "GdiPlus.Matrix.RotateAt requires 3 arguments");
@@ -546,6 +562,7 @@ extern "C" fn rotate_at(
         Err(error) => return report_error(out_error, &error),
     };
     let rad = (angle * std::f64::consts::PI / 180.0) as f32;
+    // SAFETY: `instance` is the live `MatrixInst` payload the VM allocated for this script object; `rotate_at` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut MatrixInst) };
     if order == MATRIX_ORDER_PREPEND {
         inst.core = inst.core.mul(&Mat::translate(-cx, -cy));
@@ -575,6 +592,7 @@ extern "C" fn scale(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     if a.len() < 3 {
         return report_error(out_error, "GdiPlus.Matrix.Scale requires 3 arguments");
@@ -592,6 +610,7 @@ extern "C" fn scale(
         Ok(order) => order,
         Err(error) => return report_error(out_error, &error),
     };
+    // SAFETY: `instance` is the live `MatrixInst` payload the VM allocated for this script object; `scale` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut MatrixInst) };
     inst.scale *= sx.abs().max(sy.abs());
     if order == MATRIX_ORDER_PREPEND {
@@ -616,6 +635,7 @@ extern "C" fn shear(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     if a.len() < 3 {
         return report_error(out_error, "GdiPlus.Matrix.Shear requires 3 arguments");
@@ -641,6 +661,7 @@ extern "C" fn shear(
         dx: 0.0,
         dy: 0.0,
     };
+    // SAFETY: `instance` is the live `MatrixInst` payload the VM allocated for this script object; `shear` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut MatrixInst) };
     inst.shearx += shx;
     inst.sheary += shy;
@@ -665,6 +686,7 @@ extern "C" fn translate(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     if a.len() < 3 {
         return report_error(out_error, "GdiPlus.Matrix.Translate requires 3 arguments");
@@ -682,6 +704,7 @@ extern "C" fn translate(
         Ok(order) => order,
         Err(error) => return report_error(out_error, &error),
     };
+    // SAFETY: `instance` is the live `MatrixInst` payload the VM allocated for this script object; `translate` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut MatrixInst) };
     inst.offsetx += dx;
     inst.offsety += dy;

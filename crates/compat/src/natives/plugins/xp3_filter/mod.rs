@@ -642,6 +642,7 @@ fn set_filter(
     let ctx = resolved.ctx();
     // SAFETY: the caller resolved the live binding; `ctx` outlives `services`.
     let services = unsafe { ctx.services() };
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let value = unsafe { args(argv, argc) }.first();
     // Reference `XP3FilterRegister::FuncCall` (`xp3filter.cpp:353-361`):
     // `param[0]->AsObjectClosure()` keeps objects (including `null`, which

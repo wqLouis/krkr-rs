@@ -6,6 +6,7 @@
 
 fn string_list(ctx: &CompatCtx, items: &[String]) -> Result<RetainedValue, String> {
     let array = eval_object(ctx, "[]")?;
+    // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `string_list`.
     let engine = unsafe { ctx.engine() };
     for (index, item) in items.iter().enumerate() {
         engine
@@ -21,6 +22,7 @@ fn string_list(ctx: &CompatCtx, items: &[String]) -> Result<RetainedValue, Strin
 
 fn number_pair(ctx: &CompatCtx, first: f64, second: f64) -> Result<RetainedValue, String> {
     let array = eval_object(ctx, "[]")?;
+    // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `number_pair`.
     let engine = unsafe { ctx.engine() };
     engine
         .set_member(array.raw_id(), "0", &TjsValue::Real(first))
@@ -506,6 +508,7 @@ extern "C" fn player_set_motion(
     // object back: the override may rewrite both fields
     // (`reference/cpp/plugins/motionplayer/PlayerCore.cpp:445-474`).
     let mut motion_value = motion;
+    // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `player_set_motion`.
     if let Ok(target) = unsafe { ctx.engine() }.retain_object_detached(objthis) {
         let expression = format!(
             "%[chara: {}, motion: {}]",
@@ -513,9 +516,11 @@ extern "C" fn player_set_motion(
             super::helpers::tjs_string_literal(&motion_value)
         );
         if let Ok(RetainedValue::Object(dict)) =
+            // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `player_set_motion`.
             unsafe { ctx.engine() }.eval_retained(&expression, "onFindMotion")
         {
             let id = dict.raw_id() as usize as u64;
+            // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `player_set_motion`.
             let called = unsafe { ctx.engine() }.call_member(
                 target.raw_id(),
                 "onFindMotion",
@@ -525,13 +530,16 @@ extern "C" fn player_set_motion(
             // so the retain must happen before any other object work.
             if let Ok(result) = called
                 && matches!(result, TjsValue::Object)
+                // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `player_set_motion`.
                 && let Ok(returned) = unsafe { ctx.engine() }.retain_value_detached(&result)
             {
+                // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `player_set_motion`.
                 if let Ok(chara) = unsafe { ctx.engine() }.member(returned.raw_id(), "chara")
                     && let Some(chara) = readback_string(chara)
                 {
                     inst.chara = chara;
                 }
+                // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `player_set_motion`.
                 if let Ok(motion) = unsafe { ctx.engine() }.member(returned.raw_id(), "motion")
                     && let Some(motion) = readback_string(motion)
                 {
@@ -737,6 +745,7 @@ mp_method_void!(
                 .iter_mut()
                 .zip(["m11", "m21", "m12", "m22", "m14", "m24"])
             {
+                // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `player_set_rotate`.
                 if let Ok(value) = unsafe { ctx.engine() }.member(object.raw_id(), name)
                     && !matches!(value, TjsValue::Void)
                 {
@@ -1149,6 +1158,7 @@ mp_method_variant!(
     PlayerInst,
     |p: &mut PlayerInst, _args: &[Value], ctx: &CompatCtx| {
         let object = eval_object(ctx, "%[]")?;
+        // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for this callback.
         let engine = unsafe { ctx.engine() };
         engine
             .set_member(object.raw_id(), "x", &TjsValue::Real(p.root_x))
@@ -1200,6 +1210,7 @@ mp_method_variant!(
     PlayerInst,
     |p: &mut PlayerInst, _args: &[Value], ctx: &CompatCtx| {
         let array = eval_object(ctx, "[]")?;
+        // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for this callback.
         let engine = unsafe { ctx.engine() };
         for (index, node) in p.nodes.iter().enumerate() {
             let getter = p.layer_getter_object(ctx, node)?;
@@ -1435,6 +1446,7 @@ mp_method_variant!(
             .cloned()
             .unwrap_or_default();
         let array = eval_object(ctx, "[]")?;
+        // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `skip_to_sync`.
         let engine = unsafe { ctx.engine() };
         for (index, frame) in frames.iter().enumerate() {
             let entry = eval_object(ctx, "%[]")?;
@@ -2029,6 +2041,7 @@ mp_method_variant!(
         // `reference/cpp/core/plugin/ncbind.hpp:203` creates it on the
         // `EmotePlayer` class).
         let cloned = eval_object(ctx, "new EmotePlayer(null)")?;
+        // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `player_fade_out_timeline`.
         let engine = unsafe { ctx.engine() };
         let source = cloned.raw_id();
         // Identity/transform state travels through the serialize pair.
@@ -2260,6 +2273,7 @@ mp_method_variant!(
         // (`reference/cpp/plugins/motionplayer/PlayerCore.cpp:1666-1681`,
         // `EmotePlayer.cpp:881-883`).
         let object = eval_object(ctx, "%[]")?;
+        // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for this callback.
         let engine = unsafe { ctx.engine() };
         engine
             .set_member(object.raw_id(), "x", &TjsValue::Real(p.outer_force.x))

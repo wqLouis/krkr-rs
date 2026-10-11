@@ -363,10 +363,12 @@ macro_rules! with_slot {
         let Ok((_resolved, $ctx)) = bound($engine) else {
             return report_error($out_error, "VideoOverlay: compat context is not bound");
         };
+        // SAFETY: `instance` is the live `VideoOverlayInst` payload the VM allocated for this script object; no `&mut` to it is live during this callback.
         let inst = unsafe { &*($instance as *const VideoOverlayInst) };
         let Some(id) = inst.id else {
             return report_error($out_error, "VideoOverlay: object is not constructed");
         };
+        // SAFETY: `ctx` is only created for a bound, live engine, so its service pointer is valid for `reset_mixing`.
         let services = unsafe { $ctx.services() };
         let mut state = services.state::<VideoState>();
         let Some($slot) = state.overlays.get_mut(&id) else {
@@ -399,6 +401,7 @@ macro_rules! slot_int_prop {
             _objthis: *mut c_void,
         ) -> c_int {
             with_slot!(engine, instance, out_error, _ctx, slot, {
+                // SAFETY: `value` is the valid `Value` the caller holds for this call.
                 slot.$field = value_as_i64(unsafe { &*value });
                 0
             })
@@ -429,6 +432,7 @@ macro_rules! slot_real_prop {
             _objthis: *mut c_void,
         ) -> c_int {
             with_slot!(engine, instance, out_error, _ctx, slot, {
+                // SAFETY: `value` is the valid `Value` the caller holds for this call.
                 slot.$field = value_as_f64(unsafe { &*value });
                 0
             })
@@ -478,6 +482,7 @@ macro_rules! const_real_prop {
 extern "C" fn video_create(engine: *mut c_void) -> *mut c_void {
     let mut inst = Box::new(VideoOverlayInst::default());
     if let Ok((_resolved, ctx)) = bound(engine) {
+        // SAFETY: `ctx` is only created for a bound, live engine, so its service pointer is valid for `video_create`.
         let services = unsafe { ctx.services() };
         let mut state = services.state::<VideoState>();
         let id = state.next_id;
@@ -492,10 +497,12 @@ extern "C" fn video_destroy(engine: *mut c_void, instance: *mut c_void) {
     if instance.is_null() {
         return;
     }
+    // SAFETY: `instance` is the live `VideoOverlayInst` payload the VM allocated for this script object; no `&mut` to it is live in `video_destroy`.
     let inst = unsafe { &*(instance as *const VideoOverlayInst) };
     if let (Some(id), Ok((_resolved, ctx))) = (inst.id, bound(engine)) {
         // Remove the slot while the engine is alive: dropping it releases the
         // retained `layer1`/`layer2` objects.
+        // SAFETY: `ctx` is only created for a bound, live engine, so its service pointer is valid for `video_destroy`.
         let services = unsafe { ctx.services() };
         services.state::<VideoState>().overlays.remove(&id);
     }
@@ -519,10 +526,12 @@ extern "C" fn video_ctor(
     let Ok((resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "VideoOverlay: compat context is not bound");
     };
+    // SAFETY: `instance` is the live `VideoOverlayInst` payload the VM allocated for this script object; no `&mut` to it is live in `video_ctor`.
     let inst = unsafe { &*(instance as *const VideoOverlayInst) };
     let Some(id) = inst.id else {
         return report_error(out_error, "VideoOverlay: object is not constructed");
     };
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let values = unsafe { args(argv, argc) };
     let window = match values.first() {
         Some(value) if value.ty == VAL_OBJECT && !value.object_handle().is_null() => {
@@ -534,6 +543,7 @@ extern "C" fn video_ctor(
         }
         _ => None,
     };
+    // SAFETY: `ctx` is only created for a bound, live engine, so its service pointer is valid for `video_ctor`.
     let services = unsafe { ctx.services() };
     let mut state = services.state::<VideoState>();
     let Some(slot) = state.overlays.get_mut(&id) else {
@@ -561,15 +571,18 @@ extern "C" fn vo_open(
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "VideoOverlay.open: compat context is not bound");
     };
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let values = unsafe { args(argv, argc) };
     let Some(path_value) = values.first() else {
         return report_error(out_error, "VideoOverlay.open requires 1 argument");
     };
     let path = value_as_string(path_value);
+    // SAFETY: `instance` is the live `VideoOverlayInst` payload the VM allocated for this script object; no `&mut` to it is live in `vo_open`.
     let inst = unsafe { &*(instance as *const VideoOverlayInst) };
     let Some(id) = inst.id else {
         return report_error(out_error, "VideoOverlay.open: object is not constructed");
     };
+    // SAFETY: `ctx` is only created for a bound, live engine, so its service pointer is valid for `vo_open`.
     let services = unsafe { ctx.services() };
     // Ask the host for the spec without holding the state borrow.
     let spec = {
@@ -732,6 +745,7 @@ extern "C" fn vo_set_pos(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let values = unsafe { args(argv, argc) };
     if values.len() < 2 {
         return report_error(out_error, "VideoOverlay.setPos requires 2 arguments");
@@ -755,6 +769,7 @@ extern "C" fn vo_set_size(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let values = unsafe { args(argv, argc) };
     if values.len() < 2 {
         return report_error(out_error, "VideoOverlay.setSize requires 2 arguments");
@@ -778,6 +793,7 @@ extern "C" fn vo_set_bounds(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let values = unsafe { args(argv, argc) };
     if values.len() < 4 {
         return report_error(out_error, "VideoOverlay.setBounds requires 4 arguments");
@@ -805,6 +821,7 @@ extern "C" fn vo_set_segment_loop(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let values = unsafe { args(argv, argc) };
     if values.len() < 2 {
         return report_error(
@@ -852,6 +869,7 @@ extern "C" fn vo_set_period_event(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let values = unsafe { args(argv, argc) };
     let frame = match values.len() {
         0 => -1,
@@ -903,6 +921,7 @@ extern "C" fn vo_set_mixing_layer(
             "VideoOverlay.setMixingLayer: compat context is not bound",
         );
     };
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let values = unsafe { args(argv, argc) };
     let Some(value) = values.first() else {
         return report_error(out_error, "VideoOverlay.setMixingLayer requires 1 argument");
@@ -920,6 +939,7 @@ extern "C" fn vo_set_mixing_layer(
         }
         _ => None,
     };
+    // SAFETY: `instance` is the live `VideoOverlayInst` payload the VM allocated for this script object; no `&mut` to it is live in `vo_set_mixing_layer`.
     let inst = unsafe { &*(instance as *const VideoOverlayInst) };
     let Some(id) = inst.id else {
         return report_error(
@@ -927,6 +947,7 @@ extern "C" fn vo_set_mixing_layer(
             "VideoOverlay.setMixingLayer: object is not constructed",
         );
     };
+    // SAFETY: `ctx` is only created for a bound, live engine, so its service pointer is valid for `vo_set_mixing_layer`.
     let services = unsafe { ctx.services() };
     let mut state = services.state::<VideoState>();
     let Some(slot) = state.overlays.get_mut(&id) else {
@@ -976,6 +997,7 @@ extern "C" fn vo_select_audio_stream(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let values = unsafe { args(argv, argc) };
     let stream = values.first().map(value_as_i64).unwrap_or(0);
     with_slot!(engine, instance, out_error, _ctx, slot, {
@@ -1068,6 +1090,7 @@ extern "C" fn vo_left_set(
     with_slot!(engine, instance, out_error, _ctx, slot, {
         let top = slot.overlay.bounds.top;
         slot.overlay
+            // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
             .set_position(value_as_i64(unsafe { &*value }) as i32, top);
         0
     })
@@ -1096,6 +1119,7 @@ extern "C" fn vo_top_set(
     with_slot!(engine, instance, out_error, _ctx, slot, {
         let left = slot.overlay.bounds.left;
         slot.overlay
+            // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
             .set_position(left, value_as_i64(unsafe { &*value }) as i32);
         0
     })
@@ -1124,6 +1148,7 @@ extern "C" fn vo_width_set(
     with_slot!(engine, instance, out_error, _ctx, slot, {
         let height = slot.overlay.bounds.height;
         slot.overlay
+            // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
             .set_size(value_as_i64(unsafe { &*value }).max(0) as u32, height);
         0
     })
@@ -1152,6 +1177,7 @@ extern "C" fn vo_height_set(
     with_slot!(engine, instance, out_error, _ctx, slot, {
         let width = slot.overlay.bounds.width;
         slot.overlay
+            // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
             .set_size(width, value_as_i64(unsafe { &*value }).max(0) as u32);
         0
     })
@@ -1178,6 +1204,7 @@ extern "C" fn vo_visible_set(
     _objthis: *mut c_void,
 ) -> c_int {
     with_slot!(engine, instance, out_error, _ctx, slot, {
+        // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
         slot.overlay.set_visible(value_as_bool(unsafe { &*value }));
         0
     })
@@ -1206,6 +1233,7 @@ extern "C" fn vo_position_set(
     _objthis: *mut c_void,
 ) -> c_int {
     with_slot!(engine, instance, out_error, _ctx, slot, {
+        // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
         slot.overlay.seek_ms(value_as_i64(unsafe { &*value }));
         0
     })
@@ -1232,6 +1260,7 @@ extern "C" fn vo_frame_set(
     _objthis: *mut c_void,
 ) -> c_int {
     with_slot!(engine, instance, out_error, _ctx, slot, {
+        // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
         slot.overlay.seek_frame(value_as_i64(unsafe { &*value }));
         0
     })
@@ -1258,6 +1287,7 @@ extern "C" fn vo_loop_set(
     _objthis: *mut c_void,
 ) -> c_int {
     with_slot!(engine, instance, out_error, _ctx, slot, {
+        // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
         slot.overlay.looping = value_as_bool(unsafe { &*value });
         0
     })
@@ -1284,6 +1314,7 @@ extern "C" fn vo_play_rate_set(
     _objthis: *mut c_void,
 ) -> c_int {
     with_slot!(engine, instance, out_error, _ctx, slot, {
+        // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
         let rate = value_as_f64(unsafe { &*value });
         match slot.overlay.set_play_rate(rate) {
             Ok(()) => 0,
@@ -1314,6 +1345,7 @@ extern "C" fn vo_period_event_frame_set(
 ) -> c_int {
     with_slot!(engine, instance, out_error, _ctx, slot, {
         slot.overlay
+            // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
             .set_period_event(value_as_i64(unsafe { &*value }));
         0
     })
@@ -1487,10 +1519,12 @@ extern "C" fn vo_layer1_get(
             "VideoOverlay.layer1: compat context is not bound",
         );
     };
+    // SAFETY: `instance` is the live `VideoOverlayInst` payload the VM allocated for this script object; no `&mut` to it is live in `vo_layer1_get`.
     let inst = unsafe { &*(instance as *const VideoOverlayInst) };
     let Some(id) = inst.id else {
         return report_error(out_error, "VideoOverlay.layer1: object is not constructed");
     };
+    // SAFETY: `ctx` is only created for a bound, live engine, so its service pointer is valid for `vo_layer1_get`.
     let services = unsafe { ctx.services() };
     let raw = {
         let state = services.state::<VideoState>();
@@ -1525,14 +1559,17 @@ extern "C" fn vo_layer1_set(
             "VideoOverlay.layer1: compat context is not bound",
         );
     };
+    // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
     let layer = match resolve_layer_ref(resolved.engine(), unsafe { &*value }) {
         Ok(layer) => layer,
         Err(error) => return report_error(out_error, &error),
     };
+    // SAFETY: `instance` is the live `VideoOverlayInst` payload the VM allocated for this script object; no `&mut` to it is live in `vo_layer1_set`.
     let inst = unsafe { &*(instance as *const VideoOverlayInst) };
     let Some(id) = inst.id else {
         return report_error(out_error, "VideoOverlay.layer1: object is not constructed");
     };
+    // SAFETY: `ctx` is only created for a bound, live engine, so its service pointer is valid for `vo_layer1_set`.
     let services = unsafe { ctx.services() };
     let mut state = services.state::<VideoState>();
     if let Some(slot) = state.overlays.get_mut(&id) {
@@ -1554,10 +1591,12 @@ extern "C" fn vo_layer2_get(
             "VideoOverlay.layer2: compat context is not bound",
         );
     };
+    // SAFETY: `instance` is the live `VideoOverlayInst` payload the VM allocated for this script object; no `&mut` to it is live in `vo_layer2_get`.
     let inst = unsafe { &*(instance as *const VideoOverlayInst) };
     let Some(id) = inst.id else {
         return report_error(out_error, "VideoOverlay.layer2: object is not constructed");
     };
+    // SAFETY: `ctx` is only created for a bound, live engine, so its service pointer is valid for `vo_layer2_get`.
     let services = unsafe { ctx.services() };
     let raw = {
         let state = services.state::<VideoState>();
@@ -1592,14 +1631,17 @@ extern "C" fn vo_layer2_set(
             "VideoOverlay.layer2: compat context is not bound",
         );
     };
+    // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
     let layer = match resolve_layer_ref(resolved.engine(), unsafe { &*value }) {
         Ok(layer) => layer,
         Err(error) => return report_error(out_error, &error),
     };
+    // SAFETY: `instance` is the live `VideoOverlayInst` payload the VM allocated for this script object; no `&mut` to it is live in `vo_layer2_set`.
     let inst = unsafe { &*(instance as *const VideoOverlayInst) };
     let Some(id) = inst.id else {
         return report_error(out_error, "VideoOverlay.layer2: object is not constructed");
     };
+    // SAFETY: `ctx` is only created for a bound, live engine, so its service pointer is valid for `vo_layer2_set`.
     let services = unsafe { ctx.services() };
     let mut state = services.state::<VideoState>();
     if let Some(slot) = state.overlays.get_mut(&id) {
@@ -1693,7 +1735,9 @@ const MODE_MIXER: i64 = 2;
 /// The frame body passes its own per-frame `dt`; the advance never reads wall
 /// time.
 pub fn video_advance(ctx: &CompatCtx, dt_ms: f64) -> Result<(), CompatError> {
+    // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `video_advance`.
     let host = unsafe { ctx.engine() };
+    // SAFETY: `ctx` is only created for a bound, live engine, so its service pointer is valid for `video_advance`.
     let services = unsafe { ctx.services() };
     // Phase 1: advance, present and composite. The state borrow is released
     // before any script callback runs, so a re-entrant native call cannot

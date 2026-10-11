@@ -284,7 +284,7 @@ pub struct Engine {
 
 unsafe extern "C" {
     fn tjs2_create() -> *mut Engine;
-    fn tjs2_set_data_dir(dir: *const c_char);
+    fn tjs2_set_data_dir_checked(dir: *const c_char, out_error: *mut *mut c_char) -> c_int;
     fn tjs2_destroy(e: *mut Engine);
     fn tjs2_set_log_cb(e: *mut Engine, cb: LogCb, user: *mut c_void);
     fn tjs2_exec_script(
@@ -306,8 +306,13 @@ unsafe extern "C" {
         out_error: *mut *mut c_char,
     ) -> c_int;
     /// Replace the text of a registered TJS message (reference
-    /// `TJS::TJSAssignMessage`). Returns 1 when the message exists, else 0.
-    fn tjs2_assign_message(name: *const c_char, message: *const c_char) -> c_int;
+    /// `TJS::TJSAssignMessage`). Returns 1 when the message exists, 0 when it
+    /// does not, and -1 on a C++ error (reported through `out_error`).
+    fn tjs2_assign_message_checked(
+        name: *const c_char,
+        message: *const c_char,
+        out_error: *mut *mut c_char,
+    ) -> c_int;
     /// The vendored TJS2 engine version as a static `major.minor.release`
     /// string (reference `TJSVersionMajor`/`Minor`/`Release`).
     fn tjs2_tjs_version_string() -> *const c_char;
@@ -763,10 +768,20 @@ impl Tjs2Engine {
     /// Point the C++ stream factories at a directory for relative save/load
     /// paths (the game's DATA_PATH is absolute, but some code passes plain
     /// names).
-    pub fn set_data_dir(&self, dir: &str) {
-        // SAFETY: dir is a valid NUL-terminated C string for the call.
-        let c = std::ffi::CString::new(dir).unwrap_or_default();
-        unsafe { tjs2_set_data_dir(c.as_ptr()) };
+    ///
+    /// Returns [`TjsError`] when `dir` contains a NUL byte or the C++ side
+    /// reports a failure.
+    pub fn set_data_dir(&self, dir: &str) -> Result<(), TjsError> {
+        let c =
+            std::ffi::CString::new(dir).map_err(|_| TjsError("data dir contains NUL".into()))?;
+        let mut error: *mut c_char = ptr::null_mut();
+        // SAFETY: `c` is a valid NUL-terminated string for the call; on
+        // failure the C++ side stores an owned error string in `error`.
+        let rc = unsafe { tjs2_set_data_dir_checked(c.as_ptr(), &mut error) };
+        if rc != 0 {
+            return Err(unsafe { take_error(error) });
+        }
+        Ok(())
     }
 
     /// Create a new script engine.
@@ -893,15 +908,22 @@ impl Tjs2Engine {
 
     /// Replace the text of the registered TJS message `name` with `message`
     /// (reference `TJS::TJSAssignMessage`). Returns whether a message by that
-    /// name exists.
+    /// name exists; a C++ failure is a [`TjsError`].
     pub fn assign_message(&self, name: &str, message: &str) -> Result<bool, TjsError> {
         let name = CString::new(name).map_err(|_| TjsError("message name contains NUL".into()))?;
         let message =
             CString::new(message).map_err(|_| TjsError("message text contains NUL".into()))?;
+        let mut error: *mut c_char = ptr::null_mut();
         // SAFETY: both pointers are valid, NUL-terminated UTF-8 for the call;
-        // the function reads them only.
-        let rc = unsafe { tjs2_assign_message(name.as_ptr(), message.as_ptr()) };
-        Ok(rc != 0)
+        // the function reads them only and stores an owned error string in
+        // `error` on failure.
+        let rc =
+            unsafe { tjs2_assign_message_checked(name.as_ptr(), message.as_ptr(), &mut error) };
+        match rc {
+            1 => Ok(true),
+            0 => Ok(false),
+            _ => Err(unsafe { take_error(error) }),
+        }
     }
 
     /// The vendored TJS2 engine version as `major.minor.release`.
@@ -3080,6 +3102,31 @@ var ra = a.get(); var rb = b.get();",
             COUNTER_DESTROYED.load(std::sync::atomic::Ordering::SeqCst),
             200,
             "every counter payload should have been destroyed"
+        );
+    }
+
+    /// Storing the *result* of a member call in a variable pins the
+    /// receiver's native instance after the script drops its last reference;
+    /// the statement form (result discarded) releases synchronously.
+    #[test]
+    fn stored_member_result_does_not_pin_the_native_instance() {
+        let _vm_lock = vm_lock();
+        COUNTER_CREATED.store(0, std::sync::atomic::Ordering::SeqCst);
+        COUNTER_DESTROYED.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        let e = Tjs2Engine::new().unwrap();
+        e.register_native_class_instance(&counter_builder())
+            .unwrap();
+        e.exec_script(
+            "var c = new Counter(); c.inc(); var p = c.get(); c = null;",
+            "test",
+        )
+        .unwrap();
+        e.do_gc().unwrap();
+        assert_eq!(
+            COUNTER_DESTROYED.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the receiver must be destroyed after its last reference is dropped"
         );
     }
 

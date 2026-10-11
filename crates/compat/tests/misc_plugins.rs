@@ -24,13 +24,46 @@
 
 mod common;
 
+use std::ffi::{CStr, CString, c_char, c_int};
 use std::path::{Path, PathBuf};
+use std::ptr;
 
 use common::vm_lock;
 use compat::CompatHost;
 use engine::Storage;
 use fs::FileSystem;
 use tjs::{Tjs2Engine, TjsValue};
+
+// The built-in `saveStruct` text-stream reader lives in `cpp/streams.cpp`
+// (the same decoder the VM's `loadStruct` uses).
+unsafe extern "C" {
+    fn tjs2_read_text_stream_all(
+        path_utf8: *const c_char,
+        mode_utf8: *const c_char,
+        out_utf8: *mut *mut c_char,
+    ) -> c_int;
+    fn tjs2_free_string(s: *mut c_char);
+}
+
+/// Decode a file written by the built-in `saveStruct` through the VM's own
+/// text-stream reader.
+fn decode_save_text(path: &Path) -> String {
+    let path_c = CString::new(path.to_string_lossy().as_bytes()).expect("path is NUL-free");
+    let mode_c = CString::new("").expect("empty mode is NUL-free");
+    let mut out: *mut c_char = ptr::null_mut();
+    // SAFETY: both C strings live for the call; the helper writes a malloc'd
+    // NUL-terminated UTF-8 string into `out`.
+    let rc = unsafe { tjs2_read_text_stream_all(path_c.as_ptr(), mode_c.as_ptr(), &mut out) };
+    assert_eq!(rc, 0, "tjs2_read_text_stream_all failed for {path:?}");
+    assert!(!out.is_null(), "the reader returned a null string");
+    // SAFETY: out is a NUL-terminated malloc'd string owned by us.
+    let text = unsafe { CStr::from_ptr(out) }
+        .to_string_lossy()
+        .into_owned();
+    // SAFETY: the helper allocated it with malloc; free it exactly once.
+    unsafe { tjs2_free_string(out) };
+    text
+}
 
 /// A unique temporary game directory, removed on drop.
 struct GameDir(PathBuf);
@@ -566,4 +599,98 @@ fn get_dir_list_returns_empty_for_a_missing_directory() {
         "Object",
         "a missing directory still yields the Array object"
     );
+}
+
+// ---------------------------------------------------------------------------
+// `saveStruct.dll` — static Dictionary members
+// ---------------------------------------------------------------------------
+
+/// The built-in `Array.saveStruct` walks a nested `Dictionary` through
+/// `tTJSDictionaryNI::SaveStructuredData` → `Owner->EnumMembers`
+/// (`reference/cpp/core/tjs2/tjsDictionary.cpp:417-447`), so a plain
+/// `%[x: 1]` must serialize only `x`. The reference declares the
+/// `saveStruct.dll` `Dictionary` members with `TJS_STATICMEMBER`
+/// (`reference/cpp/plugins/saveStruct.cpp:364-366`), so they live on the
+/// class object and are never copied onto the instance.
+#[test]
+fn builtin_save_struct_serializes_only_the_script_keys() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    let path = env.dir.path().join("save-keys.bin");
+    let path_lit = format!("{:?}", path.to_string_lossy());
+
+    env.run(&format!(
+        "var d = %[]; d[\"x\"] = 1; var temp = []; temp[0] = d; \
+         temp.saveStruct({path_lit}, \"z\");"
+    ));
+
+    let text = decode_save_text(&path);
+    let _ = std::fs::remove_file(&path);
+    assert!(
+        text.contains("\"x\""),
+        "the script key must serialize: {text:?}"
+    );
+    assert!(
+        !text.contains("saveStruct2"),
+        "the static plugin member leaked into the save: {text:?}"
+    );
+    assert!(
+        !text.contains("toStructString"),
+        "the static plugin member leaked into the save: {text:?}"
+    );
+}
+
+/// `KAGParser.paramMacros` is read back by enumerating the dictionary's own
+/// members (`crates/compat/src/natives/kag/mod.rs`); the plugin members the
+/// ABI used to attach to every `Dictionary` instance must not become macros.
+/// Reference `reference/cpp/plugins/KAGParser/readme.txt:51-60`.
+#[test]
+fn param_macros_round_trip_ignores_static_plugin_members() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var p = new KAGParser(); \
+         p.paramMacros = %[ greet: [ 'a', '1', 'b', '2' ] ]; \
+         var d = p.paramMacros; \
+         var keys = Scripts.getObjectKeys(d); \
+         var value = d['greet'][0] + d['greet'][1] + d['greet'][2] + d['greet'][3];",
+    );
+    assert_eq!(
+        env.eval_int("keys.count"),
+        1,
+        "only the script macro must remain"
+    );
+    assert_eq!(env.eval_str("keys[0]"), "greet");
+    assert_eq!(env.eval_str("value"), "a1b2");
+}
+
+/// The reference attaches `ArrayAdd`'s members without a static flag
+/// (`reference/cpp/plugins/saveStruct.cpp:310-313`) and `DictAdd`'s with
+/// `TJS_STATICMEMBER` (`:364-366`). Array members are reachable on the class
+/// and on its instances; Dictionary members are reachable only on the class
+/// object, never on an instance.
+#[test]
+fn save_struct_members_are_reachable_like_the_reference() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var a = [1]; \
+         var d = %[x: 1]; \
+         var arrClass = typeof Array.toStructString; \
+         var arrInstance = typeof a.toStructString; \
+         var arrSave2 = typeof a.save2; \
+         var arrStruct = a.toStructString(); \
+         var dictInstanceToStruct = typeof d.toStructString; \
+         var dictInstanceSaveStruct2 = typeof d.saveStruct2; \
+         var dictClassToStruct = typeof Dictionary.toStructString; \
+         var dictClassSaveStruct2 = typeof Dictionary.saveStruct2;",
+    );
+    assert_eq!(env.eval_str("arrClass"), "Object");
+    assert_eq!(env.eval_str("arrInstance"), "Object");
+    assert_eq!(env.eval_str("arrSave2"), "Object");
+    assert_eq!(env.eval_str("arrStruct"), "[int 1]");
+    assert_eq!(env.eval_str("dictInstanceToStruct"), "undefined");
+    assert_eq!(env.eval_str("dictInstanceSaveStruct2"), "undefined");
+    assert_eq!(env.eval_str("dictClassToStruct"), "Object");
+    assert_eq!(env.eval_str("dictClassSaveStruct2"), "Object");
 }

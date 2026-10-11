@@ -163,10 +163,12 @@ extern "C" fn ctor(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     let Ok((_resolved, ctx)) = super::bound(engine) else {
         return report_error(out_error, "GdiPlus.Image: compat context is not bound");
     };
+    // SAFETY: `instance` is the live `ImageData` payload the VM allocated for this script object; `ctor` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut ImageData) };
     if a.is_empty() {
         *inst = ImageData::default();
@@ -201,6 +203,7 @@ extern "C" fn load(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     if a.is_empty() {
         return report_error(out_error, "GdiPlus.Image.load requires 1 argument");
@@ -209,6 +212,7 @@ extern "C" fn load(
         return report_error(out_error, "GdiPlus.Image.load: compat context is not bound");
     };
     let name = crate::native_util::value_as_string(&a[0]);
+    // SAFETY: `instance` is the live `ImageData` payload the VM allocated for this script object; `load` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut ImageData) };
     *inst = load_image_data(&ctx, &name).unwrap_or_default();
     set_void(out);
@@ -231,6 +235,7 @@ extern "C" fn clone(
             "GdiPlus.Image.Clone: compat context is not bound",
         );
     };
+    // SAFETY: `instance` is the live `ImageData` payload the VM allocated for this script object; no `&mut` to it is live in `clone`.
     let inst = unsafe { &*(instance as *const ImageData) };
     match new_image_instance(resolved.engine(), inst.clone(), "GdiPlus.Image.Clone") {
         Ok(object) => {
@@ -260,6 +265,7 @@ extern "C" fn get_bounds(
             "GdiPlus.Image.GetBounds: compat context is not bound",
         );
     };
+    // SAFETY: `instance` is the live `ImageData` payload the VM allocated for this script object; no `&mut` to it is live in `get_bounds`.
     let inst = unsafe { &*(instance as *const ImageData) };
     let (x, y, w, h) = if inst.kind == 0 && !inst.is_empty() {
         (0.0, 0.0, f64::from(inst.width), f64::from(inst.height))
@@ -287,6 +293,7 @@ extern "C" fn get_flags(
     _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `instance` is the live `ImageData` payload the VM allocated for this script object; no `&mut` to it is live in `get_flags`.
     let inst = unsafe { &*(instance as *const ImageData) };
     let flags = if inst.kind == 0 {
         if inst.is_empty() {
@@ -313,6 +320,7 @@ macro_rules! dimension_getter {
             _out_error: *mut *mut c_char,
             _objthis: *mut c_void,
         ) -> c_int {
+            // SAFETY: `instance` is the live `ImageData` payload the VM allocated for this script object; no `&mut` to it is live during this callback.
             let inst = unsafe { &*(instance as *const ImageData) };
             set_int(out, i64::from(inst.$field));
             0
@@ -358,6 +366,7 @@ extern "C" fn get_last_status(
     _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `instance` is the live `ImageData` payload the VM allocated for this script object; no `&mut` to it is live in `get_last_status`.
     let inst = unsafe { &*(instance as *const ImageData) };
     set_int(out, i64::from(inst.is_empty()));
     0
@@ -377,6 +386,7 @@ extern "C" fn get_pixel_format(
     _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `instance` is the live `ImageData` payload the VM allocated for this script object; no `&mut` to it is live in `get_pixel_format`.
     let inst = unsafe { &*(instance as *const ImageData) };
     let format = if inst.kind != 0 || inst.is_empty() {
         0
@@ -400,6 +410,7 @@ extern "C" fn get_type(
     _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `instance` is the live `ImageData` payload the VM allocated for this script object; no `&mut` to it is live in `get_type`.
     let inst = unsafe { &*(instance as *const ImageData) };
     let kind = if inst.kind == 0 {
         if inst.is_empty() {
@@ -428,6 +439,7 @@ extern "C" fn rotate_flip(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     if a.is_empty() {
         return report_error(out_error, "GdiPlus.Image.RotateFlip requires 1 argument");
@@ -438,6 +450,7 @@ extern "C" fn rotate_flip(
             return report_error(out_error, &format!("GdiPlus.Image.RotateFlip: {error}"));
         }
     };
+    // SAFETY: `instance` is the live `ImageData` payload the VM allocated for this script object; `rotate_flip` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut ImageData) };
     match flip_type {
         0 => {}

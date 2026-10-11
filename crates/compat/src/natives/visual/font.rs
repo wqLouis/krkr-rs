@@ -130,6 +130,7 @@ fn measure_text(
     // font; a standalone `new Font()` measures directly
     // (`reference/cpp/core/visual/LayerIntf.cpp:11716-11731`). `owns_state`
     // is true for `new Font()` and false for the `Layer.font` wrapper.
+    // SAFETY: `instance` is the live `FontInst` payload the VM allocated for this script object; no `&mut` to it is live in `measure_text`.
     let standalone = unsafe { &*(instance as *const FontInst) }.owns_state;
     let (_resolved, ctx) = bound(engine)?;
     let mut resolver = crate::resource::resource_state(&ctx);
@@ -213,6 +214,7 @@ extern "C" fn font_destroy(engine: *mut c_void, instance: *mut c_void) {
     if instance.is_null() {
         return;
     }
+    // SAFETY: `instance` is the live `FontInst` payload the VM allocated for this script object; `font_destroy` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut FontInst) };
     if let (Some(id), Ok((_resolved, ctx))) = (inst.id, bound(engine)) {
         // SAFETY: the caller resolved `ctx` from the installed binding.
@@ -249,6 +251,7 @@ extern "C" fn font_ctor(
     let Ok((resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Font: compat context is not bound");
     };
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     let face = a
         .first()
@@ -264,6 +267,7 @@ extern "C" fn font_ctor(
     // `reference/cpp/core/visual/LayerIntf.cpp:5962-5969`).
     let height = height.saturating_abs();
     let color = a.get(2).map(value_as_i64).unwrap_or(DEFAULT_FONT_COLOR);
+    // SAFETY: `instance` is the live `FontInst` payload the VM allocated for this script object; `font_ctor` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut FontInst) };
     if inst.id.is_some() {
         return report_error(out_error, "Font: this font is already constructed");
@@ -333,6 +337,7 @@ fn with_font_read<R>(
     instance: *mut c_void,
     f: impl FnOnce(&FontState) -> R,
 ) -> Result<R, String> {
+    // SAFETY: `instance` is the live `FontInst` payload the VM allocated for this script object; no `&mut` to it is live in `with_font_read`.
     let inst = unsafe { &*(instance as *const FontInst) };
     let id = inst
         .id
@@ -352,6 +357,7 @@ fn with_font_write(
     value: &Value,
     f: impl FnOnce(&mut FontState, &Value),
 ) -> Result<(), String> {
+    // SAFETY: `instance` is the live `FontInst` payload the VM allocated for this script object; no `&mut` to it is live in `with_font_write`.
     let inst = unsafe { &*(instance as *const FontInst) };
     let id = inst
         .id
@@ -392,6 +398,7 @@ macro_rules! font_int_prop {
             out_error: *mut *mut c_char,
             _objthis: *mut c_void,
         ) -> c_int {
+            // SAFETY: `value` is the valid `Value` the caller holds for this call.
             let value = unsafe { &*value };
             match with_font_write(engine, instance, value, $setter) {
                 Ok(()) => 0,
@@ -459,6 +466,7 @@ extern "C" fn font_face_is_file_name_get(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `instance` is the live `FontInst` payload the VM allocated for this script object; no `&mut` to it is live in `font_face_is_file_name_get`.
     let inst = unsafe { &*(instance as *const FontInst) };
     let Some(id) = inst.id else {
         return report_error(
@@ -489,6 +497,7 @@ extern "C" fn font_face_is_file_name_set(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `instance` is the live `FontInst` payload the VM allocated for this script object; no `&mut` to it is live in `font_face_is_file_name_set`.
     let inst = unsafe { &*(instance as *const FontInst) };
     let Some(id) = inst.id else {
         return report_error(
@@ -504,6 +513,7 @@ extern "C" fn font_face_is_file_name_set(
     };
     font_state(&ctx)
         .face_is_file_name
+        // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
         .insert(id, value_as_bool(unsafe { &*value }));
     0
 }
@@ -534,7 +544,9 @@ extern "C" fn font_face_set(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
     let text = value_as_string(unsafe { &*value });
+    // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
     match with_font_write(engine, instance, unsafe { &*value }, |f, _| f.face = text) {
         Ok(()) => 0,
         Err(error) => report_error(out_error, &error),
@@ -557,6 +569,7 @@ extern "C" fn font_get_text_width(
     if argc < 1 {
         return report_error(out_error, "Font.getTextWidth requires a string argument");
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let text = value_as_string(&unsafe { args(argv, argc) }[0]);
     match measure_text(engine, instance, &text) {
         Ok((width, _, _)) => {
@@ -581,6 +594,7 @@ extern "C" fn font_get_text_height(
     if argc < 1 {
         return report_error(out_error, "Font.getTextHeight requires a string argument");
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let text = value_as_string(&unsafe { args(argv, argc) }[0]);
     match measure_text(engine, instance, &text) {
         Ok((_, height, _)) => {
@@ -604,6 +618,7 @@ extern "C" fn font_get_esc_width_x(
     if argc < 1 {
         return report_error(out_error, "Font.getEscWidthX requires a string argument");
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let text = value_as_string(&unsafe { args(argv, argc) }[0]);
     match measure_text(engine, instance, &text) {
         Ok((width, _, angle)) => {
@@ -627,6 +642,7 @@ extern "C" fn font_get_esc_width_y(
     if argc < 1 {
         return report_error(out_error, "Font.getEscWidthY requires a string argument");
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let text = value_as_string(&unsafe { args(argv, argc) }[0]);
     match measure_text(engine, instance, &text) {
         Ok((width, _, angle)) => {
@@ -650,6 +666,7 @@ extern "C" fn font_get_esc_height_x(
     if argc < 1 {
         return report_error(out_error, "Font.getEscHeightX requires a string argument");
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let text = value_as_string(&unsafe { args(argv, argc) }[0]);
     match measure_text(engine, instance, &text) {
         Ok((_, height, angle)) => {
@@ -673,6 +690,7 @@ extern "C" fn font_get_esc_height_y(
     if argc < 1 {
         return report_error(out_error, "Font.getEscHeightY requires a string argument");
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let text = value_as_string(&unsafe { args(argv, argc) }[0]);
     match measure_text(engine, instance, &text) {
         Ok((_, height, angle)) => {
@@ -700,6 +718,7 @@ extern "C" fn font_get_glyph_draw_rect(
             "Font.getGlyphDrawRect requires a string argument",
         );
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let text = value_as_string(&unsafe { args(argv, argc) }[0]);
     let font = match measured_font(engine, instance) {
         Ok(font) => font,
@@ -798,7 +817,9 @@ extern "C" fn font_map_prerendered_font(
             "Font.mapPrerenderedFont requires a storage argument",
         );
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let storage = value_as_string(&unsafe { args(argv, argc) }[0]);
+    // SAFETY: `instance` is the live `FontInst` payload the VM allocated for this script object; no `&mut` to it is live in `font_map_prerendered_font`.
     let inst = unsafe { &*(instance as *const FontInst) };
     if inst.id.is_none() {
         return report_error(
@@ -834,6 +855,7 @@ extern "C" fn font_unmap_prerendered_font(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `instance` is the live `FontInst` payload the VM allocated for this script object; no `&mut` to it is live in `font_unmap_prerendered_font`.
     let inst = unsafe { &*(instance as *const FontInst) };
     if inst.id.is_none() {
         return report_error(
@@ -958,6 +980,7 @@ extern "C" fn font_rasterizer_set(
     value: *const Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
+    // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
     let index = value_as_i64(unsafe { &*value });
     if index != 0 {
         return report_error(

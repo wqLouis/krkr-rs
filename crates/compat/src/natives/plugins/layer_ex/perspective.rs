@@ -329,6 +329,7 @@ extern "C" fn layer_perspective_copy(
         }
         Err(error) => return report_error(out_error, &format!("Layer.perspectiveCopy: {error}")),
     };
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     if let Err(error) = perspective_copy(&ctx, resolved.engine(), id, a) {
         return report_error(out_error, &error);

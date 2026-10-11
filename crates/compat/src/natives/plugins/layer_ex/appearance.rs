@@ -318,6 +318,7 @@ extern "C" fn ctor(
     _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `instance` is the live `AppearanceInst` payload the VM allocated for this script object; `ctor` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut AppearanceInst) };
     inst.data = AppearanceData::default();
     set_void(out);
@@ -347,6 +348,7 @@ extern "C" fn clear(
     _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `instance` is the live `AppearanceInst` payload the VM allocated for this script object; `clear` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut AppearanceInst) };
     inst.data.infos.clear();
     set_void(out);
@@ -393,6 +395,7 @@ extern "C" fn add_brush(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     if a.len() < 3 {
         return report_error(out_error, "Appearance.addBrush requires 3 arguments");
@@ -406,6 +409,7 @@ extern "C" fn add_brush(
         (Ok(ox), Ok(oy)) => (ox, oy),
         _ => return report_error(out_error, "Appearance.addBrush: ox and oy must be numbers"),
     };
+    // SAFETY: `instance` is the live `AppearanceInst` payload the VM allocated for this script object; `add_brush` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut AppearanceInst) };
     inst.data.infos.push(DrawInfo {
         paint,
@@ -434,6 +438,7 @@ extern "C" fn add_pen(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     if a.len() < 4 {
         return report_error(out_error, "Appearance.addPen requires 4 arguments");
@@ -469,6 +474,7 @@ extern "C" fn add_pen(
         (Ok(ox), Ok(oy)) => (ox, oy),
         _ => return report_error(out_error, "Appearance.addPen: ox and oy must be numbers"),
     };
+    // SAFETY: `instance` is the live `AppearanceInst` payload the VM allocated for this script object; `add_pen` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut AppearanceInst) };
     inst.data.infos.push(DrawInfo {
         paint,

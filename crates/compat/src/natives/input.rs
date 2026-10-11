@@ -962,6 +962,7 @@ extern "C" fn native_set_cursor_pos(
         return report_error(out_error, "Mouse.setCursorPos: compat context is not bound");
     };
     let ctx = resolved.ctx();
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     let x = value_as_i64(&a[0]) as i32;
     let y = value_as_i64(&a[1]) as i32;
@@ -1095,6 +1096,7 @@ extern "C" fn native_set_visible(
         return report_error(out_error, "Mouse.setVisible: compat context is not bound");
     };
     let ctx = resolved.ctx();
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let visible = value_as_bool(&unsafe { args(argv, argc) }[0]);
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
     let Some(ptr) = (unsafe { ctx.services() }).input() else {
@@ -1121,6 +1123,7 @@ extern "C" fn native_get_pressed(
         return report_error(out_error, "Mouse.getPressed: compat context is not bound");
     };
     let ctx = resolved.ctx();
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
     let Some(input) = (unsafe { input_state(&ctx) }) else {
@@ -1148,6 +1151,7 @@ extern "C" fn native_get_released(
         return report_error(out_error, "Mouse.getReleased: compat context is not bound");
     };
     let ctx = resolved.ctx();
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
     let Some(input) = (unsafe { input_state(&ctx) }) else {
@@ -1175,6 +1179,7 @@ extern "C" fn native_get_repeat(
         return report_error(out_error, "Mouse.getRepeat: compat context is not bound");
     };
     let ctx = resolved.ctx();
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
     let Some(input) = (unsafe { input_state(&ctx) }) else {
@@ -1205,6 +1210,7 @@ extern "C" fn native_get_click_count(
         );
     };
     let ctx = resolved.ctx();
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
     let Some(input) = (unsafe { input_state(&ctx) }) else {
@@ -1237,6 +1243,7 @@ extern "C" fn native_key_get_pressed(
         return report_error(out_error, "Key.getPressed: compat context is not bound");
     };
     let ctx = resolved.ctx();
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let code = key_code_arg(&unsafe { args(argv, argc) }[0]);
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
     let Some(input) = (unsafe { input_state(&ctx) }) else {
@@ -1261,6 +1268,7 @@ extern "C" fn native_key_get_released(
         return report_error(out_error, "Key.getReleased: compat context is not bound");
     };
     let ctx = resolved.ctx();
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let code = key_code_arg(&unsafe { args(argv, argc) }[0]);
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
     let Some(input) = (unsafe { input_state(&ctx) }) else {
@@ -1285,6 +1293,7 @@ extern "C" fn native_key_get_repeat(
         return report_error(out_error, "Key.getRepeat: compat context is not bound");
     };
     let ctx = resolved.ctx();
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let code = key_code_arg(&unsafe { args(argv, argc) }[0]);
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
     let Some(input) = (unsafe { input_state(&ctx) }) else {
@@ -1426,6 +1435,7 @@ macro_rules! pad_get_str {
                 );
             };
             let ctx = resolved.ctx();
+            // SAFETY: `instance` is the live `PadState` payload the VM passed to this getter, and the borrow is used only within the call.
             let state = unsafe { pad_state(instance) };
             set_string_out(&ctx, out, &state.$field);
             0
@@ -1443,6 +1453,7 @@ macro_rules! pad_get_int {
             _out_error: *mut *mut c_char,
             _objthis: *mut c_void,
         ) -> c_int {
+            // SAFETY: `instance` is the live `PadState` payload the VM passed to this getter, and the borrow is used only within the call.
             let state = unsafe { pad_state(instance) };
             set_int(out, state.$field);
             0
@@ -1460,6 +1471,7 @@ macro_rules! pad_get_bool {
             _out_error: *mut *mut c_char,
             _objthis: *mut c_void,
         ) -> c_int {
+            // SAFETY: `instance` is the live `PadState` payload the VM passed to this getter, and the borrow is used only within the call.
             let state = unsafe { pad_state(instance) };
             set_bool(out, state.$field);
             0

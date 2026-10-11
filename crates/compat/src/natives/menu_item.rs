@@ -373,8 +373,10 @@ extern "C" fn menu_item_destroy(engine: *mut c_void, instance: *mut c_void) {
     if instance.is_null() {
         return;
     }
+    // SAFETY: `instance` is the live `MenuItemInst` payload the VM allocated for this script object; no `&mut` to it is live in `menu_item_destroy`.
     let inst = unsafe { &*(instance as *const MenuItemInst) };
     if let (Some(id), Ok((_resolved, ctx))) = (inst.id, bound(engine)) {
+        // SAFETY: `ctx` is only created for a bound, live engine, so its service pointer is valid for `menu_item_destroy`.
         let services = unsafe { ctx.services() };
         // Remove the node and drop its retained values only after the state
         // borrow is released: releasing the last reference to a script object
@@ -432,6 +434,7 @@ extern "C" fn menu_item_invalidate(engine: *mut c_void, instance: *mut c_void) {
     if instance.is_null() {
         return;
     }
+    // SAFETY: `instance` is the live `MenuItemInst` payload the VM allocated for this script object; no `&mut` to it is live in `menu_item_invalidate`.
     let inst = unsafe { &*(instance as *const MenuItemInst) };
     let Some(id) = inst.id else {
         return;
@@ -515,10 +518,12 @@ extern "C" fn menu_item_ctor(
         return report_error(out_error, "MenuItem: compat context is not bound");
     };
     let host = resolved.engine();
+    // SAFETY: `instance` is the live `MenuItemInst` payload the VM allocated for this script object; `menu_item_ctor` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut MenuItemInst) };
     if inst.id.is_some() {
         return report_error(out_error, "MenuItem: this item is already constructed");
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let values = unsafe { args(argv, argc) };
 
     // Reference `tTJSNI_BaseMenuItem::Construct` (`MenuItemIntf.cpp:42-73`):
@@ -622,10 +627,12 @@ extern "C" fn menu_item_add(
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "MenuItem.add: compat context is not bound");
     };
+    // SAFETY: `instance` is the live `MenuItemInst` payload the VM allocated for this script object; no `&mut` to it is live in `menu_item_add`.
     let inst = unsafe { &*(instance as *const MenuItemInst) };
     let Some(id) = inst.id else {
         return report_error(out_error, "MenuItem.add: this item is not constructed");
     };
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let values = unsafe { args(argv, argc) };
     let Some(value) = values.first() else {
         return report_error(out_error, "MenuItem.add requires a MenuItem");
@@ -662,10 +669,12 @@ extern "C" fn menu_item_insert(
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "MenuItem.insert: compat context is not bound");
     };
+    // SAFETY: `instance` is the live `MenuItemInst` payload the VM allocated for this script object; no `&mut` to it is live in `menu_item_insert`.
     let inst = unsafe { &*(instance as *const MenuItemInst) };
     let Some(id) = inst.id else {
         return report_error(out_error, "MenuItem.insert: this item is not constructed");
     };
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let values = unsafe { args(argv, argc) };
     if values.len() < 2 {
         return report_error(out_error, "MenuItem.insert requires an item and an index");
@@ -708,10 +717,12 @@ extern "C" fn menu_item_remove(
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "MenuItem.remove: compat context is not bound");
     };
+    // SAFETY: `instance` is the live `MenuItemInst` payload the VM allocated for this script object; no `&mut` to it is live in `menu_item_remove`.
     let inst = unsafe { &*(instance as *const MenuItemInst) };
     let Some(id) = inst.id else {
         return report_error(out_error, "MenuItem.remove: this item is not constructed");
     };
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let values = unsafe { args(argv, argc) };
     let Some(value) = values.first() else {
         return report_error(out_error, "MenuItem.remove requires a MenuItem");
@@ -766,6 +777,7 @@ extern "C" fn menu_item_fire_click(
     let Ok((resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "MenuItem.fireClick: compat context is not bound");
     };
+    // SAFETY: `instance` is the live `MenuItemInst` payload the VM allocated for this script object; no `&mut` to it is live in `menu_item_fire_click`.
     let inst = unsafe { &*(instance as *const MenuItemInst) };
     let Some(id) = inst.id else {
         return report_error(
@@ -843,6 +855,7 @@ extern "C" fn menu_item_on_click(
     let Ok((resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "MenuItem.onClick: compat context is not bound");
     };
+    // SAFETY: `instance` is the live `MenuItemInst` payload the VM allocated for this script object; no `&mut` to it is live in `menu_item_on_click`.
     let inst = unsafe { &*(instance as *const MenuItemInst) };
     let Some(id) = inst.id else {
         return report_error(out_error, "MenuItem.onClick: this item is not constructed");
@@ -906,6 +919,7 @@ extern "C" fn menu_caption_get(
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "MenuItem.caption: compat context is not bound");
     };
+    // SAFETY: `instance` is the live `MenuItemInst` payload the VM allocated for this script object; no `&mut` to it is live in `menu_caption_get`.
     let inst = unsafe { &*(instance as *const MenuItemInst) };
     let Some(id) = inst.id else {
         return report_error(out_error, "MenuItem.caption: this item is not constructed");
@@ -927,10 +941,12 @@ extern "C" fn menu_caption_set(
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "MenuItem.caption: compat context is not bound");
     };
+    // SAFETY: `instance` is the live `MenuItemInst` payload the VM allocated for this script object; no `&mut` to it is live in `menu_caption_set`.
     let inst = unsafe { &*(instance as *const MenuItemInst) };
     let Some(id) = inst.id else {
         return report_error(out_error, "MenuItem.caption: this item is not constructed");
     };
+    // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
     let caption = value_as_string(unsafe { &*value });
     // SAFETY: the caller resolved `ctx` from the installed binding.
     let mut state = unsafe { ctx.services() }.state::<MenuState>();
@@ -950,6 +966,7 @@ extern "C" fn menu_shortcut_get(
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "MenuItem.shortcut: compat context is not bound");
     };
+    // SAFETY: `instance` is the live `MenuItemInst` payload the VM allocated for this script object; no `&mut` to it is live in `menu_shortcut_get`.
     let inst = unsafe { &*(instance as *const MenuItemInst) };
     let Some(id) = inst.id else {
         return report_error(out_error, "MenuItem.shortcut: this item is not constructed");
@@ -971,10 +988,12 @@ extern "C" fn menu_shortcut_set(
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "MenuItem.shortcut: compat context is not bound");
     };
+    // SAFETY: `instance` is the live `MenuItemInst` payload the VM allocated for this script object; no `&mut` to it is live in `menu_shortcut_set`.
     let inst = unsafe { &*(instance as *const MenuItemInst) };
     let Some(id) = inst.id else {
         return report_error(out_error, "MenuItem.shortcut: this item is not constructed");
     };
+    // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
     let shortcut = value_as_string(unsafe { &*value });
     // SAFETY: the caller resolved `ctx` from the installed binding.
     let mut state = unsafe { ctx.services() }.state::<MenuState>();
@@ -1000,6 +1019,7 @@ macro_rules! bool_property {
                     concat!("MenuItem.", $member, ": compat context is not bound"),
                 );
             };
+            // SAFETY: `instance` is the live `MenuItemInst` payload the VM allocated for this script object; no `&mut` to it is live during this callback.
             let inst = unsafe { &*(instance as *const MenuItemInst) };
             let Some(id) = inst.id else {
                 return report_error(
@@ -1027,6 +1047,7 @@ macro_rules! bool_property {
                     concat!("MenuItem.", $member, ": compat context is not bound"),
                 );
             };
+            // SAFETY: `instance` is the live `MenuItemInst` payload the VM allocated for this script object; no `&mut` to it is live during this callback.
             let inst = unsafe { &*(instance as *const MenuItemInst) };
             let Some(id) = inst.id else {
                 return report_error(
@@ -1034,6 +1055,7 @@ macro_rules! bool_property {
                     concat!("MenuItem.", $member, ": this item is not constructed"),
                 );
             };
+            // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
             let value = value_as_bool(unsafe { &*value });
             // SAFETY: the caller resolved `ctx` from the installed binding.
             let mut state = unsafe { ctx.services() }.state::<MenuState>();
@@ -1061,6 +1083,7 @@ extern "C" fn menu_checked_get(
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "MenuItem.checked: compat context is not bound");
     };
+    // SAFETY: `instance` is the live `MenuItemInst` payload the VM allocated for this script object; no `&mut` to it is live in `menu_checked_get`.
     let inst = unsafe { &*(instance as *const MenuItemInst) };
     let Some(id) = inst.id else {
         return report_error(out_error, "MenuItem.checked: this item is not constructed");
@@ -1082,10 +1105,12 @@ extern "C" fn menu_checked_set(
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "MenuItem.checked: compat context is not bound");
     };
+    // SAFETY: `instance` is the live `MenuItemInst` payload the VM allocated for this script object; no `&mut` to it is live in `menu_checked_set`.
     let inst = unsafe { &*(instance as *const MenuItemInst) };
     let Some(id) = inst.id else {
         return report_error(out_error, "MenuItem.checked: this item is not constructed");
     };
+    // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
     let checked = value_as_bool(unsafe { &*value });
     // SAFETY: the caller resolved `ctx` from the installed binding.
     let mut state = unsafe { ctx.services() }.state::<MenuState>();
@@ -1130,6 +1155,7 @@ extern "C" fn menu_group_get(
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "MenuItem.group: compat context is not bound");
     };
+    // SAFETY: `instance` is the live `MenuItemInst` payload the VM allocated for this script object; no `&mut` to it is live in `menu_group_get`.
     let inst = unsafe { &*(instance as *const MenuItemInst) };
     let Some(id) = inst.id else {
         return report_error(out_error, "MenuItem.group: this item is not constructed");
@@ -1151,10 +1177,12 @@ extern "C" fn menu_group_set(
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "MenuItem.group: compat context is not bound");
     };
+    // SAFETY: `instance` is the live `MenuItemInst` payload the VM allocated for this script object; no `&mut` to it is live in `menu_group_set`.
     let inst = unsafe { &*(instance as *const MenuItemInst) };
     let Some(id) = inst.id else {
         return report_error(out_error, "MenuItem.group: this item is not constructed");
     };
+    // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
     let group = match try_value_as_i64(unsafe { &*value }) {
         // `SetGroup((tjs_int)*param)` (`MenuItemIntf.cpp:399`).
         Ok(group) => group,
@@ -1180,6 +1208,7 @@ extern "C" fn menu_index_get(
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "MenuItem.index: compat context is not bound");
     };
+    // SAFETY: `instance` is the live `MenuItemInst` payload the VM allocated for this script object; no `&mut` to it is live in `menu_index_get`.
     let inst = unsafe { &*(instance as *const MenuItemInst) };
     let Some(id) = inst.id else {
         return report_error(out_error, "MenuItem.index: this item is not constructed");
@@ -1208,10 +1237,12 @@ extern "C" fn menu_index_set(
     let Ok((_resolved, _ctx)) = bound(engine) else {
         return report_error(out_error, "MenuItem.index: compat context is not bound");
     };
+    // SAFETY: `instance` is the live `MenuItemInst` payload the VM allocated for this script object; no `&mut` to it is live in `menu_index_set`.
     let inst = unsafe { &*(instance as *const MenuItemInst) };
     if inst.id.is_none() {
         return report_error(out_error, "MenuItem.index: this item is not constructed");
     }
+    // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
     if let Err(error) = try_value_as_i64(unsafe { &*value }) {
         return report_error(out_error, &error);
     }
@@ -1232,6 +1263,7 @@ extern "C" fn menu_parent_get(
     let Ok((resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "MenuItem.parent: compat context is not bound");
     };
+    // SAFETY: `instance` is the live `MenuItemInst` payload the VM allocated for this script object; no `&mut` to it is live in `menu_parent_get`.
     let inst = unsafe { &*(instance as *const MenuItemInst) };
     let Some(id) = inst.id else {
         return report_error(out_error, "MenuItem.parent: this item is not constructed");
@@ -1262,6 +1294,7 @@ extern "C" fn menu_root_get(
     let Ok((resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "MenuItem.root: compat context is not bound");
     };
+    // SAFETY: `instance` is the live `MenuItemInst` payload the VM allocated for this script object; no `&mut` to it is live in `menu_root_get`.
     let inst = unsafe { &*(instance as *const MenuItemInst) };
     let Some(id) = inst.id else {
         return report_error(out_error, "MenuItem.root: this item is not constructed");
@@ -1297,6 +1330,7 @@ extern "C" fn menu_window_get(
     let Ok((resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "MenuItem.window: compat context is not bound");
     };
+    // SAFETY: `instance` is the live `MenuItemInst` payload the VM allocated for this script object; no `&mut` to it is live in `menu_window_get`.
     let inst = unsafe { &*(instance as *const MenuItemInst) };
     let Some(id) = inst.id else {
         return report_error(out_error, "MenuItem.window: this item is not constructed");
@@ -1324,6 +1358,7 @@ extern "C" fn menu_children_get(
     let Ok((resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "MenuItem.children: compat context is not bound");
     };
+    // SAFETY: `instance` is the live `MenuItemInst` payload the VM allocated for this script object; no `&mut` to it is live in `menu_children_get`.
     let inst = unsafe { &*(instance as *const MenuItemInst) };
     let Some(id) = inst.id else {
         return report_error(out_error, "MenuItem.children: this item is not constructed");

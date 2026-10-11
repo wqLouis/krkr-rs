@@ -168,7 +168,7 @@ impl CompatHost {
         self.uninstall();
         // Replacing the box drops the old state map (and every retained value
         // it holds) now, while the engine is alive.
-        self.services = Box::new(CompatServices::new());
+        *self.services = CompatServices::new();
     }
 }
 

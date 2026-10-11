@@ -630,23 +630,6 @@ fn class_names_contain(
     Ok(false)
 }
 
-/// Whether a member value is one of the plugin methods the ABI attaches to
-/// every `Array`/`Dictionary` instance.
-///
-/// The attached callbacks are bare dispatch objects: unlike data objects
-/// (arrays, dictionaries, script classes) they report no class-name chain, so
-/// the reference's `EnumMembers` (which never sees class members) is matched
-/// by skipping them.
-fn is_attached_method(engine: &Tjs2Engine, value: &TjsOwned) -> Result<bool, JsonError> {
-    match value {
-        TjsOwned::Object(object) => {
-            let names = engine.class_names(object.raw_id())?;
-            Ok(array_count(engine, &names)? == 0)
-        }
-        _ => Ok(false),
-    }
-}
-
 /// Enumerate a dictionary's own data members in `EnumMembers` order.
 ///
 /// The ABI exposes no `EnumMembers`, so the reference walk is reproduced
@@ -681,9 +664,7 @@ fn enumerate_members(
         };
         let value = engine.member(flat.raw_id(), &(index + 1).to_string())?;
         let owned = owned_from_tjs(engine, services, value)?;
-        if !is_attached_method(engine, &owned)? {
-            entries.push((key, owned));
-        }
+        entries.push((key, owned));
         index += 2;
     }
     Ok(entries)

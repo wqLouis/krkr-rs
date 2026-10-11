@@ -444,6 +444,84 @@ fn the_empty_constructor_makes_the_initial_bitmap() {
 }
 
 #[test]
+fn dropping_a_script_bitmap_releases_its_image() {
+    let _lock = vm_lock();
+    let env = Env::new(true);
+
+    env.run("var b = new Bitmap(2, 2); b.setPixel(0, 0, 0xff112233);");
+    let id = env._scene.bitmaps.last().expect("the script bitmap").id;
+    // reference/cpp/core/visual/BitmapIntf.cpp:60-63: `SetPixel` writes the
+    // object's image, so the scene holds the color as straight-alpha RGBA.
+    assert_eq!(
+        &env._scene.bitmap(id).expect("the image is real").rgba[..4],
+        &[0x11, 0x22, 0x33, 0xff],
+        "the script Bitmap's pixels are real"
+    );
+
+    env.run("b = null;");
+    env.run("System.doCompact();");
+    // reference/cpp/core/visual/BitmapIntf.cpp:46-49: `Invalidate` deletes the
+    // object's bitmap; the pixel buffer is freed with the last owner
+    // (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:495-503`).
+    assert!(
+        env._scene.bitmap(id).is_none(),
+        "the destroyed script Bitmap's image is released"
+    );
+}
+
+#[test]
+fn a_stored_member_result_does_not_pin_the_script_bitmap() {
+    let _lock = vm_lock();
+
+    // The reported retention shape: the result of the member call is stored
+    // in a variable (rather than discarded as a statement), then the object
+    // is dropped and the GC runs. Several framings are probed because the
+    // pin was reported to depend on the compiler shape.
+    let scripts = [
+        // (a) drop and compact in the same execution
+        "var b = new Bitmap(2, 2); var p = b.getPixel(0, 0); b = null; System.doCompact();",
+        // (b) drop and compact in separate executions
+        "var b = new Bitmap(2, 2); var p = b.getPixel(0, 0); b = null;",
+        // (c) constructor inside a function (frame-local object)
+        "function f() { var b = new Bitmap(2, 2); var p = b.getPixel(0, 0); } f();",
+        // (d) statement form, for comparison
+        "var b = new Bitmap(2, 2); b.setPixel(0, 0, 0xff112233); b = null; System.doCompact();",
+        // (e) result consumed by an arithmetic expression
+        "var b = new Bitmap(2, 2); var p = b.getPixel(0, 0) + 1; b = null; System.doCompact();",
+        // (f) result stored in an array
+        "var b = new Bitmap(2, 2); var p = [b.getPixel(0, 0)]; b = null; System.doCompact();",
+        // (g) result cleared afterwards
+        "var b = new Bitmap(2, 2); var p = b.getPixel(0, 0); p = null; b = null; System.doCompact();",
+        // (h) property read (getter path, not a method call)
+        "var b = new Bitmap(2, 2); var p = b.width; b = null; System.doCompact();",
+        // (i) mask read
+        "var b = new Bitmap(2, 2); var p = b.getMaskPixel(0, 0); b = null; System.doCompact();",
+        // (j) buffer address read
+        "var b = new Bitmap(2, 2); var p = b.buffer; b = null; System.doCompact();",
+        // (k) the object passed as an argument to another object's method
+        "var a = new Bitmap(2, 2); var b = new Bitmap(2, 2); a.copyFrom(b); b = null; a = null; System.doCompact();",
+        // (l) result assigned to a global that survives the call
+        "var b = new Bitmap(2, 2); global.q = b.getPixel(0, 0); b = null; System.doCompact();",
+        // (m) the bitmap is read out of a holder object (member access)
+        "var h = %[b: new Bitmap(2, 2)]; var p = h.b.getPixel(0, 0); h = null; System.doCompact();",
+        // (n) the bitmap is read out of a holder object and stored
+        "var h = %[b: new Bitmap(2, 2)]; var b = h.b; var p = b.getPixel(0, 0); h = null; b = null; System.doCompact();",
+        // (o) the holder is a function-scope local
+        "function f() { var h = %[b: new Bitmap(2, 2)]; var p = h.b.getPixel(0, 0); } f(); System.doCompact();",
+    ];
+    for (index, script) in scripts.iter().enumerate() {
+        let env = Env::new(true);
+        env.run(script);
+        env.run("System.doCompact();");
+        let surviving = env._scene.bitmaps.len();
+        assert_eq!(
+            surviving, 0,
+            "shape {index} leaked {surviving} bitmap(s): {script}"
+        );
+    }
+}
+
+#[test]
 fn a_single_numeric_argument_leaves_the_bitmap_null() {
     let _lock = vm_lock();
     let env = Env::new(true);

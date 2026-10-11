@@ -952,6 +952,7 @@ pub(super) fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
         ],
     })?;
 
+    // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `register`.
     install_notifications(unsafe { ctx.engine() })?;
     Ok(())
 }

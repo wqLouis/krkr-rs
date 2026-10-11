@@ -16,8 +16,8 @@ use std::rc::Rc;
 use api::media::{DecodedImage, ImageInfo};
 use engine::layer_ops::RectI;
 use engine::text::{
-    CoverageMask, FontId, TextEngine, TextStyle, blit_coverage_into, blur_coverage,
-    compose_text_into, rasterize_text_coverage,
+    CoverageMask, FontId, TextCoverageCache, TextEngine, TextStyle, blit_coverage_into,
+    blur_coverage, blurred_text_coverage, compose_text_into, rasterize_text_coverage,
 };
 use engine::{BitmapState, StorageReadError};
 use tjs::{Tjs2Engine, TjsValue, Value};
@@ -41,6 +41,9 @@ type SaveFn = dyn Fn(&str, &str, u32, u32, &[u8]) -> Result<(), String>;
 pub(crate) struct ResourceResolver {
     /// Shared text shaping/layout engine.
     pub(crate) engine: TextEngine,
+    /// Rasterized character masks and their blurred shadows, keyed like the
+    /// reference `tTVPFontCache`.
+    pub(crate) coverage_cache: TextCoverageCache,
     /// Requested face string → registered face id.
     pub(crate) faces: HashMap<String, FontId>,
     /// Registered family names in registration order (`Font.getList`).
@@ -137,10 +140,23 @@ impl ResourceResolver {
         Ok(())
     }
 
-    /// Drops the mapping for `key` (the reference `TVPUnmapPrerenderedFont`,
-    /// `LayerBitmapImpl.cpp:169-185`).
+    /// Drops the mapping for `key` and releases the parsed font once no other
+    /// mapping uses it. Loaded fonts are shared by storage, so the storage
+    /// entry is dropped only when the last mapping goes.
     pub(crate) fn unmap_prerendered(&mut self, key: &PrerenderedKey) {
-        self.prerendered.retain(|(k, _)| k != key);
+        let Some(index) = self.prerendered.iter().position(|(k, _)| k == key) else {
+            return;
+        };
+        let (_, font) = self.prerendered.remove(index);
+        if self
+            .prerendered
+            .iter()
+            .any(|(_, other)| Rc::ptr_eq(other, &font))
+        {
+            return;
+        }
+        self.prerendered_storage
+            .retain(|_, stored| !Rc::ptr_eq(stored, &font));
     }
 
     /// The pre-rendered font mapped to `key`, if any.
@@ -391,28 +407,51 @@ pub(crate) fn draw_text_into_bitmap(
     let angle = (angle_tenths * std::f64::consts::PI / 1800.0) as f32;
     let opacity = params.opacity.clamp(0, 255) as u8;
     let mut ink: Option<RectI> = None;
+    // Rasterize each character once and reuse the coverage for both the
+    // shadow and the main pass (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:244-320`).
+    let masks = rasterize_text_coverage(
+        &mut resolver.coverage_cache,
+        &resolver.engine,
+        &layout,
+        &style,
+        params.antialias,
+    )
+    .map_err(|error| format!("text rasterization failed: {error}"))?;
     // A shadow exists only when `shadowlevel` is nonzero; `shadowwidth` is
     // the blur radius the shadow coverage is expanded by.
     if params.shadow_level != 0 {
         // Each character's own coverage is blurred with the cone kernel and
         // drawn once at the text opacity, before the main pass.
-        let level = params.shadow_level.clamp(0, 255) as u8;
-        let masks = rasterize_text_coverage(&resolver.engine, &layout, &style, params.antialias)
-            .map_err(|error| format!("shadow rasterization failed: {error}"))?;
+        // `shadowlevel == 255 && shadowwidth == 0` is the reference's
+        // "normal shadow", which reuses the unblurred character data
+        // (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:1168-1178`).
+        let shadow_masks = if params.shadow_level == 255 && params.shadow_width == 0 {
+            masks.clone()
+        } else {
+            let level = params.shadow_level.clamp(0, 255) as u8;
+            blurred_text_coverage(
+                &mut resolver.coverage_cache,
+                &resolver.engine,
+                &layout,
+                &style,
+                params.antialias,
+                level,
+                params.shadow_width,
+            )
+            .map_err(|error| format!("shadow blur failed: {error}"))?
+        };
         let base = (
             (params.x + params.shadow_offset.0) as f32,
             (params.y + params.shadow_offset.1) as f32,
         );
         let (sin, cos) = angle.sin_cos();
-        for mask in &masks {
-            let blurred = blur_coverage(mask, level, params.shadow_width)
-                .map_err(|error| format!("shadow blur failed: {error}"))?;
+        for mask in &shadow_masks {
             let (rot_x, rot_y) = if angle == 0.0 {
-                (blurred.x(), blurred.y())
+                (mask.x(), mask.y())
             } else {
                 (
-                    blurred.x() * cos - blurred.y() * sin,
-                    blurred.x() * sin + blurred.y() * cos,
+                    mask.x() * cos - mask.y() * sin,
+                    mask.x() * sin + mask.y() * cos,
                 )
             };
             let dest_x = (base.0 + rot_x).round() as i32;
@@ -420,7 +459,7 @@ pub(crate) fn draw_text_into_bitmap(
             if let Some(rect) = blit_coverage_into(
                 bitmap,
                 clip,
-                &blurred,
+                mask,
                 dest_x,
                 dest_y,
                 params.shadow_color,
@@ -434,18 +473,8 @@ pub(crate) fn draw_text_into_bitmap(
         }
     }
     let origin = (params.x as f32, params.y as f32);
-    if let Some(rect) = compose_text_into(
-        &resolver.engine,
-        &layout,
-        &style,
-        origin,
-        angle,
-        bitmap,
-        clip,
-        opacity,
-        params.antialias,
-    )
-    .map_err(|error| format!("text composition failed: {error}"))?
+    if let Some(rect) = compose_text_into(&masks, &style, origin, angle, bitmap, clip, opacity)
+        .map_err(|error| format!("text composition failed: {error}"))?
     {
         ink = Some(match ink {
             None => rect,
@@ -508,7 +537,7 @@ fn draw_prerendered_text(
         if let Some(item) = prerendered.find_code_unit(unit) {
             if item.width != 0 && item.height != 0 {
                 let coverage = prerendered
-                    .retrieve(item)
+                    .retrieve(&item)
                     .map_err(|error| error.to_string())?;
                 let mask = CoverageMask::new(
                     0.0,
@@ -687,13 +716,19 @@ pub(crate) struct CharItem {
 }
 
 /// A parsed pre-rendered font.
+///
+/// The header, character index and glyph data stay in the file image; a
+/// descriptor is read from it on demand instead of being copied into a
+/// parallel table.
 pub(crate) struct PrerenderedFont {
     /// Data version (0 or 1).
     version: u8,
-    /// Sorted UTF-16 code units, parallel to `items`.
-    ch_index: Vec<u16>,
-    /// Character descriptors, indexed like `ch_index`.
-    items: Vec<CharItem>,
+    /// Number of entries in the sorted character index.
+    index_count: usize,
+    /// Offset of the sorted UTF-16 code units inside `image`.
+    ch_index_offset: usize,
+    /// Offset of the character descriptors inside `image`.
+    index_offset: usize,
     /// The whole file, indexed by a descriptor's `offset`.
     image: Vec<u8>,
 }
@@ -743,53 +778,79 @@ impl PrerenderedFont {
             return Err(PrerenderedFontError::Read);
         }
 
-        let mut ch_index = Vec::with_capacity(index_count);
-        for i in 0..index_count {
-            let at = ch_index_offset + i * 2;
-            ch_index.push(u16::from_le_bytes([bytes[at], bytes[at + 1]]));
-        }
-
-        let mut items = Vec::with_capacity(index_count);
-        for i in 0..index_count {
-            let at = index_offset + i * PRERENDERED_ITEM_LEN;
-            items.push(parse_char_item(&bytes[at..at + PRERENDERED_ITEM_LEN])?);
-        }
-
         Ok(Self {
             version,
-            ch_index,
-            items,
+            index_count,
+            ch_index_offset,
+            index_offset,
             image: bytes,
         })
     }
 
     /// Returns the descriptor for a UTF-16 code unit, or `None`.
-    ///
-    /// This is the reference's binary search over the sorted `ChIndex`
-    /// (`reference/cpp/core/visual/PrerenderedFont.cpp:94-112`).
-    pub(crate) fn find_code_unit(&self, ch: u16) -> Option<&CharItem> {
-        let count = self.ch_index.len();
-        if count == 0 {
+    pub(crate) fn find_code_unit(&self, ch: u16) -> Option<CharItem> {
+        if self.index_count == 0 {
             return None;
         }
         let mut s = 0usize;
-        let mut e = count;
+        let mut e = self.index_count;
         loop {
             let d = e - s;
             if d <= 1 {
-                return if self.ch_index[s] == ch {
-                    self.items.get(s)
+                return if self.ch_index_at(s)? == ch {
+                    self.item_at(s)
                 } else {
                     None
                 };
             }
             let m = s + (d >> 1);
-            if self.ch_index[m] > ch {
+            if self.ch_index_at(m)? > ch {
                 e = m;
             } else {
                 s = m;
             }
         }
+    }
+
+    /// Reads the sorted code unit at `index` from `image`.
+    ///
+    /// `parse` validated that the whole character index lies inside `image`, so
+    /// the read is in bounds for every `index < index_count`.
+    fn ch_index_at(&self, index: usize) -> Option<u16> {
+        let at = self.ch_index_offset.checked_add(index.checked_mul(2)?)?;
+        self.u16_at(at)
+    }
+
+    /// Reads the character descriptor at `index` from `image`.
+    ///
+    /// `parse` validated that the whole descriptor index lies inside `image`,
+    /// so the read is in bounds for every `index < index_count`.
+    fn item_at(&self, index: usize) -> Option<CharItem> {
+        let at = self
+            .index_offset
+            .checked_add(index.checked_mul(PRERENDERED_ITEM_LEN)?)?;
+        Some(CharItem {
+            offset: self.u32_at(at)?,
+            width: self.u16_at(at + 4)?,
+            height: self.u16_at(at + 6)?,
+            origin_x: self.u16_at(at + 8)? as i16,
+            origin_y: self.u16_at(at + 10)? as i16,
+            inc_x: self.u16_at(at + 12)? as i16,
+            inc_y: self.u16_at(at + 14)? as i16,
+            inc: self.u16_at(at + 16)? as i16,
+        })
+    }
+
+    /// Reads a little-endian `u16` at `offset` from `image`.
+    fn u16_at(&self, offset: usize) -> Option<u16> {
+        let bytes = self.image.get(offset..offset.checked_add(2)?)?;
+        Some(u16::from_le_bytes([bytes[0], bytes[1]]))
+    }
+
+    /// Reads a little-endian `u32` at `offset` from `image`.
+    fn u32_at(&self, offset: usize) -> Option<u32> {
+        let bytes = self.image.get(offset..offset.checked_add(4)?)?;
+        Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
 
     /// Decodes a descriptor's coverage into a tight `width * height` mask.
@@ -859,28 +920,6 @@ fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, PrerenderedFontError> {
     Ok(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
 }
 
-/// Parses one packed character descriptor.
-fn parse_char_item(bytes: &[u8]) -> Result<CharItem, PrerenderedFontError> {
-    let u16_at = |offset: usize| -> Result<u16, PrerenderedFontError> {
-        let slice = bytes
-            .get(offset..offset + 2)
-            .ok_or(PrerenderedFontError::Read)?;
-        Ok(u16::from_le_bytes([slice[0], slice[1]]))
-    };
-    let i16_at =
-        |offset: usize| -> Result<i16, PrerenderedFontError> { Ok(u16_at(offset)? as i16) };
-    Ok(CharItem {
-        offset: read_u32(bytes, 0)?,
-        width: u16_at(4)?,
-        height: u16_at(6)?,
-        origin_x: i16_at(8)?,
-        origin_y: i16_at(10)?,
-        inc_x: i16_at(12)?,
-        inc_y: i16_at(14)?,
-        inc: i16_at(16)?,
-    })
-}
-
 #[cfg(test)]
 mod prerendered_tests {
     use super::*;
@@ -927,7 +966,7 @@ mod prerendered_tests {
         let font = PrerenderedFont::parse(build_tft(&[0x41, 0x42], 7)).expect("parse");
         let item = font.find_code_unit(0x42).expect("B is indexed");
         assert_eq!(item.inc, 7);
-        let coverage = font.retrieve(item).expect("retrieve");
+        let coverage = font.retrieve(&item).expect("retrieve");
         // `TVPUpscale65_255` multiplies each decoded byte by four, saturated:
         // 0x10→0x40, 0x20→0x80, 0x30→0xC0, 0x3F→0xFC
         // (`reference/cpp/core/visual/tvpgl.cpp:11392-11412`).
@@ -946,9 +985,40 @@ mod prerendered_tests {
         let font = PrerenderedFont::parse(bytes).expect("parse");
         let item = font.find_code_unit(0x41).expect("A is indexed");
         assert_eq!(
-            font.retrieve(item).expect("retrieve"),
+            font.retrieve(&item).expect("retrieve"),
             vec![0x40, 0x40, 0x40, 0x40]
         );
+    }
+
+    /// Reference: `tTVPPrerenderedFont` keeps `ChIndex`/`Index` as pointers
+    /// into the mapped file (`reference/cpp/core/visual/PrerenderedFont.cpp:60-62`),
+    /// so a descriptor read reflects an edit to the file image.
+    #[test]
+    fn reads_the_descriptor_from_the_file_image() {
+        let mut font = PrerenderedFont::parse(build_tft(&[0x41, 0x42], 7)).expect("parse");
+        assert_eq!(font.find_code_unit(0x42).expect("B is indexed").inc, 7);
+        // B's descriptor is the second 20-byte entry; `inc` sits at +16.
+        let at = font.index_offset + PRERENDERED_ITEM_LEN + 16;
+        font.image[at..at + 2].copy_from_slice(&9i16.to_le_bytes());
+        assert_eq!(font.find_code_unit(0x42).expect("B is indexed").inc, 9);
+    }
+
+    /// Reference: the constructor reads the file and sets up the index only
+    /// (`reference/cpp/core/visual/PrerenderedFont.cpp:9-76`); coverage is
+    /// expanded later by `Retrieve` (`:122-175`). Parsing therefore succeeds
+    /// even when the compressed glyph data is missing, and the read error
+    /// surfaces only on retrieval.
+    #[test]
+    fn parse_does_not_decode_glyph_coverage() {
+        let mut bytes = build_tft(&[0x41], 7);
+        // Keep the header and the 20-byte descriptor, drop the glyph data.
+        bytes.truncate(PRERENDERED_HEADER_LEN + 2 + PRERENDERED_ITEM_LEN);
+        let font = PrerenderedFont::parse(bytes).expect("the index is still valid");
+        let item = font.find_code_unit(0x41).expect("A is indexed");
+        assert!(matches!(
+            font.retrieve(&item),
+            Err(PrerenderedFontError::Read)
+        ));
     }
 
     /// Reference: a wrong signature, a non-16-bit flag and a bad version each
@@ -972,5 +1042,43 @@ mod prerendered_tests {
             PrerenderedFont::parse(bytes),
             Err(PrerenderedFontError::InvalidVersion)
         ));
+    }
+
+    /// Reference: `TVPMapPrerenderedFont` shares one `tTVPPrerenderedFont` per
+    /// storage and `AddRef`s it, and `TVPUnmapPrerenderedFont` releases the
+    /// mapping; `tTVPPrerenderedFont::Release` deletes the object (and its
+    /// file image) at the last reference
+    /// (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:127-185`,
+    /// `reference/cpp/core/visual/PrerenderedFont.cpp:83-90`).
+    #[test]
+    fn unmap_releases_the_parsed_font_at_the_last_mapping() {
+        let mut resolver = ResourceResolver::default();
+        let font = Rc::new(PrerenderedFont::parse(build_tft(&[0x41], 7)).expect("parse"));
+        resolver
+            .prerendered_storage
+            .insert("sample.tft".to_string(), Rc::clone(&font));
+        let first = PrerenderedKey {
+            face: "Ghost".to_string(),
+            height: 12,
+            bold: false,
+            italic: false,
+            angle: 0,
+        };
+        let second = PrerenderedKey {
+            height: 16,
+            ..first.clone()
+        };
+        resolver.prerendered.push((first.clone(), Rc::clone(&font)));
+        resolver
+            .prerendered
+            .push((second.clone(), Rc::clone(&font)));
+
+        // One of two mappings going away keeps the shared storage resident.
+        resolver.unmap_prerendered(&first);
+        assert!(resolver.prerendered_storage.contains_key("sample.tft"));
+
+        // The last mapping releases the parsed font.
+        resolver.unmap_prerendered(&second);
+        assert!(resolver.prerendered_storage.is_empty());
     }
 }

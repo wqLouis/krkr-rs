@@ -704,21 +704,9 @@ fn resolve_filtered_source(
         None => Vec::new(),
     };
     match (&raw_source, configs.is_empty()) {
-        (Some(source), false) => {
-            // The phase-vocoder DSP consumes one whole PCM buffer, so a
-            // streaming source is materialized before the chain runs; `open`
-            // itself still decodes nothing.
-            let materialized = if source.is_streaming() {
-                let audio = source.decode_entire().map_err(|error| error.to_string())?;
-                Arc::new(
-                    SoundSource::with_loops(Arc::new(audio), source.loops().cloned())
-                        .map_err(|error| error.to_string())?,
-                )
-            } else {
-                source.clone()
-            };
-            phase_vocoder::apply_chain(&materialized, &configs).map(Some)
-        }
+        (Some(source), false) => phase_vocoder::build_filtered_source(source.clone(), &configs)
+            .map(Some)
+            .map_err(|error| error.to_string()),
         _ => Ok(None),
     }
 }
@@ -3665,5 +3653,53 @@ mod tests {
             read_vis_buffer(&stereo, 0.0, 1, 2, 0, std::ptr::null_mut(), 0).expect("null dest"),
             0
         );
+    }
+
+    /// Reference: `Decode` feeds the DSP one hop at a time and emits exactly
+    /// the committed hop (`reference/cpp/core/sound/PhaseVocoderFilter.cpp:277-370`,
+    /// `reference/cpp/core/sound/PhaseVocoderDSP.cpp:336-426`); the streaming
+    /// chain must therefore produce the same PCM as processing the whole
+    /// buffer at once.
+    #[test]
+    fn streaming_chain_matches_whole_buffer_process() {
+        use engine::sound::AudioStream;
+        use phase_vocoder::{FilterChainStream, PhaseVocoderDsp, VocoderConfig};
+
+        let rate = 44_100u32;
+        let channels = 1usize;
+        let frames = rate as usize * 2;
+        let input: Vec<f32> = (0..frames)
+            .map(|i| (2.0 * PI * 440.0 * i as f64 / f64::from(rate)).sin() as f32 * 0.5)
+            .collect();
+        let config = VocoderConfig {
+            window: 4096,
+            overlap: 0,
+            pitch: 1.3,
+            time: 1.5,
+        };
+
+        let mut whole = PhaseVocoderDsp::new(rate, channels, config);
+        let expected = whole.process(&input);
+
+        let spec = AudioSpec {
+            sample_rate: rate,
+            channels: channels as u16,
+            total_frames: Some(frames as u64),
+        };
+        let base = Arc::new(
+            SoundSource::with_loops(Arc::new(DecodedAudio::new(spec, input)), None).expect("base"),
+        );
+        let mut stream = FilterChainStream::new(base, vec![config]).expect("chain");
+        let mut observed = vec![0.0f32; expected.len()];
+        let mut filled = 0usize;
+        while filled < expected.len() {
+            let n = stream.read(&mut observed[filled..]).expect("read");
+            if n == 0 {
+                break;
+            }
+            filled += n;
+        }
+        assert_eq!(filled, expected.len());
+        assert_eq!(observed, expected);
     }
 }

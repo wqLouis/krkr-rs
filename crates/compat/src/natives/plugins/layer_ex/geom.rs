@@ -102,6 +102,7 @@ extern "C" fn point_ctor(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     if a.len() < 2 {
         return report_error(out_error, "PointF requires 2 arguments");
@@ -110,6 +111,7 @@ extern "C" fn point_ctor(
         (Ok(x), Ok(y)) => (x, y),
         _ => return report_error(out_error, "PointF: x and y must be numbers"),
     };
+    // SAFETY: `instance` is the live `PointInst` payload the VM allocated for this script object; `point_ctor` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut PointInst) };
     inst.x = x;
     inst.y = y;
@@ -132,10 +134,12 @@ extern "C" fn point_equals(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     if a.is_empty() {
         return report_error(out_error, "PointF.Equals requires 1 argument");
     }
+    // SAFETY: `instance` is the live `PointInst` payload the VM allocated for this script object; no `&mut` to it is live in `point_equals`.
     let inst = unsafe { &*(instance as *const PointInst) };
     let (x, y) = match read_point_like(engine, &a[0], "PointF.Equals") {
         Ok(point) => point,
@@ -152,6 +156,7 @@ extern "C" fn point_x_get(
     _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `instance` is the live `PointInst` payload the VM allocated for this script object; no `&mut` to it is live in `point_x_get`.
     let inst = unsafe { &*(instance as *const PointInst) };
     set_real(out, inst.x);
     0
@@ -164,6 +169,7 @@ extern "C" fn point_y_get(
     _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `instance` is the live `PointInst` payload the VM allocated for this script object; no `&mut` to it is live in `point_y_get`.
     let inst = unsafe { &*(instance as *const PointInst) };
     set_real(out, inst.y);
     0
@@ -176,11 +182,13 @@ extern "C" fn point_x_set(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
     let raw = unsafe { &*value };
     let x = match strict_real(raw) {
         Ok(x) => x,
         Err(error) => return report_error(out_error, &format!("PointF.x: {error}")),
     };
+    // SAFETY: `instance` is the live `PointInst` payload the VM allocated for this script object; `point_x_set` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut PointInst) };
     inst.x = x;
     0
@@ -193,11 +201,13 @@ extern "C" fn point_y_set(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
     let raw = unsafe { &*value };
     let y = match strict_real(raw) {
         Ok(y) => y,
         Err(error) => return report_error(out_error, &format!("PointF.y: {error}")),
     };
+    // SAFETY: `instance` is the live `PointInst` payload the VM allocated for this script object; `point_y_set` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut PointInst) };
     inst.y = y;
     0
@@ -242,6 +252,7 @@ extern "C" fn rect_ctor(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     if a.len() < 4 {
         return report_error(out_error, "RectF requires 4 arguments");
@@ -253,6 +264,7 @@ extern "C" fn rect_ctor(
             Err(error) => return report_error(out_error, &format!("RectF: {error}")),
         }
     }
+    // SAFETY: `instance` is the live `RectInst` payload the VM allocated for this script object; `rect_ctor` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut RectInst) };
     inst.x = components[0];
     inst.y = components[1];
@@ -275,6 +287,7 @@ extern "C" fn rect_clone(
     let Ok((host, _ctx)) = super::bound(engine) else {
         return report_error(out_error, "RectF.Clone: compat context is not bound");
     };
+    // SAFETY: `instance` is the live `RectInst` payload the VM allocated for this script object; no `&mut` to it is live in `rect_clone`.
     let inst = unsafe { &*(instance as *const RectInst) };
     match new_rectf(host.engine(), inst.x, inst.y, inst.w, inst.h) {
         Ok(object) => {
@@ -301,10 +314,12 @@ extern "C" fn rect_equals(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     if a.is_empty() {
         return report_error(out_error, "RectF.Equals requires 1 argument");
     }
+    // SAFETY: `instance` is the live `RectInst` payload the VM allocated for this script object; no `&mut` to it is live in `rect_equals`.
     let inst = unsafe { &*(instance as *const RectInst) };
     let other = match read_rect_like(engine, &a[0], "RectF.Equals") {
         Ok(rect) => rect,
@@ -331,6 +346,7 @@ extern "C" fn rect_inflate(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     if a.len() < 2 {
         return report_error(out_error, "RectF.Inflate requires 2 arguments");
@@ -339,6 +355,7 @@ extern "C" fn rect_inflate(
         (Ok(dw), Ok(dh)) => (dw, dh),
         _ => return report_error(out_error, "RectF.Inflate: width and height must be numbers"),
     };
+    // SAFETY: `instance` is the live `RectInst` payload the VM allocated for this script object; `rect_inflate` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut RectInst) };
     inst.x -= dw;
     inst.y -= dh;
@@ -363,6 +380,7 @@ extern "C" fn rect_inflate_point(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     if a.is_empty() {
         return report_error(out_error, "RectF.InflatePoint requires 1 argument");
@@ -371,6 +389,7 @@ extern "C" fn rect_inflate_point(
         Ok(point) => point,
         Err(error) => return report_error(out_error, &error),
     };
+    // SAFETY: `instance` is the live `RectInst` payload the VM allocated for this script object; `rect_inflate_point` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut RectInst) };
     inst.x -= dx;
     inst.y -= dy;
@@ -393,6 +412,7 @@ extern "C" fn rect_intersects(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     if a.is_empty() {
         return report_error(out_error, "RectF.IntersectsWith requires 1 argument");
@@ -401,6 +421,7 @@ extern "C" fn rect_intersects(
         Ok(rect) => rect,
         Err(error) => return report_error(out_error, &error),
     };
+    // SAFETY: `instance` is the live `RectInst` payload the VM allocated for this script object; no `&mut` to it is live in `rect_intersects`.
     let inst = unsafe { &*(instance as *const RectInst) };
     let hits =
         !(ox > inst.x + inst.w || ox + ow < inst.x || oy > inst.y + inst.h || oy + oh < inst.y);
@@ -418,6 +439,7 @@ extern "C" fn rect_is_empty(
     _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `instance` is the live `RectInst` payload the VM allocated for this script object; no `&mut` to it is live in `rect_is_empty`.
     let inst = unsafe { &*(instance as *const RectInst) };
     set_bool(out, inst.w <= 0.0 || inst.h <= 0.0);
     0
@@ -436,6 +458,7 @@ extern "C" fn rect_offset(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     if a.len() < 2 {
         return report_error(out_error, "RectF.Offset requires 2 arguments");
@@ -444,6 +467,7 @@ extern "C" fn rect_offset(
         (Ok(dx), Ok(dy)) => (dx, dy),
         _ => return report_error(out_error, "RectF.Offset: dx and dy must be numbers"),
     };
+    // SAFETY: `instance` is the live `RectInst` payload the VM allocated for this script object; `rect_offset` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut RectInst) };
     inst.x += dx;
     inst.y += dy;
@@ -469,7 +493,9 @@ extern "C" fn rect_union(
     let Ok((host, _ctx)) = super::bound(engine) else {
         return report_error(out_error, "RectF.Union: compat context is not bound");
     };
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
+    // SAFETY: `instance` is the live `RectInst` payload the VM allocated for this script object; no `&mut` to it is live in `rect_union`.
     let inst = unsafe { &*(instance as *const RectInst) };
     let result = match a.len() {
         0 => (inst.x, inst.y, inst.w, inst.h),
@@ -540,6 +566,7 @@ extern "C" fn static_union(
     out: *mut Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     if a.len() < 3 {
         return report_error(out_error, "RectF.Union requires 3 arguments");
@@ -600,6 +627,7 @@ macro_rules! rect_component {
             _out_error: *mut *mut c_char,
             _objthis: *mut c_void,
         ) -> c_int {
+            // SAFETY: `instance` is the live `RectInst` payload the VM allocated for this script object; no `&mut` to it is live during this callback.
             let inst = unsafe { &*(instance as *const RectInst) };
             set_real(out, inst.$field);
             0
@@ -616,11 +644,13 @@ macro_rules! rect_component {
             out_error: *mut *mut c_char,
             _objthis: *mut c_void,
         ) -> c_int {
+            // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
             let raw = unsafe { &*value };
             let number = match strict_real(raw) {
                 Ok(number) => number,
                 Err(error) => return report_error(out_error, &format!("RectF property: {error}")),
             };
+            // SAFETY: `instance` is the live `RectInst` payload the VM allocated for this script object; this callback is its only live accessor.
             let inst = unsafe { &mut *(instance as *mut RectInst) };
             inst.$field = number;
             0
@@ -642,6 +672,7 @@ macro_rules! rect_derived {
             _out_error: *mut *mut c_char,
             _objthis: *mut c_void,
         ) -> c_int {
+            // SAFETY: `instance` is the live `RectInst` payload the VM allocated for this script object; no `&mut` to it is live during this callback.
             let inst = unsafe { &*(instance as *const RectInst) };
             let f: fn(&RectInst) -> f64 = $expr;
             set_real(out, f(inst));
@@ -666,6 +697,7 @@ extern "C" fn rect_location_get(
     let Ok((host, _ctx)) = super::bound(engine) else {
         return report_error(out_error, "RectF.location: compat context is not bound");
     };
+    // SAFETY: `instance` is the live `RectInst` payload the VM allocated for this script object; no `&mut` to it is live in `rect_location_get`.
     let inst = unsafe { &*(instance as *const RectInst) };
     match new_pointf(host.engine(), inst.x, inst.y) {
         Ok(object) => {
@@ -689,6 +721,7 @@ extern "C" fn rect_bounds_get(
     let Ok((host, _ctx)) = super::bound(engine) else {
         return report_error(out_error, "RectF.bounds: compat context is not bound");
     };
+    // SAFETY: `instance` is the live `RectInst` payload the VM allocated for this script object; no `&mut` to it is live in `rect_bounds_get`.
     let inst = unsafe { &*(instance as *const RectInst) };
     match new_rectf(host.engine(), inst.x, inst.y, inst.w, inst.h) {
         Ok(object) => {

@@ -73,6 +73,7 @@ extern "C" fn timer_destroy(engine: *mut c_void, instance: *mut c_void) {
     if instance.is_null() {
         return;
     }
+    // SAFETY: `instance` is the live `TimerInst` payload the VM allocated for this script object; no `&mut` to it is live in `timer_destroy`.
     let inst = unsafe { &*(instance as *const TimerInst) };
     log::debug!("Timer destroyed: {:?}", inst.id);
     if let (Some(id), Ok((_resolved, ctx))) = (inst.id, bound(engine)) {
@@ -127,6 +128,7 @@ extern "C" fn timer_ctor(
         return report_error(out_error, "Timer: compat context is not bound");
     };
     let host = resolved.engine();
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let argv = unsafe { args(argv, argc) };
     let Some(first) = argv.first() else {
         return report_error(out_error, "Timer: constructor requires an action owner");
@@ -146,6 +148,7 @@ extern "C" fn timer_ctor(
     // `Owner = tjs_obj` (`TimerIntf.cpp:52`): the timer object itself, used
     // to dispatch `onTimer` through the class chain.
     let owner = host.retain_object_detached(objthis).ok();
+    // SAFETY: `instance` is the live `TimerInst` payload the VM allocated for this script object; `timer_ctor` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut TimerInst) };
     if inst.id.is_some() {
         return report_error(out_error, "Timer: already constructed");
@@ -207,6 +210,7 @@ extern "C" fn timer_invalidate(engine: *mut c_void, instance: *mut c_void) {
     if instance.is_null() {
         return;
     }
+    // SAFETY: `instance` is the live `TimerInst` payload the VM allocated for this script object; no `&mut` to it is live in `timer_invalidate`.
     let inst = unsafe { &*(instance as *const TimerInst) };
     let (Some(id), Ok((_resolved, ctx))) = (inst.id, bound(engine)) else {
         return;
@@ -408,6 +412,7 @@ extern "C" fn timer_on_timer(
         return report_error(out_error, "Timer.onTimer: compat context is not bound");
     };
     let host = resolved.engine();
+    // SAFETY: `instance` is the live `TimerInst` payload the VM allocated for this script object; no `&mut` to it is live in `timer_on_timer`.
     let inst = unsafe { &*(instance as *const TimerInst) };
     let Some(id) = inst.id else {
         // `Construct` never completed (`TimerIntf.cpp:34-51`), so the
@@ -548,6 +553,7 @@ extern "C" fn timer_interval_get(
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Timer.interval: compat context is not bound");
     };
+    // SAFETY: `instance` is the live `TimerInst` payload the VM allocated for this script object; no `&mut` to it is live in `timer_interval_get`.
     let inst = unsafe { &*(instance as *const TimerInst) };
     let units = match inst.id {
         Some(id) => {
@@ -597,7 +603,9 @@ extern "C" fn timer_interval_set(
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Timer.interval: compat context is not bound");
     };
+    // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
     let requested = value_as_f64(unsafe { &*value });
+    // SAFETY: `instance` is the live `TimerInst` payload the VM allocated for this script object; no `&mut` to it is live in `timer_interval_set`.
     let inst = unsafe { &*(instance as *const TimerInst) };
     let Some(id) = inst.id else {
         return 0;
@@ -655,6 +663,7 @@ extern "C" fn timer_enabled_get(
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Timer.enabled: compat context is not bound");
     };
+    // SAFETY: `instance` is the live `TimerInst` payload the VM allocated for this script object; no `&mut` to it is live in `timer_enabled_get`.
     let inst = unsafe { &*(instance as *const TimerInst) };
     let enabled = match inst.id {
         Some(id) => {
@@ -685,7 +694,9 @@ extern "C" fn timer_enabled_set(
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Timer.enabled: compat context is not bound");
     };
+    // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
     let enabled = value_as_bool(unsafe { &*value });
+    // SAFETY: `instance` is the live `TimerInst` payload the VM allocated for this script object; no `&mut` to it is live in `timer_enabled_set`.
     let inst = unsafe { &*(instance as *const TimerInst) };
     let Some(id) = inst.id else {
         log::debug!("Timer.enabled -> {enabled} but the instance has no id");
@@ -724,6 +735,7 @@ extern "C" fn timer_capacity_get(
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Timer.capacity: compat context is not bound");
     };
+    // SAFETY: `instance` is the live `TimerInst` payload the VM allocated for this script object; no `&mut` to it is live in `timer_capacity_get`.
     let inst = unsafe { &*(instance as *const TimerInst) };
     let Some(id) = inst.id else {
         set_int(out, DEFAULT_TIMER_CAPACITY);
@@ -763,7 +775,9 @@ extern "C" fn timer_capacity_set(
     };
     // Verbatim: no `clamp` — a negative script value must survive for the
     // getter (`TimerIntf.cpp:233` stores `*param` as written).
+    // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
     let requested = value_as_i64(unsafe { &*value });
+    // SAFETY: `instance` is the live `TimerInst` payload the VM allocated for this script object; no `&mut` to it is live in `timer_capacity_set`.
     let inst = unsafe { &*(instance as *const TimerInst) };
     let Some(id) = inst.id else {
         return 0;
@@ -793,6 +807,7 @@ extern "C" fn timer_mode_get(
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Timer.mode: compat context is not bound");
     };
+    // SAFETY: `instance` is the live `TimerInst` payload the VM allocated for this script object; no `&mut` to it is live in `timer_mode_get`.
     let inst = unsafe { &*(instance as *const TimerInst) };
     let Some(id) = inst.id else {
         set_int(out, 0);
@@ -818,7 +833,9 @@ extern "C" fn timer_mode_set(
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Timer.mode: compat context is not bound");
     };
+    // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
     let mode = value_as_i64(unsafe { &*value });
+    // SAFETY: `instance` is the live `TimerInst` payload the VM allocated for this script object; no `&mut` to it is live in `timer_mode_set`.
     let inst = unsafe { &*(instance as *const TimerInst) };
     let Some(id) = inst.id else {
         return 0;

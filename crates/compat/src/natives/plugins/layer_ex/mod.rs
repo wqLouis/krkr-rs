@@ -182,6 +182,7 @@ pub(super) fn set_string_out(
         return Ok(());
     }
     let (_resolved, ctx) = bound(engine)?;
+    // SAFETY: `ctx` is only created for a bound, live engine, so its service pointer is valid for `set_string_out`.
     let services = unsafe { ctx.services() };
     let mut state = services.state::<Scratch>();
     state.buf.clear();

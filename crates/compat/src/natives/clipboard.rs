@@ -144,6 +144,7 @@ extern "C" fn native_has_format(
         return report_error(out_error, "Clipboard.hasFormat requires 1 argument");
     }
     // `(tjs_int)*param[0]` raises on objects (`tjsVariant.h:933-935`).
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let code = match try_value_as_i64(&unsafe { args(argv, argc) }[0]) {
         Ok(code) => code,
         Err(error) => return report_error(out_error, &error),

@@ -590,6 +590,7 @@ fn with_layer<R>(
     let (resolved, ctx) = bound(engine)?;
     let layer_id = layer_from_objthis(resolved.engine(), objthis)?
         .ok_or_else(|| format!("{method}: the receiver is not a Layer"))?;
+    // SAFETY: `ctx` is only created for a bound, live engine, so its service pointer is valid for `with_layer`.
     let services = unsafe { ctx.services() };
     let mut state = services.state::<DrawState>();
     let layer_draw = state.layers.entry(layer_id).or_default();
@@ -762,6 +763,7 @@ macro_rules! path_draw_method {
             out: *mut Value,
             out_error: *mut *mut c_char,
         ) -> c_int {
+            // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
             let a = unsafe { args(argv, argc) };
             let Some(app_value) = a.first() else {
                 return report_error(out_error, concat!($method, ": an Appearance is required"));
@@ -979,6 +981,7 @@ extern "C" fn draw_path(
     out: *mut Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     if a.len() < 2 {
         return report_error(
@@ -1017,6 +1020,7 @@ extern "C" fn clear(
     out: *mut Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     let color = argb_to_rgba(a.first().map(value_as_i64).unwrap_or(0));
     let result = with_layer(
@@ -1150,6 +1154,7 @@ extern "C" fn draw_image(
     out: *mut Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     if a.len() < 3 {
         return report_error(out_error, "Layer.drawImage requires x, y and an image");
@@ -1183,6 +1188,7 @@ extern "C" fn draw_image_rect(
     out: *mut Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     if a.len() < 7 {
         return report_error(
@@ -1229,6 +1235,7 @@ extern "C" fn draw_image_stretch(
     out: *mut Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     if a.len() < 9 {
         return report_error(
@@ -1280,6 +1287,7 @@ extern "C" fn draw_image_affine(
     out: *mut Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     if a.len() < 12 {
         return report_error(
@@ -1387,6 +1395,7 @@ extern "C" fn draw_string(
     out: *mut Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     if a.len() < 5 {
         return report_error(
@@ -1463,6 +1472,7 @@ extern "C" fn draw_path_string(
     out: *mut Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     if a.len() < 5 {
         return report_error(
@@ -1573,6 +1583,7 @@ extern "C" fn measure_string(
     out: *mut Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     if a.len() < 2 {
         return report_error(
@@ -1615,6 +1626,7 @@ extern "C" fn measure_string_internal(
     out: *mut Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     if a.len() < 2 {
         return report_error(
@@ -1685,6 +1697,7 @@ extern "C" fn set_transform(
     out: *mut Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     let Some(value) = a.first() else {
         return report_error(out_error, "Layer.setTransform requires a matrix");
@@ -1731,6 +1744,7 @@ extern "C" fn rotate_transform(
     out: *mut Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     let angle = a.first().map(value_as_f64).unwrap_or(0.0);
     update_transforms(
@@ -1752,6 +1766,7 @@ extern "C" fn scale_transform(
     out: *mut Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     let sx = a.first().map(value_as_f64).unwrap_or(1.0);
     let sy = a.get(1).map(value_as_f64).unwrap_or(sx);
@@ -1774,6 +1789,7 @@ extern "C" fn translate_transform(
     out: *mut Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     let dx = a.first().map(value_as_f64).unwrap_or(0.0);
     let dy = a.get(1).map(value_as_f64).unwrap_or(0.0);
@@ -1796,6 +1812,7 @@ extern "C" fn set_view_transform(
     out: *mut Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     let Some(value) = a.first() else {
         return report_error(out_error, "Layer.setViewTransform requires a matrix");
@@ -1842,6 +1859,7 @@ extern "C" fn rotate_view_transform(
     out: *mut Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     let angle = a.first().map(value_as_f64).unwrap_or(0.0);
     update_transforms(
@@ -1863,6 +1881,7 @@ extern "C" fn scale_view_transform(
     out: *mut Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     let sx = a.first().map(value_as_f64).unwrap_or(1.0);
     let sy = a.get(1).map(value_as_f64).unwrap_or(sx);
@@ -1885,6 +1904,7 @@ extern "C" fn translate_view_transform(
     out: *mut Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     let dx = a.first().map(value_as_f64).unwrap_or(0.0);
     let dy = a.get(1).map(value_as_f64).unwrap_or(0.0);
@@ -1984,6 +2004,7 @@ extern "C" fn record_set(
         Ok(None) => return report_error(out_error, "Layer.record: the receiver is not a Layer"),
         Err(error) => return report_error(out_error, &error),
     };
+    // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
     let enabled = value_as_bool(unsafe { &*value });
     let mut state = draw_state(&ctx);
     let layer_draw = state.layers.entry(layer_id).or_default();
@@ -2102,6 +2123,7 @@ extern "C" fn save_record(
     out: *mut Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     let Some(value) = a.first() else {
         return report_error(out_error, "Layer.saveRecord requires a filename");
@@ -2142,6 +2164,7 @@ extern "C" fn load_record(
     out: *mut Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     let Some(value) = a.first() else {
         return report_error(out_error, "Layer.loadRecord requires a filename");
@@ -2217,6 +2240,7 @@ macro_rules! draw_property {
             let Ok(Some(layer_id)) = layer_from_objthis(resolved.engine(), objthis) else {
                 return report_error(out_error, "Layer: the receiver is not a Layer");
             };
+            // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
             let new_value = value_as_f64(unsafe { &*value });
             let mut state = draw_state(&ctx);
             let layer_draw = state.layers.entry(layer_id).or_default();
@@ -2271,6 +2295,7 @@ extern "C" fn update_when_draw_set(
             "Layer.updateWhenDraw: the receiver is not a Layer",
         );
     };
+    // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
     let enabled = value_as_bool(unsafe { &*value });
     let mut state = draw_state(&ctx);
     state.layers.entry(layer_id).or_default().update_when_draw = enabled;

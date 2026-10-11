@@ -38,7 +38,6 @@ pub(crate) const DEFAULT_FONT_COLOR: i64 = 0xffff_ffff;
 pub(crate) struct ObjectRegistry {
     pub(crate) windows: HashMap<u32, DetachedValue>,
     pub(crate) layers: HashMap<u32, DetachedValue>,
-    pub(crate) bitmaps: HashMap<u32, DetachedValue>,
     pub(crate) fonts: HashMap<u32, DetachedValue>,
 }
 

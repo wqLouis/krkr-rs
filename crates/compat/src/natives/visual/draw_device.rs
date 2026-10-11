@@ -182,6 +182,7 @@ extern "C" fn pass_through_draw_device_recreate(
     _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `instance` is the live `DrawDeviceInst` payload the VM allocated for this script object; `pass_through_draw_device_recreate` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut DrawDeviceInst) };
     let (src_w, src_h) = inst.src_size();
     log::debug!("PassThroughDrawDevice.recreate: source size {src_w}x{src_h}");
@@ -210,7 +211,9 @@ extern "C" fn pass_through_draw_device_lock_touch_size(
             "PassThroughDrawDevice.lockTouchSize requires 2 arguments",
         );
     }
+    // SAFETY: `instance` is the live `DrawDeviceInst` payload the VM allocated for this script object; `pass_through_draw_device_lock_touch_size` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut DrawDeviceInst) };
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     inst.locked = (value_as_i64(&a[0]), value_as_i64(&a[1]));
     set_void(out);
@@ -250,6 +253,7 @@ extern "C" fn draw_device_name_get(
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "draw-device name: compat context is not bound");
     };
+    // SAFETY: `instance` is the live `DrawDeviceInst` payload the VM allocated for this script object; no `&mut` to it is live in `draw_device_name_get`.
     let inst = unsafe { &*(instance as *const DrawDeviceInst) };
     set_visual_string_out(&ctx, out, inst.kind.class_name());
     0
@@ -263,6 +267,7 @@ extern "C" fn draw_device_drawer_get(
     _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `instance` is the live `DrawDeviceInst` payload the VM allocated for this script object; no `&mut` to it is live in `draw_device_drawer_get`.
     let inst = unsafe { &*(instance as *const DrawDeviceInst) };
     set_int(out, inst.drawer);
     0
@@ -276,6 +281,7 @@ extern "C" fn draw_device_preferred_drawer_get(
     _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `instance` is the live `DrawDeviceInst` payload the VM allocated for this script object; no `&mut` to it is live in `draw_device_preferred_drawer_get`.
     let inst = unsafe { &*(instance as *const DrawDeviceInst) };
     set_int(out, inst.preferred_drawer);
     0
@@ -294,7 +300,9 @@ extern "C" fn draw_device_preferred_drawer_set(
     _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `instance` is the live `DrawDeviceInst` payload the VM allocated for this script object; `draw_device_preferred_drawer_set` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut DrawDeviceInst) };
+    // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
     inst.preferred_drawer = value_as_i64(unsafe { &*value }) as i32 as i64;
     0
 }

@@ -28,8 +28,10 @@
 
 use std::f64::consts::PI;
 use std::ffi::{c_char, c_int, c_void};
+use std::sync::Arc;
 
-use engine::sound::SoundSource;
+use api::media::AudioSpec;
+use engine::sound::{AudioStream, LoopInfo, LoopLink, SoundError, SoundLabel, SoundSource};
 use tjs::{NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef, Value};
 
 use crate::native_util::{report_error, set_int, set_void};
@@ -386,6 +388,21 @@ impl PhaseVocoderDsp {
         dsp
     }
 
+    /// FFT frame size in samples.
+    pub(super) fn frame_size(&self) -> usize {
+        self.frame_size
+    }
+
+    /// Input frames consumed by one [`Self::process_hop`].
+    pub(super) fn input_hop(&self) -> usize {
+        self.input_hop
+    }
+
+    /// Output frames committed by one [`Self::process_hop`].
+    pub(super) fn output_hop(&self) -> usize {
+        self.output_hop
+    }
+
     fn set_time_scale(&mut self, value: f32) {
         let value = if value.is_finite() { value } else { 1.0 };
         if self.time_scale != value {
@@ -451,7 +468,43 @@ impl PhaseVocoderDsp {
         self.rebuild = false;
     }
 
+    /// Append one analysis/synthesis hop to `output`.
+    ///
+    /// `input` must hold at least [`Self::frame_size`] frames. The hop's
+    /// window starts at frame `write_frame` of the output timeline, whose
+    /// first frame is `front_frame` (the committed prefix
+    /// `[front_frame, write_frame)` has already been consumed by the caller).
+    /// The overlapping tail of the previous hop is preserved and summed into,
+    /// so the caller can drain the committed prefix and keep only a bounded
+    /// window.
+    pub(super) fn process_hop(
+        &mut self,
+        input: &[f32],
+        output: &mut Vec<f32>,
+        write_frame: u64,
+        front_frame: u64,
+    ) {
+        if self.rebuild {
+            self.rebuild_params();
+        }
+        let channels = self.channels;
+        let frame_size = self.frame_size;
+        let offset = (write_frame - front_frame) as usize;
+        let needed = (offset + frame_size) * channels;
+        if output.len() < needed {
+            output.resize(needed, 0.0);
+        }
+        for ch in 0..channels {
+            let synth = self.process_channel(ch, input, 0);
+            for frame in 0..frame_size {
+                output[(offset + frame) * channels + ch] +=
+                    synth[frame] * self.output_window[frame];
+            }
+        }
+    }
+
     /// Render `input` (interleaved) into a scaled interleaved buffer.
+    #[cfg(test)]
     pub(super) fn process(&mut self, input: &[f32]) -> Vec<f32> {
         if self.rebuild {
             self.rebuild_params();
@@ -462,34 +515,19 @@ impl PhaseVocoderDsp {
         if frame_size == 0 || self.input_hop == 0 {
             return input.to_vec();
         }
+        let input_hop = self.input_hop;
         let output_hop = self.output_hop.max(2);
+        let steps = if input_frames >= frame_size {
+            (input_frames - frame_size) / input_hop + 1
+        } else {
+            0
+        };
         let mut output: Vec<f32> = Vec::new();
-        let mut out_frames = 0usize;
-        let mut pos = 0usize;
-
-        while pos + frame_size <= input_frames {
-            let needed = (out_frames + frame_size) * channels;
-            if output.len() < needed {
-                output.resize(needed, 0.0);
-            }
-            // Zero the fresh tail so only completed overlaps are summed.
-            let tail_start = out_frames + frame_size - output_hop;
-            for frame in tail_start..out_frames + frame_size {
-                for ch in 0..channels {
-                    output[frame * channels + ch] = 0.0;
-                }
-            }
-            for ch in 0..channels {
-                let synth = self.process_channel(ch, input, pos);
-                for frame in 0..frame_size {
-                    output[(out_frames + frame) * channels + ch] +=
-                        synth[frame] * self.output_window[frame];
-                }
-            }
-            out_frames += output_hop;
-            pos += self.input_hop;
+        for step in 0..steps {
+            let start = step * input_hop * channels;
+            self.process_hop(&input[start..], &mut output, (step * output_hop) as u64, 0);
         }
-        output.truncate(out_frames * channels);
+        output.truncate(steps * output_hop * channels);
         output
     }
 
@@ -646,45 +684,330 @@ fn wrap_pi(value: f32) -> f32 {
 }
 
 // ---------------------------------------------------------------------------
-// Filter-chain application
+// Streaming filter chain
 // ---------------------------------------------------------------------------
 
-/// Render `source` through the `PhaseVocoder` chain, returning a new
-/// [`SoundSource`] whose PCM is the scaled output.
+/// One `PhaseVocoder` stage fed and drained as the mixer pulls frames.
 ///
-/// The cumulative time scale is applied to the loop links and labels so the
-/// `.sli` loop points keep referring to the same musical position after a
-/// time stretch.
-pub(super) fn apply_chain(
-    source: &SoundSource,
-    configs: &[VocoderConfig],
-) -> Result<std::sync::Arc<SoundSource>, String> {
-    use api::media::{AudioSpec, DecodedAudio};
-    use engine::sound::{LoopInfo, LoopLink, SoundLabel};
+/// `input` and `output` are interleaved queues whose front is the next frame.
+/// `output` holds the committed prefix `[front_frame, write_frame)` plus the
+/// uncommitted overlap tail, so at most a `frame_size` window of either queue
+/// is ever retained — the reference's ring buffers
+/// (`reference/cpp/core/sound/PhaseVocoderDSP.cpp:239-292`).
+struct VocoderStage {
+    dsp: PhaseVocoderDsp,
+    channels: usize,
+    input: Vec<f32>,
+    output: Vec<f32>,
+    front_frame: u64,
+    write_frame: u64,
+    total_output: u64,
+}
 
-    let spec = source.spec();
-    let sample_rate = spec.sample_rate;
-    let channels = usize::from(spec.channels);
-    if channels == 0 {
-        return Err("source has no channels".to_string());
+impl VocoderStage {
+    /// Build a stage whose input is `input_total` frames long.
+    fn new(sample_rate: u32, channels: usize, config: VocoderConfig, input_total: u64) -> Self {
+        let dsp = PhaseVocoderDsp::new(sample_rate, channels, config);
+        let frame_size = dsp.frame_size() as u64;
+        let input_hop = dsp.input_hop().max(1) as u64;
+        let output_hop = dsp.output_hop().max(2) as u64;
+        // One `Process` step per complete `frame_size` window, advancing by
+        // `input_hop` and committing `output_hop`
+        // (`reference/cpp/core/sound/PhaseVocoderDSP.cpp:336-426`).
+        let steps = if input_total >= frame_size {
+            (input_total - frame_size) / input_hop + 1
+        } else {
+            0
+        };
+        Self {
+            dsp,
+            channels,
+            input: Vec::new(),
+            output: Vec::new(),
+            front_frame: 0,
+            write_frame: 0,
+            total_output: steps * output_hop,
+        }
     }
-    let mut samples = source.audio().interleaved.clone();
+
+    /// Frames buffered and not yet consumed by the DSP.
+    fn input_frames(&self) -> u64 {
+        (self.input.len() / self.channels) as u64
+    }
+
+    /// Committed output frames ready to hand downstream.
+    fn ready_frames(&self) -> u64 {
+        self.write_frame - self.front_frame
+    }
+
+    /// Append interleaved input frames.
+    fn push_input(&mut self, samples: &[f32]) {
+        self.input.extend_from_slice(samples);
+    }
+
+    /// Run one analysis/synthesis hop: consume `input_hop` frames and commit
+    /// `output_hop` frames.
+    fn step(&mut self) {
+        self.dsp.process_hop(
+            &self.input,
+            &mut self.output,
+            self.write_frame,
+            self.front_frame,
+        );
+        let hop = self.dsp.input_hop();
+        self.input.drain(..hop * self.channels);
+        self.write_frame += self.dsp.output_hop().max(2) as u64;
+    }
+
+    /// Copy up to `frames` committed frames into `out`, dropping them.
+    fn take(&mut self, frames: usize, out: &mut [f32]) -> usize {
+        let n = frames.min(self.ready_frames() as usize);
+        let end = n * self.channels;
+        out[..end].copy_from_slice(&self.output[..end]);
+        self.output.drain(..end);
+        self.front_frame += n as u64;
+        n
+    }
+}
+
+/// Build one stage per config, each fed by the previous stage's output.
+fn build_stages(
+    sample_rate: u32,
+    channels: usize,
+    configs: &[VocoderConfig],
+    input_total: u64,
+) -> Vec<VocoderStage> {
+    let mut stages = Vec::new();
+    let mut total = input_total;
+    for config in configs {
+        let stage = VocoderStage::new(sample_rate, channels, *config, total);
+        total = stage.total_output;
+        stages.push(stage);
+    }
+    stages
+}
+
+/// A phase-vocoder chain decoded on demand as the mixer pulls frames.
+///
+/// This mirrors the reference filter stack: the base decoder/loop manager is
+/// wrapped by each filter in `filters` order
+/// (`reference/cpp/core/sound/WaveIntf.cpp:920-980`), and each filter pulls
+/// only the hop it needs
+/// (`reference/cpp/core/sound/PhaseVocoderFilter.cpp:277-370`) instead of
+/// materializing the file. Nothing beyond a `frame_size` window per stage is
+/// retained.
+pub(super) struct FilterChainStream {
+    base: Arc<SoundSource>,
+    base_frames: u64,
+    base_cursor: u64,
+    sample_rate: u32,
+    channels: usize,
+    configs: Vec<VocoderConfig>,
+    stages: Vec<VocoderStage>,
+    total_output: u64,
+}
+
+impl FilterChainStream {
+    /// Wrap `base` with the `configs` chain. A base whose length the container
+    /// did not report is materialized once so the output frame count is known;
+    /// every other base stays incremental.
+    pub(super) fn new(
+        base: Arc<SoundSource>,
+        configs: Vec<VocoderConfig>,
+    ) -> Result<Self, SoundError> {
+        let sample_rate = base.sample_rate();
+        let channels = usize::from(base.channels());
+        if channels == 0 {
+            return Err(SoundError::InvalidSpec {
+                message: "source has no channels".to_string(),
+            });
+        }
+        let (base, base_frames) = match base.reported_frames() {
+            Some(frames) => (base, frames),
+            None => {
+                let audio = base.decode_entire()?;
+                let frames = audio.frame_count();
+                let materialized = Arc::new(SoundSource::with_loops(
+                    Arc::new(audio),
+                    base.loops().cloned(),
+                )?);
+                (materialized, frames)
+            }
+        };
+        let stages = build_stages(sample_rate, channels, &configs, base_frames);
+        let total_output = stages
+            .last()
+            .map_or(base_frames, |stage| stage.total_output);
+        Ok(Self {
+            base,
+            base_frames,
+            base_cursor: 0,
+            sample_rate,
+            channels,
+            configs,
+            stages,
+            total_output,
+        })
+    }
+
+    /// Total output frames the chain will produce.
+    pub(super) fn total_output(&self) -> u64 {
+        self.total_output
+    }
+
+    /// Produce at least one committed output frame at `index`, pulling input
+    /// from the previous stage as needed. Returns `false` at end of input.
+    fn pump(&mut self, index: usize) -> Result<bool, SoundError> {
+        if self.stages[index].ready_frames() > 0 {
+            return Ok(true);
+        }
+        let frame_size = self.stages[index].dsp.frame_size() as u64;
+        self.fill_input(index, frame_size)?;
+        if self.stages[index].input_frames() < frame_size {
+            return Ok(false);
+        }
+        self.stages[index].step();
+        Ok(true)
+    }
+
+    /// Ensure stage `index` holds `target` input frames, or as many as remain.
+    fn fill_input(&mut self, index: usize, target: u64) -> Result<(), SoundError> {
+        if self.stages[index].input_frames() >= target {
+            return Ok(());
+        }
+        if index == 0 {
+            let want = target - self.stages[0].input_frames();
+            let available = self.base_frames.saturating_sub(self.base_cursor);
+            let take = want.min(available) as usize;
+            if take == 0 {
+                return Ok(());
+            }
+            let channels = self.channels;
+            let mut buffer = vec![0.0f32; take * channels];
+            for frame in 0..take {
+                let index = self.base_cursor + frame as u64;
+                let Some((left, right)) = self.base.frame(index)? else {
+                    return Err(SoundError::Decode {
+                        message: format!(
+                            "filter chain: base source reported {0} frames but frame {index} is missing",
+                            self.base_frames
+                        ),
+                    });
+                };
+                buffer[frame * channels] = left;
+                if channels >= 2 {
+                    buffer[frame * channels + 1] = right;
+                }
+            }
+            self.base_cursor += take as u64;
+            self.stages[0].push_input(&buffer);
+            return Ok(());
+        }
+        while self.stages[index].input_frames() < target {
+            if self.stages[index - 1].ready_frames() == 0 && !self.pump(index - 1)? {
+                break;
+            }
+            let want = (target - self.stages[index].input_frames()) as usize;
+            let available = self.stages[index - 1].ready_frames() as usize;
+            let n = want.min(available);
+            if n == 0 {
+                break;
+            }
+            let channels = self.channels;
+            let mut buffer = vec![0.0f32; n * channels];
+            self.stages[index - 1].take(n, &mut buffer);
+            self.stages[index].push_input(&buffer);
+        }
+        Ok(())
+    }
+
+    /// Rewind every stage and the base to the first frame.
+    fn reset(&mut self) {
+        self.stages = build_stages(
+            self.sample_rate,
+            self.channels,
+            &self.configs,
+            self.base_frames,
+        );
+        self.base_cursor = 0;
+    }
+}
+
+impl AudioStream for FilterChainStream {
+    fn spec(&self) -> AudioSpec {
+        AudioSpec {
+            sample_rate: self.sample_rate,
+            channels: self.channels as u16,
+            total_frames: Some(self.total_output),
+        }
+    }
+
+    fn read(&mut self, out: &mut [f32]) -> Result<usize, SoundError> {
+        let channels = self.channels;
+        if channels == 0 {
+            return Ok(0);
+        }
+        let frames_wanted = out.len() / channels;
+        let mut written = 0;
+        while written < frames_wanted {
+            let last = self.stages.len() - 1;
+            if self.stages[last].ready_frames() == 0 && !self.pump(last)? {
+                break;
+            }
+            let n = (self.stages[last].ready_frames() as usize).min(frames_wanted - written);
+            let start = written * channels;
+            let end = start + n * channels;
+            self.stages[last].take(n, &mut out[start..end]);
+            written += n;
+        }
+        Ok(written * channels)
+    }
+
+    fn seek(&mut self, frame: u64) -> Result<(), SoundError> {
+        self.reset();
+        let mut remaining = frame;
+        let mut buffer = vec![0.0f32; 4096 * self.channels];
+        while remaining > 0 {
+            let want = remaining.min(4096) as usize;
+            let got = self.read(&mut buffer[..want * self.channels])?;
+            if got == 0 {
+                break;
+            }
+            remaining -= (got / self.channels) as u64;
+        }
+        Ok(())
+    }
+}
+
+/// Build a streaming [`SoundSource`] that renders `base` through the
+/// `PhaseVocoder` chain.
+///
+/// The cumulative time scale scales the loop links and labels so the `.sli`
+/// loop points keep referring to the same musical position after a time
+/// stretch.
+pub(super) fn build_filtered_source(
+    base: Arc<SoundSource>,
+    configs: &[VocoderConfig],
+) -> Result<Arc<SoundSource>, SoundError> {
     let mut time_scale = 1.0f32;
     for config in configs {
-        let mut dsp = PhaseVocoderDsp::new(sample_rate, channels, *config);
-        samples = dsp.process(&samples);
         if config.time.is_finite() && config.time > 0.0 {
             time_scale *= config.time;
         }
     }
-    let frames = samples.len() / channels;
-    let new_spec = AudioSpec {
-        sample_rate,
-        channels: spec.channels,
-        total_frames: Some(frames as u64),
+    let stream = FilterChainStream::new(base.clone(), configs.to_vec())?;
+    let spec = AudioSpec {
+        sample_rate: stream.sample_rate,
+        channels: stream.channels as u16,
+        total_frames: Some(stream.total_output()),
     };
-    let audio = std::sync::Arc::new(DecodedAudio::new(new_spec, samples));
-    let info = source.loops().map(|info| {
+    let info = scale_loops(base.loops(), time_scale);
+    SoundSource::streaming(spec, Box::new(stream), info).map(Arc::new)
+}
+
+/// Scale loop links and labels by the chain's cumulative time scale.
+fn scale_loops(info: Option<&LoopInfo>, time_scale: f32) -> Option<LoopInfo> {
+    info.map(|info| {
         let scale = f64::from(time_scale.max(0.0));
         let links = info
             .links
@@ -708,8 +1031,5 @@ pub(super) fn apply_chain(
             })
             .collect();
         LoopInfo::new(links, labels)
-    });
-    SoundSource::with_loops(audio, info)
-        .map(std::sync::Arc::new)
-        .map_err(|error| error.to_string())
+    })
 }

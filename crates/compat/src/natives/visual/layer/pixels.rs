@@ -322,7 +322,9 @@ extern "C" fn layer_operate_rect(
     if argc < 7 {
         return report_error(out_error, "Layer.operateRect requires 7 arguments");
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_operate_rect`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         return report_error(
@@ -385,7 +387,9 @@ extern "C" fn layer_operate_stretch(
     if argc < 9 {
         return report_error(out_error, "Layer.operateStretch requires 9 arguments");
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_operate_stretch`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         return report_error(
@@ -572,7 +576,9 @@ macro_rules! affine_method {
             out_error: *mut *mut c_char,
             _objthis: *mut c_void,
         ) -> c_int {
+            // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
             let a = unsafe { args(argv, argc) };
+            // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live during this callback.
             let inst = unsafe { &*(instance as *const LayerInst) };
             let Some(id) = inst.id else {
                 return report_error(
@@ -723,7 +729,9 @@ macro_rules! stretch_method {
                     concat!("Layer.", $method, " requires 9 arguments"),
                 );
             }
+            // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
             let a = unsafe { args(argv, argc) };
+            // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live during this callback.
             let inst = unsafe { &*(instance as *const LayerInst) };
             let Some(id) = inst.id else {
                 return report_error(
@@ -936,7 +944,9 @@ macro_rules! rect_method {
                     concat!("Layer.", $method, " requires 7 arguments"),
                 );
             }
+            // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
             let a = unsafe { args(argv, argc) };
+            // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live during this callback.
             let inst = unsafe { &*(instance as *const LayerInst) };
             let Some(id) = inst.id else {
                 return report_error(
@@ -979,7 +989,9 @@ extern "C" fn layer_copy_9patch(
     if argc < 1 {
         return report_error(out_error, "Layer.copy9Patch requires 1 argument");
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_copy_9patch`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         return report_error(out_error, "Layer.copy9Patch: this layer is not constructed");
@@ -1026,7 +1038,9 @@ extern "C" fn layer_color_rect(
     if argc < 5 {
         return report_error(out_error, "Layer.colorRect requires 5 arguments");
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_color_rect`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         return report_error(out_error, "Layer.colorRect: this layer is not constructed");
@@ -1146,7 +1160,9 @@ extern "C" fn layer_convert_type(
     if argc < 1 {
         return report_error(out_error, "Layer.convertType requires 1 argument");
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_convert_type`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         return report_error(
@@ -1225,6 +1241,7 @@ fn flip_axis(
     horizontal: bool,
 ) -> c_int {
     let method = if horizontal { "flipLR" } else { "flipUD" };
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `flip_axis`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         return report_error(
@@ -1302,7 +1319,9 @@ extern "C" fn layer_do_box_blur(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_do_box_blur`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         return report_error(out_error, "Layer.doBoxBlur: this layer is not constructed");
@@ -1373,7 +1392,9 @@ extern "C" fn layer_adjust_gamma(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_adjust_gamma`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         return report_error(
@@ -1442,7 +1463,9 @@ extern "C" fn layer_gaussian_blur(
     if argc < 1 {
         return report_error(out_error, "Layer.gaussianBlur requires a radius");
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_gaussian_blur`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         return report_error(
@@ -1514,6 +1537,7 @@ extern "C" fn layer_do_gray_scale(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_do_gray_scale`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         return report_error(
@@ -1561,7 +1585,9 @@ extern "C" fn layer_light(
     if argc < 2 {
         return report_error(out_error, "Layer.light requires 2 arguments");
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_light`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         return report_error(out_error, "Layer.light: this layer is not constructed");
@@ -1623,7 +1649,9 @@ extern "C" fn layer_get_main_pixel(
     if argc < 2 {
         return report_error(out_error, "Layer.getMainPixel requires 2 arguments");
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_get_main_pixel`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         return report_error(
@@ -1662,7 +1690,9 @@ extern "C" fn layer_set_main_pixel(
     if argc < 3 {
         return report_error(out_error, "Layer.setMainPixel requires 3 arguments");
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_set_main_pixel`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         return report_error(
@@ -1717,7 +1747,9 @@ extern "C" fn layer_get_mask_pixel(
     if argc < 2 {
         return report_error(out_error, "Layer.getMaskPixel requires 2 arguments");
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_get_mask_pixel`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         return report_error(
@@ -1756,7 +1788,9 @@ extern "C" fn layer_set_mask_pixel(
     if argc < 3 {
         return report_error(out_error, "Layer.setMaskPixel requires 3 arguments");
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_set_mask_pixel`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         return report_error(
@@ -1820,12 +1854,14 @@ extern "C" fn layer_independ_province_image(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     let copy = if argc >= 1 && a[0].ty != tjs::VAL_VOID {
         crate::natives::system::value_as_bool(&a[0])
     } else {
         true
     };
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_independ_province_image`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         return report_error(
@@ -1872,7 +1908,9 @@ extern "C" fn layer_copy_to_bitmap_from_main_image(
             "Layer.copyToBitmapFromMainImage requires a Bitmap",
         );
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_copy_to_bitmap_from_main_image`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         return report_error(
@@ -1935,6 +1973,7 @@ extern "C" fn layer_dump(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_dump`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         return report_error(out_error, "Layer.dump: this layer is not constructed");
@@ -1991,6 +2030,7 @@ extern "C" fn layer_load_images(
     if argc < 1 {
         return report_error(out_error, "Layer.loadImages requires 1 argument");
     }
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_load_images`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         return report_error(out_error, "Layer.loadImages: this layer is not constructed");
@@ -1998,6 +2038,7 @@ extern "C" fn layer_load_images(
     let Ok((host, ctx)) = super::bound(engine) else {
         return report_error(out_error, "Layer.loadImages: compat context is not bound");
     };
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     let name = crate::native_util::value_as_string(&a[0]);
     let colorkey = a
@@ -2026,6 +2067,7 @@ fn load_layer_image(
     colorkey: u32,
 ) -> Result<(), String> {
     log::debug!("load_layer_image: layer {layer_id} <- {name:?}");
+    // SAFETY: `ctx` is only created for a bound, live engine, so its service pointer is valid for `load_layer_image`.
     let services = unsafe { ctx.services() };
     let storage = services
         .storage()
@@ -2074,6 +2116,7 @@ extern "C" fn layer_load_province_image(
     if argc < 1 {
         return report_error(out_error, "Layer.loadProvinceImage requires 1 argument");
     }
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_load_province_image`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         return report_error(
@@ -2087,6 +2130,7 @@ extern "C" fn layer_load_province_image(
             "Layer.loadProvinceImage: compat context is not bound",
         );
     };
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     let name = crate::native_util::value_as_string(&a[0]);
     match load_layer_province(&ctx, id, &name) {
@@ -2102,6 +2146,7 @@ extern "C" fn layer_load_province_image(
 /// must match the main image's size (reference `TVPProvinceSizeMismatch`);
 /// its red channel becomes the 8-bit province value.
 fn load_layer_province(ctx: &CompatCtx, layer_id: u32, name: &str) -> Result<(), String> {
+    // SAFETY: `ctx` is only created for a bound, live engine, so its service pointer is valid for `load_layer_province`.
     let services = unsafe { ctx.services() };
     let storage = services
         .storage()
@@ -2150,6 +2195,7 @@ extern "C" fn layer_save_layer_image(
     if argc < 1 {
         return report_error(out_error, "Layer.saveLayerImage requires a name");
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     let name = crate::native_util::value_as_string(&a[0]);
     let type_name = match a.get(1) {
@@ -2163,6 +2209,7 @@ extern "C" fn layer_save_layer_image(
         }
         _ => "bmp".to_string(),
     };
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_save_layer_image`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         return report_error(
@@ -2250,7 +2297,9 @@ fn layer_draw_text_common(
     if argc < 4 {
         return report_error(out_error, &format!("Layer.{method} requires 4 arguments"));
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_draw_text_common`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         return report_error(

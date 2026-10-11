@@ -115,6 +115,7 @@ extern "C" fn layer_bring_to_back(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_bring_to_back`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         return report_error(
@@ -177,7 +178,9 @@ fn move_from_script(
     if argc < 1 {
         return report_error(out_error, &format!("Layer.{method} requires 1 argument"));
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `move_from_script`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         return report_error(
@@ -267,6 +270,7 @@ extern "C" fn layer_set_mode(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_set_mode`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         return report_error(out_error, "Layer.setMode: this layer is not constructed");
@@ -341,6 +345,7 @@ extern "C" fn layer_remove_mode(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_remove_mode`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         return report_error(out_error, "Layer.removeMode: this layer is not constructed");

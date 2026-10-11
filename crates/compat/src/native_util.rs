@@ -5,11 +5,14 @@
 //! unsafe pointer code in every native.
 #![allow(unsafe_code)]
 
-use std::ffi::{CStr, c_char, c_int};
+use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::ptr;
 use std::slice;
 
-use tjs::{VAL_INTEGER, VAL_VOID, Value, tjs2_malloc};
+use tjs::{
+    NativeObjThisMethod, NativeObjThisMethodDef, NativeObjThisProperty, NativeObjThisPropertyDef,
+    Tjs2Engine, VAL_INTEGER, VAL_VOID, Value, tjs2_malloc,
+};
 
 /// View a native callback's `argc`/`argv` as a slice.
 ///
@@ -111,6 +114,100 @@ fn alloc_error_string(msg: &str) -> *mut c_char {
         *buf.add(bytes.len()) = 0;
         buf as *mut c_char
     }
+}
+
+/// Attach static (class-level) members to an existing TJS2 builtin class
+/// object such as `Dictionary`.
+///
+/// The reference declares these with `TJS_STATICMEMBER`
+/// (`reference/cpp/plugins/saveStruct.cpp:364-366` via the
+/// `ncbAttachTJS2Class` registration path in
+/// `reference/cpp/core/plugin/ncbind.hpp:2029-2033`): the members live on the
+/// class object, are reachable through it, and are not copied onto instances,
+/// so an instance's `EnumMembers` never reports them.
+///
+/// The C++ entry point is `tjs2_register_native_builtin_static_members` in
+/// `cpp/tjs2_abi.cpp`; it reuses the objthis dispatch so the callbacks receive
+/// the receiver the member was invoked on, but marks the symbol static.
+pub(crate) fn register_builtin_static_members(
+    engine: &Tjs2Engine,
+    class_name: &str,
+    methods: &[NativeObjThisMethodDef],
+    properties: &[NativeObjThisPropertyDef],
+) -> Result<(), String> {
+    let class_name_c = CString::new(class_name)
+        .map_err(|_| format!("class name contains a NUL byte: {class_name:?}"))?;
+    let method_names: Vec<CString> = methods
+        .iter()
+        .map(|m| {
+            CString::new(m.name)
+                .map_err(|_| format!("method name contains a NUL byte: {:?}", m.name))
+        })
+        .collect::<Result<_, _>>()?;
+    let c_methods: Vec<NativeObjThisMethod> = methods
+        .iter()
+        .zip(&method_names)
+        .map(|(m, n)| NativeObjThisMethod {
+            name: n.as_ptr(),
+            f: m.f,
+        })
+        .collect();
+    let property_names: Vec<CString> = properties
+        .iter()
+        .map(|p| {
+            CString::new(p.name)
+                .map_err(|_| format!("property name contains a NUL byte: {:?}", p.name))
+        })
+        .collect::<Result<_, _>>()?;
+    let c_properties: Vec<NativeObjThisProperty> = properties
+        .iter()
+        .zip(&property_names)
+        .map(|(p, n)| NativeObjThisProperty {
+            name: n.as_ptr(),
+            get: p.get,
+            set: p.set,
+        })
+        .collect();
+    // SAFETY: the engine is live, the names and arrays are valid for the call,
+    // and the C++ side copies what it needs during registration.
+    let rc = unsafe {
+        tjs2_register_native_builtin_static_members(
+            engine.raw() as *mut c_void,
+            class_name_c.as_ptr(),
+            if c_methods.is_empty() {
+                ptr::null()
+            } else {
+                c_methods.as_ptr()
+            },
+            c_methods.len() as c_int,
+            if c_properties.is_empty() {
+                ptr::null()
+            } else {
+                c_properties.as_ptr()
+            },
+            c_properties.len() as c_int,
+        )
+    };
+    if rc != 0 {
+        return Err(format!(
+            "failed to register static members on builtin class '{class_name}' (error {rc})"
+        ));
+    }
+    Ok(())
+}
+
+unsafe extern "C" {
+    /// `cpp/tjs2_abi.cpp`: attach `TJS_STATICMEMBER` objthis members to the
+    /// builtin class object named by `class_name_utf8`. Returns 0 on success,
+    /// non-zero on failure.
+    fn tjs2_register_native_builtin_static_members(
+        e: *mut c_void,
+        class_name_utf8: *const c_char,
+        methods: *const NativeObjThisMethod,
+        count: c_int,
+        properties: *const NativeObjThisProperty,
+        prop_count: c_int,
+    ) -> c_int;
 }
 
 /// Serialize unit tests that create a TJS VM.

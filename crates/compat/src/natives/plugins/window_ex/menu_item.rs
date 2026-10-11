@@ -132,6 +132,7 @@ extern "C" fn menu_right_justify_set(
         // `rj = !!v.AsInteger();` (`reference/cpp/plugins/windowEx.cpp:1084-1088`)
         // with the `AsInteger` coercion rules of
         // `reference/cpp/core/tjs2/tjsVariant.h:862-878`.
+        // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
         match as_bool(unsafe { &*value }) {
             Ok(truthy) => truthy,
             Err(error) => {

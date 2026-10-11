@@ -12,10 +12,16 @@
 //! | `Dictionary` | `saveStruct2`     | write the `saveStruct` form to a file                  |
 //! | `Dictionary` | `toStructString`  | return the `saveStruct` form as a string               |
 //!
-//! The reference attaches these with `NCB_ATTACH_CLASS`; this port uses the
-//! objthis-only instance-member API
+//! The reference attaches these with `NCB_ATTACH_CLASS`. Its `ArrayAdd`
+//! members use no static flag (`reference/cpp/plugins/saveStruct.cpp:310-313`),
+//! so the port registers them as objthis-only instance members
 //! ([`CompatCtx::register_instance_members`](crate::CompatCtx::register_instance_members))
-//! so the callbacks receive the array/dictionary they were invoked on.
+//! and the callbacks receive the array they were invoked on. Its `DictAdd`
+//! members carry `TJS_STATICMEMBER` (`reference/cpp/plugins/saveStruct.cpp:364-366`),
+//! so the port attaches them with
+//! `native_util::register_builtin_static_members`;
+//! they live on the `Dictionary` class object and are not copied onto
+//! instances.
 //!
 //! # The serialized form
 //!
@@ -93,15 +99,6 @@ struct SaveStructState {
 /// VM raises `TJS_E_NOTIMPL` when `instanceof` is applied to a function (or
 /// another non-class object), while the reference's `IsInstanceOf` simply
 /// reports false.
-///
-/// `__krkr_save_struct_dict` skips the members an empty `%[]` already has:
-/// the port attaches non-static instance members to the builtin
-/// `Dictionary` (the `scripts_ex` helpers and this plugin's own members), so
-/// every `Dictionary` instance inherits them and `EnumMembers` reports them.
-/// The reference attaches its own `DictAdd` members as `TJS_STATICMEMBER` and
-/// other plugins to `Scripts`, so its `getDictString` never sees them; the
-/// filter reproduces that observable output without recursing into the
-/// attached methods.
 const SERIALIZER_SCRIPT: &str = r#"
 var __krkr_save_struct_ns = %[];
 
@@ -174,26 +171,15 @@ __krkr_save_struct_ns.__krkr_save_struct_arr = function(a, nl) {
 
 __krkr_save_struct_ns.__krkr_save_struct_dict = function(d, nl) {
     var NL = (nl != 0) ? "\n" : "\r\n";
-    var classpairs = [];
-    classpairs.assign(%[]);
     var pairs = [];
     pairs.assign(d);
     var r = "%[";
     var first = true;
     var i = 0;
     while (i < pairs.count) {
-        var key = pairs[i];
-        var isclass = false;
-        var j = 0;
-        while (j < classpairs.count) {
-            if (classpairs[j] == key) { isclass = true; break; }
-            j = j + 2;
-        }
-        if (!isclass) {
-            if (!first) r = r + "," + NL;
-            first = false;
-            r = r + this.__krkr_save_struct_quote(key) + "=>" + this.__krkr_save_struct_variant(pairs[i + 1], nl);
-        }
+        if (!first) r = r + "," + NL;
+        first = false;
+        r = r + this.__krkr_save_struct_quote(pairs[i]) + "=>" + this.__krkr_save_struct_variant(pairs[i + 1], nl);
         i = i + 2;
     }
     return r + "]";
@@ -586,9 +572,14 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
         properties: vec![],
     })?;
 
-    ctx.register_instance_members(&NativeInstanceMembers {
-        class_name: "Dictionary",
-        methods: vec![
+    // The reference registers `DictAdd`'s members with `TJS_STATICMEMBER`
+    // (`reference/cpp/plugins/saveStruct.cpp:364-366`), so they live on the
+    // `Dictionary` class object and instances never copy or enumerate them.
+    crate::native_util::register_builtin_static_members(
+        // SAFETY: `ctx` is only created for a bound, live engine.
+        unsafe { ctx.engine() },
+        "Dictionary",
+        &[
             NativeObjThisMethodDef {
                 name: "saveStruct2",
                 f: dict_save_struct2,
@@ -598,8 +589,9 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
                 f: dict_to_struct_string,
             },
         ],
-        properties: vec![],
-    })?;
+        &[],
+    )
+    .map_err(CompatError::Register)?;
 
     Ok(())
 }

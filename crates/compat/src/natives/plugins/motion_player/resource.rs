@@ -205,6 +205,7 @@ fn load_module(ctx: &CompatCtx, inst: &mut ResourceInst, path: &str) -> Result<u
     // (`reference/cpp/plugins/motionplayer/ResourceManager.cpp:166-169`);
     // each key holds its own handle to the same TJS object.
     for key in cache_keys(path) {
+        // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `load_module`.
         let duplicate = unsafe { ctx.engine() }
             .duplicate_retained(module.raw_id())
             .map_err(|error| error.to_string())?;
@@ -222,6 +223,7 @@ fn module_object(
     snapshot: Option<&MotionSnapshot>,
 ) -> Result<DetachedValue, String> {
     let object = eval_object(ctx, "%[]")?;
+    // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `module_object`.
     let engine = unsafe { ctx.engine() };
     engine
         .set_member(object.raw_id(), "path", &TjsValue::String(path.to_string()))
@@ -260,6 +262,7 @@ fn install(
     key: &str,
     built: Built,
 ) -> Result<(), String> {
+    // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `install`.
     let engine = unsafe { ctx.engine() };
     match built {
         Built::Scalar(value) => engine
@@ -286,6 +289,7 @@ fn build_psb(ctx: &CompatCtx, value: &PsbValue) -> Result<Built, String> {
         PsbValue::String(value) => Ok(Built::Scalar(TjsValue::String(value.clone()))),
         PsbValue::Array(values) => {
             let array = eval_object(ctx, "[]")?;
+            // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `build_psb`.
             let engine = unsafe { ctx.engine() };
             for (index, value) in values.iter().enumerate() {
                 engine
@@ -354,6 +358,7 @@ extern "C" fn resource_load(
         Ok(_) => {
             if let Some(StoredValue::Object(module)) = inst.last.as_ref() {
                 let ctx = res.ctx();
+                // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `resource_load`.
                 let engine = unsafe { ctx.engine() };
                 if let Ok(copy) = engine.duplicate_retained(module.raw_id()) {
                     set_retained(out, copy);
@@ -609,10 +614,12 @@ extern "C" fn resource_set_decrypt_func(
         return report_error(out_error, "setEmotePSBDecryptFunc: bad parameter count");
     }
     let ctx = res.ctx();
+    // SAFETY: `ctx` is only created for a bound, live engine, so its service pointer is valid for `resource_set_decrypt_func`.
     let mut store = unsafe { ctx.services() }.state::<MotionStore>();
     store.decrypt_func = None;
     if let Some(value) = arguments.first()
         && value.ty == VAL_OBJECT
+        // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `resource_set_decrypt_func`.
         && let Ok(retained) = unsafe { ctx.engine() }.retain_object_arg(value)
     {
         store.decrypt_func = Some(retained);

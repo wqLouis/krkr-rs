@@ -588,6 +588,11 @@ int tjs2_register_native_instance_members(
     const tjs2_native_objthis_method *methods, int count,
     const tjs2_native_objthis_property *properties, int prop_count);
 
+int tjs2_register_native_builtin_static_members(
+    tjs2_engine *e, const char *class_name_utf8,
+    const tjs2_native_objthis_method *methods, int count,
+    const tjs2_native_objthis_property *properties, int prop_count);
+
 /* Allocate with malloc; used to build error strings on the Rust side.
  * Pair with tjs2_free_string. */
 void *tjs2_malloc(size_t size);

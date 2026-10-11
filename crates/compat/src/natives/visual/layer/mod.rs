@@ -171,6 +171,7 @@ extern "C" fn layer_destroy(engine: *mut c_void, instance: *mut c_void) {
     if instance.is_null() {
         return;
     }
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; `layer_destroy` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut LayerInst) };
     if let (Some(id), Ok((_resolved, ctx))) = (inst.id, bound(engine)) {
         // SAFETY: the caller resolved `ctx` from the installed binding.
@@ -203,7 +204,9 @@ extern "C" fn layer_ctor(
     let Ok((resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Layer: compat context is not bound");
     };
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; `layer_ctor` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut LayerInst) };
     if inst.id.is_some() {
         return report_error(out_error, "Layer: this layer is already constructed");
@@ -278,6 +281,7 @@ extern "C" fn layer_set_pos(
     if argc < 2 {
         return report_error(out_error, "Layer.setPos requires 2 arguments");
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     let x = value_as_i64(&a[0]) as i32;
     let y = value_as_i64(&a[1]) as i32;
@@ -288,6 +292,7 @@ extern "C" fn layer_set_pos(
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Layer.setPos: compat context is not bound");
     };
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_set_pos`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         return report_error(out_error, "Layer.setPos: this layer is not constructed");
@@ -324,12 +329,14 @@ extern "C" fn layer_set_size(
     if argc < 2 {
         return report_error(out_error, "Layer.setSize requires 2 arguments");
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     let width = value_as_i64(&a[0]).max(0) as u32;
     let height = value_as_i64(&a[1]).max(0) as u32;
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Layer.setSize: compat context is not bound");
     };
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_set_size`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         return report_error(out_error, "Layer.setSize: this layer is not constructed");
@@ -363,6 +370,7 @@ extern "C" fn layer_set_size_to_image_size(
             "Layer.setSizeToImageSize: compat context is not bound",
         );
     };
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_set_size_to_image_size`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         return report_error(
@@ -401,12 +409,14 @@ extern "C" fn layer_set_image_pos(
     if argc < 2 {
         return report_error(out_error, "Layer.setImagePos requires 2 arguments");
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     let left = value_as_i64(&a[0]) as i32;
     let top = value_as_i64(&a[1]) as i32;
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Layer.setImagePos: compat context is not bound");
     };
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_set_image_pos`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         return report_error(
@@ -469,12 +479,14 @@ extern "C" fn layer_set_image_size(
     if argc < 2 {
         return report_error(out_error, "Layer.setImageSize requires 2 arguments");
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     let width = value_as_i64(&a[0]).max(0) as u32;
     let height = value_as_i64(&a[1]).max(0) as u32;
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Layer.setImageSize: compat context is not bound");
     };
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_set_image_size`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         return report_error(
@@ -673,6 +685,7 @@ extern "C" fn layer_assign_images(
     // non-object, then `NativeInstanceSupport(TJS_NIS_GETINSTANCE,
     // Layer::ClassID)` and `TVPSpecifyLayer` reject the rest
     // (`LayerIntf.cpp:9863-9875`).
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let value = &unsafe { args(argv, argc) }[0];
     if value.ty != VAL_OBJECT {
         return report_error(out_error, "Layer.assignImages: not a Layer object");
@@ -681,6 +694,7 @@ extern "C" fn layer_assign_images(
         Ok(id) if id >= 0 => id as u32,
         _ => return report_error(out_error, "Layer.assignImages: not a Layer object"),
     };
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_assign_images`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         return report_error(
@@ -722,6 +736,7 @@ extern "C" fn layer_copy_from_bitmap_to_main_image(
     };
     let bitmap_id = match resolve_object_id(
         resolved.engine(),
+        // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
         &unsafe { args(argv, argc) }[0],
         &["Bitmap"],
     ) {
@@ -730,6 +745,7 @@ extern "C" fn layer_copy_from_bitmap_to_main_image(
             return report_error(out_error, "Layer.copyFromBitmapToMainImage: not a Bitmap");
         }
     };
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_copy_from_bitmap_to_main_image`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         return report_error(
@@ -778,6 +794,7 @@ extern "C" fn layer_independ_main_image(
             "Layer.independMainImage: compat context is not bound",
         );
     };
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_independ_main_image`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         return report_error(
@@ -822,6 +839,7 @@ extern "C" fn layer_bring_to_front(
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Layer.bringToFront: compat context is not bound");
     };
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_bring_to_front`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         return report_error(
@@ -853,6 +871,7 @@ extern "C" fn layer_set_parent_id(
         return report_error(out_error, "Layer.parent: compat context is not bound");
     };
     let parent = if argc >= 1 {
+        // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
         let value = &unsafe { args(argv, argc) }[0];
         if value.ty == VAL_VOID {
             None
@@ -866,6 +885,7 @@ extern "C" fn layer_set_parent_id(
     } else {
         None
     };
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_set_parent_id`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         return report_error(out_error, "Layer.parent: this layer is not constructed");
@@ -892,6 +912,7 @@ extern "C" fn layer_focus(
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Layer.focus: compat context is not bound");
     };
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_focus`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         return report_error(out_error, "Layer.focus: this layer is not constructed");
@@ -918,6 +939,7 @@ extern "C" fn layer_update(
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Layer.update: compat context is not bound");
     };
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_update`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         return report_error(out_error, "Layer.update: this layer is not constructed");
@@ -986,6 +1008,7 @@ extern "C" fn layer_set_clip(
     if argc < 4 {
         return report_error(out_error, "Layer.setClip requires 4 arguments");
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     let x = value_as_i64(&a[0]) as i32;
     let y = value_as_i64(&a[1]) as i32;
@@ -994,6 +1017,7 @@ extern "C" fn layer_set_clip(
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Layer.setClip: compat context is not bound");
     };
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_set_clip`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         return report_error(out_error, "Layer.setClip: this layer is not constructed");
@@ -1022,6 +1046,7 @@ extern "C" fn layer_get_province_pixel(
     if argc < 2 {
         return report_error(out_error, "Layer.getProvincePixel requires 2 arguments");
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     let x = value_as_i64(&a[0]) as i32;
     let y = value_as_i64(&a[1]) as i32;
@@ -1031,6 +1056,7 @@ extern "C" fn layer_get_province_pixel(
             "Layer.getProvincePixel: compat context is not bound",
         );
     };
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_get_province_pixel`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         return report_error(
@@ -1059,6 +1085,7 @@ extern "C" fn layer_set_province_pixel(
     if argc < 3 {
         return report_error(out_error, "Layer.setProvincePixel requires 3 arguments");
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     let x = value_as_i64(&a[0]) as i32;
     let y = value_as_i64(&a[1]) as i32;
@@ -1069,6 +1096,7 @@ extern "C" fn layer_set_province_pixel(
             "Layer.setProvincePixel: compat context is not bound",
         );
     };
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_set_province_pixel`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         return report_error(
@@ -1099,6 +1127,7 @@ extern "C" fn layer_get_layer_at(
     if argc < 2 {
         return report_error(out_error, "Layer.getLayerAt requires 2 arguments");
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     let x = value_as_i64(&a[0]) as i32;
     let y = value_as_i64(&a[1]) as i32;
@@ -1107,6 +1136,7 @@ extern "C" fn layer_get_layer_at(
     let Ok((resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Layer.getLayerAt: compat context is not bound");
     };
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_get_layer_at`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         return report_error(out_error, "Layer.getLayerAt: this layer is not constructed");
@@ -1137,6 +1167,7 @@ extern "C" fn layer_fill_rect(
     if argc < 5 {
         return report_error(out_error, "Layer.fillRect requires 5 arguments");
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     let x = value_as_i64(&a[0]) as i32;
     let y = value_as_i64(&a[1]) as i32;
@@ -1146,6 +1177,7 @@ extern "C" fn layer_fill_rect(
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Layer.fillRect: compat context is not bound");
     };
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_fill_rect`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         return report_error(out_error, "Layer.fillRect: this layer is not constructed");
@@ -1207,6 +1239,7 @@ fn with_layer_read<R>(
     instance: *mut c_void,
     f: impl FnOnce(&LayerState) -> R,
 ) -> Result<R, String> {
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `with_layer_read`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let id = inst
         .id
@@ -1226,6 +1259,7 @@ fn with_layer_write(
     value: &Value,
     f: impl FnOnce(&mut LayerState, &Value),
 ) -> Result<(), String> {
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `with_layer_write`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let id = inst
         .id
@@ -1519,6 +1553,7 @@ fn layer_cursor_axis(
     axis: &str,
     x_axis: bool,
 ) -> Result<i32, String> {
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_cursor_axis`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let id = inst
         .id
@@ -1603,6 +1638,7 @@ extern "C" fn layer_opacity_set(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
     let value = unsafe { &*value };
     match with_layer_write(engine, instance, value, |l, v| {
         l.opacity = (value_as_i64(v) as f64 / 255.0).clamp(0.0, 1.0) as f32;
@@ -1636,7 +1672,9 @@ extern "C" fn layer_has_image_set(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
     let wanted = value_as_bool(unsafe { &*value });
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_has_image_set`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         return report_error(out_error, "Layer.hasImage: this layer is not constructed");
@@ -1680,6 +1718,7 @@ extern "C" fn layer_main_image_buffer_get(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_main_image_buffer_get`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         set_int(out, 0);
@@ -1708,6 +1747,7 @@ extern "C" fn layer_main_image_buffer_for_write_get(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_main_image_buffer_for_write_get`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         set_int(out, 0);
@@ -1735,6 +1775,7 @@ extern "C" fn layer_main_image_buffer_pitch_get(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_main_image_buffer_pitch_get`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         set_int(out, 0);
@@ -1762,6 +1803,7 @@ extern "C" fn layer_province_image_buffer_get(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_province_image_buffer_get`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         set_int(out, 0);
@@ -1790,6 +1832,7 @@ extern "C" fn layer_province_image_buffer_for_write_get(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_province_image_buffer_for_write_get`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         set_int(out, 0);
@@ -1817,6 +1860,7 @@ extern "C" fn layer_province_image_buffer_pitch_get(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_province_image_buffer_pitch_get`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         set_int(out, 0);
@@ -1874,6 +1918,7 @@ fn layer_node_flag(
     out_error: *mut *mut c_char,
     f: impl Fn(&Scene, u32) -> bool,
 ) -> c_int {
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_node_flag`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         set_bool(out, false);
@@ -1898,6 +1943,7 @@ extern "C" fn layer_focused_get(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_focused_get`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         set_bool(out, false);
@@ -1927,6 +1973,7 @@ extern "C" fn layer_is_primary_get(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_is_primary_get`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         set_bool(out, false);
@@ -1969,7 +2016,9 @@ extern "C" fn layer_name_set(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
     let text = value_as_string(unsafe { &*value });
+    // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
     match with_layer_write(engine, instance, unsafe { &*value }, |l, _| l.name = text) {
         Ok(()) => 0,
         Err(error) => report_error(out_error, &error),
@@ -2002,7 +2051,9 @@ extern "C" fn layer_hint_set(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
     let text = value_as_string(unsafe { &*value });
+    // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
     match with_layer_write(engine, instance, unsafe { &*value }, |l, _| l.hint = text) {
         Ok(()) => 0,
         Err(error) => report_error(out_error, &error),
@@ -2081,6 +2132,7 @@ extern "C" fn layer_children_get(
     let Ok((resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Layer.children: compat context is not bound");
     };
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_children_get`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         return report_error(out_error, "Layer.children: this layer is not constructed");
@@ -2134,6 +2186,7 @@ fn layer_focusable_neighbor(
     let Ok((resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Layer: compat context is not bound");
     };
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_focusable_neighbor`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         return report_error(out_error, "Layer: this layer is not constructed");
@@ -2163,6 +2216,7 @@ extern "C" fn layer_font_get(
         return report_error(out_error, "Layer.font: compat context is not bound");
     };
     let host = resolved.engine();
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; `layer_font_get` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut LayerInst) };
     let Some(id) = inst.id else {
         return report_error(out_error, "Layer.font: this layer is not constructed");
@@ -2233,11 +2287,13 @@ extern "C" fn layer_font_set(
     let Ok((resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Layer.font: compat context is not bound");
     };
+    // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
     let source_id = match resolve_object_id(resolved.engine(), unsafe { &*value }, &["Font"]) {
         Ok(id) if id >= 0 => id as u32,
         Ok(_) => return report_error(out_error, "Layer.font: the value is not a Font"),
         Err(error) => return report_error(out_error, &format!("Layer.font: {error}")),
     };
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_font_set`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(layer_id) = inst.id else {
         return report_error(out_error, "Layer.font: this layer is not constructed");

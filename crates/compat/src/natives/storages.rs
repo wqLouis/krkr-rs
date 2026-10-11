@@ -523,6 +523,7 @@ extern "C" fn native_search_cd(
     if argc < 1 {
         return report_error(out_error, "Storages.searchCD requires 1 argument");
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let _label = value_as_string(&unsafe { args(argv, argc) }[0]);
     let resolved = resolve_or_return!(engine, out_error, "searchCD");
     let ctx = resolved.ctx();
@@ -549,6 +550,7 @@ extern "C" fn native_select_file(
     if argc < 1 {
         return report_error(out_error, "Storages.selectFile requires 1 argument");
     }
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     if a[0].ty != VAL_OBJECT {
         return report_error(

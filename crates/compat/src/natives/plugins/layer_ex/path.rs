@@ -288,6 +288,7 @@ extern "C" fn ctor(
     _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `instance` is the live `PathInst` payload the VM allocated for this script object; `ctor` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut PathInst) };
     inst.data = PathData::default();
     set_void(out);
@@ -323,6 +324,7 @@ extern "C" fn start_figure(
     _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `instance` is the live `PathInst` payload the VM allocated for this script object; `start_figure` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut PathInst) };
     if !matches!(inst.data.figures.last(), Some(figure) if !figure.closed) {
         inst.data.figures.push(Figure::default());
@@ -343,6 +345,7 @@ extern "C" fn close_figure(
     _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `instance` is the live `PathInst` payload the VM allocated for this script object; `close_figure` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut PathInst) };
     if let Some(last) = inst.data.figures.last_mut()
         && !last.closed
@@ -368,6 +371,7 @@ macro_rules! path_scalar_method {
             out_error: *mut *mut c_char,
             _objthis: *mut c_void,
         ) -> c_int {
+            // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
             let a = unsafe { args(argv, argc) };
             if a.len() < $arity {
                 return report_error(
@@ -389,6 +393,7 @@ macro_rules! path_scalar_method {
                 }
             };
             let _ = engine;
+            // SAFETY: `instance` is the live `PathInst` payload the VM allocated for this script object; this callback is its only live accessor.
             let inst = unsafe { &mut *(instance as *mut PathInst) };
             if $closed {
                 inst.data.push_closed(points);
@@ -441,6 +446,7 @@ extern "C" fn draw_arc(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     if a.len() < 6 {
         return report_error(out_error, "Path.drawArc requires 6 arguments");
@@ -449,6 +455,7 @@ extern "C" fn draw_arc(
         Ok(p) => p,
         Err(error) => return report_error(out_error, &format!("Path.drawArc: {error}")),
     };
+    // SAFETY: `instance` is the live `PathInst` payload the VM allocated for this script object; `draw_arc` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut PathInst) };
     inst.data
         .extend(flatten_arc(p[0], p[1], p[2], p[3], p[4], p[5]));
@@ -468,6 +475,7 @@ extern "C" fn draw_pie(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     if a.len() < 6 {
         return report_error(out_error, "Path.drawPie requires 6 arguments");
@@ -479,6 +487,7 @@ extern "C" fn draw_pie(
     let (x, y, w, h) = (p[0], p[1], p[2], p[3]);
     let mut points = flatten_arc(x, y, w, h, p[4], p[5]);
     points.push((x + w / 2.0, y + h / 2.0));
+    // SAFETY: `instance` is the live `PathInst` payload the VM allocated for this script object; `draw_pie` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut PathInst) };
     inst.data.push_closed(points);
     set_void(out);
@@ -498,6 +507,7 @@ extern "C" fn draw_bezier(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     if a.len() < 8 {
         return report_error(out_error, "Path.drawBezier requires 8 arguments");
@@ -507,6 +517,7 @@ extern "C" fn draw_bezier(
         Err(error) => return report_error(out_error, &format!("Path.drawBezier: {error}")),
     };
     let (p0, c1, c2, p3) = ((p[0], p[1]), (p[2], p[3]), (p[4], p[5]), (p[6], p[7]));
+    // SAFETY: `instance` is the live `PathInst` payload the VM allocated for this script object; `draw_bezier` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut PathInst) };
     match cursor(inst) {
         Some(current) => {
@@ -535,6 +546,7 @@ extern "C" fn draw_beziers(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     if a.is_empty() {
         return report_error(out_error, "Path.drawBeziers requires 1 argument");
@@ -542,6 +554,7 @@ extern "C" fn draw_beziers(
     let Ok(points) = super::read_points(engine, &a[0], "Path.drawBeziers") else {
         return report_error(out_error, "Path.drawBeziers: invalid points");
     };
+    // SAFETY: `instance` is the live `PathInst` payload the VM allocated for this script object; `draw_beziers` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut PathInst) };
     let points = beziers_from(&points, cursor(inst));
     inst.data.extend(points);
@@ -561,6 +574,7 @@ extern "C" fn draw_lines(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     if a.is_empty() {
         return report_error(out_error, "Path.drawLines requires 1 argument");
@@ -568,6 +582,7 @@ extern "C" fn draw_lines(
     let Ok(points) = super::read_points(engine, &a[0], "Path.drawLines") else {
         return report_error(out_error, "Path.drawLines: invalid points");
     };
+    // SAFETY: `instance` is the live `PathInst` payload the VM allocated for this script object; `draw_lines` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut PathInst) };
     inst.data.extend(points);
     set_void(out);
@@ -587,6 +602,7 @@ extern "C" fn draw_polygon(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     if a.is_empty() {
         return report_error(out_error, "Path.drawPolygon requires 1 argument");
@@ -594,6 +610,7 @@ extern "C" fn draw_polygon(
     let Ok(points) = super::read_points(engine, &a[0], "Path.drawPolygon") else {
         return report_error(out_error, "Path.drawPolygon: invalid points");
     };
+    // SAFETY: `instance` is the live `PathInst` payload the VM allocated for this script object; `draw_polygon` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut PathInst) };
     inst.data.push_closed(points);
     set_void(out);
@@ -611,6 +628,7 @@ extern "C" fn draw_rectangles(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     if a.is_empty() {
         return report_error(out_error, "Path.drawRectangles requires 1 argument");
@@ -618,6 +636,7 @@ extern "C" fn draw_rectangles(
     let Ok(rects) = super::read_rects(engine, &a[0], "Path.drawRectangles") else {
         return report_error(out_error, "Path.drawRectangles: invalid rectangles");
     };
+    // SAFETY: `instance` is the live `PathInst` payload the VM allocated for this script object; `draw_rectangles` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut PathInst) };
     for (x, y, w, h) in rects {
         inst.data
@@ -644,6 +663,7 @@ macro_rules! path_curve_method {
             out_error: *mut *mut c_char,
             _objthis: *mut c_void,
         ) -> c_int {
+            // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
             let a = unsafe { args(argv, argc) };
             if a.len() < $arity {
                 return report_error(
@@ -668,6 +688,7 @@ macro_rules! path_curve_method {
                     return report_error(out_error, &format!("Path.{}: {error}", stringify!($name)))
                 }
             };
+            // SAFETY: `instance` is the live `PathInst` payload the VM allocated for this script object; this callback is its only live accessor.
             let inst = unsafe { &mut *(instance as *mut PathInst) };
             if $closed {
                 // Reference `drawClosedCurve2` draws all `size` segments and

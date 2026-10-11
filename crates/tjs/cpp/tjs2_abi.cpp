@@ -1764,12 +1764,72 @@ int tjs2_eval(tjs2_engine *e, const char *expression, const char *name,
     }
 }
 
-int tjs2_assign_message(const char *name, const char *message) {
+extern "C" int tjs2_assign_message_checked(const char *name,
+                                          const char *message,
+                                          char **out_error) {
+    if(out_error)
+        *out_error = nullptr;
     if(!name || !message)
         return 0;
-    std::u16string n = utf8_to_u16(name);
-    std::u16string m = utf8_to_u16(message);
-    return TJS::TJSAssignMessage(n.c_str(), m.c_str()) ? 1 : 0;
+    try {
+        std::u16string n = utf8_to_u16(name);
+        std::u16string m = utf8_to_u16(message);
+        return TJS::TJSAssignMessage(n.c_str(), m.c_str()) ? 1 : 0;
+    } catch(const TJS::eTJS &err) {
+        if(out_error)
+            *out_error = make_error_message(err);
+        return -1;
+    } catch(const std::exception &err) {
+        if(out_error) {
+            std::string m = std::string("C++ exception: ") + err.what();
+            char *buf = (char *)malloc(m.size() + 1);
+            if(buf)
+                std::memcpy(buf, m.c_str(), m.size() + 1);
+            *out_error = buf;
+        }
+        return -1;
+    } catch(...) {
+        if(out_error) {
+            char *buf = (char *)malloc(8);
+            if(buf)
+                std::memcpy(buf, "unknown", 8);
+            *out_error = buf;
+        }
+        return -1;
+    }
+}
+
+int tjs2_assign_message(const char *name, const char *message) {
+    return tjs2_assign_message_checked(name, message, nullptr);
+}
+
+// Guarded wrapper over the streams.cpp data-dir setter. The setter assigns a
+// std::string (which can throw std::bad_alloc); this keeps the exception on
+// the C++ side so it cannot cross the C ABI.
+extern "C" int tjs2_set_data_dir_checked(const char *dir, char **out_error) {
+    if(out_error)
+        *out_error = nullptr;
+    try {
+        tjs2_set_data_dir(dir);
+        return 0;
+    } catch(const std::exception &err) {
+        if(out_error) {
+            std::string m = std::string("C++ exception: ") + err.what();
+            char *buf = (char *)malloc(m.size() + 1);
+            if(buf)
+                std::memcpy(buf, m.c_str(), m.size() + 1);
+            *out_error = buf;
+        }
+        return -1;
+    } catch(...) {
+        if(out_error) {
+            char *buf = (char *)malloc(8);
+            if(buf)
+                std::memcpy(buf, "unknown", 8);
+            *out_error = buf;
+        }
+        return -1;
+    }
 }
 
 const char *tjs2_tjs_version_string(void) {
@@ -2500,6 +2560,66 @@ int tjs2_register_native_instance_members(
             dsp->Release();
             hr = classobj->PropSet(TJS_MEMBERENSURE, pname16.c_str(), nullptr,
                                    &pval, classobj);
+            if(TJS_FAILED(hr))
+                return -6;
+        }
+        return 0;
+    } catch(...) {
+        return -4;
+    }
+}
+
+int tjs2_register_native_builtin_static_members(
+    tjs2_engine *e, const char *class_name_utf8,
+    const tjs2_native_objthis_method *methods, int count,
+    const tjs2_native_objthis_property *properties, int prop_count) {
+    if(!e || !class_name_utf8 || count < 0 || (count > 0 && !methods) ||
+       prop_count < 0 || (prop_count > 0 && !properties))
+        return -1;
+    try {
+        std::u16string name16 = utf8_to_u16(class_name_utf8);
+
+        // Same class-object lookup as the instance registration above.
+        iTJSDispatch2 *global = e->inner->GetGlobalNoAddRef();
+        if(!global)
+            return -2;
+        TJS::tTJSVariant class_val;
+        tjs_error hr =
+            global->PropGet(0, name16.c_str(), nullptr, &class_val, global);
+        if(TJS_FAILED(hr))
+            return -2;
+        iTJSDispatch2 *classobj = class_val.AsObjectNoAddRef();
+        if(!classobj)
+            return -2;
+
+        // A static member lives on the class object and is never copied onto
+        // an instance (tTJSNativeClass::FuncCall copies the non-static
+        // symbols only, tjsNative.cpp), so an instance's EnumMembers does
+        // not report it. Its receiver is the global object
+        // (ncbAttachTJS2Class::RegistVariant, ncbind.hpp).
+        for(int i = 0; i < count; i++) {
+            const tjs2_native_objthis_method &m = methods[i];
+            if(!m.name || !m.fn)
+                return -3;
+            std::u16string mname16 = utf8_to_u16(m.name);
+            auto *dsp = new tjs2_objthis_method_dispatch(e, m.fn);
+            TJS::tTJSVariant mval(static_cast<TJS::iTJSDispatch2 *>(dsp));
+            dsp->Release();
+            hr = classobj->PropSet(TJS_MEMBERENSURE | TJS_STATICMEMBER,
+                                   mname16.c_str(), nullptr, &mval, global);
+            if(TJS_FAILED(hr))
+                return -6;
+        }
+        for(int i = 0; i < prop_count; i++) {
+            const tjs2_native_objthis_property &p = properties[i];
+            if(!p.name || (!p.get && !p.set))
+                return -3;
+            std::u16string pname16 = utf8_to_u16(p.name);
+            auto *dsp = new tjs2_objthis_property_dispatch(e, p.get, p.set);
+            TJS::tTJSVariant pval(static_cast<TJS::iTJSDispatch2 *>(dsp));
+            dsp->Release();
+            hr = classobj->PropSet(TJS_MEMBERENSURE | TJS_STATICMEMBER,
+                                   pname16.c_str(), nullptr, &pval, global);
             if(TJS_FAILED(hr))
                 return -6;
         }

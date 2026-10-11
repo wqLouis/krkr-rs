@@ -1625,10 +1625,16 @@ extern "C" fn window_draw_device_set(
     };
     match host.member(object.raw_id(), "interface") {
         Ok(TjsValue::Integer(interface)) if interface != 0 => {
-            let inst = unsafe { &mut *(instance as *mut WindowInst) };
-            // The reference invalidates the previous device object before
-            // storing the new one (`WindowIntf.cpp:255-292`).
-            if let Some(previous) = inst.draw_device.replace(object)
+            // `invalidate_retained` runs the previous object's script
+            // `finalize`, which may read or write `window.drawDevice` and
+            // re-enter this callback, so the `WindowInst` borrow is released
+            // before dispatching. The stored device object is replaced
+            // (`WindowIntf.cpp:255-292`).
+            let previous = {
+                let inst = unsafe { &mut *(instance as *mut WindowInst) };
+                inst.draw_device.replace(object)
+            };
+            if let Some(previous) = previous
                 && let Err(error) = host.invalidate_retained(previous.raw_id())
             {
                 log::warn!("Window.drawDevice: invalidate failed: {error}");
