@@ -134,6 +134,8 @@ pub fn load_font(fs: &FontSystem, bytes: &[u8], index: u32) -> Result<Font, Glyp
 /// * A character the face does not map falls back to U+FFFD and then to
 ///   `.notdef` (glyph 0); [`GlyphError::MissingGlyph`] is returned only when
 ///   the face cannot even outline `.notdef`.
+/// * A glyph the face maps but does not outline (a space, a combining mark)
+///   produces an empty bitmap carrying that glyph's advance.
 /// * [`GlyphStyle::bold`] applies a 1 px rightward coverage dilation and adds
 ///   1 px to the advance.
 /// * [`GlyphStyle::italic`] applies a synthetic oblique shear about the
@@ -141,9 +143,8 @@ pub fn load_font(fs: &FontSystem, bytes: &[u8], index: u32) -> Result<Font, Glyp
 ///
 /// # Errors
 ///
-/// Returns [`GlyphError::Rasterize`] for a non-positive/non-finite `size_px`
-/// or an un-outlineable glyph, and [`GlyphError::MissingGlyph`] for a truly
-/// missing glyph.
+/// Returns [`GlyphError::Rasterize`] for a non-positive/non-finite `size_px`,
+/// and [`GlyphError::MissingGlyph`] for a truly missing glyph.
 pub fn rasterize_glyph(
     fs: &FontSystem,
     font: &Font,
@@ -168,15 +169,14 @@ pub fn rasterize_glyph(
 
     let positioned = id.with_scale_and_position(scale, ab_glyph::point(0.0, 0.0));
     let Some(outline) = scaled.outline_glyph(positioned) else {
-        return Err(if id == GlyphId(0) {
-            GlyphError::MissingGlyph {
+        if id == GlyphId(0) {
+            return Err(GlyphError::MissingGlyph {
                 codepoint: glyph as u32,
-            }
-        } else {
-            GlyphError::Rasterize {
-                message: format!("the face has no outline for U+{:04X}", glyph as u32),
-            }
-        });
+            });
+        }
+        // The face maps this glyph but it has no outline; keep its advance so
+        // the pen still moves.
+        return Ok(GlyphBitmap::new(0, 0, Vec::new(), 0.0, 0.0, advance));
     };
 
     let bounds = outline.px_bounds();

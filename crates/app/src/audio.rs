@@ -16,48 +16,35 @@
 //!
 //! # Buffer/dt policy (the documented decision)
 //!
-//! The buffer is **dt-derived, not fixed-size**: each frame renders exactly
-//! one chunk of `carry + dt_seconds × sample_rate` frames, keeping the
-//! sub-sample remainder in `carry` for the next frame. The carry makes the
-//! mapping sample-accurate over time — no rounding drift accumulates (a
-//! 60 fps loop at 44.1 kHz renders 735 frames per frame forever; an odd rate
-//! like 48 kHz/60 alternates without losing a sample).
+//! The mixer is **render-driven**: [`sound_render`] advances it by the frames
+//! it produces, so the playback cursor is always the end of the audio rendered
+//! so far. Each frame renders one chunk of `carry + dt_seconds × sample_rate`
+//! frames, keeping the sub-sample remainder in `carry` for the next frame. The
+//! carry makes the mapping sample-accurate over time — no rounding drift
+//! accumulates (a 60 fps loop at 44.1 kHz renders 735 frames per frame
+//! forever; an odd rate like 48 kHz/60 alternates without losing a sample).
 //!
-//! This is the correct tiling for this clock arrangement: `sound_poll` owns
-//! the mixer clock (it advances to the L1 monotonic clock), so consecutive
-//! chunks must cover exactly the elapsed `dt` for the output stream to be
-//! contiguous with the mixer's positions. In steady state the chunks tile
-//! gaplessly: no dropped audio, no repeated audio, and the L1 queue depth (and
-//! therefore latency) stays constant — no silent drift. L1 pre-fills that queue
-//! with roughly 150 ms before starting the device and, on underrun, fades the
-//! last per-channel sample to silence over a few milliseconds (see `platform`'s
-//! `audio_queue`), so the constant depth is the reservoir plus one frame —
-//! independent of how the device callback is sized.
+//! Because the cursor is what was rendered, consecutive chunks tile gaplessly
+//! whatever the frame jitter: no dropped audio, no repeated audio, and the L1
+//! queue depth (and therefore latency) stays constant. L1 pre-fills that queue
+//! with roughly 150 ms before starting the device and, on a real underrun,
+//! fades the last per-channel sample to silence over a few milliseconds (see
+//! `platform`'s `audio_queue`), so the constant depth is the reservoir plus one
+//! frame — independent of how the device callback is sized.
 //!
-//! **When a frame runs long**, the mixer clock (`sound_poll`) is wall-driven
-//! and has already skipped the elapsed time while the L1 device drained its
-//! pre-fill and faded to silence (see the L1 queue policy). The audio for
-//! the stalled interval is therefore unrecoverable: a hitch is an audible
-//! skip, not something this layer can render back. The chunk written after the
-//! stall is capped at the configured maximum ([`DEFAULT_MAX_CHUNK_MS`] by
-//! default, `KRKR_RS_AUDIO_MAX_CHUNK_MS`):
-//!
-//! * the elapsed time beyond the cap is *dropped*, reported with a `warn`
-//!   (never silently), and the fractional carry is reset with it;
-//! * because the capped chunk is rendered from the mixer's *current*
-//!   (post-stall) position, at most the cap of already-banked content is
-//!   replayed once right after such a frame. The repeat and the post-hitch
-//!   latency are bounded by the cap instead of growing with the stall, and the
-//!   L1 queue additionally drops oldest samples beyond its two-second bound.
-//!
-//! The cap is a latency/repeat trade-off, not a cure for the stall. A **small**
-//! cap keeps the one-time repeat short, but rebuilds only a small reservoir
-//! after the hitch, so the next slow frame underruns sooner. A **large** cap
-//! covers more of the stall in one write and rebuilds a bigger reservoir, at
-//! the cost of a longer repeat and more post-hitch latency. Removing the repeat
-//! would mean letting the device drive the mixer's playback cursor instead of
-//! the wall clock; the same cursor also drives fade/status timing, so that
-//! change is not local to this module.
+//! **When a frame runs long**, the L1 device drains its pre-fill and underruns
+//! while the frame is stalled; the resumed chunk is still contiguous with the
+//! last rendered audio (the cursor did not move during the stall), so the only
+//! artifact is the inserted silence, smoothed by the L1 fade. One frame may
+//! advance the cursor by at most the configured maximum ([`DEFAULT_MAX_CHUNK_MS`]
+//! by default, `KRKR_RS_AUDIO_MAX_CHUNK_MS`): the elapsed time beyond the cap is
+//! reported with a `warn`, and playback simply falls behind the wall clock by
+//! that much (it does not catch up), so no audio is dropped or repeated and a
+//! single write cannot jump the queue past its bound. A **small** cap keeps the
+//! post-hitch latency low but rebuilds only a small reservoir; a **large** cap
+//! covers more of the hitch in one write at the cost of more latency. The cap
+//! bounds one frame's playback advance; it is not a substitute for the L1
+//! pre-fill.
 //!
 //! The cap defaults to [`DEFAULT_MAX_CHUNK_MS`] and is overridden by the
 //! `KRKR_RS_AUDIO_MAX_CHUNK_MS` environment variable (a positive, finite number
@@ -83,7 +70,7 @@ use std::sync::Arc;
 
 use api::error::AudioError;
 use api::media::AudioSpec;
-use compat::{CompatHost, add_audio_decoder, sound_render};
+use compat::{CompatHost, add_audio_decoder, set_sound_render_driven, sound_render};
 use engine::sound::SoundSource;
 use media::{Media, decode_audio};
 use platform::{AudioDevice, AudioOutputState, PlatformError};
@@ -105,12 +92,11 @@ const HEADLESS_SPEC: AudioSpec = AudioSpec {
     total_frames: None,
 };
 
-/// The default longest single chunk one frame may render (see the module
-/// docs).
+/// The default most playback one frame may advance (see the module docs).
 ///
-/// A stall longer than this drops the excess (with a `warn`) instead of
-/// banking an arbitrarily large buffer, so post-hitch latency and the one-time
-/// content repeat are both bounded. `KRKR_RS_AUDIO_MAX_CHUNK_MS` overrides it.
+/// A longer frame advances at most this much and reports the excess with a
+/// `warn`; playback falls that far behind the wall clock instead of the chunk
+/// dropping or repeating any audio. `KRKR_RS_AUDIO_MAX_CHUNK_MS` overrides it.
 const DEFAULT_MAX_CHUNK_MS: f64 = 250.0;
 
 /// The environment variable that overrides [`DEFAULT_MAX_CHUNK_MS`].
@@ -152,36 +138,29 @@ fn configured_max_chunk_ms() -> Result<f64, PlatformError> {
 struct ChunkPlan {
     /// Whole frames to render.
     frames: usize,
-    /// Milliseconds of elapsed output deliberately not rendered (0 unless the
+    /// Sub-frame remainder to carry into the next frame.
+    carry_frames: f64,
+    /// Milliseconds of this frame deliberately not advanced (0 unless the
     /// frame exceeded the cap).
-    dropped_ms: f64,
+    behind_ms: f64,
 }
 
 /// Plans one frame's mixer chunk.
 ///
-/// `due_frames` is the carried sub-frame remainder plus this frame's elapsed
-/// output, at `rate` Hz; `max_chunk_ms` bounds a single chunk. Returns the
-/// whole frames to render and the milliseconds deliberately not rendered when
-/// the frame exceeds the cap.
-fn plan_chunk(due_frames: f64, max_chunk_ms: f64, rate: f64) -> ChunkPlan {
-    let frames = due_frames.floor();
-    if frames < 1.0 {
-        return ChunkPlan {
-            frames: 0,
-            dropped_ms: 0.0,
-        };
-    }
-    let cap = rate * max_chunk_ms / 1000.0;
-    if frames > cap {
-        ChunkPlan {
-            frames: cap as usize,
-            dropped_ms: (frames - cap) * 1000.0 / rate,
-        }
-    } else {
-        ChunkPlan {
-            frames: frames as usize,
-            dropped_ms: 0.0,
-        }
+/// `dt_ms` is the frame's elapsed time, `carry_frames` the sub-frame remainder
+/// from the previous frame, and `max_chunk_ms` the most playback one frame may
+/// advance. The frame is clamped to the cap *before* the carry is added, so a
+/// long frame advances at most the cap and the excess is reported in
+/// `behind_ms` rather than rendered or carried.
+fn plan_chunk(dt_ms: f64, carry_frames: f64, max_chunk_ms: f64, rate: f64) -> ChunkPlan {
+    let dt_ms = dt_ms.max(0.0);
+    let behind_ms = (dt_ms - max_chunk_ms).max(0.0);
+    let due = carry_frames + dt_ms.min(max_chunk_ms) * rate / 1000.0;
+    let frames = due.floor();
+    ChunkPlan {
+        frames: frames as usize,
+        carry_frames: due - frames,
+        behind_ms,
     }
 }
 
@@ -191,6 +170,7 @@ fn plan_chunk(due_frames: f64, max_chunk_ms: f64, rate: f64) -> ChunkPlan {
 /// stateless [`Media`] backend.
 pub fn install_audio_decoder(host: &CompatHost, media: &Media) {
     let media = media.clone();
+    set_sound_render_driven(host.services(), true);
     add_audio_decoder(
         host.services(),
         Box::new(move |bytes, loops, hint| {
@@ -221,8 +201,8 @@ pub(crate) struct AudioOutput {
     buffer: Vec<f32>,
     /// Sub-sample frame carry for the dt-derived chunk size (no drift).
     carry_frames: f64,
-    /// Longest single chunk one frame may render, in milliseconds (the
-    /// configured cap; see the module docs).
+    /// Most playback one frame may advance, in milliseconds (the configured
+    /// cap; see the module docs).
     max_chunk_ms: f64,
 }
 
@@ -284,28 +264,25 @@ impl AudioOutput {
     /// fails (a malformed output spec), [`GameError::Audio`] when the L1
     /// device rejects the write — both typed, never silent.
     pub(crate) fn pump(&mut self, vm: &VmHost, dt_ms: f64) -> Result<(), GameError> {
-        let rate = f64::from(self.spec.sample_rate);
-        let due = self.carry_frames + dt_ms.max(0.0) * rate / 1000.0;
-        if !due.is_finite() {
+        if !dt_ms.is_finite() {
             self.carry_frames = 0.0;
             log::warn!("audio: non-finite frame duration; skipping this buffer");
             return Ok(());
         }
-        let plan = plan_chunk(due, self.max_chunk_ms, rate);
-        if plan.frames == 0 {
-            // Sub-sample remainder only: carry it and render nothing.
-            self.carry_frames = due;
-            return Ok(());
-        }
-        self.carry_frames = due - plan.frames as f64;
-        if plan.dropped_ms > 0.0 {
+        let rate = f64::from(self.spec.sample_rate);
+        let plan = plan_chunk(dt_ms, self.carry_frames, self.max_chunk_ms, rate);
+        self.carry_frames = plan.carry_frames;
+        if plan.behind_ms > 0.0 {
             log::warn!(
-                "audio: {dt_ms:.1} ms frame exceeds the {:.0} ms chunk cap; \
-                 dropping {:.1} ms of output",
+                "audio: {dt_ms:.1} ms frame exceeds the {:.0} ms playback cap; \
+                 playback falls {:.1} ms behind the wall clock",
                 self.max_chunk_ms,
-                plan.dropped_ms
+                plan.behind_ms
             );
-            self.carry_frames = 0.0;
+        }
+        if plan.frames == 0 {
+            // Sub-frame remainder only: carry it and render nothing.
+            return Ok(());
         }
         let frames = plan.frames;
 
@@ -325,16 +302,12 @@ impl AudioOutput {
 
 #[cfg(test)]
 mod tests {
-    use super::{ChunkPlan, DEFAULT_MAX_CHUNK_MS, plan_chunk};
+    use super::{DEFAULT_MAX_CHUNK_MS, plan_chunk};
 
     /// A 1 kHz stream, so one millisecond is exactly one frame.
     const RATE: f64 = 1_000.0;
     /// A 10 ms cap keeps the 0/1x/5x arithmetic exact.
     const CAP_MS: f64 = 10.0;
-
-    fn plan_for(frame_ms: f64) -> ChunkPlan {
-        plan_chunk(frame_ms * RATE / 1000.0, CAP_MS, RATE)
-    }
 
     #[test]
     fn the_default_cap_is_250_ms() {
@@ -343,38 +316,69 @@ mod tests {
 
     #[test]
     fn a_frame_shorter_than_one_frame_renders_nothing() {
-        // 0x the cap: the elapsed time is sub-frame and stays in the carry.
-        let plan = plan_for(0.0);
+        let plan = plan_chunk(0.0, 0.0, CAP_MS, RATE);
         assert_eq!(plan.frames, 0);
-        assert_eq!(plan.dropped_ms, 0.0);
+        assert_eq!(plan.carry_frames, 0.0);
+        assert_eq!(plan.behind_ms, 0.0);
     }
 
     #[test]
     fn a_frame_at_the_cap_renders_the_whole_chunk() {
-        // 1x the cap: the whole frame renders, nothing is dropped.
-        let plan = plan_for(CAP_MS);
+        let plan = plan_chunk(CAP_MS, 0.0, CAP_MS, RATE);
         assert_eq!(plan.frames, CAP_MS as usize);
-        assert_eq!(plan.dropped_ms, 0.0);
+        assert_eq!(plan.carry_frames, 0.0);
+        assert_eq!(plan.behind_ms, 0.0);
     }
 
     #[test]
-    fn a_frame_five_times_the_cap_drops_the_excess() {
-        // 5x the cap: render one cap and drop the other four.
-        let plan = plan_for(CAP_MS * 5.0);
+    fn a_frame_five_times_the_cap_advances_only_the_cap() {
+        let plan = plan_chunk(CAP_MS * 5.0, 0.0, CAP_MS, RATE);
         assert_eq!(plan.frames, CAP_MS as usize);
         assert!(
-            (plan.dropped_ms - CAP_MS * 4.0).abs() < 1e-9,
-            "expected {:.1} ms dropped, got {:.1}",
+            (plan.behind_ms - CAP_MS * 4.0).abs() < 1e-9,
+            "expected {:.1} ms behind, got {:.1}",
             CAP_MS * 4.0,
-            plan.dropped_ms
+            plan.behind_ms
         );
     }
 
     #[test]
-    fn a_different_cap_changes_the_rendered_chunk() {
-        // The cap is a parameter, so a larger one renders more before dropping.
-        let plan = plan_chunk(CAP_MS * 5.0 * RATE / 1000.0, CAP_MS * 2.0, RATE);
+    fn the_carry_preserves_the_sub_frame_remainder() {
+        // 0.4 ms at 1 kHz is 0.4 frames; three of them render one frame and
+        // carry 0.2.
+        let first = plan_chunk(0.4, 0.0, CAP_MS, RATE);
+        assert_eq!(first.frames, 0);
+        assert!((first.carry_frames - 0.4).abs() < 1e-9);
+        let second = plan_chunk(0.4, first.carry_frames, CAP_MS, RATE);
+        assert_eq!(second.frames, 0);
+        assert!((second.carry_frames - 0.8).abs() < 1e-9);
+        let third = plan_chunk(0.4, second.carry_frames, CAP_MS, RATE);
+        assert_eq!(third.frames, 1);
+        assert!((third.carry_frames - 0.2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_long_frame_does_not_carry_the_excess() {
+        // The excess over the cap is behind, not carried: the next frame
+        // starts fresh.
+        let plan = plan_chunk(CAP_MS * 3.0, 0.0, CAP_MS, RATE);
+        assert_eq!(plan.frames, CAP_MS as usize);
+        assert_eq!(plan.carry_frames, 0.0);
+        assert!((plan.behind_ms - CAP_MS * 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_different_cap_changes_the_advance() {
+        let plan = plan_chunk(CAP_MS * 5.0, 0.0, CAP_MS * 2.0, RATE);
         assert_eq!(plan.frames, (CAP_MS * 2.0) as usize);
-        assert!((plan.dropped_ms - CAP_MS * 3.0).abs() < 1e-9);
+        assert!((plan.behind_ms - CAP_MS * 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_negative_frame_renders_only_the_carry() {
+        let plan = plan_chunk(-5.0, 0.7, CAP_MS, RATE);
+        assert_eq!(plan.frames, 0);
+        assert!((plan.carry_frames - 0.7).abs() < 1e-9);
+        assert_eq!(plan.behind_ms, 0.0);
     }
 }

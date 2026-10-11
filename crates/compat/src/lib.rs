@@ -56,7 +56,9 @@ pub use natives::visual::timer_poll;
 pub use natives::video::{video_advance, video_poll};
 // The built-in `WaveSoundBuffer` poll, plus the host seam that installs the L1
 // media audio decoder (L3 never links a codec).
-pub use natives::sound::{AudioDecoder, add_audio_decoder, sound_poll, sound_render};
+pub use natives::sound::{
+    AudioDecoder, add_audio_decoder, set_sound_render_driven, sound_poll, sound_render,
+};
 // The disc-sound host seam that installs the L1 media audio decoder for
 // `CDDASoundBuffer`/`MIDISoundBuffer` (mirrors [`add_audio_decoder`]).
 pub use natives::cdda_midi::set_disc_audio_decoder;

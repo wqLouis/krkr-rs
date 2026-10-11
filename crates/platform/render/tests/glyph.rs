@@ -164,6 +164,24 @@ fn control_characters_and_bad_sizes_are_handled() {
 }
 
 #[test]
+fn a_mapped_glyph_without_an_outline_keeps_its_advance() {
+    let fs = create_font_system();
+    let Some(font) = load_test_font(&fs) else {
+        return;
+    };
+    // A space is mapped by the face but has no outline; it must draw nothing
+    // and still advance the pen, not fail rasterization.
+    let space = rasterize_glyph(&fs, &font, ' ', 32.0, GlyphStyle::default())
+        .expect("a space is not an error");
+    assert!(space.is_empty(), "a space has no ink");
+    assert_eq!(
+        space.advance,
+        glyph_advance(&fs, &font, ' ', 32.0, GlyphStyle::default())
+    );
+    assert!(space.advance > 0.0, "a space always advances");
+}
+
+#[test]
 fn glyph_scene_construction() {
     let run = GlyphRun {
         atlas: None,

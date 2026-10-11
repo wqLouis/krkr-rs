@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 use api::fs::{FsPath, OpenMode};
 use api::media::{AudioSpec, DecodedAudio};
 use common::vm_lock;
-use compat::{CompatHost, add_audio_decoder, sound_poll, sound_render};
+use compat::{CompatHost, add_audio_decoder, set_sound_render_driven, sound_poll, sound_render};
 use engine::Storage;
 use engine::sound::{LoopInfo, SoundSource};
 use fs::FileSystem;
@@ -1733,4 +1733,51 @@ fn methods_are_callable_on_an_unloaded_buffer() {
     assert_eq!(env.eval_ok("s.onFadeCompleted()"), TjsValue::Void);
     assert_eq!(env.eval_ok("s.onLabel('mid')"), TjsValue::Void);
     assert_eq!(env.eval_ok("s.status"), TjsValue::String("unload".into()));
+}
+
+// ---------------------------------------------------------------------------
+// 14. Render-driven mixer clock (the frame-loop host)
+// ---------------------------------------------------------------------------
+
+/// The reference's playback cursor is the samples the device consumed
+/// (`reference/cpp/core/sound/win32/WaveMixer.cpp:330-366` `FillBuffer` /
+/// `GetCurrentPlaySamples`), never a wall clock. A host that mixes on the
+/// frame loop therefore enables the render-driven mixer
+/// ([`compat::set_sound_render_driven`]): `sound_render` advances the position
+/// by exactly the frames it produced, and `sound_poll` only dispatches events,
+/// so a stalled frame cannot move the position past the audio that was
+/// rendered.
+#[test]
+fn render_driven_mixer_advances_by_the_rendered_frames() {
+    let _lock = vm_lock();
+    let env = Env::fixture(None);
+    set_sound_render_driven(env._host.services(), true);
+    env.run("var s = new WaveSoundBuffer();");
+    env.run("s.open('tone.wav'); s.play();");
+
+    let spec = AudioSpec {
+        sample_rate: TONE_RATE,
+        channels: 1,
+        total_frames: Some(u64::from(TONE_RATE)),
+    };
+    let mut quarter = vec![0.0f32; (TONE_RATE / 4) as usize];
+
+    // A quarter-second render advances the position by exactly 250 ms.
+    {
+        let ctx = env._host.ctx().expect("bound host");
+        sound_render(&ctx, &mut quarter, spec).expect("render");
+    }
+    assert_eq!(env.eval_int("s.position"), 250);
+
+    // A poll over a wall gap must not advance a render-driven position.
+    std::thread::sleep(Duration::from_millis(30));
+    env.poll();
+    assert_eq!(env.eval_int("s.position"), 250);
+
+    // The next render continues from exactly where the previous ended.
+    {
+        let ctx = env._host.ctx().expect("bound host");
+        sound_render(&ctx, &mut quarter, spec).expect("render");
+    }
+    assert_eq!(env.eval_int("s.position"), 500);
 }

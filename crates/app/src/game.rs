@@ -215,10 +215,10 @@ impl GameHost {
     /// Runs one frame: the VM frame body (events, polls, transitions), then
     /// renders and presents.
     ///
-    /// The L1 audio drain runs between the two: after `tick` (whose
-    /// `sound_poll` advanced the mixer to the L1 clock) a dt-derived chunk of
-    /// the mixer is rendered through `compat::sound_render` and written to
-    /// the device (policy documented in the `audio` module).
+    /// The L1 audio drain runs between the two: after `tick` a dt-derived
+    /// chunk of the mixer is rendered through `compat::sound_render` (which
+    /// advances the mixer by the frames it produces) and written to the
+    /// device (policy documented in the `audio` module).
     ///
     /// # Errors
     ///

@@ -481,8 +481,14 @@ pub struct SoundState {
     objects: HashMap<u64, SoundObject>,
     /// Next object id (ids start at 1; 0 is the "not constructed" sentinel).
     next_id: u64,
-    /// The L1 monotonic clock that drives the mixer in [`sound_poll`].
+    /// The L1 monotonic clock that drives the fade beat in [`sound_poll`].
     clock: Clock,
+    /// Milliseconds the clock read at the previous [`sound_poll`].
+    last_poll_ms: u64,
+    /// Whether [`sound_render`] advances the mixer by the frames it produces
+    /// and [`sound_poll`] only dispatches events. The composition root enables
+    /// this when it mixes on the frame loop; see [`set_sound_render_driven`].
+    render_driven: bool,
     /// The installed decoder chain (see [`add_audio_decoder`]).
     decoders: Vec<AudioDecoder>,
     /// Live `PhaseVocoder` filters by `interface` token (the instance
@@ -2629,8 +2635,13 @@ fn advance_and_dispatch(ctx: &mut CompatCtx, dt: f64) -> Result<(), CompatError>
     let mut dispatches: Vec<(Tjs2ValueId, &'static str, Vec<TjsValue>)> = Vec::new();
     {
         let mut state = services.state::<SoundState>();
-        let SoundState { mixer, objects, .. } = &mut *state;
-        if dt > 0.0 {
+        let SoundState {
+            mixer,
+            objects,
+            render_driven,
+            ..
+        } = &mut *state;
+        if dt > 0.0 && !*render_driven {
             mixer.advance(dt);
         }
         for object in objects.values_mut() {
@@ -2699,30 +2710,48 @@ fn advance_and_dispatch(ctx: &mut CompatCtx, dt: f64) -> Result<(), CompatError>
 
 /// The `sound_poll` step of the documented frame body (`compat::frame`).
 ///
-/// Advances the shared mixer to the L1 monotonic clock and forwards the L2
-/// playback events to the object's `onStatusChanged`/`onFadeCompleted`/
-/// `onLabel` handlers. The host calls it once per frame.
+/// Forwards the L2 playback events to the object's `onStatusChanged`/
+/// `onFadeCompleted`/`onLabel` handlers. The host calls it once per frame.
+///
+/// When the mixer is render-driven ([`set_sound_render_driven`]) the render
+/// seam has already advanced it, so this step only dispatches; otherwise it
+/// first advances the shared mixer to the L1 monotonic clock.
 pub fn sound_poll(ctx: &mut CompatCtx) -> Result<(), CompatError> {
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
     let services = unsafe { ctx.services() };
     let dt = {
-        let state = services.state::<SoundState>();
-        let now = state.clock.now_ms() as f64 / 1000.0;
-        // The mixer's internal clock starts at 0, so the first poll advances
-        // by `now`; timestamps that move backwards advance by 0 (the same
-        // rule as `Mixer::advance_to`).
-        (now - state.mixer.clock()).max(0.0)
+        let mut state = services.state::<SoundState>();
+        let now_ms = state.clock.now_ms();
+        // The first poll advances by the time elapsed since 0; timestamps that
+        // move backwards advance by 0 (the same rule as `Mixer::advance_to`).
+        let dt = now_ms.saturating_sub(state.last_poll_ms) as f64 / 1000.0;
+        state.last_poll_ms = now_ms;
+        dt
     };
     advance_and_dispatch(ctx, dt)
+}
+
+/// Selects the mixer clock source.
+///
+/// A host that mixes on the frame loop (the L1 device is fed by
+/// [`sound_render`]) calls this once at startup. The render seam then advances
+/// the mixer by exactly the frames it produces ([`Mixer::mix_advancing`]) and
+/// [`sound_poll`] only dispatches events, so a stalled frame cannot move the
+/// playback position past the audio that was rendered. When disabled, the
+/// frame poll advances the mixer to the L1 clock and [`sound_render`] samples
+/// it without advancing.
+pub fn set_sound_render_driven(services: &CompatServices, enabled: bool) {
+    services.state::<SoundState>().render_driven = enabled;
 }
 
 /// Render the mixer's current output into `out` (interleaved, `out_spec`).
 ///
 /// This is the L3↔L2 side of the playback path: L1 owns the audio device,
 /// L2 owns the mixing ([`Mixer::mix`]), and this is the thin adapter that
-/// hands the composition root a buffer to `write` to the device. It advances
-/// nothing — the frame body runs [`sound_poll`] first so the mixer tracks the
-/// L1 clock, and this call only samples the current mix into `out`.
+/// hands the composition root a buffer to `write` to the device. When the
+/// mixer is render-driven ([`set_sound_render_driven`]) it advances by the
+/// frames it renders ([`Mixer::mix_advancing`]); otherwise it samples the
+/// current mix without advancing and the frame poll owns the clock.
 ///
 /// `out.len()` must be a whole number of frames (`len % channels == 0`); a
 /// partial frame is a typed error rather than a truncated write.
@@ -2740,11 +2769,13 @@ pub fn sound_render(
     }
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
     let services = unsafe { ctx.services() };
-    let state = services.state::<SoundState>();
-    state
-        .mixer
-        .mix(out, out_spec)
-        .map_err(|error| CompatError::Engine(format!("sound_render: {error}")))
+    let mut state = services.state::<SoundState>();
+    let result = if state.render_driven {
+        state.mixer.mix_advancing(out, out_spec)
+    } else {
+        state.mixer.mix(out, out_spec)
+    };
+    result.map_err(|error| CompatError::Engine(format!("sound_render: {error}")))
 }
 
 // ---------------------------------------------------------------------------

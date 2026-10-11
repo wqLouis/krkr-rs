@@ -604,3 +604,61 @@ fn buffer_play_on_carries_flags_to_the_channel() {
         Err(SoundError::NoSource)
     ));
 }
+
+/// The mixer must be sampled at its current position *before* it is advanced.
+/// A frame loop that advances the mixer to the wall clock and then renders
+/// `dt` renders from a position that moved by more (or less) than the rendered
+/// count whenever `dt` jitters, so consecutive chunks leave a gap (or overlap)
+/// of `dt_k − dt_{k−1}` frames — a click at the frame rate. The reference mixes
+/// on the fixed-rate device callback
+/// (`reference/cpp/core/sound/win32/WaveMixer.cpp`), which has no such jitter;
+/// this port makes the mixer render-driven so the cursor advances by exactly
+/// the frames rendered ([`Mixer::mix_advancing`]) and the chunks tile.
+#[test]
+fn the_mixer_must_be_sampled_before_it_is_advanced() {
+    let rate = 1000u32;
+    let frames = 100_000usize;
+    // A ramp: source frame f has value f, so a continuous render of output
+    // index m must read source frame m.
+    let interleaved: Vec<f32> = (0..frames).map(|f| f as f32).collect();
+    let spec = out_spec(rate, 1);
+    let source =
+        Arc::new(SoundSource::new(Arc::new(DecodedAudio::new(spec, interleaved))).expect("source"));
+    let dts = [0.010, 0.031, 0.012, 0.029, 0.011, 0.033, 0.014, 0.027];
+
+    // Render-then-advance: output index m reads source frame m.
+    let mut rendered = Vec::new();
+    let mut position = 0.0f64;
+    for dt in dts {
+        let n = (dt * f64::from(rate)).round() as usize;
+        let mut out = vec![0.0f32; n];
+        mix_source(&source, position, 1.0, 1.0, 0.0, &mut out, spec).unwrap();
+        rendered.extend_from_slice(&out);
+        position += dt;
+    }
+    for (m, sample) in rendered.iter().enumerate() {
+        assert!(
+            (sample - m as f32).abs() < 0.5,
+            "render-then-advance output {m} read source frame {sample}"
+        );
+    }
+
+    // Advance-then-render: the position jumps to the running wall clock, so
+    // the chunks no longer tile and a seam appears.
+    let mut jittered = Vec::new();
+    let mut clock = 0.0f64;
+    for dt in dts {
+        clock += dt;
+        let n = (dt * f64::from(rate)).round() as usize;
+        let mut out = vec![0.0f32; n];
+        mix_source(&source, clock, 1.0, 1.0, 0.0, &mut out, spec).unwrap();
+        jittered.extend_from_slice(&out);
+    }
+    assert!(
+        jittered
+            .iter()
+            .enumerate()
+            .any(|(m, sample)| (sample - m as f32).abs() >= 0.5),
+        "advance-then-render must leave a seam under jitter"
+    );
+}
