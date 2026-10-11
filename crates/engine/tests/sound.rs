@@ -821,6 +821,68 @@ fn streaming_source_returns_none_past_the_end() {
     assert_eq!(source.frame(10_000).unwrap(), None);
 }
 
+/// Reference: the decode thread keeps only a bounded buffer and drops the
+/// consumed prefix (`reference/cpp/core/sound/win32/WaveImpl.cpp:2389-2463`
+/// fills a fixed L2 buffer); materializing the stream for a filter must not
+/// leave a second copy of the file behind.
+#[test]
+fn decode_entire_releases_the_streaming_window() {
+    let (stream, reads, seeks) = CountingStream::ramp(8_000, 1, 100_000);
+    let spec = AudioSpec {
+        sample_rate: 8_000,
+        channels: 1,
+        total_frames: Some(100_000),
+    };
+    let source = SoundSource::streaming(spec, Box::new(stream), None).expect("source");
+
+    let audio = source.decode_entire().expect("decode all");
+    assert_eq!(audio.frame_count(), 100_000);
+    // The length survives the release, so the container's duration is kept.
+    assert_eq!(source.frames(), 100_000);
+
+    // The decoded window was released: a low frame read reseeks and
+    // re-decodes instead of being served from a retained whole file.
+    let seeks_before = seeks.load(Ordering::Relaxed);
+    let reads_before = reads.load(Ordering::Relaxed);
+    assert_eq!(source.frame(0).unwrap().unwrap().0, 0.0);
+    assert!(
+        seeks.load(Ordering::Relaxed) > seeks_before,
+        "the released window must be reseeked"
+    );
+    assert!(
+        reads.load(Ordering::Relaxed) > reads_before,
+        "the first frame must be decoded again"
+    );
+}
+
+/// Reference: the decode thread retains only a bounded window behind the
+/// play cursor, so a forward read does not keep the whole file
+/// (`reference/cpp/core/sound/win32/WaveImpl.cpp:2389-2463`).
+#[test]
+fn forward_reads_release_the_decoded_prefix() {
+    let (stream, _reads, seeks) = CountingStream::ramp(8_000, 1, 1_000_000);
+    let spec = AudioSpec {
+        sample_rate: 8_000,
+        channels: 1,
+        total_frames: Some(1_000_000),
+    };
+    let source = SoundSource::streaming(spec, Box::new(stream), None).expect("source");
+
+    // Read sequentially across several one-second retention windows.
+    let end = 8_000u64 * 5;
+    for frame in 0..end {
+        assert_eq!(source.frame(frame).unwrap().unwrap().0, frame as f32);
+    }
+    // The consumed prefix is gone: returning to frame 0 must reseek instead
+    // of being served from a file-long window.
+    let before = seeks.load(Ordering::Relaxed);
+    assert_eq!(source.frame(0).unwrap().unwrap().0, 0.0);
+    assert!(
+        seeks.load(Ordering::Relaxed) > before,
+        "the consumed prefix must have been released"
+    );
+}
+
 /// The mixer reads by absolute frame index, so a streaming source must render
 /// exactly like a materialized buffer of the same samples.
 #[test]

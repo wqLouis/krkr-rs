@@ -56,11 +56,12 @@
 //! ## State
 //!
 //! Everything here is explicit caller-owned state: [`TextEngine`] holds the
-//! shaping system and the registered faces, and [`GlyphAtlas`] holds the
-//! atlas texture, its CPU mirror and the glyph cache. There are no globals,
-//! no statics and no hidden caches.
+//! shaping system and the registered faces, [`GlyphAtlas`] holds the atlas
+//! texture, its CPU mirror and the glyph cache, and [`TextCoverageCache`]
+//! holds the rasterized character masks and their blurred shadows. There are
+//! no globals, no statics and no hidden caches.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use api::geometry::{PixelRegion, RectF};
@@ -76,12 +77,13 @@ use crate::layer_ops::{RectI, intersect_rect};
 use cosmic_text::fontdb;
 use cosmic_text::{Attrs, Buffer, Family, FontSystem as CosmicFontSystem, Metrics, Shaping};
 
-/// Maximum number of shaped layouts memoized by [`TextEngine`].
+/// Maximum number of entries held by each L2 text memo.
 ///
-/// The layout cache is a pure memo of shaping results: it changes only how
-/// often `cosmic-text` runs, never the glyphs it returns. When the bound is
-/// reached the whole map is dropped, which keeps the cache simple and bounded.
-const MAX_LAYOUT_CACHE_ENTRIES: usize = 512;
+/// Reference: the `tTVPFontCache` character-cache limit `TVP_CH_MAX_CACHE_COUNT`
+/// (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:108`). It bounds both
+/// the rasterized character masks ([`TextCoverageCache`]) and the shaped-layout
+/// memo ([`TextEngine`]).
+const MAX_TEXT_CACHE_ENTRIES: usize = 1300;
 
 /// Preferred Japanese-capable CJK sans face used when a requested family is
 /// not installed on the host.
@@ -276,7 +278,9 @@ impl TextLayout {
 ///
 /// `coverage` holds exactly `width * height` row-major bytes, where `0` is
 /// fully transparent and `255` fully covered. The constructor enforces that
-/// invariant, so a mask is always internally consistent.
+/// invariant, so a mask is always internally consistent. The coverage buffer is
+/// reference-counted so placing the same mask at a different pen position is a
+/// cheap handle copy, not a pixel copy.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub struct CoverageMask {
@@ -284,7 +288,7 @@ pub struct CoverageMask {
     y: f32,
     width: u32,
     height: u32,
-    coverage: Vec<u8>,
+    coverage: Arc<Vec<u8>>,
 }
 
 impl CoverageMask {
@@ -313,7 +317,7 @@ impl CoverageMask {
             y,
             width,
             height,
-            coverage,
+            coverage: Arc::new(coverage),
         })
     }
 
@@ -339,7 +343,7 @@ impl CoverageMask {
 
     /// The row-major `width * height` coverage bytes.
     pub fn coverage(&self) -> &[u8] {
-        &self.coverage
+        self.coverage.as_slice()
     }
 
     /// Returns `true` when the mask has no pixels.
@@ -390,6 +394,9 @@ pub struct TextEngine {
     system_fonts: Option<fontdb::Database>,
     /// Memoized shaped layouts, keyed by shaping inputs only.
     layout_cache: HashMap<LayoutKey, TextLayout>,
+    /// Insertion order of the layout memo, oldest first, for eviction at the
+    /// reference limit.
+    layout_order: VecDeque<LayoutKey>,
 }
 
 impl TextEngine {
@@ -410,6 +417,7 @@ impl TextEngine {
             by_name: HashMap::new(),
             system_fonts: None,
             layout_cache: HashMap::new(),
+            layout_order: VecDeque::new(),
         }
     }
 
@@ -664,9 +672,12 @@ impl TextEngine {
             }
         };
 
-        if self.layout_cache.len() >= MAX_LAYOUT_CACHE_ENTRIES {
-            self.layout_cache.clear();
+        if self.layout_cache.len() >= MAX_TEXT_CACHE_ENTRIES
+            && let Some(oldest) = self.layout_order.pop_front()
+        {
+            self.layout_cache.remove(&oldest);
         }
+        self.layout_order.push_back(key.clone());
         self.layout_cache.insert(key, layout.clone());
         Ok(layout)
     }
@@ -1237,8 +1248,194 @@ pub fn compose_text_cpu(
     out
 }
 
+/// Cache key for one rasterized character mask in [`TextCoverageCache`].
+///
+/// Reference: `tTVPFontAndCharacterData`
+/// (`reference/cpp/core/visual/CharacterData.h:89-115`) keys `tTVPFontCache`
+/// by the face (`tTVPFont`: height, flags, angle, face), the character,
+/// `Antialiased`, `BlurLevel`, `BlurWidth`, `Blured` and `Hinting`. The sharp
+/// character and its blurred shadow are separate entries distinguished by
+/// `blur`; the rotation is absent because a cached mask is unrotated and a
+/// draw rotates it while blitting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct CoverageKey {
+    /// Registered face index.
+    font: usize,
+    /// Code point.
+    codepoint: char,
+    /// `size_px.to_bits()` (so the key stays `Eq`).
+    size_bits: u32,
+    /// Synthetic bold.
+    bold: bool,
+    /// Synthetic italic.
+    italic: bool,
+    /// Coverage antialiasing.
+    antialias: bool,
+    /// `None` for the sharp character; `Some((blur_level, blur_width))` for
+    /// the blurred shadow (the reference `Blured` plus its blur parameters).
+    blur: Option<(u8, i32)>,
+}
+
+impl CoverageKey {
+    /// The key of the sharp, unblurred character.
+    fn sharp(font: FontId, codepoint: char, style: &TextStyle, antialias: bool) -> Self {
+        Self {
+            font: font.0,
+            codepoint,
+            size_bits: style.size_px.to_bits(),
+            bold: style.bold,
+            italic: style.italic,
+            antialias,
+            blur: None,
+        }
+    }
+
+    /// The key of the blurred shadow of the same character.
+    fn blurred(
+        font: FontId,
+        codepoint: char,
+        style: &TextStyle,
+        antialias: bool,
+        blur_level: u8,
+        blur_width: i32,
+    ) -> Self {
+        Self {
+            blur: Some((blur_level, blur_width)),
+            ..Self::sharp(font, codepoint, style, antialias)
+        }
+    }
+}
+
+/// L2-owned cache of rasterized character masks and their blurred shadows.
+///
+/// Reference: the `tTVPFontCache` character cache (`TVP_CH_MAX_CACHE_COUNT`;
+/// `reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:222-232`). Its
+/// `TVPGetCharacter` (`LayerBitmapImpl.cpp:244-320`) looks a character up by
+/// `CoverageKey` and, on a miss, rasterizes it and (when the font is blurred)
+/// applies `tTVPCharacterData::Blur` (`reference/cpp/core/visual/CharacterData.cpp:118-165`)
+/// before inserting, so both the sharp character and its shadow are reused by a
+/// later draw. The type is explicit caller-owned state; there is no global
+/// cache.
+///
+/// Eviction is insertion-order (FIFO): the `order` queue is appended on every
+/// insert and the front entry is removed at the limit. The reference's
+/// `FindAndTouchWithHash` instead promotes a hit to most-recently-used before
+/// `ChopLast` trims the least-recently-used
+/// (`reference/cpp/core/tjs2/tjsHashSearch.h:358-364,424-433`).
+#[derive(Default)]
+pub struct TextCoverageCache {
+    /// Cached masks keyed by [`CoverageKey`].
+    entries: HashMap<CoverageKey, CoverageMask>,
+    /// Insertion order, oldest first, for eviction at the reference limit.
+    order: VecDeque<CoverageKey>,
+    /// Number of masks produced by rasterization; a diagnostic for tests.
+    rasterizations: u64,
+}
+
+impl TextCoverageCache {
+    /// Creates an empty cache.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The number of cached masks.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Returns `true` when the cache holds no mask.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// The number of glyphs rasterized through this cache.
+    ///
+    /// Used by tests and diagnostics; the value never affects rendering.
+    pub fn rasterizations(&self) -> u64 {
+        self.rasterizations
+    }
+
+    /// Drops every cached mask.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+    }
+
+    /// Inserts `mask` under `key`, evicting the oldest entry when the
+    /// reference limit is reached.
+    fn insert(&mut self, key: CoverageKey, mask: CoverageMask) {
+        if self.entries.len() >= MAX_TEXT_CACHE_ENTRIES
+            && let Some(oldest) = self.order.pop_front()
+        {
+            self.entries.remove(&oldest);
+        }
+        self.order.push_back(key);
+        self.entries.insert(key, mask);
+    }
+}
+
+/// Places a pen-relative (cached) mask at `glyph`'s pen position.
+///
+/// The cached mask stores only the glyph's bearings, so the same coverage is
+/// reused at any pen position; this adds the layout's `x`/`baseline_y`. The
+/// coverage buffer is shared, not copied.
+fn position_mask(mask: &CoverageMask, glyph: &LaidOutGlyph) -> CoverageMask {
+    CoverageMask {
+        x: glyph.x + mask.x,
+        y: glyph.baseline_y + mask.y,
+        width: mask.width,
+        height: mask.height,
+        coverage: Arc::clone(&mask.coverage),
+    }
+}
+
+/// Rasterizes one glyph into a cached pen-relative sharp mask, rasterizing it
+/// only on a miss.
+///
+/// `None` means the glyph has no ink (a space or a mapped glyph without an
+/// outline); the empty result is cached so a repeated draw does not rasterize
+/// it again.
+fn sharp_coverage(
+    cache: &mut TextCoverageCache,
+    engine: &TextEngine,
+    glyph: &LaidOutGlyph,
+    style: &TextStyle,
+    antialias: bool,
+) -> Result<Option<CoverageMask>, TextError> {
+    let key = CoverageKey::sharp(glyph.font, glyph.codepoint, style, antialias);
+    if let Some(cached) = cache.entries.get(&key) {
+        if cached.is_empty() {
+            return Ok(None);
+        }
+        return Ok(Some(cached.clone()));
+    }
+    let bitmap = engine.rasterize_glyph(glyph.font, glyph.codepoint, style)?;
+    cache.rasterizations += 1;
+    if bitmap.is_empty() || !bitmap.is_consistent() {
+        cache.insert(key, CoverageMask::new(0.0, 0.0, 0, 0, Vec::new())?);
+        return Ok(None);
+    }
+    let mut coverage = bitmap.coverage;
+    if !antialias {
+        for value in &mut coverage {
+            *value = if *value >= 128 { 255 } else { 0 };
+        }
+    }
+    // The mask is relative to the pen, not the layout, so it is reusable at
+    // any position.
+    let mask = CoverageMask::new(
+        bitmap.bearing_x,
+        -bitmap.bearing_y,
+        bitmap.width,
+        bitmap.height,
+        coverage,
+    )?;
+    cache.insert(key, mask.clone());
+    Ok(Some(mask))
+}
+
 /// Rasterizes every glyph of `layout` into its own 8-bit coverage mask,
-/// positioned in the text's local coordinate space.
+/// positioned in the text's local coordinate space, reusing `cache`.
 ///
 /// Each glyph keeps its own mask (rather than one mask for the whole run) so
 /// a caller can blur or transform one character without bleeding into its
@@ -1252,6 +1449,7 @@ pub fn compose_text_cpu(
 ///
 /// Propagates [`TextEngine::rasterize_glyph`]'s errors.
 pub fn rasterize_text_coverage(
+    cache: &mut TextCoverageCache,
     engine: &TextEngine,
     layout: &TextLayout,
     style: &TextStyle,
@@ -1259,23 +1457,9 @@ pub fn rasterize_text_coverage(
 ) -> Result<Vec<CoverageMask>, TextError> {
     let mut masks = Vec::with_capacity(layout.glyphs.len());
     for glyph in &layout.glyphs {
-        let bitmap = engine.rasterize_glyph(glyph.font, glyph.codepoint, style)?;
-        if bitmap.is_empty() || !bitmap.is_consistent() {
-            continue;
+        if let Some(mask) = sharp_coverage(cache, engine, glyph, style, antialias)? {
+            masks.push(position_mask(&mask, glyph));
         }
-        let mut coverage = bitmap.coverage;
-        if !antialias {
-            for value in &mut coverage {
-                *value = if *value >= 128 { 255 } else { 0 };
-            }
-        }
-        masks.push(CoverageMask::new(
-            glyph.x + bitmap.bearing_x,
-            glyph.baseline_y - bitmap.bearing_y,
-            bitmap.width,
-            bitmap.height,
-            coverage,
-        )?);
     }
     // A run whose non-whitespace characters all rasterize to no ink means the
     // resolved face cannot render them; report a typed error instead of
@@ -1289,6 +1473,55 @@ pub fn rasterize_text_coverage(
         return Err(TextError::Glyph(api::error::GlyphError::MissingGlyph {
             codepoint: glyph.codepoint as u32,
         }));
+    }
+    Ok(masks)
+}
+
+/// Blurs every glyph of `layout` with the reference character-blur kernel,
+/// returning the cached shadow masks positioned in the text's local coordinate
+/// space.
+///
+/// The blurred mask is derived from the cached sharp coverage, so a shadow
+/// never rasterizes a glyph a second time. The reference caches the blurred
+/// character beside the sharp one: `TVPGetCharacter` applies
+/// `tTVPCharacterData::Blur` before inserting when `font.Blured` is set
+/// (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:244-320`) and
+/// `DrawTextSingle`/`DrawText` request it by setting `font.Blured = true`
+/// (`LayerBitmapImpl.cpp:1114-1200,1300-1400`).
+///
+/// # Errors
+///
+/// Propagates [`rasterize_text_coverage`]'s errors and
+/// [`TextError::MaskTooLarge`].
+pub fn blurred_text_coverage(
+    cache: &mut TextCoverageCache,
+    engine: &TextEngine,
+    layout: &TextLayout,
+    style: &TextStyle,
+    antialias: bool,
+    blur_level: u8,
+    blur_width: i32,
+) -> Result<Vec<CoverageMask>, TextError> {
+    let mut masks = Vec::with_capacity(layout.glyphs.len());
+    for glyph in &layout.glyphs {
+        let key = CoverageKey::blurred(
+            glyph.font,
+            glyph.codepoint,
+            style,
+            antialias,
+            blur_level,
+            blur_width,
+        );
+        if let Some(cached) = cache.entries.get(&key) {
+            masks.push(position_mask(cached, glyph));
+            continue;
+        }
+        let Some(sharp) = sharp_coverage(cache, engine, glyph, style, antialias)? else {
+            continue;
+        };
+        let blurred = blur_coverage(&sharp, blur_level, blur_width)?;
+        cache.insert(key, blurred.clone());
+        masks.push(position_mask(&blurred, glyph));
     }
     Ok(masks)
 }
@@ -1468,13 +1701,15 @@ pub fn blit_coverage_into(
     Some(drawn)
 }
 
-/// Composites one laid-out run of text directly into `bitmap`, source-over.
+/// Composites a run of already-rasterized glyph masks directly into `bitmap`,
+/// source-over.
 ///
 /// Unlike [`compose_text_cpu`], this needs no [`GlyphAtlas`] or render
-/// pipeline: it rasterizes each glyph through the L1 rasterizer and blends the
-/// tinted coverage into the existing bitmap in place. That is the CPU path a
-/// script-visible `Layer.drawText`/`ImageFunction.drawText` needs, since those
-/// natives run without a renderer.
+/// pipeline: it blends the tinted coverage into the existing bitmap in place.
+/// That is the CPU path a script-visible `Layer.drawText`/`ImageFunction.drawText`
+/// needs, since those natives run without a renderer. The masks are the sharp
+/// coverage [`rasterize_text_coverage`] already produced, so the main pass does
+/// not rasterize the glyphs a second time.
 ///
 /// `origin` is the pen start in bitmap coordinates. `angle` rotates each
 /// glyph's rasterized box around `origin`, in radians. `clip` is a half-open
@@ -1485,28 +1720,22 @@ pub fn blit_coverage_into(
 ///
 /// # Errors
 ///
-/// Returns [`TextError::UnknownFont`], [`TextError::InvalidSize`] or
-/// [`TextError::Glyph`] for an unregistered face, a bad size or a
-/// rasterization failure.
-#[allow(clippy::too_many_arguments)]
+/// Returns [`TextError::InvalidSize`] for a bad text size.
 pub fn compose_text_into(
-    engine: &TextEngine,
-    layout: &TextLayout,
+    masks: &[CoverageMask],
     style: &TextStyle,
     origin: (f32, f32),
     angle: f32,
     bitmap: &mut BitmapState,
     clip: RectI,
     opacity: u8,
-    antialias: bool,
 ) -> Result<Option<RectI>, TextError> {
     if !(style.size_px.is_finite() && style.size_px > 0.0) {
         return Err(TextError::InvalidSize(style.size_px));
     }
     let (sin, cos) = angle.sin_cos();
-    let masks = rasterize_text_coverage(engine, layout, style, antialias)?;
     let mut ink: Option<RectI> = None;
-    for mask in &masks {
+    for mask in masks {
         let (rot_x, rot_y) = if angle == 0.0 {
             (mask.x, mask.y)
         } else {
@@ -1738,11 +1967,132 @@ mod tests {
             height: 0.0,
             line_height: 0.0,
         };
-        let error = rasterize_text_coverage(&engine, &layout, &style, true)
+        let mut cache = TextCoverageCache::new();
+        let error = rasterize_text_coverage(&mut cache, &engine, &layout, &style, true)
             .expect_err("an inked-less non-whitespace run must not render blank");
         assert!(matches!(
             error,
             TextError::Glyph(api::error::GlyphError::MissingGlyph { .. })
         ));
+    }
+
+    /// Reference: `TVPGetCharacter` looks a character up in `tTVPFontCache`
+    /// keyed by `tTVPFontAndCharacterData` (face, character, `Antialiased`,
+    /// `BlurLevel`, `BlurWidth`, `Blured`, `Hinting`;
+    /// `reference/cpp/core/visual/CharacterData.h:89-115`) and, on a miss,
+    /// rasterizes it and, when `font.Blured` is set, applies
+    /// `tTVPCharacterData::Blur` before inserting
+    /// (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:222-232,244-320`).
+    /// A repeated draw therefore reuses the cached mask instead of outlining
+    /// the glyph again, and the shadow is derived from that cached coverage.
+    #[test]
+    fn coverage_cache_reuses_a_rasterized_character() {
+        let Some(bytes) = load_test_font() else {
+            return;
+        };
+        let mut engine = TextEngine::new();
+        let Ok(font) = engine.add_font(&bytes, 0) else {
+            return;
+        };
+        let style = TextStyle::new(24.0);
+        let layout = engine
+            .layout(font, "A", &style, None)
+            .expect("layout of a single Latin glyph");
+        let mut cache = TextCoverageCache::new();
+
+        let first = rasterize_text_coverage(&mut cache, &engine, &layout, &style, true)
+            .expect("first rasterization");
+        let after_first = cache.rasterizations();
+        assert_eq!(after_first, 1, "the first draw rasterizes the glyph");
+
+        let second = rasterize_text_coverage(&mut cache, &engine, &layout, &style, true)
+            .expect("second rasterization");
+        assert_eq!(
+            cache.rasterizations(),
+            after_first,
+            "a repeated draw must reuse the cached coverage"
+        );
+        assert_eq!(first, second, "the cached mask must be identical");
+
+        // The shadow is blurred from the cached sharp coverage, so it does
+        // not rasterize the glyph a second time.
+        let blurred = blurred_text_coverage(&mut cache, &engine, &layout, &style, true, 255, 1)
+            .expect("shadow rasterization");
+        assert_eq!(
+            cache.rasterizations(),
+            after_first,
+            "the shadow must reuse the cached sharp coverage"
+        );
+        assert!(!blurred.is_empty(), "the shadow has ink");
+        assert_ne!(blurred, first, "the blurred mask is expanded");
+
+        // The cached mask is pen-relative, so the same character at two pen
+        // positions reuses one rasterization at each correct position.
+        let pair = engine
+            .layout(font, "AA", &style, None)
+            .expect("layout of two Latin glyphs");
+        let both = rasterize_text_coverage(&mut cache, &engine, &pair, &style, true)
+            .expect("reuse across positions");
+        assert_eq!(
+            cache.rasterizations(),
+            after_first,
+            "the second position must reuse the cached coverage"
+        );
+        assert_eq!(both.len(), 2);
+        assert_ne!(both[0].x(), both[1].x(), "each glyph keeps its own pen x");
+        assert_eq!(both[0].coverage(), both[1].coverage());
+    }
+
+    /// Reference: `tTVPFontCache` bounds the character cache at
+    /// `TVP_CH_MAX_CACHE_COUNT` and trims it one entry at a time
+    /// (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:108,222-232`). The
+    /// layout memo uses the same reference-derived bound, so exceeding it must
+    /// evict incrementally: the map stays at the bound, never empties, and
+    /// keeps the most recent layout while dropping the oldest.
+    #[test]
+    fn layout_memo_evicts_incrementally_at_the_reference_bound() {
+        let Some(bytes) = load_test_font() else {
+            return;
+        };
+        let mut engine = TextEngine::new();
+        let Ok(font) = engine.add_font(&bytes, 0) else {
+            return;
+        };
+        let style = TextStyle::new(16.0);
+        let wrap: Option<f32> = None;
+
+        let key_for = |text: &str| LayoutKey {
+            font,
+            text: text.to_owned(),
+            size_bits: style.size_px.to_bits(),
+            bold: style.bold,
+            italic: style.italic,
+            wrap_bits: wrap.map(f32::to_bits),
+        };
+
+        let mut texts = Vec::with_capacity(MAX_TEXT_CACHE_ENTRIES + 1);
+        for index in 0..=MAX_TEXT_CACHE_ENTRIES {
+            let text = index.to_string();
+            engine
+                .layout(font, &text, &style, wrap)
+                .expect("layout of a distinct label");
+            texts.push(text);
+        }
+
+        assert_eq!(
+            engine.cached_layouts(),
+            MAX_TEXT_CACHE_ENTRIES,
+            "the memo must stay at the reference bound, not shrink to zero"
+        );
+        assert!(
+            !engine.layout_cache.contains_key(&key_for(&texts[0])),
+            "the oldest layout must be evicted first"
+        );
+        assert!(
+            engine
+                .layout_cache
+                .contains_key(&key_for(texts.last().expect("inserted a layout"))),
+            "the most recent layout must survive eviction"
+        );
     }
 }

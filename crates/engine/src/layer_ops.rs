@@ -2292,14 +2292,18 @@ fn subtree_opacity(scene: &Scene, id: u32, root: u32) -> f32 {
     opacity
 }
 
-/// Allocate `root`'s subtree cache bitmap at `w` x `h`, reusing the existing
-/// one when its size already matches.
-fn ensure_layer_cache(scene: &mut Scene, root: u32, w: u32, h: u32) -> Option<u32> {
-    if let Some(id) = scene.layer(root)?.cache_bitmap {
+/// Allocate `root`'s composited subtree content at `w` x `h`, reusing the
+/// existing one when its size already matches. A newly allocated content is
+/// marked for recomposition.
+fn ensure_layer_content(scene: &mut Scene, root: u32, w: u32, h: u32) -> Option<u32> {
+    if let Some(id) = scene.layer(root)?.cache_content {
         if scene.bitmap(id).map(|b| (b.width, b.height)) == Some((w, h)) {
             return Some(id);
         }
         scene.remove_bitmap(id);
+        if scene.layer(root)?.cache_bitmap == Some(id) {
+            scene.set_cache_bitmap(root, None);
+        }
     }
     let bytes = (w as usize).checked_mul(h as usize)?.checked_mul(4)?;
     let mut rgba = Vec::new();
@@ -2308,8 +2312,84 @@ fn ensure_layer_cache(scene: &mut Scene, root: u32, w: u32, h: u32) -> Option<u3
     }
     rgba.resize(bytes, 0);
     let id = scene.add_bitmap(w, h, rgba);
-    scene.layer_mut(root)?.cache_bitmap = Some(id);
+    let layer = scene.layer_mut_untracked(root)?;
+    layer.cache_content = Some(id);
+    layer.cache_recalc = true;
     Some(id)
+}
+
+/// Drop `root`'s composited content and its transition frame. The two can be
+/// the same bitmap (the source endpoint draws its content); it is released
+/// once.
+fn release_subtree_caches(scene: &mut Scene, root: u32) {
+    let (content, display) = match scene.layer_mut_untracked(root) {
+        Some(layer) => (layer.cache_content.take(), layer.cache_bitmap.take()),
+        None => return,
+    };
+    if display != content
+        && let Some(display) = display
+    {
+        scene.release_bitmap(display);
+    }
+    if let Some(content) = content {
+        scene.release_bitmap(content);
+    }
+}
+
+/// Allocate or reuse `root`'s transition frame at `w` x `h`: the bitmap a
+/// whole-subtree transition blends into, which the projection draws in place
+/// of the layer's subtree. Distinct from the composited content so the blend
+/// never overwrites the content it reads.
+pub fn ensure_transition_display(scene: &mut Scene, root: u32, w: u32, h: u32) -> Option<u32> {
+    if let Some(id) = scene.layer(root)?.cache_bitmap
+        && scene.bitmap(id).map(|b| (b.width, b.height)) == Some((w, h))
+    {
+        return Some(id);
+    }
+    let stale = scene.layer_mut_untracked(root)?.cache_bitmap.take();
+    if let Some(old) = stale {
+        scene.release_bitmap(old);
+    }
+    let bytes = (w as usize).checked_mul(h as usize)?.checked_mul(4)?;
+    let mut rgba = Vec::new();
+    if rgba.try_reserve_exact(bytes).is_err() {
+        return None;
+    }
+    rgba.resize(bytes, 0);
+    let id = scene.add_bitmap(w, h, rgba);
+    scene.set_cache_bitmap(root, Some(id));
+    Some(id)
+}
+
+/// Sum of the drawn source images' [`BitmapState::content_generation`] for
+/// `root`'s subtree. It mirrors the visibility filter of
+/// [`collect_subtree_draws`] so a change to a hidden layer does not
+/// invalidate the cache, while any image edit to a drawn layer does (even
+/// one that did not go through a layer accessor).
+fn subtree_source_generation(scene: &Scene, root: u32) -> u64 {
+    let Some(root_layer) = scene.layer(root) else {
+        return 0;
+    };
+    let window = root_layer.window;
+    let mut sum = 0u64;
+    for id in scene.window_layer_order(window) {
+        if id != root && !is_descendant(scene, id, root) {
+            continue;
+        }
+        let Some(layer) = scene.layer(id) else {
+            continue;
+        };
+        if id != root && !(layer.visible && layer.opacity != 0.0) {
+            continue;
+        }
+        if id != root && (subtree_opacity(scene, id, root) * 255.0).round() == 0.0 {
+            continue;
+        }
+        if let Some(bitmap) = layer.bitmap.and_then(|bitmap| scene.bitmap(bitmap)) {
+            sum = sum.wrapping_add(bitmap.content_generation);
+        }
+    }
+    sum
 }
 
 /// One resolved draw for the subtree cache, with the layer's own placement
@@ -2511,22 +2591,23 @@ fn collect_subtree_draws(scene: &Scene, root: u32, w: u32, h: u32) -> Vec<Subtre
 }
 
 /// Render `root`'s own image and the visible layers of its subtree into the
-/// layer's cache bitmap — the reference `tTJSNI_BaseLayer::Complete`
+/// layer's composited content — the reference `tTJSNI_BaseLayer::Complete`
 /// (`LayerIntf.cpp:7673-7755`). Returns the bitmap to use as the layer's
-/// rendered content:
+/// rendered content, reusing it while the subtree is unchanged (the
+/// `CacheRecalcRegion.GetCount() == 0` early return, `:7734-7737`):
 ///
 /// * the layer's MainImage when the subtree is trivial: no visible direct
 ///   child, the image at the origin, and the image size equal to the layer
 ///   rect (`LayerIntf.cpp:7718-7725`);
-/// * otherwise the cache bitmap, freshly composited back to front over a
-///   transparent background.
+/// * otherwise the composited content bitmap, rebuilt only when the subtree
+///   changed.
 ///
 /// A layer with no MainImage is not a special case: the reference fill is
 /// transparent wherever no child drew (`LayerIntf.cpp:7217-7226`), which the
 /// transparent clear reproduces. Returns `None` for an unknown layer or a
-/// cache that cannot be allocated.
+/// content bitmap that cannot be allocated.
 ///
-/// The cache is a plain `BitmapState` in the scene: there is no hidden
+/// The content is a plain `BitmapState` in the scene: there is no hidden
 /// registry, and the caller owns its lifetime through
 /// [`Scene::inc_cache_enabled_count`] / [`Scene::dec_cache_enabled_count`].
 pub fn render_layer_subtree(scene: &mut Scene, root: u32) -> Option<u32> {
@@ -2545,71 +2626,75 @@ pub fn render_layer_subtree(scene: &mut Scene, root: u32) -> Option<u32> {
         (layer.bitmap, w, h, trivial)
     };
     if trivial {
-        // A cache rendered for an earlier, non-trivial frame is no longer the
-        // layer's content: release it so the projection falls back to the
-        // MainImage (`Complete` returns `MainImage` in this case,
-        // `LayerIntf.cpp:7718-7725`).
-        let stale = scene
-            .layer_mut(root)
-            .and_then(|layer| layer.cache_bitmap.take());
-        if let Some(stale) = stale {
-            scene.release_bitmap(stale);
-        }
+        // `Complete` returns `MainImage` here (`LayerIntf.cpp:7718-7725`), so
+        // any content composited for an earlier, non-trivial frame is stale.
+        release_subtree_caches(scene, root);
         return bitmap;
     }
-    let cache = ensure_layer_cache(scene, root, w, h)?;
-    let draws = collect_subtree_draws(scene, root, w, h);
-    let target = scene.bitmap_mut(cache)?;
-    target.rgba.fill(0);
-    let full = (i32::MIN, i32::MIN, i32::MAX, i32::MAX);
-    for draw in &draws {
-        let src = &draw.source;
-        if draw.dw == src.width as i32 && draw.dh == src.height as i32 {
-            match draw.mode {
-                0 => {}
-                1 if draw.opa == 255 => {
-                    blit_copy_clipped(target, draw.dx, draw.dy, src, draw.src, full);
+    let content = ensure_layer_content(scene, root, w, h)?;
+    let current_generation = subtree_source_generation(scene, root);
+    let (recalc, recorded) = {
+        let layer = scene.layer(root)?;
+        (layer.cache_recalc, layer.cache_source_generation)
+    };
+    if recalc || current_generation != recorded {
+        let draws = collect_subtree_draws(scene, root, w, h);
+        let target = scene.bitmap_mut(content)?;
+        target.rgba.fill(0);
+        let full = (i32::MIN, i32::MIN, i32::MAX, i32::MAX);
+        for draw in &draws {
+            let src = &draw.source;
+            if draw.dw == src.width as i32 && draw.dh == src.height as i32 {
+                match draw.mode {
+                    0 => {}
+                    1 if draw.opa == 255 => {
+                        blit_copy_clipped(target, draw.dx, draw.dy, src, draw.src, full);
+                    }
+                    1 | 2 | 13 => blit_over(
+                        target,
+                        draw.dx,
+                        draw.dy,
+                        src,
+                        draw.src,
+                        full,
+                        draw.opa,
+                        false,
+                        draw.hold_alpha,
+                    ),
+                    mode => operate_rect(
+                        target,
+                        draw.dx,
+                        draw.dy,
+                        src,
+                        draw.src,
+                        mode,
+                        draw.opa,
+                        draw.hold_alpha,
+                    ),
                 }
-                1 | 2 | 13 => blit_over(
+            } else {
+                stretch_blit_mode(
                     target,
-                    draw.dx,
-                    draw.dy,
+                    (
+                        draw.dx,
+                        draw.dy,
+                        draw.dx.saturating_add(draw.dw),
+                        draw.dy.saturating_add(draw.dh),
+                    ),
                     src,
                     draw.src,
-                    full,
-                    draw.opa,
-                    false,
-                    draw.hold_alpha,
-                ),
-                mode => operate_rect(
-                    target,
-                    draw.dx,
-                    draw.dy,
-                    src,
-                    draw.src,
-                    mode,
+                    1, // stFastLinear
+                    draw.mode,
                     draw.opa,
                     draw.hold_alpha,
-                ),
+                );
             }
-        } else {
-            stretch_blit_mode(
-                target,
-                (
-                    draw.dx,
-                    draw.dy,
-                    draw.dx.saturating_add(draw.dw),
-                    draw.dy.saturating_add(draw.dh),
-                ),
-                src,
-                draw.src,
-                1, // stFastLinear
-                draw.mode,
-                draw.opa,
-                draw.hold_alpha,
-            );
+        }
+        target.mark_dirty();
+        if let Some(layer) = scene.layer_mut_untracked(root) {
+            layer.cache_recalc = false;
+            layer.cache_source_generation = current_generation;
         }
     }
-    target.mark_dirty();
-    Some(cache)
+    Some(content)
 }

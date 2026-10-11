@@ -248,3 +248,124 @@ fn render_layer_subtree_selects_the_layer_face() {
         "the province plane is drawn"
     );
 }
+
+/// `Complete` returns the existing `CacheBitmap` while `CacheRecalcRegion` is
+/// empty (`CacheRecalcRegion.GetCount() == 0`), so an unchanged subtree is
+/// not recomposited.
+///
+/// reference/cpp/core/visual/LayerIntf.cpp:7734-7737
+#[test]
+fn render_layer_subtree_reuses_the_cache_until_the_subtree_changes() {
+    let mut scene = Scene::default();
+    let win = scene.add_window("t", (2, 2));
+    let parent = scene.add_layer(win, None);
+    scene.layer_mut(parent).unwrap().rect = Rect::new(0, 0, 2, 2);
+    let child = scene.add_layer(win, Some(parent));
+    let child_bitmap = solid_bitmap(&mut scene, 2, 2, [10, 20, 30, 255]);
+    {
+        let l = scene.layer_mut(child).unwrap();
+        l.rect = Rect::new(0, 0, 2, 2);
+        l.visible = true;
+        l.bitmap = Some(child_bitmap);
+    }
+
+    let content = render_layer_subtree(&mut scene, parent).expect("content bitmap");
+    scene.set_bitmap_clean(content);
+    // No change: the same composited content is returned and not rebuilt.
+    assert_eq!(render_layer_subtree(&mut scene, parent), Some(content));
+    assert!(
+        !scene.bitmap(content).unwrap().dirty,
+        "an unchanged subtree is not recomposited"
+    );
+
+    // The child's placement changed: `Update` appends to the ancestor's
+    // `CacheRecalcRegion` and the next `Complete` recomposites.
+    //
+    // reference/cpp/core/visual/LayerIntf.cpp:6305-6335
+    // reference/cpp/core/visual/LayerIntf.cpp:6254
+    scene.layer_mut(child).unwrap().rect = Rect::new(1, 0, 2, 2);
+    scene.set_bitmap_clean(content);
+    assert_eq!(render_layer_subtree(&mut scene, parent), Some(content));
+    let bitmap = scene.bitmap(content).unwrap();
+    assert!(bitmap.dirty, "a moved child recomposites the cache");
+    assert_eq!(&bitmap.rgba[0..4], &[0, 0, 0, 0], "the vacated pixel");
+    assert_eq!(&bitmap.rgba[4..8], &[10, 20, 30, 255], "the moved child");
+}
+
+/// An image edit that does not go through a layer accessor (the `Layer` pixel
+/// natives borrow the scene's bitmap vec directly) still invalidates the
+/// cache: the composited content records the source images'
+/// `content_generation` and recomposites when it changes.
+///
+/// reference/cpp/core/visual/LayerIntf.cpp:6305-6335
+#[test]
+fn render_layer_subtree_rebuilds_when_a_drawn_image_changes() {
+    let mut scene = Scene::default();
+    let win = scene.add_window("t", (2, 2));
+    let parent = scene.add_layer(win, None);
+    scene.layer_mut(parent).unwrap().rect = Rect::new(0, 0, 2, 2);
+    let child = scene.add_layer(win, Some(parent));
+    let child_bitmap = solid_bitmap(&mut scene, 2, 2, [10, 20, 30, 255]);
+    {
+        let l = scene.layer_mut(child).unwrap();
+        l.rect = Rect::new(0, 0, 2, 2);
+        l.visible = true;
+        l.bitmap = Some(child_bitmap);
+    }
+
+    let content = render_layer_subtree(&mut scene, parent).expect("content bitmap");
+    scene.set_bitmap_clean(content);
+    {
+        let bitmap = scene.bitmap_mut(child_bitmap).expect("child bitmap");
+        bitmap.rgba[..4].copy_from_slice(&[200, 100, 50, 255]);
+        bitmap.mark_dirty();
+    }
+    assert_eq!(render_layer_subtree(&mut scene, parent), Some(content));
+    let bitmap = scene.bitmap(content).unwrap();
+    assert!(
+        bitmap.dirty,
+        "a changed source image recomposites the cache"
+    );
+    assert_eq!(&bitmap.rgba[..4], &[200, 100, 50, 255]);
+}
+
+/// A change to a hidden layer does not invalidate the cache, matching
+/// `UpdateChildRegion`'s visible-child guard.
+///
+/// reference/cpp/core/visual/LayerIntf.cpp:6249-6256
+#[test]
+fn render_layer_subtree_ignores_hidden_child_changes() {
+    let mut scene = Scene::default();
+    let win = scene.add_window("t", (2, 2));
+    let parent = scene.add_layer(win, None);
+    scene.layer_mut(parent).unwrap().rect = Rect::new(0, 0, 2, 2);
+    let visible = scene.add_layer(win, Some(parent));
+    let visible_bitmap = solid_bitmap(&mut scene, 2, 2, [10, 20, 30, 255]);
+    {
+        let l = scene.layer_mut(visible).unwrap();
+        l.rect = Rect::new(0, 0, 2, 2);
+        l.visible = true;
+        l.bitmap = Some(visible_bitmap);
+    }
+    let hidden = scene.add_layer(win, Some(parent));
+    let hidden_bitmap = solid_bitmap(&mut scene, 2, 2, [1, 2, 3, 255]);
+    {
+        let l = scene.layer_mut(hidden).unwrap();
+        l.rect = Rect::new(0, 0, 2, 2);
+        l.visible = false;
+        l.bitmap = Some(hidden_bitmap);
+    }
+
+    let content = render_layer_subtree(&mut scene, parent).expect("content bitmap");
+    scene.set_bitmap_clean(content);
+    {
+        let bitmap = scene.bitmap_mut(hidden_bitmap).expect("hidden bitmap");
+        bitmap.rgba[..4].copy_from_slice(&[9, 9, 9, 255]);
+        bitmap.mark_dirty();
+    }
+    assert_eq!(render_layer_subtree(&mut scene, parent), Some(content));
+    assert!(
+        !scene.bitmap(content).unwrap().dirty,
+        "a hidden child's image change is not composited"
+    );
+}

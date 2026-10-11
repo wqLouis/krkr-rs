@@ -154,10 +154,27 @@ pub struct LayerState {
     /// into [`Self::cache_bitmap`]. Nonzero makes the projection draw the
     /// cache in place of the layer's own image and descendants.
     pub cache_enabled_count: u32,
-    /// The subtree cache allocated while `cache_enabled_count` is nonzero
-    /// (the reference `CacheBitmap`). `None` until the layer first needs
-    /// one; freed with the last [`Scene::dec_cache_enabled_count`].
+    /// The bitmap a whole-subtree transition draws its frame into. `None`
+    /// until the transition first needs one; freed with the last
+    /// [`Scene::dec_cache_enabled_count`]. It is distinct from
+    /// [`Self::cache_content`] so the blend never overwrites the content it
+    /// reads.
     pub cache_bitmap: Option<u32>,
+    /// The composited subtree content while `cache_enabled_count` is nonzero
+    /// (the reference `CacheBitmap` returned by `Complete`). `None` until
+    /// the layer first needs one; freed with the last
+    /// [`Scene::dec_cache_enabled_count`].
+    pub cache_content: Option<u32>,
+    /// Reference `CacheRecalcRegion`: the subtree content must be
+    /// recomposited before it is used again. Set for this layer and every
+    /// caching ancestor whenever the layer changes, and cleared when the
+    /// content is recomposited.
+    pub cache_recalc: bool,
+    /// Sum of the source images' [`BitmapState::content_generation`] when
+    /// [`Self::cache_content`] was last composited. A change to a drawn
+    /// image that did not go through a layer accessor is detected by
+    /// comparing this value with the current sum.
+    pub cache_source_generation: u64,
     /// Reference `Hint` (script `layer.hint`) and the hint-system flags.
     pub hint: String,
     /// Reference `ShowParentHint`: inherit the parent's hint.
@@ -229,6 +246,12 @@ pub struct BitmapState {
     /// destroying the layer must not free it while the script object can
     /// still read it.
     pub script_owned: bool,
+    /// Monotonic pixel-change counter, bumped whenever the pixels may have
+    /// changed (a mutable access or [`BitmapState::mark_dirty`]). A
+    /// composited subtree cache records the sum over its source images so an
+    /// image edit that did not go through a layer accessor still invalidates
+    /// the cache.
+    pub content_generation: u64,
 }
 
 impl BitmapState {
@@ -244,6 +267,7 @@ impl BitmapState {
             dirty: false,
             screen_buffer: false,
             script_owned: false,
+            content_generation: 0,
         }
     }
 
@@ -251,6 +275,7 @@ impl BitmapState {
     /// relying on a renderer-specific upload mechanism.
     pub fn mark_dirty(&mut self) {
         self.dirty = true;
+        self.content_generation = self.content_generation.wrapping_add(1);
     }
 
     /// Return the byte offset of a pixel, or `None` outside the bitmap.
@@ -388,8 +413,11 @@ impl Scene {
         self.windows.iter().find(|w| w.id == id)
     }
 
-    /// Mutably look up a window by id, bumping [`Scene::revision`].
+    /// Mutably look up a window by id, bumping [`Scene::revision`]. A window
+    /// mutation can change the root render order, so the subtree caches of
+    /// its layers are marked stale.
     pub fn window_mut(&mut self, id: u32) -> Option<&mut WindowState> {
+        self.invalidate_window_cache(id);
         self.touch();
         let index = self
             .window_index
@@ -482,6 +510,9 @@ impl Scene {
             cached: false,
             cache_enabled_count: 0,
             cache_bitmap: None,
+            cache_content: None,
+            cache_recalc: false,
+            cache_source_generation: 0,
             hint: String::new(),
             show_parent_hint: false,
             ignore_hint_sensing: false,
@@ -549,9 +580,50 @@ impl Scene {
             .is_some_and(|window| window.primary_layer == Some(id))
     }
 
-    /// Mutably look up a layer by id, bumping [`Scene::revision`].
+    /// Mark every layer of `window` as having a stale subtree cache.
+    fn invalidate_window_cache(&mut self, window: u32) {
+        for layer in &mut self.layers {
+            if layer.window == window {
+                layer.cache_recalc = true;
+            }
+        }
+    }
+
+    /// Reference `tTJSNI_BaseLayer::UpdateChildRegion`
+    /// (`LayerIntf.cpp:6236-6258`): mark `id`'s subtree cache and every
+    /// caching ancestor's as stale because this layer changed. A malformed
+    /// parent cycle terminates after the pool of layers is exhausted.
+    fn invalidate_layer_cache(&mut self, id: u32) {
+        let limit = self.layers.len().saturating_add(1);
+        let mut current = Some(id);
+        let mut steps = 0usize;
+        while let Some(c) = current {
+            if steps > limit {
+                break;
+            }
+            steps += 1;
+            current = match self.layer_mut_untracked(c) {
+                Some(layer) => {
+                    layer.cache_recalc = true;
+                    layer.parent
+                }
+                None => break,
+            };
+        }
+    }
+
+    /// Mutably look up a layer by id, bumping [`Scene::revision`]. The
+    /// layer's subtree cache and every caching ancestor's are marked stale
+    /// (`tTJSNI_BaseLayer::Update`, `LayerIntf.cpp:6305-6335`).
     pub fn layer_mut(&mut self, id: u32) -> Option<&mut LayerState> {
+        self.invalidate_layer_cache(id);
         self.touch();
+        self.layer_mut_untracked(id)
+    }
+
+    /// Mutably look up a layer by id without marking any subtree cache
+    /// stale. Used for cache bookkeeping that is not a content change.
+    pub(crate) fn layer_mut_untracked(&mut self, id: u32) -> Option<&mut LayerState> {
         let index = self
             .layer_index
             .get(&id)
@@ -824,12 +896,13 @@ impl Scene {
         let Some(layer) = self.layer(id) else {
             return;
         };
-        let (win, parent, font_id, bitmap, cache_bitmap) = (
+        let (win, parent, font_id, bitmap, cache_bitmap, cache_content) = (
             layer.window,
             layer.parent,
             layer.font_id,
             layer.bitmap,
             layer.cache_bitmap,
+            layer.cache_content,
         );
         let children = layer.children.clone();
         // `Part()`: sever this layer from its parent (or the window roots).
@@ -869,8 +942,13 @@ impl Scene {
             self.release_bitmap(bitmap);
         }
         // The subtree cache is layer-owned too; release it with the layer.
-        if let Some(cache) = cache_bitmap {
+        if cache_bitmap != cache_content
+            && let Some(cache) = cache_bitmap
+        {
             self.release_bitmap(cache);
+        }
+        if let Some(content) = cache_content {
+            self.release_bitmap(content);
         }
         // The removed layer owns its lazily-allocated font; drop it with the
         // layer (a surviving child keeps its own font).
@@ -993,6 +1071,7 @@ impl Scene {
             }
         }
         let window = self.layer(id).map(|layer| layer.window);
+        let parent = self.layer(id).and_then(|layer| layer.parent);
         // Fonts are keyed by their own font id (layer.font_id), so collect the
         // doomed layers' font ids before the layers disappear.
         let doomed_fonts: Vec<u32> = self
@@ -1008,7 +1087,13 @@ impl Scene {
             .layers
             .iter()
             .filter(|layer| doomed.contains(&layer.id))
-            .flat_map(|layer| layer.bitmap.into_iter().chain(layer.cache_bitmap))
+            .flat_map(|layer| {
+                layer
+                    .bitmap
+                    .into_iter()
+                    .chain(layer.cache_bitmap)
+                    .chain(layer.cache_content)
+            })
             .collect();
         // Drop the doomed ids from every surviving layer's child list and
         // focus search state.
@@ -1025,6 +1110,11 @@ impl Scene {
             }
         }
         self.layers.retain(|layer| !doomed.contains(&layer.id));
+        // The surviving parent lost its doomed children: its subtree cache
+        // and every caching ancestor's are now stale.
+        if let Some(parent) = parent {
+            self.invalidate_layer_cache(parent);
+        }
         for bitmap in doomed_bitmaps {
             self.release_bitmap(bitmap);
         }
@@ -1376,6 +1466,7 @@ impl Scene {
             dirty: true,
             screen_buffer: false,
             script_owned: false,
+            content_generation: 0,
         });
         self.touch();
         id
@@ -1611,30 +1702,36 @@ impl Scene {
     /// Whether any live layer still references `id` as its MainImage or its
     /// subtree cache.
     pub fn bitmap_referenced_by_layer(&self, id: u32) -> bool {
-        self.layers
-            .iter()
-            .any(|layer| layer.bitmap == Some(id) || layer.cache_bitmap == Some(id))
+        self.layers.iter().any(|layer| {
+            layer.bitmap == Some(id)
+                || layer.cache_bitmap == Some(id)
+                || layer.cache_content == Some(id)
+        })
     }
 
     /// Reference `tTJSNI_BaseLayer::IncCacheEnabledCount`
     /// (`LayerIntf.cpp:3996`): register one consumer that needs this layer's
-    /// subtree rendered into its cache. The cache bitmap itself is
-    /// allocated by [`crate::layer_ops::render_layer_subtree`] on the first
-    /// render. Returns the new count (`0` for an unknown layer).
+    /// subtree rendered into its cache. The composited content and the
+    /// transition frame are allocated by
+    /// [`crate::layer_ops::render_layer_subtree`] on the first render and by
+    /// [`crate::layer_ops::ensure_transition_display`]. Returns the new count
+    /// (`0` for an unknown layer).
     pub fn inc_cache_enabled_count(&mut self, id: u32) -> u32 {
         let Some(layer) = self.layer_mut(id) else {
             return 0;
         };
         layer.cache_enabled_count = layer.cache_enabled_count.saturating_add(1);
+        layer.cache_recalc = true;
         layer.cache_enabled_count
     }
 
     /// Reference `tTJSNI_BaseLayer::DecCacheEnabledCount`
-    /// (`LayerIntf.cpp:4008`): release one cache consumer. The cache bitmap
-    /// is freed with the last one. Returns the new count (`0` for an unknown
-    /// layer).
+    /// (`LayerIntf.cpp:4008`): release one cache consumer. The composited
+    /// content and the transition frame are freed with the last one. Returns
+    /// the new count (`0` for an unknown layer).
     pub fn dec_cache_enabled_count(&mut self, id: u32) -> u32 {
-        let count = match self.layer_mut(id) {
+        self.touch();
+        let count = match self.layer_mut_untracked(id) {
             Some(layer) => {
                 layer.cache_enabled_count = layer.cache_enabled_count.saturating_sub(1);
                 layer.cache_enabled_count
@@ -1642,11 +1739,17 @@ impl Scene {
             None => return 0,
         };
         if count == 0 {
-            let cache = self
-                .layer_mut(id)
-                .and_then(|layer| layer.cache_bitmap.take());
-            if let Some(cache) = cache {
-                self.release_bitmap(cache);
+            let (display, content) = match self.layer_mut_untracked(id) {
+                Some(layer) => (layer.cache_bitmap.take(), layer.cache_content.take()),
+                None => (None, None),
+            };
+            if display != content
+                && let Some(display) = display
+            {
+                self.release_bitmap(display);
+            }
+            if let Some(content) = content {
+                self.release_bitmap(content);
             }
         }
         count
@@ -1680,6 +1783,15 @@ impl Scene {
         false
     }
 
+    /// Release a script object's claim on `id` and free the image when no
+    /// layer still references it. Returns true when the bitmap was removed.
+    pub fn release_script_bitmap(&mut self, id: u32) -> bool {
+        if let Some(bitmap) = self.bitmaps.iter_mut().find(|bitmap| bitmap.id == id) {
+            bitmap.script_owned = false;
+        }
+        self.release_bitmap(id)
+    }
+
     /// Release every bitmap whose last holder has gone away. Returns the
     /// number freed. Per-layer release in [`Scene::remove_layer`] /
     /// [`Scene::destroy_layer`] is the normal path; this sweep is for a
@@ -1707,7 +1819,9 @@ impl Scene {
         self.bitmaps.iter().find(|b| b.id == id)
     }
 
-    /// Mutably look up a bitmap by id, bumping [`Scene::revision`].
+    /// Mutably look up a bitmap by id, bumping [`Scene::revision`] and the
+    /// bitmap's [`BitmapState::content_generation`] (every mutable access is
+    /// a possible content change).
     pub fn bitmap_mut(&mut self, id: u32) -> Option<&mut BitmapState> {
         self.touch();
         let index = self
@@ -1715,9 +1829,60 @@ impl Scene {
             .get(&id)
             .copied()
             .filter(|&index| self.bitmaps.get(index).is_some_and(|b| b.id == id));
-        match index {
+        let mut bitmap = match index {
             Some(index) => self.bitmaps.get_mut(index),
             None => self.bitmaps.iter_mut().find(|b| b.id == id),
+        };
+        if let Some(state) = bitmap.as_mut() {
+            state.content_generation = state.content_generation.wrapping_add(1);
+        }
+        bitmap
+    }
+
+    /// Borrow `dst` mutably and `src1`/`src2` immutably at the same time. The
+    /// two sources may alias each other. Returns `None` when an id is missing
+    /// or `dst` aliases a source; callers then take a copying path. Unlike
+    /// [`Scene::bitmap_mut`] this does not bump [`Scene::revision`]: a
+    /// whole-subtree transition rewrites the same frame bitmap every tick
+    /// without changing the scene graph.
+    pub fn bitmap_mut_with_refs(
+        &mut self,
+        dst: u32,
+        src1: u32,
+        src2: u32,
+    ) -> Option<(&mut BitmapState, &BitmapState, &BitmapState)> {
+        let di = self.bitmaps.iter().position(|b| b.id == dst)?;
+        let a = self.bitmaps.iter().position(|b| b.id == src1)?;
+        let b = self.bitmaps.iter().position(|b| b.id == src2)?;
+        if di == a || di == b {
+            return None;
+        }
+        let (left, right) = self.bitmaps.split_at_mut(di);
+        let (dst_slice, right) = right.split_at_mut(1);
+        let a_ref: &BitmapState = if a < di { &left[a] } else { &right[a - di - 1] };
+        let b_ref: &BitmapState = if b < di { &left[b] } else { &right[b - di - 1] };
+        Some((&mut dst_slice[0], a_ref, b_ref))
+    }
+
+    /// Set the frame bitmap a whole-subtree transition draws, without
+    /// touching the composited content. Bumps [`Scene::revision`] only when
+    /// the id actually changes. The replaced bitmap is released once nothing
+    /// else references it.
+    pub fn set_cache_bitmap(&mut self, id: u32, bitmap: Option<u32>) {
+        let mut replaced = None;
+        let changed = match self.layer_mut_untracked(id) {
+            Some(layer) if layer.cache_bitmap != bitmap => {
+                replaced = layer.cache_bitmap;
+                layer.cache_bitmap = bitmap;
+                true
+            }
+            _ => false,
+        };
+        if changed {
+            self.touch();
+            if let Some(old) = replaced {
+                self.release_bitmap(old);
+            }
         }
     }
 
@@ -1910,5 +2075,33 @@ impl Scene {
         for child in children {
             self.append_layer_subtree(window, child, all_children, order, visited);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The layer owns its cache bitmap and must free the replaced one: the
+    /// reference deletes `CacheBitmap` in `DeallocateCache` and never drops
+    /// the pointer without deleting the old object
+    /// (`reference/cpp/core/visual/LayerIntf.cpp:3975-3979`).
+    #[test]
+    fn set_cache_bitmap_releases_the_replaced_bitmap() {
+        let mut scene = Scene::default();
+        let win = scene.add_window("t", (2, 2));
+        let layer = scene.add_layer(win, None);
+        let old = scene.add_bitmap(2, 2, vec![1u8; 16]);
+        let new = scene.add_bitmap(2, 2, vec![2u8; 16]);
+
+        scene.set_cache_bitmap(layer, Some(old));
+        assert!(scene.bitmap(old).is_some());
+        scene.set_cache_bitmap(layer, Some(new));
+
+        assert!(scene.bitmap(new).is_some(), "the new cache survives");
+        assert!(
+            scene.bitmap(old).is_none(),
+            "the replaced cache is released"
+        );
     }
 }

@@ -331,6 +331,8 @@ struct StreamWindow {
     window_frames: u64,
     /// Set once `read` reported the end.
     eof: bool,
+    /// Total frames once the decoder reported the end.
+    total: Option<u64>,
 }
 
 impl StreamWindow {
@@ -346,6 +348,7 @@ impl StreamWindow {
             chunk_frames: (rate as usize / 4).max(1),
             window_frames: u64::from(rate).max(1),
             eof: false,
+            total: None,
         }
     }
 
@@ -357,6 +360,12 @@ impl StreamWindow {
     /// One past the last decoded frame.
     fn end(&self) -> u64 {
         self.start.saturating_add(self.frame_count())
+    }
+
+    /// Total frames the decoder has produced, once the end is known; the
+    /// frames decoded so far otherwise.
+    fn known_total(&self) -> u64 {
+        self.total.unwrap_or_else(|| self.frame_count())
     }
 
     /// Whether `index` is decoded into the window.
@@ -382,6 +391,7 @@ impl StreamWindow {
         self.samples.truncate(start + written);
         if written == 0 {
             self.eof = true;
+            self.total = Some(self.end());
         }
         Ok(())
     }
@@ -606,8 +616,8 @@ impl SoundSource {
     /// Decodes the whole stream into one buffer.
     ///
     /// A streaming source is rewound to the beginning and drained; the
-    /// returned buffer is an independent copy. A materialized source returns
-    /// its buffer.
+    /// returned buffer is an independent copy and the decoded window is
+    /// released so the source does not keep a second copy of the file.
     ///
     /// # Errors
     ///
@@ -626,7 +636,14 @@ impl SoundSource {
             total_frames: Some(frames),
             ..self.spec
         };
-        Ok(DecodedAudio::new(spec, window.samples.clone()))
+        let audio = DecodedAudio::new(spec, window.samples.clone());
+        // Drop the decoded window: the caller owns the returned copy and a
+        // later frame read reseeks from the start.
+        window.samples = Vec::new();
+        window.start = frames;
+        window.eof = true;
+        window.total = Some(frames);
+        Ok(audio)
     }
 
     /// Whether this source decodes incrementally instead of holding every
@@ -641,6 +658,12 @@ impl SoundSource {
             total_frames: Some(self.frames()),
             ..self.spec
         }
+    }
+
+    /// The container-reported total frame count, or `None` when the stream's
+    /// length is only known once it has been decoded to the end.
+    pub fn reported_frames(&self) -> Option<u64> {
+        self.spec.total_frames
     }
 
     /// Samples per second.
@@ -663,7 +686,7 @@ impl SoundSource {
             Some(frames) => frames,
             None => match &self.pcm {
                 Pcm::Buffer(audio) => audio.frame_count(),
-                Pcm::Stream(window) => lock_window(window).frame_count(),
+                Pcm::Stream(window) => lock_window(window).known_total(),
             },
         }
     }
@@ -677,7 +700,7 @@ impl SoundSource {
                 Pcm::Buffer(audio) => audio.frame_count() == 0,
                 Pcm::Stream(window) => {
                     let window = lock_window(window);
-                    window.eof && window.frame_count() == 0
+                    window.total == Some(0)
                 }
             },
         }
