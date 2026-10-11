@@ -97,6 +97,12 @@ impl Env {
             .unwrap_or_else(|error| panic!("exec {script:?} failed: {error}"));
     }
 
+    fn try_eval(&self, expression: &str) -> Result<TjsValue, String> {
+        self.engine
+            .eval(expression, "scripts-ex-test")
+            .map_err(|e| e.to_string())
+    }
+
     fn eval(&self, expression: &str) -> TjsValue {
         self.engine
             .eval(expression, "scripts-ex-test")
@@ -549,13 +555,56 @@ fn builtin_array_and_dictionary_members_still_work() {
 /// `reference/cpp/plugins/scriptsEx.cpp:921-956`). A content expression that
 /// reads `this` therefore resolves against that context.
 #[test]
-fn safe_eval_storage_evaluates_under_the_context_argument() {
+fn safe_eval_storage_evaluates_a_const_literal_storage() {
     let _lock = vm_lock();
     let env = Env::new();
-    env.write_storage("context.tjs", "this.answer");
+    env.write_storage("data.tjs", "42");
+    // `safeEvalStorage` wraps the storage in `(const)[...]` and returns
+    // element 0 (`reference/cpp/plugins/scriptsEx.cpp:909-960`).
     env.run(
-        "var context = %[answer: 42]; \
-         var value = Scripts.safeEvalStorage('context.tjs', '', context);",
+        "var value = Scripts.safeEvalStorage('data.tjs');",
     );
     assert_eq!(env.int("value"), 42);
+}
+
+// The wrapper is what makes the member safe: a `(const)[...]` literal admits
+// constants only, so a storage that is not a constant raises instead of
+// running (`reference/cpp/plugins/scriptsEx.cpp:909-960`). The third argument
+// is still accepted, matching the reference's `TVPExecuteExpression` call.
+#[test]
+fn safe_eval_storage_rejects_a_non_constant_storage() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.write_storage("code.tjs", "this.answer");
+    let error = env.error(
+        "Scripts.safeEvalStorage('code.tjs', '', %[answer: 42]);",
+    );
+    assert!(error.contains("syntax error"), "{error}");
+}
+
+// ---------------------------------------------------------------------------
+// plain dictionary enumeration
+// ---------------------------------------------------------------------------
+
+/// A plain `%[x: 1]` must enumerate exactly its own key. The built-in C++
+/// serializer walks a `Dictionary` with `EnumMembers`
+/// (`reference/cpp/core/tjs2/tjsDictionary.cpp:417-447`); the plugin members
+/// the ABI used to attach to every instance must not appear. The port's
+/// `Array.assign` flattening runs that same `EnumMembers` walk.
+#[test]
+fn plain_dictionary_enumerates_only_its_own_keys() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var d = %[x: 1]; \
+         var flat = []; flat.assign(d); \
+         var keys = Scripts.getObjectKeys(d); \
+         var count = Scripts.getObjectCount(d);",
+    );
+    assert_eq!(env.int("flat.count"), 2, "assign must flatten [key, value]");
+    assert_eq!(env.string("flat[0]"), "x");
+    assert_eq!(env.int("flat[1]"), 1);
+    assert_eq!(env.int("keys.count"), 1);
+    assert_eq!(env.string("keys[0]"), "x");
+    assert_eq!(env.int("count"), 1);
 }
