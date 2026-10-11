@@ -178,7 +178,12 @@ pub trait EventHandler {
     fn event(&mut self, event: PlatformEvent) -> Flow;
 
     /// Called once per due frame with the time since the previous frame.
-    fn frame(&mut self, dt_ms: f32) -> Flow;
+    ///
+    /// `window` is the live platform window. The handler may query its size
+    /// and request a new inner size so a script-driven client-area change
+    /// reaches the backend; the backend reports the applied size back as
+    /// [`PlatformEvent::Resized`].
+    fn frame(&mut self, dt_ms: f32, window: &PlatformWindow) -> Flow;
 
     /// Called when the loop is about to wait for events.
     fn about_to_wait(&mut self) -> Flow {

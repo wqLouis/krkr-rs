@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
 use winit::application::ApplicationHandler;
-use winit::dpi::LogicalSize;
+use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::event::{
     ElementState, Ime, MouseButton as WinitMouseButton, MouseScrollDelta,
     TouchPhase as WinitTouchPhase, WindowEvent,
@@ -63,6 +63,19 @@ impl PlatformWindow {
     pub fn size(&self) -> (u32, u32) {
         let size = self.window.inner_size();
         (size.width.max(1), size.height.max(1))
+    }
+
+    /// Requests an inner (client-area) size in physical pixels.
+    ///
+    /// Returns the size the backend applied immediately. A backend may apply
+    /// the request synchronously and emit no [`PlatformEvent::Resized`], in
+    /// which case the caller must resize the surface to the returned size.
+    /// Otherwise the request is pending and the applied size arrives as
+    /// [`PlatformEvent::Resized`]. The backend may clamp the request.
+    pub fn set_size(&self, size: (u32, u32)) -> Option<(u32, u32)> {
+        self.window
+            .request_inner_size(PhysicalSize::new(size.0.max(1), size.1.max(1)))
+            .map(|applied| (applied.width.max(1), applied.height.max(1)))
     }
 
     /// Returns the current display scale factor (DPI scale).
@@ -199,7 +212,10 @@ impl<H: EventHandler> ApplicationHandler for AppLoop<H> {
                 let now = Instant::now();
                 let dt_ms = now.saturating_duration_since(self.last_frame).as_secs_f32() * 1000.0;
                 self.last_frame = now;
-                self.handler.frame(dt_ms)
+                match self.window.as_ref() {
+                    Some(window) => self.handler.frame(dt_ms, window),
+                    None => Flow::Continue,
+                }
             }
             other => match map_input(other) {
                 Some(input) => self.handler.event(PlatformEvent::Input(input)),

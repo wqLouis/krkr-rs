@@ -402,6 +402,9 @@ struct DesktopApp {
     /// Input and focus events received since the last frame, delivered to
     /// the VM.
     pending_events: Vec<PlatformEvent>,
+    /// The window size a script most recently requested, so a request still
+    /// in flight is not repeated on every frame.
+    pending_size: Option<(u32, u32)>,
 }
 
 /// What the windowed loop is driving.
@@ -425,6 +428,15 @@ impl Running {
         }
     }
 
+    /// The main window's declared client size, or `None` when the host owns
+    /// no scene window (the empty-scene run).
+    fn window_size(&self) -> Option<(u32, u32)> {
+        match self {
+            Running::Empty(_) => None,
+            Running::Game(game) => game.scene().windows.first().map(|window| window.inner_size),
+        }
+    }
+
     /// Advances and presents one frame, delivering `events` to the VM.
     fn step(&mut self, dt_ms: f32, events: &[PlatformEvent]) -> Result<(), String> {
         match self {
@@ -445,7 +457,39 @@ impl DesktopApp {
             game,
             running: None,
             pending_events: Vec::new(),
+            pending_size: None,
         }
+    }
+
+    /// Requests a new platform-window inner size when a script changed the
+    /// main window's declared client size.
+    ///
+    /// `want` is the main window's current logical size; `None` means the
+    /// host owns no scene window. A request already in flight is not
+    /// repeated. When the backend applies the request synchronously (and
+    /// therefore emits no `Resized`), the surface is resized here.
+    fn apply_window_size(
+        &mut self,
+        want: Option<(u32, u32)>,
+        window: &PlatformWindow,
+    ) -> Result<(), String> {
+        let Some(size) = want else {
+            return Ok(());
+        };
+        if size.0 == 0 || size.1 == 0 {
+            return Ok(());
+        }
+        if self.pending_size == Some(size) || size == window.size() {
+            return Ok(());
+        }
+        self.pending_size = Some(size);
+        if let Some(applied) = window.set_size(size) {
+            self.pending_size = None;
+            if let Some(running) = self.running.as_mut() {
+                running.resize(applied)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -488,6 +532,14 @@ impl EventHandler for DesktopApp {
                     None => Running::Empty(Box::new(host)),
                 };
                 self.running = Some(running);
+                // Align the platform window with the client size the game
+                // declared during startup (`Window.setInnerSize`); the
+                // resulting `Resized` sizes the surface.
+                let want = self.running.as_ref().and_then(Running::window_size);
+                if let Err(error) = self.apply_window_size(want, window) {
+                    eprintln!("krkr: resize failed: {error}");
+                    return Flow::Exit;
+                }
                 Flow::Continue
             }
             Err(error) => {
@@ -500,6 +552,7 @@ impl EventHandler for DesktopApp {
     fn event(&mut self, event: PlatformEvent) -> Flow {
         match event {
             PlatformEvent::Resized(width, height) => {
+                self.pending_size = None;
                 if let Some(running) = self.running.as_mut()
                     && let Err(error) = running.resize((width, height))
                 {
@@ -530,13 +583,18 @@ impl EventHandler for DesktopApp {
         }
     }
 
-    fn frame(&mut self, dt_ms: f32) -> Flow {
+    fn frame(&mut self, dt_ms: f32, window: &PlatformWindow) -> Flow {
         if let Some(running) = self.running.as_mut() {
             let events = std::mem::take(&mut self.pending_events);
             if let Err(error) = running.step(dt_ms, &events) {
                 eprintln!("krkr: frame failed: {error}");
                 return Flow::Exit;
             }
+        }
+        let want = self.running.as_ref().and_then(Running::window_size);
+        if let Err(error) = self.apply_window_size(want, window) {
+            eprintln!("krkr: frame resize failed: {error}");
+            return Flow::Exit;
         }
         Flow::Continue
     }

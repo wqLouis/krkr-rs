@@ -36,7 +36,7 @@ use api::error::RenderError;
 use api::geometry::PixelRegion;
 use api::host::{InputState, SurfaceEvent};
 use engine::projection::project_scene;
-use engine::scene::Scene;
+use engine::scene::{Rect, Scene};
 use fs::FileSystem;
 use media::Media;
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
@@ -167,6 +167,23 @@ impl HostConfig {
     pub fn with_display_handle(mut self, display: RawDisplayHandle) -> Self {
         self.display_handle = Some(display);
         self
+    }
+}
+
+/// Resizes a window's client area to `size`.
+///
+/// The logical screen size and, when the window has one, its primary layer
+/// are resized; the layer stays at the origin because the reference forbids
+/// moving the primary layer.
+fn resize_window_client(scene: &mut Scene, window: u32, size: (u32, u32)) {
+    let primary = scene.window_mut(window).map(|window| {
+        window.inner_size = size;
+        window.primary_layer
+    });
+    if let Some(Some(primary)) = primary
+        && let Some(layer) = scene.layer_mut(primary)
+    {
+        layer.rect = Rect::new(0, 0, size.0, size.1);
     }
 }
 
@@ -357,6 +374,11 @@ impl Host {
         let size = (size.0.max(1), size.1.max(1));
         let event = resize_render(&self.pipeline, &self.surface, &mut self.render_state, size)?;
         self.surface_size = size;
+        // A platform resize changes the window's client area: the logical
+        // screen size and the primary layer follow.
+        if let Some(window) = self.scene.windows.first().map(|window| window.id) {
+            resize_window_client(&mut self.scene, window, size);
+        }
         Ok(event)
     }
 

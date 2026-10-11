@@ -90,3 +90,31 @@ fn unchanged_revision_reuses_arena_and_mutation_reprojects() {
     host.step(16.0).expect("step");
     assert_ne!(host.render_scene(), &snapshot);
 }
+
+#[test]
+fn resize_propagates_to_the_primary_window() {
+    let mut host = headless_host();
+    let window = build_solid_and_bitmap_scene(host.scene_mut());
+    let primary = host
+        .scene()
+        .window(window)
+        .expect("window")
+        .primary_layer
+        .expect("primary layer");
+
+    host.resize((800, 600)).expect("resize");
+
+    // A window resize reaches the window's client size and the primary layer,
+    // which follows it off-origin at the new size
+    // (`reference/cpp/core/visual/LayerManager.cpp:334` ->
+    // `reference/cpp/core/visual/LayerIntf.cpp:2121`).
+    assert_eq!(
+        host.scene().window(window).expect("window").inner_size,
+        (800, 600)
+    );
+    let layer = host.scene().layer(primary).expect("primary layer");
+    assert_eq!(
+        (layer.rect.x, layer.rect.y, layer.rect.w, layer.rect.h),
+        (0, 0, 800, 600)
+    );
+}

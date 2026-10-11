@@ -51,6 +51,11 @@ impl PlatformWindow {
         1.0
     }
 
+    /// Requests an inner size (no-op in the stub).
+    pub fn set_size(&self, _size: (u32, u32)) -> Option<(u32, u32)> {
+        None
+    }
+
     /// Requests a redraw (no-op in the stub).
     pub fn request_redraw(&self) {}
 }
