@@ -16,6 +16,7 @@
 #![warn(missing_docs)]
 
 pub mod blend;
+pub mod config;
 pub mod error;
 pub mod fs;
 pub mod geometry;

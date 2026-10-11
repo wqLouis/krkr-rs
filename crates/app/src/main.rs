@@ -1,16 +1,18 @@
 //! `krkr` CLI: headless frame runner and windowed desktop frontend.
 //!
 //! ```text
-//! krkr [--headless] [--frames N] [--backend null|vulkan] [--scaling game|fit|fill|expand] [--archive XP3 ...] [--base-dir DIR] [GAME]
+//! krkr [--headless] [--frames N] [--fps N] [--backend null|vulkan] [--scaling game|fit|fill|expand] [--archive XP3 ...] [--base-dir DIR] [GAME]
 //! ```
 //!
 //! * `--headless` runs an empty scene for `N` frames (default 120) through
 //!   [`app::Host`] and prints the null backend [`FrameStats`]. It needs
 //!   neither a display nor a GPU.
 //! * Without `--headless` the process opens a window through the L1
-//!   [`platform`] event loop and drives [`app::Host::step`] at
-//!   roughly 60 fps. This binary is the composition root: it wires the L1
+//!   [`platform`] event loop, drives [`app::Host::step`] on the configured
+//!   cadence. This binary is the composition root: it wires the L1
 //!   platform to the L2 engine host and contains no platform logic.
+//! * `--fps N` caps the frame rate (`N` in `1..=1000`, default 60). It paces
+//!   both the windowed event loop and the headless step.
 //! * `--archive XP3` (repeatable, order-significant, later wins) mounts the
 //!   explicit game archives and runs the L2 startup sequence through the L4
 //!   VM host. One positional path is also accepted, mirroring the reference
@@ -25,38 +27,99 @@
 //!   The headless path has no display and uses `--backend null`.
 //! * `--scaling` selects how the engine presents the logical scene inside
 //!   the framebuffer (`game` by default, plus `fit`, `fill` and `expand`).
+//! * Configuration has the precedence **launch argument > platform-provided
+//!   configuration > built-in default**. The platform supplies its own
+//!   [`api::config::ConfigSource`] through [`platform::config_source`], so
+//!   this composition root never chooses a configuration file or branches on
+//!   the target OS. An out-of-range or unparseable value is a typed error;
+//!   nothing is clamped or defaulted, and nothing takes effect until the
+//!   whole configuration validates.
 //! * `-h`/`--help` prints the usage text.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
+use api::config::{ConfigError, ConfigSource, FrameRateLimit, PresentationScaling, RuntimeConfig};
 use app::{BackendKind, FrameStats, GameHost, Host, HostConfig, StepReport, map_input_to_logical};
 use engine::projection::ScalingMode;
 use platform::{EventHandler, Flow, PlatformConfig, PlatformEvent, PlatformWindow};
 use render::ViewTransform;
 
-/// Usage text printed by `-h`/`--help` and on a parse error.
-const USAGE: &str = "\
-krkr-rs host
+/// One documented launch option.
+struct OptionDoc {
+    /// The flag, as written on the command line.
+    flag: &'static str,
+    /// The value placeholder, or an empty string for a flag with no value.
+    value: &'static str,
+    /// Description including the default and accepted range.
+    help: &'static str,
+}
 
-USAGE:
-    krkr [--headless] [--frames N] [--backend null|vulkan] [--scaling game|fit|fill|expand] [--archive XP3 ...] [--base-dir DIR] [GAME]
+/// Every launch option.
+///
+/// [`usage`] prints this table and the `--help` completeness test walks it, so
+/// an option cannot be added without help text.
+const OPTIONS: &[OptionDoc] = &[
+    OptionDoc {
+        flag: "--headless",
+        value: "",
+        help: "Run offscreen (no window/GPU).",
+    },
+    OptionDoc {
+        flag: "--frames",
+        value: "N",
+        help: "Headless frames to run (default: 120).",
+    },
+    OptionDoc {
+        flag: "--fps",
+        value: "N",
+        help: "Frame-rate limit in frames per second (default: 60, range: 1..=1000).",
+    },
+    OptionDoc {
+        flag: "--backend",
+        value: "null|vulkan",
+        help: "Render backend (default: null).",
+    },
+    OptionDoc {
+        flag: "--scaling",
+        value: "MODE",
+        help: "Presentation scaling (default: game, one of: game, fit, fill, expand).",
+    },
+    OptionDoc {
+        flag: "--archive",
+        value: "XP3",
+        help: "Mount an XP3 archive (repeatable, later wins); with none, every *.xp3 under the base directory mounts.",
+    },
+    OptionDoc {
+        flag: "--base-dir",
+        value: "DIR",
+        help: "App path (default: first archive's parent).",
+    },
+    OptionDoc {
+        flag: "-h, --help",
+        value: "",
+        help: "Print this help.",
+    },
+];
 
-OPTIONS:
-    --headless             Run offscreen (no window/GPU).
-    --frames N             Headless frames to run (default 120).
-    --backend null|vulkan  Render backend (default: null).
-    --scaling MODE         Presentation scaling (default: game):
-                             game    one logical pixel per framebuffer pixel
-                             fit     uniform scale, letterboxed
-                             fill    non-uniform scale to the window
-                             expand  grow the logical size to the window aspect
-    --archive XP3          Mount an XP3 archive (repeatable, later wins).
-                           With none, every *.xp3 under the base directory mounts.
-    --base-dir DIR         App path (default: first archive's parent).
-    GAME                   Game directory (recursively scanned for *.xp3) or an XP3 file.
-    -h, --help             Print this help.
-";
+/// Returns the usage text printed by `-h`/`--help` and on a parse error.
+fn usage() -> String {
+    let mut out = String::from("krkr-rs host\n\nUSAGE:\n    krkr [OPTIONS] [GAME]\n\nOPTIONS:\n");
+    for option in OPTIONS {
+        let left = if option.value.is_empty() {
+            option.flag.to_owned()
+        } else {
+            format!("{} {}", option.flag, option.value)
+        };
+        out.push_str(&format!("    {left:<24}{}\n", option.help));
+    }
+    out.push_str(&format!(
+        "    {:<24}{}\n",
+        "GAME", "Game directory (recursively scanned for *.xp3) or an XP3 file."
+    ));
+    out
+}
 
 /// Default number of headless frames.
 const DEFAULT_FRAMES: u32 = 120;
@@ -72,8 +135,10 @@ struct Cli {
     frames: u32,
     /// Requested render backend.
     backend: BackendKind,
-    /// Requested presentation scaling mode.
-    scaling: ScalingMode,
+    /// Frame-rate limit from `--fps`, or `None` when the argument was absent.
+    frame_rate: Option<FrameRateLimit>,
+    /// Presentation scaling from `--scaling`, or `None` when absent.
+    scaling: Option<PresentationScaling>,
     /// Explicit `--archive` list, in mount order (later wins).
     archives: Vec<PathBuf>,
     /// App path override (`--base-dir`); defaults to the current directory.
@@ -85,14 +150,29 @@ struct Cli {
     help: bool,
 }
 
+/// A command-line parse or resolution failure.
+#[derive(Debug, thiserror::Error)]
+enum CliError {
+    /// The command line is structurally malformed.
+    #[error("{0}")]
+    Usage(String),
+    /// A value failed validation.
+    #[error(transparent)]
+    Config(#[from] ConfigError),
+}
+
 impl Cli {
     /// Parses `args` (without the program name).
-    fn parse(args: impl IntoIterator<Item = String>) -> Result<Self, String> {
+    ///
+    /// Every value is parsed and validated here, so a malformed command line
+    /// has no partial effect.
+    fn parse(args: impl IntoIterator<Item = String>) -> Result<Self, CliError> {
         let mut cli = Self {
             headless: false,
             frames: DEFAULT_FRAMES,
             backend: BackendKind::Null,
-            scaling: ScalingMode::Game,
+            frame_rate: None,
+            scaling: None,
             archives: Vec::new(),
             base_dir: None,
             positional: None,
@@ -105,43 +185,51 @@ impl Cli {
                 "--frames" => {
                     let value = args
                         .next()
-                        .ok_or_else(|| "--frames requires a value".to_owned())?;
-                    cli.frames = value
-                        .parse()
-                        .map_err(|_| format!("invalid --frames value: {value}"))?;
+                        .ok_or_else(|| CliError::Usage("--frames requires a value".to_owned()))?;
+                    cli.frames = value.parse().map_err(|_| {
+                        ConfigError::invalid("--frames", value.clone(), "a non-negative integer")
+                    })?;
+                }
+                "--fps" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| CliError::Usage("--fps requires a value".to_owned()))?;
+                    cli.frame_rate = Some(FrameRateLimit::parse("--fps", &value)?);
                 }
                 "--backend" => {
                     let value = args
                         .next()
-                        .ok_or_else(|| "--backend requires a value".to_owned())?;
-                    cli.backend = parse_backend(&value)?;
+                        .ok_or_else(|| CliError::Usage("--backend requires a value".to_owned()))?;
+                    cli.backend = parse_backend(&value).map_err(CliError::Usage)?;
                 }
                 "--scaling" => {
                     let value = args
                         .next()
-                        .ok_or_else(|| "--scaling requires a value".to_owned())?;
-                    cli.scaling = parse_scaling(&value)?;
+                        .ok_or_else(|| CliError::Usage("--scaling requires a value".to_owned()))?;
+                    cli.scaling = Some(PresentationScaling::parse("--scaling", &value)?);
                 }
                 "--archive" => {
                     let value = args
                         .next()
-                        .ok_or_else(|| "--archive requires a path".to_owned())?;
+                        .ok_or_else(|| CliError::Usage("--archive requires a path".to_owned()))?;
                     cli.archives.push(PathBuf::from(value));
                 }
                 "--base-dir" => {
-                    let value = args
-                        .next()
-                        .ok_or_else(|| "--base-dir requires a directory".to_owned())?;
+                    let value = args.next().ok_or_else(|| {
+                        CliError::Usage("--base-dir requires a directory".to_owned())
+                    })?;
                     cli.base_dir = Some(PathBuf::from(value));
                 }
                 "-h" | "--help" => cli.help = true,
                 other if !other.starts_with('-') => {
                     if cli.positional.is_some() {
-                        return Err(format!("unexpected extra argument: {other}"));
+                        return Err(CliError::Usage(format!(
+                            "unexpected extra argument: {other}"
+                        )));
                     }
                     cli.positional = Some(PathBuf::from(other));
                 }
-                other => return Err(format!("unknown argument: {other}")),
+                other => return Err(CliError::Usage(format!("unknown argument: {other}"))),
             }
         }
         Ok(cli)
@@ -159,17 +247,35 @@ fn parse_backend(value: &str) -> Result<BackendKind, String> {
     }
 }
 
-/// Maps a `--scaling` value to [`ScalingMode`].
-fn parse_scaling(value: &str) -> Result<ScalingMode, String> {
-    match value {
-        "game" => Ok(ScalingMode::Game),
-        "fit" => Ok(ScalingMode::Fit),
-        "fill" => Ok(ScalingMode::Fill),
-        "expand" => Ok(ScalingMode::Expand),
-        other => Err(format!(
-            "unknown scaling mode '{other}' (expected 'game', 'fit', 'fill' or 'expand')"
-        )),
+/// Maps a resolved presentation scaling to the engine's projection mode.
+fn map_scaling(scaling: PresentationScaling) -> ScalingMode {
+    match scaling {
+        PresentationScaling::Game => ScalingMode::Game,
+        PresentationScaling::Fit => ScalingMode::Fit,
+        PresentationScaling::Fill => ScalingMode::Fill,
+        PresentationScaling::Expand => ScalingMode::Expand,
     }
+}
+
+/// Resolves the runtime configuration with the precedence
+/// **launch argument > platform configuration > built-in default**.
+///
+/// The platform's overrides are loaded and validated before any value is
+/// used; the launch argument then wins field by field, and a field neither
+/// source holds falls back to [`RuntimeConfig::default`].
+fn resolve_runtime_config(
+    cli: &Cli,
+    source: &impl ConfigSource,
+) -> Result<RuntimeConfig, ConfigError> {
+    let platform = source.load()?;
+    let defaults = RuntimeConfig::default();
+    Ok(RuntimeConfig {
+        frame_rate_limit: cli
+            .frame_rate
+            .or(platform.frame_rate_limit)
+            .unwrap_or(defaults.frame_rate_limit),
+        scaling: cli.scaling.or(platform.scaling).unwrap_or(defaults.scaling),
+    })
 }
 
 /// Formats the null backend counters on one line.
@@ -206,19 +312,28 @@ fn main() -> ExitCode {
         Ok(cli) => cli,
         Err(message) => {
             eprintln!("krkr: {message}");
-            eprint!("{USAGE}");
+            eprint!("{}", usage());
             return ExitCode::from(2);
         }
     };
     if cli.help {
-        print!("{USAGE}");
+        print!("{}", usage());
         return ExitCode::SUCCESS;
     }
 
+    let source = platform::config_source();
+    let runtime = match resolve_runtime_config(&cli, &source) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("krkr: {error}");
+            return ExitCode::from(2);
+        }
+    };
+
     let result = if cli.headless {
-        run_headless(&cli)
+        run_headless(&cli, &runtime)
     } else {
-        run_windowed(&cli)
+        run_windowed(&cli, &runtime)
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -230,10 +345,11 @@ fn main() -> ExitCode {
 }
 
 /// Runs offscreen and prints the final frame stats (or the game's scene size).
-fn run_headless(cli: &Cli) -> Result<(), String> {
+fn run_headless(cli: &Cli, runtime: &RuntimeConfig) -> Result<(), String> {
     let input = resolve_game(cli)?;
     let config = HostConfig::headless().with_backend(cli.backend);
     let mut host = Host::new(config).map_err(|error| error.to_string())?;
+    let dt_ms = runtime.frame_rate_limit.period_ms();
 
     if let Some(input) = input {
         let mut game = GameHost::open(host, input.archives.clone(), input.base_dir.clone())
@@ -246,9 +362,7 @@ fn run_headless(cli: &Cli) -> Result<(), String> {
         );
         let mut last = StepReport::default();
         for _ in 0..cli.frames {
-            last = game
-                .step(1000.0 / 60.0, &[])
-                .map_err(|error| error.to_string())?;
+            last = game.step(dt_ms, &[]).map_err(|error| error.to_string())?;
         }
         if let Some(stats) = last.stats {
             println!(
@@ -298,9 +412,7 @@ fn run_headless(cli: &Cli) -> Result<(), String> {
 
     let mut last = StepReport::default();
     for _ in 0..cli.frames {
-        last = host
-            .step(1000.0 / 60.0)
-            .map_err(|error| error.to_string())?;
+        last = host.step(dt_ms).map_err(|error| error.to_string())?;
     }
     if let Some(stats) = last.stats {
         println!("final: frame={} {}", last.frame_index, format_stats(&stats));
@@ -409,13 +521,18 @@ fn absolute(path: &Path) -> Result<PathBuf, String> {
 }
 
 /// Opens a window through the L1 platform and drives [`Host::step`].
-fn run_windowed(cli: &Cli) -> Result<(), String> {
+fn run_windowed(cli: &Cli, runtime: &RuntimeConfig) -> Result<(), String> {
     let mut config = PlatformConfig::default();
     config.title = "krkr-rs".to_owned();
     config.size = DEFAULT_SIZE;
+    config.frame_interval = Duration::from_secs_f64(runtime.frame_rate_limit.period_secs());
     platform::run(
         config,
-        DesktopApp::new(cli.backend, cli.scaling, resolve_game(cli)?),
+        DesktopApp::new(
+            cli.backend,
+            map_scaling(runtime.scaling),
+            resolve_game(cli)?,
+        ),
     )
     .map_err(|error| error.to_string())
 }
@@ -674,9 +791,26 @@ impl EventHandler for DesktopApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use api::config::{NoConfigSource, RuntimeConfigOverrides};
 
-    fn parse(args: &[&str]) -> Result<Cli, String> {
+    fn parse(args: &[&str]) -> Result<Cli, CliError> {
         Cli::parse(args.iter().map(|arg| (*arg).to_owned()))
+    }
+
+    /// A platform configuration source with fixed overrides.
+    struct FakeSource(RuntimeConfigOverrides);
+
+    impl ConfigSource for FakeSource {
+        fn load(&self) -> Result<RuntimeConfigOverrides, ConfigError> {
+            Ok(self.0)
+        }
+    }
+
+    fn overrides(fps: u32, scaling: PresentationScaling) -> FakeSource {
+        FakeSource(RuntimeConfigOverrides {
+            frame_rate_limit: Some(FrameRateLimit::new("frame_rate", fps).expect("valid")),
+            scaling: Some(scaling),
+        })
     }
 
     #[test]
@@ -687,15 +821,112 @@ mod tests {
         assert!(cli.base_dir.is_none());
         assert!(cli.positional.is_none());
         assert_eq!(cli.frames, DEFAULT_FRAMES);
-        assert_eq!(cli.scaling, ScalingMode::Game);
+        assert_eq!(cli.frame_rate, None);
+        assert_eq!(cli.scaling, None);
     }
 
     #[test]
-    fn parse_scaling_mode() {
-        let cli = parse(&["--scaling", "fit"]).expect("parse");
-        assert_eq!(cli.scaling, ScalingMode::Fit);
-        assert!(parse(&["--scaling", "stretch"]).is_err());
-        assert!(parse(&["--scaling"]).is_err());
+    fn parse_frame_rate_and_scaling() {
+        let cli = parse(&["--fps", "30", "--scaling", "fit"]).expect("parse");
+        assert_eq!(
+            cli.frame_rate,
+            Some(FrameRateLimit::new("--fps", 30).expect("valid"))
+        );
+        assert_eq!(cli.scaling, Some(PresentationScaling::Fit));
+    }
+
+    #[test]
+    fn parse_rejects_every_invalid_configuration_value() {
+        for args in [
+            &["--fps"][..],
+            &["--fps", "0"],
+            &["--fps", "1001"],
+            &["--fps", "fast"],
+            &["--scaling"],
+            &["--scaling", "stretch"],
+        ] {
+            assert!(parse(args).is_err(), "accepted {args:?}");
+        }
+    }
+
+    #[test]
+    fn invalid_value_error_names_the_option_and_the_range() {
+        let error = parse(&["--fps", "0"]).expect_err("must fail").to_string();
+        assert!(error.contains("--fps"), "{error}");
+        assert!(error.contains("1..=1000"), "{error}");
+        let error = parse(&["--scaling", "stretch"])
+            .expect_err("must fail")
+            .to_string();
+        assert!(error.contains("--scaling"), "{error}");
+        assert!(error.contains("game, fit, fill, expand"), "{error}");
+    }
+
+    #[test]
+    fn resolution_prefers_argument_then_platform_then_default() {
+        let platform = overrides(30, PresentationScaling::Fit);
+
+        // The platform beats the built-in default.
+        let cli = parse(&["--headless"]).expect("parse");
+        let config = resolve_runtime_config(&cli, &platform).expect("resolve");
+        assert_eq!(config.frame_rate_limit.fps(), 30);
+        assert_eq!(config.scaling, PresentationScaling::Fit);
+
+        // The launch argument beats the platform, field by field.
+        let cli = parse(&["--headless", "--fps", "120", "--scaling", "fill"]).expect("parse");
+        let config = resolve_runtime_config(&cli, &platform).expect("resolve");
+        assert_eq!(config.frame_rate_limit.fps(), 120);
+        assert_eq!(config.scaling, PresentationScaling::Fill);
+
+        // An argument one field overrides only that field.
+        let cli = parse(&["--headless", "--fps", "120"]).expect("parse");
+        let config = resolve_runtime_config(&cli, &platform).expect("resolve");
+        assert_eq!(config.frame_rate_limit.fps(), 120);
+        assert_eq!(config.scaling, PresentationScaling::Fit);
+    }
+
+    #[test]
+    fn resolution_falls_back_to_the_built_in_default() {
+        let cli = parse(&["--headless"]).expect("parse");
+        let config = resolve_runtime_config(&cli, &NoConfigSource).expect("resolve");
+        assert_eq!(config, RuntimeConfig::default());
+        assert_eq!(config.frame_rate_limit.fps(), 60);
+        assert_eq!(config.scaling, PresentationScaling::Game);
+    }
+
+    /// A platform source whose store exists but cannot be read.
+    struct FailingSource;
+
+    impl ConfigSource for FailingSource {
+        fn load(&self) -> Result<RuntimeConfigOverrides, ConfigError> {
+            Err(ConfigError::Source {
+                message: "boom".to_owned(),
+            })
+        }
+    }
+
+    #[test]
+    fn resolution_validates_the_platform_source_before_any_argument() {
+        let cli = parse(&["--headless", "--fps", "120", "--scaling", "fill"]).expect("parse");
+        let error = resolve_runtime_config(&cli, &FailingSource).expect_err("must fail");
+        assert!(error.to_string().contains("boom"), "{error}");
+    }
+
+    #[test]
+    fn help_lists_every_option_with_default_and_range() {
+        let text = usage();
+        for option in OPTIONS {
+            assert!(
+                text.contains(option.flag),
+                "help is missing {}",
+                option.flag
+            );
+        }
+        assert!(text.contains("GAME"), "{text}");
+        assert!(text.contains("default: 60"), "{text}");
+        assert!(text.contains("1..=1000"), "{text}");
+        assert!(text.contains("default: game"), "{text}");
+        assert!(text.contains("game, fit, fill, expand"), "{text}");
+        assert!(text.contains("default: 120"), "{text}");
     }
 
     #[test]
