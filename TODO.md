@@ -173,9 +173,40 @@ Sources: `/tmp/kag-render-audit.md`, `/tmp/kag-compat-audit.md`, `/tmp/kag-flow-
   layer (§4).
 * [x] **A.3-4** `windowEx`/`win32dialog` recognition — no divergence found.
 
-### Flow / scene / input (`kag-flow-audit`)
+### Flow / scene / save (`kag-flow-audit`)
 
-* [ ] Pending that report.
+* [~] **P0-1** `beginTransition` + `withchildren` (same as R2) — landed by
+  `fix-transition`.
+* [~] **P0-1b** the subtree renderer must apply each child's transform, mask and
+  province. `layer_ops::collect_subtree_draws` copies only
+  `rect`/`image_left`/`image_top`/`clip`/`blend`/`opacity`/`bitmap`/`fill_color`, so
+  a mid-activation `Sprite`/`AffineLayer` child renders unscaled and unrotated
+  while the reference's `Complete` draws it through its own transform. Every
+  reachable ADV transition passes `withchildren = true` with a container source
+  (`advscreen.tjs:216-217,3353,3719,3735,3737,3739`, `advobject.tjs:105`).
+* [~] **P1-1** `Layer.saveLayerImage` must write the reference BMP layout. The game
+  appends the save struct at `width*height*4 + 54` (`utility.tjs:2205`,
+  `advscreen.tjs:7286,7437,7440`), which the reference `TVPSaveTextureAsBMP`
+  produces (40-byte `TVP_WIN_BITMAPINFOHEADER`, `bfOffBits = 54`,
+  `GraphicsLoaderIntf.cpp:737-800`). The port's `image`-crate writer emits a
+  108-byte V4 header (`w*h*4 + 122`), so `saveStruct(path, "zoN")` overwrites the
+  thumbnail's last 68 bytes and a reference-compatible reader rejects the file
+  (`GraphicsLoaderIntf.cpp:399-420`).
+* [~] **P2-3** `exchange_layers` must re-parent and reorder the two layers
+  (`LayerIntf.cpp:754-979,7969-7991`); the port swaps only `x/y/visible/z_order`
+  (`transitions.rs:790-830`), and its in-file comment claiming the re-parenting is
+  unmodelled is now stale.
+* [~] **A.3-2b** `System.getMonitorInfo(flag, window)` — the shipped shim passes
+  `(true, global.Window.mainWindow)` and reads the returned dict, not an index;
+  the port treats argument 0 as a monitor index and the app installs only index 0.
+* [x] **P2-2** `Storages.addAutoPath` dedupe-without-reorder — **verified not a
+  divergence**: the reference does exactly the same (`StorageIntf.cpp:921-937`).
+* [ ] **P2-2b** the reference does raise `TVPMissingPathDelimiterAtLast` for a path
+  without a trailing `/`, `\` or `>` (`StorageIntf.cpp:924-927`); the port accepts
+  it (`engine/storage.rs:315-320`).
+* [x] Verified consistent: the scene manager, timers, `AsyncTrigger`,
+  `addContinuousHandler`, window event dispatch, `VideoOverlay`, sound, the
+  `saveStruct`/`evalStorage` offset path, and the ADV/album/screenshot rect ops.
 
 ## 6. Input / IME — implemented, with documented imprecisions
 
