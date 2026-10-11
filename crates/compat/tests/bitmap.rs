@@ -270,6 +270,68 @@ fn save_defaults_to_bmp() {
 }
 
 #[test]
+fn save_passes_the_type_verbatim() {
+    let _lock = vm_lock();
+    let env = Env::new(true);
+    let saved = Arc::new(Mutex::new(None));
+    env.record_saves(saved.clone());
+
+    // A present, non-void `type` is used verbatim, including the empty
+    // string; it is not coerced to "bmp". Only an absent/void argument falls
+    // back to "bmp" (`BitmapIntf.cpp:330-333`).
+    env.run("var b = new Bitmap(1, 1); b.save('out/blank', '');");
+    assert_eq!(
+        saved
+            .lock()
+            .expect("save lock")
+            .clone()
+            .expect("save")
+            .type_name,
+        ""
+    );
+
+    env.run("var b = new Bitmap(1, 1); b.save('out/shot.bmp', 'bmp');");
+    assert_eq!(
+        saved
+            .lock()
+            .expect("save lock")
+            .clone()
+            .expect("save")
+            .type_name,
+        "bmp"
+    );
+}
+
+#[test]
+fn save_reads_the_bpp_index_from_meta() {
+    let _lock = vm_lock();
+    let env = Env::new(true);
+    let saved = Arc::new(Mutex::new(None));
+
+    // `TVPSaveTextureAsBMP` switches on `meta.bpp` as an **index**: 0 selects 4
+    // bytes per pixel, 1 selects 3 and 2 selects 1, and an index outside that
+    // range leaves the mode's own default in place
+    // (`reference/cpp/core/visual/GraphicsLoaderIntf.cpp:740-770`). The type
+    // string itself is never mutated (`BitmapIntf.cpp:326-341`).
+    for (index, expected) in [(0, "bmp"), (1, "bmp24"), (2, "bmp8"), (24, "bmp")] {
+        env.record_saves(saved.clone());
+        env.run(&format!(
+            "var b = new Bitmap(1, 1); b.save('out/shot.bmp', 'bmp', %[bpp: {index}]);"
+        ));
+        assert_eq!(
+            saved
+                .lock()
+                .expect("save lock")
+                .clone()
+                .expect("save")
+                .type_name,
+            expected,
+            "bpp index {index}"
+        );
+    }
+}
+
+#[test]
 fn load_async_dispatches_on_loaded() {
     let _lock = vm_lock();
     let env = Env::new(true);
@@ -305,11 +367,10 @@ fn typed_errors_when_the_codec_is_absent() {
         load_error.contains("no image decoder is installed"),
         "{load_error}"
     );
-    let header_error = env.error("Bitmap.loadHeader('images/test.img')");
-    assert!(
-        header_error.contains("no image header prober is installed"),
-        "{header_error}"
-    );
+    let header_result = env.eval_ok("Bitmap.loadHeader('images/test.img')");
+    // The reference header router leaves the result void when no handler
+    // accepts the data (`BitmapIntf.cpp:378-401`); it does not raise.
+    assert_eq!(header_result, TjsValue::Void);
     let save_error = env.error("(new Bitmap(1, 1)).save('out/x.bmp', 'bmp')");
     assert!(
         save_error.contains("no image encoder is installed"),

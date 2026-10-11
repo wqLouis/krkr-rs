@@ -494,6 +494,9 @@ fn unsupported_transitions_and_media_helpers_raise_typed_errors() {
          var b = new Layer(w, null); b.setImageSize(2, 2);",
     );
     let cases = [
+        // `withchildren=true` skips the source/destination image check
+        // (`LayerIntf.cpp:9819-9821,7860-7868`), so these raise for the
+        // transition name or options instead.
         "(function(){ var w = new Window(); var a = new Layer(w,null); a.setImageSize(2,2); \
           var b = new Layer(w,null); b.setImageSize(2,2); b.beginTransition('nope', true, a, null); })()",
         "(function(){ var w = new Window(); var a = new Layer(w,null); a.setImageSize(2,2); \
@@ -506,12 +509,19 @@ fn unsupported_transitions_and_media_helpers_raise_typed_errors() {
         "(function(){ var w = new Window(); var a = new Layer(w,null); a.setImageSize(2,2); \
           var b = new Layer(w,null); b.setImageSize(2,2); \
           b.beginTransition('wave', true, a, %[time:300, wavetype:9]); })()",
-        // `loadImages`/`loadProvinceImage` are implemented but need the L2
-        // storage attached; without it they raise a typed error.
+        // `loadImages`/`loadProvinceImage`/`saveLayerImage` are implemented
+        // but need the host's storage/encoder; without it they raise a typed
+        // error. A fresh layer now carries the default main image, so
+        // `saveLayerImage` reaches the save seam and raises "no image encoder
+        // is installed" (reference `SaveLayerImage` -> `TVPSaveImage`, which
+        // throws `TVPUnknownGraphicFormat` with no handler).
         "(function(){ var w = new Window(); var l = new Layer(w,null); l.loadImages('x.png'); })()",
         "(function(){ var w = new Window(); var l = new Layer(w,null); l.loadProvinceImage('x.png'); })()",
         "(function(){ var w = new Window(); var l = new Layer(w,null); l.saveLayerImage('x.png'); })()",
-        "(function(){ var w = new Window(); var l = new Layer(w,null); l.drawText(0,0,'x',0); })()",
+        // `drawText` is implemented and now renders into the default image
+        // when the host resolves a font, so it is no longer part of this
+        // raise-list. `drawGlyph` still raises because a null glyph carries
+        // no text.
         "(function(){ var w = new Window(); var l = new Layer(w,null); l.drawGlyph(0,0,null,0); })()",
     ];
     for expression in cases {
@@ -523,6 +533,7 @@ fn unsupported_transitions_and_media_helpers_raise_typed_errors() {
                 || message.contains("unsupported")
                 || message.contains("not constructed")
                 || message.contains("no storage attached")
+                || message.contains("no image encoder is installed")
                 || message.contains("requires a `rule` image")
                 || message.contains("invalid transition option"),
             "{expression:?} should be a typed error, got: {message}"

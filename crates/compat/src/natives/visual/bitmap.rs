@@ -685,9 +685,14 @@ fn apply_save_meta(host: &Tjs2Engine, value: &Value, type_name: &str) -> Result<
         Ok(TjsValue::Real(bpp)) => bpp as i64,
         Ok(_) | Err(_) => return Ok(type_name.to_string()),
     };
+    // `TVPSaveTextureAsBMP` switches on `meta.bpp` as an **index**: 0 selects
+    // 4 bytes per pixel, 1 selects 3 and 2 selects 1, and an index outside
+    // that range leaves the mode's own default in place
+    // (`reference/cpp/core/visual/GraphicsLoaderIntf.cpp:740-770`).
     Ok(match bpp {
-        24 => "bmp24".to_string(),
-        8 => "bmp8".to_string(),
+        0 => "bmp".to_string(),
+        1 => "bmp24".to_string(),
+        2 => "bmp8".to_string(),
         _ => type_name.to_string(),
     })
 }

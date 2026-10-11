@@ -183,8 +183,10 @@ fn do_gray_scale_uses_the_reference_luma() {
     let env = Env::new();
     env.run("var b = new Bitmap(1, 1); b.setPixel(0, 0, 0xffff0000);");
     env.run("ImageFunction.doGrayScale(b, null);");
-    // (19*255 + 183*0 + 54*0) >> 8 == 18 == 0x12.
-    assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0xff121212);
+    // The reference luma is `(54*R + 183*G + 19*B) >> 8` and the packed
+    // colour's low byte is blue (`tvpgl.h:1102-1103`), so pure red is
+    // `(54*255) >> 8 == 53 == 0x35` (`tvpgl.cpp:10350-10400`).
+    assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0xff353535);
 }
 
 #[test]
