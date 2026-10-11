@@ -73,8 +73,10 @@ fn encode_image_round_trips_supported_formats() {
     let (width, height) = (8u32, 6u32);
     let rgba = pattern(width, height);
 
-    // PNG and BMP keep the alpha channel exactly, so the round trip is
-    // byte-for-byte. The reference BMP spellings are accepted too.
+    // PNG keeps the alpha channel exactly. A reference BMP is 32 bpp with the
+    // alpha byte present, but a 40-byte header carries no alpha mask, so the
+    // `image` decoder reads it as opaque RGB; the fixture is fully opaque, so
+    // the bytes still match. The reference BMP spellings are accepted too.
     for hint in ["png", ".bmp", "dib"] {
         let encoded = encode_image(&media, width, height, &rgba, hint).expect("encode");
         let decoded = decode_image(&media, &encoded, Some(hint)).expect("decode");
