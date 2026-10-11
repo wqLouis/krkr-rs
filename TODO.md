@@ -112,7 +112,72 @@ stays open, as does the `System.getDisplayMonitors`/`getMonitorInfo` nested
 `work`/`monitor` shape (`window_ex/system.rs:110-128`) that the shipped
 `k2compat/deskinfo` and `k2compat/scrinfo` read.
 
-## 3. Input / IME — implemented, with documented imprecisions
+## 5. Audit backlog — every divergence the three audits reported
+
+Sources: `/tmp/kag-render-audit.md`, `/tmp/kag-compat-audit.md`, `/tmp/kag-flow-audit.md`.
+`[x]` landed · `[~]` assigned to an agent · `[ ]` open.
+
+### Rendering / layers (`kag-render-audit`)
+
+* [~] **R1 (P0)** a constructed `Layer` must have the default 32×32 image,
+  `Rect = 0,0,32,32` and `ClipRect = 0,0,32,32`, and `setSize` must grow
+  `MainImage` (`LayerIntf.cpp:339-342,400,2381-2391,2656-2673`). Corrects `5c247bd`;
+  the test `copy_rect_on_an_imageless_layer_is_a_silent_no_op` encodes the wrong
+  premise.
+* [~] **R2 (P0)** `beginTransition`'s `withchildren` (`:9819-9821,7860-7876`).
+* [ ] **R3 (P1)** `fillRect` must fill only `rect ∩ ClipRect` inside `MainImage`
+  (`:4272-4320`); the port-only `layer.fill_color` must go.
+* [~] **R4 (P1)** prerendered `.tft` fonts (`:11790-11796`, `:11716-11746`).
+* [ ] **R5 (P2)** `setImageSize` must shrink the rect and clamp `ImageLeft/Top`
+  (`:2623-2640`); `setImagePos` must reject out-of-range positions (`:2506-2523`).
+* [~] **R6 (P2)** `Font.getTextWidth`/`getTextHeight` must apply `angle`
+  (`:11716-11746`).
+* [x] **R7 (P2)** `System.stayOnTop` — **verified not a reference member** (only
+  `Window.stayOnTop`, `WindowIntf.cpp:1608`); the script writes a dynamic member.
+  Nothing to add.
+* [~] **R8 (P2)** `Layer.hasImage` must report true on a fresh layer (`:2497`);
+  falls out of R1.
+
+### KAG parser (`kag-compat-audit` §B)
+
+* [~] **B.2-1** register `multiLineTagEnabled` (and the Ex `paramMacros`).
+* [~] **B.2-2** consume `[iscript]`/`@iscript` and fire `onScript`
+  (`KAGParser.cpp:1097-1188`, `TVPKAGInlineScriptNotEnd` `:1154`,
+  `TVPLabelOrScriptInMacro` `:1130`).
+* [~] **B.2-3** owner callbacks and vetoes — `onScenarioLoad`, `onScenarioLoaded`,
+  `onJump`, `onCall`, `onReturn`, `onAfterReturn` (`:919-937,955-966,1676-1762,1341-1350`).
+* [~] **B.3-1** 0-based `curLine`, whole-line `curPos`, consistent `curLineStr`
+  (`:987-991,1015-1053,1080-1082`).
+* [~] **B.3-2** `macros` must be the live table, not a cached copy.
+* [~] **B.3-3** `store`/`restore` must carry `lineBuffer`/`lineBufferUsing`
+  (`:506-634`).
+* [~] **B.3-4** stop silently dropping `%`-prefixed lines (`:1490-1560`).
+* [~] **B.4-1** duplicate/empty label aliasing (`:193-238,1032`).
+* [~] **B.4-2** `assign` must not copy `ProcessSpecialTags`/`Interrupted`
+  (`:395-466`); raise the bare `TVPKAGSpecifyKAGParser` text (`:59-60`).
+* [ ] **B.4-3** macro-arg default when the argument is present but void
+  (`:2110-2113`).
+* [ ] **B.4-4** `*` macro-entity injection gating (`:1877-1891`).
+* [ ] **B.4-5** `curLineStr` must return the expansion buffer while
+  `LineBufferUsing` (`:1080-1082`).
+* [ ] **B.4-6** bracket-tag `ignoreCR` is decided after the handler
+  (`state.rs:678-726`).
+* [ ] **B.4-7** Ex `taglist` shape — unverifiable from the vendored reference.
+
+### Plugins / Win32 (`kag-compat-audit` §A)
+
+* [~] **A.3-2** `getDisplayMonitors`/`getMonitorInfo` nested `work`/`monitor`
+  shape; the shipped `k2compat_deskinfo`/`k2compat_scrinfo` are the oracle.
+* [~] **A.3-3** alias `KAGParser.dll` → `KAGParserEx.dll`.
+* [ ] **A.3-1** the real `WIN32Dialog` surface — deferred to the platform dialog
+  layer (§4).
+* [x] **A.3-4** `windowEx`/`win32dialog` recognition — no divergence found.
+
+### Flow / scene / input (`kag-flow-audit`)
+
+* [ ] Pending that report.
+
+## 6. Input / IME — implemented, with documented imprecisions
 
 Landed in `b1372cf`. These are knowingly imprecise; each needs a decision or a
 reference source before it can be made exact:
@@ -139,7 +204,7 @@ reference source before it can be made exact:
 * **`onMouseDown` also runs `PrimaryMouseMove`** in the reference (so a down can
   emit `onMouseMove`); the port relies on the platform's separate move events.
 
-## 4. Refactor: reshape the internal code the plugin-extras audit left behind
+## 7. Refactor: reshape the internal code the plugin-extras audit left behind
 
 The audit (`16583bc`) deleted 30 port-only plugin members. Two pieces of internal
 code were kept for behaviour but should be reshaped to the house pattern
@@ -159,7 +224,7 @@ per-class flag list/registration copy):
   `setMaxTextureSize` stores nothing). Confirm nothing else in `motion_player`
   retains write-only state.
 
-## 5. L3 blockers — must behave like the reference
+## 8. L3 blockers — must behave like the reference
 
 Verify current state first; several were fixed in the last wave.
 
@@ -174,19 +239,19 @@ Verify current state first; several were fixed in the last wave.
 | `windowEx` dynamic events | `plugins/window_ex/window.rs` | fires `onMinimize`/`onResizing`/… when the window state changes | the port matches the dynamic lookup but never raises them (no Win32/NCHITTEST source on Linux) |
 | Hatch fill, linear gradient, `LayerExFont` leading metrics | `engine/src/layer_ops.rs`, `plugins/layer_ex/{appearance,font}.rs` | exact pixels / real metrics | approximations today — forbidden by D32; give L2 the missing primitive, never patch L3 |
 
-## 6. Platform stubs — Android only (permitted)
+## 9. Platform stubs — Android only (permitted)
 
 * `crates/platform/platform/src/android.rs` — window + event loop return `NotImplemented`; the AAudio output backend is real. Needs `ANativeWindow` + `GameActivity`, a size/scale source, a redraw request reaching the Vulkan surface, and input→`PlatformEvent` translation (`docs/migration/10-android-backends.md`).
 * `crates/platform/media/src/video/mediacodec.rs` — written, **never compiled or run**; the host build uses a typed `stub`.
 
-## 7. Deferred design work
+## 10. Deferred design work
 
 * **L2 owns the frame** — `Engine::frame`/`Engine::run`/`GameFrame` designed, not built (`docs/migration/02 §3`, `07 Phase 9`). The current L3 clock is `platform::Clock`, a wall clock: a headless run of N frames reaches real time only by accident, which is why timer tests need care.
 * **TJS VM Rust port** — deferred (`08 §10.7`).
 * **L2 API snapshot + CI build step** — `cargo public-api` decided, unwired; CI runs only `cargo fmt --check` + the stateless guard, so the surface lock is a local gate.
 * **Windowed audio on a real device** — owed.
 
-## 8. Quality backlog
+## 11. Quality backlog
 
 * **Harness hardening** — encode the §9 traps so they cannot recur: an `eval`-that-reads helper, a "not the primary layer" helper, and a fixture documenting the TJS `typeof` spellings.
 * **Remaining bean-style accessors** — `InputState::set_pointer_visible`, `SoundChannel::looping`/`set_looping`, `Mixer::set_app_focused`/`set_app_minimized`, `Storage::set_xp3_extraction_filter`, `TimerState::set_now`, `VideoOverlay::set_bounds`/`set_looping`.
@@ -196,7 +261,7 @@ Verify current state first; several were fixed in the last wave.
 * **`get_`-prefixed public API left:** `Tjs2Engine::get_member`, `get_class_names`; `Scene::get_province_pixel`.
 * **Verify no decision-number tags returned** to plugin sources: `grep -rn "//.*\bD[0-9]\+\b" crates/compat/src`.
 
-## 9. Traps that cost real time — read before triaging anything
+## 12. Traps that cost real time — read before triaging anything
 
 1. **`typeof` uses TJS spellings:** `"Object"`, `"Integer"`, `"Real"`, `"String"`, `"Octet"`, `"void"`. Only an **absent member** yields `"undefined"` (`tjsInterCodeExec.cpp:1899-1904`); present-but-unset is `"void"` (`:2601-2628`).
 2. **`void` is not `undefined`.** A bare `undefined` is a member lookup and raises; test absence with `typeof x === "undefined"` (or `typeof global.x`, since a bare `typeof <absent global>` also raises in this VM).
@@ -210,6 +275,6 @@ Verify current state first; several were fixed in the last wave.
 10. **TJS2 does not bind `function` declarations inside an anonymous function body** (an IIFE wrapper breaks them). A **named global `function` declaration also binds `this` to the global object** — for a namespace helper, use an anonymous function expression assigned to the namespace member and recurse through `this`.
 11. **`Layer.id`/`nativeId`, `Bitmap.id`, `Window.id`, `Font.id` do not exist** by design; identify through real members or the L2 `Scene`.
 
-## 10. Verified behaviour worth not re-opening
+## 13. Verified behaviour worth not re-opening
 
 XP3 parsing rejects malformed archives with typed errors (no panics); `media` decodes image/audio/video with no silent fallbacks; `wuvorbis` exposes no TJS surface by design; the null-plugin object exists only for DLLs never ported and announces itself; the compat binding is installed exactly once per process; `plugin_parity`/`native_parity` are at 100% with an empty allowlist.
