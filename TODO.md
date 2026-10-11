@@ -187,6 +187,42 @@ Sources: `/tmp/kag-render-audit.md`, `/tmp/kag-compat-audit.md`, `/tmp/kag-flow-
   disagree on `DiagonalBrick` (style 38, which `advscreen.tjs:3033` uses). Pick and
   record the oracle — it also decides the `LayerExFont` leading metrics.
 
+### File system / XP3 (`audit-fs-xp3`)
+
+Every `.xp3` under `/mnt/DATA/Games` mounts and every name normalizes. The one
+anomaly (`/mnt/DATA/Games/Others/doinaka_brother`) is a title-specific
+encrypted-name DRM variant, **not** a parse bug — do not "fix" it in the storage
+layer.
+
+* [ ] **F5 (P1)** the extraction/content filter is handed `entry.raw_name`
+  (`crates/platform/fs/src/xp3.rs:353-359`); the reference passes the
+  **normalized** name (`XP3Archive.cpp:996-1002`, `:435-437`, opened with
+  `normalizeName=true`), so a name-dependent `xp3filter.tjs` decrypts the wrong
+  bytes. The tests miss it because their names are same-case ASCII.
+* [ ] **F1 (P1)** `Storage::mount_archives` aborts on the first bad `*.xp3`
+  discovered by `app/src/game.rs:152-159` (`engine/storage.rs:182-191`); the
+  reference opens archives lazily and defensively (`StorageIntf.cpp:704-724`,
+  `StorageImpl.cpp:562-587`), so one stray or corrupt archive stops the game.
+* [ ] **F2 (P1)** `discover_archives` sorts ASCII-wise (`engine/storage.rs:858-898`),
+  so `patch@r996` beats `patch@r1071` and `patch_append5` beats `patch_append10` —
+  the wrong patch order for a numbered-patch game.
+* [ ] **F3/F4 (P1)** `find` searches disk → every mounted archive → auto paths
+  (`engine/storage.rs:341-404`); the reference searches the current path (project
+  archive) first, then auto paths by base name, and opens auto-path archives **on
+  demand**. Loose-vs-archive priority and `--archive`-only launches diverge.
+* [ ] **F6 (P1)** `Storages.getFullPath`/`getPlacedPath` return relative names; the
+  reference returns the full `file://domain/path` (`StorageImpl.cpp:1284-1290`,
+  `StorageIntf.cpp:1080-1106`).
+* [ ] **F7 (P1)** `exists` reports directories as existing
+  (`engine/storage.rs:638-657`); the vendored oracle is regular-file-only
+  (`StorageImpl.cpp:530-541`). But the code, its test and
+  `docs/migration/reviews/fs_engine.md` all disagree with the vendored reference,
+  so settle it with shipped-engine evidence before changing anything.
+* [ ] **F8-F14 (P2/P3)** `..`/absolute traversal refused; `getLocalName` misses
+  return the input; `isExistentStorageNoSearchNoNormalize` is case-sensitive; the
+  wrong `addAutoPath` message text; the filter buffer lacks `ptr`; host write
+  semantics; parser strictness. F15/F16 are dead or duplicated surface.
+
 ### Core native behaviour (`audit-core-natives`)
 
 One bug class dominates: **the port raises where the reference is inert and
