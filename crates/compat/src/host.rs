@@ -154,6 +154,22 @@ impl CompatHost {
         // different engine creates a fresh one.
         self.services.clear_noop_closure();
     }
+
+    /// Drop every value the native dispatch state retains, then remove the
+    /// binding.
+    ///
+    /// The dispatch state holds values retained on the VM whose `Drop`
+    /// releases the id on the engine, so this must run while the engine is
+    /// still alive. The `vm` host calls it from its own `Drop` before the
+    /// engine field is dropped; [`Self::uninstall`] alone leaves the state
+    /// map in place until [`Self`] itself is dropped, which can be after the
+    /// engine has been destroyed.
+    pub fn shutdown(&mut self) {
+        self.uninstall();
+        // Replacing the box drops the old state map (and every retained value
+        // it holds) now, while the engine is alive.
+        self.services = Box::new(CompatServices::new());
+    }
 }
 
 impl Drop for CompatHost {

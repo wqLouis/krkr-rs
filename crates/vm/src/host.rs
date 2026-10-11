@@ -28,13 +28,19 @@ pub struct FrameCtx<'a> {
 /// The TJS VM host (L4).
 ///
 /// Owns the C++ engine (boxed so its address is stable for the L3 binding)
-/// and the L3 [`CompatHost`] that holds the native surface state.
+/// and the L3 [`CompatHost`] that holds the native surface state. The fields
+/// are ordered so the engine is dropped last: the dispatch state retains
+/// values whose `Drop` releases an id on the engine.
 pub struct VmHost {
-    engine: Box<Tjs2Engine>,
     input: Box<InputState>,
     timer: Box<TimerState>,
+    /// The L3 dispatch state. Declared before `engine` so its retained values
+    /// are released first (fields drop in declaration order).
     compat: CompatHost,
     adapter: EventAdapter,
+    /// The C++ engine. Declared last so it outlives every value the native
+    /// state retains.
+    engine: Box<Tjs2Engine>,
 }
 
 extern "C" fn vm_log(level: c_int, msg: *const c_char, _user: *mut c_void) {
@@ -68,9 +74,9 @@ impl VmHost {
         let engine = Box::new(Tjs2Engine::new().map_err(|err| VmError::Vm(err.to_string()))?);
         // SAFETY: the user pointer is null; the callback reads only `msg`.
         unsafe { engine.set_log_cb(Some(vm_log), ptr::null_mut()) };
-        // The L2 services the natives compose are boxed so their addresses stay
-        // stable for the binding, and they are declared after the engine / before
-        // the compat host so the L3 binding never outlives them.
+        // The L2 services the natives compose are boxed so their addresses
+        // stay stable for the binding; the engine is declared last so it
+        // outlives every retained value.
         let mut input = Box::new(InputState::new());
         let mut timer = Box::new(TimerState::new());
         let mut compat = CompatHost::with_registry(registry);
@@ -86,11 +92,11 @@ impl VmHost {
                 .attach_timer(timer.as_mut() as *mut TimerState);
         }
         Ok(Self {
-            engine,
             input,
             timer,
             compat,
             adapter: EventAdapter::new(),
+            engine,
         })
     }
 
@@ -167,9 +173,59 @@ impl VmHost {
 
 impl Drop for VmHost {
     fn drop(&mut self) {
-        // Remove the L3 binding while the engine is still alive: native
-        // teardown during `Tjs2Engine::drop` must not resolve a stale
-        // binding (and `CompatHost`'s own Drop then becomes a no-op).
-        self.compat.uninstall();
+        // Release the native state's retained values while the engine is
+        // still alive, then remove the binding. Dropping the state after the
+        // engine is destroyed would release ids against a freed engine.
+        self.compat.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use tjs::{DetachedValue, RetainedValue};
+
+    use super::*;
+
+    static STATE_DROPS: AtomicUsize = AtomicUsize::new(0);
+
+    /// Native dispatch state that holds a value retained on the engine. Its
+    /// `Drop` records that teardown reached the state; the retained value's
+    /// own `Drop` then releases the id on the engine.
+    #[derive(Default)]
+    struct TeardownProbe {
+        value: Option<DetachedValue>,
+    }
+
+    impl Drop for TeardownProbe {
+        fn drop(&mut self) {
+            STATE_DROPS.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Dropping the host must release the native dispatch state while the
+    /// engine is still alive. The dropped `DetachedValue` releases its id on
+    /// the engine, so a teardown order that freed the engine first would use
+    /// the freed pointer.
+    #[test]
+    fn dropping_the_host_releases_native_state_before_the_engine() {
+        let _lock = testkit::vm_lock();
+        let host = VmHost::with_default().expect("vm host");
+        let value = host
+            .engine()
+            .eval_retained("[]", "teardown")
+            .expect("retain an object");
+        let RetainedValue::Object(object) = value else {
+            panic!("eval_retained must return an object");
+        };
+        host.compat().services().state::<TeardownProbe>().value = Some(object);
+        STATE_DROPS.store(0, Ordering::SeqCst);
+        drop(host);
+        assert_eq!(
+            STATE_DROPS.load(Ordering::SeqCst),
+            1,
+            "VmHost::drop must drop the native dispatch state"
+        );
     }
 }
