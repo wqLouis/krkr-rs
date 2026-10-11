@@ -1080,26 +1080,180 @@ fn layer_only_members_reject_a_bitmap_source() {
     }
 }
 
-/// A layer the script has only sized (`setSize`) has no main image. In the
-/// reference every destination-rectangle operation clips the rectangle
-/// against `ClipRect` **first** and returns before touching an image
-/// (`CopyRect`, `reference/cpp/core/visual/LayerIntf.cpp:4578-4579`); an
-/// imageless layer's `ClipRect` is empty (the constructor zeroes it,
-/// `:375-378`, and `ResetClip`, the only widener, raises without an image,
-/// `:4034-4039`). So `setSize` + `copyRect` is a silent no-op — exactly the
-/// KAG save-screen thumbnail path (`system/SystemWindow.tjs:45-51`) — and it
-/// neither allocates an image nor raises.
+/// Reference: the `tTJSNI_BaseLayer` constructor sizes the layer rect to
+/// `0,0,32,32` (`reference/cpp/core/visual/LayerIntf.cpp:339-342`) and ends
+/// with `AllocateDefaultImage` (`:400`), which assigns the shared 32x32
+/// transparent-white bitmap (`:104-110`, `:2381-2391`) and calls `ResetClip`
+/// (`:4032-4039`). `HasImage` is `MainImage != nullptr` (`:2497`), so a fresh
+/// layer already reports an image.
 #[test]
-fn copy_rect_on_an_imageless_layer_is_a_silent_no_op() {
+fn a_fresh_layer_has_the_default_32x32_image() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run("var w = new Window(); var l = new Layer(w, null);");
+    assert_eq!(env.eval_int("l.width"), 32);
+    assert_eq!(env.eval_int("l.height"), 32);
+    assert_eq!(env.eval_int("l.imageWidth"), 32);
+    assert_eq!(env.eval_int("l.imageHeight"), 32);
+    assert_eq!(env.eval_int("l.hasImage"), 1);
+    assert_eq!(env.eval_int("l.imageLeft"), 0);
+    assert_eq!(env.eval_int("l.imageTop"), 0);
+    // `ResetClip` sets `ClipRect` to the whole 32x32 image (`:4032-4039`).
+    assert_eq!(env.eval_int("l.clipLeft"), 0);
+    assert_eq!(env.eval_int("l.clipTop"), 0);
+    assert_eq!(env.eval_int("l.clipWidth"), 32);
+    assert_eq!(env.eval_int("l.clipHeight"), 32);
+    // The default image is transparent white (`:104-110`): the RGB reads
+    // white and the alpha plane is zero.
+    assert_eq!(env.eval_int("l.getMainPixel(0, 0)"), 0x00ff_ffff);
+    assert_eq!(env.eval_int("l.getMaskPixel(0, 0)"), 0);
+}
+
+/// Reference: `SetSize` -> `InternalSetSize` (`LayerIntf.cpp:2121-2140`)
+/// calls `ImageLayerSizeChanged` (`:2656-2673`), which grows `MainImage` to
+/// the new rect but never shrinks it.
+#[test]
+fn set_size_grows_and_never_shrinks_the_default_image() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); var l = new Layer(w, null); \
+         l.setSize(64, 48);",
+    );
+    // The image grew to cover the 64x48 rect.
+    assert_eq!(env.eval_int("l.imageWidth"), 64);
+    assert_eq!(env.eval_int("l.imageHeight"), 48);
+    env.run("l.setSize(8, 8);");
+    // The rect shrank, but `ImageLayerSizeChanged` only grows the image.
+    assert_eq!(env.eval_int("l.width"), 8);
+    assert_eq!(env.eval_int("l.imageWidth"), 64);
+    assert_eq!(env.eval_int("l.imageHeight"), 48);
+}
+
+/// Reference: a layer the script only sized still has the `MainImage` from
+/// the constructor (`reference/cpp/core/visual/LayerIntf.cpp:400`), so
+/// `CopyRect` writes into it (`:4574-4657`) — this is the KAG save-screen
+/// thumbnail path (`system/SystemWindow.tjs:45-51`).
+#[test]
+fn copy_rect_works_on_a_set_size_layer() {
     let _lock = vm_lock();
     let env = Env::new();
     env.run(
         "var w = new Window(); \
          var src = new Layer(w, null); src.setImageSize(2, 2); \
+         src.setMainPixel(0, 0, 0x123456); \
          var dst = new Layer(w, null); dst.setSize(2, 2); \
          dst.copyRect(0, 0, src, 0, 0, 2, 2);",
     );
-    env.assert_script("dst.hasImage == 0");
+    assert_eq!(env.eval_int("dst.hasImage"), 1);
+    assert_eq!(env.eval_int("dst.getMainPixel(0, 0)"), 0x123456);
+}
+
+/// Reference: `FillRect` intersects the requested rectangle with `ClipRect`
+/// and fills only that intersection inside `MainImage`
+/// (`reference/cpp/core/visual/LayerIntf.cpp:4272-4320`). Two overlapping
+/// fills therefore keep distinct pixels per region.
+#[test]
+fn fill_rect_fills_only_the_clipped_rectangle() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); var l = new Layer(w, null); \
+         l.setImageSize(4, 4); \
+         l.fillRect(0, 0, 4, 4, 0xff000000); \
+         l.fillRect(0, 0, 3, 3, 0xffff0000); \
+         l.fillRect(2, 2, 2, 2, 0xff00ff00);",
+    );
+    // The red fill covers the [0,3) square, the green fill overwrites its
+    // [2,4) corner, and the black base survives outside both.
+    assert_eq!(env.eval_int("l.getMainPixel(0, 0)"), 0xff0000);
+    assert_eq!(env.eval_int("l.getMainPixel(2, 2)"), 0x00ff00);
+    assert_eq!(env.eval_int("l.getMainPixel(3, 3)"), 0x00ff00);
+    assert_eq!(env.eval_int("l.getMainPixel(0, 3)"), 0x000000);
+}
+
+/// Reference: `FillRect` fills only the intersection of the requested
+/// rectangle and `ClipRect` (`reference/cpp/core/visual/LayerIntf.cpp:4272-4320`).
+#[test]
+fn fill_rect_respects_the_clip_rect() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); var l = new Layer(w, null); \
+         l.setImageSize(4, 4); \
+         l.fillRect(0, 0, 4, 4, 0xff000000); \
+         l.setClip(1, 1, 2, 2); \
+         l.fillRect(0, 0, 4, 4, 0xffff0000);",
+    );
+    assert_eq!(env.eval_int("l.getMainPixel(0, 0)"), 0x000000);
+    assert_eq!(env.eval_int("l.getMainPixel(1, 1)"), 0xff0000);
+    assert_eq!(env.eval_int("l.getMainPixel(2, 2)"), 0xff0000);
+    assert_eq!(env.eval_int("l.getMainPixel(3, 3)"), 0x000000);
+}
+
+/// Reference: `SetImageSize` -> `InternalSetImageSize`
+/// (`reference/cpp/core/visual/LayerIntf.cpp:2623-2640`) shrinks the layer
+/// rect to the image when the image is smaller and clamps `ImageLeft`/
+/// `ImageTop` so the image still covers the rect.
+#[test]
+fn set_image_size_shrinks_the_rect_and_clamps_the_image_offset() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); var l = new Layer(w, null); \
+         l.setSize(20, 20); \
+         l.setImagePos(-8, -8); \
+         l.setImageSize(24, 24);",
+    );
+    // The 24x24 image keeps the 20x20 rect; the -8 offsets clamp to -4 so
+    // `imageLeft + width >= rect.width` (`LayerIntf.cpp:2623-2640`).
+    assert_eq!(env.eval_int("l.width"), 20);
+    assert_eq!(env.eval_int("l.height"), 20);
+    assert_eq!(env.eval_int("l.imageWidth"), 24);
+    assert_eq!(env.eval_int("l.imageHeight"), 24);
+    assert_eq!(env.eval_int("l.imageLeft"), -4);
+    assert_eq!(env.eval_int("l.imageTop"), -4);
+    // An image smaller than the rect resets the offset and shrinks the rect.
+    env.run("l.setImageSize(16, 16);");
+    assert_eq!(env.eval_int("l.width"), 16);
+    assert_eq!(env.eval_int("l.height"), 16);
+    assert_eq!(env.eval_int("l.imageWidth"), 16);
+    assert_eq!(env.eval_int("l.imageLeft"), 0);
+    assert_eq!(env.eval_int("l.imageTop"), 0);
+}
+
+/// Reference: `SetImagePosition` (`LayerIntf.cpp:2546-2560`) rejects a
+/// positive offset and any offset that would leave the image short of the
+/// rect with `TVPInvalidImagePosition`.
+#[test]
+fn set_image_pos_rejects_out_of_range_offsets() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run("var w = new Window(); var l = new Layer(w, null); l.setSize(64, 64);");
+    assert!(env.try_run("l.setImagePos(1, 0);").is_err());
+    assert!(env.try_run("l.setImagePos(0, 1);").is_err());
+    assert!(env.try_run("l.setImagePos(-1, 0);").is_err());
+    assert!(env.try_run("l.setImagePos(0, -1);").is_err());
+    env.run("l.setImagePos(0, 0);");
+}
+
+/// Reference: `HasImage` is `MainImage != nullptr`
+/// (`reference/cpp/core/visual/LayerIntf.cpp:2497`); setting it false
+/// deallocates the image (`DeallocateImage`, `:2349-2356`) and a later
+/// `setSize` does not bring it back (`ImageLayerSizeChanged` returns without
+/// a `MainImage`, `:2656-2659`).
+#[test]
+fn has_image_setter_deallocates_and_set_size_does_not_reallocate() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); var l = new Layer(w, null); \
+         l.hasImage = false; l.setSize(64, 64);",
+    );
+    assert_eq!(env.eval_int("l.hasImage"), 0);
+    // A destination-rectangle fill on a deallocated layer raises
+    // `TVPNotDrawableLayerType` (`FillRect`, `LayerIntf.cpp:4277-4280`).
+    assert!(env.try_run("l.fillRect(0, 0, 1, 1, 0xffffffff);").is_err());
 }
 
 /// Reference: with `omAuto` (the default) `operateRect` replaces the mode
@@ -1246,6 +1400,7 @@ fn blur_and_light_are_silent_on_an_imageless_layer() {
     env.run(
         "var w = new Window(); \
          var l = new Layer(w, null); \
+         l.hasImage = false; \
          l.gaussianBlur(1); \
          l.light(10, 10); \
          var survived = 1;",
@@ -1474,7 +1629,7 @@ fn assign_images_copies_a_layer_and_deallocates_on_an_imageless_source() {
 
     // A source with no MainImage deallocates the target's image
     // (`DeallocateImage`, LayerIntf.cpp:2349-2356).
-    env.run("var empty = new Layer(w, null); dst.assignImages(empty);");
+    env.run("var empty = new Layer(w, null); empty.hasImage = false; dst.assignImages(empty);");
     assert_eq!(
         env.eval_int("dst.hasImage"),
         0,

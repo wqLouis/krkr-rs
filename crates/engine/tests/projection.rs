@@ -32,6 +32,22 @@ fn full_window_rect(w: u32, h: u32) -> Rect {
     Rect::new(0, 0, w, h)
 }
 
+/// Attach a `w` x `h` image to `layer`, positioned at the layer's origin and
+/// drawn at its full size.
+fn attach_image(scene: &mut Scene, layer: u32, w: u32, h: u32) -> u32 {
+    let pixels = (w as usize)
+        .checked_mul(h as usize)
+        .and_then(|count| count.checked_mul(4))
+        .expect("test image size");
+    let bitmap = scene.add_bitmap(w, h, vec![0u8; pixels]);
+    if let Some(state) = scene.layer_mut(layer) {
+        state.bitmap = Some(bitmap);
+        state.image_width = w;
+        state.image_height = h;
+    }
+    bitmap
+}
+
 /// `resolve_blend` passes every generic mode through unchanged at full
 /// opacity, so the projection keeps the blend L3 decoded from `Layer.type`.
 #[test]
@@ -145,25 +161,25 @@ fn hierarchy_composes_position_opacity_visibility_and_order() {
         l.rect = Rect::new(100, 40, 200, 100);
         l.opacity = 0.5;
         l.visible = true;
-        l.fill_color = Some([255, 255, 255, 255]);
     }
+    attach_image(&mut scene, parent, 200, 100);
     let child = scene.add_layer(win, Some(parent));
     {
         let l = scene.layer_mut(child).unwrap();
         l.rect = Rect::new(12, 8, 20, 10);
         l.opacity = 0.5;
         l.visible = true;
-        l.fill_color = Some([255, 255, 255, 255]);
     }
+    attach_image(&mut scene, child, 20, 10);
     let sibling = scene.add_layer(win, None);
     {
         let l = scene.layer_mut(sibling).unwrap();
         l.rect = Rect::new(1, 2, 3, 4);
         l.visible = true;
-        l.fill_color = Some([255, 255, 255, 255]);
     }
+    attach_image(&mut scene, sibling, 3, 4);
 
-    let projected = project_window(&scene, win, |_| None);
+    let projected = project_window(&scene, win, |_| Some(null_texture(1, 1)));
     let nodes = drawable_nodes(&projected);
     assert_eq!(nodes.len(), 3, "the screen buffer is not a node");
 
@@ -208,40 +224,13 @@ fn window_opacity_scales_layer_opacity() {
         let l = scene.layer_mut(fill).unwrap();
         l.rect = full_window_rect(64, 64);
         l.opacity = 0.5;
-        l.fill_color = Some([0, 0, 0, 255]);
     }
+    attach_image(&mut scene, fill, 64, 64);
 
-    let projected = project_window(&scene, win, |_| None);
+    let projected = project_window(&scene, win, |_| Some(null_texture(1, 1)));
     let nodes = drawable_nodes(&projected);
     assert_eq!(nodes.len(), 1);
     assert!((nodes[0].opacity - 0.25).abs() < 1e-6);
-}
-
-#[test]
-fn fill_color_is_straight_alpha() {
-    let mut scene = Scene::default();
-    let win = scene.add_window("t", (64, 64));
-    let fill = scene.add_layer(win, None);
-    {
-        let l = scene.layer_mut(fill).unwrap();
-        l.rect = full_window_rect(64, 64);
-        l.fill_color = Some([255, 0, 0, 128]);
-    }
-
-    let projected = project_window(&scene, win, |_| None);
-    let nodes = drawable_nodes(&projected);
-    assert_eq!(nodes.len(), 1);
-    match &nodes[0].content {
-        RenderContent::Solid(color) => {
-            assert_eq!(color[0], 1.0, "RGB untouched by alpha");
-            assert_eq!(color[1], 0.0);
-            assert_eq!(color[2], 0.0);
-            assert!((color[3] - 128.0 / 255.0).abs() < 1e-6);
-        }
-        other => panic!("expected a solid fill, got {other:?}"),
-    }
-    // A solid fill has no source sub-region.
-    assert_eq!(nodes[0].src, PixelRegion::ZERO);
 }
 
 #[test]
@@ -301,24 +290,6 @@ fn missing_bitmap_without_fill_draws_nothing() {
 }
 
 #[test]
-fn missing_bitmap_falls_back_to_solid_fill() {
-    let mut scene = Scene::default();
-    let win = scene.add_window("t", (64, 64));
-    let layer = scene.add_layer(win, None);
-    {
-        let l = scene.layer_mut(layer).unwrap();
-        l.bitmap = Some(9999); // never added
-        l.fill_color = Some([1, 2, 3, 255]);
-        l.rect = full_window_rect(64, 64);
-    }
-
-    let projected = project_window(&scene, win, |_| None);
-    let nodes = drawable_nodes(&projected);
-    assert_eq!(nodes.len(), 1);
-    assert!(matches!(nodes[0].content, RenderContent::Solid(_)));
-}
-
-#[test]
 fn screen_buffer_primary_layer_is_not_drawn() {
     let mut scene = Scene::default();
     let win = scene.add_window("t", (64, 64));
@@ -344,7 +315,7 @@ fn empty_layer_is_skipped_but_children_render() {
     let win = scene.add_window("t", (64, 64));
     let parent = scene.add_layer(win, None);
     {
-        // No bitmap and no fill colour: the layer draws nothing itself.
+        // No bitmap: the layer draws nothing itself.
         let l = scene.layer_mut(parent).unwrap();
         l.rect = full_window_rect(64, 64);
     }
@@ -352,11 +323,11 @@ fn empty_layer_is_skipped_but_children_render() {
     {
         let l = scene.layer_mut(child).unwrap();
         l.visible = true;
-        l.fill_color = Some([1, 2, 3, 255]);
         l.rect = Rect::new(0, 0, 8, 8);
     }
+    attach_image(&mut scene, child, 8, 8);
 
-    let projected = project_window(&scene, win, |_| None);
+    let projected = project_window(&scene, win, |_| Some(null_texture(1, 1)));
     let nodes = drawable_nodes(&projected);
     assert_eq!(nodes.len(), 1, "the empty layer is not a node");
     assert_eq!(nodes[0].dst, RectF::new(0.0, 0.0, 8.0, 8.0));
@@ -372,11 +343,11 @@ fn invisible_layer_is_not_drawn() {
     {
         let l = scene.layer_mut(layer).unwrap();
         l.visible = false;
-        l.fill_color = Some([1, 2, 3, 255]);
         l.rect = full_window_rect(64, 64);
     }
+    attach_image(&mut scene, layer, 64, 64);
 
-    let projected = project_window(&scene, win, |_| None);
+    let projected = project_window(&scene, win, |_| Some(null_texture(1, 1)));
     assert!(drawable_nodes(&projected).is_empty());
 }
 
@@ -388,11 +359,11 @@ fn hidden_window_projects_nothing() {
     let layer = scene.add_layer(win, None);
     {
         let l = scene.layer_mut(layer).unwrap();
-        l.fill_color = Some([1, 2, 3, 255]);
         l.rect = full_window_rect(64, 64);
     }
+    attach_image(&mut scene, layer, 64, 64);
 
-    let projected = project_window(&scene, win, |_| None);
+    let projected = project_window(&scene, win, |_| Some(null_texture(1, 1)));
     assert!(projected.nodes.iter().all(|n| n.children.is_empty()));
 }
 
@@ -403,12 +374,11 @@ fn project_scene_shares_z_across_windows() {
     let second = scene.add_window("b", (64, 64));
     for (window, x) in [(first, 0), (second, 32)] {
         let layer = scene.add_layer(window, None);
-        let l = scene.layer_mut(layer).unwrap();
-        l.fill_color = Some([1, 2, 3, 255]);
-        l.rect = Rect::new(x, 0, 16, 16);
+        scene.layer_mut(layer).unwrap().rect = Rect::new(x, 0, 16, 16);
+        attach_image(&mut scene, layer, 16, 16);
     }
 
-    let projected = project_scene(&scene, |_| None);
+    let projected = project_scene(&scene, |_| Some(null_texture(1, 1)));
     let nodes = drawable_nodes(&projected);
     assert_eq!(nodes.len(), 2);
     assert_eq!(nodes[0].z, 0);
@@ -423,11 +393,11 @@ fn hold_alpha_is_carried_through() {
     {
         let l = scene.layer_mut(layer).unwrap();
         l.hold_alpha = true;
-        l.fill_color = Some([1, 2, 3, 255]);
         l.rect = full_window_rect(64, 64);
     }
+    attach_image(&mut scene, layer, 64, 64);
 
-    let projected = project_window(&scene, win, |_| None);
+    let projected = project_window(&scene, win, |_| Some(null_texture(1, 1)));
     let nodes = drawable_nodes(&projected);
     assert_eq!(nodes.len(), 1);
     assert!(nodes[0].hold_alpha);
@@ -442,20 +412,20 @@ fn invisible_parent_hides_its_subtree() {
     let grandparent = scene.add_layer(win, None);
     {
         let l = scene.layer_mut(grandparent).unwrap();
-        l.fill_color = Some([1, 2, 3, 255]);
         l.rect = Rect::new(1, 1, 4, 4);
     }
+    attach_image(&mut scene, grandparent, 4, 4);
     let invisible = scene.add_layer(win, Some(grandparent));
     scene.layer_mut(invisible).unwrap().visible = false;
     let child = scene.add_layer(win, Some(invisible));
     {
         let l = scene.layer_mut(child).unwrap();
         l.visible = true;
-        l.fill_color = Some([4, 5, 6, 255]);
         l.rect = Rect::new(2, 2, 3, 3);
     }
+    attach_image(&mut scene, child, 3, 3);
 
-    let projected = project_window(&scene, win, |_| None);
+    let projected = project_window(&scene, win, |_| Some(null_texture(1, 1)));
     let nodes = drawable_nodes(&projected);
     assert_eq!(nodes.len(), 1, "an invisible parent hides its subtree");
     assert_eq!(nodes[0].dst, RectF::new(1.0, 1.0, 4.0, 4.0));
@@ -483,9 +453,9 @@ fn cached_layer_draws_its_bitmap_and_hides_its_subtree() {
     {
         let l = scene.layer_mut(child).unwrap();
         l.visible = true;
-        l.fill_color = Some([1, 2, 3, 255]);
         l.rect = Rect::new(0, 0, 8, 8);
     }
+    attach_image(&mut scene, child, 8, 8);
 
     let projected = project_window(&scene, win, |id| {
         if id == cache {

@@ -120,7 +120,11 @@ fn perspective_copy_identity_copies_the_source() {
     let env = Env::new();
     two_layers(&env);
     let dst = env.layer_id("dst");
-    assert_eq!(env.pixel(dst, 1, 1), [0, 0, 0, 0]);
+    // The untouched pixel is the reference's default image: transparent white
+    // `TVP_RGBA2COLOR(255, 255, 255, 0)`, filled by `setImageSize`
+    // (`reference/cpp/core/visual/LayerIntf.cpp:104-110,2313`) — not a
+    // cleared `[0, 0, 0, 0]`.
+    assert_eq!(env.pixel(dst, 1, 1), [255, 255, 255, 0]);
     env.run("dst.perspectiveCopy(src, 0, 0, 4, 4, 0, 0, 4, 0, 0, 4, 4, 4);");
     assert_eq!(env.pixel(dst, 1, 1), [255, 0, 0, 255]);
     assert_eq!(env.pixel(dst, 3, 3), [255, 0, 0, 255]);
@@ -137,9 +141,11 @@ fn perspective_copy_maps_to_a_smaller_quad() {
     env.run("dst.perspectiveCopy(src, 0, 0, 4, 4, 1, 1, 3, 1, 1, 3, 3, 3);");
     assert_eq!(env.pixel(dst, 1, 1), [255, 0, 0, 255]);
     assert_eq!(env.pixel(dst, 2, 2), [255, 0, 0, 255]);
-    // Outside the quad stays untouched.
-    assert_eq!(env.pixel(dst, 0, 0), [0, 0, 0, 0]);
-    assert_eq!(env.pixel(dst, 3, 3), [0, 0, 0, 0]);
+    // Outside the quad stays at the reference's default image (transparent
+    // white, `reference/cpp/core/visual/LayerIntf.cpp:104-110,400`), not a
+    // cleared colour.
+    assert_eq!(env.pixel(dst, 0, 0), [255, 255, 255, 0]);
+    assert_eq!(env.pixel(dst, 3, 3), [255, 255, 255, 0]);
 }
 
 #[test]
@@ -391,7 +397,9 @@ fn path_value_type_builds_and_draws() {
          dst.drawPath(app, p);",
     );
     assert_eq!(env.pixel(dst, 2, 2), [0, 255, 0, 255]);
-    assert_eq!(env.pixel(dst, 0, 0), [0, 0, 0, 0]);
+    // The corner was never drawn on: it holds the reference's default image
+    // (transparent white, `reference/cpp/core/visual/LayerIntf.cpp:104-110,400`).
+    assert_eq!(env.pixel(dst, 0, 0), [255, 255, 255, 0]);
 
     // The remaining Path members are callable and mutate the path.
     env.run(
@@ -470,7 +478,9 @@ fn layer_transforms_apply_to_drawing() {
          dst.drawRectangle(app, 0, 0, 2, 2);",
     );
     assert_eq!(env.pixel(dst, 3, 3), [255, 0, 0, 255]);
-    assert_eq!(env.pixel(dst, 0, 0), [0, 0, 0, 0]);
+    // The translated draw leaves the origin at the reference's default image
+    // (transparent white, `reference/cpp/core/visual/LayerIntf.cpp:104-110,400`).
+    assert_eq!(env.pixel(dst, 0, 0), [255, 255, 255, 0]);
     env.run("dst.resetTransform(); dst.translateViewTransform(1, 1); dst.smoothingMode = 4;");
     assert_eq!(env.eval_int("dst.smoothingMode == 4"), 1);
     assert_eq!(env.eval_int("dst.updateWhenDraw"), 1);

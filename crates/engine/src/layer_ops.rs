@@ -1351,8 +1351,9 @@ pub fn stretch_blit_plane(
     dst.mark_dirty();
 }
 
-/// `TVPDoGrayScale`: luma `(19*R + 183*G + 54*B) >> 8` in all three channels,
-/// alpha held (`tvpgl.cpp:10350`).
+/// `TVPDoGrayScale`: luma `(54*R + 183*G + 19*B) >> 8` in all three channels,
+/// alpha held (`tvpgl.cpp:10350-10400`; the reference's packed color is
+/// `TVP_RGBA2COLOR`, `tvpgl.h:1102-1103`, so its lowest byte is blue).
 pub fn do_gray_scale(bitmap: &mut BitmapState, rect: RectI) {
     let Some((x0, y0, x1, y1)) = intersect(bitmap, rect) else {
         return;
@@ -1361,7 +1362,7 @@ pub fn do_gray_scale(bitmap: &mut BitmapState, rect: RectI) {
         for x in x0..x1 {
             let mut d = read_pixel(bitmap, x, y);
             let gray =
-                ((19 * u32::from(d[0]) + 183 * u32::from(d[1]) + 54 * u32::from(d[2])) >> 8) as u8;
+                ((54 * u32::from(d[0]) + 183 * u32::from(d[1]) + 19 * u32::from(d[2])) >> 8) as u8;
             d[0] = gray;
             d[1] = gray;
             d[2] = gray;
@@ -2013,19 +2014,13 @@ pub fn affine_blit(
 // use, so any later read of the primary as an image source returns a real
 // screen buffer.
 
-/// One layer's contribution to the primary-layer composite.
-enum PrimaryDrawSource {
-    /// The layer's own MainImage (cloned so the primary can be borrowed
-    /// mutably while blitting).
-    Bitmap(BitmapState),
-    /// A solid fill for a bitmapless fill layer.
-    Solid([u8; 4]),
-}
-
+/// One layer's contribution to the primary-layer composite: the layer's own
+/// MainImage, cloned so the primary can be borrowed mutably while blitting.
+///
 /// A resolved, back-to-front draw command for the primary composite. All
 /// coordinates are absolute window coordinates; `src` is in source pixels.
 struct PrimaryDraw {
-    source: PrimaryDrawSource,
+    source: BitmapState,
     dx: i32,
     dy: i32,
     src: RectI,
@@ -2083,11 +2078,25 @@ fn primary_target_size(scene: &Scene, primary_id: u32, window: u32) -> Option<(u
 /// already attached (or a previous composite) is left untouched.
 fn ensure_primary_bitmap(scene: &mut Scene, primary_id: u32, w: u32, h: u32) -> Option<u32> {
     if let Some(bitmap_id) = scene.layer(primary_id)?.bitmap {
-        // Reusing an existing buffer: the composite below overwrites it
-        // entirely, so it becomes the screen buffer either way.
+        // Reusing an existing buffer: resize it to the window's logical size
+        // (the layer's default image may be smaller), then the composite
+        // below overwrites it entirely, so it becomes the screen buffer.
+        let matches = scene
+            .bitmap(bitmap_id)
+            .is_some_and(|bitmap| bitmap.width == w && bitmap.height == h);
+        if !matches && !scene.resize_bitmap(bitmap_id, w, h, [0, 0, 0, 0]) {
+            return None;
+        }
         if let Some(bitmap) = scene.bitmap_mut(bitmap_id) {
             bitmap.screen_buffer = true;
         }
+        let layer = scene.layer_mut(primary_id)?;
+        layer.image_left = 0;
+        layer.image_top = 0;
+        layer.image_width = w;
+        layer.image_height = h;
+        layer.clip = None;
+        layer.image_modified = true;
         return Some(bitmap_id);
     }
     let bytes = (w as usize)
@@ -2153,7 +2162,8 @@ fn node_opacity(scene: &Scene, id: u32) -> f32 {
 /// primitives `copyRect`/`piledCopy` use: an opaque full-alpha mode copies,
 /// source-over uses [`blit_over`], and the remaining modes go through
 /// [`operate_rect`].
-fn draw_primary_bitmap(dst: &mut BitmapState, draw: &PrimaryDraw, src: &BitmapState) {
+fn draw_primary_bitmap(dst: &mut BitmapState, draw: &PrimaryDraw) {
+    let src = &draw.source;
     let full = (i32::MIN, i32::MIN, i32::MAX, i32::MAX);
     match draw.mode {
         // ltBinder: a container layer draws nothing itself.
@@ -2167,28 +2177,6 @@ fn draw_primary_bitmap(dst: &mut BitmapState, draw: &PrimaryDraw, src: &BitmapSt
         ),
         mode => operate_rect(dst, draw.dx, draw.dy, src, draw.src, mode, draw.opa, false),
     }
-}
-
-/// Fill a bitmapless solid layer's rect on the primary buffer.
-fn draw_primary_solid(dst: &mut BitmapState, draw: &PrimaryDraw, color: [u8; 4]) {
-    let (sx, sy, sx1, sy1) = draw.src;
-    let dest = (
-        draw.dx,
-        draw.dy,
-        draw.dx.saturating_add(sx1.saturating_sub(sx)),
-        draw.dy.saturating_add(sy1.saturating_sub(sy)),
-    );
-    let Some((x0, y0, x1, y1)) = intersect(dst, dest) else {
-        return;
-    };
-    for y in y0..y1 {
-        for x in x0..x1 {
-            if draw.mode != 0 {
-                blend_pixel_mode(dst, x, y, color, draw.opa, draw.mode);
-            }
-        }
-    }
-    dst.mark_dirty();
 }
 
 /// Composite the window's currently-visible layer tree into its primary
@@ -2247,19 +2235,10 @@ pub fn composite_primary_layer(scene: &mut Scene, primary_id: u32) -> Option<u32
             let sx = dx0 - img_x;
             let sy = dy0 - img_y;
             draws.push(PrimaryDraw {
-                source: PrimaryDrawSource::Bitmap(src),
+                source: src,
                 dx: dx0,
                 dy: dy0,
                 src: (sx, sy, sx + (dx1 - dx0), sy + (dy1 - dy0)),
-                mode: blend_operation_mode(layer.blend),
-                opa,
-            });
-        } else if let Some(fill) = layer.fill_color {
-            draws.push(PrimaryDraw {
-                source: PrimaryDrawSource::Solid(fill),
-                dx: ax,
-                dy: ay,
-                src: (0, 0, layer.rect.w as i32, layer.rect.h as i32),
                 mode: blend_operation_mode(layer.blend),
                 opa,
             });
@@ -2275,10 +2254,7 @@ pub fn composite_primary_layer(scene: &mut Scene, primary_id: u32) -> Option<u32
     let primary = scene.bitmap_mut(bitmap_id)?;
     primary.rgba.fill(0);
     for draw in &draws {
-        match &draw.source {
-            PrimaryDrawSource::Bitmap(src) => draw_primary_bitmap(primary, draw, src),
-            PrimaryDrawSource::Solid(color) => draw_primary_solid(primary, draw, *color),
-        }
+        draw_primary_bitmap(primary, draw);
     }
     primary.mark_dirty();
     Some(bitmap_id)
@@ -2339,7 +2315,7 @@ fn ensure_layer_cache(scene: &mut Scene, root: u32, w: u32, h: u32) -> Option<u3
 /// One resolved draw for the subtree cache, with the layer's own placement
 /// (the reference `ImageLeft/Top/Width/Height` transform) and draw face.
 struct SubtreeDraw {
-    source: SubtreeSource,
+    source: BitmapState,
     dx: i32,
     dy: i32,
     /// Destination size in cache pixels; differs from the source region only
@@ -2351,12 +2327,6 @@ struct SubtreeDraw {
     mode: i64,
     opa: u8,
     hold_alpha: bool,
-}
-
-/// The pixel source of one subtree draw.
-enum SubtreeSource {
-    Bitmap(BitmapState),
-    Solid([u8; 4]),
 }
 
 /// A `width` x `height` grayscale image (the `dfMask`/`dfProvince` face).
@@ -2514,46 +2484,28 @@ fn collect_subtree_draws(scene: &Scene, root: u32, w: u32, h: u32) -> Vec<Subtre
         let (ax, ay) = scene.absolute_offset(id).unwrap_or((0, 0));
         let rel_x = ax.saturating_sub(root_ax);
         let rel_y = ay.saturating_sub(root_ay);
-        if let Some(source) = subtree_source_image(scene, layer) {
-            if source.width == 0 || source.height == 0 {
-                continue;
-            }
-            let Some((src, dest)) =
-                subtree_placement(layer, rel_x, rel_y, source.width, source.height, w, h)
-            else {
-                continue;
-            };
-            draws.push(SubtreeDraw {
-                source: SubtreeSource::Bitmap(source),
-                dx: dest.0,
-                dy: dest.1,
-                dw: dest.2 - dest.0,
-                dh: dest.3 - dest.1,
-                src,
-                mode: blend_operation_mode(layer.blend),
-                opa,
-                hold_alpha: layer.hold_alpha,
-            });
-        } else if let Some(fill) = layer.fill_color {
-            let dx0 = rel_x.max(0);
-            let dy0 = rel_y.max(0);
-            let dx1 = rel_x.saturating_add(layer.rect.w as i32).min(w as i32);
-            let dy1 = rel_y.saturating_add(layer.rect.h as i32).min(h as i32);
-            if dx1 <= dx0 || dy1 <= dy0 {
-                continue;
-            }
-            draws.push(SubtreeDraw {
-                source: SubtreeSource::Solid(fill),
-                dx: dx0,
-                dy: dy0,
-                dw: dx1 - dx0,
-                dh: dy1 - dy0,
-                src: (0, 0, dx1 - dx0, dy1 - dy0),
-                mode: blend_operation_mode(layer.blend),
-                opa,
-                hold_alpha: layer.hold_alpha,
-            });
+        let Some(source) = subtree_source_image(scene, layer) else {
+            continue;
+        };
+        if source.width == 0 || source.height == 0 {
+            continue;
         }
+        let Some((src, dest)) =
+            subtree_placement(layer, rel_x, rel_y, source.width, source.height, w, h)
+        else {
+            continue;
+        };
+        draws.push(SubtreeDraw {
+            source,
+            dx: dest.0,
+            dy: dest.1,
+            dw: dest.2 - dest.0,
+            dh: dest.3 - dest.1,
+            src,
+            mode: blend_operation_mode(layer.blend),
+            opa,
+            hold_alpha: layer.hold_alpha,
+        });
     }
     draws
 }
@@ -2611,72 +2563,51 @@ pub fn render_layer_subtree(scene: &mut Scene, root: u32) -> Option<u32> {
     target.rgba.fill(0);
     let full = (i32::MIN, i32::MIN, i32::MAX, i32::MAX);
     for draw in &draws {
-        match &draw.source {
-            SubtreeSource::Bitmap(src) => {
-                if draw.dw == src.width as i32 && draw.dh == src.height as i32 {
-                    match draw.mode {
-                        0 => {}
-                        1 if draw.opa == 255 => {
-                            blit_copy_clipped(target, draw.dx, draw.dy, src, draw.src, full);
-                        }
-                        1 | 2 | 13 => blit_over(
-                            target,
-                            draw.dx,
-                            draw.dy,
-                            src,
-                            draw.src,
-                            full,
-                            draw.opa,
-                            false,
-                            draw.hold_alpha,
-                        ),
-                        mode => operate_rect(
-                            target,
-                            draw.dx,
-                            draw.dy,
-                            src,
-                            draw.src,
-                            mode,
-                            draw.opa,
-                            draw.hold_alpha,
-                        ),
-                    }
-                } else {
-                    stretch_blit_mode(
-                        target,
-                        (
-                            draw.dx,
-                            draw.dy,
-                            draw.dx.saturating_add(draw.dw),
-                            draw.dy.saturating_add(draw.dh),
-                        ),
-                        src,
-                        draw.src,
-                        1, // stFastLinear
-                        draw.mode,
-                        draw.opa,
-                        draw.hold_alpha,
-                    );
+        let src = &draw.source;
+        if draw.dw == src.width as i32 && draw.dh == src.height as i32 {
+            match draw.mode {
+                0 => {}
+                1 if draw.opa == 255 => {
+                    blit_copy_clipped(target, draw.dx, draw.dy, src, draw.src, full);
                 }
+                1 | 2 | 13 => blit_over(
+                    target,
+                    draw.dx,
+                    draw.dy,
+                    src,
+                    draw.src,
+                    full,
+                    draw.opa,
+                    false,
+                    draw.hold_alpha,
+                ),
+                mode => operate_rect(
+                    target,
+                    draw.dx,
+                    draw.dy,
+                    src,
+                    draw.src,
+                    mode,
+                    draw.opa,
+                    draw.hold_alpha,
+                ),
             }
-            SubtreeSource::Solid(color) => {
-                let dest = (
+        } else {
+            stretch_blit_mode(
+                target,
+                (
                     draw.dx,
                     draw.dy,
                     draw.dx.saturating_add(draw.dw),
                     draw.dy.saturating_add(draw.dh),
-                );
-                if let Some((x0, y0, x1, y1)) = intersect(target, dest) {
-                    for y in y0..y1 {
-                        for x in x0..x1 {
-                            if draw.mode != 0 {
-                                blend_pixel_mode(target, x, y, *color, draw.opa, draw.mode);
-                            }
-                        }
-                    }
-                    target.mark_dirty();
-                }
-            }
+                ),
+                src,
+                draw.src,
+                1, // stFastLinear
+                draw.mode,
+                draw.opa,
+                draw.hold_alpha,
+            );
         }
     }
     target.mark_dirty();

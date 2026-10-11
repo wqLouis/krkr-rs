@@ -14,6 +14,15 @@ fn bitmap(width: u32, height: u32, rgba: Vec<u8>) -> BitmapState {
     BitmapState::new(width, height, rgba)
 }
 
+/// A `width` x `height` bitmap filled with one straight-alpha color.
+fn solid_bitmap(scene: &mut Scene, width: u32, height: u32, color: [u8; 4]) -> u32 {
+    let mut rgba = Vec::new();
+    for _ in 0..width * height {
+        rgba.extend_from_slice(&color);
+    }
+    scene.add_bitmap(width, height, rgba)
+}
+
 /// The original `blur_bitmap_in_place`: a 2-D clamped box sum with one final
 /// integer division. The rewrite must reproduce it byte-for-byte.
 fn naive_box_blur(bitmap: &BitmapState, xradius: u32, yradius: u32) -> Vec<u8> {
@@ -104,21 +113,23 @@ fn primary_composite_honours_the_layer_blend_mode() {
 
     // Opaque grey background.
     let background = scene.add_layer(win, Some(primary));
+    let background_bitmap = solid_bitmap(&mut scene, 2, 2, [100, 100, 100, 255]);
     {
         let l = scene.layer_mut(background).unwrap();
         l.visible = true;
         l.rect = Rect::new(0, 0, 2, 2);
-        l.fill_color = Some([100, 100, 100, 255]);
+        l.bitmap = Some(background_bitmap);
     }
 
     // Multiplicative grey foreground: 100 * 50 / 255 = 19, not the 50 a
     // source-over composite would produce.
     let foreground = scene.add_layer(win, Some(primary));
+    let foreground_bitmap = solid_bitmap(&mut scene, 2, 2, [50, 50, 50, 255]);
     {
         let l = scene.layer_mut(foreground).unwrap();
         l.visible = true;
         l.rect = Rect::new(0, 0, 2, 2);
-        l.fill_color = Some([50, 50, 50, 255]);
+        l.bitmap = Some(foreground_bitmap);
         l.blend = BlendMode::Multiply;
     }
 
@@ -137,11 +148,12 @@ fn render_layer_subtree_composites_children_into_a_cache() {
     let parent = scene.add_layer(win, None);
     scene.layer_mut(parent).unwrap().rect = Rect::new(0, 0, 2, 2);
     let child = scene.add_layer(win, Some(parent));
+    let child_bitmap = solid_bitmap(&mut scene, 2, 2, [10, 20, 30, 255]);
     {
         let l = scene.layer_mut(child).unwrap();
         l.rect = Rect::new(0, 0, 2, 2);
         l.visible = true;
-        l.fill_color = Some([10, 20, 30, 255]);
+        l.bitmap = Some(child_bitmap);
     }
 
     let cache = render_layer_subtree(&mut scene, parent).expect("cache bitmap");

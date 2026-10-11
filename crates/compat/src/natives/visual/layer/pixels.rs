@@ -41,11 +41,11 @@ const OM_OPAQUE: i64 = 1;
 const OM_ALPHA: i64 = 2;
 const OM_AUTO: i64 = 128;
 /// Draw faces (`tTVPDrawFace`, `reference/cpp/core/visual/LayerIntf.h:59-68`).
-const DF_ALPHA: i32 = 0;
-const DF_OPAQUE: i32 = 1;
-const DF_MASK: i32 = 2;
-const DF_PROVINCE: i32 = 3;
-const DF_ADD_ALPHA: i32 = 4;
+pub(super) const DF_ALPHA: i32 = 0;
+pub(super) const DF_OPAQUE: i32 = 1;
+pub(super) const DF_MASK: i32 = 2;
+pub(super) const DF_PROVINCE: i32 = 3;
+pub(super) const DF_ADD_ALPHA: i32 = 4;
 /// `dfAuto` — the face is chosen automatically from the layer type
 /// (`LayerIntf.h:67`).
 const DF_AUTO: i32 = 128;
@@ -142,16 +142,8 @@ fn restore_alpha_inside_clip(dst: &mut BitmapState, before: &BitmapState, clip: 
     dst.mark_dirty();
 }
 
-/// The destination bitmap + `HoldAlpha` flag of a layer, or `None` when the
-/// layer has no main image.
-///
-/// An imageless layer has an **empty** clip rectangle in the reference (the
-/// constructor zeroes it, `reference/cpp/core/visual/LayerIntf.cpp:375-378`,
-/// and `ResetClip`, the only thing that widens it, raises without an image,
-/// `:4034-4039`), so a destination-rectangle operation clips the whole
-/// rectangle away and returns before reaching the image (`CopyRect`,
-/// `LayerIntf.cpp:4578-4579`; `FillRect`, `:8977-8978`). `None` therefore
-/// means "no image: the operation is a no-op", never an error.
+/// The destination bitmap + `HoldAlpha` flag of a layer, or `None` when its
+/// MainImage has been deallocated (`Layer.hasImage = false`).
 fn dest_info(scene: &Scene, id: u32, method: &str) -> Result<Option<(u32, bool)>, String> {
     let layer = scene
         .layer(id)
@@ -163,7 +155,7 @@ fn dest_info(scene: &Scene, id: u32, method: &str) -> Result<Option<(u32, bool)>
 /// `UpdateDrawFace` (`reference/cpp/core/visual/LayerIntf.cpp:1525-1620`):
 /// when `face == dfAuto` the face is derived from the layer type, otherwise
 /// the stored face is used verbatim.
-fn draw_face(scene: &Scene, id: u32) -> i32 {
+pub(super) fn draw_face(scene: &Scene, id: u32) -> i32 {
     let Some(layer) = scene.layer(id) else {
         return DF_ALPHA;
     };
@@ -1112,7 +1104,7 @@ extern "C" fn layer_color_rect(
     }
 }
 
-fn fill_province_region(scene: &mut Scene, id: u32, dest: RectI, value: u8) {
+pub(super) fn fill_province_region(scene: &mut Scene, id: u32, dest: RectI, value: u8) {
     let Some(layer) = scene.layer_mut(id) else {
         return;
     };
@@ -2369,46 +2361,27 @@ fn layer_draw_text_common(
 /// Ensure the layer has a main-image bitmap, allocating a transparent one
 /// sized from the layer rectangle when it does not. Returns the bitmap id.
 fn ensure_layer_bitmap(scene: &mut Scene, layer_id: u32, method: &str) -> Result<u32, String> {
-    if let Some(id) = scene.layer(layer_id).and_then(|layer| layer.bitmap) {
-        return Ok(id);
-    }
-    let (width, height, fill) = {
+    let (width, height) = {
         let layer = scene
             .layer(layer_id)
             .ok_or_else(|| format!("Layer.{method}: this layer no longer exists"))?;
-        (
-            layer.rect.w,
-            layer.rect.h,
-            argb_to_rgba(layer.neutral_color),
-        )
+        if let Some(id) = layer.bitmap {
+            return Ok(id);
+        }
+        (layer.rect.w, layer.rect.h)
     };
     if width == 0 || height == 0 {
         return Err(format!(
             "Layer.{method}: unsupported layer type (no main image)"
         ));
     }
-    let Some(pixels) = (width as usize)
-        .checked_mul(height as usize)
-        .and_then(|count| count.checked_mul(4))
-    else {
-        return Err(format!("Layer.{method}: the layer rectangle is too large"));
-    };
-    let mut rgba = Vec::new();
-    if rgba.try_reserve_exact(pixels).is_err() {
+    if !scene.ensure_layer_image(layer_id, width, height) {
         return Err(format!("Layer.{method}: the layer rectangle is too large"));
     }
-    rgba.resize(pixels, 0);
-    for chunk in rgba.chunks_exact_mut(4) {
-        chunk.copy_from_slice(&fill);
-    }
-    let id = scene.add_bitmap(width, height, rgba);
-    if let Some(layer) = scene.layer_mut(layer_id) {
-        layer.bitmap = Some(id);
-        layer.image_width = width;
-        layer.image_height = height;
-        layer.image_modified = true;
-    }
-    Ok(id)
+    scene
+        .layer(layer_id)
+        .and_then(|layer| layer.bitmap)
+        .ok_or_else(|| format!("Layer.{method}: the layer has no main image"))
 }
 
 // ---------------------------------------------------------------------------

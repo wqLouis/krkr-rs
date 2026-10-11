@@ -9,14 +9,13 @@ use api::host::SurfaceEvent;
 use common::{build_solid_and_bitmap_scene, headless_host};
 
 #[test]
-fn headless_frame_draws_solid_and_texture_nodes() {
+fn headless_frame_draws_texture_nodes() {
     let mut host = headless_host();
     build_solid_and_bitmap_scene(host.scene_mut());
 
     let report = host.step(16.0).expect("step");
     let stats = report.stats.expect("null frame stats");
-    assert!(stats.solid_draws >= 1, "expected a solid fill layer");
-    assert!(stats.texture_draws >= 1, "expected a bitmap layer");
+    assert!(stats.texture_draws >= 2, "expected both layers as textures");
     assert_eq!(stats.missing_textures, 0, "dirty bitmaps must be uploaded");
     assert_eq!(report.frame_index, 1);
 }

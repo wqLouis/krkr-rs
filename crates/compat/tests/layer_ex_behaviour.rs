@@ -613,23 +613,31 @@ fn fontinfo_metrics_are_reals() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn appearance_mutators_require_their_declared_arity() {
+fn appearance_mutators_require_the_full_reference_arity() {
     let _lock = vm_lock();
     let env = Env::new();
     // `void addBrush(tTJSVariant, REAL ox = 0, REAL oy = 0)` and
-    // `void addPen(tTJSVariant, tTJSVariant, REAL ox = 0, REAL oy = 0)` are
-    // C++ default arguments only; NCB still requires the full parameter list
-    // (`reference/cpp/plugins/layerex_draw/windows/LayerExDraw.cpp:767,778`
-    // and `reference/cpp/core/plugin/ncbind.hpp:1178`).
-    assert!(
-        env.try_run("(new GdiPlus.Appearance()).addBrush(0xFFFF0000);")
-            .is_err()
+    // `void addPen(tTJSVariant, tTJSVariant, REAL ox = 0, REAL oy = 0)`
+    // (`reference/cpp/plugins/layerex_draw/blend2d/LayerExDraw.hpp:921,930`).
+    // A default argument is not part of a C++ member-pointer type, so ncbind's
+    // `ArgsCount` is the full parameter count and `doInvoke` rejects a short
+    // call before the void-default path
+    // (`reference/cpp/core/plugin/ncbind.hpp:921,1178`).
+    env.run(
+        "var app = new GdiPlus.Appearance(); \
+         app.addBrush(0xFFFF0000, 0, 0); \
+         app.addPen(0xFF00FF00, 1, 0, 0);",
     );
-    assert!(
-        env.try_run("(new GdiPlus.Appearance()).addPen(0xFFFF0000, 1);")
-            .is_err()
-    );
-    env.run("var app = new GdiPlus.Appearance(); app.addBrush(0xFFFF0000, 0, 0); app.addPen(0xFF00FF00, 1, 0, 0);");
+    for short in [
+        "(new GdiPlus.Appearance()).addBrush();",
+        "(new GdiPlus.Appearance()).addBrush(0xFFFF0000);",
+        "(new GdiPlus.Appearance()).addBrush(0xFFFF0000, 1);",
+        "(new GdiPlus.Appearance()).addPen(0xFFFF0000);",
+        "(new GdiPlus.Appearance()).addPen(0xFFFF0000, 1);",
+        "(new GdiPlus.Appearance()).addPen(0xFFFF0000, 1, 2);",
+    ] {
+        assert!(env.try_run(short).is_err(), "{short} should raise");
+    }
 }
 
 #[test]
@@ -721,7 +729,9 @@ fn path_rectangle_and_polygon_fill_the_closed_area() {
          dst.drawPath(app, p);",
     );
     assert_eq!(env.pixel(dst, 2, 2), [0, 255, 0, 255]);
-    assert_eq!(env.pixel(dst, 0, 0), [0, 0, 0, 0]);
+    // The corner was never drawn on: it holds the reference's default image
+    // (transparent white, `reference/cpp/core/visual/LayerIntf.cpp:104-110,400`).
+    assert_eq!(env.pixel(dst, 0, 0), [255, 255, 255, 0]);
 
     // `Path::drawPolygon` also closes its own figure
     // (`reference/cpp/plugins/layerex_draw/blend2d/LayerExDraw.cpp:1405-1425`).
@@ -804,7 +814,9 @@ fn perspective_copy_maps_the_source_quad() {
     env.run("dst.perspectiveCopy(src, 0, 0, 4, 4, 1, 1, 3, 1, 1, 3, 3, 3);");
     assert_eq!(env.pixel(dst, 1, 1), [255, 0, 0, 255]);
     assert_eq!(env.pixel(dst, 2, 2), [255, 0, 0, 255]);
-    assert_eq!(env.pixel(dst, 0, 0), [0, 0, 0, 0]);
+    // Outside the destination quad stays at the reference's default image
+    // (transparent white, `reference/cpp/core/visual/LayerIntf.cpp:104-110,400`).
+    assert_eq!(env.pixel(dst, 0, 0), [255, 255, 255, 0]);
 }
 
 // ---------------------------------------------------------------------------

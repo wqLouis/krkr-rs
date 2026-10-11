@@ -22,8 +22,7 @@
 //!   the render node (downgrading an opaque `Replace` below full opacity).
 //!
 //! Screen-buffer primary layers, hidden/empty layers and layers whose texture
-//! is missing (with no solid fill fallback) are skipped, matching
-//! `sync_scene`.
+//! is missing are skipped, matching `sync_scene`.
 
 use std::collections::{HashMap, HashSet};
 
@@ -187,20 +186,6 @@ pub(crate) fn visible_image_region(
     Some((PixelRegion::new(sx, sy, sw, sh), dest))
 }
 
-/// Convert a straight-alpha `[u8; 4]` fill colour to float straight alpha.
-///
-/// The composed opacity is carried separately in [`RenderNode::opacity`], so
-/// the RGB channels are left untouched (the old renderer baked opacity into
-/// the alpha-only tint; here the pipeline owns that multiplication).
-fn solid_color(color: [u8; 4]) -> [f32; 4] {
-    [
-        color[0] as f32 / 255.0,
-        color[1] as f32 / 255.0,
-        color[2] as f32 / 255.0,
-        color[3] as f32 / 255.0,
-    ]
-}
-
 /// Whether `layer_id`'s bitmap is a synthesized **screen buffer** (a window
 /// primary layer's composited `MainImage`) rather than drawable content.
 ///
@@ -342,27 +327,20 @@ fn append_window<F>(
             let opacity = win_opacity * node_composed.opacity;
             let blend = resolve_blend(layer.blend, opacity);
 
-            // A bitmap layer draws its texture; a fill layer draws its solid
-            // colour; a layer with neither draws nothing. A cached layer
-            // draws its rendered bitmap in place of its MainImage.
+            // A layer draws its texture; a cached layer draws its rendered
+            // bitmap in place of its MainImage; a layer with neither draws
+            // nothing.
             let resolved_texture = match cached_bitmap.or(layer.bitmap) {
                 Some(id) => texture(id),
                 None => None,
             };
-            let content = match resolved_texture {
-                Some(handle) => RenderContent::Texture(handle),
-                None => match layer.fill_color {
-                    Some(fill) => RenderContent::Solid(solid_color(fill)),
-                    None => {
-                        empty += 1;
-                        break 'layer None;
-                    }
-                },
+            let Some(content) = resolved_texture.map(RenderContent::Texture) else {
+                empty += 1;
+                break 'layer None;
             };
 
             // A texture's destination/source come from the image placement
-            // model; a solid fill covers the whole layer rect with no source
-            // region.
+            // model.
             let (dst, src) = match &content {
                 RenderContent::Texture(_) => {
                     // The cache is the layer's own rendered content: it draws

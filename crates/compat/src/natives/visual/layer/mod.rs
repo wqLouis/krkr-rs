@@ -112,68 +112,6 @@ fn register_layer(ctx: &CompatCtx, host: &Tjs2Engine, id: u32, objthis: *mut c_v
     }
 }
 
-/// Allocate (or resize) a layer's MainImage to at least `width` x `height`,
-/// preserving content and filling expansion with the layer's `neutral_color`
-/// (reference `AllocateImage` / `ChangeImageSize`).
-fn ensure_layer_image(scene: &mut Scene, layer_id: u32, width: u32, height: u32) {
-    let width = width.max(1);
-    let height = height.max(1);
-    let (bitmap, fill) = {
-        let Some(layer) = scene.layer(layer_id) else {
-            return;
-        };
-        (layer.bitmap, argb_to_rgba(layer.neutral_color))
-    };
-    match bitmap {
-        Some(bitmap_id) => {
-            scene.resize_bitmap(bitmap_id, width, height, fill);
-        }
-        None => {
-            let Some(pixels) = (width as usize)
-                .checked_mul(height as usize)
-                .and_then(|count| count.checked_mul(4))
-            else {
-                return;
-            };
-            let mut rgba = vec![0u8; pixels];
-            for chunk in rgba.chunks_exact_mut(4) {
-                chunk.copy_from_slice(&fill);
-            }
-            let bitmap_id = scene.add_bitmap(width, height, rgba);
-            if let Some(layer) = scene.layer_mut(layer_id) {
-                layer.bitmap = Some(bitmap_id);
-                layer.image_left = 0;
-                layer.image_top = 0;
-            }
-        }
-    }
-    if let Some(layer) = scene.layer_mut(layer_id) {
-        layer.image_width = width;
-        layer.image_height = height;
-        layer.clip = None;
-        layer.image_modified = true;
-    }
-    if scene.layer(layer_id).is_some_and(|l| l.province.is_some()) {
-        scene.resize_province_image(layer_id, width, height);
-    }
-}
-
-/// Mark a layer's image modified and refresh the tracked image window.
-fn mark_layer_image_changed(scene: &mut Scene, layer_id: u32) {
-    let dims = scene
-        .layer(layer_id)
-        .and_then(|l| l.bitmap)
-        .and_then(|id| scene.bitmap(id))
-        .map(|b| (b.width, b.height));
-    if let Some((width, height)) = dims
-        && let Some(layer) = scene.layer_mut(layer_id)
-    {
-        layer.image_width = width;
-        layer.image_height = height;
-        layer.image_modified = true;
-    }
-}
-
 /// Build a TJS array of retained Layer objects (used by `Layer.children`).
 fn layer_array(
     host: &Tjs2Engine,
@@ -314,6 +252,12 @@ extern "C" fn layer_ctor(
         },
     };
     let id = scene.add_layer(window, parent);
+    if let Some(layer) = scene.layer_mut(id) {
+        layer.rect = Rect::new(0, 0, 32, 32);
+    }
+    if !scene.ensure_layer_image(id, 32, 32) {
+        return report_error(out_error, "Layer: could not allocate the default image");
+    }
     inst.id = Some(id);
     log::debug!("Layer created: id={id} parent={parent:?}");
     register_layer(&ctx, resolved.engine(), id, objthis);
@@ -361,7 +305,7 @@ extern "C" fn layer_set_pos(
         }
     }
     if size.is_some() {
-        mark_layer_image_changed(scene, id);
+        scene.layer_size_changed(id);
     }
     set_void(out);
     0
@@ -398,7 +342,7 @@ extern "C" fn layer_set_size(
         layer.rect.w = width;
         layer.rect.h = height;
     }
-    mark_layer_image_changed(scene, id);
+    scene.layer_size_changed(id);
     set_void(out);
     0
 }
@@ -474,9 +418,39 @@ extern "C" fn layer_set_image_pos(
         Ok(scene) => scene,
         Err(error) => return report_error(out_error, &error),
     };
-    if let Some(layer) = scene.layer_mut(id) {
-        layer.image_left = left;
-        layer.image_top = top;
+    let (has_image, image_width, image_height, rect_w, rect_h, current_left, current_top) =
+        match scene.layer(id) {
+            Some(layer) => (
+                layer.bitmap.is_some(),
+                layer.image_width,
+                layer.image_height,
+                layer.rect.w,
+                layer.rect.h,
+                layer.image_left,
+                layer.image_top,
+            ),
+            None => {
+                return report_error(
+                    out_error,
+                    "Layer.setImagePos: this layer is not constructed",
+                );
+            }
+        };
+    if !has_image {
+        return report_error(out_error, "Layer.setImagePos: this layer has no main image");
+    }
+    if current_left != left || current_top != top {
+        let invalid = left > 0
+            || top > 0
+            || i64::from(image_width) + i64::from(left) < i64::from(rect_w)
+            || i64::from(image_height) + i64::from(top) < i64::from(rect_h);
+        if invalid {
+            return report_error(out_error, "Layer.setImagePos: invalid image position");
+        }
+        if let Some(layer) = scene.layer_mut(id) {
+            layer.image_left = left;
+            layer.image_top = top;
+        }
     }
     set_void(out);
     0
@@ -512,7 +486,59 @@ extern "C" fn layer_set_image_size(
         Ok(scene) => scene,
         Err(error) => return report_error(out_error, &error),
     };
-    ensure_layer_image(scene, id, width, height);
+    if width == 0 || height == 0 {
+        return report_error(
+            out_error,
+            "Layer.setImageSize: cannot create an empty layer image",
+        );
+    }
+    let (has_image, current_width, current_height) = match scene.layer(id) {
+        Some(layer) => (
+            layer.bitmap.is_some(),
+            layer.image_width,
+            layer.image_height,
+        ),
+        None => {
+            return report_error(
+                out_error,
+                "Layer.setImageSize: this layer is not constructed",
+            );
+        }
+    };
+    if !has_image {
+        return report_error(
+            out_error,
+            "Layer.setImageSize: this layer has no main image",
+        );
+    }
+    if width == current_width && height == current_height {
+        set_void(out);
+        return 0;
+    }
+    if let Some(layer) = scene.layer_mut(id) {
+        if width < layer.rect.w {
+            layer.image_left = 0;
+            layer.rect.w = width;
+        }
+        if i64::from(width) + i64::from(layer.image_left) < i64::from(layer.rect.w) {
+            let left = i64::from(layer.rect.w) - i64::from(width);
+            layer.image_left = left.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+        }
+        if height < layer.rect.h {
+            layer.image_top = 0;
+            layer.rect.h = height;
+        }
+        if i64::from(height) + i64::from(layer.image_top) < i64::from(layer.rect.h) {
+            let top = i64::from(layer.rect.h) - i64::from(height);
+            layer.image_top = top.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+        }
+    }
+    if !scene.set_layer_image_size(id, width, height) {
+        return report_error(
+            out_error,
+            "Layer.setImageSize: could not resize the layer image",
+        );
+    }
     set_void(out);
     0
 }
@@ -724,7 +750,7 @@ extern "C" fn layer_copy_from_bitmap_to_main_image(
             "Layer.copyFromBitmapToMainImage: the bitmap does not exist",
         );
     };
-    ensure_layer_image(scene, id, width, height);
+    scene.set_layer_image_size(id, width, height);
     if let Some(layer_bitmap) = scene.layer(id).and_then(|l| l.bitmap)
         && let Some(bitmap) = scene.bitmap_mut(layer_bitmap)
     {
@@ -1128,28 +1154,47 @@ extern "C" fn layer_fill_rect(
         Ok(scene) => scene,
         Err(error) => return report_error(out_error, &error),
     };
-    let bitmap_id = scene.layer(id).and_then(|layer| layer.bitmap);
-    match bitmap_id {
-        Some(bitmap_id) => {
-            if let Some(bitmap) = scene.bitmap_mut(bitmap_id) {
-                for py in y.max(0)..y.saturating_add(h as i32) {
-                    for px in x.max(0)..x.saturating_add(w as i32) {
-                        if let Some(offset) = bitmap.pixel_offset(px as u32, py as u32) {
-                            bitmap.rgba[offset..offset + 4].copy_from_slice(&color);
-                        }
-                    }
-                }
-                bitmap.mark_dirty();
-            }
-        }
-        None => {
-            if let Some(layer) = scene.layer_mut(id) {
-                layer.fill_color = Some(color);
-                layer.rect.w = layer.rect.w.max(x.max(0) as u32 + w);
-                layer.rect.h = layer.rect.h.max(y.max(0) as u32 + h);
-            }
-        }
+    let w = i32::try_from(w).unwrap_or(i32::MAX);
+    let h = i32::try_from(h).unwrap_or(i32::MAX);
+    let clip = util::layer_clip(scene, id);
+    let Some(dest) =
+        engine::layer_ops::intersect_rect((x, y, x.saturating_add(w), y.saturating_add(h)), clip)
+    else {
+        set_void(out);
+        return 0;
+    };
+    let Some(bitmap_id) = scene.layer(id).and_then(|layer| layer.bitmap) else {
+        return report_error(out_error, "Layer.fillRect: this layer has no main image");
+    };
+    let face = pixels::draw_face(scene, id);
+    if face == pixels::DF_PROVINCE {
+        pixels::fill_province_region(scene, id, dest, color[2]);
+        set_void(out);
+        return 0;
     }
+    let hold_alpha = scene.layer(id).is_some_and(|layer| layer.hold_alpha);
+    let Some(bitmap) = scene.bitmap_mut(bitmap_id) else {
+        return report_error(
+            out_error,
+            "Layer.fillRect: the layer image no longer exists",
+        );
+    };
+    let width = (dest.2 - dest.0) as u32;
+    let height = (dest.3 - dest.1) as u32;
+    match face {
+        pixels::DF_ALPHA | pixels::DF_ADD_ALPHA => {
+            engine::raster::fill_rect_replace(bitmap, dest.0, dest.1, width, height, color);
+        }
+        pixels::DF_OPAQUE if !hold_alpha => {
+            engine::raster::fill_rect_replace(bitmap, dest.0, dest.1, width, height, color);
+        }
+        pixels::DF_OPAQUE => {
+            engine::layer_ops::fill_color_hold_alpha(bitmap, dest, color, 255);
+        }
+        pixels::DF_MASK => engine::layer_ops::fill_mask(bitmap, dest, color[2]),
+        _ => {}
+    }
+    bitmap.mark_dirty();
     set_void(out);
     0
 }
@@ -1449,7 +1494,7 @@ layer_int_prop!(
 layer_int_prop!(
     layer_clip_width_get,
     layer_clip_width_set,
-    |l: &LayerState| i64::from(l.clip.map_or(0, |c| c.w)),
+    |l: &LayerState| i64::from(l.clip.map_or(l.image_width, |c| c.w)),
     |l: &mut LayerState, v: &Value| {
         let rect = l.clip.get_or_insert(Rect::default());
         rect.w = value_as_i64(v).max(0) as u32;
@@ -1458,7 +1503,7 @@ layer_int_prop!(
 layer_int_prop!(
     layer_clip_height_get,
     layer_clip_height_set,
-    |l: &LayerState| i64::from(l.clip.map_or(0, |c| c.h)),
+    |l: &LayerState| i64::from(l.clip.map_or(l.image_height, |c| c.h)),
     |l: &mut LayerState, v: &Value| {
         let rect = l.clip.get_or_insert(Rect::default());
         rect.h = value_as_i64(v).max(0) as u32;
@@ -1605,7 +1650,15 @@ extern "C" fn layer_has_image_set(
     };
     if wanted {
         let (w, h) = scene.layer(id).map_or((1, 1), |l| (l.rect.w, l.rect.h));
-        ensure_layer_image(scene, id, w, h);
+        if !scene.ensure_layer_image(id, w, h) {
+            return report_error(
+                out_error,
+                "Layer.hasImage: could not allocate the main image",
+            );
+        }
+        if let Some(layer) = scene.layer_mut(id) {
+            layer.clip = None;
+        }
     } else {
         let removed = scene.layer_mut(id).and_then(|layer| layer.bitmap.take());
         if let Some(bitmap) = removed {

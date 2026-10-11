@@ -44,6 +44,17 @@ fn dim_i32(v: u32) -> i32 {
     v.min(i32::MAX as u32) as i32
 }
 
+/// A script colour (`0xAARRGGBB`) to straight-alpha RGBA.
+fn argb_to_rgba(color: i64) -> [u8; 4] {
+    let value = color as u32;
+    [
+        (value >> 16) as u8,
+        (value >> 8) as u8,
+        value as u8,
+        (value >> 24) as u8,
+    ]
+}
+
 /// One logical layer (sprite surface) attached to a window.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -71,8 +82,6 @@ pub struct LayerState {
     pub blend: BlendMode,
     /// Z order among sibling layers of the same window.
     pub z_order: i32,
-    /// Solid fill (RGBA, straight alpha) used when there is no bitmap.
-    pub fill_color: Option<[u8; 4]>,
     /// Image placement inside the layer (reference `ImageLeft`/`ImageTop`,
     /// typically ≤ 0) and the drawn image size (`ImageWidth`/`ImageHeight`,
     /// may exceed the layer rect — the layer clips it). The game's buttons
@@ -449,7 +458,6 @@ impl Scene {
             opacity: 1.0,
             blend: BlendMode::SourceOver,
             z_order: 0,
-            fill_color: None,
             image_left: 0,
             image_top: 0,
             image_width: 0,
@@ -478,7 +486,9 @@ impl Scene {
             show_parent_hint: false,
             ignore_hint_sensing: false,
             ime_mode: 0,
-            neutral_color: 0,
+            // Transparent white, the reference `NeutralColor`/`TransparentColor`
+            // initializer (`LayerIntf.cpp:334`), encoded `0xAARRGGBB`.
+            neutral_color: 0x00ff_ffff,
             absolute_order_mode: false,
             call_on_paint: false,
             image_modified: false,
@@ -1421,6 +1431,164 @@ impl Scene {
         bitmap.rgba = rgba;
         bitmap.mark_dirty();
         true
+    }
+
+    /// Give a layer a MainImage of at least `min_w` x `min_h` pixels,
+    /// allocating one when absent and growing it when smaller. Existing
+    /// pixels are preserved and new pixels are filled with the layer's
+    /// neutral color. When the image is created or resized, the tracked image
+    /// size is refreshed and the clip rectangle reset to the whole image, and
+    /// a province plane is resized to match. Returns false when the layer is
+    /// missing or the size cannot be represented.
+    ///
+    /// Reference `AllocateImage` and `ChangeImageSize` (`LayerIntf.cpp:2326`,
+    /// `:2307`).
+    pub fn ensure_layer_image(&mut self, layer_id: u32, min_w: u32, min_h: u32) -> bool {
+        let min_w = min_w.max(1);
+        let min_h = min_h.max(1);
+        let (bitmap, fill) = match self.layer(layer_id) {
+            Some(layer) => (layer.bitmap, argb_to_rgba(layer.neutral_color)),
+            None => return false,
+        };
+        let changed = match bitmap {
+            Some(bitmap_id) => {
+                let Some((w, h)) = self.bitmap(bitmap_id).map(|b| (b.width, b.height)) else {
+                    return false;
+                };
+                if w < min_w || h < min_h {
+                    if !self.resize_bitmap(bitmap_id, w.max(min_w), h.max(min_h), fill) {
+                        return false;
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+            None => {
+                if !self.allocate_layer_bitmap(layer_id, min_w, min_h, fill) {
+                    return false;
+                }
+                true
+            }
+        };
+        if changed {
+            self.sync_layer_image(layer_id);
+        }
+        true
+    }
+
+    /// Resize a layer's MainImage to exactly `width` x `height`, allocating
+    /// it when absent. Existing pixels are preserved and the difference
+    /// filled with the neutral color. The tracked image size is refreshed and
+    /// the clip reset to the whole image, and a province plane is resized to
+    /// match. Returns false when the layer is missing or the size cannot be
+    /// represented.
+    ///
+    /// Reference `ChangeImageSize` (`LayerIntf.cpp:2307`).
+    pub fn set_layer_image_size(&mut self, layer_id: u32, width: u32, height: u32) -> bool {
+        let width = width.max(1);
+        let height = height.max(1);
+        let (bitmap, fill) = match self.layer(layer_id) {
+            Some(layer) => (layer.bitmap, argb_to_rgba(layer.neutral_color)),
+            None => return false,
+        };
+        match bitmap {
+            Some(bitmap_id) => {
+                if !self.resize_bitmap(bitmap_id, width, height, fill) {
+                    return false;
+                }
+            }
+            None => {
+                if !self.allocate_layer_bitmap(layer_id, width, height, fill) {
+                    return false;
+                }
+            }
+        }
+        self.sync_layer_image(layer_id);
+        true
+    }
+
+    /// Grow a layer's MainImage so it covers the layer rectangle and clamp
+    /// `ImageLeft`/`ImageTop`, the reference `ImageLayerSizeChanged`
+    /// (`LayerIntf.cpp:2656`). A layer with no MainImage is left untouched.
+    pub fn layer_size_changed(&mut self, layer_id: u32) {
+        let (rect_w, rect_h) = match self.layer(layer_id) {
+            Some(layer) if layer.bitmap.is_some() => (layer.rect.w, layer.rect.h),
+            _ => return,
+        };
+        self.ensure_layer_image(layer_id, rect_w, rect_h);
+        let Some((bmp_w, bmp_h)) = self
+            .layer(layer_id)
+            .and_then(|layer| layer.bitmap)
+            .and_then(|id| self.bitmap(id))
+            .map(|bitmap| (bitmap.width, bitmap.height))
+        else {
+            return;
+        };
+        if let Some(layer) = self.layer_mut(layer_id) {
+            if i64::from(bmp_w) + i64::from(layer.image_left) < i64::from(layer.rect.w) {
+                let left = i64::from(layer.rect.w) - i64::from(bmp_w);
+                layer.image_left = left.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+            }
+            if i64::from(bmp_h) + i64::from(layer.image_top) < i64::from(layer.rect.h) {
+                let top = i64::from(layer.rect.h) - i64::from(bmp_h);
+                layer.image_top = top.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+            }
+        }
+    }
+
+    /// Attach a freshly allocated `w` x `h` MainImage filled with `fill` to
+    /// the layer, resetting the image offset. Returns false when the size is
+    /// structurally impossible to allocate or the layer is missing.
+    fn allocate_layer_bitmap(&mut self, layer_id: u32, w: u32, h: u32, fill: [u8; 4]) -> bool {
+        let Some(bytes) = (w as usize)
+            .checked_mul(h as usize)
+            .and_then(|count| count.checked_mul(4))
+        else {
+            return false;
+        };
+        let mut rgba = Vec::new();
+        if rgba.try_reserve_exact(bytes).is_err() {
+            return false;
+        }
+        rgba.resize(bytes, 0);
+        for chunk in rgba.chunks_exact_mut(4) {
+            chunk.copy_from_slice(&fill);
+        }
+        let bitmap_id = self.add_bitmap(w, h, rgba);
+        let Some(layer) = self.layer_mut(layer_id) else {
+            return false;
+        };
+        layer.bitmap = Some(bitmap_id);
+        layer.image_left = 0;
+        layer.image_top = 0;
+        true
+    }
+
+    /// Refresh a layer's tracked image size and clip after its MainImage
+    /// changed, and resize its province plane to match. Reference `ResetClip`
+    /// and the province resize in `AllocateImage`/`ChangeImageSize`.
+    fn sync_layer_image(&mut self, layer_id: u32) {
+        let Some((w, h)) = self
+            .layer(layer_id)
+            .and_then(|layer| layer.bitmap)
+            .and_then(|id| self.bitmap(id))
+            .map(|bitmap| (bitmap.width, bitmap.height))
+        else {
+            return;
+        };
+        if let Some(layer) = self.layer_mut(layer_id) {
+            layer.image_width = w;
+            layer.image_height = h;
+            layer.clip = None;
+            layer.image_modified = true;
+        }
+        if self
+            .layer(layer_id)
+            .is_some_and(|layer| layer.province.is_some())
+        {
+            self.resize_province_image(layer_id, w, h);
+        }
     }
 
     /// Remove a bitmap unconditionally (the low-level primitive behind
