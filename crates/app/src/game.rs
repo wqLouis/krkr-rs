@@ -72,7 +72,7 @@ impl FrameBody for Polls {
     }
 
     fn video_poll(&mut self, ctx: &mut CompatCtx) -> Result<(), CompatError> {
-        compat::video_poll(ctx)
+        compat::video_advance(ctx, self.dt_ms)
     }
 
     fn async_trigger_poll(&mut self, ctx: &mut CompatCtx) -> Result<(), CompatError> {
@@ -150,13 +150,15 @@ impl GameHost {
         // A directory-only launch (no explicit `--archive`) mounts every
         // `*.xp3` found under the base directory
         // (`engine::storage::discover_archives`), so the CLI and the Android
-        // launcher can take the game folder instead of each archive.
-        let archives = if archives.is_empty() {
-            engine::storage::discover_archives(&fs, &base_dir)?
+        // launcher can take the game folder instead of each archive. A
+        // scanned archive that cannot be read is skipped with a warning; an
+        // explicitly requested one is a typed error.
+        let storage = Box::new(if archives.is_empty() {
+            let discovered = engine::storage::discover_archives(&fs, &base_dir)?;
+            Storage::mount_discovered_archives(fs, &base_dir, discovered)?
         } else {
-            archives
-        };
-        let storage = Box::new(Storage::mount_archives(fs, &base_dir, archives)?);
+            Storage::mount_archives(fs, &base_dir, archives)?
+        });
         let mut vm = VmHost::with_default()?;
         // SAFETY: `storage` and `host` are declared after `vm` in the returned
         // struct and therefore outlive it; the boxed `host` keeps the scene
@@ -177,6 +179,10 @@ impl GameHost {
         let media = media::Media::new();
         crate::install_audio_decoder(vm.compat(), &media);
         crate::install_image_codec(vm.compat(), &media, &storage);
+        // SAFETY: `storage` is declared after `vm` in the returned struct, so
+        // it outlives the compat host that holds the installed source.
+        unsafe { crate::install_video_source(vm.compat(), &media, &storage) }
+            .map_err(vm::VmError::from)?;
         crate::install_window_ex_facts(vm.compat(), host.surface_size());
 
         let plan = storage.startup_plan()?;

@@ -21,12 +21,13 @@
 //!
 //! L3 does **not** link `media`/FFmpeg: decoded frames are supplied by the
 //! host. A host installs a [`VideoSource`] through
-//! [`CompatHost::set_video_source`](crate::CompatHost::set_video_source) (the
-//! public seam) with the container's [`VideoSpec`] and the frames it decoded.
-//! `open(path)` asks that source for the spec and raises a TJS error when the
-//! host has none; it never fabricates metadata. The frame body's `video_poll`
-//! step advances every open overlay on the L1 clock and presents the host
-//! frame at the current position.
+//! [`CompatHost::set_video_source`](crate::CompatHost::set_video_source) (a
+//! pre-decoded buffer) or through the crate-root [`set_video_source`] (a
+//! decoder-backed source opened per path). `open(path)` asks that source for
+//! the spec and raises a TJS error when the host has none; it never fabricates
+//! metadata. The frame body's [`video_advance`] step advances every open
+//! overlay by its own per-frame `dt` and presents the host frame at the
+//! current position.
 //!
 //! # Events
 //!
@@ -44,8 +45,8 @@ use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
 
 use api::media::{RgbaFrame, VideoSpec};
-use engine::video::{VideoBounds, VideoEvent, VideoOverlay};
-use platform::Clock;
+use engine::Scene;
+use engine::video::{VideoBounds, VideoEvent, VideoOverlay, blit_frame_to_layer};
 use tjs::{
     DetachedValue, NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef,
     RetainedValue, Tjs2Engine, Tjs2ValueId, TjsValue, VAL_INTEGER, VAL_OBJECT, VAL_REAL,
@@ -108,6 +109,18 @@ impl VideoSource for BufferedSource {
 pub(crate) fn set_source(services: &CompatServices, spec: VideoSpec, frames: Vec<RgbaFrame>) {
     let mut state = services.state::<VideoState>();
     state.source = Some(Box::new(BufferedSource { spec, frames }));
+}
+
+/// Install an arbitrary decoded [`VideoSource`] for `VideoOverlay`.
+///
+/// This is the boxed-source analogue of
+/// [`CompatHost::set_video_source`](crate::CompatHost::set_video_source): the
+/// composition root installs a decoder-backed source that opens each path on
+/// demand. `open` raises when no source has been installed.
+pub fn set_video_source(ctx: &CompatCtx, source: Box<dyn VideoSource>) {
+    // SAFETY: the caller holds a live, bound context.
+    let services = unsafe { ctx.services() };
+    services.state::<VideoState>().source = Some(source);
 }
 
 // ---------------------------------------------------------------------------
@@ -198,10 +211,6 @@ struct VideoState {
     next_id: u32,
     /// The host-decoded source (installed by the host before `open`).
     source: Option<Box<dyn VideoSource>>,
-    /// The L1 monotonic clock that drives playback.
-    clock: Clock,
-    /// The last `video_poll` timestamp (to derive the per-frame `dt`).
-    last_now_ms: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1672,19 +1681,23 @@ fn dispatch_events(host: &Tjs2Engine, objthis: *mut c_void, events: &[VideoEvent
 // Frame-body poll
 // ---------------------------------------------------------------------------
 
+/// `vomLayer`: the decoded frame is assigned to `layer1`/`layer2`.
+const MODE_LAYER: i64 = 1;
+/// `vomMixer`: the frame is presented through the mixing layer.
+const MODE_MIXER: i64 = 2;
+
 /// Advance every open overlay by `dt_ms`, present the host frame at the new
-/// position and dispatch the queued events.
+/// position, composite it into the script layers the mode selects and dispatch
+/// the queued events.
 ///
-/// This is the testable core of [`video_poll`]: the frame body derives `dt_ms`
-/// from the L1 clock, while tests drive the state machine deterministically.
-///
-/// The host re-exports this (with [`video_poll`]) from the crate root; until
-/// then it is unreachable from outside the crate.
+/// The frame body passes its own per-frame `dt`; the advance never reads wall
+/// time.
 pub fn video_advance(ctx: &CompatCtx, dt_ms: f64) -> Result<(), CompatError> {
     let host = unsafe { ctx.engine() };
     let services = unsafe { ctx.services() };
-    // Phase 1: advance and present frames. The state borrow is released before
-    // any script callback runs, so a re-entrant native call cannot alias it.
+    // Phase 1: advance, present and composite. The state borrow is released
+    // before any script callback runs, so a re-entrant native call cannot
+    // alias it.
     let pending: Vec<(*mut c_void, Vec<VideoEvent>)> = {
         let mut state = services.state::<VideoState>();
         let mut source = state.source.take();
@@ -1693,13 +1706,10 @@ pub fn video_advance(ctx: &CompatCtx, dt_ms: f64) -> Result<(), CompatError> {
             if !slot.overlay.is_open() {
                 continue;
             }
-            if let Some(source) = source.as_mut() {
-                let at = slot.overlay.position_ms();
-                if let Some(frame) = source.frame_at(&slot.path, at) {
-                    let _ = slot.overlay.present_frame(frame);
-                }
-            }
+            present(&mut source, slot);
             slot.overlay.advance(dt_ms);
+            present(&mut source, slot);
+            composite_overlay(ctx, slot);
             let events = slot.overlay.poll();
             if !events.is_empty() {
                 pending.push((slot.objthis, events));
@@ -1715,24 +1725,84 @@ pub fn video_advance(ctx: &CompatCtx, dt_ms: f64) -> Result<(), CompatError> {
     Ok(())
 }
 
-/// The frame body's `video_poll` step: derive the per-frame `dt` from the L1
-/// clock and advance every open overlay.
-///
-/// The host re-exports this from the crate root; until then it is unreachable
-/// from outside the crate.
-pub fn video_poll(ctx: &mut CompatCtx) -> Result<(), CompatError> {
-    let services = unsafe { ctx.services() };
-    let now = services.state::<VideoState>().clock.now_ms();
-    let dt_ms = {
-        let mut state = services.state::<VideoState>();
-        let dt_ms = match state.last_now_ms {
-            Some(last) => now.saturating_sub(last) as f64,
-            None => 0.0,
-        };
-        state.last_now_ms = Some(now);
-        dt_ms
+/// Present the host frame at the overlay's current position, if any.
+fn present(source: &mut Option<Box<dyn VideoSource>>, slot: &mut VideoSlot) {
+    let Some(source) = source.as_mut() else {
+        return;
     };
-    video_advance(ctx, dt_ms)
+    let at = slot.overlay.position_ms();
+    if let Some(frame) = source.frame_at(&slot.path, at)
+        && let Err(error) = slot.overlay.present_frame(frame)
+    {
+        log::warn!("VideoOverlay: inconsistent decoded frame: {error}");
+    }
+}
+
+/// Composite the overlay's current frame into the layer(s) the mode selects.
+///
+/// `vomOverlay` has no script-visible destination in this port, so it is left
+/// alone. `vomLayer` mirrors the reference assigning the frame to
+/// `layer1`/`layer2`; `vomMixer` draws it over the mixing layer.
+fn composite_overlay(ctx: &CompatCtx, slot: &VideoSlot) {
+    if !slot.overlay.is_playing() {
+        return;
+    }
+    let Some(frame) = slot.overlay.current_frame() else {
+        return;
+    };
+    match slot.mode {
+        MODE_LAYER => {
+            let layers = [slot.layer1.as_ref(), slot.layer2.as_ref()];
+            for layer in layers.into_iter().flatten() {
+                prepare_layer_for_frame(ctx, layer.id, frame);
+                composite_frame(ctx, layer.id, frame, false);
+            }
+        }
+        MODE_MIXER => {
+            if let Some(layer) = slot.mixing_layer.as_ref() {
+                composite_frame(ctx, layer.id, frame, true);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Size `layer_id`'s MainImage and rectangle to the frame when they differ.
+fn prepare_layer_for_frame(ctx: &CompatCtx, layer_id: u32, frame: &RgbaFrame) {
+    let Ok(scene) = scene_mut(ctx) else {
+        return;
+    };
+    let matches = scene.layer(layer_id).is_some_and(|layer| {
+        layer.image_width == frame.width && layer.image_height == frame.height
+    });
+    if !matches && !scene.set_layer_image_size(layer_id, frame.width, frame.height) {
+        return;
+    }
+    if let Some(layer) = scene.layer_mut(layer_id)
+        && (layer.rect.w != frame.width || layer.rect.h != frame.height)
+    {
+        layer.rect.w = frame.width;
+        layer.rect.h = frame.height;
+    }
+}
+
+/// Blit `frame` into `layer_id`'s MainImage.
+fn composite_frame(ctx: &CompatCtx, layer_id: u32, frame: &RgbaFrame, source_over: bool) {
+    let Ok(scene) = scene_mut(ctx) else {
+        return;
+    };
+    blit_frame_to_layer(scene, layer_id, frame, source_over);
+}
+
+/// The attached L2 scene, mutably.
+fn scene_mut<'a>(ctx: &CompatCtx) -> Result<&'a mut Scene, String> {
+    // SAFETY: the host keeps the attached scene alive for the binding's
+    // lifetime and the VM is single-threaded.
+    let ptr = unsafe { ctx.services() }
+        .scene()
+        .ok_or_else(|| "VideoOverlay: no scene attached".to_string())?;
+    // SAFETY: see above.
+    Ok(unsafe { &mut *ptr })
 }
 
 // ---------------------------------------------------------------------------

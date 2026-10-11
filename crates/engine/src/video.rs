@@ -42,6 +42,9 @@
 
 use api::media::{RgbaFrame, VideoSpec};
 
+use crate::layer_ops::{blit_copy_clipped, blit_over, clip_rect};
+use crate::scene::{BitmapState, Scene};
+
 /// Playback status (`tTVPStatus` for the video overlay).
 ///
 /// `Pause` is a distinct status here (unlike the audio `Status`), matching
@@ -757,4 +760,50 @@ impl VideoOverlay {
     fn require_open(&self) -> Result<&VideoSpec, VideoError> {
         self.spec.as_ref().ok_or(VideoError::NotOpen)
     }
+}
+
+/// Copy a decoded RGBA [`RgbaFrame`] into `layer_id`'s MainImage, clipped to
+/// the layer's clip rectangle and to the smaller of the layer and frame
+/// dimensions.
+///
+/// `source_over` selects the alpha-compositing copy (a half-width alpha
+/// stream) over the straight replacement (an opaque stream). The layer must
+/// already own a MainImage; `false` is returned when it has none or the frame
+/// has no pixels. This is the shared primitive behind the movie layer copy and
+/// the layer-mode video overlay composite.
+pub fn blit_frame_to_layer(
+    scene: &mut Scene,
+    layer_id: u32,
+    frame: &RgbaFrame,
+    source_over: bool,
+) -> bool {
+    if frame.width == 0 || frame.height == 0 {
+        return false;
+    }
+    let Some(dst_bitmap_id) = scene.layer(layer_id).and_then(|layer| layer.bitmap) else {
+        return false;
+    };
+    let clip = clip_rect(scene.layer(layer_id).and_then(|layer| layer.clip));
+    let (layer_w, layer_h) = scene
+        .layer(layer_id)
+        .map(|layer| (layer.rect.w, layer.rect.h))
+        .unwrap_or((0, 0));
+    let sw = layer_w.min(frame.width);
+    let sh = layer_h.min(frame.height);
+    if sw == 0 || sh == 0 {
+        return false;
+    }
+    let source = BitmapState::new(frame.width, frame.height, frame.rgba.clone());
+    let src_rect = (0, 0, sw as i32, sh as i32);
+    let dx = clip.0.max(0);
+    let dy = clip.1.max(0);
+    let Some(dst) = scene.bitmap_mut(dst_bitmap_id) else {
+        return false;
+    };
+    if source_over {
+        blit_over(dst, dx, dy, &source, src_rect, clip, 255, false, false);
+    } else {
+        blit_copy_clipped(dst, dx, dy, &source, src_rect, clip);
+    }
+    true
 }

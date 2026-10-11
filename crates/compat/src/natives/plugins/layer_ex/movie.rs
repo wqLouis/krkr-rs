@@ -25,11 +25,10 @@ use std::ffi::{c_char, c_int, c_void};
 
 use api::blend::BlendMode;
 use api::media::VideoSpec;
-use engine::video::{VideoEvent, VideoOverlay};
-use engine::{BitmapState, layer_ops};
+use engine::video::{VideoEvent, VideoOverlay, blit_frame_to_layer};
 use tjs::{DetachedValue, NativeObjThisMethodDef, Tjs2Engine, Value};
 
-use super::{VideoSource, bound, ensure_layer_image, layer_clip, layer_from_objthis, scene_mut};
+use super::{VideoSource, bound, layer_from_objthis, scene_mut};
 use crate::native_util::{args, report_error, set_bool, set_void};
 use crate::{CompatCtx, CompatError};
 
@@ -122,7 +121,9 @@ fn open_movie(ctx: &CompatCtx, layer_id: u32, filename: &str, alpha: bool) -> Re
     };
     {
         let scene = scene_mut(ctx)?;
-        ensure_layer_image(scene, layer_id, movie_width, movie_height);
+        if !scene.set_layer_image_size(layer_id, movie_width, movie_height) {
+            return Err("Layer.openMovie: could not allocate the movie image".to_string());
+        }
         if let Some(layer) = scene.layer_mut(layer_id) {
             layer.rect.w = movie_width;
             layer.rect.h = movie_height;
@@ -260,37 +261,14 @@ fn copy_frame(ctx: &CompatCtx, slot: &MovieSlot) {
     let Some(frame) = slot.overlay.current_frame() else {
         return;
     };
-    if frame.width == 0 || frame.height == 0 {
-        return;
-    }
     let Ok(scene) = scene_mut(ctx) else {
         return;
     };
-    let Some(dst_bitmap_id) = scene.layer(slot.layer).and_then(|layer| layer.bitmap) else {
-        return;
-    };
-    let clip = layer_clip(scene, slot.layer);
-    let (layer_w, layer_h) = scene
-        .layer(slot.layer)
-        .map(|layer| (layer.rect.w, layer.rect.h))
-        .unwrap_or((0, 0));
-    let sw = layer_w.min(frame.width);
-    let sh = layer_h.min(frame.height);
-    if sw == 0 || sh == 0 {
-        return;
-    }
-    let source = BitmapState::new(frame.width, frame.height, frame.rgba.clone());
-    let src_rect = (0, 0, sw as i32, sh as i32);
-    let dx = clip.0.max(0);
-    let dy = clip.1.max(0);
-    if let Some(dst) = scene.bitmap_mut(dst_bitmap_id) {
-        if slot.alpha {
-            // Reference `CopyColor`: source-over with the frame's alpha.
-            layer_ops::blit_over(dst, dx, dy, &source, src_rect, clip, 255, false, false);
-        } else {
-            // Reference `Copy`: a straight replacement.
-            layer_ops::blit_copy_clipped(dst, dx, dy, &source, src_rect, clip);
-        }
+    if !blit_frame_to_layer(scene, slot.layer, frame, slot.alpha) {
+        log::warn!(
+            "LayerExMovie: layer #{} has no image to copy into",
+            slot.layer
+        );
     }
 }
 

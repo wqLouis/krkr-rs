@@ -73,6 +73,64 @@ impl Env {
             other => panic!("{expression:?} returned {other:?}, expected a real"),
         }
     }
+
+    /// The scene id of the layer named `name`.
+    fn layer_id(&self, name: &str) -> u32 {
+        self._scene
+            .layers
+            .iter()
+            .find(|layer| layer.name == name)
+            .unwrap_or_else(|| panic!("the layer {name:?}"))
+            .id
+    }
+
+    /// The layer named `name`'s rectangle size in pixels.
+    fn layer_rect(&self, name: &str) -> (u32, u32) {
+        let id = self.layer_id(name);
+        self._scene
+            .layer(id)
+            .map(|layer| (layer.rect.w, layer.rect.h))
+            .unwrap_or((0, 0))
+    }
+
+    /// The RGBA pixel at `(x, y)` of the layer named `name`.
+    fn bitmap_color(&self, name: &str, x: u32, y: u32) -> [u8; 4] {
+        let id = self.layer_id(name);
+        let bitmap_id = self
+            ._scene
+            .layer(id)
+            .and_then(|layer| layer.bitmap)
+            .expect("the layer bitmap");
+        let bitmap = self._scene.bitmap(bitmap_id).expect("bitmap state");
+        let offset = bitmap.pixel_offset(x, y).expect("pixel in range");
+        [
+            bitmap.rgba[offset],
+            bitmap.rgba[offset + 1],
+            bitmap.rgba[offset + 2],
+            bitmap.rgba[offset + 3],
+        ]
+    }
+}
+
+/// A 4x4 frame filled with `color`, at timestamp 0.
+fn solid_frame(color: [u8; 4]) -> RgbaFrame {
+    let mut rgba = Vec::with_capacity(4 * 4 * 4);
+    for _ in 0..(4 * 4) {
+        rgba.extend_from_slice(&color);
+    }
+    RgbaFrame::new(4, 4, 0, rgba)
+}
+
+/// A 4x4 @ 10 fps, 10-frame stream.
+fn movie_spec() -> VideoSpec {
+    VideoSpec {
+        width: 4,
+        height: 4,
+        fps: 10.0,
+        total_frames: Some(10),
+        sample_rate: 0,
+        channels: 0,
+    }
 }
 
 fn default_spec() -> VideoSpec {
@@ -424,4 +482,100 @@ fn every_member_is_reachable() {
          var u = v.numberOfFrame; var w = v.fps; var x = v.totalTime; \
          var y = v.numberOfAudioStream; var z = v.numberOfVideoStream;",
     );
+}
+
+/// `vomLayer` assigns the playing frame to `layer1` and sizes the layer to the
+/// video.
+///
+/// Reference: the `EC_UPDATE` handler assigns the front buffer to
+/// `layer1`/`layer2` and calls their `Update`
+/// (`reference/cpp/core/visual/impl/VideoOvlImpl.cpp:583-621`), and only while
+/// the status is `ssPlay` (`:554`); it also sizes the layer to the video
+/// (`:585-604`).
+#[test]
+fn layer_mode_composites_the_frame_into_the_layer() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var l = new Layer(w, null); l.name = 'video'; l.visible = true;",
+    );
+    env.host
+        .set_video_source(movie_spec(), vec![solid_frame([255, 0, 0, 255])]);
+    env.run(
+        "var v = new VideoOverlay(null); v.mode = 1; v.layer1 = l; \
+         v.open('movie.mpg'); v.play();",
+    );
+    let ctx = env.host.ctx().expect("bound context");
+    compat::video_advance(&ctx, 50.0).expect("advance");
+    assert_eq!(env.bitmap_color("video", 1, 1), [255, 0, 0, 255]);
+    assert_eq!(env.layer_rect("video"), (4, 4));
+}
+
+/// The default `vomOverlay` mode leaves the script layer untouched.
+///
+/// Reference: the `EC_UPDATE` composite is guarded by `Mode == vomLayer`
+/// (`reference/cpp/core/visual/impl/VideoOvlImpl.cpp:554`); `vomOverlay` draws
+/// through an OS overlay window instead.
+#[test]
+fn overlay_mode_leaves_the_layer_untouched() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var l = new Layer(w, null); l.name = 'video'; l.visible = true; \
+         l.setImageSize(4, 4);",
+    );
+    env.host
+        .set_video_source(movie_spec(), vec![solid_frame([255, 0, 0, 255])]);
+    env.run(
+        "var v = new VideoOverlay(null); v.layer1 = l; \
+         v.open('movie.mpg'); v.play();",
+    );
+    let ctx = env.host.ctx().expect("bound context");
+    compat::video_advance(&ctx, 50.0).expect("advance");
+    assert_ne!(env.bitmap_color("video", 1, 1), [255, 0, 0, 255]);
+}
+
+/// `vomMixer` presents the frame through the mixing layer.
+///
+/// Reference: the `EC_UPDATE` handler for `vomMixer` presents the video image
+/// (`reference/cpp/core/visual/impl/VideoOvlImpl.cpp:642-656`), with the mixing
+/// bitmap the `setMixingLayer` setter installed (`:882-913`).
+#[test]
+fn mixer_mode_composites_through_the_mixing_layer() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var l = new Layer(w, null); l.name = 'mix'; l.visible = true; \
+         l.setImageSize(4, 4);",
+    );
+    env.host
+        .set_video_source(movie_spec(), vec![solid_frame([0, 255, 0, 255])]);
+    env.run(
+        "var v = new VideoOverlay(null); v.mode = 2; v.setMixingLayer(l); \
+         v.open('movie.mpg'); v.play();",
+    );
+    let ctx = env.host.ctx().expect("bound context");
+    compat::video_advance(&ctx, 50.0).expect("advance");
+    assert_eq!(env.bitmap_color("mix", 1, 1), [0, 255, 0, 255]);
+}
+
+/// The advance uses the caller's per-frame `dt`, never wall time.
+///
+/// Reference: the frame body advances playback by the elapsed frame interval;
+/// the port takes that interval from the frame body instead of the clock.
+#[test]
+fn advance_uses_the_frame_body_dt() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.host
+        .set_video_source(movie_spec(), vec![solid_frame([255, 0, 0, 255])]);
+    env.run("var v = new VideoOverlay(null); v.open('movie.mpg'); v.play();");
+    let ctx = env.host.ctx().expect("bound context");
+    compat::video_advance(&ctx, 50.0).expect("advance");
+    assert_eq!(env.eval_int("v.position"), 50);
+    compat::video_advance(&ctx, 150.0).expect("advance");
+    assert_eq!(env.eval_int("v.position"), 200);
 }

@@ -51,9 +51,10 @@ pub use host::CompatHost;
 // The built-in `Timer` poll: an L4 [`FrameBody`] forwards its `timer_poll`
 // step here (the visual natives' registry lives in this crate).
 pub use natives::visual::timer_poll;
-// The built-in `VideoOverlay` poll: an L4 [`FrameBody`] forwards its `video_poll`
-// step here; `video_advance` is exposed for hosts that drive it directly.
-pub use natives::video::{video_advance, video_poll};
+// The built-in `VideoOverlay` advance: an L4 [`FrameBody`] forwards its
+// `video_poll` step to `video_advance` with its own per-frame `dt`;
+// `VideoSource`/`set_video_source` install the host-decoded source.
+pub use natives::video::{VideoSource, set_video_source, video_advance};
 // The built-in `WaveSoundBuffer` poll, plus the host seam that installs the L1
 // media audio decoder (L3 never links a codec).
 pub use natives::sound::{
