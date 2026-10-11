@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use ash::vk;
 
 use api::error::RenderError;
-use api::geometry::PixelRegion;
+use api::geometry::{Affine2, PixelRegion};
 
 use crate::render_target::RenderTargetDesc;
 use crate::scene::RenderScene;
@@ -295,6 +295,7 @@ pub(crate) fn render(
                 scene,
                 extent,
                 srgb,
+                &Affine2::IDENTITY,
             )?;
             // SAFETY: the render pass and command buffer are recording.
             unsafe { device.cmd_end_render_pass(command_buffer) };

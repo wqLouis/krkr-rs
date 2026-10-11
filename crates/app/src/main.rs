@@ -1,7 +1,7 @@
 //! `krkr` CLI: headless frame runner and windowed desktop frontend.
 //!
 //! ```text
-//! krkr [--headless] [--frames N] [--backend null|vulkan] [--archive XP3 ...] [--base-dir DIR] [GAME]
+//! krkr [--headless] [--frames N] [--backend null|vulkan] [--scaling game|fit|fill|expand] [--archive XP3 ...] [--base-dir DIR] [GAME]
 //! ```
 //!
 //! * `--headless` runs an empty scene for `N` frames (default 120) through
@@ -23,25 +23,34 @@
 //!   window with a display connection (Wayland/X11/XCB); the windowed host
 //!   passes both the window and display handle so a surface can be created.
 //!   The headless path has no display and uses `--backend null`.
+//! * `--scaling` selects how the engine presents the logical scene inside
+//!   the framebuffer (`game` by default, plus `fit`, `fill` and `expand`).
 //! * `-h`/`--help` prints the usage text.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use app::{BackendKind, FrameStats, GameHost, Host, HostConfig, StepReport};
+use app::{BackendKind, FrameStats, GameHost, Host, HostConfig, StepReport, map_input_to_logical};
+use engine::projection::ScalingMode;
 use platform::{EventHandler, Flow, PlatformConfig, PlatformEvent, PlatformWindow};
+use render::ViewTransform;
 
 /// Usage text printed by `-h`/`--help` and on a parse error.
 const USAGE: &str = "\
 krkr-rs host
 
 USAGE:
-    krkr [--headless] [--frames N] [--backend null|vulkan] [--archive XP3 ...] [--base-dir DIR] [GAME]
+    krkr [--headless] [--frames N] [--backend null|vulkan] [--scaling game|fit|fill|expand] [--archive XP3 ...] [--base-dir DIR] [GAME]
 
 OPTIONS:
     --headless             Run offscreen (no window/GPU).
     --frames N             Headless frames to run (default 120).
     --backend null|vulkan  Render backend (default: null).
+    --scaling MODE         Presentation scaling (default: game):
+                             game    one logical pixel per framebuffer pixel
+                             fit     uniform scale, letterboxed
+                             fill    non-uniform scale to the window
+                             expand  grow the logical size to the window aspect
     --archive XP3          Mount an XP3 archive (repeatable, later wins).
                            With none, every *.xp3 under the base directory mounts.
     --base-dir DIR         App path (default: first archive's parent).
@@ -63,6 +72,8 @@ struct Cli {
     frames: u32,
     /// Requested render backend.
     backend: BackendKind,
+    /// Requested presentation scaling mode.
+    scaling: ScalingMode,
     /// Explicit `--archive` list, in mount order (later wins).
     archives: Vec<PathBuf>,
     /// App path override (`--base-dir`); defaults to the current directory.
@@ -81,6 +92,7 @@ impl Cli {
             headless: false,
             frames: DEFAULT_FRAMES,
             backend: BackendKind::Null,
+            scaling: ScalingMode::Game,
             archives: Vec::new(),
             base_dir: None,
             positional: None,
@@ -103,6 +115,12 @@ impl Cli {
                         .next()
                         .ok_or_else(|| "--backend requires a value".to_owned())?;
                     cli.backend = parse_backend(&value)?;
+                }
+                "--scaling" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| "--scaling requires a value".to_owned())?;
+                    cli.scaling = parse_scaling(&value)?;
                 }
                 "--archive" => {
                     let value = args
@@ -137,6 +155,19 @@ fn parse_backend(value: &str) -> Result<BackendKind, String> {
         "vulkan" | "vk" => Ok(BackendKind::Vulkan),
         other => Err(format!(
             "unknown backend '{other}' (expected 'null' or 'vulkan')"
+        )),
+    }
+}
+
+/// Maps a `--scaling` value to [`ScalingMode`].
+fn parse_scaling(value: &str) -> Result<ScalingMode, String> {
+    match value {
+        "game" => Ok(ScalingMode::Game),
+        "fit" => Ok(ScalingMode::Fit),
+        "fill" => Ok(ScalingMode::Fill),
+        "expand" => Ok(ScalingMode::Expand),
+        other => Err(format!(
+            "unknown scaling mode '{other}' (expected 'game', 'fit', 'fill' or 'expand')"
         )),
     }
 }
@@ -382,8 +413,11 @@ fn run_windowed(cli: &Cli) -> Result<(), String> {
     let mut config = PlatformConfig::default();
     config.title = "krkr-rs".to_owned();
     config.size = DEFAULT_SIZE;
-    platform::run(config, DesktopApp::new(cli.backend, resolve_game(cli)?))
-        .map_err(|error| error.to_string())
+    platform::run(
+        config,
+        DesktopApp::new(cli.backend, cli.scaling, resolve_game(cli)?),
+    )
+    .map_err(|error| error.to_string())
 }
 
 /// The composition root's bridge from L1 platform events to the L2 host.
@@ -395,6 +429,8 @@ fn run_windowed(cli: &Cli) -> Result<(), String> {
 struct DesktopApp {
     /// Backend requested on the command line.
     backend: BackendKind,
+    /// Presentation scaling mode requested on the command line.
+    scaling: ScalingMode,
     /// The game to load, or `None` for the empty scene.
     game: Option<GameInput>,
     /// The running host, created once the window handle exists.
@@ -430,10 +466,27 @@ impl Running {
 
     /// The main window's declared client size, or `None` when the host owns
     /// no scene window (the empty-scene run).
-    fn window_size(&self) -> Option<(u32, u32)> {
+    fn inner_size(&self) -> Option<(u32, u32)> {
         match self {
             Running::Empty(_) => None,
             Running::Game(game) => game.scene().windows.first().map(|window| window.inner_size),
+        }
+    }
+
+    /// The logical size the host currently reports, or `None` when the host
+    /// owns no scene window.
+    fn logical_size(&self) -> Option<(u32, u32)> {
+        match self {
+            Running::Empty(_) => None,
+            Running::Game(game) => Some(game.host().logical_size()),
+        }
+    }
+
+    /// The framebuffer transform of the current presentation.
+    fn view(&self) -> Option<ViewTransform> {
+        match self {
+            Running::Empty(host) => Some(host.view()),
+            Running::Game(game) => Some(game.host().view()),
         }
     }
 
@@ -451,9 +504,10 @@ impl Running {
 
 impl DesktopApp {
     /// Creates a handler that has not yet received `resumed`.
-    fn new(backend: BackendKind, game: Option<GameInput>) -> Self {
+    fn new(backend: BackendKind, scaling: ScalingMode, game: Option<GameInput>) -> Self {
         Self {
             backend,
+            scaling,
             game,
             running: None,
             pending_events: Vec::new(),
@@ -464,22 +518,32 @@ impl DesktopApp {
     /// Requests a new platform-window inner size when a script changed the
     /// main window's declared client size.
     ///
-    /// `want` is the main window's current logical size; `None` means the
-    /// host owns no scene window. A request already in flight is not
-    /// repeated. When the backend applies the request synchronously (and
+    /// The host rewrites the scene window's `inner_size` to the logical size
+    /// of the current presentation, so the raw `inner_size` equals the
+    /// host's logical size unless a script declared a new size. A window
+    /// whose `inner_size` differs is a declaration and is applied to the OS
+    /// window; a user resize changes the framebuffer instead and is left
+    /// alone. When the backend applies the request synchronously (and
     /// therefore emits no `Resized`), the surface is resized here.
-    fn apply_window_size(
-        &mut self,
-        want: Option<(u32, u32)>,
-        window: &PlatformWindow,
-    ) -> Result<(), String> {
-        let Some(size) = want else {
+    fn apply_window_size(&mut self, window: &PlatformWindow) -> Result<(), String> {
+        let Some(size) = self.running.as_ref().and_then(Running::inner_size) else {
             return Ok(());
         };
+        let logical = self.running.as_ref().and_then(Running::logical_size);
+        if logical == Some(size) {
+            return Ok(());
+        }
         if size.0 == 0 || size.1 == 0 {
             return Ok(());
         }
-        if self.pending_size == Some(size) || size == window.size() {
+        if self.pending_size == Some(size) {
+            return Ok(());
+        }
+        if size == window.size() {
+            self.pending_size = None;
+            if let Some(running) = self.running.as_mut() {
+                running.resize(size)?;
+            }
             return Ok(());
         }
         self.pending_size = Some(size);
@@ -517,6 +581,7 @@ impl EventHandler for DesktopApp {
         config.surface_size = window.size();
         config.window_handle = Some(window_handle);
         config.display_handle = Some(display_handle);
+        config.scaling = self.scaling;
         match Host::new(config) {
             Ok(host) => {
                 let running = match &self.game {
@@ -535,8 +600,7 @@ impl EventHandler for DesktopApp {
                 // Align the platform window with the client size the game
                 // declared during startup (`Window.setInnerSize`); the
                 // resulting `Resized` sizes the surface.
-                let want = self.running.as_ref().and_then(Running::window_size);
-                if let Err(error) = self.apply_window_size(want, window) {
+                if let Err(error) = self.apply_window_size(window) {
                     eprintln!("krkr: resize failed: {error}");
                     return Flow::Exit;
                 }
@@ -572,6 +636,14 @@ impl EventHandler for DesktopApp {
             // (`onFocus`/`onBlur`). `ScaleFactorChanged` is informational
             // (winit follows it with `Resized`) and the adapter ignores it.
             PlatformEvent::Input(input) => {
+                // The engine presents the logical scene scaled inside the
+                // framebuffer, so a pointer/touch position is inverse-mapped
+                // to logical coordinates before the layer manager hit-tests
+                // it.
+                let input = match self.running.as_ref().and_then(Running::view) {
+                    Some(view) => map_input_to_logical(view, input),
+                    None => input,
+                };
                 self.pending_events.push(PlatformEvent::Input(input));
                 Flow::Continue
             }
@@ -591,8 +663,7 @@ impl EventHandler for DesktopApp {
                 return Flow::Exit;
             }
         }
-        let want = self.running.as_ref().and_then(Running::window_size);
-        if let Err(error) = self.apply_window_size(want, window) {
+        if let Err(error) = self.apply_window_size(window) {
             eprintln!("krkr: frame resize failed: {error}");
             return Flow::Exit;
         }
@@ -616,6 +687,15 @@ mod tests {
         assert!(cli.base_dir.is_none());
         assert!(cli.positional.is_none());
         assert_eq!(cli.frames, DEFAULT_FRAMES);
+        assert_eq!(cli.scaling, ScalingMode::Game);
+    }
+
+    #[test]
+    fn parse_scaling_mode() {
+        let cli = parse(&["--scaling", "fit"]).expect("parse");
+        assert_eq!(cli.scaling, ScalingMode::Fit);
+        assert!(parse(&["--scaling", "stretch"]).is_err());
+        assert!(parse(&["--scaling"]).is_err());
     }
 
     #[test]

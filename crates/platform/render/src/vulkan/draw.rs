@@ -44,6 +44,9 @@ const _: () = assert!(std::mem::size_of::<PushConstants>() as u32 == super::PUSH
 /// Records all visible content of `scene` into `command`.
 ///
 /// The caller has already begun the render pass and set the viewport.
+/// `root` is the transform applied around the scene root; the presentation
+/// path passes the scene's [`ViewTransform`](crate::ViewTransform) and
+/// offscreen targets pass the identity.
 ///
 /// # Errors
 ///
@@ -59,6 +62,7 @@ pub(crate) fn record_scene(
     scene: &RenderScene,
     extent: vk::Extent2D,
     srgb: bool,
+    root: &Affine2,
 ) -> Result<(), RenderError> {
     let mut recorder = Recorder {
         device,
@@ -82,7 +86,7 @@ pub(crate) fn record_scene(
         offset: vk::Offset2D { x: 0, y: 0 },
         extent,
     };
-    recorder.visit(scene.root, &Affine2::IDENTITY, 1.0, full_scissor, 0)
+    recorder.visit(scene.root, root, 1.0, full_scissor, 0)
 }
 
 /// Command-recording traversal state.

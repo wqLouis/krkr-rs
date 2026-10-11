@@ -744,6 +744,7 @@ impl VulkanPipeline {
                 scene,
                 extent,
                 srgb,
+                &scene.view.to_affine(),
             )?;
 
             // SAFETY: the render pass and command buffer are recording.

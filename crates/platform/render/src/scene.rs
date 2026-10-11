@@ -5,7 +5,7 @@
 //! semantics only: no TVP properties, no engine state.
 
 use api::blend::BlendMode;
-use api::geometry::{PixelRegion, RectF, Transform2D};
+use api::geometry::{Affine2, PixelRegion, RectF, Transform2D};
 
 use crate::texture::Texture;
 
@@ -157,6 +157,58 @@ impl Default for RenderNode {
     }
 }
 
+/// Framebuffer transform the presentation path applies to a whole scene.
+///
+/// The presentation path maps a logical point `p` to the framebuffer with
+/// `p * scale + offset`. Offscreen render targets composite in logical
+/// coordinates and ignore it. [`ViewTransform::IDENTITY`] draws logical
+/// pixels one-to-one, which is the untransformed presentation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ViewTransform {
+    /// Per-axis scale from logical to framebuffer pixels.
+    pub scale: (f32, f32),
+    /// Translation in framebuffer pixels.
+    pub offset: (f32, f32),
+}
+
+impl ViewTransform {
+    /// The identity transform.
+    pub const IDENTITY: Self = Self {
+        scale: (1.0, 1.0),
+        offset: (0.0, 0.0),
+    };
+
+    /// Expands the transform into an affine matrix.
+    pub fn to_affine(&self) -> Affine2 {
+        Affine2::scale(self.scale.0, self.scale.1)
+            .then(&Affine2::translation(self.offset.0, self.offset.1))
+    }
+
+    /// Maps a framebuffer point back to logical coordinates.
+    ///
+    /// A zero scale component (a degenerate framebuffer) leaves that axis
+    /// unchanged, so the mapping never divides by zero.
+    pub fn inverse_map(&self, point: (f32, f32)) -> (f32, f32) {
+        let inverse = |value: f32, scale: f32, offset: f32| {
+            if scale.abs() > f32::EPSILON {
+                (value - offset) / scale
+            } else {
+                value
+            }
+        };
+        (
+            inverse(point.0, self.scale.0, self.offset.0),
+            inverse(point.1, self.scale.1, self.offset.1),
+        )
+    }
+}
+
+impl Default for ViewTransform {
+    fn default() -> Self {
+        Self::IDENTITY
+    }
+}
+
 /// A complete render tree plus an optional clear colour.
 ///
 /// The middle layer owns the value and performs a field-level sync from its
@@ -169,6 +221,8 @@ pub struct RenderScene {
     pub nodes: Vec<RenderNode>,
     /// Optional background clear colour `[r, g, b, a]`.
     pub background: Option<[f32; 4]>,
+    /// Framebuffer transform the presentation path applies to the whole tree.
+    pub view: ViewTransform,
 }
 
 impl Default for RenderScene {
@@ -177,6 +231,7 @@ impl Default for RenderScene {
             root: RenderNodeId(0),
             nodes: Vec::new(),
             background: None,
+            view: ViewTransform::IDENTITY,
         }
     }
 }
@@ -188,6 +243,7 @@ impl RenderScene {
             root,
             nodes: Vec::new(),
             background: None,
+            view: ViewTransform::IDENTITY,
         }
     }
 
@@ -197,6 +253,7 @@ impl RenderScene {
             root: RenderNodeId(0),
             nodes: vec![RenderNode::default()],
             background: None,
+            view: ViewTransform::IDENTITY,
         }
     }
 

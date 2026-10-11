@@ -28,9 +28,104 @@ use std::collections::{HashMap, HashSet};
 
 use api::blend::BlendMode;
 use api::geometry::{PixelRegion, RectF};
-use render::{RenderContent, RenderNode, RenderNodeId, RenderScene, Texture};
+use render::{RenderContent, RenderNode, RenderNodeId, RenderScene, Texture, ViewTransform};
 
 use crate::scene::{LayerState, Rect, Scene};
+
+/// How the engine presents the logical scene inside the framebuffer.
+///
+/// `Game` uses the declared size one-to-one; the other three modes scale the
+/// game's declared size to the window.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ScalingMode {
+    /// Present the logical size one-to-one (the Win32 environment default).
+    #[default]
+    Game,
+    /// Uniform scale that fits the whole scene, letterboxed.
+    Fit,
+    /// Non-uniform scale that fills the window.
+    Fill,
+    /// Grow the logical size to the window's aspect, then scale uniformly.
+    Expand,
+}
+
+/// The logical size and framebuffer transform for one presentation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Presentation {
+    /// Logical scene size reported to scripts (`System.screenWidth`).
+    pub logical_size: (u32, u32),
+    /// Framebuffer transform the pipeline applies while compositing.
+    pub view: ViewTransform,
+}
+
+impl Presentation {
+    /// The untransformed presentation of `size`.
+    pub const fn identity(size: (u32, u32)) -> Self {
+        Self {
+            logical_size: size,
+            view: ViewTransform::IDENTITY,
+        }
+    }
+
+    /// Computes the presentation for `mode` from the game's declared `design`
+    /// size and the `framebuffer` size in pixels.
+    ///
+    /// Scaling is computed once from the integer sizes, so it does not
+    /// accumulate across frames. A zero design or framebuffer dimension is
+    /// degenerate (there is no framebuffer to present to): the logical size
+    /// stays `design` and the transform is the identity, so no division by
+    /// zero can occur.
+    pub fn compute(mode: ScalingMode, design: (u32, u32), framebuffer: (u32, u32)) -> Self {
+        let (design_w, design_h) = design;
+        let (frame_w, frame_h) = framebuffer;
+        if design_w == 0 || design_h == 0 || frame_w == 0 || frame_h == 0 {
+            return Self::identity(design);
+        }
+        let (dw, dh) = (design_w as f64, design_h as f64);
+        let (fw, fh) = (frame_w as f64, frame_h as f64);
+        match mode {
+            // The logical screen is the window client area, one logical pixel
+            // per framebuffer pixel.
+            ScalingMode::Game => Self::identity(framebuffer),
+            // One uniform scale, centred; the free axis is letterboxed.
+            ScalingMode::Fit => {
+                let scale = (fw / dw).min(fh / dh);
+                Self {
+                    logical_size: design,
+                    view: ViewTransform {
+                        scale: (scale as f32, scale as f32),
+                        offset: (
+                            ((fw - dw * scale) * 0.5) as f32,
+                            ((fh - dh * scale) * 0.5) as f32,
+                        ),
+                    },
+                }
+            }
+            // Independent axis scales; the frame is covered.
+            ScalingMode::Fill => Self {
+                logical_size: design,
+                view: ViewTransform {
+                    scale: ((fw / dw) as f32, (fh / dh) as f32),
+                    offset: (0.0, 0.0),
+                },
+            },
+            // Keep the design height and rewrite the width to the frame's
+            // aspect, so the uniform height scale fills exactly.
+            ScalingMode::Expand => {
+                let logical_w = (dh * fw / fh).round().clamp(0.0, u32::MAX as f64) as u32;
+                let scale = (fh / dh) as f32;
+                Self {
+                    logical_size: (logical_w, design_h),
+                    view: ViewTransform {
+                        scale: (scale, scale),
+                        offset: (0.0, 0.0),
+                    },
+                }
+            }
+        }
+    }
+}
 
 /// Background clear colour used when a projected scene has no explicit one.
 ///
@@ -451,15 +546,22 @@ fn append_window<F>(
 ///
 /// The returned scene contains a default root node plus one node per drawn
 /// layer, in `Scene::window_layer_order`, with ancestor position, opacity and
-/// visibility already composed. `texture` resolves a bitmap id to an L1
-/// texture handle; the caller owns the texture table and can pass, for
+/// visibility already composed. `view` is the framebuffer transform the
+/// pipeline applies to the whole tree. `texture` resolves a bitmap id to an
+/// L1 texture handle; the caller owns the texture table and can pass, for
 /// example, `|id| textures.get(&id).cloned()`.
-pub fn project_window<F>(scene: &Scene, window: u32, mut texture: F) -> RenderScene
+pub fn project_window<F>(
+    scene: &Scene,
+    window: u32,
+    view: ViewTransform,
+    mut texture: F,
+) -> RenderScene
 where
     F: FnMut(u32) -> Option<Texture>,
 {
     let mut out = RenderScene::with_root_node();
     out.background = Some(BACKGROUND_CLEAR);
+    out.view = view;
     let mut state = ProjectionState::default();
     append_window(scene, window, &mut out, &mut state, &mut texture);
     out
@@ -471,14 +573,16 @@ where
 /// and parent links are shared across windows so the whole tree renders
 /// deterministically from one root. Hidden windows contribute no nodes.
 ///
+/// `view` is the framebuffer transform applied to the whole tree and
 /// `texture` resolves a bitmap id to an L1 texture handle (see
 /// [`project_window`]).
-pub fn project_scene<F>(scene: &Scene, mut texture: F) -> RenderScene
+pub fn project_scene<F>(scene: &Scene, view: ViewTransform, mut texture: F) -> RenderScene
 where
     F: FnMut(u32) -> Option<Texture>,
 {
     let mut out = RenderScene::with_root_node();
     out.background = Some(BACKGROUND_CLEAR);
+    out.view = view;
     let mut state = ProjectionState::default();
     for window in &scene.windows {
         append_window(scene, window.id, &mut out, &mut state, &mut texture);

@@ -155,6 +155,41 @@ which today are a completion-callback stub.
   size; L4 calls `HostWindow::set_logical_size` (today
   `sync_host_window_resolution`, `sync.rs:367`).
 
+### 6.1 Presentation scaling
+
+This is a deliberate departure from the Win32 reference, at the user's
+request: a modern display should show the game scaled rather than pinned to
+its declared size.
+
+The behaviour to copy is not the Win32 environment's but the **cocos2d**
+one's, which is what the reference's own non-Windows builds use. It sets a
+design resolution and a `ResolutionPolicy`
+(`reference/cpp/core/environ/cocos2d/AppDelegate.cpp:63-75` — `SHOW_ALL` on
+desktop, `EXACT_FIT` on Android/iOS) and sizes its scene from the frame
+aspect (`MainScene.cpp:436-441`).
+
+`ScalingMode` selects how the engine presents the game:
+
+| mode | logical size | transform | reference |
+|---|---|---|---|
+| `Game` (default) | the game's declared size | none | the Win32 environment |
+| `Fit` | the game's declared size | uniform scale, letterboxed | cocos2d `SHOW_ALL` (`AppDelegate.cpp:73-75`) |
+| `Fill` | the game's declared size | non-uniform scale to the window | cocos2d `EXACT_FIT` (`AppDelegate.cpp:70`) |
+| `Expand` | the design height at the window's aspect | uniform scale, no letterbox | cocos2d `MainScene::initialize` (`MainScene.cpp:436-441`) |
+
+`Game` is the default, so an unconfigured run matches the reference exactly
+and every parity test keeps its meaning.
+
+The scale and offset are L2 state: the middle layer owns the projection and
+L1 applies it while compositing, per D10. Input is inverse-mapped from
+framebuffer to logical coordinates before dispatch, so a script's own
+hit-testing keeps working unchanged.
+
+`System.screenWidth`/`screenHeight` and `Window.innerWidth`/`innerHeight`
+report the **logical** size — the declared size for `Game`/`Fit`/`Fill`, the
+grown size for `Expand` — and never the framebuffer size, preserving the
+reference's design-versus-frame split (`MainScene.cpp:436-441`).
+
 ## 7. Window, input and UI (the Bevy substrate)
 
 Bevy is not only a renderer here; it also provides windowing, input and UI.

@@ -6,10 +6,11 @@
 
 use api::blend::{BlendMode, DstBlend};
 use api::geometry::{PixelRegion, RectF};
+use engine::projection::{Presentation, ScalingMode};
 use engine::{Rect, Scene, compose_layer, project_scene, project_window, resolve_blend};
 use render::{
     PipelineConfig, RenderContent, RenderNode, RenderNodeId, RenderScene, Texture, TextureDesc,
-    create_render_pipeline, create_texture,
+    ViewTransform, create_render_pipeline, create_texture,
 };
 
 /// Build a real (headless) texture handle for tests, matching how the
@@ -179,7 +180,9 @@ fn hierarchy_composes_position_opacity_visibility_and_order() {
     }
     attach_image(&mut scene, sibling, 3, 4);
 
-    let projected = project_window(&scene, win, |_| Some(null_texture(1, 1)));
+    let projected = project_window(&scene, win, ViewTransform::IDENTITY, |_| {
+        Some(null_texture(1, 1))
+    });
     let nodes = drawable_nodes(&projected);
     assert_eq!(nodes.len(), 3, "the screen buffer is not a node");
 
@@ -227,7 +230,9 @@ fn window_opacity_scales_layer_opacity() {
     }
     attach_image(&mut scene, fill, 64, 64);
 
-    let projected = project_window(&scene, win, |_| Some(null_texture(1, 1)));
+    let projected = project_window(&scene, win, ViewTransform::IDENTITY, |_| {
+        Some(null_texture(1, 1))
+    });
     let nodes = drawable_nodes(&projected);
     assert_eq!(nodes.len(), 1);
     assert!((nodes[0].opacity - 0.25).abs() < 1e-6);
@@ -247,7 +252,9 @@ fn bitmap_layer_uses_texture_and_source_region() {
         l.image_height = 254;
     }
 
-    let projected = project_window(&scene, win, |_| Some(null_texture(251, 254)));
+    let projected = project_window(&scene, win, ViewTransform::IDENTITY, |_| {
+        Some(null_texture(251, 254))
+    });
     let nodes = drawable_nodes(&projected);
     assert_eq!(nodes.len(), 1);
     assert!(matches!(nodes[0].content, RenderContent::Texture(_)));
@@ -267,7 +274,9 @@ fn bitmap_layer_1x1_rect_stays_1px() {
         l.rect = Rect::new(10, 10, 1, 1);
     }
 
-    let projected = project_window(&scene, win, |_| Some(null_texture(64, 64)));
+    let projected = project_window(&scene, win, ViewTransform::IDENTITY, |_| {
+        Some(null_texture(64, 64))
+    });
     let nodes = drawable_nodes(&projected);
     assert_eq!(nodes.len(), 1);
     assert_eq!(nodes[0].dst, RectF::new(10.0, 10.0, 1.0, 1.0));
@@ -285,7 +294,7 @@ fn missing_bitmap_without_fill_draws_nothing() {
         l.rect = full_window_rect(64, 64);
     }
 
-    let projected = project_window(&scene, win, |_| None);
+    let projected = project_window(&scene, win, ViewTransform::IDENTITY, |_| None);
     assert!(drawable_nodes(&projected).is_empty());
 }
 
@@ -302,7 +311,9 @@ fn screen_buffer_primary_layer_is_not_drawn() {
     }
     scene.bitmap_mut(bmp).unwrap().screen_buffer = true;
 
-    let projected = project_window(&scene, win, |_| Some(null_texture(64, 64)));
+    let projected = project_window(&scene, win, ViewTransform::IDENTITY, |_| {
+        Some(null_texture(64, 64))
+    });
     assert!(
         drawable_nodes(&projected).is_empty(),
         "the primary layer's screen buffer must not be drawn"
@@ -327,7 +338,9 @@ fn empty_layer_is_skipped_but_children_render() {
     }
     attach_image(&mut scene, child, 8, 8);
 
-    let projected = project_window(&scene, win, |_| Some(null_texture(1, 1)));
+    let projected = project_window(&scene, win, ViewTransform::IDENTITY, |_| {
+        Some(null_texture(1, 1))
+    });
     let nodes = drawable_nodes(&projected);
     assert_eq!(nodes.len(), 1, "the empty layer is not a node");
     assert_eq!(nodes[0].dst, RectF::new(0.0, 0.0, 8.0, 8.0));
@@ -347,7 +360,9 @@ fn invisible_layer_is_not_drawn() {
     }
     attach_image(&mut scene, layer, 64, 64);
 
-    let projected = project_window(&scene, win, |_| Some(null_texture(1, 1)));
+    let projected = project_window(&scene, win, ViewTransform::IDENTITY, |_| {
+        Some(null_texture(1, 1))
+    });
     assert!(drawable_nodes(&projected).is_empty());
 }
 
@@ -363,7 +378,9 @@ fn hidden_window_projects_nothing() {
     }
     attach_image(&mut scene, layer, 64, 64);
 
-    let projected = project_window(&scene, win, |_| Some(null_texture(1, 1)));
+    let projected = project_window(&scene, win, ViewTransform::IDENTITY, |_| {
+        Some(null_texture(1, 1))
+    });
     assert!(projected.nodes.iter().all(|n| n.children.is_empty()));
 }
 
@@ -378,7 +395,9 @@ fn project_scene_shares_z_across_windows() {
         attach_image(&mut scene, layer, 16, 16);
     }
 
-    let projected = project_scene(&scene, |_| Some(null_texture(1, 1)));
+    let projected = project_scene(&scene, ViewTransform::IDENTITY, |_| {
+        Some(null_texture(1, 1))
+    });
     let nodes = drawable_nodes(&projected);
     assert_eq!(nodes.len(), 2);
     assert_eq!(nodes[0].z, 0);
@@ -397,7 +416,9 @@ fn hold_alpha_is_carried_through() {
     }
     attach_image(&mut scene, layer, 64, 64);
 
-    let projected = project_window(&scene, win, |_| Some(null_texture(1, 1)));
+    let projected = project_window(&scene, win, ViewTransform::IDENTITY, |_| {
+        Some(null_texture(1, 1))
+    });
     let nodes = drawable_nodes(&projected);
     assert_eq!(nodes.len(), 1);
     assert!(nodes[0].hold_alpha);
@@ -425,7 +446,9 @@ fn invisible_parent_hides_its_subtree() {
     }
     attach_image(&mut scene, child, 3, 3);
 
-    let projected = project_window(&scene, win, |_| Some(null_texture(1, 1)));
+    let projected = project_window(&scene, win, ViewTransform::IDENTITY, |_| {
+        Some(null_texture(1, 1))
+    });
     let nodes = drawable_nodes(&projected);
     assert_eq!(nodes.len(), 1, "an invisible parent hides its subtree");
     assert_eq!(nodes[0].dst, RectF::new(1.0, 1.0, 4.0, 4.0));
@@ -457,7 +480,7 @@ fn cached_layer_draws_its_bitmap_and_hides_its_subtree() {
     }
     attach_image(&mut scene, child, 8, 8);
 
-    let projected = project_window(&scene, win, |id| {
+    let projected = project_window(&scene, win, ViewTransform::IDENTITY, |id| {
         if id == cache {
             Some(null_texture(64, 64))
         } else {
@@ -468,4 +491,151 @@ fn cached_layer_draws_its_bitmap_and_hides_its_subtree() {
     assert_eq!(nodes.len(), 1, "only the cached layer draws");
     assert!(matches!(nodes[0].content, RenderContent::Texture(_)));
     assert_eq!(nodes[0].dst, RectF::new(0.0, 0.0, 64.0, 64.0));
+}
+
+/// A 1280x720 game, the design size every presentation test uses.
+const DESIGN: (u32, u32) = (1280, 720);
+
+/// Compare a floating-point component within a small tolerance.
+fn assert_close(actual: f32, expected: f32) {
+    assert!(
+        (actual - expected).abs() <= 1e-5,
+        "expected {expected}, got {actual}"
+    );
+}
+
+/// `Game` is the untransformed Win32 presentation: the window client area is
+/// the logical screen and one logical pixel is one framebuffer pixel
+/// (`reference/cpp/core/base/impl/SystemImpl.cpp:877-895`,
+/// `reference/cpp/core/visual/WindowIntf.cpp:1521-1547`).
+#[test]
+fn game_mode_is_the_untransformed_presentation() {
+    for framebuffer in [(2560, 1440), (1920, 1080), (1600, 1200), (1920, 800)] {
+        let presentation = Presentation::compute(ScalingMode::Game, DESIGN, framebuffer);
+        assert_eq!(
+            presentation.view,
+            ViewTransform::IDENTITY,
+            "{framebuffer:?}"
+        );
+        assert_eq!(presentation.logical_size, framebuffer, "{framebuffer:?}");
+    }
+}
+
+/// cocos2d `SHOW_ALL` scales by the smaller axis ratio and centres the
+/// viewport, leaving a letterbox on the free axis
+/// (`reference/cpp/core/environ/cocos2d/AppDelegate.cpp:73-75`).
+#[test]
+fn fit_mode_letterboxes_uniformly() {
+    // Same aspect as the design: no letterbox.
+    let presentation = Presentation::compute(ScalingMode::Fit, DESIGN, (2560, 1440));
+    assert_close(presentation.view.scale.0, 2.0);
+    assert_close(presentation.view.scale.1, 2.0);
+    assert_close(presentation.view.offset.0, 0.0);
+    assert_close(presentation.view.offset.1, 0.0);
+    assert_eq!(presentation.logical_size, DESIGN);
+
+    let presentation = Presentation::compute(ScalingMode::Fit, DESIGN, (1920, 1080));
+    assert_close(presentation.view.scale.0, 1.5);
+    assert_close(presentation.view.scale.1, 1.5);
+    assert_close(presentation.view.offset.0, 0.0);
+    assert_close(presentation.view.offset.1, 0.0);
+    assert_eq!(presentation.logical_size, DESIGN);
+
+    // Taller window: the width fits, so the letterbox is vertical.
+    let presentation = Presentation::compute(ScalingMode::Fit, DESIGN, (1600, 1200));
+    assert_close(presentation.view.scale.0, 1.25);
+    assert_close(presentation.view.scale.1, 1.25);
+    assert_close(presentation.view.offset.0, 0.0);
+    assert_close(presentation.view.offset.1, 150.0);
+    assert_eq!(presentation.logical_size, DESIGN);
+
+    // Wider window: the height fits, so the letterbox is horizontal.
+    let presentation = Presentation::compute(ScalingMode::Fit, DESIGN, (1920, 800));
+    assert_close(presentation.view.scale.0, 800.0 / 720.0);
+    assert_close(presentation.view.scale.1, 800.0 / 720.0);
+    assert_close(presentation.view.offset.0, 2240.0 / 9.0);
+    assert_close(presentation.view.offset.1, 0.0);
+    assert_eq!(presentation.logical_size, DESIGN);
+}
+
+/// cocos2d `EXACT_FIT` scales the two axes independently and covers the whole
+/// frame with no offset
+/// (`reference/cpp/core/environ/cocos2d/AppDelegate.cpp:70`).
+#[test]
+fn fill_mode_scales_each_axis_to_the_window() {
+    let cases = [
+        ((2560, 1440), (2.0, 2.0)),
+        ((1920, 1080), (1.5, 1.5)),
+        ((1600, 1200), (1.25, 5.0 / 3.0)),
+        ((1920, 800), (1.5, 10.0 / 9.0)),
+    ];
+    for (framebuffer, (scale_x, scale_y)) in cases {
+        let presentation = Presentation::compute(ScalingMode::Fill, DESIGN, framebuffer);
+        assert_close(presentation.view.scale.0, scale_x);
+        assert_close(presentation.view.scale.1, scale_y);
+        assert_close(presentation.view.offset.0, 0.0);
+        assert_close(presentation.view.offset.1, 0.0);
+        assert_eq!(presentation.logical_size, DESIGN);
+    }
+}
+
+/// cocos2d `MainScene::initialize` keeps the design height and rewrites the
+/// width to the frame's aspect, so the uniform height scale fills exactly
+/// (`reference/cpp/core/environ/cocos2d/MainScene.cpp:436-441`).
+#[test]
+fn expand_mode_grows_the_logical_size_to_the_window_aspect() {
+    let cases = [
+        ((2560, 1440), (1280, 720), 2.0),
+        ((1920, 1080), (1280, 720), 1.5),
+        ((1600, 1200), (960, 720), 5.0 / 3.0),
+        ((1920, 800), (1728, 720), 10.0 / 9.0),
+    ];
+    for (framebuffer, logical_size, scale) in cases {
+        let presentation = Presentation::compute(ScalingMode::Expand, DESIGN, framebuffer);
+        assert_eq!(presentation.logical_size, logical_size, "{framebuffer:?}");
+        assert_close(presentation.view.scale.0, scale);
+        assert_close(presentation.view.scale.1, scale);
+        assert_close(presentation.view.offset.0, 0.0);
+        assert_close(presentation.view.offset.1, 0.0);
+    }
+}
+
+/// A zero window dimension is degenerate: the presentation stays the identity
+/// design projection and never divides by zero.
+#[test]
+fn degenerate_windows_keep_the_identity() {
+    let modes = [
+        ScalingMode::Game,
+        ScalingMode::Fit,
+        ScalingMode::Fill,
+        ScalingMode::Expand,
+    ];
+    for mode in modes {
+        for framebuffer in [(0, 0), (0, 720), (1280, 0)] {
+            let presentation = Presentation::compute(mode, DESIGN, framebuffer);
+            assert_eq!(
+                presentation.view,
+                ViewTransform::IDENTITY,
+                "{mode:?} {framebuffer:?}"
+            );
+            assert_eq!(
+                presentation.logical_size, DESIGN,
+                "{mode:?} {framebuffer:?}"
+            );
+        }
+        let presentation = Presentation::compute(mode, (0, 0), (1920, 1080));
+        assert_eq!(presentation.view, ViewTransform::IDENTITY, "{mode:?}");
+        assert_eq!(presentation.logical_size, (0, 0), "{mode:?}");
+    }
+}
+
+/// The projected tree carries the presentation transform to the pipeline.
+#[test]
+fn projection_carries_the_presentation_view() {
+    let mut scene = Scene::default();
+    let win = scene.add_window("t", (64, 64));
+    let _ = scene.add_layer(win, None);
+    let view = Presentation::compute(ScalingMode::Fit, DESIGN, (2560, 1440)).view;
+    let projected = project_window(&scene, win, view, |_| None);
+    assert_eq!(projected.view, view);
 }
