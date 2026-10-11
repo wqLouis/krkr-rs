@@ -2,9 +2,12 @@
 //!
 //! The plugin attaches structured-serialization members to the TJS2 builtins
 //! `Array` (`save2`, `saveStruct2`, `toStructString`) and `Dictionary`
-//! (`saveStruct2`, `toStructString`). The tests drive the members through TJS
-//! against a bound [`CompatHost`] and check both the textual `saveStruct` form
-//! and the UTF-16LE files the `save*` members write.
+//! (`saveStruct2`, `toStructString`). The `Array` members are ordinary
+//! instance members; the `Dictionary` members carry `TJS_STATICMEMBER`, so
+//! they live on the class object and an instance cannot reach them. The tests
+//! drive the members through TJS against a bound [`CompatHost`] and check both
+//! the textual `saveStruct` form and the UTF-16LE files the `save*` members
+//! write.
 //!
 //! Every test serializes on the shared VM lock, since the process-wide
 //! engine → context binding is single.
@@ -245,14 +248,17 @@ fn array_save2_rejects_non_string_elements() {
 }
 
 // ---------------------------------------------------------------------------
-// Dictionary members
+// Dictionary serializer, reached through an Array
 // ---------------------------------------------------------------------------
 
-// `getDictString` emits `%[`, comma+newline-separated `"key"=>value` pairs
-// and `]` (`reference/cpp/plugins/saveStruct.cpp:128-137`, separator at
-// `:106-114`), and the members the port attaches at class level must not
-// leak into the enumeration (the reference's `DictAdd` members are static,
-// `:364-366`).
+// `getVariantString` routes a non-Array object to `getDictString`
+// (`reference/cpp/plugins/saveStruct.cpp:174-183`), so a dictionary nested in
+// an array is serialized by the same `getDictString` the reference uses;
+// `getArrayString` wraps the result in `[`/`]` (`:142-164`). The dictionary
+// emits `%[`, comma+newline-separated `"key"=>value` pairs and `]`
+// (`:128-137`, separator at `:106-114`). The `Dictionary` members carry
+// `TJS_STATICMEMBER` (`:364-366`) and are never copied onto the instance, so
+// they must not leak into this enumeration.
 #[test]
 fn dictionary_to_struct_string_matches_the_reference_format() {
     let _lock = vm_lock();
@@ -260,12 +266,12 @@ fn dictionary_to_struct_string_matches_the_reference_format() {
 
     env.run(
         "var d = %[]; d[\"name\"] = \"Kirikiri\"; d[\"count\"] = 3; \
-         var s = d.toStructString();",
+         var s = [d].toStructString();",
     );
 
     let s = env.string("s");
-    assert!(s.starts_with("%["), "unexpected prefix: {s}");
-    assert!(s.ends_with(']'), "unexpected suffix: {s}");
+    assert!(s.starts_with("[%["), "unexpected prefix: {s}");
+    assert!(s.ends_with("]]"), "unexpected suffix: {s}");
     assert!(
         s.contains("\"name\"=>\"Kirikiri\""),
         "missing string member: {s}"
@@ -274,30 +280,33 @@ fn dictionary_to_struct_string_matches_the_reference_format() {
         s.contains("\"count\"=>int 3"),
         "missing integer member: {s}"
     );
-    // The non-static instance members the port attaches to `Dictionary`
-    // (`scripts_ex` helpers and this plugin's own members) are class-level
-    // and must not be serialized; the reference never sees them.
+    // The `Dictionary` members the plugin attaches are static
+    // (`reference/cpp/plugins/saveStruct.cpp:364-366`), and the `scripts_ex`
+    // helpers are class-level, so neither is copied onto the instance and
+    // neither appears in the reference's `EnumMembers` walk.
     assert!(
-        !s.contains("getObjectKeys"),
+        !s.contains("getObjectKeys") && !s.contains("saveStruct2") && !s.contains("toStructString"),
         "attached class members leaked into the struct: {s}"
     );
 }
 
-// An empty dictionary round-trips to the literal `%[]`
-// (`reference/cpp/plugins/saveStruct.cpp:128-137`: no pairs, no separator).
+// An empty dictionary nested in an array round-trips to `[%[]]`: `getDictString`
+// writes `%[`/`]` with no pairs (`reference/cpp/plugins/saveStruct.cpp:128-137`)
+// and `getArrayString` wraps it in `[`/`]` (`:142-164`).
 #[test]
 fn empty_dictionary_serializes_to_empty_brackets() {
     let _lock = vm_lock();
     let env = Env::new();
 
-    env.run("var d = %[]; var s = d.toStructString();");
-    assert_eq!(env.string("s"), "%[]");
+    env.run("var d = %[]; var s = [d].toStructString();");
+    assert_eq!(env.string("s"), "[%[]]");
 }
 
-// The `toStructString` newline flag is `param[0]` for both receivers
-// (`reference/cpp/plugins/saveStruct.cpp:302` and `:355`): `0` selects
-// CRLF, non-zero LF (`:25-29`), and it controls only the dictionary
-// separator — arrays are always comma-joined (`:156`).
+// The `toStructString` newline flag is `param[0]` of the Array receiver the
+// dictionary is nested in (`reference/cpp/plugins/saveStruct.cpp:302`,
+// reached through `getArrayString` at `:142-164`): `0` selects CRLF, non-zero
+// LF (`:25-29`), and it controls only the dictionary separator — arrays are
+// always comma-joined (`:156`).
 #[test]
 fn dictionary_newline_flag_selects_crlf_or_lf() {
     let _lock = vm_lock();
@@ -305,19 +314,25 @@ fn dictionary_newline_flag_selects_crlf_or_lf() {
 
     env.run(
         "var d = %[]; d[\"a\"] = 1; d[\"b\"] = 2; \
-         var crlf = d.toStructString(0); \
-         var lf = d.toStructString(1);",
+         var crlf = [d].toStructString(0); \
+         var lf = [d].toStructString(1);",
     );
 
     let crlf = env.string("crlf");
     let lf = env.string("lf");
+    assert!(crlf.starts_with("[%["), "unexpected prefix: {crlf}");
+    assert!(crlf.ends_with("]]"), "unexpected suffix: {crlf}");
     assert!(crlf.contains("\r\n"), "expected CRLF separator: {crlf:?}");
+    assert!(lf.starts_with("[%["), "unexpected prefix: {lf}");
+    assert!(lf.ends_with("]]"), "unexpected suffix: {lf}");
     assert!(lf.contains('\n'), "expected LF separator: {lf:?}");
     assert!(!lf.contains("\r\n"), "LF mode must not emit CRLF: {lf:?}");
 }
 
-// Nested arrays recurse through `getArrayString` (`reference/cpp/plugins/saveStruct.cpp:142-164`)
-// and nested dictionaries through `getDictString` (`:178-183`).
+// Nested arrays recurse through `getArrayString`
+// (`reference/cpp/plugins/saveStruct.cpp:178-180`) and nested dictionaries
+// through `getDictString` (`:181-183`); `getArrayString` wraps the outer
+// dictionary in `[`/`]` (`:142-164`).
 #[test]
 fn dictionary_serializes_nested_arrays_and_dictionaries() {
     let _lock = vm_lock();
@@ -326,10 +341,12 @@ fn dictionary_serializes_nested_arrays_and_dictionaries() {
     env.run(
         "var inner = %[]; inner[\"z\"] = null; \
          var d = %[]; d[\"list\"] = [1, \"two\"]; d[\"dict\"] = inner; \
-         var s = d.toStructString();",
+         var s = [d].toStructString();",
     );
 
     let s = env.string("s");
+    assert!(s.starts_with("[%["), "unexpected prefix: {s}");
+    assert!(s.ends_with("]]"), "unexpected suffix: {s}");
     assert!(
         s.contains("\"list\"=>[int 1,\"two\"]"),
         "missing nested array: {s}"
@@ -340,8 +357,10 @@ fn dictionary_serializes_nested_arrays_and_dictionaries() {
     );
 }
 
-// `Dictionary.saveStruct2` mirrors the Array member
-// (`reference/cpp/plugins/saveStruct.cpp:331-341`).
+// `Array.saveStruct2` serializes its receiver with `getArrayString`
+// (`reference/cpp/plugins/saveStruct.cpp:271-289`), which reaches
+// `getDictString` for the nested dictionary; the `Dictionary` member itself
+// is static (`:364-366`) and is not the receiver here.
 #[test]
 fn dictionary_save_struct2_writes_the_struct_form() {
     let _lock = vm_lock();
@@ -349,10 +368,10 @@ fn dictionary_save_struct2_writes_the_struct_form() {
     let path = env.path_literal("dict.txt");
 
     env.run(&format!(
-        "var d = %[]; d[\"k\"] = \"v\"; d.saveStruct2({path});"
+        "var d = %[]; d[\"k\"] = \"v\"; [d].saveStruct2({path});"
     ));
 
-    assert_eq!(env.read_struct("dict.txt"), "%[\"k\"=>\"v\"]");
+    assert_eq!(env.read_struct("dict.txt"), "[%[\"k\"=>\"v\"]]");
 }
 
 // ---------------------------------------------------------------------------
@@ -360,19 +379,36 @@ fn dictionary_save_struct2_writes_the_struct_form() {
 // ---------------------------------------------------------------------------
 
 // The reference attaches `save2`/`saveStruct2`/`toStructString` to `Array`
-// (`reference/cpp/plugins/saveStruct.cpp:310-313`) but only
-// `saveStruct2`/`toStructString` to `Dictionary` (`:364-366`), so
-// `%[].save2` must not exist while the others do.
+// without a static flag (`reference/cpp/plugins/saveStruct.cpp:310-313`, via
+// `ncbAttachTJS2Class::RegistVariant`,
+// `reference/cpp/core/plugin/ncbind.hpp:2031-2032`), so they live on the
+// `Array` class object and the creation callback copies them onto every array
+// instance because they are not `TJS_STATICMEMBER`
+// (`reference/cpp/core/tjs2/tjsNative.cpp:346-360`). The reference attaches
+// `saveStruct2`/`toStructString` to `Dictionary` with `TJS_STATICMEMBER`
+// (`saveStruct.cpp:364-366`), which stores them on the class object and sets
+// the symbol's static bit
+// (`reference/cpp/core/tjs2/tjsObject.cpp:1390-1391`); the creation callback
+// skips them, so an instance never has them.
 #[test]
-fn members_are_instance_members_on_the_builtins_only() {
+fn members_are_reachable_on_the_builtins_like_the_reference() {
     let _lock = vm_lock();
     let env = Env::new();
 
-    // The Array members are reachable from an array instance...
+    // Array members are reachable on the class and on an instance.
+    assert_eq!(env.string("typeof Array.save2"), "Object");
+    assert_eq!(env.string("typeof Array.saveStruct2"), "Object");
+    assert_eq!(env.string("typeof Array.toStructString"), "Object");
+    assert_eq!(env.string("typeof [1].save2"), "Object");
+    assert_eq!(env.string("typeof [1].saveStruct2"), "Object");
     assert_eq!(env.string("[1].toStructString()"), "[int 1]");
-    // ...and the Dictionary members from a dictionary instance.
+
+    // Dictionary members are reachable on the class only.
     env.run("var d = %[]; d[\"k\"] = 1;");
-    assert!(env.string("d.toStructString()").contains("\"k\"=>int 1"));
+    assert_eq!(env.string("typeof Dictionary.saveStruct2"), "Object");
+    assert_eq!(env.string("typeof Dictionary.toStructString"), "Object");
+    assert_eq!(env.string("typeof d.saveStruct2"), "undefined");
+    assert_eq!(env.string("typeof d.toStructString"), "undefined");
 
     // An unrelated builtin is untouched: `String` has no such member.
     let error = env
@@ -424,11 +460,14 @@ fn serializer_helpers_are_not_globals() {
     }
 }
 
-// `DictAdd` attaches only `saveStruct2` and `toStructString`
-// (`reference/cpp/plugins/saveStruct.cpp:364-366`); `save2` is an Array-only
-// member (`:310-313`), so `%[].save2` must be `undefined` while Array keeps
-// it. `typeof` on a missing member reports `undefined` without raising
-// (`reference/cpp/core/tjs2/tjsInterCodeExec.cpp:1905-1910`).
+// `DictAdd` attaches only `saveStruct2` and `toStructString`, both with
+// `TJS_STATICMEMBER` (`reference/cpp/plugins/saveStruct.cpp:364-366`); `save2`
+// is an Array-only member (`:310-313`). `typeof` on a missing member reports
+// `undefined` without raising
+// (`reference/cpp/core/tjs2/tjsInterCodeExec.cpp:1905-1910`), and the static
+// members are not copied onto a `Dictionary` instance
+// (`reference/cpp/core/tjs2/tjsNative.cpp:346-360`). Both `save2` and
+// `saveStruct2` are reachable as Array instance members (`saveStruct.cpp:310-313`).
 #[test]
 fn dictionary_has_no_save2_member() {
     let _lock = vm_lock();
@@ -437,12 +476,14 @@ fn dictionary_has_no_save2_member() {
     env.run(
         "var d = %[]; \
          var dictSave2 = (typeof d.save2 == \"undefined\") ? 1 : 0; \
-         var dictSaveStruct2 = (typeof d.saveStruct2 == \"undefined\") ? 0 : 1; \
-         var arrSave2 = (typeof [1].save2 == \"undefined\") ? 0 : 1;",
+         var dictSaveStruct2 = (typeof d.saveStruct2 == \"undefined\") ? 1 : 0; \
+         var arrSave2 = (typeof [1].save2 == \"undefined\") ? 0 : 1; \
+         var arrSaveStruct2 = (typeof [1].saveStruct2 == \"undefined\") ? 0 : 1;",
     );
     assert_eq!(env.eval_ok("dictSave2"), TjsValue::Integer(1));
     assert_eq!(env.eval_ok("dictSaveStruct2"), TjsValue::Integer(1));
     assert_eq!(env.eval_ok("arrSave2"), TjsValue::Integer(1));
+    assert_eq!(env.eval_ok("arrSaveStruct2"), TjsValue::Integer(1));
 }
 
 // The file writers require at least the filename — `TJS_E_BADPARAMCOUNT`
@@ -457,7 +498,9 @@ fn save_members_require_a_filename_but_to_struct_string_does_not() {
     for call in [
         "[1].save2()".to_string(),
         "[1].saveStruct2()".to_string(),
-        "%[].saveStruct2()".to_string(),
+        // The Dictionary writer is reachable on the class object; the
+        // argument check runs before the receiver is used.
+        "Dictionary.saveStruct2()".to_string(),
     ] {
         let error = env
             .engine
@@ -486,9 +529,9 @@ fn save2_ignores_the_utf_flag_and_keeps_crlf() {
     assert_eq!(env.read_struct("utf_flag.txt"), "x\r\n");
 }
 
-// `Dictionary.saveStruct2` writes its separator as `,` plus the newline
-// selected by `param[2]` (`reference/cpp/plugins/saveStruct.cpp:106-114`,
-// flag at `:339`): LF mode must not contain a CRLF anywhere in the output.
+// `Array.saveStruct2` writes the nested dictionary's separator as `,` plus
+// the newline selected by `param[2]` (`reference/cpp/plugins/saveStruct.cpp:106-114`,
+// flag at `:279`): LF mode must not contain a CRLF anywhere in the output.
 #[test]
 fn dictionary_save_struct2_file_newline_flag_selects_lf() {
     let _lock = vm_lock();
@@ -498,17 +541,27 @@ fn dictionary_save_struct2_file_newline_flag_selects_lf() {
 
     env.run(&format!(
         "var d = %[]; d[\"a\"] = 1; d[\"b\"] = 2; \
-         d.saveStruct2({lf}, 0, 1); \
-         d.saveStruct2({crlf}, 0, 0);"
+         [d].saveStruct2({lf}, 0, 1); \
+         [d].saveStruct2({crlf}, 0, 0);"
     ));
 
     let lf_text = env.read_struct("dict_lf.txt");
+    assert!(lf_text.starts_with("[%["), "unexpected prefix: {lf_text:?}");
+    assert!(lf_text.ends_with("]]"), "unexpected suffix: {lf_text:?}");
     assert!(lf_text.contains('\n'), "expected LF separator: {lf_text:?}");
     assert!(
         !lf_text.contains("\r\n"),
         "LF mode must not emit CRLF: {lf_text:?}"
     );
     let crlf_text = env.read_struct("dict_crlf.txt");
+    assert!(
+        crlf_text.starts_with("[%["),
+        "unexpected prefix: {crlf_text:?}"
+    );
+    assert!(
+        crlf_text.ends_with("]]"),
+        "unexpected suffix: {crlf_text:?}"
+    );
     assert!(
         crlf_text.contains("\r\n"),
         "expected CRLF separator: {crlf_text:?}"
