@@ -714,6 +714,103 @@ mod parser_tests {
             ]
         );
     }
+
+    #[test]
+    fn multiline_ams_motion_tag_keeps_its_continuation_parameters() {
+        // `emotion/はてな.ams:12-14` writes an `@motion` line command whose
+        // attributes continue on a `;`-prefixed line; KAGParserEx joins
+        // them when `multiLineTagEnabled` is on
+        // (`reference/cpp/plugins/KAGParser/readme.txt:14-38`).
+        let scenario = parse_with_options(
+            "@motion id=MARK accel=2 time=750 \\\n; path=\"0, 0, 0, 255\" area=10\n",
+            opts(),
+        )
+        .unwrap();
+        assert_eq!(scenario.events.len(), 1);
+        match &scenario.events[0] {
+            Event::Tag { name, params, .. } => {
+                assert_eq!(name, "motion");
+                assert!(
+                    params
+                        .iter()
+                        .any(|(k, v)| k == "path" && v == "0, 0, 0, 255")
+                );
+                assert!(params.iter().any(|(k, v)| k == "area" && v == "10"));
+            }
+            other => panic!("expected motion tag, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn duplicate_labels_are_suffixed() {
+        // The reference label cache suffixes the second occurrence `:2` and
+        // keeps the first under the bare name
+        // (`reference/cpp/core/base/KAGParser.cpp:193-238`).
+        let scenario = parse("*foo\n*foo\n*foo\n").unwrap();
+        assert_eq!(
+            scenario.labels.get("*foo").copied(),
+            Some(0),
+            "first occurrence keeps the bare name"
+        );
+        assert_eq!(scenario.labels.get("*foo:2").copied(), Some(1));
+        assert_eq!(scenario.labels.get("*foo:3").copied(), Some(2));
+        assert!(matches!(
+            &scenario.events[1],
+            Event::Label { name, .. } if name == "*foo:2"
+        ));
+    }
+
+    #[test]
+    fn empty_label_aliases_the_previous_one() {
+        // An empty `*` reuses the previous label name; because that name is
+        // already in the cache, the reference then suffixes the alias `:2`
+        // (`reference/cpp/core/base/KAGParser.cpp:207-238`).
+        let scenario = parse("*foo\n*\n").unwrap();
+        assert_eq!(scenario.labels.get("*foo").copied(), Some(0));
+        assert_eq!(scenario.labels.get("*foo:2").copied(), Some(1));
+        assert!(matches!(
+            &scenario.events[1],
+            Event::Label { name, .. } if name == "*foo:2"
+        ));
+    }
+
+    #[test]
+    fn empty_first_label_is_an_error() {
+        // Without a previous label an empty one cannot be aliased
+        // (`reference/cpp/core/base/KAGParser.cpp:213-216`).
+        assert_eq!(parse("*\n"), Err(Error::CannotOmitFirstLabelName));
+    }
+
+    #[test]
+    fn iscript_block_is_collected_verbatim() {
+        // The reference collects `[iscript]` … `[endscript]` lines without
+        // parsing their `[`/`]` (`reference/cpp/core/base/KAGParser.cpp:1130-1176`).
+        let scenario = parse("*start\n[iscript]\nvar a = [1, 2];\n[endscript]\nafter\n").unwrap();
+        assert_eq!(
+            scenario.events,
+            vec![
+                Event::Label {
+                    name: "*start".into(),
+                    macro_name: None,
+                    line: 1,
+                },
+                Event::Script {
+                    text: "var a = [1, 2];\r\n".into(),
+                    start_line: 2,
+                    line: 2,
+                },
+                text("after", 5),
+            ]
+        );
+    }
+
+    #[test]
+    fn iscript_without_endscript_is_an_error() {
+        assert_eq!(
+            parse("[iscript]\nvar a = 1;\n"),
+            Err(Error::InlineScriptNotEnd)
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -743,6 +840,12 @@ fn collect(
         eval,
         load_storage: &mut load,
         fire_label: None,
+        fire_script: None,
+        fire_jump: None,
+        fire_call: None,
+        fire_return: None,
+        fire_scenario_load: None,
+        fire_scenario_loaded: None,
     };
     let mut tags = Vec::new();
     loop {
@@ -796,6 +899,270 @@ fn walks_text_tags_and_line_ends() {
             vec![("100".to_string(), "true".to_string())]
         )
     );
+}
+
+#[test]
+fn cur_line_and_cur_pos_are_zero_based() {
+    // `Rewind` sets `CurLine = 0`; after `GoToLabel` the cursor is the
+    // label's 0-based line, and a returned character reports the source
+    // line and the column just past it
+    // (`reference/cpp/core/base/KAGParser.cpp:987-991`, `:1015-1053`,
+    // `:1464-1506`).
+    let mut state = KagParserState::default();
+    state.load_scenario_text("t.ks", "*start\nA\n").unwrap();
+    let mut eval = |_e: &str| Ok(EvalResult::Void);
+    let mut load = |_n: &str| Err("unexpected storage load".to_string());
+    let mut env = Environ {
+        eval: &mut eval,
+        load_storage: &mut load,
+        fire_label: None,
+        fire_script: None,
+        fire_jump: None,
+        fire_call: None,
+        fire_return: None,
+        fire_scenario_load: None,
+        fire_scenario_loaded: None,
+    };
+    state.go_to_label("*start").unwrap();
+    assert_eq!(state.cur_line(), 0);
+
+    let (name, _) = state.next_tag(&mut env).unwrap().unwrap();
+    assert_eq!(name, "ch");
+    assert_eq!(state.cur_line(), 1);
+    assert_eq!(state.cur_line_str(), "A");
+    assert_eq!(state.cur_pos(), 1);
+}
+
+#[test]
+fn percent_line_is_walked_as_text() {
+    // The base reference has no `%` handling at all, so a `%` line is
+    // ordinary text (`reference/cpp/core/base/KAGParser.cpp:1464-1512`).
+    let mut state = KagParserState::default();
+    state
+        .load_scenario_text("t.ks", "%macro mymacro\n")
+        .unwrap();
+    let mut eval = |_e: &str| Ok(EvalResult::Void);
+    let tags = collect(&mut state, &mut eval);
+    assert_eq!(ch_text(&tags), "%macro mymacro");
+}
+
+#[test]
+fn multi_line_tag_enabled_joins_continuations() {
+    // KAGParserEx reads `multiLineTagEnabled` when the scenario is parsed
+    // (`reference/cpp/plugins/KAGParser/readme.txt:14-38`); the game sets
+    // it before `loadScenario` (`system/animationsequence.tjs:15`).
+    let text = "@motion id=MARK time=750 \\\n; path=\"0, 0, 255\"\n";
+
+    let mut off = KagParserState::default();
+    off.load_scenario_text("t.ams", text).unwrap();
+    let mut eval = |_e: &str| Ok(EvalResult::Void);
+    let mut load = |_n: &str| Err("unexpected storage load".to_string());
+    let mut env = Environ {
+        eval: &mut eval,
+        load_storage: &mut load,
+        fire_label: None,
+        fire_script: None,
+        fire_jump: None,
+        fire_call: None,
+        fire_return: None,
+        fire_scenario_load: None,
+        fire_scenario_loaded: None,
+    };
+    let (name, params) = off.next_tag(&mut env).unwrap().unwrap();
+    assert_eq!(name, "motion");
+    assert!(!params.iter().any(|(k, _)| k == "path"));
+
+    let mut on = KagParserState::default();
+    on.multi_line_tag_enabled = true;
+    on.load_scenario_text("t.ams", text).unwrap();
+    let mut eval = |_e: &str| Ok(EvalResult::Void);
+    let mut load = |_n: &str| Err("unexpected storage load".to_string());
+    let mut env = Environ {
+        eval: &mut eval,
+        load_storage: &mut load,
+        fire_label: None,
+        fire_script: None,
+        fire_jump: None,
+        fire_call: None,
+        fire_return: None,
+        fire_scenario_load: None,
+        fire_scenario_loaded: None,
+    };
+    let (name, params) = on.next_tag(&mut env).unwrap().unwrap();
+    assert_eq!(name, "motion");
+    assert!(params.iter().any(|(k, v)| k == "path" && v == "0, 0, 255"));
+}
+
+#[test]
+fn param_macros_expand_into_a_tag() {
+    // KAGParserEx replaces an attribute matching a `paramMacros` key with
+    // the registered parameter list
+    // (`reference/cpp/plugins/KAGParser/readme.txt:51-60`).
+    let mut state = KagParserState::default();
+    state.set_param_macros(vec![(
+        "greet".to_string(),
+        vec![
+            ("a".to_string(), "1".to_string()),
+            ("b".to_string(), "2".to_string()),
+        ],
+    )]);
+    assert_eq!(state.param_macros_entries().len(), 1);
+    state
+        .load_scenario_text("t.ks", "*start\n[x greet]\n")
+        .unwrap();
+    let mut eval = |_e: &str| Ok(EvalResult::Void);
+    let mut load = |_n: &str| Err("unexpected storage load".to_string());
+    let mut env = Environ {
+        eval: &mut eval,
+        load_storage: &mut load,
+        fire_label: None,
+        fire_script: None,
+        fire_jump: None,
+        fire_call: None,
+        fire_return: None,
+        fire_scenario_load: None,
+        fire_scenario_loaded: None,
+    };
+    let (name, params) = state.next_tag(&mut env).unwrap().unwrap();
+    assert_eq!(name, "x");
+    assert_eq!(
+        params,
+        vec![
+            ("a".to_string(), "1".to_string()),
+            ("b".to_string(), "2".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn cur_line_str_uses_the_emb_expansion_buffer() {
+    // While an expansion is active the reference points `CurLineStr` at
+    // `LineBuffer` and `CurPos` at the buffer column
+    // (`reference/cpp/core/base/KAGParser.cpp:1873-1884`).
+    let mut state = KagParserState::default();
+    state
+        .load_scenario_text("t.ks", "[emb exp=\"'XY'\"]\n")
+        .unwrap();
+    let mut eval = |e: &str| eval_literal(e);
+    let mut load = |_n: &str| Err("unexpected storage load".to_string());
+    let mut env = Environ {
+        eval: &mut eval,
+        load_storage: &mut load,
+        fire_label: None,
+        fire_script: None,
+        fire_jump: None,
+        fire_call: None,
+        fire_return: None,
+        fire_scenario_load: None,
+        fire_scenario_loaded: None,
+    };
+    let (_, first_params) = loop {
+        let (name, params) = state.next_tag(&mut env).unwrap().unwrap();
+        if name == "ch" {
+            break (name, params);
+        }
+    };
+    assert_eq!(first_params[0].1, "X");
+    assert_eq!(state.cur_line_str(), "XY");
+    assert_eq!(state.cur_pos(), 1);
+}
+
+#[test]
+fn on_script_fires_for_an_inline_block() {
+    // The walk fires `onScript(script, storageShortName, scriptStart)` as it
+    // passes a collected inline script block
+    // (`reference/cpp/core/base/KAGParser.cpp:1161-1172`).
+    let mut state = KagParserState::default();
+    state
+        .load_scenario_text("t.ks", "*start\n[iscript]\nvar x = 1;\n[endscript]\n")
+        .unwrap();
+    let mut eval = |_e: &str| Ok(EvalResult::Void);
+    let mut load = |_n: &str| Err("unexpected storage load".to_string());
+    let mut script = String::new();
+    let mut storage = String::new();
+    let mut start = usize::MAX;
+    let mut fire_script = |s: &str, st: &str, line: usize| {
+        script = s.to_string();
+        storage = st.to_string();
+        start = line;
+    };
+    let mut env = Environ {
+        eval: &mut eval,
+        load_storage: &mut load,
+        fire_label: None,
+        fire_script: Some(&mut fire_script),
+        fire_jump: None,
+        fire_call: None,
+        fire_return: None,
+        fire_scenario_load: None,
+        fire_scenario_loaded: None,
+    };
+    let mut tags = Vec::new();
+    loop {
+        match state.next_tag(&mut env) {
+            Ok(Some(tag)) => tags.push(tag),
+            Ok(None) => break,
+            Err(e) => panic!("next_tag error: {e}"),
+        }
+    }
+    drop(env);
+    assert!(tags.is_empty());
+    assert_eq!(script, "var x = 1;\r\n");
+    assert_eq!(storage, "t.ks");
+    assert_eq!(start, 2);
+}
+
+#[test]
+fn jump_veto_skips_the_jump() {
+    // A false `onJump` result vetoes the jump, so the walk falls through
+    // (`reference/cpp/core/base/KAGParser.cpp:1897-1918`).
+    let mut state = KagParserState::default();
+    state
+        .load_scenario_text("t.ks", "*start\n@jump target=\"*end\"\nA\n*end\nB\n")
+        .unwrap();
+    let mut eval = |_e: &str| Ok(EvalResult::Void);
+    let mut load = |_n: &str| Err("unexpected storage load".to_string());
+    let mut fire_jump = |name: &str, params: &[(String, String)]| -> bool {
+        assert_eq!(name, "jump");
+        assert!(params.iter().any(|(k, v)| k == "target" && v == "*end"));
+        false
+    };
+    let mut env = Environ {
+        eval: &mut eval,
+        load_storage: &mut load,
+        fire_label: None,
+        fire_script: None,
+        fire_jump: Some(&mut fire_jump),
+        fire_call: None,
+        fire_return: None,
+        fire_scenario_load: None,
+        fire_scenario_loaded: None,
+    };
+    let mut tags = Vec::new();
+    loop {
+        match state.next_tag(&mut env) {
+            Ok(Some(tag)) => tags.push(tag),
+            Ok(None) => break,
+            Err(e) => panic!("next_tag error: {e}"),
+        }
+    }
+    assert_eq!(ch_text(&tags), "AB");
+}
+
+#[test]
+fn assign_preserves_process_special_tags_and_interrupted() {
+    // `operator=` copies `DebugLevel`/`IgnoreCR` but not
+    // `ProcessSpecialTags`/`Interrupted` (`KAGParser.cpp:395-466`).
+    let mut src = KagParserState::default();
+    src.load_scenario_text("t.ks", "*start\nA\n").unwrap();
+    src.process_special_tags = false;
+    src.interrupt();
+    src.debug_level = 2;
+    let mut dst = KagParserState::default();
+    dst.assign_from(&src);
+    assert!(dst.process_special_tags);
+    assert!(!dst.interrupted);
+    assert_eq!(dst.debug_level, 2);
 }
 
 #[test]
@@ -935,6 +1302,12 @@ fn store_and_restore_round_trip() {
         eval: &mut eval,
         load_storage: &mut load,
         fire_label: None,
+        fire_script: None,
+        fire_jump: None,
+        fire_call: None,
+        fire_return: None,
+        fire_scenario_load: None,
+        fire_scenario_loaded: None,
     };
     let first = state.next_tag(&mut env).unwrap();
     assert_eq!(first.unwrap().0, "ch");
@@ -947,11 +1320,110 @@ fn store_and_restore_round_trip() {
         eval: &mut eval2,
         load_storage: &mut load2,
         fire_label: None,
+        fire_script: None,
+        fire_jump: None,
+        fire_call: None,
+        fire_return: None,
+        fire_scenario_load: None,
+        fire_scenario_loaded: None,
     };
     restored.restore(&saved, &mut env2).unwrap();
     assert_eq!(restored.storage_name(), "t.ks");
     assert_eq!(restored.cur_label(), "*start");
     assert_eq!(restored.cur_line(), state.cur_line());
+}
+
+#[test]
+fn store_carries_the_active_line_buffer() {
+    // `Store` writes the current `lineBuffer`/`lineBufferUsing`
+    // (`reference/cpp/core/base/KAGParser.cpp:591-597`).
+    let mut state = KagParserState::default();
+    state
+        .load_scenario_text("t.ks", "[emb exp=\"'XY'\"]\n")
+        .unwrap();
+    let mut eval = |e: &str| eval_literal(e);
+    let mut load = |_n: &str| Err("unexpected storage load".to_string());
+    let mut env = Environ {
+        eval: &mut eval,
+        load_storage: &mut load,
+        fire_label: None,
+        fire_script: None,
+        fire_jump: None,
+        fire_call: None,
+        fire_return: None,
+        fire_scenario_load: None,
+        fire_scenario_loaded: None,
+    };
+    loop {
+        let (name, _) = state.next_tag(&mut env).unwrap().unwrap();
+        if name == "ch" {
+            break;
+        }
+    }
+    assert!(state.line_buffer_using());
+    assert_eq!(state.line_buffer(), "XY");
+    let saved = state.store();
+    assert!(saved.contains("lineBuffer=XY"), "{saved}");
+    assert!(saved.contains("lineBufferUsing=1"), "{saved}");
+}
+
+#[test]
+fn call_stack_snapshot_carries_the_active_line_buffer() {
+    // Each call-stack entry keeps the `LineBuffer`/`LineBufferUsing` that
+    // were live at the call site (`reference/cpp/core/base/KAGParser.cpp:591-597`,
+    // `595-634`).
+    let mut state = KagParserState::default();
+    state
+        .load_scenario_text("t.ks", "*start\n[emb exp=\"'XY'\"]\n*sub\nB\n")
+        .unwrap();
+    let mut eval = |e: &str| eval_literal(e);
+    let mut load = |_n: &str| Err("unexpected storage load".to_string());
+    let mut env = Environ {
+        eval: &mut eval,
+        load_storage: &mut load,
+        fire_label: None,
+        fire_script: None,
+        fire_jump: None,
+        fire_call: None,
+        fire_return: None,
+        fire_scenario_load: None,
+        fire_scenario_loaded: None,
+    };
+    // Walk into the expansion so the splice buffer "XY" is active, then
+    // enter a call: the snapshot must capture the live buffer.
+    loop {
+        let (name, _) = state.next_tag(&mut env).unwrap().unwrap();
+        if name == "ch" {
+            break;
+        }
+    }
+    assert!(state.line_buffer_using());
+    state.call_label("*sub", &mut env).unwrap();
+    let snapshots = state.call_stack_snapshots();
+    assert_eq!(snapshots.len(), 1);
+    assert!(snapshots[0].line_buffer_using);
+    assert_eq!(snapshots[0].line_buffer, "XY");
+}
+
+#[test]
+fn set_macros_registers_an_expandable_macro() {
+    // `set_macros` replaces the live macro table the walk consults when it
+    // meets `[name]` (`reference/cpp/core/base/KAGParser.cpp:2471-2481`).
+    let mut state = KagParserState::default();
+    state.set_macros(vec![(
+        "greet".to_string(),
+        "[ch text=\"Z\"][macropop]".to_string(),
+    )]);
+    assert_eq!(
+        state.macros_entries(),
+        vec![("greet".to_string(), "[ch text=\"Z\"][macropop]".to_string())]
+    );
+    state
+        .load_scenario_text("t.ks", "*start\n[greet]\n")
+        .unwrap();
+    let mut eval = |_e: &str| Ok(EvalResult::Void);
+    let tags = collect(&mut state, &mut eval);
+    assert_eq!(ch_text(&tags), "Z");
 }
 
 #[test]
@@ -991,6 +1463,12 @@ fn state_accessors_and_call_label() {
         eval: &mut eval,
         load_storage: &mut load,
         fire_label: None,
+        fire_script: None,
+        fire_jump: None,
+        fire_call: None,
+        fire_return: None,
+        fire_scenario_load: None,
+        fire_scenario_loaded: None,
     };
 
     // `CallLabel`: push the call stack and jump to the label.
@@ -1253,6 +1731,168 @@ fn native_debug_level_uses_the_reference_integer_conversion() {
 }
 
 #[test]
+fn native_multi_line_tag_enabled_property_round_trips() {
+    // KAGParserEx adds the `multiLineTagEnabled` property
+    // (`reference/cpp/plugins/KAGParser/readme.txt:14-38`); the game sets
+    // it before `loadScenario` (`system/animationsequence.tjs:15`).
+    let value = eval_native(
+        "(function(){ var p = new KAGParser(); p.multiLineTagEnabled = true; \
+         return p.multiLineTagEnabled ? 1 : 0; })()",
+    )
+    .expect("script");
+    assert_eq!(value, TjsValue::Integer(1));
+
+    let value = eval_native(
+        "(function(){ var p = new KAGParser(); return p.multiLineTagEnabled ? 1 : 0; })()",
+    )
+    .expect("script");
+    assert_eq!(value, TjsValue::Integer(0));
+}
+
+#[test]
+fn native_multi_line_tag_enabled_joins_ams_continuations() {
+    // `system/animationsequence.tjs:15` enables multi-line tags before
+    // loading the `.ams`; the joined `@motion` keeps the `;`-line
+    // parameters (`emotion/はてな.ams:12-14`,
+    // `reference/cpp/plugins/KAGParser/readme.txt:14-38`).
+    let _lock = common::vm_lock();
+    let env = common::Env::with_storage();
+    std::fs::write(
+        env.game_dir().expect("mounted game dir").join("motion.ams"),
+        b"*loop\n@motion id=MARK accel=2 time=750 \\\n; path=\"0, 0, 255\" area=10 zoom=1 rotate=0\n",
+    )
+    .expect("write motion.ams");
+
+    let value = env
+        .eval(
+            "(function(){ var p = new KAGParser(); p.multiLineTagEnabled = true; \
+             p.loadScenario('motion.ams'); var out = ''; while (true) { \
+             var t = p.getNextTag(); if (!t) break; \
+             if (t.tagname == 'motion') out = t.path + '|' + t.area + '|' + t.zoom + '|' + t.rotate; } \
+             return out; })()",
+        )
+        .expect("script");
+    assert_eq!(value, TjsValue::String("0, 0, 255|10|1|0".to_string()));
+}
+
+#[test]
+fn native_cur_line_is_zero_based() {
+    // `Rewind` sets `CurLine = 0` and `CurLineStr` is the current source
+    // line (`reference/cpp/core/base/KAGParser.cpp:987-991`); the character
+    // on the second source line therefore reports `curLine == 1`.
+    let _lock = common::vm_lock();
+    let env = common::Env::with_storage();
+    std::fs::write(
+        env.game_dir().expect("mounted game dir").join("line.ks"),
+        b"*start\nA\n",
+    )
+    .expect("write line.ks");
+
+    let value = env
+        .eval(
+            "(function(){ var p = new KAGParser(); p.loadScenario('line.ks'); \
+             while (true) { var t = p.getNextTag(); if (!t) break; \
+             if (t.tagname == 'ch') return p.curLine + '|' + p.curLineStr; } \
+             return 'none'; })()",
+        )
+        .expect("script");
+    assert_eq!(value, TjsValue::String("1|A".to_string()));
+}
+
+#[test]
+fn native_param_macros_property_round_trips() {
+    // KAGParserEx exposes a writable `paramMacros` dictionary whose values
+    // are `[name, value, name, value, ...]` arrays
+    // (`reference/cpp/plugins/KAGParser/readme.txt:51-60`).
+    let value = eval_native(
+        "(function(){ var p = new KAGParser(); \
+         p.paramMacros = %[ greet: [ 'a', '1', 'b', '2' ] ]; \
+         var d = p.paramMacros; \
+         return d['greet'][0] + d['greet'][1] + d['greet'][2] + d['greet'][3]; })()",
+    )
+    .expect("script");
+    assert_eq!(value, TjsValue::String("a1b2".to_string()));
+}
+
+#[test]
+fn native_param_macros_expands_into_a_tag() {
+    // A tag attribute matching a `paramMacros` key is replaced by the
+    // registered parameter list at run time
+    // (`reference/cpp/plugins/KAGParser/readme.txt:51-60`).
+    let _lock = common::vm_lock();
+    let env = common::Env::with_storage();
+    std::fs::write(
+        env.game_dir().expect("mounted game dir").join("pm.ks"),
+        b"*start\n[x greet]\n",
+    )
+    .expect("write pm.ks");
+
+    let value = env
+        .eval(
+            "(function(){ var p = new KAGParser(); \
+             p.paramMacros = %[ greet: [ 'a', '1', 'b', '2' ] ]; \
+             p.loadScenario('pm.ks'); var out = ''; while (true) { \
+             var t = p.getNextTag(); if (!t) break; \
+             if (t.tagname == 'x') out = t.a + t.b; } return out; })()",
+        )
+        .expect("script");
+    assert_eq!(value, TjsValue::String("12".to_string()));
+}
+
+#[test]
+fn native_macros_table_is_live() {
+    // `GetMacrosNoAddRef` hands out the one shared dictionary; a script
+    // mutation must be seen by the walk
+    // (`reference/cpp/core/base/KAGParser.cpp:2471-2481`).
+    let _lock = common::vm_lock();
+    let env = common::Env::with_storage();
+    std::fs::write(
+        env.game_dir().expect("mounted game dir").join("m.ks"),
+        b"*start\n[greet]\n",
+    )
+    .expect("write m.ks");
+    let value = env
+        .eval(
+            "(function(){ var p = new KAGParser(); \
+             p.macros['greet'] = '[ch text=\"Z\"]'; \
+             p.loadScenario('m.ks'); var out = ''; while (true) { \
+             var t = p.getNextTag(); if (!t) break; \
+             if (t.tagname == 'ch') out += t.text; } return out; })()",
+        )
+        .expect("script");
+    assert_eq!(value, TjsValue::String("Z".to_string()));
+}
+
+#[test]
+fn native_on_script_fires() {
+    // `onScript(script, storageShortName, scriptStart)` fires as the walk
+    // passes an `[iscript]` block (`KAGParser.cpp:1161-1172`).
+    let _lock = common::vm_lock();
+    let env = common::Env::with_storage();
+    std::fs::write(
+        env.game_dir().expect("mounted game dir").join("s.ks"),
+        b"*start\n[iscript]\nvar x = 1;\n[endscript]\n",
+    )
+    .expect("write s.ks");
+    env.run(
+        "class KagScriptProbe extends KAGParser {\n\
+         function KagScriptProbe() { KAGParser(); }\n\
+         function onScript(script, storage, line) {\n\
+           global.probeScript = script; global.probeLine = line;\n\
+         }\n\
+         }",
+    );
+    let value = env
+        .eval(
+            "(function(){ var p = new KagScriptProbe(); p.loadScenario('s.ks'); \
+             while (true) { var t = p.getNextTag(); if (!t) break; } \
+             return global.probeScript + '|' + global.probeLine; })()",
+        )
+        .expect("script");
+    assert_eq!(value, TjsValue::String("var x = 1;\r\n|2".to_string()));
+}
+
+#[test]
 fn state_reference_store_accessors_round_trip() {
     // The native `store()` dictionary is fed from these accessors
     // (`natives/kag/mod.rs:build_store_dict`); pin them at the state level.
@@ -1266,6 +1906,12 @@ fn state_reference_store_accessors_round_trip() {
         eval: &mut eval,
         load_storage: &mut load,
         fire_label: None,
+        fire_script: None,
+        fire_jump: None,
+        fire_call: None,
+        fire_return: None,
+        fire_scenario_load: None,
+        fire_scenario_loaded: None,
     };
 
     assert_eq!(state.storage_short_name(), state.storage_name());

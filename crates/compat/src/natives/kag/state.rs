@@ -14,11 +14,9 @@
 //!   char-by-char). Empty lines, which the `parser` module drops, are
 //!   recovered from the line numbers and emit `r eol=true` the same way.
 //! * The owner-object event callbacks (`onScenarioLoad`, `onScenarioLoaded`,
-//!   `onLabel`, `onScript`, `onJump`, `onCall`, `onReturn`, `onAfterReturn`)
-//!   cannot be fired: the ABI carries no handle to the owning TJS object.
-//!   Jumps/calls/returns therefore always process (no veto), labels are
-//!   skipped silently, and `[iscript]` blocks are returned as ordinary
-//!   tags.
+//!   `onLabel`, `onScript`, `onJump`, `onCall`, `onReturn`) are supplied by
+//!   the native layer through [`Environ`]. A missing handler or a handler
+//!   error leaves the tag processed, matching the reference's default.
 //! * `if`/`elsif`/`ignore` conditions, `emb` expressions, `&entity` values
 //!   and `cond` attributes are evaluated by calling back into the TJS VM
 //!   through the [`Environ`] `eval` hook (globally, not in the owner's
@@ -29,8 +27,10 @@
 //!   events, which is all the expansion path needs. The `*` macro-entity
 //!   marker is lost (the parser consumes it) and `&`/`%` value prefixes
 //!   survive in values.
-//! * `%`-directive lines are skipped silently (the `parser` module parses
-//!   them as control lines; the reference would emit them as text).
+//! * The `parser` module groups a `%` line into [`Event::Directive`];
+//!   the walk emits its characters as ordinary text. The base reference has
+//!   no `%` handling at all, so the script-visible behaviour matches
+//!   (`reference/cpp/core/base/KAGParser.cpp:1464-1512`).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -47,6 +47,8 @@ pub const MSG_CALL_STACK_UNDERFLOW: &str =
     "'return' is not matched to any 'call' ( 'return' is unexpected )";
 pub const MSG_RETURN_LOST_SYNC: &str = "Lost return position due to the scenario file changed.";
 pub const MSG_LABEL_IN_MACRO: &str = "Label in macro 'iscript' is illegal.";
+pub const MSG_CANNOT_OMIT_FIRST_LABEL: &str = "Can not ommit first label name in scenario.";
+pub const MSG_INLINE_SCRIPT_NOT_END: &str = "Matched [endscript] or @endscript not found.";
 
 /// The result of evaluating a TJS expression through [`Environ::eval`].
 #[derive(Debug, Clone, PartialEq)]
@@ -106,6 +108,22 @@ fn format_real(r: f64) -> String {
 /// a label line (reference `SkipCommentOrLabel`).
 pub type LabelCallback<'a> = &'a mut dyn FnMut(&str, Option<&str>);
 
+/// Owner callback that fires `onScript(script, storageShortName, scriptStart)`
+/// as the walk passes an inline script block (reference `SkipCommentOrLabel`).
+pub type ScriptCallback<'a> = &'a mut dyn FnMut(&str, &str, usize);
+
+/// Owner callback that fires `onJump`/`onCall`/`onReturn` with the candidate
+/// tag name and resolved parameters, and returns whether the tag should be
+/// processed (`false` vetoes it, `KAGParser.cpp:1888-1975`).
+pub type TagCallback<'a> = &'a mut dyn FnMut(&str, &[(String, String)]) -> bool;
+
+/// Owner callback for `onScenarioLoad(name)`: returns the replacement
+/// scenario text when the handler returns a string (`KAGParser.cpp:919-937`).
+pub type ScenarioLoadCallback<'a> = &'a mut dyn FnMut(&str) -> Option<String>;
+
+/// Owner callback for `onScenarioLoaded(name)` (`KAGParser.cpp:955-966`).
+pub type ScenarioLoadedCallback<'a> = &'a mut dyn FnMut(&str);
+
 /// The environment a parser walks in: expression evaluation (into the TJS
 /// VM) and scenario loading (from storage). Both are injectable so the
 /// state machine stays pure and unit-testable.
@@ -116,6 +134,21 @@ pub struct Environ<'a> {
     /// passes a label line (reference `SkipCommentOrLabel`). `None` in pure
     /// state-machine tests, where no owner object exists.
     pub fire_label: Option<LabelCallback<'a>>,
+    /// Fires the owner's `onScript` callback for an inline script block.
+    pub fire_script: Option<ScriptCallback<'a>>,
+    /// Fires the owner's `onJump` callback (vetoes the jump when it returns
+    /// false).
+    pub fire_jump: Option<TagCallback<'a>>,
+    /// Fires the owner's `onCall` callback (vetoes the call when it returns
+    /// false).
+    pub fire_call: Option<TagCallback<'a>>,
+    /// Fires the owner's `onReturn` callback (vetoes the return when it
+    /// returns false).
+    pub fire_return: Option<TagCallback<'a>>,
+    /// Fires the owner's `onScenarioLoad` before a scenario is read.
+    pub fire_scenario_load: Option<ScenarioLoadCallback<'a>>,
+    /// Fires the owner's `onScenarioLoaded` after a scenario is read.
+    pub fire_scenario_loaded: Option<ScenarioLoadedCallback<'a>>,
 }
 
 /// One pending macro/emb expansion spliced ahead of the main event stream
@@ -125,6 +158,11 @@ struct Splice {
     /// Parsed events of the expansion (macro content) or a single Text
     /// event (emb result).
     events: Vec<Event>,
+    /// Per-event scan columns aligned with `events`.
+    cols: Vec<usize>,
+    /// The expansion text (`LineBuffer`); `curLineStr` returns this while
+    /// the expansion is active.
+    buffer: String,
     /// Next event / char position within `events`.
     event_pos: usize,
     char_pos: usize,
@@ -135,10 +173,8 @@ struct Splice {
 }
 
 /// The reference `tCallStackData` fields the native `store()` dictionary
-/// carries (`KAGParser.cpp:546-634`). `lineBuffer` / `lineBufferUsing` have
-/// no counterpart in this walk model and are omitted rather than invented.
-/// The stack fields use the reference encodings (`StoreIntStackToDic` /
-/// `StoreBoolStackToDic`).
+/// carries (`KAGParser.cpp:546-634`). The stack fields use the reference
+/// encodings (`StoreIntStackToDic` / `StoreBoolStackToDic`).
 #[derive(Debug, Clone)]
 pub struct CallStackSnapshot {
     /// The scenario storage the call returns to.
@@ -151,6 +187,10 @@ pub struct CallStackSnapshot {
     pub org_line_str: String,
     /// The position within that line at the call site.
     pub pos: usize,
+    /// The expansion buffer alive at the call site (`LineBuffer`).
+    pub line_buffer: String,
+    /// Whether the expansion buffer was in use (`LineBufferUsing`).
+    pub line_buffer_using: bool,
     /// The macro-argument stack base at the call site.
     pub macro_arg_stack_base: usize,
     /// The macro-argument stack depth at the call site.
@@ -173,6 +213,9 @@ struct CallStackEntry {
     offset: usize,
     org_sig: String,
     char_index: usize,
+    /// The scan column at the call site (the reference `tCallStackData`
+    /// `Pos`).
+    cur_pos: usize,
     splice: Vec<Splice>,
     pending_rs: usize,
     macro_args_base: usize,
@@ -242,6 +285,9 @@ pub struct KagParserState {
     events: Vec<Event>,
     labels: BTreeMap<String, usize>,
     raw_lines: Vec<String>,
+    /// Per-event scan column aligned with `events` (see
+    /// [`super::parser::Scenario::cols`]).
+    event_cols: Vec<usize>,
     comment_or_label_lines: BTreeSet<usize>,
     storage_name: String,
     storage_short_name: String,
@@ -249,7 +295,12 @@ pub struct KagParserState {
     // walk position
     event_index: usize,
     char_index: usize,
+    /// Zero-based index of the line the scan cursor is on (the reference
+    /// `CurLine`, `reference/cpp/core/base/KAGParser.cpp:987-991`).
     cur_line: usize,
+    /// Column of the scan cursor within the current line or expansion
+    /// buffer (the reference `CurPos`).
+    cur_pos: usize,
     pending_rs: usize,
     splice_stack: Vec<Splice>,
 
@@ -283,14 +334,16 @@ pub struct KagParserState {
     call_stack: Vec<CallStackEntry>,
 
     // flags
-    interrupted: bool,
+    pub interrupted: bool,
     /// Whether line-end `r eol=true` tags are suppressed (`ignoreCR`).
     pub ignore_cr: bool,
     /// Whether KAG control tags (`if`, `macro`, `jump`, …) are executed by
     /// the parser instead of being returned as output
     /// (`processSpecialTags`).
     pub process_special_tags: bool,
-    multi_line_tag_enabled: bool,
+    /// Whether a tag may continue on `;`-prefixed lines
+    /// (`multiLineTagEnabled`, KAGParserEx).
+    pub multi_line_tag_enabled: bool,
     /// Reference debug level (`debugLevel`), one of the `tTVPKAGDebugLevel`
     /// values.
     pub debug_level: i32,
@@ -305,12 +358,14 @@ impl Default for KagParserState {
             events: Vec::new(),
             labels: BTreeMap::new(),
             raw_lines: Vec::new(),
+            event_cols: Vec::new(),
             comment_or_label_lines: BTreeSet::new(),
             storage_name: String::new(),
             storage_short_name: String::new(),
             event_index: 0,
             char_index: 0,
             cur_line: 0,
+            cur_pos: 0,
             pending_rs: 0,
             splice_stack: Vec::new(),
             cur_label: String::new(),
@@ -343,7 +398,8 @@ fn line_of(e: &Event) -> usize {
         | Event::Text { line, .. }
         | Event::Tag { line, .. }
         | Event::Directive { line, .. }
-        | Event::Comment { line, .. } => *line,
+        | Event::Comment { line, .. }
+        | Event::Script { line, .. } => *line,
     }
 }
 
@@ -360,10 +416,15 @@ impl KagParserState {
         };
         let scenario = super::parser::parse_with_options(text, options).map_err(|e| match e {
             super::parser::Error::EmptyScenario => MSG_NO_LINE.replace("%1", name),
+            super::parser::Error::CannotOmitFirstLabelName => {
+                MSG_CANNOT_OMIT_FIRST_LABEL.to_string()
+            }
+            super::parser::Error::InlineScriptNotEnd => MSG_INLINE_SCRIPT_NOT_END.to_string(),
             e => format!("{MSG_SYNTAX} ({e})"),
         })?;
         self.events = scenario.events;
         self.labels = scenario.labels;
+        self.event_cols = scenario.cols;
         self.raw_lines = split_lines(text);
         self.comment_or_label_lines = self
             .events
@@ -371,6 +432,19 @@ impl KagParserState {
             .filter(|e| matches!(e, Event::Comment { .. } | Event::Label { .. }))
             .map(line_of)
             .collect();
+        // The lines an inline script block spans are skipped as a unit, so
+        // no `r eol=true` fires for them (`KAGParser.cpp:1130-1176`).
+        for event in &self.events {
+            if let Event::Script {
+                text, start_line, ..
+            } = event
+            {
+                let content_lines = text.matches("\r\n").count();
+                for l in (start_line + 1)..=(start_line + content_lines + 1) {
+                    self.comment_or_label_lines.insert(l);
+                }
+            }
+        }
         self.storage_name = name.to_string();
         self.storage_short_name = extract_storage_name(name);
         self.rewind();
@@ -380,15 +454,29 @@ impl KagParserState {
 
     /// Load a scenario through the environment (reads + decodes storage).
     /// Loading the *same* storage again just rewinds, like the reference's
-    /// scenario cache (`if(StorageName == name) Rewind()`).
+    /// scenario cache (`if(StorageName == name) Rewind()`). Fires the owner's
+    /// `onScenarioLoad`/`onScenarioLoaded` callbacks
+    /// (`KAGParser.cpp:911-967`).
     pub fn load_scenario(&mut self, name: &str, env: &mut Environ<'_>) -> Result<(), String> {
         if self.storage_name == name {
             self.rewind();
             self.pending_rs = self.initial_gap_lines();
-            return Ok(());
+        } else {
+            // `onScenarioLoad` may return the scenario text itself.
+            let override_text = match env.fire_scenario_load.as_deref_mut() {
+                Some(fire) => fire(name),
+                None => None,
+            };
+            let text = match override_text {
+                Some(text) => text,
+                None => (env.load_storage)(name)?,
+            };
+            self.load_scenario_text(name, &text)?;
         }
-        let text = (env.load_storage)(name)?;
-        self.load_scenario_text(name, &text)
+        if let Some(fire) = env.fire_scenario_loaded.as_deref_mut() {
+            fire(name);
+        }
+        Ok(())
     }
 
     /// Set the walk position to the start.
@@ -398,6 +486,7 @@ impl KagParserState {
         self.pending_rs = 0;
         self.splice_stack.clear();
         self.cur_line = 0;
+        self.cur_pos = 0;
         self.cur_label.clear();
         self.cur_page.clear();
         self.break_condition_and_macro();
@@ -439,6 +528,7 @@ impl KagParserState {
         self.events.clear();
         self.labels.clear();
         self.raw_lines.clear();
+        self.event_cols.clear();
         self.comment_or_label_lines.clear();
         self.storage_name.clear();
         self.storage_short_name.clear();
@@ -446,6 +536,17 @@ impl KagParserState {
         self.macro_args.clear();
         self.macro_args_base = 0;
         self.call_stack.clear();
+    }
+
+    /// Copy another parser's walk state (`operator=`, `KAGParser.cpp:395-466`).
+    /// `process_special_tags` and `interrupted` stay with the destination:
+    /// the reference does not copy `ProcessSpecialTags`/`Interrupted`.
+    pub fn assign_from(&mut self, src: &KagParserState) {
+        let process_special_tags = self.process_special_tags;
+        let interrupted = self.interrupted;
+        *self = src.clone();
+        self.process_special_tags = process_special_tags;
+        self.interrupted = interrupted;
     }
 
     // -------------------------------------------------------------------
@@ -476,7 +577,8 @@ impl KagParserState {
         {
             self.cur_label = name.clone();
             self.cur_page = macro_name.clone().unwrap_or_default();
-            self.cur_line = *line;
+            self.cur_line = line.saturating_sub(1);
+            self.cur_pos = 0;
         }
         Ok(())
     }
@@ -519,6 +621,11 @@ impl KagParserState {
             }
             if self.pending_rs > 0 {
                 self.pending_rs -= 1;
+                // A line end advances the scan cursor to the next line
+                // before the `r` tag is returned (`CurLine++` in
+                // `_GetNextTag`).
+                self.cur_line += 1;
+                self.cur_pos = 0;
                 // Line ends encountered while a macro is being recorded are
                 // appended to the recorded body as `[r eol=true]` (the
                 // reference appends them at parse time; we defer the
@@ -551,8 +658,25 @@ impl KagParserState {
                 return Ok(None);
             };
 
+            // The scan cursor sits on the event's source line before it is
+            // read (the reference `SkipCommentOrLabel` sets `CurLine`
+            // first). A splice walks an expansion buffer, so the source
+            // line does not change.
+            if !from_splice {
+                match &ev {
+                    Event::Text { line, .. }
+                    | Event::Tag { line, .. }
+                    | Event::Label { line, .. }
+                    | Event::Directive { line, .. }
+                    | Event::Script { line, .. } => {
+                        self.cur_line = line.saturating_sub(1);
+                    }
+                    Event::Comment { .. } => {}
+                }
+            }
+
             match &ev {
-                Event::Text { text, .. } => {
+                Event::Text { text, .. } | Event::Directive { raw: text, .. } => {
                     if self.recording_macro {
                         self.record_text(text);
                         self.advance_current();
@@ -572,6 +696,9 @@ impl KagParserState {
                         continue;
                     };
                     self.bump_char_pos();
+                    // `CurPos` is the column within the whole line (or
+                    // expansion buffer), one past the emitted character.
+                    self.cur_pos = self.current_col() + self.current_char_pos();
                     if pos + 1 == text.chars().count() {
                         self.advance_current();
                     }
@@ -601,17 +728,26 @@ impl KagParserState {
                         self.advance_current();
                         continue;
                     }
+                    // The tag's column is the position just past its
+                    // closing delimiter (a line command ends its line).
+                    let tag_col = self.current_col();
                     self.advance_current();
                     if let Some(out) =
                         self.process_tag(name, params, *macro_entity, *bracket, *line, env)?
                     {
+                        if *bracket == Bracket::At {
+                            // A line command advances to the next line
+                            // (`TVP_KAG_STEP_NEXT`).
+                            self.cur_line = *line;
+                            self.cur_pos = 0;
+                        } else {
+                            self.cur_pos = tag_col;
+                        }
                         return Ok(Some(out));
                     }
                 }
                 Event::Label {
-                    name,
-                    macro_name,
-                    line,
+                    name, macro_name, ..
                 } => {
                     if self.recording_macro {
                         return Err(MSG_LABEL_IN_MACRO.to_string());
@@ -622,19 +758,47 @@ impl KagParserState {
                     // though the label itself emits no tag.
                     let name = name.clone();
                     let macro_name = macro_name.clone();
-                    let line = *line;
                     self.cur_label = name.clone();
                     self.cur_page = macro_name.clone().unwrap_or_default();
-                    self.cur_line = line;
+                    self.cur_pos = 0;
                     if let Some(fire) = env.fire_label.as_deref_mut() {
                         fire(&name, macro_name.as_deref());
                     }
                     self.advance_current();
                 }
-                Event::Comment { .. } | Event::Directive { .. } => {
+                // An inline script block fires the owner's `onScript` and is
+                // consumed (no tag); inside a macro recording it is illegal
+                // (`KAGParser.cpp:1130-1176`).
+                Event::Script {
+                    text, start_line, ..
+                } => {
+                    if self.recording_macro {
+                        return Err(MSG_LABEL_IN_MACRO.to_string());
+                    }
+                    if self.exclude_level == -1
+                        && let Some(fire) = env.fire_script.as_deref_mut()
+                    {
+                        fire(text, &self.storage_short_name, *start_line);
+                    }
+                    self.advance_current();
+                }
+                // A comment line is control flow (the reference
+                // `SkipCommentOrLabel` skips it and leaves `CurPos` at 0).
+                Event::Comment { .. } => {
+                    self.cur_pos = 0;
                     self.advance_current();
                 }
             }
+        }
+    }
+
+    /// The scan column recorded for the current event (see
+    /// [`super::parser::Scenario::cols`]).
+    fn current_col(&self) -> usize {
+        if let Some(top) = self.splice_stack.last() {
+            top.cols.get(top.event_pos).copied().unwrap_or(0)
+        } else {
+            self.event_cols.get(self.event_index).copied().unwrap_or(0)
         }
     }
 
@@ -680,14 +844,13 @@ impl KagParserState {
             return;
         };
         let line = line_of(&ev);
-        self.cur_line = line;
 
         let line_ends = match &ev {
             Event::Tag {
                 bracket: Bracket::At,
                 ..
             } => false,
-            Event::Tag { .. } | Event::Text { .. } => self
+            Event::Tag { .. } | Event::Text { .. } | Event::Directive { .. } => self
                 .events
                 .get(self.event_index + 1)
                 .map(|n| line_of(n) != line)
@@ -902,10 +1065,12 @@ impl KagParserState {
                     && bracket == Bracket::Square
                     && self.last_on_line_after_current(line);
                 if is_macro {
-                    let events = parse_macro_content(&macro_content)?;
+                    let (events, cols) = parse_macro_content(&macro_content)?;
                     self.push_macro_args(&resolved);
                     self.splice_stack.push(Splice {
                         events,
+                        cols,
+                        buffer: macro_content.clone(),
                         event_pos: 0,
                         char_pos: 0,
                         line_r_after,
@@ -921,13 +1086,17 @@ impl KagParserState {
                         Some(v) => parse_tjs_bool(v),
                         None => true,
                     };
-                    let events = if escape {
-                        vec![Event::Text { text, line }]
+                    let (events, cols, buffer) = if escape {
+                        let buffer = text.clone();
+                        (vec![Event::Text { text, line }], vec![0], buffer)
                     } else {
-                        parse_inline_events(&text, line)?
+                        let (events, cols) = parse_inline_events(&text, line)?;
+                        (events, cols, text)
                     };
                     self.splice_stack.push(Splice {
                         events,
+                        cols,
+                        buffer,
                         event_pos: 0,
                         char_pos: 0,
                         line_r_after,
@@ -938,20 +1107,41 @@ impl KagParserState {
             if special == Some(Special::Jump) {
                 let storage = self.attr(&resolved, "storage");
                 let target = self.attr(&resolved, "target");
-                self.go_to_storage_and_label(storage, target, env)?;
+                // `onJump` may veto the jump (`KAGParser.cpp:1897-1914`).
+                let process = match env.fire_jump.as_deref_mut() {
+                    Some(fire) => fire("jump", &resolved),
+                    None => true,
+                };
+                if process {
+                    self.go_to_storage_and_label(storage, target, env)?;
+                }
                 return Ok(None);
             }
             if special == Some(Special::Call) {
-                self.push_call_stack();
                 let storage = self.attr(&resolved, "storage");
                 let target = self.attr(&resolved, "target");
-                self.go_to_storage_and_label(storage, target, env)?;
+                // `onCall` may veto the call (`KAGParser.cpp:1922-1941`).
+                let process = match env.fire_call.as_deref_mut() {
+                    Some(fire) => fire("call", &resolved),
+                    None => true,
+                };
+                if process {
+                    self.push_call_stack();
+                    self.go_to_storage_and_label(storage, target, env)?;
+                }
                 return Ok(None);
             }
             if special == Some(Special::Return) {
                 let storage = self.attr(&resolved, "storage");
                 let target = self.attr(&resolved, "target");
-                self.pop_call_stack(storage, target, env)?;
+                // `onReturn` may veto the return (`KAGParser.cpp:1949-1968`).
+                let process = match env.fire_return.as_deref_mut() {
+                    Some(fire) => fire("return", &resolved),
+                    None => true,
+                };
+                if process {
+                    self.pop_call_stack(storage, target, env)?;
+                }
                 return Ok(None);
             }
             if special == Some(Special::Macro) {
@@ -1179,6 +1369,7 @@ impl KagParserState {
             offset,
             org_sig: self.current_line_str(),
             char_index: self.char_index,
+            cur_pos: self.cur_pos,
             splice: self.splice_stack.clone(),
             pending_rs: self.pending_rs,
             macro_args_base: self.macro_args_base,
@@ -1246,6 +1437,7 @@ impl KagParserState {
             }
             self.event_index = target;
             self.char_index = data.char_index;
+            self.cur_pos = data.cur_pos;
             self.splice_stack = data.splice;
             self.pending_rs = data.pending_rs;
         }
@@ -1291,6 +1483,9 @@ impl KagParserState {
         v.push(("eventIndex".into(), self.event_index.to_string()));
         v.push(("charIndex".into(), self.char_index.to_string()));
         v.push(("curLine".into(), self.cur_line.to_string()));
+        v.push(("curPos".into(), self.cur_pos.to_string()));
+        v.push(("lineBuffer".into(), self.line_buffer().to_string()));
+        v.push(("lineBufferUsing".into(), bool_str(self.line_buffer_using())));
         v.push(("pendingRs".into(), self.pending_rs.to_string()));
         v.push(("ignoreCR".into(), bool_str(self.ignore_cr)));
         v.push((
@@ -1350,6 +1545,18 @@ impl KagParserState {
             v.push((format!("callStack.{i}.offset"), e.offset.to_string()));
             v.push((format!("callStack.{i}.orgSig"), e.org_sig.clone()));
             v.push((format!("callStack.{i}.charIndex"), e.char_index.to_string()));
+            v.push((format!("callStack.{i}.curPos"), e.cur_pos.to_string()));
+            v.push((
+                format!("callStack.{i}.lineBuffer"),
+                e.splice
+                    .last()
+                    .map(|s| s.buffer.clone())
+                    .unwrap_or_default(),
+            ));
+            v.push((
+                format!("callStack.{i}.lineBufferUsing"),
+                bool_str(!e.splice.is_empty()),
+            ));
             v.push((format!("callStack.{i}.pendingRs"), e.pending_rs.to_string()));
             v.push((
                 format!("callStack.{i}.macroArgStackBase"),
@@ -1442,6 +1649,23 @@ impl KagParserState {
         }
         if let Some(l) = get_int("curLine") {
             self.cur_line = l as usize;
+        }
+        if let Some(p) = get_int("curPos") {
+            self.cur_pos = p as usize;
+        }
+        if get_bool("lineBufferUsing")
+            && let Some(buffer) = get("lineBuffer")
+            && !buffer.is_empty()
+        {
+            let (events, cols) = parse_macro_content(buffer)?;
+            self.splice_stack.push(Splice {
+                events,
+                cols,
+                buffer: buffer.to_string(),
+                event_pos: 0,
+                char_pos: 0,
+                line_r_after: false,
+            });
         }
         if let Some(p) = get_int("pendingRs") {
             self.pending_rs = p as usize;
@@ -1539,6 +1763,7 @@ impl KagParserState {
                     offset: get_int(&format!("{p}offset")).unwrap_or(0) as usize,
                     org_sig: get(&format!("{p}orgSig")).unwrap_or("").to_string(),
                     char_index: get_int(&format!("{p}charIndex")).unwrap_or(0) as usize,
+                    cur_pos: get_int(&format!("{p}curPos")).unwrap_or(0) as usize,
                     pending_rs: get_int(&format!("{p}pendingRs")).unwrap_or(0) as usize,
                     macro_args_base: get_int(&format!("{p}macroArgStackBase")).unwrap_or(0)
                         as usize,
@@ -1561,6 +1786,21 @@ impl KagParserState {
                     {
                         e.splice.push(s);
                     }
+                }
+                if e.splice.is_empty()
+                    && get_bool(&format!("{p}lineBufferUsing"))
+                    && let Some(buffer) = get(&format!("{p}lineBuffer"))
+                    && !buffer.is_empty()
+                {
+                    let (events, cols) = parse_macro_content(buffer)?;
+                    e.splice.push(Splice {
+                        events,
+                        cols,
+                        buffer: buffer.to_string(),
+                        event_pos: 0,
+                        char_pos: 0,
+                        line_r_after: false,
+                    });
                 }
                 self.call_stack.push(e);
             }
@@ -1591,14 +1831,33 @@ impl KagParserState {
     }
 
     pub fn cur_pos(&self) -> usize {
-        self.current_char_pos()
+        self.cur_pos
     }
 
     pub fn cur_line_str(&self) -> &str {
+        // While an expansion is active the reference points `CurLineStr`
+        // at `LineBuffer` (`LineBufferUsing`); otherwise it is the current
+        // source line.
+        if let Some(top) = self.splice_stack.last() {
+            return &top.buffer;
+        }
         self.raw_lines
-            .get(self.cur_line.saturating_sub(1))
+            .get(self.cur_line)
             .map(String::as_str)
             .unwrap_or_default()
+    }
+
+    /// The current expansion buffer (`LineBuffer`), or `""`.
+    pub fn line_buffer(&self) -> &str {
+        self.splice_stack
+            .last()
+            .map(|s| s.buffer.as_str())
+            .unwrap_or("")
+    }
+
+    /// Whether an expansion buffer is active (`LineBufferUsing`).
+    pub fn line_buffer_using(&self) -> bool {
+        !self.splice_stack.is_empty()
     }
 
     pub fn storage_name(&self) -> &str {
@@ -1633,6 +1892,21 @@ impl KagParserState {
         self.macro_args.len()
     }
 
+    /// The KAGParserEx `paramMacros` dictionary content: macro name → ordered
+    /// `(parameter, value)` list (`readme.txt:51-60`).
+    pub fn param_macros_entries(&self) -> Vec<(String, Vec<(String, String)>)> {
+        self.param_macros
+            .iter()
+            .map(|(name, list)| (name.clone(), list.clone()))
+            .collect()
+    }
+
+    /// Replace the whole `paramMacros` dictionary (the native property
+    /// setter).
+    pub fn set_param_macros(&mut self, entries: Vec<(String, Vec<(String, String)>)>) {
+        self.param_macros = entries.into_iter().collect();
+    }
+
     /// Every macro-argument level as ordered `(name, value)` lists (the
     /// reference `MacroArgs` vector of dictionaries).
     pub fn macro_args_entries(&self) -> &[Vec<(String, String)>] {
@@ -1650,8 +1924,15 @@ impl KagParserState {
                 offset: entry.offset,
                 // `tCallStackData::OrgLineStr` ↔ our original line string.
                 org_line_str: entry.org_sig.clone(),
-                // `tCallStackData::Pos` ↔ our position within that line.
-                pos: entry.char_index,
+                // `tCallStackData::Pos` ↔ the scan column at the call
+                // site.
+                pos: entry.cur_pos,
+                line_buffer: entry
+                    .splice
+                    .last()
+                    .map(|s| s.buffer.clone())
+                    .unwrap_or_default(),
+                line_buffer_using: !entry.splice.is_empty(),
                 macro_arg_stack_base: entry.macro_args_base,
                 macro_arg_stack_depth: entry.macro_args_depth,
                 exclude_level: entry.exclude_level,
@@ -1677,6 +1958,13 @@ impl KagParserState {
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect()
+    }
+
+    /// Replace the macro table from the live `macros` dictionary (the
+    /// reference keeps one dictionary that scripts and `@macro`/`@erasemacro`
+    /// share, `KAGParser.cpp:2471-2481`).
+    pub fn set_macros(&mut self, entries: Vec<(String, String)>) {
+        self.macros = entries.into_iter().collect();
     }
 
     /// The top macro-args dictionary (`macroParams`/`mp`) as ordered
@@ -1771,10 +2059,11 @@ fn quote_value(v: &str) -> String {
 }
 
 /// Parse macro content back into events (the reference re-parses the
-/// spliced buffer; we pre-parse once).
-fn parse_macro_content(content: &str) -> Result<Vec<Event>, String> {
+/// spliced buffer; we pre-parse once). Returns the events and their scan
+/// columns.
+fn parse_macro_content(content: &str) -> Result<(Vec<Event>, Vec<usize>), String> {
     super::parser::parse(content)
-        .map(|s| s.events)
+        .map(|s| (s.events, s.cols))
         .map_err(|e| format!("{MSG_SYNTAX} ({e})"))
 }
 
@@ -1807,17 +2096,18 @@ fn parse_tjs_bool(v: &str) -> bool {
 /// reference splices the raw text into the current line buffer, where
 /// `LineBufferUsing` keeps a leading `@` from starting a line command and
 /// `[` starts a real tag. We reproduce the `@` rule by parsing with a
-/// sentinel prefix and stripping it from the first text event.
-fn parse_inline_events(text: &str, line: usize) -> Result<Vec<Event>, String> {
+/// sentinel prefix and stripping it from the first text event. Returns the
+/// events and their scan columns (relative to the buffer).
+fn parse_inline_events(text: &str, line: usize) -> Result<(Vec<Event>, Vec<usize>), String> {
     if text.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
     let mut src = String::with_capacity(text.len() + 1);
     src.push('\u{0}');
     src.push_str(text);
-    let mut events = super::parser::parse(&src)
-        .map(|s| s.events)
-        .map_err(|e| format!("{MSG_SYNTAX} ({e})"))?;
+    let scenario = super::parser::parse(&src).map_err(|e| format!("{MSG_SYNTAX} ({e})"))?;
+    let mut events = scenario.events;
+    let cols = scenario.cols;
     if let Some(Event::Text { text: first, .. }) = events.first_mut()
         && let Some(rest) = first.strip_prefix('\u{0}')
     {
@@ -1829,11 +2119,22 @@ fn parse_inline_events(text: &str, line: usize) -> Result<Vec<Event>, String> {
             | Event::Text { line: l, .. }
             | Event::Tag { line: l, .. }
             | Event::Directive { line: l, .. }
-            | Event::Comment { line: l, .. } => *l = line,
+            | Event::Comment { line: l, .. }
+            | Event::Script { line: l, .. } => *l = line,
         }
     }
-    events.retain(|e| !matches!(e, Event::Text { text, .. } if text.is_empty()));
-    Ok(events)
+    // The sentinel occupies column 0, so shift every recorded column back
+    // so the buffer's scan columns match `LineBuffer`.
+    let mut kept_events = Vec::with_capacity(events.len());
+    let mut kept_cols = Vec::with_capacity(cols.len());
+    for (event, col) in events.into_iter().zip(cols) {
+        if matches!(&event, Event::Text { text, .. } if text.is_empty()) {
+            continue;
+        }
+        kept_events.push(event);
+        kept_cols.push(col.saturating_sub(1));
+    }
+    Ok((kept_events, kept_cols))
 }
 
 fn bool_str(b: bool) -> String {
@@ -1983,6 +2284,15 @@ fn encode_events(events: &[Event]) -> String {
                 out.push(':');
                 out.push_str(&escape_event_field(raw));
             }
+            Event::Script {
+                text, start_line, ..
+            } => {
+                out.push('X');
+                out.push(':');
+                out.push_str(&start_line.to_string());
+                out.push(':');
+                out.push_str(&escape_event_field(text));
+            }
         }
     }
     out
@@ -2000,8 +2310,11 @@ fn decode_splice(s: &str) -> Option<Splice> {
     let char_pos: usize = nums.next()?.parse().ok()?;
     let line_r_after = nums.next()? == "1";
     let events = decode_events(content);
+    let cols = vec![0; events.len()];
     Some(Splice {
         events,
+        cols,
+        buffer: String::new(),
         event_pos,
         char_pos,
         line_r_after,
@@ -2039,6 +2352,22 @@ fn decode_events(s: &str) -> Vec<Event> {
                 raw: field,
                 line: 0,
             }),
+            'X' => {
+                let start_line: usize = field.parse().unwrap_or(0);
+                let text = if i < chars.len() && chars[i] == ':' {
+                    i += 1;
+                    let (t, n) = read_field(&chars, i);
+                    i = n;
+                    t
+                } else {
+                    String::new()
+                };
+                events.push(Event::Script {
+                    text,
+                    start_line,
+                    line: 0,
+                });
+            }
             'L' => {
                 let macro_name = if i < chars.len() && chars[i] == ':' {
                     i += 1;

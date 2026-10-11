@@ -59,8 +59,9 @@
 //!   parser: one [`Event::Text`] per contiguous text run, one
 //!   [`Event::Tag`] per tag, and empty lines produce no event (the
 //!   reference emits an `r eol=true` tag).
-//! * `[iscript]`/`@iscript` … `[endscript]`/`@endscript` blocks are parsed
-//!   as ordinary tags (the reference consumes them and fires `onScript`).
+//! * `[iscript]`/`@iscript` … `[endscript]`/`@endscript` blocks are
+//!   collected into a single [`Event::Script`] (the walk fires the owner's
+//!   `onScript` as it passes it).
 //! * The trailing-`\` and trailing-`[p]` line-continuation rules only affect
 //!   `r`-tag emission in the reference; since this module has no `r` events,
 //!   a trailing `\` is kept in the text.
@@ -69,13 +70,12 @@
 //!   evaluation, macro expansion or control flow happens here.
 //! * Label names keep their leading `*` (the reference's label cache is
 //!   keyed by `*name`, and `GoToLabel`/`CallLabel` receive `*`-prefixed
-//!   names).
+//!   names). Duplicate labels are suffixed `:2`, `:3`, …, and an empty
+//!   label aliases the previous one, exactly like the reference label
+//!   cache (`reference/cpp/core/base/KAGParser.cpp:193-238`).
 //! * The KAGParserEx *multi-line tag* extension is available opt-in through
 //!   [`ParseOptions::multiline_tags`]; [`parse`] leaves it off, matching the
 //!   base parser.
-//! * Duplicate labels: the reference suffixes duplicates (`name:2`, …) for
-//!   jump disambiguation; this module records the first occurrence in
-//!   [`Scenario::labels`].
 //! * Line numbers in events are 1-based (the reference's `curLine` is
 //!   0-based).
 
@@ -144,6 +144,20 @@ pub enum Event {
         /// 1-based source line.
         line: usize,
     },
+    /// An `[iscript]`/`@iscript` … `[endscript]`/`@endscript` block, with
+    /// its raw lines joined by `\r\n`. This is the reference
+    /// `SkipCommentOrLabel` inline-script collection
+    /// (`reference/cpp/core/base/KAGParser.cpp:1130-1176`); the owner's
+    /// `onScript(script, storageShortName, scriptStart)` fires as the walk
+    /// passes it.
+    Script {
+        /// The block's source lines, joined with `\r\n`.
+        text: String,
+        /// 0-based index of the first source line inside the block.
+        start_line: usize,
+        /// 1-based source line of the opening `[iscript]`/`@iscript`.
+        line: usize,
+    },
 }
 
 /// The result of [`parse`]: an ordered event list plus a label index.
@@ -154,6 +168,12 @@ pub struct Scenario {
     /// Label name (`*start`) → index into [`Scenario::events`] of the
     /// first occurrence.
     pub labels: BTreeMap<String, usize>,
+    /// Per-event scan column, aligned with [`Scenario::events`]. For a
+    /// [`Event::Text`] it is the 0-based column where the run starts; for a
+    /// [`Event::Tag`] it is the column just past the tag's closing `]`; the
+    /// other variants carry 0. This is the reference `CurPos` scan cursor
+    /// (`reference/cpp/core/base/KAGParser.cpp:1080-1082`).
+    pub cols: Vec<usize>,
 }
 
 /// Errors produced by [`parse`].
@@ -162,6 +182,14 @@ pub enum Error {
     /// The scenario contains no lines at all (reference `TVPKAGNoLine`).
     #[error("scenario is empty")]
     EmptyScenario,
+    /// An empty label (`*`) appears before any named label (reference
+    /// `TVPKAGCannotOmmitFirstLabelName`).
+    #[error("can not omit the first label name")]
+    CannotOmitFirstLabelName,
+    /// An `[iscript]` block has no matching `[endscript]` (reference
+    /// `TVPKAGInlineScriptNotEnd`).
+    #[error("inline script has no endscript")]
+    InlineScriptNotEnd,
     /// A line could not be parsed (reference `TVPKAGSyntaxError`).
     #[error("syntax error at line {line}: {message}")]
     Syntax { line: usize, message: &'static str },
@@ -227,28 +255,85 @@ pub fn parse_with_options(source: &str, options: ParseOptions) -> Result<Scenari
     };
     let mut events = Vec::new();
     let mut labels = BTreeMap::new();
-    for (lineno, content) in &lines {
+    let mut cols = Vec::new();
+    let mut label_counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut prev_label: Option<String> = None;
+    let mut index = 0;
+    while index < lines.len() {
+        let (lineno, content) = &lines[index];
         let lineno = *lineno;
         if content.is_empty() {
             // Empty line: the reference emits an "r" tag here; we emit
             // nothing.
+            index += 1;
+            continue;
+        }
+        // An inline script block is collected verbatim (its lines may
+        // contain `[`/`]` as TJS), exactly like the reference
+        // `SkipCommentOrLabel` (`reference/cpp/core/base/KAGParser.cpp:1130-1176`).
+        if is_iscript_start(content) {
+            let mut text = String::new();
+            let mut end = index + 1;
+            let mut found = false;
+            while end < lines.len() {
+                if is_iscript_end(&lines[end].1) {
+                    found = true;
+                    break;
+                }
+                text.push_str(&lines[end].1);
+                text.push_str("\r\n");
+                end += 1;
+            }
+            if !found {
+                return Err(Error::InlineScriptNotEnd);
+            }
+            // `script_start` is the 0-based line of the first script line
+            // (`CurLine` after the reference's `CurLine++`).
+            events.push(Event::Script {
+                text,
+                start_line: lineno,
+                line: lineno,
+            });
+            cols.push(0);
+            index = end + 1;
             continue;
         }
         match content.chars().next() {
-            Some(';') => events.push(Event::Comment {
-                text: content[1..].to_owned(),
-                line: lineno,
-            }),
+            Some(';') => {
+                events.push(Event::Comment {
+                    text: content[1..].to_owned(),
+                    line: lineno,
+                });
+                cols.push(0);
+            }
             Some('*') => {
-                let (name, macro_name) = split_label(content);
-                // First occurrence wins, mirroring the reference label
-                // cache (which suffixes duplicates instead of overwriting).
-                labels.entry(name.clone()).or_insert(events.len());
+                let (mut name, macro_name) = split_label(content);
+                if name == "*" {
+                    // An empty label aliases the previous one; without a
+                    // previous label it is an error
+                    // (`KAGParser.cpp:209-219`).
+                    let Some(previous) = prev_label.clone() else {
+                        return Err(Error::CannotOmitFirstLabelName);
+                    };
+                    name = previous;
+                }
+                prev_label = Some(name.clone());
+                // Duplicate labels suffix `:2`, `:3`, ... and the first
+                // occurrence keeps the bare name (`KAGParser.cpp:193-238`).
+                let count = label_counts.entry(name.clone()).or_insert(0);
+                *count += 1;
+                let alias = if *count > 1 {
+                    format!("{name}:{count}")
+                } else {
+                    name
+                };
+                labels.insert(alias.clone(), events.len());
                 events.push(Event::Label {
-                    name,
+                    name: alias,
                     macro_name,
                     line: lineno,
                 });
+                cols.push(0);
             }
             Some('%') => {
                 let (name, args) = parse_directive(content);
@@ -258,11 +343,29 @@ pub fn parse_with_options(source: &str, options: ParseOptions) -> Result<Scenari
                     args,
                     line: lineno,
                 });
+                cols.push(0);
             }
-            _ => parse_line(content, lineno, &mut events)?,
+            _ => parse_line(content, lineno, &mut events, &mut cols)?,
         }
+        index += 1;
     }
-    Ok(Scenario { events, labels })
+    Ok(Scenario {
+        events,
+        labels,
+        cols,
+    })
+}
+
+/// Whether a line opens an inline TJS script block (reference
+/// `SkipCommentOrLabel`, `KAGParser.cpp:1130-1134`).
+fn is_iscript_start(content: &str) -> bool {
+    matches!(content, "[iscript]" | "[iscript]\\" | "@iscript")
+}
+
+/// Whether a line closes an inline TJS script block (reference
+/// `SkipCommentOrLabel`, `KAGParser.cpp:1140-1145`).
+fn is_iscript_end(content: &str) -> bool {
+    matches!(content, "[endscript]" | "[endscript]\\" | "@endscript")
 }
 
 /// Split the source into lines on `\r`, `\n` and `\r\n` (reference
@@ -364,7 +467,12 @@ fn parse_directive(line: &str) -> (String, Vec<String>) {
 /// Parse the content of a non-comment, non-label, non-directive line:
 /// either a single `@tag` line command, or a mix of text runs and inline
 /// `[tag]`s.
-fn parse_line(line: &str, lineno: usize, events: &mut Vec<Event>) -> Result<()> {
+fn parse_line(
+    line: &str,
+    lineno: usize,
+    events: &mut Vec<Event>,
+    cols: &mut Vec<usize>,
+) -> Result<()> {
     let chars: Vec<char> = line.chars().collect();
     if chars.first() == Some(&'@') {
         // Line-command mode: `@tag ...` spans the whole line. `@` is only
@@ -378,21 +486,26 @@ fn parse_line(line: &str, lineno: usize, events: &mut Vec<Event>) -> Result<()> 
             bracket: Bracket::At,
             line: lineno,
         });
+        cols.push(tag.end);
         return Ok(());
     }
 
     let mut pos = 0;
     let mut text = String::new();
+    let mut text_col = 0;
     while pos < chars.len() {
         match chars[pos] {
             '[' if pos + 1 < chars.len() && chars[pos + 1] == '[' => {
                 // `[[` escapes a literal `[` (reference normal-character
                 // branch).
+                if text.is_empty() {
+                    text_col = pos;
+                }
                 text.push('[');
                 pos += 2;
             }
             '[' => {
-                flush_text(&mut text, lineno, events);
+                flush_text(&mut text, text_col, lineno, events, cols);
                 let tag = parse_tag(&chars, pos + 1, Bracket::Square, lineno)?;
                 events.push(Event::Tag {
                     name: tag.name,
@@ -401,6 +514,7 @@ fn parse_line(line: &str, lineno: usize, events: &mut Vec<Event>) -> Result<()> 
                     bracket: Bracket::Square,
                     line: lineno,
                 });
+                cols.push(tag.end);
                 pos = tag.end;
             }
             '\t' => {
@@ -408,22 +522,33 @@ fn parse_line(line: &str, lineno: usize, events: &mut Vec<Event>) -> Result<()> 
                 pos += 1;
             }
             c => {
+                if text.is_empty() {
+                    text_col = pos;
+                }
                 text.push(c);
                 pos += 1;
             }
         }
     }
-    flush_text(&mut text, lineno, events);
+    flush_text(&mut text, text_col, lineno, events, cols);
     Ok(())
 }
 
-/// Push a pending text run as an [`Event::Text`] (if non-empty).
-fn flush_text(text: &mut String, lineno: usize, events: &mut Vec<Event>) {
+/// Push a pending text run as an [`Event::Text`] (if non-empty), recording
+/// its starting column in `cols`.
+fn flush_text(
+    text: &mut String,
+    col: usize,
+    lineno: usize,
+    events: &mut Vec<Event>,
+    cols: &mut Vec<usize>,
+) {
     if !text.is_empty() {
         events.push(Event::Text {
             text: std::mem::take(text),
             line: lineno,
         });
+        cols.push(col);
     }
 }
 

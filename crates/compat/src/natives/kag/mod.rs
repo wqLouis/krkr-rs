@@ -17,7 +17,7 @@
 //! dictionary is created with `%[]` and populated through
 //! `Tjs2Engine::set_member`, so no scenario text is evaluated as TJS — only
 //! the `taglist` array literal is built from escaped attribute names.
-//! `macros` and `macroParams` likewise return real
+//! `macros`, `macroParams` and `paramMacros` likewise return real
 //! Dictionaries.
 //!
 //! # No process globals
@@ -48,7 +48,10 @@ use crate::binding;
 use crate::native_util::{args, report_error, set_int, set_void};
 use crate::natives::system::{try_value_as_i64, value_as_bool};
 use crate::{CompatCtx, CompatError, CompatServices};
-use state::{Environ, EvalResult, KagParserState, LabelCallback};
+use state::{
+    Environ, EvalResult, KagParserState, LabelCallback, ScenarioLoadCallback,
+    ScenarioLoadedCallback, ScriptCallback, TagCallback,
+};
 
 // ---------------------------------------------------------------------------
 // per-VM scratch buffers
@@ -102,6 +105,14 @@ type EvalFn = Box<dyn FnMut(&str) -> Result<EvalResult, String>>;
 type LoadFn = Box<dyn FnMut(&str) -> Result<String, String>>;
 /// A boxed owner `onLabel(label, page)` callback.
 type LabelClosure = Box<dyn FnMut(&str, Option<&str>)>;
+/// A boxed owner `onScript(script, storageShortName, scriptStart)` callback.
+type ScriptClosure = Box<dyn FnMut(&str, &str, usize)>;
+/// A boxed owner `onJump`/`onCall`/`onReturn` veto callback.
+type TagClosure = Box<dyn FnMut(&str, &[(String, String)]) -> bool>;
+/// A boxed owner `onScenarioLoad(name)` callback.
+type ScenarioLoadClosure = Box<dyn FnMut(&str) -> Option<String>>;
+/// A boxed owner `onScenarioLoaded(name)` callback.
+type ScenarioLoadedClosure = Box<dyn FnMut(&str)>;
 
 /// Reborrow a boxed label closure as a `dyn FnMut` with the borrow's own
 /// object lifetime (`Environ<'a>` is invariant over `'a`).
@@ -109,18 +120,57 @@ fn shorten_label_closure<'a>(c: &'a mut LabelClosure) -> LabelCallback<'a> {
     &mut **c
 }
 
+/// Reborrow a boxed `onScript` closure (see [`shorten_label_closure`]).
+fn shorten_script_closure<'a>(c: &'a mut ScriptClosure) -> ScriptCallback<'a> {
+    &mut **c
+}
+
+/// Reborrow a boxed tag veto closure (see [`shorten_label_closure`]).
+fn shorten_tag_closure<'a>(c: &'a mut TagClosure) -> TagCallback<'a> {
+    &mut **c
+}
+
+/// Reborrow a boxed `onScenarioLoad` closure (see [`shorten_label_closure`]).
+fn shorten_scenario_load_closure<'a>(c: &'a mut ScenarioLoadClosure) -> ScenarioLoadCallback<'a> {
+    &mut **c
+}
+
+/// Reborrow a boxed `onScenarioLoaded` closure (see [`shorten_label_closure`]).
+fn shorten_scenario_loaded_closure<'a>(
+    c: &'a mut ScenarioLoadedClosure,
+) -> ScenarioLoadedCallback<'a> {
+    &mut **c
+}
+
 /// The injectable environment [`KagParserState`] walks in: TJS expression
 /// evaluation through the bound VM, scenario loading through the attached
-/// [`engine::Storage`], and the optional owner `onLabel` callback.
+/// [`engine::Storage`], and the optional owner event callbacks.
 struct KagEnv {
     eval: EvalFn,
     load: LoadFn,
     label: Option<LabelClosure>,
+    script: Option<ScriptClosure>,
+    jump: Option<TagClosure>,
+    call: Option<TagClosure>,
+    return_: Option<TagClosure>,
+    scenario_load: Option<ScenarioLoadClosure>,
+    scenario_loaded: Option<ScenarioLoadedClosure>,
 }
 
 /// A TJS closure that yields an object's string form (`'' + v`, the VM's
 /// `TJSObjectToString` path).
 const OBJECT_TO_STRING_SRC: &str = "(function(v){ return '' + v; })";
+
+/// A TJS closure returning the `count` of a dictionary member (a
+/// `[name, value, ...]` array). The member is read and counted in TJS so the
+/// array's own receiver is used; an array cannot cross the ABI as a Rust
+/// value without its `count` lookup resolving against the wrong receiver.
+const PARAM_MACRO_COUNT_SRC: &str = "(function(d,k){ var a=d[k]; return a.count; })";
+
+/// A TJS closure returning one element of a dictionary member array. Like
+/// [`PARAM_MACRO_COUNT_SRC`] the array is indexed in TJS, so only a scalar
+/// crosses the ABI.
+const PARAM_MACRO_ELEMENT_SRC: &str = "(function(d,k,i){ var a=d[k]; return a[i]; })";
 
 /// The string form of an already-evaluated TJS object. The object is passed
 /// to a helper closure as a retained argument, so the expression that produced
@@ -196,16 +246,142 @@ impl KagEnv {
                 let _ = engine.call_member(id.raw_id(), "onLabel", &arguments);
             }))
         };
-        Self { eval, load, label }
+        let script: Option<ScriptClosure> = if owner.is_null() {
+            None
+        } else {
+            Some(Box::new(
+                move |script: &str, storage: &str, start: usize| {
+                    let Ok(id) = engine.retain_object_detached(owner) else {
+                        return;
+                    };
+                    let arguments = [
+                        TjsValue::String(script.to_string()),
+                        TjsValue::String(storage.to_string()),
+                        TjsValue::Integer(start as i64),
+                    ];
+                    // A missing `onScript` or a handler error is ignored
+                    // (`KAGParser.cpp:1163-1170`).
+                    let _ = engine.call_member(id.raw_id(), "onScript", &arguments);
+                },
+            ))
+        };
+        let jump = owner_tag_closure(engine, owner, "onJump");
+        let call = owner_tag_closure(engine, owner, "onCall");
+        let return_ = owner_tag_closure(engine, owner, "onReturn");
+        let scenario_load: Option<ScenarioLoadClosure> = if owner.is_null() {
+            None
+        } else {
+            Some(Box::new(move |name: &str| -> Option<String> {
+                let Ok(id) = engine.retain_object_detached(owner) else {
+                    return None;
+                };
+                // `onScenarioLoad` overrides the scenario only when it
+                // returns a string (`KAGParser.cpp:925-932`).
+                match engine.call_member(
+                    id.raw_id(),
+                    "onScenarioLoad",
+                    &[TjsValue::String(name.to_string())],
+                ) {
+                    Ok(TjsValue::String(text)) => Some(text),
+                    _ => None,
+                }
+            }))
+        };
+        let scenario_loaded: Option<ScenarioLoadedClosure> = if owner.is_null() {
+            None
+        } else {
+            Some(Box::new(move |name: &str| {
+                let Ok(id) = engine.retain_object_detached(owner) else {
+                    return;
+                };
+                let _ = engine.call_member(
+                    id.raw_id(),
+                    "onScenarioLoaded",
+                    &[TjsValue::String(name.to_string())],
+                );
+            }))
+        };
+        Self {
+            eval,
+            load,
+            label,
+            script,
+            jump,
+            call,
+            return_,
+            scenario_load,
+            scenario_loaded,
+        }
     }
 
     fn environ(&mut self) -> Environ<'_> {
         let fire_label = self.label.as_mut().map(shorten_label_closure);
+        let fire_script = self.script.as_mut().map(shorten_script_closure);
+        let fire_jump = self.jump.as_mut().map(shorten_tag_closure);
+        let fire_call = self.call.as_mut().map(shorten_tag_closure);
+        let fire_return = self.return_.as_mut().map(shorten_tag_closure);
+        let fire_scenario_load = self
+            .scenario_load
+            .as_mut()
+            .map(shorten_scenario_load_closure);
+        let fire_scenario_loaded = self
+            .scenario_loaded
+            .as_mut()
+            .map(shorten_scenario_loaded_closure);
         Environ {
             eval: &mut *self.eval,
             load_storage: &mut *self.load,
             fire_label,
+            fire_script,
+            fire_jump,
+            fire_call,
+            fire_return,
+            fire_scenario_load,
+            fire_scenario_loaded,
         }
+    }
+}
+
+/// Build an owner veto closure for `member` (`onJump`/`onCall`/`onReturn`).
+/// A missing handler or any error leaves the tag processed, matching the
+/// reference's `process = true` default.
+fn owner_tag_closure(
+    engine: &'static Tjs2Engine,
+    owner: *mut c_void,
+    member: &'static str,
+) -> Option<TagClosure> {
+    if owner.is_null() {
+        return None;
+    }
+    Some(Box::new(
+        move |name: &str, params: &[(String, String)]| -> bool {
+            let Ok(id) = engine.retain_object_detached(owner) else {
+                return true;
+            };
+            let Ok(dict) = build_tag_dict(engine, name, params) else {
+                return true;
+            };
+            match engine.call_member(
+                id.raw_id(),
+                member,
+                &[TjsValue::Retained(dict.raw_id() as u64)],
+            ) {
+                Ok(value) => tjs_value_truthy(&value),
+                Err(_) => true,
+            }
+        },
+    ))
+}
+
+/// TJS `operator bool` coercion for a callback result
+/// (`tjs2/tjsVariant.h:913-935`): strings use `AsInteger() != 0`.
+fn tjs_value_truthy(value: &TjsValue) -> bool {
+    match value {
+        TjsValue::Void => false,
+        TjsValue::Integer(i) => *i != 0,
+        TjsValue::Real(r) => *r != 0.0,
+        TjsValue::String(s) => s.trim().parse::<f64>().map(|n| n != 0.0).unwrap_or(false),
+        TjsValue::Object | TjsValue::Retained(_) => true,
     }
 }
 
@@ -214,6 +390,42 @@ fn make_env(engine: *mut c_void, owner: *mut c_void) -> Result<KagEnv, String> {
     let host = resolve_host(engine)?;
     let storage = resolve_storage(engine)?;
     Ok(KagEnv::new(host, storage, owner))
+}
+
+/// Synchronize the live `macros` dictionary with the parser's macro table.
+///
+/// The reference keeps one `Macros` dictionary that scripts and
+/// `@macro`/`@erasemacro` both mutate and the walk reads
+/// (`KAGParser.cpp:2471-2481`). Our walk state owns the table, so:
+/// * when the state changed since the last publish, rebuild the cached
+///   dictionary from it;
+/// * otherwise read the cached dictionary back, picking up script
+///   mutations.
+fn sync_macros(host: &Tjs2Engine, instance: &mut KagParserInstance) -> Result<(), String> {
+    let Some(dict_id) = instance.macros_dict.as_ref().map(DetachedValue::raw_id) else {
+        return Ok(());
+    };
+    let state_entries = instance.state.macros_entries();
+    if state_entries != instance.macros_snapshot {
+        return publish_cached_dict(
+            host,
+            &mut instance.macros_dict,
+            &mut instance.macros_snapshot,
+            &state_entries,
+        );
+    }
+    let names = host.enum_members(dict_id)?;
+    let mut entries: Vec<(String, String)> = Vec::with_capacity(names.len());
+    for name in names {
+        let body = scalar_member(host, dict_id, &name).unwrap_or_default();
+        entries.push((name, body));
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    if entries != instance.macros_snapshot {
+        instance.state.set_macros(entries.clone());
+        instance.macros_snapshot = entries;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -323,12 +535,11 @@ fn retain_dict(engine: &Tjs2Engine, entries: &[(String, String)]) -> Result<Deta
 
 /// Build a tag dictionary: `tagname`, every attribute in source order, and
 /// `taglist` (the member names in insertion order).
-fn set_tag_result(
+fn build_tag_dict(
     engine: &Tjs2Engine,
-    out: *mut Value,
     name: &str,
     params: &[(String, String)],
-) -> Result<(), String> {
+) -> Result<DetachedValue, String> {
     let dict = retained_object(engine, "%[]")?;
     engine.set_member(
         dict.raw_id(),
@@ -347,6 +558,17 @@ fn set_tag_result(
         "taglist",
         &TjsValue::Retained(taglist.raw_id() as u64),
     )?;
+    Ok(dict)
+}
+
+/// Write a tag dictionary to a native result slot.
+fn set_tag_result(
+    engine: &Tjs2Engine,
+    out: *mut Value,
+    name: &str,
+    params: &[(String, String)],
+) -> Result<(), String> {
+    let dict = build_tag_dict(engine, name, params)?;
     set_retained_object(out, dict);
     Ok(())
 }
@@ -495,7 +717,7 @@ extern "C" fn native_load_scenario(
     argv: *const Value,
     out: *mut Value,
     out_error: *mut *mut c_char,
-    _objthis: *mut c_void,
+    objthis: *mut c_void,
 ) -> c_int {
     if argc < 1 {
         return report_error(out_error, "KAGParser.loadScenario requires 1 argument");
@@ -505,7 +727,7 @@ extern "C" fn native_load_scenario(
         Ok(name) => name,
         Err(e) => return report_error(out_error, &e),
     };
-    let mut env = match make_env(engine, ptr::null_mut()) {
+    let mut env = match make_env(engine, objthis) {
         Ok(env) => env,
         Err(e) => return report_error(out_error, &e),
     };
@@ -539,8 +761,12 @@ extern "C" fn native_get_next_tag(
         Ok(env) => env,
         Err(e) => return report_error(out_error, &e),
     };
-    let state = unsafe { state_of(instance) };
-    match state.next_tag(&mut env.environ()) {
+    let instance = unsafe { instance_of(instance) };
+    // Pick up script mutations of the live `macros` table before the walk.
+    if let Err(e) = sync_macros(host, instance) {
+        return report_error(out_error, &e);
+    }
+    match instance.state.next_tag(&mut env.environ()) {
         Ok(Some((name, params))) => match set_tag_result(host, out, &name, &params) {
             Ok(()) => 0,
             Err(e) => report_error(out_error, &e),
@@ -588,7 +814,7 @@ extern "C" fn native_call_label(
     argv: *const Value,
     out: *mut Value,
     out_error: *mut *mut c_char,
-    _objthis: *mut c_void,
+    objthis: *mut c_void,
 ) -> c_int {
     if argc < 1 {
         return report_error(out_error, "KAGParser.callLabel requires 1 argument");
@@ -598,7 +824,7 @@ extern "C" fn native_call_label(
         Ok(name) => name,
         Err(e) => return report_error(out_error, &e),
     };
-    let mut env = match make_env(engine, ptr::null_mut()) {
+    let mut env = match make_env(engine, objthis) {
         Ok(env) => env,
         Err(e) => return report_error(out_error, &e),
     };
@@ -669,7 +895,9 @@ extern "C" fn native_assign(
     };
     // SAFETY: the trampoline guarantees `argc` valid `Value` entries.
     let value = &unsafe { args(argv, argc) }[0];
-    const UNSPECIFIED: &str = "KAGParser.assign: Please specify KAGParser object.";
+    // The bare reference `TVPKAGSpecifyKAGParser` text
+    // (`KAGParser.cpp:59-60`).
+    const UNSPECIFIED: &str = "Please specify KAGParser object.";
     if value.ty != VAL_OBJECT || value.object_handle().is_null() {
         return report_error(out_error, UNSPECIFIED);
     }
@@ -685,9 +913,10 @@ extern "C" fn native_assign(
     // SAFETY: the payload is the engine-owned `KagParserInstance`
     // allocated by `kagparser_create`; it stays valid while `object` holds
     // the retained id and the single-threaded VM runs. Self-assignment
-    // clones the state before overwriting, so it is safe too.
+    // reads the source state before overwriting the destination, so it is
+    // safe too.
     let source = unsafe { &*(payload.as_ptr() as *const KagParserInstance) };
-    *unsafe { state_of(instance) } = source.state.clone();
+    unsafe { state_of(instance) }.assign_from(&source.state);
     set_void(out);
     0
 }
@@ -757,6 +986,14 @@ fn build_store_dict(host: &Tjs2Engine, state: &KagParserState) -> Result<Detache
         ("curLine", TjsValue::Integer(state.cur_line() as i64)),
         ("curPos", TjsValue::Integer(state.cur_pos() as i64)),
         (
+            "lineBuffer",
+            TjsValue::String(state.line_buffer().to_string()),
+        ),
+        (
+            "lineBufferUsing",
+            TjsValue::Integer(state.line_buffer_using() as i64),
+        ),
+        (
             "ExcludeLevel",
             TjsValue::Integer(i64::from(state.exclude_level())),
         ),
@@ -811,6 +1048,11 @@ fn build_store_dict(host: &Tjs2Engine, state: &KagParserState) -> Result<Detache
             ("label", TjsValue::String(entry.label.clone())),
             ("offset", TjsValue::Integer(entry.offset as i64)),
             ("orgLineStr", TjsValue::String(entry.org_line_str.clone())),
+            ("lineBuffer", TjsValue::String(entry.line_buffer.clone())),
+            (
+                "lineBufferUsing",
+                TjsValue::Integer(entry.line_buffer_using as i64),
+            ),
             ("pos", TjsValue::Integer(entry.pos as i64)),
             (
                 "macroArgStackBase",
@@ -861,7 +1103,7 @@ extern "C" fn native_restore(
     argv: *const Value,
     out: *mut Value,
     out_error: *mut *mut c_char,
-    _objthis: *mut c_void,
+    objthis: *mut c_void,
 ) -> c_int {
     if argc < 1 {
         return report_error(out_error, "KAGParser.restore requires 1 argument");
@@ -882,7 +1124,7 @@ extern "C" fn native_restore(
         Ok(object) => object,
         Err(e) => return report_error(out_error, &e),
     };
-    let mut env = match make_env(engine, ptr::null_mut()) {
+    let mut env = match make_env(engine, objthis) {
         Ok(env) => env,
         Err(e) => return report_error(out_error, &e),
     };
@@ -920,13 +1162,15 @@ fn dict_to_entries(host: &Tjs2Engine, dict: Tjs2ValueId) -> Result<Vec<(String, 
             entries.push((dst.to_string(), value));
         }
     };
-    // Top-level scalars (`KAGParser.cpp:857-906`); `curPos` maps onto the
-    // emulator's character index, the closest member of its walk model.
+    // Top-level scalars (`KAGParser.cpp:857-906`), mapped onto the
+    // emulator's walk state.
     scalar("storageName", "storageName", &mut entries);
     scalar("storageShortName", "storageShortName", &mut entries);
     scalar("curLabel", "curLabel", &mut entries);
     scalar("curLine", "curLine", &mut entries);
-    scalar("curPos", "charIndex", &mut entries);
+    scalar("curPos", "curPos", &mut entries);
+    scalar("lineBuffer", "lineBuffer", &mut entries);
+    scalar("lineBufferUsing", "lineBufferUsing", &mut entries);
     scalar("ignoreCR", "ignoreCR", &mut entries);
     scalar("processSpecialTags", "processSpecialTags", &mut entries);
     scalar("multiLineTagEnabled", "multiLineTagEnabled", &mut entries);
@@ -980,8 +1224,8 @@ fn dict_to_entries(host: &Tjs2Engine, dict: Tjs2ValueId) -> Result<Vec<(String, 
     }
 
     // `callStack` (`KAGParser.cpp:774-855`): map the reference entry keys
-    // onto the emulator's; `lineBuffer`/`lineBufferUsing` have no counterpart
-    // and are skipped (`orgLineStr` → `orgSig`, `pos` → `charIndex`).
+    // onto the emulator's (`orgLineStr` → `orgSig`, `pos` → `curPos`,
+    // `lineBuffer`/`lineBufferUsing` → the entry's expansion buffer).
     if let Some(stack) = retain_object_member(host, dict, "callStack") {
         let count = object_count(host, stack.raw_id())?;
         entries.push(("callStackCount".to_string(), count.to_string()));
@@ -995,7 +1239,9 @@ fn dict_to_entries(host: &Tjs2Engine, dict: Tjs2ValueId) -> Result<Vec<(String, 
                 ("label", "label"),
                 ("offset", "offset"),
                 ("orgLineStr", "orgSig"),
-                ("pos", "charIndex"),
+                ("lineBuffer", "lineBuffer"),
+                ("lineBufferUsing", "lineBufferUsing"),
+                ("pos", "curPos"),
                 ("macroArgStackBase", "macroArgStackBase"),
                 ("macroArgStackDepth", "macroArgStackDepth"),
                 ("ExcludeLevel", "excludeLevel"),
@@ -1248,6 +1494,8 @@ prop_get_bool!(prop_ignore_cr_get, ignore_cr);
 prop_set_bool!(prop_ignore_cr_set, ignore_cr);
 prop_get_bool!(prop_process_special_tags_get, process_special_tags);
 prop_set_bool!(prop_process_special_tags_set, process_special_tags);
+prop_get_bool!(prop_multi_line_tag_enabled_get, multi_line_tag_enabled);
+prop_set_bool!(prop_multi_line_tag_enabled_set, multi_line_tag_enabled);
 prop_get_int_field!(prop_debug_level_get, debug_level);
 prop_get_int!(prop_cur_line_get, cur_line);
 prop_get_int!(prop_cur_pos_get, cur_pos);
@@ -1280,14 +1528,14 @@ extern "C" fn prop_cur_storage_set(
     instance: *mut c_void,
     value: *const Value,
     out_error: *mut *mut c_char,
-    _objthis: *mut c_void,
+    objthis: *mut c_void,
 ) -> c_int {
     // SAFETY: value follows the trampoline contract.
     let name = match param_to_string(unsafe { &*value }) {
         Ok(name) => name,
         Err(e) => return report_error(out_error, &e),
     };
-    let mut env = match make_env(engine, ptr::null_mut()) {
+    let mut env = match make_env(engine, objthis) {
         Ok(env) => env,
         Err(e) => return report_error(out_error, &e),
     };
@@ -1345,6 +1593,178 @@ extern "C" fn prop_macro_params_get(
         out_error,
         ptr::null_mut(),
     )
+}
+
+/// Build a `paramMacros` dictionary: macro name → the flattened
+/// `[name, value, name, value, ...]` array the KAGParserEx readme documents
+/// (`reference/cpp/plugins/KAGParser/readme.txt:51-55`).
+fn retain_param_macros_dict(
+    host: &Tjs2Engine,
+    entries: &[(String, Vec<(String, String)>)],
+) -> Result<DetachedValue, String> {
+    let dict = retained_object(host, "%[]")?;
+    for (name, list) in entries {
+        let mut flat: Vec<String> = Vec::with_capacity(list.len() * 2);
+        for (key, value) in list {
+            flat.push(key.clone());
+            flat.push(value.clone());
+        }
+        let array = retained_object(host, &array_literal(&flat))?;
+        host.set_member(
+            dict.raw_id(),
+            name,
+            &TjsValue::Retained(array.raw_id() as u64),
+        )?;
+    }
+    Ok(dict)
+}
+
+/// Read a `paramMacros` dictionary back into the state's ordered entries.
+/// Each value is the alternating `[name, value, ...]` array; a missing or
+/// non-array value is an error (no silent fallback). The count and elements
+/// are read through TJS helpers (see [`PARAM_MACRO_COUNT_SRC`] and
+/// [`PARAM_MACRO_ELEMENT_SRC`]) so no object crosses the ABI.
+fn read_param_macros_dict(
+    host: &Tjs2Engine,
+    dict: Tjs2ValueId,
+) -> Result<Vec<(String, Vec<(String, String)>)>, String> {
+    let view = host.duplicate_retained(dict)?;
+    let names = crate::natives::plugins::scripts_ex::data_member_names(host, &view)?;
+    let count_helper = retained_object(host, PARAM_MACRO_COUNT_SRC)?;
+    let element_helper = retained_object(host, PARAM_MACRO_ELEMENT_SRC)?;
+    let mut entries = Vec::with_capacity(names.len());
+    for name in names {
+        let count = match call_param_macro_helper(host, &count_helper, dict, &name, None)? {
+            TjsValue::Integer(value) => value,
+            TjsValue::Real(value) => value as i64,
+            other => {
+                return Err(format!(
+                    "KAGParser.paramMacros: {name} is not an array ({other:?})"
+                ));
+            }
+        };
+        if count < 0 {
+            return Err(format!(
+                "KAGParser.paramMacros: {name} has a negative parameter count"
+            ));
+        }
+        if count % 2 != 0 {
+            return Err(format!(
+                "KAGParser.paramMacros: {name} has an odd-length parameter list"
+            ));
+        }
+        let half = usize::try_from(count / 2)
+            .map_err(|_| format!("KAGParser.paramMacros: {name} has too many parameters"))?;
+        let mut list = Vec::with_capacity(half);
+        let mut index = 0;
+        while index < count {
+            let key = scalar_param_macro_element(host, &element_helper, dict, &name, index)?;
+            let value = scalar_param_macro_element(host, &element_helper, dict, &name, index + 1)?;
+            list.push((key, value));
+            index += 2;
+        }
+        entries.push((name, list));
+    }
+    Ok(entries)
+}
+
+/// Invoke a `paramMacros` reader helper with the dictionary and macro name
+/// (and, for an element read, the array index). The dictionary is duplicated
+/// so the call's argument conversion cannot invalidate the caller's handle
+/// for the next iteration.
+fn call_param_macro_helper(
+    host: &Tjs2Engine,
+    helper: &DetachedValue,
+    dict: Tjs2ValueId,
+    name: &str,
+    index: Option<i64>,
+) -> Result<TjsValue, String> {
+    let dict_arg = host.duplicate_retained(dict)?;
+    let mut arguments = vec![
+        TjsValue::Retained(dict_arg.raw_id() as u64),
+        TjsValue::String(name.to_string()),
+    ];
+    if let Some(index) = index {
+        arguments.push(TjsValue::Integer(index));
+    }
+    host.call_detached(helper, &arguments)
+}
+
+/// Read one element of a `paramMacros` array through the element helper and
+/// render it as the reference's `ttstr` conversion of a scalar.
+fn scalar_param_macro_element(
+    host: &Tjs2Engine,
+    helper: &DetachedValue,
+    dict: Tjs2ValueId,
+    name: &str,
+    index: i64,
+) -> Result<String, String> {
+    match call_param_macro_helper(host, helper, dict, name, Some(index))? {
+        TjsValue::String(value) => Ok(value),
+        TjsValue::Integer(value) => Ok(value.to_string()),
+        TjsValue::Real(value) => Ok(value.to_string()),
+        TjsValue::Void => Ok(String::new()),
+        other => Err(format!(
+            "KAGParser.paramMacros: {name}[{index}] is not a scalar ({other:?})"
+        )),
+    }
+}
+
+/// `paramMacros` getter (KAGParserEx). Returns the dictionary of registered
+/// parameter macros.
+extern "C" fn prop_param_macros_get(
+    engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let host = match resolve_host(engine) {
+        Ok(host) => host,
+        Err(e) => return report_error(out_error, &e),
+    };
+    let entries = unsafe { state_of(instance) }.param_macros_entries();
+    match retain_param_macros_dict(host, &entries) {
+        Ok(dict) => {
+            set_retained_object(out, dict);
+            0
+        }
+        Err(e) => report_error(out_error, &e),
+    }
+}
+
+/// `paramMacros` setter (KAGParserEx): replace the registered parameter
+/// macros from a dictionary of `[name, value, ...]` arrays.
+extern "C" fn prop_param_macros_set(
+    engine: *mut c_void,
+    instance: *mut c_void,
+    value: *const Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    let host = match resolve_host(engine) {
+        Ok(host) => host,
+        Err(e) => return report_error(out_error, &e),
+    };
+    // SAFETY: value follows the trampoline contract.
+    let value = unsafe { &*value };
+    if value.ty != VAL_OBJECT || value.object_handle().is_null() {
+        return report_error(
+            out_error,
+            "KAGParser.paramMacros: please specify a dictionary",
+        );
+    }
+    let object = match host.retain_object_arg(value) {
+        Ok(object) => object,
+        Err(e) => return report_error(out_error, &e),
+    };
+    match read_param_macros_dict(host, object.raw_id()) {
+        Ok(entries) => {
+            unsafe { state_of(instance) }.set_param_macros(entries);
+            0
+        }
+        Err(e) => report_error(out_error, &e),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1424,6 +1844,11 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
                 set: Some(prop_process_special_tags_set),
             },
             NativeInstancePropertyDef {
+                name: "multiLineTagEnabled",
+                get: Some(prop_multi_line_tag_enabled_get),
+                set: Some(prop_multi_line_tag_enabled_set),
+            },
+            NativeInstancePropertyDef {
                 name: "debugLevel",
                 get: Some(prop_debug_level_get),
                 set: Some(prop_debug_level_set),
@@ -1463,6 +1888,11 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
                 get: Some(prop_macros_get),
                 // `TJS_DENY_NATIVE_PROP_SETTER` (`KAGParser.cpp:2482`).
                 set: None,
+            },
+            NativeInstancePropertyDef {
+                name: "paramMacros",
+                get: Some(prop_param_macros_get),
+                set: Some(prop_param_macros_set),
             },
             NativeInstancePropertyDef {
                 name: "macroParams",

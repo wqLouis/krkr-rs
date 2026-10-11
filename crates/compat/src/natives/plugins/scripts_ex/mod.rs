@@ -453,6 +453,21 @@ fn enumerate_entries(
     Ok(entries)
 }
 
+/// The own **data** member names of `target`, in enumeration order.
+///
+/// A raw `EnumMembers` reports the plugin members the ABI attaches to every
+/// `Array`/`Dictionary` instance; the reference keeps methods on the class,
+/// where `EnumMembers` never reports them (`reference/cpp/plugins/scriptsEx.cpp:320-345`).
+pub(crate) fn data_member_names(
+    engine: &Tjs2Engine,
+    target: &DetachedValue,
+) -> Result<Vec<String>, String> {
+    Ok(enumerate_entries(engine, target)?
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect())
+}
+
 /// The member names of `target` as a freshly-built, sorted TJS `Array`
 /// (reference `ScriptsAdd::_getKeys`).
 ///
