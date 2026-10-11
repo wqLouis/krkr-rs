@@ -142,15 +142,21 @@ fn restore_alpha_inside_clip(dst: &mut BitmapState, before: &BitmapState, clip: 
     dst.mark_dirty();
 }
 
-/// The destination bitmap + `HoldAlpha` flag of a layer.
+/// The destination bitmap + `HoldAlpha` flag of a layer, or `None` when the
+/// layer has no main image.
 ///
-/// The main image is allocated on demand from the layer rectangle when it is
-/// absent (the reference `AllocateImage`, reached through `SetType`/
-/// `SetHasImage`); a layer whose rectangle is empty has no image and raises.
-fn dest_info(scene: &mut Scene, id: u32, method: &str) -> Result<(u32, bool), String> {
-    let bitmap = ensure_layer_bitmap(scene, id, method)?;
-    let hold_alpha = scene.layer(id).is_some_and(|layer| layer.hold_alpha);
-    Ok((bitmap, hold_alpha))
+/// An imageless layer has an **empty** clip rectangle in the reference (the
+/// constructor zeroes it, `reference/cpp/core/visual/LayerIntf.cpp:375-378`,
+/// and `ResetClip`, the only thing that widens it, raises without an image,
+/// `:4034-4039`), so a destination-rectangle operation clips the whole
+/// rectangle away and returns before reaching the image (`CopyRect`,
+/// `LayerIntf.cpp:4578-4579`; `FillRect`, `:8977-8978`). `None` therefore
+/// means "no image: the operation is a no-op", never an error.
+fn dest_info(scene: &Scene, id: u32, method: &str) -> Result<Option<(u32, bool)>, String> {
+    let layer = scene
+        .layer(id)
+        .ok_or_else(|| format!("Layer.{method}: this layer no longer exists"))?;
+    Ok(layer.bitmap.map(|bitmap| (bitmap, layer.hold_alpha)))
 }
 
 /// The layer's effective draw face — the port of the reference
@@ -347,7 +353,9 @@ extern "C" fn layer_operate_rect(
         let mode = resolve_mode(opt_i64(a, 7, OM_AUTO), src_type, "operateRect")?;
         let opa = opt_i64(a, 8, 255).clamp(0, 255) as u8;
         let scene = scene_mut(&ctx)?;
-        let (dst, hold_alpha) = dest_info(scene, id, "operateRect")?;
+        let Some((dst, hold_alpha)) = dest_info(scene, id, "operateRect")? else {
+            return Ok(());
+        };
         let face = draw_face(scene, id);
         let clip = layer_clip(scene, id);
         let src_rect = (sx, sy, sx.saturating_add(sw), sy.saturating_add(sh));
@@ -414,7 +422,9 @@ extern "C" fn layer_operate_stretch(
         let opa = opt_i64(a, 10, 255).clamp(0, 255) as u8;
         let stretch_type = opt_i64(a, 11, 0);
         let scene = scene_mut(&ctx)?;
-        let (dst, hold_alpha) = dest_info(scene, id, "operateStretch")?;
+        let Some((dst, hold_alpha)) = dest_info(scene, id, "operateStretch")? else {
+            return Ok(());
+        };
         let face = draw_face(scene, id);
         let clip = layer_clip(scene, id);
         let dst_rect = normalize_rect((dx, dy, dx.saturating_add(dw), dy.saturating_add(dh)));
@@ -505,7 +515,9 @@ fn affine_op(
         }
     };
     let scene = scene_mut(ctx)?;
-    let (dst, layer_hold_alpha) = dest_info(scene, id, method)?;
+    let Some((dst, layer_hold_alpha)) = dest_info(scene, id, method)? else {
+        return Ok(());
+    };
     // Reference face gates: `AffineCopy` requires `dfAlpha`/`dfAddAlpha`/
     // `dfOpaque` (`LayerIntf.cpp:4733-4786`), `AffinePile`/`AffineBlend`
     // require `dfAlpha`/`dfOpaque` (`LayerIntf.cpp:5427-5431`),
@@ -636,7 +648,9 @@ fn stretch_op(
     let sw = value_as_i64(&a[7]) as i32;
     let sh = value_as_i64(&a[8]) as i32;
     let scene = scene_mut(ctx)?;
-    let (dst, layer_hold_alpha) = dest_info(scene, id, method)?;
+    let Some((dst, layer_hold_alpha)) = dest_info(scene, id, method)? else {
+        return Ok(());
+    };
     let face = draw_face(scene, id);
     // Reference face gates: `StretchPile`/`StretchBlend` require
     // `dfAlpha`/`dfOpaque` *before* clipping (`LayerIntf.cpp:5264-5281`,
@@ -783,7 +797,9 @@ fn rect_op(
     let sw = value_as_i64(&a[5]) as i32;
     let sh = value_as_i64(&a[6]) as i32;
     let scene = scene_mut(ctx)?;
-    let (dst, hold_alpha) = dest_info(scene, id, method)?;
+    let Some((dst, hold_alpha)) = dest_info(scene, id, method)? else {
+        return Ok(());
+    };
     let face = draw_face(scene, id);
     let clip = layer_clip(scene, id);
     let src_rect = (sx, sy, sx.saturating_add(sw), sy.saturating_add(sh));
@@ -1034,7 +1050,9 @@ extern "C" fn layer_color_rect(
         let color = argb_to_rgba(value_as_i64(&a[4]));
         let opa = opt_i64(a, 5, 255).clamp(-255, 255) as i32;
         let scene = scene_mut(&ctx)?;
-        let (dst, _hold_alpha) = dest_info(scene, id, "colorRect")?;
+        let Some((dst, _hold_alpha)) = dest_info(scene, id, "colorRect")? else {
+            return Ok(());
+        };
         let face = draw_face(scene, id);
         let clip = layer_clip(scene, id);
         let Some(dest) =
@@ -1150,7 +1168,9 @@ extern "C" fn layer_convert_type(
     let result: Result<(), String> = (|| {
         let fromtype = value_as_i64(&a[0]) as i32;
         let scene = scene_mut(&ctx)?;
-        let (dst, _) = dest_info(scene, id, "convertType")?;
+        let Some((dst, _)) = dest_info(scene, id, "convertType")? else {
+            return Ok(());
+        };
         let face = draw_face(scene, id);
         let clip = layer_clip(scene, id);
         let bitmap = scene
@@ -1228,7 +1248,9 @@ fn flip_axis(
     };
     let result: Result<(), String> = (|| {
         let scene = scene_mut(&ctx)?;
-        let (dst, _) = dest_info(scene, id, method)?;
+        let Some((dst, _)) = dest_info(scene, id, method)? else {
+            return Ok(());
+        };
         let bitmap = scene
             .bitmap_mut(dst)
             .ok_or_else(|| format!("Layer.{method}: this layer has no main image"))?;
@@ -1303,7 +1325,9 @@ extern "C" fn layer_do_box_blur(
             return Ok(());
         }
         let scene = scene_mut(&ctx)?;
-        let (dst, _) = dest_info(scene, id, "doBoxBlur")?;
+        let Some((dst, _)) = dest_info(scene, id, "doBoxBlur")? else {
+            return Ok(());
+        };
         let face = draw_face(scene, id);
         let clip = layer_clip(scene, id);
         let bitmap = scene
@@ -1384,7 +1408,9 @@ extern "C" fn layer_adjust_gamma(
             b_ceil: opt_i64(a, 8, 255) as i32,
         };
         let scene = scene_mut(&ctx)?;
-        let (dst, _) = dest_info(scene, id, "adjustGamma")?;
+        let Some((dst, _)) = dest_info(scene, id, "adjustGamma")? else {
+            return Ok(());
+        };
         let face = draw_face(scene, id);
         let clip = layer_clip(scene, id);
         let bitmap = scene
@@ -1464,7 +1490,9 @@ extern "C" fn layer_gaussian_blur(
             // (`reference/cpp/core/visual/LayerIntf.cpp:5749-5755`).
             return Ok(());
         }
-        let (dst, _) = dest_info(scene, id, "gaussianBlur")?;
+        let Some((dst, _)) = dest_info(scene, id, "gaussianBlur")? else {
+            return Ok(());
+        };
         let clip = layer_clip(scene, id);
         let bitmap = scene
             .bitmap_mut(dst)
@@ -1506,7 +1534,9 @@ extern "C" fn layer_do_gray_scale(
     };
     let result: Result<(), String> = (|| {
         let scene = scene_mut(&ctx)?;
-        let (dst, _) = dest_info(scene, id, "doGrayScale")?;
+        let Some((dst, _)) = dest_info(scene, id, "doGrayScale")? else {
+            return Ok(());
+        };
         let clip = layer_clip(scene, id);
         let bitmap = scene
             .bitmap_mut(dst)
@@ -1562,7 +1592,9 @@ extern "C" fn layer_light(
             // (`reference/cpp/core/visual/LayerIntf.cpp:1006-1025`).
             return Ok(());
         }
-        let (dst, _) = dest_info(scene, id, "light")?;
+        let Some((dst, _)) = dest_info(scene, id, "light")? else {
+            return Ok(());
+        };
         let clip = layer_clip(scene, id);
         let bitmap = scene
             .bitmap_mut(dst)

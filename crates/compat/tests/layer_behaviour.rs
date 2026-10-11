@@ -1080,16 +1080,17 @@ fn layer_only_members_reject_a_bitmap_source() {
     }
 }
 
-/// A layer the script has only sized (`setSize`) has no main image yet. The
-/// reference creates it through `AllocateImage` once the layer is drawable
-/// (`reference/cpp/core/visual/LayerIntf.cpp:2330-2338`), and every image
-/// operation then requires it (`CopyRect`, `LayerIntf.cpp:4580-4586`); KAG
-/// sizes a thumbnail layer and immediately copies into it
-/// (`system/SystemWindow.tjs:45-51`). The port allocates the image on demand
-/// from the layer rectangle, so `setSize` + `copyRect` works instead of
-/// raising "this layer has no main image".
+/// A layer the script has only sized (`setSize`) has no main image. In the
+/// reference every destination-rectangle operation clips the rectangle
+/// against `ClipRect` **first** and returns before touching an image
+/// (`CopyRect`, `reference/cpp/core/visual/LayerIntf.cpp:4578-4579`); an
+/// imageless layer's `ClipRect` is empty (the constructor zeroes it,
+/// `:375-378`, and `ResetClip`, the only widener, raises without an image,
+/// `:4034-4039`). So `setSize` + `copyRect` is a silent no-op — exactly the
+/// KAG save-screen thumbnail path (`system/SystemWindow.tjs:45-51`) — and it
+/// neither allocates an image nor raises.
 #[test]
-fn copy_rect_allocates_a_layer_sized_but_not_yet_imaged() {
+fn copy_rect_on_an_imageless_layer_is_a_silent_no_op() {
     let _lock = vm_lock();
     let env = Env::new();
     env.run(
@@ -1098,7 +1099,7 @@ fn copy_rect_allocates_a_layer_sized_but_not_yet_imaged() {
          var dst = new Layer(w, null); dst.setSize(2, 2); \
          dst.copyRect(0, 0, src, 0, 0, 2, 2);",
     );
-    env.assert_script("dst.hasImage == 1");
+    env.assert_script("dst.hasImage == 0");
 }
 
 /// Reference: with `omAuto` (the default) `operateRect` replaces the mode
