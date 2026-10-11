@@ -45,13 +45,13 @@ target/debug/krkr --headless --frames 10000 --base-dir /mnt/DATA/Games/Others/te
    image is built as `new Bitmap("FRM_02A31")` (`configwindow.tjs:324`,
    `messageframe.tjs:1546`, `album.tjs:1936`). The constructor now matches the
    reference `Construct` (`BitmapIntf.cpp:19-43`).
-2. **`Layer.beginTransition` — game blocker** — in flight. `Sprite.tjs:290` calls
-   `super.beginTransition(name, withcildren, transsrc, options)`; the reference passes
-   `withchildren` (default **true**, `LayerIntf.cpp:9819-9821`) to `StartTransition`,
-   which requires the endpoint main images **only when `!withchildren`**
-   (`:7860-7868`), otherwise transitions the whole tree through the cache
-   (`:7869-7876`).
-3. **`Layer` has no default image** — see R1 below; dispatched next.
+2. **`Layer.beginTransition` — game blocker** — landed (`a63b9fb`). `Sprite.tjs:290`
+   calls `super.beginTransition(name, withcildren, transsrc, options)`; the reference
+   passes `withchildren` (default **true**, `LayerIntf.cpp:9819-9821`) to
+   `StartTransition`, which requires the endpoint main images **only when
+   `!withchildren`** (`:7860-7868`) and otherwise transitions the whole tree through
+   the cache (`:7869-7876`).
+3. **`Layer` has no default image** — see R1 below; the last big rendering bug.
 
 ## 3. KAG rendering audit — verified findings, not yet fixed
 
@@ -124,7 +124,8 @@ Sources: `/tmp/kag-render-audit.md`, `/tmp/kag-compat-audit.md`, `/tmp/kag-flow-
   `MainImage` (`LayerIntf.cpp:339-342,400,2381-2391,2656-2673`). Corrects `5c247bd`;
   the test `copy_rect_on_an_imageless_layer_is_a_silent_no_op` encodes the wrong
   premise.
-* [~] **R2 (P0)** `beginTransition`'s `withchildren` (`:9819-9821,7860-7876`).
+* [x] **R2 (P0)** `beginTransition`'s `withchildren` (`:9819-9821,7860-7876`) —
+  landed `a63b9fb`.
 * [ ] **R3 (P1)** `fillRect` must fill only `rect ∩ ClipRect` inside `MainImage`
   (`:4272-4320`); the port-only `layer.fill_color` must go.
 * [~] **R4 (P1)** prerendered `.tft` fonts (`:11790-11796`, `:11716-11746`).
@@ -135,22 +136,26 @@ Sources: `/tmp/kag-render-audit.md`, `/tmp/kag-compat-audit.md`, `/tmp/kag-flow-
 * [x] **R7 (P2)** `System.stayOnTop` — **verified not a reference member** (only
   `Window.stayOnTop`, `WindowIntf.cpp:1608`); the script writes a dynamic member.
   Nothing to add.
-* [~] **R8 (P2)** `Layer.hasImage` must report true on a fresh layer (`:2497`);
-  falls out of R1.
+* [ ] **R8 (P2)** `Layer.hasImage` reports false on a fresh layer where the reference
+  reports true (`:2497`); it is R1's observable face.
+* [ ] **R9 (P1, new)** the **normal projection ignores `Layer.face`**. The subtree
+  renderer now selects main/alpha/mask/province, but steady-state projection always
+  draws the main image and `RenderNode` has no face field, so a `dfProvince` or
+  `dfMask` layer is only faithful *during* a transition. Making it faithful needs
+  province/mask materialized in L2/L1.
+* [ ] **R10 (P1, new)** there is **no per-layer affine field**. `RenderNode.transform`
+  is never populated; `AffineLayer` bakes its rotation/zoom into the MainImage via
+  `onPaint → affineCopy`. Any layer transform the script sets without repainting is
+  lost.
 
 ### Text / fonts (render audit R4/R6 + the text-render diagnosis)
 
-* [~] **TEXT-1** the `drawText` shadow must be spread by `shadowwidth` (the
-  reference blurs and widens the shadow bitmap by `abs(blurwidth)` on every side,
-  `CharacterData.cpp:118-160`; a shadow exists only when `shadowlevel != 0`,
-  `LayerBitmapImpl.cpp:1168-1178`). Semantics landed `3313271` — the game draws
-  white text with a zero-offset near-black shadow, so without the spread the white
-  had no halo and disappeared on a light background. **The rasterization still
-  diverges**: the reference `TVPChBlurCopy65_c` (`tvpgl.cpp:10770-10813`) convolves
-  each character's coverage with a **cone** kernel
-  `weight = ((bw - fast_int_hypot(dx,dy) + 1) * lvsum * blurlevel) >> 8` and
-  **sums with saturation** (`TVPChBlurAddMulCopy65_c`), whereas the port stamps the
-  sharp glyph at an equal weight per offset and alpha-composites it.
+* [x] **TEXT-1** the `drawText` shadow now convolves each character's coverage with
+  the reference cone kernel (`tvpgl.cpp:10770-10813`, including
+  `fast_int_hypot` at `:10738-10763`), sums with saturation
+  (`TVPChBlurAddMulCopy65_c`), composites the mask once with `shadowcolor` at the
+  draw opacity, and scales a zero-width blur by `blurlevel/256`
+  (`CharacterData.cpp:118-160`) — landed `3313271`, made exact in `3ed61ca`.
 * [x] **TEXT-2** `Font.height` must normalize a negative value to positive
   (`LayerIntf.cpp:5962-5969`) and `Font.angle` must normalize modulo 3600
   (`:5975-5988`). Landed `3313271`.
@@ -191,24 +196,24 @@ Sources: `/tmp/kag-render-audit.md`, `/tmp/kag-compat-audit.md`, `/tmp/kag-flow-
 
 ### Plugins / Win32 (`kag-compat-audit` §A)
 
-* [~] **A.3-2** `getDisplayMonitors`/`getMonitorInfo` nested `work`/`monitor`
-  shape; the shipped `k2compat_deskinfo`/`k2compat_scrinfo` are the oracle.
-* [~] **A.3-3** alias `KAGParser.dll` → `KAGParserEx.dll`.
+* [x] **A.3-2** `getDisplayMonitors`/`getMonitorInfo` nested `work`/`monitor`
+  shape — landed `c2b785b`/`16cd7cf`. Open sub-item: the real `windowEx.dll`
+  monitor dict also carries a `name` string (MONITORINFOEX `szDevice`) that the
+  host monitor tuple cannot supply, and the shipped shim never reads it.
+* [x] **A.3-3** alias `KAGParser.dll` → `KAGParserEx.dll` — landed `c2b785b`.
 * [ ] **A.3-1** the real `WIN32Dialog` surface — deferred to the platform dialog
   layer (§4).
 * [x] **A.3-4** `windowEx`/`win32dialog` recognition — no divergence found.
 
 ### Flow / scene / save (`kag-flow-audit`)
 
-* [~] **P0-1** `beginTransition` + `withchildren` (same as R2) — landed by
-  `fix-transition`.
-* [~] **P0-1b** the subtree renderer must apply each child's transform, mask and
-  province. `layer_ops::collect_subtree_draws` copies only
-  `rect`/`image_left`/`image_top`/`clip`/`blend`/`opacity`/`bitmap`/`fill_color`, so
-  a mid-activation `Sprite`/`AffineLayer` child renders unscaled and unrotated
-  while the reference's `Complete` draws it through its own transform. Every
-  reachable ADV transition passes `withchildren = true` with a container source
-  (`advscreen.tjs:216-217,3353,3719,3735,3737,3739`, `advobject.tjs:105`).
+* [x] **P0-1** `beginTransition` + `withchildren` (same as R2) — landed `a63b9fb`.
+* [x] **P0-1b** the subtree renderer applies each child's placement
+  (`ImageLeft/Top/Width/Height`, `rect`, `ClipRect`), `face` (main/alpha/mask/
+  province), `holdAlpha` and blend (`a63b9fb`). A per-layer **affine** transform is
+  still not carried: the port bakes `AffineLayer` rotation/zoom into the MainImage
+  via `onPaint → affineCopy`, and `RenderNode.transform` is never populated, so a
+  layer mid-affine still renders from its baked bitmap (see R10).
 * [~] **P1-1** `Layer.saveLayerImage` must write the reference BMP layout. The game
   appends the save struct at `width*height*4 + 54` (`utility.tjs:2205`,
   `advscreen.tjs:7286,7437,7440`), which the reference `TVPSaveTextureAsBMP`
@@ -217,13 +222,11 @@ Sources: `/tmp/kag-render-audit.md`, `/tmp/kag-compat-audit.md`, `/tmp/kag-flow-
   108-byte V4 header (`w*h*4 + 122`), so `saveStruct(path, "zoN")` overwrites the
   thumbnail's last 68 bytes and a reference-compatible reader rejects the file
   (`GraphicsLoaderIntf.cpp:399-420`).
-* [~] **P2-3** `exchange_layers` must re-parent and reorder the two layers
-  (`LayerIntf.cpp:754-979,7969-7991`); the port swaps only `x/y/visible/z_order`
-  (`transitions.rs:790-830`), and its in-file comment claiming the re-parenting is
-  unmodelled is now stale.
-* [~] **A.3-2b** `System.getMonitorInfo(flag, window)` — the shipped shim passes
-  `(true, global.Window.mainWindow)` and reads the returned dict, not an index;
-  the port treats argument 0 as a monitor index and the app installs only index 0.
+* [x] **P2-3** `exchange_layers` re-parents and reorders the pair, for both the
+  `Exchange` (`keepchildren=false`) and `Swap` (`true`) forms (`LayerIntf.cpp:754-979,
+  7969-7991`) — landed `a63b9fb`.
+* [x] **A.3-2b** `System.getMonitorInfo(flag, window|x,y|x,y,w,h)` resolved from the
+  shipped `windowEx.dll` jump table — landed `16cd7cf`.
 * [x] **P2-2** `Storages.addAutoPath` dedupe-without-reorder — **verified not a
   divergence**: the reference does exactly the same (`StorageIntf.cpp:921-937`).
 * [ ] **P2-2b** the reference does raise `TVPMissingPathDelimiterAtLast` for a path
