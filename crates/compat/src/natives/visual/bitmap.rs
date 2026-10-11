@@ -126,7 +126,6 @@ pub(crate) fn replace_bitmap_pixels(
         bitmap.width = width;
         bitmap.height = height;
         bitmap.rgba = rgba;
-        bitmap.script_owned = true;
         bitmap.mark_dirty();
     }
 }
@@ -252,6 +251,11 @@ fn load_into_bitmap(
     let id = match id {
         Some(id) => {
             replace_bitmap_pixels(scene, id, width, height, rgba);
+            // The image is the script `Bitmap`'s, so it is released with that
+            // object; a layer's own image stays layer-owned.
+            if let Some(bitmap) = scene.bitmap_mut(id) {
+                bitmap.script_owned = true;
+            }
             id
         }
         None => {
@@ -1356,4 +1360,22 @@ pub(super) fn register_bitmap_class(ctx: &mut CompatCtx) -> Result<(), CompatErr
         ],
         properties: vec![],
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `replace_bitmap_pixels` serves both a script `Bitmap` and a layer's own
+    /// image, so it must not claim script ownership itself; the script callers
+    /// set the claim, and a layer's image is released with the layer.
+    #[test]
+    fn replace_bitmap_pixels_does_not_claim_script_ownership() {
+        let mut scene = Scene::default();
+        let id = scene.add_bitmap(1, 1, vec![0, 0, 0, 0]);
+        replace_bitmap_pixels(&mut scene, id, 2, 2, vec![1; 16]);
+        let bitmap = scene.bitmap(id).expect("the bitmap survives the replace");
+        assert!(!bitmap.script_owned, "a replaced image is not script-owned");
+        assert_eq!(bitmap.rgba.len(), 16);
+    }
 }

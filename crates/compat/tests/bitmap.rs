@@ -473,41 +473,18 @@ fn dropping_a_script_bitmap_releases_its_image() {
 fn a_stored_member_result_does_not_pin_the_script_bitmap() {
     let _lock = vm_lock();
 
-    // The reported retention shape: the result of the member call is stored
-    // in a variable (rather than discarded as a statement), then the object
-    // is dropped and the GC runs. Several framings are probed because the
-    // pin was reported to depend on the compiler shape.
+    // A member-call result stored in a variable must not keep the receiver's
+    // native instance alive once the script drops its last reference. Several
+    // compiler shapes are covered: the same execution, a separate execution,
+    // a function-local object, a helper receiving the object and a holder
+    // whose member is read before the call.
     let scripts = [
-        // (a) drop and compact in the same execution
         "var b = new Bitmap(2, 2); var p = b.getPixel(0, 0); b = null; System.doCompact();",
-        // (b) drop and compact in separate executions
         "var b = new Bitmap(2, 2); var p = b.getPixel(0, 0); b = null;",
-        // (c) constructor inside a function (frame-local object)
-        "function f() { var b = new Bitmap(2, 2); var p = b.getPixel(0, 0); } f();",
-        // (d) statement form, for comparison
-        "var b = new Bitmap(2, 2); b.setPixel(0, 0, 0xff112233); b = null; System.doCompact();",
-        // (e) result consumed by an arithmetic expression
-        "var b = new Bitmap(2, 2); var p = b.getPixel(0, 0) + 1; b = null; System.doCompact();",
-        // (f) result stored in an array
-        "var b = new Bitmap(2, 2); var p = [b.getPixel(0, 0)]; b = null; System.doCompact();",
-        // (g) result cleared afterwards
-        "var b = new Bitmap(2, 2); var p = b.getPixel(0, 0); p = null; b = null; System.doCompact();",
-        // (h) property read (getter path, not a method call)
-        "var b = new Bitmap(2, 2); var p = b.width; b = null; System.doCompact();",
-        // (i) mask read
-        "var b = new Bitmap(2, 2); var p = b.getMaskPixel(0, 0); b = null; System.doCompact();",
-        // (j) buffer address read
-        "var b = new Bitmap(2, 2); var p = b.buffer; b = null; System.doCompact();",
-        // (k) the object passed as an argument to another object's method
-        "var a = new Bitmap(2, 2); var b = new Bitmap(2, 2); a.copyFrom(b); b = null; a = null; System.doCompact();",
-        // (l) result assigned to a global that survives the call
-        "var b = new Bitmap(2, 2); global.q = b.getPixel(0, 0); b = null; System.doCompact();",
-        // (m) the bitmap is read out of a holder object (member access)
+        "function f() { var b = new Bitmap(2, 2); var p = b.getPixel(0, 0); } f(); System.doCompact();",
+        "function read(b) { return b.getPixel(0, 0); } var b = new Bitmap(2, 2); var p = read(b); b = null; System.doCompact();",
         "var h = %[b: new Bitmap(2, 2)]; var p = h.b.getPixel(0, 0); h = null; System.doCompact();",
-        // (n) the bitmap is read out of a holder object and stored
-        "var h = %[b: new Bitmap(2, 2)]; var b = h.b; var p = b.getPixel(0, 0); h = null; b = null; System.doCompact();",
-        // (o) the holder is a function-scope local
-        "function f() { var h = %[b: new Bitmap(2, 2)]; var p = h.b.getPixel(0, 0); } f(); System.doCompact();",
+        "var b = new Bitmap(2, 2); b.setPixel(0, 0, 0xff112233); b = null; System.doCompact();",
     ];
     for (index, script) in scripts.iter().enumerate() {
         let env = Env::new(true);

@@ -3105,9 +3105,9 @@ var ra = a.get(); var rb = b.get();",
         );
     }
 
-    /// Storing the *result* of a member call in a variable pins the
-    /// receiver's native instance after the script drops its last reference;
-    /// the statement form (result discarded) releases synchronously.
+    /// Storing the result of a member call in a variable must not keep the
+    /// receiver's native instance alive after the script drops its last
+    /// reference.
     #[test]
     fn stored_member_result_does_not_pin_the_native_instance() {
         let _vm_lock = vm_lock();
