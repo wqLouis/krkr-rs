@@ -273,7 +273,7 @@ impl Default for VideoOverlay {
             period_event_frame: -1,
             period_fired: false,
             visible: false,
-            bounds: VideoBounds::default(),
+            bounds: VideoBounds::new(0, 0, 320, 240),
             binding: OverlayBinding {
                 visible: false,
                 ..OverlayBinding::default()
@@ -475,12 +475,15 @@ impl VideoOverlay {
 
     /// Set the playback-rate multiplier.
     ///
+    /// A rate is only validated while a stream is open; with no stream the
+    /// setter stores the value without reaching a decoder.
+    ///
     /// # Errors
     ///
-    /// Returns [`VideoError::InvalidPlayRate`] when `rate` is not finite and
-    /// strictly positive.
+    /// Returns [`VideoError::InvalidPlayRate`] when a stream is open and
+    /// `rate` is not finite and strictly positive.
     pub fn set_play_rate(&mut self, rate: f64) -> Result<(), VideoError> {
-        if !rate.is_finite() || rate <= 0.0 {
+        if self.is_open() && (!rate.is_finite() || rate <= 0.0) {
             return Err(VideoError::InvalidPlayRate { rate });
         }
         self.play_rate = rate;
@@ -503,26 +506,30 @@ impl VideoOverlay {
 
     // -- loop / segment loop ----------------------------------------------
 
-    /// The configured segment loop as `(start, end)` frames, when set.
+    /// The configured segment loop as `(start, end)` frames, when set. The
+    /// stored bounds are returned verbatim.
     pub fn segment_loop(&self) -> Option<(i64, i64)> {
         if self.segment_start >= 0 || self.segment_end >= 0 {
-            Some((self.segment_start.max(0), self.segment_end))
+            Some((self.segment_start, self.segment_end))
         } else {
             None
         }
     }
 
     /// Configure a segment loop (`setSegmentLoop`). The loop is only honoured
-    /// while [`Self::looping`] is also enabled, matching the reference.
+    /// while [`Self::looping`] is also enabled, matching the reference. With no
+    /// stream open the bounds are stored without validation.
     ///
     /// # Errors
     ///
-    /// Returns [`VideoError::InvalidSegment`] when `start < 0`, `end < start`,
-    /// or (once a stream is open) `end >= total_frames`.
+    /// Returns [`VideoError::InvalidSegment`] when a stream is open and
+    /// `start < 0`, `end < start`, or `end >= total_frames`.
     pub fn set_segment_loop(&mut self, start: i64, end: i64) -> Result<(), VideoError> {
-        let total = self.total_frames();
-        if start < 0 || end < start || (total > 0 && end >= total) {
-            return Err(VideoError::InvalidSegment { start, end, total });
+        if self.is_open() {
+            let total = self.total_frames();
+            if start < 0 || end < start || (total > 0 && end >= total) {
+                return Err(VideoError::InvalidSegment { start, end, total });
+            }
         }
         self.segment_start = start;
         self.segment_end = end;

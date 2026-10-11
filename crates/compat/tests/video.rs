@@ -251,9 +251,16 @@ fn playback_commands_translate_to_l2() {
     assert_eq!(env.eval_int("p4"), 0);
 }
 
-/// Playback commands on a closed overlay are typed errors.
+/// Playback commands on a closed overlay are inert, not errors, and the
+/// status stays `unload`.
+///
+/// Reference: `tTJSNI_VideoOverlay::Stop`/`Play`/`Pause`/`Prepare` guard the
+/// backend call with `if(VideoOverlay)`, so a closed overlay fires no
+/// `onStatusChanged` and leaves `Status` at `ssUnload`
+/// (`reference/cpp/core/visual/impl/VideoOvlImpl.cpp:308-355`). This is the
+/// `EnvEffect.tjs:804` call that must not fail.
 #[test]
-fn playback_on_a_closed_overlay_raises() {
+fn playback_on_a_closed_overlay_is_inert() {
     let _lock = vm_lock();
     let env = Env::new();
     env.run(
@@ -261,9 +268,26 @@ fn playback_on_a_closed_overlay_raises() {
          try { v.play(); } catch (e) { caught++; } \
          try { v.pause(); } catch (e) { caught++; } \
          try { v.stop(); } catch (e) { caught++; } \
-         try { v.prepare(); } catch (e) { caught++; }",
+         try { v.prepare(); } catch (e) { caught++; } \
+         var p = v.position;",
     );
-    assert_eq!(env.eval_int("caught"), 4);
+    assert_eq!(env.eval_int("caught"), 0);
+    assert_eq!(env.eval_int("p"), 0);
+}
+
+/// A fresh overlay has the reference's default 320x240 rectangle.
+///
+/// Reference: the constructor sets `Rect.right = 320` and
+/// `Rect.bottom = 240` (`reference/cpp/core/visual/impl/VideoOvlImpl.cpp:88-91`).
+#[test]
+fn fresh_overlay_has_the_default_rectangle() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run("var v = new VideoOverlay(null);");
+    assert_eq!(env.eval_int("v.left"), 0);
+    assert_eq!(env.eval_int("v.top"), 0);
+    assert_eq!(env.eval_int("v.width"), 320);
+    assert_eq!(env.eval_int("v.height"), 240);
 }
 
 /// Loop, segment loop, period event and play rate.
@@ -377,23 +401,70 @@ fn mixing_layer_selection_matches_the_reference() {
     assert_eq!(env.eval_int("thrown2"), 1);
 }
 
-/// The backend passthrough members (mode, streams, mixing colors) round-trip.
+/// `setSegmentLoop` on a closed overlay stores its bounds verbatim and does
+/// not raise.
+///
+/// Reference: the wrapper assigns `SegLoopStartFrame`/`SegLoopEndFrame`
+/// before guarding the backend call with `if(VideoOverlay)`
+/// (`reference/cpp/core/visual/impl/VideoOvlImpl.cpp:357-361`).
 #[test]
-fn passthrough_members_round_trip() {
+fn segment_loop_on_a_closed_overlay_is_stored() {
     let _lock = vm_lock();
     let env = Env::new();
     env.run(
         "var v = new VideoOverlay(null); \
+         v.setSegmentLoop(-1, 5); \
+         var s0 = v.segmentLoopStartFrame; var s1 = v.segmentLoopEndFrame; \
+         v.cancelSegmentLoop(); \
+         var s2 = v.segmentLoopStartFrame; var s3 = v.segmentLoopEndFrame;",
+    );
+    assert_eq!(env.eval_int("s0"), -1);
+    assert_eq!(env.eval_int("s1"), 5);
+    assert_eq!(env.eval_int("s2"), -1);
+    assert_eq!(env.eval_int("s3"), -1);
+}
+
+/// Backend-passthrough members: with no stream open their getters report the
+/// reference's "no backend" sentinels and their setters are inert; once a
+/// stream is open they round-trip.
+///
+/// Reference: `GetAudioBalance`/`GetAudioVolume` seed the local with `0`,
+/// `GetEnableAudioStreamNum`/`GetEnableVideoStreamNum` seed it with `-1`, and
+/// every setter is guarded by `if(VideoOverlay)`
+/// (`reference/cpp/core/visual/impl/VideoOvlImpl.cpp:814-880`).
+#[test]
+fn passthrough_members_follow_the_open_state() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.set_default_source();
+    env.run(
+        "var v = new VideoOverlay(null); \
          v.mode = 1; var mode = v.mode; \
-         v.audioBalance = 10; var ab = v.audioBalance; \
-         v.audioVolume = 20; var av = v.audioVolume; \
-         v.enabledAudioStream = 1; var eas = v.enabledAudioStream; \
-         v.enabledVideoStream = 0; var evs = v.enabledVideoStream; \
+         v.playRate = 2.0; var closed_rate = v.playRate; \
+         v.audioBalance = 10; v.audioVolume = 20; \
+         v.enabledAudioStream = 1; v.enabledVideoStream = 2; \
+         v.mixingMovieAlpha = 0.5; v.mixingMovieBGColor = 0x00ff00; \
+         v.selectAudioStream(3); \
+         var closed_ab = v.audioBalance; var closed_av = v.audioVolume; \
+         var closed_eas = v.enabledAudioStream; var closed_evs = v.enabledVideoStream; \
+         var closed_mma = v.mixingMovieAlpha; var closed_mmb = v.mixingMovieBGColor; \
+         v.open('movie.mpg'); \
+         v.audioBalance = 10; v.audioVolume = 20; \
+         v.enabledAudioStream = 1; v.enabledVideoStream = 0; \
+         v.mixingMovieAlpha = 0.5; v.mixingMovieBGColor = 0x00ff00; \
+         var ab = v.audioBalance; var av = v.audioVolume; \
+         var eas = v.enabledAudioStream; var evs = v.enabledVideoStream; \
          v.selectAudioStream(2); var eas2 = v.enabledAudioStream; \
-         v.mixingMovieAlpha = 0.5; var mma = v.mixingMovieAlpha; \
-         v.mixingMovieBGColor = 0x00ff00; var mmb = v.mixingMovieBGColor;",
+         var mma = v.mixingMovieAlpha; var mmb = v.mixingMovieBGColor;",
     );
     assert_eq!(env.eval_int("mode"), 1);
+    assert!((env.eval_real("closed_rate") - 0.0).abs() < 1e-9);
+    assert_eq!(env.eval_int("closed_ab"), 0);
+    assert_eq!(env.eval_int("closed_av"), 0);
+    assert_eq!(env.eval_int("closed_eas"), -1);
+    assert_eq!(env.eval_int("closed_evs"), -1);
+    assert!((env.eval_real("closed_mma") - 0.0).abs() < 1e-9);
+    assert_eq!(env.eval_int("closed_mmb"), 0);
     assert_eq!(env.eval_int("ab"), 10);
     assert_eq!(env.eval_int("av"), 20);
     assert_eq!(env.eval_int("eas"), 1);
@@ -403,14 +474,24 @@ fn passthrough_members_round_trip() {
     assert_eq!(env.eval_int("mmb"), 0x00ff00);
 }
 
-/// The color-adjustment values and their backend-defined metadata.
+/// Color adjustment: a closed overlay reads `-1.0` for every value and
+/// metadata member and ignores writes; once open the values round-trip and
+/// the backend-defined metadata is reported.
+///
+/// Reference: every `Get*` seeds `ret = -1.0f` and only overwrites it when
+/// `VideoOverlay` is non-null, and every `Set*` is guarded by
+/// `if(VideoOverlay)` (`reference/cpp/core/visual/impl/VideoOvlImpl.cpp:951-1064`).
 #[test]
-fn color_adjustment_round_trips() {
+fn color_adjustment_follows_the_open_state() {
     let _lock = vm_lock();
     let env = Env::new();
+    env.set_default_source();
     env.run(
         "var v = new VideoOverlay(null); \
-         var before = v.contrast; \
+         v.contrast = 1.5; \
+         var closed_c = v.contrast; var closed_cmin = v.contrastRangeMin; \
+         var closed_cdef = v.contrastDefaultValue; \
+         v.open('movie.mpg'); \
          v.contrast = 1.5; v.brightness = -0.5; v.hue = 90; v.saturation = 0.25; \
          var c = v.contrast; var b = v.brightness; var h = v.hue; var s = v.saturation; \
          var cmin = v.contrastRangeMin; var cmax = v.contrastRangeMax; \
@@ -420,7 +501,9 @@ fn color_adjustment_round_trips() {
          var smin = v.saturationRangeMin; var smax = v.saturationRangeMax; \
          var sdef = v.saturationDefaultValue; var sstep = v.saturationStepSize;",
     );
-    assert!((env.eval_real("before") - 1.0).abs() < 1e-9);
+    assert!((env.eval_real("closed_c") + 1.0).abs() < 1e-9);
+    assert!((env.eval_real("closed_cmin") + 1.0).abs() < 1e-9);
+    assert!((env.eval_real("closed_cdef") + 1.0).abs() < 1e-9);
     assert!((env.eval_real("c") - 1.5).abs() < 1e-9);
     assert!((env.eval_real("b") + 0.5).abs() < 1e-9);
     assert!((env.eval_real("h") - 90.0).abs() < 1e-9);

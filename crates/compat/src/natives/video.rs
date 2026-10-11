@@ -409,9 +409,12 @@ macro_rules! slot_int_prop {
     };
 }
 
-/// Read/write a real [`VideoSlot`] field.
-macro_rules! slot_real_prop {
-    ($get:ident, $set:ident, $field:ident) => {
+/// Read/write a backend-passthrough integer [`VideoSlot`] field.
+///
+/// With no stream open the reference wrapper's getter reports `$closed` and
+/// its setter is inert; both only reach the backend while a stream is open.
+macro_rules! passthrough_int_prop {
+    ($get:ident, $set:ident, $field:ident, $closed:expr) => {
         extern "C" fn $get(
             engine: *mut c_void,
             instance: *mut c_void,
@@ -420,7 +423,14 @@ macro_rules! slot_real_prop {
             _objthis: *mut c_void,
         ) -> c_int {
             with_slot!(engine, instance, out_error, _ctx, slot, {
-                set_real(out, slot.$field);
+                set_int(
+                    out,
+                    if slot.overlay.is_open() {
+                        slot.$field
+                    } else {
+                        $closed
+                    },
+                );
                 0
             })
         }
@@ -432,8 +442,71 @@ macro_rules! slot_real_prop {
             _objthis: *mut c_void,
         ) -> c_int {
             with_slot!(engine, instance, out_error, _ctx, slot, {
-                // SAFETY: `value` is the valid `Value` the caller holds for this call.
-                slot.$field = value_as_f64(unsafe { &*value });
+                if slot.overlay.is_open() {
+                    // SAFETY: `value` is the valid `Value` the caller holds for this call.
+                    slot.$field = value_as_i64(unsafe { &*value });
+                }
+                0
+            })
+        }
+    };
+}
+
+/// Read/write a backend-passthrough real [`VideoSlot`] field. See
+/// [`passthrough_int_prop!`].
+macro_rules! passthrough_real_prop {
+    ($get:ident, $set:ident, $field:ident, $closed:expr) => {
+        extern "C" fn $get(
+            engine: *mut c_void,
+            instance: *mut c_void,
+            out: *mut Value,
+            out_error: *mut *mut c_char,
+            _objthis: *mut c_void,
+        ) -> c_int {
+            with_slot!(engine, instance, out_error, _ctx, slot, {
+                set_real(
+                    out,
+                    if slot.overlay.is_open() {
+                        slot.$field
+                    } else {
+                        $closed
+                    },
+                );
+                0
+            })
+        }
+        extern "C" fn $set(
+            engine: *mut c_void,
+            instance: *mut c_void,
+            value: *const Value,
+            out_error: *mut *mut c_char,
+            _objthis: *mut c_void,
+        ) -> c_int {
+            with_slot!(engine, instance, out_error, _ctx, slot, {
+                if slot.overlay.is_open() {
+                    // SAFETY: `value` is the valid `Value` the caller holds for this call.
+                    slot.$field = value_as_f64(unsafe { &*value });
+                }
+                0
+            })
+        }
+    };
+}
+
+/// Read-only backend-defined real metadata (`*RangeMin`/`*RangeMax`/
+/// `*DefaultValue`/`*StepSize`). The reference reads `-1.0` from the
+/// uninitialised local when no stream is open.
+macro_rules! backend_const_real_prop {
+    ($get:ident, $value:expr) => {
+        extern "C" fn $get(
+            engine: *mut c_void,
+            instance: *mut c_void,
+            out: *mut Value,
+            out_error: *mut *mut c_char,
+            _objthis: *mut c_void,
+        ) -> c_int {
+            with_slot!(engine, instance, out_error, _ctx, slot, {
+                set_real(out, if slot.overlay.is_open() { $value } else { -1.0 });
                 0
             })
         }
@@ -454,23 +527,6 @@ macro_rules! slot_ro_int {
                 set_int(out, slot.$field);
                 0
             })
-        }
-    };
-}
-
-/// Read-only real constant (the reference's backend-defined
-/// `*RangeMin`/`*RangeMax`/`*DefaultValue`/`*StepSize` metadata).
-macro_rules! const_real_prop {
-    ($get:ident, $value:expr) => {
-        extern "C" fn $get(
-            _engine: *mut c_void,
-            _instance: *mut c_void,
-            out: *mut Value,
-            _out_error: *mut *mut c_char,
-            _objthis: *mut c_void,
-        ) -> c_int {
-            set_real(out, $value);
-            0
         }
     };
 }
@@ -645,13 +701,13 @@ extern "C" fn vo_play(
     _objthis: *mut c_void,
 ) -> c_int {
     with_slot!(engine, instance, out_error, _ctx, slot, {
-        match slot.overlay.play() {
-            Ok(()) => {
-                set_void(out);
-                0
-            }
-            Err(error) => report_error(out_error, &format!("VideoOverlay.play: {error}")),
+        if slot.overlay.is_open()
+            && let Err(error) = slot.overlay.play()
+        {
+            return report_error(out_error, &format!("VideoOverlay.play: {error}"));
         }
+        set_void(out);
+        0
     })
 }
 
@@ -666,13 +722,13 @@ extern "C" fn vo_pause(
     _objthis: *mut c_void,
 ) -> c_int {
     with_slot!(engine, instance, out_error, _ctx, slot, {
-        match slot.overlay.pause() {
-            Ok(()) => {
-                set_void(out);
-                0
-            }
-            Err(error) => report_error(out_error, &format!("VideoOverlay.pause: {error}")),
+        if slot.overlay.is_open()
+            && let Err(error) = slot.overlay.pause()
+        {
+            return report_error(out_error, &format!("VideoOverlay.pause: {error}"));
         }
+        set_void(out);
+        0
     })
 }
 
@@ -687,13 +743,13 @@ extern "C" fn vo_stop(
     _objthis: *mut c_void,
 ) -> c_int {
     with_slot!(engine, instance, out_error, _ctx, slot, {
-        match slot.overlay.stop() {
-            Ok(()) => {
-                set_void(out);
-                0
-            }
-            Err(error) => report_error(out_error, &format!("VideoOverlay.stop: {error}")),
+        if slot.overlay.is_open()
+            && let Err(error) = slot.overlay.stop()
+        {
+            return report_error(out_error, &format!("VideoOverlay.stop: {error}"));
         }
+        set_void(out);
+        0
     })
 }
 
@@ -725,13 +781,13 @@ extern "C" fn vo_prepare(
     _objthis: *mut c_void,
 ) -> c_int {
     with_slot!(engine, instance, out_error, _ctx, slot, {
-        match slot.overlay.prepare() {
-            Ok(()) => {
-                set_void(out);
-                0
-            }
-            Err(error) => report_error(out_error, &format!("VideoOverlay.prepare: {error}")),
+        if slot.overlay.is_open()
+            && let Err(error) = slot.overlay.prepare()
+        {
+            return report_error(out_error, &format!("VideoOverlay.prepare: {error}"));
         }
+        set_void(out);
+        0
     })
 }
 
@@ -1220,7 +1276,14 @@ extern "C" fn vo_position_get(
     _objthis: *mut c_void,
 ) -> c_int {
     with_slot!(engine, instance, out_error, _ctx, slot, {
-        set_int(out, slot.overlay.position_ms());
+        set_int(
+            out,
+            if slot.overlay.is_open() {
+                slot.overlay.position_ms()
+            } else {
+                0
+            },
+        );
         0
     })
 }
@@ -1233,8 +1296,10 @@ extern "C" fn vo_position_set(
     _objthis: *mut c_void,
 ) -> c_int {
     with_slot!(engine, instance, out_error, _ctx, slot, {
-        // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
-        slot.overlay.seek_ms(value_as_i64(unsafe { &*value }));
+        if slot.overlay.is_open() {
+            // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
+            slot.overlay.seek_ms(value_as_i64(unsafe { &*value }));
+        }
         0
     })
 }
@@ -1247,7 +1312,14 @@ extern "C" fn vo_frame_get(
     _objthis: *mut c_void,
 ) -> c_int {
     with_slot!(engine, instance, out_error, _ctx, slot, {
-        set_int(out, slot.overlay.frame());
+        set_int(
+            out,
+            if slot.overlay.is_open() {
+                slot.overlay.frame()
+            } else {
+                0
+            },
+        );
         0
     })
 }
@@ -1260,8 +1332,10 @@ extern "C" fn vo_frame_set(
     _objthis: *mut c_void,
 ) -> c_int {
     with_slot!(engine, instance, out_error, _ctx, slot, {
-        // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
-        slot.overlay.seek_frame(value_as_i64(unsafe { &*value }));
+        if slot.overlay.is_open() {
+            // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
+            slot.overlay.seek_frame(value_as_i64(unsafe { &*value }));
+        }
         0
     })
 }
@@ -1301,7 +1375,14 @@ extern "C" fn vo_play_rate_get(
     _objthis: *mut c_void,
 ) -> c_int {
     with_slot!(engine, instance, out_error, _ctx, slot, {
-        set_real(out, slot.overlay.play_rate());
+        set_real(
+            out,
+            if slot.overlay.is_open() {
+                slot.overlay.play_rate()
+            } else {
+                0.0
+            },
+        );
         0
     })
 }
@@ -1314,12 +1395,14 @@ extern "C" fn vo_play_rate_set(
     _objthis: *mut c_void,
 ) -> c_int {
     with_slot!(engine, instance, out_error, _ctx, slot, {
-        // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
-        let rate = value_as_f64(unsafe { &*value });
-        match slot.overlay.set_play_rate(rate) {
-            Ok(()) => 0,
-            Err(error) => report_error(out_error, &format!("VideoOverlay.playRate: {error}")),
+        if slot.overlay.is_open() {
+            // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
+            let rate = value_as_f64(unsafe { &*value });
+            if let Err(error) = slot.overlay.set_play_rate(rate) {
+                return report_error(out_error, &format!("VideoOverlay.playRate: {error}"));
+            }
         }
+        0
     })
 }
 
@@ -1382,23 +1465,25 @@ extern "C" fn vo_segment_loop_end_get(
 
 // -- audio / video streams --------------------------------------------------
 
-slot_int_prop!(vo_audio_balance_get, vo_audio_balance_set, audio_balance);
-slot_int_prop!(vo_audio_volume_get, vo_audio_volume_set, audio_volume);
-slot_int_prop!(
+passthrough_int_prop!(vo_audio_balance_get, vo_audio_balance_set, audio_balance, 0);
+passthrough_int_prop!(vo_audio_volume_get, vo_audio_volume_set, audio_volume, 0);
+passthrough_int_prop!(
     vo_enabled_audio_stream_get,
     vo_enabled_audio_stream_set,
-    enabled_audio_stream
+    enabled_audio_stream,
+    -1
 );
-slot_int_prop!(
+passthrough_int_prop!(
     vo_enabled_video_stream_get,
     vo_enabled_video_stream_set,
-    enabled_video_stream
+    enabled_video_stream,
+    -1
 );
 
 // -- mixing -----------------------------------------------------------------
 
-slot_real_prop!(vo_mixing_alpha_get, vo_mixing_alpha_set, mixing_alpha);
-slot_int_prop!(vo_mixing_bg_get, vo_mixing_bg_set, mixing_bg);
+passthrough_real_prop!(vo_mixing_alpha_get, vo_mixing_alpha_set, mixing_alpha, 0.0);
+passthrough_int_prop!(vo_mixing_bg_get, vo_mixing_bg_set, mixing_bg, 0);
 
 // -- mode -------------------------------------------------------------------
 
@@ -1406,27 +1491,27 @@ slot_int_prop!(vo_mode_get, vo_mode_set, mode);
 
 // -- color adjustment (backend-defined; inert without a decoder) ------------
 
-slot_real_prop!(vo_contrast_get, vo_contrast_set, contrast);
-slot_real_prop!(vo_brightness_get, vo_brightness_set, brightness);
-slot_real_prop!(vo_hue_get, vo_hue_set, hue);
-slot_real_prop!(vo_saturation_get, vo_saturation_set, saturation);
+passthrough_real_prop!(vo_contrast_get, vo_contrast_set, contrast, -1.0);
+passthrough_real_prop!(vo_brightness_get, vo_brightness_set, brightness, -1.0);
+passthrough_real_prop!(vo_hue_get, vo_hue_set, hue, -1.0);
+passthrough_real_prop!(vo_saturation_get, vo_saturation_set, saturation, -1.0);
 
-const_real_prop!(vo_contrast_range_min_get, 0.0);
-const_real_prop!(vo_contrast_range_max_get, 2.0);
-const_real_prop!(vo_contrast_default_value_get, 1.0);
-const_real_prop!(vo_contrast_step_size_get, 0.01);
-const_real_prop!(vo_brightness_range_min_get, -1.0);
-const_real_prop!(vo_brightness_range_max_get, 1.0);
-const_real_prop!(vo_brightness_default_value_get, 0.0);
-const_real_prop!(vo_brightness_step_size_get, 0.01);
-const_real_prop!(vo_hue_range_min_get, -180.0);
-const_real_prop!(vo_hue_range_max_get, 180.0);
-const_real_prop!(vo_hue_default_value_get, 0.0);
-const_real_prop!(vo_hue_step_size_get, 1.0);
-const_real_prop!(vo_saturation_range_min_get, 0.0);
-const_real_prop!(vo_saturation_range_max_get, 2.0);
-const_real_prop!(vo_saturation_default_value_get, 1.0);
-const_real_prop!(vo_saturation_step_size_get, 0.01);
+backend_const_real_prop!(vo_contrast_range_min_get, 0.0);
+backend_const_real_prop!(vo_contrast_range_max_get, 2.0);
+backend_const_real_prop!(vo_contrast_default_value_get, 1.0);
+backend_const_real_prop!(vo_contrast_step_size_get, 0.01);
+backend_const_real_prop!(vo_brightness_range_min_get, -1.0);
+backend_const_real_prop!(vo_brightness_range_max_get, 1.0);
+backend_const_real_prop!(vo_brightness_default_value_get, 0.0);
+backend_const_real_prop!(vo_brightness_step_size_get, 0.01);
+backend_const_real_prop!(vo_hue_range_min_get, -180.0);
+backend_const_real_prop!(vo_hue_range_max_get, 180.0);
+backend_const_real_prop!(vo_hue_default_value_get, 0.0);
+backend_const_real_prop!(vo_hue_step_size_get, 1.0);
+backend_const_real_prop!(vo_saturation_range_min_get, 0.0);
+backend_const_real_prop!(vo_saturation_range_max_get, 2.0);
+backend_const_real_prop!(vo_saturation_default_value_get, 1.0);
+backend_const_real_prop!(vo_saturation_step_size_get, 0.01);
 
 // -- media metadata ---------------------------------------------------------
 
