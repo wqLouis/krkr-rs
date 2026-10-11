@@ -385,6 +385,45 @@ fn members_are_instance_members_on_the_builtins_only() {
     );
 }
 
+// The reference registers only the Array members
+// (`reference/cpp/plugins/saveStruct.cpp:310-314`) and the Dictionary members
+// (`:364-367`); it exposes no free functions. The port therefore retains its
+// serializer helpers internally and removes every script global the
+// registration ABI created for them. The helpers live on the global object,
+// so their absence is observed through `typeof global.<name>`; a bare
+// `typeof <name>` is a must-exist read that raises for the same absence
+// (`reference/cpp/core/tjs2/tjsInterCodeExec.cpp:1899-1904`, pinned by
+// `crates/compat/tests/typeof_spellings.rs`).
+#[test]
+fn serializer_helpers_are_not_globals() {
+    let _lock = vm_lock();
+    let env = Env::new();
+
+    for name in [
+        "__krkr_save_struct_quote",
+        "__krkr_save_struct_quote_octet",
+        "__krkr_save_struct_is_array",
+        "__krkr_save_struct_variant",
+        "__krkr_save_struct_arr",
+        "__krkr_save_struct_dict",
+        "__krkr_save_struct_serialize",
+    ] {
+        assert_eq!(
+            env.string(&format!("typeof global.{name}")),
+            "undefined",
+            "{name} must not be a global"
+        );
+        // A bare `typeof` is a must-exist read, so it raises for the absent
+        // name; a leaked global would report `"Object"` instead.
+        assert!(
+            env.engine
+                .eval(&format!("typeof {name}"), "save-struct-test")
+                .is_err(),
+            "{name} must not be reachable as a bare global"
+        );
+    }
+}
+
 // `DictAdd` attaches only `saveStruct2` and `toStructString`
 // (`reference/cpp/plugins/saveStruct.cpp:364-366`); `save2` is an Array-only
 // member (`:310-313`), so `%[].save2` must be `undefined` while Array keeps

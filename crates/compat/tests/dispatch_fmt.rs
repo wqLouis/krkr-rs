@@ -615,41 +615,6 @@ fn array_to_struct_string_through_with_reaches_the_target() {
 }
 
 // ---------------------------------------------------------------------------
-// xp3_filter — Array.xor objthis member
-// ---------------------------------------------------------------------------
-
-/// `xp3_filter` attaches `xor` to the builtin `Array`
-/// (`crates/compat/src/natives/plugins/xp3_filter/mod.rs:114-122`); the
-/// callback retains the raw `objthis` and mutates it
-/// (`xp3_filter/mod.rs:513-551`). Reference `reference/cpp/plugins/xp3filter.cpp`.
-#[test]
-fn array_xor_through_with_reaches_the_target() {
-    let _lock = vm_lock();
-    let env = Env::new();
-    env.run(
-        "var target = [1, 2, 3]; \
-         var host = [9, 9, 9]; \
-         class Host { \
-             function Host() {} \
-             function callThrough(t) { with(t) { .xor(0, 3, 255); } } \
-         } \
-         var h = new Host(); \
-         h.callThrough(target);",
-    );
-
-    assert_eq!(
-        env.eval_int("target[0]"),
-        1 ^ 255,
-        "with(target){{ .xor(...) }} must mutate the target array"
-    );
-    assert_eq!(
-        env.eval_int("host[0]"),
-        9,
-        "the enclosing array must be untouched"
-    );
-}
-
-// ---------------------------------------------------------------------------
 // csv_parser — instance-payload family (with an objthis fallback)
 // ---------------------------------------------------------------------------
 

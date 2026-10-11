@@ -47,9 +47,9 @@
 //! The reference passes a `CBinaryAccessor` whose indexed accessors and
 //! `xor` method rewrite the segment in place. The VM's C ABI cannot expose a
 //! borrowed byte slice as a native object, so the port marshals the segment
-//! as a TJS `Array` of byte values (indexable, and given an `xor` method
-//! matching the reference's), calls the closure, then copies the array back
-//! into the segment. The closure receives the reference's argument list:
+//! as a TJS `Array` of byte values and attaches the reference `xor` helper as
+//! an own member of that object, calls the closure, then copies the array
+//! back into the segment. The closure receives the reference's argument list:
 //! `(file_hash, offset, buffer, buffer_size, file_name, ctx)`.
 //!
 //! The content filter is invoked once per archive entry read before the
@@ -62,17 +62,24 @@ use std::ffi::{c_char, c_int, c_void};
 
 use engine::StorageReadError;
 use tjs::{
-    DetachedValue, Engine, NativeInstanceMembers, NativeMethodDef, NativeObjThisMethodDef,
-    NativeStaticMembers, RetainedValue, Tjs2Engine, TjsValue, VAL_OBJECT, Value,
+    DetachedValue, Engine, NativeMethodDef, NativeStaticMembers, RetainedValue, Tjs2Engine,
+    TjsValue, VAL_OBJECT, Value,
 };
 
 use crate::binding;
 use crate::native_util::{args, report_error, set_void};
-use crate::natives::system::value_as_i64;
 use crate::{CompatCtx, CompatError, CompatServices};
 
 /// The configuration script the reference reads from the application path.
 const FILTER_SCRIPT: &str = "xp3filter.tjs";
+
+/// The script `xor(offset, length, value)` helper attached to every
+/// marshalled buffer, matching the reference `CBinaryAccessor::FuncXor`
+/// (`reference/cpp/plugins/xp3filter.cpp:266-297`). Attaching it to the
+/// per-call buffer object keeps the method off the core `Array` class.
+const BUFFER_XOR_HELPER: &str = "(function(offset, length, value) { \
+     for (var i = 0; i < length; i++) this[offset + i] = this[offset + i] ^ value; \
+     })";
 
 /// Per-install XP3 filter dispatch state, kept in
 /// [`CompatServices::state`](crate::CompatServices::state).
@@ -86,6 +93,9 @@ struct Xp3FilterState {
     extraction: Option<DetachedValue>,
     /// The retained `setXP3ArchiveContentFilter` closure.
     content: Option<DetachedValue>,
+    /// The retained buffer `xor` helper attached to each marshalled segment
+    /// (`reference/cpp/plugins/xp3filter.cpp:266-297`).
+    buffer_xor: Option<DetachedValue>,
     /// The `xp3filter.tjs` source read during registration, awaiting
     /// execution on the first archive read (the reference reads in the
     /// post-registration callback and executes in the decoder on first use,
@@ -118,16 +128,9 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
     })?;
 
     // The reference's `CBinaryAccessor` exposes an `xor` helper over the
-    // buffer; attach the same helper to the marshalled `Array`.
-    ctx.register_instance_members(&NativeInstanceMembers {
-        class_name: "Array",
-        methods: vec![NativeObjThisMethodDef {
-            name: "xor",
-            f: array_xor,
-        }],
-        properties: vec![],
-    })?;
-
+    // buffer (`reference/cpp/plugins/xp3filter.cpp:266-297`); the helper is
+    // attached as an own member of each marshalled buffer object rather than
+    // registered on the core `Array` class.
     install_storage_filter(ctx);
 
     // Read the configuration script during registration, matching the
@@ -137,6 +140,25 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
     // `AddXP3Decoder`, `:418`), because the setters need that binding.
     // SAFETY: the caller holds the live services.
     let services = unsafe { ctx.services() };
+    // The reference's `CBinaryAccessor` carries the `xor` helper; the port
+    // retains a script helper once and attaches it to each marshalled buffer
+    // as an own member (`reference/cpp/plugins/xp3filter.cpp:266-297`).
+    // SAFETY: registration runs on the bound, live engine.
+    match unsafe { ctx.engine() }.eval_retained(BUFFER_XOR_HELPER, "xp3_filter") {
+        Ok(RetainedValue::Object(helper)) => {
+            services.state::<Xp3FilterState>().buffer_xor = Some(helper);
+        }
+        Ok(RetainedValue::Value(other)) => {
+            return Err(CompatError::Register(format!(
+                "xp3_filter: the buffer xor helper is not a function: {other:?}"
+            )));
+        }
+        Err(error) => {
+            return Err(CompatError::Register(format!(
+                "xp3_filter: could not create the buffer xor helper: {error}"
+            )));
+        }
+    }
     match read_filter_script(services) {
         Ok(Some(text)) => services.state::<Xp3FilterState>().pending_script = Some(text),
         Ok(None) => {}
@@ -335,7 +357,16 @@ fn dispatch_extraction_filter(engine_ptr: usize, services_ptr: usize, request: F
     };
     if let Some(extraction) = extraction.as_ref()
         && let Err(error) = apply_extraction_filter(
-            engine, extraction, file_hash, offset, buffer, file_name, ctx,
+            engine,
+            services,
+            extraction,
+            FilterCall {
+                file_hash,
+                offset,
+                file_name,
+            },
+            buffer,
+            ctx,
         )
     {
         log::warn!("xp3_filter: filter for `{file_name}` failed: {error}");
@@ -403,14 +434,22 @@ fn content_context(
     }
 }
 
-/// Marshal `buffer` to a TJS `Array`, call `filter`, and copy the array back.
-fn apply_extraction_filter(
-    engine: &Tjs2Engine,
-    filter: &DetachedValue,
+/// The archive position and name an extraction filter call receives
+/// (`reference/cpp/plugins/xp3filter.cpp:266-297`).
+struct FilterCall<'a> {
     file_hash: u32,
     offset: u64,
+    file_name: &'a str,
+}
+
+/// Marshal `buffer` to a TJS `Array`, attach the buffer `xor` helper, call
+/// `filter`, and copy the array back.
+fn apply_extraction_filter(
+    engine: &Tjs2Engine,
+    services: &CompatServices,
+    filter: &DetachedValue,
+    call: FilterCall<'_>,
     buffer: &mut [u8],
-    file_name: &str,
     ctx: TjsValue,
 ) -> Result<(), String> {
     let array = match engine.eval_retained("[]", "xp3_filter") {
@@ -427,15 +466,33 @@ fn apply_extraction_filter(
             &TjsValue::Integer(i64::from(*byte)),
         )?;
     }
+    // Attach the reference `CBinaryAccessor::xor` helper as an own member of
+    // the marshalled buffer (`reference/cpp/plugins/xp3filter.cpp:266-297`),
+    // so the filter script can call `buffer.xor(offset, length, value)`
+    // without a member on the `Array` class.
+    let helper_id = services
+        .state::<Xp3FilterState>()
+        .buffer_xor
+        .as_ref()
+        .map(DetachedValue::raw_id);
+    let Some(helper_id) = helper_id else {
+        return Err("the buffer xor helper is not initialized".into());
+    };
+    let helper = engine.duplicate_retained(helper_id)?;
+    engine.set_member(
+        array.raw_id(),
+        "xor",
+        &TjsValue::Retained(helper.raw_id() as u64),
+    )?;
     // Pass a duplicate retention: the call consumes the argument's retained
     // id, while `array` stays live for the read-back.
     let pass = engine.duplicate_retained(array.raw_id())?;
     let args = [
-        TjsValue::Integer(i64::from(file_hash)),
-        TjsValue::Integer(offset as i64),
+        TjsValue::Integer(i64::from(call.file_hash)),
+        TjsValue::Integer(call.offset as i64),
         TjsValue::Retained(pass.raw_id() as u64),
         TjsValue::Integer(buffer.len() as i64),
-        TjsValue::String(file_name.to_string()),
+        TjsValue::String(call.file_name.to_string()),
         ctx,
     ];
     let call = engine.call_detached(filter, &args);
@@ -547,52 +604,6 @@ fn set_filter(
         // A programmatically installed filter must not be clobbered by the
         // deferred `xp3filter.tjs` load.
         state.script_loaded = true;
-    }
-    set_void(out);
-    0
-}
-
-// ---------------------------------------------------------------------------
-// `Array.xor(offset, length, value)` — the reference `CBinaryAccessor::FuncXor`
-// ---------------------------------------------------------------------------
-
-extern "C" fn array_xor(
-    engine: *mut c_void,
-    objthis: *mut c_void,
-    argc: c_int,
-    argv: *const Value,
-    out: *mut Value,
-    out_error: *mut *mut c_char,
-) -> c_int {
-    let Some(resolved) = binding::resolve(engine as *mut Engine) else {
-        return report_error(out_error, "Array.xor: compat context is not bound");
-    };
-    let argv = unsafe { args(argv, argc) };
-    if argv.len() < 3 {
-        return report_error(out_error, "Array.xor requires 3 arguments");
-    }
-    let offset = value_as_i64(&argv[0]).max(0) as usize;
-    let length = value_as_i64(&argv[1]).max(0) as usize;
-    let key = value_as_i64(&argv[2]) as u8;
-    let object = match resolved.engine().retain_object_detached(objthis) {
-        Ok(object) => object,
-        Err(error) => return report_error(out_error, &format!("Array.xor: {error}")),
-    };
-    let end = offset.saturating_add(length);
-    for index in offset..end {
-        let name = index.to_string();
-        let current = match resolved.engine().member(object.raw_id(), &name) {
-            Ok(TjsValue::Integer(value)) => value as u8,
-            Ok(TjsValue::Real(value)) => value as u8,
-            _ => 0,
-        };
-        if let Err(error) = resolved.engine().set_member(
-            object.raw_id(),
-            &name,
-            &TjsValue::Integer(i64::from(current ^ key)),
-        ) {
-            return report_error(out_error, &format!("Array.xor: {error}"));
-        }
     }
     set_void(out);
     0

@@ -60,6 +60,10 @@ use crate::{CompatCtx, CompatError};
 pub(crate) struct MotionState {
     /// Scratch bytes for a returned string result.
     pub(crate) string: Vec<u8>,
+    /// The class-static `Player.useD3D` probe object, created once at
+    /// registration and duplicated on every read
+    /// (`reference/cpp/plugins/motionplayer/main.cpp:498-509`).
+    pub(crate) use_d3d_probe: Option<DetachedValue>,
 }
 
 /// A TJS value stored on a native instance across calls.
@@ -305,6 +309,7 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
     // `Motion` by the PostRegist callback.
     if !global_exists(ctx, "Player") {
         player::register(ctx)?;
+        register_use_d3d_probe(ctx)?;
     }
     // The namespace-only classes are `Motion.*` subclasses in the reference:
     // `NCB_REGISTER_SUBCLASS_DELAY` only defines their members and
@@ -362,9 +367,11 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
     if !motion_id.is_null() {
         // (public `Motion.*` name, registration class name, keeps a global).
         // `Rect` is registered as `MotionRect` because the core VM already
-        // owns the `Rect` class; `Player`, `D3DEmotePlayer` and
-        // `D3DEmoteModule` are the only classes that keep their global
-        // (`reference/cpp/plugins/motionplayer/main.cpp:128,565,588`).
+        // owns the `Rect` class; `Player` is the only class aliased into
+        // `Motion` that keeps its global. `D3DEmotePlayer` and
+        // `D3DEmoteModule` are genuine top-level classes and are not
+        // namespace members (`reference/cpp/plugins/motionplayer/
+        // main.cpp:128,565,588`).
         for (public, internal, top_level) in [
             ("Player", "Player", true),
             ("ResourceManager", "ResourceManager", false),
@@ -378,22 +385,100 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
             ("Quad", "Quad", false),
             ("LayerGetter", "LayerGetter", false),
             ("EmotePlayer", "EmotePlayer", false),
-            ("D3DEmotePlayer", "D3DEmotePlayer", true),
-            ("D3DEmoteModule", "D3DEmoteModule", true),
         ] {
             if !member_exists(ctx, "Motion", public) {
                 let attached = attach_named(ctx, public, internal, motion_id).unwrap_or(false);
                 // The global exists only because the registration ABI always
                 // publishes one; the reference exposes these classes solely
                 // under `Motion`. `delete_member`'s absent-member error
-                // (`TJS_E_MEMBERNOTFOUND`, `tjsObject.cpp:1546`) is harmless:
-                // it can only occur when an earlier install already removed
-                // the global.
-                if attached && !top_level && !global_id.is_null() {
-                    let _ = ctx.delete_member(global_id, internal);
+                // (`TJS_E_MEMBERNOTFOUND`, `tjsObject.cpp:1546`) can only
+                // occur when an earlier install already removed the global,
+                // so report it without failing the install.
+                if attached
+                    && !top_level
+                    && !global_id.is_null()
+                    && let Err(error) = ctx.delete_member(global_id, internal)
+                {
+                    log::warn!("motion_player: global `{internal}` already absent: {error}");
                 }
             }
         }
     }
     Ok(())
+}
+
+/// Install the class-static `Player.useD3D` probe object.
+///
+/// The reference's post-registration callback attaches an empty dictionary to
+/// the `Player` class with `TJS_STATICMEMBER`, so `Motion.Player.useD3D` reads
+/// as an object (`reference/cpp/plugins/motionplayer/main.cpp:498-509`). The
+/// marker is created once and duplicated on every read so its identity is
+/// stable across reads.
+fn register_use_d3d_probe(ctx: &CompatCtx) -> Result<(), CompatError> {
+    // SAFETY: a `CompatCtx` is only created for a bound, live engine.
+    let engine = unsafe { ctx.engine() };
+    let marker = match engine.eval_retained("%[]", "motion_player") {
+        Ok(RetainedValue::Object(marker)) => marker,
+        Ok(RetainedValue::Value(other)) => {
+            return Err(CompatError::Register(format!(
+                "motion_player: the Player.useD3D probe is not an object: {other:?}"
+            )));
+        }
+        Err(error) => {
+            return Err(CompatError::Register(format!(
+                "motion_player: could not create the Player.useD3D probe: {error}"
+            )));
+        }
+    };
+    // SAFETY: the caller holds the live services.
+    unsafe { ctx.services() }
+        .state::<MotionState>()
+        .use_d3d_probe = Some(marker);
+    ctx.register_static_members(&tjs::NativeStaticMembers {
+        class_name: "Player",
+        methods: vec![],
+        properties: vec![NativePropertyDef {
+            name: "useD3D",
+            get: Some(player_use_d3d_probe),
+            set: None,
+        }],
+    })
+}
+
+/// Getter for the class-static `Player.useD3D` probe object
+/// (`reference/cpp/plugins/motionplayer/main.cpp:498-509`).
+extern "C" fn player_use_d3d_probe(
+    engine: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut std::ffi::c_char,
+) -> std::os::raw::c_int {
+    let Some(resolved) = crate::natives::system::resolve(engine) else {
+        return crate::native_util::report_error(
+            out_error,
+            "Player.useD3D: compat context is not bound",
+        );
+    };
+    let ctx = resolved.ctx();
+    // SAFETY: the caller resolved the live binding; `ctx` outlives `services`.
+    let services = unsafe { ctx.services() };
+    let id = services
+        .state::<MotionState>()
+        .use_d3d_probe
+        .as_ref()
+        .map(DetachedValue::raw_id);
+    let Some(id) = id else {
+        return crate::native_util::report_error(
+            out_error,
+            "Player.useD3D: the probe marker is not initialized",
+        );
+    };
+    match resolved.engine().duplicate_retained(id) {
+        Ok(duplicate) => {
+            helpers::set_retained(out, duplicate);
+            0
+        }
+        Err(error) => {
+            crate::native_util::report_error(out_error, &format!("Player.useD3D: {error}"))
+        }
+    }
 }

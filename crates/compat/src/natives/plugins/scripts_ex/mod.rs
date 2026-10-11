@@ -37,9 +37,9 @@ use std::ffi::{c_char, c_int, c_void};
 use std::ptr;
 
 use tjs::{
-    DetachedValue, Engine, NativeMethodDef, NativePropertyDef, NativeStaticMembers, RetainedValue,
-    Tjs2Engine, TjsValue, VAL_INTEGER, VAL_NULL, VAL_OBJECT, VAL_OCTET, VAL_REAL, VAL_RETAINED,
-    VAL_STRING, VAL_VOID, Value,
+    DetachedValue, Engine, NativeMethodDef, NativeStaticMembers, RetainedValue, Tjs2Engine,
+    TjsValue, VAL_INTEGER, VAL_NULL, VAL_OBJECT, VAL_OCTET, VAL_REAL, VAL_RETAINED, VAL_STRING,
+    VAL_VOID, Value,
 };
 
 use crate::binding;
@@ -1365,24 +1365,14 @@ extern "C" fn scripts_rehash(
 // constants
 // ---------------------------------------------------------------------------
 
-macro_rules! constant_getter {
-    ($name:ident, $value:expr) => {
-        extern "C" fn $name(
-            _engine: *mut c_void,
-            out: *mut Value,
-            _out_error: *mut *mut c_char,
-        ) -> c_int {
-            set_int(out, $value);
-            0
-        }
-    };
-}
-
-constant_getter!(pf_member_ensure_get, TJS_MEMBERENSURE);
-constant_getter!(pf_member_must_exist_get, TJS_MEMBERMUSTEXIST);
-constant_getter!(pf_ignore_prop_get, TJS_IGNOREPROP);
-constant_getter!(pf_hidden_member_get, TJS_HIDDENMEMBER);
-constant_getter!(pf_static_member_get, TJS_STATICMEMBER);
+/// The `pf*` flag constants and their values.
+const PF_CONSTANTS: &[(&str, i64)] = &[
+    ("pfMemberEnsure", TJS_MEMBERENSURE),
+    ("pfMemberMustExist", TJS_MEMBERMUSTEXIST),
+    ("pfIgnoreProp", TJS_IGNOREPROP),
+    ("pfHiddenMember", TJS_HIDDENMEMBER),
+    ("pfStaticMember", TJS_STATICMEMBER),
+];
 
 // ---------------------------------------------------------------------------
 // registration
@@ -1446,43 +1436,36 @@ fn static_methods() -> Vec<NativeMethodDef> {
     ]
 }
 
-/// The `pf*` flag constants exposed as read-only static properties.
-fn static_properties() -> Vec<NativePropertyDef> {
-    vec![
-        NativePropertyDef {
-            name: "pfMemberEnsure",
-            get: Some(pf_member_ensure_get),
-            set: None,
-        },
-        NativePropertyDef {
-            name: "pfMemberMustExist",
-            get: Some(pf_member_must_exist_get),
-            set: None,
-        },
-        NativePropertyDef {
-            name: "pfIgnoreProp",
-            get: Some(pf_ignore_prop_get),
-            set: None,
-        },
-        NativePropertyDef {
-            name: "pfHiddenMember",
-            get: Some(pf_hidden_member_get),
-            set: None,
-        },
-        NativePropertyDef {
-            name: "pfStaticMember",
-            get: Some(pf_static_member_get),
-            set: None,
-        },
-    ]
-}
-
 /// Register the plugin's native surface on the VM.
 pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
     ctx.register_static_members(&NativeStaticMembers {
         class_name: "Scripts",
         methods: static_methods(),
-        properties: static_properties(),
+        properties: vec![],
     })?;
+
+    // The `pf*` flags are plain class data members rather than accessor
+    // properties, so a script assignment overwrites the value. Write them
+    // onto the `Scripts` class object directly.
+    // SAFETY: a `CompatCtx` is only created for a bound, live engine.
+    let engine = unsafe { ctx.engine() };
+    let class = match engine.eval_retained("Scripts", "scripts_ex") {
+        Ok(RetainedValue::Object(class)) => class,
+        Ok(_) => {
+            return Err(CompatError::Register(
+                "scripts_ex: Scripts is not a class object".into(),
+            ));
+        }
+        Err(error) => {
+            return Err(CompatError::Register(format!(
+                "scripts_ex: Scripts lookup failed: {error}"
+            )));
+        }
+    };
+    for &(name, value) in PF_CONSTANTS {
+        engine
+            .set_member(class.raw_id(), name, &TjsValue::Integer(value))
+            .map_err(|error| CompatError::Register(format!("scripts_ex: {name}: {error}")))?;
+    }
     Ok(())
 }

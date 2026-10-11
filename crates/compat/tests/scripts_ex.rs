@@ -506,6 +506,14 @@ fn rehash_and_flag_constants() {
     assert_eq!(env.int("Scripts.pfIgnoreProp"), 0x0000_0800);
     assert_eq!(env.int("Scripts.pfHiddenMember"), 0x0000_1000);
     assert_eq!(env.int("Scripts.pfStaticMember"), 0x0001_0000);
+
+    // The reference registers each `pf*` with `Variant(name, value)`
+    // (`reference/cpp/plugins/scriptsEx.cpp:983-987`); `Variant` writes a
+    // `TJS_STATICMEMBER` data member through `PropSet`
+    // (`reference/cpp/core/plugin/ncbind.hpp:1801,1875-1877`), so a script
+    // assignment overwrites the value instead of raising.
+    env.run("Scripts.pfMemberEnsure = 5;");
+    assert_eq!(env.int("Scripts.pfMemberEnsure"), 5);
 }
 
 // ---------------------------------------------------------------------------

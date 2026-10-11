@@ -272,9 +272,12 @@ fn unregistered_cpp_helpers_are_not_script_members() {
 /// Reference: `NCB_REGISTER_CLASS(Steam)` declares no `Constructor()`
 /// (`steamPlugin.cpp:218-253`), so ncbind installs its dummy constructor,
 /// which raises `TJS_E_NOTIMPL` (`reference/cpp/core/plugin/ncbind.hpp:1948`,
-/// `1951-1956`) — `new Steam()` fails. Every member still carries
-/// `TJS_STATICMEMBER` (`steamPlugin.cpp:220-253`), so the class object keeps
-/// the whole surface.
+/// `1951-1956`) — `new Steam()` fails. Every member is static: the
+/// `RawCallback` methods pass `TJS_STATICMEMBER` explicitly
+/// (`steamPlugin.cpp:220-253`) and the five `Property` getters are static
+/// member functions (`steamPlugin.cpp:53,59,103,129,201`), from which ncbind
+/// derives `TJS_STATICMEMBER` (`reference/cpp/core/plugin/ncbind.hpp:1224-1226`),
+/// so the class object keeps the whole surface.
 #[test]
 fn steam_has_no_constructor_and_keeps_its_statics() {
     let _lock = vm_lock();

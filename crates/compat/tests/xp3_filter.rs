@@ -456,28 +456,19 @@ fn clearing_the_extraction_filter_with_null_passes_bytes_through() {
     assert_eq!(env.export("secret.txt", "step2.bin"), cipher);
 }
 
-// The reference `CBinaryAccessor::FuncXor` requires three parameters and
-// returns without a result (`reference/cpp/plugins/xp3filter.cpp:266-297`):
-// `xor(offset, length, value)` rewrites bytes in place and yields `void`,
-// while a shorter call is a typed error. The port attaches the helper to the
-// marshalled `Array` buffer (see the module docs), so the semantics are
-// pinned on an array.
+// The reference `xor` is a method of the per-call `CBinaryAccessor` object,
+// never a member of `Array` (`reference/cpp/plugins/xp3filter.cpp:21-260`);
+// the port attaches it to the marshalled buffer object, so the core `Array`
+// class must not carry it.
 #[test]
-fn xor_helper_is_void_and_requires_three_arguments() {
+fn array_class_has_no_xor_helper() {
     let _lock = vm_lock();
     let env = Env::new("");
 
-    env.run("var a = [1, 2, 3]; var r = a.xor(0, 2, 255);");
-    let r = env.engine.eval("r", "xp3-filter-test").expect("xor result");
-    assert_eq!(r, tjs::TjsValue::Void);
-    let first = env.engine.eval("a[0]", "xp3-filter-test").expect("a[0]");
-    assert_eq!(first, tjs::TjsValue::Integer(254));
-    let third = env.engine.eval("a[2]", "xp3-filter-test").expect("a[2]");
-    assert_eq!(third, tjs::TjsValue::Integer(3));
-
-    let error = env
-        .engine
-        .exec_script("a.xor(0, 1);", "xp3-filter-test")
-        .expect_err("xor with two arguments must raise");
-    assert!(!error.to_string().is_empty());
+    assert_eq!(
+        env.engine
+            .eval("typeof [].xor", "xp3-filter-test")
+            .expect("typeof [].xor"),
+        tjs::TjsValue::String("undefined".into())
+    );
 }

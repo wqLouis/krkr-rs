@@ -499,6 +499,28 @@ fn class_constants_match_the_reference_enumerations() {
     assert_eq!(env.string("kind"), "Integer");
 }
 
+// `clearStorageCache` is a **static** member function
+// (`reference/cpp/plugins/psdfile/psdclass.h:53`) bound with `NCB_METHOD`
+// (`reference/cpp/plugins/psdfile/psdclass.cpp:893`); ncbind derives
+// `TJS_STATICMEMBER` from the method's `void` class type
+// (`reference/cpp/core/plugin/ncbind.hpp:1224-1226`), so the member lives on
+// the class object and `FuncCall` never copies it onto an instance
+// (`reference/cpp/core/tjs2/tjsNative.cpp:347`).
+#[test]
+fn clear_storage_cache_is_a_class_member_only() {
+    let _lock = vm_lock();
+    let env = Env::new();
+
+    assert_eq!(env.eval_ok("PSD.clearStorageCache()"), TjsValue::Void);
+
+    env.run("var psd = new PSD();");
+    let message = env.error("psd.clearStorageCache()");
+    assert!(
+        !message.is_empty(),
+        "a static member is not copied onto an instance"
+    );
+}
+
 // Layer records round-trip through the reference layout: `getLayerInfo`
 // exposes the record fields (`reference/cpp/plugins/psdfile/psdclass.cpp:220-253`),
 // `getLayerName` prefers the `luni` unicode name over the Pascal name

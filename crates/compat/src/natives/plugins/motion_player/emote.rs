@@ -268,7 +268,7 @@ macro_rules! module_const_getter {
 module_const_getter!(module_timeline_parallel, 1);
 module_const_getter!(module_timeline_sequential, 2);
 
-/// Register `Motion.D3DEmoteModule`.
+/// Register the top-level `D3DEmoteModule` class.
 pub(crate) fn register_d3d_emote_module(ctx: &mut CompatCtx) -> Result<(), CompatError> {
     ctx.register_instance(&NativeInstanceBuilder {
         name: "D3DEmoteModule",

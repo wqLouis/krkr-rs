@@ -173,7 +173,8 @@ fn loader_exposes_the_motionplayer_classes() {
         "Motion.Rect",
         "Motion.Quad",
         "Motion.LayerGetter",
-        "Motion.D3DEmoteModule",
+        "D3DEmotePlayer",
+        "D3DEmoteModule",
     ] {
         assert_eq!(
             env.int(&format!("(typeof {name} !== 'undefined')")),

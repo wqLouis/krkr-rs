@@ -704,6 +704,29 @@ fn members_live_on_scripts_only() {
     assert!(!error.is_empty(), "expected an error for a global call");
 }
 
+/// The reference registers no free function for the plugin's internal
+/// null-classification helper — `NCB_ATTACH_CLASS` adds only the four
+/// `Scripts` static members (`reference/cpp/plugins/json/jsonPlugin.cpp:98-103`)
+/// — so the port retains the helper internally and removes the script global
+/// the registration ABI created for it. The global object carries the
+/// function, so its absence is observed through `typeof global.<name>`; a
+/// bare `typeof <name>` is a must-exist read that raises for the same absence
+/// (`reference/cpp/core/tjs2/tjsInterCodeExec.cpp:1899-1904`, pinned by
+/// `crates/compat/tests/typeof_spellings.rs`).
+#[test]
+fn null_helper_is_not_a_global() {
+    let _lock = vm_lock();
+    let env = Env::new();
+
+    assert_eq!(env.string("typeof global.__krkr_json_is_null"), "undefined");
+    // A bare `typeof` is a must-exist read, so it raises for the absent name;
+    // a leaked global would report `"Object"` instead.
+    assert!(
+        !env.error("typeof __krkr_json_is_null").is_empty(),
+        "a bare absent global must raise"
+    );
+}
+
 /// The reference's `saveJSON` always leaves `*result = true`: its `false`
 /// assignment inside the `catch` is dead because
 /// `if(result) *result = true;` runs unconditionally afterwards

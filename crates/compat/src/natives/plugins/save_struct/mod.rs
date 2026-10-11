@@ -61,16 +61,33 @@ use crate::{CompatCtx, CompatError};
 /// Name of the per-engine helper function the serializer is installed under.
 const SERIALIZER_NAME: &str = "__krkr_save_struct_serialize";
 
+/// Name of the per-engine namespace dictionary holding the serializer
+/// helpers.
+const NAMESPACE_NAME: &str = "__krkr_save_struct_ns";
+
+/// Retained id of the serializer namespace.
+///
+/// The namespace is built as the VM compiles the helpers, then retained and
+/// its global binding deleted. The engine's retained map dies with the VM, so
+/// the id is deliberately leaked on the Rust side — dropping the engine
+/// releases the C++ retention.
+#[derive(Default)]
+struct SaveStructState {
+    namespace: Option<tjs::Tjs2ValueId>,
+}
+
 /// The reference `getVariantString` / `getArrayString` / `getDictString`,
 /// expressed as a TJS function `(obj, newline) -> string`.
 ///
 /// `newline` follows the reference's `tTVPStringStream`: `0` selects CRLF and
 /// any non-zero value selects LF. Dictionary entries are separated by `,`
 /// plus that newline; array elements are always comma-separated.
-/// The helpers are installed as **global** functions rather than nested
-/// declarations: the port's TJS2 has no lexical capture for nested functions
-/// (a nested `function` is not visible to its siblings), so mutual recursion
-/// goes through the global scope.
+/// The port's TJS2 has no lexical capture for nested functions, so the
+/// helpers are anonymous function expressions stored in one namespace
+/// object. A member call binds `this` to the namespace, which is how the
+/// recursion reaches the other helpers; [`register`] removes the namespace
+/// global, since the reference exposes no free functions for them
+/// (`reference/cpp/plugins/saveStruct.cpp:310-314,364-367`).
 ///
 /// `__krkr_save_struct_is_array` guards `instanceof` with `try`/`catch`: the
 /// VM raises `TJS_E_NOTIMPL` when `instanceof` is applied to a function (or
@@ -86,7 +103,9 @@ const SERIALIZER_NAME: &str = "__krkr_save_struct_serialize";
 /// filter reproduces that observable output without recursing into the
 /// attached methods.
 const SERIALIZER_SCRIPT: &str = r#"
-function __krkr_save_struct_quote(s) {
+var __krkr_save_struct_ns = %[];
+
+__krkr_save_struct_ns.__krkr_save_struct_quote = function(s) {
     if (s === void || s === null) s = "";
     var r = "";
     var n = s.length;
@@ -103,9 +122,9 @@ function __krkr_save_struct_quote(s) {
         i = i + 1;
     }
     return '"' + r + '"';
-}
+};
 
-function __krkr_save_struct_quote_octet(o) {
+__krkr_save_struct_ns.__krkr_save_struct_quote_octet = function(o) {
     var hex = "0123456789abcdef";
     var r = "<% ";
     var n = o.length;
@@ -116,44 +135,44 @@ function __krkr_save_struct_quote_octet(o) {
         i = i + 1;
     }
     return r + "%>";
-}
+};
 
-function __krkr_save_struct_is_array(v) {
+__krkr_save_struct_ns.__krkr_save_struct_is_array = function(v) {
     try {
         return v instanceof "Array";
     } catch (e) {
         return false;
     }
-}
+};
 
-function __krkr_save_struct_variant(v, nl) {
+__krkr_save_struct_ns.__krkr_save_struct_variant = function(v, nl) {
     var t = typeof v;
     if (t == "Void") return "void";
     if (t == "Integer") return "int " + v;
     if (t == "Real") return "real " + v;
-    if (t == "String") return __krkr_save_struct_quote(v);
-    if (t == "Octet") return __krkr_save_struct_quote_octet(v);
+    if (t == "String") return this.__krkr_save_struct_quote(v);
+    if (t == "Octet") return this.__krkr_save_struct_quote_octet(v);
     if (t == "Object") {
         if (v === null) return "nullptr";
-        if (__krkr_save_struct_is_array(v)) return __krkr_save_struct_arr(v, nl);
-        return __krkr_save_struct_dict(v, nl);
+        if (this.__krkr_save_struct_is_array(v)) return this.__krkr_save_struct_arr(v, nl);
+        return this.__krkr_save_struct_dict(v, nl);
     }
     return "void";
-}
+};
 
-function __krkr_save_struct_arr(a, nl) {
+__krkr_save_struct_ns.__krkr_save_struct_arr = function(a, nl) {
     var r = "[";
     var count = a.count;
     var i = 0;
     while (i < count) {
         if (i != 0) r = r + ",";
-        r = r + __krkr_save_struct_variant(a[i], nl);
+        r = r + this.__krkr_save_struct_variant(a[i], nl);
         i = i + 1;
     }
     return r + "]";
-}
+};
 
-function __krkr_save_struct_dict(d, nl) {
+__krkr_save_struct_ns.__krkr_save_struct_dict = function(d, nl) {
     var NL = (nl != 0) ? "\n" : "\r\n";
     var classpairs = [];
     classpairs.assign(%[]);
@@ -173,16 +192,16 @@ function __krkr_save_struct_dict(d, nl) {
         if (!isclass) {
             if (!first) r = r + "," + NL;
             first = false;
-            r = r + __krkr_save_struct_quote(key) + "=>" + __krkr_save_struct_variant(pairs[i + 1], nl);
+            r = r + this.__krkr_save_struct_quote(key) + "=>" + this.__krkr_save_struct_variant(pairs[i + 1], nl);
         }
         i = i + 2;
     }
     return r + "]";
-}
+};
 
-function __krkr_save_struct_serialize(obj, nl) {
-    return __krkr_save_struct_variant(obj, nl);
-}
+__krkr_save_struct_ns.__krkr_save_struct_serialize = function(obj, nl) {
+    return this.__krkr_save_struct_variant(obj, nl);
+};
 "#;
 
 // ---------------------------------------------------------------------------
@@ -202,21 +221,21 @@ fn serialize_object(
     let Some(resolved) = resolve(engine) else {
         return Err("compat context is not bound".to_string());
     };
+    let ctx = resolved.ctx();
+    // SAFETY: `resolved` is only produced for the installed, live binding.
+    let services = unsafe { ctx.services() };
+    let namespace = {
+        let state = services.state::<SaveStructState>();
+        state.namespace
+    }
+    .ok_or_else(|| "saveStruct: the serializer is not installed".to_string())?;
     let host = resolved.engine();
     let object = host
         .retain_object_detached(objthis)
         .map_err(|error| error.to_string())?;
-    let function = match host
-        .eval_retained(SERIALIZER_NAME, "saveStruct")
-        .map_err(|error| error.to_string())?
-    {
-        RetainedValue::Object(function) => function,
-        RetainedValue::Value(value) => {
-            return Err(format!("serializer is not callable: {value:?}"));
-        }
-    };
-    let result = host.call_detached(
-        &function,
+    let result = host.call_member(
+        namespace,
+        SERIALIZER_NAME,
         &[
             TjsValue::Retained(object.raw_id() as u64),
             TjsValue::Integer(newline),
@@ -489,15 +508,64 @@ extern "C" fn dict_to_struct_string(
 
 /// Register the plugin's native surface on the VM.
 pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
-    // Install the serializer helper once per engine. It is a plain global
-    // function so the callbacks can resolve it by name; no native payload or
-    // process-global state is involved.
+    // Install the serializer helpers once per engine. The VM has no lexical
+    // capture, so the helpers are defined as globals, collected into one
+    // namespace dictionary, and the globals are removed: the reference
+    // exposes no free functions for them
+    // (`reference/cpp/plugins/saveStruct.cpp:310-314,364-367`).
     // SAFETY: `ctx` is only created for a bound, live engine.
-    unsafe { ctx.engine() }
+    let engine = unsafe { ctx.engine() };
+    engine
         .exec_script(SERIALIZER_SCRIPT, "saveStruct")
         .map_err(|error| {
             CompatError::Register(format!("saveStruct: could not install serializer: {error}"))
         })?;
+    let namespace = match engine.eval_retained(NAMESPACE_NAME, "saveStruct") {
+        Ok(RetainedValue::Object(object)) => {
+            let id = object.raw_id();
+            // The engine owns the C++ retention and frees it at destruction.
+            std::mem::forget(object);
+            id
+        }
+        Ok(RetainedValue::Value(value)) => {
+            return Err(CompatError::Register(format!(
+                "saveStruct: the serializer namespace is not an object ({value:?})"
+            )));
+        }
+        Err(error) => {
+            return Err(CompatError::Register(format!(
+                "saveStruct: could not resolve the serializer namespace: {error}"
+            )));
+        }
+    };
+    let global = match engine.eval_retained("global", "saveStruct") {
+        Ok(RetainedValue::Object(object)) => object,
+        Ok(RetainedValue::Value(value)) => {
+            return Err(CompatError::Register(format!(
+                "saveStruct: the global object is not an object ({value:?})"
+            )));
+        }
+        Err(error) => {
+            return Err(CompatError::Register(format!(
+                "saveStruct: could not resolve the global object: {error}"
+            )));
+        }
+    };
+    // Remove the namespace global the serializer script created. Its
+    // functions are namespace members, so retaining the namespace keeps them
+    // alive and the reference exposes no free functions
+    // (`reference/cpp/plugins/saveStruct.cpp:310-314,364-367`).
+    engine
+        .delete_member(global.raw_id(), NAMESPACE_NAME)
+        .map_err(|error| {
+            CompatError::Register(format!(
+                "saveStruct: could not remove the helper namespace: {error}"
+            ))
+        })?;
+    // SAFETY: `ctx` is only created for a bound, live engine.
+    unsafe { ctx.services() }
+        .state::<SaveStructState>()
+        .namespace = Some(namespace);
 
     ctx.register_instance_members(&NativeInstanceMembers {
         class_name: "Array",

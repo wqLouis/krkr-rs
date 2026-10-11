@@ -75,7 +75,12 @@ use crate::{CompatCtx, CompatError, CompatServices};
 /// `TjsValue::Object`, so the serializer asks the VM directly.
 const NULL_HELPER_NAME: &str = "__krkr_json_is_null";
 
-/// Global TJS helper installed once per engine.
+/// TJS helper installed once per engine.
+///
+/// The ABI installs every plugin helper as a global, but the reference
+/// registers no free function here (`reference/cpp/plugins/json/jsonPlugin.cpp:98-103`
+/// attaches only the four `Scripts` members), so [`register`] installs this
+/// function, retains it, and removes the global binding.
 const NULL_HELPER_SOURCE: &str = "function __krkr_json_is_null(v) { return v === null; }";
 
 // ---------------------------------------------------------------------------
@@ -84,9 +89,10 @@ const NULL_HELPER_SOURCE: &str = "function __krkr_json_is_null(v) { return v ===
 
 /// Retained id of [`NULL_HELPER_NAME`].
 ///
-/// The helper is retained on the engine for the VM's lifetime (the engine's
-/// retained map dies with it), so the id is deliberately leaked on the Rust
-/// side — dropping the engine releases the C++ retention.
+/// The helper is defined as a script global so the VM compiles it, then
+/// retained and its global binding deleted. The engine's retained map dies
+/// with the VM, so the id is deliberately leaked on the Rust side — dropping
+/// the engine releases the C++ retention.
 #[derive(Default)]
 struct JsonState {
     null_helper: Option<tjs::Tjs2ValueId>,
@@ -1077,9 +1083,10 @@ extern "C" fn native_to_json_string(
 
 /// Register the plugin's native surface on the VM.
 pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
-    // Install the null-classification helper once per engine. It is a plain
-    // global function so the writer can resolve it by name; the retained id
-    // is cached in the per-engine services state.
+    // Install the null-classification helper once per engine. It is defined
+    // as a script global so the VM compiles it, then retained and its global
+    // binding removed: the reference exposes no free function for it
+    // (`reference/cpp/plugins/json/jsonPlugin.cpp:98-103`).
     // SAFETY: `ctx` is only created for a bound, live engine.
     let engine = unsafe { ctx.engine() };
     engine
@@ -1104,6 +1111,26 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
             )));
         }
     };
+    let global = match engine.eval_retained("global", "json") {
+        Ok(RetainedValue::Object(object)) => object,
+        Ok(RetainedValue::Value(value)) => {
+            return Err(CompatError::Register(format!(
+                "json: the global object is not an object ({value:?})"
+            )));
+        }
+        Err(error) => {
+            return Err(CompatError::Register(format!(
+                "json: could not resolve the global object: {error}"
+            )));
+        }
+    };
+    engine
+        .delete_member(global.raw_id(), NULL_HELPER_NAME)
+        .map_err(|error| {
+            CompatError::Register(format!(
+                "json: could not remove the null helper global: {error}"
+            ))
+        })?;
     // SAFETY: `ctx` is only created for a bound, live engine.
     unsafe { ctx.services() }.state::<JsonState>().null_helper = Some(helper);
 

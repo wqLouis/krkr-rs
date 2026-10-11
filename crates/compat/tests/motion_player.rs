@@ -137,8 +137,6 @@ fn motion_namespace_registers_constants_and_subclasses() {
     for name in [
         "Player",
         "EmotePlayer",
-        "D3DEmotePlayer",
-        "D3DEmoteModule",
         "ResourceManager",
         "SeparateLayerAdaptor",
         "D3DAdaptor",
@@ -157,9 +155,16 @@ fn motion_namespace_registers_constants_and_subclasses() {
         );
     }
     assert_ne!(env.eval_str("typeof Player"), "undefined");
+    // The post-registration callback installs an empty object as a static
+    // `Player.useD3D` member, so the class-level probe reads `"Object"`
+    // (`reference/cpp/plugins/motionplayer/main.cpp:498-509`).
+    assert_eq!(env.eval_str("typeof Motion.Player.useD3D"), "Object");
     // `D3DEmoteModule` and `D3DEmotePlayer` are top-level classes of the
-    // emoteplayer module (`reference/cpp/plugins/motionplayer/main.cpp:565`,
-    // `:588`).
+    // emoteplayer module, not `NCB_SUBCLASS` members of `Motion`
+    // (`reference/cpp/plugins/motionplayer/main.cpp:565,588`; the nested-only
+    // list is `main.cpp:430-441`).
+    assert_eq!(env.eval_str("typeof Motion.D3DEmotePlayer"), "undefined");
+    assert_eq!(env.eval_str("typeof Motion.D3DEmoteModule"), "undefined");
     assert_ne!(env.eval_str("typeof D3DEmoteModule"), "undefined");
     assert_ne!(env.eval_str("typeof D3DEmotePlayer"), "undefined");
 }
@@ -400,7 +405,7 @@ fn derived_players_construct_through_their_class_name_member() {
         "class MyEmote extends Motion.EmotePlayer { \
              function MyEmote(rm) { super.EmotePlayer(rm); } \
          } \
-         class MyD3D extends Motion.D3DEmotePlayer { \
+         class MyD3D extends D3DEmotePlayer { \
              function MyD3D(rm) { super.D3DEmotePlayer(rm); } \
          } \
          var rm = new Motion.ResourceManager(null, 1024); \
