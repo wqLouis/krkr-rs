@@ -174,8 +174,8 @@ operate directly on `BitmapState.rgba`:
 * tone (`do_gray_scale`, `adjust_gamma`, `light_contrast`),
 * alpha/add-alpha conversion, flips, 9-patch,
 * vector raster (`raster.rs`) for `GdiPlus.Appearance` draws,
-* primary-layer screen-buffer composite (`composite_primary_layer`) used for
-  script read-back (`piledCopy`, `saveLayerImage`).
+* primary-layer screen-buffer composite (`composite_primary_layer`, since
+  removed: a screenshot is the reference `Complete` subtree composite).
 
 Masks/faces: `face = dfMain/dfMask/dfProvince/dfOpaque/dfAddAlpha` and
 `holdAlpha`; province plane in `scene.rs`. Transitions are currently a

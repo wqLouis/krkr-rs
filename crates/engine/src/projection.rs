@@ -21,8 +21,8 @@
 //! * [`resolve_blend`] passes the layer's generic [`BlendMode`] through to
 //!   the render node (downgrading an opaque `Replace` below full opacity).
 //!
-//! Screen-buffer primary layers, hidden/empty layers and layers whose texture
-//! is missing are skipped, matching `sync_scene`.
+//! Hidden/empty layers and layers whose texture is missing are skipped,
+//! matching `sync_scene`.
 
 use std::collections::{HashMap, HashSet};
 
@@ -281,20 +281,6 @@ pub(crate) fn visible_image_region(
     Some((PixelRegion::new(sx, sy, sw, sh), dest))
 }
 
-/// Whether `layer_id`'s bitmap is a synthesized **screen buffer** (a window
-/// primary layer's composited `MainImage`) rather than drawable content.
-///
-/// The reference composites the layer tree into the primary layer's
-/// `MainImage` and scripts read it back (`piledCopy`, `saveLayerImage`), so
-/// drawing it would blit the snapshot captured when the script last read it.
-fn is_screen_buffer_layer(scene: &Scene, layer_id: u32) -> bool {
-    scene
-        .layer(layer_id)
-        .and_then(|layer| layer.bitmap)
-        .and_then(|bitmap| scene.bitmap(bitmap))
-        .is_some_and(|bitmap| bitmap.screen_buffer)
-}
-
 /// Clamp a `u32` pixel dimension to a non-negative `i32` (a plain `as i32`
 /// would wrap for sizes above `i32::MAX`).
 fn dim_i32(v: u32) -> i32 {
@@ -354,8 +340,7 @@ fn append_window<F>(
 
     // Why layers produced no node — a scene that renders almost nothing is
     // invisible from the outside (`RUST_LOG=debug` reports it).
-    let (mut drawn, mut screen_buffer, mut hidden, mut empty, mut clipped) =
-        (0usize, 0usize, 0usize, 0usize, 0usize);
+    let (mut drawn, mut hidden, mut empty, mut clipped) = (0usize, 0usize, 0usize, 0usize);
 
     for layer_id in scene.window_layer_order(window) {
         let Some(layer) = scene.layer(layer_id) else {
@@ -411,10 +396,6 @@ fn append_window<F>(
         // means "skipped": the layer still passes `parent_node` on to its
         // children through `nearest` below.
         let node = 'layer: {
-            if is_screen_buffer_layer(scene, layer_id) {
-                screen_buffer += 1;
-                break 'layer None;
-            }
             if !node_composed.visible {
                 hidden += 1;
                 break 'layer None;
@@ -536,7 +517,7 @@ fn append_window<F>(
     }
 
     log::debug!(
-        "projection: window {window}: drew {drawn} layer(s); skipped screen_buffer={screen_buffer} \
+        "projection: window {window}: drew {drawn} layer(s); skipped \
          hidden={hidden} empty={empty} clipped={clipped} of {}",
         scene.window_layer_order(window).len()
     );

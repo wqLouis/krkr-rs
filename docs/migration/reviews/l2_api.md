@@ -170,7 +170,7 @@ the attribute would break).
 |---|---|---|
 | `WindowState` scene.rs:21-36 | `id,title,inner_size,visible,opacity,primary_layer,focused_layer,layers` | **yes**, all: `visual.rs:925,998,1271,1295,1320,1346,1369,1394,1417,1442,1548,1578,1646,1869,3307`, `system.rs:412` |
 | `LayerState` scene.rs:58-182 | `id,window,parent,children,bitmap,rect,visible,opacity,blend_type,z_order,fill_color,image_left,image_top,image_width,image_height,province,province_width,province_height,hit_threshold,hit_type,cursor,face,clip,hold_alpha,focusable,join_focus_chain,focus_work,enabled,name,attention_left,attention_top,use_attention,cached,hint,show_parent_hint,ignore_hint_sensing,ime_mode,neutral_color,absolute_order_mode,call_on_paint,image_modified,font_id,is_primary,pending_paint,shutdown` | **yes**, ~35 of them via the property macro `visual.rs:2692-2906` + setters `visual.rs:675-684,701-703,881,2039-2040,2127-2131,2272-2274,2399,2435,2602,3060` |
-| `BitmapState` scene.rs:189-213 | `id,width,height,rgba,name,dirty,screen_buffer,script_owned` | **yes**: `rgba` `visual.rs:2214,2225,2264,2593,3869,3886-3889,3912-3916,3985,3994,4157,4188`; `dirty` `:2226`; `script_owned` `:3727`; `width/height` `:2214`; app `lib.rs:415` |
+| `BitmapState` scene.rs:189-213 | `id,width,height,rgba,name,dirty,script_owned` | **yes**: `rgba` `visual.rs:2214,2225,2264,2593,3869,3886-3889,3912-3916,3985,3994,4157,4188`; `dirty` `:2226`; `script_owned` `:3727`; `width/height` `:2214`; app `lib.rs:415` |
 | `FontState` scene.rs:234-251 | `id,face,height,color,bold,italic,strikeout,underline,angle` | **yes**: `visual.rs:3653,3661,4448-4490,4510-4526` |
 | `Rect` scene.rs:258-264 | `x,y,w,h` | **yes** literal `visual.rs:2435`; app `common/mod.rs:23,38` |
 | `Scene` scene.rs:272-279 | `windows,layers,bitmaps,fonts` (plus private `next_*, *_index, revision`) | **yes**: `scene.windows` `visual.rs:1548,1868`, `system.rs:410`; `scene.fonts` `visual.rs:3660,4274,4352`; app `scene.bitmaps` `lib.rs:415`, `scene.layers` `tests/host.rs:81,87` |
@@ -629,10 +629,9 @@ and option storage at `visual.rs:162,263`).
 ### F-17a — Privatize fields L3 never touches — **Medium**, zero breakage
 
 **Where**: `LayerState::{province_width (scene.rs:100), province_height (102),
-focus_work (133), shutdown (182), is_primary (169)}`,
-`BitmapState::screen_buffer (scene.rs:207)`.
+focus_work (133), shutdown (182), is_primary (169)}`.
 
-**Problem**: §5.1 wants state fields accessor-backed. These six are only read by
+**Problem**: §5.1 wants state fields accessor-backed. These five are only read by
 `engine` internals; L3 checks `l.province.is_some()` (visual.rs:639) and calls
 `Scene::is_primary_layer` (scene.rs:498) instead.
 

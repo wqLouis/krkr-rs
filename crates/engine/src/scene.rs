@@ -233,14 +233,6 @@ pub struct BitmapState {
     pub name: Option<String>,
     /// Set when contents changed; the L1 pipeline re-uploads on true.
     pub dirty: bool,
-    /// True when this bitmap is a window primary layer's **screen buffer**
-    /// (synthesized by `composite_primary_layer` / `ensure_primary_bitmap`).
-    /// The reference composites the layer tree into the primary layer's
-    /// MainImage and scripts read it back (`piledCopy(0, 0,
-    /// window.primaryLayer, …)`, `saveLayerImage`); it is never content to
-    /// blit. Drawing it would replay the snapshot captured when the script
-    /// last read it and leave stale imagery on screen.
-    pub screen_buffer: bool,
     /// True when a script `Bitmap` object owns this id (created through the
     /// `Bitmap` natives). A layer's MainImage can reference such a bitmap, so
     /// destroying the layer must not free it while the script object can
@@ -265,7 +257,6 @@ impl BitmapState {
             rgba,
             name: None,
             dirty: false,
-            screen_buffer: false,
             script_owned: false,
             content_generation: 0,
         }
@@ -1464,7 +1455,6 @@ impl Scene {
             rgba,
             name: None,
             dirty: true,
-            screen_buffer: false,
             script_owned: false,
             content_generation: 0,
         });

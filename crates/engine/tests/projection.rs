@@ -137,25 +137,13 @@ fn compose_layer_honours_ancestor_invisibility() {
 }
 
 /// Parent is centered at TVP (200, 90); the child is relative to its
-/// parent at origin (112, 48) with its own 20×10 rect. The full-window
-/// primary screen layer is skipped, so the parent/child/sibling get
-/// z = 0/1/2.
+/// parent at origin (112, 48) with its own 20×10 rect. The parent, child
+/// and sibling get z = 0/1/2.
 #[test]
 fn hierarchy_composes_position_opacity_visibility_and_order() {
     let mut scene = Scene::default();
     let win = scene.add_window("t", (640, 480));
     scene.window_mut(win).unwrap().opacity = 0.8;
-    // The window's screen surface: a primary layer with a screen buffer.
-    let screen = scene.add_layer(win, None);
-    {
-        let l = scene.layer_mut(screen).unwrap();
-        l.rect = full_window_rect(640, 480);
-        l.visible = true;
-    }
-    let screen_bmp = scene.add_bitmap(1, 1, vec![0u8; 4]);
-    scene.layer_mut(screen).unwrap().bitmap = Some(screen_bmp);
-    scene.bitmap_mut(screen_bmp).unwrap().screen_buffer = true;
-
     let parent = scene.add_layer(win, None);
     {
         let l = scene.layer_mut(parent).unwrap();
@@ -184,7 +172,7 @@ fn hierarchy_composes_position_opacity_visibility_and_order() {
         Some(null_texture(1, 1))
     });
     let nodes = drawable_nodes(&projected);
-    assert_eq!(nodes.len(), 3, "the screen buffer is not a node");
+    assert_eq!(nodes.len(), 3);
 
     let parent_node = nodes
         .iter()
@@ -296,28 +284,6 @@ fn missing_bitmap_without_fill_draws_nothing() {
 
     let projected = project_window(&scene, win, ViewTransform::IDENTITY, |_| None);
     assert!(drawable_nodes(&projected).is_empty());
-}
-
-#[test]
-fn screen_buffer_primary_layer_is_not_drawn() {
-    let mut scene = Scene::default();
-    let win = scene.add_window("t", (64, 64));
-    let layer = scene.add_layer(win, None);
-    let bmp = scene.add_bitmap(64, 64, vec![0u8; 64 * 64 * 4]);
-    {
-        let l = scene.layer_mut(layer).unwrap();
-        l.bitmap = Some(bmp);
-        l.rect = full_window_rect(64, 64);
-    }
-    scene.bitmap_mut(bmp).unwrap().screen_buffer = true;
-
-    let projected = project_window(&scene, win, ViewTransform::IDENTITY, |_| {
-        Some(null_texture(64, 64))
-    });
-    assert!(
-        drawable_nodes(&projected).is_empty(),
-        "the primary layer's screen buffer must not be drawn"
-    );
 }
 
 #[test]

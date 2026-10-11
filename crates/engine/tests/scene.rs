@@ -351,29 +351,28 @@ fn script_owned_bitmap_survives_layer_destroy() {
     assert!(scene.bitmap(script).is_some(), "script Bitmap survives");
 }
 
-/// The window primary layer's screen buffer survives while its window
-/// lives and is freed when the primary layer is destroyed.
+/// The window primary layer's bitmap survives while its window lives and is
+/// freed when the primary layer is destroyed.
 #[test]
-fn primary_screen_buffer_survives_until_the_layer_is_destroyed() {
+fn primary_layer_bitmap_survives_until_the_layer_is_destroyed() {
     let mut scene = Scene::default();
     let win = scene.add_window("t", (1, 1));
     let primary = scene.add_layer(win, None);
     assert_eq!(scene.window(win).unwrap().primary_layer, Some(primary));
     let content = scene.add_layer(win, Some(primary));
-    let screen = scene.add_bitmap(4, 4, vec![0; 64]);
-    scene.bitmap_mut(screen).unwrap().screen_buffer = true;
-    scene.layer_mut(primary).unwrap().bitmap = Some(screen);
+    let primary_bmp = scene.add_bitmap(4, 4, vec![0; 64]);
+    scene.layer_mut(primary).unwrap().bitmap = Some(primary_bmp);
     let content_bmp = scene.add_bitmap(2, 2, vec![1; 16]);
     scene.layer_mut(content).unwrap().bitmap = Some(content_bmp);
 
-    // A sweep while the window lives must not free the screen buffer.
+    // A sweep while the window lives must not free the primary bitmap.
     assert_eq!(scene.collect_unused_bitmaps(), 0);
-    assert!(scene.bitmap(screen).is_some());
+    assert!(scene.bitmap(primary_bmp).is_some());
 
     scene.destroy_layer(primary);
     assert!(
-        scene.bitmap(screen).is_none(),
-        "screen buffer freed with the primary layer"
+        scene.bitmap(primary_bmp).is_none(),
+        "primary bitmap freed with the primary layer"
     );
     assert!(scene.bitmap(content_bmp).is_none(), "content freed too");
 }

@@ -3,10 +3,9 @@
 //! These lock in the behaviour of the separable running-sum box blur
 //! (`blur_bitmap_in_place`) against the original 2-D summation it replaced.
 
-use api::blend::BlendMode;
 use engine::BitmapState;
 use engine::Scene;
-use engine::layer_ops::{blur_bitmap_in_place, composite_primary_layer, render_layer_subtree};
+use engine::layer_ops::{blur_bitmap_in_place, render_layer_subtree};
 use engine::raster::fill_rect_replace;
 use engine::scene::Rect;
 
@@ -100,42 +99,6 @@ fn fill_rect_replace_still_clips_negative_origin() {
     let mut bmp = bitmap(2, 2, vec![0u8; 16]);
     fill_rect_replace(&mut bmp, -1, -1, 10, 10, [1, 2, 3, 4]);
     assert_eq!(bmp.rgba, [1, 2, 3, 4].repeat(4));
-}
-
-/// The primary composite resolves each layer's generic `BlendMode` to the
-/// right pixel operation (the bridge L3 relies on for `Layer.type`).
-#[test]
-fn primary_composite_honours_the_layer_blend_mode() {
-    let mut scene = Scene::default();
-    let win = scene.add_window("t", (2, 2));
-    let primary = scene.add_layer(win, None);
-    scene.layer_mut(primary).unwrap().rect = Rect::new(0, 0, 2, 2);
-
-    // Opaque grey background.
-    let background = scene.add_layer(win, Some(primary));
-    let background_bitmap = solid_bitmap(&mut scene, 2, 2, [100, 100, 100, 255]);
-    {
-        let l = scene.layer_mut(background).unwrap();
-        l.visible = true;
-        l.rect = Rect::new(0, 0, 2, 2);
-        l.bitmap = Some(background_bitmap);
-    }
-
-    // Multiplicative grey foreground: 100 * 50 / 255 = 19, not the 50 a
-    // source-over composite would produce.
-    let foreground = scene.add_layer(win, Some(primary));
-    let foreground_bitmap = solid_bitmap(&mut scene, 2, 2, [50, 50, 50, 255]);
-    {
-        let l = scene.layer_mut(foreground).unwrap();
-        l.visible = true;
-        l.rect = Rect::new(0, 0, 2, 2);
-        l.bitmap = Some(foreground_bitmap);
-        l.blend = BlendMode::Multiply;
-    }
-
-    let bitmap_id = composite_primary_layer(&mut scene, primary).expect("composite");
-    let rgba = &scene.bitmap(bitmap_id).unwrap().rgba;
-    assert_eq!(&rgba[..4], &[19, 19, 19, 255]);
 }
 
 /// `render_layer_subtree` returns the layer's MainImage for a trivial subtree

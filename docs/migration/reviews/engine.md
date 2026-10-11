@@ -108,7 +108,7 @@ inaccuracies:
 ### 1.8 Oversized modules — Low
 
 `layer_ops.rs` is 2104 lines mixing constant-color fills, tone ops, blits,
-resampling, and window-primary compositing; `scene.rs` is 1549 lines mixing
+and resampling; `scene.rs` is 1549 lines mixing
 the model, tree traversal/sorting and the bitmap cache. Consider splitting
 along those seams (`layer_ops/{blit,tone,resample}.rs`, `scene/{model,tree}.rs`).
 
@@ -211,8 +211,7 @@ asymptotically better. It also removes the `source = bitmap.rgba.clone()`
   per layer.
 - `window_layer_order` (`scene.rs:1393-1444`) rebuilds a `HashMap<Option<u32>,
   Vec<u32>>`, a `Vec`, and a `HashSet` on every call, and is called by
-  `layer_at`, `focusable_neighbor`, `compose`-adjacent paths and
-  `composite_primary_layer`.
+  `layer_at`, `focusable_neighbor`, and the `compose`-adjacent paths.
 
 For a scene of N layers this is O(N) heap allocations per frame. Since the
 projection already walks parent-first, `compose_layer` and
@@ -286,15 +285,13 @@ Correct and cheap; noted only because it is called on every lookup. Fine.
 ### 4.1 Unchecked pixel-coordinate `i32` addition, inconsistently — High
 
 `raster::fill_rect_replace` correctly saturates (`raster.rs:66-72`:
-`x.saturating_add(w)`), and `composite_primary_layer` uses `saturating_*`
-(`layer_ops.rs:2052-2057`) — but the blit/resample/composite paths do not:
+`x.saturating_add(w)`) — but the blit/resample/composite paths do not:
 
 - `layer_ops.rs:468-469` `dx + (src_rect.2 - src_rect.0)` in `blit_copy_clipped`
 - `layer_ops.rs:519, 584, 609` `dx + sw` in `blit_over`/`blit_plane`
 - `layer_ops.rs:717, 735` `dx + src.width as i32` in `composite_normal`/`composite_hard_light`
 - `layer_ops.rs:835` `left + width as i32` in `fill_operate_rect`
 - `layer_ops.rs:1709` `dx + sw` in `operate_rect`
-- `layer_ops.rs:1999` `draw.dx + (sx1 - sx)` in `draw_primary_solid`
 - `projection.rs:249-252` `img_x + image_width as i32` etc. in `visible_image_region`
 
 Coordinates come from scripts, so these panic in debug and wrap in release
@@ -336,10 +333,7 @@ hostile `.xp3` can OOM the process.
 - `Scene::resize_province_image` (`scene.rs:643`):
   `vec![0u8; w as usize * h as usize]` with no `checked_mul` (sizes come from
   the layer rect / MainImage).
-- `ensure_primary_bitmap` (`layer_ops.rs:1926`):
-  `vec![0; w as usize * h as usize * 4]` from the window's declared logical
-  size.
-Guard both with `checked_mul` and a sane cap, as `media` does.
+Guard it with `checked_mul` and a sane cap, as `media` does.
 
 ### 4.6 Unbounded loop/count from script geometry — Medium
 
@@ -406,13 +400,12 @@ and `layer_ops` indexes `bitmap.rgba` directly. Only `Host::sync_dirty_bitmaps`
 ## 5. Cross-cutting observations
 
 - **Defensive caps are inconsistent between L1 crates.** `media` caps
-  image dimensions/bytes and uses `checked_mul`; `engine`'s XP3/province/
-  primary paths do not. A shared `checked_dims(w, h, bpp)` helper in
+  image dimensions/bytes and uses `checked_mul`; `engine`'s XP3/province
+  paths do not. A shared `checked_dims(w, h, bpp)` helper in
   `api` (or at least duplicated) would align them.
-- **Saturating arithmetic is applied ad hoc.** `fill_rect_replace` and
-  `composite_primary_layer` are careful; the blit/transform paths are not.
-  Pick one policy (saturating everywhere coordinates are derived from scripts)
-  and apply it uniformly.
+- **Saturating arithmetic is applied ad hoc.** `fill_rect_replace` is
+  careful; the blit/transform paths are not. Pick one policy (saturating
+  everywhere coordinates are derived from scripts) and apply it uniformly.
 - **Tests exist for the happy paths** (`engine/tests/{scene,projection,storage,xp3}.rs`,
   `app/tests/host.rs`) but none exercise negative coordinates, huge extents,
   malformed XP3 sizes, or the overflow cases above. Adding those would lock in
@@ -444,8 +437,7 @@ and `layer_ops` indexes `bitmap.rgba` directly. Only `Host::sync_dirty_bitmaps`
    (`fs`, `render`) and document `flate2`. *(High, design)*
 7. **Use `u64` accumulators in `blur_bitmap_in_place` and `sample_area`**
    (`layer_ops.rs:957,962,1083`) and `checked_mul`+cap for
-   `resize_province_image`/`ensure_primary_bitmap`
-   (`scene.rs:643`, `layer_ops.rs:1926`). *(Medium, correctness)*
+   `resize_province_image` (`scene.rs:643`). *(Medium, correctness)*
 8. **Bound `flatten_arc` steps and polygon bounds** (`raster.rs:297,107-152`)
    to prevent huge allocations/loops from script input. *(Medium, DoS)*
 9. **Restore typed FS errors through `FileReader`** (`archive/xp3.rs:444-464`)
