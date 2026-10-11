@@ -48,7 +48,6 @@ pub(crate) struct ModuleSettings {
     pub(crate) alpha_op: i64,
     pub(crate) protect_translucent: bool,
     pub(crate) pixelate_division: i64,
-    pub(crate) max_texture_size: i64,
 }
 
 impl Default for ModuleSettings {
@@ -60,7 +59,6 @@ impl Default for ModuleSettings {
             alpha_op: 0,
             protect_translucent: false,
             pixelate_division: 1,
-            max_texture_size: 0,
         }
     }
 }
@@ -101,7 +99,7 @@ extern "C" fn module_ctor(
 }
 
 /// Integer-backed class-level setting (`maskMode`, `pixelateDivision`,
-/// `alphaOp`, `maxTextureSize`).
+/// `alphaOp`).
 macro_rules! module_int_member {
     ($get:ident, $set:ident, $field:ident) => {
         extern "C" fn $get(
@@ -206,9 +204,7 @@ module_int_member!(module_get_pixelate, module_set_pixelate, pixelate_division);
 /// `setMaxTextureSize(w, h)` — a static two-argument stub in the reference
 /// (`reference/cpp/plugins/motionplayer/D3DEmoteModule.h:37-40`, registered
 /// with `NCB_METHOD` at `main.cpp:585`), so calls with fewer than two
-/// arguments fail the ncbind arity gate (`ncbind.hpp:1178`). The port keeps
-/// the first argument readable through its (port-only) `maxTextureSize`
-/// getter.
+/// arguments fail the ncbind arity gate (`ncbind.hpp:1178`).
 extern "C" fn module_set_max_texture(
     engine: *mut c_void,
     _instance: *mut c_void,
@@ -218,37 +214,17 @@ extern "C" fn module_set_max_texture(
     out_error: *mut *mut std::ffi::c_char,
     _objthis: *mut c_void,
 ) -> std::os::raw::c_int {
-    let Some(res) = resolve(engine) else {
+    if resolve(engine).is_none() {
         return report_error(out_error, super::helpers::NO_BINDING);
-    };
+    }
     // SAFETY: the trampoline guarantees `argc` valid entries.
     let arguments = unsafe { args(argv, argc) };
     if arguments.len() < 2 {
         return report_error(out_error, "setMaxTextureSize: bad parameter count");
     }
-    let width = value_as_i64(&arguments[0]);
-    let ctx = res.ctx();
-    // SAFETY: the caller resolved `ctx` from the installed binding.
-    let mut store = unsafe { ctx.services() }.state::<MotionStore>();
-    store.module.max_texture_size = width;
+    // The reference stub stores nothing
+    // (`reference/cpp/plugins/motionplayer/D3DEmoteModule.h:37-40`).
     set_void(out);
-    0
-}
-
-extern "C" fn module_get_max_texture(
-    engine: *mut c_void,
-    _instance: *mut c_void,
-    out: *mut Value,
-    out_error: *mut *mut std::ffi::c_char,
-    _objthis: *mut c_void,
-) -> std::os::raw::c_int {
-    let Some(res) = resolve(engine) else {
-        return report_error(out_error, super::helpers::NO_BINDING);
-    };
-    let ctx = res.ctx();
-    // SAFETY: the caller resolved `ctx` from the installed binding.
-    let settings = unsafe { ctx.services() }.state::<MotionStore>().module;
-    set_int(out, settings.max_texture_size);
     0
 }
 
@@ -315,11 +291,6 @@ pub(crate) fn register_d3d_emote_module(ctx: &mut CompatCtx) -> Result<(), Compa
                 name: "pixelateDivision",
                 get: Some(module_get_pixelate),
                 set: Some(module_set_pixelate),
-            },
-            NativeInstancePropertyDef {
-                name: "maxTextureSize",
-                get: Some(module_get_max_texture),
-                set: None,
             },
         ],
     })?;

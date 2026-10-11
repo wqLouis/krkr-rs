@@ -371,15 +371,21 @@ fn window_flags_are_per_window_object() {
     let env = Env::new();
     env.run(
         "var a = new Window(); var b = new Window(); \
-         a.disableResize = 1; a.disableMove = 1; a.enableNCMouseEvent = 1;",
+         a.disableResize = 1; a.enableNCMouseEvent = 1;",
     );
     assert_eq!(env.eval_int("a.disableResize"), 1);
-    assert_eq!(env.eval_int("a.disableMove"), 1);
     assert_eq!(env.eval_int("a.enableNCMouseEvent"), 1);
     // The second window keeps its own defaults.
     assert_eq!(env.eval_int("b.disableResize"), 0);
-    assert_eq!(env.eval_int("b.disableMove"), 0);
     assert_eq!(env.eval_int("b.enableNCMouseEvent"), 0);
+    // The `disableMove` `RawCallback` is commented out
+    // (`reference/cpp/plugins/windowEx.cpp:976-977`), so no window exposes
+    // it.
+    assert_eq!(
+        env.eval_int("typeof a.disableMove == 'undefined'"),
+        1,
+        "Window.disableMove must not be registered"
+    );
 }
 
 /// Reference: the native instance lives exactly as long as its script object
@@ -460,7 +466,6 @@ fn window_flag_writes_coerce_like_variant_as_integer() {
         env.assign_then("w.disableResize = 0;", "w.disableResize"),
         0
     );
-    assert_eq!(env.assign_then("w.disableMove = 1;", "w.disableMove"), 1);
     assert_eq!(
         env.assign_then("w.enableNCMouseEvent = 1;", "w.enableNCMouseEvent"),
         1
@@ -477,10 +482,7 @@ fn window_flag_writes_coerce_like_variant_as_integer() {
 /// (`reference/cpp/core/tjs2/tjsVariant.h:562-571`). The setter stores
 /// `p[0]->AsObject()` (`windowEx.cpp:547-560`): objects and `null` are
 /// accepted (`tjsVariant.h:682-691` keeps `tvtObject` null), while scalars
-/// raise the variant conversion error. `resetExSystemMenu` is a no-op in the
-/// vendored reference (`windowEx.cpp:562-565` — and its registration is
-/// commented out at `windowEx.cpp:981`), so it must not clear the stored
-/// menu.
+/// raise the variant conversion error.
 #[test]
 fn ex_system_menu_object_lifecycle() {
     let _lock = vm_lock();
@@ -491,8 +493,6 @@ fn ex_system_menu_object_lifecycle() {
          var fresh = (w.exSystemMenu === null); \
          w.exSystemMenu = menu; \
          var held = w.exSystemMenu.cmd; \
-         w.resetExSystemMenu(); \
-         var afterReset = w.exSystemMenu.cmd; \
          w.exSystemMenu = null; \
          var cleared = (w.exSystemMenu === null); \
          var menu2 = %[ \"cmd\" => 9 ]; \
@@ -501,11 +501,6 @@ fn ex_system_menu_object_lifecycle() {
     );
     assert_eq!(env.eval_int("fresh"), 1, "unset reads back as null");
     assert_eq!(env.eval_int("held"), 7);
-    assert_eq!(
-        env.eval_int("afterReset"),
-        7,
-        "resetExSystemMenu is a no-op in the reference"
-    );
     assert_eq!(env.eval_int("cleared"), 1, "assignment of null clears");
     assert_eq!(env.eval_int("replaced"), 9, "reassignment replaces");
     // A scalar write raises the variant conversion error.
@@ -581,14 +576,15 @@ fn register_ex_event_reaches_the_object_and_script_overrides_win() {
     assert_eq!(env.eval_ok("w.registerExEvent()"), TjsValue::Void);
 }
 
-/// Reference: the `on*` handler names are the `EXEV_*` macros
-/// (`reference/cpp/plugins/windowEx.cpp:316-340`); in this build the native
-/// dispatcher (`regist(bool)` at `windowEx.cpp:689-691`) never fires them,
-/// and a script-assigned handler is found before anything the class
-/// provides (`reference/cpp/core/tjs2/tjsObject.cpp:1214-1225`), so calling
-/// one through the object reaches the script function.
+/// Reference: the handler names are the `EXEV_*` macros
+/// (`reference/cpp/plugins/windowEx.cpp:316-340`), but the reference
+/// registers none of them as class members; it looks a handler up on the
+/// script object when it needs to fire one (`windowEx.cpp:658-663`
+/// `hasMember`, `:730-735` `FuncCall`). A plain window must therefore have
+/// no such member, and a script-assigned handler is an ordinary object
+/// member (`reference/cpp/core/tjs2/tjsObject.cpp:1214-1225`).
 #[test]
-fn ex_event_handlers_reach_the_script_override() {
+fn ex_event_handlers_are_script_only() {
     let _lock = vm_lock();
     let env = Env::new();
     env.run("var w = new Window();");
@@ -619,9 +615,15 @@ fn ex_event_handlers_reach_the_script_override() {
         "onNonCapMouseEvent",
         "onWindowsMessageHook",
     ] {
-        env.run(&format!("w.{handler}();"));
+        // `windowEx.cpp:316-340` names the events but registers none of
+        // them; the port must not expose inert handlers either.
+        assert_eq!(
+            env.eval_int(&format!("typeof w.{handler} == 'undefined'")),
+            1,
+            "Window.{handler} must not be registered"
+        );
     }
-    // A script override shadows the native no-op *through the object*.
+    // A script override is found through the object.
     env.run(
         "var hits = 0; w.onNcMouseMove = function(x, y) { hits = x + y; }; w.onNcMouseMove(2, 3);",
     );
@@ -670,12 +672,9 @@ fn window_static_hit_test_constants_match_the_reference() {
     }
 }
 
-/// Reference: the full `Window` attachment block — every `RawCallback`,
-/// `Method` and property name the plugin adds to `Window`
-/// (`reference/cpp/plugins/windowEx.cpp:934-994`), plus the locked surface
-/// members `disableMove`/`resetExSystemMenu` whose registrations are
-/// commented out in the vendored file but whose bodies exist
-/// (`windowEx.cpp:510-529,562-565`).
+/// Reference: every `RawCallback`, `Method` and property name the plugin
+/// adds to `Window` (`reference/cpp/plugins/windowEx.cpp:934-994`) is
+/// registered and callable.
 #[test]
 fn every_window_instance_method_is_registered() {
     let _lock = vm_lock();
@@ -686,10 +685,23 @@ fn every_window_instance_method_is_registered() {
          w.minimize(); w.maximize(); w.showRestore(); w.focusMenuByKey(0); \
          w.resetWindowIcon(); w.setWindowIcon(''); \
          w.getWindowRect(); w.getClientRect(); w.getNormalRect(); \
-         w.setOverlayBitmap(l); w.resetExSystemMenu(); w.ncHitTest(0, 0); \
+         w.setOverlayBitmap(l); w.ncHitTest(0, 0); \
          w.setMessageHook(1, 'WM_MOUSEMOVE'); w.setMessageHook(0); \
          w.bringTo(); w.sendToBack(); w.registerExEvent(); \
          w.getNotificationNum('WM_MOUSEMOVE'); w.getNotificationName(512);",
+    );
+    // `disableMove` and `resetExSystemMenu` have their `RawCallback`s
+    // commented out (`reference/cpp/plugins/windowEx.cpp:976-977,981-982`),
+    // so the reference registers neither.
+    assert_eq!(
+        env.eval_int("typeof w.disableMove == 'undefined'"),
+        1,
+        "disableMove must not be registered"
+    );
+    assert_eq!(
+        env.eval_int("typeof w.resetExSystemMenu == 'undefined'"),
+        1,
+        "resetExSystemMenu must not be registered"
     );
 }
 

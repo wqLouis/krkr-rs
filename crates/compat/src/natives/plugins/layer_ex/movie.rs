@@ -495,29 +495,6 @@ extern "C" fn layer_is_playing_movie(
     0
 }
 
-/// The no-op callback methods (a script override wins). The reference reads
-/// the script members directly; registering defaults keeps the members always
-/// present on every `Layer`.
-macro_rules! noop_callback {
-    ($name:ident) => {
-        extern "C" fn $name(
-            _engine: *mut c_void,
-            _objthis: *mut c_void,
-            _argc: c_int,
-            _argv: *const Value,
-            out: *mut Value,
-            _out_error: *mut *mut c_char,
-        ) -> c_int {
-            set_void(out);
-            0
-        }
-    };
-}
-
-noop_callback!(layer_on_start_movie);
-noop_callback!(layer_on_stop_movie);
-noop_callback!(layer_on_update_movie);
-
 /// The `Layer`-instance method definitions.
 pub(super) fn layer_method_defs() -> Vec<NativeObjThisMethodDef> {
     vec![
@@ -536,18 +513,6 @@ pub(super) fn layer_method_defs() -> Vec<NativeObjThisMethodDef> {
         NativeObjThisMethodDef {
             name: "isPlayingMovie",
             f: layer_is_playing_movie,
-        },
-        NativeObjThisMethodDef {
-            name: "onStartMovie",
-            f: layer_on_start_movie,
-        },
-        NativeObjThisMethodDef {
-            name: "onStopMovie",
-            f: layer_on_stop_movie,
-        },
-        NativeObjThisMethodDef {
-            name: "onUpdateMovie",
-            f: layer_on_update_movie,
         },
     ]
 }

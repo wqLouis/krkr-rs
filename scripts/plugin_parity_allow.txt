@@ -5,7 +5,3 @@
 #   python3 scripts/plugin_parity.py --update-allow
 # The checker fails when a missing entry is not listed here.
 
-GdiPlus.Image
-GdiPlus.Matrix
-GdiPlus.addPrivateFont
-GdiPlus.getFontList

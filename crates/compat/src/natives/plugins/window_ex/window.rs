@@ -45,15 +45,10 @@ pub(crate) struct WindowExState {
 #[derive(Default)]
 struct WindowFlags {
     disable_resize: bool,
-    disable_move: bool,
     enable_nc_mouse_event: bool,
     message_hook_all: bool,
     sys_menu: Option<DetachedValue>,
     overlay: Option<DetachedValue>,
-    has_resizing: bool,
-    has_moving: bool,
-    has_move: bool,
-    has_nc_ms_move: bool,
 }
 
 /// Borrow the flags that belong to `objthis`, syncing the per-object
@@ -296,38 +291,6 @@ extern "C" fn window_disable_resize_set(
     )
 }
 
-extern "C" fn window_disable_move_get(
-    engine: *mut c_void,
-    objthis: *mut c_void,
-    out: *mut Value,
-    out_error: *mut *mut c_char,
-) -> c_int {
-    window_bool_get(
-        engine,
-        objthis,
-        out,
-        out_error,
-        "Window.disableMove",
-        |flags| flags.disable_move,
-    )
-}
-
-extern "C" fn window_disable_move_set(
-    engine: *mut c_void,
-    objthis: *mut c_void,
-    value: *const Value,
-    out_error: *mut *mut c_char,
-) -> c_int {
-    window_bool_set(
-        engine,
-        objthis,
-        value,
-        out_error,
-        "Window.disableMove",
-        |flags, enabled| flags.disable_move = enabled,
-    )
-}
-
 extern "C" fn window_enable_ncm_get(
     engine: *mut c_void,
     objthis: *mut c_void,
@@ -492,28 +455,6 @@ extern "C" fn window_ex_system_menu_set(
     }) {
         return report_error(out_error, &format!("Window.exSystemMenu: {error}"));
     }
-    0
-}
-
-extern "C" fn window_reset_ex_system_menu(
-    engine: *mut c_void,
-    _objthis: *mut c_void,
-    _argc: c_int,
-    _argv: *const Value,
-    out: *mut Value,
-    out_error: *mut *mut c_char,
-) -> c_int {
-    if resolve(engine).is_none() {
-        return report_error(
-            out_error,
-            "Window.resetExSystemMenu: compat context is not bound",
-        );
-    }
-    // The reference body is a no-op that returns `TJS_S_OK` without touching
-    // `sysMenuModified` (`reference/cpp/plugins/windowEx.cpp:562-565`); its
-    // registration is commented out at `windowEx.cpp:981` — the member is
-    // kept only because it is part of the locked runtime surface.
-    set_void(out);
     0
 }
 
@@ -745,21 +686,14 @@ extern "C" fn window_register_ex_event(
             "Window.registerExEvent: compat context is not bound",
         );
     };
+    // The reference's `checkExEvents` probes the script object for the four
+    // extended handlers (`reference/cpp/plugins/windowEx.cpp:730-735`); the
+    // handler names are the `EXEV_*` strings (`windowEx.cpp:316-340`) and
+    // none is registered as a class member. The port has no native window
+    // message dispatcher, so the probe results are not retained.
     let host = resolved.engine();
-    let has_resizing = objthis_has_member(host, objthis, "onResizing");
-    let has_moving = objthis_has_member(host, objthis, "onMoving");
-    let has_move = objthis_has_member(host, objthis, "onMove");
-    let has_nc_ms_move = objthis_has_member(host, objthis, "onNcMouseMove");
-    let ctx = resolved.ctx();
-    // SAFETY: `resolve` only succeeds for the installed, live binding.
-    let services = unsafe { ctx.services() };
-    if let Err(error) = with_window(services, host, objthis, |flags| {
-        flags.has_resizing = has_resizing;
-        flags.has_moving = has_moving;
-        flags.has_move = has_move;
-        flags.has_nc_ms_move = has_nc_ms_move;
-    }) {
-        return report_error(out_error, &format!("Window.registerExEvent: {error}"));
+    for name in ["onResizing", "onMoving", "onMove", "onNcMouseMove"] {
+        objthis_has_member(host, objthis, name);
     }
     set_void(out);
     0
@@ -793,37 +727,6 @@ int_property_getter!(ncht_bottom_get, 15);
 int_property_getter!(ncht_bottomleft_get, 16);
 int_property_getter!(ncht_bottomright_get, 17);
 int_property_getter!(ncht_border_get, 18);
-
-/// The `EVEX_*` event-handler names the reference recognizes. They are
-/// registered as inert handlers (like the core `Window`'s other `on*`
-/// events) so scripts can override them.
-const EX_EVENTS: &[&str] = &[
-    "onMinimize",
-    "onMaximize",
-    "onMaximizeQuery",
-    "onShow",
-    "onHide",
-    "onResizing",
-    "onMoving",
-    "onMove",
-    "onMoveSizeBegin",
-    "onMoveSizeEnd",
-    "onDisplayChanged",
-    "onEnterMenuLoop",
-    "onExitMenuLoop",
-    "onActivateChanged",
-    "onScreenSave",
-    "onMonitorPower",
-    "onNcMouseMove",
-    "onNcMouseLeave",
-    "onNcMouseDown",
-    "onNcMouseUp",
-    "onExSystemMenuSelected",
-    "onStartKeyMenu",
-    "onAccelKeyMenu",
-    "onNonCapMouseEvent",
-    "onWindowsMessageHook",
-];
 
 // ---------------------------------------------------------------------------
 // _Notifications
@@ -875,7 +778,7 @@ pub(super) fn install_notifications(engine: &Tjs2Engine) -> Result<(), CompatErr
 /// Register the `Window` instance members and the `Window` `ncht*` class
 /// constants added by `windowEx.dll`.
 pub(super) fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
-    let mut methods = vec![
+    let methods = vec![
         NativeObjThisMethodDef {
             name: "minimize",
             f: window_inert,
@@ -917,10 +820,6 @@ pub(super) fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
             f: window_set_overlay_bitmap,
         },
         NativeObjThisMethodDef {
-            name: "resetExSystemMenu",
-            f: window_reset_ex_system_menu,
-        },
-        NativeObjThisMethodDef {
             name: "ncHitTest",
             f: window_nc_hit_test,
         },
@@ -949,12 +848,6 @@ pub(super) fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
             f: window_get_notification_name,
         },
     ];
-    for event in EX_EVENTS {
-        methods.push(NativeObjThisMethodDef {
-            name: event,
-            f: window_inert,
-        });
-    }
 
     ctx.register_instance_members(&NativeInstanceMembers {
         class_name: "Window",
@@ -964,11 +857,6 @@ pub(super) fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
                 name: "disableResize",
                 get: Some(window_disable_resize_get),
                 set: Some(window_disable_resize_set),
-            },
-            NativeObjThisPropertyDef {
-                name: "disableMove",
-                get: Some(window_disable_move_get),
-                set: Some(window_disable_move_set),
             },
             NativeObjThisPropertyDef {
                 name: "enableNCMouseEvent",

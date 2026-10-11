@@ -31,12 +31,11 @@
 //!   `bringAfter`; `Pad.registerExEvent`.
 //! * `Window` instance members: `minimize`, `maximize`, `showRestore`,
 //!   `focusMenuByKey`, `resetWindowIcon`, `setWindowIcon`, `getWindowRect`,
-//!   `getClientRect`, `getNormalRect`, `disableResize`, `disableMove`,
-//!   `setOverlayBitmap`, `exSystemMenu`, `resetExSystemMenu`,
+//!   `getClientRect`, `getNormalRect`, `disableResize`,
+//!   `setOverlayBitmap`, `exSystemMenu`,
 //!   `enableNCMouseEvent`, `ncHitTest`, `setMessageHook`, `bringTo`,
 //!   `sendToBack`, `registerExEvent`, `getNotificationNum`,
-//!   `getNotificationName`, the `onNcMouse*`/`onWindowsMessageHook` (and the
-//!   other `on*`) handlers, and the static constants `nchtError` …
+//!   `getNotificationName`, and the static constants `nchtError` …
 //!   `nchtBorder`.
 //! * `Window._Notifications`: the two-way `WM_*` name/value dictionary.
 //!

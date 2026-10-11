@@ -463,12 +463,14 @@ fn d3d_emote_module_exposes_settings() {
     assert_eq!(env.eval_int("m.maskMode"), 1);
     assert_eq!(env.eval_int("m.maskRegionClipping ? 1 : 0"), 1);
     assert_eq!(env.eval_int("m.pixelateDivision"), 2);
-    // The port keeps `setMaxTextureSize`'s stub value readable through the
-    // extra `maxTextureSize` getter; the reference has no such getter, so
-    // `undefined` is also acceptable.
-    assert!(env.eval_bool(
-        "(typeof m.maxTextureSize === \"undefined\") || m.maxTextureSize === 2048 ? true : false"
-    ));
+    // `D3DEmoteModule` has only the `setMaxTextureSize` method, no readable
+    // property (`reference/cpp/plugins/motionplayer/D3DEmoteModule.h:37-40`,
+    // registered with `NCB_METHOD` at `main.cpp:585`).
+    assert_eq!(
+        env.eval_int("typeof m.maxTextureSize == 'undefined'"),
+        1,
+        "D3DEmoteModule.maxTextureSize must not be registered"
+    );
 }
 
 #[test]

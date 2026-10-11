@@ -177,12 +177,11 @@ fn menu_item_static_tables_are_receiver_independent() {
 // window_ex `Window` (objthis family) — `plugins/window_ex/window.rs`
 // ---------------------------------------------------------------------------
 
-/// `Window.disableResize`/`disableMove`/`enableNCMouseEvent` are
-/// objthis-only properties: the raw receiver is handed to Rust, which keys a
-/// per-object `WindowFlags` map by `objthis as usize`
-/// (`crates/compat/src/natives/plugins/window_ex/window.rs:961` and
-/// `util.rs` `sync_object_state`). The reference derives its `WindowEx`
-/// instance from the same receiver (`GetInstance(obj)`,
+/// `Window.disableResize`/`enableNCMouseEvent` are objthis-only properties:
+/// the raw receiver is handed to Rust, which keys a per-object `WindowFlags`
+/// map by `objthis as usize` (`window_ex/window.rs` and `util.rs`
+/// `sync_object_state`). The reference derives its `WindowEx` instance from
+/// the same receiver (`GetInstance(obj)`,
 /// `reference/cpp/plugins/windowEx.cpp:496-498,513-515,581`). A wrong
 /// receiver therefore flips the wrong window's flags.
 #[test]
@@ -195,7 +194,7 @@ fn window_ex_window_flags_reach_the_target() {
              function SubWindow() { super.Window(); } \
              function leak() { with(held) { .disableResize = false; } } \
              function readHeld() { with(held) { foreignResize = .disableResize; } } \
-             function moveHeld() { with(held) { .disableMove = true; } } \
+             function enableNcmHeld() { with(held) { .enableNCMouseEvent = true; } } \
          } \
          var targetWindow = new SubWindow(); \
          var anchorWindow = new SubWindow(); \
@@ -205,7 +204,7 @@ fn window_ex_window_flags_reach_the_target() {
          anchorWindow.disableResize = true; \
          anchorWindow.leak(); \
          anchorWindow.readHeld(); \
-         anchorWindow.moveHeld();",
+         anchorWindow.enableNcmHeld();",
     );
     assert_eq!(
         env.eval_int("targetWindow.disableResize"),
@@ -223,14 +222,14 @@ fn window_ex_window_flags_reach_the_target() {
         "the `with` read must read the target window"
     );
     assert_eq!(
-        env.eval_int("targetWindow.disableMove"),
+        env.eval_int("targetWindow.enableNCMouseEvent"),
         1,
-        "the `with` write must flip the target window's disableMove"
+        "the `with` write must flip the target window's enableNCMouseEvent"
     );
     assert_eq!(
-        env.eval_int("anchorWindow.disableMove"),
+        env.eval_int("anchorWindow.enableNCMouseEvent"),
         0,
-        "the enclosing window must not inherit the target's disableMove"
+        "the enclosing window must not inherit the target's enableNCMouseEvent"
     );
     // The class constants are statics, so they are receiver-independent.
     assert_eq!(env.eval_int("Window.nchtError"), 65534);
