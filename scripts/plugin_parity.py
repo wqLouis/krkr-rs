@@ -294,6 +294,16 @@ _SUBCLASS_CALL_RE = re.compile(
 )
 
 _SCRIPT_CLASS_RE = re.compile(r"\bclass\s+([A-Za-z_]\w*)")
+_SCRIPT_FUNCTION_RE = re.compile(r"\bfunction\s+([A-Za-z_]\w*)\s*\(")
+_CPP_STRING_RE = re.compile(r'"((?:[^"\\]|\\.)*)"')
+
+# ``tTJSNativeClass *cls = TVPCreateNativeClass_Storages();`` and the
+# ``REGISTER_OBJECT(Storages, cls)`` macro both name the class a variable owns.
+_TVPCREATE_RE = re.compile(r"\bTVPCreateNativeClass_([A-Za-z_]\w*)\s*\(")
+_REGISTER_OBJECT_RE = re.compile(
+    r"\bREGISTER_OBJECT\s*\(\s*([A-Za-z_]\w*)\s*,\s*([A-Za-z_]\w*)\s*\)"
+)
+_REGISTER_NCM_RE = re.compile(r"\bTJSNativeClassRegisterNCM\s*\(")
 
 
 def _cpp_name_literal(text: str) -> "str | None":
@@ -332,19 +342,72 @@ def _subclass_attachments(body: str) -> list[tuple[str, str]]:
     return out
 
 
-def _script_class_names(src: str) -> set[str]:
-    """TJS classes declared inside ``TVPExecuteScript`` string arguments.
+def _script_text(text: str) -> str:
+    """Concatenate the C++ string literals of a ``TVPExecuteScript`` argument."""
+    return "".join(_CPP_STRING_RE.findall(text))
+
+
+def _script_classes(src: str) -> dict[str, set[str]]:
+    """TJS classes (and their ``function`` members) in ``TVPExecuteScript``.
 
     ``win32dialog.cpp`` publishes ``WIN32Dialog`` from a script string rather
-    than an ncbind macro, so the port-only-class guard must count it as
-    reference-published.
+    than an ncbind macro, so it is not reachable through the class spans; its
+    ``function messageBox(...)`` is a real member and is harvested from the
+    enclosing ``class`` body.
     """
-    names: set[str] = set()
+    out: dict[str, set[str]] = {}
     for m in re.finditer(r"\bTVPExecuteScript\s*\(", src):
         args, _ = _split_call_args(src, m.end() - 1)
-        for arg in args:
-            names.update(_SCRIPT_CLASS_RE.findall(arg))
-    return names
+        script = _script_text(" ".join(args))
+        for cm in _SCRIPT_CLASS_RE.finditer(script):
+            name = cm.group(1)
+            members = out.setdefault(name, set())
+            brace = script.find("{", cm.end())
+            if brace == -1:
+                continue
+            body = script[brace : np._match_brace(script, brace)]
+            members.update(_SCRIPT_FUNCTION_RE.findall(body))
+    return out
+
+
+def _tvp_native_class_bindings(src: str) -> dict[str, str]:
+    """Variables holding a class object named by ``TVPCreateNativeClass_*``.
+
+    Handles the declaration ``tTJSNativeClass *cls =
+    TVPCreateNativeClass_Storages();`` and the ``REGISTER_OBJECT(Storages,
+    cls)`` macro invocation.
+    """
+    bindings: dict[str, str] = {}
+    for m in _TVPCREATE_RE.finditer(src):
+        prefix = src[max(0, m.start() - 96) : m.start()]
+        am = re.search(r"([A-Za-z_]\w*)\s*=\s*$", prefix)
+        if am:
+            bindings[am.group(1)] = m.group(1)
+    for m in _REGISTER_OBJECT_RE.finditer(src):
+        bindings[m.group(2)] = m.group(1)
+    return bindings
+
+
+def _ncm_members(src: str, bindings: dict[str, str]) -> dict[str, set[str]]:
+    """Members registered with ``TJSNativeClassRegisterNCM``.
+
+    The second argument is the script name; the fourth is a runtime expression
+    (``cls->getClassName().c_str()``), so the class comes from the receiver's
+    ``TVPCreateNativeClass_*`` / ``REGISTER_OBJECT`` binding instead.
+    """
+    out: dict[str, set[str]] = {}
+    for m in _REGISTER_NCM_RE.finditer(src):
+        args, _ = _split_call_args(src, m.end() - 1)
+        if len(args) < 2:
+            continue
+        var = args[0].strip().lstrip("&").strip()
+        cls = bindings.get(var)
+        if not cls:
+            continue
+        name = _cpp_name_literal(args[1])
+        if name:
+            out.setdefault(cls, set()).add(name)
+    return out
 
 
 def _collect_class_spans(
@@ -470,7 +533,9 @@ def parse_reference() -> ReferenceModel:
                     nested_by_ns.setdefault(cls, {}).update(dict(subs))
             elif kind == "attach" and cls:
                 published_top_level.add(cls)
-        published_top_level |= _script_class_names(src)
+        for script_cls, script_members in _script_classes(src).items():
+            classes.setdefault(script_cls, set()).update(script_members)
+            published_top_level.add(script_cls)
 
     nested_visible: dict[str, str] = {}
     for ns, mapping in nested_by_ns.items():
@@ -534,6 +599,17 @@ def parse_reference() -> ReferenceModel:
                     classes.setdefault(cls, set()).add(name)
                     published_top_level.add(cls)
             impl_classes.setdefault(fp.stem, set()).add(name)
+
+        # Older native-class registrations: ``cls`` is the class object built
+        # by ``TVPCreateNativeClass_<Name>()`` (or named by
+        # ``REGISTER_OBJECT(<Name>, cls)``), and ``TJSNativeClassRegisterNCM``
+        # adds a static member to it.
+        ncm_bindings = _tvp_native_class_bindings(src)
+        if ncm_bindings:
+            for cls, names in _ncm_members(src, ncm_bindings).items():
+                if cls not in EXCLUDED_REFERENCE_CLASSES:
+                    classes.setdefault(cls, set()).update(names)
+                    published_top_level.add(cls)
 
     return ReferenceModel(
         classes=classes,

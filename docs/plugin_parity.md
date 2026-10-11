@@ -18,13 +18,13 @@ The checker exits non-zero when a missing member is **not** listed in `scripts/p
 
 | metric | value |
 | --- | ---: |
-| tracked classes | 53 |
-| reference members | 969 |
-| matched | 967 |
-| **missing** | **2** |
-| extra (genuine plugin additions) | 34 |
+| tracked classes | 55 |
+| reference members | 972 |
+| matched | 972 |
+| **missing** | **0** |
+| extra (genuine plugin additions) | 0 |
 | core members (not plugin extras) | 336 |
-| coverage | **99.8%** |
+| coverage | **100.0%** |
 
 ## Per-class coverage
 
@@ -37,20 +37,22 @@ The checker exits non-zero when a missing member is **not** listed in `scripts/p
 | `Clipboard` | 0 | 2 | 0 | 0 | 0 | n/a |
 | `Console` | 7 | 8 | 7 | 0 | 0 | 100.0% |
 | `Controller` | 0 | 1 | 0 | 0 | 0 | n/a |
-| `D3DEmoteModule` | 9 | 10 | 9 | 0 | 1 | 100.0% |
+| `D3DEmoteModule` | 9 | 9 | 9 | 0 | 0 | 100.0% |
 | `D3DEmotePlayer` | 87 | 181 | 87 | 0 | 0 | 100.0% |
 | `Debug` | 0 | 12 | 0 | 0 | 0 | n/a |
 | `Dictionary` | 2 | 2 | 2 | 0 | 0 | 100.0% |
 | `DrawDeviceForSteam` | 1 | 1 | 1 | 0 | 0 | 100.0% |
-| `GdiPlus` | 157 | 155 | 155 | 2 | 0 | 98.7% |
+| `GdiPlus` | 157 | 157 | 157 | 0 | 0 | 100.0% |
 | `GdiPlus.Appearance` | 3 | 5 | 3 | 0 | 0 | 100.0% |
 | `GdiPlus.Font` | 9 | 10 | 9 | 0 | 0 | 100.0% |
+| `GdiPlus.Image` | 0 | 13 | 0 | 0 | 0 | n/a |
+| `GdiPlus.Matrix` | 0 | 16 | 0 | 0 | 0 | n/a |
 | `GdiPlus.Path` | 17 | 19 | 17 | 0 | 0 | 100.0% |
 | `GdiPlus.PointF` | 3 | 4 | 3 | 0 | 0 | 100.0% |
 | `GdiPlus.RectF` | 18 | 19 | 18 | 0 | 0 | 100.0% |
 | `ImageFunction` | 0 | 12 | 0 | 0 | 0 | n/a |
 | `Key` | 0 | 4 | 0 | 0 | 0 | n/a |
-| `Layer` | 48 | 51 | 48 | 0 | 3 | 100.0% |
+| `Layer` | 48 | 48 | 48 | 0 | 0 | 100.0% |
 | `MIDISoundBuffer` | 0 | 1 | 0 | 0 | 0 | n/a |
 | `MenuItem` | 15 | 36 | 15 | 0 | 0 | 100.0% |
 | `Motion` | 23 | 23 | 23 | 0 | 0 | 100.0% |
@@ -73,14 +75,14 @@ The checker exits non-zero when a missing member is **not** listed in `scripts/p
 | `Rect` | 0 | 25 | 0 | 0 | 0 | n/a |
 | `Scripts` | 24 | 33 | 24 | 0 | 0 | 100.0% |
 | `Steam` | 23 | 23 | 23 | 0 | 0 | 100.0% |
-| `Storages` | 30 | 45 | 30 | 0 | 2 | 100.0% |
+| `Storages` | 32 | 45 | 32 | 0 | 0 | 100.0% |
 | `System` | 16 | 64 | 16 | 0 | 0 | 100.0% |
 | `TemporaryFiles` | 2 | 2 | 2 | 0 | 0 | 100.0% |
 | `TextRenderBase` | 48 | 48 | 48 | 0 | 0 | 100.0% |
 | `VideoOverlay` | 0 | 69 | 0 | 0 | 0 | n/a |
-| `WIN32Dialog` | 0 | 1 | 0 | 0 | 1 | n/a |
+| `WIN32Dialog` | 1 | 1 | 1 | 0 | 0 | 100.0% |
 | `WaveSoundBuffer` | 6 | 38 | 6 | 0 | 0 | 100.0% |
-| `Window` | 44 | 71 | 44 | 0 | 27 | 100.0% |
+| `Window` | 44 | 44 | 44 | 0 | 0 | 100.0% |
 | `open` | 0 | 13 | 0 | 0 | 0 | n/a |
 | `steam_api` | 0 | 0 | 0 | 0 | 0 | n/a |
 
@@ -90,7 +92,7 @@ The reference publishes a class object with ``NCB_REGISTER_CLASS`` and attaches 
 
 ### Missing namespace / nested classes (allowlistable)
 
-`GdiPlus.Image`, `GdiPlus.Matrix`
+_None._
 
 ### Wrong-level classes (hard failures)
 
@@ -98,34 +100,12 @@ _None._
 
 ## Missing members by class
 
-### `GdiPlus` — 2 missing
-
-`addPrivateFont`, `getFontList`
-
+_None for tracked classes._
 ## Extra members by class
 
 Genuine plugin-surface additions: members registered in a plugin file that the reference class does not have. Core natives and members inherited from a shared registration table (``EmotePlayer`` gets ``Player``'s table) are excluded.
 
-### `D3DEmoteModule` — 1 extra
-
-`maxTextureSize`
-
-### `Layer` — 3 extra
-
-`onStartMovie`, `onStopMovie`, `onUpdateMovie`
-
-### `Storages` — 2 extra
-
-`setXP3ArchiveContentFilter`, `setXP3ArchiveExtractionFilter`
-
-### `WIN32Dialog` — 1 extra
-
-`messageBox`
-
-### `Window` — 27 extra
-
-`disableMove`, `onAccelKeyMenu`, `onActivateChanged`, `onDisplayChanged`, `onEnterMenuLoop`, `onExSystemMenuSelected`, `onExitMenuLoop`, `onHide`, `onMaximize`, `onMaximizeQuery`, `onMinimize`, `onMonitorPower`, `onMove`, `onMoveSizeBegin`, `onMoveSizeEnd`, `onMoving`, `onNcMouseDown`, `onNcMouseLeave`, `onNcMouseMove`, `onNcMouseUp`, `onNonCapMouseEvent`, `onResizing`, `onScreenSave`, `onShow`, `onStartKeyMenu`, `onWindowsMessageHook`, `resetExSystemMenu`
-
+_None for tracked classes._
 ## Core members by class (excluded from extras)
 
 Members registered by a core file (``crates/compat/src/natives/*.rs``) with no reference-plugin counterpart. These are not plugin-surface additions.
@@ -163,13 +143,14 @@ Plugin classes Rust registers that have no reference counterpart reachable throu
 | `Clipboard` | 2 | `crates/compat/src/natives/clipboard.rs` |
 | `Controller` | 1 | `crates/compat/src/natives/debug.rs` |
 | `Debug` | 12 | `crates/compat/src/natives/debug.rs` |
+| `GdiPlus.Image` | 13 |  |
+| `GdiPlus.Matrix` | 16 |  |
 | `ImageFunction` | 12 | `crates/compat/src/natives/image_function.rs` |
 | `Key` | 4 | `crates/compat/src/natives/input.rs` |
 | `MIDISoundBuffer` | 1 | `crates/compat/src/natives/cdda_midi.rs` |
 | `Mouse` | 14 | `crates/compat/src/natives/input.rs` |
 | `Rect` | 25 | `crates/compat/src/natives/plugins/motion_player/adaptors.rs`, `crates/compat/src/natives/rect.rs` |
 | `VideoOverlay` | 69 | `crates/compat/src/natives/video.rs` |
-| `WIN32Dialog` | 1 | `crates/compat/src/natives/plugins/win32_dialog/mod.rs` |
 | `open` | 13 | `crates/compat/src/natives/cdda_midi.rs` |
 
 ## Extraction notes
