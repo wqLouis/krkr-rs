@@ -104,32 +104,34 @@ impl Env {
     }
 }
 
-/// The full reference `on*` dispatch surface.
-const EVENT_HANDLERS: [&str; 24] = [
-    "onActivate",
-    "onClick",
-    "onCloseQuery",
-    "onDeactivate",
-    "onDisplayRotate",
-    "onDoubleClick",
-    "onFileDrop",
-    "onKeyDown",
-    "onKeyPress",
-    "onKeyUp",
-    "onMouseDown",
-    "onMouseEnter",
-    "onMouseLeave",
-    "onMouseMove",
-    "onMouseUp",
-    "onMouseWheel",
-    "onMultiTouch",
-    "onPopupHide",
-    "onResize",
-    "onTouchDown",
-    "onTouchMove",
-    "onTouchRotate",
-    "onTouchScaling",
-    "onTouchUp",
+/// The full reference `on*` dispatch surface with each handler's reference
+/// `TVP_ACTION_INVOKE_BEGIN` argument count
+/// (`reference/cpp/core/visual/WindowIntf.cpp:934-1250`).
+const EVENT_HANDLERS: [(&str, usize); 24] = [
+    ("onActivate", 0),
+    ("onClick", 2),
+    ("onCloseQuery", 1),
+    ("onDeactivate", 0),
+    ("onDisplayRotate", 5),
+    ("onDoubleClick", 2),
+    ("onFileDrop", 1),
+    ("onKeyDown", 2),
+    ("onKeyPress", 1),
+    ("onKeyUp", 2),
+    ("onMouseDown", 4),
+    ("onMouseEnter", 0),
+    ("onMouseLeave", 0),
+    ("onMouseMove", 3),
+    ("onMouseUp", 4),
+    ("onMouseWheel", 4),
+    ("onMultiTouch", 0),
+    ("onPopupHide", 0),
+    ("onResize", 0),
+    ("onTouchDown", 5),
+    ("onTouchMove", 5),
+    ("onTouchRotate", 6),
+    ("onTouchScaling", 5),
+    ("onTouchUp", 5),
 ];
 
 #[test]
@@ -138,16 +140,18 @@ fn event_handlers_are_callable_and_script_assignments_shadow_them() {
     let env = Env::new();
     env.run("var w = new Window();");
 
-    for handler in EVENT_HANDLERS {
-        // Calling the default must not raise: an absent member would, so this
-        // also proves every reference handler name is registered. (TJS
-        // `typeof` reports a function object as `Object`, so a call is the
-        // reliable check for "callable".)
-        env.run(&format!("w.{handler}();"));
+    for (handler, arity) in EVENT_HANDLERS {
+        // Calling the default with the reference argument count must not
+        // raise: an absent member would, so this also proves every reference
+        // handler name is registered. (TJS `typeof` reports a function object
+        // as `Object`, so a call is the reliable check for "callable".)
+        let args = vec!["0"; arity].join(", ");
+        env.run(&format!("w.{handler}({args});"));
     }
 
-    // A script assignment shadows the native no-op (the `MenuItem.onClick`
-    // dispatch contract the L3 event adapter relies on).
+    // A script assignment shadows the native default, which is what the L3
+    // event adapter resolves by name.
+    // reference/cpp/core/visual/WindowIntf.cpp:967-978
     env.run(
         "var hits = 0; var gotX = 0; var gotY = 0; \
          w.onClick = function(x, y) { hits++; gotX = x; gotY = y; }; \

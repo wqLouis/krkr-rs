@@ -1,7 +1,7 @@
 //! L1 → L3 event adaptation.
 //!
 //! L1 owns the event loop and pushes [`platform::PlatformEvent`]s; L3
-//! maps them to the TJS-visible event the VM dispatches to script handlers.
+//! maps them to the TJS-visible events the VM dispatches to script handlers.
 //! [`EventAdapter::map`] is the mapping and [`EventAdapter::dispatch`] is the
 //! delivery seam.
 //!
@@ -9,12 +9,15 @@
 //! L1 and only the TJS mapping lives here.
 #![allow(unsafe_code)]
 
+use api::host::TouchPhase;
+use std::collections::HashMap;
+
 use engine::Scene;
 use engine::input::InputState;
 use platform::{InputEvent, MouseButton, PlatformEvent};
 use tjs::TjsValue;
 
-use crate::natives::input::shift_flags;
+use crate::natives::input::{MOUSE_CLICK_MAX_MOVE, mouse_button, shift_flags};
 use crate::natives::visual::{ObjectKind, duplicate_object};
 use crate::{CompatCtx, CompatError};
 
@@ -26,6 +29,27 @@ pub struct TjsEvent {
     /// The positional arguments handed to the handler, in the order the
     /// reference `Fire*`/`On*` method passes them.
     pub args: Vec<EventValue>,
+}
+
+impl TjsEvent {
+    /// The argument list the window handler receives.
+    ///
+    /// The window and layer handlers differ only for the key events. The
+    /// reference window `onKeyDown`/`onKeyUp` take `(key, shift)` and
+    /// `onKeyPress` takes `(key)`
+    /// (`reference/cpp/core/visual/WindowIntf.cpp:984-1010`,
+    /// `reference/cpp/core/visual/WindowIntf.cpp:1130-1160`); the layer
+    /// versions append the `process` flag
+    /// (`reference/cpp/core/visual/LayerIntf.cpp:3844-3877`,
+    /// `reference/cpp/core/visual/LayerIntf.cpp:10294-10319`). Every other
+    /// input event carries the same arguments to both.
+    fn window_args(&self) -> Vec<EventValue> {
+        match self.name {
+            "onKeyDown" | "onKeyUp" => self.args.iter().take(2).cloned().collect(),
+            "onKeyPress" => self.args.iter().take(1).cloned().collect(),
+            _ => self.args.clone(),
+        }
+    }
 }
 
 /// A scalar event argument value.
@@ -60,8 +84,8 @@ impl EventAdapter {
         Self::default()
     }
 
-    /// Map a platform event to the TJS-visible event, or `None` for events
-    /// the script surface ignores.
+    /// Map a platform event to the TJS-visible event it produces, or `None`
+    /// for events the script surface ignores.
     pub fn map(&self, event: &PlatformEvent) -> Option<TjsEvent> {
         match event {
             // `OnResize` posts `onResize` with no arguments
@@ -99,14 +123,17 @@ impl EventAdapter {
         self.shift = shift_flags(state);
     }
 
-    /// Map one raw input event to the TJS-visible event.
+    /// Map one raw input event to the TJS-visible event(s).
     ///
     /// The argument list is the reference `Fire*` positional list, not an
     /// event dictionary: `onMouseMove(x, y, shift)`,
     /// `onMouseDown`/`onMouseUp(x, y, button, shift)`,
-    /// `onMouseWheel(shift, delta, x, y)` and
-    /// `onKeyDown`/`onKeyUp(key, shift, process)`
-    /// (`reference/cpp/core/visual/LayerIntf.cpp:3410-3891`).
+    /// `onMouseWheel(shift, delta, x, y)`,
+    /// `onKeyDown`/`onKeyUp(key, shift, process)`,
+    /// `onKeyPress(key, process)` and
+    /// the touch family `(x, y, cx, cy[, id])`
+    /// (`reference/cpp/core/visual/LayerIntf.cpp:3410-3891`,
+    /// `reference/cpp/core/visual/LayerIntf.cpp:10294-10319`).
     fn map_input(&self, input: &InputEvent) -> Option<TjsEvent> {
         let flags = i64::from(self.shift);
         let (pointer_x, pointer_y) = self.pointer_coordinates();
@@ -119,8 +146,15 @@ impl EventAdapter {
                     EventValue::Int(flags),
                 ],
             }),
-            // The window-level pointer-leave is not a KAG event.
-            InputEvent::PointerLeft => None,
+            // The pointer leaving the window is the window-level
+            // `onMouseLeave` (`tTVPOnMouseLeaveInputEvent`,
+            // `reference/cpp/core/visual/WindowIntf.h:479-485`); the layer
+            // leave comes from the manager's tracking, emitted in
+            // [`Self::dispatch`].
+            InputEvent::PointerLeft => Some(TjsEvent {
+                name: "onMouseLeave",
+                args: Vec::new(),
+            }),
             InputEvent::MouseButton { button, pressed } => Some(TjsEvent {
                 name: if *pressed { "onMouseDown" } else { "onMouseUp" },
                 args: vec![
@@ -147,54 +181,246 @@ impl EventAdapter {
                     EventValue::Int(1),
                 ],
             }),
-            // Text/IME and touch events have no script mapping.
-            InputEvent::Text(_) | InputEvent::Touch { .. } => None,
+            // Committed text posts `onKeyPress(key, process)`
+            // (`FireKeyPress`,
+            // `reference/cpp/core/visual/LayerIntf.cpp:3868-3877`). The
+            // reference platform posts nothing for an empty key
+            // (`if(tjsNativeInstance && vk)`,
+            // `reference/cpp/core/environ/impl/TVPWindow.cpp:909-919`).
+            InputEvent::Text(text) if text.is_empty() => None,
+            InputEvent::Text(text) => Some(TjsEvent {
+                name: "onKeyPress",
+                args: vec![EventValue::Str(text.clone()), EventValue::Int(1)],
+            }),
+            InputEvent::Touch { id, phase, x, y } => {
+                let name = match phase {
+                    TouchPhase::Started => "onTouchDown",
+                    TouchPhase::Moved => "onTouchMove",
+                    // The reference has no touch-cancel input event; a
+                    // cancelled contact ends like an ended one
+                    // (`tTVPOnTouchUpInputEvent`, `reference/cpp/core/visual/WindowIntf.h:601-614`).
+                    TouchPhase::Ended | TouchPhase::Cancelled => "onTouchUp",
+                };
+                Some(TjsEvent {
+                    name,
+                    args: vec![
+                        EventValue::Real(f64::from(*x)),
+                        EventValue::Real(f64::from(*y)),
+                        EventValue::Real(f64::from(*x)),
+                        EventValue::Real(f64::from(*y)),
+                        EventValue::Int(i64::from(*id as u32)),
+                    ],
+                })
+            }
         }
     }
 
     /// Deliver a mapped event to the script handler that owns it.
     ///
-    /// The target is resolved from the attached L2 [`Scene`]: a mouse event
-    /// goes to the layer under the cursor (or the layer that captured the
-    /// mouse), a key event to the window's focused layer, and every other
-    /// event to the window. The handler is resolved on the object by member
-    /// name and invoked with [`TjsEvent::args`] as positional arguments. A
-    /// missing handler is a no-op; a throwing handler is logged and never
+    /// The reference posts every input event to the window **and** to the
+    /// layer the manager resolves: `tTVPOnMouseDownInputEvent::Deliver` calls
+    /// `window->OnMouseDown`, which posts `onMouseDown` to the window and
+    /// then notifies the layer manager through the draw device
+    /// (`reference/cpp/core/visual/WindowIntf.cpp:331-345`,
+    /// `reference/cpp/core/visual/impl/DrawDevice.cpp:192-238`). The window
+    /// handler is resolved first, then the layer
+    /// (`onMouseMove`/`onMouseDown`/`onMouseUp` by hit test or mouse capture,
+    /// key/wheel by focus, touch by hit test).
+    ///
+    /// A mapped `onMouseLeave` is the window-level event; the layer-level
+    /// `onMouseEnter`/`onMouseLeave` are the manager's hit-test transitions
+    /// (`reference/cpp/core/visual/LayerManager.cpp:424-468`). A mouse
+    /// release additionally posts `onClick`/`onDoubleClick` when the
+    /// press/release pair is a click
+    /// (`reference/cpp/core/visual/WindowIntf.cpp:311-322`,
+    /// `reference/cpp/core/visual/LayerManager.cpp:358-372`).
+    ///
+    /// A missing handler is a no-op; a throwing handler is logged and never
     /// aborts the frame.
     pub fn dispatch(&self, ctx: &mut CompatCtx, event: &TjsEvent) -> Result<(), CompatError> {
-        let Some(target) = resolve_target(ctx, event) else {
-            log::debug!(
-                "event adapter: no target for {} ({} argument(s))",
-                event.name,
-                event.args.len(),
-            );
+        // A committed multi-character string is one `onKeyPress` per
+        // character, matching the reference platform's per-`tjs_char`
+        // post (`reference/cpp/core/environ/impl/TVPWindow.cpp:909-919`).
+        if event.name == "onKeyPress"
+            && let Some(EventValue::Str(text)) = event.args.first()
+            && text.chars().count() > 1
+        {
+            for character in text.chars() {
+                let single = TjsEvent {
+                    name: "onKeyPress",
+                    args: vec![EventValue::Str(character.to_string()), EventValue::Int(1)],
+                };
+                self.dispatch(ctx, &single)?;
+            }
             return Ok(());
+        }
+
+        // Pointer events resolve the captured/hit layer and update the mouse
+        // capture. `onMouseLeave` is the window-level event and does not
+        // perform a hit test.
+        let pointer_layer = if is_pointer_event(event.name) {
+            resolve_pointer(ctx, event.name)
+        } else {
+            None
         };
-        if let Err(error) = self.deliver(ctx, event, target) {
-            if is_missing_member(&error) {
-                log::debug!("event adapter: {} has no handler ({error})", event.name);
-            } else {
-                log::warn!("event adapter: {} dispatch failed ({error})", event.name);
+
+        // The window receives every mapped event.
+        if let Some(id) = first_window(ctx) {
+            deliver_checked(ctx, event.name, &event.window_args(), Target::Window(id));
+        }
+
+        // The layer receives the input events that hit it or have focus.
+        let layer = match event.name {
+            "onKeyDown" | "onKeyUp" | "onKeyPress" | "onMouseWheel" => focused_layer(ctx),
+            name if is_pointer_event(name) => pointer_layer,
+            "onTouchDown" | "onTouchMove" | "onTouchUp" => self.touch_layer(ctx, event),
+            _ => None,
+        };
+
+        // Layer enter/leave is the manager's hit-test transition, checked
+        // before the move/press delivery, exactly like `PrimaryMouseMove`
+        // (`reference/cpp/core/visual/LayerManager.cpp:437-457`).
+        if matches!(event.name, "onMouseMove" | "onMouseDown") {
+            track_layer_enter_leave(ctx, layer);
+        } else if event.name == "onMouseLeave" {
+            track_layer_enter_leave(ctx, None);
+            set_pointer_inside(ctx, false);
+        }
+
+        if let Some(id) = layer {
+            let args = self.layer_args(ctx, event, id);
+            deliver_checked(ctx, event.name, &args, Target::Layer(id));
+        }
+
+        // A pointer move that re-enters the window posts the window-level
+        // `onMouseEnter` (`tTVPOnMouseEnterInputEvent`,
+        // `reference/cpp/core/visual/WindowIntf.h:473-478`).
+        if event.name == "onMouseMove" && !pointer_inside(ctx) {
+            set_pointer_inside(ctx, true);
+            if let Some(id) = first_window(ctx) {
+                deliver_checked(ctx, "onMouseEnter", &[], Target::Window(id));
+            }
+        }
+
+        // A mouse release completes a click or a double click.
+        if event.name == "onMouseUp"
+            && let Some(click) = self.click_event(ctx, event)
+        {
+            if let Some(id) = pointer_layer {
+                deliver_checked(ctx, click.name, &click.args, Target::Layer(id));
+            }
+            if let Some(id) = first_window(ctx) {
+                deliver_checked(ctx, click.name, &click.args, Target::Window(id));
             }
         }
         Ok(())
     }
 
-    /// Call `event.name` on the target's registered script object with
-    /// `event.args` as positional arguments.
-    fn deliver(&self, ctx: &CompatCtx, event: &TjsEvent, target: Target) -> Result<(), String> {
-        // SAFETY: a `CompatCtx` is only created for a bound, live engine.
-        let host = unsafe { ctx.engine() };
-        let (kind, id) = match target {
-            Target::Window(id) => (ObjectKind::Window, id),
-            Target::Layer(id) => (ObjectKind::Layer, id),
+    /// The layer-level argument list for `event`, converting the touch point
+    /// into the layer's coordinate space like the manager's
+    /// `FromPrimaryCoordinates` (`reference/cpp/core/visual/LayerManager.cpp:516-524`).
+    fn layer_args(&self, ctx: &CompatCtx, event: &TjsEvent, layer_id: u32) -> Vec<EventValue> {
+        if !matches!(event.name, "onTouchDown" | "onTouchMove" | "onTouchUp") {
+            return event.args.clone();
+        }
+        let (Some(EventValue::Real(x)), Some(EventValue::Real(y))) =
+            (event.args.first(), event.args.get(1))
+        else {
+            return event.args.clone();
         };
-        let Some(object) = duplicate_object(ctx, host, kind, id) else {
-            return Err(format!("event target {id} has no script object"));
+        let (local_x, local_y) = to_layer_local(ctx, layer_id, *x, *y);
+        let mut args = event.args.clone();
+        args[0] = EventValue::Real(local_x);
+        args[1] = EventValue::Real(local_y);
+        args
+    }
+
+    /// The layer a touch event targets, honouring the touch capture
+    /// (`SetTouchCapture`/`GetTouchCapture`,
+    /// `reference/cpp/core/visual/LayerManager.cpp:516-553`).
+    fn touch_layer(&self, ctx: &CompatCtx, event: &TjsEvent) -> Option<u32> {
+        let id = match event.args.get(4) {
+            Some(EventValue::Int(value)) if *value >= 0 => *value as u64,
+            _ => return None,
         };
-        let args: Vec<TjsValue> = event.args.iter().map(event_value_to_tjs).collect();
-        host.call_member(object.raw_id(), event.name, &args)
-            .map(|_| ())
+        let stored = {
+            // SAFETY: a `CompatCtx` is only created for a bound, live engine.
+            let services = unsafe { ctx.services() };
+            services
+                .state::<InputDispatchState>()
+                .touch_capture
+                .get(&id)
+                .copied()
+        };
+        match event.name {
+            "onTouchDown" => {
+                let layer = touch_hit(ctx, event);
+                if let Some(layer_id) = layer {
+                    // SAFETY: a `CompatCtx` is only created for a bound, live engine.
+                    let services = unsafe { ctx.services() };
+                    services
+                        .state::<InputDispatchState>()
+                        .touch_capture
+                        .insert(id, layer_id);
+                }
+                layer
+            }
+            "onTouchUp" => {
+                let layer = stored.or_else(|| touch_hit(ctx, event));
+                // SAFETY: a `CompatCtx` is only created for a bound, live engine.
+                let services = unsafe { ctx.services() };
+                services
+                    .state::<InputDispatchState>()
+                    .touch_capture
+                    .remove(&id);
+                layer
+            }
+            _ => stored.or_else(|| touch_hit(ctx, event)),
+        }
+    }
+
+    /// The `onClick`/`onDoubleClick` implied by a mouse release.
+    ///
+    /// The click sequence is the L2 [`InputState`] one: a release is a click
+    /// when the current multi-click sequence has not timed out and the
+    /// pointer has not moved past the sequence distance. The reference
+    /// establishes the sequence in the platform gesture recognizer
+    /// (`reference/cpp/core/visual/LayerManager.cpp:358-372`); the vendored
+    /// source does not contain the recognizer, so the port reuses the
+    /// `Mouse.getClickCount` sequence and its existence comes from the
+    /// `layer.onClick`/`layer.onDoubleClick` natives.
+    fn click_event(&self, ctx: &CompatCtx, event: &TjsEvent) -> Option<TjsEvent> {
+        let index = match event.args.get(2)? {
+            EventValue::Int(value) if *value >= 0 => *value as usize,
+            _ => return None,
+        };
+        let button = mouse_button(index)?;
+        let state = input(ctx)?;
+        let count = state.button_click_count(button);
+        if count == 0 {
+            return None;
+        }
+        let press = state.button_last_click_pos(button)?;
+        let (pointer_x, pointer_y) = state.pointer();
+        let max_move = MOUSE_CLICK_MAX_MOVE as f32;
+        if (pointer_x - press.0).abs() > max_move || (pointer_y - press.1).abs() > max_move {
+            return None;
+        }
+        let (x, y) = self.pointer_coordinates();
+        let name = if count >= 2 {
+            "onDoubleClick"
+        } else {
+            "onClick"
+        };
+        Some(TjsEvent {
+            name,
+            args: vec![EventValue::Int(x), EventValue::Int(y)],
+        })
+    }
+
+    /// The cached pointer position as TJS integers.
+    fn pointer_coordinates(&self) -> (i64, i64) {
+        (coordinate(self.pointer.0), coordinate(self.pointer.1))
     }
 }
 
@@ -203,56 +429,46 @@ impl EventAdapter {
 pub(crate) enum Target {
     /// A scene window (focus, resize, close).
     Window(u32),
-    /// A scene layer (pointer and key events).
+    /// A scene layer (pointer, key and touch events).
     Layer(u32),
 }
 
-/// Mouse state with no L2 home: the layer that captured the mouse. It lives
-/// in [`CompatServices::state`](crate::CompatServices::state), keyed by type,
+/// Mouse state with no L2 home: the layer that captured the mouse and the
+/// layer the pointer last entered. It lives in
+/// [`CompatServices::state`](crate::CompatServices::state), keyed by type,
 /// like the other dispatch state.
 #[derive(Default)]
 struct InputDispatchState {
     /// The layer that received `onMouseDown` and owns the following
     /// `onMouseMove`/`onMouseUp` until every mouse button is released.
     mouse_capture: Option<u32>,
-}
-
-/// Resolve the event's target object and update the mouse-capture and focus
-/// state a press implies.
-fn resolve_target(ctx: &CompatCtx, event: &TjsEvent) -> Option<Target> {
-    if is_pointer_event(event.name) {
-        return resolve_pointer(ctx, event.name);
-    }
-    match event.name {
-        "onKeyDown" | "onKeyUp" | "onKeyPress" | "onMouseWheel" => {
-            focused_layer(ctx).map(Target::Layer)
-        }
-        _ => first_window(ctx).map(Target::Window),
-    }
+    /// The layer that received the last `onMouseEnter` (the manager's
+    /// `LastMouseMoveSent`), for the enter/leave transition.
+    last_mouse_layer: Option<u32>,
+    /// The layer that captured each active touch contact
+    /// (`SetTouchCapture`), so a drag stays on the pressed layer.
+    touch_capture: HashMap<u64, u32>,
+    /// Whether the pointer is currently inside the window (the window-level
+    /// enter/leave transition).
+    pointer_inside: bool,
 }
 
 /// Whether the event is a pointer event that hit-tests the layer tree.
 fn is_pointer_event(name: &str) -> bool {
-    matches!(
-        name,
-        "onMouseMove"
-            | "onMouseDown"
-            | "onMouseUp"
-            | "onClick"
-            | "onDoubleClick"
-            | "onMouseEnter"
-            | "onMouseLeave"
-    )
+    matches!(name, "onMouseMove" | "onMouseDown" | "onMouseUp")
 }
 
 /// Resolve a pointer event's layer, honouring the mouse capture.
-fn resolve_pointer(ctx: &CompatCtx, name: &str) -> Option<Target> {
+fn resolve_pointer(ctx: &CompatCtx, name: &str) -> Option<u32> {
     let stored = capture_layer(ctx);
     let captured = stored.filter(|id| scene(ctx).is_some_and(|scene| scene.layer(*id).is_some()));
     if stored.is_some() && captured.is_none() {
         set_capture_layer(ctx, None);
     }
-    let hit = captured.or_else(|| hit_layer(ctx));
+    let hit = captured.or_else(|| {
+        let (x, y) = pointer(ctx)?;
+        hit_layer(ctx, x, y)
+    });
     if name == "onMouseDown" {
         match hit {
             Some(id) => {
@@ -264,12 +480,11 @@ fn resolve_pointer(ctx: &CompatCtx, name: &str) -> Option<Target> {
     } else if name == "onMouseUp" && !any_mouse_button_down(ctx) {
         set_capture_layer(ctx, None);
     }
-    hit.map(Target::Layer)
+    hit
 }
 
-/// The layer under the cursor in the first visible window.
-fn hit_layer(ctx: &CompatCtx) -> Option<u32> {
-    let (x, y) = pointer(ctx)?;
+/// The layer under a window-space point in the first visible window.
+fn hit_layer(ctx: &CompatCtx, x: i32, y: i32) -> Option<u32> {
     let scene = scene(ctx)?;
     for window in &scene.windows {
         if !window.visible {
@@ -283,6 +498,21 @@ fn hit_layer(ctx: &CompatCtx) -> Option<u32> {
         }
     }
     None
+}
+
+/// Hit-test a touch event's window-space point.
+fn touch_hit(ctx: &CompatCtx, event: &TjsEvent) -> Option<u32> {
+    let x = match event.args.first()? {
+        EventValue::Real(value) => *value,
+        EventValue::Int(value) => *value as f64,
+        _ => return None,
+    };
+    let y = match event.args.get(1)? {
+        EventValue::Real(value) => *value,
+        EventValue::Int(value) => *value as f64,
+        _ => return None,
+    };
+    hit_layer(ctx, x.round() as i32, y.round() as i32)
 }
 
 /// The focused layer of the first window.
@@ -307,31 +537,93 @@ fn scene(ctx: &CompatCtx) -> Option<&Scene> {
     Some(unsafe { &*scene })
 }
 
-/// The current pointer position in window pixels.
-fn pointer(ctx: &CompatCtx) -> Option<(i32, i32)> {
+/// The attached input state, or `None` when the host did not attach one.
+fn input<'a>(ctx: &CompatCtx) -> Option<&'a InputState> {
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
     let services = unsafe { ctx.services() };
     let input = services.input()?;
     // SAFETY: `attach_input` keeps the pointer valid while the binding is
-    // installed; the borrow ends before any VM call.
-    let input = unsafe { &*input };
-    let (x, y) = input.pointer();
+    // installed.
+    Some(unsafe { &*input })
+}
+
+/// The current pointer position in window pixels.
+fn pointer(ctx: &CompatCtx) -> Option<(i32, i32)> {
+    let (x, y) = input(ctx)?.pointer();
     Some((x.round() as i32, y.round() as i32))
 }
 
 /// Whether a standard mouse button is held.
 fn any_mouse_button_down(ctx: &CompatCtx) -> bool {
-    // SAFETY: a `CompatCtx` is only created for a bound, live engine.
-    let services = unsafe { ctx.services() };
-    let Some(input) = services.input() else {
+    let Some(input) = input(ctx) else {
         return false;
     };
-    // SAFETY: `attach_input` keeps the pointer valid while the binding is
-    // installed; the borrow ends before any VM call.
-    let input = unsafe { &*input };
     input.is_button_down(MouseButton::Left)
         || input.is_button_down(MouseButton::Right)
         || input.is_button_down(MouseButton::Middle)
+}
+
+/// Whether the pointer is currently inside the window.
+fn pointer_inside(ctx: &CompatCtx) -> bool {
+    // SAFETY: a `CompatCtx` is only created for a bound, live engine.
+    let services = unsafe { ctx.services() };
+    services.state::<InputDispatchState>().pointer_inside
+}
+
+/// Set the pointer-inside flag.
+fn set_pointer_inside(ctx: &CompatCtx, inside: bool) {
+    // SAFETY: a `CompatCtx` is only created for a bound, live engine.
+    let services = unsafe { ctx.services() };
+    services.state::<InputDispatchState>().pointer_inside = inside;
+}
+
+/// Fire the layer enter/leave transition for a new hit layer.
+///
+/// The reference tracks `LastMouseMoveSent` and fires `onMouseLeave` on the
+/// previous layer and `onMouseEnter` on the new one
+/// (`reference/cpp/core/visual/LayerManager.cpp:437-457`).
+fn track_layer_enter_leave(ctx: &CompatCtx, new_layer: Option<u32>) {
+    let previous = {
+        // SAFETY: a `CompatCtx` is only created for a bound, live engine.
+        let services = unsafe { ctx.services() };
+        services.state::<InputDispatchState>().last_mouse_layer
+    };
+    if previous == new_layer {
+        return;
+    }
+    if let Some(old) = previous
+        && scene(ctx).is_some_and(|scene| scene.layer(old).is_some())
+    {
+        deliver_checked(ctx, "onMouseLeave", &[], Target::Layer(old));
+    }
+    if let Some(new) = new_layer {
+        deliver_checked(ctx, "onMouseEnter", &[], Target::Layer(new));
+    }
+    // SAFETY: a `CompatCtx` is only created for a bound, live engine.
+    let services = unsafe { ctx.services() };
+    services.state::<InputDispatchState>().last_mouse_layer = new_layer;
+}
+
+/// Convert a window-space point into `layer_id`'s coordinate space.
+///
+/// Mirrors the reference `FromPrimaryCoordinates`: each layer's rect offset
+/// is subtracted while walking up the parent chain
+/// (`reference/cpp/core/visual/LayerIntf.cpp`, `Layer.cursorX`).
+fn to_layer_local(ctx: &CompatCtx, layer_id: u32, x: f64, y: f64) -> (f64, f64) {
+    let Some(scene) = scene(ctx) else {
+        return (x, y);
+    };
+    let mut local = (x as f32, y as f32);
+    let mut current = scene.layer(layer_id);
+    while let Some(layer) = current {
+        if layer.parent.is_none() {
+            break;
+        }
+        local.0 -= layer.rect.x as f32;
+        local.1 -= layer.rect.y as f32;
+        current = layer.parent.and_then(|parent| scene.layer(parent));
+    }
+    (f64::from(local.0), f64::from(local.1))
 }
 
 /// The layer that captured the mouse, if any.
@@ -363,6 +655,33 @@ fn focus_clicked_layer(ctx: &CompatCtx, id: u32) {
     unsafe { &mut *scene }.set_focus(id);
 }
 
+/// Deliver a mapped event and report a missing or throwing handler.
+fn deliver_checked(ctx: &CompatCtx, name: &str, args: &[EventValue], target: Target) {
+    if let Err(error) = deliver(ctx, name, args, target) {
+        if is_missing_member(&error) {
+            log::debug!("event adapter: {name} has no handler ({error})");
+        } else {
+            log::warn!("event adapter: {name} dispatch failed ({error})");
+        }
+    }
+}
+
+/// Call `name` on the target's registered script object with `args` as
+/// positional arguments.
+fn deliver(ctx: &CompatCtx, name: &str, args: &[EventValue], target: Target) -> Result<(), String> {
+    // SAFETY: a `CompatCtx` is only created for a bound, live engine.
+    let host = unsafe { ctx.engine() };
+    let (kind, id) = match target {
+        Target::Window(id) => (ObjectKind::Window, id),
+        Target::Layer(id) => (ObjectKind::Layer, id),
+    };
+    let Some(object) = duplicate_object(ctx, host, kind, id) else {
+        return Err(format!("event target {id} has no script object"));
+    };
+    let values: Vec<TjsValue> = args.iter().map(event_value_to_tjs).collect();
+    host.call_member(object.raw_id(), name, &values).map(|_| ())
+}
+
 /// Whether a member call failed because the member is absent.
 fn is_missing_member(error: &str) -> bool {
     error.contains("does not exist")
@@ -376,13 +695,6 @@ pub(crate) fn release_mouse_capture(ctx: &CompatCtx) {
 /// Round a logical coordinate to the TJS integer the event handlers receive.
 fn coordinate(value: f32) -> i64 {
     i64::from(value.round() as i32)
-}
-
-impl EventAdapter {
-    /// The cached pointer position as TJS integers.
-    fn pointer_coordinates(&self) -> (i64, i64) {
-        (coordinate(self.pointer.0), coordinate(self.pointer.1))
-    }
 }
 
 /// Convert a mapped event argument to the TJS value the handler receives.

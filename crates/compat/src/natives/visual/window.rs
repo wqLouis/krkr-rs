@@ -1185,14 +1185,10 @@ extern "C" fn window_get_touch_velocity(
 
 // --- Window event handlers -------------------------------------------------
 
-/// The default body shared by every `Window.on*` event handler.
-///
-/// The reference declares each handler as an empty native method
-/// (`TJS_BEGIN_NATIVE_METHOD_DECL(onClick)` in `WindowImpl.cpp`), which a
-/// script assignment (`win.onClick = function (...) { ... }`) shadows through
-/// the instance's own member — exactly like `MenuItem.onClick`. The L3 event
-/// adapter / `BitmapLayerTreeOwner` invokes the handler by name, so a script
-/// override wins and this no-op otherwise.
+/// The default body of a `Window.on*` handler that does not dispatch an
+/// `action` event. A script assignment (`win.onCloseQuery = function (...) { ... }`)
+/// shadows it through the instance's own member, exactly like
+/// `MenuItem.onClick`.
 extern "C" fn window_noop_handler(
     _engine: *mut c_void,
     _instance: *mut c_void,
@@ -1205,6 +1201,261 @@ extern "C" fn window_noop_handler(
     set_void(out);
     0
 }
+
+/// One named member of the reference action event dictionary and the
+/// positional argument it is copied from (`TVP_ACTION_INVOKE_MEMBER`).
+type EventMember = (&'static str, usize);
+
+/// Copy one raw native argument into an event-dictionary member.
+///
+/// The reference `TVP_ACTION_INVOKE_MEMBER` uses `PropSet` with the variant
+/// untouched, so integers, reals and strings keep their type; an object is
+/// retained so it can cross as [`TjsValue::Retained`] (the retention is
+/// consumed while the variant copy is built).
+fn set_event_member(
+    host: &Tjs2Engine,
+    event: tjs::Tjs2ValueId,
+    name: &str,
+    value: &Value,
+) -> Result<(), String> {
+    match value.ty {
+        tjs::VAL_VOID => host.set_member(event, name, &TjsValue::Void),
+        tjs::VAL_INTEGER => host.set_member(event, name, &TjsValue::Integer(value.integer)),
+        tjs::VAL_REAL => host.set_member(event, name, &TjsValue::Real(value.real)),
+        tjs::VAL_STRING => host.set_member(event, name, &TjsValue::String(value_as_string(value))),
+        _ => {
+            let retained = host.retain_object_arg(value)?;
+            let id = retained.raw_id() as u64;
+            let result = host.set_member(event, name, &TjsValue::Retained(id));
+            drop(retained);
+            result
+        }
+    }
+}
+
+/// Build the reference event dictionary and invoke `owner.action(event)`.
+///
+/// `TVPCreateEventObject` fills `type` and `target`
+/// (`reference/cpp/core/base/EventIntf.cpp:709-736`); each
+/// `TVP_ACTION_INVOKE_MEMBER` then copies a positional argument to its named
+/// member, and `TVP_ACTION_INVOKE_END` calls `action` on the action owner
+/// (`reference/cpp/core/base/EventIntf.h:208-238`). The `FuncCall` result is
+/// never inspected, so a missing `action` member is ignored.
+fn dispatch_action_event(
+    host: &Tjs2Engine,
+    owner: &DetachedValue,
+    objthis: *mut c_void,
+    event_type: &str,
+    argc: c_int,
+    argv: *const Value,
+    members: &[EventMember],
+) -> Result<(), String> {
+    let event = match host.eval_retained("%[]", "Window action") {
+        Ok(RetainedValue::Object(event)) => event,
+        Ok(RetainedValue::Value(value)) => {
+            return Err(format!("event dictionary came back as {value:?}"));
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    host.set_member(event.raw_id(), "type", &TjsValue::String(event_type.into()))?;
+    if !objthis.is_null()
+        && let Ok(target) = host.retain_object_detached(objthis)
+    {
+        let target_id = target.raw_id() as u64;
+        let _ = host.set_member(event.raw_id(), "target", &TjsValue::Retained(target_id));
+        drop(target);
+    }
+    // SAFETY: `argv` carries `argc` live entries for this callback.
+    let raw = unsafe { args(argv, argc) };
+    for &(name, index) in members {
+        if let Some(value) = raw.get(index)
+            && let Err(error) = set_event_member(host, event.raw_id(), name, value)
+        {
+            drop(event);
+            return Err(error);
+        }
+    }
+    let event_id = event.raw_id() as u64;
+    if let Err(error) = host.call_member(owner.raw_id(), "action", &[TjsValue::Retained(event_id)])
+    {
+        log::warn!("{event_type}: action dispatch failed: {error}");
+    }
+    drop(event);
+    Ok(())
+}
+
+/// Define one `Window` event handler that forwards to the object's `action`
+/// member, mirroring the reference `TVP_ACTION_INVOKE_*` body
+/// (`reference/cpp/core/base/EventIntf.h:208-238`).
+///
+/// The generated handler first applies the reference
+/// `if(numparams < argnum) return TJS_E_BADPARAMCOUNT;` check, then builds the
+/// event dictionary and calls `objthis.action(event)`.
+macro_rules! window_action_event {
+    ($name:ident, $event:literal, $argnum:expr, [$(($member:literal, $index:expr)),* $(,)?]) => {
+        extern "C" fn $name(
+            engine: *mut c_void,
+            _instance: *mut c_void,
+            argc: c_int,
+            argv: *const Value,
+            out: *mut Value,
+            out_error: *mut *mut c_char,
+            objthis: *mut c_void,
+        ) -> c_int {
+            if argc < $argnum {
+                return report_error(
+                    out_error,
+                    concat!(
+                        "Window.",
+                        $event,
+                        ": requires ",
+                        stringify!($argnum),
+                        " arguments"
+                    ),
+                );
+            }
+            let Ok((resolved, _ctx)) = bound(engine) else {
+                return report_error(
+                    out_error,
+                    concat!("Window.", $event, ": compat context is not bound"),
+                );
+            };
+            let host = resolved.engine();
+            let owner = match host.retain_object_detached(objthis) {
+                Ok(owner) => owner,
+                Err(error) => {
+                    return report_error(
+                        out_error,
+                        &format!("Window.{}: {error}", $event),
+                    );
+                }
+            };
+            let result = dispatch_action_event(
+                host,
+                &owner,
+                objthis,
+                $event,
+                argc,
+                argv,
+                &[$(($member, $index)),*],
+            );
+            drop(owner);
+            match result {
+                Ok(()) => {
+                    set_void(out);
+                    0
+                }
+                Err(error) => report_error(out_error, &format!("Window.{}: {error}", $event)),
+            }
+        }
+    };
+}
+
+// The member names and argument counts are the reference
+// `TVP_ACTION_INVOKE_BEGIN`/`TVP_ACTION_INVOKE_MEMBER` pairs
+// (`reference/cpp/core/visual/WindowIntf.cpp:934-1250`).
+window_action_event!(window_on_activate, "onActivate", 0, []);
+window_action_event!(window_on_deactivate, "onDeactivate", 0, []);
+window_action_event!(window_on_resize, "onResize", 0, []);
+window_action_event!(window_on_mouse_enter, "onMouseEnter", 0, []);
+window_action_event!(window_on_mouse_leave, "onMouseLeave", 0, []);
+window_action_event!(window_on_click, "onClick", 2, [("x", 0), ("y", 1)]);
+window_action_event!(
+    window_on_double_click,
+    "onDoubleClick",
+    2,
+    [("x", 0), ("y", 1)]
+);
+window_action_event!(
+    window_on_mouse_down,
+    "onMouseDown",
+    4,
+    [("x", 0), ("y", 1), ("button", 2), ("shift", 3)]
+);
+window_action_event!(
+    window_on_mouse_up,
+    "onMouseUp",
+    4,
+    [("x", 0), ("y", 1), ("button", 2), ("shift", 3)]
+);
+window_action_event!(
+    window_on_mouse_move,
+    "onMouseMove",
+    3,
+    [("x", 0), ("y", 1), ("shift", 2)]
+);
+window_action_event!(
+    window_on_mouse_wheel,
+    "onMouseWheel",
+    4,
+    [("shift", 0), ("delta", 1), ("x", 2), ("y", 3)]
+);
+window_action_event!(
+    window_on_touch_down,
+    "onTouchDown",
+    5,
+    [("x", 0), ("y", 1), ("cx", 2), ("cy", 3), ("id", 4)]
+);
+window_action_event!(
+    window_on_touch_up,
+    "onTouchUp",
+    5,
+    [("x", 0), ("y", 1), ("cx", 2), ("cy", 3), ("id", 4)]
+);
+window_action_event!(
+    window_on_touch_move,
+    "onTouchMove",
+    5,
+    [("x", 0), ("y", 1), ("cx", 2), ("cy", 3), ("id", 4)]
+);
+window_action_event!(
+    window_on_touch_scaling,
+    "onTouchScaling",
+    5,
+    [
+        ("startdistance", 0),
+        ("currentdistance", 1),
+        ("cx", 2),
+        ("cy", 3),
+        ("flag", 4)
+    ]
+);
+window_action_event!(
+    window_on_touch_rotate,
+    "onTouchRotate",
+    6,
+    [
+        ("startangle", 0),
+        ("currentangle", 1),
+        ("distance", 2),
+        ("cx", 3),
+        ("cy", 4),
+        ("flag", 5)
+    ]
+);
+window_action_event!(window_on_multi_touch, "onMultiTouch", 0, []);
+window_action_event!(
+    window_on_key_down,
+    "onKeyDown",
+    2,
+    [("key", 0), ("shift", 1)]
+);
+window_action_event!(window_on_key_up, "onKeyUp", 2, [("key", 0), ("shift", 1)]);
+window_action_event!(window_on_key_press, "onKeyPress", 1, [("key", 0)]);
+window_action_event!(window_on_popup_hide, "onPopupHide", 0, []);
+window_action_event!(window_on_file_drop, "onFileDrop", 1, [("files", 0)]);
+window_action_event!(
+    window_on_display_rotate,
+    "onDisplayRotate",
+    5,
+    [
+        ("orientation", 0),
+        ("angle", 1),
+        ("bpp", 2),
+        ("width", 3),
+        ("height", 4)
+    ]
+);
 
 // --- Window input ----------------------------------------------------------
 
@@ -1697,11 +1948,11 @@ pub(super) fn register_window_class(ctx: &mut CompatCtx) -> Result<(), CompatErr
             },
             NativeInstanceMethodDef {
                 name: "onActivate",
-                f: window_noop_handler,
+                f: window_on_activate,
             },
             NativeInstanceMethodDef {
                 name: "onClick",
-                f: window_noop_handler,
+                f: window_on_click,
             },
             NativeInstanceMethodDef {
                 name: "onCloseQuery",
@@ -1709,87 +1960,87 @@ pub(super) fn register_window_class(ctx: &mut CompatCtx) -> Result<(), CompatErr
             },
             NativeInstanceMethodDef {
                 name: "onDeactivate",
-                f: window_noop_handler,
+                f: window_on_deactivate,
             },
             NativeInstanceMethodDef {
                 name: "onDisplayRotate",
-                f: window_noop_handler,
+                f: window_on_display_rotate,
             },
             NativeInstanceMethodDef {
                 name: "onDoubleClick",
-                f: window_noop_handler,
+                f: window_on_double_click,
             },
             NativeInstanceMethodDef {
                 name: "onFileDrop",
-                f: window_noop_handler,
+                f: window_on_file_drop,
             },
             NativeInstanceMethodDef {
                 name: "onKeyDown",
-                f: window_noop_handler,
+                f: window_on_key_down,
             },
             NativeInstanceMethodDef {
                 name: "onKeyPress",
-                f: window_noop_handler,
+                f: window_on_key_press,
             },
             NativeInstanceMethodDef {
                 name: "onKeyUp",
-                f: window_noop_handler,
+                f: window_on_key_up,
             },
             NativeInstanceMethodDef {
                 name: "onMouseDown",
-                f: window_noop_handler,
+                f: window_on_mouse_down,
             },
             NativeInstanceMethodDef {
                 name: "onMouseEnter",
-                f: window_noop_handler,
+                f: window_on_mouse_enter,
             },
             NativeInstanceMethodDef {
                 name: "onMouseLeave",
-                f: window_noop_handler,
+                f: window_on_mouse_leave,
             },
             NativeInstanceMethodDef {
                 name: "onMouseMove",
-                f: window_noop_handler,
+                f: window_on_mouse_move,
             },
             NativeInstanceMethodDef {
                 name: "onMouseUp",
-                f: window_noop_handler,
+                f: window_on_mouse_up,
             },
             NativeInstanceMethodDef {
                 name: "onMouseWheel",
-                f: window_noop_handler,
+                f: window_on_mouse_wheel,
             },
             NativeInstanceMethodDef {
                 name: "onMultiTouch",
-                f: window_noop_handler,
+                f: window_on_multi_touch,
             },
             NativeInstanceMethodDef {
                 name: "onPopupHide",
-                f: window_noop_handler,
+                f: window_on_popup_hide,
             },
             NativeInstanceMethodDef {
                 name: "onResize",
-                f: window_noop_handler,
+                f: window_on_resize,
             },
             NativeInstanceMethodDef {
                 name: "onTouchDown",
-                f: window_noop_handler,
+                f: window_on_touch_down,
             },
             NativeInstanceMethodDef {
                 name: "onTouchMove",
-                f: window_noop_handler,
+                f: window_on_touch_move,
             },
             NativeInstanceMethodDef {
                 name: "onTouchRotate",
-                f: window_noop_handler,
+                f: window_on_touch_rotate,
             },
             NativeInstanceMethodDef {
                 name: "onTouchScaling",
-                f: window_noop_handler,
+                f: window_on_touch_scaling,
             },
             NativeInstanceMethodDef {
                 name: "onTouchUp",
-                f: window_noop_handler,
+                f: window_on_touch_up,
             },
         ],
         properties: vec![

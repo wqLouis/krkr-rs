@@ -7,6 +7,7 @@
 
 mod common;
 
+use api::host::TouchPhase;
 use common::{Env, vm_lock};
 use platform::{InputEvent, MouseButton, PlatformEvent};
 
@@ -249,4 +250,198 @@ fn dispatch_skips_an_invalidated_layer() {
     assert_eq!(env.eval_int("upperMoves"), 0);
     // reference/cpp/core/visual/LayerManager.cpp:345-372
     assert_eq!(env.eval_int("lowerMoves"), 1);
+}
+
+/// Committed text posts `onKeyPress(key, process)` to the focused layer and
+/// the window, and the window native forwards the event dictionary to
+/// `action`.
+///
+/// Reference: `FireKeyPress` posts `(char, true)`
+/// (`reference/cpp/core/visual/LayerIntf.cpp:3868-3877`) and `OnKeyPress`
+/// posts `onKeyPress(key)` to the window (`reference/cpp/core/visual/WindowIntf.cpp:509-525`),
+/// whose native calls `objthis.action(event)`
+/// (`reference/cpp/core/base/EventIntf.h:208-238`).
+#[test]
+fn dispatch_delivers_text_as_on_key_press_to_layer_and_window() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var l = new Layer(w, null); l.focusable = true; l.visible = true; \
+         w.focusedLayer = l; \
+         var layerPress = 0; var layerKey = ''; var layerProcess = -1; \
+         l.onKeyPress = function(key, process) { layerPress = layerPress + 1; layerKey = '' + key; layerProcess = process; }; \
+         var actionCalls = 0; var actionType = ''; var actionKey = ''; var actionTarget = 0; \
+         w.action = function(ev) { actionCalls = actionCalls + 1; actionType = '' + ev.type; actionKey = '' + ev.key; if (ev.target === w) actionTarget = 1; };",
+    );
+
+    env.dispatch_events(&[PlatformEvent::Input(InputEvent::Text("a".into()))]);
+
+    // reference/cpp/core/visual/LayerIntf.cpp:3868-3877
+    assert_eq!(env.eval_int("layerPress"), 1);
+    assert_eq!(env.eval_int("layerKey === 'a'"), 1);
+    assert_eq!(env.eval_int("layerProcess"), 1);
+    // reference/cpp/core/visual/WindowIntf.cpp:509-525
+    assert_eq!(env.eval_int("actionCalls"), 1);
+    assert_eq!(env.eval_int("actionType === 'onKeyPress'"), 1);
+    assert_eq!(env.eval_int("actionKey === 'a'"), 1);
+    assert_eq!(env.eval_int("actionTarget"), 1);
+}
+
+/// A mouse release inside the click sequence posts `onClick`, and the second
+/// release of the sequence posts `onDoubleClick`, to the hit layer and to the
+/// window's `action`.
+///
+/// Reference: `PrimaryClick`/`PrimaryDoubleClick` fire the layer events
+/// (`reference/cpp/core/visual/LayerManager.cpp:358-372`) and `OnClick`
+/// posts the window event (`reference/cpp/core/visual/WindowIntf.cpp:311-322`).
+#[test]
+fn dispatch_synthesises_click_and_double_click_on_release() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); w.setSize(320, 240); \
+         var l = new Layer(w, null); l.setPos(0, 0); l.setSize(100, 50); l.visible = true; l.hitThreshold = 0; \
+         var clicks = 0; var doubles = 0; \
+         l.onClick = function(x, y) { clicks = clicks + 1; }; \
+         l.onDoubleClick = function(x, y) { doubles = doubles + 1; }; \
+         var actionClicks = 0; var actionDoubles = 0; \
+         w.action = function(ev) { if (ev.type === 'onClick') actionClicks = actionClicks + 1; if (ev.type === 'onDoubleClick') actionDoubles = actionDoubles + 1; };",
+    );
+
+    env.dispatch_events(&[
+        PlatformEvent::Input(InputEvent::PointerMoved { x: 10.0, y: 10.0 }),
+        PlatformEvent::Input(InputEvent::MouseButton {
+            button: MouseButton::Left,
+            pressed: true,
+        }),
+        PlatformEvent::Input(InputEvent::MouseButton {
+            button: MouseButton::Left,
+            pressed: false,
+        }),
+    ]);
+    // reference/cpp/core/visual/LayerManager.cpp:358-364
+    assert_eq!(env.eval_int("clicks"), 1);
+    assert_eq!(env.eval_int("doubles"), 0);
+    assert_eq!(env.eval_int("actionClicks"), 1);
+    assert_eq!(env.eval_int("actionDoubles"), 0);
+
+    env.dispatch_events(&[
+        PlatformEvent::Input(InputEvent::MouseButton {
+            button: MouseButton::Left,
+            pressed: true,
+        }),
+        PlatformEvent::Input(InputEvent::MouseButton {
+            button: MouseButton::Left,
+            pressed: false,
+        }),
+    ]);
+    // reference/cpp/core/visual/LayerManager.cpp:366-372
+    assert_eq!(env.eval_int("clicks"), 1);
+    assert_eq!(env.eval_int("doubles"), 1);
+    assert_eq!(env.eval_int("actionDoubles"), 1);
+}
+
+/// The hit-test transition fires `onMouseLeave` on the previous layer and
+/// `onMouseEnter` on the new one.
+///
+/// Reference: `LastMouseMoveSent->FireMouseLeave()` then `FireMouseEnter`
+/// (`reference/cpp/core/visual/LayerManager.cpp:437-457`).
+#[test]
+fn dispatch_tracks_layer_enter_and_leave() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); w.setSize(320, 240); \
+         var a = new Layer(w, null); a.setPos(0, 0); a.setSize(50, 50); a.visible = true; a.hitThreshold = 0; \
+         var b = new Layer(w, null); b.setPos(60, 0); b.setSize(50, 50); b.visible = true; b.hitThreshold = 0; \
+         var aEnter = 0; var aLeave = 0; var bEnter = 0; \
+         a.onMouseEnter = function() { aEnter = aEnter + 1; }; \
+         a.onMouseLeave = function() { aLeave = aLeave + 1; }; \
+         b.onMouseEnter = function() { bEnter = bEnter + 1; };",
+    );
+
+    env.dispatch_events(&[PlatformEvent::Input(InputEvent::PointerMoved {
+        x: 10.0,
+        y: 10.0,
+    })]);
+    // reference/cpp/core/visual/LayerManager.cpp:440-457
+    assert_eq!(env.eval_int("aEnter"), 1);
+    assert_eq!(env.eval_int("aLeave"), 0);
+
+    env.dispatch_events(&[PlatformEvent::Input(InputEvent::PointerMoved {
+        x: 70.0,
+        y: 10.0,
+    })]);
+    // reference/cpp/core/visual/LayerManager.cpp:437-457
+    assert_eq!(env.eval_int("aLeave"), 1);
+    assert_eq!(env.eval_int("bEnter"), 1);
+}
+
+/// A touch contact posts the layer touch handler with
+/// `(x, y, cx, cy, id)`.
+///
+/// Reference: `FireTouchDown` posts `onTouchDown` with `(x, y, cx, cy, id)`
+/// (`reference/cpp/core/visual/LayerIntf.cpp:3479-3487`), and the manager
+/// hit-tests the layer at the touch point
+/// (`reference/cpp/core/visual/LayerManager.cpp:516-524`).
+#[test]
+fn dispatch_delivers_touch_to_the_hit_layer() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); w.setSize(320, 240); \
+         var l = new Layer(w, null); l.setPos(0, 0); l.setSize(100, 50); l.visible = true; l.hitThreshold = 0; \
+         var downs = 0; var tx = -1.0; var ty = -1.0; var tid = -1; \
+         l.onTouchDown = function(x, y, cx, cy, id) { downs = downs + 1; tx = x; ty = y; tid = id; };",
+    );
+
+    env.dispatch_events(&[PlatformEvent::Input(InputEvent::Touch {
+        id: 3,
+        phase: TouchPhase::Started,
+        x: 10.0,
+        y: 20.0,
+    })]);
+    // reference/cpp/core/visual/LayerIntf.cpp:3479-3487
+    assert_eq!(env.eval_int("downs"), 1);
+    assert_eq!(env.eval_real("tx"), 10.0);
+    assert_eq!(env.eval_real("ty"), 20.0);
+    assert_eq!(env.eval_int("tid"), 3);
+}
+
+/// The window native handlers forward to `action` with the reference event
+/// dictionary: `type` (the handler name), `target` (the window object) and the
+/// named members taken from the positional arguments.
+///
+/// Reference: `OnMouseDown` posts `onMouseDown` to the window
+/// (`reference/cpp/core/visual/WindowIntf.cpp:331-345`), whose native builds
+/// `TVPCreateEventObject` + `TVP_ACTION_INVOKE_MEMBER` and calls
+/// `objthis.action(event)` (`reference/cpp/core/base/EventIntf.h:208-238`).
+#[test]
+fn dispatch_forwards_window_input_to_action_with_the_event_dictionary() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); w.setSize(320, 240); \
+         var l = new Layer(w, null); l.setPos(0, 0); l.setSize(100, 50); l.visible = true; l.hitThreshold = 0; \
+         var type = ''; var x = -1; var y = -1; var button = -1; var shift = -1; var target = 0; \
+         w.action = function(ev) { type = '' + ev.type; x = ev.x; y = ev.y; button = ev.button; shift = ev.shift; if (ev.target === w) target = 1; };",
+    );
+
+    env.dispatch_events(&[
+        PlatformEvent::Input(InputEvent::PointerMoved { x: 10.0, y: 10.0 }),
+        PlatformEvent::Input(InputEvent::MouseButton {
+            button: MouseButton::Left,
+            pressed: true,
+        }),
+    ]);
+    // reference/cpp/core/visual/WindowIntf.cpp:331-345
+    assert_eq!(env.eval_int("type === 'onMouseDown'"), 1);
+    assert_eq!(env.eval_int("x"), 10);
+    assert_eq!(env.eval_int("y"), 10);
+    assert_eq!(env.eval_int("button"), 0);
+    // `TVP_SS_LEFT` (0x08) from the held left button
+    // reference/cpp/core/environ/impl/TVPWindow.cpp:531-556
+    assert_eq!(env.eval_int("shift"), 8);
+    assert_eq!(env.eval_int("target"), 1);
 }

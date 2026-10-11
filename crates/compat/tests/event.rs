@@ -1,5 +1,6 @@
 //! Integration tests for the L1 → TJS event adapter.
 
+use api::host::TouchPhase;
 use compat::{EventAdapter, EventValue, TjsEvent};
 use platform::{InputEvent, MouseButton, PlatformEvent};
 
@@ -100,18 +101,95 @@ fn maps_keys_pointer_and_lifecycle_events() {
 }
 
 #[test]
+fn maps_text_touch_and_pointer_leave() {
+    let adapter = EventAdapter::new();
+
+    // Committed text posts `onKeyPress(key, process)` with `process = true`:
+    // `FireKeyPress` posts `(char, true)`
+    // (`reference/cpp/core/visual/LayerIntf.cpp:3868-3877`).
+    assert_eq!(
+        adapter.map(&PlatformEvent::Input(InputEvent::Text("a".into()))),
+        Some(TjsEvent {
+            name: "onKeyPress",
+            args: vec![EventValue::Str("a".into()), EventValue::Int(1)],
+        })
+    );
+
+    // A touch contact posts the layer touch event with
+    // `(x, y, cx, cy, id)`: `FireTouchDown`
+    // (`reference/cpp/core/visual/LayerIntf.cpp:3479-3487`).
+    assert_eq!(
+        adapter.map(&PlatformEvent::Input(InputEvent::Touch {
+            id: 7,
+            phase: TouchPhase::Started,
+            x: 3.0,
+            y: 4.0,
+        })),
+        Some(TjsEvent {
+            name: "onTouchDown",
+            args: vec![
+                EventValue::Real(3.0),
+                EventValue::Real(4.0),
+                EventValue::Real(3.0),
+                EventValue::Real(4.0),
+                EventValue::Int(7),
+            ],
+        })
+    );
+    assert_eq!(
+        adapter.map(&PlatformEvent::Input(InputEvent::Touch {
+            id: 7,
+            phase: TouchPhase::Moved,
+            x: 5.0,
+            y: 6.0,
+        })),
+        Some(TjsEvent {
+            name: "onTouchMove",
+            args: vec![
+                EventValue::Real(5.0),
+                EventValue::Real(6.0),
+                EventValue::Real(5.0),
+                EventValue::Real(6.0),
+                EventValue::Int(7),
+            ],
+        })
+    );
+    assert_eq!(
+        adapter.map(&PlatformEvent::Input(InputEvent::Touch {
+            id: 7,
+            phase: TouchPhase::Ended,
+            x: 5.0,
+            y: 6.0,
+        })),
+        Some(TjsEvent {
+            name: "onTouchUp",
+            args: vec![
+                EventValue::Real(5.0),
+                EventValue::Real(6.0),
+                EventValue::Real(5.0),
+                EventValue::Real(6.0),
+                EventValue::Int(7),
+            ],
+        })
+    );
+
+    // The pointer leaving the window posts the window-level `onMouseLeave`
+    // (`tTVPOnMouseLeaveInputEvent`,
+    // `reference/cpp/core/visual/WindowIntf.h:479-485`).
+    assert_eq!(
+        adapter.map(&PlatformEvent::Input(InputEvent::PointerLeft)),
+        Some(TjsEvent {
+            name: "onMouseLeave",
+            args: Vec::new(),
+        })
+    );
+}
+
+#[test]
 fn ignores_events_without_a_script_handler() {
     let adapter = EventAdapter::new();
     // The scale factor is an L1 DPI concept; TVP exposes no window handler for
     // it (the reference window handlers are
     // `reference/cpp/core/visual/WindowIntf.cpp:934-1250`).
     assert_eq!(adapter.map(&PlatformEvent::ScaleFactorChanged(2.0)), None);
-    // A raw pointer leave is not the layer `onMouseLeave`: the reference fires
-    // that from the manager's enter/leave tracking
-    // (`reference/cpp/core/visual/LayerManager.cpp:424-461`), not from a
-    // platform leave event.
-    assert_eq!(
-        adapter.map(&PlatformEvent::Input(InputEvent::PointerLeft)),
-        None
-    );
 }
