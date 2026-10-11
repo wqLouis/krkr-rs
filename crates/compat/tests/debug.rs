@@ -343,6 +343,46 @@ fn properties_round_trip() {
     });
 }
 
+#[test]
+fn log_location_clears_archive_names_and_honours_forcelog() {
+    let _lock = vm_lock();
+    let dir = std::env::temp_dir().join(format!(
+        "krkr_debug_force_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let literal = dir.to_string_lossy().replace('\\', "/");
+    let file = dir.join("krkr.console.log");
+
+    with_vm(|e| {
+        // An in-archive name has no local form and clears the location
+        // (`DebugIntf.cpp:518-532`, `StorageIntf.cpp:554-560`).
+        e.exec_script("Debug.logLocation = 'x.xp3>y';", "t")
+            .unwrap();
+        assert_eq!(
+            e.eval("Debug.logLocation", "t").unwrap(),
+            TjsValue::String(String::new())
+        );
+
+        // `-forcelog=yes` starts logging at the next location
+        // (`DebugIntf.cpp:534-543`).
+        e.exec_script("System.setArgument('-forcelog', 'yes');", "t")
+            .unwrap();
+        e.exec_script(&format!("Debug.logLocation = '{literal}';"), "t")
+            .unwrap();
+        e.exec_script("Debug.message('forced');", "t").unwrap();
+    });
+
+    let written = std::fs::read_to_string(&file)
+        .unwrap_or_else(|error| panic!("-forcelog=yes must open the log file: {error}"));
+    assert!(written.contains("forced"), "log: {written:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Reference: `startLogToFile` takes an **optional clear flag**, not a
 /// filename (`reference/cpp/core/utils/DebugIntf.cpp:620-630`); the stream
 /// is `{logLocation}/krkr.console.log`

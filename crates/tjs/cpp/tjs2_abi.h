@@ -85,13 +85,27 @@ void tjs2_set_log_cb(tjs2_engine *e, tjs2_log_cb cb, void *user);
  * non-NULL, fills it. On failure returns non-zero and, if out_error is
  * non-NULL, points it at a malloc'd UTF-8 message (free with
  * tjs2_free_string).
+ *
+ * `context` is the raw iTJSDispatch2* the script runs with as `this` (the
+ * `context` argument of the reference `TJS::tTJS::ExecScript`), or NULL for
+ * the global object. `lineofs` shifts the reported line numbers (the
+ * reference `lineofs`).
  */
 int tjs2_exec_script(tjs2_engine *e, const char *script, const char *name,
-                     tjs2_value *out_result, char **out_error);
+                     void *context, int lineofs, tjs2_value *out_result,
+                     char **out_error);
 
 /* Evaluate a TJS expression (UTF-8). Same conventions as tjs2_exec_script. */
 int tjs2_eval(tjs2_engine *e, const char *expression, const char *name,
-              tjs2_value *out_result, char **out_error);
+              void *context, int lineofs, tjs2_value *out_result,
+              char **out_error);
+
+/*
+ * Replace the text of the registered TJS message named `name` (UTF-8) and
+ * return 1, or return 0 when no message by that name is registered
+ * (reference `TJS::TJSAssignMessage`).
+ */
+int tjs2_assign_message(const char *name, const char *message);
 
 /*
  * Compile a UTF-8 script to a binary bytecode stream (reference
@@ -110,6 +124,21 @@ int tjs2_compile_script(tjs2_engine *e, const char *script,
                         const char *output_path, int isresult,
                         int outputdebug, int isexpression, const char *name,
                         int lineofs, char **out_error);
+
+/*
+ * The vendored TJS2 engine version as `major.minor.release` UTF-8 (reference
+ * `TJSVersionMajor`/`TJSVersionMinor`/`TJSVersionRelease`, `tjs.cpp:44-46`).
+ * The returned pointer is a static string; do not free it.
+ */
+const char *tjs2_tjs_version_string(void);
+
+/*
+ * The C++ translation unit's compile date/time (`__DATE__`/`__TIME__`) as
+ * static strings, the counterpart of the reference's `TVPCompileDate` /
+ * `TVPCompileTime` (`MsgIntf.cpp:136-137`). Do not free them.
+ */
+const char *tjs2_compile_date(void);
+const char *tjs2_compile_time(void);
 
 /*
  * Dump every live script block to the engine's console/log output

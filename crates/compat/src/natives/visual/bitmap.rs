@@ -662,6 +662,36 @@ extern "C" fn bitmap_copy_from(
     0
 }
 
+/// Fold the `meta.bpp` save option into the encoder's type hint. The
+/// reference `TVPSaveAsBMP` reads the meta dictionary's `bpp` member
+/// (`GraphicsLoaderIntf.cpp`); the L1 encoder only takes options through its
+/// hint, so only the BMP bit depth is translated. Every other option is
+/// accepted and ignored here.
+fn apply_save_meta(host: &Tjs2Engine, value: &Value, type_name: &str) -> Result<String, String> {
+    let lower = type_name.to_ascii_lowercase();
+    let is_bmp = lower.starts_with("bmp")
+        || lower.ends_with(".bmp")
+        || lower.ends_with(".dib")
+        || lower == "dib"
+        || lower == "bmp";
+    if !is_bmp {
+        return Ok(type_name.to_string());
+    }
+    let object = host.retain_object_arg(value)?;
+    // The reference checks `TJS_SUCCEEDED(PropGet(...))`, so a missing `bpp`
+    // is simply "use the handler default".
+    let bpp = match host.member(object.raw_id(), "bpp") {
+        Ok(TjsValue::Integer(bpp)) => bpp,
+        Ok(TjsValue::Real(bpp)) => bpp as i64,
+        Ok(_) | Err(_) => return Ok(type_name.to_string()),
+    };
+    Ok(match bpp {
+        24 => "bmp24".to_string(),
+        8 => "bmp8".to_string(),
+        _ => type_name.to_string(),
+    })
+}
+
 /// `Bitmap.save(name[, type[, meta]])` — encode this bitmap and write it
 /// through the installed host saver. The L2 [`Storage`] API is read-only, so
 /// the host owns the write; without an installed encoder the member raises a
@@ -678,7 +708,7 @@ extern "C" fn bitmap_save(
     if argc < 1 {
         return report_error(out_error, "Bitmap.save requires a storage name");
     }
-    let Ok((_resolved, ctx)) = bound(engine) else {
+    let Ok((resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Bitmap.save: compat context is not bound");
     };
     let a = unsafe { args(argv, argc) };
@@ -687,15 +717,27 @@ extern "C" fn bitmap_save(
         return report_error(out_error, "Bitmap.save: the storage name is empty");
     }
     let type_name = match a.get(1) {
-        Some(value) if value.ty != VAL_VOID => {
-            let text = value_as_string(value);
-            if text.is_empty() {
-                "bmp".to_string()
-            } else {
-                text
+        // Reference `Bitmap.save`: a present, non-void argument is used
+        // verbatim, including the empty string (`BitmapIntf.cpp:330-333`);
+        // only an absent/void argument falls back to `"bmp"`.
+        Some(value) if value.ty != VAL_VOID => value_as_string(value),
+        _ => "bmp".to_string(),
+    };
+    // The meta dictionary drives the save options (`BitmapIntf.cpp:334-336`,
+    // `TVPSaveImage`). The L1 encoder only accepts options through its type
+    // hint, so the BMP `bpp` option is folded into it; the argument is read
+    // and validated even when no option applies.
+    let type_name = match a.get(2) {
+        Some(value) if value.ty == tjs::VAL_OBJECT => {
+            match apply_save_meta(resolved.engine(), value, &type_name) {
+                Ok(type_name) => type_name,
+                Err(error) => return report_error(out_error, &format!("Bitmap.save: {error}")),
             }
         }
-        _ => "bmp".to_string(),
+        Some(value) if value.ty != VAL_VOID && value.ty != tjs::VAL_NULL => {
+            return report_error(out_error, "Bitmap.save: the meta argument is not an object");
+        }
+        _ => type_name,
     };
     let (id, loading) = {
         let inst = unsafe { &*(instance as *const BitmapInst) };
@@ -886,7 +928,14 @@ extern "C" fn bitmap_load_header(
     };
     let info = match probe_image(services, &resolved_name, &bytes) {
         Ok(info) => info,
-        Err(error) => return report_error(out_error, &format!("Bitmap.loadHeader: {error}")),
+        Err(error) => {
+            // The reference header router leaves the result void when no
+            // handler accepts the data; it does not raise
+            // (`BitmapIntf.cpp:378-401`). Log the reason and yield void.
+            log::warn!("Bitmap.loadHeader: no header handler accepted {name:?}: {error}");
+            set_void(out);
+            return 0;
+        }
     };
     let bpp = if info.has_alpha { 32 } else { 24 };
     let host = resolved.engine();

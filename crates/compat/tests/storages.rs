@@ -20,7 +20,7 @@ use tjs::{Tjs2Engine, TjsValue};
 /// keeps the `Tjs2Engine` on the heap) and (b) the host's `Drop` removes the
 /// process-wide binding before the VM is destroyed.
 struct Env {
-    host: CompatHost,
+    _host: CompatHost,
     engine: Box<Tjs2Engine>,
 }
 
@@ -29,7 +29,10 @@ impl Env {
         let engine = Box::new(Tjs2Engine::new().expect("create engine"));
         let mut host = CompatHost::new();
         host.install(&engine).expect("install compat surface");
-        Env { host, engine }
+        Env {
+            _host: host,
+            engine,
+        }
     }
 
     fn eval(&self, expression: &str) -> Result<TjsValue, String> {
@@ -166,79 +169,24 @@ fn missing_arguments_are_reported() {
 }
 
 #[test]
-fn search_cd_and_select_file_require_the_host_seam() {
+fn search_cd_and_select_file_return_the_reference_inert_values() {
     let _lock = vm_lock();
     let env = Env::new();
-    for expression in [
-        "Storages.searchCD('GAME')",
-        "Storages.selectFile(%[name: 'x.ks'])",
-    ] {
-        let message = env.error(expression);
-        assert!(
-            message.contains("host"),
-            "{expression:?} should name the missing host seam, got: {message}"
-        );
-    }
-    // Arity and parameter shape are validated before the seam is consulted.
+    // `TVPSearchCD` and `TVPSelectFile` return their inert values without a
+    // host seam (`StorageImpl.cpp:1232-1246`, `FileSelector.cpp:100-420`).
+    assert_eq!(
+        env.eval_ok("Storages.searchCD('GAME')"),
+        TjsValue::String(String::new())
+    );
+    assert_eq!(
+        env.eval_ok("Storages.selectFile(%[name: 'x.ks'])"),
+        TjsValue::Integer(0)
+    );
+    // Arity and parameter shape are still validated.
     assert!(env.error("Storages.searchCD()").contains("requires"));
     assert!(env.error("Storages.selectFile()").contains("requires"));
     assert!(
         env.error("Storages.selectFile(42)")
             .contains("parameter object")
     );
-}
-
-#[test]
-fn host_seam_serves_search_cd_and_select_file() {
-    let _lock = vm_lock();
-    let env = Env::new();
-    env.host.set_search_cd(|label| {
-        Ok(if label == "GAME" {
-            "D".to_string()
-        } else {
-            String::new()
-        })
-    });
-    assert_eq!(
-        env.eval_ok("Storages.searchCD('GAME')"),
-        TjsValue::String("D".into())
-    );
-    assert_eq!(
-        env.eval_ok("Storages.searchCD('OTHER')"),
-        TjsValue::String(String::new())
-    );
-
-    env.host
-        .set_select_file(|title, dir, name, ext, filter, save| {
-            assert_eq!(title, Some("Open"));
-            assert_eq!(dir, Some("data/"));
-            assert_eq!(name, Some("start.ks"));
-            assert_eq!(ext, Some("ks"));
-            assert_eq!(filter, Some("Scripts|*.ks"));
-            assert!(save);
-            Ok(Some("data/chosen.ks".to_string()))
-        });
-    env.engine
-        .exec_script(
-            "var p = %[title: 'Open', initialDir: 'data/', name: 'start.ks', \
-             defaultExt: 'ks', filter: 'Scripts|*.ks', save: true];",
-            "test",
-        )
-        .unwrap();
-    assert_eq!(env.eval_ok("Storages.selectFile(p)"), TjsValue::Integer(1));
-    // The selected name is written back to the parameter object.
-    assert_eq!(
-        env.eval_ok("p.name"),
-        TjsValue::String("data/chosen.ks".into())
-    );
-
-    // A cancelled chooser returns false and leaves `name` untouched.
-    env.host.set_select_file(|_, _, _, _, _, _| Ok(None));
-    env.engine
-        .exec_script(
-            "var q = %[name: 'keep.ks']; Storages.selectFile(q);",
-            "test",
-        )
-        .unwrap();
-    assert_eq!(env.eval_ok("q.name"), TjsValue::String("keep.ks".into()));
 }

@@ -50,7 +50,7 @@ use tjs::{
     TjsValue, VAL_NULL, VAL_OBJECT, VAL_RETAINED, Value,
 };
 
-use super::system::{resolve, set_string_out, try_value_as_i64, value_as_bool};
+use super::system::{get_command_line, resolve, set_string_out, try_value_as_i64, value_as_bool};
 use crate::native_util::{args, report_error, set_bool, set_void, value_as_string};
 use crate::natives::storages::normalize_storage_name;
 use crate::{CompatCtx, CompatError, CompatServices};
@@ -890,22 +890,39 @@ extern "C" fn prop_log_location_set(
         return report_error(out_error, "Debug.logLocation: missing value");
     }
     // SAFETY: the trampoline passes a valid value slot for the call.
-    // Reference `TVPSetLogLocation`: `TVPLogLocation =
-    // TVPNormalizeStorageName(loc)` then `TVPLogStreamHolder.Reopen()`
-    // (`DebugIntf.cpp:518-532`) — the stream closes and the next line reopens
-    // it at the new location. The reference also clears the location when it
-    // has no locally accessible form and re-checks the `-forcelog` command
-    // line; neither has a host seam here.
+    // Reference `TVPSetLogLocation` (`DebugIntf.cpp:518-543`): normalize the
+    // name, then `TVPGetLocallyAccessibleName`; an in-archive name has no
+    // local form and clears the location (`StorageIntf.cpp:554-560`), then
+    // `TVPLogStreamHolder.Reopen()`, then the `-forcelog` option.
     let location = normalize_storage_name(&value_as_string(unsafe { &*value }));
     let ctx = resolved.ctx();
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
+    let services = unsafe { ctx.services() };
+    let location = if location.contains('>') {
+        String::new()
+    } else {
+        location
+    };
     {
-        let mut state = unsafe { ctx.services() }.state::<DebugState>();
+        let mut state = services.state::<DebugState>();
         state.log_location = location;
         // `Reopen()` (`DebugIntf.cpp:230-232`): close the stream; a failed
         // open may be retried at the new location.
         state.log_file = None;
         state.log_open_failed = false;
+    }
+    // `-forcelog=yes` starts logging, `-forcelog=clear` truncates first
+    // (`DebugIntf.cpp:534-543`).
+    if let Some(value) = get_command_line(services, "-forcelog") {
+        let clear = match value.as_str() {
+            "yes" => Some(false),
+            "clear" => Some(true),
+            _ => None,
+        };
+        if let Some(clear) = clear {
+            services.state::<DebugState>().logging_to_file = false;
+            start_log_file(services, clear);
+        }
     }
     0
 }

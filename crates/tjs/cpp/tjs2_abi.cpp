@@ -1674,7 +1674,8 @@ void tjs2_set_log_cb(tjs2_engine *e, tjs2_log_cb cb, void *user) {
 }
 
 int tjs2_exec_script(tjs2_engine *e, const char *script, const char *name,
-                     tjs2_value *out_result, char **out_error) {
+                     void *context, int lineofs, tjs2_value *out_result,
+                     char **out_error) {
     if(!e || !script) {
         if(out_error)
             *out_error = nullptr;
@@ -1688,7 +1689,9 @@ int tjs2_exec_script(tjs2_engine *e, const char *script, const char *name,
         TJS::tTJSVariant result;
         std::u16string s = utf8_to_u16(script);
         std::u16string n = name ? utf8_to_u16(name) : std::u16string();
-        e->inner->ExecScript(s.c_str(), &result, nullptr, n.c_str(), 0);
+        e->inner->ExecScript(s.c_str(), &result,
+                             static_cast<TJS::iTJSDispatch2 *>(context),
+                             n.c_str(), (tjs_int)lineofs);
         variant_to_value(e, result, out_result);
         if(out_error)
             *out_error = nullptr;
@@ -1718,7 +1721,8 @@ int tjs2_exec_script(tjs2_engine *e, const char *script, const char *name,
 }
 
 int tjs2_eval(tjs2_engine *e, const char *expression, const char *name,
-              tjs2_value *out_result, char **out_error) {
+              void *context, int lineofs, tjs2_value *out_result,
+              char **out_error) {
     if(!e || !expression) {
         if(out_error)
             *out_error = nullptr;
@@ -1729,7 +1733,9 @@ int tjs2_eval(tjs2_engine *e, const char *expression, const char *name,
         TJS::tTJSVariant result;
         std::u16string s = utf8_to_u16(expression);
         std::u16string n = name ? utf8_to_u16(name) : std::u16string();
-        e->inner->EvalExpression(s.c_str(), &result, nullptr, n.c_str(), 0);
+        e->inner->EvalExpression(s.c_str(), &result,
+                                 static_cast<TJS::iTJSDispatch2 *>(context),
+                                 n.c_str(), (tjs_int)lineofs);
         variant_to_value(e, result, out_result);
         if(out_error)
             *out_error = nullptr;
@@ -1757,6 +1763,27 @@ int tjs2_eval(tjs2_engine *e, const char *expression, const char *name,
         return 1;
     }
 }
+
+int tjs2_assign_message(const char *name, const char *message) {
+    if(!name || !message)
+        return 0;
+    std::u16string n = utf8_to_u16(name);
+    std::u16string m = utf8_to_u16(message);
+    return TJS::TJSAssignMessage(n.c_str(), m.c_str()) ? 1 : 0;
+}
+
+const char *tjs2_tjs_version_string(void) {
+    static const std::string version = [] {
+        return std::to_string(TJS::TJSVersionMajor) + "." +
+               std::to_string(TJS::TJSVersionMinor) + "." +
+               std::to_string(TJS::TJSVersionRelease);
+    }();
+    return version.c_str();
+}
+
+const char *tjs2_compile_date(void) { return __DATE__; }
+
+const char *tjs2_compile_time(void) { return __TIME__; }
 
 int tjs2_compile_script(tjs2_engine *e, const char *script,
                         const char *output_path, int isresult,

@@ -145,6 +145,12 @@ fn link_installs_null_object_for_unknown_plugin() {
         engine.eval("Plugins.getList()[0]", "test").unwrap(),
         TjsValue::String("totally_unknown.dll".into())
     );
+    // The reference `getList` has no arity check, so extra arguments are
+    // ignored (`PluginImpl.cpp:332-345`).
+    assert_eq!(
+        engine.eval("Plugins.getList(1, 2)[0]", "test").unwrap(),
+        TjsValue::String("totally_unknown.dll".into())
+    );
     // Unlink forgets it and reports success.
     engine
         .exec_script("Plugins.unlink('totally_unknown.dll');", "test")

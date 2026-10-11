@@ -20,12 +20,12 @@
 //! | `dump()` | dump every live script block through the engine log |
 //! | `textEncoding` | get/set the fallback text decoder (default `"UTF-8"`) |
 //!
-//! `mode` honors only the reference's `oN` byte offset. Script decoding goes
+//! `mode` honors the reference's `oN` byte offset. Script decoding goes
 //! through [`crate::text::decode_text`], which handles the `FE FE` cipher /
 //! zlib container, a UTF-8/UTF-16 BOM, an explicit `textEncoding` override,
 //! then UTF-8 and CP932. An undecodable script raises a typed error instead
-//! of producing mojibake. The `context` argument is likewise ignored
-//! with a warning.
+//! of producing mojibake. The `context` argument is the script's `this`, and
+//! `lineofs` the reported line-number offset, both forwarded to the VM.
 #![allow(unsafe_code)]
 
 use std::ffi::{CStr, c_char, c_int, c_void};
@@ -34,11 +34,12 @@ use std::ptr;
 use engine::Storage;
 use tjs::{
     Engine, NativeClassBuilder, NativeMethodDef, NativePropertyDef, RetainedValue, Tjs2Engine,
-    TjsValue, VAL_REAL, VAL_RETAINED, VAL_STRING, VAL_VOID, Value,
+    TjsValue, VAL_NULL, VAL_OBJECT, VAL_REAL, VAL_RETAINED, VAL_STRING, VAL_VOID, Value,
 };
 
 use crate::binding;
 use crate::native_util::{args, report_error, set_int, set_void, value_as_string};
+use crate::natives::storages::extract_storage_name;
 use crate::natives::system::try_value_as_i64;
 use crate::{CompatCtx, CompatError, CompatServices};
 
@@ -239,23 +240,29 @@ fn load_storage_text(
 }
 
 /// Read `name` through storage and run it as a script (`expression == false`)
-/// or an expression (`expression == true`), retaining an object result.
+/// or an expression (`expression == true`), retaining an object result. The
+/// script block is labelled with `block_name` (the reference
+/// `TVPExtractStorageName` of the placed path) and runs with `context` as its
+/// `this` (`nullptr` for the global object).
+#[allow(clippy::too_many_arguments)]
 fn execute_storage(
     engine: &Tjs2Engine,
     storage: &Storage,
     name: &str,
     mode: &str,
+    block_name: &str,
+    context: *mut c_void,
     expression: bool,
     encoding: Option<&str>,
 ) -> Result<RetainedValue, String> {
     let text = load_storage_text(storage, name, mode, encoding)?;
     if expression {
         engine
-            .eval_retained(&text, name)
+            .eval_retained_with_context(&text, block_name, context, 0)
             .map_err(|error| error.to_string())
     } else {
         engine
-            .exec_script_retained(&text, name)
+            .exec_script_retained_with_context(&text, block_name, context, 0)
             .map_err(|error| error.to_string())
     }
 }
@@ -268,7 +275,40 @@ fn execute_storage(
 ///
 /// Returns the storage read, text decode, or script error as a string.
 pub fn exec_storage(engine: &Tjs2Engine, storage: &Storage, name: &str) -> Result<(), String> {
-    execute_storage(engine, storage, name, "", false, None).map(|_| ())
+    execute_storage(
+        engine,
+        storage,
+        name,
+        "",
+        &extract_storage_name(name),
+        std::ptr::null_mut(),
+        false,
+        None,
+    )
+    .map(|_| ())
+}
+
+/// The `this` a reference `Scripts` execution member runs with: an object
+/// argument's handle, or null for an absent/void/null argument. A present
+/// non-object value raises the reference's variant conversion error
+/// (`tTJSVariant::AsObjectNoAddRef`, `tjsVariant.h:694-699`).
+fn context_argument(arguments: &[Value], index: usize) -> Result<*mut c_void, String> {
+    match arguments.get(index) {
+        None => Ok(std::ptr::null_mut()),
+        Some(value) if value.ty == VAL_VOID || value.ty == VAL_NULL => Ok(std::ptr::null_mut()),
+        Some(value) if value.ty == VAL_OBJECT => Ok(value.object_handle()),
+        Some(_) => Err("the execution context is not an object".to_string()),
+    }
+}
+
+/// The optional `lineofs` argument of `Scripts.exec`/`Scripts.eval`, using the
+/// reference `(tjs_int)*param[2]` conversion (reals truncate, strings parse,
+/// objects raise).
+fn lineofs_argument(arguments: &[Value], index: usize) -> Result<i32, String> {
+    match arguments.get(index) {
+        Some(value) if value.ty != VAL_VOID => try_value_as_i64(value).map(|value| value as i32),
+        _ => Ok(0),
+    }
 }
 
 /// Resolve the process-wide binding for a callback's raw engine pointer.
@@ -311,10 +351,12 @@ extern "C" fn native_exec_storage(
     };
     let name = value_as_string(name);
     let mode = arguments.get(1).map(value_as_string).unwrap_or_default();
+    let context = match context_argument(arguments, 2) {
+        Ok(context) => context,
+        Err(error) => return report_error(out_error, &format!("Scripts.execStorage: {error}")),
+    };
+    let block_name = extract_storage_name(&name);
     log::debug!("Scripts.execStorage: {name:?} mode={mode:?}");
-    if arguments.get(2).is_some_and(|value| value.ty != VAL_VOID) {
-        log::warn!("Scripts.execStorage: the execution-context argument is ignored");
-    }
     let encoding = configured_encoding(services);
     let Some(storage) = attached_storage(services) else {
         return report_error(out_error, "Scripts.execStorage: no storage attached");
@@ -325,6 +367,8 @@ extern "C" fn native_exec_storage(
         unsafe { &*storage },
         &name,
         &mode,
+        &block_name,
+        context,
         false,
         encoding.as_deref(),
     );
@@ -352,9 +396,11 @@ extern "C" fn native_eval_storage(
     };
     let name = value_as_string(name);
     let mode = arguments.get(1).map(value_as_string).unwrap_or_default();
-    if arguments.get(2).is_some_and(|value| value.ty != VAL_VOID) {
-        log::warn!("Scripts.evalStorage: the execution-context argument is ignored");
-    }
+    let context = match context_argument(arguments, 2) {
+        Ok(context) => context,
+        Err(error) => return report_error(out_error, &format!("Scripts.evalStorage: {error}")),
+    };
+    let block_name = extract_storage_name(&name);
     let encoding = configured_encoding(services);
     let Some(storage) = attached_storage(services) else {
         return report_error(out_error, "Scripts.evalStorage: no storage attached");
@@ -365,6 +411,8 @@ extern "C" fn native_eval_storage(
         unsafe { &*storage },
         &name,
         &mode,
+        &block_name,
+        context,
         true,
         encoding.as_deref(),
     );
@@ -393,15 +441,17 @@ extern "C" fn native_exec(
     };
     let script = value_as_string(script);
     let name = arguments.get(1).map(value_as_string).unwrap_or_default();
-    if arguments.get(2).is_some_and(|value| value.ty != VAL_VOID) {
-        log::warn!("Scripts.exec: the lineofs argument cannot cross the ABI; ignoring");
-    }
-    if arguments.get(3).is_some_and(|value| value.ty != VAL_VOID) {
-        log::warn!("Scripts.exec: the execution-context argument is ignored");
-    }
+    let lineofs = match lineofs_argument(arguments, 2) {
+        Ok(lineofs) => lineofs,
+        Err(error) => return report_error(out_error, &format!("Scripts.exec: {error}")),
+    };
+    let context = match context_argument(arguments, 3) {
+        Ok(context) => context,
+        Err(error) => return report_error(out_error, &format!("Scripts.exec: {error}")),
+    };
     let result = resolved
         .engine()
-        .exec_script_retained(&script, &name)
+        .exec_script_retained_with_context(&script, &name, context, lineofs)
         .map_err(|error| error.to_string());
     finish_retained(out, out_error, services, result)
 }
@@ -424,15 +474,17 @@ extern "C" fn native_eval(
     };
     let expression = value_as_string(expression);
     let name = arguments.get(1).map(value_as_string).unwrap_or_default();
-    if arguments.get(2).is_some_and(|value| value.ty != VAL_VOID) {
-        log::warn!("Scripts.eval: the lineofs argument cannot cross the ABI; ignoring");
-    }
-    if arguments.get(3).is_some_and(|value| value.ty != VAL_VOID) {
-        log::warn!("Scripts.eval: the execution-context argument is ignored");
-    }
+    let lineofs = match lineofs_argument(arguments, 2) {
+        Ok(lineofs) => lineofs,
+        Err(error) => return report_error(out_error, &format!("Scripts.eval: {error}")),
+    };
+    let context = match context_argument(arguments, 3) {
+        Ok(context) => context,
+        Err(error) => return report_error(out_error, &format!("Scripts.eval: {error}")),
+    };
     let result = resolved
         .engine()
-        .eval_retained(&expression, &name)
+        .eval_retained_with_context(&expression, &name, context, lineofs)
         .map_err(|error| error.to_string());
     finish_retained(out, out_error, services, result)
 }

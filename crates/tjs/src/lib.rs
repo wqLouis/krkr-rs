@@ -291,6 +291,8 @@ unsafe extern "C" {
         e: *mut Engine,
         script: *const c_char,
         name: *const c_char,
+        context: *mut c_void,
+        lineofs: c_int,
         out_result: *mut Value,
         out_error: *mut *mut c_char,
     ) -> c_int;
@@ -298,9 +300,20 @@ unsafe extern "C" {
         e: *mut Engine,
         expression: *const c_char,
         name: *const c_char,
+        context: *mut c_void,
+        lineofs: c_int,
         out_result: *mut Value,
         out_error: *mut *mut c_char,
     ) -> c_int;
+    /// Replace the text of a registered TJS message (reference
+    /// `TJS::TJSAssignMessage`). Returns 1 when the message exists, else 0.
+    fn tjs2_assign_message(name: *const c_char, message: *const c_char) -> c_int;
+    /// The vendored TJS2 engine version as a static `major.minor.release`
+    /// string (reference `TJSVersionMajor`/`Minor`/`Release`).
+    fn tjs2_tjs_version_string() -> *const c_char;
+    /// The C++ compile date/time (`__DATE__`/`__TIME__`).
+    fn tjs2_compile_date() -> *const c_char;
+    fn tjs2_compile_time() -> *const c_char;
     /// Compile a UTF-8 script to a binary bytecode file (reference
     /// `tTJS::CompileScript` / `TVPCompileStorage`).
     pub fn tjs2_compile_script(
@@ -781,6 +794,24 @@ impl Tjs2Engine {
 
     /// Execute a TJS script given as UTF-8 text.
     pub fn exec_script(&self, script: &str, name: &str) -> Result<TjsValue, TjsError> {
+        self.exec_script_with_context(script, name, ptr::null_mut(), 0)
+    }
+
+    /// Execute a TJS script with an explicit `this` (`context`) and a reported
+    /// line-number offset (`lineofs`), matching the reference
+    /// `TJS::tTJS::ExecScript(content, result, context, name, lineofs)`.
+    ///
+    /// `context` is a raw `iTJSDispatch2*` obtained from an object argument's
+    /// [`Value::object_handle`]; it is only dereferenced on the C++ side while
+    /// the argument is alive.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn exec_script_with_context(
+        &self,
+        script: &str,
+        name: &str,
+        context: *mut c_void,
+        lineofs: i32,
+    ) -> Result<TjsValue, TjsError> {
         let script = CString::new(script).map_err(|_| TjsError("script contains NUL".into()))?;
         let name = CString::new(name).map_err(|_| TjsError("name contains NUL".into()))?;
         let mut result = Value {
@@ -793,12 +824,15 @@ impl Tjs2Engine {
             retained: 0,
         };
         let mut error: *mut c_char = ptr::null_mut();
-        // SAFETY: all pointers point to valid, live data for the call.
+        // SAFETY: all pointers point to valid, live data for the call; the
+        // caller guarantees `context` is a live object handle or null.
         let rc = unsafe {
             tjs2_exec_script(
                 self.inner,
                 script.as_ptr(),
                 name.as_ptr(),
+                context,
+                lineofs,
                 &mut result,
                 &mut error,
             )
@@ -811,6 +845,20 @@ impl Tjs2Engine {
 
     /// Evaluate a TJS expression given as UTF-8 text.
     pub fn eval(&self, expression: &str, name: &str) -> Result<TjsValue, TjsError> {
+        self.eval_with_context(expression, name, ptr::null_mut(), 0)
+    }
+
+    /// Evaluate a TJS expression with an explicit `this` (`context`) and a
+    /// reported line-number offset (`lineofs`), matching the reference
+    /// `TJS::tTJS::EvalExpression(content, result, context, name, lineofs)`.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn eval_with_context(
+        &self,
+        expression: &str,
+        name: &str,
+        context: *mut c_void,
+        lineofs: i32,
+    ) -> Result<TjsValue, TjsError> {
         let expression =
             CString::new(expression).map_err(|_| TjsError("expression contains NUL".into()))?;
         let name = CString::new(name).map_err(|_| TjsError("name contains NUL".into()))?;
@@ -824,12 +872,15 @@ impl Tjs2Engine {
             retained: 0,
         };
         let mut error: *mut c_char = ptr::null_mut();
-        // SAFETY: all pointers point to valid, live data for the call.
+        // SAFETY: all pointers point to valid, live data for the call; the
+        // caller guarantees `context` is a live object handle or null.
         let rc = unsafe {
             tjs2_eval(
                 self.inner,
                 expression.as_ptr(),
                 name.as_ptr(),
+                context,
+                lineofs,
                 &mut result,
                 &mut error,
             )
@@ -838,6 +889,50 @@ impl Tjs2Engine {
             return Err(unsafe { take_error(error) });
         }
         Ok(unsafe { take_value(&result) })
+    }
+
+    /// Replace the text of the registered TJS message `name` with `message`
+    /// (reference `TJS::TJSAssignMessage`). Returns whether a message by that
+    /// name exists.
+    pub fn assign_message(&self, name: &str, message: &str) -> Result<bool, TjsError> {
+        let name = CString::new(name).map_err(|_| TjsError("message name contains NUL".into()))?;
+        let message =
+            CString::new(message).map_err(|_| TjsError("message text contains NUL".into()))?;
+        // SAFETY: both pointers are valid, NUL-terminated UTF-8 for the call;
+        // the function reads them only.
+        let rc = unsafe { tjs2_assign_message(name.as_ptr(), message.as_ptr()) };
+        Ok(rc != 0)
+    }
+
+    /// The vendored TJS2 engine version as `major.minor.release`.
+    pub fn tjs_version_string(&self) -> String {
+        // SAFETY: the ABI returns a static NUL-terminated string.
+        let pointer = unsafe { tjs2_tjs_version_string() };
+        if pointer.is_null() {
+            return String::new();
+        }
+        // SAFETY: the pointer is a static NUL-terminated C string.
+        unsafe { CStr::from_ptr(pointer) }
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// The C++ translation unit's compile date and time (`__DATE__`/`__TIME__`),
+    /// the counterpart of the reference `TVPCompileDate`/`TVPCompileTime`.
+    pub fn compile_date_time(&self) -> (String, String) {
+        // SAFETY: the ABI returns static NUL-terminated strings.
+        let (date, time) = unsafe { (tjs2_compile_date(), tjs2_compile_time()) };
+        let read = |pointer: *const c_char| {
+            if pointer.is_null() {
+                String::new()
+            } else {
+                // SAFETY: the pointer is a static NUL-terminated C string.
+                unsafe { CStr::from_ptr(pointer) }
+                    .to_string_lossy()
+                    .into_owned()
+            }
+        };
+        (read(date), read(time))
     }
 
     /// Compile a UTF-8 script to a binary bytecode file (reference
@@ -925,7 +1020,20 @@ impl Tjs2Engine {
         script: &str,
         name: &str,
     ) -> Result<RetainedValue, TjsError> {
-        let v = self.exec_script(script, name)?;
+        self.exec_script_retained_with_context(script, name, ptr::null_mut(), 0)
+    }
+
+    /// [`Self::exec_script_retained`] with an explicit `this` and line offset;
+    /// see [`Self::exec_script_with_context`].
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn exec_script_retained_with_context(
+        &self,
+        script: &str,
+        name: &str,
+        context: *mut c_void,
+        lineofs: i32,
+    ) -> Result<RetainedValue, TjsError> {
+        let v = self.exec_script_with_context(script, name, context, lineofs)?;
         self.retain_object_result(v)
     }
 
@@ -933,7 +1041,20 @@ impl Tjs2Engine {
     /// result instead of losing it across the ABI. See
     /// [`Self::exec_script_retained`].
     pub fn eval_retained(&self, expression: &str, name: &str) -> Result<RetainedValue, TjsError> {
-        let v = self.eval(expression, name)?;
+        self.eval_retained_with_context(expression, name, ptr::null_mut(), 0)
+    }
+
+    /// [`Self::eval_retained`] with an explicit `this` and line offset; see
+    /// [`Self::eval_with_context`].
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn eval_retained_with_context(
+        &self,
+        expression: &str,
+        name: &str,
+        context: *mut c_void,
+        lineofs: i32,
+    ) -> Result<RetainedValue, TjsError> {
+        let v = self.eval_with_context(expression, name, context, lineofs)?;
         self.retain_object_result(v)
     }
 
@@ -3400,6 +3521,8 @@ var ra = a.get(); var rb = b.get();",
                 engine as *mut Engine,
                 script.as_ptr(),
                 c"reentrant".as_ptr(),
+                ptr::null_mut(),
+                0,
                 &mut inner,
                 &mut err,
             )
@@ -3446,6 +3569,8 @@ var ra = a.get(); var rb = b.get();",
                 engine as *mut Engine,
                 c"%[]".as_ptr(),
                 c"retainProp".as_ptr(),
+                ptr::null_mut(),
+                0,
                 &mut inner,
                 &mut err,
             )
@@ -3681,6 +3806,8 @@ var ra = a.get(); var rb = b.get();",
                 engine as *mut Engine,
                 c"%[]".as_ptr(),
                 c"arrayRet".as_ptr(),
+                ptr::null_mut(),
+                0,
                 &mut inner,
                 &mut err,
             )

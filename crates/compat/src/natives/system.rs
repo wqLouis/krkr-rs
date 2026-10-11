@@ -37,15 +37,14 @@
 //!
 //! # Host-facts seam
 //!
-//! `appDataPath`, `desktopLeft`/`Top`/`Width`/`Height`, `shellExecute` and
-//! `system` are genuine host facts with no L2 counterpart. They compose the
-//! closure seam installed through [`CompatHost`](crate::CompatHost)
-//! ([`set_app_data_path`](crate::CompatHost::set_app_data_path),
-//! [`set_desktop_rect`](crate::CompatHost::set_desktop_rect),
-//! [`set_shell_execute`](crate::CompatHost::set_shell_execute) and
-//! [`set_system_command`](crate::CompatHost::set_system_command)); when the
+//! `appDataPath`, `desktopLeft`/`Top`/`Width`/`Height` are genuine host facts
+//! with no L2 counterpart. They compose the closure seam installed through
+//! [`CompatHost`](crate::CompatHost)
+//! ([`set_app_data_path`](crate::CompatHost::set_app_data_path) and
+//! [`set_desktop_rect`](crate::CompatHost::set_desktop_rect)); when the
 //! matching fact is unset the member raises a typed error and never returns a
-//! silent default.
+//! silent default. `shellExecute` and `system` match the reference's inert
+//! values instead of consulting a host seam.
 //!
 //! # Command-line arguments
 //!
@@ -56,7 +55,7 @@
 //! [`SystemState`], not a process global.
 #![allow(unsafe_code)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::ffi::{c_char, c_int, c_void};
 use std::path::Path;
 use std::time::Instant;
@@ -68,7 +67,7 @@ use tjs::{
 };
 
 use crate::binding;
-use crate::host::{host_app_data_path, host_desktop_rect, host_shell_execute, host_system};
+use crate::host::{host_app_data_path, host_desktop_rect};
 use crate::native_util::{args, report_error, set_bool, set_int, set_void, value_as_string};
 use crate::natives::input::vk_pressed;
 use crate::{CompatCtx, CompatError, CompatServices};
@@ -105,8 +104,6 @@ struct SystemState {
     exit_on_no_window_startup: bool,
     /// `System.drawThreadNum` (stored for compatibility).
     draw_thread_num: i64,
-    /// `System.assignMessage` overrides.
-    messages: HashMap<String, String>,
     /// Epoch of the first `getTickCount` call (the reference's
     /// `TVPStartTickCount`).
     tick_epoch: Option<Instant>,
@@ -136,9 +133,10 @@ impl Default for SystemState {
             graphic_cache_limit: 0,
             // The reference's `EXIT_ON_WINDOW_CLOSE` defaults to true.
             exit_on_window_close: true,
-            exit_on_no_window_startup: false,
+            // The reference's `TVPTerminateOnNoWindowStartup` defaults to true
+            // (`SysInitImpl.cpp:383`).
+            exit_on_no_window_startup: true,
             draw_thread_num: 0,
-            messages: HashMap::new(),
             tick_epoch: None,
             uuid_counter: 0,
             continuous: Vec::new(),
@@ -542,7 +540,7 @@ fn tick_count_ms(services: &CompatServices) -> i64 {
 
 /// Reference-prefix lookup: `name` matches an entry whose next character after
 /// the prefix is `=` (value) or end-of-string (`"yes"`).
-fn get_command_line(services: &CompatServices, name: &str) -> Option<String> {
+pub(crate) fn get_command_line(services: &CompatServices, name: &str) -> Option<String> {
     let state = services.state::<SystemState>();
     for entry in state.arguments.iter() {
         if let Some(rest) = entry.strip_prefix(name) {
@@ -613,11 +611,13 @@ fn screen_size(ctx: &CompatCtx) -> (u32, u32) {
 
 /// `System.inform(text [, caption [, buttons]])`
 ///
-/// The reference shows a modal message box; krkr-rs has no GUI, so the text is
-/// logged at `info!`. With a `buttons` argument it returns `0` (the
-/// left/first button, the "OK clicked" path); otherwise it returns void.
+/// The reference shows a modal message box and returns the clicked button's
+/// index (or clears the result when no `buttons` argument is given,
+/// `SystemImpl.cpp:570-620`). krkr-rs has no GUI, so the text is logged at
+/// `info!` and the left/first button is emulated unless the button set is one
+/// the reference dialog cannot render.
 extern "C" fn native_inform(
-    _engine: *mut c_void,
+    engine: *mut c_void,
     argc: c_int,
     argv: *const Value,
     out: *mut Value,
@@ -635,11 +635,36 @@ extern "C" fn native_inform(
     };
     log::info!("System.inform [{caption}]: {text}");
     if argc >= 3 && a[2].ty != VAL_VOID {
-        set_int(out, 0);
+        let count = match inform_button_count(engine, &a[2]) {
+            Ok(count) => count,
+            Err(error) => return report_error(out_error, &format!("System.inform: {error}")),
+        };
+        // The reference's GTK dialog returns 0 for one or two buttons (the
+        // first is "OK"/"Yes") and -1 when the button set has no dialog
+        // (`environ/linux/Platform.cpp:140-183`).
+        set_int(out, if (1..=2).contains(&count) { 0 } else { -1 });
     } else {
         set_void(out);
     }
     0
+}
+
+/// The button count of `System.inform`'s third argument: an array's `count`,
+/// or the literal integer button count. A non-numeric object has no buttons.
+fn inform_button_count(engine: *mut c_void, value: &Value) -> Result<i64, String> {
+    if value.ty == VAL_OBJECT {
+        let Some(resolved) = resolve(engine) else {
+            return Err("compat context is not bound".to_string());
+        };
+        let object = resolved.engine().retain_object_arg(value)?;
+        return match resolved.engine().member(object.raw_id(), "count") {
+            Ok(TjsValue::Integer(count)) => Ok(count),
+            Ok(TjsValue::Real(count)) => Ok(count as i64),
+            Ok(_) => Ok(0),
+            Err(error) => Err(error),
+        };
+    }
+    try_value_as_i64(value)
 }
 
 /// `System.getTickCount()` → milliseconds since the first call.
@@ -917,6 +942,10 @@ extern "C" fn native_create_uuid(
 }
 
 /// `System.assignMessage(id, message)` → bool
+///
+/// Replaces the text of the registered TJS message `id` and returns whether a
+/// message by that name exists (reference `SystemIntf.cpp:288-304`,
+/// `TJS::TJSAssignMessage`). The VM's message registry is the override map.
 extern "C" fn native_assign_message(
     engine: *mut c_void,
     argc: c_int,
@@ -936,14 +965,13 @@ extern "C" fn native_assign_message(
             "System.assignMessage: compat context is not bound",
         );
     };
-    let ctx = resolved.ctx();
-    // SAFETY: a `CompatCtx` is only created for a bound, live engine.
-    unsafe { ctx.services() }
-        .state::<SystemState>()
-        .messages
-        .insert(id, message);
-    set_bool(out, true);
-    0
+    match resolved.engine().assign_message(&id, &message) {
+        Ok(assigned) => {
+            set_bool(out, assigned);
+            0
+        }
+        Err(error) => report_error(out_error, &format!("System.assignMessage: {error}")),
+    }
 }
 
 /// `System.touchImages(storages[, limit[, timeout]])` → void
@@ -1175,10 +1203,7 @@ extern "C" fn native_remove_continuous_handler(
     0
 }
 
-/// Reference `tTVPTouchDevice` capability bits (`ScriptMgnIntf.cpp`).
-const TD_INTEGRATED_TOUCH: u32 = 0x0000_0001;
-const TD_MULTI_INPUT: u32 = 0x0000_0040;
-const TD_DIGITIZER_READY: u32 = 0x0000_0080;
+/// Reference `tTVPTouchDevice` capability bits (`SystemImpl.cpp:424-434`).
 const TD_MOUSE: u32 = 0x0000_0100;
 const TD_MOUSE_WHEEL: u32 = 0x0000_0200;
 
@@ -1256,10 +1281,12 @@ extern "C" fn native_get_key_state(
 
 /// `System.shellExecute(target [, param])` → bool
 ///
-/// Delegates to the host's platform shell. Without the installed seam the
-/// member raises a typed error.
+/// The reference `TVPShellExecute` returns `true` without launching anything
+/// (the `ShellExecute` call is disabled, `SystemImpl.cpp:77-88`); the port
+/// reproduces that inert value (the null-plugin precedent, doc 08 §4.2) rather
+/// than raising.
 extern "C" fn native_shell_execute(
-    engine: *mut c_void,
+    _engine: *mut c_void,
     argc: c_int,
     argv: *const Value,
     out: *mut Value,
@@ -1268,41 +1295,25 @@ extern "C" fn native_shell_execute(
     if argc < 1 {
         return report_error(out_error, "System.shellExecute requires 1 argument");
     }
+    // The reference converts both arguments (`ttstr`), so a conversion error
+    // still propagates, but then discards them.
     let a = unsafe { args(argv, argc) };
-    let target = value_as_string(&a[0]);
-    let param = if argc >= 2 {
-        value_as_string(&a[1])
-    } else {
-        String::new()
-    };
-    let Some(resolved) = resolve(engine) else {
-        return report_error(
-            out_error,
-            "System.shellExecute: compat context is not bound",
-        );
-    };
-    let ctx = resolved.ctx();
-    // SAFETY: a `CompatCtx` is only created for a bound, live engine.
-    let services = unsafe { ctx.services() };
-    match host_shell_execute(services, &target, &param) {
-        Some(Ok(ok)) => {
-            set_bool(out, ok);
-            0
-        }
-        Some(Err(error)) => report_error(out_error, &format!("System.shellExecute: {error}")),
-        None => report_error(
-            out_error,
-            "System.shellExecute: the host shell seam is not installed",
-        ),
+    let _target = value_as_string(&a[0]);
+    if argc >= 2 {
+        let _param = value_as_string(&a[1]);
     }
+    log::warn!("System.shellExecute: no shell is available; returning true without launching");
+    set_bool(out, true);
+    0
 }
 
 /// `System.system(target)` → int
 ///
 /// The reference delivers a maximum-level compact event (which clears the
-/// graphic cache) and then returns the (commented-out) shell status. This port
-/// releases the L2 scene's unreferenced bitmaps and delegates the command to
-/// the host seam; without the seam it raises a typed error.
+/// graphic cache) and returns the (commented-out) shell status `0`
+/// (`SystemImpl.cpp:674-691`). The port releases the L2 scene's unreferenced
+/// bitmaps and returns `0`; it never runs a command, so it logs a warning
+/// instead of raising.
 extern "C" fn native_system(
     engine: *mut c_void,
     argc: c_int,
@@ -1313,25 +1324,17 @@ extern "C" fn native_system(
     if argc < 1 {
         return report_error(out_error, "System.system requires 1 argument");
     }
-    let target = value_as_string(&unsafe { args(argv, argc) }[0]);
+    let _target = value_as_string(&unsafe { args(argv, argc) }[0]);
     let Some(resolved) = resolve(engine) else {
         return report_error(out_error, "System.system: compat context is not bound");
     };
     let ctx = resolved.ctx();
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
     let services = unsafe { ctx.services() };
-    match host_system(services, &target) {
-        Some(Ok(code)) => {
-            clear_graphic_cache(services);
-            set_int(out, i64::from(code));
-            0
-        }
-        Some(Err(error)) => report_error(out_error, &format!("System.system: {error}")),
-        None => report_error(
-            out_error,
-            "System.system: the host command seam is not installed",
-        ),
-    }
+    clear_graphic_cache(services);
+    log::warn!("System.system: no command is run; returning 0");
+    set_int(out, 0);
+    0
 }
 
 /// `System.clearGraphicCache()` → void
@@ -1615,14 +1618,17 @@ extern "C" fn prop_version_information(
         );
     };
     let ctx = resolved.ctx();
-    set_string_out(
-        &ctx,
-        out,
-        &format!(
-            "krkr-rs {} (KiriKiri2/TVP native port)",
-            env!("CARGO_PKG_VERSION")
-        ),
+    // Reference `TVPGetVersionInformation` (`base/MsgIntf.cpp:158-171`) with
+    // the default `TVPVersionInformation` template (`base/MsgIntfInc.h:5-9`):
+    // `%1` is the KiriKiri version, `%2` the TJS2 version, and `%DATE%`/
+    // `%TIME%` the build macros (`base/MsgIntf.cpp:136-137`, `166-168`).
+    let (date, time) = resolved.engine().compile_date_time();
+    let tjs_version = resolved.engine().tjs_version_string();
+    let information = format!(
+        "Kirikiri 2 Executable core /{EMULATED_KIRIKIRI_VERSION} (Compiled on {date} {time}) \
+         TJS2/{tjs_version} Copyright (C) 1997-2013 W.Dee and contributors All rights reserved."
     );
+    set_string_out(&ctx, out, &information);
     0
 }
 
@@ -2015,32 +2021,15 @@ extern "C" fn prop_desktop_height(
 
 /// `System.touchDevice` → the reference `tTVPTouchDevice` bitfield.
 ///
-/// The base `tdMouse | tdMouseWheel` capability matches this fork's active
-/// reference path; the touch/pen bits are added while the attached L2 input
-/// state has an active touch contact (the only touch signal the generic input
-/// state carries). Without the L2 input state the member raises a typed error.
+/// The reference `TVPGetSupportTouchDevice` returns `tdMouse | tdMouseWheel`
+/// unconditionally: the `GetSystemMetrics` probes are disabled, so the field
+/// never varies (`SystemImpl.cpp:439-456`, `938-945`).
 extern "C" fn prop_touch_device(
-    engine: *mut c_void,
+    _engine: *mut c_void,
     out: *mut Value,
-    out_error: *mut *mut c_char,
+    _out_error: *mut *mut c_char,
 ) -> c_int {
-    let Some(resolved) = resolve(engine) else {
-        return report_error(out_error, "System.touchDevice: compat context is not bound");
-    };
-    let ctx = resolved.ctx();
-    // SAFETY: a `CompatCtx` is only created for a bound, live engine.
-    let services = unsafe { ctx.services() };
-    let Some(input_ptr) = services.input() else {
-        return report_error(out_error, "System.touchDevice: input state is not attached");
-    };
-    // SAFETY: `attach_input` guarantees the pointer stays valid while the
-    // binding is installed, and the VM is single-threaded.
-    let input = unsafe { &*input_ptr };
-    let mut flags = TD_MOUSE | TD_MOUSE_WHEEL;
-    if input.touch_point_count() > 0 {
-        flags |= TD_INTEGRATED_TOUCH | TD_MULTI_INPUT | TD_DIGITIZER_READY;
-    }
-    set_int(out, i64::from(flags));
+    set_int(out, i64::from(TD_MOUSE | TD_MOUSE_WHEEL));
     0
 }
 

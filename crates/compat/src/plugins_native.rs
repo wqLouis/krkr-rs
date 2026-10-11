@@ -113,16 +113,16 @@ extern "C" fn native_unlink(
 
 /// `Plugins.getList()` → array of linked plugin names (insertion order, the
 /// script's original casing).
+///
+/// The reference `getList` has no `numparams` check, so any arguments are
+/// ignored (`PluginImpl.cpp:332-349`).
 extern "C" fn native_get_list(
     engine: *mut c_void,
-    argc: c_int,
+    _argc: c_int,
     _argv: *const Value,
     out: *mut Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
-    if argc != 0 {
-        return report_error(out_error, "Plugins.getList takes no arguments");
-    }
     let Some(resolved) = binding::resolve(engine as *mut Engine) else {
         return report_error(out_error, "Plugins.getList: compat context is not bound");
     };

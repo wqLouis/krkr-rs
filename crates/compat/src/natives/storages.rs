@@ -24,13 +24,10 @@
 //!
 //! # Host-facts seam
 //!
-//! `searchCD` (locate a CD by volume label) and `selectFile` (the file
-//! chooser) are genuine host operations with no L2 counterpart. They compose
-//! the closure seam installed through [`CompatHost`](crate::CompatHost)
-//! ([`set_search_cd`](crate::CompatHost::set_search_cd) and
-//! [`set_select_file`](crate::CompatHost::set_select_file)); when the matching
-//! fact is unset the member raises a typed error rather than returning a
-//! fabricated value.
+//! `searchCD` and `selectFile` match the reference's inert values: the
+//! reference `TVPSearchCD` returns the empty string and `TVPSelectFile`
+//! returns `false` when no file chooser is available (`StorageImpl.cpp:1232-1246`,
+//! `FileSelector.cpp:100-420`). Neither composes a host seam.
 //!
 //! Deferred: `open` (the binary-stream object) and the `copyFile` /
 //! `deleteFile` / `selectDirectory` members of the reference. They need
@@ -44,13 +41,9 @@ use std::ffi::{c_char, c_int, c_void};
 use std::ptr;
 
 use engine::{Location, Storage};
-use tjs::{
-    Engine, NativeClassBuilder, NativeMethodDef, Tjs2Engine, Tjs2ValueId, TjsValue, VAL_OBJECT,
-    VAL_STRING, Value,
-};
+use tjs::{Engine, NativeClassBuilder, NativeMethodDef, VAL_OBJECT, VAL_STRING, Value};
 
 use crate::binding;
-use crate::host::{host_search_cd, host_select_file};
 use crate::native_util::{args, report_error, set_bool, set_void, value_as_string};
 use crate::{CompatCtx, CompatError, CompatServices};
 
@@ -98,7 +91,7 @@ fn extract_storage_ext(name: &str) -> String {
 }
 
 /// `TVPExtractStorageName`: the final path component.
-fn extract_storage_name(name: &str) -> String {
+pub(crate) fn extract_storage_name(name: &str) -> String {
     match name.rfind(['\\', '/', '>']) {
         Some(i) => name[i + 1..].to_string(),
         None => name.to_string(),
@@ -515,31 +508,11 @@ extern "C" fn native_get_local_name(
     }
 }
 
-/// Read an optional string property from a retained parameter object.
-fn member_string(host: &Tjs2Engine, id: Tjs2ValueId, name: &str) -> Option<String> {
-    match host.member(id, name) {
-        Ok(TjsValue::String(value)) => Some(value),
-        Ok(TjsValue::Integer(value)) => Some(value.to_string()),
-        Ok(TjsValue::Real(value)) => Some(value.to_string()),
-        _ => None,
-    }
-}
-
-/// Read an optional boolean property from a retained parameter object.
-fn member_bool(host: &Tjs2Engine, id: Tjs2ValueId, name: &str) -> bool {
-    match host.member(id, name) {
-        Ok(TjsValue::Integer(value)) => value != 0,
-        Ok(TjsValue::Real(value)) => value != 0.0,
-        Ok(TjsValue::String(value)) => !value.is_empty(),
-        Ok(TjsValue::Void | TjsValue::Object | TjsValue::Retained(_)) | Err(_) => false,
-    }
-}
-
 /// `Storages.searchCD(label)` → string
 ///
-/// Delegates to the host's disc search and returns the drive letter (or `""`
-/// when no disc matches). Without the installed seam the member raises a typed
-/// error.
+/// The reference `TVPSearchCD` always returns the empty string because the
+/// drive scan is disabled (`StorageImpl.cpp:1232-1246`). The port reproduces
+/// that inert value rather than raising.
 extern "C" fn native_search_cd(
     engine: *mut c_void,
     argc: c_int,
@@ -550,32 +523,24 @@ extern "C" fn native_search_cd(
     if argc < 1 {
         return report_error(out_error, "Storages.searchCD requires 1 argument");
     }
-    let label = value_as_string(&unsafe { args(argv, argc) }[0]);
+    let _label = value_as_string(&unsafe { args(argv, argc) }[0]);
     let resolved = resolve_or_return!(engine, out_error, "searchCD");
     let ctx = resolved.ctx();
     // SAFETY: `resolve_or_return!` only succeeds for the installed, live binding.
     let services = unsafe { ctx.services() };
-    match host_search_cd(services, &label) {
-        Some(Ok(drive)) => {
-            set_string_out(out, services, &drive);
-            0
-        }
-        Some(Err(error)) => report_error(out_error, &format!("Storages.searchCD: {error}")),
-        None => report_error(
-            out_error,
-            "Storages.searchCD: the host disc-search seam is not installed",
-        ),
-    }
+    log::warn!("Storages.searchCD: no disc search is available; returning an empty string");
+    set_string_out(out, services, "");
+    0
 }
 
 /// `Storages.selectFile(params)` → bool
 ///
-/// Extracts the chooser fields from the parameter object and delegates to the
-/// host's file chooser. On success the selected storage name is written back
-/// to `params.name` and the member returns true; a cancel returns false.
-/// Without the installed seam the member raises a typed error.
+/// The reference `TVPSelectFile` returns `false` when no file chooser can be
+/// shown (`FileSelector.cpp:100-420`); the port has no picker, so it returns
+/// that value rather than raising. The parameter object is still required
+/// (`StorageImpl.cpp:1299-1309`).
 extern "C" fn native_select_file(
-    engine: *mut c_void,
+    _engine: *mut c_void,
     argc: c_int,
     argv: *const Value,
     out: *mut Value,
@@ -591,50 +556,9 @@ extern "C" fn native_select_file(
             "Storages.selectFile: the parameter object is required",
         );
     }
-    let resolved = resolve_or_return!(engine, out_error, "selectFile");
-    let ctx = resolved.ctx();
-    // SAFETY: `resolve_or_return!` only succeeds for the installed, live binding.
-    let services = unsafe { ctx.services() };
-    let host = resolved.engine();
-    let params = match host.retain_object_arg(&a[0]) {
-        Ok(params) => params,
-        Err(error) => {
-            return report_error(out_error, &format!("Storages.selectFile: {error}"));
-        }
-    };
-    let id = params.raw_id();
-    let title = member_string(host, id, "title");
-    let initial_dir = member_string(host, id, "initialDir");
-    let name = member_string(host, id, "name");
-    let default_ext = member_string(host, id, "defaultExt");
-    let filter = member_string(host, id, "filter");
-    let save = member_bool(host, id, "save");
-    match host_select_file(
-        services,
-        title.as_deref(),
-        initial_dir.as_deref(),
-        name.as_deref(),
-        default_ext.as_deref(),
-        filter.as_deref(),
-        save,
-    ) {
-        Some(Ok(Some(selected))) => {
-            if let Err(error) = host.set_member(id, "name", &TjsValue::String(selected)) {
-                return report_error(out_error, &format!("Storages.selectFile: {error}"));
-            }
-            set_bool(out, true);
-            0
-        }
-        Some(Ok(None)) => {
-            set_bool(out, false);
-            0
-        }
-        Some(Err(error)) => report_error(out_error, &format!("Storages.selectFile: {error}")),
-        None => report_error(
-            out_error,
-            "Storages.selectFile: the host file-chooser seam is not installed",
-        ),
-    }
+    log::warn!("Storages.selectFile: no file picker is available; returning false");
+    set_bool(out, false);
+    0
 }
 
 /// Register the `Storages` native class (static members only).

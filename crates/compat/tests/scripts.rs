@@ -179,6 +179,66 @@ fn text_encoding_property_round_trips_through_dispatch_state() {
 }
 
 #[test]
+fn raw_exec_and_eval_honour_context_and_lineofs() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.engine.exec_script("var c = %[x: 5];", "t").unwrap();
+
+    // `context` (fourth argument) becomes the evaluation `this`
+    // (`ScriptMgnIntf.cpp:1385-1438`).
+    assert_eq!(
+        env.eval_ok("Scripts.eval('this.x', '', 0, c)"),
+        TjsValue::Integer(5)
+    );
+    assert_eq!(
+        env.eval_ok("Scripts.exec('this.x = 9;', '', 0, c)"),
+        TjsValue::Void
+    );
+    assert_eq!(env.eval_ok("c.x"), TjsValue::Integer(9));
+
+    // `lineofs` (third argument) shifts the reported source line
+    // (`ScriptMgnIntf.cpp:1390-1396`).
+    let line_of = |message: &str| -> i64 {
+        let start = message.find("blk(").expect("the block name is reported") + 4;
+        let end = message[start..]
+            .find(')')
+            .expect("the line number is closed")
+            + start;
+        message[start..end]
+            .parse()
+            .expect("the reported line is a number")
+    };
+    let base = env.error("Scripts.eval('1 +', 'blk', 0, null)");
+    let shifted = env.error("Scripts.eval('1 +', 'blk', 10, null)");
+    assert_eq!(line_of(&shifted) - line_of(&base), 10, "{shifted}");
+
+    // A present, non-object context raises the variant conversion error
+    // (`tjsVariant.h:694-699`).
+    assert!(env.eval("Scripts.eval('1', null, null, 42)").is_err());
+}
+
+#[test]
+fn stored_scripts_honour_context_and_use_the_storage_basename() {
+    let _lock = vm_lock();
+    let env = common::Env::with_storage();
+    let dir = env.game_dir().expect("game dir");
+    std::fs::create_dir_all(dir.join("data")).unwrap();
+    std::fs::write(dir.join("data/ctx.tjs"), b"this.x = 7;").unwrap();
+    std::fs::write(dir.join("data/boom.tjs"), b"1 +").unwrap();
+
+    // `execStorage`'s third argument is the script's `this`
+    // (`ScriptMgnIntf.cpp:1314-1354,704-811`).
+    env.run("var ctx = %[]; Scripts.execStorage('data/ctx.tjs', '', ctx);");
+    assert_eq!(env.eval_ok("ctx.x"), TjsValue::Integer(7));
+
+    // The block name is `TVPExtractStorageName` of the placed path, not the
+    // full storage name (`ScriptMgnIntf.cpp:720,782`).
+    let error = env.error("Scripts.execStorage('data/boom.tjs')");
+    assert!(error.contains("boom.tjs("), "error: {error}");
+    assert!(!error.contains("data/boom.tjs("), "error: {error}");
+}
+
+#[test]
 fn storage_backed_members_require_an_attached_storage() {
     let _lock = vm_lock();
     let env = Env::new();
