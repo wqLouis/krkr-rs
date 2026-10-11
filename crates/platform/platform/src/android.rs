@@ -1,31 +1,135 @@
 //! Android platform backend.
 //!
-//! The window and event loop are still stubs: selecting `platform-android`
-//! compiles this backend so the higher layers build unchanged, and [`run`]
-//! fails fast with [`PlatformError::NotImplemented`]. The **audio output** backend is real: on Android it drives
-//! AAudio (Android 8.0 / API 26+) through the maintained `ndk` crate, with a
-//! data callback that drains the same `Arc<Mutex<AudioQueue>>` the Linux cpal
-//! backend uses.
+//! Selecting `platform-android` compiles this backend so the higher layers
+//! build unchanged. Three pieces are real:
+//!
+//! * the **audio output** backend (AAudio on Android, a typed stub elsewhere);
+//! * the **window** on Android: [`PlatformWindow`] owns the [`ANativeWindow`]
+//!   the activity acquired and projects it to `raw-window-handle`, so the
+//!   renderer can create and recreate its Vulkan surface. Its size is the
+//!   surface's physical pixel size and its scale factor is the display's
+//!   `densityDpi / 160`;
+//! * the pure **input and density translation** the event loop uses (the
+//!   `*_from_android` associated functions), which names no Android type and
+//!   is therefore host-testable.
+//!
+//! The **event loop** is still a typed stub: [`run`] returns
+//! [`PlatformError::NotImplemented`]. Driving the loop needs the
+//! `android-activity` glue (and its `GameActivity` entry point) to deliver the
+//! window, lifecycle and input queue to [`crate::EventHandler`]; this crate
+//! does not depend on it, so the backend fails fast rather than presenting a
+//! black surface to an Activity that no code can start.
 //!
 //! The `ndk` dependency is target-gated in `Cargo.toml`, so on a non-Android
 //! host (where the `platform-android` feature is selected only to
 //! compile-check the crate) a typed stub keeps the public API identical and
-//! `cargo check` green. The real link (`libaaudio.so`) happens only in an
-//! Android build.
+//! `cargo check` green. The real link (`libaaudio.so`, `libandroid.so`)
+//! happens only in an Android build.
+//!
+//! [`ANativeWindow`]: https://developer.android.com/ndk/reference/group/a-native-window
 
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 
+use api::host::TouchPhase;
+
+use crate::input::{MouseButton, PhysicalKey};
 use crate::{EventHandler, PlatformConfig, PlatformError};
 
-/// The platform window handle (Android stub).
+/// The bits Android uses for the pointer index inside a motion action.
+const MOTION_ACTION_MASK: i32 = 0xFF;
+
+/// The platform window handle on Android.
 ///
-/// The type exists so [`crate::EventHandler`] signatures are identical across
-/// platforms, but it cannot be constructed until the Android window backend
-/// lands.
+/// Owns a reference to the `ANativeWindow` the activity handed over:
+/// constructing the type does not acquire a second reference, and dropping it
+/// releases exactly one (the `ndk` wrapper's contract). The renderer obtains a
+/// [`RawWindowHandle::AndroidNdk`] from [`PlatformWindow::raw_window_handle`]
+/// and binds its Vulkan surface to that window.
+#[cfg(target_os = "android")]
+pub struct PlatformWindow {
+    window: ndk::native_window::NativeWindow,
+    density_dpi: i32,
+}
+
+#[cfg(target_os = "android")]
+impl PlatformWindow {
+    /// Wraps an owned `ANativeWindow` and the display density it belongs to.
+    ///
+    /// `density_dpi` is the activity's `Configuration.densityDpi`; it becomes
+    /// the scale factor through [`PlatformWindow::density_scale_from_android`].
+    pub fn new(window: ndk::native_window::NativeWindow, density_dpi: i32) -> Self {
+        Self {
+            window,
+            density_dpi,
+        }
+    }
+
+    /// Returns the raw `ANativeWindow` handle the renderer binds to.
+    ///
+    /// # Errors
+    ///
+    /// The `ndk` wrapper never fails to build the handle; the `Result` keeps
+    /// the signature identical to the Linux backend.
+    pub fn raw_window_handle(&self) -> Result<RawWindowHandle, PlatformError> {
+        use raw_window_handle::HasWindowHandle;
+        self.window
+            .window_handle()
+            .map(|handle| handle.as_raw())
+            .map_err(|error| PlatformError::Handle(error.to_string()))
+    }
+
+    /// Returns the Android display handle.
+    ///
+    /// # Errors
+    ///
+    /// Android's display handle carries no data, so this cannot fail; the
+    /// `Result` keeps the signature identical to the Linux backend.
+    pub fn raw_display_handle(&self) -> Result<RawDisplayHandle, PlatformError> {
+        Ok(RawDisplayHandle::Android(
+            raw_window_handle::AndroidDisplayHandle::new(),
+        ))
+    }
+
+    /// Returns the surface size in physical pixels (at least 1×1).
+    ///
+    /// This is the `ANativeWindow` buffer size, i.e. the same physical space
+    /// the input coordinates use.
+    pub fn size(&self) -> (u32, u32) {
+        (
+            self.window.width().unsigned_abs().max(1),
+            self.window.height().unsigned_abs().max(1),
+        )
+    }
+
+    /// Returns the display scale factor (`densityDpi / 160`).
+    pub fn scale_factor(&self) -> f64 {
+        Self::density_scale_from_android(self.density_dpi)
+    }
+
+    /// Returns `None`: Android sizes the surface from the display, not from a
+    /// client request, so there is no applied size to report.
+    pub fn set_size(&self, _size: (u32, u32)) -> Option<(u32, u32)> {
+        None
+    }
+
+    /// No-op: the Android frame loop is ticker-driven, so a redraw request does
+    /// not need to wake a waiting event loop.
+    pub fn request_redraw(&self) {}
+}
+
+/// The platform window handle (non-Android placeholder).
+///
+/// The `ndk` dependency is target-gated, so compiling `platform-android` for a
+/// host has no `ANativeWindow` to wrap. The type exists so the
+/// [`crate::EventHandler`] signatures are identical across platforms, and every
+/// accessor fails with a typed [`PlatformError::NotImplemented`] rather than a
+/// fabricated handle.
+#[cfg(not(target_os = "android"))]
 pub struct PlatformWindow {
     _private: (),
 }
 
+#[cfg(not(target_os = "android"))]
 impl PlatformWindow {
     /// Returns the raw window handle (always an error in the stub).
     pub fn raw_window_handle(&self) -> Result<RawWindowHandle, PlatformError> {
@@ -60,15 +164,281 @@ impl PlatformWindow {
     pub fn request_redraw(&self) {}
 }
 
-/// Runs the Android event loop (stub: always unsupported).
+/// Android code -> platform-neutral value translation.
+///
+/// These are associated functions on [`PlatformWindow`] because the event loop
+/// owns the window, and they name no Android type, so they compile and are
+/// tested on the host. The TJS virtual-key codes are **not** assigned here: the
+/// compatibility layer maps [`PhysicalKey`] onto the reference `VK_*` table.
+impl PlatformWindow {
+    /// Maps an Android `AKEYCODE_*` value to the platform-neutral physical key.
+    ///
+    /// The table covers the keys the reference engine's key conversion names;
+    /// any other code keeps its raw identity as [`PhysicalKey::Native`], which
+    /// the compatibility layer maps to no virtual-key code.
+    pub fn physical_key_from_android(code: i32) -> PhysicalKey {
+        ANDROID_KEY_TABLE
+            .iter()
+            .find(|(candidate, _)| *candidate == code)
+            .map_or(PhysicalKey::Native(code as u32), |(_, key)| *key)
+    }
+
+    /// Maps an Android `AMOTION_EVENT_ACTION_*` value to a touch phase.
+    ///
+    /// The pointer index Android packs into the high bits is masked off, so
+    /// `ACTION_POINTER_DOWN`/`ACTION_POINTER_UP` are handled too. Actions that
+    /// are not a contact phase (`HOVER_*`, `SCROLL`, `BUTTON_*`, `OUTSIDE`)
+    /// return `None`.
+    pub fn touch_phase_from_android(action: i32) -> Option<TouchPhase> {
+        match action & MOTION_ACTION_MASK {
+            0 | 5 => Some(TouchPhase::Started),
+            2 => Some(TouchPhase::Moved),
+            1 | 6 => Some(TouchPhase::Ended),
+            3 => Some(TouchPhase::Cancelled),
+            _ => None,
+        }
+    }
+
+    /// Maps an Android `AMOTION_EVENT_BUTTON_*` value to a mouse button.
+    pub fn mouse_button_from_android(button: i32) -> Option<MouseButton> {
+        match button {
+            1 => Some(MouseButton::Left),
+            2 => Some(MouseButton::Right),
+            4 => Some(MouseButton::Middle),
+            8 => Some(MouseButton::Back),
+            16 => Some(MouseButton::Forward),
+            _ => None,
+        }
+    }
+
+    /// Converts an Android `Configuration.densityDpi` to the display scale.
+    ///
+    /// Android defines `DisplayMetrics.density = densityDpi / 160`, so 160 dpi
+    /// is scale 1.0 and a 420 dpi phone is scale 2.625.
+    pub fn density_scale_from_android(density_dpi: i32) -> f64 {
+        f64::from(density_dpi) / 160.0
+    }
+}
+
+/// Android `AKEYCODE_*` -> platform-neutral physical key.
+///
+/// The values are the stable AOSP `android/keycodes.h` constants. The mapping
+/// stops at the physical key; the reference virtual-key code is chosen by the
+/// compatibility layer. `AKEYCODE_BACK` is `Escape`, so the Android back key
+/// reaches the engine as Escape.
+const ANDROID_KEY_TABLE: &[(i32, PhysicalKey)] = &[
+    (29, PhysicalKey::KeyA),
+    (30, PhysicalKey::KeyB),
+    (31, PhysicalKey::KeyC),
+    (32, PhysicalKey::KeyD),
+    (33, PhysicalKey::KeyE),
+    (34, PhysicalKey::KeyF),
+    (35, PhysicalKey::KeyG),
+    (36, PhysicalKey::KeyH),
+    (37, PhysicalKey::KeyI),
+    (38, PhysicalKey::KeyJ),
+    (39, PhysicalKey::KeyK),
+    (40, PhysicalKey::KeyL),
+    (41, PhysicalKey::KeyM),
+    (42, PhysicalKey::KeyN),
+    (43, PhysicalKey::KeyO),
+    (44, PhysicalKey::KeyP),
+    (45, PhysicalKey::KeyQ),
+    (46, PhysicalKey::KeyR),
+    (47, PhysicalKey::KeyS),
+    (48, PhysicalKey::KeyT),
+    (49, PhysicalKey::KeyU),
+    (50, PhysicalKey::KeyV),
+    (51, PhysicalKey::KeyW),
+    (52, PhysicalKey::KeyX),
+    (53, PhysicalKey::KeyY),
+    (54, PhysicalKey::KeyZ),
+    (7, PhysicalKey::Digit0),
+    (8, PhysicalKey::Digit1),
+    (9, PhysicalKey::Digit2),
+    (10, PhysicalKey::Digit3),
+    (11, PhysicalKey::Digit4),
+    (12, PhysicalKey::Digit5),
+    (13, PhysicalKey::Digit6),
+    (14, PhysicalKey::Digit7),
+    (15, PhysicalKey::Digit8),
+    (16, PhysicalKey::Digit9),
+    (131, PhysicalKey::F1),
+    (132, PhysicalKey::F2),
+    (133, PhysicalKey::F3),
+    (134, PhysicalKey::F4),
+    (135, PhysicalKey::F5),
+    (136, PhysicalKey::F6),
+    (137, PhysicalKey::F7),
+    (138, PhysicalKey::F8),
+    (139, PhysicalKey::F9),
+    (140, PhysicalKey::F10),
+    (141, PhysicalKey::F11),
+    (142, PhysicalKey::F12),
+    (144, PhysicalKey::Numpad0),
+    (145, PhysicalKey::Numpad1),
+    (146, PhysicalKey::Numpad2),
+    (147, PhysicalKey::Numpad3),
+    (148, PhysicalKey::Numpad4),
+    (149, PhysicalKey::Numpad5),
+    (150, PhysicalKey::Numpad6),
+    (151, PhysicalKey::Numpad7),
+    (152, PhysicalKey::Numpad8),
+    (153, PhysicalKey::Numpad9),
+    (157, PhysicalKey::NumpadAdd),
+    (156, PhysicalKey::NumpadSubtract),
+    (155, PhysicalKey::NumpadMultiply),
+    (154, PhysicalKey::NumpadDivide),
+    (158, PhysicalKey::NumpadDecimal),
+    (159, PhysicalKey::NumpadSeparator),
+    (160, PhysicalKey::NumpadEnter),
+    (67, PhysicalKey::Backspace),
+    (112, PhysicalKey::Delete),
+    (61, PhysicalKey::Tab),
+    (66, PhysicalKey::Enter),
+    (111, PhysicalKey::Escape),
+    (62, PhysicalKey::Space),
+    (124, PhysicalKey::Insert),
+    (122, PhysicalKey::Home),
+    (123, PhysicalKey::End),
+    (92, PhysicalKey::PageUp),
+    (93, PhysicalKey::PageDown),
+    (19, PhysicalKey::ArrowUp),
+    (20, PhysicalKey::ArrowDown),
+    (21, PhysicalKey::ArrowLeft),
+    (22, PhysicalKey::ArrowRight),
+    (59, PhysicalKey::ShiftLeft),
+    (60, PhysicalKey::ShiftRight),
+    (113, PhysicalKey::ControlLeft),
+    (114, PhysicalKey::ControlRight),
+    (57, PhysicalKey::AltLeft),
+    (58, PhysicalKey::AltRight),
+    (117, PhysicalKey::SuperLeft),
+    (118, PhysicalKey::SuperRight),
+    (115, PhysicalKey::CapsLock),
+    (143, PhysicalKey::NumLock),
+    (116, PhysicalKey::ScrollLock),
+    (120, PhysicalKey::PrintScreen),
+    (121, PhysicalKey::Pause),
+    (68, PhysicalKey::Backquote),
+    (73, PhysicalKey::Backslash),
+    (71, PhysicalKey::BracketLeft),
+    (72, PhysicalKey::BracketRight),
+    (55, PhysicalKey::Comma),
+    (56, PhysicalKey::Period),
+    (74, PhysicalKey::Semicolon),
+    (75, PhysicalKey::Quote),
+    (69, PhysicalKey::Minus),
+    (70, PhysicalKey::Equal),
+    (76, PhysicalKey::Slash),
+    (82, PhysicalKey::ContextMenu),
+    (4, PhysicalKey::Escape),
+    (3, PhysicalKey::Home),
+    (24, PhysicalKey::VolumeUp),
+    (25, PhysicalKey::VolumeDown),
+    (164, PhysicalKey::VolumeMute),
+    (85, PhysicalKey::MediaPlayPause),
+    (86, PhysicalKey::MediaStop),
+    (87, PhysicalKey::MediaTrackNext),
+    (88, PhysicalKey::MediaTrackPrevious),
+    (28, PhysicalKey::Clear),
+];
+
+/// Runs the Android event loop.
 ///
 /// # Errors
 ///
-/// Always returns [`PlatformError::NotImplemented`].
+/// Always returns [`PlatformError::NotImplemented`]. The window is real, but
+/// the loop needs the `android-activity` glue that delivers the
+/// `ANativeWindow`, the lifecycle and the input queue to [`crate::EventHandler`];
+/// this crate does not depend on it, so the backend fails fast instead of
+/// running a frame loop that no Activity can start.
 pub fn run<H: EventHandler>(_config: PlatformConfig, _handler: H) -> Result<(), PlatformError> {
     Err(PlatformError::NotImplemented(
-        "android event loop".to_owned(),
+        "android event loop (the android-activity glue is not compiled in)".to_owned(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The reference turns the Android back key into Escape before converting
+    /// it to a virtual-key code.
+    /// reference/cpp/core/environ/cocos2d/MainScene.cpp:820-829
+    #[test]
+    fn back_becomes_escape() {
+        assert_eq!(
+            PlatformWindow::physical_key_from_android(4),
+            PhysicalKey::Escape
+        );
+    }
+
+    /// The reference maps the letter/digit families one-to-one and collapses
+    /// the left/right modifiers onto their own side at the physical layer.
+    /// reference/cpp/core/environ/cocos2d/CCKeyCodeConv.cpp:29-64,93-103
+    #[test]
+    fn letters_digits_and_modifiers_map() {
+        assert_eq!(
+            PlatformWindow::physical_key_from_android(29),
+            PhysicalKey::KeyA
+        );
+        assert_eq!(
+            PlatformWindow::physical_key_from_android(54),
+            PhysicalKey::KeyZ
+        );
+        assert_eq!(
+            PlatformWindow::physical_key_from_android(7),
+            PhysicalKey::Digit0
+        );
+        assert_eq!(
+            PlatformWindow::physical_key_from_android(16),
+            PhysicalKey::Digit9
+        );
+        assert_eq!(
+            PlatformWindow::physical_key_from_android(59),
+            PhysicalKey::ShiftLeft
+        );
+        assert_eq!(
+            PlatformWindow::physical_key_from_android(60),
+            PhysicalKey::ShiftRight
+        );
+    }
+
+    /// A code the reference names no key for keeps its raw identity instead of
+    /// being dropped or guessed at.
+    /// reference/cpp/core/environ/cocos2d/CCKeyCodeConv.cpp:236-237
+    #[test]
+    fn unmapped_key_keeps_its_native_code() {
+        // AKEYCODE_STAR (17) has no entry in the reference key conversion.
+        assert_eq!(
+            PlatformWindow::physical_key_from_android(17),
+            PhysicalKey::Native(17)
+        );
+    }
+
+    /// Android packs the pointer index into the high bits of a pointer action,
+    /// so the contact phase must be read from the low byte.
+    /// reference/cpp/core/environ/cocos2d/MainScene.cpp:1017-1146
+    #[test]
+    fn pointer_actions_are_masked_to_their_phase() {
+        assert_eq!(
+            PlatformWindow::touch_phase_from_android(5 | (3 << 8)),
+            Some(TouchPhase::Started)
+        );
+        assert_eq!(
+            PlatformWindow::touch_phase_from_android(6 | (2 << 8)),
+            Some(TouchPhase::Ended)
+        );
+    }
+
+    /// A hover or scroll motion is not a contact phase.
+    /// reference/cpp/core/environ/cocos2d/MainScene.cpp:1017-1146
+    #[test]
+    fn non_contact_actions_have_no_phase() {
+        assert_eq!(PlatformWindow::touch_phase_from_android(7), None);
+        assert_eq!(PlatformWindow::touch_phase_from_android(8), None);
+    }
 }
 
 /// Audio output backend (Android, AAudio via the `ndk` crate).

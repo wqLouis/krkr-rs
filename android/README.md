@@ -45,6 +45,14 @@ ANDROID_NDK_HOME=/path/to/android-ndk-r27c ./crates/android/build-android.sh
 cd android && gradle assembleDebug
 ```
 
+> **Not buildable on this branch.** `crates/android` (the `krkr_android` cdylib
+> and its `build-android.sh`) was dropped when the old Bevy frontends were
+> removed (`chore(migration): drop obsolete frontends and scaffold new crates`),
+> and the L1 Android event loop is still stubbed (`docs/android.md` §2.1). The
+> commands above are the state on the `android` branch, not here; the
+> composition root has to be rebuilt against the L1–L4 architecture before the
+> APK can be produced again.
+
 `gradle assembleDebug` rather than `./gradlew`: the repository has no Gradle
 wrapper yet (its jar is a binary), so CI installs a pinned Gradle instead.
 
@@ -76,14 +84,19 @@ The game's own files never ship in the APK: the user picks a folder at runtime.
 
 ## Current state
 
+On this branch (`migration/middle-layer-ash`) the Android frontend is partially
+inherited from the old Bevy architecture and partially rebuilt:
+
 | Part | State |
 |---|---|
-| Compose M3 launcher + SAF picker + JSON library (`games.json`) | written, **not yet compiled** (no Android SDK on the dev box) |
-| `crates/android` engine cdylib (`#[bevy_main]` + JNI) | not written — milestone M2 |
-| Touch → mouse bridge, on-screen controls | not written — milestone M4 |
-| MediaCodec video backend | not written — milestone M5 |
-| Gradle `assembleDebug` verified locally | not yet |
-| CI workflow (`.github/workflows/android.yml`) | written; runs **only** on the `android` branch and tags, so it does not build yet |
+| Compose M3 launcher + SAF picker + JSON library (`games.json`) | present (inherited); not compiled on this branch |
+| Engine composition root (`crates/android`, cdylib + JNI) | **absent on this branch** — dropped with the old Bevy frontends; must be rebuilt against L1–L4 |
+| L1 Android window (`platform::PlatformWindow`) | real `ANativeWindow` wrapper + raw handle + size/density; compiles for `aarch64-linux-android` (`docs/android.md` §2.1) |
+| L1 Android event loop | stubbed (`platform::run` returns `NotImplemented`); needs `android-activity` (`docs/android.md` §2.1) |
+| Android input translation (`PhysicalKey`/`TouchPhase`/`MouseButton`) | implemented and host-tested in `crates/platform/platform/src/android.rs` |
+| MediaCodec video backend | `crates/platform/media` has a compile-checked backend; never run on a device |
+| Gradle `assembleDebug` verified locally | not on this branch |
+| CI workflow (`.github/workflows/android.yml`) | inherited; runs only on the `android` branch and tags |
 
 Known unverified pieces are listed honestly in `docs/android.md` §2 and §6 rather
 than assumed to work.

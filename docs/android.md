@@ -84,6 +84,78 @@ lands): the full workspace for `aarch64-linux-android`, including `blake3`
 `failed to find tool "aarch64-linux-android-clang"`), `rodio`/`cpal` (AAudio),
 and `opusic-sys`.
 
+### 2.1 Platform backend: window, input and scale (current state)
+
+`crates/platform/platform/src/android.rs` is the L1 Android backend. Three
+parts are real and compile for `aarch64-linux-android` (checked with
+`cargo check -p platform --features platform-android --target
+aarch64-linux-android`):
+
+* **The window.** On Android, `PlatformWindow` owns the `ANativeWindow` the
+  activity acquired and projects it through `raw-window-handle`
+  (`RawWindowHandle::AndroidNdk`), so the renderer can bind and rebind its
+  Vulkan surface to the real window. `size()` is the `ANativeWindow` buffer
+  size in physical pixels; `scale_factor()` is the display's
+  `Configuration.densityDpi / 160`. The non-Android host keeps a typed stub,
+  because the `ndk` crate is target-gated.
+* **Input translation.** `PlatformWindow::physical_key_from_android`,
+  `touch_phase_from_android` and `mouse_button_from_android` translate the
+  Android `AKEYCODE_*` / `AMOTION_EVENT_*` values into `platform`'s
+  `PhysicalKey` / `TouchPhase` / `MouseButton`. They name no Android type, so
+  they are unit-tested on the host. `AKEYCODE_BACK` becomes
+  `PhysicalKey::Escape` (`MainScene.cpp:820-829`) rather than a new key, and the
+  reference `VK_*` codes stay the compatibility layer's job.
+* **Audio output** (AAudio) was already real.
+
+Still stubbed, and deliberately failing fast rather than degrading:
+
+* **The event loop.** `run` returns `PlatformError::NotImplemented`. Driving
+  the loop needs the `android-activity` glue and its `GameActivity` entry point
+  to deliver the `ANativeWindow`, the lifecycle and the input queue to
+  `EventHandler`. That crate is not a dependency of `platform`, so the backend
+  cannot be started — and does not pretend to be. Closing the gap is a
+  `Cargo.toml` change plus a `run` that drives `android-activity`'s
+  `AndroidApp` with the same `EventHandler` the Linux winit backend drives:
+
+  ```toml
+  [target.'cfg(target_os = "android")'.dependencies]
+  android-activity = { version = "0.6", default-features = false, features = ["game-activity"] }
+  ```
+
+  (`android-activity` 0.6.1 uses the same `ndk` 0.9 as this crate, so the
+  `NativeWindow` type unifies. Its build script compiles a small C glue file,
+  so once it is a dependency a target check needs the NDK `cc` that the current
+  check does not.)
+
+### 2.2 Scaling: Android must always use automatic scaling
+
+On a phone the game must never be presented at its raw logical size. The
+reference's Android build fills the frame by stretching: it sets the design
+resolution to the full frame size with cocos2d's `EXACT_FIT`
+(`reference/cpp/core/environ/cocos2d/AppDelegate.cpp:60-70`) and derives the
+design size from the screen aspect
+(`reference/cpp/core/environ/cocos2d/MainScene.cpp:436-438`). The Android
+build defaults to `ScalingMode::Fit` instead — a uniform scale to the largest
+size that fits, with the remainder letterboxed — so the picture keeps its
+aspect rather than being stretched on an unusual screen. That is a deliberate
+divergence from the reference's Android environment, chosen for phones; the
+desktop default stays `Game`, which is the reference's one-to-one Win32
+presentation.
+
+The platform side of this is already done: `PlatformWindow::size()` reports the
+physical surface size and `PlatformWindow::scale_factor()` the display density.
+The default itself belongs to the **platform configuration seam**, not L1 (L1
+must not know TVP/scaling semantics) and not the app (which may not branch on
+the OS):
+
+* the Android build's `platform::config_source()` reports
+  `scaling: Some(PresentationScaling::Fit)` — the platform-provided override
+  (`api::config::RuntimeConfigOverrides`), which is exactly the seam `platform`
+  already exposes for platform-specific defaults. A composition root that builds
+  its `HostConfig` directly instead sets `ScalingMode::Fit`. Either way the
+  no-argument Android launch fits the screen; `crates/app`'s built-in default
+  stays `Game` for the desktop CLI, and `--scaling` still overrides either.
+
 ---
 
 ## 3. Architecture
@@ -363,9 +435,14 @@ The storage, orientation and game-discovery questions are now **decided**
 (§1): sideloaded storage via option A, landscape lock, and explicit folders
 only — no auto-indexing of a default location.
 
-1. **Resolution/scaling policy** on phones: the games are 1280×720. Letterbox
-   (current `AutoMin` behaviour) is correct, but a wide phone leaves side bars —
-   is a `ScalingMode` that fills more aggressively ever wanted?
+1. **Resolution/scaling policy** on phones — **decided: always `Fit`.**
+   The game is scaled uniformly to fit the screen with the remainder
+   letterboxed, so it keeps its aspect. The reference's Android build stretches
+   instead (`EXACT_FIT`,
+   `reference/cpp/core/environ/cocos2d/AppDelegate.cpp:60-70`,
+   `MainScene.cpp:436-438`); we choose no distortion. The Android composition
+   root must select it as the
+   default; see §2.2 for the exact `api`/`app` changes and the platform half.
 2. **Audio focus/interruption** (phone call, notification) and lifecycle
    (backgrounding must pause the VM + mixer) — not yet scoped.
 3. **Emulator support**: arm64-only means no x86_64 emulator; verification will

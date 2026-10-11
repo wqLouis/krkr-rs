@@ -48,6 +48,41 @@ ABI's `AAudioStream_getFormat` — the guide's `AAudioStream_getDataFormat`
 snippet is a **doc typo**; that symbol is not in `AAudio.h`). Sharing mode is
 `SHARED`; performance mode `LOW_LATENCY`.
 
+## Window and input → `platform::PlatformWindow`
+
+| Our API | Android |
+|---|---|
+| `PlatformWindow::raw_window_handle` | the owned `ndk::native_window::NativeWindow` projected as `RawWindowHandle::AndroidNdk`; `ash-window` binds the Vulkan surface to it |
+| `PlatformWindow::raw_display_handle` | `RawDisplayHandle::Android(AndroidDisplayHandle::new())` — Android's display handle carries no data |
+| `PlatformWindow::size` | `ANativeWindow_getWidth` / `getHeight`, in physical pixels |
+| `PlatformWindow::scale_factor` | `Configuration.densityDpi / 160` |
+| key event | `AKeyEvent_getKeyCode` → `PlatformWindow::physical_key_from_android` → `PhysicalKey` |
+| touch motion | `AMotionEvent_getAction` / `getX` / `getY` → `PlatformWindow::touch_phase_from_android` + `InputEvent::Touch` |
+| mouse-style motion | `AMotionEvent_getButtonState` + `ACTION_BUTTON_PRESS`/`RELEASE` → `PlatformWindow::mouse_button_from_android` + `InputEvent::MouseButton` |
+
+**Implemented** (compiler-checked for `aarch64-linux-android`): the
+`ANativeWindow` wrapper and raw-handle projection, the physical size and the
+density scale, and the pure key/touch/button translation. The translation names
+no Android type, so it is host-tested; the reference `VK_*` mapping stays in the
+compatibility layer (`crates/compat/src/natives/input.rs`). `AKEYCODE_BACK` maps
+to `PhysicalKey::Escape`
+(`reference/cpp/core/environ/cocos2d/MainScene.cpp:820-829`), not to a new key.
+
+**Not implemented — the loop.** `platform::run` still returns
+`PlatformError::NotImplemented`. The event loop has to be the `android-activity`
+`GameActivity` glue (`docs/android.md` §2.1), which owns the lifecycle, the
+`ANativeWindow` handoff and the `AInputQueue` the translation above consumes.
+Until that dependency and a `run` implementation exist, the window type is
+unreachable at runtime, which is why `run` fails fast instead of showing a black
+surface.
+
+**Device validation still needed:** that the `ANativeWindow` handed over in
+`onNativeWindowCreated` is the one the renderer binds to and that recreation
+after `onNativeWindowDestroyed` rebuilds the surface; that `getWidth`/`getHeight`
+return the rotated landscape size; that the back and volume keys arrive as
+expected; and that the touch coordinates are in the same physical space as
+`size()`.
+
 ## MediaCodec → `media` video backend
 
 | Our API | NDK |
