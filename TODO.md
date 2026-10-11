@@ -187,6 +187,46 @@ Sources: `/tmp/kag-render-audit.md`, `/tmp/kag-compat-audit.md`, `/tmp/kag-flow-
   disagree on `DiagonalBrick` (style 38, which `advscreen.tjs:3033` uses). Pick and
   record the oracle — it also decides the `LayerExFont` leading metrics.
 
+### Input / audio / video (`audit-media-input`)
+
+* [ ] **M1 (P0)** the key code handed to scripts is the winit `KeyCode`
+  **discriminant**, not a Win32 `VK_*`. `crates/platform/platform/src/linux.rs:291-303`
+  emits `code as u32` and `crates/compat/src/event.rs:176-184` passes it through, so
+  `system/window.tjs:119-193`'s `key == VK_RETURN`/`VK_F12`/`VK_UP` comparisons never
+  match and every KAG keyboard shortcut is dead. It also breaks `shift_flags`
+  (`natives/input.rs:274-293`), which probes VK `0x10`/`0x11`/`0x12` against that
+  table, so `ssShift`/`ssCtrl`/`ssAlt` are always 0 — Alt+Enter, Ctrl-skip and
+  `Key.getPressed` too. The L1 doc already notes that an explicit key enum should
+  replace the cast.
+* [ ] **M2 (P0)** video is non-functional: `app/game.rs` never calls
+  `set_video_source`/`set_movie_source`, so `VideoOverlay.open` and
+  `Layer.openMovie` raise; `video_poll`/`movie_poll` are wired but moot.
+* [ ] **M3 (P1)** `onCloseQuery` is registered as `window_noop_handler`
+  (`window.rs:1958`) and `main.rs:529` consumes `CloseRequested` and exits, so L3
+  never fires it; `Window.close()` removes the window outright. The reference runs
+  `OnCloseQueryCalled` with a veto (`TVPWindow.cpp:790-880`).
+* [ ] **M4 (P1)** `MIDISoundBuffer.open`/`play` actually load and play
+  (`cdda_midi.rs:229,491`); the reference guards them with `TVP_ENABLE_MIDI`, which
+  is defined nowhere in the tree, so they must be inert (CDDA is already correct).
+* [ ] **M5 (P1)** `getVisBuffer` is a stub returning 0 (`sound.rs:1597`); the
+  reference fills `dest` and returns a count, and `useVisBuffer = true` allocates a
+  live buffer (`reference/cpp/core/sound/win32/WaveImpl.cpp:3401-3556`).
+* [ ] **M6 (P1)** `onMouseWheel`'s delta is `±1`; the reference posts `±120`
+  (`event.rs:167-175` vs `TVPWindow.cpp:109-115`).
+* [ ] **M7 (P1)** `VideoOverlay` frames are never composited — `layer1`/`mode`/
+  `setMixingLayer` are stored, but nothing reads `current_frame()` outside the
+  layer-ex movie path.
+* [ ] **M8 (P1)** `Layer.openMovie`/`startMovie` raise where the reference logs and
+  returns (`layerExMovie.cpp:160-227`), changing what a `try/catch` observes.
+* [ ] **M9 (P2)** window-level `onMouseEnter`/`onMouseLeave`/`onDoubleClick` are
+  synthesized with no reference poster; `onMouseDown` does not first run
+  `PrimaryMouseMove` and `onMouseUp` does not re-check the layer under the cursor
+  (`LayerManager.cpp:374-419`); the `Mouse`/`Key` native classes and
+  `Mouse.getWheelRot*` are **port-only** (the reference registers neither — and
+  `natives/input.rs` is absent from `native_parity`'s map); `PlayStatus` lacks
+  `"ready"`; coordinates are physical rather than the reference's primary-layer
+  node space (latent while `setZoom` is inert).
+
 ### File system / XP3 (`audit-fs-xp3`)
 
 Every `.xp3` under `/mnt/DATA/Games` mounts and every name normalizes. The one
