@@ -177,8 +177,8 @@ impl Storage {
     /// `data.xp3`.
     ///
     /// `fs` is the bottom file-system object; `base_dir` is the app path used
-    /// for disk assets. A missing or unparseable archive is a typed error, not
-    /// a warning.
+    /// for disk assets. An archive that cannot be opened or parsed is a typed
+    /// error, because the caller asked for it.
     pub fn mount_archives(
         fs: FileSystem,
         base_dir: impl Into<PathBuf>,
@@ -186,7 +186,29 @@ impl Storage {
     ) -> Result<Self, MountError> {
         let mut storage = Self::with_base_dir(fs, base_dir.into())?;
         for path in archives {
-            storage.mount_archive(path)?;
+            storage.mount_archive(path.as_ref())?;
+        }
+        Ok(storage)
+    }
+
+    /// Mounts a directory-scan archive list, skipping an archive that cannot
+    /// be read or parsed and reporting it through `warn!`.
+    ///
+    /// A scan mounts whatever the folder holds, so one stray or corrupt
+    /// archive must not abort an otherwise playable mount — the reference
+    /// `TVPCheckArchive` catch-and-log
+    /// (`reference/cpp/core/base/impl/StorageImpl.cpp:562-587`). Use
+    /// [`Self::mount_archives`] for a caller-supplied list.
+    pub fn mount_discovered_archives(
+        fs: FileSystem,
+        base_dir: impl Into<PathBuf>,
+        archives: impl IntoIterator<Item = impl AsRef<Path>>,
+    ) -> Result<Self, MountError> {
+        let mut storage = Self::with_base_dir(fs, base_dir.into())?;
+        for path in archives {
+            if let Err(error) = storage.mount_archive(path.as_ref()) {
+                log::warn!("skipping archive {}: {error}", path.as_ref().display());
+            }
         }
         Ok(storage)
     }
@@ -326,8 +348,10 @@ impl Storage {
     }
 
     /// Resolves a storage name to a location, mirroring the reference search
-    /// order: explicit `arc.xp3>path` → disk file (case-insensitive) → first
-    /// archive containing the normalized name → auto paths.
+    /// order: explicit `arc.xp3>path` → the current path (the app directory)
+    /// → the auto search paths in "later added wins" order → the mounted
+    /// archives in later-mount order. Auto-path and explicit archives are
+    /// opened on demand when they exist on disk but were not mounted.
     ///
     /// A name that simply does not resolve is `Ok(None)`. A genuine
     /// file-system failure while probing (permission denied, I/O, an
@@ -339,27 +363,10 @@ impl Storage {
     /// keeps the real filesystem spelling, and a name that escapes the mount
     /// never resolves.
     pub fn find(&self, name: &str) -> Result<Option<Location>, StorageReadError> {
-        // Explicit archive addressing: "foo.xp3>data/script.ks".
+        // Explicit archive addressing: "foo.xp3>data/script.ks". The archive is
+        // opened on demand when it exists but was not mounted.
         if let Some((arc, rest)) = name.split_once('>') {
-            // The archive part may be a bare name or a full path; match on its
-            // file name, case-insensitively.
-            let arc_name = Path::new(arc)
-                .file_name()
-                .map(|f| f.to_string_lossy())
-                .unwrap_or_default();
-            let Some(mounted) = self
-                .archives
-                .iter()
-                .rev()
-                .find(|m| m.file_name.eq_ignore_ascii_case(&arc_name))
-            else {
-                return Ok(None);
-            };
-            let rest = normalize_in_archive_name(rest);
-            if mounted.archive.entry(&rest).is_some() {
-                return Ok(Some(Location::Archive(mounted.path.clone(), rest)));
-            }
-            return Ok(None);
+            return self.find_in_archive(arc, rest);
         }
 
         // Resolve the storage-relative part. Absolute names must point inside
@@ -369,30 +376,22 @@ impl Storage {
             return Ok(None);
         };
 
-        // Disk wins over archives.
+        // The current path (the app directory) is checked first.
         if let Some(location) = self.find_disk_relative(&relative)? {
             return Ok(Some(location));
         }
 
-        // Archives, later mounts first (later-mounted wins — see
-        // `mount_archives`). Looked up by the normalized name.
         let normalized = normalize_in_archive_name(&relative);
-        for mounted in self.archives.iter().rev() {
-            if mounted.archive.entry(&normalized).is_some() {
-                return Ok(Some(Location::Archive(mounted.path.clone(), normalized)));
-            }
-        }
-
-        // Auto paths: the base name joined with each registered prefix (last
-        // added wins, like the reference's hash-table Add). Archive prefixes
-        // recurse into `find`; plain dirs go through the same disk resolution
-        // as every other disk hit, so directories are rejected and case
-        // folding is uniform.
         let base = storage_base(&normalized);
+
+        // Auto paths, last added first (the reference's "later added wins").
+        // Archive prefixes are opened on demand; plain directory prefixes go
+        // through the same disk resolution as every other disk hit, so
+        // directories are rejected and case folding is uniform.
         for entry in self.auto_paths.iter().rev() {
-            let joined = format!("{entry}{base}");
-            if entry.contains('>') {
-                if let Some(loc) = self.find(&joined)? {
+            if let Some((arc, dir)) = entry.split_once('>') {
+                let in_archive = format!("{dir}{base}");
+                if let Some(loc) = self.find_in_archive(arc, &in_archive)? {
                     return Ok(Some(loc));
                 }
             } else {
@@ -404,7 +403,68 @@ impl Storage {
                 }
             }
         }
+
+        // Mounted archives, later mounts first (later-mounted wins — see
+        // `mount_archives`). Looked up by the normalized name.
+        for mounted in self.archives.iter().rev() {
+            if mounted.archive.entry(&normalized).is_some() {
+                return Ok(Some(Location::Archive(mounted.path.clone(), normalized)));
+            }
+        }
         Ok(None)
+    }
+
+    /// Resolves `rest` inside the archive named by `arc`, opening the archive
+    /// on demand when it exists on disk but is not in the mount list. A
+    /// specific archive miss does not fall through to another archive.
+    fn find_in_archive(&self, arc: &str, rest: &str) -> Result<Option<Location>, StorageReadError> {
+        let rest = normalize_in_archive_name(rest);
+        let arc_name = Path::new(arc)
+            .file_name()
+            .map(|f| f.to_string_lossy())
+            .unwrap_or_default();
+        for mounted in self.archives.iter().rev() {
+            if mounted.file_name.eq_ignore_ascii_case(&arc_name) {
+                if mounted.archive.entry(&rest).is_some() {
+                    return Ok(Some(Location::Archive(mounted.path.clone(), rest)));
+                }
+                return Ok(None);
+            }
+        }
+        // On demand: open and parse the archive when the file exists.
+        let Some(path) = self.archive_disk_path(arc) else {
+            return Ok(None);
+        };
+        let file = match fs::open(&self.fs, &FsPath::host(&path), OpenMode::Read) {
+            Ok(file) => file,
+            Err(FsError::NotFound { .. }) | Err(FsError::NotADirectory { .. }) => {
+                return Ok(None);
+            }
+            Err(error) => return Err(StorageReadError::Fs(error)),
+        };
+        let archive = Xp3Archive::open(&self.fs, &file)?;
+        if archive.entry(&rest).is_some() {
+            Ok(Some(Location::Archive(path, rest)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// The on-disk path of the archive named by `arc`: an absolute path is
+    /// used as given, a relative one is resolved case-insensitively under the
+    /// game directory.
+    fn archive_disk_path(&self, arc: &str) -> Option<PathBuf> {
+        if let Some(relative) = self.relative_disk_name(arc)
+            && let Ok(Some(Location::Disk(path))) = self.find_disk_relative(&relative)
+        {
+            return Some(path);
+        }
+        let raw = Path::new(arc);
+        if raw.is_absolute() {
+            Some(raw.to_path_buf())
+        } else {
+            None
+        }
     }
 
     /// The storage-relative part of `name` (using `/` separators), or `None`
@@ -562,6 +622,26 @@ impl Storage {
         descend(&self.fs, &self.game_dir, &parts)
     }
 
+    /// Runs `f` against the archive at `arc_path`: the mounted index when the
+    /// archive is in the mount list, otherwise a transient open of the file on
+    /// disk.
+    fn with_archive<T>(
+        &self,
+        arc_path: &Path,
+        f: impl FnOnce(&FileState, &Xp3Archive, &str) -> Result<T, StorageReadError>,
+    ) -> Result<T, StorageReadError> {
+        if let Some(mounted) = self.archives.iter().find(|m| m.path == arc_path) {
+            return f(&mounted.file, &mounted.archive, &mounted.file_name);
+        }
+        let file = fs::open(&self.fs, &FsPath::host(arc_path), OpenMode::Read)?;
+        let archive = Xp3Archive::open(&self.fs, &file)?;
+        let file_name = arc_path
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        f(&file, &archive, &file_name)
+    }
+
     /// Reads a storage entry to bytes (disk file or archive member).
     pub fn read(&self, name: &str) -> Result<Vec<u8>, StorageReadError> {
         match self.find(name)? {
@@ -569,21 +649,12 @@ impl Storage {
                 read_fs_file(&self.fs, &path).map_err(StorageReadError::Fs)
             }
             Some(Location::Archive(arc_path, in_arc)) => {
-                let mounted = self
-                    .archives
-                    .iter()
-                    .find(|m| m.path == arc_path)
-                    .ok_or_else(|| StorageReadError::NotFound(name.to_string()))?;
-                mounted
-                    .archive
-                    .read_with_filter(
-                        &self.fs,
-                        &mounted.file,
-                        &in_arc,
-                        &mounted.file_name,
-                        self.xp3_extraction_filter.as_deref(),
-                    )
-                    .map_err(StorageReadError::Xp3)
+                let filter = self.xp3_extraction_filter.as_deref();
+                self.with_archive(&arc_path, |file, archive, file_name| {
+                    archive
+                        .read_with_filter(&self.fs, file, &in_arc, file_name, filter)
+                        .map_err(StorageReadError::Xp3)
+                })
             }
             None => Err(StorageReadError::NotFound(name.to_string())),
         }
@@ -610,21 +681,17 @@ impl Storage {
                 }))
             }
             Some(Location::Archive(arc_path, in_arc)) => {
-                let mounted = self
-                    .archives
-                    .iter()
-                    .find(|m| m.path == arc_path)
-                    .ok_or_else(|| StorageReadError::NotFound(name.to_string()))?;
-                let entry = mounted
-                    .archive
-                    .entry(&in_arc)
-                    .ok_or_else(|| StorageReadError::NotFound(name.to_string()))?;
-                Ok(Some(StorageMetadata {
-                    size: entry.org_size,
-                    modified: None,
-                    accessed: None,
-                    created: None,
-                }))
+                self.with_archive(&arc_path, |_file, archive, _file_name| {
+                    let entry = archive
+                        .entry(&in_arc)
+                        .ok_or_else(|| StorageReadError::NotFound(name.to_string()))?;
+                    Ok(Some(StorageMetadata {
+                        size: entry.org_size,
+                        modified: None,
+                        accessed: None,
+                        created: None,
+                    }))
+                })
             }
             None => Ok(None),
         }
@@ -844,10 +911,12 @@ impl Storage {
 /// This is a documented extension to the reference (D15 / doc 09): the
 /// reference never scans a folder, but a game directory is the ergonomic
 /// input for both the desktop CLI and the Android launcher. The order is
-/// deterministic — file name (case-insensitive), then shallower directories
-/// first, then full path — so `patch.xp3` overrides `data.xp3`, a numbered
-/// `patch2.xp3` overrides `patch.xp3`, and a root archive overrides a nested
-/// one of the same name (later mounts win). Symbolic-link directories are
+/// deterministic — file name in natural order (embedded decimal runs are
+/// compared by value, so `patch@r1071` overrides `patch@r996` and
+/// `patch_append10` overrides `patch_append5`), then a shallower directory
+/// last, then full path — so `patch.xp3` overrides `data.xp3` and a root
+/// archive overrides a nested one of the same name (later mounts win).
+/// Symbolic-link directories are
 /// not followed (the listing reports the link, not its target), so a link
 /// cycle cannot recurse forever.
 ///
@@ -861,7 +930,14 @@ pub fn discover_archives(
 ) -> Result<Vec<PathBuf>, StorageReadError> {
     let mut found = Vec::new();
     discover_archives_inner(file_system, base_dir, &mut found)?;
-    found.sort_by_cached_key(|path| archive_sort_key(path));
+    // Natural (numeric-aware) file-name order; among equal names a shallower
+    // path sorts last (and therefore mounts last and wins); the full path is
+    // the final tie-break.
+    found.sort_by(|a, b| {
+        natural_cmp(&archive_name(a), &archive_name(b))
+            .then_with(|| b.components().count().cmp(&a.components().count()))
+            .then_with(|| a.cmp(b))
+    });
     Ok(found)
 }
 
@@ -886,16 +962,70 @@ fn discover_archives_inner(
     Ok(())
 }
 
-/// The deterministic archive-discovery sort key: file name (case-insensitive),
-/// then depth reversed so a shallower path sorts last (and therefore mounts
-/// last and wins), then the full path.
-fn archive_sort_key(path: &Path) -> (String, std::cmp::Reverse<usize>, PathBuf) {
-    let name = path
-        .file_name()
+/// The lowercased file name used as the primary archive-discovery sort key.
+fn archive_name(path: &Path) -> String {
+    path.file_name()
         .map(|name| name.to_string_lossy().to_ascii_lowercase())
-        .unwrap_or_default();
-    let depth = path.components().count();
-    (name, std::cmp::Reverse(depth), path.to_path_buf())
+        .unwrap_or_default()
+}
+
+/// Consume a leading run of ASCII digits, returning
+/// `(value, digit_count, remainder)`.
+fn consume_number(bytes: &[u8]) -> (u128, usize, &[u8]) {
+    let mut value: u128 = 0;
+    let mut digits = 0usize;
+    let mut rest = bytes;
+    while let Some((&c, tail)) = rest.split_first() {
+        if c.is_ascii_digit() {
+            value = value
+                .saturating_mul(10)
+                .saturating_add(u128::from(c - b'0'));
+            digits += 1;
+            rest = tail;
+        } else {
+            break;
+        }
+    }
+    (value, digits, rest)
+}
+
+/// Compare two lowercased names with embedded decimal runs compared by
+/// numeric value, so `patch@r1071` sorts after `patch@r996` and
+/// `patch_append10` sorts after `patch_append5`. Non-digit bytes compare
+/// byte-wise; equal numeric values order by digit count (shorter first).
+fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let (mut ai, mut bi) = (a.as_bytes(), b.as_bytes());
+    loop {
+        match (ai.first(), bi.first()) {
+            (None, None) => return std::cmp::Ordering::Equal,
+            (None, Some(_)) => return std::cmp::Ordering::Less,
+            (Some(_), None) => return std::cmp::Ordering::Greater,
+            (Some(&ca), Some(&cb)) => {
+                if ca.is_ascii_digit() && cb.is_ascii_digit() {
+                    let (value_a, digits_a, rest_a) = consume_number(ai);
+                    let (value_b, digits_b, rest_b) = consume_number(bi);
+                    match value_a.cmp(&value_b) {
+                        std::cmp::Ordering::Equal => {
+                            if digits_a != digits_b {
+                                return digits_a.cmp(&digits_b);
+                            }
+                        }
+                        other => return other,
+                    }
+                    ai = rest_a;
+                    bi = rest_b;
+                } else {
+                    match ca.cmp(&cb) {
+                        std::cmp::Ordering::Equal => {
+                            ai = &ai[1..];
+                            bi = &bi[1..];
+                        }
+                        other => return other,
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// The base storage name (the part after the last `/`).

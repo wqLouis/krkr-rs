@@ -63,6 +63,43 @@ fn discover_archives_orders_by_name_then_shallower_last() {
 }
 
 #[test]
+fn discover_archives_orders_numbered_patches_naturally() {
+    let fs = memory_with(&[
+        ("game/data.xp3", b""),
+        ("game/patch@r785.xp3", b""),
+        ("game/patch@r996.xp3", b""),
+        ("game/patch@r1031.xp3", b""),
+        ("game/patch@r1071.xp3", b""),
+        ("game/patch_append5.xp3", b""),
+        ("game/patch_append10.xp3", b""),
+    ]);
+    let found = engine::storage::discover_archives(&fs, Path::new("/game")).expect("discover");
+    let names: Vec<String> = found
+        .iter()
+        .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    // Embedded decimal runs are compared by value, so the highest revision and
+    // the highest append number mount last and win.
+    // Reference: the game adds its numbered patch archives through
+    // `Storages.addAutoPath` and documents "later-added wins"
+    // (`reference/cpp/core/base/StorageIntf.cpp:921-937`); the vendored
+    // directory listing order is not defined, so this is the D35 discovery
+    // extension's own natural order.
+    assert_eq!(
+        names,
+        [
+            "data.xp3",
+            "patch@r785.xp3",
+            "patch@r996.xp3",
+            "patch@r1031.xp3",
+            "patch@r1071.xp3",
+            "patch_append5.xp3",
+            "patch_append10.xp3",
+        ]
+    );
+}
+
+#[test]
 fn disk_wins_over_archive() {
     let xp3 = build_xp3(&[("data/winner.txt", b"from archive", false)]);
     let storage = mount_memory_with_archives(
@@ -405,4 +442,121 @@ fn xp3_extraction_filter_decrypts_archive_reads() {
     // Clearing the filter restores the raw read.
     storage.xp3_extraction_filter = None;
     assert_eq!(storage.read("secret.bin").unwrap(), cipher);
+}
+
+/// The extraction filter receives the **normalized** in-archive name: the
+/// archive is opened with `normalizeName=true`, so `Owner->GetName` returns the
+/// name `Init` normalized.
+// Reference: `reference/cpp/core/archive/xp3/XP3Archive.cpp:435-437`
+// (`NormalizeInArchiveStorageName(item.Name)`) and `:996-1002`
+// (`tTVPXP3ExtractionFilterInfo(..., Owner->GetName(StorageIndex))`).
+#[test]
+fn xp3_extraction_filter_receives_the_normalized_name() {
+    use std::cell::RefCell;
+
+    let xp3 = build_xp3(&[(r"Bg\Title.JPG", b"payload", false)]);
+    let mut storage = mount_memory_with_archives(&[("data.xp3", &xp3)], &["data.xp3"]);
+
+    let seen = std::rc::Rc::new(RefCell::new(String::new()));
+    let seen_in_filter = std::rc::Rc::clone(&seen);
+    storage.xp3_extraction_filter = Some(Box::new(
+        move |_hash: u32,
+              _offset: u64,
+              _buffer: &mut [u8],
+              file_name: &str,
+              _archive_name: &str,
+              _file_size: u64| {
+            *seen_in_filter.borrow_mut() = file_name.to_string();
+        },
+    ));
+
+    assert_eq!(storage.read(r"Bg\Title.JPG").unwrap(), b"payload");
+    assert_eq!(&*seen.borrow(), "bg/title.jpg");
+}
+
+/// One unreadable archive in a scanned list is skipped with a warning so the
+/// rest of the game still mounts.
+// Reference: the app-path probe `TVPCheckArchive` catches `eTJSError`, logs,
+// and reports "not archive" (`reference/cpp/core/base/impl/StorageImpl.cpp:562-587`).
+#[test]
+fn mount_discovered_archives_skips_a_bad_archive() {
+    let good = build_xp3(&[("keep.bin", b"keep", false)]);
+    let fs = memory_with(&[("game/good.xp3", &good), ("game/bad.xp3", b"nope")]);
+
+    let storage =
+        Storage::mount_discovered_archives(fs, "/game", ["good.xp3", "bad.xp3"]).expect("mount");
+    assert_eq!(storage.archive_count(), 1);
+    assert!(storage.exists("keep.bin").unwrap());
+}
+
+/// An explicitly requested archive that cannot be parsed is a typed error.
+#[test]
+fn mount_archives_reports_a_typed_error() {
+    let good = build_xp3(&[("keep.bin", b"keep", false)]);
+    let fs = memory_with(&[("game/good.xp3", &good), ("game/bad.xp3", b"nope")]);
+
+    assert!(matches!(
+        Storage::mount_archives(fs, "/game", ["good.xp3", "bad.xp3"]),
+        Err(engine::storage::MountError::Xp3(_))
+    ));
+}
+
+/// `Storage::mount_archive` (the single-archive call) still surfaces the parse
+/// error as a typed value.
+#[test]
+fn mount_archive_still_reports_a_typed_error() {
+    let fs = memory_with(&[("bad.xp3", b"nope")]);
+    let mut storage =
+        Storage::mount_archives(fs, "/", std::iter::empty::<&str>()).expect("empty mount");
+    assert!(matches!(
+        storage.mount_archive("bad.xp3"),
+        Err(engine::storage::MountError::Xp3(_))
+    ));
+}
+
+/// Auto paths are searched in "later added wins" order, so a folder added
+/// after an archive overrides the archive entry.
+// Reference: `TVPGetPlacedPath` checks the current path and then the auto-path
+// table (`reference/cpp/core/base/StorageIntf.cpp:1061-1108`); the shipped
+// `system/initialize.tjs` adds `patch.xp3>` before `parts/` and documents
+// "later-added wins".
+#[test]
+fn later_added_auto_path_wins_over_a_mounted_archive() {
+    let patch = build_xp3(&[("foo.png", b"from patch", false)]);
+    let mut storage = mount_memory_with_archives(
+        &[("patch.xp3", &patch), ("parts/foo.png", b"from parts")],
+        &["patch.xp3"],
+    );
+    storage.add_auto_path("patch.xp3>");
+    storage.add_auto_path("parts/");
+
+    assert_eq!(storage.read("foo.png").unwrap(), b"from parts");
+    assert_eq!(
+        storage.find("foo.png").unwrap(),
+        Some(Location::Disk(PathBuf::from("/parts/foo.png")))
+    );
+}
+
+/// An archive named by an auto path or by explicit `arc.xp3>` addressing is
+/// opened on demand even when it was never mounted.
+// Reference: `TVPArchiveCache::Get` opens the archive named in the path when it
+// exists (`reference/cpp/core/base/StorageIntf.cpp:704-724`);
+// `TVPIsExistentStorageNoSearchNoNormalize` resolves the in-archive lookup
+// through the same cache (`:737-764`).
+#[test]
+fn archive_is_opened_on_demand() {
+    let extra = build_xp3(&[("config.tjs", b"cfg", false)]);
+    let mut storage = mount_memory(&[("extra.xp3", &extra)]);
+    storage.add_auto_path("extra.xp3>");
+
+    assert_eq!(storage.read("config.tjs").unwrap(), b"cfg");
+    assert_eq!(
+        storage.find("config.tjs").unwrap(),
+        Some(Location::Archive(
+            PathBuf::from("/extra.xp3"),
+            "config.tjs".into()
+        ))
+    );
+    // Explicit addressing opens the same on-disk archive too.
+    assert_eq!(storage.read("extra.xp3>config.tjs").unwrap(), b"cfg");
 }

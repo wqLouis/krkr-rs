@@ -121,7 +121,9 @@ pub type Result<T> = std::result::Result<T, Xp3Error>;
 /// * `file_hash` — the Adler32 name hash from the entry's `adlr` chunk;
 /// * `offset` — uncompressed offset of `buffer[0]` within the entry;
 /// * `buffer` — the segment's decoded bytes, rewritten in place;
-/// * `file_name` — the entry name as stored in the archive;
+/// * `file_name` — the entry's normalized in-archive name (the reference
+///   passes `Owner->GetName`, which is normalized because gameplay archives
+///   are opened with `normalizeName=true`);
 /// * `archive_name` — the logical archive name the caller mounted
 ///   (empty when the caller does not know it);
 /// * `file_size` — the entry's total uncompressed size.
@@ -342,19 +344,21 @@ impl Xp3Archive {
                     let mut dec = ZlibDecoder::new(&buf[..]);
                     let mut chunk = alloc_zeroed(org_len, "segment too large")?;
                     dec.read_exact(&mut chunk)
-                        .map_err(|_| Xp3Error::Inflate(entry.raw_name.clone()))?;
+                        .map_err(|_| Xp3Error::Inflate(entry.name.clone()))?;
                     chunk
                 }
                 other => return Err(Xp3Error::UnknownSegmentMethod(other, seg.flags)),
             };
             // The reference applies the extraction filter to the decoded
-            // segment (after any inflation) with the uncompressed offset.
+            // segment (after any inflation) with the uncompressed offset and
+            // the normalized in-archive name (`Owner->GetName` returns the
+            // name `Init` normalized under `normalizeName=true`).
             if let Some(filter) = filter {
                 filter(
                     entry.file_hash,
                     offset,
                     &mut decoded,
-                    &entry.raw_name,
+                    &entry.name,
                     archive_name,
                     entry.org_size,
                 );

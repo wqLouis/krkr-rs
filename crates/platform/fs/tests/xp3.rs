@@ -585,6 +585,36 @@ fn extraction_filter_rewrites_decoded_segments_in_place() {
     assert_eq!(before, &cipher_zlib);
 }
 
+/// The filter receives the **normalized** in-archive name, not the raw stored
+/// spelling: the archive is opened with `normalizeName=true`, so `GetName`
+/// returns the name `Init` normalized.
+// Reference: `reference/cpp/core/archive/xp3/XP3Archive.cpp:435-437`
+// (`NormalizeInArchiveStorageName(item.Name)`) and `:996-1002`
+// (`Owner->GetName(StorageIndex)`).
+#[test]
+fn extraction_filter_receives_the_normalized_name() {
+    use std::cell::RefCell;
+
+    let xp3 = build_xp3(&[(r"Dir\Packed.BIN", b"payload", false)]);
+    let (fs, file) = fs_with(&xp3);
+    let archive = Xp3Archive::open(&fs, &file).expect("open archive");
+    let seen = RefCell::new(String::new());
+    let filter = |_hash: u32,
+                  _offset: u64,
+                  _buffer: &mut [u8],
+                  file_name: &str,
+                  _archive_name: &str,
+                  _file_size: u64| {
+        *seen.borrow_mut() = file_name.to_string();
+    };
+
+    let data = archive
+        .read_with_filter(&fs, &file, r"Dir\Packed.BIN", "data.xp3", Some(&filter))
+        .expect("filtered read");
+    assert_eq!(data, b"payload");
+    assert_eq!(&*seen.borrow(), "dir/packed.bin");
+}
+
 /// Multiple segments advance the filter's uncompressed offset, so a streaming
 /// read and a whole-entry read see the same `(offset, buffer)` sequence.
 #[test]
