@@ -1,14 +1,11 @@
 //! Integration tests for the `CDDASoundBuffer` / `MIDISoundBuffer`
 //! native classes.
 //!
-//! The tests exercise the script-visible surface that does not need an L1
-//! codec or a CD/MIDI device: construction, the property round-trips
-//! (including the `0..=100000` volume scale), the shared playback methods on
-//! an unloaded buffer, the disabled-feature no-ops (`CDDASoundBuffer.open`
-//! and `MIDISoundBuffer.midiOut`) and the typed missing-decoder error. The
-//! generic `open` → decode path needs a host decoder, which an integration
-//! test cannot install, so only its typed error paths are covered here —
-//! mirroring `tests/sound.rs`.
+//! The reference compiles both classes' live surface out
+//! (`ENABLE_CDDA`/`TVP_ENABLE_MIDI` are defined nowhere in `reference/`), so
+//! every method is an arity-checked no-op and every property reports the
+//! disabled build's value. The tests pin each value per class: the classes
+//! differ only in `volume` (CD-DA leaves the result `void`, MIDI returns `0`).
 
 mod common;
 
@@ -67,111 +64,107 @@ impl Env {
     }
 }
 
-/// The reference defaults for both classes: full volume, no loop, no pause,
-/// unloaded.
-fn assert_defaults(env: &Env, var: &str, class: &str) {
-    env.run(&format!("var {var} = new {class}();"));
-    assert_eq!(env.eval_int(&format!("{var}.volume")), 100_000);
-    assert_eq!(env.eval_int(&format!("{var}.volume2")), 100_000);
-    assert_eq!(env.eval_int(&format!("{var}.looping")), 0);
-    assert_eq!(env.eval_int(&format!("{var}.paused")), 0);
-    assert_eq!(env.eval_int(&format!("{var}.position")), 0);
-    assert_eq!(env.eval_int(&format!("{var}.totalTime")), 0);
+/// The disabled-build value of every property, per class.
+#[test]
+fn disabled_build_defaults_are_pinned_per_class() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run("var cdda = new CDDASoundBuffer(); var midi = new MIDISoundBuffer();");
+
+    // reference/cpp/core/sound/CDDAIntf.cpp:170-234: `position`/`paused`/
+    // `totalTime` getters are "not yet implemented" and leave `*result`
+    // untouched.
+    assert_eq!(env.eval_ok("cdda.position"), TjsValue::Void);
+    assert_eq!(env.eval_ok("cdda.paused"), TjsValue::Void);
+    assert_eq!(env.eval_ok("cdda.totalTime"), TjsValue::Void);
+    // reference/cpp/core/sound/CDDAIntf.cpp:236-259: the `looping` getter body
+    // is inside `#ifdef ENABLE_CDDA`, which is undefined.
+    assert_eq!(env.eval_ok("cdda.looping"), TjsValue::Void);
+    // reference/cpp/core/sound/CDDAIntf.cpp:261-285: the `volume` getter body
+    // is likewise compiled out.
+    assert_eq!(env.eval_ok("cdda.volume"), TjsValue::Void);
+    // reference/cpp/core/sound/CDDAIntf.cpp:287-313: `#else *result = 0;`.
+    assert_eq!(env.eval_int("cdda.volume2"), 0);
+    // reference/cpp/core/sound/SoundBufferBaseIntf.cpp:58-75: a buffer that
+    // never left `ssUnload` reports "unload".
     assert_eq!(
-        env.eval_ok(&format!("{var}.status")),
+        env.eval_ok("cdda.status"),
+        TjsValue::String("unload".into())
+    );
+
+    // reference/cpp/core/sound/MIDIIntf.cpp:171-235.
+    assert_eq!(env.eval_ok("midi.position"), TjsValue::Void);
+    assert_eq!(env.eval_ok("midi.paused"), TjsValue::Void);
+    assert_eq!(env.eval_ok("midi.totalTime"), TjsValue::Void);
+    // reference/cpp/core/sound/MIDIIntf.cpp:237-260.
+    assert_eq!(env.eval_ok("midi.looping"), TjsValue::Void);
+    // reference/cpp/core/sound/MIDIIntf.cpp:262-282: the getter is *not*
+    // guarded and calls `GetVolume()`, which the disabled `tTJSNI_MIDISoundBuffer`
+    // overrides to return `0` (reference/cpp/core/sound/win32/MIDIImpl.h).
+    assert_eq!(env.eval_int("midi.volume"), 0);
+    // reference/cpp/core/sound/MIDIIntf.cpp:284-310: `#else *result = 0;`.
+    assert_eq!(env.eval_int("midi.volume2"), 0);
+    assert_eq!(
+        env.eval_ok("midi.status"),
         TjsValue::String("unload".into())
     );
 }
 
+/// Every property setter's body is inside the disabled `#ifdef`, so an
+/// assignment is accepted and changes nothing.
 #[test]
-fn both_constructors_expose_the_reference_defaults() {
+fn property_setters_are_inert() {
     let _lock = vm_lock();
     let env = Env::new();
-    assert_defaults(&env, "cdda", "CDDASoundBuffer");
-    assert_defaults(&env, "midi", "MIDISoundBuffer");
-}
+    env.run("var cdda = new CDDASoundBuffer(); var midi = new MIDISoundBuffer();");
 
-#[test]
-fn properties_round_trip_on_the_script_scale() {
-    let _lock = vm_lock();
-    let env = Env::new();
-    env.run("var s = new MIDISoundBuffer();");
-
+    // reference/cpp/core/sound/CDDAIntf.cpp:170-313 and MIDIIntf.cpp:171-310:
+    // the setters are no-ops in the disabled build.
     env.run(
-        "s.volume = 50000; s.volume2 = 25000; s.position = 250; s.looping = true; s.paused = true;",
+        "cdda.volume = 50000; cdda.volume2 = 25000; cdda.position = 250; \
+         cdda.looping = true; cdda.paused = true; cdda.totalTime = 999;",
     );
-    assert_eq!(env.eval_int("s.volume"), 50_000);
-    assert_eq!(env.eval_int("s.volume2"), 25_000);
-    assert_eq!(env.eval_int("s.position"), 250);
-    assert_eq!(env.eval_int("s.looping"), 1);
-    assert_eq!(env.eval_int("s.paused"), 1);
+    env.run(
+        "midi.volume = 50000; midi.volume2 = 25000; midi.position = 250; \
+         midi.looping = true; midi.paused = true; midi.totalTime = 999;",
+    );
 
-    // The reference clamps at both ends of the 0..=100000 scale.
-    env.run("s.volume = 200000; s.volume2 = -5;");
-    assert_eq!(env.eval_int("s.volume"), 100_000);
-    assert_eq!(env.eval_int("s.volume2"), 0);
+    assert_eq!(env.eval_ok("cdda.volume"), TjsValue::Void);
+    assert_eq!(env.eval_int("cdda.volume2"), 0);
+    assert_eq!(env.eval_ok("cdda.position"), TjsValue::Void);
+    assert_eq!(env.eval_ok("cdda.looping"), TjsValue::Void);
+    assert_eq!(env.eval_ok("cdda.paused"), TjsValue::Void);
+    assert_eq!(env.eval_ok("cdda.totalTime"), TjsValue::Void);
 
-    // The `paused` flag toggles back off.
-    env.run("s.paused = false;");
-    assert_eq!(env.eval_int("s.paused"), 0);
+    assert_eq!(env.eval_int("midi.volume"), 0);
+    assert_eq!(env.eval_int("midi.volume2"), 0);
+    assert_eq!(env.eval_ok("midi.position"), TjsValue::Void);
+    assert_eq!(env.eval_ok("midi.looping"), TjsValue::Void);
+    assert_eq!(env.eval_ok("midi.paused"), TjsValue::Void);
+    assert_eq!(env.eval_ok("midi.totalTime"), TjsValue::Void);
 }
 
+/// `status` is read-only in the reference (`TJS_DENY_NATIVE_PROP_SETTER`,
+/// `CDDAIntf.cpp:315-327`, `MIDIIntf.cpp:312-324`).
 #[test]
-fn cdda_open_is_a_no_op_when_cdda_is_disabled() {
+fn status_is_read_only() {
     let _lock = vm_lock();
     let env = Env::new();
-    env.run("var s = new CDDASoundBuffer();");
-
-    // reference/cpp/core/sound/CDDAIntf.cpp:62-73: `ENABLE_CDDA` is undefined
-    // (no `#define` anywhere in reference/), so the `_this->Open(...)` body is
-    // compiled out and the method falls through to `return TJS_S_OK` (void).
-    assert_eq!(env.eval_ok("s.open('D:')"), TjsValue::Void);
-    // reference/cpp/core/sound/CDDAIntf.cpp:68-70: no `Open()` runs, so the
-    // buffer stays unloaded.
-    assert_eq!(env.eval_ok("s.status"), TjsValue::String("unload".into()));
-    assert_eq!(env.eval_int("s.totalTime"), 0);
-}
-
-#[test]
-fn midi_open_without_storage_reports_a_typed_error() {
-    let _lock = vm_lock();
-    let env = Env::new();
-    env.run("var s = new MIDISoundBuffer();");
-
-    let message = env.error("s.open('song.mid')");
+    env.run("var s = new MIDISoundBuffer(); var c = new CDDASoundBuffer();");
     assert!(
-        message.contains("no storage is attached"),
-        "unexpected message: {message}"
+        !env.error("s.status = 'play'").is_empty(),
+        "MIDISoundBuffer.status must reject writes"
     );
-}
-
-#[test]
-fn midi_out_is_a_no_op_when_midi_is_disabled() {
-    let _lock = vm_lock();
-    let env = Env::new();
-
-    // reference/cpp/core/sound/win32/MIDIImpl.cpp:978-993: `TVP_ENABLE_MIDI`
-    // is undefined (no `#define` anywhere in reference/), so the
-    // `TVPMIDIOutData` body is compiled out and the method returns `TJS_S_OK`
-    // (void) after the arity check.
-    assert_eq!(env.eval_ok("MIDISoundBuffer.midiOut(0)"), TjsValue::Void);
-}
-
-#[test]
-fn open_requires_an_argument() {
-    let _lock = vm_lock();
-    let env = Env::new();
-    env.run("var s = new MIDISoundBuffer();");
-
-    let message = env.error("s.open()");
     assert!(
-        message.contains("required"),
-        "unexpected message: {message}"
+        !env.error("c.status = 'play'").is_empty(),
+        "CDDASoundBuffer.status must reject writes"
     );
 }
 
+/// Every method is an arity-checked no-op that returns `void` and never
+/// touches a decoder or device.
 #[test]
-fn shared_playback_methods_are_callable_on_an_unloaded_buffer() {
+fn disabled_methods_are_no_ops() {
     let _lock = vm_lock();
     let env = Env::new();
 
@@ -182,21 +175,67 @@ fn shared_playback_methods_are_callable_on_an_unloaded_buffer() {
         let var = format!("s{index}");
         env.run(&format!("var {var} = new {class}();"));
 
+        // reference/cpp/core/sound/CDDAIntf.cpp:59-132 and MIDIIntf.cpp:59-132:
+        // `open`/`play`/`stop`/`fade`/`stopFade` fall through to `TJS_S_OK`.
+        assert_eq!(env.eval_ok(&format!("{var}.open('track')")), TjsValue::Void);
         assert_eq!(env.eval_ok(&format!("{var}.play()")), TjsValue::Void);
         assert_eq!(env.eval_ok(&format!("{var}.stop()")), TjsValue::Void);
         assert_eq!(env.eval_ok(&format!("{var}.stopFade()")), TjsValue::Void);
         assert_eq!(env.eval_ok(&format!("{var}.fade(0, 50)")), TjsValue::Void);
         assert_eq!(
-            env.eval_ok(&format!("{var}.onStatusChanged('play')")),
+            env.eval_ok(&format!("{var}.fade(0, 50, 10)")),
+            TjsValue::Void
+        );
+        // The event forwarders do not require a caller argument.
+        assert_eq!(
+            env.eval_ok(&format!("{var}.onStatusChanged()")),
             TjsValue::Void
         );
         assert_eq!(
             env.eval_ok(&format!("{var}.onFadeCompleted()")),
             TjsValue::Void
         );
+        // The no-ops leave the buffer unloaded.
         assert_eq!(
             env.eval_ok(&format!("{var}.status")),
             TjsValue::String("unload".into())
         );
     }
+}
+
+/// `open` and `fade` still enforce the reference's argument counts
+/// (`TJS_E_BADPARAMCOUNT`), unlike `play`/`stop`/`stopFade`.
+#[test]
+fn open_and_fade_require_their_arguments() {
+    let _lock = vm_lock();
+    let env = Env::new();
+
+    for (index, class) in ["CDDASoundBuffer", "MIDISoundBuffer"]
+        .into_iter()
+        .enumerate()
+    {
+        let var = format!("s{index}");
+        env.run(&format!("var {var} = new {class}();"));
+        // reference/cpp/core/sound/CDDAIntf.cpp:62-73 / MIDIIntf.cpp:62-74.
+        assert!(
+            env.error(&format!("{var}.open()")).contains("required"),
+            "open() should require an argument"
+        );
+        // reference/cpp/core/sound/CDDAIntf.cpp:99-119 / MIDIIntf.cpp:100-120.
+        assert!(
+            env.error(&format!("{var}.fade(0)")).contains("fade"),
+            "fade(0) should require a second argument"
+        );
+    }
+}
+
+/// `MIDISoundBuffer.midiOut` is the reference's disabled static: an arity
+/// check then `TJS_S_OK` (`reference/cpp/core/sound/win32/MIDIImpl.cpp:978-993`).
+#[test]
+fn midi_out_is_a_no_op_when_midi_is_disabled() {
+    let _lock = vm_lock();
+    let env = Env::new();
+
+    assert_eq!(env.eval_ok("MIDISoundBuffer.midiOut(0)"), TjsValue::Void);
+    assert!(env.error("MIDISoundBuffer.midiOut()").contains("midiOut"));
 }

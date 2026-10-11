@@ -101,9 +101,11 @@
 //! * `bits` reports `32` for a loaded source (the L2 pipeline is `f32`);
 //!   `AudioSpec` carries no bit depth, so the reference's 16-bit WAV value
 //!   cannot be reproduced truthfully.
-//! * `getVisBuffer` returns `0`: L3 captures no visualization buffer (the
-//!   reference writes into a raw sample pointer, which has no safe L2
-//!   counterpart). `useVisBuffer` still round-trips its stored flag.
+//! * `getVisBuffer` copies the decoded samples around the channel's current
+//!   play position into the caller's raw `dest` as interleaved signed 16-bit
+//!   PCM (the reference `GetVisBuffer`, `WaveImpl.cpp:3401-3474`); it returns
+//!   `0` when `useVisBuffer` is off, the buffer is not playing, or the
+//!   requested layout is unsupported.
 //! * `flags` returns the live `WaveFlags` proxy (cached per buffer, so
 //!   `s.flags === s.flags`), and `labels` the cached dictionary of the loaded
 //!   `.sli` labels (rebuilt only where the reference calls
@@ -1594,31 +1596,145 @@ extern "C" fn sound_set_pos(
     )
 }
 
+/// Convert one float sample with the reference non-downmix scale
+/// (`PCMConvertLoopFloat32ToInt16_c`, `WaveFormatConverter.cpp:40-57`):
+/// `sample * 32767`, clipped to `i16` and rounded half away from zero.
+fn float_to_i16(sample: f32) -> i16 {
+    let value = sample * 32767.0;
+    if value > 32767.0 {
+        32767
+    } else if value < -32768.0 {
+        -32768
+    } else if value < 0.0 {
+        (value - 0.5) as i16
+    } else {
+        (value + 0.5) as i16
+    }
+}
+
+/// Convert one frame with the reference downmix scale
+/// (`TVPConvertFloatPCMTo16bits`, `WaveIntf.cpp:97-138`): the source channels
+/// are summed at `32768 / channels` and rounded half away from zero.
+fn downmix_to_i16(left: f32, right: f32, source_channels: usize) -> i16 {
+    let scale = 32768.0 / source_channels as f32;
+    let value = if source_channels == 1 {
+        left * scale
+    } else {
+        left * scale + right * scale
+    };
+    if value > 0.0 {
+        ((value + 0.5) as i32).min(32767) as i16
+    } else {
+        ((value - 0.5) as i32).max(-32768) as i16
+    }
+}
+
+/// The reference `GetVisBuffer` copy loop (`WaveImpl.cpp:3438-3470`): copy
+/// `numsamples` frames from `source` at `position_seconds` (plus `ahead`)
+/// into the caller's `dest`, converted to interleaved signed 16-bit PCM.
+///
+/// Returns the number of frames written. `0` when the count is not positive,
+/// `dest` is null, or the requested layout is neither mono nor the source's
+/// own layout.
+fn read_vis_buffer(
+    source: &SoundSource,
+    position_seconds: f64,
+    numsamples: i32,
+    channels: i32,
+    ahead: i32,
+    dest: *mut i16,
+) -> usize {
+    let source_channels = i32::from(source.channels());
+    if channels != source_channels && channels != 1 {
+        return 0;
+    }
+    if numsamples <= 0 || dest.is_null() {
+        return 0;
+    }
+    let sample_rate = f64::from(source.sample_rate().max(1));
+    let start = (position_seconds * sample_rate).floor() as i64 + i64::from(ahead);
+    let count = numsamples as usize;
+    let downmix = channels == 1;
+    for index in 0..count {
+        let frame = start + index as i64;
+        let (left, right) = if frame >= 0 {
+            source.frame(frame as u64).unwrap_or((0.0, 0.0))
+        } else {
+            (0.0, 0.0)
+        };
+        // SAFETY: `dest` is the sample pointer the script passed to
+        // `getVisBuffer`; the reference trusts it as well, and `count` bounds
+        // every write to `count * channels` samples.
+        unsafe {
+            if downmix {
+                *dest.add(index) = downmix_to_i16(left, right, source_channels as usize);
+            } else {
+                *dest.add(index * 2) = float_to_i16(left);
+                *dest.add(index * 2 + 1) = float_to_i16(right);
+            }
+        }
+    }
+    count
+}
+
 extern "C" fn sound_get_vis_buffer(
     engine: *mut c_void,
-    _instance: *mut c_void,
+    instance: *mut c_void,
     argc: c_int,
     argv: *const Value,
     out: *mut Value,
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    if bound(engine).is_err() {
-        return report_error(
-            out_error,
-            "WaveSoundBuffer.getVisBuffer: compat context is not bound",
-        );
-    }
-    if unsafe { args(argv, argc) }.len() < 3 {
+    let raw_args = unsafe { args(argv, argc) };
+    if raw_args.len() < 3 {
         return report_error(
             out_error,
             "WaveSoundBuffer.getVisBuffer(dest, numsamples, channels[, ahead])",
         );
     }
-    // L3 captures no visualization buffer (see the module docs): the reference
-    // writes into a raw sample pointer that has no safe L2 counterpart.
-    set_int(out, 0);
-    0
+    // `tjs_int16 *dest = (tjs_int16 *)(tjs_int64)(*param[0]);`
+    let dest = value_as_i64(&raw_args[0]) as usize as *mut i16;
+    let numsamples = value_as_i64(&raw_args[1]) as i32;
+    let channels = value_as_i64(&raw_args[2]) as i32;
+    let ahead = if raw_args.len() >= 4 {
+        value_as_i64(&raw_args[3]) as i32
+    } else {
+        0
+    };
+    with_sound!(
+        engine,
+        instance,
+        "getVisBuffer",
+        out_error,
+        |_ctx, services, id| {
+            let written = with_object(services, id, |object, mixer| {
+                if !object.use_vis_buffer || !object.device_ready || object.source.is_none() {
+                    return 0;
+                }
+                let Some(channel) = mixer.channel(object.channel_id) else {
+                    return 0;
+                };
+                if !channel.is_playing() {
+                    return 0;
+                }
+                let Some(source) = channel.source() else {
+                    return 0;
+                };
+                read_vis_buffer(
+                    source,
+                    channel.position_seconds(),
+                    numsamples,
+                    channels,
+                    ahead,
+                    dest,
+                )
+            })
+            .unwrap_or(0);
+            set_int(out, written as i64);
+            0
+        }
+    )
 }
 
 // Event forwarders. The frame poll delivers the L2 events by name through the
@@ -3348,6 +3464,88 @@ mod tests {
         assert!(
             error.to_string().contains("Condition"),
             "unexpected: {error}"
+        );
+    }
+
+    /// A source built from explicit interleaved `f32` samples at 1 kHz.
+    fn source_from(interleaved: &[f32], channels: u16) -> Arc<SoundSource> {
+        let frames = interleaved.len() / usize::from(channels);
+        let spec = AudioSpec {
+            sample_rate: 1000,
+            channels,
+            total_frames: Some(frames as u64),
+        };
+        Arc::new(
+            SoundSource::new(Arc::new(DecodedAudio::new(spec, interleaved.to_vec())))
+                .expect("valid source"),
+        )
+    }
+
+    /// `PCMConvertLoopFloat32ToInt16_c` (`WaveFormatConverter.cpp:40-57`):
+    /// `sample * 32767`, clipped and rounded half away from zero.
+    #[test]
+    fn float_to_i16_matches_the_reference_rounding() {
+        assert_eq!(float_to_i16(0.0), 0);
+        assert_eq!(float_to_i16(0.5), 16384);
+        assert_eq!(float_to_i16(-0.5), -16384);
+        assert_eq!(float_to_i16(1.0), 32767);
+        assert_eq!(float_to_i16(-1.0), -32767);
+        assert_eq!(float_to_i16(2.0), 32767);
+        assert_eq!(float_to_i16(-1.5), -32768);
+    }
+
+    /// `TVPConvertFloatPCMTo16bits` downmix (`WaveIntf.cpp:97-138`): the
+    /// source channels are summed at `32768 / channels` and rounded half
+    /// away from zero.
+    #[test]
+    fn downmix_to_i16_matches_the_reference_rounding() {
+        assert_eq!(downmix_to_i16(0.5, 0.5, 1), 16384);
+        assert_eq!(downmix_to_i16(0.5, 0.5, 2), 16384);
+        assert_eq!(downmix_to_i16(0.5, -0.5, 2), 0);
+        assert_eq!(downmix_to_i16(1.0, 1.0, 2), 32767);
+        assert_eq!(downmix_to_i16(-1.0, 0.0, 1), -32768);
+    }
+
+    /// `GetVisBuffer` copies from the current position plus `ahead`, downmixes
+    /// for `channels == 1`, and copies interleaved for the source's own layout
+    /// (`WaveImpl.cpp:3401-3474`).
+    #[test]
+    fn read_vis_buffer_copies_the_reference_layout() {
+        // Mono source: the downmix path uses the 32768 scale.
+        let mono = source_from(&[0.0, 0.25, -0.5, 1.0], 1);
+        let mut buffer = [0i16; 4];
+        let count = read_vis_buffer(&mono, 0.0, 4, 1, 0, buffer.as_mut_ptr());
+        assert_eq!(count, 4);
+        assert_eq!(buffer, [0, 8192, -16384, 32767]);
+
+        // Stereo source, `channels == 2`: interleaved at the 32767 scale.
+        let stereo = source_from(&[0.0, 1.0, 0.5, -0.5], 2);
+        let mut buffer = [0i16; 4];
+        let count = read_vis_buffer(&stereo, 0.0, 2, 2, 0, buffer.as_mut_ptr());
+        assert_eq!(count, 2);
+        assert_eq!(buffer, [0, 32767, 16384, -16384]);
+
+        // The copy starts at the playback position plus `ahead`.
+        let count = read_vis_buffer(&stereo, 0.001, 1, 2, 0, buffer.as_mut_ptr());
+        assert_eq!(count, 1);
+        assert_eq!(buffer, [16384, -16384, 16384, -16384]);
+        let count = read_vis_buffer(&stereo, 0.0, 1, 2, 1, buffer.as_mut_ptr());
+        assert_eq!(count, 1);
+        assert_eq!(buffer, [16384, -16384, 16384, -16384]);
+
+        // An unsupported layout, a non-positive count and a null destination
+        // all report no samples.
+        assert_eq!(
+            read_vis_buffer(&stereo, 0.0, 1, 3, 0, buffer.as_mut_ptr()),
+            0
+        );
+        assert_eq!(
+            read_vis_buffer(&stereo, 0.0, 0, 2, 0, buffer.as_mut_ptr()),
+            0
+        );
+        assert_eq!(
+            read_vis_buffer(&stereo, 0.0, 1, 2, 0, std::ptr::null_mut()),
+            0
         );
     }
 }

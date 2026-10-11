@@ -486,9 +486,9 @@ fn set_pos_requires_three_arguments() {
 /// Reference: `getVisBuffer` is registered outside the member table and
 /// returns `TJS_E_BADPARAMCOUNT` for fewer than three arguments
 /// (`reference/cpp/core/sound/win32/WaveImpl.cpp:3510-3531`, check at
-/// 3515-3516). The port captures no visualization buffer, so the count it
-/// reports is the reference's `0` for `!UseVisBuffer` (first guard,
-/// `WaveImpl.cpp:3406-3407`).
+/// 3515-3516). On a freshly constructed, never-played buffer the count is
+/// `0`: `UseVisBuffer` is off and the secondary buffer does not exist yet
+/// (`WaveImpl.cpp:3406-3413`).
 #[test]
 fn get_vis_buffer_requires_three_arguments_and_reports_zero() {
     let _lock = vm_lock();
@@ -502,6 +502,28 @@ fn get_vis_buffer_requires_three_arguments_and_reports_zero() {
     );
     assert_eq!(env.eval_int("s.getVisBuffer(0, 16, 1)"), 0);
     assert_eq!(env.eval_int("s.getVisBuffer(0, 16, 1, 4)"), 0);
+}
+
+/// Reference: with `useVisBuffer` on and the buffer playing, `getVisBuffer`
+/// fills the caller's buffer from the decoded source; the `getSample` plugin's
+/// `sampleValue` therefore reports the live peak instead of the `0` of an
+/// idle visualization buffer (`reference/cpp/core/sound/win32/WaveImpl.cpp:3401-3474`,
+/// `reference/cpp/plugins/getSample.cpp:103-124`).
+#[test]
+fn get_vis_buffer_fills_the_buffer_while_playing() {
+    let _lock = vm_lock();
+    let env = Env::fixture(None);
+    env.run("var s = new WaveSoundBuffer(); s.open('tone.wav');");
+    // Before `play` the secondary buffer does not exist yet (`WaveImpl.cpp:3410`).
+    assert_eq!(env.eval_real("s.sampleValue"), 0.0);
+    env.run("s.play();");
+    // The 0.5-amplitude tone's first 100 samples peak at 16384/32768, so
+    // `sampleValue` is `(16384/32768)² == 0.25` (`getSample.cpp:103-124`).
+    let value = env.eval_real("s.sampleValue");
+    assert!(
+        (value - 0.25).abs() < 0.01,
+        "expected the live tone peak, got {value}"
+    );
 }
 
 /// Reference: `status`, `bits`, `channels`, `flags`, `labels` and `filters`
