@@ -62,7 +62,7 @@ impl Env {
     /// Feed one frame of platform events through the L3 adapter into the
     /// attached L2 input state.
     fn feed_input(&self, events: &[PlatformEvent]) {
-        let adapter = EventAdapter::new();
+        let mut adapter = EventAdapter::new();
         let mut ctx = self._host.ctx().expect("bound host");
         adapter.begin_input_frame(&mut ctx);
         for event in events {

@@ -205,6 +205,26 @@ extern "C" fn layer_create(_engine: *mut c_void) -> *mut c_void {
     Box::into_raw(Box::new(LayerInst::default())) as *mut c_void
 }
 
+extern "C" fn layer_invalidate(engine: *mut c_void, instance: *mut c_void) {
+    if instance.is_null() {
+        return;
+    }
+    // SAFETY: `layer_create` allocated the payload and the VM keeps it
+    // alive for the duration of the callback.
+    let inst = unsafe { &*(instance as *const LayerInst) };
+    let Some(id) = inst.id else {
+        return;
+    };
+    let Ok((_resolved, ctx)) = bound(engine) else {
+        return;
+    };
+    if let Ok(scene) = scene_mut(&ctx) {
+        // Detach the layer from the scene so hit-testing and event dispatch
+        // no longer resolve it once its script object is invalidated.
+        scene.invalidate_layer(id);
+    }
+}
+
 extern "C" fn layer_destroy(engine: *mut c_void, instance: *mut c_void) {
     if instance.is_null() {
         return;
@@ -2273,7 +2293,7 @@ pub(super) fn register_layer_class(ctx: &mut CompatCtx) -> Result<(), CompatErro
         name: "Layer",
         create: layer_create,
         destroy: layer_destroy,
-        invalidate: None,
+        invalidate: Some(layer_invalidate),
         methods,
         properties: vec![
             NativeInstancePropertyDef {

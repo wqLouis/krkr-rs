@@ -10,15 +10,15 @@ mod common;
 use common::{Env, vm_lock};
 use platform::{InputEvent, MouseButton, PlatformEvent};
 
-/// A pointer press is delivered to the layer under the cursor and the release
+/// A pointer press is delivered to the layer under the cursor with the
+/// reference positional arguments `(x, y, button, shift)`, and the release
 /// follows the mouse capture.
 ///
-/// Reference: `tTVPLayerManager::PrimaryMouseDown` hit-tests the layer tree
-/// and captures the hit layer, `PrimaryMouseUp` delivers to the capture owner
-/// and releases it when no button remains held
-/// (`reference/cpp/core/visual/LayerManager.cpp:374-422`); the events are
-/// `onMouseDown`/`onMouseUp` on the layer object
-/// (`reference/cpp/core/visual/LayerIntf.cpp:3410-3437`).
+/// Reference: `FireMouseDown`/`FireMouseUp` post
+/// `onMouseDown`/`onMouseUp` with `(x, y, mb, flags)`
+/// (`reference/cpp/core/visual/LayerIntf.cpp:3410-3437`); the manager
+/// hit-tests the layer tree and captures the hit layer
+/// (`reference/cpp/core/visual/LayerManager.cpp:374-422`).
 #[test]
 fn dispatch_delivers_pointer_events_to_the_hit_layer() {
     let _lock = vm_lock();
@@ -28,9 +28,9 @@ fn dispatch_delivers_pointer_events_to_the_hit_layer() {
          w.setSize(320, 240); \
          var l = new Layer(w, null); \
          l.setPos(0, 0); l.setSize(100, 50); l.visible = true; l.focusable = true; l.hitThreshold = 0; \
-         var down = 0; var up = 0; var button = -1; \
-         l.onMouseDown = function(e) { down = down + 1; button = e.button; }; \
-         l.onMouseUp = function(e) { up = up + 1; };",
+         var down = 0; var up = 0; var button = -1; var downX = -1; var downY = -1; var downShift = -1; \
+         l.onMouseDown = function(x, y, btn, shift) { down = down + 1; button = btn; downX = x; downY = y; downShift = shift; }; \
+         l.onMouseUp = function(x, y, btn, shift) { up = up + 1; };",
     );
 
     env.dispatch_events(&[
@@ -40,9 +40,15 @@ fn dispatch_delivers_pointer_events_to_the_hit_layer() {
             pressed: true,
         }),
     ]);
-    // reference/cpp/core/visual/LayerManager.cpp:374-399
+    // reference/cpp/core/visual/LayerIntf.cpp:3410-3423
     assert_eq!(env.eval_int("down"), 1);
     assert_eq!(env.eval_int("button"), 0);
+    assert_eq!(env.eval_int("downX"), 10);
+    assert_eq!(env.eval_int("downY"), 10);
+    // The reference ORs the held mouse button into the shift mask
+    // (`ssLeft` = `TVP_SS_LEFT` = 0x08):
+    // reference/cpp/core/environ/impl/TVPWindow.cpp:531-556
+    assert_eq!(env.eval_int("downShift"), 8);
 
     env.dispatch_events(&[PlatformEvent::Input(InputEvent::MouseButton {
         button: MouseButton::Left,
@@ -52,13 +58,16 @@ fn dispatch_delivers_pointer_events_to_the_hit_layer() {
     assert_eq!(env.eval_int("up"), 1);
 }
 
-/// Key events go to the window's focused layer; a window focus event goes to
-/// the window object.
+/// Key events go to the window's focused layer with the reference positional
+/// arguments `(key, shift, process)`; a window activation event goes to the
+/// window object.
 ///
-/// Reference: `tTVPLayerManager::PrimaryKeyDown`/`PrimaryKeyUp` deliver to
-/// `FocusedLayer` (`reference/cpp/core/visual/LayerManager.cpp:1010-1022`);
-/// the OS activation event is posted to the window owner
-/// (`reference/cpp/core/visual/WindowIntf.cpp:485-506`).
+/// Reference: `FireKeyDown` posts `onKeyDown` with `(key, shift, true)`
+/// (`reference/cpp/core/visual/LayerIntf.cpp:3844-3854`) and
+/// `PrimaryKeyDown` delivers to `FocusedLayer`
+/// (`reference/cpp/core/visual/LayerManager.cpp:1010-1022`); the OS
+/// activation event is posted to the window owner as `onActivate`
+/// (`reference/cpp/core/visual/WindowIntf.cpp:556-570`).
 #[test]
 fn dispatch_delivers_keys_to_the_focused_layer_and_focus_to_the_window() {
     let _lock = vm_lock();
@@ -66,10 +75,10 @@ fn dispatch_delivers_keys_to_the_focused_layer_and_focus_to_the_window() {
     env.run(
         "var w = new Window(); \
          var l = new Layer(w, null); l.focusable = true; l.visible = true; \
-         var keyDown = 0; var keyCode = -1; \
-         l.onKeyDown = function(e) { keyDown = keyDown + 1; keyCode = e.code; }; \
-         var focused = 0; \
-         w.onFocus = function() { focused = focused + 1; }; \
+         var keyDown = 0; var keyCode = -1; var keyShift = -1; var keyProcess = -1; \
+         l.onKeyDown = function(key, shift, process) { keyDown = keyDown + 1; keyCode = key; keyShift = shift; keyProcess = process; }; \
+         var activated = 0; \
+         w.onActivate = function() { activated = activated + 1; }; \
          w.focusedLayer = l;",
     );
 
@@ -77,13 +86,15 @@ fn dispatch_delivers_keys_to_the_focused_layer_and_focus_to_the_window() {
         code: 13,
         pressed: true,
     })]);
-    // reference/cpp/core/visual/LayerManager.cpp:1010-1015
+    // reference/cpp/core/visual/LayerIntf.cpp:3844-3854
     assert_eq!(env.eval_int("keyDown"), 1);
     assert_eq!(env.eval_int("keyCode"), 13);
+    assert_eq!(env.eval_int("keyShift"), 0);
+    assert_eq!(env.eval_int("keyProcess"), 1);
 
     env.dispatch_events(&[PlatformEvent::Focused(true)]);
-    // reference/cpp/core/visual/WindowIntf.cpp:485-506
-    assert_eq!(env.eval_int("focused"), 1);
+    // reference/cpp/core/visual/WindowIntf.cpp:556-570
+    assert_eq!(env.eval_int("activated"), 1);
 }
 
 /// Once a layer has captured the mouse, the following moves and the release
@@ -102,9 +113,9 @@ fn dispatch_honours_mouse_capture() {
          var a = new Layer(w, null); a.setPos(0, 0); a.setSize(50, 50); a.visible = true; a.focusable = true; a.hitThreshold = 0; \
          var b = new Layer(w, null); b.setPos(60, 0); b.setSize(50, 50); b.visible = true; b.hitThreshold = 0; \
          var aMoves = 0; var bMoves = 0; var aUps = 0; \
-         a.onMouseMove = function(e) { aMoves = aMoves + 1; }; \
-         b.onMouseMove = function(e) { bMoves = bMoves + 1; }; \
-         a.onMouseUp = function(e) { aUps = aUps + 1; };",
+         a.onMouseMove = function(x, y, shift) { aMoves = aMoves + 1; }; \
+         b.onMouseMove = function(x, y, shift) { bMoves = bMoves + 1; }; \
+         a.onMouseUp = function(x, y, btn, shift) { aUps = aUps + 1; };",
     );
 
     env.dispatch_events(&[PlatformEvent::Input(InputEvent::PointerMoved {
@@ -154,7 +165,7 @@ fn dispatch_is_a_no_op_when_nothing_is_hit() {
          var l = new Layer(w, null); \
          l.setPos(0, 0); l.setSize(50, 50); l.visible = true; l.hitThreshold = 0; \
          var moves = 0; \
-         l.onMouseMove = function(e) { moves = moves + 1; };",
+         l.onMouseMove = function(x, y, shift) { moves = moves + 1; };",
     );
 
     env.dispatch_events(&[PlatformEvent::Input(InputEvent::PointerMoved {
@@ -181,7 +192,7 @@ fn dispatch_survives_a_throwing_handler() {
          var l = new Layer(w, null); \
          l.setPos(0, 0); l.setSize(50, 50); l.visible = true; l.hitThreshold = 0; \
          var entered = 0; \
-         l.onMouseDown = function(e) { entered = entered + 1; throw 'boom'; };",
+         l.onMouseDown = function(x, y, btn, shift) { entered = entered + 1; throw 'boom'; };",
     );
 
     env.dispatch_events(&[
@@ -194,4 +205,48 @@ fn dispatch_survives_a_throwing_handler() {
     // reference/cpp/core/base/EventIntf.cpp:97-118
     assert_eq!(env.eval_int("entered"), 1);
     assert_eq!(env.eval_int("1"), 1);
+}
+
+/// An invalidated layer is detached from the layer tree, so it can neither
+/// receive an event nor shadow the live layer beneath it.
+///
+/// Reference: `tTJSNI_BaseLayer::Invalidate` sets `Shutdown` and parts the
+/// layer from its manager (`reference/cpp/core/visual/LayerIntf.cpp:515-556`),
+/// and `FireMouseMove` refuses to dispatch while `Shutdown` is set
+/// (`reference/cpp/core/visual/LayerIntf.cpp:3438-3444`); the manager's
+/// hit-test then finds the layer under the cursor
+/// (`reference/cpp/core/visual/LayerManager.cpp:345-372`).
+#[test]
+fn dispatch_skips_an_invalidated_layer() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         w.setSize(320, 240); \
+         var lower = new Layer(w, null); \
+         lower.setPos(0, 0); lower.setSize(100, 100); lower.visible = true; lower.hitThreshold = 0; \
+         var upper = new Layer(w, null); \
+         upper.setPos(0, 0); upper.setSize(100, 100); upper.visible = true; upper.hitThreshold = 0; \
+         var lowerMoves = 0; var upperMoves = 0; \
+         lower.onMouseMove = function(x, y, shift) { lowerMoves = lowerMoves + 1; }; \
+         upper.onMouseMove = function(x, y, shift) { upperMoves = upperMoves + 1; }; \
+         invalidate upper;",
+    );
+
+    // `invalidate` detaches the layer from the L2 scene entirely.
+    // reference/cpp/core/visual/LayerIntf.cpp:515-556
+    assert_eq!(
+        env.scene.layers.len(),
+        1,
+        "the invalidated layer is detached"
+    );
+
+    env.dispatch_events(&[PlatformEvent::Input(InputEvent::PointerMoved {
+        x: 10.0,
+        y: 10.0,
+    })]);
+    // reference/cpp/core/visual/LayerIntf.cpp:3438-3444
+    assert_eq!(env.eval_int("upperMoves"), 0);
+    // reference/cpp/core/visual/LayerManager.cpp:345-372
+    assert_eq!(env.eval_int("lowerMoves"), 1);
 }

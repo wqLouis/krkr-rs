@@ -40,7 +40,7 @@ fn eval_i(e: &Tjs2Engine, expr: &str) -> i64 {
 
 /// Feed one frame of input events through the adapter seam.
 fn frame(
-    adapter: &EventAdapter,
+    adapter: &mut EventAdapter,
     host: &mut CompatHost,
     events: impl IntoIterator<Item = PlatformEvent>,
 ) {
@@ -56,9 +56,9 @@ fn frame(
 fn mouse_reads_state_fed_from_events() {
     let _lock = vm_lock();
     with_vm(|e, host| {
-        let adapter = EventAdapter::new();
+        let mut adapter = EventAdapter::new();
         frame(
-            &adapter,
+            &mut adapter,
             host,
             [
                 PlatformEvent::Input(InputEvent::PointerMoved { x: 300.0, y: 200.0 }),
@@ -84,7 +84,7 @@ fn mouse_reads_state_fed_from_events() {
 
         // Release: visible for exactly one frame, then gone.
         frame(
-            &adapter,
+            &mut adapter,
             host,
             [PlatformEvent::Input(InputEvent::MouseButton {
                 button: MouseButton::Left,
@@ -95,7 +95,7 @@ fn mouse_reads_state_fed_from_events() {
         assert_eq!(eval_i(e, "Mouse.getReleased(0)"), 1);
         assert_eq!(eval_i(e, "Mouse.getRepeat(0)"), 0);
 
-        frame(&adapter, host, []);
+        frame(&mut adapter, host, []);
         assert_eq!(eval_i(e, "Mouse.getReleased(0)"), 0);
         // begin_frame cleared the wheel accumulation.
         assert_eq!(eval_i(e, "Mouse.getWheelRot()"), 0);
@@ -106,9 +106,9 @@ fn mouse_reads_state_fed_from_events() {
 fn key_reads_state_fed_from_events_and_repeats() {
     let _lock = vm_lock();
     with_vm(|e, host| {
-        let adapter = EventAdapter::new();
+        let mut adapter = EventAdapter::new();
         frame(
-            &adapter,
+            &mut adapter,
             host,
             [PlatformEvent::Input(InputEvent::Key {
                 code: 0x0D, // VK_RETURN
@@ -118,11 +118,11 @@ fn key_reads_state_fed_from_events_and_repeats() {
         assert_eq!(eval_i(e, "Key.getPressed(Key.kReturn)"), 1);
         assert_eq!(eval_i(e, "Key.getRepeat(Key.kReturn)"), 1);
 
-        frame(&adapter, host, []);
+        frame(&mut adapter, host, []);
         assert_eq!(eval_i(e, "Key.getRepeat(Key.kReturn)"), 2);
 
         frame(
-            &adapter,
+            &mut adapter,
             host,
             [PlatformEvent::Input(InputEvent::Key {
                 code: 0x0D,
@@ -132,7 +132,7 @@ fn key_reads_state_fed_from_events_and_repeats() {
         assert_eq!(eval_i(e, "Key.getPressed(Key.kReturn)"), 0);
         assert_eq!(eval_i(e, "Key.getReleased(Key.kReturn)"), 1);
 
-        frame(&adapter, host, []);
+        frame(&mut adapter, host, []);
         assert_eq!(eval_i(e, "Key.getReleased(Key.kReturn)"), 0);
         assert_eq!(eval_i(e, "Key.getRepeat(Key.kReturn)"), 0);
     });
@@ -142,9 +142,9 @@ fn key_reads_state_fed_from_events_and_repeats() {
 fn key_resolves_mouse_button_vks_and_pad_any() {
     let _lock = vm_lock();
     with_vm(|e, host| {
-        let adapter = EventAdapter::new();
+        let mut adapter = EventAdapter::new();
         frame(
-            &adapter,
+            &mut adapter,
             host,
             [
                 PlatformEvent::Input(InputEvent::MouseButton {
@@ -167,7 +167,7 @@ fn key_resolves_mouse_button_vks_and_pad_any() {
         assert_eq!(eval_i(e, "Key.getPressed(Key.kPadAny)"), 1);
 
         frame(
-            &adapter,
+            &mut adapter,
             host,
             [PlatformEvent::Input(InputEvent::MouseButton {
                 button: MouseButton::Left,
@@ -244,9 +244,9 @@ fn mouse_set_cursor_pos_writes_state_and_queues_a_warp() {
 fn mouse_get_cursor_pos_fills_an_object_argument() {
     let _lock = vm_lock();
     with_vm(|e, host| {
-        let adapter = EventAdapter::new();
+        let mut adapter = EventAdapter::new();
         frame(
-            &adapter,
+            &mut adapter,
             host,
             [PlatformEvent::Input(InputEvent::PointerMoved {
                 x: 7.0,

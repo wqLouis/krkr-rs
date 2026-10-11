@@ -33,9 +33,8 @@
 //! methods on [`crate::EventAdapter`] defined below
 //! ([`crate::EventAdapter::begin_input_frame`],
 //! [`crate::EventAdapter::apply_input_event`],
-//! [`crate::EventAdapter::end_input_frame`]). The eventual `dispatch`
-//! implementation in `event.rs` should call the same seam; it lives here
-//! because `event.rs` is out of this change's scope.
+//! [`crate::EventAdapter::end_input_frame`]). Applying an input event also
+//! caches the pointer position and shift mask the mapping needs.
 //!
 //! # Script surface
 //!
@@ -319,13 +318,16 @@ impl crate::EventAdapter {
         }
     }
 
-    /// Apply one raw L1 platform event to the script-visible L2 input state.
-    pub fn apply_input_event(&self, ctx: &mut CompatCtx, event: &PlatformEvent) {
+    /// Apply one raw L1 platform event to the script-visible L2 input state
+    /// and cache the pointer/shift the event mapping needs.
+    pub fn apply_input_event(&mut self, ctx: &mut CompatCtx, event: &PlatformEvent) {
         // SAFETY: a `CompatCtx` is only created for a bound, live engine.
         let services = unsafe { ctx.services() };
         if let (Some(input), PlatformEvent::Input(raw)) = (services.input(), event) {
             // SAFETY: `attach_input` guarantees the pointer stays valid.
-            unsafe { &mut *input }.apply(raw);
+            let input = unsafe { &mut *input };
+            input.apply(raw);
+            self.cache_input_state(input);
         }
     }
 

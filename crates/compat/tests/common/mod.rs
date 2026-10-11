@@ -174,7 +174,7 @@ impl Env {
     /// each mapped event to the script handler the adapter resolves (the
     /// [`compat::EventAdapter::dispatch`] seam the VM host's `tick` uses).
     pub fn dispatch_events(&self, events: &[PlatformEvent]) {
-        let adapter = compat::EventAdapter::new();
+        let mut adapter = compat::EventAdapter::new();
         let mut ctx = self._host.ctx().expect("bound compat context");
         adapter.begin_input_frame(&mut ctx);
         for event in events {

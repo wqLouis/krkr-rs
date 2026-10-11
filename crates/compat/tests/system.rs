@@ -52,7 +52,7 @@ fn with_input(f: impl FnOnce(&Tjs2Engine, &mut CompatHost)) {
 
 /// Feed one frame of platform events through the input adapter seam.
 fn input_frame(
-    adapter: &EventAdapter,
+    adapter: &mut EventAdapter,
     host: &mut CompatHost,
     events: impl IntoIterator<Item = PlatformEvent>,
 ) {
@@ -500,9 +500,9 @@ fn host_facts_seam_serves_the_system_members() {
 fn get_key_state_reads_the_l2_input_state() {
     let _lock = vm_lock();
     with_input(|e, host| {
-        let adapter = EventAdapter::new();
+        let mut adapter = EventAdapter::new();
         input_frame(
-            &adapter,
+            &mut adapter,
             host,
             [PlatformEvent::Input(InputEvent::Key {
                 code: 0x0D, // VK_RETURN
@@ -516,7 +516,7 @@ fn get_key_state_reads_the_l2_input_state() {
         assert_eq!(eval_int(e, "System.getKeyState(Key.kReturn)"), 1);
 
         input_frame(
-            &adapter,
+            &mut adapter,
             host,
             [PlatformEvent::Input(InputEvent::Key {
                 code: 0x0D,
@@ -555,9 +555,9 @@ fn touch_device_requires_input_and_reports_capability_flags() {
     with_input(|e, host| {
         assert_eq!(eval_int(e, "System.touchDevice"), 0x300);
         // An active touch contact adds the touch/pen capability bits.
-        let adapter = EventAdapter::new();
+        let mut adapter = EventAdapter::new();
         input_frame(
-            &adapter,
+            &mut adapter,
             host,
             [PlatformEvent::Input(InputEvent::Touch {
                 id: 1,
