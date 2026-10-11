@@ -216,7 +216,7 @@ impl InputState {
             InputEvent::PointerLeft => self.pointer_inside = false,
             InputEvent::MouseButton { button, pressed } => self.set_button(*button, *pressed),
             InputEvent::Wheel { delta } => self.add_wheel(*delta),
-            InputEvent::Key { code, pressed } => self.set_key(*code, *pressed),
+            InputEvent::Key { code, pressed } => self.set_key(code.index(), *pressed),
             InputEvent::Text(text) => self.text_input.push_str(text),
             InputEvent::Touch { id, phase, x, y } => self.apply_touch(*id, *phase, *x, *y),
         }

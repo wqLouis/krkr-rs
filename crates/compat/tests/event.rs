@@ -2,7 +2,7 @@
 
 use api::host::TouchPhase;
 use compat::{EventAdapter, EventValue, TjsEvent};
-use platform::{InputEvent, MouseButton, PlatformEvent};
+use platform::{InputEvent, MouseButton, PhysicalKey, PlatformEvent};
 
 #[test]
 fn maps_keys_pointer_and_lifecycle_events() {
@@ -12,7 +12,7 @@ fn maps_keys_pointer_and_lifecycle_events() {
     // (`reference/cpp/core/visual/LayerIntf.cpp:3844-3867`).
     assert_eq!(
         adapter.map(&PlatformEvent::Input(InputEvent::Key {
-            code: 13,
+            code: PhysicalKey::Enter,
             pressed: true,
         })),
         Some(TjsEvent {
@@ -22,7 +22,7 @@ fn maps_keys_pointer_and_lifecycle_events() {
     );
     assert_eq!(
         adapter.map(&PlatformEvent::Input(InputEvent::Key {
-            code: 13,
+            code: PhysicalKey::Enter,
             pressed: false,
         })),
         Some(TjsEvent {

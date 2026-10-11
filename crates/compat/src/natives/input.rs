@@ -56,7 +56,7 @@
 use std::ffi::{c_char, c_int, c_void};
 
 use engine::input::InputState;
-use platform::{MouseButton, PlatformEvent};
+use platform::{MouseButton, PhysicalKey, PlatformEvent};
 use tjs::{
     NativeClassBuilder, NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef,
     NativeMethodDef, NativePropertyDef, TjsValue, VAL_OBJECT, Value,
@@ -112,6 +112,236 @@ pub fn mouse_button_from_vk(vk: u32) -> Option<usize> {
         _ => None,
     }
 }
+
+// ---------------------------------------------------------------------------
+// Physical key <-> reference virtual-key code (`VK_*`)
+// ---------------------------------------------------------------------------
+
+/// The reference Windows virtual-key code a platform-neutral physical key
+/// names, or `0` when the reference names no such key.
+pub fn vk_from_physical(key: PhysicalKey) -> u32 {
+    PHYSICAL_VK_TABLE
+        .iter()
+        .find(|(candidate, _)| *candidate == key)
+        .map_or(0, |(_, vk)| *vk)
+}
+
+/// The physical key a reference virtual-key code names, or `None` for a code
+/// the reference uses as a query pseudo-code (`VK_PADANY`) or a mouse button.
+///
+/// The generic modifier codes `VK_SHIFT`/`VK_CONTROL`/`VK_MENU` name either
+/// side and are resolved by [`modifier_keys`]. The explicit side codes
+/// (`VK_LSHIFT` … `VK_RMENU`) resolve to that side.
+pub fn physical_from_vk(vk: u32) -> Option<PhysicalKey> {
+    let side = match vk {
+        VK_LSHIFT => Some(PhysicalKey::ShiftLeft),
+        VK_RSHIFT => Some(PhysicalKey::ShiftRight),
+        VK_LCONTROL => Some(PhysicalKey::ControlLeft),
+        VK_RCONTROL => Some(PhysicalKey::ControlRight),
+        VK_LMENU => Some(PhysicalKey::AltLeft),
+        VK_RMENU => Some(PhysicalKey::AltRight),
+        _ => None,
+    };
+    side.or_else(|| {
+        PHYSICAL_VK_TABLE
+            .iter()
+            .find(|(_, value)| *value == vk)
+            .map(|(key, _)| *key)
+    })
+}
+
+/// The explicit side virtual-key codes (`VK_LSHIFT` … `VK_RMENU`).
+const VK_LSHIFT: u32 = 0xA0;
+const VK_RSHIFT: u32 = 0xA1;
+const VK_LCONTROL: u32 = 0xA2;
+const VK_RCONTROL: u32 = 0xA3;
+const VK_LMENU: u32 = 0xA4;
+const VK_RMENU: u32 = 0xA5;
+
+/// The physical keys a `vk` query against the generic modifier codes matches.
+fn modifier_keys(vk: u32) -> Option<&'static [PhysicalKey]> {
+    match vk {
+        VK_SHIFT => Some(&[PhysicalKey::ShiftLeft, PhysicalKey::ShiftRight]),
+        VK_CONTROL => Some(&[PhysicalKey::ControlLeft, PhysicalKey::ControlRight]),
+        VK_MENU => Some(&[PhysicalKey::AltLeft, PhysicalKey::AltRight]),
+        _ => None,
+    }
+}
+
+/// The reference virtual-key code for a stored physical-key identity.
+///
+/// `index` is a [`PhysicalKey::index`] value; an identity with no named key
+/// maps to `0`.
+pub fn vk_from_index(index: u32) -> u32 {
+    PHYSICAL_VK_TABLE
+        .iter()
+        .find(|(key, _)| key.index() == index)
+        .map_or(0, |(_, vk)| *vk)
+}
+
+/// Physical key -> reference Windows virtual-key code.
+///
+/// The values are the codes the KiriKiri scripts compare against
+/// (`system/window.tjs:119-193`), the C++ `VK_*` constants
+/// (`reference/cpp/core/base/ScriptMgnIntf.cpp:180-198`) and the reference
+/// platform's key conversion, which collapses the left/right modifiers onto the
+/// generic codes (`reference/cpp/core/environ/cocos2d/CCKeyCodeConv.cpp:91-103`).
+const PHYSICAL_VK_TABLE: &[(PhysicalKey, u32)] = &[
+    (PhysicalKey::KeyA, 0x41),
+    (PhysicalKey::KeyB, 0x42),
+    (PhysicalKey::KeyC, 0x43),
+    (PhysicalKey::KeyD, 0x44),
+    (PhysicalKey::KeyE, 0x45),
+    (PhysicalKey::KeyF, 0x46),
+    (PhysicalKey::KeyG, 0x47),
+    (PhysicalKey::KeyH, 0x48),
+    (PhysicalKey::KeyI, 0x49),
+    (PhysicalKey::KeyJ, 0x4A),
+    (PhysicalKey::KeyK, 0x4B),
+    (PhysicalKey::KeyL, 0x4C),
+    (PhysicalKey::KeyM, 0x4D),
+    (PhysicalKey::KeyN, 0x4E),
+    (PhysicalKey::KeyO, 0x4F),
+    (PhysicalKey::KeyP, 0x50),
+    (PhysicalKey::KeyQ, 0x51),
+    (PhysicalKey::KeyR, 0x52),
+    (PhysicalKey::KeyS, 0x53),
+    (PhysicalKey::KeyT, 0x54),
+    (PhysicalKey::KeyU, 0x55),
+    (PhysicalKey::KeyV, 0x56),
+    (PhysicalKey::KeyW, 0x57),
+    (PhysicalKey::KeyX, 0x58),
+    (PhysicalKey::KeyY, 0x59),
+    (PhysicalKey::KeyZ, 0x5A),
+    (PhysicalKey::Digit0, 0x30),
+    (PhysicalKey::Digit1, 0x31),
+    (PhysicalKey::Digit2, 0x32),
+    (PhysicalKey::Digit3, 0x33),
+    (PhysicalKey::Digit4, 0x34),
+    (PhysicalKey::Digit5, 0x35),
+    (PhysicalKey::Digit6, 0x36),
+    (PhysicalKey::Digit7, 0x37),
+    (PhysicalKey::Digit8, 0x38),
+    (PhysicalKey::Digit9, 0x39),
+    (PhysicalKey::F1, 0x70),
+    (PhysicalKey::F2, 0x71),
+    (PhysicalKey::F3, 0x72),
+    (PhysicalKey::F4, 0x73),
+    (PhysicalKey::F5, 0x74),
+    (PhysicalKey::F6, 0x75),
+    (PhysicalKey::F7, 0x76),
+    (PhysicalKey::F8, 0x77),
+    (PhysicalKey::F9, 0x78),
+    (PhysicalKey::F10, 0x79),
+    (PhysicalKey::F11, 0x7A),
+    (PhysicalKey::F12, 0x7B),
+    (PhysicalKey::F13, 0x7C),
+    (PhysicalKey::F14, 0x7D),
+    (PhysicalKey::F15, 0x7E),
+    (PhysicalKey::F16, 0x7F),
+    (PhysicalKey::F17, 0x80),
+    (PhysicalKey::F18, 0x81),
+    (PhysicalKey::F19, 0x82),
+    (PhysicalKey::F20, 0x83),
+    (PhysicalKey::F21, 0x84),
+    (PhysicalKey::F22, 0x85),
+    (PhysicalKey::F23, 0x86),
+    (PhysicalKey::F24, 0x87),
+    (PhysicalKey::Backspace, 0x08),
+    (PhysicalKey::Tab, 0x09),
+    (PhysicalKey::Clear, 0x0C),
+    (PhysicalKey::Enter, 0x0D),
+    (PhysicalKey::NumpadEnter, 0x0D),
+    (PhysicalKey::Escape, 0x1B),
+    (PhysicalKey::Space, 0x20),
+    (PhysicalKey::Delete, 0x2E),
+    (PhysicalKey::Insert, 0x2D),
+    (PhysicalKey::Home, 0x24),
+    (PhysicalKey::End, 0x23),
+    (PhysicalKey::PageUp, 0x21),
+    (PhysicalKey::PageDown, 0x22),
+    (PhysicalKey::ArrowUp, 0x26),
+    (PhysicalKey::ArrowDown, 0x28),
+    (PhysicalKey::ArrowLeft, 0x25),
+    (PhysicalKey::ArrowRight, 0x27),
+    (PhysicalKey::Select, 0x29),
+    (PhysicalKey::Print, 0x2A),
+    (PhysicalKey::Execute, 0x2B),
+    (PhysicalKey::PrintScreen, 0x2C),
+    (PhysicalKey::Help, 0x2F),
+    (PhysicalKey::CapsLock, 0x14),
+    (PhysicalKey::NumLock, 0x90),
+    (PhysicalKey::ScrollLock, 0x91),
+    (PhysicalKey::Pause, 0x13),
+    (PhysicalKey::SuperLeft, 0x5B),
+    (PhysicalKey::SuperRight, 0x5C),
+    (PhysicalKey::ContextMenu, 0x5D),
+    (PhysicalKey::Sleep, 0x5F),
+    (PhysicalKey::ShiftLeft, 0x10),
+    (PhysicalKey::ShiftRight, 0x10),
+    (PhysicalKey::ControlLeft, 0x11),
+    (PhysicalKey::ControlRight, 0x11),
+    (PhysicalKey::AltLeft, 0x12),
+    (PhysicalKey::AltRight, 0x12),
+    (PhysicalKey::Numpad0, 0x60),
+    (PhysicalKey::Numpad1, 0x61),
+    (PhysicalKey::Numpad2, 0x62),
+    (PhysicalKey::Numpad3, 0x63),
+    (PhysicalKey::Numpad4, 0x64),
+    (PhysicalKey::Numpad5, 0x65),
+    (PhysicalKey::Numpad6, 0x66),
+    (PhysicalKey::Numpad7, 0x67),
+    (PhysicalKey::Numpad8, 0x68),
+    (PhysicalKey::Numpad9, 0x69),
+    (PhysicalKey::NumpadMultiply, 0x6A),
+    (PhysicalKey::NumpadAdd, 0x6B),
+    (PhysicalKey::NumpadSeparator, 0x6C),
+    (PhysicalKey::NumpadSubtract, 0x6D),
+    (PhysicalKey::NumpadDecimal, 0x6E),
+    (PhysicalKey::NumpadDivide, 0x6F),
+    (PhysicalKey::Backquote, 0xC0),
+    (PhysicalKey::Backslash, 0xDC),
+    (PhysicalKey::BracketLeft, 0xDB),
+    (PhysicalKey::BracketRight, 0xDD),
+    (PhysicalKey::Comma, 0xBC),
+    (PhysicalKey::Period, 0xBE),
+    (PhysicalKey::Semicolon, 0xBA),
+    (PhysicalKey::Quote, 0xDE),
+    (PhysicalKey::Minus, 0xBD),
+    (PhysicalKey::Equal, 0xBB),
+    (PhysicalKey::Slash, 0xBF),
+    (PhysicalKey::IntlBackslash, 0xE2),
+    (PhysicalKey::IntlRo, 0xC1),
+    (PhysicalKey::IntlYen, 0xC2),
+    (PhysicalKey::KanaMode, 0x15),
+    (PhysicalKey::Hangul, 0x15),
+    (PhysicalKey::Junja, 0x17),
+    (PhysicalKey::Final, 0x18),
+    (PhysicalKey::Hanja, 0x19),
+    (PhysicalKey::Convert, 0x1C),
+    (PhysicalKey::NonConvert, 0x1D),
+    (PhysicalKey::Accept, 0x1E),
+    (PhysicalKey::ModeChange, 0x1F),
+    (PhysicalKey::ProcessKey, 0xE5),
+    (PhysicalKey::BrowserBack, 0xA6),
+    (PhysicalKey::BrowserForward, 0xA7),
+    (PhysicalKey::BrowserRefresh, 0xA8),
+    (PhysicalKey::BrowserStop, 0xA9),
+    (PhysicalKey::BrowserSearch, 0xAA),
+    (PhysicalKey::BrowserFavorites, 0xAB),
+    (PhysicalKey::BrowserHome, 0xAC),
+    (PhysicalKey::VolumeMute, 0xAD),
+    (PhysicalKey::VolumeDown, 0xAE),
+    (PhysicalKey::VolumeUp, 0xAF),
+    (PhysicalKey::MediaTrackNext, 0xB0),
+    (PhysicalKey::MediaTrackPrevious, 0xB1),
+    (PhysicalKey::MediaStop, 0xB2),
+    (PhysicalKey::MediaPlayPause, 0xB3),
+    (PhysicalKey::LaunchMail, 0xB4),
+    (PhysicalKey::MediaSelect, 0xB5),
+    (PhysicalKey::LaunchApp1, 0xB6),
+    (PhysicalKey::LaunchApp2, 0xB7),
+];
 
 // ---------------------------------------------------------------------------
 // Gamepad virtual-key codes (reference `VK_PAD*`, tvpinputdefs.h)
@@ -240,7 +470,13 @@ pub fn vk_pressed(state: &InputState, code: u32) -> bool {
     if code == VK_PADANY {
         return PAD_CODES.iter().any(|&c| state.is_key_down(c));
     }
-    state.is_key_down(code)
+    if PAD_CODES.contains(&code) {
+        return state.is_key_down(code);
+    }
+    if let Some(keys) = modifier_keys(code) {
+        return keys.iter().any(|key| state.is_key_down(key.index()));
+    }
+    physical_from_vk(code).is_some_and(|key| state.is_key_down(key.index()))
 }
 
 /// Whether virtual-key `code` was released this frame (same mapping as
@@ -252,7 +488,13 @@ pub fn vk_released(state: &InputState, code: u32) -> bool {
     if code == VK_PADANY {
         return PAD_CODES.iter().any(|&c| state.is_key_released(c));
     }
-    state.is_key_released(code)
+    if PAD_CODES.contains(&code) {
+        return state.is_key_released(code);
+    }
+    if let Some(keys) = modifier_keys(code) {
+        return keys.iter().any(|key| state.is_key_released(key.index()));
+    }
+    physical_from_vk(code).is_some_and(|key| state.is_key_released(key.index()))
 }
 
 /// Held-frame count for virtual-key `code` (`VK_PADANY` = longest pad).
@@ -267,7 +509,17 @@ pub fn vk_repeat(state: &InputState, code: u32) -> u32 {
             .max()
             .unwrap_or(0);
     }
-    state.key_hold_frames(code)
+    if PAD_CODES.contains(&code) {
+        return state.key_hold_frames(code);
+    }
+    if let Some(keys) = modifier_keys(code) {
+        return keys
+            .iter()
+            .map(|key| state.key_hold_frames(key.index()))
+            .max()
+            .unwrap_or(0);
+    }
+    physical_from_vk(code).map_or(0, |key| state.key_hold_frames(key.index()))
 }
 
 /// The reference `TVP_SS_*` shift mask for the currently held state.
@@ -1495,6 +1747,59 @@ mod tests {
         assert!(vk_pressed(&state, VK_PADANY));
         assert_eq!(vk_repeat(&state, VK_PADANY), 1);
         assert!(shift_flags(&state) & TVP_SS_LEFT != 0);
+    }
+
+    #[test]
+    fn physical_keys_map_to_the_reference_vk_families() {
+        // reference/cpp/core/base/ScriptMgnIntf.cpp:180-198
+        // reference/cpp/core/environ/cocos2d/CCKeyCodeConv.cpp:33-160
+        for (key, vk) in [
+            (PhysicalKey::Enter, 0x0D),
+            (PhysicalKey::NumpadEnter, 0x0D),
+            (PhysicalKey::Escape, 0x1B),
+            (PhysicalKey::KeyA, 0x41),
+            (PhysicalKey::KeyZ, 0x5A),
+            (PhysicalKey::Digit5, 0x35),
+            (PhysicalKey::F1, 0x70),
+            (PhysicalKey::F12, 0x7B),
+            (PhysicalKey::F24, 0x87),
+            (PhysicalKey::ArrowUp, 0x26),
+            (PhysicalKey::PageDown, 0x22),
+            (PhysicalKey::Space, 0x20),
+            (PhysicalKey::Numpad5, 0x65),
+            (PhysicalKey::NumpadMultiply, 0x6A),
+            (PhysicalKey::Semicolon, 0xBA),
+            (PhysicalKey::Slash, 0xBF),
+            (PhysicalKey::Backquote, 0xC0),
+            (PhysicalKey::ShiftLeft, 0x10),
+            (PhysicalKey::ShiftRight, 0x10),
+            (PhysicalKey::ControlLeft, 0x11),
+            (PhysicalKey::AltRight, 0x12),
+            (PhysicalKey::SuperLeft, 0x5B),
+            (PhysicalKey::ContextMenu, 0x5D),
+        ] {
+            assert_eq!(vk_from_physical(key), vk, "{key:?}");
+        }
+    }
+
+    #[test]
+    fn vk_queries_resolve_the_physical_keys_that_are_held() {
+        // reference/cpp/core/base/ScriptMgnIntf.cpp:180-198
+        let mut state = InputState::new();
+        state.begin_frame();
+        state.set_key(PhysicalKey::KeyA.index(), true);
+        state.set_key(PhysicalKey::ShiftRight.index(), true);
+        state.set_key(VK_PAD1, true);
+        state.end_frame();
+
+        assert!(vk_pressed(&state, 0x41));
+        assert!(vk_pressed(&state, VK_SHIFT));
+        assert!(vk_pressed(&state, VK_RSHIFT));
+        assert!(!vk_pressed(&state, VK_LSHIFT));
+        assert!(vk_pressed(&state, VK_PAD1));
+        assert!(vk_pressed(&state, VK_PADANY));
+        assert!(shift_flags(&state) & TVP_SS_SHIFT != 0);
+        assert_eq!(vk_from_index(PhysicalKey::KeyA.index()), 0x41);
     }
 
     #[test]

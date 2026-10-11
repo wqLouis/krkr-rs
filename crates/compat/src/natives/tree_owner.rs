@@ -58,7 +58,7 @@ use tjs::{
     Value,
 };
 
-use super::input::{MB_LEFT, MOUSE_BUTTONS, mouse_button, shift_flags};
+use super::input::{MB_LEFT, MOUSE_BUTTONS, mouse_button, shift_flags, vk_from_index};
 use crate::native_util::{args, report_error, set_bool, set_int, set_void};
 use crate::natives::system::{resolve, value_as_i64};
 use crate::{CompatCtx, CompatError};
@@ -146,7 +146,11 @@ fn input_snapshot(ctx: &CompatCtx) -> Option<InputSnapshot> {
         pointer: (f64::from(x), f64::from(y)),
         flags: i64::from(shift_flags(state)),
         wheel: f64::from(state.wheel()),
-        last_key: i64::from(state.last_pressed().last().copied().unwrap_or(0)),
+        last_key: state
+            .last_pressed()
+            .last()
+            .copied()
+            .map_or(0, |index| i64::from(vk_from_index(index))),
         text: state.text_input().to_string(),
         button: button as i64,
     })

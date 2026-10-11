@@ -10,7 +10,7 @@ mod common;
 use api::host::TouchPhase;
 use common::{Env, vm_lock};
 use compat::{CompatHost, EventAdapter};
-use platform::{InputEvent, PlatformEvent};
+use platform::{InputEvent, PhysicalKey, PlatformEvent};
 use tjs::{Tjs2Engine, TjsValue};
 
 /// Build a VM with the full compat surface installed and run `f` against it.
@@ -205,17 +205,40 @@ fn input_string_returns_initial_and_checks_arity() {
 }
 
 #[test]
-fn inform_returns_void_or_the_first_button_and_checks_arity() {
+fn inform_returns_void_or_the_button_index_and_checks_arity() {
     let _lock = vm_lock();
     with_vm(|e| {
+        // No buttons argument clears the result (`SystemImpl.cpp:610-614`).
         assert_eq!(
             e.eval("System.inform('hello')", "t").unwrap(),
             TjsValue::Void
         );
-        assert_eq!(
-            e.eval("System.inform('hello', 'caption', 1)", "t").unwrap(),
-            TjsValue::Integer(0)
-        );
+        // The reference's dialog returns the first button (0) for one or two
+        // buttons (`environ/linux/Platform.cpp:140-183`); the headless port
+        // emulates the left/first button.
+        for buttons in ["1", "2", "['a']", "['a', 'b']"] {
+            assert_eq!(
+                e.eval(
+                    &format!("System.inform('hello', 'caption', {buttons})"),
+                    "t"
+                )
+                .unwrap(),
+                TjsValue::Integer(0),
+                "buttons {buttons}"
+            );
+        }
+        // No button (or more than the dialog renders) yields -1.
+        for buttons in ["0", "3", "[]"] {
+            assert_eq!(
+                e.eval(
+                    &format!("System.inform('hello', 'caption', {buttons})"),
+                    "t"
+                )
+                .unwrap(),
+                TjsValue::Integer(-1),
+                "buttons {buttons}"
+            );
+        }
         assert!(e.eval("System.inform()", "t").is_err());
     });
 }
@@ -233,12 +256,22 @@ fn create_app_lock_reports_first_instance() {
 }
 
 #[test]
-fn assign_message_returns_true_and_checks_arity() {
+fn assign_message_returns_the_real_success_flag_and_checks_arity() {
     let _lock = vm_lock();
     with_vm(|e| {
+        // A registered engine message is overridden and reported as success
+        // (`SystemIntf.cpp:288-304`, `tjsMessage.cpp:36-43,116-120`).
         assert_eq!(
-            e.eval("System.assignMessage('id', 'hello')", "t").unwrap(),
+            e.eval("System.assignMessage('TJSInternalError', 'hello')", "t")
+                .unwrap(),
             TjsValue::Integer(1)
+        );
+        // An unregistered name returns false instead of being stored
+        // (`tjsMessage.cpp:116-120`).
+        assert_eq!(
+            e.eval("System.assignMessage('not-a-real-message', 'x')", "t")
+                .unwrap(),
+            TjsValue::Integer(0)
         );
         assert!(e.eval("System.assignMessage('id')", "t").is_err());
     });
@@ -262,6 +295,12 @@ fn properties_round_trip() {
         assert_eq!(
             e.eval("System.eventDisabled", "t").unwrap(),
             TjsValue::Integer(0)
+        );
+        // `System.exitOnNoWindowStartup` defaults to true
+        // (`SysInitImpl.cpp:383`).
+        assert_eq!(
+            e.eval("System.exitOnNoWindowStartup", "t").unwrap(),
+            TjsValue::Integer(1)
         );
         e.exec_script(
             "System.eventDisabled = true; System.graphicCacheLimit = 64; \
@@ -312,7 +351,8 @@ fn version_and_environment_properties() {
         );
         assert!(matches!(
             e.eval("System.versionInformation", "t").unwrap(),
-            TjsValue::String(s) if s.contains("krkr-rs")
+            TjsValue::String(s) if s.starts_with("Kirikiri 2 Executable core /2.32.2.426")
+                && s.contains("TJS2/")
         ));
         assert!(matches!(
             e.eval("System.platformName", "t").unwrap(),
@@ -454,8 +494,6 @@ fn host_fact_members_raise_typed_errors_when_unset() {
             "System.desktopTop",
             "System.desktopWidth",
             "System.desktopHeight",
-            "System.shellExecute('target')",
-            "System.system('target')",
         ] {
             let error = e
                 .eval(expression, "t")
@@ -466,7 +504,17 @@ fn host_fact_members_raise_typed_errors_when_unset() {
                 "{expression:?} should name the missing host seam, got: {error}"
             );
         }
-        // Arity is still checked before the seam is consulted.
+        // `shellExecute` and `system` are inert in the reference and never
+        // consult a host seam (`SystemImpl.cpp:77-88,674-691`).
+        assert_eq!(
+            e.eval("System.shellExecute('target')", "t").unwrap(),
+            TjsValue::Integer(1)
+        );
+        assert_eq!(
+            e.eval("System.system('target')", "t").unwrap(),
+            TjsValue::Integer(0)
+        );
+        // Arity is still checked.
         assert!(e.eval("System.shellExecute()", "t").is_err());
         assert!(e.eval("System.system()", "t").is_err());
     });
@@ -478,8 +526,6 @@ fn host_facts_seam_serves_the_system_members() {
     with_host(|e, host| {
         host.set_app_data_path(|| Ok("/home/user/.local/share/game/".to_string()));
         host.set_desktop_rect(|| Ok((-1920, 0, 3840, 1080)));
-        host.set_shell_execute(|target, param| Ok(target == "open" && param == "p"));
-        host.set_system_command(|target| Ok(if target == "ok" { 0 } else { 7 }));
 
         assert_eq!(
             e.eval("System.appDataPath", "t").unwrap(),
@@ -489,10 +535,6 @@ fn host_facts_seam_serves_the_system_members() {
         assert_eq!(eval_int(e, "System.desktopTop"), 0);
         assert_eq!(eval_int(e, "System.desktopWidth"), 3840);
         assert_eq!(eval_int(e, "System.desktopHeight"), 1080);
-        assert_eq!(eval_int(e, "System.shellExecute('open', 'p')"), 1);
-        assert_eq!(eval_int(e, "System.shellExecute('other')"), 0);
-        assert_eq!(eval_int(e, "System.system('ok')"), 0);
-        assert_eq!(eval_int(e, "System.system('other')"), 7);
     });
 }
 
@@ -505,7 +547,7 @@ fn get_key_state_reads_the_l2_input_state() {
             &mut adapter,
             host,
             [PlatformEvent::Input(InputEvent::Key {
-                code: 0x0D, // VK_RETURN
+                code: PhysicalKey::Enter, // VK_RETURN
                 pressed: true,
             })],
         );
@@ -519,7 +561,7 @@ fn get_key_state_reads_the_l2_input_state() {
             &mut adapter,
             host,
             [PlatformEvent::Input(InputEvent::Key {
-                code: 0x0D,
+                code: PhysicalKey::Enter, // VK_RETURN
                 pressed: false,
             })],
         );
@@ -541,20 +583,16 @@ fn get_key_state_without_input_raises_a_typed_error() {
 }
 
 #[test]
-fn touch_device_requires_input_and_reports_capability_flags() {
+fn touch_device_is_the_constant_mouse_flag() {
     let _lock = vm_lock();
-    // Without the L2 input state the property is a typed error.
+    // The reference `TVPGetSupportTouchDevice` returns `tdMouse | tdMouseWheel`
+    // unconditionally (`SystemImpl.cpp:439-466`).
     with_vm(|e| {
-        let error = e
-            .eval("System.touchDevice", "t")
-            .expect_err("missing input state must raise")
-            .to_string();
-        assert!(error.contains("input state"), "unexpected error: {error}");
+        assert_eq!(eval_int(e, "System.touchDevice"), 0x300);
     });
-    // The base flag set matches the reference's active path.
+    // An active touch contact does not change the value.
     with_input(|e, host| {
         assert_eq!(eval_int(e, "System.touchDevice"), 0x300);
-        // An active touch contact adds the touch/pen capability bits.
         let mut adapter = EventAdapter::new();
         input_frame(
             &mut adapter,
@@ -566,10 +604,7 @@ fn touch_device_requires_input_and_reports_capability_flags() {
                 y: 20.0,
             })],
         );
-        assert_eq!(
-            eval_int(e, "System.touchDevice"),
-            0x300 | 0x01 | 0x40 | 0x80
-        );
+        assert_eq!(eval_int(e, "System.touchDevice"), 0x300);
     });
 }
 

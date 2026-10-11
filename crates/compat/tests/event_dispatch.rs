@@ -9,7 +9,7 @@ mod common;
 
 use api::host::TouchPhase;
 use common::{Env, vm_lock};
-use platform::{InputEvent, MouseButton, PlatformEvent};
+use platform::{InputEvent, MouseButton, PhysicalKey, PlatformEvent};
 
 /// A pointer press is delivered to the layer under the cursor with the
 /// reference positional arguments `(x, y, button, shift)`, and the release
@@ -84,7 +84,7 @@ fn dispatch_delivers_keys_to_the_focused_layer_and_focus_to_the_window() {
     );
 
     env.dispatch_events(&[PlatformEvent::Input(InputEvent::Key {
-        code: 13,
+        code: PhysicalKey::Enter,
         pressed: true,
     })]);
     // reference/cpp/core/visual/LayerIntf.cpp:3844-3854
@@ -444,4 +444,126 @@ fn dispatch_forwards_window_input_to_action_with_the_event_dictionary() {
     // reference/cpp/core/environ/impl/TVPWindow.cpp:531-556
     assert_eq!(env.eval_int("shift"), 8);
     assert_eq!(env.eval_int("target"), 1);
+}
+
+/// A physical Enter key reaches the script's `onKeyDown` as `VK_RETURN`
+/// (`0x0D`), the code the shipped `system/window.tjs` compares against.
+///
+/// Reference: the platform key conversion maps the enter key to `VK_RETURN`
+/// (`reference/cpp/core/environ/cocos2d/CCKeyCodeConv.cpp:142`) and
+/// `FireKeyDown` posts the code with `(key, shift, process)`
+/// (`reference/cpp/core/visual/LayerIntf.cpp:3844-3854`).
+#[test]
+fn dispatch_delivers_vk_return_to_on_key_down() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var l = new Layer(w, null); l.focusable = true; l.visible = true; \
+         w.focusedLayer = l; \
+         var key = -1; \
+         l.onKeyDown = function(k, shift, process) { key = k; };",
+    );
+
+    env.dispatch_events(&[PlatformEvent::Input(InputEvent::Key {
+        code: PhysicalKey::Enter,
+        pressed: true,
+    })]);
+    // reference/cpp/core/base/ScriptMgnIntf.cpp:180-198
+    assert_eq!(env.eval_int("key"), 0x0D);
+}
+
+/// Holding a modifier sets its `TVP_SS_*` bit in the `shift` argument the
+/// input handlers receive.
+///
+/// Reference: `TVPGetCurrentShiftKeyState` probes `VK_SHIFT`/`VK_CONTROL`/
+/// `VK_MENU` (`reference/cpp/core/environ/impl/TVPWindow.cpp:573`) and the
+/// bits are `ssShift`/`ssAlt`/`ssCtrl`
+/// (`reference/cpp/core/base/ScriptMgnIntf.cpp:180-198`).
+#[test]
+fn dispatch_reports_the_shift_mask_while_modifiers_are_held() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var l = new Layer(w, null); l.focusable = true; l.visible = true; \
+         w.focusedLayer = l; \
+         var shift = -1; \
+         l.onKeyDown = function(k, s, process) { shift = s; };",
+    );
+
+    // `TVP_SS_SHIFT` (0x01) while shift is held.
+    env.dispatch_events(&[
+        PlatformEvent::Input(InputEvent::Key {
+            code: PhysicalKey::ShiftLeft,
+            pressed: true,
+        }),
+        PlatformEvent::Input(InputEvent::Key {
+            code: PhysicalKey::KeyA,
+            pressed: true,
+        }),
+    ]);
+    // reference/cpp/core/base/ScriptMgnIntf.cpp:180-198
+    assert_ne!(env.eval_int("shift") & 0x01, 0);
+
+    // `TVP_SS_CTRL` (0x04) while control is held.
+    env.dispatch_events(&[
+        PlatformEvent::Input(InputEvent::Key {
+            code: PhysicalKey::ShiftLeft,
+            pressed: false,
+        }),
+        PlatformEvent::Input(InputEvent::Key {
+            code: PhysicalKey::ControlLeft,
+            pressed: true,
+        }),
+        PlatformEvent::Input(InputEvent::Key {
+            code: PhysicalKey::KeyA,
+            pressed: true,
+        }),
+    ]);
+    // reference/cpp/core/base/ScriptMgnIntf.cpp:180-198
+    assert_ne!(env.eval_int("shift") & 0x04, 0);
+
+    // `TVP_SS_ALT` (0x02) while alt is held.
+    env.dispatch_events(&[
+        PlatformEvent::Input(InputEvent::Key {
+            code: PhysicalKey::ControlLeft,
+            pressed: false,
+        }),
+        PlatformEvent::Input(InputEvent::Key {
+            code: PhysicalKey::AltLeft,
+            pressed: true,
+        }),
+        PlatformEvent::Input(InputEvent::Key {
+            code: PhysicalKey::KeyA,
+            pressed: true,
+        }),
+    ]);
+    // reference/cpp/core/base/ScriptMgnIntf.cpp:180-198
+    assert_ne!(env.eval_int("shift") & 0x02, 0);
+}
+
+/// One wheel notch is posted as the reference `WHEEL_DELTA` (`±120`).
+///
+/// Reference: `TVPWindowLayer::onMouseScroll` converts a scroll to `±120`
+/// (`reference/cpp/core/environ/impl/TVPWindow.cpp:109-115`).
+#[test]
+fn dispatch_scales_the_wheel_delta_to_the_reference_notches() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var l = new Layer(w, null); l.focusable = true; l.visible = true; \
+         w.focusedLayer = l; \
+         var delta = 0; \
+         l.onMouseWheel = function(shift, d, x, y) { delta = d; };",
+    );
+
+    env.dispatch_events(&[PlatformEvent::Input(InputEvent::Wheel { delta: 1.0 })]);
+    // reference/cpp/core/environ/impl/TVPWindow.cpp:109-115
+    assert_eq!(env.eval_int("delta"), 120);
+
+    env.dispatch_events(&[PlatformEvent::Input(InputEvent::Wheel { delta: -1.0 })]);
+    // reference/cpp/core/environ/impl/TVPWindow.cpp:109-115
+    assert_eq!(env.eval_int("delta"), -120);
 }

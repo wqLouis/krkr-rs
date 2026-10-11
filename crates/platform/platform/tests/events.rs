@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use api::host::TouchPhase;
-use platform::{InputEvent, MouseButton, PlatformEvent};
+use platform::{InputEvent, MouseButton, PhysicalKey, PlatformEvent};
 use raw_window_handle::RawWindowHandle;
 
 #[test]
@@ -31,13 +31,13 @@ fn platform_config_default_has_a_sane_frame_interval() {
 #[test]
 fn input_events_carry_their_payload() {
     let key = InputEvent::Key {
-        code: 42,
+        code: PhysicalKey::Native(42),
         pressed: true,
     };
     assert_eq!(
         key,
         InputEvent::Key {
-            code: 42,
+            code: PhysicalKey::Native(42),
             pressed: true
         }
     );

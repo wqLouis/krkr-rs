@@ -17,7 +17,7 @@ use engine::input::InputState;
 use platform::{InputEvent, MouseButton, PlatformEvent};
 use tjs::TjsValue;
 
-use crate::natives::input::{MOUSE_CLICK_MAX_MOVE, mouse_button, shift_flags};
+use crate::natives::input::{MOUSE_CLICK_MAX_MOVE, mouse_button, shift_flags, vk_from_physical};
 use crate::natives::visual::{ObjectKind, duplicate_object};
 use crate::{CompatCtx, CompatError};
 
@@ -168,7 +168,7 @@ impl EventAdapter {
                 name: "onMouseWheel",
                 args: vec![
                     EventValue::Int(flags),
-                    EventValue::Int(coordinate(*delta)),
+                    EventValue::Int(wheel_delta(*delta)),
                     EventValue::Int(pointer_x),
                     EventValue::Int(pointer_y),
                 ],
@@ -176,7 +176,7 @@ impl EventAdapter {
             InputEvent::Key { code, pressed } => Some(TjsEvent {
                 name: if *pressed { "onKeyDown" } else { "onKeyUp" },
                 args: vec![
-                    EventValue::Int(i64::from(*code)),
+                    EventValue::Int(i64::from(vk_from_physical(*code))),
                     EventValue::Int(flags),
                     EventValue::Int(1),
                 ],
@@ -695,6 +695,18 @@ pub(crate) fn release_mouse_capture(ctx: &CompatCtx) {
 /// Round a logical coordinate to the TJS integer the event handlers receive.
 fn coordinate(value: f32) -> i64 {
     i64::from(value.round() as i32)
+}
+
+/// The reference wheel delta for one scroll notch.
+///
+/// The Cocos window layer posts `±120` per notch
+/// (`reference/cpp/core/environ/impl/TVPWindow.cpp:109-115`); the scripts read
+/// the delta in those units.
+const WHEEL_DELTA: f32 = 120.0;
+
+/// Convert a platform scroll amount into the reference wheel-delta units.
+fn wheel_delta(value: f32) -> i64 {
+    coordinate(value * WHEEL_DELTA)
 }
 
 /// Convert a mapped event argument to the TJS value the handler receives.

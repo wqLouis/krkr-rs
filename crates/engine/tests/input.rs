@@ -5,7 +5,7 @@
 //! platform backend is involved.
 
 use api::host::TouchPhase;
-use api::input::{InputEvent, MouseButton};
+use api::input::{InputEvent, MouseButton, PhysicalKey};
 use engine::input::{DEFAULT_CLICK_SEQUENCE_FRAMES, InputState};
 
 #[test]
@@ -106,40 +106,44 @@ fn click_sequence_counts_and_times_out() {
 #[test]
 fn keyboard_edges_repeat_and_last_pressed() {
     let mut state = InputState::new();
+    let code = PhysicalKey::Native(0x0D);
     state.begin_frame();
     state.apply(&InputEvent::Key {
-        code: 0x0D,
+        code,
         pressed: true,
     });
-    assert!(state.is_key_down(0x0D));
-    assert_eq!(state.last_pressed(), &[0x0D]);
-    assert_eq!(state.held_keys().collect::<Vec<_>>(), vec![0x0D]);
+    assert!(state.is_key_down(code.index()));
+    assert_eq!(state.last_pressed(), &[code.index()]);
+    assert_eq!(state.held_keys().collect::<Vec<_>>(), vec![code.index()]);
     state.end_frame();
-    assert_eq!(state.key_hold_frames(0x0D), 1);
+    assert_eq!(state.key_hold_frames(code.index()), 1);
 
     // A repeated down in a later frame is not a new edge.
     state.begin_frame();
     state.apply(&InputEvent::Key {
-        code: 0x0D,
+        code,
         pressed: true,
     });
     assert!(state.last_pressed().is_empty());
     state.end_frame();
-    assert_eq!(state.key_hold_frames(0x0D), 2);
+    assert_eq!(state.key_hold_frames(code.index()), 2);
 
     state.begin_frame();
     state.apply(&InputEvent::Key {
-        code: 0x0D,
+        code,
         pressed: false,
     });
-    assert!(state.is_key_released(0x0D));
-    assert_eq!(state.released_keys().collect::<Vec<_>>(), vec![0x0D]);
-    assert_eq!(state.key_hold_frames(0x0D), 0);
+    assert!(state.is_key_released(code.index()));
+    assert_eq!(
+        state.released_keys().collect::<Vec<_>>(),
+        vec![code.index()]
+    );
+    assert_eq!(state.key_hold_frames(code.index()), 0);
     state.end_frame();
 
     state.begin_frame();
     state.end_frame();
-    assert!(!state.is_key_released(0x0D));
+    assert!(!state.is_key_released(code.index()));
 }
 
 #[test]

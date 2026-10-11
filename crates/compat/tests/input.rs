@@ -10,7 +10,7 @@ mod common;
 
 use common::vm_lock;
 use compat::{CompatHost, EventAdapter};
-use platform::{InputEvent, MouseButton, PlatformEvent};
+use platform::{InputEvent, MouseButton, PhysicalKey, PlatformEvent};
 use tjs::{Tjs2Engine, TjsValue};
 
 /// Build a VM with the full compat surface installed and run `f` against it.
@@ -102,6 +102,21 @@ fn mouse_reads_state_fed_from_events() {
     });
 }
 
+/// Feed a raw virtual key (`VK_PAD*`) into the attached L2 input state.
+///
+/// Pad keys are not physical keys, so they do not travel through
+/// [`InputEvent::Key`]; the pad backend injects the code directly.
+fn set_virtual_key(host: &mut CompatHost, code: u32, pressed: bool) {
+    let ctx = host.ctx().expect("bound context");
+    // SAFETY: the test keeps the input state attached for the binding's
+    // lifetime (see `with_vm`).
+    let services = unsafe { ctx.services() };
+    if let Some(ptr) = services.input() {
+        // SAFETY: `attach_input` guarantees the pointer stays valid.
+        unsafe { &mut *ptr }.set_key(code, pressed);
+    }
+}
+
 #[test]
 fn key_reads_state_fed_from_events_and_repeats() {
     let _lock = vm_lock();
@@ -111,7 +126,7 @@ fn key_reads_state_fed_from_events_and_repeats() {
             &mut adapter,
             host,
             [PlatformEvent::Input(InputEvent::Key {
-                code: 0x0D, // VK_RETURN
+                code: PhysicalKey::Enter,
                 pressed: true,
             })],
         );
@@ -125,7 +140,7 @@ fn key_reads_state_fed_from_events_and_repeats() {
             &mut adapter,
             host,
             [PlatformEvent::Input(InputEvent::Key {
-                code: 0x0D,
+                code: PhysicalKey::Enter,
                 pressed: false,
             })],
         );
@@ -146,21 +161,13 @@ fn key_resolves_mouse_button_vks_and_pad_any() {
         frame(
             &mut adapter,
             host,
-            [
-                PlatformEvent::Input(InputEvent::MouseButton {
-                    button: MouseButton::Left,
-                    pressed: true,
-                }),
-                PlatformEvent::Input(InputEvent::Key {
-                    code: 0x1C0, // VK_PAD1
-                    pressed: true,
-                }),
-                PlatformEvent::Input(InputEvent::Key {
-                    code: 0x1B6, // VK_PADUP
-                    pressed: true,
-                }),
-            ],
+            [PlatformEvent::Input(InputEvent::MouseButton {
+                button: MouseButton::Left,
+                pressed: true,
+            })],
         );
+        set_virtual_key(host, 0x1C0, true); // VK_PAD1
+        set_virtual_key(host, 0x1B6, true); // VK_PADUP
         assert_eq!(eval_i(e, "Key.getPressed(Key.kLButton)"), 1);
         assert_eq!(eval_i(e, "Key.getPressed(Key.kRButton)"), 0);
         assert_eq!(eval_i(e, "Key.getPressed(Key.kPad1)"), 1);

@@ -6,4 +6,4 @@
 //! translation into these values lives in the L1 backends (`linux`,
 //! `android`).
 
-pub use api::input::{InputEvent, MouseButton};
+pub use api::input::{InputEvent, MouseButton, PhysicalKey};

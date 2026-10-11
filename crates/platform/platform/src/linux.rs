@@ -14,12 +14,12 @@ use winit::event::{
     TouchPhase as WinitTouchPhase, WindowEvent,
 };
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{NativeKeyCode, PhysicalKey};
+use winit::keyboard::{KeyCode as WinitKeyCode, NativeKeyCode, PhysicalKey as WinitPhysicalKey};
 use winit::window::{Window, WindowId};
 
 use crate::clock::Ticker;
 use crate::event::PlatformEvent;
-use crate::input::{InputEvent, MouseButton};
+use crate::input::{InputEvent, MouseButton, PhysicalKey};
 use crate::{EventHandler, Flow, PlatformConfig, PlatformError};
 
 /// The window created by [`run`].
@@ -250,7 +250,7 @@ fn map_input(event: WindowEvent) -> Option<InputEvent> {
             },
         }),
         WindowEvent::KeyboardInput { event, .. } => Some(InputEvent::Key {
-            code: key_code(event.physical_key),
+            code: physical_key(event.physical_key),
             pressed: event.state == ElementState::Pressed,
         }),
         WindowEvent::Ime(Ime::Commit(text)) => Some(InputEvent::Text(text)),
@@ -286,31 +286,177 @@ fn map_touch_phase(phase: WinitTouchPhase) -> api::host::TouchPhase {
     }
 }
 
-/// Returns the opaque platform key identifier for a physical key.
+/// Maps a winit physical key to the platform-neutral [`PhysicalKey`].
 ///
-/// Known keys use the winit `KeyCode` discriminant; unidentified keys use the
-/// native code with [`NATIVE_KEY_FLAG`] set, so the two ranges cannot collide.
-///
-/// The value is only meaningful inside the running process and within a build
-/// of winit (the `KeyCode` discriminants are not a stable ABI). Mapping it to
-/// a TJS key code is L3's job; if L3 needs a cross-build-stable id, an explicit
-/// L1 key enum should replace this cast.
-fn key_code(physical: PhysicalKey) -> u32 {
+/// A key winit identifies maps to its named value; an unidentified key, or a
+/// winit code with no named value, maps to [`PhysicalKey::Native`] carrying the
+/// raw code.
+fn physical_key(physical: WinitPhysicalKey) -> PhysicalKey {
     match physical {
-        PhysicalKey::Code(code) => code as u32,
-        PhysicalKey::Unidentified(native) => native_key_code(native),
+        WinitPhysicalKey::Code(code) => map_winit_key(code),
+        WinitPhysicalKey::Unidentified(native) => PhysicalKey::Native(native_key_code(native)),
     }
 }
 
-/// High bit marking native (platform-specific) key codes.
+/// Maps a winit `KeyCode` to the platform-neutral key.
 ///
-/// Keeps them disjoint from the winit `KeyCode` discriminants returned by
-/// [`key_code`] for known keys.
-const NATIVE_KEY_FLAG: u32 = 0x8000_0000;
+/// winit's enum is non-exhaustive; a code with no named value (a future key, or
+/// one with no KiriKiri key code) keeps its winit discriminant as a
+/// [`PhysicalKey::Native`] identity.
+fn map_winit_key(code: WinitKeyCode) -> PhysicalKey {
+    match code {
+        WinitKeyCode::Backquote => PhysicalKey::Backquote,
+        WinitKeyCode::Backslash => PhysicalKey::Backslash,
+        WinitKeyCode::BracketLeft => PhysicalKey::BracketLeft,
+        WinitKeyCode::BracketRight => PhysicalKey::BracketRight,
+        WinitKeyCode::Comma => PhysicalKey::Comma,
+        WinitKeyCode::Digit0 => PhysicalKey::Digit0,
+        WinitKeyCode::Digit1 => PhysicalKey::Digit1,
+        WinitKeyCode::Digit2 => PhysicalKey::Digit2,
+        WinitKeyCode::Digit3 => PhysicalKey::Digit3,
+        WinitKeyCode::Digit4 => PhysicalKey::Digit4,
+        WinitKeyCode::Digit5 => PhysicalKey::Digit5,
+        WinitKeyCode::Digit6 => PhysicalKey::Digit6,
+        WinitKeyCode::Digit7 => PhysicalKey::Digit7,
+        WinitKeyCode::Digit8 => PhysicalKey::Digit8,
+        WinitKeyCode::Digit9 => PhysicalKey::Digit9,
+        WinitKeyCode::Equal => PhysicalKey::Equal,
+        WinitKeyCode::IntlBackslash => PhysicalKey::IntlBackslash,
+        WinitKeyCode::IntlRo => PhysicalKey::IntlRo,
+        WinitKeyCode::IntlYen => PhysicalKey::IntlYen,
+        WinitKeyCode::KeyA => PhysicalKey::KeyA,
+        WinitKeyCode::KeyB => PhysicalKey::KeyB,
+        WinitKeyCode::KeyC => PhysicalKey::KeyC,
+        WinitKeyCode::KeyD => PhysicalKey::KeyD,
+        WinitKeyCode::KeyE => PhysicalKey::KeyE,
+        WinitKeyCode::KeyF => PhysicalKey::KeyF,
+        WinitKeyCode::KeyG => PhysicalKey::KeyG,
+        WinitKeyCode::KeyH => PhysicalKey::KeyH,
+        WinitKeyCode::KeyI => PhysicalKey::KeyI,
+        WinitKeyCode::KeyJ => PhysicalKey::KeyJ,
+        WinitKeyCode::KeyK => PhysicalKey::KeyK,
+        WinitKeyCode::KeyL => PhysicalKey::KeyL,
+        WinitKeyCode::KeyM => PhysicalKey::KeyM,
+        WinitKeyCode::KeyN => PhysicalKey::KeyN,
+        WinitKeyCode::KeyO => PhysicalKey::KeyO,
+        WinitKeyCode::KeyP => PhysicalKey::KeyP,
+        WinitKeyCode::KeyQ => PhysicalKey::KeyQ,
+        WinitKeyCode::KeyR => PhysicalKey::KeyR,
+        WinitKeyCode::KeyS => PhysicalKey::KeyS,
+        WinitKeyCode::KeyT => PhysicalKey::KeyT,
+        WinitKeyCode::KeyU => PhysicalKey::KeyU,
+        WinitKeyCode::KeyV => PhysicalKey::KeyV,
+        WinitKeyCode::KeyW => PhysicalKey::KeyW,
+        WinitKeyCode::KeyX => PhysicalKey::KeyX,
+        WinitKeyCode::KeyY => PhysicalKey::KeyY,
+        WinitKeyCode::KeyZ => PhysicalKey::KeyZ,
+        WinitKeyCode::Minus => PhysicalKey::Minus,
+        WinitKeyCode::Period => PhysicalKey::Period,
+        WinitKeyCode::Quote => PhysicalKey::Quote,
+        WinitKeyCode::Semicolon => PhysicalKey::Semicolon,
+        WinitKeyCode::Slash => PhysicalKey::Slash,
+        WinitKeyCode::AltLeft => PhysicalKey::AltLeft,
+        WinitKeyCode::AltRight => PhysicalKey::AltRight,
+        WinitKeyCode::Backspace => PhysicalKey::Backspace,
+        WinitKeyCode::CapsLock => PhysicalKey::CapsLock,
+        WinitKeyCode::ContextMenu => PhysicalKey::ContextMenu,
+        WinitKeyCode::ControlLeft => PhysicalKey::ControlLeft,
+        WinitKeyCode::ControlRight => PhysicalKey::ControlRight,
+        WinitKeyCode::Enter => PhysicalKey::Enter,
+        WinitKeyCode::SuperLeft => PhysicalKey::SuperLeft,
+        WinitKeyCode::SuperRight => PhysicalKey::SuperRight,
+        WinitKeyCode::ShiftLeft => PhysicalKey::ShiftLeft,
+        WinitKeyCode::ShiftRight => PhysicalKey::ShiftRight,
+        WinitKeyCode::Space => PhysicalKey::Space,
+        WinitKeyCode::Tab => PhysicalKey::Tab,
+        WinitKeyCode::Convert => PhysicalKey::Convert,
+        WinitKeyCode::KanaMode => PhysicalKey::KanaMode,
+        WinitKeyCode::NonConvert => PhysicalKey::NonConvert,
+        WinitKeyCode::Delete => PhysicalKey::Delete,
+        WinitKeyCode::End => PhysicalKey::End,
+        WinitKeyCode::Help => PhysicalKey::Help,
+        WinitKeyCode::Home => PhysicalKey::Home,
+        WinitKeyCode::Insert => PhysicalKey::Insert,
+        WinitKeyCode::PageDown => PhysicalKey::PageDown,
+        WinitKeyCode::PageUp => PhysicalKey::PageUp,
+        WinitKeyCode::ArrowDown => PhysicalKey::ArrowDown,
+        WinitKeyCode::ArrowLeft => PhysicalKey::ArrowLeft,
+        WinitKeyCode::ArrowRight => PhysicalKey::ArrowRight,
+        WinitKeyCode::ArrowUp => PhysicalKey::ArrowUp,
+        WinitKeyCode::NumLock => PhysicalKey::NumLock,
+        WinitKeyCode::Numpad0 => PhysicalKey::Numpad0,
+        WinitKeyCode::Numpad1 => PhysicalKey::Numpad1,
+        WinitKeyCode::Numpad2 => PhysicalKey::Numpad2,
+        WinitKeyCode::Numpad3 => PhysicalKey::Numpad3,
+        WinitKeyCode::Numpad4 => PhysicalKey::Numpad4,
+        WinitKeyCode::Numpad5 => PhysicalKey::Numpad5,
+        WinitKeyCode::Numpad6 => PhysicalKey::Numpad6,
+        WinitKeyCode::Numpad7 => PhysicalKey::Numpad7,
+        WinitKeyCode::Numpad8 => PhysicalKey::Numpad8,
+        WinitKeyCode::Numpad9 => PhysicalKey::Numpad9,
+        WinitKeyCode::NumpadAdd => PhysicalKey::NumpadAdd,
+        WinitKeyCode::NumpadClear => PhysicalKey::Clear,
+        WinitKeyCode::NumpadComma => PhysicalKey::NumpadSeparator,
+        WinitKeyCode::NumpadDecimal => PhysicalKey::NumpadDecimal,
+        WinitKeyCode::NumpadDivide => PhysicalKey::NumpadDivide,
+        WinitKeyCode::NumpadEnter => PhysicalKey::NumpadEnter,
+        WinitKeyCode::NumpadMultiply | WinitKeyCode::NumpadStar => PhysicalKey::NumpadMultiply,
+        WinitKeyCode::NumpadSubtract => PhysicalKey::NumpadSubtract,
+        WinitKeyCode::Escape => PhysicalKey::Escape,
+        WinitKeyCode::PrintScreen => PhysicalKey::PrintScreen,
+        WinitKeyCode::ScrollLock => PhysicalKey::ScrollLock,
+        WinitKeyCode::Pause => PhysicalKey::Pause,
+        WinitKeyCode::BrowserBack => PhysicalKey::BrowserBack,
+        WinitKeyCode::BrowserFavorites => PhysicalKey::BrowserFavorites,
+        WinitKeyCode::BrowserForward => PhysicalKey::BrowserForward,
+        WinitKeyCode::BrowserHome => PhysicalKey::BrowserHome,
+        WinitKeyCode::BrowserRefresh => PhysicalKey::BrowserRefresh,
+        WinitKeyCode::BrowserSearch => PhysicalKey::BrowserSearch,
+        WinitKeyCode::BrowserStop => PhysicalKey::BrowserStop,
+        WinitKeyCode::LaunchApp1 => PhysicalKey::LaunchApp1,
+        WinitKeyCode::LaunchApp2 => PhysicalKey::LaunchApp2,
+        WinitKeyCode::LaunchMail => PhysicalKey::LaunchMail,
+        WinitKeyCode::MediaPlayPause => PhysicalKey::MediaPlayPause,
+        WinitKeyCode::MediaSelect => PhysicalKey::MediaSelect,
+        WinitKeyCode::MediaStop => PhysicalKey::MediaStop,
+        WinitKeyCode::MediaTrackNext => PhysicalKey::MediaTrackNext,
+        WinitKeyCode::MediaTrackPrevious => PhysicalKey::MediaTrackPrevious,
+        WinitKeyCode::Sleep => PhysicalKey::Sleep,
+        WinitKeyCode::AudioVolumeDown => PhysicalKey::VolumeDown,
+        WinitKeyCode::AudioVolumeMute => PhysicalKey::VolumeMute,
+        WinitKeyCode::AudioVolumeUp => PhysicalKey::VolumeUp,
+        WinitKeyCode::Select => PhysicalKey::Select,
+        WinitKeyCode::F1 => PhysicalKey::F1,
+        WinitKeyCode::F2 => PhysicalKey::F2,
+        WinitKeyCode::F3 => PhysicalKey::F3,
+        WinitKeyCode::F4 => PhysicalKey::F4,
+        WinitKeyCode::F5 => PhysicalKey::F5,
+        WinitKeyCode::F6 => PhysicalKey::F6,
+        WinitKeyCode::F7 => PhysicalKey::F7,
+        WinitKeyCode::F8 => PhysicalKey::F8,
+        WinitKeyCode::F9 => PhysicalKey::F9,
+        WinitKeyCode::F10 => PhysicalKey::F10,
+        WinitKeyCode::F11 => PhysicalKey::F11,
+        WinitKeyCode::F12 => PhysicalKey::F12,
+        WinitKeyCode::F13 => PhysicalKey::F13,
+        WinitKeyCode::F14 => PhysicalKey::F14,
+        WinitKeyCode::F15 => PhysicalKey::F15,
+        WinitKeyCode::F16 => PhysicalKey::F16,
+        WinitKeyCode::F17 => PhysicalKey::F17,
+        WinitKeyCode::F18 => PhysicalKey::F18,
+        WinitKeyCode::F19 => PhysicalKey::F19,
+        WinitKeyCode::F20 => PhysicalKey::F20,
+        WinitKeyCode::F21 => PhysicalKey::F21,
+        WinitKeyCode::F22 => PhysicalKey::F22,
+        WinitKeyCode::F23 => PhysicalKey::F23,
+        WinitKeyCode::F24 => PhysicalKey::F24,
+        other => PhysicalKey::Native(other as u32),
+    }
+}
 
-/// Converts a native key code to the opaque identifier.
+/// Converts a native key code to the raw identity.
 fn native_key_code(native: NativeKeyCode) -> u32 {
-    let raw = match native {
+    match native {
         NativeKeyCode::Android(code) => code,
         NativeKeyCode::MacOS(code) => u32::from(code),
         NativeKeyCode::Windows(code) => u32::from(code),
@@ -319,8 +465,7 @@ fn native_key_code(native: NativeKeyCode) -> u32 {
             log::debug!("platform: unrecognized native key code");
             u32::MAX
         }
-    };
-    raw | NATIVE_KEY_FLAG
+    }
 }
 /// Audio output over cpal (the `platform-linux` backend).
 ///

@@ -81,7 +81,7 @@ pub use crate::linux::{PlatformWindow, run};
 pub use crate::audio::{AudioDevice, AudioOutputState};
 pub use crate::clock::{Clock, Ticker};
 pub use crate::event::PlatformEvent;
-pub use crate::input::{InputEvent, MouseButton};
+pub use crate::input::{InputEvent, MouseButton, PhysicalKey};
 pub use crate::window::headless_window_handle;
 
 use api::error::AudioError;
