@@ -56,20 +56,47 @@ fn construct(engine: &Tjs2Engine, path: &str) -> Option<DetachedValue> {
     }
 }
 
-/// Whether the object-valued member at `path` is a nested class: it constructs
-/// with no arguments, or declares a member named after its last path segment
-/// (the class-name constructor member the ABI installs for a class-named
-/// method). This admits classes whose constructor requires arguments
-/// (`Motion.ResourceManager`) while filtering the object-valued data members
-/// that are not classes (`Debug.console`, `imageTagLayerType.add`).
+/// Whether the object-valued member at `path` is a nested class.
+///
+/// A class object constructs with no arguments, or — when its constructor
+/// requires arguments — it declares a function member (the class-name
+/// constructor the ABI installs). The constructor member is not necessarily
+/// named after the path segment (`GdiPlus.Font` is backed by the internal
+/// `FontInfo`), so the member check does not depend on the segment. An
+/// object that carries class-instance names is an instance, not a class
+/// (`Debug.console`), and a data dictionary declares no function member
+/// (`imageTagLayerType.add`).
 fn is_nested_class(engine: &Tjs2Engine, child: &DetachedValue, path: &str) -> bool {
     if construct(engine, path).is_some() {
         return true;
     }
-    let name = path.rsplit('.').next().unwrap_or(path);
-    // A dictionary reports a missing key as `void`, so require a real object
-    // member (the class-name constructor is a function).
-    matches!(engine.member(child.raw_id(), name), Ok(TjsValue::Object))
+    if has_class_names(engine, child) {
+        return false;
+    }
+    has_function_member(engine, child)
+}
+
+/// Whether the object carries class-instance names (it is an instance of a
+/// native or script class, not a class object).
+fn has_class_names(engine: &Tjs2Engine, child: &DetachedValue) -> bool {
+    let Ok(names) = engine.class_names(child.raw_id()) else {
+        return false;
+    };
+    matches!(
+        engine.member(names.raw_id(), "length"),
+        Ok(TjsValue::Integer(count)) if count > 0
+    )
+}
+
+/// Whether the object declares at least one function-valued member, the
+/// class-name constructor every class object carries.
+fn has_function_member(engine: &Tjs2Engine, child: &DetachedValue) -> bool {
+    let Ok(members) = engine.enum_members(child.raw_id()) else {
+        return false;
+    };
+    members
+        .iter()
+        .any(|member| matches!(engine.member(child.raw_id(), member), Ok(TjsValue::Object)))
 }
 
 /// Record `key` -> members of the class object, plus the members of a

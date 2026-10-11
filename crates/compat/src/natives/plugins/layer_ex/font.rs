@@ -15,8 +15,8 @@ use std::ffi::{c_char, c_int, c_void};
 use engine::BitmapState;
 use engine::text::{FontId, TextEngine, TextStyle};
 use tjs::{
-    NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef, Tjs2Engine,
-    TjsValue, Value,
+    NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef, NativeMethodDef,
+    Tjs2Engine, TjsValue, Value,
 };
 
 use super::appearance::{Paint, paint_color_at};
@@ -49,6 +49,9 @@ impl FontData {
 pub(super) struct TextState {
     pub(super) engine: TextEngine,
     pub(super) faces: HashMap<String, FontId>,
+    /// Family names of the faces added by `GdiPlus.addPrivateFont`, in
+    /// registration order (the reference `bl_font_face_name`).
+    pub(super) private_fonts: Vec<String>,
 }
 
 /// Borrow the layer_ex shared text state.
@@ -544,4 +547,144 @@ pub(super) fn register_class(ctx: &mut CompatCtx) -> Result<(), CompatError> {
         methods,
         properties: property_defs(),
     })
+}
+
+// ---------------------------------------------------------------------------
+// `GdiPlus.addPrivateFont` / `GdiPlus.getFontList`
+// ---------------------------------------------------------------------------
+
+/// Read `name` from the attached storage. Any read failure is the reference's
+/// null `TVPCreateBinaryStreamForRead`, reported as `cannot open`; the
+/// underlying error is logged so it is not silently dropped.
+fn read_font_file(ctx: &CompatCtx, name: &str) -> Result<Vec<u8>, String> {
+    // SAFETY: `ctx` was resolved from the installed binding.
+    let services = unsafe { ctx.services() };
+    let Some(storage) = services.storage() else {
+        return Err(format!("cannot open:{name}"));
+    };
+    // SAFETY: `attach_storage` guarantees the pointer stays valid.
+    match unsafe { &*storage }.read(name) {
+        Ok(bytes) => Ok(bytes),
+        Err(error) => {
+            log::debug!("GdiPlus.addPrivateFont: reading `{name}` failed: {error}");
+            Err(format!("cannot open:{name}"))
+        }
+    }
+}
+
+/// `GdiPlus.addPrivateFont(fontFileName)`.
+///
+/// Reference `GdiPlus::addPrivateFont` (`reference/cpp/plugins/layerex_draw/
+/// blend2d/LayerExDraw.cpp:93-127`): a missing placed path or stream throws
+/// `cannot open:%1`, a font the blend2d reader rejects throws
+/// `blend2d cannot load:%1`, and every face of an accepted file is appended
+/// to the private face list. The port parses the file through the L2
+/// [`TextEngine`] so the same faces are reachable by family name.
+fn register_private_font(ctx: &CompatCtx, name: &str) -> Result<(), String> {
+    let bytes = read_font_file(ctx, name)?;
+    let mut state = text_state(ctx);
+    let mut names = Vec::new();
+    let mut index = 0u32;
+    loop {
+        match state.engine.add_font(&bytes, index) {
+            Ok(id) => {
+                if let Some(family) = state.engine.family_name(id)
+                    && !family.is_empty()
+                {
+                    names.push(family.to_string());
+                }
+                index += 1;
+            }
+            Err(_) if index == 0 => return Err(format!("blend2d cannot load:{name}")),
+            Err(_) => break,
+        }
+    }
+    state.private_fonts.extend(names);
+    Ok(())
+}
+
+/// `GdiPlus.addPrivateFont(fontFileName)` — reference arity 1
+/// (`static void addPrivateFont(const tjs_char *)`,
+/// `reference/cpp/plugins/layerex_draw/blend2d/LayerExDraw.hpp:780`).
+extern "C" fn add_private_font(
+    engine: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    let a = unsafe { args(argv, argc) };
+    if a.is_empty() {
+        return report_error(out_error, "GdiPlus.addPrivateFont requires 1 argument");
+    }
+    let Ok((_resolved, ctx)) = super::bound(engine) else {
+        return report_error(
+            out_error,
+            "GdiPlus.addPrivateFont: compat context is not bound",
+        );
+    };
+    let name = crate::native_util::value_as_string(&a[0]);
+    match register_private_font(&ctx, &name) {
+        Ok(()) => {
+            set_void(out);
+            0
+        }
+        Err(error) => report_error(out_error, &error),
+    }
+}
+
+/// `GdiPlus.getFontList(privateOnly)`.
+///
+/// Reference `GdiPlus::getFontList` (`reference/cpp/plugins/layerex_draw/
+/// blend2d/LayerExDraw.cpp:132-157`): the core font list when `privateOnly`
+/// is false, then the private faces; empty names are skipped. The port's
+/// core list is the [`ResourceResolver`] registered-face set (the same list
+/// `Font.getList` reports).
+extern "C" fn get_font_list(
+    engine: *mut c_void,
+    argc: c_int,
+    argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    let a = unsafe { args(argv, argc) };
+    if a.is_empty() {
+        return report_error(out_error, "GdiPlus.getFontList requires 1 argument");
+    }
+    let Ok((_resolved, ctx)) = super::bound(engine) else {
+        return report_error(
+            out_error,
+            "GdiPlus.getFontList: compat context is not bound",
+        );
+    };
+    let private_only = crate::natives::system::value_as_bool(&a[0]);
+    let mut names = Vec::new();
+    if !private_only {
+        let mut resolver = crate::resource::resource_state(&ctx);
+        names = resolver.face_names(&ctx);
+    }
+    {
+        let state = text_state(&ctx);
+        for name in &state.private_fonts {
+            if !name.is_empty() {
+                names.push(name.clone());
+            }
+        }
+    }
+    super::set_string_array_out(&ctx, out, &names);
+    0
+}
+
+/// The two `GdiPlus` static members.
+pub(super) fn static_method_defs() -> Vec<NativeMethodDef> {
+    vec![
+        NativeMethodDef {
+            name: "addPrivateFont",
+            f: add_private_font,
+        },
+        NativeMethodDef {
+            name: "getFontList",
+            f: get_font_list,
+        },
+    ]
 }

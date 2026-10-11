@@ -10,8 +10,8 @@
 //!   `onStartMovie`/`onStopMovie`/`onUpdateMovie` callbacks), attached to
 //!   `Layer`.
 //! * `reference/cpp/plugins/layerex_draw/` — the GDI+ `GdiPlus` namespace
-//!   (`PointF`/`RectF`/`Path`/`Font`/`Appearance` value types and the
-//!   `Layer.draw*` / transform / record members).
+//!   (`PointF`/`RectF`/`Image`/`Matrix`/`Path`/`Font`/`Appearance` value
+//!   types and the `Layer.draw*` / transform / record members).
 //!
 //! `layerExBase` is an internal native-instance base and is not a TJS class
 //! (`reference/cpp/plugins/layerExPerspective.cpp:255-296`); `LayerExMovie`
@@ -30,12 +30,14 @@ mod draw;
 mod font;
 mod gdiplus;
 mod geom;
+mod image;
+mod matrix;
 mod movie;
 mod path;
 mod perspective;
 mod record;
 
-use std::ffi::{c_char, c_void};
+use std::ffi::{c_char, c_int, c_void};
 
 use engine::Scene;
 use tjs::{
@@ -230,11 +232,52 @@ pub(super) fn set_string_out(
     Ok(())
 }
 
+/// Write a TJS string-array result into `out` (`GdiPlus.getFontList`).
+///
+/// The backing storage is the family's persistent linked-array scratch, so
+/// the array pointers stay valid until the next array result.
+pub(super) fn set_string_array_out(ctx: &CompatCtx, out: *mut Value, values: &[String]) {
+    // SAFETY: the caller resolved `ctx` from the installed binding.
+    let services = unsafe { ctx.services() };
+    let mut slot = services.linked_array_scratch();
+    slot.1.clear();
+    slot.0.clear();
+    for value in values {
+        let mut bytes = value.as_bytes().to_vec();
+        bytes.push(0);
+        slot.1.push(bytes);
+    }
+    let pointers: Vec<*const c_char> = slot
+        .1
+        .iter()
+        .map(|bytes| bytes.as_ptr() as *const c_char)
+        .collect();
+    slot.0 = pointers;
+    if out.is_null() {
+        return;
+    }
+    // SAFETY: the trampoline passes a valid out slot for the call; the
+    // scratch arrays live in the services state until the next array result.
+    unsafe {
+        (*out).ty = tjs::VAL_ARRAY;
+        (*out).integer = 0;
+        (*out).real = 0.0;
+        (*out).string = std::ptr::null();
+        (*out).array = slot.0.as_ptr();
+        (*out).array_count = slot.0.len() as c_int;
+        (*out).retained = 0;
+    }
+}
+
 fn finite(value: f64) -> f64 {
     if value.is_finite() { value } else { 0.0 }
 }
 
-fn eval_object(host: &Tjs2Engine, expression: &str, what: &str) -> Result<DetachedValue, String> {
+pub(super) fn eval_object(
+    host: &Tjs2Engine,
+    expression: &str,
+    what: &str,
+) -> Result<DetachedValue, String> {
     match host.eval_retained(expression, what) {
         Ok(RetainedValue::Object(object)) => Ok(object),
         Ok(RetainedValue::Value(value)) => Err(format!(

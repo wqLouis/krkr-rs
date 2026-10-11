@@ -9,11 +9,10 @@
 //! globally (`reference/cpp/core/plugin/ncbind.hpp:1792-1799,1963-1990`), so
 //! the port registers each nested class through the always-global
 //! registration ABI, aliases the class object into `GdiPlus`, then deletes
-//! the registration global. `Image` and `Matrix` are not ported and stay
-//! absent.
+//! the registration global.
 #![allow(unsafe_code)]
 
-use tjs::{DetachedValue, NativeClassBuilder, RetainedValue, TjsValue};
+use tjs::{DetachedValue, NativeClassBuilder, NativeStaticMembers, RetainedValue, TjsValue};
 
 use crate::{CompatCtx, CompatError};
 
@@ -267,6 +266,16 @@ pub(super) fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
     super::path::register_class(ctx)?;
     super::appearance::register_class(ctx)?;
     super::font::register_class(ctx)?;
+    super::image::register_class(ctx)?;
+    super::matrix::register_class(ctx)?;
+
+    // `NCB_METHOD(addPrivateFont)` / `NCB_METHOD(getFontList)`
+    // (`reference/cpp/plugins/layerex_draw/blend2d/LayerExDraw.cpp:3639-3640`).
+    ctx.register_static_members(&NativeStaticMembers {
+        class_name: "GdiPlus",
+        methods: super::font::static_method_defs(),
+        properties: Vec::new(),
+    })?;
 
     let (gdiplus_handle, global_handle) = {
         // SAFETY: a `CompatCtx` is only created for a bound, live engine.
@@ -296,6 +305,8 @@ pub(super) fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
     for (public, internal, keeps_global) in [
         ("PointF", "PointF", false),
         ("RectF", "RectF", false),
+        ("Image", "Image", false),
+        ("Matrix", "Matrix", false),
         ("Path", "Path", false),
         ("Appearance", "Appearance", false),
         ("Font", "FontInfo", false),

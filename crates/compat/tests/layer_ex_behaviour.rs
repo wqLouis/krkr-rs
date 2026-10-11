@@ -35,39 +35,73 @@
 
 mod common;
 
+use std::path::{Path, PathBuf};
+
+use api::fs::{FsPath, OpenMode};
+use api::media::{DecodedImage, ImageInfo};
 use common::vm_lock;
 use compat::CompatHost;
-use engine::Scene;
+use engine::{Scene, Storage};
+use fs::FileSystem;
 use tjs::{Tjs2Engine, TjsValue};
 
 /// Script label for diagnostics.
 const SCRIPT: &str = "layer-ex-behaviour";
 
-/// A bound VM + host + attached scene.
+/// A bound VM + host + attached scene and optional storage.
 ///
 /// Fields drop in declaration order: the host first (releasing every
-/// retained script object), then the engine and the scene.
+/// retained script object), then the engine, the scene and the storage.
 struct Env {
     _host: CompatHost,
     engine: Box<Tjs2Engine>,
     scene: Box<Scene>,
+    /// Kept alive for the host's raw pointer; `None` means no storage.
+    _storage: Option<Box<Storage>>,
 }
 
 impl Env {
     fn new() -> Env {
+        Env::build(None, false)
+    }
+
+    /// Build an env with `storage` attached and, when `codec` is true, the
+    /// synthetic image codec the `GdiPlus.Image` tests decode through.
+    fn build(storage: Option<Storage>, codec: bool) -> Env {
         let engine = Box::new(Tjs2Engine::new().expect("create engine"));
         let mut scene = Box::new(Scene::default());
+        let mut storage = storage.map(Box::new);
         let mut host = CompatHost::new();
-        // SAFETY: the boxed scene outlives the host (declared after `_host`).
+        if codec {
+            host.set_image_codec(
+                |_bytes, _hint| Ok(DecodedImage::new(2, 2, DECODED_RGBA.to_vec())),
+                |_bytes, _hint| {
+                    Ok(ImageInfo {
+                        width: 2,
+                        height: 2,
+                        has_alpha: true,
+                        format: Some("img".to_string()),
+                    })
+                },
+                |_name, _type, _width, _height, _rgba| Ok(()),
+            );
+        }
+        // SAFETY: the boxed scene and storage outlive the host (they are
+        // declared after `_host`, so they drop later).
         unsafe {
             host.services_mut()
                 .attach_scene(scene.as_mut() as *mut Scene);
+            if let Some(storage) = storage.as_mut() {
+                host.services_mut()
+                    .attach_storage(storage.as_mut() as *mut Storage);
+            }
         }
         host.install(&engine).expect("install compat surface");
         Env {
             _host: host,
             engine,
             scene,
+            _storage: storage,
         }
     }
 
@@ -156,6 +190,117 @@ fn two_layers(env: &Env) {
 }
 
 // ---------------------------------------------------------------------------
+// GdiPlus.Image / addPrivateFont / getFontList fixtures
+// ---------------------------------------------------------------------------
+
+/// The pixels the synthetic image decoder returns: a 2x2 straight-alpha RGBA
+/// image.
+const DECODED_RGBA: [u8; 16] = [1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255, 10, 11, 12, 255];
+
+/// Write `data` to `path` in an in-memory file system, creating parents.
+fn write_memory_file(fs: &FileSystem, path: &str, data: &[u8]) {
+    if let Some(parent) = Path::new(path).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(fs, &FsPath::host(parent)).expect("create parent dirs");
+    }
+    let file = fs::open(fs, &FsPath::host(path), OpenMode::Write).expect("open memory file");
+    fs::write_at(fs, &file, 0, data).expect("write memory file");
+    fs::flush(fs, &file).expect("flush memory file");
+}
+
+/// An in-memory storage holding `images/test.img`.
+fn image_storage() -> Storage {
+    let fs = FileSystem::memory();
+    write_memory_file(&fs, "/images/test.img", b"not-a-real-image");
+    Storage::mount_archives(fs, "/", std::iter::empty::<&str>()).expect("mount storage")
+}
+
+/// System fonts tried by the private-font tests; a missing or unusable font
+/// skips the case rather than failing.
+const TEST_FONT_PATHS: &[&str] = &[
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+];
+
+/// The number of faces the L2 text engine can load from `bytes`.
+fn face_count(bytes: &[u8]) -> i64 {
+    let mut engine = engine::text::TextEngine::new();
+    let mut count = 0u32;
+    while engine.add_font(bytes, count).is_ok() {
+        count += 1;
+    }
+    i64::from(count)
+}
+
+/// Find a system font the L2 text engine can actually shape and return its
+/// file name plus bytes.
+fn test_font() -> Option<(String, Vec<u8>)> {
+    for candidate in TEST_FONT_PATHS {
+        let path = Path::new(candidate);
+        let Ok(bytes) = std::fs::read(path) else {
+            continue;
+        };
+        if engine::text::TextEngine::new().add_font(&bytes, 0).is_err() {
+            continue;
+        }
+        let name = path.file_name()?.to_string_lossy().into_owned();
+        return Some((name, bytes));
+    }
+    None
+}
+
+/// A unique temporary game directory, removed on drop.
+struct GameDir(PathBuf);
+
+impl GameDir {
+    fn new() -> Self {
+        let mut path = std::env::temp_dir();
+        let unique = format!(
+            "krkr-compat-layer-ex-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        );
+        path.push(unique);
+        std::fs::create_dir_all(&path).expect("create temp game dir");
+        Self(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+
+    fn write(&self, name: &str, bytes: &[u8]) {
+        std::fs::write(self.0.join(name), bytes).expect("write fixture");
+    }
+}
+
+impl Drop for GameDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A storage mounting a copy of `name` plus a file that is not a font.
+fn font_storage(name: &str, bytes: &[u8]) -> (Storage, GameDir) {
+    let dir = GameDir::new();
+    dir.write(name, bytes);
+    dir.write("garbage.ttf", b"this is definitely not a font");
+    let storage = Storage::mount_archives(
+        FileSystem::host(dir.path()),
+        dir.path().to_path_buf(),
+        std::iter::empty::<&str>(),
+    )
+    .expect("mount font directory");
+    (storage, dir)
+}
+
+// ---------------------------------------------------------------------------
 // GdiPlus namespace shape (gdiplus.rs)
 // ---------------------------------------------------------------------------
 
@@ -169,14 +314,30 @@ fn gdiplus_namespace_matches_the_reference_shape() {
     // `NCB_SUBCLASS` attaches a class as a member of the enclosing class
     // object and never publishes it globally
     // (`reference/cpp/core/plugin/ncbind.hpp:1792-1799,1963-1990`).
-    for name in ["PointF", "RectF", "Path", "Appearance", "Font"] {
+    for name in [
+        "PointF",
+        "RectF",
+        "Image",
+        "Matrix",
+        "Path",
+        "Appearance",
+        "Font",
+    ] {
         let expression = format!("typeof GdiPlus.{name} == 'Object'");
         assert_eq!(env.eval_int(&expression), 1, "GdiPlus.{name} must exist");
     }
     // C++ `FontInfo` is script-visible as `GdiPlus.Font`
     // (`reference/cpp/plugins/layerex_draw/blend2d/LayerExDraw.cpp:3648`);
     // the bare registration globals must be gone.
-    for name in ["PointF", "RectF", "Path", "Appearance", "FontInfo"] {
+    for name in [
+        "PointF",
+        "RectF",
+        "Image",
+        "Matrix",
+        "Path",
+        "Appearance",
+        "FontInfo",
+    ] {
         // A bare `typeof <absent>` raises in this VM; a `global.` member read
         // reports absence as `"undefined"`.
         let expression = format!("typeof global.{name} == 'undefined'");
@@ -775,4 +936,301 @@ fn copy_to_bitmap_reports_a_member_specific_error() {
         message.contains("not a Bitmap"),
         "error must say it is not a Bitmap: {message}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// GdiPlus.Matrix (matrix.rs)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn gdiplus_matrix_constructor_arity() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    // `MatrixFactory` (`reference/cpp/plugins/layerex_draw/blend2d/
+    // LayerExDraw.cpp:3206-3285`): no arguments is the identity, six
+    // arguments are the elements, and any other arity returns
+    // `TJS_E_INVALIDPARAM`.
+    env.run("var m = new GdiPlus.Matrix();");
+    assert_eq!(env.eval_int("m.IsIdentity()"), 1);
+    assert_eq!(env.eval_real("m.OffsetX()"), 0.0);
+    assert_eq!(env.eval_real("m.OffsetY()"), 0.0);
+    assert_eq!(env.eval_int("m.GetLastStatus()"), 0);
+    env.run("var six = new GdiPlus.Matrix(1, 2, 3, 4, 5, 6);");
+    for script in [
+        "new GdiPlus.Matrix(1);",
+        "new GdiPlus.Matrix(1, 2);",
+        "new GdiPlus.Matrix(1, 2, 3);",
+        "new GdiPlus.Matrix(1, 2, 3, 4);",
+        "new GdiPlus.Matrix(1, 2, 3, 4, 5);",
+        "new GdiPlus.Matrix(1, 2, 3, 4, 5, 6, 7);",
+    ] {
+        assert!(env.try_run(script).is_err(), "{script} must raise");
+    }
+}
+
+#[test]
+fn gdiplus_matrix_set_elements_and_invert() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    // `SetElements` replaces the core and refreshes the cached values
+    // (`reference/cpp/plugins/layerex_draw/blend2d/LayerExDraw.hpp:443-455`).
+    env.run("var m = new GdiPlus.Matrix(); var status = m.SetElements(2, 0, 0, 2, 5, 6);");
+    assert_eq!(env.eval_int("status"), 0);
+    assert_eq!(env.eval_real("m.OffsetX()"), 5.0);
+    assert_eq!(env.eval_real("m.OffsetY()"), 6.0);
+    assert_eq!(env.eval_int("m.IsIdentity()"), 0);
+    assert_eq!(env.eval_int("m.IsInvertible()"), 1);
+    // `Invert` (`reference/cpp/plugins/layerex_draw/blend2d/LayerExDraw.hpp:
+    // 459-466`) returns `Ok` (0) and replaces the core with its inverse.
+    assert_eq!(env.eval_int("m.Invert()"), 0);
+    assert_eq!(
+        env.eval_int("m.Equals(new GdiPlus.Matrix(0.5, 0, 0, 0.5, -2.5, -3))"),
+        1
+    );
+}
+
+#[test]
+fn gdiplus_matrix_singular_invert_reports_invalid_parameter() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    // A zero-determinant matrix is not invertible and `Invert` returns
+    // `InvalidParameter` (2) (`reference/cpp/plugins/layerex_draw/blend2d/
+    // LayerExDraw.hpp:459-466`).
+    env.run("var m = new GdiPlus.Matrix(0, 0, 0, 0, 0, 0);");
+    assert_eq!(env.eval_int("m.IsInvertible()"), 0);
+    assert_eq!(env.eval_int("m.Invert()"), 2);
+}
+
+#[test]
+fn gdiplus_matrix_multiply_and_translate() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    // `Multiply(matrix, order)` (`reference/cpp/plugins/layerex_draw/blend2d/
+    // LayerExDraw.hpp:476-490`) with `MatrixOrderPrepend` applies the
+    // argument first.
+    env.run(
+        "var m = new GdiPlus.Matrix(1, 0, 0, 1, 1, 2); \
+         var other = new GdiPlus.Matrix(1, 0, 0, 1, 3, 4);",
+    );
+    assert_eq!(env.eval_int("m.Multiply(other, 0)"), 0);
+    assert_eq!(env.eval_real("m.OffsetX()"), 4.0);
+    assert_eq!(env.eval_real("m.OffsetY()"), 6.0);
+    // A non-object is the reference's null matrix; `Multiply` returns
+    // `InvalidParameter` (2) (`LayerExDraw.hpp:478-479`).
+    assert_eq!(env.eval_int("m.Multiply(5, 0)"), 2);
+    // `Translate` accumulates the cached offset
+    // (`reference/cpp/plugins/layerex_draw/blend2d/LayerExDraw.hpp:572-584`)
+    // and `Reset` clears it.
+    env.run("var t = new GdiPlus.Matrix(); t.Translate(7, 8, 0);");
+    assert_eq!(env.eval_real("t.OffsetX()"), 7.0);
+    assert_eq!(env.eval_real("t.OffsetY()"), 8.0);
+    env.run("t.Reset();");
+    assert_eq!(env.eval_real("t.OffsetX()"), 0.0);
+    assert_eq!(env.eval_int("t.IsIdentity()"), 1);
+}
+
+#[test]
+fn gdiplus_matrix_transform_arities() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    // Every `NCB_GDIP_METHOD` keeps its declared parameter list, so the
+    // defaulted `MatrixOrder` arguments are still required
+    // (`reference/cpp/plugins/layerex_draw/blend2d/LayerExDraw.hpp:476-584`,
+    // `reference/cpp/core/plugin/ncbind.hpp:1178`).
+    env.run(
+        "var m = new GdiPlus.Matrix(); \
+         var other = new GdiPlus.Matrix(); \
+         var p = new GdiPlus.PointF(0, 0);",
+    );
+    for script in [
+        "m.Multiply(other);",
+        "m.Rotate(90);",
+        "m.RotateAt(90, p);",
+        "m.Scale(2);",
+        "m.Shear(1);",
+        "m.Translate(1);",
+        "m.SetElements(1, 2, 3, 4, 5);",
+    ] {
+        assert!(env.try_run(script).is_err(), "{script} must raise");
+    }
+    env.run(
+        "m.Rotate(90, 0); \
+         m.RotateAt(90, p, 0); \
+         m.Scale(2, 2, 0); \
+         m.Shear(1, 1, 0); \
+         m.Translate(1, 2, 0); \
+         m.SetElements(1, 2, 3, 4, 5, 6);",
+    );
+}
+
+#[test]
+fn gdiplus_matrix_equals_converts_arrays_and_objects() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    // `MatrixConvertor` (`reference/cpp/plugins/layerex_draw/blend2d/
+    // LayerExDraw.cpp:3124-3157`) accepts a native `Matrix`, a six-element
+    // array, or an object with the `m11`/`m12`/`m21`/`m22`/`dx`/`dy`
+    // members.
+    env.run("var m = new GdiPlus.Matrix(1, 2, 3, 4, 5, 6);");
+    assert_eq!(env.eval_int("m.Equals([1, 2, 3, 4, 5, 6])"), 1);
+    assert_eq!(
+        env.eval_int("m.Equals(%[m11:1, m12:2, m21:3, m22:4, dx:5, dy:6])"),
+        1
+    );
+    assert_eq!(
+        env.eval_int("m.Equals(new GdiPlus.Matrix(1, 2, 3, 4, 5, 6))"),
+        1
+    );
+    assert_eq!(
+        env.eval_int("m.Equals(new GdiPlus.Matrix(6, 5, 4, 3, 2, 1))"),
+        0
+    );
+    // A non-object is the reference's null pointer; the port raises instead
+    // of dereferencing it.
+    assert!(env.try_run("m.Equals(5);").is_err());
+}
+
+// ---------------------------------------------------------------------------
+// GdiPlus.Image (image.rs)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn gdiplus_image_factory_and_accessors() {
+    let _lock = vm_lock();
+    let env = Env::build(Some(image_storage()), true);
+    // `ImageFactory` (`reference/cpp/plugins/layerex_draw/blend2d/
+    // LayerExDraw.cpp:3338-3354`): no arguments is an empty image, one
+    // string loads it.
+    env.run(
+        "var empty = new GdiPlus.Image(); \
+         var img = new GdiPlus.Image('images/test.img');",
+    );
+    assert_eq!(env.eval_int("empty.GetWidth()"), 0);
+    assert_eq!(env.eval_int("empty.GetHeight()"), 0);
+    assert_eq!(env.eval_int("empty.GetType()"), 0);
+    assert_eq!(env.eval_int("empty.GetLastStatus()"), 1);
+    assert_eq!(env.eval_int("empty.GetFlags()"), 0);
+    assert_eq!(env.eval_int("empty.GetPixelFormat()"), 0);
+
+    // `GdipImage::GetWidth`/`GetHeight`/`GetType`/`GetLastStatus`
+    // (`reference/cpp/plugins/layerex_draw/blend2d/LayerExDraw.hpp:708-731`)
+    // and `GetFlags` (`:696-706`) describe the loaded 2x2 bitmap.
+    assert_eq!(env.eval_int("img.GetWidth()"), 2);
+    assert_eq!(env.eval_int("img.GetHeight()"), 2);
+    assert_eq!(env.eval_int("img.GetType()"), 1);
+    assert_eq!(env.eval_int("img.GetLastStatus()"), 0);
+    assert_eq!(env.eval_int("img.GetFlags()"), 18);
+    // The source had an alpha channel, so `GetPixelFormat` reports
+    // `PixelFormat32bppARGB` (`reference/cpp/plugins/layerex_draw/blend2d/
+    // LayerExDraw.hpp:712-723` and `:33-35`).
+    assert_eq!(env.eval_int("img.GetPixelFormat()"), 2_498_570);
+    // Both resolutions are the reference's 96 DPI default (`:716,733`).
+    assert_eq!(env.eval_real("img.GetHorizontalResolution()"), 96.0);
+    assert_eq!(env.eval_real("img.GetVerticalResolution()"), 96.0);
+
+    // `GetBounds` returns `(0, 0, width, height)` (`:668-694`).
+    env.run("var bounds = img.GetBounds();");
+    assert_eq!(env.eval_real("bounds.x"), 0.0);
+    assert_eq!(env.eval_real("bounds.y"), 0.0);
+    assert_eq!(env.eval_real("bounds.width"), 2.0);
+    assert_eq!(env.eval_real("bounds.height"), 2.0);
+
+    // `load` (`LayerExDraw.cpp:3356-3363`) replaces the image; a missing
+    // file leaves an empty image without raising.
+    env.run("var other = new GdiPlus.Image(); other.load('missing.png');");
+    assert_eq!(env.eval_int("other.GetWidth()"), 0);
+    assert_eq!(env.eval_int("other.GetLastStatus()"), 1);
+    env.run("other.load('images/test.img');");
+    assert_eq!(env.eval_int("other.GetWidth()"), 2);
+}
+
+#[test]
+fn gdiplus_image_factory_rejects_non_strings_and_missing_files() {
+    let _lock = vm_lock();
+    let env = Env::build(Some(image_storage()), true);
+    // `ImageFactory` returns `TJS_E_INVALIDPARAM` for a non-string first
+    // argument and throws `cannot open:%1` when a string load yields nothing
+    // (`reference/cpp/plugins/layerex_draw/blend2d/LayerExDraw.cpp:3338-3354`).
+    assert!(env.try_run("new GdiPlus.Image(5);").is_err());
+    let message = env
+        .try_run("new GdiPlus.Image('missing.png');")
+        .expect_err("a missing image must raise");
+    assert!(message.contains("cannot open"), "{message}");
+}
+
+#[test]
+fn gdiplus_image_clone_and_rotate_flip() {
+    let _lock = vm_lock();
+    let env = Env::build(Some(image_storage()), true);
+    env.run("var img = new GdiPlus.Image('images/test.img'); var copy = img.Clone();");
+    assert_eq!(env.eval_int("copy.GetWidth()"), 2);
+    assert_eq!(env.eval_int("copy.GetHeight()"), 2);
+    // `RotateFlip` returns `Ok` (0) for the handled transforms and
+    // `NotImplemented` (6) otherwise
+    // (`reference/cpp/plugins/layerex_draw/blend2d/LayerExDraw.hpp:736-773`).
+    assert_eq!(env.eval_int("copy.RotateFlip(0)"), 0);
+    assert_eq!(env.eval_int("copy.RotateFlip(6)"), 0);
+    assert_eq!(env.eval_int("copy.RotateFlip(7)"), 6);
+}
+
+// ---------------------------------------------------------------------------
+// GdiPlus.addPrivateFont / getFontList (font.rs)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn gdiplus_private_font_registration_and_listing() {
+    let _lock = vm_lock();
+    let Some((name, bytes)) = test_font() else {
+        return;
+    };
+    let count = face_count(&bytes);
+    let (storage, _dir) = font_storage(&name, &bytes);
+    let env = Env::build(Some(storage), false);
+
+    // `getFontList` (`reference/cpp/plugins/layerex_draw/blend2d/
+    // LayerExDraw.cpp:132-157`) reports no private faces before
+    // `addPrivateFont`.
+    assert_eq!(env.eval_int("GdiPlus.getFontList(true).length"), 0);
+
+    // `addPrivateFont` (`LayerExDraw.cpp:93-127`) adds every face of the
+    // file; `getFontList(true)` then reports the same count, and
+    // `getFontList(false)` never reports fewer.
+    env.run(&format!("GdiPlus.addPrivateFont('{name}');"));
+    assert!(count >= 1, "a test font should expose at least one face");
+    assert_eq!(env.eval_int("GdiPlus.getFontList(true).length"), count);
+    assert!(env.eval_int("GdiPlus.getFontList(false).length") >= count);
+
+    // The private face is registered with the shared text engine, so a
+    // `GdiPlus.Font` for its family reports real metrics
+    // (`reference/cpp/plugins/layerex_draw/blend2d/LayerExDraw.cpp:375-383`).
+    env.run(
+        "var names = GdiPlus.getFontList(true); \
+         var face = new GdiPlus.Font(names[0], 16, 0);",
+    );
+    assert_eq!(env.eval_int("face.lineSpacing > 0"), 1);
+}
+
+#[test]
+fn gdiplus_private_font_error_paths() {
+    let _lock = vm_lock();
+    let Some((name, bytes)) = test_font() else {
+        return;
+    };
+    let (storage, _dir) = font_storage(&name, &bytes);
+    let env = Env::build(Some(storage), false);
+    // A missing file throws `cannot open:%1`
+    // (`reference/cpp/plugins/layerex_draw/blend2d/LayerExDraw.cpp:93-127`).
+    let missing = env
+        .try_run("GdiPlus.addPrivateFont('does-not-exist.ttf');")
+        .expect_err("a missing font must raise");
+    assert!(missing.contains("cannot open"), "{missing}");
+    // A readable file the font reader rejects throws `blend2d cannot load:%1`.
+    let garbage = env
+        .try_run("GdiPlus.addPrivateFont('garbage.ttf');")
+        .expect_err("a malformed font must raise");
+    assert!(garbage.contains("blend2d cannot load"), "{garbage}");
+    // Both `NCB_METHOD`s require their one parameter
+    // (`reference/cpp/core/plugin/ncbind.hpp:1178`).
+    assert!(env.try_run("GdiPlus.addPrivateFont();").is_err());
+    assert!(env.try_run("GdiPlus.getFontList();").is_err());
 }
