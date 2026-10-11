@@ -53,6 +53,33 @@ target/debug/krkr --headless --frames 10000 --base-dir /mnt/DATA/Games/Others/te
    the cache (`:7869-7876`).
 3. **`Layer` has no default image** — see R1 below; the last big rendering bug.
 
+## 2a. Real-game reports (audited / in flight)
+
+All reported by running a real title (`/mnt/DATA/Games/Others/test`) with the
+release build.
+
+1. **A drag snapped a slider straight to 100 %** — landed (`d840cce`). A layer's
+   pointer handlers received the primary window point; the reference converts with
+   `FromPrimaryCoordinates` before firing the layer event
+   (`LayerManager.cpp:361-382,508-509`, `LayerIntf.cpp:2282-2291`) and keeps the raw
+   point for the window handler (`WindowIntf.cpp:335-345`).
+2. **SIGSEGV while saving** — open. `docs/audits/save-crash.md` localises it to the
+   `saveStruct` text-write stage (`crates/tjs/cpp/streams.cpp:534-621`, the only
+   port-authored C++ on the path), with the unbounded serializer recursion and the
+   instance-member leak ranked below it.
+3. **A saved Dictionary gains `saveStruct2`/`toStructString`** — open. Those members
+   are registered as instance members, so the built-in serializer writes them into
+   every saved Dictionary; the reference makes them class statics. Same root cause
+   as the `KAGParser.paramMacros` enumeration bug (`4ff163a`).
+4. **Transition/settings hang, dialog hang** — open. `docs/audits/perf-hotspots.md`
+   #1 is the transition subtree re-rendered, cloned and re-blended every frame
+   (the reference returns the cache while `CacheRecalcRegion` is empty,
+   `LayerIntf.cpp:7734-7737`); #2 is the missing character and shadow cache
+   (`LayerBitmapImpl.cpp:224-320,1114-1200`) plus a second rasterization.
+5. **The game cannot change resolution** — open.
+6. **`Scripts.eval` drops the fourth `context` argument, `exec` keeps it** — open.
+7. The startup hang is partly the `/mnt/DATA` NTFS-3G (`fuseblk`) mount, not CPU.
+
 ## 3. KAG rendering audit — verified findings, not yet fixed
 
 A full render/UI audit of the KAG system scripts (`kag-render-audit`, evidence in
