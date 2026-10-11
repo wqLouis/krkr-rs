@@ -138,6 +138,26 @@ Sources: `/tmp/kag-render-audit.md`, `/tmp/kag-compat-audit.md`, `/tmp/kag-flow-
 * [~] **R8 (P2)** `Layer.hasImage` must report true on a fresh layer (`:2497`);
   falls out of R1.
 
+### Text / fonts (render audit R4/R6 + the text-render diagnosis)
+
+* [x] **TEXT-1** the `drawText` shadow must be spread by `shadowwidth` (the
+  reference blurs and widens the shadow bitmap by `abs(blurwidth)` on every side,
+  `CharacterData.cpp:118-160`; a shadow exists only when `shadowlevel != 0`,
+  `LayerBitmapImpl.cpp:1168-1178`). Landed `3313271`; the game draws white text
+  with a zero-offset near-black shadow, so without the spread the white had no
+  halo and disappeared on a light background.
+* [x] **TEXT-2** `Font.height` must normalize a negative value to positive
+  (`LayerIntf.cpp:5962-5969`) and `Font.angle` must normalize modulo 3600
+  (`:5975-5988`). Landed `3313271`.
+* [ ] **TEXT-3 (D32)** `Font.faceIsFileName` is still a no-op stub returning 0
+  (`font.rs:387-390`). It needs per-font state in the engine's font record.
+  `resolve_face` already tries the storage for a file-name face, so the reader is
+  the missing half.
+* [ ] **TEXT-4 (D11)** in `crates/engine/src/text.rs`, when `resolve_face` falls
+  back to `default_font()` on a host whose faces carry no glyph for the text,
+  `compose_text_into` skips the empty masks and the run renders blank with no
+  error. Choose a fallback that can cover the text or raise a typed error.
+
 ### KAG parser (`kag-compat-audit` §B)
 
 * [~] **B.2-1** register `multiLineTagEnabled` (and the Ex `paramMacros`).
