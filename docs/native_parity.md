@@ -1,6 +1,6 @@
 # Native surface parity
 
-> **Generated** by `scripts/native_parity.py` on 2026-10-11 — do not edit by hand.
+> **Generated** by `scripts/native_parity.py` on 2026-10-12 — do not edit by hand.
 
 Machine-diff of the reference C++ native class surface (`reference/cpp/core/**/*.cpp`) against the native classes the Rust engine registers. A *missing* member exists in the reference but is not registered by Rust; an *extra* member is registered by Rust but has no reference counterpart (engine-internal helpers such as `id` and `nativeId` are expected here).
 
