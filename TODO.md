@@ -38,26 +38,79 @@ Real-game oracle (expect no `WARN`/`ERROR`, `texture >= 1`):
 target/debug/krkr --headless --frames 10000 --base-dir /mnt/DATA/Games/Others/test
 ```
 
-## 2. In-flight fixes (dispatched; re-verify and land them)
+## 2. Landed / in flight
 
-1. **`Layer.beginTransition` — game blocker.**
-   `Sprite.tjs(290)` calls `super.beginTransition(name, withcildren, transsrc, options)`;
-   the port raises `the transition source has no main image`. The reference passes
+1. **`Bitmap(name)` ignored a storage name** — landed (`572f2ce`). It was the direct
+   cause of the invisible checkboxes, radio buttons and sliders: every KAG widget
+   image is built as `new Bitmap("FRM_02A31")` (`configwindow.tjs:324`,
+   `messageframe.tjs:1546`, `album.tjs:1936`). The constructor now matches the
+   reference `Construct` (`BitmapIntf.cpp:19-43`).
+2. **`Layer.beginTransition` — game blocker** — in flight. `Sprite.tjs:290` calls
+   `super.beginTransition(name, withcildren, transsrc, options)`; the reference passes
    `withchildren` (default **true**, `LayerIntf.cpp:9819-9821`) to `StartTransition`,
-   which requires the destination/source main images **only when `!withchildren`**
-   (`:7860-7868`, `TVPTransitionSourceAndDestinationMustHaveImage`); with
-   `withchildren` it transitions the whole layer tree through the cache
-   (`:7869-7876`). The port checks unconditionally and composites main images only
-   (`crates/compat/src/natives/visual/layer/transitions.rs:159-166`, `:844-870`).
-   Fix = parse `withchildren`, gate the check on it, and composite the source
-   subtree when `withchildren` (add an L2 primitive if the subtree render needs one).
-2. **Checkbox / radio / slider UI not rendered, silently.**
-   The `GdiPlus` namespace is fixed, so `new GdiPlus.Appearance()` no longer raises,
-   yet these widgets stay invisible. Trace the KAG drawing path
-   (`system/{selectitem,messageframe,utility,advscreen,album,config}.tjs`) through
-   `layer_ex/{draw,appearance,path}.rs` and `engine/src/raster.rs` for the exact
-   cause (hatch/gradient paint, empty path, imageless layer, visibility/order, or an
-   unreached KAG branch).
+   which requires the endpoint main images **only when `!withchildren`**
+   (`:7860-7868`), otherwise transitions the whole tree through the cache
+   (`:7869-7876`).
+3. **`Layer` has no default image** — see R1 below; dispatched next.
+
+## 3. KAG rendering audit — verified findings, not yet fixed
+
+A full render/UI audit of the KAG system scripts (`kag-render-audit`, evidence in
+`/tmp/kag-render-audit.md`). Root causes, most important first.
+
+* **R1 (P0) — a constructed `Layer` has no image, and `setSize` does not grow one.**
+  The reference ctor ends with `AllocateDefaultImage()` (`LayerIntf.cpp:400`), which
+  assigns the shared 32×32 transparent-white bitmap and calls `ResetClip()`; `Rect`
+  defaults to `0,0,32,32` (`:339-342`), so a fresh layer has `MainImage != nullptr`
+  and `ClipRect = 0,0,32,32`. `setSize` → `InternalSetSize` → `ImageLayerSizeChanged`
+  **grows** `MainImage` to the rect (`:2656-2673`). The port creates
+  `bitmap: None, rect: 0,0,0,0` and `layer_set_size` never allocates
+  (`scene.rs:437-438`, `layer/mod.rs:367-402`), so `hasImage`, `copyRect`,
+  `stretchCopy`, `colorRect` and `Layer.clear` no-op. This is why slider tracks,
+  album thumbnails, procedural sprites and several panels render blank. **This
+  corrects `5c247bd`:** that revert quoted the ctor's pre-`AllocateDefaultImage`
+  `ClipRect = 0` (`:375-378`) and missed `ResetClip()` at `:400`; the test
+  `copy_rect_on_an_imageless_layer_is_a_silent_no_op` (`layer_behaviour.rs:1095`)
+  encodes the wrong premise. `LayerExDraw.with_layer` allocating on demand
+  (`layer_ex/draw.rs:601`) masks this for `draw*` only.
+* **R3 (P1) — `fillRect` on an imageless layer paints the whole layer, last colour
+  wins.** `layer/mod.rs:1143-1150` stores one `layer.fill_color` for the whole rect;
+  the reference fills only `rect ∩ ClipRect` inside `MainImage` (`:4272-4320`). Five
+  nested fills in `selectitem.tjs:1178` collapse to one.
+* **R4 (P1) — prerendered fonts (`.tft`) are ignored.** 24 `font/*.tft` ship in
+  `data.xp3` (24 more in `patch.xp3`); `system/system.tjs` maps them through
+  `Font.mapPrerenderedFont`. The port records the name in a map nothing reads
+  (`font.rs:651-683`) and never raises when the storage is missing, so the KAG
+  `catch` never fires. Text is rasterized with the L1 fallback face instead of the
+  shipped bitmap face — wrong glyphs and wrong `getTextWidth` metrics. **This is the
+  prime suspect for the "some text does not render / white on white" report.**
+* **R5 (P2)** `setImageSize` does not shrink the rect or clamp `ImageLeft/Top`
+  (`:2623-2640`); `setImagePos` accepts out-of-range values (`:2506-2523`).
+* **R6 (P2)** `Font.getTextWidth`/`getTextHeight` ignore `angle`
+  (`LayerIntf.cpp:11716-11746` multiplies by `cos(angle·π/1800)`).
+* **R7 (P2)** `System.stayOnTop` is not a registered member though
+  `configwindow.tjs:1264` and `window.tjs:83` assign it.
+* **R8 (P2)** `Layer.hasImage` reports false on a fresh layer where the reference
+  reports true (`:2497`); it is R1's observable face.
+
+## 4. Win32 compatibility: dialogs and popups
+
+Decision: dialogs/popups belong to a **platform-level compatibility layer**, so the
+same script gets a native-looking dialog on whichever OS runs it. They are **not** to
+be faked in the compat layer.
+
+* Linux: implement the dialog ourselves — either drawn by our own engine or hosted
+  in GTK. Not decided; **left for later**.
+* The non-dialog Win32 surface (registry, shell, system metrics, synthetic handles,
+  message receivers) stays emulated in compat, and a typed error there is still a
+  compatibility bug.
+
+Consequence: the missing `WIN32Dialog` surface (`Header`, `Items`, `Bitmap`, `Blob`,
+`SolidBrush`, `getOctetAddress`, `getStringAddress`, `getStringFromAddress`,
+`initCommonControlsEx`, and the instance API; `natives/plugins/win32_dialog/mod.rs`)
+stays open, as does the `System.getDisplayMonitors`/`getMonitorInfo` nested
+`work`/`monitor` shape (`window_ex/system.rs:110-128`) that the shipped
+`k2compat/deskinfo` and `k2compat/scrinfo` read.
 
 ## 3. Input / IME — implemented, with documented imprecisions
 
