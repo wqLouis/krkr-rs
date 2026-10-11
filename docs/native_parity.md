@@ -22,7 +22,7 @@ The checker exits non-zero when a missing member is **not** listed in `scripts/n
 | reference members | 636 |
 | matched | 636 |
 | **missing** | **0** |
-| extra (Rust only) | 0 |
+| extra (Rust only) | 2 |
 | coverage | **100.0%** |
 
 ## Per-class coverage
@@ -42,7 +42,7 @@ The checker exits non-zero when a missing member is **not** listed in `scripts/n
 | `MenuItem` | 21 | 21 | 21 | 0 | 0 | 100.0% |
 | `Storages` | 13 | 13 | 13 | 0 | 0 | 100.0% |
 | `Scripts` | 10 | 10 | 10 | 0 | 0 | 100.0% |
-| `KAGParser` | 24 | 24 | 24 | 0 | 0 | 100.0% |
+| `KAGParser` | 24 | 26 | 24 | 0 | 2 | 100.0% |
 | `WaveSoundBuffer` | 32 | 32 | 32 | 0 | 0 | 100.0% |
 | `Pad` | 24 | 24 | 24 | 0 | 0 | 100.0% |
 | `Rect` | 19 | 19 | 19 | 0 | 0 | 100.0% |
@@ -59,7 +59,10 @@ _None for tracked classes._
 
 Rust registrations with no reference counterpart; usually intentional engine internals.
 
-_None for tracked classes._
+### `KAGParser` — 2 extra
+
+`multiLineTagEnabled`, `paramMacros`
+
 ## Reference classes not registered in Rust
 
 | class | reference members |

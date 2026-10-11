@@ -550,3 +550,20 @@ fn helper_plugins_register_no_script_surface() {
         );
     }
 }
+
+/// Reference: `TVPGetLocalFileListAt` does nothing when `opendir`/the
+/// directory probe fails (`reference/cpp/core/base/impl/StorageImpl.cpp:222-247`)
+/// and `getDirList`'s `catch` rethrows only *other* exceptions
+/// (`reference/cpp/plugins/dirlist.cpp:44-51`), so a missing directory yields
+/// an empty array rather than the fstat member's `"Directory not found."`.
+#[test]
+fn get_dir_list_returns_empty_for_a_missing_directory() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    assert_eq!(env.eval_int("getDirList('missing/').length"), 0);
+    assert_eq!(
+        env.eval_str("typeof getDirList('missing/')"),
+        "Object",
+        "a missing directory still yields the Array object"
+    );
+}

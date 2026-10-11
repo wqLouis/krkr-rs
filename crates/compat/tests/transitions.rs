@@ -434,8 +434,8 @@ fn with_children_is_read_at_argument_one() {
     // Both layers have a size but no main image.
     env.run(
         "var w = new Window(); \
-         var a = new Layer(w, null); a.setSize(2, 2); a.name = 'src'; \
-         var b = new Layer(w, null); b.setSize(2, 2); b.visible = true; b.name = 'dest';",
+         var a = new Layer(w, null); a.setSize(2, 2); a.name = 'src'; a.hasImage = false; \
+         var b = new Layer(w, null); b.setSize(2, 2); b.visible = true; b.name = 'dest'; b.hasImage = false;",
     );
     for value in ["false", "0"] {
         let message = env.error(&format!(
@@ -473,10 +473,10 @@ fn with_children_blends_the_layer_subtrees() {
     // pixels so the child composites into the cache.
     env.run(
         "var w = new Window(); \
-         var a = new Layer(w, null); a.setSize(2, 2); a.name = 'src'; \
+         var a = new Layer(w, null); a.setSize(2, 2); a.name = 'src'; a.hasImage = false; \
          var ac = new Layer(w, a); ac.setSize(2, 2); ac.neutralColor = 0xff0000ff; \
          ac.setImageSize(2, 2); ac.visible = true; \
-         var b = new Layer(w, null); b.setSize(2, 2); b.visible = true; b.name = 'dest'; \
+         var b = new Layer(w, null); b.setSize(2, 2); b.visible = true; b.name = 'dest'; b.hasImage = false; \
          var bc = new Layer(w, b); bc.setSize(2, 2); bc.neutralColor = 0xffff0000; \
          bc.setImageSize(2, 2); bc.visible = true; \
          b.beginTransition('crossfade', true, a, %[time: 100]);",
@@ -530,10 +530,10 @@ fn container_source_without_image_transitions_its_children() {
     // visible child (the ADV object). `dest` mirrors it with the other colour.
     env.run(
         "var w = new Window(); \
-         var container = new Layer(w, null); container.setSize(2, 2); container.name = 'src'; \
+         var container = new Layer(w, null); container.setSize(2, 2); container.name = 'src'; container.hasImage = false; \
          var sc = new Layer(w, container); sc.setSize(2, 2); sc.neutralColor = 0xffff0000; \
          sc.setImageSize(2, 2); sc.visible = true; \
-         var dest = new Layer(w, null); dest.setSize(2, 2); dest.visible = true; dest.name = 'dest'; \
+         var dest = new Layer(w, null); dest.setSize(2, 2); dest.visible = true; dest.name = 'dest'; dest.hasImage = false; \
          var dc = new Layer(w, dest); dc.setSize(2, 2); dc.neutralColor = 0xff0000ff; \
          dc.setImageSize(2, 2); dc.visible = true; \
          dest.beginTransition('crossfade', true, container, %[time: 100]);",
