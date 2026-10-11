@@ -5,17 +5,19 @@
 //! is written to the log. The default is `true` (the reference's
 //! `outputErrorLogOnEval`).
 //!
-//! The override reproduces the core `Scripts.eval` behavior (evaluate the
-//! expression, optional name, ignore the unmarshallable `lineofs`/`context`
-//! arguments) and adds the conditional log line.
+//! The override evaluates exactly like the core member — `name`, `lineofs`
+//! and `context` included — while `outputErrorLogOnEval` is set, and
+//! evaluates with the same `name` and `lineofs` but no context and no log
+//! once it is cleared (`reference/cpp/plugins/windowEx.cpp:1540-1556`).
 #![allow(unsafe_code)]
 
 use std::ffi::{c_char, c_int, c_void};
 
-use tjs::{Engine, NativeMethodDef, NativeStaticMembers, VAL_VOID, Value};
+use tjs::{Engine, NativeMethodDef, NativeStaticMembers, Value};
 
 use crate::binding;
 use crate::native_util::{args, report_error, set_bool, value_as_string};
+use crate::natives::scripts::{context_argument, lineofs_argument};
 use crate::{CompatCtx, CompatError};
 
 use super::util::{as_bool, finish_retained};
@@ -55,16 +57,25 @@ extern "C" fn scripts_eval(
     };
     let expression = value_as_string(expression);
     let name = arguments.get(1).map(value_as_string).unwrap_or_default();
-    if arguments.get(2).is_some_and(|value| value.ty != VAL_VOID) {
-        log::warn!("Scripts.eval: the lineofs argument cannot cross the ABI; ignoring");
-    }
-    if arguments.get(3).is_some_and(|value| value.ty != VAL_VOID) {
-        log::warn!("Scripts.eval: the execution-context argument is ignored");
-    }
+    let lineofs = match lineofs_argument(arguments, 2) {
+        Ok(lineofs) => lineofs,
+        Err(error) => return report_error(out_error, &format!("Scripts.eval: {error}")),
+    };
     let log_errors = services.state::<ScriptsExState>().output_error_log_on_eval;
+    // The cleared-flag branch of the reference evaluates through
+    // `TVPExecuteExpression`, which passes no context and mutes the console
+    // (`reference/cpp/plugins/windowEx.cpp:1548-1556`).
+    let context = if log_errors {
+        match context_argument(arguments, 3) {
+            Ok(context) => context,
+            Err(error) => return report_error(out_error, &format!("Scripts.eval: {error}")),
+        }
+    } else {
+        std::ptr::null_mut()
+    };
     let result = resolved
         .engine()
-        .eval_retained(&expression, &name)
+        .eval_retained_with_context(&expression, &name, context, lineofs)
         .map_err(|error| error.to_string());
     if log_errors && let Err(error) = &result {
         log::error!("Scripts.eval({name:?}): {error}");

@@ -292,7 +292,7 @@ pub fn exec_storage(engine: &Tjs2Engine, storage: &Storage, name: &str) -> Resul
 /// argument's handle, or null for an absent/void/null argument. A present
 /// non-object value raises the reference's variant conversion error
 /// (`tTJSVariant::AsObjectNoAddRef`, `tjsVariant.h:694-699`).
-fn context_argument(arguments: &[Value], index: usize) -> Result<*mut c_void, String> {
+pub(crate) fn context_argument(arguments: &[Value], index: usize) -> Result<*mut c_void, String> {
     match arguments.get(index) {
         None => Ok(std::ptr::null_mut()),
         Some(value) if value.ty == VAL_VOID || value.ty == VAL_NULL => Ok(std::ptr::null_mut()),
@@ -304,7 +304,7 @@ fn context_argument(arguments: &[Value], index: usize) -> Result<*mut c_void, St
 /// The optional `lineofs` argument of `Scripts.exec`/`Scripts.eval`, using the
 /// reference `(tjs_int)*param[2]` conversion (reals truncate, strings parse,
 /// objects raise).
-fn lineofs_argument(arguments: &[Value], index: usize) -> Result<i32, String> {
+pub(crate) fn lineofs_argument(arguments: &[Value], index: usize) -> Result<i32, String> {
     match arguments.get(index) {
         Some(value) if value.ty != VAL_VOID => try_value_as_i64(value).map(|value| value as i32),
         _ => Ok(0),

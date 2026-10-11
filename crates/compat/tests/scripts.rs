@@ -184,8 +184,10 @@ fn raw_exec_and_eval_honour_context_and_lineofs() {
     let env = Env::new();
     env.engine.exec_script("var c = %[x: 5];", "t").unwrap();
 
-    // `context` (fourth argument) becomes the evaluation `this`
-    // (`ScriptMgnIntf.cpp:1385-1438`).
+    // While `outputErrorLogOnEval` is at its default `true`, `windowEx`'s
+    // `Scripts.eval` override delegates to the core eval, so `context` (the
+    // fourth argument) becomes the evaluation `this`
+    // (`WindowEx.cpp:1542-1547`, `ScriptMgnIntf.cpp:1385-1438`).
     assert_eq!(
         env.eval_ok("Scripts.eval('this.x', '', 0, c)"),
         TjsValue::Integer(5)
