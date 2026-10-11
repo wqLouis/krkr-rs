@@ -6,8 +6,8 @@
 //! native payload for an existing class, so the members are attached to
 //! `Window` with
 //! [`register_instance_members`](crate::CompatCtx::register_instance_members)
-//! and the small per-window flag set lives in [`WindowExState`] keyed by the
-//! `objthis` pointer. The class constants (`ncht*`) are `TJS_STATICMEMBER`
+//! and the per-window flags live in [`WindowEx`] keyed by the `objthis`
+//! pointer. The class constants (`ncht*`) are `TJS_STATICMEMBER`
 //! properties.
 //!
 //! Host actions the reference leaves inert on this host (`minimize`,
@@ -29,17 +29,8 @@ use crate::{CompatCtx, CompatError};
 
 use super::notifications;
 use super::util::{
-    as_bool, as_integer, int_property_getter, is_object, objthis_has_member, objthis_int, resolve,
-    set_retained_out,
+    as_bool, as_integer, int_property_getter, is_object, objthis_int, resolve, set_retained_out,
 };
-
-/// Per-binding `Window` plugin state.
-#[derive(Default)]
-pub(crate) struct WindowExState {
-    windows: HashMap<usize, super::util::Tokened<WindowFlags>>,
-    /// Identity-token counter; see [`super::util::sync_object_state`].
-    next_token: i64,
-}
 
 /// The per-window flags `WindowEx` caches.
 #[derive(Default)]
@@ -51,21 +42,79 @@ struct WindowFlags {
     overlay: Option<DetachedValue>,
 }
 
-/// Borrow the flags that belong to `objthis`, syncing the per-object
-/// identity token first so a reused address starts from the constructor
-/// defaults (see [`super::util::sync_object_state`]).
-fn with_window<T>(
-    services: &crate::CompatServices,
-    engine: &Tjs2Engine,
-    objthis: *mut c_void,
-    f: impl FnOnce(&mut WindowFlags) -> T,
-) -> Result<T, String> {
-    let key = objthis as usize;
-    let mut state = services.state::<WindowExState>();
-    let state = &mut *state;
-    super::util::sync_object_state(&mut state.windows, &mut state.next_token, engine, objthis)?;
-    let entry = state.windows.entry(key).or_default();
-    Ok(f(&mut entry.value))
+/// The shared `WindowEx` behaviour the `Window` members compose.
+///
+/// One flag set is held per script object, keyed by the raw receiver address
+/// (see [`super::util::sync_object_state`]); the reference's per-object
+/// operations are methods so the thin callbacks only marshal arguments and
+/// results.
+#[derive(Default)]
+pub(crate) struct WindowEx {
+    windows: HashMap<usize, super::util::Tokened<WindowFlags>>,
+    /// Identity-token counter; see [`super::util::sync_object_state`].
+    next_token: i64,
+}
+
+impl WindowEx {
+    /// Borrow the flags that belong to `objthis`, syncing the per-object
+    /// identity token first so a reused address starts from the constructor
+    /// defaults (see [`super::util::sync_object_state`]).
+    fn with_window<T>(
+        &mut self,
+        engine: &Tjs2Engine,
+        objthis: *mut c_void,
+        f: impl FnOnce(&mut WindowFlags) -> T,
+    ) -> Result<T, String> {
+        let key = objthis as usize;
+        super::util::sync_object_state(&mut self.windows, &mut self.next_token, engine, objthis)?;
+        let entry = self.windows.entry(key).or_default();
+        Ok(f(&mut entry.value))
+    }
+
+    /// `setMessageHookAll`: assign the all-messages flag and return it.
+    fn set_message_hook_all(
+        &mut self,
+        engine: &Tjs2Engine,
+        objthis: *mut c_void,
+        on: bool,
+    ) -> Result<bool, String> {
+        self.with_window(engine, objthis, |flags| {
+            flags.message_hook_all = on;
+            flags.message_hook_all
+        })
+    }
+
+    /// `setMessageHookOnel`: return the all-messages flag unchanged.
+    fn message_hook_all(
+        &mut self,
+        engine: &Tjs2Engine,
+        objthis: *mut c_void,
+    ) -> Result<bool, String> {
+        self.with_window(engine, objthis, |flags| flags.message_hook_all)
+    }
+
+    /// The reference `TJS_S_OK` window actions (`minimize`, `maximize`,
+    /// `showRestore`, `resetWindowIcon`, `setWindowIcon`, `bringTo`,
+    /// `sendToBack`): accepted and inert.
+    fn inert() {}
+
+    /// `checkExEvents`: probe the extended handler names on the script object.
+    /// The results are not stored because the port has no native window
+    /// message dispatcher.
+    fn check_ex_events(engine: &Tjs2Engine, objthis: *mut c_void) {
+        for name in ["onResizing", "onMoving", "onMove", "onNcMouseMove"] {
+            Self::has_member(engine, objthis, name);
+        }
+    }
+
+    /// Whether `objthis` defines (or inherits) `name` — the reference's
+    /// `WindowEx::hasMember`.
+    fn has_member(engine: &Tjs2Engine, objthis: *mut c_void, name: &str) -> bool {
+        let Ok(object) = super::util::retain_objthis(engine, objthis) else {
+            return false;
+        };
+        engine.member(object.raw_id(), name).is_ok()
+    }
 }
 
 /// Emit a stored object (or TJS `null`) without holding the state borrow.
@@ -251,6 +300,7 @@ extern "C" fn window_inert(
     if resolve(engine).is_none() {
         return report_error(out_error, "windowEx: compat context is not bound");
     }
+    WindowEx::inert();
     set_void(out);
     0
 }
@@ -337,7 +387,8 @@ fn window_bool_get(
     let ctx = resolved.ctx();
     // SAFETY: `resolve` only succeeds for the installed, live binding.
     let services = unsafe { ctx.services() };
-    let value = match with_window(services, resolved.engine(), objthis, |flags| select(flags)) {
+    let mut state = services.state::<WindowEx>();
+    let value = match state.with_window(resolved.engine(), objthis, |flags| select(flags)) {
         Ok(value) => value,
         Err(error) => return report_error(out_error, &format!("{what}: {error}")),
     };
@@ -368,9 +419,10 @@ fn window_bool_set(
     let ctx = resolved.ctx();
     // SAFETY: `resolve` only succeeds for the installed, live binding.
     let services = unsafe { ctx.services() };
-    if let Err(error) = with_window(services, resolved.engine(), objthis, |flags| {
-        select(flags, enabled)
-    }) {
+    let mut state = services.state::<WindowEx>();
+    if let Err(error) =
+        state.with_window(resolved.engine(), objthis, |flags| select(flags, enabled))
+    {
         return report_error(out_error, &format!("{what}: {error}"));
     }
     0
@@ -395,12 +447,15 @@ extern "C" fn window_ex_system_menu_get(
     let ctx = resolved.ctx();
     // SAFETY: `resolve` only succeeds for the installed, live binding.
     let services = unsafe { ctx.services() };
-    let stored = match with_window(services, resolved.engine(), objthis, |flags| {
-        flags.sys_menu.as_ref().map(|value| value.raw_id())
-    }) {
-        Ok(stored) => stored,
-        Err(error) => {
-            return report_error(out_error, &format!("Window.exSystemMenu: {error}"));
+    let stored = {
+        let mut state = services.state::<WindowEx>();
+        match state.with_window(resolved.engine(), objthis, |flags| {
+            flags.sys_menu.as_ref().map(|value| value.raw_id())
+        }) {
+            Ok(stored) => stored,
+            Err(error) => {
+                return report_error(out_error, &format!("Window.exSystemMenu: {error}"));
+            }
         }
     };
     emit_stored(resolved.engine(), out, stored, "Window.exSystemMenu")
@@ -450,9 +505,10 @@ extern "C" fn window_ex_system_menu_set(
     let ctx = resolved.ctx();
     // SAFETY: `resolve` only succeeds for the installed, live binding.
     let services = unsafe { ctx.services() };
-    if let Err(error) = with_window(services, resolved.engine(), objthis, |flags| {
-        flags.sys_menu = stored
-    }) {
+    let mut state = services.state::<WindowEx>();
+    if let Err(error) =
+        state.with_window(resolved.engine(), objthis, |flags| flags.sys_menu = stored)
+    {
         return report_error(out_error, &format!("Window.exSystemMenu: {error}"));
     }
     0
@@ -509,7 +565,8 @@ extern "C" fn window_set_overlay_bitmap(
     let ctx = resolved.ctx();
     // SAFETY: `resolve` only succeeds for the installed, live binding.
     let services = unsafe { ctx.services() };
-    if let Err(error) = with_window(services, resolved.engine(), objthis, |flags| {
+    let mut state = services.state::<WindowEx>();
+    if let Err(error) = state.with_window(resolved.engine(), objthis, |flags| {
         flags.overlay = Some(overlay)
     }) {
         return report_error(out_error, &format!("Window.setOverlayBitmap: {error}"));
@@ -581,9 +638,8 @@ extern "C" fn window_set_message_hook(
         // The one-message form neither stores the bit nor changes the hook
         // state: `setMessageHookOnel` only returns the all-hook flag
         // (`windowEx.cpp:747`, called at `windowEx.cpp:613`).
-        match with_window(services, resolved.engine(), objthis, |flags| {
-            flags.message_hook_all
-        }) {
+        let mut state = services.state::<WindowEx>();
+        match state.message_hook_all(resolved.engine(), objthis) {
             Ok(flag) => flag,
             Err(error) => {
                 return report_error(out_error, &format!("Window.setMessageHook: {error}"));
@@ -592,10 +648,8 @@ extern "C" fn window_set_message_hook(
     } else {
         // `setMessageHookAll(on)` assigns and returns the flag
         // (`windowEx.cpp:749`, called at `windowEx.cpp:615`).
-        match with_window(services, resolved.engine(), objthis, |flags| {
-            flags.message_hook_all = on;
-            flags.message_hook_all
-        }) {
+        let mut state = services.state::<WindowEx>();
+        match state.set_message_hook_all(resolved.engine(), objthis, on) {
             Ok(flag) => flag,
             Err(error) => {
                 return report_error(out_error, &format!("Window.setMessageHook: {error}"));
@@ -687,14 +741,10 @@ extern "C" fn window_register_ex_event(
         );
     };
     // The reference's `checkExEvents` probes the script object for the four
-    // extended handlers (`reference/cpp/plugins/windowEx.cpp:730-735`); the
-    // handler names are the `EXEV_*` strings (`windowEx.cpp:316-340`) and
-    // none is registered as a class member. The port has no native window
-    // message dispatcher, so the probe results are not retained.
-    let host = resolved.engine();
-    for name in ["onResizing", "onMoving", "onMove", "onNcMouseMove"] {
-        objthis_has_member(host, objthis, name);
-    }
+    // extended handlers; the handler names are the `EXEV_*` strings and none
+    // is registered as a class member. The port has no native window message
+    // dispatcher, so the probe results are not retained.
+    WindowEx::check_ex_events(resolved.engine(), objthis);
     set_void(out);
     0
 }

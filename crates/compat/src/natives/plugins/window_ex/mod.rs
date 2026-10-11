@@ -11,7 +11,7 @@
 //! objthis-only members (no per-object native payload) to an existing class,
 //! so — exactly like `main` did for `registerExEvent` — the `WindowEx`
 //! members live on `Window` and `MenuItemEx`'s on `MenuItem`. The small
-//! per-object flag sets live in [`window::WindowExState`] /
+//! per-object flag sets live in [`window::WindowEx`] /
 //! [`menu_item::MenuItemExState`] keyed by the `objthis` pointer; there is no
 //! `WindowEx` global class, matching the reference.
 //!

@@ -285,14 +285,6 @@ fn leading_number_len(text: &str) -> usize {
     index
 }
 
-/// Whether `objthis` defines (or inherits) a member.
-pub(crate) fn objthis_has_member(engine: &Tjs2Engine, objthis: *mut c_void, name: &str) -> bool {
-    let Ok(object) = retain_objthis(engine, objthis) else {
-        return false;
-    };
-    engine.member(object.raw_id(), name).is_ok()
-}
-
 // ---------------------------------------------------------------------------
 // per-object state guard
 // ---------------------------------------------------------------------------
