@@ -100,10 +100,11 @@ extern "C" fn pv_destroy(engine: *mut c_void, instance: *mut c_void) {
     drop(unsafe { Box::from_raw(instance as *mut PhaseVocoderInst) });
 }
 
-/// Borrow the payload of a `PhaseVocoder` instance.
-fn payload(instance: *mut c_void) -> &'static mut PhaseVocoderInst {
+/// Run `f` with the payload of a `PhaseVocoder` instance.
+fn with_payload<R>(instance: *mut c_void, f: impl FnOnce(&mut PhaseVocoderInst) -> R) -> R {
     // SAFETY: the dispatcher guarantees `instance` is the create payload.
-    unsafe { &mut *(instance as *mut PhaseVocoderInst) }
+    let payload = unsafe { &mut *(instance as *mut PhaseVocoderInst) };
+    f(payload)
 }
 
 /// Mirror the payload config into the shared registry.
@@ -114,7 +115,7 @@ fn publish(engine: *mut c_void, instance: *mut c_void) {
     let ctx = resolved.ctx();
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
     let services = unsafe { ctx.services() };
-    let config = payload(instance).config;
+    let config = with_payload(instance, |payload| payload.config);
     services
         .state::<super::SoundState>()
         .vocoders
@@ -142,7 +143,10 @@ extern "C" fn pv_window_get(
     _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    set_int(out, payload(instance).config.window as i64);
+    set_int(
+        out,
+        with_payload(instance, |payload| payload.config.window as i64),
+    );
     0
 }
 
@@ -153,6 +157,7 @@ extern "C" fn pv_window_set(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
     let window = super::value_as_i64(unsafe { &*value });
     // Reference `SetWindow`: only the powers of two 64..=32768 are accepted.
     if !matches!(
@@ -161,7 +166,7 @@ extern "C" fn pv_window_set(
     ) {
         return report_error(out_error, "Invalid window size must be in 64 to 32768");
     }
-    payload(instance).config.window = window as usize;
+    with_payload(instance, |payload| payload.config.window = window as usize);
     publish(engine, instance);
     0
 }
@@ -173,7 +178,10 @@ extern "C" fn pv_overlap_get(
     _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    set_int(out, i64::from(payload(instance).config.overlap));
+    set_int(
+        out,
+        i64::from(with_payload(instance, |payload| payload.config.overlap)),
+    );
     0
 }
 
@@ -184,12 +192,13 @@ extern "C" fn pv_overlap_set(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
     let overlap = super::value_as_i64(unsafe { &*value });
     // Reference `SetOverlap`: 0 (auto) or one of 2, 4, 8, 16, 32.
     if !matches!(overlap, 0 | 2 | 4 | 8 | 16 | 32) {
         return report_error(out_error, "Invalid overlap count must be in 2 to 32");
     }
-    payload(instance).config.overlap = overlap as u32;
+    with_payload(instance, |payload| payload.config.overlap = overlap as u32);
     publish(engine, instance);
     0
 }
@@ -201,7 +210,10 @@ extern "C" fn pv_pitch_get(
     _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    super::set_real(out, f64::from(payload(instance).config.pitch));
+    super::set_real(
+        out,
+        f64::from(with_payload(instance, |payload| payload.config.pitch)),
+    );
     0
 }
 
@@ -212,7 +224,10 @@ extern "C" fn pv_pitch_set(
     _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    payload(instance).config.pitch = super::value_as_f64(unsafe { &*value }) as f32;
+    // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
+    with_payload(instance, |payload| {
+        payload.config.pitch = super::value_as_f64(unsafe { &*value }) as f32;
+    });
     publish(engine, instance);
     0
 }
@@ -224,7 +239,10 @@ extern "C" fn pv_time_get(
     _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    super::set_real(out, f64::from(payload(instance).config.time));
+    super::set_real(
+        out,
+        f64::from(with_payload(instance, |payload| payload.config.time)),
+    );
     0
 }
 
@@ -235,7 +253,10 @@ extern "C" fn pv_time_set(
     _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    payload(instance).config.time = super::value_as_f64(unsafe { &*value }) as f32;
+    // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
+    with_payload(instance, |payload| {
+        payload.config.time = super::value_as_f64(unsafe { &*value }) as f32;
+    });
     publish(engine, instance);
     0
 }

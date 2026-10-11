@@ -8,11 +8,13 @@
 
 use std::f64::consts::PI;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use api::media::{AudioSpec, DecodedAudio};
 use engine::sound::{
-    LOOP_FLAG_COUNT, LoopCondition, LoopFlags, LoopInfo, LoopLink, MAX_LOOP_FLAG_VALUE, MAX_VOLUME,
-    Mixer, SoundBuffer, SoundError, SoundLabel, SoundSource, Status, mix_source,
+    AudioStream, LOOP_FLAG_COUNT, LoopCondition, LoopFlags, LoopInfo, LoopLink,
+    MAX_LOOP_FLAG_VALUE, MAX_VOLUME, Mixer, SoundBuffer, SoundError, SoundLabel, SoundSource,
+    Status, mix_source,
 };
 
 fn out_spec(sample_rate: u32, channels: u16) -> AudioSpec {
@@ -660,5 +662,208 @@ fn the_mixer_must_be_sampled_before_it_is_advanced() {
             .enumerate()
             .any(|(m, sample)| (sample - m as f32).abs() >= 0.5),
         "advance-then-render must leave a seam under jitter"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Incremental (streaming) sources
+// ---------------------------------------------------------------------------
+
+/// A decoded PCM ramp behind an [`AudioStream`], counting decoder work.
+struct CountingStream {
+    samples: Vec<f32>,
+    channels: usize,
+    position: u64,
+    spec: AudioSpec,
+    reads: Arc<AtomicUsize>,
+    seeks: Arc<AtomicUsize>,
+}
+
+impl CountingStream {
+    /// A mono/stereo ramp whose frame `f` holds the value `f`.
+    fn ramp(rate: u32, channels: u16, frames: u64) -> (Self, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let channel_count = usize::from(channels);
+        let samples: Vec<f32> = (0..frames)
+            .flat_map(|frame| std::iter::repeat_n(frame as f32, channel_count))
+            .collect();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let seeks = Arc::new(AtomicUsize::new(0));
+        (
+            Self {
+                samples,
+                channels: channel_count,
+                position: 0,
+                spec: AudioSpec {
+                    sample_rate: rate,
+                    channels,
+                    total_frames: Some(frames),
+                },
+                reads: reads.clone(),
+                seeks: seeks.clone(),
+            },
+            reads,
+            seeks,
+        )
+    }
+}
+
+impl AudioStream for CountingStream {
+    fn spec(&self) -> AudioSpec {
+        self.spec
+    }
+
+    fn read(&mut self, out: &mut [f32]) -> Result<usize, SoundError> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        let start = self.position as usize * self.channels;
+        if start >= self.samples.len() {
+            return Ok(0);
+        }
+        let available = self.samples.len() - start;
+        let aligned = (out.len().min(available) / self.channels) * self.channels;
+        out[..aligned].copy_from_slice(&self.samples[start..start + aligned]);
+        self.position += (aligned / self.channels) as u64;
+        Ok(aligned)
+    }
+
+    fn seek(&mut self, frame: u64) -> Result<(), SoundError> {
+        self.seeks.fetch_add(1, Ordering::Relaxed);
+        self.position = frame.min(self.samples.len() as u64 / self.channels as u64);
+        Ok(())
+    }
+}
+
+/// Reference: `Open` creates the decoder, builds the filter chain and reads
+/// `FilterOutput->GetFormat()` for the duration
+/// (`reference/cpp/core/sound/win32/WaveImpl.cpp:3043-3056`); only the decode
+/// thread fills the L2 buffer, and only while it is `Running`
+/// (`WaveImpl.cpp:1823-1866`, `2389-2463`). Opening a source therefore decodes
+/// no samples.
+#[test]
+fn streaming_source_decodes_nothing_at_construction() {
+    let (stream, reads, seeks) = CountingStream::ramp(48_000, 2, 4_800_000);
+    let spec = AudioSpec {
+        sample_rate: 48_000,
+        channels: 2,
+        total_frames: Some(4_800_000),
+    };
+    let source = SoundSource::streaming(spec, Box::new(stream), None).expect("streaming source");
+
+    assert_eq!(reads.load(Ordering::Relaxed), 0, "open must decode nothing");
+    assert_eq!(seeks.load(Ordering::Relaxed), 0, "open must not seek");
+    assert!(source.is_streaming());
+    // The length comes from the container, not from decoding.
+    assert_eq!(source.frames(), 4_800_000);
+    assert!((source.duration_seconds() - 100.0).abs() < 1e-9);
+
+    // The first frame read decodes one bounded chunk, not the whole file.
+    assert_eq!(source.frame(0).unwrap(), Some((0.0, 0.0)));
+    assert_eq!(reads.load(Ordering::Relaxed), 1);
+}
+
+/// Reference: `tTVPWaveDecoder::Render` decodes forward from the current
+/// position and `SetPosition` is the only backwards operation
+/// (`reference/cpp/core/sound/WaveIntf.h:84-113`); the sound buffer reseeks
+/// on `SetSamplePosition` and on a loop wrap
+/// (`reference/cpp/core/sound/win32/WaveImpl.cpp:3131-3143`, `2458-2463`).
+#[test]
+fn streaming_source_decodes_forward_and_reseeks_backwards() {
+    let (stream, reads, seeks) = CountingStream::ramp(8_000, 1, 1_000_000);
+    let spec = AudioSpec {
+        sample_rate: 8_000,
+        channels: 1,
+        total_frames: Some(1_000_000),
+    };
+    let source = SoundSource::streaming(spec, Box::new(stream), None).expect("source");
+
+    // A far forward frame reseeks once (the same forward-gap rule the final
+    // check asserts) and decodes the window there; the next frame is served
+    // from the decoded window with no further reads.
+    assert_eq!(source.frame(50_000).unwrap().unwrap().0, 50_000.0);
+    let reads_after_first = reads.load(Ordering::Relaxed);
+    assert!(reads_after_first >= 1, "the first read decoded a chunk");
+    assert_eq!(source.frame(50_001).unwrap().unwrap().0, 50_001.0);
+    assert_eq!(
+        reads.load(Ordering::Relaxed),
+        reads_after_first,
+        "a forward step inside the window decodes nothing more"
+    );
+
+    // A backwards read reseeks and re-decodes instead of keeping the file.
+    let before = seeks.load(Ordering::Relaxed);
+    assert_eq!(source.frame(10).unwrap().unwrap().0, 10.0);
+    assert_eq!(
+        seeks.load(Ordering::Relaxed),
+        before + 1,
+        "a backwards read reseeks"
+    );
+
+    // A forward gap reseeks rather than decoding through the skipped frames.
+    let before = seeks.load(Ordering::Relaxed);
+    assert_eq!(source.frame(900_000).unwrap().unwrap().0, 900_000.0);
+    assert_eq!(seeks.load(Ordering::Relaxed), before + 1);
+}
+
+/// Reference: `Render` reports the end by returning fewer samples than
+/// requested (`reference/cpp/core/sound/WaveIntf.h:95-105`), and a frame at
+/// or past the container's `TotalSamples` is never read
+/// (`reference/cpp/core/sound/win32/WaveImpl.cpp:3135-3136`).
+#[test]
+fn streaming_source_returns_none_past_the_end() {
+    let (stream, _reads, _seeks) = CountingStream::ramp(1_000, 1, 100);
+    let spec = AudioSpec {
+        sample_rate: 1_000,
+        channels: 1,
+        total_frames: Some(100),
+    };
+    let source = SoundSource::streaming(spec, Box::new(stream), None).expect("source");
+    assert_eq!(source.frame(99).unwrap().unwrap().0, 99.0);
+    assert_eq!(source.frame(100).unwrap(), None);
+    assert_eq!(source.frame(10_000).unwrap(), None);
+}
+
+/// The mixer reads by absolute frame index, so a streaming source must render
+/// exactly like a materialized buffer of the same samples.
+#[test]
+fn mixer_renders_a_streaming_source_like_a_materialized_one() {
+    let rate = 8_000u32;
+    let frames = 20_000u64;
+    let samples: Vec<f32> = (0..frames).map(|frame| frame as f32).collect();
+    let spec = AudioSpec {
+        sample_rate: rate,
+        channels: 1,
+        total_frames: Some(frames),
+    };
+
+    let materialized = Arc::new(
+        SoundSource::new(Arc::new(DecodedAudio::new(spec, samples))).expect("materialized"),
+    );
+    let (stream, _reads, _seeks) = CountingStream::ramp(rate, 1, frames);
+    let streaming = Arc::new(SoundSource::streaming(spec, Box::new(stream), None).expect("stream"));
+
+    let mut expected = vec![0.0f32; 4_000];
+    mix_source(
+        &materialized,
+        0.25,
+        1.0,
+        0.5,
+        0.0,
+        &mut expected,
+        out_spec(rate, 1),
+    )
+    .unwrap();
+    let mut observed = vec![0.0f32; 4_000];
+    mix_source(
+        &streaming,
+        0.25,
+        1.0,
+        0.5,
+        0.0,
+        &mut observed,
+        out_spec(rate, 1),
+    )
+    .unwrap();
+    assert_eq!(
+        expected, observed,
+        "a streaming source renders like a materialized one"
     );
 }

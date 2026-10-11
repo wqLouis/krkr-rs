@@ -28,6 +28,7 @@
 mod common;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use api::fs::{FsPath, OpenMode};
@@ -35,7 +36,7 @@ use api::media::{AudioSpec, DecodedAudio};
 use common::vm_lock;
 use compat::{CompatHost, add_audio_decoder, set_sound_render_driven, sound_poll, sound_render};
 use engine::Storage;
-use engine::sound::{LoopInfo, SoundSource};
+use engine::sound::{AudioStream, LoopInfo, SoundError, SoundSource};
 use fs::FileSystem;
 use tjs::{Tjs2Engine, TjsValue};
 
@@ -1802,4 +1803,157 @@ fn render_driven_mixer_advances_by_the_rendered_frames() {
         sound_render(&ctx, &mut quarter, spec).expect("render");
     }
     assert_eq!(env.eval_int("s.position"), 500);
+}
+
+// ---------------------------------------------------------------------------
+// 15. Incremental (streaming) open
+// ---------------------------------------------------------------------------
+
+/// A ramp source behind an [`AudioStream`], counting decoder reads.
+struct RampStream {
+    samples: Vec<f32>,
+    channels: usize,
+    position: u64,
+    spec: AudioSpec,
+    reads: Arc<AtomicUsize>,
+}
+
+impl RampStream {
+    fn new(rate: u32, channels: u16, frames: u64, reads: Arc<AtomicUsize>) -> Self {
+        let channel_count = usize::from(channels);
+        let samples: Vec<f32> = (0..frames)
+            .flat_map(|frame| std::iter::repeat_n(frame as f32, channel_count))
+            .collect();
+        Self {
+            samples,
+            channels: channel_count,
+            position: 0,
+            spec: AudioSpec {
+                sample_rate: rate,
+                channels,
+                total_frames: Some(frames),
+            },
+            reads,
+        }
+    }
+}
+
+impl AudioStream for RampStream {
+    fn spec(&self) -> AudioSpec {
+        self.spec
+    }
+
+    fn read(&mut self, out: &mut [f32]) -> Result<usize, SoundError> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        let start = self.position as usize * self.channels;
+        if start >= self.samples.len() {
+            return Ok(0);
+        }
+        let n = out.len().min(self.samples.len() - start);
+        let take = (n / self.channels) * self.channels;
+        out[..take].copy_from_slice(&self.samples[start..start + take]);
+        self.position += (take / self.channels) as u64;
+        Ok(take)
+    }
+
+    fn seek(&mut self, frame: u64) -> Result<(), SoundError> {
+        self.position = frame.min(self.samples.len() as u64 / self.channels as u64);
+        Ok(())
+    }
+}
+
+/// The standard environment with a decoder that returns a 10 s streaming
+/// ramp, plus the counter of its decoder reads.
+fn streaming_env() -> (Env, Arc<AtomicUsize>) {
+    let engine = Box::new(Tjs2Engine::new().expect("create engine"));
+    let mut storage = Some(Box::new(mount_memory(&[("tone.wav", b"RIFF")])));
+    let mut host = CompatHost::new();
+    // SAFETY: the boxed storage outlives the host (it is declared after
+    // `_host`, so it drops later), matching `attach_storage`.
+    unsafe {
+        host.services_mut()
+            .attach_storage(storage.as_mut().unwrap().as_mut() as *mut Storage);
+    }
+    host.install(&engine).expect("install compat surface");
+    let reads = Arc::new(AtomicUsize::new(0));
+    let counter = reads.clone();
+    add_audio_decoder(
+        host.services(),
+        Box::new(move |_bytes, loops, _hint| {
+            let frames = u64::from(TONE_RATE) * 10;
+            let stream = RampStream::new(TONE_RATE, 1, frames, counter.clone());
+            let spec = AudioSpec {
+                sample_rate: TONE_RATE,
+                channels: 1,
+                total_frames: Some(frames),
+            };
+            let source = SoundSource::streaming(spec, Box::new(stream), loops)
+                .map_err(|error| error.to_string())?;
+            Ok(Arc::new(source))
+        }),
+    );
+    (
+        Env {
+            _host: host,
+            engine,
+            _storage: storage,
+        },
+        reads,
+    )
+}
+
+/// Reference: `Open` creates the decoder and reads its format
+/// (`reference/cpp/core/sound/win32/WaveImpl.cpp:3043-3056`); the decode
+/// thread fills the L2 buffer only while playback runs
+/// (`WaveImpl.cpp:1823-1866`, `2389-2463`). Opening a sound must therefore
+/// decode nothing; the first render pulls the samples.
+#[test]
+fn open_does_not_decode_the_whole_file() {
+    let _lock = vm_lock();
+    let (env, reads) = streaming_env();
+
+    env.run("var s = new WaveSoundBuffer(); s.open('tone.wav');");
+    assert_eq!(
+        reads.load(Ordering::Relaxed),
+        0,
+        "open must not decode the stream (WaveImpl.cpp:3043-3056)"
+    );
+    // The container's total frames still answer `totalTime` before playback.
+    assert_eq!(env.eval_int("s.totalTime"), 10_000);
+    assert_eq!(env.eval_int("s.frequency"), i64::from(TONE_RATE));
+
+    env.run("s.play();");
+    assert_eq!(
+        reads.load(Ordering::Relaxed),
+        0,
+        "play alone decodes nothing"
+    );
+    assert!(env.peak() > 0.0, "the ramp must be audible");
+    assert!(
+        reads.load(Ordering::Relaxed) > 0,
+        "the first render decodes the stream"
+    );
+    // `sampleValue` reads the visualization buffer from the decoded window.
+    assert!(env.eval_real("s.sampleValue") > 0.0);
+}
+
+/// Reference: the filter chain is rebuilt and applied when the buffer starts
+/// (`reference/cpp/core/sound/win32/WaveImpl.cpp:2916-2930`). The phase-vocoder
+/// DSP processes one PCM buffer, so a streaming source is materialized for the
+/// chain while remaining incremental for ordinary playback.
+#[test]
+fn phase_vocoder_materializes_a_streaming_source() {
+    let _lock = vm_lock();
+    let (env, reads) = streaming_env();
+
+    env.run(
+        "var s = new WaveSoundBuffer(); s.open('tone.wav'); \
+         var pv = new WaveSoundBuffer.PhaseVocoder(); pv.time = 2.0; \
+         s.filters.add(pv); s.play();",
+    );
+    assert!(
+        reads.load(Ordering::Relaxed) > 0,
+        "the filter chain materializes the stream"
+    );
+    assert_eq!(env.eval_ok("s.status"), TjsValue::String("play".into()));
 }

@@ -38,8 +38,8 @@
 //! [`Storage`](engine::Storage), parses the side-car with the module's
 //! [`parse_sli`], and hands both to the decoder — a typed error
 //! when no decoder or no storage is installed. The decoder returns a
-//! ready [`SoundSource`], which is stored both on the L2 [`SoundBuffer`] and in
-//! the per-object handle.
+//! [`SoundSource`] (materialized or incremental), which is stored both on the
+//! L2 [`SoundBuffer`] and in the per-object handle.
 //!
 //! # Events
 //!
@@ -102,10 +102,12 @@
 //!   `AudioSpec` carries no bit depth, so the reference's 16-bit WAV value
 //!   cannot be reproduced truthfully.
 //! * `getVisBuffer` copies the decoded samples around the channel's current
-//!   play position into the caller's raw `dest` as interleaved signed 16-bit
+//!   play position into the caller's `dest` as interleaved signed 16-bit
 //!   PCM (the reference `GetVisBuffer`, `WaveImpl.cpp:3401-3474`); it returns
 //!   `0` when `useVisBuffer` is off, the buffer is not playing, or the
-//!   requested layout is unsupported.
+//!   requested layout is unsupported. `dest` must be a buffer registered
+//!   through [`VisBufferRegistration`]; any other address raises a typed
+//!   error, and the write is clamped to the registered length.
 //! * `flags` returns the live `WaveFlags` proxy (cached per buffer, so
 //!   `s.flags === s.flags`), and `labels` the cached dictionary of the loaded
 //!   `.sli` labels (rebuilt only where the reference calls
@@ -136,8 +138,8 @@ use std::sync::Arc;
 use api::media::AudioSpec;
 
 use engine::sound::{
-    LoopCondition, LoopInfo, LoopLink, Mixer, SoundBuffer, SoundChannel, SoundEvent, SoundLabel,
-    SoundSource, Status,
+    LoopCondition, LoopInfo, LoopLink, Mixer, SoundBuffer, SoundChannel, SoundError, SoundEvent,
+    SoundLabel, SoundSource, Status,
 };
 use platform::Clock;
 use tjs::{
@@ -355,13 +357,14 @@ fn entities(body: &str) -> Vec<(String, String)> {
 // Host-supplied decode hook
 // ---------------------------------------------------------------------------
 
-/// A host-supplied whole-file audio decoder.
+/// A host-supplied audio decoder.
 ///
 /// `open` reads the audio bytes and the optional `.sli` (already parsed into a
-/// generic [`LoopInfo`]) from the attached L2 storage and calls this to produce
-/// a ready [`SoundSource`]. The host (L4), which links the L1 `media` crate,
-/// installs it with [`add_audio_decoder`]. `hint` is the storage name, used
-/// only for backend selection.
+/// generic [`LoopInfo`]) from the attached L2 storage and calls this to build
+/// a [`SoundSource`] — either a materialized buffer or an incremental stream
+/// that decodes as playback reads it. The host (L4), which links the L1
+/// `media` crate, installs it with [`add_audio_decoder`]. `hint` is the
+/// storage name, used only for backend selection.
 pub type AudioDecoder =
     Box<dyn Fn(&[u8], Option<LoopInfo>, Option<&str>) -> Result<Arc<SoundSource>, String>>;
 
@@ -497,6 +500,10 @@ pub struct SoundState {
     /// address), so `sound_play` can resolve the `filters` chain to DSP
     /// parameters. Entries are removed when the filter object is destroyed.
     vocoders: HashMap<usize, VocoderConfig>,
+    /// Sample buffers a plugin registered as `getVisBuffer` destinations,
+    /// keyed by address, holding the buffer length in `i16` samples. Only a
+    /// registered destination is writable.
+    vis_buffers: HashMap<usize, usize>,
     /// The script-visible `globalFocusMode`, stored verbatim like the
     /// reference static (`WaveImpl.cpp:1889-1891`, `WaveIntf.cpp:1616-1618`
     /// — the reference casts and stores without clamping).
@@ -697,7 +704,21 @@ fn resolve_filtered_source(
         None => Vec::new(),
     };
     match (&raw_source, configs.is_empty()) {
-        (Some(source), false) => phase_vocoder::apply_chain(source, &configs).map(Some),
+        (Some(source), false) => {
+            // The phase-vocoder DSP consumes one whole PCM buffer, so a
+            // streaming source is materialized before the chain runs; `open`
+            // itself still decodes nothing.
+            let materialized = if source.is_streaming() {
+                let audio = source.decode_entire().map_err(|error| error.to_string())?;
+                Arc::new(
+                    SoundSource::with_loops(Arc::new(audio), source.loops().cloned())
+                        .map_err(|error| error.to_string())?,
+                )
+            } else {
+                source.clone()
+            };
+            phase_vocoder::apply_chain(&materialized, &configs).map(Some)
+        }
         _ => Ok(None),
     }
 }
@@ -1629,13 +1650,48 @@ fn downmix_to_i16(left: f32, right: f32, source_channels: usize) -> i16 {
     }
 }
 
+/// Registration of one caller-owned sample buffer as a legitimate
+/// `getVisBuffer` destination for the duration of a plugin call.
+///
+/// The buffer must stay alive and hold at least `len` `i16` samples while the
+/// registration is alive. [`sound_get_vis_buffer`] writes only into a
+/// registered buffer and never past its length.
+pub(crate) struct VisBufferRegistration<'a> {
+    services: &'a CompatServices,
+    ptr: usize,
+}
+
+impl<'a> VisBufferRegistration<'a> {
+    /// Register `ptr` as a sample buffer of `len` `i16` samples.
+    pub(crate) fn register(services: &'a CompatServices, ptr: *mut i16, len: usize) -> Self {
+        services
+            .state::<SoundState>()
+            .vis_buffers
+            .insert(ptr as usize, len);
+        Self {
+            services,
+            ptr: ptr as usize,
+        }
+    }
+}
+
+impl Drop for VisBufferRegistration<'_> {
+    fn drop(&mut self) {
+        self.services
+            .state::<SoundState>()
+            .vis_buffers
+            .remove(&self.ptr);
+    }
+}
+
 /// The reference `GetVisBuffer` copy loop (`WaveImpl.cpp:3438-3470`): copy
 /// `numsamples` frames from `source` at `position_seconds` (plus `ahead`)
 /// into the caller's `dest`, converted to interleaved signed 16-bit PCM.
 ///
 /// Returns the number of frames written. `0` when the count is not positive,
 /// `dest` is null, or the requested layout is neither mono nor the source's
-/// own layout.
+/// own layout. A decoder failure is a typed error. `dest` must point into a
+/// buffer of `dest_len` `i16` samples; the write is clamped to it.
 fn read_vis_buffer(
     source: &SoundSource,
     position_seconds: f64,
@@ -1643,28 +1699,31 @@ fn read_vis_buffer(
     channels: i32,
     ahead: i32,
     dest: *mut i16,
-) -> usize {
+    dest_len: usize,
+) -> Result<usize, SoundError> {
     let source_channels = i32::from(source.channels());
     if channels != source_channels && channels != 1 {
-        return 0;
+        return Ok(0);
     }
     if numsamples <= 0 || dest.is_null() {
-        return 0;
+        return Ok(0);
     }
     let sample_rate = f64::from(source.sample_rate().max(1));
     let start = (position_seconds * sample_rate).floor() as i64 + i64::from(ahead);
-    let count = numsamples as usize;
     let downmix = channels == 1;
+    // A frame occupies one `i16` when downmixing and two when interleaved.
+    let per_frame = if downmix { 1 } else { 2 };
+    let count = (numsamples as usize).min(dest_len / per_frame);
     for index in 0..count {
         let frame = start + index as i64;
         let (left, right) = if frame >= 0 {
-            source.frame(frame as u64).unwrap_or((0.0, 0.0))
+            source.frame(frame as u64)?.unwrap_or((0.0, 0.0))
         } else {
             (0.0, 0.0)
         };
-        // SAFETY: `dest` is the sample pointer the script passed to
-        // `getVisBuffer`; the reference trusts it as well, and `count` bounds
-        // every write to `count * channels` samples.
+        // SAFETY: `dest` is a buffer registered through
+        // `VisBufferRegistration` with `dest_len` `i16` samples, and `count`
+        // is clamped so `index * per_frame + per_frame <= dest_len`.
         unsafe {
             if downmix {
                 *dest.add(index) = downmix_to_i16(left, right, source_channels as usize);
@@ -1674,7 +1733,7 @@ fn read_vis_buffer(
             }
         }
     }
-    count
+    Ok(count)
 }
 
 extern "C" fn sound_get_vis_buffer(
@@ -1708,18 +1767,28 @@ extern "C" fn sound_get_vis_buffer(
         "getVisBuffer",
         out_error,
         |_ctx, services, id| {
-            let written = with_object(services, id, |object, mixer| {
+            let registered = {
+                let state = services.state::<SoundState>();
+                state.vis_buffers.get(&(dest as usize)).copied()
+            };
+            let result = with_object(services, id, |object, mixer| -> Result<usize, SoundError> {
                 if !object.use_vis_buffer || !object.device_ready || object.source.is_none() {
-                    return 0;
+                    return Ok(0);
                 }
                 let Some(channel) = mixer.channel(object.channel_id) else {
-                    return 0;
+                    return Ok(0);
                 };
                 if !channel.is_playing() {
-                    return 0;
+                    return Ok(0);
                 }
                 let Some(source) = channel.source() else {
-                    return 0;
+                    return Ok(0);
+                };
+                let Some(dest_len) = registered else {
+                    return Err(SoundError::Decode {
+                        message: "getVisBuffer destination is not a registered sample buffer"
+                            .to_string(),
+                    });
                 };
                 read_vis_buffer(
                     source,
@@ -1728,11 +1797,19 @@ extern "C" fn sound_get_vis_buffer(
                     channels,
                     ahead,
                     dest,
+                    dest_len,
                 )
-            })
-            .unwrap_or(0);
-            set_int(out, written as i64);
-            0
+            });
+            match result {
+                None => report_error(out_error, "WaveSoundBuffer.getVisBuffer: not constructed"),
+                Some(Ok(count)) => {
+                    set_int(out, count as i64);
+                    0
+                }
+                Some(Err(error)) => {
+                    report_error(out_error, &format!("WaveSoundBuffer.getVisBuffer: {error}"))
+                }
+            }
         }
     )
 }
@@ -3506,6 +3583,33 @@ mod tests {
         assert_eq!(downmix_to_i16(-1.0, 0.0, 1), -32768);
     }
 
+    /// Registering a buffer as a `getVisBuffer` destination makes it
+    /// discoverable while the registration is alive and removes it when the
+    /// guard drops, so a stale address is never writable.
+    #[test]
+    fn vis_buffer_registration_tracks_the_live_buffer() {
+        let services = CompatServices::new();
+        let mut buffer = [0i16; 4];
+        let ptr = buffer.as_mut_ptr() as usize;
+        let registration =
+            VisBufferRegistration::register(&services, buffer.as_mut_ptr(), buffer.len());
+        assert_eq!(
+            services
+                .state::<SoundState>()
+                .vis_buffers
+                .get(&ptr)
+                .copied(),
+            Some(4)
+        );
+        drop(registration);
+        assert!(
+            !services
+                .state::<SoundState>()
+                .vis_buffers
+                .contains_key(&ptr)
+        );
+    }
+
     /// `GetVisBuffer` copies from the current position plus `ahead`, downmixes
     /// for `channels == 1`, and copies interleaved for the source's own layout
     /// (`WaveImpl.cpp:3401-3474`).
@@ -3514,37 +3618,51 @@ mod tests {
         // Mono source: the downmix path uses the 32768 scale.
         let mono = source_from(&[0.0, 0.25, -0.5, 1.0], 1);
         let mut buffer = [0i16; 4];
-        let count = read_vis_buffer(&mono, 0.0, 4, 1, 0, buffer.as_mut_ptr());
+        let count = read_vis_buffer(&mono, 0.0, 4, 1, 0, buffer.as_mut_ptr(), buffer.len())
+            .expect("mono read");
         assert_eq!(count, 4);
         assert_eq!(buffer, [0, 8192, -16384, 32767]);
 
         // Stereo source, `channels == 2`: interleaved at the 32767 scale.
         let stereo = source_from(&[0.0, 1.0, 0.5, -0.5], 2);
         let mut buffer = [0i16; 4];
-        let count = read_vis_buffer(&stereo, 0.0, 2, 2, 0, buffer.as_mut_ptr());
+        let count = read_vis_buffer(&stereo, 0.0, 2, 2, 0, buffer.as_mut_ptr(), buffer.len())
+            .expect("stereo read");
         assert_eq!(count, 2);
         assert_eq!(buffer, [0, 32767, 16384, -16384]);
 
         // The copy starts at the playback position plus `ahead`.
-        let count = read_vis_buffer(&stereo, 0.001, 1, 2, 0, buffer.as_mut_ptr());
+        let count = read_vis_buffer(&stereo, 0.001, 1, 2, 0, buffer.as_mut_ptr(), buffer.len())
+            .expect("positioned read");
         assert_eq!(count, 1);
         assert_eq!(buffer, [16384, -16384, 16384, -16384]);
-        let count = read_vis_buffer(&stereo, 0.0, 1, 2, 1, buffer.as_mut_ptr());
+        let count = read_vis_buffer(&stereo, 0.0, 1, 2, 1, buffer.as_mut_ptr(), buffer.len())
+            .expect("ahead read");
         assert_eq!(count, 1);
         assert_eq!(buffer, [16384, -16384, 16384, -16384]);
+
+        // A destination shorter than `numsamples` clamps the write to it.
+        let count = read_vis_buffer(&mono, 0.0, 4, 1, 0, buffer.as_mut_ptr(), buffer.len())
+            .expect("clamped read");
+        assert_eq!(count, 4);
+        let count = read_vis_buffer(&mono, 0.0, 4, 1, 0, buffer.as_mut_ptr(), 2)
+            .expect("short destination");
+        assert_eq!(count, 2);
 
         // An unsupported layout, a non-positive count and a null destination
         // all report no samples.
         assert_eq!(
-            read_vis_buffer(&stereo, 0.0, 1, 3, 0, buffer.as_mut_ptr()),
+            read_vis_buffer(&stereo, 0.0, 1, 3, 0, buffer.as_mut_ptr(), buffer.len())
+                .expect("layout"),
             0
         );
         assert_eq!(
-            read_vis_buffer(&stereo, 0.0, 0, 2, 0, buffer.as_mut_ptr()),
+            read_vis_buffer(&stereo, 0.0, 0, 2, 0, buffer.as_mut_ptr(), buffer.len())
+                .expect("zero count"),
             0
         );
         assert_eq!(
-            read_vis_buffer(&stereo, 0.0, 1, 2, 0, std::ptr::null_mut()),
+            read_vis_buffer(&stereo, 0.0, 1, 2, 0, std::ptr::null_mut(), 0).expect("null dest"),
             0
         );
     }

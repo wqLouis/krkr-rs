@@ -68,11 +68,11 @@
 
 use std::sync::Arc;
 
-use api::error::AudioError;
+use api::error::{AudioError, MediaError};
 use api::media::AudioSpec;
 use compat::{CompatHost, add_audio_decoder, set_sound_render_driven, sound_render};
-use engine::sound::SoundSource;
-use media::{Media, decode_audio};
+use engine::sound::{AudioStream, SoundError, SoundSource};
+use media::{AudioDecoderState, Media, open_audio, read_audio, seek_audio};
 use platform::{AudioDevice, AudioOutputState, PlatformError};
 use vm::VmHost;
 
@@ -164,18 +164,65 @@ fn plan_chunk(dt_ms: f64, carry_frames: f64, max_chunk_ms: f64, rate: f64) -> Ch
     }
 }
 
+/// One game audio stream over the bottom decoder.
+///
+/// `open_audio` probes the container without decoding; this value decodes and
+/// reseeks on demand as [`SoundSource::frame`] drives it.
+struct MediaAudioStream {
+    /// The stateless decode backend.
+    media: Media,
+    /// The decoder state this stream owns across reads and seeks.
+    state: AudioDecoderState,
+    /// The container format reported at open.
+    spec: AudioSpec,
+}
+
+impl AudioStream for MediaAudioStream {
+    fn spec(&self) -> AudioSpec {
+        self.spec
+    }
+
+    fn read(&mut self, out: &mut [f32]) -> Result<usize, SoundError> {
+        match read_audio(&self.media, &mut self.state, out) {
+            Ok(written) => Ok(written),
+            // The decoder reports the end as `EndOfStream`; a zero-sample
+            // read is the end-of-window signal.
+            Err(MediaError::EndOfStream) => Ok(0),
+            Err(error) => Err(SoundError::Decode {
+                message: error.to_string(),
+            }),
+        }
+    }
+
+    fn seek(&mut self, frame: u64) -> Result<(), SoundError> {
+        seek_audio(&self.media, &mut self.state, frame).map_err(|error| SoundError::Decode {
+            message: error.to_string(),
+        })
+    }
+}
+
 /// Install the `media` audio decoder on `host`.
 ///
-/// Call once, before any script runs. The decoder owns a clone of the
-/// stateless [`Media`] backend.
+/// Call once, before any script runs. Opening a sound probes the container
+/// (sample rate, channels, total frames) and installs an incremental decoder;
+/// samples are decoded only as playback reads them. The decoder owns a clone
+/// of the stateless [`Media`] backend and its own explicit
+/// [`AudioDecoderState`].
 pub fn install_audio_decoder(host: &CompatHost, media: &Media) {
     let media = media.clone();
     set_sound_render_driven(host.services(), true);
     add_audio_decoder(
         host.services(),
         Box::new(move |bytes, loops, hint| {
-            let audio = decode_audio(&media, bytes, hint).map_err(|error| error.to_string())?;
-            let source = SoundSource::with_loops(Arc::new(audio), loops)
+            let bytes: Arc<[u8]> = Arc::from(bytes);
+            let (spec, state) =
+                open_audio(&media, bytes, hint).map_err(|error| error.to_string())?;
+            let stream = MediaAudioStream {
+                media: media.clone(),
+                state,
+                spec,
+            };
+            let source = SoundSource::streaming(spec, Box::new(stream), loops)
                 .map_err(|error| error.to_string())?;
             Ok(Arc::new(source))
         }),

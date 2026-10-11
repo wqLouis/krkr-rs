@@ -42,6 +42,7 @@ use tjs::{
 };
 
 use crate::native_util::{args, report_error, set_int, set_void};
+use crate::natives::sound::VisBufferRegistration;
 use crate::natives::system::{resolve, value_as_i64};
 use crate::{CompatCtx, CompatError, CompatServices};
 
@@ -156,11 +157,16 @@ fn mark_use_vis_buffer(host: &Tjs2Engine, objthis: *mut c_void) {
 /// `AsInteger` semantics.
 fn call_get_vis_buffer(
     host: &Tjs2Engine,
+    services: &CompatServices,
     objthis: *mut c_void,
     buffer: *mut i16,
+    buffer_len: usize,
     count: i32,
     aheads: Option<i32>,
 ) -> Result<i64, String> {
+    // Register the caller-owned destination for the duration of the call, so
+    // `getVisBuffer` accepts this address and clamps its write to `buffer_len`.
+    let _registration = VisBufferRegistration::register(services, buffer, buffer_len);
     let object = host.retain_object_detached(objthis)?;
     let mut arguments = vec![
         TjsValue::Integer(buffer as i64),
@@ -224,12 +230,14 @@ extern "C" fn get_sample(
     out: *mut Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
-    let Ok((resolved, _ctx)) = bound(engine) else {
+    let Ok((resolved, ctx)) = bound(engine) else {
         return report_error(
             out_error,
             "WaveSoundBuffer.getSample: compat context is not bound",
         );
     };
+    // SAFETY: the caller resolved `ctx` from the installed binding.
+    let services = unsafe { ctx.services() };
     // SAFETY: argv/argc follow the native-callback ABI for the call.
     let raw = unsafe { args(argv, argc) };
     let count = if let Some(first) = raw.first() {
@@ -242,7 +250,15 @@ extern "C" fn get_sample(
         return 0;
     }
     let mut buffer = vec![0i16; count as usize];
-    match call_get_vis_buffer(resolved.engine(), objthis, buffer.as_mut_ptr(), count, None) {
+    match call_get_vis_buffer(
+        resolved.engine(),
+        services,
+        objthis,
+        buffer.as_mut_ptr(),
+        buffer.len(),
+        count,
+        None,
+    ) {
         Ok(_reported) => {
             set_int(out, average_non_negative(&buffer));
             0
@@ -277,8 +293,10 @@ extern "C" fn sample_value_get(
     // zeroed buffer; reproduce that here.
     let reported = match call_get_vis_buffer(
         host,
+        services,
         objthis,
         buffer.as_mut_ptr(),
+        buffer.len(),
         params.counts,
         Some(params.aheads),
     ) {

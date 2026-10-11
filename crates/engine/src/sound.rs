@@ -4,9 +4,10 @@
 //! `crates/tvp-sound/src/{mixer,source,wavesound,waveflags}.rs`. This is
 //! the **state** half of sound, re-expressed as explicit L2 values:
 //!
-//! * [`SoundSource`] — caller-supplied decoded PCM plus its [`AudioSpec`]
-//!   and optional generic loop information. It owns no decoder; L1 `media`
-//!   produces the buffer and L2 wraps it.
+//! * [`SoundSource`] — a playable PCM source: either caller-supplied
+//!   decoded samples or an [`AudioStream`] that decodes forward as playback
+//!   reads it and reseeks on a backwards read. The stream's own
+//!   [`AudioSpec`] and optional generic loop information travel with it.
 //! * [`SoundChannel`] — one playback voice: play/stop/pause, loop, pan,
 //!   volume/volume2, playback rate, 3D position and linear fades.
 //! * [`SoundBuffer`] — the script-object half: the loaded source, its
@@ -24,11 +25,13 @@
 //!
 //! # Errors
 //!
-//! Invalid PCM/spec values are rejected when a [`SoundSource`] is built, and
-//! an invalid output spec is a typed [`SoundError`] rather than silent
-//! silence. There are no hardcoded chain/size/loop caps.
+//! Invalid PCM/spec values are rejected when a [`SoundSource`] is built, a
+//! decoder failure is a typed [`SoundError`], and an invalid output spec is a
+//! typed [`SoundError`] rather than silent silence. There are no hardcoded
+//! chain/size/loop caps.
 
-use std::sync::Arc;
+use std::fmt;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use api::media::{AudioSpec, DecodedAudio};
 
@@ -73,6 +76,12 @@ pub enum SoundError {
     /// A buffer has no loaded source.
     #[error("sound buffer has no loaded source")]
     NoSource,
+    /// An incremental decoder failed while reading or seeking.
+    #[error("audio decode failed: {message}")]
+    Decode {
+        /// Human-readable description of the failure.
+        message: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -274,18 +283,239 @@ impl Default for LoopFlags {
 // Decoded source
 // ---------------------------------------------------------------------------
 
-/// A playable decoded PCM source: caller-supplied interleaved `f32` samples
-/// plus their [`AudioSpec`] and optional generic loop information.
+/// An incremental, seekable PCM decoder supplied to [`SoundSource::streaming`].
 ///
-/// Construction validates the buffer so the mixer can assume a consistent,
-/// mono-or-stereo source. The value is cheap to clone (the PCM lives behind
-/// an [`Arc`]) and is shared by every channel that plays it.
-#[derive(Debug, Clone)]
+/// The concrete decoder lives in the bottom media layer; the middle layer
+/// owns it and drives it. The stream keeps its own read/seek position:
+/// [`read`](AudioStream::read) continues from where the previous call stopped
+/// and [`seek`](AudioStream::seek) repositions it. The caller holds the value
+/// and calls it with `&mut`, so no decoder state is global or hidden in the
+/// bottom service.
+pub trait AudioStream: Send + Sync {
+    /// The stream's format, including the total frame count when known.
+    fn spec(&self) -> AudioSpec;
+
+    /// Decodes up to `out.len()` interleaved samples from the current position
+    /// into `out`, returning the number of samples written.
+    ///
+    /// The count is a whole number of frames and may be less than `out.len()`
+    /// when the stream ends; `0` marks the end. A decoder failure is a typed
+    /// error, never silence.
+    fn read(&mut self, out: &mut [f32]) -> Result<usize, SoundError>;
+
+    /// Repositions the stream so the next [`Self::read`] starts at `frame`.
+    fn seek(&mut self, frame: u64) -> Result<(), SoundError>;
+}
+
+/// The PCM storage of a [`SoundSource`].
+enum Pcm {
+    /// Fully decoded PCM supplied by the caller.
+    Buffer(Arc<DecodedAudio>),
+    /// An incremental decoder plus the window of frames decoded so far.
+    Stream(Mutex<StreamWindow>),
+}
+
+/// The decoded window an incremental [`SoundSource`] keeps around its cursor.
+struct StreamWindow {
+    /// The caller-owned decoder.
+    stream: Box<dyn AudioStream>,
+    /// Interleaved channel count (1 or 2).
+    channels: usize,
+    /// Decoded interleaved samples for `[start, start + frames)`.
+    samples: Vec<f32>,
+    /// Frame index of `samples[0]`.
+    start: u64,
+    /// Frames to decode per pull.
+    chunk_frames: usize,
+    /// Frames to retain behind the cursor.
+    window_frames: u64,
+    /// Set once `read` reported the end.
+    eof: bool,
+}
+
+impl StreamWindow {
+    fn new(stream: Box<dyn AudioStream>, rate: u32, channels: u16) -> Self {
+        // Decode a quarter second per pull and retain one second, mirroring
+        // the reference's decode-ahead buffer length.
+        let rate = rate.max(1);
+        Self {
+            stream,
+            channels: usize::from(channels),
+            samples: Vec::new(),
+            start: 0,
+            chunk_frames: (rate as usize / 4).max(1),
+            window_frames: u64::from(rate).max(1),
+            eof: false,
+        }
+    }
+
+    /// Number of complete decoded frames in the window.
+    fn frame_count(&self) -> u64 {
+        (self.samples.len() / self.channels) as u64
+    }
+
+    /// One past the last decoded frame.
+    fn end(&self) -> u64 {
+        self.start.saturating_add(self.frame_count())
+    }
+
+    /// Whether `index` is decoded into the window.
+    fn covers(&self, index: u64) -> bool {
+        index >= self.start && index < self.end()
+    }
+
+    /// Decodes another chunk, appending it to the window.
+    fn decode_more(&mut self) -> Result<(), SoundError> {
+        if self.eof {
+            return Ok(());
+        }
+        let start = self.samples.len();
+        self.samples
+            .resize(start + self.chunk_frames * self.channels, 0.0);
+        let written = match self.stream.read(&mut self.samples[start..]) {
+            Ok(written) => written,
+            Err(error) => {
+                self.samples.truncate(start);
+                return Err(error);
+            }
+        };
+        self.samples.truncate(start + written);
+        if written == 0 {
+            self.eof = true;
+        }
+        Ok(())
+    }
+
+    /// Restarts the decoder at `frame`, discarding the decoded window.
+    fn seek_to(&mut self, frame: u64) -> Result<(), SoundError> {
+        self.stream.seek(frame)?;
+        self.samples.clear();
+        self.start = frame;
+        self.eof = false;
+        Ok(())
+    }
+
+    /// Reads `index`, decoding forward or reseeking backwards as needed.
+    fn frame(&mut self, index: u64) -> Result<Option<(f32, f32)>, SoundError> {
+        if index < self.start || index > self.end() {
+            // Backwards: re-decode from the target. Forward gap: reseek
+            // instead of decoding through the skipped frames.
+            self.seek_to(index)?;
+        }
+        while index >= self.end() && !self.eof {
+            self.decode_more()?;
+        }
+        self.trim(index);
+        if !self.covers(index) {
+            return Ok(None);
+        }
+        let offset = usize::try_from(index - self.start).map_err(|_| SoundError::Decode {
+            message: "decoded frame offset does not fit in memory".to_string(),
+        })?;
+        let base = offset
+            .checked_mul(self.channels)
+            .ok_or_else(|| SoundError::Decode {
+                message: "decoded frame offset overflowed".to_string(),
+            })?;
+        let left = *self.samples.get(base).ok_or_else(|| SoundError::Decode {
+            message: "decoded window is shorter than the frame index".to_string(),
+        })?;
+        let right = if self.channels >= 2 {
+            *self
+                .samples
+                .get(base + 1)
+                .ok_or_else(|| SoundError::Decode {
+                    message: "decoded window is shorter than the frame index".to_string(),
+                })?
+        } else {
+            left
+        };
+        Ok(Some((left, right)))
+    }
+
+    /// Drops decoded frames older than the retained window, never dropping
+    /// `index` (the frame about to be read).
+    fn trim(&mut self, index: u64) {
+        let frames = self.frame_count();
+        if frames <= self.window_frames {
+            return;
+        }
+        let keep_from = self.end().saturating_sub(self.window_frames).min(index);
+        if keep_from > self.start {
+            let drop = (keep_from - self.start) as usize;
+            self.samples.drain(..drop * self.channels);
+            self.start = keep_from;
+        }
+    }
+}
+
+/// Locks a stream window, recovering from a poisoned mutex.
+///
+/// No code path panics while the window is locked, so the recovery cannot
+/// expose a half-updated window.
+fn lock_window(window: &Mutex<StreamWindow>) -> MutexGuard<'_, StreamWindow> {
+    window
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Rejects a sample rate or channel count the mixer cannot use.
+fn validate_source_spec(spec: AudioSpec) -> Result<(), SoundError> {
+    if spec.sample_rate == 0 {
+        return Err(SoundError::InvalidSpec {
+            message: "sample rate must be non-zero".to_string(),
+        });
+    }
+    if spec.channels == 0 || spec.channels > 2 {
+        return Err(SoundError::UnsupportedChannels {
+            channels: spec.channels,
+        });
+    }
+    Ok(())
+}
+
+/// Reads one frame out of a fully decoded buffer.
+fn buffer_frame(audio: &DecodedAudio, frame: u64) -> Option<(f32, f32)> {
+    let channels = usize::from(audio.spec.channels);
+    if channels == 0 {
+        return None;
+    }
+    let index = usize::try_from(frame).ok()?.checked_mul(channels)?;
+    let left = *audio.interleaved.get(index)?;
+    let right = if channels >= 2 {
+        *audio.interleaved.get(index + 1)?
+    } else {
+        left
+    };
+    Some((left, right))
+}
+
+/// A playable PCM source: either caller-supplied decoded samples or an
+/// incremental [`AudioStream`] that decodes as playback advances.
+///
+/// Construction validates the format so the mixer can assume a consistent,
+/// mono-or-stereo source. A materialized source holds its decoded buffer; a
+/// streaming source owns the decoder and a bounded window of decoded frames,
+/// decoding forward as [`Self::frame`] is read and reseeking on a backwards
+/// read. The decoder state is this value's own, never a global or a bottom
+/// service cache.
 #[non_exhaustive]
 pub struct SoundSource {
-    audio: Arc<DecodedAudio>,
-    frames: u64,
+    spec: AudioSpec,
+    pcm: Pcm,
     info: Option<LoopInfo>,
+    /// Whole-file PCM, materialized on demand from a streaming source.
+    materialized: OnceLock<DecodedAudio>,
+}
+
+impl fmt::Debug for SoundSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SoundSource")
+            .field("spec", &self.spec)
+            .field("streaming", &self.is_streaming())
+            .field("info", &self.info)
+            .finish_non_exhaustive()
+    }
 }
 
 impl SoundSource {
@@ -302,67 +532,155 @@ impl SoundSource {
         audio: Arc<DecodedAudio>,
         info: Option<LoopInfo>,
     ) -> Result<Self, SoundError> {
-        let spec = audio.spec;
-        if spec.sample_rate == 0 {
-            return Err(SoundError::InvalidSpec {
-                message: "sample rate must be non-zero".to_string(),
-            });
-        }
-        if spec.channels == 0 || spec.channels > 2 {
-            return Err(SoundError::UnsupportedChannels {
-                channels: spec.channels,
-            });
-        }
+        validate_source_spec(audio.spec)?;
         let frames = audio.frame_count();
         let expected = frames
-            .checked_mul(u64::from(spec.channels))
+            .checked_mul(u64::from(audio.spec.channels))
             .and_then(|n| usize::try_from(n).ok());
         if expected != Some(audio.interleaved.len()) {
             return Err(SoundError::InconsistentBuffer {
                 len: audio.interleaved.len(),
                 frames,
-                channels: spec.channels,
+                channels: audio.spec.channels,
             });
         }
+        let spec = AudioSpec {
+            total_frames: Some(frames),
+            ..audio.spec
+        };
         Ok(Self {
-            audio,
-            frames,
+            spec,
+            pcm: Pcm::Buffer(audio),
             info,
+            materialized: OnceLock::new(),
         })
     }
 
-    /// The decoded buffer.
-    pub fn audio(&self) -> &DecodedAudio {
-        &self.audio
+    /// Wrap an incremental [`AudioStream`] that decodes as playback advances.
+    ///
+    /// `spec` comes from the container — including its total frame count when
+    /// the container reports one — so the duration is known without decoding
+    /// the stream. The stream's own [`AudioStream::spec`] must agree on the
+    /// sample rate and channel count. No sample is decoded here.
+    pub fn streaming(
+        spec: AudioSpec,
+        stream: Box<dyn AudioStream>,
+        info: Option<LoopInfo>,
+    ) -> Result<Self, SoundError> {
+        validate_source_spec(spec)?;
+        let stream_spec = stream.spec();
+        if stream_spec.sample_rate != spec.sample_rate || stream_spec.channels != spec.channels {
+            return Err(SoundError::InvalidSpec {
+                message: format!(
+                    "stream format {} Hz/{} ch disagrees with the container's {} Hz/{} ch",
+                    stream_spec.sample_rate, stream_spec.channels, spec.sample_rate, spec.channels
+                ),
+            });
+        }
+        let window = StreamWindow::new(stream, spec.sample_rate, spec.channels);
+        Ok(Self {
+            spec,
+            pcm: Pcm::Stream(Mutex::new(window)),
+            info,
+            materialized: OnceLock::new(),
+        })
     }
 
-    /// The source format, with `total_frames` always filled in.
+    /// The decoded PCM, materializing a streaming source on first access.
+    ///
+    /// A streaming source decodes the whole stream into memory here. The
+    /// phase-vocoder filter chain materializes its input before processing;
+    /// every other path reads frames through [`Self::frame`].
+    pub fn audio(&self) -> &DecodedAudio {
+        match &self.pcm {
+            Pcm::Buffer(audio) => audio,
+            Pcm::Stream(_) => self.materialized.get_or_init(|| {
+                self.decode_entire().unwrap_or_else(|error| {
+                    log::warn!("sound: could not materialize the streaming source: {error}");
+                    DecodedAudio::new(self.spec, Vec::new())
+                })
+            }),
+        }
+    }
+
+    /// Decodes the whole stream into one buffer.
+    ///
+    /// A streaming source is rewound to the beginning and drained; the
+    /// returned buffer is an independent copy. A materialized source returns
+    /// its buffer.
+    ///
+    /// # Errors
+    ///
+    /// A typed [`SoundError::Decode`] when the decoder fails.
+    pub fn decode_entire(&self) -> Result<DecodedAudio, SoundError> {
+        let Pcm::Stream(window) = &self.pcm else {
+            return Ok(self.audio().clone());
+        };
+        let mut window = lock_window(window);
+        window.seek_to(0)?;
+        while !window.eof {
+            window.decode_more()?;
+        }
+        let frames = window.frame_count();
+        let spec = AudioSpec {
+            total_frames: Some(frames),
+            ..self.spec
+        };
+        Ok(DecodedAudio::new(spec, window.samples.clone()))
+    }
+
+    /// Whether this source decodes incrementally instead of holding every
+    /// decoded sample.
+    pub fn is_streaming(&self) -> bool {
+        matches!(&self.pcm, Pcm::Stream(_))
+    }
+
+    /// The source format, with `total_frames` filled in when known.
     pub fn spec(&self) -> AudioSpec {
         AudioSpec {
-            sample_rate: self.audio.spec.sample_rate,
-            channels: self.audio.spec.channels,
-            total_frames: Some(self.frames),
+            total_frames: Some(self.frames()),
+            ..self.spec
         }
     }
 
     /// Samples per second.
     pub fn sample_rate(&self) -> u32 {
-        self.audio.spec.sample_rate
+        self.spec.sample_rate
     }
 
     /// Interleaved channel count (1 or 2).
     pub fn channels(&self) -> u16 {
-        self.audio.spec.channels
+        self.spec.channels
     }
 
     /// Total number of frames.
+    ///
+    /// For a streaming source whose container did not report a length, this is
+    /// the number of frames decoded so far; it reaches the true total once
+    /// playback has decoded to the end.
     pub fn frames(&self) -> u64 {
-        self.frames
+        match self.spec.total_frames {
+            Some(frames) => frames,
+            None => match &self.pcm {
+                Pcm::Buffer(audio) => audio.frame_count(),
+                Pcm::Stream(window) => lock_window(window).frame_count(),
+            },
+        }
     }
 
     /// Whether the source has no frames.
     pub fn is_empty(&self) -> bool {
-        self.frames == 0
+        match self.spec.total_frames {
+            Some(0) => true,
+            Some(_) => false,
+            None => match &self.pcm {
+                Pcm::Buffer(audio) => audio.frame_count() == 0,
+                Pcm::Stream(window) => {
+                    let window = lock_window(window);
+                    window.eof && window.frame_count() == 0
+                }
+            },
+        }
     }
 
     /// Duration in seconds.
@@ -371,7 +689,7 @@ impl SoundSource {
         if rate == 0 {
             0.0
         } else {
-            self.frames as f64 / f64::from(rate)
+            self.frames() as f64 / f64::from(rate)
         }
     }
 
@@ -399,20 +717,19 @@ impl SoundSource {
 
     /// Read one sample frame as `(left, right)` (mono duplicated).
     ///
-    /// Returns `None` past the end.
-    pub fn frame(&self, frame: u64) -> Option<(f32, f32)> {
-        if frame >= self.frames {
-            return None;
+    /// Forward reads decode as needed; a backwards read reseeks and
+    /// re-decodes; a frame at or past the end returns `None`. A decoder
+    /// failure is a typed error, never silence.
+    pub fn frame(&self, frame: u64) -> Result<Option<(f32, f32)>, SoundError> {
+        if let Some(total) = self.spec.total_frames
+            && frame >= total
+        {
+            return Ok(None);
         }
-        let channels = usize::from(self.audio.spec.channels);
-        let index = usize::try_from(frame).ok()?.checked_mul(channels)?;
-        let left = *self.audio.interleaved.get(index)?;
-        let right = if channels >= 2 {
-            *self.audio.interleaved.get(index + 1)?
-        } else {
-            left
-        };
-        Some((left, right))
+        match &self.pcm {
+            Pcm::Buffer(audio) => Ok(buffer_frame(audio, frame)),
+            Pcm::Stream(window) => lock_window(window).frame(frame),
+        }
     }
 
     /// Whether playback at `seconds` has reached or passed the end.
@@ -1179,8 +1496,9 @@ impl Default for MixSettings {
 /// Mix `channels` into `out`, which is first cleared, then clamped to
 /// `-1..=1`.
 ///
-/// The PCM buffers are the caller-supplied sources held by each channel; the
-/// function decodes nothing. [`Mixer::mix`] is the usual entry point.
+/// The PCM buffers are the caller-supplied sources held by each channel; a
+/// streaming source decodes forward as it is read. [`Mixer::mix`] is the usual
+/// entry point.
 pub fn mix(
     channels: &[SoundChannel],
     settings: MixSettings,
@@ -1208,7 +1526,7 @@ pub fn mix(
             channel.pan,
             out,
             out_spec,
-        );
+        )?;
     }
     for sample in out.iter_mut() {
         *sample = sample.clamp(-1.0, 1.0);
@@ -1231,8 +1549,7 @@ pub fn mix_source(
     out_spec: AudioSpec,
 ) -> Result<(), SoundError> {
     validate_out_spec(out_spec)?;
-    accumulate_source(source, position_seconds, rate, gain, pan, out, out_spec);
-    Ok(())
+    accumulate_source(source, position_seconds, rate, gain, pan, out, out_spec)
 }
 
 /// Render one source into `out` without revalidating the output spec.
@@ -1244,9 +1561,9 @@ fn accumulate_source(
     pan: f32,
     out: &mut [f32],
     out_spec: AudioSpec,
-) {
+) -> Result<(), SoundError> {
     if out.is_empty() || gain <= 0.0 {
-        return;
+        return Ok(());
     }
     let out_channels = usize::from(out_spec.channels);
     let out_rate = f64::from(out_spec.sample_rate);
@@ -1264,10 +1581,10 @@ fn accumulate_source(
         let i0 = sample_pos.floor();
         let i0u = i0 as u64;
         let frac = (sample_pos - i0) as f32;
-        let Some((a0, b0)) = source.frame(i0u) else {
+        let Some((a0, b0)) = source.frame(i0u)? else {
             continue;
         };
-        let (a1, b1) = source.frame(i0u.saturating_add(1)).unwrap_or((a0, b0));
+        let (a1, b1) = source.frame(i0u.saturating_add(1))?.unwrap_or((a0, b0));
         let (left, right) = if src_channels == 1 {
             let s = a0 + (a1 - a0) * frac;
             (s, s)
@@ -1281,6 +1598,7 @@ fn accumulate_source(
             frame[1] += right * gain * right_gain;
         }
     }
+    Ok(())
 }
 
 /// Validate an output spec for the mixer.
