@@ -2283,3 +2283,402 @@ pub fn composite_primary_layer(scene: &mut Scene, primary_id: u32) -> Option<u32
     primary.mark_dirty();
     Some(bitmap_id)
 }
+
+/// Whether `layer` has at least one direct child that is itself visible with
+/// nonzero opacity — the reference `GetVisibleChildrenCount`
+/// (`LayerIntf.h:265-268`).
+fn has_visible_child(scene: &Scene, layer: &crate::scene::LayerState) -> bool {
+    layer.children.iter().any(|&child| {
+        scene
+            .layer(child)
+            .is_some_and(|c| c.visible && c.opacity != 0.0)
+    })
+}
+
+/// Product of the opacities from `id` up to (but excluding) `root`.
+///
+/// The subtree root's own opacity is applied by the projection when it draws
+/// the rendered content, so it must not be baked into the cache; a deeper
+/// layer's own opacity and every intermediate ancestor's do belong to the
+/// composited pixels.
+fn subtree_opacity(scene: &Scene, id: u32, root: u32) -> f32 {
+    let mut opacity = 1.0f32;
+    let mut current = Some(id);
+    for _ in 0..1024 {
+        let Some(c) = current else { break };
+        if c == root {
+            break;
+        }
+        let Some(layer) = scene.layer(c) else { break };
+        opacity *= layer.opacity.clamp(0.0, 1.0);
+        current = layer.parent;
+    }
+    opacity
+}
+
+/// Allocate `root`'s subtree cache bitmap at `w` x `h`, reusing the existing
+/// one when its size already matches.
+fn ensure_layer_cache(scene: &mut Scene, root: u32, w: u32, h: u32) -> Option<u32> {
+    if let Some(id) = scene.layer(root)?.cache_bitmap {
+        if scene.bitmap(id).map(|b| (b.width, b.height)) == Some((w, h)) {
+            return Some(id);
+        }
+        scene.remove_bitmap(id);
+    }
+    let bytes = (w as usize).checked_mul(h as usize)?.checked_mul(4)?;
+    let mut rgba = Vec::new();
+    if rgba.try_reserve_exact(bytes).is_err() {
+        return None;
+    }
+    rgba.resize(bytes, 0);
+    let id = scene.add_bitmap(w, h, rgba);
+    scene.layer_mut(root)?.cache_bitmap = Some(id);
+    Some(id)
+}
+
+/// One resolved draw for the subtree cache, with the layer's own placement
+/// (the reference `ImageLeft/Top/Width/Height` transform) and draw face.
+struct SubtreeDraw {
+    source: SubtreeSource,
+    dx: i32,
+    dy: i32,
+    /// Destination size in cache pixels; differs from the source region only
+    /// when the layer scales its image.
+    dw: i32,
+    dh: i32,
+    /// Source region in bitmap pixels.
+    src: RectI,
+    mode: i64,
+    opa: u8,
+    hold_alpha: bool,
+}
+
+/// The pixel source of one subtree draw.
+enum SubtreeSource {
+    Bitmap(BitmapState),
+    Solid([u8; 4]),
+}
+
+/// A `width` x `height` grayscale image (the `dfMask`/`dfProvince` face).
+fn grayscale_bitmap(
+    width: u32,
+    height: u32,
+    value: impl Fn(u32, u32) -> u8,
+) -> Option<BitmapState> {
+    let bytes = (width as usize)
+        .checked_mul(height as usize)?
+        .checked_mul(4)?;
+    let mut rgba = Vec::new();
+    if rgba.try_reserve_exact(bytes).is_err() {
+        return None;
+    }
+    rgba.resize(bytes, 0);
+    for y in 0..height {
+        for x in 0..width {
+            let gray = value(x, y);
+            let i = (y as usize * width as usize + x as usize) * 4;
+            rgba[i] = gray;
+            rgba[i + 1] = gray;
+            rgba[i + 2] = gray;
+            rgba[i + 3] = 255;
+        }
+    }
+    Some(BitmapState::new(width, height, rgba))
+}
+
+/// The image a layer draws for its `face` (`LayerIntf.h:59-67`): the main
+/// image for the ordinary faces, the alpha plane for `dfMask` (`2`) and the
+/// 8-bit province plane for `dfProvince` (`3`).
+fn subtree_source_image(scene: &Scene, layer: &crate::scene::LayerState) -> Option<BitmapState> {
+    match layer.face {
+        2 => {
+            let main = layer.bitmap.and_then(|id| scene.bitmap(id))?;
+            grayscale_bitmap(main.width, main.height, |x, y| {
+                main.pixel_offset(x, y)
+                    .map(|i| main.rgba[i + 3])
+                    .unwrap_or(0)
+            })
+        }
+        3 => {
+            let province = layer.province.as_deref()?;
+            let width = layer.province_width;
+            let height = layer.province_height;
+            grayscale_bitmap(width, height, |x, y| {
+                province
+                    .get(y as usize * width as usize + x as usize)
+                    .copied()
+                    .unwrap_or(0)
+            })
+        }
+        _ => layer.bitmap.and_then(|id| scene.bitmap(id)).cloned(),
+    }
+}
+
+/// Resolve a layer's drawn region in the cache: the source region in bitmap
+/// pixels and the destination rectangle. Honors `ImageLeft/Top/Width/Height`
+/// (the layout transform), the layer rect and `ClipRect`, like the reference
+/// `Draw`/`DrawSelf` placement. `dw`/`dh` differ from the source extent only
+/// when the layer scales its image.
+fn subtree_placement(
+    layer: &crate::scene::LayerState,
+    rel_x: i32,
+    rel_y: i32,
+    bmp_w: u32,
+    bmp_h: u32,
+    w: u32,
+    h: u32,
+) -> Option<(RectI, RectI)> {
+    let img_w = if layer.image_width > 0 {
+        layer.image_width
+    } else {
+        bmp_w
+    };
+    let img_h = if layer.image_height > 0 {
+        layer.image_height
+    } else {
+        bmp_h
+    };
+    if img_w == 0 || img_h == 0 {
+        return None;
+    }
+    let img_x = rel_x.saturating_add(layer.image_left);
+    let img_y = rel_y.saturating_add(layer.image_top);
+    let img_x1 = img_x.saturating_add(img_w as i32);
+    let img_y1 = img_y.saturating_add(img_h as i32);
+    let rect_x1 = rel_x.saturating_add(layer.rect.w as i32);
+    let rect_y1 = rel_y.saturating_add(layer.rect.h as i32);
+    let (clx0, cly0, clx1, cly1) = clip_rect(layer.clip);
+    let dx0 = img_x.saturating_add(clx0).max(img_x).max(rel_x).max(0);
+    let dy0 = img_y.saturating_add(cly0).max(img_y).max(rel_y).max(0);
+    let dx1 = img_x
+        .saturating_add(clx1)
+        .min(img_x1)
+        .min(rect_x1)
+        .min(w as i32);
+    let dy1 = img_y
+        .saturating_add(cly1)
+        .min(img_y1)
+        .min(rect_y1)
+        .min(h as i32);
+    if dx1 <= dx0 || dy1 <= dy0 {
+        return None;
+    }
+    let scale_x = f64::from(bmp_w) / f64::from(img_w);
+    let scale_y = f64::from(bmp_h) / f64::from(img_h);
+    let sx0 = ((f64::from(dx0 - img_x) * scale_x).floor().max(0.0)) as i32;
+    let sy0 = ((f64::from(dy0 - img_y) * scale_y).floor().max(0.0)) as i32;
+    let sx1 = ((f64::from(dx1 - img_x) * scale_x)
+        .ceil()
+        .min(f64::from(bmp_w))) as i32;
+    let sy1 = ((f64::from(dy1 - img_y) * scale_y)
+        .ceil()
+        .min(f64::from(bmp_h))) as i32;
+    if sx1 <= sx0 || sy1 <= sy0 {
+        return None;
+    }
+    Some(((sx0, sy0, sx1, sy1), (dx0, dy0, dx1, dy1)))
+}
+
+/// Resolve the back-to-front draws for `root` and its subtree, relative to
+/// `root`'s origin, using the same `ImageLeft/Top/Width/Height` placement the
+/// render projection applies.
+fn collect_subtree_draws(scene: &Scene, root: u32, w: u32, h: u32) -> Vec<SubtreeDraw> {
+    let Some(root_layer) = scene.layer(root) else {
+        return Vec::new();
+    };
+    let window = root_layer.window;
+    let Some((root_ax, root_ay)) = scene.absolute_offset(root) else {
+        return Vec::new();
+    };
+    let mut draws = Vec::new();
+    for id in scene.window_layer_order(window) {
+        if id != root && !is_descendant(scene, id, root) {
+            continue;
+        }
+        let Some(layer) = scene.layer(id) else {
+            continue;
+        };
+        // The subtree root is rendered even when it is itself invisible: the
+        // reference `InternalComplete2` draws it with `visiblecheck = false`
+        // (`LayerIntf.cpp:7558-7565`). Every other layer is skipped when it
+        // is invisible or fully transparent (the reference `IsSeen`,
+        // `LayerIntf.h:306`).
+        if id != root && !(layer.visible && layer.opacity != 0.0) {
+            continue;
+        }
+        let opacity = subtree_opacity(scene, id, root);
+        let opa = (opacity * 255.0).round().clamp(0.0, 255.0) as u8;
+        if opa == 0 && id != root {
+            continue;
+        }
+        let (ax, ay) = scene.absolute_offset(id).unwrap_or((0, 0));
+        let rel_x = ax.saturating_sub(root_ax);
+        let rel_y = ay.saturating_sub(root_ay);
+        if let Some(source) = subtree_source_image(scene, layer) {
+            if source.width == 0 || source.height == 0 {
+                continue;
+            }
+            let Some((src, dest)) =
+                subtree_placement(layer, rel_x, rel_y, source.width, source.height, w, h)
+            else {
+                continue;
+            };
+            draws.push(SubtreeDraw {
+                source: SubtreeSource::Bitmap(source),
+                dx: dest.0,
+                dy: dest.1,
+                dw: dest.2 - dest.0,
+                dh: dest.3 - dest.1,
+                src,
+                mode: blend_operation_mode(layer.blend),
+                opa,
+                hold_alpha: layer.hold_alpha,
+            });
+        } else if let Some(fill) = layer.fill_color {
+            let dx0 = rel_x.max(0);
+            let dy0 = rel_y.max(0);
+            let dx1 = rel_x.saturating_add(layer.rect.w as i32).min(w as i32);
+            let dy1 = rel_y.saturating_add(layer.rect.h as i32).min(h as i32);
+            if dx1 <= dx0 || dy1 <= dy0 {
+                continue;
+            }
+            draws.push(SubtreeDraw {
+                source: SubtreeSource::Solid(fill),
+                dx: dx0,
+                dy: dy0,
+                dw: dx1 - dx0,
+                dh: dy1 - dy0,
+                src: (0, 0, dx1 - dx0, dy1 - dy0),
+                mode: blend_operation_mode(layer.blend),
+                opa,
+                hold_alpha: layer.hold_alpha,
+            });
+        }
+    }
+    draws
+}
+
+/// Render `root`'s own image and the visible layers of its subtree into the
+/// layer's cache bitmap — the reference `tTJSNI_BaseLayer::Complete`
+/// (`LayerIntf.cpp:7673-7755`). Returns the bitmap to use as the layer's
+/// rendered content:
+///
+/// * the layer's MainImage when the subtree is trivial: no visible direct
+///   child, the image at the origin, and the image size equal to the layer
+///   rect (`LayerIntf.cpp:7718-7725`);
+/// * otherwise the cache bitmap, freshly composited back to front over a
+///   transparent background.
+///
+/// A layer with no MainImage is not a special case: the reference fill is
+/// transparent wherever no child drew (`LayerIntf.cpp:7217-7226`), which the
+/// transparent clear reproduces. Returns `None` for an unknown layer or a
+/// cache that cannot be allocated.
+///
+/// The cache is a plain `BitmapState` in the scene: there is no hidden
+/// registry, and the caller owns its lifetime through
+/// [`Scene::inc_cache_enabled_count`] / [`Scene::dec_cache_enabled_count`].
+pub fn render_layer_subtree(scene: &mut Scene, root: u32) -> Option<u32> {
+    let (bitmap, w, h, trivial) = {
+        let layer = scene.layer(root)?;
+        let w = layer.rect.w.max(1);
+        let h = layer.rect.h.max(1);
+        let main_image_matches_rect = layer
+            .bitmap
+            .and_then(|id| scene.bitmap(id))
+            .is_some_and(|b| b.width == layer.rect.w && b.height == layer.rect.h);
+        let trivial = !has_visible_child(scene, layer)
+            && layer.image_left == 0
+            && layer.image_top == 0
+            && main_image_matches_rect;
+        (layer.bitmap, w, h, trivial)
+    };
+    if trivial {
+        // A cache rendered for an earlier, non-trivial frame is no longer the
+        // layer's content: release it so the projection falls back to the
+        // MainImage (`Complete` returns `MainImage` in this case,
+        // `LayerIntf.cpp:7718-7725`).
+        let stale = scene
+            .layer_mut(root)
+            .and_then(|layer| layer.cache_bitmap.take());
+        if let Some(stale) = stale {
+            scene.release_bitmap(stale);
+        }
+        return bitmap;
+    }
+    let cache = ensure_layer_cache(scene, root, w, h)?;
+    let draws = collect_subtree_draws(scene, root, w, h);
+    let target = scene.bitmap_mut(cache)?;
+    target.rgba.fill(0);
+    let full = (i32::MIN, i32::MIN, i32::MAX, i32::MAX);
+    for draw in &draws {
+        match &draw.source {
+            SubtreeSource::Bitmap(src) => {
+                if draw.dw == src.width as i32 && draw.dh == src.height as i32 {
+                    match draw.mode {
+                        0 => {}
+                        1 if draw.opa == 255 => {
+                            blit_copy_clipped(target, draw.dx, draw.dy, src, draw.src, full);
+                        }
+                        1 | 2 | 13 => blit_over(
+                            target,
+                            draw.dx,
+                            draw.dy,
+                            src,
+                            draw.src,
+                            full,
+                            draw.opa,
+                            false,
+                            draw.hold_alpha,
+                        ),
+                        mode => operate_rect(
+                            target,
+                            draw.dx,
+                            draw.dy,
+                            src,
+                            draw.src,
+                            mode,
+                            draw.opa,
+                            draw.hold_alpha,
+                        ),
+                    }
+                } else {
+                    stretch_blit_mode(
+                        target,
+                        (
+                            draw.dx,
+                            draw.dy,
+                            draw.dx.saturating_add(draw.dw),
+                            draw.dy.saturating_add(draw.dh),
+                        ),
+                        src,
+                        draw.src,
+                        1, // stFastLinear
+                        draw.mode,
+                        draw.opa,
+                        draw.hold_alpha,
+                    );
+                }
+            }
+            SubtreeSource::Solid(color) => {
+                let dest = (
+                    draw.dx,
+                    draw.dy,
+                    draw.dx.saturating_add(draw.dw),
+                    draw.dy.saturating_add(draw.dh),
+                );
+                if let Some((x0, y0, x1, y1)) = intersect(target, dest) {
+                    for y in y0..y1 {
+                        for x in x0..x1 {
+                            if draw.mode != 0 {
+                                blend_pixel_mode(target, x, y, *color, draw.opa, draw.mode);
+                            }
+                        }
+                    }
+                    target.mark_dirty();
+                }
+            }
+        }
+    }
+    target.mark_dirty();
+    Some(cache)
+}

@@ -6,7 +6,7 @@
 use api::blend::BlendMode;
 use engine::BitmapState;
 use engine::Scene;
-use engine::layer_ops::{blur_bitmap_in_place, composite_primary_layer};
+use engine::layer_ops::{blur_bitmap_in_place, composite_primary_layer, render_layer_subtree};
 use engine::raster::fill_rect_replace;
 use engine::scene::Rect;
 
@@ -125,4 +125,114 @@ fn primary_composite_honours_the_layer_blend_mode() {
     let bitmap_id = composite_primary_layer(&mut scene, primary).expect("composite");
     let rgba = &scene.bitmap(bitmap_id).unwrap().rgba;
     assert_eq!(&rgba[..4], &[19, 19, 19, 255]);
+}
+
+/// `render_layer_subtree` returns the layer's MainImage for a trivial subtree
+/// and otherwise composites the layer's own image and its visible children
+/// into a cache bitmap (the reference `Complete`, `LayerIntf.cpp:7673-7755`).
+#[test]
+fn render_layer_subtree_composites_children_into_a_cache() {
+    let mut scene = Scene::default();
+    let win = scene.add_window("t", (2, 2));
+    let parent = scene.add_layer(win, None);
+    scene.layer_mut(parent).unwrap().rect = Rect::new(0, 0, 2, 2);
+    let child = scene.add_layer(win, Some(parent));
+    {
+        let l = scene.layer_mut(child).unwrap();
+        l.rect = Rect::new(0, 0, 2, 2);
+        l.visible = true;
+        l.fill_color = Some([10, 20, 30, 255]);
+    }
+
+    let cache = render_layer_subtree(&mut scene, parent).expect("cache bitmap");
+    {
+        let bitmap = scene.bitmap(cache).unwrap();
+        assert_eq!((bitmap.width, bitmap.height), (2, 2));
+        assert_eq!(&bitmap.rgba[..4], &[10, 20, 30, 255]);
+    }
+
+    // A trivial subtree returns the layer's MainImage and allocates no cache.
+    let mut scene = Scene::default();
+    let win = scene.add_window("t", (2, 2));
+    let layer = scene.add_layer(win, None);
+    let main = scene.add_bitmap(2, 2, vec![7u8; 16]);
+    {
+        let l = scene.layer_mut(layer).unwrap();
+        l.rect = Rect::new(0, 0, 2, 2);
+        l.bitmap = Some(main);
+    }
+    assert_eq!(render_layer_subtree(&mut scene, layer), Some(main));
+    assert!(scene.layer(layer).unwrap().cache_bitmap.is_none());
+}
+
+/// The subtree render applies each child's `ImageLeft/Top/Width/Height`
+/// placement — the reference `DrawSelf`/`CopySelf` transform
+/// (`LayerIntf.cpp:6744-6750`) — so a sprite-sheet frame selected with a
+/// negative `image_left` composites the right pixels.
+#[test]
+fn render_layer_subtree_applies_image_placement() {
+    let mut scene = Scene::default();
+    let win = scene.add_window("t", (2, 2));
+    let parent = scene.add_layer(win, None);
+    scene.layer_mut(parent).unwrap().rect = Rect::new(0, 0, 2, 2);
+    let child = scene.add_layer(win, Some(parent));
+    // A 4x2 sheet: the left half is red, the right half blue.
+    let mut rgba = vec![0u8; 4 * 2 * 4];
+    for y in 0..2 {
+        for x in 0..4usize {
+            let i = (y * 4 + x) * 4;
+            let color = if x < 2 {
+                [255, 0, 0, 255]
+            } else {
+                [0, 0, 255, 255]
+            };
+            rgba[i..i + 4].copy_from_slice(&color);
+        }
+    }
+    let sheet = scene.add_bitmap(4, 2, rgba);
+    {
+        let l = scene.layer_mut(child).unwrap();
+        l.rect = Rect::new(0, 0, 2, 2);
+        l.visible = true;
+        l.bitmap = Some(sheet);
+        l.image_left = -2;
+    }
+    let cache = render_layer_subtree(&mut scene, parent).expect("cache bitmap");
+    let bitmap = scene.bitmap(cache).unwrap();
+    assert_eq!(
+        &bitmap.rgba[..4],
+        &[0, 0, 255, 255],
+        "the right frame is drawn"
+    );
+}
+
+/// `dfMask`/`dfProvince` layers draw their alpha/province plane rather than
+/// the main image (`tTVPDrawFace`, `LayerIntf.h:59-67`; `DrawSelf`,
+/// `LayerIntf.cpp:6721-6793`).
+#[test]
+fn render_layer_subtree_selects_the_layer_face() {
+    let mut scene = Scene::default();
+    let win = scene.add_window("t", (2, 2));
+    let parent = scene.add_layer(win, None);
+    scene.layer_mut(parent).unwrap().rect = Rect::new(0, 0, 2, 2);
+    let child = scene.add_layer(win, Some(parent));
+    let main = scene.add_bitmap(2, 2, vec![9u8; 16]);
+    let province = vec![200u8; 4].into_boxed_slice();
+    {
+        let l = scene.layer_mut(child).unwrap();
+        l.rect = Rect::new(0, 0, 2, 2);
+        l.visible = true;
+        l.bitmap = Some(main);
+        l.province = Some(province);
+        l.province_width = 2;
+        l.province_height = 2;
+        l.face = 3; // dfProvince
+    }
+    let cache = render_layer_subtree(&mut scene, parent).expect("cache bitmap");
+    let bitmap = scene.bitmap(cache).unwrap();
+    assert_eq!(
+        &bitmap.rgba[..4],
+        &[200, 200, 200, 255],
+        "the province plane is drawn"
+    );
 }

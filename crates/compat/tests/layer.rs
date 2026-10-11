@@ -476,8 +476,8 @@ fn extrans_transitions_begin_and_stop() {
     ] {
         env.run(&format!(
             "var w = new Window(); \
-             var a = new Layer(w, null); a.setImageSize(64, 64); \
-             var b = new Layer(w, null); b.setImageSize(64, 64); \
+             var a = new Layer(w, null); a.setImageSize(64, 64); a.setSize(64, 64); \
+             var b = new Layer(w, null); b.setImageSize(64, 64); b.setSize(64, 64); \
              b.beginTransition({name:?}, true, a, %[time: 300]);"
         ));
         env.run("b.stopTransition();");

@@ -460,3 +460,42 @@ fn invisible_parent_hides_its_subtree() {
     assert_eq!(nodes.len(), 1, "an invisible parent hides its subtree");
     assert_eq!(nodes[0].dst, RectF::new(1.0, 1.0, 4.0, 4.0));
 }
+
+/// A layer with an enabled and rendered subtree cache draws that cache and
+/// its descendants are not emitted separately: the cache already contains
+/// them (`InternalComplete2` composites the subtree into `CacheBitmap`,
+/// `LayerIntf.cpp:7156-7226`; `Complete` hands it to the parent,
+/// `:7673-7755`).
+#[test]
+fn cached_layer_draws_its_bitmap_and_hides_its_subtree() {
+    let mut scene = Scene::default();
+    let win = scene.add_window("t", (64, 64));
+    let parent = scene.add_layer(win, None);
+    let cache = scene.add_bitmap(64, 64, vec![0u8; 64 * 64 * 4]);
+    {
+        let l = scene.layer_mut(parent).unwrap();
+        l.rect = full_window_rect(64, 64);
+        l.visible = true;
+        l.cache_enabled_count = 1;
+        l.cache_bitmap = Some(cache);
+    }
+    let child = scene.add_layer(win, Some(parent));
+    {
+        let l = scene.layer_mut(child).unwrap();
+        l.visible = true;
+        l.fill_color = Some([1, 2, 3, 255]);
+        l.rect = Rect::new(0, 0, 8, 8);
+    }
+
+    let projected = project_window(&scene, win, |id| {
+        if id == cache {
+            Some(null_texture(64, 64))
+        } else {
+            None
+        }
+    });
+    let nodes = drawable_nodes(&projected);
+    assert_eq!(nodes.len(), 1, "only the cached layer draws");
+    assert!(matches!(nodes[0].content, RenderContent::Texture(_)));
+    assert_eq!(nodes[0].dst, RectF::new(0.0, 0.0, 64.0, 64.0));
+}

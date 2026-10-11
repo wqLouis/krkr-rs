@@ -187,8 +187,8 @@ impl Env {
 fn two_layers(env: &Env, size: i64) {
     env.run(&format!(
         "var w = new Window(); \
-         var a = new Layer(w, null); a.setImageSize({size}, {size}); \
-         var b = new Layer(w, null); b.setImageSize({size}, {size}); b.visible = true; \
+         var a = new Layer(w, null); a.setSize({size}, {size}); a.setImageSize({size}, {size}); \
+         var b = new Layer(w, null); b.setSize({size}, {size}); b.setImageSize({size}, {size}); b.visible = true; \
          for (var i = 0; i < {size} * {size}; i++) {{ \
              b.setMainPixel(i % {size}, i / {size}, {RED}); \
              a.setMainPixel(i % {size}, i / {size}, {BLUE}); \
@@ -231,6 +231,29 @@ fn blend_rgb(s1: i64, s2: i64, opa: i32) -> i64 {
         out |= (a + (((b - a) * i64::from(opa)) >> 8)) << shift;
     }
     out
+}
+
+/// A scene layer by its script `name`.
+fn named_layer<'a>(env: &'a Env, name: &str) -> &'a engine::LayerState {
+    env._scene
+        .layers
+        .iter()
+        .find(|layer| layer.name == name)
+        .unwrap_or_else(|| panic!("layer {name:?} not found"))
+}
+
+/// The layer's rendered subtree cache (the reference `CacheBitmap`), or
+/// `None` before the first frame and after the teardown.
+fn cache_bitmap_of(env: &Env, name: &str) -> Option<u32> {
+    named_layer(env, name).cache_bitmap
+}
+
+/// The `0xRRGGBB` colour of a scene bitmap at `(x, y)`.
+fn scene_pixel(env: &Env, bitmap: u32, x: u32, y: u32) -> i64 {
+    let bitmap = env._scene.bitmap(bitmap).expect("scene bitmap");
+    let offset = bitmap.pixel_offset(x, y).expect("pixel offset");
+    let px = &bitmap.rgba[offset..offset + 4];
+    (i64::from(px[0]) << 16) | (i64::from(px[1]) << 8) | i64::from(px[2])
 }
 
 // ---------------------------------------------------------------------------
@@ -352,8 +375,8 @@ fn source_size_mismatch_is_rejected_at_begin() {
     let env = Env::new();
     env.run(
         "var w = new Window(); \
-         var a = new Layer(w, null); a.setImageSize(4, 4); \
-         var b = new Layer(w, null); b.setImageSize(2, 2); b.visible = true;",
+         var a = new Layer(w, null); a.setSize(4, 4); a.setImageSize(4, 4); \
+         var b = new Layer(w, null); b.setSize(2, 2); b.setImageSize(2, 2); b.visible = true;",
     );
     let message = env.error("b.beginTransition('crossfade', true, a, %[time: 100]);");
     assert!(
@@ -388,6 +411,168 @@ fn time_below_two_milliseconds_is_raised_to_two() {
         env.advance(1.0);
         assert_eq!(env.eval_int("hits"), 1, "time: {time} completes at 2 ms");
     }
+}
+
+// ---------------------------------------------------------------------------
+// withchildren: the whole-subtree path
+// ---------------------------------------------------------------------------
+
+/// The native member reads `withchildren` from argument index 1: a `void`
+/// (or omitted) argument keeps the default `true`, any other value is its
+/// boolean coercion (`LayerIntf.cpp:9819-9821`). Without children
+/// `StartTransition` requires both endpoints' main images
+/// (`TVPTransitionSourceAndDestinationMustHaveImage`,
+/// `LayerIntf.cpp:7860-7868`); with the default it transitions the layer
+/// trees and does not.
+///
+/// reference/cpp/core/visual/LayerIntf.cpp:9815-9848
+/// reference/cpp/core/visual/LayerIntf.cpp:7860-7868
+#[test]
+fn with_children_is_read_at_argument_one() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    // Both layers have a size but no main image.
+    env.run(
+        "var w = new Window(); \
+         var a = new Layer(w, null); a.setSize(2, 2); a.name = 'src'; \
+         var b = new Layer(w, null); b.setSize(2, 2); b.visible = true; b.name = 'dest';",
+    );
+    for value in ["false", "0"] {
+        let message = env.error(&format!(
+            "b.beginTransition('crossfade', {value}, a, %[time: 100]);"
+        ));
+        assert!(
+            message.contains("must have image"),
+            "withchildren={value} must require the main images, got: {message}"
+        );
+    }
+    // `void` keeps the default `true`; the tree transition is accepted and
+    // the teardown releases the cache consumers.
+    env.run("b.beginTransition('crossfade', void, a, %[time: 100]); b.stopTransition();");
+    assert_eq!(named_layer(&env, "dest").cache_enabled_count, 0);
+}
+
+/// With `withchildren = true` (the default) `StartTransition` transitions the
+/// whole layer tree: caching is enabled on both layers
+/// (`IncCacheEnabledCount`, `LayerIntf.cpp:7869-7876`) and each layer's
+/// content is rendered through `Complete`, which composites the layer's own
+/// image and its children (`LayerIntf.cpp:7673-7755`). A KAG `Sprite` keeps
+/// its content in child layers and has no main image of its own, so the
+/// blend must read the children. The frame is the same linear cross-fade as
+/// the main-image path (`TransIntf.cpp:578-601`).
+///
+/// reference/cpp/core/visual/LayerIntf.cpp:7673-7755
+/// reference/cpp/core/visual/LayerIntf.cpp:7860-7876
+/// reference/cpp/core/visual/TransIntf.cpp:578-601
+#[test]
+fn with_children_blends_the_layer_subtrees() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    // `a` and `b` have no main image; their children hold the red/blue
+    // pixels. `neutralColor` makes `setImageSize` fill the child with opaque
+    // pixels so the child composites into the cache.
+    env.run(
+        "var w = new Window(); \
+         var a = new Layer(w, null); a.setSize(2, 2); a.name = 'src'; \
+         var ac = new Layer(w, a); ac.setSize(2, 2); ac.neutralColor = 0xff0000ff; \
+         ac.setImageSize(2, 2); ac.visible = true; \
+         var b = new Layer(w, null); b.setSize(2, 2); b.visible = true; b.name = 'dest'; \
+         var bc = new Layer(w, b); bc.setSize(2, 2); bc.neutralColor = 0xffff0000; \
+         bc.setImageSize(2, 2); bc.visible = true; \
+         b.beginTransition('crossfade', true, a, %[time: 100]);",
+    );
+    // Caching is enabled on both layers for the transition.
+    assert_eq!(named_layer(&env, "dest").cache_enabled_count, 1);
+    assert_eq!(named_layer(&env, "src").cache_enabled_count, 1);
+
+    env.advance(50.0);
+    let cache = cache_bitmap_of(&env, "dest").expect("destination cache");
+    assert!(cache_bitmap_of(&env, "src").is_some(), "source cache");
+    // 50 ms into a 100 ms cross-fade is phase 128.
+    let expected = blend_rgb(RED, BLUE, 128);
+    for (x, y) in [(0u32, 0u32), (1, 0), (0, 1), (1, 1)] {
+        assert_eq!(
+            scene_pixel(&env, cache, x, y),
+            expected,
+            "destination cache at ({x},{y})"
+        );
+    }
+    // The children keep their own pixels: only the cache holds the blend.
+    assert_eq!(env.eval_int("bc.getMainPixel(0, 0)"), RED);
+    assert_eq!(env.eval_int("ac.getMainPixel(0, 0)"), BLUE);
+
+    // The teardown drops both caches (`DecCacheEnabledCount`,
+    // LayerIntf.cpp:7961-7964).
+    env.run("b.stopTransition();");
+    assert!(
+        cache_bitmap_of(&env, "dest").is_none(),
+        "destination cache freed"
+    );
+    assert!(cache_bitmap_of(&env, "src").is_none(), "source cache freed");
+    assert_eq!(named_layer(&env, "dest").cache_enabled_count, 0);
+    assert_eq!(named_layer(&env, "src").cache_enabled_count, 0);
+}
+
+/// The exact game path (`system/advscreen.tjs:216-217,3353,3719`: the source
+/// is the whole-screen container, whose content lives in child layers and
+/// which has no main image of its own). `withchildren = true` must accept it
+/// — the image requirement applies only without children
+/// (`LayerIntf.cpp:7860-7868`) — and blend the composited child subtrees
+/// through the cache (`LayerIntf.cpp:7869-7876`). Before the fix this call
+/// raised `the transition source has no main image`.
+///
+/// reference/cpp/core/visual/LayerIntf.cpp:7860-7876
+#[test]
+fn container_source_without_image_transitions_its_children() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    // `container` is the transition source: sized, no `setImageSize`, one
+    // visible child (the ADV object). `dest` mirrors it with the other colour.
+    env.run(
+        "var w = new Window(); \
+         var container = new Layer(w, null); container.setSize(2, 2); container.name = 'src'; \
+         var sc = new Layer(w, container); sc.setSize(2, 2); sc.neutralColor = 0xffff0000; \
+         sc.setImageSize(2, 2); sc.visible = true; \
+         var dest = new Layer(w, null); dest.setSize(2, 2); dest.visible = true; dest.name = 'dest'; \
+         var dc = new Layer(w, dest); dc.setSize(2, 2); dc.neutralColor = 0xff0000ff; \
+         dc.setImageSize(2, 2); dc.visible = true; \
+         dest.beginTransition('crossfade', true, container, %[time: 100]);",
+    );
+    env.advance(50.0);
+    let cache = cache_bitmap_of(&env, "dest").expect("destination cache");
+    let expected = blend_rgb(RED, BLUE, 128);
+    for (x, y) in [(0u32, 0u32), (1, 0), (0, 1), (1, 1)] {
+        assert_eq!(
+            scene_pixel(&env, cache, x, y),
+            expected,
+            "destination cache at ({x},{y})"
+        );
+    }
+}
+
+/// The `ttExchange` teardown runs `Exchange` (`LayerIntf.cpp:754-979`),
+/// which re-parents the two layers: when they are not siblings each moves to
+/// the other's parent (`this->Join(target_parent)`, `target->Join(this_parent)`,
+/// `:880-883`), so the destination ends up under the source's old parent.
+///
+/// reference/cpp/core/visual/LayerIntf.cpp:754-979
+#[test]
+fn exchange_reparents_non_sibling_layers() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var p1 = new Layer(w, null); p1.setSize(2, 2); \
+         var p2 = new Layer(w, null); p2.setSize(2, 2); p2.visible = true; \
+         var a = new Layer(w, p1); a.setSize(2, 2); a.name = 'src'; \
+         var ac = new Layer(w, a); ac.setSize(2, 2); ac.setImageSize(2, 2); ac.visible = true; \
+         var b = new Layer(w, p2); b.setSize(2, 2); b.visible = true; b.name = 'dest'; \
+         var bc = new Layer(w, b); bc.setSize(2, 2); bc.setImageSize(2, 2); bc.visible = true; \
+         b.beginTransition('crossfade', true, a, %[time: 100]); \
+         b.stopTransition();",
+    );
+    assert_eq!(env.eval_int("b.parent === p1"), 1, "b moved to a's parent");
+    assert_eq!(env.eval_int("a.parent === p2"), 1, "a moved to b's parent");
 }
 
 // ---------------------------------------------------------------------------
@@ -710,8 +895,8 @@ fn on_transition_completed_is_dispatched_through_the_object() {
              } \
          } \
          var w = new Window(); \
-         var a = new SubLayer(w, null); a.setImageSize(2, 2); \
-         var b = new SubLayer(w, null); b.setImageSize(2, 2); b.visible = true; \
+         var a = new SubLayer(w, null); a.setSize(2, 2); a.setImageSize(2, 2); \
+         var b = new SubLayer(w, null); b.setSize(2, 2); b.setImageSize(2, 2); b.visible = true; \
          b.beginTransition('crossfade', true, a, %[time: 100]);",
     );
     env.advance(100.0);
@@ -901,8 +1086,8 @@ fn extrans_grid(env: &Env, name: &str, options: &str, size: i64) -> String {
 fn extrans_patterned_grid(env: &Env, name: &str, options: &str, size: i64) -> String {
     env.run(&format!(
         "var w = new Window(); \
-         var a = new Layer(w, null); a.setImageSize({size}, {size}); \
-         var b = new Layer(w, null); b.setImageSize({size}, {size}); b.visible = true; \
+         var a = new Layer(w, null); a.setSize({size}, {size}); a.setImageSize({size}, {size}); \
+         var b = new Layer(w, null); b.setSize({size}, {size}); b.setImageSize({size}, {size}); b.visible = true; \
          for (var y = 0; y < {size}; y++) for (var x = 0; x < {size}; x++) {{ \
              b.setMainPixel(x, y, ((x * 16) << 16) | ((y * 16) << 8) | ((x + y) * 8)); \
              a.setMainPixel(x, y, ((({size} - 1 - x) * 16) << 16) | \

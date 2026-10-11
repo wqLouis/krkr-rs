@@ -140,6 +140,15 @@ pub struct LayerState {
     pub use_attention: bool,
     /// Reference `Cached`: request the layer be rendered to a cache.
     pub cached: bool,
+    /// Reference `CacheEnabledCount` (`LayerIntf.h:722`): the number of
+    /// active consumers that require this layer's whole subtree rendered
+    /// into [`Self::cache_bitmap`]. Nonzero makes the projection draw the
+    /// cache in place of the layer's own image and descendants.
+    pub cache_enabled_count: u32,
+    /// The subtree cache allocated while `cache_enabled_count` is nonzero
+    /// (the reference `CacheBitmap`). `None` until the layer first needs
+    /// one; freed with the last [`Scene::dec_cache_enabled_count`].
+    pub cache_bitmap: Option<u32>,
     /// Reference `Hint` (script `layer.hint`) and the hint-system flags.
     pub hint: String,
     /// Reference `ShowParentHint`: inherit the parent's hint.
@@ -463,6 +472,8 @@ impl Scene {
             attention_top: 0,
             use_attention: false,
             cached: false,
+            cache_enabled_count: 0,
+            cache_bitmap: None,
             hint: String::new(),
             show_parent_hint: false,
             ignore_hint_sensing: false,
@@ -803,8 +814,13 @@ impl Scene {
         let Some(layer) = self.layer(id) else {
             return;
         };
-        let (win, parent, font_id, bitmap) =
-            (layer.window, layer.parent, layer.font_id, layer.bitmap);
+        let (win, parent, font_id, bitmap, cache_bitmap) = (
+            layer.window,
+            layer.parent,
+            layer.font_id,
+            layer.bitmap,
+            layer.cache_bitmap,
+        );
         let children = layer.children.clone();
         // `Part()`: sever this layer from its parent (or the window roots).
         if let Some(p) = parent {
@@ -841,6 +857,10 @@ impl Scene {
         // (see [`Scene::release_bitmap`]).
         if let Some(bitmap) = bitmap {
             self.release_bitmap(bitmap);
+        }
+        // The subtree cache is layer-owned too; release it with the layer.
+        if let Some(cache) = cache_bitmap {
+            self.release_bitmap(cache);
         }
         // The removed layer owns its lazily-allocated font; drop it with the
         // layer (a surviving child keeps its own font).
@@ -978,7 +998,7 @@ impl Scene {
             .layers
             .iter()
             .filter(|layer| doomed.contains(&layer.id))
-            .filter_map(|layer| layer.bitmap)
+            .flat_map(|layer| layer.bitmap.into_iter().chain(layer.cache_bitmap))
             .collect();
         // Drop the doomed ids from every surviving layer's child list and
         // focus search state.
@@ -1420,9 +1440,48 @@ impl Scene {
         true
     }
 
-    /// Whether any live layer still references `id` as its MainImage.
+    /// Whether any live layer still references `id` as its MainImage or its
+    /// subtree cache.
     pub fn bitmap_referenced_by_layer(&self, id: u32) -> bool {
-        self.layers.iter().any(|layer| layer.bitmap == Some(id))
+        self.layers
+            .iter()
+            .any(|layer| layer.bitmap == Some(id) || layer.cache_bitmap == Some(id))
+    }
+
+    /// Reference `tTJSNI_BaseLayer::IncCacheEnabledCount`
+    /// (`LayerIntf.cpp:3996`): register one consumer that needs this layer's
+    /// subtree rendered into its cache. The cache bitmap itself is
+    /// allocated by [`crate::layer_ops::render_layer_subtree`] on the first
+    /// render. Returns the new count (`0` for an unknown layer).
+    pub fn inc_cache_enabled_count(&mut self, id: u32) -> u32 {
+        let Some(layer) = self.layer_mut(id) else {
+            return 0;
+        };
+        layer.cache_enabled_count = layer.cache_enabled_count.saturating_add(1);
+        layer.cache_enabled_count
+    }
+
+    /// Reference `tTJSNI_BaseLayer::DecCacheEnabledCount`
+    /// (`LayerIntf.cpp:4008`): release one cache consumer. The cache bitmap
+    /// is freed with the last one. Returns the new count (`0` for an unknown
+    /// layer).
+    pub fn dec_cache_enabled_count(&mut self, id: u32) -> u32 {
+        let count = match self.layer_mut(id) {
+            Some(layer) => {
+                layer.cache_enabled_count = layer.cache_enabled_count.saturating_sub(1);
+                layer.cache_enabled_count
+            }
+            None => return 0,
+        };
+        if count == 0 {
+            let cache = self
+                .layer_mut(id)
+                .and_then(|layer| layer.cache_bitmap.take());
+            if let Some(cache) = cache {
+                self.release_bitmap(cache);
+            }
+        }
+        count
     }
 
     /// Release a bitmap when the last holder is gone.

@@ -25,7 +25,7 @@
 //! is missing (with no solid fill fallback) are skipped, matching
 //! `sync_scene`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use api::blend::BlendMode;
 use api::geometry::{PixelRegion, RectF};
@@ -267,6 +267,10 @@ fn append_window<F>(
     // Maps a layer id to the node its children should link to (its own node
     // when drawn, otherwise its nearest drawn ancestor).
     let mut nearest: HashMap<u32, RenderNodeId> = HashMap::new();
+    // Layers whose subtree is drawn through a cache bitmap: the cached layer
+    // itself once its cache is rendered, and every descendant the cache
+    // already contains.
+    let mut cached_subtree: HashSet<u32> = HashSet::new();
 
     // Why layers produced no node — a scene that renders almost nothing is
     // invisible from the outside (`RUST_LOG=debug` reports it).
@@ -277,6 +281,29 @@ fn append_window<F>(
         let Some(layer) = scene.layer(layer_id) else {
             continue;
         };
+
+        // A cached ancestor already contains this layer's pixels in its
+        // rendered bitmap (`InternalComplete2` draws the subtree into
+        // `CacheBitmap`, `LayerIntf.cpp:7156-7226`), so it contributes no
+        // node of its own. The flag propagates so the whole subtree is
+        // skipped.
+        let ancestor_cached = layer
+            .parent
+            .is_some_and(|parent| cached_subtree.contains(&parent));
+        if ancestor_cached {
+            cached_subtree.insert(layer_id);
+            continue;
+        }
+        // A layer whose cache has been rendered draws that cache instead of
+        // its own image and descendants. A layer that merely enabled caching
+        // but has no cache bitmap yet (its subtree is trivial) draws
+        // normally.
+        let cached_bitmap = layer
+            .cache_bitmap
+            .filter(|_| layer.cache_enabled_count != 0);
+        if cached_bitmap.is_some() {
+            cached_subtree.insert(layer_id);
+        }
 
         let mut node_composed = layer
             .parent
@@ -316,11 +343,11 @@ fn append_window<F>(
             let blend = resolve_blend(layer.blend, opacity);
 
             // A bitmap layer draws its texture; a fill layer draws its solid
-            // colour; a layer with neither draws nothing.
-            let resolved_texture = if let Some(id) = layer.bitmap {
-                texture(id)
-            } else {
-                None
+            // colour; a layer with neither draws nothing. A cached layer
+            // draws its rendered bitmap in place of its MainImage.
+            let resolved_texture = match cached_bitmap.or(layer.bitmap) {
+                Some(id) => texture(id),
+                None => None,
             };
             let content = match resolved_texture {
                 Some(handle) => RenderContent::Texture(handle),
@@ -338,21 +365,37 @@ fn append_window<F>(
             // region.
             let (dst, src) = match &content {
                 RenderContent::Texture(_) => {
-                    let (bmp_w, bmp_h) = bitmap_dims(scene, layer);
-                    let img_w = if layer.image_width > 0 {
-                        layer.image_width
-                    } else {
-                        bmp_w
+                    // The cache is the layer's own rendered content: it draws
+                    // over the whole layer rect with no image placement of its
+                    // own (the reference hands `CacheBitmap` to the parent at
+                    // the layer's rect, `LayerIntf.cpp:7221-7226`).
+                    let (bmp_w, bmp_h) = match cached_bitmap {
+                        Some(id) => scene
+                            .bitmap(id)
+                            .map_or((1, 1), |b| (b.width.max(1), b.height.max(1))),
+                        None => bitmap_dims(scene, layer),
                     };
-                    let img_h = if layer.image_height > 0 {
-                        layer.image_height
-                    } else {
-                        bmp_h
+                    let (image_left, image_top, img_w, img_h) = match cached_bitmap {
+                        Some(_) => (0, 0, bmp_w, bmp_h),
+                        None => (
+                            layer.image_left,
+                            layer.image_top,
+                            if layer.image_width > 0 {
+                                layer.image_width
+                            } else {
+                                bmp_w
+                            },
+                            if layer.image_height > 0 {
+                                layer.image_height
+                            } else {
+                                bmp_h
+                            },
+                        ),
                     };
                     match visible_image_region(
                         node_composed.rect,
-                        layer.image_left,
-                        layer.image_top,
+                        image_left,
+                        image_top,
                         img_w,
                         img_h,
                         bmp_w,
@@ -366,8 +409,8 @@ fn append_window<F>(
                                 "projection: layer {layer_id} clipped away: rect={:?} \
                                  image=({},{}) {}x{} bitmap={}x{} parent={:?}",
                                 node_composed.rect,
-                                layer.image_left,
-                                layer.image_top,
+                                image_left,
+                                image_top,
                                 img_w,
                                 img_h,
                                 bmp_w,

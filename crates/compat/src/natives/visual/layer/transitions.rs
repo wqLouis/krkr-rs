@@ -20,7 +20,7 @@ use std::ffi::{c_char, c_int, c_void};
 
 use engine::Scene;
 use engine::trans::{RuleMask, ScrollFrom, ScrollStay, Trans, TransKind};
-use tjs::{NativeInstanceMethodDef, TjsValue, VAL_OBJECT, Value};
+use tjs::{NativeInstanceMethodDef, TjsValue, VAL_OBJECT, VAL_VOID, Value};
 
 use super::super::bitmap::{decode_image, read_image_from_storage};
 use super::super::common::{
@@ -28,6 +28,7 @@ use super::super::common::{
 };
 use super::{LayerExtras, LayerInst, LayerTransition, bound};
 use crate::native_util::{args, report_error, set_void, value_as_string};
+use crate::natives::system::value_as_bool;
 
 /// `beginTransition(name [, withchildren [, transwith [, options]]])`.
 ///
@@ -41,15 +42,19 @@ use crate::native_util::{args, report_error, set_void, value_as_string};
 ///    (`TVPCurrentTransitionMustBeStopping`, `LayerIntf.cpp:7776-7778`);
 /// 3. a source that is itself transitioning *from this* layer is rejected
 ///    (`TVPTransitionMutualSource`, `LayerIntf.cpp:7779-7781`);
-/// 4. the handler provider parses and validates its options while the
+/// 4. without children both endpoints must have a main image
+///    (`TVPTransitionSourceAndDestinationMustHaveImage`,
+///    `LayerIntf.cpp:7860-7868`), and the two sources' sizes must match
+///    (`LayerIntf.cpp:7837-7850`, checked by the provider);
+/// 5. the handler provider parses and validates its options while the
 ///    script is inside the call (`wave.cpp:327-351`,
-///    `ripple.cpp:1574-1627`, `TransIntf.cpp:512-516`), and rejects
-///    mismatched source sizes (`wave.cpp:319-320`,
-///    `TransIntf.cpp:493-497`).
+///    `ripple.cpp:1574-1627`, `TransIntf.cpp:512-516`).
 ///
 /// `withchildren` (default `true`, `LayerIntf.cpp:9819-9821`) selects the
-/// whole-layer tree in the reference; the port transitions main images
-/// only and accepts the argument without acting on it.
+/// whole layer tree: caching is enabled for both layers
+/// (`LayerIntf.cpp:7869-7876`) and each frame blends the fully rendered
+/// subtrees. Without it the reference requires the main images and blends
+/// those.
 extern "C" fn layer_begin_transition(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -78,6 +83,12 @@ extern "C" fn layer_begin_transition(
     };
     let result: Result<(), String> = (|| {
         let name = value_as_string(&a[0]);
+        // `withchildren` defaults to true; a `void` argument keeps the
+        // default (`LayerIntf.cpp:9819-9821`).
+        let with_children = match a.get(1) {
+            Some(value) if value.ty != VAL_VOID => value_as_bool(value),
+            _ => true,
+        };
         // The transition source is required by the reference
         // (`TVPSpecifyLayer`, LayerIntf.cpp:9828-9841).
         let source = match a.get(2) {
@@ -119,27 +130,38 @@ extern "C" fn layer_begin_transition(
                 );
             }
         }
-        // The destination must still exist; its main image size is the
-        // reference's `src1` (`LayerIntf.cpp:7827-7831`) and seeds the
-        // size-dependent option defaults/checks below.
         let scene = scene_ref(&ctx)?;
-        if scene.layer(id).is_none() {
+        let Some(dest_layer) = scene.layer(id) else {
             return Err("Layer.beginTransition: this layer no longer exists".into());
-        }
-        let dest_size = scene
-            .layer(id)
-            .and_then(|layer| layer.bitmap)
-            .and_then(|bitmap| scene.bitmap(bitmap))
-            .map(|bitmap| (bitmap.width, bitmap.height));
-        // The provider's up-front `src1`/`src2` size check runs before it
-        // parses options (`wave.cpp:319-320`, `TransIntf.cpp:493-497`); a
-        // source with no main image is caught after the provider
-        // (`LayerIntf.cpp:7860-7868`).
-        let source_size = scene
+        };
+        let source_layer = scene
             .layer(source)
-            .and_then(|layer| layer.bitmap)
-            .and_then(|bitmap| scene.bitmap(bitmap))
-            .map(|bitmap| (bitmap.width, bitmap.height));
+            .ok_or_else(|| "Layer.beginTransition: transwith is not a Layer".to_string())?;
+        // The provider receives `src1`/`src2` sizes: the layer rects when
+        // the whole subtree is transitioned, the MainImage sizes otherwise
+        // (`LayerIntf.cpp:7837-7851`).
+        let (dest_size, source_size) = if with_children {
+            (
+                Some((dest_layer.rect.w, dest_layer.rect.h)),
+                Some((source_layer.rect.w, source_layer.rect.h)),
+            )
+        } else {
+            (
+                main_image_size(scene, dest_layer),
+                main_image_size(scene, source_layer),
+            )
+        };
+        // Without children both endpoints must have a main image
+        // (`TVPTransitionSourceAndDestinationMustHaveImage`,
+        // `LayerIntf.cpp:7860-7868`); with children the subtree is cached
+        // instead.
+        if !with_children && (dest_layer.bitmap.is_none() || source_layer.bitmap.is_none()) {
+            return Err(
+                "Layer.beginTransition: Transition source and destination must have image".into(),
+            );
+        }
+        // The provider's up-front `src1`/`src2` size check runs before it
+        // parses options (`wave.cpp:319-320`, `TransIntf.cpp:493-497`).
         if let (Some(dest_size), Some(source_size)) = (dest_size, source_size)
             && dest_size != source_size
         {
@@ -151,23 +173,24 @@ extern "C" fn layer_begin_transition(
         }
         let duration = options_duration(host.engine(), a.get(3)).unwrap_or(300.0);
         let trans = build_transition(&ctx, host.engine(), &name, duration, a.get(3), dest_size)?;
-        // The source must exist and have a main image (it is composited
-        // into this layer during the transition).
-        {
-            let source_layer = scene
-                .layer(source)
-                .ok_or_else(|| "Layer.beginTransition: transwith is not a Layer".to_string())?;
-            if source_layer.bitmap.is_none() {
-                return Err(
-                    "Layer.beginTransition: the transition source has no main image".into(),
-                );
-            }
+        // Caching is enabled for both layers while a whole-subtree
+        // transition runs (`LayerIntf.cpp:7869-7876`); the frame step
+        // renders each subtree into its cache.
+        if with_children {
+            let scene = scene_mut(&ctx)?;
+            scene.inc_cache_enabled_count(id);
+            scene.inc_cache_enabled_count(source);
         }
         // SAFETY: the caller resolved `ctx` from the installed binding.
         let mut extras = unsafe { ctx.services() }.state::<LayerExtras>();
-        extras
-            .transitions
-            .insert(id, LayerTransition { trans, source });
+        extras.transitions.insert(
+            id,
+            LayerTransition {
+                trans,
+                source,
+                with_children,
+            },
+        );
         Ok(())
     })();
     match result {
@@ -233,6 +256,14 @@ extern "C" fn layer_stop_transition(
     }
     set_void(out);
     0
+}
+
+/// A layer's main-image size in pixels, or `None` when it has no image.
+fn main_image_size(scene: &Scene, layer: &engine::LayerState) -> Option<(u32, u32)> {
+    layer
+        .bitmap
+        .and_then(|bitmap| scene.bitmap(bitmap))
+        .map(|bitmap| (bitmap.width, bitmap.height))
 }
 
 /// Build the L2 transition for a script name.
@@ -649,19 +680,19 @@ fn object_alive(ctx: &crate::CompatCtx, kind: ObjectKind, id: u32) -> bool {
 /// processes the transition in the same pre-draw step.
 pub fn advance_transitions(ctx: &crate::CompatCtx, dt_ms: f64) -> Result<(), String> {
     super::paint_poll(ctx)?;
-    let active: Vec<(u32, u32)> = {
+    let active: Vec<(u32, u32, bool)> = {
         // SAFETY: the caller resolved `ctx` from the installed binding.
         let services = unsafe { ctx.services() };
         services
             .state::<LayerExtras>()
             .transitions
             .iter()
-            .map(|(&id, entry)| (id, entry.source))
+            .map(|(&id, entry)| (id, entry.source, entry.with_children))
             .collect()
     };
     // `(destination, source, fire_event)`.
     let mut ended: Vec<(u32, u32, bool)> = Vec::new();
-    for (id, source) in active {
+    for (id, source, with_children) in active {
         // A dead endpoint tears the transition down without the event: both
         // the destination's `Owner` and the source's `Shutdown` gate the
         // dispatch (LayerIntf.cpp:7997-8004).
@@ -690,7 +721,7 @@ pub fn advance_transitions(ctx: &crate::CompatCtx, dt_ms: f64) -> Result<(), Str
             // `Process` write into the destination the reference performs
             // per tick; no per-frame clone of the transition (or its rule
             // image) is needed.
-            composite_transition(ctx, id, source, &entry.trans)?;
+            composite_transition(ctx, id, source, &entry.trans, with_children)?;
             done
         };
         if done {
@@ -719,32 +750,44 @@ fn end_transition(ctx: &crate::CompatCtx, dest: u32, source: u32, event: bool) {
         .state::<LayerExtras>()
         .transitions
         .remove(&dest);
-    if removed.is_none() {
+    let Some(entry) = removed else {
         // `InternalStopTransition` only acts while `InTransition`
         // (LayerIntf.cpp:7950).
         log::debug!("Layer.end_transition: layer {dest} had no active transition");
         return;
+    };
+    // A whole-subtree transition disabled caching on both layers and releases
+    // the caches here (`DecCacheEnabledCount`, LayerIntf.cpp:7961-7964),
+    // before the exchange.
+    if entry.with_children
+        && let Ok(scene) = scene_mut(ctx)
+    {
+        scene.dec_cache_enabled_count(dest);
+        scene.dec_cache_enabled_count(source);
     }
     // The exchange happens before the event gate in the reference
     // (LayerIntf.cpp:7969-7991 vs `:7997`), so a handler observes the
-    // exchanged layers.
+    // exchanged layers. `InternalStopTransition` uses `Exchange` when the
+    // transition ran with children and `Swap` (which also exchanges the
+    // layers' direct children) otherwise (`:7969-7987`).
     // SAFETY: see above.
     if let Ok(scene) = scene_mut(ctx) {
-        exchange_layers(scene, dest, source);
+        exchange_layers(scene, dest, source, !entry.with_children);
     }
     if event {
         dispatch_transition_completed(ctx, dest, source);
     }
 }
 
-/// The `ttExchange` teardown of `InternalStopTransition`
-/// (`reference/cpp/core/visual/LayerIntf.cpp:7969-7991`): the destination
-/// and source layers exchange position (`SetPosition`, `:7988-7989`),
-/// visibility (`:7990-7991`) and sibling order (the `Exchange` order-index
-/// swap, `:961-977`; layers without a parent keep their window order).
-/// The port transitions main images only, so the tree re-parenting of
-/// `Exchange` (`:754-979`) is not modelled.
-fn exchange_layers(scene: &mut Scene, dest: u32, source: u32) {
+/// The reference `tTJSNI_BaseLayer::Exchange` (`LayerIntf.cpp:754-979`) as
+/// the `ttExchange` teardown uses it (`:7969-7991`): the two layers trade
+/// places in the tree — parent, sibling order and primary slot — and then
+/// the teardown swaps their position and visibility (`SetPosition`,
+/// `:7988-7989`; `SetVisible`, `:7990-7991`). `swap_children` selects the
+/// `Swap` form (`:260-263`), which also exchanges the layers' direct
+/// children; `InternalStopTransition` uses it when the transition ran
+/// without children (`:7969-7987`).
+fn exchange_layers(scene: &mut Scene, dest: u32, source: u32, swap_children: bool) {
     if dest == source {
         return;
     }
@@ -763,13 +806,84 @@ fn exchange_layers(scene: &mut Scene, dest: u32, source: u32) {
         source_layer.visible,
         source_layer.z_order,
     );
-    if dest_x == source_x
-        && dest_y == source_y
-        && dest_visible == source_visible
-        && dest_order == source_order
-    {
-        return;
+    let dest_parent = dest_layer.parent;
+    let source_parent = source_layer.parent;
+    let dest_window = dest_layer.window;
+    let source_window = source_layer.window;
+    let dest_primary = dest_layer.is_primary;
+    let source_primary = source_layer.is_primary;
+    let dest_children = dest_layer.children.clone();
+    let source_children = source_layer.children.clone();
+    let dest_index = child_index(scene, dest);
+    let source_index = child_index(scene, source);
+    let dest_ancestor = ancestor_child(scene, dest, source);
+    let source_ancestor = ancestor_child(scene, source, dest);
+
+    if dest_parent == source_parent {
+        // Siblings: the shared parent's child list is the render order, so
+        // swapping the two entries reproduces `SetOrderIndex` exactly.
+        if let Some(parent) = dest_parent {
+            if let Some(layer) = scene.layer_mut(parent) {
+                let i = layer.children.iter().position(|&child| child == dest);
+                let j = layer.children.iter().position(|&child| child == source);
+                if let (Some(i), Some(j)) = (i, j) {
+                    layer.children.swap(i, j);
+                }
+            }
+        } else if dest_window == source_window
+            && let Some(window) = scene.window_mut(dest_window)
+        {
+            let i = window.layers.iter().position(|&child| child == dest);
+            let j = window.layers.iter().position(|&child| child == source);
+            if let (Some(i), Some(j)) = (i, j) {
+                window.layers.swap(i, j);
+            }
+        }
+    } else {
+        detach_layer(scene, dest);
+        detach_layer(scene, source);
+        // An ancestor exchange detaches the intermediate layer so the
+        // subtree can change place (`LayerIntf.cpp:790-909`).
+        let intermediate = dest_ancestor.or(source_ancestor);
+        if let Some(intermediate) = intermediate {
+            detach_layer(scene, intermediate);
+        }
+        match (dest_ancestor, source_ancestor) {
+            (Some(intermediate), None) => {
+                // `dest` is a descendant of `source`.
+                let source_join = if dest_parent == Some(source) {
+                    Some(dest)
+                } else {
+                    dest_parent
+                };
+                insert_layer(scene, dest, source_parent, source_index);
+                insert_layer(scene, source, source_join, dest_index);
+                if intermediate != dest {
+                    insert_layer(scene, intermediate, Some(dest), None);
+                }
+            }
+            (None, Some(intermediate)) => {
+                // `source` is a descendant of `dest`.
+                let dest_join = if source_parent == Some(dest) {
+                    Some(source)
+                } else {
+                    source_parent
+                };
+                insert_layer(scene, dest, dest_join, source_index);
+                insert_layer(scene, source, dest_parent, dest_index);
+                if intermediate != source {
+                    insert_layer(scene, intermediate, Some(source), None);
+                }
+            }
+            _ => {
+                insert_layer(scene, dest, source_parent, source_index);
+                insert_layer(scene, source, dest_parent, dest_index);
+            }
+        }
     }
+
+    // `SetPosition`/`SetVisible` (`LayerIntf.cpp:7988-7991`) and the sibling
+    // order (`SetOrderIndex`, `:961-977`).
     if let Some(layer) = scene.layer_mut(dest) {
         layer.rect.x = source_x;
         layer.rect.y = source_y;
@@ -782,6 +896,126 @@ fn exchange_layers(scene: &mut Scene, dest: u32, source: u32) {
         layer.visible = dest_visible;
         layer.z_order = dest_order;
     }
+
+    // The primary slot follows the layer (`DetachPrimary`/`AttachPrimary`,
+    // `LayerIntf.cpp:800-822`).
+    if dest_primary && let Some(window) = scene.window_mut(dest_window) {
+        window.primary_layer = Some(source);
+    }
+    if source_primary && let Some(window) = scene.window_mut(source_window) {
+        window.primary_layer = Some(dest);
+    }
+    if let Some(layer) = scene.layer_mut(dest) {
+        layer.is_primary = source_primary;
+    }
+    if let Some(layer) = scene.layer_mut(source) {
+        layer.is_primary = dest_primary;
+    }
+
+    // The `Swap` form also exchanges the layers' direct children
+    // (`LayerIntf.cpp:817-909`).
+    if swap_children {
+        if let Some(layer) = scene.layer_mut(dest) {
+            layer.children.clone_from(&source_children);
+        }
+        if let Some(layer) = scene.layer_mut(source) {
+            layer.children.clone_from(&dest_children);
+        }
+        for &child in &source_children {
+            if let Some(layer) = scene.layer_mut(child) {
+                layer.parent = Some(dest);
+            }
+        }
+        for &child in &dest_children {
+            if let Some(layer) = scene.layer_mut(child) {
+                layer.parent = Some(source);
+            }
+        }
+    }
+}
+
+/// The index of `id` in its parent's child list (or its window's root list).
+fn child_index(scene: &Scene, id: u32) -> Option<usize> {
+    let layer = scene.layer(id)?;
+    match layer.parent {
+        Some(parent) => scene
+            .layer(parent)?
+            .children
+            .iter()
+            .position(|&child| child == id),
+        None => scene
+            .window(layer.window)?
+            .layers
+            .iter()
+            .position(|&child| child == id),
+    }
+}
+
+/// Remove `id` from its parent's child list (or its window's root list).
+fn detach_layer(scene: &mut Scene, id: u32) {
+    let (parent, window) = match scene.layer(id) {
+        Some(layer) => (layer.parent, layer.window),
+        None => return,
+    };
+    match parent {
+        Some(parent) => {
+            if let Some(layer) = scene.layer_mut(parent) {
+                layer.children.retain(|&child| child != id);
+            }
+        }
+        None => {
+            if let Some(window) = scene.window_mut(window) {
+                window.layers.retain(|&child| child != id);
+            }
+        }
+    }
+    if let Some(layer) = scene.layer_mut(id) {
+        layer.parent = None;
+    }
+}
+
+/// Insert `id` under `parent` (or the window root list) at `index`.
+fn insert_layer(scene: &mut Scene, id: u32, parent: Option<u32>, index: Option<usize>) {
+    if let Some(layer) = scene.layer_mut(id) {
+        layer.parent = parent;
+    }
+    match parent {
+        Some(parent) => {
+            if let Some(layer) = scene.layer_mut(parent) {
+                let index = index
+                    .unwrap_or(layer.children.len())
+                    .min(layer.children.len());
+                layer.children.insert(index, id);
+            }
+        }
+        None => {
+            let window = scene.layer(id).map(|layer| layer.window);
+            if let Some(window) = window
+                && let Some(state) = scene.window_mut(window)
+            {
+                let index = index.unwrap_or(state.layers.len()).min(state.layers.len());
+                state.layers.insert(index, id);
+            }
+        }
+    }
+}
+
+/// The child of `ancestor` on the path down to `id`, or `None` when `id` is
+/// not a proper descendant of `ancestor`.
+fn ancestor_child(scene: &Scene, id: u32, ancestor: u32) -> Option<u32> {
+    if id == ancestor {
+        return None;
+    }
+    let mut child = id;
+    let mut current = scene.layer(id)?.parent;
+    while let Some(parent) = current {
+        if parent == ancestor {
+            return Some(child);
+        }
+        child = parent;
+        current = scene.layer(parent)?.parent;
+    }
+    None
 }
 
 /// Fire `onTransitionCompleted(dest, src)` on the destination layer object.
@@ -833,35 +1067,71 @@ fn dispatch_transition_completed(ctx: &crate::CompatCtx, dest: u32, src: u32) {
 
 /// Render one transition frame into the destination layer's image.
 ///
-/// `src1` is the destination's own current image and `src2` the `transwith`
-/// layer's, exactly as the reference captures them in `StartTransition`.
-/// Both sources are cloned before the destination is borrowed mutably — the
-/// same read-source/write-destination shape the rest of the L3 pixel natives
-/// use (`Layer.copyRect` and friends).
+/// Without children, `src1` is the destination's own MainImage and `src2`
+/// the `transwith` layer's, exactly as the reference captures them in
+/// `StartTransition`. With children, each endpoint is first rendered into
+/// its subtree cache — the reference `Complete` (`LayerIntf.cpp:7673-7755`)
+/// — and the blend is written back into the destination's cache, which the
+/// projection draws in place of the subtree.
 ///
-/// A layer with no image simply does not composite; the timing still runs,
-/// matching a reference layer whose image contributes nothing.
+/// Sources are cloned before the destination is borrowed mutably — the same
+/// read-source/write-destination shape the rest of the L3 pixel natives use
+/// (`Layer.copyRect` and friends).
 fn composite_transition(
     ctx: &crate::CompatCtx,
     id: u32,
     source: u32,
     trans: &Trans,
+    with_children: bool,
 ) -> Result<(), String> {
     let scene = scene_mut(ctx)?;
+    if with_children {
+        // `render_layer_subtree` returns the MainImage for a trivial subtree
+        // and the cache otherwise; blending back into that bitmap leaves the
+        // destination holding the current transition frame.
+        let dst_render = engine::layer_ops::render_layer_subtree(scene, id).ok_or_else(|| {
+            "Layer.beginTransition: cannot render the destination subtree".to_string()
+        })?;
+        let src_render =
+            engine::layer_ops::render_layer_subtree(scene, source).ok_or_else(|| {
+                "Layer.beginTransition: cannot render the transition source subtree".to_string()
+            })?;
+        let (Some(src1), Some(src2)) = (
+            scene.bitmap(dst_render).cloned(),
+            scene.bitmap(src_render).cloned(),
+        ) else {
+            return Err(
+                "Layer.beginTransition: the transition cache bitmap is missing".to_string(),
+            );
+        };
+        let Some(dst) = scene.bitmap_mut(dst_render) else {
+            return Err(
+                "Layer.beginTransition: the transition destination bitmap is missing".to_string(),
+            );
+        };
+        let region = Trans::full_region(dst);
+        return trans
+            .apply(dst, &src1, &src2, region)
+            .map_err(|error| error.to_string());
+    }
     let (Some(dst_layer), Some(src_layer)) = (scene.layer(id), scene.layer(source)) else {
-        return Ok(());
+        return Err("Layer.beginTransition: the transition layer no longer exists".to_string());
     };
     let (Some(dst_id), Some(src2_id)) = (dst_layer.bitmap, src_layer.bitmap) else {
-        return Ok(());
+        return Err(
+            "Layer.beginTransition: Transition source and destination must have image".to_string(),
+        );
     };
     let (Some(src1), Some(src2)) = (
         scene.bitmap(dst_id).cloned(),
         scene.bitmap(src2_id).cloned(),
     ) else {
-        return Ok(());
+        return Err("Layer.beginTransition: a transition main image is missing".to_string());
     };
     let Some(dst) = scene.bitmap_mut(dst_id) else {
-        return Ok(());
+        return Err(
+            "Layer.beginTransition: the transition destination bitmap is missing".to_string(),
+        );
     };
     let region = Trans::full_region(dst);
     trans

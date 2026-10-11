@@ -55,6 +55,10 @@ struct LayerTransition {
     /// The `transwith` layer the destination is being blended into (the
     /// reference's transition source).
     source: u32,
+    /// Reference `TransWithChildren` (`LayerIntf.cpp:7872`): the transition
+    /// blends the destination's and source's whole subtrees rather than
+    /// their MainImages.
+    with_children: bool,
 }
 
 #[derive(Default)]
