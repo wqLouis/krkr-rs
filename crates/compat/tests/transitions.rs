@@ -469,16 +469,20 @@ fn with_children_blends_the_layer_subtrees() {
     let _lock = vm_lock();
     let env = Env::new();
     // `a` and `b` have no main image; their children hold the red/blue
-    // pixels. `neutralColor` makes `setImageSize` fill the child with opaque
-    // pixels so the child composites into the cache.
+    // pixels. A fresh layer already has the reference's 32x32
+    // transparent-white image, and `setImageSize` fills only the region it
+    // expands, so shrinking to 2x2 keeps those default pixels; the children
+    // are painted opaque with `fillRect`
+    // (`LayerIntf.cpp:108-110`, `LayerBitmapIntf.cpp:122-160`,
+    // `LayerIntf.cpp:4272-4285`).
     env.run(
         "var w = new Window(); \
          var a = new Layer(w, null); a.setSize(2, 2); a.name = 'src'; a.hasImage = false; \
-         var ac = new Layer(w, a); ac.setSize(2, 2); ac.neutralColor = 0xff0000ff; \
-         ac.setImageSize(2, 2); ac.visible = true; \
+         var ac = new Layer(w, a); ac.setSize(2, 2); ac.setImageSize(2, 2); \
+         ac.fillRect(0, 0, 2, 2, 0xff0000ff); ac.visible = true; \
          var b = new Layer(w, null); b.setSize(2, 2); b.visible = true; b.name = 'dest'; b.hasImage = false; \
-         var bc = new Layer(w, b); bc.setSize(2, 2); bc.neutralColor = 0xffff0000; \
-         bc.setImageSize(2, 2); bc.visible = true; \
+         var bc = new Layer(w, b); bc.setSize(2, 2); bc.setImageSize(2, 2); \
+         bc.fillRect(0, 0, 2, 2, 0xffff0000); bc.visible = true; \
          b.beginTransition('crossfade', true, a, %[time: 100]);",
     );
     // Caching is enabled on both layers for the transition.
@@ -513,6 +517,92 @@ fn with_children_blends_the_layer_subtrees() {
     assert_eq!(named_layer(&env, "src").cache_enabled_count, 0);
 }
 
+/// A whole-subtree transition composites each endpoint once and reuses the
+/// content while it is unchanged: `Complete` returns the existing
+/// `CacheBitmap` while `CacheRecalcRegion` is empty, and the transition's
+/// `tempupdate` update never appends to it.
+///
+/// reference/cpp/core/visual/LayerIntf.cpp:7734-7737
+/// reference/cpp/core/visual/LayerIntf.cpp:6305-6335
+#[test]
+fn with_children_reuses_the_subtree_content_between_frames() {
+    let _lock = vm_lock();
+    let mut env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var a = new Layer(w, null); a.setSize(2, 2); a.name = 'src'; a.hasImage = false; \
+         var ac = new Layer(w, a); ac.setSize(2, 2); ac.setImageSize(2, 2); \
+         ac.fillRect(0, 0, 2, 2, 0xff0000ff); ac.visible = true; \
+         var b = new Layer(w, null); b.setSize(2, 2); b.visible = true; b.name = 'dest'; b.hasImage = false; \
+         var bc = new Layer(w, b); bc.setSize(2, 2); bc.setImageSize(2, 2); \
+         bc.fillRect(0, 0, 2, 2, 0xffff0000); bc.visible = true; \
+         b.beginTransition('crossfade', true, a, %[time: 100]);",
+    );
+    env.advance(25.0);
+    let dest_content = named_layer(&env, "dest")
+        .cache_content
+        .expect("destination content");
+    let src_content = named_layer(&env, "src")
+        .cache_content
+        .expect("source content");
+    // Clear the render-dirty flags: a reused cache is not re-marked dirty.
+    env._scene.set_bitmap_clean(dest_content);
+    env._scene.set_bitmap_clean(src_content);
+    env.advance(25.0);
+    assert!(
+        !env._scene.bitmap(dest_content).unwrap().dirty,
+        "the destination subtree content is reused, not recomposited"
+    );
+    assert!(
+        !env._scene.bitmap(src_content).unwrap().dirty,
+        "the source subtree content is reused, not recomposited"
+    );
+    // The blend still advances: 50 ms into a 100 ms cross-fade is phase 128.
+    let display = named_layer(&env, "dest")
+        .cache_bitmap
+        .expect("destination frame");
+    assert_eq!(scene_pixel(&env, display, 0, 0), blend_rgb(RED, BLUE, 128));
+}
+
+/// A mid-transition change to a drawn child invalidates the cached content:
+/// the next frame recomposites it before blending.
+///
+/// reference/cpp/core/visual/LayerIntf.cpp:6305-6335
+#[test]
+fn with_children_rebuilds_when_a_drawn_child_changes() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var a = new Layer(w, null); a.setSize(2, 2); a.name = 'src'; a.hasImage = false; \
+         var ac = new Layer(w, a); ac.setSize(2, 2); ac.setImageSize(2, 2); \
+         ac.fillRect(0, 0, 2, 2, 0xff0000ff); ac.visible = true; \
+         var b = new Layer(w, null); b.setSize(2, 2); b.visible = true; b.name = 'dest'; b.hasImage = false; \
+         var bc = new Layer(w, b); bc.setSize(2, 2); bc.setImageSize(2, 2); \
+         bc.fillRect(0, 0, 2, 2, 0xffff0000); bc.visible = true; \
+         b.beginTransition('crossfade', true, a, %[time: 100]);",
+    );
+    env.advance(25.0);
+    let dest_content = named_layer(&env, "dest")
+        .cache_content
+        .expect("destination content");
+    assert_eq!(scene_pixel(&env, dest_content, 0, 0), RED);
+    env.run("bc.setMainPixel(0, 0, 0x0000ff00);");
+    env.advance(25.0);
+    assert_eq!(
+        scene_pixel(&env, dest_content, 0, 0),
+        0x00ff00,
+        "the changed child is recomposited"
+    );
+    let display = named_layer(&env, "dest")
+        .cache_bitmap
+        .expect("destination frame");
+    assert_eq!(
+        scene_pixel(&env, display, 0, 0),
+        blend_rgb(0x00ff00, BLUE, 128)
+    );
+}
+
 /// The exact game path (`system/advscreen.tjs:216-217,3353,3719`: the source
 /// is the whole-screen container, whose content lives in child layers and
 /// which has no main image of its own). `withchildren = true` must accept it
@@ -531,11 +621,11 @@ fn container_source_without_image_transitions_its_children() {
     env.run(
         "var w = new Window(); \
          var container = new Layer(w, null); container.setSize(2, 2); container.name = 'src'; container.hasImage = false; \
-         var sc = new Layer(w, container); sc.setSize(2, 2); sc.neutralColor = 0xffff0000; \
-         sc.setImageSize(2, 2); sc.visible = true; \
+         var sc = new Layer(w, container); sc.setSize(2, 2); sc.setImageSize(2, 2); \
+         sc.fillRect(0, 0, 2, 2, 0xffff0000); sc.visible = true; \
          var dest = new Layer(w, null); dest.setSize(2, 2); dest.visible = true; dest.name = 'dest'; dest.hasImage = false; \
-         var dc = new Layer(w, dest); dc.setSize(2, 2); dc.neutralColor = 0xff0000ff; \
-         dc.setImageSize(2, 2); dc.visible = true; \
+         var dc = new Layer(w, dest); dc.setSize(2, 2); dc.setImageSize(2, 2); \
+         dc.fillRect(0, 0, 2, 2, 0xff0000ff); dc.visible = true; \
          dest.beginTransition('crossfade', true, container, %[time: 100]);",
     );
     env.advance(50.0);
