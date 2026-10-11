@@ -59,6 +59,70 @@ fn dispatch_delivers_pointer_events_to_the_hit_layer() {
     assert_eq!(env.eval_int("up"), 1);
 }
 
+/// A layer handler receives the pointer position in the layer's own
+/// coordinate space; the window handler keeps the window position.
+///
+/// The manager converts the primary (window) point with
+/// `FromPrimaryCoordinates` before firing the layer event
+/// (`reference/cpp/core/visual/LayerManager.cpp:380-382`,
+/// `reference/cpp/core/visual/LayerManager.cpp:508-509`), which subtracts
+/// each non-primary ancestor's rect offset
+/// (`reference/cpp/core/visual/LayerIntf.cpp:2282-2291`); the window event
+/// is fired with the untouched window point
+/// (`reference/cpp/core/visual/WindowIntf.cpp:335-345`).
+///
+/// A drag-based slider computes its value from this local x, so a
+/// window-space x makes every drag clamp to the maximum.
+#[test]
+fn dispatch_delivers_layer_local_pointer_coordinates() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         w.setSize(320, 240); \
+         var base = new Layer(w, null); \
+         var outer = new Layer(w, base); \
+         outer.setPos(40, 30); outer.setSize(200, 100); outer.visible = true; outer.hitThreshold = 0; \
+         var inner = new Layer(w, outer); \
+         inner.setPos(60, 20); inner.setSize(100, 50); inner.visible = true; inner.hitThreshold = 0; \
+         var downX = -1; var downY = -1; var moveX = -1; var moveY = -1; \
+         var clickX = -1; var clickY = -1; var windowX = -1; var windowY = -1; \
+         inner.onMouseDown = function(x, y, btn, shift) { downX = x; downY = y; }; \
+         inner.onMouseMove = function(x, y, shift) { moveX = x; moveY = y; }; \
+         inner.onClick = function(x, y) { clickX = x; clickY = y; }; \
+         w.onMouseDown = function(x, y, btn, shift) { windowX = x; windowY = y; };",
+    );
+
+    // The window point (110, 70) is (110 - 40 - 60, 70 - 30 - 20) = (10, 20)
+    // in `inner`.
+    env.dispatch_events(&[PlatformEvent::Input(InputEvent::PointerMoved {
+        x: 110.0,
+        y: 70.0,
+    })]);
+    // reference/cpp/core/visual/LayerManager.cpp:508-509
+    assert_eq!(env.eval_int("moveX"), 10);
+    assert_eq!(env.eval_int("moveY"), 20);
+
+    env.dispatch_events(&[PlatformEvent::Input(InputEvent::MouseButton {
+        button: MouseButton::Left,
+        pressed: true,
+    })]);
+    // reference/cpp/core/visual/LayerManager.cpp:380-382
+    assert_eq!(env.eval_int("downX"), 10);
+    assert_eq!(env.eval_int("downY"), 20);
+    // reference/cpp/core/visual/WindowIntf.cpp:335-345
+    assert_eq!(env.eval_int("windowX"), 110);
+    assert_eq!(env.eval_int("windowY"), 70);
+
+    env.dispatch_events(&[PlatformEvent::Input(InputEvent::MouseButton {
+        button: MouseButton::Left,
+        pressed: false,
+    })]);
+    // reference/cpp/core/visual/LayerManager.cpp:361-362
+    assert_eq!(env.eval_int("clickX"), 10);
+    assert_eq!(env.eval_int("clickY"), 20);
+}
+
 /// Key events go to the window's focused layer with the reference positional
 /// arguments `(key, shift, process)`; a window activation event goes to the
 /// window object.

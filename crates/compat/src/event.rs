@@ -307,7 +307,8 @@ impl EventAdapter {
             && let Some(click) = self.click_event(ctx, event)
         {
             if let Some(id) = pointer_layer {
-                deliver_checked(ctx, click.name, &click.args, Target::Layer(id));
+                let args = self.layer_args(ctx, &click, id);
+                deliver_checked(ctx, click.name, &args, Target::Layer(id));
             }
             if let Some(id) = first_window(ctx) {
                 deliver_checked(ctx, click.name, &click.args, Target::Window(id));
@@ -316,22 +317,41 @@ impl EventAdapter {
         Ok(())
     }
 
-    /// The layer-level argument list for `event`, converting the touch point
-    /// into the layer's coordinate space like the manager's
-    /// `FromPrimaryCoordinates` (`reference/cpp/core/visual/LayerManager.cpp:516-524`).
+    /// The layer-level argument list for `event`, converting the pointer
+    /// position from window coordinates into the layer's own coordinates by
+    /// subtracting the offset to the primary layer. The window handler keeps
+    /// the window coordinates.
     fn layer_args(&self, ctx: &CompatCtx, event: &TjsEvent, layer_id: u32) -> Vec<EventValue> {
-        if !matches!(event.name, "onTouchDown" | "onTouchMove" | "onTouchUp") {
+        if !matches!(
+            event.name,
+            "onMouseMove"
+                | "onMouseDown"
+                | "onMouseUp"
+                | "onClick"
+                | "onDoubleClick"
+                | "onTouchDown"
+                | "onTouchMove"
+                | "onTouchUp"
+        ) {
             return event.args.clone();
         }
-        let (Some(EventValue::Real(x)), Some(EventValue::Real(y))) =
-            (event.args.first(), event.args.get(1))
-        else {
-            return event.args.clone();
-        };
-        let (local_x, local_y) = to_layer_local(ctx, layer_id, *x, *y);
         let mut args = event.args.clone();
-        args[0] = EventValue::Real(local_x);
-        args[1] = EventValue::Real(local_y);
+        let (Some(x), Some(y)) = (args.first().cloned(), args.get(1).cloned()) else {
+            return args;
+        };
+        let (local_x, local_y) = match (x, y) {
+            (EventValue::Int(x), EventValue::Int(y)) => {
+                let (local_x, local_y) = to_layer_local_int(ctx, layer_id, x, y);
+                (EventValue::Int(local_x), EventValue::Int(local_y))
+            }
+            (EventValue::Real(x), EventValue::Real(y)) => {
+                let (local_x, local_y) = to_layer_local(ctx, layer_id, x, y);
+                (EventValue::Real(local_x), EventValue::Real(local_y))
+            }
+            _ => return args,
+        };
+        args[0] = local_x;
+        args[1] = local_y;
         args
     }
 
@@ -604,26 +624,39 @@ fn track_layer_enter_leave(ctx: &CompatCtx, new_layer: Option<u32>) {
     services.state::<InputDispatchState>().last_mouse_layer = new_layer;
 }
 
-/// Convert a window-space point into `layer_id`'s coordinate space.
-///
-/// Mirrors the reference `FromPrimaryCoordinates`: each layer's rect offset
-/// is subtracted while walking up the parent chain
-/// (`reference/cpp/core/visual/LayerIntf.cpp`, `Layer.cursorX`).
-fn to_layer_local(ctx: &CompatCtx, layer_id: u32, x: f64, y: f64) -> (f64, f64) {
+/// Sum of the rect offsets of `layer_id` and its non-primary ancestors.
+fn layer_primary_offset(ctx: &CompatCtx, layer_id: u32) -> (i64, i64) {
     let Some(scene) = scene(ctx) else {
-        return (x, y);
+        return (0, 0);
     };
-    let mut local = (x as f32, y as f32);
+    let mut offset = (0i64, 0i64);
     let mut current = scene.layer(layer_id);
     while let Some(layer) = current {
         if layer.parent.is_none() {
             break;
         }
-        local.0 -= layer.rect.x as f32;
-        local.1 -= layer.rect.y as f32;
+        offset.0 += i64::from(layer.rect.x);
+        offset.1 += i64::from(layer.rect.y);
         current = layer.parent.and_then(|parent| scene.layer(parent));
     }
-    (f64::from(local.0), f64::from(local.1))
+    offset
+}
+
+/// Convert a window-space point into `layer_id`'s coordinate space.
+///
+/// Mirrors the reference `FromPrimaryCoordinates`: each layer's rect offset
+/// is subtracted while walking up the parent chain
+/// (`reference/cpp/core/visual/LayerIntf.cpp:2282-2297`).
+fn to_layer_local(ctx: &CompatCtx, layer_id: u32, x: f64, y: f64) -> (f64, f64) {
+    let (offset_x, offset_y) = layer_primary_offset(ctx, layer_id);
+    (x - offset_x as f64, y - offset_y as f64)
+}
+
+/// Integer form of [`to_layer_local`], matching the reference's integer
+/// coordinate subtraction exactly.
+fn to_layer_local_int(ctx: &CompatCtx, layer_id: u32, x: i64, y: i64) -> (i64, i64) {
+    let (offset_x, offset_y) = layer_primary_offset(ctx, layer_id);
+    (x - offset_x, y - offset_y)
 }
 
 /// The layer that captured the mouse, if any.
