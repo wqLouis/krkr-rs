@@ -140,12 +140,17 @@ Sources: `/tmp/kag-render-audit.md`, `/tmp/kag-compat-audit.md`, `/tmp/kag-flow-
 
 ### Text / fonts (render audit R4/R6 + the text-render diagnosis)
 
-* [x] **TEXT-1** the `drawText` shadow must be spread by `shadowwidth` (the
+* [~] **TEXT-1** the `drawText` shadow must be spread by `shadowwidth` (the
   reference blurs and widens the shadow bitmap by `abs(blurwidth)` on every side,
   `CharacterData.cpp:118-160`; a shadow exists only when `shadowlevel != 0`,
-  `LayerBitmapImpl.cpp:1168-1178`). Landed `3313271`; the game draws white text
-  with a zero-offset near-black shadow, so without the spread the white had no
-  halo and disappeared on a light background.
+  `LayerBitmapImpl.cpp:1168-1178`). Semantics landed `3313271` — the game draws
+  white text with a zero-offset near-black shadow, so without the spread the white
+  had no halo and disappeared on a light background. **The rasterization still
+  diverges**: the reference `TVPChBlurCopy65_c` (`tvpgl.cpp:10770-10813`) convolves
+  each character's coverage with a **cone** kernel
+  `weight = ((bw - fast_int_hypot(dx,dy) + 1) * lvsum * blurlevel) >> 8` and
+  **sums with saturation** (`TVPChBlurAddMulCopy65_c`), whereas the port stamps the
+  sharp glyph at an equal weight per offset and alpha-composites it.
 * [x] **TEXT-2** `Font.height` must normalize a negative value to positive
   (`LayerIntf.cpp:5962-5969`) and `Font.angle` must normalize modulo 3600
   (`:5975-5988`). Landed `3313271`.
