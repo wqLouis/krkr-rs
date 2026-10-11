@@ -5,8 +5,9 @@
 //! the **state** half of sound, re-expressed as explicit L2 values:
 //!
 //! * [`SoundSource`] — a playable PCM source: either caller-supplied
-//!   decoded samples or an [`AudioStream`] that decodes forward as playback
-//!   reads it and reseeks on a backwards read. The stream's own
+//!   decoded samples or an [`AudioStream`] that a decode-ahead worker fills a
+//!   bounded window from on its own thread while the frame thread reads it; a
+//!   read outside the window reseeks the worker. The stream's own
 //!   [`AudioSpec`] and optional generic loop information travel with it.
 //! * [`SoundChannel`] — one playback voice: play/stop/pause, loop, pan,
 //!   volume/volume2, playback rate, 3D position and linear fades.
@@ -21,7 +22,9 @@
 //! the application's update loop calls [`Mixer::advance`] (or
 //! [`Mixer::advance_to`]) each frame, and the L1 `AudioDevice` (in
 //! `platform`) later pulls [`Mixer::mix`] into its own callback. Two
-//! independent [`Mixer`] values in one process never interact.
+//! independent [`Mixer`] values in one process never interact. A streaming
+//! [`SoundSource`] owns its decode-ahead worker thread and its window as
+//! explicit per-source state.
 //!
 //! # Errors
 //!
@@ -30,8 +33,10 @@
 //! typed [`SoundError`] rather than silent silence. There are no hardcoded
 //! chain/size/loop caps.
 
+use std::collections::VecDeque;
 use std::fmt;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
+use std::thread::JoinHandle;
 
 use api::media::{AudioSpec, DecodedAudio};
 
@@ -48,7 +53,7 @@ pub const MAX_VOLUME: f32 = 1.0;
 pub const MAX_PAN: f32 = 1.0;
 
 /// Errors produced by the sound model and mixer.
-#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum SoundError {
     /// An audio specification is unusable.
@@ -79,6 +84,12 @@ pub enum SoundError {
     /// An incremental decoder failed while reading or seeking.
     #[error("audio decode failed: {message}")]
     Decode {
+        /// Human-readable description of the failure.
+        message: String,
+    },
+    /// The decode-ahead worker thread could not be started.
+    #[error("could not start the audio decode thread: {message}")]
+    DecodeThread {
         /// Human-readable description of the failure.
         message: String,
     },
@@ -311,47 +322,45 @@ pub trait AudioStream: Send + Sync {
 enum Pcm {
     /// Fully decoded PCM supplied by the caller.
     Buffer(Arc<DecodedAudio>),
-    /// An incremental decoder plus the window of frames decoded so far.
-    Stream(Mutex<StreamWindow>),
+    /// An incremental decoder with a decode-ahead worker and the window of
+    /// frames it has produced.
+    Stream(StreamSource),
 }
 
-/// The decoded window an incremental [`SoundSource`] keeps around its cursor.
-struct StreamWindow {
-    /// The caller-owned decoder.
-    stream: Box<dyn AudioStream>,
+/// The buffer a streaming source's decode-ahead worker fills and the frame
+/// thread reads.
+struct StreamBuffer {
     /// Interleaved channel count (1 or 2).
     channels: usize,
-    /// Decoded interleaved samples for `[start, start + frames)`.
-    samples: Vec<f32>,
-    /// Frame index of `samples[0]`.
-    start: u64,
     /// Frames to decode per pull.
     chunk_frames: usize,
-    /// Frames to retain behind the cursor.
-    window_frames: u64,
+    /// Decoded interleaved samples for `[start, start + frames)`.
+    samples: VecDeque<f32>,
+    /// Frame index of `samples.front()`.
+    start: u64,
+    /// The next frame the reader will request.
+    cursor: u64,
+    /// Maximum frames the worker decodes ahead of `cursor`.
+    lookahead_frames: u64,
+    /// Frames kept behind `cursor` so an overlapping read does not reseek.
+    retain_frames: u64,
     /// Set once `read` reported the end.
     eof: bool,
     /// Total frames once the decoder reported the end.
     total: Option<u64>,
+    /// A reseek the worker must perform before decoding on.
+    seek_request: Option<u64>,
+    /// Set while `decode_entire` needs the whole stream in `samples`.
+    materialize: bool,
+    /// Set when the source is dropped; the worker exits.
+    stop: bool,
+    /// Set once playback begins; the worker decodes nothing before then.
+    started: bool,
+    /// The first decoder failure, reported to every reader.
+    error: Option<SoundError>,
 }
 
-impl StreamWindow {
-    fn new(stream: Box<dyn AudioStream>, rate: u32, channels: u16) -> Self {
-        // Decode a quarter second per pull and retain one second, mirroring
-        // the reference's decode-ahead buffer length.
-        let rate = rate.max(1);
-        Self {
-            stream,
-            channels: usize::from(channels),
-            samples: Vec::new(),
-            start: 0,
-            chunk_frames: (rate as usize / 4).max(1),
-            window_frames: u64::from(rate).max(1),
-            eof: false,
-            total: None,
-        }
-    }
-
+impl StreamBuffer {
     /// Number of complete decoded frames in the window.
     fn frame_count(&self) -> u64 {
         (self.samples.len() / self.channels) as u64
@@ -373,52 +382,8 @@ impl StreamWindow {
         index >= self.start && index < self.end()
     }
 
-    /// Decodes another chunk, appending it to the window.
-    fn decode_more(&mut self) -> Result<(), SoundError> {
-        if self.eof {
-            return Ok(());
-        }
-        let start = self.samples.len();
-        self.samples
-            .resize(start + self.chunk_frames * self.channels, 0.0);
-        let written = match self.stream.read(&mut self.samples[start..]) {
-            Ok(written) => written,
-            Err(error) => {
-                self.samples.truncate(start);
-                return Err(error);
-            }
-        };
-        self.samples.truncate(start + written);
-        if written == 0 {
-            self.eof = true;
-            self.total = Some(self.end());
-        }
-        Ok(())
-    }
-
-    /// Restarts the decoder at `frame`, discarding the decoded window.
-    fn seek_to(&mut self, frame: u64) -> Result<(), SoundError> {
-        self.stream.seek(frame)?;
-        self.samples.clear();
-        self.start = frame;
-        self.eof = false;
-        Ok(())
-    }
-
-    /// Reads `index`, decoding forward or reseeking backwards as needed.
-    fn frame(&mut self, index: u64) -> Result<Option<(f32, f32)>, SoundError> {
-        if index < self.start || index > self.end() {
-            // Backwards: re-decode from the target. Forward gap: reseek
-            // instead of decoding through the skipped frames.
-            self.seek_to(index)?;
-        }
-        while index >= self.end() && !self.eof {
-            self.decode_more()?;
-        }
-        self.trim(index);
-        if !self.covers(index) {
-            return Ok(None);
-        }
+    /// Reads the decoded frame at `index`, which the window must cover.
+    fn read_frame(&self, index: u64) -> Result<(f32, f32), SoundError> {
         let offset = usize::try_from(index - self.start).map_err(|_| SoundError::Decode {
             message: "decoded frame offset does not fit in memory".to_string(),
         })?;
@@ -440,33 +405,300 @@ impl StreamWindow {
         } else {
             left
         };
-        Ok(Some((left, right)))
+        Ok((left, right))
     }
 
-    /// Drops decoded frames older than the retained window, never dropping
-    /// `index` (the frame about to be read).
-    fn trim(&mut self, index: u64) {
-        let frames = self.frame_count();
-        if frames <= self.window_frames {
-            return;
-        }
-        let keep_from = self.end().saturating_sub(self.window_frames).min(index);
-        if keep_from > self.start {
-            let drop = (keep_from - self.start) as usize;
-            self.samples.drain(..drop * self.channels);
-            self.start = keep_from;
+    /// Drops decoded frames before the retained history window.
+    fn trim(&mut self) {
+        let keep_from = self
+            .cursor
+            .saturating_sub(self.retain_frames)
+            .min(self.end());
+        while self.start < keep_from {
+            for _ in 0..self.channels {
+                self.samples.pop_front();
+            }
+            self.start += 1;
         }
     }
 }
 
-/// Locks a stream window, recovering from a poisoned mutex.
+/// The condition variables the decode worker and the frame thread signal each
+/// other with.
+struct StreamShared {
+    /// The decoded window and its bookkeeping.
+    buffer: Mutex<StreamBuffer>,
+    /// Signalled when the window grows (or `eof`/`error` changes): the frame
+    /// thread waits here while starved.
+    data_ready: Condvar,
+    /// Signalled when the frame thread consumes frames or requests a reseek:
+    /// the worker waits here while the lookahead is full.
+    work_ready: Condvar,
+}
+
+/// A streaming decoder plus the decode-ahead worker that owns it.
 ///
-/// No code path panics while the window is locked, so the recovery cannot
+/// The worker is a plain `std::thread` owned by this value: the decoder
+/// ([`AudioStream`]) and the buffer are L2-owned state, the thread is a
+/// portable std abstraction rather than platform code, and nothing here is a
+/// process global. Dropping the value stops and joins the worker.
+struct StreamSource {
+    /// The window and signalling the worker shares with the frame thread.
+    shared: Arc<StreamShared>,
+    /// The decode-ahead worker, joined when the source drops.
+    worker: Option<JoinHandle<()>>,
+}
+
+/// Locks a stream buffer, recovering from a poisoned mutex.
+///
+/// No code path panics while the buffer is locked, so the recovery cannot
 /// expose a half-updated window.
-fn lock_window(window: &Mutex<StreamWindow>) -> MutexGuard<'_, StreamWindow> {
-    window
+fn lock_buffer(shared: &StreamShared) -> MutexGuard<'_, StreamBuffer> {
+    shared
+        .buffer
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Decodes ahead into `shared` until the source is dropped.
+///
+/// The worker owns the decoder. It waits while the lookahead is full, performs
+/// a reseek when the reader asks for a frame outside the window, and decodes
+/// the whole stream while `decode_entire` materializes it. The frame thread
+/// only reads what this function appends.
+fn decode_worker(mut stream: Box<dyn AudioStream>, shared: Arc<StreamShared>) {
+    loop {
+        let mut buffer = lock_buffer(&shared);
+        if buffer.stop {
+            break;
+        }
+        if !buffer.started {
+            drop(
+                shared
+                    .work_ready
+                    .wait(buffer)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+            continue;
+        }
+        if let Some(target) = buffer.seek_request.take() {
+            drop(buffer);
+            let result = stream.seek(target);
+            let mut buffer = lock_buffer(&shared);
+            match result {
+                Ok(()) => {
+                    buffer.samples.clear();
+                    buffer.start = target;
+                    buffer.cursor = target;
+                    buffer.eof = false;
+                    buffer.error = None;
+                }
+                Err(error) => buffer.error = Some(error),
+            }
+            shared.data_ready.notify_all();
+            shared.work_ready.notify_all();
+            continue;
+        }
+        let full = buffer.end() >= buffer.cursor.saturating_add(buffer.lookahead_frames);
+        if buffer.eof || (full && !buffer.materialize) {
+            if buffer.materialize && buffer.eof {
+                buffer.materialize = false;
+                shared.data_ready.notify_all();
+            }
+            drop(
+                shared
+                    .work_ready
+                    .wait(buffer)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+            continue;
+        }
+        let channels = buffer.channels;
+        let chunk_frames = buffer.chunk_frames;
+        drop(buffer);
+        let mut chunk = vec![0.0f32; chunk_frames * channels];
+        let result = stream.read(&mut chunk);
+        let mut buffer = lock_buffer(&shared);
+        match result {
+            Ok(0) => {
+                buffer.eof = true;
+                buffer.total = Some(buffer.end());
+            }
+            Ok(written) => {
+                let take = written.min(chunk.len());
+                buffer.samples.extend(chunk[..take].iter().copied());
+            }
+            Err(error) => {
+                buffer.error = Some(error);
+                buffer.eof = true;
+            }
+        }
+        shared.data_ready.notify_all();
+    }
+}
+
+impl StreamSource {
+    /// Starts the decode-ahead worker for `rate`/`channels`.
+    ///
+    /// The worker is created immediately but decodes nothing until the first
+    /// read or materialize request, so construction, `open` and `play` never
+    /// wait on the decoder.
+    fn new(stream: Box<dyn AudioStream>, rate: u32, channels: u16) -> Result<Self, SoundError> {
+        // Decode a quarter second per pull and keep one second decoded ahead
+        // of the cursor, mirroring the reference's decode-ahead buffer length.
+        let rate = rate.max(1);
+        let channels = usize::from(channels);
+        let chunk_frames = (rate as usize / 4).max(1);
+        let buffer = StreamBuffer {
+            channels,
+            chunk_frames,
+            samples: VecDeque::new(),
+            start: 0,
+            cursor: 0,
+            lookahead_frames: u64::from(rate).max(1),
+            retain_frames: chunk_frames as u64,
+            eof: false,
+            total: None,
+            seek_request: None,
+            materialize: false,
+            stop: false,
+            started: false,
+            error: None,
+        };
+        let shared = Arc::new(StreamShared {
+            buffer: Mutex::new(buffer),
+            data_ready: Condvar::new(),
+            work_ready: Condvar::new(),
+        });
+        let worker_shared = Arc::clone(&shared);
+        let worker = std::thread::Builder::new()
+            .name("tvp-audio".to_string())
+            .spawn(move || decode_worker(stream, worker_shared))
+            .map_err(|error| SoundError::DecodeThread {
+                message: error.to_string(),
+            })?;
+        Ok(Self {
+            shared,
+            worker: Some(worker),
+        })
+    }
+
+    /// Starts the decode-ahead worker.
+    ///
+    /// Returns immediately: the worker decodes on its own thread. Repeated
+    /// calls are a no-op.
+    fn start(&self) {
+        let mut buffer = lock_buffer(&self.shared);
+        if !buffer.started {
+            buffer.started = true;
+            self.shared.work_ready.notify_all();
+        }
+    }
+
+    /// Reads `index`, waiting for the worker while the window is starved.
+    ///
+    /// The frame thread never decodes: a frame outside the window asks the
+    /// worker to reseek, and a frame at the leading edge waits for the next
+    /// decoded chunk.
+    fn frame(&self, index: u64) -> Result<Option<(f32, f32)>, SoundError> {
+        let shared = &self.shared;
+        let mut buffer = lock_buffer(shared);
+        if !buffer.started {
+            buffer.started = true;
+            shared.work_ready.notify_all();
+        }
+        loop {
+            if let Some(error) = &buffer.error {
+                return Err(error.clone());
+            }
+            if buffer.eof && index >= buffer.end() {
+                return Ok(None);
+            }
+            if index < buffer.start || index > buffer.end() {
+                // Backwards, or a forward gap: reseek instead of decoding
+                // through the skipped frames.
+                buffer.seek_request = Some(index);
+                buffer.cursor = index;
+                shared.work_ready.notify_all();
+            } else if index == buffer.end() {
+                // Starved at the leading edge: the worker is decoding.
+                buffer.cursor = index;
+                shared.work_ready.notify_all();
+            }
+            if buffer.covers(index) {
+                let sample = buffer.read_frame(index)?;
+                buffer.cursor = index.saturating_add(1);
+                buffer.trim();
+                shared.work_ready.notify_all();
+                return Ok(Some(sample));
+            }
+            buffer = shared
+                .data_ready
+                .wait(buffer)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    /// Decodes the whole stream into one buffer, releasing the window.
+    fn materialize(&self, spec: AudioSpec) -> Result<DecodedAudio, SoundError> {
+        let shared = &self.shared;
+        let mut buffer = lock_buffer(shared);
+        buffer.started = true;
+        buffer.seek_request = Some(0);
+        buffer.materialize = true;
+        shared.work_ready.notify_all();
+        while buffer.materialize || !buffer.eof {
+            if let Some(error) = &buffer.error {
+                return Err(error.clone());
+            }
+            buffer = shared
+                .data_ready
+                .wait(buffer)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        if let Some(error) = &buffer.error {
+            return Err(error.clone());
+        }
+        let samples = Vec::from(std::mem::take(&mut buffer.samples));
+        let frames = (samples.len() / buffer.channels) as u64;
+        // The window is released; a later read reseeks from the start.
+        buffer.start = frames;
+        buffer.cursor = frames;
+        buffer.eof = true;
+        buffer.total = Some(frames);
+        let spec = AudioSpec {
+            total_frames: Some(frames),
+            ..spec
+        };
+        Ok(DecodedAudio::new(spec, samples))
+    }
+
+    /// Total frames once the end is known, the frames decoded so far
+    /// otherwise.
+    fn known_total(&self) -> u64 {
+        lock_buffer(&self.shared).known_total()
+    }
+
+    /// Whether the decoder reported a zero-length stream.
+    fn is_empty(&self) -> bool {
+        lock_buffer(&self.shared).total == Some(0)
+    }
+}
+
+impl Drop for StreamSource {
+    fn drop(&mut self) {
+        if let Some(worker) = self.worker.take() {
+            {
+                let mut buffer = lock_buffer(&self.shared);
+                buffer.stop = true;
+            }
+            self.shared.work_ready.notify_all();
+            self.shared.data_ready.notify_all();
+            if worker.join().is_err() {
+                log::warn!("sound: the audio decode thread stopped unexpectedly");
+            }
+        }
+    }
 }
 
 /// Rejects a sample rate or channel count the mixer cannot use.
@@ -505,10 +737,10 @@ fn buffer_frame(audio: &DecodedAudio, frame: u64) -> Option<(f32, f32)> {
 ///
 /// Construction validates the format so the mixer can assume a consistent,
 /// mono-or-stereo source. A materialized source holds its decoded buffer; a
-/// streaming source owns the decoder and a bounded window of decoded frames,
-/// decoding forward as [`Self::frame`] is read and reseeking on a backwards
-/// read. The decoder state is this value's own, never a global or a bottom
-/// service cache.
+/// streaming source owns a decode-ahead worker (a plain `std::thread`) and a
+/// bounded window of frames the worker fills while the frame thread reads it,
+/// reseeking when a read leaves the window. The decoder and the window are
+/// this value's own, never a global or a bottom service cache.
 #[non_exhaustive]
 pub struct SoundSource {
     spec: AudioSpec,
@@ -571,7 +803,9 @@ impl SoundSource {
     /// `spec` comes from the container — including its total frame count when
     /// the container reports one — so the duration is known without decoding
     /// the stream. The stream's own [`AudioStream::spec`] must agree on the
-    /// sample rate and channel count. No sample is decoded here.
+    /// sample rate and channel count. A decode-ahead worker is created for
+    /// the stream but decodes nothing until playback starts (or the first
+    /// frame read), so `open` never waits on the decoder.
     pub fn streaming(
         spec: AudioSpec,
         stream: Box<dyn AudioStream>,
@@ -587,10 +821,10 @@ impl SoundSource {
                 ),
             });
         }
-        let window = StreamWindow::new(stream, spec.sample_rate, spec.channels);
+        let source = StreamSource::new(stream, spec.sample_rate, spec.channels)?;
         Ok(Self {
             spec,
-            pcm: Pcm::Stream(Mutex::new(window)),
+            pcm: Pcm::Stream(source),
             info,
             materialized: OnceLock::new(),
         })
@@ -623,33 +857,27 @@ impl SoundSource {
     ///
     /// A typed [`SoundError::Decode`] when the decoder fails.
     pub fn decode_entire(&self) -> Result<DecodedAudio, SoundError> {
-        let Pcm::Stream(window) = &self.pcm else {
+        let Pcm::Stream(source) = &self.pcm else {
             return Ok(self.audio().clone());
         };
-        let mut window = lock_window(window);
-        window.seek_to(0)?;
-        while !window.eof {
-            window.decode_more()?;
-        }
-        let frames = window.frame_count();
-        let spec = AudioSpec {
-            total_frames: Some(frames),
-            ..self.spec
-        };
-        let audio = DecodedAudio::new(spec, window.samples.clone());
-        // Drop the decoded window: the caller owns the returned copy and a
-        // later frame read reseeks from the start.
-        window.samples = Vec::new();
-        window.start = frames;
-        window.eof = true;
-        window.total = Some(frames);
-        Ok(audio)
+        source.materialize(self.spec)
     }
 
     /// Whether this source decodes incrementally instead of holding every
     /// decoded sample.
     pub fn is_streaming(&self) -> bool {
         matches!(&self.pcm, Pcm::Stream(_))
+    }
+
+    /// Starts the decode-ahead worker for a streaming source.
+    ///
+    /// Returns immediately: the worker decodes on its own thread, so playback
+    /// and decoding overlap. A no-op for a materialized source and for a
+    /// repeated call.
+    pub fn start_decoding(&self) {
+        if let Pcm::Stream(source) = &self.pcm {
+            source.start();
+        }
     }
 
     /// The source format, with `total_frames` filled in when known.
@@ -686,7 +914,7 @@ impl SoundSource {
             Some(frames) => frames,
             None => match &self.pcm {
                 Pcm::Buffer(audio) => audio.frame_count(),
-                Pcm::Stream(window) => lock_window(window).known_total(),
+                Pcm::Stream(source) => source.known_total(),
             },
         }
     }
@@ -698,10 +926,7 @@ impl SoundSource {
             Some(_) => false,
             None => match &self.pcm {
                 Pcm::Buffer(audio) => audio.frame_count() == 0,
-                Pcm::Stream(window) => {
-                    let window = lock_window(window);
-                    window.total == Some(0)
-                }
+                Pcm::Stream(source) => source.is_empty(),
             },
         }
     }
@@ -740,9 +965,11 @@ impl SoundSource {
 
     /// Read one sample frame as `(left, right)` (mono duplicated).
     ///
-    /// Forward reads decode as needed; a backwards read reseeks and
-    /// re-decodes; a frame at or past the end returns `None`. A decoder
-    /// failure is a typed error, never silence.
+    /// A streaming source reads from the decode-ahead worker's window: a
+    /// forward read inside the window returns at once, a read at the leading
+    /// edge waits for the worker, and a read outside the window asks the
+    /// worker to reseek. A frame at or past the end returns `None`, and a
+    /// decoder failure is a typed error, never silence.
     pub fn frame(&self, frame: u64) -> Result<Option<(f32, f32)>, SoundError> {
         if let Some(total) = self.spec.total_frames
             && frame >= total
@@ -751,7 +978,7 @@ impl SoundSource {
         }
         match &self.pcm {
             Pcm::Buffer(audio) => Ok(buffer_frame(audio, frame)),
-            Pcm::Stream(window) => lock_window(window).frame(frame),
+            Pcm::Stream(source) => source.frame(frame),
         }
     }
 
@@ -949,8 +1176,21 @@ impl SoundChannel {
         }
     }
 
+    /// Install `source` on the channel without starting playback (the
+    /// reference's post-`Open` state: loaded, `stop`).
+    pub fn load(&mut self, source: Arc<SoundSource>) {
+        self.source = Some(source);
+        self.playing = false;
+        self.paused = false;
+        self.position_seconds = 0.0;
+        self.done = false;
+        self.fade = None;
+        self.fade_finished = false;
+    }
+
     /// Start (or restart) `source` from position 0.
     pub fn play(&mut self, source: Arc<SoundSource>) {
+        source.start_decoding();
         self.source = Some(source);
         self.playing = true;
         self.paused = false;
@@ -1260,6 +1500,19 @@ impl SoundBuffer {
     /// channel's copy at the loop point).
     pub fn apply_flags_to(&self, channel: &mut SoundChannel) {
         *channel.flags_mut() = self.flags.clone();
+    }
+
+    /// Install this buffer's source on `channel` without playing it,
+    /// carrying the buffer's loop flags over.
+    pub fn load_on(&mut self, channel: &mut SoundChannel) -> Result<(), SoundError> {
+        let Some(source) = &self.source else {
+            return Err(SoundError::NoSource);
+        };
+        channel.load(source.clone());
+        self.apply_flags_to(channel);
+        self.next_label = 0;
+        self.last_sample = 0.0;
+        Ok(())
     }
 
     /// Reset the label cursor and start `channel` on this buffer's source,

@@ -1903,14 +1903,16 @@ fn streaming_env() -> (Env, Arc<AtomicUsize>) {
 }
 
 /// Reference: `Open` creates the decoder and reads its format
-/// (`reference/cpp/core/sound/win32/WaveImpl.cpp:3043-3056`); the decode
-/// thread fills the L2 buffer only while playback runs
-/// (`WaveImpl.cpp:1823-1866`, `2389-2463`). Opening a sound must therefore
-/// decode nothing; the first render pulls the samples.
+/// (`reference/cpp/core/sound/win32/WaveImpl.cpp:3043-3056`); `Play` starts
+/// the decode thread (`WaveImpl.cpp:1823-1866`, `2911-2921`) and the thread
+/// fills the L2 buffer while playback runs. Opening a sound therefore decodes
+/// nothing, `play` returns without decoding, and the window holds only the
+/// decode-ahead lookahead rather than the whole file.
 #[test]
 fn open_does_not_decode_the_whole_file() {
     let _lock = vm_lock();
     let (env, reads) = streaming_env();
+    let total_chunks = 10 * TONE_RATE as usize / (TONE_RATE as usize / 4);
 
     env.run("var s = new WaveSoundBuffer(); s.open('tone.wav');");
     assert_eq!(
@@ -1922,16 +1924,20 @@ fn open_does_not_decode_the_whole_file() {
     assert_eq!(env.eval_int("s.totalTime"), 10_000);
     assert_eq!(env.eval_int("s.frequency"), i64::from(TONE_RATE));
 
+    // `play` starts the decode-ahead worker and returns; the worker fills the
+    // window on its own thread.
     env.run("s.play();");
-    assert_eq!(
-        reads.load(Ordering::Relaxed),
-        0,
-        "play alone decodes nothing"
-    );
+    assert_eq!(env.eval_ok("s.status"), TjsValue::String("play".into()));
     assert!(env.peak() > 0.0, "the ramp must be audible");
+    let decoded = reads.load(Ordering::Relaxed);
     assert!(
-        reads.load(Ordering::Relaxed) > 0,
-        "the first render decodes the stream"
+        decoded > 0,
+        "the decode-ahead worker must decode the stream"
+    );
+    assert!(
+        decoded < total_chunks,
+        "the window holds only the lookahead, not the whole file: \
+         {decoded} of {total_chunks} windows"
     );
     // `sampleValue` reads the visualization buffer from the decoded window.
     assert!(env.eval_real("s.sampleValue") > 0.0);
@@ -1954,13 +1960,16 @@ fn phase_vocoder_streams_a_streaming_source() {
     env.run(
         "var s = new WaveSoundBuffer(); s.open('tone.wav'); \
          var pv = new WaveSoundBuffer.PhaseVocoder(); pv.time = 2.0; \
-         s.filters.add(pv); s.play();",
+         s.filters.add(pv);",
     );
     assert_eq!(
         reads.load(Ordering::Relaxed),
         0,
         "building the filter chain must decode nothing"
     );
+    // `play` starts the decode-ahead worker; it fills the window on its own
+    // thread (`reference/cpp/core/sound/win32/WaveImpl.cpp:1823-1866`).
+    env.run("s.play();");
     assert_eq!(env.eval_ok("s.status"), TjsValue::String("play".into()));
 
     // The first rendered window pulls only the input hops it needs.

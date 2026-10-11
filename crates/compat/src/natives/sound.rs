@@ -1316,13 +1316,15 @@ extern "C" fn sound_open(
             object.buffer.open(source);
             if let Some(channel) = mixer.channel(object.channel_id) {
                 // Load the source onto the channel so `status` reports
-                // `"stop"` (the reference's post-`open` state) while keeping
-                // it unstarted. `looping` is *not* reset: the reference
-                // re-applies the instance flag to the fresh loop manager
+                // `"stop"` (the reference's post-`open` state) without
+                // starting the decode-ahead worker; only `play` does that.
+                // `looping` is *not* reset: the reference re-applies the
+                // instance flag to the fresh loop manager
                 // (`WaveImpl.cpp:3049`).
-                if object.buffer.play_on(channel).is_ok() {
-                    channel.stop();
-                    channel.set_position(0.0);
+                if object.buffer.load_on(channel).is_err() {
+                    log::warn!(
+                        "WaveSoundBuffer.open: the buffer had no source to load onto the channel"
+                    );
                 }
             }
         });
@@ -1398,13 +1400,23 @@ extern "C" fn sound_play(
             } else {
                 channel.position_seconds()
             };
-            object
-                .buffer
-                .play_on(channel)
-                .map_err(|error| error.to_string())?;
+            if filtered.is_some() {
+                // The filter chain wraps the raw source, so only the filtered
+                // render starts a decode-ahead worker; load the raw source
+                // without starting it.
+                object
+                    .buffer
+                    .load_on(channel)
+                    .map_err(|error| error.to_string())?;
+            } else {
+                object
+                    .buffer
+                    .play_on(channel)
+                    .map_err(|error| error.to_string())?;
+            }
             if let Some(filtered) = &filtered {
                 // Replace the raw source with the filtered render while
-                // keeping the label cursor/flags `play_on` just reset.
+                // keeping the label cursor/flags `load_on` just reset.
                 channel.play(filtered.clone());
                 object.buffer.apply_flags_to(channel);
             }
