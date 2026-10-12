@@ -37,7 +37,6 @@ crates/compat/src/natives/plugins/json/mod.rs:768:strip_prefix('+') — Option o
 # --- MediaFormat::i32 returns Option (absent key); the default is the
 #     documented absent-key value (audit §3.2 rank 3) ----------------------
 crates/platform/media/src/video/mediacodec.rs:596:result-fallback — MediaFormat::i32 returns Option; absent key => documented default
-crates/platform/media/src/video/mediacodec.rs:597:result-fallback — MediaFormat::i32 returns Option; absent key => documented default
 crates/platform/media/src/video/mediacodec.rs:875:result-fallback — MediaFormat::i32 returns Option; absent key => documented default
 crates/platform/media/src/video/mediacodec.rs:876:result-fallback — MediaFormat::i32 returns Option; absent key => documented default
 crates/platform/media/src/video/mediacodec.rs:879:result-fallback — MediaFormat::i32 returns Option; absent key => documented default
@@ -47,7 +46,6 @@ crates/platform/media/src/video/mediacodec.rs:1047:result-fallback — MediaForm
 crates/platform/media/src/video/mediacodec.rs:1048:result-fallback — MediaFormat::i32 returns Option; absent key => documented default
 crates/platform/media/src/video/mediacodec.rs:1067:result-fallback — MediaFormat::i32 returns Option; absent key => documented default
 crates/platform/media/src/video/mediacodec.rs:1079:result-fallback — MediaFormat::i32 returns Option; absent key => documented default
-crates/platform/media/src/video/mediacodec.rs:1083:result-fallback — MediaFormat::i32 returns Option; absent key => documented default
 
 # --- u64::try_from(bytes.len()) cannot overflow on the 64-bit host
 #     (audit §3.1) --------------------------------------------------------

@@ -426,3 +426,27 @@ of synchronous decodes) and `docs/audits/perf-hotspots.md`.
   resolution change.
 * Dirty-rectangle bitmap uploads and the per-frame fence wait (§12).
 * Bounded GPU glyph-atlas cells (§12).
+
+### Decoding on the GPU — checked, and not the lever
+
+Recorded so it is not re-opened without new evidence.
+
+* **MediaCodec decodes to memory, not to a surface.** Both decoders are
+  configured with no surface (`mediacodec.rs` `configure(&track.format, None,
+  Decoder)`), so the output is a YUV byte buffer that the port converts on the
+  CPU (`yuv420_to_rgba`, `media/src/yuv.rs`) and then uploads. A hardware
+  decoder may sit behind that, but nothing downstream of it is GPU-side. The
+  surface path (`Some(surface)` → a Vulkan image through `AHardwareBuffer`) is
+  the zero-copy work in §12, and it is blocked today because
+  `COLOR_FormatYUV420Flexible` needs `AMediaCodec_getOutputImage`, which `ndk`
+  does not expose. The desktop FFmpeg path is CPU-only as well — no `hwaccel`,
+  no `hw_device`, no `get_format`.
+* **TLG is not a GPU decode target.** Both formats are entropy-coded bit
+  streams with serial dependencies: TLG5 is LZSS over a sliding window shared
+  across the image, TLG6 is Golomb-Rice/RLE with a per-block method map, then
+  predictors and colour filters. The parallel stages are the cheap ones, the
+  entropy decode dominates, and the result has to come back to CPU memory
+  because the layer pixels are what `getPixel`/`saveLayerImage` observe (D34).
+  The renderer also has no compute pipeline at all. The lever is scheduling -
+  the cache hit above and decoding independent images on a worker pool - not a
+  compute shader.
