@@ -71,8 +71,10 @@ pub(crate) fn clear_layer_focus(ctx: &CompatCtx, window: u32, direction: bool) -
 /// focus state first, then fire `onBlur` on the outgoing layer with the
 /// newly focused layer (or `null`) and then `onFocus` on the incoming
 /// layer with the previously focused layer (or `null`) and the direction.
-/// The event arguments are the layers' registered script objects, the
-/// `prevfocused->Owner` the reference posts
+/// Either event is skipped while its layer is `Shutdown`
+/// (`LayerManager.cpp:786-790`), so an invalidated layer that still holds
+/// focus is cleared silently. The event arguments are the layers'
+/// registered script objects, the `prevfocused->Owner` the reference posts
 /// (`reference/cpp/core/visual/LayerIntf.cpp:3702-3727`); both handlers
 /// are delivered synchronously, the reference `TVP_EPT_IMMEDIATE` shape
 /// (`reference/cpp/core/base/EventIntf.cpp:215-233`).
@@ -120,14 +122,32 @@ fn set_focus_to(ctx: &CompatCtx, window: u32, target: Option<u32>, direction: bo
     // runs before `FocusedLayer->FireFocus(org, direction)` (`:786-790`) —
     // `onBlur` always precedes `onFocus`, and each fires only while its layer
     // still has an owner (`reference/cpp/core/visual/LayerIntf.cpp:3702`,
-    // `:3715`).
-    if let Some(prev) = prev {
+    // `:3715`). Both ends are re-checked for `Shutdown` at their own fire
+    // site (`LayerManager.cpp:786-790`): a handler that invalidates the
+    // other end silences that end's event.
+    if let Some(prev) = prev
+        && fires_focus_events(ctx, prev)
+    {
         fire_focus_event(ctx, host, prev, "onBlur", target);
     }
-    if let Some(target) = target {
+    if let Some(target) = target
+        && fires_focus_events(ctx, target)
+    {
         fire_on_focus(ctx, host, target, prev, direction);
     }
     true
+}
+
+/// `!layer->Shutdown` evaluated where the event fires
+/// (`reference/cpp/core/visual/LayerManager.cpp:786-790`, the re-guards in
+/// `FireBlur`/`FireFocus` at `reference/cpp/core/visual/LayerIntf.cpp:3703`,
+/// `:3717`): a layer marked by `Invalidate()` (`:516`) fires no focus event
+/// in either direction. A record that is already gone was invalidated too.
+fn fires_focus_events(ctx: &CompatCtx, id: u32) -> bool {
+    match scene_ref(ctx) {
+        Ok(scene) => scene.layer(id).is_some_and(|l| !l.shutdown),
+        Err(_) => false,
+    }
 }
 
 /// `FireBlur(newly_focused)`: one argument, the layer that is now focused
@@ -231,12 +251,17 @@ fn deliver(ctx: &CompatCtx, host: &Tjs2Engine, layer: u32, name: &str, args: &[T
 /// (`reference/cpp/core/visual/LayerManager.cpp:690-711`): when the
 /// focused layer is `root` or below it in the parent chain, move focus to
 /// the next focusable layer of the chain after `root` (direction forward)
-/// or clear it. Call it after the state change that made the subtree
-/// unusable — the reference callers (`SetVisible(false)`
-/// `reference/cpp/core/visual/LayerIntf.cpp:1183-1206`, `SetEnabled(false)`
-/// `:3801-3832`, `SeverChild` `:657-665`, `NotifyPart` via
-/// `LayerManager.cpp:197-201`) all blur once the flag is off or the child
-/// is being severed.
+/// or clear it. A [`engine::LayerState::shutdown`] `root` (reference
+/// `tTJSNI_BaseLayer::Shutdown`) always takes the clear: the reference's
+/// `GetNextFocusable` search walks `GetNeighborBelow`, which yields
+/// nothing once the layer's manager is gone
+/// (`reference/cpp/core/visual/LayerIntf.cpp:1261-1262`), and `Invalidate`
+/// releases the manager before the blur reaches it
+/// (`reference/cpp/core/visual/LayerIntf.cpp:515-516`, `:538-544`). The
+/// other callers blur after a state change on a live layer
+/// (`SetVisible(false)` `reference/cpp/core/visual/LayerIntf.cpp:1183-1206`,
+/// `SetEnabled(false)` `:3801-3832`, `SeverChild` `:657-665`, `NotifyPart`
+/// via `LayerManager.cpp:197-201`).
 pub(crate) fn blur_tree(ctx: &CompatCtx, root: u32) {
     let (window, focused) = {
         let scene = match scene_ref(ctx) {
@@ -262,7 +287,11 @@ pub(crate) fn blur_tree(ctx: &CompatCtx, root: u32) {
     };
     // `next = root->GetNextFocusable()` (`LayerManager.cpp:702`): the focus
     // chain search after `root` (`reference/cpp/core/visual/LayerIntf.cpp:3631-3647`),
-    // modelled by [`Scene::next_focusable`].
+    // modelled by [`Scene::next_focusable`]. The reference search starts at
+    // `root` through `GetNeighborBelow`, which returns null without the
+    // layer's manager (`reference/cpp/core/visual/LayerIntf.cpp:1261-1262`)
+    // — `Invalidate` released it (`:538-541`) — so a shutdown `root` can
+    // only produce the clear.
     let next = {
         let scene = match scene_ref(ctx) {
             Ok(scene) => scene,
@@ -271,7 +300,11 @@ pub(crate) fn blur_tree(ctx: &CompatCtx, root: u32) {
                 return;
             }
         };
-        scene.next_focusable(root)
+        if scene.layer(root).is_some_and(|l| l.shutdown) {
+            None
+        } else {
+            scene.next_focusable(root)
+        }
     };
     // `if(next != FocusedLayer) SetFocusTo(next, true); else SetFocusTo(nullptr, true);`
     // (`LayerManager.cpp:704-708`).

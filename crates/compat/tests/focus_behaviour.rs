@@ -217,19 +217,29 @@ fn hiding_an_ancestor_blurs_the_focused_descendant() {
     assert_eq!(env.eval_int("w.focusedLayer === null"), 1);
 }
 
-/// Removing the focused layer blurs it while it is still in the tree:
-/// `invalidate` → `Part()` → `NotifyPart` → `BlurTree`
-/// (`reference/cpp/core/visual/LayerIntf.cpp:624-631`,
-/// `reference/cpp/core/visual/LayerManager.cpp:197-201`, `:690-711`), so
-/// the outgoing layer's object is still valid inside the handlers.
+/// Invalidating the focused layer fires **nothing** and leaves focus
+/// null. `Invalidate()` sets `Shutdown` before any detach
+/// (`reference/cpp/core/visual/LayerIntf.cpp:515-516`) and releases the
+/// layer's own manager before `Part()` (`:538-544`), so the `SeverChild`
+/// blur (`:657-665` via `reference/cpp/core/visual/LayerManager.cpp:197-201`,
+/// `:690-711`) computes its next focus with a search whose
+/// `GetNeighborBelow` dies on the missing manager
+/// (`reference/cpp/core/visual/LayerIntf.cpp:1261-1262`, walk at
+/// `:3631-3649`): `SetFocusTo(nullptr, true)` clears focus
+/// (`reference/cpp/core/visual/LayerManager.cpp:704-708`) while skipping
+/// the outgoing `FireBlur` because the holder is `Shutdown` (`:786-787`)
+/// and firing no `onFocus` without a target (`:789-790`). Destruction and
+/// GC finalization run the same `Invalidate()`
+/// (`reference/cpp/core/tjs2/tjsObject.cpp:389-400`).
 #[test]
-fn removing_the_focused_layer_blurs_to_the_next_focusable() {
+fn invalidating_the_focused_layer_fires_no_events_and_clears_focus() {
     let _lock = vm_lock();
     let env = Env::new();
     env.run(
         "var w = new Window(); \
-         var a = new Layer(w, null); a.name = 'a'; a.focusable = true; a.visible = true; \
-         var b = new Layer(w, null); b.name = 'b'; b.focusable = true; b.visible = true; \
+         var top = new Layer(w, null); \
+         var a = new Layer(w, top); a.name = 'a'; a.focusable = true; a.visible = true; \
+         var b = new Layer(w, top); b.name = 'b'; b.focusable = true; b.visible = true; \
          var evlog = ''; \
          a.onBlur = function(focused) { evlog += 'a.blur:' + (focused === null ? 'null' : focused.name) + ';'; }; \
          b.onFocus = function(blurred, direction) { evlog += 'b.focus:' + (blurred === null ? 'null' : blurred.name) + ':' + direction + ';'; }; \
@@ -237,11 +247,114 @@ fn removing_the_focused_layer_blurs_to_the_next_focusable() {
          evlog = ''; \
          invalidate a;",
     );
+    assert_eq!(env.eval_int("evlog === ''"), 1);
+    assert_eq!(env.eval_int("w.focusedLayer === null"), 1);
+}
+
+/// Invalidating the **primary** (parentless) layer while it holds focus
+/// fires nothing as well: `Invalidate` marks it first
+/// (`reference/cpp/core/visual/LayerIntf.cpp:515-516`) and
+/// `DetachPrimary` then runs `SetFocusTo(nullptr)`
+/// (`reference/cpp/core/visual/LayerManager.cpp:175-185`, `:178`), whose
+/// `Shutdown` guard skips the outgoing `FireBlur` (`:786-787`) and whose
+/// null target fires no `onFocus` (`:789-790`). The children loop parts
+/// the focused layer afterwards, into focus that is already null
+/// (`reference/cpp/core/visual/LayerIntf.cpp:546-548`, early-out
+/// `reference/cpp/core/visual/LayerManager.cpp:695-696`).
+#[test]
+fn invalidating_the_primary_layer_fires_no_events_and_clears_focus() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var a = new Layer(w, null); a.name = 'a'; a.focusable = true; a.visible = true; \
+         var b = new Layer(w, a); b.name = 'b'; b.focusable = true; b.visible = true; \
+         var evlog = ''; \
+         a.onBlur = function(focused) { evlog += 'a.blur:' + (focused === null ? 'null' : focused.name) + ';'; }; \
+         b.onFocus = function(blurred, direction) { evlog += 'b.focus:' + (blurred === null ? 'null' : blurred.name) + ':' + direction + ';'; }; \
+         a.focus(); \
+         evlog = ''; \
+         invalidate a;",
+    );
+    assert_eq!(env.eval_int("evlog === ''"), 1);
+    assert_eq!(env.eval_int("w.focusedLayer === null"), 1);
+}
+
+/// Invalidating a live, non-focused ancestor of the focused layer fires
+/// exactly one event: the outgoing layer's `onBlur(null)`. Only the
+/// ancestor is marked and loses its manager
+/// (`reference/cpp/core/visual/LayerIntf.cpp:515-516`, `:538-541`); its
+/// `Part()` reaches the parent's live manager through `SeverChild`
+/// (`:624-631`, `:657-665`) and `BlurTree` proceeds because the focused
+/// layer sits below it
+/// (`reference/cpp/core/visual/LayerManager.cpp:697-700`), but the
+/// `GetNextFocusable` origin is the inert ancestor, whose search dies
+/// with the manager (`reference/cpp/core/visual/LayerIntf.cpp:1261-1262`)
+/// — focus clears instead of hopping to the focusable sibling — and
+/// `SetFocusTo(nullptr, true)` fires `FireBlur` on the **live** focused
+/// layer only (`reference/cpp/core/visual/LayerManager.cpp:786-787`,
+/// argument `reference/cpp/core/visual/LayerIntf.cpp:3702-3713`); with no
+/// target, no `onFocus` fires (`reference/cpp/core/visual/LayerManager.cpp:789-790`).
+/// The children loop then parts each child into an already-cleared focus
+/// (`reference/cpp/core/visual/LayerIntf.cpp:546-548`, early-out
+/// `reference/cpp/core/visual/LayerManager.cpp:695-696`).
+#[test]
+fn invalidating_a_live_ancestor_blurs_the_focused_descendant_once() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var top = new Layer(w, null); \
+         var p = new Layer(w, top); p.name = 'p'; p.visible = true; \
+         var c = new Layer(w, p); c.name = 'c'; c.focusable = true; c.visible = true; \
+         var a = new Layer(w, p); a.name = 'a'; a.focusable = true; a.visible = true; \
+         var evlog = ''; \
+         a.onBlur = function(focused) { evlog += 'a.blur:' + (focused === null ? 'null' : focused.name) + ';'; }; \
+         a.onFocus = function(blurred, direction) { evlog += 'a.focus:' + (blurred === null ? 'null' : blurred.name) + ':' + direction + ';'; }; \
+         c.onFocus = function(blurred, direction) { evlog += 'c.focus:' + (blurred === null ? 'null' : blurred.name) + ':' + direction + ';'; }; \
+         a.focus(); \
+         evlog = ''; \
+         invalidate p;",
+    );
     assert_eq!(
         env.eval_ok("evlog"),
-        TjsValue::String("a.blur:b;b.focus:a:1;".into())
+        TjsValue::String("a.blur:null;".into())
     );
-    assert_eq!(env.eval_int("w.focusedLayer === b"), 1);
+    assert_eq!(env.eval_int("w.focusedLayer === null"), 1);
+}
+
+/// Invalidating a primary layer whose **descendant** holds focus fires
+/// exactly that descendant's `onBlur(null)`: `DetachPrimary` clears with
+/// `SetFocusTo(nullptr)` while only the primary is `Shutdown`
+/// (`reference/cpp/core/visual/LayerManager.cpp:175-185`), so the live
+/// descendant's `FireBlur` runs (`:786-787`, argument
+/// `reference/cpp/core/visual/LayerIntf.cpp:3702-3713`) and the null
+/// target fires no `onFocus` (`reference/cpp/core/visual/LayerManager.cpp:789-790`).
+/// The later `BlurTree(primary)` early-returns on the cleared focus
+/// (`reference/cpp/core/visual/LayerManager.cpp:695-696`), so the
+/// focusable sibling never receives the focus the dying tree held.
+#[test]
+fn invalidating_the_primary_layer_blurs_its_focused_descendant_once() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var p = new Layer(w, null); p.name = 'p'; p.visible = true; \
+         var c = new Layer(w, p); c.name = 'c'; c.focusable = true; c.visible = true; \
+         var a = new Layer(w, p); a.name = 'a'; a.focusable = true; a.visible = true; \
+         var evlog = ''; \
+         a.onBlur = function(focused) { evlog += 'a.blur:' + (focused === null ? 'null' : focused.name) + ';'; }; \
+         a.onFocus = function(blurred, direction) { evlog += 'a.focus:' + (blurred === null ? 'null' : blurred.name) + ':' + direction + ';'; }; \
+         c.onFocus = function(blurred, direction) { evlog += 'c.focus:' + (blurred === null ? 'null' : blurred.name) + ':' + direction + ';'; }; \
+         a.focus(); \
+         evlog = ''; \
+         invalidate p;",
+    );
+    assert_eq!(
+        env.eval_ok("evlog"),
+        TjsValue::String("a.blur:null;".into())
+    );
+    assert_eq!(env.eval_int("w.focusedLayer === null"), 1);
 }
 
 /// Re-parenting a focused layer parts it from its old parent

@@ -161,9 +161,18 @@ extern "C" fn layer_invalidate(engine: *mut c_void, instance: *mut c_void) {
     let Ok((_resolved, ctx)) = bound(engine) else {
         return;
     };
-    // Reference `Part()` blurs the focused subtree while the layer is still
-    // in the tree (`reference/cpp/core/visual/LayerIntf.cpp:624-631` via
-    // `LayerManager.cpp:197-201`, `:690-711`).
+    // Reference `Invalidate()` flips `Shutdown` before any detach or blur
+    // (`reference/cpp/core/visual/LayerIntf.cpp:515-516`), so the blur the
+    // teardown triggers (`:538-544` → `Part()` `:624-631` → `SeverChild`
+    // `:657-665` via `LayerManager.cpp:197-201`, `:690-711`) sees an inert
+    // layer: the search origin has lost the manager and can only clear
+    // focus, and an invalidated focus holder fires no `onBlur`
+    // (`LayerManager.cpp:786-787`).
+    if let Ok(scene) = scene_mut(&ctx)
+        && let Some(layer) = scene.layer_mut(id)
+    {
+        layer.shutdown = true;
+    }
     blur_tree(&ctx, id);
     if let Ok(scene) = scene_mut(&ctx) {
         // Detach the layer from the scene so hit-testing and event dispatch
