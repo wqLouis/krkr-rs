@@ -511,3 +511,28 @@ fits the allowlist.
    source only, not run.
 6. **Whether `.map_err`-based propagation would change error *strings*** that a
    script can observe (D34) for the `.sli`/PSD fixes.
+
+---
+
+## 12. The guard, and what it found that this audit did not
+
+`scripts/check-error-handling.sh` enforces §4 mechanically (a bash wrapper over a
+python3 scanner; no compiler), with `scripts/error_handling_allow.txt` holding
+the sites this audit classified as legitimate. It over-reports by design — a
+receiver that is an `Option` looks like one that is a `Result` to a scanner — and
+the allowlist is where that is resolved. Against the tree it found, beyond this
+audit's list:
+
+* `crates/compat/src/natives/storages.rs` — `Path::strip_prefix(..).unwrap_or_else(|_| normalize_storage_name(name))`: a key without the expected prefix silently falls back to the original name.
+* `crates/compat/src/natives/visual/layer/mod.rs` — `i32::try_from(w/h).unwrap_or(i32::MAX)`: an out-of-range size becomes a saturation cap.
+* `crates/platform/media/src/video/ffmpeg.rs` — `u16::try_from(channels).unwrap_or(0)`: an impossible channel count becomes zero.
+* `crates/platform/media/src/video/ffmpeg.rs` — `u64::try_from(ms).unwrap_or(0)`: a negative timestamp becomes zero.
+* `crates/platform/media/src/video/mediacodec.rs` — the same `u64::try_from(pts_ms).unwrap_or(0)` shape.
+
+It also reports nine sites this audit ranked but did not put in the in-flight
+set (`crates/android/src/host.rs`, `crates/android/src/log_file.rs`,
+`crates/app/src/window_ex.rs`, `crates/platform/fs/src/ops.rs`,
+`crates/platform/media/src/video/{ffmpeg,mediacodec}.rs`) and thirty sites this
+audit marked *needs a decision*, which are not allowlisted because "needs a
+decision" is not "legitimate". Both groups are tracked in `TODO.md` §14. The
+guard joins the gate only when its output is clean.

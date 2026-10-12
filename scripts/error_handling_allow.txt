@@ -1,0 +1,78 @@
+# Error-handling allowlist (AGENTS §4).  Enforced by
+# scripts/check-error-handling.sh.
+#
+# One entry per line:  path:line:pattern — reason
+#
+#   path     repo-relative path of the file.
+#   line     the line at the time the entry was written.  Advisory when
+#            `pattern` is a code anchor; exact-match when it is a rule name.
+#   pattern  EITHER a rule name (parse-unwrap, result-fallback,
+#            let-underscore, ok-discard, iflet-ok, debug-assert,
+#            non-exhaustive, allow-dead-code) — then path:line:pattern must
+#            all match — OR a substring of the offending source line, matched
+#            by path + substring so the entry survives line churn and fails
+#            closed when the code changes.
+#   reason   why the site is legitimate.  Cite reference/cpp/** where the
+#            behaviour comes from (D30); a site is not evidence without one.
+#
+# Blank lines and lines starting with '#' are ignored.  An entry that no
+# longer matches any finding is reported as stale so the list can shrink.
+#
+# This list holds the LEGITIMATE rows of docs/audits/error-handling.md.  Do
+# not add a site the audit classifies as a violation; fix it instead.
+
+# --- mutex poisoning is recovered deliberately; no fallible operation is
+#     hidden (audit §3.1). -------------------------------------------------
+crates/engine/src/sound.rs:460:PoisonError::into_inner — recover from a poisoned stream-buffer lock by design; no path panics while it is held
+crates/compat/src/plugin.rs:217:(|poison| poison.into_inner()) — plugin registry lock; poisoning is recovered by design
+crates/compat/src/binding.rs:37:result-fallback — process binding lock; poisoning is recovered by design
+crates/testkit/src/vm.rs:12:result-fallback — dev-helper VM lock; poisoning is recovered by design
+
+# --- str::strip_prefix returns Option, not Result (audit §3.1) ------------
+crates/compat/src/natives/sound.rs:194:strip_prefix('\u{feff}') — Option on &str; the BOM is genuinely optional
+crates/compat/src/resource.rs:258:strip_prefix('@') — Option on &str; the face-name prefix is genuinely optional
+crates/platform/media/src/hint.rs:20:strip_prefix('.') — Option on &str; the media-hint dot is genuinely optional
+crates/compat/src/natives/plugins/json/mod.rs:768:strip_prefix('+') — Option on &str; the JSON argument marker is genuinely optional
+
+# --- MediaFormat::i32 returns Option (absent key); the default is the
+#     documented absent-key value (audit §3.2 rank 3) ----------------------
+crates/platform/media/src/video/mediacodec.rs:596:result-fallback — MediaFormat::i32 returns Option; absent key => documented default
+crates/platform/media/src/video/mediacodec.rs:597:result-fallback — MediaFormat::i32 returns Option; absent key => documented default
+crates/platform/media/src/video/mediacodec.rs:875:result-fallback — MediaFormat::i32 returns Option; absent key => documented default
+crates/platform/media/src/video/mediacodec.rs:876:result-fallback — MediaFormat::i32 returns Option; absent key => documented default
+crates/platform/media/src/video/mediacodec.rs:879:result-fallback — MediaFormat::i32 returns Option; absent key => documented default
+crates/platform/media/src/video/mediacodec.rs:886:result-fallback — MediaFormat::i32 returns Option; absent key => documented default
+crates/platform/media/src/video/mediacodec.rs:891:result-fallback — MediaFormat::i32 returns Option; absent key => documented default
+crates/platform/media/src/video/mediacodec.rs:1047:result-fallback — MediaFormat::i32 returns Option; absent key => documented default
+crates/platform/media/src/video/mediacodec.rs:1048:result-fallback — MediaFormat::i32 returns Option; absent key => documented default
+crates/platform/media/src/video/mediacodec.rs:1067:result-fallback — MediaFormat::i32 returns Option; absent key => documented default
+crates/platform/media/src/video/mediacodec.rs:1079:result-fallback — MediaFormat::i32 returns Option; absent key => documented default
+crates/platform/media/src/video/mediacodec.rs:1083:result-fallback — MediaFormat::i32 returns Option; absent key => documented default
+
+# --- u64::try_from(bytes.len()) cannot overflow on the 64-bit host
+#     (audit §3.1) --------------------------------------------------------
+crates/platform/fs/src/ops.rs:63:u64::try_from(bytes.len()) — usize -> u64 cannot overflow on the 64-bit host
+
+# --- existence probe whose failure surfaces at the real I/O call
+#     (audit §4.1) --------------------------------------------------------
+crates/platform/fs/src/host.rs:29:std::fs::metadata — metadata only rejects directories; the open below reports the real error
+crates/platform/fs/src/ops.rs:167:std::fs::metadata — metadata only rejects directories; remove_file below reports the real error
+
+# --- reference-documented ignored callbacks (audit §5.1;
+#     reference/cpp/core/plugin/Kirikiri/KAGParser.cpp:1163-1170) ---------
+crates/compat/src/natives/kag/mod.rs:246:let-underscore — onLabel handler errors are ignored, matching the reference
+crates/compat/src/natives/kag/mod.rs:264:let-underscore — onScript handler errors are ignored, matching the reference
+crates/compat/src/natives/kag/mod.rs:297:let-underscore — onScenarioLoaded handler errors are ignored, matching the reference
+
+# --- best-effort cleanup (audit §5.1) -------------------------------------
+crates/platform/media/src/video/mediacodec.rs:357:let-underscore — codec.stop() during teardown is best-effort
+
+# --- debug_assert backed by adjacent validation (audit §8) ----------------
+crates/compat/src/natives/plugins/wutcwf/mod.rs:305:debug-assert — TcwfHeader::parse rejects bytes_per_block < 32; the equal assert is redundant
+crates/compat/src/natives/plugins/wutcwf/mod.rs:306:debug-assert — decode_tcwf allocates exactly samples_per_block*channels; the equal assert is redundant
+crates/platform/render/src/glyph.rs:222:debug-assert — internal rasterizer invariant; no unsafe/indexing depends on it in release
+
+# --- pub(crate) thiserror error enums, never matched variant-by-variant
+#     (audit §7) -----------------------------------------------------------
+crates/compat/src/natives/sound.rs:171:non-exhaustive — SliError is a pub(crate) thiserror error enum, not a discriminant
+crates/compat/src/resource.rs:673:non-exhaustive — PrerenderedFontError is a pub(crate) thiserror error enum, not a discriminant

@@ -346,7 +346,33 @@ these needs new evidence, not a re-read.
   0 missing and **2 intentional extras** (`KAGParser.multiLineTagEnabled`,
   `paramMacros`; `docs/native_parity.md`).
 
-## 14. Audit reports
+## 14. Error handling — the guard and what is left
+
+`scripts/check-error-handling.sh` enforces §4 mechanically (bash + python3, no
+compiler), with `scripts/error_handling_allow.txt` holding the sites the audit
+classified as legitimate. It is not in the gate yet: it must be green first.
+
+Open when the in-flight fixes land:
+
+* **The guard's six new findings**, which the audit did not classify: the
+  storage-name fallback in `compat/natives/storages.rs`, the size saturation in
+  `compat/natives/visual/layer/mod.rs`, two conversions in
+  `platform/media/src/video/ffmpeg.rs`, one in `mediacodec.rs`, and the Android
+  and `app/window_ex.rs` sites. Being fixed now.
+* **Thirty sites the audit marked "needs a decision"** — mostly `let _ =` on a
+  fallible call (`set_member`, `delete_member`, `resolve_face`, `update_layer`,
+  `buffer.poll`, `overlay.stop`, `send_eof`) and five `.ok()` discards. Each is
+  either fixed or covered by an allowlist entry naming the reason; none is
+  covered today, so the guard fails on them.
+* **Nine sites the audit ranked but did not name in the in-flight set**
+  (`android/src/host.rs`, `android/src/log_file.rs`, `app/src/window_ex.rs`,
+  `platform/fs/src/ops.rs`, `platform/media/src/video/*`). Some are the same
+  `usize → u64` conversions the audit calls legitimate; the rest need the fix or
+  an allowlist reason.
+* **Wire the guard into the gate** (AGENTS §0, straight after the stateless
+  guard) and update the audit with the new findings.
+
+## 15. Audit reports
 
 | topic | report |
 |---|---|
@@ -363,3 +389,5 @@ these needs new evidence, not a re-read.
 | Android launcher UI | `docs/audits/android-ui-review.md` |
 | Android JNI seam | `docs/audits/android-jni-review.md` |
 | Android storage/lifetime | `docs/audits/android-storage-review.md` |
+| Error handling, fallbacks and panics | `docs/audits/error-handling.md` |
+| The menu popup surface | `docs/audits/menu-popup.md` |
