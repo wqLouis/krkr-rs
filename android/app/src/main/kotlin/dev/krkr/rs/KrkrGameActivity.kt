@@ -40,7 +40,7 @@ class KrkrGameActivity : GameActivity() {
          *
          * `@JvmField` (not `@JvmStatic`) is deliberate: it puts a real static
          * **field** on this class, which is what the JNI `GetStaticField` read
-         * in `crates/android/src/lib.rs` expects. A `@JvmStatic var` in a
+         * in `crates/android/src/jni_fields.rs` expects. A `@JvmStatic var` in a
          * companion would expose accessor *methods* instead, and the field
          * would live on the companion object.
          */

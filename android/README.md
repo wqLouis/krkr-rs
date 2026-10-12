@@ -45,13 +45,11 @@ ANDROID_NDK_HOME=/path/to/android-ndk-r27c ./crates/android/build-android.sh
 cd android && gradle assembleDebug
 ```
 
-> **Not buildable on this branch.** `crates/android` (the `krkr_android` cdylib
-> and its `build-android.sh`) was dropped when the old Bevy frontends were
-> removed (`chore(migration): drop obsolete frontends and scaffold new crates`),
-> and the L1 Android event loop is still stubbed (`docs/android.md` §2.1). The
-> commands above are the state on the `android` branch, not here; the
-> composition root has to be rebuilt against the L1–L4 architecture before the
-> APK can be produced again.
+> **Rebuilt composition root.** `crates/android` is again the `krkr_android`
+> cdylib (`android_main` plus its `build-android.sh`); it drives the shared
+> `app::Host`/`app::GameHost` from the `android-activity` `GameActivity` loop
+> (`docs/android.md` §2.1). The commands above still require the Android SDK
+> and NDK, which are not part of the desktop build.
 
 `gradle assembleDebug` rather than `./gradlew`: the repository has no Gradle
 wrapper yet (its jar is a binary), so CI installs a pinned Gradle instead.
@@ -60,7 +58,7 @@ wrapper yet (its jar is a binary), so CI installs a pinned Gradle instead.
 
 All Android-specific knowledge lives in `crates/android/build-android.sh` so the
 engine crates stay platform-neutral. `cargo ndk` is deliberately **not** used: it
-does not provide `CXX` in the form `crates/tjs2-sys/build.rs` reads (it sets the
+does not provide `CXX` in the form `crates/tjs/build.rs` reads (it sets the
 target-scoped `CXX_<triple>`), so the build script falls back to its default
 `zig c++` — which compiles for the **host**. An Android build then contains
 x86-64 objects, and `cargo check` does not link, so it looks like it worked.
@@ -90,10 +88,10 @@ inherited from the old Bevy architecture and partially rebuilt:
 | Part | State |
 |---|---|
 | Compose M3 launcher + SAF picker + JSON library (`games.json`) | present (inherited); not compiled on this branch |
-| Engine composition root (`crates/android`, cdylib + JNI) | **absent on this branch** — dropped with the old Bevy frontends; must be rebuilt against L1–L4 |
+| Engine composition root (`crates/android`, cdylib + `android_main`) | **present** — reads the Activity's JNI fields, writes `krkr_state.json`, drives the host |
+| Android event loop | driven by `crates/android` through `android-activity`; `platform::run` stays the desktop (winit) driver (`docs/android.md` §2.1) |
 | L1 Android window (`platform::PlatformWindow`) | real `ANativeWindow` wrapper + raw handle + size/density; compiles for `aarch64-linux-android` (`docs/android.md` §2.1) |
-| L1 Android event loop | stubbed (`platform::run` returns `NotImplemented`); needs `android-activity` (`docs/android.md` §2.1) |
-| Android input translation (`PhysicalKey`/`TouchPhase`/`MouseButton`) | implemented and host-tested in `crates/platform/platform/src/android.rs` |
+| Android input translation (`PhysicalKey`/`TouchPhase`/`MouseButton`) | implemented and host-tested in `crates/platform/platform/src/android.rs`, consumed by the composition root's loop |
 | MediaCodec video backend | `crates/platform/media` has a compile-checked backend; never run on a device |
 | Gradle `assembleDebug` verified locally | not on this branch |
 | CI workflow (`.github/workflows/android.yml`) | inherited; runs only on the `android` branch and tags |

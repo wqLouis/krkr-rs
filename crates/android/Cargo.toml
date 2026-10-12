@@ -1,0 +1,40 @@
+[package]
+name = "android"
+description = "krkr-rs Android composition root: android_main, the GameActivity event loop and JNI wiring"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The cdylib name must match `android.app.lib_name` in the manifest
+# (android/app/src/main/AndroidManifest.xml) — it is how the AGDK GameActivity
+# finds the native entry point.
+[lib]
+name = "krkr_android"
+crate-type = ["cdylib"]
+
+[dependencies]
+# The state-file writer is plain std + log, so it also compiles and is tested
+# on the host even though only the Android build runs it.
+log = { workspace = true }
+
+# Everything that touches Android is target-scoped: on a desktop host the
+# crate compiles to just the (host-tested) state module and the desktop
+# dependency graph is unchanged.
+[target.'cfg(target_os = "android")'.dependencies]
+# The GameActivity glue the Kotlin `KrkrGameActivity` attaches to. The Kotlin
+# class derives from Google's GameActivity, so the `game-activity` feature
+# selects the matching native entry point.
+android-activity = { version = "0.6", default-features = false, features = ["game-activity"] }
+# The three static fields `KrkrGameActivity` publishes are read with JNI.
+jni = "0.21"
+api = { workspace = true }
+# The emulator host (L2 engine state + L4 VM host) the loop drives.
+app = { path = "../app" }
+# The L1 Android backend (real window + input translation). The desktop
+# composition root selects `platform-linux` instead.
+platform = { workspace = true, features = ["platform-android"] }
+# The composition root chooses the presentation mode and names the engine's
+# `ScalingMode` at the `HostConfig` boundary.
+engine = { workspace = true }
+# The composition root owns the process logger.
+env_logger = { workspace = true }

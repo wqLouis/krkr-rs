@@ -69,6 +69,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "android"
+version = "1.0.0"
+dependencies = [
+ "android-activity",
+ "api",
+ "app",
+ "engine",
+ "env_logger",
+ "jni 0.21.1",
+ "log",
+ "platform",
+]
+
+[[package]]
 name = "android-activity"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -84,6 +98,7 @@ dependencies = [
  "ndk-context",
  "ndk-sys",
  "num_enum",
+ "simd_cesu8",
  "thiserror 2.0.20",
 ]
 

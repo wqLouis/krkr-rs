@@ -12,17 +12,8 @@ path = "src/main.rs"
 [dependencies]
 api = { workspace = true }
 engine = { workspace = true }
-# D13: select the platform explicitly; platform has no default feature.
-# The desktop binary builds the Linux backend. An Android frontend must depend
-# on `platform` with `features = ["platform-android"]` instead.
-platform = { workspace = true, features = ["platform-linux"] }
 render = { workspace = true }
 fs = { workspace = true }
-# D13: the desktop binary selects the FFmpeg video backend explicitly rather
-# than relying on `media`'s default, so the Android frontend's
-# `default-features = false, features = ["video-mediacodec"]` counterpart is
-# documented at the call site too.
-media = { workspace = true, features = ["video-ffmpeg"] }
 raw-window-handle = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
@@ -32,6 +23,21 @@ env_logger = { workspace = true }
 compat = { workspace = true }
 # The composition root also drives the L4 VM host (boot + frame body).
 vm = { workspace = true }
+
+# The window/audio and video backends are selected per target so a desktop
+# backend can never leak into an Android build (and vice versa). `platform`
+# has no default feature; `media` defaults to FFmpeg on the desktop and the
+# Android build turns that default off for MediaCodec.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+platform = { workspace = true, features = ["platform-linux"] }
+media = { workspace = true, features = ["video-ffmpeg"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+platform = { workspace = true, features = ["platform-android"] }
+# Named by path rather than `workspace = true`: edition 2024 forbids a member
+# from turning off default features inherited from the workspace, and the
+# Android arm must drop FFmpeg for MediaCodec.
+media = { path = "../platform/media", default-features = false, features = ["video-mediacodec"] }
 
 [dev-dependencies]
 tjs = { workspace = true }
