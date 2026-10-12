@@ -63,8 +63,16 @@ impl Env {
     /// `codec` is true the synthetic decode/probe/save closures are installed;
     /// otherwise every codec-backed member raises.
     fn new(codec: bool) -> Env {
+        Env::with_files(codec, &[("/images/test.img", b"not-a-real-image")])
+    }
+
+    /// Like [`Env::new`], but the in-memory storage also holds `files`
+    /// (`(path, bytes)`), written before the storage is mounted.
+    fn with_files(codec: bool, files: &[(&str, &[u8])]) -> Env {
         let fs = FileSystem::memory();
-        write_memory_file(&fs, "/images/test.img", b"not-a-real-image");
+        for &(path, data) in files {
+            write_memory_file(&fs, path, data);
+        }
         let storage =
             Storage::mount_archives(fs, "/", std::iter::empty::<&str>()).expect("mount storage");
 
@@ -125,6 +133,30 @@ impl Env {
                 });
                 Ok(())
             },
+        );
+    }
+
+    /// Replaces the installed codec with one whose decode closure records each
+    /// resolved name (the storage name that actually resolved) and returns the
+    /// shared 2x2 test image.
+    fn record_decodes(&self, hints: Arc<Mutex<Vec<String>>>) {
+        self.host.set_image_codec(
+            move |_bytes, hint| {
+                hints
+                    .lock()
+                    .expect("decode lock")
+                    .push(hint.unwrap_or_default().to_string());
+                Ok(DecodedImage::new(2, 2, DECODED_RGBA.to_vec()))
+            },
+            |_bytes, _hint| {
+                Ok(ImageInfo {
+                    width: 2,
+                    height: 2,
+                    has_alpha: true,
+                    format: Some("img".to_string()),
+                })
+            },
+            |_name, _type, _width, _height, _rgba| Ok(()),
         );
     }
 
@@ -515,4 +547,138 @@ fn a_single_numeric_argument_leaves_the_bitmap_null() {
     // (reference/cpp/core/visual/BitmapIntf.cpp:194-210).
     assert_eq!(env.eval_int("b.buffer"), 0);
     assert_eq!(env.eval_int("b.bufferPitch"), 0);
+}
+
+/// A load that changes the image dimensions installs the decoded buffer
+/// byte-for-byte, reports the new dimensions and leaves the bitmap dirty.
+///
+/// reference/cpp/core/visual/BitmapIntf.cpp:98-106 (`tTJSNI_Bitmap::Load`
+/// replaces the object's image through `TVPLoadGraphic`).
+#[test]
+fn load_into_a_resized_bitmap_installs_the_decoded_pixels() {
+    let _lock = vm_lock();
+    let env = Env::new(true);
+
+    env.run("var b = new Bitmap(1, 1);");
+    let revision = env._scene.revision();
+    env.run("b.load('images/test.img');");
+
+    assert_eq!(env.eval_int("b.width"), 2);
+    assert_eq!(env.eval_int("b.height"), 2);
+    assert_eq!(env.eval_int("b.bufferPitch"), 8);
+    // Straight-alpha RGBA (1, 2, 3, 255) reads back as ARGB 0xff010203, and
+    // every pixel comes from the decoded buffer, not the zero-filled resize.
+    assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0xff01_0203);
+    assert_eq!(env.eval_int("b.getPixel(1, 0)"), 0xff04_0506);
+    assert_eq!(env.eval_int("b.getPixel(0, 1)"), 0xff07_0809);
+    assert_eq!(env.eval_int("b.getPixel(1, 1)"), 0xff0a_0b0c);
+    assert_eq!(env.eval_int("b.getMaskPixel(0, 1)"), 255);
+
+    let bitmap = env._scene.bitmaps.last().expect("the loaded image");
+    assert_eq!(bitmap.width, 2);
+    assert_eq!(bitmap.height, 2);
+    assert_eq!(bitmap.rgba.as_slice(), DECODED_RGBA.as_slice());
+    assert!(bitmap.dirty, "a loaded image is dirty");
+    assert!(
+        bitmap.content_generation > 0,
+        "a loaded image bumps its content generation"
+    );
+    assert!(
+        env._scene.revision() > revision,
+        "a load invalidates the scene projection"
+    );
+}
+
+/// A load whose image size matches the bitmap's current size takes the same
+/// field-assignment path and installs the decoded buffer unchanged.
+///
+/// reference/cpp/core/visual/BitmapIntf.cpp:98-106.
+#[test]
+fn load_into_a_same_size_bitmap_installs_the_decoded_pixels() {
+    let _lock = vm_lock();
+    let env = Env::new(true);
+
+    env.run("var b = new Bitmap(2, 2); b.setPixel(0, 0, 0xff112233);");
+    env.run("b.load('images/test.img');");
+
+    assert_eq!(env.eval_int("b.width"), 2);
+    assert_eq!(env.eval_int("b.height"), 2);
+    assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0xff01_0203);
+    assert_eq!(env.eval_int("b.getPixel(1, 1)"), 0xff0a_0b0c);
+
+    let bitmap = env._scene.bitmaps.last().expect("the loaded image");
+    assert_eq!(bitmap.rgba.as_slice(), DECODED_RGBA.as_slice());
+    assert!(bitmap.dirty, "a loaded image is dirty");
+}
+
+/// The literal name resolves before any extension is appended: with both
+/// `images/plain` and `images/plain.png` present, the decoder is handed
+/// `images/plain`.
+///
+/// reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1591-1610 (when the name
+/// has no extension the reference appends its registered extensions until one
+/// exists; the port probes the literal name first).
+#[test]
+fn resolution_tries_the_plain_name_before_any_extension() {
+    let _lock = vm_lock();
+    let files: &[(&str, &[u8])] = &[
+        ("/images/plain", b"plain"),
+        ("/images/plain.png", b"extended"),
+    ];
+    let env = Env::with_files(true, files);
+    let hints = Arc::new(Mutex::new(Vec::new()));
+    env.record_decodes(hints.clone());
+
+    env.run("var b = new Bitmap(); b.load('images/plain');");
+
+    assert_eq!(env.eval_int("b.width"), 2);
+    assert_eq!(
+        hints.lock().expect("decode lock").clone(),
+        vec!["images/plain".to_string()],
+        "the literal name is resolved without probing an extension"
+    );
+}
+
+/// A name that only resolves with an appended extension is decoded under the
+/// resolved name.
+///
+/// reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1591-1610.
+#[test]
+fn resolution_probes_extensions_when_the_plain_name_misses() {
+    let _lock = vm_lock();
+    let files: &[(&str, &[u8])] = &[("/images/only.png", b"extended")];
+    let env = Env::with_files(true, files);
+    let hints = Arc::new(Mutex::new(Vec::new()));
+    env.record_decodes(hints.clone());
+
+    env.run("var b = new Bitmap(); b.load('images/only');");
+
+    assert_eq!(env.eval_int("b.width"), 2);
+    assert_eq!(
+        hints.lock().expect("decode lock").clone(),
+        vec!["images/only.png".to_string()],
+        "the `.png` candidate is resolved and handed to the decoder"
+    );
+}
+
+/// A name that resolves to no candidate keeps failing with the unresolved
+/// request in the message.
+///
+/// reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1605-1610: when no
+/// extension candidate exists the reference raises.
+#[test]
+fn a_name_that_resolves_to_nothing_raises_and_names_the_request() {
+    let _lock = vm_lock();
+    let env = Env::with_files(true, &[]);
+
+    let error = env.error("(new Bitmap(1, 1)).load('images/missing');");
+    assert!(
+        error.contains("Bitmap.load: storage not found: images/missing"),
+        "{error}"
+    );
+    let header_error = env.error("Bitmap.loadHeader('images/missing')");
+    assert!(
+        header_error.contains("Bitmap.loadHeader: storage not found: images/missing"),
+        "{header_error}"
+    );
 }

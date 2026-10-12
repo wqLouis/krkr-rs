@@ -73,18 +73,20 @@ const IMAGE_EXTENSION_PROBE: [&str; 21] = [
 
 /// Read `name` through the attached L2 [`Storage`], probing the common image
 /// extensions when the name itself does not resolve.
+///
+/// The plain name is tried first and each extension is composed only after the
+/// earlier candidates miss, so a name that resolves as given composes none.
 pub(crate) fn read_image_from_storage(
     storage: &Storage,
     name: &str,
 ) -> Result<(String, Vec<u8>), String> {
-    let mut candidates: Vec<String> = Vec::with_capacity(IMAGE_EXTENSION_PROBE.len() + 1);
-    candidates.push(name.to_string());
-    candidates.extend(
-        IMAGE_EXTENSION_PROBE
-            .iter()
-            .map(|extension| format!("{name}{extension}")),
-    );
-    for candidate in candidates {
+    match storage.read(name) {
+        Ok(bytes) => return Ok((name.to_string(), bytes)),
+        Err(StorageReadError::NotFound(_)) => {}
+        Err(error) => return Err(error.to_string()),
+    }
+    for extension in IMAGE_EXTENSION_PROBE {
+        let candidate = format!("{name}{extension}");
         match storage.read(&candidate) {
             Ok(bytes) => return Ok((candidate, bytes)),
             Err(StorageReadError::NotFound(_)) => {}
@@ -121,7 +123,6 @@ pub(crate) fn replace_bitmap_pixels(
     height: u32,
     rgba: Vec<u8>,
 ) {
-    scene.resize_bitmap(id, width, height, [0, 0, 0, 0]);
     if let Some(bitmap) = scene.bitmap_mut(id) {
         bitmap.width = width;
         bitmap.height = height;
