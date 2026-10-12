@@ -307,9 +307,8 @@ wait.
 `pixel_offset` + 4-byte copy — inside the innermost loop, with no row
 specialization, no `chunks_exact_mut(4)`, no bulk copy. `compose_text_into` and
 `blit_coverage_into` (`text.rs:1425`) use a generic per-pixel
-`blend_tinted_coverage` with `f32` math per channel. The projection's
-`draw_primary_bitmap` (`crates/engine/src/layer_ops.rs:2165`) is likewise
-per-pixel.
+`blend_tinted_coverage` with `f32` math per channel. The projection reaches the
+screen through these same helpers.
 
 These are the building blocks of #1, #3 and the text path. A rowwise fast path
 (`copy_from_slice` for `mode=0`/opaque and `32`-bit word operations for the

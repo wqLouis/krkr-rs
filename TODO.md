@@ -558,6 +558,14 @@ Verify current state first; several were fixed in the last wave.
 
 ## 9. Platform stubs — Android only (permitted)
 
+**The Android target is never built or tested on the development host.** No NDK is
+installed there and none may be installed; android- only code is written and
+reviewed here but compiled and run on a machine with the NDK. The host bar is
+`cargo check --workspace` staying green: an Android dependency is target-gated so
+the host never compiles it, and a `--target *-linux-android` check is not run. Code
+that has not been compiled is documented as unverified rather than described as
+working.
+
 * `crates/platform/platform/src/android.rs` — window + event loop return `NotImplemented`; the AAudio output backend is real. Needs `ANativeWindow` + `GameActivity`, a size/scale source, a redraw request reaching the Vulkan surface, and input→`PlatformEvent` translation (`docs/migration/10-android-backends.md`).
 * `crates/platform/media/src/video/mediacodec.rs` — written, **never compiled or run**; the host build uses a typed `stub`.
 
@@ -585,17 +593,6 @@ Verify current state first; several were fixed in the last wave.
 * **`unsafe_code` lint** — `forbid` where there is no `unsafe`, `deny(unsafe_code)` + a file-level `allow` where the FFI lives.
 * **`get_`-prefixed public API left:** `Tjs2Engine::get_member`, `get_class_names`; `Scene::get_province_pixel`.
 * **Verify no decision-number tags returned** to plugin sources: `grep -rn "//.*\bD[0-9]\+\b" crates/compat/src`.
-* **A dead "primary screen buffer" subsystem.** `layer_ops::composite_primary_layer`
-  (`crates/engine/src/layer_ops.rs:2185`) is called only from
-  `crates/engine/tests/layer_ops.rs:136`; it is the sole production setter of
-  `BitmapState::screen_buffer` (`:2091`, `:2113`), which
-  `projection.rs:290-295,414-415` then consults through
-  `is_screen_buffer_layer`. A screenshot is the reference's `Complete` composite
-  (`LayerIntf.cpp:4545-4550`, `:7673-7755`) — the `piledCopy` subtree render — so
-  this alternate design was superseded and nothing reaches it. Decide whether to
-  delete it and its projection branch, or to wire it to the path that needs a
-  screen buffer; `docs/migration/reviews/engine.md:215,289` and
-  `history/01-investigation.md:177` record why it existed.
 
 ## 12. Traps that cost real time — read before triaging anything
 

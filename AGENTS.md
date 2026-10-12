@@ -25,8 +25,12 @@ The gate runs in this order and must end green:
 cargo fmt --all -- --check
 bash scripts/check-stateless.sh                  # D9 guard
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace                           # all crates
+cargo test --workspace --no-fail-fast            # all crates; never fail-fast, so one
+                                                 # failing target cannot hide the rest
 cargo test -p platform --features platform-linux
+cargo clippy -p platform --features platform-android --all-targets -- -D warnings
+cargo test -p platform --features platform-android
+python3 scripts/check-android-target.py              # per-target feature resolution
 python3 scripts/surface_lock.py --update         # only the main agent; review the diff
 python3 scripts/surface_lock.py
 python3 scripts/native_parity.py
@@ -35,6 +39,20 @@ python3 scripts/plugin_parity.py --no-doc
 
 `scripts/surface_lock.py --update` is for the **main agent only**, after the
 change is understood.
+
+The `platform-android` steps build the **feature on the host**, not the Android
+target: the feature compiles the platform-independent helpers plus a typed stub,
+and everything that needs `ndk` stays gated to `target_os = "android"`. The
+Android target itself is **never** built or tested here — there is no NDK on the
+host and none may be installed (see §9 of `TODO.md`); it is compiled and run on a
+machine that has one, and Android-only code that has not been compiled is
+documented as unverified rather than described as working.
+
+`scripts/check-android-target.py` resolves the dependency graph per target
+without compiling anything and fails when a desktop-only backend feature leaks
+into the Android target, or when two mutually-exclusive backends are enabled
+together. A feature leak of that kind is invisible until something builds the
+other way, which is how it reached the tree twice.
 
 ---
 

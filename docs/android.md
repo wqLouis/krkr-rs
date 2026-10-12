@@ -107,25 +107,24 @@ aarch64-linux-android`):
   reference `VK_*` codes stay the compatibility layer's job.
 * **Audio output** (AAudio) was already real.
 
-Still stubbed, and deliberately failing fast rather than degrading:
+The **event loop** is driven by the Android composition root, not by
+`platform::run`. `platform::run` is the desktop (winit) driver and still
+returns `PlatformError::NotImplemented` on Android; the Android root
+(`crates/android`) owns the `android-activity` `GameActivity` glue and turns
+its lifecycle and input callbacks into the same `PlatformEvent`s, calling the
+same `EventHandler` the winit driver calls. The `android-activity` dependency
+lives in `crates/android` (target-scoped) so the desktop workspace is
+unaffected:
 
-* **The event loop.** `run` returns `PlatformError::NotImplemented`. Driving
-  the loop needs the `android-activity` glue and its `GameActivity` entry point
-  to deliver the `ANativeWindow`, the lifecycle and the input queue to
-  `EventHandler`. That crate is not a dependency of `platform`, so the backend
-  cannot be started — and does not pretend to be. Closing the gap is a
-  `Cargo.toml` change plus a `run` that drives `android-activity`'s
-  `AndroidApp` with the same `EventHandler` the Linux winit backend drives:
+```toml
+[target.'cfg(target_os = "android")'.dependencies]
+android-activity = { version = "0.6", default-features = false, features = ["game-activity"] }
+```
 
-  ```toml
-  [target.'cfg(target_os = "android")'.dependencies]
-  android-activity = { version = "0.6", default-features = false, features = ["game-activity"] }
-  ```
-
-  (`android-activity` 0.6.1 uses the same `ndk` 0.9 as this crate, so the
-  `NativeWindow` type unifies. Its build script compiles a small C glue file,
-  so once it is a dependency a target check needs the NDK `cc` that the current
-  check does not.)
+(`android-activity` 0.6.1 uses the same `ndk` 0.9 as `platform`, so the
+`NativeWindow` type unifies. Its build script compiles a small C++ glue file,
+so an Android target check needs the NDK `cc`/`cxx` that the `platform` check
+above does not.)
 
 ### 2.2 Scaling: Android must always use automatic scaling
 
@@ -144,17 +143,17 @@ presentation.
 
 The platform side of this is already done: `PlatformWindow::size()` reports the
 physical surface size and `PlatformWindow::scale_factor()` the display density.
-The default itself belongs to the **platform configuration seam**, not L1 (L1
-must not know TVP/scaling semantics) and not the app (which may not branch on
-the OS):
+The default itself belongs to the **launcher**, not L1 (L1 must not know
+TVP/scaling semantics) and not the engine (which receives an already-resolved
+value and does no configuration I/O of its own):
 
-* the Android build's `platform::config_source()` reports
-  `scaling: Some(PresentationScaling::Fit)` — the platform-provided override
-  (`api::config::RuntimeConfigOverrides`), which is exactly the seam `platform`
-  already exposes for platform-specific defaults. A composition root that builds
-  its `HostConfig` directly instead sets `ScalingMode::Fit`. Either way the
-  no-argument Android launch fits the screen; `crates/app`'s built-in default
-  stays `Game` for the desktop CLI, and `--scaling` still overrides either.
+* the Android composition root `crates/android` builds its `RuntimeConfig` with
+  `scaling: PresentationScaling::Fit` and drives the shared
+  `app::Host`/`app::GameHost` from the `android-activity` event loop; the
+  desktop CLI drives the same host through `app::run`. The desktop default
+  stays `Game`, and `--scaling` still overrides either. Loading the
+  configuration is deliberately the launcher's business, so each platform can
+  implement it its own way (`docs/runtime-config.md`).
 
 ---
 

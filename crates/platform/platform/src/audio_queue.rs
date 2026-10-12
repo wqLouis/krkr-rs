@@ -68,6 +68,7 @@ pub(crate) const PREFILL_MS: usize = 150;
 /// ramp) and short enough that a listener does not hear a new silence gap.
 /// Counted in sample frames at `sample_rate`, with the gain advanced once per
 /// frame, so the fade is the same wall-clock length for mono and stereo.
+#[cfg(any(feature = "platform-linux", target_os = "android"))]
 pub(crate) const RAMP_MS: usize = 5;
 
 /// The software queue shared by [`AudioDevice::write`] and the device
@@ -81,21 +82,27 @@ pub(crate) const RAMP_MS: usize = 5;
 pub(crate) struct AudioQueue {
     /// Interleaved samples not yet consumed by the device.
     samples: VecDeque<f32>,
-    /// Channels per frame (at least one).
-    channels: usize,
     /// Maximum buffered samples (the two-second cap).
     capacity: usize,
     /// Samples required before the device may start.
     prefill: usize,
+    /// Channels per frame (at least one).
+    #[cfg(any(feature = "platform-linux", target_os = "android"))]
+    channels: usize,
     /// The last emitted sample of each channel (the hold source).
+    #[cfg(any(feature = "platform-linux", target_os = "android"))]
     last_frame: Vec<f32>,
     /// Frames in a full fade (`RAMP_MS` at `sample_rate`, at least one).
+    #[cfg(any(feature = "platform-linux", target_os = "android"))]
     ramp_samples: usize,
     /// The shared output gain in `0.0..=1.0`, applied to every channel.
+    #[cfg(any(feature = "platform-linux", target_os = "android"))]
     gain: f32,
     /// Fade position in `0..=ramp_samples`; `gain == level / ramp_samples`.
+    #[cfg(any(feature = "platform-linux", target_os = "android"))]
     gain_level: usize,
     /// Position within the current frame (`0..channels`).
+    #[cfg(any(feature = "platform-linux", target_os = "android"))]
     phase: usize,
 }
 
@@ -111,16 +118,23 @@ impl AudioQueue {
         let prefill = (per_second.saturating_mul(PREFILL_MS) / 1_000).min(capacity);
         // The ramp is one gain step per frame, so it is measured in frames
         // (not interleaved samples) and is channel-count independent.
+        #[cfg(any(feature = "platform-linux", target_os = "android"))]
         let ramp_samples = ((sample_rate as usize).saturating_mul(RAMP_MS) / 1_000).max(1);
         Self {
             samples: VecDeque::new(),
-            channels,
             capacity,
             prefill,
+            #[cfg(any(feature = "platform-linux", target_os = "android"))]
+            channels,
+            #[cfg(any(feature = "platform-linux", target_os = "android"))]
             last_frame: vec![0.0; channels],
+            #[cfg(any(feature = "platform-linux", target_os = "android"))]
             ramp_samples,
+            #[cfg(any(feature = "platform-linux", target_os = "android"))]
             gain: 1.0,
+            #[cfg(any(feature = "platform-linux", target_os = "android"))]
             gain_level: ramp_samples,
+            #[cfg(any(feature = "platform-linux", target_os = "android"))]
             phase: 0,
         }
     }
@@ -144,6 +158,7 @@ impl AudioQueue {
 
     /// Returns the next queued sample, or repeats the last sample for this
     /// channel on underrun while fading toward silence (see the module docs).
+    #[cfg(any(feature = "platform-linux", target_os = "android"))]
     pub(crate) fn pop_or_hold(&mut self) -> f32 {
         let channel = self.phase;
         // The gain is advanced once per frame, before the frame's first
@@ -174,6 +189,7 @@ impl AudioQueue {
     /// Steps the shared gain one frame toward `1.0` (real audio) or `0.0`
     /// (silence). The level is kept as an integer so a completed fade is
     /// exactly `1.0` or `0.0`, not a rounded near-miss.
+    #[cfg(any(feature = "platform-linux", target_os = "android"))]
     fn advance_gain(&mut self, toward_silence: bool) {
         if toward_silence {
             self.gain_level = self.gain_level.saturating_sub(1);
@@ -188,7 +204,7 @@ impl AudioQueue {
     /// This is the exact underrun step the device callbacks drive one sample
     /// at a time; it exists as a slice form so it can be unit-tested without
     /// a device.
-    #[cfg(test)]
+    #[cfg(all(test, any(feature = "platform-linux", target_os = "android")))]
     pub(crate) fn drain(&mut self, out: &mut [f32]) -> bool {
         let underrun = self.samples.len() < out.len();
         for slot in out.iter_mut() {
@@ -198,7 +214,7 @@ impl AudioQueue {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "platform-linux", target_os = "android")))]
 mod tests {
     use super::*;
 
