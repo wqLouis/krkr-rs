@@ -318,12 +318,12 @@ fn build_xp3(entries: &[(&str, &[u8], bool)]) -> Vec<u8> {
     file
 }
 
-/// An in-memory storage mounting `data.xp3` with one entry,
-/// `images/broken.png`, whose index entry is valid but whose stored zlib
-/// segment is corrupt. Reading the entry is an archive error, not a missing
-/// entry, so the in-memory file system alone cannot produce this case.
-fn corrupt_archive_storage() -> Storage {
-    let mut xp3 = build_xp3(&[("images/broken.png", &[0x5a_u8; 256], true)]);
+/// An in-memory storage mounting `data.xp3` with one entry, `entry`, whose
+/// index entry is valid but whose stored zlib segment is corrupt. Reading the
+/// entry is an archive error, not a missing entry, so the in-memory file
+/// system alone cannot produce this case.
+fn corrupt_archive_storage(entry: &str) -> Storage {
+    let mut xp3 = build_xp3(&[(entry, &[0x5a_u8; 256], true)]);
     // The stored segment starts after the 19-byte XP3 header (11-byte magic
     // plus the 8-byte index offset); flipping its zlib header makes the
     // decoder reject the stream.
@@ -1386,7 +1386,7 @@ fn gdiplus_image_name_that_resolves_to_nothing_raises_cannot_open() {
 #[test]
 fn gdiplus_image_storage_read_failure_surfaces_as_itself() {
     let _lock = vm_lock();
-    let env = Env::build(Some(corrupt_archive_storage()), true);
+    let env = Env::build(Some(corrupt_archive_storage("images/broken.png")), true);
 
     let error = env
         .try_run("new GdiPlus.Image('images/broken.png');")
@@ -1452,11 +1452,16 @@ fn gdiplus_private_font_error_paths() {
     let (storage, _dir) = font_storage(&name, &bytes);
     let env = Env::build(Some(storage), false);
     // A missing file throws `cannot open:%1`
-    // (`reference/cpp/plugins/layerex_draw/blend2d/LayerExDraw.cpp:93-127`).
+    // (`reference/cpp/plugins/layerex_draw/blend2d/
+    // LayerExDraw.cpp:94-95,125`): the empty placed path reaches the final
+    // `TVPThrowExceptionMessage` with the requested name.
     let missing = env
         .try_run("GdiPlus.addPrivateFont('does-not-exist.ttf');")
         .expect_err("a missing font must raise");
-    assert!(missing.contains("cannot open"), "{missing}");
+    assert!(
+        missing.contains("cannot open:does-not-exist.ttf"),
+        "{missing}"
+    );
     // A readable file the font reader rejects throws `blend2d cannot load:%1`.
     let garbage = env
         .try_run("GdiPlus.addPrivateFont('garbage.ttf');")
@@ -1466,6 +1471,33 @@ fn gdiplus_private_font_error_paths() {
     // (`reference/cpp/core/plugin/ncbind.hpp:1178`).
     assert!(env.try_run("GdiPlus.addPrivateFont();").is_err());
     assert!(env.try_run("GdiPlus.getFontList();").is_err());
+}
+
+/// A storage read that fails for a reason other than "not found" is surfaced
+/// as itself instead of being reported as the reference's missing-file
+/// `cannot open:%1`.
+///
+/// reference/cpp/plugins/layerex_draw/blend2d/LayerExDraw.cpp:94-100: the
+/// reference reads the resolved storage through a binary stream, and a read
+/// that cannot be satisfied raises the stream error
+/// (`reference/cpp/core/tjs2/tjs.cpp:665-669`), so it propagates out of
+/// `addPrivateFont` and never becomes `cannot open:%1` (that message is only
+/// the empty-placed-path path, LayerExDraw.cpp:125). The in-memory file
+/// system cannot fail a read for an entry it holds, so the failure comes from
+/// a mounted XP3 whose index parses but whose zlib segment is corrupt.
+#[test]
+fn gdiplus_private_font_storage_read_failure_surfaces_as_itself() {
+    let _lock = vm_lock();
+    let env = Env::build(Some(corrupt_archive_storage("fonts/broken.ttf")), false);
+
+    let error = env
+        .try_run("GdiPlus.addPrivateFont('fonts/broken.ttf');")
+        .expect_err("a genuine read failure must raise");
+    assert!(error.contains("archive error"), "{error}");
+    assert!(
+        !error.contains("cannot open") && !error.contains("storage not found"),
+        "the real cause must not be collapsed into not-found: {error}"
+    );
 }
 
 // ---------------------------------------------------------------------------

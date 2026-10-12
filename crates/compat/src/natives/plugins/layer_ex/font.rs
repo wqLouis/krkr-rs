@@ -12,8 +12,8 @@
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
 
-use engine::BitmapState;
 use engine::text::{FontId, TextEngine, TextStyle};
+use engine::{BitmapState, StorageReadError};
 use tjs::{
     NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef, NativeMethodDef,
     Tjs2Engine, TjsValue, Value,
@@ -568,9 +568,13 @@ pub(super) fn register_class(ctx: &mut CompatCtx) -> Result<(), CompatError> {
 // `GdiPlus.addPrivateFont` / `GdiPlus.getFontList`
 // ---------------------------------------------------------------------------
 
-/// Read `name` from the attached storage. Any read failure is the reference's
-/// null `TVPCreateBinaryStreamForRead`, reported as `cannot open`; the
-/// underlying error is logged so it is not silently dropped.
+/// Read `name` from the attached storage.
+///
+/// Only a missing entry is the reference's `cannot open:%1`
+/// (`reference/cpp/plugins/layerex_draw/blend2d/LayerExDraw.cpp:94-95,125`).
+/// Any other read failure is the reference's `ReadBuffer` raising the stream
+/// error out of `addPrivateFont`
+/// (`reference/cpp/core/tjs2/tjs.cpp:665-669`), so it is returned as itself.
 fn read_font_file(ctx: &CompatCtx, name: &str) -> Result<Vec<u8>, String> {
     // SAFETY: `ctx` was resolved from the installed binding.
     let services = unsafe { ctx.services() };
@@ -580,17 +584,15 @@ fn read_font_file(ctx: &CompatCtx, name: &str) -> Result<Vec<u8>, String> {
     // SAFETY: `attach_storage` guarantees the pointer stays valid.
     match unsafe { &*storage }.read(name) {
         Ok(bytes) => Ok(bytes),
-        Err(error) => {
-            log::debug!("GdiPlus.addPrivateFont: reading `{name}` failed: {error}");
-            Err(format!("cannot open:{name}"))
-        }
+        Err(StorageReadError::NotFound(_)) => Err(format!("cannot open:{name}")),
+        Err(error) => Err(error.to_string()),
     }
 }
 
 /// `GdiPlus.addPrivateFont(fontFileName)`.
 ///
 /// Reference `GdiPlus::addPrivateFont` (`reference/cpp/plugins/layerex_draw/
-/// blend2d/LayerExDraw.cpp:93-127`): a missing placed path or stream throws
+/// blend2d/LayerExDraw.cpp:93-126`): a missing placed path throws
 /// `cannot open:%1`, a font the blend2d reader rejects throws
 /// `blend2d cannot load:%1`, and every face of an accepted file is appended
 /// to the private face list. The port parses the file through the L2
