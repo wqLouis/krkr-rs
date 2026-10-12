@@ -104,11 +104,12 @@ object RuntimeOptions {
  *
  * This follows [GameLibrary]: the app keeps its launcher state in inspectable
  * JSON files rather than `SharedPreferences`, so it stays portable and
- * user-editable. Writes are atomic (temp file + rename) and reads are tolerant
- * — a missing or corrupt file falls back to [RuntimeOptions.DEFAULTS] rather
- * than crashing the launcher. An individual value that is present but invalid
- * is preserved and handed to the engine, which rejects it with the option name
- * and its accepted values.
+ * user-editable. Writes are atomic and flushed to disk before the replace, so a
+ * failed write leaves the previous file intact, and reads are tolerant — a
+ * missing or corrupt file falls back to [RuntimeOptions.DEFAULTS] rather than
+ * crashing the launcher. An individual value that is present but invalid is
+ * preserved and handed to the engine, which rejects it with the option name and
+ * its accepted values.
  *
  * File: `<app files dir>/settings.json`
  *
@@ -157,15 +158,7 @@ class RuntimeSettingsStore(context: Context) {
             .put(FIELD_SCALING, settings.scaling)
             .put(FIELD_PRELOAD_ARCHIVES, settings.preloadArchives)
         return runCatching {
-            file.parentFile?.mkdirs()
-            // Atomic replace: write a sibling temp file, then rename over the
-            // target. A kill mid-write leaves the previous settings intact.
-            val tmp = File(file.parentFile, "$FILE_NAME.tmp")
-            tmp.writeText(root.toString(2))
-            if (!tmp.renameTo(file)) {
-                tmp.copyTo(file, overwrite = true)
-                tmp.delete()
-            }
+            DurableWrite.text(file, root.toString(2))
         }.onFailure { error ->
             Log.e(TAG, "cannot write $file: ${error.message}")
         }.isSuccess

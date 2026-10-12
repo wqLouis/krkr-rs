@@ -73,7 +73,7 @@ object SafPaths {
      * `raw:/...` ids are turned into absolute paths. An id that merely has the
      * right shape is not trusted.
      */
-    fun resolve(context: Context, treeUri: Uri): String? {
+    fun resolve(treeUri: Uri): String? {
         val authority = treeUri.authority ?: return null
         val documentId = runCatching {
             DocumentsContract.getTreeDocumentId(treeUri)
@@ -95,13 +95,17 @@ object SafPaths {
         if (separator < 0) return null
         val volumeId = documentId.substring(0, separator)
         val relative = documentId.substring(separator + 1)
+        // The picker never emits a `..` segment; a hand-edited `games.json`
+        // could. Reject it rather than let a document id address a directory
+        // outside the volume root it names.
+        if (relative.split('/').any { it == ".." }) return null
 
-        val root = volumeRoot(context, volumeId) ?: return null
+        val root = volumeRoot(volumeId) ?: return null
         return if (relative.isEmpty()) root else "$root/$relative"
     }
 
-    private fun volumeRoot(context: Context, volumeId: String): String? = when {
-        volumeId.equals("primary", ignoreCase = true) -> primaryRoot(context)
+    private fun volumeRoot(volumeId: String): String? = when {
+        volumeId.equals("primary", ignoreCase = true) -> primaryRoot()
         VOLUME_UUID.matches(volumeId) -> "/storage/$volumeId"
         else -> null
     }
@@ -137,14 +141,16 @@ object SafPaths {
     }
 
     /**
-     * The primary shared volume. `Environment.getExternalStorageDirectory()`
-     * is deprecated but remains the only way to obtain the path that
-     * `DocumentsContract`'s `primary` volume id refers to; it is correct on
-     * every API level we target.
+     * The primary shared volume, or null when the platform will not report it.
+     *
+     * `Environment.getExternalStorageDirectory()` is deprecated but remains the
+     * only way to obtain the path that `DocumentsContract`'s `primary` volume id
+     * refers to; it is correct on every API level we target. There is no
+     * private-data fallback: a wrong root is worse than a reported absence, and
+     * returning null lets the caller's "cannot open this folder" path stay
+     * honest.
      */
     @Suppress("DEPRECATION")
-    private fun primaryRoot(context: Context): String? =
-        runCatching { Environment.getExternalStorageDirectory().absolutePath }
-            .getOrNull()
-            ?: context.filesDir.parentFile?.absolutePath
+    private fun primaryRoot(): String? =
+        runCatching { Environment.getExternalStorageDirectory().absolutePath }.getOrNull()
 }

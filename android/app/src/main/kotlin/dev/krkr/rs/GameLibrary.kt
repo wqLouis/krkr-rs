@@ -12,9 +12,11 @@ import java.io.File
  *
  * [uri] is the SAF tree URI — the **durable identity** of the folder, and the
  * handle the persisted URI permission is granted against. [path] is the
- * filesystem path the engine is actually handed (`docs/android.md` §4);
- * it is cached because resolving it needs a `ContentResolver` query, and is
- * nullable because a provider may not be addressable as a path at all.
+ * filesystem path the engine is actually handed (`docs/android.md` §4). It is
+ * a cache of [SafPaths.resolve] for diagnostics and for the case where the URI
+ * no longer resolves; resolving is pure string work, so a launch prefers the
+ * fresh path and treats this one as a fallback. It is nullable because a
+ * provider may not be addressable as a path at all.
  */
 data class GameEntry(
     val uri: Uri,
@@ -56,10 +58,11 @@ enum class SaveResult { SAVED, UNCHANGED, FAILED }
  * }
  * ```
  *
- * Writes are atomic (temp file + rename) so a crash or a kill during a write
- * cannot leave a truncated library behind. Reads are tolerant: a missing file
- * is an empty library, and a corrupt one is reported and treated as empty
- * rather than crashing the launcher on every start.
+ * Writes are atomic and flushed to disk before the replace, so a crash, a kill
+ * or a power loss cannot leave a truncated library behind, and a failed write
+ * leaves the previous file intact. Reads are tolerant: a missing file is an
+ * empty library, and a corrupt one is reported and treated as empty rather than
+ * crashing the launcher on every start.
  */
 class GameLibrary(context: Context) {
 
@@ -101,14 +104,17 @@ class GameLibrary(context: Context) {
 
     /**
      * Refreshes the cached path when a folder resolves differently than before
-     * (e.g. a removable volume mounted under a new id). No-op if unchanged.
+     * (a hand-edited file, a restored backup, or the primary-volume fallback).
+     * No-op if unchanged. [SaveResult.FAILED] means the cache is now stale, so
+     * the caller can say so instead of leaving the divergence silent.
      */
-    fun updatePath(uri: Uri, path: String?) {
+    fun updatePath(uri: Uri, path: String?): SaveResult {
         val entries = all()
         val updated = entries.map {
             if (it.key == uri.toString() && it.path != path) it.copy(path = path) else it
         }
-        if (updated != entries) write(updated)
+        if (updated == entries) return SaveResult.UNCHANGED
+        return if (write(updated)) SaveResult.SAVED else SaveResult.FAILED
     }
 
     // -- serialization -------------------------------------------------------
@@ -177,15 +183,7 @@ class GameLibrary(context: Context) {
             .put(FIELD_GAMES, games)
 
         return runCatching {
-            file.parentFile?.mkdirs()
-            // Atomic replace: write a sibling temp file, then rename over the
-            // target. A kill mid-write leaves the previous library intact.
-            val tmp = File(file.parentFile, "$FILE_NAME.tmp")
-            tmp.writeText(root.toString(2))
-            if (!tmp.renameTo(file)) {
-                tmp.copyTo(file, overwrite = true)
-                tmp.delete()
-            }
+            DurableWrite.text(file, root.toString(2))
         }.onFailure { e ->
             Log.e(TAG, "cannot write $file: ${e.message}")
         }.isSuccess

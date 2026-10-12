@@ -103,14 +103,7 @@ object EngineDiagnostics {
                 .put("at", System.currentTimeMillis())
             path?.let { obj.put("path", it) }
 
-            val file = launchFile(context)
-            file.parentFile?.mkdirs()
-            val tmp = File(file.parentFile, "$LAUNCH_FILE.tmp")
-            tmp.writeText(obj.toString())
-            if (!tmp.renameTo(file)) {
-                tmp.copyTo(file, overwrite = true)
-                tmp.delete()
-            }
+            DurableWrite.text(launchFile(context), obj.toString())
         }.onFailure { LauncherLog.w("cannot record pending launch: ${it.message}") }
     }
 

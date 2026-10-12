@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  No data is extracted, for cloud backup or device transfer.
+
+  The launcher's `games.json` and `settings.json` are deliberately portable and
+  inspectable — the user or `adb` can copy them — but their contents are
+  absolute paths that only resolve on the device the folders were picked on.
+  Restoring a `path` onto another device can name an unrelated folder, and the
+  launcher has no server-side state worth backing up. `allowBackup="false"` in
+  the manifest already disables cloud backup on every supported level; these
+  rules cover the API 31+ device-to-device transfer, which `allowBackup` no
+  longer governs. Both blocks exclude every storage domain.
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="root" path="." />
+        <exclude domain="file" path="." />
+        <exclude domain="database" path="." />
+        <exclude domain="sharedpref" path="." />
+        <exclude domain="external" path="." />
+        <exclude domain="device_root" path="." />
+        <exclude domain="device_file" path="." />
+        <exclude domain="device_database" path="." />
+        <exclude domain="device_sharedpref" path="." />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="root" path="." />
+        <exclude domain="file" path="." />
+        <exclude domain="database" path="." />
+        <exclude domain="sharedpref" path="." />
+        <exclude domain="external" path="." />
+        <exclude domain="device_root" path="." />
+        <exclude domain="device_file" path="." />
+        <exclude domain="device_database" path="." />
+        <exclude domain="device_sharedpref" path="." />
+    </device-transfer>
+</data-extraction-rules>

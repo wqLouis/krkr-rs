@@ -312,7 +312,7 @@ private fun LauncherScreen(
         // Resolve now so the config file records where the game actually is;
         // a folder that cannot be addressed as a path is still added (the user
         // may mount that volume later), but we say so immediately.
-        val path = SafPaths.resolve(context, uri)
+        val path = SafPaths.resolve(uri)
         when (library.add(GameEntry(uri, name, path))) {
             SaveResult.SAVED -> {
                 games = library.all()
@@ -686,13 +686,14 @@ private fun launchGame(
         return
     }
 
-    // Re-resolve on every launch. The mapping is pure string work (no I/O), and
-    // the cached path in `games.json` can go stale: a volume may be remounted
-    // under a new id, or the folder renamed or moved. Keep using the cached path
-    // while it is valid, but hold the fresh resolution ready as a fallback.
+    // Re-resolve on every launch. The mapping is pure string work (no I/O), so
+    // the fresh path is authoritative: the cached path in `games.json` can name
+    // a different folder after a hand edit or a restored backup, and the
+    // primary-volume fallback can resolve the same URI two ways. Use the cached
+    // path only when the URI no longer resolves at all.
     val cached = entry.path
-    val resolved = SafPaths.resolve(context, entry.uri)
-    var path = cached ?: resolved
+    val fresh = SafPaths.resolve(entry.uri)
+    var path = fresh ?: cached
     if (path == null) {
         LauncherLog.w("launch blocked: \"${entry.name}\" has no resolvable path")
         onIssue(
@@ -708,25 +709,26 @@ private fun launchGame(
     }
 
     var problem = GamePreflight.check(path)
-    if (problem != null && resolved != null && resolved != path) {
-        // The cached path stopped working. A remount or a move can change where
-        // the same URI resolves, so try the fresh path before giving up; adopt
-        // it (and remember it) only when it is genuinely a game.
+    if (problem != null && fresh != null && path == fresh && cached != null && cached != fresh) {
+        // The fresh path does not work, but the cached one still does. Fall back
+        // to it rather than refusing a folder the user could launch.
         LauncherLog.i(
-            "cached path \"$path\" failed (${problem.title}); trying resolved path \"$resolved\"",
+            "resolved path \"$fresh\" failed (${problem.title}); trying cached path \"$cached\"",
         )
-        val freshProblem = GamePreflight.check(resolved)
-        if (freshProblem == null) {
-            library.updatePath(entry.uri, resolved)
-            path = resolved
+        val cachedProblem = GamePreflight.check(cached)
+        if (cachedProblem == null) {
+            path = cached
             problem = null
         } else {
-            problem = freshProblem
+            problem = cachedProblem
         }
-    } else if (problem == null && cached == null && resolved != null) {
-        // First launch of a folder added while its volume was not mounted:
-        // remember where it resolved.
-        library.updatePath(entry.uri, resolved)
+    }
+    if (problem == null && fresh != null && path == fresh && cached != fresh) {
+        // The fresh resolution is what we are launching; keep the cache in step
+        // with it so the file matches the path in use.
+        if (library.updatePath(entry.uri, fresh) == SaveResult.FAILED) {
+            LauncherLog.w("could not refresh the cached path for \"${entry.name}\"")
+        }
     }
     if (problem != null) {
         LauncherLog.w("launch blocked: \"${entry.name}\" — ${problem.title} ($path)")

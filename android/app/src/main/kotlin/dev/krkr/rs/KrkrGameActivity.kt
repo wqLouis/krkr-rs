@@ -36,7 +36,10 @@ class KrkrGameActivity : GameActivity() {
          * Read from native code (`crates/android`) through JNI as soon as
          * `android_main` starts. Null until [onCreate] has run, so the native
          * side must treat null as a fatal configuration error rather than
-         * guessing a directory.
+         * guessing a directory. It is not cleared when the Activity is
+         * destroyed: a new instance republishes it in [onCreate] before that
+         * instance's `android_main` reads, and clearing it early would race a
+         * slow first read.
          *
          * `@JvmField` (not `@JvmStatic`) is deliberate: it puts a real static
          * **field** on this class, which is what the JNI `GetStaticField` read
@@ -60,9 +63,9 @@ class KrkrGameActivity : GameActivity() {
          * for the same reason: `super` enters `android_main`, so the field is
          * always populated before native code can observe it.
          *
-         * It is intentionally not cleared in [onDestroy]: the native shutdown
-         * path may still want the directory to record a final `stopped` state,
-         * and clearing it a moment too early would lose that.
+         * Native code copies the directory once at `android_main` startup and
+         * never reads the field again, so nothing clears it afterwards; the
+         * terminal `stopped`/`failed` write uses the copy, not this field.
          */
         @JvmField
         var pendingStateDir: String? = null
@@ -170,11 +173,5 @@ class KrkrGameActivity : GameActivity() {
         pendingFrameRate = settings.frameRate
         pendingScaling = settings.scaling
         pendingPreloadArchives = settings.preloadArchives
-    }
-
-    override fun onDestroy() {
-        pendingGameDir = null
-        pendingGameName = null
-        super.onDestroy()
     }
 }
