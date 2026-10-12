@@ -1756,7 +1756,10 @@ extern "C" fn prop_graphic_cache_limit_get(
     let limit = match services.scene() {
         // SAFETY: the host keeps the attached scene alive for the binding's
         // lifetime and the VM is single-threaded.
-        Some(ptr) => i64::try_from(unsafe { &*ptr }.graphic_cache_limit()).unwrap_or(i64::MAX),
+        // The getter returns `(tjs_int)TVPGetGraphicCacheLimit()`
+        // (`reference/cpp/core/base/SystemIntf.cpp:358-361`), so the stored
+        // `tjs_uint64` narrows to 32 bits on the way out.
+        Some(ptr) => i64::from(unsafe { &*ptr }.graphic_cache_limit() as i32),
         None => 0,
     };
     set_int(out, limit);
@@ -1778,14 +1781,19 @@ extern "C" fn prop_graphic_cache_limit_set(
         return report_error(out_error, "System.graphicCacheLimit: missing value");
     }
     // SAFETY: the trampoline passes a valid value slot for the call.
-    // `TVPSetGraphicCacheLimit((tjs_int)*param)` (`SystemIntf.cpp:366-369`):
-    // the strict conversion raises on objects, and the write immediately
+    // The strict conversion raises on objects, and the write immediately
     // evicts the decoded-image cache down to the new limit
     // (`reference/cpp/core/visual/GraphicsLoaderIntf.cpp:2423-2441`).
     let limit = match try_value_as_i64(unsafe { &*value }) {
         Ok(limit) => limit,
         Err(error) => return report_error(out_error, &error),
     };
+    // The reference passes `(tjs_int)*param` to `TVPSetGraphicCacheLimit`
+    // (`reference/cpp/core/base/SystemIntf.cpp:365`), i.e. the variant cast
+    // `(tjs_int)AsInteger()` (`reference/cpp/core/tjs2/tjsVariant.h:933-935`):
+    // a value outside the 32-bit range truncates to its low 32 bits instead
+    // of raising.
+    let limit = i64::from(limit as i32);
     let ctx = resolved.ctx();
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
     let services = unsafe { ctx.services() };

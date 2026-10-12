@@ -9,9 +9,10 @@
 #![allow(dead_code)]
 
 use std::path::PathBuf;
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
+use api::media::{DecodedImage, ImageInfo};
 use compat::CompatHost;
 use engine::Scene;
 use engine::Storage;
@@ -155,6 +156,37 @@ impl Env {
     pub fn error(&self, expression: &str) -> String {
         self.eval(expression)
             .expect_err(&format!("{expression:?} should have raised"))
+    }
+
+    /// Install a synthetic image codec whose decode closure appends the
+    /// resolved storage name to `hints` and returns a fixed 2x2 straight-
+    /// alpha RGBA test image, replacing any codec installed earlier.
+    ///
+    /// Every decoder run grows `hints` by one, so its length counts the
+    /// loads that were not served from the scene's decoded-image cache.
+    pub fn record_decodes(&self, hints: Arc<Mutex<Vec<String>>>) {
+        self._host.set_image_codec(
+            move |_bytes, hint| {
+                hints
+                    .lock()
+                    .expect("decode lock")
+                    .push(hint.unwrap_or_default().to_string());
+                Ok(DecodedImage::new(
+                    2,
+                    2,
+                    vec![1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255, 10, 11, 12, 255],
+                ))
+            },
+            |_bytes, _hint| {
+                Ok(ImageInfo {
+                    width: 2,
+                    height: 2,
+                    has_alpha: true,
+                    format: Some("img".to_string()),
+                })
+            },
+            |_name, _type, _width, _height, _rgba| Ok(()),
+        );
     }
 
     /// One frame-body `timer_poll` step; returns whether any timer remains

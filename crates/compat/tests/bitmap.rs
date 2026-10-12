@@ -682,3 +682,191 @@ fn a_name_that_resolves_to_nothing_raises_and_names_the_request() {
         "{header_error}"
     );
 }
+
+/// With the default limit (`0`) the cache is off, so the same name loaded
+/// twice decodes twice and both loads see the same pixels.
+///
+/// reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1433-1434 (the cache
+/// starts disabled) and `:1962-1969` (a disabled cache installs the freshly
+/// loaded image instead of consulting the hash).
+#[test]
+fn the_default_cache_limit_decodes_every_load() {
+    let _lock = vm_lock();
+    let env = Env::new(true);
+    let hints = Arc::new(Mutex::new(Vec::new()));
+    env.record_decodes(hints.clone());
+
+    // The disabled default reads back through the script property
+    // (`reference/cpp/core/base/SystemIntf.cpp:358-361`).
+    assert_eq!(env.eval_int("System.graphicCacheLimit"), 0);
+    env.run("var first = new Bitmap(); first.load('images/test.img');");
+    env.run("var second = new Bitmap(); second.load('images/test.img');");
+
+    assert_eq!(
+        hints.lock().expect("decode lock").clone(),
+        vec!["images/test.img".to_string(), "images/test.img".to_string()],
+        "the default limit decodes every load"
+    );
+    for (x, y) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+        let first_pixel = env.eval_int(&format!("first.getPixel({x}, {y})"));
+        assert_eq!(
+            first_pixel,
+            env.eval_int(&format!("second.getPixel({x}, {y})")),
+            "pixel ({x}, {y})"
+        );
+    }
+    // Each load installed the decoded buffer
+    // (`reference/cpp/core/visual/BitmapIntf.cpp:98-106`).
+    assert_eq!(env.eval_int("second.width"), 2);
+    assert_eq!(env.eval_int("second.getPixel(0, 0)"), 0xff01_0203);
+    assert_eq!(env.eval_int("second.getPixel(1, 1)"), 0xff0a_0b0c);
+}
+
+/// A limit above zero enables the cache: the second load of the same name
+/// runs no decoder and its pixels are identical to the first load's.
+/// Returning the limit to `0` disables the cache again and the next loads
+/// decode.
+///
+/// reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1886-1908 (the load
+/// consults the cache and returns the stored image), `:1937-1960` (a miss
+/// decodes and stores), `:2423-2441` (the limit's setter).
+#[test]
+fn an_enabled_cache_decodes_once_per_name() {
+    let _lock = vm_lock();
+    let env = Env::new(true);
+    let hints = Arc::new(Mutex::new(Vec::new()));
+    env.record_decodes(hints.clone());
+
+    env.run("System.graphicCacheLimit = 1048576;");
+    assert_eq!(env.eval_int("System.graphicCacheLimit"), 1048576);
+    env.run("var first = new Bitmap(); first.load('images/test.img');");
+    env.run("var second = new Bitmap(); second.load('images/test.img');");
+
+    assert_eq!(
+        hints.lock().expect("decode lock").clone(),
+        vec!["images/test.img".to_string()],
+        "the second load is a cache hit"
+    );
+    for (x, y) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+        let first_pixel = env.eval_int(&format!("first.getPixel({x}, {y})"));
+        assert_eq!(
+            first_pixel,
+            env.eval_int(&format!("second.getPixel({x}, {y})")),
+            "pixel ({x}, {y})"
+        );
+    }
+    assert_eq!(env.eval_int("second.width"), 2);
+    assert_eq!(env.eval_int("second.getPixel(0, 0)"), 0xff01_0203);
+
+    env.run("System.graphicCacheLimit = 0;");
+    env.run("var third = new Bitmap(); third.load('images/test.img');");
+    env.run("var fourth = new Bitmap(); fourth.load('images/test.img');");
+    assert_eq!(
+        hints.lock().expect("decode lock").clone(),
+        vec![
+            "images/test.img".to_string(),
+            "images/test.img".to_string(),
+            "images/test.img".to_string()
+        ],
+        "limit 0 disables the cache and both loads decode"
+    );
+}
+
+/// A cache hit installs the stored pixels into the loading Bitmap, so a
+/// `setPixel` write on one Bitmap cannot reach the cached image: the next
+/// load of the same name still reads the pristine decoded pixels.
+///
+/// `SetPixel` writes the receiving Bitmap's own image
+/// (`reference/cpp/core/visual/BitmapIntf.cpp:60-66`); the load returns the
+/// cached image (`reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1897-1906`)
+/// and a write severs that sharing before touching pixels
+/// (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:641-661`).
+#[test]
+fn a_cache_hit_returns_pristine_pixels_after_a_set_pixel_write() {
+    let _lock = vm_lock();
+    let env = Env::new(true);
+    let hints = Arc::new(Mutex::new(Vec::new()));
+    env.record_decodes(hints.clone());
+
+    env.run("System.graphicCacheLimit = 1048576;");
+    env.run("var first = new Bitmap(); first.load('images/test.img');");
+    env.run("first.setPixel(0, 0, 0xff112233);");
+    env.run("var second = new Bitmap(); second.load('images/test.img');");
+
+    assert_eq!(
+        hints.lock().expect("decode lock").len(),
+        1,
+        "the second load is a cache hit"
+    );
+    // The write reached only the first Bitmap.
+    assert_eq!(env.eval_int("first.getPixel(0, 0)"), 0xff11_2233);
+    // The reloaded Bitmap still has the decoded pixels.
+    assert_eq!(env.eval_int("second.getPixel(0, 0)"), 0xff01_0203);
+    assert_eq!(env.eval_int("second.getPixel(1, 1)"), 0xff0a_0b0c);
+}
+
+/// Two different names occupy two cache entries: each decodes once and
+/// every later load hits its own entry with its own pixels.
+///
+/// The cache key is the name plus the load parameters
+/// (`reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1257-1264`), and the
+/// load consults exactly that key
+/// (`reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1886-1897`).
+#[test]
+fn two_different_names_are_cached_separately() {
+    let _lock = vm_lock();
+    let files: &[(&str, &[u8])] = &[
+        ("/images/alpha.img", b"AAAA"),
+        ("/images/beta.img", b"BBBB"),
+    ];
+    let env = Env::with_files(true, files);
+    let hints = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&hints);
+    // Each file decodes to a distinct grey so the two entries' pixels are
+    // distinguishable; the resolved name is recorded like
+    // `Env::record_decodes`.
+    env.host.set_image_codec(
+        move |bytes, hint| {
+            recorder
+                .lock()
+                .expect("decode lock")
+                .push(hint.unwrap_or_default().to_string());
+            let seed = *bytes.first().expect("the test file has content");
+            let mut rgba = Vec::with_capacity(16);
+            for _ in 0..4 {
+                rgba.extend_from_slice(&[seed, seed, seed, 0xff]);
+            }
+            Ok(DecodedImage::new(2, 2, rgba))
+        },
+        |_bytes, _hint| {
+            Ok(ImageInfo {
+                width: 2,
+                height: 2,
+                has_alpha: true,
+                format: Some("img".to_string()),
+            })
+        },
+        |_name, _type, _width, _height, _rgba| Ok(()),
+    );
+
+    env.run("System.graphicCacheLimit = 1048576;");
+    env.run("var alpha = new Bitmap(); alpha.load('images/alpha.img');");
+    env.run("var beta = new Bitmap(); beta.load('images/beta.img');");
+    env.run("var alphaAgain = new Bitmap(); alphaAgain.load('images/alpha.img');");
+    env.run("var betaAgain = new Bitmap(); betaAgain.load('images/beta.img');");
+
+    assert_eq!(
+        hints.lock().expect("decode lock").clone(),
+        vec![
+            "images/alpha.img".to_string(),
+            "images/beta.img".to_string()
+        ],
+        "each name decodes once and both reloads hit"
+    );
+    // The files start with 'A' (0x41) and 'B' (0x42): each reload reads its
+    // own entry's pixels.
+    assert_eq!(env.eval_int("alpha.getPixel(0, 0)"), 0xff41_4141);
+    assert_eq!(env.eval_int("alphaAgain.getPixel(0, 0)"), 0xff41_4141);
+    assert_eq!(env.eval_int("beta.getPixel(0, 0)"), 0xff42_4242);
+    assert_eq!(env.eval_int("betaAgain.getPixel(0, 0)"), 0xff42_4242);
+}

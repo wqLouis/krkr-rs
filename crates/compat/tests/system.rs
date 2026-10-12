@@ -7,6 +7,8 @@
 
 mod common;
 
+use std::sync::{Arc, Mutex};
+
 use api::host::TouchPhase;
 use common::{Env, vm_lock};
 use compat::{CompatHost, EventAdapter};
@@ -639,4 +641,138 @@ fn clear_graphic_cache_releases_unused_bitmaps() {
         TjsValue::Void
     );
     assert!(scene.bitmap(bitmap).is_none());
+}
+
+/// The limit's edges read back exactly what the scene stores: `0` disables
+/// the cache, `-1` selects the system limit, a value above the 512 MiB cap
+/// clamps to the cap, and a negative below `-1` — which the reference's
+/// `tjs_int` argument turns into a huge `tjs_uint64` — clamps the same way
+/// (`reference/cpp/core/visual/GraphicsLoaderIntf.cpp:2423-2441`; the
+/// system limit is itself capped at 512 MiB,
+/// `reference/cpp/core/base/impl/SysInitImpl.cpp:275-277`). The getter
+/// narrows the stored value back to an integer
+/// (`reference/cpp/core/base/SystemIntf.cpp:358-361`).
+#[test]
+fn graphic_cache_limit_edges_round_trip() {
+    let _lock = vm_lock();
+    let mut scene = engine::Scene::default();
+    let engine = Tjs2Engine::new().expect("create engine");
+    let mut host = CompatHost::new();
+    // SAFETY: `scene` is declared before `host` and therefore outlives the
+    // binding installed below.
+    unsafe { host.services_mut().attach_scene(&mut scene) };
+    host.install(&engine).expect("install compat surface");
+
+    const CAP: i64 = 512 * 1024 * 1024;
+    assert_eq!(scene.graphic_cache_limit(), 0, "the default is disabled");
+
+    for (value, expected) in [
+        (0i64, 0i64),
+        (-1, CAP),
+        (CAP + 1, CAP),
+        (-2, CAP),
+        (64 * 1024 * 1024, 64 * 1024 * 1024),
+    ] {
+        engine
+            .exec_script(&format!("System.graphicCacheLimit = {value};"), "t")
+            .expect("assign graphicCacheLimit");
+        assert_eq!(
+            eval_int(&engine, "System.graphicCacheLimit"),
+            expected,
+            "the script reads back {value}"
+        );
+        assert_eq!(
+            scene.graphic_cache_limit(),
+            expected as u64,
+            "the scene stores {value}"
+        );
+    }
+}
+
+/// A script value is cast to `tjs_int` before it reaches the cache, so only
+/// the low 32 bits survive: `2^32 + 64` stores and reads back `64`, `2^40`
+/// truncates to `0` and leaves the cache disabled, and a truncated `-1`
+/// selects the system limit like a script-supplied `-1`. The reference does
+/// not raise on out-of-range values: the setter receives
+/// `TVPSetGraphicCacheLimit((tjs_int)*param)`
+/// (`reference/cpp/core/base/SystemIntf.cpp:365`), defined as the variant
+/// cast `(tjs_int)AsInteger()`
+/// (`reference/cpp/core/tjs2/tjsVariant.h:933-935`), and the getter narrows
+/// the stored `tjs_uint64` the same way
+/// (`reference/cpp/core/base/SystemIntf.cpp:358-361`); `0` disables the
+/// cache and `-1` selects the system limit
+/// (`reference/cpp/core/visual/GraphicsLoaderIntf.cpp:2423-2441`).
+#[test]
+fn graphic_cache_limit_variant_truncates_to_tjs_int() {
+    let _lock = vm_lock();
+    let mut scene = engine::Scene::default();
+    let engine = Tjs2Engine::new().expect("create engine");
+    let mut host = CompatHost::new();
+    // SAFETY: `scene` is declared before `host` and therefore outlives the
+    // binding installed below.
+    unsafe { host.services_mut().attach_scene(&mut scene) };
+    host.install(&engine).expect("install compat surface");
+
+    const CAP: i64 = 512 * 1024 * 1024;
+    for (value, expected) in [
+        (4_294_967_360i64, 64i64),
+        (1i64 << 40, 0),
+        (4_294_967_295i64, CAP),
+    ] {
+        engine
+            .exec_script(&format!("System.graphicCacheLimit = {value};"), "t")
+            .expect("assign graphicCacheLimit");
+        assert_eq!(
+            eval_int(&engine, "System.graphicCacheLimit"),
+            expected,
+            "the script reads back the low 32 bits of {value}"
+        );
+        assert_eq!(
+            scene.graphic_cache_limit(),
+            expected as u64,
+            "the scene stores the low 32 bits of {value}"
+        );
+    }
+}
+
+/// The observed effect of the edges on decoding: at the default limit of
+/// `0` every load runs the decoder, a positive limit makes the second load
+/// of the same name a hit, and returning to `0` decodes again.
+///
+/// reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1433-1434 (disabled by
+/// default), `:1886-1908` (an enabled load consults the cache), `:2423-2441`
+/// (the limit's setter).
+#[test]
+fn graphic_cache_limit_edges_control_decoding() {
+    let _lock = vm_lock();
+    let env = Env::with_storage();
+    let dir = env.game_dir().expect("game dir");
+    std::fs::create_dir_all(dir.join("images")).expect("image dir");
+    std::fs::write(dir.join("images/test.img"), b"not-a-real-image").expect("write image");
+    let hints = Arc::new(Mutex::new(Vec::new()));
+    env.record_decodes(Arc::clone(&hints));
+
+    assert_eq!(env.eval_int("System.graphicCacheLimit"), 0);
+    env.run("var first = new Bitmap(); first.load('images/test.img');");
+    env.run("var second = new Bitmap(); second.load('images/test.img');");
+    assert_eq!(decode_count(&hints), 2, "at limit 0 every load decodes");
+
+    env.run("System.graphicCacheLimit = 1048576;");
+    env.run("var third = new Bitmap(); third.load('images/test.img');");
+    env.run("var fourth = new Bitmap(); fourth.load('images/test.img');");
+    assert_eq!(
+        decode_count(&hints),
+        3,
+        "a positive limit makes the second load hit"
+    );
+
+    env.run("System.graphicCacheLimit = 0;");
+    env.run("var fifth = new Bitmap(); fifth.load('images/test.img');");
+    env.run("var sixth = new Bitmap(); sixth.load('images/test.img');");
+    assert_eq!(decode_count(&hints), 5, "back at limit 0 both loads decode");
+}
+
+/// The decoder runs recorded by `Env::record_decodes`.
+fn decode_count(hints: &Arc<Mutex<Vec<String>>>) -> usize {
+    hints.lock().expect("decode lock").len()
 }
