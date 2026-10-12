@@ -308,6 +308,20 @@ pub fn drop_texture(p: &RenderPipeline, state: &mut RenderState, tex: Texture) {
     }
 }
 
+/// One texture update in a batch uploaded by [`upload_textures`].
+///
+/// `pixels` is tightly packed, row-major, for `region` in the texture's
+/// format.
+#[derive(Clone, Copy, Debug)]
+pub struct TextureUpload<'a> {
+    /// Destination texture handle.
+    pub texture: &'a Texture,
+    /// Sub-rectangle to replace.
+    pub region: PixelRegion,
+    /// Tightly packed pixels for `region`.
+    pub pixels: &'a [u8],
+}
+
 /// Copies a sub-rectangle of pixels into `tex`.
 ///
 /// `pixels` is tightly packed, row-major, in the texture's format.
@@ -327,6 +341,35 @@ pub fn upload_texture(
     match &p.kind {
         PipelineKind::Null(backend) => backend.upload_texture(state, tex, region, pixels),
         PipelineKind::Vulkan(backend) => backend.upload_texture(state, tex, region, pixels),
+    }
+}
+
+/// Copies every upload's sub-rectangle into its texture in one batch.
+///
+/// On the Vulkan backend the batch is staged, recorded and submitted once, so
+/// a frame's dirty bitmaps pay a single GPU wait instead of one per texture.
+/// The null backend applies each upload to its CPU storage in order.
+///
+/// `pixels` is tightly packed, row-major, in the texture's format.
+///
+/// # Errors
+///
+/// Returns [`RenderError::Upload`] when any region is out of bounds or its
+/// pixel slice does not match the region size, and
+/// [`RenderError::Unsupported`] for an unimplemented backend.
+pub fn upload_textures(
+    p: &RenderPipeline,
+    state: &mut RenderState,
+    uploads: &[TextureUpload<'_>],
+) -> Result<(), RenderError> {
+    match &p.kind {
+        PipelineKind::Null(backend) => {
+            for upload in uploads {
+                backend.upload_texture(state, upload.texture, upload.region, upload.pixels)?;
+            }
+            Ok(())
+        }
+        PipelineKind::Vulkan(backend) => backend.upload_textures(state, uploads),
     }
 }
 
@@ -424,5 +467,54 @@ pub fn render(
     match &p.kind {
         PipelineKind::Null(backend) => backend.render(surface, state, scene),
         PipelineKind::Vulkan(backend) => backend.render(surface, state, scene),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use api::geometry::PixelRegion;
+    use testkit::headless_window;
+
+    #[test]
+    fn upload_textures_applies_every_region() {
+        let pipeline = RenderPipeline::null();
+        let (_surface, mut state) =
+            begin_render_state(&pipeline, &headless_window()).expect("begin");
+        let a = create_texture(&pipeline, TextureDesc::new(4, 4)).expect("texture a");
+        let b = create_texture(&pipeline, TextureDesc::new(3, 2)).expect("texture b");
+
+        // `a`'s region is 2x1 pixels and `b`'s is 3x2, so the staging slices
+        // differ in both length and placement.
+        let a_pixels = [1u8; 2 * 4];
+        let b_pixels = [2u8; 3 * 2 * 4];
+        upload_textures(
+            &pipeline,
+            &mut state,
+            &[
+                TextureUpload {
+                    texture: &a,
+                    region: PixelRegion::new(1, 1, 2, 1),
+                    pixels: &a_pixels,
+                },
+                TextureUpload {
+                    texture: &b,
+                    region: PixelRegion::new(0, 0, 3, 2),
+                    pixels: &b_pixels,
+                },
+            ],
+        )
+        .expect("batch upload");
+
+        let a_stored = NullRenderPipeline::texture_pixels(&state, &a).expect("a stored");
+        let a_offset = (4 + 1) * 4;
+        assert_eq!(
+            &a_stored[a_offset..a_offset + a_pixels.len()],
+            &a_pixels[..]
+        );
+        assert_eq!(&a_stored[0..4], &[0u8; 4][..]);
+
+        let b_stored = NullRenderPipeline::texture_pixels(&state, &b).expect("b stored");
+        assert_eq!(b_stored, &b_pixels[..]);
     }
 }

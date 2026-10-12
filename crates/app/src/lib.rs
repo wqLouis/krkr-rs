@@ -43,9 +43,9 @@ use media::Media;
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 use render::{
     PipelineConfig, RenderPipeline, RenderScene, RenderState, Surface, Texture, TextureDesc,
-    TextureFormat, ViewTransform, begin_render_state, begin_render_state_with_display,
-    create_render_pipeline, create_texture, drop_texture, render, resize as resize_render,
-    upload_texture,
+    TextureFormat, TextureUpload, ViewTransform, begin_render_state,
+    begin_render_state_with_display, create_render_pipeline, create_texture, drop_texture, render,
+    resize as resize_render, upload_textures,
 };
 
 pub use audio::install_audio_decoder;
@@ -565,7 +565,8 @@ impl Host {
     ///
     /// A bitmap whose dimensions changed recreates its texture; one with an
     /// inconsistent pixel length is skipped with a warning so one bad bitmap
-    /// cannot abort the frame.
+    /// cannot abort the frame. All dirty bitmaps are uploaded in one batch,
+    /// so the frame pays a single GPU wait instead of one per bitmap.
     fn sync_dirty_bitmaps(&mut self) {
         let dirty: Vec<u32> = self
             .scene
@@ -575,6 +576,7 @@ impl Host {
             .map(|bitmap| bitmap.id)
             .collect();
 
+        let mut ready: Vec<u32> = Vec::with_capacity(dirty.len());
         for id in dirty {
             let Some((width, height, len)) = self
                 .scene
@@ -615,28 +617,29 @@ impl Host {
                     }
                 }
             }
+            ready.push(id);
+        }
 
-            let Some(texture) = self.textures.get(&id).cloned() else {
-                continue;
-            };
-            let region = PixelRegion::new(0, 0, width, height);
-            let upload = self
-                .scene
-                .bitmap(id)
-                .map(|bitmap| bitmap.rgba.as_slice())
-                .map(|pixels| {
-                    upload_texture(
-                        &self.pipeline,
-                        &mut self.render_state,
-                        &texture,
-                        region,
-                        pixels,
-                    )
-                });
-            if let Some(Err(error)) = upload {
-                log::warn!("failed to upload bitmap #{id}: {error}");
+        if !ready.is_empty() {
+            let uploads: Vec<TextureUpload<'_>> = ready
+                .iter()
+                .filter_map(|id| {
+                    let bitmap = self.scene.bitmap(*id)?;
+                    let texture = self.textures.get(id)?;
+                    Some(TextureUpload {
+                        texture,
+                        region: PixelRegion::new(0, 0, bitmap.width, bitmap.height),
+                        pixels: &bitmap.rgba,
+                    })
+                })
+                .collect();
+            if let Err(error) = upload_textures(&self.pipeline, &mut self.render_state, &uploads) {
+                log::warn!("failed to upload {} bitmap(s): {error}", uploads.len());
             }
-            self.scene.set_bitmap_clean(id);
+            drop(uploads);
+            for id in ready {
+                self.scene.set_bitmap_clean(id);
+            }
         }
     }
 
