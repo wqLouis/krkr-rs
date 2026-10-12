@@ -32,11 +32,42 @@ pub struct WindowState {
     pub opacity: f32,
     /// The layer scripts use as `window.primaryLayer`.
     pub primary_layer: Option<u32>,
-    /// The layer that currently holds keyboard focus in this window
-    /// (reference `tTVPLayerManager::FocusedLayer`), if any.
+    /// The focused layer of the window's **input domain** — the domain a
+    /// window-level focus read/write and all input events bind to. It is the
+    /// focus of [`Self::focus_domains`]'s first entry, kept in step by
+    /// [`WindowState::sync_focused_layer`].
     pub focused_layer: Option<u32>,
+    /// Focus domain ids in registration order: one per parentless root
+    /// layer, in the order the roots were created. Index 0 is the window's
+    /// input domain (`reference/cpp/core/visual/LayerTreeOwnerImpl.h:21`
+    /// `PrimaryLayerManagerIndex`, pushed in creation order by
+    /// `RegisterLayerManager`, `reference/cpp/core/visual/LayerTreeOwnerImpl.cpp:93-98`).
+    pub focus_domains: Vec<u32>,
+    /// The focused layer of each registered domain, when one is set. A
+    /// domain absent from the map has no focus, exactly like a manager whose
+    /// `FocusedLayer` is null (`reference/cpp/core/visual/LayerManager.h:483-490`).
+    pub domain_focus: HashMap<u32, u32>,
     /// Render order, back -> front.
     pub layers: Vec<u32>,
+}
+
+impl WindowState {
+    /// The domain the window's input and `focusedLayer` reads/writes bind
+    /// to: the first-registered root's domain. `None` while the window has
+    /// no parentless layer, like the reference's null `GetLayerManagerAt(0)`
+    /// (`reference/cpp/core/visual/LayerTreeOwnerImpl.cpp:24-28`).
+    fn input_domain(&self) -> Option<u32> {
+        self.focus_domains.first().copied()
+    }
+
+    /// Refresh [`Self::focused_layer`] from the input domain's slot. Every
+    /// focus mutation goes through here so the window-level mirror and the
+    /// per-domain map cannot disagree.
+    fn sync_focused_layer(&mut self) {
+        self.focused_layer = self
+            .input_domain()
+            .and_then(|domain| self.domain_focus.get(&domain).copied());
+    }
 }
 
 /// Clamp a `u32` pixel dimension to a non-negative `i32` (a plain `as i32`
@@ -66,6 +97,14 @@ pub struct LayerState {
     pub window: u32,
     /// Parent layer id, or None to attach directly to the window.
     pub parent: Option<u32>,
+    /// Focus domain id: the id of the parentless root whose focus manager
+    /// this layer belongs to. A parentless layer founds its own domain (its
+    /// own id); a child inherits its parent's. Fixed at creation, because
+    /// the reference assigns the manager once and never reassigns it
+    /// (`reference/cpp/core/visual/LayerIntf.cpp:449-473`); all focus moves
+    /// and searches stay inside one domain
+    /// (`reference/cpp/core/visual/LayerManager.h:483-490`).
+    pub domain: u32,
     /// Direct child layer ids in maintained (back → front sibling) order.
     pub children: Vec<u32>,
     /// Bitmap id shown on this layer, if any.
@@ -509,6 +548,8 @@ impl Scene {
             opacity: 1.0,
             primary_layer: None,
             focused_layer: None,
+            focus_domains: Vec::new(),
+            domain_focus: HashMap::new(),
             layers: Vec::new(),
         });
         self.touch();
@@ -589,10 +630,19 @@ impl Scene {
         let id = self.next_layer;
         self.next_layer += 1;
         let primary = self.window(window).and_then(|w| w.primary_layer).is_none();
+        // A parentless layer founds its own focus domain (the reference
+        // creates one manager per parentless layer and attaches it as the
+        // primary, `reference/cpp/core/visual/LayerIntf.cpp:461-473`); a
+        // child inherits its parent's (`:449-455`). The domain id is the
+        // founding root's own layer id, so `id == domain` identifies it.
+        let domain = parent
+            .and_then(|parent| self.layer(parent).map(|layer| layer.domain))
+            .unwrap_or(id);
         self.layers.push(LayerState {
             id,
             window,
             parent,
+            domain,
             children: Vec::new(),
             bitmap: None,
             rect: Rect::default(),
@@ -664,6 +714,11 @@ impl Scene {
             None => {
                 if let Some(w) = self.window_mut(window) {
                     w.layers.push(id);
+                    // Register the new manager at the end of the window's
+                    // list (`RegisterLayerManager`,
+                    // `reference/cpp/core/visual/LayerTreeOwnerImpl.cpp:93-98`).
+                    w.focus_domains.push(domain);
+                    w.sync_focused_layer();
                 }
             }
         }
@@ -1035,9 +1090,10 @@ impl Scene {
         let Some(layer) = self.layer(id) else {
             return;
         };
-        let (win, parent, font_id, bitmap, cache_bitmap, cache_content) = (
+        let (win, parent, domain, font_id, bitmap, cache_bitmap, cache_content) = (
             layer.window,
             layer.parent,
+            layer.domain,
             layer.font_id,
             layer.bitmap,
             layer.cache_bitmap,
@@ -1100,14 +1156,21 @@ impl Scene {
             self.layer_index.insert(layer.id, index);
         }
         // The reference `DetachPrimary` leaves the window without a primary,
-        // and `SeverChild` blurs a removed focus holder.
+        // and `SeverChild` blurs a removed focus holder. A removed parentless
+        // root also unregisters its manager (`UnregisterSelfFromWindow`,
+        // `reference/cpp/core/visual/LayerIntf.cpp:533-535`;
+        // `reference/cpp/core/visual/LayerTreeOwnerImpl.cpp:99-108`), so the
+        // next root becomes the window's input domain.
         if let Some(w) = self.window_mut(win) {
             if w.primary_layer == Some(id) {
                 w.primary_layer = None;
             }
-            if w.focused_layer == Some(id) {
-                w.focused_layer = None;
+            if id == domain {
+                w.focus_domains.retain(|registered| *registered != domain);
+                w.domain_focus.remove(&domain);
             }
+            w.domain_focus.retain(|_, focused| *focused != id);
+            w.sync_focused_layer();
         }
         self.touch();
     }
@@ -1276,43 +1339,96 @@ impl Scene {
             if w.primary_layer.is_some_and(|p| doomed.contains(&p)) {
                 w.primary_layer = None;
             }
-            if w.focused_layer.is_some_and(|f| doomed.contains(&f)) {
-                w.focused_layer = None;
-            }
+            // A doomed parentless root unregisters its manager (a domain id
+            // is its root's id); survivors lose only a doomed focus holder.
+            w.focus_domains.retain(|domain| !doomed.contains(domain));
+            w.domain_focus
+                .retain(|domain, focused| !doomed.contains(domain) && !doomed.contains(focused));
+            w.sync_focused_layer();
         }
         self.touch();
     }
 
     /// Reference `tTVPLayerManager::SetFocusTo`: give keyboard focus to
-    /// `id` within its window, clearing the previous holder. Returns
-    /// `(previous, new)`. An invalid `id` returns `(None, None)` and leaves
-    /// the current holder unchanged; use [`Scene::clear_focus`] to blur it.
+    /// `id` in the window's **input domain** — the first-registered root's
+    /// domain, the one `Window.focusedLayer` and all input bind to —
+    /// clearing the previous holder. Returns `(previous, new)`. An invalid
+    /// `id` returns `(None, None)` and leaves the current holder unchanged;
+    /// use [`Scene::clear_focus`] to blur it.
+    ///
+    /// The layer's own domain is irrelevant, matching the reference setter,
+    /// which moves the window's first manager regardless of the layer's
+    /// membership (`reference/cpp/core/visual/LayerTreeOwnerImpl.cpp:385-389`).
+    /// Use [`Scene::set_domain_focus`] to move focus in a specific domain.
     pub fn set_focus(&mut self, id: u32) -> (Option<u32>, Option<u32>) {
         let Some(layer) = self.layer(id) else {
             return (None, None);
         };
         let win = layer.window;
-        let prev = self.window(win).and_then(|w| w.focused_layer);
+        let Some(domain) = self.window(win).and_then(|w| w.input_domain()) else {
+            return (None, None);
+        };
+        let prev = self.focused_in(win, domain);
         if prev == Some(id) {
             return (prev, Some(id));
         }
-        if let Some(w) = self.window_mut(win) {
-            w.focused_layer = Some(id);
-        }
-        self.touch();
+        self.set_domain_focus(win, domain, Some(id));
         (prev, Some(id))
     }
 
-    /// Clear the focused layer of `window`, returning the previous holder.
+    /// Clear the input-domain focus of `window`, returning the previous
+    /// holder. This is the `Window.focusedLayer = null` shape
+    /// (`reference/cpp/core/visual/LayerTreeOwnerImpl.cpp:385-389`).
     pub fn clear_focus(&mut self, window: u32) -> Option<u32> {
-        let prev = self.window(window).and_then(|w| w.focused_layer);
-        if let Some(w) = self.window_mut(window) {
-            w.focused_layer = None;
-        }
+        let domain = self.window(window).and_then(|w| w.input_domain())?;
+        let prev = self.focused_in(window, domain);
         if prev.is_some() {
-            self.touch();
+            self.set_domain_focus(window, domain, None);
         }
         prev
+    }
+
+    /// The focused layer of `window`'s `domain`, or `None` when that domain
+    /// holds no focus. A domain is one parentless root's manager
+    /// (`reference/cpp/core/visual/LayerIntf.cpp:461-473`); every focus
+    /// read/write stays inside one domain
+    /// (`reference/cpp/core/visual/LayerManager.h:483-490`).
+    pub fn focused_in(&self, window: u32, domain: u32) -> Option<u32> {
+        self.window(window)
+            .and_then(|w| w.domain_focus.get(&domain).copied())
+    }
+
+    /// Move `window`'s `domain` focus to `target` (`None` clears it) — the
+    /// `tTVPLayerManager::FocusedLayer` assignment (`LayerTreeOwnerImpl.h:483-490`).
+    /// Moving a domain other than the input domain leaves the window-level
+    /// `focused_layer` untouched.
+    pub fn set_domain_focus(&mut self, window: u32, domain: u32, target: Option<u32>) {
+        if self.window(window).is_none() {
+            return;
+        }
+        if self.focused_in(window, domain) == target {
+            return;
+        }
+        if let Some(w) = self.window_mut(window) {
+            match target {
+                Some(id) => {
+                    w.domain_focus.insert(domain, id);
+                }
+                None => {
+                    w.domain_focus.remove(&domain);
+                }
+            }
+            w.sync_focused_layer();
+        }
+    }
+
+    /// The domain a window's input events and `focusedLayer` property bind
+    /// to: the first-registered parentless root's domain, or `None` while
+    /// the window has no such root (`PrimaryLayerManagerIndex` is 0 and
+    /// never reassigned, `reference/cpp/core/visual/LayerTreeOwnerImpl.h:21`,
+    /// `reference/cpp/core/visual/LayerTreeOwnerImpl.cpp:20`).
+    pub fn window_input_root(&self, window: u32) -> Option<u32> {
+        self.window(window).and_then(|w| w.input_domain())
     }
 
     /// Reference `GetNodeVisible`: `visible` and every ancestor visible.
@@ -1395,20 +1511,30 @@ impl Scene {
 
     /// Reference `_GetNextFocusable`/`GetNextFocusable`
     /// (`LayerIntf.cpp:3631`): the next `JoinFocusChain` focusable layer in
-    /// the window's paint order, wrapping, never returning `id` itself.
+    /// the window's paint order, wrapping, never returning `id` itself. Only
+    /// layers of `id`'s own focus domain are considered; the reference walks
+    /// the receiver's manager node list, which reaches no other root
+    /// (`reference/cpp/core/visual/LayerIntf.cpp:1260-1283`).
     pub fn next_focusable(&self, id: u32) -> Option<u32> {
         self.focusable_neighbor(id, true)
     }
 
     /// Reference `_GetPrevFocusable`/`GetPrevFocusable`
-    /// (`LayerIntf.cpp:3595`): the previous focusable layer, wrapping.
+    /// (`LayerIntf.cpp:3595`): the previous focusable layer, wrapping, scoped
+    /// to `id`'s focus domain like [`Scene::next_focusable`].
     pub fn prev_focusable(&self, id: u32) -> Option<u32> {
         self.focusable_neighbor(id, false)
     }
 
     fn focusable_neighbor(&self, id: u32, forward: bool) -> Option<u32> {
         let layer = self.layer(id)?;
-        let order = self.window_layer_order(layer.window);
+        // The manager chain holds exactly one root's tree, so the search is
+        // restricted to `id`'s domain.
+        let order: Vec<u32> = self
+            .window_layer_order(layer.window)
+            .into_iter()
+            .filter(|&cand| self.layer(cand).is_some_and(|l| l.domain == layer.domain))
+            .collect();
         let n = order.len();
         if n == 0 {
             return None;
@@ -2592,5 +2718,153 @@ mod tests {
         assert_eq!(scene.image_cache.total_bytes, 0);
         assert!(scene.image_cache.entries.is_empty());
         assert!(scene.image_cache.order.is_empty());
+    }
+
+    /// Every parentless layer founds its own focus domain (the reference
+    /// creates one `tTVPLayerManager` per parentless layer,
+    /// `reference/cpp/core/visual/LayerIntf.cpp:461-473`), and a child
+    /// inherits its parent's (`:449-455`). The domain id is the founding
+    /// root's layer id.
+    #[test]
+    fn parentless_layers_found_domains_and_children_inherit_them() {
+        let mut scene = Scene::default();
+        let win = scene.add_window("t", (1, 1));
+        let a = scene.add_layer(win, None);
+        let a_child = scene.add_layer(win, Some(a));
+        let b = scene.add_layer(win, None);
+
+        assert_eq!(scene.layer(a).unwrap().domain, a);
+        assert_eq!(scene.layer(a_child).unwrap().domain, a);
+        assert_eq!(scene.layer(b).unwrap().domain, b);
+        assert_ne!(a, b, "the siblings are separate domains");
+        assert_eq!(scene.layer(a_child).unwrap().parent, Some(a));
+    }
+
+    /// Focus is per domain: moving one domain's focus leaves the other
+    /// domain untouched, and the window keeps reporting the input domain
+    /// (domain 0) — `reference/cpp/core/visual/LayerManager.h:483-490`,
+    /// `reference/cpp/core/visual/LayerTreeOwnerImpl.h:21`.
+    #[test]
+    fn focus_is_isolated_between_domains() {
+        let mut scene = Scene::default();
+        let win = scene.add_window("t", (1, 1));
+        let a = scene.add_layer(win, None);
+        let b = scene.add_layer(win, None);
+        let a_domain = scene.layer(a).unwrap().domain;
+        let b_domain = scene.layer(b).unwrap().domain;
+
+        assert_eq!(scene.window_input_root(win), Some(a_domain));
+        scene.set_domain_focus(win, a_domain, Some(a));
+        scene.set_domain_focus(win, b_domain, Some(b));
+
+        assert_eq!(scene.focused_in(win, a_domain), Some(a));
+        assert_eq!(scene.focused_in(win, b_domain), Some(b));
+        assert_eq!(
+            scene.window(win).unwrap().focused_layer,
+            Some(a),
+            "the window-level focus stays on the input domain"
+        );
+        scene.set_domain_focus(win, b_domain, None);
+        assert_eq!(scene.focused_in(win, a_domain), Some(a));
+        assert_eq!(scene.focused_in(win, b_domain), None);
+    }
+
+    /// The focus search wraps only inside the receiver's domain; a sibling
+    /// parentless root is invisible to it
+    /// (`reference/cpp/core/visual/LayerIntf.cpp:1260-1283`).
+    #[test]
+    fn focus_search_stays_inside_the_domain() {
+        let mut scene = Scene::default();
+        let win = scene.add_window("t", (1, 1));
+        let a = scene.add_layer(win, None);
+        let a2 = scene.add_layer(win, Some(a));
+        let b = scene.add_layer(win, None);
+        for id in [a, a2, b] {
+            let layer = scene.layer_mut(id).unwrap();
+            layer.visible = true;
+            layer.focusable = true;
+        }
+
+        assert_eq!(scene.next_focusable(a), Some(a2));
+        assert_eq!(scene.prev_focusable(a), Some(a2));
+        assert_eq!(scene.next_focusable(a2), Some(a));
+        assert_eq!(
+            scene.next_focusable(b),
+            None,
+            "b's domain has no other layer"
+        );
+    }
+
+    /// `set_focus`/`clear_focus` are the window-level (input-domain) shape:
+    /// a layer of another domain is still moved into domain 0, matching the
+    /// reference setter
+    /// (`reference/cpp/core/visual/LayerTreeOwnerImpl.cpp:385-389`).
+    #[test]
+    fn set_focus_moves_the_input_domain_regardless_of_the_layer_domain() {
+        let mut scene = Scene::default();
+        let win = scene.add_window("t", (1, 1));
+        let a = scene.add_layer(win, None);
+        let b = scene.add_layer(win, None);
+        let a_domain = scene.layer(a).unwrap().domain;
+        let b_domain = scene.layer(b).unwrap().domain;
+
+        assert_eq!(scene.set_focus(b), (None, Some(b)));
+        assert_eq!(scene.focused_in(win, a_domain), Some(b));
+        assert_eq!(scene.focused_in(win, b_domain), None);
+        assert_eq!(scene.window(win).unwrap().focused_layer, Some(b));
+        assert_eq!(scene.clear_focus(win), Some(b));
+        assert_eq!(scene.focused_in(win, a_domain), None);
+    }
+
+    /// Removing a parentless root unregisters its manager
+    /// (`reference/cpp/core/visual/LayerIntf.cpp:533-535`;
+    /// `reference/cpp/core/visual/LayerTreeOwnerImpl.cpp:99-108`), clears
+    /// its focus and promotes the next root to the input domain.
+    #[test]
+    fn removing_a_root_unregisters_its_domain_and_promotes_the_next() {
+        let mut scene = Scene::default();
+        let win = scene.add_window("t", (1, 1));
+        let a = scene.add_layer(win, None);
+        let a_child = scene.add_layer(win, Some(a));
+        let b = scene.add_layer(win, None);
+        let a_domain = scene.layer(a).unwrap().domain;
+        let b_domain = scene.layer(b).unwrap().domain;
+        scene.set_domain_focus(win, a_domain, Some(a_child));
+
+        scene.remove_layer(a);
+
+        assert_eq!(
+            scene.window_input_root(win),
+            Some(b_domain),
+            "b's manager is promoted once a's is unregistered"
+        );
+        assert_eq!(scene.focused_in(win, a_domain), None);
+        assert_eq!(scene.window(win).unwrap().focused_layer, None);
+        // The detached child survives and keeps the assigned domain, which
+        // the reference fixes for the layer's whole life.
+        assert_eq!(scene.layer(a_child).unwrap().domain, a_domain);
+        assert!(scene.layer(a).is_none());
+    }
+
+    /// Destroying a whole subtree unregisters any parentless root inside it
+    /// and drops focus holders anywhere in the scene.
+    #[test]
+    fn destroying_a_root_subtree_unregisters_its_domain() {
+        let mut scene = Scene::default();
+        let win = scene.add_window("t", (1, 1));
+        let a = scene.add_layer(win, None);
+        let a_child = scene.add_layer(win, Some(a));
+        let b = scene.add_layer(win, None);
+        let a_domain = scene.layer(a).unwrap().domain;
+        let b_domain = scene.layer(b).unwrap().domain;
+        scene.set_domain_focus(win, b_domain, Some(b));
+
+        scene.destroy_layer(a);
+
+        assert!(scene.layer(a).is_none());
+        assert!(scene.layer(a_child).is_none());
+        assert_eq!(scene.focused_in(win, a_domain), None);
+        assert_eq!(scene.window_input_root(win), Some(b_domain));
+        assert_eq!(scene.focused_in(win, b_domain), Some(b));
     }
 }

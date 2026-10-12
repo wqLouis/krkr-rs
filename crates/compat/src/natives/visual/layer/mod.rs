@@ -29,7 +29,9 @@ mod transitions;
 mod util;
 
 pub use focus::take_capture_releases;
-pub(crate) use focus::{blur_tree, clear_layer_focus, focus_layer};
+pub(crate) use focus::{
+    blur_tree, clear_domain_focus, clear_layer_focus, focus_layer, focus_layer_in_input_domain,
+};
 pub use transitions::advance_transitions;
 
 /// Per-layer L3 state that has no home in the L2 [`engine::Scene`] yet: the
@@ -962,6 +964,30 @@ extern "C" fn layer_set_parent_id(
         };
         scene.layer(id).and_then(|l| l.parent)
     };
+    // `Join` refuses a self-parent (`reference/cpp/core/visual/LayerIntf.cpp:612-613`)
+    // and a move under a parent whose manager differs (`:614-615`) before
+    // any part or blur; every parentless layer owns its own manager, so
+    // "different manager" is "different focus domain". A missing record on
+    // either side is a released manager, which also fails the comparison.
+    if parent == Some(id) {
+        return report_error(out_error, "Layer.parent: Cannot set parent self");
+    }
+    if let Some(parent) = parent {
+        let scene = match scene_ref(&ctx) {
+            Ok(scene) => scene,
+            Err(error) => return report_error(out_error, &error),
+        };
+        let same_domain = scene
+            .layer(id)
+            .zip(scene.layer(parent))
+            .is_some_and(|(layer, target)| layer.domain == target.domain);
+        if !same_domain {
+            return report_error(
+                out_error,
+                "Layer.parent: Cannot move to under Other primary layer",
+            );
+        }
+    }
     // Reference `Join` calls `Part()` while the layer is still attached to
     // its old parent and only then re-attaches it
     // (`reference/cpp/core/visual/LayerIntf.cpp:619-621`); `Part()` fires
@@ -2401,7 +2427,8 @@ fn layer_node_flag(
     0
 }
 
-/// `layer.focused` — whether the layer holds its window's focus.
+/// `layer.focused` — whether the layer holds the focus of its own focus
+/// domain.
 extern "C" fn layer_focused_get(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -2422,10 +2449,12 @@ extern "C" fn layer_focused_get(
         Ok(scene) => scene,
         Err(error) => return report_error(out_error, &error),
     };
+    // Reference `GetFocused` compares the layer against its **own
+    // manager's** focus (`reference/cpp/core/visual/LayerIntf.cpp:3569-3572`),
+    // not the window-bound one.
     let focused = scene
         .layer(id)
-        .and_then(|layer| scene.window(layer.window))
-        .and_then(|window| window.focused_layer)
+        .and_then(|layer| scene.focused_in(layer.window, layer.domain))
         == Some(id);
     set_bool(out, focused);
     0

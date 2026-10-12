@@ -493,16 +493,18 @@ fn dispatch_without_an_override_reaches_the_native_without_raising() {
 /// (`reference/cpp/core/visual/LayerManager.cpp:736-747`,
 /// `LayerIntf.cpp:3574-3593`). With three focusable layers `a, b, c` and no
 /// focus, `b.focusNext()` must return the *first* focusable layer `a`, not
-/// the receiver's neighbour `c`.
+/// the receiver's neighbour `c`. The three layers live under one parentless
+/// root, so they share its manager (`LayerIntf.cpp:449-455`, `:461-473`).
 #[test]
 fn focus_search_starts_from_the_focused_layer_not_the_receiver() {
     let _lock = vm_lock();
     let env = Env::new();
     env.run(
         "var w = new Window(); \
-         var a = new Layer(w, null); a.focusable = true; a.visible = true; a.name = 'a'; \
-         var b = new Layer(w, null); b.focusable = true; b.visible = true; b.name = 'b'; \
-         var c = new Layer(w, null); c.focusable = true; c.visible = true; c.name = 'c'; \
+         var top = new Layer(w, null); \
+         var a = new Layer(w, top); a.focusable = true; a.visible = true; a.name = 'a'; \
+         var b = new Layer(w, top); b.focusable = true; b.visible = true; b.name = 'b'; \
+         var c = new Layer(w, top); c.focusable = true; c.visible = true; c.name = 'c'; \
          var got = b.focusNext();",
     );
     assert_eq!(env.eval_int("got === a"), 1);
@@ -510,16 +512,19 @@ fn focus_search_starts_from_the_focused_layer_not_the_receiver() {
 
 /// Reference: `FocusPrev` with no focused layer also uses
 /// `SearchFirstFocusable(false)` — the *first* focusable layer, not the
-/// last (`reference/cpp/core/visual/LayerManager.cpp:723-733`).
+/// last (`reference/cpp/core/visual/LayerManager.cpp:723-733`). The three
+/// layers share one parentless root's manager
+/// (`LayerIntf.cpp:449-455`, `:461-473`).
 #[test]
 fn focus_prev_without_focus_returns_the_first_focusable() {
     let _lock = vm_lock();
     let env = Env::new();
     env.run(
         "var w = new Window(); \
-         var a = new Layer(w, null); a.focusable = true; a.visible = true; a.name = 'a'; \
-         var b = new Layer(w, null); b.focusable = true; b.visible = true; b.name = 'b'; \
-         var c = new Layer(w, null); c.focusable = true; c.visible = true; c.name = 'c'; \
+         var top = new Layer(w, null); \
+         var a = new Layer(w, top); a.focusable = true; a.visible = true; a.name = 'a'; \
+         var b = new Layer(w, top); b.focusable = true; b.visible = true; b.name = 'b'; \
+         var c = new Layer(w, top); c.focusable = true; c.visible = true; c.name = 'c'; \
          var got = c.focusPrev();",
     );
     assert_eq!(env.eval_int("got === a"), 1);
@@ -529,15 +534,17 @@ fn focus_prev_without_focus_returns_the_first_focusable() {
 /// the focus chain from the *focused* layer
 /// (`reference/cpp/core/visual/LayerManager.cpp:723-747` with
 /// `LayerIntf.cpp:3631-3660`: `GetNextFocusable` searches from `this`,
-/// wrapping, skipping non-focusable nodes).
+/// wrapping, skipping non-focusable nodes); both layers share one parentless
+/// root's manager (`LayerIntf.cpp:449-455`, `:461-473`).
 #[test]
 fn focus_neighbours_walk_from_the_current_focus() {
     let _lock = vm_lock();
     let env = Env::new();
     env.run(
         "var w = new Window(); \
-         var a = new Layer(w, null); a.focusable = true; a.visible = true; a.name = 'a'; \
-         var b = new Layer(w, null); b.focusable = true; b.visible = true; b.name = 'b'; \
+         var top = new Layer(w, null); \
+         var a = new Layer(w, top); a.focusable = true; a.visible = true; a.name = 'a'; \
+         var b = new Layer(w, top); b.focusable = true; b.visible = true; b.name = 'b'; \
          a.focus(); \
          var next = a.focusNext(); \
          var prev = b.focusPrev();",
@@ -806,22 +813,25 @@ fn set_mode_rejects_disabled_layers_but_forces_invisible_ones() {
 /// (`880`) — the next focusable layer after the removed one, skipping
 /// non-focusable nodes — or clears focus when none remains
 /// (`SetFocusTo(nullptr)`, `876-884`); removing a non-modal layer is a
-/// silent no-op.
+/// silent no-op. The modal and the focusable layers live under one
+/// parentless root, so `GetNextFocusable` can reach them
+/// (`LayerIntf.cpp:449-455`, `:461-473`): focus sits on the *last*
+/// focusable while the non-focusable `ch` is skipped, so removing the modal
+/// hands it to the *first* focusable.
 #[test]
 fn remove_mode_hands_focus_to_the_next_focusable() {
     let _lock = vm_lock();
     let env = Env::new();
     env.run(
         "var w = new Window(); \
-         var p = new Layer(w, null); p.name = 'p'; \
-         var ch = new Layer(w, p); ch.name = 'ch'; \
-         ch.focusable = true; ch.visible = true; \
-         var other = new Layer(w, null); other.name = 'other'; \
-         other.focusable = true; other.visible = true; \
+         var p = new Layer(w, null); p.name = 'p'; p.visible = true; \
+         var ch = new Layer(w, p); ch.name = 'ch'; ch.focusable = false; ch.visible = true; \
+         var first = new Layer(w, p); first.name = 'first'; first.focusable = true; first.visible = true; \
+         var last = new Layer(w, p); last.name = 'last'; last.focusable = true; last.visible = true; \
          p.setMode(); \
-         ch.focusable = false; \
+         last.focus(); \
          p.removeMode(); \
-         var focus_after = (w.focusedLayer == other);",
+         var focus_after = (w.focusedLayer == first);",
     );
     env.assert_script("focus_after");
 }

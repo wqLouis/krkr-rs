@@ -17,7 +17,7 @@ use engine::Scene;
 use tjs::{NativeInstanceMethodDef, Value};
 
 use super::super::common::{resolve_object_id, scene_mut, scene_ref};
-use super::{LayerExtras, LayerInst, bound, clear_layer_focus, focus_layer};
+use super::{LayerExtras, LayerInst, bound, clear_domain_focus, focus_layer};
 use crate::native_util::{args, report_error, set_void};
 
 /// Mutable access to the sibling order vector that holds `id`.
@@ -309,22 +309,27 @@ extern "C" fn layer_set_mode(
                 "Layer.setMode: cannot set mode to a disabled or parent-hidden layer".into(),
             );
         }
-        let (window, target) = {
+        let (window, domain, target) = {
             let scene = scene_mut(&ctx)?;
             let Some(window) = scene.layer(id).map(|l| l.window) else {
                 return Err("Layer.setMode: this layer no longer exists".into());
             };
-            (window, first_focusable_subtree(scene, id))
+            let domain = scene.layer(id).map(|l| l.domain);
+            (window, domain, first_focusable_subtree(scene, id))
         };
         // Focus moves to the first focusable node of the modal's subtree
-        // with direction forward (`LayerManager.cpp:855`); the helper fires
-        // `onBlur`/`onFocus` synchronously.
+        // with direction forward (`LayerManager.cpp:855`), on the modal
+        // layer's own domain manager (`:838-856`); the helper fires
+        // `onBlur`/`onFocus` synchronously, and the null target clears that
+        // domain's focus.
         match target {
             Some(target) => {
                 focus_layer(&ctx, target, true);
             }
             None => {
-                clear_layer_focus(&ctx, window, true);
+                if let Some(domain) = domain {
+                    clear_domain_focus(&ctx, window, domain, true);
+                }
             }
         }
         {
@@ -369,23 +374,31 @@ extern "C" fn layer_remove_mode(
         had
     };
     if was_modal {
-        let (window, next) = {
+        let (window, domain, next) = {
             let scene = match scene_ref(&ctx) {
                 Ok(scene) => scene,
                 Err(error) => return report_error(out_error, &error),
             };
-            (scene.layer(id).map(|l| l.window), scene.next_focusable(id))
+            (
+                scene.layer(id).map(|l| l.window),
+                scene.layer(id).map(|l| l.domain),
+                scene.next_focusable(id),
+            )
         };
         if let Some(window) = window {
             // `RemoveModeFrom` hands focus to `layer->GetNextFocusable()`
-            // with direction forward (`LayerManager.cpp:876-883`); the
-            // helper fires `onBlur`/`onFocus` synchronously.
+            // with direction forward, on the removed layer's own domain
+            // manager (`LayerManager.cpp:869-890`); the helper fires
+            // `onBlur`/`onFocus` synchronously, and the null target clears
+            // that domain's focus.
             match next {
                 Some(next) => {
                     focus_layer(&ctx, next, true);
                 }
                 None => {
-                    clear_layer_focus(&ctx, window, true);
+                    if let Some(domain) = domain {
+                        clear_domain_focus(&ctx, window, domain, true);
+                    }
                 }
             }
         }

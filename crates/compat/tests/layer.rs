@@ -366,14 +366,21 @@ fn copy_to_bitmap_and_copy9patch() {
     assert!(env.eval("l.copy9Patch(b)").is_ok());
 }
 
+/// Reference: once a layer is focused, `FocusNext`/`FocusPrev` move within
+/// the focused layer's own manager, wrapping and skipping non-focusable
+/// nodes (`reference/cpp/core/visual/LayerManager.cpp:723-747`; the search
+/// runs the manager's node list, `LayerIntf.cpp:3631-3660`). Both layers
+/// are children of one parentless root, so they share its manager
+/// (`LayerIntf.cpp:449-455`, `:461-473`).
 #[test]
 fn focus_next_and_prev_walk_the_focus_chain() {
     let _lock = vm_lock();
     let env = Env::new();
     env.run(
         "var w = new Window(); \
-         var a = new Layer(w, null); a.focusable = true; a.visible = true; a.name = 'a'; \
-         var b = new Layer(w, null); b.focusable = true; b.visible = true; b.name = 'b'; \
+         var top = new Layer(w, null); \
+         var a = new Layer(w, top); a.focusable = true; a.visible = true; a.name = 'a'; \
+         var b = new Layer(w, top); b.focusable = true; b.visible = true; b.name = 'b'; \
          a.focus(); \
          var next = a.focusNext(); \
          var prev = b.focusPrev();",

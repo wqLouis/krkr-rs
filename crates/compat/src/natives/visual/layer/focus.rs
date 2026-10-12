@@ -4,7 +4,11 @@
 //! `SetAttentionPoint` / `SetCursorPos` / `ReleaseCapture` /
 //! `ReleaseTouchCapture` in `reference/cpp/core/visual/LayerIntf.cpp`.
 //!
-//! The focus search runs over the L2 [`engine::Scene`] focusable-node chain
+//! Focus is per **domain** (`engine::LayerState::domain`): the reference
+//! keeps one `tTVPLayerManager` per parentless-root tree and every focus
+//! operation stays inside one manager
+//! (`reference/cpp/core/visual/LayerIntf.cpp:449-473`, `LayerManager.h:483-490`).
+//! The focus search runs over the L2 [`engine::Scene`] domain chain
 //! ([`Scene::next_focusable`] / [`Scene::prev_focusable`]). Every focus
 //! transition goes through [`focus_layer`] / [`clear_layer_focus`], the port
 //! of `tTVPLayerManager::SetFocusTo`'s guard, state move and synchronous
@@ -29,18 +33,18 @@ use crate::CompatCtx;
 use crate::native_util::{args, report_error, set_void};
 use crate::natives::system::value_as_i64;
 
-/// Give `id` keyboard focus and fire the focus events, or return without
-/// any effect when the layer is not node-focusable.
+/// Give `id` keyboard focus, in its own domain, and fire the focus events,
+/// or return without any effect when the layer is not node-focusable.
 ///
-/// Reference `tTVPLayerManager::SetFocusTo`
-/// (`reference/cpp/core/visual/LayerManager.cpp:760-817`): the target is
-/// rejected before any state changes when `GetNodeFocusable()` is false
-/// (`:766-767`) — `Focusable && Visible && Enabled` plus every ancestor
-/// visible and enabled (`reference/cpp/core/visual/LayerIntf.h:663-667`),
-/// modelled by [`Scene::node_focusable`]. The window is the target's own,
-/// matching [`Scene::set_focus`]. Returns whether focus moved.
+/// Reference `tTJSNI_BaseLayer::SetFocus` → `tTVPLayerManager::SetFocusTo`
+/// (`reference/cpp/core/visual/LayerIntf.cpp:3561-3564`,
+/// `LayerManager.cpp:760-817`): the target's own manager moves, and
+/// `GetNodeFocusable()` is rejected before any state changes (`:766-767`)
+/// — `Focusable && Visible && Enabled` plus every ancestor visible and
+/// enabled (`reference/cpp/core/visual/LayerIntf.h:663-667`), modelled by
+/// [`Scene::node_focusable`]. Returns whether focus moved.
 pub(crate) fn focus_layer(ctx: &CompatCtx, id: u32, direction: bool) -> bool {
-    let window = {
+    let (window, domain) = {
         let scene = match scene_ref(ctx) {
             Ok(scene) => scene,
             Err(error) => {
@@ -51,34 +55,82 @@ pub(crate) fn focus_layer(ctx: &CompatCtx, id: u32, direction: bool) -> bool {
         let Some(layer) = scene.layer(id) else {
             return false;
         };
-        if !scene.node_focusable(id) {
-            return false;
-        }
-        layer.window
+        (layer.window, layer.domain)
     };
-    set_focus_to(ctx, window, Some(id), direction)
+    set_focus_to(ctx, window, domain, Some(id), direction)
 }
 
-/// Clear `window`'s focus and fire `onBlur` on the outgoing layer, with
-/// `direction` as in [`focus_layer`] (the reference `SetFocusTo(nullptr,
-/// direction)` tail of `LayerManager.cpp:760-817`). Returns whether focus
-/// moved.
+/// Clear `window`'s **input-domain** focus and fire `onBlur` on the
+/// outgoing layer, with `direction` as in [`focus_layer`]. This is the
+/// `Window.focusedLayer = null` / tree-owner shape, which the reference
+/// routes to the window's first registered manager
+/// (`reference/cpp/core/visual/LayerTreeOwnerImpl.cpp:385-389`); a window
+/// without an input root is a no-op, like the reference's null
+/// `GetLayerManagerAt(0)`. Returns whether focus moved.
 pub(crate) fn clear_layer_focus(ctx: &CompatCtx, window: u32, direction: bool) -> bool {
-    set_focus_to(ctx, window, None, direction)
+    let Some(domain) = scene_ref(ctx)
+        .ok()
+        .and_then(|scene| scene.window_input_root(window))
+    else {
+        return false;
+    };
+    set_focus_to(ctx, window, domain, None, direction)
 }
 
-/// Port of the `SetFocusTo` tail (`LayerManager.cpp:783-790`): move the
-/// focus state first, then fire `onBlur` on the outgoing layer with the
-/// newly focused layer (or `null`) and then `onFocus` on the incoming
-/// layer with the previously focused layer (or `null`) and the direction.
-/// Either event is skipped while its layer is `Shutdown`
+/// Clear `window`'s `domain` focus and fire `onBlur` on the outgoing
+/// layer. The `SetFocusTo(nullptr, direction)` tail
+/// (`reference/cpp/core/visual/LayerManager.cpp:704-708`, `:876-883`) for
+/// callers that operate on a layer's own domain, not the window-bound one.
+pub(crate) fn clear_domain_focus(
+    ctx: &CompatCtx,
+    window: u32,
+    domain: u32,
+    direction: bool,
+) -> bool {
+    set_focus_to(ctx, window, domain, None, direction)
+}
+
+/// `Window.focusedLayer = layer` / the tree-owner setter shape: run the
+/// `SetFocusTo(layer, direction)` sequence in `window`'s **input domain**,
+/// regardless of the layer's own domain — the reference setter moves the
+/// first registered manager's `FocusedLayer` and never checks membership
+/// (`reference/cpp/core/visual/LayerTreeOwnerImpl.cpp:385-389`,
+/// `LayerManager.h:488-490`, `LayerManager.cpp:760-767`). A window without
+/// an input root is a no-op. Returns whether focus moved.
+pub(crate) fn focus_layer_in_input_domain(
+    ctx: &CompatCtx,
+    window: u32,
+    layer: u32,
+    direction: bool,
+) -> bool {
+    let Some(domain) = scene_ref(ctx)
+        .ok()
+        .and_then(|scene| scene.window_input_root(window))
+    else {
+        return false;
+    };
+    set_focus_to(ctx, window, domain, Some(layer), direction)
+}
+
+/// Port of the `SetFocusTo` body (`LayerManager.cpp:760-790`): reject a
+/// non-node-focusable target (`:766-767`), move the focus state of
+/// `window`'s `domain` first, then fire `onBlur` on the outgoing layer
+/// with the newly focused layer (or `null`) and then `onFocus` on the
+/// incoming layer with the previously focused layer (or `null`) and the
+/// direction. Either event is skipped while its layer is `Shutdown`
 /// (`LayerManager.cpp:786-790`), so an invalidated layer that still holds
 /// focus is cleared silently. The event arguments are the layers'
 /// registered script objects, the `prevfocused->Owner` the reference posts
 /// (`reference/cpp/core/visual/LayerIntf.cpp:3702-3727`); both handlers
 /// are delivered synchronously, the reference `TVP_EPT_IMMEDIATE` shape
 /// (`reference/cpp/core/base/EventIntf.cpp:215-233`).
-fn set_focus_to(ctx: &CompatCtx, window: u32, target: Option<u32>, direction: bool) -> bool {
+fn set_focus_to(
+    ctx: &CompatCtx,
+    window: u32,
+    domain: u32,
+    target: Option<u32>,
+    direction: bool,
+) -> bool {
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
     let host = unsafe { ctx.engine() };
     let prev = {
@@ -89,9 +141,15 @@ fn set_focus_to(ctx: &CompatCtx, window: u32, target: Option<u32>, direction: bo
                 return false;
             }
         };
+        // `if(layer && !layer->GetNodeFocusable()) return false;`
+        // (`LayerManager.cpp:766-767`).
+        if let Some(target) = target
+            && !scene.node_focusable(target)
+        {
+            return false;
+        }
         let prev = scene
-            .window(window)
-            .and_then(|w| w.focused_layer)
+            .focused_in(window, domain)
             .filter(|&id| scene.layer(id).is_some());
         // `if(FocusedLayer == layer) return false;` — no state change and
         // no events (`LayerManager.cpp:779-780`).
@@ -108,14 +166,7 @@ fn set_focus_to(ctx: &CompatCtx, window: u32, target: Option<u32>, direction: bo
                 return false;
             }
         };
-        match target {
-            Some(id) => {
-                scene.set_focus(id);
-            }
-            None => {
-                scene.clear_focus(window);
-            }
-        }
+        scene.set_domain_focus(window, domain, target);
     }
     // `FocusedLayer = layer` precedes the events (`LayerManager.cpp:783-784`),
     // so an `onBlur` handler already reads the new focus; `org->FireBlur(layer)`
@@ -263,7 +314,7 @@ fn deliver(ctx: &CompatCtx, host: &Tjs2Engine, layer: u32, name: &str, args: &[T
 /// `SetEnabled(false)` `:3801-3832`, `SeverChild` `:657-665`, `NotifyPart`
 /// via `LayerManager.cpp:197-201`).
 pub(crate) fn blur_tree(ctx: &CompatCtx, root: u32) {
-    let (window, focused) = {
+    let (window, domain, focused) = {
         let scene = match scene_ref(ctx) {
             Ok(scene) => scene,
             Err(error) => {
@@ -274,8 +325,14 @@ pub(crate) fn blur_tree(ctx: &CompatCtx, root: u32) {
         let Some(layer) = scene.layer(root) else {
             return;
         };
+        // The manager whose `FocusedLayer` can sit at or below `root` is
+        // the one `root` belongs to — `NotifyPart`/`SeverChild`/the state
+        // setters all reach the layer's own manager
+        // (`reference/cpp/core/visual/LayerIntf.cpp:657-665`,
+        // `LayerManager.cpp:197-201`).
+        let domain = layer.domain;
         // `if(!FocusedLayer) return false;` (`LayerManager.cpp:695-696`).
-        let Some(focused) = scene.window(layer.window).and_then(|w| w.focused_layer) else {
+        let Some(focused) = scene.focused_in(layer.window, domain) else {
             return;
         };
         // `if(!FocusedLayer->IsAncestorOrSelf(root)) return false;`
@@ -283,7 +340,7 @@ pub(crate) fn blur_tree(ctx: &CompatCtx, root: u32) {
         if !is_ancestor_or_self(scene, root, focused) {
             return;
         }
-        (layer.window, focused)
+        (layer.window, domain, focused)
     };
     // `next = root->GetNextFocusable()` (`LayerManager.cpp:702`): the focus
     // chain search after `root` (`reference/cpp/core/visual/LayerIntf.cpp:3631-3647`),
@@ -310,10 +367,10 @@ pub(crate) fn blur_tree(ctx: &CompatCtx, root: u32) {
     // (`LayerManager.cpp:704-708`).
     match next {
         Some(next) if next != focused => {
-            set_focus_to(ctx, window, Some(next), true);
+            set_focus_to(ctx, window, domain, Some(next), true);
         }
         _ => {
-            set_focus_to(ctx, window, None, true);
+            set_focus_to(ctx, window, domain, None, true);
         }
     }
 }
@@ -338,17 +395,21 @@ fn is_ancestor_or_self(scene: &Scene, root: u32, focused: u32) -> bool {
     false
 }
 
-/// The first focusable layer of `window` in paint order — the port of the
-/// reference `tTJSNI_BaseLayer::SearchFirstFocusable` walk
+/// The first focusable layer of `window`'s `domain` in paint order — the
+/// port of the reference `tTJSNI_BaseLayer::SearchFirstFocusable` walk
 /// (`reference/cpp/core/visual/LayerIntf.cpp:3574-3593`): test the node
 /// itself (`GetNodeFocusable() && JoinFocusChain`), then recurse into the
 /// children in order. `Scene::window_layer_order` is the same DFS pre-order
-/// the reference walk produces, so one pass finds the identical node.
-fn first_focusable(scene: &Scene, window: u32) -> Option<u32> {
-    scene
-        .window_layer_order(window)
-        .into_iter()
-        .find(|&id| scene.node_focusable(id) && scene.layer(id).is_some_and(|l| l.join_focus_chain))
+/// the reference walk produces (started at the domain's primary,
+/// `LayerManager.cpp:749-757`), so one pass over the domain's nodes finds
+/// the identical node.
+fn first_focusable(scene: &Scene, window: u32, domain: u32) -> Option<u32> {
+    scene.window_layer_order(window).into_iter().find(|&id| {
+        scene
+            .layer(id)
+            .is_some_and(|l| l.domain == domain && l.join_focus_chain)
+            && scene.node_focusable(id)
+    })
 }
 
 /// Shared body of `focusNext` / `focusPrev`.
@@ -386,13 +447,17 @@ fn focus_neighbor(
             );
         };
         let window = layer.window;
+        let domain = layer.domain;
         // Reference `tTVPLayerManager::FocusNext` / `FocusPrev`
-        // (`reference/cpp/core/visual/LayerManager.cpp:723-747`): the search
-        // starts from the *manager's* focused layer — never from the
-        // receiver — and when nothing is focused it starts from the first
-        // focusable layer of the primary chain (`SearchFirstFocusable`),
-        // which the receiver-independent path below reproduces.
-        let focused = scene.window(window).and_then(|w| w.focused_layer);
+        // (`reference/cpp/core/visual/LayerManager.cpp:723-747`): the
+        // search starts from the *domain manager's* focused layer — never
+        // from the receiver — and when nothing is focused it starts from
+        // the first focusable layer of the domain's primary chain
+        // (`SearchFirstFocusable`, `LayerManager.cpp:749-757`), which the
+        // receiver-independent path below reproduces. The whole search
+        // stays inside the receiver's domain: the neighbor walk uses the
+        // manager's node list (`LayerIntf.cpp:1260-1283`).
+        let focused = scene.focused_in(window, domain);
         match focused {
             Some(focused) if scene.layer(focused).is_some() => {
                 if forward {
@@ -401,7 +466,7 @@ fn focus_neighbor(
                     scene.prev_focusable(focused)
                 }
             }
-            _ => first_focusable(scene, window),
+            _ => first_focusable(scene, window, domain),
         }
     };
     if let Some(target) = target {
