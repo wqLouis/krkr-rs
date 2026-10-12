@@ -75,6 +75,37 @@ impl State {
     }
 }
 
+/// The outcome of one engine run, accumulated while the loop runs and written
+/// once the loop ends.
+///
+/// A failure recorded anywhere in the run is terminal: [`Self::terminal`] then
+/// yields `failed` and its message. The clean `stopped` an ordinary exit writes
+/// therefore cannot replace a failure the launcher has to report.
+#[derive(Debug, Default)]
+pub(crate) struct RunOutcome {
+    /// The first fatal error seen, if any.
+    failure: Option<String>,
+}
+
+impl RunOutcome {
+    /// Records a fatal error and the message the launcher should show. The
+    /// first error wins; a later one does not replace it.
+    pub(crate) fn fail(&mut self, message: impl Into<String>) {
+        if self.failure.is_none() {
+            self.failure = Some(message.into());
+        }
+    }
+
+    /// The state-file record for the end of the run, and the failure message
+    /// when there was one.
+    pub(crate) fn terminal(&self) -> (State, Option<&str>) {
+        match self.failure.as_deref() {
+            Some(message) => (State::Failed, Some(message)),
+            None => (State::Stopped, None),
+        }
+    }
+}
+
 /// Directory holding `krkr_state.json`, set once at startup on Android from
 /// `KrkrGameActivity.pendingStateDir`.
 #[cfg(target_os = "android")]
@@ -336,5 +367,51 @@ mod tests {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(civil_from_days(19_723), (2024, 1, 1));
         assert_eq!(civil_from_days(20_000), (2024, 10, 4));
+    }
+
+    /// A failure recorded during the run is terminal: the clean-exit write that
+    /// follows the loop must not replace it with `stopped` (which the launcher
+    /// reads as a clean exit and clears the pending marker for —
+    /// `android/app/src/main/kotlin/dev/krkr/rs/MainActivity.kt`, the
+    /// `"stopped"`/`else` reconcile branch).
+    #[test]
+    fn a_recorded_failure_is_terminal() {
+        let mut outcome = RunOutcome::default();
+        assert_eq!(outcome.terminal(), (State::Stopped, None));
+
+        outcome.fail("cannot open the game");
+        assert_eq!(
+            outcome.terminal(),
+            (State::Failed, Some("cannot open the game"))
+        );
+
+        // The first failure stands even if the loop records a later one.
+        outcome.fail("frame failed");
+        assert_eq!(
+            outcome.terminal(),
+            (State::Failed, Some("cannot open the game"))
+        );
+
+        // A run that recorded nothing still ends as a clean stop.
+        assert_eq!(RunOutcome::default().terminal(), (State::Stopped, None));
+    }
+
+    /// The terminal write for a run that recorded a failure lands as `failed`
+    /// with the message, so the launcher's reconcile shows it instead of
+    /// clearing the pending marker on a `stopped` (the launcher branches on the
+    /// `state` field: `android/app/src/main/kotlin/dev/krkr/rs/MainActivity.kt`).
+    #[test]
+    fn terminal_write_reports_a_recorded_failure() {
+        let dir = scratch_dir("terminal");
+        let mut outcome = RunOutcome::default();
+        outcome.fail("cannot open the game");
+        let (state, message) = outcome.terminal();
+        write_state_at(&dir, state, message).expect("write terminal state");
+
+        let json = std::fs::read_to_string(dir.join(STATE_FILE_NAME)).expect("read state file");
+        assert!(json.contains("\"state\": \"failed\""), "json: {json}");
+        assert!(json.contains("cannot open the game"), "json: {json}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

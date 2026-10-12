@@ -44,6 +44,9 @@ pub(crate) struct AndroidHost {
     gestures: GestureSynthesizer,
     /// Monotonic start for the gesture clock; only differences matter.
     gesture_clock: Instant,
+    /// The first fatal error, if the loop is ending because of one. The state
+    /// file reports this instead of a clean stop.
+    outcome: state::RunOutcome,
 }
 
 impl AndroidHost {
@@ -63,6 +66,7 @@ impl AndroidHost {
             pending_events: Vec::new(),
             gestures: GestureSynthesizer::default(),
             gesture_clock: Instant::now(),
+            outcome: state::RunOutcome::default(),
         }
     }
 
@@ -70,6 +74,13 @@ impl AndroidHost {
     /// destroyed.
     pub(crate) fn teardown(&mut self) {
         self.running = None;
+    }
+
+    /// Records a fatal error for the state file and ends the loop.
+    fn fail(&mut self, message: String) -> Flow {
+        log::error!("{message}");
+        self.outcome.fail(message);
+        Flow::Exit
     }
 
     /// Delivers a translated input event through the normal event path.
@@ -136,15 +147,13 @@ impl EventHandler for AndroidHost {
         let window_handle = match window.raw_window_handle() {
             Ok(handle) => handle,
             Err(error) => {
-                log::error!("cannot obtain the Android window handle: {error}");
-                return Flow::Exit;
+                return self.fail(format!("cannot obtain the Android window handle: {error}"));
             }
         };
         let display_handle = match window.raw_display_handle() {
             Ok(handle) => handle,
             Err(error) => {
-                log::error!("cannot obtain the Android display handle: {error}");
-                return Flow::Exit;
+                return self.fail(format!("cannot obtain the Android display handle: {error}"));
             }
         };
         let mut config = HostConfig::default();
@@ -156,8 +165,7 @@ impl EventHandler for AndroidHost {
         let host = match Host::new(config) {
             Ok(host) => host,
             Err(error) => {
-                log::error!("cannot create the render host: {error}");
-                return Flow::Exit;
+                return self.fail(format!("cannot create the render host: {error}"));
             }
         };
         // A directory-only launch mounts every `*.xp3` under the folder. The
@@ -173,25 +181,25 @@ impl EventHandler for AndroidHost {
                 self.running = Some(game);
                 Flow::Continue
             }
-            Err(error) => {
-                log::error!("cannot open the game: {error}");
-                let message = error.to_string();
-                state::write_state(state::State::Failed, Some(&message));
-                Flow::Exit
-            }
+            Err(error) => self.fail(format!("cannot open the game: {error}")),
         }
     }
 
     fn event(&mut self, event: PlatformEvent) -> Flow {
         match event {
             PlatformEvent::Resized(width, height) => {
-                if let Some(game) = self.running.as_mut()
-                    && let Err(error) = game.host_mut().resize((width, height))
-                {
-                    log::error!("resize failed: {error}");
-                    return Flow::Exit;
+                // The resize error borrows the running game; build the message
+                // first so the terminal failure can be recorded afterwards.
+                let failure = self.running.as_mut().and_then(|game| {
+                    game.host_mut()
+                        .resize((width, height))
+                        .err()
+                        .map(|error| format!("resize failed: {error}"))
+                });
+                match failure {
+                    Some(message) => self.fail(message),
+                    None => Flow::Continue,
                 }
-                Flow::Continue
             }
             // Input and sizes are physical, so the density value needs no host
             // action; the accompanying physical resize carries the new size.
@@ -216,16 +224,15 @@ impl EventHandler for AndroidHost {
     }
 
     fn frame(&mut self, dt_ms: f32, _window: &PlatformWindow) -> Flow {
-        if let Some(game) = self.running.as_mut() {
-            let events = std::mem::take(&mut self.pending_events);
-            if let Err(error) = game.step(dt_ms, &events) {
-                log::error!("frame failed: {error}");
-                let message = error.to_string();
-                state::write_state(state::State::Failed, Some(&message));
-                return Flow::Exit;
-            }
+        let Some(game) = self.running.as_mut() else {
+            return Flow::Continue;
+        };
+        let events = std::mem::take(&mut self.pending_events);
+        let result = game.step(dt_ms, &events);
+        match result {
+            Ok(_) => Flow::Continue,
+            Err(error) => self.fail(format!("frame failed: {error}")),
         }
-        Flow::Continue
     }
 }
 
@@ -235,7 +242,11 @@ impl EventHandler for AndroidHost {
 /// `RedrawNeeded` and content-rect callbacks also request a frame, so the
 /// first frame and a surface change are presented promptly. While paused, the
 /// ticker keeps running but no frame is stepped.
-pub(crate) fn run_loop(app: AndroidApp, mut handler: AndroidHost, frame_period: Duration) {
+pub(crate) fn run_loop(
+    app: AndroidApp,
+    mut handler: AndroidHost,
+    frame_period: Duration,
+) -> state::RunOutcome {
     let mut ticker = Ticker::new(frame_period, Instant::now());
     let mut last_frame = Instant::now();
     let mut window: Option<PlatformWindow> = None;
@@ -257,16 +268,21 @@ pub(crate) fn run_loop(app: AndroidApp, mut handler: AndroidHost, frame_period: 
             match event {
                 MainEvent::InitWindow { .. } => match create_window(&app) {
                     Ok(created) => {
+                        let resumed = handler.resumed(&created);
                         window = Some(created);
-                        if let Some(created) = window.as_ref()
-                            && handler.resumed(created) == Flow::Exit
-                        {
+                        if resumed == Flow::Exit {
                             exit = true;
+                        } else {
+                            // Storage is mounted, natives are registered and the
+                            // VM is bootstrapped. Publish `running` so the
+                            // launcher's reconcile sees a live engine instead of
+                            // a stale `starting`.
+                            state::write_state(state::State::Running, None);
                         }
                         frame_requested = true;
                     }
                     Err(error) => {
-                        log::error!("cannot open the Android window: {error}");
+                        handler.fail(format!("cannot open the Android window: {error}"));
                         exit = true;
                     }
                 },
@@ -356,12 +372,14 @@ pub(crate) fn run_loop(app: AndroidApp, mut handler: AndroidHost, frame_period: 
                     exit = true;
                 }
                 if let Err(error) = handler.sync_script_size() {
-                    log::error!("cannot apply the script window size: {error}");
+                    handler.fail(format!("cannot apply the script window size: {error}"));
                     exit = true;
                 }
             }
         }
     }
+
+    handler.outcome
 }
 
 /// Wraps the `ANativeWindow` the activity handed over, with its display

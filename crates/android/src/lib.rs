@@ -77,13 +77,19 @@ mod android_entry {
     #[unsafe(no_mangle)]
     pub fn android_main(app: AndroidApp) {
         // The state directory is read first: the state file and the logger are
-        // then available for every later failure.
-        if let Some(state_dir) = jni_fields::activity_static_string(
+        // then available for every later failure. A read failure is not the
+        // same as an unset field, but with no directory there is nowhere to
+        // write the state file, so stderr is the only channel here.
+        match jni_fields::activity_static_string(
             &app,
             jni_fields::FIELD_STATE_DIR,
             jni_fields::SIG_STRING,
         ) {
-            state::set_state_dir(state_dir);
+            Ok(Some(state_dir)) => state::set_state_dir(state_dir),
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!("krkr-rs: cannot read KrkrGameActivity.pendingStateDir: {error}");
+            }
         }
         if let Err(error) = init_logging() {
             // The launcher reads a file, not logcat: without it the Logs screen
@@ -102,43 +108,65 @@ mod android_entry {
             jni_fields::FIELD_GAME_DIR,
             jni_fields::SIG_STRING,
         ) {
-            Some(dir) => PathBuf::from(dir),
-            None => {
-                let message =
-                    "no game directory was passed by KrkrGameActivity (pendingGameDir is unset)";
-                log::error!("{message}");
-                state::write_state(state::State::Failed, Some(message));
+            Ok(Some(dir)) => PathBuf::from(dir),
+            Ok(None) => {
+                report_startup_failure(
+                    "no game directory was passed by KrkrGameActivity (pendingGameDir is unset)",
+                );
+                return;
+            }
+            Err(error) => {
+                report_startup_failure(&format!(
+                    "cannot read KrkrGameActivity.pendingGameDir: {error}"
+                ));
                 return;
             }
         };
-        let name = jni_fields::activity_static_string(
+        let name = match jni_fields::activity_static_string(
             &app,
             jni_fields::FIELD_GAME_NAME,
             jni_fields::SIG_STRING,
-        )
-        .unwrap_or_default();
+        ) {
+            Ok(Some(name)) => name,
+            Ok(None) => String::new(),
+            // The name only decorates a log line; a read failure there is not
+            // fatal, but it is logged rather than silently blanked.
+            Err(error) => {
+                log::warn!("cannot read KrkrGameActivity.pendingGameName: {error}");
+                String::new()
+            }
+        };
         log::info!("krkr: launching {name:?} from {}", game_dir.display());
 
-        // The launcher persisted this choice in its own settings store and
-        // published it over JNI. Resolving it here keeps configuration loading
-        // the launcher's business: the emulator only receives the finished
-        // value. An unparseable or out-of-range value is a typed error, never a
-        // fall back to the default (D11).
-        let frame_rate = jni_fields::activity_static_string(
-            &app,
-            jni_fields::FIELD_FRAME_RATE,
-            jni_fields::SIG_STRING,
-        );
-        let scaling = jni_fields::activity_static_string(
-            &app,
-            jni_fields::FIELD_SCALING,
-            jni_fields::SIG_STRING,
-        );
-        let preload_archives = jni_fields::activity_static_string(
-            &app,
-            jni_fields::FIELD_PRELOAD_ARCHIVES,
-            jni_fields::SIG_STRING,
-        );
+        // The launcher persisted these choices in its own settings store and
+        // published them over JNI. Resolving them here keeps configuration
+        // loading the launcher's business: the emulator only receives the
+        // finished value. An unparseable or out-of-range value is a typed
+        // error, never a fall back to the default. A JNI read *failure* is
+        // likewise reported rather than treated as "unset": only a
+        // null/empty field means "no override", and only that takes the
+        // default.
+        let frame_rate = match read_settings_field(&app, jni_fields::FIELD_FRAME_RATE) {
+            Ok(value) => value,
+            Err(message) => {
+                report_startup_failure(&message);
+                return;
+            }
+        };
+        let scaling = match read_settings_field(&app, jni_fields::FIELD_SCALING) {
+            Ok(value) => value,
+            Err(message) => {
+                report_startup_failure(&message);
+                return;
+            }
+        };
+        let preload_archives = match read_settings_field(&app, jni_fields::FIELD_PRELOAD_ARCHIVES) {
+            Ok(value) => value,
+            Err(message) => {
+                report_startup_failure(&message);
+                return;
+            }
+        };
         let runtime = match config::resolve_runtime_config(
             frame_rate.as_deref(),
             scaling.as_deref(),
@@ -164,13 +192,29 @@ mod android_entry {
             game_dir,
             runtime.preload_archives,
         );
-        host::run_loop(
+        let outcome = host::run_loop(
             app,
             handler,
             Duration::from_secs_f64(runtime.frame_rate_limit.period_secs()),
         );
 
-        state::write_state(state::State::Stopped, None);
+        // The terminal write reports a recorded failure, or a clean stop when
+        // the loop recorded none; a later `stopped` must never erase a failure.
+        let (terminal, message) = outcome.terminal();
+        state::write_state(terminal, message);
+    }
+
+    /// Reads one optional settings field, turning a JNI read failure into the
+    /// option it belongs to instead of treating it as "unset".
+    fn read_settings_field(app: &AndroidApp, field: &str) -> Result<Option<String>, String> {
+        jni_fields::activity_static_string(app, field, jni_fields::SIG_STRING)
+            .map_err(|error| format!("cannot read KrkrGameActivity.{field}: {error}"))
+    }
+
+    /// Reports a startup failure through the state file and the log.
+    fn report_startup_failure(message: &str) {
+        log::error!("{message}");
+        state::write_state(state::State::Failed, Some(message));
     }
 
     /// Maps a resolved presentation scaling to the engine's projection mode.
@@ -216,14 +260,25 @@ mod android_entry {
             stderr,
             file: Mutex::new(Some(file)),
         };
-        if log::set_boxed_logger(Box::new(logger)).is_err() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                "a global logger is already installed",
-            ));
+        match log::set_boxed_logger(Box::new(logger)) {
+            Ok(()) => {
+                log::set_max_level(max_level);
+                Ok(())
+            }
+            // The global logger is process-wide, so this can only mean an
+            // earlier `android_main` in this same process already installed it:
+            // `android-activity` calls `android_main` once per Activity
+            // instance and the launcher and the engine share the process. The
+            // existing logger already fans every record into the same
+            // `krkr.log`, so a second launch keeps logging instead of failing.
+            // There is no other process that could own this process's logger;
+            // a genuine setup failure (an unopenable log file) was returned
+            // above, before the claim.
+            Err(_) => {
+                log::debug!("the engine log is already installed for this process");
+                Ok(())
+            }
         }
-        log::set_max_level(max_level);
-        Ok(())
     }
 
     /// The one global logger: the `env_logger` stderr sink plus the capped

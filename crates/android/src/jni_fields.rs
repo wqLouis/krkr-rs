@@ -42,29 +42,33 @@ pub(crate) const SIG_STRING: &str = "Ljava/lang/String;";
 /// `FindClass`, because `FindClass` on a native-attached thread resolves
 /// against the system class loader and would not find the application class.
 ///
-/// Returns `None` when the field is unset or a JNI step fails. Every failure is
-/// logged and any pending Java exception is cleared, so the `android_main`
-/// thread is left clean for the loop's later JNI use.
+/// `Ok(None)` means the field is null or empty — the launcher published no
+/// value — while `Err` means a JNI step failed and the value, if present, could
+/// not be read. Callers must keep those two cases apart: an absent settings
+/// value takes its default, a read failure is reported like a missing game
+/// directory rather than silently defaulted. Every failure is logged and any
+/// pending Java exception is cleared, so the `android_main` thread is left
+/// clean for the loop's later JNI use.
 #[allow(unsafe_code)]
 pub(crate) fn activity_static_string(
     app: &AndroidApp,
     field: &str,
     signature: &str,
-) -> Option<String> {
+) -> Result<Option<String>, jni::errors::Error> {
     // SAFETY: `AndroidApp` owns the VM and Activity pointers for the lifetime
     // of `android_main`, which is the only caller.
     let vm = match unsafe { jni::JavaVM::from_raw(app.vm_as_ptr().cast()) } {
         Ok(vm) => vm,
         Err(error) => {
             log::error!("cannot obtain the JavaVM: {error}");
-            return None;
+            return Err(error);
         }
     };
     let mut env = match vm.attach_current_thread() {
         Ok(env) => env,
         Err(error) => {
             log::error!("cannot attach the native thread to the JVM: {error}");
-            return None;
+            return Err(error);
         }
     };
     // SAFETY: the Activity pointer is a global reference owned by the app; the
@@ -80,24 +84,28 @@ pub(crate) fn activity_static_string(
     };
     let object = match value.l() {
         Ok(object) if !object.is_null() => object,
-        Ok(_) => return None,
+        Ok(_) => return Ok(None),
         Err(error) => return report(&mut env, field, error),
     };
     let string = jni::objects::JString::from(object);
     match env.get_string(&string) {
         Ok(value) => {
             let value: String = value.into();
-            (!value.is_empty()).then_some(value)
+            Ok((!value.is_empty()).then_some(value))
         }
         Err(error) => report(&mut env, field, error),
     }
 }
 
-/// Logs a failed JNI step, clears the pending exception and yields `None`.
-fn report<T>(env: &mut jni::JNIEnv<'_>, field: &str, error: jni::errors::Error) -> Option<T> {
+/// Logs a failed JNI step, clears the pending exception and yields the error.
+fn report<T>(
+    env: &mut jni::JNIEnv<'_>,
+    field: &str,
+    error: jni::errors::Error,
+) -> Result<T, jni::errors::Error> {
     log::error!("cannot read KrkrGameActivity.{field}: {error}");
     // The jni crate leaves the Java exception pending; clear it so every later
     // JNI call on this thread is not poisoned.
     let _ = env.exception_clear();
-    None
+    Err(error)
 }
