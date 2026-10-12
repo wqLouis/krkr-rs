@@ -133,14 +133,26 @@ class KrkrGameActivity : GameActivity() {
 
     /**
      * `launchMode="singleTask"`: a second launch while an instance is alive is
-     * delivered here rather than to [onCreate], so the static fields the native
-     * side reads would otherwise keep pointing at the previous game. Refresh
-     * them from the new Intent and log that the engine is already running.
+     * delivered here rather than to [onCreate]. The native side reads
+     * [pendingGameDir] once, when `android_main` starts, so these fields must
+     * keep describing the game the engine is actually running. A different game
+     * cannot take effect, so such an intent is ignored; the launcher refuses it
+     * before starting anything, which keeps the pending-launch marker naming the
+     * running game.
      */
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        pendingGameDir = intent.getStringExtra(EXTRA_GAME_DIR)
+        val gameDir = intent.getStringExtra(EXTRA_GAME_DIR)
+        val currentDir = pendingGameDir
+        if (currentDir != null && gameDir != currentDir) {
+            LauncherLog.w(
+                "onNewIntent ignored: the engine is already running \"${pendingGameName ?: "?"}\", " +
+                    "not \"${intent.getStringExtra(EXTRA_GAME_NAME) ?: "?"}\"",
+            )
+            return
+        }
+        pendingGameDir = gameDir
         pendingGameName = intent.getStringExtra(EXTRA_GAME_NAME)
         pendingStateDir = filesDir.absolutePath
         publishRuntimeSettings()

@@ -8,6 +8,7 @@ import android.net.Uri
 import android.os.Bundle
 import android.provider.Settings
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -60,11 +61,14 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
@@ -251,14 +255,23 @@ private fun LauncherScreen(
     var games by remember { mutableStateOf(library.all()) }
     var pendingRemoval by remember { mutableStateOf<GameEntry?>(null) }
     var gameIssue by remember { mutableStateOf<Issue?>(null) }
-    var showLogs by remember { mutableStateOf(false) }
-    var showSettings by remember { mutableStateOf(false) }
+    // Saveable so a configuration change (rotation, dark-mode toggle, fold,
+    // resize) does not close the open sub-screen or forget a dismissal.
+    var showLogs by rememberSaveable { mutableStateOf(false) }
+    var showSettings by rememberSaveable { mutableStateOf(false) }
 
     // The permission dialog is shown whenever the grant is missing, unless the
     // user explicitly dismissed it ("Not now"). Tapping a game re-opens it.
-    var permissionDismissed by remember { mutableStateOf(false) }
+    var permissionDismissed by rememberSaveable { mutableStateOf(false) }
     LaunchedEffect(permissionGranted) { if (permissionGranted) permissionDismissed = false }
     val showPermission = !permissionGranted && !permissionDismissed
+
+    // System back must agree with the TopAppBar arrow: while a sub-screen is
+    // open it returns to the library instead of finishing the Activity.
+    BackHandler(enabled = showLogs || showSettings) {
+        showLogs = false
+        showSettings = false
+    }
 
     /** Reports a transient problem to the user; never fails silently. */
     fun notify(text: String) {
@@ -721,6 +734,41 @@ private fun launchGame(
         return
     }
 
+    // A game cannot be switched inside a live android_main: the native side reads
+    // pendingGameDir once, when android_main starts, and nothing ever re-reads
+    // it. Starting a second game would therefore just resume the first while the
+    // pending marker written below would name the second, so a later crash would
+    // be blamed on the wrong game. Only allow the launch when it is the game that
+    // is already running (which merely brings it back to the front); otherwise
+    // refuse and say why, and never write a marker for a game that will not run.
+    val running = EngineDiagnostics.readState(context)?.takeIf {
+        (it.state == "starting" || it.state == "running") &&
+            it.pid != null && it.pid == android.os.Process.myPid()
+    }
+    if (running != null) {
+        val current = EngineDiagnostics.readLaunch(context)
+        if (current?.path == path) {
+            LauncherLog.i("engine already running \"${entry.name}\"; bringing it to the front")
+            runCatching {
+                context.startActivity(
+                    Intent(context, KrkrGameActivity::class.java)
+                        .putExtra(KrkrGameActivity.EXTRA_GAME_DIR, path)
+                        .putExtra(KrkrGameActivity.EXTRA_GAME_NAME, entry.name),
+                )
+            }.onFailure { LauncherLog.w("could not bring the running game to the front: ${it.message}") }
+            return
+        }
+        LauncherLog.w("launch blocked: the engine is already running a different game")
+        onIssue(
+            Issue(
+                title = "A game is already running",
+                message = "krkr-rs can only run one game at a time. Close \"" +
+                    (current?.name ?: "the running game") + "\" and try again.",
+            ),
+        )
+        return
+    }
+
     LauncherLog.i("launching \"${entry.name}\" from $path")
     EngineDiagnostics.markLaunch(context, entry.name, path)
     runCatching {
@@ -762,9 +810,11 @@ private fun SettingsScreen(
     onBack: () -> Unit,
 ) {
     val saved = remember { store.read() }
-    var frameRate by remember { mutableStateOf(saved.frameRate) }
-    var scaling by remember { mutableStateOf(saved.scaling) }
-    var preloadArchives by remember { mutableStateOf(saved.preloadArchives) }
+    // Saveable so an in-progress edit survives a configuration change rather
+    // than silently reverting to the on-disk values.
+    var frameRate by rememberSaveable { mutableStateOf(saved.frameRate) }
+    var scaling by rememberSaveable { mutableStateOf(saved.scaling) }
+    var preloadArchives by rememberSaveable { mutableStateOf(saved.preloadArchives) }
 
     // Validate only the frame rate here: the other values can only be set from
     // their fixed controls, except when the file was hand-edited.
@@ -875,6 +925,9 @@ private fun SettingsScreen(
             Switch(
                 checked = preloadChecked,
                 onCheckedChange = { preloadArchives = it.toString() },
+                // The visible "Archive preload" label is a separate node, so
+                // name the switch itself for TalkBack.
+                modifier = Modifier.semantics { contentDescription = "Archive preload" },
             )
             Spacer(Modifier.width(8.dp))
             Text(
@@ -935,7 +988,7 @@ private fun SettingsScreen(
         Text(
             text = "Settings file: ${store.settingsFile().absolutePath}",
             style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.outline,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
     }
 }
@@ -964,7 +1017,7 @@ private fun EmptyLibrary(modifier: Modifier = Modifier, configPath: String) {
             Text(
                 text = "Library: $configPath",
                 style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.outline,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
                 textAlign = TextAlign.Center,
             )
         }
