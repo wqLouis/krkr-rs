@@ -2,6 +2,33 @@
 
 Audit only. **No source file was modified.** Deliverable: `docs/audits/perf-hotspots.md`.
 
+> **Status, added after the fact.** Hotspot **#1 was fixed in `00a07d9`**, and its
+> consequence **#5 with it**, on a tree that already contained this audit. The
+> reference rule is `CacheRecalcRegion`: `Complete()` returns the cached image
+> while that region is empty (`reference/cpp/core/visual/LayerIntf.cpp:7734-7737`)
+> and a transition update never fills it, because a temporary update skips the
+> region append (`:6305-6335`), so the subtree is composited once per content
+> change and the cached images are blended per frame. The engine now gates on
+> `LayerState::cache_recalc` plus a source-generation sum, and the compat
+> transition writes through a path that does not bump `Scene::revision`, so the
+> per-frame re-projection is gone too. `crates/engine/tests/layer_ops.rs` and
+> `crates/compat/tests/transitions.rs` cover the reuse, the mid-transition source
+> change and the no-reprojection property.
+>
+> The other findings were re-checked against the code afterwards, and two needed
+> correcting. **#2** was partly stale: the character and shadow cache already
+> existed (`00a07d9`) and the double rasterization was already gone (`b6188f7`);
+> the real remaining defect was that both text caches evicted in insertion order
+> while the reference is an LRU, which thrashes whenever the working set exceeds
+> the limit — that is now an LRU. **#3** is fixed for the stall: a frame's dirty
+> bitmaps are staged, recorded and submitted once with one wait, instead of one
+> submit and one blocking wait per bitmap. Its second half, re-uploading only the
+> changed rectangle, is **not** fixable at that seam as the code stands —
+> `BitmapState` carries only a `dirty` flag and no region, so the caller has no
+> rectangle to pass; adding one is an L2 change across every pixel-writing site.
+> **#4** is the software-blit cost; **#6** is the environment. Read the impact
+> column below as of the audit's date, not as the current state.
+
 Game under test: `/mnt/DATA/Games/Others/test` (KAG title; `system/messagearea.tjs`,
 `system/advscreen.tjs`). Branch `migration/middle-layer-ash`. The reference
 `reference/cpp/**` is the only oracle.
@@ -14,11 +41,11 @@ Author: performance audit (read-only). Date: 2026-10-11.
 
 | # | Hotspot | Where | Class | Impact |
 |---|---|---|---|---|
-| **1** | Whole-subtree transition re-renders **both** cached subtrees, clones both bitmaps and re-blends **every frame**; the reference reuses the cache until the source changes | `crates/engine/src/layer_ops.rs:2532` (`render_layer_subtree`), `crates/compat/.../transitions.rs:1092,1096,1100-1101`, `:1080` | **NEW regression** (`a63b9fb`) | **Critical** — matches "clicking settings / transitions hangs" and "laggy gameplay" |
-| **2** | Per-character text draw re-rasterizes glyph outlines and re-blurs the shadow on every `drawText`, with **no character/shadow cache**; the reference caches both | `crates/engine/src/text.rs:1254,1316,1507`; `crates/compat/src/resource.rs:400,408,437` | Missing cache is **pre-existing**; the cone-convolution rewrite is **not** a net regression (it is faster than the code it replaced). A new **double** rasterization was added | **High** — matches "dialog pops up hangs" |
-| **3** | Every dirty bitmap is re-uploaded **in full** to the GPU each frame, and each upload is a **synchronous** submit + `wait_for_fences(u64::MAX)` | `crates/app/src/lib.rs:441`; `crates/platform/render/src/vulkan/texture.rs:299,516` | Pre-existing | High (Vulkan) — amplifies 1 and 2 |
+| **1** | Whole-subtree transition re-renders **both** cached subtrees, clones both bitmaps and re-blends **every frame**; the reference reuses the cache until the source changes | `crates/engine/src/layer_ops.rs:2532` (`render_layer_subtree`), `crates/compat/.../transitions.rs:1092,1096,1100-1101`, `:1080` | **Fixed in `00a07d9`** — see the status note above | **Critical** — matches "clicking settings / transitions hangs" and "laggy gameplay" |
+| **2** | Per-character text draw re-rasterizes glyph outlines and re-blurs the shadow on every `drawText`, with **no character/shadow cache**; the reference caches both | `crates/engine/src/text.rs:1254,1316,1507`; `crates/compat/src/resource.rs:400,408,437` | Cache and the double-raster fix already landed (`00a07d9`, `b6188f7`); the **eviction was FIFO where the reference is LRU** — **fixed** | **High** — matches "dialog pops up hangs" |
+| **3** | Every dirty bitmap is re-uploaded **in full** to the GPU each frame, and each upload is a **synchronous** submit + `wait_for_fences(u64::MAX)` | `crates/app/src/lib.rs:441`; `crates/platform/render/src/vulkan/texture.rs:299,516` | Per-bitmap stall **fixed** (one batch submit per frame); the full re-upload needs a region the seam does not carry | High (Vulkan) — amplifies 1 and 2 |
 | **4** | Subtree/transition per-pixel software blits and blends (`fill(0)` + `read_pixel`/`write_pixel` per pixel, no row specialization) | `crates/engine/src/layer_ops.rs:451,511,2165,2563`; `crates/engine/src/trans/mod.rs:721,748,783` | Pre-existing | High in debug, medium in release |
-| **5** | Transition re-render forces a **full scene re-projection** every frame (`bitmap_mut` bumps revision; `project_scene` allocates a fresh tree) | `crates/engine/src/scene.rs:1700`; `crates/app/src/lib.rs:325`; `crates/engine/src/projection.rs:476` | Consequence of #1 | Medium |
+| **5** | Transition re-render forces a **full scene re-projection** every frame (`bitmap_mut` bumps revision; `project_scene` allocates a fresh tree) | `crates/engine/src/scene.rs:1700`; `crates/app/src/lib.rs:325`; `crates/engine/src/projection.rs:476` | Consequence of #1 — **fixed with it** | Medium |
 | **6** | Startup/loading blocks in **FUSE (`fuseblk`/NTFS-3G) I/O for tens of seconds** | environment (`/mnt/DATA` mount) | Environmental, not code | High for *this* user, not a code defect |
 
 The two "prime suspect" changes were checked against `git show` and the reference.

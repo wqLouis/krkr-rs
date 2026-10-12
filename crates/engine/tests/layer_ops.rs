@@ -255,6 +255,37 @@ fn render_layer_subtree_reuses_the_cache_until_the_subtree_changes() {
     assert_eq!(&bitmap.rgba[4..8], &[10, 20, 30, 255], "the moved child");
 }
 
+/// Reusing the composited subtree content does not mutate the scene graph:
+/// the second `Complete` returns the existing `CacheBitmap` without bumping
+/// `Scene::revision`, so the renderer does not rebuild the projected scene
+/// for a frame that only reads the cache.
+///
+/// reference/cpp/core/visual/LayerIntf.cpp:7734-7737
+#[test]
+fn render_layer_subtree_reuse_does_not_touch_the_scene_revision() {
+    let mut scene = Scene::default();
+    let win = scene.add_window("t", (2, 2));
+    let parent = scene.add_layer(win, None);
+    scene.layer_mut(parent).unwrap().rect = Rect::new(0, 0, 2, 2);
+    let child = scene.add_layer(win, Some(parent));
+    let child_bitmap = solid_bitmap(&mut scene, 2, 2, [10, 20, 30, 255]);
+    {
+        let l = scene.layer_mut(child).unwrap();
+        l.rect = Rect::new(0, 0, 2, 2);
+        l.visible = true;
+        l.bitmap = Some(child_bitmap);
+    }
+
+    let content = render_layer_subtree(&mut scene, parent).expect("content bitmap");
+    let revision = scene.revision();
+    assert_eq!(render_layer_subtree(&mut scene, parent), Some(content));
+    assert_eq!(
+        scene.revision(),
+        revision,
+        "a reused subtree cache does not mutate the scene graph"
+    );
+}
+
 /// An image edit that does not go through a layer accessor (the `Layer` pixel
 /// natives borrow the scene's bitmap vec directly) still invalidates the
 /// cache: the composited content records the source images'

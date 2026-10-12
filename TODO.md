@@ -583,6 +583,17 @@ working.
   behaviour oracle.
 * **L2 API snapshot + CI build step** — `cargo public-api` decided, unwired; CI runs only `cargo fmt --check` + the stateless guard, so the surface lock is a local gate.
 * **Windowed audio on a real device** — owed.
+* **Zero-copy image presentation** — a later stage, not a fix owed now. Every
+  upload goes CPU pixels → a persistent host-visible staging buffer →
+  `vkCmdCopyBufferToImage`; there is no `dmabuf`, `AHardwareBuffer`,
+  `VK_EXT_external_memory` or `VK_ANDROID_hardware_buffer` path anywhere. The
+  copy is not a bottleneck at current sizes (1280×720 RGBA is 3.7 MB, ~220 MB/s
+  at 60 fps), which is why removing it is a feature and not a performance
+  repair. Android: an `AHardwareBuffer` imported as a `VkImage` through
+  `VK_ANDROID_hardware_buffer`, and for video a decoder writing straight into
+  that image (MediaCodec output, or FFmpeg hwaccel with a Vulkan or dmabuf pixel
+  format) instead of into system memory. Desktop: `VK_EXT_external_memory_dma_buf`
+  with `VK_EXT_image_drm_format_modifier`. Not started.
 
 ## 11. Quality backlog
 
@@ -593,6 +604,23 @@ working.
 * **`unsafe_code` lint** — `forbid` where there is no `unsafe`, `deny(unsafe_code)` + a file-level `allow` where the FFI lives.
 * **`get_`-prefixed public API left:** `Tjs2Engine::get_member`, `get_class_names`; `Scene::get_province_pixel`.
 * **Verify no decision-number tags returned** to plugin sources: `grep -rn "//.*\bD[0-9]\+\b" crates/compat/src`.
+* **Dirty rectangles for bitmap uploads** — the renderer can upload a
+  sub-rectangle, but nothing above it knows one: `BitmapState` carries a `dirty`
+  flag and a `content_generation`, no region. A bitmap with one changed row is
+  re-uploaded whole every frame. Adding the last-written region needs it set at
+  every pixel-writing site (layer fills and blits, text, video, the compat
+  natives that write pixels), then copied row-wise into a packed scratch buffer.
+  `content_generation` cannot substitute: several sites set `dirty` without
+  bumping it, so skipping on an unchanged generation would drop those updates.
+* **Unbounded GPU glyph atlas** — `engine::text`'s `GlyphAtlas` grows with every
+  distinct glyph, size and style and is never evicted; it is a separate structure
+  from the CPU character cache, which is bounded at the reference's
+  `TVP_CH_MAX_CACHE_COUNT`. Bound it or evict it the same way.
+* **Fence-per-frame uploads** — a frame's uploads now take one submit and one
+  wait, but they still wait before the frame ends. Overlapping them with the
+  previous frame's GPU work needs as many staging buffers and upload command
+  buffers as there are frames in flight, and the upload resources are shared with
+  the offscreen render-target paths.
 
 ## 12. Traps that cost real time — read before triaging anything
 
