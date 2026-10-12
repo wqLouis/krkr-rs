@@ -384,3 +384,45 @@ Remaining:
 | Android storage/lifetime | `docs/audits/android-storage-review.md` |
 | Error handling, fallbacks and panics | `docs/audits/error-handling.md` |
 | The menu popup surface | `docs/audits/menu-popup.md` |
+
+## 16. Next minor version (v2.1) — performance and bug fixes
+
+This major version is about behaviour and architecture. These are deliberately
+deferred and do not block v2.
+
+### A scene transition takes about two seconds in release
+
+A release run logged 60 `load_layer_image` calls inside one transition,
+13:00:57.620 → 13:00:59.558 — one load every ~32 ms, so ~1.9 s end to end, all on
+the VM thread. The same name appears repeatedly: `FRM_02C11` is loaded into about
+thirty different layers (209, 215, 221, … 374). Either the decoded-image cache is
+not consulted before decoding, or it is not retaining these entries.
+
+Work through these in order:
+
+1. **Is the decoded-image cache actually consulted?** `Scene::cached_decoded_image`
+   exists and `System.graphicCacheLimit` drives its bound, but a limit of 0
+disables it and nothing asserts a hit on a real game's load path. Count hits and
+misses for the sequence above: the repeated `FRM_02C11` must be a hit after the
+first decode, and every miss must be explainable (a different key, eviction, or
+a limit of 0).
+2. **The decode is synchronous on the VM thread** (`docs/audits/image-load-cost.md`),
+   so a scene change blocks the frame until every image is decoded. A worker pool
+   that hands results back to the VM thread — the pattern the sound decode-ahead
+   worker already uses — would overlap them. Measure the payload first: TLG
+   1280×403 was 15.3 ms in release, so 60 loads is the arithmetic above.
+3. **Speculative prefetch**: scan the scenario scripts for image-name literals
+   and enqueue decodes before the script asks for them, into a bounded cache.
+4. **A per-frame budget**: a transition that must load many images should yield
+   and continue across frames instead of stalling one.
+
+Keep the evidence: `docs/audits/image-load-cost.md` (the 6.77 s frame was the sum
+of synchronous decodes) and `docs/audits/perf-hotspots.md`.
+
+### Other candidates
+
+* The two real-game reports in §3 that still need a repro from the field: the
+  save crash (the serializer recursion plus a missing backtrace) and the
+  resolution change.
+* Dirty-rectangle bitmap uploads and the per-frame fence wait (§12).
+* Bounded GPU glyph-atlas cells (§12).
