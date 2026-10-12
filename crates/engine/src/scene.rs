@@ -2289,6 +2289,8 @@ impl Scene {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
 
     /// The layer owns its cache bitmap and must free the replaced one: the
@@ -2312,5 +2314,283 @@ mod tests {
             scene.bitmap(old).is_none(),
             "the replaced cache is released"
         );
+    }
+
+    /// A synthetic RGBA image whose buffer is exactly `bytes` long (a
+    /// multiple of four), so the cache's byte accounting can be asserted
+    /// without decoding a real file.
+    fn cache_image(bytes: usize) -> DecodedImage {
+        DecodedImage::new((bytes / 4) as u32, 1, vec![0x5a; bytes])
+    }
+
+    /// The load key of a full-colour, unkeyed, unscaled load of `name`.
+    fn cache_key(name: &str) -> DecodedImageKey {
+        DecodedImageKey::new(name, 0, DecodedImageMode::Full, 0, 0)
+    }
+
+    /// Load `name` through the scene's decoded-image cache, counting how
+    /// often the decode closure actually runs; a `bytes`-sized image would
+    /// be produced on every miss.
+    fn load_cached(scene: &mut Scene, decodes: &Cell<usize>, name: &str, bytes: usize) {
+        scene
+            .cached_decoded_image::<_, ()>(cache_key(name), || {
+                decodes.set(decodes.get() + 1);
+                Ok(cache_image(bytes))
+            })
+            .expect("the synthetic decode cannot fail");
+    }
+
+    /// Whether `name` currently sits in the cache.
+    fn cached(scene: &Scene, name: &str) -> bool {
+        scene.image_cache.entries.contains_key(&cache_key(name))
+    }
+
+    /// Inserting past the byte limit chops the least-recently-used entry
+    /// first and the byte total tracks the survivors. The check runs on the
+    /// old total before the new image is pushed
+    /// (`reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1951-1960`), so
+    /// right after an insert the total may sit above the limit by the new
+    /// entry's size; the chop loop (`:1441-1454`) then runs at the next
+    /// insert.
+    #[test]
+    fn cache_insert_past_the_limit_evicts_the_lru_entry_first() {
+        let decodes = Cell::new(0);
+        let mut scene = Scene::default();
+        scene.set_graphic_cache_limit(768); // room for three 256-byte images
+
+        load_cached(&mut scene, &decodes, "a", 256);
+        load_cached(&mut scene, &decodes, "b", 256);
+        load_cached(&mut scene, &decodes, "c", 256);
+        // reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1955-1958 and
+        // :1447-1448: the total is the sum of the cached images' sizes.
+        assert_eq!(decodes.get(), 3);
+        assert_eq!(scene.image_cache.total_bytes, 768);
+
+        // The fourth image pushes the total over the limit, but nothing is
+        // chopped at its own insert.
+        load_cached(&mut scene, &decodes, "d", 256);
+        // reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1952-1960: the
+        // check sees the old total, then the new image is added.
+        assert_eq!(scene.image_cache.total_bytes, 1024);
+        assert!(cached(&scene, "a"));
+
+        // The fifth insert first chops the least-recently-used entry ("a"),
+        // then pushes the new one.
+        load_cached(&mut scene, &decodes, "e", 256);
+        // reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1441-1454: while
+        // the total is above the limit the last (least recently used) entry
+        // is chopped.
+        assert!(!cached(&scene, "a"), "the LRU entry is evicted first");
+        assert!(cached(&scene, "b"));
+        assert!(cached(&scene, "c"));
+        assert!(cached(&scene, "d"));
+        assert!(cached(&scene, "e"), "the new entry is stored");
+        assert_eq!(scene.image_cache.total_bytes, 1024);
+
+        // The survivors still hit; the evicted entry decodes again.
+        load_cached(&mut scene, &decodes, "b", 256);
+        load_cached(&mut scene, &decodes, "c", 256);
+        load_cached(&mut scene, &decodes, "d", 256);
+        load_cached(&mut scene, &decodes, "e", 256);
+        assert_eq!(decodes.get(), 5, "the survivors hit the cache");
+        load_cached(&mut scene, &decodes, "a", 256);
+        assert_eq!(decodes.get(), 6, "the evicted entry decodes again");
+    }
+
+    /// A cache hit promotes the entry out of the least-recently-used slot,
+    /// so it is not the one the next eviction chops
+    /// (`reference/cpp/core/tjs2/tjsHashSearch.h:358-364`: find-and-touch
+    /// updates the additional order, whose most-recent end is where adds and
+    /// touches land and whose least-recent end is what eviction chops,
+    /// `:507-527`).
+    #[test]
+    fn cache_hit_promotes_the_entry_against_eviction() {
+        let decodes = Cell::new(0);
+        let mut scene = Scene::default();
+        scene.set_graphic_cache_limit(768);
+
+        load_cached(&mut scene, &decodes, "a", 256);
+        load_cached(&mut scene, &decodes, "b", 256);
+        load_cached(&mut scene, &decodes, "c", 256);
+
+        // The hit on "a" promotes it; it does not decode again.
+        // reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1895-1897: a
+        // found entry is returned without loading the image again.
+        load_cached(&mut scene, &decodes, "a", 256);
+        assert_eq!(decodes.get(), 3, "the hit does not decode");
+
+        // The next two inserts chop "b" — now the LRU entry — while the
+        // touched "a" survives.
+        // reference/cpp/core/tjs2/tjsHashSearch.h:542-554: the touch moves
+        // the entry to the most-recent end.
+        load_cached(&mut scene, &decodes, "d", 256);
+        load_cached(&mut scene, &decodes, "e", 256);
+        assert!(!cached(&scene, "b"), "the untouched entry is evicted");
+        assert!(cached(&scene, "a"), "the touched entry survives");
+        assert!(cached(&scene, "c"));
+        assert!(cached(&scene, "d"));
+        assert!(cached(&scene, "e"));
+
+        load_cached(&mut scene, &decodes, "a", 256);
+        assert_eq!(decodes.get(), 5, "the promoted entry still hits");
+        load_cached(&mut scene, &decodes, "b", 256);
+        assert_eq!(decodes.get(), 6, "the un-promoted entry decodes again");
+    }
+
+    /// Eviction runs at the start of an insert, so an image bigger than the
+    /// whole limit is admitted alone — the check sees the old total and the
+    /// size guard is commented out
+    /// (`reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1951-1960`,
+    /// `:1956-1957`) — but it is chopped at the very next insert
+    /// (`:1441-1454`) and never survives alongside another cached image.
+    #[test]
+    fn oversized_image_is_chopped_at_the_next_insert() {
+        let decodes = Cell::new(0);
+        let mut scene = Scene::default();
+        scene.set_graphic_cache_limit(512);
+
+        // Bigger than the whole limit: admitted on its own, over the limit.
+        load_cached(&mut scene, &decodes, "huge", 1024);
+        assert_eq!(scene.image_cache.total_bytes, 1024);
+        load_cached(&mut scene, &decodes, "huge", 1024);
+        assert_eq!(decodes.get(), 1, "it is temporarily a cache hit");
+
+        // The next insert chops it first: the loop sees 1024 > 512 before
+        // the new image is pushed.
+        load_cached(&mut scene, &decodes, "small", 256);
+        assert!(!cached(&scene, "huge"), "the oversized entry is chopped");
+        assert!(cached(&scene, "small"));
+        assert_eq!(scene.image_cache.total_bytes, 256);
+
+        load_cached(&mut scene, &decodes, "huge", 1024);
+        assert_eq!(decodes.get(), 3, "the oversized entry decodes again");
+    }
+
+    /// A limit of zero disables the cache: existing entries are evicted by
+    /// the setter's own check
+    /// (`reference/cpp/core/visual/GraphicsLoaderIntf.cpp:2441`) and every
+    /// later load decodes and stores nothing (`:2425-2427`, `:1886`).
+    #[test]
+    fn cache_limit_zero_disables_future_caching() {
+        let decodes = Cell::new(0);
+        let mut scene = Scene::default();
+        scene.set_graphic_cache_limit(768);
+        load_cached(&mut scene, &decodes, "a", 256);
+        load_cached(&mut scene, &decodes, "b", 256);
+        assert_eq!(scene.image_cache.total_bytes, 512);
+
+        scene.set_graphic_cache_limit(0);
+        assert_eq!(scene.graphic_cache_limit(), 0);
+        assert_eq!(scene.image_cache.total_bytes, 0);
+        assert!(scene.image_cache.entries.is_empty());
+
+        // Every call decodes and stores nothing.
+        load_cached(&mut scene, &decodes, "a", 256);
+        load_cached(&mut scene, &decodes, "a", 256);
+        load_cached(&mut scene, &decodes, "b", 256);
+        assert_eq!(decodes.get(), 5, "the disabled cache never hits");
+        assert_eq!(scene.image_cache.total_bytes, 0);
+        assert!(scene.image_cache.entries.is_empty());
+
+        // Re-enabling restores caching, so the decodes above were the
+        // disabled path.
+        scene.set_graphic_cache_limit(768);
+        load_cached(&mut scene, &decodes, "a", 256);
+        load_cached(&mut scene, &decodes, "a", 256);
+        assert_eq!(decodes.get(), 6, "the re-enabled cache hits again");
+    }
+
+    /// Nonzero limits are clamped to the 512 MiB system cap. A negative
+    /// value below -1 reaches the reference's `tjs_uint64` parameter as a
+    /// huge unsigned quantity and clamps the same way
+    /// (`reference/cpp/core/visual/GraphicsLoaderIntf.cpp:2423-2441`), and
+    /// a value within the cap is kept as-is.
+    #[test]
+    fn cache_limit_clamps_to_the_system_cap() {
+        const SYSTEM_LIMIT: u64 = 512 * 1024 * 1024;
+        let mut scene = Scene::default();
+
+        // reference/cpp/core/visual/GraphicsLoaderIntf.cpp:2428-2430: -1
+        // selects the system limit; :2438-2439 caps it at 512 MiB.
+        scene.set_graphic_cache_limit(-1);
+        assert_eq!(scene.graphic_cache_limit(), SYSTEM_LIMIT);
+
+        // reference/cpp/core/visual/GraphicsLoaderIntf.cpp:2432-2433: a
+        // value above the system limit clamps to it.
+        scene.set_graphic_cache_limit(1 << 40);
+        assert_eq!(scene.graphic_cache_limit(), SYSTEM_LIMIT);
+        scene.set_graphic_cache_limit(i64::MAX);
+        assert_eq!(scene.graphic_cache_limit(), SYSTEM_LIMIT);
+
+        // A negative value below -1 converts to a huge tjs_uint64
+        // (reference/cpp/core/visual/GraphicsLoaderIntf.cpp:2423) and
+        // clamps the same way.
+        scene.set_graphic_cache_limit(-2);
+        assert_eq!(scene.graphic_cache_limit(), SYSTEM_LIMIT);
+
+        scene.set_graphic_cache_limit(1 << 20);
+        assert_eq!(scene.graphic_cache_limit(), 1 << 20);
+    }
+
+    /// Lowering the limit evicts down to it, keeping the most recently used
+    /// entries (the chop loop at the end of the setter,
+    /// `reference/cpp/core/visual/GraphicsLoaderIntf.cpp:2441` + `:1441-1454`).
+    #[test]
+    fn lowering_the_cache_limit_evicts_down_to_it() {
+        let decodes = Cell::new(0);
+        let mut scene = Scene::default();
+        scene.set_graphic_cache_limit(768);
+        load_cached(&mut scene, &decodes, "a", 256);
+        load_cached(&mut scene, &decodes, "b", 256);
+        load_cached(&mut scene, &decodes, "c", 256);
+
+        scene.set_graphic_cache_limit(256);
+        assert!(!cached(&scene, "a"));
+        assert!(!cached(&scene, "b"));
+        assert!(cached(&scene, "c"));
+        assert_eq!(scene.image_cache.total_bytes, 256);
+    }
+
+    /// Clearing the cache drops every entry and zeroes the byte total while
+    /// the limit is kept
+    /// (`reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1456-1459`).
+    #[test]
+    fn clear_cache_empties_entries_and_zeroes_total_bytes() {
+        let decodes = Cell::new(0);
+        let mut scene = Scene::default();
+        scene.set_graphic_cache_limit(768);
+        load_cached(&mut scene, &decodes, "a", 256);
+        load_cached(&mut scene, &decodes, "b", 256);
+        load_cached(&mut scene, &decodes, "c", 256);
+        assert_eq!(scene.image_cache.total_bytes, 768);
+
+        scene.clear_decoded_image_cache();
+        assert_eq!(scene.image_cache.total_bytes, 0);
+        assert!(scene.image_cache.entries.is_empty());
+        assert!(scene.image_cache.order.is_empty());
+        assert_eq!(scene.graphic_cache_limit(), 768, "the limit is kept");
+
+        // The next load of a cleared image decodes again.
+        load_cached(&mut scene, &decodes, "a", 256);
+        assert_eq!(decodes.get(), 4);
+    }
+
+    /// Out of the box the cache is disabled: the reference starts with
+    /// `TVPGraphicCacheEnabled = false` and a zero limit
+    /// (`reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1433-1434`) and
+    /// skips the lookup entirely while disabled (`:1886-1896`), so every
+    /// call decodes and nothing is stored.
+    #[test]
+    fn cache_is_disabled_by_default() {
+        let decodes = Cell::new(0);
+        let mut scene = Scene::default();
+        assert_eq!(scene.graphic_cache_limit(), 0);
+
+        load_cached(&mut scene, &decodes, "a", 256);
+        load_cached(&mut scene, &decodes, "a", 256);
+        assert_eq!(decodes.get(), 2, "the default cache never hits");
+        assert_eq!(scene.image_cache.total_bytes, 0);
+        assert!(scene.image_cache.entries.is_empty());
+        assert!(scene.image_cache.order.is_empty());
     }
 }
