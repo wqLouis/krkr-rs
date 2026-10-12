@@ -583,6 +583,25 @@ working.
   behaviour oracle.
 * **L2 API snapshot + CI build step** — `cargo public-api` decided, unwired; CI runs only `cargo fmt --check` + the stateless guard, so the surface lock is a local gate.
 * **Windowed audio on a real device** — owed.
+* **A GPU text path** — the premise that one already existed half-held, and the
+  half that held is not usable. Text is rasterized on the CPU and baked into the
+  layer's bitmap, which is both what the renderer uploads and what
+  `getPixel`/`saveLayerImage` read back; that composite is the observable
+  representation. `GlyphAtlas`, `rasterize_layout`, `project_text` and
+  `compose_text_cpu` are reached only from tests, `RenderContent::Glyphs` is
+  rejected by both renderers (`render/src/cpu.rs:240`,
+  `render/src/vulkan/draw.rs:233`), and `GpuCapabilities::supports_glyph_atlas` is
+  false on every backend and read by nothing. There is no GPU rasterizer; the
+  rasterizer is `ab_glyph` on the CPU.
+
+  So this is not a rasterizer swap. Either the layer's main image becomes a
+  GPU-rendered target whose pixels are materialized only when a script reads them
+  (per-frame readback would cost more than the compositing it replaces, and a
+  GPU-only representation would change what `getPixel` returns, which AGENTS §3
+  D34 forbids), or the CPU composite stays authoritative and the GPU path draws
+  from the same pixels. `RenderTarget`/`read_render_target` exist and are wired
+  nowhere. `GlyphPlacement` also carries no bearings, which positioning needs.
+  `engine::text::rasterize_run` is the L2 seam a backend would slot into.
 * **Zero-copy image presentation** — a later stage, not a fix owed now. Every
   upload goes CPU pixels → a persistent host-visible staging buffer →
   `vkCmdCopyBufferToImage`; there is no `dmabuf`, `AHardwareBuffer`,
