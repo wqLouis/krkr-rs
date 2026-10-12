@@ -4,7 +4,7 @@
 use std::ffi::{c_char, c_int, c_void};
 
 use api::media::{DecodedImage, ImageInfo};
-use engine::{Scene, Storage, StorageReadError};
+use engine::{DecodedImageKey, DecodedImageMode, Scene, Storage, StorageReadError};
 use tjs::{
     DetachedValue, NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef,
     NativeMethodDef, NativeStaticMembers, RetainedValue, Tjs2Engine, TjsValue, VAL_VOID, Value,
@@ -215,13 +215,15 @@ fn save_option_expression(type_name: &str) -> Option<&'static str> {
     }
 }
 
-/// Decode the storage image `name` into RGBA8, applying the color key.
-fn decode_storage_image(
+/// Read `name` through the attached storage, decode it and apply the color
+/// key. This is the uncached decode body the scene's decoded-image cache
+/// wraps.
+pub(crate) fn decode_storage_image_uncached(
     ctx: &CompatCtx,
     name: &str,
     colorkey: u32,
-) -> Result<(u32, u32, Vec<u8>), String> {
-    // SAFETY: `ctx` is only created for a bound, live engine, so its service pointer is valid for `decode_storage_image`.
+) -> Result<DecodedImage, String> {
+    // SAFETY: `ctx` is only created for a bound, live engine, so its service pointer is valid for `decode_storage_image_uncached`.
     let services = unsafe { ctx.services() };
     let storage = services
         .storage()
@@ -235,7 +237,33 @@ fn decode_storage_image(
     let (width, height) = (image.width, image.height);
     let mut rgba = image.rgba;
     apply_color_key(&mut rgba, width, colorkey);
-    Ok((width, height, rgba))
+    Ok(DecodedImage::new(width, height, rgba))
+}
+
+/// Load `name` through the scene's decoded-image cache (the reference
+/// `TVPLoadGraphic` cache path,
+/// `reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1878-1960`). The cache is
+/// keyed by the requested name, color key, mode and desired size; the decode
+/// body runs only on a miss, or while the cache is disabled.
+pub(crate) fn load_cached_storage_image(
+    ctx: &CompatCtx,
+    name: &str,
+    colorkey: u32,
+    mode: DecodedImageMode,
+) -> Result<DecodedImage, String> {
+    let key = DecodedImageKey::new(name, colorkey, mode, 0, 0);
+    let scene = scene_mut(ctx)?;
+    scene.cached_decoded_image(key, || decode_storage_image_uncached(ctx, name, colorkey))
+}
+
+/// Decode the storage image `name` into RGBA8, applying the color key, through
+/// the cache.
+fn decode_storage_image(
+    ctx: &CompatCtx,
+    name: &str,
+    colorkey: u32,
+) -> Result<DecodedImage, String> {
+    load_cached_storage_image(ctx, name, colorkey, DecodedImageMode::Full)
 }
 
 /// Load `name` into bitmap `id`, allocating the scene bitmap when the payload
@@ -247,7 +275,9 @@ fn load_into_bitmap(
     name: &str,
     colorkey: u32,
 ) -> Result<(u32, u32, u32), String> {
-    let (width, height, rgba) = decode_storage_image(ctx, name, colorkey)?;
+    let image = decode_storage_image(ctx, name, colorkey)?;
+    let (width, height) = (image.width, image.height);
+    let rgba = image.rgba;
     let scene = scene_mut(ctx)?;
     let id = match id {
         Some(id) => {
@@ -663,13 +693,7 @@ extern "C" fn bitmap_copy_from(
             "Bitmap.copyFrom: the source bitmap does not exist",
         );
     };
-    scene.resize_bitmap(id, width, height, [0, 0, 0, 0]);
-    if let Some(bitmap) = scene.bitmap_mut(id) {
-        bitmap.rgba = rgba;
-        bitmap.width = width;
-        bitmap.height = height;
-        bitmap.mark_dirty();
-    }
+    replace_bitmap_pixels(scene, id, width, height, rgba);
     set_void(out);
     0
 }

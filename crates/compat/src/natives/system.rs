@@ -29,11 +29,12 @@
 //! `getKeyState` reads the attached L2 [`engine::input::InputState`]
 //! (TVP virtual-key codes and pad/`VK_PADANY` semantics are the same as the
 //! `Key` class); `touchDevice` derives its touch-capability bits from the
-//! active contacts in the same L2 state; `clearGraphicCache` releases every
-//! unreferenced bitmap in the attached L2 [`engine::Scene`]
-//! ([`engine::Scene::collect_unused_bitmaps`]) — the L2 counterpart of the
-//! reference's
-//! graphic cache.
+//! active contacts in the same L2 state; `clearGraphicCache` clears the
+//! attached L2 [`engine::Scene`]'s decoded-image cache and releases every
+//! bitmap it no longer references
+//! ([`engine::Scene::clear_decoded_image_cache`],
+//! [`engine::Scene::collect_unused_bitmaps`]) — the L2 counterpart of the
+//! reference's graphic cache.
 //!
 //! # Host-facts seam
 //!
@@ -96,8 +97,6 @@ struct SystemState {
     title: String,
     /// `System.eventDisabled`.
     event_disabled: bool,
-    /// `System.graphicCacheLimit` (stored for compatibility).
-    graphic_cache_limit: i64,
     /// `System.exitOnWindowClose`.
     exit_on_window_close: bool,
     /// `System.exitOnNoWindowStartup`.
@@ -130,7 +129,6 @@ impl Default for SystemState {
             exit_request: None,
             title: String::new(),
             event_disabled: false,
-            graphic_cache_limit: 0,
             // The reference's `EXIT_ON_WINDOW_CLOSE` defaults to true.
             exit_on_window_close: true,
             // The reference's `TVPTerminateOnNoWindowStartup` defaults to true
@@ -1029,9 +1027,9 @@ extern "C" fn native_touch_images(
 /// `System.doCompact([level])` → void
 ///
 /// The reference defaults `level` to `TVP_COMPACT_LEVEL_MAX` (100) and runs
-/// the TJS garbage collector from `clIdle` (5) up. The archive/graphic cache
-/// clearing at the higher thresholds needs services that have not landed; the
-/// GC half is implemented here.
+/// the TJS garbage collector from `clIdle` (5) up; a level at or above
+/// `TVP_COMPACT_LEVEL_MINIMIZE` (15) also clears the graphic cache
+/// (`reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1463-1470`).
 extern "C" fn native_do_compact(
     engine: *mut c_void,
     argc: c_int,
@@ -1058,6 +1056,16 @@ extern "C" fn native_do_compact(
         && let Err(e) = resolved.engine().do_gc()
     {
         log::warn!("System.doCompact: TJS garbage collection failed: {e}");
+    }
+    if level >= 15 {
+        // The reference's `tTVPClearGraphicCacheCallback::OnCompact` clears the
+        // graphic cache at or above `TVP_COMPACT_LEVEL_MINIMIZE`
+        // (`reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1463-1470`).
+        let ctx = resolved.ctx();
+        // SAFETY: `ctx` borrows the live engine state resolved above; the
+        // services handle is valid for `ctx`'s lifetime.
+        let services = unsafe { ctx.services() };
+        clear_graphic_cache(services);
     }
     set_void(out);
     0
@@ -1219,16 +1227,20 @@ extern "C" fn native_remove_continuous_handler(
 const TD_MOUSE: u32 = 0x0000_0100;
 const TD_MOUSE_WHEEL: u32 = 0x0000_0200;
 
-/// Release every bitmap the attached L2 scene no longer references (the
-/// reference `TVPClearGraphicCache`). Returns the number freed; a missing
-/// scene has no cache and frees nothing.
+/// Clear the attached scene's decoded-image cache and release every bitmap
+/// it no longer references (the reference `TVPClearGraphicCache`,
+/// `reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1456-1459`). Returns the
+/// number of unreferenced bitmaps freed; a missing scene has no cache and
+/// frees nothing.
 fn clear_graphic_cache(services: &CompatServices) -> usize {
     let Some(ptr) = services.scene() else {
         return 0;
     };
     // SAFETY: the host keeps the attached scene alive for the binding's
     // lifetime, and the VM is single-threaded.
-    unsafe { &mut *ptr }.collect_unused_bitmaps()
+    let scene = unsafe { &mut *ptr };
+    scene.clear_decoded_image_cache();
+    scene.collect_unused_bitmaps()
 }
 
 /// `System.getKeyState(code [, getcurrent])` → int
@@ -1354,9 +1366,10 @@ extern "C" fn native_system(
 
 /// `System.clearGraphicCache()` → void
 ///
-/// Releases every bitmap the attached L2 [`engine::Scene`] no longer
-/// references — the L2 counterpart of the reference's `TVPClearGraphicCache`.
-/// With no scene attached there is no cache, so the call is a no-op.
+/// Clears the attached L2 [`engine::Scene`]'s decoded-image cache and releases
+/// every bitmap it no longer references — the L2 counterpart of the
+/// reference's `TVPClearGraphicCache`. With no scene attached there is no
+/// cache, so the call is a no-op.
 extern "C" fn native_clear_graphic_cache(
     engine: *mut c_void,
     _argc: c_int,
@@ -1739,10 +1752,14 @@ extern "C" fn prop_graphic_cache_limit_get(
     };
     let ctx = resolved.ctx();
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
-    let value = unsafe { ctx.services() }
-        .state::<SystemState>()
-        .graphic_cache_limit;
-    set_int(out, value);
+    let services = unsafe { ctx.services() };
+    let limit = match services.scene() {
+        // SAFETY: the host keeps the attached scene alive for the binding's
+        // lifetime and the VM is single-threaded.
+        Some(ptr) => i64::try_from(unsafe { &*ptr }.graphic_cache_limit()).unwrap_or(i64::MAX),
+        None => 0,
+    };
+    set_int(out, limit);
     0
 }
 
@@ -1763,8 +1780,8 @@ extern "C" fn prop_graphic_cache_limit_set(
     // SAFETY: the trampoline passes a valid value slot for the call.
     // `TVPSetGraphicCacheLimit((tjs_int)*param)` (`SystemIntf.cpp:366-369`):
     // the strict conversion raises on objects, and the write immediately
-    // shrinks the cache — the port releases every unreferenced bitmap, the
-    // same purge `clearGraphicCache` runs.
+    // evicts the decoded-image cache down to the new limit
+    // (`reference/cpp/core/visual/GraphicsLoaderIntf.cpp:2423-2441`).
     let limit = match try_value_as_i64(unsafe { &*value }) {
         Ok(limit) => limit,
         Err(error) => return report_error(out_error, &error),
@@ -1772,11 +1789,11 @@ extern "C" fn prop_graphic_cache_limit_set(
     let ctx = resolved.ctx();
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
     let services = unsafe { ctx.services() };
-    {
-        let mut state = services.state::<SystemState>();
-        state.graphic_cache_limit = limit;
+    if let Some(ptr) = services.scene() {
+        // SAFETY: the host keeps the attached scene alive for the binding's
+        // lifetime and the VM is single-threaded.
+        unsafe { &mut *ptr }.set_graphic_cache_limit(limit);
     }
-    clear_graphic_cache(services);
     0
 }
 

@@ -14,6 +14,7 @@
 use std::collections::{HashMap, HashSet};
 
 use api::blend::BlendMode;
+use api::media::DecodedImage;
 
 /// One logical window.
 #[derive(Debug, Clone)]
@@ -322,6 +323,137 @@ impl Rect {
     }
 }
 
+/// The image-load variant a [`DecodedImageKey`] identifies.
+///
+/// The reference's `tTVPGraphicsSearchData` carries a `tTVPGraphicLoadMode`
+/// (`reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1257-1264`); the port
+/// performs two of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DecodedImageMode {
+    /// A full-colour RGBA load.
+    Full,
+    /// A province plane read from the decoded image's red channel.
+    Province,
+}
+
+/// The key identifying one entry in the scene's decoded-image cache.
+///
+/// Mirrors the reference `tTVPGraphicsSearchData {Name, KeyIdx, Mode, DesW,
+/// DesH}` (`reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1257-1264`); the
+/// name is normalized by [`DecodedImageKey::new`] the same way the storage
+/// layer normalizes it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct DecodedImageKey {
+    /// Normalized storage name.
+    pub name: String,
+    /// Colour-key index.
+    pub color_key: u32,
+    /// Load variant.
+    pub mode: DecodedImageMode,
+    /// Desired width; `0` keeps the image's own size.
+    pub desired_width: u32,
+    /// Desired height; `0` keeps the image's own size.
+    pub desired_height: u32,
+}
+
+impl DecodedImageKey {
+    /// Build a key, normalizing `name` with the storage layer's rule
+    /// (lowercased, `\` collapsed to `/`).
+    pub fn new(
+        name: &str,
+        color_key: u32,
+        mode: DecodedImageMode,
+        desired_width: u32,
+        desired_height: u32,
+    ) -> Self {
+        Self {
+            name: crate::normalize_in_archive_name(name),
+            color_key,
+            mode,
+            desired_width,
+            desired_height,
+        }
+    }
+}
+
+/// The scene's decoded-image cache: the entries, the byte accounting, the
+/// least-recently-used order and the byte limit.
+///
+/// The limit counts the decoded bytes (`Width * Height * PixelSize`,
+/// `reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1305-1310`); the cache is
+/// enabled only while the limit is nonzero, matching the reference's default
+/// (`:1433-1434`).
+#[derive(Debug)]
+struct DecodedImageCache {
+    /// Cached images by key.
+    entries: HashMap<DecodedImageKey, DecodedImage>,
+    /// Recency order: index 0 is the least recently used, the back is the
+    /// most recently used (the reference's additional order, whose `NFirst`
+    /// is most recent: `reference/cpp/core/tjs2/tjsHashSearch.h:513-527`).
+    order: Vec<DecodedImageKey>,
+    /// Sum of the cached images' `rgba` byte counts.
+    total_bytes: u64,
+    /// Byte limit; `0` disables the cache.
+    limit: u64,
+}
+
+impl Default for DecodedImageCache {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: Vec::new(),
+            total_bytes: 0,
+            limit: 0,
+        }
+    }
+}
+
+impl DecodedImageCache {
+    /// Whether the cache stores entries.
+    fn enabled(&self) -> bool {
+        self.limit != 0
+    }
+
+    /// Look `key` up, mark it most recently used and return an owned copy of
+    /// the pixels.
+    fn take_copy(&mut self, key: &DecodedImageKey) -> Option<DecodedImage> {
+        let image = self.entries.get(key)?.clone();
+        self.order.retain(|entry| entry != key);
+        self.order.push(key.clone());
+        Some(image)
+    }
+
+    /// Drop least-recently-used entries until the total is within the limit
+    /// (the reference `TVPCheckGraphicCacheLimit`,
+    /// `reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1441-1454`).
+    fn evict_to_limit(&mut self) {
+        while self.total_bytes > self.limit {
+            let Some(key) = self.order.first().cloned() else {
+                break;
+            };
+            self.order.remove(0);
+            if let Some(image) = self.entries.remove(&key) {
+                self.total_bytes = self.total_bytes.saturating_sub(image.rgba.len() as u64);
+            }
+        }
+    }
+
+    /// Store `image` under `key`. The limit is checked before the insert, so
+    /// the total may exceed it by the new entry's size (the reference
+    /// `TVPCheckGraphicCacheLimit` call order,
+    /// `reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1952-1960`).
+    fn insert(&mut self, key: DecodedImageKey, image: DecodedImage) {
+        self.evict_to_limit();
+        if let Some(previous) = self.entries.remove(&key) {
+            self.total_bytes = self.total_bytes.saturating_sub(previous.rgba.len() as u64);
+            self.order.retain(|entry| entry != &key);
+        }
+        self.total_bytes = self.total_bytes.saturating_add(image.rgba.len() as u64);
+        self.entries.insert(key.clone(), image);
+        self.order.push(key);
+    }
+}
+
 /// The whole logical scene.
 #[derive(Debug, Default)]
 #[non_exhaustive]
@@ -352,6 +484,8 @@ pub struct Scene {
     bitmap_index: HashMap<u32, usize>,
     /// `font.id` → index into `fonts`.
     font_index: HashMap<u32, usize>,
+    /// Decoded-image cache (the reference graphic cache).
+    image_cache: DecodedImageCache,
     /// Monotonic mutation counter (see [`Scene::revision`]).
     revision: u64,
 }
@@ -1820,6 +1954,77 @@ impl Scene {
             }
         }
         freed
+    }
+
+    /// The decoded-image cache byte limit (`0` when the cache is disabled).
+    pub fn graphic_cache_limit(&self) -> u64 {
+        self.image_cache.limit
+    }
+
+    /// Set the decoded-image cache byte limit, mirroring
+    /// `TVPSetGraphicCacheLimit` (`reference/cpp/core/visual/GraphicsLoaderIntf.cpp:2423-2441`):
+    /// `0` disables the cache; `-1` selects the system limit; every other
+    /// value — including a negative one below `-1`, which the reference's
+    /// `tjs_uint64` parameter converts to a huge unsigned quantity — is
+    /// clamped to the system limit. Entries are then evicted down to the new
+    /// limit.
+    ///
+    /// The reference derives its system limit from physical memory at startup
+    /// and caps it at 512 MiB
+    /// (`reference/cpp/core/base/impl/SysInitImpl.cpp:235-277`); the port has
+    /// no memory probe, so the cap is the system limit.
+    pub fn set_graphic_cache_limit(&mut self, limit: i64) {
+        const SYSTEM_LIMIT: u64 = 512 * 1024 * 1024;
+        self.image_cache.limit = if limit == 0 {
+            0
+        } else if limit == -1 {
+            SYSTEM_LIMIT
+        } else {
+            (limit as u64).min(SYSTEM_LIMIT)
+        };
+        self.image_cache.evict_to_limit();
+    }
+
+    /// Drop every decoded-image cache entry (the reference
+    /// `TVPClearGraphicCache`,
+    /// `reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1456-1459`).
+    pub fn clear_decoded_image_cache(&mut self) {
+        self.image_cache.entries.clear();
+        self.image_cache.order.clear();
+        self.image_cache.total_bytes = 0;
+    }
+
+    /// Return the cached decoded image for `key`, or run `decode`, cache the
+    /// result and return it.
+    ///
+    /// A caller receives an owned copy, so mutating the returned pixels
+    /// cannot corrupt a later cache hit. The reference shares a refcounted
+    /// bitmap and copies on write
+    /// (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:641-664`), which
+    /// is observably the same. When the cache is disabled the decode always
+    /// runs and nothing is stored.
+    ///
+    /// # Errors
+    ///
+    /// Returns `decode`'s error unchanged when the key is missing and the
+    /// decode fails.
+    pub fn cached_decoded_image<F, E>(
+        &mut self,
+        key: DecodedImageKey,
+        decode: F,
+    ) -> Result<DecodedImage, E>
+    where
+        F: FnOnce() -> Result<DecodedImage, E>,
+    {
+        if !self.image_cache.enabled() {
+            return decode();
+        }
+        if let Some(image) = self.image_cache.take_copy(&key) {
+            return Ok(image);
+        }
+        let image = decode()?;
+        self.image_cache.insert(key, image.clone());
+        Ok(image)
     }
 
     /// Look up a bitmap by id. Uses the id→index map, falling back to a

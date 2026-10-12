@@ -33,6 +33,20 @@ fn with_host(f: impl FnOnce(&Tjs2Engine, &CompatHost)) {
     f(&engine, &host);
 }
 
+/// Build a VM + host with the L2 scene attached.
+///
+/// `scene` is declared before `host`, so `host` (and its binding) drops first
+/// while the scene state is still alive.
+fn with_scene(f: impl FnOnce(&Tjs2Engine)) {
+    let engine = Tjs2Engine::new().expect("create engine");
+    let mut scene = engine::Scene::default();
+    let mut host = CompatHost::new();
+    // SAFETY: `scene` outlives the host binding.
+    unsafe { host.services_mut().attach_scene(&mut scene) };
+    host.install(&engine).expect("install compat surface");
+    f(&engine);
+}
+
 /// Build a VM + host with the L2 input state attached.
 ///
 /// `input` is declared before `host`, so `host` (and its binding) drops first
@@ -280,7 +294,7 @@ fn assign_message_returns_the_real_success_flag_and_checks_arity() {
 #[test]
 fn properties_round_trip() {
     let _lock = vm_lock();
-    with_vm(|e| {
+    with_scene(|e| {
         // title: empty state reads back the reference default.
         assert_eq!(
             e.eval("System.title", "t").unwrap(),

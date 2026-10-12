@@ -16,12 +16,10 @@ use std::ffi::{c_char, c_int, c_void};
 
 use api::blend::{BlendMode, DstBlend};
 use engine::layer_ops::{self, GammaAdjust, RectI};
-use engine::{BitmapState, Scene};
+use engine::{BitmapState, DecodedImageMode, Scene};
 use tjs::{NativeInstanceMethodDef, Tjs2Engine, Value};
 
-use super::super::bitmap::{
-    COLOR_KEY_NONE, apply_color_key, decode_image, read_image_from_storage, replace_bitmap_pixels,
-};
+use super::super::bitmap::{COLOR_KEY_NONE, load_cached_storage_image, replace_bitmap_pixels};
 use super::super::common::scene_mut;
 use super::super::common::{
     DEFAULT_FONT_FACE, DEFAULT_FONT_HEIGHT, argb_to_rgba, rgba_to_argb, set_null_out,
@@ -2082,20 +2080,9 @@ fn load_layer_image(
     colorkey: u32,
 ) -> Result<(), String> {
     log::debug!("load_layer_image: layer {layer_id} <- {name:?}");
-    // SAFETY: `ctx` is only created for a bound, live engine, so its service pointer is valid for `load_layer_image`.
-    let services = unsafe { ctx.services() };
-    let storage = services
-        .storage()
-        .ok_or_else(|| "no storage attached".to_string())?;
-    // SAFETY: `attach_storage` guarantees the pointer stays valid.
-    let (resolved, bytes) = read_image_from_storage(unsafe { &*storage }, name)?;
-    let image = decode_image(services, &resolved, &bytes)?;
-    if !image.is_consistent() {
-        return Err("the decoded image is malformed".to_string());
-    }
+    let image = load_cached_storage_image(ctx, name, colorkey, DecodedImageMode::Full)?;
     let (width, height) = (image.width, image.height);
-    let mut rgba = image.rgba;
-    apply_color_key(&mut rgba, width, colorkey);
+    let rgba = image.rgba;
     let scene = scene_mut(ctx)?;
     if scene.layer(layer_id).is_none() {
         return Err("the layer no longer exists".to_string());
@@ -2161,17 +2148,7 @@ extern "C" fn layer_load_province_image(
 /// must match the main image's size (reference `TVPProvinceSizeMismatch`);
 /// its red channel becomes the 8-bit province value.
 fn load_layer_province(ctx: &CompatCtx, layer_id: u32, name: &str) -> Result<(), String> {
-    // SAFETY: `ctx` is only created for a bound, live engine, so its service pointer is valid for `load_layer_province`.
-    let services = unsafe { ctx.services() };
-    let storage = services
-        .storage()
-        .ok_or_else(|| "no storage attached".to_string())?;
-    // SAFETY: `attach_storage` guarantees the pointer stays valid.
-    let (resolved, bytes) = read_image_from_storage(unsafe { &*storage }, name)?;
-    let image = decode_image(services, &resolved, &bytes)?;
-    if !image.is_consistent() {
-        return Err("the decoded province image is malformed".to_string());
-    }
+    let image = load_cached_storage_image(ctx, name, COLOR_KEY_NONE, DecodedImageMode::Province)?;
     let scene = scene_mut(ctx)?;
     let (main_w, main_h) = scene
         .layer(layer_id)
