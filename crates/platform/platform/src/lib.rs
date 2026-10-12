@@ -148,6 +148,21 @@ impl Default for PlatformConfig {
     }
 }
 
+/// The event loop's contribution to one frame's wall-clock gap.
+///
+/// The gap between two frames is the previous frame's work plus the time the
+/// loop spent waiting for events, so the two are reported together and the
+/// caller can subtract the measured wait from the gap. `input_ms` is a
+/// subset of `poll_ms`: the time inside the poll spent translating and
+/// dispatching input.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FramePacing {
+    /// Milliseconds spent in the event poll before this frame.
+    pub poll_ms: f64,
+    /// Milliseconds of `poll_ms` spent dispatching input.
+    pub input_ms: f64,
+}
+
 /// Whether the [`EventHandler`] wants the loop to continue.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -185,7 +200,11 @@ pub trait EventHandler {
     /// and request a new inner size so a script-driven client-area change
     /// reaches the backend; the backend reports the applied size back as
     /// [`PlatformEvent::Resized`].
-    fn frame(&mut self, dt_ms: f32, window: &PlatformWindow) -> Flow;
+    ///
+    /// `pacing` is the loop's own measurement of the wait and input dispatch
+    /// that preceded this frame, so the handler can attribute the frame gap
+    /// it is given as `dt_ms`.
+    fn frame(&mut self, dt_ms: f32, window: &PlatformWindow, pacing: FramePacing) -> Flow;
 
     /// Called when the loop is about to wait for events.
     fn about_to_wait(&mut self) -> Flow {

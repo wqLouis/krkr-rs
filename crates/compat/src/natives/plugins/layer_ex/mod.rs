@@ -495,23 +495,34 @@ pub(super) fn read_rects(
     Ok(out)
 }
 
-/// Read a native value object's payload pointer from its hidden `__handle`
-/// property (the ABI carries no cross-class native-instance handle).
-pub(super) fn read_handle(engine: *mut c_void, value: &Value, what: &str) -> Result<usize, String> {
+/// Resolve an object argument to the payload pointer of the native class
+/// `class_name` through the VM's native-instance lookup — the
+/// `NativeInstanceSupport(TJS_NIS_GETINSTANCE, classid)` mechanism behind the
+/// reference plugin argument adaptor. The lookup keys on the argument object
+/// itself, not on its `ObjThis` or on any script-visible member; an object of
+/// another class is a typed error.
+pub(super) fn read_instance(
+    engine: *mut c_void,
+    value: &Value,
+    class_name: &str,
+    what: &str,
+) -> Result<usize, String> {
     let (resolved, _ctx) = bound(engine)?;
     let host = resolved.engine();
     if value.ty != VAL_OBJECT {
-        return Err(format!("{what}: expected a native value object"));
+        return Err(format!(
+            "{what}: the argument is not of the {class_name} type"
+        ));
     }
     let object = host
         .retain_object_arg(value)
         .map_err(|error| format!("{what}: {error}"))?;
-    match host.member(object.raw_id(), "__handle") {
-        Ok(TjsValue::Integer(handle)) if handle > 0 => Ok(handle as usize),
-        Ok(TjsValue::Real(handle)) if handle > 0.0 => Ok(handle as usize),
-        _ => Err(format!(
-            "{what}: the argument is not a LayerExDraw value type"
+    match host.native_instance_payload(object.raw_id(), class_name) {
+        Ok(Some(payload)) => Ok(payload.as_ptr() as usize),
+        Ok(None) => Err(format!(
+            "{what}: the argument is not of the {class_name} type"
         )),
+        Err(error) => Err(format!("{what}: {error}")),
     }
 }
 

@@ -537,32 +537,56 @@ spdlog logger that writes to stderr (logcat) at a fixed `debug` level and does
 not honour the launcher setting; the exception disassembly we need goes
 through the `log` callback and does honour it.
 
-The log is capped at 1 MiB and rotated once, keeping `krkr.log.1`, so a long
-session cannot fill the device's storage. The file is opened before the global
-logger is installed; a log the app cannot open is returned as a startup error
-and written to the state file as `failed`, so the Logs screen is never silently
-empty with no explanation (D11). The file name and the directory are the
-Kotlin contract (`EngineDiagnostics.engineLogFile` is
-`File(filesDir, "krkr.log")`, and `KrkrGameActivity.pendingStateDir` is
-`filesDir.absolutePath`).
+The log is capped at **1 MiB per file** and rotated through `krkr.log.1` …
+`krkr.log.6`: each rotation shifts the existing files up one slot and drops
+the oldest, so the sink holds seven files and about **7 MiB worst case** (a
+record larger than the whole cap is still written whole rather than truncated
+mid-record, so one oversized record can add its own size once). Six rotations
+are kept deliberately. The failure observed on a device repeated a VM exception
+dump until 87% of one session's output was the same text; the old
+single-rotation pair (2 MiB) could therefore lose the *start* of the very
+session that failed, including the original exception. Six rotations hold a few
+launches' startup plus the failure cascade at a bounded cost. The file is
+opened before the global logger is installed; a log the app cannot open is
+returned as a startup error and written to the state file as `failed`, so the
+Logs screen is never silently empty with no explanation (D11). The current file
+name and the directory are the Kotlin contract
+(`EngineDiagnostics.engineLogFile` is `File(filesDir, "krkr.log")`, and
+`KrkrGameActivity.pendingStateDir` is `filesDir.absolutePath`); the rotations
+are discovered from the directory, not fixed by Kotlin.
 
 An app-private directory cannot be browsed on a device, so the Logs screen
-offers two ways off it: the **tail** (copy/share of the last 400 lines, which
-the crash dialogs also use), and the **full log** — *Share all* stages the
-current and rotated file of both sides into `cacheDir` and sends them as
-`ACTION_SEND_MULTIPLE` attachments with a read grant on the `FileProvider`
-URIs, while *Export* writes one combined file through the system document
-picker (`ACTION_CREATE_DOCUMENT`) to a location a PC can reach over USB. The
-screen lists each file with its real path and size, or `not created yet`, and
-names any file that was absent when the export ran; an absent or empty file
-never fails the export.
+offers two ways off it: the **tail** (copy/share of the last 400 lines plus the
+state file, which the crash dialogs also use), and the **full log** — *Share
+all* stages the `krkr_state.json` file, **every** engine log the retention
+policy currently has on disk, and the launcher's current and rotated log into
+`cacheDir` and sends them as `ACTION_SEND_MULTIPLE` attachments with a read
+grant on the `FileProvider` URIs, while *Export* writes one combined file
+through the system document picker (`ACTION_CREATE_DOCUMENT`) to a location a
+PC can reach over USB. The export **enumerates** the engine logs from the files
+directory rather than naming a fixed pair, so it cannot drift from the Rust
+sink's rotation count. The screen lists each file with its real path and size,
+or `not created yet`, shows the `krkr_state.json` content in its own section
+(its `message` is the single most useful line for a failed title), and reports
+the combined size before the export. The export does not truncate anything: it
+writes every file whole, and honesty about a several-MiB export is enough
+because it goes to the user's own Downloads or mail, not a server. An absent or
+empty file is named when the export runs and never fails it.
 
-**Host-tested:** the record format, the byte accounting, the 1 MiB rotation,
-reopening a previous file and the missing-directory error
-(`crates/android/src/log_file.rs` unit tests). **Not verified on the host:**
-that `<filesDir>` is writable by the app process, that the records appear in
-`adb logcat` under the `env_logger` format, and that the Logs screen and crash
-dialog read them back.
+The state file's `message` explains a **reported** failure only. A native crash
+or a `SIGKILL` leaves the last state the process wrote — `starting` or
+`running`, with `message: null` — so the export then tells you the engine never
+reported an exit, not why it died; the `krkr.log` history is what covers that
+case.
+
+**Host-tested:** the record format, the byte accounting, the multi-step
+rotation (the slot order, the dropped oldest, a previous process's file rotated
+rather than appended, and the cap holding for every file), reopening a previous
+file and the missing-directory error (`crates/android/src/log_file.rs` unit
+tests). **Not verified on the host:** that `<filesDir>` is writable by the app
+process, that the records appear in `adb logcat` under the `env_logger` format,
+that the Logs screen and crash dialog read them back, and the Kotlin export
+enumeration (there is no Gradle/SDK on the host — see §7's build note).
 
 Two deliberate choices worth restating:
 
@@ -584,7 +608,7 @@ Two deliberate choices worth restating:
 | M4 | Touch → mouse bridge | **implemented and host-tested** (`crates/android/src/gesture.rs`); on-screen controls and the Activity-level back gesture still open |
 | M5 | MediaCodec video backend (replacing FFmpeg on Android) | **compile-verified and symbol-checked**; never run on a device |
 | M6 | CI APK build + artifact upload | workflow written, never triggered |
-| M7 | Engine writes `<filesDir>/krkr.log` (capped, rotated) for the Logs screen | **host-tested**; never run on a device |
+| M7 | Engine writes `<filesDir>/krkr.log` (capped, rotated through `krkr.log.1`–`.6`) for the Logs screen; the full-log export also carries `krkr_state.json` | **host-tested**; never run on a device |
 
 The whole chain now produces an installable APK from a clean tree — see §7 —
 but **nothing has been run on hardware**. What that leaves genuinely unproven is

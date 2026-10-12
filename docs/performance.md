@@ -239,28 +239,129 @@ settings. Two families of lines carry the timing:
 * **Per-frame attribution.** A frame whose wall-clock gap reaches 250 ms (the
   audio drain's playback cap, so it is the same frame that logs the existing
   `audio: ... exceeds the ... playback cap` warning) logs exactly one `warn`
-  line naming every phase and the render-host costs, for example:
+  line, for example:
 
   ```text
-  WARN frame 812 slow: gap=668.8 ms since the previous frame; timer=0.3 sound=1.2 video=0.0 async=0.1 continuous=2.4 project_and_render=3.1 body=7.1; audio=0.9 host_sync=4.0 host_project=2.0 host_render=610.0 total=624.5 ms
+  WARN frame 775 slow: gap=581.4 ms since the previous frame; the gap spans the previous frame, so these are its phases: timer=4.4 sound=0.0 video=0.0 async=0.0 continuous=0.0 project_and_render=0.0 body=4.4; its host: audio=17.6 host_sync=0.0 host_project=0.0 host_render=0.9 total=22.9; its gpu: acquire=0.0 present=0.0 recreate=0.0 fence_wait=0.0; this wait: platform_wait=15.6 input=0.2 unaccounted=542.9 ms
   ```
 
-  `gap` is the platform's wall-clock frame period. The six frame-body
-  phases — `timer`, `sound`, `video`, `async`, `continuous`,
-  `project_and_render` — are measured by `run_frame_body`; `audio`,
-  `host_sync`, `host_project` and `host_render` cover the work outside it
-  (mixer drain, dirty-bitmap upload, scene projection, pipeline render). A
-  fast frame logs nothing.
+  `gap` is the platform's wall-clock interval since the previous frame
+  started. The phases that explain that interval belong to the **previous**
+  frame, so the line reports the previous frame's `timer`, `sound`, `video`,
+  `async`, `continuous`, `project_and_render` and `body` (measured by
+  `run_frame_body`), its `audio`, `host_sync`, `host_project`, `host_render`
+  and `total` (the work outside the body), and its Vulkan call costs
+  `acquire`, `present`, `recreate` and `fence_wait`. `platform_wait` and
+  `input` are the current step's own wait (the event-loop poll, with input
+  dispatch a subset of it), and `unaccounted =
+  gap - previous total - platform_wait`. A fast frame logs nothing.
+
+  This is the correction that makes the old line readable: previously the
+  line printed the *current* frame's phases against the *previous* interval,
+  so `gap=581.4` and `total=22.9` looked contradictory when they simply
+  described different frames. The 581 ms in the real device log is the
+  previous frame, and `unaccounted` now closes the budget instead of hiding
+  the discrepancy.
 
 * **Start-up aggregates.** After the startup scripts run, four `info` lines
   report archives mounted (count, index entries, bytes, milliseconds), images
   decoded, decoders opened, and entry scripts; the first frame then logs
   `startup: first frame N ms after open`.
 
-Read the per-frame line first. If `host_render` (or `host_sync`) dominates
-with a small `body`, the cost is in the render host; if one poll phase
-dominates, it is in that poll. The start-up lines separate mount/index parse,
-decode, decoder open and script execution.
+Read the per-frame line first. A large previous `body`/one poll phase means
+that poll; a large previous `host_render` means the render host; a large
+`acquire`/`present`/`recreate`/`fence_wait` means the presentation call; a
+large `platform_wait` means the event loop itself was blocked (a pause, a
+suspend, or the platform starving the loop); a large `unaccounted` means loop
+overhead or a stall outside both. The start-up lines separate mount/index
+parse, decode, decoder open and script execution.
+
+### 6.1 The 581 ms mobile stall — instrument and prediction
+
+**The change (measurement only; no present mode, pacing or sleeping change).**
+
+* `crates/platform/render/src/vulkan/mod.rs` times `vkAcquireNextImageKHR`,
+  `vkQueuePresentKHR`, the frame and per-image `vkWaitForFences` calls, and
+  every `recreate_swapchain` the frame triggers, exposing them as
+  `FrameTimings { acquire_ms, present_ms, recreate_ms, fence_wait_ms }`.
+* `crates/platform/render/src/lib.rs` defines `FrameTimings` and the free
+  `pub fn last_frame_timings(state: &RenderState) -> Option<FrameTimings>`; the
+  null backend records an all-zero value once a frame has rendered, so the
+  shape is testable without a GPU.
+* `crates/platform/platform/src` defines `FramePacing { poll_ms, input_ms }`,
+  measured by the desktop loop (`linux.rs`) as the time between the end of the
+  previous frame and the start of the current one, and by the Android loop
+  (`crates/android/src/host.rs`) around each `poll_events` with input dispatch
+  accumulated inside it. `EventHandler::frame` takes the `FramePacing`, so the
+  data flow is one-way and per-frame instead of a mutable setter that a
+  handler could read a frame late.
+* `crates/app/src/game.rs` keeps one slow-frame line. `GameHost::step` stays
+  as the no-measurement entry point (so out-of-tree callers and the headless
+  loop are unchanged); `GameHost::step_with_pacing` carries the platform
+  measurement and logs the previous frame's attribution. The stored
+  `FrameAttribution` holds the phases, host report, GPU timings, audio cost
+  and total of the last completed frame, and is overwritten only after the
+  next frame runs.
+
+**The expected device line.**
+
+```text
+WARN frame 774 slow: gap=581.4 ms since the previous frame; the gap spans the previous frame, so these are its phases: timer=<t> sound=<s> video=<v> async=<a> continuous=<c> project_and_render=<p> body=<b>; its host: audio=<au> host_sync=<hs> host_project=<hp> host_render=<hr> total=<tot>; its gpu: acquire=<ac> present=<pr> recreate=<rc> fence_wait=<fw>; this wait: platform_wait=<w> input=<i> unaccounted=<gap-tot-w> ms
+```
+
+**Falsifiable prediction.** From the real log (`krkr-rs-logs (2).txt`) the
+frame that ends the 581.4 ms interval is preceded by a burst of
+`DEBUG storage miss "FRM_02A43.<ext>"` lines — each one several KiB of
+auto-path expansion (now compacted to ~0.5 KiB for the 41-path shape, grouped
+by auto-path shape) — emitted on the image-load path inside the frame body.
+The current line showed only the *next* frame's tiny `body=4.4`, which is
+exactly why the 581 ms looked unaccounted. My prediction is therefore that the
+new line will put the stall in the **previous frame's `body`** (most likely
+`project_and_render` or `timer`, the poll that performs the load), with
+`host_render`, `acquire`, `present`, `recreate` and `fence_wait` all small
+(single-digit ms). If instead the new `acquire`/`present`/`fence_wait` fields
+dominate, the cause is the Vulkan presentation and this prediction is wrong;
+if `platform_wait` dominates, the app was paused or descheduled between
+frames, not stalled in a frame. A device log settles it.
+
+**Steady state cost.** A fast frame does one `f64` comparison in
+`slow_frame_line` and returns `None`; no `String` is allocated and nothing is
+formatted. The platform loops add a handful of `Instant::now()` reads per
+frame (`linux.rs` two, the Android loop two plus per input batch). Formatting
+happens only on a gap at or above 250 ms.
+
+**Tests.** `crates/app/src/game.rs` unit-tests `FrameAttribution`:
+`fast_gap_emits_nothing` and `first_frame_emits_nothing` assert no line for a
+fast gap or a missing predecessor; `slow_line_names_the_previous_frame_and_balances_the_gap`
+drives a deliberately slow previous phase (480 ms) and asserts every field
+populates and that `unaccounted = gap - previous total - platform_wait`;
+`slow_line_follows_the_most_recent_frame` shows the attribution moves to the
+newly recorded frame. `crates/platform/render/src/lib.rs` asserts
+`last_frame_timings` is `None` before a render and `Some(FrameTimings::default())`
+after a null frame. Only a device can show the real 581 ms; this task ships
+the instrument, not the answer.
+
+**Gate.** The standard gate (AGENTS §0), in order:
+
+```bash
+cargo fmt --all -- --check
+bash scripts/check-stateless.sh
+bash scripts/check-error-handling.sh
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --no-fail-fast
+cargo test -p platform --features platform-linux
+cargo clippy -p platform --features platform-android --all-targets -- -D warnings
+cargo test -p platform --features platform-android
+python3 scripts/check-android-target.py
+python3 scripts/surface_lock.py --update
+python3 scripts/surface_lock.py
+python3 scripts/native_parity.py
+python3 scripts/plugin_parity.py --no-doc
+```
+
+The Android-only loop (`crates/android/src/host.rs`) is target-gated and is
+**not** compiled by the host gate; its `FramePacing` plumbing is documented as
+unverified until an Android build compiles it (AGENTS §0/§9).
 
 ---
 

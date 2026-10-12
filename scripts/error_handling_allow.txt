@@ -8,7 +8,8 @@
 #            `pattern` is a code anchor; exact-match when it is a rule name.
 #   pattern  EITHER a rule name (parse-unwrap, result-fallback,
 #            let-underscore, ok-discard, iflet-ok, debug-assert,
-#            non-exhaustive, allow-dead-code) — then path:line:pattern must
+#            non-exhaustive, allow-dead-code, pointer-sign) — then
+#            path:line:pattern must
 #            all match — OR a substring of the offending source line, matched
 #            by path + substring so the entry survives line churn and fails
 #            closed when the code changes.
@@ -119,3 +120,41 @@ crates/compat/src/resource.rs:233:let _ = self.resolve_face(ctx, DEFAULT_FACE); 
 
 # --- rasterizer invariants no malformed input can reach ---------------------
 crates/platform/render/src/glyph.rs:303:debug_assert!(size_px > 0.0 — px_scale_for_height is private; its three callers reject a non-positive or non-finite size first
+
+# --- pointer/address values cast to a signed integer or sign-checked
+#     (D37; the `pointer-sign` rule). -------------------------------------
+# Reference-faithful script-visible address getters.  The reference hands the
+# script a native pointer as an integer (D28/D34), so the cast stays; the value
+# is opaque and no in-tree code reads it back through a sign test or narrows it
+# (D37).  A new sign test on one of these is a violation, not an allowlisted
+# site.
+crates/compat/src/natives/visual/window.rs:1700:instance as i64 — `Window.HWND`; the reference casts `_this` to `tTVInteger` as an opaque handle (WindowImpl.cpp:2288-2298)
+crates/compat/src/natives/visual/bitmap.rs:1187:b.rgba.as_ptr() as i64 — `Bitmap.buffer`; the reference pixel-buffer address, opaque to the script
+crates/compat/src/natives/visual/bitmap.rs:1219:bitmap.rgba.as_mut_ptr() as i64 — `Bitmap.bufferForWrite`; the reference pixel-buffer address, opaque to the script
+crates/compat/src/natives/visual/layer/mod.rs:2227:scene.main_image_pixel_buffer(id) as i64 — `Layer.mainImageBuffer`; the reference MainImage address (LayerIntf.cpp:3005), opaque
+crates/compat/src/natives/visual/layer/mod.rs:2256:scene.main_image_pixel_buffer_for_write(id) as i64 — `Layer.mainImageBufferForWrite`; the reference MainImage address, opaque
+crates/compat/src/natives/visual/layer/mod.rs:2312:scene.province_image_pixel_buffer(id) as i64 — `Layer.provinceImageBuffer`; the reference ProvinceImage address (LayerIntf.cpp:3027), opaque
+crates/compat/src/natives/visual/layer/mod.rs:2341:scene.province_image_pixel_buffer_for_write(id) as i64 — `Layer.provinceImageBufferForWrite`; the reference ProvinceImage address, opaque
+crates/compat/src/natives/rect.rs:702:instance as usize as i64 — `Rect.nativeArray`; the reference `tTVPRect::array` address, opaque to the script
+crates/compat/src/natives/visual/draw_device.rs:218:instance as i64 — `DrawDevice.interface`; the reference `reinterpret_cast<tjs_int64>(GetDevice())` (BasicDrawDevice.cpp:886-896), opaque
+crates/compat/src/natives/plugins/steam/mod.rs:509:instance as i64 — `DrawDeviceForSteam.interface`; the reference draw-device address (DrawDeviceForSteam.cpp:21-24), opaque
+crates/compat/src/natives/sound/phase_vocoder.rs:137:instance as usize as i64 — `PhaseVocoder.interface`; an opaque token resolved in-tree bit-exactly via `as usize` with no sign test (sound.rs:772-773)
+
+# The receiver is a pointer but the cast is on a numeric value read through
+# it, not on the address (review-trigger false positives).
+crates/compat/src/natives/kag/mod.rs:1346:state_of(instance) }.$method() as i64 — macro reads a numeric KAG state field through the instance payload; the cast is on the field, not the pointer
+crates/compat/src/natives/kag/mod.rs:1361:state_of(instance) }.$field as i64 — macro reads a numeric KAG state field through the instance payload; the cast is on the field, not the pointer
+crates/compat/src/natives/sound/phase_vocoder.rs:150:payload.config.window as i64 — `window` is the FFT size in samples, not the payload address
+crates/compat/src/natives/system.rs:1744:&*ptr }.graphic_cache_limit() as i32 — dereferences the pointer to a numeric cache limit; the cast is on the field, not the address
+
+# --- pointer-flow/pointer-compare review triggers that are not addresses
+#     (D37; the flow-sensitive rules). -----------------------------------
+# The pass over-reports a comparison of a name that looks like a pointer but
+# holds a numeric id/index, or that a match binding shadows; each is a false
+# positive, not a sign test or a narrowing of a real address.
+crates/compat/src/binding.rs:104:binding.engine_raw == engine as usize — the process binding compares the raw engine pointer it stored at install; an opaque identity check with no sign test or narrowing, valid on every target (audit §4 rank 3)
+crates/compat/src/natives/menu_item.rs:404:&& handle != 0 — `handle` is `node.self_handle`, a numeric id, not an address; an id compared to 0 is platform-independent
+crates/compat/src/natives/system.rs:1828:Ok(value) => value != 0, — this `value` is the script integer from try_value_as_i64; it shadows the `*const Value` parameter, so the pointer taint does not apply
+crates/compat/src/resource.rs:921:if ptr >= self.image.len() { — `ptr` is the byte cursor `item.offset as usize` into the image, not an address
+crates/compat/src/resource.rs:928:if out.is_empty() || ptr >= self.image.len() { — `ptr` is the byte cursor `item.offset as usize` into the image, not an address
+crates/tjs/src/lib.rs:1923:if out.ty != VAL_RETAINED || out.retained == 0 { — `retained` is the ABI retained-object index, an opaque token the reference also compares to 0

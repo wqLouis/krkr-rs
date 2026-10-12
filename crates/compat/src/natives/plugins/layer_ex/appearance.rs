@@ -12,13 +12,10 @@
 use std::ffi::{c_char, c_int, c_void};
 
 use engine::raster::hatch_foreground;
-use tjs::{
-    NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef, Tjs2Engine,
-    TjsValue, Value,
-};
+use tjs::{NativeInstanceBuilder, NativeInstanceMethodDef, Tjs2Engine, TjsValue, Value};
 
 use super::{argb_to_rgba, bound, value_as_f64};
-use crate::native_util::{args, report_error, set_int, set_void};
+use crate::native_util::{args, report_error, set_void};
 use crate::{CompatCtx, CompatError};
 
 /// One paint description.
@@ -325,19 +322,6 @@ extern "C" fn ctor(
     0
 }
 
-/// Hidden property used by the `Layer.draw*` methods to recover the native
-/// draw list (the ABI carries no cross-class native instance handle).
-extern "C" fn handle_get(
-    _engine: *mut c_void,
-    instance: *mut c_void,
-    out: *mut Value,
-    _out_error: *mut *mut c_char,
-    _objthis: *mut c_void,
-) -> c_int {
-    set_int(out, instance as usize as i64);
-    0
-}
-
 /// `clear()`.
 extern "C" fn clear(
     _engine: *mut c_void,
@@ -505,15 +489,6 @@ pub(super) fn method_defs() -> Vec<NativeInstanceMethodDef> {
     ]
 }
 
-/// The property table.
-pub(super) fn property_defs() -> Vec<NativeInstancePropertyDef> {
-    vec![NativeInstancePropertyDef {
-        name: "__handle",
-        get: Some(handle_get),
-        set: None,
-    }]
-}
-
 /// Register the `Appearance` class.
 pub(super) fn register_class(ctx: &mut CompatCtx) -> Result<(), CompatError> {
     let mut methods = vec![NativeInstanceMethodDef {
@@ -527,6 +502,6 @@ pub(super) fn register_class(ctx: &mut CompatCtx) -> Result<(), CompatError> {
         destroy,
         invalidate: None,
         methods,
-        properties: property_defs(),
+        properties: Vec::new(),
     })
 }

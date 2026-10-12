@@ -25,7 +25,7 @@ use super::font::{TextBitmap, read_font, render_text, tint_coverage};
 use super::path::{PathData, PathInst};
 use super::{
     argb_to_rgba, bound, ensure_layer_image, layer_clip, layer_from_objthis, mark_layer_paint,
-    new_rectf, read_handle, read_points, read_rects, scene_mut, set_real, set_retained_out,
+    new_rectf, read_instance, read_points, read_rects, scene_mut, set_real, set_retained_out,
     value_as_f64, value_as_usize,
 };
 use crate::CompatCtx;
@@ -642,15 +642,16 @@ fn appearance_ref<'a>(
     value: &Value,
     what: &str,
 ) -> Result<&'a AppearanceData, String> {
-    let ptr = read_handle(engine, value, what)?;
-    // SAFETY: `read_handle` returned the payload of a live `Appearance`
-    // argument, which is alive for the duration of the callback.
+    let ptr = read_instance(engine, value, "Appearance", what)?;
+    // SAFETY: the VM's native-instance lookup returned the payload of the
+    // live `Appearance` argument, which is alive for the duration of the
+    // callback.
     let inst = unsafe { &*(ptr as *const AppearanceInst) };
     Ok(&inst.data)
 }
 
 fn path_ref<'a>(engine: *mut c_void, value: &Value, what: &str) -> Result<&'a PathData, String> {
-    let ptr = read_handle(engine, value, what)?;
+    let ptr = read_instance(engine, value, "Path", what)?;
     // SAFETY: see `appearance_ref`.
     let inst = unsafe { &*(ptr as *const PathInst) };
     Ok(&inst.data)

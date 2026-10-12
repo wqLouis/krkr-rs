@@ -29,6 +29,15 @@ use crate::CompatCtx;
 /// establish a platform face (the reference `TVPDefaultFontFaceName`).
 const DEFAULT_FACE: &str = "MS Gothic";
 
+/// The name the default-face fallback is resolved under.
+///
+/// A fixed name keeps the requested family free, so a face registered later
+/// for that family (`System.addFont`, `GdiPlus.addPrivateFont`) is not shadowed
+/// by the fallback's own name-map entry. The reference resolves an unknown name
+/// to its default face without recording the requested name in its font map
+/// (`reference/cpp/core/visual/FontImpl.cpp:159-168`).
+const FALLBACK_FACE: &str = "__krkr_default_face__";
+
 /// Host-supplied image decoder: the L1 `media::decode_image` call behind
 /// `Bitmap.load`.
 type DecodeFn = dyn Fn(&[u8], Option<&str>) -> Result<DecodedImage, String>;
@@ -242,11 +251,16 @@ impl ResourceResolver {
 /// The face may be a comma-separated candidate list with an optional leading
 /// `@` (vertical writing). Each candidate is tried through the
 /// `System.addFont` registry, the attached storage, then the host's installed
-/// system fonts. When no candidate resolves, the host's Japanese-capable CJK
-/// fallback is tried, then the engine's first registered face (the reference
-/// `TVPCreateFontStream` default,
-/// `reference/cpp/core/visual/FontImpl.cpp:159-168`); only an engine with no
-/// registered face at all raises.
+/// system fonts. When no candidate resolves, the host's default face is tried
+/// (the reference `TVPCreateFontStream` default,
+/// `reference/cpp/core/visual/FontImpl.cpp:159-168`), then the engine's first
+/// registered face; only an engine with no registered face at all raises.
+///
+/// Only a resolution found through a candidate is cached. A default-face
+/// fallback is resolved under [`FALLBACK_FACE`] and is never cached under
+/// `face`, so a face registered later for `face` (`System.addFont`,
+/// `GdiPlus.addPrivateFont`) is found on the next lookup instead of being
+/// shadowed by a stale fallback entry.
 pub(crate) fn resolve_face(
     ctx: &CompatCtx,
     engine: &mut TextEngine,
@@ -267,16 +281,14 @@ pub(crate) fn resolve_face(
             return Ok(id);
         }
     }
-    // No candidate is registered, in storage or an installed family: try the
-    // host's Japanese-capable CJK fallback for the requested name
-    // (`FontImpl.cpp:159-164`), then the engine's first registered face
-    // (`TVPCreateFontStream`'s default).
-    if let Ok(id) = engine.load_system_font(face) {
-        cache.insert(face.to_string(), id);
+    // No candidate is registered, in storage or an installed family: fall
+    // back to the host's default face (the reference `TVPCreateFontStream`
+    // default, `FontImpl.cpp:159-168`). Loading it under a fixed name keeps
+    // `face` free for a later registration.
+    if let Ok(id) = engine.load_system_font(FALLBACK_FACE) {
         return Ok(id);
     }
     if let Some(id) = engine.default_font_for(face) {
-        cache.insert(face.to_string(), id);
         return Ok(id);
     }
     Err(format!("no font is available for face '{face}'"))

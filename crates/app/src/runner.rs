@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use api::config::{PresentationScaling, RuntimeConfig};
 use engine::projection::ScalingMode;
-use platform::{EventHandler, Flow, PlatformConfig, PlatformEvent, PlatformWindow};
+use platform::{EventHandler, Flow, FramePacing, PlatformConfig, PlatformEvent, PlatformWindow};
 use render::ViewTransform;
 
 use crate::{
@@ -296,11 +296,17 @@ impl Running {
     }
 
     /// Advances and presents one frame, delivering `events` to the VM.
-    fn step(&mut self, dt_ms: f32, events: &[PlatformEvent]) -> Result<(), String> {
+    fn step(
+        &mut self,
+        dt_ms: f32,
+        events: &[PlatformEvent],
+        pacing: FramePacing,
+    ) -> Result<(), String> {
         match self {
             Running::Empty(host) => host.step(dt_ms).map(|_| ()).map_err(|e| e.to_string()),
             Running::Game(game) => {
-                game.step(dt_ms, events).map_err(|e| e.to_string())?;
+                game.step_with_pacing(dt_ms, events, pacing)
+                    .map_err(|e| e.to_string())?;
                 Ok(())
             }
         }
@@ -473,10 +479,10 @@ impl EventHandler for DesktopApp {
         }
     }
 
-    fn frame(&mut self, dt_ms: f32, window: &PlatformWindow) -> Flow {
+    fn frame(&mut self, dt_ms: f32, window: &PlatformWindow, pacing: FramePacing) -> Flow {
         if let Some(running) = self.running.as_mut() {
             let events = std::mem::take(&mut self.pending_events);
-            if let Err(error) = running.step(dt_ms, &events) {
+            if let Err(error) = running.step(dt_ms, &events, pacing) {
                 eprintln!("krkr: frame failed: {error}");
                 return Flow::Exit;
             }

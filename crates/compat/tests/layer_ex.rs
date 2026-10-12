@@ -467,6 +467,112 @@ fn layer_draws_other_shapes() {
     assert_eq!(env.pixel(dst, 2, 2), [255, 0, 0, 255]);
 }
 
+/// The reference `drawPolygon` resolves its paint source through the
+/// native-instance lookup (`ncbInstanceAdaptor<Appearance>::GetNativeInstance`,
+/// the `NativeInstanceSupport(TJS_NIS_GETINSTANCE, classid)` behind
+/// `TJS_GET_NATIVE_INSTANCE`; `reference/cpp/plugins/layerex_draw/windows/
+/// main.cpp:596,872-902`), never through a script-visible member. The port
+/// therefore exposes no `__handle` member, and every `draw*` method keeps
+/// working without one.
+#[test]
+fn layer_shape_draws_use_the_native_instance_not_a_hidden_property() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    two_layers(&env);
+    let dst = env.layer_id("dst");
+    // No hidden handle member: the native instance is looked up on the
+    // argument itself.
+    assert_eq!(
+        env.eval_int("typeof ((new GdiPlus.Appearance()).__handle) == 'undefined'"),
+        1
+    );
+    assert_eq!(
+        env.eval_int("typeof ((new GdiPlus.Path()).__handle) == 'undefined'"),
+        1
+    );
+    env.run(
+        "var app = new GdiPlus.Appearance(); \
+         app.addBrush(0xFFFF0000, 0, 0); \
+         dst.drawPolygon(app, [[0,0],[4,0],[2,4]]);",
+    );
+    // (2, 1) is the triangle's centroid pixel, fully inside the fill. (2, 2)
+    // sits on the anti-aliased right edge (the (4,0)-(2,4) edge cuts it to 75%
+    // coverage), so it reads a partial alpha.
+    assert_eq!(env.pixel(dst, 2, 1), [255, 0, 0, 255]);
+
+    // Every `draw*` method shares the same Appearance lookup.
+    env.run(
+        "dst.clear(0); \
+         dst.drawArc(app, 0, 0, 4, 4, 0, 360); \
+         dst.drawEllipse(app, 0, 0, 4, 4); \
+         dst.drawRectangle(app, 1, 1, 2, 2); \
+         dst.drawLines(app, [[0,0],[1,1],[2,0]]);",
+    );
+    assert_eq!(env.pixel(dst, 2, 2), [255, 0, 0, 255]);
+
+    // `drawPath` reads the Appearance and the Path the same way.
+    env.run(
+        "dst.clear(0); \
+         var p = new GdiPlus.Path(); \
+         p.drawRectangle(1, 1, 2, 2); \
+         dst.drawPath(app, p);",
+    );
+    assert_eq!(env.pixel(dst, 2, 2), [255, 0, 0, 255]);
+}
+
+/// The real game's `MessageFrame.tjs` `ResizeButton` constructor
+/// (system/MessageFrame.tjs:1920-1931): `class ResizeButton extends Layer`
+/// with a legacy-style bare `Layer(win, par)` base-constructor call, an
+/// `Appearance` built from the layer's own `width`/`height`, and a bare
+/// `drawPolygon(app, points)`. The reference accepts it; the port must too.
+#[test]
+fn layer_draw_polygon_accepts_the_game_resize_button_shape() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    two_layers(&env);
+    env.run(
+        "class ResizeButton extends Layer { \
+             function ResizeButton(win, par) { \
+                 Layer(win, par); \
+                 setSize(16, 16); \
+                 var app = new GdiPlus.Appearance(); \
+                 app.addBrush(0xFFFF0000, 0, 0); \
+                 drawPolygon(app, [[width\\2, 0], [width, 0], [width, height], [0, height], [0, height\\2]]); \
+             } \
+         } \
+         var rb = new ResizeButton(w, dst); \
+         rb.name = 'resize'; \
+         rb.visible = true;",
+    );
+    let resize = env.layer_id("resize");
+    // The pentagon covers its center; the cut corner (0, 0) stays clear.
+    assert_eq!(env.pixel(resize, 8, 8), [255, 0, 0, 255]);
+    assert_eq!(env.pixel(resize, 0, 0), [255, 255, 255, 0]);
+}
+
+/// A genuinely wrong argument still raises a typed error (the reference
+/// rejects an argument that is not the expected native instance; it never
+/// panics and never accepts an arbitrary value).
+#[test]
+fn layer_draw_rejects_non_appearance_arguments() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    two_layers(&env);
+    let error = env
+        .eval("dst.drawPolygon(42, [[0,0],[4,0],[2,4]])")
+        .expect_err("a number is not an Appearance");
+    assert!(error.contains("Appearance"), "unexpected message: {error}");
+    let error = env
+        .eval("dst.drawPolygon(%[x:1], [[0,0],[4,0],[2,4]])")
+        .expect_err("a plain object is not an Appearance");
+    assert!(error.contains("Appearance"), "unexpected message: {error}");
+    env.run("var app = new GdiPlus.Appearance();");
+    let error = env
+        .eval("dst.drawPath(app, 42)")
+        .expect_err("a number is not a Path");
+    assert!(error.contains("Path"), "unexpected message: {error}");
+}
+
 #[test]
 fn layer_transforms_apply_to_drawing() {
     let _lock = vm_lock();

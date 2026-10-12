@@ -43,10 +43,10 @@ use fs::FileSystem;
 use media::Media;
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 use render::{
-    PipelineConfig, RenderPipeline, RenderScene, RenderState, Surface, Texture, TextureDesc,
-    TextureFormat, TextureUpload, ViewTransform, begin_render_state,
-    begin_render_state_with_display, create_render_pipeline, create_texture, drop_texture, render,
-    resize as resize_render, upload_textures,
+    FrameTimings, PipelineConfig, RenderPipeline, RenderScene, RenderState, Surface, Texture,
+    TextureDesc, TextureFormat, TextureUpload, ViewTransform, begin_render_state,
+    begin_render_state_with_display, create_render_pipeline, create_texture, drop_texture,
+    last_frame_timings, render, resize as resize_render, upload_textures,
 };
 
 pub use audio::install_audio_decoder;
@@ -581,6 +581,15 @@ impl Host {
     /// Returns the null backend's counters for the last frame, if available.
     pub fn last_frame(&self) -> Option<FrameStats> {
         render::NullRenderPipeline::last_frame(&self.render_state)
+    }
+
+    /// Returns the presentation calls' costs for the last presented frame.
+    ///
+    /// The Vulkan backend reports the acquire/present/fence/recreate costs it
+    /// measured; the null backend reports zeros. `None` means no frame has
+    /// been presented through this state yet.
+    pub fn last_frame_timings(&self) -> Option<FrameTimings> {
+        last_frame_timings(&self.render_state)
     }
 
     /// Uploads every bitmap whose dirty flag is set and clears the flag.

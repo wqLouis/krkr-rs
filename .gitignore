@@ -34,3 +34,6 @@ __pycache__/
 
 # Stray runtime data from an unrelated tool (not part of this project)
 /config/
+
+# Device logs captured from the phone (runtime evidence, not source).
+krkr-rs-logs*.txt

@@ -14,7 +14,9 @@ use std::time::{Duration, Instant};
 use android_activity::{AndroidApp, MainEvent, PollEvent};
 use app::{BackendKind, GameHost, Host, HostConfig};
 use engine::projection::ScalingMode;
-use platform::{EventHandler, Flow, PlatformError, PlatformEvent, PlatformWindow, Ticker};
+use platform::{
+    EventHandler, Flow, FramePacing, PlatformError, PlatformEvent, PlatformWindow, Ticker,
+};
 
 use crate::gesture::GestureSynthesizer;
 use crate::input::translate_input;
@@ -229,12 +231,12 @@ impl EventHandler for AndroidHost {
         }
     }
 
-    fn frame(&mut self, dt_ms: f32, _window: &PlatformWindow) -> Flow {
+    fn frame(&mut self, dt_ms: f32, _window: &PlatformWindow, pacing: FramePacing) -> Flow {
         let Some(game) = self.running.as_mut() else {
             return Flow::Continue;
         };
         let events = std::mem::take(&mut self.pending_events);
-        let result = game.step(dt_ms, &events);
+        let result = game.step_with_pacing(dt_ms, &events, pacing);
         match result {
             Ok(_) => Flow::Continue,
             Err(error) => self.fail(format!("frame failed: {error}")),
@@ -260,10 +262,15 @@ pub(crate) fn run_loop(
     let mut frame_requested = true;
     let mut exit = false;
     let event_source = app.clone();
+    // Poll and input dispatch time accumulated since the last frame; the
+    // frame's gap spans all of it, not just the final poll call.
+    let mut accumulated_poll = Duration::ZERO;
+    let mut accumulated_input = Duration::ZERO;
 
     while !exit {
         let now = Instant::now();
         let timeout = ticker.deadline().saturating_duration_since(now);
+        let poll_started = Instant::now();
         event_source.poll_events(Some(timeout), |poll_event| {
             if exit {
                 return;
@@ -352,13 +359,18 @@ pub(crate) fn run_loop(
                     state::write_state(state::State::Running, None);
                 }
                 MainEvent::LowMemory => log::warn!("the system reported low memory"),
-                MainEvent::InputAvailable => translate_input(&app, &mut handler),
+                MainEvent::InputAvailable => {
+                    let input_started = Instant::now();
+                    translate_input(&app, &mut handler);
+                    accumulated_input += input_started.elapsed();
+                }
                 // `MainEvent` is non-exhaustive; the lifecycle events the
                 // engine observes are handled above and the rest need no host
                 // action.
                 _ => {}
             }
         });
+        accumulated_poll += poll_started.elapsed();
 
         let now = Instant::now();
         // The long-press timeout is time-based, not event-based: advance the
@@ -374,7 +386,13 @@ pub(crate) fn run_loop(
             if let Some(created) = &window {
                 let dt_ms = now.saturating_duration_since(last_frame).as_secs_f32() * 1000.0;
                 last_frame = now;
-                if handler.frame(dt_ms, created) == Flow::Exit {
+                let pacing = FramePacing {
+                    poll_ms: accumulated_poll.as_secs_f64() * 1000.0,
+                    input_ms: accumulated_input.as_secs_f64() * 1000.0,
+                };
+                accumulated_poll = Duration::ZERO;
+                accumulated_input = Duration::ZERO;
+                if handler.frame(dt_ms, created, pacing) == Flow::Exit {
                     exit = true;
                 }
                 if let Err(error) = handler.sync_script_size() {

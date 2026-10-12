@@ -561,8 +561,10 @@ private fun LogsScreen(modifier: Modifier = Modifier, onNotify: (String) -> Unit
     val engineTail = remember(refreshToken) {
         LauncherLog.tail(EngineDiagnostics.engineLogFile(context), LOG_TAIL_LINES)
     }
+    val stateText = remember(refreshToken) { EngineDiagnostics.stateText(context) }
     val fullLog = remember(refreshToken) { fullLogSources(context) }
     val fileSummaries = remember(refreshToken) { fullLogSummaries(fullLog) }
+    val fullLogBytes = remember(refreshToken) { totalLogBytes(fullLog) }
 
     // The user picks the destination with the system document picker; the
     // result is the chosen document URI, or null when they cancel.
@@ -579,11 +581,12 @@ private fun LogsScreen(modifier: Modifier = Modifier, onNotify: (String) -> Unit
             return@rememberLauncherForActivityResult
         }
         val missing = missingLogNames(fullLog)
+        val size = formatBytes(fullLogBytes)
         onNotify(
             if (missing.isEmpty()) {
-                "Exported the full log."
+                "Exported the full log ($size)."
             } else {
-                "Exported the log; missing: ${missing.joinToString(", ")}."
+                "Exported the log ($size); missing: ${missing.joinToString(", ")}."
             },
         )
     }
@@ -601,12 +604,12 @@ private fun LogsScreen(modifier: Modifier = Modifier, onNotify: (String) -> Unit
             )
             TextButton(onClick = { refreshToken++ }) { Text("Refresh") }
             TextButton(onClick = {
-                if (!shareLogs(context, launcherTail, engineTail)) {
+                if (!shareLogs(context, launcherTail, engineTail, stateText)) {
                     onNotify("Could not open the share sheet.")
                 }
             }) { Text("Share") }
             TextButton(onClick = {
-                if (copyLogs(context, launcherTail, engineTail)) {
+                if (copyLogs(context, launcherTail, engineTail, stateText)) {
                     onNotify("Logs copied.")
                 } else {
                     onNotify("Could not copy the logs.")
@@ -616,7 +619,9 @@ private fun LogsScreen(modifier: Modifier = Modifier, onNotify: (String) -> Unit
         Spacer(Modifier.height(4.dp))
         Text(
             text = "Last $LOG_TAIL_LINES lines, newest last. " +
-                LauncherLog.file(context).name + " + " + EngineDiagnostics.engineLogFile(context).name,
+                EngineDiagnostics.stateFile(context).name + " + " +
+                LauncherLog.file(context).name + " + " +
+                EngineDiagnostics.engineLogFile(context).name,
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -641,8 +646,15 @@ private fun LogsScreen(modifier: Modifier = Modifier, onNotify: (String) -> Unit
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
+        Text(
+            text = "Export total: ${formatBytes(fullLogBytes)} across ${fullLog.size} files " +
+                "(the export writes every file whole; nothing is truncated).",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
         Spacer(Modifier.height(8.dp))
         Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
+            LogSection("krkr_state.json", stateText)
             LogSection("krkr-launcher.log", launcherTail)
             LogSection("krkr.log", engineTail)
         }
@@ -664,21 +676,30 @@ private fun LogSection(title: String, body: String) {
     )
 }
 
-private fun combineLogs(launcherTail: String, engineTail: String): String = buildString {
-    appendLine("== krkr-launcher.log ==")
-    appendLine(launcherTail.ifBlank { "(empty)" })
-    appendLine()
-    appendLine("== krkr.log ==")
-    appendLine(engineTail.ifBlank { "(empty)" })
-}
+private fun combineLogs(launcherTail: String, engineTail: String, stateText: String): String =
+    buildString {
+        appendLine("== krkr_state.json ==")
+        appendLine(stateText.ifBlank { "(empty)" })
+        appendLine()
+        appendLine("== krkr-launcher.log ==")
+        appendLine(launcherTail.ifBlank { "(empty)" })
+        appendLine()
+        appendLine("== krkr.log ==")
+        appendLine(engineTail.ifBlank { "(empty)" })
+    }
 
 /**
  * Shares the logs as text, attaching a file through the app's FileProvider.
  * Returns false when the chooser could not be opened, so the caller can tell
  * the user instead of failing silently.
  */
-private fun shareLogs(context: Context, launcherTail: String, engineTail: String): Boolean {
-    val text = combineLogs(launcherTail, engineTail)
+private fun shareLogs(
+    context: Context,
+    launcherTail: String,
+    engineTail: String,
+    stateText: String,
+): Boolean {
+    val text = combineLogs(launcherTail, engineTail, stateText)
     val intent = Intent(Intent.ACTION_SEND).apply {
         type = "text/plain"
         putExtra(Intent.EXTRA_SUBJECT, "krkr-rs logs")
@@ -704,7 +725,12 @@ private fun shareLogs(context: Context, launcherTail: String, engineTail: String
         .isSuccess
 }
 
-private fun copyLogs(context: Context, launcherTail: String, engineTail: String): Boolean {
+private fun copyLogs(
+    context: Context,
+    launcherTail: String,
+    engineTail: String,
+    stateText: String,
+): Boolean {
     val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
     if (clipboard == null) {
         LauncherLog.w("clipboard service unavailable; cannot copy logs")
@@ -712,13 +738,14 @@ private fun copyLogs(context: Context, launcherTail: String, engineTail: String)
     }
     return runCatching {
         clipboard.setPrimaryClip(
-            ClipData.newPlainText("krkr-rs logs", combineLogs(launcherTail, engineTail)),
+            ClipData.newPlainText("krkr-rs logs", combineLogs(launcherTail, engineTail, stateText)),
         )
     }.onFailure { LauncherLog.e("cannot copy logs", it) }.isSuccess
 }
 
 /**
- * One log file in the full-log export.
+ * One diagnostics file in the full-log export: the engine state, an engine log
+ * or a launcher log.
  *
  * [displayName] is the on-disk name shown to the user; [shareName] is the
  * unambiguous name used in the cache and the share sheet, where `krkr.log` and
@@ -726,13 +753,32 @@ private fun copyLogs(context: Context, launcherTail: String, engineTail: String)
  */
 private data class LogSource(val displayName: String, val shareName: String, val file: File)
 
-/** The complete log, newest first: both sides' current and rotated files. */
-private fun fullLogSources(context: Context): List<LogSource> = listOf(
-    LogSource("krkr.log", "krkr-engine.log", EngineDiagnostics.engineLogFile(context)),
-    LogSource("krkr.log.1", "krkr-engine.log.1", EngineDiagnostics.engineLogRotatedFile(context)),
-    LogSource("krkr-launcher.log", "krkr-launcher.log", LauncherLog.file(context)),
-    LogSource("krkr-launcher.log.1", "krkr-launcher.log.1", LauncherLog.rotatedFile(context)),
-)
+/**
+ * The complete log, in the order the files are read: the engine state first —
+ * its `message` is the one line that says why a title failed — then every
+ * engine log the retention policy has on disk, then the launcher's own file
+ * and its rotation.
+ *
+ * The engine files are enumerated from the files directory rather than named,
+ * so the export follows the Rust sink's rotation count without keeping a
+ * second copy of it. A missing or empty file is still listed here; the
+ * readers below name it as missing rather than failing.
+ */
+private fun fullLogSources(context: Context): List<LogSource> = buildList {
+    add(LogSource("krkr_state.json", "krkr-state.json", EngineDiagnostics.stateFile(context)))
+    for (file in EngineDiagnostics.engineLogFiles(context)) {
+        add(LogSource(file.name, engineShareName(file.name), file))
+    }
+    add(LogSource("krkr-launcher.log", "krkr-launcher.log", LauncherLog.file(context)))
+    add(LogSource("krkr-launcher.log.1", "krkr-launcher.log.1", LauncherLog.rotatedFile(context)))
+}
+
+/**
+ * The unambiguous share/cache name for an engine log, so `krkr.log` and
+ * `krkr.log.1` are not confused in the share sheet or the cache directory.
+ */
+private fun engineShareName(name: String): String =
+    "krkr-engine" + name.removePrefix("krkr")
 
 /** A path and size for each source, naming a file that does not exist as such. */
 private fun fullLogSummaries(sources: List<LogSource>): List<String> = sources.map { source ->
@@ -747,6 +793,11 @@ private fun fullLogSummaries(sources: List<LogSource>): List<String> = sources.m
 private fun missingLogNames(sources: List<LogSource>): List<String> = sources
     .filter { !it.file.isFile || it.file.length() == 0L }
     .map { it.displayName }
+
+/** The combined size of the files that are present, for the export notice. */
+private fun totalLogBytes(sources: List<LogSource>): Long = sources.sumOf { source ->
+    if (source.file.isFile) source.file.length() else 0L
+}
 
 /** Formats [bytes] as B, KiB or MiB for the Logs screen. */
 private fun formatBytes(bytes: Long): String {

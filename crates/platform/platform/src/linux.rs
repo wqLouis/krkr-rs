@@ -20,7 +20,7 @@ use winit::window::{Window, WindowId};
 use crate::clock::Ticker;
 use crate::event::PlatformEvent;
 use crate::input::{InputEvent, MouseButton, PhysicalKey};
-use crate::{EventHandler, Flow, PlatformConfig, PlatformError};
+use crate::{EventHandler, Flow, FramePacing, PlatformConfig, PlatformError};
 
 /// The window created by [`run`].
 ///
@@ -128,6 +128,11 @@ struct AppLoop<H: EventHandler> {
     window: Option<PlatformWindow>,
     ticker: Ticker,
     last_frame: Instant,
+    /// Instant the previous frame finished, so the next frame can report the
+    /// time the loop spent outside a frame (the event wait).
+    last_frame_end: Instant,
+    /// Input dispatch time accumulated since the last frame.
+    input_ms: f64,
     /// First fatal error seen inside the loop, returned by [`run`].
     failure: Option<PlatformError>,
 }
@@ -141,6 +146,8 @@ impl<H: EventHandler> AppLoop<H> {
             handler,
             window: None,
             last_frame: now,
+            last_frame_end: now,
+            input_ms: 0.0,
             failure: None,
         }
     }
@@ -176,6 +183,7 @@ impl<H: EventHandler> ApplicationHandler for AppLoop<H> {
 
             let now = Instant::now();
             self.last_frame = now;
+            self.last_frame_end = now;
             self.ticker = Ticker::new(self.config.frame_interval, now);
             self.window = Some(PlatformWindow { window });
         }
@@ -211,14 +219,29 @@ impl<H: EventHandler> ApplicationHandler for AppLoop<H> {
             WindowEvent::RedrawRequested => {
                 let now = Instant::now();
                 let dt_ms = now.saturating_duration_since(self.last_frame).as_secs_f32() * 1000.0;
+                let poll_ms = now
+                    .saturating_duration_since(self.last_frame_end)
+                    .as_secs_f64()
+                    * 1000.0;
                 self.last_frame = now;
-                match self.window.as_ref() {
-                    Some(window) => self.handler.frame(dt_ms, window),
+                let pacing = FramePacing {
+                    poll_ms,
+                    input_ms: std::mem::take(&mut self.input_ms),
+                };
+                let flow = match self.window.as_ref() {
+                    Some(window) => self.handler.frame(dt_ms, window, pacing),
                     None => Flow::Continue,
-                }
+                };
+                self.last_frame_end = Instant::now();
+                flow
             }
             other => match map_input(other) {
-                Some(input) => self.handler.event(PlatformEvent::Input(input)),
+                Some(input) => {
+                    let started = Instant::now();
+                    let flow = self.handler.event(PlatformEvent::Input(input));
+                    self.input_ms += started.elapsed().as_secs_f64() * 1000.0;
+                    flow
+                }
                 None => Flow::Continue,
             },
         };

@@ -318,6 +318,14 @@ Open:
 * **Zero-copy image presentation** — a later stage, not a repair: uploads go
   through a host-visible staging buffer with no `dmabuf`/`AHardwareBuffer` path
   anywhere. Expected gain ~0–5% for sprites and ~10–25% for movie playback.
+* **C++ `-O2 -flto` for the TJS2 VM** — measured, deferred. It wins on paper
+  (compile 89.5%, exec 92.5% of `-O2` on the host harness in `scripts/perf/`),
+  but the objects become LLVM bitcode and the Android link step is the only
+  place it can be validated, so it needs a device A/B before adoption. `-O3`
+  was measured and rejected (exec 102.6% of `-O2`), as were
+  `-fvisibility=hidden`/`-fno-semantic-interposition` (flat) and `mimalloc`
+  (~0.08 allocations per op). `TJS2_OPT`/`TJS2_EXTRA_CXXFLAGS` keep every level
+  switchable (`docs/performance.md` §7).
 
 ## 13. Verified — do not re-open
 
@@ -429,6 +437,34 @@ of synchronous decodes) and `docs/audits/perf-hotspots.md`.
   resolution change.
 * Dirty-rectangle bitmap uploads and the per-frame fence wait (§12).
 * Bounded GPU glyph-atlas cells (§12).
+
+### The address-safety guard is a trigger, not a proof
+
+The `pointer-flow`/`pointer-compare`/`char-signedness`/`addr-narrow` rules in
+`scripts/check-error-handling.sh` are a one-function-body taint over a
+name-based interprocedural set. They do not catch a pointer laundered through a
+`usize`-returning helper with no address-suggesting name, taint crossing a
+struct field or a closure, address-keyed state with neither a cast nor a
+comparison, or a pointer round-tripped through script state. `D37`
+(`docs/migration/README.md` §3) and `docs/audits/pointer-handles.md` remain the
+review backstop, and the audit's §9 follow-ups (rank 3 address-keyed maps, the
+`PhaseVocoder` token) are open.
+
+### Device verification owed
+
+Each of these needs a real KiriKiri title on a real device, which is the only
+place they can be confirmed (`D36`):
+
+* the `Layer.drawPolygon`/`drawPath` native-instance fix (the aarch64 black
+  screen) — confirm the scene transition past "start game";
+* the slow-frame attribution line — confirm which field carries the ~558 ms
+  stall and that `unaccounted` closes the budget;
+* one export per title for the four titles whose failure reason was never
+  captured, now that the log keeps six rotations and the state file is
+  included;
+* whether any shipped script compares `Window.HWND`/`Bitmap.buffer`/
+  `Layer.*ImageBuffer`/`interface` numerically (the rank 2 getters in the
+  pointer audit).
 
 ### Start-up is not measurable on a device
 

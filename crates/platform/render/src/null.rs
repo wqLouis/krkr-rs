@@ -21,7 +21,7 @@ use crate::scene::{
 };
 use crate::state::{RenderState, StateKind, Surface, SurfaceKind};
 use crate::texture::{Texture, TextureDesc};
-use crate::{BackendKind, GpuCapabilities, TextureFormat};
+use crate::{BackendKind, FrameTimings, GpuCapabilities, TextureFormat};
 
 /// Maximum width/height advertised by the null backend.
 pub const NULL_MAX_TEXTURE_DIMENSION: u32 = 16384;
@@ -219,6 +219,7 @@ impl NullRenderPipeline {
         let stats = traverse(null, scene);
         null.frame_index = null.frame_index.wrapping_add(1);
         null.last_frame = Some(stats);
+        null.last_timings = Some(FrameTimings::default());
         Ok(Presentation {
             presented: true,
             surface_event: None,
@@ -273,6 +274,9 @@ pub(crate) struct NullState {
     pub(crate) render_targets: HashMap<u64, NullRenderTarget>,
     /// Counters from the most recent frame.
     pub(crate) last_frame: Option<FrameStats>,
+    /// Vulkan call timings from the most recent frame; all zero because the
+    /// null backend runs no GPU calls.
+    pub(crate) last_timings: Option<FrameTimings>,
 }
 
 /// CPU-side image storage for one offscreen render target.

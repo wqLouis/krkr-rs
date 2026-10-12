@@ -10,7 +10,7 @@ compat = { workspace = true }
 engine = { workspace = true }
 tjs = { workspace = true }
 thiserror = { workspace = true }
-log = { workspace = true }
+log = { workspace = true, features = ["std"] }
 
 # D13: `platform` has no default platform feature; select exactly one per
 # target (L4 consumes only the platform-agnostic event types).

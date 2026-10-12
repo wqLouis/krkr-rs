@@ -49,6 +49,7 @@ mod texture;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use ash::vk;
 use raw_window_handle::{
@@ -63,7 +64,7 @@ use crate::render_target::{RenderTarget, RenderTargetDesc};
 use crate::scene::RenderScene;
 use crate::state::{RenderState, StateKind, Surface, SurfaceKind};
 use crate::texture::{Texture, TextureDesc};
-use crate::{BackendKind, GpuCapabilities, TextureFormat};
+use crate::{BackendKind, FrameTimings, GpuCapabilities, TextureFormat};
 
 /// Number of frames recorded concurrently.
 pub const MAX_FRAMES_IN_FLIGHT: usize = 2;
@@ -358,6 +359,7 @@ impl VulkanPipeline {
             surface_size,
             frame_index: 0,
             swapchain_ready: true,
+            last_timings: None,
         };
 
         Ok((
@@ -673,23 +675,42 @@ impl VulkanPipeline {
         let graphics_queue = vstate.graphics_queue;
         let present_queue = vstate.present_queue;
 
+        // Per-frame GPU call costs, written into the state before every return
+        // so a slow frame's line can name what blocked.
+        let mut fence_wait_ms = 0.0_f64;
+        let mut present_ms = 0.0_f64;
+        let mut recreate_ms = 0.0_f64;
+
         // SAFETY: the fence belongs to this frame slot and was created
         // signalled, so the first wait returns immediately.
+        let fence_started = Instant::now();
         unsafe { device.wait_for_fences(&[in_flight], true, u64::MAX) }
             .map_err(|error| device::result_error("failed to wait for the frame fence", error))?;
+        fence_wait_ms += fence_started.elapsed().as_secs_f64() * 1000.0;
 
         // SAFETY: `swapchain` is valid; `image_available` must be unsignalled.
-        let (image_index, suboptimal) = match unsafe {
+        let acquire_started = Instant::now();
+        let acquire_result = unsafe {
             swapchain_loader.acquire_next_image(
                 swapchain,
                 u64::MAX,
                 image_available,
                 vk::Fence::null(),
             )
-        } {
+        };
+        let acquire_ms = acquire_started.elapsed().as_secs_f64() * 1000.0;
+        let (image_index, suboptimal) = match acquire_result {
             Ok(value) => value,
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                let recreate_started = Instant::now();
                 recreate_swapchain(&device, vstate, surface_handle)?;
+                recreate_ms += recreate_started.elapsed().as_secs_f64() * 1000.0;
+                vstate.last_timings = Some(FrameTimings {
+                    acquire_ms,
+                    present_ms,
+                    recreate_ms,
+                    fence_wait_ms,
+                });
                 return Ok(Presentation {
                     presented: false,
                     surface_event: Some(SurfaceEvent::OutOfDate),
@@ -710,10 +731,12 @@ impl VulkanPipeline {
         let record_result: Result<(), RenderError> = (|| {
             if vstate.images_in_flight[image_index as usize] != vk::Fence::null() {
                 let image_fence = vstate.images_in_flight[image_index as usize];
+                let image_wait_started = Instant::now();
                 // SAFETY: the fence guards this swapchain image.
                 unsafe { device.wait_for_fences(&[image_fence], true, u64::MAX) }.map_err(
                     |error| device::result_error("failed to wait for a swapchain image", error),
                 )?;
+                fence_wait_ms += image_wait_started.elapsed().as_secs_f64() * 1000.0;
             }
 
             // SAFETY: the fence/image are idle and the pool is not in use.
@@ -824,8 +847,10 @@ impl VulkanPipeline {
             .swapchains(&swapchains)
             .image_indices(&image_indices);
         // SAFETY: the present info references live semaphores/swapchain.
+        let present_started = Instant::now();
         let present_result =
             unsafe { swapchain_loader.queue_present(present_queue, &present_info) };
+        present_ms = present_started.elapsed().as_secs_f64() * 1000.0;
 
         vstate.frame_in_flight = (vstate.frame_in_flight + 1) % MAX_FRAMES_IN_FLIGHT;
         vstate.frame_index = vstate.frame_index.wrapping_add(1);
@@ -842,13 +867,27 @@ impl VulkanPipeline {
         }
 
         if needs_recreate {
+            let recreate_started = Instant::now();
             recreate_swapchain(&device, vstate, surface_handle)?;
+            recreate_ms += recreate_started.elapsed().as_secs_f64() * 1000.0;
+            vstate.last_timings = Some(FrameTimings {
+                acquire_ms,
+                present_ms,
+                recreate_ms,
+                fence_wait_ms,
+            });
             return Ok(Presentation {
                 presented: true,
                 surface_event: Some(SurfaceEvent::OutOfDate),
             });
         }
 
+        vstate.last_timings = Some(FrameTimings {
+            acquire_ms,
+            present_ms,
+            recreate_ms,
+            fence_wait_ms,
+        });
         Ok(Presentation {
             presented: true,
             surface_event: None,
@@ -933,6 +972,8 @@ pub(crate) struct VulkanState {
     pub(crate) frame_index: u64,
     /// Whether the swapchain is usable.
     pub(crate) swapchain_ready: bool,
+    /// Vulkan call timings from the most recent presented frame.
+    pub(crate) last_timings: Option<FrameTimings>,
 }
 
 impl Drop for VulkanState {

@@ -63,6 +63,7 @@ pub use crate::scene::{
     Clip, GlyphPlacement, GlyphRun, RenderContent, RenderNode, RenderNodeId, RenderScene,
     ViewTransform,
 };
+use crate::state::StateKind;
 pub use crate::state::{RenderState, Surface};
 pub use crate::texture::{Texture, TextureDesc, TextureFormat};
 pub use api::glyph::{FontMetrics, GlyphBitmap, GlyphStyle};
@@ -126,6 +127,25 @@ impl PipelineConfig {
             ..Self::default()
         }
     }
+}
+
+/// Wall-clock costs of the presentation calls that complete one frame.
+///
+/// The fields are measured by the Vulkan backend around the blocking calls
+/// that can stall a mobile frame: the acquire/present queue operations, the
+/// frame-fence waits, and any swapchain recreation the frame triggered. The
+/// null backend records an all-zero value, so a caller can rely on the shape
+/// without a GPU.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FrameTimings {
+    /// Milliseconds blocked in `vkAcquireNextImageKHR`.
+    pub acquire_ms: f64,
+    /// Milliseconds blocked in `vkQueuePresentKHR`.
+    pub present_ms: f64,
+    /// Milliseconds spent recreating the swapchain during the frame.
+    pub recreate_ms: f64,
+    /// Milliseconds blocked waiting on the frame and per-image fences.
+    pub fence_wait_ms: f64,
 }
 
 /// Static capabilities reported by a [`RenderPipeline`].
@@ -472,6 +492,19 @@ pub fn render(
     }
 }
 
+/// Returns the most recent presented frame's Vulkan call timings.
+///
+/// Returns `None` for a render state that has not presented a frame, so a
+/// caller can distinguish "no measurement yet" from a measured all-zero
+/// frame. The null backend records zeros for every presented frame, so the
+/// value is `Some` there once a frame has rendered.
+pub fn last_frame_timings(state: &RenderState) -> Option<FrameTimings> {
+    match &state.kind {
+        StateKind::Null(null) => null.last_timings,
+        StateKind::Vulkan(vulkan) => vulkan.last_timings,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -518,5 +551,18 @@ mod tests {
 
         let b_stored = NullRenderPipeline::texture_pixels(&state, &b).expect("b stored");
         assert_eq!(b_stored, &b_pixels[..]);
+    }
+
+    /// The null backend has no GPU calls, but it still answers the timing
+    /// query once a frame has rendered, so a caller can rely on the shape.
+    #[test]
+    fn null_frame_timings_are_recorded_as_zero() {
+        let pipeline = RenderPipeline::null();
+        let (surface, mut state) =
+            begin_render_state(&pipeline, &headless_window()).expect("begin");
+        assert_eq!(last_frame_timings(&state), None);
+        let scene = RenderScene::with_root_node();
+        render(&pipeline, &surface, &mut state, &scene).expect("render");
+        assert_eq!(last_frame_timings(&state), Some(FrameTimings::default()));
     }
 }

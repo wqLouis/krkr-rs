@@ -612,7 +612,6 @@
     ],
     "GdiPlus.Appearance": [
       "Appearance",
-      "__handle",
       "addBrush",
       "addPen",
       "clear",
@@ -668,7 +667,6 @@
     ],
     "GdiPlus.Path": [
       "Path",
-      "__handle",
       "closeFigure",
       "drawArc",
       "drawBezier",

@@ -371,6 +371,107 @@ fn test_font() -> Option<(String, Vec<u8>)> {
     None
 }
 
+/// The font-family name `bytes` reports to the L2 text engine.
+fn family_name(bytes: &[u8]) -> Option<String> {
+    let mut engine = engine::text::TextEngine::new();
+    let id = engine.add_font(bytes, 0).ok()?;
+    engine.family_name(id).map(str::to_owned)
+}
+
+/// Rewrite the `name` table's family records of `bytes` to `family`.
+///
+/// Every family record must already hold `old`, and `family` must be ASCII of
+/// the same length, so the string-storage offsets stay valid. Returns `None`
+/// when the name table cannot be rewritten.
+fn rename_font_family(bytes: &[u8], old: &str, family: &str) -> Option<Vec<u8>> {
+    if !old.is_ascii() || !family.is_ascii() || family.len() != old.len() {
+        return None;
+    }
+    let read_u16 = |at: usize| -> Option<u16> {
+        bytes
+            .get(at..at + 2)
+            .map(|b| u16::from_be_bytes([b[0], b[1]]))
+    };
+    let read_u32 = |at: usize| -> Option<u32> {
+        bytes
+            .get(at..at + 4)
+            .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    let table_count = read_u16(4)? as usize;
+    let mut name_offset = None;
+    for index in 0..table_count {
+        let record = 12 + index * 16;
+        if bytes.get(record..record + 4) == Some(&b"name"[..]) {
+            name_offset = Some(read_u32(record + 8)? as usize);
+            break;
+        }
+    }
+    let name_offset = name_offset?;
+    let name_count = read_u16(name_offset + 2)? as usize;
+    let storage_offset = read_u16(name_offset + 4)? as usize;
+    let encode = |text: &str, platform: u16, encoding: u16| -> Option<Vec<u8>> {
+        match (platform, encoding) {
+            (1, 0) => Some(text.as_bytes().to_vec()),
+            (0, _) | (3, 1) | (3, 10) => {
+                let mut encoded = Vec::with_capacity(text.len() * 2);
+                for unit in text.encode_utf16() {
+                    encoded.extend_from_slice(&unit.to_be_bytes());
+                }
+                Some(encoded)
+            }
+            _ => None,
+        }
+    };
+    let mut patched = bytes.to_vec();
+    let mut replaced = 0usize;
+    for index in 0..name_count {
+        let record = name_offset + 6 + index * 12;
+        let platform = read_u16(record)?;
+        let encoding = read_u16(record + 2)?;
+        let name_id = read_u16(record + 6)?;
+        if name_id != 1 && name_id != 16 {
+            continue;
+        }
+        let length = read_u16(record + 8)? as usize;
+        let offset = read_u16(record + 10)? as usize;
+        let start = name_offset
+            .checked_add(storage_offset)?
+            .checked_add(offset)?;
+        let end = start.checked_add(length)?;
+        let Some(expected) = encode(old, platform, encoding) else {
+            continue;
+        };
+        let Some(replacement) = encode(family, platform, encoding) else {
+            continue;
+        };
+        if expected.len() != length
+            || replacement.len() != length
+            || bytes.get(start..end) != Some(expected.as_slice())
+        {
+            return None;
+        }
+        patched[start..end].copy_from_slice(&replacement);
+        replaced += 1;
+    }
+    (replaced > 0).then_some(patched)
+}
+
+/// A test font whose family is renamed to a value no host has installed, so
+/// `GdiPlus.addPrivateFont` is what first makes the family resolvable.
+///
+/// Returns `(storage file name, patched bytes, family)`; `None` when the name
+/// table cannot be rewritten or the patch is not observed.
+fn private_family_font() -> Option<(String, Vec<u8>, String)> {
+    let (name, bytes) = test_font()?;
+    let old = family_name(&bytes)?;
+    let custom = "K".repeat(old.len());
+    let patched = rename_font_family(&bytes, &old, &custom)?;
+    if family_name(&patched).as_deref() != Some(custom.as_str()) {
+        return None;
+    }
+    Some((name, patched, custom))
+}
+
 /// A unique temporary game directory, removed on drop.
 struct GameDir(PathBuf);
 
@@ -1441,6 +1542,70 @@ fn gdiplus_private_font_registration_and_listing() {
          var face = new GdiPlus.Font(names[0], 16, 0);",
     );
     assert_eq!(env.eval_int("face.lineSpacing > 0"), 1);
+}
+
+/// Reference: `GdiPlus::addPrivateFont` appends the file's faces to the private
+/// face list, and a `FontInfo` re-resolves its family against that list on the
+/// next use, so a face added after a failed lookup is used from then on
+/// (`reference/cpp/plugins/layerex_draw/blend2d/LayerExDraw.cpp:93-126,
+/// 215-221,374-383`). A cached default-face fallback must not keep the
+/// requested family on the fallback face.
+#[test]
+fn gdiplus_private_font_invalidates_a_failed_face_lookup() {
+    let _lock = vm_lock();
+    let Some((name, bytes, family)) = private_family_font() else {
+        return;
+    };
+    let (storage, _dir) = font_storage(&name, &bytes);
+    let env = Env::build(Some(storage), false);
+
+    // Before the registration the family is unknown; it resolves to the
+    // default face, and so does an unrelated missing family.
+    env.run(&format!(
+        "var missing = new GdiPlus.Font('{family}', 16, 0); \
+         var fallbackSpacing = missing.lineSpacing; \
+         var unrelated = new GdiPlus.Font('OtherlyMissing', 16, 0); \
+         var unrelatedFallback = unrelated.lineSpacing;"
+    ));
+    let fallback_spacing = env.eval_real("fallbackSpacing");
+    assert!(
+        fallback_spacing > 0.0,
+        "the default face must shape text, got {fallback_spacing}"
+    );
+
+    // `addPrivateFont` (`LayerExDraw.cpp:93-126`) supplies the family.
+    env.run(&format!("GdiPlus.addPrivateFont('{name}');"));
+    assert!(
+        env.eval_int("GdiPlus.getFontList(true).length > 0") == 1,
+        "addPrivateFont must list the new family"
+    );
+
+    // The next lookup must resolve to the private face, whose metrics equal
+    // the same bytes loaded directly from storage. An unrelated family stays
+    // on the default face.
+    env.run(&format!(
+        "var resolved = new GdiPlus.Font('{family}', 16, 0); \
+         var resolvedSpacing = resolved.lineSpacing; \
+         var direct = new GdiPlus.Font('{name}', 16, 0); \
+         var directSpacing = direct.lineSpacing; \
+         var unrelatedAfter = new GdiPlus.Font('OtherlyMissing', 16, 0); \
+         var unrelatedSpacing = unrelatedAfter.lineSpacing;"
+    ));
+    let direct_spacing = env.eval_real("directSpacing");
+    let resolved_spacing = env.eval_real("resolvedSpacing");
+    assert_ne!(
+        fallback_spacing, direct_spacing,
+        "the default and private faces must differ for this test to be meaningful"
+    );
+    assert_eq!(
+        resolved_spacing, direct_spacing,
+        "a face registered by addPrivateFont must be used after a failed lookup"
+    );
+    assert_eq!(
+        env.eval_real("unrelatedSpacing"),
+        env.eval_real("unrelatedFallback"),
+        "an unrelated fallback must stay on the default face"
+    );
 }
 
 #[test]

@@ -16,7 +16,7 @@ use compat::{CompatCtx, CompatError, FrameBody};
 use engine::Storage;
 use engine::storage::{MountOptions, StartupPlan};
 use fs::FileSystem;
-use platform::{PlatformError, PlatformEvent};
+use platform::{FramePacing, PlatformError, PlatformEvent};
 use vm::{FrameCtx, VmHost};
 
 use crate::audio::AudioOutput;
@@ -71,7 +71,7 @@ pub enum GameError {
 /// The fields are overwritten by each poll's completion hook, so one instance
 /// describes exactly one frame. [`FramePhases::body_ms`] is the sum of the six
 /// poll phases; the render host's own costs are not part of it.
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 struct FramePhases {
     timer_ms: f64,
     sound_ms: f64,
@@ -176,6 +176,94 @@ impl FrameBody for Polls {
     }
 }
 
+/// The previous frame's measured attribution, kept so a slow gap names the
+/// frame it actually spans.
+///
+/// The gap handed to a step is the interval since the previous step started,
+/// so the phase and host costs that explain it belong to the previous frame,
+/// not the one running now. One instance holds exactly that previous frame
+/// until the next step replaces it.
+#[derive(Default)]
+struct FrameAttribution {
+    /// The previous frame's poll-phase costs.
+    phases: FramePhases,
+    /// The previous frame's host step report.
+    report: StepReport,
+    /// The previous frame's GPU call costs, when the backend reports them.
+    timings: Option<render::FrameTimings>,
+    /// The previous frame's audio drain cost.
+    audio_ms: f64,
+    /// The previous frame's whole wall-clock cost.
+    total_ms: f64,
+    /// Whether a frame has been attributed yet.
+    valid: bool,
+}
+
+impl FrameAttribution {
+    /// Records the frame that just completed.
+    fn record(
+        &mut self,
+        phases: FramePhases,
+        report: StepReport,
+        timings: Option<render::FrameTimings>,
+        audio_ms: f64,
+        total_ms: f64,
+    ) {
+        self.phases = phases;
+        self.report = report;
+        self.timings = timings;
+        self.audio_ms = audio_ms;
+        self.total_ms = total_ms;
+        self.valid = true;
+    }
+
+    /// Formats the single slow-frame line for `gap_ms`, or `None` when the
+    /// gap is below the threshold or no previous frame exists yet.
+    ///
+    /// The named phases and host/GPU costs are the previous frame's, because
+    /// the gap spans it. `platform_wait` and `input` are this step's
+    /// measurement; `unaccounted` is `gap - previous total - platform wait`,
+    /// so a non-zero value is loop overhead or a stall outside both the
+    /// frame and the event poll.
+    fn slow_frame_line(&self, gap_ms: f64, pacing: FramePacing) -> Option<String> {
+        if !self.valid || gap_ms < SLOW_FRAME_MS {
+            return None;
+        }
+        let phases = &self.phases;
+        let report = &self.report;
+        let timings = self.timings.unwrap_or_default();
+        let unaccounted = gap_ms - self.total_ms - pacing.poll_ms;
+        Some(format!(
+            "frame {} slow: gap={gap_ms:.1} ms since the previous frame; \
+             the gap spans the previous frame, so these are its phases: \
+             timer={:.1} sound={:.1} video={:.1} async={:.1} continuous={:.1} \
+             project_and_render={:.1} body={:.1}; its host: audio={:.1} \
+             host_sync={:.1} host_project={:.1} host_render={:.1} total={:.1}; \
+             its gpu: acquire={:.1} present={:.1} recreate={:.1} fence_wait={:.1}; \
+             this wait: platform_wait={:.1} input={:.1} unaccounted={unaccounted:.1} ms",
+            report.frame_index,
+            phases.timer_ms,
+            phases.sound_ms,
+            phases.video_ms,
+            phases.async_trigger_ms,
+            phases.continuous_handler_ms,
+            phases.project_and_render_ms,
+            phases.body_ms,
+            self.audio_ms,
+            report.sync_ms,
+            report.project_ms,
+            report.render_ms,
+            self.total_ms,
+            timings.acquire_ms,
+            timings.present_ms,
+            timings.recreate_ms,
+            timings.fence_wait_ms,
+            pacing.poll_ms,
+            pacing.input_ms,
+        ))
+    }
+}
+
 /// A running game: the L4 VM host bound to the render host's scene and the
 /// mounted game storage.
 ///
@@ -201,6 +289,9 @@ pub struct GameHost {
     now_ms: u64,
     /// Wall-clock instant the open sequence started.
     open_start: Instant,
+    /// The previous frame's measured attribution, reported when the next gap
+    /// is slow.
+    last_frame: FrameAttribution,
     /// Whether the first frame's timing has been logged.
     first_frame_logged: bool,
 }
@@ -321,6 +412,7 @@ impl GameHost {
             polls: Polls::default(),
             now_ms: 0,
             open_start,
+            last_frame: FrameAttribution::default(),
             first_frame_logged: false,
         })
     }
@@ -364,7 +456,33 @@ impl GameHost {
     /// counters (they exist on the null backend only, see [`StepReport::stats`]);
     /// the windowed loop ignores them.
     pub fn step(&mut self, dt_ms: f32, events: &[PlatformEvent]) -> Result<StepReport, GameError> {
+        self.step_with_pacing(dt_ms, events, FramePacing::default())
+    }
+
+    /// Runs one frame exactly like [`Self::step`], but attributes a slow gap
+    /// with the platform loop's own `pacing` measurement.
+    ///
+    /// The line a slow gap produces names the **previous** frame: the gap is
+    /// the interval since that frame started, so its phases and host/GPU
+    /// costs are what explain the gap, while the newly-finished frame's own
+    /// costs are reported by the next slow line. `platform_wait` and `input`
+    /// are this step's wait, and `unaccounted` closes the budget.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::step`].
+    pub fn step_with_pacing(
+        &mut self,
+        dt_ms: f32,
+        events: &[PlatformEvent],
+        pacing: FramePacing,
+    ) -> Result<StepReport, GameError> {
         let dt = f64::from(dt_ms.max(0.0));
+        // The gap spans the previous frame, so attribute it before this step
+        // overwrites the stored frame.
+        if let Some(line) = self.last_frame.slow_frame_line(dt, pacing) {
+            log::warn!("{line}");
+        }
         self.polls.dt_ms = dt;
         self.polls.phases = FramePhases::default();
         self.now_ms = self.now_ms.saturating_add(dt as u64);
@@ -382,12 +500,14 @@ impl GameHost {
         let report = self.host.step(dt_ms)?;
         let total_ms = step_started.elapsed().as_secs_f64() * 1000.0;
 
-        // The gap is the platform's wall-clock frame period, the same value
-        // the audio drain caps against; a gap this long also produces the
-        // audio warning, so the attribution line explains it.
-        if dt >= SLOW_FRAME_MS {
-            self.log_slow_frame(dt, audio_ms, &report, total_ms);
-        }
+        self.last_frame.record(
+            self.polls.phases,
+            report,
+            self.host.last_frame_timings(),
+            audio_ms,
+            total_ms,
+        );
+
         if !self.first_frame_logged {
             self.first_frame_logged = true;
             log::info!(
@@ -396,29 +516,6 @@ impl GameHost {
             );
         }
         Ok(report)
-    }
-
-    /// Emits the one warning line a slow frame gets, naming every measured
-    /// phase on it.
-    fn log_slow_frame(&self, gap_ms: f64, audio_ms: f64, report: &StepReport, total_ms: f64) {
-        let phases = &self.polls.phases;
-        log::warn!(
-            "frame {} slow: gap={gap_ms:.1} ms since the previous frame; \
-             timer={:.1} sound={:.1} video={:.1} async={:.1} continuous={:.1} \
-             project_and_render={:.1} body={:.1}; audio={audio_ms:.1} \
-             host_sync={:.1} host_project={:.1} host_render={:.1} total={total_ms:.1} ms",
-            report.frame_index,
-            phases.timer_ms,
-            phases.sound_ms,
-            phases.video_ms,
-            phases.async_trigger_ms,
-            phases.continuous_handler_ms,
-            phases.project_and_render_ms,
-            phases.body_ms,
-            report.sync_ms,
-            report.project_ms,
-            report.render_ms,
-        );
     }
 }
 
@@ -541,4 +638,125 @@ fn run_startup(
         log::warn!("startup: {name}: {error}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds a valid attribution for `frame` whose body spent `body_ms` in
+    /// the `project_and_render` phase.
+    fn attribution_for(frame: u64, body_ms: f64, host_render_ms: f64) -> FrameAttribution {
+        let mut attribution = FrameAttribution::default();
+        attribution.record(
+            FramePhases {
+                project_and_render_ms: body_ms,
+                body_ms,
+                ..FramePhases::default()
+            },
+            StepReport {
+                frame_index: frame,
+                render_ms: host_render_ms,
+                ..StepReport::default()
+            },
+            Some(render::FrameTimings {
+                acquire_ms: 1.5,
+                present_ms: 2.5,
+                recreate_ms: 0.0,
+                fence_wait_ms: 0.5,
+            }),
+            3.0,
+            body_ms + host_render_ms + 3.0,
+        );
+        attribution
+    }
+
+    /// A fast frame emits nothing, even from a frame that was itself slow.
+    #[test]
+    fn fast_gap_emits_nothing() {
+        let attribution = attribution_for(7, 480.0, 10.0);
+        assert!(
+            attribution
+                .slow_frame_line(16.0, FramePacing::default())
+                .is_none()
+        );
+    }
+
+    /// The first frame has no predecessor, so a large gap for it emits
+    /// nothing rather than attributing a frame that never ran.
+    #[test]
+    fn first_frame_emits_nothing() {
+        let attribution = FrameAttribution::default();
+        assert!(
+            attribution
+                .slow_frame_line(900.0, FramePacing::default())
+                .is_none()
+        );
+    }
+
+    /// The slow line names the **previous** frame and accounts the gap as
+    /// `previous total + platform wait + unaccounted`.
+    #[test]
+    fn slow_line_names_the_previous_frame_and_balances_the_gap() {
+        let attribution = attribution_for(7, 480.0, 10.0);
+        let timings = attribution.timings.expect("timings recorded");
+        let line = attribution
+            .slow_frame_line(
+                520.0,
+                FramePacing {
+                    poll_ms: 15.0,
+                    input_ms: 4.0,
+                },
+            )
+            .expect("slow gap emits a line");
+
+        assert!(line.contains("frame 7 slow"), "line was: {line}");
+        assert!(
+            line.contains("project_and_render=480.0"),
+            "line was: {line}"
+        );
+        assert!(line.contains("body=480.0"), "line was: {line}");
+        assert!(line.contains("host_render=10.0"), "line was: {line}");
+        assert!(line.contains("acquire=1.5"), "line was: {line}");
+        assert!(line.contains("present=2.5"), "line was: {line}");
+        assert!(line.contains("fence_wait=0.5"), "line was: {line}");
+        assert!(line.contains("platform_wait=15.0"), "line was: {line}");
+        assert!(line.contains("input=4.0"), "line was: {line}");
+        // total was 480 + 10 + 3 = 493, so 520 - 493 - 15 = 12 unaccounted.
+        assert!(line.contains("unaccounted=12.0"), "line was: {line}");
+        assert!(line.contains("total=493.0"), "line was: {line}");
+        assert_eq!(timings.present_ms, 2.5);
+    }
+
+    /// After the next frame is recorded, the following slow gap names that
+    /// new frame, not the old one: the attribution tracks the last frame.
+    #[test]
+    fn slow_line_follows_the_most_recent_frame() {
+        let mut attribution = attribution_for(7, 480.0, 10.0);
+        let first = attribution
+            .slow_frame_line(520.0, FramePacing::default())
+            .expect("first slow line");
+        assert!(first.contains("frame 7 slow"), "line was: {first}");
+
+        attribution.record(
+            FramePhases {
+                timer_ms: 250.0,
+                body_ms: 250.0,
+                ..FramePhases::default()
+            },
+            StepReport {
+                frame_index: 8,
+                ..StepReport::default()
+            },
+            None,
+            0.0,
+            300.0,
+        );
+        let second = attribution
+            .slow_frame_line(320.0, FramePacing::default())
+            .expect("second slow line");
+        assert!(second.contains("frame 8 slow"), "line was: {second}");
+        assert!(second.contains("timer=250.0"), "line was: {second}");
+        assert!(!second.contains("frame 7"), "line was: {second}");
+    }
 }

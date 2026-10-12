@@ -259,8 +259,9 @@ mod android_entry {
     ///   (`RUST_LOG` selects the filter when it is set; otherwise the launcher's
     ///   log level does);
     /// * [`FileSink`] on `<filesDir>/krkr.log`, the file the launcher's Logs
-    ///   screen reads. It is capped at [`log_file::LOG_MAX_BYTES`] and rotates
-    ///   once, so a long session cannot fill the device's storage.
+    ///   screen reads. It is capped at [`log_file::LOG_MAX_BYTES`] and keeps
+    ///   [`log_file::LOG_ROTATED_FILES`] rotations, so a long or failure-heavy
+    ///   session cannot fill the device's storage.
     ///
     /// `RUST_LOG` keeps its precedence for anyone who can set it; a device
     /// cannot, so the launcher's level is what a device uses. `level` is the

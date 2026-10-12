@@ -264,6 +264,98 @@ impl SearchTrace {
     }
 }
 
+/// The auto-path candidates tried for one miss, grouped by resolution shape.
+///
+/// A folder entry's candidate is the entry (minus a trailing slash) plus the
+/// base name; an archive entry (`arc.xp3>dir`) appends the base to the entry.
+/// The first entry of each shape prints its full candidate; the rest print only
+/// the entry, because the shape's rule is already shown once. That names every
+/// entry and every candidate while keeping a 41-entry list from repeating the
+/// same boilerplate on each line.
+struct AutoPathTrace {
+    /// The storage-relative base name every candidate appends.
+    base: String,
+    /// Folder candidates (a `/` is inserted before the base).
+    folders: ShapeEntries,
+    /// Archive candidates (`arc.xp3>dir` plus the base).
+    archives: ShapeEntries,
+}
+
+impl AutoPathTrace {
+    /// Creates a trace for the given base name.
+    fn new(base: &str) -> Self {
+        Self {
+            base: base.to_string(),
+            folders: ShapeEntries::default(),
+            archives: ShapeEntries::default(),
+        }
+    }
+
+    /// Records one folder auto-path entry and its candidate.
+    fn record_folder(&mut self, entry: &str, candidate: String) {
+        self.folders.record(entry, candidate);
+    }
+
+    /// Records one archive auto-path entry and its candidate.
+    fn record_archive(&mut self, entry: &str, candidate: String) {
+        self.archives.record(entry, candidate);
+    }
+
+    /// Whether any auto-path entry was recorded.
+    fn is_empty(&self) -> bool {
+        self.folders.is_empty() && self.archives.is_empty()
+    }
+
+    /// Renders the grouped list: the base rule once, then per shape the full
+    /// first candidate and the remaining entries.
+    fn render(&self) -> String {
+        let mut out = String::from("auto paths (later added first; candidates append \"");
+        out.push_str(&self.base);
+        out.push_str("\"): ");
+        let sections: Vec<String> = [&self.folders, &self.archives]
+            .into_iter()
+            .filter_map(ShapeEntries::render)
+            .collect();
+        out.push_str(&sections.join("; "));
+        out
+    }
+}
+
+/// The entries of one resolution shape and the first entry's full candidate.
+#[derive(Default)]
+struct ShapeEntries {
+    /// The full candidate of the first entry of the shape.
+    example: Option<String>,
+    /// The entries after the first, in search order.
+    rest: Vec<String>,
+}
+
+impl ShapeEntries {
+    /// Records one entry of the shape; the first also keeps its candidate.
+    fn record(&mut self, entry: &str, candidate: String) {
+        if self.example.is_none() {
+            self.example = Some(candidate);
+        } else {
+            self.rest.push(entry.to_string());
+        }
+    }
+
+    /// Whether this shape recorded no entries.
+    fn is_empty(&self) -> bool {
+        self.example.is_none()
+    }
+
+    /// Renders the shape, or `None` when it has no entries.
+    fn render(&self) -> Option<String> {
+        let example = self.example.as_ref()?;
+        if self.rest.is_empty() {
+            Some(example.clone())
+        } else {
+            Some(format!("{example} (also {})", self.rest.join(", ")))
+        }
+    }
+}
+
 /// Metadata returned for a resolved storage entry.
 ///
 /// XP3 indexes carry the uncompressed file size but no timestamps, so archive
@@ -649,9 +741,10 @@ impl Storage {
     /// is collapsed into "not found".
     ///
     /// A miss logs one `debug` line naming every location tried (disk
-    /// spellings, auto-path candidates, mounted archives in later-first order,
-    /// or the explicit `arc.xp3>path` interpretation). A hit logs nothing, and
-    /// the trace is only built when debug logging is enabled.
+    /// spellings, auto-path candidates grouped by resolution shape, mounted
+    /// archives in later-first order, or the explicit `arc.xp3>path`
+    /// interpretation). A hit logs nothing, and the trace is only built when
+    /// debug logging is enabled.
     ///
     /// Storage names are case-insensitive even when the host filesystem is
     /// not. Only the storage-relative part is normalized; the mount prefix
@@ -701,29 +794,36 @@ impl Storage {
         // Auto paths, last added first (the reference's "later added wins").
         // Each auto path's candidate table is built once and cached, so the
         // lookup is an in-memory hit rather than a directory probe. Archive
-        // prefixes are opened on demand when the table is built.
-        if !self.auto_paths.is_empty() {
-            trace.attempt(|| {
-                let order: Vec<&str> = self.auto_paths.iter().rev().map(String::as_str).collect();
-                format!("auto paths, later added first: [{}]", order.join(", "))
-            });
-        }
+        // prefixes are opened on demand when the table is built. The trace
+        // groups the entries by resolution shape, so a 41-entry list names each
+        // entry once instead of repeating the candidate boilerplate per line.
+        let mut auto_trace = if trace.enabled {
+            Some(AutoPathTrace::new(base))
+        } else {
+            None
+        };
         for entry in self.auto_paths.iter().rev() {
             if let Some((arc, dir)) = entry.split_once('>') {
-                let in_archive = format!("{dir}{base}");
-                trace.attempt(|| format!("auto path {entry:?} -> {arc:?}>{in_archive:?}"));
+                if let Some(auto_trace) = auto_trace.as_mut() {
+                    auto_trace.record_archive(entry, format!("{arc}>{dir}{base}"));
+                }
             } else {
                 let dir = entry.trim_end_matches('/');
                 if dir.is_empty() {
                     continue;
                 }
-                trace.attempt(|| format!("auto path {entry:?} -> {dir}/{base}"));
+                if let Some(auto_trace) = auto_trace.as_mut() {
+                    auto_trace.record_folder(entry, format!("{dir}/{base}"));
+                }
             }
             match self.auto_path_table(entry)?.lookup(base) {
                 Some(AutoPathHit::File(location)) => return Ok(Some(location)),
                 Some(AutoPathHit::Directory) => continue,
                 None => {}
             }
+        }
+        if let Some(auto_trace) = auto_trace.filter(|trace| !trace.is_empty()) {
+            trace.attempt(|| auto_trace.render());
         }
 
         // Mounted archives, later mounts first (later-mounted wins — see
@@ -1852,4 +1952,130 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
         pi += 1;
     }
     pi == pat.len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    thread_local! {
+        /// Log lines written on this thread since the last clear. Tests run in
+        /// parallel, so the capture is per-thread.
+        static LINES: std::cell::RefCell<Vec<String>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// A `log` sink that records every record on the calling thread.
+    struct CaptureLogger;
+
+    impl log::Log for CaptureLogger {
+        fn enabled(&self, _metadata: &log::Metadata) -> bool {
+            true
+        }
+
+        fn log(&self, record: &log::Record) {
+            LINES.with(|lines| lines.borrow_mut().push(record.args().to_string()));
+        }
+
+        fn flush(&self) {}
+    }
+
+    /// Installs the recording sink once per test binary, clears this thread's
+    /// buffer, runs `f`, and returns its result plus the thread's log lines.
+    fn capture<R>(f: impl FnOnce() -> R) -> (R, Vec<String>) {
+        static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        ONCE.get_or_init(|| {
+            let _ = log::set_boxed_logger(Box::new(CaptureLogger));
+            log::set_max_level(log::LevelFilter::Debug);
+        });
+        LINES.with(|lines| lines.borrow_mut().clear());
+        let result = f();
+        let lines = LINES.with(|lines| lines.borrow().clone());
+        (result, lines)
+    }
+
+    /// Writes one file into an in-memory root, creating parent directories.
+    fn write_mem(fs: &FileSystem, path: &str, data: &[u8]) {
+        let path_obj = Path::new(path);
+        if let Some(parent) = path_obj.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(fs, &FsPath::host(parent)).expect("create parent dirs");
+        }
+        let file = fs::open(fs, &FsPath::host(path), OpenMode::Write).expect("open memory file");
+        fs::write_at(fs, &file, 0, data).expect("write memory file");
+        fs::flush(fs, &file).expect("flush memory file");
+    }
+
+    /// The shape grouping keeps the first candidate of each shape literal and
+    /// collapses the rest to the entry name, so the candidate rule is stated
+    /// once without losing any searched location.
+    #[test]
+    fn auto_path_trace_groups_by_shape() {
+        let mut trace = AutoPathTrace::new("config.tjs");
+        trace.record_folder("parts/", "parts/config.tjs".to_string());
+        trace.record_folder("other/", "other/config.tjs".to_string());
+        trace.record_archive("data.xp3>system/", "data.xp3>system/config.tjs".to_string());
+
+        let rendered = trace.render();
+        assert!(rendered.contains("parts/config.tjs"), "{rendered}");
+        assert!(rendered.contains("other/"), "{rendered}");
+        assert!(
+            rendered.contains("data.xp3>system/config.tjs"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("other/config.tjs"),
+            "the repeated candidate is collapsed: {rendered}"
+        );
+
+        // A folder entry without a trailing slash still shows the inserted
+        // separator in its example candidate.
+        let mut no_slash = AutoPathTrace::new("config.tjs");
+        no_slash.record_folder("nested", "nested/config.tjs".to_string());
+        assert_eq!(
+            no_slash.render(),
+            "auto paths (later added first; candidates append \"config.tjs\"): nested/config.tjs"
+        );
+    }
+
+    /// The 41-auto-path startup shape still names every entry after the
+    /// compaction; the line is far shorter than the old per-entry format.
+    #[test]
+    fn storage_miss_line_names_every_auto_path() {
+        const AUTO_PATHS: usize = 41;
+        let fs = FileSystem::memory();
+        for i in 0..AUTO_PATHS {
+            write_mem(&fs, &format!("/game/ap{i:02}/present.dat"), b"x");
+        }
+        let mut storage =
+            Storage::mount_archives(fs, "/game", std::iter::empty::<&str>()).expect("mount");
+        for i in 0..AUTO_PATHS {
+            storage.add_auto_path(format!("ap{i:02}/"));
+        }
+
+        let (found, logs) = capture(|| storage.find("missing000.txt"));
+        assert!(found.unwrap().is_none());
+        let miss = logs
+            .iter()
+            .find(|line| line.contains("storage miss"))
+            .expect("one miss line");
+
+        for i in 0..AUTO_PATHS {
+            assert!(
+                miss.contains(&format!("ap{i:02}/")),
+                "entry ap{i:02}/ is not named: {miss}"
+            );
+        }
+        assert!(miss.contains("ap40/missing000.txt"), "{miss}");
+        assert!(miss.contains("/game/missing000.txt"), "{miss}");
+        assert!(
+            !miss.contains("auto path \""),
+            "the per-entry boilerplate is gone: {miss}"
+        );
+        assert!(
+            miss.len() < 700,
+            "the compact miss line is still large: {miss}"
+        );
+    }
 }

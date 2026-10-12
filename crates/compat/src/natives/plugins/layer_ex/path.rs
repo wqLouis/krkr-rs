@@ -18,9 +18,9 @@
 use std::ffi::{c_char, c_int, c_void};
 
 use engine::raster::{flatten_arc, flatten_cubic};
-use tjs::{NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef, Value};
+use tjs::{NativeInstanceBuilder, NativeInstanceMethodDef, Value};
 
-use crate::native_util::{args, report_error, set_int, set_void};
+use crate::native_util::{args, report_error, set_void};
 use crate::{CompatCtx, CompatError};
 
 /// One closed or open figure of a path, already flattened to a polyline.
@@ -292,19 +292,6 @@ extern "C" fn ctor(
     let inst = unsafe { &mut *(instance as *mut PathInst) };
     inst.data = PathData::default();
     set_void(out);
-    0
-}
-
-/// Hidden property used by `Layer.drawPath` to recover this path's native
-/// payload (the ABI carries no cross-class native instance handle).
-extern "C" fn handle_get(
-    _engine: *mut c_void,
-    instance: *mut c_void,
-    out: *mut Value,
-    _out_error: *mut *mut c_char,
-    _objthis: *mut c_void,
-) -> c_int {
-    set_int(out, instance as usize as i64);
     0
 }
 
@@ -833,14 +820,6 @@ pub(super) fn method_defs() -> Vec<NativeInstanceMethodDef> {
     ]
 }
 
-pub(super) fn property_defs() -> Vec<NativeInstancePropertyDef> {
-    vec![NativeInstancePropertyDef {
-        name: "__handle",
-        get: Some(handle_get),
-        set: None,
-    }]
-}
-
 /// Register the `Path` class.
 pub(super) fn register_class(ctx: &mut CompatCtx) -> Result<(), CompatError> {
     let mut methods = vec![NativeInstanceMethodDef {
@@ -854,6 +833,6 @@ pub(super) fn register_class(ctx: &mut CompatCtx) -> Result<(), CompatError> {
         destroy,
         invalidate: None,
         methods,
-        properties: property_defs(),
+        properties: Vec::new(),
     })
 }

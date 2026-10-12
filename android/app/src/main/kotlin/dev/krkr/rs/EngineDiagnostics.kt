@@ -67,12 +67,30 @@ object EngineDiagnostics {
     fun engineLogFile(context: Context): File = File(context.filesDir, ENGINE_LOG)
 
     /**
-     * The one rotated engine log the Rust side keeps, `krkr.log.1`.
+     * Every engine log file, current first (`krkr.log`), then its rotations in
+     * order (`krkr.log.1`, `krkr.log.2`, …).
      *
-     * The engine caps the current file at 1 MiB and rotates once; a full-log
-     * export reads this file as well as [engineLogFile].
+     * The list is discovered from the files directory rather than a fixed pair
+     * or a Kotlin copy of the retention count, so it cannot drift from the Rust
+     * sink's policy: a new rotation simply appears, and one that is absent is
+     * simply not listed. The launcher's own `krkr-launcher.log` does not match —
+     * it starts with `krkr-`, not `krkr.log`.
      */
-    fun engineLogRotatedFile(context: Context): File = File(context.filesDir, "$ENGINE_LOG.1")
+    fun engineLogFiles(context: Context): List<File> =
+        context.filesDir.listFiles().orEmpty()
+            .filter { it.isFile && isEngineLogName(it.name) }
+            .sortedBy { engineLogOrder(it.name) }
+
+    /**
+     * The raw state file for display, or "" when it is missing or unreadable.
+     * Never throws: the state file's `message` is the most useful line for a
+     * failed title, so the Logs screen shows it as written, without parsing it.
+     */
+    fun stateText(context: Context): String {
+        val file = stateFile(context)
+        if (!file.isFile) return ""
+        return runCatching { file.readText() }.getOrDefault("")
+    }
 
     /**
      * The pending-launch marker file. Exposed so reconciliation can compare its
@@ -133,4 +151,17 @@ object EngineDiagnostics {
     fun clearLaunch(context: Context) {
         runCatching { launchFile(context).delete() }
     }
+}
+
+/** One engine log name: `krkr.log` or `krkr.log.<digits>`. */
+private fun isEngineLogName(name: String): Boolean {
+    if (name == EngineDiagnostics.ENGINE_LOG) return true
+    val suffix = name.removePrefix("${EngineDiagnostics.ENGINE_LOG}.")
+    return suffix != name && suffix.isNotEmpty() && suffix.all { it.isDigit() }
+}
+
+/** Sort key: the current file first, then rotation slot order. */
+private fun engineLogOrder(name: String): Int {
+    if (name == EngineDiagnostics.ENGINE_LOG) return 0
+    return name.removePrefix("${EngineDiagnostics.ENGINE_LOG}.").toIntOrNull() ?: Int.MAX_VALUE
 }
