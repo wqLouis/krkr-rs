@@ -268,7 +268,7 @@ fn read_filter_script(services: &CompatServices) -> Result<Option<String>, Strin
         Err(StorageReadError::NotFound(_)) => return Ok(None),
         Err(error) => return Err(format!("could not read {FILTER_SCRIPT}: {error}")),
     };
-    crate::text::decode_text(&bytes, None).map(Some)
+    crate::text::decode_text(&bytes, crate::text::TextEncoding::Detect).map(Some)
 }
 
 /// Execute the `xp3filter.tjs` source read at registration.

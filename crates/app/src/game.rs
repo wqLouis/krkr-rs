@@ -307,7 +307,10 @@ impl GameHost {
 
         let plan = storage.startup_plan()?;
         let startup_started = Instant::now();
-        run_startup(&vm, &storage, &plan, &stats)?;
+        vm.compat().begin_native_timing();
+        let startup_result = run_startup(&vm, &storage, &plan, &stats);
+        vm.compat().end_native_timing();
+        startup_result?;
         let startup_time = startup_started.elapsed();
         log_startup(&storage, &stats, mount_time, startup_time);
         Ok(Self {

@@ -71,7 +71,7 @@ crates/platform/render/src/glyph.rs:222:debug-assert — internal rasterizer inv
 # --- pub(crate) thiserror error enums, never matched variant-by-variant
 #     (audit §7) -----------------------------------------------------------
 crates/compat/src/natives/sound.rs:172:#[non_exhaustive] — SliError is a pub(crate) thiserror error enum, not a discriminant
-crates/compat/src/resource.rs:673:non-exhaustive — PrerenderedFontError is a pub(crate) thiserror error enum, not a discriminant
+crates/compat/src/resource.rs:673:#[non_exhaustive] — PrerenderedFontError is a pub(crate) thiserror error enum, not a discriminant
 
 # --- event `type`/`target` writes: the dictionary is created immediately
 #     above and the id is just retained, so the `TJS_MEMBERENSURE` write

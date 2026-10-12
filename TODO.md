@@ -19,6 +19,7 @@ re-opened. History is read with `git log`.
 * **Tests** carry a `reference/cpp/...:line` citation above every behaviour assertion. An assertion without one is not evidence.
 * **Printed/logged text must not use internal jargon** (`L1`–`L4`, decision numbers). Tests are exempt.
 * **D32:** only the Android backend may be stubbed; L3 may not stub and may not approximate. `#[allow(dead_code)]` is banned (one exception: `crates/compat/tests/common/mod.rs`).
+* **Evidence** (D36): a compatibility claim names what was asserted and where — host test, device run, or both — and a knowingly-left divergence is recorded as an approximation, not an "unobservable". An engine release needs at least one real KiriKiri title run on a real device with its log captured (`<filesDir>/krkr.log`; §11 and `docs/android.md` §7).
 * **Traps that cost real time live in `AGENTS.md` §9** and are deliberately not duplicated here.
 
 ## 1. The gate (run in this order)
@@ -274,8 +275,10 @@ Open:
 
 * `tjs/build.rs` is not target-aware (`docs/android.md` §2).
 * Audio focus / lifecycle handling.
-* On-device validation of everything: startup, decode, render, MediaCodec,
-  `memfd`, touch mapping, surface recreation.
+* On-device validation of everything (D36): startup, decode, render, MediaCodec,
+  `memfd`, touch mapping, surface recreation, and **font resolution** (the
+  system directories are populated and a requested face loads) — captured in
+  `<filesDir>/krkr.log`. No release without this run.
 * Surface recreation restarts the game (`docs/audits/android-jni-review.md` F5).
 * No drift guard between the Kotlin option constants (`RuntimeSettings.kt`) and
   the Rust ones (`api::config`) — they agree today by hand.

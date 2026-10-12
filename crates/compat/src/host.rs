@@ -100,6 +100,24 @@ impl CompatHost {
         self.bound
     }
 
+    /// Opens the per-native dispatch-timing window (the startup sequence).
+    ///
+    /// Call before the startup scripts run; pair with
+    /// [`Self::end_native_timing`]. The counters live in the host's dispatch
+    /// state and the window is closed again before the first frame, so the
+    /// frame path is never timed.
+    pub fn begin_native_timing(&self) {
+        crate::natives::begin_native_timing(self.services.as_ref());
+    }
+
+    /// Closes the per-native dispatch-timing window and emits the one report
+    /// line: the top members by total milliseconds with call counts, at `info`
+    /// when a single native reached the documented threshold and at `debug`
+    /// otherwise.
+    pub fn end_native_timing(&self) {
+        crate::natives::end_native_timing(self.services.as_ref());
+    }
+
     /// A dispatch context handle for the bound VM.
     ///
     /// Returns [`CompatError::Engine`] before [`Self::install`], so the

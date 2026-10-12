@@ -40,7 +40,7 @@ use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
 use std::ptr;
 
-use engine::{Location, Storage};
+use engine::{Location, Storage, StorageReadError};
 use tjs::{Engine, NativeClassBuilder, NativeMethodDef, VAL_OBJECT, VAL_STRING, Value};
 
 use crate::binding;
@@ -153,7 +153,30 @@ fn attached_storage(services: &CompatServices) -> Option<*mut Storage> {
     services.storage()
 }
 
+/// Formats a storage error for a `Storages` member.
+///
+/// A message that originates in the reference is raised verbatim:
+/// `TVPInvalidPathName` is `"Invalid path name %1"`
+/// (`reference/cpp/core/base/MsgIntfInc.h:28`) and is thrown from
+/// `TVPNormalizeStorageName` when a `..` escapes the mount
+/// (`reference/cpp/core/base/StorageIntf.cpp:400`). A message that is ours has
+/// no reference counterpart, so it keeps the `Storages.<member>: ` prefix that
+/// says which member failed.
+fn storage_error_message(member: &str, error: &StorageReadError) -> String {
+    match error {
+        StorageReadError::InvalidPathName(_) => error.to_string(),
+        _ => format!("Storages.{member}: {error}"),
+    }
+}
+
 /// Compute the placed path for `name` through the L2 [`Storage::find`].
+///
+/// Documented approximation of `TVPGetPlacedPath`
+/// (`reference/cpp/core/base/StorageIntf.cpp:1061-1097`): the reference returns
+/// the normalized absolute path it resolved (`CurrentPath` plus the request, or
+/// the absolute auto-path prefix plus the base name), while this returns the
+/// game-directory-relative disk path and `archive-file-name>in-archive-path`.
+/// Both still resolve back to the same storage through `find`/`read`.
 fn compute_placed_path(storage: &Storage, name: &str) -> Result<String, String> {
     match storage.find(name) {
         Ok(Some(Location::Disk(path))) => {
@@ -171,7 +194,7 @@ fn compute_placed_path(storage: &Storage, name: &str) -> Result<String, String> 
             Ok(format!("{archive}>{in_archive}"))
         }
         Ok(None) => Ok(String::new()),
-        Err(error) => Err(format!("Storages.getPlacedPath: {error}")),
+        Err(error) => Err(storage_error_message("getPlacedPath", &error)),
     }
 }
 
@@ -358,7 +381,10 @@ extern "C" fn native_is_existent_storage(
             set_bool(out, exists);
             0
         }
-        Err(error) => report_error(out_error, &format!("Storages.isExistentStorage: {error}")),
+        Err(error) => report_error(
+            out_error,
+            &storage_error_message("isExistentStorage", &error),
+        ),
     }
 }
 
@@ -453,10 +479,14 @@ extern "C" fn native_clear_archive_cache(
     let ctx = resolved.ctx();
     // SAFETY: `resolve_or_return!` only succeeds for the installed, live binding.
     let services = unsafe { ctx.services() };
-    // The L2 mounts parse their indexes eagerly and hold them for the storage
-    // lifetime, so there is no archive cache to drop; the only cache is the L3
+    // The reference clears both the archive cache and the auto-path cache in
+    // `TVPClearStorageCaches`; drop the L2 resolver tables as well as the L3
     // placed-path cache (the reference's `TVPAutoPathCache`).
     services.state::<PlacedCache>().0.clear();
+    if let Some(storage) = attached_storage(services) {
+        // SAFETY: the host keeps the attached storage alive for the VM lifetime.
+        unsafe { &mut *storage }.clear_resolution_cache();
+    }
     log::debug!("Storages.clearArchiveCache: cleared the placed-path cache");
     set_void(out);
     0
@@ -502,9 +532,9 @@ extern "C" fn native_get_local_name(
                 set_string_out(out, services, &name);
                 0
             }
-            Err(error) => report_error(out_error, &format!("Storages.getLocalName: {error}")),
+            Err(error) => report_error(out_error, &storage_error_message("getLocalName", &error)),
         },
-        Err(error) => report_error(out_error, &format!("Storages.getLocalName: {error}")),
+        Err(error) => report_error(out_error, &storage_error_message("getLocalName", &error)),
     }
 }
 
@@ -623,4 +653,31 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
         ],
         properties: vec![],
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A reference-originated error is raised verbatim; our own diagnostics
+    /// keep the member prefix.
+    ///
+    /// Reference: `TVPInvalidPathName` is `"Invalid path name %1"`
+    /// (`reference/cpp/core/base/MsgIntfInc.h:28`), thrown from
+    /// `TVPNormalizeStorageName` when a `..` escapes the mount
+    /// (`reference/cpp/core/base/StorageIntf.cpp:400`).
+    #[test]
+    fn invalid_path_name_raises_the_reference_string_verbatim() {
+        let error = StorageReadError::InvalidPathName("../../x".to_string());
+        assert_eq!(
+            storage_error_message("isExistentStorage", &error),
+            "Invalid path name ../../x"
+        );
+
+        let error = StorageReadError::NotFound("x".to_string());
+        assert_eq!(
+            storage_error_message("isExistentStorage", &error),
+            "Storages.isExistentStorage: storage not found: x"
+        );
+    }
 }

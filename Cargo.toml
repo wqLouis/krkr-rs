@@ -46,6 +46,13 @@ ash = "0.38"
 raw-window-handle = "0.6"
 winit = "0.30"
 flate2 = "1"
+# Script text decoding: `chardetng` detects the charset of BOM-less
+# legacy-encoded scripts (the maintained successor of the reference's uchardet
+# detector) and `encoding_rs` performs the bulk decode from the reported
+# charset. Hand-rolled per-encoding byte tables cannot replace them: the legacy
+# East-Asian charsets overlap byte-for-byte.
+chardetng = "1"
+encoding_rs = "0.8"
 # Video decode (Linux): maintained FFmpeg binding. Linked dynamically through
 # pkg-config (the `static` feature is deliberately *not* enabled). The media
 # crate consumes it through the optional `video-ffmpeg` feature; Android uses

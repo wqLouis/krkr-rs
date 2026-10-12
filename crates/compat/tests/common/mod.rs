@@ -113,6 +113,11 @@ impl Env {
         self._game_dir.as_ref()
     }
 
+    /// The mounted L2 storage, for tests that inspect its read counter.
+    pub fn storage(&self) -> Option<&Storage> {
+        self._storage.as_deref()
+    }
+
     /// The VM the harness is bound to (for the shared [`eval_then`]
     /// helper, which takes the engine rather than an [`Env`]).
     pub fn engine(&self) -> &Tjs2Engine {

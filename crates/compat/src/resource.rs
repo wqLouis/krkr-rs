@@ -10,6 +10,7 @@
 //! [`resolve_face`].
 #![allow(unsafe_code)]
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -19,7 +20,7 @@ use engine::text::{
     CoverageMask, FontId, TextCoverageCache, TextEngine, TextStyle, blit_coverage_into,
     blur_coverage, blurred_text_coverage, compose_text_into, rasterize_text_coverage,
 };
-use engine::{BitmapState, StorageReadError};
+use engine::{BitmapState, Location, Storage, StorageReadError};
 use tjs::{Tjs2Engine, TjsValue, Value};
 
 use crate::CompatCtx;
@@ -56,7 +57,7 @@ pub(crate) struct ResourceResolver {
     probe: Option<Rc<ProbeFn>>,
     /// Host image encoder/saver.
     save: Option<Rc<SaveFn>>,
-    /// Loaded pre-rendered fonts, keyed by the requested storage spelling.
+    /// Loaded pre-rendered fonts, keyed by the resolved placed path.
     prerendered_storage: HashMap<String, Rc<PrerenderedFont>>,
     /// Font-value → pre-rendered font mappings, in registration order.
     prerendered: Vec<(PrerenderedKey, Rc<PrerenderedFont>)>,
@@ -117,10 +118,11 @@ impl ResourceResolver {
 
     /// Maps the font value `key` to the pre-rendered font `storage`.
     ///
-    /// The storage is read and validated now; a missing or malformed file is
-    /// reported, matching `TVPMapPrerenderedFont`
-    /// (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:127-167`) and
-    /// `tTVPPrerenderedFont` (`reference/cpp/core/visual/PrerenderedFont.cpp:9-76`).
+    /// The storage is resolved and its header validated now; the glyph body is
+    /// read on first use. The reference reads and holds the whole file but
+    /// validates only the header here too, so deferring the body (and the
+    /// index-bounds check the reference leaves unchecked) is not
+    /// script-observable (`reference/cpp/core/visual/PrerenderedFont.cpp:9-76`).
     pub(crate) fn map_prerendered(
         &mut self,
         ctx: &CompatCtx,
@@ -167,15 +169,14 @@ impl ResourceResolver {
             .map(|(_, font)| Rc::clone(font))
     }
 
-    /// Loads (or reuses) the pre-rendered font object for `storage`.
+    /// Loads (or reuses) the pre-rendered font for `storage`, shared by
+    /// resolved placed path (`TVPPrerenderedFonts`,
+    /// `reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:129-147`).
     fn load_prerendered(
         &mut self,
         ctx: &CompatCtx,
         storage: &str,
     ) -> Result<Rc<PrerenderedFont>, String> {
-        if let Some(font) = self.prerendered_storage.get(storage) {
-            return Ok(Rc::clone(font));
-        }
         // SAFETY: the caller resolved `ctx` from the installed binding.
         let services = unsafe { ctx.services() };
         let Some(store) = services.storage() else {
@@ -184,16 +185,16 @@ impl ResourceResolver {
         // SAFETY: the host keeps the attached storage alive for the binding's
         // lifetime (the `attach_storage` contract).
         let store = unsafe { &*store };
-        let bytes = match store.read(storage) {
-            Ok(bytes) => bytes,
-            Err(StorageReadError::NotFound(_)) => {
-                return Err(format!("Cannot find storage {storage}"));
-            }
-            Err(error) => return Err(error.to_string()),
+        let Some(location) = store.find(storage).map_err(|error| error.to_string())? else {
+            return Err(format!("Cannot find storage {storage}"));
         };
-        let font = Rc::new(PrerenderedFont::parse(bytes).map_err(|error| error.to_string())?);
+        let placed_path = placed_path_key(&location);
+        if let Some(font) = self.prerendered_storage.get(&placed_path) {
+            return Ok(Rc::clone(font));
+        }
+        let font = Rc::new(PrerenderedFont::map(store, storage)?);
         self.prerendered_storage
-            .insert(storage.to_string(), Rc::clone(&font));
+            .insert(placed_path, Rc::clone(&font));
         Ok(font)
     }
 
@@ -388,11 +389,12 @@ pub(crate) fn draw_text_into_bitmap(
         angle: angle_tenths.round() as i32,
     };
     if let Some(prerendered) = resolver.prerendered_for(&key) {
+        let body = prerendered.ensure_body(ctx)?;
         return draw_prerendered_text(
             resolver,
             bitmap,
             font,
-            &prerendered,
+            &body,
             size_px,
             &style,
             angle_tenths,
@@ -508,7 +510,7 @@ fn draw_prerendered_text(
     resolver: &ResourceResolver,
     bitmap: &mut BitmapState,
     font: FontId,
-    prerendered: &PrerenderedFont,
+    body: &PrerenderedBody,
     size_px: f32,
     style: &TextStyle,
     angle_tenths: f64,
@@ -534,11 +536,9 @@ fn draw_prerendered_text(
     let mut pen_y = params.y as f64;
     let mut glyphs: Vec<PrerenderedGlyph> = Vec::new();
     for unit in params.text.encode_utf16() {
-        if let Some(item) = prerendered.find_code_unit(unit) {
+        if let Some(item) = body.find_code_unit(unit) {
             if item.width != 0 && item.height != 0 {
-                let coverage = prerendered
-                    .retrieve(&item)
-                    .map_err(|error| error.to_string())?;
+                let coverage = body.retrieve(&item).map_err(|error| error.to_string())?;
                 let mask = CoverageMask::new(
                     0.0,
                     0.0,
@@ -715,12 +715,58 @@ pub(crate) struct CharItem {
     pub(crate) inc: i16,
 }
 
-/// A parsed pre-rendered font.
+/// The fixed header of a `.tft`, validated when the font is mapped.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PrerenderedHeader {
+    /// Data version (0 or 1).
+    version: u8,
+    /// Number of entries in the sorted character index.
+    index_count: usize,
+    /// Offset of the sorted UTF-16 code units inside the file.
+    ch_index_offset: usize,
+    /// Offset of the character descriptors inside the file.
+    index_offset: usize,
+}
+
+/// Validates the fixed header from its first [`PRERENDERED_HEADER_LEN`] bytes.
 ///
-/// The header, character index and glyph data stay in the file image; a
-/// descriptor is read from it on demand instead of being copied into a
-/// parallel table.
-pub(crate) struct PrerenderedFont {
+/// # Errors
+///
+/// The same [`PrerenderedFontError`] the reference raises at map time
+/// (`reference/cpp/core/visual/PrerenderedFont.cpp:40-59`). A truncated,
+/// non-empty file is `InvalidSignature`: the reference `memcmp`s 22 bytes of a
+/// shorter allocation and then indexes `Image[23]` and the offset words out of
+/// bounds, so we raise a typed error rather than copy that defect.
+pub(crate) fn validate_header(prefix: &[u8]) -> Result<PrerenderedHeader, PrerenderedFontError> {
+    if prefix.len() < PRERENDERED_HEADER_LEN {
+        if prefix.is_empty() {
+            return Err(PrerenderedFontError::ZeroSize);
+        }
+        return Err(PrerenderedFontError::InvalidSignature);
+    }
+    if !prefix.starts_with(PRERENDERED_SIGNATURE) {
+        return Err(PrerenderedFontError::InvalidSignature);
+    }
+    if prefix[23] != 2 {
+        return Err(PrerenderedFontError::NotUnicode16);
+    }
+    let version = prefix[22];
+    if version != 0 && version != 1 {
+        return Err(PrerenderedFontError::InvalidVersion);
+    }
+    Ok(PrerenderedHeader {
+        version,
+        index_count: read_u32(prefix, 24)? as usize,
+        ch_index_offset: read_u32(prefix, 28)? as usize,
+        index_offset: read_u32(prefix, 32)? as usize,
+    })
+}
+
+/// A parsed pre-rendered font body.
+///
+/// The character index and glyph data stay in the file image; a descriptor is
+/// read from it on demand instead of being copied into a parallel table.
+pub(crate) struct PrerenderedBody {
     /// Data version (0 or 1).
     version: u8,
     /// Number of entries in the sorted character index.
@@ -733,34 +779,23 @@ pub(crate) struct PrerenderedFont {
     image: Vec<u8>,
 }
 
-impl PrerenderedFont {
-    /// Parses `bytes` as a `.tft`.
+impl PrerenderedBody {
+    /// Parses `bytes` as a `.tft` body, given the header validated at map
+    /// time.
     ///
     /// # Errors
     ///
-    /// Returns a [`PrerenderedFontError`] for a bad signature, wrong Unicode
-    /// width or version, an empty file, or a truncated/overflowing index.
-    pub(crate) fn parse(bytes: Vec<u8>) -> Result<Self, PrerenderedFontError> {
-        if bytes.len() < PRERENDERED_HEADER_LEN {
-            if bytes.is_empty() {
-                return Err(PrerenderedFontError::ZeroSize);
-            }
-            return Err(PrerenderedFontError::InvalidSignature);
-        }
-        if !bytes.starts_with(PRERENDERED_SIGNATURE) {
-            return Err(PrerenderedFontError::InvalidSignature);
-        }
-        if bytes[23] != 2 {
-            return Err(PrerenderedFontError::NotUnicode16);
-        }
-        let version = bytes[22];
-        if version != 0 && version != 1 {
-            return Err(PrerenderedFontError::InvalidVersion);
-        }
-
-        let index_count = read_u32(&bytes, 24)? as usize;
-        let ch_index_offset = read_u32(&bytes, 28)? as usize;
-        let index_offset = read_u32(&bytes, 32)? as usize;
+    /// Returns a [`PrerenderedFontError`] when the index points outside the
+    /// file or a size computation overflows. The reference never checks these
+    /// bounds at map time; failing here is the first-use analogue of the
+    /// reference's unchecked reads.
+    pub(crate) fn parse(
+        bytes: Vec<u8>,
+        header: &PrerenderedHeader,
+    ) -> Result<Self, PrerenderedFontError> {
+        let index_count = header.index_count;
+        let ch_index_offset = header.ch_index_offset;
+        let index_offset = header.index_offset;
 
         let ch_index_len = index_count
             .checked_mul(2)
@@ -779,7 +814,7 @@ impl PrerenderedFont {
         }
 
         Ok(Self {
-            version,
+            version: header.version,
             index_count,
             ch_index_offset,
             index_offset,
@@ -912,6 +947,90 @@ impl PrerenderedFont {
     }
 }
 
+/// A mapped pre-rendered font.
+///
+/// The fixed header is validated when the mapping is created; the whole file
+/// is read and its index bounds checked on first use. The reference reads the
+/// whole file at map time and holds it; here only the resolved storage name
+/// and the header are kept until a glyph is requested. The divergence is not
+/// observable through the script surface because the reference validates only
+/// the header at map time, and the index bounds we defer are unchecked reads
+/// there.
+pub(crate) struct PrerenderedFont {
+    /// The requested storage spelling, used for the first-use read.
+    storage: String,
+    /// The header validated at map time.
+    header: PrerenderedHeader,
+    /// The whole file, read once on first use.
+    body: RefCell<Option<Rc<PrerenderedBody>>>,
+}
+
+impl PrerenderedFont {
+    /// Reads and validates the fixed header of `storage` through `store`.
+    ///
+    /// # Errors
+    ///
+    /// The [`Storage::stat`]/[`Storage::read_prefix`] error as a string, the
+    /// header [`PrerenderedFontError`]s, or `Cannot find storage` when the
+    /// name does not resolve (`TVPSearchPlacedPath`,
+    /// `reference/cpp/core/base/StorageIntf.cpp:1111-1115`).
+    pub(crate) fn map(store: &Storage, storage: &str) -> Result<Self, String> {
+        let Some(meta) = store.stat(storage).map_err(|error| error.to_string())? else {
+            return Err(format!("Cannot find storage {storage}"));
+        };
+        if meta.size == 0 {
+            return Err(PrerenderedFontError::ZeroSize.to_string());
+        }
+        let prefix = store
+            .read_prefix(storage, PRERENDERED_HEADER_LEN)
+            .map_err(|error| error.to_string())?;
+        let header = validate_header(&prefix).map_err(|error| error.to_string())?;
+        Ok(Self {
+            storage: storage.to_string(),
+            header,
+            body: RefCell::new(None),
+        })
+    }
+
+    /// Reads and validates the whole file on first use, returning the cached
+    /// body.
+    ///
+    /// # Errors
+    ///
+    /// The storage error as a string when the file cannot be re-read, or the
+    /// index [`PrerenderedFontError`] when the deferred bounds check fails.
+    pub(crate) fn ensure_body(&self, ctx: &CompatCtx) -> Result<Rc<PrerenderedBody>, String> {
+        if let Some(body) = self.body.borrow().as_ref() {
+            return Ok(Rc::clone(body));
+        }
+        // SAFETY: the caller resolved `ctx` from the installed binding.
+        let services = unsafe { ctx.services() };
+        let Some(store) = services.storage() else {
+            return Err(format!("Cannot find storage {}", self.storage));
+        };
+        // SAFETY: the host keeps the attached storage alive for the binding's
+        // lifetime (the `attach_storage` contract).
+        let store = unsafe { &*store };
+        let bytes = store
+            .read(&self.storage)
+            .map_err(|error| error.to_string())?;
+        let body = Rc::new(
+            PrerenderedBody::parse(bytes, &self.header).map_err(|error| error.to_string())?,
+        );
+        *self.body.borrow_mut() = Some(Rc::clone(&body));
+        Ok(body)
+    }
+}
+
+/// The reference's placed-path key for a resolved storage location
+/// (`TVPSearchPlacedPath`, `reference/cpp/core/base/StorageIntf.cpp:1111-1115`).
+fn placed_path_key(location: &Location) -> String {
+    match location {
+        Location::Disk(path) => path.to_string_lossy().into_owned(),
+        Location::Archive(archive, in_archive) => format!("{}>{}", archive.display(), in_archive),
+    }
+}
+
 /// Reads a little-endian `u32` at `offset`.
 fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, PrerenderedFontError> {
     let slice = bytes
@@ -974,12 +1093,19 @@ mod prerendered_tests {
         bytes
     }
 
+    /// Validates the header of `bytes` and parses the body, as the lazy path
+    /// does at map time and first use.
+    fn body_of(bytes: Vec<u8>) -> PrerenderedBody {
+        let header = validate_header(&bytes[..PRERENDERED_HEADER_LEN]).expect("header");
+        PrerenderedBody::parse(bytes, &header).expect("parse")
+    }
+
     /// Reference: the header, sorted `ChIndex` binary search and the version-1
     /// run-length decoder are `tTVPPrerenderedFont`
     /// (`reference/cpp/core/visual/PrerenderedFont.cpp:47-175`).
     #[test]
     fn parses_finds_and_retrieves_a_version_one_font() {
-        let font = PrerenderedFont::parse(build_tft(&[0x41, 0x42], 7)).expect("parse");
+        let font = body_of(build_tft(&[0x41, 0x42], 7));
         let item = font.find_code_unit(0x42).expect("B is indexed");
         assert_eq!(item.inc, 7);
         let coverage = font.retrieve(&item).expect("retrieve");
@@ -998,7 +1124,7 @@ mod prerendered_tests {
         bytes[22] = 0;
         bytes.truncate(PRERENDERED_HEADER_LEN + 2 + PRERENDERED_ITEM_LEN);
         bytes.extend_from_slice(&[0x10, 0x41, 0x03]);
-        let font = PrerenderedFont::parse(bytes).expect("parse");
+        let font = body_of(bytes);
         let item = font.find_code_unit(0x41).expect("A is indexed");
         assert_eq!(
             font.retrieve(&item).expect("retrieve"),
@@ -1011,7 +1137,7 @@ mod prerendered_tests {
     /// so a descriptor read reflects an edit to the file image.
     #[test]
     fn reads_the_descriptor_from_the_file_image() {
-        let mut font = PrerenderedFont::parse(build_tft(&[0x41, 0x42], 7)).expect("parse");
+        let mut font = body_of(build_tft(&[0x41, 0x42], 7));
         assert_eq!(font.find_code_unit(0x42).expect("B is indexed").inc, 7);
         // B's descriptor is the second 20-byte entry; `inc` sits at +16.
         let at = font.index_offset + PRERENDERED_ITEM_LEN + 16;
@@ -1029,7 +1155,7 @@ mod prerendered_tests {
         let mut bytes = build_tft(&[0x41], 7);
         // Keep the header and the 20-byte descriptor, drop the glyph data.
         bytes.truncate(PRERENDERED_HEADER_LEN + 2 + PRERENDERED_ITEM_LEN);
-        let font = PrerenderedFont::parse(bytes).expect("the index is still valid");
+        let font = body_of(bytes);
         let item = font.find_code_unit(0x41).expect("A is indexed");
         assert!(matches!(
             font.retrieve(&item),
@@ -1043,20 +1169,38 @@ mod prerendered_tests {
     #[test]
     fn rejects_a_bad_header() {
         assert!(matches!(
-            PrerenderedFont::parse(vec![0u8; 64]),
+            validate_header(&[0u8; 64]),
             Err(PrerenderedFontError::InvalidSignature)
         ));
         let mut bytes = build_tft(&[0x41], 7);
         bytes[23] = 1;
         assert!(matches!(
-            PrerenderedFont::parse(bytes),
+            validate_header(&bytes),
             Err(PrerenderedFontError::NotUnicode16)
         ));
         let mut bytes = build_tft(&[0x41], 7);
         bytes[22] = 2;
         assert!(matches!(
-            PrerenderedFont::parse(bytes),
+            validate_header(&bytes),
             Err(PrerenderedFontError::InvalidVersion)
+        ));
+    }
+
+    /// Reference: the constructor `memcmp`s 22 bytes and then indexes
+    /// `Image[23]` and the offset words without checking the length
+    /// (`reference/cpp/core/visual/PrerenderedFont.cpp:40-67`); a file shorter
+    /// than the header is an out-of-bounds read there. We raise the
+    /// invalid-file error for a truncated non-empty file and the zero-size
+    /// error for an empty one, rather than copy that defect.
+    #[test]
+    fn truncated_header_raises_signature_error() {
+        assert!(matches!(
+            validate_header(PRERENDERED_SIGNATURE),
+            Err(PrerenderedFontError::InvalidSignature)
+        ));
+        assert!(matches!(
+            validate_header(&[]),
+            Err(PrerenderedFontError::ZeroSize)
         ));
     }
 
@@ -1069,7 +1213,13 @@ mod prerendered_tests {
     #[test]
     fn unmap_releases_the_parsed_font_at_the_last_mapping() {
         let mut resolver = ResourceResolver::default();
-        let font = Rc::new(PrerenderedFont::parse(build_tft(&[0x41], 7)).expect("parse"));
+        let header =
+            validate_header(&build_tft(&[0x41], 7)[..PRERENDERED_HEADER_LEN]).expect("header");
+        let font = Rc::new(PrerenderedFont {
+            storage: "sample.tft".to_string(),
+            header,
+            body: RefCell::new(None),
+        });
         resolver
             .prerendered_storage
             .insert("sample.tft".to_string(), Rc::clone(&font));

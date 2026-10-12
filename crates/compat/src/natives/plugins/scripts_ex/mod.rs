@@ -820,7 +820,7 @@ fn safe_eval_storage(
         Some(offset) => &bytes[offset.min(bytes.len())..],
         None => &bytes[..],
     };
-    let text = crate::text::decode_text(bytes, None)
+    let text = crate::text::decode_text(bytes, crate::text::TextEncoding::Detect)
         .map_err(|error| format!("scripts_ex: safeEvalStorage '{name}': {error}"))?;
     let wrapped = format!("(const)[{text}]");
     let shortname = storage_name(&name);

@@ -120,10 +120,23 @@ size (zlib segments use `org_size`) gives:
                                                                                = 110.7 MB total
 ```
 
-`PrerenderedFont::parse` moves the whole file into `image` and keeps the
-`ch_index`/`items` vectors on top
-(`crates/compat/src/resource.rs:714,724,760,770`). This is the single largest
-CPU allocation in the process.
+`PrerenderedFont::parse` moved the whole file into `image` and kept the index
+vectors on top, which was the single largest CPU allocation in the process.
+
+**Startup change (this tree).** `mapPrerenderedFont` now resolves the storage,
+validates only the fixed header and records the index offsets; the whole file
+is read once on the first glyph request (`crates/compat/src/resource.rs`, via
+`Storage::stat`/`Storage::read_prefix` and `Storage::read`). The storage map is
+keyed by the resolved placed path, mirroring `TVPPrerenderedFonts`. The
+reference reads and holds the whole file at map time
+(`reference/cpp/core/visual/PrerenderedFont.cpp:9-76`) but validates only the
+header there too, so deferring the body is not observable through the script
+surface; the one divergence is that our index-bounds check (which the reference
+performs as unchecked reads) moves with the body read. A mapping that is never
+drawn reads one 36-byte header prefix and no glyph payload. Verified on the
+host by the read-counter and reference-header-error tests in
+`crates/compat/tests/font.rs`; the startup wall-clock A/B is still to be
+measured.
 
 ### Formulas
 

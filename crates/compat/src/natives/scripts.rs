@@ -28,8 +28,10 @@
 //! `lineofs` the reported line-number offset, both forwarded to the VM.
 #![allow(unsafe_code)]
 
+use std::cell::Cell;
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::ptr;
+use std::time::Instant;
 
 use engine::Storage;
 use tjs::{
@@ -43,7 +45,8 @@ use crate::natives::storages::extract_storage_name;
 use crate::natives::system::try_value_as_i64;
 use crate::{CompatCtx, CompatError, CompatServices};
 
-/// Per-family dispatch state: the `Scripts.textEncoding` override.
+/// Per-family dispatch state: the `Scripts.textEncoding` override and the
+/// current script-execution nesting depth.
 #[derive(Default)]
 struct ScriptsState {
     /// The explicit read-encoding spelling, when a script set one. The
@@ -54,6 +57,57 @@ struct ScriptsState {
     /// property maps to `None` (the automatic decoder) rather than a forced
     /// UTF-8 override.
     text_encoding: Option<String>,
+    /// Nesting depth of the script executions currently on the stack. The
+    /// entry script runs at 0; a `Scripts.exec*`/`eval*` call it makes runs
+    /// one deeper, which is what makes the emitted timing lines show nesting.
+    depth: Cell<u32>,
+}
+
+/// Times one script execution and, at `debug`, logs its name and cost.
+///
+/// The guard restores the recorded depth on every exit path, including an
+/// early storage/decode error. It exists only while `debug` logging is on, so
+/// a release build pays nothing.
+struct ScriptExecTimer<'a> {
+    services: Option<&'a CompatServices>,
+    label: &'a str,
+    started: Instant,
+    depth: u32,
+}
+
+impl<'a> ScriptExecTimer<'a> {
+    /// Starts timing `label`, or returns `None` when `debug` logging is off.
+    fn start(services: Option<&'a CompatServices>, label: &'a str) -> Option<Self> {
+        if !log::log_enabled!(log::Level::Debug) {
+            return None;
+        }
+        let depth = match services {
+            Some(services) => {
+                let state = services.state::<ScriptsState>();
+                let depth = state.depth.get();
+                state.depth.set(depth.saturating_add(1));
+                depth
+            }
+            None => 0,
+        };
+        Some(Self {
+            services,
+            label,
+            started: Instant::now(),
+            depth,
+        })
+    }
+}
+
+impl Drop for ScriptExecTimer<'_> {
+    fn drop(&mut self) {
+        if let Some(services) = self.services {
+            services.state::<ScriptsState>().depth.set(self.depth);
+        }
+        let ms = self.started.elapsed().as_secs_f64() * 1000.0;
+        let indent = "  ".repeat(self.depth as usize);
+        log::debug!("startup: script {indent}{} in {ms:.1} ms", self.label);
+    }
 }
 
 /// Scratch buffer for a string result; the C++ trampoline copies it before the
@@ -236,6 +290,9 @@ fn load_storage_text(
         Some(offset) => &bytes[offset.min(bytes.len())..],
         None => &bytes[..],
     };
+    let encoding = encoding.map_or(crate::text::TextEncoding::Detect, |name| {
+        crate::text::TextEncoding::Named(name)
+    });
     crate::text::decode_text(bytes, encoding).map_err(|error| format!("Scripts: '{name}': {error}"))
 }
 
@@ -254,7 +311,9 @@ fn execute_storage(
     context: *mut c_void,
     expression: bool,
     encoding: Option<&str>,
+    services: Option<&CompatServices>,
 ) -> Result<RetainedValue, String> {
+    let _timer = ScriptExecTimer::start(services, block_name);
     let text = load_storage_text(storage, name, mode, encoding)?;
     if expression {
         engine
@@ -275,6 +334,12 @@ fn execute_storage(
 ///
 /// Returns the storage read, text decode, or script error as a string.
 pub fn exec_storage(engine: &Tjs2Engine, storage: &Storage, name: &str) -> Result<(), String> {
+    // The composition root calls this directly (the entry script), outside a
+    // native callback, so resolve the dispatch state here to keep the
+    // per-script nesting depth continuous across the boundary.
+    let resolved = binding::resolve(engine.raw());
+    let ctx = resolved.as_ref().map(|resolved| resolved.ctx());
+    let services = ctx.as_ref().map(|ctx| unsafe { ctx.services() });
     execute_storage(
         engine,
         storage,
@@ -284,6 +349,7 @@ pub fn exec_storage(engine: &Tjs2Engine, storage: &Storage, name: &str) -> Resul
         std::ptr::null_mut(),
         false,
         None,
+        services,
     )
     .map(|_| ())
 }
@@ -341,6 +407,7 @@ extern "C" fn native_exec_storage(
     let ctx = resolved.ctx();
     // SAFETY: `resolve_or_return!` only succeeds for the installed, live binding.
     let services = unsafe { ctx.services() };
+    let _native = crate::natives::NativeTimer::start(services, "Scripts.execStorage");
     // SAFETY: the trampoline guarantees `argc` valid `Value` entries.
     let arguments = unsafe { args(argv, argc) };
     let Some(name) = arguments.first() else {
@@ -371,6 +438,7 @@ extern "C" fn native_exec_storage(
         context,
         false,
         encoding.as_deref(),
+        Some(services),
     );
     finish_retained(out, out_error, services, result)
 }
@@ -386,6 +454,7 @@ extern "C" fn native_eval_storage(
     let ctx = resolved.ctx();
     // SAFETY: `resolve_or_return!` only succeeds for the installed, live binding.
     let services = unsafe { ctx.services() };
+    let _native = crate::natives::NativeTimer::start(services, "Scripts.evalStorage");
     // SAFETY: the trampoline guarantees `argc` valid `Value` entries.
     let arguments = unsafe { args(argv, argc) };
     let Some(name) = arguments.first() else {
@@ -415,6 +484,7 @@ extern "C" fn native_eval_storage(
         context,
         true,
         encoding.as_deref(),
+        Some(services),
     );
     finish_retained(out, out_error, services, result)
 }
@@ -434,6 +504,7 @@ extern "C" fn native_exec(
     let ctx = resolved.ctx();
     // SAFETY: `resolve_or_return!` only succeeds for the installed, live binding.
     let services = unsafe { ctx.services() };
+    let _native = crate::natives::NativeTimer::start(services, "Scripts.exec");
     // SAFETY: the trampoline guarantees `argc` valid `Value` entries.
     let arguments = unsafe { args(argv, argc) };
     let Some(script) = arguments.first() else {
@@ -441,6 +512,12 @@ extern "C" fn native_exec(
     };
     let script = value_as_string(script);
     let name = arguments.get(1).map(value_as_string).unwrap_or_default();
+    let label = if name.is_empty() {
+        "Scripts.exec"
+    } else {
+        name.as_str()
+    };
+    let _script = ScriptExecTimer::start(Some(services), label);
     let lineofs = match lineofs_argument(arguments, 2) {
         Ok(lineofs) => lineofs,
         Err(error) => return report_error(out_error, &format!("Scripts.exec: {error}")),
@@ -467,6 +544,7 @@ extern "C" fn native_eval(
     let ctx = resolved.ctx();
     // SAFETY: `resolve_or_return!` only succeeds for the installed, live binding.
     let services = unsafe { ctx.services() };
+    let _native = crate::natives::NativeTimer::start(services, "Scripts.eval");
     // SAFETY: the trampoline guarantees `argc` valid `Value` entries.
     let arguments = unsafe { args(argv, argc) };
     let Some(expression) = arguments.first() else {
@@ -474,6 +552,12 @@ extern "C" fn native_eval(
     };
     let expression = value_as_string(expression);
     let name = arguments.get(1).map(value_as_string).unwrap_or_default();
+    let label = if name.is_empty() {
+        "Scripts.eval"
+    } else {
+        name.as_str()
+    };
+    let _script = ScriptExecTimer::start(Some(services), label);
     let lineofs = match lineofs_argument(arguments, 2) {
         Ok(lineofs) => lineofs,
         Err(error) => return report_error(out_error, &format!("Scripts.eval: {error}")),
@@ -500,6 +584,7 @@ extern "C" fn native_compile_storage(
     let ctx = resolved.ctx();
     // SAFETY: `resolve_or_return!` only succeeds for the installed, live binding.
     let services = unsafe { ctx.services() };
+    let _native = crate::natives::NativeTimer::start(services, "Scripts.compileStorage");
     // SAFETY: the trampoline guarantees `argc` valid `Value` entries.
     let arguments = unsafe { args(argv, argc) };
     if arguments.len() < 2 {
@@ -782,4 +867,72 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
             set: Some(native_text_encoding_set),
         }],
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use tjs::Tjs2Engine;
+
+    use crate::CompatHost;
+    use crate::native_util::test_vm_lock;
+    use crate::natives::NativeTiming;
+
+    /// A bound VM with the compat surface installed, for the timing tests.
+    struct Env {
+        host: CompatHost,
+        engine: Box<Tjs2Engine>,
+    }
+
+    impl Env {
+        fn new() -> Env {
+            let engine = Box::new(Tjs2Engine::new().expect("create engine"));
+            let mut host = CompatHost::new();
+            host.install(&engine).expect("install compat surface");
+            Env { host, engine }
+        }
+    }
+
+    /// A script dominated by one native is attributed to that native's name.
+    #[test]
+    fn native_timing_attributes_a_dominated_script() {
+        let _lock = test_vm_lock();
+        let env = Env::new();
+        env.host.begin_native_timing();
+        env.engine
+            .exec_script(
+                "Scripts.exec('var total = 0; for(var i = 0; i < 400000; i++) total += i;', 'slow');",
+                "timing-attribution",
+            )
+            .expect("run the busy script");
+        env.host.end_native_timing();
+
+        let timing = env.host.services().state::<NativeTiming>();
+        let recorded = timing.recorded();
+        assert_eq!(recorded.len(), 1);
+        let entry = recorded
+            .iter()
+            .find(|entry| entry.0 == "Scripts.exec")
+            .expect("Scripts.exec is recorded");
+        assert_eq!(entry.1, 1);
+        assert!(entry.2 > 0);
+    }
+
+    /// A fast native reports below the threshold; one that reaches it reports
+    /// above.
+    #[test]
+    fn native_timing_report_level_tracks_the_threshold() {
+        let timing = NativeTiming::default();
+        timing.begin();
+        timing.record("Scripts.exec", Duration::from_micros(1));
+        let (slow, line) = timing.format_report().expect("a report");
+        assert!(!slow);
+        assert!(line.contains("Scripts.exec"));
+
+        timing.begin();
+        timing.record("Scripts.exec", Duration::from_millis(120));
+        let (slow, _) = timing.format_report().expect("a report");
+        assert!(slow);
+    }
 }

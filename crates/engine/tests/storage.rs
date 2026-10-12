@@ -13,6 +13,49 @@ use testkit::build_xp3;
 mod common;
 use common::{memory_with, mount_memory, mount_memory_with_archives};
 
+// ---------------------------------------------------------------------------
+// Log capture (for the storage miss line)
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    /// Log lines written on this thread since the last clear. The tests run in
+    /// parallel, so the capture is per-thread.
+    static CAPTURED_LOGS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A `log` sink that records every record on the calling thread.
+struct CaptureLogger;
+
+impl log::Log for CaptureLogger {
+    fn enabled(&self, _metadata: &log::Metadata) -> bool {
+        true
+    }
+
+    fn log(&self, record: &log::Record) {
+        CAPTURED_LOGS.with(|logs| {
+            logs.borrow_mut()
+                .push(format!("{} {}", record.level(), record.args()));
+        });
+    }
+
+    fn flush(&self) {}
+}
+
+/// Installs the recording sink once per test binary, clears this thread's
+/// buffer, runs `f`, and returns its result plus the thread's log lines.
+fn capture_logs<R>(f: impl FnOnce() -> R) -> (R, Vec<String>) {
+    static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    ONCE.get_or_init(|| {
+        let _ = log::set_boxed_logger(Box::new(CaptureLogger));
+        log::set_max_level(log::LevelFilter::Debug);
+    });
+    CAPTURED_LOGS.with(|logs| logs.borrow_mut().clear());
+    let result = f();
+    let logs = CAPTURED_LOGS.with(|logs| logs.borrow().clone());
+    (result, logs)
+}
+
 #[test]
 fn normalize_matches_reference() {
     assert_eq!(
@@ -167,11 +210,33 @@ fn mixed_case_disk_name_resolves() {
     }
 }
 
+/// A `..` that leaves the mount is the reference's `TVPInvalidPathName`
+/// (`reference/cpp/core/base/StorageIntf.cpp:400`), not a plain miss; a `..`
+/// that stays inside the mount still resolves.
 #[test]
-fn traversal_does_not_resolve() {
-    let storage = mount_memory(&[("escape.dat", b"in")]);
-    assert!(storage.find("../escape.dat").unwrap().is_none());
-    assert!(storage.find("savedata/../../escape.dat").unwrap().is_none());
+fn traversal_escape_raises_and_inner_traversal_resolves() {
+    let storage = mount_memory(&[("escape.dat", b"in"), ("savedata/keep.dat", b"x")]);
+
+    for name in ["../escape.dat", "savedata/../../escape.dat", "../../x"] {
+        let result = storage.find(name);
+        assert!(
+            matches!(
+                result.as_ref(),
+                Err(engine::storage::StorageReadError::InvalidPathName(_))
+            ),
+            "{name} must raise InvalidPathName, got {result:?}"
+        );
+        assert!(matches!(
+            storage.exists(name),
+            Err(engine::storage::StorageReadError::InvalidPathName(_))
+        ));
+    }
+
+    // A `..` that stays inside the mount resolves.
+    assert!(storage.exists("savedata/../escape.dat").unwrap());
+    assert_eq!(storage.read("savedata/../escape.dat").unwrap(), b"in");
+
+    // An absolute name that maps below the root is not a traversal.
     assert!(!storage.exists("/outside.dat").unwrap());
 }
 
@@ -280,6 +345,388 @@ fn auto_path_resolves_base_name() {
             "config.tjs".into()
         ))
     );
+}
+
+/// An absolute plain-directory auto path — the
+/// `Storages.addAutoPath(System.exePath + "chs/")` form the shipped
+/// `system/Initialize.tjs` uses — resolves a base name in that absolute
+/// directory, not below the game directory.
+///
+/// Reference: `TVPAddAutoPath` stores the normalized absolute path and
+/// `TVPRebuildAutoPathTable` lists it, so `TVPGetPlacedPath` returns
+/// `path + storagename` (`reference/cpp/core/base/StorageIntf.cpp:921-937`,
+/// `:1024-1034`).
+#[test]
+fn absolute_auto_path_resolves_in_that_directory() {
+    let fs = memory_with(&[("game/chs/config.tjs", b"translated")]);
+    let mut storage =
+        Storage::mount_archives(fs, "/game", std::iter::empty::<&str>()).expect("mount");
+    storage.add_auto_path("/game/chs/");
+
+    assert_eq!(
+        storage.find("config.tjs").unwrap(),
+        Some(Location::Disk(PathBuf::from("/game/chs/config.tjs")))
+    );
+    assert_eq!(storage.read("config.tjs").unwrap(), b"translated");
+    assert!(storage.exists("config.tjs").unwrap());
+}
+
+/// The `>` form of the same absolute pattern — the more common KAG form
+/// `Storages.addAutoPath(System.exePath + "data.xp3>")` — already resolved
+/// against the mounted archive by base file name: `find_in_archive` matches the
+/// archive on its file name and `archive_disk_path` already kept an absolute
+/// path. This test pins that behavior for the mounted case.
+///
+/// Reference: `TVPAddAutoPath` (`reference/cpp/core/base/StorageIntf.cpp:921-937`)
+/// and `TVPRebuildAutoPathTable` (`:979-1013`).
+#[test]
+fn absolute_archive_auto_path_resolves_a_mounted_archive() {
+    let xp3 = build_xp3(&[("system/Config.tjs", b"mounted", false)]);
+    let fs = memory_with(&[("game/data.xp3", &xp3)]);
+    let mut storage = Storage::mount_archives(fs, "/game", ["data.xp3"]).expect("mount");
+    storage.add_auto_path("/game/data.xp3>system/");
+
+    assert_eq!(
+        storage.find("Config.tjs").unwrap(),
+        Some(Location::Archive(
+            PathBuf::from("/game/data.xp3"),
+            "system/config.tjs".into()
+        ))
+    );
+    assert_eq!(storage.read("Config.tjs").unwrap(), b"mounted");
+}
+
+/// The same absolute `>` auto path opens and parses an archive that was not
+/// mounted: `TVPArchiveCache.Get` opens the archive named in the path when it
+/// exists and is not already cached
+/// (`reference/cpp/core/base/StorageIntf.cpp:695-724`).
+#[test]
+fn absolute_archive_auto_path_opens_an_unmounted_archive() {
+    let xp3 = build_xp3(&[("config.tjs", b"on demand", false)]);
+    let fs = memory_with(&[("game/extra.xp3", &xp3)]);
+    let mut storage =
+        Storage::mount_archives(fs, "/game", std::iter::empty::<&str>()).expect("mount");
+    storage.add_auto_path("/game/extra.xp3>");
+
+    assert_eq!(
+        storage.find("config.tjs").unwrap(),
+        Some(Location::Archive(
+            PathBuf::from("/game/extra.xp3"),
+            "config.tjs".into()
+        ))
+    );
+    assert_eq!(storage.read("config.tjs").unwrap(), b"on demand");
+}
+
+/// `.` and `..` components fold the way the reference normalizes a storage
+/// name, so `./config.tjs` and `sub/../config.tjs` resolve to `config.tjs`;
+/// a `..` that would escape the root raises `InvalidPathName`.
+///
+/// Reference: the redundant-path compression in `TVPNormalizeStorageName`
+/// (`reference/cpp/core/base/StorageIntf.cpp:371-425`) and the
+/// `TVPInvalidPathName` raise at `:400`.
+#[test]
+fn dot_components_fold_and_escape_raises() {
+    let xp3 = build_xp3(&[("config.tjs", b"cfg", false)]);
+    let storage = mount_memory_with_archives(&[("data.xp3", &xp3)], &["data.xp3"]);
+
+    assert_eq!(storage.read("./config.tjs").unwrap(), b"cfg");
+    assert_eq!(storage.read("sub/../config.tjs").unwrap(), b"cfg");
+    assert!(matches!(
+        storage.find("../../escape.dat"),
+        Err(engine::storage::StorageReadError::InvalidPathName(_))
+    ));
+}
+
+/// The script-visible name `Config.tjs` resolves through each path the search
+/// order defines: the game directory, a mounted archive, a relative folder
+/// auto path, and an archive auto path with an in-archive prefix.
+#[test]
+fn each_resolution_path_resolves_a_script_name() {
+    // The game directory (current path).
+    let disk = mount_memory(&[("Config.tjs", b"disk")]);
+    assert_eq!(disk.read("Config.tjs").unwrap(), b"disk");
+
+    // A mounted archive at the requested path.
+    let xp3 = build_xp3(&[("Config.tjs", b"archive", false)]);
+    let mounted = mount_memory_with_archives(&[("data.xp3", &xp3)], &["data.xp3"]);
+    assert_eq!(mounted.read("Config.tjs").unwrap(), b"archive");
+
+    // A relative folder auto path.
+    let mut folder = mount_memory(&[("chs/Config.tjs", b"folder")]);
+    folder.add_auto_path("chs/");
+    assert_eq!(folder.read("Config.tjs").unwrap(), b"folder");
+
+    // An archive auto path with an in-archive prefix.
+    let prefixed = build_xp3(&[("system/Config.tjs", b"prefixed", false)]);
+    let mut prefixed = mount_memory_with_archives(&[("data.xp3", &prefixed)], &["data.xp3"]);
+    prefixed.add_auto_path("data.xp3>system/");
+    assert_eq!(prefixed.read("Config.tjs").unwrap(), b"prefixed");
+}
+
+/// A miss logs one `debug` line naming every location searched: the disk
+/// spellings, each auto-path candidate in later-added-first order, and the
+/// mounted archives in later-first order. A hit logs nothing.
+#[test]
+fn miss_reports_every_searched_location() {
+    let patch = build_xp3(&[("other.txt", b"x", false)]);
+    let mut storage = mount_memory_with_archives(&[("patch.xp3", &patch)], &["patch.xp3"]);
+    storage.add_auto_path("data.xp3>");
+    storage.add_auto_path("parts/");
+
+    let (found, logs) = capture_logs(|| storage.find("config.tjs"));
+    assert_eq!(found.unwrap(), None);
+
+    let misses: Vec<&String> = logs
+        .iter()
+        .filter(|line| line.contains("storage miss"))
+        .collect();
+    assert_eq!(misses.len(), 1, "one line per miss: {logs:?}");
+    let miss = misses[0];
+    assert!(
+        miss.starts_with("DEBUG storage miss \"config.tjs\""),
+        "{miss}"
+    );
+    assert!(miss.contains("disk /config.tjs"), "{miss}");
+    assert!(miss.contains("parts/config.tjs"), "{miss}");
+    assert!(miss.contains("data.xp3"), "{miss}");
+    assert!(miss.contains("/patch.xp3"), "{miss}");
+
+    // A hit produces no miss line.
+    let (found, logs) = capture_logs(|| storage.find("other.txt"));
+    assert_eq!(
+        found.unwrap(),
+        Some(Location::Archive(
+            PathBuf::from("/patch.xp3"),
+            "other.txt".into()
+        ))
+    );
+    assert!(
+        logs.iter().all(|line| !line.contains("storage miss")),
+        "a hit must not log: {logs:?}"
+    );
+}
+
+/// The resolver builds each auto path's candidate table once: a second miss
+/// re-lists no directory, and the miss line still names every candidate.
+#[test]
+fn resolver_cache_lists_each_auto_path_once() {
+    let xp3 = build_xp3(&[("system/Config.tjs", b"cfg", false)]);
+    let fs = memory_with(&[("game/data.xp3", &xp3), ("game/parts/foo.png", b"parts")]);
+    let mut storage = Storage::mount_archives(fs, "/game", ["data.xp3"]).expect("mount");
+    storage.add_auto_path("data.xp3>system/");
+    storage.add_auto_path("parts/");
+
+    let (found, first_logs) = capture_logs(|| storage.find("missing.txt"));
+    assert_eq!(found.unwrap(), None);
+    let miss_line = first_logs
+        .iter()
+        .find(|line| line.contains("storage miss"))
+        .expect("a miss logs one line");
+    assert!(miss_line.contains("parts/missing.txt"), "{miss_line}");
+    assert!(miss_line.contains("data.xp3"), "{miss_line}");
+    assert!(miss_line.contains("system/missing.txt"), "{miss_line}");
+    let after_first = storage.probe_counts();
+    assert_eq!(after_first.misses, 1);
+    assert!(
+        after_first.list >= 2,
+        "the two auto-path directories were listed: {after_first:?}"
+    );
+
+    // The second miss is served from the cached tables: no new listing.
+    let (found, logs) = capture_logs(|| storage.find("missing.txt"));
+    assert_eq!(found.unwrap(), None);
+    let after_second = storage.probe_counts();
+    assert_eq!(
+        after_second.list, after_first.list,
+        "a second miss re-listed a directory"
+    );
+    assert_eq!(after_second.misses, 2);
+    assert!(
+        logs.iter().any(|line| line.contains("storage miss")),
+        "the cached miss is still reported: {logs:?}"
+    );
+}
+
+/// The startup shape from the device measurement: many auto paths and many
+/// misses. With the cache the listing count is one per auto-path directory,
+/// not one per miss per auto path.
+#[test]
+fn resolver_cache_probe_count_for_startup_shape() {
+    const AUTO_PATHS: usize = 41;
+    const MISSES: usize = 291;
+
+    let owned: Vec<(String, Vec<u8>)> = (0..AUTO_PATHS)
+        .map(|i| (format!("game/ap{i:02}/present.dat"), b"x".to_vec()))
+        .collect();
+    let files: Vec<(&str, &[u8])> = owned
+        .iter()
+        .map(|(path, data)| (path.as_str(), data.as_slice()))
+        .collect();
+    let fs = memory_with(&files);
+    let mut storage =
+        Storage::mount_archives(fs, "/game", std::iter::empty::<&str>()).expect("mount");
+    for i in 0..AUTO_PATHS {
+        storage.add_auto_path(format!("ap{i:02}/"));
+    }
+
+    for i in 0..MISSES {
+        let name = format!("missing{i:03}.txt");
+        assert!(storage.find(&name).unwrap().is_none());
+    }
+
+    let counts = storage.probe_counts();
+    // One listing per auto-path directory plus one for the game directory.
+    assert_eq!(
+        counts.list,
+        (AUTO_PATHS + 1) as u64,
+        "one listing per directory, not one per miss: {counts:?}"
+    );
+    assert_eq!(counts.misses, MISSES as u64);
+}
+
+/// A prefix read of a zlib entry decodes only the requested bytes: the
+/// lazy-font case, where a header probe must not inflate the body.
+///
+/// The prefix read is our own API (the reference exposes a seekable per-member
+/// stream, `tTVPXP3ArchiveStream`, instead); the segment decoding it bounds is
+/// the reference's.
+#[test]
+fn read_prefix_is_lazy_for_a_zlib_entry() {
+    let payload = vec![0u8; 1024 * 1024];
+    let xp3 = build_xp3(&[("big.bin", &payload, true)]);
+    let storage = mount_memory_with_archives(&[("data.xp3", &xp3)], &["data.xp3"]);
+
+    assert_eq!(storage.read_bytes(), 0);
+    let prefix = storage.read_prefix("big.bin", 36).unwrap();
+    assert_eq!(prefix.len(), 36);
+    assert_eq!(
+        storage.read_bytes(),
+        36,
+        "a header read must not decode the whole entry"
+    );
+
+    let whole = storage.read("big.bin").unwrap();
+    assert_eq!(whole.len(), payload.len());
+    assert_eq!(storage.read_bytes(), 36 + whole.len() as u64);
+    assert!(36 < whole.len());
+}
+
+/// An entry shorter than `max_len` is returned short; the caller decides
+/// whether that is an error.
+#[test]
+fn read_prefix_returns_a_short_entry_short() {
+    let xp3 = build_xp3(&[("tiny.bin", b"hi", false)]);
+    let storage = mount_memory_with_archives(&[("data.xp3", &xp3)], &["data.xp3"]);
+    assert_eq!(storage.read_prefix("tiny.bin", 64).unwrap(), b"hi");
+    assert_eq!(storage.read_bytes(), 2);
+}
+
+/// An unresolvable name is `NotFound`, matching `read`.
+#[test]
+fn read_prefix_of_an_unresolvable_name_is_not_found() {
+    let storage = mount_memory(&[("present.bin", b"x")]);
+    assert!(matches!(
+        storage.read_prefix("missing.bin", 16),
+        Err(engine::storage::StorageReadError::NotFound(_))
+    ));
+}
+
+/// The extraction filter is applied to the prefix bytes exactly as `read`
+/// applies it, so the prefix equals the filtered whole-entry prefix.
+///
+/// Reference: the filter runs on each decoded segment
+/// (`reference/cpp/core/archive/xp3/XP3Archive.cpp`); the prefix is the same
+/// transform on fewer bytes.
+#[test]
+fn read_prefix_applies_the_extraction_filter() {
+    let payload: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+    let xp3 = build_xp3(&[("secret.bin", &payload, true)]);
+    let mut storage = mount_memory_with_archives(&[("data.xp3", &xp3)], &["data.xp3"]);
+    storage.xp3_extraction_filter = Some(Box::new(
+        |_hash: u32,
+         _offset: u64,
+         buffer: &mut [u8],
+         _file_name: &str,
+         _archive_name: &str,
+         _file_size: u64| {
+            for byte in buffer.iter_mut() {
+                *byte ^= 0x5A;
+            }
+        },
+    ));
+
+    let whole = storage.read("secret.bin").unwrap();
+    let prefix = storage.read_prefix("secret.bin", 64).unwrap();
+    assert_eq!(prefix, whole[..64].to_vec());
+}
+
+/// A raw archive segment is read positionally up to the limit.
+#[test]
+fn read_prefix_reads_a_raw_entry_positionally() {
+    let payload: Vec<u8> = (0..1024u32).map(|i| (i % 251) as u8).collect();
+    let xp3 = build_xp3(&[("raw.bin", &payload, false)]);
+    let storage = mount_memory_with_archives(&[("data.xp3", &xp3)], &["data.xp3"]);
+
+    assert_eq!(
+        storage.read_prefix("raw.bin", 40).unwrap(),
+        payload[..40].to_vec()
+    );
+    assert_eq!(storage.read_bytes(), 40);
+    assert_eq!(storage.read("raw.bin").unwrap(), payload);
+}
+
+/// A host file prefix is bounded by the file size and is not filtered.
+#[test]
+fn read_prefix_reads_a_disk_file() {
+    let storage = mount_memory(&[("header.bin", b"0123456789")]);
+    assert_eq!(storage.read_prefix("header.bin", 4).unwrap(), b"0123");
+    assert_eq!(
+        storage.read_prefix("header.bin", 64).unwrap(),
+        b"0123456789"
+    );
+    assert_eq!(storage.read_bytes(), 4 + 10);
+}
+
+/// The prefix read opens an unmounted archive on demand, like `read`.
+#[test]
+fn read_prefix_opens_an_archive_on_demand() {
+    let xp3 = build_xp3(&[("config.tjs", b"0123456789", false)]);
+    let storage = mount_memory(&[("extra.xp3", &xp3)]);
+    assert_eq!(
+        storage.read_prefix("extra.xp3>config.tjs", 4).unwrap(),
+        b"0123"
+    );
+    assert_eq!(storage.read_bytes(), 4);
+}
+
+/// The preloaded backing serves the same prefix bytes as the streaming one.
+#[test]
+fn read_prefix_matches_for_preloaded_archives() {
+    let payload: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
+    let xp3 = build_xp3(&[
+        ("data/raw.bin", &payload, false),
+        ("data/packed.bin", &payload, true),
+    ]);
+    let files = [("data.xp3", xp3.as_slice())];
+
+    let streaming = mount_memory_with_archives(&files, &["data.xp3"]);
+    let fs = memory_with(&files);
+    let preloaded = Storage::mount_archives_with(
+        fs,
+        "/",
+        ["data.xp3"],
+        MountOptions {
+            preload_archives: true,
+        },
+    )
+    .expect("mount preloaded");
+
+    let want = &payload[..100];
+    for name in ["data/raw.bin", "data/packed.bin"] {
+        assert_eq!(streaming.read_prefix(name, 100).unwrap().as_slice(), want);
+        assert_eq!(preloaded.read_prefix(name, 100).unwrap().as_slice(), want);
+    }
 }
 
 /// A large-but-valid archive entry still reads end-to-end: no size cap is

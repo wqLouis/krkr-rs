@@ -589,9 +589,13 @@ Two deliberate choices worth restating:
 The whole chain now produces an installable APK from a clean tree — see §7 —
 but **nothing has been run on hardware**. What that leaves genuinely unproven is
 narrow and worth stating plainly: whether the engine starts, decodes and renders
-on a real phone; whether MediaCodec's demux/decode loop works; whether
-`memfd_create` is permitted by a device's seccomp policy; and whether touch
-delivery and coordinate mapping behave as the host tests assume.
+on a real phone; whether the system font directories (`/system/fonts`) are
+populated and a requested face resolves — the host test checks the directory
+list, not a device's contents; whether MediaCodec's demux/decode loop works;
+whether `memfd_create` is permitted by a device's seccomp policy; and whether
+touch delivery and coordinate mapping behave as the host tests assume. Per D36
+(`docs/migration/README.md` §3), a release needs at least one real KiriKiri
+title run on a real device with its log captured (`<filesDir>/krkr.log`, §7).
 
 ---
 

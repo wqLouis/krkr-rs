@@ -261,3 +261,203 @@ Read the per-frame line first. If `host_render` (or `host_sync`) dominates
 with a small `body`, the cost is in the render host; if one poll phase
 dominates, it is in that poll. The start-up lines separate mount/index parse,
 decode, decoder open and script execution.
+
+---
+
+## 7. Build-level VM optimisation (vendored C++ `-O3` / LTO, Rust profile)
+
+Status: **measured, A/B prepared.** The C++ numbers below are x86-64 host
+numbers produced by a standalone harness, not by cargo; the Rust and Android
+changes are prepared with commands but were not built here (see §7.5).
+
+Machine: 12 logical cores, 32 GB, zig 0.16.0 (bundled clang), gcc 16.2.1,
+bison. Sources: the exact set `crates/tjs/build.rs` compiles (35 vendored
+tjs2 `*.cpp` + the three generated bison parsers + `tjs2_abi.cpp` +
+`streams.cpp`) plus `scripts/perf/tjs2_bench.cpp`.
+
+The starting premise was a device log showing one entry script taking
+20.8 s. The log in this tree (`krkr-rs-logs.txt`) is a **host** run, and in it
+that line is wall-clock around I/O stalls, not a single VM call: the
+timestamped lines around it show a ~14 s gap (15:37:17 → 15:37:31) and then
+~0.5 s per `load_layer_image` line while assets are read, while the same run
+reports only 170 ms of actual image decode. The VM-only cost of parsing and
+compiling all 48 real `.tjs` scripts is ~119 ms at `-O2` (the `compile`
+column below). Build flags cannot move that 20.8 s number; a device run with
+the `startup:`/`slow:` lines is what would tell whether a device's entry-script
+time is storage-bound or VM-bound.
+
+### 7.1 Measured C++ configurations
+
+Two measurements per binary, both single-threaded:
+
+* **compile** — the 48 real-game `.tjs` files extracted from
+  `/mnt/DATA/Games/Others/test/data.xp3`, compiled 20 times in one process
+  (average per pass). The `.ks` files are KAG, not TJS, and the TJS2 compiler
+  rejects them, so they are excluded.
+* **exec** — `scripts/perf/workload.tjs`, a class/object/array/dictionary/
+  string/Math workload (one execution per process). `check total` reads the
+  script's accumulator back through the engine; it must be identical for every
+  configuration.
+
+Each configuration ran 7 processes; the table gives the median and
+`[min-max]` across those runs.
+
+| config | flags | compile (ms) | exec (ms) | vs `-O2` |
+|---|---|---:|---:|---|
+| `O2` | `-O2` | 118.9 [117.7–120.8] | 319.3 [315.8–326.0] | baseline |
+| `O3` | `-O3` | 118.4 [118.1–119.9] | 327.8 [318.7–331.7] | 99.5% / 102.6% |
+| `O2thin` | `-O2 -flto=thin` | 111.7 [110.6–111.9] | 303.2 [299.8–310.5] | 93.9% / 94.9% |
+| `O2full` | `-O2 -flto` | 106.5 [104.7–109.3] | 295.5 [292.9–298.6] | 89.5% / 92.5% |
+| `O2vis` | `-O2 -fvisibility=hidden -fno-semantic-interposition` | 117.4 [115.2–119.2] | 321.6 [314.3–329.8] | 98.7% / 100.7% |
+
+`check total = 12023191456` and `compile ok=48 fail=0` for every
+configuration.
+
+### 7.2 Verdicts
+
+* **`-O3` — reject.** Flat: compile 99.5%, exec 102.6% of `-O2` (the exec
+difference is within run-to-run spread and leans the wrong way). No reason to
+change the shipped `-O2`.
+* **`-O2 -flto` — real but deferred; needs an LLVM link + device evidence.**
+  Full LTO is the only measured win (compile 89.5%, exec 92.5% of `-O2`; thin
+  LTO 93.9% / 94.9%). It is not adoptable as-is on the host: the C++ objects
+  become LLVM bitcode, and the host's default final linker is gcc, which
+  cannot consume them (`cc: file not recognized: file format not
+  recognized`). Making it work needs an LLVM-aware final link (an
+  `ld.lld -r --lto-O2` partial link, or `clang -fuse-ld=lld -flto`). The
+  Android build already links with the NDK clang driver, so it is a candidate
+  there — with a device A/B, never assumed from these x86-64 numbers.
+* **`-fvisibility=hidden -fno-semantic-interposition` — reject.** Flat
+  (98.7% / 100.7%): the TJS2 code is linked as a static archive into an
+  executable, so symbol interposition was never costing a call.
+* **Semantics guard.** No configuration here uses `-ffast-math`,
+  `-funsafe-math-optimizations` or `-ffp-contract=fast`; float results are
+  unchanged (the `exec` accumulator is compared across configurations). The
+  `-O3` run re-exposed no UB over the 48 real scripts or the workload, but that
+  is a smoke test, not the full compatibility suite.
+
+### 7.3 Host A/B commands
+
+The C++ harness (builds with `zig c++`; runs no cargo):
+
+```bash
+ZIGOUT=deps/zig-out scripts/perf/bench-tjs-opt.sh \
+  --configs 'O2|-O2;O3|-O3;O2thin|-O2 -flto=thin;O2full|-O2 -flto;O2vis|-O2 -fvisibility=hidden -fno-semantic-interposition' \
+  --runs 7 --iters 20
+```
+
+It extracts the `.tjs` corpus from the game XP3 on first run, generates the
+bison parsers into `target/perf/tjs-opt/gen`, and prints one table row per
+configuration with the raw `zig c++` compile and link lines on stderr.
+
+For the real build, `crates/tjs/build.rs` now also honours
+`TJS2_EXTRA_CXXFLAGS` (whitespace-separated, appended after the optimisation
+level; unset by default) alongside the existing `TJS2_OPT`:
+
+```bash
+TJS2_OPT=-O3 cargo build --release -p krkr                       # -O3 A/B
+TJS2_EXTRA_CXXFLAGS='-fvisibility=hidden' cargo build --release -p krkr
+```
+
+`TJS2_EXTRA_CXXFLAGS='-flto'` compiles, but the host link then fails on gcc as
+above; it is intended for a link that uses the NDK/clang driver.
+
+### 7.4 Rust profile and panic strategy
+
+Rust `lto = "thin"` → `"fat"` is prepared, not measured here (cargo is out of
+scope for this pass). It is switchable without editing the tree because Cargo
+exposes the profile through the environment:
+
+```bash
+cargo build --release -p krkr                                   # as shipped
+CARGO_PROFILE_RELEASE_LTO=fat cargo build --release -p krkr     # A/B
+```
+
+Adopting it means changing one line in `Cargo.toml`
+(`[profile.release] lto = "fat"`); it raises build time and peak memory, so the
+A/B needs a wall-clock build measurement, not just a runtime one.
+
+**`panic = "abort"` — do not use as-is.** `crates/engine/src/timer.rs` relies
+on unwinding: `RestoreCallback::drop` restores a taken timer callback *also on
+unwind*, and the module documents that a panicking callback propagates after
+the registry is made consistent. `crates/engine/tests/timer.rs` asserts that
+contract with `catch_unwind`. `panic = "abort"` converts a panicking timer
+callback (and any other script-triggerable panic) into a process abort, so it
+is an observable behaviour change, not just a codegen knob; it is only safe if
+the timer is deliberately changed to abort-on-panic.
+
+### 7.5 Android A/B and what is unverified
+
+The Android build links with the NDK clang driver (`build-android.sh` sets
+`CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER`), so it is the one place the LTO
+candidate can actually be tried. There is no NDK and no device on this host,
+and the Android target is never built here (AGENTS §0/§11), so none of this is
+verified:
+
+```bash
+# C++ full LTO (candidate)
+TJS2_EXTRA_CXXFLAGS='-flto' \
+CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS='-C link-arg=-flto' \
+  ./crates/android/build-android.sh --ndk "$ANDROID_NDK_HOME"
+
+# Rust fat LTO
+CARGO_PROFILE_RELEASE_LTO=fat ./crates/android/build-android.sh --ndk "$ANDROID_NDK_HOME"
+```
+
+The 16 KB page-alignment and arm64 staging checks in `build-android.sh` run
+after the link, so they still gate an LTO build; they must stay green.
+`TJS2_EXTRA_CXXFLAGS=-flto` also makes `check_object_arch` see bitcode (it
+skips non-ELF input), so the final `.so` arch check is the guard that matters
+there.
+
+A device run confirms or rejects the candidate through the existing lines:
+`startup: entry scripts count=N in M ms` for the parse+compile+execute cost,
+and the `slow:`/`startup: first frame` lines for the frame path. The build
+must show no new `TJS2`/VM errors and an identical script-observable result.
+
+### 7.6 Allocator (mimalloc) — separate proposal, not compelling
+
+An `LD_PRELOAD` counter over one `exec` workload run (20 000 objects, ~1M
+interpreter operations) records `malloc=82501 calloc=104 realloc=0 free=2447
+bytes=14547636` — about 0.08 allocations per operation, all on the VM thread:
+
+```bash
+gcc -O2 -shared -fPIC -o malloc_count.so scripts/perf/malloc_count.c -ldl
+LD_PRELOAD=$PWD/malloc_count.so target/perf/tjs-opt/O2full/bench \
+  exec scripts/perf/workload.tjs 1 total
+```
+
+The VM is single-threaded and the allocation rate is low, which is the case
+where a replacement allocator helps least. It is kept as a separate proposal
+with its own risk (global allocator swap, Android allocator interaction, RSS
+behaviour) rather than part of the flag set, and it needs a before/after
+number before adoption.
+
+### 7.7 PGO / BOLT — deferred
+
+PGO and BOLT are both feasible in principle (clang is available, and the
+workload here is a usable training input), but the only target that matters
+for the Android startup number cannot be trained here: instrumented training
+for `aarch64-linux-android` needs an NDK and a device (neither present), and a
+Linux x86-64 profile has no evidence of transferring to arm64. BOLT needs
+`llvm-bolt` and a Linux profile too. Deferred rather than proposed vaguely;
+revisit only with a device in the loop.
+
+### 7.8 Reproduce the C++ table by hand
+
+For one configuration (the exact command the harness runs, per source):
+
+```bash
+GEN=target/perf/tjs-opt/gen
+zig c++ -std=c++17 -fPIC -pthread -fno-sanitize=undefined -DNDEBUG \
+  -DTJS_TEXT_OUT_CRLF -D__STDC_CONSTANT_MACROS -DUSE_UNICODE_FSTRING \
+  -DFMT_HEADER_ONLY -DSPDLOG_FMT_EXTERNAL -Wno-date-time \
+  -Wno-tautological-constant-out-of-range-compare \
+  -I crates/tjs/cpp/tjs2 -I "$GEN" -I crates/tjs/cpp -I deps/zig-out/include \
+  -O2 -c crates/tjs/cpp/tjs2/<one>.cpp -o /tmp/obj/<one>.o
+zig c++ -std=c++17 -O2 -I crates/tjs/cpp -I crates/tjs/cpp/tjs2 -I "$GEN" \
+  -I deps/zig-out/include scripts/perf/tjs2_bench.cpp /tmp/obj/*.o \
+  deps/zig-out/lib/libonig.a -lz -o /tmp/bench
+/tmp/bench compile target/perf/tjs-opt/corpus 20 --tjs-only
+/tmp/bench exec scripts/perf/workload.tjs 1 total
+```

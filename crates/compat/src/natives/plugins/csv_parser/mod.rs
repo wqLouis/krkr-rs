@@ -362,7 +362,7 @@ fn read_storage_text(engine: *mut c_void, filename: &str, utf8: bool) -> Result<
     if utf8 {
         String::from_utf8(bytes).map_err(|error| format!("UTF-8: {error}"))
     } else {
-        crate::text::decode_text(&bytes, None)
+        crate::text::decode_text(&bytes, crate::text::TextEncoding::Detect)
     }
 }
 

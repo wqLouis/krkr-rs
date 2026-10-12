@@ -231,7 +231,7 @@ impl KagEnv {
             // SAFETY: the host keeps an attached storage alive for the whole
             // VM lifetime (see `CompatServices::attach_storage`).
             let bytes = unsafe { &*ptr }.read(name).map_err(|e| e.to_string())?;
-            crate::text::decode_text(&bytes, None)
+            crate::text::decode_text(&bytes, crate::text::TextEncoding::Detect)
         });
         let label: Option<LabelClosure> = if owner.is_null() {
             None

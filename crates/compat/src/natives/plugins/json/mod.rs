@@ -960,7 +960,14 @@ extern "C" fn native_eval_json_storage(
             return report_error(out_error, &format!("Scripts.evalJSONStorage: {error}"));
         }
     };
-    let encoding = if utf8 { Some("UTF-8") } else { None };
+    // `utf8 = false` means the current code page (`anaul.tjs:16,19`, matching
+    // `encode_text` above). No current-code-page model exists, so name the
+    // documented CP932; detection would read CP932 `"あ"` as windows-1251.
+    let encoding = if utf8 {
+        crate::text::TextEncoding::Named("UTF-8")
+    } else {
+        crate::text::TextEncoding::Named("cp932")
+    };
     let text = match crate::text::decode_text(&bytes, encoding) {
         Ok(text) => text,
         Err(error) => {

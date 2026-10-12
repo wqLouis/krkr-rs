@@ -352,6 +352,170 @@ fn font_map_prerendered_font_raises_for_a_missing_storage() {
     env.error("f.id");
 }
 
+/// Reference: `tTVPPrerenderedFont`'s constructor reads the file and checks
+/// the header, wrapping every failure in `TVPPrerenderedFontMappingFailed` =
+/// "Prerendered font mapping failed : %1"
+/// (`reference/cpp/core/base/impl/MsgImpl.h:58-59`). The sub-messages are
+/// `TVPFileSizeIsZero` "File size is zero."
+/// (`reference/cpp/core/base/MsgIntfInc.h:218`), `TVPInvalidPrerenderedFontFile`
+/// "Signature not found or invalid pre-rendered font file." (`:221-222`),
+/// `TVPNot16BitUnicodeFontFile` "Not a 16-bit UNICODE font file." (`:223`) and
+/// `TVPInvalidHeaderVersion` "Invalid header version." (`:224`); the checks
+/// themselves are at `reference/cpp/core/visual/PrerenderedFont.cpp:22-58`.
+#[test]
+fn font_map_prerendered_font_raises_the_reference_header_errors() {
+    let _lock = vm_lock();
+    let env = common::Env::with_storage();
+    let game_dir = env.game_dir().expect("game dir").clone();
+    std::fs::write(game_dir.join("empty.tft"), b"").expect("write empty");
+    std::fs::write(game_dir.join("bad-signature.tft"), vec![0u8; 64]).expect("write bad signature");
+    let mut bad_version = build_tft(&[b'A' as u16], 7);
+    bad_version[22] = 2;
+    std::fs::write(game_dir.join("bad-version.tft"), &bad_version).expect("write bad version");
+    let mut not_unicode = build_tft(&[b'A' as u16], 7);
+    not_unicode[23] = 1;
+    std::fs::write(game_dir.join("not-unicode.tft"), &not_unicode).expect("write not-unicode");
+    env.run("var f = new Font('Ghost', 16, 0);");
+
+    let empty = env.error("f.mapPrerenderedFont('empty.tft')");
+    assert!(
+        empty.contains("Prerendered font mapping failed : File size is zero."),
+        "unexpected empty-file message: {empty}"
+    );
+    let signature = env.error("f.mapPrerenderedFont('bad-signature.tft')");
+    assert!(
+        signature.contains(
+            "Prerendered font mapping failed : Signature not found or invalid pre-rendered font file."
+        ),
+        "unexpected signature message: {signature}"
+    );
+    let version = env.error("f.mapPrerenderedFont('bad-version.tft')");
+    assert!(
+        version.contains("Prerendered font mapping failed : Invalid header version."),
+        "unexpected version message: {version}"
+    );
+    let unicode = env.error("f.mapPrerenderedFont('not-unicode.tft')");
+    assert!(
+        unicode.contains("Prerendered font mapping failed : Not a 16-bit UNICODE font file."),
+        "unexpected unicode message: {unicode}"
+    );
+    // A failed mapping is not recorded: the font stays usable and unmapped.
+    assert_eq!(env.eval_int("f.height"), 16);
+}
+
+/// Reference: `tTVPPrerenderedFont`'s constructor reads the whole file and
+/// keeps it (`reference/cpp/core/visual/PrerenderedFont.cpp:9-76`). This port
+/// validates the fixed header at map time and defers the glyph body, so a
+/// startup-shaped run of 24 mappings reads 24 header prefixes and no glyph
+/// payload.
+#[test]
+fn font_prerendered_map_reads_only_the_header() {
+    let _lock = vm_lock();
+    let env = common::Env::with_storage();
+    let game_dir = env.game_dir().expect("game dir").clone();
+    for i in 0..24u16 {
+        std::fs::write(
+            game_dir.join(format!("f{i}.tft")),
+            build_tft(&[b'A' as u16 + i], 100),
+        )
+        .expect("write tft");
+    }
+    env.run(
+        "for (var i = 0; i < 24; i = i + 1) { \
+             var f = new Font('Ghost', i + 1, 0); \
+             f.mapPrerenderedFont('f' + i + '.tft'); \
+         }",
+    );
+    let storage = env.storage().expect("storage");
+    // 24 mappings, a 36-byte header prefix each, no glyph payload.
+    assert_eq!(storage.read_bytes(), 24 * 36);
+}
+
+/// Reference: `TVPMapPrerenderedFont` reuses the `tTVPPrerenderedFont` already
+/// in `TVPPrerenderedFonts` for the same placed path and `AddRef`s it instead
+/// of reading again (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:129-147`).
+#[test]
+fn font_prerendered_remap_reads_nothing() {
+    let _lock = vm_lock();
+    let env = common::Env::with_storage();
+    let game_dir = env.game_dir().expect("game dir").clone();
+    std::fs::write(game_dir.join("sample.tft"), build_tft(&[b'A' as u16], 100)).expect("write tft");
+    env.run(
+        "var f1 = new Font('Ghost', 12, 0); \
+         f1.mapPrerenderedFont('sample.tft');",
+    );
+    assert_eq!(env.storage().expect("storage").read_bytes(), 36);
+    env.run(
+        "var f2 = new Font('Ghost', 16, 0); \
+         f2.mapPrerenderedFont('sample.tft');",
+    );
+    assert_eq!(env.storage().expect("storage").read_bytes(), 36);
+}
+
+/// Reference: `tTVPNativeBaseBitmap::DrawTextMultiple` writes each character's
+/// pre-rendered coverage through `Retrieve` and `TVPUpscale65_255`
+/// (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:1285-1433`,
+/// `reference/cpp/core/visual/PrerenderedFont.cpp:122-175`). This pins the
+/// exact pixels, so the lazily read body must produce what the eager path did.
+#[test]
+fn layer_draw_text_prerendered_pixels_match_the_coverage() {
+    let _lock = vm_lock();
+    let Some((font_dir, font_name)) = test_font() else {
+        return;
+    };
+    let font_bytes = std::fs::read(font_dir.join(&font_name)).expect("read test font");
+    let env = common::Env::with_storage();
+    let game_dir = env.game_dir().expect("game dir").clone();
+    std::fs::write(game_dir.join("Pre"), &font_bytes).expect("write face");
+    std::fs::write(game_dir.join("sample.tft"), build_tft(&[b'A' as u16], 3)).expect("write tft");
+    env.run(
+        "var w = new Window(); \
+         var l = new Layer(w, null); \
+         l.setImageSize(64, 64); \
+         var f = new Font('Pre', 12, 0); \
+         f.mapPrerenderedFont('sample.tft'); \
+         l.font.face = 'Pre'; \
+         l.font.height = 12; \
+         l.font.bold = false; \
+         l.font.italic = false; \
+         l.font.angle = 0; \
+         l.drawText(4, 4, 'A', 0x00ffffff, 255);",
+    );
+    let layer = env.scene.layers.last().expect("the layer exists");
+    let bitmap = env
+        .scene
+        .bitmap(layer.bitmap.expect("the layer has a main image"))
+        .expect("the bitmap exists");
+    // A fresh transparent layer painted source-over gives alpha == coverage, so
+    // the 2x2 descriptor's decoded `[0x40, 0x80, 0xC0, 0xFC]` is the exact
+    // painted block.
+    let mut painted: Vec<(u32, u32, u8)> = Vec::new();
+    for y in 0..bitmap.height {
+        for x in 0..bitmap.width {
+            let at = ((y * bitmap.width + x) * 4) as usize;
+            if bitmap.rgba[at + 3] != 0 {
+                painted.push((x, y, bitmap.rgba[at + 3]));
+            }
+        }
+    }
+    assert_eq!(painted.len(), 4, "exactly the 2x2 glyph is painted");
+    let x0 = painted.iter().map(|p| p.0).min().expect("a painted pixel");
+    let y0 = painted.iter().map(|p| p.1).min().expect("a painted pixel");
+    assert_eq!(
+        (
+            painted.iter().map(|p| p.0).max().unwrap() - x0,
+            painted.iter().map(|p| p.1).max().unwrap() - y0
+        ),
+        (1, 1),
+        "the painted pixels form one 2x2 block"
+    );
+    let mut alphas = [0u8; 4];
+    for (x, y, alpha) in &painted {
+        alphas[((y - y0) * 2 + (x - x0)) as usize] = *alpha;
+    }
+    assert_eq!(alphas, [0x40, 0x80, 0xC0, 0xFC]);
+}
+
 /// Reference: `tTVPNativeBaseBitmap::GetTextSize` sums each character's
 /// pre-rendered `Inc` and reports `abs(Font.Height)` as the height
 /// (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:1435-1473`).

@@ -1,0 +1,38 @@
+// Dispatch/object/array/dictionary/string workload for the TJS2 VM A/B.
+// Not a game script: exercises the interpreter paths that dominate script
+// execution (member calls, object creation, indexing, string building).
+class BenchPoint {
+    function BenchPoint(x, y) { this.x = x; this.y = y; }
+    function sum() { return this.x + this.y; }
+    function dist2(other) {
+        var dx = this.x - other.x;
+        var dy = this.y - other.y;
+        return dx * dx + dy * dy;
+    }
+}
+function benchAdd(a, b) { return a + b; }
+var total = 0;
+var pts = [];
+for (var i = 0; i < 20000; i++)
+    pts[i] = new BenchPoint(i, i * 2);
+for (var iter = 0; iter < 20; iter++) {
+    for (var i = 0; i < 20000; i++) {
+        var p = pts[i];
+        total += p.sum();
+        total = benchAdd(total, 1);
+        if (i > 0) total += p.dist2(pts[i - 1]) % 7;
+    }
+}
+var d = %[];
+for (var i = 0; i < 20000; i++)
+    d["k" + (i % 1000)] = i;
+for (var i = 0; i < 1000; i++)
+    total += d["k" + i];
+var s = "";
+for (var i = 0; i < 5000; i++)
+    s += "x";
+total += s.length;
+var f = 0.0;
+for (var i = 0; i < 20000; i++)
+    f = f * 1.0000001 + Math.sqrt(i);
+total += Math.floor(f);

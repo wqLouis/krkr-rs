@@ -7,7 +7,7 @@ use std::io::{Read, Seek, SeekFrom};
 
 use api::error::FsError;
 use api::fs::{FsPath, OpenMode};
-use fs::xp3::{XP3_MAGIC, Xp3Archive, Xp3Error, normalize_in_archive_name};
+use fs::xp3::{SEGM_ENCODE_RAW, XP3_MAGIC, Xp3Archive, Xp3Error, normalize_in_archive_name};
 use fs::{FileState, FileSystem};
 use testkit::build_xp3;
 
@@ -688,4 +688,206 @@ fn extraction_filter_offset_advances_across_segments() {
         b"AAAABBBBBB"
     );
     assert_eq!(*calls.borrow(), vec![(0, 4), (4, 6)]);
+}
+
+// ---------------------------------------------------------------------------
+// Prefix reads (`Xp3Archive::read_prefix_with_filter`).
+//
+// The prefix API is our own capability, not a reference behaviour: on this
+// path the reference reads whole files. These tests pin the properties the
+// middle-layer wrapper relies on — correct leading bytes, in-order
+// concatenation across segments, short results, and the same typed errors as
+// the whole-entry read.
+// ---------------------------------------------------------------------------
+
+/// Build a raw-index XP3 archive holding one entry made of several raw
+/// segments, so a read must concatenate them in order. Layout mirrors
+/// `testkit::build_xp3`; the index is stored raw.
+fn build_xp3_raw_segments(name: &str, segments: &[&[u8]]) -> Vec<u8> {
+    let mut file = Vec::new();
+    file.extend_from_slice(&XP3_MAGIC);
+    file.extend_from_slice(&0u64.to_le_bytes());
+
+    let mut segm = Vec::new();
+    let mut org_size = 0u64;
+    let mut arc_size = 0u64;
+    for data in segments {
+        let start = file.len() as u64;
+        file.extend_from_slice(data);
+        segm.extend_from_slice(&SEGM_ENCODE_RAW.to_le_bytes());
+        segm.extend_from_slice(&start.to_le_bytes());
+        segm.extend_from_slice(&(data.len() as u64).to_le_bytes());
+        segm.extend_from_slice(&(data.len() as u64).to_le_bytes());
+        org_size += data.len() as u64;
+        arc_size += data.len() as u64;
+    }
+
+    let units: Vec<u16> = name.encode_utf16().collect();
+    let mut info = Vec::new();
+    info.extend_from_slice(&0u32.to_le_bytes());
+    info.extend_from_slice(&org_size.to_le_bytes());
+    info.extend_from_slice(&arc_size.to_le_bytes());
+    info.extend_from_slice(&(units.len() as i16).to_le_bytes());
+    for unit in &units {
+        info.extend_from_slice(&unit.to_le_bytes());
+    }
+
+    let mut body = Vec::new();
+    body.extend_from_slice(b"info");
+    body.extend_from_slice(&(info.len() as u64).to_le_bytes());
+    body.extend_from_slice(&info);
+    body.extend_from_slice(b"segm");
+    body.extend_from_slice(&(segm.len() as u64).to_le_bytes());
+    body.extend_from_slice(&segm);
+    body.extend_from_slice(b"adlr");
+    body.extend_from_slice(&4u64.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+
+    let mut chunk = Vec::new();
+    chunk.extend_from_slice(b"File");
+    chunk.extend_from_slice(&(body.len() as u64).to_le_bytes());
+    chunk.extend_from_slice(&body);
+
+    let index_ofs = file.len() as u64;
+    file.push(0u8); // raw index block
+    file.extend_from_slice(&(chunk.len() as u64).to_le_bytes());
+    file.extend_from_slice(&chunk);
+    file[11..19].copy_from_slice(&index_ofs.to_le_bytes());
+    file
+}
+
+/// A raw entry split across segments: the prefix is the leading bytes and the
+/// segments are concatenated in order.
+#[test]
+fn read_prefix_concatenates_raw_segments_in_order() {
+    let xp3 = build_xp3_raw_segments("multi.bin", &[b"AAAA", b"BBBBBB", b"CC"]);
+    let (fs, file) = fs_with(&xp3);
+    let archive = Xp3Archive::open(&fs, &file).expect("open archive");
+
+    assert_eq!(
+        archive
+            .read_prefix_with_filter(&fs, &file, "multi.bin", "", 4, None)
+            .unwrap(),
+        b"AAAA"
+    );
+    assert_eq!(
+        archive
+            .read_prefix_with_filter(&fs, &file, "multi.bin", "", 6, None)
+            .unwrap(),
+        b"AAAABB"
+    );
+    assert_eq!(
+        archive
+            .read_prefix_with_filter(&fs, &file, "multi.bin", "", 12, None)
+            .unwrap(),
+        b"AAAABBBBBBCC"
+    );
+    assert_eq!(
+        archive
+            .read_prefix_with_filter(&fs, &file, "multi.bin", "", 64, None)
+            .unwrap(),
+        b"AAAABBBBBBCC"
+    );
+}
+
+/// A prefix that spans a segment boundary is exactly the leading slice of the
+/// whole-entry read, for every limit from zero to past the end.
+#[test]
+fn read_prefix_matches_a_truncated_whole_read() {
+    let xp3 = build_xp3_raw_segments("span.bin", &[b"0123456789", b"abcdefghij", b"XYZ"]);
+    let (fs, file) = fs_with(&xp3);
+    let archive = Xp3Archive::open(&fs, &file).expect("open archive");
+    let entry = archive.entry("span.bin").expect("entry");
+    let whole = archive.read_entry(&fs, &file, entry).unwrap();
+    assert_eq!(whole, b"0123456789abcdefghijXYZ");
+
+    for max_len in [0usize, 1, 5, 9, 10, 11, 15, 20, 23, 24, 100] {
+        let prefix = archive
+            .read_prefix_with_filter(&fs, &file, "span.bin", "", max_len, None)
+            .unwrap();
+        assert_eq!(
+            prefix.as_slice(),
+            &whole[..max_len.min(whole.len())],
+            "max_len {max_len}"
+        );
+    }
+}
+
+/// An entry shorter than `max_len` returns short, and a zero limit returns
+/// empty. `read_prefix_with_filter` is our own API and the caller decides
+/// whether a short result is an error.
+#[test]
+fn read_prefix_returns_short_entries_short() {
+    let xp3 = build_xp3(&[("tiny.bin", b"hi", false)]);
+    let (fs, file) = fs_with(&xp3);
+    let archive = Xp3Archive::open(&fs, &file).expect("open archive");
+
+    assert_eq!(
+        archive
+            .read_prefix_with_filter(&fs, &file, "tiny.bin", "", 64, None)
+            .unwrap(),
+        b"hi"
+    );
+    assert!(
+        archive
+            .read_prefix_with_filter(&fs, &file, "tiny.bin", "", 0, None)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// A zlib-backed entry's prefix is the leading bytes of its whole read.
+#[test]
+fn read_prefix_reads_a_zlib_entry() {
+    let payload = b"zlib compressed leading bytes";
+    let xp3 = build_xp3(&[("packed.bin", payload, true)]);
+    let (fs, file) = fs_with(&xp3);
+    let archive = Xp3Archive::open(&fs, &file).expect("open archive");
+    let entry = archive.entry("packed.bin").expect("entry");
+
+    assert_eq!(archive.read_entry(&fs, &file, entry).unwrap(), payload);
+    assert_eq!(
+        archive
+            .read_prefix_with_filter(&fs, &file, "packed.bin", "", 5, None)
+            .unwrap(),
+        b"zlib "
+    );
+}
+
+/// A genuine zlib decode failure is the same typed error the whole-entry read
+/// produces. The single segment of `bad.bin` starts at offset 19 (11-byte
+/// magic + 8-byte index-offset slot).
+#[test]
+fn read_prefix_reports_a_zlib_failure() {
+    let payload = vec![0x5au8; 4096];
+    let mut xp3 = build_xp3(&[("bad.bin", &payload, true)]);
+    xp3[19] ^= 0xff; // corrupt the zlib header
+    let (fs, file) = fs_with(&xp3);
+    let archive = Xp3Archive::open(&fs, &file).expect("open archive");
+
+    let err = archive
+        .read_prefix_with_filter(&fs, &file, "bad.bin", "", 64, None)
+        .unwrap_err();
+    assert!(
+        matches!(err, Xp3Error::Inflate(_)),
+        "unexpected error: {err:?}"
+    );
+}
+
+/// A prefix read preserves a bottom-layer read failure as the original typed
+/// `FsError`, exactly like the whole-entry read.
+#[test]
+fn read_prefix_preserves_a_bottom_read_failure() {
+    let xp3 = build_xp3(&[("gone.bin", b"payload", false)]);
+    let (fs, file) = fs_with(&xp3);
+    let archive = Xp3Archive::open(&fs, &file).expect("open archive");
+    fs::remove_file(&fs, &FsPath::host("/bad.xp3")).expect("remove backing file");
+
+    let err = archive
+        .read_prefix_with_filter(&fs, &file, "gone.bin", "", 4, None)
+        .unwrap_err();
+    assert!(
+        matches!(err, Xp3Error::Fs(FsError::NotFound { .. })),
+        "typed FsError was not preserved: {err:?}"
+    );
 }

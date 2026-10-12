@@ -161,15 +161,22 @@ fn probe_script() -> &'static str {
     "return \"日本語 OK\";"
 }
 
+/// A Japanese script long enough for charset detection to report Shift_JIS
+/// (cp932). The short `probe_script` above is not detectable on its own; it is
+/// only used on the BOM/container/override paths, which do not run detection.
+fn detectable_japanese_script() -> &'static str {
+    "// これは日本語のスクリプトです。文字コードの判定を確かめるためのテストです。\nreturn \"日本語のテストに成功しました\";"
+}
+
 #[test]
 fn cp932_script_is_decoded() {
     let _lock = vm_lock();
     let dir = GameDir::new();
-    dir.write("cp932.tjs", &cp932(probe_script()));
+    dir.write("cp932.tjs", &cp932(detectable_japanese_script()));
     let env = Env::new(dir);
     assert_eq!(
         env.eval_ok("Scripts.execStorage('cp932.tjs')"),
-        TjsValue::String("日本語 OK".into())
+        TjsValue::String("日本語のテストに成功しました".into())
     );
 }
 
@@ -235,12 +242,14 @@ fn text_encoding_override_forces_the_decoder() {
     dir.write("cp932.tjs", &cp932(probe_script()));
     let env = Env::new(dir);
 
-    // Forcing UTF-8 must reject the CP932 bytes rather than fall back.
+    // Forcing UTF-8 uses the override, not detection: the malformed CP932 bytes
+    // are dropped (the reference's Boost.Locale `skip` policy) rather than the
+    // script being detected as Shift_JIS or the load raising.
     env.eval_ok("Scripts.textEncoding = 'utf-8'");
-    let message = env.error("Scripts.execStorage('cp932.tjs')");
-    assert!(
-        message.contains("UTF-8"),
-        "expected a UTF-8 error, got: {message}"
+    assert_eq!(
+        env.eval_ok("Scripts.execStorage('cp932.tjs')"),
+        TjsValue::String("{ OK".into()),
+        "forcing UTF-8 must drop the malformed bytes, not fall back to detection"
     );
 
     // An unknown override is a typed error, not a silent auto-detect.

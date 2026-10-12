@@ -378,6 +378,7 @@ fn main() {
     // `TJS2_OPT` selects the vendored-C++ optimisation level; changing it must
     // trigger a rebuild of the static library.
     println!("cargo:rerun-if-env-changed=TJS2_OPT");
+    println!("cargo:rerun-if-env-changed=TJS2_EXTRA_CXXFLAGS");
 
     // -- toolchain ----------------------------------------------------------
     // The C compiler is what switches oniguruma off the zig path; see the
@@ -546,6 +547,13 @@ fn main() {
     // TU, special-case its file name here. `TJS2_OPT` overrides the level for
     // benchmarking.
     let opt = env::var("TJS2_OPT").unwrap_or_else(|_| "-O2".to_string());
+    flags.push(opt);
+    // `TJS2_EXTRA_CXXFLAGS` appends whitespace-separated flags after the
+    // optimisation level for A/B benchmarking (for example `-flto`). It is
+    // unset in the shipped build. Flags that change float semantics must not
+    // be used: script-observable values are part of the compatibility surface.
+    let extra = env::var("TJS2_EXTRA_CXXFLAGS").unwrap_or_default();
+    flags.extend(extra.split_whitespace().map(str::to_string));
 
     // Collect all sources: upstream tjs2 + generated parsers + our shim.
     let mut sources: Vec<PathBuf> = TJS2_SOURCES.iter().map(|s| tjs2_dir.join(s)).collect();
@@ -563,7 +571,6 @@ fn main() {
         .map(|src| {
             let cxx = cxx.clone();
             let flags = flags.clone();
-            let opt = opt.clone();
             let obj_dir = obj_dir.clone();
             let failed = failed.clone();
             let lock = lock.clone();
@@ -577,7 +584,6 @@ fn main() {
                 let mut cmd = Command::new(&cxx[0]);
                 cmd.args(&cxx[1..])
                     .args(&flags)
-                    .arg(&opt)
                     .arg("-c")
                     .arg(&src)
                     .arg("-o")

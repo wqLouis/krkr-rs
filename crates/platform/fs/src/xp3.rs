@@ -340,6 +340,141 @@ impl Xp3Archive {
         self.read_entry_from(&mut reader, entry, archive_name, filter)
     }
 
+    /// Read at most `max_len` bytes from the start of an entry by name,
+    /// applying an extraction filter to each decoded segment.
+    ///
+    /// This is the lazy counterpart of [`Self::read_with_filter`]: a raw
+    /// segment is read positionally up to the limit, and a zlib segment is
+    /// inflated only as far as the requested bytes need, so a header probe
+    /// never inflates the whole entry. It concatenates across segments until
+    /// `max_len` is reached; trailing segments are not read or decoded. This
+    /// is our own API, not a reference-parity claim: the reference exposes a
+    /// seekable per-member stream (`tTVPXP3ArchiveStream`) but on this path
+    /// reads whole files, so the reference does not do partial reads here.
+    /// Segment order and concatenation are the same as [`Self::read`], and a
+    /// genuine decode or I/O failure is the same typed error. A shorter entry
+    /// returns short; the caller decides whether a short result is an error
+    /// (the middle-layer wrapper treats a short header as the reference's own
+    /// short-read case).
+    pub fn read_prefix_with_filter(
+        &self,
+        fs: &FileSystem,
+        file: &FileState,
+        name: &str,
+        archive_name: &str,
+        max_len: usize,
+        filter: Option<&Xp3ExtractionFilter<'_>>,
+    ) -> Result<Vec<u8>> {
+        let normalized = normalize_in_archive_name(name);
+        let entry = self
+            .entries
+            .get(&normalized)
+            .ok_or_else(|| Xp3Error::NotFound(name.to_string()))?;
+        let mut reader = FileReader { fs, file, pos: 0 };
+        self.read_entry_prefix_from(&mut reader, entry, archive_name, max_len, filter)
+    }
+
+    /// Read at most `max_len` bytes of an entry from an in-memory archive
+    /// image, with the same bounds checks as [`Self::read_entry_from_bytes`].
+    pub fn read_entry_prefix_from_bytes(
+        &self,
+        bytes: &[u8],
+        entry: &Entry,
+        archive_name: &str,
+        max_len: usize,
+        filter: Option<&Xp3ExtractionFilter<'_>>,
+    ) -> Result<Vec<u8>> {
+        let len = u64::try_from(bytes.len())
+            .map_err(|_| Xp3Error::CorruptIndex("archive image is too large to address"))?;
+        for seg in &entry.segments {
+            let start = self
+                .base
+                .checked_add(seg.start)
+                .ok_or(Xp3Error::CorruptIndex("segment offset overflow"))?;
+            let end = start
+                .checked_add(seg.arc_size)
+                .ok_or(Xp3Error::CorruptIndex("segment size overflow"))?;
+            if end > len {
+                return Err(Xp3Error::CorruptIndex("segment overruns the archive image"));
+            }
+        }
+        let mut reader = io::Cursor::new(bytes);
+        self.read_entry_prefix_from(&mut reader, entry, archive_name, max_len, filter)
+    }
+
+    /// Read a bounded prefix of an entry through any `Read + Seek` source.
+    fn read_entry_prefix_from<R: Read + Seek>(
+        &self,
+        reader: &mut R,
+        entry: &Entry,
+        archive_name: &str,
+        max_len: usize,
+        filter: Option<&Xp3ExtractionFilter<'_>>,
+    ) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut offset: u64 = 0;
+        for seg in &entry.segments {
+            if out.len() >= max_len {
+                break;
+            }
+            let remaining = max_len - out.len();
+            let method = seg.flags & SEGM_ENCODE_METHOD_MASK;
+            // The decoded length of a segment: the uncompressed size for a
+            // zlib segment, the stored size for a raw one.
+            let decoded_len = if method == SEGM_ENCODE_ZLIB {
+                seg.org_size
+            } else {
+                seg.arc_size
+            };
+            let want = u64::try_from(remaining)
+                .map_err(|_| Xp3Error::CorruptIndex("segment too large"))?
+                .min(decoded_len);
+            let want =
+                usize::try_from(want).map_err(|_| Xp3Error::CorruptIndex("segment too large"))?;
+            let start = self
+                .base
+                .checked_add(seg.start)
+                .ok_or(Xp3Error::CorruptIndex("segment offset overflow"))?;
+            reader.seek(SeekFrom::Start(start))?;
+            let mut decoded = match method {
+                SEGM_ENCODE_RAW => {
+                    let mut buf = alloc_zeroed(want, "segment too large")?;
+                    reader.read_exact(&mut buf)?;
+                    buf
+                }
+                SEGM_ENCODE_ZLIB => {
+                    let mut buf = alloc_zeroed(want, "segment too large")?;
+                    // The decoder pulls compressed bytes from the bounded
+                    // reader on demand, so only as much of the segment as the
+                    // requested output needs is read and inflated.
+                    let mut dec = ZlibDecoder::new((&mut *reader).take(seg.arc_size));
+                    dec.read_exact(&mut buf)
+                        .map_err(|_| Xp3Error::Inflate(entry.name.clone()))?;
+                    buf
+                }
+                other => return Err(Xp3Error::UnknownSegmentMethod(other, seg.flags)),
+            };
+            // The reference applies the extraction filter to the decoded
+            // segment with the uncompressed offset and the normalized
+            // in-archive name; a prefix is the same transform on fewer bytes.
+            if let Some(filter) = filter {
+                filter(
+                    entry.file_hash,
+                    offset,
+                    &mut decoded,
+                    &entry.name,
+                    archive_name,
+                    entry.org_size,
+                );
+            }
+            offset = offset
+                .checked_add(decoded.len() as u64)
+                .ok_or(Xp3Error::CorruptIndex("entry size overflow"))?;
+            out.extend_from_slice(&decoded);
+        }
+        Ok(out)
+    }
+
     /// Read an entry through any `Read + Seek` source.
     fn read_entry_from<R: Read + Seek>(
         &self,
@@ -824,5 +959,268 @@ mod tests {
         index.extend_from_slice(&[0u8; 3]);
         let err = archive.parse_index(&index).unwrap_err();
         assert!(matches!(err, Xp3Error::CorruptIndex(_)));
+    }
+
+    /// A prefix read concatenates across raw and zlib segments and stops at
+    /// the requested length.
+    #[test]
+    fn prefix_read_concatenates_across_segments() {
+        use flate2::Compression;
+        use flate2::write::ZlibEncoder;
+        use std::io::Write;
+
+        let raw_a = b"AAAA".to_vec();
+        let raw_b = b"BBBBBB".to_vec();
+        let zlib_src = b"CCCCCCCC".to_vec();
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(&zlib_src).expect("zlib compress");
+        let zlib = enc.finish().expect("zlib finish");
+
+        let mut image = Vec::new();
+        let start_a = image.len() as u64;
+        image.extend_from_slice(&raw_a);
+        let start_b = image.len() as u64;
+        image.extend_from_slice(&raw_b);
+        let start_c = image.len() as u64;
+        image.extend_from_slice(&zlib);
+
+        let entry = Entry {
+            flags: 0,
+            org_size: (raw_a.len() + raw_b.len() + zlib_src.len()) as u64,
+            arc_size: (raw_a.len() + raw_b.len() + zlib.len()) as u64,
+            raw_name: "multi.bin".to_string(),
+            name: "multi.bin".to_string(),
+            segments: vec![
+                Segment {
+                    flags: SEGM_ENCODE_RAW,
+                    start: start_a,
+                    org_size: raw_a.len() as u64,
+                    arc_size: raw_a.len() as u64,
+                },
+                Segment {
+                    flags: SEGM_ENCODE_RAW,
+                    start: start_b,
+                    org_size: raw_b.len() as u64,
+                    arc_size: raw_b.len() as u64,
+                },
+                Segment {
+                    flags: SEGM_ENCODE_ZLIB,
+                    start: start_c,
+                    org_size: zlib_src.len() as u64,
+                    arc_size: zlib.len() as u64,
+                },
+            ],
+            file_hash: 0,
+        };
+
+        let archive = Xp3Archive {
+            base: 0,
+            entries: BTreeMap::new(),
+        };
+        let mut reader = io::Cursor::new(image.as_slice());
+        assert_eq!(
+            archive
+                .read_entry_prefix_from(&mut reader, &entry, "test.xp3", 6, None)
+                .unwrap(),
+            b"AAAABB"
+        );
+        assert_eq!(
+            archive
+                .read_entry_prefix_from(&mut reader, &entry, "test.xp3", 12, None)
+                .unwrap(),
+            b"AAAABBBBBBCC"
+        );
+        assert_eq!(
+            archive
+                .read_entry_prefix_from(&mut reader, &entry, "test.xp3", 64, None)
+                .unwrap(),
+            b"AAAABBBBBBCCCCCCCC"
+        );
+    }
+
+    /// A `Read + Seek` source that counts the bytes it hands out, so the
+    /// prefix path can be shown to pull materially less input than the
+    /// whole-entry path.
+    struct CountingReader<'a> {
+        data: &'a [u8],
+        pos: usize,
+        bytes_read: usize,
+    }
+
+    impl Read for CountingReader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let remaining = self.data.len().saturating_sub(self.pos);
+            let n = buf.len().min(remaining);
+            buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            self.bytes_read += n;
+            Ok(n)
+        }
+    }
+
+    impl Seek for CountingReader<'_> {
+        fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+            let target: i128 = match pos {
+                SeekFrom::Start(off) => off as i128,
+                SeekFrom::End(off) => self.data.len() as i128 + off as i128,
+                SeekFrom::Current(off) => self.pos as i128 + off as i128,
+            };
+            let target = u64::try_from(target.max(0)).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "seek target is out of range")
+            })?;
+            self.pos = usize::try_from(target).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "seek target is out of range")
+            })?;
+            Ok(target)
+        }
+    }
+
+    /// Build a one-segment entry whose stored bytes live at archive offset
+    /// `start` in an image the caller supplies.
+    fn single_segment_entry(
+        name: &str,
+        method: u32,
+        start: u64,
+        stored: &[u8],
+        org_size: usize,
+    ) -> Entry {
+        Entry {
+            flags: 0,
+            org_size: org_size as u64,
+            arc_size: stored.len() as u64,
+            raw_name: name.to_string(),
+            name: name.to_string(),
+            segments: vec![Segment {
+                flags: method,
+                start,
+                org_size: org_size as u64,
+                arc_size: stored.len() as u64,
+            }],
+            file_hash: 0,
+        }
+    }
+
+    /// A zlib prefix inflates only as far as the requested bytes: 36 bytes of
+    /// a 1 MiB incompressible entry decode far less than the whole-entry read
+    /// and pull far less input from the source, and the decoded output stops
+    /// at 36 bytes. Two things are counted: the decoded bytes the extraction
+    /// filter sees (36 vs the whole entry), and the raw bytes the zlib decoder
+    /// pulled through the counting `Read`. This is our own prefix capability
+    /// (the reference reads whole files on this path), so it carries no
+    /// reference citation.
+    #[test]
+    fn prefix_inflates_only_the_requested_bytes() {
+        use flate2::Compression;
+        use flate2::write::ZlibEncoder;
+        use std::io::Write;
+
+        let mut payload = Vec::with_capacity(1 << 20);
+        let mut state: u32 = 0x1234_5678;
+        for _ in 0..(1 << 20) {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            payload.push((state >> 24) as u8);
+        }
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(&payload).expect("zlib compress");
+        let stored = enc.finish().expect("zlib finish");
+        assert!(
+            stored.len() > 64 * 1024,
+            "fixture must exceed the decoder buffer: {}",
+            stored.len()
+        );
+
+        let entry = single_segment_entry("big.bin", SEGM_ENCODE_ZLIB, 0, &stored, payload.len());
+        let archive = Xp3Archive {
+            base: 0,
+            entries: BTreeMap::new(),
+        };
+
+        let mut prefix_reader = CountingReader {
+            data: &stored,
+            pos: 0,
+            bytes_read: 0,
+        };
+        let prefix_decoded = std::cell::Cell::new(0usize);
+        let prefix_filter =
+            |_hash: u32,
+             _offset: u64,
+             buffer: &mut [u8],
+             _name: &str,
+             _archive: &str,
+             _size: u64| { prefix_decoded.set(prefix_decoded.get() + buffer.len()) };
+        let prefix = archive
+            .read_entry_prefix_from(&mut prefix_reader, &entry, "", 36, Some(&prefix_filter))
+            .expect("prefix read");
+        assert_eq!(prefix, payload[..36]);
+        let prefix_bytes = prefix_reader.bytes_read;
+        let prefix_decoded = prefix_decoded.get();
+
+        let mut whole_reader = CountingReader {
+            data: &stored,
+            pos: 0,
+            bytes_read: 0,
+        };
+        let whole_decoded = std::cell::Cell::new(0usize);
+        let whole_filter =
+            |_hash: u32,
+             _offset: u64,
+             buffer: &mut [u8],
+             _name: &str,
+             _archive: &str,
+             _size: u64| { whole_decoded.set(whole_decoded.get() + buffer.len()) };
+        let whole = archive
+            .read_entry_from(&mut whole_reader, &entry, "", Some(&whole_filter))
+            .expect("whole read");
+        assert_eq!(whole, payload);
+        let whole_bytes = whole_reader.bytes_read;
+        let whole_decoded = whole_decoded.get();
+
+        assert_eq!(prefix.len(), 36, "decoded output must stop at max_len");
+        assert_eq!(
+            prefix_decoded, 36,
+            "the filter sees exactly max_len decoded bytes"
+        );
+        assert!(
+            prefix_decoded * 8 < whole_decoded,
+            "prefix decoded {prefix_decoded} bytes, whole decoded {whole_decoded}"
+        );
+        assert!(
+            prefix_bytes * 8 < whole_bytes,
+            "prefix pulled {prefix_bytes} source bytes, whole pulled {whole_bytes}"
+        );
+    }
+
+    /// A raw prefix reads positionally for exactly the requested bytes, and a
+    /// zero limit reads nothing at all.
+    #[test]
+    fn prefix_reads_raw_positionally_and_zero_reads_nothing() {
+        let stored: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+        let entry = single_segment_entry("raw.bin", SEGM_ENCODE_RAW, 0, &stored, stored.len());
+        let archive = Xp3Archive {
+            base: 0,
+            entries: BTreeMap::new(),
+        };
+
+        let mut reader = CountingReader {
+            data: &stored,
+            pos: 0,
+            bytes_read: 0,
+        };
+        let prefix = archive
+            .read_entry_prefix_from(&mut reader, &entry, "", 7, None)
+            .expect("prefix read");
+        assert_eq!(prefix, &stored[..7]);
+        assert_eq!(reader.bytes_read, 7);
+
+        let mut reader = CountingReader {
+            data: &stored,
+            pos: 0,
+            bytes_read: 0,
+        };
+        let empty = archive
+            .read_entry_prefix_from(&mut reader, &entry, "", 0, None)
+            .expect("zero-length prefix");
+        assert!(empty.is_empty());
+        assert_eq!(reader.bytes_read, 0);
     }
 }

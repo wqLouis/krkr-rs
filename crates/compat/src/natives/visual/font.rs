@@ -31,7 +31,7 @@ use super::common::{
 };
 use crate::native_util::{args, report_error, set_int, set_void, value_as_string};
 use crate::natives::system::{value_as_bool, value_as_i64};
-use crate::resource::{PrerenderedFont, PrerenderedKey};
+use crate::resource::{PrerenderedBody, PrerenderedKey};
 use crate::{CompatCtx, CompatError};
 
 /// `Font` payload: the scene font id. `owns_state` is true while this object
@@ -146,7 +146,8 @@ fn measure_text(
         angle: font.angle.round() as i32,
     };
     if !standalone && let Some(prerendered) = resolver.prerendered_for(&key) {
-        let width = prerendered_text_width(&resolver.engine, id, &prerendered, text, &style)
+        let body = prerendered.ensure_body(&ctx)?;
+        let width = prerendered_text_width(&resolver.engine, id, &body, text, &style)
             .map_err(|error| format!("Font: text layout failed: {error}"))?;
         return Ok((width, f64::from(font.height), font.angle));
     }
@@ -163,13 +164,13 @@ fn measure_text(
 fn prerendered_text_width(
     engine: &TextEngine,
     font: FontId,
-    prerendered: &PrerenderedFont,
+    body: &PrerenderedBody,
     text: &str,
     style: &TextStyle,
 ) -> Result<f64, TextError> {
     let mut width: i64 = 0;
     for unit in text.encode_utf16() {
-        if let Some(item) = prerendered.find_code_unit(unit) {
+        if let Some(item) = body.find_code_unit(unit) {
             width = width.saturating_add(i64::from(item.inc));
         } else if let Some(ch) = char::from_u32(u32::from(unit)) {
             width = width.saturating_add(engine.glyph_advance(font, ch, style)?.round() as i64);
@@ -833,6 +834,9 @@ extern "C" fn font_map_prerendered_font(
             "Font.mapPrerenderedFont: compat context is not bound",
         );
     };
+    // SAFETY: only succeeds for the installed, live binding.
+    let services = unsafe { ctx.services() };
+    let _timing = crate::natives::NativeTimer::start(services, "Font.mapPrerenderedFont");
     let key = match font_prerendered_key(engine, instance) {
         Ok(key) => key,
         Err(error) => return report_error(out_error, &error),
