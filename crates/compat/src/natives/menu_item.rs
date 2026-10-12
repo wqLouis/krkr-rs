@@ -22,7 +22,7 @@
 //! | member | behavior |
 //! |---|---|
 //! | `HMENU` | `0`: `GetMenuItemHandleForPlugin` returns `nullptr` (`impl/MenuItemImpl.cpp:193-196`), cast by the getter (`:409-413`) |
-//! | `popup(flags,x,y)` | the reference success value `1` (`impl/MenuItemImpl.cpp:309-315`) |
+//! | `popup(flags,x,y)` | the reference success value `1` (`impl/MenuItemImpl.cpp:309-315`); `flags`/`x`/`y` still undergo the reference `AsInteger` coercion (`MenuItemIntf.cpp:290-292`) |
 //!
 //! Everything else is pure logical state: the tree operations (`add`,
 //! `insert`, `remove`, `index`), the item flags (`caption`, `checked`,
@@ -740,20 +740,32 @@ extern "C" fn menu_item_remove(
 
 /// `popup(flags, x, y)` — the reference `TrackPopup` opens a native popup
 /// and returns `1` (`impl/MenuItemImpl.cpp:309-315`); the `popup` native
-/// method returns that result after its arity check
-/// (`MenuItemIntf.cpp:285-299`). This build has no OS popup, so a valid call
-/// reports the same success value and only the arity check can fail.
+/// method converts its arguments and returns that result
+/// (`MenuItemIntf.cpp:285-299`). This build has no OS popup, so the menu
+/// surface is not opened; the arity check and the `AsInteger` coercions are
+/// still performed exactly as the reference does before `TrackPopup` runs.
 extern "C" fn menu_item_popup(
     _engine: *mut c_void,
     _instance: *mut c_void,
     argc: c_int,
-    _argv: *const Value,
+    argv: *const Value,
     out: *mut Value,
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
     if argc < 3 {
         return report_error(out_error, "MenuItem.popup requires flags, x and y");
+    }
+    // `tjs_uint32 flags = (tTVInteger)*param[0]; tjs_int x = *param[1];
+    // tjs_int y = *param[2];` (`MenuItemIntf.cpp:290-292`): each conversion
+    // runs `AsInteger` and raises `TJSThrowVariantConvertError` on an object,
+    // `null` or an octet before `TrackPopup` is reached.
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
+    let values = unsafe { args(argv, argc) };
+    for value in &values[..3] {
+        if let Err(error) = try_value_as_i64(value) {
+            return report_error(out_error, &error);
+        }
     }
     set_int(out, 1);
     0

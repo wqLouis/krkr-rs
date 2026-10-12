@@ -239,3 +239,67 @@ fn midi_out_is_a_no_op_when_midi_is_disabled() {
     assert_eq!(env.eval_ok("MIDISoundBuffer.midiOut(0)"), TjsValue::Void);
     assert!(env.error("MIDISoundBuffer.midiOut()").contains("midiOut"));
 }
+
+/// The event members sit outside the `ENABLE_CDDA`/`TVP_ENABLE_MIDI` guards:
+/// they still forward to the constructor's `ActionOwner`
+/// (`reference/cpp/core/sound/SoundBufferBaseIntf.cpp:39-45`,
+/// `CDDAIntf.cpp:135-164`, `MIDIIntf.cpp:136-165`).
+///
+/// The owner is a class instance rather than a dictionary: a bare identifier
+/// inside a function that lives in a dictionary literal reads through the
+/// dictionary, and `tTJSDictionaryObject::PropGet` swallows a miss as void
+/// (`reference/cpp/core/tjs2/tjsDictionary.cpp:739-743`), so such an action
+/// could not reach the surrounding script. A class instance reports
+/// `TJS_E_MEMBERNOTFOUND` and the proxy falls through to the script scope
+/// (`tjsInterCodeExec.cpp:262-268`).
+#[test]
+fn event_members_forward_to_the_construction_action_owner() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var log = []; \
+         class Ctrl { function Ctrl() {} function action(ev) { log.add(ev.type); } } \
+         var cdda = new CDDASoundBuffer(new Ctrl()); \
+         cdda.onFadeCompleted(); \
+         cdda.onStatusChanged('play'); \
+         var status = ''; \
+         class Ctrl2 { function Ctrl2() {} function action(ev) { status = ev.status; } } \
+         var midi = new MIDISoundBuffer(new Ctrl2()); \
+         midi.onStatusChanged('stop');",
+    );
+    // `TVP_ACTION_INVOKE_BEGIN(0, \"onFadeCompleted\")` /
+    // `TVP_ACTION_INVOKE_BEGIN(1, \"onStatusChanged\")` build the event and
+    // call the owner's `action` (`EventIntf.cpp:709-736`, `EventIntf.h:208-234`).
+    assert_eq!(env.eval_int("log.count"), 2);
+    assert_eq!(
+        env.eval_ok("log[0]"),
+        TjsValue::String("onFadeCompleted".into())
+    );
+    assert_eq!(
+        env.eval_ok("log[1]"),
+        TjsValue::String("onStatusChanged".into())
+    );
+    // `TVP_ACTION_INVOKE_MEMBER(\"status\")` copies the first argument.
+    assert_eq!(env.eval_ok("status"), TjsValue::String("stop".into()));
+}
+
+/// With an action owner set, `onStatusChanged` enforces its one-argument
+/// count; without an owner the check is skipped, because it lives inside
+/// `if(obj.Object)` (`reference/cpp/core/base/EventIntf.h:208-225`).
+#[test]
+fn on_status_changed_requires_status_when_an_owner_is_set() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var owner = %[ action: function(ev) {} ]; \
+         var cdda = new CDDASoundBuffer(owner); \
+         var plain = new CDDASoundBuffer();",
+    );
+    assert!(
+        env.error("cdda.onStatusChanged()")
+            .contains("onStatusChanged"),
+        "an owned onStatusChanged() must require the status argument"
+    );
+    // A no-owner instance still returns void with no argument.
+    assert_eq!(env.eval_ok("plain.onStatusChanged()"), TjsValue::Void);
+}

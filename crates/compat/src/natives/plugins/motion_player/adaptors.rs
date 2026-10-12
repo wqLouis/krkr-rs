@@ -10,12 +10,15 @@
 
 use std::ffi::c_void;
 
-use tjs::{NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef, Value};
+use tjs::{
+    DetachedValue, NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef,
+    TjsValue, VAL_OBJECT, Value,
+};
 
 use super::StoredValue;
-use super::helpers::{inst_mut, value_as_f64};
+use super::helpers::{inst_mut, set_retained, value_as_f64};
 use crate::native_util::{args, report_error, set_void};
-use crate::natives::system::{resolve, value_as_bool, value_as_i64};
+use crate::natives::system::{resolve, try_value_as_i64, value_as_bool, value_as_i64};
 use crate::{CompatCtx, CompatError};
 
 // ---------------------------------------------------------------------------
@@ -347,6 +350,9 @@ pub(crate) struct SeparateInst {
     /// (`reference/cpp/plugins/motionplayer/SeparateLayerAdaptor.h:147`).
     absolute: i64,
     target: StoredValue,
+    /// The reference `_owner`, computed once from the construction-time
+    /// `targetLayer.window` (`SeparateLayerAdaptor.cpp:26-34`, `:231`).
+    owner: Option<DetachedValue>,
 }
 
 impl Default for SeparateInst {
@@ -354,6 +360,7 @@ impl Default for SeparateInst {
         Self {
             absolute: 0,
             target: StoredValue::Void,
+            owner: None,
         }
     }
 }
@@ -390,6 +397,20 @@ extern "C" fn separate_ctor(
     let arguments = unsafe { args(argv, argc) };
     if let Some(value) = arguments.first() {
         inst.target = StoredValue::from_value(value, &res.ctx());
+        // `_owner(separateLayerOwnerLike_0x6C69D4(targetLayer))`
+        // (`SeparateLayerAdaptor.cpp:231`): read `targetLayer.window` once at
+        // construction. A non-object, a missing member or a failed read
+        // leaves the owner unset, like the reference's unset variant.
+        if let Some(target_id) = inst.target.object_id() {
+            let host = res.engine();
+            if matches!(
+                host.member(target_id as tjs::Tjs2ValueId, "window"),
+                Ok(TjsValue::Object)
+            ) && let Ok(owner) = host.retain_value_detached(&TjsValue::Object)
+            {
+                inst.owner = Some(owner);
+            }
+        }
     }
     set_void(out);
     0
@@ -442,17 +463,49 @@ mp_method_void!(
 
 extern "C" fn separate_owner_interface(
     engine: *mut c_void,
-    _instance: *mut c_void,
+    instance: *mut c_void,
     _argc: std::os::raw::c_int,
     _argv: *const Value,
     out: *mut Value,
     out_error: *mut *mut std::ffi::c_char,
     _objthis: *mut c_void,
 ) -> std::os::raw::c_int {
-    if resolve(engine).is_none() {
+    let Some(res) = resolve(engine) else {
         return report_error(out_error, super::helpers::NO_BINDING);
+    };
+    // SAFETY: the VM guarantees the live payload.
+    let Some(inst) = (unsafe { inst_mut::<SeparateInst>(instance) }) else {
+        return report_error(out_error, "SeparateLayerAdaptor: null instance");
+    };
+    // `getLayerTreeOwnerInterfaceCompat` (`SeparateLayerAdaptor.cpp:297-330`):
+    // an unset owner returns `TJS_S_OK` with the result left void; otherwise
+    // the result is the owner's `layerTreeOwnerInterface` property. This port's
+    // `Window.layerTreeOwnerInterface` is the window object itself.
+    let Some(owner) = inst.owner.as_ref() else {
+        set_void(out);
+        return 0;
+    };
+    match res
+        .engine()
+        .member(owner.raw_id(), "layerTreeOwnerInterface")
+    {
+        Ok(TjsValue::Object) => match res.engine().retain_value_detached(&TjsValue::Object) {
+            Ok(object) => set_retained(out, object),
+            Err(error) => {
+                return report_error(
+                    out_error,
+                    &format!("SeparateLayerAdaptor.layerTreeOwnerInterface: {error}"),
+                );
+            }
+        },
+        Ok(_) => set_void(out),
+        Err(error) => {
+            return report_error(
+                out_error,
+                &format!("SeparateLayerAdaptor.layerTreeOwnerInterface: {error}"),
+            );
+        }
     }
-    set_void(out);
     0
 }
 
@@ -473,11 +526,14 @@ pub(crate) struct D3DInst {
 
 impl Default for D3DInst {
     fn default() -> Self {
+        // Reference field defaults (`D3DAdaptor.h:99-107`): `_visible`,
+        // `_alphaOpAdd`, `_canvasCaptureEnabled` and `_resizable` are false,
+        // `_clearEnabled` is true, and the size/clear color are 0.
         Self {
-            visible: true,
+            visible: false,
             alpha_op_add: false,
             canvas_capture: false,
-            clear: false,
+            clear: true,
             size: (0, 0),
             clear_color: 0,
             resizable: false,
@@ -499,16 +555,58 @@ extern "C" fn d3d_destroy(_engine: *mut c_void, instance: *mut c_void) {
 
 extern "C" fn d3d_ctor(
     engine: *mut c_void,
-    _instance: *mut c_void,
-    _argc: std::os::raw::c_int,
-    _argv: *const Value,
+    instance: *mut c_void,
+    argc: std::os::raw::c_int,
+    argv: *const Value,
     out: *mut Value,
     out_error: *mut *mut std::ffi::c_char,
     _objthis: *mut c_void,
 ) -> std::os::raw::c_int {
-    if resolve(engine).is_none() {
+    let Some(res) = resolve(engine) else {
         return report_error(out_error, super::helpers::NO_BINDING);
+    };
+    // SAFETY: the VM guarantees the live payload.
+    let Some(inst) = (unsafe { inst_mut::<D3DInst>(instance) }) else {
+        return report_error(out_error, "D3DAdaptor: null instance");
+    };
+    // SAFETY: the trampoline guarantees `argc` valid entries.
+    let arguments = unsafe { args(argv, argc) };
+    // `if(numparams < 5) return TJS_E_BADPARAMCOUNT;` (`D3DAdaptor.cpp:19-20`).
+    if arguments.len() < 5 {
+        return report_error(
+            out_error,
+            "D3DAdaptor requires a Window, width, height, centerX and centerY",
+        );
     }
+    // `param[0]->AsObjectNoAddRef()` must be a `Window` instance or the
+    // reference throws `"must set Window object"` (`D3DAdaptor.cpp:21-27`).
+    if arguments[0].ty != VAL_OBJECT {
+        return report_error(out_error, "must set Window object");
+    }
+    let Ok(window) = res.engine().retain_object_arg(&arguments[0]) else {
+        return report_error(out_error, "must set Window object");
+    };
+    match res
+        .engine()
+        .native_instance_payload(window.raw_id(), "Window")
+    {
+        Ok(Some(_)) => {}
+        Ok(None) => return report_error(out_error, "must set Window object"),
+        Err(error) => {
+            return report_error(out_error, &format!("D3DAdaptor: window lookup: {error}"));
+        }
+    }
+    // `static_cast<int>(param[1..4]->AsInteger())`
+    // (`D3DAdaptor.cpp:38-42`): `AsInteger` raises on an object, `null` or an
+    // octet.
+    let mut values = [0i32; 4];
+    for (slot, value) in values.iter_mut().zip(&arguments[1..5]) {
+        match try_value_as_i64(value) {
+            Ok(value) => *slot = value as i32,
+            Err(error) => return report_error(out_error, &error),
+        }
+    }
+    inst.size = (values[0], values[1]);
     set_void(out);
     0
 }
@@ -585,17 +683,57 @@ mp_set_bool!(d3d_set_clear, D3DInst, |p: &mut D3DInst, v: bool| p.clear =
 
 extern "C" fn d3d_capture_canvas(
     engine: *mut c_void,
-    _instance: *mut c_void,
-    _argc: std::os::raw::c_int,
-    _argv: *const Value,
+    instance: *mut c_void,
+    argc: std::os::raw::c_int,
+    argv: *const Value,
     out: *mut Value,
     out_error: *mut *mut std::ffi::c_char,
     _objthis: *mut c_void,
 ) -> std::os::raw::c_int {
-    if resolve(engine).is_none() {
+    let Some(res) = resolve(engine) else {
         return report_error(out_error, super::helpers::NO_BINDING);
+    };
+    // SAFETY: the VM guarantees the live payload.
+    let Some(inst) = (unsafe { inst_mut::<D3DInst>(instance) }) else {
+        return report_error(out_error, "D3DAdaptor: null instance");
+    };
+    // SAFETY: the trampoline guarantees `argc` valid entries.
+    let arguments = unsafe { args(argv, argc) };
+    // `if(numparams < 1 || !param[0]) return TJS_E_BADPARAMCOUNT;`
+    // (`D3DAdaptor.cpp:65-67`).
+    if arguments.is_empty() || arguments[0].ty != VAL_OBJECT {
+        return report_error(out_error, "D3DAdaptor.captureCanvas expects a Layer");
     }
-    set_void(out);
+    let Ok(layer) = res.engine().retain_object_arg(&arguments[0]) else {
+        return report_error(out_error, "D3DAdaptor.captureCanvas expects a Layer object");
+    };
+    // `layerObj->NativeInstanceSupport(..., tTJSNC_Layer::ClassID, ...)`;
+    // failure is `TJS_E_INVALIDPARAM` (`D3DAdaptor.cpp:69-76`).
+    match crate::CompatCtx::native_instance_id(res.engine(), layer.raw_id(), &["Layer"]) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return report_error(
+                out_error,
+                "D3DAdaptor.captureCanvas expects a native Layer object",
+            );
+        }
+        Err(error) => {
+            return report_error(out_error, &format!("D3DAdaptor.captureCanvas: {error}"));
+        }
+    }
+    // `if(_width <= 0 || _height <= 0) return TJS_S_OK;` — the result stays
+    // void (`D3DAdaptor.cpp:78-80`).
+    if inst.size.0 <= 0 || inst.size.1 <= 0 {
+        set_void(out);
+        return 0;
+    }
+    // The remaining reference work copies the adaptor's render-target texture
+    // into the layer (`D3DAdaptor.cpp:82-102`). The port has no L3 render
+    // target: the texture is populated by `Player.draw(d3dAdaptor)`
+    // (`PlayerRenderTargets.cpp:931-1070`), which is not wired. The reference
+    // return value (the Layer argument) is preserved; no pixels are
+    // fabricated.
+    set_retained(out, layer);
     0
 }
 

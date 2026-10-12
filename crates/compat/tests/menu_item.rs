@@ -420,3 +420,19 @@ fn hmenu_is_zero_and_popup_reports_success() {
     // (`reference/cpp/core/visual/MenuItemIntf.cpp:289-290`).
     assert!(env.error("m.popup()").contains("requires flags"));
 }
+
+#[test]
+fn popup_coerces_its_arguments_before_returning_success() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run("var m = new MenuItem();");
+    // `tjs_uint32 flags = (tTVInteger)*param[0]; tjs_int x = *param[1];
+    // tjs_int y = *param[2];` (`MenuItemIntf.cpp:290-292`): each `AsInteger`
+    // conversion raises `TJSThrowVariantConvertError` on an object or `null`
+    // before `TrackPopup` runs.
+    assert!(env.error("m.popup(%[], 10, 20)").contains("object"));
+    assert!(env.error("m.popup(0, null, 20)").contains("null"));
+    assert!(env.error("m.popup(0, 10, %[])").contains("object"));
+    // The success value is still `1` for coercible arguments.
+    assert_eq!(env.eval_int("m.popup(0, 10, 20)"), 1);
+}

@@ -732,3 +732,44 @@ fn shortcut_initial_globals_are_defined() {
     env.run("global.ShortCutInitialPadKeyMap = 1;");
     assert_eq!(env.eval_int("global.ShortCutInitialPadKeyMap"), 1);
 }
+
+#[test]
+fn separate_layer_adaptor_layer_tree_owner_interface_delegates_to_its_owner() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    // `_owner` is the construction-time `targetLayer.window`
+    // (`reference/cpp/plugins/motionplayer/SeparateLayerAdaptor.cpp:26-34`,
+    // `:231`); the hidden `layerTreeOwnerInterface` method returns that
+    // owner's own `layerTreeOwnerInterface` property (`:297-330`).
+    env.run(
+        "var iface = %[]; \
+         var win = %[ layerTreeOwnerInterface: iface ]; \
+         var sla = new Motion.SeparateLayerAdaptor(%[ window: win ]); \
+         var got = sla.layerTreeOwnerInterface(); \
+         var first = %[]; var second = %[]; \
+         var fixed = new Motion.SeparateLayerAdaptor(%[ window: %[ layerTreeOwnerInterface: first ] ]); \
+         fixed.targetLayer = %[ window: %[ layerTreeOwnerInterface: second ] ]; \
+         var fixedGot = fixed.layerTreeOwnerInterface();",
+    );
+    assert_eq!(env.eval_int("got === iface ? 1 : 0"), 1);
+    // `setTargetLayer` does not recompute `_owner`.
+    assert_eq!(env.eval_int("fixedGot === first ? 1 : 0"), 1);
+    assert_eq!(env.eval_int("fixedGot === second ? 1 : 0"), 0);
+    // No owner (no constructor argument) leaves the result void.
+    assert_eq!(
+        env.eval_str("typeof (new Motion.SeparateLayerAdaptor()).layerTreeOwnerInterface()"),
+        "void"
+    );
+}
+
+#[test]
+fn d3d_adaptor_constructor_validates_its_window_and_size_arguments() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    // `Factory` requires five parameters (`reference/cpp/plugins/motionplayer/
+    // D3DAdaptor.cpp:19-20`) and a `Window` first argument, otherwise it throws
+    // `"must set Window object"` (`:21-27`).
+    assert!(env.eval("new Motion.D3DAdaptor()").is_err());
+    assert!(env.eval("new Motion.D3DAdaptor(0, 1, 1, 0, 0)").is_err());
+    assert!(env.eval("new Motion.D3DAdaptor(%[], 1, 1, 0, 0)").is_err());
+}
