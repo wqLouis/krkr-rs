@@ -603,6 +603,7 @@ working.
 * **`#[non_exhaustive]`** — public structs/DTOs yes; enums L3 matches exhaustively no (a `_` arm turns a compile-time guarantee into a silent fallback).
 * **`unsafe_code` lint** — `forbid` where there is no `unsafe`, `deny(unsafe_code)` + a file-level `allow` where the FFI lives.
 * **`get_`-prefixed public API left:** `Tjs2Engine::get_member`, `get_class_names`; `Scene::get_province_pixel`.
+* **`LayerExMovie` teardown** — the plugin registers instance members but nothing is wired for a `Layer` being destroyed, so a movie open at that moment keeps its foreign voice on the mixer, and the reference releases it in `~layerExMovie` → `stopMovie()` (`plugins/layerExMovie.cpp:131-138`). Pre-existing: the slot was never removed on Layer destruction either. Needs a teardown/invalidate hook for the plugin.
 * **Verify no decision-number tags returned** to plugin sources: `grep -rn "//.*\bD[0-9]\+\b" crates/compat/src`.
 * **Dirty rectangles for bitmap uploads** — the renderer can upload a
   sub-rectangle, but nothing above it knows one: `BitmapState` carries a `dirty`

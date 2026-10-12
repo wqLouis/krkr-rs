@@ -149,6 +149,45 @@ impl PresentationScaling {
     }
 }
 
+/// Which rasterizer produces glyph coverage.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum GlyphBackend {
+    /// Rasterize on the CPU and upload the finished coverage.
+    #[default]
+    Cpu,
+    /// Rasterize on the GPU.
+    Gpu,
+}
+
+impl GlyphBackend {
+    /// The built-in default (`Cpu`).
+    pub const DEFAULT: Self = Self::Cpu;
+
+    /// Human-readable accepted values for error and help text.
+    pub const RANGE: &str = "one of: cpu, gpu";
+
+    /// Parses a glyph-backend name.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::InvalidValue`] when `value` is not an accepted name.
+    pub fn parse(option: &'static str, value: &str) -> Result<Self, ConfigError> {
+        match value {
+            "cpu" => Ok(Self::Cpu),
+            "gpu" => Ok(Self::Gpu),
+            other => Err(ConfigError::invalid(option, other.to_owned(), Self::RANGE)),
+        }
+    }
+
+    /// The canonical name of this backend.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::Gpu => "gpu",
+        }
+    }
+}
+
 /// The fully resolved runtime configuration a launcher passes to the
 /// emulator.
 ///
@@ -166,6 +205,14 @@ pub struct RuntimeConfig {
     /// [`PresentationScaling::Game`], `Fit`, `Fill` or `Expand`, default
     /// [`PresentationScaling::Game`].
     pub scaling: PresentationScaling,
+    /// Which rasterizer produces glyph coverage, default
+    /// [`GlyphBackend::Cpu`].
+    pub glyph_backend: GlyphBackend,
+    /// Whether a mounted archive is read into memory in full at mount, default
+    /// `false`. It trades the archive's size in resident memory for removing
+    /// the per-entry reads a mounted archive otherwise does, which is the cost
+    /// a slow backing filesystem makes visible.
+    pub preload_archives: bool,
 }
 
 impl Default for RuntimeConfig {
@@ -173,6 +220,8 @@ impl Default for RuntimeConfig {
         Self {
             frame_rate_limit: FrameRateLimit::DEFAULT,
             scaling: PresentationScaling::DEFAULT,
+            glyph_backend: GlyphBackend::DEFAULT,
+            preload_archives: false,
         }
     }
 }
@@ -188,6 +237,23 @@ pub struct RuntimeConfigOverrides {
     pub frame_rate_limit: Option<FrameRateLimit>,
     /// A source's presentation scaling, if it holds one.
     pub scaling: Option<PresentationScaling>,
+    /// A source's glyph backend, if it holds one.
+    pub glyph_backend: Option<GlyphBackend>,
+    /// A source's archive-preload choice, if it holds one.
+    pub preload_archives: Option<bool>,
+}
+
+/// Parses a boolean configuration value.
+fn parse_bool(option: &'static str, value: &str) -> Result<bool, ConfigError> {
+    match value {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        other => Err(ConfigError::invalid(
+            option,
+            other.to_owned(),
+            "one of: true, false",
+        )),
+    }
 }
 
 /// Parses `key=value` configuration text into overrides.
@@ -196,7 +262,8 @@ pub struct RuntimeConfigOverrides {
 /// launcher's business. Blank lines and lines whose first non-space character
 /// is `#` are ignored. A line without `=` or with an unknown key is an error,
 /// as is a value that fails validation; nothing is silently skipped. The
-/// recognized keys are `frame_rate` and `scaling`.
+/// recognized keys are `frame_rate`, `scaling`, `glyph_backend` and
+/// `preload_archives`.
 ///
 /// # Errors
 ///
@@ -220,6 +287,12 @@ pub fn parse_overrides(text: &str) -> Result<RuntimeConfigOverrides, ConfigError
             }
             "scaling" => {
                 overrides.scaling = Some(PresentationScaling::parse("scaling", value)?);
+            }
+            "glyph_backend" => {
+                overrides.glyph_backend = Some(GlyphBackend::parse("glyph_backend", value)?);
+            }
+            "preload_archives" => {
+                overrides.preload_archives = Some(parse_bool("preload_archives", value)?);
             }
             other => {
                 return Err(ConfigError::Source {

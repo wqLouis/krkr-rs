@@ -57,6 +57,7 @@ pub(crate) fn resolve_runtime_config(
     Ok(RuntimeConfig {
         frame_rate_limit,
         scaling,
+        ..defaults
     })
 }
 

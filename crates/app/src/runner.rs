@@ -482,6 +482,7 @@ mod tests {
         let runtime = RuntimeConfig {
             frame_rate_limit: FrameRateLimit::new("test", 500).expect("valid"),
             scaling: PresentationScaling::Fit,
+            ..RuntimeConfig::default()
         };
         let report = run(Launch {
             runtime,
