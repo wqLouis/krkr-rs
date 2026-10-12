@@ -24,6 +24,7 @@ The gate runs in this order and must end green:
 ```bash
 cargo fmt --all -- --check
 bash scripts/check-stateless.sh                  # D9 guard
+bash scripts/check-error-handling.sh             # AGENTS §4 guard
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --no-fail-fast            # all crates; never fail-fast, so one
                                                  # failing target cannot hide the rest

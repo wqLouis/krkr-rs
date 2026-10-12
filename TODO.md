@@ -26,6 +26,7 @@ re-opened. History is read with `git log`.
 ```bash
 cargo fmt --all -- --check
 bash scripts/check-stateless.sh                                   # D9 guard
+bash scripts/check-error-handling.sh                              # AGENTS §4 guard
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --no-fail-fast                             # all crates; never fail-fast
 cargo test -p platform --features platform-linux
@@ -346,31 +347,23 @@ these needs new evidence, not a re-read.
   0 missing and **2 intentional extras** (`KAGParser.multiLineTagEnabled`,
   `paramMacros`; `docs/native_parity.md`).
 
-## 14. Error handling — the guard and what is left
+## 14. Error handling
 
 `scripts/check-error-handling.sh` enforces §4 mechanically (bash + python3, no
-compiler), with `scripts/error_handling_allow.txt` holding the sites the audit
-classified as legitimate. It is not in the gate yet: it must be green first.
+compiler) and runs in the gate, right after the stateless guard.
+`scripts/error_handling_allow.txt` holds the sites whose failure is genuinely
+ignorable, each with a reason; the guard fails on anything else, and reports a
+stale entry when code moves. The audit is `docs/audits/error-handling.md`.
 
-Open when the in-flight fixes land:
+Remaining:
 
-* **The guard's six new findings**, which the audit did not classify: the
-  storage-name fallback in `compat/natives/storages.rs`, the size saturation in
-  `compat/natives/visual/layer/mod.rs`, two conversions in
-  `platform/media/src/video/ffmpeg.rs`, one in `mediacodec.rs`, and the Android
-  and `app/window_ex.rs` sites. Being fixed now.
-* **Thirty sites the audit marked "needs a decision"** — mostly `let _ =` on a
-  fallible call (`set_member`, `delete_member`, `resolve_face`, `update_layer`,
-  `buffer.poll`, `overlay.stop`, `send_eof`) and five `.ok()` discards. Each is
-  either fixed or covered by an allowlist entry naming the reason; none is
-  covered today, so the guard fails on them.
-* **Nine sites the audit ranked but did not name in the in-flight set**
-  (`android/src/host.rs`, `android/src/log_file.rs`, `app/src/window_ex.rs`,
-  `platform/fs/src/ops.rs`, `platform/media/src/video/*`). Some are the same
-  `usize → u64` conversions the audit calls legitimate; the rest need the fix or
-  an allowlist reason.
-* **Wire the guard into the gate** (AGENTS §0, straight after the stateless
-  guard) and update the audit with the new findings.
+* **`AudioSpec::channels` is `u16`** where the reference keeps a 32-bit
+  `tTVPWaveFormat::Channels` (`reference/cpp/core/sound/WaveIntf.h:47`). A
+  decoder count outside that range is now a typed error rather than a zero, but
+  the narrowing is the divergence; widening the field is an `api` change.
+* The scan cannot tell a `Result` receiver from an `Option` one, so it
+  over-reports by design. A site that needs a decision and has no allowlist
+  entry fails the gate rather than being accepted silently.
 
 ## 15. Audit reports
 
