@@ -112,19 +112,35 @@ layer, the window bound to the first, a cross-domain re-parent raising
   `crates/engine/tests/storage.rs:353-365` now agree with `TVPIsExistentStorage`.
   Annotate it as resolved.
 
-## 5. Win32 dialogs and popups — deferred to a platform layer
+## 5. Dialogs and popups
 
-Decision: dialogs/popups belong to a **platform-level compatibility layer**, so a
-script gets a native-looking dialog on whichever OS runs it; they are not faked
-in compat. Open surface:
+The reference does **not** use a native OS menu for a popup. `MenuItem.popup`
+always calls `TVPShowPopMenu` and returns `1` (`MenuItemImpl.cpp:309-315`; the
+Win32 `TrackPopupMenu` body is commented out), and `TVPShowPopMenu` pushes an
+engine-drawn UI form into the main scene (`InGameMenuForm.cpp:115`), whose rows
+the engine builds and whose activation schedules the form's removal and then
+fires the item's `onClick`. So the faithful implementation draws the menu
+itself; a native popup is a deliberate divergence in appearance, not a port.
 
-* the real `WIN32Dialog` API (`Header`, `Items`, `Bitmap`, `Blob`,
-  `SolidBrush`, `getOctetAddress`, `getStringAddress`, `getStringFromAddress`,
-  `initCommonControlsEx`, the instance API) — only the class ctor and
-  `messageBox` are registered (`crates/compat/src/natives/plugins/win32_dialog/mod.rs:256-280`);
-* `MenuItem.popup` / `popupEx` (the menu surface behind `TVPShowPopMenu`);
-* the monitor dictionary's `name` string (MONITORINFOEX `szDevice`) that the
-  host monitor tuple cannot supply (`crates/compat/src/natives/plugins/window_ex/system.rs`).
+Decision: implement the reference's own form. Where the platform seam goes, keep
+it behind the L2 menu state so a native backend can be added later without
+touching L3 — but no native backend is built now:
+
+* **Linux native menus/dialogs are unsupported and deferred.** The XDG Desktop
+  Portal has no menu or popup interface, so there is nothing to call; the
+  toolkit route (GTK popover) wants to own the main loop, which conflicts with
+  the window and render loop. A portal *is* the right backend for
+  `Storages.selectFile`, which is a separate item.
+* **Android native popups** are a possible later backend (an Activity-hosted
+  popup), not part of this change.
+* The reference's dialog surface — the real `WIN32Dialog` API (`Header`, `Items`,
+  `Bitmap`, `Blob`, `SolidBrush`, `getOctetAddress`, `getStringAddress`,
+  `getStringFromAddress`, `initCommonControlsEx`, the instance API); only the
+  class ctor and `messageBox` are registered
+  (`crates/compat/src/natives/plugins/win32_dialog/mod.rs:256-280`) — is still
+  open, and has the same request → form → result shape as the popup.
+* The monitor dictionary's `name` string (MONITORINFOEX `szDevice`) that the host
+  monitor tuple cannot supply (`crates/compat/src/natives/plugins/window_ex/system.rs`).
 
 ## 6. Core natives
 
