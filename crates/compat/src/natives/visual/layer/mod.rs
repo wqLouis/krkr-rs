@@ -262,7 +262,7 @@ extern "C" fn layer_ctor(
         return report_error(out_error, "Layer: could not allocate the default image");
     }
     inst.id = Some(id);
-    log::debug!("Layer created: id={id} parent={parent:?}");
+    log::trace!("Layer created: id={id} parent={parent:?}");
     register_layer(&ctx, resolved.engine(), id, objthis);
     set_int(out, i64::from(id));
     0
@@ -1335,7 +1335,7 @@ layer_int_prop!(
     |l: &LayerState| i64::from(l.visible),
     |l: &mut LayerState, v: &Value| {
         let visible = value_as_bool(v);
-        log::debug!("Layer {} .visible -> {visible}", l.id);
+        log::trace!("Layer {} .visible -> {visible}", l.id);
         l.visible = visible;
     }
 );

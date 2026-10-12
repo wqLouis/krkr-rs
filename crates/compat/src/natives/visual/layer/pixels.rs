@@ -2001,7 +2001,7 @@ extern "C" fn layer_dump(
         Err(error) => return report_error(out_error, &error),
     };
     if let Some(layer) = scene.layer(id) {
-        log::info!(
+        log::debug!(
             "Layer.dump: id={} window={} parent={:?} rect=({},{},{}x{}) visible={} \
              enabled={} focusable={} name={:?} bitmap={:?} children={:?}",
             layer.id,

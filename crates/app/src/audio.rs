@@ -338,7 +338,7 @@ impl AudioOutput {
         let ctx = vm.compat().ctx().map_err(vm::VmError::from)?;
         sound_render(&ctx, &mut self.buffer, self.spec).map_err(vm::VmError::from)?;
         self.device.write(&mut self.state, &self.buffer)?;
-        log::debug!(
+        log::trace!(
             "audio: wrote {frames} frames ({:.1} ms) to the {} device",
             frames as f64 * 1000.0 / rate,
             if self.null { "null" } else { "output" },

@@ -1767,7 +1767,7 @@ impl Scene {
             return false;
         }
         if self.remove_bitmap(id) {
-            log::debug!("released scene bitmap #{id}");
+            log::trace!("released scene bitmap #{id}");
             return true;
         }
         false

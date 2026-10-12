@@ -459,7 +459,7 @@ fn append_window<F>(
                         // Fully clipped away: the layer draws nothing.
                         None => {
                             clipped += 1;
-                            log::debug!(
+                            log::trace!(
                                 "projection: layer {layer_id} clipped away: rect={:?} \
                                  image=({},{}) {}x{} bitmap={}x{} parent={:?}",
                                 node_composed.rect,
@@ -516,7 +516,7 @@ fn append_window<F>(
         }
     }
 
-    log::debug!(
+    log::trace!(
         "projection: window {window}: drew {drawn} layer(s); skipped \
          hidden={hidden} empty={empty} clipped={clipped} of {}",
         scene.window_layer_order(window).len()

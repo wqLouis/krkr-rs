@@ -75,7 +75,7 @@ extern "C" fn timer_destroy(engine: *mut c_void, instance: *mut c_void) {
     }
     // SAFETY: `instance` is the live `TimerInst` payload the VM allocated for this script object; no `&mut` to it is live in `timer_destroy`.
     let inst = unsafe { &*(instance as *const TimerInst) };
-    log::debug!("Timer destroyed: {:?}", inst.id);
+    log::trace!("Timer destroyed: {:?}", inst.id);
     if let (Some(id), Ok((_resolved, ctx))) = (inst.id, bound(engine)) {
         // SAFETY: the caller resolved `ctx` from the installed binding.
         let services = unsafe { ctx.services() };
@@ -271,7 +271,7 @@ fn dispatch_on_timer(host: &Tjs2Engine, services: &CompatServices, id: TimerId) 
             .get(&id)
             .and_then(|timer| timer.owner.as_ref().map(DetachedValue::raw_id))
     };
-    log::debug!("timer {id:?}: dispatching (owner {})", owner.is_some());
+    log::trace!("timer {id:?}: dispatching (owner {})", owner.is_some());
     let result: Result<(), String> = match owner {
         Some(owner) => host.call_member(owner, "onTimer", &[]).map(|_| ()),
         None => invoke_action(host, services, id, std::ptr::null_mut()),
@@ -418,7 +418,7 @@ extern "C" fn timer_on_timer(
         // `Construct` never completed (`TimerIntf.cpp:34-51`), so the
         // reference's `ActionOwner` is null and `onTimer` is a no-op that
         // still returns `TJS_S_OK`.
-        log::debug!("Timer.onTimer: the timer is not constructed; nothing to dispatch");
+        log::trace!("Timer.onTimer: the timer is not constructed; nothing to dispatch");
         set_void(out);
         return 0;
     };
@@ -699,7 +699,7 @@ extern "C" fn timer_enabled_set(
     // SAFETY: `instance` is the live `TimerInst` payload the VM allocated for this script object; no `&mut` to it is live in `timer_enabled_set`.
     let inst = unsafe { &*(instance as *const TimerInst) };
     let Some(id) = inst.id else {
-        log::debug!("Timer.enabled -> {enabled} but the instance has no id");
+        log::trace!("Timer.enabled -> {enabled} but the instance has no id");
         return 0;
     };
     // SAFETY: the caller resolved `ctx` from the installed binding.
@@ -718,7 +718,7 @@ extern "C" fn timer_enabled_set(
         .timers
         .get(&id)
         .map(|binding| binding.armed);
-    log::debug!("Timer {id:?}: enabled -> {enabled} (engine armed: {armed:?})");
+    log::trace!("Timer {id:?}: enabled -> {enabled} (engine armed: {armed:?})");
     0
 }
 
@@ -875,7 +875,7 @@ pub fn timer_poll(ctx: &mut CompatCtx) -> Result<bool, CompatError> {
     // strictly sequentially (the single-threaded attach contract).
     let fired = unsafe { &mut *timer_ptr }.advance(now);
     if fired > 0 {
-        log::debug!("timer_poll: {fired} timer(s) fired at {now}");
+        log::trace!("timer_poll: {fired} timer(s) fired at {now}");
     }
     // L3 mirrors what it pushed to L2 (`TimerBinding::armed`).
     let any_armed = services
