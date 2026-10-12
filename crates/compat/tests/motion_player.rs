@@ -1,0 +1,775 @@
+//! Integration tests for the `motion_player` / `emote_player` plugin family
+//! (`Motion`, `Player`, `EmotePlayer`, `D3DEmotePlayer`, `D3DEmoteModule`,
+//! `ResourceManager`, `SeparateLayerAdaptor`, `D3DAdaptor`, `SourceCache`,
+//! `ObjSource`, `Point`, `Circle`, `Rect`, `Quad`, `LayerGetter`).
+//!
+//! The reference splits the classes across `motionplayer.dll` and
+//! `emoteplayer.dll`; both are registered into the same VM here, so the tests
+//! drive the assembled surface. They attach a caller-owned L2 [`Scene`] and
+//! exercise the script-visible behaviour: the namespace constants, the
+//! geometry hit-test classes, the resource manager's layer-id allocator and
+//! module cache, the player's property/animation/variable/timeline model and
+//! the EmotePlayer shell. Every behaviour assertion cites the reference
+//! `file:line` it pins.
+
+mod common;
+
+use common::vm_lock;
+use compat::CompatHost;
+use engine::{Scene, Storage};
+use fs::FileSystem;
+use tjs::{Tjs2Engine, TjsValue};
+
+/// A bound VM + host + attached scene, optionally with a host-backed storage.
+struct Env {
+    // Drop order matters: the host removes the process-wide binding before
+    // the boxed engine/scene/storage it points at are freed.
+    _host: CompatHost,
+    engine: Box<Tjs2Engine>,
+    _scene: Box<Scene>,
+    _storage: Option<Box<Storage>>,
+}
+
+impl Env {
+    fn new() -> Env {
+        Env::build(None)
+    }
+
+    /// A VM whose storage is the reference `emote` fixture directory.
+    fn with_reference_storage() -> Env {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../reference/tests/test_files/emote");
+        Env::build(Some(dir))
+    }
+
+    fn build(storage_dir: Option<std::path::PathBuf>) -> Env {
+        let engine = Box::new(Tjs2Engine::new().expect("create engine"));
+        let mut scene = Box::new(Scene::default());
+        let mut storage = storage_dir.map(|dir| {
+            let fs = FileSystem::host(&dir);
+            Box::new(
+                Storage::mount_archives(fs, dir.clone(), std::iter::empty::<&str>())
+                    .expect("mount storage"),
+            )
+        });
+        let mut host = CompatHost::new();
+        // SAFETY: the boxed scene and storage outlive the host binding (they
+        // are declared after `_host` and dropped later).
+        unsafe {
+            host.services_mut()
+                .attach_scene(scene.as_mut() as *mut Scene);
+            if let Some(storage) = storage.as_mut() {
+                host.services_mut()
+                    .attach_storage(storage.as_mut() as *mut Storage);
+            }
+        }
+        host.install(&engine).expect("install compat surface");
+        Env {
+            _host: host,
+            engine,
+            _scene: scene,
+            _storage: storage,
+        }
+    }
+
+    fn run(&self, script: &str) {
+        self.engine
+            .exec_script(script, "motion-player-test")
+            .unwrap_or_else(|error| panic!("exec {script:?} failed: {error}"));
+    }
+
+    fn eval(&self, expression: &str) -> Result<TjsValue, String> {
+        self.engine
+            .eval(expression, "motion-player-test")
+            .map_err(|error| error.to_string())
+    }
+
+    fn eval_int(&self, expression: &str) -> i64 {
+        match self.eval(expression) {
+            Ok(TjsValue::Integer(value)) => value,
+            other => panic!("{expression:?} returned {other:?}, expected an integer"),
+        }
+    }
+
+    fn eval_real(&self, expression: &str) -> f64 {
+        match self.eval(expression) {
+            Ok(TjsValue::Real(value)) => value,
+            Ok(TjsValue::Integer(value)) => value as f64,
+            other => panic!("{expression:?} returned {other:?}, expected a real"),
+        }
+    }
+
+    fn eval_bool(&self, expression: &str) -> bool {
+        self.eval_int(expression) != 0
+    }
+
+    fn eval_str(&self, expression: &str) -> String {
+        match self.eval(expression) {
+            Ok(TjsValue::String(value)) => value,
+            other => panic!("{expression:?} returned {other:?}, expected a string"),
+        }
+    }
+}
+
+#[test]
+fn motion_namespace_registers_constants_and_subclasses() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    // The `Motion` namespace constants are registered as `Variant`s
+    // (`reference/cpp/plugins/motionplayer/main.cpp:444-477`).
+    assert_eq!(env.eval_int("Motion.LayerTypeObj"), 0);
+    assert_eq!(env.eval_int("Motion.LayerTypeShape"), 1);
+    assert_eq!(env.eval_int("Motion.LayerTypeCamera"), 5);
+    assert_eq!(env.eval_int("Motion.ShapeTypeQuad"), 3);
+    assert_eq!(env.eval_int("Motion.PlayFlagForce"), 1);
+    assert_eq!(env.eval_int("Motion.PlayFlagStealth"), 16);
+    assert_eq!(env.eval_int("Motion.TransformOrderSlant"), 3);
+    assert_eq!(env.eval_int("Motion.CoordinateRecutangularXZ"), 1);
+    assert_eq!(env.eval_int("Motion.MaskModeAlpha"), 1);
+    // `getD3DAvailable` is a method on `Player`, not a static `Motion`
+    // helper (`reference/cpp/plugins/motionplayer/main.cpp:288`).
+    env.run("var p = new Motion.Player(null); p.getD3DAvailable();");
+
+    // `Motion` registers the helper classes as subclasses
+    // (`reference/cpp/plugins/motionplayer/main.cpp:430-441`); `Player` is a
+    // top-level class (`main.cpp:128`) aliased into the namespace by the
+    // post-registration callback (`main.cpp:522-524`).
+    for name in [
+        "Player",
+        "EmotePlayer",
+        "ResourceManager",
+        "SeparateLayerAdaptor",
+        "D3DAdaptor",
+        "SourceCache",
+        "ObjSource",
+        "Point",
+        "Circle",
+        "Rect",
+        "Quad",
+        "LayerGetter",
+    ] {
+        assert_ne!(
+            env.eval_str(&format!("typeof Motion.{name}")),
+            "undefined",
+            "Motion.{name} missing"
+        );
+    }
+    assert_ne!(env.eval_str("typeof Player"), "undefined");
+    // The post-registration callback installs an empty object as a static
+    // `Player.useD3D` member, so the class-level probe reads `"Object"`
+    // (`reference/cpp/plugins/motionplayer/main.cpp:498-509`).
+    assert_eq!(env.eval_str("typeof Motion.Player.useD3D"), "Object");
+    // `D3DEmoteModule` and `D3DEmotePlayer` are top-level classes of the
+    // emoteplayer module, not `NCB_SUBCLASS` members of `Motion`
+    // (`reference/cpp/plugins/motionplayer/main.cpp:565,588`; the nested-only
+    // list is `main.cpp:430-441`).
+    assert_eq!(env.eval_str("typeof Motion.D3DEmotePlayer"), "undefined");
+    assert_eq!(env.eval_str("typeof Motion.D3DEmoteModule"), "undefined");
+    assert_ne!(env.eval_str("typeof D3DEmoteModule"), "undefined");
+    assert_ne!(env.eval_str("typeof D3DEmotePlayer"), "undefined");
+}
+
+#[test]
+fn namespace_only_classes_are_not_top_level_globals() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    // `NCB_REGISTER_SUBCLASS_DELAY` only defines members: its `RegistEnd`
+    // adds a dummy constructor and never publishes a global
+    // (`reference/cpp/core/plugin/ncbind.hpp:1963-1970`). `NCB_SUBCLASS`
+    // attaches the class under `Motion` as a `TJS_STATICMEMBER`
+    // (`ncbind.hpp:1982-1987`, `reference/cpp/plugins/motionplayer/
+    // main.cpp:427-441`). A missing member reads back as the string
+    // "undefined" through the VM's `typeof`
+    // (`reference/cpp/core/tjs2/tjsInterCodeExec.cpp:1899-1904`).
+    for name in [
+        "ResourceManager",
+        "SeparateLayerAdaptor",
+        "D3DAdaptor",
+        "SourceCache",
+        "ObjSource",
+        "Point",
+        "Circle",
+        "MotionRect",
+        "Quad",
+        "LayerGetter",
+        "EmotePlayer",
+    ] {
+        assert_eq!(
+            env.eval_str(&format!("typeof global.{name}")),
+            "undefined",
+            "{name} must not be published as a top-level global"
+        );
+    }
+    // Each class stays reachable through the namespace it was attached to
+    // (`reference/cpp/plugins/motionplayer/main.cpp:427-441`); a class object
+    // reports the VM's `typeof` spelling "Object", not JavaScript's "object"
+    // (`reference/cpp/core/tjs2/tjsInterCodeExec.cpp:2612-2614`).
+    for name in [
+        "Motion.ResourceManager",
+        "Motion.SeparateLayerAdaptor",
+        "Motion.D3DAdaptor",
+        "Motion.SourceCache",
+        "Motion.ObjSource",
+        "Motion.Point",
+        "Motion.Circle",
+        "Motion.Rect",
+        "Motion.Quad",
+        "Motion.LayerGetter",
+        "Motion.EmotePlayer",
+    ] {
+        assert_eq!(
+            env.eval_str(&format!("typeof {name}")),
+            "Object",
+            "{name} must remain reachable"
+        );
+    }
+    // `Player`, `D3DEmotePlayer` and `D3DEmoteModule` are the reference's
+    // genuine top-level classes (`reference/cpp/plugins/motionplayer/
+    // main.cpp:128,565,588`).
+    for name in ["Player", "D3DEmotePlayer", "D3DEmoteModule"] {
+        assert_eq!(
+            env.eval_str(&format!("typeof {name}")),
+            "Object",
+            "{name} must stay top-level"
+        );
+    }
+}
+
+#[test]
+fn geometry_hit_test_classes_work() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    // Each class exposes the reference `type` value
+    // (`reference/cpp/plugins/motionplayer/SourceCache.h:129-138`, `:140-153`,
+    // `:155-168`, `:170-180`).
+    assert_eq!(env.eval_int("(new Motion.Point()).type"), 0);
+    assert_eq!(env.eval_int("(new Motion.Circle()).type"), 1);
+    assert_eq!(env.eval_int("(new Motion.Rect()).type"), 2);
+    assert_eq!(env.eval_int("(new Motion.Quad()).type"), 3);
+    // `Point::contains` and `Quad::contains` are unimplemented stubs that
+    // always miss (`reference/cpp/plugins/motionplayer/SourceCache.h:136`,
+    // `:177`).
+    assert!(!env.eval_bool("(new Motion.Point()).contains(0, 0) ? true : false"));
+    assert!(!env.eval_bool("(new Motion.Quad()).contains(0, 0) ? true : false"));
+    // A short call fails the ncbind arity gate instead of defaulting
+    // (`reference/cpp/core/plugin/ncbind.hpp:1178`).
+    assert!(env.eval("(new Motion.Point()).contains(0)").is_err());
+    // `Circle::contains` is a real radius test; the default radius is 0
+    // (`reference/cpp/plugins/motionplayer/SourceCache.h:148-151`).
+    assert!(env.eval_bool("(new Motion.Circle()).contains(0, 0) ? true : false"));
+    assert!(!env.eval_bool("(new Motion.Circle()).contains(1, 0) ? true : false"));
+    // `Quad::getP` is an unimplemented stub returning an unset variant, so
+    // the property reads back as `void`
+    // (`reference/cpp/plugins/motionplayer/SourceCache.h:176`).
+    assert!(matches!(
+        env.eval("(new Motion.Quad()).p"),
+        Ok(TjsValue::Void)
+    ));
+}
+
+#[test]
+fn layer_getter_matches_reference_field_types_and_defaults() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run("var g = new Motion.LayerGetter();");
+    // `getType` is an `int` returning 0
+    // (`reference/cpp/plugins/motionplayer/SourceCache.h:212`, `:241`).
+    assert!(matches!(env.eval("g.type"), Ok(TjsValue::Integer(0))));
+    // `getOpacity` returns the raw `int` field, which defaults to 255
+    // (`reference/cpp/plugins/motionplayer/SourceCache.h:231`, `:250`).
+    assert!(matches!(env.eval("g.opacity"), Ok(TjsValue::Integer(255))));
+    // The boolean visibility flags default true
+    // (`reference/cpp/plugins/motionplayer/SourceCache.h:214`, `:243`).
+    for name in ["visible", "branchVisible", "layerVisible"] {
+        assert!(matches!(
+            env.eval(&format!("g.{name}")),
+            Ok(TjsValue::Integer(1))
+        ));
+    }
+    // The zoom fields are `double`, defaulting to 1.0
+    // (`reference/cpp/plugins/motionplayer/SourceCache.h:223`, `:246`).
+    for name in ["zoomX", "zoomY"] {
+        assert!((env.eval_real(&format!("g.{name}")) - 1.0).abs() < 1e-9);
+    }
+    // Position/origin fields are `double` and default to 0.0
+    // (`reference/cpp/plugins/motionplayer/SourceCache.h:217-220`, `:244`,
+    // `:249`).
+    for name in ["x", "y", "left", "top", "originX", "originY"] {
+        assert!(env.eval_real(&format!("g.{name}")).abs() < 1e-9);
+    }
+    // `getLabel` is a `ttstr`, defaulting to empty
+    // (`reference/cpp/plugins/motionplayer/SourceCache.h:213`, `:242`).
+    assert_eq!(env.eval_str("g.label"), "");
+    // The variant-valued getters return an unset `tTJSVariant` (`void`)
+    // (`reference/cpp/plugins/motionplayer/SourceCache.h:232-238`).
+    for name in [
+        "mtx",
+        "vtx",
+        "color",
+        "bezierPatch",
+        "shape",
+        "motion",
+        "particle",
+    ] {
+        assert!(
+            matches!(env.eval(&format!("g.{name}")), Ok(TjsValue::Void)),
+            "{name} must read back as void"
+        );
+    }
+}
+
+#[test]
+fn separate_layer_adaptor_absolute_is_an_integer_and_survives_clear() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    // `absolute` is a `tjs_int` whose reference default is 0
+    // (`reference/cpp/plugins/motionplayer/SeparateLayerAdaptor.h:97-98`,
+    // `:147`).
+    assert!(matches!(
+        env.eval("(new Motion.SeparateLayerAdaptor()).absolute"),
+        Ok(TjsValue::Integer(0))
+    ));
+    env.run(
+        "var s = new Motion.SeparateLayerAdaptor(); \
+         var target = %[]; \
+         s.absolute = 2; \
+         s.targetLayer = target;",
+    );
+    // The property round-trips an integer, not a boolean
+    // (`reference/cpp/plugins/motionplayer/SeparateLayerAdaptor.h:97-98`).
+    assert!(matches!(env.eval("s.absolute"), Ok(TjsValue::Integer(2))));
+    // `clear()` releases the private render state only; `absolute` and
+    // `targetLayer` are untouched
+    // (`reference/cpp/plugins/motionplayer/SeparateLayerAdaptor.cpp:262-279`).
+    env.run("s.clear();");
+    assert_eq!(env.eval_int("s.absolute"), 2);
+    assert_eq!(env.eval_int("s.targetLayer === target ? 1 : 0"), 1);
+    // `assign` copies managed render lists only; a non-adaptor argument is
+    // a plain no-op and never overwrites `targetLayer`
+    // (`reference/cpp/plugins/motionplayer/SeparateLayerAdaptor.cpp:438-467`).
+    env.run("s.assign(%[]);");
+    assert_eq!(env.eval_int("s.targetLayer === target ? 1 : 0"), 1);
+}
+
+#[test]
+fn resource_manager_allocates_and_releases_layer_ids() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    // `requireLayerId` hands out increasing ids starting from 1
+    // (`reference/cpp/plugins/motionplayer/ResourceManager.cpp:292-305`).
+    env.run(
+        "var rm = new Motion.ResourceManager(null, 1024); \
+         var id1 = rm.requireLayerId(); \
+         var id2 = rm.requireLayerId();",
+    );
+    let id1 = env.eval_int("id1");
+    let id2 = env.eval_int("id2");
+    assert_eq!(id1, 1, "the first id must be 1");
+    assert!(id2 > id1, "layer ids should increase ({id1} then {id2})");
+    // `clearCache` resets the allocator and the id maps
+    // (`reference/cpp/plugins/motionplayer/ResourceManager.cpp:207-224`).
+    env.run("rm.releaseLayerId(id1); rm.clearCache();");
+    assert_eq!(env.eval_int("rm.requireLayerId()"), 1);
+    // A short `releaseLayerId` call fails the ncbind arity gate
+    // (`reference/cpp/plugins/motionplayer/ResourceManager.h:37`).
+    assert!(env.eval("rm.releaseLayerId()").is_err());
+    // The constructor has an ncbind arity of 2
+    // (`reference/cpp/plugins/motionplayer/main.cpp:405`).
+    assert!(env.eval("new Motion.ResourceManager(null)").is_err());
+    // The static decrypt seed requires exactly one integer
+    // (`reference/cpp/plugins/motionplayer/ResourceManager.cpp:112-121`).
+    assert!(
+        env.eval("Motion.ResourceManager.setEmotePSBDecryptSeed()")
+            .is_err()
+    );
+    let error = env
+        .eval("Motion.ResourceManager.setEmotePSBDecryptSeed(1.5)")
+        .unwrap_err();
+    assert!(
+        error.contains("invalid parameter"),
+        "unexpected error: {error}"
+    );
+    env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
+}
+
+#[test]
+fn derived_players_construct_through_their_class_name_member() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    // `EmotePlayer` and `D3DEmotePlayer` each declare their own
+    // `NCB_CONSTRUCTOR` (`reference/cpp/plugins/motionplayer/main.cpp:299,588`),
+    // which ncbind registers under the class name (`ncbind.hpp:1745`), so a
+    // script subclass reaches the native instance through
+    // `super.EmotePlayer()` / `super.D3DEmotePlayer()`.
+    env.run(
+        "class MyEmote extends Motion.EmotePlayer { \
+             function MyEmote(rm) { super.EmotePlayer(rm); } \
+         } \
+         class MyD3D extends D3DEmotePlayer { \
+             function MyD3D(rm) { super.D3DEmotePlayer(rm); } \
+         } \
+         var rm = new Motion.ResourceManager(null, 1024); \
+         var e = new MyEmote(rm); \
+         var d = new MyD3D(rm);",
+    );
+    assert_eq!(env.eval_str("typeof e"), "Object");
+    assert_eq!(env.eval_str("typeof d"), "Object");
+}
+
+#[test]
+fn d3d_emote_module_settings_are_class_statics() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    // All `D3DEmoteModule` backing fields are `inline static`, so a fresh
+    // instance reads the class default; `maskMode` starts at 1
+    // (`reference/cpp/plugins/motionplayer/D3DEmoteModule.h:43-48`).
+    assert_eq!(env.eval_int("(new D3DEmoteModule()).maskMode"), 1);
+    env.run(
+        "var a = new D3DEmoteModule(); \
+         var b = new D3DEmoteModule(); \
+         a.maskMode = 3; \
+         a.alphaOp = 2; \
+         a.pixelateDivision = 4;",
+    );
+    // Because the fields are static, a second instance observes the same
+    // value (`reference/cpp/plugins/motionplayer/D3DEmoteModule.h:24-25`,
+    // `:31-32`, `:43-48`).
+    assert_eq!(env.eval_int("b.maskMode"), 3);
+    assert_eq!(env.eval_int("b.alphaOp"), 2);
+    assert_eq!(env.eval_int("b.pixelateDivision"), 4);
+    // `setMaxTextureSize(int w, int h)` is an ncbind arity-2 method
+    // (`reference/cpp/plugins/motionplayer/D3DEmoteModule.h:37-40`,
+    // `reference/cpp/plugins/motionplayer/main.cpp:586`).
+    assert!(env.eval("a.setMaxTextureSize(2048)").is_err());
+    env.run("a.setMaxTextureSize(2048, 1024);");
+}
+
+#[test]
+fn d3d_emote_module_exposes_settings() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var m = new D3DEmoteModule(); \
+         m.maskMode = 1; \
+         m.maskRegionClipping = true; \
+         m.mipMapEnabled = true; \
+         m.alphaOp = 1; \
+         m.protectTranslucentTextureColor = true; \
+         m.pixelateDivision = 2; \
+         m.setMaxTextureSize(2048, 1024);",
+    );
+    // Each property is registered on the reference class
+    // (`reference/cpp/plugins/motionplayer/main.cpp:573-583`).
+    assert_eq!(env.eval_int("m.maskMode"), 1);
+    assert_eq!(env.eval_int("m.maskRegionClipping ? 1 : 0"), 1);
+    assert_eq!(env.eval_int("m.pixelateDivision"), 2);
+    // `D3DEmoteModule` has only the `setMaxTextureSize` method, no readable
+    // property (`reference/cpp/plugins/motionplayer/D3DEmoteModule.h:37-40`,
+    // registered with `NCB_METHOD` at `main.cpp:585`).
+    assert_eq!(
+        env.eval_int("typeof m.maxTextureSize == 'undefined'"),
+        1,
+        "D3DEmoteModule.maxTextureSize must not be registered"
+    );
+}
+
+#[test]
+fn player_round_trips_its_property_surface() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    // Every property is registered on the reference class
+    // (`reference/cpp/plugins/motionplayer/main.cpp:129-197`).
+    env.run(
+        "var rm = new Motion.ResourceManager(null, 1024); \
+         var p = new Motion.Player(rm); \
+         p.completionType = 3; \
+         p.chara = \"neko\"; \
+         p.motionKey = \"idle\"; \
+         p.outline = \"line\"; \
+         p.priorDraw = 1.5; \
+         p.frameLastTime = 10; \
+         p.frameLoopTime = 4; \
+         p.loopTime = 2; \
+         p.queuing = true; \
+         p.directEdit = true; \
+         p.selectorEnabled = true; \
+         p.speed = false; \
+         p.frameTickCount = 12.5; \
+         p.maskMode = 1; \
+         p.colorWeight = 0x12345678; \
+         p.independentLayerInherit = true; \
+         p.zFactor = 2.5; \
+         p.cameraFOV = 45; \
+         p.canvasCaptureEnabled = true; \
+         p.clearEnabled = true; \
+         p.hitThreshold = 0.5; \
+         p.preview = true; \
+         p.outsideFactor = 0.25; \
+         p.stealthChara = \"ghost\"; \
+         p.stealthMotion = \"none\"; \
+         p.useD3D = true; \
+         p.meshline = \"m\";",
+    );
+    assert_eq!(env.eval_int("p.completionType"), 3);
+    assert_eq!(env.eval_str("p.chara"), "neko");
+    assert_eq!(env.eval_str("p.motionKey"), "idle");
+    assert_eq!(env.eval_str("p.outline"), "line");
+    assert!((env.eval_real("p.priorDraw") - 1.5).abs() < 1e-9);
+    assert!((env.eval_real("p.frameLastTime") - 10.0).abs() < 1e-9);
+    assert_eq!(env.eval_int("p.queuing ? 1 : 0"), 1);
+    assert_eq!(env.eval_int("p.speed ? 1 : 0"), 0);
+    assert_eq!(env.eval_int("p.maskMode"), 1);
+    assert_eq!(env.eval_int("p.useD3D ? 1 : 0"), 1);
+    assert!((env.eval_real("p.zFactor") - 2.5).abs() < 1e-9);
+    assert!((env.eval_real("p.hitThreshold") - 0.5).abs() < 1e-9);
+}
+
+#[test]
+fn player_variable_surface_round_trips() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    // `setVariable(ttstr, double)` is a raw callback; `getVariable` is an
+    // ncbind arity-1 real getter
+    // (`reference/cpp/plugins/motionplayer/main.cpp:253-255`,
+    // `Player.h:344`).
+    env.run("var p = new Motion.Player(null); p.setVariable(\"face_mouth\", 3.5);");
+    assert!((env.eval_real("p.getVariable(\"face_mouth\")") - 3.5).abs() < 1e-9);
+    // `countVariables` counts the snapshot's declared variables
+    // (`reference/cpp/plugins/motionplayer/PlayerVariable.cpp:568-574`).
+    assert!(env.eval_int("p.countVariables()") >= 0);
+    // `getVariable` requires its label
+    // (`reference/cpp/plugins/motionplayer/Player.h:344`).
+    assert!(env.eval("p.getVariable()").is_err());
+}
+
+#[test]
+fn player_timeline_surface_is_queryable() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    // `playTimeline(ttstr, tjs_int)` requires two arguments
+    // (`reference/cpp/plugins/motionplayer/Player.h:364`).
+    env.run(
+        "var p = new Motion.Player(null); \
+         p.playTimeline(\"idle\", 1); \
+         var info = p.getPlayingTimelineInfoList();",
+    );
+    assert!(env.eval("p.playTimeline(\"idle\")").is_err());
+    // `getPlayingTimelineInfoList` returns an array (the reference returns
+    // an empty array when no motion is active)
+    // (`reference/cpp/plugins/motionplayer/PlayerTimeline.cpp:337-339`).
+    assert_ne!(env.eval_str("typeof info"), "undefined");
+    // `getTimelinePlaying` reports the state of the named timeline
+    // (`reference/cpp/plugins/motionplayer/PlayerTimeline.cpp:64-71`).
+    assert_eq!(env.eval_int("p.getTimelinePlaying(\"idle\") ? 1 : 0"), 0);
+    // `stopTimeline` requires its label
+    // (`reference/cpp/plugins/motionplayer/Player.h:365`).
+    env.run("p.stopTimeline(\"idle\");");
+    assert!(env.eval("p.stopTimeline()").is_err());
+}
+
+#[test]
+fn player_methods_reject_missing_arguments() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run("var p = new Motion.Player(null);");
+    // Each call is one argument short of the ncbind arity registered by the
+    // reference, so it must fail with a typed error rather than defaulting
+    // (`reference/cpp/core/plugin/ncbind.hpp:1178`):
+    // `setSize(w, h)` (`Player.h:319`), `draw(tTJSVariant)`
+    // (`Player.h:322-323`, `main.cpp:234`), `frameProgress(double)`
+    // (`Player.h:324`), `setMirror(bool)` (`Player.h:266`),
+    // `setRotate(double, double, double)` (`Player.h:263`),
+    // `fadeInTimeline(ttstr, double, tjs_int)` (`Player.h:368`),
+    // `onFindMotion(ttstr, tjs_int)` (`Player.h:380`),
+    // `initPhysics(tTJSVariant)` (`Player.h:256`),
+    // `setStereovisionCameraPosition(double, double, double)` (`Player.h:339`).
+    for call in [
+        "p.setSize(1)",
+        "p.draw()",
+        "p.frameProgress()",
+        "p.setMirror()",
+        "p.setRotate(1, 0)",
+        "p.fadeInTimeline(\"idle\", 1)",
+        "p.onFindMotion(\"idle\")",
+        "p.initPhysics()",
+        "p.setStereovisionCameraPosition(1, 2)",
+        "p.setDrawAffineTranslateMatrix(1, 2, 3)",
+    ] {
+        assert!(env.eval(call).is_err(), "{call} must fail");
+    }
+    // A scalar `draw` argument is a no-op, but an object that is not a native
+    // `Layer` is a typed error — the reference resolves the target only
+    // through `NativeInstanceSupport(TJS_NIS_GETINSTANCE, Layer)`
+    // (`reference/cpp/plugins/motionplayer/PlayerRenderInternal.cpp:334-345`,
+    // `reference/cpp/core/visual/VideoOvlIntf.cpp:385-398`).
+    env.run("p.draw(1);");
+    assert!(env.eval("p.draw(%[])").is_err());
+}
+
+#[test]
+fn player_on_find_motion_override_wins() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    // `setMotionCompat` builds `{chara, motion}`, calls
+    // `objthis.onFindMotion(dict)` through the object (so a script override
+    // runs) and reads the returned object back
+    // (`reference/cpp/plugins/motionplayer/PlayerCore.cpp:445-474`).
+    env.run(
+        "var p = new Motion.Player(null); \
+         var seen = \"\"; \
+         p.onFindMotion = function(d) { \
+             seen = d.chara + \"/\" + d.motion; \
+             return %[chara: \"overridden\", motion: \"M2\"]; \
+         }; \
+         p.motion = \"M1\";",
+    );
+    assert_eq!(env.eval_str("seen"), "/M1");
+    // The override's returned object rewrites both identity fields
+    // (`reference/cpp/plugins/motionplayer/PlayerCore.cpp:458-472`).
+    assert_eq!(env.eval_str("p.motionKey"), "M2");
+    assert_eq!(env.eval_str("p.chara"), "overridden");
+}
+
+#[test]
+fn emote_player_shell_transforms_animate() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    // `setCoord`/`setScale`/`setRot`/`setColor` are the EmotePlayer raw
+    // callbacks (`reference/cpp/plugins/motionplayer/main.cpp:343-350`).
+    env.run(
+        "var rm = new Motion.ResourceManager(null, 1024); \
+         var e = new Motion.EmotePlayer(rm); \
+         e.setCoord(10, 20, 0); \
+         e.setScale(2, 0); \
+         e.setRot(0.5, 0); \
+         e.setColor(0xFF00FF, 0);",
+    );
+    // The binary getters are hardcoded (`getRot` 0.0, `getScale` 1.0,
+    // `getColor` 0) (`reference/cpp/plugins/motionplayer/EmotePlayer.cpp:325-326`,
+    // `:387-388`, `:426-427`).
+    assert_eq!(env.eval_real("e.getScale()"), 1.0);
+    assert_eq!(env.eval_real("e.getRot()"), 0.0);
+    assert_eq!(env.eval_int("e.getColor()"), 0);
+    // The shell member set includes the parameterless `pass`/`skip`
+    // (`reference/cpp/plugins/motionplayer/main.cpp:385-388`).
+    env.run("e.show(); e.hide(); e.progress(16); e.pass(); e.skip();");
+}
+
+#[test]
+fn resource_manager_loads_and_unloads_a_psb_module() {
+    let _lock = vm_lock();
+    let env = Env::with_reference_storage();
+    let path = "e-mote3.0バニラパジャマa.psb";
+    env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
+    // `load(ttstr)` parses the PSB and returns the module object
+    // (`reference/cpp/plugins/motionplayer/ResourceManager.cpp:143-170`).
+    env.run(&format!(
+        "var rm = new Motion.ResourceManager(null, 1024); \
+         var m = rm.load(\"{path}\");"
+    ));
+    // A parsed module is an object; the VM's `typeof` spells that "Object"
+    // (`reference/cpp/core/tjs2/tjsInterCodeExec.cpp:2612-2614`).
+    assert_eq!(env.eval_str("typeof m"), "Object");
+    assert_eq!(env.eval_str("m.path"), path);
+    // The module bridges the parsed metadata as a TJS dictionary
+    // (`reference/cpp/plugins/motionplayer/ResourceManager.cpp:143-170`).
+    assert_eq!(env.eval_str("m.metadata.base.chara"), "all_parts");
+    // The logical canvas size comes from the root's `screenSize` sibling
+    // (`reference/cpp/plugins/motionplayer/docs/MOTIONPLAYER_PSB_STRUCT.md`
+    // §2); the fixture's `screenSize` is 800x1080.
+    assert!((env.eval_real("m.width") - 800.0).abs() < 1e-9);
+    assert!((env.eval_real("m.height") - 1080.0).abs() < 1e-9);
+    // `findSource` returns the cached module object itself
+    // (`reference/cpp/plugins/motionplayer/ResourceManager.cpp:263-265`).
+    assert!(env.eval_bool(&format!("rm.findSource(\"{path}\") === m ? true : false")));
+    // A Player bound to the module loads it lazily on the first query
+    // (`reference/cpp/plugins/motionplayer/PlayerVariable.cpp:568-574`,
+    // `PlayerTimeline.cpp:75-76`).
+    env.run("var p = new Motion.Player(rm); p.project = m;");
+    // The reference fixture's `metadata.variableList` declares 24 variables,
+    // the first of which is `move_UD`
+    // (`reference/tests/test_files/emote/e-mote3.0バニラパジャマa.json`); the
+    // list is a direct child of `metadata`, not of `metadata.base`
+    // (`reference/cpp/plugins/motionplayer/docs/MOTIONPLAYER_PSB_STRUCT.md`
+    // §4.1).
+    assert!(env.eval_int("p.countVariables()") >= 24);
+    assert_eq!(env.eval_str("p.getVariableLabelAt(0)"), "move_UD");
+    // `metadata.timelineControl` declares 18 timelines in the same fixture,
+    // so the clip/timeline model is populated too.
+    assert!(env.eval_int("p.countMainTimelines()") > 0);
+    assert!(!env.eval_str("p.getMainTimelineLabelAt(0)").is_empty());
+    // `unload(ttstr)` drops every cache key that points at the module
+    // (`reference/cpp/plugins/motionplayer/ResourceManager.cpp:172-205`).
+    env.run(&format!("rm.unload(\"{path}\");"));
+    // `findSource` on a miss returns an unset variant, which the VM's
+    // `typeof` spells "void" (`reference/cpp/core/tjs2/tjsInterCodeExec.cpp:2608-2610`).
+    assert_eq!(
+        env.eval_str(&format!("typeof rm.findSource(\"{path}\")")),
+        "void"
+    );
+}
+
+/// Reference: the `PostRegistCallback` defines `global.ShortCutInitialPadKeyMap`
+/// and `global.ShortCutInitialGamePadKeyMap` as empty dictionaries when they
+/// are unset, because an encrypted `keybinder.tjs` dereferences them
+/// (`reference/cpp/plugins/motionplayer/main.cpp:534-544`).
+#[test]
+fn shortcut_initial_globals_are_defined() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    assert_eq!(
+        env.eval_str("typeof global.ShortCutInitialPadKeyMap"),
+        "Object",
+        "ShortCutInitialPadKeyMap must be a dictionary global"
+    );
+    assert_eq!(
+        env.eval_str("typeof global.ShortCutInitialGamePadKeyMap"),
+        "Object",
+        "ShortCutInitialGamePadKeyMap must be a dictionary global"
+    );
+    // The globals are ordinary writable members (the reference uses
+    // `PropSet`), so a game can replace them.
+    env.run("global.ShortCutInitialPadKeyMap = 1;");
+    assert_eq!(env.eval_int("global.ShortCutInitialPadKeyMap"), 1);
+}
+
+#[test]
+fn separate_layer_adaptor_layer_tree_owner_interface_delegates_to_its_owner() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    // `_owner` is the construction-time `targetLayer.window`
+    // (`reference/cpp/plugins/motionplayer/SeparateLayerAdaptor.cpp:26-34`,
+    // `:231`); the hidden `layerTreeOwnerInterface` method returns that
+    // owner's own `layerTreeOwnerInterface` property (`:297-330`).
+    env.run(
+        "var iface = %[]; \
+         var win = %[ layerTreeOwnerInterface: iface ]; \
+         var sla = new Motion.SeparateLayerAdaptor(%[ window: win ]); \
+         var got = sla.layerTreeOwnerInterface(); \
+         var first = %[]; var second = %[]; \
+         var fixed = new Motion.SeparateLayerAdaptor(%[ window: %[ layerTreeOwnerInterface: first ] ]); \
+         fixed.targetLayer = %[ window: %[ layerTreeOwnerInterface: second ] ]; \
+         var fixedGot = fixed.layerTreeOwnerInterface();",
+    );
+    assert_eq!(env.eval_int("got === iface ? 1 : 0"), 1);
+    // `setTargetLayer` does not recompute `_owner`.
+    assert_eq!(env.eval_int("fixedGot === first ? 1 : 0"), 1);
+    assert_eq!(env.eval_int("fixedGot === second ? 1 : 0"), 0);
+    // No owner (no constructor argument) leaves the result void.
+    assert_eq!(
+        env.eval_str("typeof (new Motion.SeparateLayerAdaptor()).layerTreeOwnerInterface()"),
+        "void"
+    );
+}
+
+#[test]
+fn d3d_adaptor_constructor_validates_its_window_and_size_arguments() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    // `Factory` requires five parameters (`reference/cpp/plugins/motionplayer/
+    // D3DAdaptor.cpp:19-20`) and a `Window` first argument, otherwise it throws
+    // `"must set Window object"` (`:21-27`).
+    assert!(env.eval("new Motion.D3DAdaptor()").is_err());
+    assert!(env.eval("new Motion.D3DAdaptor(0, 1, 1, 0, 0)").is_err());
+    assert!(env.eval("new Motion.D3DAdaptor(%[], 1, 1, 0, 0)").is_err());
+}

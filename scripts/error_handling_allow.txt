@@ -1,0 +1,121 @@
+# Error-handling allowlist (AGENTS §4).  Enforced by
+# scripts/check-error-handling.sh.
+#
+# One entry per line:  path:line:pattern — reason
+#
+#   path     repo-relative path of the file.
+#   line     the line at the time the entry was written.  Advisory when
+#            `pattern` is a code anchor; exact-match when it is a rule name.
+#   pattern  EITHER a rule name (parse-unwrap, result-fallback,
+#            let-underscore, ok-discard, iflet-ok, debug-assert,
+#            non-exhaustive, allow-dead-code) — then path:line:pattern must
+#            all match — OR a substring of the offending source line, matched
+#            by path + substring so the entry survives line churn and fails
+#            closed when the code changes.
+#   reason   why the site is legitimate.  Cite reference/cpp/** where the
+#            behaviour comes from (D30); a site is not evidence without one.
+#
+# Blank lines and lines starting with '#' are ignored.  An entry that no
+# longer matches any finding is reported as stale so the list can shrink.
+#
+# This list holds the LEGITIMATE rows of docs/audits/error-handling.md.  Do
+# not add a site the audit classifies as a violation; fix it instead.
+
+# --- mutex poisoning is recovered deliberately; no fallible operation is
+#     hidden (audit §3.1). -------------------------------------------------
+crates/engine/src/sound.rs:460:PoisonError::into_inner — recover from a poisoned stream-buffer lock by design; no path panics while it is held
+crates/compat/src/plugin.rs:217:(|poison| poison.into_inner()) — plugin registry lock; poisoning is recovered by design
+crates/compat/src/binding.rs:37:result-fallback — process binding lock; poisoning is recovered by design
+crates/testkit/src/vm.rs:12:result-fallback — dev-helper VM lock; poisoning is recovered by design
+
+# --- str::strip_prefix returns Option, not Result (audit §3.1) ------------
+crates/compat/src/natives/sound.rs:194:strip_prefix('\u{feff}') — Option on &str; the BOM is genuinely optional
+crates/compat/src/resource.rs:258:strip_prefix('@') — Option on &str; the face-name prefix is genuinely optional
+crates/platform/media/src/hint.rs:20:strip_prefix('.') — Option on &str; the media-hint dot is genuinely optional
+crates/compat/src/natives/plugins/json/mod.rs:768:strip_prefix('+') — Option on &str; the JSON argument marker is genuinely optional
+
+# --- MediaFormat::i32 returns Option (absent key); the default is the
+#     documented absent-key value (audit §3.2 rank 3) ----------------------
+crates/platform/media/src/video/mediacodec.rs:596:result-fallback — MediaFormat::i32 returns Option; absent key => documented default
+crates/platform/media/src/video/mediacodec.rs:875:result-fallback — MediaFormat::i32 returns Option; absent key => documented default
+crates/platform/media/src/video/mediacodec.rs:876:result-fallback — MediaFormat::i32 returns Option; absent key => documented default
+crates/platform/media/src/video/mediacodec.rs:879:result-fallback — MediaFormat::i32 returns Option; absent key => documented default
+crates/platform/media/src/video/mediacodec.rs:886:result-fallback — MediaFormat::i32 returns Option; absent key => documented default
+crates/platform/media/src/video/mediacodec.rs:891:result-fallback — MediaFormat::i32 returns Option; absent key => documented default
+crates/platform/media/src/video/mediacodec.rs:1047:result-fallback — MediaFormat::i32 returns Option; absent key => documented default
+crates/platform/media/src/video/mediacodec.rs:1048:result-fallback — MediaFormat::i32 returns Option; absent key => documented default
+crates/platform/media/src/video/mediacodec.rs:1067:result-fallback — MediaFormat::i32 returns Option; absent key => documented default
+crates/platform/media/src/video/mediacodec.rs:1079:result-fallback — MediaFormat::i32 returns Option; absent key => documented default
+
+# --- u64::try_from(bytes.len()) cannot overflow on the 64-bit host
+#     (audit §3.1) --------------------------------------------------------
+crates/platform/fs/src/ops.rs:63:u64::try_from(bytes.len()) — usize -> u64 cannot overflow on the 64-bit host
+
+# --- existence probe whose failure surfaces at the real I/O call
+#     (audit §4.1) --------------------------------------------------------
+crates/platform/fs/src/host.rs:29:std::fs::metadata — metadata only rejects directories; the open below reports the real error
+crates/platform/fs/src/ops.rs:167:std::fs::metadata — metadata only rejects directories; remove_file below reports the real error
+
+# --- reference-documented ignored callbacks (audit §5.1;
+#     reference/cpp/core/base/KAGParser.cpp:1158-1170) ---------
+crates/compat/src/natives/kag/mod.rs:250:let _ = engine.call_member( — onLabel/onScript/onScenarioLoaded handler errors are ignored, matching the reference
+
+# --- best-effort cleanup (audit §5.1) -------------------------------------
+crates/platform/media/src/video/mediacodec.rs:357:let-underscore — codec.stop() during teardown is best-effort
+
+# --- debug_assert backed by adjacent validation (audit §8) ----------------
+crates/compat/src/natives/plugins/wutcwf/mod.rs:305:debug-assert — TcwfHeader::parse rejects bytes_per_block < 32; the equal assert is redundant
+crates/compat/src/natives/plugins/wutcwf/mod.rs:306:debug-assert — decode_tcwf allocates exactly samples_per_block*channels; the equal assert is redundant
+crates/platform/render/src/glyph.rs:222:debug-assert — internal rasterizer invariant; no unsafe/indexing depends on it in release
+
+# --- pub(crate) thiserror error enums, never matched variant-by-variant
+#     (audit §7) -----------------------------------------------------------
+crates/compat/src/natives/sound.rs:172:#[non_exhaustive] — SliError is a pub(crate) thiserror error enum, not a discriminant
+crates/compat/src/resource.rs:673:non-exhaustive — PrerenderedFontError is a pub(crate) thiserror error enum, not a discriminant
+
+# --- event `type`/`target` writes: the dictionary is created immediately
+#     above and the id is just retained, so the `TJS_MEMBERENSURE` write
+#     cannot fail; the reference guards it only as an internal error
+#     (reference/cpp/core/base/EventIntf.cpp:709-736) ----------------------
+crates/compat/src/natives/async_trigger.rs:314:let _ = host.set_member(event.raw_id(), "target", &TjsValue::Retained(target_id)); — live dictionary plus live retained id; EventIntf.cpp:709-736 guards this only as an internal error
+crates/compat/src/natives/cdda_midi.rs:261:let _ = host.set_member(event.raw_id(), "target", &TjsValue::Retained(target_id)); — live dictionary plus live retained id; EventIntf.cpp:709-736 guards this only as an internal error
+crates/compat/src/natives/menu_item.rs:901:let _ = host.set_member(event.raw_id(), "type", &TjsValue::String("onClick".into())); — live dictionary plus non-NUL name; EventIntf.cpp:709-736 guards this only as an internal error
+crates/compat/src/natives/menu_item.rs:908:let _ = host.set_member(event.raw_id(), "target", &TjsValue::Retained(target_id)); — live dictionary plus live retained id; EventIntf.cpp:709-736 guards this only as an internal error
+crates/compat/src/natives/sound.rs:1974:let _ = host.set_member(event.raw_id(), "target", &TjsValue::Retained(target_id)); — live dictionary plus live retained id; EventIntf.cpp:709-736 guards this only as an internal error
+crates/compat/src/natives/visual/timer.rs:309:let _ = host.set_member(event.raw_id(), "target", &TjsValue::Retained(target_id)); — live dictionary plus live retained id; EventIntf.cpp:709-736 guards this only as an internal error
+crates/compat/src/natives/visual/window.rs:1393:let _ = host.set_member(event.raw_id(), "target", &TjsValue::Retained(target_id)); — live dictionary plus live retained id; EventIntf.cpp:709-736 guards this only as an internal error
+
+# --- reference-ignored writes / cleanup -----------------------------------
+crates/compat/src/natives/plugins/layer_ex/gdiplus.rs:324:let _ = ctx.delete_member(global_id, internal); — the class globals exist only because the registration ABI publishes one; the absent-member error means an earlier install already removed it
+crates/compat/src/natives/plugins/layer_ex/movie.rs:239:let _ = slot.overlay.stop(); — the reference stopMovie stops and releases the overlay unconditionally (layerExMovie.cpp:214-227); stop() only fails with NotOpen during teardown
+crates/compat/src/natives/plugins/layer_ex/movie.rs:366:let _ = slot.overlay.stop(); — the reference onEnded posts stopMovie, which stops and releases the overlay (layerExMovie.cpp:281-289); stop() only fails with NotOpen during teardown
+crates/compat/src/natives/plugins/motion_player/resource.rs:174:let _ = engine_ref.set_member(window.raw_id(), name, &TjsValue::Retained(id)); — the reference ignores the PropSet result when pre-defining the pad-key dictionaries (ResourceManager.cpp:88-100)
+crates/compat/src/natives/plugins/psb_file/mod.rs:202:let _ = host.set_member(global.raw_id(), PSB_BUF_GLOBAL, &TjsValue::Void); — clearing a temporary global after exec_script; the live global makes the write infallible
+crates/compat/src/natives/plugins/psb_file/mod.rs:203:let _ = host.set_member(global.raw_id(), PSB_KEY_GLOBAL, &TjsValue::Void); — clearing a temporary global after exec_script; the live global makes the write infallible
+crates/compat/src/null_plugin.rs:103:let _ = host.set_call_missing(object.raw_id()); — the retained null-plugin object is live, so the catch-all flag cannot fail to be set
+crates/compat/src/null_plugin.rs:177:let _ = host.set_default_member(prop.raw_id(), &TjsValue::Retained(noop.raw_id() as u64)); — both ids are live retentions; the access has already been logged
+
+# --- Option/`Vec` returns the guard's method-name heuristic flags ----------
+crates/compat/src/natives/sound.rs:1297:let _ = object.buffer.poll(channel); — SoundBuffer::poll returns Vec<SoundEvent>, not a Result; the transitional event is deliberately discarded
+crates/compat/src/natives/visual/layer/mod.rs:342:let _ = scene.update_layer(id, |layer| { — Scene::update_layer returns Option<bool>; the layer was just verified present and the change flag is tracked by the closure
+crates/engine/src/storage.rs:593:path.strip_prefix(&self.game_dir).ok()?.to_path_buf() — the contract is the mount-relative name, so a path outside the mount is genuinely None
+
+# --- Path::strip_prefix's error means "not under the prefix", and the rename
+#     filter intentionally skips those keys (audit §3.3) --------------------
+crates/platform/fs/src/ops.rs:281:ok-discard — Path::strip_prefix's error is exactly "not under src"; the rename filter skips keys outside the moved directory
+crates/platform/fs/src/ops.rs:290:ok-discard — Path::strip_prefix's error is exactly "not under src"; the rename filter skips keys outside the moved directory
+
+# --- usize -> u64 cannot overflow (audit §3.1) -----------------------------
+crates/platform/fs/src/ops.rs:426:u64::try_from(v.len()) — usize -> u64 cannot overflow on any supported target
+crates/platform/fs/src/ops.rs:455:u64::try_from(n) — usize -> u64 cannot overflow on any supported target
+
+# --- reference Option defaults (audit §3.3) --------------------------------
+crates/compat/src/natives/plugins/psd_file/parse.rs:799:descriptor.integer("lastAppliedComp").unwrap_or(-1) — the reference defaults an absent lastAppliedComp to -1 (reference/cpp/plugins/psdfile/psdparse/psdresource.cpp:112-113)
+crates/compat/src/natives/plugins/psd_file/parse.rs:1146:offset.integer("Hrzn").unwrap_or(0) — the reference defaults an absent Hrzn to 0 (reference/cpp/plugins/psdfile/psdparse/psdlayer.cpp:87-89)
+crates/compat/src/natives/plugins/psd_file/parse.rs:1147:offset.integer("Hrzn").unwrap_or(0) — the reference defaults an absent Hrzn to 0 (reference/cpp/plugins/psdfile/psdparse/psdlayer.cpp:87-89)
+crates/compat/src/natives/storages.rs:163:normalize_storage_name(name) — TVPGetPlacedPath returns the normalized input when the placement is outside the game directory (reference/cpp/core/base/StorageIntf.cpp:1061-1097)
+crates/compat/src/resource.rs:225:let _ = self.resolve_face(ctx, DEFAULT_FACE); — Font.getList/defaultFaceName have no reference error path; an unresolved default yields the empty list/name (LayerIntf.cpp:11777-11786, 12177)
+crates/compat/src/resource.rs:233:let _ = self.resolve_face(ctx, DEFAULT_FACE); — Font.getList/defaultFaceName have no reference error path; an unresolved default yields the empty list/name (LayerIntf.cpp:11777-11786, 12177)
+
+# --- rasterizer invariants no malformed input can reach ---------------------
+crates/platform/render/src/glyph.rs:303:debug_assert!(size_px > 0.0 — px_scale_for_height is private; its three callers reject a non-positive or non-finite size first

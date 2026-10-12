@@ -8,15 +8,15 @@ prioritized plan for each target.
 Method: manifest + source inspection, `cargo tree`, and `cargo check` of the
 pure-Rust leaf crates for `wasm32-unknown-unknown` and
 `aarch64-linux-android`. No release builds, no toolchain/target installs.
-The full game path (`render`/`engine`/`tjs2-sys`) was **not** cross-checked
-because `crates/tjs2-sys/build.rs` compiles the C++ VM for the *host*
+The full game path (`render`/`engine`/`tjs`) was **not** cross-checked
+because `crates/tjs/build.rs` compiles the C++ VM for the *host*
 regardless of `--target` (see §2), which would make a `cargo check` result
 misleading; a real cross build is not cheap. That limitation is called out
 again in §11.
 
 > **Update (verified):** the Android cross-build of the C++ VM *has* since been
 done. With NDK r27c installed and `CXX` pointed at
-> `aarch64-linux-android21-clang++`, `cargo check -p tjs2-sys --target
+> `aarch64-linux-android21-clang++`, `cargo check -p tjs --target
 > aarch64-linux-android` **succeeds in ~19 s** — `build.rs` honours the `CXX`
 > override, so it does *not* build for the host when the override is set. Zig is
 > not an option for Android (it refuses to provide Android libc). See
@@ -43,7 +43,7 @@ done. With NDK r27c installed and `CXX` pointed at
 | Area | Android (`aarch64-linux-android`) | wasm32 (`wasm32-unknown-unknown`) | Effort |
 |---|---|---|---|
 | Cargo workspace / Bevy features | Builds with Bevy defaults; needs Android entrypoint + packaging | Builds with Bevy defaults; needs wasm entrypoint + web packaging | M |
-| C++ TJS2 VM (`tjs2-sys`) | **Verified**: cross-compiles with the NDK clang (~19 s); zig cannot (no Android libc). build.rs still not target-aware for the C++ link flags | **Hard blocker**: no C++ runtime for `wasm32-unknown-unknown`; needs Emscripten/WASI side module | L |
+| C++ TJS2 VM (`tjs`) | **Verified**: cross-compiles with the NDK clang (~19 s); zig cannot (no Android libc). build.rs still not target-aware for the C++ link flags | **Hard blocker**: no C++ runtime for `wasm32-unknown-unknown`; needs Emscripten/WASI side module | L |
 | oniguruma C lib | Cross-compile with NDK; `deps/build.zig` already target-aware | Same C++ toolchain problem | L |
 | libopus (`opusic-sys` bundled) | `opusic-sys` has explicit NDK support (`ANDROID_NDK_HOME` + cmake toolchain) | **Hard blocker**: cmake/emscripten not wired; no wasm libopus | M / L |
 | Filesystem / storage | `std::fs` works only inside app-private dirs; APK assets need `AssetManager`; scoped storage | **Hard blocker**: no synchronous fs; needs fetch/OPFS/IndexedDB + a storage trait | L |
@@ -61,25 +61,25 @@ decode, text layout, the WGSL blend material (WebGL2-compatible, §9).
 ## 2. Workspace layout and dependencies
 
 Workspace `Cargo.toml`:
-- Members: 19 crates (`Cargo.toml:3`); `default-members = ["crates/render", "crates/app"]`
+- Members: 19 crates (`Cargo.toml:3`); `default-members = ["crates/platform/render", "crates/app"]`
   (`Cargo.toml:4`).
 - Release profile uses thin LTO + `codegen-units = 1` (`Cargo.toml:12-15`) —
   irrelevant to cross-compilation, but note `lto` interacts with `opusic-sys`'s
   cmake LTO handling (see §6).
 
 Bevy:
-- `crates/render/Cargo.toml:16` → `bevy = "0.19"` with **default features**
+- `crates/platform/render/Cargo.toml:16` → `bevy = "0.19"` with **default features**
   (no `default-features = false`).
 - Bevy 0.19.1 defaults are `default = ["2d", "3d", "ui", "audio"]`
   (`bevy 0.19.1` manifest, `[features]`). `default_platform` includes
   `multi_threaded`, `bevy_winit`, `bevy_gilrs`, `webgl2`, `x11`, `wayland`,
   `sysinfo_plugin`, `default_font` (same manifest). So the current app pulls
   Winit, the render stack, and Bevy audio/rodio.
-- `crates/render/Cargo.toml` also declares `crates/render/src/main.rs` as the
-  `krkr-rs` bin and exports a `krkr_render` lib (`crates/render/src/lib.rs`).
+- `crates/platform/render/Cargo.toml` also declares `crates/platform/render/src/main.rs` as the
+  `krkr-rs` bin and exports a `render` lib (`crates/platform/render/src/lib.rs`).
 
 Crates that are hard to cross-compile (contain or depend on native code):
-- `crates/tjs2-sys` — C++ TJS2 VM + libonig (§3).
+- `crates/tjs` — C++ TJS2 VM + libonig (§3).
 - `crates/tvp-sound` — `symphonia-adapter-libopus` → `opusic-sys` bundled
   (C libopus via cmake), and `rodio` → `cpal` (`crates/tvp-sound/Cargo.toml:18-20`).
 - `crates/tvp-archive` — `zip`/`sevenz-rust`/`tar`
@@ -94,7 +94,7 @@ Crates that are hard to cross-compile (contain or depend on native code):
   `[dev-dependencies]` to avoid dragging fs/rand code into non-test wasm builds.
 
 Pure-Rust crates (fine to cross-compile in principle): `xp3`, `kag`,
-`tvp-util`, `tvp-streams`, `tvp-config`, `tvp-text`, `engine` (once `tjs2-sys`
+`tvp-util`, `tvp-streams`, `tvp-config`, `tvp-text`, `engine` (once `tjs`
 links), `tvp-input`, `tvp-natives`, `tvp-scripts`, `tvp-storages`,
 `tvp-kagparser`.
 
@@ -102,9 +102,9 @@ links), `tvp-input`, `tvp-natives`, `tvp-scripts`, `tvp-storages`,
 
 ## 3. Native / C++ code — the central blocker
 
-### 3.1 `tjs2-sys` build
+### 3.1 `tjs` build
 
-`crates/tjs2-sys/build.rs` does **not** use `cmake` or the `cc` crate. It:
+`crates/tjs/build.rs` does **not** use `cmake` or the `cc` crate. It:
 1. runs `zig build` in `deps/` to fetch fmt/spdlog/boost headers and build
    `libonig.a` (`build.rs:122-128`; `deps/build.zig` builds ~55 oniguruma C
    sources into a static lib);
@@ -126,9 +126,9 @@ final Rust link would reveal the mismatch. Under `cargo check` (no link) it can
 even appear to "succeed". This is why the full game path is untested here.
 
 The vendored C++ uses `std::mutex`, `std::thread::id`, `std::this_thread`
-(`crates/tjs2-sys/cpp/tjs2/tjsUtils.cpp:14-38`,
+(`crates/tjs/cpp/tjs2/tjsUtils.cpp:14-38`,
 `cpp/tjs2/tjsInterCodeExec.cpp:476-498`) and `<cstdio>` file I/O in the save
-path (`crates/tjs2-sys/cpp/streams.cpp:21,63,152`). It needs a full C++
+path (`crates/tjs/cpp/streams.cpp:21,63,152`). It needs a full C++
 runtime (libc++/libc++abi), RTTI, exceptions, and thread support.
 
 ### 3.2 oniguruma
@@ -257,8 +257,8 @@ What a port needs:
 
 ## 6. Threading / concurrency
 
-- The VM is single-threaded by design: `tjs2-sys` documents this and only makes
-  the handle `Send`/`Sync` via `unsafe impl` (`crates/tjs2-sys/src/lib.rs:311-314,
+- The VM is single-threaded by design: `tjs` documents this and only makes
+  the handle `Send`/`Sync` via `unsafe impl` (`crates/tjs/src/lib.rs:311-314,
   339-340`), with per-crate `VM_LOCK` test mutexes.
 - The Bevy app serializes the whole VM step with `static VM_RUN_LOCK`
   (`render/src/main.rs:319-330`) because Bevy's scheduler may run systems on
@@ -272,7 +272,7 @@ What a port needs:
   `unsafe impl Send/Sync` (`tvp-sound/src/player.rs:200-210`); the mixer itself
   is pull-based (no app-owned thread) — grep for `thread` in
   `tvp-sound/src/mixer.rs` finds none.
-- `tjs2-sys/build.rs` uses `std::thread::spawn` during the **build**
+- `tjs/build.rs` uses `std::thread::spawn` during the **build**
   (`build.rs:254`), which is host-side only.
 
 Impact:
@@ -341,14 +341,14 @@ Cross-compile needs:
 ## 8. Entrypoints and build tooling
 
 Current entrypoints:
-- Native binary: `crates/render/src/main.rs` (`fn main`, windowed `App` via
+- Native binary: `crates/platform/render/src/main.rs` (`fn main`, windowed `App` via
   `DefaultPlugins` at `:129-176`, or `MinimalPlugins` headless at
   `:178-198`). CLI-only headless tool: `crates/app/src/main.rs`
   (`krkr-cli`); the graphical runner's `krkr-rs run <game> --headless` is the
   diagnostic path.
 - No `#[wasm_bindgen(start)]` lib entry and no `android_main`/GameActivity
   entry exist (grep, §4).
-- `krkr_render` is already a lib (`render/src/lib.rs`) that exposes
+- `render` is already a lib (`render/src/lib.rs`) that exposes
   `sync_scene`, `SharedScene`, `LayerBlendPlugin`, etc., so a wasm/Android
   entry can reuse it.
 
@@ -365,7 +365,7 @@ What each target additionally needs:
 - **Android**: `android_main` (`#[cfg(target_os = "android")]`) or Bevy's
   GameActivity integration; a Gradle project with `AndroidManifest.xml`,
   `cargo-ndk` (or a custom linker config), the NDK sysroot wired into
-  `tjs2-sys`/onig/opus, and asset packaging for the game.
+  `tjs`/onig/opus, and asset packaging for the game.
 - **wasm**: `wasm-bindgen-cli` (matching the `wasm-bindgen` crate version),
   a `#[wasm_bindgen(start)]` entry, `index.html` + a bundler (`trunk` or
   `wasm-pack`), async storage bootstrap, and a user-gesture audio start.
@@ -455,7 +455,7 @@ Failed:
 ### 10.3 Not tested (and why)
 
 - `render` / `engine` / `tvp-sound` / `tvp-visual` cross-checks were **not**
-  run: each pulls `tjs2-sys`, whose `build.rs` compiles the C++ VM for the host
+  run: each pulls `tjs`, whose `build.rs` compiles the C++ VM for the host
   regardless of `--target` (§3.1), so `cargo check` (no link) is not
   authoritative, and a linking build is not a "cheap" check. Treat the C++ and
   libopus cross-compilation as **unverified** until the build wiring is fixed.
@@ -467,18 +467,18 @@ Failed:
 Ordered so that each step is independently testable. Files/crates to touch are
 named, with why.
 
-1. **Trim Bevy features** (`crates/render/Cargo.toml:16`). Pick an explicit 2D
+1. **Trim Bevy features** (`crates/platform/render/Cargo.toml:16`). Pick an explicit 2D
    feature set (`default-features = false`, keep `bevy_winit`, `bevy_render`,
    `bevy_sprite`, `bevy_asset`, `bevy_audio`/audio format features, `png`, and
    the Android activity feature). Why: drop `3d`, `ui`, `bevy_gilrs`,
    `sysinfo_plugin`, desktop-only `x11`/`wayland`, and reduce the dependency
    surface before touching the VM/audio. Effort S.
-2. **Add an Android entrypoint** (new `crates/render/src/main.rs` branch or a
+2. **Add an Android entrypoint** (new `crates/platform/render/src/main.rs` branch or a
    new `src/bin/android.rs`/`src/android.rs`). Use `#[cfg(target_os =
    "android")]` + a `android_main` (or Bevy's GameActivity plugin) that builds
    the same `App` as `game_app` (`render/src/main.rs:129-176`). Replace
    `std::env::args`/`std::process::exit` for this path. Effort M.
-3. **Cross-compile the C++ VM** (`crates/tjs2-sys/build.rs`). Teach `build.rs`
+3. **Cross-compile the C++ VM** (`crates/tjs/build.rs`). Teach `build.rs`
    to read `TARGET` and pass the right compiler/target to `zig c++` (or set
    `CXX` to the NDK `clang++` and use `-target`/`--sysroot`), compile
    `deps/build.zig` with `-Dtarget=<TARGET>` (add the missing flag at
@@ -512,7 +512,7 @@ named, with why.
 
 ## 12. Prioritized task list — wasm32 ("runs in a browser")
 
-1. **Scaffold the web target** (`crates/render`): add a `#[wasm_bindgen(start)]`
+1. **Scaffold the web target** (`crates/platform/render`): add a `#[wasm_bindgen(start)]`
    lib entry that builds the same `App` as `game_app`; add `index.html` and a
    bundler config (Trunk or wasm-pack); install `wasm-bindgen-cli` matching the
    crate version. Keep the native `main.rs` behind `#[cfg(not(target_arch =
@@ -547,7 +547,7 @@ named, with why.
 
 ## 13. Hard blockers and viable strategies
 
-### B1. C++ TJS2 VM (`tjs2-sys`) — the biggest blocker
+### B1. C++ TJS2 VM (`tjs`) — the biggest blocker
 
 **Android**: solvable with NDK cross-compilation. Make `build.rs` target-aware
 (today it never reads `TARGET`: `build.rs:122-153,254-278`), cross-compile
@@ -629,6 +629,6 @@ a platform-supplied game handle for wasm/Android. Small but pervasive. S/M.
   for wasm/Android as-is (untested; trimming them is recommended regardless).
 - Android `std::fs` behavior under scoped storage for the intended game
   layout; depends on where the game is shipped.
-- `tjs2-sys/cpp/streams.cpp` save/load uses `fopen` directly
+- `tjs/cpp/streams.cpp` save/load uses `fopen` directly
   (`streams.cpp:63,152`); it would need a backend hook for both targets beyond
   the Rust `Storage` layer.

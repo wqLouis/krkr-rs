@@ -8,6 +8,7 @@ import android.net.Uri
 import android.os.Bundle
 import android.provider.Settings
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -27,6 +28,9 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.selectableGroup
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -34,6 +38,7 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -41,9 +46,12 @@ import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -53,11 +61,16 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -98,10 +111,12 @@ class MainActivity : ComponentActivity() {
         LauncherLog.i("MainActivity.onCreate")
         permissionGranted.value = SafPaths.hasAllFilesAccess()
         val library = GameLibrary(this)
+        val settings = RuntimeSettingsStore(this)
         setContent {
             KrkrTheme {
                 LauncherScreen(
                     library = library,
+                    settings = settings,
                     permissionGranted = permissionGranted.value,
                     onOpenPermissionSettings = ::openAllFilesSettings,
                     startupIssue = startupIssue.value,
@@ -227,6 +242,7 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun LauncherScreen(
     library: GameLibrary,
+    settings: RuntimeSettingsStore,
     permissionGranted: Boolean,
     onOpenPermissionSettings: () -> Unit,
     startupIssue: Issue?,
@@ -239,13 +255,23 @@ private fun LauncherScreen(
     var games by remember { mutableStateOf(library.all()) }
     var pendingRemoval by remember { mutableStateOf<GameEntry?>(null) }
     var gameIssue by remember { mutableStateOf<Issue?>(null) }
-    var showLogs by remember { mutableStateOf(false) }
+    // Saveable so a configuration change (rotation, dark-mode toggle, fold,
+    // resize) does not close the open sub-screen or forget a dismissal.
+    var showLogs by rememberSaveable { mutableStateOf(false) }
+    var showSettings by rememberSaveable { mutableStateOf(false) }
 
     // The permission dialog is shown whenever the grant is missing, unless the
     // user explicitly dismissed it ("Not now"). Tapping a game re-opens it.
-    var permissionDismissed by remember { mutableStateOf(false) }
+    var permissionDismissed by rememberSaveable { mutableStateOf(false) }
     LaunchedEffect(permissionGranted) { if (permissionGranted) permissionDismissed = false }
     val showPermission = !permissionGranted && !permissionDismissed
+
+    // System back must agree with the TopAppBar arrow: while a sub-screen is
+    // open it returns to the library instead of finishing the Activity.
+    BackHandler(enabled = showLogs || showSettings) {
+        showLogs = false
+        showSettings = false
+    }
 
     /** Reports a transient problem to the user; never fails silently. */
     fun notify(text: String) {
@@ -286,7 +312,7 @@ private fun LauncherScreen(
         // Resolve now so the config file records where the game actually is;
         // a folder that cannot be addressed as a path is still added (the user
         // may mount that volume later), but we say so immediately.
-        val path = SafPaths.resolve(context, uri)
+        val path = SafPaths.resolve(uri)
         when (library.add(GameEntry(uri, name, path))) {
             SaveResult.SAVED -> {
                 games = library.all()
@@ -308,16 +334,28 @@ private fun LauncherScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text(if (showLogs) "Logs" else "krkr-rs") },
+                title = {
+                    Text(
+                        when {
+                            showLogs -> "Logs"
+                            showSettings -> "Settings"
+                            else -> "krkr-rs"
+                        },
+                    )
+                },
                 navigationIcon = {
-                    if (showLogs) {
-                        IconButton(onClick = { showLogs = false }) {
+                    if (showLogs || showSettings) {
+                        IconButton(onClick = {
+                            showLogs = false
+                            showSettings = false
+                        }) {
                             Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                         }
                     }
                 },
                 actions = {
-                    if (!showLogs) {
+                    if (!showLogs && !showSettings) {
+                        TextButton(onClick = { showSettings = true }) { Text("Settings") }
                         TextButton(onClick = { showLogs = true }) { Text("Logs") }
                     }
                 },
@@ -325,7 +363,7 @@ private fun LauncherScreen(
         },
         snackbarHost = { SnackbarHost(snackbar) },
         floatingActionButton = {
-            if (!showLogs) {
+            if (!showLogs && !showSettings) {
                 ExtendedFloatingActionButton(
                     onClick = { pickFolder.launch(null) },
                     icon = { Icon(Icons.Default.Add, contentDescription = null) },
@@ -338,6 +376,13 @@ private fun LauncherScreen(
             LogsScreen(
                 modifier = Modifier.fillMaxSize().padding(padding),
                 onNotify = { notify(it) },
+            )
+        } else if (showSettings) {
+            SettingsScreen(
+                store = settings,
+                modifier = Modifier.fillMaxSize().padding(padding),
+                onNotify = { notify(it) },
+                onBack = { showSettings = false },
             )
         } else if (games.isEmpty()) {
             EmptyLibrary(
@@ -641,13 +686,14 @@ private fun launchGame(
         return
     }
 
-    // Re-resolve on every launch. The mapping is pure string work (no I/O), and
-    // the cached path in `games.json` can go stale: a volume may be remounted
-    // under a new id, or the folder renamed or moved. Keep using the cached path
-    // while it is valid, but hold the fresh resolution ready as a fallback.
+    // Re-resolve on every launch. The mapping is pure string work (no I/O), so
+    // the fresh path is authoritative: the cached path in `games.json` can name
+    // a different folder after a hand edit or a restored backup, and the
+    // primary-volume fallback can resolve the same URI two ways. Use the cached
+    // path only when the URI no longer resolves at all.
     val cached = entry.path
-    val resolved = SafPaths.resolve(context, entry.uri)
-    var path = cached ?: resolved
+    val fresh = SafPaths.resolve(entry.uri)
+    var path = fresh ?: cached
     if (path == null) {
         LauncherLog.w("launch blocked: \"${entry.name}\" has no resolvable path")
         onIssue(
@@ -663,29 +709,65 @@ private fun launchGame(
     }
 
     var problem = GamePreflight.check(path)
-    if (problem != null && resolved != null && resolved != path) {
-        // The cached path stopped working. A remount or a move can change where
-        // the same URI resolves, so try the fresh path before giving up; adopt
-        // it (and remember it) only when it is genuinely a game.
+    if (problem != null && fresh != null && path == fresh && cached != null && cached != fresh) {
+        // The fresh path does not work, but the cached one still does. Fall back
+        // to it rather than refusing a folder the user could launch.
         LauncherLog.i(
-            "cached path \"$path\" failed (${problem.title}); trying resolved path \"$resolved\"",
+            "resolved path \"$fresh\" failed (${problem.title}); trying cached path \"$cached\"",
         )
-        val freshProblem = GamePreflight.check(resolved)
-        if (freshProblem == null) {
-            library.updatePath(entry.uri, resolved)
-            path = resolved
+        val cachedProblem = GamePreflight.check(cached)
+        if (cachedProblem == null) {
+            path = cached
             problem = null
         } else {
-            problem = freshProblem
+            problem = cachedProblem
         }
-    } else if (problem == null && cached == null && resolved != null) {
-        // First launch of a folder added while its volume was not mounted:
-        // remember where it resolved.
-        library.updatePath(entry.uri, resolved)
+    }
+    if (problem == null && fresh != null && path == fresh && cached != fresh) {
+        // The fresh resolution is what we are launching; keep the cache in step
+        // with it so the file matches the path in use.
+        if (library.updatePath(entry.uri, fresh) == SaveResult.FAILED) {
+            LauncherLog.w("could not refresh the cached path for \"${entry.name}\"")
+        }
     }
     if (problem != null) {
         LauncherLog.w("launch blocked: \"${entry.name}\" — ${problem.title} ($path)")
         onIssue(problem)
+        return
+    }
+
+    // A game cannot be switched inside a live android_main: the native side reads
+    // pendingGameDir once, when android_main starts, and nothing ever re-reads
+    // it. Starting a second game would therefore just resume the first while the
+    // pending marker written below would name the second, so a later crash would
+    // be blamed on the wrong game. Only allow the launch when it is the game that
+    // is already running (which merely brings it back to the front); otherwise
+    // refuse and say why, and never write a marker for a game that will not run.
+    val running = EngineDiagnostics.readState(context)?.takeIf {
+        (it.state == "starting" || it.state == "running") &&
+            it.pid != null && it.pid == android.os.Process.myPid()
+    }
+    if (running != null) {
+        val current = EngineDiagnostics.readLaunch(context)
+        if (current?.path == path) {
+            LauncherLog.i("engine already running \"${entry.name}\"; bringing it to the front")
+            runCatching {
+                context.startActivity(
+                    Intent(context, KrkrGameActivity::class.java)
+                        .putExtra(KrkrGameActivity.EXTRA_GAME_DIR, path)
+                        .putExtra(KrkrGameActivity.EXTRA_GAME_NAME, entry.name),
+                )
+            }.onFailure { LauncherLog.w("could not bring the running game to the front: ${it.message}") }
+            return
+        }
+        LauncherLog.w("launch blocked: the engine is already running a different game")
+        onIssue(
+            Issue(
+                title = "A game is already running",
+                message = "krkr-rs can only run one game at a time. Close \"" +
+                    (current?.name ?: "the running game") + "\" and try again.",
+            ),
+        )
         return
     }
 
@@ -705,6 +787,210 @@ private fun launchGame(
                 title = "Could not start the engine",
                 message = "Android refused to start the game activity: ${it.message}",
             ),
+        )
+    }
+}
+
+/**
+ * The runtime-settings screen: the launcher's persisted copy of the engine
+ * options the player can change.
+ *
+ * It exposes the three options the engine honours — the frame-rate limit, the
+ * presentation scaling and the archive preload — with the same accepted values
+ * and range as the desktop CLI's `--fps`, `--scaling` and `preload_archives`
+ * (`api::config`). Nothing is offered for a feature the engine has no knob for.
+ *
+ * Saving writes the settings file atomically; [KrkrGameActivity] reads it and
+ * publishes it over JNI on the next launch, which is why the change is described
+ * as applying to the next run.
+ */
+@Composable
+private fun SettingsScreen(
+    store: RuntimeSettingsStore,
+    modifier: Modifier = Modifier,
+    onNotify: (String) -> Unit,
+    onBack: () -> Unit,
+) {
+    val saved = remember { store.read() }
+    // Saveable so an in-progress edit survives a configuration change rather
+    // than silently reverting to the on-disk values.
+    var frameRate by rememberSaveable { mutableStateOf(saved.frameRate) }
+    var scaling by rememberSaveable { mutableStateOf(saved.scaling) }
+    var preloadArchives by rememberSaveable { mutableStateOf(saved.preloadArchives) }
+
+    // Validate only the frame rate here: the other values can only be set from
+    // their fixed controls, except when the file was hand-edited.
+    val frameRateValue = frameRate.trim().toIntOrNull()
+    val frameRateValid = frameRateValue != null &&
+        frameRateValue in RuntimeOptions.MIN_FRAME_RATE..RuntimeOptions.MAX_FRAME_RATE
+    val scalingKnown = scaling in RuntimeOptions.SCALING
+    val preloadKnown = preloadArchives in RuntimeOptions.PRELOAD_VALUES
+    val preloadChecked = preloadArchives.toBooleanStrictOrNull() ?: false
+
+    Column(
+        modifier = modifier.fillMaxSize().padding(16.dp).verticalScroll(rememberScrollState()),
+    ) {
+        Text("Runtime settings", style = MaterialTheme.typography.titleMedium)
+        Spacer(Modifier.height(4.dp))
+        Text(
+            "Applied the next time a game starts.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.height(20.dp))
+
+        Text("Frame-rate limit", style = MaterialTheme.typography.titleSmall)
+        Spacer(Modifier.height(4.dp))
+        OutlinedTextField(
+            value = frameRate,
+            onValueChange = { frameRate = it },
+            label = { Text("Frames per second") },
+            singleLine = true,
+            isError = !frameRateValid,
+            supportingText = {
+                if (frameRateValid) {
+                    Text(
+                        "Integer in ${RuntimeOptions.FRAME_RATE_RANGE}; " +
+                            "default ${RuntimeOptions.DEFAULT_FRAME_RATE}.",
+                    )
+                } else {
+                    Text(
+                        "Must be an integer in ${RuntimeOptions.FRAME_RATE_RANGE} frames per second.",
+                    )
+                }
+            },
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+            modifier = Modifier.fillMaxWidth(),
+        )
+        Spacer(Modifier.height(24.dp))
+
+        Text("Presentation scaling", style = MaterialTheme.typography.titleSmall)
+        Spacer(Modifier.height(4.dp))
+        Text(
+            "How the game picture is fitted to the screen. " +
+                "Default: ${RuntimeOptions.DEFAULT_SCALING}.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Column(Modifier.selectableGroup()) {
+            RuntimeOptions.SCALING.forEach { mode ->
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .selectable(
+                            selected = scaling == mode,
+                            onClick = { scaling = mode },
+                            role = Role.RadioButton,
+                        )
+                        .padding(vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    RadioButton(selected = scaling == mode, onClick = null)
+                    Spacer(Modifier.width(8.dp))
+                    Column {
+                        Text(
+                            text = mode.replaceFirstChar { it.uppercase() },
+                            style = MaterialTheme.typography.bodyLarge,
+                        )
+                        Text(
+                            text = RuntimeOptions.scalingDescription(mode),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
+        }
+        if (!scalingKnown) {
+            Text(
+                text = "This saved value (\"$scaling\") is not one of " +
+                    "${RuntimeOptions.SCALING.joinToString(", ")}; choose one before saving.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+            )
+        }
+        Spacer(Modifier.height(24.dp))
+
+        Text("Archive preload", style = MaterialTheme.typography.titleSmall)
+        Spacer(Modifier.height(4.dp))
+        Text(
+            RuntimeOptions.preloadDescription(),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Switch(
+                checked = preloadChecked,
+                onCheckedChange = { preloadArchives = it.toString() },
+                // The visible "Archive preload" label is a separate node, so
+                // name the switch itself for TalkBack.
+                modifier = Modifier.semantics { contentDescription = "Archive preload" },
+            )
+            Spacer(Modifier.width(8.dp))
+            Text(
+                text = if (preloadChecked) "On" else "Off",
+                style = MaterialTheme.typography.bodyLarge,
+            )
+        }
+        if (!preloadKnown) {
+            Text(
+                text = "This saved value (\"$preloadArchives\") is not one of " +
+                    "${RuntimeOptions.PRELOAD_VALUES.joinToString(", ")}; " +
+                    "toggle the switch before saving.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+            )
+        }
+        Spacer(Modifier.height(24.dp))
+
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            TextButton(onClick = {
+                frameRate = RuntimeOptions.DEFAULT_FRAME_RATE.toString()
+                scaling = RuntimeOptions.DEFAULT_SCALING
+                preloadArchives = RuntimeOptions.DEFAULT_PRELOAD_ARCHIVES
+            }) { Text("Restore defaults") }
+            Button(onClick = {
+                val fps = frameRate.trim().toIntOrNull()
+                if (fps == null || fps !in RuntimeOptions.MIN_FRAME_RATE..RuntimeOptions.MAX_FRAME_RATE) {
+                    onNotify(
+                        "Frame rate must be an integer in " +
+                            "${RuntimeOptions.FRAME_RATE_RANGE} frames per second.",
+                    )
+                    return@Button
+                }
+                if (scaling !in RuntimeOptions.SCALING) {
+                    onNotify("Choose one of: ${RuntimeOptions.SCALING.joinToString(", ")}.")
+                    return@Button
+                }
+                if (preloadArchives !in RuntimeOptions.PRELOAD_VALUES) {
+                    onNotify("Choose one of: ${RuntimeOptions.PRELOAD_VALUES.joinToString(", ")}.")
+                    return@Button
+                }
+                if (store.write(
+                        RuntimeSettings(
+                            frameRate = fps.toString(),
+                            scaling = scaling,
+                            preloadArchives = preloadArchives,
+                        ),
+                    )
+                ) {
+                    onNotify("Settings saved.")
+                    onBack()
+                } else {
+                    onNotify("Could not save the settings; they were not changed.")
+                }
+            }) { Text("Save") }
+        }
+        Spacer(Modifier.height(8.dp))
+        Text(
+            text = "Settings file: ${store.settingsFile().absolutePath}",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
     }
 }
@@ -733,7 +1019,7 @@ private fun EmptyLibrary(modifier: Modifier = Modifier, configPath: String) {
             Text(
                 text = "Library: $configPath",
                 style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.outline,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
                 textAlign = TextAlign.Center,
             )
         }

@@ -8,7 +8,7 @@
 # ## Why not `cargo ndk`?
 #
 # `cargo-ndk` wires up `CC`/`AR`/the Rust linker, but it does **not** provide
-# `CXX` in the form `crates/tjs2-sys/build.rs` reads (it sets the target-scoped
+# `CXX` in the form `crates/tjs/build.rs` reads (it sets the target-scoped
 # `CXX_<triple>`, while the build script reads plain `CXX`). The result is worse
 # than a failure: `build.rs` falls back to its default `zig c++`, which compiles
 # for the **host**, so an Android build silently contains x86-64 objects. That
@@ -62,7 +62,7 @@ RUST_TARGET="aarch64-linux-android"
 # means moving to a newer NDK as well — they must be raised together.
 API_LEVEL=35
 
-CRATE="krkr-android"
+CRATE="android"
 # The cdylib name is fixed by `android.app.lib_name` in the manifest.
 LIB_NAME="libkrkr_android.so"
 
@@ -146,11 +146,10 @@ echo "krkr-rs android: ndk=$NDK"
 
 # --- build ------------------------------------------------------------------
 #
-# No FFmpeg: Android has no system FFmpeg, and this crate depends on `render`
-# with `default-features = false` (Cargo.toml), which drops the `ffmpeg`
-# feature transitively. The engine's MediaCodec backend is the replacement
-# (docs/android.md §6); until it lands, video returns a clear "no MPEG decoder
-# in this build" error rather than failing to compile.
+# The crate graph is selected by `-p android`; the video backend is chosen by
+# `crates/app`, which this crate depends on. Android has no system FFmpeg, so
+# that choice must resolve to `media`'s MediaCodec backend (docs/android.md
+# §6) and the desktop FFmpeg feature must not reach this target.
 cd "$ROOT"
 cargo "$MODE" "${CARGO_PROFILE_ARGS[@]}" --target "$RUST_TARGET" -p "$CRATE"
 

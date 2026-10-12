@@ -1,0 +1,73 @@
+[package]
+name = "compat"
+description = "krkr-rs L3 KiriKiri compatibility surface: native classes + KAG + event adapter + static plugins"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+engine = { workspace = true }
+tjs = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+flate2 = { workspace = true }
+encoding_rs = "0.8"
+# Tests only: production reads time from `std`, tests cross-check it against C.
+# `json` plugin: `serde_json` (1.0.x) replaces the hand-written
+# recursive-descent parser for `Scripts.evalJSON` — value/number/escape/
+# surrogate handling is its job, not ours. The reference's relaxed dialect
+# (comments, single quotes, `;`/`=`/`=>` separators, `void`, `\xNN`) is
+# normalized to strict JSON first (see `natives/plugins/json`).
+# `preserve_order` keeps dictionary member order like the reference's
+# vector-backed store; `arbitrary_precision` keeps the old parser's number
+# semantics (`-0` stays an integer, overflowing exponents like `1e400`
+# still saturate to ±infinity through Rust's own `f64` parser). The
+# reference-exact *writer* stays hand-rolled: serde_json's formatter cannot
+# reproduce its empty-container newlines or its `TJSRealToString` floats.
+serde_json = { version = "1.0.151", features = [
+    "preserve_order",
+    "arbitrary_precision",
+] }
+# `fstat`/`scripts_ex` `getMD5HashString`: RFC 1321 MD5. Rust's std has no
+# message-digest facility at all (verified: nothing hash-like in std), so a
+# crate is required; `md-5` is the maintained RustCrypto implementation from
+# the `digest`/`sha2` team, replacing two hand-rolled copies of the
+# algorithm. Pinned to the battle-tested 0.10 line.
+md-5 = "0.10.6"
+# The media DTOs (`VideoSpec`/`RgbaFrame`) cross the L3 host seam; the `media`
+# decoder itself is never linked here (decoded frames are supplied by the
+# host). The touch tests also name `api::host::TouchPhase` directly (the
+# `platform` re-export only covers `InputEvent`/`MouseButton`).
+api = { workspace = true }
+
+[dev-dependencies]
+fs = { workspace = true }
+# Tests only: cross-check the production `std`-based timestamp arithmetic in
+# `natives/debug.rs` against the C library's `gmtime_r`/`asctime_r` for the
+# same instant — "both must have the same behaviour" — without linking any
+# C time call into the binary.
+libc = "0.2"
+
+# D13: `platform` has no default platform feature, so each target selects
+# exactly one. L3 uses only the platform-agnostic event types; it still needs a
+# backend feature to compile the L1 crate.
+[target.'cfg(target_os = "linux")'.dependencies]
+platform = { workspace = true, features = ["platform-linux"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+platform = { workspace = true, features = ["platform-android"] }
+
+# Integration tests only: `tests/wuvorbis.rs` plays the composition root
+# (mirroring `crates/app/src/audio.rs`) and installs the L1 `media` decoder on
+# the `add_audio_decoder` chain to prove the `.ogg` path end-to-end. The
+# production crate still never links a codec — same precedent as `fs` above,
+# which only the unit tests use. The dev-dependency is target-scoped so a
+# desktop codec cannot leak into an Android test graph (nor MediaCodec into a
+# desktop one). The Android arm names the path directly because edition 2024
+# forbids a member from turning off default features inherited from the
+# workspace.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+media = { workspace = true }
+
+[target.'cfg(target_os = "android")'.dev-dependencies]
+media = { path = "../platform/media", default-features = false, features = ["video-mediacodec"] }

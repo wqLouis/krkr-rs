@@ -1,332 +1,597 @@
-//! Game storage: mount a game directory and its `.xp3` archives, and resolve
-//! storage names the way the reference engine does.
+//! Game storage namespace (L2).
+//!
+//! A [`Storage`] value owns everything needed to resolve TVP storage names:
+//!
+//! * an immutable bottom [`FileSystem`] object (created by L1) and the base
+//!   directory it is mounted at;
+//! * the parsed [`Xp3Archive`] values explicitly mounted by the caller, each
+//!   with its L2-owned [`FileState`];
+//! * the auto search-path list.
+//!
+//! This is the middle layer: the bottom layer knows nothing
+//! about `.xp3`, `arc.xp3>path` addressing, case-insensitive lookup or the
+//! auto-path list. There are no globals or process-wide caches — a `Storage`
+//! is a plain value the caller owns, and all `FileState`s live inside it.
+//! The XP3 container read + parse itself is L1 (`fs::xp3`); this layer
+//! only owns the namespace.
+//!
+//! Loading is explicit: the caller supplies the archive list and the loader
+//! never enumerates the game directory, with one documented exception —
+//! [`discover_archives`], a folder scan a caller opts into by passing only a
+//! directory (the ergonomic path for the CLI and the Android launcher).
+//! See [`Storage::mount_archives`] / [`Storage::mount_archive`].
+//!
+//! A mount can optionally read each archive into memory in full
+//! ([`MountOptions::preload_archives`]); the image is owned by this layer and
+//! a borrow of it is handed to L1 for every entry read.
+//!
+//! Resolution order mirrors the reference engine:
+//!
+//! 1. explicit `arc.xp3>path` addressing,
+//! 2. disk files (normalized spelling, then the script's spelling, then a
+//!    bounded component-wise case-insensitive walk),
+//! 3. mounted archives, later mounts first (later-mounted wins),
+//! 4. the auto search-path list.
 
-use std::cell::{Ref, RefCell};
-use std::fs;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use xp3::{Xp3Archive, normalize_in_archive_name};
+use api::error::FsError;
+use api::fs::{FsPath, OpenMode};
+use fs::xp3::{self, Xp3Archive, Xp3ExtractionFilter, normalize_in_archive_name};
+use fs::{FileState, FileSystem};
 
-/// Process-wide auto search paths (the reference's `TVPAutoPathTable`).
-/// Entries are storage-name prefixes: plain dirs (`system/`) or archive
-/// prefixes (`data.xp3>system/`). The game populates them at startup via
-/// `Storages.addAutoPath`.
-static AUTO_PATHS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// Windows `FILE_ATTRIBUTE_DIRECTORY` (0x10).
+pub const ATTR_DIRECTORY: i64 = 0x10;
+/// Windows `FILE_ATTRIBUTE_ARCHIVE` (0x20) — the "normal file" bit.
+pub const ATTR_NORMAL: i64 = 0x20;
 
-/// Replace the auto-path list (used at startup).
-pub fn set_auto_paths(paths: Vec<String>) {
-    *AUTO_PATHS.lock().unwrap_or_else(|p| p.into_inner()) = paths;
-}
-
-/// Append one auto path (the `Storages.addAutoPath` native).
-pub fn add_auto_path(path: String) {
-    let mut list = AUTO_PATHS.lock().unwrap_or_else(|p| p.into_inner());
-    if !list.contains(&path) {
-        list.push(path);
-    }
-}
-
-/// Remove one auto path (the `Storages.removeAutoPath` native).
-pub fn remove_auto_path(path: &str) {
-    let mut list = AUTO_PATHS.lock().unwrap_or_else(|p| p.into_inner());
-    list.retain(|p| p != path);
-}
-
-/// Current auto-path list.
-pub fn auto_paths() -> Vec<String> {
-    AUTO_PATHS.lock().unwrap_or_else(|p| p.into_inner()).clone()
-}
-
-/// The base storage name (the part after the last `/`).
-fn storage_base(name: &str) -> &str {
-    name.rsplit('/').next().unwrap_or(name)
-}
-
-/// Find a disk file by normalized relative name, comparing path components
-/// case-insensitively (ASCII) and descending into a directory only when the
-/// target's next component matches its name. Cost is therefore bounded by the
-/// path depth rather than by the size of the tree, and no `str` is ever
-/// sliced at a non-`char` boundary (components are split on `/`).
-fn find_disk_case_insensitive(base: &Path, relative: &str) -> Option<PathBuf> {
-    fn descend(dir: &Path, parts: &[&str]) -> Option<PathBuf> {
-        let want = parts[0];
-        // Directories whose name matches this component and that still have
-        // remaining target components to match are searched after the direct
-        // file hit, so a file directly at this level wins.
-        let mut subdirs = Vec::new();
-        for entry in fs::read_dir(dir).ok()?.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if !name.eq_ignore_ascii_case(want) {
-                continue;
-            }
-            let path = entry.path();
-            if parts.len() == 1 {
-                if path.is_file() {
-                    return Some(path);
-                }
-            } else if path.is_dir() {
-                subdirs.push(path);
-            }
-        }
-        for subdir in subdirs {
-            if let Some(found) = descend(&subdir, &parts[1..]) {
-                return Some(found);
-            }
-        }
-        None
-    }
-
-    let parts: Vec<&str> = relative.split('/').filter(|p| !p.is_empty()).collect();
-    if parts.is_empty() {
-        return None;
-    }
-    descend(base, &parts)
-}
-
-/// One mounted `.xp3` archive. The path is fixed at mount time; the parsed
-/// [`Xp3Archive`] is opened on first use and dropped by
-/// [`Storage::clear_archive_cache`], so a clear costs no archive I/O. The
-/// next lookup re-opens only the archives it actually has to scan.
+/// One mounted `.xp3` archive: its logical path, the backing that owns its
+/// bytes and the parsed index.
 struct MountedArchive {
+    /// Logical path of the archive file (as mounted).
     path: PathBuf,
-    /// Parsed archive, or `None` before the first use / after a cache clear.
-    archive: RefCell<Option<Xp3Archive>>,
+    /// Base file name (used for `arc.xp3>path` matching and listings).
+    file_name: String,
+    /// Where the archive's bytes are read from.
+    backing: ArchiveBacking,
+    /// Parsed index.
+    archive: Xp3Archive,
 }
 
-impl MountedArchive {
-    fn new(path: PathBuf) -> Self {
-        Self {
-            path,
-            archive: RefCell::new(None),
-        }
-    }
-
-    /// Ensure the archive is parsed, opening it on demand. Kept separate from
-    /// the borrow-returning accessors so no `Ref` is ever held across the
-    /// mutation that populates the cell.
-    fn ensure_open(&self) -> Result<(), xp3::Error> {
-        if self.archive.borrow().is_some() {
-            return Ok(());
-        }
-        match Xp3Archive::open(&self.path) {
-            Ok(arc) => {
-                log::info!("opened {} ({} entries)", self.path.display(), arc.len());
-                *self.archive.borrow_mut() = Some(arc);
-                Ok(())
-            }
-            Err(e) => {
-                log::warn!("skipping {}: {e}", self.path.display());
-                Err(e)
-            }
-        }
-    }
-
-    /// The parsed archive, opening it on demand. `None` when the file is not
-    /// a readable XP3 archive.
-    fn get(&self) -> Option<Ref<'_, Xp3Archive>> {
-        self.ensure_open().ok()?;
-        Some(Ref::map(self.archive.borrow(), |a| {
-            a.as_ref().expect("archive opened by ensure_open")
-        }))
-    }
-
-    /// Mutable access for reading, opening on demand.
-    fn get_mut(&mut self) -> Result<&mut Xp3Archive, xp3::Error> {
-        self.ensure_open()?;
-        Ok(self
-            .archive
-            .get_mut()
-            .as_mut()
-            .expect("archive opened by ensure_open"))
-    }
-
-    /// Drop the parsed archive, keeping the mount (and its path).
-    fn drop_cache(&self) {
-        *self.archive.borrow_mut() = None;
-    }
+/// Where a mounted archive's bytes are read from.
+///
+/// The bytes are owned by the storage; the stateless L1 reader is handed the
+/// backing on every entry read and never holds it.
+enum ArchiveBacking {
+    /// The archive file stays open and each entry read is positional.
+    Stream(FileState),
+    /// The whole archive file was read into memory at mount; entry reads copy
+    /// from this image.
+    Memory(Vec<u8>),
 }
 
-/// A mounted game storage: one game directory plus all `.xp3` archives
-/// found inside it.
+/// Options controlling how [`Storage`] mounts archives.
+///
+/// The default keeps every archive on the file system and reads each entry
+/// positionally. Enabling [`preload_archives`](Self::preload_archives) reads
+/// each archive into memory once at mount.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MountOptions {
+    /// Read each mounted archive into memory in full at mount.
+    ///
+    /// The resident-memory cost is the archive's own size; there is no cap.
+    /// Every entry then reads from that buffer instead of the file system,
+    /// which removes the per-entry random reads a slow backing store makes
+    /// visible. A short read, an unrepresentable size or a failed allocation
+    /// is a typed [`MountError`], never a silent fall back to the streaming
+    /// path.
+    pub preload_archives: bool,
+}
+
+/// A mounted game storage: one base directory plus the explicitly mounted
+/// `.xp3` archives.
+#[non_exhaustive]
 pub struct Storage {
-    /// Absolute path of the game directory.
-    pub game_dir: PathBuf,
-    /// Mounted archives in sorted-name order (deterministic). Each archive is
-    /// parsed lazily on first use.
+    /// Immutable bottom file-system object.
+    fs: FileSystem,
+    /// Base (app) directory used for disk assets.
+    game_dir: PathBuf,
+    /// Mounted archives in mount order; later entries take precedence.
     archives: Vec<MountedArchive>,
+    /// Auto search-path prefixes (plain dirs or `arc.xp3>` prefixes).
+    auto_paths: Vec<String>,
+    /// Whether an archive is read into memory in full when it is mounted.
+    preload_archives: bool,
+    /// The per-segment XP3 extraction filter (the `xp3filter` seam), if any.
+    ///
+    /// L2 owns the state; the stateless L1 reader receives the closure as a
+    /// borrow on every read, and it is never stored in L1. `None` means no
+    /// filter. The closure is invoked once per decoded segment with
+    /// `(file_hash, offset, buffer, file_name, archive_name, file_size)` and
+    /// may rewrite `buffer` in place.
+    pub xp3_extraction_filter: Option<Box<Xp3ExtractionFilter<'static>>>,
 }
 
 /// A resolved storage location.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Location {
-    /// A file on disk (absolute path).
+    /// A file on the bottom file system.
     Disk(PathBuf),
-    /// A file inside an archive: (archive path, normalized in-archive name).
+    /// A file inside an archive: `(archive path, normalized in-archive name)`.
     Archive(PathBuf, String),
 }
 
 /// Metadata returned for a resolved storage entry.
 ///
-/// XP3 indexes carry the uncompressed file size but do not carry filesystem
-/// timestamps, so archive entries have `None` for all three time fields.
-/// Disk entries use the host filesystem metadata and preserve the native
-/// timestamp resolution exposed by [`std::fs::Metadata`].
+/// XP3 indexes carry the uncompressed file size but no timestamps, so archive
+/// entries have `None` for all three time fields. Disk entries use the host
+/// file-system metadata exposed by [`fs::stat`] (only the modification
+/// time is surfaced by the bottom API).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct StorageMetadata {
+    /// Uncompressed size in bytes.
     pub size: u64,
+    /// Last modification time, when the backend reports it.
     pub modified: Option<SystemTime>,
+    /// Last access time, when the backend reports it.
     pub accessed: Option<SystemTime>,
+    /// Creation time, when the backend reports it.
     pub created: Option<SystemTime>,
 }
 
+/// Errors while mounting a game storage.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum MountError {
+    /// The mount path is not a directory.
+    #[error("not a directory: {0}")]
+    NotADirectory(String),
+    /// A bottom file-system operation failed.
+    #[error(transparent)]
+    Fs(#[from] FsError),
+    /// An archive failed to open or parse.
+    #[error("archive error: {0}")]
+    Xp3(#[from] xp3::Xp3Error),
+    /// A preloaded archive was shorter than its reported size.
+    #[error("archive {path} is truncated: read {read} of {expected} bytes")]
+    TruncatedArchive {
+        /// Archive path as mounted.
+        path: String,
+        /// Size the archive reported.
+        expected: u64,
+        /// Bytes actually read before the file ended.
+        read: u64,
+    },
+    /// A preloaded archive is larger than this platform can address in a
+    /// single buffer.
+    #[error("archive {path} is too large to hold in memory: {size} bytes")]
+    ArchiveTooLarge {
+        /// Archive path as mounted.
+        path: String,
+        /// Reported size in bytes.
+        size: u64,
+    },
+    /// A preloaded archive's buffer could not be allocated.
+    #[error("archive {path} could not be read into memory: {size} bytes")]
+    ArchiveAllocation {
+        /// Archive path as mounted.
+        path: String,
+        /// Reported size in bytes.
+        size: u64,
+    },
+}
+
+/// Errors while reading or listing storage entries.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum StorageReadError {
+    /// The requested storage name did not resolve.
+    #[error("storage not found: {0}")]
+    NotFound(String),
+    /// A bottom file-system operation failed.
+    #[error(transparent)]
+    Fs(#[from] FsError),
+    /// An archive read failed.
+    #[error("archive error: {0}")]
+    Xp3(#[from] xp3::Xp3Error),
+}
+
+/// The searched startup script (reference `TVPStartupScriptName`).
+pub const STARTUP_SCRIPT: &str = "startup.tjs";
+/// The compatibility fallback run when `startup.tjs` is absent or fails
+/// (reference `system/Initialize.tjs`).
+pub const INITIALIZE_SCRIPT: &str = "system/Initialize.tjs";
+/// `patch.tjs`, app-path only (reference `TVPExecuteStartupScript`).
+pub const PATCH_SCRIPT: &str = "patch.tjs";
+/// `AfterStartup.tjs`, app-path only (reference `TVPExecuteStartupScript`).
+pub const AFTER_STARTUP_SCRIPT: &str = "AfterStartup.tjs";
+
+/// The startup scripts resolved against a [`Storage`] (reference
+/// `TVPExecuteStartupScript`).
+///
+/// `patch.tjs` and `AfterStartup.tjs` are **app-path only** (disk, no archive
+/// search); `startup.tjs` and the `system/Initialize.tjs` fallback are
+/// searched across disk and mounted archives. The caller decides whether to
+/// run the fallback from whether `startup.tjs` succeeds.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct StartupPlan {
+    /// `patch.tjs`, executed first when present (app-path only).
+    pub patch: Option<String>,
+    /// `startup.tjs`, the main searched startup script.
+    pub startup: Option<String>,
+    /// `system/Initialize.tjs`, run when `startup.tjs` is absent or fails.
+    pub fallback: Option<String>,
+    /// `AfterStartup.tjs`, executed last when present (app-path only).
+    pub after: Option<String>,
+}
+
 impl Storage {
-    /// Mount a game directory: opens every `*.xp3` in it (top level only,
-    /// matching how the reference app scans the game folder).
-    pub fn mount(game_dir: impl AsRef<Path>) -> Result<Self, MountError> {
-        let game_dir = game_dir.as_ref().to_path_buf();
-        if !game_dir.is_dir() {
-            return Err(MountError::NotADirectory(game_dir));
-        }
-        let mut archives = Vec::new();
-        for entry in fs::read_dir(&game_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path
-                .extension()
-                .map(|e| e.eq_ignore_ascii_case("xp3"))
-                .unwrap_or(false)
-            {
-                // Record the mount only; parsing happens on first use.
-                archives.push(MountedArchive::new(path));
-            }
-        }
-        archives.sort_by(|a, b| a.path.cmp(&b.path));
-        Ok(Storage { game_dir, archives })
+    /// Creates a storage rooted at `base_dir` and mounts each archive in
+    /// `archives`, in order.
+    ///
+    /// Loading is explicit: the caller supplies the archive list (from the
+    /// command line or Android Intent extras), and the loader never scans the
+    /// folder. Later archives take precedence over earlier ones, so
+    /// `--archive data.xp3 --archive patch.xp3` lets `patch.xp3` override
+    /// `data.xp3`.
+    ///
+    /// `fs` is the bottom file-system object; `base_dir` is the app path used
+    /// for disk assets. An archive that cannot be opened or parsed is a typed
+    /// error, because the caller asked for it.
+    pub fn mount_archives(
+        fs: FileSystem,
+        base_dir: impl Into<PathBuf>,
+        archives: impl IntoIterator<Item = impl AsRef<Path>>,
+    ) -> Result<Self, MountError> {
+        Self::mount_archives_with(fs, base_dir, archives, MountOptions::default())
     }
 
-    /// Game directory path.
+    /// Creates a storage rooted at `base_dir` and mounts each archive in
+    /// `archives`, in order, with an explicit choice of how the archive bytes
+    /// are held (see [`MountOptions`]).
+    ///
+    /// This is [`Self::mount_archives`] with the backing selected; the mount
+    /// order and the later-wins precedence are unchanged.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::mount_archives`], plus a typed error when a preloaded
+    /// archive cannot be read into memory in full.
+    pub fn mount_archives_with(
+        fs: FileSystem,
+        base_dir: impl Into<PathBuf>,
+        archives: impl IntoIterator<Item = impl AsRef<Path>>,
+        options: MountOptions,
+    ) -> Result<Self, MountError> {
+        let mut storage = Self::with_base_dir(fs, base_dir.into(), options.preload_archives)?;
+        for path in archives {
+            storage.mount_archive(path.as_ref())?;
+        }
+        Ok(storage)
+    }
+
+    /// Mounts a directory-scan archive list, skipping an archive that cannot
+    /// be read or parsed and reporting it through `warn!`.
+    ///
+    /// A scan mounts whatever the folder holds, so one stray or corrupt
+    /// archive must not abort an otherwise playable mount — the reference
+    /// `TVPCheckArchive` catch-and-log
+    /// (`reference/cpp/core/base/impl/StorageImpl.cpp:562-587`). Use
+    /// [`Self::mount_archives`] for a caller-supplied list.
+    pub fn mount_discovered_archives(
+        fs: FileSystem,
+        base_dir: impl Into<PathBuf>,
+        archives: impl IntoIterator<Item = impl AsRef<Path>>,
+    ) -> Result<Self, MountError> {
+        Self::mount_discovered_archives_with(fs, base_dir, archives, MountOptions::default())
+    }
+
+    /// Mounts a directory-scan archive list with an explicit backing, skipping
+    /// an archive that cannot be read or parsed and reporting it through
+    /// `warn!`.
+    ///
+    /// This is [`Self::mount_discovered_archives`] with [`MountOptions`]; the
+    /// skip-and-warn rule and the mount order are unchanged. A preload failure
+    /// on a scanned archive is one more archive that is skipped and reported,
+    /// exactly like a parse failure — preloading never changes which archive
+    /// wins.
+    pub fn mount_discovered_archives_with(
+        fs: FileSystem,
+        base_dir: impl Into<PathBuf>,
+        archives: impl IntoIterator<Item = impl AsRef<Path>>,
+        options: MountOptions,
+    ) -> Result<Self, MountError> {
+        let mut storage = Self::with_base_dir(fs, base_dir.into(), options.preload_archives)?;
+        for path in archives {
+            if let Err(error) = storage.mount_archive(path.as_ref()) {
+                log::warn!("skipping archive {}: {error}", path.as_ref().display());
+            }
+        }
+        Ok(storage)
+    }
+
+    /// Creates an empty storage rooted at `base_dir`, validating that the
+    /// base path exists and is a directory. No archives are mounted; use
+    /// [`Self::mount_archive`] to add them explicitly.
+    fn with_base_dir(
+        fs: FileSystem,
+        base_dir: PathBuf,
+        preload_archives: bool,
+    ) -> Result<Self, MountError> {
+        let meta = fs::stat(&fs, &FsPath::host(&base_dir))?;
+        if !meta.is_dir {
+            return Err(MountError::NotADirectory(base_dir.display().to_string()));
+        }
+        Ok(Storage {
+            fs,
+            game_dir: base_dir,
+            archives: Vec::new(),
+            auto_paths: Vec::new(),
+            preload_archives,
+            xp3_extraction_filter: None,
+        })
+    }
+
+    /// The bottom file-system object this storage reads through.
+    pub fn file_system(&self) -> &FileSystem {
+        &self.fs
+    }
+
+    /// The game directory path.
     pub fn game_dir(&self) -> &Path {
         &self.game_dir
     }
 
-    /// Number of mounted archives, whether or not they have been parsed yet.
+    /// Number of mounted archives.
     pub fn archive_count(&self) -> usize {
         self.archives.len()
     }
 
-    /// Run `f` for every mounted archive, opening each on demand. Archives
-    /// that cannot be opened are skipped (a warning is logged by the opener).
-    ///
-    /// This replaces the old `archives()` iterator: because a parsed archive
-    /// lives behind a `RefCell`, no caller may hold a borrow across a
-    /// (lazy-open) mutation, so the borrow is confined to the closure.
+    /// The logical paths of the mounted archives, in mount order.
+    pub fn archive_paths(&self) -> impl Iterator<Item = &Path> {
+        self.archives.iter().map(|m| m.path.as_path())
+    }
+
+    /// Runs `f` for every mounted archive and its parsed index.
     pub fn for_each_archive(&self, mut f: impl FnMut(&Path, &Xp3Archive)) {
         for mounted in &self.archives {
-            if let Some(archive) = mounted.get() {
-                f(&mounted.path, &archive);
-            }
+            f(&mounted.path, &mounted.archive);
         }
     }
 
-    /// Drop every parsed archive, keeping the mount list and `game_dir`. This
-    /// is the reference `TVPClearArchiveCache()`: the cache of *open archive
-    /// objects* is cleared (`StorageIntf.cpp:728`), and the next access
-    /// re-opens on demand through `TVPArchiveCache::Get` → `TVPOpenArchive`.
-    /// The mount/auto-path table is not touched.
-    pub fn clear_archive_cache(&self) {
-        for mounted in &self.archives {
-            mounted.drop_cache();
-        }
-    }
-
-    /// Resolve a storage name to a location, mirroring the reference search
-    /// order: explicit `arc.xp3>path` → disk file (case-insensitive) → first
-    /// archive containing the normalized name → auto paths.
+    /// Mounts one archive by path, parsing its index eagerly.
     ///
-    /// Storage names are case-insensitive in the reference engine even when
-    /// the host filesystem is not. Only the *storage-relative* part is
-    /// normalized; the mount prefix keeps the real filesystem spelling (and a
-    /// name that escapes the mount never resolves).
-    pub fn find(&self, name: &str) -> Option<Location> {
-        // Explicit archive addressing: "foo.xp3>data/script.ks"
+    /// The path is resolved against the storage base directory (absolute
+    /// paths are used as given) and opened through the bottom file system.
+    /// Mounting the same archive twice is a no-op.
+    pub fn mount_archive(&mut self, path: impl AsRef<Path>) -> Result<(), MountError> {
+        let raw = path.as_ref();
+        let path = if raw.is_absolute() {
+            raw.to_path_buf()
+        } else {
+            self.game_dir.join(raw)
+        };
+        if self.archives.iter().any(|m| m.path == path) {
+            return Ok(());
+        }
+        let file = fs::open(&self.fs, &FsPath::host(&path), OpenMode::Read)?;
+        let archive = Xp3Archive::open(&self.fs, &file)?;
+        let backing = if self.preload_archives {
+            ArchiveBacking::Memory(read_archive_image(&self.fs, &file, &path)?)
+        } else {
+            ArchiveBacking::Stream(file)
+        };
+        let file_name = path
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        log::info!("opened {} ({} entries)", path.display(), archive.len());
+        self.archives.push(MountedArchive {
+            path,
+            file_name,
+            backing,
+            archive,
+        });
+        Ok(())
+    }
+
+    /// Unmounts an archive by logical path, resolving relative paths against
+    /// the game directory exactly as [`Self::mount_archive`] does. A bare file
+    /// name (no directory component) that does not match an exact path removes
+    /// the single archive with that base name; if several mounted archives
+    /// share the name the request is ambiguous and nothing is removed.
+    ///
+    /// Returns `true` if an archive was removed.
+    pub fn unmount_archive(&mut self, path: impl AsRef<Path>) -> bool {
+        let raw = path.as_ref();
+        let resolved = if raw.is_absolute() {
+            raw.to_path_buf()
+        } else {
+            self.game_dir.join(raw)
+        };
+        if let Some(index) = self.archives.iter().position(|m| m.path == resolved) {
+            self.archives.remove(index);
+            return true;
+        }
+        // Only a bare file name may fall back to base-name matching, and only
+        // when it identifies exactly one archive.
+        let bare = raw.parent().is_none_or(|p| p.as_os_str().is_empty());
+        if !bare {
+            return false;
+        }
+        let Some(target) = raw
+            .file_name()
+            .map(|f| f.to_string_lossy().to_ascii_lowercase())
+        else {
+            return false;
+        };
+        let mut matches = self
+            .archives
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.file_name.to_ascii_lowercase() == target);
+        let Some((index, _)) = matches.next() else {
+            return false;
+        };
+        if matches.next().is_some() {
+            return false;
+        }
+        self.archives.remove(index);
+        true
+    }
+
+    /// Appends an auto search path (the `Storages.addAutoPath` semantics).
+    /// Duplicates are ignored.
+    pub fn add_auto_path(&mut self, path: impl Into<String>) {
+        let path = path.into();
+        if !self.auto_paths.contains(&path) {
+            self.auto_paths.push(path);
+        }
+    }
+
+    /// Removes an auto search path.
+    pub fn remove_auto_path(&mut self, path: &str) {
+        self.auto_paths.retain(|p| p != path);
+    }
+
+    /// Resolves a storage name to a location, mirroring the reference search
+    /// order: explicit `arc.xp3>path` → the current path (the app directory)
+    /// → the auto search paths in "later added wins" order → the mounted
+    /// archives in later-mount order. Auto-path and explicit archives are
+    /// opened on demand when they exist on disk but were not mounted.
+    ///
+    /// A name that simply does not resolve is `Ok(None)`. A genuine
+    /// file-system failure while probing (permission denied, I/O, an
+    /// unrepresentable path) is propagated as [`StorageReadError::Fs`]; it is
+    /// never collapsed into "not found".
+    ///
+    /// Storage names are case-insensitive even when the host filesystem is
+    /// not. Only the storage-relative part is normalized; the mount prefix
+    /// keeps the real filesystem spelling, and a name that escapes the mount
+    /// never resolves.
+    pub fn find(&self, name: &str) -> Result<Option<Location>, StorageReadError> {
+        // Explicit archive addressing: "foo.xp3>data/script.ks". The archive is
+        // opened on demand when it exists but was not mounted.
         if let Some((arc, rest)) = name.split_once('>') {
-            // The archive part may be a bare name ("data.xp3") or a full
-            // path ("/game/dir/data.xp3"); match on its file name.
-            let arc_name = Path::new(arc)
-                .file_name()
-                .map(|f| f.to_string_lossy())
-                .unwrap_or_default();
-            let mounted = self.archives.iter().find(|m| {
-                m.path
-                    .file_name()
-                    .is_some_and(|f| f.eq_ignore_ascii_case(&*arc_name))
-            })?;
-            let rest = normalize_in_archive_name(rest);
-            if mounted.get()?.entry(&rest).is_some() {
-                return Some(Location::Archive(mounted.path.clone(), rest));
-            }
-            return None;
+            return self.find_in_archive(arc, rest);
         }
 
         // Resolve the storage-relative part. Absolute names must point inside
-        // the mount, and traversal components are refused, so a name can
-        // never resolve outside the game directory.
-        let relative = self.relative_disk_name(name)?;
+        // the mount, and traversal components are refused, so a name can never
+        // resolve outside the game directory.
+        let Some(relative) = self.relative_disk_name(name) else {
+            return Ok(None);
+        };
 
-        // Disk file (exact normalized spelling first, then the script's
-        // spelling, then a bounded case-insensitive walk).
-        if let Some(location) = self.find_disk_relative(&relative) {
-            return Some(location);
+        // The current path (the app directory) is checked first.
+        if let Some(location) = self.find_disk_relative(&relative)? {
+            return Ok(Some(location));
         }
 
-        // Archives, in mount order (looked up by the storage-relative name).
         let normalized = normalize_in_archive_name(&relative);
-        for mounted in &self.archives {
-            // Resolve per archive and stop at the first hit, so a lookup after
-            // a cache clear parses at most the archives it must walk. An
-            // archive that fails to open is skipped, not fatal.
-            let Some(archive) = mounted.get() else {
-                continue;
-            };
-            if archive.entry(&normalized).is_some() {
-                return Some(Location::Archive(mounted.path.clone(), normalized));
-            }
-        }
-
-        // Auto paths: the base name joined with each registered prefix
-        // (last added wins, like the reference's hash-table Add). Archive
-        // prefixes recurse into `find`; plain dirs hit the disk.
         let base = storage_base(&normalized);
-        for entry in auto_paths().iter().rev() {
-            let joined = format!("{entry}{base}");
-            if entry.contains('>') {
-                if let Some(loc) = self.find(&joined) {
-                    return Some(loc);
+
+        // Auto paths, last added first (the reference's "later added wins").
+        // Archive prefixes are opened on demand; plain directory prefixes go
+        // through the same disk resolution as every other disk hit, so
+        // directories are rejected and case folding is uniform.
+        for entry in self.auto_paths.iter().rev() {
+            if let Some((arc, dir)) = entry.split_once('>') {
+                let in_archive = format!("{dir}{base}");
+                if let Some(loc) = self.find_in_archive(arc, &in_archive)? {
+                    return Ok(Some(loc));
                 }
             } else {
                 let dir = entry.trim_end_matches('/');
-                if !dir.is_empty() && self.game_dir.join(dir).join(base).is_file() {
-                    return Some(Location::Disk(self.game_dir.join(dir).join(base)));
+                if !dir.is_empty()
+                    && let Some(loc) = self.find_disk_relative(&format!("{dir}/{base}"))?
+                {
+                    return Ok(Some(loc));
                 }
             }
         }
-        None
+
+        // Mounted archives, later mounts first (later-mounted wins — see
+        // `mount_archives`). Looked up by the normalized name.
+        for mounted in self.archives.iter().rev() {
+            if mounted.archive.entry(&normalized).is_some() {
+                return Ok(Some(Location::Archive(mounted.path.clone(), normalized)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Resolves `rest` inside the archive named by `arc`, opening the archive
+    /// on demand when it exists on disk but is not in the mount list. A
+    /// specific archive miss does not fall through to another archive.
+    fn find_in_archive(&self, arc: &str, rest: &str) -> Result<Option<Location>, StorageReadError> {
+        let rest = normalize_in_archive_name(rest);
+        let arc_name = Path::new(arc)
+            .file_name()
+            .map(|f| f.to_string_lossy())
+            .unwrap_or_default();
+        for mounted in self.archives.iter().rev() {
+            if mounted.file_name.eq_ignore_ascii_case(&arc_name) {
+                if mounted.archive.entry(&rest).is_some() {
+                    return Ok(Some(Location::Archive(mounted.path.clone(), rest)));
+                }
+                return Ok(None);
+            }
+        }
+        // On demand: open and parse the archive when the file exists.
+        let Some(path) = self.archive_disk_path(arc) else {
+            return Ok(None);
+        };
+        let file = match fs::open(&self.fs, &FsPath::host(&path), OpenMode::Read) {
+            Ok(file) => file,
+            Err(FsError::NotFound { .. }) | Err(FsError::NotADirectory { .. }) => {
+                return Ok(None);
+            }
+            Err(error) => return Err(StorageReadError::Fs(error)),
+        };
+        let archive = Xp3Archive::open(&self.fs, &file)?;
+        if archive.entry(&rest).is_some() {
+            Ok(Some(Location::Archive(path, rest)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// The on-disk path of the archive named by `arc`: an absolute path is
+    /// used as given, a relative one is resolved case-insensitively under the
+    /// game directory.
+    fn archive_disk_path(&self, arc: &str) -> Option<PathBuf> {
+        if let Some(relative) = self.relative_disk_name(arc)
+            && let Ok(Some(Location::Disk(path))) = self.find_disk_relative(&relative)
+        {
+            return Some(path);
+        }
+        let raw = Path::new(arc);
+        if raw.is_absolute() {
+            Some(raw.to_path_buf())
+        } else {
+            None
+        }
     }
 
     /// The storage-relative part of `name` (using `/` separators), or `None`
     /// when the name is absolute and does not point inside the mount, or
     /// contains a traversal (`..`) component.
     pub fn relative_disk_name(&self, name: &str) -> Option<String> {
-        // Fold Windows separators so a `\`-separated storage name behaves
-        // like the reference on any host. The mount prefix itself contains no
-        // backslashes, so this cannot corrupt it.
+        // Fold Windows separators so a `\`-separated storage name behaves like
+        // the reference on any host.
         let separators = name.replace('\\', "/");
         let path = Path::new(&separators);
         let relative = if path.is_absolute() {
-            path.strip_prefix(&self.game_dir).ok()?.to_path_buf()
+            if self.game_dir.as_os_str().is_empty() {
+                path.to_path_buf()
+            } else {
+                path.strip_prefix(&self.game_dir).ok()?.to_path_buf()
+            }
         } else {
             path.to_path_buf()
         };
@@ -343,439 +608,674 @@ impl Storage {
         Some(relative.to_string_lossy().replace('\\', "/"))
     }
 
-    /// Resolve an existing disk file for a storage name, case-insensitively.
+    /// Resolves an existing disk file for a storage name, case-insensitively.
     /// Returns the real on-disk path so writers can update the existing file
     /// instead of creating a case-variant duplicate.
-    pub fn find_disk(&self, name: &str) -> Option<PathBuf> {
-        let relative = self.relative_disk_name(name)?;
-        match self.find_disk_relative(&relative)? {
-            Location::Disk(path) => Some(path),
-            Location::Archive(..) => None,
-        }
+    pub fn find_disk(&self, name: &str) -> Result<Option<PathBuf>, StorageReadError> {
+        let Some(relative) = self.relative_disk_name(name) else {
+            return Ok(None);
+        };
+        Ok(match self.find_disk_relative(&relative)? {
+            Some(Location::Disk(path)) => Some(path),
+            Some(Location::Archive(..)) => None,
+            None => None,
+        })
     }
 
     /// Disk branch of [`Self::find`], given an already-resolved relative name.
-    fn find_disk_relative(&self, relative: &str) -> Option<Location> {
+    fn find_disk_relative(&self, relative: &str) -> Result<Option<Location>, StorageReadError> {
+        Ok(self.resolve_disk(relative)?.and_then(|(path, is_dir)| {
+            if is_dir {
+                None
+            } else {
+                Some(Location::Disk(path))
+            }
+        }))
+    }
+
+    /// Resolves a disk-relative name to an on-disk path plus whether it is a
+    /// directory, applying the normalized spelling, then the script's exact
+    /// spelling, then the bounded case-insensitive walk. A missing name is
+    /// `Ok(None)`; other file-system failures propagate.
+    fn resolve_disk(&self, relative: &str) -> Result<Option<(PathBuf, bool)>, StorageReadError> {
         if relative.is_empty() {
-            return None;
+            return Ok(None);
         }
         // Reference semantics: storage names are normalized to lowercase
         // before lookup, so the lowercase spelling wins when both a lowercase
         // and a mixed-case file exist.
         let normalized = normalize_in_archive_name(relative);
         let candidate = self.game_dir.join(&normalized);
-        if candidate.is_file() {
-            return Some(Location::Disk(candidate));
+        match fs::stat(&self.fs, &FsPath::host(&candidate)) {
+            Ok(meta) => return Ok(Some((candidate, meta.is_dir))),
+            Err(FsError::NotFound { .. }) | Err(FsError::NotADirectory { .. }) => {}
+            Err(error) => return Err(StorageReadError::Fs(error)),
         }
         // Fast path: the exact spelling the script used.
         if normalized != relative {
             let exact = self.game_dir.join(relative);
-            if exact.is_file() {
-                return Some(Location::Disk(exact));
+            match fs::stat(&self.fs, &FsPath::host(&exact)) {
+                Ok(meta) => return Ok(Some((exact, meta.is_dir))),
+                Err(FsError::NotFound { .. }) | Err(FsError::NotADirectory { .. }) => {}
+                Err(error) => return Err(StorageReadError::Fs(error)),
             }
         }
         // Bounded, component-wise case-insensitive walk.
-        find_disk_case_insensitive(&self.game_dir, &normalized).map(Location::Disk)
+        self.find_disk_case_insensitive(&normalized)
     }
 
-    /// Read a storage entry to bytes (disk file or archive member).
-    pub fn read(&mut self, name: &str) -> Result<Vec<u8>, ReadError> {
-        match self.find(name) {
-            Some(Location::Disk(path)) => Ok(fs::read(path)?),
-            Some(Location::Archive(arc_path, in_arc)) => {
-                let mounted = self
-                    .archives
-                    .iter_mut()
-                    .find(|m| m.path == arc_path)
-                    .expect("resolved archive must be mounted");
-                let arc = mounted.get_mut()?;
-                arc.read(&in_arc).map_err(ReadError::Xp3)
+    /// Resolves a disk-relative name that must name a directory.
+    fn find_disk_dir(&self, relative: &str) -> Result<Option<PathBuf>, StorageReadError> {
+        Ok(self
+            .resolve_disk(relative)?
+            .and_then(|(path, is_dir)| is_dir.then_some(path)))
+    }
+
+    /// Bounded component-wise case-insensitive disk walk.
+    ///
+    /// Directories are entered only when their name matches the target's next
+    /// component, so cost is bounded by the path depth rather than the size of
+    /// the tree. A file directly at the current level wins over descending;
+    /// a directory at the final level is returned as `is_dir` so callers can
+    /// distinguish it from a file.
+    fn find_disk_case_insensitive(
+        &self,
+        relative: &str,
+    ) -> Result<Option<(PathBuf, bool)>, StorageReadError> {
+        fn descend(
+            fs: &FileSystem,
+            dir: &Path,
+            parts: &[&str],
+        ) -> Result<Option<(PathBuf, bool)>, StorageReadError> {
+            let want = parts[0];
+            let entries = match fs::list(fs, &FsPath::host(dir)) {
+                Ok(entries) => entries,
+                Err(FsError::NotFound { .. }) | Err(FsError::NotADirectory { .. }) => {
+                    return Ok(None);
+                }
+                Err(error) => return Err(StorageReadError::Fs(error)),
+            };
+            // Directories matching this component are searched after the
+            // direct file hit, so a file directly at this level wins.
+            let mut subdirs = Vec::new();
+            let mut dir_match = None;
+            for entry in entries {
+                if !entry.name.eq_ignore_ascii_case(want) {
+                    continue;
+                }
+                let path = dir.join(&entry.name);
+                if parts.len() == 1 {
+                    if !entry.is_dir {
+                        return Ok(Some((path, false)));
+                    }
+                    if dir_match.is_none() {
+                        dir_match = Some(path);
+                    }
+                } else if entry.is_dir {
+                    subdirs.push(path);
+                }
             }
-            None => Err(ReadError::NotFound(name.to_string())),
+            if let Some(path) = dir_match {
+                return Ok(Some((path, true)));
+            }
+            for subdir in subdirs {
+                if let Some(found) = descend(fs, &subdir, &parts[1..])? {
+                    return Ok(Some(found));
+                }
+            }
+            Ok(None)
+        }
+
+        let parts: Vec<&str> = relative.split('/').filter(|p| !p.is_empty()).collect();
+        if parts.is_empty() {
+            return Ok(None);
+        }
+        descend(&self.fs, &self.game_dir, &parts)
+    }
+
+    /// Runs `f` against the parsed index of the archive at `arc_path`: the
+    /// mounted one when present, otherwise a transient open+parse of the file
+    /// on disk. The backing is not exposed because the only remaining caller
+    /// ([`Self::stat`]) reads index metadata, not entry bytes.
+    fn with_archive<T>(
+        &self,
+        arc_path: &Path,
+        f: impl FnOnce(&Xp3Archive, &str) -> Result<T, StorageReadError>,
+    ) -> Result<T, StorageReadError> {
+        if let Some(mounted) = self.archives.iter().find(|m| m.path == arc_path) {
+            return f(&mounted.archive, &mounted.file_name);
+        }
+        let file = fs::open(&self.fs, &FsPath::host(arc_path), OpenMode::Read)?;
+        let archive = Xp3Archive::open(&self.fs, &file)?;
+        let file_name = arc_path
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        f(&archive, &file_name)
+    }
+
+    /// Reads a storage entry to bytes (disk file or archive member).
+    pub fn read(&self, name: &str) -> Result<Vec<u8>, StorageReadError> {
+        match self.find(name)? {
+            Some(Location::Disk(path)) => {
+                read_fs_file(&self.fs, &path).map_err(StorageReadError::Fs)
+            }
+            Some(Location::Archive(arc_path, in_arc)) => self.read_archive(&arc_path, &in_arc),
+            None => Err(StorageReadError::NotFound(name.to_string())),
         }
     }
 
-    /// Return metadata for a resolved storage entry.
+    /// Reads `in_arc` from the mounted archive at `arc_path`, or from a
+    /// transient open when the archive is not in the mount list. A mounted
+    /// archive reads through its own backing, so a preloaded archive never
+    /// touches the file system.
+    fn read_archive(&self, arc_path: &Path, in_arc: &str) -> Result<Vec<u8>, StorageReadError> {
+        let filter = self.xp3_extraction_filter.as_deref();
+        if let Some(mounted) = self.archives.iter().find(|m| m.path == arc_path) {
+            let entry = mounted
+                .archive
+                .entry(in_arc)
+                .ok_or_else(|| StorageReadError::NotFound(in_arc.to_string()))?;
+            return match &mounted.backing {
+                ArchiveBacking::Stream(file) => mounted
+                    .archive
+                    .read_entry_with_filter(&self.fs, file, entry, &mounted.file_name, filter)
+                    .map_err(StorageReadError::Xp3),
+                ArchiveBacking::Memory(bytes) => mounted
+                    .archive
+                    .read_entry_from_bytes(bytes, entry, &mounted.file_name, filter)
+                    .map_err(StorageReadError::Xp3),
+            };
+        }
+        let file = fs::open(&self.fs, &FsPath::host(arc_path), OpenMode::Read)?;
+        let archive = Xp3Archive::open(&self.fs, &file)?;
+        let file_name = arc_path
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        archive
+            .read_with_filter(&self.fs, &file, in_arc, &file_name, filter)
+            .map_err(StorageReadError::Xp3)
+    }
+
+    /// Returns metadata for a resolved storage entry.
     ///
-    /// Disk files are read through [`std::fs::metadata`]. For an XP3 entry,
-    /// `size` is the uncompressed size from the archive index; archive
-    /// timestamps are intentionally absent because XP3 has no timestamp
-    /// fields. Names follow the same resolution order as [`Self::find`].
-    pub fn stat(&self, name: &str) -> Option<StorageMetadata> {
-        match self.find(name) {
+    /// Disk files are read through [`fs::stat`]. For an XP3 entry, `size`
+    /// is the uncompressed size from the archive index; archive timestamps
+    /// are absent because XP3 has no timestamp fields. Names follow the same
+    /// resolution order as [`Self::find`].
+    ///
+    /// A name that does not resolve is `Ok(None)`; a file-system failure while
+    /// probing propagates.
+    pub fn stat(&self, name: &str) -> Result<Option<StorageMetadata>, StorageReadError> {
+        match self.find(name)? {
             Some(Location::Disk(path)) => {
-                let metadata = fs::metadata(path).ok()?;
-                Some(StorageMetadata {
-                    size: metadata.len(),
-                    modified: metadata.modified().ok(),
-                    accessed: metadata.accessed().ok(),
-                    created: metadata.created().ok(),
-                })
-            }
-            Some(Location::Archive(archive_path, in_archive)) => {
-                let mounted = self.archives.iter().find(|m| m.path == archive_path)?;
-                let archive = mounted.get()?;
-                let entry = archive.entry(&in_archive)?;
-                Some(StorageMetadata {
-                    size: entry.org_size,
-                    modified: None,
+                let meta = fs::stat(&self.fs, &FsPath::host(&path))?;
+                Ok(Some(StorageMetadata {
+                    size: meta.size,
+                    modified: meta.modified_ms.map(system_time_from_millis),
                     accessed: None,
                     created: None,
+                }))
+            }
+            Some(Location::Archive(arc_path, in_arc)) => {
+                self.with_archive(&arc_path, |archive, _file_name| {
+                    let entry = archive
+                        .entry(&in_arc)
+                        .ok_or_else(|| StorageReadError::NotFound(name.to_string()))?;
+                    Ok(Some(StorageMetadata {
+                        size: entry.org_size,
+                        modified: None,
+                        accessed: None,
+                        created: None,
+                    }))
                 })
             }
-            None => None,
+            None => Ok(None),
         }
     }
 
-    /// True if a storage name resolves.
-    pub fn exists(&self, name: &str) -> bool {
-        self.find(name).is_some()
+    /// True if a storage name resolves to a file or a directory.
+    ///
+    /// This matches `TVPIsExistentStorage`, which reports directories as
+    /// existing; [`Self::find`] itself is file-only. A file-system failure
+    /// while probing propagates.
+    pub fn exists(&self, name: &str) -> Result<bool, StorageReadError> {
+        if self.find(name)?.is_some() {
+            return Ok(true);
+        }
+        let Some(relative) = self.relative_disk_name(name) else {
+            return Ok(false);
+        };
+        Ok(self.find_disk_dir(&relative)?.is_some())
     }
 
-    /// Number of archives whose parsed form is currently cached. Test-only:
-    /// lets the storage tests observe the lazy open/clear behavior directly.
-    #[cfg(test)]
-    fn parsed_archive_count(&self) -> usize {
-        self.archives
-            .iter()
-            .filter(|m| m.archive.borrow().is_some())
-            .count()
+    /// Resolve the startup script sequence against this storage (reference
+    /// `TVPExecuteStartupScript`).
+    ///
+    /// Pure storage lookups: `patch.tjs` and `AfterStartup.tjs` are app-path
+    /// only (disk, no archive search, matching `TVPIsExistentStorageNoSearch`),
+    /// while `startup.tjs` and the `system/Initialize.tjs` fallback are
+    /// searched across disk and archives.
+    ///
+    /// # Errors
+    ///
+    /// A file-system failure while probing propagates.
+    pub fn startup_plan(&self) -> Result<StartupPlan, StorageReadError> {
+        Ok(StartupPlan {
+            patch: self.app_path_file(PATCH_SCRIPT)?,
+            startup: self
+                .exists(STARTUP_SCRIPT)?
+                .then(|| STARTUP_SCRIPT.to_owned()),
+            fallback: self
+                .exists(INITIALIZE_SCRIPT)?
+                .then(|| INITIALIZE_SCRIPT.to_owned()),
+            after: self.app_path_file(AFTER_STARTUP_SCRIPT)?,
+        })
     }
-}
 
-/// Errors while mounting a game storage.
-#[derive(Debug, thiserror::Error)]
-pub enum MountError {
-    #[error("not a directory: {0}")]
-    NotADirectory(PathBuf),
-    #[error("cannot read game directory: {0}")]
-    Io(#[from] std::io::Error),
-}
+    /// The app-path-only file `name` when it exists on disk (reference
+    /// `TVPIsExistentStorageNoSearch`).
+    fn app_path_file(&self, name: &str) -> Result<Option<String>, StorageReadError> {
+        Ok(self.find_disk(name)?.map(|_| name.to_owned()))
+    }
 
-/// Errors while reading a storage entry.
-#[derive(Debug, thiserror::Error)]
-pub enum ReadError {
-    #[error("storage not found: {0}")]
-    NotFound(String),
-    #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("archive error: {0}")]
-    Xp3(#[from] xp3::Error),
-}
+    /// Lists the immediate children of storage directory `dir`, merging disk
+    /// entries with archive entries. Names are normalized (`/` separators,
+    /// lowercase); directory children carry a trailing `/`. Results are sorted
+    /// and deduplicated.
+    ///
+    /// A missing or non-directory `dir` lists nothing (it does not error);
+    /// only a bottom file-system failure propagates.
+    pub fn list(&self, dir: &str) -> Result<Vec<String>, StorageReadError> {
+        let normalized = normalize_in_archive_name(dir);
+        let normalized = normalized.trim_end_matches('/').to_string();
+        let mut found = BTreeSet::new();
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Build a minimal raw-index XP3 archive (no compression) for the lazy
-    /// cache tests. Layout matches what [`Xp3Archive::open`] expects.
-    fn build_xp3(entries: &[(&str, &[u8])]) -> Vec<u8> {
-        let mut file = Vec::new();
-        file.extend_from_slice(&xp3::XP3_MAGIC);
-        file.extend_from_slice(&0u64.to_le_bytes()); // index-offset slot
-
-        let mut file_chunks: Vec<Vec<u8>> = Vec::new();
-        for (name, data) in entries {
-            let start = file.len() as u64;
-            file.extend_from_slice(data);
-
-            let units: Vec<u16> = name.encode_utf16().collect();
-            let mut info = Vec::new();
-            info.extend_from_slice(b"info");
-            info.extend_from_slice(&((22 + units.len() * 2) as u64).to_le_bytes());
-            info.extend_from_slice(&0u32.to_le_bytes()); // flags
-            info.extend_from_slice(&(data.len() as i64).to_le_bytes());
-            info.extend_from_slice(&(data.len() as i64).to_le_bytes());
-            info.extend_from_slice(&(units.len() as i16).to_le_bytes());
-            for u in &units {
-                info.extend_from_slice(&u.to_le_bytes());
+        let disk_dir = if normalized.is_empty() {
+            self.game_dir.clone()
+        } else {
+            self.game_dir.join(&normalized)
+        };
+        match fs::list(&self.fs, &FsPath::host(&disk_dir)) {
+            Ok(entries) => {
+                for entry in entries {
+                    found.insert(child_name(&normalized, &entry.name, entry.is_dir));
+                }
             }
-
-            let mut segm = Vec::new();
-            segm.extend_from_slice(b"segm");
-            segm.extend_from_slice(&28u64.to_le_bytes());
-            segm.extend_from_slice(&0u32.to_le_bytes()); // raw segment
-            segm.extend_from_slice(&(start as i64).to_le_bytes());
-            segm.extend_from_slice(&(data.len() as i64).to_le_bytes());
-            segm.extend_from_slice(&(data.len() as i64).to_le_bytes());
-
-            let mut aldr = Vec::new();
-            aldr.extend_from_slice(b"aldr");
-            aldr.extend_from_slice(&4u64.to_le_bytes());
-            aldr.extend_from_slice(&0u32.to_le_bytes());
-
-            let mut fc = Vec::new();
-            fc.extend_from_slice(b"File");
-            fc.extend_from_slice(&((info.len() + segm.len() + aldr.len()) as u64).to_le_bytes());
-            fc.extend_from_slice(&info);
-            fc.extend_from_slice(&segm);
-            fc.extend_from_slice(&aldr);
-            file_chunks.push(fc);
+            Err(FsError::NotFound { .. }) | Err(FsError::NotADirectory { .. }) => {}
+            Err(e) => return Err(StorageReadError::Fs(e)),
         }
 
-        let mut index_data = Vec::new();
-        for fc in &file_chunks {
-            index_data.extend_from_slice(fc);
-        }
-        let index_ofs = file.len() as u64;
-        file.push(0u8); // raw index block
-        file.extend_from_slice(&(index_data.len() as u64).to_le_bytes());
-        file.extend_from_slice(&index_data);
-        file[11..19].copy_from_slice(&index_ofs.to_le_bytes());
-        file
-    }
-
-    #[test]
-    fn normalize_matches_reference() {
-        assert_eq!(
-            normalize_in_archive_name(r"Data\BG\Title.jpg"),
-            "data/bg/title.jpg"
-        );
-        assert_eq!(
-            normalize_in_archive_name("Data//BG//title.jpg"),
-            "data/bg/title.jpg"
-        );
-    }
-
-    /// A unique scratch directory with an **uppercase** component, so the
-    /// tests prove the mount prefix is not lowercased.
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new(tag: &str) -> Self {
-            static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let dir =
-                std::env::temp_dir().join(format!("TvpStorage-{tag}-{}-{n}", std::process::id()));
-            let _ = fs::remove_dir_all(&dir);
-            fs::create_dir_all(&dir).unwrap();
-            Self(dir)
+        let prefix = if normalized.is_empty() {
+            String::new()
+        } else {
+            format!("{normalized}/")
+        };
+        for mounted in &self.archives {
+            for entry in mounted.archive.entries() {
+                let Some(rest) = entry.name.strip_prefix(&prefix) else {
+                    continue;
+                };
+                if rest.is_empty() {
+                    continue;
+                }
+                let (head, is_dir) = match rest.split_once('/') {
+                    Some((head, _)) => (head, true),
+                    None => (rest, false),
+                };
+                found.insert(if is_dir {
+                    format!("{prefix}{head}/")
+                } else {
+                    format!("{prefix}{head}")
+                });
+            }
         }
 
-        fn path(&self) -> &Path {
-            &self.0
+        Ok(found.into_iter().collect())
+    }
+
+    /// `Storages.getFileList(mask, attr)`: storage names matching a wildcard
+    /// mask, merged across the disk root and every mounted archive.
+    ///
+    /// * The mask is normalized (lowercased, `\` → `/`).
+    /// * If it contains `>` it addresses archives: `arcmask>inarcmask`, where
+    ///   `arcmask` wildcard-matches the archive file name.
+    /// * The part before the last `/` is a required literal directory prefix;
+    ///   the part after is a `*`/`?` wildcard matched case-insensitively
+    ///   against the base name. Matching is **recursive under the prefix**
+    ///   (matching the reference `Storages.getFileList`): a mask with no
+    ///   `>` matches base names at any depth below the prefix, and a mask
+    ///   with no `/` matches at any depth in the whole tree.
+    /// * Disk entries are emitted as normalized relative names; archive
+    ///   entries as `arc.xp3>path`.
+    /// * `attr` filters results: `0` or [`ATTR_NORMAL`] → regular files,
+    ///   [`ATTR_DIRECTORY`] → directories (with a trailing `/`); bits OR
+    ///   together.
+    ///
+    /// A genuine file-system failure while walking the disk tree propagates;
+    /// only a missing or non-directory subtree is treated as empty.
+    pub fn file_list(&self, mask: &str, attr: i64) -> Result<Vec<String>, StorageReadError> {
+        let mask = normalize_in_archive_name(mask);
+        let (arc_pat, in_arc_mask) = match mask.split_once('>') {
+            Some((arc, rest)) => (Some(arc.to_string()), rest.to_string()),
+            None => (None, mask),
+        };
+        let (dir_prefix, base_pat) = match in_arc_mask.rsplit_once('/') {
+            Some((dir, base)) => (
+                format!("{dir}/"),
+                if base.is_empty() {
+                    "*".to_string()
+                } else {
+                    base.to_string()
+                },
+            ),
+            None => (String::new(), in_arc_mask.clone()),
+        };
+        let include_files = attr == 0 || attr & ATTR_NORMAL != 0;
+        let include_dirs = attr & ATTR_DIRECTORY != 0;
+
+        let mut found = BTreeSet::new();
+
+        // Disk entries under the game directory, recursively.
+        let mut disk = Vec::new();
+        self.collect_disk_entries(&self.game_dir, "", &mut disk)?;
+        for (name, is_dir) in disk {
+            let base = name.rsplit('/').next().unwrap_or(&name);
+            let prefix_ok = dir_prefix.is_empty() || name.starts_with(&dir_prefix);
+            let attr_ok = (is_dir && include_dirs) || (!is_dir && include_files);
+            if prefix_ok && attr_ok && wildcard_match(&base_pat, base) {
+                found.insert(if is_dir { format!("{name}/") } else { name });
+            }
         }
-    }
 
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-
-    #[test]
-    fn absolute_and_relative_mixed_case_resolve_to_real_file() {
-        let dir = TempDir::new("mixedcase");
-        fs::create_dir_all(dir.path().join("savedata")).unwrap();
-        let real = dir.path().join("savedata/savemng.dat");
-        fs::write(&real, b"save data").unwrap();
-        let storage = Storage::mount(dir.path()).unwrap();
-
-        let game = dir.path().to_string_lossy().into_owned();
-        for name in [
-            format!("{game}/savedata/saveMng.dat"),
-            format!("{game}/SAVEDATA/SAVEMNG.DAT"),
-            "savedata/saveMng.dat".to_string(),
-            "SAVEDATA/SAVEMNG.DAT".to_string(),
-        ] {
-            let location = storage
-                .find(&name)
-                .unwrap_or_else(|| panic!("{name} must resolve"));
-            assert_eq!(location, Location::Disk(real.clone()), "{name}");
-            assert!(storage.exists(&name), "{name}");
-            assert_eq!(storage.stat(&name).unwrap().size, 9, "{name}");
-            assert_eq!(storage.find_disk(&name).unwrap(), real, "{name}");
+        // Archive entries, addressed as "arc.xp3>path".
+        for mounted in &self.archives {
+            if let Some(pat) = &arc_pat
+                && !wildcard_match(pat, &mounted.file_name)
+            {
+                continue;
+            }
+            for entry in mounted.archive.entries() {
+                let base = entry.name.rsplit('/').next().unwrap_or(&entry.name);
+                let prefix_ok = dir_prefix.is_empty() || entry.name.starts_with(&dir_prefix);
+                if prefix_ok && wildcard_match(&base_pat, base) {
+                    found.insert(format!("{}>{}", mounted.file_name, entry.name));
+                }
+            }
         }
 
-        // A path outside the mount never resolves, even when it exists.
-        let outside =
-            std::env::temp_dir().join(format!("TvpStorage-outside-{}.txt", std::process::id()));
-        fs::write(&outside, b"x").unwrap();
-        assert!(storage.find(&outside.to_string_lossy()).is_none());
-        assert!(!storage.exists(&outside.to_string_lossy()));
-        assert!(
-            storage
-                .relative_disk_name(&outside.to_string_lossy())
-                .is_none()
-        );
-        let _ = fs::remove_file(&outside);
+        Ok(found.into_iter().collect())
     }
 
-    #[test]
-    fn lowercase_canonical_wins_over_exact_case_variant() {
-        // The reference lowercases storage names before lookup, so when two
-        // files differ only by case the canonical (lowercase) one wins. This
-        // is what makes the game's `saveMng.dat` read the real `savemng.dat`
-        // even though a stray exact-case `saveMng.dat` exists next to it.
-        let dir = TempDir::new("shadow");
-        fs::create_dir_all(dir.path().join("savedata")).unwrap();
-        fs::write(dir.path().join("savedata/savemng.dat"), b"canonical").unwrap();
-        fs::write(dir.path().join("savedata/saveMng.dat"), b"stray").unwrap();
-        let storage = Storage::mount(dir.path()).unwrap();
-        let location = storage
-            .find(&format!("{}/savedata/saveMng.dat", dir.path().display()))
-            .unwrap();
-        assert_eq!(
-            location,
-            Location::Disk(dir.path().join("savedata/savemng.dat"))
-        );
-    }
-
-    #[test]
-    fn traversal_and_outer_names_do_not_resolve() {
-        let dir = TempDir::new("traversal");
-        fs::create_dir_all(dir.path().join("savedata")).unwrap();
-        fs::write(dir.path().join("escape.dat"), b"in").unwrap();
-        fs::write(
-            dir.path()
-                .parent()
-                .unwrap()
-                .join(format!("TvpStorage-neighbour-{}.dat", std::process::id())),
-            b"out",
-        )
-        .unwrap();
-        let storage = Storage::mount(dir.path()).unwrap();
-        assert!(storage.find("../escape.dat").is_none());
-        assert!(storage.find("savedata/../../escape.dat").is_none());
-        let _ = fs::remove_file(
-            dir.path()
-                .parent()
-                .unwrap()
-                .join(format!("TvpStorage-neighbour-{}.dat", std::process::id())),
-        );
-    }
-
-    #[test]
-    fn clear_archive_cache_drops_parsed_archives_without_opening() {
-        let dir = TempDir::new("clear-cache");
-        fs::write(
-            dir.path().join("data.xp3"),
-            build_xp3(&[("data/inside.txt", b"hello from archive")]),
-        )
-        .unwrap();
-        let mut storage = Storage::mount(dir.path()).unwrap();
-
-        // Mounting records the path but parses nothing.
-        assert_eq!(storage.archive_count(), 1);
-        assert_eq!(storage.parsed_archive_count(), 0);
-
-        // The first lookup parses exactly the one archive it scans.
-        assert!(storage.find("data/inside.txt").is_some());
-        assert_eq!(storage.parsed_archive_count(), 1);
-        assert_eq!(
-            storage.read("data/inside.txt").unwrap(),
-            b"hello from archive"
-        );
-
-        // The clear drops the parsed archive and opens nothing itself.
-        storage.clear_archive_cache();
-        assert_eq!(storage.parsed_archive_count(), 0);
-        assert_eq!(storage.archive_count(), 1);
-
-        // ...and the name still resolves and reads after the clear.
-        assert!(storage.find("data/inside.txt").is_some());
-        assert_eq!(storage.parsed_archive_count(), 1);
-        assert_eq!(
-            storage.read("data/inside.txt").unwrap(),
-            b"hello from archive"
-        );
-    }
-
-    #[test]
-    fn clear_archive_cache_reopens_only_as_far_as_needed() {
-        // A name in the first archive must resolve after one parse; a name in
-        // the second must resolve after walking (and parsing) both.
-        let dir = TempDir::new("clear-cache-two");
-        fs::write(dir.path().join("a.xp3"), build_xp3(&[("only/a.txt", b"a")])).unwrap();
-        fs::write(dir.path().join("b.xp3"), build_xp3(&[("only/b.txt", b"b")])).unwrap();
-        let storage = Storage::mount(dir.path()).unwrap();
-        assert_eq!(storage.archive_count(), 2);
-        assert_eq!(storage.parsed_archive_count(), 0);
-
-        assert_eq!(
-            storage.find("only/a.txt"),
-            Some(Location::Archive(
-                dir.path().join("a.xp3"),
-                "only/a.txt".into()
-            ))
-        );
-        assert_eq!(storage.parsed_archive_count(), 1);
-
-        storage.clear_archive_cache();
-        assert_eq!(storage.parsed_archive_count(), 0);
-
-        assert_eq!(
-            storage.find("only/b.txt"),
-            Some(Location::Archive(
-                dir.path().join("b.xp3"),
-                "only/b.txt".into()
-            ))
-        );
-        assert_eq!(storage.parsed_archive_count(), 2);
-    }
-
-    #[test]
-    fn repeated_clear_and_lookup_cycles_stay_correct() {
-        let dir = TempDir::new("clear-cache-cycles");
-        fs::write(
-            dir.path().join("x.xp3"),
-            build_xp3(&[("n/value.txt", b"v")]),
-        )
-        .unwrap();
-        let mut storage = Storage::mount(dir.path()).unwrap();
-        for _ in 0..3 {
-            assert!(storage.exists("n/value.txt"));
-            assert_eq!(storage.read("n/value.txt").unwrap(), b"v");
-            storage.clear_archive_cache();
-            assert_eq!(storage.parsed_archive_count(), 0);
-            assert!(storage.exists("n/value.txt"));
+    /// Recursively collects disk entries as `(normalized relative name,
+    /// is_dir)`, using the bottom file system for listing. A missing or
+    /// non-directory subtree contributes nothing; any other listing failure
+    /// propagates rather than silently truncating the result.
+    fn collect_disk_entries(
+        &self,
+        dir: &Path,
+        rel: &str,
+        out: &mut Vec<(String, bool)>,
+    ) -> Result<(), StorageReadError> {
+        let entries = match fs::list(&self.fs, &FsPath::host(dir)) {
+            Ok(entries) => entries,
+            Err(FsError::NotFound { .. }) | Err(FsError::NotADirectory { .. }) => {
+                return Ok(());
+            }
+            Err(error) => return Err(StorageReadError::Fs(error)),
+        };
+        for entry in entries {
+            let rel = if rel.is_empty() {
+                entry.name.clone()
+            } else {
+                format!("{rel}/{}", entry.name)
+            };
+            let normalized = normalize_in_archive_name(&rel);
+            let child = dir.join(&entry.name);
+            if entry.is_dir {
+                out.push((normalized, true));
+                self.collect_disk_entries(&child, &rel, out)?;
+            } else {
+                out.push((normalized, false));
+            }
         }
-    }
-
-    #[test]
-    fn unreadable_archive_is_skipped_but_not_cached() {
-        // A `.xp3` that is not an XP3 must not make lookups fail; it is
-        // logged and skipped, and its failure is not cached as an open
-        // archive. Disk files and later archives still resolve.
-        let dir = TempDir::new("bad-archive");
-        fs::write(dir.path().join("a.xp3"), b"not an xp3").unwrap();
-        fs::write(
-            dir.path().join("b.xp3"),
-            build_xp3(&[("real.txt", b"real")]),
-        )
-        .unwrap();
-        fs::write(dir.path().join("disk.txt"), b"disk").unwrap();
-        let mut storage = Storage::mount(dir.path()).unwrap();
-        assert!(storage.exists("disk.txt"));
-        assert_eq!(
-            storage.find("real.txt"),
-            Some(Location::Archive(
-                dir.path().join("b.xp3"),
-                "real.txt".into()
-            ))
-        );
-        assert_eq!(storage.read("real.txt").unwrap(), b"real");
-        // Only the valid archive became cached.
-        assert_eq!(storage.parsed_archive_count(), 1);
+        Ok(())
     }
 }
 
-#[cfg(test)]
-mod probe_tests {
-    use super::*;
+/// Recursively discovers every `*.xp3` under `base_dir`, in mount order.
+///
+/// This is a documented extension to the reference (D15 / doc 09): the
+/// reference never scans a folder, but a game directory is the ergonomic
+/// input for both the desktop CLI and the Android launcher. The order is
+/// deterministic — file name in natural order (embedded decimal runs are
+/// compared by value, so `patch@r1071` overrides `patch@r996` and
+/// `patch_append10` overrides `patch_append5`), then a shallower directory
+/// last, then full path — so `patch.xp3` overrides `data.xp3` and a root
+/// archive overrides a nested one of the same name (later mounts win).
+/// Symbolic-link directories are
+/// not followed (the listing reports the link, not its target), so a link
+/// cycle cannot recurse forever.
+///
+/// # Errors
+///
+/// A missing or non-directory subtree contributes nothing; any other listing
+/// failure is returned rather than silently truncating the scan.
+pub fn discover_archives(
+    file_system: &FileSystem,
+    base_dir: &Path,
+) -> Result<Vec<PathBuf>, StorageReadError> {
+    let mut found = Vec::new();
+    discover_archives_inner(file_system, base_dir, &mut found)?;
+    // Natural (numeric-aware) file-name order; among equal names a shallower
+    // path sorts last (and therefore mounts last and wins); the full path is
+    // the final tie-break.
+    found.sort_by(|a, b| {
+        natural_cmp(&archive_name(a), &archive_name(b))
+            .then_with(|| b.components().count().cmp(&a.components().count()))
+            .then_with(|| a.cmp(b))
+    });
+    Ok(found)
+}
 
-    #[test]
-    fn absolute_path_resolves() {
-        let game = "/mnt/DATA/Games/Others/test";
-        if !Path::new(game).is_dir() {
-            eprintln!("skipping: {game} is not present on this host");
-            return;
+fn discover_archives_inner(
+    file_system: &FileSystem,
+    dir: &Path,
+    out: &mut Vec<PathBuf>,
+) -> Result<(), StorageReadError> {
+    let entries = match fs::list(file_system, &FsPath::host(dir)) {
+        Ok(entries) => entries,
+        Err(FsError::NotFound { .. }) | Err(FsError::NotADirectory { .. }) => return Ok(()),
+        Err(error) => return Err(StorageReadError::Fs(error)),
+    };
+    for entry in entries {
+        let child = dir.join(&entry.name);
+        if entry.is_dir {
+            discover_archives_inner(file_system, &child, out)?;
+        } else if entry.name.to_ascii_lowercase().ends_with(".xp3") {
+            out.push(child);
         }
-        let storage = Storage::mount(game).unwrap();
-        let loc = storage.find(&format!("{game}/data.xp3"));
-        println!("absolute: {loc:?}");
-        assert!(loc.is_some(), "absolute path must resolve");
-        assert!(storage.find("data.xp3").is_some());
-        assert!(storage.find("system/Utility.tjs").is_some());
     }
+    Ok(())
+}
+
+/// The lowercased file name used as the primary archive-discovery sort key.
+fn archive_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
+/// Consume a leading run of ASCII digits, returning
+/// `(value, digit_count, remainder)`.
+fn consume_number(bytes: &[u8]) -> (u128, usize, &[u8]) {
+    let mut value: u128 = 0;
+    let mut digits = 0usize;
+    let mut rest = bytes;
+    while let Some((&c, tail)) = rest.split_first() {
+        if c.is_ascii_digit() {
+            value = value
+                .saturating_mul(10)
+                .saturating_add(u128::from(c - b'0'));
+            digits += 1;
+            rest = tail;
+        } else {
+            break;
+        }
+    }
+    (value, digits, rest)
+}
+
+/// Compare two lowercased names with embedded decimal runs compared by
+/// numeric value, so `patch@r1071` sorts after `patch@r996` and
+/// `patch_append10` sorts after `patch_append5`. Non-digit bytes compare
+/// byte-wise; equal numeric values order by digit count (shorter first).
+fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let (mut ai, mut bi) = (a.as_bytes(), b.as_bytes());
+    loop {
+        match (ai.first(), bi.first()) {
+            (None, None) => return std::cmp::Ordering::Equal,
+            (None, Some(_)) => return std::cmp::Ordering::Less,
+            (Some(_), None) => return std::cmp::Ordering::Greater,
+            (Some(&ca), Some(&cb)) => {
+                if ca.is_ascii_digit() && cb.is_ascii_digit() {
+                    let (value_a, digits_a, rest_a) = consume_number(ai);
+                    let (value_b, digits_b, rest_b) = consume_number(bi);
+                    match value_a.cmp(&value_b) {
+                        std::cmp::Ordering::Equal => {
+                            if digits_a != digits_b {
+                                return digits_a.cmp(&digits_b);
+                            }
+                        }
+                        other => return other,
+                    }
+                    ai = rest_a;
+                    bi = rest_b;
+                } else {
+                    match ca.cmp(&cb) {
+                        std::cmp::Ordering::Equal => {
+                            ai = &ai[1..];
+                            bi = &bi[1..];
+                        }
+                        other => return other,
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The base storage name (the part after the last `/`).
+fn storage_base(name: &str) -> &str {
+    name.rsplit('/').next().unwrap_or(name)
+}
+
+/// Builds a listed child name from its parent prefix.
+fn child_name(parent: &str, name: &str, is_dir: bool) -> String {
+    let normalized = normalize_in_archive_name(name);
+    let full = if parent.is_empty() {
+        normalized
+    } else {
+        format!("{parent}/{normalized}")
+    };
+    if is_dir { format!("{full}/") } else { full }
+}
+
+/// Converts epoch milliseconds to a [`SystemTime`].
+fn system_time_from_millis(ms: u64) -> SystemTime {
+    UNIX_EPOCH + Duration::from_millis(ms)
+}
+
+/// Reads a whole file through the bottom positional API.
+fn read_fs_file(fs: &FileSystem, path: &Path) -> Result<Vec<u8>, FsError> {
+    let file = fs::open(fs, &FsPath::host(path), OpenMode::Read)?;
+    let size = fs::file_size(fs, &file)?;
+    let size = usize::try_from(size).map_err(|_| FsError::Io {
+        message: "file size does not fit in usize".to_string(),
+    })?;
+    let mut out = Vec::new();
+    out.try_reserve_exact(size).map_err(|_| FsError::Io {
+        message: "file size cannot be allocated".to_string(),
+    })?;
+    out.resize(size, 0);
+    let mut read = 0usize;
+    while read < size {
+        let n = fs::read_at(fs, &file, read as u64, &mut out[read..])?;
+        if n == 0 {
+            break;
+        }
+        read += n;
+    }
+    out.truncate(read);
+    Ok(out)
+}
+
+/// Reads the whole of an open archive file into memory.
+///
+/// The size the file system reports is authoritative: a file that ends before
+/// it is a typed error, never a shortened buffer. There is no size cap; a size
+/// the platform cannot represent or allocate is a typed error instead. The
+/// returned image is owned by the storage and handed to L1 for each entry
+/// read; L1 never keeps it.
+fn read_archive_image(
+    fs: &FileSystem,
+    file: &FileState,
+    path: &Path,
+) -> Result<Vec<u8>, MountError> {
+    let size = fs::file_size(fs, file)?;
+    let display = path.display().to_string();
+    let len = usize::try_from(size).map_err(|_| MountError::ArchiveTooLarge {
+        path: display.clone(),
+        size,
+    })?;
+    let mut image = Vec::new();
+    image
+        .try_reserve_exact(len)
+        .map_err(|_| MountError::ArchiveAllocation {
+            path: display.clone(),
+            size,
+        })?;
+    image.resize(len, 0);
+    let mut read = 0usize;
+    while read < len {
+        let n = fs::read_at(fs, file, read as u64, &mut image[read..])?;
+        if n == 0 {
+            return Err(MountError::TruncatedArchive {
+                path: display,
+                expected: size,
+                read: read as u64,
+            });
+        }
+        read += n;
+    }
+    Ok(image)
+}
+
+/// Case-insensitive `*`/`?` wildcard match (ASCII case folding).
+fn wildcard_match(pattern: &str, text: &str) -> bool {
+    let pat: Vec<char> = pattern.chars().collect();
+    let text: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let (mut star, mut retry) = (usize::MAX, 0usize);
+    while ti < text.len() {
+        if pi < pat.len() && (pat[pi] == '?' || pat[pi].eq_ignore_ascii_case(&text[ti])) {
+            pi += 1;
+            ti += 1;
+        } else if pi < pat.len() && pat[pi] == '*' {
+            star = pi;
+            retry = ti;
+            pi += 1;
+        } else if star != usize::MAX {
+            pi = star + 1;
+            retry += 1;
+            ti = retry;
+        } else {
+            return false;
+        }
+    }
+    while pi < pat.len() && pat[pi] == '*' {
+        pi += 1;
+    }
+    pi == pat.len()
 }

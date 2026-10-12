@@ -1,0 +1,24 @@
+[package]
+name = "vm"
+description = "krkr-rs L4 TJS VM host over tjs: lifecycle, bytecode, GC roots, frame body"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+compat = { workspace = true }
+engine = { workspace = true }
+tjs = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+
+# D13: `platform` has no default platform feature; select exactly one per
+# target (L4 consumes only the platform-agnostic event types).
+[target.'cfg(target_os = "linux")'.dependencies]
+platform = { workspace = true, features = ["platform-linux"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+platform = { workspace = true, features = ["platform-android"] }
+
+[dev-dependencies]
+testkit = { workspace = true }

@@ -1,9 +1,9 @@
 [package]
-name = "krkr-android"
+name = "android"
+description = "krkr-rs Android composition root: android_main, the GameActivity event loop and JNI wiring"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Android entry point (cdylib) for the krkr-rs engine"
 
 # The cdylib name must match `android.app.lib_name` in the manifest
 # (android/app/src/main/AndroidManifest.xml) — it is how the AGDK GameActivity
@@ -12,17 +12,31 @@ description = "Android entry point (cdylib) for the krkr-rs engine"
 name = "krkr_android"
 crate-type = ["cdylib"]
 
-# Android-only crate. The whole source is `#![cfg(target_os = "android")]`, so
-# other targets build an empty cdylib instead of dragging in the Android
-# toolchain — which is why the dependencies are scoped to the target too.
+[dependencies]
+# The state-file writer is plain std + log, so it also compiles and is tested
+# on the host even though only the Android build runs it.
+log = { workspace = true }
+# The pure L1 type crate: the settings resolver reads the option types and
+# their parsers, so `config` is host-tested as well as compiled for Android.
+api = { workspace = true }
+
+# Everything that touches Android is target-scoped: on a desktop host the
+# crate compiles to just the (host-tested) state module and the desktop
+# dependency graph is unchanged.
 [target.'cfg(target_os = "android")'.dependencies]
-bevy = { version = "0.19", features = ["android-game-activity"] }
-engine = { path = "../engine" }
+# The GameActivity glue the Kotlin `KrkrGameActivity` attaches to. The Kotlin
+# class derives from Google's GameActivity, so the `game-activity` feature
+# selects the matching native entry point.
+android-activity = { version = "0.6", default-features = false, features = ["game-activity"] }
+# The three static fields `KrkrGameActivity` publishes are read with JNI.
 jni = "0.21"
-log = "0.4"
-# `default-features = false` drops `render`'s `ffmpeg` feature, which forwards
-# to `tvp-natives`: Android has no system FFmpeg, so the movie path uses the
-# MediaCodec backend instead (docs/android.md §6). Until that lands, video
-# returns a clear "no MPEG decoder in this build" error.
-render = { path = "../render", default-features = false }
-tvp-visual = { path = "../tvp-visual" }
+# The emulator host (L2 engine state + L4 VM host) the loop drives.
+app = { path = "../app" }
+# The L1 Android backend (real window + input translation). The desktop
+# composition root selects `platform-linux` instead.
+platform = { workspace = true, features = ["platform-android"] }
+# The composition root chooses the presentation mode and names the engine's
+# `ScalingMode` at the `HostConfig` boundary.
+engine = { workspace = true }
+# The composition root owns the process logger.
+env_logger = { workspace = true }

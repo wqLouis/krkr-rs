@@ -1,7 +1,25 @@
 [workspace]
 resolver = "2"
-members = ["crates/xp3", "crates/tjs2-sys", "crates/engine", "crates/kag", "crates/tvp-util", "crates/tvp-streams", "crates/tvp-natives", "crates/tvp-storages", "crates/tvp-scripts", "crates/tvp-archive", "crates/tvp-config", "crates/app", "crates/tvp-visual", "crates/render", "crates/tvp-text", "crates/tvp-kagparser", "crates/tvp-input", "crates/tvp-sound", "crates/android"]
-default-members = ["crates/render", "crates/app"]
+members = [
+    # The C++ TJS2 VM — the compatibility anchor and the only legacy crate
+    # the new architecture still links.
+    "crates/tjs",
+    # new architecture (D9/D10)
+    "crates/platform/api",
+    "crates/platform/fs",
+    "crates/platform/media",
+    "crates/platform/render",
+    "crates/engine",
+    "crates/platform/platform",
+    "crates/compat",
+    "crates/vm",
+    "crates/app",
+    # Android composition root (target-gated deps; empty on the desktop host)
+    "crates/android",
+    # dev-only shared test helper (not part of the runtime architecture)
+    "crates/testkit",
+]
+default-members = ["crates/app"]
 
 [workspace.package]
 version = "1.0.0"
@@ -9,8 +27,34 @@ edition = "2024"
 license = "GPL-3.0-only"
 
 [workspace.dependencies]
-xp3 = { path = "crates/xp3" }
-tjs2-sys = { path = "crates/tjs2-sys" }
+tjs = { path = "crates/tjs" }
+api = { path = "crates/platform/api" }
+fs = { path = "crates/platform/fs" }
+media = { path = "crates/platform/media" }
+render = { path = "crates/platform/render" }
+engine = { path = "crates/engine" }
+platform = { path = "crates/platform/platform" }
+compat = { path = "crates/compat" }
+vm = { path = "crates/vm" }
+# dev-only test helper; consumed through [dev-dependencies] only
+testkit = { path = "crates/testkit" }
+cosmic-text = { version = "0.19", default-features = false, features = ["std"] }
+thiserror = "2"
+log = "0.4"
+env_logger = "0.11"
+ash = "0.38"
+raw-window-handle = "0.6"
+winit = "0.30"
+flate2 = "1"
+# Video decode (Linux): maintained FFmpeg binding. Linked dynamically through
+# pkg-config (the `static` feature is deliberately *not* enabled). The media
+# crate consumes it through the optional `video-ffmpeg` feature; Android uses
+# the NDK MediaCodec backend instead (see crates/platform/media/Cargo.toml).
+ffmpeg-next = { version = "9", default-features = false, features = [
+    "format",
+    "software-resampling",
+    "software-scaling",
+] }
 
 [profile.release]
 lto = "thin"

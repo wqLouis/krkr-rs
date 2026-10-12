@@ -35,10 +35,10 @@ cross-checked") is now superseded for Android — see §2 below.
 
 - **The C++ TJS2 VM cross-compiles for Android.** Zig cannot do it (it refuses
   to provide Android libc: `unable to provide libc for target
-  aarch64-linux.5.10...android.29`), but `crates/tjs2-sys/build.rs` already
+  aarch64-linux.5.10...android.29`), but `crates/tjs/build.rs` already
   honours a `CXX` override, so pointing it at the NDK's
   `aarch64-linux-android21-clang++` and running
-  `cargo check -p tjs2-sys --target aarch64-linux-android` **succeeds in ~19 s**
+  `cargo check -p tjs --target aarch64-linux-android` **succeeds in ~19 s**
   (NDK r27c, bison + python present). This was the single largest unknown and
   it is now a known-good path. `docs/portability.md` §2/§11's statement that
   the full path "was not cross-checked because build.rs compiles for the host
@@ -50,7 +50,7 @@ cross-checked") is now superseded for Android — see §2 below.
   (→ `bevy_internal/android-game-activity` → `bevy_winit` →
   `winit/android-game-activity`) and the `android-native-activity`
   alternative (`bevy_winit-0.19.1/Cargo.toml:43-44`).
-- **`tjs2-sys/build.rs` is not target-aware** (`:332`): it gates the C++
+- **`tjs/build.rs` is not target-aware** (`:332`): it gates the C++
   runtime link flags on `env::consts::OS`, which in a build script is the
   **host** OS. A Linux→Android build therefore emits desktop-only
   `-lc++ -lc++abi` instead of letting the NDK clang link `libc++_static`. Must
@@ -65,7 +65,7 @@ cross-checked") is now superseded for Android — see §2 below.
   Android cross-build uses the NDK clang; zig remains the toolchain for the
   Linux/host build.
 - **`cargo ndk` must not be used for this build.** It does not set `CXX` in the
-  form `crates/tjs2-sys/build.rs` reads (it sets the target-scoped
+  form `crates/tjs/build.rs` reads (it sets the target-scoped
   `CXX_<triple>`), so the build script falls back to its default `zig c++` —
   which targets the **host**. `cargo ndk -t arm64-v8a build` was measured
   producing `out/obj/tjsInterCodeExec.o: ELF 64-bit … x86-64` inside an Android
@@ -84,6 +84,81 @@ lands): the full workspace for `aarch64-linux-android`, including `blake3`
 `failed to find tool "aarch64-linux-android-clang"`), `rodio`/`cpal` (AAudio),
 and `opusic-sys`.
 
+### 2.1 Platform backend: window, input and scale (current state)
+
+`crates/platform/platform/src/android.rs` is the L1 Android backend. Three
+parts are real and compile for `aarch64-linux-android` (checked with
+`cargo check -p platform --features platform-android --target
+aarch64-linux-android`):
+
+* **The window.** On Android, `PlatformWindow` owns the `ANativeWindow` the
+  activity acquired and projects it through `raw-window-handle`
+  (`RawWindowHandle::AndroidNdk`), so the renderer can bind and rebind its
+  Vulkan surface to the real window. `size()` is the `ANativeWindow` buffer
+  size in physical pixels; `scale_factor()` is the display's
+  `Configuration.densityDpi / 160`. The non-Android host keeps a typed stub,
+  because the `ndk` crate is target-gated.
+* **Input translation.** `PlatformWindow::physical_key_from_android`,
+  `touch_phase_from_android` and `mouse_button_from_android` translate the
+  Android `AKEYCODE_*` / `AMOTION_EVENT_*` values into `platform`'s
+  `PhysicalKey` / `TouchPhase` / `MouseButton`. They name no Android type, so
+  they are unit-tested on the host. `AKEYCODE_BACK` becomes
+  `PhysicalKey::Escape` (`MainScene.cpp:820-829`) rather than a new key, and the
+  reference `VK_*` codes stay the compatibility layer's job. The composition
+  root (`crates/android/src/input.rs`) consumes contact phases through the
+  touch→mouse synthesizer (`crates/android/src/gesture.rs`, §5) instead of
+  forwarding raw touch.
+* **Audio output** (AAudio) was already real.
+
+The **event loop** is driven by the Android composition root, not by
+`platform::run`. `platform::run` is the desktop (winit) driver and still
+returns `PlatformError::NotImplemented` on Android; the Android root
+(`crates/android`) owns the `android-activity` `GameActivity` glue and turns
+its lifecycle and input callbacks into the same `PlatformEvent`s, calling the
+same `EventHandler` the winit driver calls. The `android-activity` dependency
+lives in `crates/android` (target-scoped) so the desktop workspace is
+unaffected:
+
+```toml
+[target.'cfg(target_os = "android")'.dependencies]
+android-activity = { version = "0.6", default-features = false, features = ["game-activity"] }
+```
+
+(`android-activity` 0.6.1 uses the same `ndk` 0.9 as `platform`, so the
+`NativeWindow` type unifies. Its build script compiles a small C++ glue file,
+so an Android target check needs the NDK `cc`/`cxx` that the `platform` check
+above does not.)
+
+### 2.2 Scaling: Android must always use automatic scaling
+
+On a phone the game must never be presented at its raw logical size. The
+reference's Android build fills the frame by stretching: it sets the design
+resolution to the full frame size with cocos2d's `EXACT_FIT`
+(`reference/cpp/core/environ/cocos2d/AppDelegate.cpp:60-70`) and derives the
+design size from the screen aspect
+(`reference/cpp/core/environ/cocos2d/MainScene.cpp:436-438`). The Android
+build defaults to `ScalingMode::Fit` instead — a uniform scale to the largest
+size that fits, with the remainder letterboxed — so the picture keeps its
+aspect rather than being stretched on an unusual screen. That is a deliberate
+divergence from the reference's Android environment, chosen for phones; the
+desktop default stays `Game`, which is the reference's one-to-one Win32
+presentation.
+
+The platform side of this is already done: `PlatformWindow::size()` reports the
+physical surface size and `PlatformWindow::scale_factor()` the display density.
+The default itself belongs to the **launcher**, not L1 (L1 must not know
+TVP/scaling semantics) and not the engine (which receives an already-resolved
+value and does no configuration I/O of its own):
+
+* the Android composition root `crates/android` builds its `RuntimeConfig` with
+  `scaling: PresentationScaling::Fit` and drives the shared
+  `app::Host`/`app::GameHost` from the `android-activity` event loop; the
+  desktop CLI drives the same host through `app::run`. The desktop default
+  stays `Game`, and `--scaling` still overrides either. Loading the
+  configuration is deliberately the launcher's business, so each platform can
+  implement it its own way (`docs/runtime-config.md`). On Android the player's
+  saved choice overrides `Fit` through the settings screen (§3.2).
+
 ---
 
 ## 3. Architecture
@@ -92,17 +167,21 @@ and `opusic-sys`.
 android/                          Kotlin + Compose M3 app (Gradle)
   app/src/main/kotlin/…/
     MainActivity.kt               library: game list, "Add game" (SAF), settings
-    GameActivity.kt               hosts the engine surface (GameActivity)
+    KrkrGameActivity.kt           hosts the engine surface; publishes the game
+                                  dir + runtime settings over JNI
     GameLibrary.kt                persisted picked-folder URIs + metadata
+    RuntimeSettings.kt            persisted runtime options (frame rate, scaling,
+                                  archive preload)
     ui/                           Compose screens, M3 theme
   app/src/main/jniLibs/arm64-v8a/
     libkrkr_android.so            ← the Rust engine (cargo-ndk output)
 
 crates/android/                   Rust cdylib (package `krkr-android`)
-  src/lib.rs                      #[bevy_main] android_main; reads the game
-                                  dir from the Activity (JNI/intent extras),
-                                  builds the Bevy app from `render`
-crates/render/                    shared app assembly (refactored so the
+  src/lib.rs                      android_main: reads the game dir and the
+                                  runtime settings from the Activity over JNI,
+                                  builds the app from `render`
+  src/jni_fields.rs               the static-field JNI reads
+  src/config.rs                   validates the settings into a `RuntimeConfig`crates/platform/render/                    shared app assembly (refactored so the
                                   desktop bin and the Android cdylib build the
                                   same App)
 crates/tvp-natives/src/video/
@@ -165,6 +244,77 @@ is absent when the folder is not addressable as a path (a cloud provider); such
 an entry is still listed, and launching it explains why it cannot run rather
 than starting the engine against a path that will not resolve.
 
+### 3.2 Runtime settings — `settings.json` and the JNI path
+
+The launcher also persists the player's runtime options and carries them into
+the engine. A **Settings** screen reachable from the launcher's top bar exposes
+the three options `api::config::RuntimeConfig` carries today, with the same
+accepted values as the desktop `--fps`/`--scaling` and `preload_archives`.
+Nothing is offered for a feature the engine has no knob for
+— a control that silently did nothing is the bug class this project forbids
+(`AGENTS.md` D11).
+
+| option | values / range | default | basis |
+|---|---|---|---|
+| Frame-rate limit | decimal integer `1..=1000` fps | `60` | reference `fps_limit` default 60 (`reference/cpp/core/environ/ui/PreferenceConfig.h:304-309`); the same range `--fps` accepts |
+| Presentation scaling | `game`, `fit`, `fill`, `expand` | `fit` | `game` is the reference's one-to-one Win32 presentation; `fit` is the Android default (§2.2), because a phone must not present the raw logical size |
+| Archive preload | `true`, `false` | `false` | whether every mounted archive is read into memory when it mounts; the cost is that archive's size in resident memory, the gain is that entry reads stop touching the backing filesystem |
+
+`fill` and `expand` are exposed because the engine honours them; the desktop
+default remains `game`.
+
+The archive-preload switch is the option to weigh on a phone: it is not a debug
+mode, it reads the archive into the same storage as before so every entry
+returns the same bytes, and the resident-memory cost is the archive's size — a
+real and often large number — traded for no longer reading it back from
+storage.
+
+The choices are stored as JSON in the app's private files directory —
+`<filesDir>/settings.json` — next to `games.json`, following the same
+inspectable, atomically-written convention (§3.1):
+
+```json
+{ "version": 1, "frame_rate": "60", "scaling": "fit",
+  "preload_archives": "false" }
+```
+
+`RuntimeSettings.kt` keeps each value as the exact string the user chose; it
+does not validate the value itself. Validation belongs to the read side, exactly
+as it does for the desktop `key=value` file.
+
+The configuration path mirrors the desktop launcher's, with the settings file
+playing the role of the `KRKR_CONFIG` file:
+
+1. **The settings UI** validates the frame rate (`1..=1000`), the scaling (one
+   of the four) and the archive preload (`true`/`false`) and writes
+   `settings.json` atomically. A value loaded from a hand-edited file that is
+   not one of the accepted values is shown and must be corrected before it can
+   be saved; the hand-edited value is preserved, not rewritten.
+2. **`KrkrGameActivity`** reads `settings.json` in `onCreate`/`onNewIntent`
+   *before* `super.onCreate` and copies the three values onto the static fields
+   `pendingFrameRate`, `pendingScaling` and `pendingPreloadArchives` — the same
+   JNI channel `pendingGameDir`/`pendingGameName`/`pendingStateDir` already use.
+3. **`crates/android`** reads those fields (`jni_fields.rs`) and resolves them
+   (`config.rs`) into a `RuntimeConfig`, applying `fit` as the presentation
+   default and `false` as the preload default. An unparseable or out-of-range
+   value is a typed `ConfigError` naming the option and the accepted values; it
+   is written to `krkr_state.json` as a failure and the loop is never started —
+   it is never replaced by the default (D11).
+4. **The shared emulator host** receives the finished value: the
+   `crates/android` loop passes the scaling into the render host, the
+   archive-preload choice into `app::GameHost::open_with_preload`, and the
+   frame period into its ticker, exactly as the desktop `app::run` does. The
+   emulator core performs no configuration I/O, exactly as on the desktop
+   (`docs/runtime-config.md`).
+
+Because the settings are read at launch, a change applies to the **next** run,
+which the screen states.
+
+Two options that have been suggested are deliberately **not** exposed, because
+the engine exposes no knob for either: texture resolution and audio buffering.
+Adding a control for them would be a stub. They are engine work, not launcher
+work — see `docs/runtime-config.md` §3.
+
 ---
 
 ## 4. Storage: SAF is a URI, the engine wants paths
@@ -207,25 +357,59 @@ contained if that ever changes. Option **C** is not used.
 ## 5. Touch input
 
 KiriKiri games are mouse-and-keyboard driven, so the bridge is
-touch → mouse/keyboard, not a new input model:
+**touch → mouse**, not a new input model. The reference's Android environment
+turns one finger into a virtual mouse
+(`reference/cpp/core/environ/cocos2d/MainScene.cpp:1017-1146`); this port does
+the same, at the composition root: the state machine is
+`crates/android/src/gesture.rs` (pure, host-tested) and the Android motion
+events are `crates/android/src/input.rs`. The synthesised events travel the
+same host path and the same aspect-correct window→game transform as a real
+mouse, so engine-side layer hit-testing, `onMouseDown`/`onMouseUp`,
+`onClick`/`onDoubleClick` and the game's own cursor logic keep working
+unchanged. A tap that a KAG menu used to miss is the symptom this fixes.
 
-- **Tap → left click** at the touch position, through the same
-  aspect-correct window→game transform the desktop bridge already uses, so
-  engine-side layer hit-testing, `onMouseDown`/`onMouseUp` and the game's own
-  cursor logic all keep working unchanged.
-- **Long press → right click** (KAG uses right-click for the menu; games also
-  call `System.getMouseButtonState(1)`).
-- **Drag → mouse move with the button held** (some games implement drag).
-- **Two-finger tap / swipe-down → `Escape`/right-click equivalent**, since
-  there is no back button in the game and Android's back gesture must be
-  handled (`onBackPressed` → engine "open menu" event, second press → exit).
-- **On-screen controls overlay** for keys the games need and touch cannot
-  express: at minimum a Ctrl (skip) button, a right-click button and a
-  menu/back button, drawn either as a Compose overlay over the surface or
-  in-engine. Compose is preferable (M3 styling, no engine changes) — it can
-  sit in the same `GameActivity` hierarchy above the surface.
-- Multi-touch must not double-fire: the bridge should consume `TouchInput`
-  events on Android rather than also synthesising mouse events.
+The mapping, as implemented:
+
+- **Tap → left click.** A single finger that travels no more than 16 px and is
+  released before 1000 ms presses and releases the left button at the touch
+  position. The L2 input state turns the press/release pair into
+  `onMouseDown`/`onMouseUp` and then `onClick`/`onDoubleClick`.
+- **Drag → mouse move with the button held.** Once the finger passes the slop,
+  the left button presses and every move is a pointer move until the release.
+- **Long press → right click.** A finger held still past 1000 ms (the
+  reference's virtual-mouse timeout, `MainScene.cpp:1097-1101`) presses the
+  right button, released when the finger lifts. KAG opens its menu on the right
+  button and games read it through `System.getMouseButtonState(1)`.
+- **Two-finger tap / swipe-down → `Escape`.** Two fingers that both lift
+  within 300 ms, or that drag down past 64 px, emit an Escape press/release
+  pair — the key the Android back button already maps to (`AKEYCODE_BACK` →
+  `PhysicalKey::Escape`, §2.1).
+- **Multi-touch must not double-fire.** The raw touch is consumed by the
+  synthesizer and is **not** also forwarded as `onTouchDown`/`onTouchMove`/
+  `onTouchUp`: a KAG menu reads the mouse family, and sending both would fire
+  twice. A second finger that arrives after a drag or a long press has begun is
+  ignored, so it cannot turn an active drag into a back gesture.
+
+The 16 px slop is a fixed physical-pixel value. The reference scales the same
+threshold by the display DPI (`MainScene.cpp:494-496`); that is a small
+deliberate divergence which keeps the synthesizer free of a display service.
+
+**Implemented and host-tested:** the whole state machine and every mapping
+above (`crates/android/src/gesture.rs` unit tests). **Not verified on the
+host:** that the Android motion actions and timestamps actually reach it in the
+assumed order, that the synthesised events hit a real KAG menu, and the
+DPI-based slop.
+
+Not done yet:
+
+- **On-screen controls overlay** for keys touch cannot express: at minimum a
+  Ctrl (skip) button, a right-click button and a menu/back button. Compose is
+  the intended home (M3 styling, no engine changes) — it can sit in the same
+  `GameActivity` hierarchy above the surface. There is no control for it today.
+- **The Activity-level back gesture.** `android-activity` 0.6 does not surface
+  `onBackPressed`, so the only back path is the mapped `AKEYCODE_BACK` key; the
+  two-finger gestures above are the in-game substitute. “First press opens the
+  menu, a second press exits” is not implemented.
 
 ---
 
@@ -321,11 +505,34 @@ tag. It has run repeatedly; the `android-v1.0.0` release carries the built APK.
 **Diagnostics on a device.** Because a failure here is otherwise invisible (the
 engine's stdout/stderr is discarded, and `MANAGE_EXTERNAL_STORAGE` needs the
 user to visit a Settings page that no `requestPermissions` call can reach), the
-engine writes `<filesDir>/krkr.log` and an atomically-written
-`<filesDir>/krkr_state.json` (`starting`/`running`/`failed`/`stopped` plus the
-real error message and pid), and the launcher turns that into a dialog with the
-reason and a **Logs** screen that can copy or share it. A crash is recognised
-by a stale `starting`/`running` whose pid is no longer the current process.
+engine writes two files into `<filesDir>` and the launcher reads them:
+
+* `<filesDir>/krkr_state.json` — atomically written
+  `starting`/`running`/`failed`/`stopped` plus the real error message and pid;
+  the launcher turns it into a dialog with the reason. A crash is recognised by
+  a stale `starting`/`running` whose pid is no longer the current process.
+* `<filesDir>/krkr.log` — the engine log, and what the launcher's **Logs**
+  screen (copy/share) and the dialogs' tail read. `env_logger` writes every
+  record to stderr, which `android-activity` redirects to logcat, and the same
+  record is appended to this file. Lines are UTF-8, oldest first,
+  `"<rfc3339> <LEVEL> <message>"`; the launcher reads the last 400 lines, up
+  to 256 KiB, dropping a leading partial line (`LauncherLog.tail`).
+
+The log is capped at 1 MiB and rotated once, keeping `krkr.log.1`, so a long
+session cannot fill the device's storage. The file is opened before the global
+logger is installed; a log the app cannot open is returned as a startup error
+and written to the state file as `failed`, so the Logs screen is never silently
+empty with no explanation (D11). The file name and the directory are the
+Kotlin contract (`EngineDiagnostics.engineLogFile` is
+`File(filesDir, "krkr.log")`, and `KrkrGameActivity.pendingStateDir` is
+`filesDir.absolutePath`).
+
+**Host-tested:** the record format, the byte accounting, the 1 MiB rotation,
+reopening a previous file and the missing-directory error
+(`crates/android/src/log_file.rs` unit tests). **Not verified on the host:**
+that `<filesDir>` is writable by the app process, that the records appear in
+`adb logcat` under the `env_logger` format, and that the Logs screen and crash
+dialog read them back.
 
 Two deliberate choices worth restating:
 
@@ -344,9 +551,10 @@ Two deliberate choices worth restating:
 | M1 | Whole workspace cross-checks with the FFmpeg feature off; `build.rs` made target-aware | **verified** (`build-android.sh --check`) |
 | M2 | Rust `cdylib` + `#[bevy_main]` entry point; engine builds an `App` from `render` | **verified** — links and exports `android_main` |
 | M3 | Compose M3 launcher + SAF picker + persisted library; hands the folder to `GameActivity` | **compiles and packages** (never run on a device) |
-| M4 | Touch → mouse bridge | **implemented and host-tested** (on-screen controls and the back gesture still open) |
+| M4 | Touch → mouse bridge | **implemented and host-tested** (`crates/android/src/gesture.rs`); on-screen controls and the Activity-level back gesture still open |
 | M5 | MediaCodec video backend (replacing FFmpeg on Android) | **compile-verified and symbol-checked**; never run on a device |
 | M6 | CI APK build + artifact upload | workflow written, never triggered |
+| M7 | Engine writes `<filesDir>/krkr.log` (capped, rotated) for the Logs screen | **host-tested**; never run on a device |
 
 The whole chain now produces an installable APK from a clean tree — see §7 —
 but **nothing has been run on hardware**. What that leaves genuinely unproven is
@@ -363,9 +571,14 @@ The storage, orientation and game-discovery questions are now **decided**
 (§1): sideloaded storage via option A, landscape lock, and explicit folders
 only — no auto-indexing of a default location.
 
-1. **Resolution/scaling policy** on phones: the games are 1280×720. Letterbox
-   (current `AutoMin` behaviour) is correct, but a wide phone leaves side bars —
-   is a `ScalingMode` that fills more aggressively ever wanted?
+1. **Resolution/scaling policy** on phones — **decided: default `Fit`, and the
+   player can override it.** The game is scaled uniformly to fit the screen by
+   default, with the remainder letterboxed, so it keeps its aspect. The
+   reference's Android build stretches instead (`EXACT_FIT`,
+   `reference/cpp/core/environ/cocos2d/AppDelegate.cpp:60-70`,
+   `MainScene.cpp:436-438`); we choose no distortion. The Android composition
+   root selects `Fit` as the default and the settings screen (§3.2) can override
+   it with any of the engine's four modes.
 2. **Audio focus/interruption** (phone call, notification) and lifecycle
    (backgrounding must pause the VM + mixer) — not yet scoped.
 3. **Emulator support**: arm64-only means no x86_64 emulator; verification will

@@ -36,11 +36,14 @@ class KrkrGameActivity : GameActivity() {
          * Read from native code (`crates/android`) through JNI as soon as
          * `android_main` starts. Null until [onCreate] has run, so the native
          * side must treat null as a fatal configuration error rather than
-         * guessing a directory.
+         * guessing a directory. It is not cleared when the Activity is
+         * destroyed: a new instance republishes it in [onCreate] before that
+         * instance's `android_main` reads, and clearing it early would race a
+         * slow first read.
          *
          * `@JvmField` (not `@JvmStatic`) is deliberate: it puts a real static
          * **field** on this class, which is what the JNI `GetStaticField` read
-         * in `crates/android/src/lib.rs` expects. A `@JvmStatic var` in a
+         * in `crates/android/src/jni_fields.rs` expects. A `@JvmStatic var` in a
          * companion would expose accessor *methods* instead, and the field
          * would live on the companion object.
          */
@@ -60,12 +63,46 @@ class KrkrGameActivity : GameActivity() {
          * for the same reason: `super` enters `android_main`, so the field is
          * always populated before native code can observe it.
          *
-         * It is intentionally not cleared in [onDestroy]: the native shutdown
-         * path may still want the directory to record a final `stopped` state,
-         * and clearing it a moment too early would lose that.
+         * Native code copies the directory once at `android_main` startup and
+         * never reads the field again, so nothing clears it afterwards; the
+         * terminal `stopped`/`failed` write uses the copy, not this field.
          */
         @JvmField
         var pendingStateDir: String? = null
+
+        /**
+         * The frame-rate limit the user chose, as a decimal string.
+         *
+         * Read from native code (`crates/android`) through JNI exactly like
+         * [pendingGameDir], and resolved there into the `RuntimeConfig` the
+         * engine receives. Null means the launcher had no persisted choice, so
+         * the engine's default applies.
+         *
+         * `@JvmField` is deliberate: JNI `GetStaticField` reads a real static
+         * *field*, not a companion accessor.
+         */
+        @JvmField
+        var pendingFrameRate: String? = null
+
+        /**
+         * The presentation scaling the user chose (`game`/`fit`/`fill`/
+         * `expand`), read through JNI like [pendingFrameRate].
+         *
+         * The launcher defaults this to `fit` on Android; the user's choice
+         * overrides it.
+         */
+        @JvmField
+        var pendingScaling: String? = null
+
+        /**
+         * Whether every mounted archive is read into memory at mount (`true`
+         * or `false`), read through JNI like [pendingFrameRate].
+         *
+         * Null means the launcher had no persisted choice, so the engine's
+         * `false` default applies.
+         */
+        @JvmField
+        var pendingPreloadArchives: String? = null
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -80,8 +117,9 @@ class KrkrGameActivity : GameActivity() {
         pendingGameDir = intent.getStringExtra(EXTRA_GAME_DIR)
         pendingGameName = intent.getStringExtra(EXTRA_GAME_NAME)
         pendingStateDir = filesDir.absolutePath
+        publishRuntimeSettings()
         LauncherLog.i(
-            "KrkrGameActivity.onCreate: game=${pendingGameName ?: "?"} dir=${pendingGameDir ?: "?"} stateDir=${pendingStateDir ?: "?"}",
+            "KrkrGameActivity.onCreate: game=${pendingGameName ?: "?"} dir=${pendingGameDir ?: "?"} stateDir=${pendingStateDir ?: "?"} fps=${pendingFrameRate ?: "?"} scaling=${pendingScaling ?: "?"} preload=${pendingPreloadArchives ?: "?"}",
         )
         super.onCreate(savedInstanceState)
 
@@ -98,24 +136,42 @@ class KrkrGameActivity : GameActivity() {
 
     /**
      * `launchMode="singleTask"`: a second launch while an instance is alive is
-     * delivered here rather than to [onCreate], so the static fields the native
-     * side reads would otherwise keep pointing at the previous game. Refresh
-     * them from the new Intent and log that the engine is already running.
+     * delivered here rather than to [onCreate]. The native side reads
+     * [pendingGameDir] once, when `android_main` starts, so these fields must
+     * keep describing the game the engine is actually running. A different game
+     * cannot take effect, so such an intent is ignored; the launcher refuses it
+     * before starting anything, which keeps the pending-launch marker naming the
+     * running game.
      */
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        pendingGameDir = intent.getStringExtra(EXTRA_GAME_DIR)
+        val gameDir = intent.getStringExtra(EXTRA_GAME_DIR)
+        val currentDir = pendingGameDir
+        if (currentDir != null && gameDir != currentDir) {
+            LauncherLog.w(
+                "onNewIntent ignored: the engine is already running \"${pendingGameName ?: "?"}\", " +
+                    "not \"${intent.getStringExtra(EXTRA_GAME_NAME) ?: "?"}\"",
+            )
+            return
+        }
+        pendingGameDir = gameDir
         pendingGameName = intent.getStringExtra(EXTRA_GAME_NAME)
         pendingStateDir = filesDir.absolutePath
+        publishRuntimeSettings()
         LauncherLog.i(
-            "KrkrGameActivity.onNewIntent: engine already running; game=${pendingGameName ?: "?"} dir=${pendingGameDir ?: "?"}",
+            "KrkrGameActivity.onNewIntent: engine already running; game=${pendingGameName ?: "?"} dir=${pendingGameDir ?: "?"} fps=${pendingFrameRate ?: "?"} scaling=${pendingScaling ?: "?"} preload=${pendingPreloadArchives ?: "?"}",
         )
     }
 
-    override fun onDestroy() {
-        pendingGameDir = null
-        pendingGameName = null
-        super.onDestroy()
+    /**
+     * Copies the launcher's saved runtime settings onto the static fields the
+     * native side reads. Must run before `super.onCreate` enters `android_main`.
+     */
+    private fun publishRuntimeSettings() {
+        val settings = RuntimeSettingsStore(this).read()
+        pendingFrameRate = settings.frameRate
+        pendingScaling = settings.scaling
+        pendingPreloadArchives = settings.preloadArchives
     }
 }

@@ -1,0 +1,710 @@
+//! Integration tests for the game storage namespace (`Storage`).
+//!
+//! Relocated from the inline `#[cfg(test)]` module in `src/storage.rs`. The
+//! synthetic XP3 builder lives in the `testkit` dev crate; the
+//! in-memory file-system helpers live in `tests/common/mod.rs`.
+
+use std::path::{Path, PathBuf};
+
+use engine::storage::{ATTR_DIRECTORY, ATTR_NORMAL, MountOptions};
+use engine::{Location, Storage, normalize_in_archive_name};
+use testkit::build_xp3;
+
+mod common;
+use common::{memory_with, mount_memory, mount_memory_with_archives};
+
+#[test]
+fn normalize_matches_reference() {
+    assert_eq!(
+        normalize_in_archive_name(r"Data\BG\Title.jpg"),
+        "data/bg/title.jpg"
+    );
+    assert_eq!(
+        normalize_in_archive_name("Data//BG//title.jpg"),
+        "data/bg/title.jpg"
+    );
+    assert_eq!(normalize_in_archive_name("/leading"), "leading");
+}
+
+#[test]
+fn discover_archives_orders_by_name_then_shallower_last() {
+    let fs = memory_with(&[
+        ("game/data.xp3", b""),
+        ("game/patch.xp3", b""),
+        ("game/sub/extra.xp3", b""),
+        ("game/sub/patch.xp3", b""),
+        ("game/readme.txt", b""),
+        ("game/UPPER.XP3", b""),
+    ]);
+    let found = engine::storage::discover_archives(&fs, Path::new("/game")).expect("discover");
+    let names: Vec<String> = found
+        .iter()
+        .map(|path| {
+            path.strip_prefix("/game")
+                .unwrap_or(path)
+                .display()
+                .to_string()
+        })
+        .collect();
+    // Name (case-insensitive) is the primary key; among equal names the
+    // shallower path sorts last (and therefore mounts last and wins). So
+    // `patch.xp3` overrides `data.xp3`, and the root `patch.xp3` overrides
+    // `sub/patch.xp3`; a non-`.xp3` file is ignored.
+    assert_eq!(
+        names,
+        [
+            "data.xp3",
+            "sub/extra.xp3",
+            "sub/patch.xp3",
+            "patch.xp3",
+            "UPPER.XP3",
+        ]
+    );
+}
+
+#[test]
+fn discover_archives_orders_numbered_patches_naturally() {
+    let fs = memory_with(&[
+        ("game/data.xp3", b""),
+        ("game/patch@r785.xp3", b""),
+        ("game/patch@r996.xp3", b""),
+        ("game/patch@r1031.xp3", b""),
+        ("game/patch@r1071.xp3", b""),
+        ("game/patch_append5.xp3", b""),
+        ("game/patch_append10.xp3", b""),
+    ]);
+    let found = engine::storage::discover_archives(&fs, Path::new("/game")).expect("discover");
+    let names: Vec<String> = found
+        .iter()
+        .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    // Embedded decimal runs are compared by value, so the highest revision and
+    // the highest append number mount last and win.
+    // Reference: the game adds its numbered patch archives through
+    // `Storages.addAutoPath` and documents "later-added wins"
+    // (`reference/cpp/core/base/StorageIntf.cpp:921-937`); the vendored
+    // directory listing order is not defined, so this is the D35 discovery
+    // extension's own natural order.
+    assert_eq!(
+        names,
+        [
+            "data.xp3",
+            "patch@r785.xp3",
+            "patch@r996.xp3",
+            "patch@r1031.xp3",
+            "patch@r1071.xp3",
+            "patch_append5.xp3",
+            "patch_append10.xp3",
+        ]
+    );
+}
+
+#[test]
+fn disk_wins_over_archive() {
+    let xp3 = build_xp3(&[("data/winner.txt", b"from archive", false)]);
+    let storage = mount_memory_with_archives(
+        &[("data.xp3", &xp3), ("data/winner.txt", b"from disk")],
+        &["data.xp3"],
+    );
+
+    assert_eq!(
+        storage.find("data/winner.txt").unwrap(),
+        Some(Location::Disk(PathBuf::from("/data/winner.txt")))
+    );
+    assert_eq!(storage.read("data/winner.txt").unwrap(), b"from disk");
+}
+
+#[test]
+fn archive_is_used_when_no_disk_file() {
+    let xp3 = build_xp3(&[
+        ("data/inside.txt", b"hello from archive", false),
+        ("data/other.txt", b"other", false),
+    ]);
+    let storage = mount_memory_with_archives(&[("data.xp3", &xp3)], &["data.xp3"]);
+
+    assert_eq!(
+        storage.find("data/inside.txt").unwrap(),
+        Some(Location::Archive(
+            PathBuf::from("/data.xp3"),
+            "data/inside.txt".into()
+        ))
+    );
+    assert_eq!(
+        storage.read("data/inside.txt").unwrap(),
+        b"hello from archive"
+    );
+    assert!(storage.exists("data/inside.txt").unwrap());
+    assert_eq!(storage.stat("data/inside.txt").unwrap().unwrap().size, 18);
+}
+
+#[test]
+fn arc_xp3_path_targets_one_archive() {
+    let a = build_xp3(&[("shared.txt", b"from a", false)]);
+    let b = build_xp3(&[("shared.txt", b"from b", false)]);
+    let storage = mount_memory_with_archives(&[("a.xp3", &a), ("b.xp3", &b)], &["a.xp3", "b.xp3"]);
+
+    assert_eq!(
+        storage.read("a.xp3>shared.txt").unwrap(),
+        b"from a".to_vec()
+    );
+    assert_eq!(
+        storage.read("b.xp3>shared.txt").unwrap(),
+        b"from b".to_vec()
+    );
+    // A specific archive miss does not fall through to the other archive.
+    assert!(!storage.exists("a.xp3>missing.txt").unwrap());
+}
+
+#[test]
+fn mixed_case_disk_name_resolves() {
+    let storage = mount_memory(&[("savedata/savemng.dat", b"save data")]);
+    for name in ["savedata/saveMng.dat", "SAVEDATA/SAVEMNG.DAT"] {
+        assert!(
+            storage.find(name).unwrap().is_some(),
+            "{name} must resolve case-insensitively"
+        );
+        assert_eq!(storage.read(name).unwrap(), b"save data");
+    }
+}
+
+#[test]
+fn traversal_does_not_resolve() {
+    let storage = mount_memory(&[("escape.dat", b"in")]);
+    assert!(storage.find("../escape.dat").unwrap().is_none());
+    assert!(storage.find("savedata/../../escape.dat").unwrap().is_none());
+    assert!(!storage.exists("/outside.dat").unwrap());
+}
+
+#[test]
+fn lowercase_canonical_wins_over_exact_case_variant() {
+    let storage = mount_memory(&[
+        ("savedata/savemng.dat", b"canonical"),
+        ("savedata/saveMng.dat", b"stray"),
+    ]);
+    assert_eq!(storage.read("savedata/saveMng.dat").unwrap(), b"canonical");
+}
+
+#[test]
+fn archive_reads_raw_and_zlib_segments() {
+    let xp3 = build_xp3(&[
+        ("plain.bin", b"raw bytes", false),
+        ("packed.bin", b"zlib compressed payload", true),
+    ]);
+    let storage = mount_memory_with_archives(&[("packed.xp3", &xp3)], &["packed.xp3"]);
+
+    assert_eq!(storage.read("plain.bin").unwrap(), b"raw bytes");
+    assert_eq!(
+        storage.read("packed.bin").unwrap(),
+        b"zlib compressed payload"
+    );
+}
+
+#[test]
+fn mount_and_unmount_archive() {
+    let a = build_xp3(&[("only/a.txt", b"a", false)]);
+    let mut storage = mount_memory_with_archives(&[("a.xp3", &a)], &["a.xp3"]);
+    assert_eq!(storage.archive_count(), 1);
+    assert!(storage.exists("only/a.txt").unwrap());
+
+    assert!(storage.unmount_archive("a.xp3"));
+    assert_eq!(storage.archive_count(), 0);
+    assert!(!storage.exists("only/a.txt").unwrap());
+}
+
+#[test]
+fn list_merges_disk_and_archives() {
+    let xp3 = build_xp3(&[
+        ("assets/arc_only.dat", b"arc", false),
+        ("assets/sub/nested.dat", b"nested", false),
+    ]);
+    let storage = mount_memory_with_archives(
+        &[("data.xp3", &xp3), ("assets/disk_only.dat", b"disk")],
+        &["data.xp3"],
+    );
+
+    let listed = storage.list("assets").unwrap();
+    assert_eq!(
+        listed,
+        vec![
+            "assets/arc_only.dat".to_string(),
+            "assets/disk_only.dat".to_string(),
+            "assets/sub/".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn file_list_wildcards_and_attrs() {
+    let xp3 = build_xp3(&[("scripts/arc.tjs", b"x", false)]);
+    let storage = mount_memory_with_archives(
+        &[
+            ("data.xp3", &xp3),
+            ("scripts/disk.tjs", b"y"),
+            ("scripts/sub/nested.tjs", b"n"),
+            ("scripts/readme.txt", b"z"),
+        ],
+        &["data.xp3"],
+    );
+
+    let mut tjs = storage.file_list("scripts/*.tjs", ATTR_NORMAL).unwrap();
+    tjs.sort();
+    assert_eq!(
+        tjs,
+        vec![
+            "data.xp3>scripts/arc.tjs".to_string(),
+            "scripts/disk.tjs".to_string(),
+            "scripts/sub/nested.tjs".to_string(),
+        ]
+    );
+
+    let dirs = storage.file_list("scripts/", ATTR_DIRECTORY).unwrap();
+    assert!(dirs.contains(&"scripts/sub/".to_string()), "{dirs:?}");
+
+    let arc_entries = storage.file_list("*.xp3>scripts/*.tjs", 0).unwrap();
+    assert!(
+        arc_entries.contains(&"data.xp3>scripts/arc.tjs".to_string()),
+        "{arc_entries:?}"
+    );
+}
+
+#[test]
+fn auto_path_resolves_base_name() {
+    let xp3 = build_xp3(&[("config.tjs", b"cfg", false)]);
+    let mut storage = mount_memory_with_archives(&[("data.xp3", &xp3)], &["data.xp3"]);
+    storage.add_auto_path("data.xp3>");
+
+    assert_eq!(
+        storage.find("config.tjs").unwrap(),
+        Some(Location::Archive(
+            PathBuf::from("/data.xp3"),
+            "config.tjs".into()
+        ))
+    );
+}
+
+/// A large-but-valid archive entry still reads end-to-end: no size cap is
+/// imposed, only genuine overflow/invalid data is rejected.
+#[test]
+fn reads_a_large_but_valid_archive_entry() {
+    let payload: Vec<u8> = (0..2 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+    let xp3 = build_xp3(&[("data/large.bin", &payload, true)]);
+    let storage = mount_memory_with_archives(&[("data.xp3", &xp3)], &["data.xp3"]);
+
+    let read = storage.read("data/large.bin").unwrap();
+    assert_eq!(read.len(), payload.len());
+    assert_eq!(read, payload);
+}
+
+/// Precedence: later-mounted archives override earlier ones, so
+/// `--archive data.xp3 --archive patch.xp3` lets `patch.xp3` win.
+#[test]
+fn later_mounted_archive_wins() {
+    let data = build_xp3(&[("shared.txt", b"from data", false)]);
+    let patch = build_xp3(&[("shared.txt", b"from patch", false)]);
+    let files = [
+        ("data.xp3", data.as_slice()),
+        ("patch.xp3", patch.as_slice()),
+    ];
+
+    let storage = mount_memory_with_archives(&files, &["data.xp3", "patch.xp3"]);
+    assert_eq!(storage.read("shared.txt").unwrap(), b"from patch");
+    assert_eq!(
+        storage.find("shared.txt").unwrap(),
+        Some(Location::Archive(
+            PathBuf::from("/patch.xp3"),
+            "shared.txt".into()
+        ))
+    );
+
+    let storage = mount_memory_with_archives(&files, &["patch.xp3", "data.xp3"]);
+    assert_eq!(storage.read("shared.txt").unwrap(), b"from data");
+}
+
+/// The base directory is the app path for disk assets **and** the root a
+/// relative archive path resolves against, so `--base-dir /game` finds
+/// `/game/data.xp3` whatever the process working directory is.
+///
+/// Reference: the app path is a single directory used for both archive lookup
+/// and loose assets (`TVPGetAppPath`,
+/// `reference/cpp/core/base/impl/StorageImpl.cpp:505`).
+#[test]
+fn archive_resolves_relative_to_base_dir() {
+    let xp3 = build_xp3(&[("startup.tjs", b"// startup", false)]);
+    let fs = memory_with(&[("game/data.xp3", &xp3)]);
+    let storage = Storage::mount_archives(fs, "/game", ["data.xp3"]).expect("mount");
+
+    assert_eq!(storage.archive_count(), 1);
+    assert!(storage.exists("startup.tjs").unwrap());
+}
+
+/// Mounting never enumerates the game directory: an archive present on disk
+/// is ignored until the caller names it explicitly. The reference has no
+/// `*.xp3` folder scan either — `TVPCheckStartupArg` only inspects `argv[1]`
+/// (`reference/cpp/core/environ/win32/Platform.cpp:93`).
+#[test]
+fn mounting_does_not_scan_for_archives() {
+    let xp3 = build_xp3(&[("inside.txt", b"archive", false)]);
+    let storage = mount_memory(&[("data.xp3", &xp3)]);
+
+    assert_eq!(storage.archive_count(), 0);
+    assert!(!storage.exists("inside.txt").unwrap());
+}
+
+/// `find` is file-only, but `exists` reports directories as existing, matching
+/// `TVPIsExistentStorage` (review 1.10).
+#[test]
+fn directories_exist_but_do_not_find() {
+    let storage = mount_memory(&[("savedata/keep.dat", b"x")]);
+
+    assert_eq!(storage.find("savedata").unwrap(), None);
+    assert!(storage.exists("savedata").unwrap());
+    assert!(storage.exists("SAVEDATA").unwrap());
+    assert!(!storage.exists("missing-dir").unwrap());
+}
+
+/// Unmounting by a bare name must not remove every archive that shares it, and
+/// an exact path removes exactly one archive (review 1.6).
+#[test]
+fn unmount_archive_does_not_remove_same_named_archives() {
+    let a = build_xp3(&[("a.bin", b"a", false)]);
+    let b = build_xp3(&[("b.bin", b"b", false)]);
+    let mut storage = mount_memory_with_archives(
+        &[("one/data.xp3", &a), ("two/data.xp3", &b)],
+        &["one/data.xp3", "two/data.xp3"],
+    );
+    assert_eq!(storage.archive_count(), 2);
+
+    // Ambiguous bare base name: nothing is removed.
+    assert!(!storage.unmount_archive("data.xp3"));
+    assert_eq!(storage.archive_count(), 2);
+
+    // Exact path removes only that archive.
+    assert!(storage.unmount_archive("two/data.xp3"));
+    assert_eq!(storage.archive_count(), 1);
+    assert!(storage.exists("a.bin").unwrap());
+    assert!(!storage.exists("b.bin").unwrap());
+}
+
+/// `Storage` owns the XP3 extraction filter and hands it to every archive
+/// read; installing and clearing it changes the bytes a `read` returns while
+/// `find`/`stat` stay filter-free.
+#[test]
+fn xp3_extraction_filter_decrypts_archive_reads() {
+    use std::cell::RefCell;
+
+    let key = 0x5Au8;
+    let plain = b"decrypted archive payload".to_vec();
+    let cipher: Vec<u8> = plain.iter().map(|byte| byte ^ key).collect();
+    let xp3 = build_xp3(&[("secret.bin", &cipher, false)]);
+    let mut storage = mount_memory_with_archives(&[("data.xp3", &xp3)], &["data.xp3"]);
+
+    // No filter: the stored bytes come back unchanged.
+    assert_eq!(storage.read("secret.bin").unwrap(), cipher);
+
+    let seen = std::rc::Rc::new(RefCell::new(Vec::new()));
+    let seen_in_filter = std::rc::Rc::clone(&seen);
+    storage.xp3_extraction_filter = Some(Box::new(
+        move |file_hash: u32,
+              offset: u64,
+              buffer: &mut [u8],
+              file_name: &str,
+              archive_name: &str,
+              file_size: u64| {
+            seen_in_filter.borrow_mut().push((
+                file_hash,
+                offset,
+                file_name.to_string(),
+                archive_name.to_string(),
+                file_size,
+            ));
+            for byte in buffer.iter_mut() {
+                *byte ^= key;
+            }
+        },
+    ));
+
+    assert_eq!(storage.read("secret.bin").unwrap(), plain);
+    let seen = seen.borrow();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].0, 0, "build_xp3 writes a zero adlr hash");
+    assert_eq!(seen[0].1, 0);
+    assert_eq!(seen[0].2, "secret.bin");
+    assert_eq!(seen[0].3, "data.xp3");
+    assert_eq!(seen[0].4, plain.len() as u64);
+    drop(seen);
+
+    // Metadata is read from the index and is unaffected by the filter.
+    assert_eq!(
+        storage.stat("secret.bin").unwrap().unwrap().size,
+        plain.len() as u64
+    );
+
+    // Clearing the filter restores the raw read.
+    storage.xp3_extraction_filter = None;
+    assert_eq!(storage.read("secret.bin").unwrap(), cipher);
+}
+
+/// The extraction filter receives the **normalized** in-archive name: the
+/// archive is opened with `normalizeName=true`, so `Owner->GetName` returns the
+/// name `Init` normalized.
+// Reference: `reference/cpp/core/archive/xp3/XP3Archive.cpp:435-437`
+// (`NormalizeInArchiveStorageName(item.Name)`) and `:996-1002`
+// (`tTVPXP3ExtractionFilterInfo(..., Owner->GetName(StorageIndex))`).
+#[test]
+fn xp3_extraction_filter_receives_the_normalized_name() {
+    use std::cell::RefCell;
+
+    let xp3 = build_xp3(&[(r"Bg\Title.JPG", b"payload", false)]);
+    let mut storage = mount_memory_with_archives(&[("data.xp3", &xp3)], &["data.xp3"]);
+
+    let seen = std::rc::Rc::new(RefCell::new(String::new()));
+    let seen_in_filter = std::rc::Rc::clone(&seen);
+    storage.xp3_extraction_filter = Some(Box::new(
+        move |_hash: u32,
+              _offset: u64,
+              _buffer: &mut [u8],
+              file_name: &str,
+              _archive_name: &str,
+              _file_size: u64| {
+            *seen_in_filter.borrow_mut() = file_name.to_string();
+        },
+    ));
+
+    assert_eq!(storage.read(r"Bg\Title.JPG").unwrap(), b"payload");
+    assert_eq!(&*seen.borrow(), "bg/title.jpg");
+}
+
+/// One unreadable archive in a scanned list is skipped with a warning so the
+/// rest of the game still mounts.
+// Reference: the app-path probe `TVPCheckArchive` catches `eTJSError`, logs,
+// and reports "not archive" (`reference/cpp/core/base/impl/StorageImpl.cpp:562-587`).
+#[test]
+fn mount_discovered_archives_skips_a_bad_archive() {
+    let good = build_xp3(&[("keep.bin", b"keep", false)]);
+    let fs = memory_with(&[("game/good.xp3", &good), ("game/bad.xp3", b"nope")]);
+
+    let storage =
+        Storage::mount_discovered_archives(fs, "/game", ["good.xp3", "bad.xp3"]).expect("mount");
+    assert_eq!(storage.archive_count(), 1);
+    assert!(storage.exists("keep.bin").unwrap());
+}
+
+/// An explicitly requested archive that cannot be parsed is a typed error.
+#[test]
+fn mount_archives_reports_a_typed_error() {
+    let good = build_xp3(&[("keep.bin", b"keep", false)]);
+    let fs = memory_with(&[("game/good.xp3", &good), ("game/bad.xp3", b"nope")]);
+
+    assert!(matches!(
+        Storage::mount_archives(fs, "/game", ["good.xp3", "bad.xp3"]),
+        Err(engine::storage::MountError::Xp3(_))
+    ));
+}
+
+/// `Storage::mount_archive` (the single-archive call) still surfaces the parse
+/// error as a typed value.
+#[test]
+fn mount_archive_still_reports_a_typed_error() {
+    let fs = memory_with(&[("bad.xp3", b"nope")]);
+    let mut storage =
+        Storage::mount_archives(fs, "/", std::iter::empty::<&str>()).expect("empty mount");
+    assert!(matches!(
+        storage.mount_archive("bad.xp3"),
+        Err(engine::storage::MountError::Xp3(_))
+    ));
+}
+
+/// Auto paths are searched in "later added wins" order, so a folder added
+/// after an archive overrides the archive entry.
+// Reference: `TVPGetPlacedPath` checks the current path and then the auto-path
+// table (`reference/cpp/core/base/StorageIntf.cpp:1061-1108`); the shipped
+// `system/initialize.tjs` adds `patch.xp3>` before `parts/` and documents
+// "later-added wins".
+#[test]
+fn later_added_auto_path_wins_over_a_mounted_archive() {
+    let patch = build_xp3(&[("foo.png", b"from patch", false)]);
+    let mut storage = mount_memory_with_archives(
+        &[("patch.xp3", &patch), ("parts/foo.png", b"from parts")],
+        &["patch.xp3"],
+    );
+    storage.add_auto_path("patch.xp3>");
+    storage.add_auto_path("parts/");
+
+    assert_eq!(storage.read("foo.png").unwrap(), b"from parts");
+    assert_eq!(
+        storage.find("foo.png").unwrap(),
+        Some(Location::Disk(PathBuf::from("/parts/foo.png")))
+    );
+}
+
+/// An archive named by an auto path or by explicit `arc.xp3>` addressing is
+/// opened on demand even when it was never mounted.
+// Reference: `TVPArchiveCache::Get` opens the archive named in the path when it
+// exists (`reference/cpp/core/base/StorageIntf.cpp:704-724`);
+// `TVPIsExistentStorageNoSearchNoNormalize` resolves the in-archive lookup
+// through the same cache (`:737-764`).
+#[test]
+fn archive_is_opened_on_demand() {
+    let extra = build_xp3(&[("config.tjs", b"cfg", false)]);
+    let mut storage = mount_memory(&[("extra.xp3", &extra)]);
+    storage.add_auto_path("extra.xp3>");
+
+    assert_eq!(storage.read("config.tjs").unwrap(), b"cfg");
+    assert_eq!(
+        storage.find("config.tjs").unwrap(),
+        Some(Location::Archive(
+            PathBuf::from("/extra.xp3"),
+            "config.tjs".into()
+        ))
+    );
+    // Explicit addressing opens the same on-disk archive too.
+    assert_eq!(storage.read("extra.xp3>config.tjs").unwrap(), b"cfg");
+}
+
+/// With `preload_archives` set the whole archive image is held in memory, but
+/// every entry must read exactly the bytes the streaming path returns. This is
+/// the correctness question for preloading: an off-by-one in the index or a
+/// partial read would otherwise surface much later as a corrupt asset.
+///
+/// Reference: both paths run the same whole-entry read, which concatenates the
+/// segments and inflates zlib ones (`tTVPXP3ArchiveStream::Read`,
+/// `reference/cpp/core/archive/xp3/XP3Archive.cpp:996-1002`); preloading only
+/// changes where the bytes come from.
+#[test]
+fn preloaded_archive_reads_match_the_streaming_path() {
+    let payload: Vec<u8> = (0..96 * 1024).map(|i| (i % 251) as u8).collect();
+    let xp3 = build_xp3(&[
+        ("data/raw.bin", &payload, false),
+        ("data/packed.bin", &payload, true),
+        ("small.txt", b"hello", false),
+    ]);
+    let files = [("data.xp3", xp3.as_slice())];
+
+    let streaming = mount_memory_with_archives(&files, &["data.xp3"]);
+    let fs = memory_with(&files);
+    let preloaded = Storage::mount_archives_with(
+        fs,
+        "/",
+        ["data.xp3"],
+        MountOptions {
+            preload_archives: true,
+        },
+    )
+    .expect("mount preloaded");
+
+    for name in ["data/raw.bin", "data/packed.bin", "small.txt"] {
+        assert_eq!(
+            streaming.read(name).unwrap(),
+            preloaded.read(name).unwrap(),
+            "{name} differs between the streaming and preloaded paths"
+        );
+    }
+    assert_eq!(preloaded.read("data/packed.bin").unwrap(), payload);
+}
+
+/// The `xp3filter` extraction seam rewrites decoded segments in place for a
+/// preloaded archive exactly as it does for a streaming one.
+#[test]
+fn preloading_preserves_the_extraction_filter() {
+    let key = 0x5Au8;
+    let plain = b"decrypted archive payload".to_vec();
+    let cipher: Vec<u8> = plain.iter().map(|byte| byte ^ key).collect();
+    let xp3 = build_xp3(&[("secret.bin", &cipher, false)]);
+    let files = [("data.xp3", xp3.as_slice())];
+
+    let mut streaming = mount_memory_with_archives(&files, &["data.xp3"]);
+    streaming.xp3_extraction_filter = Some(Box::new(
+        move |_hash: u32,
+              _offset: u64,
+              buffer: &mut [u8],
+              _name: &str,
+              _archive: &str,
+              _size: u64| {
+            for byte in buffer.iter_mut() {
+                *byte ^= key;
+            }
+        },
+    ));
+
+    let fs = memory_with(&files);
+    let mut preloaded = Storage::mount_archives_with(
+        fs,
+        "/",
+        ["data.xp3"],
+        MountOptions {
+            preload_archives: true,
+        },
+    )
+    .expect("mount preloaded");
+    preloaded.xp3_extraction_filter = Some(Box::new(
+        move |_hash: u32,
+              _offset: u64,
+              buffer: &mut [u8],
+              _name: &str,
+              _archive: &str,
+              _size: u64| {
+            for byte in buffer.iter_mut() {
+                *byte ^= key;
+            }
+        },
+    ));
+
+    assert_eq!(streaming.read("secret.bin").unwrap(), plain);
+    assert_eq!(preloaded.read("secret.bin").unwrap(), plain);
+}
+
+/// Preloading does not change mount precedence: the later-mounted archive
+/// still wins, and resolution still reports the winning archive.
+#[test]
+fn preloading_does_not_change_mount_precedence() {
+    let data = build_xp3(&[("shared.txt", b"from data", false)]);
+    let patch = build_xp3(&[("shared.txt", b"from patch", false)]);
+    let files = [
+        ("data.xp3", data.as_slice()),
+        ("patch.xp3", patch.as_slice()),
+    ];
+
+    let fs = memory_with(&files);
+    let storage = Storage::mount_archives_with(
+        fs,
+        "/",
+        ["data.xp3", "patch.xp3"],
+        MountOptions {
+            preload_archives: true,
+        },
+    )
+    .expect("mount");
+
+    assert_eq!(storage.read("shared.txt").unwrap(), b"from patch");
+    assert_eq!(
+        storage.find("shared.txt").unwrap(),
+        Some(Location::Archive(
+            PathBuf::from("/patch.xp3"),
+            "shared.txt".into()
+        ))
+    );
+}
+
+/// Reading an entry out of an in-memory image is bounds-checked: an image too
+/// short for a segment is a typed corruption error, not an opaque EOF.
+#[test]
+fn reading_an_in_memory_image_rejects_an_overrunning_segment() {
+    let xp3 = build_xp3(&[("data/a.bin", b"payload", false)]);
+    let fs = memory_with(&[("data.xp3", &xp3)]);
+    let file = fs::open(
+        &fs,
+        &api::fs::FsPath::host("/data.xp3"),
+        api::fs::OpenMode::Read,
+    )
+    .expect("open archive");
+    let archive = fs::xp3::Xp3Archive::open(&fs, &file).expect("parse archive");
+    let entry = archive.entry("data/a.bin").cloned().expect("entry");
+
+    let err = archive
+        .read_entry_from_bytes(&[], &entry, "data.xp3", None)
+        .expect_err("segment overruns an empty image");
+    assert!(
+        matches!(err, fs::xp3::Xp3Error::CorruptIndex(_)),
+        "unexpected error: {err:?}"
+    );
+}

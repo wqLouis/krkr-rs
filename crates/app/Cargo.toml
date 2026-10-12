@@ -1,28 +1,43 @@
 [package]
-name = "krkr-app"
-description = "krkr-rs CLI + native wiring: registers TVP native classes, loads games"
+name = "app"
+description = "krkr-rs host: L2 engine host + L1 render assembly (platform loop in platform)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "krkr-cli"
+name = "krkr"
 path = "src/main.rs"
 
-[features]
-default = ["ffmpeg"]
-# Pass-through so `--no-default-features` also drops the tvp-natives FFmpeg
-# movie decoder (e.g. Android).
-ffmpeg = ["tvp-natives/ffmpeg"]
-
 [dependencies]
-engine = { path = "../engine" }
-tjs2-sys = { workspace = true }
-tvp-natives = { path = "../tvp-natives", default-features = false }
-tvp-input = { path = "../tvp-input" }
-tvp-storages = { path = "../tvp-storages" }
-tvp-kagparser = { path = "../tvp-kagparser" }
-tvp-scripts = { path = "../tvp-scripts" }
-tvp-visual = { path = "../tvp-visual" }
-tvp-sound = { path = "../tvp-sound" }
-log = "0.4"
+api = { workspace = true }
+engine = { workspace = true }
+render = { workspace = true }
+fs = { workspace = true }
+raw-window-handle = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+# The composition root owns the process logger (`RUST_LOG`, default `info`).
+env_logger = { workspace = true }
+# The composition root installs the L3 compat host seams (image codec, etc.).
+compat = { workspace = true }
+# The composition root also drives the L4 VM host (boot + frame body).
+vm = { workspace = true }
+
+# The window/audio and video backends are selected per target so a desktop
+# backend can never leak into an Android build (and vice versa). `platform`
+# has no default feature; `media` defaults to FFmpeg on the desktop and the
+# Android build turns that default off for MediaCodec.
+[target.'cfg(target_os = "linux")'.dependencies]
+platform = { workspace = true, features = ["platform-linux"] }
+media = { workspace = true, features = ["video-ffmpeg"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+platform = { workspace = true, features = ["platform-android"] }
+# Named by path rather than `workspace = true`: edition 2024 forbids a member
+# from turning off default features inherited from the workspace, and the
+# Android arm must drop FFmpeg for MediaCodec.
+media = { path = "../platform/media", default-features = false, features = ["video-mediacodec"] }
+
+[dev-dependencies]
+tjs = { workspace = true }

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="icon.png" alt="krkr-rs" width="180">
+  <img src="icons/ic_launcher_foreground%20%C2%B7%20108%20%C3%97%20108%20%C2%B7%20transparent.svg" alt="krkr-rs" width="180">
 </p>
 
 <h1 align="center">krkr-rs</h1>
@@ -17,10 +17,11 @@
 
 **krkr-rs** is a native Rust reimplementation of the KiriKiri2 (TVP) engine, built to run games based on KiriKiri2 on Linux and Android.
 
-By replacing the original C++/OpenGL/Cocos2dx framework with **Bevy** and **Vulkan**, it brings a modern rendering pipeline to Linux and Android while preserving engine compatibility.
+By replacing the original C++/OpenGL/Cocos2dx framework with a **pure Rust + Vulkan** engine, it brings a modern rendering pipeline to Linux and Android while preserving engine compatibility.
 
 * **Original TJS2 VM:** Uses the upstream C++ TJS2 virtual machine via a thin Rust FFI wrapper to ensure unmodified scripts and save files work seamlessly.
 * **Rust Core:** Reimplementations for archive handling, TLG5/TLG6 image decoding, custom blend modes, font rasterization, Ogg/Opus audio, and KAG scenario tags.
+* **Native Vulkan Renderer:** A Rust rendering engine built directly on Vulkan (`ash` + `ash-window`). Text is rasterized on the CPU into the layer bitmap.
 * **Video Playback:** Handled via FFmpeg on desktop Linux and native `MediaCodec` on Android.
 * **Android Frontend:** Includes a native Kotlin/Material 3 launcher using the system file picker (`arm64-v8a`).
 
@@ -31,10 +32,10 @@ By replacing the original C++/OpenGL/Cocos2dx framework with **Bevy** and **Vulk
 cargo build
 
 # Run a game
-./target/debug/krkr-rs run "/path/to/game"
+./target/debug/krkr --base-dir "/path/to/game"
 
 # Headless smoke test
-./target/debug/krkr-rs run "/path/to/game" --headless
+./target/debug/krkr --headless --frames 1000 --base-dir "/path/to/game"
 
 ```
 

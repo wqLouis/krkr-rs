@@ -1,12 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Adaptive launcher icon (API 26+). The foreground is the logo from the
-  repository's `icon.png`, scaled into the 72dp safe zone of the 108dp canvas;
-  the background is a flat colour.
+  Adaptive launcher icon (API 26+). The foreground layer is
+  `icons/ic_launcher_foreground · 108 × 108 · transparent.svg`, rendered 1:1
+  into the 108dp canvas at each density as
+  mipmap-<density>/ic_launcher_foreground.png; its artwork already sits inside
+  the 72dp safe circle. The background layer comes from
+  `icons/ic_launcher_background · 108 × 108.svg`, a single flat rectangle of
+  #123E42, so it is stored as the colour below rather than as an image.
 
-  The logo has a transparent background and is predominantly blue, so the
-  background is kept light for contrast — change `ic_launcher_background` in
-  `values/colors.xml` to re-tint it, no image regeneration needed.
+  Change `ic_launcher_background` in `values/colors.xml` to re-tint the icon,
+  no image regeneration needed.
 -->
 <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
     <background android:drawable="@color/ic_launcher_background" />

@@ -1,201 +1,334 @@
-//! Android entry point for the krkr-rs engine.
+//! krkr-rs Android composition root.
 //!
-//! This crate is a `cdylib` loaded by the launcher's `KrkrGameActivity`
-//! (declared through `android.app.lib_name` in the manifest). It does exactly
-//! what the desktop binary's `run` subcommand does — take a game directory and
-//! run it — with the Android UI living entirely in Kotlin around it
-//! (`docs/android.md`). The engine itself knows nothing about Android: the
-//! command-line runner and this entry point build the *same* Bevy app through
-//! `krkr_render::runner`.
+//! `crates/app` is the desktop composition root and must not branch on the
+//! operating system, and `platform` is L1: it may not call up into the
+//! emulator. The OS entry point is therefore its own crate per host. This
+//! crate owns `android_main`, the `GameActivity` event loop and the JNI reads
+//! that hand the launcher's choice to the shared host; it contains no engine
+//! logic. The desktop binary (`krkr`) and this library drive the same
+//! `app::Host` and `app::GameHost` through the same `platform::EventHandler`.
 //!
-//! ## How the game directory arrives
+//! Two Android-specific rules live here rather than in the shared host:
 //!
-//! The user picks a folder in the Material 3 launcher, which starts this
-//! Activity with the resolved path; `KrkrGameActivity` publishes it as a static
-//! field **before** calling `super.onCreate`, because that call is what loads
-//! this library and enters [`main`]. Reading it here through JNI is therefore
-//! race-free by construction — the value is written before the library can run.
+//! * **The loop.** `platform::run` is a desktop (winit) driver; the Android
+//!   driver is `android-activity`, whose lifecycle and input arrive on the
+//!   `android_main` thread. [`host::run_loop`] normalizes those callbacks into
+//!   the same `PlatformEvent`s the winit backend emits.
+//! * **The presentation default.** Phones always present the scene scaled
+//!   uniformly to fit the screen, with the remainder letterboxed
+//!   (`ScalingMode::Fit`), instead of showing the raw logical size. The
+//!   desktop default stays `Game`, the reference's one-to-one Win32
+//!   presentation; the user's saved scaling setting overrides either. See
+//!   `docs/android.md` §2.2 and §3.2.
 //!
-//! That is deliberately the *only* JNI in the engine. Everything else — input,
-//! rendering, audio, storage — goes through the same platform-neutral code the
-//! desktop build uses.
-//!
-//! ## Failure is observable
-//!
-//! The same mechanism passes `KrkrGameActivity.pendingStateDir` (the app's
-//! `filesDir`). Native code uses it for two files the launcher can read:
-//! `krkr_state.json`, the startup-state file written by `engine::state`, and
-//! `krkr.log`, the capped log file written by `engine::logging` (see those
-//! modules for the exact shapes). A startup failure writes `failed` with the
-//! real error and terminates the process; a crash leaves `starting`/`running`
-//! behind because a process killed in native code cannot report anything
-//! itself. Either way the launcher regains control instead of showing an
-//! unexplained black surface.
-#![cfg(target_os = "android")]
+//! The state-file writer ([`state`]), the log-file sink ([`log_file`]) and the
+//! touch→mouse synthesizer ([`gesture`]) are plain `std` and name no Android
+//! type, so the host test target compiles and exercises them; the Android-only
+//! modules are target-gated.
 
-use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+#![deny(unsafe_code)]
+#![warn(missing_docs)]
 
-use bevy::prelude::*;
-use krkr_render::sync::SharedScene;
-use tvp_visual::scene::Scene;
+#[cfg(any(target_os = "android", test))]
+mod config;
+#[cfg(any(target_os = "android", test))]
+mod gesture;
+#[cfg(target_os = "android")]
+mod host;
+#[cfg(target_os = "android")]
+mod input;
+#[cfg(target_os = "android")]
+#[allow(unsafe_code)]
+mod jni_fields;
+#[cfg(any(target_os = "android", test))]
+mod log_file;
+#[cfg(any(target_os = "android", test))]
+mod state;
 
-/// Static field on `dev.krkr.rs.KrkrGameActivity` holding the chosen folder.
-const FIELD_GAME_DIR: &str = "pendingGameDir";
-/// JNI signature of [`FIELD_GAME_DIR`].
-const SIG_GAME_DIR: &str = "Ljava/lang/String;";
-/// Static field on the same class holding the folder's display name (logging).
-const FIELD_GAME_NAME: &str = "pendingGameName";
-/// Static field on the same class holding the app's `filesDir`, where the
-/// state file (`krkr_state.json`) and log file (`krkr.log`) live.
-const FIELD_STATE_DIR: &str = "pendingStateDir";
+#[cfg(target_os = "android")]
+mod android_entry {
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+    use std::time::Duration;
 
-/// The Android entry point.
-///
-/// `#[bevy_main]` expands to an `android_main` that stores the `AndroidApp` in
-/// `bevy::android::ANDROID_APP` and then calls this function, so the app
-/// handle is available here without any plumbing of our own.
-#[bevy_main]
-fn main() {
-    // The state directory must be known before logging starts: the log file
-    // lives in it. It is read through the same JNI helper as the game dir and
-    // is likewise written before `super.onCreate`.
-    if let Some(state_dir) = activity_static_string(FIELD_STATE_DIR, SIG_GAME_DIR) {
-        engine::state::set_state_dir(state_dir);
-    }
-    engine::init_logging(false);
-    // Do not clear a previous file: a crash leaves `starting`/`running`
-    // behind so the launcher can tell it apart from a clean `stopped` exit.
-    engine::state::write_state(engine::state::State::Starting, None);
+    use android_activity::AndroidApp;
+    use api::config::PresentationScaling;
+    use app::BackendKind;
+    use engine::projection::ScalingMode;
 
-    let Some(game_dir) = activity_static_string(FIELD_GAME_DIR, SIG_GAME_DIR) else {
-        // The launcher never starts this Activity without a folder, so this is
-        // a programming error rather than a user-facing condition. Record it
-        // for the launcher and terminate instead of sitting on a black
-        // surface with a live process.
-        let message = format!(
-            "no game directory was passed by KrkrGameActivity \
-             ({FIELD_GAME_DIR} is unset) — cannot start the engine"
+    use crate::log_file::{self, FileSink};
+    use crate::{config, host, jni_fields, state};
+
+    /// The Android entry point.
+    ///
+    /// The symbol is resolved by the `GameActivity` glue, which the manifest
+    /// names through `android.app.lib_name`. It uses the Rust ABI because the
+    /// glue declares `extern "Rust" { fn android_main(app: AndroidApp); }`.
+    ///
+    /// The launcher's folder is read first so the engine has something to mount
+    /// before any other work; a missing folder is reported through the state
+    /// file and the loop is never started. The launcher's saved runtime settings
+    /// (frame-rate limit, presentation scaling and archive preload) are read
+    /// next over the same JNI channel and resolved by
+    /// [`crate::config`]: the presentation default is
+    /// [`PresentationScaling::Fit`] and the user's stored choice overrides it,
+    /// and an out-of-range value is reported and the loop is never started.
+    #[allow(unsafe_code)]
+    #[unsafe(no_mangle)]
+    pub fn android_main(app: AndroidApp) {
+        // The state directory is read first: the state file and the logger are
+        // then available for every later failure. A read failure is not the
+        // same as an unset field, but with no directory there is nowhere to
+        // write the state file, so stderr is the only channel here.
+        match jni_fields::activity_static_string(
+            &app,
+            jni_fields::FIELD_STATE_DIR,
+            jni_fields::SIG_STRING,
+        ) {
+            Ok(Some(state_dir)) => state::set_state_dir(state_dir),
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!("krkr-rs: cannot read KrkrGameActivity.pendingStateDir: {error}");
+            }
+        }
+        if let Err(error) = init_logging() {
+            // The launcher reads a file, not logcat: without it the Logs screen
+            // is empty and a later failure has no explanation. A log the app
+            // cannot open is therefore a reported startup failure, never a
+            // silent fall back to stderr only.
+            let message = format!("cannot start the engine log: {error}");
+            eprintln!("krkr-rs: {message}");
+            state::write_state(state::State::Failed, Some(&message));
+            return;
+        }
+        state::write_state(state::State::Starting, None);
+
+        let game_dir = match jni_fields::activity_static_string(
+            &app,
+            jni_fields::FIELD_GAME_DIR,
+            jni_fields::SIG_STRING,
+        ) {
+            Ok(Some(dir)) => PathBuf::from(dir),
+            Ok(None) => {
+                report_startup_failure(
+                    "no game directory was passed by KrkrGameActivity (pendingGameDir is unset)",
+                );
+                return;
+            }
+            Err(error) => {
+                report_startup_failure(&format!(
+                    "cannot read KrkrGameActivity.pendingGameDir: {error}"
+                ));
+                return;
+            }
+        };
+        let name = match jni_fields::activity_static_string(
+            &app,
+            jni_fields::FIELD_GAME_NAME,
+            jni_fields::SIG_STRING,
+        ) {
+            Ok(Some(name)) => name,
+            Ok(None) => String::new(),
+            // The name only decorates a log line; a read failure there is not
+            // fatal, but it is logged rather than silently blanked.
+            Err(error) => {
+                log::warn!("cannot read KrkrGameActivity.pendingGameName: {error}");
+                String::new()
+            }
+        };
+        log::info!("krkr: launching {name:?} from {}", game_dir.display());
+
+        // The launcher persisted these choices in its own settings store and
+        // published them over JNI. Resolving them here keeps configuration
+        // loading the launcher's business: the emulator only receives the
+        // finished value. An unparseable or out-of-range value is a typed
+        // error, never a fall back to the default. A JNI read *failure* is
+        // likewise reported rather than treated as "unset": only a
+        // null/empty field means "no override", and only that takes the
+        // default.
+        let frame_rate = match read_settings_field(&app, jni_fields::FIELD_FRAME_RATE) {
+            Ok(value) => value,
+            Err(message) => {
+                report_startup_failure(&message);
+                return;
+            }
+        };
+        let scaling = match read_settings_field(&app, jni_fields::FIELD_SCALING) {
+            Ok(value) => value,
+            Err(message) => {
+                report_startup_failure(&message);
+                return;
+            }
+        };
+        let preload_archives = match read_settings_field(&app, jni_fields::FIELD_PRELOAD_ARCHIVES) {
+            Ok(value) => value,
+            Err(message) => {
+                report_startup_failure(&message);
+                return;
+            }
+        };
+        let runtime = match config::resolve_runtime_config(
+            frame_rate.as_deref(),
+            scaling.as_deref(),
+            preload_archives.as_deref(),
+        ) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                log::error!("invalid runtime configuration: {error}");
+                let message = error.to_string();
+                state::write_state(state::State::Failed, Some(&message));
+                return;
+            }
+        };
+        log::info!(
+            "krkr: frame rate {} fps, scaling {}, preload archives {}",
+            runtime.frame_rate_limit.fps(),
+            runtime.scaling.as_str(),
+            runtime.preload_archives
         );
-        log::error!("krkr-rs: {message}");
-        engine::state::write_state(engine::state::State::Failed, Some(&message));
-        std::process::exit(1);
-    };
+        let handler = host::AndroidHost::new(
+            BackendKind::Vulkan,
+            map_scaling(runtime.scaling),
+            game_dir,
+            runtime.preload_archives,
+        );
+        let outcome = host::run_loop(
+            app,
+            handler,
+            Duration::from_secs_f64(runtime.frame_rate_limit.period_secs()),
+        );
 
-    let name = activity_static_string(FIELD_GAME_NAME, SIG_GAME_DIR).unwrap_or_default();
-    let game_dir = PathBuf::from(game_dir);
-    log::info!("krkr-rs: launching {name:?} from {}", game_dir.display());
+        // The terminal write reports a recorded failure, or a clean stop when
+        // the loop recorded none; a later `stopped` must never erase a failure.
+        let (terminal, message) = outcome.terminal();
+        state::write_state(terminal, message);
+    }
 
-    let shared = SharedScene(Arc::new(RwLock::new(Scene::default())));
-    // `run_app` writes `stopped` for a clean or game-requested exit and
-    // `failed` for an engine/renderer failure that returned without panicking.
-    // A panic during app construction (e.g. no wgpu adapter) never reaches it
-    // and instead leaves `starting` behind, which the launcher reads as a
-    // crash; the panic hook records the reason in `krkr.log`.
-    krkr_render::runner::run_app(krkr_render::runner::game_app(shared, game_dir, None));
-}
+    /// Reads one optional settings field, turning a JNI read failure into the
+    /// option it belongs to instead of treating it as "unset".
+    fn read_settings_field(app: &AndroidApp, field: &str) -> Result<Option<String>, String> {
+        jni_fields::activity_static_string(app, field, jni_fields::SIG_STRING)
+            .map_err(|error| format!("cannot read KrkrGameActivity.{field}: {error}"))
+    }
 
-/// Read a `String` static field off the Activity class through JNI.
-///
-/// The field is read from the *Activity's own class* (`GetObjectClass` on the
-/// Activity) rather than via `FindClass`, because `FindClass` on a
-/// native-attached thread resolves against the system class loader and would
-/// not find application classes.
-///
-/// Returns `None` when the field is unset or any JNI step fails. Every failure
-/// is reported through [`report_failure`] (stderr *and* `log`), and any Java
-/// exception left behind by a failed call is cleared, so the caller's thread is
-/// always left clean.
-fn activity_static_string(field: &str, signature: &str) -> Option<String> {
-    let android_app = bevy::android::ANDROID_APP.get()?;
+    /// Reports a startup failure through the state file and the log.
+    fn report_startup_failure(message: &str) {
+        log::error!("{message}");
+        state::write_state(state::State::Failed, Some(message));
+    }
 
-    // SAFETY: `ANDROID_APP` is set by the generated `android_main` and lives for
-    // the whole process; `vm_as_ptr`/`activity_as_ptr` are the JavaVM and
-    // Activity the process was started with, valid for that same lifetime.
-    let vm = match unsafe { jni::JavaVM::from_raw(android_app.vm_as_ptr().cast()) } {
-        Ok(vm) => vm,
-        Err(e) => {
-            report_failure(format_args!("cannot obtain the JavaVM: {e}"));
-            return None;
+    /// Maps a resolved presentation scaling to the engine's projection mode.
+    fn map_scaling(scaling: PresentationScaling) -> ScalingMode {
+        match scaling {
+            PresentationScaling::Game => ScalingMode::Game,
+            PresentationScaling::Fit => ScalingMode::Fit,
+            PresentationScaling::Fill => ScalingMode::Fill,
+            PresentationScaling::Expand => ScalingMode::Expand,
         }
-    };
+    }
 
-    // `android_main` runs on the Activity's native thread; attach it so JNI
-    // calls are legal even if android-activity has not already done so.
-    let mut env = match vm.attach_current_thread() {
-        Ok(env) => env,
-        Err(e) => {
-            report_failure(format_args!("cannot attach to the JVM: {e}"));
-            return None;
-        }
-    };
+    /// Installs the process logger.
+    ///
+    /// The single global logger fans every record out to two sinks:
+    ///
+    /// * `env_logger` on stderr, which `android-activity` redirects to logcat
+    ///   (`RUST_LOG` selects the filter, default `info`);
+    /// * [`FileSink`] on `<filesDir>/krkr.log`, the file the launcher's Logs
+    ///   screen reads. It is capped at [`log_file::LOG_MAX_BYTES`] and rotates
+    ///   once, so a long session cannot fill the device's storage.
+    ///
+    /// The file is opened before the logger is claimed. An unusable log file
+    /// is returned as an error for [`android_main`] to report through the
+    /// state file, rather than a fallback that leaves the Logs screen empty.
+    /// A missing state directory is the same error: without it there is no
+    /// place for the file the launcher reads.
+    fn init_logging() -> std::io::Result<()> {
+        let Some(dir) = state::state_dir() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "KrkrGameActivity.pendingStateDir is unset; the log has nowhere to go",
+            ));
+        };
+        let file = FileSink::open(dir.join(log_file::LOG_FILE_NAME))?;
 
-    let activity = unsafe { jni::objects::JObject::from_raw(android_app.activity_as_ptr().cast()) };
-    let class = match env.get_object_class(&activity) {
-        Ok(class) => class,
-        Err(e) => {
-            report_failure(format_args!("cannot get the Activity class: {e}"));
-            clear_pending_exception(&mut env);
-            return None;
+        let mut builder =
+            env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
+        builder.format_timestamp_millis();
+        let stderr = builder.build();
+        let max_level = stderr.filter();
+        let logger = FanoutLog {
+            stderr,
+            file: Mutex::new(Some(file)),
+        };
+        match log::set_boxed_logger(Box::new(logger)) {
+            Ok(()) => {
+                log::set_max_level(max_level);
+                Ok(())
+            }
+            // The global logger is process-wide, so this can only mean an
+            // earlier `android_main` in this same process already installed it:
+            // `android-activity` calls `android_main` once per Activity
+            // instance and the launcher and the engine share the process. The
+            // existing logger already fans every record into the same
+            // `krkr.log`, so a second launch keeps logging instead of failing.
+            // There is no other process that could own this process's logger;
+            // a genuine setup failure (an unopenable log file) was returned
+            // above, before the claim.
+            Err(_) => {
+                log::debug!("the engine log is already installed for this process");
+                Ok(())
+            }
         }
-    };
+    }
 
-    let value = match env.get_static_field(&class, field, signature) {
-        Ok(value) => value,
-        Err(e) => {
-            report_failure(format_args!("cannot read {field}: {e}"));
-            clear_pending_exception(&mut env);
-            return None;
-        }
-    };
-    let object = match value.l() {
-        Ok(object) if !object.is_null() => object,
-        Ok(_) => return None,
-        Err(e) => {
-            report_failure(format_args!("{field} is not an object: {e}"));
-            clear_pending_exception(&mut env);
-            return None;
-        }
-    };
+    /// The one global logger: the `env_logger` stderr sink plus the capped
+    /// file. `log` records are filtered once, by the `env_logger` filter, so
+    /// the file holds exactly what stderr holds.
+    struct FanoutLog {
+        stderr: env_logger::Logger,
+        file: Mutex<Option<FileSink>>,
+    }
 
-    let string = jni::objects::JString::from(object);
-    match env.get_string(&string) {
-        Ok(value) => {
-            let value: String = value.into();
-            (!value.is_empty()).then_some(value)
+    impl FanoutLog {
+        /// Append `record` to the file, if a sink is open.
+        fn write_file(&self, record: &log::Record<'_>) {
+            // A panic while logging poisons the mutex but must not stop the
+            // record from reaching the file.
+            let mut guard = match self.file.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if let Some(sink) = guard.as_mut() {
+                sink.write_line(&log_file::format_record(record));
+            }
         }
-        Err(e) => {
-            report_failure(format_args!("{field} is not a valid string: {e}"));
-            clear_pending_exception(&mut env);
-            None
+    }
+
+    impl log::Log for FanoutLog {
+        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+            log::Log::enabled(&self.stderr, metadata)
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            if !self.stderr.matches(record) {
+                return;
+            }
+            log::Log::log(&self.stderr, record);
+            self.write_file(record);
+        }
+
+        fn flush(&self) {
+            log::Log::flush(&self.stderr);
+            let mut guard = match self.file.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if let Some(sink) = guard.as_mut() {
+                sink.flush();
+            }
         }
     }
 }
 
-/// Report a startup/JNI failure so it is visible even before the global logger
-/// exists.
-///
-/// The state directory is read **before** `engine::init_logging`, because the
-/// log file lives inside it (`krkr.log`), so the logger cannot be initialised
-/// first. At that point the global logger is still the no-op default and
-/// `log::error!` goes nowhere ([`engine::state::write_state`] is also a no-op
-/// while the directory is unset). `eprintln!` survives that window —
-/// android-activity forwards stderr to logcat — so every failure is reported on
-/// stderr as well as through the normal logger once it exists.
-fn report_failure(args: std::fmt::Arguments<'_>) {
-    eprintln!("krkr-rs: {args}");
-    log::error!("krkr-rs: {args}");
-}
-
-/// Clear a Java exception left pending by a failed JNI call.
-///
-/// The `jni` crate (0.21) returns [`jni::errors::Error::JavaException`] from
-/// `get_static_field`/`get_string`/… **without** calling `ExceptionClear` (see
-/// its `check_exception!` macro). Returning with one pending poisons every later
-/// JNI call on this thread — and `android_main` carries on into the Bevy app,
-/// where winit/android-activity/input all call JNI on it. Clearing here keeps
-/// the thread clean; its result is ignored because the error is already being
-/// reported.
-fn clear_pending_exception(env: &mut jni::JNIEnv<'_>) {
-    let _ = env.exception_clear();
-}
+#[cfg(target_os = "android")]
+pub use android_entry::android_main;

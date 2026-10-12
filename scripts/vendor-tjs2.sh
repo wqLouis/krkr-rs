@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 # Re-vendor the C++ TJS2 core from the reference checkout into
-# crates/tjs2-sys/cpp/tjs2, then re-apply every krkr-rs patch.
+# crates/tjs/cpp/tjs2, then re-apply every krkr-rs patch.
 #
 # The patches live in `scripts/patches/tjs2-krkr-rs.patch` (a unified diff
 # against the reference tree) rather than as ad-hoc edits here, so they are
 # reviewable in git and cannot be silently lost when upstream is re-vendored.
-# **Any new change to `crates/tjs2-sys/cpp/tjs2/**` must be added to that
+# **Any new change to `crates/tjs/cpp/tjs2/**` must be added to that
 # patch file**, otherwise this script will re-copy the pristine upstream and
 # the change will disappear.
 #
 # To regenerate the patch after editing the vendored sources:
 #   rm -rf /tmp/vend && mkdir -p /tmp/vend
 #   cp -r reference/cpp/core/tjs2 /tmp/vend/a
-#   cp -r crates/tjs2-sys/cpp/tjs2 /tmp/vend/b
+#   cp -r crates/tjs/cpp/tjs2 /tmp/vend/b
 #   rm -f /tmp/vend/{a,b}/CMakeLists.txt /tmp/vend/b/LICENSE.krkr2
 #   (cd /tmp/vend && diff -ruN a b) \
 #     | sed -E 's/^(---|\+\+\+) ([ab]\/[^\t]+)\t.*/\1 \2/' \
@@ -21,7 +21,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 REF="$ROOT/reference/cpp/core/tjs2"
-DEST="$ROOT/crates/tjs2-sys/cpp/tjs2"
+DEST="$ROOT/crates/tjs/cpp/tjs2"
 PATCH="$ROOT/scripts/patches/tjs2-krkr-rs.patch"
 
 if [[ ! -d "$REF" ]]; then
