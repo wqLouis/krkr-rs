@@ -85,6 +85,41 @@ fn tlg6_narrow_width_roundtrip() {
 }
 
 #[test]
+fn tlg6_multi_band_partial_roundtrip() {
+    // Taller than one 8-row block row with a remainder, and a width that is
+    // not a multiple of 8, so the reused per-band scratch crosses the
+    // block-row boundary.
+    let (w, h) = (29usize, 37usize);
+    let img = test_image(w, h);
+    let encoded = encode_tlg6(&img, w, h, 4);
+    let media = Media::new();
+    let decoded = decode_image(&media, &encoded, None).expect("multi-band TLG6 should decode");
+    assert_eq!((decoded.width as usize, decoded.height as usize), (w, h));
+    assert_eq!(
+        decoded.rgba, img,
+        "multi-band TLG6 round trip must be lossless"
+    );
+}
+
+#[test]
+fn tlg6_multi_band_partial_rgb_roundtrip() {
+    // Same shape as above with the 24-bit color count, so the reused scratch
+    // is checked on a channel count whose unused alpha lane stays zero.
+    let (w, h) = (45usize, 21usize);
+    let mut img = test_image(w, h);
+    for px in img.chunks_exact_mut(4) {
+        px[3] = 0xff;
+    }
+    let encoded = encode_tlg6(&img, w, h, 3);
+    let media = Media::new();
+    let decoded = decode_image(&media, &encoded, None).expect("24-bit multi-band TLG6");
+    assert_eq!(
+        decoded.rgba, img,
+        "24-bit multi-band round trip must be lossless"
+    );
+}
+
+#[test]
 fn tlg5_rgba_roundtrip() {
     let (w, h) = (24usize, 16usize);
     let img = test_image(w, h);

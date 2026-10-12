@@ -100,7 +100,7 @@ fn decode_tlg_bytes(bytes: &[u8]) -> Result<DecodedImage, String> {
 
 /// Converts an `image`-crate dynamic image to the RGBA8 DTO.
 fn decoded_from_dynamic(image: DynamicImage) -> DecodedImage {
-    let rgba = image.to_rgba8();
+    let rgba = image.into_rgba8();
     let (width, height) = (rgba.width(), rgba.height());
     DecodedImage::new(width, height, rgba.into_raw())
 }

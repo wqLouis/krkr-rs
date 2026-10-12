@@ -213,6 +213,9 @@ fn decode_tlg5(raw: &[u8]) -> Result<RgbaImage, String> {
     let mut outbufs: Vec<Vec<u8>> = vec![vec![0u8; block_elems]; colors];
     let mut img = vec![0u8; width * height * 4];
     let mut rowbuf = vec![0u8; width * 4];
+    // LZSS scratch reused across blocks; `lzss_decompress` fills it from the
+    // start after each clear.
+    let mut tmp = Vec::new();
 
     for y_blk in (0..height).step_by(blockheight) {
         let y_lim = (y_blk + blockheight).min(height);
@@ -228,7 +231,7 @@ fn decode_tlg5(raw: &[u8]) -> Result<RgbaImage, String> {
             pos += size;
             if mark == 0 {
                 // modified-LZSS compressed
-                let mut tmp = Vec::with_capacity(elems);
+                tmp.clear();
                 lzss_decompress(data, &mut text, &mut r, &mut tmp, elems)?;
                 if tmp.len() < elems {
                     return Err("TLG5: LZSS stream underrun".into());
@@ -350,14 +353,21 @@ fn decode_tlg6(raw: &[u8]) -> Result<RgbaImage, String> {
     let zeroline_val: u32 = if colors == 3 { 0xff00_0000 } else { 0 };
     let mut prevline = vec![zeroline_val; width];
     let mut img = vec![0u8; width * height * 4];
+    // Scratch reused across block rows. A block row is at most
+    // `TLG6_H_BLOCK_SIZE` scanlines; every byte read below is either written
+    // by one of the color lanes or stays at the zeroed initial value.
+    let band_pixels = TLG6_H_BLOCK_SIZE * width;
+    let mut pixelbuf = vec![0u32; band_pixels];
+    let mut curline = vec![0u32; width];
+    let mut lane_buf = vec![0u8; band_pixels * 4];
 
     for y in (0..height).step_by(TLG6_H_BLOCK_SIZE) {
         let ylim = (y + TLG6_H_BLOCK_SIZE).min(height);
         let pixel_count = (ylim - y) * width;
+        let lane_len = pixel_count * 4;
         let skipbytes = (ylim - y) * TLG6_W_BLOCK_SIZE;
 
         // Decode each channel's residual lane into a per-pixel byte lane.
-        let mut pixelbuf = vec![0u32; pixel_count];
         for c in 0..colors {
             let bit_length = read_i32(raw, pos)? as u32;
             pos += 4;
@@ -371,8 +381,16 @@ fn decode_tlg6(raw: &[u8]) -> Result<RgbaImage, String> {
                 .get(pos..pos + byte_len)
                 .ok_or("TLG6: truncated bit pool")?;
             pos += byte_len;
-            let lane = decode_golomb_lane(pool, pixel_count, c, c == 0 && colors != 1, lzt, gbt)?;
-            for (i, g) in lane.chunks(4).enumerate() {
+            decode_golomb_lane(
+                pool,
+                pixel_count,
+                c,
+                c == 0 && colors != 1,
+                lzt,
+                gbt,
+                &mut lane_buf[..lane_len],
+            )?;
+            for (i, g) in lane_buf[..lane_len].chunks(4).enumerate() {
                 let v = pixelbuf[i];
                 let b = v.to_le_bytes();
                 let mut nb = b;
@@ -384,7 +402,6 @@ fn decode_tlg6(raw: &[u8]) -> Result<RgbaImage, String> {
         // Per-line block decode (reference `TVPTLG6DecodeLineGeneric`).
         let ft_base = (y / TLG6_H_BLOCK_SIZE) * x_block_count;
         let initialp = if colors == 3 { 0xff00_0000 } else { 0 };
-        let mut curline = vec![0u32; width];
         for yy in y..ylim {
             let dir = (yy & 1) ^ 1;
             let oddskip = (ylim - yy - 1) as isize - (yy - y) as isize;
@@ -399,7 +416,7 @@ fn decode_tlg6(raw: &[u8]) -> Result<RgbaImage, String> {
                     &filter_types,
                     ft_base,
                     skipbytes,
-                    &pixelbuf,
+                    &pixelbuf[..pixel_count],
                     start,
                     initialp,
                     oddskip,
@@ -418,7 +435,7 @@ fn decode_tlg6(raw: &[u8]) -> Result<RgbaImage, String> {
                     &filter_types,
                     ft_base,
                     skipbytes,
-                    &pixelbuf,
+                    &pixelbuf[..pixel_count],
                     start,
                     initialp,
                     oddskip,
@@ -693,7 +710,8 @@ impl GolombBits<'_> {
 /// Decode one channel's residual lane (reference
 /// `TVPTLG6DecodeGolombValues[ForFirst]`). The stream alternates zero/nonzero
 /// run lengths (Elias-gamma coded), non-zero values use Golomb-Rice coding
-/// with an adaptive `k` from the precomputed table.
+/// with an adaptive `k` from the precomputed table. Writes the channel's byte
+/// into `out`, which holds `pixel_count * 4` bytes.
 fn decode_golomb_lane(
     pool: &[u8],
     pixel_count: usize,
@@ -701,11 +719,11 @@ fn decode_golomb_lane(
     first: bool,
     lzt: &[u8; 4096],
     gbt: &[[u8; 4]; TLG6_GOLOMB_TABLE_LEN],
-) -> Result<Vec<u8>, String> {
+    out: &mut [u8],
+) -> Result<(), String> {
     if pool.is_empty() {
         return Err("TLG6: empty bit pool".into());
     }
-    let mut out = vec![0u8; pixel_count * 4];
     let mut bs = GolombBits {
         pool,
         pos: 0,
@@ -778,7 +796,7 @@ fn decode_golomb_lane(
         }
         zero ^= 1;
     }
-    Ok(out)
+    Ok(())
 }
 
 /// Decode one Golomb-Rice value; returns the signed residual and `m >> 1`
