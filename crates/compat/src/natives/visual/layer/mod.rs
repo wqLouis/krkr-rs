@@ -1292,8 +1292,8 @@ extern "C" fn layer_fill_rect(
     let a = unsafe { args(argv, argc) };
     let x = value_as_i64(&a[0]) as i32;
     let y = value_as_i64(&a[1]) as i32;
-    let w = value_as_i64(&a[2]).max(0) as u32;
-    let h = value_as_i64(&a[3]).max(0) as u32;
+    let w = value_as_i64(&a[2]) as i32;
+    let h = value_as_i64(&a[3]) as i32;
     let color = argb_to_rgba(value_as_i64(&a[4]));
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Layer.fillRect: compat context is not bound");
@@ -1307,8 +1307,6 @@ extern "C" fn layer_fill_rect(
         Ok(scene) => scene,
         Err(error) => return report_error(out_error, &error),
     };
-    let w = i32::try_from(w).unwrap_or(i32::MAX);
-    let h = i32::try_from(h).unwrap_or(i32::MAX);
     let clip = util::layer_clip(scene, id);
     let Some(dest) =
         engine::layer_ops::intersect_rect((x, y, x.saturating_add(w), y.saturating_add(h)), clip)

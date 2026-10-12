@@ -906,7 +906,7 @@ fn value_as_f64(v: &Value) -> f64 {
     match v.ty {
         tjs::VAL_INTEGER => v.integer as f64,
         tjs::VAL_REAL => v.real,
-        tjs::VAL_STRING => value_as_string(v).parse().unwrap_or(0.0),
+        tjs::VAL_STRING => crate::natives::system::tjs_string_to_real(&value_as_string(v)),
         _ => 0.0,
     }
 }

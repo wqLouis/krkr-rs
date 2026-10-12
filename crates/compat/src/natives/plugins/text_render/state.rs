@@ -240,7 +240,7 @@ fn tjs_i64(v: &TjsValue) -> i64 {
     match v {
         TjsValue::Integer(i) => *i,
         TjsValue::Real(r) => *r as i64,
-        TjsValue::String(s) => s.parse().unwrap_or(0),
+        TjsValue::String(s) => crate::natives::system::tjs_string_to_integer(s),
         _ => 0,
     }
 }
@@ -250,7 +250,7 @@ fn tjs_f64(v: &TjsValue) -> f64 {
     match v {
         TjsValue::Integer(i) => *i as f64,
         TjsValue::Real(r) => *r,
-        TjsValue::String(s) => s.parse().unwrap_or(0.0),
+        TjsValue::String(s) => crate::natives::system::tjs_string_to_real(s),
         _ => 0.0,
     }
 }

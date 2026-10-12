@@ -175,7 +175,7 @@ fn member_angle(host: &Tjs2Engine, id: tjs::Tjs2ValueId, name: &str) -> Option<f
     match host.member(id, name) {
         Ok(TjsValue::Integer(value)) => Some(value as f64),
         Ok(TjsValue::Real(value)) => Some(value),
-        Ok(TjsValue::String(value)) => Some(value.parse().unwrap_or(0.0)),
+        Ok(TjsValue::String(value)) => Some(crate::natives::system::tjs_string_to_real(&value)),
         Ok(_) => Some(0.0),
         Err(_) => None,
     }

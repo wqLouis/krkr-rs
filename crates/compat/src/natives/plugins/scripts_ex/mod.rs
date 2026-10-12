@@ -975,21 +975,25 @@ fn run_prop_set(
     value: Owned,
     flag: i64,
 ) -> Result<Owned, String> {
-    let array_index = is_instance_of(engine, target, "Array")? && key.parse::<i64>().is_ok();
-    if array_index {
-        if flag & TJS_MEMBERMUSTEXIST != 0 {
-            let count = array_count(engine, target)?;
-            let mut index = key.parse::<i64>().unwrap_or(0);
-            if index < 0 {
-                index += count;
+    let is_array = is_instance_of(engine, target, "Array")?;
+    match (is_array, key.parse::<i64>()) {
+        (true, Ok(mut index)) => {
+            if flag & TJS_MEMBERMUSTEXIST != 0 {
+                let count = array_count(engine, target)?;
+                if index < 0 {
+                    index += count;
+                }
+                if index < 0 || index >= count {
+                    return Err(format!("Scripts.propSet: member {key} not found"));
+                }
             }
-            if index < 0 || index >= count {
+        }
+        _ => {
+            if flag & TJS_MEMBERENSURE == 0 && !member_exists(engine, services, target, key)? {
+                // Without TJS_MEMBERENSURE the write fails on a missing member.
                 return Err(format!("Scripts.propSet: member {key} not found"));
             }
         }
-    } else if flag & TJS_MEMBERENSURE == 0 && !member_exists(engine, services, target, key)? {
-        // Without TJS_MEMBERENSURE the write fails on a missing member.
-        return Err(format!("Scripts.propSet: member {key} not found"));
     }
     let argument = value.to_tjs_for_call(engine)?;
     engine.set_member(target.raw_id(), key, &argument)?;
@@ -1013,26 +1017,30 @@ fn run_prop_get(
     key: &str,
     flag: i64,
 ) -> Result<Owned, String> {
-    let array_index = is_instance_of(engine, target, "Array")? && key.parse::<i64>().is_ok();
-    if array_index {
-        if flag & TJS_MEMBERMUSTEXIST != 0 {
-            let count = array_count(engine, target)?;
-            let mut index = key.parse::<i64>().unwrap_or(0);
-            if index < 0 {
-                index += count;
-            }
-            if index < 0 || index >= count {
-                return Err(format!("Scripts.propGet: member {key} not found"));
+    let is_array = is_instance_of(engine, target, "Array")?;
+    match (is_array, key.parse::<i64>()) {
+        (true, Ok(mut index)) => {
+            if flag & TJS_MEMBERMUSTEXIST != 0 {
+                let count = array_count(engine, target)?;
+                if index < 0 {
+                    index += count;
+                }
+                if index < 0 || index >= count {
+                    return Err(format!("Scripts.propGet: member {key} not found"));
+                }
             }
         }
-    } else if !member_exists(engine, services, target, key)? {
-        if flag & TJS_MEMBERENSURE != 0 {
-            // The reference creates the member as void before reading it.
-            engine.set_member(target.raw_id(), key, &TjsValue::Void)?;
-        } else if flag & TJS_MEMBERMUSTEXIST != 0 {
-            return Err(format!("Scripts.propGet: member {key} not found"));
+        _ => {
+            if !member_exists(engine, services, target, key)? {
+                if flag & TJS_MEMBERENSURE != 0 {
+                    // The reference creates the member as void before reading it.
+                    engine.set_member(target.raw_id(), key, &TjsValue::Void)?;
+                } else if flag & TJS_MEMBERMUSTEXIST != 0 {
+                    return Err(format!("Scripts.propGet: member {key} not found"));
+                }
+                // Flag 0 on a dictionary: the read below returns void.
+            }
         }
-        // Flag 0 on a dictionary: the read below returns void.
     }
     let value = engine.member(target.raw_id(), key)?;
     owned_from_tjs(engine, value)

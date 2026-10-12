@@ -5,8 +5,6 @@
 //! (`fs::open`, `fs::read_at`, …) are unchanged by the module
 //! split.
 
-use std::path::Path;
-
 use api::error::FsError;
 use api::fs::{DirEntry, FileStat, FsPath, OpenMode, SeekFrom};
 
@@ -43,7 +41,7 @@ pub fn stat(fs: &FileSystem, path: &FsPath) -> Result<FileStat, FsError> {
                 .modified()
                 .ok()
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+                .and_then(|d| u64::try_from(d.as_millis()).ok());
             Ok(FileStat {
                 size: if meta.is_dir() { 0 } else { meta.len() },
                 is_dir: meta.is_dir(),
@@ -273,32 +271,37 @@ pub fn rename(fs: &FileSystem, from: &FsPath, to: &FsPath) -> Result<(), FsError
             }
 
             // Directory move: relocate every descendant directory and file by
-            // rewriting the `src` prefix to `dst`.
-            let dir_keys: Vec<std::path::PathBuf> = guard
+            // rewriting the `src` prefix to `dst`. Keys that do not start with
+            // `src` have no suffix to rewrite and are skipped.
+            let dir_entries: Vec<(std::path::PathBuf, std::path::PathBuf)> = guard
                 .dirs
                 .iter()
-                .filter(|k| k.starts_with(&src))
-                .cloned()
+                .filter_map(|k| {
+                    k.strip_prefix(&src)
+                        .ok()
+                        .map(|suffix| (k.clone(), suffix.to_path_buf()))
+                })
                 .collect();
-            let file_entries: Vec<(std::path::PathBuf, Vec<u8>)> = guard
+            let file_entries: Vec<(std::path::PathBuf, std::path::PathBuf, Vec<u8>)> = guard
                 .files
                 .iter()
-                .filter(|(k, _)| k.starts_with(&src))
-                .map(|(k, v)| (k.clone(), v.clone()))
+                .filter_map(|(k, v)| {
+                    k.strip_prefix(&src)
+                        .ok()
+                        .map(|suffix| (k.clone(), suffix.to_path_buf(), v.clone()))
+                })
                 .collect();
-            for k in &dir_keys {
+            for (k, _) in &dir_entries {
                 guard.dirs.remove(k);
             }
-            for (k, _) in &file_entries {
+            for (k, _, _) in &file_entries {
                 guard.files.remove(k);
             }
-            for k in dir_keys {
-                let suffix = k.strip_prefix(&src).unwrap_or_else(|_| Path::new(""));
-                guard.dirs.insert(join_suffix(&dst, suffix));
+            for (_, suffix) in dir_entries {
+                guard.dirs.insert(join_suffix(&dst, &suffix));
             }
-            for (k, bytes) in file_entries {
-                let suffix = k.strip_prefix(&src).unwrap_or_else(|_| Path::new(""));
-                guard.files.insert(join_suffix(&dst, suffix), bytes);
+            for (_, suffix, bytes) in file_entries {
+                guard.files.insert(join_suffix(&dst, &suffix), bytes);
             }
             let mut cur = std::path::PathBuf::new();
             for comp in dst.components() {

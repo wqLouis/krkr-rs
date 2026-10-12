@@ -74,7 +74,7 @@ impl FileSink {
     /// adopted so the cap spans previous launches.
     pub(crate) fn open(path: PathBuf) -> std::io::Result<Self> {
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
-        let written = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let written = file.metadata()?.len();
         Ok(Self {
             rotated: rotated_path(&path),
             path,
@@ -149,10 +149,22 @@ impl FileSink {
                 .append(true)
                 .open(&self.path)
             {
-                Ok(file) => {
-                    self.written = file.metadata().map(|m| m.len()).unwrap_or(0);
-                    self.file = Some(file);
-                }
+                Ok(file) => match file.metadata() {
+                    Ok(metadata) => {
+                        self.written = metadata.len();
+                        self.file = Some(file);
+                    }
+                    Err(error) => {
+                        if !self.reported_error {
+                            self.reported_error = true;
+                            eprintln!(
+                                "krkr-rs: cannot stat log file {}: {error}",
+                                self.path.display()
+                            );
+                        }
+                        return None;
+                    }
+                },
                 Err(error) => {
                     if !self.reported_error {
                         self.reported_error = true;

@@ -41,7 +41,7 @@
 //! [`System.inform`]: crate::natives::system
 #![allow(unsafe_code)]
 
-use std::ffi::{CString, c_char, c_int, c_void};
+use std::ffi::{c_char, c_int, c_void};
 use std::ptr;
 
 use tjs::{
@@ -118,19 +118,8 @@ fn scalar_slot(value: &TjsValue) -> Value {
 /// negated exactly as KiriKiri would.
 fn tjs_not(value: &TjsValue) -> bool {
     if let TjsValue::String(text) = value {
-        // A result string crossed the ABI as a C string, so it never holds an
-        // interior NUL; the fallback only guards the pathological case.
-        let buffer = CString::new(text.as_str()).unwrap_or_default();
-        let raw = Value {
-            ty: VAL_STRING,
-            integer: 0,
-            real: 0.0,
-            string: buffer.as_ptr(),
-            array: ptr::null(),
-            array_count: 0,
-            retained: 0,
-        };
-        return !value_as_bool(&raw);
+        // `operator bool` on a string is `AsInteger() != 0`.
+        return crate::natives::system::tjs_string_to_integer(text) == 0;
     }
     !value_as_bool(&scalar_slot(value))
 }

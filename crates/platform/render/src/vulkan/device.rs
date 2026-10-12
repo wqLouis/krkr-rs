@@ -65,6 +65,17 @@ fn layer_name(property: &vk::LayerProperties) -> &CStr {
     unsafe { CStr::from_ptr(property.layer_name.as_ptr()) }
 }
 
+/// Converts the configured application name into the NUL-terminated C string
+/// `VkApplicationInfo::pApplicationName` requires.
+///
+/// A C string cannot carry an interior NUL, so a name that does is reported as
+/// [`RenderError::InvalidArgument`] rather than silently renamed.
+fn application_name_cstring(name: &str) -> Result<CString, RenderError> {
+    CString::new(name).map_err(|error| RenderError::InvalidArgument {
+        message: format!("the Vulkan application name is not a valid C string: {error}"),
+    })
+}
+
 /// Loads the Vulkan loader, creates the instance and selects a physical device.
 ///
 /// The instance enables `VK_KHR_surface` plus every platform surface extension
@@ -143,8 +154,7 @@ pub(crate) fn create_instance(config: &PipelineConfig) -> Result<InstanceBundle,
         }
     }
 
-    let application_name =
-        CString::new(config.application_name.clone()).unwrap_or_else(|_| c"krkr-rs".to_owned());
+    let application_name = application_name_cstring(config.application_name.as_str())?;
     let engine_name = c"krkr-rs";
 
     let application_info = vk::ApplicationInfo::default()
@@ -371,5 +381,22 @@ mod tests {
         let formatted = vk_result_message(vk::Result::ERROR_INITIALIZATION_FAILED);
         assert!(formatted.contains("VK_ERROR_INITIALIZATION_FAILED"));
         assert!(formatted.contains("Initialization of an object has failed"));
+    }
+
+    // The reference engine has no Vulkan instance and therefore no application
+    // name, so this is the render layer's own typed-error contract for the
+    // backend argument rather than a reference behaviour.
+    #[test]
+    fn application_name_accepts_a_plain_name() {
+        let name = application_name_cstring("krkr-rs").expect("plain name");
+        assert_eq!(name.as_c_str(), c"krkr-rs");
+    }
+
+    #[test]
+    fn application_name_rejects_an_interior_nul() {
+        assert!(matches!(
+            application_name_cstring("krkr\0rs"),
+            Err(RenderError::InvalidArgument { .. })
+        ));
     }
 }

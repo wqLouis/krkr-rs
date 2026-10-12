@@ -29,17 +29,8 @@ use tjs::{
 };
 
 use crate::native_util::{args, report_error, set_int, set_void, value_as_string};
-use crate::natives::sound::AudioDecoder;
 use crate::natives::system::{resolve, set_string_out};
-use crate::{CompatCtx, CompatError, CompatServices};
-
-// ---------------------------------------------------------------------------
-// Host seam
-// ---------------------------------------------------------------------------
-
-/// The reference build never consults a disc decoder, so the seam is a
-/// no-op; it stays so hosts that wire every sound class together compile.
-pub fn set_disc_audio_decoder(_services: &CompatServices, _decoder: AudioDecoder) {}
+use crate::{CompatCtx, CompatError};
 
 // ---------------------------------------------------------------------------
 // Which disc class an instance belongs to

@@ -51,7 +51,7 @@ pub(crate) fn open_host(base: &Path, path: &FsPath, mode: OpenMode) -> Result<Fi
     }
     let file = opts.open(&full).map_err(|e| io_error(&display, e))?;
     let cursor = if mode == OpenMode::Append {
-        file.metadata().map(|m| m.len()).unwrap_or(0)
+        file.metadata().map_err(|e| io_error(&display, e))?.len()
     } else {
         0
     };
@@ -173,8 +173,10 @@ mod tests {
     use std::io::{Error, ErrorKind};
 
     use api::error::FsError;
+    use api::fs::{FsPath, OpenMode};
 
     use super::io_error;
+    use crate::{FileSystem, flush, open, write_at};
 
     /// Every `ErrorKind` covered by an `FsError` variant is preserved, and an
     /// unclassified kind falls back to `FsError::Io`.
@@ -208,5 +210,27 @@ mod tests {
             io_error("/p", Error::from(ErrorKind::Other)),
             FsError::Io { .. }
         ));
+    }
+
+    /// Reference: append mode opens the file with `O_APPEND`
+    /// (`reference/cpp/core/base/impl/StorageImpl.cpp:651-652`), so a write
+    /// lands at the current end and the initial cursor is the existing length.
+    /// A metadata failure is a typed error, not an offset of `0`.
+    #[test]
+    fn append_cursor_starts_at_the_file_length() {
+        let dir = std::env::temp_dir().join(format!("fs-append-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let fs = FileSystem::host(dir.clone());
+
+        let file = open(&fs, &FsPath::host("a.bin"), OpenMode::Write).expect("create file");
+        write_at(&fs, &file, 0, b"hello").expect("write file");
+        flush(&fs, &file).expect("flush file");
+        drop(file);
+
+        let append = open(&fs, &FsPath::host("a.bin"), OpenMode::Append).expect("append file");
+        assert_eq!(append.cursor(), 5);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

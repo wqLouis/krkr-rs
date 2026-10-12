@@ -203,19 +203,46 @@ pub(crate) enum FileHandle {
     },
 }
 
-/// Locks `mutex`, treating poisoning as a bug rather than recovering.
+/// Locks `mutex`, panicking if it has been poisoned.
 ///
-/// A poisoned mutex means a previous operation panicked while holding the
-/// lock, so the protected `MemoryStore` may be half-mutated. Silently
-/// recovering with `into_inner()` would let IO observe that inconsistent
-/// state; the only honest response is to fail loudly instead.
+/// Poisoning means a previous operation panicked while holding the lock. The
+/// `MemoryStore` methods validate their input and never panic on malformed
+/// game data, so poisoning does not come from bad input; it would leave the
+/// store half-mutated, and recovering with `into_inner()` would let IO observe
+/// that inconsistent state. The store must stay internally consistent, so the
+/// lock fails loudly rather than recovering.
 ///
 /// # Panics
 ///
 /// Panics if the mutex is poisoned by a prior panic while the lock was held.
-/// This is a bug, not a recoverable IO condition.
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .expect("MemoryStore mutex poisoned: a previous operation panicked while holding the lock")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    /// A healthy lock hands back the guard for the protected value.
+    #[test]
+    fn lock_returns_the_guard() {
+        let mutex = Mutex::new(7u32);
+        assert_eq!(*super::lock(&mutex), 7);
+    }
+
+    /// Poisoning is a bug, not a recoverable IO condition: the lock panics
+    /// instead of exposing a half-mutated store.
+    #[test]
+    #[should_panic(expected = "poisoned")]
+    fn lock_panics_on_poisoning() {
+        let mutex = Mutex::new(0u32);
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = mutex.lock().expect("freshly created mutex");
+            panic!("poison the lock");
+        }));
+        assert!(poisoned.is_err(), "the closure must panic");
+        let _guard = super::lock(&mutex);
+    }
 }

@@ -138,6 +138,56 @@ impl<'a> Reader<'a> {
         }
         Ok(String::from_utf16_lossy(&units))
     }
+
+    /// The reference `IteratorBase::getInt16` (`psdparse.h:107-125`): `-1`
+    /// when fewer than two bytes remain, otherwise the big-endian value. The
+    /// cursor does not advance on a short read.
+    pub(crate) fn i16_ref(&mut self) -> i16 {
+        if self.data.len().saturating_sub(self.pos) < 2 {
+            return -1;
+        }
+        let b = &self.data[self.pos..self.pos + 2];
+        self.pos += 2;
+        i16::from_be_bytes([b[0], b[1]])
+    }
+
+    /// The reference `IteratorBase::getInt32` (`psdparse.h:127-140`): `-1`
+    /// when fewer than four bytes remain.
+    pub(crate) fn i32_ref(&mut self) -> i32 {
+        if self.data.len().saturating_sub(self.pos) < 4 {
+            return -1;
+        }
+        let b = &self.data[self.pos..self.pos + 4];
+        self.pos += 4;
+        i32::from_be_bytes([b[0], b[1], b[2], b[3]])
+    }
+
+    /// The reference `IteratorBase::getCh` (`psdparse.h:101-105`): `-1` at
+    /// the end of the data, otherwise the byte (`0..=255`).
+    pub(crate) fn ch_ref(&mut self) -> i32 {
+        if self.pos >= self.data.len() {
+            return -1;
+        }
+        let value = i32::from(self.data[self.pos]);
+        self.pos += 1;
+        value
+    }
+
+    /// The reference `IteratorBase::getUnicodeString` (`psdparse.h:181-187`):
+    /// a `getInt32` code-unit count followed by that many `getInt16` units. A
+    /// short read contributes `-1` units (`0xffff`), matching the reference's
+    /// `(wchar_t)-1` push.
+    pub(crate) fn unicode_string_ref(&mut self) -> String {
+        let count = self.i32_ref();
+        if count <= 0 {
+            return String::new();
+        }
+        let mut units = Vec::new();
+        for _ in 0..count {
+            units.push(self.i16_ref() as u16);
+        }
+        String::from_utf16_lossy(&units)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -364,7 +414,7 @@ pub(crate) struct LayerInfo {
     pub(crate) channels: Vec<ChannelInfo>,
     pub(crate) blend_mode: BlendMode,
     pub(crate) opacity: u8,
-    pub(crate) fill_opacity: u8,
+    pub(crate) fill_opacity: i32,
     pub(crate) clipping: u8,
     pub(crate) flag: u8,
     pub(crate) extra_data: LayerExtra,
@@ -448,8 +498,8 @@ pub(crate) struct SliceResource {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct GuideItem {
     pub(crate) location: i32,
-    /// 0 = vertical, 1 = horizontal.
-    pub(crate) direction: u8,
+    /// 0 = vertical, 1 = horizontal (`-1` on a short read).
+    pub(crate) direction: i32,
 }
 
 /// The parsed grid/guide resource (reference `GridGuideResource`).
@@ -593,16 +643,15 @@ impl PsdFile {
                 1032 => self.load_grid_and_guide(&resource.data),
                 1050 => self.load_slice(&resource.data),
                 1046 => {
+                    // Reference `loadResourceColorTableCount` reads through
+                    // `IteratorBase` (`getInt16`), so a short block is `-1`.
                     let mut r = Reader::new(&resource.data);
-                    if let Ok(value) = r.i16() {
-                        self.color_table.valid_count = value;
-                    }
+                    self.color_table.valid_count = r.i16_ref();
                 }
                 1047 => {
+                    // Reference `loadResourceTransparencyIndex` (`getInt16`).
                     let mut r = Reader::new(&resource.data);
-                    if let Ok(value) = r.i16() {
-                        self.color_table.transparency_index = value;
-                    }
+                    self.color_table.transparency_index = r.i16_ref();
                 }
                 1065 => self.load_layer_comps(&resource.data),
                 _ => {}
@@ -657,24 +706,22 @@ impl PsdFile {
 
     fn load_grid_and_guide(&mut self, data: &[u8]) {
         let mut r = Reader::new(data);
-        // version (read and discarded)
-        if r.i32().is_err() {
-            return;
-        }
-        let horizontal_grid = r.i32().unwrap_or(0);
-        let vertical_grid = r.i32().unwrap_or(0);
-        let guide_num = r.i32().unwrap_or(0);
-        if guide_num < 0 {
-            return;
-        }
-        let mut guides = Vec::with_capacity(guide_num as usize);
-        for _ in 0..guide_num {
-            let Ok(location) = r.i32() else { break };
-            let Ok(direction) = r.u8() else { break };
+        // Reference `loadResourceGridAndGuide`: the version is read and
+        // discarded, every field comes from `IteratorBase` (a short read is
+        // `-1`), a non-positive guide count yields no guides, and the
+        // resource is enabled as soon as it is seen.
+        let _version = r.i32_ref();
+        let horizontal_grid = r.i32_ref();
+        let vertical_grid = r.i32_ref();
+        let guide_num = r.i32_ref();
+        let mut guides = Vec::new();
+        let mut i = 0;
+        while i < guide_num {
             guides.push(GuideItem {
-                location,
-                direction,
+                location: r.i32_ref(),
+                direction: r.ch_ref(),
             });
+            i += 1;
         }
         self.grid_guide = Some(GridGuideResource {
             horizontal_grid,
@@ -685,55 +732,55 @@ impl PsdFile {
 
     fn load_slice(&mut self, data: &[u8]) {
         let mut r = Reader::new(data);
-        let Ok(version) = r.i32() else { return };
+        // Reference `loadResourceSlice`: the v6 fields all come from
+        // `IteratorBase`, so a short read yields `-1`/empty instead of
+        // aborting, and the resource is enabled for any v6 block. The
+        // `uint8_t` colour fields store `getCh()` (so a short read is
+        // `0xff`).
+        let version = r.i32_ref();
         if version == 6 {
             let mut slice = SliceResource {
-                bounding_left: r.i32().unwrap_or(0),
-                bounding_top: r.i32().unwrap_or(0),
-                bounding_right: r.i32().unwrap_or(0),
-                bounding_bottom: r.i32().unwrap_or(0),
+                bounding_left: r.i32_ref(),
+                bounding_top: r.i32_ref(),
+                bounding_right: r.i32_ref(),
+                bounding_bottom: r.i32_ref(),
                 ..Default::default()
             };
-            let Ok(group_name) = r.unicode_string() else {
-                return;
-            };
-            slice.group_name = group_name;
-            let slice_num = r.i32().unwrap_or(0);
-            if slice_num < 0 {
-                return;
-            }
-            for _ in 0..slice_num {
+            slice.group_name = r.unicode_string_ref();
+            let slice_num = r.i32_ref();
+            let mut i = 0;
+            while i < slice_num {
                 let mut item = SliceItem {
-                    id: r.i32().unwrap_or(0),
-                    group_id: r.i32().unwrap_or(0),
-                    origin: r.i32().unwrap_or(0),
+                    id: r.i32_ref(),
+                    group_id: r.i32_ref(),
+                    origin: r.i32_ref(),
                     ..Default::default()
                 };
                 if item.origin == 1 {
-                    item.associated_layer_id = r.i32().unwrap_or(-1);
+                    item.associated_layer_id = r.i32_ref();
                 } else {
                     item.associated_layer_id = -1;
                 }
-                let Ok(name) = r.unicode_string() else { break };
-                item.name = name;
-                item.slice_type = r.i32().unwrap_or(0);
-                item.left = r.i32().unwrap_or(0);
-                item.top = r.i32().unwrap_or(0);
-                item.right = r.i32().unwrap_or(0);
-                item.bottom = r.i32().unwrap_or(0);
-                item.url = r.unicode_string().unwrap_or_default();
-                item.target = r.unicode_string().unwrap_or_default();
-                item.message = r.unicode_string().unwrap_or_default();
-                item.alt_tag = r.unicode_string().unwrap_or_default();
-                item.cell_text_is_html = r.u8().unwrap_or(0) != 0;
-                item.cell_text = r.unicode_string().unwrap_or_default();
-                item.horizontal_align = r.i32().unwrap_or(0);
-                item.vertical_align = r.i32().unwrap_or(0);
-                item.color_a = r.u8().unwrap_or(0);
-                item.color_r = r.u8().unwrap_or(0);
-                item.color_g = r.u8().unwrap_or(0);
-                item.color_b = r.u8().unwrap_or(0);
+                item.name = r.unicode_string_ref();
+                item.slice_type = r.i32_ref();
+                item.left = r.i32_ref();
+                item.top = r.i32_ref();
+                item.right = r.i32_ref();
+                item.bottom = r.i32_ref();
+                item.url = r.unicode_string_ref();
+                item.target = r.unicode_string_ref();
+                item.message = r.unicode_string_ref();
+                item.alt_tag = r.unicode_string_ref();
+                item.cell_text_is_html = r.ch_ref() != 0;
+                item.cell_text = r.unicode_string_ref();
+                item.horizontal_align = r.i32_ref();
+                item.vertical_align = r.i32_ref();
+                item.color_a = r.ch_ref() as u8;
+                item.color_r = r.ch_ref() as u8;
+                item.color_g = r.ch_ref() as u8;
+                item.color_b = r.ch_ref() as u8;
                 slice.slices.push(item);
+                i += 1;
             }
             self.slice = Some(slice);
         }
@@ -957,25 +1004,31 @@ fn parse_layer_extra(bytes: &[u8]) -> Result<LayerExtra> {
 }
 
 fn parse_layer_mask(bytes: &[u8]) -> LayerMask {
-    let mut r = Reader::new(bytes);
     let mut mask = LayerMask::default();
-    mask.top = r.i32().unwrap_or(0);
-    mask.left = r.i32().unwrap_or(0);
-    mask.bottom = r.i32().unwrap_or(0);
-    mask.right = r.i32().unwrap_or(0);
-    mask.default_color = r.u8().map(i32::from).unwrap_or(0);
-    mask.flags = r.u8().map(i32::from).unwrap_or(0);
+    // The reference `LayerMaskParser` grammar requires the full 19-byte base
+    // record; a shorter block fails the parse and leaves the zero-initialised
+    // mask. The extra fields need the full 37-byte record. Only `top`,
+    // `left`, `bottom`, `right` and `default_color` are script-observable
+    // (`psdclass.cpp:317-371`).
+    if bytes.len() < 19 {
+        return mask;
+    }
+    mask.top = i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    mask.left = i32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+    mask.bottom = i32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+    mask.right = i32::from_be_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
+    mask.default_color = i32::from(bytes[16]);
+    mask.flags = i32::from(bytes[17]);
+    // Byte 18 (`kind`) is parsed and discarded.
     mask.width = mask.right - mask.left;
     mask.height = mask.bottom - mask.top;
-    // The extra fields are present only when the block is longer than the
-    // 20-byte base record.
-    if bytes.len() > 20 {
-        mask.real_flags = r.u8().map(i32::from).unwrap_or(0);
-        mask.real_user_mask_background = r.u8().map(i32::from).unwrap_or(0);
-        mask.enclosing_top = r.i32().unwrap_or(0);
-        mask.enclosing_left = r.i32().unwrap_or(0);
-        mask.enclosing_bottom = r.i32().unwrap_or(0);
-        mask.enclosing_right = r.i32().unwrap_or(0);
+    if bytes.len() >= 37 {
+        mask.real_flags = i32::from(bytes[19]);
+        mask.real_user_mask_background = i32::from(bytes[20]);
+        mask.enclosing_top = i32::from_be_bytes([bytes[21], bytes[22], bytes[23], bytes[24]]);
+        mask.enclosing_left = i32::from_be_bytes([bytes[25], bytes[26], bytes[27], bytes[28]]);
+        mask.enclosing_bottom = i32::from_be_bytes([bytes[29], bytes[30], bytes[31], bytes[32]]);
+        mask.enclosing_right = i32::from_be_bytes([bytes[33], bytes[34], bytes[35], bytes[36]]);
     }
     mask
 }
@@ -996,23 +1049,21 @@ fn apply_additional_layer(layer: &mut LayerInfo, additional: &AdditionalLayer) {
         b"SoCo" | b"GdFl" | b"PtFl" => layer.layer_type = LayerType::Fill,
         b"lsct" | b"lsdk" => load_section_divider(layer, additional),
         b"luni" => {
+            // Reference `loadLayerUnicodeName` (`getUnicodeString`).
             let mut r = Reader::new(&additional.data);
-            if let Ok(name) = r.unicode_string() {
-                layer.layer_name_unicode = name;
-            }
+            layer.layer_name_unicode = r.unicode_string_ref();
         }
         b"lyid" => {
+            // Reference `loadLayerId` (`getInt32`; `-1` on a short read).
             let mut r = Reader::new(&additional.data);
-            if let Ok(id) = r.i32() {
-                layer.layer_id = id;
-            }
+            layer.layer_id = r.i32_ref();
         }
         b"shmd" => load_layer_metadata(layer, additional),
         b"iOpa" => {
+            // Reference `loadLayerFillOpacity` (`getCh`; `-1` on a short
+            // read, which the reference stores in its `int` field).
             let mut r = Reader::new(&additional.data);
-            if let Ok(opacity) = r.u8() {
-                layer.fill_opacity = opacity;
-            }
+            layer.fill_opacity = r.ch_ref();
         }
         _ => {}
     }
@@ -1020,19 +1071,18 @@ fn apply_additional_layer(layer: &mut LayerInfo, additional: &AdditionalLayer) {
 
 fn load_section_divider(layer: &mut LayerInfo, additional: &AdditionalLayer) {
     let mut r = Reader::new(&additional.data);
-    let Ok(divider_type) = r.i32() else { return };
+    let divider_type = r.i32_ref();
     match divider_type {
         1 | 2 => layer.layer_type = LayerType::Folder,
         3 => layer.layer_type = LayerType::Hidden,
         _ => {}
     }
     if additional.data.len() >= 12 {
-        let _signature = r.i32();
-        if let Ok(key) = r.key4() {
-            layer.blend_mode = BlendMode::from_key(key);
-        }
+        let _signature = r.i32_ref();
+        let key = r.i32_ref();
+        layer.blend_mode = BlendMode::from_key(key.to_be_bytes());
         if additional.data.len() >= 16 {
-            let _sub_type = r.i32();
+            let _sub_type = r.i32_ref();
         }
     }
 }
@@ -1104,5 +1154,35 @@ fn load_layer_comp_descriptor(layer: &mut LayerInfo, r: &mut Reader<'_>) {
             None => info.is_enabled = last_enabled,
         }
         layer.layer_comps.insert(id, info);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Reader, parse_layer_mask};
+
+    /// A short read from the reference `IteratorBase` yields `-1`/empty
+    /// (`reference/cpp/plugins/psdfile/psdparse/psdparse.h:101-187`), not a
+    /// zero default.
+    #[test]
+    fn short_reads_use_the_reference_sentinels() {
+        let mut reader = Reader::new(&[0x01]);
+        assert_eq!(reader.i32_ref(), -1);
+        assert_eq!(reader.i16_ref(), -1);
+        assert_eq!(reader.ch_ref(), 1);
+        assert_eq!(reader.ch_ref(), -1);
+
+        let mut empty = Reader::new(&[]);
+        assert_eq!(empty.unicode_string_ref(), "");
+    }
+
+    /// A layer-mask block shorter than the reference grammar's 19-byte base
+    /// record leaves the zero-initialised mask (`LayerMaskParser` in
+    /// `reference/cpp/plugins/psdfile/psdparse/psdparse.h`).
+    #[test]
+    fn short_layer_mask_stays_zero() {
+        let mask = parse_layer_mask(&[0u8; 4]);
+        assert_eq!(mask.top, 0);
+        assert_eq!(mask.default_color, 0);
     }
 }

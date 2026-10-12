@@ -64,7 +64,11 @@ fn channel_byte_size(width: i32, height: i32, depth: u16) -> usize {
 }
 
 /// Decode one channel, returning its raw (big-endian) channel buffer.
-fn decode_channel(channel: &ChannelInfo, width: i32, height: i32, depth: u16) -> Vec<u8> {
+///
+/// The reference `getLayerImage` ignores the RLE/zip return value, so a
+/// corrupt stream yields whatever the destination held; this port surfaces a
+/// decompression failure as a typed error instead of a silent zero fill.
+fn decode_channel(channel: &ChannelInfo, width: i32, height: i32, depth: u16) -> Result<Vec<u8>> {
     let size = channel_byte_size(width, height, depth);
     let mut out = vec![0u8; size];
     match channel.compression {
@@ -76,14 +80,14 @@ fn decode_channel(channel: &ChannelInfo, width: i32, height: i32, depth: u16) ->
             decode_packbits(&mut out, &channel.data, height.max(0) as usize, 1, 0, 0);
         }
         2 => {
-            inflate_into(&mut out, &channel.data);
+            inflate_into(&mut out, &channel.data)?;
         }
         3 => {
-            decode_zip_with_prediction(&mut out, &channel.data, width, height, depth);
+            decode_zip_with_prediction(&mut out, &channel.data, width, height, depth)?;
         }
         _ => out.fill(0xff),
     }
-    out
+    Ok(out)
 }
 
 /// Expand PackBits rows into `dst` (reference `decodePackBits`).
@@ -152,14 +156,11 @@ fn decode_packbits(
 }
 
 /// Inflate a zlib stream into `dst` (reference `decodeZipWithoutPrediction`).
-fn inflate_into(dst: &mut [u8], src: &[u8]) {
-    let mut decoder = ZlibDecoder::new(src);
-    let mut buffer = Vec::new();
-    if decoder.read_to_end(&mut buffer).is_err() {
-        return;
-    }
+fn inflate_into(dst: &mut [u8], src: &[u8]) -> Result<()> {
+    let (buffer, _) = inflate_exact(src, dst.len())?;
     let count = buffer.len().min(dst.len());
     dst[..count].copy_from_slice(&buffer[..count]);
+    Ok(())
 }
 
 /// Inflate `expected` bytes and return them with the number of input bytes
@@ -182,13 +183,13 @@ fn decode_zip_with_prediction(
     width: i32,
     height: i32,
     depth: u16,
-) -> Option<()> {
+) -> Result<()> {
     if width <= 0 || height <= 0 {
-        return None;
+        return Ok(());
     }
     let width = width as usize;
     let height = height as usize;
-    let (mut buffer, _) = inflate_exact(src, dst.len()).ok()?;
+    let (mut buffer, _) = inflate_exact(src, dst.len())?;
     buffer.resize(dst.len(), 0);
 
     match depth {
@@ -244,9 +245,9 @@ fn decode_zip_with_prediction(
                 }
             }
         }
-        _ => return None,
+        _ => return Err(PsdError::Decompress(format!("unsupported depth {depth}"))),
     }
-    Some(())
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -518,7 +519,11 @@ fn merge_mask_to_alpha(
 // ---------------------------------------------------------------------------
 
 /// Decode one layer (reference `PSDFile::getLayerImage`).
-pub(crate) fn layer_image(psd: &PsdFile, layer: &LayerInfo, mode: ImageMode) -> Option<LayerImage> {
+pub(crate) fn layer_image(
+    psd: &PsdFile,
+    layer: &LayerInfo,
+    mode: ImageMode,
+) -> Result<Option<LayerImage>> {
     let mask = &layer.extra_data.layer_mask;
 
     let (left, top, width, height, opacity, native_type) = match mode {
@@ -541,13 +546,13 @@ pub(crate) fn layer_image(psd: &PsdFile, layer: &LayerInfo, mode: ImageMode) -> 
     };
 
     if width <= 0 || height <= 0 {
-        return None;
+        return Ok(None);
     }
 
     // A mask with no stored image is a 1x1 fill with the default colour.
     if mode == ImageMode::Mask && (mask.width <= 0 || mask.height <= 0) {
         let color = mask.default_color as u8;
-        return Some(LayerImage {
+        return Ok(Some(LayerImage {
             left: 0,
             top: 0,
             width: 1,
@@ -555,7 +560,7 @@ pub(crate) fn layer_image(psd: &PsdFile, layer: &LayerInfo, mode: ImageMode) -> 
             opacity: 255,
             native_type: BlendMode::Normal.as_tvp(),
             pixels: vec![color, color, color, 255],
-        });
+        }));
     }
 
     let depth = psd.header.depth;
@@ -589,7 +594,7 @@ pub(crate) fn layer_image(psd: &PsdFile, layer: &LayerInfo, mode: ImageMode) -> 
         } else {
             (image_rect.width(), image_rect.height())
         };
-        let decoded = decode_channel(channel, cw, ch, depth);
+        let decoded = decode_channel(channel, cw, ch, depth)?;
         match channel.id {
             -1 => alpha_index = Some(channels.len()),
             -2 | -3 => mask_index = Some(channels.len()),
@@ -600,7 +605,7 @@ pub(crate) fn layer_image(psd: &PsdFile, layer: &LayerInfo, mode: ImageMode) -> 
     }
 
     if mode == ImageMode::Mask && mask_index.is_none() {
-        return None;
+        return Ok(None);
     }
 
     let (output_width, output_height) = match mode {
@@ -662,7 +667,7 @@ pub(crate) fn layer_image(psd: &PsdFile, layer: &LayerInfo, mode: ImageMode) -> 
         _ => vec![0; output_width * output_height * 4],
     };
 
-    Some(LayerImage {
+    Ok(Some(LayerImage {
         left,
         top,
         width: output_width as u32,
@@ -670,36 +675,38 @@ pub(crate) fn layer_image(psd: &PsdFile, layer: &LayerInfo, mode: ImageMode) -> 
         opacity,
         native_type,
         pixels,
-    })
+    }))
 }
 
 /// Decode the merged composite image (reference `PSDFile::getMergedImage`).
-pub(crate) fn merged_image(psd: &PsdFile) -> Option<(u32, u32, Vec<u8>)> {
-    let image_data = psd.image_data.as_ref()?;
+pub(crate) fn merged_image(psd: &PsdFile) -> Result<Option<(u32, u32, Vec<u8>)>> {
+    let Some(image_data) = psd.image_data.as_ref() else {
+        return Ok(None);
+    };
     let width = psd.header.width;
     let height = psd.header.height;
     if width <= 0 || height <= 0 {
-        return None;
+        return Ok(None);
     }
     let depth = psd.header.depth;
     let channel_count = psd.header.channels as usize;
     if channel_count == 0 {
-        return None;
+        return Ok(None);
     }
     let size = channel_byte_size(width, height, depth);
     if size == 0 {
-        return None;
+        return Ok(None);
     }
 
     let mut reader = super::parse::Reader::new(image_data);
-    let compression = reader.u16().ok()?;
+    let compression = reader.u16()?;
     let body = &image_data[2..];
 
     let mut channels: Vec<Vec<u8>> = Vec::with_capacity(channel_count);
     match compression {
         0 => {
             if body.len() < size * channel_count {
-                return None;
+                return Err(PsdError::Decompress("truncated merged image data".into()));
             }
             for i in 0..channel_count {
                 channels.push(body[i * size..(i + 1) * size].to_vec());
@@ -723,7 +730,7 @@ pub(crate) fn merged_image(psd: &PsdFile) -> Option<(u32, u32, Vec<u8>)> {
         2 => {
             let mut offset = 0usize;
             for _ in 0..channel_count {
-                let (buffer, consumed) = inflate_exact(&body[offset..], size).ok()?;
+                let (buffer, consumed) = inflate_exact(&body[offset..], size)?;
                 offset += consumed;
                 let mut decoded = vec![0u8; size];
                 let count = buffer.len().min(size);
@@ -741,7 +748,7 @@ pub(crate) fn merged_image(psd: &PsdFile) -> Option<(u32, u32, Vec<u8>)> {
                 decode_zip_with_prediction(&mut decoded, remaining, width, height, depth)?;
                 // Advance past the zlib stream by re-inflating to measure the
                 // consumed input length.
-                let (_, consumed) = inflate_exact(remaining, size).ok()?;
+                let (_, consumed) = inflate_exact(remaining, size)?;
                 offset += consumed;
                 channels.push(decoded);
             }
@@ -778,5 +785,19 @@ pub(crate) fn merged_image(psd: &PsdFile) -> Option<(u32, u32, Vec<u8>)> {
         _ => vec![0; width * height * 4],
     };
 
-    Some((width as u32, height as u32, pixels))
+    Ok(Some((width as u32, height as u32, pixels)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::inflate_into;
+
+    /// A corrupt zlib stream is a typed decompression error, not a silent
+    /// zero fill (`reference/cpp/plugins/psdfile/psdparse/psdimage.cpp:589-605`
+    /// returns false when inflate fails).
+    #[test]
+    fn corrupt_zip_channel_is_an_error() {
+        let mut dst = [0u8; 8];
+        assert!(inflate_into(&mut dst, b"not a zlib stream").is_err());
+    }
 }

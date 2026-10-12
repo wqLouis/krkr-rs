@@ -301,35 +301,29 @@ pub(crate) fn try_value_as_i64(v: &Value) -> Result<i64, String> {
     }
 }
 
-/// The reference `TJSStringToInteger` (`tjs2/tjsVariant.cpp:301-307`): parse
-/// the leading number token of `str` with the lexer's number grammar
-/// (`tjs2/tjsLex.cpp:611-743`) and integer-ise it — an optional sign (plus
-/// following spaces), the `true`/`false` keywords, `0x`/`0b`/leading-zero
-/// octal forms, and decimal integer/real literals (including `e` exponents).
-/// Anything unparsable yields `0`; trailing garbage (`"12abc"`) is ignored.
-pub(crate) fn tjs_string_to_integer(s: &str) -> i64 {
+// `tjs_string_to_integer` lives in the standalone `tjsnum` module so the
+// KAG attribute walk can include it without the rest of `system`.
+pub(crate) use crate::natives::tjsnum::tjs_string_to_integer;
+
+/// The reference `TJSStringToReal` (`tjs2/tjsVariant.cpp:309-313`): the same
+/// lexer number grammar as [`tjs_string_to_integer`], but a decimal token with
+/// a point or exponent keeps its fractional value (`"12.5abc"` is `12.5`);
+/// every other form converts through its integer value, exactly as the
+/// reference's `AsReal()` does for an integer variant. Anything unparsable
+/// yields `0.0`; trailing garbage is ignored.
+pub(crate) fn tjs_string_to_real(s: &str) -> f64 {
     let bytes = s.as_bytes();
     let mut pos = 0usize;
     let mut negative = false;
     if pos < bytes.len() && (bytes[pos] == b'+' || bytes[pos] == b'-') {
         negative = bytes[pos] == b'-';
         pos += 1;
-        // The lexer skips spaces after the sign (`TJSSkipSpace`,
-        // `tjsLex.cpp:720-730`).
         while pos < bytes.len() && bytes[pos] == b' ' {
             pos += 1;
         }
     }
     let rest = &s[pos..];
-    let apply_sign = |value: i64| {
-        if negative {
-            value.wrapping_neg()
-        } else {
-            value
-        }
-    };
-    // Keyword forms (`tjsLex.cpp:614-634`), matched like `TJSStringMatch`
-    // (case-sensitive, and not followed by an alphabetic character or `_`).
+    let apply_sign = |value: f64| if negative { -value } else { value };
     let word_follows = |after: &str| {
         after
             .chars()
@@ -337,13 +331,10 @@ pub(crate) fn tjs_string_to_integer(s: &str) -> i64 {
             .is_some_and(|c| c.is_alphabetic() || c == '_')
     };
     for (keyword, value) in [
-        ("true", 1i64),
-        ("false", 0i64),
-        // `NaN`/`Infinity` are real literals; the reference's
-        // `(tTVInteger)` cast of them is platform-dependent and yields the
-        // integer-indefinite value on its primary (x86) target.
-        ("NaN", i64::MIN),
-        ("Infinity", i64::MIN),
+        ("true", 1.0f64),
+        ("false", 0.0f64),
+        ("NaN", f64::NAN),
+        ("Infinity", f64::INFINITY),
     ] {
         if let Some(after) = rest.strip_prefix(keyword)
             && !word_follows(after)
@@ -352,51 +343,27 @@ pub(crate) fn tjs_string_to_integer(s: &str) -> i64 {
         }
     }
     let digits = rest.as_bytes();
-    // `0x`/`0X` hexadecimal (`tjsLex.cpp:626-630`).
     if digits.len() >= 2 && digits[0] == b'0' && (digits[1] == b'x' || digits[1] == b'X') {
-        return apply_sign(parse_radix(&rest[2..], 16));
+        return apply_sign(crate::natives::tjsnum::parse_radix(&rest[2..], 16) as f64);
     }
-    // `0b`/`0B` binary (`tjsLex.cpp:632-636`).
     if digits.len() >= 2 && digits[0] == b'0' && (digits[1] == b'b' || digits[1] == b'B') {
-        return apply_sign(parse_radix(&rest[2..], 2));
+        return apply_sign(crate::natives::tjsnum::parse_radix(&rest[2..], 2) as f64);
     }
-    // A leading zero that is neither `0x`, `0b`, `0.` nor `0e` is octal
-    // (`tjsLex.cpp:638-655`).
     if digits.first() == Some(&b'0') && digits.len() > 1 {
         match digits[1] {
             b'.' | b'e' | b'E' => {}
-            b'p' | b'P' => return 0,
-            _ => return apply_sign(parse_radix(rest, 8)),
+            b'p' | b'P' => return 0.0,
+            _ => return apply_sign(crate::natives::tjsnum::parse_radix(rest, 8) as f64),
         }
     }
-    // Decimal integer or real (`tjsLex.cpp:686-698`).
-    apply_sign(parse_decimal(rest))
+    apply_sign(parse_decimal_real(rest))
 }
 
-/// Parse leading digits of `s` in `radix` (reference
-/// `TJSParseNonDecimalNumber`), accumulating with the reference's wrapping
-/// 64-bit arithmetic (`tjsLex.cpp:288-310`); `0` when no digit parses.
-fn parse_radix(s: &str, radix: u32) -> i64 {
-    let mut value: i64 = 0;
-    let mut any = false;
-    for c in s.chars() {
-        let Some(digit) = c.to_digit(radix) else {
-            break;
-        };
-        any = true;
-        value = value
-            .wrapping_mul(i64::from(radix))
-            .wrapping_add(i64::from(digit));
-    }
-    if any { value } else { 0 }
-}
-
-/// Parse a leading decimal number token (`TJSExtractNumber` +
-/// `TJSParseDecimalInteger`/`TJSParseDecimalReal`, `tjsLex.cpp:382-429` and
-/// `447-470`): digits with at most one `.` and at most one `e`/`E` exponent
-/// (optional spaces and sign after the exponent marker). A token with a
-/// point or exponent is real and truncates towards zero via `as i64`.
-fn parse_decimal(s: &str) -> i64 {
+/// Parse a leading decimal number token as a real (`TJSExtractNumber` +
+/// `TJSParseDecimalReal`, `tjsLex.cpp:447-509`): digits with at most one `.`
+/// and one `e`/`E` exponent. A token without a point or exponent keeps the
+/// reference's wrapping integer value; an unparsable prefix is `0.0`.
+fn parse_decimal_real(s: &str) -> f64 {
     let bytes = s.as_bytes();
     let mut i = 0usize;
     let mut seen_point = false;
@@ -428,28 +395,24 @@ fn parse_decimal(s: &str) -> i64 {
         }
     }
     if end == 0 {
-        return 0;
+        return 0.0;
     }
     let token = &s[..end];
     if seen_point || seen_exp {
-        // Re-slicing to `end` keeps a valid `f64` literal; a dangling `e`
-        // exponent marker without digits (`"1e"`) falls back to the mantissa
-        // prefix, matching `strtod`'s behaviour in
-        // `TJSParseDecimalReal` (`tjsLex.cpp:472-509`).
         token
             .parse::<f64>()
             .or_else(|_| match token.find(['e', 'E']) {
                 Some(exp) if exp > 0 => token[..exp].parse::<f64>().map_err(|_| ()),
                 _ => Err(()),
             })
-            .map_or(0, |real| real as i64)
+            .unwrap_or(0.0)
     } else {
         token
             .bytes()
             .filter(u8::is_ascii_digit)
             .fold(0i64, |value, digit| {
                 value.wrapping_mul(10).wrapping_add(i64::from(digit - b'0'))
-            })
+            }) as f64
     }
 }
 
@@ -2541,4 +2504,37 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{tjs_string_to_integer, tjs_string_to_real};
+
+    /// `TJSStringToReal` parses the leading number token
+    /// (`reference/cpp/core/tjs2/tjsVariant.cpp:309-313`,
+    /// `reference/cpp/core/tjs2/tjsLex.cpp:611-743`), so `"12abc"` is 12,
+    /// not the `0` a whole-string parse would produce.
+    #[test]
+    fn string_to_real_parses_the_leading_number() {
+        assert_eq!(tjs_string_to_real("12abc"), 12.0);
+        assert_eq!(tjs_string_to_real("12.5abc"), 12.5);
+        // The sign is recognised only at the first character, and a space is
+        // skipped only *after* a sign (`tjsLex.cpp:700-720`).
+        assert_eq!(tjs_string_to_real("  -3.5e2xyz"), 0.0);
+        assert_eq!(tjs_string_to_real("- 3.5e2xyz"), -350.0);
+        assert_eq!(tjs_string_to_real("0x10"), 16.0);
+        assert_eq!(tjs_string_to_real("true"), 1.0);
+        assert_eq!(tjs_string_to_real("false"), 0.0);
+        assert_eq!(tjs_string_to_real("abc"), 0.0);
+    }
+
+    /// `TJSStringToInteger` (`reference/cpp/core/tjs2/tjsVariant.cpp:301-307`)
+    /// parses the same leading token and truncates a real towards zero.
+    #[test]
+    fn string_to_integer_parses_the_leading_number() {
+        assert_eq!(tjs_string_to_integer("12abc"), 12);
+        assert_eq!(tjs_string_to_integer("12.9abc"), 12);
+        assert_eq!(tjs_string_to_integer("0x10"), 16);
+        assert_eq!(tjs_string_to_integer("abc"), 0);
+    }
 }

@@ -227,7 +227,9 @@ pub struct VideoOverlay {
     status: PlayStatus,
     playing: bool,
     position_ms: i64,
-    play_rate: f64,
+    /// The playback-rate multiplier (`1.0` is native speed). It stores any
+    /// value it is given.
+    pub play_rate: f64,
     /// Whether whole-stream looping is enabled.
     pub looping: bool,
     segment_start: i64,
@@ -465,17 +467,6 @@ impl VideoOverlay {
     /// The stream frame rate in frames per second (0.0 when closed).
     pub fn fps(&self) -> f64 {
         self.spec.map(|s| f64::from(s.fps)).unwrap_or(0.0)
-    }
-
-    /// The playback-rate multiplier (`1.0` is native speed).
-    pub fn play_rate(&self) -> f64 {
-        self.play_rate
-    }
-
-    /// Set the playback-rate multiplier. The reference stores whatever it is
-    /// given and never validates it.
-    pub fn set_play_rate(&mut self, rate: f64) {
-        self.play_rate = rate;
     }
 
     /// Seek to `milliseconds` (clamped to `>= 0`). The reference `position`
@@ -824,4 +815,22 @@ pub fn blit_frame_to_layer_opacity(
         blit_copy_clipped(dst, dx, dy, &source, src_rect, clip);
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The play-rate field stores any value it is given; the reference never
+    /// validates it (`reference/cpp/core/movie/ffmpeg/KRMoviePlayer.cpp:78`).
+    #[test]
+    fn play_rate_stores_any_value() {
+        let mut overlay = VideoOverlay::new();
+        overlay.play_rate = 0.0;
+        assert_eq!(overlay.play_rate, 0.0);
+        overlay.play_rate = -2.0;
+        assert_eq!(overlay.play_rate, -2.0);
+        overlay.play_rate = 2.0;
+        assert_eq!(overlay.play_rate, 2.0);
+    }
 }

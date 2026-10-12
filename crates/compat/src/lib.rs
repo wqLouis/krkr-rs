@@ -60,9 +60,6 @@ pub use natives::video::{VideoSource, set_video_source, video_advance};
 pub use natives::sound::{
     AudioDecoder, add_audio_decoder, set_sound_render_driven, sound_poll, sound_render,
 };
-// The disc-sound host seam that installs the L1 media audio decoder for
-// `CDDASoundBuffer`/`MIDISoundBuffer` (mirrors [`add_audio_decoder`]).
-pub use natives::cdda_midi::set_disc_audio_decoder;
 // The built-in `System` poll and the host's exit-request drain: an L4
 // [`FrameBody`] forwards its `continuous_handler_poll` step here and the frame
 // loop consumes `take_exit_request`.

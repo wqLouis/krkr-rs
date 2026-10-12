@@ -140,12 +140,14 @@ fn object_params(services: &CompatServices, objthis: *mut c_void) -> (SamplePara
 
 /// Perform the reference constructor's `objthis.useVisBuffer = 1` write.
 ///
-/// Failures are ignored: the reference only logs them, and an object that is
-/// not a live `WaveSoundBuffer` (for example the class object itself) simply
-/// has no visualization buffer to enable.
+/// The reference logs a failed write and continues (`getSample.cpp:79-82`):
+/// an object that is not a live `WaveSoundBuffer` (for example the class
+/// object itself) simply has no visualization buffer to enable.
 fn mark_use_vis_buffer(host: &Tjs2Engine, objthis: *mut c_void) {
-    if let Ok(object) = host.retain_object_detached(objthis) {
-        let _ = host.set_member(object.raw_id(), "useVisBuffer", &TjsValue::Integer(1));
+    if let Ok(object) = host.retain_object_detached(objthis)
+        && let Err(error) = host.set_member(object.raw_id(), "useVisBuffer", &TjsValue::Integer(1))
+    {
+        log::warn!("WaveSoundBuffer.useVisBuffer=1 failed: {error}");
     }
 }
 
@@ -180,7 +182,7 @@ fn call_get_vis_buffer(
     Ok(match result {
         TjsValue::Integer(value) => value,
         TjsValue::Real(value) => value as i64,
-        TjsValue::String(value) => value.parse().unwrap_or(0),
+        TjsValue::String(value) => crate::natives::system::tjs_string_to_integer(&value),
         _ => 0,
     })
 }

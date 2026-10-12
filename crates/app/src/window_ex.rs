@@ -14,12 +14,13 @@ type MonitorRect = (i32, i32, i32, i32, i32, i32, i32, i32, bool);
 /// Installs every `windowEx` host-fact provider on `host`.
 ///
 /// `surface_size` is the render surface the primary monitor covers. An
-/// unknown system-metric name yields `0` and an unset environment variable
-/// yields no value.
+/// unknown system-metric name yields `0`, an unset environment variable
+/// yields no value, and a surface dimension that does not fit the Win32
+/// monitor rectangle makes `getDisplayMonitors` report an error.
 pub fn install_window_ex_facts(host: &CompatHost, surface_size: (u32, u32)) {
-    let primary = primary_monitor(surface_size);
-
-    host.set_window_ex_display_monitors(move || Ok(vec![primary]));
+    host.set_window_ex_display_monitors(move || {
+        primary_monitor(surface_size).map(|monitor| vec![monitor])
+    });
     host.set_window_ex_cursor_pos(|| Ok((0, 0)));
     host.set_window_ex_set_cursor_pos(|_x, _y| Ok(()));
     host.set_window_ex_system_metrics(move |name| Ok(system_metric(name, surface_size)));
@@ -34,10 +35,25 @@ pub fn install_window_ex_facts(host: &CompatHost, surface_size: (u32, u32)) {
 }
 
 /// Returns the one primary monitor covering `surface_size`.
-fn primary_monitor(surface_size: (u32, u32)) -> MonitorRect {
-    let width = i32::try_from(surface_size.0).unwrap_or(i32::MAX);
-    let height = i32::try_from(surface_size.1).unwrap_or(i32::MAX);
-    (0, 0, width, height, 0, 0, width, height, true)
+///
+/// A Win32 monitor rectangle holds `LONG` edges, so a surface dimension that
+/// does not fit in `i32` is reported instead of clamped.
+fn primary_monitor(surface_size: (u32, u32)) -> Result<MonitorRect, String> {
+    let width = i32::try_from(surface_size.0).map_err(|_| {
+        format!(
+            "surface width {} is outside the monitor-rectangle range 0..={}",
+            surface_size.0,
+            i32::MAX
+        )
+    })?;
+    let height = i32::try_from(surface_size.1).map_err(|_| {
+        format!(
+            "surface height {} is outside the monitor-rectangle range 0..={}",
+            surface_size.1,
+            i32::MAX
+        )
+    })?;
+    Ok((0, 0, width, height, 0, 0, width, height, true))
 }
 
 /// Returns the plausible Win32 value for the uppercased metric `name`.
@@ -93,8 +109,8 @@ mod tests {
     #[test]
     fn primary_monitor_covers_the_surface() {
         assert_eq!(
-            primary_monitor((1280, 720)),
-            (0, 0, 1280, 720, 0, 0, 1280, 720, true)
+            primary_monitor((1280, 720)).ok(),
+            Some((0, 0, 1280, 720, 0, 0, 1280, 720, true))
         );
     }
 

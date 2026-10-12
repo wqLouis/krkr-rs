@@ -45,7 +45,16 @@ impl Value {
     pub(crate) fn as_integer(&self) -> Option<i32> {
         match self {
             Self::Integer(value) => Some(*value),
-            _ => None,
+            Self::Reference
+            | Self::Descriptor(_)
+            | Self::List(_)
+            | Self::Double
+            | Self::UnitFloat
+            | Self::Text(_)
+            | Self::Enumerated
+            | Self::Boolean(_)
+            | Self::Class
+            | Self::Alias => None,
         }
     }
 
@@ -53,7 +62,16 @@ impl Value {
     pub(crate) fn as_descriptor(&self) -> Option<&Descriptor> {
         match self {
             Self::Descriptor(descriptor) => Some(descriptor),
-            _ => None,
+            Self::Reference
+            | Self::List(_)
+            | Self::Double
+            | Self::UnitFloat
+            | Self::Text(_)
+            | Self::Enumerated
+            | Self::Integer(_)
+            | Self::Boolean(_)
+            | Self::Class
+            | Self::Alias => None,
         }
     }
 }

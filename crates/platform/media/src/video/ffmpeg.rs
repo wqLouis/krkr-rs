@@ -329,7 +329,7 @@ fn decode_audio_track(
                         message: format!("{name}: audio resampler: {error}"),
                     })?;
                     spec.sample_rate = rate;
-                    spec.channels = u16::try_from(out_layout.channels().max(0)).unwrap_or(0);
+                    spec.channels = channel_count(name, out_layout.channels())?;
                     resampler = Some(converter);
                 }
 
@@ -365,7 +365,10 @@ fn decode_audio_track(
                 }
             }
             Err(FfmpegError::Eof) => {
-                let _ = decoder.send_eof();
+                decoder.send_eof().map_err(|error| MediaError::Decode {
+                    format: String::new(),
+                    message: format!("{name}: audio decoder flush: {error}"),
+                })?;
                 demux_eof = true;
             }
             Err(error) => {
@@ -400,6 +403,20 @@ fn audio_layout(frame: &AudioFrame) -> ChannelLayout {
     } else {
         ChannelLayout::default(i32::from(frame.channels().max(1)))
     }
+}
+
+/// Converts a decoder channel count to the `AudioSpec::channels` field.
+///
+/// The reference keeps the count in a 32-bit `tTVPWaveFormat::Channels`
+/// (`reference/cpp/core/sound/WaveIntf.h:47`); a count that does not fit the
+/// port's `u16` is reported rather than clamped.
+fn channel_count(name: &str, channels: i32) -> Result<u16, MediaError> {
+    u16::try_from(channels).map_err(|_| MediaError::InvalidData {
+        message: format!(
+            "{name}: audio channel count {channels} is outside 0..={}",
+            u16::MAX
+        ),
+    })
 }
 
 /// Runs the resampler over one decoded frame and copies the packed `f32`
@@ -481,7 +498,12 @@ pub fn audio(m: &Media, state: &VideoDecoderState) -> Result<DecodedAudio, Media
 fn seek_to(state: &mut VideoDecoderState, at_ms: u64) -> Result<(), MediaError> {
     // `avformat_seek_file` with stream index -1 expects AV_TIME_BASE units
     // (microseconds).
-    let timestamp = i64::try_from(at_ms.saturating_mul(1000)).unwrap_or(i64::MAX);
+    let timestamp = at_ms
+        .checked_mul(1000)
+        .and_then(|micros| i64::try_from(micros).ok())
+        .ok_or_else(|| MediaError::InvalidData {
+            message: format!("{}: seek target {at_ms} ms is out of range", state.name),
+        })?;
     state
         .input
         .seek(timestamp, ..)
@@ -521,7 +543,10 @@ fn decode_next(state: &mut VideoDecoderState) -> Result<Option<RgbaFrame>, Media
                 }
             }
             Err(FfmpegError::Eof) => {
-                let _ = state.decoder.send_eof();
+                state
+                    .decoder
+                    .send_eof()
+                    .map_err(|error| decode_error(&state.name, error))?;
                 state.eof = true;
             }
             Err(error) => {
@@ -599,20 +624,67 @@ fn convert_frame(
         rgba.extend_from_slice(&data[start..end]);
     }
 
-    let pts_ms = frame_pts_ms(state.time_base, frame);
+    let pts_ms = frame_pts_ms(state.time_base, frame, &state.name)?;
     Ok(RgbaFrame::new(width, height, pts_ms, rgba))
 }
 
 /// Converts a frame timestamp in stream time-base units to milliseconds.
-fn frame_pts_ms(time_base: Rational, frame: &VideoFrame) -> u64 {
+///
+/// A missing or non-positive timestamp is presented at time 0, matching the
+/// reference, which substitutes 0 for an unusable PTS
+/// (`reference/cpp/core/movie/ffmpeg/VideoPlayer.cpp:815-819`).
+fn frame_pts_ms(time_base: Rational, frame: &VideoFrame, name: &str) -> Result<u64, MediaError> {
     let Some(timestamp) = frame.timestamp().or_else(|| frame.pts()) else {
-        return 0;
+        return Ok(0);
     };
     let numerator = i128::from(time_base.numerator());
     let denominator = i128::from(time_base.denominator());
     if timestamp <= 0 || numerator <= 0 || denominator <= 0 {
-        return 0;
+        return Ok(0);
     }
     let ms = i128::from(timestamp) * numerator * 1000 / denominator;
-    u64::try_from(ms).unwrap_or(0)
+    u64::try_from(ms).map_err(|_| MediaError::InvalidData {
+        message: format!("{name}: frame timestamp {ms} ms is out of range"),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Rational, VideoFrame, channel_count, frame_pts_ms};
+
+    /// A channel count that fits `AudioSpec::channels` is stored as reported;
+    /// the reference keeps it in a 32-bit `tTVPWaveFormat::Channels`
+    /// (`reference/cpp/core/sound/WaveIntf.h:47`).
+    #[test]
+    fn channel_count_accepts_a_u16_count() {
+        assert_eq!(channel_count("<video>", 2).ok(), Some(2));
+    }
+
+    /// A count above the `AudioSpec::channels` range is reported, not clamped;
+    /// the reference's 32-bit field would hold it
+    /// (`reference/cpp/core/sound/WaveIntf.h:47`).
+    #[test]
+    fn channel_count_rejects_a_count_over_u16() {
+        let over = i32::from(u16::MAX) + 1;
+        assert!(channel_count("<video>", over).is_err());
+    }
+
+    /// A frame PTS is rescaled from the stream time base to milliseconds.
+    #[test]
+    fn frame_pts_ms_rescales_a_positive_timestamp() {
+        let mut frame = VideoFrame::empty();
+        frame.set_pts(Some(15));
+        assert_eq!(
+            frame_pts_ms(Rational::new(1, 30), &frame, "<video>"),
+            Ok(500)
+        );
+    }
+
+    /// A frame with no usable PTS is presented at time 0, matching the
+    /// reference (`reference/cpp/core/movie/ffmpeg/VideoPlayer.cpp:815-819`).
+    #[test]
+    fn frame_pts_ms_treats_a_missing_timestamp_as_zero() {
+        let frame = VideoFrame::empty();
+        assert_eq!(frame_pts_ms(Rational::new(1, 30), &frame, "<video>"), Ok(0));
+    }
 }

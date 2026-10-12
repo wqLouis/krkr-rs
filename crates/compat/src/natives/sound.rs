@@ -137,6 +137,7 @@ use std::sync::Arc;
 
 use api::media::AudioSpec;
 
+use engine::StorageReadError;
 use engine::sound::{
     LoopCondition, LoopInfo, LoopLink, Mixer, SoundBuffer, SoundChannel, SoundError, SoundEvent,
     SoundLabel, SoundSource, Status,
@@ -208,7 +209,7 @@ pub(crate) fn parse_sli(bytes: &[u8]) -> Result<LoopInfo, SliError> {
 /// Parse the reference condition spelling (case-insensitive).
 fn parse_condition(text: &str) -> Option<LoopCondition> {
     match text.trim().to_ascii_lowercase().as_str() {
-        "no" | "" => Some(LoopCondition::None),
+        "no" => Some(LoopCondition::None),
         "eq" => Some(LoopCondition::Equal),
         "ne" => Some(LoopCondition::NotEqual),
         "gt" => Some(LoopCondition::Greater),
@@ -219,25 +220,71 @@ fn parse_condition(text: &str) -> Option<LoopCondition> {
     }
 }
 
+/// Reference `tTVPWaveLoopManager::GetInt64` (`WaveLoopManager.cpp:963-989`):
+/// skip leading whitespace, an optional `-` (plus spaces), then the leading
+/// decimal digits. `None` only when the value is empty or just a sign; a
+/// non-numeric value parses as `0`, exactly like the reference.
+fn sli_get_int64(value: &str) -> Option<i64> {
+    let bytes = value.as_bytes();
+    let mut pos = 0usize;
+    while pos < bytes.len() && bytes[pos] <= 0x20 {
+        pos += 1;
+    }
+    if pos >= bytes.len() {
+        return None;
+    }
+    let mut negative = false;
+    if bytes[pos] == b'-' {
+        negative = true;
+        pos += 1;
+        while pos < bytes.len() && bytes[pos] <= 0x20 {
+            pos += 1;
+        }
+        if pos >= bytes.len() {
+            return None;
+        }
+    }
+    let mut magnitude: i64 = 0;
+    while pos < bytes.len() && bytes[pos].is_ascii_digit() {
+        magnitude = magnitude
+            .wrapping_mul(10)
+            .wrapping_add(i64::from(bytes[pos] - b'0'));
+        pos += 1;
+    }
+    Some(if negative { -magnitude } else { magnitude })
+}
+
+/// [`sli_get_int64`] narrowed to the port's `u64` sample positions. A
+/// negative `.sli` value is unrepresentable here and becomes a typed error
+/// (the reference stores an `i64`).
+fn sli_get_u64(value: &str) -> Option<u64> {
+    sli_get_int64(value).and_then(|value| u64::try_from(value).ok())
+}
+
+/// Reference `tTVPWaveLoopManager::GetBool` (`WaveLoopManager.cpp:992-1011`):
+/// `True`/`False`/`Yes`/`No`, case-insensitive; anything else fails.
+fn sli_get_bool(value: &str) -> Option<bool> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes") {
+        Some(true)
+    } else if value.eq_ignore_ascii_case("false") || value.eq_ignore_ascii_case("no") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 /// Old format: `LoopStart=<n>` / `LoopLength=<n>`.
 fn parse_old(text: &str) -> Result<LoopInfo, SliError> {
-    let find = |key: &str| -> Option<&str> {
-        text.find(key).map(|i| {
-            let rest = &text[i + key.len()..];
-            let end = rest
-                .find(|c: char| !c.is_ascii_digit())
-                .unwrap_or(rest.len());
-            &rest[..end]
-        })
-    };
-    let length: u64 = find("LoopLength=")
-        .ok_or_else(|| sli_error("sli: missing LoopLength"))?
-        .parse()
-        .map_err(|_| sli_error("sli: invalid LoopLength"))?;
-    let start: u64 = find("LoopStart=")
-        .ok_or_else(|| sli_error("sli: missing LoopStart"))?
-        .parse()
-        .map_err(|_| sli_error("sli: invalid LoopStart"))?;
+    // Reference `ReadInformation` (`WaveLoopManager.cpp:1296-1316`) finds the
+    // keys with `strstr` and parses each with `GetInt64`.
+    let find = |key: &str| -> Option<&str> { text.find(key).map(|i| &text[i + key.len()..]) };
+    let length = find("LoopLength=")
+        .ok_or_else(|| sli_error("sli: missing LoopLength"))
+        .and_then(|value| sli_get_u64(value).ok_or_else(|| sli_error("sli: invalid LoopLength")))?;
+    let start = find("LoopStart=")
+        .ok_or_else(|| sli_error("sli: missing LoopStart"))
+        .and_then(|value| sli_get_u64(value).ok_or_else(|| sli_error("sli: invalid LoopStart")))?;
     Ok(LoopInfo::new(
         vec![LoopLink::new(
             start.saturating_add(length),
@@ -289,7 +336,7 @@ fn parse_v2(text: &str) -> Result<LoopInfo, SliError> {
             if word.eq_ignore_ascii_case("Link") {
                 info.links.push(parse_link(body)?);
             } else {
-                info.labels.push(parse_label(body));
+                info.labels.push(parse_label(body)?);
             }
         } else {
             return Err(sli_error(format!("sli: unexpected token '{word}'")));
@@ -303,35 +350,49 @@ fn parse_link(body: &str) -> Result<LoopLink, SliError> {
     let mut link = LoopLink::new(0, 0, false, LoopCondition::None, 0, 0);
     for (key, value) in entities(body) {
         match key.to_ascii_lowercase().as_str() {
-            "from" => link.from = value.trim().parse().unwrap_or(0),
-            "to" => link.to = value.trim().parse().unwrap_or(0),
-            "smooth" => link.smooth = value.trim().eq_ignore_ascii_case("true"),
+            "from" => {
+                link.from = sli_get_u64(&value).ok_or_else(|| sli_error("sli: invalid From"))?
+            }
+            "to" => link.to = sli_get_u64(&value).ok_or_else(|| sli_error("sli: invalid To"))?,
+            "smooth" => {
+                link.smooth =
+                    sli_get_bool(&value).ok_or_else(|| sli_error("sli: invalid Smooth"))?
+            }
             "condition" => {
                 link.condition = parse_condition(&value)
                     .ok_or_else(|| sli_error(format!("sli: unknown Condition '{value}'")))?
             }
-            "refvalue" => link.ref_value = value.trim().parse().unwrap_or(0),
-            "condvar" => link.cond_var = value.trim().parse().unwrap_or(0),
-            _ => {}
+            "refvalue" => {
+                link.ref_value =
+                    sli_get_int64(&value).ok_or_else(|| sli_error("sli: invalid RefValue"))?
+            }
+            "condvar" => {
+                link.cond_var =
+                    sli_get_int64(&value).ok_or_else(|| sli_error("sli: invalid CondVar"))?
+            }
+            _ => return Err(sli_error(format!("sli: unknown Link key '{key}'"))),
         }
     }
     Ok(link)
 }
 
 /// Parse one `key=value;` block body into a [`SoundLabel`].
-fn parse_label(body: &str) -> SoundLabel {
+fn parse_label(body: &str) -> Result<SoundLabel, SliError> {
     let mut label = SoundLabel::new(0, String::new());
     for (key, value) in entities(body) {
         match key.to_ascii_lowercase().as_str() {
-            "position" => label.position = value.trim().parse().unwrap_or(0),
+            "position" => {
+                label.position =
+                    sli_get_u64(&value).ok_or_else(|| sli_error("sli: invalid Position"))?
+            }
             "name" => {
                 let v = value.trim();
                 label.name = v.trim_matches(|c| c == '\'' || c == '"').to_string();
             }
-            _ => {}
+            _ => return Err(sli_error(format!("sli: unknown Label key '{key}'"))),
         }
     }
-    label
+    Ok(label)
 }
 
 /// Split a `key=value; key=value;` body into pairs (`GetEntityToken`).
@@ -576,7 +637,7 @@ fn value_as_f64(v: &Value) -> f64 {
     match v.ty {
         VAL_INTEGER => v.integer as f64,
         VAL_REAL => v.real,
-        VAL_STRING => value_as_string(v).parse().unwrap_or(0.0),
+        VAL_STRING => crate::natives::system::tjs_string_to_real(&value_as_string(v)),
         _ => 0.0,
     }
 }
@@ -1263,7 +1324,17 @@ extern "C" fn sound_open(
                 );
             }
         };
-        let sli_bytes = unsafe { &*storage }.read(&format!("{name}.sli")).ok();
+        let sli_name = format!("{name}.sli");
+        // The reference tests `TVPIsExistentStorage(sliname)` and only then
+        // opens and reads it (`WaveImpl.cpp:3062-3082`); a missing side-car
+        // is skipped, but a read failure after the existence check
+        // propagates. The error is carried past the decode below so a
+        // decoder failure still reports first, as in the reference.
+        let (sli_bytes, sli_read_error) = match unsafe { &*storage }.read(&sli_name) {
+            Ok(bytes) => (Some(bytes), None),
+            Err(StorageReadError::NotFound(_)) => (None, None),
+            Err(error) => (None, Some(error)),
+        };
         // The *parse* result is carried past the decode: the reference
         // creates the decoder and assigns `InputFormat`/`Frequency` *before*
         // it parses the side-car (`WaveImpl.cpp:3043-3056`) and only then
@@ -1331,6 +1402,12 @@ extern "C" fn sound_open(
         });
         if stored.is_none() {
             return report_error(out_error, "WaveSoundBuffer.open: not constructed");
+        }
+        if let Some(error) = sli_read_error {
+            return report_error(
+                out_error,
+                &format!("WaveSoundBuffer.open: cannot read {sli_name:?}: {error}"),
+            );
         }
         if let Some(Err(error)) = &sli_parsed {
             // Reference `TVPThrowExceptionMessage(TVPInvalidLoopInformation,
@@ -3791,5 +3868,33 @@ mod tests {
         }
         assert_eq!(filled, expected.len());
         assert_eq!(observed, expected);
+    }
+
+    /// Reference `GetInt64` parses the leading decimal digits after optional
+    /// whitespace and a sign, and only fails on an empty value
+    /// (`reference/cpp/core/sound/WaveLoopManager.cpp:963-989`).
+    #[test]
+    fn sli_get_int64_parses_the_reference_prefix() {
+        assert_eq!(sli_get_int64("12abc"), Some(12));
+        assert_eq!(sli_get_int64(" -42"), Some(-42));
+        assert_eq!(sli_get_int64("abc"), Some(0));
+        assert_eq!(sli_get_int64(""), None);
+        assert_eq!(sli_get_int64("-"), None);
+    }
+
+    /// Reference `GetBool` accepts `True`/`False`/`Yes`/`No`
+    /// (`reference/cpp/core/sound/WaveLoopManager.cpp:992-1011`).
+    #[test]
+    fn sli_get_bool_accepts_the_reference_spellings() {
+        assert_eq!(sli_get_bool("yes"), Some(true));
+        assert_eq!(sli_get_bool("FALSE"), Some(false));
+        assert_eq!(sli_get_bool("maybe"), None);
+    }
+
+    /// An unknown `Link` key fails the reference parse
+    /// (`reference/cpp/core/sound/WaveLoopManager.cpp:1178-1200`).
+    #[test]
+    fn sli_rejects_unknown_keys() {
+        assert!(parse_sli(b"#2.00\nLink { From=1; Bogus=2; }\n").is_err());
     }
 }

@@ -113,8 +113,14 @@ impl AndroidHost {
     }
 
     /// Milliseconds since the host was created, for the long-press timeout.
+    ///
+    /// Only differences are compared (`crate::gesture`).
     fn now_ms(&self) -> u64 {
-        u64::try_from(self.gesture_clock.elapsed().as_millis()).unwrap_or(u64::MAX)
+        let elapsed = self.gesture_clock.elapsed();
+        elapsed
+            .as_secs()
+            .saturating_mul(1_000)
+            .saturating_add(u64::from(elapsed.subsec_millis()))
     }
 
     /// Re-applies the presentation when a script declared a new client size.

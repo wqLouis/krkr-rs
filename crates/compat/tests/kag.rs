@@ -15,6 +15,8 @@ mod kvp;
 mod parser;
 #[path = "../src/natives/kag/state.rs"]
 mod state;
+#[path = "../src/natives/tjsnum.rs"]
+mod tjsnum;
 
 use state::{Environ, EvalResult, KagParserState};
 mod parser_tests {

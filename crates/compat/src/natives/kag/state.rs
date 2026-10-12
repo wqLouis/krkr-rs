@@ -1080,8 +1080,9 @@ impl KagParserState {
                     let text = (env.eval)(&exp)?.to_string_repr().unwrap_or_default();
                     // `escape` defaults to true. The reference converts the
                     // attribute variant with `operator bool`, which for a
-                    // string is `AsInteger() != 0` — so `escape=false`,
-                    // `escape=0` and a bare flag all evaluate to false.
+                    // string is `AsInteger() != 0` (`tjs2/tjsVariant.cpp:301-307`)
+                    // — so `escape=false` and `escape=0` evaluate to false,
+                    // while a bare flag (`"true"`) evaluates to true.
                     let escape = match self.attr(&resolved, "escape") {
                         Some(v) => parse_tjs_bool(v),
                         None => true,
@@ -1725,7 +1726,14 @@ impl KagParserState {
                     self.macros.insert(kvp::unescape_field(name), v.clone());
                 }
             }
-            debug_assert_eq!(self.macros.len(), n);
+            // `store` writes `macrosCount` together with the `macros.`
+            // entries, so a mismatch means the save is corrupt.
+            if self.macros.len() != n {
+                return Err(format!(
+                    "KAGParser.restore: macrosCount is {n} but {} macros were read",
+                    self.macros.len()
+                ));
+            }
         }
 
         // parameter macros
@@ -1781,10 +1789,8 @@ impl KagParserState {
                 }
                 let sc = get_int(&format!("{p}spliceCount")).unwrap_or(0) as usize;
                 for j in 0..sc {
-                    if let Some(v) = get(&format!("{p}splice.{j}"))
-                        && let Some(s) = decode_splice(v)
-                    {
-                        e.splice.push(s);
+                    if let Some(v) = get(&format!("{p}splice.{j}")) {
+                        e.splice.push(decode_splice(v)?);
                     }
                 }
                 if e.splice.is_empty()
@@ -1811,10 +1817,8 @@ impl KagParserState {
         if let Some(n) = get_int("spliceCount") {
             let n = n as usize;
             for j in 0..n {
-                if let Some(v) = get(&format!("splice.{j}"))
-                    && let Some(s) = decode_splice(v)
-                {
-                    self.splice_stack.push(s);
+                if let Some(v) = get(&format!("splice.{j}")) {
+                    self.splice_stack.push(decode_splice(v)?);
                 }
             }
         }
@@ -2086,10 +2090,12 @@ fn split_value_prefix(s: &str) -> (bool, bool, &str) {
 }
 
 /// Convert an attribute value to a boolean the way `tTJSVariant::operator
-/// bool` does for a string: `AsInteger() != 0`. `escape=false` is false,
-/// `escape=1` is true, and a bare flag (value `"true"`) is false.
+/// bool` does for a string: `AsInteger() != 0` (`tjs2/tjsVariant.cpp:301-307`).
+/// `escape=false`/`escape=0` and `escape=0.5` are false, `escape=1` is true,
+/// and a bare flag (the `"true"` a missing value becomes,
+/// `KAGParser.cpp:2057-2058`) is true.
 fn parse_tjs_bool(v: &str) -> bool {
-    v.trim().parse::<f64>().map(|n| n != 0.0).unwrap_or(false)
+    super::tjsnum::tjs_string_to_integer(v) != 0
 }
 
 /// Parse an `emb escape=false` result as an inline tag stream. The
@@ -2299,19 +2305,31 @@ fn encode_events(events: &[Event]) -> String {
 }
 
 /// Decode a splice encoding (see [`encode_splice`]).
-fn decode_splice(s: &str) -> Option<Splice> {
-    let (kind, rest) = s.split_once(':')?;
+fn decode_splice(s: &str) -> Result<Splice, String> {
+    let (kind, rest) = s
+        .split_once(':')
+        .ok_or_else(|| "splice: missing kind".to_string())?;
     if kind != "K" {
-        return None;
+        return Err(format!("splice: unknown kind '{kind}'"));
     }
-    let (nums, content) = rest.split_once(':')?;
+    let (nums, content) = rest
+        .split_once(':')
+        .ok_or_else(|| "splice: missing counts".to_string())?;
     let mut nums = nums.split(',');
-    let event_pos: usize = nums.next()?.parse().ok()?;
-    let char_pos: usize = nums.next()?.parse().ok()?;
-    let line_r_after = nums.next()? == "1";
-    let events = decode_events(content);
+    let event_pos: usize = nums
+        .next()
+        .ok_or_else(|| "splice: missing event position".to_string())?
+        .parse()
+        .map_err(|_| "splice: invalid event position".to_string())?;
+    let char_pos: usize = nums
+        .next()
+        .ok_or_else(|| "splice: missing char position".to_string())?
+        .parse()
+        .map_err(|_| "splice: invalid char position".to_string())?;
+    let line_r_after = nums.next() == Some("1");
+    let events = decode_events(content)?;
     let cols = vec![0; events.len()];
-    Some(Splice {
+    Ok(Splice {
         events,
         cols,
         buffer: String::new(),
@@ -2322,7 +2340,7 @@ fn decode_splice(s: &str) -> Option<Splice> {
 }
 
 /// Decode the event list produced by [`encode_events`].
-fn decode_events(s: &str) -> Vec<Event> {
+fn decode_events(s: &str) -> Result<Vec<Event>, String> {
     let mut events = Vec::new();
     let mut i = 0;
     let chars: Vec<char> = s.chars().collect();
@@ -2353,7 +2371,9 @@ fn decode_events(s: &str) -> Vec<Event> {
                 line: 0,
             }),
             'X' => {
-                let start_line: usize = field.parse().unwrap_or(0);
+                let start_line: usize = field
+                    .parse()
+                    .map_err(|_| format!("event: invalid start line '{field}'"))?;
                 let text = if i < chars.len() && chars[i] == ':' {
                     i += 1;
                     let (t, n) = read_field(&chars, i);
@@ -2393,7 +2413,9 @@ fn decode_events(s: &str) -> Vec<Event> {
                     (String::new(), i)
                 };
                 i = n2;
-                let count: usize = count_str.parse().unwrap_or(0);
+                let count: usize = count_str
+                    .parse()
+                    .map_err(|_| format!("event: invalid parameter count '{count_str}'"))?;
                 let (bracket_char, n3) = if i < chars.len() && chars[i] == ':' {
                     i += 1;
                     if i < chars.len() {
@@ -2419,7 +2441,10 @@ fn decode_events(s: &str) -> Vec<Event> {
                 i = n3b;
                 let macro_entity = match marker.as_str() {
                     "" | "-" => None,
-                    s => s.parse().ok(),
+                    s => Some(
+                        s.parse()
+                            .map_err(|_| format!("event: invalid macro entity '{s}'"))?,
+                    ),
                 };
                 let mut params = Vec::new();
                 for _ in 0..count {
@@ -2449,7 +2474,7 @@ fn decode_events(s: &str) -> Vec<Event> {
             _ => break,
         }
     }
-    events
+    Ok(events)
 }
 
 /// Read one escaped field from `chars` starting at `i`; returns the field
@@ -2478,4 +2503,51 @@ fn read_field(chars: &[char], mut i: usize) -> (String, usize) {
         }
     }
     (out, i)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Environ, EvalResult, KagParserState, parse_tjs_bool};
+
+    /// `tTJSVariant::operator bool` on a string is `AsInteger() != 0`
+    /// (`reference/cpp/core/tjs2/tjsVariant.h:913-925`,
+    /// `reference/cpp/core/tjs2/tjsVariant.cpp:301-307`): `"0.5"` is false and
+    /// a bare flag (`"true"`, `reference/cpp/core/base/KAGParser.cpp:2057-2058`)
+    /// is true.
+    #[test]
+    fn parse_tjs_bool_uses_as_integer() {
+        assert!(!parse_tjs_bool("0.5"));
+        assert!(!parse_tjs_bool("0"));
+        assert!(!parse_tjs_bool("false"));
+        assert!(!parse_tjs_bool(""));
+        assert!(parse_tjs_bool("1"));
+        assert!(parse_tjs_bool("true"));
+    }
+
+    /// A `macrosCount` that disagrees with the serialized `macros.` entries
+    /// marks a corrupt save, which `restore_decoded` rejects instead of
+    /// silently accepting.
+    #[test]
+    fn restore_rejects_a_mismatched_macros_count() {
+        let mut state = KagParserState::default();
+        let mut eval = |_e: &str| Ok(EvalResult::Void);
+        let mut load = |_name: &str| Ok(String::new());
+        let mut env = Environ {
+            eval: &mut eval,
+            load_storage: &mut load,
+            fire_label: None,
+            fire_script: None,
+            fire_jump: None,
+            fire_call: None,
+            fire_return: None,
+            fire_scenario_load: None,
+            fire_scenario_loaded: None,
+        };
+        let entries = vec![
+            ("macrosCount".to_string(), "2".to_string()),
+            ("macros.foo".to_string(), "body".to_string()),
+        ];
+        let error = state.restore_decoded(entries, &mut env).unwrap_err();
+        assert!(error.contains("macrosCount"), "{error}");
+    }
 }

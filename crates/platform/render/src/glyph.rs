@@ -297,6 +297,9 @@ pub fn font_metrics(fs: &FontSystem, font: &Font, size_px: f32) -> FontMetrics {
 /// `size_px` pixels wide. This is a direct adaptation of `tvp-text`'s
 /// `px_scale_for_height`.
 fn px_scale_for_height(font: &FontVec, size_px: f32) -> PxScale {
+    // `rasterize_glyph`, `glyph_advance` and `font_metrics` all reject a
+    // non-positive or non-finite `size_px` before they call this, so the scale
+    // factor is positive here.
     debug_assert!(size_px > 0.0, "pixel size must be positive");
     let units_per_em = font.units_per_em().unwrap_or(1000.0);
     let extent = font.height_unscaled();

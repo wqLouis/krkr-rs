@@ -389,7 +389,7 @@ fn value_as_f64(v: &Value) -> f64 {
     match v.ty {
         VAL_INTEGER => v.integer as f64,
         VAL_REAL => v.real,
-        VAL_STRING => value_as_string(v).parse().unwrap_or(0.0),
+        VAL_STRING => crate::natives::system::tjs_string_to_real(&value_as_string(v)),
         _ => 0.0,
     }
 }
@@ -1811,7 +1811,7 @@ extern "C" fn vo_play_rate_get(
         set_real(
             out,
             if slot.overlay.is_open() {
-                slot.overlay.play_rate()
+                slot.overlay.play_rate
             } else {
                 0.0
             },
@@ -1830,7 +1830,7 @@ extern "C" fn vo_play_rate_set(
     with_slot!(engine, instance, out_error, _ctx, slot, {
         if slot.overlay.is_open() {
             // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
-            slot.overlay.set_play_rate(value_as_f64(unsafe { &*value }));
+            slot.overlay.play_rate = value_as_f64(unsafe { &*value });
         }
         0
     })

@@ -582,7 +582,7 @@ fn tjs_value_as_f64(value: &TjsValue) -> f64 {
     match value {
         TjsValue::Integer(number) => *number as f64,
         TjsValue::Real(number) => *number,
-        TjsValue::String(text) => text.parse().unwrap_or(0.0),
+        TjsValue::String(text) => crate::natives::system::tjs_string_to_real(text),
         _ => 0.0,
     }
 }

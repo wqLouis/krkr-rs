@@ -369,7 +369,8 @@ fn build_time_dict(
 ) -> Result<DetachedValue, String> {
     let dict = retained_object(engine, "%[]")?;
     if let Some(size) = size {
-        let size = i64::try_from(size).unwrap_or(i64::MAX);
+        let size = i64::try_from(size)
+            .map_err(|_| "file size does not fit in a 64-bit integer".to_string())?;
         engine.set_member(dict.raw_id(), "size", &TjsValue::Integer(size))?;
     }
     for (key, seconds) in times {
@@ -943,19 +944,39 @@ extern "C" fn storages_dirlist_ex(
     };
     for (index, entry) in entries.flatten().enumerate() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        let meta = entry.metadata().ok();
-        let size = meta
-            .as_ref()
-            .filter(|meta| meta.is_file())
-            .map_or(0, |meta| i64::try_from(meta.len()).unwrap_or(i64::MAX));
-        let attrib = meta.as_ref().map_or(0, permissions_mode);
+        let meta = match entry.metadata() {
+            Ok(meta) => meta,
+            Err(error) => {
+                return report_error(
+                    out_error,
+                    &format!(
+                        "Storages.dirlistEx: cannot stat {}: {error}",
+                        entry.path().display()
+                    ),
+                );
+            }
+        };
+        let size = if meta.is_file() {
+            match i64::try_from(meta.len()) {
+                Ok(size) => size,
+                Err(_) => {
+                    return report_error(
+                        out_error,
+                        "Storages.dirlistEx: file size does not fit in a 64-bit integer",
+                    );
+                }
+            }
+        } else {
+            0
+        };
+        let attrib = permissions_mode(&meta);
         // The reference writes raw epoch **seconds** (not `Date` objects,
         // unlike `_getTime`): `tTJSVariant vmtime = mtime;` with
         // `mtime = to_time_t(...)` and `ctime`/`atime` mirroring it
         // (`reference/cpp/plugins/fstat/main.cpp:584-597`).
         let mtime = meta
-            .as_ref()
-            .and_then(|meta| meta.modified().ok())
+            .modified()
+            .ok()
             .and_then(system_time_seconds)
             .unwrap_or(0);
         let dict = match retained_object(host, "%[]") {

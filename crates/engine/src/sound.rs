@@ -835,15 +835,22 @@ impl SoundSource {
     /// A streaming source decodes the whole stream into memory here. The
     /// phase-vocoder filter chain materializes its input before processing;
     /// every other path reads frames through [`Self::frame`].
-    pub fn audio(&self) -> &DecodedAudio {
+    ///
+    /// # Errors
+    ///
+    /// Returns the decoder's typed [`SoundError`] when a streaming source
+    /// cannot be materialized. The failure is reported to the caller and is
+    /// never replaced with an empty buffer.
+    pub fn audio(&self) -> Result<&DecodedAudio, SoundError> {
         match &self.pcm {
-            Pcm::Buffer(audio) => audio,
-            Pcm::Stream(_) => self.materialized.get_or_init(|| {
-                self.decode_entire().unwrap_or_else(|error| {
-                    log::warn!("sound: could not materialize the streaming source: {error}");
-                    DecodedAudio::new(self.spec, Vec::new())
-                })
-            }),
+            Pcm::Buffer(audio) => Ok(&**audio),
+            Pcm::Stream(_) => {
+                if let Some(audio) = self.materialized.get() {
+                    return Ok(audio);
+                }
+                let audio = self.decode_entire()?;
+                Ok(self.materialized.get_or_init(|| audio))
+            }
         }
     }
 
@@ -857,10 +864,10 @@ impl SoundSource {
     ///
     /// A typed [`SoundError::Decode`] when the decoder fails.
     pub fn decode_entire(&self) -> Result<DecodedAudio, SoundError> {
-        let Pcm::Stream(source) = &self.pcm else {
-            return Ok(self.audio().clone());
-        };
-        source.materialize(self.spec)
+        match &self.pcm {
+            Pcm::Buffer(audio) => Ok((**audio).clone()),
+            Pcm::Stream(source) => source.materialize(self.spec),
+        }
     }
 
     /// Whether this source decodes incrementally instead of holding every
@@ -1897,4 +1904,54 @@ fn validate_out_spec(spec: AudioSpec) -> Result<(), SoundError> {
 fn pan_gains(pan: f32) -> (f32, f32) {
     let p = pan.clamp(-MAX_PAN, MAX_PAN);
     (1.0 - p.max(0.0), 1.0 - (-p).max(0.0))
+}
+
+#[cfg(test)]
+mod tests {
+    use api::media::AudioSpec;
+
+    use super::*;
+
+    /// A stream whose decoder reports a hard failure on the first read.
+    struct FailingStream {
+        spec: AudioSpec,
+    }
+
+    impl AudioStream for FailingStream {
+        fn spec(&self) -> AudioSpec {
+            self.spec
+        }
+
+        fn read(&mut self, _out: &mut [f32]) -> Result<usize, SoundError> {
+            Err(SoundError::Decode {
+                message: "corrupt frame".to_string(),
+            })
+        }
+
+        fn seek(&mut self, _frame: u64) -> Result<(), SoundError> {
+            Ok(())
+        }
+    }
+
+    /// A decode failure surfaces as a typed error from `audio()` rather than
+    /// an empty buffer. Reference: an undecodable stream fails the wave buffer
+    /// load instead of yielding silence (`reference/cpp/core/sound/WaveIntf.cpp:750-767`).
+    #[test]
+    fn materialize_reports_decode_failure_instead_of_silence() {
+        let spec = AudioSpec {
+            sample_rate: 44_100,
+            channels: 1,
+            total_frames: Some(44_100),
+        };
+        let source = SoundSource::streaming(spec, Box::new(FailingStream { spec }), None)
+            .expect("stream construction does not decode");
+        match source.audio() {
+            Ok(audio) => panic!(
+                "expected a decode error, got {} frames",
+                audio.frame_count()
+            ),
+            Err(SoundError::Decode { message }) => assert_eq!(message, "corrupt frame"),
+            Err(other) => panic!("unexpected error: {other}"),
+        }
+    }
 }

@@ -55,7 +55,15 @@ impl PsbValue {
     pub(crate) fn as_array(&self) -> Option<&[u32]> {
         match self {
             Self::Array(values) => Some(values),
-            _ => None,
+            Self::Null
+            | Self::Bool(_)
+            | Self::Int(_)
+            | Self::Float(_)
+            | Self::Double(_)
+            | Self::String(_)
+            | Self::Resource(..)
+            | Self::List(_)
+            | Self::Dict(_) => None,
         }
     }
 
@@ -63,7 +71,15 @@ impl PsbValue {
     pub(crate) fn get(&self, key: &str) -> Option<&PsbValue> {
         match self {
             Self::Dict(entries) => entries.iter().find(|(k, _)| k == key).map(|(_, v)| v),
-            _ => None,
+            Self::Null
+            | Self::Bool(_)
+            | Self::Int(_)
+            | Self::Float(_)
+            | Self::Double(_)
+            | Self::Array(_)
+            | Self::String(_)
+            | Self::Resource(..)
+            | Self::List(_) => None,
         }
     }
 
@@ -74,7 +90,12 @@ impl PsbValue {
             Self::Float(value) => Some(f64::from(*value)),
             Self::Double(value) => Some(*value),
             Self::Bool(value) => Some(if *value { 1.0 } else { 0.0 }),
-            _ => None,
+            Self::Null
+            | Self::Array(_)
+            | Self::String(_)
+            | Self::Resource(..)
+            | Self::List(_)
+            | Self::Dict(_) => None,
         }
     }
 
@@ -85,7 +106,12 @@ impl PsbValue {
             Self::Int(value) => *value != 0,
             Self::Float(value) => *value != 0.0,
             Self::Double(value) => *value != 0.0,
-            _ => false,
+            Self::Null
+            | Self::Array(_)
+            | Self::String(_)
+            | Self::Resource(..)
+            | Self::List(_)
+            | Self::Dict(_) => false,
         }
     }
 
@@ -93,7 +119,15 @@ impl PsbValue {
     pub(crate) fn as_list(&self) -> Option<&[PsbValue]> {
         match self {
             Self::List(items) => Some(items),
-            _ => None,
+            Self::Null
+            | Self::Bool(_)
+            | Self::Int(_)
+            | Self::Float(_)
+            | Self::Double(_)
+            | Self::Array(_)
+            | Self::String(_)
+            | Self::Resource(..)
+            | Self::Dict(_) => None,
         }
     }
 
@@ -101,7 +135,15 @@ impl PsbValue {
     pub(crate) fn as_dict(&self) -> Option<&[(String, PsbValue)]> {
         match self {
             Self::Dict(entries) => Some(entries),
-            _ => None,
+            Self::Null
+            | Self::Bool(_)
+            | Self::Int(_)
+            | Self::Float(_)
+            | Self::Double(_)
+            | Self::Array(_)
+            | Self::String(_)
+            | Self::Resource(..)
+            | Self::List(_) => None,
         }
     }
 }

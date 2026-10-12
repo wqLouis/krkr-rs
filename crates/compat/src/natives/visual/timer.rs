@@ -643,7 +643,7 @@ fn value_as_f64(v: &Value) -> f64 {
     match v.ty {
         VAL_REAL => v.real,
         VAL_INTEGER => v.integer as f64,
-        VAL_STRING => value_as_string(v).parse().unwrap_or(0.0),
+        VAL_STRING => crate::natives::system::tjs_string_to_real(&value_as_string(v)),
         _ => 0.0,
     }
 }

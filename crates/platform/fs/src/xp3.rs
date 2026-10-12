@@ -496,7 +496,7 @@ impl Xp3Archive {
         let mut rest = data;
         while let Some((header, tail)) = split_chunk_header(rest) {
             let (tag, size) = header.split_at(4);
-            let size = u64::from_le_bytes(prefix(size));
+            let size = u64::from_le_bytes(prefix(size)?);
             let size =
                 usize::try_from(size).map_err(|_| Xp3Error::CorruptIndex("chunk too large"))?;
             let (payload, next) = tail
@@ -531,7 +531,7 @@ impl Xp3Archive {
 
         while let Some((header, tail)) = split_chunk_header(rest) {
             let (tag, size) = header.split_at(4);
-            let size = u64::from_le_bytes(prefix(size));
+            let size = u64::from_le_bytes(prefix(size)?);
             let size =
                 usize::try_from(size).map_err(|_| Xp3Error::CorruptIndex("sub-chunk too large"))?;
             let (payload, next) = tail
@@ -548,10 +548,10 @@ impl Xp3Archive {
                     if payload.len() < 22 {
                         return Err(Xp3Error::CorruptIndex("info sub-chunk too short"));
                     }
-                    flags = u32::from_le_bytes(prefix(&payload[0..4]));
-                    org_size = u64::from_le_bytes(prefix(&payload[4..12]));
-                    arc_size = u64::from_le_bytes(prefix(&payload[12..20]));
-                    let name_len = i16::from_le_bytes(prefix(&payload[20..22]));
+                    flags = u32::from_le_bytes(prefix(&payload[0..4])?);
+                    org_size = u64::from_le_bytes(prefix(&payload[4..12])?);
+                    arc_size = u64::from_le_bytes(prefix(&payload[12..20])?);
+                    let name_len = i16::from_le_bytes(prefix(&payload[20..22])?);
                     let name_len = usize::try_from(name_len)
                         .map_err(|_| Xp3Error::CorruptIndex("negative name length"))?;
                     let name_bytes = payload
@@ -581,10 +581,10 @@ impl Xp3Archive {
                         let (start, s) = s.split_at(8);
                         let (org_size, arc_size) = s.split_at(8);
                         segments.push(Segment {
-                            flags: u32::from_le_bytes(prefix(flags)),
-                            start: u64::from_le_bytes(prefix(start)),
-                            org_size: u64::from_le_bytes(prefix(org_size)),
-                            arc_size: u64::from_le_bytes(prefix(arc_size)),
+                            flags: u32::from_le_bytes(prefix(flags)?),
+                            start: u64::from_le_bytes(prefix(start)?),
+                            org_size: u64::from_le_bytes(prefix(org_size)?),
+                            arc_size: u64::from_le_bytes(prefix(arc_size)?),
                         });
                     }
                 }
@@ -594,7 +594,7 @@ impl Xp3Archive {
                     }
                     seen_adlr = true;
                     if let Some(h) = payload.get(0..4) {
-                        file_hash = u32::from_le_bytes(prefix(h));
+                        file_hash = u32::from_le_bytes(prefix(h)?);
                     }
                 }
                 _ => { /* unknown sub-chunk: ignore */ }
@@ -707,10 +707,12 @@ impl Seek for FileReader<'_> {
 // Format helpers
 // ---------------------------------------------------------------------------
 
-/// Read the first `N` bytes of `b` as an array. Every call site checks the
-/// length of `b` first, so the panic is unreachable.
-fn prefix<const N: usize>(b: &[u8]) -> [u8; N] {
-    b[..N].try_into().expect("length checked by the caller")
+/// Read the first `N` bytes of `b` as an array, reporting a short slice as a
+/// corrupt index rather than panicking.
+fn prefix<const N: usize>(b: &[u8]) -> Result<[u8; N]> {
+    b.get(..N)
+        .and_then(|s| s.try_into().ok())
+        .ok_or(Xp3Error::CorruptIndex("truncated chunk field"))
 }
 
 /// Split a `[4-byte tag][u64 LE size]` chunk header off the front of `data`.
@@ -791,4 +793,36 @@ fn alloc_zeroed(len: usize, what: &'static str) -> Result<Vec<u8>> {
         .map_err(|_| Xp3Error::CorruptIndex(what))?;
     v.resize(len, 0);
     Ok(v)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+
+    /// A field slice shorter than `N` is a typed corrupt-index error, not a
+    /// panic.
+    #[test]
+    fn prefix_rejects_a_short_slice() {
+        let err = prefix::<8>(&[0u8; 4]).unwrap_err();
+        assert!(matches!(err, Xp3Error::CorruptIndex(_)));
+        assert_eq!(prefix::<4>(&[1, 2, 3, 4]).unwrap(), [1, 2, 3, 4]);
+    }
+
+    /// A chunk whose declared payload overruns the index is reported as a
+    /// corrupt index rather than panicking.
+    #[test]
+    fn chunk_overrunning_the_index_is_rejected() {
+        let mut archive = Xp3Archive {
+            base: 0,
+            entries: BTreeMap::new(),
+        };
+        let mut index = Vec::new();
+        index.extend_from_slice(b"File");
+        index.extend_from_slice(&4u64.to_le_bytes());
+        index.extend_from_slice(&[0u8; 3]);
+        let err = archive.parse_index(&index).unwrap_err();
+        assert!(matches!(err, Xp3Error::CorruptIndex(_)));
+    }
 }

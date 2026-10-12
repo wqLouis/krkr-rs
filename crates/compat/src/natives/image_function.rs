@@ -220,7 +220,9 @@ fn opt_f64(a: &[Value], index: usize, default: f64) -> Result<f64, String> {
         Some(v) if v.ty != VAL_VOID => match v.ty {
             VAL_REAL => Ok(v.real),
             VAL_INTEGER => Ok(v.integer as f64),
-            VAL_STRING => Ok(value_as_string(v).parse::<f64>().unwrap_or(0.0)),
+            VAL_STRING => Ok(crate::natives::system::tjs_string_to_real(
+                &value_as_string(v),
+            )),
             _ => Err(format!("ImageFunction: argument {index} is not a number")),
         },
         _ => Ok(default),
@@ -235,7 +237,9 @@ fn try_value_as_f64(v: &Value) -> Result<f64, String> {
     match v.ty {
         VAL_INTEGER => Ok(v.integer as f64),
         VAL_REAL => Ok(v.real),
-        VAL_STRING => Ok(value_as_string(v).parse::<f64>().unwrap_or(0.0)),
+        VAL_STRING => Ok(crate::natives::system::tjs_string_to_real(
+            &value_as_string(v),
+        )),
         _ => Err("ImageFunction: argument is not a number".to_string()),
     }
 }

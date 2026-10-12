@@ -34,6 +34,10 @@ mod kvp;
 mod parser;
 mod state;
 
+// `state` is compiled standalone in `tests/kag.rs` and uses only `super::`
+// paths, so expose the shared number coercion under a `kag::` name.
+pub(crate) use crate::natives::tjsnum;
+
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::ptr;
 
@@ -46,7 +50,7 @@ use tjs::{
 
 use crate::binding;
 use crate::native_util::{args, report_error, set_int, set_void};
-use crate::natives::system::{try_value_as_i64, value_as_bool};
+use crate::natives::system::{tjs_string_to_integer, try_value_as_i64, value_as_bool};
 use crate::{CompatCtx, CompatError, CompatServices};
 use state::{
     Environ, EvalResult, KagParserState, LabelCallback, ScenarioLoadCallback,
@@ -374,13 +378,15 @@ fn owner_tag_closure(
 }
 
 /// TJS `operator bool` coercion for a callback result
-/// (`tjs2/tjsVariant.h:913-935`): strings use `AsInteger() != 0`.
+/// (`tjs2/tjsVariant.h:913-935`): strings use `AsInteger() != 0`
+/// (`tjs2/tjsVariant.cpp:301-307`), so `"0.5"` and a bare `"true"` flag
+/// convert as their integer value.
 fn tjs_value_truthy(value: &TjsValue) -> bool {
     match value {
         TjsValue::Void => false,
         TjsValue::Integer(i) => *i != 0,
         TjsValue::Real(r) => *r != 0.0,
-        TjsValue::String(s) => s.trim().parse::<f64>().map(|n| n != 0.0).unwrap_or(false),
+        TjsValue::String(s) => tjs_string_to_integer(s) != 0,
         TjsValue::Object | TjsValue::Retained(_) => true,
     }
 }
@@ -1909,4 +1915,23 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
             },
         ],
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tjs_value_truthy;
+    use tjs::TjsValue;
+
+    /// `tTJSVariant::operator bool` for a string is `AsInteger() != 0`
+    /// (`reference/cpp/core/tjs2/tjsVariant.h:913-925`,
+    /// `reference/cpp/core/tjs2/tjsVariant.cpp:301-307`), so `"0.5"` is false
+    /// while `"true"` and `"12abc"` are true.
+    #[test]
+    fn truthy_strings_use_as_integer() {
+        assert!(!tjs_value_truthy(&TjsValue::String("0.5".into())));
+        assert!(!tjs_value_truthy(&TjsValue::String("false".into())));
+        assert!(!tjs_value_truthy(&TjsValue::String("abc".into())));
+        assert!(tjs_value_truthy(&TjsValue::String("true".into())));
+        assert!(tjs_value_truthy(&TjsValue::String("12abc".into())));
+    }
 }

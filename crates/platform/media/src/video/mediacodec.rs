@@ -680,7 +680,7 @@ mod android {
     /// Seeks the extractor to `at_ms` and flushes the video decoder.
     fn seek_to(state: &mut VideoDecoderState, at_ms: u64) -> Result<(), MediaError> {
         select_only(&state.extractor, state.video_index, state.audio_index);
-        let timestamp_us = i64::try_from(at_ms.saturating_mul(1000)).unwrap_or(i64::MAX);
+        let timestamp_us = seek_micros(at_ms, &state.name)?;
         let status = state
             .extractor
             .seek_to(timestamp_us, AMEDIAEXTRACTOR_SEEK_PREVIOUS_SYNC);
@@ -773,7 +773,7 @@ mod android {
                         return Ok(Some(RgbaFrame::new(
                             layout.width() as u32,
                             layout.height() as u32,
-                            u64::try_from(pts_ms).unwrap_or(0),
+                            pts_millis(pts_ms, name)?,
                             rgba,
                         )));
                     }
@@ -1205,5 +1205,24 @@ mod android {
         } else {
             DEFAULT_FRAME_DURATION_MS
         }
+    }
+
+    /// Converts a seek target in milliseconds to the microseconds
+    /// `AMediaExtractor_seekTo` takes.
+    fn seek_micros(at_ms: u64, name: &str) -> Result<i64, MediaError> {
+        at_ms
+            .checked_mul(1000)
+            .and_then(|micros| i64::try_from(micros).ok())
+            .ok_or_else(|| MediaError::InvalidData {
+                message: format!("{name}: seek target {at_ms} ms is out of range"),
+            })
+    }
+
+    /// Converts a decoded presentation time in milliseconds to the `u64` the
+    /// frame carries.
+    fn pts_millis(pts_ms: i64, name: &str) -> Result<u64, MediaError> {
+        u64::try_from(pts_ms).map_err(|_| MediaError::InvalidData {
+            message: format!("{name}: presentation time {pts_ms} ms is out of range"),
+        })
     }
 }

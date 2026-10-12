@@ -789,9 +789,13 @@ fn get_layer_data_impl(
         Ok(id) => id,
         Err(error) => return report_error(out_error, &error),
     };
-    let Some(image) = decode::layer_image(file, layer, mode) else {
-        set_void(out);
-        return 0;
+    let image = match decode::layer_image(file, layer, mode) {
+        Ok(Some(image)) => image,
+        Ok(None) => {
+            set_void(out);
+            return 0;
+        }
+        Err(error) => return report_error(out_error, &format!("PSD: {error}")),
     };
     let scene = match scene_mut(&binding.ctx()) {
         Ok(scene) => scene,
@@ -895,9 +899,13 @@ extern "C" fn psd_get_blend(
     let Some(file) = inst.file.as_ref() else {
         return report_error(out_error, "PSD: no data");
     };
-    let Some((width, height, pixels)) = decode::merged_image(file) else {
-        set_bool(out, false);
-        return 0;
+    let (width, height, pixels) = match decode::merged_image(file) {
+        Ok(Some(image)) => image,
+        Ok(None) => {
+            set_bool(out, false);
+            return 0;
+        }
+        Err(error) => return report_error(out_error, &format!("PSD.getBlend: {error}")),
     };
     let layer_id = match resolve_layer_id(binding.engine(), layer_value) {
         Ok(id) => id,

@@ -37,56 +37,11 @@ pub(super) fn value_as_f64(v: &Value) -> f64 {
     match v.ty {
         tjs::VAL_INTEGER => v.integer as f64,
         VAL_REAL => v.real,
-        VAL_STRING => string_to_real(&crate::native_util::value_as_string(v)),
+        VAL_STRING => {
+            crate::natives::system::tjs_string_to_real(&crate::native_util::value_as_string(v))
+        }
         _ => 0.0,
     }
-}
-
-/// The reference `TJSStringToReal` behaviour: parse the leading numeric
-/// token of `s` (sign, digits, fraction, exponent) and ignore the rest;
-/// anything unparsable yields `0.0`.
-fn string_to_real(s: &str) -> f64 {
-    let bytes = s.as_bytes();
-    let mut i = 0usize;
-    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
-        i += 1;
-    }
-    let mut seen_digit = false;
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
-        i += 1;
-        seen_digit = true;
-    }
-    if i < bytes.len() && bytes[i] == b'.' {
-        i += 1;
-        while i < bytes.len() && bytes[i].is_ascii_digit() {
-            i += 1;
-            seen_digit = true;
-        }
-    }
-    if seen_digit && i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
-        let save = i;
-        i += 1;
-        if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
-            i += 1;
-        }
-        let mut exp_digit = false;
-        while i < bytes.len() && bytes[i].is_ascii_digit() {
-            i += 1;
-            exp_digit = true;
-        }
-        if !exp_digit {
-            i = save;
-        }
-    }
-    if !seen_digit {
-        return 0.0;
-    }
-    // The slice is a well-formed float literal by construction; a failure
-    // (e.g. exponent overflow) still parses as an infinite/`f64` value.
-    s[..i].trim().parse::<f64>().unwrap_or(0.0)
 }
 
 /// TJS numeric coercion for a real-valued default.

@@ -347,12 +347,12 @@ fn segment_loop_and_play_rate_store_what_they_are_given() {
     v.set_segment_loop(5, 30);
     assert_eq!(v.segment_loop(), Some((5, 30)));
 
-    v.set_play_rate(0.0);
-    assert_eq!(v.play_rate(), 0.0);
-    v.set_play_rate(-2.0);
-    assert_eq!(v.play_rate(), -2.0);
+    v.play_rate = 0.0;
+    assert_eq!(v.play_rate, 0.0);
+    v.play_rate = -2.0;
+    assert_eq!(v.play_rate, -2.0);
 
-    v.set_play_rate(2.0);
+    v.play_rate = 2.0;
     v.play().unwrap();
     v.advance(250.0);
     assert_eq!(v.position_ms(), 500, "rate multiplies elapsed time");

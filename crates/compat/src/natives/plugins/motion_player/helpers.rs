@@ -89,7 +89,7 @@ pub(crate) fn value_as_f64(v: &Value) -> f64 {
     match v.ty {
         VAL_INTEGER => v.integer as f64,
         VAL_REAL => v.real,
-        VAL_STRING => value_as_string(v).parse().unwrap_or(0.0),
+        VAL_STRING => crate::natives::system::tjs_string_to_real(&value_as_string(v)),
         _ => 0.0,
     }
 }
@@ -205,7 +205,9 @@ pub(crate) fn set_real_member<T>(
             VAL_REAL => unsafe { (*value).real },
             VAL_INTEGER => unsafe { (*value).integer as f64 },
             // SAFETY: `value` is the valid `Value` the caller holds for this call.
-            VAL_STRING => value_as_string(unsafe { &*value }).parse().unwrap_or(0.0),
+            VAL_STRING => {
+                crate::natives::system::tjs_string_to_real(&value_as_string(unsafe { &*value }))
+            }
             _ => 0.0,
         }
     };

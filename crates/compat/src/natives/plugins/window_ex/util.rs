@@ -177,9 +177,9 @@ pub(crate) fn as_integer(value: &Value) -> Result<i64, String> {
         VAL_VOID => Ok(0),
         VAL_INTEGER => Ok(value.integer),
         VAL_REAL => Ok(value.real as i64),
-        VAL_STRING => Ok(parse_number_prefix(&crate::native_util::value_as_string(
-            value,
-        ))),
+        VAL_STRING => Ok(crate::natives::system::tjs_string_to_integer(
+            &crate::native_util::value_as_string(value),
+        )),
         // tvtObject (including `null`) and tvtOctet raise
         // `TJSThrowVariantConvertError` in `AsInteger`.
         VAL_NULL | VAL_OBJECT | VAL_RETAINED | VAL_ARRAY | VAL_OCTET => {
@@ -193,96 +193,6 @@ pub(crate) fn as_integer(value: &Value) -> Result<i64, String> {
 /// uses (`windowEx.cpp:507,525,581,601,1085`).
 pub(crate) fn as_bool(value: &Value) -> Result<bool, String> {
     Ok(as_integer(value)? != 0)
-}
-
-/// The leading-number parse `tTJSVariantString::ToInteger()` performs:
-/// an optional sign, then a decimal / hexadecimal (`0x`) / binary (`0b`) /
-/// octal (`0…`) number prefix; reals truncate through `AsInteger`. Anything
-/// that does not start with a number parses as 0
-/// (`reference/cpp/core/tjs2/tjsVariantString.cpp:457-466`).
-fn parse_number_prefix(text: &str) -> i64 {
-    let chars: Vec<char> = text.chars().collect();
-    let mut index = 0usize;
-    let mut negative = false;
-    if index < chars.len() && (chars[index] == '+' || chars[index] == '-') {
-        negative = chars[index] == '-';
-        index += 1;
-    }
-    let rest: String = chars[index..].iter().collect();
-    let lower = rest.to_ascii_lowercase();
-    if lower.starts_with("true") {
-        return if negative { -1 } else { 1 };
-    }
-    if lower.starts_with("false") {
-        return 0;
-    }
-    let value = if let Some(hex) = lower.strip_prefix("0x") {
-        let digits: String = hex.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
-        if digits.is_empty() {
-            return 0;
-        }
-        i64::from_str_radix(&digits, 16).unwrap_or(i64::MAX)
-    } else if let Some(bin) = lower.strip_prefix("0b") {
-        let digits: String = bin.chars().take_while(|c| matches!(c, '0' | '1')).collect();
-        if digits.is_empty() {
-            return 0;
-        }
-        i64::from_str_radix(&digits, 2).unwrap_or(i64::MAX)
-    } else if lower.starts_with('0') && lower[1..].starts_with(|c: char| c.is_ascii_digit()) {
-        // leading-zero octal (`TJSParseNonDecimalNumber` with `TJSOctNum`)
-        let digits: String = lower
-            .chars()
-            .take_while(|c| matches!(c, '0'..='7'))
-            .collect();
-        i64::from_str_radix(&digits, 8).unwrap_or(0)
-    } else if lower.starts_with(|c: char| c.is_ascii_digit() || c == '.') {
-        let end = leading_number_len(&lower);
-        let number = &lower[..end];
-        if number.is_empty() || number == "." {
-            return 0;
-        }
-        if number.contains('.') || number.contains('e') {
-            match number.parse::<f64>() {
-                Ok(real) => real as i64,
-                Err(_) => return 0,
-            }
-        } else {
-            number.parse::<i64>().unwrap_or(i64::MAX)
-        }
-    } else {
-        return 0;
-    };
-    if negative { -value } else { value }
-}
-
-/// Length of the leading decimal number in `text` (digits, one fraction dot,
-/// one exponent).
-fn leading_number_len(text: &str) -> usize {
-    let bytes = text.as_bytes();
-    let mut index = 0usize;
-    while index < bytes.len() && bytes[index].is_ascii_digit() {
-        index += 1;
-    }
-    if index < bytes.len() && bytes[index] == b'.' {
-        index += 1;
-        while index < bytes.len() && bytes[index].is_ascii_digit() {
-            index += 1;
-        }
-    }
-    if index < bytes.len() && matches!(bytes[index], b'e' | b'E') {
-        let mut probe = index + 1;
-        if probe < bytes.len() && matches!(bytes[probe], b'+' | b'-') {
-            probe += 1;
-        }
-        let digits_start = probe;
-        while probe < bytes.len() && bytes[probe].is_ascii_digit() {
-            probe += 1;
-        }
-        if probe > digits_start {
-            index = probe;
-        }
-    }
-    index
 }
 
 // ---------------------------------------------------------------------------
