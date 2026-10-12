@@ -47,12 +47,6 @@ fs = { workspace = true }
 # same instant — "both must have the same behaviour" — without linking any
 # C time call into the binary.
 libc = "0.2"
-# Integration tests only: `tests/wuvorbis.rs` plays the composition root
-# (mirroring `crates/app/src/audio.rs`) and installs the L1 `media` decoder on
-# the `add_audio_decoder` chain to prove the `.ogg` path end-to-end. The
-# production crate still never links a codec — same precedent as `fs` above,
-# which only the unit tests use.
-media = { workspace = true }
 
 # D13: `platform` has no default platform feature, so each target selects
 # exactly one. L3 uses only the platform-agnostic event types; it still needs a
@@ -62,3 +56,18 @@ platform = { workspace = true, features = ["platform-linux"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 platform = { workspace = true, features = ["platform-android"] }
+
+# Integration tests only: `tests/wuvorbis.rs` plays the composition root
+# (mirroring `crates/app/src/audio.rs`) and installs the L1 `media` decoder on
+# the `add_audio_decoder` chain to prove the `.ogg` path end-to-end. The
+# production crate still never links a codec — same precedent as `fs` above,
+# which only the unit tests use. The dev-dependency is target-scoped so a
+# desktop codec cannot leak into an Android test graph (nor MediaCodec into a
+# desktop one). The Android arm names the path directly because edition 2024
+# forbids a member from turning off default features inherited from the
+# workspace.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+media = { workspace = true }
+
+[target.'cfg(target_os = "android")'.dev-dependencies]
+media = { path = "../platform/media", default-features = false, features = ["video-mediacodec"] }

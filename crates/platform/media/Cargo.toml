@@ -10,7 +10,11 @@ license.workspace = true
 # the desktop FFmpeg backend. An Android frontend must turn the default off and
 # select the stub instead:
 #
-#     media = { workspace = true, default-features = false, features = ["video-mediacodec"] }
+#     media = { path = "../platform/media", default-features = false, features = ["video-mediacodec"] }
+#
+# A member cannot spell this as `workspace = true, default-features = false`:
+# edition 2024 forbids a member from overriding the workspace dependency's
+# `default-features`, so the Android consumer names the path directly.
 #
 # Selecting neither (or both) is a hard `compile_error!` in src/video/mod.rs.
 default = ["video-ffmpeg"]

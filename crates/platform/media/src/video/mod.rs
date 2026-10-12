@@ -20,7 +20,7 @@
 //!
 //! ```toml
 //! # Android frontend
-//! media = { workspace = true, default-features = false, features = ["video-mediacodec"] }
+//! media = { path = "../platform/media", default-features = false, features = ["video-mediacodec"] }
 //! ```
 //!
 //! # Stateless object, explicit state

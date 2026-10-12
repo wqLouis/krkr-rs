@@ -28,7 +28,7 @@ vm = { workspace = true }
 # backend can never leak into an Android build (and vice versa). `platform`
 # has no default feature; `media` defaults to FFmpeg on the desktop and the
 # Android build turns that default off for MediaCodec.
-[target.'cfg(not(target_os = "android"))'.dependencies]
+[target.'cfg(target_os = "linux")'.dependencies]
 platform = { workspace = true, features = ["platform-linux"] }
 media = { workspace = true, features = ["video-ffmpeg"] }
 

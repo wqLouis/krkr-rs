@@ -91,8 +91,8 @@ def resolved_features(root: str, triple: str) -> dict[str, set[str]]:
     dependency plus the selected root's dev-dependencies — the graph
     ``cargo test -p <root>`` builds — while dropping build edges and the
     dev-dependencies of transitive normal dependencies, which a test of the
-    root never compiles. Dropping dev edges would hide a dev-dependency that
-    pulls the wrong codec default, which is how the `compat` leak survived.
+    root never compiles. Dropping dev edges entirely would hide a
+    dev-dependency that pulls the wrong codec default.
     """
     out = run(
         [
