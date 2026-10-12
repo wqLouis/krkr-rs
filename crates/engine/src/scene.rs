@@ -383,7 +383,7 @@ impl DecodedImageKey {
 /// `reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1305-1310`); the cache is
 /// enabled only while the limit is nonzero, matching the reference's default
 /// (`:1433-1434`).
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct DecodedImageCache {
     /// Cached images by key.
     entries: HashMap<DecodedImageKey, DecodedImage>,
@@ -395,17 +395,6 @@ struct DecodedImageCache {
     total_bytes: u64,
     /// Byte limit; `0` disables the cache.
     limit: u64,
-}
-
-impl Default for DecodedImageCache {
-    fn default() -> Self {
-        Self {
-            entries: HashMap::new(),
-            order: Vec::new(),
-            total_bytes: 0,
-            limit: 0,
-        }
-    }
 }
 
 impl DecodedImageCache {
