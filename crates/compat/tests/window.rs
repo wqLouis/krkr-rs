@@ -350,3 +350,68 @@ fn layer_tree_owner_interface_is_the_window_object() {
     // It is read-only, matching the reference `TJS_DENY_NATIVE_PROP_SETTER`.
     assert!(env.eval("w.layerTreeOwnerInterface = null").is_err());
 }
+
+/// `Window.postInputEvent` posts a synthetic key event through the same
+/// dispatch a real input event uses.
+///
+/// Reference: `tTJSNI_Window::PostInputEvent` accepts `onKeyDown`/`onKeyUp`
+/// (reading `key` and `shift`) and `onKeyPress` (reading `key`), then hands
+/// the values to the form, which posts the `on*` event
+/// (`reference/cpp/core/visual/WindowIntf.cpp:913-930`,
+/// `reference/cpp/core/visual/impl/WindowImpl.cpp:1190-1264`).
+#[test]
+fn post_input_event_delivers_key_events_to_window_and_focused_layer() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var l = new Layer(w, null); l.focusable = true; l.visible = true; w.focusedLayer = l; \
+         var windowKey = -1; var windowShift = -1; \
+         var layerKey = -1; var layerShift = -1; var layerProcess = -1; \
+         w.onKeyDown = function(key, shift) { windowKey = key; windowShift = shift; }; \
+         l.onKeyDown = function(key, shift, process) { layerKey = key; layerShift = shift; layerProcess = process; };",
+    );
+
+    assert_eq!(
+        env.eval_ok("w.postInputEvent('onKeyDown', %[key: 13, shift: 0])"),
+        TjsValue::Void
+    );
+    // The window gets `(key, shift)`; the focused layer gets
+    // `(key, shift, true)` (`reference/cpp/core/visual/WindowIntf.cpp:485-496`,
+    // `reference/cpp/core/visual/LayerIntf.cpp:3844-3854`).
+    assert_eq!(env.eval_int("windowKey"), 13);
+    assert_eq!(env.eval_int("windowShift"), 0);
+    assert_eq!(env.eval_int("layerKey"), 13);
+    assert_eq!(env.eval_int("layerShift"), 0);
+    assert_eq!(env.eval_int("layerProcess"), 1);
+}
+
+/// An unknown event name and a missing `params` object are the reference
+/// `TVPSpecifiedEventNameIsUnknown` / `TVPSpecifiedEventNeedsParameter`
+/// (`reference/cpp/core/visual/impl/WindowImpl.cpp:1208-1216`).
+#[test]
+fn post_input_event_rejects_unknown_names_and_missing_parameters() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run("var w = new Window();");
+
+    assert!(env.eval("w.postInputEvent('onMouseDown')").is_err());
+    assert!(env.eval("w.postInputEvent('onKeyDown')").is_err());
+    assert!(env.eval("w.postInputEvent('onKeyPress', 1)").is_err());
+}
+
+/// `onKeyPress` posts the low 8 bits of `key` as a one-character string
+/// (`reference/cpp/core/visual/impl/WindowImpl.cpp:1243-1261`).
+#[test]
+fn post_input_event_key_press_delivers_the_character() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var key = ''; \
+         w.onKeyPress = function(k) { key = k; };",
+    );
+
+    env.run("w.postInputEvent('onKeyPress', %[key: 65]);");
+    assert_eq!(env.eval_int("key == 'A'"), 1);
+}

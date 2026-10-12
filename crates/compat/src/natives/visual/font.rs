@@ -11,8 +11,8 @@
 //! string read as a storage name), then the host's installed system fonts,
 //! with the reference's default-face fallback for an unresolved name.
 //! `defaultFaceName`/`getList` report the resolver's registered faces;
-//! `doUserSelect` still needs a host font-selection UI and raises a typed
-//! error.
+//! `doUserSelect` accepts its four arguments and returns `0`, matching the
+//! reference's disabled host-selection call.
 #![allow(unsafe_code)]
 
 use std::collections::HashMap;
@@ -751,13 +751,15 @@ extern "C" fn font_get_glyph_draw_rect(
 }
 
 /// `font.doUserSelect(flags, caption, prompt, samplestring)` — the reference
-/// delegates to a host font-selection UI. No such seam exists in compat.
+/// reads the four arguments, disables the host font-selection call with
+/// `#if 0`, and returns `0` without touching the font
+/// (`reference/cpp/core/visual/LayerIntf.cpp:11931-11956`).
 extern "C" fn font_do_user_select(
     _engine: *mut c_void,
     _instance: *mut c_void,
     argc: c_int,
     _argv: *const Value,
-    _out: *mut Value,
+    out: *mut Value,
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
@@ -767,10 +769,8 @@ extern "C" fn font_do_user_select(
             "Font.doUserSelect requires flags, caption, prompt and samplestring",
         );
     }
-    report_error(
-        out_error,
-        "Font.doUserSelect: no host font-selection UI is exposed",
-    )
+    set_int(out, 0);
+    0
 }
 
 /// `font.getList(flags)` — the registered face family names as a TJS array

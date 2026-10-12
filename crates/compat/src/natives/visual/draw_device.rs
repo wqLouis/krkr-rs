@@ -31,7 +31,6 @@ use tjs::{
     NativeStaticMembers, RetainedValue, TjsValue, Value,
 };
 
-use super::common::{bound, set_visual_string_out};
 use crate::native_util::{args, report_error, set_int, set_void};
 use crate::natives::system::value_as_i64;
 use crate::{CompatCtx, CompatError};
@@ -47,26 +46,8 @@ const DT_DB_DD: i64 = 3;
 /// Reference `dtDBD3D`.
 const DT_DB_D3D: i64 = 4;
 
-/// Which script class a [`DrawDeviceInst`] backs.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum DeviceKind {
-    Basic,
-    PassThrough,
-}
-
-impl DeviceKind {
-    /// The reference class name, used for `name` and in error messages.
-    fn class_name(self) -> &'static str {
-        match self {
-            DeviceKind::Basic => "BasicDrawDevice",
-            DeviceKind::PassThrough => "PassThroughDrawDevice",
-        }
-    }
-}
-
 /// The native payload of one draw device.
 struct DrawDeviceInst {
-    kind: DeviceKind,
     /// Reference `DrawerType`: the drawer currently in use. The reference
     /// constructor initializes `BasicDrawDevice` to `dtDrawDib`
     /// (`BasicDrawDevice.h`) and `PassThroughDrawDevice` to `dtNone` until
@@ -105,7 +86,6 @@ impl DrawDeviceInst {
 /// Allocate a `BasicDrawDevice` payload (reference constructor defaults).
 extern "C" fn basic_draw_device_create(_engine: *mut c_void) -> *mut c_void {
     Box::into_raw(Box::new(DrawDeviceInst {
-        kind: DeviceKind::Basic,
         drawer: DT_DRAW_DIB,
         preferred_drawer: DT_DRAW_DIB,
         locked: (0, 0),
@@ -117,7 +97,6 @@ extern "C" fn basic_draw_device_create(_engine: *mut c_void) -> *mut c_void {
 /// drawer and `LockedWidth = LockedHeight = -1`).
 extern "C" fn pass_through_draw_device_create(_engine: *mut c_void) -> *mut c_void {
     Box::into_raw(Box::new(DrawDeviceInst {
-        kind: DeviceKind::PassThrough,
         drawer: DT_NONE,
         preferred_drawer: DT_NONE,
         locked: (-1, -1),
@@ -237,25 +216,6 @@ extern "C" fn draw_device_interface_get(
     _objthis: *mut c_void,
 ) -> c_int {
     set_int(out, instance as i64);
-    0
-}
-
-/// `name` — the reference parser attributes the `TVP_REGISTER_PTDD_ENUM`
-/// macro parameter to this member; there is no reference implementation, so
-/// the port reports the script class name.
-extern "C" fn draw_device_name_get(
-    engine: *mut c_void,
-    instance: *mut c_void,
-    out: *mut Value,
-    out_error: *mut *mut c_char,
-    _objthis: *mut c_void,
-) -> c_int {
-    let Ok((_resolved, ctx)) = bound(engine) else {
-        return report_error(out_error, "draw-device name: compat context is not bound");
-    };
-    // SAFETY: `instance` is the live `DrawDeviceInst` payload the VM allocated for this script object; no `&mut` to it is live in `draw_device_name_get`.
-    let inst = unsafe { &*(instance as *const DrawDeviceInst) };
-    set_visual_string_out(&ctx, out, inst.kind.class_name());
     0
 }
 
@@ -412,11 +372,6 @@ fn common_properties() -> Vec<NativeInstancePropertyDef> {
             set: None,
         },
         NativeInstancePropertyDef {
-            name: "name",
-            get: Some(draw_device_name_get),
-            set: None,
-        },
-        NativeInstancePropertyDef {
             name: "drawer",
             get: Some(draw_device_drawer_get),
             set: None,
@@ -480,12 +435,11 @@ pub(super) fn register_draw_devices(ctx: &mut CompatCtx) -> Result<(), CompatErr
 
 #[cfg(test)]
 mod tests {
-    use super::{DT_DB_D3D, DT_DB_DD, DT_DB_GDI, DT_DRAW_DIB, DT_NONE, DeviceKind, DrawDeviceInst};
+    use super::{DT_DB_D3D, DT_DB_DD, DT_DB_GDI, DT_DRAW_DIB, DT_NONE, DrawDeviceInst};
 
     #[test]
     fn reference_defaults_match_the_headers() {
         let basic = DrawDeviceInst {
-            kind: DeviceKind::Basic,
             drawer: DT_DRAW_DIB,
             preferred_drawer: DT_DRAW_DIB,
             locked: (0, 0),
@@ -495,7 +449,6 @@ mod tests {
         assert_eq!(basic.src_size(), (0, 0));
 
         let pass_through = DrawDeviceInst {
-            kind: DeviceKind::PassThrough,
             drawer: DT_NONE,
             preferred_drawer: DT_NONE,
             locked: (-1, -1),

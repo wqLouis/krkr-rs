@@ -6,8 +6,7 @@
 //! fonts, then the default-face fallback); the positive cases mount a
 //! directory holding a system font and skip when no usable font is present
 //! (mirroring the L2/L1 text tests). `getList`, `defaultFaceName` and
-//! `getGlyphDrawRect` report the resolver's registered faces; only
-//! `doUserSelect` remains deferred (no host font-selection UI).
+//! `getGlyphDrawRect` report the resolver's registered faces.
 //!
 //! The tests serialize on the shared VM lock because the engine → context
 //! binding is process-wide and single.
@@ -303,16 +302,19 @@ fn font_get_list_and_default_face_name_report_the_registered_face() {
     }
 }
 
+/// The reference reads the four arguments, disables the host font-selection
+/// call and returns `0` without touching the font
+/// (`reference/cpp/core/visual/LayerIntf.cpp:11931-11956`).
 #[test]
-fn font_user_select_is_deferred() {
+fn font_user_select_returns_zero_without_changing_the_font() {
     let _lock = vm_lock();
     let env = Env::new(None);
     env.run("var f = new Font('Ghost', 16, 0);");
 
-    assert!(
-        env.error("f.doUserSelect(0, '', '', '')")
-            .contains("font-selection UI")
-    );
+    assert_eq!(env.eval_int("f.doUserSelect(0, '', '', '')"), 0);
+    assert_eq!(env.eval_int("f.face == 'Ghost'"), 1);
+    // Fewer than four arguments is still an error (TJS_E_BADPARAMCOUNT).
+    assert!(env.eval("f.doUserSelect(0, '', '')").is_err());
 }
 
 #[test]

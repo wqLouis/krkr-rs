@@ -580,10 +580,16 @@ fn draw_device_classes_are_attached_to_window() {
          var p = new Window.PassThroughDrawDevice();",
     );
 
-    // `name` plus the drawer defaults match the reference constructors
+    // The reference has no `name` member (`BasicDrawDevice.cpp:898-913`
+    // registers only `interface`, the `dt*` constants, `preferredDrawer` and
+    // `drawer`), so a read raises.
+    assert!(env.eval("b.name").is_err(), "BasicDrawDevice has no `name`");
+    assert!(
+        env.eval("p.name").is_err(),
+        "PassThroughDrawDevice has no `name`"
+    );
+    // The drawer defaults match the reference constructors
     // (`BasicDrawDevice.h`: dtDrawDib; `PassThroughDrawDevice.cpp`: dtNone).
-    assert_eq!(env.eval_int("b.name == 'BasicDrawDevice'"), 1);
-    assert_eq!(env.eval_int("p.name == 'PassThroughDrawDevice'"), 1);
     assert_eq!(env.eval_int("b.drawer"), 1);
     assert_eq!(env.eval_int("b.preferredDrawer"), 1);
     assert_eq!(env.eval_int("p.drawer"), 0);

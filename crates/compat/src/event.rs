@@ -17,6 +17,7 @@ use engine::input::InputState;
 use platform::{InputEvent, MouseButton, PlatformEvent};
 use tjs::TjsValue;
 
+use crate::natives::input::shift_state::{TVP_SS_ALT, TVP_SS_CTRL, TVP_SS_SHIFT};
 use crate::natives::input::{MOUSE_CLICK_MAX_MOVE, mouse_button, shift_flags, vk_from_physical};
 use crate::natives::visual::{ObjectKind, duplicate_object};
 use crate::{CompatCtx, CompatError};
@@ -725,6 +726,44 @@ const WHEEL_DELTA: f32 = 120.0;
 /// Convert a platform scroll amount into the reference wheel-delta units.
 fn wheel_delta(value: f32) -> i64 {
     coordinate(value * WHEEL_DELTA)
+}
+
+/// The shift mask the reference `onKeyUp` handler receives from a posted
+/// event: `TVP_TShiftState_From_uint32(shift)` — the TVP `ssShift`/`ssCtrl`/
+/// `ssAlt` bits mapped to the Windows `MK_SHIFT`/`MK_CONTROL`/`MK_ALT` bits —
+/// OR-ed with the held mouse buttons (`reference/cpp/core/visual/impl/WindowImpl.cpp:53-67`,
+/// `reference/cpp/core/environ/impl/TVPWindow.h:437-441`).
+pub(crate) fn key_up_shift(ctx: &CompatCtx, shift: i64) -> i64 {
+    const MK_LBUTTON: i64 = 0x0001;
+    const MK_RBUTTON: i64 = 0x0002;
+    const MK_SHIFT: i64 = 0x0004;
+    const MK_CONTROL: i64 = 0x0008;
+    const MK_MBUTTON: i64 = 0x0010;
+    const MK_ALT: i64 = 0x0020;
+
+    let shift = shift as u32;
+    let mut result = 0i64;
+    if shift & TVP_SS_SHIFT != 0 {
+        result |= MK_SHIFT;
+    }
+    if shift & TVP_SS_CTRL != 0 {
+        result |= MK_CONTROL;
+    }
+    if shift & TVP_SS_ALT != 0 {
+        result |= MK_ALT;
+    }
+    if let Some(input) = input(ctx) {
+        if input.is_button_down(MouseButton::Left) {
+            result |= MK_LBUTTON;
+        }
+        if input.is_button_down(MouseButton::Right) {
+            result |= MK_RBUTTON;
+        }
+        if input.is_button_down(MouseButton::Middle) {
+            result |= MK_MBUTTON;
+        }
+    }
+    result
 }
 
 /// Convert a mapped event argument to the TJS value the handler receives.

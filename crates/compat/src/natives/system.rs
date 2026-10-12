@@ -307,7 +307,7 @@ pub(crate) fn try_value_as_i64(v: &Value) -> Result<i64, String> {
 /// following spaces), the `true`/`false` keywords, `0x`/`0b`/leading-zero
 /// octal forms, and decimal integer/real literals (including `e` exponents).
 /// Anything unparsable yields `0`; trailing garbage (`"12abc"`) is ignored.
-fn tjs_string_to_integer(s: &str) -> i64 {
+pub(crate) fn tjs_string_to_integer(s: &str) -> i64 {
     let bytes = s.as_bytes();
     let mut pos = 0usize;
     let mut negative = false;
@@ -1475,10 +1475,19 @@ extern "C" fn prop_saved_games_path(
     saved_games_path_prop(engine, out, out_error, "savedGamesPath")
 }
 
-/// `System.exeName` — the project directory with a trailing separator, as the
-/// reference returns `TVPNormalizeStorageName(ExePath())`
-/// (`reference/cpp/core/base/impl/SystemImpl.cpp:838-847`,
-/// `reference/cpp/core/environ/Application.cpp:92`).
+/// The synthetic app directory reported when no L2 storage is attached.
+const FALLBACK_EXE_NAME: &str = "krkr-rs/";
+
+/// `System.exeName` — the emulated `ExePath()` in normalized storage form.
+///
+/// The reference returns `TVPNormalizeStorageName(ExePath())`
+/// (`reference/cpp/core/base/impl/SystemImpl.cpp:838-847`), where `ExePath()`
+/// is the application path (`reference/cpp/core/environ/Application.cpp:92`).
+/// The application path here is the L2 storage root ([`project_dir`], the
+/// launcher's `--base-dir` / first archive's parent / default working
+/// directory). When no storage is attached the app path is unknown, so the
+/// getter reports the working directory with a trailing separator instead of
+/// raising: a Windows application always has an executable path (D18).
 extern "C" fn prop_exe_name(
     engine: *mut c_void,
     out: *mut Value,
@@ -1488,13 +1497,15 @@ extern "C" fn prop_exe_name(
         return report_error(out_error, "System.exeName: compat context is not bound");
     };
     let ctx = resolved.ctx();
-    match project_dir(&ctx) {
-        Some(dir) => {
-            set_string_out(&ctx, out, &dir_with_separator(&dir));
-            0
-        }
-        None => report_error(out_error, "System.exeName: storage is not attached"),
-    }
+    let name = match project_dir(&ctx) {
+        Some(dir) => dir_with_separator(&dir),
+        None => match std::env::current_dir() {
+            Ok(dir) => dir_with_separator(&dir),
+            Err(_) => FALLBACK_EXE_NAME.to_string(),
+        },
+    };
+    set_string_out(&ctx, out, &name);
+    0
 }
 
 extern "C" fn prop_title_get(
@@ -1614,9 +1625,16 @@ extern "C" fn prop_screen_height(
     0
 }
 
-/// The KiriKiri version this port reports (`TVPGetVersionString`,
-/// `reference/cpp/core/base/MsgIntf.cpp:173-177`).
-const EMULATED_KIRIKIRI_VERSION: &str = "2.32.2.426";
+/// The four components `TVPGetVersion` sets statically: major, minor,
+/// release and build (`reference/cpp/core/base/impl/MsgImpl.cpp:20-30`).
+const KIRIKIRI_VERSION: (i64, i64, i64, i64) = (2, 32, 2, 426);
+
+/// `TVPGetVersionString`: `"{major}.{minor}.{release}.{build}"`
+/// (`reference/cpp/core/base/MsgIntf.cpp:173-177`).
+fn kirikiri_version_string() -> String {
+    let (major, minor, release, build) = KIRIKIRI_VERSION;
+    format!("{major}.{minor}.{release}.{build}")
+}
 
 extern "C" fn prop_version_string(
     engine: *mut c_void,
@@ -1630,7 +1648,7 @@ extern "C" fn prop_version_string(
         );
     };
     let ctx = resolved.ctx();
-    set_string_out(&ctx, out, EMULATED_KIRIKIRI_VERSION);
+    set_string_out(&ctx, out, &kirikiri_version_string());
     0
 }
 
@@ -1652,8 +1670,9 @@ extern "C" fn prop_version_information(
     // `%TIME%` the build macros (`base/MsgIntf.cpp:136-137`, `166-168`).
     let (date, time) = resolved.engine().compile_date_time();
     let tjs_version = resolved.engine().tjs_version_string();
+    let version = kirikiri_version_string();
     let information = format!(
-        "Kirikiri 2 Executable core /{EMULATED_KIRIKIRI_VERSION} (Compiled on {date} {time}) \
+        "Kirikiri 2 Executable core /{version} (Compiled on {date} {time}) \
          TJS2/{tjs_version} Copyright (C) 1997-2013 W.Dee and contributors All rights reserved."
     );
     set_string_out(&ctx, out, &information);

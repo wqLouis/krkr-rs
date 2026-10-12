@@ -14,7 +14,7 @@ use super::common::{
     ObjectKind, VisualState, WindowObject, bound, duplicate_object, input_ref, resolve_object_id,
     scene_mut, scene_ref, set_null_out, set_object_out, set_real, set_retained_out,
 };
-use super::{clear_layer_focus, focus_layer};
+use super::{clear_layer_focus, focus_layer_in_input_domain};
 use crate::native_util::{args, report_error, set_bool, set_int, set_void, value_as_string};
 use crate::natives::system::{set_string_out, value_as_bool, value_as_i64};
 use crate::{CompatCtx, CompatError};
@@ -610,10 +610,39 @@ extern "C" fn window_hide_mouse_cursor(
     0
 }
 
-/// `Window.postInputEvent(name[, params])` — accepted and logged; the host
-/// input bridge is not wired yet.
+/// Read `params.key` / `params.shift` and convert it the way the reference's
+/// `(tjs_int)val` does (`reference/cpp/core/visual/impl/WindowImpl.cpp:1217-1235`).
+/// A missing member is the reference `TVPSpecifiedEventNeedsParameter2`.
+fn read_param_int(
+    engine: &Tjs2Engine,
+    object: tjs::Tjs2ValueId,
+    event: &str,
+    param: &str,
+) -> Result<i64, String> {
+    let value = engine
+        .member(object, param)
+        .map_err(|_| format!("Specified event {event} needs parameter {param}"))?;
+    match value {
+        TjsValue::Integer(value) => Ok(value),
+        TjsValue::Real(value) => Ok(value as i64),
+        TjsValue::String(text) => Ok(crate::natives::system::tjs_string_to_integer(&text)),
+        TjsValue::Void => Ok(0),
+        TjsValue::Object | TjsValue::Retained(_) => {
+            Err("value is an object, not an integer".to_string())
+        }
+    }
+}
+
+/// `Window.postInputEvent(name[, params])` — post a synthetic input event to
+/// the window and its focused layer.
+///
+/// The reference accepts only `onKeyDown`, `onKeyUp` and `onKeyPress`, reads
+/// `params.key` (and `params.shift` for down/up), and hands the values to the
+/// window form, which posts the same TJS event a real input event would
+/// (`reference/cpp/core/visual/WindowIntf.cpp:913-930`,
+/// `reference/cpp/core/visual/impl/WindowImpl.cpp:1190-1264`).
 extern "C" fn window_post_input_event(
-    _engine: *mut c_void,
+    engine: *mut c_void,
     _instance: *mut c_void,
     argc: c_int,
     argv: *const Value,
@@ -624,8 +653,103 @@ extern "C" fn window_post_input_event(
     if argc < 1 {
         return report_error(out_error, "Window.postInputEvent requires an event name");
     }
-    let name = value_as_string(&unsafe { args(argv, argc) }[0]);
-    log::debug!("Window.postInputEvent({name:?}): no input bridge is wired; ignored");
+    let Ok((resolved, mut ctx)) = bound(engine) else {
+        return report_error(
+            out_error,
+            "Window.postInputEvent: compat context is not bound",
+        );
+    };
+    // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
+    let a = unsafe { args(argv, argc) };
+    let name = value_as_string(&a[0]);
+    let event = match name.as_str() {
+        "onKeyDown" | "onKeyUp" => {
+            // `eventparams = param[1]->AsObjectNoAddRef()`; a non-object
+            // leaves it null and the reference raises the needs-parameter
+            // error (`reference/cpp/core/visual/impl/WindowImpl.cpp:1213-1216`).
+            let Some(params) = (argc >= 2)
+                .then(|| &a[1])
+                .filter(|value| value.ty == VAL_OBJECT)
+            else {
+                return report_error(
+                    out_error,
+                    &format!("Specified event {name} needs parameter"),
+                );
+            };
+            let object = match resolved.engine().retain_object_arg(params) {
+                Ok(object) => object,
+                Err(error) => {
+                    return report_error(out_error, &format!("Window.postInputEvent: {error}"));
+                }
+            };
+            let key = match read_param_int(resolved.engine(), object.raw_id(), &name, "key") {
+                Ok(value) => value,
+                Err(error) => return report_error(out_error, &error),
+            };
+            let shift = match read_param_int(resolved.engine(), object.raw_id(), &name, "shift") {
+                Ok(value) => value,
+                Err(error) => return report_error(out_error, &error),
+            };
+            // The window form takes the key as a `tjs_uint16`
+            // (`reference/cpp/core/visual/impl/WindowImpl.cpp:1237-1242`).
+            let key = i64::from(key as u16);
+            let shift = if name == "onKeyUp" {
+                crate::event::key_up_shift(&ctx, shift)
+            } else {
+                shift
+            };
+            crate::TjsEvent {
+                name: if name == "onKeyDown" {
+                    "onKeyDown"
+                } else {
+                    "onKeyUp"
+                },
+                args: vec![
+                    crate::EventValue::Int(key),
+                    crate::EventValue::Int(shift),
+                    crate::EventValue::Int(1),
+                ],
+            }
+        }
+        "onKeyPress" => {
+            let Some(params) = (argc >= 2)
+                .then(|| &a[1])
+                .filter(|value| value.ty == VAL_OBJECT)
+            else {
+                return report_error(
+                    out_error,
+                    &format!("Specified event {name} needs parameter"),
+                );
+            };
+            let object = match resolved.engine().retain_object_arg(params) {
+                Ok(object) => object,
+                Err(error) => {
+                    return report_error(out_error, &format!("Window.postInputEvent: {error}"));
+                }
+            };
+            let key = match read_param_int(resolved.engine(), object.raw_id(), &name, "key") {
+                Ok(value) => value,
+                Err(error) => return report_error(out_error, &error),
+            };
+            // `char vcl_key = key` widens the low 8 bits to the 16-bit
+            // `tjs_char` the window form carries
+            // (`reference/cpp/core/visual/impl/WindowImpl.cpp:1258-1261`).
+            let character = String::from_utf16_lossy(&[key as u8 as i8 as i16 as u16]);
+            crate::TjsEvent {
+                name: "onKeyPress",
+                args: vec![crate::EventValue::Str(character), crate::EventValue::Int(1)],
+            }
+        }
+        _ => {
+            return report_error(
+                out_error,
+                &format!("Specified event name {name} is unknown"),
+            );
+        }
+    };
+    if let Err(error) = crate::EventAdapter::new().dispatch(&mut ctx, &event) {
+        return report_error(out_error, &format!("Window.postInputEvent: {error}"));
+    }
     set_void(out);
     0
 }
@@ -997,14 +1121,16 @@ extern "C" fn window_focused_layer_set(
         Ok(_) => None,
         Err(error) => return report_error(out_error, &format!("Window.focusedLayer: {error}")),
     };
-    // `SetFocusedLayer` = `SetFocusTo(layer, false)`
-    // (`reference/cpp/core/environ/WindowIntf.cpp:1781`,
-    // `reference/cpp/core/visual/impl/BitmapLayerTreeOwner.cpp:609`,
-    // `reference/cpp/core/visual/impl/LayerManager.h:488-490`): the guard and
-    // the focus events apply exactly as for any focus transition.
+    // `SetFocusedLayer` = `SetFocusTo(layer, false)` on the window's
+    // **first registered manager**, regardless of the layer's own domain
+    // (`reference/cpp/core/environ/WindowIntf.cpp:1781` goes through the
+    // draw device, `reference/cpp/core/visual/impl/DrawDevice.cpp:555-559`,
+    // to `LayerTreeOwnerImpl.cpp:385-389` and `LayerManager.h:488-490`):
+    // the guard and the focus events apply exactly as for any focus
+    // transition, inside that domain.
     match layer_id {
         Some(layer) => {
-            focus_layer(&ctx, layer, false);
+            focus_layer_in_input_domain(&ctx, window, layer, false);
         }
         None => {
             clear_layer_focus(&ctx, window, false);

@@ -48,7 +48,6 @@
       "dtNone",
       "finalize",
       "interface",
-      "name",
       "preferredDrawer",
       "recreate"
     ],
@@ -1869,7 +1868,6 @@
       "finalize",
       "interface",
       "lockTouchSize",
-      "name",
       "preferredDrawer",
       "recreate"
     ],
@@ -2608,7 +2606,6 @@
       "dtNone",
       "finalize",
       "interface",
-      "name",
       "preferredDrawer",
       "recreate"
     ],
@@ -2623,7 +2620,6 @@
       "finalize",
       "interface",
       "lockTouchSize",
-      "name",
       "preferredDrawer",
       "recreate"
     ],

@@ -404,7 +404,22 @@ fn storage_backed_paths_are_typed_errors_without_storage() {
         assert!(e.eval("System.dataPath", "t").is_err());
         assert!(e.eval("System.personalPath", "t").is_err());
         assert!(e.eval("System.savedGamesPath", "t").is_err());
-        assert!(e.eval("System.exeName", "t").is_err());
+    });
+}
+
+/// `System.exeName` is a Win32 fact: the reference always has an executable
+/// path (`reference/cpp/core/base/impl/SystemImpl.cpp:838-847`), so a host
+/// without storage reports the working directory rather than raising (D18).
+#[test]
+fn exe_name_without_storage_reports_the_working_directory() {
+    let _lock = vm_lock();
+    with_vm(|e| {
+        let cwd = std::env::current_dir().expect("working directory");
+        let expected = format!("{}/", cwd.display().to_string().trim_end_matches('/'));
+        assert_eq!(
+            e.eval("System.exeName", "t").unwrap(),
+            TjsValue::String(expected)
+        );
     });
 }
 
