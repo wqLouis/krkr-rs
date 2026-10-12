@@ -1,7 +1,7 @@
 //! `krkr` CLI: headless frame runner and windowed desktop frontend.
 //!
 //! ```text
-//! krkr [--headless] [--frames N] [--fps N] [--backend null|vulkan] [--scaling game|fit|fill|expand] [--archive XP3 ...] [--base-dir DIR] [GAME]
+//! krkr [--headless] [--frames N] [--fps N] [--backend null|vulkan] [--scaling game|fit|fill|expand] [--preload-archives] [--archive XP3 ...] [--base-dir DIR] [GAME]
 //! ```
 //!
 //! * `--headless` runs an empty scene for `N` frames (default 120) through
@@ -19,8 +19,14 @@
 //!   `TVPCheckStartupArg`: a directory becomes the app path (its loose
 //!   `startup.tjs` decides bootability), a file is mounted as an archive.
 //!   `--base-dir DIR` sets the app path; it defaults to the first archive's
-//!   parent and every relative archive path resolves against it. **No folder
-//!   is ever scanned** for `*.xp3` (the reference has no such scan).
+//!   parent and every relative archive path resolves against it. With no
+//!   `--archive` and a directory app path, every `*.xp3` under it mounts
+//!   recursively; an explicit archive list suppresses that, and the reference
+//!   has no such scan.
+//! * `--preload-archives` reads each mounted archive into memory when it
+//!   mounts, trading the archive's size in resident memory for never reading it
+//!   back from storage. Off by default; entries return the same bytes either
+//!   way.
 //! * `--backend vulkan` requests the Vulkan pipeline. It needs a real
 //!   window with a display connection (Wayland/X11/XCB); the windowed host
 //!   passes both the window and display handle so a surface can be created.
