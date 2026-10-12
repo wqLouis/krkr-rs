@@ -66,6 +66,30 @@ class KrkrGameActivity : GameActivity() {
          */
         @JvmField
         var pendingStateDir: String? = null
+
+        /**
+         * The frame-rate limit the user chose, as a decimal string.
+         *
+         * Read from native code (`crates/android`) through JNI exactly like
+         * [pendingGameDir], and resolved there into the `RuntimeConfig` the
+         * engine receives. Null means the launcher had no persisted choice, so
+         * the engine's default applies.
+         *
+         * `@JvmField` is deliberate: JNI `GetStaticField` reads a real static
+         * *field*, not a companion accessor.
+         */
+        @JvmField
+        var pendingFrameRate: String? = null
+
+        /**
+         * The presentation scaling the user chose (`game`/`fit`/`fill`/
+         * `expand`), read through JNI like [pendingFrameRate].
+         *
+         * The launcher defaults this to `fit` on Android; the user's choice
+         * overrides it.
+         */
+        @JvmField
+        var pendingScaling: String? = null
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -80,8 +104,9 @@ class KrkrGameActivity : GameActivity() {
         pendingGameDir = intent.getStringExtra(EXTRA_GAME_DIR)
         pendingGameName = intent.getStringExtra(EXTRA_GAME_NAME)
         pendingStateDir = filesDir.absolutePath
+        publishRuntimeSettings()
         LauncherLog.i(
-            "KrkrGameActivity.onCreate: game=${pendingGameName ?: "?"} dir=${pendingGameDir ?: "?"} stateDir=${pendingStateDir ?: "?"}",
+            "KrkrGameActivity.onCreate: game=${pendingGameName ?: "?"} dir=${pendingGameDir ?: "?"} stateDir=${pendingStateDir ?: "?"} fps=${pendingFrameRate ?: "?"} scaling=${pendingScaling ?: "?"}",
         )
         super.onCreate(savedInstanceState)
 
@@ -108,9 +133,20 @@ class KrkrGameActivity : GameActivity() {
         pendingGameDir = intent.getStringExtra(EXTRA_GAME_DIR)
         pendingGameName = intent.getStringExtra(EXTRA_GAME_NAME)
         pendingStateDir = filesDir.absolutePath
+        publishRuntimeSettings()
         LauncherLog.i(
-            "KrkrGameActivity.onNewIntent: engine already running; game=${pendingGameName ?: "?"} dir=${pendingGameDir ?: "?"}",
+            "KrkrGameActivity.onNewIntent: engine already running; game=${pendingGameName ?: "?"} dir=${pendingGameDir ?: "?"} fps=${pendingFrameRate ?: "?"} scaling=${pendingScaling ?: "?"}",
         )
+    }
+
+    /**
+     * Copies the launcher's saved runtime settings onto the static fields the
+     * native side reads. Must run before `super.onCreate` enters `android_main`.
+     */
+    private fun publishRuntimeSettings() {
+        val settings = RuntimeSettingsStore(this).read()
+        pendingFrameRate = settings.frameRate
+        pendingScaling = settings.scaling
     }
 
     override fun onDestroy() {

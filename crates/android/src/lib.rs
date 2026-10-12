@@ -18,7 +18,8 @@
 //!   uniformly to fit the screen, with the remainder letterboxed
 //!   (`ScalingMode::Fit`), instead of showing the raw logical size. The
 //!   desktop default stays `Game`, the reference's one-to-one Win32
-//!   presentation; see `docs/android.md` §2.2.
+//!   presentation; the user's saved scaling setting overrides either. See
+//!   `docs/android.md` §2.2 and §3.2.
 //!
 //! The state-file writer ([`state`]) is plain `std` and has no Android
 //! dependency, so the host test target compiles and exercises it; the
@@ -27,6 +28,8 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+#[cfg(any(target_os = "android", test))]
+mod config;
 #[cfg(target_os = "android")]
 mod host;
 #[cfg(target_os = "android")]
@@ -43,11 +46,11 @@ mod android_entry {
     use std::time::Duration;
 
     use android_activity::AndroidApp;
-    use api::config::{PresentationScaling, RuntimeConfig};
+    use api::config::PresentationScaling;
     use app::BackendKind;
     use engine::projection::ScalingMode;
 
-    use crate::{host, jni_fields, state};
+    use crate::{config, host, jni_fields, state};
 
     /// The Android entry point.
     ///
@@ -57,9 +60,11 @@ mod android_entry {
     ///
     /// The launcher's folder is read first so the engine has something to mount
     /// before any other work; a missing folder is reported through the state
-    /// file and the loop is never started. The presentation default is chosen
-    /// here: [`PresentationScaling::Fit`] is mapped to the engine's
-    /// [`ScalingMode::Fit`] and carried into the host.
+    /// file and the loop is never started. The launcher's saved runtime settings
+    /// (frame-rate limit and presentation scaling) are read next over the same
+    /// JNI channel and resolved by [`crate::config`]: the presentation default
+    /// is [`PresentationScaling::Fit`] and the user's stored choice overrides
+    /// it, and an out-of-range value is reported and the loop is never started.
     #[allow(unsafe_code)]
     #[unsafe(no_mangle)]
     pub fn android_main(app: AndroidApp) {
@@ -97,12 +102,36 @@ mod android_entry {
         .unwrap_or_default();
         log::info!("krkr: launching {name:?} from {}", game_dir.display());
 
-        // A phone always fits the scene rather than presenting the raw logical
-        // size, so the default is set on this side of the composition root.
-        let runtime = RuntimeConfig {
-            scaling: PresentationScaling::Fit,
-            ..RuntimeConfig::default()
-        };
+        // The launcher persisted this choice in its own settings store and
+        // published it over JNI. Resolving it here keeps configuration loading
+        // the launcher's business: the emulator only receives the finished
+        // value. An unparseable or out-of-range value is a typed error, never a
+        // fall back to the default (D11).
+        let frame_rate = jni_fields::activity_static_string(
+            &app,
+            jni_fields::FIELD_FRAME_RATE,
+            jni_fields::SIG_STRING,
+        );
+        let scaling = jni_fields::activity_static_string(
+            &app,
+            jni_fields::FIELD_SCALING,
+            jni_fields::SIG_STRING,
+        );
+        let runtime =
+            match config::resolve_runtime_config(frame_rate.as_deref(), scaling.as_deref()) {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    log::error!("invalid runtime configuration: {error}");
+                    let message = error.to_string();
+                    state::write_state(state::State::Failed, Some(&message));
+                    return;
+                }
+            };
+        log::info!(
+            "krkr: frame rate {} fps, scaling {}",
+            runtime.frame_rate_limit.fps(),
+            runtime.scaling.as_str()
+        );
         let handler =
             host::AndroidHost::new(BackendKind::Vulkan, map_scaling(runtime.scaling), game_dir);
         host::run_loop(

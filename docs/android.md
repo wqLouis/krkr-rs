@@ -153,7 +153,8 @@ value and does no configuration I/O of its own):
   desktop CLI drives the same host through `app::run`. The desktop default
   stays `Game`, and `--scaling` still overrides either. Loading the
   configuration is deliberately the launcher's business, so each platform can
-  implement it its own way (`docs/runtime-config.md`).
+  implement it its own way (`docs/runtime-config.md`). On Android the player's
+  saved choice overrides `Fit` through the settings screen (§3.2).
 
 ---
 
@@ -163,17 +164,20 @@ value and does no configuration I/O of its own):
 android/                          Kotlin + Compose M3 app (Gradle)
   app/src/main/kotlin/…/
     MainActivity.kt               library: game list, "Add game" (SAF), settings
-    GameActivity.kt               hosts the engine surface (GameActivity)
+    KrkrGameActivity.kt           hosts the engine surface; publishes the game
+                                  dir + runtime settings over JNI
     GameLibrary.kt                persisted picked-folder URIs + metadata
+    RuntimeSettings.kt            persisted runtime options (frame rate, scaling)
     ui/                           Compose screens, M3 theme
   app/src/main/jniLibs/arm64-v8a/
     libkrkr_android.so            ← the Rust engine (cargo-ndk output)
 
 crates/android/                   Rust cdylib (package `krkr-android`)
-  src/lib.rs                      #[bevy_main] android_main; reads the game
-                                  dir from the Activity (JNI/intent extras),
-                                  builds the Bevy app from `render`
-crates/platform/render/                    shared app assembly (refactored so the
+  src/lib.rs                      android_main: reads the game dir and the
+                                  runtime settings from the Activity over JNI,
+                                  builds the app from `render`
+  src/jni_fields.rs               the static-field JNI reads
+  src/config.rs                   validates the settings into a `RuntimeConfig`crates/platform/render/                    shared app assembly (refactored so the
                                   desktop bin and the Android cdylib build the
                                   same App)
 crates/tvp-natives/src/video/
@@ -235,6 +239,66 @@ handed (§4), cached because resolving it costs a `ContentResolver` query. `path
 is absent when the folder is not addressable as a path (a cloud provider); such
 an entry is still listed, and launching it explains why it cannot run rather
 than starting the engine against a path that will not resolve.
+
+### 3.2 Runtime settings — `settings.json` and the JNI path
+
+The launcher also persists the player's runtime options and carries them into
+the engine. A **Settings** screen reachable from the launcher's top bar exposes
+exactly the two options `api::config::RuntimeConfig` actually carries, with the
+same accepted values as the desktop `--fps`/`--scaling`. Nothing is offered for
+a feature the engine has no knob for — a control that silently did nothing is
+the bug class this project forbids (`AGENTS.md` D11).
+
+| option | values / range | default | basis |
+|---|---|---|---|
+| Frame-rate limit | decimal integer `1..=1000` fps | `60` | reference `fps_limit` default 60 (`reference/cpp/core/environ/ui/PreferenceConfig.h:304-309`); the same range `--fps` accepts |
+| Presentation scaling | `game`, `fit`, `fill`, `expand` | `fit` | `game` is the reference's one-to-one Win32 presentation; `fit` is the Android default (§2.2), because a phone must not present the raw logical size |
+
+`fill` and `expand` are exposed because the engine honours them; the desktop
+default remains `game`.
+
+The choices are stored as JSON in the app's private files directory —
+`<filesDir>/settings.json` — next to `games.json`, following the same
+inspectable, atomically-written convention (§3.1):
+
+```json
+{ "version": 1, "frame_rate": "60", "scaling": "fit" }
+```
+
+`RuntimeSettings.kt` keeps each value as the exact string the user chose; it
+does not validate the value itself. Validation belongs to the read side, exactly
+as it does for the desktop `key=value` file.
+
+The configuration path mirrors the desktop launcher's, with the settings file
+playing the role of the `KRKR_CONFIG` file:
+
+1. **The settings UI** validates the frame rate (`1..=1000`) and the scaling
+   (one of the four) and writes `settings.json` atomically. A value loaded from
+   a hand-edited file that is not one of the accepted modes is shown and must be
+   corrected before it can be saved.
+2. **`KrkrGameActivity`** reads `settings.json` in `onCreate`/`onNewIntent`
+   *before* `super.onCreate` and copies the two values onto the static fields
+   `pendingFrameRate` and `pendingScaling` — the same JNI channel
+   `pendingGameDir`/`pendingGameName`/`pendingStateDir` already use.
+3. **`crates/android`** reads those fields (`jni_fields.rs`) and resolves them
+   (`config.rs`) into a `RuntimeConfig`, applying `fit` as the presentation
+   default. An unparseable or out-of-range value is a typed `ConfigError` naming
+   the option and the accepted range; it is written to `krkr_state.json` as a
+   failure and the loop is never started — it is never replaced by the default
+   (D11).
+4. **The shared emulator host** receives the finished value: the
+   `crates/android` loop passes the scaling into `app::Host`/`app::GameHost`
+   and the frame period into its ticker, exactly as the desktop `app::run`
+   does. The emulator core performs no configuration I/O, exactly as on the
+   desktop (`docs/runtime-config.md`).
+
+Because the settings are read at launch, a change applies to the **next** run,
+which the screen states.
+
+Two options that have been suggested are deliberately **not** exposed, because
+the engine exposes no knob for either: texture resolution and audio buffering.
+Adding a control for them would be a stub. They are engine work, not launcher
+work — see `docs/runtime-config.md` §3.
 
 ---
 
@@ -434,14 +498,14 @@ The storage, orientation and game-discovery questions are now **decided**
 (§1): sideloaded storage via option A, landscape lock, and explicit folders
 only — no auto-indexing of a default location.
 
-1. **Resolution/scaling policy** on phones — **decided: always `Fit`.**
-   The game is scaled uniformly to fit the screen with the remainder
-   letterboxed, so it keeps its aspect. The reference's Android build stretches
-   instead (`EXACT_FIT`,
+1. **Resolution/scaling policy** on phones — **decided: default `Fit`, and the
+   player can override it.** The game is scaled uniformly to fit the screen by
+   default, with the remainder letterboxed, so it keeps its aspect. The
+   reference's Android build stretches instead (`EXACT_FIT`,
    `reference/cpp/core/environ/cocos2d/AppDelegate.cpp:60-70`,
    `MainScene.cpp:436-438`); we choose no distortion. The Android composition
-   root must select it as the
-   default; see §2.2 for the exact `api`/`app` changes and the platform half.
+   root selects `Fit` as the default and the settings screen (§3.2) can override
+   it with any of the engine's four modes.
 2. **Audio focus/interruption** (phone call, notification) and lifecycle
    (backgrounding must pause the VM + mixer) — not yet scoped.
 3. **Emulator support**: arm64-only means no x86_64 emulator; verification will

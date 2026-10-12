@@ -29,14 +29,15 @@ app::run(Launch {
 ```
 
 ```rust
-// crates/android — an Android launcher, the same entry point
-let runtime = RuntimeConfig {
-    scaling: PresentationScaling::Fit,             // phones always fit the screen
-    ..RuntimeConfig::default()
-};
+// crates/android — the Android launcher, the same entry point
+// The player's stored choices (frame rate, scaling) are read from the
+// launcher's own settings file, resolved over the Android defaults, and the
+// finished value is handed in. An unparseable or out-of-range value is a
+// ConfigError naming the option and its range; it is never defaulted away.
+let runtime = config::resolve(stored_frame_rate, stored_scaling)?;
 app::run(Launch {
     runtime,
-    backend: BackendKind::Null,
+    backend: BackendKind::Vulkan,
     game: Some(GameInput { base_dir, archives }),
     mode: RunMode::Windowed,
 })?;

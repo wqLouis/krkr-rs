@@ -16,6 +16,9 @@ crate-type = ["cdylib"]
 # The state-file writer is plain std + log, so it also compiles and is tested
 # on the host even though only the Android build runs it.
 log = { workspace = true }
+# The pure L1 type crate: the settings resolver reads the option types and
+# their parsers, so `config` is host-tested as well as compiled for Android.
+api = { workspace = true }
 
 # Everything that touches Android is target-scoped: on a desktop host the
 # crate compiles to just the (host-tested) state module and the desktop
@@ -27,7 +30,6 @@ log = { workspace = true }
 android-activity = { version = "0.6", default-features = false, features = ["game-activity"] }
 # The three static fields `KrkrGameActivity` publishes are read with JNI.
 jni = "0.21"
-api = { workspace = true }
 # The emulator host (L2 engine state + L4 VM host) the loop drives.
 app = { path = "../app" }
 # The L1 Android backend (real window + input translation). The desktop

@@ -27,6 +27,9 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.selectableGroup
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -34,6 +37,7 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -41,6 +45,8 @@ import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
@@ -57,7 +63,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -98,10 +106,12 @@ class MainActivity : ComponentActivity() {
         LauncherLog.i("MainActivity.onCreate")
         permissionGranted.value = SafPaths.hasAllFilesAccess()
         val library = GameLibrary(this)
+        val settings = RuntimeSettingsStore(this)
         setContent {
             KrkrTheme {
                 LauncherScreen(
                     library = library,
+                    settings = settings,
                     permissionGranted = permissionGranted.value,
                     onOpenPermissionSettings = ::openAllFilesSettings,
                     startupIssue = startupIssue.value,
@@ -227,6 +237,7 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun LauncherScreen(
     library: GameLibrary,
+    settings: RuntimeSettingsStore,
     permissionGranted: Boolean,
     onOpenPermissionSettings: () -> Unit,
     startupIssue: Issue?,
@@ -240,6 +251,7 @@ private fun LauncherScreen(
     var pendingRemoval by remember { mutableStateOf<GameEntry?>(null) }
     var gameIssue by remember { mutableStateOf<Issue?>(null) }
     var showLogs by remember { mutableStateOf(false) }
+    var showSettings by remember { mutableStateOf(false) }
 
     // The permission dialog is shown whenever the grant is missing, unless the
     // user explicitly dismissed it ("Not now"). Tapping a game re-opens it.
@@ -308,16 +320,28 @@ private fun LauncherScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text(if (showLogs) "Logs" else "krkr-rs") },
+                title = {
+                    Text(
+                        when {
+                            showLogs -> "Logs"
+                            showSettings -> "Settings"
+                            else -> "krkr-rs"
+                        },
+                    )
+                },
                 navigationIcon = {
-                    if (showLogs) {
-                        IconButton(onClick = { showLogs = false }) {
+                    if (showLogs || showSettings) {
+                        IconButton(onClick = {
+                            showLogs = false
+                            showSettings = false
+                        }) {
                             Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                         }
                     }
                 },
                 actions = {
-                    if (!showLogs) {
+                    if (!showLogs && !showSettings) {
+                        TextButton(onClick = { showSettings = true }) { Text("Settings") }
                         TextButton(onClick = { showLogs = true }) { Text("Logs") }
                     }
                 },
@@ -325,7 +349,7 @@ private fun LauncherScreen(
         },
         snackbarHost = { SnackbarHost(snackbar) },
         floatingActionButton = {
-            if (!showLogs) {
+            if (!showLogs && !showSettings) {
                 ExtendedFloatingActionButton(
                     onClick = { pickFolder.launch(null) },
                     icon = { Icon(Icons.Default.Add, contentDescription = null) },
@@ -338,6 +362,13 @@ private fun LauncherScreen(
             LogsScreen(
                 modifier = Modifier.fillMaxSize().padding(padding),
                 onNotify = { notify(it) },
+            )
+        } else if (showSettings) {
+            SettingsScreen(
+                store = settings,
+                modifier = Modifier.fillMaxSize().padding(padding),
+                onNotify = { notify(it) },
+                onBack = { showSettings = false },
             )
         } else if (games.isEmpty()) {
             EmptyLibrary(
@@ -705,6 +736,156 @@ private fun launchGame(
                 title = "Could not start the engine",
                 message = "Android refused to start the game activity: ${it.message}",
             ),
+        )
+    }
+}
+
+/**
+ * The runtime-settings screen: the launcher's persisted copy of the engine
+ * options the player can change.
+ *
+ * It exposes exactly the two options the engine honours — the frame-rate limit
+ * and the presentation scaling — with the same accepted values and range as the
+ * desktop CLI's `--fps` and `--scaling` (`api::config`). Nothing is offered for
+ * a feature the engine has no knob for.
+ *
+ * Saving writes the settings file atomically; [KrkrGameActivity] reads it and
+ * publishes it over JNI on the next launch, which is why the change is described
+ * as applying to the next run.
+ */
+@Composable
+private fun SettingsScreen(
+    store: RuntimeSettingsStore,
+    modifier: Modifier = Modifier,
+    onNotify: (String) -> Unit,
+    onBack: () -> Unit,
+) {
+    val saved = remember { store.read() }
+    var frameRate by remember { mutableStateOf(saved.frameRate) }
+    var scaling by remember { mutableStateOf(saved.scaling) }
+
+    // Validate only the frame rate here: the scaling value can only be set from
+    // the fixed list of radio buttons, except when the file was hand-edited.
+    val frameRateValue = frameRate.trim().toIntOrNull()
+    val frameRateValid = frameRateValue != null &&
+        frameRateValue in RuntimeOptions.MIN_FRAME_RATE..RuntimeOptions.MAX_FRAME_RATE
+    val scalingKnown = scaling in RuntimeOptions.SCALING
+
+    Column(
+        modifier = modifier.fillMaxSize().padding(16.dp).verticalScroll(rememberScrollState()),
+    ) {
+        Text("Runtime settings", style = MaterialTheme.typography.titleMedium)
+        Spacer(Modifier.height(4.dp))
+        Text(
+            "Applied the next time a game starts.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.height(20.dp))
+
+        Text("Frame-rate limit", style = MaterialTheme.typography.titleSmall)
+        Spacer(Modifier.height(4.dp))
+        OutlinedTextField(
+            value = frameRate,
+            onValueChange = { frameRate = it },
+            label = { Text("Frames per second") },
+            singleLine = true,
+            isError = !frameRateValid,
+            supportingText = {
+                if (frameRateValid) {
+                    Text(
+                        "Integer in ${RuntimeOptions.FRAME_RATE_RANGE}; " +
+                            "default ${RuntimeOptions.DEFAULT_FRAME_RATE}.",
+                    )
+                } else {
+                    Text(
+                        "Must be an integer in ${RuntimeOptions.FRAME_RATE_RANGE} frames per second.",
+                    )
+                }
+            },
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+            modifier = Modifier.fillMaxWidth(),
+        )
+        Spacer(Modifier.height(24.dp))
+
+        Text("Presentation scaling", style = MaterialTheme.typography.titleSmall)
+        Spacer(Modifier.height(4.dp))
+        Text(
+            "How the game picture is fitted to the screen. " +
+                "Default: ${RuntimeOptions.DEFAULT_SCALING}.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Column(Modifier.selectableGroup()) {
+            RuntimeOptions.SCALING.forEach { mode ->
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .selectable(
+                            selected = scaling == mode,
+                            onClick = { scaling = mode },
+                            role = Role.RadioButton,
+                        )
+                        .padding(vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    RadioButton(selected = scaling == mode, onClick = null)
+                    Spacer(Modifier.width(8.dp))
+                    Column {
+                        Text(
+                            text = mode.replaceFirstChar { it.uppercase() },
+                            style = MaterialTheme.typography.bodyLarge,
+                        )
+                        Text(
+                            text = RuntimeOptions.scalingDescription(mode),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
+        }
+        if (!scalingKnown) {
+            Text(
+                text = "This saved value (\"$scaling\") is not one of " +
+                    "${RuntimeOptions.SCALING.joinToString(", ")}; choose one before saving.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+            )
+        }
+        Spacer(Modifier.height(24.dp))
+
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            TextButton(onClick = {
+                frameRate = RuntimeOptions.DEFAULT_FRAME_RATE.toString()
+                scaling = RuntimeOptions.DEFAULT_SCALING
+            }) { Text("Restore defaults") }
+            Button(onClick = {
+                val fps = frameRate.trim().toIntOrNull()
+                if (fps == null || fps !in RuntimeOptions.MIN_FRAME_RATE..RuntimeOptions.MAX_FRAME_RATE) {
+                    onNotify(
+                        "Frame rate must be an integer in " +
+                            "${RuntimeOptions.FRAME_RATE_RANGE} frames per second.",
+                    )
+                    return@Button
+                }
+                if (scaling !in RuntimeOptions.SCALING) {
+                    onNotify("Choose one of: ${RuntimeOptions.SCALING.joinToString(", ")}.")
+                    return@Button
+                }
+                if (store.write(RuntimeSettings(frameRate = fps.toString(), scaling = scaling))) {
+                    onNotify("Settings saved.")
+                    onBack()
+                } else {
+                    onNotify("Could not save the settings; they were not changed.")
+                }
+            }) { Text("Save") }
+        }
+        Spacer(Modifier.height(8.dp))
+        Text(
+            text = "Settings file: ${store.settingsFile().absolutePath}",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.outline,
         )
     }
 }

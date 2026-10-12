@@ -1,4 +1,4 @@
-//! Reads the three static fields `KrkrGameActivity` publishes before
+//! Reads the static fields `KrkrGameActivity` publishes before
 //! `super.onCreate` returns.
 //!
 //! The launcher starts the engine Activity with an Intent extra and, before
@@ -10,7 +10,10 @@
 //! [`pendingGameDir`](FIELD_GAME_DIR) and [`pendingGameName`](FIELD_GAME_NAME)
 //! are written by `KrkrGameActivity.onCreate`; [`pendingStateDir`](FIELD_STATE_DIR)
 //! is its `filesDir.absolutePath`, where [`crate::state`] writes
-//! `krkr_state.json`.
+//! `krkr_state.json`. [`pendingFrameRate`](FIELD_FRAME_RATE) and
+//! [`pendingScaling`](FIELD_SCALING) are the launcher's persisted runtime
+//! settings; [`crate::config`] validates them into the `RuntimeConfig` the
+//! emulator receives.
 
 use android_activity::AndroidApp;
 
@@ -20,6 +23,12 @@ pub(crate) const FIELD_GAME_DIR: &str = "pendingGameDir";
 pub(crate) const FIELD_GAME_NAME: &str = "pendingGameName";
 /// Static field on the same class holding the app's `filesDir`.
 pub(crate) const FIELD_STATE_DIR: &str = "pendingStateDir";
+/// Static field on the same class holding the frame-rate limit, as a decimal
+/// integer; unset means the launcher had no override.
+pub(crate) const FIELD_FRAME_RATE: &str = "pendingFrameRate";
+/// Static field on the same class holding the presentation scaling name
+/// (`game`/`fit`/`fill`/`expand`); unset means the launcher had no override.
+pub(crate) const FIELD_SCALING: &str = "pendingScaling";
 /// JNI signature of every field above (all are `java.lang.String`).
 pub(crate) const SIG_STRING: &str = "Ljava/lang/String;";
 
