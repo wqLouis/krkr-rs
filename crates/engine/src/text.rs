@@ -61,7 +61,7 @@
 //! holds the rasterized character masks and their blurred shadows. There are
 //! no globals, no statics and no hidden caches.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use api::geometry::{PixelRegion, RectF};
@@ -392,11 +392,9 @@ pub struct TextEngine {
     /// It is kept separate from the shaping database so that only explicitly
     /// resolved faces participate in layout.
     system_fonts: Option<fontdb::Database>,
-    /// Memoized shaped layouts, keyed by shaping inputs only.
-    layout_cache: HashMap<LayoutKey, TextLayout>,
-    /// Insertion order of the layout memo, oldest first, for eviction at the
-    /// reference limit.
-    layout_order: VecDeque<LayoutKey>,
+    /// Memoized shaped layouts, keyed by shaping inputs only. Bounded at the
+    /// reference limit with least-recently-used eviction.
+    layout_cache: LruCache<LayoutKey, TextLayout>,
 }
 
 impl TextEngine {
@@ -416,8 +414,7 @@ impl TextEngine {
             faces: Vec::new(),
             by_name: HashMap::new(),
             system_fonts: None,
-            layout_cache: HashMap::new(),
-            layout_order: VecDeque::new(),
+            layout_cache: LruCache::new(MAX_TEXT_CACHE_ENTRIES),
         }
     }
 
@@ -672,12 +669,6 @@ impl TextEngine {
             }
         };
 
-        if self.layout_cache.len() >= MAX_TEXT_CACHE_ENTRIES
-            && let Some(oldest) = self.layout_order.pop_front()
-        {
-            self.layout_cache.remove(&oldest);
-        }
-        self.layout_order.push_back(key.clone());
         self.layout_cache.insert(key, layout.clone());
         Ok(layout)
     }
@@ -1255,8 +1246,9 @@ pub fn compose_text_cpu(
 /// by the face (`tTVPFont`: height, flags, angle, face), the character,
 /// `Antialiased`, `BlurLevel`, `BlurWidth`, `Blured` and `Hinting`. The sharp
 /// character and its blurred shadow are separate entries distinguished by
-/// `blur`; the rotation is absent because a cached mask is unrotated and a
-/// draw rotates it while blitting.
+/// `blur`. The rotation is absent because the rasterizer produces an
+/// unrotated bitmap and the draw only offsets it; colour is absent because it
+/// is a draw argument, not cached data.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct CoverageKey {
     /// Registered face index.
@@ -1306,28 +1298,181 @@ impl CoverageKey {
     }
 }
 
+/// A fixed-capacity least-recently-used map.
+///
+/// Reference: `tTJSHashTable::FindAndTouchWithHash` moves a hit to the front
+/// of the recency order
+/// (`reference/cpp/core/tjs2/tjsHashSearch.h:358-364,516-528`) and
+/// `tTJSHashCache::ChopLast` removes entries from the back
+/// (`reference/cpp/core/tjs2/tjsHashSearch.h:424-433,593-599`), so an entry at
+/// the limit is evicted only when it is the least recently used.
+struct LruCache<K, V> {
+    /// Live and reusable slots; a live key owns exactly one slot.
+    slots: Vec<Slot<K, V>>,
+    /// Indices of evicted slots available for reuse.
+    free: Vec<usize>,
+    /// Live key → slot index.
+    index: HashMap<K, usize>,
+    /// Most-recently-used slot.
+    head: Option<usize>,
+    /// Least-recently-used slot, the next eviction victim.
+    tail: Option<usize>,
+    /// Maximum number of live entries; must be positive.
+    capacity: usize,
+}
+
+/// One slot of an [`LruCache`] recency list.
+struct Slot<K, V> {
+    /// Key while the slot is live.
+    key: Option<K>,
+    /// Value while the slot is live.
+    value: Option<V>,
+    /// More-recently-used neighbour.
+    prev: Option<usize>,
+    /// Less-recently-used neighbour.
+    next: Option<usize>,
+}
+
+impl<K, V> Slot<K, V> {
+    /// An unoccupied slot.
+    fn empty() -> Self {
+        Self {
+            key: None,
+            value: None,
+            prev: None,
+            next: None,
+        }
+    }
+}
+
+impl<K: Eq + std::hash::Hash + Clone, V> LruCache<K, V> {
+    /// Creates an empty cache holding at most `capacity` entries.
+    fn new(capacity: usize) -> Self {
+        Self {
+            slots: Vec::new(),
+            free: Vec::new(),
+            index: HashMap::new(),
+            head: None,
+            tail: None,
+            capacity,
+        }
+    }
+
+    /// The number of live entries.
+    fn len(&self) -> usize {
+        self.index.len()
+    }
+
+    /// Returns `true` when the cache holds no entry.
+    fn is_empty(&self) -> bool {
+        self.index.is_empty()
+    }
+
+    /// Drops every entry.
+    fn clear(&mut self) {
+        self.slots.clear();
+        self.free.clear();
+        self.index.clear();
+        self.head = None;
+        self.tail = None;
+    }
+
+    /// Returns the value for `key`, marking it the most recently used.
+    fn get(&mut self, key: &K) -> Option<&V> {
+        let slot = *self.index.get(key)?;
+        self.unlink(slot);
+        self.link_front(slot);
+        self.slots[slot].value.as_ref()
+    }
+
+    /// Inserts `value` under `key`, marking it the most recently used and
+    /// evicting the least recently used entry when the cache is full.
+    fn insert(&mut self, key: K, value: V) {
+        if let Some(&slot) = self.index.get(&key) {
+            self.slots[slot].value = Some(value);
+            self.unlink(slot);
+            self.link_front(slot);
+            return;
+        }
+        if self.index.len() >= self.capacity {
+            self.evict_lru();
+        }
+        let slot = match self.free.pop() {
+            Some(slot) => slot,
+            None => {
+                self.slots.push(Slot::empty());
+                self.slots.len() - 1
+            }
+        };
+        self.slots[slot].key = Some(key.clone());
+        self.slots[slot].value = Some(value);
+        self.slots[slot].prev = None;
+        self.slots[slot].next = None;
+        self.index.insert(key, slot);
+        self.link_front(slot);
+    }
+
+    /// Removes the least recently used entry, if any.
+    fn evict_lru(&mut self) {
+        let Some(slot) = self.tail else {
+            return;
+        };
+        self.unlink(slot);
+        if let Some(key) = self.slots[slot].key.take() {
+            self.index.remove(&key);
+        }
+        self.slots[slot].value = None;
+        self.free.push(slot);
+    }
+
+    /// Detaches `slot` from the recency list.
+    fn unlink(&mut self, slot: usize) {
+        let (prev, next) = {
+            let entry = &self.slots[slot];
+            (entry.prev, entry.next)
+        };
+        match prev {
+            Some(prev) => self.slots[prev].next = next,
+            None => self.head = next,
+        }
+        match next {
+            Some(next) => self.slots[next].prev = prev,
+            None => self.tail = prev,
+        }
+        self.slots[slot].prev = None;
+        self.slots[slot].next = None;
+    }
+
+    /// Inserts `slot` at the front of the recency list.
+    fn link_front(&mut self, slot: usize) {
+        let head = self.head;
+        self.slots[slot].prev = None;
+        self.slots[slot].next = head;
+        if let Some(head) = head {
+            self.slots[head].prev = Some(slot);
+        }
+        self.head = Some(slot);
+        if self.tail.is_none() {
+            self.tail = Some(slot);
+        }
+    }
+}
+
 /// L2-owned cache of rasterized character masks and their blurred shadows.
 ///
 /// Reference: the `tTVPFontCache` character cache (`TVP_CH_MAX_CACHE_COUNT`;
-/// `reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:222-232`). Its
+/// `reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:108,222-232`). Its
 /// `TVPGetCharacter` (`LayerBitmapImpl.cpp:244-320`) looks a character up by
 /// `CoverageKey` and, on a miss, rasterizes it and (when the font is blurred)
-/// applies `tTVPCharacterData::Blur` (`reference/cpp/core/visual/CharacterData.cpp:118-165`)
-/// before inserting, so both the sharp character and its shadow are reused by a
-/// later draw. The type is explicit caller-owned state; there is no global
-/// cache.
-///
-/// Eviction is insertion-order (FIFO): the `order` queue is appended on every
-/// insert and the front entry is removed at the limit. The reference's
-/// `FindAndTouchWithHash` instead promotes a hit to most-recently-used before
-/// `ChopLast` trims the least-recently-used
-/// (`reference/cpp/core/tjs2/tjsHashSearch.h:358-364,424-433`).
-#[derive(Default)]
+/// applies `tTVPCharacterData::Blur`
+/// (`reference/cpp/core/visual/CharacterData.cpp:118-165`) before inserting,
+/// so both the sharp character and its shadow are reused by a later draw.
+/// Eviction is least-recently-used, matching the reference's
+/// `FindAndTouchWithHash`/`ChopLast` pair. The type is explicit caller-owned
+/// state; there is no global cache.
 pub struct TextCoverageCache {
-    /// Cached masks keyed by [`CoverageKey`].
-    entries: HashMap<CoverageKey, CoverageMask>,
-    /// Insertion order, oldest first, for eviction at the reference limit.
-    order: VecDeque<CoverageKey>,
+    /// Cached masks, evicted least-recently-used at the reference limit.
+    entries: LruCache<CoverageKey, CoverageMask>,
     /// Number of masks produced by rasterization; a diagnostic for tests.
     rasterizations: u64,
 }
@@ -1335,7 +1480,10 @@ pub struct TextCoverageCache {
 impl TextCoverageCache {
     /// Creates an empty cache.
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            entries: LruCache::new(MAX_TEXT_CACHE_ENTRIES),
+            rasterizations: 0,
+        }
     }
 
     /// The number of cached masks.
@@ -1358,19 +1506,23 @@ impl TextCoverageCache {
     /// Drops every cached mask.
     pub fn clear(&mut self) {
         self.entries.clear();
-        self.order.clear();
     }
 
-    /// Inserts `mask` under `key`, evicting the oldest entry when the
-    /// reference limit is reached.
+    /// Looks `key` up, marking it the most recently used.
+    fn get(&mut self, key: &CoverageKey) -> Option<&CoverageMask> {
+        self.entries.get(key)
+    }
+
+    /// Inserts `mask` under `key`, evicting the least recently used entry at
+    /// the reference limit.
     fn insert(&mut self, key: CoverageKey, mask: CoverageMask) {
-        if self.entries.len() >= MAX_TEXT_CACHE_ENTRIES
-            && let Some(oldest) = self.order.pop_front()
-        {
-            self.entries.remove(&oldest);
-        }
-        self.order.push_back(key);
         self.entries.insert(key, mask);
+    }
+}
+
+impl Default for TextCoverageCache {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1403,7 +1555,7 @@ fn sharp_coverage(
     antialias: bool,
 ) -> Result<Option<CoverageMask>, TextError> {
     let key = CoverageKey::sharp(glyph.font, glyph.codepoint, style, antialias);
-    if let Some(cached) = cache.entries.get(&key) {
+    if let Some(cached) = cache.get(&key) {
         if cached.is_empty() {
             return Ok(None);
         }
@@ -1512,7 +1664,7 @@ pub fn blurred_text_coverage(
             blur_level,
             blur_width,
         );
-        if let Some(cached) = cache.entries.get(&key) {
+        if let Some(cached) = cache.get(&key) {
             masks.push(position_mask(cached, glyph));
             continue;
         }
@@ -2043,14 +2195,311 @@ mod tests {
         assert_eq!(both[0].coverage(), both[1].coverage());
     }
 
-    /// Reference: `tTVPFontCache` bounds the character cache at
-    /// `TVP_CH_MAX_CACHE_COUNT` and trims it one entry at a time
-    /// (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:108,222-232`). The
-    /// layout memo uses the same reference-derived bound, so exceeding it must
-    /// evict incrementally: the map stays at the bound, never empties, and
-    /// keeps the most recent layout while dropping the oldest.
+    /// Rasterizes `text` for `font` through `cache` and returns the layout
+    /// plus the positioned sharp masks.
+    fn cached_run(
+        engine: &mut TextEngine,
+        cache: &mut TextCoverageCache,
+        font: FontId,
+        text: &str,
+        style: &TextStyle,
+    ) -> (TextLayout, Vec<CoverageMask>) {
+        let layout = engine.layout(font, text, style, None).expect("layout");
+        let masks =
+            rasterize_text_coverage(cache, engine, &layout, style, true).expect("rasterize");
+        (layout, masks)
+    }
+
+    /// The uncached oracle: rasterizes each glyph directly from the L1
+    /// rasterizer, bypassing [`TextCoverageCache`], and pairs the pen-relative
+    /// mask with its glyph.
+    fn uncached_pen_masks(
+        engine: &TextEngine,
+        layout: &TextLayout,
+        style: &TextStyle,
+        antialias: bool,
+    ) -> Vec<(CoverageMask, LaidOutGlyph)> {
+        let mut masks = Vec::new();
+        for glyph in &layout.glyphs {
+            let bitmap = engine
+                .rasterize_glyph(glyph.font, glyph.codepoint, style)
+                .expect("rasterize");
+            if bitmap.is_empty() {
+                continue;
+            }
+            let mut coverage = bitmap.coverage;
+            if !antialias {
+                for value in &mut coverage {
+                    *value = if *value >= 128 { 255 } else { 0 };
+                }
+            }
+            let mask = CoverageMask::new(
+                bitmap.bearing_x,
+                -bitmap.bearing_y,
+                bitmap.width,
+                bitmap.height,
+                coverage,
+            )
+            .expect("consistent coverage");
+            masks.push((mask, *glyph));
+        }
+        masks
+    }
+
+    /// Positions pen-relative masks at their glyphs' pen positions.
+    fn position_all(pen: &[(CoverageMask, LaidOutGlyph)]) -> Vec<CoverageMask> {
+        pen.iter()
+            .map(|(mask, glyph)| position_mask(mask, glyph))
+            .collect()
+    }
+
+    /// Blits positioned masks at their own coordinates.
+    fn blit_run(
+        bitmap: &mut BitmapState,
+        clip: RectI,
+        masks: &[CoverageMask],
+        color: [u8; 4],
+        opacity: u8,
+    ) {
+        for mask in masks {
+            blit_coverage_into(
+                bitmap,
+                clip,
+                mask,
+                mask.x().round() as i32,
+                mask.y().round() as i32,
+                color,
+                opacity,
+            );
+        }
+    }
+
+    /// Reference: `tTVPFontAndCharacterData` keys the character cache on the
+    /// face (`tTVPFont`: height, flags, angle, face), the character,
+    /// `Antialiased` and the blur fields
+    /// (`reference/cpp/core/visual/CharacterData.h:89-115`), and
+    /// `TVPGetCharacter` rasterizes on a miss
+    /// (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:244-320`). A
+    /// different size or style is therefore a distinct entry and rasterizes
+    /// separately, while the same size and style reuses the cached mask.
     #[test]
-    fn layout_memo_evicts_incrementally_at_the_reference_bound() {
+    fn coverage_cache_distinguishes_size_and_style() {
+        let Some(bytes) = load_test_font() else {
+            return;
+        };
+        let mut engine = TextEngine::new();
+        let Ok(font) = engine.add_font(&bytes, 0) else {
+            return;
+        };
+        let mut cache = TextCoverageCache::new();
+        let base = TextStyle::new(24.0);
+        let mut bold = TextStyle::new(24.0);
+        bold.bold = true;
+        let large = TextStyle::new(32.0);
+
+        let _ = cached_run(&mut engine, &mut cache, font, "A", &base);
+        assert_eq!(cache.rasterizations(), 1);
+        let _ = cached_run(&mut engine, &mut cache, font, "A", &base);
+        assert_eq!(
+            cache.rasterizations(),
+            1,
+            "same size and style reuses the mask"
+        );
+        let _ = cached_run(&mut engine, &mut cache, font, "A", &bold);
+        assert_eq!(cache.rasterizations(), 2, "bold is a distinct cache entry");
+        let _ = cached_run(&mut engine, &mut cache, font, "A", &large);
+        assert_eq!(
+            cache.rasterizations(),
+            3,
+            "a different size is a distinct entry"
+        );
+    }
+
+    /// Reference: `tTVPFontAndCharacterData` carries no colour
+    /// (`reference/cpp/core/visual/CharacterData.h:89-96`); colour is a draw
+    /// argument (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:907-949`),
+    /// so recolouring reuses the cached mask.
+    #[test]
+    fn coverage_cache_reuses_a_mask_across_colours() {
+        let Some(bytes) = load_test_font() else {
+            return;
+        };
+        let mut engine = TextEngine::new();
+        let Ok(font) = engine.add_font(&bytes, 0) else {
+            return;
+        };
+        let mut cache = TextCoverageCache::new();
+        let mut red = TextStyle::new(24.0);
+        red.color = [255, 0, 0, 255];
+        let mut blue = TextStyle::new(24.0);
+        blue.color = [0, 0, 255, 255];
+
+        let (_, red_masks) = cached_run(&mut engine, &mut cache, font, "A", &red);
+        assert_eq!(cache.rasterizations(), 1);
+        let (_, blue_masks) = cached_run(&mut engine, &mut cache, font, "A", &blue);
+        assert_eq!(
+            cache.rasterizations(),
+            1,
+            "colour is not part of the mask key"
+        );
+        assert_eq!(red_masks, blue_masks, "the coverage is colour-independent");
+    }
+
+    /// Reference: the character cache is bounded by `TVP_CH_MAX_CACHE_COUNT`
+    /// (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:108`) and evicts
+    /// the least recently used entry, not the oldest inserted: a hit runs
+    /// `FindAndTouchWithHash`, which moves the entry to the front, and
+    /// `ChopLast` removes from the tail
+    /// (`reference/cpp/core/tjs2/tjsHashSearch.h:358-364,424-433,593-599`). A
+    /// request after eviction is still rasterized and cached correctly.
+    #[test]
+    fn coverage_cache_evicts_the_least_recently_used() {
+        let style = TextStyle::new(16.0);
+        let synthetic = |index: usize| {
+            let codepoint =
+                char::from_u32(u32::try_from(index).expect("small index")).expect("codepoint");
+            CoverageKey::sharp(FontId(usize::MAX), codepoint, &style, true)
+        };
+        let mask = || CoverageMask::new(0.0, 0.0, 1, 1, vec![128]).expect("1x1 mask");
+
+        let mut cache = TextCoverageCache::new();
+        for index in 0..MAX_TEXT_CACHE_ENTRIES {
+            cache.insert(synthetic(index), mask());
+        }
+        assert_eq!(cache.len(), MAX_TEXT_CACHE_ENTRIES);
+
+        // Touch the oldest entry so the least recently used one is the second
+        // inserted, which distinguishes LRU from FIFO.
+        let touched = synthetic(0);
+        assert!(cache.get(&touched).is_some());
+        cache.insert(synthetic(MAX_TEXT_CACHE_ENTRIES), mask());
+        assert_eq!(
+            cache.len(),
+            MAX_TEXT_CACHE_ENTRIES,
+            "the reference limit is a hard bound"
+        );
+        assert!(
+            cache.get(&touched).is_some(),
+            "the touched entry survives eviction"
+        );
+        assert!(
+            cache.get(&synthetic(1)).is_none(),
+            "the least recently used entry is evicted"
+        );
+
+        // A genuinely new request after eviction rasterizes once and is then
+        // reused; the glyph is still correct.
+        let Some(bytes) = load_test_font() else {
+            return;
+        };
+        let mut engine = TextEngine::new();
+        let Ok(font) = engine.add_font(&bytes, 0) else {
+            return;
+        };
+        let before = cache.rasterizations();
+        let (layout, first) = cached_run(&mut engine, &mut cache, font, "A", &style);
+        assert_eq!(
+            cache.rasterizations(),
+            before + 1,
+            "the newly requested glyph is rasterized once"
+        );
+        assert_eq!(
+            first,
+            position_all(&uncached_pen_masks(&engine, &layout, &style, true)),
+            "the glyph after eviction matches a fresh rasterization"
+        );
+        let (_, second) = cached_run(&mut engine, &mut cache, font, "A", &style);
+        assert_eq!(
+            cache.rasterizations(),
+            before + 1,
+            "the newly cached glyph is reused"
+        );
+        assert_eq!(first, second);
+        assert!(!first.is_empty(), "the glyph still has ink after eviction");
+    }
+
+    /// Reference: `TVPGetCharacter` returns the same rasterized coverage
+    /// whether it comes from the cache or a fresh rasterization
+    /// (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:244-320`), so
+    /// caching must not change a single output pixel. This compares the cached
+    /// path against a freshly rasterized (uncached) composition of the same
+    /// run, including its blurred shadow.
+    #[test]
+    fn cached_and_uncached_composition_are_pixel_identical() {
+        let Some(bytes) = load_test_font() else {
+            return;
+        };
+        let mut engine = TextEngine::new();
+        let Ok(font) = engine.add_font(&bytes, 0) else {
+            return;
+        };
+        let mut style = TextStyle::new(24.0);
+        style.color = [30, 60, 90, 255];
+        let shadow = [200, 10, 10, 255];
+        let clip = (0, 0, 256, 64);
+
+        let mut cache = TextCoverageCache::new();
+        let (layout, sharp) = cached_run(&mut engine, &mut cache, font, "Ag", &style);
+        let shadowed = blurred_text_coverage(&mut cache, &engine, &layout, &style, true, 200, 2)
+            .expect("shadow");
+
+        let pen = uncached_pen_masks(&engine, &layout, &style, true);
+        assert_eq!(
+            sharp,
+            position_all(&pen),
+            "cached sharp masks match a fresh rasterization"
+        );
+        let shadow_uncached: Vec<CoverageMask> = pen
+            .iter()
+            .map(|(mask, glyph)| position_mask(&blur_coverage(mask, 200, 2).expect("blur"), glyph))
+            .collect();
+        assert_eq!(
+            shadowed, shadow_uncached,
+            "cached shadows match a fresh blur"
+        );
+
+        let mut cached_bitmap = BitmapState::new(256, 64, vec![0; 256 * 64 * 4]);
+        blit_run(&mut cached_bitmap, clip, &shadowed, shadow, 220);
+        compose_text_into(
+            &sharp,
+            &style,
+            (0.0, 0.0),
+            0.0,
+            &mut cached_bitmap,
+            clip,
+            255,
+        )
+        .expect("compose cached");
+
+        let mut uncached_bitmap = BitmapState::new(256, 64, vec![0; 256 * 64 * 4]);
+        blit_run(&mut uncached_bitmap, clip, &shadow_uncached, shadow, 220);
+        compose_text_into(
+            &position_all(&pen),
+            &style,
+            (0.0, 0.0),
+            0.0,
+            &mut uncached_bitmap,
+            clip,
+            255,
+        )
+        .expect("compose uncached");
+
+        assert_eq!(
+            cached_bitmap.rgba, uncached_bitmap.rgba,
+            "caching must not change a pixel"
+        );
+    }
+
+    /// Reference: the `tTVPFontCache` limit is `TVP_CH_MAX_CACHE_COUNT`
+    /// (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:108`) and eviction
+    /// is least-recently-used: `FindAndTouchWithHash` promotes a hit and
+    /// `ChopLast` removes the tail
+    /// (`reference/cpp/core/tjs2/tjsHashSearch.h:358-364,424-433,593-599`).
+    /// The shaped-layout memo shares that bound, stays at it by evicting one
+    /// entry per insert, and keeps a re-read layout while dropping the least
+    /// recently used one.
+    #[test]
+    fn layout_memo_evicts_the_least_recently_used_at_the_reference_bound() {
         let Some(bytes) = load_test_font() else {
             return;
         };
@@ -2071,13 +2520,22 @@ mod tests {
         };
 
         let mut texts = Vec::with_capacity(MAX_TEXT_CACHE_ENTRIES + 1);
-        for index in 0..=MAX_TEXT_CACHE_ENTRIES {
+        for index in 0..MAX_TEXT_CACHE_ENTRIES {
             let text = index.to_string();
             engine
                 .layout(font, &text, &style, wrap)
                 .expect("layout of a distinct label");
             texts.push(text);
         }
+        // Re-read the first layout so it becomes the most recently used.
+        engine
+            .layout(font, &texts[0], &style, wrap)
+            .expect("re-read a layout");
+        let text = MAX_TEXT_CACHE_ENTRIES.to_string();
+        engine
+            .layout(font, &text, &style, wrap)
+            .expect("layout past the reference bound");
+        texts.push(text);
 
         assert_eq!(
             engine.cached_layouts(),
@@ -2085,13 +2543,18 @@ mod tests {
             "the memo must stay at the reference bound, not shrink to zero"
         );
         assert!(
-            !engine.layout_cache.contains_key(&key_for(&texts[0])),
-            "the oldest layout must be evicted first"
+            engine.layout_cache.get(&key_for(&texts[0])).is_some(),
+            "the re-read layout must survive eviction"
+        );
+        assert!(
+            engine.layout_cache.get(&key_for(&texts[1])).is_none(),
+            "the least recently used layout must be evicted first"
         );
         assert!(
             engine
                 .layout_cache
-                .contains_key(&key_for(texts.last().expect("inserted a layout"))),
+                .get(&key_for(texts.last().expect("inserted a layout")))
+                .is_some(),
             "the most recent layout must survive eviction"
         );
     }
