@@ -333,8 +333,15 @@ impl AudioOutput {
         }
         let frames = plan.frames;
 
-        self.buffer
-            .resize(frames * usize::from(self.spec.channels), 0.0);
+        let channels = usize::try_from(self.spec.channels).map_err(|_| {
+            PlatformError::from(AudioError::InvalidSpec {
+                message: format!(
+                    "output channel count {} does not fit in memory",
+                    self.spec.channels
+                ),
+            })
+        })?;
+        self.buffer.resize(frames * channels, 0.0);
         let ctx = vm.compat().ctx().map_err(vm::VmError::from)?;
         sound_render(&ctx, &mut self.buffer, self.spec).map_err(vm::VmError::from)?;
         self.device.write(&mut self.state, &self.buffer)?;

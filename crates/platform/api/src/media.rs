@@ -61,7 +61,7 @@ pub struct AudioSpec {
     /// Sample rate in Hz.
     pub sample_rate: u32,
     /// Number of interleaved channels.
-    pub channels: u16,
+    pub channels: u32,
     /// Total number of frames, when known (e.g. for a whole file).
     pub total_frames: Option<u64>,
 }
@@ -153,7 +153,7 @@ pub struct VideoSpec {
     /// Audio sample rate in Hz (0 when there is no audio track).
     pub sample_rate: u32,
     /// Audio channel count (0 when there is no audio track).
-    pub channels: u16,
+    pub channels: u32,
     /// Number of audio streams in the container.
     pub audio_streams: u32,
     /// Number of video streams in the container.

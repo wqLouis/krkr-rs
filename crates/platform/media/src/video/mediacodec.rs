@@ -380,7 +380,7 @@ mod android {
     struct AudioState {
         codec: Codec,
         out_rate: u32,
-        out_channels: u16,
+        out_channels: u32,
         pcm_encoding: i32,
         input_done: bool,
         output_done: bool,
@@ -504,7 +504,7 @@ mod android {
                             out_rate = rate.max(0) as u32;
                         }
                         if let Some(channels) = format.i32("channel-count") {
-                            out_channels = channels.max(0) as u16;
+                            out_channels = channel_count(&name, channels)?;
                         }
                         if let Some(value) = format.i32("pcm-encoding") {
                             encoding = value;
@@ -594,7 +594,7 @@ mod android {
             Some(track) => Some(AudioState {
                 codec: create_audio_codec(track, &name)?,
                 out_rate: track.format.i32("sample-rate").unwrap_or(0).max(0) as u32,
-                out_channels: track.format.i32("channel-count").unwrap_or(0).max(0) as u16,
+                out_channels: channel_count_opt(&name, track.format.i32("channel-count"))?,
                 pcm_encoding: PCM_ENCODING_16BIT,
                 input_done: false,
                 output_done: false,
@@ -1078,10 +1078,10 @@ mod android {
             .and_then(|track| track.format.i32("sample-rate"))
             .unwrap_or(0)
             .max(0) as u32;
-        let channels = audio
-            .and_then(|track| track.format.i32("channel-count"))
-            .unwrap_or(0)
-            .max(0) as u16;
+        let channels = channel_count_opt(
+            name,
+            audio.and_then(|track| track.format.i32("channel-count")),
+        )?;
         // This backend opens a single video and a single (optional) audio
         // track, so the counts are the tracks it actually decodes.
         let audio_streams = if audio.is_some() { 1 } else { 0 };
@@ -1196,6 +1196,27 @@ mod android {
     /// Interpreting `None` as zero.
     fn non_negative(value: Option<i32>) -> usize {
         value.unwrap_or(0).max(0) as usize
+    }
+
+    /// Converts a decoder channel count to the `AudioSpec::channels` field.
+    ///
+    /// The reference keeps the count in a 32-bit `tTVPWaveFormat::Channels`
+    /// (`reference/cpp/core/sound/WaveIntf.h:47`); only a negative count cannot
+    /// be represented and is reported rather than clamped. This Android path is
+    /// compile-checked but has not run on a device.
+    fn channel_count(name: &str, channels: i32) -> Result<u32, MediaError> {
+        u32::try_from(channels).map_err(|_| MediaError::InvalidData {
+            message: format!("{name}: audio channel count {channels} is negative"),
+        })
+    }
+
+    /// [`channel_count`] for a `MediaFormat` lookup, mapping an absent key to
+    /// zero channels.
+    fn channel_count_opt(name: &str, channels: Option<i32>) -> Result<u32, MediaError> {
+        match channels {
+            Some(count) => channel_count(name, count),
+            None => Ok(0),
+        }
     }
 
     /// Nominal frame duration in milliseconds, with a safe fallback.

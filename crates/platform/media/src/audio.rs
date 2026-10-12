@@ -170,11 +170,15 @@ where
             message: format!("{name}: no audio codec parameters"),
         })?;
     let sample_rate = codec_params.sample_rate.unwrap_or(0);
-    let channels = codec_params
-        .channels
-        .as_ref()
-        .map(|channels| channels.count())
-        .unwrap_or(0) as u16;
+    let channels = match codec_params.channels.as_ref() {
+        Some(channels) => {
+            let count = channels.count();
+            u32::try_from(count).map_err(|_| MediaError::InvalidData {
+                message: format!("{name}: audio channel count {count} does not fit in 32 bits"),
+            })?
+        }
+        None => 0,
+    };
     let duration_seconds = match (track.duration, track.time_base) {
         (Some(duration), Some(time_base)) => time_base
             .calc_duration(duration)
@@ -332,7 +336,13 @@ pub fn read_audio(
     out: &mut [f32],
 ) -> Result<usize, MediaError> {
     let _ = m;
-    let channels = usize::from(state.spec.channels.max(1)).max(1);
+    let channels =
+        usize::try_from(state.spec.channels.max(1)).map_err(|_| MediaError::InvalidData {
+            message: format!(
+                "audio channel count {} does not fit in memory",
+                state.spec.channels
+            ),
+        })?;
     let frame_aligned = out.len() - (out.len() % channels);
     let mut written = 0usize;
 
@@ -436,7 +446,10 @@ fn decode_packet_into(
         match setup.decoder.decode(&packet) {
             Ok(decoded) => {
                 spec.sample_rate = decoded.spec().rate();
-                spec.channels = decoded.spec().channels().count() as u16;
+                let count = decoded.spec().channels().count();
+                spec.channels = u32::try_from(count).map_err(|_| MediaError::InvalidData {
+                    message: format!("{name}: audio channel count {count} does not fit in 32 bits"),
+                })?;
                 let start = pending.len();
                 pending.resize(start + decoded.samples_interleaved(), 0.0);
                 decoded.copy_to_slice_interleaved(&mut pending[start..]);
@@ -445,7 +458,14 @@ fn decode_packet_into(
                 // entry (read_audio only decodes once it is drained), but the
                 // offset is kept general.
                 if *skip_frames > 0 {
-                    let channels = usize::from(spec.channels.max(1)).max(1);
+                    let channels = usize::try_from(spec.channels.max(1)).map_err(|_| {
+                        MediaError::InvalidData {
+                            message: format!(
+                                "audio channel count {} does not fit in memory",
+                                spec.channels
+                            ),
+                        }
+                    })?;
                     let available = (pending.len() - *pending_offset) / channels;
                     if (available as u64) <= *skip_frames {
                         *skip_frames -= available as u64;

@@ -408,14 +408,11 @@ fn audio_layout(frame: &AudioFrame) -> ChannelLayout {
 /// Converts a decoder channel count to the `AudioSpec::channels` field.
 ///
 /// The reference keeps the count in a 32-bit `tTVPWaveFormat::Channels`
-/// (`reference/cpp/core/sound/WaveIntf.h:47`); a count that does not fit the
-/// port's `u16` is reported rather than clamped.
-fn channel_count(name: &str, channels: i32) -> Result<u16, MediaError> {
-    u16::try_from(channels).map_err(|_| MediaError::InvalidData {
-        message: format!(
-            "{name}: audio channel count {channels} is outside 0..={}",
-            u16::MAX
-        ),
+/// (`reference/cpp/core/sound/WaveIntf.h:47`); only a negative count cannot
+/// be represented and is reported rather than clamped.
+fn channel_count(name: &str, channels: i32) -> Result<u32, MediaError> {
+    u32::try_from(channels).map_err(|_| MediaError::InvalidData {
+        message: format!("{name}: audio channel count {channels} is negative"),
     })
 }
 
@@ -652,21 +649,24 @@ fn frame_pts_ms(time_base: Rational, frame: &VideoFrame, name: &str) -> Result<u
 mod tests {
     use super::{Rational, VideoFrame, channel_count, frame_pts_ms};
 
-    /// A channel count that fits `AudioSpec::channels` is stored as reported;
-    /// the reference keeps it in a 32-bit `tTVPWaveFormat::Channels`
+    /// A non-negative channel count is stored as reported; the reference keeps
+    /// it in a 32-bit `tTVPWaveFormat::Channels`
     /// (`reference/cpp/core/sound/WaveIntf.h:47`).
     #[test]
-    fn channel_count_accepts_a_u16_count() {
+    fn channel_count_accepts_a_non_negative_count() {
         assert_eq!(channel_count("<video>", 2).ok(), Some(2));
+        assert_eq!(
+            channel_count("<video>", i32::MAX).ok(),
+            Some(i32::MAX as u32)
+        );
     }
 
-    /// A count above the `AudioSpec::channels` range is reported, not clamped;
-    /// the reference's 32-bit field would hold it
-    /// (`reference/cpp/core/sound/WaveIntf.h:47`).
+    /// A negative decoder count cannot be represented in the reference's
+    /// unsigned 32-bit field (`reference/cpp/core/sound/WaveIntf.h:47`), so it
+    /// is reported rather than clamped.
     #[test]
-    fn channel_count_rejects_a_count_over_u16() {
-        let over = i32::from(u16::MAX) + 1;
-        assert!(channel_count("<video>", over).is_err());
+    fn channel_count_rejects_a_negative_count() {
+        assert!(channel_count("<video>", -1).is_err());
     }
 
     /// A frame PTS is rescaled from the stream time base to milliseconds.

@@ -19,7 +19,7 @@ use engine::sound::{
     Status, mix_source,
 };
 
-fn out_spec(sample_rate: u32, channels: u16) -> AudioSpec {
+fn out_spec(sample_rate: u32, channels: u32) -> AudioSpec {
     AudioSpec {
         sample_rate,
         channels,
@@ -30,12 +30,13 @@ fn out_spec(sample_rate: u32, channels: u16) -> AudioSpec {
 /// A 440 Hz sine tone as a decoded source, optionally with loop info.
 fn tone_with_loops(
     rate: u32,
-    channels: u16,
+    channels: u32,
     seconds: f64,
     info: Option<LoopInfo>,
 ) -> Arc<SoundSource> {
     let frames = (rate as f64 * seconds) as usize;
-    let mut interleaved = Vec::with_capacity(frames * usize::from(channels));
+    let mut interleaved =
+        Vec::with_capacity(frames * usize::try_from(channels).expect("channel count fits"));
     for f in 0..frames {
         let value = (2.0 * PI * 440.0 * f as f64 / rate as f64).sin() as f32 * 0.5;
         for _ in 0..channels {
@@ -53,7 +54,7 @@ fn tone_with_loops(
     )
 }
 
-fn tone(rate: u32, channels: u16, seconds: f64) -> Arc<SoundSource> {
+fn tone(rate: u32, channels: u32, seconds: f64) -> Arc<SoundSource> {
     tone_with_loops(rate, channels, seconds, None)
 }
 
@@ -683,8 +684,8 @@ struct CountingStream {
 
 impl CountingStream {
     /// A mono/stereo ramp whose frame `f` holds the value `f`.
-    fn ramp(rate: u32, channels: u16, frames: u64) -> (Self, Arc<AtomicUsize>, Arc<AtomicUsize>) {
-        let channel_count = usize::from(channels);
+    fn ramp(rate: u32, channels: u32, frames: u64) -> (Self, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let channel_count = usize::try_from(channels).expect("channel count fits");
         let samples: Vec<f32> = (0..frames)
             .flat_map(|frame| std::iter::repeat_n(frame as f32, channel_count))
             .collect();
@@ -789,8 +790,8 @@ struct SignallingStream {
 
 impl SignallingStream {
     /// A mono/stereo ramp whose frame `f` holds the value `f`.
-    fn ramp(rate: u32, channels: u16, frames: u64) -> (Self, DecodeSignal, DecodeSignal) {
-        let channel_count = usize::from(channels);
+    fn ramp(rate: u32, channels: u32, frames: u64) -> (Self, DecodeSignal, DecodeSignal) {
+        let channel_count = usize::try_from(channels).expect("channel count fits");
         let samples: Vec<f32> = (0..frames)
             .flat_map(|frame| std::iter::repeat_n(frame as f32, channel_count))
             .collect();

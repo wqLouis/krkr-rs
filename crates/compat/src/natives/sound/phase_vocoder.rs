@@ -801,7 +801,7 @@ pub(super) struct FilterChainStream {
     base_frames: u64,
     base_cursor: u64,
     sample_rate: u32,
-    channels: usize,
+    channels: u32,
     configs: Vec<VocoderConfig>,
     stages: Vec<VocoderStage>,
     total_output: u64,
@@ -816,12 +816,15 @@ impl FilterChainStream {
         configs: Vec<VocoderConfig>,
     ) -> Result<Self, SoundError> {
         let sample_rate = base.sample_rate();
-        let channels = usize::from(base.channels());
+        let channels = base.channels();
         if channels == 0 {
             return Err(SoundError::InvalidSpec {
                 message: "source has no channels".to_string(),
             });
         }
+        let stage_channels = usize::try_from(channels).map_err(|_| SoundError::InvalidSpec {
+            message: format!("channel count {channels} does not fit in memory"),
+        })?;
         let (base, base_frames) = match base.reported_frames() {
             Some(frames) => (base, frames),
             None => {
@@ -834,7 +837,7 @@ impl FilterChainStream {
                 (materialized, frames)
             }
         };
-        let stages = build_stages(sample_rate, channels, &configs, base_frames);
+        let stages = build_stages(sample_rate, stage_channels, &configs, base_frames);
         let total_output = stages
             .last()
             .map_or(base_frames, |stage| stage.total_output);
@@ -853,6 +856,13 @@ impl FilterChainStream {
     /// Total output frames the chain will produce.
     pub(super) fn total_output(&self) -> u64 {
         self.total_output
+    }
+
+    /// The interleaved channel count as a `usize` for buffer arithmetic.
+    fn channels_usize(&self) -> Result<usize, SoundError> {
+        usize::try_from(self.channels).map_err(|_| SoundError::InvalidSpec {
+            message: format!("channel count {} does not fit in memory", self.channels),
+        })
     }
 
     /// Produce at least one committed output frame at `index`, pulling input
@@ -882,7 +892,7 @@ impl FilterChainStream {
             if take == 0 {
                 return Ok(());
             }
-            let channels = self.channels;
+            let channels = self.channels_usize()?;
             let mut buffer = vec![0.0f32; take * channels];
             for frame in 0..take {
                 let index = self.base_cursor + frame as u64;
@@ -913,7 +923,7 @@ impl FilterChainStream {
             if n == 0 {
                 break;
             }
-            let channels = self.channels;
+            let channels = self.channels_usize()?;
             let mut buffer = vec![0.0f32; n * channels];
             self.stages[index - 1].take(n, &mut buffer);
             self.stages[index].push_input(&buffer);
@@ -922,14 +932,15 @@ impl FilterChainStream {
     }
 
     /// Rewind every stage and the base to the first frame.
-    fn reset(&mut self) {
+    fn reset(&mut self) -> Result<(), SoundError> {
         self.stages = build_stages(
             self.sample_rate,
-            self.channels,
+            self.channels_usize()?,
             &self.configs,
             self.base_frames,
         );
         self.base_cursor = 0;
+        Ok(())
     }
 }
 
@@ -937,13 +948,13 @@ impl AudioStream for FilterChainStream {
     fn spec(&self) -> AudioSpec {
         AudioSpec {
             sample_rate: self.sample_rate,
-            channels: self.channels as u16,
+            channels: self.channels,
             total_frames: Some(self.total_output),
         }
     }
 
     fn read(&mut self, out: &mut [f32]) -> Result<usize, SoundError> {
-        let channels = self.channels;
+        let channels = self.channels_usize()?;
         if channels == 0 {
             return Ok(0);
         }
@@ -964,16 +975,17 @@ impl AudioStream for FilterChainStream {
     }
 
     fn seek(&mut self, frame: u64) -> Result<(), SoundError> {
-        self.reset();
+        self.reset()?;
+        let channels = self.channels_usize()?;
         let mut remaining = frame;
-        let mut buffer = vec![0.0f32; 4096 * self.channels];
+        let mut buffer = vec![0.0f32; 4096 * channels];
         while remaining > 0 {
             let want = remaining.min(4096) as usize;
-            let got = self.read(&mut buffer[..want * self.channels])?;
+            let got = self.read(&mut buffer[..want * channels])?;
             if got == 0 {
                 break;
             }
-            remaining -= (got / self.channels) as u64;
+            remaining -= (got / channels) as u64;
         }
         Ok(())
     }
@@ -998,7 +1010,7 @@ pub(super) fn build_filtered_source(
     let stream = FilterChainStream::new(base.clone(), configs.to_vec())?;
     let spec = AudioSpec {
         sample_rate: stream.sample_rate,
-        channels: stream.channels as u16,
+        channels: stream.channels,
         total_frames: Some(stream.total_output()),
     };
     let info = scale_loops(base.loops(), time_scale);

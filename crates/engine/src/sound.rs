@@ -66,7 +66,7 @@ pub enum SoundError {
     #[error("unsupported source channel count {channels} (only mono/stereo)")]
     UnsupportedChannels {
         /// Channel count that was rejected.
-        channels: u16,
+        channels: u32,
     },
     /// A decoded buffer's length does not match its spec.
     #[error("inconsistent PCM buffer: {len} samples for {frames} frames x {channels} channels")]
@@ -76,7 +76,7 @@ pub enum SoundError {
         /// Frame count implied by the spec.
         frames: u64,
         /// Channel count implied by the spec.
-        channels: u16,
+        channels: u32,
     },
     /// A buffer has no loaded source.
     #[error("sound buffer has no loaded source")]
@@ -543,11 +543,13 @@ impl StreamSource {
     /// The worker is created immediately but decodes nothing until the first
     /// read or materialize request, so construction, `open` and `play` never
     /// wait on the decoder.
-    fn new(stream: Box<dyn AudioStream>, rate: u32, channels: u16) -> Result<Self, SoundError> {
+    fn new(stream: Box<dyn AudioStream>, rate: u32, channels: u32) -> Result<Self, SoundError> {
         // Decode a quarter second per pull and keep one second decoded ahead
         // of the cursor, mirroring the reference's decode-ahead buffer length.
         let rate = rate.max(1);
-        let channels = usize::from(channels);
+        let channels = usize::try_from(channels).map_err(|_| SoundError::InvalidSpec {
+            message: format!("channel count {channels} does not fit in memory"),
+        })?;
         let chunk_frames = (rate as usize / 4).max(1);
         let buffer = StreamBuffer {
             channels,
@@ -718,7 +720,7 @@ fn validate_source_spec(spec: AudioSpec) -> Result<(), SoundError> {
 
 /// Reads one frame out of a fully decoded buffer.
 fn buffer_frame(audio: &DecodedAudio, frame: u64) -> Option<(f32, f32)> {
-    let channels = usize::from(audio.spec.channels);
+    let channels = usize::try_from(audio.spec.channels).ok()?;
     if channels == 0 {
         return None;
     }
@@ -907,7 +909,7 @@ impl SoundSource {
     }
 
     /// Interleaved channel count (1 or 2).
-    pub fn channels(&self) -> u16 {
+    pub fn channels(&self) -> u32 {
         self.spec.channels
     }
 
@@ -1742,7 +1744,12 @@ impl Mixer {
         out_spec: AudioSpec,
     ) -> Result<(), SoundError> {
         self.mix(out, out_spec)?;
-        let channels = usize::from(out_spec.channels);
+        let channels = usize::try_from(out_spec.channels).map_err(|_| SoundError::InvalidSpec {
+            message: format!(
+                "output channel count {} does not fit in memory",
+                out_spec.channels
+            ),
+        })?;
         if out_spec.sample_rate > 0 && channels > 0 {
             let frames = out.len() / channels;
             if frames > 0 {
@@ -1848,10 +1855,20 @@ fn accumulate_source(
     if out.is_empty() || gain <= 0.0 {
         return Ok(());
     }
-    let out_channels = usize::from(out_spec.channels);
+    let out_channels = usize::try_from(out_spec.channels).map_err(|_| SoundError::InvalidSpec {
+        message: format!(
+            "output channel count {} does not fit in memory",
+            out_spec.channels
+        ),
+    })?;
     let out_rate = f64::from(out_spec.sample_rate);
     let src_rate = f64::from(source.sample_rate().max(1));
-    let src_channels = usize::from(source.channels());
+    let src_channels = usize::try_from(source.channels()).map_err(|_| SoundError::InvalidSpec {
+        message: format!(
+            "source channel count {} does not fit in memory",
+            source.channels()
+        ),
+    })?;
     let rate = if rate.is_finite() { rate } else { 1.0 };
     let (left_gain, right_gain) = pan_gains(pan);
 

@@ -532,7 +532,7 @@ struct SoundFormat {
     /// Samples per second.
     rate: u32,
     /// Channel count (1 or 2).
-    channels: u16,
+    channels: u32,
     /// Total sample frames.
     frames: u64,
 }
@@ -1745,7 +1745,7 @@ fn float_to_i16(sample: f32) -> i16 {
 /// Convert one frame with the reference downmix scale
 /// (`TVPConvertFloatPCMTo16bits`, `WaveIntf.cpp:97-138`): the source channels
 /// are summed at `32768 / channels` and rounded half away from zero.
-fn downmix_to_i16(left: f32, right: f32, source_channels: usize) -> i16 {
+fn downmix_to_i16(left: f32, right: f32, source_channels: u32) -> i16 {
     let scale = 32768.0 / source_channels as f32;
     let value = if source_channels == 1 {
         left * scale
@@ -1810,8 +1810,8 @@ fn read_vis_buffer(
     dest: *mut i16,
     dest_len: usize,
 ) -> Result<usize, SoundError> {
-    let source_channels = i32::from(source.channels());
-    if channels != source_channels && channels != 1 {
+    let source_channels = source.channels();
+    if i64::from(channels) != i64::from(source_channels) && channels != 1 {
         return Ok(0);
     }
     if numsamples <= 0 || dest.is_null() {
@@ -1835,7 +1835,7 @@ fn read_vis_buffer(
         // is clamped so `index * per_frame + per_frame <= dest_len`.
         unsafe {
             if downmix {
-                *dest.add(index) = downmix_to_i16(left, right, source_channels as usize);
+                *dest.add(index) = downmix_to_i16(left, right, source_channels);
             } else {
                 *dest.add(index * 2) = float_to_i16(left);
                 *dest.add(index * 2 + 1) = float_to_i16(right);
@@ -3068,7 +3068,12 @@ pub fn sound_render(
     out: &mut [f32],
     out_spec: AudioSpec,
 ) -> Result<(), CompatError> {
-    let channels = usize::from(out_spec.channels.max(1));
+    let channels = usize::try_from(out_spec.channels.max(1)).map_err(|_| {
+        CompatError::Engine(format!(
+            "sound_render: channel count {} does not fit in memory",
+            out_spec.channels
+        ))
+    })?;
     if !out.len().is_multiple_of(channels) {
         return Err(CompatError::Engine(format!(
             "sound_render: {} samples is not a whole number of {channels}-channel frames",
@@ -3304,9 +3309,10 @@ mod tests {
     }
 
     /// A synthetic mono/stereo sine tone as an L2 source.
-    fn tone(rate: u32, channels: u16, seconds: f64, info: Option<LoopInfo>) -> Arc<SoundSource> {
+    fn tone(rate: u32, channels: u32, seconds: f64, info: Option<LoopInfo>) -> Arc<SoundSource> {
         let frames = (rate as f64 * seconds) as usize;
-        let mut interleaved = Vec::with_capacity(frames * usize::from(channels));
+        let mut interleaved =
+            Vec::with_capacity(frames * usize::try_from(channels).expect("channel count fits"));
         for frame in 0..frames {
             let value = (2.0 * PI * 440.0 * frame as f64 / f64::from(rate)).sin() as f32 * 0.5;
             for _ in 0..channels {
@@ -3700,8 +3706,8 @@ mod tests {
     }
 
     /// A source built from explicit interleaved `f32` samples at 1 kHz.
-    fn source_from(interleaved: &[f32], channels: u16) -> Arc<SoundSource> {
-        let frames = interleaved.len() / usize::from(channels);
+    fn source_from(interleaved: &[f32], channels: u32) -> Arc<SoundSource> {
+        let frames = interleaved.len() / usize::try_from(channels).expect("channel count fits");
         let spec = AudioSpec {
             sample_rate: 1000,
             channels,
@@ -3850,7 +3856,7 @@ mod tests {
 
         let spec = AudioSpec {
             sample_rate: rate,
-            channels: channels as u16,
+            channels: u32::try_from(channels).expect("channel count fits"),
             total_frames: Some(frames as u64),
         };
         let base = Arc::new(

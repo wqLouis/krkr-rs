@@ -225,7 +225,7 @@ pub fn is_tcwf(bytes: &[u8]) -> bool {
 /// `numblocks * samplesperblock` frames, channel-interleaved.
 pub fn decode_tcwf(bytes: &[u8]) -> Result<DecodedAudio, TcwfError> {
     let header = TcwfHeader::parse(bytes)?;
-    let channels = header.channels as usize;
+    let channels = usize::from(header.channels);
     let samples_per_block = header.samplesperblock as usize;
     let bytes_per_block = header.bytesperblock as usize;
     let blocks = header.numblocks as usize;
@@ -280,7 +280,7 @@ pub fn decode_tcwf(bytes: &[u8]) -> Result<DecodedAudio, TcwfError> {
     Ok(DecodedAudio::new(
         AudioSpec {
             sample_rate: header.frequency as u32,
-            channels: header.channels as u16,
+            channels: u32::from(header.channels),
             total_frames: Some(total_frames as u64),
         },
         interleaved,

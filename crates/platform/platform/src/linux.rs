@@ -547,8 +547,8 @@ pub(crate) mod audio {
         let config = supported.config();
         let queue = Arc::new(Mutex::new(AudioQueue::new(
             config.sample_rate.0,
-            config.channels,
-        )));
+            u32::from(config.channels),
+        )?));
         let stream = build_stream(
             &device,
             &config,
@@ -630,7 +630,7 @@ pub(crate) mod audio {
                 message: error.to_string(),
             })?;
         for range in configs {
-            if range.channels() == spec.channels
+            if u32::from(range.channels()) == spec.channels
                 && let Some(config) = range.try_with_sample_rate(wanted)
             {
                 return Ok(config);
@@ -663,7 +663,7 @@ pub(crate) mod audio {
             Ok(config) if (1..=2).contains(&config.channels()) => {
                 return Ok(AudioSpec {
                     sample_rate: config.sample_rate().0,
-                    channels: config.channels(),
+                    channels: u32::from(config.channels()),
                     total_frames: None,
                 });
             }
@@ -680,7 +680,7 @@ pub(crate) mod audio {
         let chosen = device.supported_output_configs().ok().and_then(|ranges| {
             choose_output_spec(ranges.map(|range| {
                 (
-                    range.channels(),
+                    u32::from(range.channels()),
                     range.min_sample_rate().0,
                     range.max_sample_rate().0,
                 )
@@ -787,7 +787,7 @@ pub(crate) mod audio {
     /// considered: stereo over mono, then 48 kHz, then 44.1 kHz, then the
     /// range's maximum rate. Returns `None` when the device offers no
     /// mono/stereo range, in which case the caller uses [`FALLBACK_SPEC`].
-    fn choose_output_spec(ranges: impl IntoIterator<Item = (u16, u32, u32)>) -> Option<AudioSpec> {
+    fn choose_output_spec(ranges: impl IntoIterator<Item = (u32, u32, u32)>) -> Option<AudioSpec> {
         let mut best: Option<((u8, u8, u32), AudioSpec)> = None;
         for (channels, min, max) in ranges {
             if channels == 0 || channels > 2 {

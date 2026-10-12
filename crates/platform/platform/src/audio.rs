@@ -131,7 +131,7 @@ impl AudioDevice {
             },
             AudioOutputState {
                 kind: StateKind::Null(NullState {
-                    queue: AudioQueue::new(spec.sample_rate, spec.channels),
+                    queue: AudioQueue::new(spec.sample_rate, spec.channels)?,
                     playing: false,
                     stopped: false,
                 }),
@@ -157,7 +157,13 @@ impl AudioDevice {
     /// misaligned buffer or [`AudioError::NotRunning`] after
     /// [`AudioDevice::stop`].
     pub fn write(&self, state: &mut AudioOutputState, pcm: &[f32]) -> Result<(), PlatformError> {
-        let channels = usize::from(self.spec.channels);
+        let channels =
+            usize::try_from(self.spec.channels).map_err(|_| AudioError::InvalidSpec {
+                message: format!(
+                    "channel count {} does not fit in memory",
+                    self.spec.channels
+                ),
+            })?;
         if channels == 0 || !pcm.len().is_multiple_of(channels) {
             return Err(AudioError::InvalidSpec {
                 message: format!(

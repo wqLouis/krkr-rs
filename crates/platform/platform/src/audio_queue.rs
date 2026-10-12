@@ -45,6 +45,8 @@
 
 use std::collections::VecDeque;
 
+use api::error::AudioError;
+
 /// The most audio the queue may hold, in milliseconds.
 ///
 /// This is the documented two-second contract: a slow consumer must never let
@@ -109,8 +111,17 @@ pub(crate) struct AudioQueue {
 impl AudioQueue {
     /// Creates an empty queue for an interleaved stream of `channels`
     /// channels at `sample_rate` Hz.
-    pub(crate) fn new(sample_rate: u32, channels: u16) -> Self {
-        let channels = usize::from(channels).max(1);
+    ///
+    /// # Errors
+    ///
+    /// [`AudioError::InvalidSpec`] when the channel count cannot be
+    /// represented in the address space.
+    pub(crate) fn new(sample_rate: u32, channels: u32) -> Result<Self, AudioError> {
+        let channels = usize::try_from(channels)
+            .map_err(|_| AudioError::InvalidSpec {
+                message: format!("channel count {channels} does not fit in memory"),
+            })?
+            .max(1);
         // `sample_rate * channels` is samples per second; both caps are
         // expressed in milliseconds.
         let per_second = (sample_rate as usize).saturating_mul(channels);
@@ -120,7 +131,7 @@ impl AudioQueue {
         // (not interleaved samples) and is channel-count independent.
         #[cfg(any(feature = "platform-linux", target_os = "android"))]
         let ramp_samples = ((sample_rate as usize).saturating_mul(RAMP_MS) / 1_000).max(1);
-        Self {
+        Ok(Self {
             samples: VecDeque::new(),
             capacity,
             prefill,
@@ -136,7 +147,7 @@ impl AudioQueue {
             gain_level: ramp_samples,
             #[cfg(any(feature = "platform-linux", target_os = "android"))]
             phase: 0,
-        }
+        })
     }
 
     /// Queues interleaved `pcm`, dropping the oldest samples beyond the cap,
@@ -220,7 +231,7 @@ mod tests {
 
     /// A small queue so the policy numbers stay small in assertions.
     fn queue() -> AudioQueue {
-        AudioQueue::new(1_000, 1)
+        AudioQueue::new(1_000, 1).expect("a 1 kHz mono queue is valid")
     }
 
     #[test]
@@ -375,7 +386,7 @@ mod tests {
         // A stereo underrun must not smear the left channel's last value into
         // the right channel (or vice versa), and the shared gain must scale
         // both by the same factor so the image never shifts.
-        let mut queue = AudioQueue::new(1_000, 2);
+        let mut queue = AudioQueue::new(1_000, 2).expect("a 1 kHz stereo queue is valid");
         queue.push(&[0.3, 0.4]);
         let mut out = [0.0; 4];
         assert!(queue.drain(&mut out));

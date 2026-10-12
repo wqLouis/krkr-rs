@@ -61,9 +61,10 @@ const UNDECODABLE: &str = "undecodable.wav";
 
 /// A synthetic mono sine tone as an L2 source (the `.sli` parse result is
 /// attached by the caller, exactly like the reference decoder chain).
-fn tone(rate: u32, channels: u16, seconds: f64, info: Option<LoopInfo>) -> Arc<SoundSource> {
+fn tone(rate: u32, channels: u32, seconds: f64, info: Option<LoopInfo>) -> Arc<SoundSource> {
     let frames = (f64::from(rate) * seconds) as usize;
-    let mut interleaved = Vec::with_capacity(frames * usize::from(channels));
+    let mut interleaved =
+        Vec::with_capacity(frames * usize::try_from(channels).expect("channel count fits"));
     for frame in 0..frames {
         let value = (2.0 * std::f64::consts::PI * 440.0 * frame as f64 / f64::from(rate)).sin()
             as f32
@@ -1819,8 +1820,8 @@ struct RampStream {
 }
 
 impl RampStream {
-    fn new(rate: u32, channels: u16, frames: u64, reads: Arc<AtomicUsize>) -> Self {
-        let channel_count = usize::from(channels);
+    fn new(rate: u32, channels: u32, frames: u64, reads: Arc<AtomicUsize>) -> Self {
+        let channel_count = usize::try_from(channels).expect("channel count fits");
         let samples: Vec<f32> = (0..frames)
             .flat_map(|frame| std::iter::repeat_n(frame as f32, channel_count))
             .collect();

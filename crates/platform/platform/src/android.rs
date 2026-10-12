@@ -518,16 +518,25 @@ pub(crate) mod audio {
     /// The stream is started by [`write`] once the queue holds the pre-fill
     /// target, so AAudio never drains an empty queue.
     pub(crate) fn open(spec: AudioSpec) -> Result<(Backend, StreamState), PlatformError> {
-        let queue = Arc::new(Mutex::new(AudioQueue::new(spec.sample_rate, spec.channels)));
+        let queue = Arc::new(Mutex::new(AudioQueue::new(
+            spec.sample_rate,
+            spec.channels,
+        )?));
         let disconnected = Arc::new(AtomicBool::new(false));
         let callback_queue = Arc::clone(&queue);
         let callback_flag = Arc::clone(&disconnected);
 
         let builder = AudioStreamBuilder::new().map_err(open_error)?;
+        let channel_count = i32::try_from(spec.channels).map_err(|_| AudioError::InvalidSpec {
+            message: format!(
+                "channel count {} does not fit in an AAudio stream",
+                spec.channels
+            ),
+        })?;
         let builder = builder
             .direction(AudioDirection::Output)
             .sample_rate(spec.sample_rate as i32)
-            .channel_count(i32::from(spec.channels))
+            .channel_count(channel_count)
             .format(AudioFormat::PCM_Float)
             .sharing_mode(AudioSharingMode::Shared)
             .performance_mode(AudioPerformanceMode::LowLatency)
@@ -586,9 +595,12 @@ pub(crate) mod audio {
         let channels = stream.channel_count();
         // `stream` drops here, closing the probe before it is ever started.
         if rate > 0 && (1..=2).contains(&channels) {
+            let channels = u32::try_from(channels).map_err(|_| AudioError::InvalidSpec {
+                message: format!("AAudio reported {channels} channels, which is out of range"),
+            })?;
             return Ok(AudioSpec {
                 sample_rate: rate as u32,
-                channels: channels as u16,
+                channels,
                 total_frames: None,
             });
         }
