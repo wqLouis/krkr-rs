@@ -4,6 +4,20 @@
 //! the plain values it returns and the style/format descriptions it accepts.
 //! The middle layer owns the atlas and layout built from them.
 
+/// Which rasterizer produces glyph coverage.
+///
+/// A caller selects it when it rasterizes a shaped run: the CPU path returns
+/// the coverage masks a bitmap composite consumes, the GPU path fills a glyph
+/// atlas. It is an input to rasterization, not a launch configuration value.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum GlyphBackend {
+    /// Rasterize on the CPU and upload the finished coverage.
+    #[default]
+    Cpu,
+    /// Rasterize on the GPU.
+    Gpu,
+}
+
 /// Requested glyph style.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct GlyphStyle {

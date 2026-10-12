@@ -11,10 +11,23 @@
 //!   [`render::rasterize_glyph`] / [`render::glyph_advance`] /
 //!   [`render::font_metrics`] contract. L1 owns the font and the coverage
 //!   bitmap; L2 owns the *atlas* that packs those bitmaps.
-//! * **GPU drawing** is the existing L1 quad pipeline: laid-out glyphs are
-//!   projected into a [`RenderScene`] as per-glyph [`RenderContent::Texture`]
-//!   quads. We do **not** add a second text draw path and we do **not**
-//!   depend on a renderer backend.
+//! * **GPU projection** is the L1 quad pipeline: [`project_text`] turns
+//!   positioned glyphs into per-glyph [`RenderContent::Texture`] quads against
+//!   an L2-owned [`GlyphAtlas`]. The production text draw does **not** use it
+//!   yet; the layer-bitmap composite below is the authoritative path.
+//!
+//! ## The CPU composite is the production text path
+//!
+//! Script-visible text is drawn by compositing per-character coverage into the
+//! layer's [`BitmapState`] ([`rasterize_text_coverage`] +
+//! [`compose_text_into`]), so `getPixel` and every other readback observe the
+//! same pixels the reference produces. The [`GlyphAtlas`] path exists for a
+//! future accelerated display: it rasterizes the same coverage once, packs it
+//! into a texture, and [`project_text`] emits textured quads that the L1
+//! pipeline can draw. No backend is wired to that path today —
+//! `RenderContent::Glyphs` is unanswered by the CPU and Vulkan renderers, and
+//! [`GlyphAtlas`] requires a live [`RenderPipeline`] that the L3 natives do not
+//! have.
 //!
 //! ## Why `cosmic-text`
 //!
@@ -40,18 +53,12 @@
 //!
 //! ## CPU and GPU coexistence (`getPixel`)
 //!
-//! The same rasterized coverage feeds two consumers:
-//!
-//! * the **GPU path** ([`project_text`]) uploads a glyph atlas once and emits
-//!   textured quads, drawn by the existing pipeline; and
-//! * the **CPU path** ([`compose_text_cpu`]) composites the same atlas pixels
-//!   into an RGBA buffer, which is what a script-visible `getPixel`/readback
-//!   must query.
-//!
-//! Both read the identical [`GlyphAtlas`] pixels, so the correctness
-//! baseline and the accelerated display agree. The CPU path is not a fallback
-//! for a missing GPU: it is the authoritative, deterministic compositor; the
-//! GPU path is the visual presentation of the same data.
+//! The same rasterized coverage can feed two consumers: the authoritative
+//! layer-bitmap composite ([`rasterize_text_coverage`]/[`compose_text_into`])
+//! that `getPixel`/readback observe, and a future GPU presentation
+//! ([`GlyphAtlas`] + [`project_text`]) that reads the identical pixels. Only
+//! the former is wired into the emulator; the latter is the seam a GPU backend
+//! would fill.
 //!
 //! ## State
 //!
@@ -65,7 +72,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use api::geometry::{PixelRegion, RectF};
-use api::glyph::{GlyphBitmap, GlyphStyle};
+use api::glyph::{GlyphBackend, GlyphBitmap, GlyphStyle};
 use render::{
     Font, FontMetrics, FontSystem, RenderContent, RenderNode, RenderNodeId, RenderPipeline,
     RenderScene, RenderState, Texture, TextureDesc, TextureFormat,
@@ -80,10 +87,10 @@ use cosmic_text::{Attrs, Buffer, Family, FontSystem as CosmicFontSystem, Metrics
 /// Maximum number of entries held by each L2 text memo.
 ///
 /// Reference: the `tTVPFontCache` character-cache limit `TVP_CH_MAX_CACHE_COUNT`
-/// (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:108`). It bounds both
-/// the rasterized character masks ([`TextCoverageCache`]) and the shaped-layout
-/// memo ([`TextEngine`]).
-const MAX_TEXT_CACHE_ENTRIES: usize = 1300;
+/// (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:108`). It bounds the
+/// rasterized character masks ([`TextCoverageCache`]), the shaped-layout memo
+/// ([`TextEngine`]) and the glyph atlas' entry map ([`GlyphAtlas`]).
+pub const MAX_TEXT_CACHE_ENTRIES: usize = 1300;
 
 /// Preferred Japanese-capable CJK sans face used when a requested family is
 /// not installed on the host.
@@ -888,6 +895,12 @@ impl AtlasGlyph {
 /// bilinear bleeding. Adding a new glyph uploads only its sub-rectangle with
 /// [`render::upload_texture`]; the CPU mirror is kept so the same pixels can be
 /// composited for CPU readback and re-uploaded after a render-state recreation.
+///
+/// The entry map is bounded at [`MAX_TEXT_CACHE_ENTRIES`] and evicts the least
+/// recently used glyph, the same bound and policy as [`TextCoverageCache`] and
+/// the shaped-layout memo. Eviction drops the map entry only: the shelf packer
+/// never reclaims the cell, so [`GlyphAtlas::clear`] is the way to reset the
+/// pixel space between frames.
 #[non_exhaustive]
 pub struct GlyphAtlas {
     /// Atlas texture handle passed to the quad pipeline.
@@ -904,8 +917,9 @@ pub struct GlyphAtlas {
     cursor_y: u32,
     /// Tallest glyph in the current shelf.
     row_height: u32,
-    /// Rasterized glyphs, keyed by face/codepoint/size/style.
-    entries: HashMap<GlyphKey, AtlasGlyph>,
+    /// Rasterized glyphs, keyed by face/codepoint/size/style and evicted least
+    /// recently used at the reference limit.
+    entries: LruCache<GlyphKey, AtlasGlyph>,
 }
 
 impl GlyphAtlas {
@@ -929,8 +943,23 @@ impl GlyphAtlas {
             cursor_x: 0,
             cursor_y: 0,
             row_height: 0,
-            entries: HashMap::new(),
+            entries: LruCache::new(MAX_TEXT_CACHE_ENTRIES),
         })
+    }
+
+    /// Drops every cached glyph and resets the shelf packer, zeroing the CPU
+    /// mirror.
+    ///
+    /// A glyph handle returned before the call is no longer valid. Pixel space
+    /// is only reclaimed here because the shelf packer never reuses an
+    /// individual cell; the owner calls this between frames once the frame's
+    /// projected glyphs have been consumed.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.pixels.fill(0);
+        self.cursor_x = 0;
+        self.cursor_y = 0;
+        self.row_height = 0;
     }
 
     /// Returns the atlas texture handle.
@@ -1189,11 +1218,13 @@ pub fn project_text(
 
 /// Composites positioned glyphs into a fresh `width × height` RGBA buffer.
 ///
-/// This is the CPU composition path used by the correctness baseline
-/// (`getPixel`/readback): it reads the same [`GlyphAtlas`] coverage the GPU
-/// path uploads, tints it with each glyph's colour and applies straight-alpha
-/// source-over with the glyph's opacity. The returned buffer starts fully
-/// transparent.
+/// This is the buffer-based companion of [`project_text`]: it reads the same
+/// [`GlyphAtlas`] coverage, tints it with each glyph's colour and applies
+/// straight-alpha source-over with the glyph's opacity. It is not the
+/// production text path — the emulator composites coverage straight into the
+/// layer bitmap with [`compose_text_into`] — but it is the reference for a
+/// test that compares the projected atlas pixels with a CPU composite. The
+/// returned buffer starts fully transparent.
 pub fn compose_text_cpu(
     atlas: &GlyphAtlas,
     glyphs: &[PositionedGlyph],
@@ -1676,6 +1707,65 @@ pub fn blurred_text_coverage(
         masks.push(position_mask(&blurred, glyph));
     }
     Ok(masks)
+}
+
+/// The drawable form one layout takes under the selected glyph backend.
+///
+/// The two forms are deliberately different values: the `cpu` form carries
+/// per-character coverage the caller composites into a bitmap, and the `gpu`
+/// form carries pen-positioned atlas glyphs the caller projects into a
+/// [`RenderScene`]. Both are built from the same [`TextLayout`], so the glyph
+/// positions, advances and metrics agree; only the rasterization and draw path
+/// differ.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RasterizedRun {
+    /// Coverage masks in text-local space, for [`compose_text_into`].
+    Coverage(Vec<CoverageMask>),
+    /// Pen-positioned glyphs backed by the caller's [`GlyphAtlas`], for
+    /// [`project_text`] or [`compose_text_cpu`].
+    Atlas(Vec<PositionedGlyph>),
+}
+
+/// Rasterizes `layout` through the selected glyph `backend`.
+///
+/// `Cpu` returns the coverage masks [`compose_text_into`] composites into a
+/// bitmap, reusing `cache`. `Gpu` fills `atlas` and returns pen-positioned
+/// glyphs for [`project_text`]; it needs a live `pipeline` to upload the atlas
+/// texture.
+///
+/// The shaped [`TextLayout`] is the single source of glyph positions and
+/// advances, so choosing `Gpu` changes only which raster coverage the draw
+/// consumes, never a script-observable metric. The one visual difference is
+/// antialiasing: `Cpu` thresholds the coverage to on/off when `antialias` is
+/// false, while the atlas cache keys coverage without it, so `Gpu` always
+/// rasterizes antialiased coverage (the readback bitmap the `Cpu` composite
+/// produces is unaffected).
+///
+/// # Errors
+///
+/// Propagates [`rasterize_text_coverage`] / [`GlyphAtlas::rasterize_layout`]'s
+/// errors.
+#[allow(clippy::too_many_arguments)]
+pub fn rasterize_run(
+    backend: GlyphBackend,
+    cache: &mut TextCoverageCache,
+    atlas: &mut GlyphAtlas,
+    pipeline: &RenderPipeline,
+    state: &mut RenderState,
+    engine: &TextEngine,
+    layout: &TextLayout,
+    style: &TextStyle,
+    antialias: bool,
+    opacity: f32,
+) -> Result<RasterizedRun, TextError> {
+    match backend {
+        GlyphBackend::Cpu => Ok(RasterizedRun::Coverage(rasterize_text_coverage(
+            cache, engine, layout, style, antialias,
+        )?)),
+        GlyphBackend::Gpu => Ok(RasterizedRun::Atlas(
+            atlas.rasterize_layout(pipeline, state, engine, layout, style, opacity)?,
+        )),
+    }
 }
 
 /// Whether a codepoint is expected to leave ink.
