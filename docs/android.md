@@ -259,6 +259,7 @@ Nothing is offered for a feature the engine has no knob for
 | Frame-rate limit | decimal integer `1..=1000` fps | `60` | reference `fps_limit` default 60 (`reference/cpp/core/environ/ui/PreferenceConfig.h:304-309`); the same range `--fps` accepts |
 | Presentation scaling | `game`, `fit`, `fill`, `expand` | `fit` | `game` is the reference's one-to-one Win32 presentation; `fit` is the Android default (§2.2), because a phone must not present the raw logical size |
 | Archive preload | `true`, `false` | `false` | whether every mounted archive is read into memory when it mounts; the cost is that archive's size in resident memory, the gain is that entry reads stop touching the backing filesystem |
+| Engine log level | `off`, `error`, `warn`, `info`, `debug`, `trace` | `info` | how much the engine writes to `krkr.log`; `debug`/`trace` are diagnostic and produce large logs (see §7) |
 
 `fill` and `expand` are exposed because the engine honours them; the desktop
 default remains `game`.
@@ -275,7 +276,7 @@ inspectable, atomically-written convention (§3.1):
 
 ```json
 { "version": 1, "frame_rate": "60", "scaling": "fit",
-  "preload_archives": "false" }
+  "preload_archives": "false", "log_level": "info" }
 ```
 
 `RuntimeSettings.kt` keeps each value as the exact string the user chose; it
@@ -291,21 +292,24 @@ playing the role of the `KRKR_CONFIG` file:
    not one of the accepted values is shown and must be corrected before it can
    be saved; the hand-edited value is preserved, not rewritten.
 2. **`KrkrGameActivity`** reads `settings.json` in `onCreate`/`onNewIntent`
-   *before* `super.onCreate` and copies the three values onto the static fields
-   `pendingFrameRate`, `pendingScaling` and `pendingPreloadArchives` — the same
-   JNI channel `pendingGameDir`/`pendingGameName`/`pendingStateDir` already use.
+   *before* `super.onCreate` and copies the four values onto the static fields
+   `pendingFrameRate`, `pendingScaling`, `pendingPreloadArchives` and
+   `pendingLogLevel` — the same JNI channel
+   `pendingGameDir`/`pendingGameName`/`pendingStateDir` already use.
 3. **`crates/android`** reads those fields (`jni_fields.rs`) and resolves them
    (`config.rs`) into a `RuntimeConfig`, applying `fit` as the presentation
-   default and `false` as the preload default. An unparseable or out-of-range
-   value is a typed `ConfigError` naming the option and the accepted values; it
-   is written to `krkr_state.json` as a failure and the loop is never started —
-   it is never replaced by the default (D11).
+   default and `false` as the preload default. The log level is resolved first,
+   before the logger is installed, because it selects the filter; its default
+   is `info`. An unparseable or out-of-range value is a typed `ConfigError`
+   naming the option and the accepted values; it is written to `krkr_state.json`
+   as a failure and the loop is never started — it is never replaced by the
+   default (D11).
 4. **The shared emulator host** receives the finished value: the
    `crates/android` loop passes the scaling into the render host, the
    archive-preload choice into `app::GameHost::open_with_preload`, and the
-   frame period into its ticker, exactly as the desktop `app::run` does. The
-   emulator core performs no configuration I/O, exactly as on the desktop
-   (`docs/runtime-config.md`).
+   frame period into its ticker, exactly as the desktop `app::run` does; the
+   log level becomes the process logger's filter. The emulator core performs no
+   configuration I/O, exactly as on the desktop (`docs/runtime-config.md`).
 
 Because the settings are read at launch, a change applies to the **next** run,
 which the screen states.
@@ -512,11 +516,26 @@ engine writes two files into `<filesDir>` and the launcher reads them:
   the launcher turns it into a dialog with the reason. A crash is recognised by
   a stale `starting`/`running` whose pid is no longer the current process.
 * `<filesDir>/krkr.log` — the engine log, and what the launcher's **Logs**
-  screen (copy/share) and the dialogs' tail read. `env_logger` writes every
-  record to stderr, which `android-activity` redirects to logcat, and the same
-  record is appended to this file. Lines are UTF-8, oldest first,
+  screen and the dialogs' tail read. `env_logger` writes every record to
+  stderr and the same record is appended to this file. Lines are UTF-8, oldest first,
   `"<rfc3339> <LEVEL> <message>"`; the launcher reads the last 400 lines, up
   to 256 KiB, dropping a leading partial line (`LauncherLog.tail`).
+
+The engine's log level is a **launcher setting** (`settings.json` →
+`pendingLogLevel` → `crates/android`), not an environment variable: `RUST_LOG`
+cannot be set on a device. `RUST_LOG` keeps its precedence on the desktop and
+for anyone who can set it; when it is unset the launcher's level (default
+`info`) selects the filter. `info` omits the TJS VM's exception detail: the
+VM's per-exception disassembly, register dump and console output reach our
+logger as `debug` records (`crates/tjs/cpp/tjs2_abi.cpp`
+`ConsoleOutputAdapter`; `tjsInterCodeExec.cpp`
+`DisplayExceptionGeneratedCode`), so **`debug` is the level that surfaces a
+script exception in `krkr.log`**. `debug` (and `trace`) also record per-frame
+detail, so the log grows and rotates much sooner; use it to diagnose a
+problem, then return to `info`. The vendored VM also has an independent
+spdlog logger that writes to stderr (logcat) at a fixed `debug` level and does
+not honour the launcher setting; the exception disassembly we need goes
+through the `log` callback and does honour it.
 
 The log is capped at 1 MiB and rotated once, keeping `krkr.log.1`, so a long
 session cannot fill the device's storage. The file is opened before the global
@@ -526,6 +545,17 @@ empty with no explanation (D11). The file name and the directory are the
 Kotlin contract (`EngineDiagnostics.engineLogFile` is
 `File(filesDir, "krkr.log")`, and `KrkrGameActivity.pendingStateDir` is
 `filesDir.absolutePath`).
+
+An app-private directory cannot be browsed on a device, so the Logs screen
+offers two ways off it: the **tail** (copy/share of the last 400 lines, which
+the crash dialogs also use), and the **full log** — *Share all* stages the
+current and rotated file of both sides into `cacheDir` and sends them as
+`ACTION_SEND_MULTIPLE` attachments with a read grant on the `FileProvider`
+URIs, while *Export* writes one combined file through the system document
+picker (`ACTION_CREATE_DOCUMENT`) to a location a PC can reach over USB. The
+screen lists each file with its real path and size, or `not created yet`, and
+names any file that was absent when the export ran; an absent or empty file
+never fails the export.
 
 **Host-tested:** the record format, the byte accounting, the 1 MiB rotation,
 reopening a previous file and the missing-directory error

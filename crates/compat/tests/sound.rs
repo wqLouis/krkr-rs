@@ -1994,3 +1994,88 @@ fn phase_vocoder_streams_a_streaming_source() {
          {total_chunks} windows"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Log capture (for the invalidated-action-owner dispatch)
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    /// Log lines written on this thread since the last clear. The sound tests
+    /// run in parallel, so the capture is per-thread.
+    static CAPTURED_LOGS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A `log` sink that records every record on the calling thread.
+struct CaptureLogger;
+
+impl log::Log for CaptureLogger {
+    fn enabled(&self, _metadata: &log::Metadata) -> bool {
+        true
+    }
+
+    fn log(&self, record: &log::Record) {
+        CAPTURED_LOGS.with(|logs| {
+            logs.borrow_mut()
+                .push(format!("{} {}", record.level(), record.args()));
+        });
+    }
+
+    fn flush(&self) {}
+}
+
+/// Install the capturing sink once per test binary, clear this thread's
+/// buffer, run `f`, and return its result plus the thread's log lines.
+fn capture_logs<R>(f: impl FnOnce() -> R) -> (R, Vec<String>) {
+    static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    ONCE.get_or_init(|| {
+        let _ = log::set_boxed_logger(Box::new(CaptureLogger));
+        log::set_max_level(log::LevelFilter::Debug);
+    });
+    CAPTURED_LOGS.with(|logs| logs.borrow_mut().clear());
+    let result = f();
+    let logs = CAPTURED_LOGS.with(|logs| logs.borrow().clone());
+    (result, logs)
+}
+
+/// Reference: the native `onStatusChanged`/`onFadeCompleted`/`onLabel`
+/// members invoke the constructor's action owner through
+/// `TVP_ACTION_INVOKE_END_NAME`, which **discards** the `FuncCall` result
+/// (`reference/cpp/core/base/EventIntf.h:231-234`). An already-invalidated
+/// action owner therefore produces neither a call nor a log message: the
+/// reference surfaces nothing (this is distinct from a delivered event whose
+/// *target* was invalidated, which `tTVPEvent::Deliver` drops before the call,
+/// `EventIntf.cpp:97-99`). Our dispatch must not warn on every tick for a
+/// state the reference treats as an ordinary no-op.
+#[test]
+fn invalidated_action_owner_is_not_a_warning() {
+    let _lock = vm_lock();
+    let env = Env::fixture(None);
+    env.run(
+        "class Ctrl { function Ctrl() {} function action(ev) { hits++; } } \
+         var hits = 0; \
+         var ctrl = new Ctrl(); \
+         var s = new WaveSoundBuffer(ctrl);",
+    );
+    // The sound object keeps the action owner retained; invalidating the owner
+    // leaves the buffer alive (the reference's `ActionOwner` is independent of
+    // `Owner`).
+    env.run("invalidate ctrl;");
+
+    let (_, logs) = capture_logs(|| {
+        // The invalidated owner makes `FuncCall` report `TJS_E_INVALIDOBJECT`;
+        // the reference swallows it.
+        env.run("s.onStatusChanged('play');");
+    });
+    let warnings: Vec<&String> = logs
+        .iter()
+        .filter(|line| line.starts_with("WARN"))
+        .collect();
+    assert!(
+        warnings.is_empty(),
+        "an invalidated action owner is a silent no-op in the reference; \
+         our dispatch warned: {warnings:?}"
+    );
+    // The action never ran, matching the discarded result.
+    assert_eq!(env.eval_int("hits"), 0);
+}

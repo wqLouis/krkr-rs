@@ -19,6 +19,7 @@ data class RuntimeSettings(
     val frameRate: String,
     val scaling: String,
     val preloadArchives: String,
+    val logLevel: String,
 )
 
 /**
@@ -31,6 +32,9 @@ data class RuntimeSettings(
  * (`docs/android.md` §2.2). Only options the engine can actually honour are
  * listed — there is no control for texture resolution or audio buffering,
  * because the engine exposes no knob for either.
+ *
+ * [LOG_LEVELS] mirrors the engine's `pendingLogLevel` field: one of `off`,
+ * `error`, `warn`, `info`, `debug`, `trace`, with `info` when unset or empty.
  */
 object RuntimeOptions {
     /** Lowest accepted frame-rate limit; mirrors `MIN_FRAME_RATE`. */
@@ -68,6 +72,7 @@ object RuntimeOptions {
         frameRate = DEFAULT_FRAME_RATE.toString(),
         scaling = DEFAULT_SCALING,
         preloadArchives = DEFAULT_PRELOAD_ARCHIVES,
+        logLevel = DEFAULT_LOG_LEVEL,
     )
 
     /** A one-line description of [mode], shown under its radio button. */
@@ -96,6 +101,32 @@ object RuntimeOptions {
     fun preloadDescription(): String =
         "Default: ${if (DEFAULT_PRELOAD_ARCHIVES == "true") "on" else "off"}. " +
             PRELOAD_DESCRIPTION
+
+    /** The accepted log levels, from least to most records; mirrors `pendingLogLevel`. */
+    val LOG_LEVELS = listOf("off", "error", "warn", "info", "debug", "trace")
+
+    /** The built-in log-level default; an unset or empty setting means this. */
+    const val DEFAULT_LOG_LEVEL = "info"
+
+    /**
+     * A one-line description of [level], shown under its radio button.
+     *
+     * `debug` and `trace` are diagnostic: they record the VM's exception dumps
+     * and per-frame detail, so the engine log grows and rotates much sooner.
+     */
+    fun logLevelDescription(level: String): String = when (level) {
+        "off" -> "Record nothing."
+        "error" -> "Record errors only."
+        "warn" -> "Record warnings and errors."
+        "info" -> "Record the normal progress messages. Recommended."
+        "debug" ->
+            "Record the VM's exception dumps and extra diagnostic detail. Slower, and " +
+                "the log grows and rotates much sooner."
+        "trace" ->
+            "Record the most detail, including per-frame tracing. The slowest; use only " +
+                "when debug is not enough."
+        else -> "Unknown level."
+    }
 }
 
 /**
@@ -115,7 +146,7 @@ object RuntimeOptions {
  *
  * ```json
  * { "version": 1, "frame_rate": "60", "scaling": "fit",
- *   "preload_archives": "false" }
+ *   "preload_archives": "false", "log_level": "info" }
  * ```
  */
 class RuntimeSettingsStore(context: Context) {
@@ -144,6 +175,7 @@ class RuntimeSettingsStore(context: Context) {
                 FIELD_PRELOAD_ARCHIVES,
                 RuntimeOptions.DEFAULTS.preloadArchives,
             ),
+            logLevel = stringField(root, FIELD_LOG_LEVEL, RuntimeOptions.DEFAULTS.logLevel),
         )
     }
 
@@ -157,6 +189,7 @@ class RuntimeSettingsStore(context: Context) {
             .put(FIELD_FRAME_RATE, settings.frameRate)
             .put(FIELD_SCALING, settings.scaling)
             .put(FIELD_PRELOAD_ARCHIVES, settings.preloadArchives)
+            .put(FIELD_LOG_LEVEL, settings.logLevel)
         return runCatching {
             DurableWrite.text(file, root.toString(2))
         }.onFailure { error ->
@@ -186,5 +219,6 @@ class RuntimeSettingsStore(context: Context) {
         const val FIELD_FRAME_RATE = "frame_rate"
         const val FIELD_SCALING = "scaling"
         const val FIELD_PRELOAD_ARCHIVES = "preload_archives"
+        const val FIELD_LOG_LEVEL = "log_level"
     }
 }

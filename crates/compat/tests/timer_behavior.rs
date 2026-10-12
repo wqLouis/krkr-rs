@@ -1552,3 +1552,143 @@ fn throwing_action_owner_keeps_its_receiver_on_the_next_fire() {
 
     assert_no_problems(problems);
 }
+
+/// Reference: the timer's `onTimer` event is posted at the timer object
+/// (`TimerIntf.cpp:100`) and the native `onTimer` invokes the constructor's
+/// action with the event dictionary built by `TVP_ACTION_INVOKE_BEGIN(0,
+/// "onTimer", objthis)` (`TimerIntf.cpp:164`, `EventIntf.h:208-215`):
+/// `type == "onTimer"` and `target == the timer object`
+/// (`TVPCreateEventObject`, `EventIntf.cpp:709-736`). The action closure runs
+/// with its own receiver as `this` (`tTJSVariantClosure::FuncCall` prefers
+/// `ObjThis` over the fallback object, `tjsVariant.h:219-228`).
+///
+/// This drives the **engine** path (`timer_poll` → `TimerState::advance` →
+/// the registered callback → `dispatch_on_timer`), never a direct
+/// `timer.onTimer()` call, so it pins that the timer object is still retained
+/// at fire time and `target` is present in the delivered event.
+#[test]
+fn engine_driven_fire_delivers_type_target_and_this() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    let mut problems = Vec::new();
+
+    env.run(
+        "var hits = 0; var evType = 'none'; var evTarget = -1; var thisIsOwner = -1; \
+         class Probe { \
+             function Probe() {} \
+             function onAction(ev) { \
+                 hits++; \
+                 evType = ev.type; \
+                 evTarget = (ev.target === probeTimer) ? 1 : 0; \
+                 thisIsOwner = (this === probeOwner) ? 1 : 0; \
+             } \
+         } \
+         var probeOwner = new Probe(); \
+         var probeTimer = new Timer(probeOwner.onAction, ''); \
+         probeTimer.interval = 10; \
+         probeTimer.enabled = true;",
+    );
+    sleep_ms(30);
+    env.poll();
+
+    check(&mut problems, "action invocations", env.eval_int("hits"), 1);
+    check(
+        &mut problems,
+        "event `type`",
+        env.eval_ok("evType"),
+        TjsValue::String("onTimer".into()),
+    );
+    check(
+        &mut problems,
+        "event `target` is the timer object",
+        env.eval_int("evTarget"),
+        1,
+    );
+    check(
+        &mut problems,
+        "`this` inside the action is the constructor's action owner",
+        env.eval_int("thisIsOwner"),
+        1,
+    );
+
+    assert_no_problems(problems);
+}
+
+/// Reference: `tTJSNI_BaseTimer::Fire` posts `onTimer` with the mode's
+/// priority flag — `TVP_EPT_NORMAL` / `TVP_EPT_EXCLUSIVE` / `TVP_EPT_IDLE`
+/// (`TimerIntf.cpp:86-98`) — and `_TVPDeliverAllEvents2` delivers exclusive
+/// events before normal, and normal before idle (`EventIntf.cpp:426-519`).
+/// Delivery order is the mode priority, not creation order.
+///
+/// Our `timer_poll` queues the fires the L2 callbacks post and drains them by
+/// `mode_priority`. Before that queue existed the fires were dispatched inside
+/// `advance` in creation order, so this test — an idle timer created before an
+/// exclusive one — observed `idle` first.
+#[test]
+fn engine_driven_fire_is_delivered_exclusive_before_idle() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    let mut problems = Vec::new();
+
+    env.run(
+        "var order = []; \
+         var idleTimer = new Timer(function(){ order.add('idle'); }, ''); \
+         idleTimer.mode = 2; idleTimer.interval = 10; \
+         var exclusiveTimer = new Timer(function(){ order.add('exclusive'); }, ''); \
+         exclusiveTimer.mode = 1; exclusiveTimer.interval = 10; \
+         idleTimer.enabled = true; \
+         exclusiveTimer.enabled = true;",
+    );
+    sleep_ms(30);
+    env.poll();
+
+    check(
+        &mut problems,
+        "first delivered event",
+        env.eval_ok("order[0]"),
+        TjsValue::String("exclusive".into()),
+    );
+    check(
+        &mut problems,
+        "second delivered event",
+        env.eval_ok("order[1]"),
+        TjsValue::String("idle".into()),
+    );
+
+    assert_no_problems(problems);
+}
+
+/// The reference native `onTimer` has no disable-on-error path
+/// (`TimerIntf.cpp:156-171`), and an `enabled = false` written by the action
+/// must disarm the timer for the next poll: `SetEnabled(false)` calls
+/// `CancelEvents()` and drops `NextTick` (`tTVPTimerThread::SetEnabled`,
+/// `reference/cpp/core/utils/impl/TimerImpl.cpp:277-281`), and the thread then
+/// skips the disabled timer (`TimerImpl.cpp:125`).
+///
+/// The port reaches the L2 registry through the handle the poll itself uses,
+/// so a write made from inside the callback is re-entrant. This test advances
+/// twice and requires exactly one invocation: if the write were lost, the
+/// re-armed deadline would fire again on the second poll.
+#[test]
+fn self_disabling_action_is_invoked_once() {
+    let _lock = vm_lock();
+    let env = Env::new();
+
+    env.run(
+        "var hits = 0; \
+         var t = new Timer(function(){ hits++; t.enabled = false; }, ''); \
+         t.interval = 10; \
+         t.enabled = true;",
+    );
+    sleep_ms(30);
+    env.poll();
+    sleep_ms(30);
+    env.poll();
+
+    assert_eq!(
+        env.eval_int("hits"),
+        1,
+        "a self-disabled timer fired again: the action's `enabled = false` write was lost"
+    );
+    assert_eq!(env.eval_int("t.enabled"), 0);
+}

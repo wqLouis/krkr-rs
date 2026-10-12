@@ -2536,6 +2536,89 @@ mod tests {
         );
     }
 
+    // Captured `(level, message)` records from the engine's log callback,
+    // per thread (the tests run in parallel across threads).
+    thread_local! {
+        static VM_LOG_RECORDS: std::cell::RefCell<Vec<(c_int, String)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    extern "C" fn record_vm_log(level: c_int, msg: *const c_char, _user: *mut c_void) {
+        if msg.is_null() {
+            return;
+        }
+        // SAFETY: msg is a NUL-terminated UTF-8 string valid for the call.
+        let s = unsafe { CStr::from_ptr(msg) }
+            .to_string_lossy()
+            .into_owned();
+        VM_LOG_RECORDS.with(|logs| logs.borrow_mut().push((level, s)));
+    }
+
+    /// A `try`-caught VM exception is raised as an `eTJS` error and reaches
+    /// the `catch(eTJS&)` arm, which logs the message with `spdlog::debug`.
+    /// The ABI bridge must forward that record to the engine's log callback
+    /// at DEBUG, with the message intact, so a device running at `debug`
+    /// records it in the engine log. Reference:
+    /// `reference/cpp/core/tjs2/tjsInterCodeExec.cpp:1311`.
+    #[test]
+    fn caught_exception_reaches_the_log_callback_as_debug() {
+        let _vm_lock = vm_lock();
+        let e = Tjs2Engine::new().unwrap();
+        e.register_native_class(&test_natives_builder()).unwrap();
+        // SAFETY: the callback is a plain fn with no user pointer needs.
+        unsafe { e.set_log_cb(Some(record_vm_log), ptr::null_mut()) };
+        VM_LOG_RECORDS.with(|logs| logs.borrow_mut().clear());
+
+        e.exec_script(
+            "var r = ''; try { TestNatives.add(1); } catch(e) { r = 'caught'; }",
+            "test",
+        )
+        .unwrap();
+        assert_eq!(
+            e.eval("r", "test").unwrap(),
+            TjsValue::String("caught".into())
+        );
+
+        let records = VM_LOG_RECORDS.with(|logs| logs.borrow().clone());
+        // The exact message (without the source position the console trace
+        // path appends) is the record the spdlog bridge adds; debug-mode
+        // builds also emit a `... at position` console record.
+        assert!(
+            records
+                .iter()
+                .any(|(level, msg)| *level == LOG_DEBUG && msg == "add requires 2 arguments"),
+            "the caught exception must reach the log callback as debug: {records:?}"
+        );
+    }
+
+    /// The uncaught path is unchanged: the VM reports the exception through
+    /// the returned error and prints the diagnostic disassembly dump, not the
+    /// caught-exception debug record. Reference:
+    /// `reference/cpp/core/tjs2/tjsInterCodeExec.cpp:1313`.
+    #[test]
+    fn uncaught_exception_still_surfaces_the_error_and_dump() {
+        let _vm_lock = vm_lock();
+        let e = Tjs2Engine::new().unwrap();
+        e.register_native_class(&test_natives_builder()).unwrap();
+        // SAFETY: the callback is a plain fn with no user pointer needs.
+        unsafe { e.set_log_cb(Some(record_vm_log), ptr::null_mut()) };
+        VM_LOG_RECORDS.with(|logs| logs.borrow_mut().clear());
+
+        let err = e.eval("TestNatives.add(1)", "test").unwrap_err();
+        assert!(
+            err.to_string().contains("add requires 2 arguments"),
+            "the uncaught error must still surface: {err}"
+        );
+
+        let records = VM_LOG_RECORDS.with(|logs| logs.borrow().clone());
+        assert!(
+            records
+                .iter()
+                .any(|(level, msg)| *level == LOG_DEBUG && msg.contains("An exception occurred")),
+            "the uncaught path still prints the disassembly dump: {records:?}"
+        );
+    }
+
     #[test]
     fn native_class_rejects_duplicate_registration() {
         let _vm_lock = vm_lock();

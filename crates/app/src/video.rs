@@ -40,6 +40,8 @@ use compat::{CompatError, CompatHost, VideoSource, set_movie_source, set_video_s
 use engine::Storage;
 use media::{Media, VideoDecoderState, open_video, present_video, video_audio};
 
+use crate::startup::StartupStats;
+
 /// One opened stream: its spec and its decoder.
 struct OpenStream {
     /// The stream description read when the decoder was opened.
@@ -54,6 +56,8 @@ struct Inner {
     media: Media,
     /// The game storage the streams are read from.
     storage: *const Storage,
+    /// Start-up counters shared with the composition root.
+    stats: Rc<StartupStats>,
     /// Open decoders, keyed by the storage path they were opened from.
     streams: HashMap<String, OpenStream>,
 }
@@ -74,6 +78,7 @@ impl Inner {
             let media = self.media.clone();
             let (spec, decoder) =
                 open_video(&media, Arc::from(bytes.into_boxed_slice()), Some(path))?;
+            self.stats.record_video_decoder();
             self.streams
                 .insert(path.to_string(), OpenStream { spec, decoder });
         }
@@ -163,11 +168,28 @@ pub unsafe fn install_video_source(
     media: &Media,
     storage: &Storage,
 ) -> Result<(), CompatError> {
+    let stats = StartupStats::new();
+    // SAFETY: the caller upholds the storage lifetime documented above.
+    unsafe { install_video_source_metered(host, media, storage, &stats) }
+}
+
+/// Installs the video source with the shared [`StartupStats`] counter set.
+///
+/// # Safety
+///
+/// The same storage-lifetime contract as [`install_video_source`].
+pub(crate) unsafe fn install_video_source_metered(
+    host: &CompatHost,
+    media: &Media,
+    storage: &Storage,
+    stats: &Rc<StartupStats>,
+) -> Result<(), CompatError> {
     let ctx = host.ctx()?;
     let source = MediaVideoSource {
         inner: Rc::new(RefCell::new(Inner {
             media: media.clone(),
             storage: storage as *const Storage,
+            stats: Rc::clone(stats),
             streams: HashMap::new(),
         })),
     };

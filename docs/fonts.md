@@ -12,6 +12,55 @@ implicit path, and it exists so a game runs before the user has supplied a
 `fonts.json`. Once a configuration is installed, krkr-rs never touches the
 system font database unless `allow_system_discovery` is explicitly `true`.
 
+## System font sources (current engine)
+
+The engine resolves a face through a lazily built `fontdb::Database`
+(`engine::text::TextEngine`). The database is built the first time a face is
+requested from the host, from two sources:
+
+1. `fontdb`'s own system scan (`Database::load_system_fonts`). It knows the
+   Windows, macOS and Unix/X11 font directories, but it deliberately excludes
+   Android, so on Android this source contributes nothing.
+2. The directories the composition root passes to
+   `engine::text::TextEngine::set_system_font_dirs`, obtained from the L1
+   `platform::system_font_dirs`:
+   * Android — `/system/fonts`, `/product/fonts`, `/vendor/fonts`;
+   * Unix-like desktop — `/usr/share/fonts`, `/usr/local/share/fonts`, the
+     XDG per-user directory (`$XDG_DATA_HOME/fonts`, defaulting to
+     `$HOME/.local/share/fonts`) and the legacy `$HOME/.fonts`.
+
+A directory in the list that is not present on the host is skipped: it is an
+absent source, not an error. Adding the directory list is what lets Android
+reach its `NotoSansCJK-Regular.ttc`, which `fontdb` cannot find on its own.
+The scan stays lazy, so the start-up cost is unchanged until text first needs
+a host face.
+
+> **Unverified on this host:** `platform::ANDROID_SYSTEM_FONT_DIRS` is
+> compiled and unit-tested on the desktop host (the constant and its
+> `/system/fonts` entry), but no Android device is exercised by this
+> repository's test gate, so the device's actual font directories and their
+> contents are not verified here.
+
+### Fallback order
+
+When a requested face is not already registered, not in the mounted storage
+and not an installed family, `compat::resource::resolve_face` falls back in
+the reference's order:
+
+1. the exact requested family (each comma-separated candidate, before the
+   next candidate is tried);
+2. the Japanese/CJK fallback families, in order: `Noto Sans CJK JP`,
+   `Noto Sans CJK SC`, `Noto Sans CJK TC`, `Noto Sans CJK KR`, then
+   `Droid Sans Fallback` (the reference's bundled CJK face);
+3. the well-known Noto CJK collection paths;
+4. the engine's first registered face (the reference `TVPCreateFontStream`
+   default font);
+5. otherwise a typed `TextError::FontNotFound`.
+
+`TextEngine::load_system_font_exact` is the exact-family query a candidate
+list needs and never substitutes an unrelated face; only
+`TextEngine::load_system_font` applies steps 2–3.
+
 ## Schema
 
 `fonts.json` is a JSON object with three optional keys:

@@ -16,6 +16,7 @@
 //! L2 timer while the binding keeps reporting the script's `enabled`.
 #![allow(unsafe_code)]
 
+use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
 
 use engine::timer::{TimerCallback, TimerId, TimerState};
@@ -61,6 +62,121 @@ struct TimerInst {
     id: Option<TimerId>,
 }
 
+/// Deferred `onTimer` deliveries for the current poll.
+///
+/// The reference `tTJSNI_BaseTimer::Fire` does not call the action: it
+/// **posts** `onTimer` to the owner (`TimerIntf.cpp:100`) with the mode's
+/// priority flag (`TimerIntf.cpp:86-98`) and the event loop delivers the
+/// queued events later, exclusive first, then normal, then idle
+/// (`EventIntf.cpp:426-519`). This is the L3 half of that model: the L2
+/// callback enqueues one entry per fire, and [`timer_poll`] drains the queue
+/// after `advance` returns, ordering by the mode captured at fire time.
+///
+/// A schedule write while the queue is draining cancels the timer's pending
+/// entries the way the reference's `CancelEvents` does, tracked by the
+/// per-timer generation counter: [`post_on_timer`] stamps each entry with the
+/// current generation and [`sync_schedule`] bumps it for the writes the
+/// reference cancels on (`SetEnabled(false)`, `SetInterval`), so the drain
+/// skips a cancelled entry.
+#[derive(Default)]
+struct TimerPosts {
+    /// Posts in fire order; [`timer_poll`] sorts a copy by priority before
+    /// delivery.
+    pending: Vec<TimerPost>,
+    /// Cancellation generation per timer. An absent entry is generation 0.
+    generation: HashMap<TimerId, u64>,
+}
+
+/// One queued `onTimer` posting: the timer, the mode captured at fire time,
+/// and the schedule generation it was posted under.
+struct TimerPost {
+    id: TimerId,
+    mode: i64,
+    generation: u64,
+}
+
+/// The delivery priority of a `tTVPAsyncTriggerMode` (`EventIntf.h:312`):
+/// exclusive events are delivered before normal events, which are delivered
+/// before idle events (`EventIntf.cpp:426-519`).
+fn mode_priority(mode: i64) -> u8 {
+    match mode {
+        // atmExclusive
+        1 => 0,
+        // atmAtIdle
+        2 => 2,
+        // atmNormal (0) and anything unrecognized
+        _ => 1,
+    }
+}
+
+/// Queue one fire of `id` — the L3 half of the reference's
+/// `tTJSNI_BaseTimer::Fire` posting (`TimerIntf.cpp:69-111`).
+///
+/// The reference computes `cap = TVPLimitTimerCapacity ? 1 : (Capacity == 0 ?
+/// 65535 : Capacity)` and posts only while `cap - <queued> > 0`
+/// (`TimerIntf.cpp:71-93`); a non-positive capacity posts nothing. The L2
+/// registry fires a timer at most once per [`TimerState::advance`] and never
+/// catches up a late frame, so the queue depth here is at most one entry per
+/// timer and a positive capacity never drops a fire; a negative capacity is
+/// already expressed by not arming the L2 timer (`sync_schedule`). The check
+/// is kept so the mapping stays explicit.
+fn post_on_timer(services: &CompatServices, id: TimerId) {
+    let mut posts = services.state::<TimerPosts>();
+    let (mode, capacity) = {
+        let state = services.state::<VisualState>();
+        let Some(binding) = state.timers.get(&id) else {
+            return;
+        };
+        (binding.mode, binding.capacity)
+    };
+    // `TimerIntf.cpp:76-77`: `0` is the "no limit" sentinel.
+    let cap = if capacity == 0 { 65535 } else { capacity };
+    if cap <= 0 {
+        return;
+    }
+    let queued = posts.pending.iter().filter(|post| post.id == id).count() as i64;
+    if queued >= cap {
+        return;
+    }
+    let generation = posts.generation.get(&id).copied().unwrap_or(0);
+    posts.pending.push(TimerPost {
+        id,
+        mode,
+        generation,
+    });
+}
+
+/// Bump `id`'s cancellation generation, invalidating every entry already
+/// queued for it (the reference `CancelEvents`, `TimerIntf.cpp:62-67`).
+fn cancel_pending(services: &CompatServices, id: TimerId) {
+    let mut posts = services.state::<TimerPosts>();
+    let entry = posts.generation.entry(id).or_insert(0);
+    *entry = entry.wrapping_add(1);
+}
+
+/// Drop all queue state for a torn-down timer, so a long session does not
+/// accumulate generation entries for ids that can never be reused.
+fn forget_posts(services: &CompatServices, id: TimerId) {
+    let mut posts = services.state::<TimerPosts>();
+    posts.pending.retain(|post| post.id != id);
+    posts.generation.remove(&id);
+}
+
+/// Whether a queued post may still be delivered: its timer has not been
+/// invalidated and no schedule write cancelled it since it was posted.
+fn timer_post_is_live(services: &CompatServices, id: TimerId, generation: u64) -> bool {
+    if !services.state::<VisualState>().timers.contains_key(&id) {
+        return false;
+    }
+    services
+        .state::<TimerPosts>()
+        .generation
+        .get(&id)
+        .copied()
+        .unwrap_or(0)
+        == generation
+}
+
 // ---------------------------------------------------------------------------
 // Timer (L3 adapter over the L2 `engine::timer::TimerState` registry)
 // ---------------------------------------------------------------------------
@@ -86,6 +202,7 @@ extern "C" fn timer_destroy(engine: *mut c_void, instance: *mut c_void) {
         // The dropped `TimerBinding` releases the action owner and the
         // retained timer object.
         services.state::<VisualState>().timers.remove(&id);
+        forget_posts(services, id);
     }
     // SAFETY: instance came from `timer_create`'s `Box::into_raw` and is
     // freed exactly once by the VM.
@@ -220,6 +337,7 @@ extern "C" fn timer_invalidate(engine: *mut c_void, instance: *mut c_void) {
     // Reference `CancelEvents()` + `Owner`/`ActionOwner` release: the entry's
     // drop releases both retentions, so `timer_poll` has nothing to dispatch.
     services.state::<VisualState>().timers.remove(&id);
+    forget_posts(services, id);
     // Reference `tTVPTimerThread::Remove(this)`: the timer must not tick
     // again, and `timer_poll` must stop reporting an armed timer.
     if let Some(timer) = services.timer() {
@@ -242,24 +360,20 @@ fn timer_callback(engine: *mut c_void) -> TimerCallback {
         // timer's constructor; L2 only invokes callbacks from `timer_poll`,
         // which requires the same bound context, so `bound` resolves it the
         // same way every other native does.
-        let Ok((resolved, ctx)) = bound(engine) else {
+        let Ok((_resolved, ctx)) = bound(engine) else {
             log::warn!("Timer {id:?}: compat context is not bound; fire dropped");
             return;
         };
-        let host = resolved.engine();
         // SAFETY: the caller resolved `ctx` from the installed binding.
         let services = unsafe { ctx.services() };
-        dispatch_on_timer(host, services, id);
+        post_on_timer(services, id);
     })
 }
 
 /// Dispatch `id`'s `onTimer` — always the object's `onTimer` **member**
 /// (`EventIntf.cpp:104`: `Target->FuncCall(0, "onTimer", ...)`), so a script
 /// subclass override wins; the native member then invokes the constructor's
-/// action owner (see [`invoke_action`]). Fall back to the action owner
-/// itself when the timer object could not be retained at construction (the
-/// reference always has `Owner`, so this only covers the port's retention
-/// failure).
+/// action owner (see [`invoke_action`]).
 ///
 /// Delivery failures are logged and never disable the timer — the reference
 /// has no disable-on-error path in `TimerIntf.cpp`/`TimerImpl.cpp`.
@@ -274,7 +388,15 @@ fn dispatch_on_timer(host: &Tjs2Engine, services: &CompatServices, id: TimerId) 
     log::trace!("timer {id:?}: dispatching (owner {})", owner.is_some());
     let result: Result<(), String> = match owner {
         Some(owner) => host.call_member(owner, "onTimer", &[]).map(|_| ()),
-        None => invoke_action(host, services, id, std::ptr::null_mut()),
+        // The reference's `Owner` is always the timer object
+        // (`TimerIntf.cpp:52`); a missing retention is a port-only failure,
+        // and delivering without it would omit the event's `target`
+        // (`TVP_ACTION_INVOKE_BEGIN(0, "onTimer", objthis)`,
+        // `TimerIntf.cpp:164`). Skip rather than deliver a malformed event.
+        None => {
+            log::debug!("Timer {id:?}: no retained timer object; onTimer fire skipped");
+            return;
+        }
     };
     if let Err(error) = result {
         // Reference: `onTimer` returns `TJS_S_OK` whatever happened
@@ -491,7 +613,13 @@ fn push_enabled(timer: &mut TimerState, id: TimerId, enabled: bool) {
 ///   (`TimerImpl.cpp:294-301`) — cancelling that round's pending fire. A
 ///   capacity or enabled write that changes nothing leaves a pending fire
 ///   untouched (`SetCapacity` only stores).
-fn sync_schedule(services: &CompatServices, id: TimerId, now: u64, rearm_interval: bool) {
+fn sync_schedule(
+    services: &CompatServices,
+    id: TimerId,
+    now: u64,
+    rearm_interval: bool,
+    cancel_events: bool,
+) {
     let (want, interval_ms, was_armed) = {
         let state = services.state::<VisualState>();
         let Some(binding) = state.timers.get(&id) else {
@@ -503,6 +631,15 @@ fn sync_schedule(services: &CompatServices, id: TimerId, now: u64, rearm_interva
         let want = binding.enabled && binding.capacity >= 0 && interval_ms.is_some();
         (want, interval_ms, binding.armed)
     };
+    // The reference cancels a timer's queued events on `SetEnabled(false)`
+    // (`tTVPTimerThread::SetEnabled`, `TimerImpl.cpp:277-281`) and on
+    // `SetInterval` while enabled (`TimerImpl.cpp:294-301`); `SetCapacity`
+    // only stores (`TimerIntf.cpp:234-236`). `cancel_events` carries that
+    // per-write distinction; bump the delivery generation so any queued post
+    // is dropped.
+    if cancel_events {
+        cancel_pending(services, id);
+    }
     let Some(timer_ptr) = services.timer() else {
         log::debug!("Timer {id:?}: no timer registry is attached; the schedule write is dropped");
         return;
@@ -631,7 +768,7 @@ extern "C" fn timer_interval_set(
         // conversion reproduces exactly this storage.
         binding.interval_units = units;
     }
-    sync_schedule(services, id, now, true);
+    sync_schedule(services, id, now, true, true);
     0
 }
 
@@ -712,7 +849,7 @@ extern "C" fn timer_enabled_set(
         };
         binding.enabled = enabled;
     }
-    sync_schedule(services, id, now, false);
+    sync_schedule(services, id, now, false, !enabled);
     let armed = services
         .state::<VisualState>()
         .timers
@@ -792,7 +929,7 @@ extern "C" fn timer_capacity_set(
         };
         binding.capacity = requested;
     }
-    sync_schedule(services, id, now, false);
+    sync_schedule(services, id, now, false, false);
     0
 }
 
@@ -863,6 +1000,8 @@ extern "C" fn timer_mode_set(
 /// disable-on-error path in `TimerIntf.cpp`/`TimerImpl.cpp`.
 pub fn timer_poll(ctx: &mut CompatCtx) -> Result<bool, CompatError> {
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
+    let host = unsafe { ctx.engine() };
+    // SAFETY: see above.
     let services = unsafe { ctx.services() };
     // The clock borrow ends at this statement — before any callback can
     // re-enter `state::<VisualState>()`.
@@ -876,6 +1015,22 @@ pub fn timer_poll(ctx: &mut CompatCtx) -> Result<bool, CompatError> {
     let fired = unsafe { &mut *timer_ptr }.advance(now);
     if fired > 0 {
         log::trace!("timer_poll: {fired} timer(s) fired at {now}");
+    }
+    // Deliver the `onTimer` postings the callbacks queued, ordering them the
+    // way the reference event queue does: exclusive before normal before idle
+    // (`EventIntf.cpp:426-519`). The queue is taken out whole, so a handler
+    // that posts again lands in the next poll rather than re-entering the VM
+    // mid-drain.
+    let mut posts = {
+        let mut queue = services.state::<TimerPosts>();
+        std::mem::take(&mut queue.pending)
+    };
+    posts.sort_by_key(|post| mode_priority(post.mode));
+    for post in posts {
+        if !timer_post_is_live(services, post.id, post.generation) {
+            continue;
+        }
+        dispatch_on_timer(host, services, post.id);
     }
     // L3 mirrors what it pushed to L2 (`TimerBinding::armed`).
     let any_armed = services

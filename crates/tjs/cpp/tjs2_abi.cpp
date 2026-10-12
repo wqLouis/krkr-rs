@@ -27,24 +27,12 @@
 #include "tjs2_abi.h"
 
 #include <spdlog/spdlog.h>
+#include <spdlog/sinks/base_sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 
-// The reference main() registers the spdlog loggers the tjs2 code expects
-// (`spdlog::get("tjs2")` etc.). Register them once per process, routing to
-// stderr. (Routing into the per-engine log callback can come later.)
-static void ensure_spdlog_loggers() {
-    static std::once_flag once;
-    std::call_once(once, [] {
-        spdlog::set_level(spdlog::level::debug);
-        if(!spdlog::get("tjs2"))
-            spdlog::stderr_color_mt("tjs2");
-        if(!spdlog::get("core"))
-            spdlog::stderr_color_mt("core");
-        if(!spdlog::get("plugin"))
-            spdlog::stderr_color_mt("plugin");
-        spdlog::set_default_logger(spdlog::get("core"));
-    });
-}
+#include <atomic>
+#include <memory>
+#include <mutex>
 
 // Provided by the environ module in the full engine; we have no locale
 // catalog yet, so fall back to returning the key itself.
@@ -103,6 +91,92 @@ struct tjs2_engine {
 };
 
 namespace {
+
+// ---------------------------------------------------------------------------
+// spdlog -> engine log callback bridge
+// ---------------------------------------------------------------------------
+
+// The engine whose log callback receives the VM's spdlog records. spdlog
+// loggers are process-wide while the callback is per engine; the compat
+// binding is process-global and single, so at most one engine is active at a
+// time. This is the most recently created engine that installed a callback.
+// The pointer is atomic because the sink and the thread installing the
+// callback need not be the same thread, and it is cleared before the engine
+// (and its callback/user) is freed so the sink never dereferences a dead
+// engine.
+std::atomic<tjs2_engine *> g_log_engine{nullptr};
+
+// Map a spdlog severity onto the ABI's coarser scale (no trace, one error
+// level). A debug record stays debug so a run at `info` can ignore it.
+int tjs2_level_for(spdlog::level::level_enum level) {
+    switch(level) {
+        case spdlog::level::trace:
+        case spdlog::level::debug:
+            return TJS2_LOG_DEBUG;
+        case spdlog::level::info:
+            return TJS2_LOG_INFO;
+        case spdlog::level::warn:
+            return TJS2_LOG_WARN;
+        case spdlog::level::err:
+        case spdlog::level::critical:
+            return TJS2_LOG_ERROR;
+        case spdlog::level::off:
+        default:
+            return TJS2_LOG_DEBUG;
+    }
+}
+
+// A spdlog sink that forwards records to the active engine's log callback.
+// Until an engine installs one (and after it is cleared) there is no
+// destination, so records fall through to the stderr sink the VM used before
+// this bridge existed. That keeps output visible, and because the logger has
+// only this one sink the record is not also written to stderr once the
+// callback is installed.
+class Tjs2EngineLogSink : public spdlog::sinks::base_sink<std::mutex> {
+    std::shared_ptr<spdlog::sinks::stderr_color_sink_mt> stderr_;
+
+public:
+    Tjs2EngineLogSink()
+        : stderr_(std::make_shared<spdlog::sinks::stderr_color_sink_mt>()) {}
+
+protected:
+    void sink_it_(const spdlog::details::log_msg &msg) override {
+        tjs2_engine *e = g_log_engine.load(std::memory_order_acquire);
+        if(e && e->log_cb) {
+            std::string text(msg.payload.data(), msg.payload.size());
+            e->log_cb(tjs2_level_for(msg.level), text.c_str(), e->log_user);
+            return;
+        }
+        stderr_->log(msg);
+    }
+
+    void flush_() override { stderr_->flush(); }
+};
+
+// The reference main() registers the spdlog loggers the tjs2 code expects
+// (`spdlog::get("tjs2")` etc.). Register them once per process, all backed by
+// the bridge sink above.
+static void ensure_spdlog_loggers() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        auto sink = std::make_shared<Tjs2EngineLogSink>();
+        if(!spdlog::get("tjs2"))
+            spdlog::register_logger(
+                std::make_shared<spdlog::logger>("tjs2", sink));
+        if(!spdlog::get("core"))
+            spdlog::register_logger(
+                std::make_shared<spdlog::logger>("core", sink));
+        if(!spdlog::get("plugin"))
+            spdlog::register_logger(
+                std::make_shared<spdlog::logger>("plugin", sink));
+        spdlog::set_default_logger(spdlog::get("core"));
+        // Set the level after registration: a logger registered directly
+        // (not through a factory) keeps its constructor default of `info`,
+        // and `set_level` is what pushes `debug` down to every registered
+        // logger and the global level for later ones.
+        spdlog::set_level(spdlog::level::debug);
+    });
+}
 
 // Convert UTF-8 -> tjs_char (char16_t on this build).
 std::u16string utf8_to_u16(const char *s) {
@@ -1656,6 +1730,10 @@ tjs2_engine *tjs2_create(void) {
 void tjs2_destroy(tjs2_engine *e) {
     if(!e)
         return;
+    // The spdlog bridge may still point at this engine; clear it before the
+    // engine (and its callback/user) is freed.
+    if(g_log_engine.load(std::memory_order_acquire) == e)
+        g_log_engine.store(nullptr, std::memory_order_release);
     try {
         e->inner->Shutdown();
         // Drop retained values, the last-object slot and the registered
@@ -1679,6 +1757,12 @@ void tjs2_set_log_cb(tjs2_engine *e, tjs2_log_cb cb, void *user) {
         return;
     e->log_cb = cb;
     e->log_user = user;
+    // Newest installed callback wins; clearing the active engine's callback
+    // detaches it so the bridge falls back to stderr.
+    if(cb)
+        g_log_engine.store(e, std::memory_order_release);
+    else if(g_log_engine.load(std::memory_order_acquire) == e)
+        g_log_engine.store(nullptr, std::memory_order_release);
 }
 
 int tjs2_exec_script(tjs2_engine *e, const char *script, const char *name,

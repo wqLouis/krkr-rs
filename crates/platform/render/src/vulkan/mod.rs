@@ -14,8 +14,8 @@
 //!   combined graphics+present queue family;
 //! * swapchain create/recreate with image views, a render pass and
 //!   framebuffers (`OUT_OF_DATE`/`SUBOPTIMAL` handled);
-//! * a staging-buffer upload path with layout transitions and sub-rectangle
-//!   (`PixelRegion`) copies;
+//! * a ring of staging-buffer upload slots with layout transitions and
+//!   sub-rectangle (`PixelRegion`) copies;
 //! * textured and solid pipelines with per-blend fixed-function state, a
 //!   host-visible unit-quad vertex buffer and per-texture descriptor sets;
 //! * a per-frame command buffer and sync objects, and full scene traversal
@@ -46,6 +46,7 @@ mod swapchain;
 mod target;
 mod texture;
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -282,6 +283,7 @@ impl VulkanPipeline {
             frames: Vec::new(),
             render_finished: Vec::new(),
             upload: None,
+            offscreen: None,
             armed: true,
         };
 
@@ -303,16 +305,28 @@ impl VulkanPipeline {
             teardown.render_finished.push(semaphore);
         }
 
-        let (upload_pool, upload_command, upload_fence) =
-            create_upload_resources(&device_bundle.device, device_bundle.queue_family_index)?;
+        let upload = texture::UploadRing::new(
+            &device_bundle.device,
+            device_bundle.queue_family_index,
+            texture::UPLOAD_SLOTS,
+        )?;
+        teardown.upload = Some(upload);
+        let (offscreen_pool, offscreen_command, offscreen_fence) =
+            create_offscreen_resources(&device_bundle.device, device_bundle.queue_family_index)?;
         // Copy the handles into the guard so a late failure frees them; ash
         // handles are cheap `Copy` values.
-        teardown.upload = Some((upload_pool, upload_fence));
+        teardown.offscreen = Some((offscreen_pool, offscreen_fence));
 
         // Success: transfer ownership to the state and disarm the guard.
         teardown.armed = false;
         let frames = std::mem::take(&mut teardown.frames);
         let render_finished = std::mem::take(&mut teardown.render_finished);
+        // The ring is not `Copy`, so it is taken back out of the guard before
+        // the guard is dropped.
+        let upload = teardown
+            .upload
+            .take()
+            .expect("the upload ring was created above");
         drop(teardown);
 
         let surface_size = (swapchain.extent.width, swapchain.extent.height);
@@ -336,10 +350,11 @@ impl VulkanPipeline {
             textures: HashMap::new(),
             offscreen: HashMap::new(),
             render_targets: HashMap::new(),
-            staging: texture::StagingBuffer::default(),
-            upload_pool,
-            upload_command,
-            upload_fence,
+            upload,
+            offscreen_pool,
+            offscreen_command,
+            offscreen_fence,
+            readback: RefCell::new(texture::StagingBuffer::default()),
             surface_size,
             frame_index: 0,
             swapchain_ready: true,
@@ -456,11 +471,9 @@ impl VulkanPipeline {
             &vstate.device,
             &self.memory_properties,
             vstate.graphics_queue,
-            vstate.upload_pool,
-            vstate.upload_command,
-            vstate.upload_fence,
-            &mut vstate.staging,
+            &mut vstate.upload,
             gpu,
+            key,
             region,
             pixels,
         )
@@ -494,6 +507,11 @@ impl VulkanPipeline {
 
     /// Renders `scene` into the offscreen `target`.
     ///
+    /// The offscreen render is synchronous: its pixels are read back by a
+    /// separate call, so the result must be complete when this returns. Any
+    /// texture upload that is still in flight is waited before recording, so
+    /// the pass samples the pixels it was given.
+    ///
     /// # Errors
     ///
     /// Returns [`RenderError::InvalidArgument`] for a mismatched backend and
@@ -516,9 +534,10 @@ impl VulkanPipeline {
         let VulkanState {
             device,
             graphics_queue,
-            upload_pool,
-            upload_command,
-            upload_fence,
+            upload,
+            offscreen_pool,
+            offscreen_command,
+            offscreen_fence,
             offscreen,
             render_targets,
             textures,
@@ -550,12 +569,13 @@ impl VulkanPipeline {
             .ok_or_else(|| RenderError::Framebuffer {
                 message: "render-target state disappeared".to_owned(),
             })?;
+        upload.wait_all(device)?;
         target::render(
             device,
             *graphics_queue,
-            *upload_pool,
-            *upload_command,
-            *upload_fence,
+            *offscreen_pool,
+            *offscreen_command,
+            *offscreen_fence,
             gpu,
             pass,
             textures,
@@ -564,6 +584,12 @@ impl VulkanPipeline {
     }
 
     /// Copies a sub-rectangle of an offscreen `target` into `out`.
+    ///
+    /// The copy is synchronous: a script observes `out` on return. The
+    /// readback buffer is reused across calls rather than allocated per call;
+    /// the readback API takes `&RenderState`, so the buffer sits behind a
+    /// `RefCell` in [`VulkanState`] and is borrowed for the duration of the
+    /// call.
     pub(crate) fn read_render_target(
         &self,
         state: &RenderState,
@@ -584,14 +610,16 @@ impl VulkanPipeline {
                     message: "render target has not been rendered yet".to_owned(),
                 })?;
         validate_readback(target.desc(), region, out.len())?;
+        let mut readback = vstate.readback.borrow_mut();
         target::read(
             &vstate.device,
             &self.memory_properties,
             vstate.graphics_queue,
-            vstate.upload_pool,
-            vstate.upload_command,
-            vstate.upload_fence,
+            vstate.offscreen_pool,
+            vstate.offscreen_command,
+            vstate.offscreen_fence,
             gpu,
+            &mut readback,
             region,
             out,
         )
@@ -761,6 +789,13 @@ impl VulkanPipeline {
                 })?;
             }
 
+            // The frame samples textures uploaded since the previous frame.
+            // Wait for those uploads before this submit so no draw observes a
+            // stale image; an upload recorded in the frame's own command buffer
+            // would not need this, but the upload API is called outside the
+            // frame (see the module's upload ring).
+            vstate.upload.wait_all(&device)?;
+
             let wait_semaphores = [image_available];
             let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
             let command_buffers = [command_buffer];
@@ -879,14 +914,19 @@ pub(crate) struct VulkanState {
     pub(crate) offscreen: HashMap<TextureFormat, target::OffscreenPass>,
     /// GPU offscreen targets keyed by [`RenderTarget`] identity.
     pub(crate) render_targets: HashMap<u64, target::VulkanRenderTarget>,
-    /// Persistent staging buffer reused by every upload.
-    pub(crate) staging: texture::StagingBuffer,
-    /// Pool and command buffer used for one-time uploads.
-    pub(crate) upload_pool: vk::CommandPool,
-    /// Persistent upload command buffer.
-    pub(crate) upload_command: vk::CommandBuffer,
-    /// Fence waited on after each upload (created signalled).
-    pub(crate) upload_fence: vk::Fence,
+    /// Ring of independently synchronised texture-upload slots.
+    pub(crate) upload: texture::UploadRing,
+    /// Pool used for one synchronous offscreen render or readback.
+    pub(crate) offscreen_pool: vk::CommandPool,
+    /// Command buffer used for one synchronous offscreen render or readback.
+    pub(crate) offscreen_command: vk::CommandBuffer,
+    /// Fence waited on after one synchronous offscreen render or readback
+    /// (created signalled).
+    pub(crate) offscreen_fence: vk::Fence,
+    /// Host-visible buffer reused by every readback; grown on demand. The
+    /// readback entry point takes `&RenderState`, so it is borrowed mutably
+    /// only for the duration of one synchronous copy.
+    pub(crate) readback: RefCell<texture::StagingBuffer>,
     /// Last reported surface size in physical pixels.
     pub(crate) surface_size: (u32, u32),
     /// Number of frames recorded through this state.
@@ -922,9 +962,10 @@ impl Drop for VulkanState {
             for semaphore in &self.render_finished {
                 self.device.destroy_semaphore(*semaphore, None);
             }
-            self.staging.destroy(&self.device);
-            self.device.destroy_command_pool(self.upload_pool, None);
-            self.device.destroy_fence(self.upload_fence, None);
+            self.upload.destroy(&self.device);
+            self.readback.get_mut().destroy(&self.device);
+            self.device.destroy_command_pool(self.offscreen_pool, None);
+            self.device.destroy_fence(self.offscreen_fence, None);
             self.surface_loader.destroy_surface(self.surface, None);
             self.device.destroy_device(None);
         }
@@ -946,7 +987,8 @@ struct BeginTeardown<'a> {
     pipelines: &'a pipelines::PipelineSet,
     frames: Vec<VulkanFrame>,
     render_finished: Vec<vk::Semaphore>,
-    upload: Option<(vk::CommandPool, vk::Fence)>,
+    upload: Option<texture::UploadRing>,
+    offscreen: Option<(vk::CommandPool, vk::Fence)>,
     armed: bool,
 }
 
@@ -960,7 +1002,10 @@ impl Drop for BeginTeardown<'_> {
         // surface is destroyed before the device.
         unsafe {
             let _ = self.device.device_wait_idle();
-            if let Some((pool, fence)) = self.upload.take() {
+            if let Some(upload) = self.upload.take() {
+                upload.destroy(self.device);
+            }
+            if let Some((pool, fence)) = self.offscreen.take() {
                 self.device.destroy_command_pool(pool, None);
                 self.device.destroy_fence(fence, None);
             }
@@ -1106,8 +1151,12 @@ fn create_frame(device: &ash::Device, queue_family_index: u32) -> Result<VulkanF
     }
 }
 
-/// Creates the reusable upload command buffer and a signalled fence.
-fn create_upload_resources(
+/// Creates the reusable offscreen command buffer and a signalled fence.
+///
+/// `render_to_target` and `read_render_target` are synchronous and never run
+/// concurrently, so they share one pool, command buffer and fence; the upload
+/// ring has its own, so an offscreen render no longer serialises uploads.
+fn create_offscreen_resources(
     device: &ash::Device,
     queue_family_index: u32,
 ) -> Result<(vk::CommandPool, vk::CommandBuffer, vk::Fence), RenderError> {
@@ -1118,7 +1167,7 @@ fn create_upload_resources(
     let pool = unsafe { device.create_command_pool(&pool_info, None) }.map_err(|error| {
         RenderError::DeviceUnavailable {
             message: format!(
-                "failed to create the upload command pool: {}",
+                "failed to create the offscreen command pool: {}",
                 device::vk_result_message(error)
             ),
         }
@@ -1135,14 +1184,14 @@ fn create_upload_resources(
             // SAFETY: owned here.
             unsafe { device.destroy_command_pool(pool, None) };
             return Err(RenderError::OutOfMemory {
-                message: "the upload pool returned no command buffer".to_owned(),
+                message: "the offscreen pool returned no command buffer".to_owned(),
             });
         }
         Err(error) => {
             // SAFETY: owned here.
             unsafe { device.destroy_command_pool(pool, None) };
             return Err(RenderError::OutOfMemory {
-                message: format!("failed to allocate the upload command buffer: {error}"),
+                message: format!("failed to allocate the offscreen command buffer: {error}"),
             });
         }
     };
@@ -1159,7 +1208,7 @@ fn create_upload_resources(
         unsafe { device.destroy_command_pool(pool, None) };
         RenderError::DeviceUnavailable {
             message: format!(
-                "failed to create the upload fence: {}",
+                "failed to create the offscreen fence: {}",
                 device::vk_result_message(error)
             ),
         }
@@ -1419,4 +1468,17 @@ fn validate_upload(
         });
     }
     Ok(())
+}
+
+/// Returns the number of texture-upload batches the Vulkan backend has
+/// submitted through `state`, or `None` when `state` is not a Vulkan state.
+///
+/// This is a diagnostic for asserting that a frame's uploads were merged: a
+/// frame that rasterizes N new glyphs should report one batch for them, not N.
+/// It is only meaningful on a machine that can create a Vulkan device.
+pub fn upload_submit_count(state: &RenderState) -> Option<u64> {
+    match &state.kind {
+        StateKind::Vulkan(vstate) => Some(vstate.upload.submits()),
+        StateKind::Null(_) => None,
+    }
 }

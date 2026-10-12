@@ -78,12 +78,20 @@ import androidx.core.content.FileProvider
 import dev.krkr.rs.ui.KrkrTheme
 import kotlinx.coroutines.launch
 import java.io.File
+import java.io.OutputStream
+import java.util.Locale
 
 /** How many lines of each log the Logs screen and crash dialogs show. */
 private const val LOG_TAIL_LINES = 400
 
 /** How many log lines to attach to an error dialog. */
 private const val ISSUE_TAIL_LINES = 25
+
+/** File name offered to the system document picker for the combined export. */
+private const val EXPORT_FILE_NAME = "krkr-rs-logs.txt"
+
+/** Cache subdirectory the full-log Share action stages its copies in. */
+private const val CACHE_DIR = "share"
 
 /**
  * The launcher: it owns the game library and nothing else.
@@ -536,9 +544,11 @@ private fun IssueDialog(
 }
 
 /**
- * The log viewer: the tail of both the launcher and the engine log, with Share
- * and Copy. This is the escape hatch that lets a user report a failure ("here,
- * send me this") without adb.
+ * The log viewer: the tail of both the launcher and the engine log for reading
+ * on screen, plus the full-log Share and Export actions. The tail Share/Copy
+ * stay for a quick paste; Share all sends every log file through the share
+ * sheet and Export writes one combined file to a folder the user picks. This is
+ * the escape hatch that lets a user report a failure without adb.
  */
 @Composable
 private fun LogsScreen(modifier: Modifier = Modifier, onNotify: (String) -> Unit) {
@@ -550,6 +560,32 @@ private fun LogsScreen(modifier: Modifier = Modifier, onNotify: (String) -> Unit
     }
     val engineTail = remember(refreshToken) {
         LauncherLog.tail(EngineDiagnostics.engineLogFile(context), LOG_TAIL_LINES)
+    }
+    val fullLog = remember(refreshToken) { fullLogSources(context) }
+    val fileSummaries = remember(refreshToken) { fullLogSummaries(fullLog) }
+
+    // The user picks the destination with the system document picker; the
+    // result is the chosen document URI, or null when they cancel.
+    val exportLog = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("text/plain"),
+    ) { uri: Uri? ->
+        if (uri == null) {
+            onNotify("Export cancelled.")
+            return@rememberLauncherForActivityResult
+        }
+        val failure = writeFullLog(context, uri)
+        if (failure != null) {
+            onNotify(failure)
+            return@rememberLauncherForActivityResult
+        }
+        val missing = missingLogNames(fullLog)
+        onNotify(
+            if (missing.isEmpty()) {
+                "Exported the full log."
+            } else {
+                "Exported the log; missing: ${missing.joinToString(", ")}."
+            },
+        )
     }
 
     Column(modifier.fillMaxSize().padding(16.dp)) {
@@ -584,6 +620,27 @@ private fun LogsScreen(modifier: Modifier = Modifier, onNotify: (String) -> Unit
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+        Spacer(Modifier.height(8.dp))
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Text(
+                text = "Full log",
+                style = MaterialTheme.typography.titleMedium,
+                modifier = Modifier.weight(1f),
+            )
+            TextButton(onClick = { onNotify(shareFullLogs(context)) }) { Text("Share all") }
+            TextButton(onClick = { exportLog.launch(EXPORT_FILE_NAME) }) { Text("Export") }
+        }
+        fileSummaries.forEach { summary ->
+            Text(
+                text = summary,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
         Spacer(Modifier.height(8.dp))
         Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
             LogSection("krkr-launcher.log", launcherTail)
@@ -658,6 +715,150 @@ private fun copyLogs(context: Context, launcherTail: String, engineTail: String)
             ClipData.newPlainText("krkr-rs logs", combineLogs(launcherTail, engineTail)),
         )
     }.onFailure { LauncherLog.e("cannot copy logs", it) }.isSuccess
+}
+
+/**
+ * One log file in the full-log export.
+ *
+ * [displayName] is the on-disk name shown to the user; [shareName] is the
+ * unambiguous name used in the cache and the share sheet, where `krkr.log` and
+ * `krkr.log.1` would otherwise be easy to confuse.
+ */
+private data class LogSource(val displayName: String, val shareName: String, val file: File)
+
+/** The complete log, newest first: both sides' current and rotated files. */
+private fun fullLogSources(context: Context): List<LogSource> = listOf(
+    LogSource("krkr.log", "krkr-engine.log", EngineDiagnostics.engineLogFile(context)),
+    LogSource("krkr.log.1", "krkr-engine.log.1", EngineDiagnostics.engineLogRotatedFile(context)),
+    LogSource("krkr-launcher.log", "krkr-launcher.log", LauncherLog.file(context)),
+    LogSource("krkr-launcher.log.1", "krkr-launcher.log.1", LauncherLog.rotatedFile(context)),
+)
+
+/** A path and size for each source, naming a file that does not exist as such. */
+private fun fullLogSummaries(sources: List<LogSource>): List<String> = sources.map { source ->
+    if (source.file.isFile) {
+        "${source.displayName} — ${formatBytes(source.file.length())} — ${source.file.absolutePath}"
+    } else {
+        "${source.displayName} — not created yet"
+    }
+}
+
+/** The display names of the sources that are absent or empty. */
+private fun missingLogNames(sources: List<LogSource>): List<String> = sources
+    .filter { !it.file.isFile || it.file.length() == 0L }
+    .map { it.displayName }
+
+/** Formats [bytes] as B, KiB or MiB for the Logs screen. */
+private fun formatBytes(bytes: Long): String {
+    val kib = bytes / 1024.0
+    val mib = kib / 1024.0
+    return when {
+        bytes < 1024 -> "$bytes B"
+        kib < 10 -> "%.1f KiB".format(Locale.US, kib)
+        kib < 1024 -> "%.0f KiB".format(Locale.US, kib)
+        else -> "%.1f MiB".format(Locale.US, mib)
+    }
+}
+
+/**
+ * Shares every present log as a file, copying each into the cache first.
+ *
+ * An absent or empty log is named as missing rather than failing the whole
+ * share; when no log exists at all, nothing is opened and the user is told.
+ * Returns the message to show, including why a share did not start.
+ */
+private fun shareFullLogs(context: Context): String {
+    val sources = fullLogSources(context)
+    val staged = mutableListOf<Uri>()
+    val missing = mutableListOf<String>()
+    var anyPresent = false
+    for (source in sources) {
+        if (!source.file.isFile || source.file.length() == 0L) {
+            missing += source.displayName
+            continue
+        }
+        anyPresent = true
+        runCatching {
+            val dir = File(context.cacheDir, CACHE_DIR).apply { mkdirs() }
+            val copy = File(dir, source.shareName)
+            source.file.copyTo(copy, overwrite = true)
+            staged += FileProvider.getUriForFile(
+                context,
+                "${context.packageName}.fileprovider",
+                copy,
+            )
+        }.onFailure {
+            LauncherLog.w("cannot stage ${source.shareName} for sharing: ${it.message}")
+            missing += source.displayName
+        }
+    }
+    if (staged.isEmpty()) {
+        return if (anyPresent) {
+            "Could not prepare the log files to share."
+        } else {
+            "There are no log files to share yet."
+        }
+    }
+    val intent = Intent(Intent.ACTION_SEND_MULTIPLE).apply {
+        type = "text/plain"
+        putExtra(Intent.EXTRA_SUBJECT, "krkr-rs logs")
+        putParcelableArrayListExtra(Intent.EXTRA_STREAM, ArrayList(staged))
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        putExtra(
+            Intent.EXTRA_TEXT,
+            if (missing.isEmpty()) {
+                "krkr-rs full logs attached."
+            } else {
+                "krkr-rs logs attached; missing: ${missing.joinToString(", ")}."
+            },
+        )
+    }
+    val opened = runCatching { context.startActivity(Intent.createChooser(intent, "Share logs")) }
+        .onFailure { LauncherLog.e("cannot share the full logs", it) }
+        .isSuccess
+    if (!opened) {
+        return "Could not open the share sheet."
+    }
+    return if (missing.isEmpty()) {
+        "Sharing the full logs."
+    } else {
+        "Sharing the logs that exist; missing: ${missing.joinToString(", ")}."
+    }
+}
+
+/**
+ * Writes one combined log to the document at [uri].
+ *
+ * Returns an error message when the document could not be written, or null on
+ * success. A missing or empty source is recorded in the file rather than
+ * aborting the export.
+ */
+private fun writeFullLog(context: Context, uri: Uri): String? {
+    val sources = fullLogSources(context)
+    return runCatching {
+        val out = context.contentResolver.openOutputStream(uri, "wt")
+            ?: error("the document provider returned no write stream")
+        out.use { writeCombinedLog(sources, it) }
+    }.fold(
+        onSuccess = { null },
+        onFailure = { error ->
+            LauncherLog.e("cannot export the logs", error)
+            "Could not write the log file: ${error.message}"
+        },
+    )
+}
+
+/** Writes [sources] to [out], each preceded by a header that names it. */
+private fun writeCombinedLog(sources: List<LogSource>, out: OutputStream) {
+    for (source in sources) {
+        out.write("===== ${source.displayName} =====\n".toByteArray(Charsets.UTF_8))
+        if (!source.file.isFile || source.file.length() == 0L) {
+            out.write("(no entries)\n\n".toByteArray(Charsets.UTF_8))
+            continue
+        }
+        source.file.inputStream().use { it.copyTo(out) }
+        out.write("\n\n".toByteArray(Charsets.UTF_8))
+    }
 }
 
 /**
@@ -795,10 +996,11 @@ private fun launchGame(
  * The runtime-settings screen: the launcher's persisted copy of the engine
  * options the player can change.
  *
- * It exposes the three options the engine honours — the frame-rate limit, the
- * presentation scaling and the archive preload — with the same accepted values
- * and range as the desktop CLI's `--fps`, `--scaling` and `preload_archives`
- * (`api::config`). Nothing is offered for a feature the engine has no knob for.
+ * It exposes the four options the engine honours — the frame-rate limit, the
+ * presentation scaling, the archive preload and the engine log level — with
+ * the same accepted values and range as the desktop CLI's `--fps`, `--scaling`
+ * and `preload_archives` (`api::config`). Nothing is offered for a feature the
+ * engine has no knob for.
  *
  * Saving writes the settings file atomically; [KrkrGameActivity] reads it and
  * publishes it over JNI on the next launch, which is why the change is described
@@ -817,6 +1019,7 @@ private fun SettingsScreen(
     var frameRate by rememberSaveable { mutableStateOf(saved.frameRate) }
     var scaling by rememberSaveable { mutableStateOf(saved.scaling) }
     var preloadArchives by rememberSaveable { mutableStateOf(saved.preloadArchives) }
+    var logLevel by rememberSaveable { mutableStateOf(saved.logLevel) }
 
     // Validate only the frame rate here: the other values can only be set from
     // their fixed controls, except when the file was hand-edited.
@@ -826,6 +1029,7 @@ private fun SettingsScreen(
     val scalingKnown = scaling in RuntimeOptions.SCALING
     val preloadKnown = preloadArchives in RuntimeOptions.PRELOAD_VALUES
     val preloadChecked = preloadArchives.toBooleanStrictOrNull() ?: false
+    val logLevelKnown = logLevel in RuntimeOptions.LOG_LEVELS
 
     Column(
         modifier = modifier.fillMaxSize().padding(16.dp).verticalScroll(rememberScrollState()),
@@ -948,11 +1152,62 @@ private fun SettingsScreen(
         }
         Spacer(Modifier.height(24.dp))
 
+        Text("Log level", style = MaterialTheme.typography.titleSmall)
+        Spacer(Modifier.height(4.dp))
+        Text(
+            "How much the engine writes to its log file (krkr.log); " +
+                "default: ${RuntimeOptions.DEFAULT_LOG_LEVEL}. " +
+                "Use debug or trace only to diagnose a problem — they log the VM's " +
+                "exception dumps and per-frame detail, which slows the game and makes " +
+                "the log grow and rotate much sooner.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Column(Modifier.selectableGroup()) {
+            RuntimeOptions.LOG_LEVELS.forEach { level ->
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .selectable(
+                            selected = logLevel == level,
+                            onClick = { logLevel = level },
+                            role = Role.RadioButton,
+                        )
+                        .padding(vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    RadioButton(selected = logLevel == level, onClick = null)
+                    Spacer(Modifier.width(8.dp))
+                    Column {
+                        Text(
+                            text = level.replaceFirstChar { it.uppercase() },
+                            style = MaterialTheme.typography.bodyLarge,
+                        )
+                        Text(
+                            text = RuntimeOptions.logLevelDescription(level),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
+        }
+        if (!logLevelKnown) {
+            Text(
+                text = "This saved value (\"$logLevel\") is not one of " +
+                    "${RuntimeOptions.LOG_LEVELS.joinToString(", ")}; choose one before saving.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+            )
+        }
+        Spacer(Modifier.height(24.dp))
+
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             TextButton(onClick = {
                 frameRate = RuntimeOptions.DEFAULT_FRAME_RATE.toString()
                 scaling = RuntimeOptions.DEFAULT_SCALING
                 preloadArchives = RuntimeOptions.DEFAULT_PRELOAD_ARCHIVES
+                logLevel = RuntimeOptions.DEFAULT_LOG_LEVEL
             }) { Text("Restore defaults") }
             Button(onClick = {
                 val fps = frameRate.trim().toIntOrNull()
@@ -971,11 +1226,16 @@ private fun SettingsScreen(
                     onNotify("Choose one of: ${RuntimeOptions.PRELOAD_VALUES.joinToString(", ")}.")
                     return@Button
                 }
+                if (logLevel !in RuntimeOptions.LOG_LEVELS) {
+                    onNotify("Choose one of: ${RuntimeOptions.LOG_LEVELS.joinToString(", ")}.")
+                    return@Button
+                }
                 if (store.write(
                         RuntimeSettings(
                             frameRate = fps.toString(),
                             scaling = scaling,
                             preloadArchives = preloadArchives,
+                            logLevel = logLevel,
                         ),
                     )
                 ) {

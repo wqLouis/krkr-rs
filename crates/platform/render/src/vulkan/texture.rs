@@ -48,14 +48,16 @@ impl VulkanTexture {
     }
 }
 
-/// Persistent host-visible staging buffer reused by every upload.
+/// Persistent host-visible staging buffer reused by one upload slot.
 ///
-/// The buffer grows geometrically and is only recreated (after the GPU is
-/// idle) when an upload needs more space, removing the per-upload allocation
-/// and destruction of the original implementation.
+/// The buffer grows geometrically and is only recreated when an upload needs
+/// more space. The owning [`UploadSlot`] waits its fence before the buffer is
+/// touched, so the old buffer is destroyed without a further wait.
 pub(crate) struct StagingBuffer {
-    buffer: vk::Buffer,
-    memory: vk::DeviceMemory,
+    /// The host-visible buffer; null until the first reserve.
+    pub(crate) buffer: vk::Buffer,
+    /// Memory backing [`Self::buffer`]; null until the first reserve.
+    pub(crate) memory: vk::DeviceMemory,
     capacity: vk::DeviceSize,
 }
 
@@ -85,29 +87,23 @@ impl StagingBuffer {
 
     /// Grows the buffer to hold at least `size` bytes.
     ///
-    /// `fence` must guard the previous upload that used this buffer; it is
-    /// waited on before the old buffer is destroyed. The caller guarantees the
-    /// fence is the upload fence and that a failure to wait is an error.
-    fn reserve(
+    /// `usage` is the buffer usage the caller will use it for. A staging
+    /// buffer is only ever a transfer source and a readback buffer only a
+    /// transfer destination, so the usage never changes after the first
+    /// reserve. The caller guarantees no GPU work still reads the old buffer;
+    /// it is therefore destroyed without a wait.
+    pub(crate) fn reserve(
         &mut self,
         device: &ash::Device,
         memory_properties: &vk::PhysicalDeviceMemoryProperties,
-        fence: vk::Fence,
         size: vk::DeviceSize,
+        usage: vk::BufferUsageFlags,
     ) -> Result<(), RenderError> {
         if self.capacity >= size {
             return Ok(());
         }
-        // SAFETY: the fence guards the previous upload that used this buffer;
-        // it is signalled once that upload completes.
-        unsafe { device.wait_for_fences(&[fence], true, u64::MAX) }.map_err(|error| {
-            RenderError::Upload {
-                message: format!("failed to wait for the upload fence: {error}"),
-            }
-        })?;
-
         let capacity = staging_capacity(size)?;
-        let (buffer, memory) = create_staging_buffer(device, memory_properties, capacity)?;
+        let (buffer, memory) = create_staging_buffer(device, memory_properties, capacity, usage)?;
         self.destroy(device);
         self.buffer = buffer;
         self.memory = memory;
@@ -157,6 +153,221 @@ impl StagingBuffer {
         unsafe { device.unmap_memory(self.memory) };
         Ok(())
     }
+}
+
+/// Number of independently synchronised texture-upload slots.
+///
+/// Two frames may be presented concurrently, so a ring of two could stall the
+/// first upload after a frame boundary on a fence the present loop has not
+/// reaped yet. A third slot absorbs that boundary, and three staging buffers
+/// is a bounded amount of host memory.
+pub(crate) const UPLOAD_SLOTS: usize = 3;
+
+/// One independently synchronised upload slot.
+struct UploadSlot {
+    /// Host-visible staging buffer reused by this slot.
+    staging: StagingBuffer,
+    /// Pool owning [`Self::command`].
+    pool: vk::CommandPool,
+    /// Command buffer one upload batch is recorded into.
+    command: vk::CommandBuffer,
+    /// Signalled when this slot's last submit completes.
+    fence: vk::Fence,
+    /// Whether [`Self::fence`] still guards unfinished GPU work.
+    in_flight: bool,
+    /// Textures touched by the in-flight batch; used to serialise two batches
+    /// that would otherwise transition the same image at the same time.
+    keys: Vec<u64>,
+    /// Number of batches submitted from this slot; a diagnostic counter.
+    submits: u64,
+}
+
+/// Round-robin ring of upload slots.
+///
+/// Each slot stages and submits one batch independently, so a batch only waits
+/// on the GPU when its slot is reused, never right after it is submitted. The
+/// ring is caller-owned state on [`VulkanState`]; there are no globals.
+pub(crate) struct UploadRing {
+    slots: Vec<UploadSlot>,
+    next: usize,
+}
+
+impl UploadRing {
+    /// Creates `count` slots whose fences start signalled.
+    pub(crate) fn new(
+        device: &ash::Device,
+        queue_family_index: u32,
+        count: usize,
+    ) -> Result<Self, RenderError> {
+        let mut slots = Vec::with_capacity(count);
+        for _ in 0..count {
+            match create_upload_slot(device, queue_family_index) {
+                Ok(slot) => slots.push(slot),
+                Err(error) => {
+                    for slot in &slots {
+                        destroy_upload_slot(device, slot);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(Self { slots, next: 0 })
+    }
+
+    /// Destroys every slot's staging buffer, command pool and fence.
+    ///
+    /// The caller guarantees every slot's fence has been waited.
+    pub(crate) fn destroy(&self, device: &ash::Device) {
+        for slot in &self.slots {
+            destroy_upload_slot(device, slot);
+        }
+    }
+
+    /// Returns the number of upload batches submitted through this ring.
+    ///
+    /// This is a diagnostic: a caller can assert that a frame's N texture
+    /// uploads were merged into one batch instead of N.
+    pub(crate) fn submits(&self) -> u64 {
+        self.slots.iter().map(|slot| slot.submits).sum()
+    }
+
+    /// Waits for every in-flight upload to complete.
+    pub(crate) fn wait_all(&mut self, device: &ash::Device) -> Result<(), RenderError> {
+        for slot in &mut self.slots {
+            if !slot.in_flight {
+                continue;
+            }
+            // SAFETY: the fence guards this slot's last submit.
+            unsafe { device.wait_for_fences(&[slot.fence], true, u64::MAX) }.map_err(|error| {
+                RenderError::Upload {
+                    message: format!("failed to wait for an upload: {error}"),
+                }
+            })?;
+            slot.in_flight = false;
+            slot.keys.clear();
+        }
+        Ok(())
+    }
+
+    /// Waits the round-robin slot if its batch is still in flight and resets
+    /// its command pool.
+    ///
+    /// When a slot still in flight touches a texture in `keys`, every in-flight
+    /// slot is waited first: two batches must not record layout transitions on
+    /// the same image concurrently.
+    fn acquire(
+        &mut self,
+        device: &ash::Device,
+        keys: &[u64],
+    ) -> Result<&mut UploadSlot, RenderError> {
+        let incoming: HashSet<u64> = keys.iter().copied().collect();
+        let overlaps = self
+            .slots
+            .iter()
+            .any(|slot| slot.in_flight && slot.keys.iter().any(|key| incoming.contains(key)));
+        if overlaps {
+            self.wait_all(device)?;
+        }
+        let index = self.next;
+        self.next = (self.next + 1) % self.slots.len();
+        let slot = &mut self.slots[index];
+        if slot.in_flight {
+            // SAFETY: the fence guards this slot's last submit.
+            unsafe { device.wait_for_fences(&[slot.fence], true, u64::MAX) }.map_err(|error| {
+                RenderError::Upload {
+                    message: format!("failed to wait for an upload slot: {error}"),
+                }
+            })?;
+            slot.in_flight = false;
+            slot.keys.clear();
+        }
+        // SAFETY: the slot's fence has been waited, so its pool is idle.
+        unsafe {
+            device
+                .reset_command_pool(slot.pool, vk::CommandPoolResetFlags::empty())
+                .map_err(|error| RenderError::Upload {
+                    message: format!("failed to reset an upload command pool: {error}"),
+                })?;
+        }
+        Ok(slot)
+    }
+}
+
+/// Creates one upload slot with a signalled fence.
+fn create_upload_slot(
+    device: &ash::Device,
+    queue_family_index: u32,
+) -> Result<UploadSlot, RenderError> {
+    let pool_info = vk::CommandPoolCreateInfo::default()
+        .queue_family_index(queue_family_index)
+        .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+    // SAFETY: `device` is live and the pool info is valid.
+    let pool = unsafe { device.create_command_pool(&pool_info, None) }.map_err(|error| {
+        RenderError::DeviceUnavailable {
+            message: format!("failed to create an upload command pool: {error}"),
+        }
+    })?;
+
+    let allocate_info = vk::CommandBufferAllocateInfo::default()
+        .command_pool(pool)
+        .level(vk::CommandBufferLevel::PRIMARY)
+        .command_buffer_count(1);
+    // SAFETY: the pool was just created.
+    let command = match unsafe { device.allocate_command_buffers(&allocate_info) } {
+        Ok(mut buffers) if !buffers.is_empty() => buffers.remove(0),
+        Ok(_) => {
+            // SAFETY: the pool is owned here.
+            unsafe { device.destroy_command_pool(pool, None) };
+            return Err(RenderError::OutOfMemory {
+                message: "the upload pool returned no command buffer".to_owned(),
+            });
+        }
+        Err(error) => {
+            // SAFETY: the pool is owned here.
+            unsafe { device.destroy_command_pool(pool, None) };
+            return Err(RenderError::OutOfMemory {
+                message: format!("failed to allocate an upload command buffer: {error}"),
+            });
+        }
+    };
+
+    // SAFETY: `device` is live.
+    let fence = match unsafe {
+        device.create_fence(
+            &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
+            None,
+        )
+    } {
+        Ok(fence) => fence,
+        Err(error) => {
+            // SAFETY: the pool is owned here.
+            unsafe { device.destroy_command_pool(pool, None) };
+            return Err(RenderError::DeviceUnavailable {
+                message: format!("failed to create an upload fence: {error}"),
+            });
+        }
+    };
+
+    Ok(UploadSlot {
+        staging: StagingBuffer::default(),
+        pool,
+        command,
+        fence,
+        in_flight: false,
+        keys: Vec::new(),
+        submits: 0,
+    })
+}
+
+/// Destroys one upload slot's fence, command pool and staging buffer.
+fn destroy_upload_slot(device: &ash::Device, slot: &UploadSlot) {
+    // SAFETY: all handles were created by `device`; the caller guarantees the
+    // slot's fence has been waited.
+    unsafe {
+        device.destroy_fence(slot.fence, None);
+        device.destroy_command_pool(slot.pool, None);
+    }
+    slot.staging.destroy(device);
 }
 
 /// Returns the capacity to allocate for a staging buffer holding at least
@@ -352,18 +563,16 @@ pub(crate) fn create_texture(
 
 /// Copies a tightly packed sub-rectangle of `pixels` into `texture`.
 ///
-/// The command pool must not have any command buffers in flight; the function
-/// resets it, records, submits to `queue` and waits for `fence`.
+/// The batch is staged and submitted to a free slot of `ring` without waiting.
+/// `key` identifies `texture` so two uploads to the same image are serialised.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn upload(
     device: &ash::Device,
     memory_properties: &vk::PhysicalDeviceMemoryProperties,
     queue: vk::Queue,
-    command_pool: vk::CommandPool,
-    command_buffer: vk::CommandBuffer,
-    fence: vk::Fence,
-    staging: &mut StagingBuffer,
+    ring: &mut UploadRing,
     texture: &mut VulkanTexture,
+    key: u64,
     region: PixelRegion,
     pixels: &[u8],
 ) -> Result<(), RenderError> {
@@ -371,24 +580,40 @@ pub(crate) fn upload(
     if total == 0 {
         return Ok(());
     }
-    staging.reserve(device, memory_properties, fence, total as vk::DeviceSize)?;
+    // A single upload is a one-element batch, so it shares the batch's
+    // staging, recording and image-layout rules.
     let uploads = [TextureUpload {
-        key: 0,
+        key,
         region,
         pixels,
     }];
     let offsets = [0usize];
-    staging.write(device, total, &uploads, &offsets)?;
-
-    let staging_buffer = staging.buffer;
     let first_upload = !texture.uploaded;
-    let result = record_and_submit(device, queue, command_pool, command_buffer, fence, |cb| {
-        record_copy(device, cb, staging_buffer, texture, region, 0, first_upload);
-        Ok(())
-    });
-    // A failure can leave the image mid-transition, so the next upload starts
-    // from `UNDEFINED` and the texture stays unrenderable until then.
-    texture.uploaded = result.is_ok();
+    let result = submit_batch(
+        device,
+        memory_properties,
+        queue,
+        ring,
+        &[key],
+        &uploads,
+        &offsets,
+        total,
+        |command_buffer, staging_buffer| {
+            record_copy(
+                device,
+                command_buffer,
+                staging_buffer,
+                texture,
+                region,
+                0,
+                first_upload,
+            );
+            Ok(())
+        },
+    );
+    if result.is_ok() {
+        texture.uploaded = true;
+    }
     result
 }
 
@@ -406,21 +631,18 @@ pub(crate) struct TextureUpload<'a> {
 }
 
 /// Copies a batch of sub-rectangles into their textures with one staging
-/// reserve, one command buffer, one submit and one fence wait.
+/// reserve, one command buffer and one submit, without waiting for the GPU.
 ///
 /// Every destination must already exist in `textures` and every `region` must
-/// have been validated against its texture. The staging buffer is reused, so
-/// only one batch is in flight at a time: the wait at the end of the call is
-/// what lets the next batch rewrite it.
+/// have been validated against its texture. Waiting happens in [`UploadRing`]
+/// only when a slot is reused or when `wait_all` asks the present path for the
+/// pixels.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn upload_batch(
     device: &ash::Device,
     memory_properties: &vk::PhysicalDeviceMemoryProperties,
     queue: vk::Queue,
-    command_pool: vk::CommandPool,
-    command_buffer: vk::CommandBuffer,
-    fence: vk::Fence,
-    staging: &mut StagingBuffer,
+    ring: &mut UploadRing,
     textures: &mut HashMap<u64, VulkanTexture>,
     uploads: &[TextureUpload<'_>],
 ) -> Result<(), RenderError> {
@@ -429,43 +651,129 @@ pub(crate) fn upload_batch(
     }
 
     let (offsets, total) = staging_layout(uploads)?;
-    staging.reserve(device, memory_properties, fence, total as vk::DeviceSize)?;
-    staging.write(device, total, uploads, &offsets)?;
-
-    let staging_buffer = staging.buffer;
+    let keys: Vec<u64> = uploads.iter().map(|upload| upload.key).collect();
     // A texture repeated in one batch is only in `UNDEFINED` for its first
     // copy; every later copy starts from the sampled layout the previous
     // transition left behind.
     let mut seen: HashSet<u64> = HashSet::with_capacity(uploads.len());
-    let result = record_and_submit(device, queue, command_pool, command_buffer, fence, |cb| {
-        for (upload, &offset) in uploads.iter().zip(&offsets) {
-            let gpu = textures
-                .get_mut(&upload.key)
-                .ok_or_else(|| RenderError::Upload {
-                    message: "texture state disappeared during upload".to_owned(),
-                })?;
-            let first_upload = !gpu.uploaded && seen.insert(upload.key);
-            record_copy(
-                device,
-                cb,
-                staging_buffer,
-                gpu,
-                upload.region,
-                offset as vk::DeviceSize,
-                first_upload,
-            );
-        }
-        Ok(())
-    });
+    let result = submit_batch(
+        device,
+        memory_properties,
+        queue,
+        ring,
+        &keys,
+        uploads,
+        &offsets,
+        total,
+        |command_buffer, staging_buffer| {
+            for (upload, &offset) in uploads.iter().zip(&offsets) {
+                let gpu = textures
+                    .get_mut(&upload.key)
+                    .ok_or_else(|| RenderError::Upload {
+                        message: "texture state disappeared during upload".to_owned(),
+                    })?;
+                let first_upload = !gpu.uploaded && seen.insert(upload.key);
+                record_copy(
+                    device,
+                    command_buffer,
+                    staging_buffer,
+                    gpu,
+                    upload.region,
+                    offset as vk::DeviceSize,
+                    first_upload,
+                );
+            }
+            Ok(())
+        },
+    );
 
-    // A failure can leave an image mid-transition, so every texture in the
-    // batch is marked unrenderable and re-uploaded from `UNDEFINED` next time.
-    for upload in uploads {
-        if let Some(gpu) = textures.get_mut(&upload.key) {
-            gpu.uploaded = result.is_ok();
+    // The images stay sampleable if the submit failed: nothing reached the
+    // queue, so their recorded transitions never ran.
+    if result.is_ok() {
+        for upload in uploads {
+            if let Some(gpu) = textures.get_mut(&upload.key) {
+                gpu.uploaded = true;
+            }
         }
     }
     result
+}
+
+/// Stages `uploads` in a free ring slot and submits them without waiting.
+///
+/// `record` receives the recording command buffer and the staging buffer it
+/// must copy from. Nothing is submitted when `record` fails, so the slot's
+/// fence stays signalled and the slot is reusable.
+#[allow(clippy::too_many_arguments)]
+fn submit_batch<F>(
+    device: &ash::Device,
+    memory_properties: &vk::PhysicalDeviceMemoryProperties,
+    queue: vk::Queue,
+    ring: &mut UploadRing,
+    keys: &[u64],
+    uploads: &[TextureUpload<'_>],
+    offsets: &[usize],
+    total: usize,
+    record: F,
+) -> Result<(), RenderError>
+where
+    F: FnOnce(vk::CommandBuffer, vk::Buffer) -> Result<(), RenderError>,
+{
+    let slot = ring.acquire(device, keys)?;
+    slot.staging.reserve(
+        device,
+        memory_properties,
+        total as vk::DeviceSize,
+        vk::BufferUsageFlags::TRANSFER_SRC,
+    )?;
+    slot.staging.write(device, total, uploads, offsets)?;
+    let staging_buffer = slot.staging.buffer;
+
+    // SAFETY: the slot's pool was reset by `acquire` and the command buffer is
+    // idle.
+    unsafe {
+        let begin_info = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        device
+            .begin_command_buffer(slot.command, &begin_info)
+            .map_err(|error| RenderError::Upload {
+                message: format!("failed to begin an upload command buffer: {error}"),
+            })?;
+    }
+
+    // A recording failure leaves the command buffer unsubmitted, so the fence
+    // stays signalled and the slot is reusable.
+    record(slot.command, staging_buffer)?;
+
+    // SAFETY: the command buffer is recording and was begun above. The fence
+    // is reset only immediately before the submit so an earlier error leaves
+    // it signalled and the slot reusable. A failed submit leaves the fence
+    // unsignalled but `in_flight` false, so no later wait hangs on it.
+    unsafe {
+        device
+            .end_command_buffer(slot.command)
+            .map_err(|error| RenderError::Upload {
+                message: format!("failed to end an upload command buffer: {error}"),
+            })?;
+        device
+            .reset_fences(&[slot.fence])
+            .map_err(|error| RenderError::Upload {
+                message: format!("failed to reset an upload fence: {error}"),
+            })?;
+        let command_buffers = [slot.command];
+        let submit = vk::SubmitInfo::default().command_buffers(&command_buffers);
+        device
+            .queue_submit(queue, &[submit], slot.fence)
+            .map_err(|error| RenderError::Upload {
+                message: format!("failed to submit an upload: {error}"),
+            })?;
+    }
+
+    slot.in_flight = true;
+    slot.keys.clear();
+    slot.keys.extend_from_slice(keys);
+    slot.submits = slot.submits.saturating_add(1);
+    Ok(())
 }
 
 /// Returns the staging offset of every upload and the total byte count.
@@ -571,8 +879,10 @@ impl VulkanPipeline {
     /// Copies every upload's sub-rectangle into its texture as one batch.
     ///
     /// Every region is validated and every destination image created before
-    /// the batch is staged, recorded and submitted, so a frame's dirty
-    /// bitmaps pay a single GPU wait instead of one per texture.
+    /// the batch is staged, recorded and submitted to a free upload slot. The
+    /// call does not wait for that submit; the present path waits for the
+    /// uploads it is about to sample (or a later upload to the same texture
+    /// waits when it reuses an in-flight slot).
     pub(crate) fn upload_textures(
         &self,
         state: &mut RenderState,
@@ -615,10 +925,7 @@ impl VulkanPipeline {
         let VulkanState {
             device,
             graphics_queue,
-            upload_pool,
-            upload_command,
-            upload_fence,
-            staging,
+            upload,
             textures,
             ..
         } = &mut **vstate;
@@ -626,10 +933,7 @@ impl VulkanPipeline {
             device,
             &self.memory_properties,
             *graphics_queue,
-            *upload_pool,
-            *upload_command,
-            *upload_fence,
-            staging,
+            upload,
             textures,
             &batch,
         )
@@ -641,10 +945,11 @@ fn create_staging_buffer(
     device: &ash::Device,
     memory_properties: &vk::PhysicalDeviceMemoryProperties,
     size: vk::DeviceSize,
+    usage: vk::BufferUsageFlags,
 ) -> Result<(vk::Buffer, vk::DeviceMemory), RenderError> {
     let buffer_info = vk::BufferCreateInfo::default()
         .size(size)
-        .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+        .usage(usage)
         .sharing_mode(vk::SharingMode::EXCLUSIVE);
     // SAFETY: `buffer_info` borrows a local valid for the call.
     let buffer = unsafe { device.create_buffer(&buffer_info, None) }.map_err(|error| {
@@ -734,73 +1039,6 @@ fn transition_image(
             &[barrier],
         );
     }
-}
-
-/// Records `record` into a one-time command buffer and submits it.
-pub(crate) fn record_and_submit<F>(
-    device: &ash::Device,
-    queue: vk::Queue,
-    command_pool: vk::CommandPool,
-    command_buffer: vk::CommandBuffer,
-    fence: vk::Fence,
-    record: F,
-) -> Result<(), RenderError>
-where
-    F: FnOnce(vk::CommandBuffer) -> Result<(), RenderError>,
-{
-    // SAFETY: the caller guarantees no command buffers from this pool are in
-    // flight; the fence was created signalled so the first wait returns.
-    unsafe {
-        device
-            .wait_for_fences(&[fence], true, u64::MAX)
-            .map_err(|error| RenderError::Upload {
-                message: format!("failed to wait for the upload fence: {error}"),
-            })?;
-        device
-            .reset_command_pool(command_pool, vk::CommandPoolResetFlags::empty())
-            .map_err(|error| RenderError::Upload {
-                message: format!("failed to reset the upload command pool: {error}"),
-            })?;
-        let begin_info = vk::CommandBufferBeginInfo::default()
-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        device
-            .begin_command_buffer(command_buffer, &begin_info)
-            .map_err(|error| RenderError::Upload {
-                message: format!("failed to begin the upload command buffer: {error}"),
-            })?;
-    }
-
-    record(command_buffer)?;
-
-    // SAFETY: the command buffer is recording and was begun above. The fence
-    // is reset only immediately before the submit so an earlier error leaves
-    // it signalled and the frame slot reusable.
-    unsafe {
-        device
-            .end_command_buffer(command_buffer)
-            .map_err(|error| RenderError::Upload {
-                message: format!("failed to end the upload command buffer: {error}"),
-            })?;
-        device
-            .reset_fences(&[fence])
-            .map_err(|error| RenderError::Upload {
-                message: format!("failed to reset the upload fence: {error}"),
-            })?;
-        let command_buffers = [command_buffer];
-        let submit = vk::SubmitInfo::default().command_buffers(&command_buffers);
-        device
-            .queue_submit(queue, &[submit], fence)
-            .map_err(|error| RenderError::Upload {
-                message: format!("failed to submit the upload: {error}"),
-            })?;
-        device
-            .wait_for_fences(&[fence], true, u64::MAX)
-            .map_err(|error| RenderError::Upload {
-                message: format!("failed to wait for the upload: {error}"),
-            })?;
-    }
-
-    Ok(())
 }
 
 /// Finds a memory type satisfying `properties` among `type_bits`.

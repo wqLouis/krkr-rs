@@ -228,4 +228,89 @@ mod tests {
             "VmHost::drop must drop the native dispatch state"
         );
     }
+
+    /// A caught script exception travels the full path: the VM's spdlog
+    /// record is bridged to the engine callback, which the host routes to
+    /// the `log` crate. The record must be DEBUG and carry the exception
+    /// message. Reference: `reference/cpp/core/tjs2/tjsInterCodeExec.cpp:1311`.
+    #[test]
+    fn caught_exception_reaches_the_engine_log() {
+        use std::cell::RefCell;
+        use std::ffi::{c_char, c_int, c_void};
+        use tjs::{NativeClassBuilder, NativeMethodDef, Value};
+
+        thread_local! {
+            static LINES: RefCell<Vec<String>> =
+                const { RefCell::new(Vec::new()) };
+        }
+        struct CaptureLogger;
+        impl log::Log for CaptureLogger {
+            fn enabled(&self, _metadata: &log::Metadata) -> bool {
+                true
+            }
+            fn log(&self, record: &log::Record) {
+                LINES.with(|lines| {
+                    lines
+                        .borrow_mut()
+                        .push(format!("{} {}", record.level(), record.args()));
+                });
+            }
+            fn flush(&self) {}
+        }
+        static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        ONCE.get_or_init(|| {
+            let _ = log::set_boxed_logger(Box::new(CaptureLogger));
+            log::set_max_level(log::LevelFilter::Debug);
+        });
+
+        // A native that always fails: the VM raises it as an `eTJS` error,
+        // so a surrounding `try` reaches the logging catch arm.
+        extern "C" fn boom(
+            _engine: *mut c_void,
+            _argc: c_int,
+            _argv: *const Value,
+            _out: *mut Value,
+            out_error: *mut *mut c_char,
+        ) -> c_int {
+            const MSG: &[u8] = b"boom-message\0";
+            // SAFETY: tjs2_malloc returns a writable buffer of the requested
+            // size, and out_error is a valid slot for the call.
+            unsafe {
+                let p = tjs::tjs2_malloc(MSG.len()) as *mut u8;
+                std::ptr::copy_nonoverlapping(MSG.as_ptr(), p, MSG.len());
+                *out_error = p as *mut c_char;
+            }
+            1
+        }
+
+        let _lock = testkit::vm_lock();
+        let host = VmHost::with_default().expect("vm host");
+        host.engine()
+            .register_native_class(&NativeClassBuilder {
+                name: "Boom",
+                methods: vec![NativeMethodDef {
+                    name: "fire",
+                    f: boom,
+                }],
+                properties: Vec::new(),
+            })
+            .expect("register Boom");
+
+        LINES.with(|lines| lines.borrow_mut().clear());
+        host.exec(
+            "var r = 0; try { Boom.fire(); } catch(e) { r = 1; }",
+            "test",
+        )
+        .expect("exec");
+        assert_eq!(host.eval("r", "test").unwrap(), TjsValue::Integer(1));
+
+        let lines = LINES.with(|lines| lines.borrow().clone());
+        // The bare message is the record the spdlog bridge adds; a debug-mode
+        // build also emits a `... at position` console record, which does not
+        // match exactly.
+        assert!(
+            lines.iter().any(|line| line == "DEBUG tjs: boom-message"),
+            "the caught exception must reach the engine log: {lines:?}"
+        );
+    }
 }

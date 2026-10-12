@@ -209,8 +209,6 @@ was inspected and needed no change (§2).
     remain the single largest startup latency opportunity and are outside this
     pass's ownership.
 
----
-
 ## 5. Files changed
 
 | File | Change |
@@ -229,3 +227,37 @@ green (all test binaries, 0 failures); `cargo clippy -p tvp-sound -p render
 applied. `render`/`tvp-visual` were not modified by this pass — their sources
 were being edited concurrently by other agents, so the full run was re-taken
 after their in-progress edit settled.
+
+---
+
+## 6. Reading a slow run on a device
+
+The Android build logs at `info` into `<filesDir>/krkr.log`, which the
+launcher's Logs screen reads; `debug`/`trace` are selectable in the launcher
+settings. Two families of lines carry the timing:
+
+* **Per-frame attribution.** A frame whose wall-clock gap reaches 250 ms (the
+  audio drain's playback cap, so it is the same frame that logs the existing
+  `audio: ... exceeds the ... playback cap` warning) logs exactly one `warn`
+  line naming every phase and the render-host costs, for example:
+
+  ```text
+  WARN frame 812 slow: gap=668.8 ms since the previous frame; timer=0.3 sound=1.2 video=0.0 async=0.1 continuous=2.4 project_and_render=3.1 body=7.1; audio=0.9 host_sync=4.0 host_project=2.0 host_render=610.0 total=624.5 ms
+  ```
+
+  `gap` is the platform's wall-clock frame period. The six frame-body
+  phases — `timer`, `sound`, `video`, `async`, `continuous`,
+  `project_and_render` — are measured by `run_frame_body`; `audio`,
+  `host_sync`, `host_project` and `host_render` cover the work outside it
+  (mixer drain, dirty-bitmap upload, scene projection, pipeline render). A
+  fast frame logs nothing.
+
+* **Start-up aggregates.** After the startup scripts run, four `info` lines
+  report archives mounted (count, index entries, bytes, milliseconds), images
+  decoded, decoders opened, and entry scripts; the first frame then logs
+  `startup: first frame N ms after open`.
+
+Read the per-frame line first. If `host_render` (or `host_sync`) dominates
+with a small `body`, the cost is in the render host; if one poll phase
+dominates, it is in that poll. The start-up lines separate mount/index parse,
+decode, decoder open and script execution.

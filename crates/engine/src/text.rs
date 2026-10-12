@@ -69,6 +69,7 @@
 //! no globals, no statics and no hidden caches.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use api::geometry::{PixelRegion, RectF};
@@ -92,9 +93,20 @@ use cosmic_text::{Attrs, Buffer, Family, FontSystem as CosmicFontSystem, Metrics
 /// ([`TextEngine`]) and the glyph atlas' entry map ([`GlyphAtlas`]).
 pub const MAX_TEXT_CACHE_ENTRIES: usize = 1300;
 
-/// Preferred Japanese-capable CJK sans face used when a requested family is
-/// not installed on the host.
-const NOTO_SANS_CJK_JP: &str = "Noto Sans CJK JP";
+/// Japanese/Chinese/Korean-capable fallback families, tried in order when a
+/// requested family is not installed on the host.
+///
+/// The reference ships a bundled `NotoSansCJK-Regular.ttc` as its default face
+/// (`reference/cpp/core/visual/FontImpl.cpp:220-243`); the shipped Android build
+/// bundles `DroidSansFallback.ttf` instead. Both are reached here by family
+/// name when the host's system fonts carry them.
+const CJK_FALLBACK_FAMILIES: &[&str] = &[
+    "Noto Sans CJK JP",
+    "Noto Sans CJK SC",
+    "Noto Sans CJK TC",
+    "Noto Sans CJK KR",
+    "Droid Sans Fallback",
+];
 
 /// Well-known Noto CJK collection paths, tried when the family query misses.
 const KNOWN_JP_PATHS: &[&str] = &[
@@ -399,6 +411,13 @@ pub struct TextEngine {
     /// It is kept separate from the shaping database so that only explicitly
     /// resolved faces participate in layout.
     system_fonts: Option<fontdb::Database>,
+    /// System-font directories the host supplied through
+    /// [`TextEngine::set_system_font_dirs`]. They are scanned, in addition to
+    /// `fontdb`'s default locations, when the system database is first built.
+    system_font_dirs: Vec<PathBuf>,
+    /// Whether the "resolved to the engine default face" fallback has been
+    /// logged. The record is emitted once per engine, not once per name.
+    default_fallback_logged: bool,
     /// Memoized shaped layouts, keyed by shaping inputs only. Bounded at the
     /// reference limit with least-recently-used eviction.
     layout_cache: LruCache<LayoutKey, TextLayout>,
@@ -421,8 +440,21 @@ impl TextEngine {
             faces: Vec::new(),
             by_name: HashMap::new(),
             system_fonts: None,
+            system_font_dirs: Vec::new(),
+            default_fallback_logged: false,
             layout_cache: LruCache::new(MAX_TEXT_CACHE_ENTRIES),
         }
+    }
+
+    /// Selects the host's system-font directories.
+    ///
+    /// The directories are scanned lazily, the first time a face is resolved
+    /// from the host, together with `fontdb`'s default system locations. A
+    /// database built before this call is discarded so the new list takes
+    /// effect; call it before any face has been resolved to avoid the rescan.
+    pub fn set_system_font_dirs(&mut self, dirs: Vec<PathBuf>) {
+        self.system_font_dirs = dirs;
+        self.system_fonts = None;
     }
 
     /// Registers a font face from `bytes` (a TTF/OTF, or a TTC/OTC with
@@ -474,8 +506,9 @@ impl TextEngine {
     ///
     /// The family is matched case-insensitively, including the localized
     /// family names in the font's name table. When nothing matches, the
-    /// Japanese-capable CJK fallback is used (`Noto Sans CJK JP`, then the
-    /// well-known Noto CJK collection paths). Only the resolved face is
+    /// Japanese/CJK fallback families are tried (`Noto Sans CJK JP` and the
+    /// other `Noto Sans CJK` regions, then `Droid Sans Fallback`), then the
+    /// well-known Noto CJK collection paths. Only the resolved face is
     /// loaded into the shaping database, so layout never picks up an
     /// unrelated system font.
     ///
@@ -513,17 +546,28 @@ impl TextEngine {
     }
 
     /// Reads the bytes and collection index of the system face matching
-    /// `family`. With `fallback`, a missing family falls back to the
-    /// Japanese-capable CJK face.
+    /// `family`. With `fallback`, a missing family falls back through
+    /// [`CJK_FALLBACK_FAMILIES`] and the well-known Noto CJK paths.
     fn system_face_bytes(
         &mut self,
         family: &str,
         fallback: bool,
     ) -> Result<(Vec<u8>, u32), TextError> {
-        let system = self.system_fonts.get_or_insert_with(load_system_database);
+        if self.system_fonts.is_none() {
+            self.system_fonts = Some(load_system_database(&self.system_font_dirs));
+        }
+        let system = self
+            .system_fonts
+            .as_mut()
+            .ok_or_else(|| TextError::FontNotFound {
+                family: family.to_string(),
+            })?;
         let matched = if fallback {
-            let named =
-                find_family(system, family).or_else(|| find_family(system, NOTO_SANS_CJK_JP));
+            let named = find_family(system, family).or_else(|| {
+                CJK_FALLBACK_FAMILIES
+                    .iter()
+                    .find_map(|candidate| find_family(system, candidate))
+            });
             named.or_else(|| load_known_jp_path(system))
         } else {
             find_family(system, family)
@@ -562,9 +606,20 @@ impl TextEngine {
     }
 
     /// Returns the first registered face, the fallback for a face that cannot
-    /// be resolved.
-    pub fn default_font(&self) -> Option<FontId> {
-        (!self.faces.is_empty()).then_some(FontId(0))
+    /// be resolved, and notes that `family` used it.
+    ///
+    /// The reference substitutes its default face silently
+    /// (`reference/cpp/core/visual/FontImpl.cpp:159-168`), so the first such
+    /// fallback is logged once per engine rather than once per name.
+    pub fn default_font_for(&mut self, family: &str) -> Option<FontId> {
+        if self.faces.is_empty() {
+            return None;
+        }
+        if !self.default_fallback_logged {
+            self.default_fallback_logged = true;
+            log::info!("system fonts: face '{family}' resolved to the engine default face");
+        }
+        Some(FontId(0))
     }
 
     /// Returns the L1 metrics of `id` at `size_px`.
@@ -798,10 +853,44 @@ impl Default for TextEngine {
 }
 
 /// Builds the host font database used by [`TextEngine::load_system_font`].
-fn load_system_database() -> fontdb::Database {
+///
+/// `fontdb`'s own scan knows the Windows, macOS and Unix font directories but
+/// excludes Android, so `dirs` (the host's system-font directories, supplied
+/// through [`TextEngine::set_system_font_dirs`]) is scanned in addition. The
+/// resulting face count and directory count are logged at `info`, once per
+/// engine, so a missing font source is visible in the log rather than only in a
+/// later failure.
+fn load_system_database(dirs: &[PathBuf]) -> fontdb::Database {
     let mut db = fontdb::Database::new();
     db.load_system_fonts();
+    let directories = load_font_directories(&mut db, dirs);
+    let faces = db.len();
+    if faces == 0 {
+        log::info!(
+            "system fonts: no fonts found in any of {directories} directories; \
+             text has no face to fall back to"
+        );
+    } else {
+        log::info!("system fonts: {faces} faces from {directories} directories");
+    }
     db
+}
+
+/// Scans the font files in every existing directory of `dirs` into `db` and
+/// returns how many directories existed.
+///
+/// A directory that is not present is skipped: the platform list names
+/// locations a device may not mount, and an absent directory is an absent
+/// source rather than an error.
+fn load_font_directories(db: &mut fontdb::Database, dirs: &[PathBuf]) -> usize {
+    let mut directories = 0;
+    for dir in dirs {
+        if dir.is_dir() {
+            db.load_fonts_dir(dir);
+            directories += 1;
+        }
+    }
+    directories
 }
 
 /// Finds the face whose family name equals `family` case-insensitively.
@@ -892,9 +981,11 @@ impl AtlasGlyph {
 /// A glyph atlas: an L2-owned RGBA texture plus its CPU mirror and cache.
 ///
 /// Glyphs are packed left-to-right, top-to-bottom, one pixel apart to avoid
-/// bilinear bleeding. Adding a new glyph uploads only its sub-rectangle with
-/// [`render::upload_texture`]; the CPU mirror is kept so the same pixels can be
-/// composited for CPU readback and re-uploaded after a render-state recreation.
+/// bilinear bleeding. Rasterizing a glyph writes its sub-rectangle into the CPU
+/// mirror and records the region as pending; [`GlyphAtlas::flush`] uploads
+/// every pending region as one [`render::upload_textures`] batch. The CPU
+/// mirror is kept coherent with the GPU so the same pixels can be composited
+/// for CPU readback and re-uploaded after a render-state recreation.
 ///
 /// The entry map is bounded at [`MAX_TEXT_CACHE_ENTRIES`] and evicts the least
 /// recently used glyph, the same bound and policy as [`TextCoverageCache`] and
@@ -920,6 +1011,16 @@ pub struct GlyphAtlas {
     /// Rasterized glyphs, keyed by face/codepoint/size/style and evicted least
     /// recently used at the reference limit.
     entries: LruCache<GlyphKey, AtlasGlyph>,
+    /// Regions written to the CPU mirror but not yet copied to the GPU.
+    pending: Vec<PendingGlyphUpload>,
+}
+
+/// One rasterized glyph region waiting for its GPU copy.
+struct PendingGlyphUpload {
+    /// Sub-rectangle of the atlas holding the pixels.
+    region: PixelRegion,
+    /// Tightly packed straight-alpha RGBA pixels for `region`.
+    pixels: Vec<u8>,
 }
 
 impl GlyphAtlas {
@@ -944,6 +1045,7 @@ impl GlyphAtlas {
             cursor_y: 0,
             row_height: 0,
             entries: LruCache::new(MAX_TEXT_CACHE_ENTRIES),
+            pending: Vec::new(),
         })
     }
 
@@ -960,6 +1062,7 @@ impl GlyphAtlas {
         self.cursor_x = 0;
         self.cursor_y = 0;
         self.row_height = 0;
+        self.pending.clear();
     }
 
     /// Returns the atlas texture handle.
@@ -987,20 +1090,29 @@ impl GlyphAtlas {
         self.entries.is_empty()
     }
 
+    /// Returns the number of rasterized regions waiting for
+    /// [`GlyphAtlas::flush`].
+    ///
+    /// This is a diagnostic: a caller can check that a run of text queued its
+    /// glyphs for one batch instead of uploading each glyph separately.
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
     /// Rasterizes `codepoint` (if needed) and packs it into the atlas.
     ///
     /// The glyph is cached by face, code point, size and style (never colour),
     /// so a repeated request does not re-rasterize or re-upload and a colour
-    /// change reuses the cached coverage.
+    /// change reuses the cached coverage. The new region is written to the CPU
+    /// mirror and queued for [`GlyphAtlas::flush`]; it is not copied to the GPU
+    /// until that flush.
     ///
     /// # Errors
     ///
-    /// Returns [`TextError::UnknownFont`], [`TextError::Glyph`],
-    /// [`TextError::AtlasFull`] or [`TextError::Render`].
+    /// Returns [`TextError::UnknownFont`], [`TextError::Glyph`] or
+    /// [`TextError::AtlasFull`].
     pub fn glyph(
         &mut self,
-        pipeline: &RenderPipeline,
-        state: &mut RenderState,
         engine: &TextEngine,
         font: FontId,
         codepoint: char,
@@ -1050,7 +1162,10 @@ impl GlyphAtlas {
             let rgba = coverage_rgba(&bitmap);
             self.blit(x, y, bitmap.width, bitmap.height, &rgba);
             let region = PixelRegion::new(x, y, bitmap.width, bitmap.height);
-            render::upload_texture(pipeline, state, &self.texture, region, &rgba)?;
+            self.pending.push(PendingGlyphUpload {
+                region,
+                pixels: rgba,
+            });
             AtlasGlyph {
                 region,
                 bearing_x: bitmap.bearing_x,
@@ -1064,12 +1179,51 @@ impl GlyphAtlas {
         Ok(entry)
     }
 
-    /// Rasterizes every glyph of `layout` and returns them positioned for
-    /// projection or CPU composition.
+    /// Copies every region rasterized since the last flush to the atlas texture
+    /// as one [`render::upload_textures`] batch.
+    ///
+    /// On success the pending list is cleared; on failure it is kept so the
+    /// caller can retry. [`GlyphAtlas::glyph`] updates the CPU mirror
+    /// regardless, so CPU readback stays coherent whether or not the GPU copy
+    /// has happened.
     ///
     /// # Errors
     ///
-    /// Propagates the same errors as [`GlyphAtlas::glyph`].
+    /// Returns [`TextError::Render`] when the backend rejects the batch.
+    pub fn flush(
+        &mut self,
+        pipeline: &RenderPipeline,
+        state: &mut RenderState,
+    ) -> Result<(), TextError> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let uploads: Vec<render::TextureUpload<'_>> = self
+            .pending
+            .iter()
+            .map(|pending| render::TextureUpload {
+                texture: &self.texture,
+                region: pending.region,
+                pixels: &pending.pixels,
+            })
+            .collect();
+        render::upload_textures(pipeline, state, &uploads)?;
+        drop(uploads);
+        self.pending.clear();
+        Ok(())
+    }
+
+    /// Rasterizes every glyph of `layout` and returns them positioned for
+    /// projection or CPU composition.
+    ///
+    /// Every new glyph in the layout is uploaded by a single
+    /// [`GlyphAtlas::flush`] at the end, so a line of N new glyphs costs one
+    /// GPU batch rather than N.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the same errors as [`GlyphAtlas::glyph`] and
+    /// [`GlyphAtlas::flush`].
     pub fn rasterize_layout(
         &mut self,
         pipeline: &RenderPipeline,
@@ -1081,7 +1235,7 @@ impl GlyphAtlas {
     ) -> Result<Vec<PositionedGlyph>, TextError> {
         let mut positioned = Vec::with_capacity(layout.glyphs.len());
         for glyph in &layout.glyphs {
-            let entry = self.glyph(pipeline, state, engine, glyph.font, glyph.codepoint, style)?;
+            let entry = self.glyph(engine, glyph.font, glyph.codepoint, style)?;
             positioned.push(PositionedGlyph {
                 glyph: entry,
                 x: glyph.x,
@@ -1090,6 +1244,7 @@ impl GlyphAtlas {
                 color: style.color,
             });
         }
+        self.flush(pipeline, state)?;
         Ok(positioned)
     }
 
@@ -2165,6 +2320,83 @@ mod tests {
             Err(TextError::FontNotFound { .. }) => {}
             Err(error) => panic!("unexpected error: {error}"),
         }
+    }
+
+    /// Copies the first available test font into a fresh temporary directory
+    /// and returns the directory plus the family name `fontdb` reports for
+    /// it. `None` when the host has no usable test font.
+    fn explicit_font_dir_fixture() -> Option<(PathBuf, String)> {
+        let path = TEST_FONT_PATHS
+            .iter()
+            .map(PathBuf::from)
+            .find(|path| path.is_file())?;
+        let mut probe = fontdb::Database::new();
+        let ids = probe.load_font_source(fontdb::Source::File(path.clone()));
+        let family = ids.into_iter().find_map(|id| {
+            probe
+                .face(id)
+                .and_then(|face| face.families.first().map(|(name, _)| name.clone()))
+        })?;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0);
+        let dir =
+            std::env::temp_dir().join(format!("krkr-text-fonts-{}-{stamp}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok()?;
+        std::fs::copy(&path, dir.join(path.file_name()?)).ok()?;
+        Some((dir, family))
+    }
+
+    /// Reference: `TVPEnumFontsProc` enumerates a directory's fonts into the
+    /// name→path map and `TVPFindFont` matches a requested name against that
+    /// map (`reference/cpp/core/visual/FontImpl.cpp:100-168,277-285`). A
+    /// directory supplied to the text engine must therefore make its families
+    /// resolvable even when the platform's default scan does not reach it.
+    #[test]
+    fn an_explicit_directory_supplies_a_resolvable_family() {
+        let Some((dir, family)) = explicit_font_dir_fixture() else {
+            return;
+        };
+        let mut db = fontdb::Database::new();
+        load_font_directories(&mut db, std::slice::from_ref(&dir));
+        assert!(
+            find_family(&db, &family).is_some(),
+            "the explicit directory must supply {family:?}"
+        );
+
+        let mut engine = TextEngine::new();
+        engine.set_system_font_dirs(vec![dir.clone()]);
+        let id = engine
+            .load_system_font_exact(&family)
+            .expect("a supplied directory must resolve its family");
+        assert!(
+            engine.layout(id, "A", &TextStyle::new(24.0), None).is_ok(),
+            "the resolved face must shape"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Reference: `TVPFindFont`/`TVPCreateFontStream` do not fabricate a face
+    /// for a name that was never enumerated, and only the fallback entry
+    /// point substitutes the default (`reference/cpp/core/visual/FontImpl.cpp:
+    /// 159-168,277-285`). The exact query must therefore raise the typed
+    /// error rather than silently picking another face.
+    #[test]
+    fn an_absent_exact_family_reports_a_typed_error() {
+        let mut engine = TextEngine::new();
+        let error = engine
+            .load_system_font_exact("this-family-is-not-installed")
+            .expect_err("an absent exact family must not resolve");
+        assert!(matches!(error, TextError::FontNotFound { .. }));
+    }
+
+    /// A directory that is not mounted is an absent source, not an error.
+    #[test]
+    fn a_missing_directory_is_skipped() {
+        let mut db = fontdb::Database::new();
+        load_font_directories(&mut db, &[PathBuf::from("/nonexistent-krkr-font-dir")]);
+        assert_eq!(db.len(), 0);
     }
 
     /// Reference: `FreeTypeFontRasterizer::GetBitmap` falls back to the face's

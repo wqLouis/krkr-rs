@@ -28,6 +28,7 @@ mod audio;
 mod game;
 mod image_codec;
 mod runner;
+mod startup;
 mod video;
 mod window_ex;
 
@@ -49,7 +50,9 @@ use render::{
 };
 
 pub use audio::install_audio_decoder;
+pub(crate) use audio::install_audio_decoder_metered;
 pub use game::{GameError, GameHost};
+pub(crate) use image_codec::install_image_codec_metered;
 pub use image_codec::{install_image_codec, install_image_codec_on};
 pub use render::{BackendKind, FrameStats};
 // The emulator entry point. A launcher resolves `Launch` (including the
@@ -57,6 +60,7 @@ pub use render::{BackendKind, FrameStats};
 // module for the entry point contract.
 pub use runner::{GameInput, Launch, RunMode, RunReport, run};
 pub use video::install_video_source;
+pub(crate) use video::install_video_source_metered;
 pub use window_ex::install_window_ex_facts;
 
 /// Errors surfaced by [`Host`].
@@ -85,6 +89,12 @@ pub struct StepReport {
     pub elapsed_ms: f64,
     /// Per-frame counters from the null backend, or `None` on a GPU backend.
     pub stats: Option<FrameStats>,
+    /// Milliseconds spent syncing dirty bitmaps to textures.
+    pub sync_ms: f64,
+    /// Milliseconds spent projecting the scene tree.
+    pub project_ms: f64,
+    /// Milliseconds spent in the pipeline's render call.
+    pub render_ms: f64,
 }
 
 /// Immutable configuration for [`Host::new`].
@@ -372,23 +382,33 @@ impl Host {
     /// Returns [`HostError::Render`] when the render action fails.
     pub fn step(&mut self, dt_ms: f32) -> Result<StepReport, HostError> {
         self.elapsed_ms += f64::from(dt_ms).max(0.0);
+
+        let sync_started = std::time::Instant::now();
         self.sync_dirty_bitmaps();
         self.prune_stale_textures();
+        let sync_ms = sync_started.elapsed().as_secs_f64() * 1000.0;
 
+        let project_started = std::time::Instant::now();
         self.reproject_render_scene();
+        let project_ms = project_started.elapsed().as_secs_f64() * 1000.0;
 
+        let render_started = std::time::Instant::now();
         render(
             &self.pipeline,
             &self.surface,
             &mut self.render_state,
             &self.render_scene,
         )?;
+        let render_ms = render_started.elapsed().as_secs_f64() * 1000.0;
         self.frame_index = self.frame_index.saturating_add(1);
 
         Ok(StepReport {
             frame_index: self.frame_index,
             elapsed_ms: self.elapsed_ms,
             stats: self.last_frame(),
+            sync_ms,
+            project_ms,
+            render_ms,
         })
     }
 
@@ -567,8 +587,9 @@ impl Host {
     ///
     /// A bitmap whose dimensions changed recreates its texture; one with an
     /// inconsistent pixel length is skipped with a warning so one bad bitmap
-    /// cannot abort the frame. All dirty bitmaps are uploaded in one batch,
-    /// so the frame pays a single GPU wait instead of one per bitmap.
+    /// cannot abort the frame. All dirty bitmaps are uploaded in one batch, so
+    /// the frame submits them once and the present path waits for that batch
+    /// instead of waiting once per bitmap.
     fn sync_dirty_bitmaps(&mut self) {
         let dirty: Vec<u32> = self
             .scene

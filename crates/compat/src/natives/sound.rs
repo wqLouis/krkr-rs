@@ -924,9 +924,33 @@ fn dispatch_member(
     let Some(owner) = owner else {
         return;
     };
+    // Reference `tTVPEvent::Deliver` checks the event target with
+    // `TJSIsObjectValid(Target->IsValid(...))` and drops the event when the
+    // target was invalidated (`EventIntf.cpp:97-99`). The collected dispatch
+    // holds the raw retained id across other handlers' calls, so a peer
+    // handler can invalidate this object before its turn; skip it rather than
+    // call into an invalidated object.
+    if !is_valid_sound_object(host, owner) {
+        return;
+    }
     if let Err(error) = host.call_member(owner, member, args) {
         log::warn!("WaveSoundBuffer: {member} handler failed: {error}");
     }
+}
+
+/// Whether `id` still names a live, non-invalidated `WaveSoundBuffer` (or a
+/// script subclass of it) — the reference `Target->IsValid` check that
+/// `tTVPEvent::Deliver` makes before invoking a posted event
+/// (`reference/cpp/core/base/EventIntf.cpp:97-99`). The native-instance
+/// payload lookup reports `None` once the object is invalidated (the ABI's
+/// `GetNativePtr` guard, mirroring the reference teardown that sets
+/// `CanDeliverEvents = false` and clears `Owner`, `SoundBufferBaseIntf.cpp:46-54`)
+/// or its retained id was released.
+fn is_valid_sound_object(host: &Tjs2Engine, id: Tjs2ValueId) -> bool {
+    matches!(
+        host.native_instance_payload(id, "WaveSoundBuffer"),
+        Ok(Some(_))
+    )
 }
 
 /// Poll `id`'s buffer **right now** and deliver the status transition
@@ -2101,9 +2125,12 @@ fn forward_action(call: CallArgs, spec: ActionSpec) -> c_int {
     if let Err(error) = host.call_member(action.raw_id(), "action", &[TjsValue::Retained(event_id)])
     {
         // The reference never inspects this `FuncCall` result
-        // (`EventIntf.h:227-234`): a plain object without an `action` member
-        // and a throwing callback are both swallowed by the delivery seam.
-        log::warn!("WaveSoundBuffer.{what}: action dispatch failed: {error}");
+        // (`EventIntf.h:227-234`): a plain object without an `action` member,
+        // a throwing callback, and an already-invalidated action owner are
+        // all swallowed by the delivery seam — nothing is logged. Keep it at
+        // `debug` so a per-tick invalidation cannot spam the warning log
+        // while the failure is still visible under `RUST_LOG=debug`.
+        log::debug!("WaveSoundBuffer.{what}: action dispatch failed: {error}");
     }
     drop(event);
     drop(member_retained);

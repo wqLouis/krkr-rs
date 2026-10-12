@@ -134,7 +134,7 @@ fn glyph_atlas_is_bounded_and_clear_reclaims_space() {
     let Ok(font) = engine.add_font(&bytes, 0) else {
         return;
     };
-    let (pipeline, _surface, mut state) = null_pipeline();
+    let (pipeline, _surface, _state) = null_pipeline();
     let mut atlas = GlyphAtlas::new(&pipeline, 1024).expect("atlas");
 
     // Distinct (codepoint, size) pairs so every request is a cache miss: 94
@@ -144,7 +144,7 @@ fn glyph_atlas_is_bounded_and_clear_reclaims_space() {
             .expect("ASCII codepoint");
         let style = TextStyle::new(8.0 + (index / 94) as f32);
         atlas
-            .glyph(&pipeline, &mut state, &engine, font, codepoint, &style)
+            .glyph(&engine, font, codepoint, &style)
             .expect("distinct glyph");
     }
     assert_eq!(
@@ -158,5 +158,113 @@ fn glyph_atlas_is_bounded_and_clear_reclaims_space() {
     assert!(
         atlas.pixels().iter().all(|byte| *byte == 0),
         "clear must zero the CPU mirror"
+    );
+}
+
+/// Reference: `TVPGetCharacter` rasterizes a character on a cache miss and
+/// caches it (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:244-320`);
+/// the atlas is the GPU form of that cache. A run of N new glyphs must be
+/// queued and flushed as one upload batch, so a frame's upload work grows with
+/// the number of text runs, not the number of characters. The null backend
+/// records the uploaded pixels, which is the host-observable evidence that one
+/// flush carried the whole run.
+#[test]
+fn atlas_batches_a_run_into_one_flush() {
+    let Some(bytes) = load_test_font() else {
+        return;
+    };
+    let mut engine = TextEngine::new();
+    let Ok(font) = engine.add_font(&bytes, 0) else {
+        return;
+    };
+    let (pipeline, _surface, mut state) = null_pipeline();
+    let style = TextStyle::new(24.0);
+    let layout = engine
+        .layout(font, "Hello", &style, None)
+        .expect("layout of a Latin run");
+    let mut cache = TextCoverageCache::new();
+    let mut atlas = GlyphAtlas::new(&pipeline, 256).expect("atlas");
+
+    let gpu = rasterize_run(
+        GlyphBackend::Gpu,
+        &mut cache,
+        &mut atlas,
+        &pipeline,
+        &mut state,
+        &engine,
+        &layout,
+        &style,
+        true,
+        1.0,
+    )
+    .expect("gpu run");
+    let RasterizedRun::Atlas(glyphs) = gpu else {
+        panic!("the gpu backend must return atlas glyphs");
+    };
+    assert!(
+        glyphs.len() > 1,
+        "the run must contain more than one glyph, got {}",
+        glyphs.len()
+    );
+
+    // `rasterize_layout` flushed the run, so no region is left queued.
+    assert_eq!(
+        atlas.pending_len(),
+        0,
+        "one flush must drain every glyph of the run"
+    );
+
+    // The single flush copied exactly the CPU mirror the glyphs wrote.
+    let uploaded = render::NullRenderPipeline::texture_pixels(&state, atlas.texture())
+        .expect("the flushed atlas must be uploaded");
+    assert_eq!(
+        uploaded,
+        atlas.pixels(),
+        "the GPU atlas must match the CPU mirror after one flush"
+    );
+
+    // A second flush with no new glyphs must not upload anything again, which
+    // is the null-backend evidence that the first flush was a single batch.
+    let bytes_after = render::NullRenderPipeline::texture_uploaded_bytes(&state, atlas.texture())
+        .expect("uploaded byte count");
+    atlas.flush(&pipeline, &mut state).expect("second flush");
+    let bytes_again = render::NullRenderPipeline::texture_uploaded_bytes(&state, atlas.texture())
+        .expect("uploaded byte count");
+    assert_eq!(
+        bytes_after, bytes_again,
+        "a flush with nothing pending must upload nothing"
+    );
+}
+
+/// Reference: the glyph atlas is a cache, not a per-character upload stream
+/// (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:244-320`). Rasterizing
+/// glyphs only queues their regions; a single `flush` submits them together.
+#[test]
+fn glyphs_queue_until_one_flush() {
+    let Some(bytes) = load_test_font() else {
+        return;
+    };
+    let mut engine = TextEngine::new();
+    let Ok(font) = engine.add_font(&bytes, 0) else {
+        return;
+    };
+    let (pipeline, _surface, mut state) = null_pipeline();
+    let style = TextStyle::new(24.0);
+    let mut atlas = GlyphAtlas::new(&pipeline, 256).expect("atlas");
+
+    atlas.glyph(&engine, font, 'A', &style).expect("glyph A");
+    atlas.glyph(&engine, font, 'B', &style).expect("glyph B");
+    atlas.glyph(&engine, font, 'C', &style).expect("glyph C");
+    assert_eq!(
+        atlas.pending_len(),
+        3,
+        "three new glyphs must be queued, not uploaded one by one"
+    );
+
+    atlas.flush(&pipeline, &mut state).expect("flush");
+    assert_eq!(
+        atlas.pending_len(),
+        0,
+        "one flush drains every queued glyph"
     );
 }

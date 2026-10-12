@@ -13,16 +13,21 @@
 //! storage's game directory; a later [`Storage::read`] then sees the file.
 //!
 //! The installed closures are self-contained and own only a cloned
-//! [`FileSystem`] handle plus a [`PathBuf`], so the host can install the
+//! [`FileSystem`] handle, a [`PathBuf`], the shared [`StartupStats`] counter
+//! set and a clone of the stateless backend, so the host can install the
 //! codec before or after the engine binding and keeps no extra lifetime.
 
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::time::Instant;
 
 use api::fs::{FsPath, OpenMode};
 use compat::CompatHost;
 use engine::Storage;
 use fs::FileSystem;
 use media::{Media, decode_image, encode_image, probe_image};
+
+use crate::startup::StartupStats;
 
 /// Installs the `media`-backed image codec on `host`.
 ///
@@ -40,9 +45,20 @@ use media::{Media, decode_image, encode_image, probe_image};
 /// [`install_audio_decoder`](crate::install_audio_decoder); the closures own
 /// a clone of it.
 pub fn install_image_codec(host: &CompatHost, media: &Media, storage: &Storage) {
+    let stats = StartupStats::new();
+    install_image_codec_metered(host, media, storage, &stats);
+}
+
+/// Installs the image codec with the shared [`StartupStats`] counter set.
+pub(crate) fn install_image_codec_metered(
+    host: &CompatHost,
+    media: &Media,
+    storage: &Storage,
+    stats: &Rc<StartupStats>,
+) {
     let fs = storage.file_system().clone();
     let base = storage.game_dir().to_path_buf();
-    install_image_codec_on(host, media, fs, base);
+    install_image_codec_on_metered(host, media, fs, base, stats);
 }
 
 /// Installs the `media` image codec with an explicit write target.
@@ -51,13 +67,30 @@ pub fn install_image_codec(host: &CompatHost, media: &Media, storage: &Storage) 
 /// lower-level entry point is for hosts that keep the output elsewhere
 /// (for example a dedicated screenshot directory).
 pub fn install_image_codec_on(host: &CompatHost, media: &Media, fs: FileSystem, base: PathBuf) {
+    let stats = StartupStats::new();
+    install_image_codec_on_metered(host, media, fs, base, &stats);
+}
+
+/// Installs the image codec with an explicit write target and the shared
+/// [`StartupStats`] counter set.
+fn install_image_codec_on_metered(
+    host: &CompatHost,
+    media: &Media,
+    fs: FileSystem,
+    base: PathBuf,
+    stats: &Rc<StartupStats>,
+) {
     let decode_media = media.clone();
     let probe_media = media.clone();
     let save_media = media.clone();
+    let decode_stats = Rc::clone(stats);
 
     host.set_image_codec(
         move |bytes, hint| {
-            decode_image(&decode_media, bytes, hint).map_err(|error| error.to_string())
+            let started = Instant::now();
+            let result = decode_image(&decode_media, bytes, hint);
+            decode_stats.record_image_decode(started.elapsed());
+            result.map_err(|error| error.to_string())
         },
         move |bytes, hint| {
             probe_image(&probe_media, bytes, hint).map_err(|error| error.to_string())

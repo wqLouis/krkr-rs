@@ -66,6 +66,7 @@
 //! is a typed [`PlatformError`] surfaced through [`crate::GameError::Audio`] —
 //! never silence.
 
+use std::rc::Rc;
 use std::sync::Arc;
 
 use api::error::{AudioError, MediaError};
@@ -77,6 +78,7 @@ use platform::{AudioDevice, AudioOutputState, PlatformError};
 use vm::VmHost;
 
 use crate::GameError;
+use crate::startup::StartupStats;
 
 /// The format the headless (null) output device is opened with.
 ///
@@ -209,7 +211,19 @@ impl AudioStream for MediaAudioStream {
 /// of the stateless [`Media`] backend and its own explicit
 /// [`AudioDecoderState`].
 pub fn install_audio_decoder(host: &CompatHost, media: &Media) {
+    let stats = StartupStats::new();
+    install_audio_decoder_metered(host, media, &stats);
+}
+
+/// Installs the `media` audio decoder with the shared [`StartupStats`]
+/// counter set.
+pub(crate) fn install_audio_decoder_metered(
+    host: &CompatHost,
+    media: &Media,
+    stats: &Rc<StartupStats>,
+) {
     let media = media.clone();
+    let stats = Rc::clone(stats);
     set_sound_render_driven(host.services(), true);
     add_audio_decoder(
         host.services(),
@@ -217,6 +231,7 @@ pub fn install_audio_decoder(host: &CompatHost, media: &Media) {
             let bytes: Arc<[u8]> = Arc::from(bytes);
             let (spec, state) =
                 open_audio(&media, bytes, hint).map_err(|error| error.to_string())?;
+            stats.record_audio_decoder();
             let stream = MediaAudioStream {
                 media: media.clone(),
                 state,

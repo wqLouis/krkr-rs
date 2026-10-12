@@ -24,7 +24,7 @@ use crate::texture::TextureFormat;
 
 use super::draw;
 use super::pipelines::{self, PipelineSet};
-use super::texture::{VulkanTexture, find_memory_type, image_format};
+use super::texture::{StagingBuffer, VulkanTexture, find_memory_type, image_format};
 
 /// Render pass plus pipelines compiled against it, one per target format.
 pub(crate) struct OffscreenPass {
@@ -306,6 +306,11 @@ pub(crate) fn render(
 
 /// Copies `region` of `target` into `out` and waits for completion.
 ///
+/// `readback` is reused across calls: it is grown on demand and only the
+/// copy region is mapped, so a readback no longer allocates and destroys a
+/// buffer. The copy is synchronous because the caller observes `out` on
+/// return.
+///
 /// # Errors
 ///
 /// Returns [`RenderError::Framebuffer`] on allocation/copy/map failure.
@@ -318,91 +323,89 @@ pub(crate) fn read(
     command_buffer: vk::CommandBuffer,
     fence: vk::Fence,
     target: &VulkanRenderTarget,
+    readback: &mut StagingBuffer,
     region: PixelRegion,
     out: &mut [u8],
 ) -> Result<(), RenderError> {
     let bytes_per_pixel = target.desc.format.bytes_per_pixel() as vk::DeviceSize;
     let size = (region.area() * bytes_per_pixel as u64).max(1);
 
-    let (buffer, memory) = create_readback_buffer(device, memory_properties, size)?;
+    readback.reserve(
+        device,
+        memory_properties,
+        size,
+        vk::BufferUsageFlags::TRANSFER_DST,
+    )?;
+    let buffer = readback.buffer;
+    let memory = readback.memory;
 
-    let result = (|| -> Result<(), RenderError> {
-        record_and_submit(
-            device,
-            queue,
-            command_pool,
-            command_buffer,
-            fence,
-            |command_buffer| {
-                barrier_to_transfer_src(device, command_buffer, target);
-                let subresource = vk::ImageSubresourceLayers::default()
-                    .aspect_mask(vk::ImageAspectFlags::COLOR)
-                    .mip_level(0)
-                    .base_array_layer(0)
-                    .layer_count(1);
-                let copy = vk::BufferImageCopy::default()
-                    .buffer_offset(0)
-                    .buffer_row_length(0)
-                    .buffer_image_height(0)
-                    .image_subresource(subresource)
-                    .image_offset(vk::Offset3D {
-                        x: region.x as i32,
-                        y: region.y as i32,
-                        z: 0,
-                    })
-                    .image_extent(vk::Extent3D {
-                        width: region.width,
-                        height: region.height,
-                        depth: 1,
-                    });
-                // SAFETY: the command buffer is recording and both handles are
-                // live.
-                unsafe {
-                    device.cmd_copy_image_to_buffer(
-                        command_buffer,
-                        target.image,
-                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                        buffer,
-                        &[copy],
-                    );
-                }
-                Ok(())
-            },
-        )?;
+    record_and_submit(
+        device,
+        queue,
+        command_pool,
+        command_buffer,
+        fence,
+        |command_buffer| {
+            barrier_to_transfer_src(device, command_buffer, target);
+            let subresource = vk::ImageSubresourceLayers::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .mip_level(0)
+                .base_array_layer(0)
+                .layer_count(1);
+            let copy = vk::BufferImageCopy::default()
+                .buffer_offset(0)
+                .buffer_row_length(0)
+                .buffer_image_height(0)
+                .image_subresource(subresource)
+                .image_offset(vk::Offset3D {
+                    x: region.x as i32,
+                    y: region.y as i32,
+                    z: 0,
+                })
+                .image_extent(vk::Extent3D {
+                    width: region.width,
+                    height: region.height,
+                    depth: 1,
+                });
+            // SAFETY: the command buffer is recording and both handles are
+            // live.
+            unsafe {
+                device.cmd_copy_image_to_buffer(
+                    command_buffer,
+                    target.image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    buffer,
+                    &[copy],
+                );
+            }
+            Ok(())
+        },
+    )?;
 
-        // SAFETY: the fence has been waited on, so the mapped memory is no
-        // longer written by the GPU and `size` bytes are valid.
-        let mapped = unsafe { device.map_memory(memory, 0, size, vk::MemoryMapFlags::empty()) }
-            .map_err(|error| RenderError::Framebuffer {
-                message: format!("failed to map the readback buffer: {error}"),
-            })?;
-        let expected = region.area() as usize * target.desc.format.bytes_per_pixel() as usize;
-        if out.len() != expected {
-            // SAFETY: `mapped` was mapped above with `size`.
-            unsafe { device.unmap_memory(memory) };
-            return Err(RenderError::Framebuffer {
-                message: format!(
-                    "readback buffer is {} bytes, expected {expected}",
-                    out.len()
-                ),
-            });
-        }
-        // SAFETY: `mapped` points at `size` readable bytes and `out` is
-        // `expected <= size` bytes long.
-        unsafe {
-            std::ptr::copy_nonoverlapping(mapped.cast::<u8>(), out.as_mut_ptr(), out.len());
-            device.unmap_memory(memory);
-        }
-        Ok(())
-    })();
-
-    // SAFETY: the GPU is idle with respect to `buffer`/`memory` after the
-    // synchronous submit and unmap above.
-    unsafe {
-        device.destroy_buffer(buffer, None);
-        device.free_memory(memory, None);
+    // SAFETY: the fence has been waited on, so the mapped memory is no
+    // longer written by the GPU and `size` bytes are valid.
+    let mapped = unsafe { device.map_memory(memory, 0, size, vk::MemoryMapFlags::empty()) }
+        .map_err(|error| RenderError::Framebuffer {
+            message: format!("failed to map the readback buffer: {error}"),
+        })?;
+    let expected = region.area() as usize * target.desc.format.bytes_per_pixel() as usize;
+    if out.len() != expected {
+        // SAFETY: `mapped` was mapped above with `size`.
+        unsafe { device.unmap_memory(memory) };
+        return Err(RenderError::Framebuffer {
+            message: format!(
+                "readback buffer is {} bytes, expected {expected}",
+                out.len()
+            ),
+        });
     }
-    result
+    // SAFETY: `mapped` points at `size` readable bytes and `out` is
+    // `expected <= size` bytes long.
+    unsafe {
+        std::ptr::copy_nonoverlapping(mapped.cast::<u8>(), out.as_mut_ptr(), out.len());
+        device.unmap_memory(memory);
+    }
+    Ok(())
 }
 
 /// Creates the colour-only render pass used for offscreen targets.
@@ -496,64 +499,6 @@ fn barrier_to_transfer_src(
             &[barrier],
         );
     }
-}
-
-/// Creates a host-visible, host-coherent buffer for readback.
-fn create_readback_buffer(
-    device: &ash::Device,
-    memory_properties: &vk::PhysicalDeviceMemoryProperties,
-    size: vk::DeviceSize,
-) -> Result<(vk::Buffer, vk::DeviceMemory), RenderError> {
-    let buffer_info = vk::BufferCreateInfo::default()
-        .size(size)
-        .usage(vk::BufferUsageFlags::TRANSFER_DST)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE);
-    // SAFETY: `buffer_info` borrows a local valid for the call.
-    let buffer = unsafe { device.create_buffer(&buffer_info, None) }.map_err(|error| {
-        RenderError::Framebuffer {
-            message: format!("failed to create the readback buffer: {error}"),
-        }
-    })?;
-
-    // SAFETY: `buffer` was just created by `device`.
-    let requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
-    let memory_type = match find_memory_type(
-        memory_properties,
-        requirements.memory_type_bits,
-        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-    ) {
-        Ok(memory_type) => memory_type,
-        Err(error) => {
-            // SAFETY: `buffer` is owned here.
-            unsafe { device.destroy_buffer(buffer, None) };
-            return Err(error);
-        }
-    };
-    let allocate_info = vk::MemoryAllocateInfo::default()
-        .allocation_size(requirements.size)
-        .memory_type_index(memory_type);
-    // SAFETY: `allocate_info` is valid.
-    let memory = unsafe { device.allocate_memory(&allocate_info, None) }.map_err(|error| {
-        // SAFETY: `buffer` is owned here.
-        unsafe { device.destroy_buffer(buffer, None) };
-        RenderError::OutOfMemory {
-            message: format!("failed to allocate readback memory: {error}"),
-        }
-    })?;
-
-    // SAFETY: `memory` was allocated for `buffer`.
-    if let Err(error) = unsafe { device.bind_buffer_memory(buffer, memory, 0) } {
-        // SAFETY: both handles are owned here.
-        unsafe {
-            device.destroy_buffer(buffer, None);
-            device.free_memory(memory, None);
-        }
-        return Err(RenderError::Framebuffer {
-            message: format!("failed to bind readback memory: {error}"),
-        });
-    }
-
-    Ok((buffer, memory))
 }
 
 /// Records a fallible `record` closure and submits it synchronously.

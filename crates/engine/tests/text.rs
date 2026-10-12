@@ -89,15 +89,15 @@ fn atlas_rasterizes_and_caches_glyphs() {
     };
     let mut engine = TextEngine::new();
     let font = engine.add_font(&bytes, 0).expect("register font");
-    let (pipeline, _surface, mut state) = null_pipeline();
+    let (pipeline, _surface, _state) = null_pipeline();
     let mut atlas = GlyphAtlas::new(&pipeline, 128).expect("atlas");
     let style = text_style(24.0, [255, 255, 255, 255]);
 
     let first = atlas
-        .glyph(&pipeline, &mut state, &engine, font, 'A', &style)
+        .glyph(&engine, font, 'A', &style)
         .expect("first glyph");
     let second = atlas
-        .glyph(&pipeline, &mut state, &engine, font, 'A', &style)
+        .glyph(&engine, font, 'A', &style)
         .expect("cached glyph");
 
     assert_eq!(first, second, "repeat request must reuse the atlas cell");
@@ -113,12 +113,12 @@ fn atlas_full_is_a_typed_error() {
     };
     let mut engine = TextEngine::new();
     let font = engine.add_font(&bytes, 0).expect("register font");
-    let (pipeline, _surface, mut state) = null_pipeline();
+    let (pipeline, _surface, _state) = null_pipeline();
     let mut atlas = GlyphAtlas::new(&pipeline, 2).expect("tiny atlas");
     let style = TextStyle::new(48.0);
 
     let error = atlas
-        .glyph(&pipeline, &mut state, &engine, font, 'A', &style)
+        .glyph(&engine, font, 'A', &style)
         .expect_err("a 48px glyph cannot fit a 2x2 atlas");
     assert!(matches!(error, TextError::AtlasFull { .. }));
 }
@@ -130,12 +130,10 @@ fn project_text_emits_textured_quads() {
     };
     let mut engine = TextEngine::new();
     let font = engine.add_font(&bytes, 0).expect("register font");
-    let (pipeline, _surface, mut state) = null_pipeline();
+    let (pipeline, _surface, _state) = null_pipeline();
     let mut atlas = GlyphAtlas::new(&pipeline, 128).expect("atlas");
     let style = text_style(24.0, [255, 255, 255, 255]);
-    let glyph = atlas
-        .glyph(&pipeline, &mut state, &engine, font, 'A', &style)
-        .expect("glyph");
+    let glyph = atlas.glyph(&engine, font, 'A', &style).expect("glyph");
     let positioned = [PositionedGlyph::new(
         glyph,
         10.0,
@@ -164,12 +162,10 @@ fn cpu_composition_matches_atlas_ink() {
     };
     let mut engine = TextEngine::new();
     let font = engine.add_font(&bytes, 0).expect("register font");
-    let (pipeline, _surface, mut state) = null_pipeline();
+    let (pipeline, _surface, _state) = null_pipeline();
     let mut atlas = GlyphAtlas::new(&pipeline, 128).expect("atlas");
     let style = text_style(24.0, [255, 0, 0, 255]);
-    let glyph = atlas
-        .glyph(&pipeline, &mut state, &engine, font, 'A', &style)
-        .expect("glyph");
+    let glyph = atlas.glyph(&engine, font, 'A', &style).expect("glyph");
     let positioned = [PositionedGlyph::new(
         glyph,
         4.0,
@@ -197,19 +193,17 @@ fn colour_change_reuses_the_cached_glyph() {
     };
     let mut engine = TextEngine::new();
     let font = engine.add_font(&bytes, 0).expect("register font");
-    let (pipeline, _surface, mut state) = null_pipeline();
+    let (pipeline, _surface, _state) = null_pipeline();
     let mut atlas = GlyphAtlas::new(&pipeline, 128).expect("atlas");
     let white = text_style(24.0, [255, 255, 255, 255]);
     let mut red = white;
     red.color = [255, 0, 0, 255];
 
     let first = atlas
-        .glyph(&pipeline, &mut state, &engine, font, 'A', &white)
+        .glyph(&engine, font, 'A', &white)
         .expect("white glyph");
     let coverage = atlas.pixels().to_vec();
-    let second = atlas
-        .glyph(&pipeline, &mut state, &engine, font, 'A', &red)
-        .expect("red glyph");
+    let second = atlas.glyph(&engine, font, 'A', &red).expect("red glyph");
 
     assert_eq!(first, second, "a colour change must reuse the atlas cell");
     assert_eq!(atlas.len(), 1, "colour must not create a new cache entry");
@@ -241,13 +235,11 @@ fn tinted_cpu_output_matches_the_baked_reference() {
     };
     let mut engine = TextEngine::new();
     let font = engine.add_font(&bytes, 0).expect("register font");
-    let (pipeline, _surface, mut state) = null_pipeline();
+    let (pipeline, _surface, _state) = null_pipeline();
     let mut atlas = GlyphAtlas::new(&pipeline, 128).expect("atlas");
     let color = [40, 120, 200, 200];
     let style = text_style(24.0, color);
-    let glyph = atlas
-        .glyph(&pipeline, &mut state, &engine, font, 'A', &style)
-        .expect("glyph");
+    let glyph = atlas.glyph(&engine, font, 'A', &style).expect("glyph");
     let positioned = [PositionedGlyph::new(glyph, 4.0, 32.0, 1.0, color)];
 
     let (width, height) = (64u32, 64u32);

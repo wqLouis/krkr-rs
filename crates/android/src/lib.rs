@@ -67,10 +67,11 @@ mod android_entry {
     ///
     /// The launcher's folder is read first so the engine has something to mount
     /// before any other work; a missing folder is reported through the state
-    /// file and the loop is never started. The launcher's saved runtime settings
-    /// (frame-rate limit, presentation scaling and archive preload) are read
-    /// next over the same JNI channel and resolved by
-    /// [`crate::config`]: the presentation default is
+    /// file and the loop is never started. The launcher's log level is read
+    /// next and validated before the logger is installed, because it selects
+    /// the filter. The remaining saved runtime settings (frame-rate limit,
+    /// presentation scaling and archive preload) are read over the same JNI
+    /// channel and resolved by [`crate::config`]: the presentation default is
     /// [`PresentationScaling::Fit`] and the user's stored choice overrides it,
     /// and an out-of-range value is reported and the loop is never started.
     #[allow(unsafe_code)]
@@ -91,7 +92,29 @@ mod android_entry {
                 eprintln!("krkr-rs: cannot read KrkrGameActivity.pendingStateDir: {error}");
             }
         }
-        if let Err(error) = init_logging() {
+        // The log level is the launcher's choice and the filter is fixed when
+        // the logger is installed, so it is read and validated first. This is
+        // the one settings read that happens before the logger exists: a read
+        // failure or an unknown level is echoed on stderr and written to the
+        // state file, which is what the launcher reads. A missing value means
+        // the launcher published no override, so the built-in default applies.
+        let log_level = match read_settings_field(&app, jni_fields::FIELD_LOG_LEVEL) {
+            Ok(value) => match config::resolve_log_level(value.as_deref()) {
+                Ok(level) => level,
+                Err(error) => {
+                    let message = format!("invalid runtime configuration: {error}");
+                    eprintln!("krkr-rs: {message}");
+                    state::write_state(state::State::Failed, Some(&message));
+                    return;
+                }
+            },
+            Err(message) => {
+                eprintln!("krkr-rs: {message}");
+                state::write_state(state::State::Failed, Some(&message));
+                return;
+            }
+        };
+        if let Err(error) = init_logging(log_level) {
             // The launcher reads a file, not logcat: without it the Logs screen
             // is empty and a later failure has no explanation. A log the app
             // cannot open is therefore a reported startup failure, never a
@@ -181,10 +204,11 @@ mod android_entry {
             }
         };
         log::info!(
-            "krkr: frame rate {} fps, scaling {}, preload archives {}",
+            "krkr: frame rate {} fps, scaling {}, preload archives {}, log level {}",
             runtime.frame_rate_limit.fps(),
             runtime.scaling.as_str(),
-            runtime.preload_archives
+            runtime.preload_archives,
+            log_level.as_filter()
         );
         let handler = host::AndroidHost::new(
             BackendKind::Vulkan,
@@ -232,17 +256,23 @@ mod android_entry {
     /// The single global logger fans every record out to two sinks:
     ///
     /// * `env_logger` on stderr, which `android-activity` redirects to logcat
-    ///   (`RUST_LOG` selects the filter, default `info`);
+    ///   (`RUST_LOG` selects the filter when it is set; otherwise the launcher's
+    ///   log level does);
     /// * [`FileSink`] on `<filesDir>/krkr.log`, the file the launcher's Logs
     ///   screen reads. It is capped at [`log_file::LOG_MAX_BYTES`] and rotates
     ///   once, so a long session cannot fill the device's storage.
+    ///
+    /// `RUST_LOG` keeps its precedence for anyone who can set it; a device
+    /// cannot, so the launcher's level is what a device uses. `level` is the
+    /// launcher's choice; a device needs `debug` to surface the VM's exception
+    /// dumps.
     ///
     /// The file is opened before the logger is claimed. An unusable log file
     /// is returned as an error for [`android_main`] to report through the
     /// state file, rather than a fallback that leaves the Logs screen empty.
     /// A missing state directory is the same error: without it there is no
     /// place for the file the launcher reads.
-    fn init_logging() -> std::io::Result<()> {
+    fn init_logging(level: config::LogLevel) -> std::io::Result<()> {
         let Some(dir) = state::state_dir() else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -251,8 +281,9 @@ mod android_entry {
         };
         let file = FileSink::open(dir.join(log_file::LOG_FILE_NAME))?;
 
-        let mut builder =
-            env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
+        let mut builder = env_logger::Builder::from_env(
+            env_logger::Env::default().default_filter_or(level.as_filter()),
+        );
         builder.format_timestamp_millis();
         let stderr = builder.build();
         let max_level = stderr.filter();

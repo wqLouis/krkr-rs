@@ -50,6 +50,7 @@ mod audio;
 mod audio_queue;
 mod clock;
 mod event;
+mod fonts;
 mod input;
 mod window;
 
@@ -81,6 +82,7 @@ pub use crate::linux::{PlatformWindow, run};
 pub use crate::audio::{AudioDevice, AudioOutputState};
 pub use crate::clock::{Clock, Ticker};
 pub use crate::event::PlatformEvent;
+pub use crate::fonts::{ANDROID_SYSTEM_FONT_DIRS, system_font_dirs};
 pub use crate::input::{InputEvent, MouseButton, PhysicalKey};
 pub use crate::window::headless_window_handle;
 

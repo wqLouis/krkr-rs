@@ -12,6 +12,8 @@
 //! function that enforces the order ([`run_frame_body`]); the natives
 //! implement the individual polls.
 
+use std::time::{Duration, Instant};
+
 use crate::{CompatCtx, CompatError};
 
 /// The five ordered polls of one VM frame body.
@@ -19,6 +21,11 @@ use crate::{CompatCtx, CompatError};
 /// Every method defaults to a no-op so a host can implement only the polls
 /// its natives need; the order is enforced by [`run_frame_body`], never by
 /// the implementor.
+///
+/// Each poll has a matching `*_completed` hook that [`run_frame_body`] calls
+/// with the poll's wall-clock duration. A host that wants per-frame cost
+/// attribution overrides the hooks it cares about; the default discards the
+/// measurement. A poll that returns an error does not report a duration.
 pub trait FrameBody {
     /// Timers due this frame.
     fn timer_poll(&mut self, _ctx: &mut CompatCtx) -> Result<(), CompatError> {
@@ -54,15 +61,57 @@ pub trait FrameBody {
     fn project_and_render(&mut self, _ctx: &mut CompatCtx) -> Result<(), CompatError> {
         Ok(())
     }
+
+    /// Wall-clock duration of [`timer_poll`](Self::timer_poll).
+    fn timer_completed(&mut self, _elapsed: Duration) {}
+
+    /// Wall-clock duration of [`sound_poll`](Self::sound_poll).
+    fn sound_completed(&mut self, _elapsed: Duration) {}
+
+    /// Wall-clock duration of [`video_poll`](Self::video_poll).
+    fn video_completed(&mut self, _elapsed: Duration) {}
+
+    /// Wall-clock duration of
+    /// [`async_trigger_poll`](Self::async_trigger_poll).
+    fn async_trigger_completed(&mut self, _elapsed: Duration) {}
+
+    /// Wall-clock duration of
+    /// [`continuous_handler_poll`](Self::continuous_handler_poll).
+    fn continuous_handler_completed(&mut self, _elapsed: Duration) {}
+
+    /// Wall-clock duration of
+    /// [`project_and_render`](Self::project_and_render).
+    fn project_and_render_completed(&mut self, _elapsed: Duration) {}
 }
 
 /// Run the frame body in the documented order, stopping at the first error.
+///
+/// Each poll's wall-clock duration is reported to the matching `*_completed`
+/// hook; the remaining polls do not run after an error.
 pub fn run_frame_body(body: &mut dyn FrameBody, ctx: &mut CompatCtx) -> Result<(), CompatError> {
+    let started = Instant::now();
     body.timer_poll(ctx)?;
+    body.timer_completed(started.elapsed());
+
+    let started = Instant::now();
     body.sound_poll(ctx)?;
+    body.sound_completed(started.elapsed());
+
+    let started = Instant::now();
     body.video_poll(ctx)?;
+    body.video_completed(started.elapsed());
+
+    let started = Instant::now();
     body.async_trigger_poll(ctx)?;
+    body.async_trigger_completed(started.elapsed());
+
+    let started = Instant::now();
     body.continuous_handler_poll(ctx)?;
+    body.continuous_handler_completed(started.elapsed());
+
+    let started = Instant::now();
     body.project_and_render(ctx)?;
+    body.project_and_render_completed(started.elapsed());
+
     Ok(())
 }

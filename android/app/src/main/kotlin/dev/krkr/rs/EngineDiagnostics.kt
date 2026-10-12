@@ -67,6 +67,14 @@ object EngineDiagnostics {
     fun engineLogFile(context: Context): File = File(context.filesDir, ENGINE_LOG)
 
     /**
+     * The one rotated engine log the Rust side keeps, `krkr.log.1`.
+     *
+     * The engine caps the current file at 1 MiB and rotates once; a full-log
+     * export reads this file as well as [engineLogFile].
+     */
+    fun engineLogRotatedFile(context: Context): File = File(context.filesDir, "$ENGINE_LOG.1")
+
+    /**
      * The pending-launch marker file. Exposed so reconciliation can compare its
      * modification time against the engine state file's (same filesystem, same
      * clock) and tell this run's state apart from a stale leftover.

@@ -57,6 +57,14 @@ object LauncherLog {
     /** The launcher log file, even before [init] has run. */
     fun file(context: Context): File = File(context.filesDir, FILE_NAME)
 
+    /**
+     * The one rotated launcher log, `krkr-launcher.log.1`.
+     *
+     * The rotation renames the current log to [ROTATED_NAME] when it exceeds
+     * [MAX_BYTES]; a full-log export reads this file as well as [file].
+     */
+    fun rotatedFile(context: Context): File = File(context.filesDir, ROTATED_NAME)
+
     fun d(message: String) = record(Log.DEBUG, "D", message, null)
     fun i(message: String) = record(Log.INFO, "I", message, null)
     fun w(message: String) = record(Log.WARN, "W", message, null)

@@ -3,7 +3,7 @@
 //!
 //! `KrkrGameActivity` persists the user's choices in its own settings file and
 //! publishes them as the static string fields `pendingFrameRate`,
-//! `pendingScaling` and `pendingPreloadArchives` before
+//! `pendingScaling`, `pendingPreloadArchives` and `pendingLogLevel` before
 //! `super.onCreate` enters native code (see [`crate::jni_fields`]). This module
 //! is where those raw strings become the one validated value the emulator
 //! receives, so the launcher keeps owning configuration loading and the core
@@ -19,7 +19,8 @@
 //! built-in (`false`). The presentation default is
 //! [`PresentationScaling::Fit`], not the desktop's `Game`: a phone must never
 //! present the raw logical size, and the picture keeps its aspect rather than
-//! being stretched (`docs/android.md` §2.2). The user's stored choice overrides
+//! being stretched (`docs/android.md` §2.2). The log-level default is `info`,
+//! which omits the VM's diagnostic detail. The user's stored choice overrides
 //! each default.
 
 use api::config::{ConfigError, FrameRateLimit, PresentationScaling, RuntimeConfig, parse_bool};
@@ -30,6 +31,92 @@ const OPTION_FRAME_RATE: &str = "frame_rate";
 const OPTION_SCALING: &str = "scaling";
 /// Configuration-key name used in archive-preload errors.
 const OPTION_PRELOAD_ARCHIVES: &str = "preload_archives";
+/// Configuration-key name used in log-level errors.
+const OPTION_LOG_LEVEL: &str = "log_level";
+
+/// A log-level filter the launcher selects for the engine logger.
+///
+/// The names are the ones `env_logger`'s `RUST_LOG` filter accepts, so the
+/// launcher value and an environment override select the same thing. `Off`
+/// silences every record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum LogLevel {
+    /// Every record is discarded.
+    Off,
+    /// Only failures.
+    Error,
+    /// Failures and recoverable problems.
+    Warn,
+    /// Failures, warnings and normal lifecycle records.
+    Info,
+    /// Adds diagnostic records, including the TJS VM's exception dumps.
+    Debug,
+    /// Adds per-frame and per-value tracing.
+    Trace,
+}
+
+impl LogLevel {
+    /// The level used when the launcher publishes no value.
+    ///
+    /// This is a built-in default, not a fallback that hides a failure: an
+    /// unset field means the launcher had no override, which is different
+    /// from a present-but-invalid value.
+    pub(crate) const DEFAULT: Self = Self::Info;
+
+    /// Human-readable accepted values, as written in errors.
+    pub(crate) const ACCEPTED: &'static str = "one of: off, error, warn, info, debug, trace";
+
+    /// Parses a level name.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::InvalidValue`] when `value` is not one of the accepted
+    /// names.
+    pub(crate) fn parse(option: &'static str, value: &str) -> Result<Self, ConfigError> {
+        match value {
+            "off" => Ok(Self::Off),
+            "error" => Ok(Self::Error),
+            "warn" => Ok(Self::Warn),
+            "info" => Ok(Self::Info),
+            "debug" => Ok(Self::Debug),
+            "trace" => Ok(Self::Trace),
+            other => Err(ConfigError::invalid(
+                option,
+                other.to_owned(),
+                Self::ACCEPTED,
+            )),
+        }
+    }
+
+    /// The filter string this level selects.
+    pub(crate) fn as_filter(&self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Error => "error",
+            Self::Warn => "warn",
+            Self::Info => "info",
+            Self::Debug => "debug",
+            Self::Trace => "trace",
+        }
+    }
+}
+
+/// Resolves the launcher's log level over the built-in default.
+///
+/// `None` means the launcher published no value, so the documented default
+/// [`LogLevel::DEFAULT`] applies. A present value that is not one of
+/// [`LogLevel::ACCEPTED`] is a typed [`ConfigError`] naming the option and the
+/// accepted values — it is never silently replaced by the default.
+///
+/// # Errors
+///
+/// [`ConfigError::InvalidValue`] when `value` is not an accepted level name.
+pub(crate) fn resolve_log_level(value: Option<&str>) -> Result<LogLevel, ConfigError> {
+    match value {
+        Some(value) => LogLevel::parse(OPTION_LOG_LEVEL, value),
+        None => Ok(LogLevel::DEFAULT),
+    }
+}
 
 /// Resolves the launcher's published settings over the Android defaults.
 ///
@@ -140,5 +227,65 @@ mod tests {
         assert!(resolve_runtime_config(Some("30"), Some("stretch"), Some("true")).is_err());
         assert!(resolve_runtime_config(Some("fast"), Some("fit"), Some("false")).is_err());
         assert!(resolve_runtime_config(Some("60"), Some("fit"), Some("yes")).is_err());
+    }
+
+    #[test]
+    fn every_log_level_name_parses_to_its_filter() {
+        for (text, expected) in [
+            ("off", LogLevel::Off),
+            ("error", LogLevel::Error),
+            ("warn", LogLevel::Warn),
+            ("info", LogLevel::Info),
+            ("debug", LogLevel::Debug),
+            ("trace", LogLevel::Trace),
+        ] {
+            let level = resolve_log_level(Some(text)).expect("accepted level");
+            assert_eq!(level, expected);
+            // The filter string the logger receives is the name the launcher
+            // chose, so the setting and `RUST_LOG` select the same thing.
+            assert_eq!(level.as_filter(), text);
+        }
+    }
+
+    #[test]
+    fn an_unset_log_level_takes_the_documented_default() {
+        // An unset field means the launcher had no override; the engine stays
+        // at `info`, which omits the VM's per-frame and exception-dump detail.
+        assert_eq!(resolve_log_level(None).expect("default"), LogLevel::Info);
+        assert_eq!(LogLevel::DEFAULT, LogLevel::Info);
+    }
+
+    #[test]
+    fn an_unknown_log_level_is_rejected_with_the_option_and_every_accepted_value() {
+        let error = resolve_log_level(Some("verbose")).expect_err("unknown level");
+        let message = error.to_string();
+        assert!(message.contains("log_level"), "{message}");
+        for level in ["off", "error", "warn", "info", "debug", "trace"] {
+            assert!(
+                message.contains(level),
+                "the rejected-value error omits '{level}': {message}"
+            );
+        }
+    }
+
+    /// The accepted-values text names every level, so a level cannot be added
+    /// without the error message naming it.
+    #[test]
+    fn the_accepted_log_level_text_names_every_level() {
+        for level in [
+            LogLevel::Off,
+            LogLevel::Error,
+            LogLevel::Warn,
+            LogLevel::Info,
+            LogLevel::Debug,
+            LogLevel::Trace,
+        ] {
+            assert!(
+                LogLevel::ACCEPTED.contains(level.as_filter()),
+                "the accepted-values text omits {:?}: {}",
+                level,
+                LogLevel::ACCEPTED
+            );
+        }
     }
 }
