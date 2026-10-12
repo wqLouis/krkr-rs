@@ -1291,6 +1291,150 @@ fn has_image_setter_deallocates_and_set_size_does_not_reallocate() {
     assert!(env.try_run("l.fillRect(0, 0, 1, 1, 0xffffffff);").is_err());
 }
 
+/// Reference: `setSizeToImageSize` is
+/// `SetSize(GetImageWidth(), GetImageHeight())`
+/// (`reference/cpp/core/visual/LayerIntf.cpp:8584-8588`); `SetSize` reaches
+/// `ImageLayerSizeChanged` (`:2121-2139`, `:2656-2674`), which clamps a
+/// negative `ImageLeft`/`ImageTop` back toward zero once the rect grows to
+/// the image size.
+#[test]
+fn set_size_to_image_size_clamps_the_image_offset() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var base = new Layer(w, null); \
+         var l = new Layer(w, null); \
+         l.setSize(20, 20); \
+         l.setImagePos(-4, -4); \
+         l.setImageSize(24, 24);",
+    );
+    // Precondition: the 20x20 rect with a 24x24 image leaves the offset at -4.
+    assert_eq!(env.eval_int("l.imageLeft"), -4);
+    assert_eq!(env.eval_int("l.imageTop"), -4);
+    // Growing the rect to 24x24 leaves the image short by 4, so the offset
+    // clamps to 0 (`:2664-2674`).
+    env.run("l.setSizeToImageSize();");
+    assert_eq!(env.eval_int("l.width"), 24);
+    assert_eq!(env.eval_int("l.height"), 24);
+    assert_eq!(env.eval_int("l.imageLeft"), 0);
+    assert_eq!(env.eval_int("l.imageTop"), 0);
+}
+
+/// Reference: `setSizeToImageSize` reads `GetImageWidth`/`GetImageHeight`,
+/// which throw `TVPNotDrawableLayerType` when there is no `MainImage`
+/// (`reference/cpp/core/visual/LayerIntf.cpp:2587-2590`, `:8584-8588`).
+#[test]
+fn set_size_to_image_size_without_image_raises() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); var base = new Layer(w, null); \
+         var l = new Layer(w, null); l.hasImage = false;",
+    );
+    let message = env
+        .try_run("l.setSizeToImageSize();")
+        .expect_err("no MainImage must raise");
+    assert!(
+        message.contains("Not drawable layer type"),
+        "unexpected message: {message}"
+    );
+}
+
+/// Reference: `SetClip` throws `TVPNotDrawableLayerType` with no `MainImage`
+/// and otherwise clamps the rectangle to the image — near edges at zero, far
+/// edges at the image bounds, far edges never before near edges
+/// (`reference/cpp/core/visual/LayerIntf.cpp:4042-4059`).
+#[test]
+fn set_clip_requires_an_image_and_intersects_it() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); var base = new Layer(w, null); \
+         var l = new Layer(w, null); l.setImageSize(4, 4); \
+         l.setClip(1, 1, 2, 2);",
+    );
+    // An in-bounds rectangle is stored unchanged.
+    assert_eq!(env.eval_int("l.clipLeft"), 1);
+    assert_eq!(env.eval_int("l.clipTop"), 1);
+    assert_eq!(env.eval_int("l.clipWidth"), 2);
+    assert_eq!(env.eval_int("l.clipHeight"), 2);
+    // The near edge clamps to zero; the far edge is measured from the
+    // original near edge, so width 3 from -1 ends at 2.
+    env.run("l.setClip(-1, -1, 3, 3);");
+    assert_eq!(env.eval_int("l.clipLeft"), 0);
+    assert_eq!(env.eval_int("l.clipTop"), 0);
+    assert_eq!(env.eval_int("l.clipWidth"), 2);
+    assert_eq!(env.eval_int("l.clipHeight"), 2);
+    // A rectangle past the image truncates at the image bounds.
+    env.run("l.setClip(0, 0, 100, 100);");
+    assert_eq!(env.eval_int("l.clipWidth"), 4);
+    assert_eq!(env.eval_int("l.clipHeight"), 4);
+    // A layer with no MainImage raises instead of keeping the old clip.
+    env.run("l.hasImage = false;");
+    let message = env
+        .try_run("l.setClip(0, 0, 1, 1);")
+        .expect_err("no MainImage must raise");
+    assert!(
+        message.contains("Not drawable layer type"),
+        "unexpected message: {message}"
+    );
+}
+
+/// Reference: `SetPosition` and `InternalSetBounds` throw
+/// `TVPCannotMovePrimary` when the layer is the window's primary layer
+/// (`reference/cpp/core/visual/LayerIntf.cpp:2203-2207`, `:2144-2147`), and
+/// `InternalSetBounds` throws `TVPInvalidParam` for a negative extent
+/// (`:2138-2142`). A zero extent is not negative, a size-only change on the
+/// primary is allowed, and a non-primary move still succeeds.
+#[test]
+fn set_pos_refuses_primary_moves_and_negative_extents() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); var base = new Layer(w, null); \
+         var l = new Layer(w, null);",
+    );
+    // The primary layer refuses a real move.
+    let message = env
+        .try_run("base.setPos(5, 7);")
+        .expect_err("moving the primary must raise");
+    assert!(
+        message.contains("Cannot move primary layer"),
+        "unexpected message: {message}"
+    );
+    // Writing the position the primary already holds is not a move.
+    env.run("base.setPos(0, 0);");
+    // A size-only change on the primary is allowed, as is `setSize`.
+    env.run("base.setPos(0, 0, 20, 30); base.setSize(10, 10);");
+    assert_eq!(env.eval_int("base.width"), 10);
+    // A negative extent is rejected before the move is considered.
+    let message = env
+        .try_run("base.setPos(5, 7, -1, 10);")
+        .expect_err("a negative extent must raise");
+    assert!(
+        message.contains("Invalid argument"),
+        "unexpected message: {message}"
+    );
+    // A zero extent is not negative and must not raise; the non-primary
+    // layer also moves freely.
+    env.run("l.setPos(-4, -6, 0, 0);");
+    assert_eq!(env.eval_int("l.left"), -4);
+    assert_eq!(env.eval_int("l.top"), -6);
+    assert_eq!(env.eval_int("l.width"), 0);
+    assert_eq!(env.eval_int("l.height"), 0);
+    env.run("l.setPos(7, 8);");
+    assert_eq!(env.eval_int("l.left"), 7);
+    assert_eq!(env.eval_int("l.top"), 8);
+    // A void third/fourth argument is a position-only move, so the size is
+    // kept (`reference/cpp/core/visual/LayerIntf.cpp:8559-8564`).
+    env.run("l.setSize(20, 30); l.setPos(5, 7, void, void);");
+    assert_eq!(env.eval_int("l.width"), 20);
+    assert_eq!(env.eval_int("l.height"), 30);
+    assert_eq!(env.eval_int("l.left"), 5);
+    assert_eq!(env.eval_int("l.top"), 7);
+}
+
 /// Reference: with `omAuto` (the default) `operateRect` replaces the mode
 /// by the source layer's `GetOperationModeFromType()`
 /// (`reference/cpp/core/visual/LayerIntf.cpp:8996-8999`), which shares the

@@ -285,9 +285,12 @@ extern "C" fn layer_set_pos(
     let a = unsafe { args(argv, argc) };
     let x = value_as_i64(&a[0]) as i32;
     let y = value_as_i64(&a[1]) as i32;
-    let size = match (a.get(2), a.get(3)) {
-        (Some(w), Some(h)) => Some((value_as_i64(w).max(0) as u32, value_as_i64(h).max(0) as u32)),
-        _ => None,
+    // A bounds request is exactly four arguments whose third and fourth are
+    // not void; otherwise the call is a position-only move.
+    let size = if argc == 4 && a[2].ty != VAL_VOID && a[3].ty != VAL_VOID {
+        Some((value_as_i64(&a[2]) as i32, value_as_i64(&a[3]) as i32))
+    } else {
+        None
     };
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Layer.setPos: compat context is not bound");
@@ -301,6 +304,21 @@ extern "C" fn layer_set_pos(
         Ok(scene) => scene,
         Err(error) => return report_error(out_error, &error),
     };
+    // A negative extent is rejected before the move is considered.
+    if let Some((width, height)) = size
+        && (width < 0 || height < 0)
+    {
+        return report_error(out_error, "Layer.setPos: Invalid argument");
+    }
+    let Some((current_x, current_y)) = scene.layer(id).map(|layer| (layer.rect.x, layer.rect.y))
+    else {
+        return report_error(out_error, "Layer.setPos: this layer is not constructed");
+    };
+    // Only a position change is refused on the primary layer; a size-only
+    // change, or writing the position it already holds, is allowed.
+    if (current_x != x || current_y != y) && scene.is_primary_layer(id) && (x != 0 || y != 0) {
+        return report_error(out_error, "Layer.setPos: Cannot move primary layer");
+    }
     // The position guard and the size guard are independent: a repeated
     // position write does not run `layer_size_changed`, and a repeated size
     // write does not re-run the position half.
@@ -312,13 +330,14 @@ extern "C" fn layer_set_pos(
             layer.rect.y = y;
             changed = true;
         }
-        if let Some((w, h)) = size
-            && (layer.rect.w != w || layer.rect.h != h)
-        {
-            layer.rect.w = w;
-            layer.rect.h = h;
-            size_changed = true;
-            changed = true;
+        if let Some((w, h)) = size {
+            let (w, h) = (w as u32, h as u32);
+            if layer.rect.w != w || layer.rect.h != h {
+                layer.rect.w = w;
+                layer.rect.h = h;
+                size_changed = true;
+                changed = true;
+            }
         }
         changed
     });
@@ -401,20 +420,28 @@ extern "C" fn layer_set_size_to_image_size(
         Ok(scene) => scene,
         Err(error) => return report_error(out_error, &error),
     };
-    if let Some((width, height)) = scene
+    // A layer with no MainImage raises instead of leaving the rect unchanged.
+    let Some((width, height)) = scene
         .layer(id)
         .and_then(|l| l.bitmap)
         .and_then(|bitmap| scene.bitmap(bitmap))
         .map(|b| (b.width, b.height))
+    else {
+        return report_error(
+            out_error,
+            "Layer.setSizeToImageSize: Not drawable layer type",
+        );
+    };
+    if scene.update_layer(id, |layer| {
+        if layer.rect.w == width && layer.rect.h == height {
+            return false;
+        }
+        layer.rect.w = width;
+        layer.rect.h = height;
+        true
+    }) == Some(true)
     {
-        let _ = scene.update_layer(id, |layer| {
-            if layer.rect.w == width && layer.rect.h == height {
-                return false;
-            }
-            layer.rect.w = width;
-            layer.rect.h = height;
-            true
-        });
+        scene.layer_size_changed(id);
     }
     set_void(out);
     0
@@ -1034,10 +1061,10 @@ extern "C" fn layer_set_clip(
     }
     // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
-    let x = value_as_i64(&a[0]) as i32;
-    let y = value_as_i64(&a[1]) as i32;
-    let w = value_as_i64(&a[2]).max(0) as u32;
-    let h = value_as_i64(&a[3]).max(0) as u32;
+    let left = value_as_i64(&a[0]) as i32;
+    let top = value_as_i64(&a[1]) as i32;
+    let width = value_as_i64(&a[2]) as i32;
+    let height = value_as_i64(&a[3]) as i32;
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Layer.setClip: compat context is not bound");
     };
@@ -1050,8 +1077,33 @@ extern "C" fn layer_set_clip(
         Ok(scene) => scene,
         Err(error) => return report_error(out_error, &error),
     };
+    // A layer with no MainImage raises rather than storing the rectangle.
+    let Some((image_w, image_h)) = scene
+        .layer(id)
+        .and_then(|layer| layer.bitmap)
+        .and_then(|bitmap| scene.bitmap(bitmap))
+        .map(|bitmap| (bitmap.width, bitmap.height))
+    else {
+        return report_error(out_error, "Layer.setClip: Not drawable layer type");
+    };
+    // Clamp the near edge at zero, the far edge at the image bounds, and the
+    // far edge at or past the near edge. The far edge is measured from the
+    // unclamped near edge.
+    let left_clamped = i64::from(left).max(0);
+    let top_clamped = i64::from(top).max(0);
+    let right = (i64::from(width) + i64::from(left))
+        .min(i64::from(image_w))
+        .max(left_clamped);
+    let bottom = (i64::from(height) + i64::from(top))
+        .min(i64::from(image_h))
+        .max(top_clamped);
     if let Some(layer) = scene.layer_mut(id) {
-        layer.clip = Some(Rect::new(x, y, w, h));
+        layer.clip = Some(Rect::new(
+            left_clamped as i32,
+            top_clamped as i32,
+            (right - left_clamped) as u32,
+            (bottom - top_clamped) as u32,
+        ));
     }
     set_void(out);
     0

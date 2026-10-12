@@ -113,6 +113,7 @@ fn window_and_layer_round_trip_through_the_scene() {
          w.setSize(320, 240); \
          w.setPos(5, 6); \
          w.caption = 'hello'; \
+         var base = new Layer(w, null); \
          var l = new Layer(w, null); \
          l.setPos(10, 20); \
          l.setSize(100, 50); \
@@ -128,7 +129,14 @@ fn window_and_layer_round_trip_through_the_scene() {
     assert_eq!(env.eval_int("w.left"), 5);
     assert_eq!(env.eval_int("w.top"), 6);
 
-    let layer = env.scene.layers.first().expect("one layer");
+    // The first layer on a window is its primary layer, which the reference
+    // refuses to move (`reference/cpp/core/visual/LayerIntf.cpp:2206-2207`).
+    let layer = env
+        .scene
+        .layers
+        .iter()
+        .find(|layer| layer.name == "sprite")
+        .expect("the sprite layer");
     assert_eq!((layer.rect.x, layer.rect.y), (10, 20));
     assert_eq!((layer.rect.w, layer.rect.h), (100, 50));
     assert!(layer.visible);
@@ -525,6 +533,7 @@ fn layer_cursor_reads_the_pointer_touch_and_layer_offset() {
     let env = Env::new();
     env.run(
         "var w = new Window(); \
+         var base = new Layer(w, null); \
          var l = new Layer(w, null); \
          l.setPos(10, 20); \
          var c = new Layer(w, l); \
