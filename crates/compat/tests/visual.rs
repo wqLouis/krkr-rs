@@ -266,6 +266,8 @@ fn focus_and_children_round_trip() {
          parent.name = 'parent'; \
          var child = new Layer(w, parent); \
          child.name = 'child'; \
+         child.focusable = true; \
+         child.visible = true; \
          w.focusedLayer = child; \
          var focused = w.focusedLayer;",
     );

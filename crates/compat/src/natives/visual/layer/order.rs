@@ -16,8 +16,8 @@ use std::ffi::{c_char, c_int, c_void};
 use engine::Scene;
 use tjs::{NativeInstanceMethodDef, Value};
 
-use super::super::common::{resolve_object_id, scene_mut};
-use super::{LayerExtras, LayerInst, bound};
+use super::super::common::{resolve_object_id, scene_mut, scene_ref};
+use super::{LayerExtras, LayerInst, bound, clear_layer_focus, focus_layer};
 use crate::native_util::{args, report_error, set_void};
 
 /// Mutable access to the sibling order vector that holds `id`.
@@ -309,14 +309,22 @@ extern "C" fn layer_set_mode(
                 "Layer.setMode: cannot set mode to a disabled or parent-hidden layer".into(),
             );
         }
-        match first_focusable_subtree(scene, id) {
+        let (window, target) = {
+            let scene = scene_mut(&ctx)?;
+            let Some(window) = scene.layer(id).map(|l| l.window) else {
+                return Err("Layer.setMode: this layer no longer exists".into());
+            };
+            (window, first_focusable_subtree(scene, id))
+        };
+        // Focus moves to the first focusable node of the modal's subtree
+        // with direction forward (`LayerManager.cpp:855`); the helper fires
+        // `onBlur`/`onFocus` synchronously.
+        match target {
             Some(target) => {
-                scene.set_focus(target);
+                focus_layer(&ctx, target, true);
             }
             None => {
-                if let Some(window) = scene.layer(id).map(|l| l.window) {
-                    scene.clear_focus(window);
-                }
+                clear_layer_focus(&ctx, window, true);
             }
         }
         {
@@ -361,17 +369,23 @@ extern "C" fn layer_remove_mode(
         had
     };
     if was_modal {
-        let scene = match scene_mut(&ctx) {
-            Ok(scene) => scene,
-            Err(error) => return report_error(out_error, &error),
+        let (window, next) = {
+            let scene = match scene_ref(&ctx) {
+                Ok(scene) => scene,
+                Err(error) => return report_error(out_error, &error),
+            };
+            (scene.layer(id).map(|l| l.window), scene.next_focusable(id))
         };
-        match scene.next_focusable(id) {
-            Some(next) => {
-                scene.set_focus(next);
-            }
-            None => {
-                if let Some(window) = scene.layer(id).map(|l| l.window) {
-                    scene.clear_focus(window);
+        if let Some(window) = window {
+            // `RemoveModeFrom` hands focus to `layer->GetNextFocusable()`
+            // with direction forward (`LayerManager.cpp:876-883`); the
+            // helper fires `onBlur`/`onFocus` synchronously.
+            match next {
+                Some(next) => {
+                    focus_layer(&ctx, next, true);
+                }
+                None => {
+                    clear_layer_focus(&ctx, window, true);
                 }
             }
         }

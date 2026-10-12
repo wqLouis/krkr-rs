@@ -490,11 +490,11 @@ fn resolve_pointer(ctx: &CompatCtx, name: &str) -> Option<u32> {
         hit_layer(ctx, x, y)
     });
     if name == "onMouseDown" {
+        // The reference press path sets the mouse capture and fires
+        // `onMouseDown`; it never moves layer focus
+        // (`reference/cpp/core/visual/LayerManager.cpp:374-399`).
         match hit {
-            Some(id) => {
-                set_capture_layer(ctx, Some(id));
-                focus_clicked_layer(ctx, id);
-            }
+            Some(id) => set_capture_layer(ctx, Some(id)),
             None => set_capture_layer(ctx, None),
         }
     } else if name == "onMouseUp" && !any_mouse_button_down(ctx) {
@@ -671,21 +671,6 @@ fn set_capture_layer(ctx: &CompatCtx, layer: Option<u32>) {
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
     let services = unsafe { ctx.services() };
     services.state::<InputDispatchState>().mouse_capture = layer;
-}
-
-/// Give a clicked focusable layer the keyboard focus.
-fn focus_clicked_layer(ctx: &CompatCtx, id: u32) {
-    if !scene(ctx).is_some_and(|scene| scene.node_focusable(id)) {
-        return;
-    }
-    // SAFETY: a `CompatCtx` is only created for a bound, live engine.
-    let services = unsafe { ctx.services() };
-    let Some(scene) = services.scene() else {
-        return;
-    };
-    // SAFETY: `attach_scene` keeps the pointer valid while the binding is
-    // installed.
-    unsafe { &mut *scene }.set_focus(id);
 }
 
 /// Deliver a mapped event and report a missing or throwing handler.

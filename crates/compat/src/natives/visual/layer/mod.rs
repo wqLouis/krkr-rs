@@ -29,6 +29,7 @@ mod transitions;
 mod util;
 
 pub use focus::take_capture_releases;
+pub(crate) use focus::{blur_tree, clear_layer_focus, focus_layer};
 pub use transitions::advance_transitions;
 
 /// Per-layer L3 state that has no home in the L2 [`engine::Scene`] yet: the
@@ -160,6 +161,10 @@ extern "C" fn layer_invalidate(engine: *mut c_void, instance: *mut c_void) {
     let Ok((_resolved, ctx)) = bound(engine) else {
         return;
     };
+    // Reference `Part()` blurs the focused subtree while the layer is still
+    // in the tree (`reference/cpp/core/visual/LayerIntf.cpp:624-631` via
+    // `LayerManager.cpp:197-201`, `:690-711`).
+    blur_tree(&ctx, id);
     if let Ok(scene) = scene_mut(&ctx) {
         // Detach the layer from the scene so hit-testing and event dispatch
         // no longer resolve it once its script object is invalidated.
@@ -941,6 +946,22 @@ extern "C" fn layer_set_parent_id(
     let Some(id) = inst.id else {
         return report_error(out_error, "Layer.parent: this layer is not constructed");
     };
+    let old_parent = {
+        let scene = match scene_ref(&ctx) {
+            Ok(scene) => scene,
+            Err(error) => return report_error(out_error, &error),
+        };
+        scene.layer(id).and_then(|l| l.parent)
+    };
+    // Reference `Join` calls `Part()` while the layer is still attached to
+    // its old parent and only then re-attaches it
+    // (`reference/cpp/core/visual/LayerIntf.cpp:619-621`); `Part()` fires
+    // `NotifyPart` -> `BlurTree` before the sever, so the blur sees the
+    // pre-move tree (`LayerIntf.cpp:624-631`, `LayerManager.cpp:197-201`,
+    // `:690-711`).
+    if old_parent.is_some() {
+        blur_tree(&ctx, id);
+    }
     let scene = match scene_mut(&ctx) {
         Ok(scene) => scene,
         Err(error) => return report_error(out_error, &error),
@@ -950,12 +971,16 @@ extern "C" fn layer_set_parent_id(
     0
 }
 
-/// `Layer.focus()` — give the layer keyboard focus.
+/// `Layer.focus([direction])` — give the layer keyboard focus.
+///
+/// The optional argument is the focus direction: the reference native reads
+/// `param[0]->operator bool()`, defaulting to `true`
+/// (`reference/cpp/core/visual/LayerIntf.cpp:9726-9742`).
 extern "C" fn layer_focus(
     engine: *mut c_void,
     instance: *mut c_void,
-    _argc: c_int,
-    _argv: *const Value,
+    argc: c_int,
+    argv: *const Value,
     out: *mut Value,
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
@@ -963,16 +988,18 @@ extern "C" fn layer_focus(
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Layer.focus: compat context is not bound");
     };
+    let direction = if argc >= 1 {
+        // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
+        value_as_bool(&unsafe { args(argv, argc) }[0])
+    } else {
+        true
+    };
     // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_focus`.
     let inst = unsafe { &*(instance as *const LayerInst) };
     let Some(id) = inst.id else {
         return report_error(out_error, "Layer.focus: this layer is not constructed");
     };
-    let scene = match scene_mut(&ctx) {
-        Ok(scene) => scene,
-        Err(error) => return report_error(out_error, &error),
-    };
-    scene.set_focus(id);
+    focus_layer(&ctx, id, direction);
     set_void(out);
     0
 }
@@ -1078,32 +1105,15 @@ extern "C" fn layer_set_clip(
         Err(error) => return report_error(out_error, &error),
     };
     // A layer with no MainImage raises rather than storing the rectangle.
-    let Some((image_w, image_h)) = scene
-        .layer(id)
-        .and_then(|layer| layer.bitmap)
-        .and_then(|bitmap| scene.bitmap(bitmap))
-        .map(|bitmap| (bitmap.width, bitmap.height))
-    else {
-        return report_error(out_error, "Layer.setClip: Not drawable layer type");
-    };
-    // Clamp the near edge at zero, the far edge at the image bounds, and the
-    // far edge at or past the near edge. The far edge is measured from the
-    // unclamped near edge.
-    let left_clamped = i64::from(left).max(0);
-    let top_clamped = i64::from(top).max(0);
-    let right = (i64::from(width) + i64::from(left))
-        .min(i64::from(image_w))
-        .max(left_clamped);
-    let bottom = (i64::from(height) + i64::from(top))
-        .min(i64::from(image_h))
-        .max(top_clamped);
-    if let Some(layer) = scene.layer_mut(id) {
-        layer.clip = Some(Rect::new(
-            left_clamped as i32,
-            top_clamped as i32,
-            (right - left_clamped) as u32,
-            (bottom - top_clamped) as u32,
-        ));
+    if let Err(error) = set_clip_rect(
+        scene,
+        id,
+        i64::from(left),
+        i64::from(top),
+        i64::from(width),
+        i64::from(height),
+    ) {
+        return report_error(out_error, &format!("Layer.setClip: {error}"));
     }
     set_void(out);
     0
@@ -1350,6 +1360,116 @@ fn with_layer_write(
     }
 }
 
+/// [`with_layer_write`], then [`blur_tree`] on the layer when the write
+/// changed it and the flag now reads off — the reference
+/// `SetVisible(false)` / `SetEnabled(false)` / `SetFocusable(false)` each
+/// blur the focused subtree the change made unusable
+/// (`reference/cpp/core/visual/LayerIntf.cpp:1183-1206`, `:3801-3832`,
+/// `:3683-3696`).
+fn with_layer_write_blur(
+    engine: *mut c_void,
+    instance: *mut c_void,
+    value: &Value,
+    f: impl FnOnce(&mut LayerState, &Value) -> bool,
+    off: impl FnOnce(&LayerState) -> bool,
+) -> Result<(), String> {
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `with_layer_write_blur`.
+    let inst = unsafe { &*(instance as *const LayerInst) };
+    let id = inst
+        .id
+        .ok_or_else(|| "Layer: this layer is not constructed".to_string())?;
+    let (_resolved, ctx) = bound(engine)?;
+    let scene = scene_mut(&ctx)?;
+    let changed = match scene.update_layer(id, |layer| f(layer, value)) {
+        Some(changed) => changed,
+        None => return Err("Layer: layer no longer exists".to_string()),
+    };
+    if changed && scene.layer(id).is_some_and(off) {
+        blur_tree(&ctx, id);
+    }
+    Ok(())
+}
+
+/// Mutate the layer through the bound scene with the whole scene handed to
+/// the setter: a property write that must refuse before it stores (the
+/// position setters) or run scene-level follow-up after it (the size
+/// setters) needs the scene the value lives in, not just the layer. The
+/// setter owns change detection — it decides whether the write invalidates
+/// and whether its follow-up runs.
+fn with_layer_scene(
+    engine: *mut c_void,
+    instance: *mut c_void,
+    value: &Value,
+    f: impl FnOnce(&mut Scene, u32, &Value) -> Result<(), String>,
+) -> Result<(), String> {
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `with_layer_scene`.
+    let inst = unsafe { &*(instance as *const LayerInst) };
+    let id = inst
+        .id
+        .ok_or_else(|| "Layer: this layer is not constructed".to_string())?;
+    let (_resolved, ctx) = bound(engine)?;
+    let scene = scene_mut(&ctx)?;
+    f(scene, id, value)
+}
+
+/// The clip rectangle the `clip*` getters report: the stored clip, or the
+/// whole image while no clip has been stored.
+fn effective_clip(layer: &LayerState) -> Rect {
+    layer
+        .clip
+        .unwrap_or_else(|| Rect::new(0, 0, layer.image_width, layer.image_height))
+}
+
+/// The clip a `clip*` property setter writes its own edge into — the same
+/// read the getters do, so the stored value the script last read is the
+/// value the next write intersects from.
+fn current_clip(scene: &Scene, id: u32) -> Result<Rect, String> {
+    scene
+        .layer(id)
+        .map(effective_clip)
+        .ok_or_else(|| "Layer: layer no longer exists".to_string())
+}
+
+/// Store `left`/`top`/`width`/`height` intersected with the layer's
+/// MainImage — the rectangle both the `setClip` method and the `clip*`
+/// property setters store. Without an image nothing is stored and
+/// `Not drawable layer type` is returned. The near edges clamp at zero, the
+/// far edges at the image bounds measured from the unclamped near edge, and
+/// a far edge never precedes its near edge. `left`/`top` arrive bounded by
+/// `tjs_int`; `width`/`height` only reach the stored rectangle through the
+/// image bounds.
+fn set_clip_rect(
+    scene: &mut Scene,
+    id: u32,
+    left: i64,
+    top: i64,
+    width: i64,
+    height: i64,
+) -> Result<(), String> {
+    let Some((image_w, image_h)) = scene
+        .layer(id)
+        .and_then(|layer| layer.bitmap)
+        .and_then(|bitmap| scene.bitmap(bitmap))
+        .map(|bitmap| (i64::from(bitmap.width), i64::from(bitmap.height)))
+    else {
+        return Err("Not drawable layer type".to_string());
+    };
+    let left_clamped = left.max(0);
+    let top_clamped = top.max(0);
+    let right = (width + left).min(image_w).max(left_clamped);
+    let bottom = (height + top).min(image_h).max(top_clamped);
+    let Some(layer) = scene.layer_mut(id) else {
+        return Err("layer no longer exists".to_string());
+    };
+    layer.clip = Some(Rect::new(
+        left_clamped as i32,
+        top_clamped as i32,
+        (right - left_clamped) as u32,
+        (bottom - top_clamped) as u32,
+    ));
+    Ok(())
+}
+
 /// Define a read-only `Layer` integer property (getter only, no setter).
 macro_rules! layer_int_get {
     ($get:ident, $getter:expr) => {
@@ -1374,21 +1494,7 @@ macro_rules! layer_int_get {
 /// Define a read/write layer property over an `i64`/bool field.
 macro_rules! layer_int_prop {
     ($get:ident, $set:ident, $getter:expr, $setter:expr) => {
-        extern "C" fn $get(
-            engine: *mut c_void,
-            instance: *mut c_void,
-            out: *mut Value,
-            out_error: *mut *mut c_char,
-            _objthis: *mut c_void,
-        ) -> c_int {
-            match with_layer_read(engine, instance, $getter) {
-                Ok(value) => {
-                    set_int(out, value);
-                    0
-                }
-                Err(error) => report_error(out_error, &error),
-            }
-        }
+        layer_int_get!($get, $getter);
         extern "C" fn $set(
             engine: *mut c_void,
             instance: *mut c_void,
@@ -1406,7 +1512,54 @@ macro_rules! layer_int_prop {
     };
 }
 
-layer_int_prop!(
+/// Define a boolean layer property whose setter blurs the focused subtree
+/// when the flag turns off; the citations live on
+/// [`with_layer_write_blur`].
+macro_rules! layer_blur_off_prop {
+    ($get:ident, $set:ident, $getter:expr, $setter:expr, $off:expr) => {
+        layer_int_get!($get, $getter);
+        extern "C" fn $set(
+            engine: *mut c_void,
+            instance: *mut c_void,
+            value: *const Value,
+            out_error: *mut *mut c_char,
+            _objthis: *mut c_void,
+        ) -> c_int {
+            // SAFETY: the trampoline passes a valid value slot.
+            let value = unsafe { &*value };
+            match with_layer_write_blur(engine, instance, value, $setter, $off) {
+                Ok(()) => 0,
+                Err(error) => report_error(out_error, &error),
+            }
+        }
+    };
+}
+
+/// Define a read/write layer property whose setter needs the whole scene:
+/// it can raise before it stores and run scene-level follow-up after it.
+/// The setter receives the scene, the layer id and the script value, and
+/// returns the error to raise, if any.
+macro_rules! layer_int_prop_scene {
+    ($get:ident, $set:ident, $getter:expr, $setter:expr) => {
+        layer_int_get!($get, $getter);
+        extern "C" fn $set(
+            engine: *mut c_void,
+            instance: *mut c_void,
+            value: *const Value,
+            out_error: *mut *mut c_char,
+            _objthis: *mut c_void,
+        ) -> c_int {
+            // SAFETY: the trampoline passes a valid value slot.
+            let value = unsafe { &*value };
+            match with_layer_scene(engine, instance, value, $setter) {
+                Ok(()) => 0,
+                Err(error) => report_error(out_error, &error),
+            }
+        }
+    };
+}
+
+layer_blur_off_prop!(
     layer_visible_get,
     layer_visible_set,
     |l: &LayerState| i64::from(l.visible),
@@ -1418,7 +1571,8 @@ layer_int_prop!(
         }
         l.visible = visible;
         true
-    }
+    },
+    |l: &LayerState| !l.visible
 );
 layer_int_prop!(
     layer_type_get,
@@ -1433,56 +1587,110 @@ layer_int_prop!(
         true
     }
 );
-layer_int_prop!(
+layer_int_prop_scene!(
     layer_left_get,
     layer_left_set,
     |l: &LayerState| i64::from(l.rect.x),
-    |l: &mut LayerState, v: &Value| {
+    |scene: &mut Scene, id: u32, v: &Value| {
         let left = value_as_i64(v) as i32;
-        if l.rect.x == left {
-            return false;
+        let current = scene
+            .layer(id)
+            .map(|layer| layer.rect.x)
+            .ok_or_else(|| "Layer: layer no longer exists".to_string())?;
+        // A primary layer refuses a real move to a nonzero left; writing
+        // the value the layer already holds stores nothing and raises
+        // nothing.
+        if current != left && scene.is_primary_layer(id) && left != 0 {
+            return Err("Layer: Cannot move primary layer".to_string());
         }
-        l.rect.x = left;
-        true
+        match scene.update_layer(id, |layer| {
+            if layer.rect.x == left {
+                return false;
+            }
+            layer.rect.x = left;
+            true
+        }) {
+            Some(_) => Ok(()),
+            None => Err("Layer: layer no longer exists".to_string()),
+        }
     }
 );
-layer_int_prop!(
+layer_int_prop_scene!(
     layer_top_get,
     layer_top_set,
     |l: &LayerState| i64::from(l.rect.y),
-    |l: &mut LayerState, v: &Value| {
+    |scene: &mut Scene, id: u32, v: &Value| {
         let top = value_as_i64(v) as i32;
-        if l.rect.y == top {
-            return false;
+        let current = scene
+            .layer(id)
+            .map(|layer| layer.rect.y)
+            .ok_or_else(|| "Layer: layer no longer exists".to_string())?;
+        // A primary layer refuses a real move to a nonzero top; writing
+        // the value the layer already holds stores nothing and raises
+        // nothing.
+        if current != top && scene.is_primary_layer(id) && top != 0 {
+            return Err("Layer: Cannot move primary layer".to_string());
         }
-        l.rect.y = top;
-        true
+        match scene.update_layer(id, |layer| {
+            if layer.rect.y == top {
+                return false;
+            }
+            layer.rect.y = top;
+            true
+        }) {
+            Some(_) => Ok(()),
+            None => Err("Layer: layer no longer exists".to_string()),
+        }
     }
 );
-layer_int_prop!(
+layer_int_prop_scene!(
     layer_width_get,
     layer_width_set,
     |l: &LayerState| i64::from(l.rect.w),
-    |l: &mut LayerState, v: &Value| {
+    |scene: &mut Scene, id: u32, v: &Value| {
         let width = value_as_i64(v).max(0) as u32;
-        if l.rect.w == width {
-            return false;
+        match scene.update_layer(id, |layer| {
+            if layer.rect.w == width {
+                return false;
+            }
+            layer.rect.w = width;
+            true
+        }) {
+            Some(true) => {
+                // A changed extent grows the MainImage when it no longer
+                // covers the rectangle and shifts the image offset so the
+                // image still covers it; an imageless layer runs nothing.
+                scene.layer_size_changed(id);
+                Ok(())
+            }
+            Some(false) => Ok(()),
+            None => Err("Layer: layer no longer exists".to_string()),
         }
-        l.rect.w = width;
-        true
     }
 );
-layer_int_prop!(
+layer_int_prop_scene!(
     layer_height_get,
     layer_height_set,
     |l: &LayerState| i64::from(l.rect.h),
-    |l: &mut LayerState, v: &Value| {
+    |scene: &mut Scene, id: u32, v: &Value| {
         let height = value_as_i64(v).max(0) as u32;
-        if l.rect.h == height {
-            return false;
+        match scene.update_layer(id, |layer| {
+            if layer.rect.h == height {
+                return false;
+            }
+            layer.rect.h = height;
+            true
+        }) {
+            Some(true) => {
+                // A changed extent grows the MainImage when it no longer
+                // covers the rectangle and shifts the image offset so the
+                // image still covers it; an imageless layer runs nothing.
+                scene.layer_size_changed(id);
+                Ok(())
+            }
+            Some(false) => Ok(()),
+            None => Err("Layer: layer no longer exists".to_string()),
         }
-        l.rect.h = height;
-        true
     }
 );
 layer_int_prop!(
@@ -1571,7 +1779,7 @@ layer_int_get!(layer_image_width_get, |l: &LayerState| i64::from(
 layer_int_get!(layer_image_height_get, |l: &LayerState| i64::from(
     l.image_height
 ));
-layer_int_prop!(
+layer_blur_off_prop!(
     layer_focusable_get,
     layer_focusable_set,
     |l: &LayerState| i64::from(l.focusable),
@@ -1582,7 +1790,8 @@ layer_int_prop!(
         }
         l.focusable = focusable;
         true
-    }
+    },
+    |l: &LayerState| !l.focusable
 );
 layer_int_prop!(
     layer_join_focus_chain_get,
@@ -1593,7 +1802,7 @@ layer_int_prop!(
         true
     }
 );
-layer_int_prop!(
+layer_blur_off_prop!(
     layer_enabled_get,
     layer_enabled_set,
     |l: &LayerState| i64::from(l.enabled),
@@ -1604,7 +1813,8 @@ layer_int_prop!(
         }
         l.enabled = enabled;
         true
-    }
+    },
+    |l: &LayerState| !l.enabled
 );
 layer_int_prop!(
     layer_cached_get,
@@ -1713,44 +1923,76 @@ layer_int_prop!(
         true
     }
 );
-layer_int_prop!(
+layer_int_prop_scene!(
     layer_clip_left_get,
     layer_clip_left_set,
-    |l: &LayerState| i64::from(l.clip.map_or(0, |c| c.x)),
-    |l: &mut LayerState, v: &Value| {
-        let rect = l.clip.get_or_insert(Rect::default());
-        rect.x = value_as_i64(v) as i32;
-        true
+    |l: &LayerState| i64::from(effective_clip(l).x),
+    |scene: &mut Scene, id: u32, v: &Value| {
+        let left = value_as_i64(v) as i32;
+        let clip = current_clip(scene, id)?;
+        set_clip_rect(
+            scene,
+            id,
+            i64::from(left),
+            i64::from(clip.y),
+            i64::from(clip.w),
+            i64::from(clip.h),
+        )
+        .map_err(|error| format!("Layer: {error}"))
     }
 );
-layer_int_prop!(
+layer_int_prop_scene!(
     layer_clip_top_get,
     layer_clip_top_set,
-    |l: &LayerState| i64::from(l.clip.map_or(0, |c| c.y)),
-    |l: &mut LayerState, v: &Value| {
-        let rect = l.clip.get_or_insert(Rect::default());
-        rect.y = value_as_i64(v) as i32;
-        true
+    |l: &LayerState| i64::from(effective_clip(l).y),
+    |scene: &mut Scene, id: u32, v: &Value| {
+        let top = value_as_i64(v) as i32;
+        let clip = current_clip(scene, id)?;
+        set_clip_rect(
+            scene,
+            id,
+            i64::from(clip.x),
+            i64::from(top),
+            i64::from(clip.w),
+            i64::from(clip.h),
+        )
+        .map_err(|error| format!("Layer: {error}"))
     }
 );
-layer_int_prop!(
+layer_int_prop_scene!(
     layer_clip_width_get,
     layer_clip_width_set,
-    |l: &LayerState| i64::from(l.clip.map_or(l.image_width, |c| c.w)),
-    |l: &mut LayerState, v: &Value| {
-        let rect = l.clip.get_or_insert(Rect::default());
-        rect.w = value_as_i64(v).max(0) as u32;
-        true
+    |l: &LayerState| i64::from(effective_clip(l).w),
+    |scene: &mut Scene, id: u32, v: &Value| {
+        let width = value_as_i64(v) as i32;
+        let clip = current_clip(scene, id)?;
+        set_clip_rect(
+            scene,
+            id,
+            i64::from(clip.x),
+            i64::from(clip.y),
+            i64::from(width),
+            i64::from(clip.h),
+        )
+        .map_err(|error| format!("Layer: {error}"))
     }
 );
-layer_int_prop!(
+layer_int_prop_scene!(
     layer_clip_height_get,
     layer_clip_height_set,
-    |l: &LayerState| i64::from(l.clip.map_or(l.image_height, |c| c.h)),
-    |l: &mut LayerState, v: &Value| {
-        let rect = l.clip.get_or_insert(Rect::default());
-        rect.h = value_as_i64(v).max(0) as u32;
-        true
+    |l: &LayerState| i64::from(effective_clip(l).h),
+    |scene: &mut Scene, id: u32, v: &Value| {
+        let height = value_as_i64(v) as i32;
+        let clip = current_clip(scene, id)?;
+        set_clip_rect(
+            scene,
+            id,
+            i64::from(clip.x),
+            i64::from(clip.y),
+            i64::from(clip.w),
+            i64::from(height),
+        )
+        .map_err(|error| format!("Layer: {error}"))
     }
 );
 

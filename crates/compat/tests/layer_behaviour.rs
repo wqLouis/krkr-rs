@@ -23,6 +23,14 @@
 //!   instance properties would change the locked VM surface. The
 //!   class-qualified access the reference documentation uses
 //!   (`PassThroughDrawDevice.cpp:29-70`) is pinned below.
+//! * `setSize` (and the `width`/`height` property setters) clamps a negative
+//!   extent to zero rather than storing the reference's wrapped `tjs_uint`,
+//!   under which `layer.width` reads `4294967295` while the image stays
+//!   untouched (`reference/cpp/core/visual/LayerIntf.cpp:8579`, `:2121-2139`,
+//!   `:2664-2674`); emulating it needs the scene rectangle to carry the
+//!   wrapped extent and every consumer of `rect.w`/`rect.h` to read it
+//!   through the reference's signed view, which reaches past the audited
+//!   files.
 
 mod common;
 
@@ -582,8 +590,12 @@ fn set_attention_pos_stores_both_components() {
 fn set_cursor_pos_accumulates_the_parent_chain_offsets() {
     let _lock = vm_lock();
     let mut env = Env::new();
+    // The first layer of a window is its primary layer, which the reference
+    // refuses to move (`reference/cpp/core/visual/LayerIntf.cpp:2163-2179`),
+    // so `g` gets a throwaway primary layer before it.
     env.run(
         "var w = new Window(); \
+         var base = new Layer(w, null); \
          var g = new Layer(w, null); g.left = 10; g.top = 20; \
          var p = new Layer(w, g); p.left = 30; p.top = 40; \
          var c = new Layer(w, p); c.left = 5; c.top = 6; \
@@ -1433,6 +1445,155 @@ fn set_pos_refuses_primary_moves_and_negative_extents() {
     assert_eq!(env.eval_int("l.height"), 30);
     assert_eq!(env.eval_int("l.left"), 5);
     assert_eq!(env.eval_int("l.top"), 7);
+}
+
+/// Reference: the `left`/`top` property setters are `SetLeft`/`SetTop`
+/// (`reference/cpp/core/visual/LayerIntf.cpp:10699`, `:10717`), which throw
+/// `TVPCannotMovePrimary` exactly when the written value differs from the
+/// stored one and is nonzero on the primary layer (`:2163-2179`,
+/// `:2183-2199`) — the per-field projection of `SetPosition`'s condition
+/// (`:2203-2207`). The size properties carry no primary guard
+/// (`:2220-2249`).
+#[test]
+fn left_and_top_property_writes_refuse_the_primary_layer() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var base = new Layer(w, null); \
+         var l = new Layer(w, null);",
+    );
+    // The primary layer refuses a real move through either property.
+    let message = env
+        .try_run("base.left = 5;")
+        .expect_err("moving the primary must raise");
+    assert!(
+        message.contains("Cannot move primary layer"),
+        "unexpected message: {message}"
+    );
+    let message = env
+        .try_run("base.top = 7;")
+        .expect_err("moving the primary must raise");
+    assert!(
+        message.contains("Cannot move primary layer"),
+        "unexpected message: {message}"
+    );
+    // A refused write stores nothing.
+    assert_eq!(env.eval_int("base.left"), 0);
+    assert_eq!(env.eval_int("base.top"), 0);
+    // Writing the value the primary already holds is not a change
+    // (`reference/cpp/core/visual/LayerIntf.cpp:2164`, `:2184`).
+    env.run("base.left = 0; base.top = 0;");
+    // The size properties have no primary guard (`:2220-2249`).
+    env.run("base.width = 30; base.height = 40;");
+    assert_eq!(env.eval_int("base.width"), 30);
+    assert_eq!(env.eval_int("base.height"), 40);
+    // A non-primary layer moves freely.
+    env.run("l.left = 7; l.top = 9;");
+    assert_eq!(env.eval_int("l.left"), 7);
+    assert_eq!(env.eval_int("l.top"), 9);
+}
+
+/// Reference: the `width`/`height` property setters are `SetWidth`/
+/// `SetHeight` (`reference/cpp/core/visual/LayerIntf.cpp:10735`, `:10753`);
+/// a changed extent stores the size and runs `ImageLayerSizeChanged`
+/// (`:2220-2249` → `:2656-2674`), which shifts the image offset to
+/// `Rect.get_width() - MainImage->GetWidth()` when
+/// `MainImage->GetWidth() + ImageLeft` falls short of the rectangle
+/// (`:2664-2666`) — reaching 0 when the rectangle meets the image — and runs
+/// nothing when the extent is unchanged (`:2221`) or the layer has no
+/// MainImage (`:2658-2659`).
+#[test]
+fn width_and_height_property_writes_run_the_image_follow_up() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var base = new Layer(w, null); \
+         var l = new Layer(w, null); \
+         l.setSize(20, 20); \
+         l.setImagePos(-4, -4); \
+         l.setImageSize(24, 24);",
+    );
+    // Precondition: the 20x20 rect with a 24x24 image leaves the offset at -4.
+    assert_eq!(env.eval_int("l.imageLeft"), -4);
+    assert_eq!(env.eval_int("l.imageTop"), -4);
+    // Widening to 22 shifts the offset to 22 - 24 = -2; the follow-up
+    // shifts, it does not clamp blindly (`:2664-2666`).
+    env.run("l.width = 22;");
+    assert_eq!(env.eval_int("l.width"), 22);
+    assert_eq!(env.eval_int("l.imageLeft"), -2);
+    // Reaching the image extent clamps the offset to 0.
+    env.run("l.width = 24; l.height = 24;");
+    assert_eq!(env.eval_int("l.width"), 24);
+    assert_eq!(env.eval_int("l.imageLeft"), 0);
+    assert_eq!(env.eval_int("l.imageTop"), 0);
+    // A shrink leaves the offset alone: the condition at `:2664` is unmet.
+    env.run("l.width = 10;");
+    assert_eq!(env.eval_int("l.width"), 10);
+    assert_eq!(env.eval_int("l.imageLeft"), 0);
+    // A layer with no MainImage stores the extent and runs nothing
+    // (`:2658-2659`), and the property setter itself never raises
+    // (`:2220-2233`).
+    env.run("l.hasImage = false; l.height = 33;");
+    assert_eq!(env.eval_int("l.height"), 33);
+}
+
+/// Reference: the `clip*` property setters are `SetClipLeft`/`SetClipTop`/
+/// `SetClipWidth`/`SetClipHeight` (`reference/cpp/core/visual/LayerIntf.cpp:
+/// 10897`, `:10915`, `:10933`, `:10951`), each rewriting the whole clip
+/// rectangle through `SetClip` from the current edges (`:4062-4079`):
+/// `SetClip` throws `TVPNotDrawableLayerType` without a MainImage
+/// (`:4043-4045`) and stores near edges clamped at zero, far edges at the
+/// image bounds measured from the *unclamped* near edge, with a far edge
+/// never before its near edge (`:4047-4059`).
+#[test]
+fn clip_property_setters_intersect_the_image_like_set_clip() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var base = new Layer(w, null); \
+         var l = new Layer(w, null); \
+         l.setImageSize(4, 4);",
+    );
+    // With an image every property write is accepted. A far edge past the
+    // image truncates at the image bounds (`:4053`).
+    env.run("l.clipWidth = 100;");
+    assert_eq!(env.eval_int("l.clipWidth"), 4);
+    // The near edge clamps at zero and the far edge is measured from the
+    // unclamped near edge (`:4047-4049`, `:4053`): width 4 starting at -1
+    // ends at 3.
+    env.run("l.clipLeft = -1;");
+    assert_eq!(env.eval_int("l.clipLeft"), 0);
+    assert_eq!(env.eval_int("l.clipWidth"), 3);
+    // The same holds for the top/height pair (`:4048`, `:4050`, `:4054`).
+    env.run("l.clipTop = -1;");
+    assert_eq!(env.eval_int("l.clipTop"), 0);
+    assert_eq!(env.eval_int("l.clipHeight"), 3);
+    // A near edge beyond its far edge pins the far edge at the near edge
+    // (`:4055-4056`): clipLeft 10 with far edge min(3 + 10, 4) = 4 gives
+    // width 0.
+    env.run("l.clipLeft = 10;");
+    assert_eq!(env.eval_int("l.clipLeft"), 10);
+    assert_eq!(env.eval_int("l.clipWidth"), 0);
+    // Rewriting one edge keeps the others (`:4062-4079`): clipHeight from
+    // the stored rectangle (10, 0, 0, 3) clamps its far edge at the image.
+    env.run("l.clipHeight = 100;");
+    assert_eq!(env.eval_int("l.clipLeft"), 10);
+    assert_eq!(env.eval_int("l.clipWidth"), 0);
+    assert_eq!(env.eval_int("l.clipHeight"), 4);
+    // Without a MainImage every one of the four raises (`:4043-4045`).
+    env.run("l.hasImage = false;");
+    for property in ["clipLeft", "clipTop", "clipWidth", "clipHeight"] {
+        let message = env
+            .try_run(&format!("l.{property} = 1;"))
+            .expect_err("a layer with no MainImage must raise");
+        assert!(
+            message.contains("Not drawable layer type"),
+            "{property}: unexpected message: {message}"
+        );
+    }
 }
 
 /// Reference: with `omAuto` (the default) `operateRect` replaces the mode

@@ -185,8 +185,16 @@ impl Env {
 /// and an invisible destination ends the transition at the first frame —
 /// reference/cpp/core/visual/LayerIntf.cpp:8056-8060).
 fn two_layers(env: &Env, size: i64) {
+    two_layers_with(env, size, "");
+}
+
+/// `two_layers` with `preamble` inserted right after the window is created:
+/// the tests that position `a` pass a throwaway first layer there, because
+/// a window's first layer is its primary layer and the reference refuses to
+/// move the primary layer (`reference/cpp/core/visual/LayerIntf.cpp:2163-2179`).
+fn two_layers_with(env: &Env, size: i64, preamble: &str) {
     env.run(&format!(
-        "var w = new Window(); \
+        "var w = new Window(); {preamble} \
          var a = new Layer(w, null); a.setSize({size}, {size}); a.setImageSize({size}, {size}); \
          var b = new Layer(w, null); b.setSize({size}, {size}); b.setImageSize({size}, {size}); b.visible = true; \
          for (var i = 0; i < {size} * {size}; i++) {{ \
@@ -1037,12 +1045,12 @@ fn stop_without_an_active_transition_is_a_noop() {
 fn stopping_midway_keeps_the_frame_and_exchanges_layers() {
     let _lock = vm_lock();
     let env = Env::new();
-    two_layers(&env, 2);
+    two_layers_with(&env, 2, "var base = new Layer(w, null); ");
     counter(&env);
-    // `a` is the window's first layer, so the layer manager attaches it as
-    // the primary layer and forces it visible
-    // (`reference/cpp/core/visual/LayerManager.cpp:161-172`); hide it
-    // explicitly so the `ttExchange` visibility swap below is observable
+    // The window's primary layer is the throwaway layer — the reference
+    // refuses to move the primary layer
+    // (`reference/cpp/core/visual/LayerIntf.cpp:2163-2179`) — and `a` is
+    // hidden so the `ttExchange` visibility swap below is observable
     // (`reference/cpp/core/visual/LayerIntf.cpp:7974-7986`).
     env.run(
         "a.left = 10; a.top = 20; a.visible = false; \
@@ -1078,11 +1086,12 @@ fn stopping_midway_keeps_the_frame_and_exchanges_layers() {
 fn completion_exchanges_layers_and_copies_source_two() {
     let _lock = vm_lock();
     let env = Env::new();
-    two_layers(&env, 2);
+    two_layers_with(&env, 2, "var base = new Layer(w, null); ");
     counter(&env);
-    // `a` is the window's first layer, so `AttachPrimary` forces it visible
-    // (`reference/cpp/core/visual/LayerManager.cpp:161-172`); hide it so the
-    // completed transition's visibility swap is observable
+    // The window's primary layer is the throwaway layer — the reference
+    // refuses to move the primary layer
+    // (`reference/cpp/core/visual/LayerIntf.cpp:2163-2179`) — and `a` is
+    // hidden so the completed transition's visibility swap is observable
     // (`reference/cpp/core/visual/LayerIntf.cpp:7974-7986`).
     env.run(
         "a.left = 10; a.top = 20; a.visible = false; \

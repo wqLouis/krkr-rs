@@ -160,6 +160,7 @@ fn focused_layer_setter_mirrors_into_the_scene() {
     env.run(
         "var w = new Window(); \
          var l = new Layer(w, null); \
+         l.focusable = true; \
          var owner = new BitmapLayerTreeOwner(); \
          owner.focusedLayer = l;",
     );

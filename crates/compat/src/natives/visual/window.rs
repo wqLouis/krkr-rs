@@ -14,6 +14,7 @@ use super::common::{
     ObjectKind, VisualState, WindowObject, bound, duplicate_object, input_ref, resolve_object_id,
     scene_mut, scene_ref, set_null_out, set_object_out, set_real, set_retained_out,
 };
+use super::{clear_layer_focus, focus_layer};
 use crate::native_util::{args, report_error, set_bool, set_int, set_void, value_as_string};
 use crate::natives::system::{set_string_out, value_as_bool, value_as_i64};
 use crate::{CompatCtx, CompatError};
@@ -996,16 +997,17 @@ extern "C" fn window_focused_layer_set(
         Ok(_) => None,
         Err(error) => return report_error(out_error, &format!("Window.focusedLayer: {error}")),
     };
-    let scene = match scene_mut(&ctx) {
-        Ok(scene) => scene,
-        Err(error) => return report_error(out_error, &error),
-    };
+    // `SetFocusedLayer` = `SetFocusTo(layer, false)`
+    // (`reference/cpp/core/environ/WindowIntf.cpp:1781`,
+    // `reference/cpp/core/visual/impl/BitmapLayerTreeOwner.cpp:609`,
+    // `reference/cpp/core/visual/impl/LayerManager.h:488-490`): the guard and
+    // the focus events apply exactly as for any focus transition.
     match layer_id {
         Some(layer) => {
-            scene.set_focus(layer);
+            focus_layer(&ctx, layer, false);
         }
         None => {
-            scene.clear_focus(window);
+            clear_layer_focus(&ctx, window, false);
         }
     }
     0

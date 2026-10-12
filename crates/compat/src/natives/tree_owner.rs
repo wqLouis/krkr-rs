@@ -61,6 +61,7 @@ use tjs::{
 use super::input::{MB_LEFT, MOUSE_BUTTONS, mouse_button, shift_flags, vk_from_index};
 use crate::native_util::{args, report_error, set_bool, set_int, set_void};
 use crate::natives::system::{resolve, value_as_i64};
+use crate::natives::visual::{clear_layer_focus, focus_layer};
 use crate::{CompatCtx, CompatError};
 
 /// The `on*` owner hooks, in reference order (test/documentation copy of the
@@ -705,29 +706,26 @@ extern "C" fn focused_layer_set(
     } else {
         (None, None)
     };
+    // `SetFocusedLayer` = `SetFocusTo(layer, false)`, so the focusability
+    // guard and the focus events apply exactly as for any focus transition
+    // (`reference/cpp/core/visual/impl/BitmapLayerTreeOwner.cpp:579-615`,
+    // `reference/cpp/core/visual/impl/LayerManager.h:488-490`).
     if let Some(id) = scene_id {
         let ctx = resolved.ctx();
-        // SAFETY: a `CompatCtx` is only created for a bound, live engine and
-        // the host keeps the attached scene alive for the binding's lifetime.
-        let scene = unsafe { ctx.services() }.scene();
-        if let Some(ptr) = scene {
-            // SAFETY: see above; no VM call is made while the borrow is held.
-            unsafe { &mut *ptr }.set_focus(id);
-        }
+        focus_layer(&ctx, id, false);
     } else {
         // Clearing: blur the layer that had focus in its own window.
         // SAFETY: `instance` is the live payload the VM passed to the callback.
         let previous = unsafe { &*(instance as *const TreeOwnerInst) }.focused_id;
         if let Some(previous) = previous {
             let ctx = resolved.ctx();
-            // SAFETY: see above.
+            // SAFETY: the host keeps the attached scene alive for the binding's
+            // lifetime and the VM is single-threaded.
             let scene = unsafe { ctx.services() }.scene();
-            if let Some(ptr) = scene {
-                // SAFETY: see above.
-                let scene = unsafe { &mut *ptr };
-                if let Some(window) = scene.layer(previous).map(|layer| layer.window) {
-                    scene.clear_focus(window);
-                }
+            // SAFETY: see above; no VM call is made while the borrow is held.
+            let window = scene.and_then(|ptr| unsafe { &*ptr }.layer(previous).map(|l| l.window));
+            if let Some(window) = window {
+                clear_layer_focus(&ctx, window, false);
             }
         }
     }
