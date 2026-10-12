@@ -35,14 +35,19 @@
 
 mod common;
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use api::fs::{FsPath, OpenMode};
 use api::media::{DecodedImage, ImageInfo};
 use common::vm_lock;
 use compat::CompatHost;
 use engine::{Scene, Storage};
+use flate2::Compression;
+use flate2::write::ZlibEncoder;
 use fs::FileSystem;
+use fs::xp3::{SEGM_ENCODE_RAW, SEGM_ENCODE_ZLIB, XP3_MAGIC};
 use tjs::{Tjs2Engine, TjsValue};
 
 /// Script label for diagnostics.
@@ -103,6 +108,29 @@ impl Env {
             scene,
             _storage: storage,
         }
+    }
+
+    /// Replace the installed image codec with one whose decode closure records
+    /// each resolved storage name and returns the shared 2x2 test image.
+    fn record_decodes(&self, hints: Arc<Mutex<Vec<String>>>) {
+        self._host.set_image_codec(
+            move |_bytes, hint| {
+                hints
+                    .lock()
+                    .expect("decode lock")
+                    .push(hint.unwrap_or_default().to_string());
+                Ok(DecodedImage::new(2, 2, DECODED_RGBA.to_vec()))
+            },
+            |_bytes, _hint| {
+                Ok(ImageInfo {
+                    width: 2,
+                    height: 2,
+                    has_alpha: true,
+                    format: Some("img".to_string()),
+                })
+            },
+            |_name, _type, _width, _height, _rgba| Ok(()),
+        );
     }
 
     fn run(&self, script: &str) {
@@ -209,11 +237,102 @@ fn write_memory_file(fs: &FileSystem, path: &str, data: &[u8]) {
     fs::flush(fs, &file).expect("flush memory file");
 }
 
+/// An in-memory storage holding `files` (written before the mount).
+fn memory_storage(files: &[(&str, &[u8])]) -> Storage {
+    let fs = FileSystem::memory();
+    for &(path, bytes) in files {
+        write_memory_file(&fs, path, bytes);
+    }
+    Storage::mount_archives(fs, "/", std::iter::empty::<&str>()).expect("mount storage")
+}
+
 /// An in-memory storage holding `images/test.img`.
 fn image_storage() -> Storage {
+    memory_storage(&[("/images/test.img", b"not-a-real-image")])
+}
+
+/// Build a minimal raw-index XP3 archive in memory: `(name, data, zlib)`.
+///
+/// Local copy of the shared `testkit::build_xp3` fixture (`compat` does not
+/// depend on `testkit`), matching the copies in `fstat.rs`/`xp3_filter.rs`.
+fn build_xp3(entries: &[(&str, &[u8], bool)]) -> Vec<u8> {
+    let mut file = Vec::new();
+    file.extend_from_slice(&XP3_MAGIC);
+    file.extend_from_slice(&0u64.to_le_bytes());
+
+    let mut file_chunks: Vec<Vec<u8>> = Vec::new();
+    for (name, data, zlib) in entries {
+        let (stored, flags): (Vec<u8>, u32) = if *zlib {
+            let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+            enc.write_all(data).expect("zlib compress");
+            (enc.finish().expect("zlib finish"), SEGM_ENCODE_ZLIB)
+        } else {
+            (data.to_vec(), SEGM_ENCODE_RAW)
+        };
+        let start = file.len() as u64;
+        file.extend_from_slice(&stored);
+
+        let units: Vec<u16> = name.encode_utf16().collect();
+        let mut info = Vec::new();
+        info.extend_from_slice(b"info");
+        info.extend_from_slice(&((22 + units.len() * 2) as u64).to_le_bytes());
+        info.extend_from_slice(&0u32.to_le_bytes());
+        info.extend_from_slice(&(data.len() as i64).to_le_bytes());
+        info.extend_from_slice(&(stored.len() as i64).to_le_bytes());
+        info.extend_from_slice(&(units.len() as i16).to_le_bytes());
+        for unit in &units {
+            info.extend_from_slice(&unit.to_le_bytes());
+        }
+
+        let mut segm = Vec::new();
+        segm.extend_from_slice(b"segm");
+        segm.extend_from_slice(&28u64.to_le_bytes());
+        segm.extend_from_slice(&flags.to_le_bytes());
+        segm.extend_from_slice(&(start as i64).to_le_bytes());
+        segm.extend_from_slice(&(data.len() as i64).to_le_bytes());
+        segm.extend_from_slice(&(stored.len() as i64).to_le_bytes());
+
+        let mut adlr = Vec::new();
+        adlr.extend_from_slice(b"adlr");
+        adlr.extend_from_slice(&4u64.to_le_bytes());
+        adlr.extend_from_slice(&0u32.to_le_bytes());
+
+        let mut chunk = Vec::new();
+        chunk.extend_from_slice(b"File");
+        chunk.extend_from_slice(&((info.len() + segm.len() + adlr.len()) as u64).to_le_bytes());
+        chunk.extend_from_slice(&info);
+        chunk.extend_from_slice(&segm);
+        chunk.extend_from_slice(&adlr);
+        file_chunks.push(chunk);
+    }
+
+    let mut index_data = Vec::new();
+    for chunk in &file_chunks {
+        index_data.extend_from_slice(chunk);
+    }
+    let index_ofs = file.len() as u64;
+    file.push(0u8); // raw index block
+    file.extend_from_slice(&(index_data.len() as u64).to_le_bytes());
+    file.extend_from_slice(&index_data);
+    file[11..19].copy_from_slice(&index_ofs.to_le_bytes());
+    file
+}
+
+/// An in-memory storage mounting `data.xp3` with one entry,
+/// `images/broken.png`, whose index entry is valid but whose stored zlib
+/// segment is corrupt. Reading the entry is an archive error, not a missing
+/// entry, so the in-memory file system alone cannot produce this case.
+fn corrupt_archive_storage() -> Storage {
+    let mut xp3 = build_xp3(&[("images/broken.png", &[0x5a_u8; 256], true)]);
+    // The stored segment starts after the 19-byte XP3 header (11-byte magic
+    // plus the 8-byte index offset); flipping its zlib header makes the
+    // decoder reject the stream.
+    for byte in &mut xp3[19..23] {
+        *byte ^= 0xff;
+    }
     let fs = FileSystem::memory();
-    write_memory_file(&fs, "/images/test.img", b"not-a-real-image");
-    Storage::mount_archives(fs, "/", std::iter::empty::<&str>()).expect("mount storage")
+    write_memory_file(&fs, "/data.xp3", &xp3);
+    Storage::mount_archives(fs, "/", ["data.xp3"]).expect("mount storage")
 }
 
 /// System fonts tried by the private-font tests; a missing or unusable font
@@ -1183,6 +1302,108 @@ fn gdiplus_image_clone_and_rotate_flip() {
     assert_eq!(env.eval_int("copy.RotateFlip(0)"), 0);
     assert_eq!(env.eval_int("copy.RotateFlip(6)"), 0);
     assert_eq!(env.eval_int("copy.RotateFlip(7)"), 6);
+}
+
+/// The literal name resolves before any extension is appended: with both
+/// `images/plain` and `images/plain.png` present the decoder is handed
+/// `images/plain`.
+///
+/// reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1591-1610: when the name
+/// has no registered extension the reference appends its registered
+/// extensions until one exists; the port probes the literal name first.
+#[test]
+fn gdiplus_image_resolution_tries_the_plain_name_before_any_extension() {
+    let _lock = vm_lock();
+    let files: &[(&str, &[u8])] = &[
+        ("/images/plain", b"plain"),
+        ("/images/plain.png", b"extended"),
+    ];
+    let env = Env::build(Some(memory_storage(files)), true);
+    let hints = Arc::new(Mutex::new(Vec::new()));
+    env.record_decodes(Arc::clone(&hints));
+
+    env.run("var img = new GdiPlus.Image('images/plain');");
+
+    assert_eq!(env.eval_int("img.GetWidth()"), 2);
+    assert_eq!(
+        hints.lock().expect("decode lock").clone(),
+        vec!["images/plain".to_string()],
+        "the literal name is resolved without probing an extension"
+    );
+}
+
+/// A name that only resolves with an appended extension is decoded under the
+/// resolved name.
+///
+/// reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1591-1610.
+#[test]
+fn gdiplus_image_resolution_probes_extensions_and_uses_the_resolved_name() {
+    let _lock = vm_lock();
+    let files: &[(&str, &[u8])] = &[("/images/only.png", b"extended")];
+    let env = Env::build(Some(memory_storage(files)), true);
+    let hints = Arc::new(Mutex::new(Vec::new()));
+    env.record_decodes(Arc::clone(&hints));
+
+    env.run("var img = new GdiPlus.Image('images/only');");
+
+    assert_eq!(env.eval_int("img.GetWidth()"), 2);
+    assert_eq!(
+        hints.lock().expect("decode lock").clone(),
+        vec!["images/only.png".to_string()],
+        "the `.png` candidate is resolved and handed to the decoder"
+    );
+}
+
+/// A name that resolves to no candidate still fails the way the reference
+/// fails: `cannot open:%1`.
+///
+/// reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1605-1610: when no
+/// extension candidate exists the reference raises; reference/cpp/plugins/
+/// layerex_draw/blend2d/LayerExDraw.cpp:3338-3354: `ImageFactory` throws
+/// `cannot open:%1` when the load yields nothing.
+#[test]
+fn gdiplus_image_name_that_resolves_to_nothing_raises_cannot_open() {
+    let _lock = vm_lock();
+    let files: &[(&str, &[u8])] = &[];
+    let env = Env::build(Some(memory_storage(files)), true);
+
+    let error = env
+        .try_run("new GdiPlus.Image('images/missing.png');")
+        .expect_err("a name that resolves to nothing must raise");
+    assert!(error.contains("cannot open:images/missing.png"), "{error}");
+    assert!(!error.contains("archive error"), "{error}");
+}
+
+/// A storage read that fails for a reason other than "not found" is surfaced
+/// as itself instead of being retried as the next extension and ultimately
+/// reported as a missing entry.
+///
+/// reference/cpp/core/visual/GraphicsLoaderIntf.cpp:1591-1610: the reference
+/// probes each candidate by existence alone, so a real read failure is not a
+/// missing entry. The in-memory file system cannot fail a read for an entry it
+/// holds, so the failure comes from a mounted XP3 whose index parses but whose
+/// zlib segment is corrupt.
+#[test]
+fn gdiplus_image_storage_read_failure_surfaces_as_itself() {
+    let _lock = vm_lock();
+    let env = Env::build(Some(corrupt_archive_storage()), true);
+
+    let error = env
+        .try_run("new GdiPlus.Image('images/broken.png');")
+        .expect_err("a genuine read failure must raise");
+    assert!(error.contains("archive error"), "{error}");
+    assert!(
+        !error.contains("cannot open") && !error.contains("storage not found"),
+        "the real cause must not be collapsed into not-found: {error}"
+    );
+
+    // `load` reaches the same read and raises instead of silently leaving an
+    // empty image.
+    env.run("var img = new GdiPlus.Image();");
+    let load_error = env
+        .try_run("img.load('images/broken.png');")
+        .expect_err("load must surface the read failure");
+    assert!(load_error.contains("archive error"), "{load_error}");
 }
 
 // ---------------------------------------------------------------------------

@@ -10,6 +10,7 @@
 
 use std::ffi::{c_char, c_int, c_void};
 
+use engine::{Storage, StorageReadError};
 use tjs::{DetachedValue, NativeInstanceBuilder, NativeInstanceMethodDef, Tjs2Engine, Value};
 
 use super::draw::Mat;
@@ -73,34 +74,58 @@ impl ImageData {
     }
 }
 
+/// Read `name` through the attached storage, probing the common image
+/// extensions when the name itself does not resolve.
+///
+/// The plain name is tried first and each extension is composed only after the
+/// earlier candidates miss, so a name that resolves as given composes none.
+/// Only a missing entry advances to the next candidate; any other read failure
+/// is returned as itself.
+fn read_image_candidate(
+    storage: &Storage,
+    name: &str,
+) -> Result<Option<(String, Vec<u8>)>, StorageReadError> {
+    match storage.read(name) {
+        Ok(bytes) => return Ok(Some((name.to_string(), bytes))),
+        Err(StorageReadError::NotFound(_)) => {}
+        Err(error) => return Err(error),
+    }
+    for extension in IMAGE_EXTENSION_PROBE {
+        let candidate = format!("{name}{extension}");
+        match storage.read(&candidate) {
+            Ok(bytes) => return Ok(Some((candidate, bytes))),
+            Err(StorageReadError::NotFound(_)) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(None)
+}
+
 /// Decode `name` through the attached storage and the installed host decoder.
 ///
 /// The reference `loadImage` returns an empty image for a missing placed path
-/// or a decode failure, so `None` here is the empty image, not an error.
-fn load_image_data(ctx: &CompatCtx, name: &str) -> Option<ImageData> {
+/// or a decode failure, so `Ok(None)` here is the empty image. A storage read
+/// failure that is not "not found" is returned as itself instead of being
+/// retried as the next candidate.
+fn load_image_data(ctx: &CompatCtx, name: &str) -> Result<Option<ImageData>, StorageReadError> {
     // SAFETY: `ctx` was resolved from the installed binding.
     let services = unsafe { ctx.services() };
-    let storage = services.storage()?;
-    let mut candidates = Vec::with_capacity(IMAGE_EXTENSION_PROBE.len() + 1);
-    candidates.push(name.to_string());
-    candidates.extend(
-        IMAGE_EXTENSION_PROBE
-            .iter()
-            .map(|extension| format!("{name}{extension}")),
-    );
-    let (resolved, bytes) = candidates.into_iter().find_map(|candidate| {
-        // SAFETY: `attach_storage` guarantees the pointer stays valid.
-        match unsafe { &*storage }.read(&candidate) {
-            Ok(bytes) => Some((candidate, bytes)),
-            Err(_) => None,
-        }
-    })?;
+    let Some(storage) = services.storage() else {
+        return Ok(None);
+    };
+    // SAFETY: `attach_storage` guarantees the pointer stays valid.
+    let Some((resolved, bytes)) = read_image_candidate(unsafe { &*storage }, name)? else {
+        return Ok(None);
+    };
     let decoded = {
         let resolver = crate::resource::resource_state(ctx);
-        resolver.decode(&bytes, Some(&resolved)).ok()?
+        match resolver.decode(&bytes, Some(&resolved)) {
+            Ok(decoded) => decoded,
+            Err(_) => return Ok(None),
+        }
     };
     if !decoded.is_consistent() {
-        return None;
+        return Ok(None);
     }
     let has_alpha = {
         let resolver = crate::resource::resource_state(ctx);
@@ -109,14 +134,14 @@ fn load_image_data(ctx: &CompatCtx, name: &str) -> Option<ImageData> {
             Err(_) => decoded.rgba.chunks_exact(4).any(|pixel| pixel[3] < 255),
         }
     };
-    Some(ImageData {
+    Ok(Some(ImageData {
         kind: 0,
         width: decoded.width as i32,
         height: decoded.height as i32,
         rgba: decoded.rgba,
         has_alpha,
         trans: Mat::IDENTITY,
-    })
+    }))
 }
 
 /// Build a fresh `GdiPlus.Image` and install `data` as its payload.
@@ -178,12 +203,13 @@ extern "C" fn ctor(
     if a.len() == 1 && a[0].ty == tjs::VAL_STRING {
         let name = crate::native_util::value_as_string(&a[0]);
         match load_image_data(&ctx, &name) {
-            Some(data) => {
+            Ok(Some(data)) => {
                 *inst = data;
                 set_void(out);
                 0
             }
-            None => report_error(out_error, &format!("cannot open:{name}")),
+            Ok(None) => report_error(out_error, &format!("cannot open:{name}")),
+            Err(error) => report_error(out_error, &error.to_string()),
         }
     } else {
         report_error(out_error, "GdiPlus.Image: invalid parameter")
@@ -192,8 +218,8 @@ extern "C" fn ctor(
 
 /// `load(filename)` — reference `ImageLoad` (`reference/cpp/plugins/
 /// layerex_draw/blend2d/LayerExDraw.cpp:3356-3363`): the loaded image
-/// replaces the current one; a missing or undecodable file leaves an empty
-/// image and does not raise.
+/// replaces the current one. A missing or undecodable file leaves an empty
+/// image; a storage read failure raises the underlying error.
 extern "C" fn load(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -214,7 +240,11 @@ extern "C" fn load(
     let name = crate::native_util::value_as_string(&a[0]);
     // SAFETY: `instance` is the live `ImageData` payload the VM allocated for this script object; `load` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut ImageData) };
-    *inst = load_image_data(&ctx, &name).unwrap_or_default();
+    *inst = match load_image_data(&ctx, &name) {
+        Ok(Some(data)) => data,
+        Ok(None) => ImageData::default(),
+        Err(error) => return report_error(out_error, &error.to_string()),
+    };
     set_void(out);
     0
 }
