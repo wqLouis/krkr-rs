@@ -104,7 +104,10 @@ aarch64-linux-android`):
   `PhysicalKey` / `TouchPhase` / `MouseButton`. They name no Android type, so
   they are unit-tested on the host. `AKEYCODE_BACK` becomes
   `PhysicalKey::Escape` (`MainScene.cpp:820-829`) rather than a new key, and the
-  reference `VK_*` codes stay the compatibility layer's job.
+  reference `VK_*` codes stay the compatibility layer's job. The composition
+  root (`crates/android/src/input.rs`) consumes contact phases through the
+  touch→mouse synthesizer (`crates/android/src/gesture.rs`, §5) instead of
+  forwarding raw touch.
 * **Audio output** (AAudio) was already real.
 
 The **event loop** is driven by the Android composition root, not by
@@ -354,25 +357,59 @@ contained if that ever changes. Option **C** is not used.
 ## 5. Touch input
 
 KiriKiri games are mouse-and-keyboard driven, so the bridge is
-touch → mouse/keyboard, not a new input model:
+**touch → mouse**, not a new input model. The reference's Android environment
+turns one finger into a virtual mouse
+(`reference/cpp/core/environ/cocos2d/MainScene.cpp:1017-1146`); this port does
+the same, at the composition root: the state machine is
+`crates/android/src/gesture.rs` (pure, host-tested) and the Android motion
+events are `crates/android/src/input.rs`. The synthesised events travel the
+same host path and the same aspect-correct window→game transform as a real
+mouse, so engine-side layer hit-testing, `onMouseDown`/`onMouseUp`,
+`onClick`/`onDoubleClick` and the game's own cursor logic keep working
+unchanged. A tap that a KAG menu used to miss is the symptom this fixes.
 
-- **Tap → left click** at the touch position, through the same
-  aspect-correct window→game transform the desktop bridge already uses, so
-  engine-side layer hit-testing, `onMouseDown`/`onMouseUp` and the game's own
-  cursor logic all keep working unchanged.
-- **Long press → right click** (KAG uses right-click for the menu; games also
-  call `System.getMouseButtonState(1)`).
-- **Drag → mouse move with the button held** (some games implement drag).
-- **Two-finger tap / swipe-down → `Escape`/right-click equivalent**, since
-  there is no back button in the game and Android's back gesture must be
-  handled (`onBackPressed` → engine "open menu" event, second press → exit).
-- **On-screen controls overlay** for keys the games need and touch cannot
-  express: at minimum a Ctrl (skip) button, a right-click button and a
-  menu/back button, drawn either as a Compose overlay over the surface or
-  in-engine. Compose is preferable (M3 styling, no engine changes) — it can
-  sit in the same `GameActivity` hierarchy above the surface.
-- Multi-touch must not double-fire: the bridge should consume `TouchInput`
-  events on Android rather than also synthesising mouse events.
+The mapping, as implemented:
+
+- **Tap → left click.** A single finger that travels no more than 16 px and is
+  released before 1000 ms presses and releases the left button at the touch
+  position. The L2 input state turns the press/release pair into
+  `onMouseDown`/`onMouseUp` and then `onClick`/`onDoubleClick`.
+- **Drag → mouse move with the button held.** Once the finger passes the slop,
+  the left button presses and every move is a pointer move until the release.
+- **Long press → right click.** A finger held still past 1000 ms (the
+  reference's virtual-mouse timeout, `MainScene.cpp:1097-1101`) presses the
+  right button, released when the finger lifts. KAG opens its menu on the right
+  button and games read it through `System.getMouseButtonState(1)`.
+- **Two-finger tap / swipe-down → `Escape`.** Two fingers that both lift
+  within 300 ms, or that drag down past 64 px, emit an Escape press/release
+  pair — the key the Android back button already maps to (`AKEYCODE_BACK` →
+  `PhysicalKey::Escape`, §2.1).
+- **Multi-touch must not double-fire.** The raw touch is consumed by the
+  synthesizer and is **not** also forwarded as `onTouchDown`/`onTouchMove`/
+  `onTouchUp`: a KAG menu reads the mouse family, and sending both would fire
+  twice. A second finger that arrives after a drag or a long press has begun is
+  ignored, so it cannot turn an active drag into a back gesture.
+
+The 16 px slop is a fixed physical-pixel value. The reference scales the same
+threshold by the display DPI (`MainScene.cpp:494-496`); that is a small
+deliberate divergence which keeps the synthesizer free of a display service.
+
+**Implemented and host-tested:** the whole state machine and every mapping
+above (`crates/android/src/gesture.rs` unit tests). **Not verified on the
+host:** that the Android motion actions and timestamps actually reach it in the
+assumed order, that the synthesised events hit a real KAG menu, and the
+DPI-based slop.
+
+Not done yet:
+
+- **On-screen controls overlay** for keys touch cannot express: at minimum a
+  Ctrl (skip) button, a right-click button and a menu/back button. Compose is
+  the intended home (M3 styling, no engine changes) — it can sit in the same
+  `GameActivity` hierarchy above the surface. There is no control for it today.
+- **The Activity-level back gesture.** `android-activity` 0.6 does not surface
+  `onBackPressed`, so the only back path is the mapped `AKEYCODE_BACK` key; the
+  two-finger gestures above are the in-game substitute. “First press opens the
+  menu, a second press exits” is not implemented.
 
 ---
 
@@ -468,11 +505,34 @@ tag. It has run repeatedly; the `android-v1.0.0` release carries the built APK.
 **Diagnostics on a device.** Because a failure here is otherwise invisible (the
 engine's stdout/stderr is discarded, and `MANAGE_EXTERNAL_STORAGE` needs the
 user to visit a Settings page that no `requestPermissions` call can reach), the
-engine writes `<filesDir>/krkr.log` and an atomically-written
-`<filesDir>/krkr_state.json` (`starting`/`running`/`failed`/`stopped` plus the
-real error message and pid), and the launcher turns that into a dialog with the
-reason and a **Logs** screen that can copy or share it. A crash is recognised
-by a stale `starting`/`running` whose pid is no longer the current process.
+engine writes two files into `<filesDir>` and the launcher reads them:
+
+* `<filesDir>/krkr_state.json` — atomically written
+  `starting`/`running`/`failed`/`stopped` plus the real error message and pid;
+  the launcher turns it into a dialog with the reason. A crash is recognised by
+  a stale `starting`/`running` whose pid is no longer the current process.
+* `<filesDir>/krkr.log` — the engine log, and what the launcher's **Logs**
+  screen (copy/share) and the dialogs' tail read. `env_logger` writes every
+  record to stderr, which `android-activity` redirects to logcat, and the same
+  record is appended to this file. Lines are UTF-8, oldest first,
+  `"<rfc3339> <LEVEL> <message>"`; the launcher reads the last 400 lines, up
+  to 256 KiB, dropping a leading partial line (`LauncherLog.tail`).
+
+The log is capped at 1 MiB and rotated once, keeping `krkr.log.1`, so a long
+session cannot fill the device's storage. The file is opened before the global
+logger is installed; a log the app cannot open is returned as a startup error
+and written to the state file as `failed`, so the Logs screen is never silently
+empty with no explanation (D11). The file name and the directory are the
+Kotlin contract (`EngineDiagnostics.engineLogFile` is
+`File(filesDir, "krkr.log")`, and `KrkrGameActivity.pendingStateDir` is
+`filesDir.absolutePath`).
+
+**Host-tested:** the record format, the byte accounting, the 1 MiB rotation,
+reopening a previous file and the missing-directory error
+(`crates/android/src/log_file.rs` unit tests). **Not verified on the host:**
+that `<filesDir>` is writable by the app process, that the records appear in
+`adb logcat` under the `env_logger` format, and that the Logs screen and crash
+dialog read them back.
 
 Two deliberate choices worth restating:
 
@@ -491,9 +551,10 @@ Two deliberate choices worth restating:
 | M1 | Whole workspace cross-checks with the FFmpeg feature off; `build.rs` made target-aware | **verified** (`build-android.sh --check`) |
 | M2 | Rust `cdylib` + `#[bevy_main]` entry point; engine builds an `App` from `render` | **verified** — links and exports `android_main` |
 | M3 | Compose M3 launcher + SAF picker + persisted library; hands the folder to `GameActivity` | **compiles and packages** (never run on a device) |
-| M4 | Touch → mouse bridge | **implemented and host-tested** (on-screen controls and the back gesture still open) |
+| M4 | Touch → mouse bridge | **implemented and host-tested** (`crates/android/src/gesture.rs`); on-screen controls and the Activity-level back gesture still open |
 | M5 | MediaCodec video backend (replacing FFmpeg on Android) | **compile-verified and symbol-checked**; never run on a device |
 | M6 | CI APK build + artifact upload | workflow written, never triggered |
+| M7 | Engine writes `<filesDir>/krkr.log` (capped, rotated) for the Logs screen | **host-tested**; never run on a device |
 
 The whole chain now produces an installable APK from a clean tree — see §7 —
 but **nothing has been run on hardware**. What that leaves genuinely unproven is

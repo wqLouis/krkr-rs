@@ -7,10 +7,11 @@
 //! reference virtual-key table.
 
 use android_activity::input::{
-    InputEvent as AndroidInputEvent, KeyAction, KeyEvent, MotionAction, MotionEvent,
+    InputEvent as AndroidInputEvent, KeyAction, KeyEvent, MotionAction, MotionEvent, Pointer,
 };
 use android_activity::{AndroidApp, InputStatus};
 
+use api::host::TouchPhase;
 use platform::{InputEvent, PlatformWindow};
 
 use crate::host::AndroidHost;
@@ -50,9 +51,11 @@ fn deliver(handler: &mut AndroidHost, event: &AndroidInputEvent<'_>) {
 
 /// Translates a motion event into touch, pointer-move or mouse-button input.
 ///
-/// Contact phases go to [`InputEvent::Touch`]; a hover move becomes a pointer
-/// move; a button press/release becomes a mouse button. An action that is none
-/// of these (outside, scroll) is dropped.
+/// The contact phases are fed to the touch synthesizer ([`AndroidHost::touch`])
+/// rather than forwarded as raw touch: KAG reads the mouse event family, and
+/// sending both would fire twice (`docs/android.md` §5). A hover move becomes a
+/// pointer move; a button press/release becomes a mouse button. An action that
+/// is none of these (outside, scroll) is dropped.
 fn deliver_motion(handler: &mut AndroidHost, motion: &MotionEvent<'_>) {
     let action = match i32::try_from(u32::from(motion.action())) {
         Ok(action) => action,
@@ -62,23 +65,25 @@ fn deliver_motion(handler: &mut AndroidHost, motion: &MotionEvent<'_>) {
         }
     };
     if let Some(phase) = PlatformWindow::touch_phase_from_android(action) {
-        for pointer in motion.pointers() {
-            let id = match u64::try_from(pointer.pointer_id()) {
-                Ok(id) => id,
-                Err(_) => {
-                    log::warn!(
-                        "negative Android pointer id {} ignored",
-                        pointer.pointer_id()
-                    );
-                    continue;
+        match phase {
+            // A move or a cancel names every active contact; a change of
+            // contact set names only the pointer that changed.
+            TouchPhase::Moved | TouchPhase::Cancelled => {
+                for pointer in motion.pointers() {
+                    deliver_touch(handler, &pointer, phase);
                 }
-            };
-            handler.send_input(InputEvent::Touch {
-                id,
-                phase,
-                x: pointer.x(),
-                y: pointer.y(),
-            });
+            }
+            TouchPhase::Started | TouchPhase::Ended => {
+                let index = motion.pointer_index();
+                if index < motion.pointer_count() {
+                    deliver_touch(handler, &motion.pointer_at_index(index), phase);
+                } else {
+                    log::warn!(
+                        "touch action index {index} is out of range for {} pointer(s)",
+                        motion.pointer_count()
+                    );
+                }
+            }
         }
         return;
     }
@@ -105,6 +110,21 @@ fn deliver_motion(handler: &mut AndroidHost, motion: &MotionEvent<'_>) {
         }
         _ => {}
     }
+}
+
+/// Feeds one Android pointer into the host's touch synthesizer.
+fn deliver_touch(handler: &mut AndroidHost, pointer: &Pointer<'_>, phase: TouchPhase) {
+    let id = match u64::try_from(pointer.pointer_id()) {
+        Ok(id) => id,
+        Err(_) => {
+            log::warn!(
+                "negative Android pointer id {} ignored",
+                pointer.pointer_id()
+            );
+            return;
+        }
+    };
+    handler.touch(id, phase, pointer.x(), pointer.y());
 }
 
 /// Translates a key event into [`InputEvent::Key`].

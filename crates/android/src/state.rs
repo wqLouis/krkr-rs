@@ -89,6 +89,16 @@ pub fn set_state_dir(dir: impl Into<PathBuf>) {
     let _ = STATE_DIR.set(dir.into());
 }
 
+/// The configured state directory, or `None` on a host build.
+///
+/// The log file lives in the same directory as the state file
+/// (`<filesDir>/krkr.log` next to `<filesDir>/krkr_state.json`), so the logger
+/// reads the directory from here rather than keeping a second copy.
+#[cfg(target_os = "android")]
+pub(crate) fn state_dir() -> Option<&'static Path> {
+    STATE_DIR.get().map(PathBuf::as_path)
+}
+
 /// Write the state file for the configured directory.
 ///
 /// This is the side-effecting entry point used by the Android entry point. It

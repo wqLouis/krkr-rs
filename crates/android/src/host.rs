@@ -16,6 +16,7 @@ use app::{BackendKind, GameHost, Host, HostConfig};
 use engine::projection::ScalingMode;
 use platform::{EventHandler, Flow, PlatformError, PlatformEvent, PlatformWindow, Ticker};
 
+use crate::gesture::GestureSynthesizer;
 use crate::input::translate_input;
 use crate::state;
 
@@ -38,6 +39,11 @@ pub(crate) struct AndroidHost {
     running: Option<GameHost>,
     /// Input and focus events received since the last frame.
     pending_events: Vec<PlatformEvent>,
+    /// Touch -> mouse synthesizer, kept across input batches because a tap or
+    /// a drag spans several Android motion events.
+    gestures: GestureSynthesizer,
+    /// Monotonic start for the gesture clock; only differences matter.
+    gesture_clock: Instant,
 }
 
 impl AndroidHost {
@@ -55,6 +61,8 @@ impl AndroidHost {
             preload_archives,
             running: None,
             pending_events: Vec::new(),
+            gestures: GestureSynthesizer::default(),
+            gesture_clock: Instant::now(),
         }
     }
 
@@ -67,6 +75,35 @@ impl AndroidHost {
     /// Delivers a translated input event through the normal event path.
     pub(crate) fn send_input(&mut self, input: platform::InputEvent) {
         let _ = self.event(PlatformEvent::Input(input));
+    }
+
+    /// Feeds one touch contact into the mouse synthesizer and delivers the
+    /// mouse input it produces.
+    ///
+    /// The raw touch is consumed here rather than forwarded: a KAG menu reads
+    /// the mouse event family, and forwarding both would fire twice
+    /// (`docs/android.md` §5).
+    pub(crate) fn touch(&mut self, id: u64, phase: api::host::TouchPhase, x: f32, y: f32) {
+        let now_ms = self.now_ms();
+        let events = self.gestures.phase(id, phase, x, y, now_ms);
+        for event in events {
+            self.send_input(event);
+        }
+    }
+
+    /// Advances the gesture clock so a held, stationary finger becomes a long
+    /// press. Called once per event-loop iteration.
+    pub(crate) fn gesture_tick(&mut self) {
+        let now_ms = self.now_ms();
+        let events = self.gestures.tick(now_ms);
+        for event in events {
+            self.send_input(event);
+        }
+    }
+
+    /// Milliseconds since the host was created, for the long-press timeout.
+    fn now_ms(&self) -> u64 {
+        u64::try_from(self.gesture_clock.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
     /// Re-applies the presentation when a script declared a new client size.
@@ -302,6 +339,11 @@ pub(crate) fn run_loop(app: AndroidApp, mut handler: AndroidHost, frame_period: 
         });
 
         let now = Instant::now();
+        // The long-press timeout is time-based, not event-based: advance the
+        // gesture clock even when the finger is holding still.
+        if !exit {
+            handler.gesture_tick();
+        }
         if ticker.poll(now) {
             frame_requested = true;
         }

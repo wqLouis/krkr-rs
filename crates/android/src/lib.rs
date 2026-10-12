@@ -21,15 +21,18 @@
 //!   presentation; the user's saved scaling setting overrides either. See
 //!   `docs/android.md` §2.2 and §3.2.
 //!
-//! The state-file writer ([`state`]) is plain `std` and has no Android
-//! dependency, so the host test target compiles and exercises it; the
-//! Android-only modules are target-gated.
+//! The state-file writer ([`state`]), the log-file sink ([`log_file`]) and the
+//! touch→mouse synthesizer ([`gesture`]) are plain `std` and name no Android
+//! type, so the host test target compiles and exercises them; the Android-only
+//! modules are target-gated.
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
 #[cfg(any(target_os = "android", test))]
 mod config;
+#[cfg(any(target_os = "android", test))]
+mod gesture;
 #[cfg(target_os = "android")]
 mod host;
 #[cfg(target_os = "android")]
@@ -38,11 +41,14 @@ mod input;
 #[allow(unsafe_code)]
 mod jni_fields;
 #[cfg(any(target_os = "android", test))]
+mod log_file;
+#[cfg(any(target_os = "android", test))]
 mod state;
 
 #[cfg(target_os = "android")]
 mod android_entry {
     use std::path::PathBuf;
+    use std::sync::Mutex;
     use std::time::Duration;
 
     use android_activity::AndroidApp;
@@ -50,6 +56,7 @@ mod android_entry {
     use app::BackendKind;
     use engine::projection::ScalingMode;
 
+    use crate::log_file::{self, FileSink};
     use crate::{config, host, jni_fields, state};
 
     /// The Android entry point.
@@ -78,7 +85,16 @@ mod android_entry {
         ) {
             state::set_state_dir(state_dir);
         }
-        init_logging();
+        if let Err(error) = init_logging() {
+            // The launcher reads a file, not logcat: without it the Logs screen
+            // is empty and a later failure has no explanation. A log the app
+            // cannot open is therefore a reported startup failure, never a
+            // silent fall back to stderr only.
+            let message = format!("cannot start the engine log: {error}");
+            eprintln!("krkr-rs: {message}");
+            state::write_state(state::State::Failed, Some(&message));
+            return;
+        }
         state::write_state(state::State::Starting, None);
 
         let game_dir = match jni_fields::activity_static_string(
@@ -169,14 +185,93 @@ mod android_entry {
 
     /// Installs the process logger.
     ///
-    /// `android-activity` redirects the process's standard error to logcat, so
-    /// a stderr logger is visible on the device. `RUST_LOG` selects the filter
-    /// (default `info`). Initializing twice is a no-op.
-    fn init_logging() {
+    /// The single global logger fans every record out to two sinks:
+    ///
+    /// * `env_logger` on stderr, which `android-activity` redirects to logcat
+    ///   (`RUST_LOG` selects the filter, default `info`);
+    /// * [`FileSink`] on `<filesDir>/krkr.log`, the file the launcher's Logs
+    ///   screen reads. It is capped at [`log_file::LOG_MAX_BYTES`] and rotates
+    ///   once, so a long session cannot fill the device's storage.
+    ///
+    /// The file is opened before the logger is claimed. An unusable log file
+    /// is returned as an error for [`android_main`] to report through the
+    /// state file, rather than a fallback that leaves the Logs screen empty.
+    /// A missing state directory is the same error: without it there is no
+    /// place for the file the launcher reads.
+    fn init_logging() -> std::io::Result<()> {
+        let Some(dir) = state::state_dir() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "KrkrGameActivity.pendingStateDir is unset; the log has nowhere to go",
+            ));
+        };
+        let file = FileSink::open(dir.join(log_file::LOG_FILE_NAME))?;
+
         let mut builder =
             env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
         builder.format_timestamp_millis();
-        let _ = builder.try_init();
+        let stderr = builder.build();
+        let max_level = stderr.filter();
+        let logger = FanoutLog {
+            stderr,
+            file: Mutex::new(Some(file)),
+        };
+        if log::set_boxed_logger(Box::new(logger)).is_err() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "a global logger is already installed",
+            ));
+        }
+        log::set_max_level(max_level);
+        Ok(())
+    }
+
+    /// The one global logger: the `env_logger` stderr sink plus the capped
+    /// file. `log` records are filtered once, by the `env_logger` filter, so
+    /// the file holds exactly what stderr holds.
+    struct FanoutLog {
+        stderr: env_logger::Logger,
+        file: Mutex<Option<FileSink>>,
+    }
+
+    impl FanoutLog {
+        /// Append `record` to the file, if a sink is open.
+        fn write_file(&self, record: &log::Record<'_>) {
+            // A panic while logging poisons the mutex but must not stop the
+            // record from reaching the file.
+            let mut guard = match self.file.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if let Some(sink) = guard.as_mut() {
+                sink.write_line(&log_file::format_record(record));
+            }
+        }
+    }
+
+    impl log::Log for FanoutLog {
+        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+            log::Log::enabled(&self.stderr, metadata)
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            if !self.stderr.matches(record) {
+                return;
+            }
+            log::Log::log(&self.stderr, record);
+            self.write_file(record);
+        }
+
+        fn flush(&self) {
+            log::Log::flush(&self.stderr);
+            let mut guard = match self.file.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if let Some(sink) = guard.as_mut() {
+                sink.flush();
+            }
+        }
     }
 }
 
