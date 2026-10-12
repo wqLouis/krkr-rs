@@ -293,8 +293,9 @@ Open:
 * **`streams.cpp`: thin C++ adapter over a Rust implementation** — deferred. It
   is the only port-authored C++ besides the ABI boundary (794 lines), and every
   memory-safety defect in the save path was in it.
-* **L2 API snapshot + CI build step** — `cargo public-api` decided, unwired; CI
-  runs only `cargo fmt --check` + the stateless guard.
+* **L2 API snapshot + CI** — `cargo public-api` is decided but unwired. There is
+  no CI gate: the only workflow builds the Android app on tags and does not run
+  the Rust gate, so §1 is run locally.
 * **Windowed audio on a real device** — the cpal backend is real and wired
   (`crates/platform/platform/src/linux.rs`, `crates/app/src/audio.rs`); owed is
   the device validation.
