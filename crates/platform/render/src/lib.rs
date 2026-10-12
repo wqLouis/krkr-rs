@@ -198,7 +198,9 @@ impl fmt::Debug for RenderPipeline {
 /// # Errors
 ///
 /// Returns [`RenderError::Unsupported`] when the requested backend is not
-/// implemented in this build (currently the Vulkan backend).
+/// implemented in this build, or [`RenderError::DeviceUnavailable`] when the
+/// Vulkan backend is present but its loader, instance or device cannot be
+/// brought up.
 pub fn create_render_pipeline(config: PipelineConfig) -> Result<RenderPipeline, RenderError> {
     match config.backend {
         BackendKind::Null => Ok(RenderPipeline::null()),

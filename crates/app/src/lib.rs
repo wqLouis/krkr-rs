@@ -297,8 +297,10 @@ impl Host {
     /// # Errors
     ///
     /// Returns [`HostError::Render`] when the requested backend cannot be
-    /// created (currently `--backend vulkan`, whose Phase 5 skeleton returns
-    /// [`RenderError::Unsupported`]) or when surface creation fails.
+    /// created or when surface creation fails. A `--backend vulkan` host
+    /// reports [`RenderError::Unsupported`] for a backend this build does not
+    /// implement, and [`RenderError::DeviceUnavailable`] when the Vulkan
+    /// loader, instance or device cannot be brought up.
     pub fn new(config: HostConfig) -> Result<Self, HostError> {
         let pipeline = create_render_pipeline(PipelineConfig {
             backend: config.backend,

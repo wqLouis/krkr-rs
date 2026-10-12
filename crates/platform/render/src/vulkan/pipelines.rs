@@ -13,6 +13,7 @@ use ash::vk;
 use api::blend::BlendMode;
 use api::error::RenderError;
 
+use super::device;
 use super::shaders;
 use super::texture::find_memory_type;
 
@@ -378,8 +379,13 @@ fn create_sampler(device: &ash::Device) -> Result<vk::Sampler, RenderError> {
         .min_lod(0.0)
         .max_lod(0.0);
     // SAFETY: `create_info` borrows a local valid for the call.
-    unsafe { device.create_sampler(&create_info, None) }.map_err(|error| RenderError::Unsupported {
-        message: format!("failed to create the texture sampler: {error}"),
+    unsafe { device.create_sampler(&create_info, None) }.map_err(|error| {
+        RenderError::DeviceUnavailable {
+            message: format!(
+                "failed to create the texture sampler: {}",
+                device::vk_result_message(error)
+            ),
+        }
     })
 }
 

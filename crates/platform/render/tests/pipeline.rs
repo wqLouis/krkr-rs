@@ -27,7 +27,10 @@ fn default_config_is_headless() {
 fn vulkan_backend_is_either_available_or_reports_unsupported() {
     match create_render_pipeline(PipelineConfig::vulkan()) {
         Ok(pipeline) => assert_eq!(pipeline.backend(), BackendKind::Vulkan),
-        Err(error) => assert!(matches!(error, RenderError::Unsupported { .. })),
+        Err(error) => assert!(matches!(
+            error,
+            RenderError::Unsupported { .. } | RenderError::DeviceUnavailable { .. }
+        )),
     }
 
     assert_eq!(BackendKind::Vulkan.name(), "vulkan");

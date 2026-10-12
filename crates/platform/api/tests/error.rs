@@ -26,6 +26,23 @@ fn glyph_missing_glyph_formats_codepoint() {
     assert_eq!(error.to_string(), "font has no glyph for U+1F600");
 }
 
+// The reference is the oracle for behaviour, not for error strings: it raises a
+// failed device creation distinctly from an unsupported technique and names the
+// underlying code (reference/cpp/core/visual/impl/BasicDrawDevice.cpp:113-123,
+// reference/cpp/core/base/impl/MsgImpl.h:131-133). This only checks that the
+// wording keeps that distinction and never reads as "not supported".
+#[test]
+fn render_device_unavailable_is_not_reported_as_unsupported() {
+    let error = RenderError::DeviceUnavailable {
+        message: "no usable Vulkan physical device was handed back".to_owned(),
+    };
+    assert_eq!(
+        error.to_string(),
+        "render device unavailable: no usable Vulkan physical device was handed back"
+    );
+    assert!(!error.to_string().contains("not supported"));
+}
+
 #[test]
 fn errors_are_cloneable_values() {
     let error = RenderError::SurfaceLost;

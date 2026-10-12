@@ -76,13 +76,16 @@ pub(crate) fn create_instance(config: &PipelineConfig) -> Result<InstanceBundle,
     // SAFETY: `Entry::load` dlopens the platform Vulkan loader. It is the
     // standard, documented way to initialise ash and is safe to call once per
     // process; the returned `Entry` owns the loader handle.
-    let entry = unsafe { ash::Entry::load() }.map_err(|error| RenderError::Unsupported {
+    let entry = unsafe { ash::Entry::load() }.map_err(|error| RenderError::DeviceUnavailable {
         message: format!("the Vulkan loader is unavailable: {error}"),
     })?;
 
     let extension_properties = unsafe { entry.enumerate_instance_extension_properties(None) }
-        .map_err(|error| RenderError::Unsupported {
-            message: format!("failed to enumerate Vulkan instance extensions: {error}"),
+        .map_err(|error| RenderError::DeviceUnavailable {
+            message: format!(
+                "failed to enumerate Vulkan instance extensions: {}",
+                vk_result_message(error)
+            ),
         })?;
     let available: Vec<&CStr> = extension_properties.iter().map(extension_name).collect();
 
@@ -120,8 +123,11 @@ pub(crate) fn create_instance(config: &PipelineConfig) -> Result<InstanceBundle,
     let mut enabled_layers: Vec<*const c_char> = Vec::new();
     if config.validation {
         let layers = unsafe { entry.enumerate_instance_layer_properties() }.map_err(|error| {
-            RenderError::Unsupported {
-                message: format!("failed to enumerate Vulkan layers: {error}"),
+            RenderError::DeviceUnavailable {
+                message: format!(
+                    "failed to enumerate Vulkan layers: {}",
+                    vk_result_message(error)
+                ),
             }
         })?;
         if layers
@@ -156,8 +162,11 @@ pub(crate) fn create_instance(config: &PipelineConfig) -> Result<InstanceBundle,
     // SAFETY: `create_info` borrows locals that live until the call returns;
     // the instance is destroyed by the owning `InstanceGuard`.
     let instance = unsafe { entry.create_instance(&create_info, None) }.map_err(|error| {
-        RenderError::Unsupported {
-            message: format!("failed to create the Vulkan instance: {error}"),
+        RenderError::DeviceUnavailable {
+            message: format!(
+                "failed to create the Vulkan instance: {}",
+                vk_result_message(error)
+            ),
         }
     })?;
 
@@ -182,8 +191,11 @@ fn select_physical_device(
     instance: &ash::Instance,
 ) -> Result<(vk::PhysicalDevice, u32, vk::PhysicalDeviceMemoryProperties), RenderError> {
     let devices = unsafe { instance.enumerate_physical_devices() }.map_err(|error| {
-        RenderError::Unsupported {
-            message: format!("failed to enumerate Vulkan physical devices: {error}"),
+        RenderError::DeviceUnavailable {
+            message: format!(
+                "no usable Vulkan physical device was handed back: enumeration failed with {}",
+                vk_result_message(error)
+            ),
         }
     })?;
 
@@ -226,8 +238,9 @@ fn select_physical_device(
     best.map(|(_, device, max_dimension, memory_properties)| {
         (device, max_dimension, memory_properties)
     })
-    .ok_or_else(|| RenderError::Unsupported {
-        message: "no Vulkan device supports VK_KHR_swapchain and a graphics queue".to_owned(),
+    .ok_or_else(|| RenderError::DeviceUnavailable {
+        message: "no Vulkan physical device supports VK_KHR_swapchain and a graphics queue"
+            .to_owned(),
     })
 }
 
@@ -247,8 +260,8 @@ fn device_has_extension(
 
 /// Creates a logical device with a combined graphics+present queue family.
 ///
-/// Returns [`RenderError::Unsupported`] when no queue family supports both
-/// graphics and presentation for `surface`.
+/// Returns [`RenderError::DeviceUnavailable`] when no queue family supports
+/// both graphics and presentation for `surface`.
 pub(crate) fn create_device(
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
@@ -275,7 +288,7 @@ pub(crate) fn create_device(
         }
     }
 
-    let queue_family_index = chosen.ok_or_else(|| RenderError::Unsupported {
+    let queue_family_index = chosen.ok_or_else(|| RenderError::DeviceUnavailable {
         message: "no Vulkan queue family supports both graphics and presentation".to_owned(),
     })?;
 
@@ -293,8 +306,11 @@ pub(crate) fn create_device(
     // SAFETY: `device_info` borrows locals valid for the call; the device is
     // destroyed in `VulkanState::drop`.
     let device = unsafe { instance.create_device(physical_device, &device_info, None) }.map_err(
-        |error| RenderError::Unsupported {
-            message: format!("failed to create the Vulkan logical device: {error}"),
+        |error| RenderError::DeviceUnavailable {
+            message: format!(
+                "failed to create the Vulkan logical device: {}",
+                vk_result_message(error)
+            ),
         },
     )?;
 
@@ -311,6 +327,15 @@ pub(crate) fn create_device(
     })
 }
 
+/// Formats a Vulkan result as its canonical name and the loader's description.
+///
+/// The name (`VK_ERROR_INITIALIZATION_FAILED`) is what a user can search for;
+/// the description is the text the loader supplies. An unrecognised result
+/// falls back to its raw numeric value.
+pub(crate) fn vk_result_message(result: vk::Result) -> String {
+    format!("VK_{result:?} ({result})")
+}
+
 /// Maps a Vulkan result into an owned render error.
 pub(crate) fn result_error(context: &str, result: vk::Result) -> RenderError {
     match result {
@@ -323,8 +348,28 @@ pub(crate) fn result_error(context: &str, result: vk::Result) -> RenderError {
                 message: context.to_owned(),
             }
         }
-        other => RenderError::Unsupported {
-            message: format!("{context}: {other:?}"),
+        other => RenderError::DeviceUnavailable {
+            message: format!("{context}: {}", vk_result_message(other)),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The reference raises a failed device creation distinctly from an
+    // unsupported technique and names the underlying code before raising it
+    // (reference/cpp/core/visual/impl/BasicDrawDevice.cpp:113-123,
+    // reference/cpp/core/visual/impl/BasicDrawDevice.cpp:368-375,
+    // reference/cpp/core/base/impl/MsgImpl.h:131-133,
+    // reference/cpp/core/base/impl/MsgImpl.h:268-306). The reference is the
+    // oracle for behaviour, not for error strings; this only checks that the
+    // result name survives, as the reference keeps the named error.
+    #[test]
+    fn vk_result_message_names_the_result() {
+        let formatted = vk_result_message(vk::Result::ERROR_INITIALIZATION_FAILED);
+        assert!(formatted.contains("VK_ERROR_INITIALIZATION_FAILED"));
+        assert!(formatted.contains("Initialization of an object has failed"));
     }
 }

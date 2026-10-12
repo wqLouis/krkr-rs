@@ -141,6 +141,19 @@ pub enum RenderError {
         /// Human-readable description of the failure.
         message: String,
     },
+    /// The render backend is present, but no usable device could be obtained
+    /// or a runtime device operation failed.
+    ///
+    /// Unlike [`RenderError::Unsupported`], which reports a capability this
+    /// build or backend does not provide, this reports a runtime failure while
+    /// loading the backend, enumerating physical devices, creating the device
+    /// or performing a device operation. `message` carries the underlying
+    /// Vulkan result name and description when one is available.
+    #[error("render device unavailable: {message}")]
+    DeviceUnavailable {
+        /// Human-readable description of the failure.
+        message: String,
+    },
     /// The logical device was lost.
     #[error("render device was lost: {message}")]
     DeviceLost {

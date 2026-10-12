@@ -123,8 +123,8 @@ impl VulkanPipeline {
     ///
     /// # Errors
     ///
-    /// Returns [`RenderError::Unsupported`] when no Vulkan loader or suitable
-    /// device is available.
+    /// Returns [`RenderError::DeviceUnavailable`] when the Vulkan loader,
+    /// instance or a suitable device is unavailable.
     pub(crate) fn new(config: &crate::PipelineConfig) -> Result<Self, RenderError> {
         let bundle = device::create_instance(config)?;
         if bundle.validation {
@@ -209,8 +209,11 @@ impl VulkanPipeline {
                 None,
             )
         }
-        .map_err(|error| RenderError::Unsupported {
-            message: format!("failed to create the Vulkan surface: {error}"),
+        .map_err(|error| RenderError::DeviceUnavailable {
+            message: format!(
+                "failed to create the Vulkan presentation surface: {}",
+                device::vk_result_message(error)
+            ),
         })?;
 
         let device_bundle = device::create_device(
@@ -291,8 +294,11 @@ impl VulkanPipeline {
                     .device
                     .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
             }
-            .map_err(|error| RenderError::Unsupported {
-                message: format!("failed to create presentation semaphores: {error}"),
+            .map_err(|error| RenderError::DeviceUnavailable {
+                message: format!(
+                    "failed to create presentation semaphores: {}",
+                    device::vk_result_message(error)
+                ),
             })?;
             teardown.render_finished.push(semaphore);
         }
@@ -1034,8 +1040,11 @@ fn create_frame(device: &ash::Device, queue_family_index: u32) -> Result<VulkanF
     // SAFETY: `device` is live and the pool info is valid.
     let command_pool =
         unsafe { device.create_command_pool(&pool_info, None) }.map_err(|error| {
-            RenderError::Unsupported {
-                message: format!("failed to create a frame command pool: {error}"),
+            RenderError::DeviceUnavailable {
+                message: format!(
+                    "failed to create a frame command pool: {}",
+                    device::vk_result_message(error)
+                ),
             }
         })?;
 
@@ -1090,7 +1099,7 @@ fn create_frame(device: &ash::Device, queue_family_index: u32) -> Result<VulkanF
             }
             // SAFETY: owned here.
             unsafe { device.destroy_command_pool(command_pool, None) };
-            Err(RenderError::Unsupported {
+            Err(RenderError::DeviceUnavailable {
                 message: "failed to create frame synchronisation objects".to_owned(),
             })
         }
@@ -1107,8 +1116,11 @@ fn create_upload_resources(
         .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
     // SAFETY: `device` is live.
     let pool = unsafe { device.create_command_pool(&pool_info, None) }.map_err(|error| {
-        RenderError::Unsupported {
-            message: format!("failed to create the upload command pool: {error}"),
+        RenderError::DeviceUnavailable {
+            message: format!(
+                "failed to create the upload command pool: {}",
+                device::vk_result_message(error)
+            ),
         }
     })?;
 
@@ -1145,8 +1157,11 @@ fn create_upload_resources(
     .map_err(|error| {
         // SAFETY: owned here.
         unsafe { device.destroy_command_pool(pool, None) };
-        RenderError::Unsupported {
-            message: format!("failed to create the upload fence: {error}"),
+        RenderError::DeviceUnavailable {
+            message: format!(
+                "failed to create the upload fence: {}",
+                device::vk_result_message(error)
+            ),
         }
     })?;
 
@@ -1219,8 +1234,11 @@ fn rebuild_image_sync(state: &mut VulkanState, device: &ash::Device) -> Result<(
         // SAFETY: `device` is live.
         let semaphore =
             unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }.map_err(
-                |error| RenderError::Unsupported {
-                    message: format!("failed to create presentation semaphores: {error}"),
+                |error| RenderError::DeviceUnavailable {
+                    message: format!(
+                        "failed to create presentation semaphores: {}",
+                        device::vk_result_message(error)
+                    ),
                 },
             )?;
         state.render_finished.push(semaphore);
