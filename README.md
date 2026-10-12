@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="icon.png" alt="krkr-rs" width="180">
+  <img src="icons/ic_launcher_foreground%20%C2%B7%20108%20%C3%97%20108%20%C2%B7%20transparent.svg" alt="krkr-rs" width="180">
 </p>
 
 <h1 align="center">krkr-rs</h1>
