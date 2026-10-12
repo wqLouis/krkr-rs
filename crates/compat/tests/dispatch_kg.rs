@@ -276,7 +276,7 @@ fn video_overlay_with_write_keeps_the_target_receiver() {
         "class SubVideo extends VideoOverlay { \
              var _target = null; \
              var readValue = 0; \
-             function SubVideo() { super.VideoOverlay(null); left = 100; visible = false; } \
+             function SubVideo() { super.VideoOverlay(new global.Window()); left = 100; visible = false; } \
              function poke() { \
                  with(_target) { readValue = .left; } \
                  with(_target) { .left = 30; } \

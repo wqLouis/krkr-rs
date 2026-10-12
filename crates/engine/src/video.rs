@@ -36,9 +36,9 @@
 //! # Errors
 //!
 //! An unusable [`VideoSpec`] (non-positive/NaN `fps`, missing frame count),
-//! a playback command on a closed overlay, an invalid segment range, an
-//! invalid play rate and an inconsistent decoded frame are typed
-//! [`VideoError`]s instead of silent no-ops.
+//! a playback command on a closed overlay and an inconsistent decoded frame
+//! are typed [`VideoError`]s instead of silent no-ops. Script-visible values
+//! are not validated here: the reference stores whatever it is given.
 
 use api::media::{RgbaFrame, VideoSpec};
 
@@ -197,22 +197,6 @@ pub enum VideoError {
         /// Actual buffer length.
         len: usize,
     },
-    /// A segment loop range was outside `0..total_frames`.
-    #[error("invalid segment loop {start}..={end} (total frames {total})")]
-    InvalidSegment {
-        /// Requested loop start frame.
-        start: i64,
-        /// Requested loop end frame.
-        end: i64,
-        /// Known total frame count (0 when the overlay is closed).
-        total: i64,
-    },
-    /// A playback rate was not finite and positive.
-    #[error("invalid play rate {rate}")]
-    InvalidPlayRate {
-        /// The rejected rate.
-        rate: f64,
-    },
 }
 
 /// Frame-to-milliseconds conversion at `fps` (reference `frame_to_ms`).
@@ -249,7 +233,8 @@ pub struct VideoOverlay {
     segment_start: i64,
     segment_end: i64,
     period_event_frame: i64,
-    period_fired: bool,
+    period_past: bool,
+    preparing: bool,
     visible: bool,
     /// The overlay rectangle in window coordinates.
     pub bounds: VideoBounds,
@@ -271,7 +256,8 @@ impl Default for VideoOverlay {
             segment_start: -1,
             segment_end: -1,
             period_event_frame: -1,
-            period_fired: false,
+            period_past: false,
+            preparing: false,
             visible: false,
             bounds: VideoBounds::new(0, 0, 320, 240),
             binding: OverlayBinding {
@@ -322,18 +308,24 @@ impl VideoOverlay {
             }
             Some(_) => {}
         }
+        let was_open = self.spec.is_some();
         self.spec = Some(spec);
         self.playing = false;
         self.position_ms = 0;
-        self.period_fired = false;
+        self.play_rate = 0.0;
+        self.preparing = false;
+        self.period_past = false;
         self.segment_start = -1;
         self.segment_end = -1;
         self.period_event_frame = -1;
         self.frame = None;
         self.last_frame_update = -1;
-        // `apply_open` assigns the status directly rather than firing an
-        // `onStatusChanged`.
-        self.status = PlayStatus::Stop;
+        // The reference `Open` closes any previous backend (firing `unload`)
+        // and then enters the `stop` state.
+        if was_open {
+            self.set_status(PlayStatus::Unload);
+        }
+        self.set_status(PlayStatus::Stop);
         Ok(())
     }
 
@@ -343,10 +335,10 @@ impl VideoOverlay {
         self.spec = None;
         self.playing = false;
         self.position_ms = 0;
-        self.period_fired = false;
+        self.preparing = false;
         self.frame = None;
         self.last_frame_update = -1;
-        self.status = PlayStatus::Unload;
+        self.set_status(PlayStatus::Unload);
     }
 
     /// Whether a stream is open.
@@ -374,26 +366,25 @@ impl VideoOverlay {
     // -- playback ----------------------------------------------------------
 
     /// Start (or resume) playback, firing `onStatusChanged("play")` only on a
-    /// real status change. A non-looping stream that is already at the end
-    /// restarts from frame 0 (reference `vo_play`).
+    /// real status change. A paused backend resumes at normal speed
+    /// (reference `vo_play`).
     ///
     /// # Errors
     ///
     /// Returns [`VideoError::NotOpen`] when no stream is open.
     pub fn play(&mut self) -> Result<(), VideoError> {
         self.require_open()?;
-        let end_ms = self.duration_ms();
-        if !self.looping && self.position_ms >= end_ms {
-            self.position_ms = 0;
+        if self.play_rate == 0.0 {
+            self.play_rate = 1.0;
         }
         self.playing = true;
-        self.period_fired = false;
         self.set_status(PlayStatus::Play);
         Ok(())
     }
 
     /// Freeze playback at the current position and enter the `pause` state
-    /// (reference `vo_pause`).
+    /// (reference `vo_pause`). A paused backend reports a playback rate of
+    /// `0`.
     ///
     /// # Errors
     ///
@@ -401,6 +392,7 @@ impl VideoOverlay {
     pub fn pause(&mut self) -> Result<(), VideoError> {
         self.require_open()?;
         self.playing = false;
+        self.play_rate = 0.0;
         self.set_status(PlayStatus::Pause);
         Ok(())
     }
@@ -415,26 +407,33 @@ impl VideoOverlay {
         self.require_open()?;
         self.playing = false;
         self.position_ms = 0;
-        self.period_fired = false;
+        self.play_rate = 0.0;
         self.set_status(PlayStatus::Stop);
         Ok(())
     }
 
-    /// Rewind to frame 0 without changing the playing/paused state
-    /// (reference `vo_rewind`).
+    /// Rewind to frame 0 without changing the playing/paused state, re-arming
+    /// a period event that had already passed (reference `vo_rewind`).
     pub fn rewind(&mut self) {
         self.position_ms = 0;
-        self.period_fired = false;
+        if self.period_event_frame >= 0 && self.period_past {
+            self.period_past = false;
+        }
     }
 
-    /// Fire the `perPrepare` `onPeriod` event (reference `vo_prepare`).
+    /// Enter prepare mode: pause, rewind and play; the `perPrepare`
+    /// `onPeriod` event fires on the first decoded frame (reference
+    /// `vo_prepare`).
     ///
     /// # Errors
     ///
     /// Returns [`VideoError::NotOpen`] when no stream is open.
     pub fn prepare(&mut self) -> Result<(), VideoError> {
         self.require_open()?;
-        self.pending.push(VideoEvent::Period(PeriodReason::Prepare));
+        self.pause()?;
+        self.rewind();
+        self.preparing = true;
+        self.play()?;
         Ok(())
     }
 
@@ -473,35 +472,26 @@ impl VideoOverlay {
         self.play_rate
     }
 
-    /// Set the playback-rate multiplier.
-    ///
-    /// A rate is only validated while a stream is open; with no stream the
-    /// setter stores the value without reaching a decoder.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`VideoError::InvalidPlayRate`] when a stream is open and
-    /// `rate` is not finite and strictly positive.
-    pub fn set_play_rate(&mut self, rate: f64) -> Result<(), VideoError> {
-        if self.is_open() && (!rate.is_finite() || rate <= 0.0) {
-            return Err(VideoError::InvalidPlayRate { rate });
-        }
+    /// Set the playback-rate multiplier. The reference stores whatever it is
+    /// given and never validates it.
+    pub fn set_play_rate(&mut self, rate: f64) {
         self.play_rate = rate;
-        Ok(())
     }
 
-    /// Seek to `milliseconds` (clamped to `>= 0`), re-arming any period
-    /// event (reference `position` setter).
+    /// Seek to `milliseconds` (clamped to `>= 0`). The reference `position`
+    /// setter does not touch the period event.
     pub fn seek_ms(&mut self, milliseconds: i64) {
         self.position_ms = milliseconds.max(0);
-        self.period_fired = false;
     }
 
-    /// Seek to `frame` (clamped to `>= 0`), re-arming any period event
+    /// Seek to `frame` (clamped to `>= 0`). A period event whose frame is at
+    /// or after the new position is re-armed when it had already passed
     /// (reference `frame` setter).
     pub fn seek_frame(&mut self, frame: i64) {
         self.position_ms = frame_to_ms(self.fps(), frame.max(0));
-        self.period_fired = false;
+        if self.period_event_frame >= frame && self.period_past {
+            self.period_past = false;
+        }
     }
 
     // -- loop / segment loop ----------------------------------------------
@@ -516,25 +506,12 @@ impl VideoOverlay {
         }
     }
 
-    /// Configure a segment loop (`setSegmentLoop`). The loop is only honoured
-    /// while [`Self::looping`] is also enabled, matching the reference. With no
-    /// stream open the bounds are stored without validation.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`VideoError::InvalidSegment`] when a stream is open and
-    /// `start < 0`, `end < start`, or `end >= total_frames`.
-    pub fn set_segment_loop(&mut self, start: i64, end: i64) -> Result<(), VideoError> {
-        if self.is_open() {
-            let total = self.total_frames();
-            if start < 0 || end < start || (total > 0 && end >= total) {
-                return Err(VideoError::InvalidSegment { start, end, total });
-            }
-        }
+    /// Configure a segment loop (`setSegmentLoop`). The reference stores both
+    /// frames verbatim, without validating the range; `-1` is a valid value
+    /// that cancels the segment.
+    pub fn set_segment_loop(&mut self, start: i64, end: i64) {
         self.segment_start = start;
         self.segment_end = end;
-        self.period_fired = false;
-        Ok(())
     }
 
     /// Clear the segment loop (`cancelSegmentLoop`).
@@ -550,17 +527,17 @@ impl VideoOverlay {
         (self.period_event_frame >= 0).then_some(self.period_event_frame)
     }
 
-    /// Configure the frame at which `onPeriod(perPeriod)` fires
+    /// Configure the frame at which `onPeriod(perPeriod)` fires. A frame at
+    /// or before the current position is marked as already passed
     /// (`setPeriodEvent`).
     pub fn set_period_event(&mut self, frame: i64) {
         self.period_event_frame = frame;
-        self.period_fired = false;
+        self.period_past = frame <= self.frame();
     }
 
     /// Clear the period event (`cancelPeriodEvent`).
     pub fn cancel_period_event(&mut self) {
-        self.period_event_frame = -1;
-        self.period_fired = false;
+        self.set_period_event(-1);
     }
 
     // -- rectangle / visibility -------------------------------------------
@@ -665,14 +642,31 @@ impl VideoOverlay {
         std::mem::take(&mut self.pending)
     }
 
+    /// Remove and return the queued status changes, leaving every other event
+    /// queued. Callers that must fire `onStatusChanged` synchronously (the
+    /// reference posts it with `TVP_EPT_IMMEDIATE`) use this instead of
+    /// [`Self::poll`].
+    pub fn take_status_events(&mut self) -> Vec<PlayStatus> {
+        let mut statuses = Vec::new();
+        self.pending.retain(|event| match event {
+            VideoEvent::StatusChanged(status) => {
+                statuses.push(*status);
+                false
+            }
+            _ => true,
+        });
+        statuses
+    }
+
     /// Advance the clock by `dt_ms` milliseconds, updating the position and
     /// queuing the resulting events.
     ///
     /// A non-looping stream that crosses its end stops (`stop` status) and
-    /// queues [`VideoEvent::TransitionComplete`]. A looping stream wraps to
-    /// the segment start (or frame 0) and queues a `perLoop`/`perSegLoop`
-    /// period event; a segment wrap also queues [`VideoEvent::TransitionComplete`].
-    /// A configured period event fires once per arming.
+    /// rewinds to frame 0, queueing [`VideoEvent::TransitionComplete`]. A
+    /// configured segment loop wraps to its start whenever its end frame is
+    /// reached, regardless of [`Self::looping`]. A whole-stream loop wraps to
+    /// frame 0 and queues a `perLoop` period event. A configured period event
+    /// fires once per arming.
     pub fn advance(&mut self, dt_ms: f64) {
         if !self.playing || !dt_ms.is_finite() || dt_ms < 0.0 {
             return;
@@ -682,32 +676,52 @@ impl VideoOverlay {
         if fps <= 0.0 || total <= 0 {
             return;
         }
+
+        // Prepare mode pauses and rewinds on the first decoded frame.
+        if self.preparing {
+            if self.frame.is_some() {
+                self.emit_frame_update();
+                self.pending.push(VideoEvent::Period(PeriodReason::Prepare));
+                self.playing = false;
+                self.play_rate = 0.0;
+                self.set_status(PlayStatus::Pause);
+                self.rewind();
+                self.preparing = false;
+            }
+            return;
+        }
+
         let rate = self.play_rate;
         self.position_ms = self
             .position_ms
-            .saturating_add((dt_ms * rate).round() as i64);
-        self.position_ms = self.position_ms.max(0);
+            .saturating_add((dt_ms * rate).round() as i64)
+            .max(0);
 
-        let (start, end) = self.segment_bounds();
-        let end_ms = frame_to_ms(fps, end + 1);
         let frame = ms_to_frame(fps, self.position_ms);
 
-        if frame > end || self.position_ms >= end_ms {
-            if self.looping {
-                self.position_ms = frame_to_ms(fps, start);
-                self.period_fired = false;
-                let segmented = self.segment_start >= 0 || self.segment_end >= 0;
-                self.pending.push(VideoEvent::Period(if segmented {
-                    PeriodReason::SegmentLoop
-                } else {
-                    PeriodReason::Loop
-                }));
-                if segmented {
-                    self.pending.push(VideoEvent::TransitionComplete);
-                }
-                self.emit_frame_update();
+        // A configured segment loops back before the whole-stream end,
+        // whether or not whole-stream looping is enabled.
+        if self.segment_end > 0 && frame >= self.segment_end {
+            let start = if self.segment_start > 0 {
+                self.segment_start
             } else {
-                self.position_ms = end_ms;
+                0
+            };
+            self.seek_frame(start);
+            self.pending
+                .push(VideoEvent::Period(PeriodReason::SegmentLoop));
+            return;
+        }
+
+        let end_ms = frame_to_ms(fps, total);
+        if frame >= total || self.position_ms >= end_ms {
+            if self.looping {
+                self.rewind();
+                self.pending.push(VideoEvent::Period(PeriodReason::Loop));
+            } else {
+                // The reference `EC_COMPLETE` handler calls `Stop()`, which
+                // rewinds to the start, before reporting the stop status.
+                self.position_ms = 0;
                 self.playing = false;
                 self.set_status(PlayStatus::Stop);
                 self.pending.push(VideoEvent::TransitionComplete);
@@ -715,30 +729,14 @@ impl VideoOverlay {
             return;
         }
 
-        if self.period_event_frame >= 0 && !self.period_fired && frame >= self.period_event_frame {
-            self.period_fired = true;
+        self.emit_frame_update();
+        if self.period_event_frame >= 0 && !self.period_past && frame >= self.period_event_frame {
+            self.period_event_frame = -1;
             self.pending.push(VideoEvent::Period(PeriodReason::Period));
         }
-        self.emit_frame_update();
     }
 
     // -- internals ---------------------------------------------------------
-
-    /// The active `(start, end)` inclusive frame range (reference
-    /// `segment_bounds`).
-    fn segment_bounds(&self) -> (i64, i64) {
-        let start = if self.segment_start >= 0 {
-            self.segment_start
-        } else {
-            0
-        };
-        let end = if self.segment_end >= start {
-            self.segment_end
-        } else {
-            (self.total_frames() - 1).max(start)
-        };
-        (start, end)
-    }
 
     /// Set the status, queueing `StatusChanged` only on a real change
     /// (reference `set_status`).
@@ -769,20 +767,33 @@ impl VideoOverlay {
     }
 }
 
-/// Copy a decoded RGBA [`RgbaFrame`] into `layer_id`'s MainImage, clipped to
-/// the layer's clip rectangle and to the smaller of the layer and frame
-/// dimensions.
-///
-/// `source_over` selects the alpha-compositing copy (a half-width alpha
-/// stream) over the straight replacement (an opaque stream). The layer must
-/// already own a MainImage; `false` is returned when it has none or the frame
-/// has no pixels. This is the shared primitive behind the movie layer copy and
-/// the layer-mode video overlay composite.
+/// Copy a decoded RGBA [`RgbaFrame`] into `layer_id`'s MainImage at full
+/// opacity. See [`blit_frame_to_layer_opacity`].
 pub fn blit_frame_to_layer(
     scene: &mut Scene,
     layer_id: u32,
     frame: &RgbaFrame,
     source_over: bool,
+) -> bool {
+    blit_frame_to_layer_opacity(scene, layer_id, frame, source_over, 255)
+}
+
+/// Copy a decoded RGBA [`RgbaFrame`] into `layer_id`'s MainImage, clipped to
+/// the layer's clip rectangle and to the smaller of the layer and frame
+/// dimensions.
+///
+/// `source_over` selects the alpha-compositing copy (a half-width alpha
+/// stream) over the straight replacement (an opaque stream); `opacity` is the
+/// compositing opacity applied in that path (reference `SetMixingBitmap(dest,
+/// alpha)`). The layer must already own a MainImage; `false` is returned when
+/// it has none or the frame has no pixels. This is the shared primitive behind
+/// the movie layer copy and the layer-mode video overlay composite.
+pub fn blit_frame_to_layer_opacity(
+    scene: &mut Scene,
+    layer_id: u32,
+    frame: &RgbaFrame,
+    source_over: bool,
+    opacity: u8,
 ) -> bool {
     if frame.width == 0 || frame.height == 0 {
         return false;
@@ -808,7 +819,7 @@ pub fn blit_frame_to_layer(
         return false;
     };
     if source_over {
-        blit_over(dst, dx, dy, &source, src_rect, clip, 255, false, false);
+        blit_over(dst, dx, dy, &source, src_rect, clip, opacity, false, false);
     } else {
         blit_copy_clipped(dst, dx, dy, &source, src_rect, clip);
     }

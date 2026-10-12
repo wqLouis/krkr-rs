@@ -46,7 +46,9 @@ use std::ffi::{c_char, c_int, c_void};
 
 use api::media::{RgbaFrame, VideoSpec};
 use engine::Scene;
-use engine::video::{VideoBounds, VideoEvent, VideoOverlay, blit_frame_to_layer};
+use engine::video::{
+    PlayStatus, VideoBounds, VideoEvent, VideoOverlay, blit_frame_to_layer_opacity,
+};
 use tjs::{
     DetachedValue, NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef,
     RetainedValue, Tjs2Engine, Tjs2ValueId, TjsValue, VAL_INTEGER, VAL_OBJECT, VAL_REAL,
@@ -151,14 +153,6 @@ struct VideoSlot {
     /// Selected audio/video stream numbers (`-1` when none is selected).
     enabled_audio_stream: i64,
     enabled_video_stream: i64,
-    /// `mixingMovieAlpha`/`mixingMovieBGColor` (reference `vomMixer`).
-    mixing_alpha: f64,
-    mixing_bg: i64,
-    /// Color-adjustment passthrough (inert without a decoder).
-    contrast: f64,
-    brightness: f64,
-    hue: f64,
-    saturation: f64,
     /// Stream counts from the host spec (`VideoSpec` has no stream count).
     number_of_audio_stream: i64,
     number_of_video_stream: i64,
@@ -179,12 +173,6 @@ impl VideoSlot {
             audio_volume: 0,
             enabled_audio_stream: 0,
             enabled_video_stream: 0,
-            mixing_alpha: 1.0,
-            mixing_bg: 0,
-            contrast: 1.0,
-            brightness: 0.0,
-            hue: 0.0,
-            saturation: 1.0,
             number_of_audio_stream: 0,
             number_of_video_stream: 0,
         }
@@ -378,37 +366,6 @@ macro_rules! with_slot {
     }};
 }
 
-/// Read/write an integer [`VideoSlot`] field.
-macro_rules! slot_int_prop {
-    ($get:ident, $set:ident, $field:ident) => {
-        extern "C" fn $get(
-            engine: *mut c_void,
-            instance: *mut c_void,
-            out: *mut Value,
-            out_error: *mut *mut c_char,
-            _objthis: *mut c_void,
-        ) -> c_int {
-            with_slot!(engine, instance, out_error, _ctx, slot, {
-                set_int(out, slot.$field);
-                0
-            })
-        }
-        extern "C" fn $set(
-            engine: *mut c_void,
-            instance: *mut c_void,
-            value: *const Value,
-            out_error: *mut *mut c_char,
-            _objthis: *mut c_void,
-        ) -> c_int {
-            with_slot!(engine, instance, out_error, _ctx, slot, {
-                // SAFETY: `value` is the valid `Value` the caller holds for this call.
-                slot.$field = value_as_i64(unsafe { &*value });
-                0
-            })
-        }
-    };
-}
-
 /// Read/write a backend-passthrough integer [`VideoSlot`] field.
 ///
 /// With no stream open the reference wrapper's getter reports `$closed` and
@@ -452,10 +409,54 @@ macro_rules! passthrough_int_prop {
     };
 }
 
-/// Read/write a backend-passthrough real [`VideoSlot`] field. See
-/// [`passthrough_int_prop!`].
-macro_rules! passthrough_real_prop {
-    ($get:ident, $set:ident, $field:ident, $closed:expr) => {
+/// Read/write backend-defined real metadata. The in-tree FFmpeg backend
+/// leaves every colour getter at the wrapper's `-1.0` seed even while a stream
+/// is open, and its setters are inert.
+macro_rules! backend_stub_real_prop {
+    ($get:ident, $set:ident) => {
+        extern "C" fn $get(
+            _engine: *mut c_void,
+            _instance: *mut c_void,
+            out: *mut Value,
+            _out_error: *mut *mut c_char,
+            _objthis: *mut c_void,
+        ) -> c_int {
+            set_real(out, -1.0);
+            0
+        }
+        extern "C" fn $set(
+            _engine: *mut c_void,
+            _instance: *mut c_void,
+            _value: *const Value,
+            _out_error: *mut *mut c_char,
+            _objthis: *mut c_void,
+        ) -> c_int {
+            0
+        }
+    };
+}
+
+/// Read-only backend-defined real metadata that reports a fixed value with no
+/// stream open.
+macro_rules! backend_const_real_prop {
+    ($get:ident) => {
+        extern "C" fn $get(
+            _engine: *mut c_void,
+            _instance: *mut c_void,
+            out: *mut Value,
+            _out_error: *mut *mut c_char,
+            _objthis: *mut c_void,
+        ) -> c_int {
+            set_real(out, -1.0);
+            0
+        }
+    };
+}
+
+/// Read/write a backend-passthrough real with fixed open/closed values. The
+/// in-tree FFmpeg backend's setters are stubs, so the setter is inert.
+macro_rules! backend_open_real_prop {
+    ($get:ident, $set:ident, $open_value:expr, $closed_value:expr) => {
         extern "C" fn $get(
             engine: *mut c_void,
             instance: *mut c_void,
@@ -467,37 +468,30 @@ macro_rules! passthrough_real_prop {
                 set_real(
                     out,
                     if slot.overlay.is_open() {
-                        slot.$field
+                        $open_value
                     } else {
-                        $closed
+                        $closed_value
                     },
                 );
                 0
             })
         }
         extern "C" fn $set(
-            engine: *mut c_void,
-            instance: *mut c_void,
-            value: *const Value,
-            out_error: *mut *mut c_char,
+            _engine: *mut c_void,
+            _instance: *mut c_void,
+            _value: *const Value,
+            _out_error: *mut *mut c_char,
             _objthis: *mut c_void,
         ) -> c_int {
-            with_slot!(engine, instance, out_error, _ctx, slot, {
-                if slot.overlay.is_open() {
-                    // SAFETY: `value` is the valid `Value` the caller holds for this call.
-                    slot.$field = value_as_f64(unsafe { &*value });
-                }
-                0
-            })
+            0
         }
     };
 }
 
-/// Read-only backend-defined real metadata (`*RangeMin`/`*RangeMax`/
-/// `*DefaultValue`/`*StepSize`). The reference reads `-1.0` from the
-/// uninitialised local when no stream is open.
-macro_rules! backend_const_real_prop {
-    ($get:ident, $value:expr) => {
+/// Read/write an integer backend-passthrough with fixed open/closed values. See
+/// [`backend_open_real_prop!`].
+macro_rules! backend_open_int_prop {
+    ($get:ident, $set:ident, $open_value:expr, $closed_value:expr) => {
         extern "C" fn $get(
             engine: *mut c_void,
             instance: *mut c_void,
@@ -506,9 +500,25 @@ macro_rules! backend_const_real_prop {
             _objthis: *mut c_void,
         ) -> c_int {
             with_slot!(engine, instance, out_error, _ctx, slot, {
-                set_real(out, if slot.overlay.is_open() { $value } else { -1.0 });
+                set_int(
+                    out,
+                    if slot.overlay.is_open() {
+                        $open_value
+                    } else {
+                        $closed_value
+                    },
+                );
                 0
             })
+        }
+        extern "C" fn $set(
+            _engine: *mut c_void,
+            _instance: *mut c_void,
+            _value: *const Value,
+            _out_error: *mut *mut c_char,
+            _objthis: *mut c_void,
+        ) -> c_int {
+            0
         }
     };
 }
@@ -529,6 +539,63 @@ macro_rules! slot_ro_int {
             })
         }
     };
+}
+
+/// Run `command` against the overlay's slot, then return its dispatch target
+/// and the status changes it produced. The caller fires those synchronously,
+/// after this function has released the state borrow, matching the reference's
+/// immediate `onStatusChanged`.
+///
+/// A command failure is reported through `out_error` and yields `None`.
+fn run_command(
+    engine: *mut c_void,
+    instance: *mut c_void,
+    out_error: *mut *mut c_char,
+    command: impl FnOnce(&mut VideoSlot) -> Result<(), String>,
+) -> Option<(*mut c_void, Vec<PlayStatus>)> {
+    let Ok((_resolved, ctx)) = bound(engine) else {
+        report_error(out_error, "VideoOverlay: compat context is not bound");
+        return None;
+    };
+    // SAFETY: `instance` is the live `VideoOverlayInst` payload the VM
+    // allocated for this script object; no `&mut` to it is live here.
+    let inst = unsafe { &*(instance as *const VideoOverlayInst) };
+    let Some(id) = inst.id else {
+        report_error(out_error, "VideoOverlay: object is not constructed");
+        return None;
+    };
+    // SAFETY: `ctx` is only created for a bound, live engine, so its service
+    // pointer is valid for this command.
+    let services = unsafe { ctx.services() };
+    let mut state = services.state::<VideoState>();
+    let Some(slot) = state.overlays.get_mut(&id) else {
+        report_error(out_error, "VideoOverlay: object state is missing");
+        return None;
+    };
+    if let Err(message) = command(slot) {
+        drop(state);
+        report_error(out_error, &message);
+        return None;
+    }
+    let objthis = slot.objthis;
+    let statuses = slot.overlay.take_status_events();
+    Some((objthis, statuses))
+}
+
+/// Fire `onStatusChanged` for each status change, synchronously.
+fn dispatch_statuses(engine: *mut c_void, objthis: *mut c_void, statuses: &[PlayStatus]) {
+    if objthis.is_null() || statuses.is_empty() {
+        return;
+    }
+    let Ok((resolved, _ctx)) = bound(engine) else {
+        return;
+    };
+    let events: Vec<VideoEvent> = statuses
+        .iter()
+        .copied()
+        .map(VideoEvent::StatusChanged)
+        .collect();
+    dispatch_events(resolved.engine(), objthis, &events);
 }
 
 // ---------------------------------------------------------------------------
@@ -567,9 +634,9 @@ extern "C" fn video_destroy(engine: *mut c_void, instance: *mut c_void) {
     drop(unsafe { Box::from_raw(instance as *mut VideoOverlayInst) });
 }
 
-/// `VideoOverlay(win)` — the constructor hook. The optional first argument is
-/// the owning window (reference `Construct`); `null`/no argument is accepted
-/// (the headless port cannot validate the class).
+/// `VideoOverlay(win)` — the constructor hook. The reference `Construct`
+/// requires a live `Window` argument: a missing
+/// argument is a bad parameter count and a null/non-`Window` object raises.
 extern "C" fn video_ctor(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -589,15 +656,16 @@ extern "C" fn video_ctor(
     };
     // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let values = unsafe { args(argv, argc) };
-    let window = match values.first() {
-        Some(value) if value.ty == VAL_OBJECT && !value.object_handle().is_null() => {
-            match object_id(resolved.engine(), value) {
-                Ok(id) if id >= 0 => Some(id as u32),
-                Ok(_) => None,
-                Err(error) => return report_error(out_error, &format!("VideoOverlay: {error}")),
-            }
-        }
-        _ => None,
+    let Some(value) = values.first() else {
+        return report_error(out_error, "VideoOverlay: a Window argument is required");
+    };
+    if value.ty != VAL_OBJECT || value.object_handle().is_null() {
+        return report_error(out_error, "VideoOverlay: specify a Window");
+    }
+    let window = match object_id(resolved.engine(), value) {
+        Ok(id) if id >= 0 => id as u32,
+        Ok(_) => return report_error(out_error, "VideoOverlay: specify a Window"),
+        Err(error) => return report_error(out_error, &format!("VideoOverlay: {error}")),
     };
     // SAFETY: `ctx` is only created for a bound, live engine, so its service pointer is valid for `video_ctor`.
     let services = unsafe { ctx.services() };
@@ -606,9 +674,7 @@ extern "C" fn video_ctor(
         return report_error(out_error, "VideoOverlay: object state is missing");
     };
     slot.objthis = objthis;
-    if let Some(window) = window {
-        slot.overlay.bind_window(window);
-    }
+    slot.overlay.bind_window(window);
     drop(state);
     set_void(out);
     0
@@ -665,7 +731,10 @@ extern "C" fn vo_open(
     } else {
         0
     };
+    let objthis = slot.objthis;
+    let statuses = slot.overlay.take_status_events();
     drop(state);
+    dispatch_statuses(engine, objthis, &statuses);
     set_void(out);
     0
 }
@@ -680,14 +749,18 @@ extern "C" fn vo_close(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    with_slot!(engine, instance, out_error, _ctx, slot, {
+    let Some((objthis, statuses)) = run_command(engine, instance, out_error, |slot| {
         slot.overlay.close();
         slot.path.clear();
         slot.number_of_audio_stream = 0;
         slot.number_of_video_stream = 0;
-        set_void(out);
-        0
-    })
+        Ok(())
+    }) else {
+        return 1;
+    };
+    dispatch_statuses(engine, objthis, &statuses);
+    set_void(out);
+    0
 }
 
 /// `play()`.
@@ -700,15 +773,19 @@ extern "C" fn vo_play(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    with_slot!(engine, instance, out_error, _ctx, slot, {
-        if slot.overlay.is_open()
-            && let Err(error) = slot.overlay.play()
-        {
-            return report_error(out_error, &format!("VideoOverlay.play: {error}"));
+    let Some((objthis, statuses)) = run_command(engine, instance, out_error, |slot| {
+        if slot.overlay.is_open() {
+            slot.overlay
+                .play()
+                .map_err(|error| format!("VideoOverlay.play: {error}"))?;
         }
-        set_void(out);
-        0
-    })
+        Ok(())
+    }) else {
+        return 1;
+    };
+    dispatch_statuses(engine, objthis, &statuses);
+    set_void(out);
+    0
 }
 
 /// `pause()`.
@@ -721,15 +798,19 @@ extern "C" fn vo_pause(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    with_slot!(engine, instance, out_error, _ctx, slot, {
-        if slot.overlay.is_open()
-            && let Err(error) = slot.overlay.pause()
-        {
-            return report_error(out_error, &format!("VideoOverlay.pause: {error}"));
+    let Some((objthis, statuses)) = run_command(engine, instance, out_error, |slot| {
+        if slot.overlay.is_open() {
+            slot.overlay
+                .pause()
+                .map_err(|error| format!("VideoOverlay.pause: {error}"))?;
         }
-        set_void(out);
-        0
-    })
+        Ok(())
+    }) else {
+        return 1;
+    };
+    dispatch_statuses(engine, objthis, &statuses);
+    set_void(out);
+    0
 }
 
 /// `stop()`.
@@ -742,15 +823,19 @@ extern "C" fn vo_stop(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    with_slot!(engine, instance, out_error, _ctx, slot, {
-        if slot.overlay.is_open()
-            && let Err(error) = slot.overlay.stop()
-        {
-            return report_error(out_error, &format!("VideoOverlay.stop: {error}"));
+    let Some((objthis, statuses)) = run_command(engine, instance, out_error, |slot| {
+        if slot.overlay.is_open() {
+            slot.overlay
+                .stop()
+                .map_err(|error| format!("VideoOverlay.stop: {error}"))?;
         }
-        set_void(out);
-        0
-    })
+        Ok(())
+    }) else {
+        return 1;
+    };
+    dispatch_statuses(engine, objthis, &statuses);
+    set_void(out);
+    0
 }
 
 /// `rewind()`.
@@ -763,14 +848,18 @@ extern "C" fn vo_rewind(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    with_slot!(engine, instance, out_error, _ctx, slot, {
+    let Some((objthis, statuses)) = run_command(engine, instance, out_error, |slot| {
         slot.overlay.rewind();
-        set_void(out);
-        0
-    })
+        Ok(())
+    }) else {
+        return 1;
+    };
+    dispatch_statuses(engine, objthis, &statuses);
+    set_void(out);
+    0
 }
 
-/// `prepare()`.
+/// `prepare()`. The reference acts only in `vomLayer` mode.
 extern "C" fn vo_prepare(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -780,15 +869,19 @@ extern "C" fn vo_prepare(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
-    with_slot!(engine, instance, out_error, _ctx, slot, {
-        if slot.overlay.is_open()
-            && let Err(error) = slot.overlay.prepare()
-        {
-            return report_error(out_error, &format!("VideoOverlay.prepare: {error}"));
+    let Some((objthis, statuses)) = run_command(engine, instance, out_error, |slot| {
+        if slot.overlay.is_open() && slot.mode == MODE_LAYER {
+            slot.overlay
+                .prepare()
+                .map_err(|error| format!("VideoOverlay.prepare: {error}"))?;
         }
-        set_void(out);
-        0
-    })
+        Ok(())
+    }) else {
+        return 1;
+    };
+    dispatch_statuses(engine, objthis, &statuses);
+    set_void(out);
+    0
 }
 
 /// `setPos(left, top)`.
@@ -809,7 +902,21 @@ extern "C" fn vo_set_pos(
     let left = value_as_i64(&values[0]) as i32;
     let top = value_as_i64(&values[1]) as i32;
     with_slot!(engine, instance, out_error, _ctx, slot, {
-        slot.overlay.set_position(left, top);
+        if slot.mode == MODE_LAYER {
+            if let Ok(scene) = scene_mut(&_ctx) {
+                for layer in [slot.layer1.as_ref(), slot.layer2.as_ref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(state) = scene.layer_mut(layer.id) {
+                        state.rect.x = left;
+                        state.rect.y = top;
+                    }
+                }
+            }
+        } else {
+            slot.overlay.set_position(left, top);
+        }
         set_void(out);
         0
     })
@@ -833,7 +940,9 @@ extern "C" fn vo_set_size(
     let width = value_as_i64(&values[0]).max(0) as u32;
     let height = value_as_i64(&values[1]).max(0) as u32;
     with_slot!(engine, instance, out_error, _ctx, slot, {
-        slot.overlay.set_size(width, height);
+        if slot.mode != MODE_LAYER {
+            slot.overlay.set_size(width, height);
+        }
         set_void(out);
         0
     })
@@ -861,7 +970,9 @@ extern "C" fn vo_set_bounds(
         value_as_i64(&values[3]).max(0) as u32,
     );
     with_slot!(engine, instance, out_error, _ctx, slot, {
-        slot.overlay.bounds = bounds;
+        if slot.mode != MODE_LAYER {
+            slot.overlay.bounds = bounds;
+        }
         set_void(out);
         0
     })
@@ -888,13 +999,9 @@ extern "C" fn vo_set_segment_loop(
     let start = value_as_i64(&values[0]);
     let end = value_as_i64(&values[1]);
     with_slot!(engine, instance, out_error, _ctx, slot, {
-        match slot.overlay.set_segment_loop(start, end) {
-            Ok(()) => {
-                set_void(out);
-                0
-            }
-            Err(error) => report_error(out_error, &format!("VideoOverlay.setSegmentLoop: {error}")),
-        }
+        slot.overlay.set_segment_loop(start, end);
+        set_void(out);
+        0
     })
 }
 
@@ -1055,7 +1162,13 @@ extern "C" fn vo_select_audio_stream(
 ) -> c_int {
     // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let values = unsafe { args(argv, argc) };
-    let stream = values.first().map(value_as_i64).unwrap_or(0);
+    if values.is_empty() {
+        return report_error(
+            out_error,
+            "VideoOverlay.selectAudioStream requires 1 argument",
+        );
+    }
+    let stream = value_as_i64(&values[0]);
     with_slot!(engine, instance, out_error, _ctx, slot, {
         slot.enabled_audio_stream = stream;
         set_void(out);
@@ -1144,10 +1257,23 @@ extern "C" fn vo_left_set(
     _objthis: *mut c_void,
 ) -> c_int {
     with_slot!(engine, instance, out_error, _ctx, slot, {
-        let top = slot.overlay.bounds.top;
-        slot.overlay
-            // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
-            .set_position(value_as_i64(unsafe { &*value }) as i32, top);
+        // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
+        let left = value_as_i64(unsafe { &*value }) as i32;
+        if slot.mode == MODE_LAYER {
+            if let Ok(scene) = scene_mut(&_ctx) {
+                for layer in [slot.layer1.as_ref(), slot.layer2.as_ref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(state) = scene.layer_mut(layer.id) {
+                        state.rect.x = left;
+                    }
+                }
+            }
+        } else {
+            let top = slot.overlay.bounds.top;
+            slot.overlay.set_position(left, top);
+        }
         0
     })
 }
@@ -1173,10 +1299,23 @@ extern "C" fn vo_top_set(
     _objthis: *mut c_void,
 ) -> c_int {
     with_slot!(engine, instance, out_error, _ctx, slot, {
-        let left = slot.overlay.bounds.left;
-        slot.overlay
-            // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
-            .set_position(left, value_as_i64(unsafe { &*value }) as i32);
+        // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
+        let top = value_as_i64(unsafe { &*value }) as i32;
+        if slot.mode == MODE_LAYER {
+            if let Ok(scene) = scene_mut(&_ctx) {
+                for layer in [slot.layer1.as_ref(), slot.layer2.as_ref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(state) = scene.layer_mut(layer.id) {
+                        state.rect.y = top;
+                    }
+                }
+            }
+        } else {
+            let left = slot.overlay.bounds.left;
+            slot.overlay.set_position(left, top);
+        }
         0
     })
 }
@@ -1202,10 +1341,12 @@ extern "C" fn vo_width_set(
     _objthis: *mut c_void,
 ) -> c_int {
     with_slot!(engine, instance, out_error, _ctx, slot, {
-        let height = slot.overlay.bounds.height;
-        slot.overlay
+        if slot.mode != MODE_LAYER {
+            let height = slot.overlay.bounds.height;
             // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
-            .set_size(value_as_i64(unsafe { &*value }).max(0) as u32, height);
+            slot.overlay
+                .set_size(value_as_i64(unsafe { &*value }).max(0) as u32, height);
+        }
         0
     })
 }
@@ -1231,10 +1372,12 @@ extern "C" fn vo_height_set(
     _objthis: *mut c_void,
 ) -> c_int {
     with_slot!(engine, instance, out_error, _ctx, slot, {
-        let width = slot.overlay.bounds.width;
-        slot.overlay
+        if slot.mode != MODE_LAYER {
+            let width = slot.overlay.bounds.width;
             // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
-            .set_size(width, value_as_i64(unsafe { &*value }).max(0) as u32);
+            slot.overlay
+                .set_size(width, value_as_i64(unsafe { &*value }).max(0) as u32);
+        }
         0
     })
 }
@@ -1261,7 +1404,21 @@ extern "C" fn vo_visible_set(
 ) -> c_int {
     with_slot!(engine, instance, out_error, _ctx, slot, {
         // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
-        slot.overlay.set_visible(value_as_bool(unsafe { &*value }));
+        let visible = value_as_bool(unsafe { &*value });
+        slot.overlay.set_visible(visible);
+        if slot.overlay.is_open()
+            && slot.mode == MODE_LAYER
+            && let Ok(scene) = scene_mut(&_ctx)
+        {
+            for layer in [slot.layer1.as_ref(), slot.layer2.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                if let Some(state) = scene.layer_mut(layer.id) {
+                    state.visible = visible;
+                }
+            }
+        }
         0
     })
 }
@@ -1397,10 +1554,7 @@ extern "C" fn vo_play_rate_set(
     with_slot!(engine, instance, out_error, _ctx, slot, {
         if slot.overlay.is_open() {
             // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
-            let rate = value_as_f64(unsafe { &*value });
-            if let Err(error) = slot.overlay.set_play_rate(rate) {
-                return report_error(out_error, &format!("VideoOverlay.playRate: {error}"));
-            }
+            slot.overlay.set_play_rate(value_as_f64(unsafe { &*value }));
         }
         0
     })
@@ -1482,36 +1636,66 @@ passthrough_int_prop!(
 
 // -- mixing -----------------------------------------------------------------
 
-passthrough_real_prop!(vo_mixing_alpha_get, vo_mixing_alpha_set, mixing_alpha, 0.0);
-passthrough_int_prop!(vo_mixing_bg_get, vo_mixing_bg_set, mixing_bg, 0);
+// The in-tree FFmpeg backend stubs the mixing setters and returns fixed
+// values.
+backend_open_real_prop!(vo_mixing_alpha_get, vo_mixing_alpha_set, 1.0, 0.0);
+backend_open_int_prop!(vo_mixing_bg_get, vo_mixing_bg_set, 0xFF00_0000_i64, 0);
 
 // -- mode -------------------------------------------------------------------
 
-slot_int_prop!(vo_mode_get, vo_mode_set, mode);
+extern "C" fn vo_mode_get(
+    engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    with_slot!(engine, instance, out_error, _ctx, slot, {
+        set_int(out, slot.mode);
+        0
+    })
+}
 
-// -- color adjustment (backend-defined; inert without a decoder) ------------
+/// The reference ignores a `mode` write while a stream is open.
+extern "C" fn vo_mode_set(
+    engine: *mut c_void,
+    instance: *mut c_void,
+    value: *const Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    with_slot!(engine, instance, out_error, _ctx, slot, {
+        if !slot.overlay.is_open() {
+            // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
+            slot.mode = value_as_i64(unsafe { &*value });
+        }
+        0
+    })
+}
 
-passthrough_real_prop!(vo_contrast_get, vo_contrast_set, contrast, -1.0);
-passthrough_real_prop!(vo_brightness_get, vo_brightness_set, brightness, -1.0);
-passthrough_real_prop!(vo_hue_get, vo_hue_set, hue, -1.0);
-passthrough_real_prop!(vo_saturation_get, vo_saturation_set, saturation, -1.0);
+// -- color adjustment (backend-defined; stubbed by the FFmpeg backend) -------
 
-backend_const_real_prop!(vo_contrast_range_min_get, 0.0);
-backend_const_real_prop!(vo_contrast_range_max_get, 2.0);
-backend_const_real_prop!(vo_contrast_default_value_get, 1.0);
-backend_const_real_prop!(vo_contrast_step_size_get, 0.01);
-backend_const_real_prop!(vo_brightness_range_min_get, -1.0);
-backend_const_real_prop!(vo_brightness_range_max_get, 1.0);
-backend_const_real_prop!(vo_brightness_default_value_get, 0.0);
-backend_const_real_prop!(vo_brightness_step_size_get, 0.01);
-backend_const_real_prop!(vo_hue_range_min_get, -180.0);
-backend_const_real_prop!(vo_hue_range_max_get, 180.0);
-backend_const_real_prop!(vo_hue_default_value_get, 0.0);
-backend_const_real_prop!(vo_hue_step_size_get, 1.0);
-backend_const_real_prop!(vo_saturation_range_min_get, 0.0);
-backend_const_real_prop!(vo_saturation_range_max_get, 2.0);
-backend_const_real_prop!(vo_saturation_default_value_get, 1.0);
-backend_const_real_prop!(vo_saturation_step_size_get, 0.01);
+backend_stub_real_prop!(vo_contrast_get, vo_contrast_set);
+backend_stub_real_prop!(vo_brightness_get, vo_brightness_set);
+backend_stub_real_prop!(vo_hue_get, vo_hue_set);
+backend_stub_real_prop!(vo_saturation_get, vo_saturation_set);
+
+backend_const_real_prop!(vo_contrast_range_min_get);
+backend_const_real_prop!(vo_contrast_range_max_get);
+backend_const_real_prop!(vo_contrast_default_value_get);
+backend_const_real_prop!(vo_contrast_step_size_get);
+backend_const_real_prop!(vo_brightness_range_min_get);
+backend_const_real_prop!(vo_brightness_range_max_get);
+backend_const_real_prop!(vo_brightness_default_value_get);
+backend_const_real_prop!(vo_brightness_step_size_get);
+backend_const_real_prop!(vo_hue_range_min_get);
+backend_const_real_prop!(vo_hue_range_max_get);
+backend_const_real_prop!(vo_hue_default_value_get);
+backend_const_real_prop!(vo_hue_step_size_get);
+backend_const_real_prop!(vo_saturation_range_min_get);
+backend_const_real_prop!(vo_saturation_range_max_get);
+backend_const_real_prop!(vo_saturation_default_value_get);
+backend_const_real_prop!(vo_saturation_step_size_get);
 
 // -- media metadata ---------------------------------------------------------
 
@@ -1884,12 +2068,13 @@ fn composite_overlay(ctx: &CompatCtx, slot: &VideoSlot) {
             let layers = [slot.layer1.as_ref(), slot.layer2.as_ref()];
             for layer in layers.into_iter().flatten() {
                 prepare_layer_for_frame(ctx, layer.id, frame);
-                composite_frame(ctx, layer.id, frame, false);
+                composite_frame(ctx, layer.id, frame, false, 255);
             }
         }
         MODE_MIXER => {
             if let Some(layer) = slot.mixing_layer.as_ref() {
-                composite_frame(ctx, layer.id, frame, true);
+                let opacity = (slot.mixing_layer_alpha * 255.0).clamp(0.0, 255.0).round() as u8;
+                composite_frame(ctx, layer.id, frame, true, opacity);
             }
         }
         _ => {}
@@ -1915,12 +2100,19 @@ fn prepare_layer_for_frame(ctx: &CompatCtx, layer_id: u32, frame: &RgbaFrame) {
     }
 }
 
-/// Blit `frame` into `layer_id`'s MainImage.
-fn composite_frame(ctx: &CompatCtx, layer_id: u32, frame: &RgbaFrame, source_over: bool) {
+/// Blit `frame` into `layer_id`'s MainImage with `opacity` in the
+/// alpha-compositing path.
+fn composite_frame(
+    ctx: &CompatCtx,
+    layer_id: u32,
+    frame: &RgbaFrame,
+    source_over: bool,
+    opacity: u8,
+) {
     let Ok(scene) = scene_mut(ctx) else {
         return;
     };
-    blit_frame_to_layer(scene, layer_id, frame, source_over);
+    blit_frame_to_layer_opacity(scene, layer_id, frame, source_over, opacity);
 }
 
 /// The attached L2 scene, mutably.

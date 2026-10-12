@@ -74,6 +74,13 @@ impl Env {
         }
     }
 
+    fn eval_string(&self, expression: &str) -> String {
+        match self.eval(expression) {
+            TjsValue::String(value) => value,
+            other => panic!("{expression:?} returned {other:?}, expected a string"),
+        }
+    }
+
     /// The scene id of the layer named `name`.
     fn layer_id(&self, name: &str) -> u32 {
         self._scene
@@ -158,7 +165,7 @@ fn open_reads_host_metadata() {
     let env = Env::new();
     env.set_default_source();
     env.run(
-        "var v = new VideoOverlay(null); \
+        "var v = new VideoOverlay(new Window()); \
          v.open('movie.mpg');",
     );
     assert_eq!(env.eval_int("v.originalWidth"), 640);
@@ -181,7 +188,7 @@ fn open_without_a_source_raises() {
     let _lock = vm_lock();
     let env = Env::new();
     env.run(
-        "var v = new VideoOverlay(null); var caught = 0; \
+        "var v = new VideoOverlay(new Window()); var caught = 0; \
          try { v.open('movie.mpg'); } catch (e) { caught = 1; }",
     );
     assert_eq!(env.eval_int("caught"), 1);
@@ -202,7 +209,7 @@ fn open_with_an_invalid_spec_raises() {
         default_frames(),
     );
     env.run(
-        "var v = new VideoOverlay(null); var caught = 0; \
+        "var v = new VideoOverlay(new Window()); var caught = 0; \
          try { v.open('movie.mpg'); } catch (e) { caught = 1; }",
     );
     assert_eq!(env.eval_int("caught"), 1);
@@ -214,7 +221,7 @@ fn bounds_and_visibility_round_trip() {
     let _lock = vm_lock();
     let env = Env::new();
     env.run(
-        "var v = new VideoOverlay(null); \
+        "var v = new VideoOverlay(new Window()); \
          v.left = 1; v.top = 2; v.width = 3; v.height = 4; \
          v.visible = true; \
          v.setPos(9, 8); v.setSize(7, 6); \
@@ -236,7 +243,7 @@ fn playback_commands_translate_to_l2() {
     let env = Env::new();
     env.set_default_source();
     env.run(
-        "var v = new VideoOverlay(null); \
+        "var v = new VideoOverlay(new Window()); \
          v.open('movie.mpg'); \
          v.position = 100; var p1 = v.position; \
          v.frame = 15; var p2 = v.position; \
@@ -264,7 +271,7 @@ fn playback_on_a_closed_overlay_is_inert() {
     let _lock = vm_lock();
     let env = Env::new();
     env.run(
-        "var v = new VideoOverlay(null); var caught = 0; \
+        "var v = new VideoOverlay(new Window()); var caught = 0; \
          try { v.play(); } catch (e) { caught++; } \
          try { v.pause(); } catch (e) { caught++; } \
          try { v.stop(); } catch (e) { caught++; } \
@@ -283,7 +290,7 @@ fn playback_on_a_closed_overlay_is_inert() {
 fn fresh_overlay_has_the_default_rectangle() {
     let _lock = vm_lock();
     let env = Env::new();
-    env.run("var v = new VideoOverlay(null);");
+    env.run("var v = new VideoOverlay(new Window());");
     assert_eq!(env.eval_int("v.left"), 0);
     assert_eq!(env.eval_int("v.top"), 0);
     assert_eq!(env.eval_int("v.width"), 320);
@@ -297,7 +304,7 @@ fn loop_and_period_members_round_trip() {
     let env = Env::new();
     env.set_default_source();
     env.run(
-        "var v = new VideoOverlay(null); \
+        "var v = new VideoOverlay(new Window()); \
          v.open('movie.mpg'); \
          v.loop = true; var loop = v.loop; \
          v.setSegmentLoop(10, 20); \
@@ -320,20 +327,37 @@ fn loop_and_period_members_round_trip() {
     assert!((env.eval_real("rate") - 2.0).abs() < 1e-9);
 }
 
-/// Invalid segment ranges and play rates are typed errors.
+/// Segment-loop bounds and the play rate are stored verbatim; the reference
+/// validates neither.
+///
+/// Reference: `SetSegmentLoop` stores both frames and calls the backend with
+/// no range check (`reference/cpp/core/visual/impl/VideoOvlImpl.cpp:357-361`);
+/// `SetLoop(false)` itself uses `(-1, -1)` (`:787-789`); `SetPlayRate` is
+/// unvalidated (`reference/cpp/core/movie/ffmpeg/KRMoviePlayer.cpp:75-79`).
 #[test]
-fn invalid_loop_and_rate_raise() {
+fn segment_loop_and_play_rate_accept_any_value() {
     let _lock = vm_lock();
     let env = Env::new();
     env.set_default_source();
     env.run(
-        "var v = new VideoOverlay(null); \
+        "var v = new VideoOverlay(new Window()); \
          v.open('movie.mpg'); var caught = 0; \
          try { v.setSegmentLoop(-1, 5); } catch (e) { caught++; } \
+         var s0 = v.segmentLoopStartFrame; var s1 = v.segmentLoopEndFrame; \
          try { v.setSegmentLoop(5, 2); } catch (e) { caught++; } \
-         try { v.playRate = 0; } catch (e) { caught++; }",
+         var s2 = v.segmentLoopStartFrame; var s3 = v.segmentLoopEndFrame; \
+         try { v.playRate = 0; } catch (e) { caught++; } \
+         var r0 = v.playRate; \
+         try { v.playRate = -3; } catch (e) { caught++; } \
+         var r1 = v.playRate;",
     );
-    assert_eq!(env.eval_int("caught"), 3);
+    assert_eq!(env.eval_int("caught"), 0);
+    assert_eq!(env.eval_int("s0"), -1);
+    assert_eq!(env.eval_int("s1"), 5);
+    assert_eq!(env.eval_int("s2"), 5);
+    assert_eq!(env.eval_int("s3"), 2);
+    assert!((env.eval_real("r0") - 0.0).abs() < 1e-9);
+    assert!((env.eval_real("r1") + 3.0).abs() < 1e-9);
 }
 
 /// `layer1`/`layer2` store a real Layer object and return it; a null clears
@@ -350,7 +374,7 @@ fn layer_refs_round_trip_and_validate() {
     env.run(
         "var w = new Window(); \
          var l = new Layer(w, null); \
-         var v = new VideoOverlay(null); \
+         var v = new VideoOverlay(new Window()); \
          v.layer1 = l; var same1 = (v.layer1 === l); \
          v.layer2 = l; var same2 = (v.layer2 === l); \
          v.layer1 = null; var cleared = (v.layer1 === null); \
@@ -385,7 +409,7 @@ fn mixing_layer_selection_matches_the_reference() {
         "var w = new Window(); \
          var shown = new Layer(w, null); shown.visible = true; shown.opacity = 128; \
          var hidden = new Layer(w, null); hidden.visible = false; hidden.opacity = 255; \
-         var v = new VideoOverlay(null); \
+         var v = new VideoOverlay(new Window()); \
          v.setMixingLayer(shown); \
          v.setMixingLayer(hidden); \
          v.resetMixingLayer(); \
@@ -412,7 +436,7 @@ fn segment_loop_on_a_closed_overlay_is_stored() {
     let _lock = vm_lock();
     let env = Env::new();
     env.run(
-        "var v = new VideoOverlay(null); \
+        "var v = new VideoOverlay(new Window()); \
          v.setSegmentLoop(-1, 5); \
          var s0 = v.segmentLoopStartFrame; var s1 = v.segmentLoopEndFrame; \
          v.cancelSegmentLoop(); \
@@ -431,14 +455,16 @@ fn segment_loop_on_a_closed_overlay_is_stored() {
 /// Reference: `GetAudioBalance`/`GetAudioVolume` seed the local with `0`,
 /// `GetEnableAudioStreamNum`/`GetEnableVideoStreamNum` seed it with `-1`, and
 /// every setter is guarded by `if(VideoOverlay)`
-/// (`reference/cpp/core/visual/impl/VideoOvlImpl.cpp:814-880`).
+/// (`reference/cpp/core/visual/impl/VideoOvlImpl.cpp:814-880`). The mixing
+/// movie alpha/background are stubbed by the FFmpeg backend to `1.0` and
+/// `0xFF000000` while open (`reference/cpp/core/movie/ffmpeg/KRMoviePlayer.h:112-118`).
 #[test]
 fn passthrough_members_follow_the_open_state() {
     let _lock = vm_lock();
     let env = Env::new();
     env.set_default_source();
     env.run(
-        "var v = new VideoOverlay(null); \
+        "var v = new VideoOverlay(new Window()); \
          v.mode = 1; var mode = v.mode; \
          v.playRate = 2.0; var closed_rate = v.playRate; \
          v.audioBalance = 10; v.audioVolume = 20; \
@@ -470,24 +496,24 @@ fn passthrough_members_follow_the_open_state() {
     assert_eq!(env.eval_int("eas"), 1);
     assert_eq!(env.eval_int("evs"), 0);
     assert_eq!(env.eval_int("eas2"), 2);
-    assert!((env.eval_real("mma") - 0.5).abs() < 1e-9);
-    assert_eq!(env.eval_int("mmb"), 0x00ff00);
+    assert!((env.eval_real("mma") - 1.0).abs() < 1e-9);
+    assert_eq!(env.eval_int("mmb"), 0xFF00_0000);
 }
 
-/// Color adjustment: a closed overlay reads `-1.0` for every value and
-/// metadata member and ignores writes; once open the values round-trip and
-/// the backend-defined metadata is reported.
+/// Color adjustment is stubbed by the in-tree FFmpeg backend: every getter
+/// reads `-1.0` whether or not a stream is open, and every setter is inert.
 ///
-/// Reference: every `Get*` seeds `ret = -1.0f` and only overwrites it when
-/// `VideoOverlay` is non-null, and every `Set*` is guarded by
-/// `if(VideoOverlay)` (`reference/cpp/core/visual/impl/VideoOvlImpl.cpp:951-1064`).
+/// Reference: `KRMoviePlayer.h:130-168` leaves every `Get*` empty, so the
+/// wrapper's `ret = -1.0f` seed survives even while a stream is open
+/// (`reference/cpp/core/visual/impl/VideoOvlImpl.cpp:979-1112`); every `Set*`
+/// is equally a no-op.
 #[test]
-fn color_adjustment_follows_the_open_state() {
+fn color_adjustment_is_stubbed_by_the_backend() {
     let _lock = vm_lock();
     let env = Env::new();
     env.set_default_source();
     env.run(
-        "var v = new VideoOverlay(null); \
+        "var v = new VideoOverlay(new Window()); \
          v.contrast = 1.5; \
          var closed_c = v.contrast; var closed_cmin = v.contrastRangeMin; \
          var closed_cdef = v.contrastDefaultValue; \
@@ -497,30 +523,42 @@ fn color_adjustment_follows_the_open_state() {
          var cmin = v.contrastRangeMin; var cmax = v.contrastRangeMax; \
          var cdef = v.contrastDefaultValue; var cstep = v.contrastStepSize; \
          var bmin = v.brightnessRangeMin; var bmax = v.brightnessRangeMax; \
-         var hmin = v.hueRangeMin; var hmax = v.hueRangeMax; var hstep = v.hueStepSize; \
+         var bdef = v.brightnessDefaultValue; var bstep = v.brightnessStepSize; \
+         var hmin = v.hueRangeMin; var hmax = v.hueRangeMax; \
+         var hdef = v.hueDefaultValue; var hstep = v.hueStepSize; \
          var smin = v.saturationRangeMin; var smax = v.saturationRangeMax; \
          var sdef = v.saturationDefaultValue; var sstep = v.saturationStepSize;",
     );
-    assert!((env.eval_real("closed_c") + 1.0).abs() < 1e-9);
-    assert!((env.eval_real("closed_cmin") + 1.0).abs() < 1e-9);
-    assert!((env.eval_real("closed_cdef") + 1.0).abs() < 1e-9);
-    assert!((env.eval_real("c") - 1.5).abs() < 1e-9);
-    assert!((env.eval_real("b") + 0.5).abs() < 1e-9);
-    assert!((env.eval_real("h") - 90.0).abs() < 1e-9);
-    assert!((env.eval_real("s") - 0.25).abs() < 1e-9);
-    assert!((env.eval_real("cmin") - 0.0).abs() < 1e-9);
-    assert!((env.eval_real("cmax") - 2.0).abs() < 1e-9);
-    assert!((env.eval_real("cdef") - 1.0).abs() < 1e-9);
-    assert!((env.eval_real("cstep") - 0.01).abs() < 1e-9);
-    assert!((env.eval_real("bmin") + 1.0).abs() < 1e-9);
-    assert!((env.eval_real("bmax") - 1.0).abs() < 1e-9);
-    assert!((env.eval_real("hmin") + 180.0).abs() < 1e-9);
-    assert!((env.eval_real("hmax") - 180.0).abs() < 1e-9);
-    assert!((env.eval_real("hstep") - 1.0).abs() < 1e-9);
-    assert!((env.eval_real("smin") - 0.0).abs() < 1e-9);
-    assert!((env.eval_real("smax") - 2.0).abs() < 1e-9);
-    assert!((env.eval_real("sdef") - 1.0).abs() < 1e-9);
-    assert!((env.eval_real("sstep") - 0.01).abs() < 1e-9);
+    for value in [
+        "closed_c",
+        "closed_cmin",
+        "closed_cdef",
+        "c",
+        "b",
+        "h",
+        "s",
+        "cmin",
+        "cmax",
+        "cdef",
+        "cstep",
+        "bmin",
+        "bmax",
+        "bdef",
+        "bstep",
+        "hmin",
+        "hmax",
+        "hdef",
+        "hstep",
+        "smin",
+        "smax",
+        "sdef",
+        "sstep",
+    ] {
+        assert!(
+            (env.eval_real(value) + 1.0).abs() < 1e-9,
+            "{value} must read the backend's -1.0 seed"
+        );
+    }
 }
 
 /// Every registered member is reachable from a script (the constructor plus
@@ -531,7 +569,7 @@ fn every_member_is_reachable() {
     let env = Env::new();
     env.set_default_source();
     env.run(
-        "var v = new VideoOverlay(null); \
+        "var v = new VideoOverlay(new Window()); \
          v.open('movie.mpg'); \
          v.play(); v.pause(); v.stop(); v.rewind(); v.prepare(); \
          v.setPos(1, 2); v.setSize(3, 4); v.setBounds(5, 6, 7, 8); \
@@ -586,7 +624,7 @@ fn layer_mode_composites_the_frame_into_the_layer() {
     env.host
         .set_video_source(movie_spec(), vec![solid_frame([255, 0, 0, 255])]);
     env.run(
-        "var v = new VideoOverlay(null); v.mode = 1; v.layer1 = l; \
+        "var v = new VideoOverlay(new Window()); v.mode = 1; v.layer1 = l; \
          v.open('movie.mpg'); v.play();",
     );
     let ctx = env.host.ctx().expect("bound context");
@@ -612,7 +650,7 @@ fn overlay_mode_leaves_the_layer_untouched() {
     env.host
         .set_video_source(movie_spec(), vec![solid_frame([255, 0, 0, 255])]);
     env.run(
-        "var v = new VideoOverlay(null); v.layer1 = l; \
+        "var v = new VideoOverlay(new Window()); v.layer1 = l; \
          v.open('movie.mpg'); v.play();",
     );
     let ctx = env.host.ctx().expect("bound context");
@@ -637,7 +675,7 @@ fn mixer_mode_composites_through_the_mixing_layer() {
     env.host
         .set_video_source(movie_spec(), vec![solid_frame([0, 255, 0, 255])]);
     env.run(
-        "var v = new VideoOverlay(null); v.mode = 2; v.setMixingLayer(l); \
+        "var v = new VideoOverlay(new Window()); v.mode = 2; v.setMixingLayer(l); \
          v.open('movie.mpg'); v.play();",
     );
     let ctx = env.host.ctx().expect("bound context");
@@ -655,10 +693,188 @@ fn advance_uses_the_frame_body_dt() {
     let env = Env::new();
     env.host
         .set_video_source(movie_spec(), vec![solid_frame([255, 0, 0, 255])]);
-    env.run("var v = new VideoOverlay(null); v.open('movie.mpg'); v.play();");
+    env.run("var v = new VideoOverlay(new Window()); v.open('movie.mpg'); v.play();");
     let ctx = env.host.ctx().expect("bound context");
     compat::video_advance(&ctx, 50.0).expect("advance");
     assert_eq!(env.eval_int("v.position"), 50);
     compat::video_advance(&ctx, 150.0).expect("advance");
     assert_eq!(env.eval_int("v.position"), 200);
+}
+
+/// `onStatusChanged` fires synchronously from `open`/`close`/`play`/`pause`/
+/// `stop`.
+///
+/// Reference: `SetStatus` posts the event with `TVP_EPT_IMMEDIATE`
+/// (`reference/cpp/core/visual/VideoOvlIntf.cpp:91-110`), which is delivered
+/// inside the posting call (`reference/cpp/core/visual/EventIntf.cpp:217-231`),
+/// and `open`/`close` end in `SetStatus(ssStop)`/`SetStatus(ssUnload)`
+/// (`reference/cpp/core/visual/impl/VideoOvlImpl.cpp:241,265`).
+#[test]
+fn status_events_fire_synchronously() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.set_default_source();
+    env.run(
+        "var v = new VideoOverlay(new Window()); \
+         var log = ''; \
+         v.onStatusChanged = function(s) { log += s + ','; }; \
+         v.open('movie.mpg'); var after_open = log; \
+         v.play(); var after_play = log; \
+         v.pause(); var after_pause = log; \
+         v.stop(); var after_stop = log; \
+         v.close(); var after_close = log;",
+    );
+    assert_eq!(env.eval_string("after_open"), "stop,");
+    assert_eq!(env.eval_string("after_play"), "stop,play,");
+    assert_eq!(env.eval_string("after_pause"), "stop,play,pause,");
+    assert_eq!(env.eval_string("after_stop"), "stop,play,pause,stop,");
+    assert_eq!(
+        env.eval_string("after_close"),
+        "stop,play,pause,stop,unload,"
+    );
+}
+
+/// `prepare` acts only in `vomLayer` mode and fires `perPrepare` on the first
+/// decoded frame.
+///
+/// Reference: `Prepare()` is guarded by `Mode == vomLayer`
+/// (`reference/cpp/core/visual/impl/VideoOvlImpl.cpp:349-355`); `EC_UPDATE`
+/// fires `perPrepare` then pauses and rewinds (`:635-640`).
+#[test]
+fn prepare_only_acts_in_layer_mode() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.host
+        .set_video_source(movie_spec(), vec![solid_frame([1, 2, 3, 255])]);
+    env.run(
+        "var w = new Window(); \
+         var l = new Layer(w, null); l.name = 'prep'; l.visible = true; \
+         var a = new VideoOverlay(w); \
+         var ap = ''; a.onPeriod = function(r) { ap += r + ','; }; \
+         a.open('movie.mpg'); a.prepare(); \
+         var b = new VideoOverlay(w); b.mode = 1; b.layer1 = l; \
+         var bp = ''; b.onPeriod = function(r) { bp += r + ','; }; \
+         b.open('movie.mpg'); b.prepare();",
+    );
+    let ctx = env.host.ctx().expect("bound context");
+    compat::video_advance(&ctx, 50.0).expect("advance");
+    assert_eq!(
+        env.eval_string("ap"),
+        "",
+        "vomOverlay prepare must be a silent no-op"
+    );
+    assert_eq!(
+        env.eval_string("bp"),
+        "2,",
+        "vomLayer prepare fires perPrepare"
+    );
+    assert_eq!(
+        env.eval_int("b.position"),
+        0,
+        "prepare ends paused at frame 0"
+    );
+}
+
+/// A `mode` write after `open` is ignored.
+///
+/// Reference: `SetMode` writes only when no backend exists
+/// (`reference/cpp/core/visual/impl/VideoOvlImpl.cpp:794-799`).
+#[test]
+fn mode_is_frozen_after_open() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.set_default_source();
+    env.run(
+        "var v = new VideoOverlay(new Window()); \
+         v.mode = 2; var before = v.mode; \
+         v.open('movie.mpg'); \
+         v.mode = 1; var after = v.mode;",
+    );
+    assert_eq!(env.eval_int("before"), 2);
+    assert_eq!(env.eval_int("after"), 2);
+}
+
+/// In `vomLayer` mode `setPos`/`left`/`top` move the bound layers; the size
+/// setters are no-ops and the getters read the wrapper's own stale rectangle.
+///
+/// Reference: `SetPosition`/`SetLeft`/`SetTop` move `Layer1`/`Layer2`
+/// (`reference/cpp/core/visual/impl/VideoOvlImpl.cpp:392-442`);
+/// `SetSize`/`SetWidth`/`SetHeight`/`SetBounds` return immediately (`:404-458`);
+/// the getters read `Rect` (`reference/cpp/core/visual/impl/VideoOvlImpl.h:118-133`).
+#[test]
+fn layer_mode_geometry_targets_the_bound_layers() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.set_default_source();
+    env.run(
+        "var w = new Window(); \
+         var l = new Layer(w, null); l.name = 'vgeom'; l.visible = true; \
+         var v = new VideoOverlay(w); v.mode = 1; v.layer1 = l; \
+         v.open('movie.mpg');",
+    );
+    let id = env.layer_id("vgeom");
+    let before = env._scene.layer(id).expect("layer").rect;
+    env.run(
+        "v.setPos(5, 6); v.left = 7; \
+         var wrapper_left = v.left; var wrapper_top = v.top; \
+         v.setSize(100, 100); v.width = 50; \
+         var wrapper_width = v.width; var wrapper_height = v.height;",
+    );
+    let rect = env._scene.layer(id).expect("layer").rect;
+    assert_eq!(rect.x, 7, "setPos/left move the bound layer");
+    assert_eq!(rect.y, 6);
+    assert_eq!(
+        (rect.w, rect.h),
+        (before.w, before.h),
+        "size setters are no-ops"
+    );
+    assert_eq!(env.eval_int("wrapper_left"), 0);
+    assert_eq!(env.eval_int("wrapper_top"), 0);
+    assert_eq!(env.eval_int("wrapper_width"), 320);
+    assert_eq!(env.eval_int("wrapper_height"), 240);
+}
+
+/// The constructor requires a live `Window` argument.
+///
+/// Reference: `Construct` returns `TJS_E_BADPARAMCOUNT` for a missing argument
+/// and throws `TVPSpecifyWindow` for a null/non-`Window` object
+/// (`reference/cpp/core/visual/VideoOvlIntf.cpp:38-55`).
+#[test]
+fn constructor_requires_a_window() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var thrown = 0; \
+         try { new VideoOverlay(); } catch (e) { thrown++; } \
+         try { new VideoOverlay(null); } catch (e) { thrown++; } \
+         try { new VideoOverlay(%[foo: 1]); } catch (e) { thrown++; } \
+         var w = new Window(); var ok = 0; \
+         try { new VideoOverlay(w); ok = 1; } catch (e) {}",
+    );
+    assert_eq!(env.eval_int("thrown"), 3);
+    assert_eq!(env.eval_int("ok"), 1);
+}
+
+/// The `vomMixer` composite uses the mixing layer's opacity.
+///
+/// Reference: `SetMixingLayer` passes `opacity/255` to `SetMixingBitmap`
+/// (`reference/cpp/core/visual/impl/VideoOvlImpl.cpp:882-913`).
+#[test]
+fn mixer_mode_applies_the_layer_opacity() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var l = new Layer(w, null); l.name = 'mixop'; l.visible = true; \
+         l.opacity = 128; l.setImageSize(4, 4);",
+    );
+    env.host
+        .set_video_source(movie_spec(), vec![solid_frame([0, 255, 0, 255])]);
+    env.run(
+        "var v = new VideoOverlay(new Window()); v.mode = 2; v.setMixingLayer(l); \
+         v.open('movie.mpg'); v.play();",
+    );
+    let ctx = env.host.ctx().expect("bound context");
+    compat::video_advance(&ctx, 50.0).expect("advance");
+    assert_eq!(env.bitmap_color("mixop", 1, 1), [0, 255, 0, 128]);
 }
