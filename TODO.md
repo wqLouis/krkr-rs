@@ -51,25 +51,24 @@ target/debug/krkr --headless --frames 10000 --base-dir /mnt/DATA/Games/Others/te
 A directory-only launch mounts every `*.xp3` under the base directory
 recursively; an explicit `--archive` list suppresses that (AGENTS §9 trap 12).
 
-## 2. In flight
+## 2. Focus model
 
-* **Stub implementations** — `Window.postInputEvent`, `System.exeName`,
-  `System.versionString`, `Font.doUserSelect` (return `0`, not a raise), and the
-  port-only `DrawDevice.name` removal (`implement-stub-natives`); the plugin
-  stub rows (`MenuItem.popup`, `D3DAdaptor`, `SeparateLayerAdaptor`,
-  `CDDA.onFadeCompleted`) under oracle-first review (`implement-stub-plugins`).
-  Source: `docs/audits/stub-inventory.md`.
-* **Android engine state** — the entry path fails on the second launch in a warm
-  process (already-installed logger treated as fatal), the terminal state write
-  clobbers recorded failures, and five fatal exits write no state
-  (`fix-android-engine-state`, from `docs/audits/android-jni-review.md`).
-* **Vulkan init error** — a device-enumeration failure reports itself as
-  "render backend is not supported", which misattributes a broken driver
-  (`fix-vulkan-init-error`).
-* **Focus domains** — the reference gives every parentless layer its own focus
-  manager (`docs/audits/focus-invalidate-events.md` Q2); the per-root change is
-  in progress.
-* **Android storage audit** — `docs/audits/android-storage-review.md` pending.
+The per-root domain change landed (`96207a6`): a focus domain per parentless
+layer, the window bound to the first, a cross-domain re-parent raising
+`TVPCannotMoveToUnderOtherPrimaryLayer`. Two residuals:
+
+* **Input is still flattened across domains.** Hit-testing walks every window
+  layer (`crates/compat/src/event.rs` → `Scene::layer_at`), where the reference
+  binds input to manager index 0 (`LayerTreeOwnerImpl.h:21`), so a click can
+  reach a layer in a second root that the reference would never deliver it to.
+  The engine-side lookup exists (`Scene::window_input_root`); the dispatch does
+  not use it. Changing this will need the multi-root input fixtures rebased the
+  way the focus fixtures were.
+* **`is_primary`/`primary_layer` is per window, not per manager.** Every
+  parentless root is the primary of its own manager (`LayerIntf.cpp:1217-1222`),
+  so hiding or moving a *second* root should raise
+  `TVPCannotSetPrimaryInvisible`/`TVPCannotMovePrimaryOrSiblingless`; the port
+  only raises for the window's first layer.
 
 ## 3. Real-game reports
 
