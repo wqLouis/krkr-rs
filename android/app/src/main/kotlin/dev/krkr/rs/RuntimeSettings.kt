@@ -12,20 +12,22 @@ import java.io.File
  * as parsed numbers or enums. Validation belongs to the read side
  * (`crates/android`), exactly like the desktop launcher's `key=value` file:
  * keeping the raw text means a hand-edited or corrupted value is reported by
- * the engine with the option name and its accepted range instead of being
+ * the engine with the option name and its accepted values instead of being
  * silently replaced by a default (`AGENTS.md` D11).
  */
 data class RuntimeSettings(
     val frameRate: String,
     val scaling: String,
+    val preloadArchives: String,
 )
 
 /**
  * The accepted runtime options, their ranges and their defaults.
  *
- * These mirror `api::config::{FrameRateLimit, PresentationScaling}`: the
- * frame-rate range and default come from there, while the Android default
- * presentation is [DEFAULT_SCALING] (`fit`) rather than the desktop `game`
+ * These mirror `api::config::{FrameRateLimit, PresentationScaling}` and the
+ * boolean `preload_archives` option: every default and accepted value comes
+ * from there, while the Android default presentation is
+ * [DEFAULT_SCALING] (`fit`) rather than the desktop `game`
  * (`docs/android.md` §2.2). Only options the engine can actually honour are
  * listed — there is no control for texture resolution or audio buffering,
  * because the engine exposes no knob for either.
@@ -55,10 +57,17 @@ object RuntimeOptions {
      */
     const val DEFAULT_SCALING = "fit"
 
+    /** The two accepted archive-preload values, as stored in the file. */
+    val PRELOAD_VALUES = listOf("true", "false")
+
+    /** The built-in archive-preload default; mirrors `RuntimeConfig`. */
+    const val DEFAULT_PRELOAD_ARCHIVES = "false"
+
     /** The stored defaults, used when the settings file is missing or empty. */
     val DEFAULTS = RuntimeSettings(
         frameRate = DEFAULT_FRAME_RATE.toString(),
         scaling = DEFAULT_SCALING,
+        preloadArchives = DEFAULT_PRELOAD_ARCHIVES,
     )
 
     /** A one-line description of [mode], shown under its radio button. */
@@ -69,6 +78,24 @@ object RuntimeOptions {
         "expand" -> "Grow the logical area to the screen aspect, then scale uniformly."
         else -> "Unknown mode."
     }
+
+    /**
+     * The archive-preload trade, shown under its switch.
+     *
+     * Preloading is not a debug mode: it reads the archive into the same
+     * storage as before, so every entry returns the same bytes. The cost is
+     * the archive's size in resident memory, which on a phone is worth weighing
+     * before turning it on.
+     */
+    const val PRELOAD_DESCRIPTION =
+        "Read every mounted archive into memory when it mounts. On, the game uses " +
+            "memory equal to each archive's size but never reads it back from storage; " +
+            "off, it reads entries from storage as they are needed."
+
+    /** A sentence naming the default and the trade, shown above the switch. */
+    fun preloadDescription(): String =
+        "Default: ${if (DEFAULT_PRELOAD_ARCHIVES == "true") "on" else "off"}. " +
+            PRELOAD_DESCRIPTION
 }
 
 /**
@@ -81,12 +108,13 @@ object RuntimeOptions {
  * — a missing or corrupt file falls back to [RuntimeOptions.DEFAULTS] rather
  * than crashing the launcher. An individual value that is present but invalid
  * is preserved and handed to the engine, which rejects it with the option name
- * and its range.
+ * and its accepted values.
  *
  * File: `<app files dir>/settings.json`
  *
  * ```json
- * { "version": 1, "frame_rate": "60", "scaling": "fit" }
+ * { "version": 1, "frame_rate": "60", "scaling": "fit",
+ *   "preload_archives": "false" }
  * ```
  */
 class RuntimeSettingsStore(context: Context) {
@@ -110,6 +138,11 @@ class RuntimeSettingsStore(context: Context) {
         return RuntimeSettings(
             frameRate = stringField(root, FIELD_FRAME_RATE, RuntimeOptions.DEFAULTS.frameRate),
             scaling = stringField(root, FIELD_SCALING, RuntimeOptions.DEFAULTS.scaling),
+            preloadArchives = stringField(
+                root,
+                FIELD_PRELOAD_ARCHIVES,
+                RuntimeOptions.DEFAULTS.preloadArchives,
+            ),
         )
     }
 
@@ -122,6 +155,7 @@ class RuntimeSettingsStore(context: Context) {
             .put(FIELD_VERSION, SCHEMA_VERSION)
             .put(FIELD_FRAME_RATE, settings.frameRate)
             .put(FIELD_SCALING, settings.scaling)
+            .put(FIELD_PRELOAD_ARCHIVES, settings.preloadArchives)
         return runCatching {
             file.parentFile?.mkdirs()
             // Atomic replace: write a sibling temp file, then rename over the
@@ -158,5 +192,6 @@ class RuntimeSettingsStore(context: Context) {
         const val FIELD_VERSION = "version"
         const val FIELD_FRAME_RATE = "frame_rate"
         const val FIELD_SCALING = "scaling"
+        const val FIELD_PRELOAD_ARCHIVES = "preload_archives"
     }
 }

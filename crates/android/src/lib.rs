@@ -61,10 +61,11 @@ mod android_entry {
     /// The launcher's folder is read first so the engine has something to mount
     /// before any other work; a missing folder is reported through the state
     /// file and the loop is never started. The launcher's saved runtime settings
-    /// (frame-rate limit and presentation scaling) are read next over the same
-    /// JNI channel and resolved by [`crate::config`]: the presentation default
-    /// is [`PresentationScaling::Fit`] and the user's stored choice overrides
-    /// it, and an out-of-range value is reported and the loop is never started.
+    /// (frame-rate limit, presentation scaling and archive preload) are read
+    /// next over the same JNI channel and resolved by
+    /// [`crate::config`]: the presentation default is
+    /// [`PresentationScaling::Fit`] and the user's stored choice overrides it,
+    /// and an out-of-range value is reported and the loop is never started.
     #[allow(unsafe_code)]
     #[unsafe(no_mangle)]
     pub fn android_main(app: AndroidApp) {
@@ -117,23 +118,36 @@ mod android_entry {
             jni_fields::FIELD_SCALING,
             jni_fields::SIG_STRING,
         );
-        let runtime =
-            match config::resolve_runtime_config(frame_rate.as_deref(), scaling.as_deref()) {
-                Ok(runtime) => runtime,
-                Err(error) => {
-                    log::error!("invalid runtime configuration: {error}");
-                    let message = error.to_string();
-                    state::write_state(state::State::Failed, Some(&message));
-                    return;
-                }
-            };
-        log::info!(
-            "krkr: frame rate {} fps, scaling {}",
-            runtime.frame_rate_limit.fps(),
-            runtime.scaling.as_str()
+        let preload_archives = jni_fields::activity_static_string(
+            &app,
+            jni_fields::FIELD_PRELOAD_ARCHIVES,
+            jni_fields::SIG_STRING,
         );
-        let handler =
-            host::AndroidHost::new(BackendKind::Vulkan, map_scaling(runtime.scaling), game_dir);
+        let runtime = match config::resolve_runtime_config(
+            frame_rate.as_deref(),
+            scaling.as_deref(),
+            preload_archives.as_deref(),
+        ) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                log::error!("invalid runtime configuration: {error}");
+                let message = error.to_string();
+                state::write_state(state::State::Failed, Some(&message));
+                return;
+            }
+        };
+        log::info!(
+            "krkr: frame rate {} fps, scaling {}, preload archives {}",
+            runtime.frame_rate_limit.fps(),
+            runtime.scaling.as_str(),
+            runtime.preload_archives
+        );
+        let handler = host::AndroidHost::new(
+            BackendKind::Vulkan,
+            map_scaling(runtime.scaling),
+            game_dir,
+            runtime.preload_archives,
+        );
         host::run_loop(
             app,
             handler,

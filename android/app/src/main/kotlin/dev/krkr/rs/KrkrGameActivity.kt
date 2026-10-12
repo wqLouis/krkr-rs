@@ -90,6 +90,16 @@ class KrkrGameActivity : GameActivity() {
          */
         @JvmField
         var pendingScaling: String? = null
+
+        /**
+         * Whether every mounted archive is read into memory at mount (`true`
+         * or `false`), read through JNI like [pendingFrameRate].
+         *
+         * Null means the launcher had no persisted choice, so the engine's
+         * `false` default applies.
+         */
+        @JvmField
+        var pendingPreloadArchives: String? = null
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -106,7 +116,7 @@ class KrkrGameActivity : GameActivity() {
         pendingStateDir = filesDir.absolutePath
         publishRuntimeSettings()
         LauncherLog.i(
-            "KrkrGameActivity.onCreate: game=${pendingGameName ?: "?"} dir=${pendingGameDir ?: "?"} stateDir=${pendingStateDir ?: "?"} fps=${pendingFrameRate ?: "?"} scaling=${pendingScaling ?: "?"}",
+            "KrkrGameActivity.onCreate: game=${pendingGameName ?: "?"} dir=${pendingGameDir ?: "?"} stateDir=${pendingStateDir ?: "?"} fps=${pendingFrameRate ?: "?"} scaling=${pendingScaling ?: "?"} preload=${pendingPreloadArchives ?: "?"}",
         )
         super.onCreate(savedInstanceState)
 
@@ -135,7 +145,7 @@ class KrkrGameActivity : GameActivity() {
         pendingStateDir = filesDir.absolutePath
         publishRuntimeSettings()
         LauncherLog.i(
-            "KrkrGameActivity.onNewIntent: engine already running; game=${pendingGameName ?: "?"} dir=${pendingGameDir ?: "?"} fps=${pendingFrameRate ?: "?"} scaling=${pendingScaling ?: "?"}",
+            "KrkrGameActivity.onNewIntent: engine already running; game=${pendingGameName ?: "?"} dir=${pendingGameDir ?: "?"} fps=${pendingFrameRate ?: "?"} scaling=${pendingScaling ?: "?"} preload=${pendingPreloadArchives ?: "?"}",
         )
     }
 
@@ -147,6 +157,7 @@ class KrkrGameActivity : GameActivity() {
         val settings = RuntimeSettingsStore(this).read()
         pendingFrameRate = settings.frameRate
         pendingScaling = settings.scaling
+        pendingPreloadArchives = settings.preloadArchives
     }
 
     override fun onDestroy() {

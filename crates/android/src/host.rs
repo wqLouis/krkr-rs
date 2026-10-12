@@ -31,6 +31,9 @@ pub(crate) struct AndroidHost {
     scaling: ScalingMode,
     /// The folder the launcher selected; mounted when the window appears.
     game_dir: PathBuf,
+    /// Whether every mounted archive is read into memory at mount, from the
+    /// launcher's resolved settings.
+    preload_archives: bool,
     /// The running game, created by [`EventHandler::resumed`].
     running: Option<GameHost>,
     /// Input and focus events received since the last frame.
@@ -39,11 +42,17 @@ pub(crate) struct AndroidHost {
 
 impl AndroidHost {
     /// Creates a handler that has not yet received a window.
-    pub(crate) fn new(backend: BackendKind, scaling: ScalingMode, game_dir: PathBuf) -> Self {
+    pub(crate) fn new(
+        backend: BackendKind,
+        scaling: ScalingMode,
+        game_dir: PathBuf,
+        preload_archives: bool,
+    ) -> Self {
         Self {
             backend,
             scaling,
             game_dir,
+            preload_archives,
             running: None,
             pending_events: Vec::new(),
         }
@@ -114,8 +123,15 @@ impl EventHandler for AndroidHost {
                 return Flow::Exit;
             }
         };
-        // A directory-only launch mounts every `*.xp3` under the folder.
-        match GameHost::open(host, Vec::new(), self.game_dir.clone()) {
+        // A directory-only launch mounts every `*.xp3` under the folder. The
+        // launcher's archive-preload choice is passed through the same mount
+        // path the desktop build uses.
+        match GameHost::open_with_preload(
+            host,
+            Vec::new(),
+            self.game_dir.clone(),
+            self.preload_archives,
+        ) {
             Ok(game) => {
                 self.running = Some(game);
                 Flow::Continue

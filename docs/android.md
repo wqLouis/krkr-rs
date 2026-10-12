@@ -167,7 +167,8 @@ android/                          Kotlin + Compose M3 app (Gradle)
     KrkrGameActivity.kt           hosts the engine surface; publishes the game
                                   dir + runtime settings over JNI
     GameLibrary.kt                persisted picked-folder URIs + metadata
-    RuntimeSettings.kt            persisted runtime options (frame rate, scaling)
+    RuntimeSettings.kt            persisted runtime options (frame rate, scaling,
+                                  archive preload)
     ui/                           Compose screens, M3 theme
   app/src/main/jniLibs/arm64-v8a/
     libkrkr_android.so            ← the Rust engine (cargo-ndk output)
@@ -244,25 +245,34 @@ than starting the engine against a path that will not resolve.
 
 The launcher also persists the player's runtime options and carries them into
 the engine. A **Settings** screen reachable from the launcher's top bar exposes
-exactly the two options `api::config::RuntimeConfig` actually carries, with the
-same accepted values as the desktop `--fps`/`--scaling`. Nothing is offered for
-a feature the engine has no knob for — a control that silently did nothing is
-the bug class this project forbids (`AGENTS.md` D11).
+the three options `api::config::RuntimeConfig` carries today, with the same
+accepted values as the desktop `--fps`/`--scaling` and `preload_archives`.
+Nothing is offered for a feature the engine has no knob for
+— a control that silently did nothing is the bug class this project forbids
+(`AGENTS.md` D11).
 
 | option | values / range | default | basis |
 |---|---|---|---|
 | Frame-rate limit | decimal integer `1..=1000` fps | `60` | reference `fps_limit` default 60 (`reference/cpp/core/environ/ui/PreferenceConfig.h:304-309`); the same range `--fps` accepts |
 | Presentation scaling | `game`, `fit`, `fill`, `expand` | `fit` | `game` is the reference's one-to-one Win32 presentation; `fit` is the Android default (§2.2), because a phone must not present the raw logical size |
+| Archive preload | `true`, `false` | `false` | whether every mounted archive is read into memory when it mounts; the cost is that archive's size in resident memory, the gain is that entry reads stop touching the backing filesystem |
 
 `fill` and `expand` are exposed because the engine honours them; the desktop
 default remains `game`.
+
+The archive-preload switch is the option to weigh on a phone: it is not a debug
+mode, it reads the archive into the same storage as before so every entry
+returns the same bytes, and the resident-memory cost is the archive's size — a
+real and often large number — traded for no longer reading it back from
+storage.
 
 The choices are stored as JSON in the app's private files directory —
 `<filesDir>/settings.json` — next to `games.json`, following the same
 inspectable, atomically-written convention (§3.1):
 
 ```json
-{ "version": 1, "frame_rate": "60", "scaling": "fit" }
+{ "version": 1, "frame_rate": "60", "scaling": "fit",
+  "preload_archives": "false" }
 ```
 
 `RuntimeSettings.kt` keeps each value as the exact string the user chose; it
@@ -272,25 +282,27 @@ as it does for the desktop `key=value` file.
 The configuration path mirrors the desktop launcher's, with the settings file
 playing the role of the `KRKR_CONFIG` file:
 
-1. **The settings UI** validates the frame rate (`1..=1000`) and the scaling
-   (one of the four) and writes `settings.json` atomically. A value loaded from
-   a hand-edited file that is not one of the accepted modes is shown and must be
-   corrected before it can be saved.
+1. **The settings UI** validates the frame rate (`1..=1000`), the scaling (one
+   of the four) and the archive preload (`true`/`false`) and writes
+   `settings.json` atomically. A value loaded from a hand-edited file that is
+   not one of the accepted values is shown and must be corrected before it can
+   be saved; the hand-edited value is preserved, not rewritten.
 2. **`KrkrGameActivity`** reads `settings.json` in `onCreate`/`onNewIntent`
-   *before* `super.onCreate` and copies the two values onto the static fields
-   `pendingFrameRate` and `pendingScaling` — the same JNI channel
-   `pendingGameDir`/`pendingGameName`/`pendingStateDir` already use.
+   *before* `super.onCreate` and copies the three values onto the static fields
+   `pendingFrameRate`, `pendingScaling` and `pendingPreloadArchives` — the same
+   JNI channel `pendingGameDir`/`pendingGameName`/`pendingStateDir` already use.
 3. **`crates/android`** reads those fields (`jni_fields.rs`) and resolves them
    (`config.rs`) into a `RuntimeConfig`, applying `fit` as the presentation
-   default. An unparseable or out-of-range value is a typed `ConfigError` naming
-   the option and the accepted range; it is written to `krkr_state.json` as a
-   failure and the loop is never started — it is never replaced by the default
-   (D11).
+   default and `false` as the preload default. An unparseable or out-of-range
+   value is a typed `ConfigError` naming the option and the accepted values; it
+   is written to `krkr_state.json` as a failure and the loop is never started —
+   it is never replaced by the default (D11).
 4. **The shared emulator host** receives the finished value: the
-   `crates/android` loop passes the scaling into `app::Host`/`app::GameHost`
-   and the frame period into its ticker, exactly as the desktop `app::run`
-   does. The emulator core performs no configuration I/O, exactly as on the
-   desktop (`docs/runtime-config.md`).
+   `crates/android` loop passes the scaling into the render host, the
+   archive-preload choice into `app::GameHost::open_with_preload`, and the
+   frame period into its ticker, exactly as the desktop `app::run` does. The
+   emulator core performs no configuration I/O, exactly as on the desktop
+   (`docs/runtime-config.md`).
 
 Because the settings are read at launch, a change applies to the **next** run,
 which the screen states.
