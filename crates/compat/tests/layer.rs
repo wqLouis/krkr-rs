@@ -540,3 +540,374 @@ fn unsupported_transitions_and_media_helpers_raise_typed_errors() {
         );
     }
 }
+
+/// An unchanged `visible` write is a no-op: the reference guards on
+/// `if(Visible != st)` and skips `Update()` and the parent notify
+/// (`reference/cpp/core/visual/LayerIntf.cpp:1183-1193`), so the scene
+/// revision does not advance and no subtree cache is marked stale. A real
+/// hidden<->visible flip still invalidates.
+#[test]
+fn unchanged_visible_write_does_not_invalidate() {
+    let _lock = vm_lock();
+    let mut env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var base = new Layer(w, null); \
+         var l = new Layer(w, null);",
+    );
+    let id = env.scene.layers.last().expect("the layer").id;
+    for layer in &mut env.scene.layers {
+        layer.cache_recalc = false;
+    }
+    let before = env.scene.revision();
+
+    // hidden -> visible still invalidates.
+    // reference/cpp/core/visual/LayerIntf.cpp:1187-1193
+    env.run("l.visible = true;");
+    assert!(
+        env.scene.revision() > before,
+        "a hidden->visible write still invalidates"
+    );
+    assert!(env.scene.layer(id).unwrap().cache_recalc);
+
+    // The same value written again touches nothing.
+    for layer in &mut env.scene.layers {
+        layer.cache_recalc = false;
+    }
+    let revision = env.scene.revision();
+    env.run("l.visible = true;");
+    // reference/cpp/core/visual/LayerIntf.cpp:1183
+    assert_eq!(
+        env.scene.revision(),
+        revision,
+        "an unchanged visible write bumps no revision"
+    );
+    assert!(
+        !env.scene.layer(id).unwrap().cache_recalc,
+        "an unchanged visible write marks no cache stale"
+    );
+
+    // visible -> hidden still invalidates.
+    env.run("l.visible = false;");
+    // reference/cpp/core/visual/LayerIntf.cpp:1187-1193
+    assert!(
+        env.scene.revision() > revision,
+        "a visible->hidden write still invalidates"
+    );
+    assert!(env.scene.layer(id).unwrap().cache_recalc);
+}
+
+/// The reference guards the geometry, opacity and blend property setters on an
+/// unchanged value (`reference/cpp/core/visual/LayerIntf.cpp:2163` left,
+/// `:2183` top, `:2220` width, `:2235` height, `:1205` opacity, `:1689`
+/// type), so a repeated write is free.
+#[test]
+fn unchanged_geometry_opacity_and_blend_writes_are_no_ops() {
+    let _lock = vm_lock();
+    let mut env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var base = new Layer(w, null); \
+         var l = new Layer(w, null);",
+    );
+    let id = env.scene.layers.last().expect("the layer").id;
+    for write in [
+        "l.left = 7;",
+        "l.top = 9;",
+        "l.width = 40;",
+        "l.height = 24;",
+        "l.opacity = 128;",
+        "l.type = 1;",
+    ] {
+        env.run(write);
+        for layer in &mut env.scene.layers {
+            layer.cache_recalc = false;
+        }
+        let revision = env.scene.revision();
+        env.run(write);
+        assert_eq!(
+            env.scene.revision(),
+            revision,
+            "{write} repeated at the same value bumps no revision"
+        );
+        assert!(
+            !env.scene.layer(id).unwrap().cache_recalc,
+            "{write} repeated at the same value marks no cache stale"
+        );
+    }
+}
+
+/// `hitType` has no guard in the reference: the inline setter assigns
+/// unconditionally (`reference/cpp/core/visual/LayerIntf.h:608`), so a
+/// repeated write still invalidates and this port keeps that behaviour.
+#[test]
+fn unchanged_unguarded_property_write_still_invalidates() {
+    let _lock = vm_lock();
+    let mut env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var base = new Layer(w, null); \
+         var l = new Layer(w, null);",
+    );
+    let id = env.scene.layers.last().expect("the layer").id;
+    env.run("l.hitType = 1;");
+    for layer in &mut env.scene.layers {
+        layer.cache_recalc = false;
+    }
+    let revision = env.scene.revision();
+    env.run("l.hitType = 1;");
+    assert!(
+        env.scene.revision() > revision,
+        "an unguarded repeated write bumps revision"
+    );
+    assert!(env.scene.layer(id).unwrap().cache_recalc);
+}
+
+/// `Layer.setPos` guards an unchanged position: the reference's `SetPosition`
+/// enters only `if(Rect.left != left || Rect.top != top)`
+/// (`reference/cpp/core/visual/LayerIntf.cpp:2203-2204`), so writing back the
+/// stored position bumps no revision and marks no cache stale, while a real
+/// move still invalidates. A negative offset is legal on a non-primary layer.
+#[test]
+fn unchanged_set_pos_write_does_not_invalidate() {
+    let _lock = vm_lock();
+    let mut env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var base = new Layer(w, null); \
+         var l = new Layer(w, null);",
+    );
+    let id = env.scene.layers.last().expect("the layer").id;
+
+    // A real move invalidates and reads back.
+    // reference/cpp/core/visual/LayerIntf.cpp:2204-2216
+    env.run("l.setPos(5, 7);");
+    assert_eq!(env.eval_int("l.left"), 5);
+    assert_eq!(env.eval_int("l.top"), 7);
+    assert!(env.scene.layer(id).unwrap().cache_recalc);
+
+    for layer in &mut env.scene.layers {
+        layer.cache_recalc = false;
+    }
+    let revision = env.scene.revision();
+    env.run("l.setPos(5, 7);");
+    // reference/cpp/core/visual/LayerIntf.cpp:2203
+    assert_eq!(
+        env.scene.revision(),
+        revision,
+        "an unchanged setPos bumps no revision"
+    );
+    assert!(
+        !env.scene.layer(id).unwrap().cache_recalc,
+        "an unchanged setPos marks no cache stale"
+    );
+
+    // The position guard is not a clamp: a negative move still invalidates.
+    // reference/cpp/core/visual/LayerIntf.cpp:2204-2211
+    env.run("l.setPos(-4, -6);");
+    assert!(
+        env.scene.revision() > revision,
+        "a negative setPos still invalidates"
+    );
+    assert_eq!(env.eval_int("l.left"), -4);
+    assert_eq!(env.eval_int("l.top"), -6);
+}
+
+/// `Layer.setPos(left, top, width, height)` takes the reference's `SetBounds`
+/// path (`reference/cpp/core/visual/LayerIntf.cpp:8559-8565`):
+/// `InternalSetBounds` guards the offsets (`:2144`) and then calls the
+/// `InternalSetSize` guard (`:2121-2122`, `:2159`), so repeating the same
+/// bounds bumps no revision, while either a moved position or a resized rect
+/// still invalidates.
+#[test]
+fn unchanged_set_pos_with_bounds_write_does_not_invalidate() {
+    let _lock = vm_lock();
+    let mut env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var base = new Layer(w, null); \
+         var l = new Layer(w, null);",
+    );
+    let id = env.scene.layers.last().expect("the layer").id;
+
+    // reference/cpp/core/visual/LayerIntf.cpp:2138-2159
+    env.run("l.setPos(5, 7, 20, 30);");
+    assert_eq!(env.eval_int("l.left"), 5);
+    assert_eq!(env.eval_int("l.top"), 7);
+    assert_eq!(env.eval_int("l.width"), 20);
+    assert_eq!(env.eval_int("l.height"), 30);
+    assert!(env.scene.layer(id).unwrap().cache_recalc);
+
+    for layer in &mut env.scene.layers {
+        layer.cache_recalc = false;
+    }
+    let revision = env.scene.revision();
+    env.run("l.setPos(5, 7, 20, 30);");
+    // reference/cpp/core/visual/LayerIntf.cpp:2121, :2144
+    assert_eq!(
+        env.scene.revision(),
+        revision,
+        "an unchanged setPos with bounds bumps no revision"
+    );
+    assert!(!env.scene.layer(id).unwrap().cache_recalc);
+
+    // A new position alone still invalidates with the size unchanged.
+    // reference/cpp/core/visual/LayerIntf.cpp:2144-2159
+    env.run("l.setPos(6, 7, 20, 30);");
+    assert!(
+        env.scene.revision() > revision,
+        "a moved setPos with bounds still invalidates"
+    );
+    assert_eq!(env.eval_int("l.left"), 6);
+    assert_eq!(env.eval_int("l.width"), 20);
+}
+
+/// `Layer.setSize` delegates to the guarded `InternalSetSize`
+/// (`reference/cpp/core/visual/LayerIntf.cpp:2250-2251`): the body runs only
+/// when `Rect.get_width() != width || Rect.get_height() != height`
+/// (`:2121-2122`), so a repeated size write bumps no revision and does not
+/// re-run `ImageLayerSizeChanged` (`:2656-2673`). A real resize still grows
+/// the image, a zero extent still changes the rect, and the image never
+/// shrinks.
+#[test]
+fn unchanged_set_size_write_does_not_invalidate() {
+    let _lock = vm_lock();
+    let mut env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var base = new Layer(w, null); \
+         var l = new Layer(w, null);",
+    );
+    let id = env.scene.layers.last().expect("the layer").id;
+
+    // reference/cpp/core/visual/LayerIntf.cpp:2122-2139, :2656-2673
+    env.run("l.setSize(48, 40);");
+    assert_eq!(env.eval_int("l.width"), 48);
+    assert_eq!(env.eval_int("l.height"), 40);
+    assert_eq!(env.eval_int("l.imageWidth"), 48);
+    assert_eq!(env.eval_int("l.imageHeight"), 40);
+    assert!(env.scene.layer(id).unwrap().cache_recalc);
+
+    for layer in &mut env.scene.layers {
+        layer.cache_recalc = false;
+    }
+    let revision = env.scene.revision();
+    env.run("l.setSize(48, 40);");
+    // reference/cpp/core/visual/LayerIntf.cpp:2121
+    assert_eq!(
+        env.scene.revision(),
+        revision,
+        "an unchanged setSize bumps no revision"
+    );
+    assert!(
+        !env.scene.layer(id).unwrap().cache_recalc,
+        "an unchanged setSize marks no cache stale"
+    );
+
+    // A zero extent is a real change; the rect shrinks but the image does not.
+    env.run("l.setSize(0, 0);");
+    assert!(
+        env.scene.revision() > revision,
+        "a zero-extent setSize still invalidates"
+    );
+    assert_eq!(env.eval_int("l.width"), 0);
+    assert_eq!(env.eval_int("l.height"), 0);
+    assert_eq!(env.eval_int("l.imageWidth"), 48);
+    assert_eq!(env.eval_int("l.imageHeight"), 40);
+}
+
+/// `Layer.setSizeToImageSize` is `SetSize(GetImageWidth(), GetImageHeight())`
+/// (`reference/cpp/core/visual/LayerIntf.cpp:8584-8588`), so it inherits the
+/// `InternalSetSize` guard (`:2121-2122`): a call whose values already match
+/// bumps no revision, while a real resize does. `setSize` never shrinks the
+/// image, so the 4x4 rect still has the default 32x32 image here.
+#[test]
+fn unchanged_set_size_to_image_size_write_does_not_invalidate() {
+    let _lock = vm_lock();
+    let mut env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var base = new Layer(w, null); \
+         var l = new Layer(w, null); \
+         l.setSize(4, 4);",
+    );
+    let id = env.scene.layers.last().expect("the layer").id;
+    for layer in &mut env.scene.layers {
+        layer.cache_recalc = false;
+    }
+    let revision = env.scene.revision();
+
+    // reference/cpp/core/visual/LayerIntf.cpp:8587-8588, :2122-2139
+    env.run("l.setSizeToImageSize();");
+    assert!(
+        env.scene.revision() > revision,
+        "a real setSizeToImageSize resizes and invalidates"
+    );
+    assert_eq!(env.eval_int("l.width"), 32);
+    assert_eq!(env.eval_int("l.height"), 32);
+    assert_eq!(env.eval_int("l.imageWidth"), 32);
+    assert_eq!(env.eval_int("l.imageHeight"), 32);
+
+    for layer in &mut env.scene.layers {
+        layer.cache_recalc = false;
+    }
+    let revision = env.scene.revision();
+    env.run("l.setSizeToImageSize();");
+    // reference/cpp/core/visual/LayerIntf.cpp:8587, :2121
+    assert_eq!(
+        env.scene.revision(),
+        revision,
+        "an unchanged setSizeToImageSize bumps no revision"
+    );
+    assert!(!env.scene.layer(id).unwrap().cache_recalc);
+}
+
+/// `setImagePos` and `setImageSize` already sit behind their reference guards:
+/// `SetImagePosition` only enters on a changed offset
+/// (`reference/cpp/core/visual/LayerIntf.cpp:2549`) and `SetImageSize` returns
+/// early on an unchanged image size (`:2649-2650`), so repeating either with
+/// the stored values bumps no revision while the offset still reads back.
+#[test]
+fn unchanged_set_image_pos_and_size_writes_do_not_invalidate() {
+    let _lock = vm_lock();
+    let mut env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var base = new Layer(w, null); \
+         var l = new Layer(w, null); \
+         l.setSize(20, 20); \
+         l.setImageSize(24, 24);",
+    );
+    let id = env.scene.layers.last().expect("the layer").id;
+
+    // reference/cpp/core/visual/LayerIntf.cpp:2549-2560
+    env.run("l.setImagePos(-4, -4);");
+    assert_eq!(env.eval_int("l.imageLeft"), -4);
+    assert_eq!(env.eval_int("l.imageTop"), -4);
+
+    for layer in &mut env.scene.layers {
+        layer.cache_recalc = false;
+    }
+    let revision = env.scene.revision();
+    env.run("l.setImagePos(-4, -4);");
+    // reference/cpp/core/visual/LayerIntf.cpp:2549
+    assert_eq!(
+        env.scene.revision(),
+        revision,
+        "an unchanged setImagePos bumps no revision"
+    );
+    assert!(!env.scene.layer(id).unwrap().cache_recalc);
+
+    for layer in &mut env.scene.layers {
+        layer.cache_recalc = false;
+    }
+    let revision = env.scene.revision();
+    env.run("l.setImageSize(24, 24);");
+    // reference/cpp/core/visual/LayerIntf.cpp:2649-2650
+    assert_eq!(
+        env.scene.revision(),
+        revision,
+        "an unchanged setImageSize bumps no revision"
+    );
+    assert!(!env.scene.layer(id).unwrap().cache_recalc);
+}

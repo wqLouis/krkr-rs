@@ -612,6 +612,31 @@ impl Scene {
         self.layer_mut_untracked(id)
     }
 
+    /// Apply `f` to a layer and invalidate only when `f` reports a change.
+    ///
+    /// `f` returns true when it actually mutated the layer. Only then is the
+    /// layer's subtree cache, and every caching ancestor's, marked stale and
+    /// [`Scene::revision`] bumped; an unchanged write touches neither, so a
+    /// property setter that receives its current value is free. Returns
+    /// `None` when the layer is absent, which lets a caller distinguish a
+    /// missing layer from a no-op write.
+    ///
+    /// The reference guards a property write the same way, comparing the
+    /// requested value with the stored one before it invalidates
+    /// (`tTJSNI_BaseLayer::SetVisible`, `LayerIntf.cpp:1183`).
+    pub fn update_layer(
+        &mut self,
+        id: u32,
+        f: impl FnOnce(&mut LayerState) -> bool,
+    ) -> Option<bool> {
+        let changed = f(self.layer_mut_untracked(id)?);
+        if changed {
+            self.invalidate_layer_cache(id);
+            self.touch();
+        }
+        Some(changed)
+    }
+
     /// Mutably look up a layer by id without marking any subtree cache
     /// stale. Used for cache bookkeeping that is not a content change.
     pub(crate) fn layer_mut_untracked(&mut self, id: u32) -> Option<&mut LayerState> {

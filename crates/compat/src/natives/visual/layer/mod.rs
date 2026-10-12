@@ -301,15 +301,28 @@ extern "C" fn layer_set_pos(
         Ok(scene) => scene,
         Err(error) => return report_error(out_error, &error),
     };
-    if let Some(layer) = scene.layer_mut(id) {
-        layer.rect.x = x;
-        layer.rect.y = y;
-        if let Some((w, h)) = size {
+    // The position guard and the size guard are independent: a repeated
+    // position write does not run `layer_size_changed`, and a repeated size
+    // write does not re-run the position half.
+    let mut size_changed = false;
+    let _ = scene.update_layer(id, |layer| {
+        let mut changed = false;
+        if layer.rect.x != x || layer.rect.y != y {
+            layer.rect.x = x;
+            layer.rect.y = y;
+            changed = true;
+        }
+        if let Some((w, h)) = size
+            && (layer.rect.w != w || layer.rect.h != h)
+        {
             layer.rect.w = w;
             layer.rect.h = h;
+            size_changed = true;
+            changed = true;
         }
-    }
-    if size.is_some() {
+        changed
+    });
+    if size_changed {
         scene.layer_size_changed(id);
     }
     set_void(out);
@@ -345,11 +358,17 @@ extern "C" fn layer_set_size(
         Ok(scene) => scene,
         Err(error) => return report_error(out_error, &error),
     };
-    if let Some(layer) = scene.layer_mut(id) {
+    if scene.update_layer(id, |layer| {
+        if layer.rect.w == width && layer.rect.h == height {
+            return false;
+        }
         layer.rect.w = width;
         layer.rect.h = height;
+        true
+    }) == Some(true)
+    {
+        scene.layer_size_changed(id);
     }
-    scene.layer_size_changed(id);
     set_void(out);
     0
 }
@@ -387,10 +406,15 @@ extern "C" fn layer_set_size_to_image_size(
         .and_then(|l| l.bitmap)
         .and_then(|bitmap| scene.bitmap(bitmap))
         .map(|b| (b.width, b.height))
-        && let Some(layer) = scene.layer_mut(id)
     {
-        layer.rect.w = width;
-        layer.rect.h = height;
+        let _ = scene.update_layer(id, |layer| {
+            if layer.rect.w == width && layer.rect.h == height {
+                return false;
+            }
+            layer.rect.w = width;
+            layer.rect.h = height;
+            true
+        });
     }
     set_void(out);
     0
@@ -1252,12 +1276,14 @@ fn with_layer_read<R>(
         .ok_or_else(|| "Layer: layer no longer exists".to_string())
 }
 
-/// Mutate a layer through the bound scene.
+/// Mutate a layer through the bound scene. `f` returns true when it changed
+/// the layer; an unchanged write marks no subtree cache stale and bumps no
+/// revision, so a setter that receives the stored value is free.
 fn with_layer_write(
     engine: *mut c_void,
     instance: *mut c_void,
     value: &Value,
-    f: impl FnOnce(&mut LayerState, &Value),
+    f: impl FnOnce(&mut LayerState, &Value) -> bool,
 ) -> Result<(), String> {
     // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `with_layer_write`.
     let inst = unsafe { &*(instance as *const LayerInst) };
@@ -1266,11 +1292,10 @@ fn with_layer_write(
         .ok_or_else(|| "Layer: this layer is not constructed".to_string())?;
     let (_resolved, ctx) = bound(engine)?;
     let scene = scene_mut(&ctx)?;
-    let layer = scene
-        .layer_mut(id)
-        .ok_or_else(|| "Layer: layer no longer exists".to_string())?;
-    f(layer, value);
-    Ok(())
+    match scene.update_layer(id, |layer| f(layer, value)) {
+        Some(_) => Ok(()),
+        None => Err("Layer: layer no longer exists".to_string()),
+    }
 }
 
 /// Define a read-only `Layer` integer property (getter only, no setter).
@@ -1336,86 +1361,157 @@ layer_int_prop!(
     |l: &mut LayerState, v: &Value| {
         let visible = value_as_bool(v);
         log::trace!("Layer {} .visible -> {visible}", l.id);
+        if l.visible == visible {
+            return false;
+        }
         l.visible = visible;
+        true
     }
 );
 layer_int_prop!(
     layer_type_get,
     layer_type_set,
     |l: &LayerState| blend::to_native(l.blend),
-    |l: &mut LayerState, v: &Value| l.blend = blend::from_native(value_as_i64(v))
+    |l: &mut LayerState, v: &Value| {
+        let new_blend = blend::from_native(value_as_i64(v));
+        if l.blend == new_blend {
+            return false;
+        }
+        l.blend = new_blend;
+        true
+    }
 );
 layer_int_prop!(
     layer_left_get,
     layer_left_set,
     |l: &LayerState| i64::from(l.rect.x),
-    |l: &mut LayerState, v: &Value| l.rect.x = value_as_i64(v) as i32
+    |l: &mut LayerState, v: &Value| {
+        let left = value_as_i64(v) as i32;
+        if l.rect.x == left {
+            return false;
+        }
+        l.rect.x = left;
+        true
+    }
 );
 layer_int_prop!(
     layer_top_get,
     layer_top_set,
     |l: &LayerState| i64::from(l.rect.y),
-    |l: &mut LayerState, v: &Value| l.rect.y = value_as_i64(v) as i32
+    |l: &mut LayerState, v: &Value| {
+        let top = value_as_i64(v) as i32;
+        if l.rect.y == top {
+            return false;
+        }
+        l.rect.y = top;
+        true
+    }
 );
 layer_int_prop!(
     layer_width_get,
     layer_width_set,
     |l: &LayerState| i64::from(l.rect.w),
-    |l: &mut LayerState, v: &Value| l.rect.w = value_as_i64(v).max(0) as u32
+    |l: &mut LayerState, v: &Value| {
+        let width = value_as_i64(v).max(0) as u32;
+        if l.rect.w == width {
+            return false;
+        }
+        l.rect.w = width;
+        true
+    }
 );
 layer_int_prop!(
     layer_height_get,
     layer_height_set,
     |l: &LayerState| i64::from(l.rect.h),
-    |l: &mut LayerState, v: &Value| l.rect.h = value_as_i64(v).max(0) as u32
+    |l: &mut LayerState, v: &Value| {
+        let height = value_as_i64(v).max(0) as u32;
+        if l.rect.h == height {
+            return false;
+        }
+        l.rect.h = height;
+        true
+    }
 );
 layer_int_prop!(
     layer_absolute_get,
     layer_absolute_set,
     |l: &LayerState| i64::from(l.z_order),
-    |l: &mut LayerState, v: &Value| l.z_order = value_as_i64(v) as i32
+    |l: &mut LayerState, v: &Value| {
+        l.z_order = value_as_i64(v) as i32;
+        true
+    }
 );
 layer_int_prop!(
     layer_hit_threshold_get,
     layer_hit_threshold_set,
     |l: &LayerState| i64::from(l.hit_threshold),
-    |l: &mut LayerState, v: &Value| l.hit_threshold = value_as_i64(v) as i32
+    |l: &mut LayerState, v: &Value| {
+        l.hit_threshold = value_as_i64(v) as i32;
+        true
+    }
 );
 layer_int_prop!(
     layer_hit_type_get,
     layer_hit_type_set,
     |l: &LayerState| i64::from(l.hit_type),
-    |l: &mut LayerState, v: &Value| l.hit_type = value_as_i64(v) as i32
+    |l: &mut LayerState, v: &Value| {
+        l.hit_type = value_as_i64(v) as i32;
+        true
+    }
 );
 layer_int_prop!(
     layer_cursor_get,
     layer_cursor_set,
     |l: &LayerState| i64::from(l.cursor),
-    |l: &mut LayerState, v: &Value| l.cursor = value_as_i64(v) as i32
+    |l: &mut LayerState, v: &Value| {
+        l.cursor = value_as_i64(v) as i32;
+        true
+    }
 );
 layer_int_prop!(
     layer_face_get,
     layer_face_set,
     |l: &LayerState| i64::from(l.face),
-    |l: &mut LayerState, v: &Value| l.face = value_as_i64(v) as i32
+    |l: &mut LayerState, v: &Value| {
+        l.face = value_as_i64(v) as i32;
+        true
+    }
 );
 layer_int_prop!(
     layer_hold_alpha_get,
     layer_hold_alpha_set,
     |l: &LayerState| i64::from(l.hold_alpha),
-    |l: &mut LayerState, v: &Value| l.hold_alpha = value_as_bool(v)
+    |l: &mut LayerState, v: &Value| {
+        l.hold_alpha = value_as_bool(v);
+        true
+    }
 );
 layer_int_prop!(
     layer_image_left_get,
     layer_image_left_set,
     |l: &LayerState| i64::from(l.image_left),
-    |l: &mut LayerState, v: &Value| l.image_left = value_as_i64(v) as i32
+    |l: &mut LayerState, v: &Value| {
+        let left = value_as_i64(v) as i32;
+        if l.image_left == left {
+            return false;
+        }
+        l.image_left = left;
+        true
+    }
 );
 layer_int_prop!(
     layer_image_top_get,
     layer_image_top_set,
     |l: &LayerState| i64::from(l.image_top),
-    |l: &mut LayerState, v: &Value| l.image_top = value_as_i64(v) as i32
+    |l: &mut LayerState, v: &Value| {
+        let top = value_as_i64(v) as i32;
+        if l.image_top == top {
+            return false;
+        }
+        l.image_top = top;
+        true
+    }
 );
 layer_int_get!(layer_image_width_get, |l: &LayerState| i64::from(
     l.image_width
@@ -1427,85 +1523,143 @@ layer_int_prop!(
     layer_focusable_get,
     layer_focusable_set,
     |l: &LayerState| i64::from(l.focusable),
-    |l: &mut LayerState, v: &Value| l.focusable = value_as_bool(v)
+    |l: &mut LayerState, v: &Value| {
+        let focusable = value_as_bool(v);
+        if l.focusable == focusable {
+            return false;
+        }
+        l.focusable = focusable;
+        true
+    }
 );
 layer_int_prop!(
     layer_join_focus_chain_get,
     layer_join_focus_chain_set,
     |l: &LayerState| i64::from(l.join_focus_chain),
-    |l: &mut LayerState, v: &Value| l.join_focus_chain = value_as_bool(v)
+    |l: &mut LayerState, v: &Value| {
+        l.join_focus_chain = value_as_bool(v);
+        true
+    }
 );
 layer_int_prop!(
     layer_enabled_get,
     layer_enabled_set,
     |l: &LayerState| i64::from(l.enabled),
-    |l: &mut LayerState, v: &Value| l.enabled = value_as_bool(v)
+    |l: &mut LayerState, v: &Value| {
+        let enabled = value_as_bool(v);
+        if l.enabled == enabled {
+            return false;
+        }
+        l.enabled = enabled;
+        true
+    }
 );
 layer_int_prop!(
     layer_cached_get,
     layer_cached_set,
     |l: &LayerState| i64::from(l.cached),
-    |l: &mut LayerState, v: &Value| l.cached = value_as_bool(v)
+    |l: &mut LayerState, v: &Value| {
+        let cached = value_as_bool(v);
+        if l.cached == cached {
+            return false;
+        }
+        l.cached = cached;
+        true
+    }
 );
 layer_int_prop!(
     layer_image_modified_get,
     layer_image_modified_set,
     |l: &LayerState| i64::from(l.image_modified),
-    |l: &mut LayerState, v: &Value| l.image_modified = value_as_bool(v)
+    |l: &mut LayerState, v: &Value| {
+        l.image_modified = value_as_bool(v);
+        true
+    }
 );
 layer_int_prop!(
     layer_attention_left_get,
     layer_attention_left_set,
     |l: &LayerState| i64::from(l.attention_left),
-    |l: &mut LayerState, v: &Value| l.attention_left = value_as_i64(v) as i32
+    |l: &mut LayerState, v: &Value| {
+        l.attention_left = value_as_i64(v) as i32;
+        true
+    }
 );
 layer_int_prop!(
     layer_attention_top_get,
     layer_attention_top_set,
     |l: &LayerState| i64::from(l.attention_top),
-    |l: &mut LayerState, v: &Value| l.attention_top = value_as_i64(v) as i32
+    |l: &mut LayerState, v: &Value| {
+        l.attention_top = value_as_i64(v) as i32;
+        true
+    }
 );
 layer_int_prop!(
     layer_use_attention_get,
     layer_use_attention_set,
     |l: &LayerState| i64::from(l.use_attention),
-    |l: &mut LayerState, v: &Value| l.use_attention = value_as_bool(v)
+    |l: &mut LayerState, v: &Value| {
+        l.use_attention = value_as_bool(v);
+        true
+    }
 );
 layer_int_prop!(
     layer_show_parent_hint_get,
     layer_show_parent_hint_set,
     |l: &LayerState| i64::from(l.show_parent_hint),
-    |l: &mut LayerState, v: &Value| l.show_parent_hint = value_as_bool(v)
+    |l: &mut LayerState, v: &Value| {
+        l.show_parent_hint = value_as_bool(v);
+        true
+    }
 );
 layer_int_prop!(
     layer_ignore_hint_sensing_get,
     layer_ignore_hint_sensing_set,
     |l: &LayerState| i64::from(l.ignore_hint_sensing),
-    |l: &mut LayerState, v: &Value| l.ignore_hint_sensing = value_as_bool(v)
+    |l: &mut LayerState, v: &Value| {
+        l.ignore_hint_sensing = value_as_bool(v);
+        true
+    }
 );
 layer_int_prop!(
     layer_ime_mode_get,
     layer_ime_mode_set,
     |l: &LayerState| i64::from(l.ime_mode),
-    |l: &mut LayerState, v: &Value| l.ime_mode = value_as_i64(v) as i32
+    |l: &mut LayerState, v: &Value| {
+        l.ime_mode = value_as_i64(v) as i32;
+        true
+    }
 );
 layer_int_prop!(
     layer_neutral_color_get,
     layer_neutral_color_set,
     |l: &LayerState| l.neutral_color,
-    |l: &mut LayerState, v: &Value| l.neutral_color = value_as_i64(v)
+    |l: &mut LayerState, v: &Value| {
+        l.neutral_color = value_as_i64(v);
+        true
+    }
 );
 layer_int_prop!(
     layer_absolute_order_mode_get,
     layer_absolute_order_mode_set,
     |l: &LayerState| i64::from(l.absolute_order_mode),
-    |l: &mut LayerState, v: &Value| l.absolute_order_mode = value_as_bool(v)
+    |l: &mut LayerState, v: &Value| {
+        let mode = value_as_bool(v);
+        if l.absolute_order_mode == mode {
+            return false;
+        }
+        l.absolute_order_mode = mode;
+        true
+    }
 );
 layer_int_prop!(
     layer_call_on_paint_get,
     layer_call_on_paint_set,
     |l: &LayerState| i64::from(l.call_on_paint),
-    |l: &mut LayerState, v: &Value| l.call_on_paint = value_as_bool(v)
+    |l: &mut LayerState, v: &Value| {
+        l.call_on_paint = value_as_bool(v);
+        true
+    }
 );
 layer_int_prop!(
     layer_clip_left_get,
@@ -1514,6 +1668,7 @@ layer_int_prop!(
     |l: &mut LayerState, v: &Value| {
         let rect = l.clip.get_or_insert(Rect::default());
         rect.x = value_as_i64(v) as i32;
+        true
     }
 );
 layer_int_prop!(
@@ -1523,6 +1678,7 @@ layer_int_prop!(
     |l: &mut LayerState, v: &Value| {
         let rect = l.clip.get_or_insert(Rect::default());
         rect.y = value_as_i64(v) as i32;
+        true
     }
 );
 layer_int_prop!(
@@ -1532,6 +1688,7 @@ layer_int_prop!(
     |l: &mut LayerState, v: &Value| {
         let rect = l.clip.get_or_insert(Rect::default());
         rect.w = value_as_i64(v).max(0) as u32;
+        true
     }
 );
 layer_int_prop!(
@@ -1541,6 +1698,7 @@ layer_int_prop!(
     |l: &mut LayerState, v: &Value| {
         let rect = l.clip.get_or_insert(Rect::default());
         rect.h = value_as_i64(v).max(0) as u32;
+        true
     }
 );
 
@@ -1641,7 +1799,12 @@ extern "C" fn layer_opacity_set(
     // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
     let value = unsafe { &*value };
     match with_layer_write(engine, instance, value, |l, v| {
-        l.opacity = (value_as_i64(v) as f64 / 255.0).clamp(0.0, 1.0) as f32;
+        let opacity = (value_as_i64(v) as f64 / 255.0).clamp(0.0, 1.0) as f32;
+        if l.opacity == opacity {
+            return false;
+        }
+        l.opacity = opacity;
+        true
     }) {
         Ok(()) => 0,
         Err(error) => report_error(out_error, &error),
@@ -2019,7 +2182,10 @@ extern "C" fn layer_name_set(
     // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
     let text = value_as_string(unsafe { &*value });
     // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
-    match with_layer_write(engine, instance, unsafe { &*value }, |l, _| l.name = text) {
+    match with_layer_write(engine, instance, unsafe { &*value }, |l, _| {
+        l.name = text;
+        true
+    }) {
         Ok(()) => 0,
         Err(error) => report_error(out_error, &error),
     }
@@ -2054,7 +2220,10 @@ extern "C" fn layer_hint_set(
     // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
     let text = value_as_string(unsafe { &*value });
     // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
-    match with_layer_write(engine, instance, unsafe { &*value }, |l, _| l.hint = text) {
+    match with_layer_write(engine, instance, unsafe { &*value }, |l, _| {
+        l.hint = text;
+        true
+    }) {
         Ok(()) => 0,
         Err(error) => report_error(out_error, &error),
     }

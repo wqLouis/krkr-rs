@@ -363,3 +363,95 @@ fn render_layer_subtree_ignores_hidden_child_changes() {
         "a hidden child's image change is not composited"
     );
 }
+
+/// `Scene::update_layer` skips all invalidation when its closure reports no
+/// change: the layer's subtree cache and every caching ancestor's stay clean
+/// and `Scene::revision` does not advance. The reference guards a property
+/// write the same way, comparing the requested value with the stored one
+/// before it invalidates (`tTJSNI_BaseLayer::SetVisible`,
+/// `reference/cpp/core/visual/LayerIntf.cpp:1183`).
+#[test]
+fn update_layer_unchanged_write_does_not_invalidate() {
+    let mut scene = Scene::default();
+    let win = scene.add_window("t", (1, 1));
+    let parent = scene.add_layer(win, None);
+    let child = scene.add_layer(win, Some(parent));
+    // The first write changes the value, so it invalidates like `layer_mut`.
+    assert_eq!(
+        scene.update_layer(child, |layer| {
+            if layer.visible {
+                return false;
+            }
+            layer.visible = true;
+            true
+        }),
+        Some(true)
+    );
+    for layer in &mut scene.layers {
+        layer.cache_recalc = false;
+    }
+    let revision = scene.revision();
+    // The second write receives the stored value: the guard skips `Update()`
+    // and `Parent->NotifyChildrenVisualStateChanged()`
+    // (`reference/cpp/core/visual/LayerIntf.cpp:1183-1193`).
+    assert_eq!(
+        scene.update_layer(child, |layer| {
+            if layer.visible {
+                return false;
+            }
+            layer.visible = true;
+            true
+        }),
+        Some(false)
+    );
+    assert_eq!(
+        scene.revision(),
+        revision,
+        "a no-op write bumps no revision"
+    );
+    assert!(!scene.layer(child).unwrap().cache_recalc);
+    assert!(!scene.layer(parent).unwrap().cache_recalc);
+}
+
+/// A write that changes the value still invalidates: the layer and every
+/// caching ancestor are marked for recomposite and the revision advances, so
+/// the host re-projects. `reference/cpp/core/visual/LayerIntf.cpp:1190-1193`
+/// (`SetVisible` calls `Update()` then notifies the parent).
+#[test]
+fn update_layer_changed_write_marks_subtree_and_ancestors() {
+    let mut scene = Scene::default();
+    let win = scene.add_window("t", (1, 1));
+    let parent = scene.add_layer(win, None);
+    let child = scene.add_layer(win, Some(parent));
+    for layer in &mut scene.layers {
+        layer.cache_recalc = false;
+    }
+    let revision = scene.revision();
+    assert_eq!(
+        scene.update_layer(child, |layer| {
+            if layer.visible {
+                return false;
+            }
+            layer.visible = true;
+            true
+        }),
+        Some(true)
+    );
+    assert!(
+        scene.revision() > revision,
+        "a changed write bumps revision"
+    );
+    assert!(scene.layer(child).unwrap().cache_recalc);
+    assert!(scene.layer(parent).unwrap().cache_recalc);
+}
+
+/// A missing layer is `None`, distinct from `Some(false)` (an untouched
+/// write): `with_layer_write` must keep raising for a stale id instead of
+/// treating it as a no-op.
+#[test]
+fn update_layer_missing_layer_reports_absent() {
+    let mut scene = Scene::default();
+    let revision = scene.revision();
+    assert_eq!(scene.update_layer(9999, |_| true), None);
+    assert_eq!(scene.revision(), revision);
+}
