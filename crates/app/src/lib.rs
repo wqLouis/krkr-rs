@@ -27,6 +27,7 @@
 mod audio;
 mod game;
 mod image_codec;
+mod runner;
 mod video;
 mod window_ex;
 
@@ -51,6 +52,10 @@ pub use audio::install_audio_decoder;
 pub use game::{GameError, GameHost};
 pub use image_codec::{install_image_codec, install_image_codec_on};
 pub use render::{BackendKind, FrameStats};
+// The emulator entry point. A launcher resolves `Launch` (including the
+// `RuntimeConfig` it loaded its own way) and calls `run`; see the `runner`
+// module for the entry point contract.
+pub use runner::{GameInput, Launch, RunMode, RunReport, run};
 pub use video::install_video_source;
 pub use window_ex::install_window_ex_facts;
 

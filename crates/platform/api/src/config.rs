@@ -1,17 +1,17 @@
-//! Launch-configuration DTOs and the platform configuration-source seam.
+//! Launch-configuration DTOs.
 //!
-//! [`RuntimeConfig`] is the one resolved value the binary acts on. It is
-//! produced with the precedence **launch argument > platform-provided
-//! configuration > built-in default**: the composition root parses the
-//! arguments, asks the platform for its overrides through [`ConfigSource`],
-//! and fills in the defaults. The type lives here so every layer shares one
-//! definition; the resolution itself belongs to the composition root.
+//! [`RuntimeConfig`] is the one resolved value a launcher passes to the
+//! emulator. It is produced with the precedence **launch argument > platform
+//! configuration > built-in default**, but the loading belongs to the
+//! launcher: the desktop CLI reads a `key=value` file through
+//! [`parse_overrides`], an Android launcher reads its own store, and both
+//! hand the finished value to the same entry point. Nothing here reads a
+//! file or knows a platform.
 //!
 //! Every field is validated. An unparseable or out-of-range value is a typed
 //! [`ConfigError`] naming the option and the accepted range — it is never
-//! clamped or defaulted. [`RuntimeConfigOverrides`] lets a platform supply
-//! only the fields it actually holds, so the built-in default is applied by
-//! the resolver rather than baked into the platform.
+//! clamped or defaulted. [`RuntimeConfigOverrides`] is the partial shape a
+//! parser or launcher holds before the built-in defaults are filled in.
 
 use thiserror::Error;
 
@@ -47,8 +47,8 @@ impl FrameRateLimit {
 
     /// Wraps `fps`, rejecting a value outside the accepted range.
     ///
-    /// `option` is the launch-argument or platform-key name used in the error
-    /// (for example `--fps` or `frame_rate`).
+    /// `option` is the launch-argument or configuration-key name used in the
+    /// error (for example `--fps` or `frame_rate`).
     ///
     /// # Errors
     ///
@@ -149,11 +149,12 @@ impl PresentationScaling {
     }
 }
 
-/// The fully resolved runtime configuration the binary acts on.
+/// The fully resolved runtime configuration a launcher passes to the
+/// emulator.
 ///
-/// Built by the composition root from the launch arguments, the platform
-/// configuration and the built-in defaults, in that precedence. Every field
-/// is already validated, so the fields are plain public values.
+/// A launcher builds it from its own configuration store and the launch
+/// arguments, over the built-in defaults, in that precedence. Every field is
+/// already validated, so the fields are plain public values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RuntimeConfig {
     /// Frame-rate limit in frames per second; range
@@ -176,60 +177,26 @@ impl Default for RuntimeConfig {
     }
 }
 
-/// The subset of [`RuntimeConfig`] a [`ConfigSource`] holds.
+/// The subset of [`RuntimeConfig`] a parser or launcher holds.
 ///
-/// A platform that has no value for a field leaves it `None`; the resolver
-/// then falls back to the built-in default. Keeping the platform's answer
-/// partial makes the precedence explicit instead of hiding the default
-/// inside the platform.
+/// A source that has no value for a field leaves it `None`; the launcher then
+/// falls back to the built-in default. Keeping the partial shape makes the
+/// precedence explicit instead of hiding the default inside the source.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct RuntimeConfigOverrides {
-    /// Platform-provided frame-rate limit, if the platform holds one.
+    /// A source's frame-rate limit, if it holds one.
     pub frame_rate_limit: Option<FrameRateLimit>,
-    /// Platform-provided presentation scaling, if the platform holds one.
+    /// A source's presentation scaling, if it holds one.
     pub scaling: Option<PresentationScaling>,
-}
-
-/// The platform's configuration seam.
-///
-/// The composition root resolves settings with the precedence *launch
-/// argument > platform configuration > built-in default*, but it must not
-/// know **where** a platform keeps that configuration: a desktop build may
-/// read a file, an Android build its own storage, and a build with no
-/// persistent configuration returns no overrides. Each platform supplies its
-/// implementation, so the composition root contains no `#[cfg(target_os)]`
-/// and no configuration path.
-pub trait ConfigSource {
-    /// Loads the platform's overrides, or an empty set when the platform
-    /// holds no configuration.
-    ///
-    /// # Errors
-    ///
-    /// [`ConfigError`] when the platform's store exists but cannot be read or
-    /// contains an invalid or unknown entry.
-    fn load(&self) -> Result<RuntimeConfigOverrides, ConfigError>;
-}
-
-/// A [`ConfigSource`] that holds no configuration.
-///
-/// It yields an empty override set, so every field falls back to the built-in
-/// default. This is the valid "no source" implementation for a platform that
-/// keeps no persistent configuration.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct NoConfigSource;
-
-impl ConfigSource for NoConfigSource {
-    fn load(&self) -> Result<RuntimeConfigOverrides, ConfigError> {
-        Ok(RuntimeConfigOverrides::default())
-    }
 }
 
 /// Parses `key=value` configuration text into overrides.
 ///
-/// Blank lines and lines whose first non-space character is `#` are ignored.
-/// A line without `=` or with an unknown key is an error, as is a value that
-/// fails validation; nothing is silently skipped. The recognized keys are
-/// `frame_rate` and `scaling`.
+/// This is the parser a file-backed launcher uses; the text itself is the
+/// launcher's business. Blank lines and lines whose first non-space character
+/// is `#` are ignored. A line without `=` or with an unknown key is an error,
+/// as is a value that fails validation; nothing is silently skipped. The
+/// recognized keys are `frame_rate` and `scaling`.
 ///
 /// # Errors
 ///
@@ -274,14 +241,14 @@ pub enum ConfigError {
     /// A configuration value is unparseable or out of range.
     #[error("{option}: '{value}' is not valid (expected {expected})")]
     InvalidValue {
-        /// Name of the launch option or platform configuration key.
+        /// Name of the launch option or configuration-file key.
         option: &'static str,
         /// The rejected value, as written.
         value: String,
         /// Human-readable description of the accepted form and range.
         expected: &'static str,
     },
-    /// A platform configuration source could not be read.
+    /// A configuration store could not be read.
     #[error("configuration source: {message}")]
     Source {
         /// Human-readable description of the failure.
@@ -377,13 +344,5 @@ mod tests {
         let error = parse_overrides("frame_rate=0").expect_err("must reject");
         assert!(error.to_string().contains("frame_rate"));
         assert!(parse_overrides("scaling=stretch").is_err());
-    }
-
-    #[test]
-    fn no_source_yields_no_overrides() {
-        assert_eq!(
-            NoConfigSource.load().expect("load"),
-            RuntimeConfigOverrides::default()
-        );
     }
 }

@@ -85,7 +85,6 @@ pub use crate::input::{InputEvent, MouseButton, PhysicalKey};
 pub use crate::window::headless_window_handle;
 
 use api::error::AudioError;
-use std::path::PathBuf;
 use std::time::Duration;
 
 /// Errors from the platform layer.
@@ -189,65 +188,5 @@ pub trait EventHandler {
     /// Called when the loop is about to wait for events.
     fn about_to_wait(&mut self) -> Flow {
         Flow::Continue
-    }
-}
-
-/// Environment variable naming the desktop configuration file.
-///
-/// When it is unset the platform holds no persistent configuration.
-pub const CONFIG_PATH_ENV: &str = "KRKR_CONFIG";
-
-/// Returns the configuration source this platform build supplies.
-///
-/// This is the platform half of the configuration seam: the composition root
-/// asks for a source and never learns where the configuration is stored. The
-/// desktop build reads the `key=value` file named by [`CONFIG_PATH_ENV`] when
-/// the variable is set and yields the built-in defaults otherwise. A
-/// different platform build supplies its own implementation here (for example
-/// an Android settings store) instead of changing the composition root. A
-/// source that is configured but unreadable is a typed error, never an empty
-/// result (a silent fallback).
-///
-/// The returned type is opaque so the choice stays a platform concern.
-pub fn config_source() -> impl api::config::ConfigSource {
-    match std::env::var_os(CONFIG_PATH_ENV) {
-        Some(path) => Source::File(FileConfigSource {
-            path: PathBuf::from(path),
-        }),
-        None => Source::None(api::config::NoConfigSource),
-    }
-}
-
-/// The platform's source choice, dispatched to the concrete implementation.
-enum Source {
-    /// The platform holds no configuration.
-    None(api::config::NoConfigSource),
-    /// The platform reads a file.
-    File(FileConfigSource),
-}
-
-impl api::config::ConfigSource for Source {
-    fn load(&self) -> Result<api::config::RuntimeConfigOverrides, api::config::ConfigError> {
-        match self {
-            Self::None(source) => source.load(),
-            Self::File(source) => source.load(),
-        }
-    }
-}
-
-/// A [`api::config::ConfigSource`] backed by a `key=value` file.
-struct FileConfigSource {
-    /// Path of the configuration file.
-    path: PathBuf,
-}
-
-impl api::config::ConfigSource for FileConfigSource {
-    fn load(&self) -> Result<api::config::RuntimeConfigOverrides, api::config::ConfigError> {
-        let text = std::fs::read_to_string(&self.path).map_err(|error| {
-            api::config::ConfigError::Source {
-                message: format!("cannot read {}: {error}", self.path.display()),
-            }
-        })?;
-        api::config::parse_overrides(&text)
     }
 }

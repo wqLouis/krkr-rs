@@ -3,53 +3,79 @@
 Status: implemented. Related: [`migration/09-game-loading.md`](migration/09-game-loading.md)
 (launch arguments), [`android.md`](android.md) (the Android frontend).
 
-The binary resolves one explicit value, `api::config::RuntimeConfig`, with the
-precedence
+The engine is configured with one explicit value,
+`api::config::RuntimeConfig`, resolved with the precedence
 
 ```
-launch argument  >  platform-provided configuration  >  built-in default
+launch argument  >  the launcher's configuration store  >  built-in default
 ```
 
-`crates/app/src/main.rs` parses and validates the arguments, `platform` supplies
-a `api::config::ConfigSource`, and the resolver merges the two over the
-defaults. Every field is validated; an unparseable or out-of-range value is a
-typed `ConfigError` naming the option and its accepted range, never a clamped
-or defaulted value (D11). Nothing takes effect until the whole configuration —
-arguments *and* the platform source — validates.
-
-## 1. The platform seam
-
-`RuntimeConfig` lives in `api` (the shared DTO home). The *source* of the
-platform half is `api::config::ConfigSource`, implemented and returned by
-`platform::config_source()`. The composition root calls that function and never
-chooses a path, a format or an OS:
+**The launcher owns configuration loading.** It parses its own store, merges
+the launch arguments over it, and passes the finished `RuntimeConfig` to
+`app::run` as a function argument. The emulator core never reads a
+configuration file, an environment variable or a platform settings store, so
+the same entry point serves every frontend:
 
 ```rust
-let source = platform::config_source();
-let runtime = resolve_runtime_config(&cli, &source)?;
+// crates/app/src/main.rs — the desktop CLI
+let file = load_desktop_config()?;                 // KRKR_CONFIG, `key=value`
+let runtime = resolve_runtime_config(&cli, file);  // arguments over file over defaults
+app::run(Launch {
+    runtime,
+    backend: cli.backend,
+    game: resolve_game(&cli)?,
+    mode: if cli.headless { RunMode::Headless { frames: cli.frames } } else { RunMode::Windowed },
+})?;
 ```
 
-A `#[cfg(target_os = ...)]` in the app would be wrong: the app is the
-composition root and must not branch on the OS, and the platform is where the
-window, IO and lifecycle already live. Each platform build therefore holds its
-configuration its own way behind the same trait:
+```rust
+// crates/android — an Android launcher, the same entry point
+let runtime = RuntimeConfig {
+    scaling: PresentationScaling::Fit,             // phones always fit the screen
+    ..RuntimeConfig::default()
+};
+app::run(Launch {
+    runtime,
+    backend: BackendKind::Null,
+    game: Some(GameInput { base_dir, archives }),
+    mode: RunMode::Windowed,
+})?;
+```
 
-* desktop reads the `key=value` file named by the `KRKR_CONFIG` environment
-  variable (absent → `NoConfigSource` → defaults);
-* a future Android build can return a settings-store-backed source instead;
-* `NoConfigSource` is the valid "no configuration" implementation.
+The reason is that **where configuration comes from is a platform concern**,
+not an engine one. A desktop build reads a file; an Android build reads its
+own storage; a build with no persistent configuration just uses the defaults.
+Keeping that choice in each launcher means the core contains no
+`#[cfg(target_os = ...)]`, no configuration path and no loading trait — it
+only acts on the value it is handed. A launcher still needs the shared value
+types and the `key=value` parser, so `api::config` provides `RuntimeConfig`,
+`FrameRateLimit`, `PresentationScaling`, `parse_overrides`, the partial
+`RuntimeConfigOverrides` shape and the typed `ConfigError`.
 
-A source that is configured but unreadable or malformed is a typed error, not
-an empty result ("no silent fallbacks"). Configuration is deliberately **not**
-read from a fixed `.config` path baked into the app, so no platform is forced
-into the desktop's storage model.
+Every field is validated. An unparseable or out-of-range value is a typed
+`ConfigError` naming the option and the accepted range, never a clamped or
+defaulted value (D11). Nothing takes effect until the whole configuration —
+arguments *and* the launcher's store — validates.
+
+## 1. The desktop file
+
+The desktop launcher reads the `key=value` file named by the `KRKR_CONFIG`
+environment variable (unset → no file → defaults). This loader lives in
+`crates/app/src/main.rs`, next to the argument parser that shares its
+precedence; the emulator core does not know it exists. `crates/app` is allowed
+to read files (only the compatibility layer is barred from `std::fs`).
+
+A file that is named but unreadable is a typed error, and so is an unknown key
+or a bad value; nothing is skipped and nothing is applied until the whole file
+parses. The recognized keys are `frame_rate` and `scaling`, matching the
+`--fps` and `--scaling` argument names.
 
 ## 2. Implemented options
 
 | option | unit / range | default | basis |
 |---|---|---|---|
-| `--fps N` (`frame_rate_limit`) | frames per second, `1..=1000` | `60` | reference `fps_limit` default `60` (`reference/cpp/core/environ/ui/PreferenceConfig.h:304-309`), applied as the animation interval `1/fps` (`reference/cpp/core/environ/cocos2d/MainScene.cpp:684-685`); the main loop sleeps the remaining interval (`reference/cpp/core/environ/RenderUtils.h`, `TVPDrawSceneOnce`) |
-| `--scaling MODE` (`scaling`) | `game`, `fit`, `fill`, `expand` | `game` | `game` is the reference Win32 one-to-one presentation; the other three are the existing engine projection modes |
+| `--fps N` (`frame_rate`) | frames per second, `1..=1000` | `60` | reference `fps_limit` default `60` (`reference/cpp/core/environ/ui/PreferenceConfig.h:304-309`), applied as the animation interval `1/fps` (`reference/cpp/core/environ/cocos2d/MainScene.cpp:684-685`); the main loop sleeps the remaining interval (`reference/cpp/core/environ/RenderUtils.h`, `TVPDrawSceneOnce`) |
+| `--scaling MODE` (`scaling`) | `game`, `fit`, `fill`, `expand` | `game` (Android launchers default to `fit`) | `game` is the reference Win32 one-to-one presentation; the other three are the existing engine projection modes |
 
 The frame-rate limit paces both loops: the windowed loop through
 `PlatformConfig::frame_interval` and the headless step through
@@ -80,7 +106,9 @@ would be a stub, so they are reported rather than implemented.
 
 ## 4. Tests
 
-`crates/app/src/main.rs` covers the precedence (argument beats platform beats
-default, field by field), every validation failure, and `--help` completeness;
-`crates/platform/api/src/config.rs` covers the value validation and the
-`key=value` parser.
+`crates/app/src/main.rs` covers the desktop loader, the precedence
+(argument beats file beats default, field by field), every validation failure,
+and `--help` completeness. `crates/app/src/runner.rs` drives `app::run` with a
+configuration passed directly — no file and no environment variable — and
+checks the run used its frame period. `crates/platform/api/src/config.rs`
+covers the value validation and the `key=value` parser.
