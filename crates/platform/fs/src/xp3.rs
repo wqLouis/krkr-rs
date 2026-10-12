@@ -301,9 +301,55 @@ impl Xp3Archive {
         archive_name: &str,
         filter: Option<&Xp3ExtractionFilter<'_>>,
     ) -> Result<Vec<u8>> {
+        let mut reader = FileReader { fs, file, pos: 0 };
+        self.read_entry_from(&mut reader, entry, archive_name, filter)
+    }
+
+    /// Read the full contents of an entry from an in-memory archive image.
+    ///
+    /// `bytes` is the whole archive file, including any EXE wrapper, exactly
+    /// as it was read from disk; the parser's base offset and each segment's
+    /// absolute offset address into it. Every segment is bounds-checked
+    /// against `bytes` before it is read, so a corrupt index or a truncated
+    /// image is a typed error rather than a short read.
+    ///
+    /// Like [`Self::read_entry_with_filter`], `filter` is applied to each
+    /// decoded segment and is never stored.
+    pub fn read_entry_from_bytes(
+        &self,
+        bytes: &[u8],
+        entry: &Entry,
+        archive_name: &str,
+        filter: Option<&Xp3ExtractionFilter<'_>>,
+    ) -> Result<Vec<u8>> {
+        let len = u64::try_from(bytes.len())
+            .map_err(|_| Xp3Error::CorruptIndex("archive image is too large to address"))?;
+        for seg in &entry.segments {
+            let start = self
+                .base
+                .checked_add(seg.start)
+                .ok_or(Xp3Error::CorruptIndex("segment offset overflow"))?;
+            let end = start
+                .checked_add(seg.arc_size)
+                .ok_or(Xp3Error::CorruptIndex("segment size overflow"))?;
+            if end > len {
+                return Err(Xp3Error::CorruptIndex("segment overruns the archive image"));
+            }
+        }
+        let mut reader = io::Cursor::new(bytes);
+        self.read_entry_from(&mut reader, entry, archive_name, filter)
+    }
+
+    /// Read an entry through any `Read + Seek` source.
+    fn read_entry_from<R: Read + Seek>(
+        &self,
+        reader: &mut R,
+        entry: &Entry,
+        archive_name: &str,
+        filter: Option<&Xp3ExtractionFilter<'_>>,
+    ) -> Result<Vec<u8>> {
         // Note: `protected` (DRM bit) files are read normally, matching the
         // reference emulator, which allows extracting protected storage.
-        let mut reader = FileReader { fs, file, pos: 0 };
         // Size the output from the segments' own declared sizes rather than
         // the entry header. The sum is checked for overflow and the
         // allocation is fallible, so a structurally invalid size is an error

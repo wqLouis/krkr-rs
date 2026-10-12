@@ -185,6 +185,39 @@ entries measured in `docs/optimization.md`). The middle layer should:
 None of this changes the stateless fs surface; it is L2 optimization and
 L2-owned index state.
 
+### 7.1 Whole-archive preload (`preload_archives`)
+
+`RuntimeConfig::preload_archives` (`--preload-archives` on the CLI,
+`preload_archives=true` in the desktop config file) makes
+`engine::storage::Storage` read each mounted archive into memory in full at
+mount. This is the answer to a slow backing store: with the game's 633 MB
+`data.xp3` on an NTFS-3G/FUSE mount, per-entry random reads dominate wall
+time (a headless run measured `real 2m00s` against `user 5.3s`), and reading
+the archive once, sequentially, removes them.
+
+* The cost is **the archive's own size** in resident memory — 633 MB for a
+  633 MB archive, summed over every mounted archive. There is no cap and no
+  heuristic; the user opts in.
+* `Storage::mount_archives_with` and `mount_discovered_archives_with` take
+  the choice through `MountOptions::preload_archives`; the plain
+  `mount_archives` / `mount_discovered_archives` constructors keep the
+  streaming backing.
+* With the flag off the path is unchanged: the archive file stays open and
+  every entry read is positional. With it on, an internal `ArchiveBacking`
+  enum holds the image (`Vec<u8>`) instead of the open handle.
+* Mount order and precedence do not change. A preload failure on a scanned
+  archive is skipped and warned about exactly like a parse failure, and on
+  an explicitly requested archive it is a typed `MountError`
+  (`TruncatedArchive`, `ArchiveTooLarge`, `ArchiveAllocation`); it is never
+  collapsed into a silent fall back to the streaming path.
+* The index is still parsed eagerly at mount — it is small, and `find`,
+  `stat` and listing need it. Preloading only materializes the entry data.
+
+**Layering.** `fs::xp3` stays stateless: `Xp3Archive` stores only the base
+offset and the entry map, and `read_entry_from_bytes` takes the image as an
+explicit `&[u8]` argument. L2 owns the `Vec<u8>` and hands a view of it to L1
+on every entry read; L1 never caches it, keeps it, or returns it.
+
 ## 8. Platform notes
 
 * **Linux**: host path root, `std::fs`. `xdg-open` etc. stay in `System`.

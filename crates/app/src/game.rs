@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use compat::{CompatCtx, CompatError, FrameBody};
 use engine::Storage;
-use engine::storage::StartupPlan;
+use engine::storage::{MountOptions, StartupPlan};
 use fs::FileSystem;
 use platform::{PlatformError, PlatformEvent};
 use vm::{FrameCtx, VmHost};
@@ -132,7 +132,9 @@ impl GameHost {
     /// the L2 startup sequence.
     ///
     /// `base_dir` is the app path (loose files, `patch.tjs`,
-    /// `AfterStartup.tjs`).
+    /// `AfterStartup.tjs`). Every mounted archive keeps its file open and is
+    /// read positionally per entry; use [`Self::open_with_preload`] to hold
+    /// the archives in memory instead.
     ///
     /// # Errors
     ///
@@ -140,8 +142,28 @@ impl GameHost {
     /// headless hosts use the null backend and cannot fail here), when
     /// an archive cannot be mounted, the VM cannot be created, or the startup
     /// sequence fails.
-    #[allow(unsafe_code)]
     pub fn open(host: Host, archives: Vec<PathBuf>, base_dir: PathBuf) -> Result<Self, GameError> {
+        Self::open_with_preload(host, archives, base_dir, false)
+    }
+
+    /// Like [`Self::open`], but reads every mounted archive into memory in
+    /// full at mount when `preload_archives` is set.
+    ///
+    /// The resident-memory cost is the sum of the mounted archives' sizes and
+    /// there is no cap; the mount order and precedence are unchanged. See
+    /// [`engine::storage::MountOptions`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::open`], plus a typed error when a preloaded archive cannot
+    /// be read into memory in full.
+    #[allow(unsafe_code)]
+    pub fn open_with_preload(
+        host: Host,
+        archives: Vec<PathBuf>,
+        base_dir: PathBuf,
+        preload_archives: bool,
+    ) -> Result<Self, GameError> {
         // L1 audio first: a windowed host opens the real device and fails
         // fast if none exists; a headless host gets the null backend.
         let audio = AudioOutput::open(host.is_headless())?;
@@ -155,9 +177,19 @@ impl GameHost {
         // explicitly requested one is a typed error.
         let storage = Box::new(if archives.is_empty() {
             let discovered = engine::storage::discover_archives(&fs, &base_dir)?;
-            Storage::mount_discovered_archives(fs, &base_dir, discovered)?
+            Storage::mount_discovered_archives_with(
+                fs,
+                &base_dir,
+                discovered,
+                MountOptions { preload_archives },
+            )?
         } else {
-            Storage::mount_archives(fs, &base_dir, archives)?
+            Storage::mount_archives_with(
+                fs,
+                &base_dir,
+                archives,
+                MountOptions { preload_archives },
+            )?
         });
         let mut vm = VmHost::with_default()?;
         // SAFETY: `storage` and `host` are declared after `vm` in the returned

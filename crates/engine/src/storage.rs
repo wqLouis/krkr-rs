@@ -21,6 +21,10 @@
 //! directory (the ergonomic path for the CLI and the Android launcher).
 //! See [`Storage::mount_archives`] / [`Storage::mount_archive`].
 //!
+//! A mount can optionally read each archive into memory in full
+//! ([`MountOptions::preload_archives`]); the image is owned by this layer and
+//! a borrow of it is handed to L1 for every entry read.
+//!
 //! Resolution order mirrors the reference engine:
 //!
 //! 1. explicit `arc.xp3>path` addressing,
@@ -43,17 +47,47 @@ pub const ATTR_DIRECTORY: i64 = 0x10;
 /// Windows `FILE_ATTRIBUTE_ARCHIVE` (0x20) — the "normal file" bit.
 pub const ATTR_NORMAL: i64 = 0x20;
 
-/// One mounted `.xp3` archive: its logical path plus the parsed index and the
-/// open handle that owns its bytes.
+/// One mounted `.xp3` archive: its logical path, the backing that owns its
+/// bytes and the parsed index.
 struct MountedArchive {
     /// Logical path of the archive file (as mounted).
     path: PathBuf,
     /// Base file name (used for `arc.xp3>path` matching and listings).
     file_name: String,
-    /// L2-owned open handle for the archive bytes.
-    file: FileState,
+    /// Where the archive's bytes are read from.
+    backing: ArchiveBacking,
     /// Parsed index.
     archive: Xp3Archive,
+}
+
+/// Where a mounted archive's bytes are read from.
+///
+/// The bytes are owned by the storage; the stateless L1 reader is handed the
+/// backing on every entry read and never holds it.
+enum ArchiveBacking {
+    /// The archive file stays open and each entry read is positional.
+    Stream(FileState),
+    /// The whole archive file was read into memory at mount; entry reads copy
+    /// from this image.
+    Memory(Vec<u8>),
+}
+
+/// Options controlling how [`Storage`] mounts archives.
+///
+/// The default keeps every archive on the file system and reads each entry
+/// positionally. Enabling [`preload_archives`](Self::preload_archives) reads
+/// each archive into memory once at mount.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MountOptions {
+    /// Read each mounted archive into memory in full at mount.
+    ///
+    /// The resident-memory cost is the archive's own size; there is no cap.
+    /// Every entry then reads from that buffer instead of the file system,
+    /// which removes the per-entry random reads a slow backing store makes
+    /// visible. A short read, an unrepresentable size or a failed allocation
+    /// is a typed [`MountError`], never a silent fall back to the streaming
+    /// path.
+    pub preload_archives: bool,
 }
 
 /// A mounted game storage: one base directory plus the explicitly mounted
@@ -68,6 +102,8 @@ pub struct Storage {
     archives: Vec<MountedArchive>,
     /// Auto search-path prefixes (plain dirs or `arc.xp3>` prefixes).
     auto_paths: Vec<String>,
+    /// Whether an archive is read into memory in full when it is mounted.
+    preload_archives: bool,
     /// The per-segment XP3 extraction filter (the `xp3filter` seam), if any.
     ///
     /// L2 owns the state; the stateless L1 reader receives the closure as a
@@ -119,6 +155,33 @@ pub enum MountError {
     /// An archive failed to open or parse.
     #[error("archive error: {0}")]
     Xp3(#[from] xp3::Xp3Error),
+    /// A preloaded archive was shorter than its reported size.
+    #[error("archive {path} is truncated: read {read} of {expected} bytes")]
+    TruncatedArchive {
+        /// Archive path as mounted.
+        path: String,
+        /// Size the archive reported.
+        expected: u64,
+        /// Bytes actually read before the file ended.
+        read: u64,
+    },
+    /// A preloaded archive is larger than this platform can address in a
+    /// single buffer.
+    #[error("archive {path} is too large to hold in memory: {size} bytes")]
+    ArchiveTooLarge {
+        /// Archive path as mounted.
+        path: String,
+        /// Reported size in bytes.
+        size: u64,
+    },
+    /// A preloaded archive's buffer could not be allocated.
+    #[error("archive {path} could not be read into memory: {size} bytes")]
+    ArchiveAllocation {
+        /// Archive path as mounted.
+        path: String,
+        /// Reported size in bytes.
+        size: u64,
+    },
 }
 
 /// Errors while reading or listing storage entries.
@@ -184,7 +247,27 @@ impl Storage {
         base_dir: impl Into<PathBuf>,
         archives: impl IntoIterator<Item = impl AsRef<Path>>,
     ) -> Result<Self, MountError> {
-        let mut storage = Self::with_base_dir(fs, base_dir.into())?;
+        Self::mount_archives_with(fs, base_dir, archives, MountOptions::default())
+    }
+
+    /// Creates a storage rooted at `base_dir` and mounts each archive in
+    /// `archives`, in order, with an explicit choice of how the archive bytes
+    /// are held (see [`MountOptions`]).
+    ///
+    /// This is [`Self::mount_archives`] with the backing selected; the mount
+    /// order and the later-wins precedence are unchanged.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::mount_archives`], plus a typed error when a preloaded
+    /// archive cannot be read into memory in full.
+    pub fn mount_archives_with(
+        fs: FileSystem,
+        base_dir: impl Into<PathBuf>,
+        archives: impl IntoIterator<Item = impl AsRef<Path>>,
+        options: MountOptions,
+    ) -> Result<Self, MountError> {
+        let mut storage = Self::with_base_dir(fs, base_dir.into(), options.preload_archives)?;
         for path in archives {
             storage.mount_archive(path.as_ref())?;
         }
@@ -204,7 +287,25 @@ impl Storage {
         base_dir: impl Into<PathBuf>,
         archives: impl IntoIterator<Item = impl AsRef<Path>>,
     ) -> Result<Self, MountError> {
-        let mut storage = Self::with_base_dir(fs, base_dir.into())?;
+        Self::mount_discovered_archives_with(fs, base_dir, archives, MountOptions::default())
+    }
+
+    /// Mounts a directory-scan archive list with an explicit backing, skipping
+    /// an archive that cannot be read or parsed and reporting it through
+    /// `warn!`.
+    ///
+    /// This is [`Self::mount_discovered_archives`] with [`MountOptions`]; the
+    /// skip-and-warn rule and the mount order are unchanged. A preload failure
+    /// on a scanned archive is one more archive that is skipped and reported,
+    /// exactly like a parse failure — preloading never changes which archive
+    /// wins.
+    pub fn mount_discovered_archives_with(
+        fs: FileSystem,
+        base_dir: impl Into<PathBuf>,
+        archives: impl IntoIterator<Item = impl AsRef<Path>>,
+        options: MountOptions,
+    ) -> Result<Self, MountError> {
+        let mut storage = Self::with_base_dir(fs, base_dir.into(), options.preload_archives)?;
         for path in archives {
             if let Err(error) = storage.mount_archive(path.as_ref()) {
                 log::warn!("skipping archive {}: {error}", path.as_ref().display());
@@ -216,7 +317,11 @@ impl Storage {
     /// Creates an empty storage rooted at `base_dir`, validating that the
     /// base path exists and is a directory. No archives are mounted; use
     /// [`Self::mount_archive`] to add them explicitly.
-    fn with_base_dir(fs: FileSystem, base_dir: PathBuf) -> Result<Self, MountError> {
+    fn with_base_dir(
+        fs: FileSystem,
+        base_dir: PathBuf,
+        preload_archives: bool,
+    ) -> Result<Self, MountError> {
         let meta = fs::stat(&fs, &FsPath::host(&base_dir))?;
         if !meta.is_dir {
             return Err(MountError::NotADirectory(base_dir.display().to_string()));
@@ -226,6 +331,7 @@ impl Storage {
             game_dir: base_dir,
             archives: Vec::new(),
             auto_paths: Vec::new(),
+            preload_archives,
             xp3_extraction_filter: None,
         })
     }
@@ -274,6 +380,11 @@ impl Storage {
         }
         let file = fs::open(&self.fs, &FsPath::host(&path), OpenMode::Read)?;
         let archive = Xp3Archive::open(&self.fs, &file)?;
+        let backing = if self.preload_archives {
+            ArchiveBacking::Memory(read_archive_image(&self.fs, &file, &path)?)
+        } else {
+            ArchiveBacking::Stream(file)
+        };
         let file_name = path
             .file_name()
             .map(|f| f.to_string_lossy().into_owned())
@@ -282,7 +393,7 @@ impl Storage {
         self.archives.push(MountedArchive {
             path,
             file_name,
-            file,
+            backing,
             archive,
         });
         Ok(())
@@ -622,16 +733,17 @@ impl Storage {
         descend(&self.fs, &self.game_dir, &parts)
     }
 
-    /// Runs `f` against the archive at `arc_path`: the mounted index when the
-    /// archive is in the mount list, otherwise a transient open of the file on
-    /// disk.
+    /// Runs `f` against the parsed index of the archive at `arc_path`: the
+    /// mounted one when present, otherwise a transient open+parse of the file
+    /// on disk. The backing is not exposed because the only remaining caller
+    /// ([`Self::stat`]) reads index metadata, not entry bytes.
     fn with_archive<T>(
         &self,
         arc_path: &Path,
-        f: impl FnOnce(&FileState, &Xp3Archive, &str) -> Result<T, StorageReadError>,
+        f: impl FnOnce(&Xp3Archive, &str) -> Result<T, StorageReadError>,
     ) -> Result<T, StorageReadError> {
         if let Some(mounted) = self.archives.iter().find(|m| m.path == arc_path) {
-            return f(&mounted.file, &mounted.archive, &mounted.file_name);
+            return f(&mounted.archive, &mounted.file_name);
         }
         let file = fs::open(&self.fs, &FsPath::host(arc_path), OpenMode::Read)?;
         let archive = Xp3Archive::open(&self.fs, &file)?;
@@ -639,7 +751,7 @@ impl Storage {
             .file_name()
             .map(|f| f.to_string_lossy().into_owned())
             .unwrap_or_default();
-        f(&file, &archive, &file_name)
+        f(&archive, &file_name)
     }
 
     /// Reads a storage entry to bytes (disk file or archive member).
@@ -648,16 +760,42 @@ impl Storage {
             Some(Location::Disk(path)) => {
                 read_fs_file(&self.fs, &path).map_err(StorageReadError::Fs)
             }
-            Some(Location::Archive(arc_path, in_arc)) => {
-                let filter = self.xp3_extraction_filter.as_deref();
-                self.with_archive(&arc_path, |file, archive, file_name| {
-                    archive
-                        .read_with_filter(&self.fs, file, &in_arc, file_name, filter)
-                        .map_err(StorageReadError::Xp3)
-                })
-            }
+            Some(Location::Archive(arc_path, in_arc)) => self.read_archive(&arc_path, &in_arc),
             None => Err(StorageReadError::NotFound(name.to_string())),
         }
+    }
+
+    /// Reads `in_arc` from the mounted archive at `arc_path`, or from a
+    /// transient open when the archive is not in the mount list. A mounted
+    /// archive reads through its own backing, so a preloaded archive never
+    /// touches the file system.
+    fn read_archive(&self, arc_path: &Path, in_arc: &str) -> Result<Vec<u8>, StorageReadError> {
+        let filter = self.xp3_extraction_filter.as_deref();
+        if let Some(mounted) = self.archives.iter().find(|m| m.path == arc_path) {
+            let entry = mounted
+                .archive
+                .entry(in_arc)
+                .ok_or_else(|| StorageReadError::NotFound(in_arc.to_string()))?;
+            return match &mounted.backing {
+                ArchiveBacking::Stream(file) => mounted
+                    .archive
+                    .read_entry_with_filter(&self.fs, file, entry, &mounted.file_name, filter)
+                    .map_err(StorageReadError::Xp3),
+                ArchiveBacking::Memory(bytes) => mounted
+                    .archive
+                    .read_entry_from_bytes(bytes, entry, &mounted.file_name, filter)
+                    .map_err(StorageReadError::Xp3),
+            };
+        }
+        let file = fs::open(&self.fs, &FsPath::host(arc_path), OpenMode::Read)?;
+        let archive = Xp3Archive::open(&self.fs, &file)?;
+        let file_name = arc_path
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        archive
+            .read_with_filter(&self.fs, &file, in_arc, &file_name, filter)
+            .map_err(StorageReadError::Xp3)
     }
 
     /// Returns metadata for a resolved storage entry.
@@ -681,7 +819,7 @@ impl Storage {
                 }))
             }
             Some(Location::Archive(arc_path, in_arc)) => {
-                self.with_archive(&arc_path, |_file, archive, _file_name| {
+                self.with_archive(&arc_path, |archive, _file_name| {
                     let entry = archive
                         .entry(&in_arc)
                         .ok_or_else(|| StorageReadError::NotFound(name.to_string()))?;
@@ -1071,6 +1209,47 @@ fn read_fs_file(fs: &FileSystem, path: &Path) -> Result<Vec<u8>, FsError> {
     }
     out.truncate(read);
     Ok(out)
+}
+
+/// Reads the whole of an open archive file into memory.
+///
+/// The size the file system reports is authoritative: a file that ends before
+/// it is a typed error, never a shortened buffer. There is no size cap; a size
+/// the platform cannot represent or allocate is a typed error instead. The
+/// returned image is owned by the storage and handed to L1 for each entry
+/// read; L1 never keeps it.
+fn read_archive_image(
+    fs: &FileSystem,
+    file: &FileState,
+    path: &Path,
+) -> Result<Vec<u8>, MountError> {
+    let size = fs::file_size(fs, file)?;
+    let display = path.display().to_string();
+    let len = usize::try_from(size).map_err(|_| MountError::ArchiveTooLarge {
+        path: display.clone(),
+        size,
+    })?;
+    let mut image = Vec::new();
+    image
+        .try_reserve_exact(len)
+        .map_err(|_| MountError::ArchiveAllocation {
+            path: display.clone(),
+            size,
+        })?;
+    image.resize(len, 0);
+    let mut read = 0usize;
+    while read < len {
+        let n = fs::read_at(fs, file, read as u64, &mut image[read..])?;
+        if n == 0 {
+            return Err(MountError::TruncatedArchive {
+                path: display,
+                expected: size,
+                read: read as u64,
+            });
+        }
+        read += n;
+    }
+    Ok(image)
 }
 
 /// Case-insensitive `*`/`?` wildcard match (ASCII case folding).

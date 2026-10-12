@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use engine::storage::{ATTR_DIRECTORY, ATTR_NORMAL};
+use engine::storage::{ATTR_DIRECTORY, ATTR_NORMAL, MountOptions};
 use engine::{Location, Storage, normalize_in_archive_name};
 use testkit::build_xp3;
 
@@ -559,4 +559,152 @@ fn archive_is_opened_on_demand() {
     );
     // Explicit addressing opens the same on-disk archive too.
     assert_eq!(storage.read("extra.xp3>config.tjs").unwrap(), b"cfg");
+}
+
+/// With `preload_archives` set the whole archive image is held in memory, but
+/// every entry must read exactly the bytes the streaming path returns. This is
+/// the correctness question for preloading: an off-by-one in the index or a
+/// partial read would otherwise surface much later as a corrupt asset.
+///
+/// Reference: both paths run the same whole-entry read, which concatenates the
+/// segments and inflates zlib ones (`tTVPXP3ArchiveStream::Read`,
+/// `reference/cpp/core/archive/xp3/XP3Archive.cpp:996-1002`); preloading only
+/// changes where the bytes come from.
+#[test]
+fn preloaded_archive_reads_match_the_streaming_path() {
+    let payload: Vec<u8> = (0..96 * 1024).map(|i| (i % 251) as u8).collect();
+    let xp3 = build_xp3(&[
+        ("data/raw.bin", &payload, false),
+        ("data/packed.bin", &payload, true),
+        ("small.txt", b"hello", false),
+    ]);
+    let files = [("data.xp3", xp3.as_slice())];
+
+    let streaming = mount_memory_with_archives(&files, &["data.xp3"]);
+    let fs = memory_with(&files);
+    let preloaded = Storage::mount_archives_with(
+        fs,
+        "/",
+        ["data.xp3"],
+        MountOptions {
+            preload_archives: true,
+        },
+    )
+    .expect("mount preloaded");
+
+    for name in ["data/raw.bin", "data/packed.bin", "small.txt"] {
+        assert_eq!(
+            streaming.read(name).unwrap(),
+            preloaded.read(name).unwrap(),
+            "{name} differs between the streaming and preloaded paths"
+        );
+    }
+    assert_eq!(preloaded.read("data/packed.bin").unwrap(), payload);
+}
+
+/// The `xp3filter` extraction seam rewrites decoded segments in place for a
+/// preloaded archive exactly as it does for a streaming one.
+#[test]
+fn preloading_preserves_the_extraction_filter() {
+    let key = 0x5Au8;
+    let plain = b"decrypted archive payload".to_vec();
+    let cipher: Vec<u8> = plain.iter().map(|byte| byte ^ key).collect();
+    let xp3 = build_xp3(&[("secret.bin", &cipher, false)]);
+    let files = [("data.xp3", xp3.as_slice())];
+
+    let mut streaming = mount_memory_with_archives(&files, &["data.xp3"]);
+    streaming.xp3_extraction_filter = Some(Box::new(
+        move |_hash: u32,
+              _offset: u64,
+              buffer: &mut [u8],
+              _name: &str,
+              _archive: &str,
+              _size: u64| {
+            for byte in buffer.iter_mut() {
+                *byte ^= key;
+            }
+        },
+    ));
+
+    let fs = memory_with(&files);
+    let mut preloaded = Storage::mount_archives_with(
+        fs,
+        "/",
+        ["data.xp3"],
+        MountOptions {
+            preload_archives: true,
+        },
+    )
+    .expect("mount preloaded");
+    preloaded.xp3_extraction_filter = Some(Box::new(
+        move |_hash: u32,
+              _offset: u64,
+              buffer: &mut [u8],
+              _name: &str,
+              _archive: &str,
+              _size: u64| {
+            for byte in buffer.iter_mut() {
+                *byte ^= key;
+            }
+        },
+    ));
+
+    assert_eq!(streaming.read("secret.bin").unwrap(), plain);
+    assert_eq!(preloaded.read("secret.bin").unwrap(), plain);
+}
+
+/// Preloading does not change mount precedence: the later-mounted archive
+/// still wins, and resolution still reports the winning archive.
+#[test]
+fn preloading_does_not_change_mount_precedence() {
+    let data = build_xp3(&[("shared.txt", b"from data", false)]);
+    let patch = build_xp3(&[("shared.txt", b"from patch", false)]);
+    let files = [
+        ("data.xp3", data.as_slice()),
+        ("patch.xp3", patch.as_slice()),
+    ];
+
+    let fs = memory_with(&files);
+    let storage = Storage::mount_archives_with(
+        fs,
+        "/",
+        ["data.xp3", "patch.xp3"],
+        MountOptions {
+            preload_archives: true,
+        },
+    )
+    .expect("mount");
+
+    assert_eq!(storage.read("shared.txt").unwrap(), b"from patch");
+    assert_eq!(
+        storage.find("shared.txt").unwrap(),
+        Some(Location::Archive(
+            PathBuf::from("/patch.xp3"),
+            "shared.txt".into()
+        ))
+    );
+}
+
+/// Reading an entry out of an in-memory image is bounds-checked: an image too
+/// short for a segment is a typed corruption error, not an opaque EOF.
+#[test]
+fn reading_an_in_memory_image_rejects_an_overrunning_segment() {
+    let xp3 = build_xp3(&[("data/a.bin", b"payload", false)]);
+    let fs = memory_with(&[("data.xp3", &xp3)]);
+    let file = fs::open(
+        &fs,
+        &api::fs::FsPath::host("/data.xp3"),
+        api::fs::OpenMode::Read,
+    )
+    .expect("open archive");
+    let archive = fs::xp3::Xp3Archive::open(&fs, &file).expect("parse archive");
+    let entry = archive.entry("data/a.bin").cloned().expect("entry");
+
+    let err = archive
+        .read_entry_from_bytes(&[], &entry, "data.xp3", None)
+        .expect_err("segment overruns an empty image");
+    assert!(
+        matches!(err, fs::xp3::Xp3Error::CorruptIndex(_)),
+        "unexpected error: {err:?}"
+    );
 }
