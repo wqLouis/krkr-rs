@@ -623,6 +623,9 @@ working.
 * **`unsafe_code` lint** — `forbid` where there is no `unsafe`, `deny(unsafe_code)` + a file-level `allow` where the FFI lives.
 * **`get_`-prefixed public API left:** `Tjs2Engine::get_member`, `get_class_names`; `Scene::get_province_pixel`.
 * **`LayerExMovie` teardown** — the plugin registers instance members but nothing is wired for a `Layer` being destroyed, so a movie open at that moment keeps its foreign voice on the mixer, and the reference releases it in `~layerExMovie` → `stopMovie()` (`plugins/layerExMovie.cpp:131-138`). Pre-existing: the slot was never removed on Layer destruction either. Needs a teardown/invalidate hook for the plugin.
+* **`onFocus`/`onBlur` are never dispatched.** The reference's `SetVisible` calls `BlurTree`/`CheckTreeFocusableState` and those can fire them (`reference/cpp/core/visual/LayerIntf.cpp:1194-1200`); `events.rs` defines both and nothing dispatches either, so focus changes are silent to scripts. The no-op-write guard does not remove an event we deliver — we never delivered it.
+* **`Layer.opacity` representation.** The reference stores an unclamped `tjs_int` 0..=255; the port stores a normalized `f32` and clamps. In range the values agree, so the write guard is exact, but an out-of-range value reads back differently — a script-observable divergence.
+* **`imageLeft`/`imageTop` on a non-drawable layer.** The reference throws `TVPNotDrawableLayerType` before its own no-op guard (`reference/cpp/core/visual/LayerIntf.cpp:2505,2526`); the port writes the field.
 * **Verify no decision-number tags returned** to plugin sources: `grep -rn "//.*\bD[0-9]\+\b" crates/compat/src`.
 * **Dirty rectangles for bitmap uploads** — the renderer can upload a
   sub-rectangle, but nothing above it knows one: `BitmapState` carries a `dirty`
