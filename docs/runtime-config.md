@@ -68,7 +68,7 @@ to read files (only the compatibility layer is barred from `std::fs`).
 
 A file that is named but unreadable is a typed error, and so is an unknown key
 or a bad value; nothing is skipped and nothing is applied until the whole file
-parses. The recognized keys are `frame_rate`, `scaling`, `glyph_backend` and
+parses. The recognized keys are `frame_rate`, `scaling` and
 `preload_archives`, matching the argument names.
 
 ## 2. Implemented options
@@ -77,7 +77,6 @@ parses. The recognized keys are `frame_rate`, `scaling`, `glyph_backend` and
 |---|---|---|---|
 | `--fps N` (`frame_rate`) | frames per second, `1..=1000` | `60` | reference `fps_limit` default `60` (`reference/cpp/core/environ/ui/PreferenceConfig.h:304-309`), applied as the animation interval `1/fps` (`reference/cpp/core/environ/cocos2d/MainScene.cpp:684-685`); the main loop sleeps the remaining interval (`reference/cpp/core/environ/RenderUtils.h`, `TVPDrawSceneOnce`) |
 | `--scaling MODE` (`scaling`) | `game`, `fit`, `fill`, `expand` | `game` (Android launchers default to `fit`) | `game` is the reference Win32 one-to-one presentation; the other three are the existing engine projection modes |
-| `--glyph-backend B` (`glyph_backend`) | `cpu`, `gpu` | `cpu` | which rasterizer produces glyph coverage; `cpu` is the reference-faithful path, `gpu` draws from the GPU glyph atlas instead |
 | `--preload-archives` (`preload_archives`) | `true`, `false` | `false` | read every mounted archive into memory when it mounts; the cost is that archive's size in resident memory, the gain is that entry reads stop touching the backing filesystem |
 
 The frame-rate limit paces both loops: the windowed loop through
@@ -85,11 +84,6 @@ The frame-rate limit paces both loops: the windowed loop through
 `FrameRateLimit::period_ms`. `1000` is the upper bound because that is where
 the period reaches the platform ticker's 1 ms minimum; a higher limit would be
 silently clamped, so it is rejected instead.
-
-The glyph backend is a rendering choice, so it is held to the boundary in
-AGENTS §3 (`D34`): a script observes layout metrics, advances and text extents,
-which are identical under either backend, while the rasterized pixels may
-differ within what still looks the same.
 
 Preloading is a memory-for-filesystem trade and is worth setting when the game
 lives on a slow mount. It is not a special mode: it reads the archive into the

@@ -149,45 +149,6 @@ impl PresentationScaling {
     }
 }
 
-/// Which rasterizer produces glyph coverage.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum GlyphBackend {
-    /// Rasterize on the CPU and upload the finished coverage.
-    #[default]
-    Cpu,
-    /// Rasterize on the GPU.
-    Gpu,
-}
-
-impl GlyphBackend {
-    /// The built-in default (`Cpu`).
-    pub const DEFAULT: Self = Self::Cpu;
-
-    /// Human-readable accepted values for error and help text.
-    pub const RANGE: &str = "one of: cpu, gpu";
-
-    /// Parses a glyph-backend name.
-    ///
-    /// # Errors
-    ///
-    /// [`ConfigError::InvalidValue`] when `value` is not an accepted name.
-    pub fn parse(option: &'static str, value: &str) -> Result<Self, ConfigError> {
-        match value {
-            "cpu" => Ok(Self::Cpu),
-            "gpu" => Ok(Self::Gpu),
-            other => Err(ConfigError::invalid(option, other.to_owned(), Self::RANGE)),
-        }
-    }
-
-    /// The canonical name of this backend.
-    pub const fn as_str(&self) -> &'static str {
-        match self {
-            Self::Cpu => "cpu",
-            Self::Gpu => "gpu",
-        }
-    }
-}
-
 /// The fully resolved runtime configuration a launcher passes to the
 /// emulator.
 ///
@@ -205,9 +166,6 @@ pub struct RuntimeConfig {
     /// [`PresentationScaling::Game`], `Fit`, `Fill` or `Expand`, default
     /// [`PresentationScaling::Game`].
     pub scaling: PresentationScaling,
-    /// Which rasterizer produces glyph coverage, default
-    /// [`GlyphBackend::Cpu`].
-    pub glyph_backend: GlyphBackend,
     /// Whether a mounted archive is read into memory in full at mount, default
     /// `false`. It trades the archive's size in resident memory for removing
     /// the per-entry reads a mounted archive otherwise does, which is the cost
@@ -220,7 +178,6 @@ impl Default for RuntimeConfig {
         Self {
             frame_rate_limit: FrameRateLimit::DEFAULT,
             scaling: PresentationScaling::DEFAULT,
-            glyph_backend: GlyphBackend::DEFAULT,
             preload_archives: false,
         }
     }
@@ -237,14 +194,17 @@ pub struct RuntimeConfigOverrides {
     pub frame_rate_limit: Option<FrameRateLimit>,
     /// A source's presentation scaling, if it holds one.
     pub scaling: Option<PresentationScaling>,
-    /// A source's glyph backend, if it holds one.
-    pub glyph_backend: Option<GlyphBackend>,
     /// A source's archive-preload choice, if it holds one.
     pub preload_archives: Option<bool>,
 }
 
-/// Parses a boolean configuration value.
-fn parse_bool(option: &'static str, value: &str) -> Result<bool, ConfigError> {
+/// Parses a boolean configuration value, accepting `true` and `false`.
+///
+/// # Errors
+///
+/// [`ConfigError::InvalidValue`] when `value` is neither, naming `option` and
+/// the accepted values.
+pub fn parse_bool(option: &'static str, value: &str) -> Result<bool, ConfigError> {
     match value {
         "true" => Ok(true),
         "false" => Ok(false),
@@ -256,14 +216,17 @@ fn parse_bool(option: &'static str, value: &str) -> Result<bool, ConfigError> {
     }
 }
 
+/// The configuration keys [`parse_overrides`] accepts, in the order its
+/// unknown-key diagnostic lists them.
+const ACCEPTED_KEYS: [&str; 3] = ["frame_rate", "scaling", "preload_archives"];
+
 /// Parses `key=value` configuration text into overrides.
 ///
 /// This is the parser a file-backed launcher uses; the text itself is the
 /// launcher's business. Blank lines and lines whose first non-space character
 /// is `#` are ignored. A line without `=` or with an unknown key is an error,
 /// as is a value that fails validation; nothing is silently skipped. The
-/// recognized keys are `frame_rate`, `scaling`, `glyph_backend` and
-/// `preload_archives`.
+/// recognized keys are `frame_rate`, `scaling` and `preload_archives`.
 ///
 /// # Errors
 ///
@@ -288,16 +251,18 @@ pub fn parse_overrides(text: &str) -> Result<RuntimeConfigOverrides, ConfigError
             "scaling" => {
                 overrides.scaling = Some(PresentationScaling::parse("scaling", value)?);
             }
-            "glyph_backend" => {
-                overrides.glyph_backend = Some(GlyphBackend::parse("glyph_backend", value)?);
-            }
             "preload_archives" => {
                 overrides.preload_archives = Some(parse_bool("preload_archives", value)?);
             }
             other => {
+                let keys = ACCEPTED_KEYS
+                    .iter()
+                    .map(|key| format!("'{key}'"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 return Err(ConfigError::Source {
                     message: format!(
-                        "line {}: unknown key '{other}' (expected 'frame_rate' or 'scaling')",
+                        "line {}: unknown key '{other}' (expected one of: {keys})",
                         index + 1
                     ),
                 });
@@ -410,6 +375,20 @@ mod tests {
     fn overrides_reject_unknown_key_and_malformed_line() {
         assert!(parse_overrides("teleport=on").is_err());
         assert!(parse_overrides("frame_rate").is_err());
+    }
+
+    /// The unknown-key diagnostic lists every accepted key, so a key cannot be
+    /// added without the message naming it.
+    #[test]
+    fn the_unknown_key_diagnostic_names_every_accepted_key() {
+        let error = parse_overrides("teleport=on").expect_err("unknown key");
+        let message = error.to_string();
+        for key in ACCEPTED_KEYS {
+            assert!(
+                message.contains(key),
+                "the unknown-key diagnostic omits '{key}': {message}"
+            );
+        }
     }
 
     #[test]

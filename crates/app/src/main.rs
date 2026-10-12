@@ -42,8 +42,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use api::config::{
-    ConfigError, FrameRateLimit, GlyphBackend, PresentationScaling, RuntimeConfig,
-    RuntimeConfigOverrides, parse_overrides,
+    ConfigError, FrameRateLimit, PresentationScaling, RuntimeConfig, RuntimeConfigOverrides,
+    parse_overrides,
 };
 use app::{BackendKind, GameInput, Launch, RunMode};
 
@@ -86,11 +86,6 @@ const OPTIONS: &[OptionDoc] = &[
         flag: "--scaling",
         value: "MODE",
         help: "Presentation scaling (default: game, one of: game, fit, fill, expand).",
-    },
-    OptionDoc {
-        flag: "--glyph-backend",
-        value: "B",
-        help: "Glyph rasterizer (default: cpu, one of: cpu, gpu).",
     },
     OptionDoc {
         flag: "--preload-archives",
@@ -148,8 +143,6 @@ struct Cli {
     frame_rate: Option<FrameRateLimit>,
     /// Presentation scaling from `--scaling`, or `None` when absent.
     scaling: Option<PresentationScaling>,
-    /// Glyph backend from `--glyph-backend`, or `None` when absent.
-    glyph_backend: Option<GlyphBackend>,
     /// Whether `--preload-archives` was given.
     preload_archives: Option<bool>,
     /// Explicit `--archive` list, in mount order (later wins).
@@ -186,7 +179,6 @@ impl Cli {
             backend: BackendKind::Null,
             frame_rate: None,
             scaling: None,
-            glyph_backend: None,
             preload_archives: None,
             archives: Vec::new(),
             base_dir: None,
@@ -222,12 +214,6 @@ impl Cli {
                         .next()
                         .ok_or_else(|| CliError::Usage("--scaling requires a value".to_owned()))?;
                     cli.scaling = Some(PresentationScaling::parse("--scaling", &value)?);
-                }
-                "--glyph-backend" => {
-                    let value = args.next().ok_or_else(|| {
-                        CliError::Usage("--glyph-backend requires a value".to_owned())
-                    })?;
-                    cli.glyph_backend = Some(GlyphBackend::parse("--glyph-backend", &value)?);
                 }
                 "--preload-archives" => cli.preload_archives = Some(true),
                 "--archive" => {
@@ -312,10 +298,6 @@ fn resolve_runtime_config(cli: &Cli, file: RuntimeConfigOverrides) -> RuntimeCon
             .or(file.frame_rate_limit)
             .unwrap_or(defaults.frame_rate_limit),
         scaling: cli.scaling.or(file.scaling).unwrap_or(defaults.scaling),
-        glyph_backend: cli
-            .glyph_backend
-            .or(file.glyph_backend)
-            .unwrap_or(defaults.glyph_backend),
         preload_archives: cli
             .preload_archives
             .or(file.preload_archives)

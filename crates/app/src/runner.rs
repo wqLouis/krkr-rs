@@ -124,8 +124,13 @@ fn run_headless(launch: &Launch, frames: u32) -> Result<RunReport, String> {
     let dt_ms = launch.runtime.frame_rate_limit.period_ms();
 
     if let Some(input) = &launch.game {
-        let mut game = GameHost::open(host, input.archives.clone(), input.base_dir.clone())
-            .map_err(|error| error.to_string())?;
+        let mut game = GameHost::open_with_preload(
+            host,
+            input.archives.clone(),
+            input.base_dir.clone(),
+            launch.runtime.preload_archives,
+        )
+        .map_err(|error| error.to_string())?;
         println!(
             "krkr headless game: backend={} frames={} archives={}",
             game.host().backend().name(),
@@ -212,6 +217,7 @@ fn run_windowed(launch: &Launch) -> Result<(), String> {
             launch.backend,
             map_scaling(launch.runtime.scaling),
             launch.game.clone(),
+            launch.runtime.preload_archives,
         ),
     )
     .map_err(|error| error.to_string())
@@ -230,6 +236,8 @@ struct DesktopApp {
     scaling: ScalingMode,
     /// The game to load, or `None` for the empty scene.
     game: Option<GameInput>,
+    /// Whether every mounted archive is read into memory at mount.
+    preload_archives: bool,
     /// The running host, created once the window handle exists.
     running: Option<Running>,
     /// Input and focus events received since the last frame, delivered to
@@ -301,11 +309,17 @@ impl Running {
 
 impl DesktopApp {
     /// Creates a handler that has not yet received `resumed`.
-    fn new(backend: BackendKind, scaling: ScalingMode, game: Option<GameInput>) -> Self {
+    fn new(
+        backend: BackendKind,
+        scaling: ScalingMode,
+        game: Option<GameInput>,
+        preload_archives: bool,
+    ) -> Self {
         Self {
             backend,
             scaling,
             game,
+            preload_archives,
             running: None,
             pending_events: Vec::new(),
             pending_size: None,
@@ -385,7 +399,12 @@ impl EventHandler for DesktopApp {
             Ok(host) => {
                 let running = match &self.game {
                     Some(input) => {
-                        match GameHost::open(host, input.archives.clone(), input.base_dir.clone()) {
+                        match GameHost::open_with_preload(
+                            host,
+                            input.archives.clone(),
+                            input.base_dir.clone(),
+                            self.preload_archives,
+                        ) {
                             Ok(game) => Running::Game(Box::new(game)),
                             Err(error) => {
                                 eprintln!("krkr: failed to open game: {error}");
