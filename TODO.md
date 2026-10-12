@@ -427,6 +427,25 @@ of synchronous decodes) and `docs/audits/perf-hotspots.md`.
 * Dirty-rectangle bitmap uploads and the per-frame fence wait (§12).
 * Bounded GPU glyph-atlas cells (§12).
 
+### Start-up is not measurable on a device
+
+Before optimising anything, make the cost visible where it happens. Android's
+logger defaults to `info` (`crates/android/src/lib.rs`), and `RUST_LOG` cannot be
+set on a device, so the per-image `debug` lines a desktop run shows never reach
+`krkr.log`. The startup path logs no timing at all: at info level it prints the
+game directory and little else, so "it took a long time to load" cannot be
+attributed to reading, decoding, compiling scripts or the first frame.
+
+Two small pieces, neither of them a micro-optimisation:
+
+* **Aggregate timing at info level**: images loaded, bytes read, decode
+  milliseconds, scripts compiled, first frame presented — one line per phase, so
+  a release APK reports its own start-up cost without debug logging.
+* **A log-level option**: the launcher owns configuration on Android, so the
+  level belongs with the other options rather than in an environment variable
+  that cannot be set on the device. It also needs to be re-readable per launch,
+  since the logger is installed once per process.
+
 ### Decoding on the GPU — checked, and not the lever
 
 Recorded so it is not re-opened without new evidence.
