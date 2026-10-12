@@ -510,6 +510,46 @@ pub struct SoundState {
     global_focus_mode: i32,
 }
 
+impl SoundState {
+    /// Attach a voice to the shared mixer and return its channel id.
+    ///
+    /// The caller owns the source: the channel carries no object id, so it is
+    /// not a `SoundBuffer` script object, and the object lifecycle neither
+    /// knows nor touches it. A movie's own audio takes this path, because the
+    /// reference plays it through the movie player rather than a script
+    /// `SoundBuffer` (`VideoOvlImpl.cpp:882-913`).
+    pub(crate) fn add_foreign_voice(&mut self, source: Arc<SoundSource>) -> u64 {
+        let id = self.mixer.spawn_channel();
+        let channel = self
+            .mixer
+            .channel(id)
+            .expect("spawn_channel returns a live id");
+        channel.play(source);
+        id
+    }
+
+    /// Mutable access to a foreign voice's channel, for its gain, pan and
+    /// transport members.
+    pub(crate) fn foreign_voice_mut(&mut self, id: u64) -> Option<&mut SoundChannel> {
+        self.mixer.channel(id)
+    }
+
+    /// Detach a foreign voice and drop its channel.
+    pub(crate) fn remove_foreign_voice(&mut self, id: u64) {
+        self.mixer.remove_channel(id);
+    }
+
+    /// TVP's `0..=100000` volume scale as the mixer's `0..=1` gain.
+    pub(crate) fn script_volume_to_gain(value: i64) -> f32 {
+        (value as f64 / TVP_VOLUME_SCALE).clamp(0.0, 1.0) as f32
+    }
+
+    /// TVP's `-100000..=100000` pan scale as the mixer's `-1..=1` balance.
+    pub(crate) fn script_pan_to_balance(value: i64) -> f32 {
+        (value as f64 / TVP_VOLUME_SCALE).clamp(-1.0, 1.0) as f32
+    }
+}
+
 /// Payload of one `WaveSoundBuffer` TJS object.
 #[derive(Default)]
 struct SoundInst {
@@ -749,7 +789,7 @@ fn start_fade(
     if fade.count == 0 && fade.blank == 0 {
         // `if(FadeCount == 0 && BlankLeft == 0) StopFade(false, true);` —
         // the fade completes inside `Fade`, jumping straight to the target.
-        channel.set_volume(from_script_volume(to));
+        channel.set_volume(SoundState::script_volume_to_gain(to));
         completions += 1;
     } else {
         object.fade = Some(fade);
@@ -764,7 +804,7 @@ fn stop_fade(object: &mut SoundObject, channel: &mut SoundChannel) -> bool {
     let Some(fade) = object.fade.take() else {
         return false;
     };
-    channel.set_volume(from_script_volume(fade.to));
+    channel.set_volume(SoundState::script_volume_to_gain(fade.to));
     true
 }
 
@@ -793,12 +833,12 @@ fn tick_fade(object: &mut SoundObject, channel: &mut SoundChannel) -> bool {
         } else {
             fade.count -= 1;
             let volume = (to_script_volume(channel.volume()) + fade.delta).clamp(0, 100_000);
-            channel.set_volume(from_script_volume(volume));
+            channel.set_volume(SoundState::script_volume_to_gain(volume));
             false
         }
     };
     if done && let Some(fade) = object.fade.take() {
-        channel.set_volume(from_script_volume(fade.to));
+        channel.set_volume(SoundState::script_volume_to_gain(fade.to));
     }
     done
 }
@@ -880,16 +920,8 @@ fn to_script_volume(value: f32) -> i64 {
     (f64::from(value) * TVP_VOLUME_SCALE).round() as i64
 }
 
-fn from_script_volume(value: i64) -> f32 {
-    (value as f64 / TVP_VOLUME_SCALE).clamp(0.0, 1.0) as f32
-}
-
 fn to_script_pan(value: f32) -> i64 {
     (f64::from(value) * TVP_VOLUME_SCALE).round() as i64
-}
-
-fn from_script_pan(value: i64) -> f32 {
-    (value as f64 / TVP_VOLUME_SCALE).clamp(-1.0, 1.0) as f32
 }
 
 /// Resolve the bound context and the object id for a native callback (the
@@ -2517,15 +2549,21 @@ channel_setter!(sound_looping_set, "looping", value, out_error, |channel| {
 });
 
 channel_setter!(sound_volume_set, "volume", value, out_error, |channel| {
-    channel.set_volume(from_script_volume(value_as_i64(unsafe { &*value })));
+    channel.set_volume(SoundState::script_volume_to_gain(value_as_i64(unsafe {
+        &*value
+    })));
 });
 
 channel_setter!(sound_volume2_set, "volume2", value, out_error, |channel| {
-    channel.set_volume2(from_script_volume(value_as_i64(unsafe { &*value })));
+    channel.set_volume2(SoundState::script_volume_to_gain(value_as_i64(unsafe {
+        &*value
+    })));
 });
 
 channel_setter!(sound_pan_set, "pan", value, out_error, |channel| {
-    channel.set_pan(from_script_pan(value_as_i64(unsafe { &*value })));
+    channel.set_pan(SoundState::script_pan_to_balance(value_as_i64(unsafe {
+        &*value
+    })));
 });
 
 // The setters that also touch `SoundObject` are written out explicitly.
@@ -2738,7 +2776,7 @@ extern "C" fn sound_global_volume_set(
     value: *const Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
-    let volume = from_script_volume(value_as_i64(unsafe { &*value }));
+    let volume = SoundState::script_volume_to_gain(value_as_i64(unsafe { &*value }));
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "WaveSoundBuffer.globalVolume: not bound");
     };
@@ -3207,6 +3245,46 @@ mod tests {
             SoundSource::with_loops(Arc::new(DecodedAudio::new(spec, interleaved)), info)
                 .expect("valid source"),
         )
+    }
+
+    /// A foreign voice plays through the one shared mixer without becoming a
+    /// script object, exposes its channel for the gain and pan a movie's own
+    /// members set, and is dropped on removal.
+    ///
+    /// reference/cpp/core/visual/impl/VideoOvlImpl.cpp:882-913
+    #[test]
+    fn foreign_voice_attaches_sets_gain_and_releases() {
+        let mut state = SoundState::default();
+        assert!(state.objects.is_empty(), "the mixer starts with no objects");
+
+        let id = state.add_foreign_voice(tone(44_100, 2, 0.1, None));
+        assert!(
+            state.objects.is_empty(),
+            "a foreign voice is not a script-visible SoundBuffer object"
+        );
+        assert!(
+            state.foreign_voice_mut(id).is_some_and(|c| c.is_playing()),
+            "attaching starts the voice"
+        );
+
+        // The script scale is 0..=100000; the mixer works in 0..=1 and -1..=1.
+        let channel = state
+            .foreign_voice_mut(id)
+            .expect("the voice has a channel");
+        channel.set_volume(SoundState::script_volume_to_gain(50_000));
+        channel.set_pan(SoundState::script_pan_to_balance(-50_000));
+        let channel = state
+            .foreign_voice_mut(id)
+            .expect("the voice still has a channel");
+        assert_eq!(channel.volume(), 0.5);
+        assert_eq!(channel.pan(), -0.5);
+
+        state.remove_foreign_voice(id);
+        assert!(
+            state.foreign_voice_mut(id).is_none(),
+            "release drops the channel"
+        );
+        assert!(state.objects.is_empty(), "release leaves the objects alone");
     }
 
     /// An in-memory L2 storage populated with the given entries.

@@ -1082,6 +1082,10 @@ mod android {
             .and_then(|track| track.format.i32("channel-count"))
             .unwrap_or(0)
             .max(0) as u16;
+        // This backend opens a single video and a single (optional) audio
+        // track, so the counts are the tracks it actually decodes.
+        let audio_streams = if audio.is_some() { 1 } else { 0 };
+        let audio_stream = if audio.is_some() { 0 } else { -1 };
 
         Ok(VideoSpec {
             width,
@@ -1090,6 +1094,10 @@ mod android {
             total_frames,
             sample_rate,
             channels,
+            audio_streams,
+            video_streams: 1,
+            audio_stream,
+            video_stream: 0,
         })
     }
 

@@ -154,6 +154,16 @@ pub struct VideoSpec {
     pub sample_rate: u32,
     /// Audio channel count (0 when there is no audio track).
     pub channels: u16,
+    /// Number of audio streams in the container.
+    pub audio_streams: u32,
+    /// Number of video streams in the container.
+    pub video_streams: u32,
+    /// Index of the selected audio stream among the container's audio streams,
+    /// or `-1` when none is selected.
+    pub audio_stream: i32,
+    /// Index of the selected video stream among the container's video streams,
+    /// or `-1` when none is selected.
+    pub video_stream: i32,
 }
 
 impl VideoSpec {

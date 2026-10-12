@@ -18,6 +18,7 @@ fn spec(fps: f32, frames: u64) -> VideoSpec {
         total_frames: Some(frames),
         sample_rate: 0,
         channels: 0,
+        ..VideoSpec::default()
     }
 }
 

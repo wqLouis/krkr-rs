@@ -24,10 +24,11 @@
 //! [`CompatHost::set_video_source`](crate::CompatHost::set_video_source) (a
 //! pre-decoded buffer) or through the crate-root [`set_video_source`] (a
 //! decoder-backed source opened per path). `open(path)` asks that source for
-//! the spec and raises a TJS error when the host has none; it never fabricates
-//! metadata. The frame body's [`video_advance`] step advances every open
-//! overlay by its own per-frame `dt` and presents the host frame at the
-//! current position.
+//! the spec and, for the decoded audio track, raises a TJS error when the host
+//! has none; it never fabricates metadata. The frame body's [`video_advance`]
+//! step advances every open overlay by its own per-frame `dt`, presents the
+//! host frame at the current position and syncs the decoded audio's mixer
+//! voice with the overlay's position and transport state.
 //!
 //! # Events
 //!
@@ -43,9 +44,12 @@
 
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
+use std::sync::Arc;
 
-use api::media::{RgbaFrame, VideoSpec};
+use api::error::MediaError;
+use api::media::{DecodedAudio, RgbaFrame, VideoSpec};
 use engine::Scene;
+use engine::sound::{SoundError, SoundSource};
 use engine::video::{
     PlayStatus, VideoBounds, VideoEvent, VideoOverlay, blit_frame_to_layer_opacity,
 };
@@ -56,6 +60,7 @@ use tjs::{
 };
 
 use crate::native_util::{args, report_error, set_bool, set_int, set_void, value_as_string};
+use crate::natives::sound::{SoundState, TVP_VOLUME_SCALE};
 use crate::natives::system::{resolve, value_as_bool, value_as_i64};
 use crate::{CompatCtx, CompatError, CompatServices};
 
@@ -78,6 +83,36 @@ pub trait VideoSource {
     /// The decoded frame at `at_ms` for `path`, or `None` when the host has no
     /// frame for that position.
     fn frame_at(&mut self, path: &str, at_ms: i64) -> Option<RgbaFrame>;
+
+    /// The decoded audio track for `path`.
+    ///
+    /// `Ok(None)` reports that the stream has no audio track; `Err` is a
+    /// decode failure (surfaced as a TJS error, never silence). The default
+    /// reports no audio, so a source that only serves video compiles
+    /// unchanged.
+    fn audio(&mut self, _path: &str) -> Result<Option<DecodedAudio>, MediaError> {
+        Ok(None)
+    }
+}
+
+/// Ask a host [`VideoSource`] for a movie's decoded audio track.
+///
+/// `audio_streams == 0` means the container has no audio stream, so the host
+/// is not asked at all. `Ok(None)` reports that the stream has no audio track;
+/// `Err` is a real decode failure and is propagated to the caller, never
+/// replaced with silence.
+///
+/// This is the one place both movie natives query the audio seam, so the
+/// "does the container carry audio" decision is not duplicated.
+pub(crate) fn decoded_audio(
+    source: &mut dyn VideoSource,
+    path: &str,
+    audio_streams: u32,
+) -> Result<Option<DecodedAudio>, MediaError> {
+    if audio_streams == 0 {
+        return Ok(None);
+    }
+    source.audio(path)
 }
 
 /// The default host source: a spec plus the pre-decoded frame buffer the host
@@ -147,15 +182,19 @@ struct VideoSlot {
     mixing_layer_alpha: f64,
     /// `mode` (`tTVPVideoOverlayMode`; reference default `vomOverlay`).
     mode: i64,
-    /// Audio balance/volume passthrough (reference `TVPDSAttenuateToPan`).
+    /// Audio balance/volume in the TVP `-100000..=100000` scale, as the
+    /// device stores them (`reference/cpp/core/movie/ffmpeg/KRMoviePlayer.cpp:93-117`).
     audio_balance: i64,
     audio_volume: i64,
-    /// Selected audio/video stream numbers (`-1` when none is selected).
+    /// The decoder's selected audio/video stream index (`-1` for none).
     enabled_audio_stream: i64,
     enabled_video_stream: i64,
-    /// Stream counts from the host spec (`VideoSpec` has no stream count).
+    /// Stream counts from the host [`VideoSpec`].
     number_of_audio_stream: i64,
     number_of_video_stream: i64,
+    /// The decoded movie audio and its shared-mixer voice, once `open` has
+    /// installed it.
+    movie_audio: Option<MovieAudio>,
 }
 
 impl VideoSlot {
@@ -175,6 +214,109 @@ impl VideoSlot {
             enabled_video_stream: 0,
             number_of_audio_stream: 0,
             number_of_video_stream: 0,
+            movie_audio: None,
+        }
+    }
+
+    /// Push this slot's script volume/balance to the mixer voice.
+    fn apply_audio(&self, services: &CompatServices) {
+        if let Some(audio) = &self.movie_audio {
+            audio.apply(
+                services,
+                SoundState::script_volume_to_gain(self.audio_volume),
+                SoundState::script_pan_to_balance(self.audio_balance),
+            );
+        }
+    }
+
+    /// Sync the mixer voice with the overlay's current playback state.
+    fn sync_audio(&self, services: &CompatServices) {
+        if let Some(audio) = &self.movie_audio {
+            audio.sync(
+                services,
+                &self.overlay,
+                SoundState::script_volume_to_gain(self.audio_volume),
+                SoundState::script_pan_to_balance(self.audio_balance),
+            );
+        }
+    }
+
+    /// Drop the mixer voice, if any.
+    fn release_audio(&mut self, services: &CompatServices) {
+        if let Some(audio) = self.movie_audio.take() {
+            audio.detach(services);
+        }
+    }
+}
+
+/// The decoded movie audio and the shared-mixer voice it plays on.
+///
+/// This is the one implementation shared by every native that plays decoded
+/// movie audio. The sound family owns the one [`engine::sound::Mixer`], so the
+/// value registers the decoded track through [`SoundState`] and keeps only the
+/// voice id; the owner composes it and drives [`Self::sync`] from its own
+/// transport. A caller with script volume/pan members passes their normalized
+/// values to [`Self::sync`]; a caller with none passes the device defaults
+/// (unity gain, centre pan), which is what `layerExMovie` uses.
+pub(crate) struct MovieAudio {
+    source: Arc<SoundSource>,
+    channel: u64,
+}
+
+impl MovieAudio {
+    /// Wrap `decoded` in an L2 [`SoundSource`] and register it on the shared
+    /// mixer as a foreign voice (the track is not a script `SoundBuffer`).
+    pub(crate) fn attach(
+        services: &CompatServices,
+        decoded: DecodedAudio,
+    ) -> Result<Self, SoundError> {
+        let source = Arc::new(SoundSource::new(Arc::new(decoded))?);
+        let mut sound = services.state::<SoundState>();
+        let channel = sound.add_foreign_voice(source.clone());
+        Ok(Self { source, channel })
+    }
+
+    /// Remove the mixer voice.
+    pub(crate) fn detach(&self, services: &CompatServices) {
+        services
+            .state::<SoundState>()
+            .remove_foreign_voice(self.channel);
+    }
+
+    /// Push only the volume/pan (no playback-state change).
+    fn apply(&self, services: &CompatServices, volume: f32, pan: f32) {
+        let mut sound = services.state::<SoundState>();
+        if let Some(channel) = sound.foreign_voice_mut(self.channel) {
+            channel.set_volume(volume);
+            channel.set_pan(pan);
+        }
+    }
+
+    /// Push the volume/pan and the overlay's playback state and position.
+    pub(crate) fn sync(
+        &self,
+        services: &CompatServices,
+        overlay: &VideoOverlay,
+        volume: f32,
+        pan: f32,
+    ) {
+        let mut sound = services.state::<SoundState>();
+        let Some(channel) = sound.foreign_voice_mut(self.channel) else {
+            return;
+        };
+        channel.set_volume(volume);
+        channel.set_pan(pan);
+        channel.looping = overlay.looping;
+        if overlay.is_playing() {
+            if channel.is_paused() {
+                channel.resume();
+            }
+            if !channel.is_playing() {
+                channel.play(self.source.clone());
+            }
+            channel.set_position(overlay.position_ms() as f64 / 1000.0);
+        } else {
+            channel.pause();
         }
     }
 }
@@ -366,49 +508,6 @@ macro_rules! with_slot {
     }};
 }
 
-/// Read/write a backend-passthrough integer [`VideoSlot`] field.
-///
-/// With no stream open the reference wrapper's getter reports `$closed` and
-/// its setter is inert; both only reach the backend while a stream is open.
-macro_rules! passthrough_int_prop {
-    ($get:ident, $set:ident, $field:ident, $closed:expr) => {
-        extern "C" fn $get(
-            engine: *mut c_void,
-            instance: *mut c_void,
-            out: *mut Value,
-            out_error: *mut *mut c_char,
-            _objthis: *mut c_void,
-        ) -> c_int {
-            with_slot!(engine, instance, out_error, _ctx, slot, {
-                set_int(
-                    out,
-                    if slot.overlay.is_open() {
-                        slot.$field
-                    } else {
-                        $closed
-                    },
-                );
-                0
-            })
-        }
-        extern "C" fn $set(
-            engine: *mut c_void,
-            instance: *mut c_void,
-            value: *const Value,
-            out_error: *mut *mut c_char,
-            _objthis: *mut c_void,
-        ) -> c_int {
-            with_slot!(engine, instance, out_error, _ctx, slot, {
-                if slot.overlay.is_open() {
-                    // SAFETY: `value` is the valid `Value` the caller holds for this call.
-                    slot.$field = value_as_i64(unsafe { &*value });
-                }
-                0
-            })
-        }
-    };
-}
-
 /// Read/write backend-defined real metadata. The in-tree FFmpeg backend
 /// leaves every colour getter at the wrapper's `-1.0` seed even while a stream
 /// is open, and its setters are inert.
@@ -582,6 +681,75 @@ fn run_command(
     Some((objthis, statuses))
 }
 
+/// Run `command` with the overlay's slot and the service set, reporting any
+/// failure through `out_error`.
+///
+/// Unlike [`run_command`], this does not drain status changes: it is for the
+/// audio/stream setters, whose only script-visible effect is reported by their
+/// getters.
+fn run_slot(
+    engine: *mut c_void,
+    instance: *mut c_void,
+    out_error: *mut *mut c_char,
+    what: &str,
+    command: impl FnOnce(&CompatServices, &mut VideoSlot) -> Result<(), String>,
+) -> Result<(), c_int> {
+    let Ok((_resolved, ctx)) = bound(engine) else {
+        return Err(report_error(
+            out_error,
+            &format!("VideoOverlay.{what}: compat context is not bound"),
+        ));
+    };
+    // SAFETY: `instance` is the live `VideoOverlayInst` payload the VM
+    // allocated for this script object; no `&mut` to it is live here.
+    let inst = unsafe { &*(instance as *const VideoOverlayInst) };
+    let Some(id) = inst.id else {
+        return Err(report_error(
+            out_error,
+            &format!("VideoOverlay.{what}: object is not constructed"),
+        ));
+    };
+    // SAFETY: `ctx` is only created for a bound, live engine, so its service
+    // pointer is valid for this command.
+    let services = unsafe { ctx.services() };
+    let mut state = services.state::<VideoState>();
+    let Some(slot) = state.overlays.get_mut(&id) else {
+        return Err(report_error(
+            out_error,
+            &format!("VideoOverlay.{what}: object state is missing"),
+        ));
+    };
+    command(services, slot).map_err(|message| report_error(out_error, &message))
+}
+
+/// Apply the reference's `SelectAudioStream(index)`.
+///
+/// `index` is the 0-based position among the container's audio streams. An
+/// out-of-range index is ignored: the reference's stream lookup returns the
+/// invalid stream and the caller skips the switch
+/// (`reference/cpp/core/movie/ffmpeg/VideoPlayer.cpp:1346-1356`). This decoder
+/// opens a single audio stream, so a different in-range index is a typed error
+/// rather than a silent lie.
+fn select_audio_stream(slot: &mut VideoSlot, stream: i64) -> Result<(), String> {
+    let count = slot.overlay.spec().map_or(0, |spec| spec.audio_streams);
+    let in_range = u32::try_from(stream).is_ok_and(|index| index < count);
+    if !in_range || slot.enabled_audio_stream == stream {
+        return Ok(());
+    }
+    Err("VideoOverlay.selectAudioStream: this decoder decodes a single audio stream".to_string())
+}
+
+/// Apply the reference's `SelectVideoStream(index)`; see
+/// [`select_audio_stream`].
+fn select_video_stream(slot: &mut VideoSlot, stream: i64) -> Result<(), String> {
+    let count = slot.overlay.spec().map_or(0, |spec| spec.video_streams);
+    let in_range = u32::try_from(stream).is_ok_and(|index| index < count);
+    if !in_range || slot.enabled_video_stream == stream {
+        return Ok(());
+    }
+    Err("VideoOverlay.selectVideoStream: this decoder decodes a single video stream".to_string())
+}
+
 /// Fire `onStatusChanged` for each status change, synchronously.
 fn dispatch_statuses(engine: *mut c_void, objthis: *mut c_void, statuses: &[PlayStatus]) {
     if objthis.is_null() || statuses.is_empty() {
@@ -624,10 +792,14 @@ extern "C" fn video_destroy(engine: *mut c_void, instance: *mut c_void) {
     let inst = unsafe { &*(instance as *const VideoOverlayInst) };
     if let (Some(id), Ok((_resolved, ctx))) = (inst.id, bound(engine)) {
         // Remove the slot while the engine is alive: dropping it releases the
-        // retained `layer1`/`layer2` objects.
+        // retained `layer1`/`layer2` objects, and `release_audio` removes the
+        // movie-audio mixer voice.
         // SAFETY: `ctx` is only created for a bound, live engine, so its service pointer is valid for `video_destroy`.
         let services = unsafe { ctx.services() };
-        services.state::<VideoState>().overlays.remove(&id);
+        let mut state = services.state::<VideoState>();
+        if let Some(mut slot) = state.overlays.remove(&id) {
+            slot.release_audio(services);
+        }
     }
     // SAFETY: instance came from `video_create`'s `Box::into_raw` and is freed
     // exactly once by the VM.
@@ -706,31 +878,82 @@ extern "C" fn vo_open(
     };
     // SAFETY: `ctx` is only created for a bound, live engine, so its service pointer is valid for `vo_open`.
     let services = unsafe { ctx.services() };
-    // Ask the host for the spec without holding the state borrow.
-    let spec = {
-        let state = services.state::<VideoState>();
-        state.source.as_ref().and_then(|source| source.spec(&path))
-    };
-    let Some(spec) = spec else {
-        return report_error(
-            out_error,
-            &format!("VideoOverlay.open: no decoded source for {path:?}"),
-        );
+    // Ask the host for the spec and the decoded audio without holding the
+    // state borrow.
+    let (spec, audio) = {
+        let mut state = services.state::<VideoState>();
+        let Some(source) = state.source.as_mut() else {
+            return report_error(
+                out_error,
+                &format!("VideoOverlay.open: no decoded source for {path:?}"),
+            );
+        };
+        let Some(spec) = source.spec(&path) else {
+            return report_error(
+                out_error,
+                &format!("VideoOverlay.open: no decoded source for {path:?}"),
+            );
+        };
+        let audio = match decoded_audio(source.as_mut(), &path, spec.audio_streams) {
+            Ok(audio) => audio,
+            Err(error) => {
+                return report_error(out_error, &format!("VideoOverlay.open: {error}"));
+            }
+        };
+        (spec, audio)
     };
     let mut state = services.state::<VideoState>();
     let Some(slot) = state.overlays.get_mut(&id) else {
         return report_error(out_error, "VideoOverlay.open: object state is missing");
     };
+    slot.release_audio(services);
     if let Err(error) = slot.overlay.open(spec) {
         return report_error(out_error, &format!("VideoOverlay.open: {error}"));
     }
     slot.path = path;
-    slot.number_of_audio_stream = if spec.has_audio() { 1 } else { 0 };
-    slot.number_of_video_stream = if spec.width > 0 && spec.height > 0 {
-        1
+    slot.number_of_audio_stream = i64::from(spec.audio_streams);
+    slot.number_of_video_stream = i64::from(spec.video_streams);
+    slot.enabled_audio_stream = if spec.audio_streams > 0 {
+        i64::from(spec.audio_stream)
     } else {
-        0
+        -1
     };
+    slot.enabled_video_stream = if spec.video_streams > 0 {
+        i64::from(spec.video_stream)
+    } else {
+        -1
+    };
+    // A freshly created audio device starts at unity volume and centre pan
+    // (`reference/cpp/core/sound/win32/WaveMixer.cpp:124-126`).
+    if spec.audio_streams > 0 {
+        slot.audio_volume = TVP_VOLUME_SCALE as i64;
+        slot.audio_balance = 0;
+    } else {
+        slot.audio_volume = 0;
+        slot.audio_balance = 0;
+    }
+    if let Some(decoded) = audio {
+        match MovieAudio::attach(services, decoded) {
+            Ok(movie_audio) => {
+                slot.movie_audio = Some(movie_audio);
+                slot.sync_audio(services);
+            }
+            Err(error) => {
+                slot.overlay.close();
+                slot.path.clear();
+                slot.number_of_audio_stream = 0;
+                slot.number_of_video_stream = 0;
+                slot.enabled_audio_stream = -1;
+                slot.enabled_video_stream = -1;
+                slot.audio_volume = 0;
+                slot.audio_balance = 0;
+                return report_error(
+                    out_error,
+                    &format!("VideoOverlay.open: cannot play movie audio: {error}"),
+                );
+            }
+        }
+    }
     let objthis = slot.objthis;
     let statuses = slot.overlay.take_status_events();
     drop(state);
@@ -749,11 +972,20 @@ extern "C" fn vo_close(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    let Ok((_resolved, ctx)) = bound(engine) else {
+        return report_error(out_error, "VideoOverlay.close: compat context is not bound");
+    };
+    let services = unsafe { ctx.services() };
     let Some((objthis, statuses)) = run_command(engine, instance, out_error, |slot| {
         slot.overlay.close();
+        slot.release_audio(services);
         slot.path.clear();
         slot.number_of_audio_stream = 0;
         slot.number_of_video_stream = 0;
+        slot.enabled_audio_stream = -1;
+        slot.enabled_video_stream = -1;
+        slot.audio_volume = 0;
+        slot.audio_balance = 0;
         Ok(())
     }) else {
         return 1;
@@ -773,11 +1005,16 @@ extern "C" fn vo_play(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    let Ok((_resolved, ctx)) = bound(engine) else {
+        return report_error(out_error, "VideoOverlay.play: compat context is not bound");
+    };
+    let services = unsafe { ctx.services() };
     let Some((objthis, statuses)) = run_command(engine, instance, out_error, |slot| {
         if slot.overlay.is_open() {
             slot.overlay
                 .play()
                 .map_err(|error| format!("VideoOverlay.play: {error}"))?;
+            slot.sync_audio(services);
         }
         Ok(())
     }) else {
@@ -798,11 +1035,16 @@ extern "C" fn vo_pause(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    let Ok((_resolved, ctx)) = bound(engine) else {
+        return report_error(out_error, "VideoOverlay.pause: compat context is not bound");
+    };
+    let services = unsafe { ctx.services() };
     let Some((objthis, statuses)) = run_command(engine, instance, out_error, |slot| {
         if slot.overlay.is_open() {
             slot.overlay
                 .pause()
                 .map_err(|error| format!("VideoOverlay.pause: {error}"))?;
+            slot.sync_audio(services);
         }
         Ok(())
     }) else {
@@ -823,11 +1065,16 @@ extern "C" fn vo_stop(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    let Ok((_resolved, ctx)) = bound(engine) else {
+        return report_error(out_error, "VideoOverlay.stop: compat context is not bound");
+    };
+    let services = unsafe { ctx.services() };
     let Some((objthis, statuses)) = run_command(engine, instance, out_error, |slot| {
         if slot.overlay.is_open() {
             slot.overlay
                 .stop()
                 .map_err(|error| format!("VideoOverlay.stop: {error}"))?;
+            slot.sync_audio(services);
         }
         Ok(())
     }) else {
@@ -848,8 +1095,16 @@ extern "C" fn vo_rewind(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    let Ok((_resolved, ctx)) = bound(engine) else {
+        return report_error(
+            out_error,
+            "VideoOverlay.rewind: compat context is not bound",
+        );
+    };
+    let services = unsafe { ctx.services() };
     let Some((objthis, statuses)) = run_command(engine, instance, out_error, |slot| {
         slot.overlay.rewind();
+        slot.sync_audio(services);
         Ok(())
     }) else {
         return 1;
@@ -869,11 +1124,19 @@ extern "C" fn vo_prepare(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    let Ok((_resolved, ctx)) = bound(engine) else {
+        return report_error(
+            out_error,
+            "VideoOverlay.prepare: compat context is not bound",
+        );
+    };
+    let services = unsafe { ctx.services() };
     let Some((objthis, statuses)) = run_command(engine, instance, out_error, |slot| {
         if slot.overlay.is_open() && slot.mode == MODE_LAYER {
             slot.overlay
                 .prepare()
                 .map_err(|error| format!("VideoOverlay.prepare: {error}"))?;
+            slot.sync_audio(services);
         }
         Ok(())
     }) else {
@@ -1169,11 +1432,24 @@ extern "C" fn vo_select_audio_stream(
         );
     }
     let stream = value_as_i64(&values[0]);
-    with_slot!(engine, instance, out_error, _ctx, slot, {
-        slot.enabled_audio_stream = stream;
-        set_void(out);
-        0
-    })
+    match run_slot(
+        engine,
+        instance,
+        out_error,
+        "selectAudioStream",
+        |_services, slot| {
+            if slot.overlay.is_open() {
+                select_audio_stream(slot, stream)?;
+            }
+            Ok(())
+        },
+    ) {
+        Ok(()) => {
+            set_void(out);
+            0
+        }
+        Err(code) => code,
+    }
 }
 
 // -- overridable event hooks -------------------------------------------------
@@ -1619,20 +1895,191 @@ extern "C" fn vo_segment_loop_end_get(
 
 // -- audio / video streams --------------------------------------------------
 
-passthrough_int_prop!(vo_audio_balance_get, vo_audio_balance_set, audio_balance, 0);
-passthrough_int_prop!(vo_audio_volume_get, vo_audio_volume_set, audio_volume, 0);
-passthrough_int_prop!(
-    vo_enabled_audio_stream_get,
-    vo_enabled_audio_stream_set,
-    enabled_audio_stream,
-    -1
-);
-passthrough_int_prop!(
-    vo_enabled_video_stream_get,
-    vo_enabled_video_stream_set,
-    enabled_video_stream,
-    -1
-);
+extern "C" fn vo_audio_balance_get(
+    engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    with_slot!(engine, instance, out_error, _ctx, slot, {
+        set_int(
+            out,
+            if slot.overlay.is_open() {
+                slot.audio_balance
+            } else {
+                0
+            },
+        );
+        0
+    })
+}
+
+extern "C" fn vo_audio_balance_set(
+    engine: *mut c_void,
+    instance: *mut c_void,
+    value: *const Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: `value` is the valid `Value` the caller holds for this call.
+    let balance = value_as_i64(unsafe { &*value });
+    match run_slot(
+        engine,
+        instance,
+        out_error,
+        "audioBalance",
+        |services, slot| {
+            if slot.overlay.is_open() {
+                slot.audio_balance = balance;
+                slot.apply_audio(services);
+            }
+            Ok(())
+        },
+    ) {
+        Ok(()) => 0,
+        Err(code) => code,
+    }
+}
+
+extern "C" fn vo_audio_volume_get(
+    engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    with_slot!(engine, instance, out_error, _ctx, slot, {
+        set_int(
+            out,
+            if slot.overlay.is_open() {
+                slot.audio_volume
+            } else {
+                0
+            },
+        );
+        0
+    })
+}
+
+extern "C" fn vo_audio_volume_set(
+    engine: *mut c_void,
+    instance: *mut c_void,
+    value: *const Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: `value` is the valid `Value` the caller holds for this call.
+    let volume = value_as_i64(unsafe { &*value });
+    match run_slot(
+        engine,
+        instance,
+        out_error,
+        "audioVolume",
+        |services, slot| {
+            if slot.overlay.is_open() {
+                slot.audio_volume = volume;
+                slot.apply_audio(services);
+            }
+            Ok(())
+        },
+    ) {
+        Ok(()) => 0,
+        Err(code) => code,
+    }
+}
+
+extern "C" fn vo_enabled_audio_stream_get(
+    engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    with_slot!(engine, instance, out_error, _ctx, slot, {
+        set_int(
+            out,
+            if slot.overlay.is_open() {
+                slot.enabled_audio_stream
+            } else {
+                -1
+            },
+        );
+        0
+    })
+}
+
+extern "C" fn vo_enabled_audio_stream_set(
+    engine: *mut c_void,
+    instance: *mut c_void,
+    value: *const Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: `value` is the valid `Value` the caller holds for this call.
+    let stream = value_as_i64(unsafe { &*value });
+    match run_slot(
+        engine,
+        instance,
+        out_error,
+        "enabledAudioStream",
+        |_services, slot| {
+            if slot.overlay.is_open() {
+                select_audio_stream(slot, stream)?;
+            }
+            Ok(())
+        },
+    ) {
+        Ok(()) => 0,
+        Err(code) => code,
+    }
+}
+
+extern "C" fn vo_enabled_video_stream_get(
+    engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    with_slot!(engine, instance, out_error, _ctx, slot, {
+        set_int(
+            out,
+            if slot.overlay.is_open() {
+                slot.enabled_video_stream
+            } else {
+                -1
+            },
+        );
+        0
+    })
+}
+
+extern "C" fn vo_enabled_video_stream_set(
+    engine: *mut c_void,
+    instance: *mut c_void,
+    value: *const Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: `value` is the valid `Value` the caller holds for this call.
+    let stream = value_as_i64(unsafe { &*value });
+    match run_slot(
+        engine,
+        instance,
+        out_error,
+        "enabledVideoStream",
+        |_services, slot| {
+            if slot.overlay.is_open() {
+                select_video_stream(slot, stream)?;
+            }
+            Ok(())
+        },
+    ) {
+        Ok(()) => 0,
+        Err(code) => code,
+    }
+}
 
 // -- mixing -----------------------------------------------------------------
 
@@ -2022,6 +2469,7 @@ pub fn video_advance(ctx: &CompatCtx, dt_ms: f64) -> Result<(), CompatError> {
             present(&mut source, slot);
             slot.overlay.advance(dt_ms);
             present(&mut source, slot);
+            slot.sync_audio(services);
             composite_overlay(ctx, slot);
             let events = slot.overlay.poll();
             if !events.is_empty() {
@@ -2542,6 +2990,7 @@ mod tests {
                 total_frames: Some(3),
                 sample_rate: 0,
                 channels: 0,
+                ..VideoSpec::default()
             },
             frames: vec![frame(0), frame(100), frame(200)],
         };

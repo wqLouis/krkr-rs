@@ -118,6 +118,24 @@ fn open_input(bytes: &Arc<[u8]>, hint: Option<&str>, name: &str) -> Result<Input
     })
 }
 
+/// Counts the container's streams of `kind`.
+fn count_streams(input: &Input, kind: MediaType) -> u32 {
+    input
+        .streams()
+        .filter(|stream| stream.parameters().medium() == kind)
+        .count() as u32
+}
+
+/// The 0-based position of `index` among the container's `kind` streams, or
+/// `-1` when it is not one of them.
+fn stream_index_of(input: &Input, kind: MediaType, index: usize) -> i32 {
+    input
+        .streams()
+        .filter(|stream| stream.parameters().medium() == kind)
+        .position(|stream| stream.index() == index)
+        .map_or(-1, |position| position as i32)
+}
+
 /// Converts a stream/frame rational pair into a nominal fps.
 fn fps_from(avg: Rational, frame_rate: Option<Rational>) -> f32 {
     for rate in [Some(avg), frame_rate].into_iter().flatten() {
@@ -155,6 +173,9 @@ pub fn open(
         )
     };
 
+    let video_streams = count_streams(&input, MediaType::Video);
+    let video_stream = stream_index_of(&input, MediaType::Video, video_stream_index);
+
     let parameters = input
         .stream(video_stream_index)
         .map(|stream| stream.parameters())
@@ -187,6 +208,9 @@ pub fn open(
         .streams()
         .best(MediaType::Audio)
         .map(|stream| stream.index());
+    let audio_streams = count_streams(&input, MediaType::Audio);
+    let audio_stream =
+        audio_stream_index.map_or(-1, |index| stream_index_of(&input, MediaType::Audio, index));
     let audio = match audio_stream_index {
         Some(index) => Some(decode_audio_track(&mut input, index, &name)?),
         None => None,
@@ -222,6 +246,10 @@ pub fn open(
         total_frames,
         sample_rate,
         channels,
+        audio_streams,
+        video_streams,
+        audio_stream,
+        video_stream,
     };
 
     let state = VideoDecoderState {
@@ -278,12 +306,22 @@ fn decode_audio_track(
                 if resampler.is_none() {
                     let layout = audio_layout(&frame);
                     let rate = frame.rate();
+                    // The reference's movie audio buffer converts to the
+                    // mixer's stereo layout
+                    // (`reference/cpp/core/movie/ffmpeg/AEFactory.cpp:150-175`);
+                    // the L2 mixer renders mono/stereo only, so a
+                    // multi-channel track is downmixed here.
+                    let out_layout = if layout.channels() > 2 {
+                        ChannelLayout::STEREO
+                    } else {
+                        layout
+                    };
                     let converter = resampling::Context::get(
                         frame.format(),
                         layout,
                         rate,
                         Sample::F32(sample::Type::Packed),
-                        layout,
+                        out_layout,
                         rate,
                     )
                     .map_err(|error| MediaError::Decode {
@@ -291,7 +329,7 @@ fn decode_audio_track(
                         message: format!("{name}: audio resampler: {error}"),
                     })?;
                     spec.sample_rate = rate;
-                    spec.channels = u16::try_from(layout.channels().max(0)).unwrap_or(0);
+                    spec.channels = u16::try_from(out_layout.channels().max(0)).unwrap_or(0);
                     resampler = Some(converter);
                 }
 

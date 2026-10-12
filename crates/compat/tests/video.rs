@@ -9,7 +9,8 @@
 
 mod common;
 
-use api::media::{RgbaFrame, VideoSpec};
+use api::error::MediaError;
+use api::media::{AudioSpec, DecodedAudio, RgbaFrame, VideoSpec};
 use common::vm_lock;
 use compat::CompatHost;
 use engine::Scene;
@@ -128,7 +129,7 @@ fn solid_frame(color: [u8; 4]) -> RgbaFrame {
     RgbaFrame::new(4, 4, 0, rgba)
 }
 
-/// A 4x4 @ 10 fps, 10-frame stream.
+/// A 4x4 @ 10 fps, 10-frame video-only stream.
 fn movie_spec() -> VideoSpec {
     VideoSpec {
         width: 4,
@@ -137,6 +138,10 @@ fn movie_spec() -> VideoSpec {
         total_frames: Some(10),
         sample_rate: 0,
         channels: 0,
+        audio_streams: 0,
+        video_streams: 1,
+        audio_stream: -1,
+        video_stream: 0,
     }
 }
 
@@ -148,6 +153,10 @@ fn default_spec() -> VideoSpec {
         total_frames: Some(300),
         sample_rate: 48_000,
         channels: 2,
+        audio_streams: 1,
+        video_streams: 1,
+        audio_stream: 0,
+        video_stream: 0,
     }
 }
 
@@ -450,12 +459,16 @@ fn segment_loop_on_a_closed_overlay_is_stored() {
 
 /// Backend-passthrough members: with no stream open their getters report the
 /// reference's "no backend" sentinels and their setters are inert; once a
-/// stream is open they round-trip.
+/// stream is open the volume/balance round-trip and the stream selectors
+/// follow the decoder's single stream.
 ///
 /// Reference: `GetAudioBalance`/`GetAudioVolume` seed the local with `0`,
 /// `GetEnableAudioStreamNum`/`GetEnableVideoStreamNum` seed it with `-1`, and
 /// every setter is guarded by `if(VideoOverlay)`
-/// (`reference/cpp/core/visual/impl/VideoOvlImpl.cpp:814-880`). The mixing
+/// (`reference/cpp/core/visual/impl/VideoOvlImpl.cpp:814-880`). A selection
+/// index outside the stream count is ignored: the reference's stream lookup
+/// returns the invalid stream and the caller skips the switch
+/// (`reference/cpp/core/movie/ffmpeg/VideoPlayer.cpp:1346-1356`). The mixing
 /// movie alpha/background are stubbed by the FFmpeg backend to `1.0` and
 /// `0xFF000000` while open (`reference/cpp/core/movie/ffmpeg/KRMoviePlayer.h:112-118`).
 #[test]
@@ -493,9 +506,11 @@ fn passthrough_members_follow_the_open_state() {
     assert_eq!(env.eval_int("closed_mmb"), 0);
     assert_eq!(env.eval_int("ab"), 10);
     assert_eq!(env.eval_int("av"), 20);
-    assert_eq!(env.eval_int("eas"), 1);
+    // The single-stream movie keeps its decoder selection (`0`); both an
+    // out-of-range selector and the same-stream write are no-ops.
+    assert_eq!(env.eval_int("eas"), 0);
     assert_eq!(env.eval_int("evs"), 0);
-    assert_eq!(env.eval_int("eas2"), 2);
+    assert_eq!(env.eval_int("eas2"), 0);
     assert!((env.eval_real("mma") - 1.0).abs() < 1e-9);
     assert_eq!(env.eval_int("mmb"), 0xFF00_0000);
 }
@@ -877,4 +892,199 @@ fn mixer_mode_applies_the_layer_opacity() {
     let ctx = env.host.ctx().expect("bound context");
     compat::video_advance(&ctx, 50.0).expect("advance");
     assert_eq!(env.bitmap_color("mixop", 1, 1), [0, 255, 0, 128]);
+}
+
+/// A host-decoded source that also supplies an audio track, so the seam's
+/// `audio` path can be driven without a real movie file.
+struct AudioSource {
+    spec: VideoSpec,
+    frames: Vec<RgbaFrame>,
+    audio: DecodedAudio,
+}
+
+impl compat::VideoSource for AudioSource {
+    fn spec(&self, _path: &str) -> Option<VideoSpec> {
+        Some(self.spec)
+    }
+
+    fn frame_at(&mut self, _path: &str, at_ms: i64) -> Option<RgbaFrame> {
+        let mut chosen = self.frames.first()?.clone();
+        for frame in &self.frames {
+            if frame.pts_ms as i64 <= at_ms {
+                chosen = frame.clone();
+            } else {
+                break;
+            }
+        }
+        Some(chosen)
+    }
+
+    fn audio(&mut self, _path: &str) -> Result<Option<DecodedAudio>, MediaError> {
+        Ok(Some(self.audio.clone()))
+    }
+}
+
+/// The closed overlay reports the reference's zeroed audio state.
+///
+/// Reference: `GetAudioVolume`/`GetAudioBalance` return `0` while no backend
+/// exists and `GetNumberOfAudioStream` returns `0`
+/// (`reference/cpp/core/visual/impl/VideoOvlImpl.cpp:814-841`).
+#[test]
+fn audio_members_are_zeroed_before_open() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var v = new VideoOverlay(new Window()); \
+         var av = v.audioVolume; var ab = v.audioBalance; \
+         var na = v.numberOfAudioStream; var nv = v.numberOfVideoStream; \
+         var ea = v.enabledAudioStream; var ev = v.enabledVideoStream;",
+    );
+    assert_eq!(env.eval_int("av"), 0);
+    assert_eq!(env.eval_int("ab"), 0);
+    assert_eq!(env.eval_int("na"), 0);
+    assert_eq!(env.eval_int("nv"), 0);
+    assert_eq!(env.eval_int("ea"), -1);
+    assert_eq!(env.eval_int("ev"), -1);
+}
+
+/// `open` reports the decoder's real stream counts and selection, and the
+/// decoded audio starts at the device's unity volume and centre pan.
+///
+/// Reference: `GetNumberOfAudioStream`/`GetEnableAudioStreamNum` read
+/// `m_pPlayer->GetAudioStreamCount()`/`GetAudioStream()`
+/// (`reference/cpp/core/movie/ffmpeg/KRMoviePlayer.cpp:119-131`); the sound
+/// buffer's defaults are `_volume = 1` and `_pan = 0`
+/// (`reference/cpp/core/sound/win32/WaveMixer.cpp:124-126`), which the wrapper
+/// scales by `100000` (`reference/cpp/core/visual/impl/VideoOvlImpl.cpp:826-836`).
+#[test]
+fn open_reports_audio_stream_counts_and_default_gain() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    let ctx = env.host.ctx().expect("bound context");
+    compat::set_video_source(
+        &ctx,
+        Box::new(AudioSource {
+            spec: VideoSpec {
+                audio_streams: 2,
+                ..default_spec()
+            },
+            frames: default_frames(),
+            audio: DecodedAudio::new(
+                AudioSpec {
+                    sample_rate: 48_000,
+                    channels: 2,
+                    total_frames: Some(1000),
+                },
+                vec![0.5; 2000],
+            ),
+        }),
+    );
+    env.run("var v = new VideoOverlay(new Window()); v.open('movie.mpg');");
+    assert_eq!(env.eval_int("v.numberOfAudioStream"), 2);
+    assert_eq!(env.eval_int("v.numberOfVideoStream"), 1);
+    assert_eq!(env.eval_int("v.enabledAudioStream"), 0);
+    assert_eq!(env.eval_int("v.enabledVideoStream"), 0);
+    assert_eq!(env.eval_int("v.audioVolume"), 100_000);
+    assert_eq!(env.eval_int("v.audioBalance"), 0);
+}
+
+/// A selection index inside the container's stream count but different from
+/// the decoder's single opened stream is a typed error, not a silent lie; an
+/// out-of-range index is ignored exactly as the reference ignores it.
+///
+/// Reference: `SelectAudioStream` looks the index up with
+/// `m_SelectionStreams.Get` and switches only when the result is a real
+/// stream (`reference/cpp/core/movie/ffmpeg/VideoPlayer.cpp:1346-1356`); this
+/// decoder opens one stream, so a different in-range index cannot be honoured.
+#[test]
+fn selecting_another_audio_stream_raises() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    let ctx = env.host.ctx().expect("bound context");
+    compat::set_video_source(
+        &ctx,
+        Box::new(AudioSource {
+            spec: VideoSpec {
+                audio_streams: 2,
+                ..default_spec()
+            },
+            frames: default_frames(),
+            audio: DecodedAudio::new(
+                AudioSpec {
+                    sample_rate: 48_000,
+                    channels: 2,
+                    total_frames: Some(1000),
+                },
+                vec![0.5; 2000],
+            ),
+        }),
+    );
+    env.run(
+        "var v = new VideoOverlay(new Window()); v.open('movie.mpg'); \
+         v.selectAudioStream(5); var ignored = v.enabledAudioStream; \
+         var thrown = 0; \
+         try { v.selectAudioStream(1); } catch (e) { thrown = 1; } \
+         var still = v.enabledAudioStream;",
+    );
+    assert_eq!(env.eval_int("ignored"), 0);
+    assert_eq!(env.eval_int("thrown"), 1);
+    assert_eq!(env.eval_int("still"), 0);
+}
+
+/// The decoded movie audio is mixed into the shared mixer and honours the TVP
+/// volume/pan scale.
+///
+/// Reference: the movie player passes the script value as
+/// `volume / 100000`/`balance / 100000` to the sound buffer
+/// (`reference/cpp/core/movie/ffmpeg/KRMoviePlayer.cpp:93-117`), whose mixer
+/// gain law silences one side at full pan
+/// (`reference/cpp/core/sound/win32/WaveMixer.cpp:127-137`).
+#[test]
+fn movie_audio_reaches_the_mixer_with_volume_and_pan() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    let ctx = env.host.ctx().expect("bound context");
+    compat::set_video_source(
+        &ctx,
+        Box::new(AudioSource {
+            spec: default_spec(),
+            frames: default_frames(),
+            audio: DecodedAudio::new(
+                AudioSpec {
+                    sample_rate: 48_000,
+                    channels: 2,
+                    total_frames: Some(1000),
+                },
+                vec![0.5; 2000],
+            ),
+        }),
+    );
+    env.run("var v = new VideoOverlay(new Window()); v.open('movie.mpg'); v.play();");
+    compat::video_advance(&ctx, 10.0).expect("advance");
+
+    let out_spec = AudioSpec {
+        sample_rate: 48_000,
+        channels: 2,
+        total_frames: None,
+    };
+    let mut out = vec![0.0f32; 200];
+    compat::sound_render(&ctx, &mut out, out_spec).expect("render");
+    assert!(
+        out.iter().any(|sample| sample.abs() > 0.0),
+        "movie audio is silent"
+    );
+
+    env.run("v.audioBalance = 100000;");
+    let mut panned = vec![0.0f32; 200];
+    compat::sound_render(&ctx, &mut panned, out_spec).expect("render");
+    assert!(
+        panned[0].abs() < 1e-6,
+        "full right pan must silence the left channel"
+    );
+    assert!(panned[1].abs() > 0.0);
+
+    env.run("v.audioVolume = 0;");
+    let mut muted = vec![0.0f32; 200];
+    compat::sound_render(&ctx, &mut muted, out_spec).expect("render");
+    assert!(muted.iter().all(|sample| sample.abs() < 1e-6));
 }

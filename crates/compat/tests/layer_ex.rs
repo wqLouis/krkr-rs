@@ -13,6 +13,8 @@
 
 mod common;
 
+use api::error::MediaError;
+use api::media::{AudioSpec, DecodedAudio, RgbaFrame, VideoSpec};
 use common::vm_lock;
 use compat::CompatHost;
 use engine::Scene;
@@ -643,4 +645,185 @@ fn layer_measures_and_draws_text_with_a_font() {
         }
     }
     assert!(any_ink, "drawString should composite glyphs");
+}
+
+/// A host-decoded movie source with an audio track, so the `Layer.openMovie`
+/// audio path can be driven without a real movie file.
+struct MovieAudioSource {
+    spec: VideoSpec,
+    frames: Vec<RgbaFrame>,
+    audio: DecodedAudio,
+}
+
+impl compat::VideoSource for MovieAudioSource {
+    fn spec(&self, _path: &str) -> Option<VideoSpec> {
+        Some(self.spec)
+    }
+
+    fn frame_at(&mut self, _path: &str, at_ms: i64) -> Option<RgbaFrame> {
+        let mut chosen = self.frames.first()?.clone();
+        for frame in &self.frames {
+            if frame.pts_ms as i64 <= at_ms {
+                chosen = frame.clone();
+            } else {
+                break;
+            }
+        }
+        Some(chosen)
+    }
+
+    fn audio(&mut self, _path: &str) -> Result<Option<DecodedAudio>, MediaError> {
+        Ok(Some(self.audio.clone()))
+    }
+}
+
+/// A 4x4 @ 10 fps, 10-frame movie with one 48 kHz stereo audio stream.
+fn movie_audio_spec() -> VideoSpec {
+    VideoSpec {
+        width: 4,
+        height: 4,
+        fps: 10.0,
+        total_frames: Some(10),
+        sample_rate: 48_000,
+        channels: 2,
+        audio_streams: 1,
+        video_streams: 1,
+        audio_stream: 0,
+        video_stream: 0,
+    }
+}
+
+/// A 4x4 opaque red frame at timestamp 0.
+fn movie_audio_frame() -> RgbaFrame {
+    let mut rgba = Vec::with_capacity(4 * 4 * 4);
+    for _ in 0..(4 * 4) {
+        rgba.extend_from_slice(&[255, 0, 0, 255]);
+    }
+    RgbaFrame::new(4, 4, 0, rgba)
+}
+
+/// A movie opened through `Layer.openMovie` plays its decoded audio on the one
+/// shared mixer at the device defaults, and `stopMovie` releases it.
+///
+/// Reference: the reference `layerExMovie` drives the movie player's own sound
+/// device, whose buffer starts at `_volume = 1` and `_pan = 0`
+/// (`reference/cpp/core/sound/win32/WaveMixer.cpp:126-127`) and which
+/// `layerExMovie` never adjusts (it exposes no volume/pan members,
+/// `reference/cpp/plugins/layerExMovie.cpp:154-227`). The player is parked at
+/// `DVD_PLAYSPEED_PAUSE` on open
+/// (`reference/cpp/core/movie/ffmpeg/VideoPlayer.cpp:309`) and `Play` raises it
+/// to speed 1 (`reference/cpp/core/movie/ffmpeg/VideoPlayer.cpp:201-205`), so
+/// `startMovie` is where the audio starts; `stopMovie` releases the player
+/// through `clearMovie()` (`reference/cpp/plugins/layerExMovie.cpp:214-227`).
+#[test]
+fn movie_audio_reaches_the_mixer_at_the_default_gain() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    let ctx = env._host.ctx().expect("bound context");
+    compat::set_movie_source(
+        &ctx,
+        Box::new(MovieAudioSource {
+            spec: movie_audio_spec(),
+            frames: vec![movie_audio_frame()],
+            audio: DecodedAudio::new(
+                AudioSpec {
+                    sample_rate: 48_000,
+                    channels: 2,
+                    total_frames: Some(1000),
+                },
+                vec![0.5; 2000],
+            ),
+        }),
+    );
+    env.run(
+        "var w = new Window(); var l = new Layer(w, null); l.name = 'movie'; \
+         l.setImageSize(4, 4); l.openMovie('movie.mpg', false);",
+    );
+    // Opening installs the track but the player parks at
+    // `DVD_PLAYSPEED_PAUSE` (`reference/cpp/core/movie/ffmpeg/VideoPlayer.cpp:309`),
+    // so nothing is audible yet.
+    let out_spec = AudioSpec {
+        sample_rate: 48_000,
+        channels: 2,
+        total_frames: None,
+    };
+    let mut parked = vec![0.0f32; 200];
+    compat::sound_render(&ctx, &mut parked, out_spec).expect("render");
+    assert!(
+        parked.iter().all(|sample| sample.abs() < 1e-6),
+        "the movie's audio started before startMovie"
+    );
+
+    // `Play` raises the speed to 1
+    // (`reference/cpp/core/movie/ffmpeg/VideoPlayer.cpp:201-205`), so
+    // `startMovie` is where the audio starts.
+    env.run("l.startMovie(false);");
+    compat::movie_poll(&ctx, 10.0).expect("poll");
+
+    let mut out = vec![0.0f32; 200];
+    compat::sound_render(&ctx, &mut out, out_spec).expect("render");
+    assert!(
+        (out[0] - 0.5).abs() < 1e-3,
+        "the left channel is not at the unity gain: {}",
+        out[0]
+    );
+    assert!(
+        (out[1] - 0.5).abs() < 1e-3,
+        "the right channel is not at the centre pan: {}",
+        out[1]
+    );
+
+    env.run("l.stopMovie();");
+    let mut stopped = vec![0.0f32; 200];
+    compat::sound_render(&ctx, &mut stopped, out_spec).expect("render");
+    assert!(
+        stopped.iter().all(|sample| sample.abs() < 1e-6),
+        "stopMovie left the movie's voice on the mixer"
+    );
+}
+
+/// A decode failure while opening a movie's audio is a typed error, not
+/// silence: the reference `openMovie` returns on a failed stream open
+/// (`reference/cpp/plugins/layerExMovie.cpp:154-166`) and never plays a
+/// substitute.
+#[test]
+fn movie_audio_decode_failure_raises() {
+    struct FailingAudio {
+        spec: VideoSpec,
+        frames: Vec<RgbaFrame>,
+    }
+
+    impl compat::VideoSource for FailingAudio {
+        fn spec(&self, _path: &str) -> Option<VideoSpec> {
+            Some(self.spec)
+        }
+
+        fn frame_at(&mut self, _path: &str, at_ms: i64) -> Option<RgbaFrame> {
+            let _ = at_ms;
+            self.frames.first().cloned()
+        }
+
+        fn audio(&mut self, _path: &str) -> Result<Option<DecodedAudio>, MediaError> {
+            Err(MediaError::Decode {
+                format: "mp3".to_string(),
+                message: "corrupt audio frame".to_string(),
+            })
+        }
+    }
+
+    let _lock = vm_lock();
+    let env = Env::new();
+    let ctx = env._host.ctx().expect("bound context");
+    compat::set_movie_source(
+        &ctx,
+        Box::new(FailingAudio {
+            spec: movie_audio_spec(),
+            frames: vec![movie_audio_frame()],
+        }),
+    );
+    env.run(
+        "var w = new Window(); var l = new Layer(w, null); var caught = 0; \
+         try { l.openMovie('movie.mpg', false); } catch (e) { caught = 1; }",
+    );
+    assert_eq!(env.eval_int("caught"), 1);
 }

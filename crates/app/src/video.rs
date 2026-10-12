@@ -4,8 +4,9 @@
 //! `LayerExMovie` members read decoded streams through the [`compat::VideoSource`]
 //! seam. This module is the composition root that installs the L1-backed
 //! source: it reads each stream's bytes through the L2 [`Storage`], opens them
-//! with [`media::open_video`] and serves frames with [`media::present_video`],
-//! caching one decoder per path.
+//! with [`media::open_video`] and serves frames with [`media::present_video`]
+//! and the decoded audio track with [`media::video_audio`], caching one decoder
+//! per path.
 //!
 //! One source is shared by the `VideoOverlay` seam
 //! ([`compat::set_video_source`]) and the movie seam
@@ -33,10 +34,11 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use api::media::{RgbaFrame, VideoSpec};
+use api::error::MediaError;
+use api::media::{DecodedAudio, RgbaFrame, VideoSpec};
 use compat::{CompatError, CompatHost, VideoSource, set_movie_source, set_video_source};
 use engine::Storage;
-use media::{Media, VideoDecoderState, open_video, present_video};
+use media::{Media, VideoDecoderState, open_video, present_video, video_audio};
 
 /// One opened stream: its spec and its decoder.
 struct OpenStream {
@@ -58,36 +60,36 @@ struct Inner {
 
 impl Inner {
     /// Open `path` if it is not cached, returning the cached stream.
-    fn open(&mut self, path: &str) -> Option<&OpenStream> {
+    ///
+    /// A read or decode failure is a typed error. The video-only seam callers
+    /// log it and report absence; the audio seam propagates it.
+    fn open(&mut self, path: &str) -> Result<&OpenStream, MediaError> {
         if !self.streams.contains_key(path) {
             // SAFETY: `install_video_source` requires the storage to outlive
             // the compat host that owns this source.
             let storage = unsafe { &*self.storage };
-            let bytes = match storage.read(path) {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    log::warn!("video: cannot read {path:?}: {error}");
-                    return None;
-                }
-            };
+            let bytes = storage.read(path).map_err(|error| MediaError::Io {
+                message: format!("video: cannot read {path:?}: {error}"),
+            })?;
             let media = self.media.clone();
-            match open_video(&media, Arc::from(bytes.into_boxed_slice()), Some(path)) {
-                Ok((spec, decoder)) => {
-                    self.streams
-                        .insert(path.to_string(), OpenStream { spec, decoder });
-                }
-                Err(error) => {
-                    log::warn!("video: cannot open {path:?}: {error}");
-                    return None;
-                }
-            }
+            let (spec, decoder) =
+                open_video(&media, Arc::from(bytes.into_boxed_slice()), Some(path))?;
+            self.streams
+                .insert(path.to_string(), OpenStream { spec, decoder });
         }
-        self.streams.get(path)
+        self.streams
+            .get(path)
+            .ok_or_else(|| MediaError::InvalidState {
+                message: format!("video: {path:?} vanished from the decoder cache"),
+            })
     }
 
     /// Decode the frame at `at_ms` for `path`, opening the stream if needed.
     fn frame(&mut self, path: &str, at_ms: i64) -> Option<RgbaFrame> {
-        self.open(path)?;
+        if let Err(error) = self.open(path) {
+            log::warn!("video: {error}");
+            return None;
+        }
         let media = self.media.clone();
         let stream = self.streams.get_mut(path)?;
         let at = at_ms.max(0) as u64;
@@ -98,6 +100,17 @@ impl Inner {
                 None
             }
         }
+    }
+
+    /// The decoded audio track for `path`; `Ok(None)` when the container has
+    /// no audio stream.
+    fn audio(&mut self, path: &str) -> Result<Option<DecodedAudio>, MediaError> {
+        let media = self.media.clone();
+        let stream = self.open(path)?;
+        if stream.spec.audio_streams == 0 {
+            return Ok(None);
+        }
+        video_audio(&media, &stream.decoder).map(Some)
     }
 }
 
@@ -113,11 +126,21 @@ struct MediaVideoSource {
 
 impl VideoSource for MediaVideoSource {
     fn spec(&self, path: &str) -> Option<VideoSpec> {
-        self.inner.borrow_mut().open(path).map(|stream| stream.spec)
+        match self.inner.borrow_mut().open(path) {
+            Ok(stream) => Some(stream.spec),
+            Err(error) => {
+                log::warn!("video: {error}");
+                None
+            }
+        }
     }
 
     fn frame_at(&mut self, path: &str, at_ms: i64) -> Option<RgbaFrame> {
         self.inner.borrow_mut().frame(path, at_ms)
+    }
+
+    fn audio(&mut self, path: &str) -> Result<Option<DecodedAudio>, MediaError> {
+        self.inner.borrow_mut().audio(path)
     }
 }
 

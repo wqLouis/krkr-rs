@@ -24,13 +24,13 @@ use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
 
 use api::blend::BlendMode;
-use api::media::VideoSpec;
 use engine::video::{VideoEvent, VideoOverlay, blit_frame_to_layer};
 use tjs::{DetachedValue, NativeObjThisMethodDef, Tjs2Engine, Value};
 
 use super::{VideoSource, bound, layer_from_objthis, scene_mut};
 use crate::native_util::{args, report_error, set_bool, set_void};
-use crate::{CompatCtx, CompatError};
+use crate::natives::video::{MovieAudio, decoded_audio};
+use crate::{CompatCtx, CompatError, CompatServices};
 
 // ---------------------------------------------------------------------------
 // Per-layer playback state
@@ -53,6 +53,12 @@ struct MovieSlot {
     playing: bool,
     /// The retained `Layer` script object, used to dispatch the callbacks.
     layer_obj: Option<DetachedValue>,
+    /// The decoded movie audio and the shared-mixer voice it plays on. The
+    /// reference plays a movie layer's audio through the player's own sound
+    /// device at the device defaults; `layerExMovie` registers no volume/pan
+    /// members (`reference/cpp/plugins/layerExMovie.cpp:337-341`), so the
+    /// unity gain and centre pan stay untouched.
+    movie_audio: Option<MovieAudio>,
 }
 
 impl MovieSlot {
@@ -66,6 +72,22 @@ impl MovieSlot {
             movie_height: 0,
             playing: false,
             layer_obj: None,
+            movie_audio: None,
+        }
+    }
+
+    /// Sync the mixer voice with the overlay's current playback state at the
+    /// device defaults (unity gain, centre pan).
+    fn sync_audio(&self, services: &CompatServices) {
+        if let Some(audio) = &self.movie_audio {
+            audio.sync(services, &self.overlay, 1.0, 0.0);
+        }
+    }
+
+    /// Drop the mixer voice, if any.
+    fn release_audio(&mut self, services: &CompatServices) {
+        if let Some(audio) = self.movie_audio.take() {
+            audio.detach(services);
         }
     }
 }
@@ -99,19 +121,23 @@ fn value_string(v: &Value) -> String {
 // ---------------------------------------------------------------------------
 
 /// Reference `layerExMovie::openMovie`: open the stream metadata, size the
-/// layer, set its type and enter the stopped state.
+/// layer, set its type, install the decoded audio track on the shared mixer
+/// and enter the stopped state.
 fn open_movie(ctx: &CompatCtx, layer_id: u32, filename: &str, alpha: bool) -> Result<(), String> {
     // SAFETY: the caller holds a live, bound context.
     let services = unsafe { ctx.services() };
-    let spec: VideoSpec = {
+    let (spec, audio) = {
         let mut state = services.state::<LayerExMovieState>();
         let source = state
             .source
             .as_mut()
             .ok_or_else(|| "Layer.openMovie: no movie source installed".to_string())?;
-        source
+        let spec = source
             .spec(filename)
-            .ok_or_else(|| format!("Layer.openMovie: no video metadata for {filename:?}"))?
+            .ok_or_else(|| format!("Layer.openMovie: no video metadata for {filename:?}"))?;
+        let audio = decoded_audio(source.as_mut(), filename, spec.audio_streams)
+            .map_err(|error| format!("Layer.openMovie: {error}"))?;
+        (spec, audio)
     };
 
     let (movie_width, movie_height) = if alpha {
@@ -142,6 +168,7 @@ fn open_movie(ctx: &CompatCtx, layer_id: u32, filename: &str, alpha: bool) -> Re
         .slots
         .entry(layer_id)
         .or_insert_with(|| MovieSlot::new(layer_id));
+    slot.release_audio(services);
     slot.overlay.close();
     slot.overlay
         .open(spec)
@@ -150,6 +177,19 @@ fn open_movie(ctx: &CompatCtx, layer_id: u32, filename: &str, alpha: bool) -> Re
     slot.alpha = alpha;
     slot.movie_width = movie_width as i32;
     slot.movie_height = movie_height as i32;
+    if let Some(decoded) = audio {
+        match MovieAudio::attach(services, decoded) {
+            Ok(movie_audio) => {
+                slot.movie_audio = Some(movie_audio);
+                slot.sync_audio(services);
+            }
+            Err(error) => {
+                slot.overlay.close();
+                slot.path.clear();
+                return Err(format!("Layer.openMovie: cannot play movie audio: {error}"));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -174,6 +214,7 @@ fn start_movie(
             .play()
             .map_err(|error| format!("Layer.startMovie: {error}"))?;
         slot.playing = true;
+        slot.sync_audio(services);
     }
     dispatch_callback(ctx, host, layer_id, "onStartMovie");
     Ok(())
@@ -199,6 +240,7 @@ fn stop_movie(ctx: &CompatCtx, host: &Tjs2Engine, layer_id: u32) -> Result<(), S
         slot.overlay.clear_frame();
         slot.overlay.close();
         slot.playing = false;
+        slot.release_audio(services);
         was
     };
     if was_playing {
@@ -277,8 +319,8 @@ fn copy_frame(ctx: &CompatCtx, slot: &MovieSlot) {
 // ---------------------------------------------------------------------------
 
 /// Advance every playing movie by `dt_ms`, present the frame at the new
-/// position, copy it into the layer and dispatch the `onUpdateMovie` /
-/// `onStopMovie` callbacks.
+/// position, copy it into the layer, sync the movie's audio voice and
+/// dispatch the `onUpdateMovie` / `onStopMovie` callbacks.
 ///
 /// The host calls this once per frame (reference
 /// `layerExMovie::OnContinuousCallback`). It is a free function (like
@@ -303,6 +345,7 @@ pub fn movie_poll(ctx: &CompatCtx, dt_ms: f64) -> Result<(), CompatError> {
             slot.overlay.advance(dt_ms);
             let events = slot.overlay.poll();
             present(&mut source, slot);
+            slot.sync_audio(services);
             copy_frame(ctx, slot);
 
             let mut ended = false;
@@ -324,6 +367,7 @@ pub fn movie_poll(ctx: &CompatCtx, dt_ms: f64) -> Result<(), CompatError> {
                 slot.overlay.clear_frame();
                 slot.overlay.close();
                 slot.playing = false;
+                slot.release_audio(services);
                 dispatch.push((layer_id, "onStopMovie"));
             }
         }
@@ -502,6 +546,7 @@ pub(super) fn layer_method_defs() -> Vec<NativeObjThisMethodDef> {
 mod tests {
     use super::*;
     use crate::CompatHost;
+    use api::media::VideoSpec;
     use engine::Scene;
     use std::sync::MutexGuard;
     use tjs::TjsValue;
@@ -619,6 +664,7 @@ mod tests {
             total_frames: Some(10),
             sample_rate: 0,
             channels: 0,
+            ..VideoSpec::default()
         }
     }
 
