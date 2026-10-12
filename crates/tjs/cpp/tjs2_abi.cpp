@@ -1095,12 +1095,20 @@ public:
     // (reference concrete `Invalidate` bodies): it detaches the object from
     // its owner and releases the resources it holds, breaking the
     // script/native reference cycle so the object can reach refcount 0. The
-    // payload itself stays allocated for the later destructor.
+    // payload itself stays allocated for the later destructor. Direct
+    // dispatch stays enabled while the callback runs — the reference
+    // teardown fires script handlers from inside it (a layer's `Invalidate`
+    // reaches `Part()` -> `BlurTree` -> `FireBlur`/`FireFocus`,
+    // reference/cpp/core/visual/LayerIntf.cpp:515-544) and those handlers
+    // read the object's native properties — and stops only once the
+    // callback returns. The object-level `IsInvalidating` guard in
+    // `tTJSCustomObject::_Finalize` keeps the callback single-shot under
+    // re-entry (tjsObject.cpp:372-386).
     void Invalidate() override {
         if(!invalidated) {
-            invalidated = true; // stop direct dispatch immediately
             if(invalidate && native_ptr)
                 invalidate(engine, native_ptr);
+            invalidated = true; // stop direct dispatch once teardown returned
         }
         inherited::Invalidate();
     }
