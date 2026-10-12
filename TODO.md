@@ -167,6 +167,14 @@ raises because the reference raises.
   re-check the layer under the cursor (`LayerManager.cpp:374-420`); the `Mouse`
   and `Key` native classes are port-only and appear in neither parity map; and
   `PlayStatus` lacks `"ready"` (`VideoOvlIntf.cpp:73,84`).
+* **M9b (P2)** `Window.useMouseKey` is stored and never acted on. While it is on,
+  the reference's `InternalKeyDown` turns `VK_RETURN`/`VK_SPACE`/`VK_ESCAPE`/pad
+  keys into synthetic mouse events (`TVPWindow.cpp:648-707`).
+* **M9c (P2)** `Window.postInputEvent` dispatches to the first window and its
+  focused layer instead of `this` window (the reference's `_form`): correct for
+  single-window titles, wrong for multi-window ones. The other stub residuals
+  (`D3DAdaptor` capture, the `MenuItem.popup` surface, the CDDA constructor
+  argument convention) are in `docs/audits/stub-inventory.md` §Remaining.
 * **§6 input imprecisions** (documented, each needs a decision or a source):
   click/double-click timing (30 frames, double on the second **release** where
   Windows fires it on the second press); `onTouchScaling`/`onTouchRotate`
@@ -282,6 +290,11 @@ Open:
   CPU into the layer bitmap, which is also what `getPixel`/`saveLayerImage` read
   back — that composite is the observable representation (`D34`), so this is not
   a rasterizer swap. Recorded in `docs/optimization.md`.
+* **An L3 render-target surface** — L1 exposes
+  `create_render_target`/`read_render_target`, but neither `engine` nor `compat`
+  plumbs them, so `D3DAdaptor.captureCanvas` cannot copy a rendered texture into
+  its layer and the player's `renderToD3DAdaptor` path is unwired. The same
+  missing readback the GPU text path needs.
 * **Zero-copy image presentation** — a later stage, not a repair: uploads go
   through a host-visible staging buffer with no `dmabuf`/`AHardwareBuffer` path
   anywhere. Expected gain ~0–5% for sprites and ~10–25% for movie playback.

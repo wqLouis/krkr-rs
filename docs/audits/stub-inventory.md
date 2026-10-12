@@ -9,34 +9,65 @@ classifier rejects the false positives. Counts for the 127 candidates:
 
 | classification | count | meaning |
 |---|---|---|
-| REAL STUB | 8 | the reference does real work; the port raises / no-ops / fabricates |
+| REAL STUB | 8 | callbacks where the reference does real work and the port raised / no-opped / fabricated |
 | REFERENCE NO-OP | 28 | the C++ itself does nothing or returns a fixed value — the port already matches |
 | FALSE POSITIVE | 83 | the callback does real work and only tripped a heuristic |
 | ALREADY IMPLEMENTED | 8 | the font/text/image cluster fixed by `resource.rs`/`engine::text` |
 
 The 28 REFERENCE NO-OP rows are **not** bugs: they match the reference (e.g.
-`Storages.truncateFile`, `Font.doUserSelect`, `pad_noop_set`, `TextRender`
-`renderCount`/`keyWait`). No action.
+`Storages.truncateFile`, `pad_noop_set`, `TextRender` `renderCount`/`keyWait`).
+No action.
 
-## REAL STUBS
+## Real stubs
 
-Ordered by impact on a running game.
+Eight callbacks across seven table rows — the `D3DAdaptor` row bundles two
+(`d3d_ctor` and `d3d_capture_canvas`). The classification pass missed one more
+callback of the same kind: `disc_on_status_changed` is the sibling of
+`CDDA.onFadeCompleted` and shares its reference path, so the complete set is
+**nine callbacks**. Two rows had already been fixed before the pass ran, at
+line numbers it read stale (`70f8335`).
 
-| member / fn | site | reference | subsystem | seam |
-|---|---|---|---|---|
-| `Window.postInputEvent` (`window_post_input_event`) | `natives/visual/window.rs:614` | `WindowIntf.cpp:913-930` → `tjTJSNI_Window::PostInputEvent` | input dispatch | wiring onto `event.rs::dispatch` |
-| `MenuItem.popup` (`menu_item_popup`) | `natives/menu_item.rs:735` | `MenuItemImpl.cpp:309-315` → `TVPShowPopMenu` (`InGameMenuForm.cpp:115`) | menu / UI | none (needs a native menu surface) |
-| `D3DAdaptor` ctor + capture (`d3d_ctor`, `d3d_capture_canvas`) | `plugins/motion_player/adaptors.rs:500,586` | `D3DAdaptor.cpp:17-53,63-104` | motion_player / D3D | none (Windows D3D render target) |
-| `SeparateLayerAdaptor` (`separate_owner_interface`) | `plugins/motion_player/adaptors.rs:443` | `SeparateLayerAdaptor.cpp:297-330` | motion_player | none (hidden member; low script impact) |
-| `CDDA.onFadeCompleted` (`disc_on_fade_completed`) | `cdda_midi.rs:647` | `CDDAIntf.cpp:152-164`, `WaveIntf.cpp:1210-1222` | sound / CDDA | none (no disc frame poll) |
-| `System.exeName` (`prop_exe_name`) | `natives/system.rs:1447` | `SystemImpl.cpp:838-847` (`TVPNormalizeStorageName(ExePath())`) | Win32 facts | host app-path accessor (low impact) |
-| `System.versionString` (`prop_version_string`) | `natives/system.rs:1577` | `MsgIntf.cpp:173-177` (4-part version) | Win32/version fact | none (low impact) |
+Status after the implementation pass:
+
+| callback(s) | site | reference | status |
+|---|---|---|---|
+| `Window.postInputEvent` | `natives/visual/window.rs` | `WindowIntf.cpp:913-930` → `tjTJSNI_Window::PostInputEvent` | **implemented** — builds a `TjsEvent` and dispatches through the same adapter a real input event uses. Remaining gaps in §Remaining |
+| `MenuItem.popup` | `natives/menu_item.rs` | `MenuItemImpl.cpp:309-315` → `MenuItemIntf.cpp:285-299` | **arguments implemented** — the three `AsInteger` coercions run before the call, so an object/`null` argument raises a convert error. The menu surface stays with the platform dialog layer |
+| `D3DAdaptor` ctor + capture | `plugins/motion_player/adaptors.rs` | `D3DAdaptor.cpp:17-53,63-104` | **ctor + validation implemented**, plus the payload defaults (`visible=false`, `clear=true`). The pixel copy is open — see §Remaining. The row's "Windows D3D" seam was **wrong**: the class is registered unconditionally and uses `TVPGetRenderManager()->CreateTexture2D`, not raw D3D |
+| `SeparateLayerAdaptor.layerTreeOwnerInterface` | `plugins/motion_player/adaptors.rs` | `SeparateLayerAdaptor.cpp:297-330` | **implemented** — stores the construction-time owner and delegates; `targetLayer=` does not recompute it, as the reference |
+| `CDDA.onFadeCompleted` + `onStatusChanged` | `cdda_midi.rs` | `CDDAIntf.cpp:135-164`, `SoundBufferBaseIntf.cpp:32-45` | **implemented** — stores the action owner and forwards the reference event dictionary. The row's "no disc frame poll" was half true: the event bodies are unguarded and forward even in the disabled build; only the posting timer is absent |
+| `System.exeName` | `natives/system.rs` | `SystemImpl.cpp:838-847` | **already landed** (`70f8335`) — returns the app directory; the pass read a stale line |
+| `System.versionString` | `natives/system.rs` | `MsgIntf.cpp:173-177` | **already landed** (`70f8335`) — the four components are now explicit constants |
 
 ## Port divergences (not stubs)
 
-- `font_do_user_select` (`natives/visual/font.rs:643`): the reference `#if 0`s the
-  call and returns `0` (`LayerIntf.cpp:11931-11956`); the port raises a typed
-  error. Fix: return `0`, set nothing. Script-observable, so it matters (D32).
-- `draw_device_name_get` (`natives/visual/draw_device.rs:243`): registers a `name`
-  member the reference does not have (`BasicDrawDevice.cpp:898-913` only registers
-  `dtNone/dtDrawDib/dtDBGDI/dtDBDD/dtDBD3D`). A Rust-side surface artifact.
+Both fixed:
+
+- `font_do_user_select`: the reference `#if 0`s the host call and writes `0`
+  (`LayerIntf.cpp:11931-11956`); the port raised. It now returns `0`.
+- `draw_device_name_get`: the port registered a `name` member the reference does
+  not have (`BasicDrawDevice.cpp:886-944`). Removed from `BasicDrawDevice` and
+  `PassThroughDrawDevice`.
+
+## Remaining
+
+* **`D3DAdaptor.captureCanvas` pixel copy** (`D3DAdaptor.cpp:82-102`). The port
+  has no L3 render-target surface: L1 exposes
+  `create_render_target`/`read_render_target`
+  (`crates/platform/render/src/render_target.rs`) but neither `engine` nor
+  `compat` plumbs it, and the player's `renderToD3DAdaptor` path is not wired.
+  The valid `captureCanvas(layer)` returns the layer as the reference does, but
+  leaves its pixels unchanged. Copying a zeroed buffer would be a fabricated
+  capture (D32).
+* **`MenuItem.popup` menu surface** — the platform dialog layer's job (§5 of
+  `TODO.md`).
+* **`Window.postInputEvent` target selection** — the dispatch delivers to the
+  first window and its focused layer rather than to `this` window (the
+  reference's `_form`). Correct for single-window titles, wrong for multi-window.
+* **`Window.useMouseKey`** — the reference's `InternalKeyDown` turns
+  `VK_RETURN`/`VK_SPACE`/`VK_ESCAPE`/pad keys into synthetic mouse events while
+  it is on (`TVPWindow.cpp:648-707`); the port stores the flag and never acts.
+* **`CDDASoundBuffer` constructor argument convention** — the reference requires
+  an object first argument (`numparams < 1` → `TJS_E_BADPARAMCOUNT`; non-object
+  throws through `AsObjectClosure`); the port, like its `WaveSoundBuffer`,
+  tolerates zero/non-object arguments as an empty owner.
