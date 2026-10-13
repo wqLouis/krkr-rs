@@ -95,6 +95,26 @@ impl FramePhases {
     }
 }
 
+/// Per-frame wall-clock costs the VM tick records outside the ordered polls.
+#[derive(Clone, Copy, Default)]
+struct TickPhases {
+    /// Event adapter's per-frame setup.
+    input_begin_ms: f64,
+    /// Adapting and dispatching the frame's platform events to script.
+    input_events_ms: f64,
+    /// Event adapter's per-frame commit.
+    input_end_ms: f64,
+    /// The whole `VmHost::tick` call, including the compat context lookup.
+    tick_ms: f64,
+}
+
+impl TickPhases {
+    /// The input segments' combined cost.
+    fn input_ms(&self) -> f64 {
+        self.input_begin_ms + self.input_events_ms + self.input_end_ms
+    }
+}
+
 /// The ordered frame-body polls the game host runs each frame (doc 08 §6).
 #[derive(Default)]
 struct Polls {
@@ -103,6 +123,8 @@ struct Polls {
     dt_ms: f64,
     /// Wall-clock cost of each poll in the current frame.
     phases: FramePhases,
+    /// Wall-clock cost of the VM tick's non-poll segments.
+    tick: TickPhases,
 }
 
 impl FrameBody for Polls {
@@ -178,6 +200,18 @@ impl FrameBody for Polls {
             elapsed,
         );
     }
+
+    fn input_begin_completed(&mut self, elapsed: Duration) {
+        self.tick.input_begin_ms = elapsed.as_secs_f64() * 1000.0;
+    }
+
+    fn input_events_completed(&mut self, elapsed: Duration) {
+        self.tick.input_events_ms = elapsed.as_secs_f64() * 1000.0;
+    }
+
+    fn input_end_completed(&mut self, elapsed: Duration) {
+        self.tick.input_end_ms = elapsed.as_secs_f64() * 1000.0;
+    }
 }
 
 /// The previous frame's measured attribution, kept so a slow gap names the
@@ -191,12 +225,16 @@ impl FrameBody for Polls {
 struct FrameAttribution {
     /// The previous frame's poll-phase costs.
     phases: FramePhases,
+    /// The previous frame's VM-tick costs outside the polls.
+    tick: TickPhases,
     /// The previous frame's host step report.
     report: StepReport,
     /// The previous frame's GPU call costs, when the backend reports them.
     timings: Option<render::FrameTimings>,
     /// The previous frame's audio drain cost.
     audio_ms: f64,
+    /// The previous frame's whole `Host::step` cost.
+    host_ms: f64,
     /// The previous frame's whole wall-clock cost.
     total_ms: f64,
     /// Whether a frame has been attributed yet.
@@ -205,18 +243,23 @@ struct FrameAttribution {
 
 impl FrameAttribution {
     /// Records the frame that just completed.
+    #[allow(clippy::too_many_arguments)]
     fn record(
         &mut self,
         phases: FramePhases,
+        tick: TickPhases,
         report: StepReport,
         timings: Option<render::FrameTimings>,
         audio_ms: f64,
+        host_ms: f64,
         total_ms: f64,
     ) {
         self.phases = phases;
+        self.tick = tick;
         self.report = report;
         self.timings = timings;
         self.audio_ms = audio_ms;
+        self.host_ms = host_ms;
         self.total_ms = total_ms;
         self.valid = true;
     }
@@ -228,23 +271,32 @@ impl FrameAttribution {
     /// the gap spans it. `platform_wait` and `input` are this step's
     /// measurement; `unaccounted` is `gap - previous total - platform wait`,
     /// so a non-zero value is loop overhead or a stall outside both the
-    /// frame and the event poll.
+    /// frame and the event poll. `tick_residual` is the VM tick not covered
+    /// by the input segments and the six polls; `host_residual` is the
+    /// host step not covered by sync/project/render.
     fn slow_frame_line(&self, gap_ms: f64, pacing: FramePacing) -> Option<String> {
         if !self.valid || gap_ms < SLOW_FRAME_MS {
             return None;
         }
         let phases = &self.phases;
+        let tick = &self.tick;
         let report = &self.report;
         let timings = self.timings.unwrap_or_default();
         let unaccounted = gap_ms - self.total_ms - pacing.poll_ms;
+        let tick_residual = tick.tick_ms - tick.input_ms() - phases.body_ms;
+        let host_residual = self.host_ms - report.sync_ms - report.project_ms - report.render_ms;
         Some(format!(
             "frame {} slow: gap={gap_ms:.1} ms since the previous frame; \
              the gap spans the previous frame, so these are its phases: \
              timer={:.1} sound={:.1} video={:.1} async={:.1} continuous={:.1} \
-             project_and_render={:.1} body={:.1}; its host: audio={:.1} \
-             host_sync={:.1} host_project={:.1} host_render={:.1} total={:.1}; \
-             its gpu: acquire={:.1} present={:.1} recreate={:.1} fence_wait={:.1}; \
-             this wait: platform_wait={:.1} input={:.1} unaccounted={unaccounted:.1} ms",
+             project_and_render={:.1} body={:.1}; its vm: tick={:.1} \
+             input_begin={:.1} input_events={:.1} input_end={:.1} \
+             tick_residual={tick_residual:.1}; its host: host_total={:.1} \
+             audio={:.1} host_sync={:.1} sync_upload={:.1} sync_prune={:.1} \
+             host_project={:.1} host_render={:.1} submit={:.1} \
+             host_residual={host_residual:.1} total={:.1}; its gpu: acquire={:.1} \
+             present={:.1} recreate={:.1} fence_wait={:.1}; this wait: \
+             platform_wait={:.1} input={:.1} unaccounted={unaccounted:.1} ms",
             report.frame_index,
             phases.timer_ms,
             phases.sound_ms,
@@ -253,10 +305,18 @@ impl FrameAttribution {
             phases.continuous_handler_ms,
             phases.project_and_render_ms,
             phases.body_ms,
+            tick.tick_ms,
+            tick.input_begin_ms,
+            tick.input_events_ms,
+            tick.input_end_ms,
+            self.host_ms,
             self.audio_ms,
             report.sync_ms,
+            report.upload_ms,
+            report.prune_ms,
             report.project_ms,
             report.render_ms,
+            timings.submit_ms,
             self.total_ms,
             timings.acquire_ms,
             timings.present_ms,
@@ -526,6 +586,7 @@ impl GameHost {
         }
         self.polls.dt_ms = dt;
         self.polls.phases = FramePhases::default();
+        self.polls.tick = TickPhases::default();
         self.now_ms = self.now_ms.saturating_add(dt as u64);
         let frame = FrameCtx {
             now_ms: self.now_ms,
@@ -534,18 +595,24 @@ impl GameHost {
             events,
         };
         let step_started = Instant::now();
+        let vm_started = Instant::now();
         self.vm.tick(frame)?;
+        self.polls.tick.tick_ms = vm_started.elapsed().as_secs_f64() * 1000.0;
         let audio_started = Instant::now();
         self.audio.pump(&self.vm, dt)?;
         let audio_ms = audio_started.elapsed().as_secs_f64() * 1000.0;
+        let host_started = Instant::now();
         let report = self.host.step(dt_ms)?;
+        let host_ms = host_started.elapsed().as_secs_f64() * 1000.0;
         let total_ms = step_started.elapsed().as_secs_f64() * 1000.0;
 
         self.last_frame.record(
             self.polls.phases,
+            self.polls.tick,
             report,
             self.host.last_frame_timings(),
             audio_ms,
+            host_ms,
             total_ms,
         );
 
@@ -816,19 +883,31 @@ mod tests {
                 body_ms,
                 ..FramePhases::default()
             },
+            TickPhases {
+                input_begin_ms: 1.0,
+                input_events_ms: 2.0,
+                input_end_ms: 0.5,
+                tick_ms: body_ms + 3.5 + 4.0,
+            },
             StepReport {
                 frame_index: frame,
+                sync_ms: 0.5,
+                upload_ms: 0.4,
+                prune_ms: 0.1,
+                project_ms: 0.2,
                 render_ms: host_render_ms,
                 ..StepReport::default()
             },
             Some(render::FrameTimings {
                 acquire_ms: 1.5,
                 present_ms: 2.5,
+                submit_ms: 0.7,
                 recreate_ms: 0.0,
                 fence_wait_ms: 0.5,
             }),
             3.0,
-            body_ms + host_render_ms + 3.0,
+            host_render_ms + 1.0,
+            body_ms + 3.5 + 4.0 + host_render_ms + 1.0 + 3.0,
         );
         attribution
     }
@@ -878,15 +957,27 @@ mod tests {
             "line was: {line}"
         );
         assert!(line.contains("body=480.0"), "line was: {line}");
+        assert!(line.contains("tick=487.5"), "line was: {line}");
+        assert!(line.contains("input_begin=1.0"), "line was: {line}");
+        assert!(line.contains("input_events=2.0"), "line was: {line}");
+        assert!(line.contains("input_end=0.5"), "line was: {line}");
+        assert!(line.contains("tick_residual=4.0"), "line was: {line}");
+        assert!(line.contains("host_total=11.0"), "line was: {line}");
         assert!(line.contains("host_render=10.0"), "line was: {line}");
+        assert!(line.contains("host_sync=0.5"), "line was: {line}");
+        assert!(line.contains("sync_upload=0.4"), "line was: {line}");
+        assert!(line.contains("sync_prune=0.1"), "line was: {line}");
+        assert!(line.contains("host_project=0.2"), "line was: {line}");
+        assert!(line.contains("submit=0.7"), "line was: {line}");
+        assert!(line.contains("host_residual=0.3"), "line was: {line}");
         assert!(line.contains("acquire=1.5"), "line was: {line}");
         assert!(line.contains("present=2.5"), "line was: {line}");
         assert!(line.contains("fence_wait=0.5"), "line was: {line}");
         assert!(line.contains("platform_wait=15.0"), "line was: {line}");
         assert!(line.contains("input=4.0"), "line was: {line}");
-        // total was 480 + 10 + 3 = 493, so 520 - 493 - 15 = 12 unaccounted.
-        assert!(line.contains("unaccounted=12.0"), "line was: {line}");
-        assert!(line.contains("total=493.0"), "line was: {line}");
+        // total was 480 + 7.5 + 10 + 1 + 3 = 501.5, so 520 - 501.5 - 15 = 3.5.
+        assert!(line.contains("unaccounted=3.5"), "line was: {line}");
+        assert!(line.contains("total=501.5"), "line was: {line}");
         assert_eq!(timings.present_ms, 2.5);
     }
 
@@ -906,11 +997,16 @@ mod tests {
                 body_ms: 250.0,
                 ..FramePhases::default()
             },
+            TickPhases {
+                tick_ms: 250.0,
+                ..TickPhases::default()
+            },
             StepReport {
                 frame_index: 8,
                 ..StepReport::default()
             },
             None,
+            0.0,
             0.0,
             300.0,
         );

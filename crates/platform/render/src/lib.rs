@@ -142,6 +142,9 @@ pub struct FrameTimings {
     pub acquire_ms: f64,
     /// Milliseconds blocked in `vkQueuePresentKHR`.
     pub present_ms: f64,
+    /// Milliseconds spent recording and submitting the frame's command buffer,
+    /// including the upload wait before the submit.
+    pub submit_ms: f64,
     /// Milliseconds spent recreating the swapchain during the frame.
     pub recreate_ms: f64,
     /// Milliseconds blocked waiting on the frame and per-image fences.

@@ -4,7 +4,7 @@
 
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::ptr;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use compat::{CompatHost, EventAdapter, FrameBody, PluginRegistry, run_frame_body};
 use engine::input::InputState;
@@ -453,14 +453,21 @@ impl VmHost {
         let mut ctx = self.compat.ctx()?;
         // The input state is per-frame: clear it, fold in every raw event,
         // then commit so held/repeat counters advance exactly once (doc 08 §6).
+        // Each segment reports its wall-clock cost through the body hooks.
+        let started = Instant::now();
         self.adapter.begin_input_frame(&mut ctx);
+        frame.body.input_begin_completed(started.elapsed());
+        let started = Instant::now();
         for event in frame.events {
             self.adapter.apply_input_event(&mut ctx, event);
             if let Some(mapped) = self.adapter.map(event) {
                 self.adapter.dispatch(&mut ctx, &mapped)?;
             }
         }
+        frame.body.input_events_completed(started.elapsed());
+        let started = Instant::now();
         self.adapter.end_input_frame(&mut ctx);
+        frame.body.input_end_completed(started.elapsed());
         run_frame_body(frame.body, &mut ctx)?;
         Ok(())
     }

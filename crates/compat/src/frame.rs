@@ -82,6 +82,19 @@ pub trait FrameBody {
     /// Wall-clock duration of
     /// [`project_and_render`](Self::project_and_render).
     fn project_and_render_completed(&mut self, _elapsed: Duration) {}
+
+    /// Wall-clock duration of the event adapter's per-frame setup, reported by
+    /// [`crate::EventAdapter`]'s host (`VmHost::tick`) before the events are
+    /// drained.
+    fn input_begin_completed(&mut self, _elapsed: Duration) {}
+
+    /// Wall-clock duration of adapting and dispatching the frame's platform
+    /// events to script, reported by the VM host after the event loop.
+    fn input_events_completed(&mut self, _elapsed: Duration) {}
+
+    /// Wall-clock duration of the event adapter's per-frame commit, reported
+    /// by the VM host after [`input_events_completed`](Self::input_events_completed).
+    fn input_end_completed(&mut self, _elapsed: Duration) {}
 }
 
 /// Run the frame body in the documented order, stopping at the first error.

@@ -91,6 +91,10 @@ pub struct StepReport {
     pub stats: Option<FrameStats>,
     /// Milliseconds spent syncing dirty bitmaps to textures.
     pub sync_ms: f64,
+    /// Milliseconds of `sync_ms` spent uploading dirty bitmaps.
+    pub upload_ms: f64,
+    /// Milliseconds of `sync_ms` spent dropping textures whose bitmap is gone.
+    pub prune_ms: f64,
     /// Milliseconds spent projecting the scene tree.
     pub project_ms: f64,
     /// Milliseconds spent in the pipeline's render call.
@@ -384,8 +388,12 @@ impl Host {
         self.elapsed_ms += f64::from(dt_ms).max(0.0);
 
         let sync_started = std::time::Instant::now();
+        let upload_started = std::time::Instant::now();
         self.sync_dirty_bitmaps();
+        let upload_ms = upload_started.elapsed().as_secs_f64() * 1000.0;
+        let prune_started = std::time::Instant::now();
         self.prune_stale_textures();
+        let prune_ms = prune_started.elapsed().as_secs_f64() * 1000.0;
         let sync_ms = sync_started.elapsed().as_secs_f64() * 1000.0;
 
         let project_started = std::time::Instant::now();
@@ -407,6 +415,8 @@ impl Host {
             elapsed_ms: self.elapsed_ms,
             stats: self.last_frame(),
             sync_ms,
+            upload_ms,
+            prune_ms,
             project_ms,
             render_ms,
         })

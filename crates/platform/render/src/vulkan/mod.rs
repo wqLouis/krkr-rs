@@ -680,6 +680,7 @@ impl VulkanPipeline {
         let mut fence_wait_ms = 0.0_f64;
         let mut present_ms = 0.0_f64;
         let mut recreate_ms = 0.0_f64;
+        let mut submit_ms = 0.0_f64;
 
         let fence_started = Instant::now();
         // SAFETY: the fence belongs to this frame slot and was created
@@ -708,6 +709,7 @@ impl VulkanPipeline {
                 vstate.last_timings = Some(FrameTimings {
                     acquire_ms,
                     present_ms,
+                    submit_ms,
                     recreate_ms,
                     fence_wait_ms,
                 });
@@ -728,6 +730,7 @@ impl VulkanPipeline {
         // succeeds it is neither waited on nor safe to reuse, so any error in
         // this block must recreate it (see `recreate_acquired_semaphore`).
         let signal_semaphores = [vstate.render_finished[image_index as usize]];
+        let submit_started = Instant::now();
         let record_result: Result<(), RenderError> = (|| {
             if vstate.images_in_flight[image_index as usize] != vk::Fence::null() {
                 let image_fence = vstate.images_in_flight[image_index as usize];
@@ -834,6 +837,7 @@ impl VulkanPipeline {
             vstate.images_in_flight[image_index as usize] = in_flight;
             Ok(())
         })();
+        submit_ms = submit_started.elapsed().as_secs_f64() * 1000.0;
 
         if let Err(error) = record_result {
             recreate_acquired_semaphore(&device, vstate, frame_index);
@@ -873,6 +877,7 @@ impl VulkanPipeline {
             vstate.last_timings = Some(FrameTimings {
                 acquire_ms,
                 present_ms,
+                submit_ms,
                 recreate_ms,
                 fence_wait_ms,
             });
@@ -885,6 +890,7 @@ impl VulkanPipeline {
         vstate.last_timings = Some(FrameTimings {
             acquire_ms,
             present_ms,
+            submit_ms,
             recreate_ms,
             fence_wait_ms,
         });

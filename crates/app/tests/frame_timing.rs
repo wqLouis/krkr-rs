@@ -5,13 +5,14 @@
 //! [`run_frame_body`] with a body whose timer poll sleeps a known amount and
 //! checks that the reported timer cost dominates, that every phase is
 //! reported, and that the wall-clock total that contains all of them is at
-//! least their sum. This is instrumentation coverage, not a reference
-//! behaviour assertion.
+//! least their sum. It then drives a real [`VmHost::tick`] to prove the input
+//! segments report before the ordered polls. This is instrumentation
+//! coverage, not a reference behaviour assertion.
 
 use std::time::{Duration, Instant};
 
 use compat::{CompatCtx, CompatError, FrameBody, run_frame_body};
-use vm::VmHost;
+use vm::{FrameCtx, VmHost};
 
 /// A frame body that records every phase completion and can make the timer
 /// phase deliberately slow.
@@ -54,11 +55,23 @@ impl FrameBody for RecordingBody {
     fn project_and_render_completed(&mut self, elapsed: Duration) {
         self.phases.push(("project_and_render", elapsed));
     }
+
+    fn input_begin_completed(&mut self, elapsed: Duration) {
+        self.phases.push(("input_begin", elapsed));
+    }
+
+    fn input_events_completed(&mut self, elapsed: Duration) {
+        self.phases.push(("input_events", elapsed));
+    }
+
+    fn input_end_completed(&mut self, elapsed: Duration) {
+        self.phases.push(("input_end", elapsed));
+    }
 }
 
 #[test]
 fn slow_phase_dominates_and_the_wall_total_contains_the_sum() {
-    let host = VmHost::with_default().expect("vm host");
+    let mut host = VmHost::with_default().expect("vm host");
     let mut ctx = host.compat().ctx().expect("bound compat context");
     let mut body = RecordingBody {
         slow_timer: true,
@@ -102,5 +115,34 @@ fn slow_phase_dominates_and_the_wall_total_contains_the_sum() {
     assert!(
         total >= Duration::from_millis(25),
         "the wall total must include the deliberate sleep, got {total:?}"
+    );
+
+    // A real tick reports the event-adapter segments before the ordered
+    // polls, so a slow gap can be attributed to input dispatch or to the
+    // frame body.
+    body.phases.clear();
+    body.slow_timer = false;
+    let frame = FrameCtx {
+        now_ms: 16,
+        dt_ms: 16,
+        body: &mut body,
+        events: &[],
+    };
+    host.tick(frame).expect("tick");
+    let tick_names: Vec<&str> = body.phases.iter().map(|(name, _)| *name).collect();
+    assert_eq!(
+        tick_names,
+        vec![
+            "input_begin",
+            "input_events",
+            "input_end",
+            "timer",
+            "sound",
+            "video",
+            "async_trigger",
+            "continuous_handler",
+            "project_and_render",
+        ],
+        "the tick reports the input segments before the ordered polls"
     );
 }
