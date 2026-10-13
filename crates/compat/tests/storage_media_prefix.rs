@@ -102,6 +102,12 @@ impl Env {
             .map_err(|error| error.to_string())
     }
 
+    fn run(&self, script: &str) {
+        self.engine
+            .exec_script(script, "test")
+            .unwrap_or_else(|error| panic!("exec {script:?} failed: {error}"));
+    }
+
     fn eval_ok(&self, expression: &str) -> TjsValue {
         self.eval(expression)
             .unwrap_or_else(|error| panic!("eval {expression:?} failed: {error}"))
@@ -179,5 +185,29 @@ fn missing_file_prefixed_name_reports_the_script_spelling() {
     assert!(
         message.contains(&name),
         "diagnostic dropped the script spelling: {message}"
+    );
+}
+
+/// A write whose name carries the `file:` media prefix lands under the game
+/// directory, not under a literal `file:/…` path.
+///
+/// Reference: `ArrayAdd::save2` opens the target through
+/// `TVPCreateStream(param[0]->AsString(), TJS_BS_WRITE)`
+/// (`reference/cpp/plugins/saveStruct.cpp:228-233`), which normalizes the
+/// `media://domain/path` form before the storage write
+/// (`reference/cpp/core/base/StorageIntf.cpp:240-430`).
+#[test]
+fn save2_strips_the_file_media_prefix() {
+    let _lock = vm_lock();
+    let dir = GameDir::new();
+    let env = Env::new(dir);
+    env.run("var a = ['hello']; a.save2('file:SaveData/out.txt');");
+    let out = env._dir.path().join("SaveData/out.txt");
+    let written =
+        std::fs::read(&out).unwrap_or_else(|error| panic!("save2 did not write {out:?}: {error}"));
+    assert!(!written.is_empty(), "save2 wrote an empty file");
+    assert!(
+        !env._dir.path().join("file:").exists(),
+        "the media prefix leaked into the written path"
     );
 }

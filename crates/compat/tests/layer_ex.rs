@@ -13,6 +13,9 @@
 
 mod common;
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use api::error::MediaError;
 use api::media::{AudioSpec, DecodedAudio, RgbaFrame, VideoSpec};
 use common::vm_lock;
@@ -939,4 +942,59 @@ fn movie_audio_decode_failure_raises() {
          try { l.openMovie('movie.mpg', false); } catch (e) { caught = 1; }",
     );
     assert_eq!(env.eval_int("caught"), 1);
+}
+
+/// Records the storage name each `openMovie` asks its host source for.
+struct PathRecordingSource {
+    spec: VideoSpec,
+    frames: Vec<RgbaFrame>,
+    seen: Rc<RefCell<Vec<String>>>,
+}
+
+impl compat::VideoSource for PathRecordingSource {
+    fn spec(&self, path: &str) -> Option<VideoSpec> {
+        self.seen.borrow_mut().push(path.to_string());
+        Some(self.spec)
+    }
+
+    fn frame_at(&mut self, _path: &str, at_ms: i64) -> Option<RgbaFrame> {
+        let _ = at_ms;
+        self.frames.first().cloned()
+    }
+}
+
+/// `Layer.openMovie` strips the `file:` media prefix before it asks the host
+/// source, and the resolved name is what the frame body reuses.
+///
+/// Reference: `layerExMovie::openMovie` opens the stream through
+/// `TVPCreateStream(filename, TJS_BS_READ)`
+/// (`reference/cpp/plugins/layerExMovie.cpp:159-161`), which normalizes the
+/// media name (`reference/cpp/core/base/StorageIntf.cpp:240-430`), so the
+/// decoded source sees the bare name; the overlay keeps that same name for
+/// `GetVideoBuffer`/`SetVideoBuffer` and the frame body
+/// (`reference/cpp/plugins/layerExMovie.cpp:154-196`).
+#[test]
+fn open_movie_strips_the_file_media_prefix() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    let ctx = env._host.ctx().expect("bound context");
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    compat::set_movie_source(
+        &ctx,
+        Box::new(PathRecordingSource {
+            spec: movie_audio_spec(),
+            frames: vec![movie_audio_frame()],
+            seen: Rc::clone(&seen),
+        }),
+    );
+    env.run(
+        "var w = new Window(); var l = new Layer(w, null); \
+         l.setImageSize(4, 4); l.openMovie('file:movie.mpg', false);",
+    );
+    let seen = seen.borrow();
+    assert_eq!(seen.len(), 1, "the host source was asked more than once");
+    assert_eq!(
+        seen[0], "movie.mpg",
+        "the host source did not see the stripped storage name"
+    );
 }

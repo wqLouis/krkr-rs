@@ -28,6 +28,7 @@ from .checks import (
     native_parity,
     plugin_parity,
     stateless,
+    storage_boundary,
     surface_lock,
 )
 from .common import REPO_ROOT
@@ -39,6 +40,7 @@ CHECKS: dict[str, Callable[[list[str]], int]] = {
     "error-handling": error_handling.run,
     "house-style": house_style.run,
     "layering": layering.run,
+    "storage-boundary": storage_boundary.run,
     "host-facts": host_facts.run,
     "android-target": android_target.run,
     "surface-lock": surface_lock.run,
@@ -54,6 +56,7 @@ GATE_SEQUENCE: list[tuple[str, str, str, list[str]]] = [
     ("error-handling", "check", "error-handling", []),
     ("house-style", "check", "house-style", []),
     ("layering", "check", "layering", []),
+    ("storage-boundary", "check", "storage-boundary", []),
     (
         "cargo clippy",
         "cargo",
@@ -110,6 +113,7 @@ Checks:
   error-handling   silent fallbacks and dropped errors (AGENTS §4)
   house-style      bean accessors, parameter shapes, comments (AGENTS §5/§6)
   layering         layer vocabulary and unsafe placement (AGENTS §2/§5)
+  storage-boundary script storage names that reach L2 or the host unstripped
   host-facts       host seams with no production installer
   android-target   per-target backend-feature resolution
   surface-lock     VM dispatch surface vs the committed baseline

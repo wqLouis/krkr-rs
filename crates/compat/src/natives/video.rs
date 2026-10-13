@@ -62,6 +62,7 @@ use tjs::{
 use crate::native_util::{args, report_error, set_bool, set_int, set_void, value_as_string};
 use crate::natives::sound::{SoundState, TVP_VOLUME_SCALE};
 use crate::natives::system::{resolve, value_as_bool, value_as_i64};
+use crate::storage::strip_file_media;
 use crate::{CompatCtx, CompatError, CompatServices};
 
 // ---------------------------------------------------------------------------
@@ -871,6 +872,11 @@ extern "C" fn vo_open(
         return report_error(out_error, "VideoOverlay.open requires 1 argument");
     };
     let path = value_as_string(path_value);
+    // The reference `tTJSNI_VideoOverlay::Open` opens the storage through
+    // `TVPCreateStream` (`reference/cpp/core/visual/impl/VideoOvlImpl.cpp:132-160`),
+    // which normalizes the media name; the L2 namespace takes the bare name.
+    // The script spelling stays in the diagnostics.
+    let lookup = strip_file_media(&path);
     // SAFETY: `instance` is the live `VideoOverlayInst` payload the VM allocated for this script object; no `&mut` to it is live in `vo_open`.
     let inst = unsafe { &*(instance as *const VideoOverlayInst) };
     let Some(id) = inst.id else {
@@ -888,13 +894,13 @@ extern "C" fn vo_open(
                 &format!("VideoOverlay.open: no decoded source for {path:?}"),
             );
         };
-        let Some(spec) = source.spec(&path) else {
+        let Some(spec) = source.spec(lookup) else {
             return report_error(
                 out_error,
                 &format!("VideoOverlay.open: no decoded source for {path:?}"),
             );
         };
-        let audio = match decoded_audio(source.as_mut(), &path, spec.audio_streams) {
+        let audio = match decoded_audio(source.as_mut(), lookup, spec.audio_streams) {
             Ok(audio) => audio,
             Err(error) => {
                 return report_error(out_error, &format!("VideoOverlay.open: {error}"));
@@ -910,7 +916,7 @@ extern "C" fn vo_open(
     if let Err(error) = slot.overlay.open(spec) {
         return report_error(out_error, &format!("VideoOverlay.open: {error}"));
     }
-    slot.path = path;
+    slot.path = lookup.to_string();
     slot.number_of_audio_stream = i64::from(spec.audio_streams);
     slot.number_of_video_stream = i64::from(spec.video_streams);
     slot.enabled_audio_stream = if spec.audio_streams > 0 {

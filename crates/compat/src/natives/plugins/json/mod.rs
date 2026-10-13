@@ -872,8 +872,12 @@ fn is_drive_path(name: &str) -> bool {
 
 /// Resolve a reference stream name to a filesystem path.
 fn output_path(ctx: &CompatCtx, filename: &str) -> PathBuf {
-    let path = Path::new(filename);
-    if path.is_absolute() || is_drive_path(filename) {
+    // The reference resolves the write target through `TVPGetPlacedPath`
+    // before `TVPSaveText` writes it (`reference/cpp/plugins/json/jsonPlugin.cpp:36-70`),
+    // so the media prefix is L3 syntax; the L2 namespace joins the bare name.
+    let lookup = strip_file_media(filename);
+    let path = Path::new(lookup);
+    if path.is_absolute() || is_drive_path(lookup) {
         return path.to_path_buf();
     }
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.

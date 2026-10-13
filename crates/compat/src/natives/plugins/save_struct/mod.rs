@@ -63,6 +63,7 @@ use tjs::{NativeInstanceMembers, NativeObjThisMethodDef, RetainedValue, TjsValue
 
 use super::super::system::{resolve, set_string_out, value_as_i64};
 use crate::native_util::{args, report_error, set_void, value_as_string};
+use crate::storage::strip_file_media;
 use crate::{CompatCtx, CompatError};
 
 /// Name of the per-engine helper function the serializer is installed under.
@@ -252,8 +253,12 @@ fn is_drive_path(name: &str) -> bool {
 /// reference's data-dir-relative `TVPCreateStream`. With no storage attached
 /// the name is used as given.
 fn output_path(ctx: &CompatCtx, filename: &str) -> PathBuf {
-    let path = Path::new(filename);
-    if path.is_absolute() || is_drive_path(filename) {
+    // The reference resolves the write target through `TVPCreateStream`
+    // (`reference/cpp/plugins/saveStruct.cpp:233,276,336`), so the media
+    // prefix is L3 syntax; the L2 namespace joins the bare name.
+    let lookup = strip_file_media(filename);
+    let path = Path::new(lookup);
+    if path.is_absolute() || is_drive_path(lookup) {
         return path.to_path_buf();
     }
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.

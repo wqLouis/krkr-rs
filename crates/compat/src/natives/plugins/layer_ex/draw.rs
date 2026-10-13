@@ -32,6 +32,7 @@ use super::{
 use crate::CompatCtx;
 use crate::native_util::{args, report_error, set_bool, set_void, value_as_string};
 use crate::natives::system::{value_as_bool, value_as_i64};
+use crate::storage::strip_file_media;
 
 use super::record::{RecordOp, decode_record, encode_record, replay_record};
 
@@ -2131,6 +2132,10 @@ extern "C" fn save_record(
         return report_error(out_error, "Layer.saveRecord requires a filename");
     };
     let filename = value_as_string(value);
+    // The reference writes the metafile through `TVPCreateIStream(filename, ...)`
+    // (`reference/cpp/plugins/layerex_draw/windows/LayerExDraw.cpp:1856-1875`),
+    // so the media prefix is L3 syntax; the host filesystem takes the bare name.
+    let lookup = strip_file_media(&filename);
     let (resolved, ctx) = match bound(engine) {
         Ok(value) => value,
         Err(error) => return report_error(out_error, &error),
@@ -2150,7 +2155,7 @@ extern "C" fn save_record(
         return 0;
     };
     let file_system = fs::FileSystem::host("");
-    match fs::write(&file_system, &FsPath::host(&filename), &encode_record(&ops)) {
+    match fs::write(&file_system, &FsPath::host(lookup), &encode_record(&ops)) {
         Ok(()) => set_bool(out, true),
         Err(error) => {
             return report_error(out_error, &format!("Layer.saveRecord: {error}"));
@@ -2173,6 +2178,10 @@ extern "C" fn load_record(
         return report_error(out_error, "Layer.loadRecord requires a filename");
     };
     let filename = value_as_string(value);
+    // The reference reads the metafile through `loadImage(filename)`
+    // (`reference/cpp/plugins/layerex_draw/windows/LayerExDraw.cpp:1890-1897`),
+    // so the media prefix is L3 syntax; the host filesystem takes the bare name.
+    let lookup = strip_file_media(&filename);
     let (resolved, ctx) = match bound(engine) {
         Ok(value) => value,
         Err(error) => return report_error(out_error, &error),
@@ -2181,7 +2190,7 @@ extern "C" fn load_record(
         return report_error(out_error, "Layer.loadRecord: the receiver is not a Layer");
     };
     let file_system = fs::FileSystem::host("");
-    let bytes = match fs::read(&file_system, &FsPath::host(&filename)) {
+    let bytes = match fs::read(&file_system, &FsPath::host(lookup)) {
         Ok(bytes) => bytes,
         Err(error) => return report_error(out_error, &format!("Layer.loadRecord: {error}")),
     };

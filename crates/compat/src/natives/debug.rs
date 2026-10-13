@@ -53,6 +53,7 @@ use tjs::{
 use super::system::{get_command_line, resolve, set_string_out, try_value_as_i64, value_as_bool};
 use crate::native_util::{args, report_error, set_bool, set_void, value_as_string};
 use crate::natives::storages::normalize_storage_name;
+use crate::storage::strip_file_media;
 use crate::{CompatCtx, CompatError, CompatServices};
 
 /// The reference `TVPLogMaxLines` (`utils/DebugIntf.cpp:43`).
@@ -217,7 +218,7 @@ fn open_log_file(state: &mut DebugState, truncate: bool) {
         state.log_open_failed = true;
         return;
     }
-    let mut native = state.log_location.clone();
+    let mut native = strip_file_media(&state.log_location).to_string();
     if !native.ends_with('/') {
         native.push('/');
     }

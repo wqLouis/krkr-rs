@@ -30,6 +30,7 @@ use tjs::{DetachedValue, NativeObjThisMethodDef, Tjs2Engine, Value};
 use super::{VideoSource, bound, layer_from_objthis, scene_mut};
 use crate::native_util::{args, report_error, set_bool, set_void};
 use crate::natives::video::{MovieAudio, decoded_audio};
+use crate::storage::strip_file_media;
 use crate::{CompatCtx, CompatError, CompatServices};
 
 // ---------------------------------------------------------------------------
@@ -126,6 +127,11 @@ fn value_string(v: &Value) -> String {
 fn open_movie(ctx: &CompatCtx, layer_id: u32, filename: &str, alpha: bool) -> Result<(), String> {
     // SAFETY: the caller holds a live, bound context.
     let services = unsafe { ctx.services() };
+    // The reference opens the movie through `TVPCreateStream(filename, ...)`
+    // (`reference/cpp/plugins/layerExMovie.cpp:160`), which normalizes the
+    // media name before the storage lookup; the L2 namespace takes the bare
+    // name. The script spelling stays in the diagnostics.
+    let lookup = strip_file_media(filename);
     let (spec, audio) = {
         let mut state = services.state::<LayerExMovieState>();
         let source = state
@@ -133,9 +139,9 @@ fn open_movie(ctx: &CompatCtx, layer_id: u32, filename: &str, alpha: bool) -> Re
             .as_mut()
             .ok_or_else(|| "Layer.openMovie: no movie source installed".to_string())?;
         let spec = source
-            .spec(filename)
+            .spec(lookup)
             .ok_or_else(|| format!("Layer.openMovie: no video metadata for {filename:?}"))?;
-        let audio = decoded_audio(source.as_mut(), filename, spec.audio_streams)
+        let audio = decoded_audio(source.as_mut(), lookup, spec.audio_streams)
             .map_err(|error| format!("Layer.openMovie: {error}"))?;
         (spec, audio)
     };
@@ -173,7 +179,7 @@ fn open_movie(ctx: &CompatCtx, layer_id: u32, filename: &str, alpha: bool) -> Re
     slot.overlay
         .open(spec)
         .map_err(|error| format!("Layer.openMovie: {error}"))?;
-    slot.path = filename.to_string();
+    slot.path = lookup.to_string();
     slot.alpha = alpha;
     slot.movie_width = movie_width as i32;
     slot.movie_height = movie_height as i32;

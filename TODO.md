@@ -805,9 +805,9 @@ yet.
   it. `docs/migration/06-file-system.md` contradicted D2/D6/`02 §2.3` by
   handing TVP storage naming to L2; `docs/audits/storage-layering.md` records
   the target split (L2 = a TVP-free mount/read VFS, L3 = the name grammar and
-  resolution), with the first slice staged. `scripts/check-layering.sh` gained
-  an `l2-storage-name` rule so a `file:` literal in `crates/engine/**` fails
-  the gate.
+  resolution), with the first slice staged. The `layering` check gained an
+  `l2-storage-name` rule so a `file:` literal in `crates/engine/**` fails the
+  gate.
 * **Live directory listings.** `Storage` no longer caches directory listings;
   the case-insensitive walk and `local_name` enumerate on every call, matching
   the reference's live `opendir`. The auto-path candidate table and the
@@ -818,8 +818,31 @@ yet.
   setters; `font` lost its setter (the reference denies it,
   `LayerIntf.cpp:11339-11350`). The `imageWidth` omission was the real-game
   `system/MessageLayer.tjs:830` startup failure.
-* **The accessor parity gate.** `scripts/native_parity.py` now extracts the
+* **The accessor parity gate.** The `native-parity` check now extracts the
   reference getter/setter per `TJS_BEGIN_NATIVE_PROP_DECL` and the Rust
   `NativeInstancePropertyDef { get, set }`, and fails on any mismatch in either
-  direction (`scripts/native_parity_props_allow.txt` ratchet + fixtures). This
-  is the blind spot that let the `imageWidth` bug through.
+  direction (`scripts/allowlists/native_parity_props_allow.txt` ratchet +
+  fixtures). This is the blind spot that let the `imageWidth` bug through.
+
+### 19.5 The third round (this branch)
+
+* **Host facts are wired.** `System.desktopLeft/Top/Width/Height` install a
+  desktop-rectangle fact from the surface size (`tTVPScreen::GetDesktop*`,
+  `SystemImpl.cpp:897-935`); `System.appDataPath` is computed, not a host fact
+  (`TVPGetAppDataPath` returns `TVPGetAppPath`, `SystemImpl.cpp:366-380`); the
+  reference's inert clipboard is installed (`ClipboardImpl.cpp:5-19`).
+* **One storage media boundary.** `crate::storage::strip_file_media` is the
+  single home for the `file://.`/`file://`/`file:` prefix; every script-name
+  loader, the video seam, the write-side joins, `saveRecord`/`loadRecord` and
+  the log location route through it. A `file://.`-prefixed lowercased
+  `System.dataPath` now resolves case-insensitively (the `test` game's
+  `saveMng.dat`).
+* **The gate is one uv project.** `uv run --project scripts krkr-gate gate`
+  runs the whole sequence; each check is also a subcommand (`stateless`,
+  `error-handling`, `house-style`, `layering`, `storage-boundary`,
+  `host-facts`, `android-target`, `surface-lock`, `native-parity`,
+  `plugin-parity`, `extract-xp3`).
+* **New class-level checks.** `host-facts` fails a `CompatHost` provider seam
+  with no production installer; `storage-boundary` fails a script-supplied
+  name that reaches L2 or a host seam without `strip_file_media` in
+  `crates/compat/src/**`.

@@ -1,0 +1,8 @@
+# Storage-boundary allowlist: script names that reach L2 or the host
+# without a direct strip_file_media route, reviewed as safe.
+# One entry per line: <file> :: <function> :: <call> -- reason
+# Regenerate after review with:
+#   uv run --project scripts krkr-gate storage-boundary --update-allow
+# The checker fails when an unstripped call is not listed here.
+
+crates/compat/src/natives/video.rs :: decoded_audio :: source.audio(path) -- the shared seam helper forwards its caller's already-resolved path to VideoSource::audio; both callers (VideoOverlay.open and Layer.openMovie) strip through crate::storage::strip_file_media, and every decoded_audio call site is checked by the second-argument rule
