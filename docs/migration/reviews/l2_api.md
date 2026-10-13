@@ -13,9 +13,29 @@ Audit of the `engine` (L2) public surface against
   and the composition root `crates/app/src/**` (L5-ish, included because it is
   a real caller of the frozen seam).
 
+> **Resolution status (current tree).** This audit predates several decisions
+> and cleanups; its counts and `crates/.../visual.rs` line references are the
+> audit-time snapshot. Since then:
+> * **D27** replaced `TimerConfig`/`TimerMode`/`TimerFire` with
+>   `TimerState::{create_interval, set_interval, set_enabled, remove}`;
+>   `TimerState::advance` remains public only until D26 (Phase 9). F-11 (timer
+>   half) and F-16 are therefore moot.
+> * **D33** supersedes §1/§2.1: `engine` may name the L1 *type* crates
+>   (`api`, `fs`, `render`). The `text`/`storage`/`projection` L1 coupling
+>   (F-01/F-02/F-14) is accepted, not a violation, and the `cargo public-api`
+>   snapshot (§4) is dropped in favour of review.
+> * `#[non_exhaustive]` is now present on 60+ `engine` items (F-03/F-04/F-05
+>   mostly done); the crate-root re-export is curated and the 29 `LT_*`
+>   constants are `pub(crate)`, not public (F-07/F-09 done).
+> * `BitmapCache`/`CachedImage` and the projection helpers are no longer
+>   public (F-08 done).
+> * The remaining live items are the raw `usize` pixel-buffer surface (F-06,
+>   the D37 review backstop), field privacy (F-17a/F-17b) and the naming
+>   passes (F-18/S-0…S-5).
+
 ---
 
-## 0. Executive summary
+## 0. Executive summary (audit-time snapshot)
 
 | Metric | Value |
 |---|---|

@@ -1,9 +1,11 @@
 # Startup attribution
 
-Startup on a real device is dominated by the entry scripts, not by mounting
-or decoding: a measured 692 MB mount took 39 ms and 36 images decoded in
-170 ms, while the single `startup.tjs` execution took 20.8 s. Two pieces of
-instrumentation make that time attributable.
+Startup on a real device is dominated by the entry scripts' asset I/O, not by
+mounting or VM execution: one device run mounted 692 MB in 39 ms and decoded
+36 images in 170 ms, while the `startup.tjs` entry script's wall-clock time was
+20.8 s. The per-script and per-native lines below attribute that wall-clock
+time; the VM-only cost of parsing and compiling the real `.tjs` corpus is much
+smaller (`docs/performance.md` §5).
 
 ## Per-script timing
 
@@ -38,15 +40,17 @@ the per-script lines give the exclusive cost.
 
 ## Coverage and extension
 
-Only the `Scripts` family is instrumented today. Every other native adds one
-line at the top of its callback:
+The `Scripts` family (`execStorage`/`evalStorage`/`exec`/`eval`/
+`compileStorage`) and `Font.mapPrerenderedFont` are instrumented today. Every
+other native adds one line at the top of its callback:
 
 ```rust
 let _timing = crate::natives::NativeTimer::start(services, "Font.mapPrerenderedFont");
 ```
 
 The native needs `services: &CompatServices`; a native that resolves the
-binding through `bound(engine)` already has it.
+binding through `bound(engine)` already has it. The guard times the whole
+callback, so every return path is counted.
 
 ## Cost
 

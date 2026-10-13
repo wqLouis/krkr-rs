@@ -1,6 +1,6 @@
 # 02 — Target architecture
 
-Status: design, **revised** for the final layering (see §1.1). This document
+Status: design + implemented, **revised** for the final layering (see §1.1). This document
 defines the layer boundaries, the crate layout, the dependency rules and
 where each responsibility lands. The stateless-object contract between L1
 and L2 is in [`03-middle-layer-api.md`](03-middle-layer-api.md); the TJS/VM
@@ -85,8 +85,9 @@ L1  →  OS / Vulkan / FFmpeg / MediaCodec only
   `Media`, `FileSystem`, `FontSystem`, `AudioDevice`, `Platform` are
   stateless services; every evolving value (`RenderState`, `FileState`,
   `DecoderState`, `SurfaceState`) is defined by L1 and stored by L2.
-* **All platform code.** Windowing/surface (winit on Linux,
-  `android-activity`/NDK on Android), the event loop, input, clock, threads,
+* **All platform code.** Windowing/surface (winit on Linux, the `ndk` window on
+  Android; the `android-activity` GameActivity glue lives in the Android
+  composition root, `crates/android`), the event loop, input, clock, threads,
   process lifecycle, JNI, SAF/AssetManager. Higher layers must not contain
   `#[cfg(target_os)]`.
 * **The render pipeline.** Traversal, composition, batching, blend-state
@@ -244,7 +245,7 @@ what is compiled:
 
 * platform: `platform-linux` | `platform-android` (exactly one);
 * render: `render-vulkan`;
-* media: `media-ffmpeg` (Linux) | `media-mediacodec` (Android).
+* media: `video-ffmpeg` (Linux) | `video-mediacodec` (Android).
 
 `#[cfg]` and the backend crates are confined to L1. L2/L3/L4 are
 platform-agnostic and compile identically everywhere. This is what keeps
@@ -279,36 +280,41 @@ Names are provisional; the dependency direction is the contract.
 ```
 crates/
   # L1 — platform core ------------------------------------------------------
-  api        shared DTOs + error types (no impls)
-  fs         stateless FileSystem + FileState + XP3 read/parse
-  render     stateless RenderPipeline/FontSystem + Vulkan + glyph
-  media      stateless Media + image/audio/video decode
-                  (media-ffmpeg | media-mediacodec)
-  platform   window/surface, event loop, input, clock, threads,
-                  process lifecycle; winit | android-activity; the
-                  platform abstraction higher layers use
+  platform/api      shared DTOs + error types (no impls)
+  platform/fs       stateless FileSystem + FileState + XP3 read/parse
+  platform/render   stateless RenderPipeline/FontSystem + Vulkan + glyph
+  platform/media    stateless Media + image/audio/video decode
+                    (video-ffmpeg | video-mediacodec)
+  platform/platform window/surface, event loop, input, clock, threads,
+                    process lifecycle; winit | ndk; the platform
+                    abstraction higher layers use
 
   # L2 — the small game engine ---------------------------------------------
   engine     Scene/Bitmap/Sprite, mixer, timers, the VFS namespace,
-                  RenderScene projection; owns engine state
+                    RenderScene projection; owns engine state
 
   # L3 — KiriKiri compatibility --------------------------------------------
   compat     native classes + KAG + event adapter + static plugins
-                  (absorbs today's tvp-natives/tvp-visual/tvp-storages/
-                   tvp-scripts/tvp-input/tvp-sound/tvp-text/tvp-kagparser)
+                    (absorbed the former `tvp-natives`/`tvp-visual`/
+                     `tvp-storages`/`tvp-scripts`/`tvp-input`/`tvp-sound`/
+                     `tvp-text`/`tvp-kagparser` crates)
 
   # L4 — TJS VM -------------------------------------------------------------
-  vm         TJS VM host over tjs + the composition root
+  vm         TJS VM host over tjs
   tjs        the C++ VM FFI (unchanged)
 
   # root --------------------------------------------------------------------
   app        thin binary: select platform, wire L1..L4, start the loop
+  android    the Android composition root: android_main, the GameActivity
+                    loop and JNI wiring
+  testkit    dev-only shared test helpers
 ```
 
-Existing crates are not renamed in one go. The machinery:
-* keep `tjs`, `tvp-util`, `tvp-streams` where they are unless in the way;
+The crate consolidation is complete. For reference, the machinery was:
+* keep `tjs` where it is unless in the way;
 * fold the `tvp-*` native families into `compat` as `plugins/*`;
-* the old `engine` loader splits: mount/discover → L2, execute → L3/L4;
+* the old `engine` loader split into mount/discover (L2) and execute
+  (L3/L4);
 * keep the game runnable at every step (roadmap).
 
 ## 7. Component ownership
@@ -344,14 +350,16 @@ Existing crates are not renamed in one go. The machinery:
    features and the trivial composition root.
 3. **D9:** L1 has no mutable statics, no `thread_local!`, no
    `LazyLock`/`OnceLock`/`OnceCell` caches, no id-keyed registries, no
-   `&mut self` on its service objects. Guarded in CI.
+   `&mut self` on its service objects. Guarded by `scripts/check-stateless.sh`
+   in the gate.
 4. **D10:** L2 contains no traversal, draw-list, batching or blend-state
    selection; its render path is "sync scene → call render".
 5. **D11:** no silent fallback and no hardcoded limit in L1/L2; the one
-   documented exception is `Plugins.link` (D14).
+   documented exception is the null plugin object (D14).
 6. The game runs on Linux and Android with Vulkan and no Bevy in
    `Cargo.lock`.
-7. Loading takes an explicit archive list; no directory scan (§5, doc 09).
+7. Loading takes an explicit archive list; a directory scan runs only when no
+   explicit list is given (§5, doc 09, D35).
 
 ## 10. Why the reference validates this
 
@@ -384,11 +392,12 @@ optimisations this freeze is meant to protect.
 
 ### 12.1. Dependency rule (what L3 may use)
 
-- **L3 (`compat`) may depend on `api`, `engine`, `platform` (event/DTO types
-  only) and `tjs`.** It must **not** call `render`, `media`, or `fs` directly —
-  those are L1 and reach the game only *through* `engine`. (Verified today:
-  `compat`'s non-dev deps are `api`, `engine`, `platform`, `tjs`, `thiserror`,
-  `log`, `flate2`, `encoding_rs`.)
+- **L3 (`compat`) may depend on `api`, `engine`, `fs` and `tjs`.** It must
+  **not** call `render` or `media` directly — those are L1 and reach the game
+  only *through* `engine`. (Verified today: `compat`'s non-dev deps are
+  `api`, `engine`, `fs`, `tjs`, `thiserror`, `log`, `flate2`, `chardetng`,
+  `encoding_rs`, `serde_json`, `md-5`.) L3 file IO goes through the L1 `fs`
+  abstraction rather than `std::fs`, which is platform code.
 - **`engine` may name L1 types.** `engine` depends on the L1 *type* crates
   (`api`, `fs`, `render`) and its public surface may use their types
   (`RenderScene`, `FileState`, `FontMetrics`, …). A change to an L1 type that
@@ -402,8 +411,8 @@ optimisations this freeze is meant to protect.
    changing an existing public item requires an explicit decision entry (a `Dxx`
    in [`README.md`](README.md)).
 2. **`#[non_exhaustive]` on public enums and option/state structs**, so we can
-   add variants/fields later without a breaking change. (Most `engine` types
-   currently lack it — see §5.)
+   add variants/fields later without a breaking change. (Most `engine` types now
+   carry it; the remainder are listed in §12.5.)
 3. **Explicit state, not methods on hidden globals** (D9). Public state values
    implement `Default`/`new`; mutators take `&mut self`.
 4. **Typed errors** (D11). Each family owns one `#[non_exhaustive]` error enum
@@ -414,8 +423,8 @@ optimisations this freeze is meant to protect.
    as a number, but the L2 API must not be built on raw pointers).
 6. **No TVP-specific constants in L2.** `LT_*`, `TVP_*`, VK codes, `tTVP*` enums
    are KiriKiri semantics = **L3**. L2 keeps only generic concepts (`BlendMode`,
-   generic flags). (Debt: `projection.rs` `LT_*`, `scene.rs` `LT_OPAQUE/ALPHA/…`,
-   `sound.rs` `TVP_*`.)
+   generic flags). The old L2 `LT_*`/`TVP_*` constants are gone from the code;
+   the names survive only in doc comments citing the reference.
 7. **No cross-layer constants or vocabulary.** A layer owns its constants and
    types; an **upper layer must not import a lower layer's constant or type**.
    If an upper layer needs a value, it defines its own and the lower layer
@@ -431,7 +440,7 @@ optimisations this freeze is meant to protect.
 
 | Module | Stable public surface | Notes |
 |---|---|---|
-| `scene` | `Scene` + its methods; `WindowState`, `LayerState`, `BitmapState`, `FontState`, `Rect` | The layer system. Fields are currently `pub`; they should become accessor-backed (§5). |
+| `scene` | `Scene` + its methods; `WindowState`, `LayerState`, `BitmapState`, `FontState`, `Rect` | The layer system. State fields are `pub` by house style; the types carry `#[non_exhaustive]` so growth is additive. |
 | `projection` | `project_window`, `project_scene`, `ComposedLayer`, `compose_layer`, `resolve_blend` | The native `lt*` blend numbering lives in L3 (`natives/visual/layer/blend.rs`). |
 | `layer_ops` / `raster` | the pixel operations (`blit_*`, `fill_*`, `blur_*`, `affine_blit`, `fill_polygon`, …) | Pure transforms over `BitmapState`. `GammaAdjust` fields are public-by-design (a plain parameter block). |
 | `storage` | `Storage` + `mount_archives`/`mount_archive`/`find`/`read`/`stat`/`exists`/`get_file_list`/`add_auto_path`/`extract…`; `discover_startup` | The VFS namespace + TVP addressing. |
@@ -439,7 +448,7 @@ optimisations this freeze is meant to protect.
 | `sound` | `Mixer`, `SoundSource`, `SoundChannel`, `SoundBuffer`, `LoopInfo`, `LoopFlags`, `SoundLabel`, `LoopLink`, `mix`/`mix_source` | Pure PCM state; L1 device consumes. The `.sli` parser and the TVP `0..100000` scale live in L3. |
 | `text` | `TextEngine`, `GlyphAtlas`, `TextLayout`, `PositionedGlyph`, `TextStyle`, `project_text`, `compose_text_cpu`, `TextError` | L1 raster/atlas swap must not change this. |
 | `input` | `InputState`, `ButtonState`, `KeyState`, `TouchContact` | Generic; no VK codes. |
-| `timer` | `TimerState`, `TimerId`, `TimerConfig`, `TimerMode`, `TimerFire`, `TimerError` | Generic firing; TVP dispatch mode stays L3. |
+| `timer` | `TimerState`, `TimerId`, `TimerCallback`, `TimerError` | Generic firing; TVP dispatch mode stays L3. |
 | `video` | `VideoOverlay` + enums (`PlayStatus`, `VideoEvent`, `OverlayBinding`, `VideoBounds`, `PeriodReason`, `VideoError`) | Consumes frames from the caller; no codec dep. |
 | `trans` | `Trans`, `TransKind`, `TransStep`, `RuleMask`, `TransError` | Over `layer_ops`. |
 
@@ -461,18 +470,16 @@ surface:
 ### 12.5. Known debt to stabilise (tracked)
 
 1. **Public state fields** on `WindowState`/`LayerState`/`BitmapState`
-   (`scene.rs`) — make private + accessors, or mark `#[non_exhaustive]` and treat
-   as read-mostly. L3 currently reads/writes some directly.
+   (`scene.rs`) are still public; the types are `#[non_exhaustive]` so growth
+   is additive, and L3 reads/writes some fields directly.
 2. **Raw `usize` handles**: `main_image_pixel_buffer*` / `province_image_pixel_buffer*`
    return addresses for the TJS `buffer`/`bufferForWrite` properties. Either keep
    them documented as *opaque addresses* (never dereferenced in Rust) or expose a
    safe `with_*_pixels` only.
-3. **TVP constants in L2** (`LT_*` in `projection.rs`/`scene.rs`, `TVP_*` in
-   `sound.rs`) — move to L3 or wrap behind `compat` names.
-4. **`#[non_exhaustive]`** missing on ~all public enums/structs — add it so future
-   growth is additive.
-5. **Naming**: settle `SoundChannel` vs `Channel`, `VideoOverlay` methods vs the
-   reference `vo_*`, etc.
+3. **Naming**: settle `SoundChannel` vs `Channel`, `VideoOverlay` methods vs the
+   reference `vo_*`, etc. The TVP constants and most `#[non_exhaustive]` gaps
+   have been closed: L2 enums/structs carry the attribute and the `LT_*`/`TVP_*`
+   names remain only in doc comments.
 
 ### 12.6. Guard (D21, superseded by D33)
 

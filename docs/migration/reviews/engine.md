@@ -1,8 +1,8 @@
 # Review — `engine` and `app`
 
 Scope: `crates/engine/` (layer system state, `layer_ops`, `raster`,
-`projection`, `storage`, `archive/xp3`) and `crates/app/` (winit host +
-CLI). Reviewed against:
+`projection`, `storage`) and `crates/app/` (host assembly + CLI). Reviewed
+against:
 
 - `docs/migration/02-target-architecture.md` (D9/D10, Invariants A/B/C)
 - `docs/migration/03-middle-layer-api.md` (the L2/L1 contract)
@@ -21,13 +21,30 @@ Severity legend: **Critical** (breaks an invariant / exploitable) · **High**
 The crates are in good shape: `#![forbid(unsafe_code)]` and
 `#![warn(missing_docs)]` are set, there are **no globals, statics,
 `LazyLock`/`OnceLock`, or `thread_local`** anywhere in either crate, the L2/L1
-split (state in `Scene`/`Storage`/`Xp3Archive`, actions on `FileSystem`/
-`RenderPipeline` values) is respected, and the code is unusually well
-documented with reference citations. The main problems are (a) the
-`engine` dependency graph contradicts architecture §4, (b) unchecked
-`i32`/`u32` pixel arithmetic and untrusted-size allocations that the sibling
-`media` crate already defends against, and (c) avoidable per-frame
-allocation in `projection`/`Host::step`.
+split (state in `Scene`/`Storage`, actions on `FileSystem`/`RenderPipeline`
+values) is respected, and the code is unusually well
+documented with reference citations.
+
+> **Resolution status (current tree).**
+> * §1.1 — D33 and `02-target-architecture.md` §12.1 now state that `engine`
+>   depends on the L1 *type* crates (`api`, `fs`, `render`); the earlier `02`
+>   §4 wording is fixed. `flate2` is used by the FS-side XP3 reader, not by
+>   `engine`.
+> * §1.2 — there is no `krkr-core`; `app` and `crates/android` are the two
+>   composition roots.
+> * §1.3/§1.4/§2.4/§4.2/§4.3/§4.7 — the XP3 parser now lives in
+>   `crates/platform/fs/src/xp3.rs` with `Xp3Error`, checked arithmetic and
+>   typed `CorruptIndex`; see `reviews/fs_engine.md` resolution status.
+> * §3.1/§4.1/§4.4 — `blur_bitmap_in_place` is a separable sliding running-sum
+>   box blur with `u64` accumulators, and the coordinate arithmetic uses
+>   `saturating_*` throughout `layer_ops`/`projection`/`raster`.
+> * §3.3 — `Host::step` keeps a persistent `RenderScene`, reuses its arena and
+>   skips reprojection while `Scene::revision()` is unchanged
+>   (`crates/app/src/lib.rs`).
+>
+> The remaining perf/consistency findings (§2.1, §2.3, §3.2, §3.4–3.9, §4.5,
+> §4.6, §4.8, §4.9, §4.10) have not all been re-checked; read them as a
+> snapshot, not as current defects.
 
 ---
 

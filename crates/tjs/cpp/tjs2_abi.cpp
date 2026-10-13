@@ -23,6 +23,7 @@
 #include "tjsInterface.h"
 #include "tjsDebug.h"
 #include "tjsInterCodeExec.h"
+#include "tjsByteCodeLoader.h"
 
 #include "tjs2_abi.h"
 
@@ -2000,6 +2001,107 @@ int tjs2_compile_script(tjs2_engine *e, const char *script, size_t script_len,
             throw;
         }
         delete output;
+        return 0;
+    } catch(const TJS::eTJS &err) {
+        if(out_error)
+            *out_error = make_error_message(err);
+        return 1;
+    } catch(const std::exception &err) {
+        if(out_error) {
+            std::string m = std::string("C++ exception: ") + err.what();
+            char *buf = (char *)malloc(m.size() + 1);
+            if(buf)
+                std::memcpy(buf, m.c_str(), m.size() + 1);
+            *out_error = buf;
+        }
+        return 1;
+    } catch(...) {
+        if(out_error) {
+            char *buf = (char *)malloc(8);
+            if(buf)
+                std::memcpy(buf, "unknown", 8);
+            *out_error = buf;
+        }
+        return 1;
+    }
+}
+
+int tjs2_load_bytecode(tjs2_engine *e, const char *buff, size_t len,
+                       const char *name, void *context, int *out_is_bytecode,
+                       tjs2_value *out_result, char **out_error) {
+    if(out_error)
+        *out_error = nullptr;
+    if(out_is_bytecode)
+        *out_is_bytecode = 0;
+    if(out_result) {
+        out_result->type = TJS2_VAL_VOID;
+        out_result->integer = 0;
+        out_result->real = 0.0;
+        out_result->string = nullptr;
+        out_result->array = nullptr;
+        out_result->array_count = 0;
+        out_result->retained = nullptr;
+    }
+    if(!e || (!buff && len != 0))
+        return -1;
+    // Same result-slot discipline as tjs2_exec_script: the retention an
+    // object-valued bytecode result needs is resolved against this call only.
+    e->last_object.Clear();
+    try {
+        std::u16string n = name ? utf8_to_u16(name) : std::u16string();
+        TJS::tTJSVariant result;
+        // The stream loader's failure path raises with a null block, and
+        // `eTJSScriptError`'s block holder dereferences that null
+        // (`tjsError.cpp:61-64`). A recognized-but-rejected blob would crash
+        // there. Probe the loader's own tag predicate and parser first so it
+        // becomes a typed error; recognized bytecode still executes through
+        // the VM's stream-based `LoadByteCode` below. This decides only the
+        // malformed-recognized case, never bytecode-vs-text: a non-bytecode
+        // input skips the probe and lets `LoadByteCode` return false.
+        if(len >= (size_t)TJS::tTJSScriptBlock::BYTECODE_FILE_TAG_SIZE &&
+           TJS::tTJSByteCodeLoader::IsTJS2ByteCode(
+               reinterpret_cast<const tjs_uint8 *>(buff))) {
+            // `ReadByteCode` reads its fixed header through offset 19: the
+            // file tag, the 4-byte file size, the 4-byte DATA tag and the
+            // 4-byte data-area size. A recognized magic shorter than that
+            // would read past the buffer (in the probe and again in the
+            // loader), so reject it as broken bytecode up front.
+            const size_t fixed_header =
+                (size_t)TJS::tTJSScriptBlock::BYTECODE_FILE_TAG_SIZE +
+                4 /* file size */ + 4 /* DATA tag */ + 4 /* data-area size */;
+            if(len < fixed_header) {
+                if(out_error)
+                    *out_error = make_error_string(
+                        "Bytecode read error. File is broken or it's not "
+                        "bytecode file.");
+                return 1;
+            }
+            TJS::tTJSByteCodeLoader loader;
+            TJS::tTJSScriptBlock *probe = loader.ReadByteCode(
+                e->inner, name ? n.c_str() : nullptr,
+                reinterpret_cast<const tjs_uint8 *>(buff), len);
+            if(!probe) {
+                if(out_error)
+                    *out_error = make_error_string(
+                        "Bytecode read error. File is broken or it's not "
+                        "bytecode file.");
+                return 1;
+            }
+            probe->Release();
+        }
+        std::unique_ptr<TJS::tTJSBinaryStream> stream{
+            tjs2_create_memory_stream(buff, len)
+        };
+        bool is_bytecode = e->inner->LoadByteCode(
+            stream.get(), &result,
+            static_cast<TJS::iTJSDispatch2 *>(context),
+            name ? n.c_str() : nullptr);
+        if(is_bytecode)
+            variant_to_value(e, result, out_result);
+        if(out_is_bytecode)
+            *out_is_bytecode = is_bytecode ? 1 : 0;
+        if(out_error)
+            *out_error = nullptr;
         return 0;
     } catch(const TJS::eTJS &err) {
         if(out_error)

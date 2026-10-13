@@ -563,3 +563,21 @@ is the oracle. The proposed form — the DLL path, its content hash, and the
 decompiled function or address — is recorded in `plugins/analysis/README.md`
 and needs a decision entry before the first such plugin lands, because a test
 that cannot cite its evidence is not evidence.
+
+**Parity extractor coverage (`docs/audits/propset-parity.md`).** Both parity
+scripts now read class-level `PropSet` registrations, namespace attachments
+and script globals, so the `Window.menu` class of gap is caught. Two
+extractor gaps remain, neither a missing port member:
+
+* **False `name` member from a macro definition.**
+  `native_parity._preprocess_cpp` does not blank `#define` bodies, so
+  `#define TVP_REGISTER_PTDD_ENUM(name)` contributes a member literally named
+  `name` to `BasicDrawDevice`/`PassThroughDrawDevice`; the runtime comparison
+  lists it as missing. Fix: blank `#define` bodies in the core reader the way
+  the plugin reader already does, then review the (only-shrinking) diff.
+* **Global free functions are not in the runtime dump.**
+  `runtime_surface.rs` walks class objects and instances, not the global
+  object's free functions, so `--runtime` always reports
+  `getDirList`/`drawFFTGraph` as missing. Fix: enumerate global function
+  members in the dump, or teach the runtime comparison that `__global__` is
+  not represented. A host-only change; no script behaviour is involved.

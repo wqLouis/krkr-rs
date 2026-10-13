@@ -335,6 +335,21 @@ unsafe extern "C" {
         lineofs: c_int,
         out_error: *mut *mut c_char,
     ) -> c_int;
+    /// Load and execute TJS2 precompiled bytecode from an in-memory buffer
+    /// (reference `tTJS::LoadByteCode(tTJSBinaryStream*, ...)`, the bytecode
+    /// branch of `TVPExecuteStorage`). Writes the `out_is_bytecode` flag and a
+    /// `TJS2_VAL_*` result; returns 0 on success and non-zero with a malloc'd
+    /// message in `out_error` on a genuine loader failure.
+    fn tjs2_load_bytecode(
+        e: *mut Engine,
+        buff: *const c_char,
+        len: usize,
+        name: *const c_char,
+        context: *mut c_void,
+        out_is_bytecode: *mut c_int,
+        out_result: *mut Value,
+        out_error: *mut *mut c_char,
+    ) -> c_int;
     /// Dump all live script blocks to the console/log output (`tTJS::Dump`).
     pub fn tjs2_dump(e: *mut Engine, out_error: *mut *mut c_char) -> c_int;
     /// Run the TJS2 garbage collector (`tTJS::DoGarbageCollection`); the
@@ -525,6 +540,17 @@ unsafe extern "C" {
         path_utf8: *const c_char,
         mode_utf8: *const c_char,
         out_utf8: *mut *mut c_char,
+    ) -> c_int;
+    /// The `TJS_BS_*` access the binary-write factory selects for a mode.
+    fn tjs2_test_binary_write_access(mode_utf8: *const c_char) -> *const c_char;
+    /// Open through the wired binary factory and close immediately.
+    fn tjs2_test_open_binary_stream(
+        name_utf8: *const c_char,
+        mode_utf8: *const c_char,
+        for_write: c_int,
+        out_opened: *mut c_int,
+        out_access: *mut *const c_char,
+        out_error: *mut *mut c_char,
     ) -> c_int;
 }
 
@@ -1010,6 +1036,61 @@ impl Tjs2Engine {
             return Err(take_error(error));
         }
         Ok(())
+    }
+
+    /// Load and execute TJS2 precompiled bytecode from an in-memory buffer
+    /// (reference `TVPExecuteStorage`'s bytecode branch,
+    /// `reference/cpp/core/base/ScriptMgnIntf.cpp:713-727`, which calls the
+    /// VM's stream-based `tTJS::LoadByteCode`).
+    ///
+    /// Returns `Ok(Some(result))` when the loader recognized and consumed
+    /// `bytes` (TJS2 bytecode, or the binary-serialized data the same loader
+    /// entry also accepts), `Ok(None)` when it did not (the caller then decodes
+    /// the same bytes as text), and `Err` when the loader recognized bytecode
+    /// and rejected it. `context` is the script's `this` (a raw
+    /// `iTJSDispatch2*`), or null for the global object.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn load_bytecode(
+        &self,
+        bytes: &[u8],
+        name: &str,
+        context: *mut c_void,
+    ) -> Result<Option<RetainedValue>, TjsError> {
+        // `bytes` is handed over as a pointer and a length; `name` is a
+        // diagnostic label and stays a NUL-terminated C string.
+        let name = CString::new(name).map_err(|_| TjsError("name contains NUL".into()))?;
+        let mut is_bytecode: c_int = 0;
+        let mut result = Value {
+            ty: VAL_VOID,
+            integer: 0,
+            real: 0.0,
+            string: ptr::null(),
+            array: ptr::null(),
+            array_count: 0,
+            retained: 0,
+        };
+        let mut error: *mut c_char = ptr::null_mut();
+        // SAFETY: all pointers point to valid, live data for the call; the
+        // caller guarantees `context` is a live object handle or null.
+        let rc = unsafe {
+            tjs2_load_bytecode(
+                self.inner,
+                bytes.as_ptr().cast::<c_char>(),
+                bytes.len(),
+                name.as_ptr(),
+                context,
+                &mut is_bytecode,
+                &mut result,
+                &mut error,
+            )
+        };
+        if rc != 0 {
+            return Err(take_error(error));
+        }
+        if is_bytecode == 0 {
+            return Ok(None);
+        }
+        self.retain_object_result(take_value(&result)).map(Some)
     }
 
     /// Dump all live script blocks through the log callback installed with
@@ -5492,5 +5573,208 @@ var ra = a.get(); var rb = b.get();",
             text.contains("\"scenario\""),
             "fixture is missing the scenario field"
         );
+    }
+
+    // --- stream factory modes and dispositions ---------------------------
+
+    /// A data directory for the wired tjs stream factories. `set_data_dir`
+    /// points their relative-name resolution at it.
+    fn stream_temp_dir(name: &str) -> std::path::PathBuf {
+        let dir = temp_path(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn stream_test_access(mode: &str) -> String {
+        let mode = CString::new(mode).unwrap();
+        // SAFETY: the helper returns a static NUL-terminated string.
+        let pointer = unsafe { tjs2_test_binary_write_access(mode.as_ptr()) };
+        // SAFETY: the pointer is a static NUL-terminated string.
+        unsafe { CStr::from_ptr(pointer) }
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn open_test_binary(name: &str, mode: &str, for_write: bool) -> (bool, String) {
+        let name = CString::new(name).unwrap();
+        let mode = CString::new(mode).unwrap();
+        let mut opened: c_int = 0;
+        let mut access: *const c_char = ptr::null();
+        let mut error: *mut c_char = ptr::null_mut();
+        // SAFETY: all pointers are valid for the call; the helper writes a
+        // static access string and, on failure, a malloc'd message.
+        let rc = unsafe {
+            tjs2_test_open_binary_stream(
+                name.as_ptr(),
+                mode.as_ptr(),
+                for_write as c_int,
+                &mut opened,
+                &mut access,
+                &mut error,
+            )
+        };
+        assert_eq!(rc, 0, "helper must not fail for {name:?}");
+        if !error.is_null() {
+            // SAFETY: the helper allocated it with malloc.
+            unsafe { tjs2_free_string(error) };
+        }
+        let access = if access.is_null() {
+            String::new()
+        } else {
+            // SAFETY: the helper returns a static NUL-terminated string.
+            unsafe { CStr::from_ptr(access) }
+                .to_string_lossy()
+                .into_owned()
+        };
+        (opened != 0, access)
+    }
+
+    /// `BinaryStream.cpp:57-76`: `oN` (N > 0) is `TJS_BS_UPDATE`, everything
+    /// else is `TJS_BS_WRITE`. The port additionally maps `a` to
+    /// `TJS_BS_APPEND`; the reference binary factory has no `a` branch, so that
+    /// is a port extension (reported, not silently fixed).
+    #[test]
+    fn binary_write_mode_selects_the_reference_access() {
+        let _vm_lock = vm_lock();
+        for (mode, expected) in [
+            ("", "TJS_BS_WRITE"),
+            ("wb", "TJS_BS_WRITE"),
+            ("o0", "TJS_BS_WRITE"),
+            ("o4", "TJS_BS_UPDATE"),
+            ("o255", "TJS_BS_UPDATE"),
+            ("a", "TJS_BS_APPEND"),
+            ("ab", "TJS_BS_APPEND"),
+        ] {
+            assert_eq!(stream_test_access(mode), expected, "mode {mode:?}");
+        }
+    }
+
+    /// `_TVPCreateStream` (`StorageIntf.cpp:1137-1141`) normalizes the name
+    /// for `TJS_BS_WRITE` without requiring the file to exist, so a write to a
+    /// new storage name creates it. This is the behaviour the `Config.tjs`
+    /// hypothesis depends on.
+    #[test]
+    fn write_mode_creates_a_missing_storage_name() {
+        let _vm_lock = vm_lock();
+        let dir = stream_temp_dir("stream-write-create");
+        let e = Tjs2Engine::new().unwrap();
+        e.set_data_dir(dir.to_str().unwrap()).unwrap();
+        assert!(!dir.join("created.tjs").exists());
+        let (opened, access) = open_test_binary("created.tjs", "", true);
+        assert!(opened, "a write must open a new file");
+        assert_eq!(access, "TJS_BS_WRITE");
+        assert!(
+            dir.join("created.tjs").is_file(),
+            "write mode must create the host file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_mode_truncates_an_existing_file() {
+        let _vm_lock = vm_lock();
+        let dir = stream_temp_dir("stream-write-truncate");
+        let e = Tjs2Engine::new().unwrap();
+        e.set_data_dir(dir.to_str().unwrap()).unwrap();
+        std::fs::write(dir.join("existing.tjs"), b"AAAA").unwrap();
+        let (opened, _) = open_test_binary("existing.tjs", "", true);
+        assert!(opened);
+        assert_eq!(
+            std::fs::read(dir.join("existing.tjs")).unwrap(),
+            b"",
+            "TJS_BS_WRITE must truncate"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `oN` opens at an offset and must not truncate (`BinaryStream.cpp:65-76`).
+    /// The reference takes the placed path for UPDATE, so a missing file would
+    /// throw `TVPCannotOpenStorage` (`StorageIntf.cpp:1137-1144`); the port's
+    /// update fallback creates it instead -- a divergence recorded here.
+    #[test]
+    fn update_mode_preserves_the_file_and_creates_when_missing() {
+        let _vm_lock = vm_lock();
+        let dir = stream_temp_dir("stream-update");
+        let e = Tjs2Engine::new().unwrap();
+        e.set_data_dir(dir.to_str().unwrap()).unwrap();
+        std::fs::write(dir.join("update.tjs"), b"AAAAAAAA").unwrap();
+        let (opened, access) = open_test_binary("update.tjs", "o2", true);
+        assert!(opened);
+        assert_eq!(access, "TJS_BS_UPDATE");
+        assert_eq!(
+            std::fs::read(dir.join("update.tjs")).unwrap(),
+            b"AAAAAAAA",
+            "TJS_BS_UPDATE must not truncate"
+        );
+
+        let (opened, _) = open_test_binary("missing.tjs", "o2", true);
+        assert!(opened, "the port's update fallback creates a missing file");
+        assert!(dir.join("missing.tjs").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Read takes the placed path and requires it to exist
+    /// (`StorageIntf.cpp:1136-1144`). The port returns a closed stream rather
+    /// than throwing, which the caller sees as an empty read; the
+    /// `opened=false` flag (and the `stream open ... failed` log line) is how
+    /// that becomes visible.
+    #[test]
+    fn read_mode_requires_an_existing_file() {
+        let _vm_lock = vm_lock();
+        let dir = stream_temp_dir("stream-read");
+        let e = Tjs2Engine::new().unwrap();
+        e.set_data_dir(dir.to_str().unwrap()).unwrap();
+        let (opened, access) = open_test_binary("nope.tjs", "", false);
+        assert!(!opened, "a missing read must not open");
+        assert_eq!(access, "TJS_BS_READ");
+
+        std::fs::write(dir.join("there.tjs"), b"hi").unwrap();
+        let (opened, _) = open_test_binary("there.tjs", "", false);
+        assert!(opened, "an existing read must open");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The factory emits one line per stream: the requested name, the
+    /// reference access, whether the host file existed, and the host path. A
+    /// failed open is a `warn` naming the reason, so a silent write failure
+    /// cannot hide.
+    #[test]
+    fn stream_creation_and_open_failure_are_logged() {
+        let _vm_lock = vm_lock();
+        let dir = stream_temp_dir("stream-log");
+        let e = Tjs2Engine::new().unwrap();
+        e.set_data_dir(dir.to_str().unwrap()).unwrap();
+        // SAFETY: `record_vm_log` is a plain fn with no user pointer needs.
+        unsafe { e.set_log_cb(Some(record_vm_log), ptr::null_mut()) };
+        VM_LOG_RECORDS.with(|logs| logs.borrow_mut().clear());
+
+        let (opened, _) = open_test_binary("logged.tjs", "", true);
+        assert!(opened);
+        let (opened, _) = open_test_binary("absent.tjs", "", false);
+        assert!(!opened);
+
+        let logs = VM_LOG_RECORDS.with(|logs| logs.borrow().clone());
+        let created = logs
+            .iter()
+            .find(|(_, msg)| msg.contains("stream open binary-write 'logged.tjs'"))
+            .unwrap_or_else(|| panic!("write creation must be logged: {logs:?}"));
+        assert_eq!(created.0, LOG_DEBUG, "creation is a debug line");
+        assert!(created.1.contains("access=TJS_BS_WRITE"), "{}", created.1);
+        assert!(created.1.contains("resolved=true"), "{}", created.1);
+        assert!(created.1.contains("existed=false"), "{}", created.1);
+        assert!(
+            created.1.contains(dir.join("logged.tjs").to_str().unwrap()),
+            "the host path must be named: {}",
+            created.1
+        );
+
+        let failed = logs
+            .iter()
+            .find(|(_, msg)| msg.contains("stream open binary-read 'absent.tjs'"))
+            .unwrap_or_else(|| panic!("a failed open must be logged: {logs:?}"));
+        assert_eq!(failed.0, LOG_WARN, "failure is a warn line");
+        assert!(failed.1.contains("access=TJS_BS_READ"), "{}", failed.1);
+        assert!(failed.1.contains("failed:"), "{}", failed.1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

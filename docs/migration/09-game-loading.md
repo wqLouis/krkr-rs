@@ -29,18 +29,19 @@ krkr --archive data.xp3 --archive patch.xp3 [--base-dir DIR] [GAME]
   reference: win32 `TVPCheckStartupArg` only inspects `argv[1]`, and the
   Linux/macOS/Android implementations return `false` outright
   (`environ/linux/Platform.cpp:285`, `environ/apple/macos/platform.mm:208`,
-  `environ/android/AndroidUtils.cpp:695`). We never enumerate a folder for
-  `*.xp3`; a `startup.tjs` inside a mounted archive is found by the normal
-  storage search (§5), not by a scan. *(Amended by D35: a directory-only
-  launch — `--base-dir`/positional directory with no `--archive` — opts into a
-  recursive `*.xp3` scan (`engine::storage::discover_archives`) as a documented
-  ergonomic extension; explicit `--archive` entries suppress it.)*
+  `environ/android/AndroidUtils.cpp:695`). The reference never enumerates a
+  folder for `*.xp3`; a `startup.tjs` inside a mounted archive is found by the
+  normal storage search (§5), not by a scan. *(Amended by D35: a
+  directory-only launch — `--base-dir`/positional directory with no
+  `--archive` — opts into a recursive `*.xp3` scan
+  (`engine::storage::discover_archives`) as a documented ergonomic extension;
+  explicit `--archive` entries suppress it.)*
 * `key=value` arguments become command-line config
   (`TVPSetCommandLine` semantics).
 
-Android: the same archive list arrives through Intent extras. The old
-`pendingGameDir`/`pendingGameName` contract is replaced by an archive list +
-base dir.
+Android: the launcher passes a game directory and game name through the
+`pendingGameDir`/`pendingGameName` static fields; a directory-only launch
+there mounts the `*.xp3` files found under it (D35), same as the CLI.
 
 ## 2. Base directory
 
@@ -138,11 +139,11 @@ TJS script (L4)
 Parsing holds no state, so it is L1; L2 only ever sees a parsed file
 system; L3 is just the script adapter.
 
-**Multiple archives:** every `--archive` input is mounted at launch. Because
-the folder scan is gone, scripts may also mount more at runtime through the
-L3 native. (The reference `Storages` has no `mountArchive` — it relied on
-folder enumeration — so this native is an intentional, documented
-extension.)
+**Multiple archives:** every `--archive` input is mounted at launch, and a
+directory-only launch mounts the discovered `*.xp3` list (D35). Scripts may
+also mount more at runtime through the L3 native. (The reference `Storages`
+has no `mountArchive` — it relied on folder enumeration — so this native is an
+intentional, documented extension.)
 
 ## 7. Reference mapping
 
@@ -183,9 +184,9 @@ explicit `--archive` entry is never skipped.
 * **CLI** — `krkr [--archive XP3 ...] [--base-dir DIR] [GAME]`. The base
   directory defaults to the first archive's parent (else the current
   directory); a positional directory sets it, a positional file is mounted as
-  an archive. **Nothing scans a folder for `*.xp3`.** The `boot_game` test
-  derives an archive list from `KRKR_TEST_GAME` for convenience only; the
-  product path never does.
+  an archive. When no `--archive` is given the base directory is scanned for
+  `*.xp3` (D35); an explicit list suppresses the scan. The `boot_game` test
+  derives an archive list from `KRKR_TEST_GAME` for convenience only.
 
 [`Storage::mount_archives`]: ../../crates/engine/src/storage.rs
 [`Storage::mount_discovered_archives`]: ../../crates/engine/src/storage.rs

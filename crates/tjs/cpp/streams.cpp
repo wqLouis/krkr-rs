@@ -38,6 +38,7 @@
 
 #include "tjs2_abi.h"
 
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -50,6 +51,8 @@
 #include <zlib.h>
 
 #include <tjs.h>
+
+#include <spdlog/spdlog.h>
 
 static std::string g_data_dir;
 
@@ -282,16 +285,39 @@ static FILE *open_file(const std::string &path, FileAccess access) {
     return nullptr;
 }
 
+// The reference access flag the binary-write factory selects for `mode`:
+// `oN` (N > 0) is `TJS_BS_UPDATE` (the reference `TVPCreateBinaryStreamForWrite`
+// opens at an offset), an `a` is the port's `TJS_BS_APPEND`, everything else is
+// `TJS_BS_WRITE` (create/truncate).
+static FileAccess binary_write_access(const std::string &mode) {
+    if(mode.find('a') != std::string::npos)
+        return FileAccess::Append;
+    return mode_offset(mode) != 0 ? FileAccess::Update : FileAccess::Write;
+}
+
+// The text-write factory follows the reference `tTVPTextWriteStream` exactly:
+// `oN` (N > 0) is `TJS_BS_UPDATE`, everything else is `TJS_BS_WRITE`.
+static FileAccess text_write_access(const std::string &mode) {
+    return mode_offset(mode) != 0 ? FileAccess::Update : FileAccess::Write;
+}
+
 class FileBinaryStream : public TJS::tTJSBinaryStream {
     FILE *f;
     bool readable;
     bool writable;
+    std::string path;
+    std::string open_error;
+    bool write_failure_logged = false;
 
 public:
-    FileBinaryStream(const std::string &path, FileAccess access)
-        : f(open_file(path, access)),
+    FileBinaryStream(const std::string &p, FileAccess access)
+        : f(open_file(p, access)),
           readable(access == FileAccess::Read || access == FileAccess::Update),
-          writable(access != FileAccess::Read) {}
+          writable(access != FileAccess::Read),
+          path(p) {
+        if(!f)
+            open_error = std::strerror(errno);
+    }
 
     ~FileBinaryStream() override {
         if(f)
@@ -299,6 +325,7 @@ public:
     }
 
     bool ok() const { return f != nullptr; }
+    const std::string &error() const { return open_error; }
 
     // NOTE: the base class implements GetPosition() as Seek(0, SEEK_CUR), so
     // Seek must return the position itself instead of calling GetPosition()
@@ -318,8 +345,19 @@ public:
     }
 
     tjs_uint Write(const void *buffer, tjs_uint write_size) override {
-        if(!f || !writable)
+        if(!f || !writable) {
+            // One line per stream, not per byte: a refused write must be
+            // visible in a device log but must not spam it.
+            if(!write_failure_logged) {
+                write_failure_logged = true;
+                std::string reason =
+                    f ? std::string("stream is read-only")
+                      : ("open failed: " + open_error);
+                spdlog::warn("stream write refused '{}' ({} byte(s)): {}",
+                             path, write_size, reason);
+            }
             return 0;
+        }
         return (tjs_uint)std::fwrite(buffer, 1, write_size, f);
     }
 
@@ -335,6 +373,71 @@ public:
         return end < 0 ? 0 : (tjs_uint64)end;
     }
 };
+
+// ---------------------------------------------------------------------------
+// Binary stream (in-memory, read-only)
+// ---------------------------------------------------------------------------
+
+// Wraps a caller-owned byte range so the VM's stream-based
+// `tTJS::LoadByteCode` can run on bytes that are already in memory. The
+// range is borrowed, not copied: the stream must not outlive it.
+class MemoryBinaryStream : public TJS::tTJSBinaryStream {
+    const tjs_uint8 *data;
+    tjs_uint64 len;
+    tjs_int64 pos;
+
+public:
+    MemoryBinaryStream(const void *buffer, size_t length)
+        : data(static_cast<const tjs_uint8 *>(buffer)), len((tjs_uint64)length),
+          pos(0) {}
+
+    // The base class implements GetPosition() as Seek(0, SEEK_CUR), so Seek
+    // returns the new position itself instead of calling GetPosition().
+    tjs_uint64 Seek(tjs_int64 offset, tjs_int whence) override {
+        tjs_int64 base;
+        switch(whence) {
+            case SEEK_SET:
+                base = 0;
+                break;
+            case SEEK_CUR:
+                base = pos;
+                break;
+            case SEEK_END:
+                base = (tjs_int64)len;
+                break;
+            default:
+                return (tjs_uint64)pos;
+        }
+        tjs_int64 next = base + offset;
+        if(next < 0)
+            next = 0;
+        if(next > (tjs_int64)len)
+            next = (tjs_int64)len;
+        pos = next;
+        return (tjs_uint64)pos;
+    }
+
+    tjs_uint Read(void *buffer, tjs_uint read_size) override {
+        if(!buffer || pos >= (tjs_int64)len)
+            return 0;
+        tjs_uint64 available = len - (tjs_uint64)pos;
+        tjs_uint count =
+            read_size < available ? read_size : (tjs_uint)available;
+        std::memcpy(buffer, data + pos, count);
+        pos += count;
+        return count;
+    }
+
+    tjs_uint Write(const void * /*buffer*/, tjs_uint /*write_size*/) override {
+        return 0;
+    }
+
+    tjs_uint64 GetSize() override { return len; }
+};
+
+TJS::tTJSBinaryStream *tjs2_create_memory_stream(const void *data, size_t len) {
+    return new MemoryBinaryStream(data, len);
+}
 
 // ---------------------------------------------------------------------------
 // Text stream helpers
@@ -416,6 +519,57 @@ static std::string utf16_to_utf8(const char16_t *s, size_t len) {
     return out;
 }
 
+// The storage name as UTF-8 for the diagnostic lines (the same conversion the
+// rest of the port uses; `AsNarrowStdString` would mangle non-ASCII).
+static std::string ttstr_utf8(const ttstr &s) {
+    return utf16_to_utf8(s.c_str(), (size_t)s.GetLen());
+}
+
+// The reference's `TJS_BS_*` name for the access a factory chose.
+static const char *reference_access_name(FileAccess access) {
+    switch(access) {
+        case FileAccess::Read:
+            return "TJS_BS_READ";
+        case FileAccess::Write:
+            return "TJS_BS_WRITE";
+        case FileAccess::Append:
+            return "TJS_BS_APPEND";
+        case FileAccess::Update:
+            return "TJS_BS_UPDATE";
+    }
+    return "TJS_BS_UNKNOWN";
+}
+
+// One `debug` line per stream the factories hand out (a `warn` when the open
+// failed), so a device log shows every attempted storage open and where it
+// resolved. Volume is one line per stream, never per byte. `resolved` follows
+// the reference `_TVPCreateStream` resolve step -- `TJS_BS_WRITE` normalizes
+// the name without requiring the file, every other access takes the placed
+// path and requires it (`reference/cpp/core/base/StorageIntf.cpp:1131-1148`) --
+// while `existed` is the host file's state before the open. A write to a new
+// name therefore shows `resolved=true existed=false opened=true`.
+static void log_stream_open(const char *kind, const ttstr &name,
+                            const std::string &mode, FileAccess access,
+                            const std::string &host, bool existed,
+                            bool opened, const std::string &reason) {
+    std::string label = reference_access_name(access);
+    if(mode.find('d') != std::string::npos)
+        label += "|TJS_BS_DELETE_ON_CLOSE";
+    bool resolved = access == FileAccess::Write || existed;
+    if(opened) {
+        spdlog::debug(
+            "stream open {} '{}' mode='{}' access={} resolved={} existed={} "
+            "host='{}'",
+            kind, ttstr_utf8(name), mode, label, resolved, existed, host);
+    } else {
+        spdlog::warn(
+            "stream open {} '{}' mode='{}' access={} resolved={} existed={} "
+            "host='{}' failed: {}",
+            kind, ttstr_utf8(name), mode, label, resolved, existed, host,
+            reason);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Text read stream
 // ---------------------------------------------------------------------------
@@ -423,14 +577,19 @@ static std::string utf16_to_utf8(const char16_t *s, size_t len) {
 class TextReadStream : public TJS::iTJSTextReadStream {
     std::vector<char16_t> text; // decoded contents
     size_t pos;
+    bool opened = false;
+    std::string open_error;
 
 public:
     TextReadStream(const std::string &path, const std::string &mode)
         : pos(0) {
         long long ofs = mode_offset(mode);
         FileBinaryStream stream(path, FileAccess::Read);
-        if(!stream.ok())
+        if(!stream.ok()) {
+            open_error = stream.error();
             return;
+        }
+        opened = true;
         uint64_t size = stream.GetSize();
         if(ofs < 0 || (uint64_t)ofs > size)
             return; // offset past the end: empty stream
@@ -514,6 +673,9 @@ public:
             }
         }
     }
+
+    bool ok() const { return opened; }
+    const std::string &error() const { return open_error; }
 
     tjs_uint Read(TJS::tTJSString &targ, tjs_uint size) override {
         size_t remaining = text.size() - pos;
@@ -636,8 +798,7 @@ public:
             crypt_mode = 2;
 
         long long ofs = mode_offset(mode);
-        FileAccess access =
-            ofs != 0 ? FileAccess::Update : FileAccess::Write;
+        FileAccess access = text_write_access(mode);
         stream = std::make_unique<FileBinaryStream>(path, access);
         if(!stream->ok())
             return;
@@ -702,6 +863,11 @@ public:
         write_raw(buf.data(), (size_t)len * sizeof(char16_t));
     }
 
+    bool ok() const { return stream && stream->ok(); }
+    std::string error() const {
+        return stream ? stream->error() : std::string();
+    }
+
     void Destruct() override {
         try {
             finalize();
@@ -718,18 +884,34 @@ public:
 // ---------------------------------------------------------------------------
 static TJS::iTJSTextReadStream *create_text_read(const ttstr &name,
                                                  const ttstr &mode) {
-    return new TextReadStream(resolve_path(name), mode.AsNarrowStdString());
+    std::string m = mode.AsNarrowStdString();
+    std::string host = resolve_path(name);
+    bool existed = std::filesystem::exists(host);
+    auto *s = new TextReadStream(host, m);
+    log_stream_open("text-read", name, m, FileAccess::Read, host, existed,
+                    s->ok(), s->error());
+    return s;
 }
 
 static TJS::iTJSTextWriteStream *create_text_write(const ttstr &name,
                                                    const ttstr &mode) {
-    return new TextWriteStream(resolve_path(name), mode.AsNarrowStdString());
+    std::string m = mode.AsNarrowStdString();
+    std::string host = resolve_path(name);
+    bool existed = std::filesystem::exists(host);
+    auto *s = new TextWriteStream(host, m);
+    log_stream_open("text-write", name, m, text_write_access(m), host, existed,
+                    s->ok(), s->error());
+    return s;
 }
 
 static TJS::tTJSBinaryStream *create_bin_read(const ttstr &name,
                                               const ttstr &mode) {
     std::string m = mode.AsNarrowStdString();
-    auto *s = new FileBinaryStream(resolve_path(name), FileAccess::Read);
+    std::string host = resolve_path(name);
+    bool existed = std::filesystem::exists(host);
+    auto *s = new FileBinaryStream(host, FileAccess::Read);
+    log_stream_open("binary-read", name, m, FileAccess::Read, host, existed,
+                    s->ok(), s->error());
     long long ofs = mode_offset(m);
     if(ofs != 0)
         s->SetPosition((tjs_uint64)ofs);
@@ -739,16 +921,12 @@ static TJS::tTJSBinaryStream *create_bin_read(const ttstr &name,
 static TJS::tTJSBinaryStream *create_bin_write(const ttstr &name,
                                                const ttstr &mode) {
     std::string m = mode.AsNarrowStdString();
-    FileAccess access;
-    if(m.find('a') != std::string::npos) {
-        access = FileAccess::Append;
-    } else {
-        long long ofs = mode_offset(m);
-        // KAG's `"o<ofs>"` must update an existing file (a BMP prefix),
-        // never truncate it.
-        access = ofs != 0 ? FileAccess::Update : FileAccess::Write;
-    }
-    auto *s = new FileBinaryStream(resolve_path(name), access);
+    std::string host = resolve_path(name);
+    bool existed = std::filesystem::exists(host);
+    FileAccess access = binary_write_access(m);
+    auto *s = new FileBinaryStream(host, access);
+    log_stream_open("binary-write", name, m, access, host, existed, s->ok(),
+                    s->error());
     long long ofs = mode_offset(m);
     if(ofs != 0)
         s->SetPosition((tjs_uint64)ofs);
@@ -793,6 +971,65 @@ extern "C" int tjs2_read_text_stream_all(const char *path_utf8,
         buf[utf8.size()] = 0;
         *out_utf8 = buf;
         return 0;
+    } catch(...) {
+        return 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Factory test helpers (declared by the Rust tests)
+// ---------------------------------------------------------------------------
+
+// The `TJS_BS_*` access name the binary-write factory chooses for `mode`
+// ("TJS_BS_WRITE", "TJS_BS_APPEND" or "TJS_BS_UPDATE"). Static string; do not
+// free it.
+extern "C" const char *tjs2_test_binary_write_access(const char *mode_utf8) {
+    std::string mode = mode_utf8 ? mode_utf8 : "";
+    return reference_access_name(binary_write_access(mode));
+}
+
+// Open through the wired binary factory and close immediately. `for_write`
+// selects the write factory (non-zero) or the read factory (zero).
+// `*out_opened` is 1 when the host file actually opened; `*out_access`
+// receives the reference access name (static). Returns 0, or non-zero with a
+// malloc'd message in `*out_error`.
+extern "C" int tjs2_test_open_binary_stream(const char *name_utf8,
+                                            const char *mode_utf8,
+                                            int for_write, int *out_opened,
+                                            const char **out_access,
+                                            char **out_error) {
+    if(out_opened)
+        *out_opened = 0;
+    if(out_access)
+        *out_access = "";
+    if(out_error)
+        *out_error = nullptr;
+    if(!name_utf8)
+        return 1;
+    try {
+        std::string mode = mode_utf8 ? mode_utf8 : "";
+        TJS::ttstr name(name_utf8);
+        TJS::ttstr tmode(mode.c_str());
+        TJS::tTJSBinaryStream *stream =
+            for_write ? create_bin_write(name, tmode)
+                      : create_bin_read(name, tmode);
+        auto *binary = dynamic_cast<FileBinaryStream *>(stream);
+        if(out_opened)
+            *out_opened = (binary && binary->ok()) ? 1 : 0;
+        if(out_access)
+            *out_access = reference_access_name(
+                for_write ? binary_write_access(mode) : FileAccess::Read);
+        delete stream;
+        return 0;
+    } catch(const std::exception &err) {
+        if(out_error) {
+            std::string m = std::string("exception: ") + err.what();
+            char *buf = (char *)std::malloc(m.size() + 1);
+            if(buf)
+                std::memcpy(buf, m.c_str(), m.size() + 1);
+            *out_error = buf;
+        }
+        return 1;
     } catch(...) {
         return 1;
     }

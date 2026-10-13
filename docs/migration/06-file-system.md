@@ -1,7 +1,7 @@
 # 06 — File system
 
-Status: design sketch. Extracts raw byte IO into the bottom core and moves
-the TVP storage namespace on top of it.
+Status: implemented. Raw byte IO lives in the bottom `fs` crate and the TVP
+storage namespace sits on top of it in L2 `engine::storage`.
 
 Goal: a **stateless `FileSystem` object** plus an explicit **`FileState`**
 value. L1 knows about paths, URIs, handles, stat and listing — and nothing
@@ -11,19 +11,16 @@ keep their current surface.
 
 ---
 
-## 1. Inventory being replaced
+## 1. Inventory
 
-| Concern | Today | Target |
-|---------|-------|--------|
-| Game mount + namespace (`arc.xp3>path`, disk-over-archive, case rules, auto-path) | `engine/src/storage.rs` (concrete `PathBuf`/`fs`) | L2 `engine::storage` over the `FileSystem` object |
-| XP3 container parsing + segment read | `crates/xp3/src/archive.rs` (owns `std::fs::File`, seek/read) | L1 `fs::xp3`, a stateless parse + positional read over a `FileState`; L2 registers the parsed index |
-| Raw host path IO | `std::fs` scattered in `engine`, `tvp-storages`, `tvp-visual`, `tvp-natives`, `engine::logging`, `engine::state` | L1 `fs` (`FileSystem` + `FileState`) |
-| Stream abstraction | `tvp-streams::binary::BinaryStream` (exists, unused by storage) | L2 wrapper over a `FileState` + cursor |
-| TJS `Array.save/load/saveStruct` | C++ `std::fopen` in `tjs/cpp/streams.cpp` | unresolved; see §6 |
-| Android SAF / APK assets | SAF→path + `MANAGE_EXTERNAL_STORAGE` (option A, `docs/android.md §4`) | optional `Uri` root |
-
-The read path today has **no abstraction** (`docs/portability.md`); this is
-the largest structural change of the three bottom components.
+| Concern | Owner |
+|---------|-------|
+| Game mount + namespace (`arc.xp3>path`, disk-over-archive, case rules, auto-path) | L2 `engine::storage` over the `FileSystem` object |
+| XP3 container parsing + segment read | L1 `fs::xp3`, a stateless parse + positional read over a `FileState`; L2 registers the parsed index |
+| Raw host path IO | L1 `fs` (`FileSystem` + `FileState`); `std::fs` is platform code and stays there |
+| Stream abstraction | an L2 wrapper over a `FileState` + cursor |
+| TJS `Array.save/load/saveStruct` | C++ `std::fopen` in `tjs/cpp/streams.cpp`; the one IO path the fs surface does not reach |
+| Android SAF / APK assets | `FsPath::Uri` exists in the API; no SAF/asset backend is wired yet |
 
 ## 2. Boundaries
 
@@ -65,10 +62,11 @@ name belongs to. It never keeps a table of open files; L2 stores each
 > earlier sketch in this document and is the contract implemented by
 > `engine::storage` and `docs/migration/09-game-loading.md`.
 
-### Natives (`krkr-tjs`) keep
+### L3 (`compat`) uses
 
-The exact same method surface and error strings; only their implementation
-calls the middle layer instead of touching `std::fs`.
+The exact same method surface and error strings; its implementation calls the
+middle layer (and, where it needs file IO, the L1 `fs` abstraction) instead of
+touching `std::fs`.
 
 ## 3. Object + state, not streams
 
@@ -98,16 +96,15 @@ pub fn read_seq(fs: &FileSystem, file: &mut FileState, buf: &mut [u8])
     -> Result<usize, FsError>;
 ```
 
-The existing `tvp-streams::binary::BinaryStream` (`binary.rs:57`) remains the
-**sequential** stream the scripts see; it becomes an L2 value wrapping a
+The **sequential** stream the scripts see is an L2 value wrapping a
 `FileState` + offset. There is only one byte-IO mechanism in L1, and no
 open-file registry.
 
 `Xp3Archive` is parsed in L1 over positional reads (or a buffered `Vec<u8>`)
 instead of a live `std::fs::File`; it stores only the base offset and the
-entry map, and every read takes the owning `FileState` explicitly. L2 owns
-the `FileState`s and the parsed index. This is the prerequisite that also
-unlocks:
+entry map, and every read takes the owning `FileState` (or byte image)
+explicitly. L2 owns the `FileState`s and the parsed index. This is the
+prerequisite that also unlocks:
 * concurrent reads (no shared cursor) for parallel media/image workers;
 * Android `AssetManager`/SAF sources;
 * in-memory test fixtures.
@@ -145,13 +142,15 @@ surface makes option B *possible* without a second rewrite.
 
 These are not game-storage reads but still OS IO:
 
-* logging sink (`engine/src/logging.rs`, rotating `krkr.log`) → the
-  `FileSystem` object or a dedicated `LogSink` writer;
-* state file (`engine/src/state.rs`, `krkr_state.json`) → `FileSystem`;
-* savedata (`savedata/`) → `FileSystem`;
-* `Debug.startLogToFile` → `FileSystem`.
+* on Android the rotating `krkr.log` (`crates/android/src/log_file.rs`) and the
+  `krkr_state.json` startup-state file (`crates/android/src/state.rs`) are the
+  launcher's contract; both are plain `std` writers and are host-tested;
+* savedata (`savedata/`) is routed through the storage namespace;
+* `Debug.startLogToFile` is a native that writes through the host seam.
 
-All of them become testable with the in-memory root.
+`System.appDataPath` is supplied by the composition root through
+`CompatHost::set_app_data_path`; on Android it is the state directory the
+launcher passed in.
 
 ## 6. The C++ `fopen` bypass
 
@@ -162,13 +161,12 @@ stateless fs surface cannot reach. Options:
 | Option | Description | Cost |
 |--------|-------------|------|
 | A | Add an IO hook in `cpp/streams.cpp` that calls back into Rust (function-pointer table set at init). | C ABI addition + threading care; keeps TJS file semantics. |
-| B | Reimplement the save/load natives in Rust (`krkr-tjs`) and stop using the C++ stream. | Touches the TJS ABI; must match serialization exactly. |
+| B | Reimplement the save/load natives in Rust and stop using the C++ stream. | Touches the TJS ABI; must match serialization exactly. |
 | C | Leave as-is; document `std::fopen` as a platform escape hatch. | Degrades on Android/scoped storage; keeps `std::fs` reachable outside L1. |
 
-Plan: **A** if save files must go through the fs surface; otherwise **C** is
-acceptable for the first migration milestones and revisited before Android
-savedata hardening. This is listed as an open question in
-`07-roadmap.md §7`.
+The port currently keeps option C: `streams.cpp` is the only port-authored
+C++ besides the ABI shim, and it still uses `std::fopen`. Replacing it with a
+thin C++ adapter over a Rust implementation is deferred (`TODO.md` §12).
 
 ## 7. Case-insensitivity and archives
 
@@ -228,18 +226,15 @@ on every entry read; L1 never caches it, keeps it, or returns it.
   would implement the same functions; the in-memory root is the stepping
   stone.
 
-## 9. Migration steps specific to FS
+## 9. Implementation
 
-1. Define the stateless `FileSystem`/`FileState` API in `api`
-   (`03-middle-layer-api.md §1`).
-2. Implement the host path root + the in-memory root.
-3. Read + parse XP3 in L1 `fs::xp3` over positional reads, returning
-   only parsed index metadata; L2 owns the `FileState`s and any buffering.
-4. Move `engine::Storage` into L2 `engine` on top of the fs functions;
-   keep the current public API as a shim for natives.
-5. Route logging/state/savedata/native file IO through the fs functions.
-6. Add Android/SAF roots only if/when APK assets or SAF streaming are needed.
-7. Decide the `cpp/streams.cpp` hook.
-
-Each step is independently testable with the in-memory root and preserves
-the existing `Storages`/`Scripts` behavior.
+* The stateless `FileSystem`/`FileState` API lives in `api::fs` + `fs`
+  (`03-middle-layer-api.md §1`), with a host root and an in-memory root.
+* XP3 is read and parsed in L1 `fs::xp3` over positional reads, returning
+  parsed index metadata; L2 owns the `FileState`s and any buffering.
+* `engine::Storage` sits on top of the fs functions and owns the namespace,
+  the mount index and the auto-path table.
+* L3 file IO calls the L1 `fs` abstraction.
+* Android/SAF roots are not wired; the `FsPath::Uri` variant is reserved for
+  them.
+* The `cpp/streams.cpp` hook is not wired (option C, §6).

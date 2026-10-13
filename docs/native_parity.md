@@ -10,6 +10,7 @@ Machine-diff of the reference C++ native class surface (`reference/cpp/core/**/*
 python3 scripts/native_parity.py                 # check + regenerate this report
 python3 scripts/native_parity.py --no-doc        # check only
 python3 scripts/native_parity.py --update-allow  # accept current gaps after review
+python3 scripts/native_parity.py --self-test     # extractor fixture self-test
 ```
 
 The checker exits non-zero when a missing member is **not** listed in `scripts/native_parity_allow.txt` (a regression). When an allowlisted member is implemented it prints a stale-entry warning so the allowlist can shrink. Coverage can therefore only move in one direction.
@@ -19,11 +20,36 @@ The checker exits non-zero when a missing member is **not** listed in `scripts/n
 | metric | value |
 | --- | ---: |
 | tracked classes | 22 |
-| reference members | 636 |
-| matched | 636 |
+| reference members | 640 |
+| matched | 640 |
 | **missing** | **0** |
 | extra (Rust only) | 2 |
 | coverage | **100.0%** |
+
+## Reference registration mechanisms
+
+How each reference member becomes script-visible. `native-macro` is `TJS_BEGIN_NATIVE_*_DECL`, `constructor` the class-name entry, and `propset` a class-object member installed after the class is built with `PropSet(TJS_MEMBERENSURE, ...)`. A member reached by more than one mechanism is counted once, under the strongest.
+
+| mechanism | members |
+| --- | ---: |
+| `native-macro` | 753 |
+| `constructor` | 33 |
+| `propset` | 4 |
+
+## Class-level members installed by `PropSet`
+
+Members and class objects attached to an already-built class object. `kind` is `unknown` when `PropSet` does not reveal method versus property.
+
+| class | member | kind | static | mechanism |
+| --- | --- | --- | --- | --- |
+| `WaveSoundBuffer` | `PhaseVocoder` | unknown | true | `propset` |
+| `Window` | `BasicDrawDevice` | unknown | true | `propset` |
+| `Window` | `PassThroughDrawDevice` | unknown | true | `propset` |
+| `Window` | `menu` | unknown | true | `propset` |
+
+## Registration sites with a runtime-built name
+
+_None._
 
 ## Per-class coverage
 
@@ -31,7 +57,7 @@ The checker exits non-zero when a missing member is **not** listed in `scripts/n
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | `Layer` | 149 | 149 | 149 | 0 | 0 | 100.0% |
 | `Bitmap` | 19 | 19 | 19 | 0 | 0 | 100.0% |
-| `Window` | 82 | 82 | 82 | 0 | 0 | 100.0% |
+| `Window` | 85 | 85 | 85 | 0 | 0 | 100.0% |
 | `Font` | 21 | 21 | 21 | 0 | 0 | 100.0% |
 | `Timer` | 5 | 5 | 5 | 0 | 0 | 100.0% |
 | `System` | 49 | 49 | 49 | 0 | 0 | 100.0% |
@@ -43,7 +69,7 @@ The checker exits non-zero when a missing member is **not** listed in `scripts/n
 | `Storages` | 13 | 13 | 13 | 0 | 0 | 100.0% |
 | `Scripts` | 10 | 10 | 10 | 0 | 0 | 100.0% |
 | `KAGParser` | 24 | 26 | 24 | 0 | 2 | 100.0% |
-| `WaveSoundBuffer` | 32 | 32 | 32 | 0 | 0 | 100.0% |
+| `WaveSoundBuffer` | 33 | 33 | 33 | 0 | 0 | 100.0% |
 | `Pad` | 24 | 24 | 24 | 0 | 0 | 100.0% |
 | `Rect` | 19 | 19 | 19 | 0 | 0 | 100.0% |
 | `Clipboard` | 2 | 2 | 2 | 0 | 0 | 100.0% |
@@ -80,3 +106,12 @@ These builders have no native C++ counterpart in `reference/cpp/core` (TJS-level
 | --- | ---: | --- |
 | `SoundBuffer` | 0 | `crates/compat/src/natives/sound.rs#SoundBuffer` |
 | `SoundChannel` | 0 | `crates/compat/src/natives/sound.rs#SoundChannel` |
+
+## Extraction notes and remaining blind spots
+
+- Reference members come from `TJS_BEGIN_NATIVE_(STATIC_)METHOD/PROP_DECL` blocks, `TJS_END_NATIVE_CONSTRUCTOR_DECL`, and class-object members installed with `PropSet`/`PropSetByNum` on a variable bound by `TVPCreateNativeClass_*`/`registerObject`.
+- The Rust side is read from the builders in `RUST_CLASS_MAP`, plus `attach_class(ctx, "Target", "Member")` and a class member assigned inside an `exec_script` string, so a class attached after construction is not a false missing.
+- A `PropSet` name that is not a string literal is not counted (see the runtime-built-name section): a name built at runtime cannot be recovered from source, and a coverage figure that silently dropped it would read as evidence it does not exist.
+- A `PropSet` on an *instance* object (`this`, a dictionary, a method parameter) is not a class member and is deliberately not counted; only class-object receivers are members of the class surface.
+- `global->PropSet(...)` registers a global (a class object or a free function such as `getDirList`), not a class member; the plugin reader covers that surface, this report does not.
+- A member installed by a plugin at load time rather than in the core is outside this report; `scripts/plugin_parity.py` covers the plugin surface.

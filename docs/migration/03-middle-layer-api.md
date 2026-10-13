@@ -1,7 +1,8 @@
 # 03 — Middle-layer API (stateless objects + explicit state)
 
-Status: design sketch. Signatures are illustrative Rust; no code is written
-on this branch.
+Status: design + implemented. The signatures are implemented in
+`crates/platform/{api,fs,media,render,platform}`; the `Engine` object in §8
+is still a design sketch (D26 has not landed).
 
 This is the contract between the middle layer (L2) and the bottom core (L1).
 The bottom layer creates the **abstraction objects**; the middle layer stores
@@ -88,9 +89,9 @@ explicit `&mut` parameter. The state is a bottom-defined value
 * "Could two engines run in one process?" stays **yes**: objects are
   immutable services, all state is local to the caller.
 
-The current codebase does the opposite: it hides engine state in
-process-global statics (`history/01-investigation.md §9`) and re-derives the tree
-into Bevy entities every frame.
+The old tree did the opposite: it hid engine state in process-global statics
+(`history/01-investigation.md §9`) and re-derived the tree into entities every
+frame. The stateless split is enforced by `scripts/check-stateless.sh`.
 
 ---
 
@@ -134,7 +135,7 @@ pub enum FsPath {
 * The cursor is inside `FileState`, which L2 stores.
 * The storage namespace, `arc.xp3>path` addressing, case-insensitive walk
   and mount index are L2 state; L1 has no namespace.
-* `tvp-streams::binary::BinaryStream` becomes an L2 value wrapping a
+* The sequential stream the scripts see is an L2 value wrapping a
   `FileState` + offset.
 
 ## 2. Render pipeline
@@ -522,9 +523,12 @@ Tests construct `Engine` with a `NullRenderPipeline`, an in-memory
 
 ## 9. Enforcing the model
 
-* A CI check greps `krkr-core` for forbidden constructs (`static mut`,
-  `thread_local!`, `LazyLock`, `OnceLock`, `lazy_static!`, `OnceCell`) and
-  for `&mut self` methods on the L1 service objects.
+* `scripts/check-stateless.sh` greps the L1 crates
+  (`platform/{api,fs,media,render,platform}`) for forbidden constructs
+  (`static mut`, `thread_local!`, `LazyLock`, `OnceLock`, `lazy_static!`,
+  `OnceCell`) and for `&mut self` methods on the L1 service objects.
+  `scripts/check-layering.sh` enforces the layer vocabulary, `unsafe`
+  `SAFETY:` notes and the per-crate `missing_docs` lint.
 * An integration test constructs **two independent `RenderPipeline`/`Media`/
   `FileSystem` objects and two `Engine`s** in one process; if L1 had globals
   or object state, this would alias or fail.

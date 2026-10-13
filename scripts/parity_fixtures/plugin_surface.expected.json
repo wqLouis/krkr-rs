@@ -1,0 +1,20 @@
+{
+  "classes": {
+    "Gadget": ["ping"],
+    "Widget": ["load", "width"],
+    "Widget.Part": ["poke"],
+    "__global__": ["drawFFTGraph", "getDirList", "helper"]
+  },
+  "nested": {
+    "Motion": ["Player"],
+    "Widget": ["Part"]
+  },
+  "propset": {
+    "Motion": ["Player"],
+    "__global__": ["getDirList"]
+  },
+  "unrecoverable": [
+    "global.PropSet: dynamicName.c_str()",
+    "unresolved static member playerClass.PropSet: useD3D"
+  ]
+}

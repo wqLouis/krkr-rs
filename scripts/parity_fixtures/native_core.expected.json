@@ -1,0 +1,15 @@
+{
+  "members": {
+    "Gadget": ["ping"],
+    "Widget": [
+      "SubClass",
+      "Widget",
+      "count",
+      "create",
+      "load",
+      "menu",
+      "width"
+    ]
+  },
+  "unrecoverable": ["name.c_str()", "PropSetByNum: 0"]
+}

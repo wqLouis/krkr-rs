@@ -13,7 +13,14 @@ How it works (short version)
   (``NCB_REGISTER_CLASS``, ``NCB_REGISTER_SUBCLASS*``, ``NCB_ATTACH_CLASS*``)
   and the older ``TJS_BEGIN_NATIVE_MEMBERS(X)`` blocks attribute their members
   to the TJS target class; ``NCB_ATTACH_FUNCTION`` / ``_WITHTAG`` and
-  ``NCB_REGISTER_FUNCTION`` attach free functions to a class.  Preprocessor
+  ``NCB_REGISTER_FUNCTION`` attach free functions to a class.  Class and
+  global members installed after construction with
+  ``PropSet(TJS_MEMBERENSURE, ...)`` are read too: a namespace attaching a
+  class (``motion->PropSet("Player")`` -> ``Motion.Player``), the global
+  object registering a free function (``getDirList``), and a TJS global
+  function published from a ``TVPExecuteScript`` string (``drawFFTGraph``).
+  A ``PropSet`` whose name is built at runtime is reported as unrecoverable
+  rather than dropped.  Preprocessor
   regions disabled in a normal build (``#if 0``) are ignored, as are
   ``#define`` bodies (so the macros themselves are not mistaken for uses).
 * Rust surface: every ``.rs`` file under ``crates/compat/src/natives/plugins``
@@ -64,6 +71,7 @@ Usage
     python3 scripts/plugin_parity.py --update-allow  # refresh the allowlist
     python3 scripts/plugin_parity.py --no-doc        # skip docs/plugin_parity.md
     python3 scripts/plugin_parity.py --quiet         # only print failures
+    python3 scripts/plugin_parity.py --self-test     # extractor fixture self-test
     python3 scripts/plugin_parity.py --runtime target/runtime_surface.json \
         --no-doc                                     # check the live VM surface
 
@@ -75,8 +83,10 @@ from __future__ import annotations
 import argparse
 import datetime
 import glob
+import json
 import re
 import sys
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -94,6 +104,7 @@ RUST_PLUGINS_DIR = REPO_ROOT / "crates" / "compat" / "src" / "natives" / "plugin
 RUST_NATIVES_DIR = REPO_ROOT / "crates" / "compat" / "src" / "natives"
 ALLOWLIST_PATH = SCRIPT_DIR / "plugin_parity_allow.txt"
 DOC_PATH = REPO_ROOT / "docs" / "plugin_parity.md"
+FIXTURES_DIR = REPO_ROOT / "scripts" / "parity_fixtures"
 
 REFERENCE_GLOBS = ("**/*.cpp", "**/*.hpp", "**/*.h")
 
@@ -152,6 +163,8 @@ class ReferenceModel:
     nested_by_ns: dict[str, dict[str, str]] = field(default_factory=dict)
     namespace_objects: set[str] = field(default_factory=set)
     published_top_level: set[str] = field(default_factory=set)
+    unrecoverable: list[str] = field(default_factory=list)
+    propset_members: dict[str, set[str]] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +232,82 @@ _REGISTER_FUNCTION_RE = re.compile(
 _TJS_CREATE_CLASS_RE = re.compile(
     r"TJSCreateNativeClassForPlugin\s*\(\s*TJS_W\s*\(\s*\"([^\"]+)\""
 )
+
+# Class-level registration performed after a class/object is built.
+# ``_PLUGIN_PROPSET_RE`` finds the receiver; ``_split_call_args`` reads the
+# flag/name arguments.  A namespace object is a variable bound (usually via
+# ``global->PropGet(..., TJS_W("Motion"), ...)``) to a namespace dispatch.
+_PLUGIN_PROPSET_RE = re.compile(
+    r"([A-Za-z_]\w*)\s*(?:->|\.)\s*(PropSet|PropSetByNum)\s*\("
+)
+_PLUGIN_PROPGET_RE = re.compile(r"\bPropGet\s*\(")
+_PLUGIN_AS_OBJECT_RE = re.compile(
+    r"([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*)\s*\.\s*AsObjectNoAddRef\s*\("
+)
+_SCRIPT_GLOBAL_FUNCTION_RE = re.compile(r"\bfunction\s+([A-Za-z_]\w*)\s*\(")
+
+
+def _plugin_namespace_bindings(src: str) -> dict[str, str]:
+    """Namespace-object variable -> TJS namespace name for one plugin file.
+
+    The reference reaches a namespace object by reading a global
+    (``global->PropGet(0, TJS_W("Motion"), ..., &motionVar, global)`` then
+    ``motion = motionVar.AsObjectNoAddRef()``).  ``global`` itself always maps
+    to the synthetic global class.
+    """
+    bindings: dict[str, str] = {"global": GLOBAL_CLASS}
+    propvars: dict[str, set[str]] = {}
+    for m in _PLUGIN_PROPGET_RE.finditer(src):
+        args = np._split_cpp_args(src, m.end() - 1)
+        name = None
+        out_var = None
+        for arg in args:
+            literal = np._cpp_string_literal(arg)
+            if literal is not None:
+                name = literal
+            om = re.fullmatch(r"&\s*([A-Za-z_]\w*)", arg)
+            if om:
+                out_var = om.group(1)
+        if name and out_var:
+            propvars.setdefault(out_var, set()).add(name)
+    for m in _PLUGIN_AS_OBJECT_RE.finditer(src):
+        var, propvar = m.group(1), m.group(2)
+        # A scratch variant (``tmp``) is often reused by several ``PropGet``
+        # calls, so only a single-valued binding is trusted.
+        names = propvars.get(propvar)
+        if names is not None and len(names) == 1:
+            bindings[var] = next(iter(names))
+    return bindings
+
+
+def _script_globals(classes: dict[str, set[str]], src: str) -> set[str]:
+    """Global TJS functions defined in ``TVPExecuteScript`` strings.
+
+    ``fftgraph.cpp`` publishes ``drawFFTGraph`` from a script string, the same
+    way ``_script_classes`` reads script classes.  Functions declared inside a
+    class body the reader already harvested are excluded.
+    """
+    class_members = {m for members in classes.values() for m in members}
+    out: set[str] = set()
+    for m in re.finditer(r"\bTVPExecuteScript\s*\(", src):
+        args, _ = _split_call_args(src, m.end() - 1)
+        script = _script_text(" ".join(args))
+        for fm in _SCRIPT_GLOBAL_FUNCTION_RE.finditer(script):
+            name = fm.group(1)
+            if name not in class_members:
+                out.add(name)
+    return out
+
+
+def _plugin_propset_sites(src: str) -> list[tuple[str, str, str, str]]:
+    """``(receiver, method, flag_text, name_expr)`` for each class-level call."""
+    out: list[tuple[str, str, str, str]] = []
+    for m in _PLUGIN_PROPSET_RE.finditer(src):
+        args = np._split_cpp_args(src, m.end() - 1)
+        if len(args) < 2:
+            continue
+        out.append((m.group(1), m.group(2), args[0], args[1]))
+    return out
 
 
 def _blank_directives(src: str) -> str:
@@ -497,10 +586,11 @@ def _iter_reference_files() -> list[Path]:
     return files
 
 
-def parse_reference() -> ReferenceModel:
+def parse_reference(sources: "list[Path] | None" = None) -> ReferenceModel:
     """Return the reference plugin surface as a :class:`ReferenceModel`.
 
-    Class blocks are classified top-level vs. ``NCB_REGISTER_SUBCLASS``
+    ``sources`` overrides the reference plugin directory; the self-test passes
+    a single fixture file.  Class blocks are classified top-level vs. ``NCB_REGISTER_SUBCLASS``
     (nested).  The ``NCB_SUBCLASS``/``SubClass`` attachments inside a
     top-level block map their internal classes onto the dotted
     ``Namespace.name`` surface, so a class is compared at the place the
@@ -514,16 +604,19 @@ def parse_reference() -> ReferenceModel:
     nested_by_ns: dict[str, dict[str, str]] = {}
     namespace_objects: set[str] = set()
     published_top_level: set[str] = set()
+    unrecoverable: list[str] = []
+    global_members: set[str] = set()
+    propset_members: dict[str, set[str]] = {}
 
     files: list[tuple[Path, str, list[tuple[int, int, str, "str | None", str]]]] = []
-    for fp in _iter_reference_files():
+    for fp in (sources if sources is not None else _iter_reference_files()):
         raw = fp.read_text(encoding="utf-8", errors="replace")
         src = _blank_directives(np._strip_cpp_comments(np._preprocess_cpp(raw)))
         files.append((fp, src, _collect_class_spans(src)))
 
     # Namespace nesting first: a namespace may attach a nested class defined
     # earlier in the same translation unit.
-    for _fp, src, spans in files:
+    for fp, src, spans in files:
         for start, end, cls, _impl, kind in spans:
             if kind == "top":
                 published_top_level.add(cls)
@@ -536,6 +629,42 @@ def parse_reference() -> ReferenceModel:
         for script_cls, script_members in _script_classes(src).items():
             classes.setdefault(script_cls, set()).update(script_members)
             published_top_level.add(script_cls)
+
+        # Class-level members installed after construction.  A namespace
+        # object (``Motion``) can attach a class with ``PropSet``; the global
+        # object registers a free function (``getDirList``); a class object
+        # with ``TJS_STATICMEMBER`` whose receiver is a lambda parameter cannot
+        # be attributed, and a name that is not a literal is unrecoverable.
+        bindings = _plugin_namespace_bindings(src)
+        for var, method, flag, name_expr in _plugin_propset_sites(src):
+            target = bindings.get(var)
+            name = np._cpp_string_literal(name_expr)
+            rel = str(fp.relative_to(REPO_ROOT))
+            if target == GLOBAL_CLASS:
+                if name:
+                    global_members.add(name)
+                    propset_members.setdefault(GLOBAL_CLASS, set()).add(name)
+                else:
+                    unrecoverable.append(f"{rel}: global.{method}: {name_expr}")
+                continue
+            if target is not None:
+                if name:
+                    nested_by_ns.setdefault(target, {})[name] = name
+                    namespace_objects.add(target)
+                    propset_members.setdefault(target, set()).add(name)
+                else:
+                    unrecoverable.append(
+                        f"{rel}: {target}.{var}.{method}: {name_expr}"
+                    )
+                continue
+            if "TJS_STATICMEMBER" in flag:
+                # A class object passed to a helper (``playerClass``); the
+                # literal name is visible but the class is not statically
+                # bound here.
+                detail = name if name is not None else name_expr
+                unrecoverable.append(
+                    f"{rel}: unresolved static member {var}.{method}: {detail}"
+                )
 
     nested_visible: dict[str, str] = {}
     for ns, mapping in nested_by_ns.items():
@@ -582,6 +711,10 @@ def parse_reference() -> ReferenceModel:
                 classes.setdefault(cls, set())
                 published_top_level.add(cls)
 
+        # Global functions published from a script string, and the
+        # ``global->PropSet`` free functions collected in the first pass.
+        classes.setdefault(GLOBAL_CLASS, set()).update(_script_globals(classes, src))
+
         # Manual ``addMethod(dispatch, TJS_W("name"), ..)`` registrations: the
         # target class is the class named in the nearest previous ``PropGet``.
         # Record the member under the file stem too, so a Rust class named after
@@ -611,12 +744,16 @@ def parse_reference() -> ReferenceModel:
                     classes.setdefault(cls, set()).update(names)
                     published_top_level.add(cls)
 
+    classes.setdefault(GLOBAL_CLASS, set()).update(global_members)
+
     return ReferenceModel(
         classes=classes,
         impl_classes=impl_classes,
         nested_by_ns=nested_by_ns,
         namespace_objects=namespace_objects,
         published_top_level=published_top_level,
+        unrecoverable=unrecoverable,
+        propset_members=propset_members,
     )
 
 
@@ -1240,6 +1377,16 @@ def _parse_rust_file(
         for cls, names in _rust_data_members(code, raw, bindings).items():
             result.setdefault(cls, set()).update(names)
 
+    # TJS functions installed from a script string.  They are not attributed
+    # to a class; ``parse_rust`` keeps only the names the reference publishes
+    # as globals.
+    script_globals: set[str] = set()
+    for _off, (_end, content, _quote) in strings.items():
+        for m in _SCRIPT_GLOBAL_FUNCTION_RE.finditer(content):
+            script_globals.add(m.group(1))
+    if script_globals:
+        result.setdefault("__script__", set()).update(script_globals)
+
     return result, dynamic
 
 
@@ -1275,7 +1422,9 @@ def _is_plugin_file(path: Path) -> bool:
         return False
 
 
-def parse_rust() -> tuple[
+def parse_rust(
+    global_names: "set[str] | None" = None,
+) -> tuple[
     dict[str, set[str]],
     dict[str, list[str]],
     dict[str, set[str]],
@@ -1287,6 +1436,10 @@ def parse_rust() -> tuple[
 ]:
     """Return ``(members, sources, plugin_only, core_members, dynamic_groups,
     aliases, plugin_classes, core_classes)``.
+
+    ``global_names`` is the reference global-function surface; a script-defined
+    function is kept only when it is one of those names, so an internal helper
+    installed with ``exec_script`` is not mistaken for script surface.
 
     ``plugin_only`` holds the members registered by a plugin file that no core
     file also registers; those are the only candidates for a *plugin* extra.
@@ -1317,6 +1470,9 @@ def parse_rust() -> tuple[
     dynamic: list[tuple[str, int, "int | None", set[str], set[str], Path]] = []
     for path, raw, code, strings, local in files:
         res, dyn = _parse_rust_file(path, raw, code, strings, local, global_defs)
+        script_members = res.pop("__script__", set())
+        if global_names is not None:
+            res.setdefault(GLOBAL_CLASS, set()).update(script_members & global_names)
         rel = str(path.relative_to(REPO_ROOT))
         is_plugin = _is_plugin_file(path)
         target = plugin_members if is_plugin else core_members
@@ -1390,28 +1546,54 @@ def parse_rust() -> tuple[
 
 
 def read_allowlist(path: Path) -> set[str]:
+    return set(read_allowlist_reasons(path))
+
+
+def read_allowlist_reasons(path: Path) -> "OrderedDict[str, str]":
+    """Allowlist entries as ``{key: reason}``.
+
+    An entry is ``Class.member`` (optionally ``Namespace.Name`` or a namespace
+    object) followed by a reason after an em dash, ``#`` or `` -- ``.  A
+    reason starting with ``debt:`` marks a deliberately-baselined known gap
+    (mirrors ``scripts/layering_allow.txt``); a bare entry has an empty reason.
+    """
+    entries: "OrderedDict[str, str]" = OrderedDict()
     if not path.exists():
-        return set()
-    entries: set[str] = set()
+        return entries
     for line in path.read_text(encoding="utf-8").splitlines():
-        item = line.strip()
-        if not item or item.startswith("#"):
+        text = line.strip()
+        if not text or text.startswith("#"):
             continue
-        entries.add(item)
+        for sep in ("\u2014", " -- ", " # "):
+            if sep in text:
+                key, _, reason = text.partition(sep)
+                entries[key.strip()] = reason.strip()
+                break
+        else:
+            entries[text] = ""
     return entries
 
 
-def write_allowlist(path: Path, entries: set[str]) -> None:
+def write_allowlist(
+    path: Path, entries: set[str], reasons: "dict[str, str] | None" = None
+) -> None:
     header = (
         "# Plugin parity allowlist: reference surface that is known-missing.\n"
-        "# One entry per line: Class.member, a class (`GdiPlus.Image`), or a\n"
-        "# namespace object (`GdiPlus`).\n"
+        "# One entry per line: Class.member, a class (`GdiPlus.Image`) or a\n"
+        "# namespace object (`GdiPlus`), optionally followed by '— reason'.\n"
+        "# A reason beginning with 'debt:' records a known gap that is accepted\n"
+        "# but still visible; see docs/audits/propset-parity.md.\n"
         "# Regenerate after intentional additions with:\n"
         "#   python3 scripts/plugin_parity.py --update-allow\n"
         "# The checker fails when a missing entry is not listed here.\n"
         "\n"
     )
-    body = "\n".join(sorted(entries))
+    reasons = reasons or {}
+    lines = []
+    for key in sorted(entries):
+        reason = (reasons.get(key) or "").strip()
+        lines.append(f"{key} \u2014 {reason}" if reason else key)
+    body = "\n".join(lines)
     path.write_text(header + body + ("\n" if body else ""), encoding="utf-8")
 
 
@@ -1426,10 +1608,14 @@ def build_report(
     structure_missing: "set[str] | None" = None,
     wrong_level_failures: "list[str] | None" = None,
     port_only_failures: "list[str] | None" = None,
+    propset_members: "dict[str, set[str]] | None" = None,
+    unrecoverable: "list[str] | None" = None,
 ) -> str:
     structure_missing = structure_missing or set()
     wrong_level_failures = wrong_level_failures or []
     port_only_failures = port_only_failures or []
+    propset_members = propset_members or {}
+    unrecoverable = unrecoverable or []
     total_ref = sum(len(ref.get(c, ())) for c in tracked)
     total_matched = sum(len(ref.get(c, set()) & rust.get(c, set())) for c in tracked)
     total_missing = sum(len(missing_by_class.get(c, ())) for c in tracked)
@@ -1462,6 +1648,7 @@ def build_report(
     lines.append("python3 scripts/plugin_parity.py                 # check + regenerate this report")
     lines.append("python3 scripts/plugin_parity.py --no-doc        # check only")
     lines.append("python3 scripts/plugin_parity.py --update-allow  # accept current gaps after review")
+    lines.append("python3 scripts/plugin_parity.py --self-test     # extractor fixture self-test")
     lines.append("```")
     lines.append("")
     lines.append(
@@ -1482,6 +1669,45 @@ def build_report(
     lines.append(f"| extra (genuine plugin additions) | {total_extra} |")
     lines.append(f"| core members (not plugin extras) | {total_core} |")
     lines.append(f"| coverage | **{coverage:.1f}%** |")
+    lines.append("")
+
+    lines.append("## Members installed by `PropSet`")
+    lines.append("")
+    lines.append(
+        "Class and global members the reference installs after construction "
+        "with ``PropSet(TJS_MEMBERENSURE, ...)``: a namespace attaching a class "
+        "(``Motion.Player``), the global object registering a free function "
+        "(``getDirList``), or a class-object member. ``kind`` is unknown "
+        "because ``PropSet`` does not reveal method versus property."
+    )
+    lines.append("")
+    if propset_members:
+        lines.append("| class | member | kind | static | mechanism |")
+        lines.append("| --- | --- | --- | --- | --- |")
+        for cls in sorted(propset_members):
+            for member in sorted(propset_members[cls]):
+                lines.append(
+                    f"| `{cls}` | `{member}` | unknown | true | `propset` |"
+                )
+    else:
+        lines.append("_None._")
+    lines.append("")
+
+    lines.append("## Registration sites with a runtime-built name")
+    lines.append("")
+    if unrecoverable:
+        lines.append(
+            f"{len(unrecoverable)} site(s) install a member whose name is not a "
+            "string literal, or whose receiver is a helper parameter, so the "
+            "source reader cannot recover it. These are not counted as "
+            "members: the coverage figures exclude them, which is a remaining "
+            "blind spot, not a claim they do not exist."
+        )
+        lines.append("")
+        for site in unrecoverable:
+            lines.append(f"- `{site}`")
+    else:
+        lines.append("_None._")
     lines.append("")
 
     lines.append("## Per-class coverage")
@@ -1638,6 +1864,25 @@ def build_report(
         "a hard failure, as is a nested class leaking to the top level. A "
         "missing namespace object or nested class is an allowlistable ratchet gap."
     )
+    lines.append(
+        "- Class and global members installed after construction with "
+        "`PropSet(TJS_MEMBERENSURE, ...)` are read too: a namespace attaching a "
+        "class (`motion->PropSet(\"Player\")` -> `Motion.Player`), the global "
+        "object registering a free function (`getDirList`), and a TJS global "
+        "function published from a `TVPExecuteScript` string (`drawFFTGraph`)."
+    )
+    lines.append(
+        "- Remaining blind spots: a `PropSet` name built at runtime "
+        "(`idstr.c_str()`) or a static member on an unresolved helper parameter "
+        "(`playerClass->PropSet(...)`) is recorded as unrecoverable, not counted; "
+        "the coverage figures therefore exclude it rather than claiming it absent."
+    )
+    lines.append(
+        "- A `PropSet` on an instance object (a window, a dictionary, a method "
+        "parameter) is not a class member and is not counted. A member installed "
+        "by a plugin DLL that has no `reference/cpp` source is outside this "
+        "report until its surface is extracted (D38)."
+    )
     lines.append("")
     lines.append("## Documented exclusions")
     lines.append("")
@@ -1761,6 +2006,67 @@ def _port_only_class_failures(
     return failures
 
 
+def self_test(verbose: bool = True) -> int:
+    """Assert the reference extractor still sees each registration mechanism.
+
+    ``scripts/parity_fixtures/plugin_surface.cpp`` exercises the ncbind macro
+    blocks, class/namespace/global ``PropSet`` registrations and a script
+    global, plus a runtime-built name that must be reported as unrecoverable.
+    """
+    fixture = FIXTURES_DIR / "plugin_surface.cpp"
+    expected_path = FIXTURES_DIR / "plugin_surface.expected.json"
+    for path in (fixture, expected_path):
+        if not path.is_file():
+            print(f"plugin_parity: self-test fixture missing: {path}")
+            return 1
+    expected = json.loads(expected_path.read_text(encoding="utf-8"))
+    model = parse_reference([fixture])
+
+    problems: list[str] = []
+
+    def diff_map(label: str, got: dict, want: dict) -> None:
+        for key in sorted(set(got) | set(want)):
+            g = set(got.get(key, []))
+            w = set(want.get(key, []))
+            if g - w:
+                problems.append(f"{label}[{key}]: unexpected {sorted(g - w)}")
+            if w - g:
+                problems.append(f"{label}[{key}]: missing {sorted(w - g)}")
+
+    diff_map("classes", model.classes, expected["classes"])
+    diff_map(
+        "nested",
+        {ns: set(mapping) for ns, mapping in model.nested_by_ns.items()},
+        expected.get("nested", {}),
+    )
+    diff_map("propset", model.propset_members, expected.get("propset", {}))
+
+    want_unrecoverable = expected.get("unrecoverable", [])
+    if len(model.unrecoverable) != len(want_unrecoverable):
+        problems.append(
+            "unrecoverable sites: expected "
+            f"{len(want_unrecoverable)}, got {len(model.unrecoverable)}: "
+            f"{model.unrecoverable}"
+        )
+    for needle in want_unrecoverable:
+        if not any(needle in site for site in model.unrecoverable):
+            problems.append(f"unrecoverable sites: no site matching {needle!r}")
+
+    if problems:
+        print("plugin_parity: extractor self-test FAILED:")
+        for problem in problems:
+            print(f"  {problem}")
+        print("  Fix the extractor; do not silence the self-test.")
+        return 1
+    total = sum(len(v) for v in model.classes.values())
+    if verbose:
+        print(
+            "plugin_parity: extractor self-test ok "
+            f"({total} members, {len(model.unrecoverable)} unrecoverable site(s))"
+        )
+    return 0
+
+
 def _check_runtime(args: argparse.Namespace) -> int:
     """Compare the parsed reference plugin surface against a runtime dump.
 
@@ -1813,15 +2119,16 @@ def _check_runtime(args: argparse.Namespace) -> int:
         source_aliases,
         plugin_classes,
         core_classes,
-    ) = parse_rust()
+    ) = parse_rust(reference.classes.get(GLOBAL_CLASS, set()))
     alias_visible = {
         f"{ns}.{public}"
-        for public, _internal, keeps in source_aliases
-        if not keeps
+        for public, _internal, _keeps in source_aliases
         for ns in reference.nested_by_ns
         if public in reference.nested_by_ns[ns]
     }
-    structure_missing = _missing_structure_entries(reference, set(runtime))
+    structure_missing = _missing_structure_entries(
+        reference, set(runtime) | alias_visible
+    )
     if structure_missing:
         print(
             f"plugin_parity(runtime): {len(structure_missing)} namespace/nested "
@@ -1862,6 +2169,11 @@ def main(argv: list[str] | None = None) -> int:
         "--quiet", action="store_true", help="only print failures/stale warnings"
     )
     parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="run the extractor self-test against scripts/parity_fixtures and exit",
+    )
+    parser.add_argument(
         "--runtime",
         metavar="PATH",
         help="compare the parsed reference plugin surface against a "
@@ -1869,6 +2181,14 @@ def main(argv: list[str] | None = None) -> int:
         "does not touch the allowlist)",
     )
     args = parser.parse_args(argv)
+
+    # A regex that silently stops matching is the failure mode; run the
+    # fixture self-test on every invocation (the guard scripts do the same).
+    selftest = self_test(verbose=not args.quiet)
+    if selftest != 0:
+        return selftest
+    if args.self_test:
+        return 0
 
     if args.runtime:
         return _check_runtime(args)
@@ -1885,7 +2205,7 @@ def main(argv: list[str] | None = None) -> int:
         aliases,
         plugin_classes,
         core_classes,
-    ) = parse_rust()
+    ) = parse_rust(reference.classes.get(GLOBAL_CLASS, set()))
 
     # Rust classes that are the port of a reference class under another name
     # (``Motion.Rect`` -> ``MotionRect``).  Drop the alias's own name from the
@@ -1907,8 +2227,6 @@ def main(argv: list[str] | None = None) -> int:
     # so ``Motion.Point`` matches and the bare global is not an extra.
     alias_visible: dict[str, str] = {}
     for public, internal, keeps_global in aliases:
-        if keeps_global:
-            continue
         ns = next(
             (n for n, mapping in reference.nested_by_ns.items() if public in mapping),
             None,
@@ -1916,6 +2234,12 @@ def main(argv: list[str] | None = None) -> int:
         if ns is None:
             continue
         dotted = f"{ns}.{public}"
+        if keeps_global:
+            # The reference attaches the class into the namespace with
+            # ``PropSet`` *and* leaves the global in place; the port keeps the
+            # global, so the dotted name must still count as present.
+            alias_visible[public] = dotted
+            continue
         internal_key = RUST_CLASS_ALIASES.get(internal, internal)
         moved = set(plugin_only.get(internal_key, ())) | set(
             plugin_only.get(public, ())
@@ -1977,7 +2301,9 @@ def main(argv: list[str] | None = None) -> int:
     # A missing namespace object or nested class is a ratchet gap, not a
     # wrong-level registration; key it like a member so ``--update-allow``
     # accepts it (``GdiPlus`` / ``GdiPlus.Image``).
-    structure_missing = _missing_structure_entries(reference, set(rust))
+    structure_missing = _missing_structure_entries(
+        reference, set(rust) | set(alias_visible.values())
+    )
     all_missing = {
         f"{cls}.{member}"
         for cls, missing in missing_by_class.items()
@@ -1986,7 +2312,9 @@ def main(argv: list[str] | None = None) -> int:
 
     allow = read_allowlist(ALLOWLIST_PATH)
     if args.update_allow:
-        write_allowlist(ALLOWLIST_PATH, all_missing)
+        write_allowlist(
+            ALLOWLIST_PATH, all_missing, read_allowlist_reasons(ALLOWLIST_PATH)
+        )
         print(
             f"plugin_parity: wrote {len(all_missing)} known-missing entries to "
             f"{ALLOWLIST_PATH.relative_to(REPO_ROOT)}"
@@ -2021,6 +2349,8 @@ def main(argv: list[str] | None = None) -> int:
                 structure_missing,
                 wrong_level_failures,
                 port_only_failures,
+                reference.propset_members,
+                reference.unrecoverable,
             ),
             encoding="utf-8",
         )

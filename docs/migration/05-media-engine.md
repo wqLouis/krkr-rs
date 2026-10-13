@@ -1,41 +1,40 @@
 # 05 — Media engine
 
-Status: design sketch. Extracts decoding from `tvp-sound`, `tvp-visual` and
-`tvp-natives/video` into the bottom core.
-
-Goal: one bottom-layer media engine that decodes images, audio and video,
-with two platform backends — **system FFmpeg on Linux** and **Android
+Status: implemented. One bottom-layer media crate decodes images, audio and
+video, with two platform backends — **system FFmpeg on Linux** and **Android
 MediaCodec** — behind the TVP-free stateless [`media`](03-middle-layer-api.md#4-media)
 API. The mixer, sound object model, `.sli` loops, video-overlay events and
-all script semantics stay in the middle layer.
+all script semantics are L2/L3.
 
 ---
 
-## 1. Inventory being replaced
+## 1. Inventory
 
-| Concern | Today | Target |
-|---------|-------|--------|
-| Image decode | `tvp-visual/src/bitmap.rs::decode_image` + `tlg.rs` + `image` crate | `media` (shared `ImageDecoder`) |
-| Audio decode | `tvp-sound/src/decode.rs` (symphonia + libopus), `source.rs` policy | `media` (FFmpeg audio / MediaCodec audio) |
-| Audio mixer/model | `tvp-sound/src/mixer.rs`, `wavesound.rs`, `natives.rs`, `sli.rs` | stays L2 `engine` |
-| Audio output | `tvp-sound/src/player.rs` (rodio/cpal) | `krkr-core` `AudioDevice` |
-| Video decode | `tvp-natives/src/video/{ffmpeg,android,yuv}.rs` | `media` (two backends) |
-| Video overlay events | `tvp-natives/src/video_overlay.rs` | stays L2 (polls the engine) |
-| Format registry | ad hoc per path | declared per backend |
+| Concern | Owner |
+|---------|-------|
+| Image decode (TLG5/6 + `image` formats) | `media` (`image_decode`, `tlg`) |
+| Image encode (PNG/BMP/JPEG) | `media` (`image_encode`) |
+| Audio decode (symphonia + Opus adapter) | `media` (`audio`) |
+| Audio mixer/model | L2 `engine::sound` |
+| Audio output device | L1 `platform::audio` |
+| Video decode | `media::video` (FFmpeg | MediaCodec) |
+| Video overlay events | L2 `engine::video` + L3 `compat` |
+| YUV conversion | `media::yuv` |
 
-The current split is already close: `tvp-sound` and `tvp-natives/video` are
-Bevy-free, and the `MovieDecoder` interface already abstracts FFmpeg vs
-MediaCodec. This is the least disruptive of the three bottom components.
+The split is complete: `media` is Bevy-free and links no graphics or windowing
+dependency, and the FFmpeg backend is behind the `video-ffmpeg` feature.
 
 ## 2. Engine shape
 
 ```
 media
-  ├─ image/                 format sniffing, TLG5/6, image crate
-  ├─ audio/                 probe, decode-all, streaming decoder
-  ├─ video/                 probe, open, present_at, audio track
-  ├─ backend/ffmpeg.rs      Linux: ffmpeg-next (+ symphonia for codecs it lacks)
-  └─ backend/mediacodec.rs  Android: AMediaExtractor + AMediaCodec
+  ├─ image_decode.rs        format sniffing + the image crate
+  ├─ tlg.rs                 TLG5/TLG6
+  ├─ image_encode.rs        PNG/BMP/JPEG encode
+  ├─ audio.rs               probe, decode-all, streaming decoder
+  ├─ video/ffmpeg.rs        Linux: ffmpeg-next
+  ├─ video/mediacodec.rs    Android: AMediaExtractor + AMediaCodec
+  └─ yuv.rs                 YUV → RGBA8
 ```
 
 The API is stateless (D9): pure free functions for image/whole-file audio
@@ -46,16 +45,17 @@ except for trivially small probes.
 
 ## 3. Image decode
 
-* Move `tvp-visual/src/tlg.rs` and the `decode_image` dispatch into
-  `media`. TLG is a pure format and has no platform dependency.
-* Keep the current order: extension hint → magic sniff (`image::guess_format`)
-  → decode. TLG by extension and by `TLG` magic.
+* `tlg.rs` and the `decode_image` dispatch live in `media`; TLG is a pure
+  format with no platform dependency.
+* The order is: extension hint → magic sniff (`image::guess_format`) →
+  decode. TLG by extension and by `TLG` magic.
 * `probe_image` returns dimensions/alpha/format without full decode (used by
   `loadHeader`).
-* Async decode path: the existing `AsyncTrigger`/poll machinery
-  (`tvp-visual/src/natives/bitmap.rs::loadAsync`) stays in L2 and owns the
-  completion table; L1 is just the pure `decode_image` call plus, if
-  needed, an L2-scheduled worker.
+* Async decode path: the script-facing `AsyncTrigger`/poll machinery stays
+  in L2/L3 and owns the completion table; L1 is the pure `decode_image` call
+  plus, where needed, an L2-scheduled worker. Image decoding is currently
+  synchronous on the VM thread; the async/decode-worker path is tracked in
+  `TODO.md` §16.
 * Image **save** (TLG5/TLG6, PNG) lives in `media` too, because it is a
   format concern. `Bitmap.saveLayerImage`/`save` go through it.
 * Supported formats stay the current `image` 0.25 feature list (png, jpeg,
@@ -64,13 +64,13 @@ except for trivially small probes.
 
 ## 4. Audio decode
 
-### 4.1 What moves
+### 4.1 Decoder
 
-* symphonia setup, codec registry, Opus adapter (`decode.rs`);
+* symphonia setup, codec registry, Opus adapter (`audio.rs`);
 * probe/whole-file/streaming shapes (`AudioMetadata`, `DecodedAudio`,
-  `StreamDecoder::next_chunk`);
+  `AudioDecoderState`);
 * the compressed-buffer sharing (`Arc<[u8]>`) and ring-buffer decode-ahead
-  policy (`source.rs`).
+  policy.
 
 ### 4.2 What stays L2
 
@@ -83,11 +83,10 @@ except for trivially small probes.
 
 ### 4.3 Backend split
 
-On Linux the current symphonia path is already the decode engine; the plan
-is to keep it and add FFmpeg audio only where symphonia lacks a codec. On
-Android the plan is `AMediaCodec` for AAC/video audio with symphonia for
-wav/ogg/mp3. The same free functions and decoder values are
-used either way, so the mixer never learns which backend ran.
+Audio decoding is symphonia on both targets (wav/pcm, ogg/vorbis, flac, mp3)
+plus the Opus adapter; there is no separate FFmpeg audio path. Video uses
+FFmpeg on Linux and MediaCodec on Android. The same free functions and decoder
+values are used either way, so the mixer never learns which backend ran.
 
 ### 4.4 Long tracks
 
@@ -112,12 +111,13 @@ Keep the current `MovieDecoder` semantics as an L1-defined
 
 ### 5.2 FFmpeg backend (Linux)
 
-* `ffmpeg-next` with the existing in-memory custom `StreamIo` (no temp
-  file); L2 reads the bytes through `fs` and passes them in.
-* Reuse `present_at`, `next_video_frame`, `convert_video` (swscale→RGBA),
-  `drain_audio` (swresample→f32) verbatim.
-* Fix the known inefficiency: audio is decoded fully at `open`
-  (`ffmpeg.rs:234`); the target streams it through the audio decode API.
+* `ffmpeg-next` with the in-memory custom `StreamIo` (no temp file); L2 reads
+  the bytes through `fs` and passes them in.
+* `present_video`, `next_video_frame`, `convert_video` (swscale→RGBA) and
+  `drain_audio` (swresample→f32) are implemented.
+* **Known inefficiency:** the audio track is decoded fully at `open`
+  (`decode_audio_track`); streaming the audio through the audio decode API is
+  open work (`TODO.md` §9 `M5`).
 
 ### 5.3 MediaCodec backend (Android)
 
@@ -129,24 +129,15 @@ Keep the current `MovieDecoder` semantics as an L1-defined
 * This backend is compile-verified and host-tests its pure parts but is
   **runtime-untested**; it stays that way until run on a device
   (`docs/android.md §6`).
-* No JNI is needed for decode (`libmediandk`); JNI remains only in the
-  Android host crate.
 
 ### 5.4 Feeding L2
 
-The current `VideoOverlay` does **not** feed the mixer or the renderer
-(`video_overlay.rs`); it exposes `frameBytes` and composites over a mixing
-layer's `MainImage`. The migration adds the two missing sinks without
-changing the public native API:
-
-1. **Frame sink**: `present_video` returns `RgbaFrame`; L2 blits it into the
-   target layer's `BitmapState` (CPU) exactly like `compose_mixing` does
-   today, or emits a texture update. This is what makes video visible
-   through the normal layer system.
-2. **PCM sink**: `video_audio` returns interleaved `f32`; L2 installs it as
-   a mixer source so video audio actually plays.
-
-Both are L2 changes; the engine API already produces the required data.
+The video frame sink exists: `present_video` returns an `RgbaFrame` and L2
+blits it into the target layer's `BitmapState` (CPU), so video is visible
+through the normal layer system; `blit_frame_to_layer_opacity` composites
+it into `layer1`/`layer2` and the mixing layer. The `video_audio` PCM sink
+returns interleaved `f32`; installing it as a mixer source remains open:
+the FFmpeg backend still decodes the whole audio track eagerly (§5.2).
 
 ## 6. Threading and the poll contract
 
@@ -163,9 +154,10 @@ The **L2 worker pool** owns its threads; L1 is stateless functions. Rules:
 * Pure L1 functions are freely `Send`; RAII decoder values are owned by L2
   and need not be `Sync`.
 
-L2 drains completions at a fixed point each frame (today: the top of
-`run_vm`, with `sound_poll`/`video_overlay_poll`/`async_poll`), before the
-render list is built.
+L2 drains completions at a fixed point each frame: the host runs the ordered
+`compat::run_frame_body` sequence (`timer_poll → sound_poll → video_poll →
+async_trigger_poll → continuous_handler_poll → project_and_render`), before
+the render list is built.
 
 ## 7. Errors and capability detection
 
@@ -189,27 +181,20 @@ render list is built.
 | FFmpeg dependency | system pkg-config | **none** |
 | JNI for decode | n/a | none (libmediandk) |
 
-Cargo features mirror the current `ffmpeg` pass-through
-(`crates/platform/render/Cargo.toml`, `crates/app/Cargo.toml`,
-`crates/tvp-natives/Cargo.toml`): the media engine's `ffmpeg` feature is
-enabled for desktop and off on Android, where `mediacodec` is enabled
-instead.
+Cargo features: the `media` crate's `video-ffmpeg` feature is the default for
+desktop and is turned off on Android, where `video-mediacodec` is selected
+instead (`crates/platform/media/Cargo.toml`, `crates/app/Cargo.toml`,
+`crates/android/Cargo.toml`).
 
-## 9. Migration steps specific to media
+## 9. Implementation
 
-1. Define the stateless media signatures + DTOs in `api`
-   (`03-middle-layer-api.md §4`).
-2. Move `tlg.rs`/`decode_image` into `media`; keep a thin re-export in
-   `tvp-visual` so natives compile unchanged.
-3. Implement the FFmpeg backend by wrapping the existing `video/ffmpeg.rs`
-   and `decode.rs` as free functions + `AudioDecoderState`/
-   `VideoDecoderState` values; implement the unsupported backend as pure
-   error-returning stubs.
-4. Switch `tvp-sound::source` and `tvp-visual` bitmap loading to the
-   stateless API; **L2 gains the thread pool and completion table**.
-5. Add the video frame/PCM sinks in L2.
-6. Implement the MediaCodec backend by moving `video/android.rs` + `yuv.rs`.
-7. Delete the old decode modules; the natives keep calling the engine.
-
-Each step leaves the game runnable because the wrappers preserve the current
-public functions until the callers move.
+* `media` exposes the stateless `Media` object, the pure image/audio
+  functions, and the caller-owned `AudioDecoderState`/`VideoDecoderState`
+  values (`03-middle-layer-api.md §4`).
+* TLG5/TLG6 and the `image`-crate dispatch are in `media`; the image encoder
+  is in `media::image_encode`.
+* The FFmpeg backend wraps the video demux/decode, and the MediaCodec backend
+  covers Android; exactly one is selected by feature.
+* L2 owns the mixer, the decode-ahead worker pool and the completion table;
+  the video frame/PCM sinks feed the layer bitmap and the mixer.
+* The old `tvp-sound`/`tvp-natives` decode modules are gone.

@@ -1,32 +1,28 @@
 # 07 — Migration roadmap
 
-Status: plan. Phases are ordered so the game stays runnable after each one.
-No phase begins implementation until this plan is reviewed.
+Status: plan + status record. Phases are ordered so the game stayed runnable
+after each one.
 
 > **Revision note (final layering, 2026).** This roadmap was written for the
 > original layering (host on top, Bevy strangler). Two things changed since:
 > the Bevy frontends were removed and the new crates
-> (`api/fs/media/render/engine/app`) were implemented (waves 1–3), and
+> (`platform/{api,fs,media,render,platform}`, `engine`, `compat`, `vm`,
+> `app`, `android`) were implemented (waves 1–3), and
 > the layering was finalised in
 > [`02-target-architecture.md`](02-target-architecture.md) — host/platform
 > code and archive parsing in **L1**, **L2** a generic engine that holds the
-> layer system, **L3** the KiriKiri compat surface, **L4** the TJS VM. The
-> remaining work is:
+> layer system, **L3** the KiriKiri compat surface, **L4** the TJS VM.
 >
-> 1. Move the host/window/event loop out of `app` into a `platform`
->    crate (L1), and make platform/backends compile-time features (D13).
-> 2. Move XP3 parsing from `engine` into L1; keep only the VFS
->    namespace in L2 (D6 rev., doc 02 §5).
-> 3. Replace `Storage::mount`/`discover_archives` with explicit archive
->    loading + the startup-discovery order (D15, doc 09).
-> 4. Introduce `compat` (L3) and `vm` (L4): port the `tvp-*`
->    natives into L3 plugins, with the null-plugin object (D14, doc 08).
-> 5. Media video + the TJS execution path (boot `startup.tjs`).
-> 6. Android host in L1.
-> 7. Delete `tvp-*` once their replacements land.
+> The original list of remaining work (move the host into `platform`, move
+> XP3 into L1, explicit archive loading, introduce `compat`/`vm`, media video
+> + startup, Android host, delete `tvp-*`) is **done**. What remains is
+> tracked in `TODO.md`: the frame-owning `Engine` (Phase 9 below), native
+> plugin coverage (`TODO.md` §17), the unmodelled parts of the timer event
+> queue, Android on-device validation, and the deferred performance work
+> (§9, D22).
 >
-> The phase list below is kept as the historical record of the
-> Bevy-strangler plan.
+> The per-phase list below is kept as the record of how the rework was
+> sequenced.
 
 ---
 
@@ -212,22 +208,22 @@ compat -p app` green with tests driving `frame(now)` virtually; doc 02 §3
 | Level | What | Where |
 |-------|------|-------|
 | Unit | pure helpers, blend mapping, FS namespace, layout | L2/L1 crates |
-| **Statelessness (D9)** | grep/lint for globals + build two independent engines in one process | CI / `krkr-core` |
-| Golden image | Bevy vs Vulkan framebuffer compare per scripted scene | `render` |
-| Blend matrix | one quad per `BlendMode` over a known background | `render` |
-| Integration | `krkr-rs run <game> --headless` scene dump snapshot | `app` |
+| **Statelessness (D9)** | `scripts/check-stateless.sh` + build two independent engines in one process | gate |
+| Backend parity | the null and Vulkan backends consume the same `RenderScene` contract; the null software rasterizer is the baseline | `render` |
+| Blend matrix | one quad per fixed-function `BlendMode` over a known background | `render` |
+| Integration | `krkr --headless` scene/phase log over the real title | `app` |
 | **Surface lock (D29)** | the live VM dispatch dump vs the committed baseline: `python3 scripts/surface_lock.py` — fails on any **added or removed** member | **gate, every commit** |
 | Parity | reference-vs-Rust *report* of what is missing (coverage tracking — a presence metric, not a correctness claim) | report |
 | Media | host-testable pure parts (YUV, TLG, decode wrappers) | `media` |
 | FS | in-memory `FileSystem` fixtures, real-game mount | `fs`/`engine` |
-| Android | compile + symbol checks in CI; device run manual | CI / manual |
+| Android | host-feature compile + `scripts/check-android-target.py`; device run manual | gate / manual |
 
-Regression rule: the headless scene dump, the **surface lock** and the
-native-parity report are the three coarse "nothing broke" signals and must be
-checked at every phase and before every commit. The lock is the hard one: it is
-the only signal that fails when someone *invents* surface or silently drops a
-member. Behaviour is constrained separately — every semantic must be
-cited to `reference/cpp` (D28).
+Regression rule: the headless run, the **surface lock** and the native-parity
+report are the three coarse "nothing broke" signals and must be checked at
+every phase and before every commit. The lock is the hard one: it is the only
+signal that fails when someone *invents* surface or silently drops a member.
+Behaviour is constrained separately — every semantic must be cited to
+`reference/cpp` (D28).
 
 ## 5. Metrics to watch
 

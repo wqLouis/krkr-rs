@@ -30,17 +30,24 @@ app::run(Launch {
 
 ```rust
 // crates/android — the Android launcher, the same entry point
-// The player's stored choices (frame rate, scaling) are read from the
-// launcher's own settings file, resolved over the Android defaults, and the
-// finished value is handed in. An unparseable or out-of-range value is a
-// ConfigError naming the option and its range; it is never defaulted away.
-let runtime = config::resolve(stored_frame_rate, stored_scaling)?;
-app::run(Launch {
-    runtime,
-    backend: BackendKind::Vulkan,
-    game: Some(GameInput { base_dir, archives }),
-    mode: RunMode::Windowed,
-})?;
+// The player's stored choices (frame rate, scaling, archive preload) are read
+// from the launcher's own settings file, resolved over the Android defaults,
+// and the finished value is handed to the shared host. An unparseable or
+// out-of-range value is a ConfigError naming the option and its range; it is
+// never defaulted away.
+let log_level = config::resolve_log_level(stored_log_level)?; // selects the logger filter
+let runtime = config::resolve_runtime_config(
+    stored_frame_rate,
+    stored_scaling,
+    stored_preload_archives,
+)?;
+let handler = host::AndroidHost::new(
+    BackendKind::Vulkan,
+    map_scaling(runtime.scaling),
+    game_dir,
+    runtime.preload_archives,
+);
+host::run_loop(app, handler, Duration::from_secs_f64(runtime.frame_rate_limit.period_secs()));
 ```
 
 The reason is that **where configuration comes from is a platform concern**,
@@ -55,7 +62,7 @@ types and the `key=value` parser, so `api::config` provides `RuntimeConfig`,
 
 Every field is validated. An unparseable or out-of-range value is a typed
 `ConfigError` naming the option and the accepted range, never a clamped or
-defaulted value (D11). Nothing takes effect until the whole configuration —
+defaulted value. Nothing takes effect until the whole configuration —
 arguments *and* the launcher's store — validates.
 
 ## 1. The desktop file
@@ -92,8 +99,8 @@ difference is that the bytes no longer come from the backing filesystem.
 
 ## 3. Not implemented meaningfully
 
-Both of these were requested, but there is no knob to turn today; inventing one
-would be a stub, so they are reported rather than implemented.
+Both of these have no knob to turn today; inventing one would be a stub, so
+they are reported rather than implemented.
 
 * **Texture resolution.** The renderer exposes no downsample factor. It
   advertises `GpuCapabilities::max_texture_dimension` — a hardware limit
@@ -101,7 +108,7 @@ would be a stub, so they are reported rather than implemented.
   Vulkan device limit), not a setting — and `TextureDesc` is always the decoded
   image's native size. A "texture resolution" option would need a scale factor
   threaded through decode/upload while keeping the script-visible
-  `Bitmap.width`/`height` unchanged (D34); that is a substantive change to
+  `Bitmap.width`/`height` unchanged; that is a substantive change to
   `media`/`render`/`app`, not a new DTO field.
 * **Audio buffering.** The pre-fill (`PREFILL_MS = 150`) and cap
   (`MAX_BUFFER_MS = 2000`) are `pub(crate)` constants in

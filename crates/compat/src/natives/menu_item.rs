@@ -1723,3 +1723,23 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
 
     Ok(())
 }
+
+/// `menu.dll` built-in: the DLL registers the core `MenuItem` class.
+///
+/// The shipped `menu.dll` is a `ncbind` plugin whose recovered script
+/// surface is exactly this class (constructor, `finalize`, `add`, `insert`,
+/// `remove`, `popup`, `onClick`, `fireClick` and the fifteen properties).
+/// `MenuItem` is a core class — the reference engine registers it in
+/// `reference/cpp/core/base/ScriptMgnIntf.cpp:542`, and [`register`] already
+/// ran from the core native pass — so the plugin adds no TJS surface of its
+/// own and this entry only marks the name as a built-in. `Plugins.link`
+/// therefore resolves `menu.dll` without installing the null plugin object.
+///
+/// The DLL also attaches a read-only `menu` property to `Window`. That is a
+/// **core** member, not a plugin member: the reference engine attaches it in
+/// `reference/cpp/core/base/ScriptMgnIntf.cpp:538-542`, so this port registers
+/// it on the core `Window` class (`crate::natives::visual::window`), not
+/// here.
+pub fn register_plugin(_ctx: &mut CompatCtx) -> Result<(), CompatError> {
+    Ok(())
+}

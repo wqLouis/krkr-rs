@@ -2,12 +2,11 @@
 
 Status: **experiment**. Target: a native Android app (Kotlin + Jetpack Compose,
 Material 3) that manages a library of KiriKiri games and launches the real
-engine — the same Rust + Bevy + C++ TJS2 stack the desktop binary runs — with
+engine — the same Rust engine + C++ TJS2 stack the desktop binary runs — with
 touch input and MediaCodec video.
 
-This document is the plan. `docs/portability.md` is the older, broader build
-assessment (Android + wasm); §1 there ("the full game path was not
-cross-checked") is now superseded for Android — see §2 below.
+This document is the plan. [`portability.md`](portability.md) covers the
+per-target backend features; §2 below is the Android-specific state.
 
 ---
 
@@ -20,18 +19,26 @@ cross-checked") is now superseded for Android — see §2 below.
 | ABIs | **`arm64-v8a` only** | User directive. No `armeabi-v7a`/`x86`/`x86_64`. Emulator testing is out of scope until an x86_64 ABI is added back. |
 | UI | Kotlin + **Jetpack Compose + Material 3** | User directive: "native M3 design app ui" |
 | App shape | **Frontend-first**: a launcher app that picks a game folder, then hands off to the engine | User directive |
-| Activity backend | `android-activity`'s **`GameActivity`** (`winit/android-game-activity`, `bevy/android-game-activity`) | `GameActivity` derives from `AndroidAppCompat` (`winit-0.30.13/src/platform/android.rs:49`), i.e. it *is* a normal `AppCompatActivity` — so it can host a Compose UI, unlike `NativeActivity` |
+| Activity backend | `android-activity`'s **`GameActivity`** | `GameActivity` derives from `AndroidAppCompat` (`winit-0.30.13/src/platform/android.rs:49`), i.e. it *is* a normal `AppCompatActivity` — so it can host a Compose UI, unlike `NativeActivity` |
 | Video | **NDK MediaCodec** (`libmediandk`) on Android; FFmpeg on desktop | `ffmpeg-next` links via pkg-config and cannot be assumed on Android; MediaCodec is what Kirikiroid2 uses |
 | Folder picking | Android **SAF** (`ACTION_OPEN_DOCUMENT_TREE`) + persisted permission | User directive ("use android's system file picker") |
 | Storage access | **SAF for picking, a resolved filesystem path for reading, `MANAGE_EXTERNAL_STORAGE`** — option A in §4 | The app is **sideloaded**, so the Play-policy restriction is moot (user directive). The SAF-backed storage backend (option B) is **not** planned. |
 | Game selection | **Explicit folders only** — no auto-indexing of a default directory | User directive: mirror `krkr-rs run <game directory>` |
 | Orientation | **Locked to landscape** | User directive. The games are 1280×720; portrait would letterbox badly. |
-| Launcher state | **JSON config file** (`games.json`) in the app's private files dir — **Android app only** | User directive: keep the library in a config file so folders never have to be found again. JSON, matching `crates/tvp-config`, which deliberately replaced the reference's XML preferences with JSON. |
+| Launcher state | **JSON config file** (`games.json`) in the app's private files dir — **Android app only** | User directive: keep the library in a config file so folders never have to be found again. JSON is the project's configuration convention (`api::config` replaced the reference's `GlobalPreference.xml`/`Kirikiroid2Preference.xml` with a `key=value` store). |
 | Engine and CLI | **Unchanged on every platform.** No library, no config file, no game list in the Rust workspace | User directive: the Linux build is "pure simple cli" — `krkr-rs run <game directory>` and nothing more. The Android app is what adds convenience, not the engine. |
 
 ---
 
 ## 2. What is already verified (measured, not assumed)
+
+> **The development host has no NDK or Android SDK, and the Android target is
+> never built or tested here** (AGENTS §0, `TODO.md` §11). The cross-compiles
+> and the packaged build below were run on a machine that has the toolchain;
+> Android-only code that has not been compiled is documented as unverified,
+> never as working. The host bar is `cargo check --workspace` staying
+> green, the `platform-android` host-feature steps and
+> `scripts/check-android-target.py`.
 
 - **The C++ TJS2 VM cross-compiles for Android.** Zig cannot do it (it refuses
   to provide Android libc: `unable to provide libc for target
@@ -40,22 +47,12 @@ cross-checked") is now superseded for Android — see §2 below.
   `aarch64-linux-android21-clang++` and running
   `cargo check -p tjs --target aarch64-linux-android` **succeeds in ~19 s**
   (NDK r27c, bison + python present). This was the single largest unknown and
-  it is now a known-good path. `docs/portability.md` §2/§11's statement that
-  the full path "was not cross-checked because build.rs compiles for the host
-  regardless of `--target`" is therefore outdated.
-- **Bevy needs no Android logging work**: `bevy_log` already installs an
-  `android_log_sys` backend on `target_os = "android"`
-  (`bevy_log-0.19.1/src/lib.rs:21`, `src/android_tracing.rs`).
-- **Bevy 0.19 exposes the needed backends**: `bevy/android-game-activity`
-  (→ `bevy_internal/android-game-activity` → `bevy_winit` →
-  `winit/android-game-activity`) and the `android-native-activity`
-  alternative (`bevy_winit-0.19.1/Cargo.toml:43-44`).
-- **`tjs/build.rs` is not target-aware** (`:332`): it gates the C++
-  runtime link flags on `env::consts::OS`, which in a build script is the
-  **host** OS. A Linux→Android build therefore emits desktop-only
-  `-lc++ -lc++abi` instead of letting the NDK clang link `libc++_static`. Must
-  switch to `CARGO_CFG_TARGET_OS == "android"` (drop the explicit C++ runtime
-  flags for Android). *Not yet fixed.*
+  it is now a known-good path.
+- **`tjs/build.rs` is target-aware**: it reads `CARGO_CFG_TARGET_OS` and the
+  Cargo target, emits the desktop C++ runtime flags (`-lc++ -lc++abi -pthread`)
+  only when the *target* is desktop Linux, and derives oniguruma's `config.h`
+  sizes from the target rather than the build host. The Android cross-build
+  supplies the NDK `CC`/`CXX` and does not need the desktop runtime flags.
 - **Zig can target Android for C, but not for C++** (zig 0.16.0, measured):
   `zig cc -target aarch64-linux-android` works once the sysroot's include dirs
   are given explicitly with `-isystem` (`--sysroot` is **not** honoured by the
@@ -78,18 +75,15 @@ cross-checked") is now superseded for Android — see §2 below.
   without a newer NDK. The app's `compileSdk`/`targetSdk` (37) are independent
   of that.
 
-Not yet verified (still to be cross-checked once the FFmpeg feature split
-lands): the full workspace for `aarch64-linux-android`, including `blake3`
-(C + asm via `cc-rs` — needs `cargo-ndk`'s toolchain wiring, seen failing with
-`failed to find tool "aarch64-linux-android-clang"`), `rodio`/`cpal` (AAudio),
-and `opusic-sys`.
+The full workspace is cross-checked for `aarch64-linux-android` on a machine
+with the NDK; it is not cross-checked on the development host.
 
 ### 2.1 Platform backend: window, input and scale (current state)
 
 `crates/platform/platform/src/android.rs` is the L1 Android backend. Three
-parts are real and compile for `aarch64-linux-android` (checked with
-`cargo check -p platform --features platform-android --target
-aarch64-linux-android`):
+parts are real and compile for `aarch64-linux-android` on a machine with the
+NDK (the host-feature step `cargo check -p platform --features platform-android`
+checks the target-independent helpers and the typed stub):
 
 * **The window.** On Android, `PlatformWindow` owns the `ANativeWindow` the
   activity acquired and projects it through `raw-window-handle`
@@ -108,7 +102,7 @@ aarch64-linux-android`):
   root (`crates/android/src/input.rs`) consumes contact phases through the
   touch→mouse synthesizer (`crates/android/src/gesture.rs`, §5) instead of
   forwarding raw touch.
-* **Audio output** (AAudio) was already real.
+* **Audio output** (AAudio) is real.
 
 The **event loop** is driven by the Android composition root, not by
 `platform::run`. `platform::run` is the desktop (winit) driver and still
@@ -179,14 +173,19 @@ android/                          Kotlin + Compose M3 app (Gradle)
 crates/android/                   Rust cdylib (package `krkr-android`)
   src/lib.rs                      android_main: reads the game dir and the
                                   runtime settings from the Activity over JNI,
-                                  builds the app from `render`
+                                  builds the shared `app::Host`
   src/jni_fields.rs               the static-field JNI reads
-  src/config.rs                   validates the settings into a `RuntimeConfig`crates/platform/render/                    shared app assembly (refactored so the
-                                  desktop bin and the Android cdylib build the
-                                  same App)
-crates/tvp-natives/src/video/
-  ffmpeg.rs                       desktop decoder   (default)
-  android.rs                      MediaCodec decoder (target_os = "android")
+  src/config.rs                   validates the settings into a `RuntimeConfig`
+
+crates/app/                       shared app assembly (`app::Host`/`app::GameHost`,
+                                  driven by the desktop `krkr` binary and by the
+                                  Android cdylib alike)
+
+crates/platform/media/src/video/
+  ffmpeg.rs                       desktop decoder   (`video-ffmpeg`)
+  mediacodec.rs                   MediaCodec decoder (`video-mediacodec`)
+
+crates/tjs/                       C++ TJS2 VM (target-aware build)
 ```
 
 Two Activities, one engine:
@@ -217,8 +216,8 @@ shared with it, so there is no schema coupling in either direction.
 The library is a plain JSON file in the app's private files directory
 (`<filesDir>/games.json`), not `SharedPreferences`: it is inspectable,
 portable and user-editable, and JSON is already the project's configuration
-convention (`crates/tvp-config` replaced the reference engine's
-`GlobalPreference.xml`/`Kirikiroid2Preference.xml` with `config.json`).
+convention (`api::config` replaced the reference engine's
+`GlobalPreference.xml`/`Kirikiroid2Preference.xml` with a `key=value` store).
 Losing this file means re-picking every game folder, which is precisely what it
 exists to prevent, so it is written atomically (temp file + rename) and read
 tolerantly (a corrupt file is reported and treated as empty rather than
@@ -251,8 +250,7 @@ the engine. A **Settings** screen reachable from the launcher's top bar exposes
 the three options `api::config::RuntimeConfig` carries today, with the same
 accepted values as the desktop `--fps`/`--scaling` and `preload_archives`.
 Nothing is offered for a feature the engine has no knob for
-— a control that silently did nothing is the bug class this project forbids
-(`AGENTS.md` D11).
+— a control that silently did nothing is the bug class this project forbids.
 
 | option | values / range | default | basis |
 |---|---|---|---|
@@ -303,7 +301,7 @@ playing the role of the `KRKR_CONFIG` file:
    is `info`. An unparseable or out-of-range value is a typed `ConfigError`
    naming the option and the accepted values; it is written to `krkr_state.json`
    as a failure and the loop is never started — it is never replaced by the
-   default (D11).
+   default.
 4. **The shared emulator host** receives the finished value: the
    `crates/android` loop passes the scaling into the render host, the
    archive-preload choice into `app::GameHost::open_with_preload`, and the
@@ -370,7 +368,7 @@ events are `crates/android/src/input.rs`. The synthesised events travel the
 same host path and the same aspect-correct window→game transform as a real
 mouse, so engine-side layer hit-testing, `onMouseDown`/`onMouseUp`,
 `onClick`/`onDoubleClick` and the game's own cursor logic keep working
-unchanged. A tap that a KAG menu used to miss is the symptom this fixes.
+unchanged. A tap a KAG menu would otherwise miss is the symptom this fixes.
 
 The mapping, as implemented:
 
@@ -442,7 +440,9 @@ run on hardware.
 
 ## 7. Packaging and CI
 
-**Verified end to end on this machine.** From a clean tree:
+**Verified end to end on a machine with the NDK and SDK** (the development
+host has neither and does not build the Android target — §2). From a clean
+tree:
 
 ```bash
 ANDROID_NDK_HOME=/path/to/ndk ./crates/android/build-android.sh   # → 71 MB .so
@@ -549,7 +549,7 @@ session that failed, including the original exception. Six rotations hold a few
 launches' startup plus the failure cascade at a bounded cost. The file is
 opened before the global logger is installed; a log the app cannot open is
 returned as a startup error and written to the state file as `failed`, so the
-Logs screen is never silently empty with no explanation (D11). The current file
+Logs screen is never silently empty with no explanation. The current file
 name and the directory are the Kotlin contract
 (`EngineDiagnostics.engineLogFile` is `File(filesDir, "krkr.log")`, and
 `KrkrGameActivity.pendingStateDir` is `filesDir.absolutePath`); the rotations
@@ -603,7 +603,7 @@ Two deliberate choices worth restating:
 |---|---|---|
 | M0 | C++ TJS2 VM cross-compiles for `arm64-v8a` | **verified** (19 s, NDK r27c) |
 | M1 | Whole workspace cross-checks with the FFmpeg feature off; `build.rs` made target-aware | **verified** (`build-android.sh --check`) |
-| M2 | Rust `cdylib` + `#[bevy_main]` entry point; engine builds an `App` from `render` | **verified** — links and exports `android_main` |
+| M2 | Rust `cdylib` + `android_main` entry point; the engine builds the shared `app::GameHost` | **verified** — links and exports `android_main` |
 | M3 | Compose M3 launcher + SAF picker + persisted library; hands the folder to `GameActivity` | **compiles and packages** (never run on a device) |
 | M4 | Touch → mouse bridge | **implemented and host-tested** (`crates/android/src/gesture.rs`); on-screen controls and the Activity-level back gesture still open |
 | M5 | MediaCodec video backend (replacing FFmpeg on Android) | **compile-verified and symbol-checked**; never run on a device |
@@ -617,9 +617,9 @@ on a real phone; whether the system font directories (`/system/fonts`) are
 populated and a requested face resolves — the host test checks the directory
 list, not a device's contents; whether MediaCodec's demux/decode loop works;
 whether `memfd_create` is permitted by a device's seccomp policy; and whether
-touch delivery and coordinate mapping behave as the host tests assume. Per D36
-(`docs/migration/README.md` §3), a release needs at least one real KiriKiri
-title run on a real device with its log captured (`<filesDir>/krkr.log`, §7).
+touch delivery and coordinate mapping behave as the host tests assume. A
+release needs at least one real KiriKiri title run on a real device with its
+log captured (`<filesDir>/krkr.log`, §7).
 
 ---
 

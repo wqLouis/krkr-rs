@@ -1,6 +1,8 @@
 # Plugin parity allowlist: reference surface that is known-missing.
-# One entry per line: Class.member, a class (`GdiPlus.Image`), or a
-# namespace object (`GdiPlus`).
+# One entry per line: Class.member, a class (`GdiPlus.Image`) or a
+# namespace object (`GdiPlus`), optionally followed by '— reason'.
+# A reason beginning with 'debt:' records a known gap that is accepted
+# but still visible; see docs/audits/propset-parity.md.
 # Regenerate after intentional additions with:
 #   python3 scripts/plugin_parity.py --update-allow
 # The checker fails when a missing entry is not listed here.

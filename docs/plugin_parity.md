@@ -1,6 +1,6 @@
 # Plugin surface parity
 
-> **Generated** by `scripts/plugin_parity.py` on 2026-10-11 — do not edit by hand.
+> **Generated** by `scripts/plugin_parity.py` on 2026-10-13 — do not edit by hand.
 
 Machine-diff of the reference KiriKiri plugin surface (`reference/cpp/plugins/**`) against the plugin classes the Rust engine registers (`crates/compat/src/natives/plugins/**`). A *missing* member exists in the reference but is not registered by Rust. An *extra* is a genuine plugin-surface addition: a member registered by a plugin file that the reference class does not have. Core natives (`natives/*.rs`) and members inherited from a shared registration table are counted separately.
 
@@ -10,6 +10,7 @@ Machine-diff of the reference KiriKiri plugin surface (`reference/cpp/plugins/**
 python3 scripts/plugin_parity.py                 # check + regenerate this report
 python3 scripts/plugin_parity.py --no-doc        # check only
 python3 scripts/plugin_parity.py --update-allow  # accept current gaps after review
+python3 scripts/plugin_parity.py --self-test     # extractor fixture self-test
 ```
 
 The checker exits non-zero when a missing member is **not** listed in `scripts/plugin_parity_allow.txt` (a regression). When an allowlisted member is implemented it prints a stale-entry warning so the allowlist can shrink. Coverage can therefore only move in one direction.
@@ -18,13 +19,29 @@ The checker exits non-zero when a missing member is **not** listed in `scripts/p
 
 | metric | value |
 | --- | ---: |
-| tracked classes | 55 |
-| reference members | 972 |
-| matched | 972 |
+| tracked classes | 56 |
+| reference members | 974 |
+| matched | 974 |
 | **missing** | **0** |
 | extra (genuine plugin additions) | 0 |
 | core members (not plugin extras) | 336 |
 | coverage | **100.0%** |
+
+## Members installed by `PropSet`
+
+Class and global members the reference installs after construction with ``PropSet(TJS_MEMBERENSURE, ...)``: a namespace attaching a class (``Motion.Player``), the global object registering a free function (``getDirList``), or a class-object member. ``kind`` is unknown because ``PropSet`` does not reveal method versus property.
+
+| class | member | kind | static | mechanism |
+| --- | --- | --- | --- | --- |
+| `Motion` | `Player` | unknown | true | `propset` |
+| `__global__` | `getDirList` | unknown | true | `propset` |
+
+## Registration sites with a runtime-built name
+
+2 site(s) install a member whose name is not a string literal, or whose receiver is a helper parameter, so the source reader cannot recover it. These are not counted as members: the coverage figures exclude them, which is a remaining blind spot, not a claim they do not exist.
+
+- `reference/cpp/plugins/layerExPerspective.cpp: Layer.dispatch.PropSet: methodName`
+- `reference/cpp/plugins/motionplayer/main.cpp: unresolved static member playerClass.PropSet: useD3D`
 
 ## Per-class coverage
 
@@ -43,11 +60,11 @@ The checker exits non-zero when a missing member is **not** listed in `scripts/p
 | `Dictionary` | 2 | 2 | 2 | 0 | 0 | 100.0% |
 | `DrawDeviceForSteam` | 1 | 1 | 1 | 0 | 0 | 100.0% |
 | `GdiPlus` | 157 | 157 | 157 | 0 | 0 | 100.0% |
-| `GdiPlus.Appearance` | 3 | 5 | 3 | 0 | 0 | 100.0% |
+| `GdiPlus.Appearance` | 3 | 4 | 3 | 0 | 0 | 100.0% |
 | `GdiPlus.Font` | 9 | 10 | 9 | 0 | 0 | 100.0% |
-| `GdiPlus.Image` | 0 | 13 | 0 | 0 | 0 | n/a |
+| `GdiPlus.Image` | 0 | 34 | 0 | 0 | 0 | n/a |
 | `GdiPlus.Matrix` | 0 | 16 | 0 | 0 | 0 | n/a |
-| `GdiPlus.Path` | 17 | 19 | 17 | 0 | 0 | 100.0% |
+| `GdiPlus.Path` | 17 | 18 | 17 | 0 | 0 | 100.0% |
 | `GdiPlus.PointF` | 3 | 4 | 3 | 0 | 0 | 100.0% |
 | `GdiPlus.RectF` | 18 | 19 | 18 | 0 | 0 | 100.0% |
 | `ImageFunction` | 0 | 12 | 0 | 0 | 0 | n/a |
@@ -83,6 +100,7 @@ The checker exits non-zero when a missing member is **not** listed in `scripts/p
 | `WIN32Dialog` | 1 | 1 | 1 | 0 | 0 | 100.0% |
 | `WaveSoundBuffer` | 6 | 38 | 6 | 0 | 0 | 100.0% |
 | `Window` | 44 | 44 | 44 | 0 | 0 | 100.0% |
+| `__global__` | 2 | 2 | 2 | 0 | 0 | 100.0% |
 | `open` | 0 | 13 | 0 | 0 | 0 | n/a |
 | `steam_api` | 0 | 0 | 0 | 0 | 0 | n/a |
 
@@ -143,7 +161,7 @@ Plugin classes Rust registers that have no reference counterpart reachable throu
 | `Clipboard` | 2 | `crates/compat/src/natives/clipboard.rs` |
 | `Controller` | 1 | `crates/compat/src/natives/debug.rs` |
 | `Debug` | 12 | `crates/compat/src/natives/debug.rs` |
-| `GdiPlus.Image` | 13 |  |
+| `GdiPlus.Image` | 34 |  |
 | `GdiPlus.Matrix` | 16 |  |
 | `ImageFunction` | 12 | `crates/compat/src/natives/image_function.rs` |
 | `Key` | 4 | `crates/compat/src/natives/input.rs` |
@@ -161,6 +179,9 @@ Plugin classes Rust registers that have no reference counterpart reachable throu
 - `layerExBase` is not modelled as a class: it is an internal C++ base whose names (`imageWidth`, `clipLeft`, `update`, ...) are read from the `Layer` object (`reference/cpp/plugins/layerExBase.hpp:84-91`) and are part of the core `Layer` surface, which `native_parity.py` covers. `LayerExMovie`/`LayerExPerspective` are `NCB_ATTACH_CLASS` implementations, not published classes.
 - `NCB_SUBCLASS`/`NCB_SUBCLASS_NAME`/`NCB_GDIP_SUBCLASS`/`SubClass` inside a `NCB_REGISTER_CLASS` block are modelled as `Namespace.name` classes. A Rust port that registers the class globally and then `set_member`s it into the namespace and `delete_member`s the global (`motion_player`) is recognised as the nested class.
 - A plugin file that registers a class the reference never publishes at all (`LayerExMovie`, `LayerExPerspective`, a bare `LayerExBase`) is a hard failure, as is a nested class leaking to the top level. A missing namespace object or nested class is an allowlistable ratchet gap.
+- Class and global members installed after construction with `PropSet(TJS_MEMBERENSURE, ...)` are read too: a namespace attaching a class (`motion->PropSet("Player")` -> `Motion.Player`), the global object registering a free function (`getDirList`), and a TJS global function published from a `TVPExecuteScript` string (`drawFFTGraph`).
+- Remaining blind spots: a `PropSet` name built at runtime (`idstr.c_str()`) or a static member on an unresolved helper parameter (`playerClass->PropSet(...)`) is recorded as unrecoverable, not counted; the coverage figures therefore exclude it rather than claiming it absent.
+- A `PropSet` on an instance object (a window, a dictionary, a method parameter) is not a class member and is not counted. A member installed by a plugin DLL that has no `reference/cpp` source is outside this report until its surface is extracted (D38).
 
 ## Documented exclusions
 

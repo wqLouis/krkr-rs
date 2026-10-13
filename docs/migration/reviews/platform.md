@@ -28,12 +28,32 @@ Severity legend:
 | **Low** | Local idiom/robustness/consistency; worth fixing opportunistically. |
 
 Overall the two crates are structurally clean: `platform` has no
-mutable statics/`thread_local!`/hidden caches, `#![forbid(unsafe_code)]` at
+mutable statics/`thread_local!`/hidden caches, `#![deny(unsafe_code)]` at
 the root, and no L2/L3/L4 dependency; the winit types are confined to
-`linux.rs`; the D13 "neither/both features" guard works. The problems are
-(a) the composition root actually contains the L2 engine state, (b) several
-silent fallbacks at the handle/DPI boundary, and (c) the D9 guard does not
-cover the crate it is supposed to guard.
+`linux.rs`; the D13 "neither/both features" guard works.
+
+> **Resolution status (current tree).**
+> * §2 — `raw_window_handle`/`raw_display_handle` return
+>   `Result<_, PlatformError::Handle>`, `HostConfig` carries an explicit
+>   `headless` flag, and the synthetic handle is only built for an explicit
+>   null-backend headless host (D11).
+> * §3 — the coordinate DTOs moved to `api::input` and the docs no longer
+>   assert a logical space; re-check the physical/logical contract at the
+>   L1→L3 boundary.
+> * §4 — `platform` has `default = []` and each backend module is gated with
+>   `#[cfg(all(feature = X, not(feature = Y)))]`; a non-empty Android feature is
+>   selected by the composition root.
+> * §5 — `scripts/check-stateless.sh` now includes
+>   `crates/platform/platform` in `CRATES`, and it runs in the gate (AGENTS §0).
+>   The `&mut self`-on-service check it promised also exists.
+> * §6 — `resumed` now always calls the handler and guards only window
+>   creation (the trait contract holds).
+> * §8 — `Ticker` clamps the interval to `[1 ms, 1 h]` and uses
+>   `checked_add`; `PlatformConfig`/`PlatformError`/`FramePacing` are
+>   `#[non_exhaustive]`.
+> * §1 (the L2 state store still lives in `app`) is the live D26 item; §7/§9
+>   and the minor idioms in §10 have not all been re-checked. The closing note
+>   about `crates/engine/src/logging.rs` is obsolete (that module is gone).
 
 ---
 
@@ -137,18 +157,13 @@ features are set, `mod linux` and `mod android` both compile and produce
 `compile_error!`; gate each module with `#[cfg(all(feature = X, not(feature
 = Y)))]` to keep the message clean.)
 
-## 5. D9 CI guard omits `platform` and is not wired to CI — Medium
+## 5. D9 gate coverage — **Resolved**
 
-`scripts/check-stateless.sh:19-24` checks only
-`api`/`fs`/`media`/`render`. The acceptance criterion
-that D9 must be "Guarded in CI" (`02-target-architecture.md` §9.3) is
-therefore not applied to the L1 crate the criterion names — L1 includes
-`platform`. The script is also missing the `&mut self`-on-service
-check that `03-middle-layer-api.md` §9 promises. No workflow invokes the
-script at all. (The crate is currently clean — `rg` for
-`static mut`/`thread_local!`/`LazyLock`/`OnceLock`/`OnceCell` in
-`crates/platform/platform/src` finds nothing — so this is a guard gap, not an
-existing violation.)
+`scripts/check-stateless.sh` now checks
+`api`/`fs`/`media`/`render`/`platform` and the `&mut self`-on-service
+check, and it runs in the gate (AGENTS §0). The acceptance criterion
+that D9 must be guarded (`02-target-architecture.md` §9.3) is satisfied for the
+L1 crates the criterion names.
 
 Fix: add `"crates/platform/platform"` to `CRATES`; add the `&mut self` pattern
 or a targeted check; add a Linux CI job that runs
@@ -252,9 +267,7 @@ before the window. Correct or remove the `DesktopApp` comment.
 
 ## Note (out of the reviewed crates)
 
-`#[cfg(target_os = "android")]` still appears in the legacy
-`crates/engine/src/logging.rs:152,200,215` and
-`crates/engine/Cargo.toml:20`. That violates "no `#[cfg(target_os)]`
-outside L1", but `crates/engine` is the legacy anchor slated for deletion
-per `07-roadmap.md` and is not in `default-members`; the reviewed new crates
-are clean.
+The old note about `#[cfg(target_os = "android")]` in
+`crates/engine/src/logging.rs` is obsolete: that module and the legacy
+anchor crates are gone. `engine` has no platform code and the `platform`
+crate owns every `#[cfg(target_os)]`.

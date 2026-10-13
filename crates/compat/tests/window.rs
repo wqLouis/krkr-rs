@@ -270,6 +270,47 @@ fn win32_host_facts_return_plausible_values() {
     assert!(env.eval("w.registerMessageReceiver(0, 1)").is_err());
 }
 
+/// Reference `reference/cpp/core/base/ScriptMgnIntf.cpp:538-542`: the core
+/// script manager attaches a `menu` property to the `Window` class. Its
+/// value is a `WindowMenuProperty` (`impl/MenuItemImpl.cpp:65-91`): the
+/// getter returns the per-window root `MenuItem`, created on first read
+/// through `TVPCreateMenuItemObject(objthis)` (`MenuItemIntf.cpp:559-573`),
+/// and the setter returns `TJS_E_ACCESSDENYED`.
+#[test]
+fn window_menu_is_a_cached_root_menu_item_and_read_only() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run("var w = new Window(); var m = w.menu; var again = w.menu;");
+
+    // The property exists on the window and is a `MenuItem` object.
+    assert_eq!(env.eval_int("m instanceof 'MenuItem'"), 1);
+    // `TVPCreateMenuItemObject(objthis)` builds `new MenuItem(window, window)`
+    // (`MenuItemIntf.cpp:559-573`), so the root carries its window and is its
+    // own root with no parent.
+    assert_eq!(env.eval_int("m.window === w"), 1);
+    assert_eq!(env.eval_int("m.root === m"), 1);
+    assert_eq!(env.eval_int("m.parent === null"), 1);
+
+    // Repeated reads return the same cached object
+    // (`impl/MenuItemImpl.cpp:65-82`).
+    assert_eq!(env.eval_int("m === again"), 1);
+
+    // The cache is per window: a second window has its own root.
+    env.run("var w2 = new Window(); var m2 = w2.menu;");
+    assert_eq!(env.eval_int("m2 === m"), 0);
+    assert_eq!(env.eval_int("m2.window === w2"), 1);
+
+    // The setter is access-denied (`impl/MenuItemImpl.cpp:84-91`), surfacing
+    // the reference `TJS_E_ACCESSDENYED` message.
+    let error = env
+        .eval("w.menu = 1")
+        .expect_err("Window.menu must be read-only");
+    assert!(
+        error.contains("Read-only"),
+        "Window.menu write must raise TJS_E_ACCESSDENYED, got {error:?}"
+    );
+}
+
 #[test]
 fn draw_device_installs_a_default_and_round_trips() {
     let _lock = vm_lock();

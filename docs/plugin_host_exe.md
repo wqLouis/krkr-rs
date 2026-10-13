@@ -17,6 +17,12 @@ Reference engine in tree: `reference/` (the KrKr2 Emulator fork; see
 `docs/wine_box64.md` for the earlier Wine study, whose conclusion this study
 sharpens and partially revises).
 
+**Non-goal.** A Wine plugin-host `.exe` is rejected; the port continues the
+native Rust reimplementation, which is the next major version's target
+(`TODO.md` §17). The engine's current render stack is `render` (Vulkan), not
+Bevy/wgpu; the Bevy references below are the environment this study was written
+against.
+
 ---
 
 ## 0. Verdict (short)
@@ -43,11 +49,11 @@ host.
 | `windowEx.dll` | Win32 window extension | 4 | 22 | no (User32/GDI + TJS) | XL | No |
 
 **Recommended scope:** *self-contained C-API decoders only*. For this game even
-that is redundant (`tvp-sound` already decodes Ogg/Vorbis natively), so the
+that is redundant (`media` already decodes Ogg/Vorbis natively), so the
 practical recommendation is: **do not build the host exe for this title; add it
-as an optional sidecar only if a future title ships a Windows-only, closed-source
-codec/DRM plugin that exposes a plain C ABI.** Everything else stays a native
-Rust reimplementation.
+as an optional sidecar only if a future title ships a Windows-only,
+closed-source codec/DRM plugin that exposes a plain C ABI.** Everything else
+stays a native Rust reimplementation.
 
 ---
 

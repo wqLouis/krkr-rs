@@ -1,6 +1,7 @@
 # Android backends (AAudio + MediaCodec) — design & references
 
-Status: **design + reference doc for untestable-on-this-host backends.** **Android
+Status: **implemented inside the Android composition root; unverified on a
+device.** **Android
 is a first-class host target (D18); Windows is emulated, not a host.** We
 cannot build or run Android here, so this file pins the behaviour to the
 official Android documentation and defines exactly how the L1 backends map onto
@@ -68,13 +69,12 @@ compatibility layer (`crates/compat/src/natives/input.rs`). `AKEYCODE_BACK` maps
 to `PhysicalKey::Escape`
 (`reference/cpp/core/environ/cocos2d/MainScene.cpp:820-829`), not to a new key.
 
-**Not implemented — the loop.** `platform::run` still returns
-`PlatformError::NotImplemented`. The event loop has to be the `android-activity`
-`GameActivity` glue (`docs/android.md` §2.1), which owns the lifecycle, the
-`ANativeWindow` handoff and the `AInputQueue` the translation above consumes.
-Until that dependency and a `run` implementation exist, the window type is
-unreachable at runtime, which is why `run` fails fast instead of showing a black
-surface.
+**The loop** lives in the Android composition root, not in `platform`:
+`crates/android/src/host.rs` drives `android-activity`'s `GameActivity`, owns
+the lifecycle, constructs a `PlatformWindow` from the `ANativeWindow` and feeds
+the translation above. `platform`'s own Android `run` stays a typed stub
+(`PlatformError::NotImplemented`) because it has no `android-activity`
+dependency; the composition root does not call it.
 
 **Device validation still needed:** that the `ANativeWindow` handed over in
 `onNativeWindowCreated` is the one the renderer binds to and that recreation
@@ -132,21 +132,22 @@ build (NDK target) compiles the `ndk` path.
 
 Lint: `ndk` is safe, but two operations still need `unsafe` — the audio callback
 hands the buffer over as a raw `*mut c_void` (no safe slice wrapper), and the
-extractor shim is raw FFI. Both crates therefore use
+extractor shim is raw FFI. The `media` crate therefore uses
 `#![cfg_attr(not(target_os = "android"), forbid(unsafe_code))]` +
 `#![cfg_attr(target_os = "android", deny(unsafe_code))]`, with `#[allow(unsafe_code)]`
 scoped to the one module each (`media`'s extractor shim; `platform`'s buffer
-conversion). Rustc rejects a local `allow` under a crate-wide `forbid`, which is
-why Android uses `deny`.
+conversion). The `platform` crate is `#![deny(unsafe_code)]` (not `forbid`) with
+a scoped allow on the Android audio module. Rustc rejects a local `allow`
+under a crate-wide `forbid`, which is why the Android path uses `deny`.
 
 ## What we cannot verify here
 - No device/emulator in this environment, so the backends **cannot be run**. They
-  *are* compile-checked: `cargo check --target aarch64-linux-android -p platform
-  --features platform-android` and the equivalent `media` check compile the real
-  `ndk` code (no link), so the API usage is type-checked, not just the host stub.
-  Add an **Android CI job** (NDK target) so this stays checked, and validate on a
-  device before calling it done. Everything testable stays covered by the
-  Linux/null backends.
+  *are* compile-checked by the host `platform-android` feature and by
+  `scripts/check-android-target.py` (which resolves the per-target dependency
+  graph without compiling); the real Android target is compiled on a machine
+  with an NDK, and everything Android-only is documented as unverified.
+  Validate on a device before calling it done. Everything testable stays covered
+  by the Linux/null backends.
 - On-device validation still needed: AAudio open/start + callback drain without
   underruns, `PCM_I16` correctness, real disconnect reap, whether `LOW_LATENCY`
   is granted; MediaCodec demux/decode loop, `memfd`+`setDataSourceFd`, seek +

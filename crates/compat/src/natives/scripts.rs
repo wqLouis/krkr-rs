@@ -20,12 +20,17 @@
 //! | `dump()` | dump every live script block through the engine log |
 //! | `textEncoding` | get/set the fallback text decoder (default `"UTF-8"`) |
 //!
-//! `mode` honors the reference's `oN` byte offset. Script decoding goes
-//! through [`crate::text::decode_text`], which handles the `FE FE` cipher /
-//! zlib container, a UTF-8/UTF-16 BOM, an explicit `textEncoding` override,
-//! then UTF-8 and CP932. An undecodable script raises a typed error instead
-//! of producing mojibake. The `context` argument is the script's `this`, and
-//! `lineofs` the reported line-number offset, both forwarded to the VM.
+//! `mode` honors the reference's `oN` byte offset. A storage script is
+//! offered to the TJS2 bytecode loader first and decoded as text only when
+//! the loader reports it is not bytecode, which is the reference
+//! `TVPExecuteStorage` order
+//! (`reference/cpp/core/base/ScriptMgnIntf.cpp:713-760`). Script decoding
+//! goes through [`crate::text::decode_text`], which handles the `FE FE`
+//! cipher / zlib container, a UTF-8/UTF-16 BOM, an explicit `textEncoding`
+//! override, then UTF-8 and CP932. An undecodable script raises a typed error
+//! instead of producing mojibake. The `context` argument is the script's
+//! `this`, and `lineofs` the reported line-number offset, both forwarded to
+//! the VM.
 #![allow(unsafe_code)]
 
 use std::cell::Cell;
@@ -296,25 +301,26 @@ fn log_script_read(name: &str, bytes: &[u8], encoding: Option<&str>, text: Optio
     );
 }
 
-/// Read storage `name`, apply the mode's `oN` offset and decode the text.
-fn load_storage_text(
-    storage: &Storage,
-    name: &str,
-    mode: &str,
-    encoding: Option<&str>,
-) -> Result<String, String> {
+/// Read storage `name` and apply the mode's `oN` byte offset. The reference
+/// opens the bytecode stream with the same mode string it later opens the
+/// text stream with (`reference/cpp/core/base/ScriptMgnIntf.cpp:716,783`),
+/// so the offset is applied before either path runs.
+fn read_storage_bytes(storage: &Storage, name: &str, mode: &str) -> Result<Vec<u8>, String> {
     let bytes = storage
         .read(name)
         .map_err(|error| format!("Scripts: '{name}': {error}"))?;
-    let bytes = match mode_offset(mode) {
-        Some(offset) => &bytes[offset.min(bytes.len())..],
-        None => &bytes[..],
-    };
+    Ok(match mode_offset(mode) {
+        Some(offset) => bytes[offset.min(bytes.len())..].to_vec(),
+        None => bytes,
+    })
+}
+
+/// Decode `bytes` as text and log the `script read` diagnostic (the byte
+/// signature is only materialised when debug logging is on).
+fn decode_storage_text(name: &str, bytes: &[u8], encoding: Option<&str>) -> Result<String, String> {
     let encoding = encoding.map_or(crate::text::TextEncoding::Detect, |name| {
         crate::text::TextEncoding::Named(name)
     });
-    // The byte signature is only materialised when debug logging is on; the
-    // decode itself is the normal path.
     let decoded = if log::log_enabled!(log::Level::Debug) {
         let reported = crate::text::decode_text_reported(bytes, encoding);
         match &reported {
@@ -333,11 +339,198 @@ fn load_storage_text(
     decoded.map_err(|error| format!("Scripts: '{name}': {error}"))
 }
 
+/// Maximum number of source bytes a failure diagnostic prints.
+const FAILURE_SOURCE_BYTES: usize = 8 * 1024;
+/// Lines printed from the head when an error names no line.
+const FAILURE_HEAD_LINES: usize = 40;
+
+/// The source line a script error names, from the `<block>(<line>): <message>`
+/// form the VM's error conversion produces (`tjs2_abi.cpp`
+/// `make_error_message`). Returns `None` when no such prefix is present.
+fn error_source_line(error: &str) -> Option<usize> {
+    let bytes = error.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'(' {
+            let mut end = i + 1;
+            let mut value = 0usize;
+            while end < bytes.len() && bytes[end].is_ascii_digit() {
+                value = value
+                    .checked_mul(10)?
+                    .checked_add(usize::from(bytes[end] - b'0'))?;
+                end += 1;
+            }
+            if end > i + 1 && bytes.get(end) == Some(&b')') && bytes.get(end + 1) == Some(&b':') {
+                return Some(value);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The longest prefix of `text` that is at most `max_bytes` long and ends on
+/// a character boundary.
+fn clip_to_bytes(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// Build the `debug` diagnostic for a script whose execution failed: the
+/// error, then a numbered excerpt of the decoded source. When the error names
+/// a line, the excerpt always contains that line and grows outward on both
+/// sides until the byte cap is reached; when it names none, the excerpt is the
+/// head of the script. The excerpt is bounded by [`FAILURE_SOURCE_BYTES`] and
+/// states what was left out.
+fn script_failure_message(name: &str, source: &str, error: &str) -> String {
+    let lines: Vec<&str> = source
+        .split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .collect();
+    let total = lines.len();
+    let entry = |number: usize| format!("{number:>6}| {}\n", lines[number - 1]);
+
+    let mut chosen: Vec<usize> = Vec::new();
+    let mut capped = false;
+    match error_source_line(error).filter(|line| (1..=total).contains(line)) {
+        Some(line) => {
+            chosen.push(line);
+            let mut used = entry(line).len();
+            if used > FAILURE_SOURCE_BYTES {
+                capped = true;
+            } else {
+                let mut before = line;
+                let mut after = line;
+                let mut before_done = line == 1;
+                let mut after_done = line == total;
+                while !(before_done && after_done) {
+                    let mut progressed = false;
+                    if !before_done {
+                        let candidate = before - 1;
+                        let length = entry(candidate).len();
+                        if used + length <= FAILURE_SOURCE_BYTES {
+                            chosen.push(candidate);
+                            used += length;
+                            before = candidate;
+                            before_done = candidate == 1;
+                            progressed = true;
+                        } else {
+                            before_done = true;
+                        }
+                    }
+                    if !after_done {
+                        let candidate = after + 1;
+                        let length = entry(candidate).len();
+                        if used + length <= FAILURE_SOURCE_BYTES {
+                            chosen.push(candidate);
+                            used += length;
+                            after = candidate;
+                            after_done = candidate == total;
+                            progressed = true;
+                        } else {
+                            after_done = true;
+                        }
+                    }
+                    if !progressed {
+                        break;
+                    }
+                }
+                capped = before > 1 || after < total;
+            }
+        }
+        None => {
+            let head = total.min(FAILURE_HEAD_LINES);
+            let mut used = 0usize;
+            for number in 1..=head {
+                let length = entry(number).len();
+                chosen.push(number);
+                if used + length > FAILURE_SOURCE_BYTES {
+                    capped = true;
+                    break;
+                }
+                used += length;
+            }
+        }
+    }
+    chosen.sort_unstable();
+
+    let mut body = String::new();
+    for &number in &chosen {
+        let text = entry(number);
+        let remaining = FAILURE_SOURCE_BYTES.saturating_sub(body.len());
+        if text.len() > remaining {
+            body.push_str(clip_to_bytes(&text, remaining));
+            capped = true;
+            break;
+        }
+        body.push_str(&text);
+    }
+
+    let shown = chosen.len();
+    let first = chosen.first().copied().unwrap_or(1);
+    let last = chosen.last().copied().unwrap_or(1);
+    let mut message = format!(
+        "script failure '{name}': {error}\nsource lines {first}-{last} of {total}:\n{body}"
+    );
+    if capped {
+        message.push_str(&format!(
+            "... excerpt truncated at {FAILURE_SOURCE_BYTES} bytes\n"
+        ));
+    }
+    let omitted = total.saturating_sub(shown);
+    if omitted > 0 {
+        message.push_str(&format!("... {omitted} more line(s) not shown\n"));
+    }
+    message
+}
+
+/// Log a failed script's decoded source at `debug`, so a device log carries
+/// the evidence next to the error. Nothing is logged when debug is off, and a
+/// script that succeeds logs no source.
+fn log_script_failure(name: &str, source: &str, error: &str) {
+    if !log::log_enabled!(log::Level::Debug) {
+        return;
+    }
+    let message = script_failure_message(name, source, error);
+    log::debug!("{message}");
+}
+
+/// Log that a failed script was precompiled bytecode, which has no text
+/// source to excerpt.
+fn log_bytecode_failure(name: &str, error: &str) {
+    if !log::log_enabled!(log::Level::Debug) {
+        return;
+    }
+    log::debug!("script failure '{name}': precompiled bytecode, no source to show: {error}");
+}
+
+/// Read storage `name`, apply the mode's `oN` offset and decode the text.
+fn load_storage_text(
+    storage: &Storage,
+    name: &str,
+    mode: &str,
+    encoding: Option<&str>,
+) -> Result<String, String> {
+    let bytes = read_storage_bytes(storage, name, mode)?;
+    decode_storage_text(name, &bytes, encoding)
+}
+
 /// Read `name` through storage and run it as a script (`expression == false`)
 /// or an expression (`expression == true`), retaining an object result. The
 /// script block is labelled with `block_name` (the reference
 /// `TVPExtractStorageName` of the placed path) and runs with `context` as its
 /// `this` (`nullptr` for the global object).
+///
+/// The bytes are offered to the bytecode loader first and only decoded as
+/// text when that reports they were not bytecode, which is the reference
+/// `TVPExecuteStorage` order
+/// (`reference/cpp/core/base/ScriptMgnIntf.cpp:691-699,713-760`).
 #[allow(clippy::too_many_arguments)]
 fn execute_storage(
     engine: &Tjs2Engine,
@@ -351,16 +544,38 @@ fn execute_storage(
     services: Option<&CompatServices>,
 ) -> Result<RetainedValue, String> {
     let _timer = ScriptExecTimer::start(services, block_name);
-    let text = load_storage_text(storage, name, mode, encoding)?;
-    if expression {
-        engine
-            .eval_retained_with_context(&text, block_name, context, 0)
-            .map_err(|error| error.to_string())
-    } else {
-        engine
-            .exec_script_retained_with_context(&text, block_name, context, 0)
-            .map_err(|error| error.to_string())
+    let bytes = read_storage_bytes(storage, name, mode)?;
+    // Bytecode first, text second. `Ok(None)` means the loader did not
+    // recognize bytecode; a non-bytecode input is not an error, but a
+    // recognized-and-rejected one is.
+    match engine.load_bytecode(&bytes, block_name, context) {
+        Ok(Some(result)) => {
+            if log::log_enabled!(log::Level::Debug) {
+                log_script_read(name, &bytes, Some("precompiled bytecode"), None);
+            }
+            return Ok(result);
+        }
+        Ok(None) => {}
+        Err(error) => {
+            if log::log_enabled!(log::Level::Debug) {
+                log_script_read(name, &bytes, Some("precompiled bytecode"), None);
+            }
+            let error = error.to_string();
+            log_bytecode_failure(name, &error);
+            return Err(error);
+        }
     }
+    let text = decode_storage_text(name, &bytes, encoding)?;
+    let result = if expression {
+        engine.eval_retained_with_context(&text, block_name, context, 0)
+    } else {
+        engine.exec_script_retained_with_context(&text, block_name, context, 0)
+    };
+    result.map_err(|error| {
+        let error = error.to_string();
+        log_script_failure(name, &text, &error);
+        error
+    })
 }
 
 /// Execute storage `name` as a script through `engine`: the core of
@@ -912,6 +1127,8 @@ mod tests {
 
     use tjs::Tjs2Engine;
 
+    use super::{error_source_line, script_failure_message};
+
     use crate::CompatHost;
     use crate::native_util::test_vm_lock;
     use crate::natives::NativeTiming;
@@ -971,5 +1188,33 @@ mod tests {
         timing.record("Scripts.exec", Duration::from_millis(120));
         let (slow, _) = timing.format_report().expect("a report");
         assert!(slow);
+    }
+
+    /// The failure diagnostic reads the `<block>(<line>):` prefix the VM's
+    /// error conversion produces and ignores a message without one.
+    #[test]
+    fn error_source_line_reads_the_reported_line() {
+        assert_eq!(
+            error_source_line("TJS error: Initialize.tjs(579): script exception"),
+            Some(579)
+        );
+        assert_eq!(error_source_line("TJS error: (12): boom"), Some(12));
+        assert_eq!(error_source_line("TJS error: boom"), None);
+        assert_eq!(error_source_line("TJS error: blocked"), None);
+    }
+
+    /// An error with no reported line falls back to a bounded head of the
+    /// script and states how many lines it left out.
+    #[test]
+    fn failure_message_uses_the_head_without_a_reported_line() {
+        let source = (1..=100)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let message = script_failure_message("foo.tjs", &source, "TJS error: boom");
+        assert!(message.contains("source lines 1-40 of 100:"), "{message}");
+        assert!(message.contains("    40| line 40"), "{message}");
+        assert!(!message.contains("line 41"), "{message}");
+        assert!(message.contains("more line(s) not shown"), "{message}");
     }
 }

@@ -123,6 +123,11 @@ pub const BUILTIN_PLUGINS: &[BuiltinPluginDef] = &[
         register: layer_ex::register,
     },
     BuiltinPluginDef {
+        name: "menu.dll",
+        aliases: &[],
+        register: crate::natives::menu_item::register_plugin,
+    },
+    BuiltinPluginDef {
         name: "motionplayer.dll",
         aliases: &[],
         register: motion_player::register,

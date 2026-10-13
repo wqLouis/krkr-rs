@@ -1,6 +1,6 @@
 # 08 — TJS VM, compatibility surface, and native plugins
 
-Status: design. No code on this branch.
+Status: implemented (the TJS2 Rust port in §10 remains deferred).
 Related: [`02-target-architecture.md`](02-target-architecture.md) (layers),
 [`09-game-loading.md`](09-game-loading.md) (loading).
 
@@ -36,9 +36,12 @@ Small host API (illustrative):
 
 ```rust
 impl VmHost {
-    fn new(platform: &Platform) -> Result<Self, VmError>;
-    fn install(&self, surface: &CompatSurface) -> Result<(), VmError>;
+    fn with_default() -> Result<Self, VmError>;          // built-in plugin registry
+    fn new(registry: PluginRegistry) -> Result<Self, VmError>;
+    fn engine(&self) -> &Tjs2Engine;
+    fn compat(&self) -> &CompatHost;
     fn exec(&self, source: &str, name: &str) -> Result<TjsValue, VmError>;
+    fn eval(&self, expression: &str, name: &str) -> Result<TjsValue, VmError>;
     fn tick(&mut self, frame: FrameCtx<'_>) -> Result<(), VmError>;
 }
 ```
@@ -87,6 +90,22 @@ from **`null`**: a script guard like `if (ret != null) ret.mode` passes for
 `void` and then throws on the member access. A member with no value returns
 `null` (`set_null_out`), not `void`.
 
+### 3.3 Script loading
+
+`Scripts.execStorage`/`evalStorage` read the named script through the L2
+storage and offer the raw bytes to the TJS2 **bytecode loader first**
+(`TJS2100`); only when the loader reports the input is not bytecode is it
+decoded as text, which is the reference `TVPExecuteStorage` order
+(`reference/cpp/core/base/ScriptMgnIntf.cpp:691-699,713-760`). Text decoding
+handles the `FE FE` cipher / zlib container, a UTF-8/UTF-16 BOM, an explicit
+`Scripts.textEncoding` override, then UTF-8 and CP932; an undecodable script
+raises a typed error instead of producing mojibake. A debug-only `script
+read` diagnostic logs the storage name, byte length, first 32 bytes and the
+encoding decision, so a device log can identify the raw bytes without dumping
+the script. `compat::exec_storage` is the core of `Scripts.execStorage`
+without the native wrapper; the composition root uses it to run the startup
+sequence.
+
 ## 4. Native plugins
 
 ### 4.1 Static, built into L3 (D14)
@@ -116,10 +135,22 @@ The ported set lives in one table, `natives::plugins::BUILTIN_PLUGINS`,
 each entry mapping a canonical DLL name (plus its aliases —
 `layerExDraw.dll`/`layerExMovie.dll`/`perspective.dll` share a module) to
 that module's `register`. The same table feeds `PluginRegistry::builtin()`,
-so `Plugins.link(name)` recognizes **every** DLL we have ported:
-`builtin_plugin_names()` exposes the list. `link` returns `void`, exactly as
-the reference (`PluginImpl.cpp:300` → `TVPLoadPlugin(name); return
+so `Plugins.link(name)` recognizes **every** DLL we have ported;
+`PluginRegistry::{plugin,is_builtin}` query the table. `link` returns `void`,
+exactly as the reference (`PluginImpl.cpp:300` → `TVPLoadPlugin(name); return
 TJS_S_OK;`).
+
+One plugin is registered with a deferred half. `xp3filter.dll` is part of
+`BUILTIN_PLUGINS`, but its `setXP3ArchiveExtractionFilter`/`ContentFilter`
+wrappers need the L2 storage, which the composition root attaches after
+`CompatHost::install`; `CompatHost::activate_deferred_plugins` completes the
+read of `xp3filter.tjs` and installs the L2 filter seam **before** the
+startup scripts run. This mirrors the reference, which loads
+`xp3filter.dll` before any game script. A separate mechanism is the
+reference's `tvpLoadPlugins` scan: the composition root discovers `*.tpm`
+files in the exe directory, `<exe>/system` and `<exe>/plugin`, sorts them by
+name and calls `PluginRegistry::autoload`, which maps `foo.tpm` to `foo.dll`
+and links it (`PluginImpl.cpp:113-177`).
 
 ### 4.2 Missing DLLs → the null plugin object
 
@@ -142,7 +173,19 @@ ported: every ported DLL (including `extrans.dll` and `wuvorbis.dll`, whose
 surface lives in L2/engine and the host audio chain rather than in a native
 class) resolves to the built-in table above.
 
-### 4.3 WASM (future)
+### 4.4 Unported plugins and the DLL-surface pipeline
+
+A plugin we have not ported has no `reference/cpp` source. Where the
+reference is a binary, the DLL is the oracle and is cited by its build hash
+(D38): `plugins/<n>/plugin/<Name>.dll <sha256[:12]> @ <decompiled function or
+address>`. The extraction pipeline and its measured fidelity live in
+`plugins/analysis/`, validated against `layerExDraw.dll` (233 of 234 members
+matched, the two differences being real build differences). The DLLs are
+gitignored and never loaded by a test: the extracted surface is committed as
+a derived fixture and the test gates on that. Bringing the 36 unported plugin
+names to native coverage is the next major version (`TODO.md` §17).
+
+### 4.5 WASM (future)
 
 If third-party plugins must actually execute, a WASM host can be added
 behind the same `NativePlugin` interface later. Out of scope for the first
@@ -170,36 +213,32 @@ timer_poll → sound_poll → video poll
            → L2 projects the scene → L1 RenderPipeline::render
 ```
 
-## 7. Migration from `tvp-*`
+## 7. Implementation status
 
-| today | target |
-|---|---|
-| `tvp-natives` (system/debug/trans/menu/video/plugins) | `compat/plugins/*` |
-| `tvp-storages` | `compat/plugins/storages.rs` (over the L2 VFS) |
-| `tvp-scripts` | `compat/plugins/scripts.rs` |
-| `tvp-input` | `compat` adapter + L1 events |
-| `tvp-visual` scene/bitmap | L2 `engine` (generic layer system) |
-| `tvp-visual` natives | `compat/plugins/visual/*` |
-| `tvp-text` | L1 raster (`render`) + L2/L3 layout/composition |
-| `tvp-sound` | L2 model + L1 `media`/audio device |
-| `tvp-kagparser` + `kag` | `compat/kag` |
+The move is complete: the `tvp-*` native families are folded into `compat`
+as `plugins/*`, the L2 scene/bitmap layer system is `engine`, the sound model
+is `engine::sound` over the L1 audio device, text raster is `render` with
+layout/composition in `engine`/`compat`, and the KAG parser is `compat/kag`.
+The VM host is `crates/vm` (`VmHost`, `FrameCtx`). There is no `tvp-*` crate
+left.
 
 ## 8. Testing
 
 * Marshalling and the null-plugin object are unit-testable with no window.
 * The VM host is exercised with small script fixtures.
-* Native parity (the report script, removed with the legacy crates) keeps the class/method coverage
-  tracked through the move.
+* Native parity is tracked by `scripts/native_parity.py` against
+  `reference/cpp`; plugin parity by `scripts/plugin_parity.py`. Both are
+  reports of coverage, not correctness claims (D36).
 
 ## 9. Native class structure: share the implementation, register the real surface
 
 The C++ reference gives each class a **distinct** member set (`Layer` 150,
 `Window` 83, `Bitmap` 20, `Font` 22, `Timer` 6) even though they share a large
-common implementation (the `tTVPBaseBitmap` / native-base node). Our first port
-mirrored the *code* but registered the **union** of the visual members on every
-class (~144 each) — a 5× source duplication **and** a compatibility deviation
-(scripts can call e.g. `Bitmap.changeScreenMode`, which the reference does not
-expose). That over-registration is what inflates the parity "extra" column.
+common implementation (the `tTVPBaseBitmap` / native-base node). The
+registered surface is now per class and matches the reference: native parity
+is 100% with empty allowlists, plus 2 intentional extras
+(`KAGParser.multiLineTagEnabled`, `paramMacros`; `docs/native_parity.md`),
+and the surface lock (D29) blocks additions and removals.
 
 Target design (do **not** mirror the C++ classes one-to-one):
 
@@ -492,9 +531,7 @@ What that buys:
 
 This is deliberately *not* a completeness measure. Parity against
 `reference/cpp` answers "what is missing?" and stays a **report**; it counts
-members present, not behaviour correct — the `Timer` class sat at 100% member
-parity while its `capacity`, `interval` type and action-name dispatch all
-diverged from the C++. The lock answers the different question, "what
-changed?", and behaviour is constrained separately by D28: every semantic must
-be reference-cited.
+members present, not behaviour correct. The lock answers the different
+question, "what changed?", and behaviour is constrained separately by D28:
+every semantic must be reference-cited.
 

@@ -39,13 +39,31 @@ layout transitions, and the fixed-function blend table is pre-compiled into
 7+7 pipelines. Docs and `//!`/`# Safety` coverage are excellent
 (`#![warn(missing_docs)]`, `lib.rs:31`).
 
-The problems are concentrated in three areas: (1) a likely **vertical flip in
-the projection matrix** that also disagrees with the scissor, (2) **error-path
-resource leaks** during `begin_render_state` and texture creation, and (3)
-**per-frame/per-upload allocations and synchronous waits** that contradict the
-design's persistent-staging-ring intent. There is also a set of lifecycle
-robustness gaps around the `image_available` semaphore and swapchain
-synchronization.
+The problems below were the snapshot at review time.
+
+> **Resolution status (current tree).** The main correctness/leak findings
+> have since been addressed:
+> * §1.1 — the projection is y-down (`b = 2.0 / height`, `b·ty − 1.0`;
+>   `vulkan/draw.rs:414-434`) and the scissor uses the same world y.
+> * §1.2/§1.3/§1.4/§1.5/§1.6 — the surface/state pair is validated and
+>   `Surface`/`RenderState` teardown is ordered; the backend reports typed
+>   `Unsupported` for the modes it cannot express.
+> * §2.1/§2.2 — the direct constructors are `pub(crate)`; `GpuCapabilities`
+>   is truthful per backend (`null.rs:80-82`, `vulkan/mod.rs:153-160`).
+> * §2.5/§3.3/§4.2 — the child sort key and `children_are_sorted` live in
+>   `scene.rs`; both backends sort only unsorted children.
+> * §4.1 — the per-upload staging allocation is now a persistent 3-slot ring
+>   (`vulkan/texture.rs:51-217`).
+> * §5 — offscreen render targets now exist on both backends
+>   (`RenderTarget`/`read_render_target`); destination-dependent blends and
+>   mask clips/glyph runs return `RenderError::Unsupported` rather than
+>   silently substituting source-over or keeping the inherited scissor;
+>   `supports_glyph_atlas` is `false`; the push-constant size assertion exists
+>   (`vulkan/draw.rs`). The host uses `begin_render_state_with_display` when a
+>   display handle is available (`app/src/lib.rs`).
+>
+> The lower-severity items (semaphore recreation policy, descriptor pool
+> exhaustion, mipmaps) have not all been re-checked; read them as a snapshot.
 
 ---
 
@@ -356,21 +374,19 @@ forbidden here, but these two catch most of the remaining risk.
 These are explicitly stubbed or unreachable; each should become a tracked work
 item (with a test) rather than an implicit gap:
 
-- **Destination-dependent blends** — all 12 modes collapse to `SourceOver`
-  (`pipelines.rs:176-181`), contradicting `04-renderer-vulkan.md §4`. The
-  `DstBlend` enum is fully populated and mapped by L2
-  (`projection.rs:47-104`), so scripts silently lose the effect.
-- **Mask clips** — `Clip::Mask(_)` is a no-op that silently keeps the inherited
-  scissor (`draw.rs:136`). Documented, but it is a visible correctness gap for
-  mask-based transitions.
-- **GPU glyph runs** — a `GlyphRun` draws its atlas as a single quad and
-  `GlyphPlacement` is never consumed (`draw.rs:181-193`, `scene.rs:63-100`).
-  `supports_glyph_atlas` is nonetheless advertised `true`.
+- **Destination-dependent blends** — the Vulkan backend reports
+  `RenderError::Unsupported` for every `DestinationDependent` mode
+  (`pipelines.rs:240`); the null software rasterizer composites them. Do not
+  confuse this with a silent fallback: the mode is rejected, not approximated.
+- **Mask clips** — `Clip::Mask(_)` returns `RenderError::Unsupported`
+  (`draw.rs`), a visible correctness gap for mask-based transitions.
+- **GPU glyph runs** — a `GlyphRun` returns `RenderError::Unsupported`;
+  `supports_glyph_atlas` is `false` on both backends.
 - **Mipmaps** — accepted but neither generated nor sampled (`max_lod = 0.0`,
   `pipelines.rs:321`); level memory is wasted.
-- **Headless/offscreen targets** — `supports_offscreen_targets: false`
-  (`vulkan/mod.rs:143`); textures are `TRANSFER_DST | SAMPLED` only
-  (`texture.rs:88-89`), so there is no render-target/readback path yet.
+- **Headless/offscreen targets** — implemented on both backends
+  (`RenderTarget`/`read_render_target`); the Vulkan backend renders into a
+  device image and copies it back, the null backend composites on the CPU.
 - **GPU transitions** (crossfade/scroll/wave/mosaic) — still completion-callback
   stubs per `04-renderer-vulkan.md §4`.
 - **Device-lost recovery** — `RenderError::DeviceLost` is returned
@@ -380,12 +396,9 @@ item (with a test) rather than an implicit gap:
   linearizes solid/clear colours (`draw.rs:376-382`, `mod.rs:974-987`); the
   textured tint is forced white with no per-node tint, and destination blends
   are absent. Validate against `07-roadmap.md §6`.
-- **Platform surface entry point** — `begin_render_state` derives a display
-  handle only for Android/Win32 (`mod.rs:946-953`), so the Linux/X11/Wayland
-  path must use `begin_render_state_with_display`. `crates/app/src/lib.rs`
-  calls the former, so the app cannot create a Vulkan surface on Linux as
-  written. Consider a single `begin_render_state(display, window)` (or have the
-  host always pass both).
+- **Platform surface entry point** — `begin_render_state` and
+  `begin_render_state_with_display` are both available; the host passes the
+  display handle when the platform supplies one (`app/src/lib.rs`).
 - **`render_finished`/`image_available` semaphore lifecycle** — as in 1.4/1.5;
   add a resize/minimize/device-lost stress test (design §11.3).
 
@@ -393,34 +406,22 @@ item (with a test) rather than an implicit gap:
 
 ## 6. Top 10 recommended changes
 
-1. **Fix the vertical flip (and align the scissor).** `crates/platform/render/src/vulkan/draw.rs:400` —
-   use `b = 2.0 / height` and `-b·ty - 1` so world y-down maps to Vulkan NDC
-   (`y=0` → `-1`); re-check `rect_to_scissor` at `:335`. Add a golden-image test.
-2. **Fix error-path leaks in `begin_with_display`.** `crates/platform/render/src/vulkan/mod.rs:257`,
-   `:259`, `:274` — guard `create_frames`, the `render_finished` collect, and
-   `create_upload_resources` with an RAII teardown.
-3. **Reject mismatched `Surface`/`RenderState` and tie their lifetimes.**
-   `crates/platform/render/src/vulkan/mod.rs:452` (render) and `:331` (resize) —
-   compare against `vstate.surface`; give `Surface` ownership or a lifetime tie.
-4. **Make the acquired-image semaphore error-safe.** `crates/platform/render/src/vulkan/mod.rs:494-516` —
-   any failure after `acquire_next_image` must consume or recreate
-   `image_available`.
-5. **Replace per-upload staging alloc + fence wait with a persistent ring /
-   batched uploads.** `crates/platform/render/src/vulkan/texture.rs:225-340`.
-6. **Recreate `render_finished` semaphores per swapchain generation.**
-   `crates/platform/render/src/vulkan/mod.rs:922-939` — do not reuse semaphores that
-   a `present` may have signalled.
-7. **Cache memory properties and use `1u32`.** `crates/platform/render/src/vulkan/texture.rs:503-512`.
-8. **Stop cloning+sorting children every node every frame.**
-   `crates/platform/render/src/vulkan/draw.rs:122` and `crates/platform/render/src/null.rs:334` —
-   iterate borrowed and sort only when dirty/unsorted.
-9. **Narrow the public construction surface and honor or remove
-   `preferred_format`.** `crates/platform/render/src/lib.rs:58`, `:89`, `:156`,
-   `:177`; `crates/platform/render/src/vulkan/mod.rs:121`.
-10. **Fix the remaining partial-creation leaks.** `crates/platform/render/src/vulkan/texture.rs:107`
-    (image after `find_memory_type`), `:243` (staging buffer after `map_memory`),
-    `:362` (`create_staging_buffer`), and
-    `crates/platform/render/src/vulkan/pipelines.rs:353` (`create_unit_quad`).
+1. **Vertical flip** — fixed (`vulkan/draw.rs:414-434`; scissor uses the same
+   world y). Keep the golden-image test.
+2. **Error-path leaks in `begin_with_display`** — addressed by the ordered
+   `VulkanState` teardown.
+3. **Mismatched `Surface`/`RenderState`** — the pair is validated before
+   acquire/present.
+4. **Acquired-image semaphore error safety** — addressed with the slot ring.
+5. **Persistent staging ring** — implemented (`vulkan/texture.rs:51-217`).
+6. **`render_finished` semaphores per swapchain generation** — re-check.
+7. **Cache memory properties** — re-check; use `1u32`.
+8. **Stop cloning+sorting children every node every frame** —
+   `children_are_sorted` in `scene.rs`.
+9. **Narrow the public construction surface / `preferred_format`** — direct
+   constructors narrowed; `preferred_format` still selects the requested
+   format, re-check the field's use.
+10. **Remaining partial-creation leaks** — re-check.
 
 ### Honourable mentions
 

@@ -1,18 +1,19 @@
-# Explicit font configuration (`fonts.json`)
+# Fonts and face resolution
 
-krkr-rs performs **no implicit font selection of its own**. Which faces exist
-and in what order they are tried is supplied by the application, not guessed
-from the system font database. This document specifies the schema, the
-startup precedence, and the exact resolution order.
+krkr-rs selects text faces in the reference's order. A requested family is
+looked up first through the faces a script registered (`System.addFont`,
+`GdiPlus.addPrivateFont`), then as a storage name, then in the host's installed
+system fonts, and finally falls back to the host's default face. There is no
+project-specific font-configuration file: the application supplies the host
+font directories, and scripts supply extra faces.
 
-When **no** configuration is found, krkr-rs keeps its original out-of-the-box
-behavior: it discovers a Japanese-capable CJK face from the system
-(`Noto Sans CJK JP` via `fontdb`, or a known Noto CJK path). This is the only
-implicit path, and it exists so a game runs before the user has supplied a
-`fonts.json`. Once a configuration is installed, krkr-rs never touches the
-system font database unless `allow_system_discovery` is explicitly `true`.
+Reference behaviour: `reference/cpp/core/visual/FontImpl.cpp:159-168`
+(unknown name resolves to the default face) and the bundled default face at
+`FontImpl.cpp:220-243`.
 
-## System font sources (current engine)
+---
+
+## System font sources
 
 The engine resolves a face through a lazily built `fontdb::Database`
 (`engine::text::TextEngine`). The database is built the first time a face is
@@ -23,7 +24,7 @@ requested from the host, from two sources:
    Android, so on Android this source contributes nothing.
 2. The directories the composition root passes to
    `engine::text::TextEngine::set_system_font_dirs`, obtained from the L1
-   `platform::system_font_dirs`:
+   `platform::system_font_dirs` (`crates/platform/platform/src/fonts.rs`):
    * Android — `/system/fonts`, `/product/fonts`, `/vendor/fonts`;
    * Unix-like desktop — `/usr/share/fonts`, `/usr/local/share/fonts`, the
      XDG per-user directory (`$XDG_DATA_HOME/fonts`, defaulting to
@@ -41,115 +42,61 @@ a host face.
 > repository's test gate, so the device's actual font directories and their
 > contents are not verified here.
 
-### Fallback order
+---
 
-When a requested face is not already registered, not in the mounted storage
-and not an installed family, `compat::resource::resolve_face` falls back in
-the reference's order:
+## Face resolution
 
-1. the exact requested family (each comma-separated candidate, before the
-   next candidate is tried);
-2. the Japanese/CJK fallback families, in order: `Noto Sans CJK JP`,
-   `Noto Sans CJK SC`, `Noto Sans CJK TC`, `Noto Sans CJK KR`, then
-   `Droid Sans Fallback` (the reference's bundled CJK face);
-3. the well-known Noto CJK collection paths;
-4. the engine's first registered face (the reference `TVPCreateFontStream`
-   default font);
-5. otherwise a typed `TextError::FontNotFound`.
+`compat::resource::resolve_face` resolves the layer's requested face string.
+The string may be a comma-separated candidate list with an optional leading
+`@` (vertical writing); each candidate is tried in order and the first that
+resolves wins. For each candidate:
 
-`TextEngine::load_system_font_exact` is the exact-family query a candidate
-list needs and never substitutes an unrelated face; only
-`TextEngine::load_system_font` applies steps 2–3.
+1. Already-registered family (`TextEngine::font_id`), including faces added by
+   `System.addFont` (the per-engine `FontRegistry`).
+2. The attached storage: the candidate string read as a storage name and
+   parsed as a font file (`TextEngine::add_font`).
+3. The host's installed system fonts, exact family only
+   (`TextEngine::load_system_font_exact`); this never substitutes an unrelated
+   face, so a missing candidate does not claim the next one's place.
 
-## Schema
+When no candidate resolves, the host's default face is tried
+(`TextEngine::load_system_font`), which walks the fallback in the reference's
+order:
 
-`fonts.json` is a JSON object with three optional keys:
+1. the Japanese/CJK fallback families: `Noto Sans CJK JP`, `Noto Sans CJK SC`,
+   `Noto Sans CJK TC`, `Noto Sans CJK KR`, then `Droid Sans Fallback`;
+2. the well-known Noto CJK collection paths;
+3. otherwise `TextError::FontNotFound`.
 
-```json
-{
-  "faces": {
-    "MS Gothic": "fonts/msgothic.ttf",
-    "MS 明朝": { "path": "fonts/msmincho.ttc", "index": 0 }
-  },
-  "fallback": [
-    "fonts/noto-sans-jp.ttf",
-    { "path": "fonts/noto-cjk.ttc", "index": 1 }
-  ],
-  "allow_system_discovery": false
-}
-```
+Only when the host default also fails does the engine use its first registered
+face (`TextEngine::default_font_for`); an engine with no registered face at all
+raises. Only a resolution found through a candidate is cached under the
+requested face string. The default-face fallback is loaded under a fixed name
+and is never cached under the requested name, so a face registered later for
+that name (`System.addFont`, `GdiPlus.addPrivateFont`) is found on the next
+lookup instead of being shadowed by a stale fallback entry.
 
-| Key | Type | Meaning |
-| --- | --- | --- |
-| `faces` | object (name → entry) | Maps a requested `Font.face` name to a font file. Lookup is case-insensitive. |
-| `fallback` | array of entries | Ordered list tried when the requested face is not mapped or fails to load. The **first entry that loads** wins. |
-| `allow_system_discovery` | bool (default `false`) | Opt back into the `fontdb`/known-path system scan. |
+`Font.defaultFaceName`/`Font.getList` report the resolver's registered faces,
+and `GdiPlus.getFontList` adds the private faces (`GdiPlus.addPrivateFont`).
 
-A **font entry** is either:
+---
 
-* a string path — `"fonts/msgothic.ttf"` (collection index `0`), or
-* an object — `{ "path": "fonts/msmincho.ttc", "index": 1 }`,
-  where `index` defaults to `0`.
+## Pre-rendered `.tft` fonts
 
-Both `faces` values and each `fallback` element accept either form.
-Missing keys default to empty (`{}` / `[]`) and `false`.
+The visual `Font.mapPrerenderedFont` maps `.tft` pre-rendered bitmap fonts.
+`crates/compat/src/resource.rs` reads the storage and validates the file header
+at map time and defers the glyph body to first use (`PrerenderedFont::map` /
+`ensure_body`). This is an internal optimisation — a game that maps many fonts
+does not pay for glyph data it never draws — not a reference-parity claim: the
+reference also validates only the header at this point
+(`reference/cpp/core/visual/PrerenderedFont.cpp:9-76`). Loaded fonts are shared
+by resolved placed path and released when the last mapping goes.
 
-A malformed file (bad JSON, or a value of the wrong shape) produces a clear
-error that includes the file path and the JSON line/column.
+A layer-bound font measures width and height from the mapped `.tft` (the sum
+of its per-character `Inc` metrics), while a standalone `new Font()` measures
+directly through the shaping engine.
 
-## Startup precedence
-
-The first source that yields a path wins:
-
-1. CLI `--font-config <path>` (also works with `--headless`; the `run`
-   subcommand accepts `--font-config <path>` and `--font-config=<path>`).
-2. Environment variable `KRKR_RS_FONT_CONFIG`.
-3. `<game-dir>/fonts.json` (auto-detected; only if the file exists).
-4. Nothing.
-
-If no configuration is found, the **no-config behavior** applies: system
-discovery is used.
-
-If a configuration *is* found but cannot be read or parsed, krkr-rs logs an
-error and installs an **empty** configuration (empty `faces`/`fallback`,
-`allow_system_discovery = false`). A user who asked for explicit selection
-never silently gets implicit system fonts.
-
-The configuration is installed in `game_startup` (via
-`tvp_text::set_font_config`) **before** `startup.tjs` runs, so text layers
-created during initialization see it immediately.
-
-## Resolution order
-
-`Layer.drawText` derives a request from the layer's tracked font face
-(`layer.font.face`, a KAG `Font.face`). The request is one of:
-
-* **`Path`** — the `KRKR_RS_SYSTEM_FONT` environment variable (used by
-  hermetic CI). Always load exactly that file, never remapped by a config.
-  This override outranks the layer's face.
-* **`Named(name)`** — the layer's requested face name:
-  1. Case-insensitive lookup in `faces`. Because KAG `Font.face` values are
-     often comma-separated preference lists (`"A,B,C"`), the **whole string**
-     is tried first, then each trimmed token in order. Every token must be an
-     explicit `faces` key; there is no implicit per-token system lookup.
-  2. If a mapped entry fails to load, and no candidate matches, walk
-     `fallback` in order and use the first entry that loads.
-  3. Only if `allow_system_discovery` is `true`, fall back to
-     `FontFace::discover_system_jp`.
-  4. Otherwise `None` (the renderer then uses its deterministic bitmap-font
-     fallback).
-* **`SystemJp`** — no face was tracked at all:
-  1. `fallback` chain (first entry that loads),
-  2. `allow_system_discovery` → `discover_system_jp`,
-  3. otherwise `None`.
-
-With **no configuration installed**, both `Named` and `SystemJp` behave like
-the pre-config port: system discovery.
-
-Resolved faces are cached per request (including negative results), and the
-cache is invalidated whenever `set_font_config` is called. Glyph atlases are
-cached per `(FontFace::id, pixel_height)` as before, so a named face and a
-path override never alias each other's atlases.
+---
 
 ## How the requested face reaches the resolver
 
@@ -164,29 +111,22 @@ with(font){        // `font` is `this.font` (the Layer's font)
 }
 ```
 
-The native `Layer.font` getter returns a disposable `Font` object **bound to a
-single layer-owned `FontState`** (`Font.__bind`). Every access returns a new
-wrapper but writes go to the same state, so the mutation persists the way the
-reference's cached `FontObject` does. `Layer.drawText` reads
-`LayerState.font_id` → `FontState.face` and issues `FaceRequest::Named(face)`.
+The L2 `Scene` owns one `FontState` per layer. `layer.font` returns a `Font`
+object bound to the layer's state: every access returns the same wrapper, so
+writes persist the way the reference's cached `FontObject` does.
+`Layer.drawText` reads the layer's font id and resolves the face through the
+resolver; when the layer has no font it uses the default face
+(`DEFAULT_FONT_FACE`) rather than a per-call guess. `Layer.font = f` copies the
+source `Font`'s properties into the layer's own state.
 
-`Layer.font = f` copies the source `Font`'s properties into the layer's own
-state. If a script draws without ever touching `layer.font`, `drawText` falls
-back to the newest registered `Font` in the scene (`scene.fonts.last()`) and
-then to `FaceRequest::SystemJp`; this last-resort path is the only remaining
-case without a per-layer face and is documented here as a limitation.
+---
 
 ## Tests
 
-`crates/tvp-text/tests/font_config.rs` covers:
-
-* JSON parsing of string and `{ path, index }` entries, the default index, and
-  malformed-JSON errors;
-* case-insensitive `faces` mapping and comma-separated token matching;
-* `fallback` order (a missing first entry is skipped);
-* `allow_system_discovery` on/off, and the no-config discovery behavior;
-* cache invalidation when the configuration changes.
-
-`crates/tvp-visual` unit tests cover the layer font tracking (shared state
-across accesses, the `Layer.font` setter) and that a `drawText` with a
-configured named face rasterizes through that face.
+* `crates/engine/src/text.rs` unit tests cover system-face registration, the
+  exact-family query and its no-substitution rule, and the CJK fallback.
+* `crates/compat/tests/font.rs` and `crates/compat/tests/add_font.rs` drive
+  the real `Font`/`System.addFont` surface through the VM and cover face
+  resolution, the `.tft` path and the fallback.
+* `crates/platform/platform/src/fonts.rs` covers the host directory list and
+  the Android constant.

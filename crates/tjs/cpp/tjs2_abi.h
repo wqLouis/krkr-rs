@@ -10,6 +10,20 @@
 #include <stddef.h> /* size_t */
 
 #ifdef __cplusplus
+namespace TJS {
+class tTJSBinaryStream;
+}
+/*
+ * Create a read-only binary stream over `len` bytes of `data` (which stays
+ * borrowed, not copied, and must outlive the stream). The caller owns the
+ * returned stream (`delete` it). This is the in-memory stream the VM's
+ * stream-based `LoadByteCode` runs on; the file-backed stream factory cannot
+ * be used because the bytes are already in memory.
+ */
+TJS::tTJSBinaryStream *tjs2_create_memory_stream(const void *data, size_t len);
+#endif
+
+#ifdef __cplusplus
 extern "C" {
 #endif
 
@@ -134,6 +148,30 @@ int tjs2_compile_script(tjs2_engine *e, const char *script, size_t script_len,
                         const char *output_path, int isresult,
                         int outputdebug, int isexpression, const char *name,
                         int lineofs, char **out_error);
+
+/*
+ * Load and execute TJS2 precompiled bytecode from an in-memory buffer
+ * (reference `tTJS::LoadByteCode(tTJSBinaryStream*, ...)`, whose only caller
+ * in the script path is `TVPExecuteStorage`,
+ * `reference/cpp/core/base/ScriptMgnIntf.cpp:713-727`). `buff`/`len` are the
+ * raw storage bytes (offset applied by the caller); `name` is the diagnostic
+ * block name and `context` the script `this` (the `context` argument of the
+ * reference `LoadByteCode`).
+ *
+ * `out_is_bytecode` mirrors the reference's `isbytecode`: 1 when the loader
+ * recognized and consumed the input (TJS2 bytecode, or the binary-serialized
+ * data the same loader entry also accepts) and `out_result` holds its value,
+ * and 0 when the input was neither, with `out_result` left void; the caller
+ * then falls through to the text path. A non-bytecode input is not an error.
+ *
+ * Returns 0 on success, non-zero on a genuine failure (bytecode that the
+ * loader recognizes and then rejects) with a malloc'd UTF-8 message in
+ * *out_error (free with tjs2_free_string). `name` stays NUL-terminated;
+ * `out_result`/`out_is_bytecode` may be NULL.
+ */
+int tjs2_load_bytecode(tjs2_engine *e, const char *buff, size_t len,
+                       const char *name, void *context, int *out_is_bytecode,
+                       tjs2_value *out_result, char **out_error);
 
 /*
  * The vendored TJS2 engine version as `major.minor.release` UTF-8 (reference

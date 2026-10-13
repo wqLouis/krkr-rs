@@ -14,8 +14,13 @@ How it works (short version)
   on.  Class attribution uses the enclosing ``tTJSNativeClass(TJS_W("X"))``
   constructor, the ``TJS_BEGIN_NATIVE_MEMBERS(X)`` macro argument, or the
   ``TVPCreateNativeClass_X()`` function that performs ``_OUTER``
-  registrations.  Preprocessor regions that are disabled in a normal build
-  (``#if 0``, ``#ifdef USE_OBSOLETE_FUNCTIONS``) are ignored.
+  registrations.  Class-object members installed after construction with
+  ``PropSet(TJS_MEMBERENSURE, ...)`` on a variable bound by
+  ``TVPCreateNativeClass_*`` / ``registerObject`` are read too (``Window.menu``,
+  ``Window.BasicDrawDevice``).  A ``PropSet`` whose name is not a literal is
+  reported as unrecoverable rather than dropped.  Preprocessor regions that
+  are disabled in a normal build (``#if 0``,
+  ``#ifdef USE_OBSOLETE_FUNCTIONS``) are ignored.
 * Rust surface: for the files listed in ``RUST_CLASS_MAP`` the builder whose
   ``name: "X"`` matches is scanned for ``name: "member"`` entries,
   ``method("member", ...)`` / ``property("member", ...)`` shorthands,
@@ -37,6 +42,7 @@ Usage
     python3 scripts/native_parity.py --update-allow  # refresh the allowlist
     python3 scripts/native_parity.py --no-doc        # skip docs/native_parity.md
     python3 scripts/native_parity.py --quiet         # only print failures
+    python3 scripts/native_parity.py --self-test     # extractor fixture self-test
     python3 scripts/native_parity.py --runtime target/runtime_surface.json \
         --no-doc                                     # check the live VM surface
 
@@ -53,12 +59,14 @@ import os
 import re
 import sys
 from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 REFERENCE_GLOB = "reference/cpp/core/**/*.cpp"
 ALLOWLIST_PATH = REPO_ROOT / "scripts" / "native_parity_allow.txt"
 DOC_PATH = REPO_ROOT / "docs" / "native_parity.md"
+FIXTURES_DIR = REPO_ROOT / "scripts" / "parity_fixtures"
 
 # Classes that live in tjs2 itself (provided by the VM, not the TVP port).
 TJS2_BUILTINS = {
@@ -158,6 +166,35 @@ CPP_ASSUMED_DEFINED: set[str] = set()
 IGNORED_REFERENCE_MEMBERS = {"finalize"}
 
 
+@dataclass(frozen=True)
+class MemberInfo:
+    """How one script-visible reference member is installed.
+
+    ``kind`` is ``"method"`` / ``"property"`` when the declaring macro says
+    so, ``"constructor"`` for the class-name entry, and ``"unknown"`` when the
+    installation mechanism does not reveal it (``PropSet`` installs a value or
+    a property object, and the two are not distinguishable from the call site).
+    ``static`` is true for a class-object member; ``mechanism`` names the source
+    construct so the report can show where a member came from.
+    """
+
+    kind: str = "unknown"
+    static: bool = False
+    mechanism: str = "unknown"
+
+
+# Registration mechanisms, in descending order of how much they reveal.  A
+# member reached by more than one mechanism keeps the first (strongest) entry.
+_MECHANISM_RANK = {
+    "native-macro": 0,
+    "constructor": 1,
+    "ncm": 2,
+    "propset": 3,
+    "propset-bynum": 4,
+    "unknown": 5,
+}
+
+
 # ---------------------------------------------------------------------------
 # C++ reference parsing
 # ---------------------------------------------------------------------------
@@ -169,7 +206,7 @@ _CPP_CTOR_RE = re.compile(
 )
 _CPP_FUNC_RE = re.compile(r"TVPCreateNativeClass_(\w+)\s*\([^)]*\)\s*\{")
 _CPP_MEMBER_RE = re.compile(
-    r"TJS_BEGIN_NATIVE_(?:STATIC_)?(?:METHOD|PROP)_DECL\s*\(\s*([A-Za-z_]\w*)\s*\)"
+    r"TJS_BEGIN_NATIVE_(STATIC_)?(METHOD|PROP)_DECL\s*\(\s*([A-Za-z_]\w*)\s*\)"
 )
 _CPP_CTOR_END_RE = re.compile(
     r"TJS_END_NATIVE_(?:STATIC_)?CONSTRUCTOR_DECL\s*\(\s*([A-Za-z_]\w*)\s*\)"
@@ -265,56 +302,218 @@ def _match_brace(src: str, open_pos: int) -> int:
     return n
 
 
-def parse_reference() -> dict[str, set[str]]:
-    """Return ``{reference_class: {member, ...}}``."""
-    classes: dict[str, set[str]] = {}
+def _split_cpp_args(src: str, open_paren: int) -> list[str]:
+    """Split a C++ call argument list whose ``(`` is at ``open_paren``.
+
+    Returns the argument strings; only parens/brackets/braces are tracked,
+    which is enough for the registration calls in this tree.
+    """
+    depth = 0
+    args: list[str] = []
+    cur: list[str] = []
+    i = open_paren + 1
+    n = len(src)
+    while i < n:
+        c = src[i]
+        if c in "([{":
+            depth += 1
+            cur.append(c)
+        elif c in ")]}":
+            if c == ")" and depth == 0:
+                args.append("".join(cur).strip())
+                return args
+            depth -= 1
+            cur.append(c)
+        elif c == "," and depth == 0:
+            args.append("".join(cur).strip())
+            cur = []
+        else:
+            cur.append(c)
+        i += 1
+    args.append("".join(cur).strip())
+    return args
+
+
+def _cpp_string_literal(expr: str) -> "str | None":
+    """The TJS name in ``TJS_W("x")`` / ``"x"``; ``None`` for an expression."""
+    m = re.search(r'TJS_W\s*\(\s*"([^"]+)"\s*\)', expr)
+    if m:
+        return m.group(1)
+    m = re.fullmatch(r'\s*"([^"]+)"\s*', expr)
+    return m.group(1) if m else None
+
+
+def _core_class_bindings(src: str) -> dict[str, str]:
+    """Class object variable -> TJS class name for one core file.
+
+    Two shapes bind a class object to a local: an explicit
+    ``var = TVPCreateNativeClass_X()`` and the ``registerObject`` call
+    ``registerObject(TJS_W("X"), (var = TVPCreateNativeClass_X()))``.  The
+    ``registerObject`` spelling wins because it names the TJS class directly.
+    """
+    bindings: dict[str, str] = {}
+    for m in re.finditer(
+        r"([A-Za-z_]\w*)\s*=\s*TVPCreateNativeClass_(\w+)\s*\(", src
+    ):
+        bindings[m.group(1)] = m.group(2)
+    for m in re.finditer(
+        r'registerObject\s*\(\s*TJS_W\s*\(\s*"([^"]+)"\s*\)\s*,\s*'
+        r"\(?\s*([A-Za-z_]\w*)\s*=\s*TVPCreateNativeClass_(\w+)\s*\(",
+        src,
+    ):
+        bindings[m.group(2)] = m.group(1)
+    return bindings
+
+
+def collect_propset_members(
+    src: str, bindings: dict[str, str]
+) -> tuple[dict[str, dict[str, MemberInfo]], list[str]]:
+    """Class-level members installed with ``PropSet`` / ``PropSetByNum``.
+
+    ``bindings`` maps a class-object variable to its TJS class name.  A
+    ``var->PropSet(TJS_MEMBERENSURE, TJS_W("name"), ...)`` call on a bound
+    variable installs a class member; ``TJS_STATICMEMBER`` makes the static
+    kind explicit, but the member is class-level either way.  A name that is
+    not a string literal (``something.c_str()``, a loop variable, ...) cannot
+    be recovered and is returned in the second list so it is counted as an
+    unsupported site rather than silently dropped.
+    """
+    members: dict[str, dict[str, MemberInfo]] = {}
+    unrecoverable: list[str] = []
+    for m in re.finditer(
+        r"([A-Za-z_]\w*)\s*(?:->|\.)\s*(PropSet|PropSetByNum)\s*\(", src
+    ):
+        var, method = m.group(1), m.group(2)
+        cls = bindings.get(var)
+        if cls is None:
+            continue
+        open_paren = src.index("(", m.start())
+        args = _split_cpp_args(src, open_paren)
+        if len(args) < 2:
+            continue
+        name = _cpp_string_literal(args[1])
+        if name is None:
+            unrecoverable.append(f"{cls}.{var}.{method}: {args[1]}")
+            continue
+        info = MemberInfo(
+            kind="unknown",
+            static=True,
+            mechanism="propset" if method == "PropSet" else "propset-bynum",
+        )
+        members.setdefault(cls, {})[name] = info
+    return members, unrecoverable
+
+
+def _set_member(
+    surface: dict[str, dict[str, MemberInfo]],
+    cls: str,
+    name: str,
+    info: MemberInfo,
+) -> None:
+    """Add a member, keeping the strongest (earliest) mechanism seen."""
+    existing = surface.setdefault(cls, {})
+    old = existing.get(name)
+    if old is None or _MECHANISM_RANK.get(info.mechanism, 9) < _MECHANISM_RANK.get(
+        old.mechanism, 9
+    ):
+        existing[name] = info
+
+
+def parse_cpp_source_surface(
+    src: str,
+) -> tuple[dict[str, dict[str, MemberInfo]], list[str]]:
+    """Reference members declared in one already-masked C++ source.
+
+    Covers the native-member macro blocks and constructors, plus class-level
+    ``PropSet``/``PropSetByNum`` registrations on a class object bound from
+    ``TVPCreateNativeClass_*`` / ``registerObject``.  The second return value
+    lists registration sites whose member name is built at runtime.
+    """
+    surface: dict[str, dict[str, MemberInfo]] = {}
+    unrecoverable: list[str] = []
+
+    spans: list[tuple[int, int, str]] = []
+
+    # TJS_BEGIN_NATIVE_MEMBERS(X) ... TJS_END_NATIVE_MEMBERS
+    for m in _CPP_BLOCK_RE.finditer(src):
+        cls = m.group(1)
+        # Prefer the enclosing tTJSNativeClass(TJS_W("X")) argument: the
+        # macro argument is sometimes a copy/paste leftover (DebugImpl.cpp
+        # uses TJS_BEGIN_NATIVE_MEMBERS(Debug) inside Controller/Console).
+        for cm in _CPP_CTOR_RE.finditer(src[: m.start()]):
+            cls = cm.group(1)
+        end_m = _CPP_END_MEMBERS_RE.search(src[m.end() :])
+        end = m.end() + end_m.start() if end_m else len(src)
+        spans.append((m.start(), end, cls))
+
+    # TVPCreateNativeClass_X() { ... }  (hosts the _OUTER registrations)
+    for m in _CPP_FUNC_RE.finditer(src):
+        open_pos = src.index("{", m.start())
+        spans.append((m.start(), _match_brace(src, open_pos), m.group(1)))
+
+    def enclosing(pos: int) -> "str | None":
+        containing = [s for s in spans if s[0] < pos < s[1]]
+        if not containing:
+            return None
+        return min(containing, key=lambda s: s[1] - s[0])[2]
+
+    # Attribute every member declaration to the innermost containing span.
+    for m in _CPP_MEMBER_RE.finditer(src):
+        name = m.group(3)
+        if name in IGNORED_REFERENCE_MEMBERS:
+            continue
+        cls = enclosing(m.start())
+        if cls is None:
+            continue
+        kind = "method" if m.group(2) == "METHOD" else "property"
+        _set_member(
+            surface,
+            cls,
+            name,
+            MemberInfo(kind, m.group(1) is not None, "native-macro"),
+        )
+
+    # Constructor registrations expose a member named after the class.
+    for m in _CPP_CTOR_END_RE.finditer(src):
+        name = m.group(1)
+        cls = enclosing(m.start())
+        if cls is None:
+            continue
+        _set_member(surface, cls, name, MemberInfo("constructor", False, "constructor"))
+
+    # Class-object registrations performed after the class is built.
+    ps_members, ps_unrecoverable = collect_propset_members(
+        src, _core_class_bindings(src)
+    )
+    for cls, entries in ps_members.items():
+        for name, info in entries.items():
+            _set_member(surface, cls, name, info)
+    unrecoverable.extend(ps_unrecoverable)
+    return surface, unrecoverable
+
+
+def parse_reference_surface() -> tuple[dict[str, dict[str, MemberInfo]], list[str]]:
+    """Return ``({class: {member: MemberInfo}}, unrecoverable_sites)``."""
+    surface: dict[str, dict[str, MemberInfo]] = {}
+    unrecoverable: list[str] = []
     files = sorted(glob.glob(str(REPO_ROOT / REFERENCE_GLOB), recursive=True))
     for fp in files:
         raw = Path(fp).read_text(encoding="utf-8", errors="replace")
         src = _strip_cpp_comments(_preprocess_cpp(raw))
+        file_surface, file_unrecoverable = parse_cpp_source_surface(src)
+        for cls, entries in file_surface.items():
+            for name, info in entries.items():
+                _set_member(surface, cls, name, info)
+        unrecoverable.extend(
+            f"{Path(fp).relative_to(REPO_ROOT)}: {site}" for site in file_unrecoverable
+        )
+    return surface, unrecoverable
 
-        spans: list[tuple[int, int, str]] = []
 
-        # TJS_BEGIN_NATIVE_MEMBERS(X) ... TJS_END_NATIVE_MEMBERS
-        for m in _CPP_BLOCK_RE.finditer(src):
-            cls = m.group(1)
-            # Prefer the enclosing tTJSNativeClass(TJS_W("X")) argument: the
-            # macro argument is sometimes a copy/paste leftover (DebugImpl.cpp
-            # uses TJS_BEGIN_NATIVE_MEMBERS(Debug) inside Controller/Console).
-            for cm in _CPP_CTOR_RE.finditer(src[: m.start()]):
-                cls = cm.group(1)
-            end_m = _CPP_END_MEMBERS_RE.search(src[m.end() :])
-            end = m.end() + end_m.start() if end_m else len(src)
-            spans.append((m.start(), end, cls))
-
-        # TVPCreateNativeClass_X() { ... }  (hosts the _OUTER registrations)
-        for m in _CPP_FUNC_RE.finditer(src):
-            open_pos = src.index("{", m.start())
-            spans.append((m.start(), _match_brace(src, open_pos), m.group(1)))
-
-        # Attribute every member declaration to the innermost containing span.
-        for m in _CPP_MEMBER_RE.finditer(src):
-            name = m.group(1)
-            if name in IGNORED_REFERENCE_MEMBERS:
-                continue
-            pos = m.start()
-            containing = [s for s in spans if s[0] < pos < s[1]]
-            if not containing:
-                continue
-            cls = min(containing, key=lambda s: s[1] - s[0])[2]
-            classes.setdefault(cls, set()).add(name)
-
-        # Constructor registrations expose a member named after the class.
-        for m in _CPP_CTOR_END_RE.finditer(src):
-            name = m.group(1)
-            pos = m.start()
-            containing = [s for s in spans if s[0] < pos < s[1]]
-            if not containing:
-                continue
-            cls = min(containing, key=lambda s: s[1] - s[0])[2]
-            classes.setdefault(cls, set()).add(name)
-
-    return classes
+def parse_reference() -> dict[str, set[str]]:
+    """Return ``{reference_class: {member, ...}}``."""
+    surface, _unrecoverable = parse_reference_surface()
+    return {cls: set(entries) for cls, entries in surface.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -763,6 +962,43 @@ def parse_rust_file(path: Path) -> dict[str, set[str]]:
     return result
 
 
+_RUNTIME_ATTACH_RE = re.compile(
+    r"attach_class\s*\(\s*\w+\s*,\s*\"([^\"]+)\"\s*,\s*\"([^\"]+)\"\s*\)"
+)
+_SCRIPT_MEMBER_RE = re.compile(r"([A-Za-z_]\w*)\.([A-Za-z_]\w*)\s*=")
+
+
+def parse_runtime_class_attachments() -> dict[str, set[str]]:
+    """Class members the port installs after the class object is built.
+
+    Two shapes the builder reader cannot see are recognised:
+    ``attach_class(ctx, "Target", "Member")`` (the draw devices attached to
+    ``Window``) and a class-member assignment inside an ``exec_script`` string
+    (``WaveSoundBuffer.PhaseVocoder = ...``).  Only targets that are tracked
+    classes are kept, so ordinary script assignments (``t.fontSize = ...``)
+    are ignored.
+    """
+    tracked = set(RUST_CLASS_MAP) | set(RUST_ONLY_CLASS_MAP)
+    out: dict[str, set[str]] = {}
+    root = REPO_ROOT / "crates" / "compat" / "src" / "natives"
+    if not root.is_dir():
+        return out
+    for path in sorted(root.rglob("*.rs")):
+        raw = path.read_text(encoding="utf-8", errors="replace")
+        _code, strings = _lex_rust(raw)
+        code_no_comment = _strip_cpp_comments(raw)
+        for m in _RUNTIME_ATTACH_RE.finditer(code_no_comment):
+            target, member = m.group(1), m.group(2)
+            if target in tracked:
+                out.setdefault(target, set()).add(member)
+        for _off, (_end, content, _quote) in strings.items():
+            for m in _SCRIPT_MEMBER_RE.finditer(content):
+                target, member = m.group(1), m.group(2)
+                if target in tracked:
+                    out.setdefault(target, set()).add(member)
+    return out
+
+
 def parse_rust() -> tuple[dict[str, set[str]], dict[str, list[str]]]:
     """Parse all mapped Rust files.
 
@@ -797,6 +1033,14 @@ def parse_rust() -> tuple[dict[str, set[str]], dict[str, list[str]]]:
                 members |= parsed.get(builder, set())
         class_members[cls] = members
         class_sources[cls] = sources
+
+    for cls, members in parse_runtime_class_attachments().items():
+        if cls in class_members:
+            class_members[cls] |= members
+            note = "runtime class attachment"
+            class_sources.setdefault(cls, [])
+            if note not in class_sources[cls]:
+                class_sources[cls].append(note)
     return class_members, class_sources
 
 
@@ -806,27 +1050,54 @@ def parse_rust() -> tuple[dict[str, set[str]], dict[str, list[str]]]:
 
 
 def read_allowlist(path: Path) -> set[str]:
+    return set(read_allowlist_reasons(path))
+
+
+def read_allowlist_reasons(path: Path) -> "OrderedDict[str, str]":
+    """Allowlist entries as ``{key: reason}``.
+
+    An entry is ``Class.member`` optionally followed by a reason after an
+    em dash, a ``#`` comment marker or `` -- ``.  A reason starting with
+    ``debt:`` marks a deliberately-baselined known gap (mirrors
+    ``scripts/layering_allow.txt``); a bare entry has an empty reason.
+    """
+    entries: "OrderedDict[str, str]" = OrderedDict()
     if not path.exists():
-        return set()
-    entries: set[str] = set()
+        return entries
     for line in path.read_text(encoding="utf-8").splitlines():
-        item = line.strip()
-        if not item or item.startswith("#"):
+        text = line.strip()
+        if not text or text.startswith("#"):
             continue
-        entries.add(item)
+        reason = ""
+        for sep in ("\u2014", " -- ", " # "):
+            if sep in text:
+                key, _, reason = text.partition(sep)
+                entries[key.strip()] = reason.strip()
+                break
+        else:
+            entries[text] = ""
     return entries
 
 
-def write_allowlist(path: Path, entries: set[str]) -> None:
+def write_allowlist(
+    path: Path, entries: set[str], reasons: "dict[str, str] | None" = None
+) -> None:
     header = (
         "# Native parity allowlist: reference members that are known-missing.\n"
-        "# One entry per line: Class.member\n"
+        "# One entry per line: Class.member [— reason]\n"
+        "# A reason beginning with 'debt:' records a known gap that is accepted\n"
+        "# but still visible; see docs/audits/propset-parity.md.\n"
         "# Regenerate after intentional additions with:\n"
         "#   python3 scripts/native_parity.py --update-allow\n"
         "# The checker fails when a missing member is not listed here.\n"
         "\n"
     )
-    body = "\n".join(sorted(entries))
+    reasons = reasons or {}
+    lines = []
+    for key in sorted(entries):
+        reason = (reasons.get(key) or "").strip()
+        lines.append(f"{key} \u2014 {reason}" if reason else key)
+    body = "\n".join(lines)
     path.write_text(header + body + ("\n" if body else ""), encoding="utf-8")
 
 
@@ -837,7 +1108,11 @@ def build_report(
     rust_sources: dict[str, list[str]],
     missing_by_class: dict[str, set[str]],
     extra_by_class: dict[str, set[str]],
+    ref_surface: "dict[str, dict[str, MemberInfo]] | None" = None,
+    unrecoverable: "list[str] | None" = None,
 ) -> str:
+    ref_surface = ref_surface or {}
+    unrecoverable = unrecoverable or []
     tracked = [c for c in RUST_CLASS_MAP if c in ref]
     total_ref = sum(len(ref.get(c, ())) for c in tracked)
     total_matched = sum(len(ref.get(c, set()) & rust.get(c, set())) for c in tracked)
@@ -868,6 +1143,7 @@ def build_report(
     lines.append("python3 scripts/native_parity.py                 # check + regenerate this report")
     lines.append("python3 scripts/native_parity.py --no-doc        # check only")
     lines.append("python3 scripts/native_parity.py --update-allow  # accept current gaps after review")
+    lines.append("python3 scripts/native_parity.py --self-test     # extractor fixture self-test")
     lines.append("```")
     lines.append("")
     lines.append(
@@ -887,6 +1163,72 @@ def build_report(
     lines.append(f"| **missing** | **{total_missing}** |")
     lines.append(f"| extra (Rust only) | {total_extra} |")
     lines.append(f"| coverage | **{coverage:.1f}%** |")
+    lines.append("")
+
+    # Registration mechanisms (how each reference member becomes visible).
+    mechanism_counts: "OrderedDict[str, int]" = OrderedDict()
+    for entries in ref_surface.values():
+        for info in entries.values():
+            mechanism_counts[info.mechanism] = (
+                mechanism_counts.get(info.mechanism, 0) + 1
+            )
+    if mechanism_counts:
+        lines.append("## Reference registration mechanisms")
+        lines.append("")
+        lines.append(
+            "How each reference member becomes script-visible. `native-macro` is "
+            "`TJS_BEGIN_NATIVE_*_DECL`, `constructor` the class-name entry, and "
+            "`propset` a class-object member installed after the class is built "
+            "with `PropSet(TJS_MEMBERENSURE, ...)`. A member reached by more than "
+            "one mechanism is counted once, under the strongest."
+        )
+        lines.append("")
+        lines.append("| mechanism | members |")
+        lines.append("| --- | ---: |")
+        for mech, count in sorted(mechanism_counts.items(), key=lambda kv: (-kv[1], kv[0])):
+            lines.append(f"| `{mech}` | {count} |")
+        lines.append("")
+
+        propset = [
+            (cls, name, info)
+            for cls, entries in ref_surface.items()
+            for name, info in entries.items()
+            if info.mechanism in ("propset", "propset-bynum")
+        ]
+        lines.append("## Class-level members installed by `PropSet`")
+        lines.append("")
+        lines.append(
+            "Members and class objects attached to an already-built class object. "
+            "`kind` is `unknown` when `PropSet` does not reveal method versus "
+            "property."
+        )
+        lines.append("")
+        if propset:
+            lines.append("| class | member | kind | static | mechanism |")
+            lines.append("| --- | --- | --- | --- | --- |")
+            for cls, name, info in sorted(propset):
+                lines.append(
+                    f"| `{cls}` | `{name}` | {info.kind} | "
+                    f"{str(info.static).lower()} | `{info.mechanism}` |"
+                )
+        else:
+            lines.append("_None._")
+        lines.append("")
+
+    lines.append("## Registration sites with a runtime-built name")
+    lines.append("")
+    if unrecoverable:
+        lines.append(
+            f"{len(unrecoverable)} site(s) install a member whose name is not a "
+            "string literal, so the source reader cannot recover it. These are "
+            "not counted as members: the coverage figures exclude them, which is a "
+            "remaining blind spot, not a claim they do not exist."
+        )
+        lines.append("")
+        for site in unrecoverable:
+            lines.append(f"- `{site}`")
+    else:
+        lines.append("_None._")
     lines.append("")
 
     lines.append("## Per-class coverage")
@@ -972,12 +1314,106 @@ def build_report(
     else:
         lines.append("_None._")
     lines.append("")
+
+    lines.append("## Extraction notes and remaining blind spots")
+    lines.append("")
+    lines.append(
+        "- Reference members come from `TJS_BEGIN_NATIVE_(STATIC_)METHOD/PROP_DECL` "
+        "blocks, `TJS_END_NATIVE_CONSTRUCTOR_DECL`, and class-object members "
+        "installed with `PropSet`/`PropSetByNum` on a variable bound by "
+        "`TVPCreateNativeClass_*`/`registerObject`."
+    )
+    lines.append(
+        "- The Rust side is read from the builders in `RUST_CLASS_MAP`, plus "
+        "`attach_class(ctx, \"Target\", \"Member\")` and a class member assigned "
+        "inside an `exec_script` string, so a class attached after construction "
+        "is not a false missing."
+    )
+    lines.append(
+        "- A `PropSet` name that is not a string literal is not counted (see "
+        "the runtime-built-name section): a name built at runtime cannot be "
+        "recovered from source, and a coverage figure that silently dropped it "
+        "would read as evidence it does not exist."
+    )
+    lines.append(
+        "- A `PropSet` on an *instance* object (`this`, a dictionary, a method "
+        "parameter) is not a class member and is deliberately not counted; "
+        "only class-object receivers are members of the class surface."
+    )
+    lines.append(
+        "- `global->PropSet(...)` registers a global (a class object or a free "
+        "function such as `getDirList`), not a class member; the plugin reader "
+        "covers that surface, this report does not."
+    )
+    lines.append(
+        "- A member installed by a plugin at load time rather than in the core "
+        "is outside this report; `scripts/plugin_parity.py` covers the plugin "
+        "surface."
+    )
+    lines.append("")
     return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+
+
+def self_test(verbose: bool = True) -> int:
+    """Assert the reference extractor still sees each registration mechanism.
+
+    ``scripts/parity_fixtures/native_core.cpp`` exercises every core mechanism
+    the extractor claims, plus a runtime-built name that must be reported as
+    unrecoverable.  A regex that silently stops matching fails here rather than
+    quietly shrinking the covered surface.
+    """
+    fixture = FIXTURES_DIR / "native_core.cpp"
+    expected_path = FIXTURES_DIR / "native_core.expected.json"
+    for path in (fixture, expected_path):
+        if not path.is_file():
+            print(f"native_parity: self-test fixture missing: {path}")
+            return 1
+    expected = json.loads(expected_path.read_text(encoding="utf-8"))
+    raw = fixture.read_text(encoding="utf-8")
+    src = _strip_cpp_comments(_preprocess_cpp(raw))
+    surface, unrecoverable = parse_cpp_source_surface(src)
+    got = {cls: sorted(entries) for cls, entries in surface.items()}
+    want = expected["members"]
+
+    problems: list[str] = []
+    for cls in sorted(set(got) | set(want)):
+        got_members = set(got.get(cls, []))
+        want_members = set(want.get(cls, []))
+        if got_members - want_members:
+            problems.append(f"{cls}: unexpected member(s) {sorted(got_members - want_members)}")
+        if want_members - got_members:
+            problems.append(f"{cls}: missing member(s) {sorted(want_members - got_members)}")
+
+    want_unrecoverable = expected.get("unrecoverable", [])
+    if len(unrecoverable) != len(want_unrecoverable):
+        problems.append(
+            "unrecoverable sites: expected "
+            f"{len(want_unrecoverable)}, got {len(unrecoverable)}: {unrecoverable}"
+        )
+    for needle in want_unrecoverable:
+        if not any(needle in site for site in unrecoverable):
+            problems.append(f"unrecoverable sites: no site matching {needle!r}")
+    if any("runtime" in m for members in got.values() for m in members):
+        problems.append("runtime-built name leaked into the member set")
+
+    if problems:
+        print("native_parity: extractor self-test FAILED:")
+        for problem in problems:
+            print(f"  {problem}")
+        print("  Fix the extractor; do not silence the self-test.")
+        return 1
+    if verbose:
+        print(
+            "native_parity: extractor self-test ok "
+            f"({sum(len(v) for v in got.values())} members, "
+            f"{len(unrecoverable)} unrecoverable site(s))"
+        )
+    return 0
 
 
 def _check_runtime(args: argparse.Namespace) -> int:
@@ -1025,6 +1461,11 @@ def main(argv: list[str] | None = None) -> int:
         "--quiet", action="store_true", help="only print failures/stale warnings"
     )
     parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="run the extractor self-test against scripts/parity_fixtures and exit",
+    )
+    parser.add_argument(
         "--runtime",
         metavar="PATH",
         help="compare the parsed reference surface against a runtime_surface.json "
@@ -1032,10 +1473,19 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    # A regex that silently stops matching is the failure mode; run the
+    # fixture self-test on every invocation (the guard scripts do the same).
+    selftest = self_test(verbose=not args.quiet)
+    if selftest != 0:
+        return selftest
+    if args.self_test:
+        return 0
+
     if args.runtime:
         return _check_runtime(args)
 
-    ref = parse_reference()
+    ref_surface, unrecoverable = parse_reference_surface()
+    ref = {cls: set(entries) for cls, entries in ref_surface.items()}
     rust, rust_sources = parse_rust()
 
     # The constructor (reference `TJS_END_NATIVE_CONSTRUCTOR_DECL(X)`, Rust
@@ -1065,9 +1515,12 @@ def main(argv: list[str] | None = None) -> int:
 
     # `--update-allow` accepts the current gap set wholesale, so the check
     # below is bypassed and the allowlist is rewritten deterministically.
+    # Existing reasons (including `debt:` markers) are preserved.
     allow = read_allowlist(ALLOWLIST_PATH)
     if args.update_allow:
-        write_allowlist(ALLOWLIST_PATH, all_missing)
+        write_allowlist(
+            ALLOWLIST_PATH, all_missing, read_allowlist_reasons(ALLOWLIST_PATH)
+        )
         print(
             f"native_parity: wrote {len(all_missing)} known-missing entries to "
             f"{ALLOWLIST_PATH.relative_to(REPO_ROOT)}"
@@ -1089,6 +1542,8 @@ def main(argv: list[str] | None = None) -> int:
                 rust_sources,
                 missing_by_class,
                 extra_by_class,
+                ref_surface,
+                unrecoverable,
             ),
             encoding="utf-8",
         )

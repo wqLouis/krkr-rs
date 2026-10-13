@@ -1,0 +1,55 @@
+# menu.dll script surface fixture (derived from the shipped binary, not loaded
+# by any test).
+#
+# source DLL:   plugins/1/plugin/menu.dll
+# sha256:       ecc8eba384e2dd2bb7ada8655e63bd9a3962b899dbe4fd8efdf6e1734603a49a
+# also seen:    plugins/4/plugin/menu.dll (identical surface and registration
+#               sequence at different addresses: V2Link @ 0x10003500,
+#               class builder FUN_10007510 @ 0x10007510)
+#               sha256 a697b99271fe318751676ffd213b422b511d976c305f3a46082b618b9b08365e
+# extraction:   plugins/analysis/run_pipeline.sh (Ghidra ExportNcbSurface +
+#               DecompileCandidates + ncb_surface.py); report
+#               plugins/analysis/menu-ecc8eba384e2.md
+# registration: V2Link @ 0x10003570 (calls FUN_100075a0 and installs the
+#               MenuItem global; also attaches the read-only Window.menu
+#               property to the Window class);
+#               FUN_100075a0 @ 0x100075a0 builds tTJSNativeClassForPlugin("MenuItem")
+#               and registers every member below through TJSNativeClassRegisterNCM
+#               (call site DAT_1001fba4, type 1 = method, type 2 = property,
+#               property flag 0x10000 = static);
+#               V2Unlink @ 0x10003b50 removes the global.
+#
+# The test `menu_dll_surface` compares the live VM surface for `MenuItem` with
+# this list. One line per member, `<kind> <name>`, kind one of
+# `method` / `ctor` / `property`; comment and blank lines are ignored.
+#
+# The recovered surface does not record method-vs-read-only-property: the
+# pipeline puts read-only properties in the methods column because their
+# registration call has the same arity as a method. The kind here follows the
+# decompiled registration site (type 1 = method, type 2 = property), so it is
+# not the pipeline's classification alone.
+
+class MenuItem
+method finalize
+method add
+method insert
+method remove
+method popup
+method onClick
+method fireClick
+ctor MenuItem
+property caption
+property checked
+property enabled
+property group
+property radio
+property shortcut
+property visible
+property parent
+property children
+property root
+property window
+property index
+property HMENU
+property textToKeycode
+property keycodeToText

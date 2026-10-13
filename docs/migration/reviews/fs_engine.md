@@ -22,6 +22,32 @@ Severity legend: **Critical** (breaks an invariant / exploitable) · **High**
 (likely bug or clear design break) · **Medium** (correctness or cost risk) ·
 **Low** (quality).
 
+> **Resolution status (current tree).** Every finding in §1 has since been
+> addressed:
+> * §1.1 — no chain cap; the parser tracks visited index offsets and returns
+>   `Xp3Error::CorruptIndex("index chain cycle")` (`fs/src/xp3.rs:576-594`).
+> * §1.2 — `parse_file_chunk` requires `info`, `segm` and `aldr` and rejects a
+>   missing one (`fs/src/xp3.rs:663-746`).
+> * §1.3 — `Storage::find` returns `Result<Option<Location>, StorageReadError>`;
+>   only `NotFound`/`NotADirectory` map to `Ok(None)` (`engine/src/storage.rs:754`).
+> * §1.4 — the `debug_assert_eq!` was replaced by a typed `CorruptIndex`.
+> * §1.5 — the auto-path lookup requires a non-directory and uses the same
+>   resolution helper (`engine/src/storage.rs:787-819`).
+> * §1.6 — `unmount_archive` resolves against `game_dir`; bare-name matching is
+>   allowed only when it identifies exactly one archive
+>   (`engine/src/storage.rs:649-690`).
+> * §1.7 — `find_xp3_offset` carries the overlap across every read, not only a
+>   full chunk (`fs/src/xp3.rs:864-894`).
+> * §1.8 — `Xp3Archive::open` maps only `UnexpectedEof` to `NotAnXp3` and keeps
+>   other I/O errors (`fs/src/xp3.rs:205-216`).
+> * §1.9 — `collect_disk_entries` returns `Result`, propagating non-absence
+>   errors (`engine/src/storage.rs:1618-1630`).
+> * §1.10 — `exists` is directory-aware (`engine/src/storage.rs:1446-1452`),
+>   matching `TVPIsExistentStorage`; `crates/engine/tests/storage.rs:353-365`
+>   asserts it.
+> * §2 — the legacy `crates/xp3` parser is gone, and doc 06 now places the XP3
+>   parse in L1.
+
 ---
 
 ## 0. Verdict
@@ -38,11 +64,9 @@ later-mounted wins, `patch.tjs`/`AfterStartup.tjs` are app-path-only,
 size-handling (`try_reserve`, checked offset arithmetic, `usize::try_from`) is
 carefully done.
 
-The remaining problems are concentrated in two places: (a) the XP3 parser
-still has a hardcoded chain cap and silently accepts structurally incomplete
-`File` chunks, and (b) `Storage::find` collapses every filesystem error into
-`None`, which defeats D11 and makes `read`/`stat`/startup discovery report
-"not found" for genuine I/O failures.
+The findings below were the snapshot at review time; the resolution status
+above records how each was addressed. The size-handling (`try_reserve`,
+checked offset arithmetic, `usize::try_from`) is carefully done.
 
 ---
 
@@ -270,14 +294,10 @@ resolved location. Do not leave `exists` implying the reference semantics while
   the exact cases behind 1.1, 1.2 and 1.4. The `xp3_builder` helper is also
   duplicated verbatim in `crates/platform/fs/tests/common/` and
   `crates/engine/tests/common/`.
-- `docs/migration/06-file-system.md:44-52` still says the middle layer owns the
-  archive containers (`xp3`), which contradicts the revised D6 in
-  `02-target-architecture.md` §5 and doc 09. Update doc 06 so the design and
-  the code agree.
-- The legacy `crates/xp3` crate still contains a near-identical parser
-  (`crates/xp3/src/archive.rs`), so the format logic now exists twice. It is a
-  legacy anchor, but it should be deleted or reduced to a re-export once
-  `crates/engine` stops depending on it.
+- `docs/migration/06-file-system.md:44-52` said the middle layer owns the
+  archive containers (`xp3`); that section now matches the revised D6 and the
+  code (L1 owns the parse).
+- The legacy `crates/xp3` crate (with a near-identical parser) is gone.
 
 ---
 

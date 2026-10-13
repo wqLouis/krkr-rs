@@ -18,9 +18,29 @@ Method: source read-only. No build/test/cargo was run. Severity:
 Overall the three crates are in good shape structurally: no `unsafe` anywhere
 (`#![forbid(unsafe_code)]` in all three lib roots), typed `thiserror` error
 values, D9 state separation applied to `Media`/`FileState`, and genuinely
-careful numeric code in `tlg.rs`/`yuv.rs`. The problems are concentrated in
-untrusted-length arithmetic on the write/decode paths and in a handful of
-consistency/dependency issues.
+careful numeric code in `tlg.rs`/`yuv.rs`.
+
+> **Resolution status (current tree).** The high-severity findings have been
+> addressed:
+> * §4.1 `write_at` — validates the range with `memory_range` and grows
+>   fallibly with `try_reserve` (`fs/src/ops.rs`), so an overflowing offset is
+>   a typed `FsError` rather than a panic/abort.
+> * §4.1 TLG5 `blockheight` — `usize::try_from` and
+>   `blockheight == 0 || blockheight > height` are rejected (`media/src/tlg.rs:193-199`).
+> * §4.1 TLG6 `ft_size` — `usize::try_from` + `checked_add`
+>   (`media/src/tlg.rs:318-323`).
+> * §1.3 — `api`'s error enums carry `#[non_exhaustive]` and `FsError` has an
+>   `InvalidState` variant (`api/src/error.rs`).
+> * §1.5/§5.7 — the unused `fs`/`media` dependencies are gone; `thiserror` is
+>   used by `fs::xp3`, `flate2` by the XP3 reader.
+> * §4.2 — `MediaConfig::allow_large_images` was deleted with the rest of the
+>   field; `tlg` is `pub(crate)` and only the contract items are exported.
+> * §2.3/§5.5/§5.8 — audio probe/decode take a borrowed `Cursor<&[u8]>`, the
+>   memory `copy` moves rather than clones, and the hint/extension helpers are
+>   shared.
+>
+> Lower-severity consistency items (§1.1, §1.2, §2.2/§2.5, §4.5) have not all
+> been re-checked; read them as a snapshot, not as current defects.
 
 ---
 

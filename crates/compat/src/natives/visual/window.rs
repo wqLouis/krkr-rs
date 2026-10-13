@@ -53,6 +53,10 @@ struct WindowInst {
     /// `WindowIntf.h:190-194`). The window installs a default
     /// `BasicDrawDevice` at construction.
     draw_device: Option<DetachedValue>,
+    /// `Window.menu` (reference `WindowMenuProperty`,
+    /// `impl/MenuItemImpl.cpp:65-91`): the per-window root `MenuItem`, built
+    /// on first read and kept so repeated reads return the same object.
+    menu_root: Option<DetachedValue>,
     /// `Window.registerMessageReceiver` entries as `(proc, userdata)`
     /// (reference `tTVPWMRRegMode` register/unregister).
     message_receivers: Vec<(i64, i64)>,
@@ -87,6 +91,7 @@ impl Default for WindowInst {
             touch_scale_threshold: 5.0,
             touch_rotate_threshold: 5.0,
             draw_device: None,
+            menu_root: None,
             message_receivers: Vec::new(),
         }
     }
@@ -1762,6 +1767,65 @@ extern "C" fn window_hwnd_get(
     0
 }
 
+/// `Window.menu` — the per-window root `MenuItem`, built on first read and
+/// cached (reference `WindowMenuProperty::PropGet`,
+/// `reference/cpp/core/visual/impl/MenuItemImpl.cpp:65-82`): it reads the
+/// window's `HWND`, returns the cached root for that handle, and otherwise
+/// builds one with `TVPCreateMenuItemObject(objthis)`, i.e.
+/// `new MenuItem(window, window)` (`MenuItemIntf.cpp:559-573`), caching it
+/// under the handle. The property is registered read-only; a write is
+/// `TJS_E_ACCESSDENYED` (`WindowMenuProperty::PropSet`,
+/// `impl/MenuItemImpl.cpp:84-91`), which the read-only property registration
+/// produces. The reference attaches this in
+/// `reference/cpp/core/base/ScriptMgnIntf.cpp:538-542`.
+extern "C" fn window_menu_get(
+    engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    objthis: *mut c_void,
+) -> c_int {
+    let Ok((resolved, _ctx)) = bound(engine) else {
+        return report_error(out_error, "Window.menu: compat context is not bound");
+    };
+    // The reference reads `objthis->HWND` and reports `TJS_E_INVALIDOBJECT`
+    // when it cannot (`impl/MenuItemImpl.cpp:66-72`); `HWND` always resolves
+    // here, so a cached root is built for the window object directly.
+    // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM owns it, keeps it alive and passes it unaliased for the duration of this callback.
+    let has_root = unsafe { &*(instance as *const WindowInst) }
+        .menu_root
+        .is_some();
+    if !has_root {
+        let host = resolved.engine();
+        // `new MenuItem(this, this)` with `this` bound to the window object is
+        // `TVPCreateMenuItemObject(objthis)`: the first argument is the action
+        // owner and the second is the window (reference
+        // `reference/cpp/core/visual/MenuItemIntf.cpp:559-573`).
+        let object = match host.eval_retained_with_context(
+            "new MenuItem(this, this)",
+            "Window.menu",
+            objthis,
+            0,
+        ) {
+            Ok(RetainedValue::Object(object)) => object,
+            Ok(_) => {
+                return report_error(out_error, "Window.menu: the root is not an object");
+            }
+            Err(error) => return report_error(out_error, &format!("Window.menu: {error}")),
+        };
+        // SAFETY: as above; the eval above runs no code that reads or writes
+        // this `WindowInst`, and no borrow is held across it.
+        let inst = unsafe { &mut *(instance as *mut WindowInst) };
+        if inst.menu_root.is_none() {
+            inst.menu_root = Some(object);
+        }
+    }
+    // SAFETY: as above; the cached value is only read here.
+    let inst = unsafe { &*(instance as *const WindowInst) };
+    set_object_out(resolved.engine(), out, inst.menu_root.as_ref());
+    0
+}
+
 /// `Window.drawDevice` — the stored draw-device object, or `null` when none
 /// was installed (reference `WindowImpl.cpp:2300-2316` returns
 /// `GetDrawDeviceObject()`).
@@ -2388,6 +2452,14 @@ pub(super) fn register_window_class(ctx: &mut CompatCtx) -> Result<(), CompatErr
             NativeInstancePropertyDef {
                 name: "HWND",
                 get: Some(window_hwnd_get),
+                set: None,
+            },
+            NativeInstancePropertyDef {
+                name: "menu",
+                get: Some(window_menu_get),
+                // Reference `WindowMenuProperty::PropSet` returns
+                // `TJS_E_ACCESSDENYED` (`impl/MenuItemImpl.cpp:84-91`); a
+                // read-only property registration produces the same error.
                 set: None,
             },
             NativeInstancePropertyDef {

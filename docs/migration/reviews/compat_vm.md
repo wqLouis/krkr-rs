@@ -26,11 +26,30 @@ Severity legend:
 Overall the design matches doc 08: the single process-wide engine→context
 binding is small and documented, the null plugin correctly uses the VM
 `missing` handler, and `run_frame_body` enforces the documented poll order.
-The main problems are (a) `CompatCtx` is an unsound safe handle, (b) the null
-plugin recompiles/handles a closure per member access, (c) `unlink` is not a
-real unlink and breaks `link→unlink→link`, and (d) L3 redeclares
-`PlatformEvent` instead of consuming L1's. `tjs2_prop_set_default` itself is
-correct (verified against `tjs2_prop_set`).
+
+> **Resolution status (current tree).** Every finding below has been
+> addressed:
+> * §1 — `CompatCtx` is `!Send + !Sync` (`PhantomData<*mut ()>`),
+>   `CompatHost::ctx()` returns `Result`, and the service accessors hand back
+>   raw pointers (`crates/compat/src/ctx.rs:224-250`, `host.rs:145`).
+> * §2 — the no-op closure is created once and duplicated per access
+>   (`crates/compat/src/ctx.rs` `noop_closure`, `null_plugin.rs:154-166`).
+> * §3 — `activate` tracks a `registered` set so a built-in registers once;
+>   `unlink` clears a null global it installed and leaves built-ins idempotent
+>   (`crates/compat/src/plugin.rs:230-289`).
+> * §4 — the `getList` scratch lives in `CompatServices`; the only
+>   `thread_local!` left in `compat` is inside a `#[cfg(test)]` module.
+> * §5 — L3 consumes `platform::PlatformEvent` (`crates/compat/src/event.rs`).
+> * §6 — the null object is installed under the script's original name
+>   (`crates/compat/src/plugin.rs:250-260`).
+> * §7 — `CompatServices::scene()`/`storage()` return `*mut` and every caller
+>   dereferences under `unsafe` (`crates/compat/src/ctx.rs`).
+> * §9 — `PluginRegistry` keeps an insertion-ordered `Vec<LinkedEntry>` for
+>   `Plugins.getList` (`crates/compat/src/plugin.rs:135`).
+> * §10 — `FrameBody` gains a `project_and_render` step the order enforces
+>   (`crates/compat/src/frame.rs`).
+> * §11 — `CompatError::Unsupported` is gone; `compat` now uses its `fs`/`api`
+>   dependencies and `vm` uses `platform::PlatformEvent`.
 
 ---
 

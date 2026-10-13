@@ -1,5 +1,7 @@
 # Native parity allowlist: reference members that are known-missing.
-# One entry per line: Class.member
+# One entry per line: Class.member [— reason]
+# A reason beginning with 'debt:' records a known gap that is accepted
+# but still visible; see docs/audits/propset-parity.md.
 # Regenerate after intentional additions with:
 #   python3 scripts/native_parity.py --update-allow
 # The checker fails when a missing member is not listed here.
