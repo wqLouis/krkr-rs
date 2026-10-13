@@ -206,9 +206,10 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
 ///
 /// A plugin can only read an L2 service at registration when that service is
 /// already attached. The composition root attaches the storage after
-/// [`CompatHost::install`](crate::CompatHost::install), so this runs from
-/// [`CompatHost::begin_native_timing`](crate::CompatHost::begin_native_timing)
-/// before the startup scripts read anything. Idempotent.
+/// [`CompatHost::install`](crate::CompatHost::install), so
+/// [`CompatHost::activate_deferred_plugins`](crate::CompatHost::activate_deferred_plugins)
+/// completes the read and the seam install before the startup scripts run,
+/// returning a read failure to the caller. Idempotent.
 pub fn activate_deferred(
     engine: &tjs::Tjs2Engine,
     services: &crate::CompatServices,

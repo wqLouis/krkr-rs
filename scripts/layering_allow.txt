@@ -1,0 +1,74 @@
+# Layering/unsafe allowlist (AGENTS §2/§5).  Enforced by
+# scripts/check-layering.sh.
+#
+# One entry per line:  path:line:pattern — reason
+#
+#   path     repo-relative path.  A shell glob is allowed (`*` matches `/`
+#            too), so one reviewed location is one entry.
+#   line     the line at the time the entry was written, or `*` for any line.
+#            Advisory when `pattern` is a code anchor; exact-match when it is
+#            a rule name.
+#   pattern  EITHER a rule name (l1-vocabulary, l2-vocabulary, l3-platform,
+#            unsafe-no-safety-note, unsafe-allow-outside-ffi,
+#            missing-docs-lint) — then path, line and pattern must all match —
+#            OR a substring of the offending source line, matched by path +
+#            substring so the entry survives line churn and fails closed when
+#            the code changes.
+#   reason   why the site is legitimate or the debt is accepted.
+#
+# Blank lines and lines starting with '#' are ignored.  An entry that no longer
+# matches any finding is reported as stale so the list can shrink.
+#
+# Two kinds of entry live here, and they are not the same thing:
+#   * LEGITIMATE EXCEPTION — the rule does not apply at the site.
+#   * KNOWN DEBT — the rule does apply and the site violates AGENTS, but the
+#     fix is a tracked migration.  These are marked "debt:" so the guard does
+#     not hide the violation behind a clean exit.
+#
+# --- KNOWN DEBT: AGENTS §5 SAFETY-comment gaps -----------------------------
+# docs/audits/unsafe-inventory.md §2.6 already records that the compat crate
+# does not meet "every unsafe block carries a // SAFETY: note".  These entries
+# baseline the existing per-file gaps so the guard still fails on a *new* file
+# or a new rule; they are file-level because the per-site list is long and
+# churns.  New missing notes inside a listed file are not caught.
+crates/app/src/game.rs:*:unsafe-no-safety-note — debt: wired scene/storage pointer attach; unsafe-inventory §2.7
+crates/compat/src/natives/debug.rs:*:unsafe-no-safety-note — debt: callback instance deref (DebugState); unsafe-inventory §2.6
+crates/compat/src/natives/kag/mod.rs:*:unsafe-no-safety-note — debt: state_of/instance_of callback derefs; unsafe-inventory §2.6
+crates/compat/src/natives/plugins/csv_parser/mod.rs:*:unsafe-no-safety-note — debt: callback instance deref (CsvParserInst); unsafe-inventory §2.6
+crates/compat/src/natives/plugins/motion_player/emote.rs:*:unsafe-no-safety-note — debt: property *const Value deref; unsafe-inventory §2.6
+crates/compat/src/natives/plugins/motion_player/helpers.rs:*:unsafe-no-safety-note — debt: inst_ref/inst_mut plus property derefs; unsafe-inventory §2.6
+crates/compat/src/natives/plugins/motion_player/player_members.rs:*:unsafe-no-safety-note — debt: property *const Value deref; unsafe-inventory §2.6
+crates/compat/src/natives/plugins/text_render/mod.rs:*:unsafe-no-safety-note — debt: property *const Value deref; unsafe-inventory §2.6
+crates/compat/src/natives/plugins/xp3_filter/mod.rs:*:unsafe-no-safety-note — debt: wired services pointer deref; unsafe-inventory §2.6
+crates/compat/src/natives/rect.rs:*:unsafe-no-safety-note — debt: payload pointer deref (RectData); unsafe-inventory §2.6
+crates/compat/src/natives/scripts.rs:*:unsafe-no-safety-note — debt: wired services/storage deref; unsafe-inventory §2.6
+crates/compat/src/natives/sound/phase_vocoder.rs:*:unsafe-no-safety-note — debt: property *const Value deref; unsafe-inventory §2.6
+crates/compat/src/natives/sound.rs:*:unsafe-no-safety-note — debt: callback argv/instance derefs and generated setters; unsafe-inventory §2.6
+crates/compat/src/natives/system.rs:*:unsafe-no-safety-note — debt: wired services pointer deref; unsafe-inventory §2.6
+crates/compat/src/natives/tree_owner.rs:*:unsafe-no-safety-note — debt: callback instance deref (TreeOwnerInst); unsafe-inventory §2.6
+crates/compat/src/natives/video.rs:*:unsafe-no-safety-note — debt: wired services pointer deref; unsafe-inventory §2.6
+crates/compat/src/natives/visual/font.rs:*:unsafe-no-safety-note — debt: wired services pointer deref; unsafe-inventory §2.6
+crates/compat/src/natives/visual/layer/mod.rs:*:unsafe-no-safety-note — debt: wired services pointer deref; unsafe-inventory §2.6
+crates/compat/src/natives/visual/layer/transitions.rs:*:unsafe-no-safety-note — debt: wired services pointer deref; unsafe-inventory §2.6
+crates/compat/src/natives/visual/window.rs:*:unsafe-no-safety-note — debt: instance derefs in the Window trampolines; unsafe-inventory §2.6
+crates/platform/render/src/vulkan/device.rs:*:unsafe-no-safety-note — debt: ash calls on a Vulkan-owned handle; unsafe-inventory §2.7
+crates/platform/render/src/vulkan/mod.rs:*:unsafe-no-safety-note — debt: ash calls on a Vulkan-owned handle; unsafe-inventory §2.7
+crates/platform/render/src/vulkan/swapchain.rs:*:unsafe-no-safety-note — debt: ash swapchain call on a Vulkan-owned handle; unsafe-inventory §2.7
+crates/tjs/src/lib.rs:*:unsafe-no-safety-note — debt: tjs2_* C ABI wrapper blocks; unsafe-inventory §2.7
+
+# --- KNOWN DEBT: AGENTS §2, L3 platform code ------------------------------
+# The compat layer is barred from `std::fs`; these native plugins emulate the
+# Win32/TJS file APIs and touch the host path directly because L1 `fs` and L2
+# `engine::Storage` do not yet expose the operation.  Anchor `std::fs` so a
+# different platform leak in the same file (`winit`, `jni`, …) is still caught.
+crates/compat/src/natives/debug.rs:*:std::fs — debt: Debug.startLogToFile; route through the fs surface (06-file-system.md §5)
+crates/compat/src/natives/plugins/fstat/mod.rs:*:std::fs — debt: TVP_stat/Storages file ops (stat/write/copy/remove/read_dir/mkdir); no L1/L2 equivalent yet
+crates/compat/src/natives/plugins/json/mod.rs:*:std::fs — debt: JSON.save/load path IO; no L1/L2 write equivalent yet
+crates/compat/src/natives/plugins/layer_ex/draw.rs:*:std::fs — debt: LayerExDraw record save/load path IO; no L1/L2 equivalent yet
+crates/compat/src/natives/plugins/psd_file/mod.rs:*:std::fs — debt: PSD load reads the file by name; no L1/L2 path-read helper here
+crates/compat/src/natives/plugins/save_struct/mod.rs:*:std::fs — debt: Array.saveStruct path IO; no L1/L2 write equivalent yet
+
+# --- LEGITIMATE EXCEPTION: missing-docs lint absent from the tjs wrapper ---
+# A peer is deciding whether the vendored FFI wrapper takes the lint; the
+# allowlist records the decision point rather than pre-empting it.
+crates/tjs/src/lib.rs:*:missing-docs-lint — FFI wrapper; missing-docs decision tracked by the crate owner

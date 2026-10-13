@@ -260,13 +260,19 @@ fn emit_record(level: c_int, msg: &str) {
     }
 }
 
-/// UTC `YYYY-MM-DDTHH:MM:SSZ` for a wall-clock instant.
+/// UTC `YYYY-MM-DDTHH:MM:SSZ` for a wall-clock instant, or `"unknown"` for a
+/// clock that cannot be represented relative to the epoch.
 fn utc_timestamp(time: SystemTime) -> String {
-    let secs = time
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs());
-    let (year, month, day) = civil_from_days((secs / 86_400) as i64);
-    let tod = secs % 86_400;
+    let Ok(elapsed) = time.duration_since(UNIX_EPOCH) else {
+        return "unknown".to_string();
+    };
+    // A second count always fits in `i64`; the conversion states that rather
+    // than truncating with `as`.
+    let Ok(days) = i64::try_from(elapsed.as_secs() / 86_400) else {
+        return "unknown".to_string();
+    };
+    let (year, month, day) = civil_from_days(days);
+    let tod = elapsed.as_secs() % 86_400;
     format!(
         "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
         tod / 3600,
@@ -276,7 +282,7 @@ fn utc_timestamp(time: SystemTime) -> String {
 }
 
 /// Epoch days to `(year, month, day)`.
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z - era * 146_097;
@@ -287,7 +293,7 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let day = doy - (153 * mp + 2) / 5 + 1;
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = if month <= 2 { y + 1 } else { y };
-    (year, month as u32, day as u32)
+    (year, month, day)
 }
 
 extern "C" fn vm_log(level: c_int, msg: *const c_char, user: *mut c_void) {

@@ -1,0 +1,33 @@
+# House-style allowlist (AGENTS §5/§6).  Enforced by
+# scripts/check-house-style.sh.
+#
+# One entry per line:  path:line:pattern — reason
+#
+#   path     repo-relative path of the file.
+#   line     the line at the time the entry was written.  Advisory when
+#            `pattern` is a code anchor; exact-match when it is a rule name.
+#   pattern  EITHER a rule name (bean-accessor, ref-collection-param,
+#            decision-number, glob-reexport, jargon-in-log) — then
+#            path:line:pattern must all match — OR a substring of the
+#            offending source line, matched by path + substring so the entry
+#            survives line churn and fails closed when the code changes.
+#   reason   why the site is legitimate.
+#
+# Blank lines and lines starting with '#' are ignored.  An entry that no
+# longer matches any finding is reported as stale so the list can shrink.
+#
+# The list is intentionally short: a real violation is fixed, not allowlisted.
+# A `get_*`/`set_*` pure field-mover, a whole-crate glob re-export, or a
+# decision number in a comment is always a violation and does not belong here.
+
+# --- read-only boolean queries over a private field.  The §5 remedy for a
+#     pure field-mover is to make the field public; these fields cannot be
+#     public because a setter would break a state invariant (bound/paused/
+#     done/completed/playing) or the field mirrors an owned config value.
+#     The method is the read-only API, so it is not a bean accessor. -------
+crates/app/src/lib.rs:547:pub fn is_headless(&self) -> bool — read-only query; `headless` mirrors `HostConfig::headless`, which is the public knob
+crates/compat/src/host.rs:99:pub fn is_bound(&self) -> bool — read-only query; `bound` is private because it gates the unsafe engine/services dereferences
+crates/engine/src/sound.rs:1170:pub fn is_paused(&self) -> bool — read-only query; `paused` is private and mutated together with `playing`/`done`
+crates/engine/src/sound.rs:1175:pub fn is_done(&self) -> bool — read-only query; `done` is private and mutated together with `playing`/`paused`
+crates/engine/src/trans/mod.rs:498:pub fn is_complete(&self) -> bool — read-only query; `completed` is private playback state
+crates/engine/src/video.rs:364:pub fn is_playing(&self) -> bool — read-only query; `playing` is private and mutated together with the frame clock

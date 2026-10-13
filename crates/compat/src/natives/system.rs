@@ -1450,7 +1450,7 @@ const FALLBACK_EXE_NAME: &str = "krkr-rs/";
 /// launcher's `--base-dir` / first archive's parent / default working
 /// directory). When no storage is attached the app path is unknown, so the
 /// getter reports the working directory with a trailing separator instead of
-/// raising: a Windows application always has an executable path (D18).
+/// raising: a Windows application always has an executable path.
 extern "C" fn prop_exe_name(
     engine: *mut c_void,
     out: *mut Value,

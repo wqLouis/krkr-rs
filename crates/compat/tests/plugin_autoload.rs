@@ -162,6 +162,13 @@ fn autoload_installs_null_for_unported_and_warns_once() {
 // The native `Plugins.link` path is unchanged: it still resolves a built-in by
 // its DLL name and still takes the null path for an unknown name. `autoload`
 // reuses the same registry activation, so the native surface gains no member.
+//
+// Reference: `Plugins.link` calls `TVPLoadPlugin(name)`
+// (`reference/cpp/core/plugin/PluginImpl.cpp:294-307`), which loads a built-in
+// and registers its classes. An unported name has no reference success path —
+// `TVPLoadPlugin` logs a failure and creates no global (`:48-56`) — so
+// `global.nope` here is the port's null plugin choice, not a reference
+// behaviour.
 #[test]
 fn plugins_link_path_is_unchanged() {
     let _lock = vm_lock();

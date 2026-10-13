@@ -97,14 +97,14 @@ impl Env {
             (None, None)
         };
         host.install(&engine).expect("install compat surface");
-        // The composition root finishes the startup lifecycle here with
-        // `begin_native_timing` before any startup script runs
-        // (`crates/app/src/game.rs`): attach the scene/storage, install the
-        // surface, then complete the deferred, service-dependent half of
-        // plugin registration (the `xp3filter.tjs` read). Stopping one call
-        // short left that work inactive across the suite, which is how a
-        // plugin-ordering bug once stayed green, so the harness now keeps the
-        // same order as the app.
+        // The composition root finishes the startup lifecycle here before any
+        // startup script runs (`crates/app/src/game.rs`): attach the
+        // scene/storage, install the surface, complete the deferred,
+        // service-dependent half of plugin registration (the `xp3filter.tjs`
+        // read), then open the timing window. The harness keeps the same order
+        // as the app.
+        host.activate_deferred_plugins()
+            .expect("deferred plugin activation");
         host.begin_native_timing();
         Env {
             _host: host,

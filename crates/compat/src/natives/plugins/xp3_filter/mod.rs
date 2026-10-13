@@ -33,8 +33,9 @@
 //! [`CompatHost`](crate::CompatHost) as a registration error); when the
 //! composition root attaches the storage after registration, the read and the
 //! seam install are completed at
-//! [`CompatHost::begin_native_timing`](crate::CompatHost), which runs before
-//! the startup sequence. That completion reports the not-yet-attached storage
+//! [`CompatHost::activate_deferred_plugins`](crate::CompatHost::activate_deferred_plugins),
+//! which the composition root calls before the startup sequence. That
+//! completion reports the not-yet-attached storage
 //! as its own state (`ScriptLookup::StorageNotAttached` /
 //! `SeamInstall::StorageNotAttached`), never as an absent script. The script
 //! executes on the first archive read, once
@@ -244,13 +245,13 @@ enum SeamInstall {
 /// post-registration callback before the game runs
 /// (`reference/cpp/plugins/xp3filter.cpp:550-564`); a composition root that
 /// attaches the storage after [`register`] completes it at
-/// [`CompatHost::begin_native_timing`](crate::CompatHost).
+/// [`CompatHost::activate_deferred_plugins`](crate::CompatHost::activate_deferred_plugins).
 pub fn activate(engine: &Tjs2Engine, services: &CompatServices) -> Result<(), CompatError> {
     if !services.state::<Xp3FilterState>().script_read {
         match read_filter_script(services) {
             Ok(ScriptLookup::StorageNotAttached) => {
                 log::debug!(
-                    "xp3_filter: deferred: L2 storage not attached yet; {FILTER_SCRIPT} not looked for"
+                    "xp3_filter: deferred: storage not attached yet; {FILTER_SCRIPT} not looked for"
                 );
                 return Ok(());
             }
@@ -276,7 +277,7 @@ pub fn activate(engine: &Tjs2Engine, services: &CompatServices) -> Result<(), Co
         SeamInstall::Installed => {}
         SeamInstall::StorageNotAttached => {
             log::debug!(
-                "xp3_filter: deferred: L2 storage not attached; extraction-filter seam not installed"
+                "xp3_filter: deferred: storage not attached; extraction-filter seam not installed"
             );
         }
     }

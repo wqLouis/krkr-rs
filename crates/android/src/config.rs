@@ -12,7 +12,7 @@
 //! Each option is optional: an unset field means the launcher had no override
 //! and the built-in default applies. A present but unparseable or out-of-range
 //! value is a typed [`ConfigError`] naming the option and the accepted values;
-//! it is never silently replaced by the default (D11).
+//! it is never silently replaced by the default.
 //!
 //! The Android launcher owns its own default resolution. The frame-rate default
 //! is the shared built-in (60 fps) and the preload default is the shared

@@ -413,6 +413,10 @@ impl GameHost {
 
         let plan = storage.startup_plan()?;
         let startup_started = Instant::now();
+        // Complete the deferred, service-dependent half of plugin
+        // registration before the startup scripts run; a read failure stops
+        // the open instead of running unfiltered.
+        vm.compat().activate_deferred_plugins()?;
         vm.compat().begin_native_timing();
         let startup_result = run_startup(&vm, &storage, &plan, &stats);
         vm.compat().end_native_timing();
@@ -605,7 +609,7 @@ fn discover_tpm_plugins(fs: &FileSystem, base_dir: &Path) -> Result<Vec<String>,
             Err(error) => return Err(GameError::Storage(StorageReadError::Fs(error))),
         };
         for entry in entries {
-            if !entry.is_dir && entry.name.to_ascii_lowercase().ends_with(".tpm") {
+            if !entry.is_dir && has_tpm_extension(&entry.name) {
                 found.push(entry.name);
             }
         }
@@ -613,6 +617,14 @@ fn discover_tpm_plugins(fs: &FileSystem, base_dir: &Path) -> Result<Vec<String>,
     // ASCII filename order, the reference's sort key (`PluginImpl.cpp:168`).
     found.sort();
     Ok(found)
+}
+
+/// Whether `name` ends in `.tpm`, case-insensitively.
+///
+/// The reference matches the suffix without regard to case
+/// (`reference/cpp/core/plugin/PluginImpl.cpp:76-88`).
+fn has_tpm_extension(name: &str) -> bool {
+    name.len() >= 4 && name.as_bytes()[name.len() - 4..].eq_ignore_ascii_case(b".tpm")
 }
 
 /// Runs one startup script through `exec_storage` and records its cost.
@@ -878,8 +890,8 @@ mod tests {
     /// Production attaches the storage before the compat surface is installed
     /// (`VmHost::with_default_services`), so the `xp3filter` plugin installs
     /// its L2 seam during registration — before the deferred hook in
-    /// `begin_native_timing` ever runs. Without the ordering fix the seam is
-    /// still `None` here.
+    /// `activate_deferred_plugins` ever runs. Without the ordering fix the
+    /// seam is still `None` here.
     #[test]
     #[allow(unsafe_code)] // the service attach takes the storage pointer
     fn vm_attaches_services_before_install_so_xp3_filter_registers() {

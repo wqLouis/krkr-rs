@@ -17,9 +17,11 @@ L2 extraction-filter seam install. The plugin was inert for every game, not
 only the four.
 
 The fix is now landed: production attaches scene/storage before
-`CompatHost::install` (`VmHost::with_default_services`), the two silent states
-are distinct typed outcomes, and the deferred hook in `begin_native_timing` is
-kept as an idempotent safety net for late-attaching embedders (§2.3–2.4).
+`CompatHost::install` (`VmHost::with_default_services`), so `xp3filter.tjs` is
+read during registration; the two silent states are distinct typed outcomes;
+and the deferred hook is an explicit, fallible
+`CompatHost::activate_deferred_plugins` the composition root calls as a safety
+net for an embedder that attaches late (§2.3–2.4).
 `.tpm` auto-load, the other reference behavior that makes internal-vs-external
 plugin loading well-defined, is also landed (§6).
 
@@ -188,10 +190,12 @@ the product while the compat tests passed.
   `SeamInstall::Installed` / `StorageNotAttached`. The caller must handle all
   variants, so the two conditions can no longer collapse into one `Ok(None)`.
 * `natives::plugins::activate_deferred` dispatches deferred activation.
-* `CompatHost::begin_native_timing` runs the deferred activation before opening
-  the timing window; `GameHost::open_with_preload` calls it before `run_startup`,
+* `CompatHost::activate_deferred_plugins` is the named, fallible step the
+  composition root calls; `begin_native_timing` only opens the timing window.
+  `GameHost::open_with_preload` calls the activation before `run_startup`,
   which is after `storage.startup_plan()` (existence probes only, no content
-  decode) and before the first `exec_storage`.
+  decode) and before the first `exec_storage`. A read failure is returned to
+  the caller, which stops the open instead of running unfiltered.
 * The activation is idempotent; neither path can double install the seam
   (`seam_installed`) or re-read the script (`script_read`).
 
@@ -239,11 +243,13 @@ so nothing that does not opt in can see a service before install. Production now
 reaches `xp3_filter::register` with the storage attached, so the registration
 time read and the seam install happen there.
 
-The deferred `activate` in `begin_native_timing` is kept as an idempotent safety
-net for embedders that attach late; in production it is a **no-op** (it finds
-`script_read` and `seam_installed` already set), and the only way it is
-observable is the `debug` "deferred: L2 storage not attached yet" line, which
-must not appear on the production path.
+The deferred `activate` behind `CompatHost::activate_deferred_plugins` is kept
+as an idempotent safety net for embedders that attach late; in production it is
+a **no-op** (it finds `script_read` and `seam_installed` already set), and the
+only way it is observable is the `debug` "deferred: storage not attached yet"
+line, which must not appear on the production path. The step is fallible: a
+read failure is a `CompatError::Register` the composition root propagates, so
+a late-attach failure is never silently dropped.
 
 The production/test divergence that hid this bug is therefore closed: both the
 compat tests and production attach services before `CompatHost::install`.
@@ -333,28 +339,49 @@ xp3_filter: xp3filter.tjs loaded (N bytes); archive content is filtered
 xp3_filter: xp3filter.tjs not found; archive content is not filtered
 ```
 
-Exactly one of those two appears when the storage is attached before
-`begin_native_timing` (the fixed composition). At `debug`:
+`FileSink` writes each record as `<rfc3339> <LEVEL> <message>`; the message
+text is shown below.
+
+Exactly one of those two appears when the storage is attached before install
+(the production composition): `xp3filter.tjs` is read during registration. At
+`debug`:
 
 ```
 xp3_filter: XP3 extraction-filter seam installed
-xp3_filter: deferred: L2 storage not attached yet; xp3filter.tjs not looked for
-xp3_filter: deferred: L2 storage not attached; extraction-filter seam not installed
+xp3_filter: deferred: storage not attached yet; xp3filter.tjs not looked for
+xp3_filter: deferred: storage not attached; extraction-filter seam not installed
+script read '<name>' bytes=<len> head32=[<first 32 bytes, lowercase hex, space-separated>] encoding=<decision> nul_bytes=<count> decoded_has_nul=<true|false>
 ```
 
 The `debug` "deferred: … not looked for" line is deliberately worded so it
 cannot be grepped and mistaken for the `info` "not found" line; it means the
 storage was not attached yet, not that the script is absent. On the intended
-composition (storage attached before install) it must not appear. If neither
-`info` line
-appears at all, the deferred activation did not run (check that
-`CompatHost::begin_native_timing` is reached) or the log level filters `info`.
-An execution failure of the filter script still emits
+composition (storage attached before install) it must not appear: production
+reads the script during registration, and the deferred step
+(`CompatHost::activate_deferred_plugins`) is a no-op when it finds
+`script_read`/`seam_installed` already set.
+
+The `script read '<name>' bytes=… head32=[…] encoding=<decision> nul_bytes=…
+decoded_has_nul=…` line is emitted at `debug` for every storage-backed script
+read through the `Scripts` natives (`execStorage`/`evalStorage`/`compileStorage`),
+which includes the startup sequence's `startup.tjs`/`patch` scripts
+(`compat::exec_storage` routes through the same path). `<decision>` is the
+encoding path the decode took, exactly one of `UTF-32LE BOM`, `UTF-32BE BOM`,
+`UTF-8 BOM`, `UTF-16LE BOM`, `UTF-16BE BOM`, `FE FE container mode <n>`,
+`explicit '<name>'`, `detected <charset>`, `detected WINDOWS-1252->latin1`, or
+`decode-error` when the decode failed; `<name>` is the storage name as
+requested. The line is emitted before the script is executed, so a startup
+script's bytes can be identified from the export even when execution fails.
+
+If neither `info` line appears at all, the activation did not run (check that
+`CompatHost::activate_deferred_plugins` is reached) or the log level filters
+`info`. An execution failure of the filter script still emits
 `xp3_filter: {error}` at `warn`. A failed (non-`NotFound`) `xp3filter.tjs`
-read during the deferred activation is reported as
-`deferred plugin activation: xp3_filter: could not read xp3filter.tjs: ...`
-at `warn` (at registration it is a `CompatError::Register` instead, matching
-the reference's rethrow at `xp3filter.cpp:556-558`).
+read is a `CompatError::Register` from both paths: `CompatHost::install`
+returns it at registration, and `CompatHost::activate_deferred_plugins`
+returns it on the deferred path, so the composition root stops the open with a
+typed error instead of logging it (matching the reference's rethrow at
+`xp3filter.cpp:556-558`).
 
 Interpretation:
 

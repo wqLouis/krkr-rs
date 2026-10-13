@@ -4,10 +4,11 @@
 //!
 //! The compat binding is process-global and single (AGENTS §9.7), and the
 //! shared harness in `common::Env` now installs it (and calls
-//! `begin_native_timing`, which activates the deferred plugin work). This test
-//! must be the **first** thing in its process to call `CompatHost::install`,
-//! because it needs to observe the state where the binding is installed and the
-//! storage is attached *afterwards* — the late-attach case the deferred hook
+//! `activate_deferred_plugins`, which completes the deferred plugin work).
+//! This test must be the **first** thing in its process to call
+//! `CompatHost::install`, because it needs to observe the state where the
+//! binding is installed and the storage is attached *afterwards* — the
+//! late-attach case the deferred hook
 //! exists for. If it shared a binary with the `common::Env` tests, the
 //! harness's `install` would already have happened, this test's own `install`
 //! would be a no-op on the occupied binding, its `attach_storage` would never
@@ -23,66 +24,8 @@ use common::vm_lock;
 use compat::CompatHost;
 use engine::Storage;
 use fs::FileSystem;
-use fs::xp3::{SEGM_ENCODE_RAW, XP3_MAGIC};
+use testkit::build_xp3;
 use tjs::Tjs2Engine;
-
-/// Build a raw-index XP3 archive with one raw segment per `(name, stored)`
-/// entry. The stored bytes are written verbatim, so callers pass ciphertext.
-fn build_xp3(entries: &[(&str, &[u8])]) -> Vec<u8> {
-    let mut file = Vec::new();
-    file.extend_from_slice(&XP3_MAGIC);
-    file.extend_from_slice(&0u64.to_le_bytes());
-
-    let mut file_chunks: Vec<Vec<u8>> = Vec::new();
-    for (name, stored) in entries {
-        let start = file.len() as u64;
-        file.extend_from_slice(stored);
-
-        let units: Vec<u16> = name.encode_utf16().collect();
-        let mut info = Vec::new();
-        info.extend_from_slice(b"info");
-        info.extend_from_slice(&((22 + units.len() * 2) as u64).to_le_bytes());
-        info.extend_from_slice(&0u32.to_le_bytes());
-        info.extend_from_slice(&(stored.len() as i64).to_le_bytes());
-        info.extend_from_slice(&(stored.len() as i64).to_le_bytes());
-        info.extend_from_slice(&(units.len() as i16).to_le_bytes());
-        for unit in &units {
-            info.extend_from_slice(&unit.to_le_bytes());
-        }
-
-        let mut segm = Vec::new();
-        segm.extend_from_slice(b"segm");
-        segm.extend_from_slice(&28u64.to_le_bytes());
-        segm.extend_from_slice(&SEGM_ENCODE_RAW.to_le_bytes());
-        segm.extend_from_slice(&(start as i64).to_le_bytes());
-        segm.extend_from_slice(&(stored.len() as i64).to_le_bytes());
-        segm.extend_from_slice(&(stored.len() as i64).to_le_bytes());
-
-        let mut adlr = Vec::new();
-        adlr.extend_from_slice(b"adlr");
-        adlr.extend_from_slice(&4u64.to_le_bytes());
-        adlr.extend_from_slice(&0x1234_5678u32.to_le_bytes());
-
-        let mut chunk = Vec::new();
-        chunk.extend_from_slice(b"File");
-        chunk.extend_from_slice(&((info.len() + segm.len() + adlr.len()) as u64).to_le_bytes());
-        chunk.extend_from_slice(&info);
-        chunk.extend_from_slice(&segm);
-        chunk.extend_from_slice(&adlr);
-        file_chunks.push(chunk);
-    }
-
-    let mut index_data = Vec::new();
-    for chunk in &file_chunks {
-        index_data.extend_from_slice(chunk);
-    }
-    let index_ofs = file.len() as u64;
-    file.push(0u8);
-    file.extend_from_slice(&(index_data.len() as u64).to_le_bytes());
-    file.extend_from_slice(&index_data);
-    file[11..19].copy_from_slice(&index_ofs.to_le_bytes());
-    file
-}
 
 /// A unique temporary game directory, removed on drop.
 struct GameDir(PathBuf);
@@ -119,11 +62,14 @@ fn xor(data: &[u8], key: u8) -> Vec<u8> {
 }
 
 // The composition root may attach the L2 storage after `CompatHost::install`,
-// so `xp3filter.tjs` is not readable at registration. The deferred activation
-// at `begin_native_timing` must still read the script and install the seam
+// so `xp3filter.tjs` is not readable at registration. The reference reads the
+// script in its post-registration callback before the game runs
+// (`reference/cpp/plugins/xp3filter.cpp:550-564`); the port completes that
+// read at `activate_deferred_plugins`, which must still install the seam
 // before the first archive read, or a filtered archive's content stays
-// encrypted. (Production now attaches before install; this is the safety-net
-// path for an embedder that attaches late, and it must keep working.)
+// encrypted. (Production attaches before install, so registration already
+// completes it; this is the safety-net path for an embedder that attaches
+// late, and it must keep working.)
 #[test]
 fn storage_attached_after_install_is_completed_before_startup() {
     let _lock = vm_lock();
@@ -141,7 +87,7 @@ fn storage_attached_after_install_is_completed_before_startup() {
     std::fs::write(dir.path().join("xp3filter.tjs"), script).expect("write filter script");
     std::fs::write(
         dir.path().join("data.xp3"),
-        build_xp3(&[("secret.txt", &cipher)]),
+        build_xp3(&[("secret.txt", &cipher, false)]),
     )
     .expect("write archive");
 
@@ -164,9 +110,10 @@ fn storage_attached_after_install_is_completed_before_startup() {
         host.services_mut()
             .attach_storage(storage.as_mut() as *mut Storage);
     }
-    // The last compat call before the startup scripts; it completes the
-    // deferred `xp3filter.tjs` read and seam install.
-    host.begin_native_timing();
+    // The named lifecycle step completes the deferred `xp3filter.tjs` read and
+    // seam install; a read failure would surface here.
+    host.activate_deferred_plugins()
+        .expect("deferred plugin activation");
 
     let dest = dir.path().join("out.bin");
     engine
@@ -178,7 +125,6 @@ fn storage_attached_after_install_is_completed_before_startup() {
     let exported = std::fs::read(&dest).expect("read exported file");
     assert_eq!(exported, plain);
 
-    host.end_native_timing();
     drop(host);
     drop(engine);
     drop(storage);

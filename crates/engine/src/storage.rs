@@ -1649,8 +1649,7 @@ impl Storage {
 
 /// Recursively discovers every `*.xp3` under `base_dir`, in mount order.
 ///
-/// This is a documented extension to the reference (D15 / doc 09): the
-/// reference never scans a folder, but a game directory is the ergonomic
+/// The reference never scans a folder, but a game directory is the ergonomic
 /// input for both the desktop CLI and the Android launcher. The order is
 /// deterministic — file name in natural order (embedded decimal runs are
 /// compared by value, so `patch@r1071` overrides `patch@r996` and

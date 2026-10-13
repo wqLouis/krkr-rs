@@ -312,20 +312,22 @@ impl PluginRegistry {
     ///
     /// Linking goes through the same path as `Plugins.link`: a ported name
     /// activates its built-in emulation, an unported name gets the null-plugin
-    /// object and one warning (the documented D14 divergence from the
-    /// reference, which tries to load the DLL and creates no global when it
-    /// fails).
-    pub fn autoload(&self, names: &[String], ctx: &mut CompatCtx) -> Result<(), CompatError> {
+    /// object and one warning (the reference tries to load the DLL and creates
+    /// no global when it fails).
+    pub fn autoload<I, S>(&self, names: I, ctx: &mut CompatCtx) -> Result<(), CompatError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
         // One null-plugin warning per distinct unported name, even when the
         // same file is found in more than one scanned directory.
         let mut warned: BTreeSet<String> = BTreeSet::new();
         for name in names {
+            let name = name.as_ref();
             log::info!("(info) Loading {name}");
             let dll = tpm_to_dll_name(name);
             if self.activate(&dll, ctx)? == PluginOutcome::Null && warned.insert(dll) {
-                log::warn!(
-                    "Plugins auto-load {name:?}: no built-in emulation; null plugin path (D14)"
-                );
+                log::warn!("Plugins auto-load {name:?}: no built-in emulation; null plugin path");
             }
         }
         Ok(())

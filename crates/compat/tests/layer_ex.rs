@@ -524,7 +524,12 @@ fn layer_shape_draws_use_the_native_instance_not_a_hidden_property() {
 /// (system/MessageFrame.tjs:1920-1931): `class ResizeButton extends Layer`
 /// with a legacy-style bare `Layer(win, par)` base-constructor call, an
 /// `Appearance` built from the layer's own `width`/`height`, and a bare
-/// `drawPolygon(app, points)`. The reference accepts it; the port must too.
+/// `drawPolygon(app, points)`. The reference accepts it: `drawPolygon` is
+/// registered on the `LayerExDraw` attach
+/// (`reference/cpp/plugins/layerex_draw/windows/main.cpp:902`) and its
+/// implementation reads the `Appearance`
+/// (`reference/cpp/plugins/layerex_draw/windows/LayerExDraw.cpp:1392`); the
+/// port must too.
 #[test]
 fn layer_draw_polygon_accepts_the_game_resize_button_shape() {
     let _lock = vm_lock();
@@ -550,9 +555,11 @@ fn layer_draw_polygon_accepts_the_game_resize_button_shape() {
     assert_eq!(env.pixel(resize, 0, 0), [255, 255, 255, 0]);
 }
 
-/// A genuinely wrong argument still raises a typed error (the reference
-/// rejects an argument that is not the expected native instance; it never
-/// panics and never accepts an arbitrary value).
+/// A genuinely wrong argument still raises a typed error. The reference
+/// converts the argument through the `GetNativeInstance` adaptor
+/// (`reference/cpp/plugins/layerex_draw/windows/main.cpp:105-113`, registered
+/// at `:902`), which rejects an object of the wrong class; it never panics and
+/// never accepts an arbitrary value.
 #[test]
 fn layer_draw_rejects_non_appearance_arguments() {
     let _lock = vm_lock();

@@ -28,6 +28,8 @@ re-opened. History is read with `git log`.
 cargo fmt --all -- --check
 bash scripts/check-stateless.sh                                   # D9 guard
 bash scripts/check-error-handling.sh                              # AGENTS §4 guard
+bash scripts/check-house-style.sh                                 # AGENTS §5/§6 guard
+bash scripts/check-layering.sh                                    # AGENTS §2/§5 guard
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --no-fail-fast                             # all crates; never fail-fast
 cargo test -p platform --features platform-linux
@@ -508,3 +510,19 @@ Recorded so it is not re-opened without new evidence.
   The renderer also has no compute pipeline at all. The lever is scheduling -
   the cache hit above and decoding independent images on a worker pool - not a
   compute shader.
+
+### Guard-recorded debt
+
+`scripts/check-layering.sh` baselines two real violations so it can forbid new
+ones. Both are tracked work, not accepted practice, and the allowlist entries
+carry a `debt:` marker so clearing one is visible:
+
+* **25 `std::fs` uses in compat source, across 6 files** (`l3-platform`).
+  AGENTS §2 keeps platform code in L1; these should route through the L1 `fs`
+abstraction. The guard excludes `crates/compat/tests/**`, where `std::fs` is
+legitimate for fixtures.
+* **194 `unsafe` blocks with no `// SAFETY:` note, across 24 files**
+  (`unsafe-no-safety-note`). AGENTS §5 requires a note per block; the sites are
+already inventoried in `docs/audits/unsafe-inventory.md` §2.6. Each note needs
+a real safety argument, so this is review work, not a bulk edit. Baselined
+per file, so a new file or a new rule fails the gate.

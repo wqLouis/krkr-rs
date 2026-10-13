@@ -24,10 +24,9 @@
 //!   any text (`LauncherLog.tail`).
 //! * The file is capped at [`LOG_MAX_BYTES`] and rotated through
 //!   `krkr.log.1` … `krkr.log.{LOG_ROTATED_FILES}`; each rotation shifts the
-//!   existing files up one slot and drops the oldest. A long session can
-//!   therefore not fill the device's storage, and a failure cascade cannot
-//!   push the start of the same session out of the history as easily as the
-//!   single rotation did.
+//!   existing files up one slot and drops the oldest. A long session or a
+//!   failure cascade therefore cannot fill the device's storage and cannot
+//!   push the start of the session out of the retained history.
 //!
 //! The line format is `"<rfc3339> <LEVEL> <message>"` ([`format_record`]).
 //!
@@ -53,15 +52,8 @@ pub(crate) const LOG_MAX_BYTES: u64 = 1024 * 1024;
 ///
 /// A rotation moves `krkr.log` to `krkr.log.1`, shifts every existing
 /// rotation up one slot and drops the file in the last slot, so the sink
-/// holds `krkr.log` plus this many rotations.
-///
-/// Six is chosen against the 1 MiB cap and the spam a broken title produces.
-/// A session whose failure repeats a VM exception dump (the observed cascade
-/// was 87% repeated dumps) writes several times the cap, so the old
-/// single-rotation policy could lose the start of the very session that
-/// failed — including the original exception. Six rotations hold roughly the
-/// last 7 MiB of output, a few launches' startup plus the failure cascade,
-/// while keeping the sink's disk use bounded (see [`FileSink`]).
+/// holds `krkr.log` plus this many rotations. Its disk use is bounded by
+/// `(1 + LOG_ROTATED_FILES) * LOG_MAX_BYTES`.
 pub(crate) const LOG_ROTATED_FILES: usize = 6;
 
 /// A size-capped, append-only log file with multi-step rotation.

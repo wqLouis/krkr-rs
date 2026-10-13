@@ -75,24 +75,57 @@ pub(crate) struct DecodedText {
     pub encoding: String,
 }
 
+/// The decoding decision that produced the text.
+///
+/// Carried as a `Copy` value so the common decode path never formats the
+/// diagnostic label; only [`decode_text_reported`] turns it into a string.
+#[derive(Clone, Copy)]
+enum DecodePath<'a> {
+    /// The `FE FE` container's mode byte.
+    Container(u8),
+    /// A byte-order mark, named by the label.
+    Bom(&'static str),
+    /// An explicit `Scripts.textEncoding` name.
+    Explicit(&'a str),
+    /// The charset detector's decision; `None` is the reference's
+    /// `WINDOWS-1252` -> latin1 special case.
+    Detected(Option<&'static str>),
+}
+
+impl DecodePath<'_> {
+    /// The label [`decode_text_reported`] reports for this decision.
+    fn label(self) -> String {
+        match self {
+            DecodePath::Container(mode) => format!("FE FE container mode {mode}"),
+            DecodePath::Bom(label) => label.to_string(),
+            DecodePath::Explicit(name) => format!("explicit '{name}'"),
+            DecodePath::Detected(Some(name)) => format!("detected {name}"),
+            DecodePath::Detected(None) => "detected WINDOWS-1252->latin1".to_string(),
+        }
+    }
+}
+
 /// Decode like [`decode_text`], additionally returning the encoding decision.
 pub(crate) fn decode_text_reported(
     bytes: &[u8],
     encoding: TextEncoding<'_>,
 ) -> Result<DecodedText, String> {
-    let (text, encoding) = decode_text_inner(bytes, encoding);
-    text.map(|text| DecodedText { text, encoding })
+    let (text, path) = decode_text_inner(bytes, encoding);
+    text.map(|text| DecodedText {
+        text,
+        encoding: path.label(),
+    })
 }
 
-/// The shared decode dispatch; the label is the encoding decision, present
-/// even when the decode fails so a caller can report what was attempted.
-fn decode_text_inner(bytes: &[u8], encoding: TextEncoding<'_>) -> (Result<String, String>, String) {
+/// The shared decode dispatch; the decision is present even when the decode
+/// fails so a caller can report what was attempted.
+fn decode_text_inner<'a>(
+    bytes: &[u8],
+    encoding: TextEncoding<'a>,
+) -> (Result<String, String>, DecodePath<'a>) {
     // 1. `FE FE` container (never a valid UTF BOM, so it wins unambiguously).
     if bytes.len() >= 3 && bytes[0] == 0xFE && bytes[1] == 0xFE {
-        return (
-            decode_container(bytes),
-            format!("FE FE container mode {}", bytes[2]),
-        );
+        return (decode_container(bytes), DecodePath::Container(bytes[2]));
     }
     // 2. Byte-order marks. UTF-32 is tested before UTF-16 because a UTF-32LE
     //    BOM begins with the UTF-16LE BOM `FF FE`, so the longer match must
@@ -100,38 +133,38 @@ fn decode_text_inner(bytes: &[u8], encoding: TextEncoding<'_>) -> (Result<String
     if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE, 0x00, 0x00]) {
         return (
             Ok(decode_utf32(rest, "UTF-32LE", u32::from_le_bytes)),
-            "UTF-32LE BOM".to_string(),
+            DecodePath::Bom("UTF-32LE BOM"),
         );
     }
     if let Some(rest) = bytes.strip_prefix(&[0x00, 0x00, 0xFE, 0xFF]) {
         return (
             Ok(decode_utf32(rest, "UTF-32BE", u32::from_be_bytes)),
-            "UTF-32BE BOM".to_string(),
+            DecodePath::Bom("UTF-32BE BOM"),
         );
     }
     if let Some(rest) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
         return (
             decode_from_encoding(rest, encoding_rs::UTF_8),
-            "UTF-8 BOM".to_string(),
+            DecodePath::Bom("UTF-8 BOM"),
         );
     }
     if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
         return (
             decode_from_encoding(rest, encoding_rs::UTF_16LE),
-            "UTF-16LE BOM".to_string(),
+            DecodePath::Bom("UTF-16LE BOM"),
         );
     }
     if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
         return (
             decode_from_encoding(rest, encoding_rs::UTF_16BE),
-            "UTF-16BE BOM".to_string(),
+            DecodePath::Bom("UTF-16BE BOM"),
         );
     }
     // 3. An explicit named encoding forces the decoder.
     if let TextEncoding::Named(name) = encoding
         && !name.is_empty()
     {
-        return (decode_named(bytes, name), format!("explicit '{name}'"));
+        return (decode_named(bytes, name), DecodePath::Explicit(name));
     }
     // 4. Detect the charset and decode from it.
     detect_and_decode(bytes)
@@ -147,7 +180,7 @@ fn decode_text_inner(bytes: &[u8], encoding: TextEncoding<'_>) -> (Result<String
 /// per-charset tables. Neither crate allocates per input byte: `chardetng`
 /// scores fixed-size buffers and `encoding_rs` decodes the whole slice in one
 /// pass, allocating only the output string.
-fn detect_and_decode(bytes: &[u8]) -> (Result<String, String>, String) {
+fn detect_and_decode(bytes: &[u8]) -> (Result<String, String>, DecodePath<'static>) {
     // `Allow` keeps ISO-2022-JP in the candidate set, matching the charsets the
     // reference's uchardet can report.
     let mut detector = EncodingDetector::new(Iso2022JpDetection::Allow);
@@ -158,7 +191,7 @@ fn detect_and_decode(bytes: &[u8]) -> (Result<String, String>, String) {
     if detected.name() == encoding_rs::WINDOWS_1252.name() {
         return (
             Ok(encoding_rs::mem::decode_latin1(bytes).into_owned()),
-            "detected WINDOWS-1252->latin1".to_string(),
+            DecodePath::Detected(None),
         );
     }
     // The reference maps `SHIFT_JIS` to `cp932`; `encoding_rs`'s WHATWG
@@ -166,7 +199,7 @@ fn detect_and_decode(bytes: &[u8]) -> (Result<String, String>, String) {
     // used as-is.
     (
         decode_from_encoding(bytes, detected),
-        format!("detected {}", detected.name()),
+        DecodePath::Detected(Some(detected.name())),
     )
 }
 
