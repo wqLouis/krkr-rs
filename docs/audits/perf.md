@@ -83,6 +83,45 @@ it is reference-faithful. It is **needs-review** only because it changes
 present timing (out of scope for this task) and must be paired with a
 "force redraw" path (first frame, resize, resume, `Invalidate`).
 
+**Lazy rendering — skip the whole frame, not just the present.** The
+`render()` call is unconditional (`crates/app/src/lib.rs:404`); the scene
+revision only gates the projection (`:434-441`). The Android loop already
+carries a `frame_requested` flag, but `ticker.poll(now)` sets it on **every**
+tick (`crates/android/src/host.rs:381`), so the step runs at `frame_period`
+whether or not anything changed. Gating only the present still leaves the
+scene traversal, the command-buffer recording and the submit running for a
+screen that has not changed, so the CPU and GPU cost — and the power — is paid
+even when the image is identical.
+
+The reference separates the two beats: the VM/timer beat runs continuously
+(`tTVPApplication`'s ~16 ms tick), while the *draw* is posted only by a layer
+change through `RequestUpdate`
+(`reference/cpp/core/visual/impl/DrawDevice.cpp:185-189`) →
+`UpdateContent` → `DrawDevice->Update()` / `Show()`
+(`reference/cpp/core/visual/WindowIntf.cpp:626-637`). A static screen runs no
+draw at all. "Lazy rendering" is that split, and it is the mechanism the
+reference uses to stay cool on a phone.
+
+Design: the loop always advances the VM, timers, mixer and video from its
+ticker, but skips `sync_dirty_bitmaps` + `reproject_render_scene` + `render()`
+when nothing asks for a redraw. A redraw is requested by a `Scene::revision`
+change (already computed, `crates/app/src/lib.rs:440`), an input or focus
+event, a video/overlay advance, a resize/scale/inset change, resume, the first
+frame, and the script-visible `Invalidate`. Because the platform holds the
+last presented image, a skipped frame is the previous image, not a blank one —
+exactly what the reference shows. The port already has both halves of the
+signal (`frame_requested`, `Scene::revision`, and the `dirty` flags on
+`BitmapState`); the missing piece is a single host-level `needs_render` value
+that those set and `step` clears.
+
+**How to check the efficiency.** Add a rendered/skipped counter to the slow
+line (or a one-line summary every N frames) and compare the port's
+`submit`/`present` totals for a static KAG screen against the reference. A
+title/advance-prompt screen is the canonical case: the reference presents on
+the order of once per scripted change, the port presents once per tick. The
+same counter is the acceptance test for the change — a static screen should
+show skipped frames climbing while rendered frames stay flat.
+
 **Swapchain present mode / vsync / image count.**
 
 * Present mode is chosen as `MAILBOX` whenever available, else `FIFO`
@@ -275,8 +314,9 @@ host step the same way.
 
 ## 6. Suggested order of work (proposals only)
 
-1. Add the update/present gate (#1) — the reference mechanism, biggest power
-   win, paired with a forced-redraw path. **needs-review.**
+1. Add the lazy-rendering / update-present gate (#1) — advance the VM every
+   tick but render only on a redraw request, paired with a forced-redraw path.
+   The reference mechanism, biggest power win. **needs-review.**
 2. Batch the streaming-audio window read and cut the per-read notify (#2).
    **safe-to-adopt** with a PCM-equality test.
 3. Carry a dirty region on `BitmapState` and upload only it (#4).
