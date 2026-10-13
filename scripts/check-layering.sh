@@ -17,6 +17,16 @@
 #   l2-vocabulary      `crates/engine/**` must not name TVP/TJS vocabulary in
 #                      code (the same tokens, plus the TVP `0..100000` volume
 #                      scale literal).
+#   l2-storage-name    `crates/engine/**` must not carry the TVP media/domain
+#                      storage-name prefix.  A string literal whose content
+#                      *begins* `file:` (which covers `file://`, `file://.`,
+#                      and the single-slash `file:/…` form) names a TVP
+#                      storage and belongs to L3.  The rule inspects string
+#                      literals because the prefix only ever lives inside one;
+#                      anchoring at the literal start keeps an ordinary
+#                      `file:` inside a log message from matching, and a
+#                      comment is never a literal.  `arc.xp3>path` addressing
+#                      stays L2 and is deliberately not matched.
 #   l3-platform        `crates/compat/src/**` must not contain platform code
 #                      (`#[cfg(target_os`, `winit`, `android-activity`,
 #                      `std::fs`, `jni`, `ndk`).  `crates/compat/tests/**` is
@@ -61,6 +71,9 @@
 #   * bare `tjs` — a local named `tjs` (a test variable, a file list) is
 #                indistinguishable from the language name; only `TJS` and the
 #                `.tjs` extension are unambiguous, and the extension is a string.
+#   * `arc.xp3>path` — the VFS addressing is L2 (`06-file-system.md` §5), not
+#                TVP storage naming; the storage-name rule matches only the
+#                `file:` media prefix.
 # kag/KAG is checked because it has no L1/L2 meaning at all.
 #
 # Allowlist: scripts/layering_allow.txt
@@ -133,6 +146,13 @@ L1_TOKENS = (
 )
 L1_VK_TOKEN = re.compile(r"\bVK_[A-Za-z0-9_]")
 L2_TOKENS = L1_TOKENS + (L1_VK_TOKEN, re.compile(r"\b100000\b"))
+# The TVP media/domain storage-name prefix (`file://.`, `file://`, `file:`, and
+# the single-slash `file:/…`).  The token scan runs over masked code, so a
+# prefix that only ever lives inside a string literal is invisible to it; the
+# l2-storage-name rule matches this against the *content* of a literal span.
+# Anchoring at `^` keeps an ordinary `file:` inside a log sentence from
+# matching, and a comment is never a literal span.
+L2_STORAGE_NAME = re.compile(r"^file:")
 L3_TOKENS = (
     (re.compile(r"#\[cfg\(\s*target_os")),
     (re.compile(r"\bwinit\b")),
@@ -150,6 +170,7 @@ MISSING_DOCS = re.compile(r"#!\[warn\(missing_docs\)\]")
 RULES = {
     "l1-vocabulary",
     "l2-vocabulary",
+    "l2-storage-name",
     "l3-platform",
     "unsafe-no-safety-note",
     "unsafe-allow-outside-ffi",
@@ -157,29 +178,23 @@ RULES = {
 }
 
 
-def mask(src):
-    """Blank comments and string/char literal *contents*, keeping newlines.
+def scan_spans(src):
+    """Yield `(kind, start, end)` for every comment and string/char literal.
 
-    The result has the same length as `src`, so byte offsets and line numbers
-    stay valid.  Braces inside literals can no longer desynchronise the
-    `#[cfg(test)]` brace matcher.
+    `kind` is `"comment"`, `"str"` or `"char"`; the spans are byte offsets
+    into `src` and keep their newlines, so positions stay valid.  `mask`
+    blanks the spans and the storage-name rule needs the string spans
+    themselves, so one tokenizer feeds both.
     """
-    out = list(src)
     n = len(src)
     i = 0
-
-    def blank(a, b):
-        for k in range(a, b):
-            if out[k] != "\n":
-                out[k] = " "
-
     while i < n:
         c = src[i]
         if c == "/" and i + 1 < n and src[i + 1] == "/":
             j = i + 2
             while j < n and src[j] != "\n":
                 j += 1
-            blank(i, j)
+            yield ("comment", i, j)
             i = j
         elif c == "/" and i + 1 < n and src[i + 1] == "*":
             depth = 1
@@ -193,7 +208,7 @@ def mask(src):
                     j += 2
                 else:
                     j += 1
-            blank(i, j)
+            yield ("comment", i, j)
             i = j
         elif c == "r" and i + 1 < n and (src[i + 1] == '"' or src[i + 1] == "#"):
             m = re.match(r'r(#*)"', src[i:])
@@ -202,13 +217,13 @@ def mask(src):
                 start = i + len(m.group(0))
                 end = src.find('"' + hashes, start)
                 if end == -1:
-                    blank(i, n)
+                    yield ("str", i, n)
                     i = n
                 else:
-                    blank(i, end + len(hashes) + 1)
+                    yield ("str", i, end + len(hashes) + 1)
                     i = end + len(hashes) + 1
-                continue
-            i += 1
+            else:
+                i += 1
         elif c == '"':
             j = i + 1
             while j < n:
@@ -219,20 +234,49 @@ def mask(src):
                     break
                 else:
                     j += 1
-            blank(i, j)
+            yield ("str", i, j)
             i = j
         elif c == "'":
             m = re.match(
                 r"'(?:\\(?:x[0-9a-fA-F]{2}|u\{[0-9a-fA-F_]+\}|.)|[^'\\])'", src[i:]
             )
             if m:
-                blank(i, i + len(m.group(0)))
+                yield ("char", i, i + len(m.group(0)))
                 i += len(m.group(0))
             else:
                 i += 1
         else:
             i += 1
+
+
+def mask(src):
+    """Blank comment and string/char literal contents, keeping newlines.
+
+    The result has the same length as `src`, so byte offsets and line numbers
+    stay valid.  Braces inside literals can no longer desynchronise the
+    `#[cfg(test)]` brace matcher.
+    """
+    out = list(src)
+    for _kind, a, b in scan_spans(src):
+        for k in range(a, b):
+            if out[k] != "\n":
+                out[k] = " "
     return "".join(out)
+
+
+def literal_content(span):
+    """The content of a string-literal span, or `None` for another kind.
+
+    `span` is the literal including its `r`/`r#` prefix and its quotes; a byte
+    or C string's leading `b`/`c` sits outside the span.
+    """
+    m = re.match(r'^r(#*)"', span)
+    if m:
+        return span[m.end() :]
+    m = re.match(r'^"', span)
+    if m:
+        return span[m.end() :]
+    return None
 
 
 def test_ranges(masked):
@@ -342,6 +386,7 @@ def scan_text(rel, src):
     findings = []
     log = logical(rel)
     orig = src.splitlines()
+    spans = list(scan_spans(src))
     masked = mask(src)
     ranges = test_ranges(masked)
     lines = masked.splitlines()
@@ -371,6 +416,12 @@ def scan_text(rel, src):
             tokens_scan(tokens, "l1-vocabulary")
         if log.startswith("crates/engine/"):
             tokens_scan(L2_TOKENS, "l2-vocabulary")
+            for kind, a, b in spans:
+                if kind != "str" or in_ranges(a, ranges):
+                    continue
+                body = literal_content(src[a:b])
+                if body is not None and L2_STORAGE_NAME.match(body):
+                    add(line_of(offsets, a), "l2-storage-name")
         if log.startswith("crates/compat/src/"):
             tokens_scan(L3_TOKENS, "l3-platform")
 
@@ -469,6 +520,7 @@ FIXTURES_CRATES = FIXTURES / "crates"
 BAD_FIXTURES = {
     "crates/platform/api/src/bad_l1_vocabulary.rs": "l1-vocabulary",
     "crates/engine/src/bad_l2_vocabulary.rs": "l2-vocabulary",
+    "crates/engine/src/bad_l2_storage_name.rs": "l2-storage-name",
     "crates/compat/src/bad_l3_platform.rs": "l3-platform",
     "crates/compat/src/bad_unsafe_note.rs": "unsafe-no-safety-note",
     "crates/engine/src/bad_unsafe_allow.rs": "unsafe-allow-outside-ffi",
@@ -477,6 +529,7 @@ BAD_FIXTURES = {
 GOOD_FIXTURES = (
     "scripts/layering_fixtures/crates/platform/api/src/good_l1.rs",
     "scripts/layering_fixtures/crates/engine/src/good_l2.rs",
+    "scripts/layering_fixtures/crates/engine/src/good_l2_storage_name.rs",
     "scripts/layering_fixtures/crates/compat/src/good_l3.rs",
     "scripts/layering_fixtures/crates/compat/src/good_unsafe_note.rs",
     "scripts/layering_fixtures/crates/compat/src/good_allow.rs",

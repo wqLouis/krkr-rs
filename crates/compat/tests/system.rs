@@ -7,6 +7,7 @@
 
 mod common;
 
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use api::host::TouchPhase;
@@ -409,18 +410,34 @@ fn storage_backed_paths_are_typed_errors_without_storage() {
 
 /// `System.exeName` is a Win32 fact: the reference always has an executable
 /// path (`reference/cpp/core/base/impl/SystemImpl.cpp:838-847`), so a host
-/// without storage reports the working directory rather than raising (D18).
+/// without storage reports the normalized working directory rather than
+/// raising (D18).
 #[test]
 fn exe_name_without_storage_reports_the_working_directory() {
     let _lock = vm_lock();
     with_vm(|e| {
         let cwd = std::env::current_dir().expect("working directory");
-        let expected = format!("{}/", cwd.display().to_string().trim_end_matches('/'));
+        // reference/cpp/core/base/impl/SystemImpl.cpp:838-847
         assert_eq!(
             e.eval("System.exeName", "t").unwrap(),
-            TjsValue::String(expected)
+            TjsValue::String(normalized_app_dir(&cwd))
         );
     });
+}
+
+/// `TVPNormalizeStorageName` of a native host path: the local `file://.`
+/// media/domain prefix (`TVPPreNormalizeStorageName`,
+/// `reference/cpp/core/base/impl/StorageImpl.cpp:422-467`) plus the lowercased
+/// `/`-separated path, with the trailing delimiter `TVPExtractStoragePath`
+/// keeps (`reference/cpp/core/base/StorageIntf.cpp:837-859`).
+fn normalized_app_dir(path: &Path) -> String {
+    let normalized = format!(
+        "file://.{}",
+        path.to_string_lossy()
+            .replace('\\', "/")
+            .to_ascii_lowercase()
+    );
+    format!("{}/", normalized.trim_end_matches('/'))
 }
 
 #[test]
@@ -428,12 +445,12 @@ fn exe_name_is_the_project_directory_with_a_trailing_separator() {
     let _lock = vm_lock();
     let env = Env::with_storage();
     let dir = env.game_dir().expect("game dir");
-    // TVPNormalizeStorageName(ExePath()), where ExePath() is the project
-    // directory (`reference/cpp/core/base/impl/SystemImpl.cpp:838-847`,
+    // `TVPNormalizeStorageName(ExePath())`, where `ExePath()` is the native
+    // project directory (`reference/cpp/core/base/impl/SystemImpl.cpp:838-847`,
     // `reference/cpp/core/environ/Application.cpp:92`).
     assert_eq!(
         env.eval("System.exeName").unwrap(),
-        TjsValue::String(format!("{}/", dir.display()))
+        TjsValue::String(normalized_app_dir(dir))
     );
 }
 
@@ -442,21 +459,27 @@ fn storage_backed_paths_match_the_reference() {
     let _lock = vm_lock();
     let env = Env::with_storage();
     let dir = env.game_dir().expect("game dir");
-    let app = format!("{}/", dir.display());
+    let app = normalized_app_dir(dir);
 
     // `System.exePath`, `System.personalPath` and `System.savedGamesPath` all
-    // return `TVPGetAppPath()`; only `System.dataPath` is `TVPDataPath`, the
-    // application directory plus `savedata/`.
+    // return `TVPGetAppPath()`, the normalized application path; only
+    // `System.dataPath` is `TVPDataPath`, the application directory plus
+    // `savedata/`.
+    // reference/cpp/core/base/impl/StorageImpl.cpp:504-507 (`TVPGetAppPath`)
     // reference/cpp/core/base/impl/SystemImpl.cpp:341-359 (`TVPGetPersonalPath`)
     // reference/cpp/core/base/impl/SystemImpl.cpp:387-397 (`TVPGetSavedGamesPath`)
     // reference/cpp/core/base/impl/SystemImpl.cpp:798-807 (exePath)
     // reference/cpp/core/base/impl/SystemImpl.cpp:808-816 (personalPath)
     // reference/cpp/core/base/impl/SystemImpl.cpp:828-836 (dataPath)
+    // reference/cpp/core/base/impl/SystemImpl.cpp:838-847 (exeName)
     // reference/cpp/core/base/impl/SystemImpl.cpp:849-857 (savedGamesPath)
-    // reference/cpp/core/base/impl/StorageImpl.cpp:504-507 (`TVPGetAppPath`)
     // reference/cpp/core/environ/impl/ApplicationSpecialPath.h:13-19 (dataPath)
     assert_eq!(
         env.eval("System.exePath").unwrap(),
+        TjsValue::String(app.clone())
+    );
+    assert_eq!(
+        env.eval("System.exeName").unwrap(),
         TjsValue::String(app.clone())
     );
     assert_eq!(

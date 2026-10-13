@@ -774,23 +774,49 @@ yet.
    (present only in the device's XP3 archives) or a TJS-level trace of the
    expression that builds `saveDataLocation`. Do not add a title-specific patch
    (D28).
-2. **Directory case-correction.** The reference `TVPGetLocalName`
-   (`GetLocallyAccessibleName`, `StorageImpl.cpp:339-400`) case-corrects every
-   component, so `isExistentDirectory('<root>/ASSETS/')` is `true` when
-   `<root>/Assets/` exists. The port's `local_path` joins the normalized
-   spelling for directories (the public `find` is file-only), so it reports
-   `false`. The file path is unaffected; a directory reached only through a
-   different case is. Fix needs an engine directory lookup that case-corrects.
-3. **`innerSunken` storage vs constant.** The vendored `iWindowLayer`
-   no-ops the setter and returns `false` (`TVPWindow.h:143-144`); the port
-   stores the value, matching the stateful `tTJSNI_Window` pattern and the
-   `useMouseKey`/`focusable` neighbours. If a later reference shows the shipped
-   form is stateless, reduce it to constant `false` and update the test.
-4. **`typeof <undeclared global>` logs an exception dump.** Three launches show
-   `motion_player.tjs(1)` raising at `typeof Motion`/`Player`/`D3DEmotePlayer`/…
-   The games continue, so the exception is caught, but if the reference's
-   `typeof` on an absent global is silent this is a `tjs` VM defect worth a
-   separate look (`docs/vm-defects.md`).
+2. **Directory case-correction — resolved.** `Storage::local_name` now
+   case-corrects every component (`GetLocallyAccessibleName`,
+   `StorageImpl.cpp:339-407`), so `isExistentDirectory('<root>/ASSETS/')` is
+   `true` when `<root>/Assets/` exists. The directory-listing cache was the
+   blocker and is gone: the case walk and `GetLocallyAccessibleName` read the
+   directory live (`opendir`/`readdir` on every call), so a directory created
+   after mount is seen.
+3. **`innerSunken` storage vs constant — resolved.** The concrete
+   `TVPWindowLayer` does not override `Set/GetInnerSunken`, so the shipped form
+   is constant `false`/no-op (`TVPWindow.h:135-184`); the port now matches and
+   the test pins it.
+4. **`typeof <undeclared global>` — resolved (reference behaviour).** A bare
+   `typeof <name>` is an ordinary must-exist read and raises; only the property
+   form reports `"undefined"` (`docs/vm-defects.md` SEM-2). The device
+   `Motion`/`Player`/... names are published unconditionally by the port, so a
+   build that still logs them predates those registrations.
 5. **Device verification of all of the above (D36)** is still owed: a fresh run
    of the four titles with the log exported, and the §18.3 priority list after
    that.
+
+### 19.4 The second round (this branch)
+
+* **Storage resolution moved to L3.** The `file://`/`file:`/`file://.` media
+  prefix is parsed at the `compat` boundary (`natives/storages.rs`
+  `strip_file_media`) before any engine call; the engine namespace never sees
+  it. `docs/migration/06-file-system.md` contradicted D2/D6/`02 §2.3` by
+  handing TVP storage naming to L2; `docs/audits/storage-layering.md` records
+  the target split (L2 = a TVP-free mount/read VFS, L3 = the name grammar and
+  resolution), with the first slice staged. `scripts/check-layering.sh` gained
+  an `l2-storage-name` rule so a `file:` literal in `crates/engine/**` fails
+  the gate.
+* **Live directory listings.** `Storage` no longer caches directory listings;
+  the case-insensitive walk and `local_name` enumerate on every call, matching
+  the reference's live `opendir`. The auto-path candidate table and the
+  resolved-hit table stay cached.
+* **`Layer` property accessors.** `imageWidth`/`imageHeight` gained the
+  reference setter (`SetImageWidth`/`SetImageHeight`, `LayerIntf.cpp:2565-2621`)
+  and their getters now raise on an imageless layer; `cursorX`/`cursorY` gained
+  setters; `font` lost its setter (the reference denies it,
+  `LayerIntf.cpp:11339-11350`). The `imageWidth` omission was the real-game
+  `system/MessageLayer.tjs:830` startup failure.
+* **The accessor parity gate.** `scripts/native_parity.py` now extracts the
+  reference getter/setter per `TJS_BEGIN_NATIVE_PROP_DECL` and the Rust
+  `NativeInstancePropertyDef { get, set }`, and fails on any mismatch in either
+  direction (`scripts/native_parity_props_allow.txt` ratchet + fixtures). This
+  is the blind spot that let the `imageWidth` bug through.

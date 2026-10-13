@@ -10,7 +10,7 @@
 
 mod common;
 
-use common::{eval_then, vm_lock};
+use common::vm_lock;
 use compat::{CompatHost, EventAdapter};
 use engine::Scene;
 use engine::input::InputState;
@@ -467,14 +467,14 @@ fn obsolete_window_members_are_registered() {
     let env = Env::new();
     env.run("var w = new Window();");
 
-    // `innerSunken`: the reference form getter defaults to `false`
-    // (`reference/cpp/core/environ/impl/TVPWindow.h:143-144`) and the write
-    // is stored and read back
-    // (`reference/cpp/core/visual/impl/WindowImpl.cpp:1687-1697`).
+    // `innerSunken`: the reference window forwards to its form
+    // (`reference/cpp/core/visual/impl/WindowImpl.cpp:1687-1697`), whose
+    // getter is a constant `false` and whose setter is empty
+    // (`reference/cpp/core/environ/impl/TVPWindow.h:143-144`; the concrete
+    // `TVPWindowLayer` at `TVPWindow.h:187-188` does not override either).
     assert_eq!(env.eval_int("w.innerSunken"), 0);
-    let inner_sunken = eval_then(&env.engine, "w.innerSunken = true;", "w.innerSunken")
-        .expect("write-then-read Window.innerSunken");
-    assert_eq!(inner_sunken, TjsValue::Integer(1));
+    env.run("w.innerSunken = true;");
+    assert_eq!(env.eval_int("w.innerSunken"), 0);
 
     // `layerLeft`/`layerTop`: the form getters report a fixed `0` and the
     // setters are empty (`reference/cpp/core/environ/impl/TVPWindow.h:178-182`).

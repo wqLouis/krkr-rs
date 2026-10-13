@@ -10,6 +10,7 @@ Machine-diff of the reference C++ native class surface (`reference/cpp/core/**/*
 python3 scripts/native_parity.py                 # check + regenerate this report
 python3 scripts/native_parity.py --no-doc        # check only
 python3 scripts/native_parity.py --update-allow  # accept current gaps after review
+python3 scripts/native_parity.py --update-props-allow  # accept accessor mismatches
 python3 scripts/native_parity.py --self-test     # extractor fixture self-test
 ```
 
@@ -119,3 +120,12 @@ These builders have no native C++ counterpart in `reference/cpp/core` (TJS-level
 - A `PropSet` on an *instance* object (`this`, a dictionary, a method parameter) is not a class member and is deliberately not counted; only class-object receivers are members of the class surface.
 - `global->PropSet(...)` registers a global (a class object or a free function such as `getDirList`), not a class member; the plugin reader covers that surface, this report does not.
 - A member installed by a plugin at load time rather than in the core is outside this report; `scripts/plugin_parity.py` covers the plugin surface.
+
+## Property getter/setter parity
+
+A reference property declared with `TJS_BEGIN_NATIVE_PROP_DECL` must expose the same accessors in Rust: a reference-readable property needs a Rust `get`, and a reference-writable one a Rust `set`. The reverse (a Rust accessor the reference denies) is listed as *extra* and fails identically. `scripts/native_parity_props_allow.txt` records accepted exceptions.
+
+- missing accessors: 0
+- extra accessors: 0
+
+_None._

@@ -377,19 +377,13 @@ fn is_existent_directory_resolves_a_mixed_case_absolute_path() {
     );
 }
 
-/// A case-variant absolute path inside the mount does not raise
-/// `TVPCannotGetLocalName` (`reference/cpp/plugins/fstat/main.cpp:757-765`).
-///
-/// Known approximation: the reference's `TVPGetLocalName` walks the real
-/// directory entries and case-corrects every existing component, so an
-/// existing `Assets` makes `isExistentDirectory('.../ASSETS/')` report
-/// `true` (`reference/cpp/core/base/impl/StorageImpl.cpp:339-400`). This
-/// port resolves the disk-relative spelling case-insensitively only through
-/// `Storage::find` (which is file-only) and otherwise joins the normalized
-/// spelling, so it reports `false`; only the absence of the raise is pinned
-/// here.
+/// A case-variant absolute path inside the mount is case-corrected by
+/// `TVPGetLocalName`, so an existing `Assets` makes
+/// `isExistentDirectory('.../ASSETS/')` report `true`
+/// (`reference/cpp/plugins/fstat/main.cpp:757-765`,
+/// `reference/cpp/core/base/impl/StorageImpl.cpp:339-407`).
 #[test]
-fn is_existent_directory_case_variant_does_not_raise() {
+fn is_existent_directory_case_variant_resolves() {
     let _lock = vm_lock();
     let env = Env::mixed_case_root();
     let root = env.dir.as_ref().unwrap().path().join("Games/KR");
@@ -397,12 +391,90 @@ fn is_existent_directory_case_variant_does_not_raise() {
     let variant = format!("{}/ASSETS/", root.display());
     // reference/cpp/plugins/fstat/main.cpp:757-765
     assert!(
-        matches!(
-            env.eval_ok(&format!("Storages.isExistentDirectory('{variant}')")),
-            TjsValue::Integer(_)
-        ),
-        "a case-variant path must not raise"
+        env.bool(&format!("Storages.isExistentDirectory('{variant}')")),
+        "the case-variant directory must resolve to the real spelling"
     );
+}
+
+/// `Storages.getLocalName` returns the case-corrected native path: a
+/// `file://.` name loses its media prefix and a case-variant directory
+/// resolves to the real on-disk spelling — the reference
+/// `TVPGetLocalName(TVPNormalizeStorageName(name))`
+/// (`reference/cpp/core/base/impl/StorageImpl.cpp:1283-1297`,
+/// `:339-407`).
+#[test]
+fn get_local_name_strips_the_file_media_prefix_and_case_corrects() {
+    let _lock = vm_lock();
+    let env = Env::mixed_case_root();
+    let root = env.dir.as_ref().unwrap().path().join("Games/KR");
+    std::fs::create_dir_all(root.join("Assets")).expect("create fixture");
+    std::fs::write(root.join("Assets/Config.tjs"), b"cfg").expect("write fixture");
+
+    // reference/cpp/core/base/impl/StorageImpl.cpp:1283-1297
+    assert_eq!(
+        env.string(&format!(
+            "Storages.getLocalName('file://.{}/Assets/Config.tjs')",
+            root.display()
+        )),
+        root.join("Assets/Config.tjs")
+            .to_string_lossy()
+            .into_owned()
+    );
+    // reference/cpp/core/base/impl/StorageImpl.cpp:339-407
+    assert_eq!(
+        env.string(&format!(
+            "Storages.getLocalName('{}/ASSETS/')",
+            root.display()
+        )),
+        root.join("Assets").to_string_lossy().into_owned()
+    );
+}
+
+/// The `file://.` media prefix is L3 syntax; `Storages` strips it before the L2
+/// namespace sees the name, so a prefixed name behaves exactly like the bare
+/// one (`TVPNormalizeStorageName` parses media/domain/path,
+/// `reference/cpp/core/base/StorageIntf.cpp:240-430`).
+#[test]
+fn is_existent_storage_and_get_placed_path_strip_the_file_media_prefix() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    let dir = env.dir.as_ref().expect("game dir");
+    dir.write("data/config.tjs", b"cfg");
+    let root = dir.path();
+    let prefixed = format!("file://.{}/data/config.tjs", root.display());
+
+    // reference/cpp/core/base/StorageIntf.cpp:240-430
+    assert!(env.bool(&format!("Storages.isExistentStorage('{prefixed}')")));
+    assert_eq!(
+        env.string(&format!("Storages.getPlacedPath('{prefixed}')")),
+        env.string("Storages.getPlacedPath('data/config.tjs')")
+    );
+}
+
+/// `Storages.addAutoPath` strips the `file://.` media prefix — the reference
+/// `System.exePath + "chs/"` form — so the L2 auto-path table holds the bare
+/// absolute path and a base name resolves in that directory
+/// (`reference/cpp/core/base/StorageIntf.cpp:921-937`).
+#[test]
+fn add_auto_path_strips_the_file_media_prefix() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    let dir = env.dir.as_ref().expect("game dir");
+    dir.write("chs/config.tjs", b"translated");
+    let root = dir.path();
+    let entry = format!("file://.{}/chs/", root.display());
+    env.run(&format!("Storages.addAutoPath('{entry}');"));
+
+    // reference/cpp/core/base/StorageIntf.cpp:921-937
+    assert_eq!(
+        env.string("Storages.getPlacedPath('config.tjs')"),
+        "chs/config.tjs"
+    );
+    assert!(env.bool("Storages.isExistentStorage('config.tjs')"));
+
+    // removeAutoPath strips the same prefix and removes the entry.
+    env.run(&format!("Storages.removeAutoPath('{entry}');"));
+    assert_eq!(env.string("Storages.getPlacedPath('config.tjs')"), "");
 }
 
 /// `fstat` returns `size` plus `Date` timestamps (`reference/cpp/plugins/fstat/main.cpp:260-291`,

@@ -6,6 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
+use api::fs::FsPath;
 use engine::storage::{ATTR_DIRECTORY, ATTR_NORMAL, MountOptions};
 use engine::{Location, Storage, normalize_in_archive_name};
 use testkit::build_xp3;
@@ -233,6 +234,67 @@ fn absolute_name_resolves_case_insensitively_below_the_mount() {
 
     // An absolute name outside the mount is still a miss.
     assert!(!storage.exists("/Other/Savedata/Data.bin").unwrap());
+}
+
+/// [`Storage::local_name`] case-corrects every existing component and returns
+/// the real on-disk spelling, for files and directories alike — the reference
+/// `tTVPFileMedia::GetLocallyAccessibleName`
+/// (`reference/cpp/core/base/impl/StorageImpl.cpp:339-407`).
+#[test]
+fn local_name_case_corrects_components() {
+    let fs = memory_with(&[
+        ("Games/KR/Assets/config.tjs", b"cfg"),
+        ("Games/KR/Assets/sub/data.bin", b"data"),
+    ]);
+    let storage =
+        Storage::mount_archives(fs, "/Games/KR", std::iter::empty::<&str>()).expect("mount");
+
+    // reference/cpp/core/base/impl/StorageImpl.cpp:339-407
+    assert_eq!(
+        storage.local_name("/Games/KR/ASSETS/").unwrap(),
+        Some(PathBuf::from("/Games/KR/Assets"))
+    );
+    assert_eq!(
+        storage.local_name("assets/CONFIG.TJS").unwrap(),
+        Some(PathBuf::from("/Games/KR/Assets/config.tjs"))
+    );
+    // A component that does not exist keeps the requested spelling, and the
+    // remaining components are appended unchanged.
+    assert_eq!(
+        storage.local_name("assets/absent/deep.bin").unwrap(),
+        Some(PathBuf::from("/Games/KR/Assets/absent/deep.bin"))
+    );
+    // A name outside the mount is a miss.
+    assert_eq!(storage.local_name("/elsewhere/x").unwrap(), None);
+    // A `..` that escapes the mount is the reference's `TVPInvalidPathName`.
+    // reference/cpp/core/base/StorageIntf.cpp:400
+    assert!(matches!(
+        storage.local_name("../escape"),
+        Err(engine::storage::StorageReadError::InvalidPathName(_))
+    ));
+}
+
+/// The case-correction walk reads the directory live: a listing warmed while
+/// the directory was empty must not hide a directory created afterwards. The
+/// reference `tTVPFileMedia::GetLocallyAccessibleName` calls `opendir`/
+/// `readdir` on every invocation
+/// (`reference/cpp/core/base/impl/StorageImpl.cpp:339-407`).
+#[test]
+fn local_name_reads_the_directory_live() {
+    let file_system = memory_with(&[("game/keep.txt", b"x")]);
+    let storage =
+        Storage::mount_archives(file_system, "/game", std::iter::empty::<&str>()).expect("mount");
+
+    // Warm the game-directory listing while it has no `Assets` entry.
+    assert!(storage.find("missing.txt").unwrap().is_none());
+    fs::create_dir_all(storage.file_system(), &FsPath::host("/game/Assets"))
+        .expect("create Assets");
+
+    // reference/cpp/core/base/impl/StorageImpl.cpp:339-407
+    assert_eq!(
+        storage.local_name("ASSETS/").unwrap(),
+        Some(PathBuf::from("/game/Assets"))
+    );
 }
 
 /// A `..` that leaves the mount is the reference's `TVPInvalidPathName`
@@ -699,8 +761,9 @@ fn miss_reports_every_searched_location() {
     );
 }
 
-/// The resolver builds each auto path's candidate table once: a second miss
-/// re-lists no directory, and the miss line still names every candidate.
+/// The resolver builds each auto path's candidate table once, while the
+/// current-path case walk stays live: a second miss re-lists only the current
+/// path, and the miss line still names every candidate.
 #[test]
 fn resolver_cache_lists_each_auto_path_once() {
     let xp3 = build_xp3(&[("system/Config.tjs", b"cfg", false)]);
@@ -725,13 +788,15 @@ fn resolver_cache_lists_each_auto_path_once() {
         "the two auto-path directories were listed: {after_first:?}"
     );
 
-    // The second miss is served from the cached tables: no new listing.
+    // The second miss is served from the cached auto-path tables; only the
+    // live current-path case walk lists a directory.
     let (found, logs) = capture_logs(|| storage.find("missing.txt"));
     assert_eq!(found.unwrap(), None);
     let after_second = storage.probe_counts();
     assert_eq!(
-        after_second.list, after_first.list,
-        "a second miss re-listed a directory"
+        after_second.list,
+        after_first.list + 1,
+        "a second miss must re-list only the live current-path walk"
     );
     assert_eq!(after_second.misses, 2);
     assert!(
@@ -741,8 +806,12 @@ fn resolver_cache_lists_each_auto_path_once() {
 }
 
 /// The startup shape from the device measurement: many auto paths and many
-/// misses. With the cache the listing count is one per auto-path directory,
-/// not one per miss per auto path.
+/// misses. The auto-path candidate table is cached (one listing per auto-path
+/// directory), while the current-path case walk reads live (one listing per
+/// miss) — matching the reference, which caches the auto-path table but
+/// `opendir`s the real directory on every lookup
+/// (`reference/cpp/core/base/StorageIntf.cpp:959-1052`,
+/// `reference/cpp/core/base/impl/StorageImpl.cpp:339-407`).
 #[test]
 fn resolver_cache_probe_count_for_startup_shape() {
     const AUTO_PATHS: usize = 41;
@@ -768,11 +837,12 @@ fn resolver_cache_probe_count_for_startup_shape() {
     }
 
     let counts = storage.probe_counts();
-    // One listing per auto-path directory plus one for the game directory.
+    // One listing per auto-path directory (the candidate table is built once)
+    // plus one live listing per miss for the current-path case walk.
     assert_eq!(
         counts.list,
-        (AUTO_PATHS + 1) as u64,
-        "one listing per directory, not one per miss: {counts:?}"
+        (AUTO_PATHS + MISSES) as u64,
+        "one listing per auto-path directory plus the live current-path walk: {counts:?}"
     );
     assert_eq!(counts.misses, MISSES as u64);
 }

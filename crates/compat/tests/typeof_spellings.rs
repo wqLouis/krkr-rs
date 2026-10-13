@@ -101,6 +101,50 @@ fn undefined_is_absence_and_void_is_unset() {
     assert_eq!(env.eval_ok("dict.missing"), TjsValue::Void);
 }
 
+/// The device-log shape: a top-level `typeof <bare identifier>` for a name
+/// that is not declared. Unlike `typeof obj.prop`, this **raises** in TJS2.
+///
+/// The `typeof` operator only takes the must-exist member path when its
+/// operand is already a property access — `T_DOT`, `T_LBRACKET` or
+/// `T_WITHDOT` (`reference/cpp/core/tjs2/tjsInterCodeGen.cpp:1805-1812`).
+/// Any other operand, a bare symbol included, takes the "normal operation"
+/// path (`:1815-1839`): the symbol is read as an ordinary variable first and
+/// the result is typed afterwards. A symbol that is not a local is rewritten
+/// to `this.<name>` / `global.<name>`
+/// (`reference/cpp/core/tjs2/tjsInterCodeGen.cpp:2320-2345`) and read with
+/// `VM_GPD` (`:2039-2049`), i.e. `GetPropertyDirect` with flags `0`
+/// (`reference/cpp/core/tjs2/tjsInterCodeExec.cpp:1166-1167`, `:1400-1428`).
+/// The global object is a `tTJSCustomObject`, whose `PropGet` returns
+/// `TJS_E_MEMBERNOTFOUND` for an absent member
+/// (`reference/cpp/core/tjs2/tjsObject.cpp:1276-1310`), and
+/// `TJSThrowFrom_tjs_error` turns that into `Member "<name>" does not exist`
+/// (`reference/cpp/core/tjs2/tjsError.cpp:254-268`;
+/// `reference/cpp/core/tjs2/tjsError.h:264`). Only the property-access form
+/// reaches `TypeOfMemberDirect`'s `"undefined"` arm
+/// (`reference/cpp/core/tjs2/tjsInterCodeExec.cpp:1865-1904`), which is what
+/// the reference's own `motionplayer` uses to probe a class member
+/// (`reference/cpp/plugins/motionplayer/main.cpp:505`,
+/// `typeof Motion.Player.useD3D`). The device log's bare `typeof Motion`
+/// therefore raises in the reference too; the top-level script catches it and
+/// keeps running, which is why the dump appears without aborting the title.
+#[test]
+fn bare_undeclared_global_typeof_raises() {
+    let _lock = vm_lock();
+    let env = Env::new();
+
+    let error = env.error("typeof SomeAbsentGlobal");
+    assert!(
+        error.contains("SomeAbsentGlobal") && error.contains("does not exist"),
+        "a bare absent identifier must raise the reference member-not-found error, got: {error}"
+    );
+
+    // The property-access spelling is the one that reports absence instead.
+    assert_eq!(
+        env.eval_ok("typeof global.SomeAbsentGlobal"),
+        TjsValue::String("undefined".into())
+    );
+}
+
 /// TJS2 is not JavaScript syntactically either: `{}` is not an object literal
 /// (the parser reads it as a block and rejects the expression) and there is no
 /// global `Object` constructor (a bare `new Object()` is a member lookup that

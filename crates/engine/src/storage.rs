@@ -119,8 +119,8 @@ pub struct Storage {
     /// `(file_hash, offset, buffer, file_name, archive_name, file_size)` and
     /// may rewrite `buffer` in place.
     pub xp3_extraction_filter: Option<Box<Xp3ExtractionFilter<'static>>>,
-    /// Lazily built resolver tables and directory listings, invalidated when
-    /// the auto-path list or the mounted archives change.
+    /// Lazily built resolver tables, invalidated when the auto-path list or
+    /// the mounted archives change.
     resolution_cache: RefCell<ResolutionCache>,
 }
 
@@ -147,12 +147,6 @@ pub struct ProbeCounts {
     /// Lookups that resolved to nothing (the reference's empty placed path).
     pub misses: u64,
 }
-
-/// A directory listing cached for repeated resolution.
-///
-/// The entries are the raw `fs::list` result in list order, so the
-/// case-insensitive walk re-scans them without a new enumeration.
-type DirectoryListing = Rc<Vec<(String, bool)>>;
 
 /// The direct children of an archive auto-path prefix: the archive path and a
 /// map from lower-cased base name to normalized in-archive name.
@@ -219,8 +213,6 @@ impl AutoPathTable {
 /// The per-storage resolver cache.
 #[derive(Default)]
 struct ResolutionCache {
-    /// Directory listings keyed by absolute path.
-    directories: HashMap<PathBuf, DirectoryListing>,
     /// Candidate tables keyed by the auto-path entry string.
     auto_paths: HashMap<String, Rc<AutoPathTable>>,
     /// Resolved hits keyed by the requested storage name (the reference's
@@ -774,13 +766,12 @@ impl Storage {
         self.resolution_cache.borrow().read_bytes
     }
 
-    /// Drops the cached auto-path tables and directory listings.
+    /// Drops the cached auto-path tables.
     ///
     /// Call when the auto-path list or the mounted archives change; the probe
     /// counters are kept so the diagnostic survives an invalidation.
     pub fn clear_resolution_cache(&mut self) {
         let cache = self.resolution_cache.get_mut();
-        cache.directories.clear();
         cache.auto_paths.clear();
         cache.placed.clear();
     }
@@ -919,29 +910,26 @@ impl Storage {
         Ok(None)
     }
 
-    /// The cached listing of `dir`, enumerating it once on first use.
-    fn directory_listing(&self, dir: &Path) -> Result<DirectoryListing, StorageReadError> {
-        let cached = self.resolution_cache.borrow().directories.get(dir).cloned();
-        if let Some(listing) = cached {
-            return Ok(listing);
-        }
+    /// The live listing of `dir`, enumerating it on every call.
+    ///
+    /// The reference's case-insensitive lookup and `GetLocallyAccessibleName`
+    /// both walk the real directory with a live `opendir`/`readdir` on every
+    /// call (`reference/cpp/core/base/impl/StorageImpl.cpp:339-407`), so the
+    /// listing is never cached: a script that creates a directory and then
+    /// resolves it case-insensitively must see it. The auto-path candidate
+    /// table is cached separately, so a repeat auto-path lookup still lists
+    /// nothing.
+    fn directory_listing(&self, dir: &Path) -> Result<Vec<(String, bool)>, StorageReadError> {
         self.resolution_cache.borrow_mut().probes.list += 1;
         let entries = match fs::list(&self.fs, &FsPath::host(dir)) {
             Ok(entries) => entries,
             Err(FsError::NotFound { .. }) | Err(FsError::NotADirectory { .. }) => Vec::new(),
             Err(error) => return Err(StorageReadError::Fs(error)),
         };
-        let listing: DirectoryListing = Rc::new(
-            entries
-                .into_iter()
-                .map(|entry| (entry.name, entry.is_dir))
-                .collect(),
-        );
-        self.resolution_cache
-            .borrow_mut()
-            .directories
-            .insert(dir.to_path_buf(), Rc::clone(&listing));
-        Ok(listing)
+        Ok(entries
+            .into_iter()
+            .map(|entry| (entry.name, entry.is_dir))
+            .collect())
     }
 
     /// Counts and runs one `stat` probe, returning whether the path is a
@@ -983,7 +971,7 @@ impl Storage {
         }
     }
 
-    /// Builds the plain-directory candidate table from one cached listing.
+    /// Builds the plain-directory candidate table from one live listing.
     fn build_folder_auto_path(&self, dir: &str) -> Result<AutoPathTable, StorageReadError> {
         let root = if Path::new(dir).is_absolute() {
             PathBuf::from(dir)
@@ -1190,6 +1178,73 @@ impl Storage {
         })
     }
 
+    /// The case-corrected host path for a storage name below the mount — the
+    /// reference `tTVPFileMedia::GetLocallyAccessibleName`
+    /// (`reference/cpp/core/base/impl/StorageImpl.cpp:339-407`).
+    ///
+    /// Every path component is matched against the real directory entries
+    /// ASCII-case-insensitively and the real on-disk spelling is returned; from
+    /// the first component that does not exist, the requested spelling is kept
+    /// for it and the remaining components, like the reference's
+    /// `newname += ptr_cur; break;`. Unlike [`Self::find`] this matches
+    /// directories too and does not require the final component to exist.
+    ///
+    /// `Ok(None)` means `name` is not below the mount (including an in-archive
+    /// name); a `..` that escapes the mount is
+    /// [`StorageReadError::InvalidPathName`].
+    pub fn local_name(&self, name: &str) -> Result<Option<PathBuf>, StorageReadError> {
+        if name.contains('>') {
+            return Ok(None);
+        }
+        let Some(relative) = self.relative_disk_name_checked(name)? else {
+            return Ok(None);
+        };
+        Ok(Some(self.case_correct_path(&relative)))
+    }
+
+    /// Walks `relative` (already folded and `/`-separated) below the game
+    /// directory, replacing each existing component with its real on-disk
+    /// spelling. From the first component that does not exist, the requested
+    /// spelling of every remaining component is appended unchanged.
+    fn case_correct_path(&self, relative: &str) -> PathBuf {
+        let mut host = self.game_dir.clone();
+        let parts: Vec<&str> = relative
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .collect();
+        for (index, part) in parts.iter().enumerate() {
+            if let Some(real) = self.case_correct_component(&host, part) {
+                host.push(real);
+            } else {
+                // The reference appends the requested spelling of this
+                // component and every remaining one, then stops correcting
+                // (`newname += ptr_cur`,
+                // `reference/cpp/core/base/impl/StorageImpl.cpp:373-377`).
+                for rest in &parts[index..] {
+                    host.push(*rest);
+                }
+                break;
+            }
+        }
+        host
+    }
+
+    /// The real on-disk spelling of the child of `dir` named `want`, or `None`
+    /// when no child matches or the directory cannot be listed.
+    fn case_correct_component(&self, dir: &Path, want: &str) -> Option<String> {
+        let listing = match self.directory_listing(dir) {
+            Ok(listing) => listing,
+            // The reference's `opendir` failure appends the requested spelling
+            // and stops the walk
+            // (`reference/cpp/core/base/impl/StorageImpl.cpp:373-377`).
+            Err(_) => return None,
+        };
+        listing
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(want))
+            .map(|(name, _)| name.clone())
+    }
+
     /// Disk branch of [`Self::find`], given an already-resolved relative name
     /// below the game directory.
     fn find_disk_relative(
@@ -1293,9 +1348,8 @@ impl Storage {
                 let path = dir.join(name.as_str());
                 if parts.len() == 1 {
                     if !is_dir {
-                        // The listing is cached, so validate against the live
-                        // file system: a file removed since the listing must
-                        // not resolve.
+                        // Validate against the live file system: a file removed
+                        // between the listing and this probe must not resolve.
                         if storage.stat_probe(&path)?.is_some() {
                             return Ok(Some((path, false)));
                         }

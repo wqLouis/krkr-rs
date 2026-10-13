@@ -614,6 +614,47 @@ fn set_cursor_pos_accumulates_the_parent_chain_offsets() {
     assert!(env.try_run("c.setCursorPos(1);").is_err());
 }
 
+/// Reference: `SetCursorX` stores the pending X
+/// (`reference/cpp/core/visual/LayerIntf.cpp:3108-3112`); `SetCursorY` warps
+/// the pointer to that X and the given Y, adding this layer's and every
+/// *parented* ancestor's rect offset and stopping before the parentless root
+/// (`LayerIntf.cpp:3132-3145`).
+#[test]
+fn cursor_property_setters_store_then_warp_the_pointer() {
+    let _lock = vm_lock();
+    let mut env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var base = new Layer(w, null); \
+         var g = new Layer(w, null); g.left = 10; g.top = 20; \
+         var p = new Layer(w, g); p.left = 30; p.top = 40; \
+         var c = new Layer(w, p); c.left = 5; c.top = 6; \
+         c.cursorX = 9;",
+    );
+    // `cursorX` only stores the pending X; it does not warp.
+    assert_eq!(env.input.take_warp_request(), None);
+    env.run("c.cursorY = 2;");
+    // c adds its own (5, 6) and p adds (30, 40); the parentless g
+    // contributes nothing → (9 + 5 + 30, 2 + 6 + 40).
+    assert_eq!(env.input.take_warp_request(), Some((44.0, 48.0)));
+}
+
+/// Reference: `font` is a get-only property — the block ends with
+/// `TJS_DENY_NATIVE_PROP_SETTER` (`reference/cpp/core/visual/LayerIntf.cpp:11339-11350`)
+/// — so assignment raises `TJSAccessDenyed`
+/// (`reference/cpp/core/tjs2/tjsError.h:295-296`).
+#[test]
+fn font_property_is_read_only() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run("var w = new Window(); var f = new Font(); var l = new Layer(w, null);");
+    let message = env.try_run("l.font = f;").expect_err("font is read-only");
+    assert!(
+        message.contains("Read-only") || message.contains("Write-only"),
+        "unexpected message: {message}"
+    );
+}
+
 /// Reference: `releaseCapture()` ignores which layer captures and releases
 /// the mouse capture globally (`reference/cpp/core/visual/LayerIntf.cpp:3467-3472`);
 /// `releaseTouchCapture` with **no** argument releases every touch capture
@@ -1277,6 +1318,156 @@ fn set_image_size_shrinks_the_rect_and_clamps_the_image_offset() {
     assert_eq!(env.eval_int("l.imageWidth"), 16);
     assert_eq!(env.eval_int("l.imageLeft"), 0);
     assert_eq!(env.eval_int("l.imageTop"), 0);
+}
+
+/// Reference: `SetImageWidth` (`LayerIntf.cpp:2565-2585`) resizes the
+/// MainImage to the requested width while keeping its height, shrinking the
+/// layer rect when the new width is below it and never growing the rect;
+/// `SetImageHeight` is the transpose (`:2594-2614`). `ChangeImageSize`
+/// preserves the overlapping pixels and fills the expanded region with the
+/// neutral color (`:2307-2323`, `LayerBitmapIntf.cpp:122-163`).
+#[test]
+fn image_width_and_height_setters_resize_the_image() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); var l = new Layer(w, null); \
+         l.setMainPixel(1, 1, 0x123456); \
+         l.imageWidth = 40;",
+    );
+    // Growing the width keeps the 32x32 rect and the height; the existing
+    // pixel is retained while the expanded region is neutral white.
+    assert_eq!(env.eval_int("l.imageWidth"), 40);
+    assert_eq!(env.eval_int("l.imageHeight"), 32);
+    assert_eq!(env.eval_int("l.width"), 32);
+    assert_eq!(env.eval_int("l.height"), 32);
+    assert_eq!(env.eval_int("l.imageLeft"), 0);
+    assert_eq!(env.eval_int("l.getMainPixel(1, 1)"), 0x123456);
+    assert_eq!(env.eval_int("l.getMainPixel(35, 1)"), 0xffffff);
+    // A width below the rect shrinks the rect and clears the offset.
+    env.run("l.imageWidth = 16;");
+    assert_eq!(env.eval_int("l.imageWidth"), 16);
+    assert_eq!(env.eval_int("l.imageHeight"), 32);
+    assert_eq!(env.eval_int("l.width"), 16);
+    assert_eq!(env.eval_int("l.imageLeft"), 0);
+    // Growing the height keeps the rect; shrinking it shrinks the rect.
+    env.run("l.imageHeight = 48;");
+    assert_eq!(env.eval_int("l.imageWidth"), 16);
+    assert_eq!(env.eval_int("l.imageHeight"), 48);
+    assert_eq!(env.eval_int("l.height"), 32);
+    assert_eq!(env.eval_int("l.imageTop"), 0);
+    env.run("l.imageHeight = 8;");
+    assert_eq!(env.eval_int("l.imageHeight"), 8);
+    assert_eq!(env.eval_int("l.height"), 8);
+    assert_eq!(env.eval_int("l.imageTop"), 0);
+}
+
+/// Reference: `SetImageWidth`/`SetImageHeight` clamp `ImageLeft`/`ImageTop`
+/// when the image no longer covers the rect (`LayerIntf.cpp:2578-2580`,
+/// `:2607-2609`).
+#[test]
+fn image_dimension_setter_clamps_the_image_offset() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); var l = new Layer(w, null); \
+         l.setSize(20, 20); \
+         l.setImagePos(-12, -12);",
+    );
+    assert_eq!(env.eval_int("l.imageLeft"), -12);
+    assert_eq!(env.eval_int("l.imageTop"), -12);
+    // 20 is not below the rect, so the width setter takes the offset clamp:
+    // 20 + (-12) is below the rect width, so `ImageLeft` becomes 0.
+    env.run("l.imageWidth = 20;");
+    assert_eq!(env.eval_int("l.imageWidth"), 20);
+    assert_eq!(env.eval_int("l.width"), 20);
+    assert_eq!(env.eval_int("l.imageLeft"), 0);
+    // The height setter clamps the top offset the same way.
+    env.run("l.imageHeight = 20;");
+    assert_eq!(env.eval_int("l.imageHeight"), 20);
+    assert_eq!(env.eval_int("l.height"), 20);
+    assert_eq!(env.eval_int("l.imageTop"), 0);
+}
+
+/// Reference: `SetImageWidth`/`SetImageHeight` return immediately when the
+/// requested dimension already matches the MainImage
+/// (`LayerIntf.cpp:2569-2570`, `:2598-2599`), leaving the rect and the
+/// offset untouched.
+#[test]
+fn image_dimension_setter_is_a_noop_for_the_same_value() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); var l = new Layer(w, null); \
+         l.setSize(20, 20); \
+         l.setImagePos(-8, -8);",
+    );
+    env.run("l.imageWidth = 32; l.imageHeight = 32;");
+    assert_eq!(env.eval_int("l.imageWidth"), 32);
+    assert_eq!(env.eval_int("l.imageHeight"), 32);
+    assert_eq!(env.eval_int("l.width"), 20);
+    assert_eq!(env.eval_int("l.height"), 20);
+    assert_eq!(env.eval_int("l.imageLeft"), -8);
+    assert_eq!(env.eval_int("l.imageTop"), -8);
+}
+
+/// Reference: `GetImageWidth`/`GetImageHeight` and `SetImageWidth`/
+/// `SetImageHeight` all raise `TVPNotDrawableLayerType` with no MainImage
+/// (`LayerIntf.cpp:2565-2592`, `:2594-2621`).
+#[test]
+fn image_dimensions_require_an_image() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); var base = new Layer(w, null); \
+         var l = new Layer(w, null); l.hasImage = false;",
+    );
+    for expression in ["l.imageWidth", "l.imageHeight"] {
+        let message = env
+            .eval(expression)
+            .expect_err("reading an image dimension without an image must raise");
+        assert!(
+            message.contains("Not drawable layer type"),
+            "{expression}: unexpected message: {message}"
+        );
+    }
+    for script in ["l.imageWidth = 8;", "l.imageHeight = 8;"] {
+        let message = env
+            .try_run(script)
+            .expect_err("writing an image dimension without an image must raise");
+        assert!(
+            message.contains("Not drawable layer type"),
+            "{script}: unexpected message: {message}"
+        );
+    }
+}
+
+/// Reference: `ChangeImageSize` throws `TVPCannotCreateEmptyLayerImage` for a
+/// zero extent (`LayerIntf.cpp:2308-2310`, `MsgIntfInc.h:64-65`); the width
+/// setter shrinks the rect before raising, so the rect is already zero while
+/// the MainImage keeps its old size.
+#[test]
+fn image_dimension_setter_rejects_zero() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run("var w = new Window(); var l = new Layer(w, null);");
+    let message = env
+        .try_run("l.imageWidth = 0;")
+        .expect_err("a zero width must raise");
+    assert!(
+        message.contains("Cannot create empty layer image"),
+        "unexpected message: {message}"
+    );
+    assert_eq!(env.eval_int("l.width"), 0);
+    assert_eq!(env.eval_int("l.imageWidth"), 32);
+    let message = env
+        .try_run("l.imageHeight = 0;")
+        .expect_err("a zero height must raise");
+    assert!(
+        message.contains("Cannot create empty layer image"),
+        "unexpected message: {message}"
+    );
+    assert_eq!(env.eval_int("l.height"), 0);
 }
 
 /// Reference: `SetImagePosition` (`LayerIntf.cpp:2546-2560`) rejects a

@@ -116,8 +116,12 @@ object bound to the layer's state: every access returns the same wrapper, so
 writes persist the way the reference's cached `FontObject` does.
 `Layer.drawText` reads the layer's font id and resolves the face through the
 resolver; when the layer has no font it uses the default face
-(`DEFAULT_FONT_FACE`) rather than a per-call guess. `Layer.font = f` copies the
-source `Font`'s properties into the layer's own state.
+(`DEFAULT_FONT_FACE`) rather than a per-call guess. The `font` property is
+read-only, matching the reference (`TJS_DENY_NATIVE_PROP_SETTER`,
+`reference/cpp/core/visual/LayerIntf.cpp:11339-11350`): a layer's font is set
+by writing the returned `Font` object's own members (`face`, `height`, ...),
+as in the `with(font)` block above, and the writes persist through the layer's
+bound `FontState`.
 
 ---
 

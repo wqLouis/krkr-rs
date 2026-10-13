@@ -978,3 +978,79 @@ owned by another agent and was not edited here):
 - In §11 "The dispatch surface is the contract (D29)", last paragraph, after
   the `Timer` example:
   `Known behaviour divergences that the surface lock cannot catch are listed in [`docs/vm-defects.md`](../vm-defects.md) (e.g. TIM-1 on `Timer.capacity`).`
+
+---
+
+## SEM-2 — a bare `typeof <undeclared identifier>` raises; only the property form reports `"undefined"`
+
+**Summary:** `typeof SomeAbsentGlobal` (a bare identifier, no property
+access) raises `Member "SomeAbsentGlobal" does not exist`; it does **not**
+return `"undefined"`. The device-log shape `typeof Motion` therefore logs an
+exception in the reference engine too, and this is reference behaviour, not a
+port defect. The `typeof <obj>.<prop>` / `typeof global.<name>` form is the one
+that reports `"undefined"`.
+
+**Finding / trap (not a bug).** The `typeof` operator special-cases its operand
+only when it is already a property access (`T_DOT` / `T_LBRACKET` /
+`T_WITHDOT`): that path emits `VM_TYPEOFD` / `VM_TYPEOFI` with
+`TJS_MEMBERMUSTEXIST`, and `TypeOfMemberDirect` maps `TJS_E_MEMBERNOTFOUND` to
+the string `"undefined"`. A bare symbol takes the "normal operation" branch,
+which reads the symbol as an ordinary variable first and only then applies
+`VM_TYPEOF`. The code generator rewrites a non-local symbol to `this.<name>` /
+`global.<name>` and reads it with `VM_GPD` (flags `0`, so not must-exist). The
+script global object is a `tTJSCustomObject`, whose `PropGet` returns
+`TJS_E_MEMBERNOTFOUND` for an absent member; `GetPropertyDirect` sees
+`TJS_FAILED(hr)` and throws through `TJSThrowFrom_tjs_error`, producing
+`Member "<name>" does not exist`. A bare absent name therefore can never reach
+the `"undefined"` arm — the read raises first. This is the same must-exist read
+rule that makes a bare `undefined` raise (SEM-1), and it is deliberate TJS2
+semantics (`TypeOf`'s comments say the spellings "differ from TJS1").
+
+**Evidence.**
+- Only property-access operands get the safe path:
+  `reference/cpp/core/tjs2/tjsInterCodeGen.cpp:1805-1812` (`haspropnode`),
+  `:1815-1839` (bare path emits `VM_TYPEOF` after an ordinary read).
+- A non-local symbol is rewritten to `this.<name>` / `global.<name>` and read
+  normally: `reference/cpp/core/tjs2/tjsInterCodeGen.cpp:2320-2345`; `stNone` →
+  `VM_GPD`: `:2039-2049`.
+- `VM_GPD` passes flags `0` and throws on failure:
+  `reference/cpp/core/tjs2/tjsInterCodeExec.cpp:1166-1167`, `:1400-1428`.
+- The global object rejects absent members: `tTJSCustomObject::PropGet`,
+  `reference/cpp/core/tjs2/tjsObject.cpp:1276-1310`
+  (`return TJS_E_MEMBERNOTFOUND` at `:1309`).
+- The error text: `TJSThrowFrom_tjs_error` → `TJSMemberNotFound`
+  (`Member "%1" does not exist`), `reference/cpp/core/tjs2/tjsError.cpp:254-268`;
+  message declaration `reference/cpp/core/tjs2/tjsError.h:264`.
+- The safe path: `TypeOfMemberDirect`'s `"undefined"` arm,
+  `reference/cpp/core/tjs2/tjsInterCodeExec.cpp:1865-1904`.
+- The reference's own `motionplayer` probes a **member**, not a bare name:
+  `reference/cpp/plugins/motionplayer/main.cpp:505`
+  (`typeof Motion.Player.useD3D`).
+- Pinned by `crates/compat/tests/typeof_spellings.rs`
+  `bare_undeclared_global_typeof_raises` (property form:
+  `undefined_is_absence_and_void_is_unset`).
+
+**Whose bug:** n/a — reference semantics, to keep. Not a defect.
+
+**Script-observable:** yes, directly. A top-level `typeof <undeclared global>`
+dumps an exception (caught or ignored by the script) in both engines; a script
+that wants a silent feature probe must use `typeof global.<name>` or
+`typeof <obj>.<member>`. The scripts then continuing is consistent with the
+exception being caught or ignored at startup; it is not evidence of a port
+defect.
+
+**Current workaround.** None needed: we match the reference. Note that the
+device-log names (`Motion`, `Player`, `D3DEmotePlayer`, `D3DEmoteModule`,
+`ShortCutInitialPadKeyMap`) are published **unconditionally** by the port's
+`motionplayer.dll` port at install time
+(`crates/compat/src/natives/plugins/motion_player/mod.rs:298-424`,
+`crates/compat/src/natives/plugins/mod.rs:64-225`), so on a current build those
+specific `typeof` reads resolve and do not raise. A device that still logs them
+is running a build without those registrations (or before them); investigate
+plugin registration, not `typeof`.
+
+**What a rewrite should do.** Preserve the split exactly:
+`VM_TYPEOFD` / `VM_TYPEOFI` (property access) returns `"undefined"` for
+`TJS_E_MEMBERNOTFOUND`, while a bare identifier does an ordinary must-exist read
+and raises. Do not make `typeof <bare name>` silently return `"undefined"` the
+way JavaScript does (SEM-1).

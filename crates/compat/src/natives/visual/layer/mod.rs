@@ -68,6 +68,9 @@ struct LayerTransition {
 struct LayerInst {
     id: Option<u32>,
     font_object: Option<DetachedValue>,
+    /// Reference `tTJSNI_BaseLayer::CursorX_Work` (`LayerIntf.cpp:347`): the
+    /// pending X `SetCursorX` stores for the next `SetCursorY`.
+    cursor_x_work: i32,
 }
 
 /// The scene id a `Layer` payload carries — the reader behind the VM's
@@ -1806,12 +1809,195 @@ layer_int_prop!(
         true
     }
 );
-layer_int_get!(layer_image_width_get, |l: &LayerState| i64::from(
-    l.image_width
-));
-layer_int_get!(layer_image_height_get, |l: &LayerState| i64::from(
-    l.image_height
-));
+/// `Layer.imageWidth`/`Layer.imageHeight` getter. The reference
+/// `GetImageWidth`/`GetImageHeight` raise `TVPNotDrawableLayerType` when the
+/// layer has no `MainImage` (`LayerIntf.cpp:2587-2592`, `:2616-2621`).
+fn layer_image_dimension_get(
+    engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    name: &str,
+    dimension: impl FnOnce(&LayerState) -> u32,
+) -> c_int {
+    match with_layer_read(engine, instance, |layer| {
+        if layer.bitmap.is_none() {
+            Err(format!("{name}: Not drawable layer type"))
+        } else {
+            Ok(i64::from(dimension(layer)))
+        }
+    }) {
+        Ok(Ok(value)) => {
+            set_int(out, value);
+            0
+        }
+        Ok(Err(error)) | Err(error) => report_error(out_error, &error),
+    }
+}
+
+extern "C" fn layer_image_width_get(
+    engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    layer_image_dimension_get(
+        engine,
+        instance,
+        out,
+        out_error,
+        "Layer.imageWidth",
+        |layer| layer.image_width,
+    )
+}
+
+extern "C" fn layer_image_height_get(
+    engine: *mut c_void,
+    instance: *mut c_void,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    layer_image_dimension_get(
+        engine,
+        instance,
+        out,
+        out_error,
+        "Layer.imageHeight",
+        |layer| layer.image_height,
+    )
+}
+
+/// `Layer.imageWidth = width` — the reference `SetImageWidth`
+/// (`LayerIntf.cpp:2565-2585`): raise on an imageless layer, treat an
+/// unchanged width as a no-op, shrink the layer rect and clamp the image
+/// offset, then resize the MainImage to the new width keeping its height.
+extern "C" fn layer_image_width_set(
+    engine: *mut c_void,
+    instance: *mut c_void,
+    value: *const Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: the trampoline passes a valid value slot.
+    let value = unsafe { &*value };
+    match with_layer_scene(engine, instance, value, |scene, id, v| {
+        let width = value_as_i64(v) as u32;
+        let Some((has_image, image_width)) = scene
+            .layer(id)
+            .map(|layer| (layer.bitmap.is_some(), layer.image_width))
+        else {
+            return Err("Layer: layer no longer exists".to_string());
+        };
+        if !has_image {
+            return Err("Layer.imageWidth: Not drawable layer type".to_string());
+        }
+        if width == image_width {
+            return Ok(());
+        }
+        // `SetWidth` shrinks the rect and clears the offset, then
+        // `ImageLayerSizeChanged` grows the image back to cover the rect.
+        let mut rect_changed = false;
+        if let Some(layer) = scene.layer_mut(id)
+            && (width as i32) < layer.rect.w as i32
+        {
+            layer.image_left = 0;
+            layer.rect.w = width;
+            rect_changed = true;
+        }
+        if rect_changed {
+            scene.layer_size_changed(id);
+        }
+        // The clamp reads the rect width the shrink above left behind.
+        let Some(rect_w) = scene.layer(id).map(|layer| layer.rect.w) else {
+            return Err("Layer: layer no longer exists".to_string());
+        };
+        if let Some(layer) = scene.layer_mut(id)
+            && (width.wrapping_add(layer.image_left as u32) as i32) < rect_w as i32
+        {
+            layer.image_left = rect_w.wrapping_sub(width) as i32;
+        }
+        let Some(image_height) = scene.layer(id).map(|layer| layer.image_height) else {
+            return Err("Layer: layer no longer exists".to_string());
+        };
+        if width == 0 {
+            return Err("Layer.imageWidth: Cannot create empty layer image".to_string());
+        }
+        if !scene.set_layer_image_size(id, width, image_height) {
+            return Err("Layer.imageWidth: could not resize the layer image".to_string());
+        }
+        Ok(())
+    }) {
+        Ok(()) => 0,
+        Err(error) => report_error(out_error, &error),
+    }
+}
+
+/// `Layer.imageHeight = height` — the reference `SetImageHeight`
+/// (`LayerIntf.cpp:2594-2614`): raise on an imageless layer, treat an
+/// unchanged height as a no-op, shrink the layer rect and clamp the image
+/// offset, then resize the MainImage to the new height keeping its width.
+extern "C" fn layer_image_height_set(
+    engine: *mut c_void,
+    instance: *mut c_void,
+    value: *const Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: the trampoline passes a valid value slot.
+    let value = unsafe { &*value };
+    match with_layer_scene(engine, instance, value, |scene, id, v| {
+        let height = value_as_i64(v) as u32;
+        let Some((has_image, image_height)) = scene
+            .layer(id)
+            .map(|layer| (layer.bitmap.is_some(), layer.image_height))
+        else {
+            return Err("Layer: layer no longer exists".to_string());
+        };
+        if !has_image {
+            return Err("Layer.imageHeight: Not drawable layer type".to_string());
+        }
+        if height == image_height {
+            return Ok(());
+        }
+        // `SetHeight` shrinks the rect and clears the offset, then
+        // `ImageLayerSizeChanged` grows the image back to cover the rect.
+        let mut rect_changed = false;
+        if let Some(layer) = scene.layer_mut(id)
+            && (height as i32) < layer.rect.h as i32
+        {
+            layer.image_top = 0;
+            layer.rect.h = height;
+            rect_changed = true;
+        }
+        if rect_changed {
+            scene.layer_size_changed(id);
+        }
+        // The clamp reads the rect height the shrink above left behind.
+        let Some(rect_h) = scene.layer(id).map(|layer| layer.rect.h) else {
+            return Err("Layer: layer no longer exists".to_string());
+        };
+        if let Some(layer) = scene.layer_mut(id)
+            && (height.wrapping_add(layer.image_top as u32) as i32) < rect_h as i32
+        {
+            layer.image_top = rect_h.wrapping_sub(height) as i32;
+        }
+        let Some(image_width) = scene.layer(id).map(|layer| layer.image_width) else {
+            return Err("Layer: layer no longer exists".to_string());
+        };
+        if height == 0 {
+            return Err("Layer.imageHeight: Cannot create empty layer image".to_string());
+        }
+        if !scene.set_layer_image_size(id, image_width, height) {
+            return Err("Layer.imageHeight: could not resize the layer image".to_string());
+        }
+        Ok(())
+    }) {
+        Ok(()) => 0,
+        Err(error) => report_error(out_error, &error),
+    }
+}
 layer_blur_off_prop!(
     layer_focusable_get,
     layer_focusable_set,
@@ -2095,6 +2281,76 @@ extern "C" fn layer_cursor_y_get(
         }
         Err(error) => report_error(out_error, &error),
     }
+}
+
+/// `layer.cursorX = x` — the reference `SetCursorX` stores `CursorX_Work` for
+/// the next `SetCursorY` (`reference/cpp/core/visual/LayerIntf.cpp:3108-3112`).
+extern "C" fn layer_cursor_x_set(
+    _engine: *mut c_void,
+    instance: *mut c_void,
+    value: *const Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: the trampoline passes a valid value slot.
+    let x = value_as_i64(unsafe { &*value }) as i32;
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_cursor_x_set`.
+    let inst = unsafe { &mut *(instance as *mut LayerInst) };
+    inst.cursor_x_work = x;
+    0
+}
+
+/// `layer.cursorY = y` — the reference `SetCursorY` warps the pointer to the
+/// pending `cursorX` and `y`, adding this layer's and every *parented*
+/// ancestor's rect offset and stopping before the parentless root
+/// (`reference/cpp/core/visual/LayerIntf.cpp:3132-3145`).
+extern "C" fn layer_cursor_y_set(
+    engine: *mut c_void,
+    instance: *mut c_void,
+    value: *const Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    // SAFETY: the trampoline passes a valid value slot.
+    let y = value_as_i64(unsafe { &*value }) as i32;
+    let Ok((_resolved, ctx)) = bound(engine) else {
+        return report_error(out_error, "Layer.cursorY: compat context is not bound");
+    };
+    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_cursor_y_set`.
+    let inst = unsafe { &*(instance as *const LayerInst) };
+    let Some(id) = inst.id else {
+        return report_error(out_error, "Layer.cursorY: this layer is not constructed");
+    };
+    let x = inst.cursor_x_work;
+    let (x, y) = {
+        let scene = match scene_ref(&ctx) {
+            Ok(scene) => scene,
+            Err(error) => return report_error(out_error, &error),
+        };
+        let mut x = x;
+        let mut y = y;
+        let mut current = Some(id);
+        while let Some(layer_id) = current {
+            let Some(layer) = scene.layer(layer_id) else {
+                break;
+            };
+            // The reference adds `p->Rect` only when `p->Parent` exists and
+            // stops before the root (`LayerIntf.cpp:3154-3160`).
+            let Some(parent) = layer.parent else {
+                break;
+            };
+            x = x.wrapping_add(layer.rect.x);
+            y = y.wrapping_add(layer.rect.y);
+            current = Some(parent);
+        }
+        (x, y)
+    };
+    let input = match util::input_mut(&ctx) {
+        Ok(input) => input,
+        Err(error) => return report_error(out_error, &format!("Layer.cursorY: {error}")),
+    };
+    input.warp_pointer(x as f32, y as f32);
+    0
 }
 
 /// `layer.opacity` (0..255 scale, reference `GetOpacity`/`SetOpacity`).
@@ -2775,56 +3031,6 @@ fn boxed_font_object(
     0
 }
 
-/// `layer.font = font` — copy the source Font's state into the layer's font.
-extern "C" fn layer_font_set(
-    engine: *mut c_void,
-    instance: *mut c_void,
-    value: *const Value,
-    out_error: *mut *mut c_char,
-    _objthis: *mut c_void,
-) -> c_int {
-    let Ok((resolved, ctx)) = bound(engine) else {
-        return report_error(out_error, "Layer.font: compat context is not bound");
-    };
-    // SAFETY: `value` is the valid `Value` the C++ trampoline passes to this callback.
-    let source_id = match resolve_object_id(resolved.engine(), unsafe { &*value }, &["Font"]) {
-        Ok(id) if id >= 0 => id as u32,
-        Ok(_) => return report_error(out_error, "Layer.font: the value is not a Font"),
-        Err(error) => return report_error(out_error, &format!("Layer.font: {error}")),
-    };
-    // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_font_set`.
-    let inst = unsafe { &*(instance as *const LayerInst) };
-    let Some(layer_id) = inst.id else {
-        return report_error(out_error, "Layer.font: this layer is not constructed");
-    };
-    let scene = match scene_mut(&ctx) {
-        Ok(scene) => scene,
-        Err(error) => return report_error(out_error, &error),
-    };
-    let Some(source) = scene.font(source_id).cloned() else {
-        return 0;
-    };
-    let destination = match scene
-        .layer(layer_id)
-        .and_then(|layer| layer.font_id)
-        .filter(|id| scene.font(*id).is_some())
-    {
-        Some(id) => id,
-        None => {
-            let id = scene.add_font(source.face.clone(), source.height, source.color);
-            if let Some(layer) = scene.layer_mut(layer_id) {
-                layer.font_id = Some(id);
-            }
-            id
-        }
-    };
-    if let Some(font) = scene.fonts.iter_mut().find(|font| font.id == destination) {
-        *font = source;
-        font.id = destination;
-    }
-    0
-}
-
 pub(super) fn register_layer_class(ctx: &mut CompatCtx) -> Result<(), CompatError> {
     let mut methods = vec![
         NativeInstanceMethodDef {
@@ -2911,7 +3117,7 @@ pub(super) fn register_layer_class(ctx: &mut CompatCtx) -> Result<(), CompatErro
             NativeInstancePropertyDef {
                 name: "font",
                 get: Some(layer_font_get),
-                set: Some(layer_font_set),
+                set: None,
             },
             NativeInstancePropertyDef {
                 name: "visible",
@@ -3011,12 +3217,12 @@ pub(super) fn register_layer_class(ctx: &mut CompatCtx) -> Result<(), CompatErro
             NativeInstancePropertyDef {
                 name: "cursorX",
                 get: Some(layer_cursor_x_get),
-                set: None,
+                set: Some(layer_cursor_x_set),
             },
             NativeInstancePropertyDef {
                 name: "cursorY",
                 get: Some(layer_cursor_y_get),
-                set: None,
+                set: Some(layer_cursor_y_set),
             },
             NativeInstancePropertyDef {
                 name: "face",
@@ -3041,12 +3247,12 @@ pub(super) fn register_layer_class(ctx: &mut CompatCtx) -> Result<(), CompatErro
             NativeInstancePropertyDef {
                 name: "imageWidth",
                 get: Some(layer_image_width_get),
-                set: None,
+                set: Some(layer_image_width_set),
             },
             NativeInstancePropertyDef {
                 name: "imageHeight",
                 get: Some(layer_image_height_get),
-                set: None,
+                set: Some(layer_image_height_set),
             },
             NativeInstancePropertyDef {
                 name: "window",

@@ -68,6 +68,7 @@ use tjs::{
 };
 
 use crate::native_util::{args, report_error, set_bool, set_int, set_void, value_as_string};
+use crate::natives::storages::strip_file_media;
 use crate::natives::system::{EngineBinding, resolve, set_string_out, value_as_bool, value_as_i64};
 use crate::{CompatCtx, CompatError};
 
@@ -152,21 +153,24 @@ fn normalize_name(name: &str) -> String {
 /// `reference/cpp/core/base/MsgIntfInc.h:35`,
 /// `reference/cpp/core/base/StorageIntf.cpp:546-550`).
 fn local_path(storage: &Storage, name: &str) -> Result<PathBuf, String> {
-    // `TVPGetLocallyAccessibleName` returns an empty name for any name that
-    // carries the archive delimiter (`reference/cpp/core/base/StorageIntf.cpp:
-    // 554-559`), so `TVPGetLocalName` raises for it.
-    if name.contains('>') {
-        return Err(format!("Cannot get local name from {name}"));
-    }
-    match storage.find(name) {
+    // A file that resolves through the disk namespace (including an auto path)
+    // keeps its resolved real-case path; `Storage::find` already applies the
+    // case-insensitive walk. A directory (or a name that does not exist) is not
+    // a `find` hit, so it is case-corrected through
+    // `Storage::local_name` — the reference `TVPGetLocalName`
+    // (`reference/cpp/core/base/impl/StorageImpl.cpp:339-407`). The `file://`
+    // media syntax is L3; the L2 namespace sees the bare name.
+    let lookup = strip_file_media(name);
+    match storage.find(lookup) {
         Ok(Some(Location::Disk(path))) => Ok(path),
+        // An in-archive name has no locally accessible form and raises
+        // (`reference/cpp/core/base/StorageIntf.cpp:546-550`).
         Ok(Some(Location::Archive(_, _))) => Err(format!("Cannot get local name from {name}")),
-        Ok(None) => {
-            let relative = storage
-                .relative_disk_name(name)
-                .ok_or_else(|| format!("Cannot get local name from {name}"))?;
-            Ok(storage.game_dir().join(relative))
-        }
+        Ok(None) => match storage.local_name(lookup) {
+            Ok(Some(path)) => Ok(path),
+            Ok(None) => Err(format!("Cannot get local name from {name}")),
+            Err(error) => Err(error.to_string()),
+        },
         Err(error) => Err(error.to_string()),
     }
 }
@@ -174,7 +178,8 @@ fn local_path(storage: &Storage, name: &str) -> Result<PathBuf, String> {
 /// The reference `TVPGetPlacedPath`: a disk path only when the name resolves
 /// to an existing disk file (archive and placer-only names yield `None`).
 fn placed_local(storage: &Storage, name: &str) -> Option<PathBuf> {
-    match storage.find(name) {
+    // The `file://` media syntax is L3; the L2 namespace sees the bare name.
+    match storage.find(strip_file_media(name)) {
         Ok(Some(Location::Disk(path))) => Some(path),
         Ok(Some(Location::Archive(..))) | Ok(None) | Err(_) => None,
     }
@@ -188,7 +193,7 @@ fn normalized_local(storage: &Storage, name: &str) -> Option<PathBuf> {
     if name.contains(TVP_ARCHIVE_DELIMITER) {
         return None;
     }
-    let normalized = normalize_name(name);
+    let normalized = normalize_name(strip_file_media(name));
     storage
         .relative_disk_name(&normalized)
         .map(|relative| storage.game_dir().join(relative))
@@ -198,7 +203,7 @@ fn normalized_local(storage: &Storage, name: &str) -> Option<PathBuf> {
 /// (`copyFileNoNormalize` semantics).
 fn raw_local(storage: &Storage, name: &str) -> Option<PathBuf> {
     storage
-        .relative_disk_name(name)
+        .relative_disk_name(strip_file_media(name))
         .map(|relative| storage.game_dir().join(relative))
 }
 
@@ -495,10 +500,12 @@ extern "C" fn storages_fstat(
         return report_error(out_error, "Storages.fstat requires 1 argument");
     };
     let name = value_as_string(name);
+    // The media prefix is L3 syntax; the L2 namespace resolves the bare name.
+    let lookup = strip_file_media(&name);
 
-    match storage.find(&name) {
+    match storage.find(lookup) {
         Ok(Some(Location::Archive(..))) => {
-            let size = match storage.stat(&name) {
+            let size = match storage.stat(lookup) {
                 Ok(Some(meta)) => meta.size,
                 Ok(None) => {
                     return report_error(
@@ -760,7 +767,7 @@ extern "C" fn storages_export_file(
     }
     let source = value_as_string(&argv[0]);
     let dest = value_as_string(&argv[1]);
-    let bytes = match storage.read(&source) {
+    let bytes = match storage.read(strip_file_media(&source)) {
         Ok(bytes) => bytes,
         Err(error) => {
             return report_error(
@@ -1508,13 +1515,15 @@ extern "C" fn storages_is_existent_storage_no_search_no_normalize(
         );
     };
     let name = value_as_string(name);
+    // The media prefix is L3 syntax; the L2 namespace resolves the bare name.
+    let name = strip_file_media(&name);
     let exists = if name.contains('>') {
-        matches!(storage.find(&name), Ok(Some(_)))
+        matches!(storage.find(name), Ok(Some(_)))
     } else {
-        let candidate = if Path::new(&name).is_absolute() {
-            PathBuf::from(&name)
+        let candidate = if Path::new(name).is_absolute() {
+            PathBuf::from(name)
         } else {
-            storage.game_dir().join(&name)
+            storage.game_dir().join(name)
         };
         fs::exists(&host_file_system(), &FsPath::host(&candidate))
     };
@@ -1583,7 +1592,7 @@ extern "C" fn storages_get_md5_hash_string(
         return report_error(out_error, "Storages.getMD5HashString requires 1 argument");
     };
     let name = value_as_string(name);
-    let bytes = match storage.read(&name) {
+    let bytes = match storage.read(strip_file_media(&name)) {
         Ok(bytes) => bytes,
         Err(error) => {
             return report_error(

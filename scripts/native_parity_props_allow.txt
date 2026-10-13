@@ -1,0 +1,9 @@
+# Native parity allowlist: accepted property getter/setter mismatches.
+# One entry per line: Class.property [— reason]
+# An entry records a reference property whose Rust accessors differ.
+# A reason beginning with 'debt:' records a known divergence that is
+# accepted but still visible.
+# Regenerate after intentional additions with:
+#   python3 scripts/native_parity.py --update-props-allow
+# The checker fails when a mismatch is not listed here.
+

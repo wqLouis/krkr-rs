@@ -1,0 +1,16 @@
+{
+  "reference": {
+    "PropWidget.readWrite": [true, true],
+    "PropWidget.readOnly": [true, false]
+  },
+  "good_missing": {},
+  "good_extra": {},
+  "bad_missing": {
+    "PropWidget.readWrite": "reference get=yes set=yes; rust get=yes set=no"
+  },
+  "bad_extra": {},
+  "extra_missing": {},
+  "extra_extra": {
+    "PropWidget.readOnly": "reference get=yes set=no; rust get=yes set=yes"
+  }
+}

@@ -26,21 +26,31 @@ How it works (short version)
   ``name: "X"`` matches is scanned for ``name: "member"`` entries,
   ``method("member", ...)`` / ``property("member", ...)`` shorthands,
   referenced stub arrays (``noop_stubs``) and referenced helper functions
-  (``system_properties()``).
+  (``system_properties()``).  Every ``Native*PropertyDef`` literal also
+  records its ``get``/``set`` presence.
 * Missing = reference - rust, extra = rust - reference.  Coverage is
   ``matched / reference``.
+* Accessor parity: a reference property declared with
+  ``TJS_BEGIN_NATIVE_PROP_DECL`` must expose the same accessors in Rust.  A
+  reference-readable property whose Rust def has no ``get``, or a
+  reference-writable one whose def has no ``set``, fails the check (the
+  ``Layer.imageWidth`` shape); a Rust accessor the reference denies is
+  reported as *extra* and fails the same way.
 
 Ratchet
 -------
 ``scripts/native_parity_allow.txt`` lists the currently accepted missing
-members (one ``Class.member`` per line).  The checker fails when a *new*
-missing member appears.  When an allowlisted member becomes implemented it is
-reported as stale so the list can shrink.
+members (one ``Class.member`` per line);
+``scripts/native_parity_props_allow.txt`` lists the currently accepted
+accessor mismatches (one ``Class.property`` per line).  The checker fails when
+a *new* one appears, and reports an allowlisted entry that no longer applies
+as stale so the list can shrink.
 
 Usage
 -----
     python3 scripts/native_parity.py                 # check + regenerate report
-    python3 scripts/native_parity.py --update-allow  # refresh the allowlist
+    python3 scripts/native_parity.py --update-allow  # refresh the member allowlist
+    python3 scripts/native_parity.py --update-props-allow  # refresh the accessor allowlist
     python3 scripts/native_parity.py --no-doc        # skip docs/native_parity.md
     python3 scripts/native_parity.py --quiet         # only print failures
     python3 scripts/native_parity.py --self-test     # extractor fixture self-test
@@ -66,6 +76,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 REFERENCE_GLOB = "reference/cpp/core/**/*.cpp"
 ALLOWLIST_PATH = REPO_ROOT / "scripts" / "native_parity_allow.txt"
+PROPS_ALLOWLIST_PATH = REPO_ROOT / "scripts" / "native_parity_props_allow.txt"
 DOC_PATH = REPO_ROOT / "docs" / "native_parity.md"
 FIXTURES_DIR = REPO_ROOT / "scripts" / "parity_fixtures"
 
@@ -228,11 +239,19 @@ class MemberInfo:
     a property object, and the two are not distinguishable from the call site).
     ``static`` is true for a class-object member; ``mechanism`` names the source
     construct so the report can show where a member came from.
+
+    ``get``/``set`` record the accessor halves of a ``TJS_BEGIN_NATIVE_PROP_DECL``
+    property: whether its block contains ``TJS_BEGIN_NATIVE_PROP_GETTER`` /
+    ``TJS_BEGIN_NATIVE_PROP_SETTER``.  They stay ``None`` for methods and for
+    mechanisms (``PropSet``, constructor) whose accessors the source does not
+    express.
     """
 
     kind: str = "unknown"
     static: bool = False
     mechanism: str = "unknown"
+    get: "bool | None" = None
+    set: "bool | None" = None
 
 
 # Registration mechanisms, in descending order of how much they reveal.  A
@@ -260,6 +279,15 @@ _CPP_FUNC_RE = re.compile(r"TVPCreateNativeClass_(\w+)\s*\([^)]*\)\s*\{")
 _CPP_MEMBER_RE = re.compile(
     r"TJS_BEGIN_NATIVE_(STATIC_)?(METHOD|PROP)_DECL\s*\(\s*([A-Za-z_]\w*)\s*\)"
 )
+_CPP_PROP_BEGIN_RE = re.compile(
+    r"TJS_BEGIN_NATIVE_(STATIC_)?PROP_DECL\s*\(\s*([A-Za-z_]\w*)\s*\)"
+)
+# A property block closes with one of four DECL spellings; the getter/setter
+# blocks inside it close with ``TJS_END_NATIVE_PROP_GETTER`` / ``_SETTER`` and
+# must not end the property.
+_CPP_PROP_END_RE = re.compile(r"TJS_END_NATIVE_(?:STATIC_)?PROP_DECL(?:_OUTER)?")
+_CPP_PROP_GETTER_RE = re.compile(r"TJS_BEGIN_NATIVE_PROP_GETTER")
+_CPP_PROP_SETTER_RE = re.compile(r"TJS_BEGIN_NATIVE_PROP_SETTER")
 _CPP_CTOR_END_RE = re.compile(
     r"TJS_END_NATIVE_(?:STATIC_)?CONSTRUCTOR_DECL\s*\(\s*([A-Za-z_]\w*)\s*\)"
 )
@@ -496,6 +524,25 @@ def _set_member(
         existing[name] = info
 
 
+def collect_prop_accessors(src: str) -> dict[int, tuple[bool, bool]]:
+    """Accessor presence for each ``TJS_BEGIN_NATIVE_PROP_DECL`` in ``src``.
+
+    Keyed by the offset of the ``TJS_BEGIN_NATIVE_PROP_DECL`` so the member
+    loop can attach the pair to the property it just recorded.  A read-only
+    property ends its setter with ``TJS_DENY_NATIVE_PROP_SETTER`` (which is not
+    a ``TJS_BEGIN_NATIVE_PROP_SETTER``), so its ``set`` half is false.
+    """
+    out: dict[int, tuple[bool, bool]] = {}
+    for m in _CPP_PROP_BEGIN_RE.finditer(src):
+        end = _CPP_PROP_END_RE.search(src, m.end())
+        body = src[m.end() : end.start()] if end else src[m.end() :]
+        out[m.start()] = (
+            bool(_CPP_PROP_GETTER_RE.search(body)),
+            bool(_CPP_PROP_SETTER_RE.search(body)),
+        )
+    return out
+
+
 def parse_cpp_source_surface(
     src: str,
 ) -> tuple[dict[str, dict[str, MemberInfo]], list[str]]:
@@ -534,6 +581,9 @@ def parse_cpp_source_surface(
             return None
         return min(containing, key=lambda s: s[1] - s[0])[2]
 
+    # Accessor halves per property declaration, keyed by declaration offset.
+    prop_accessors = collect_prop_accessors(src)
+
     # Attribute every member declaration to the innermost containing span.
     for m in _CPP_MEMBER_RE.finditer(src):
         name = m.group(3)
@@ -543,11 +593,17 @@ def parse_cpp_source_surface(
         if cls is None:
             continue
         kind = "method" if m.group(2) == "METHOD" else "property"
+        get: "bool | None" = None
+        set_: "bool | None" = None
+        if kind == "property":
+            pair = prop_accessors.get(m.start())
+            if pair is not None:
+                get, set_ = pair
         _set_member(
             surface,
             cls,
             name,
-            MemberInfo(kind, m.group(1) is not None, "native-macro"),
+            MemberInfo(kind, m.group(1) is not None, "native-macro", get, set_),
         )
 
     # Constructor registrations expose a member named after the class.
@@ -821,6 +877,103 @@ def _match_bracket(src: str, open_pos: int) -> int:
     return n
 
 
+_RUST_PROP_DEF_RE = re.compile(r"\bNative(?:Instance|ObjThis)?PropertyDef\s*\{")
+_RUST_PROP_NAME_RE = re.compile(r"\bname\s*:")
+_RUST_PROP_GET_RE = re.compile(r"\bget\s*:\s*(Some\b|None\b)")
+_RUST_PROP_SET_RE = re.compile(r"\bset\s*:\s*(Some\b|None\b)")
+
+
+def _extract_prop_accessors(
+    code: str,
+    strings: dict[int, tuple[int, str, int]],
+    start: int,
+    end: int,
+    skip: "list[tuple[int, int]] | None" = None,
+    unrecoverable: "list[str] | None" = None,
+) -> "dict[str, tuple[bool | None, bool | None]]":
+    """The ``get``/``set`` presence of every property def literal in the range.
+
+    A literal ``Native*PropertyDef { name: "x", get: Some(..), set: None }``
+    yields ``{"x": (True, False)}``.  A def whose ``name`` is not a string
+    literal, or whose ``get``/``set`` field is not a static ``Some``/``None``,
+    is recorded as unrecoverable (when a list is supplied) rather than guessed.
+    ``skip`` ranges are ``macro_rules!`` bodies, whose defs are templates with
+    ``$``-names, not registrations.
+    """
+    out: "dict[str, tuple[bool | None, bool | None]]" = {}
+    skip = skip or []
+    for m in _RUST_PROP_DEF_RE.finditer(code, start, end):
+        if any(s <= m.start() < e for s, e in skip):
+            continue
+        open_pos = code.index("{", m.end() - 1)
+        close = _match_brace(code, open_pos)
+        if close > end:
+            close = end
+        body = code[open_pos:close]
+        nm = _RUST_PROP_NAME_RE.search(body)
+        name = None
+        if nm:
+            after = open_pos + nm.end()
+            candidates = [off for off in strings if after <= off < close]
+            if candidates:
+                name = strings[min(candidates)][1]
+        if name is None:
+            if unrecoverable is not None:
+                unrecoverable.append(
+                    f"property def at offset {m.start()} has no literal name"
+                )
+            continue
+        gm = _RUST_PROP_GET_RE.search(body)
+        sm = _RUST_PROP_SET_RE.search(body)
+        get = (gm.group(1) == "Some") if gm else None
+        set_ = (sm.group(1) == "Some") if sm else None
+        if (get is None or set_ is None) and unrecoverable is not None:
+            unrecoverable.append(
+                f"property {name!r} has no static get/set "
+                f"(get={gm.group(1) if gm else '?'}, "
+                f"set={sm.group(1) if sm else '?'})"
+            )
+        out[name] = (get, set_)
+    return out
+
+
+def _macro_rule_ranges(code: str) -> list[tuple[int, int]]:
+    """``macro_rules! NAME { ... }`` spans.
+
+    Their ``Native*PropertyDef`` are templates with ``$``-names, not
+    registrations, so accessor extraction skips them.
+    """
+    ranges: list[tuple[int, int]] = []
+    for m in re.finditer(r"macro_rules!\s*[A-Za-z_]\w*\s*\{", code):
+        open_pos = code.index("{", m.start())
+        ranges.append((m.start(), _match_brace(code, open_pos)))
+    return ranges
+
+
+def _variable_range(code: str, var: str) -> "tuple[int, int] | None":
+    """The ``[ ... ]`` / ``vec![ ... ]`` range of ``let [mut] var = ...``."""
+    m = re.search(r"\blet\s+(?:mut\s+)?" + re.escape(var) + r"\b[^=;]*=", code)
+    if not m:
+        return None
+    rhs = m.end()
+    bracket = code.find("[", rhs)
+    if bracket == -1:
+        return None
+    # Ignore a '[' that belongs to a generic/attribute before the value.
+    return bracket, _match_bracket(code, bracket)
+
+
+def _function_range(code: str, fn: str) -> "tuple[int, int] | None":
+    """The ``{ ... }`` body range of ``fn name( ... )``."""
+    m = re.search(r"\bfn\s+" + re.escape(fn) + r"\s*\(", code)
+    if not m:
+        return None
+    open_pos = code.find("{", m.end())
+    if open_pos == -1:
+        return None
+    return open_pos, _match_brace(code, open_pos)
+
+
 def _resolve_expr(
     code: str,
     strings: dict[int, tuple[int, str, int]],
@@ -838,32 +991,48 @@ def _resolve_variable(
     code: str, strings: dict[int, tuple[int, str, int]], var: str
 ) -> set[str]:
     """Resolve ``let [mut] var ... = [...]`` / ``= vec![...]``."""
-    m = re.search(
-        r"\blet\s+(?:mut\s+)?" + re.escape(var) + r"\b[^=;]*=", code
-    )
-    if not m:
+    rng = _variable_range(code, var)
+    if rng is None:
         return set()
-    rhs = m.end()
-    bracket = code.find("[", rhs)
-    if bracket == -1:
-        return set()
-    # Ignore a '[' that belongs to a generic/attribute before the value.
-    end = _match_bracket(code, bracket)
-    return _resolve_expr(code, strings, bracket, end)
+    return _resolve_expr(code, strings, rng[0], rng[1])
+
+
+def _resolve_variable_accessors(
+    code: str,
+    strings: dict[int, tuple[int, str, int]],
+    var: str,
+    skip: "list[tuple[int, int]]",
+    unrecoverable: "list[str]",
+) -> "dict[str, tuple[bool | None, bool | None]]":
+    """Accessors of the def literals in a ``let [mut] var = [...]`` value."""
+    rng = _variable_range(code, var)
+    if rng is None:
+        return {}
+    return _extract_prop_accessors(code, strings, rng[0], rng[1], skip, unrecoverable)
 
 
 def _resolve_function(
     code: str, strings: dict[int, tuple[int, str, int]], fn: str
 ) -> set[str]:
     """Resolve a helper returning a member vector (e.g. system_properties())."""
-    m = re.search(r"\bfn\s+" + re.escape(fn) + r"\s*\(", code)
-    if not m:
+    rng = _function_range(code, fn)
+    if rng is None:
         return set()
-    open_pos = code.find("{", m.end())
-    if open_pos == -1:
-        return set()
-    end = _match_brace(code, open_pos)
-    return _extract_members(code, strings, open_pos, end)
+    return _extract_members(code, strings, rng[0], rng[1])
+
+
+def _resolve_function_accessors(
+    code: str,
+    strings: dict[int, tuple[int, str, int]],
+    fn: str,
+    skip: "list[tuple[int, int]]",
+    unrecoverable: "list[str]",
+) -> "dict[str, tuple[bool | None, bool | None]]":
+    """Accessors of the def literals in a helper ``fn`` returning a def vector."""
+    rng = _function_range(code, fn)
+    if rng is None:
+        return {}
+    return _extract_prop_accessors(code, strings, rng[0], rng[1], skip, unrecoverable)
 
 
 def _const_strings(code: str, strings: dict[int, tuple[int, str, int]]) -> dict[str, str]:
@@ -920,6 +1089,21 @@ def _builder_spans(
     return spans
 
 
+def _def_function_ranges(code: str) -> list[tuple[int, int]]:
+    """Body ranges of ``fn ...() -> Vec<Native*MethodDef/PropertyDef>``."""
+    ranges: list[tuple[int, int]] = []
+    for m in re.finditer(
+        r"fn\s+[A-Za-z_]\w*\s*\([^)]*\)\s*->\s*[^{;]*"
+        r"Native(?:Instance|Static)?(?:Method|Property)Def",
+        code,
+    ):
+        open_pos = code.find("{", m.end())
+        if open_pos == -1:
+            continue
+        ranges.append((open_pos, _match_brace(code, open_pos)))
+    return ranges
+
+
 def _def_function_members(
     code: str,
     strings: dict[int, tuple[int, str, int]],
@@ -932,32 +1116,50 @@ def _def_function_members(
     into submodules (``visual/layer/pixels.rs`` etc.) is still attributed.
     """
     members: set[str] = set()
-    for m in re.finditer(
-        r"fn\s+[A-Za-z_]\w*\s*\([^)]*\)\s*->\s*[^{;]*"
-        r"Native(?:Instance|Static)?(?:Method|Property)Def",
-        code,
-    ):
-        open_pos = code.find("{", m.end())
-        if open_pos == -1:
-            continue
-        end = _match_brace(code, open_pos)
+    for open_pos, end in _def_function_ranges(code):
         members |= _extract_members(code, strings, open_pos, end)
         for lit in re.finditer(r'\b[A-Za-z_]\w*\s*\(\s*"([^"]+)"', raw[open_pos:end]):
             members.add(lit.group(1))
     return members
 
 
-def parse_rust_file(path: Path) -> dict[str, set[str]]:
-    """Return ``{builder_class_name: {member, ...}}`` for one Rust file.
+def _def_function_accessors(
+    code: str,
+    strings: dict[int, tuple[int, str, int]],
+    skip: "list[tuple[int, int]]",
+    unrecoverable: "list[str]",
+) -> "dict[str, tuple[bool | None, bool | None]]":
+    """Accessors declared by ``fn ...() -> Vec<Native*PropertyDef>`` helpers."""
+    accessors: "dict[str, tuple[bool | None, bool | None]]" = {}
+    for open_pos, end in _def_function_ranges(code):
+        accessors.update(
+            _extract_prop_accessors(code, strings, open_pos, end, skip, unrecoverable)
+        )
+    return accessors
 
-    A file that does not exist yet (a native family not started) contributes
-    no members rather than failing: the coverage report then shows it as
-    unimplemented, which is the point.
+
+def parse_rust_file(
+    path: Path,
+) -> tuple[
+    dict[str, set[str]],
+    dict[str, dict[str, tuple[bool | None, bool | None]]],
+    list[str],
+]:
+    """Parse one Rust file into members, property accessors and unrecoverable sites.
+
+    Returns ``(members, accessors, unrecoverable)`` where ``members`` is
+    ``{builder_class_name: {member, ...}}`` and ``accessors`` is
+    ``{builder_class_name: {property: (get, set)}}`` for the
+    ``Native*PropertyDef`` literals.  A file that does not exist yet (a native
+    family not started) contributes no members rather than failing: the
+    coverage report then shows it as unimplemented, which is the point.
     """
     if not path.is_file():
-        return {}
+        return {}, {}, []
     raw = path.read_text(encoding="utf-8", errors="replace")
     code, strings = _lex_rust(raw)
+    macro_spans = _macro_rule_ranges(code)
+    unrecoverable: list[str] = []
 
     # Stub arrays appended to a list, e.g. `methods.extend(noop_stubs.into_iter()`
     # in layer.rs.  Keyed by the receiver so the members only attach to the
@@ -971,6 +1173,7 @@ def parse_rust_file(path: Path) -> dict[str, set[str]]:
         extends.setdefault(m.group(1), set()).add(m.group(2))
 
     result: dict[str, set[str]] = {}
+    accessors: dict[str, dict[str, tuple[bool | None, bool | None]]] = {}
     for start, end, cls, name_lit in _builder_spans(code, strings, raw):
         members = _extract_members(
             code,
@@ -978,6 +1181,9 @@ def parse_rust_file(path: Path) -> dict[str, set[str]]:
             start,
             end,
             exclude={name_lit} if name_lit is not None else set(),
+        )
+        props = _extract_prop_accessors(
+            code, strings, start, end, macro_spans, unrecoverable
         )
         builder = code[start:end]
 
@@ -1005,16 +1211,30 @@ def parse_rust_file(path: Path) -> dict[str, set[str]]:
         for kind, ident in refs:
             if kind == "fn":
                 members |= _resolve_function(code, strings, ident)
+                props.update(
+                    _resolve_function_accessors(
+                        code, strings, ident, macro_spans, unrecoverable
+                    )
+                )
             else:
                 members |= _resolve_variable(code, strings, ident)
+                props.update(
+                    _resolve_variable_accessors(
+                        code, strings, ident, macro_spans, unrecoverable
+                    )
+                )
 
         result.setdefault(cls, set()).update(members)
+        accessors.setdefault(cls, {}).update(props)
 
     # Helper functions returning a def vector (`fn method_defs() -> Vec<..>`),
     # collected under ``__defs__`` so a class mapped with ``builder=None``
     # unions them (used when a class is split across files).
     result.setdefault("__defs__", set()).update(
         _def_function_members(code, strings, raw)
+    )
+    accessors.setdefault("__defs__", {}).update(
+        _def_function_accessors(code, strings, macro_spans, unrecoverable)
     )
 
     # Builder factory whose class name is a parameter, e.g.
@@ -1031,12 +1251,16 @@ def parse_rust_file(path: Path) -> dict[str, set[str]]:
             continue
         end = _match_brace(code, open_pos)
         bmembers = _extract_members(code, strings, open_pos, end)
+        bprops = _extract_prop_accessors(
+            code, strings, open_pos, end, macro_spans, unrecoverable
+        )
         for call in re.finditer(
             r"\b" + re.escape(fname) + r"\s*\(\s*\"([^\"]+)\"", raw
         ):
             result.setdefault(call.group(1), set()).update(bmembers)
+            accessors.setdefault(call.group(1), {}).update(bprops)
 
-    return result
+    return result, accessors, unrecoverable
 
 
 _RUNTIME_ATTACH_RE = re.compile(
@@ -1076,22 +1300,43 @@ def parse_runtime_class_attachments() -> dict[str, set[str]]:
     return out
 
 
-def parse_rust() -> tuple[dict[str, set[str]], dict[str, list[str]]]:
+def parse_rust() -> tuple[
+    dict[str, set[str]],
+    dict[str, dict[str, tuple[bool | None, bool | None]]],
+    dict[str, list[str]],
+    list[str],
+]:
     """Parse all mapped Rust files.
 
-    Returns ``(class_members, class_sources)``.
+    Returns ``(class_members, class_accessors, class_sources, unrecoverable)``.
     """
-    cache: dict[str, dict[str, set[str]]] = {}
+    cache: dict[
+        str,
+        tuple[
+            dict[str, set[str]],
+            dict[str, dict[str, tuple[bool | None, bool | None]]],
+            list[str],
+        ],
+    ] = {}
     class_members: dict[str, set[str]] = {}
+    class_accessors: dict[str, dict[str, tuple[bool | None, bool | None]]] = {}
     class_sources: dict[str, list[str]] = {}
+    rust_unrecoverable: list[str] = []
 
-    def get_file(rel: str) -> dict[str, set[str]]:
+    def get_file(
+        rel: str,
+    ) -> tuple[
+        dict[str, set[str]],
+        dict[str, dict[str, tuple[bool | None, bool | None]]],
+        list[str],
+    ]:
         if rel not in cache:
             cache[rel] = parse_rust_file(REPO_ROOT / rel)
         return cache[rel]
 
     for cls, specs in {**RUST_CLASS_MAP, **RUST_ONLY_CLASS_MAP}.items():
         members: set[str] = set()
+        accessors: dict[str, tuple[bool | None, bool | None]] = {}
         sources: list[str] = []
         existing = [rel for rel, _ in specs if (REPO_ROOT / rel).is_file()]
         if not existing:
@@ -1101,14 +1346,19 @@ def parse_rust() -> tuple[dict[str, set[str]], dict[str, list[str]]]:
                 "renamed/moved; update RUST_CLASS_MAP."
             )
         for rel, builder in specs:
-            parsed = get_file(rel)
+            parsed, parsed_accessors, parsed_unrecoverable = get_file(rel)
+            rust_unrecoverable.extend(parsed_unrecoverable)
             sources.append(rel + (f"#{builder}" if builder else ""))
             if builder is None:
                 for _, mset in parsed.items():
                     members |= mset
+                for _, props in parsed_accessors.items():
+                    accessors.update(props)
             else:
                 members |= parsed.get(builder, set())
+                accessors.update(parsed_accessors.get(builder, {}))
         class_members[cls] = members
+        class_accessors[cls] = accessors
         class_sources[cls] = sources
 
     for cls, members in parse_runtime_class_attachments().items():
@@ -1118,7 +1368,60 @@ def parse_rust() -> tuple[dict[str, set[str]], dict[str, list[str]]]:
             class_sources.setdefault(cls, [])
             if note not in class_sources[cls]:
                 class_sources[cls].append(note)
-    return class_members, class_sources
+    return class_members, class_accessors, class_sources, rust_unrecoverable
+
+
+def _yesno(value: "bool | None") -> str:
+    return "yes" if value else "no"
+
+
+def accessor_mismatches(
+    ref_surface: "dict[str, dict[str, MemberInfo]]",
+    ref_members: "dict[str, set[str]]",
+    rust_members: "dict[str, set[str]]",
+    rust_accessors: "dict[str, dict[str, tuple[bool | None, bool | None]]]",
+    classes: "list[str] | None" = None,
+) -> tuple["OrderedDict[str, str]", "OrderedDict[str, str]"]:
+    """Compare property accessors, returning ``(missing, extra)``.
+
+    ``missing`` is the failing set: a reference-readable property whose Rust
+    def has no ``get``, or a reference-writable property whose Rust def has no
+    ``set`` (the ``Layer.imageWidth`` shape).  ``extra`` is the reverse: Rust
+    exposes an accessor the reference denies.  Both are keyed
+    ``Class.property`` with a ``reference get=.. set=..; rust get=.. set=..``
+    description.
+
+    A property the reference installs through a mechanism that does not
+    express accessors (``PropSet``), or a Rust def whose accessors are not
+    statically readable, is skipped: the member diff and the unrecoverable
+    report cover those.
+    """
+    missing: "OrderedDict[str, str]" = OrderedDict()
+    extra: "OrderedDict[str, str]" = OrderedDict()
+    for cls in (classes if classes is not None else list(RUST_CLASS_MAP)):
+        names = rust_members.get(cls, set())
+        for name, info in ref_surface.get(cls, {}).items():
+            if info.kind != "property" or info.get is None or info.set is None:
+                continue
+            if name not in names:
+                continue
+            rust = rust_accessors.get(cls, {}).get(name)
+            if rust is None or rust[0] is None or rust[1] is None:
+                continue
+            ref_get, ref_set = bool(info.get), bool(info.set)
+            rust_get, rust_set = rust
+            if ref_get == rust_get and ref_set == rust_set:
+                continue
+            detail = (
+                f"reference get={_yesno(ref_get)} set={_yesno(ref_set)}; "
+                f"rust get={_yesno(rust_get)} set={_yesno(rust_set)}"
+            )
+            key = f"{cls}.{name}"
+            if (ref_get and not rust_get) or (ref_set and not rust_set):
+                missing[key] = detail
+            else:
+                extra[key] = detail
+    return missing, extra
 
 
 # ---------------------------------------------------------------------------
@@ -1156,19 +1459,36 @@ def read_allowlist_reasons(path: Path) -> "OrderedDict[str, str]":
     return entries
 
 
+MEMBER_ALLOW_HEADER = (
+    "# Native parity allowlist: reference members that are known-missing.\n"
+    "# One entry per line: Class.member [— reason]\n"
+    "# A reason beginning with 'debt:' records a known gap that is accepted\n"
+    "# but still visible; see docs/audits/propset-parity.md.\n"
+    "# Regenerate after intentional additions with:\n"
+    "#   python3 scripts/native_parity.py --update-allow\n"
+    "# The checker fails when a missing member is not listed here.\n"
+    "\n"
+)
+
+PROPS_ALLOW_HEADER = (
+    "# Native parity allowlist: accepted property getter/setter mismatches.\n"
+    "# One entry per line: Class.property [— reason]\n"
+    "# An entry records a reference property whose Rust accessors differ.\n"
+    "# A reason beginning with 'debt:' records a known divergence that is\n"
+    "# accepted but still visible.\n"
+    "# Regenerate after intentional additions with:\n"
+    "#   python3 scripts/native_parity.py --update-props-allow\n"
+    "# The checker fails when a mismatch is not listed here.\n"
+    "\n"
+)
+
+
 def write_allowlist(
-    path: Path, entries: set[str], reasons: "dict[str, str] | None" = None
+    path: Path,
+    entries: set[str],
+    reasons: "dict[str, str] | None" = None,
+    header: str = MEMBER_ALLOW_HEADER,
 ) -> None:
-    header = (
-        "# Native parity allowlist: reference members that are known-missing.\n"
-        "# One entry per line: Class.member [— reason]\n"
-        "# A reason beginning with 'debt:' records a known gap that is accepted\n"
-        "# but still visible; see docs/audits/propset-parity.md.\n"
-        "# Regenerate after intentional additions with:\n"
-        "#   python3 scripts/native_parity.py --update-allow\n"
-        "# The checker fails when a missing member is not listed here.\n"
-        "\n"
-    )
     reasons = reasons or {}
     lines = []
     for key in sorted(entries):
@@ -1187,9 +1507,13 @@ def build_report(
     extra_by_class: dict[str, set[str]],
     ref_surface: "dict[str, dict[str, MemberInfo]] | None" = None,
     unrecoverable: "list[str] | None" = None,
+    props_missing: "dict[str, str] | None" = None,
+    props_extra: "dict[str, str] | None" = None,
 ) -> str:
     ref_surface = ref_surface or {}
     unrecoverable = unrecoverable or []
+    props_missing = props_missing or {}
+    props_extra = props_extra or {}
     tracked = [c for c in RUST_CLASS_MAP if c in ref]
     total_ref = sum(len(ref.get(c, ())) for c in tracked)
     total_matched = sum(len(ref.get(c, set()) & rust.get(c, set())) for c in tracked)
@@ -1220,6 +1544,10 @@ def build_report(
     lines.append("python3 scripts/native_parity.py                 # check + regenerate this report")
     lines.append("python3 scripts/native_parity.py --no-doc        # check only")
     lines.append("python3 scripts/native_parity.py --update-allow  # accept current gaps after review")
+    lines.append(
+        "python3 scripts/native_parity.py --update-props-allow  "
+        "# accept accessor mismatches"
+    )
     lines.append("python3 scripts/native_parity.py --self-test     # extractor fixture self-test")
     lines.append("```")
     lines.append("")
@@ -1428,12 +1756,95 @@ def build_report(
         "surface."
     )
     lines.append("")
+
+    lines.append("## Property getter/setter parity")
+    lines.append("")
+    lines.append(
+        "A reference property declared with `TJS_BEGIN_NATIVE_PROP_DECL` must "
+        "expose the same accessors in Rust: a reference-readable property "
+        "needs a Rust `get`, and a reference-writable one a Rust `set`. The "
+        "reverse (a Rust accessor the reference denies) is listed as *extra* "
+        "and fails identically. `scripts/native_parity_props_allow.txt` "
+        "records accepted exceptions."
+    )
+    lines.append("")
+    lines.append(f"- missing accessors: {len(props_missing)}")
+    lines.append(f"- extra accessors: {len(props_extra)}")
+    lines.append("")
+    if props_missing or props_extra:
+        lines.append("| property | direction | reference | rust |")
+        lines.append("| --- | --- | --- | --- |")
+        for key, detail in props_missing.items():
+            ref_part, _, rust_part = detail.partition("; ")
+            lines.append(
+                f"| `{key}` | missing | {ref_part.removeprefix('reference ')} "
+                f"| {rust_part.removeprefix('rust ')} |"
+            )
+        for key, detail in props_extra.items():
+            ref_part, _, rust_part = detail.partition("; ")
+            lines.append(
+                f"| `{key}` | extra | {ref_part.removeprefix('reference ')} "
+                f"| {rust_part.removeprefix('rust ')} |"
+            )
+    else:
+        lines.append("_None._")
+    lines.append("")
     return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+
+
+def _accessor_self_test() -> list[str]:
+    """Fixture checks for the getter/setter rule (a match, a miss, an extra).
+
+    ``native_props.cpp`` declares ``readWrite`` (get+set) and ``readOnly``
+    (get only).  ``native_props_good.rs`` matches both,
+    ``native_props_bad.rs`` drops ``readWrite``'s setter, and
+    ``native_props_extra.rs`` adds a setter the reference denies for
+    ``readOnly``.  The rule must return nothing for the good fixture and
+    exactly the expected miss/extra for the other two.
+    """
+    ref_path = FIXTURES_DIR / "native_props.cpp"
+    good_path = FIXTURES_DIR / "native_props_good.rs"
+    bad_path = FIXTURES_DIR / "native_props_bad.rs"
+    extra_path = FIXTURES_DIR / "native_props_extra.rs"
+    expected_path = FIXTURES_DIR / "native_props.expected.json"
+    problems: list[str] = []
+    for path in (ref_path, good_path, bad_path, extra_path, expected_path):
+        if not path.is_file():
+            problems.append(f"accessor fixture missing: {path}")
+    if problems:
+        return problems
+    expected = json.loads(expected_path.read_text(encoding="utf-8"))
+    raw = ref_path.read_text(encoding="utf-8")
+    src = _strip_cpp_comments(_preprocess_cpp(raw))
+    ref_surface, _unrecoverable = parse_cpp_source_surface(src)
+    for key, want in expected["reference"].items():
+        cls, name = key.split(".", 1)
+        info = ref_surface.get(cls, {}).get(name)
+        got = None if info is None else [bool(info.get), bool(info.set)]
+        if got != list(want):
+            problems.append(f"{key}: reference accessors {got} != {want}")
+    ref_members = {cls: set(entries) for cls, entries in ref_surface.items()}
+    for variant, path in (
+        ("good", good_path),
+        ("bad", bad_path),
+        ("extra", extra_path),
+    ):
+        members, accessors, _unrecoverable = parse_rust_file(path)
+        missing, extra = accessor_mismatches(
+            ref_surface, ref_members, members, accessors, classes=["PropWidget"]
+        )
+        want_missing = expected[f"{variant}_missing"]
+        want_extra = expected[f"{variant}_extra"]
+        if dict(missing) != want_missing:
+            problems.append(f"{variant}: missing {dict(missing)} != {want_missing}")
+        if dict(extra) != want_extra:
+            problems.append(f"{variant}: extra {dict(extra)} != {want_extra}")
+    return problems
 
 
 def self_test(verbose: bool = True) -> int:
@@ -1483,6 +1894,8 @@ def self_test(verbose: bool = True) -> int:
             problems.append(f"unrecoverable sites: no site matching {needle!r}")
     if any("runtime" in m for members in got.values() for m in members):
         problems.append("runtime-built name leaked into the member set")
+
+    problems.extend(_accessor_self_test())
 
     if problems:
         print("native_parity: extractor self-test FAILED:")
@@ -1538,6 +1951,14 @@ def main(argv: list[str] | None = None) -> int:
         help="rewrite scripts/native_parity_allow.txt with the current missing set",
     )
     parser.add_argument(
+        "--update-props-allow",
+        action="store_true",
+        help=(
+            "rewrite scripts/native_parity_props_allow.txt with the current "
+            "getter/setter mismatches"
+        ),
+    )
+    parser.add_argument(
         "--no-doc", action="store_true", help="do not regenerate docs/native_parity.md"
     )
     parser.add_argument(
@@ -1569,7 +1990,8 @@ def main(argv: list[str] | None = None) -> int:
 
     ref_surface, unrecoverable = parse_reference_surface()
     ref = {cls: set(entries) for cls, entries in ref_surface.items()}
-    rust, rust_sources = parse_rust()
+    rust, rust_accessors, rust_sources, rust_unrecoverable = parse_rust()
+    unrecoverable.extend(rust_unrecoverable)
 
     # The constructor (reference `TJS_END_NATIVE_CONSTRUCTOR_DECL(X)`, Rust
     # `NativeInstanceBuilder { name: "X" }` / class builder name) is the class
@@ -1615,6 +2037,32 @@ def main(argv: list[str] | None = None) -> int:
     # removed).  These are only a warning so the allowlist can shrink.
     stale = sorted(allow - all_missing)
 
+    # Getter/setter parity: a reference-readable property must have a Rust
+    # `get`, and a reference-writable one a Rust `set` (the `imageWidth`
+    # shape).  `props_extra` is the reverse direction: a Rust accessor the
+    # reference denies, which lets a script write a property the reference
+    # raises on.  Both directions are gated by the same allowlist.
+    props_missing, props_extra = accessor_mismatches(
+        ref_surface, ref, rust, rust_accessors
+    )
+    props_allow = read_allowlist(PROPS_ALLOWLIST_PATH)
+    if args.update_props_allow:
+        write_allowlist(
+            PROPS_ALLOWLIST_PATH,
+            set(props_missing) | set(props_extra),
+            read_allowlist_reasons(PROPS_ALLOWLIST_PATH),
+            PROPS_ALLOW_HEADER,
+        )
+        print(
+            f"native_parity: wrote {len(set(props_missing) | set(props_extra))} "
+            f"getter/setter entries to "
+            f"{PROPS_ALLOWLIST_PATH.relative_to(REPO_ROOT)}"
+        )
+        props_allow = set(props_missing) | set(props_extra)
+    new_props_missing = sorted(set(props_missing) - props_allow)
+    new_props_extra = sorted(set(props_extra) - props_allow)
+    stale_props = sorted(props_allow - set(props_missing) - set(props_extra))
+
     if not args.no_doc:
         DOC_PATH.parent.mkdir(parents=True, exist_ok=True)
         DOC_PATH.write_text(
@@ -1627,6 +2075,8 @@ def main(argv: list[str] | None = None) -> int:
                 extra_by_class,
                 ref_surface,
                 unrecoverable,
+                props_missing,
+                props_extra,
             ),
             encoding="utf-8",
         )
@@ -1647,6 +2097,16 @@ def main(argv: list[str] | None = None) -> int:
             f"{total_extra} extra, coverage {cov:.1f}%"
         )
 
+    if not args.quiet and (props_missing or props_extra):
+        print(
+            f"native_parity: {len(props_missing)} getter/setter "
+            f"mismatch(es), {len(props_extra)} extra accessor(s):"
+        )
+        for key, detail in props_missing.items():
+            print(f"  - {key}: {detail}")
+        for key, detail in props_extra.items():
+            print(f"  ~ {key}: {detail} (extra)")
+
     if stale:
         print(
             f"native_parity: {len(stale)} allowlisted member(s) are now "
@@ -1654,6 +2114,47 @@ def main(argv: list[str] | None = None) -> int:
         )
         for entry in stale:
             print(f"  - {entry}")
+
+    if stale_props:
+        print(
+            f"native_parity: {len(stale_props)} allowlisted getter/setter "
+            "mismatch(es) are now resolved — shrink "
+            "scripts/native_parity_props_allow.txt:"
+        )
+        for entry in stale_props:
+            print(f"  - {entry}")
+
+    if new_props_missing:
+        print(
+            f"native_parity: {len(new_props_missing)} new getter/setter "
+            f"mismatch(es) not in "
+            f"{PROPS_ALLOWLIST_PATH.relative_to(REPO_ROOT)}:",
+            file=sys.stderr,
+        )
+        for entry in new_props_missing:
+            print(f"  - {entry}: {props_missing[entry]}", file=sys.stderr)
+        print(
+            "native_parity: run with --update-props-allow only after reviewing "
+            "these.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if new_props_extra:
+        print(
+            f"native_parity: {len(new_props_extra)} new extra-accessor "
+            f"mismatch(es) not in "
+            f"{PROPS_ALLOWLIST_PATH.relative_to(REPO_ROOT)}:",
+            file=sys.stderr,
+        )
+        for entry in new_props_extra:
+            print(f"  - {entry}: {props_extra[entry]} (extra)", file=sys.stderr)
+        print(
+            "native_parity: run with --update-props-allow only after reviewing "
+            "these.",
+            file=sys.stderr,
+        )
+        return 1
 
     if new_missing:
         print(

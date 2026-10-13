@@ -84,6 +84,24 @@ pub(crate) fn normalize_storage_name(name: &str) -> String {
     }
 }
 
+/// Strips the local `file` media prefix from a storage name, returning the
+/// bare VFS name the L2 [`Storage`] namespace accepts. The reference parses
+/// `media://domain/path` and hands the path to the media
+/// (`reference/cpp/core/base/StorageIntf.cpp:240-430`); the application paths
+/// this port emits use `file://.` followed by an absolute host path, and
+/// `file://` / `file:` are accepted as well.
+///
+/// This is the L3→L2 boundary: the engine namespace never sees the media
+/// syntax.
+pub(crate) fn strip_file_media(name: &str) -> &str {
+    for prefix in ["file://.", "file://", "file:"] {
+        if let Some(rest) = name.strip_prefix(prefix) {
+            return rest;
+        }
+    }
+    name
+}
+
 /// `TVPExtractStorageExt`: the extension including the dot, or `""`.
 fn extract_storage_ext(name: &str) -> String {
     for (i, c) in name.char_indices().rev() {
@@ -184,6 +202,8 @@ fn storage_error_message(member: &str, error: &StorageReadError) -> String {
 /// game-directory-relative disk path and `archive-file-name>in-archive-path`.
 /// Both still resolve back to the same storage through `find`/`read`.
 fn compute_placed_path(storage: &Storage, name: &str) -> Result<String, String> {
+    // The media prefix is L3 syntax; the L2 namespace resolves the bare name.
+    let name = strip_file_media(name);
     match storage.find(name) {
         Ok(Some(Location::Disk(path))) => {
             let relative = path
@@ -248,6 +268,8 @@ extern "C" fn native_add_auto_path(
         Ok(entry) => entry,
         Err(message) => return report_error(out_error, &message),
     };
+    // L2 stores the bare VFS auto path, never the `file://` media syntax.
+    let entry = strip_file_media(&entry);
     let Some(storage) = attached_storage(services) else {
         return report_error(out_error, "Storages.addAutoPath: no storage attached");
     };
@@ -281,11 +303,13 @@ extern "C" fn native_remove_auto_path(
         Ok(entry) => entry,
         Err(message) => return report_error(out_error, &message),
     };
+    // L2 stores the bare VFS auto path, never the `file://` media syntax.
+    let entry = strip_file_media(&entry);
     let Some(storage) = attached_storage(services) else {
         return report_error(out_error, "Storages.removeAutoPath: no storage attached");
     };
     // SAFETY: see `native_add_auto_path`.
-    unsafe { &mut *storage }.remove_auto_path(&entry);
+    unsafe { &mut *storage }.remove_auto_path(entry);
     services.state::<PlacedCache>().0.clear();
     set_void(out);
     0
@@ -378,11 +402,13 @@ extern "C" fn native_is_existent_storage(
         return report_error(out_error, "Storages.isExistentStorage requires 1 argument");
     };
     let name = value_as_string(name);
+    // The media prefix is L3 syntax; the L2 namespace resolves the bare name.
+    let name = strip_file_media(&name);
     let Some(storage) = attached_storage(services) else {
         return report_error(out_error, "Storages.isExistentStorage: no storage attached");
     };
     // SAFETY: the host keeps the attached storage alive for the VM lifetime.
-    match unsafe { &*storage }.exists(&name) {
+    match unsafe { &*storage }.exists(name) {
         Ok(exists) => {
             set_bool(out, exists);
             0
@@ -515,26 +541,31 @@ extern "C" fn native_get_local_name(
         return report_error(out_error, "Storages.getLocalName requires 1 argument");
     };
     let name = value_as_string(name);
+    // The media prefix is L3 syntax; the L2 namespace resolves the bare name.
+    let lookup = strip_file_media(&name);
     let Some(storage) = attached_storage(services) else {
         return report_error(out_error, "Storages.getLocalName: no storage attached");
     };
     // SAFETY: the host keeps the attached storage alive for the VM lifetime.
     let storage = unsafe { &*storage };
-    match storage.find_disk(&name) {
-        Ok(Some(path)) => {
-            set_string_out(out, services, &path.to_string_lossy());
-            0
-        }
-        Ok(None) => match storage.find(&name) {
-            // The reference throws `TVPCannotGetLocalName` for archive-only
-            // names; a plain miss returns the name unchanged.
-            Ok(Some(Location::Archive(..))) => report_error(
-                out_error,
-                &format!(
-                    "Storages.getLocalName: \"{name}\" is inside an archive and has no local name"
-                ),
+    // `TVPGetLocalName(TVPNormalizeStorageName(name))`: the case-corrected
+    // native path for a disk name, and a raise for an in-archive name
+    // (`reference/cpp/core/base/impl/StorageImpl.cpp:1283-1297`,
+    // `reference/cpp/core/base/StorageIntf.cpp:546-550`). A miss outside the
+    // mount returns the input unchanged.
+    match storage.find(lookup) {
+        Ok(Some(Location::Archive(..))) => report_error(
+            out_error,
+            &format!(
+                "Storages.getLocalName: \"{name}\" is inside an archive and has no local name"
             ),
-            Ok(Some(Location::Disk(..))) | Ok(None) => {
+        ),
+        Ok(Some(Location::Disk(..))) | Ok(None) => match storage.local_name(lookup) {
+            Ok(Some(path)) => {
+                set_string_out(out, services, &path.to_string_lossy());
+                0
+            }
+            Ok(None) => {
                 set_string_out(out, services, &name);
                 0
             }

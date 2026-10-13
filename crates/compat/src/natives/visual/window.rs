@@ -41,7 +41,6 @@ struct WindowInst {
     ime_mode: i32,
     use_mouse_key: bool,
     trap_key: bool,
-    inner_sunken: bool,
     modal: bool,
     mask_region: Option<i32>,
     /// `tTVPBorderStyle` (0 = `bsNone`).
@@ -85,7 +84,6 @@ impl Default for WindowInst {
             ime_mode: 0,
             use_mouse_key: false,
             trap_key: false,
-            inner_sunken: false,
             modal: false,
             mask_region: None,
             border_style: 0,
@@ -1136,11 +1134,21 @@ window_bool_prop!(
     use_mouse_key
 );
 window_bool_prop!(window_trap_key_get, window_trap_key_set, trap_key);
-window_bool_prop!(
-    window_inner_sunken_get,
-    window_inner_sunken_set,
-    inner_sunken
-);
+
+/// `Window.innerSunken` — the reference window forwards to its form
+/// (`reference/cpp/core/visual/impl/WindowImpl.cpp:1687-1697`), whose getter
+/// returns a fixed `false` and ignores writes
+/// (`reference/cpp/core/environ/impl/TVPWindow.h:143-144`).
+extern "C" fn window_inner_sunken_get(
+    _engine: *mut c_void,
+    _instance: *mut c_void,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    set_bool(out, false);
+    0
+}
 
 /// `Window.layerLeft` — the reference form reports a fixed `0` and ignores
 /// writes (`reference/cpp/core/environ/impl/TVPWindow.h:178-179`).
@@ -1182,7 +1190,8 @@ extern "C" fn window_show_scroll_bars_get(
 }
 
 /// The empty setter shared by the obsolete properties whose reference form
-/// setter is a no-op (`layerLeft`, `layerTop`, `showScrollBars`).
+/// setter is a no-op (`layerLeft`, `layerTop`, `showScrollBars`,
+/// `innerSunken`).
 extern "C" fn window_ignored_prop_set(
     _engine: *mut c_void,
     _instance: *mut c_void,
@@ -2465,7 +2474,7 @@ pub(super) fn register_window_class(ctx: &mut CompatCtx) -> Result<(), CompatErr
             NativeInstancePropertyDef {
                 name: "innerSunken",
                 get: Some(window_inner_sunken_get),
-                set: Some(window_inner_sunken_set),
+                set: Some(window_ignored_prop_set),
             },
             NativeInstancePropertyDef {
                 name: "minWidth",

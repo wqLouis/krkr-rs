@@ -143,7 +143,7 @@ Legend: **instance** = Rust uses the `instance` payload (C++ derived it from `ob
 | site (file:line) | family | receiver | risk | reference | repro plan |
 |---|---|---|---|---|---|
 | `visual/layer/mod.rs:1071` | `layer_int_prop!` (visible/type/left/top/width/height/absolute/cursor/face/…) | `instance` -> scene layer | **suspect** (the measured bug) | `LayerIntf.cpp:10592` (`visible` uses `TJS_GET_NATIVE_INSTANCE`) | the exact `Title.tjs` shape |
-| `visual/layer/mod.rs:1050` | `layer_int_get!` (image_width/height, …) | `instance` | suspect (read misroute) | `LayerIntf.cpp` same macro | `with(_logo){ return .imageWidth; }` from a timer |
+| `visual/layer/mod.rs:1815,1838,1855` | hand-written `layer_image_dimension_get` + `layer_image_width_get`/`layer_image_height_get` | `instance` (`with_layer_read`) | suspect (read misroute) | `LayerIntf.cpp:10796-10830` (`TJS_GET_NATIVE_INSTANCE`) | `with(_logo){ return .imageWidth; }` from a timer |
 | `visual/layer/mod.rs:1085` | hand‑written `layer_visible_set` logs only; writes via `with_layer_write` | `instance` | suspect | `LayerIntf.cpp:10592` | as above |
 | `visual/layer/pixels.rs:556,699,910` | `affine_method!`/`stretch_method!`/`rect_method!` | `instance` (`with_layer_write`) | needs‑test (method, arg objects explicit) | `LayerIntf.cpp` affine/stretch | call via `with` with a wrong enclosing Layer |
 | `visual/layer/pixels.rs:1954` | `loadImages` (hand) | `instance` | needs‑test (method; user reports it works) | `LayerIntf.cpp` `loadImages` | — |
@@ -230,7 +230,7 @@ parameter and cannot be misrouted by the receiver at all. Classify **safe**.
 
 ## 5. Ranked shortlist (most likely to affect real games)
 
-1. **`visual/layer/mod.rs:1071` `layer_int_prop!` / `:1050` `layer_int_get!`** — every
+1. **`visual/layer/mod.rs:1071` `layer_int_prop!` / `:1815,1838,1855` hand-written `layer_image_dimension_get` + `layer_image_width_get`/`layer_image_height_get`** — every
    `Layer`/`Sprite` property a KAG game touches (`visible`, `left`, `top`, `width`,
    `height`, `absolute`, `cursor`, `face`, …). This is the measured bug; a wrong receiver
    that is *also* a Layer (e.g. the enclosing `Logo` layer) silently writes the wrong layer

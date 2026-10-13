@@ -544,10 +544,34 @@ fn project_dir(ctx: &CompatCtx) -> Option<std::path::PathBuf> {
     Some(unsafe { &*ptr }.game_dir().to_path_buf())
 }
 
-/// Append a trailing `/` the way the reference's `TVPNativeProjectDir` does.
-fn dir_with_separator(path: &Path) -> String {
-    let s = path.display().to_string();
-    if s.ends_with('/') { s } else { format!("{s}/") }
+/// The reference storage-name form of a native host path:
+/// `TVPNormalizeStorageName` prepends the local media and domain `file://.` to
+/// an absolute path (`TVPPreNormalizeStorageName`,
+/// `reference/cpp/core/base/impl/StorageImpl.cpp:422-467`) and the file media
+/// lowercases the domain and path and unifies `\` to `/`
+/// (`tTVPFileMedia::NormalizeDomainName`/`NormalizePathName`,
+/// `reference/cpp/core/base/impl/StorageImpl.cpp:95-117`, applied at
+/// `reference/cpp/core/base/StorageIntf.cpp:362-369`). A non-absolute path is
+/// returned as-is.
+fn normalize_host_path(path: &Path) -> String {
+    let native = path.to_string_lossy().replace('\\', "/");
+    if native.starts_with('/') {
+        format!("file://.{}", native.to_ascii_lowercase())
+    } else {
+        native
+    }
+}
+
+/// The reference application-path form: normalized and carrying the trailing
+/// `/` the reference's `TVPExtractStoragePath` keeps
+/// (`reference/cpp/core/base/StorageIntf.cpp:837-859`).
+fn normalized_app_path(path: &Path) -> String {
+    let normalized = normalize_host_path(path);
+    if normalized.ends_with('/') {
+        normalized
+    } else {
+        format!("{normalized}/")
+    }
 }
 
 /// The logical screen size: the first window of the attached L2 scene, or
@@ -1368,9 +1392,13 @@ extern "C" fn prop_exe_path(
         return report_error(out_error, "System.exePath: compat context is not bound");
     };
     let ctx = resolved.ctx();
+    // `System.exePath` is `TVPGetAppPath()`
+    // (`reference/cpp/core/base/impl/SystemImpl.cpp:798-807`), which is
+    // `TVPExtractStoragePath(TVPProjectDir)`
+    // (`reference/cpp/core/base/impl/StorageImpl.cpp:504-507`).
     match project_dir(&ctx) {
         Some(dir) => {
-            set_string_out(&ctx, out, &dir_with_separator(&dir));
+            set_string_out(&ctx, out, &normalized_app_path(&dir));
             0
         }
         None => report_error(out_error, "System.exePath: storage is not attached"),
@@ -1386,9 +1414,17 @@ extern "C" fn prop_data_path(
         return report_error(out_error, "System.dataPath: compat context is not bound");
     };
     let ctx = resolved.ctx();
+    // `System.dataPath` is `TVPDataPath`
+    // (`reference/cpp/core/base/impl/SystemImpl.cpp:828-836`), the application
+    // directory plus `savedata/`
+    // (`reference/cpp/core/environ/impl/ApplicationSpecialPath.h:13-19`).
     match project_dir(&ctx) {
         Some(dir) => {
-            set_string_out(&ctx, out, &dir_with_separator(&dir.join("savedata")));
+            set_string_out(
+                &ctx,
+                out,
+                &format!("{}savedata/", normalized_app_path(&dir)),
+            );
             0
         }
         None => report_error(out_error, "System.dataPath: storage is not attached"),
@@ -1398,7 +1434,8 @@ extern "C" fn prop_data_path(
 /// `System.personalPath` / `System.savedGamesPath`: the application directory
 /// (the game folder), not its `savedata/` subfolder. The reference's
 /// `TVPGetPersonalPath()` and `TVPGetSavedGamesPath()` both return
-/// `TVPGetAppPath()`; only `TVPDataPath` names `savedata/`.
+/// `TVPGetAppPath()` (`reference/cpp/core/base/impl/SystemImpl.cpp:341-359`,
+/// `:387-397`); only `TVPDataPath` names `savedata/`.
 fn app_path_prop(
     engine: *mut c_void,
     out: *mut Value,
@@ -1414,7 +1451,7 @@ fn app_path_prop(
     let ctx = resolved.ctx();
     match project_dir(&ctx) {
         Some(dir) => {
-            set_string_out(&ctx, out, &dir_with_separator(&dir));
+            set_string_out(&ctx, out, &normalized_app_path(&dir));
             0
         }
         None => report_error(
@@ -1451,8 +1488,8 @@ const FALLBACK_EXE_NAME: &str = "krkr-rs/";
 /// The application path here is the L2 storage root ([`project_dir`], the
 /// launcher's `--base-dir` / first archive's parent / default working
 /// directory). When no storage is attached the app path is unknown, so the
-/// getter reports the working directory with a trailing separator instead of
-/// raising: a Windows application always has an executable path.
+/// getter reports the normalized working directory instead of raising: a
+/// Windows application always has an executable path.
 extern "C" fn prop_exe_name(
     engine: *mut c_void,
     out: *mut Value,
@@ -1463,9 +1500,9 @@ extern "C" fn prop_exe_name(
     };
     let ctx = resolved.ctx();
     let name = match project_dir(&ctx) {
-        Some(dir) => dir_with_separator(&dir),
+        Some(dir) => normalized_app_path(&dir),
         None => match std::env::current_dir() {
-            Ok(dir) => dir_with_separator(&dir),
+            Ok(dir) => normalized_app_path(&dir),
             Err(_) => FALLBACK_EXE_NAME.to_string(),
         },
     };
