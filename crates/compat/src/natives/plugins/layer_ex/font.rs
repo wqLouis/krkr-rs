@@ -22,6 +22,7 @@ use tjs::{
 use super::appearance::{Paint, paint_color_at};
 use super::{set_real, value_as_f64};
 use crate::native_util::{args, report_error, set_void};
+use crate::storage::strip_file_media;
 use crate::{CompatCtx, CompatError};
 
 /// The script-visible fields of a `FontInfo`.
@@ -582,7 +583,7 @@ fn read_font_file(ctx: &CompatCtx, name: &str) -> Result<Vec<u8>, String> {
         return Err(format!("cannot open:{name}"));
     };
     // SAFETY: `attach_storage` guarantees the pointer stays valid.
-    match unsafe { &*storage }.read(name) {
+    match unsafe { &*storage }.read(strip_file_media(name)) {
         Ok(bytes) => Ok(bytes),
         Err(StorageReadError::NotFound(_)) => Err(format!("cannot open:{name}")),
         Err(error) => Err(error.to_string()),

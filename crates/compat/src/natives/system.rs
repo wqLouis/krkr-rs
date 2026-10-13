@@ -38,14 +38,17 @@
 //!
 //! # Host-facts seam
 //!
-//! `appDataPath`, `desktopLeft`/`Top`/`Width`/`Height` are genuine host facts
-//! with no L2 counterpart. They compose the closure seam installed through
+//! `desktopLeft`/`Top`/`Width`/`Height` are genuine host facts with no L2
+//! counterpart. They compose the closure seam installed through
 //! [`CompatHost`](crate::CompatHost)
-//! ([`set_app_data_path`](crate::CompatHost::set_app_data_path) and
-//! [`set_desktop_rect`](crate::CompatHost::set_desktop_rect)); when the
-//! matching fact is unset the member raises a typed error and never returns a
-//! silent default. `shellExecute` and `system` match the reference's inert
-//! values instead of consulting a host seam.
+//! ([`set_desktop_rect`](crate::CompatHost::set_desktop_rect)); when the fact
+//! is unset the member raises a typed error and never returns a silent
+//! default. `appDataPath` is not a host fact: the reference's
+//! `TVPGetAppDataPath()` returns `TVPGetAppPath()`
+//! (`reference/cpp/core/base/impl/SystemImpl.cpp:366-380`, `:819`), so it
+//! reuses the application-path helper alongside `exePath`. `shellExecute` and
+//! `system` match the reference's inert values instead of consulting a host
+//! seam.
 //!
 //! # Command-line arguments
 //!
@@ -68,7 +71,7 @@ use tjs::{
 };
 
 use crate::binding;
-use crate::host::{host_app_data_path, host_desktop_rect};
+use crate::host::host_desktop_rect;
 use crate::native_util::{args, report_error, set_bool, set_int, set_void, value_as_string};
 use crate::natives::input::vk_pressed;
 use crate::{CompatCtx, CompatError, CompatServices};
@@ -1971,37 +1974,6 @@ extern "C" fn prop_draw_thread_num_set(
     0
 }
 
-/// Report a `System` string host fact, raising a typed error when the seam is
-/// unset or the provider fails.
-fn host_string_property(
-    engine: *mut c_void,
-    out: *mut Value,
-    out_error: *mut *mut c_char,
-    member: &str,
-    read: impl FnOnce(&CompatServices) -> Option<Result<String, String>>,
-) -> c_int {
-    let Some(resolved) = resolve(engine) else {
-        return report_error(
-            out_error,
-            &format!("System.{member}: compat context is not bound"),
-        );
-    };
-    let ctx = resolved.ctx();
-    // SAFETY: a `CompatCtx` is only created for a bound, live engine.
-    let services = unsafe { ctx.services() };
-    match read(services) {
-        Some(Ok(value)) => {
-            set_string_out(&ctx, out, &value);
-            0
-        }
-        Some(Err(error)) => report_error(out_error, &format!("System.{member}: {error}")),
-        None => report_error(
-            out_error,
-            &format!("System.{member}: the host fact is not installed"),
-        ),
-    }
-}
-
 /// Report one field of the `System.desktop*` host rectangle.
 fn host_desktop_property(
     engine: *mut c_void,
@@ -2037,7 +2009,11 @@ extern "C" fn prop_app_data_path(
     out: *mut Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
-    host_string_property(engine, out, out_error, "appDataPath", host_app_data_path)
+    // `System.appDataPath` is `TVPGetAppDataPath()`, which returns
+    // `TVPGetAppPath()` unconditionally — the OS-specific branch is disabled
+    // (`reference/cpp/core/base/impl/SystemImpl.cpp:366-380`, getter at
+    // `:819`) — so it equals `System.exePath`.
+    app_path_prop(engine, out, out_error, "appDataPath")
 }
 
 extern "C" fn prop_desktop_left(

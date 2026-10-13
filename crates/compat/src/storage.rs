@@ -1,0 +1,38 @@
+//! The script-name → VFS-name boundary for storage-backed natives.
+//!
+//! L3 owns the TVP storage-name grammar; the L2 [`engine::Storage`] namespace
+//! takes a bare name within a mount. A script name may carry the local `file`
+//! media prefix (`file://.`, `file://` or `file:`) which the namespace does not
+//! understand, so every native that hands a script-supplied name to L2 routes
+//! it through [`strip_file_media`] first.
+
+/// Strips the local `file` media prefix from a storage name, returning the
+/// bare VFS name the L2 [`engine::Storage`] namespace accepts.
+///
+/// The prefixes are tried longest first so `file://.` wins over `file://` and
+/// `file:`. A name without a prefix is returned unchanged.
+pub(crate) fn strip_file_media(name: &str) -> &str {
+    for prefix in ["file://.", "file://", "file:"] {
+        if let Some(rest) = name.strip_prefix(prefix) {
+            return rest;
+        }
+    }
+    name
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_file_media;
+
+    #[test]
+    fn strips_the_local_file_media_prefix() {
+        // The reference parses `media://domain/path` and hands the path to the
+        // media (`reference/cpp/core/base/StorageIntf.cpp:240-430`); the port
+        // accepts the `file://.` application form and the shorter `file://` /
+        // `file:` spellings.
+        assert_eq!(strip_file_media("file://./tmp/a.tjs"), "/tmp/a.tjs");
+        assert_eq!(strip_file_media("file:///tmp/a.tjs"), "/tmp/a.tjs");
+        assert_eq!(strip_file_media("file:a.tjs"), "a.tjs");
+        assert_eq!(strip_file_media("data/a.tjs"), "data/a.tjs");
+    }
+}

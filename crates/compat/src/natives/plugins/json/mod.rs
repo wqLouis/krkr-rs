@@ -68,6 +68,7 @@ use tjs::{
 
 use super::super::system::{resolve, set_string_out, value_as_i64};
 use crate::native_util::{args, report_error, set_int, set_void, value_as_string};
+use crate::storage::strip_file_media;
 use crate::{CompatCtx, CompatError, CompatServices};
 
 /// Name of the TJS helper that distinguishes TJS `null` from other objects.
@@ -850,14 +851,16 @@ fn write_value_out(ctx: &CompatCtx, out: *mut Value, value: TjsOwned) {
 fn read_input(ctx: &CompatCtx, name: &str) -> Result<Vec<u8>, String> {
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
     let services = unsafe { ctx.services() };
+    // The media prefix is L3 syntax; the L2 namespace resolves the bare name.
+    let lookup = strip_file_media(name);
     if let Some(pointer) = services.storage() {
         // SAFETY: the host keeps the attached storage alive for the binding.
         return unsafe { &*pointer }
-            .read(name)
+            .read(lookup)
             .map_err(|error| format!("'{name}': {error}"));
     }
     let file_system = fs::FileSystem::host("");
-    fs::read(&file_system, &FsPath::host(name)).map_err(|error| format!("'{name}': {error}"))
+    fs::read(&file_system, &FsPath::host(lookup)).map_err(|error| format!("'{name}': {error}"))
 }
 
 /// Whether `name` is a Windows drive-letter path (`C:/...`), which the

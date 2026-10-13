@@ -76,6 +76,7 @@ use error::PsbError;
 
 use crate::native_util::{args, report_error, set_bool, set_void, value_as_string};
 use crate::natives::system::resolve;
+use crate::storage::strip_file_media;
 use crate::{CompatCtx, CompatError};
 
 // ---------------------------------------------------------------------------
@@ -343,7 +344,7 @@ fn load_document(ctx: &CompatCtx, inst: &mut PsbFileInst, path: &str) -> Result<
     };
     // SAFETY: the host keeps the attached storage alive for the binding.
     let bytes = unsafe { &*storage }
-        .read(path)
+        .read(strip_file_media(path))
         .map_err(|error| error.to_string())?;
     match container::parse_stream(&bytes, 0) {
         Ok(document) => {

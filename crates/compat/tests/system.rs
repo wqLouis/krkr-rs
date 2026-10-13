@@ -402,6 +402,7 @@ fn storage_backed_paths_are_typed_errors_without_storage() {
         // D11: the getter needs the attached L2 storage; without it the read
         // is a typed error, never a placeholder path.
         assert!(e.eval("System.exePath", "t").is_err());
+        assert!(e.eval("System.appDataPath", "t").is_err());
         assert!(e.eval("System.dataPath", "t").is_err());
         assert!(e.eval("System.personalPath", "t").is_err());
         assert!(e.eval("System.savedGamesPath", "t").is_err());
@@ -461,12 +462,13 @@ fn storage_backed_paths_match_the_reference() {
     let dir = env.game_dir().expect("game dir");
     let app = normalized_app_dir(dir);
 
-    // `System.exePath`, `System.personalPath` and `System.savedGamesPath` all
-    // return `TVPGetAppPath()`, the normalized application path; only
-    // `System.dataPath` is `TVPDataPath`, the application directory plus
-    // `savedata/`.
+    // `System.exePath`, `System.appDataPath`, `System.personalPath` and
+    // `System.savedGamesPath` all return `TVPGetAppPath()`, the normalized
+    // application path; only `System.dataPath` is `TVPDataPath`, the
+    // application directory plus `savedata/`.
     // reference/cpp/core/base/impl/StorageImpl.cpp:504-507 (`TVPGetAppPath`)
     // reference/cpp/core/base/impl/SystemImpl.cpp:341-359 (`TVPGetPersonalPath`)
+    // reference/cpp/core/base/impl/SystemImpl.cpp:366-380 (`TVPGetAppDataPath`)
     // reference/cpp/core/base/impl/SystemImpl.cpp:387-397 (`TVPGetSavedGamesPath`)
     // reference/cpp/core/base/impl/SystemImpl.cpp:798-807 (exePath)
     // reference/cpp/core/base/impl/SystemImpl.cpp:808-816 (personalPath)
@@ -476,6 +478,10 @@ fn storage_backed_paths_match_the_reference() {
     // reference/cpp/core/environ/impl/ApplicationSpecialPath.h:13-19 (dataPath)
     assert_eq!(
         env.eval("System.exePath").unwrap(),
+        TjsValue::String(app.clone())
+    );
+    assert_eq!(
+        env.eval("System.appDataPath").unwrap(),
         TjsValue::String(app.clone())
     );
     assert_eq!(
@@ -579,7 +585,6 @@ fn host_fact_members_raise_typed_errors_when_unset() {
     let _lock = vm_lock();
     with_host(|e, _host| {
         for expression in [
-            "System.appDataPath",
             "System.desktopLeft",
             "System.desktopTop",
             "System.desktopWidth",
@@ -614,13 +619,8 @@ fn host_fact_members_raise_typed_errors_when_unset() {
 fn host_facts_seam_serves_the_system_members() {
     let _lock = vm_lock();
     with_host(|e, host| {
-        host.set_app_data_path(|| Ok("/home/user/.local/share/game/".to_string()));
         host.set_desktop_rect(|| Ok((-1920, 0, 3840, 1080)));
 
-        assert_eq!(
-            e.eval("System.appDataPath", "t").unwrap(),
-            TjsValue::String("/home/user/.local/share/game/".into())
-        );
         assert_eq!(eval_int(e, "System.desktopLeft"), -1920);
         assert_eq!(eval_int(e, "System.desktopTop"), 0);
         assert_eq!(eval_int(e, "System.desktopWidth"), 3840);

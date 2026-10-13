@@ -68,8 +68,8 @@ use tjs::{
 };
 
 use crate::native_util::{args, report_error, set_bool, set_int, set_void, value_as_string};
-use crate::natives::storages::strip_file_media;
 use crate::natives::system::{EngineBinding, resolve, set_string_out, value_as_bool, value_as_i64};
+use crate::storage::strip_file_media;
 use crate::{CompatCtx, CompatError};
 
 /// The global constants the reference installs from its post-registration

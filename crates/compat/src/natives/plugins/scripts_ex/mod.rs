@@ -45,6 +45,7 @@ use tjs::{
 use crate::binding;
 use crate::native_util::{args, report_error, set_int, set_void, value_as_string};
 use crate::natives::system::value_as_i64;
+use crate::storage::strip_file_media;
 use crate::{CompatCtx, CompatError, CompatServices};
 
 // ---------------------------------------------------------------------------
@@ -813,8 +814,9 @@ fn safe_eval_storage(
     };
     // SAFETY: the host keeps the attached storage alive for the VM lifetime.
     let storage = unsafe { &*storage };
+    // The media prefix is L3 syntax; the L2 namespace resolves the bare name.
     let bytes = storage
-        .read(&name)
+        .read(strip_file_media(&name))
         .map_err(|error| format!("scripts_ex: safeEvalStorage '{name}': {error}"))?;
     let bytes = match mode_offset(&mode) {
         Some(offset) => &bytes[offset.min(bytes.len())..],

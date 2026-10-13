@@ -51,6 +51,7 @@ use tjs::{
 use crate::binding;
 use crate::native_util::{args, report_error, set_int, set_void};
 use crate::natives::system::{tjs_string_to_integer, try_value_as_i64, value_as_bool};
+use crate::storage::strip_file_media;
 use crate::{CompatCtx, CompatError, CompatServices};
 use state::{
     Environ, EvalResult, KagParserState, LabelCallback, ScenarioLoadCallback,
@@ -230,7 +231,9 @@ impl KagEnv {
             };
             // SAFETY: the host keeps an attached storage alive for the whole
             // VM lifetime (see `CompatServices::attach_storage`).
-            let bytes = unsafe { &*ptr }.read(name).map_err(|e| e.to_string())?;
+            let bytes = unsafe { &*ptr }
+                .read(strip_file_media(name))
+                .map_err(|e| e.to_string())?;
             crate::text::decode_text(&bytes, crate::text::TextEncoding::Detect)
         });
         let label: Option<LabelClosure> = if owner.is_null() {

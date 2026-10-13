@@ -151,6 +151,7 @@ use tjs::{
 
 use crate::native_util::{args, report_error, set_int, set_void, value_as_string};
 use crate::natives::system::{resolve, set_string_out, value_as_bool, value_as_i64};
+use crate::storage::strip_file_media;
 use crate::{CompatCtx, CompatError, CompatServices};
 
 mod phase_vocoder;
@@ -1339,7 +1340,9 @@ extern "C" fn sound_open(
         let Some(storage) = services.storage() else {
             return report_error(out_error, "WaveSoundBuffer.open: no storage is attached");
         };
-        let audio = match unsafe { &*storage }.read(&name) {
+        // The media prefix is L3 syntax; the L2 namespace resolves the bare name.
+        let lookup = strip_file_media(&name);
+        let audio = match unsafe { &*storage }.read(lookup) {
             Ok(bytes) => bytes,
             Err(error) => {
                 return report_error(
@@ -1348,7 +1351,7 @@ extern "C" fn sound_open(
                 );
             }
         };
-        let sli_name = format!("{name}.sli");
+        let sli_name = format!("{lookup}.sli");
         // The reference tests `TVPIsExistentStorage(sliname)` and only then
         // opens and reads it (`WaveImpl.cpp:3062-3082`); a missing side-car
         // is skipped, but a read failure after the existence check

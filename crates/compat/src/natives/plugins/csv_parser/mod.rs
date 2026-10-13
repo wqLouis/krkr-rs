@@ -36,6 +36,7 @@ use tjs::{
 
 use super::super::system::{resolve, try_value_as_i64, value_as_i64};
 use crate::native_util::{args, report_error, set_int, set_void, value_as_string};
+use crate::storage::strip_file_media;
 use crate::{CompatCtx, CompatError};
 
 // ---------------------------------------------------------------------------
@@ -357,7 +358,7 @@ fn read_storage_text(engine: *mut c_void, filename: &str, utf8: bool) -> Result<
     };
     // SAFETY: see above.
     let bytes = unsafe { &*storage }
-        .read(filename)
+        .read(strip_file_media(filename))
         .map_err(|error| error.to_string())?;
     if utf8 {
         String::from_utf8(bytes).map_err(|error| format!("UTF-8: {error}"))

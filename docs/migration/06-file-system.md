@@ -148,9 +148,10 @@ These are not game-storage reads but still OS IO:
 * savedata (`savedata/`) is routed through the storage namespace;
 * `Debug.startLogToFile` is a native that writes through the host seam.
 
-`System.appDataPath` is supplied by the composition root through
-`CompatHost::set_app_data_path`; on Android it is the state directory the
-launcher passed in.
+`System.appDataPath` is not a host fact: the reference's `TVPGetAppDataPath()`
+returns `TVPGetAppPath()` unconditionally
+(`reference/cpp/core/base/impl/SystemImpl.cpp:366-380`), so the getter reuses
+the application-path helper alongside `System.exePath`.
 
 ## 6. The C++ `fopen` bypass
 

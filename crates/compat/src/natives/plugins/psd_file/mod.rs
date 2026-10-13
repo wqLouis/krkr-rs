@@ -37,6 +37,7 @@ use tjs::{
 
 use crate::native_util::{args, report_error, set_bool, set_int, set_void, value_as_string};
 use crate::natives::system::{resolve, set_string_out, value_as_i64};
+use crate::storage::strip_file_media;
 use crate::{CompatCtx, CompatError};
 
 mod decode;
@@ -467,17 +468,19 @@ extern "C" fn psd_ctor(
 fn read_psd_bytes(ctx: &CompatCtx, filename: &str) -> Result<Vec<u8>, String> {
     // SAFETY: `ctx` is only created for a bound, live engine, so its service pointer is valid for `read_psd_bytes`.
     let services = unsafe { ctx.services() };
+    // The media prefix is L3 syntax; the L2 namespace resolves the bare name.
+    let lookup = strip_file_media(filename);
     if let Some(storage) = services.storage() {
         // SAFETY: the host keeps the attached storage alive for the binding's
         // lifetime.
-        match unsafe { &*storage }.read(filename) {
+        match unsafe { &*storage }.read(lookup) {
             Ok(bytes) => return Ok(bytes),
             Err(StorageReadError::NotFound(_)) => {}
             Err(error) => return Err(error.to_string()),
         }
     }
     let file_system = fs::FileSystem::host("");
-    fs::read(&file_system, &FsPath::host(filename))
+    fs::read(&file_system, &FsPath::host(lookup))
         .map_err(|error| format!("cannot read {filename}: {error}"))
 }
 

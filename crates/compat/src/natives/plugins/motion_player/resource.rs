@@ -20,6 +20,7 @@ use super::model::MotionSnapshot;
 use super::psb::{PsbValue, parse_stream};
 use crate::native_util::{args, report_error, set_int, set_void, value_as_string};
 use crate::natives::system::{resolve, value_as_i64};
+use crate::storage::strip_file_media;
 use crate::{CompatCtx, CompatError};
 
 /// Per-engine snapshot store keyed by an opaque id.
@@ -191,7 +192,7 @@ fn load_module(ctx: &CompatCtx, inst: &mut ResourceInst, path: &str) -> Result<u
     };
     // SAFETY: the host keeps the attached storage alive for the binding.
     let bytes = unsafe { &*storage }
-        .read(path)
+        .read(strip_file_media(path))
         .map_err(|error| error.to_string())?;
     let psb = parse_stream(&bytes, seed).map_err(|error| error.0)?;
     let snapshot = MotionSnapshot::from_psb(psb);

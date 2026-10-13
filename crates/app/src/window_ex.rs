@@ -16,11 +16,13 @@ type MonitorRect = (i32, i32, i32, i32, i32, i32, i32, i32, bool);
 /// `surface_size` is the render surface the primary monitor covers. An
 /// unknown system-metric name yields `0`, an unset environment variable
 /// yields no value, and a surface dimension that does not fit the Win32
-/// monitor rectangle makes `getDisplayMonitors` report an error.
+/// monitor rectangle makes `getDisplayMonitors` and `System.desktop*`
+/// report an error.
 pub fn install_window_ex_facts(host: &CompatHost, surface_size: (u32, u32)) {
     host.set_window_ex_display_monitors(move || {
         primary_monitor(surface_size).map(|monitor| vec![monitor])
     });
+    host.set_desktop_rect(move || desktop_rect(surface_size));
     host.set_window_ex_cursor_pos(|| Ok((0, 0)));
     host.set_window_ex_set_cursor_pos(|_x, _y| Ok(()));
     host.set_window_ex_system_metrics(move |name| Ok(system_metric(name, surface_size)));
@@ -35,25 +37,31 @@ pub fn install_window_ex_facts(host: &CompatHost, surface_size: (u32, u32)) {
 }
 
 /// Returns the one primary monitor covering `surface_size`.
+fn primary_monitor(surface_size: (u32, u32)) -> Result<MonitorRect, String> {
+    let width = surface_edge(surface_size.0, "width")?;
+    let height = surface_edge(surface_size.1, "height")?;
+    Ok((0, 0, width, height, 0, 0, width, height, true))
+}
+
+/// Returns the `System.desktop*` rectangle `(left, top, width, height)` of the
+/// primary monitor: the render surface at the origin.
+fn desktop_rect(surface_size: (u32, u32)) -> Result<(i32, i32, u32, u32), String> {
+    surface_edge(surface_size.0, "width")?;
+    surface_edge(surface_size.1, "height")?;
+    Ok((0, 0, surface_size.0, surface_size.1))
+}
+
+/// Validates one surface dimension as a Win32 monitor-rectangle edge.
 ///
 /// A Win32 monitor rectangle holds `LONG` edges, so a surface dimension that
 /// does not fit in `i32` is reported instead of clamped.
-fn primary_monitor(surface_size: (u32, u32)) -> Result<MonitorRect, String> {
-    let width = i32::try_from(surface_size.0).map_err(|_| {
+fn surface_edge(value: u32, axis: &str) -> Result<i32, String> {
+    i32::try_from(value).map_err(|_| {
         format!(
-            "surface width {} is outside the monitor-rectangle range 0..={}",
-            surface_size.0,
+            "surface {axis} {value} is outside the monitor-rectangle range 0..={}",
             i32::MAX
         )
-    })?;
-    let height = i32::try_from(surface_size.1).map_err(|_| {
-        format!(
-            "surface height {} is outside the monitor-rectangle range 0..={}",
-            surface_size.1,
-            i32::MAX
-        )
-    })?;
-    Ok((0, 0, width, height, 0, 0, width, height, true))
+    })
 }
 
 /// Returns the plausible Win32 value for the uppercased metric `name`.
@@ -104,7 +112,7 @@ fn expand_env_value(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{expand_env_value, primary_monitor, system_metric};
+    use super::{desktop_rect, expand_env_value, primary_monitor, system_metric};
 
     #[test]
     fn primary_monitor_covers_the_surface() {
@@ -112,6 +120,20 @@ mod tests {
             primary_monitor((1280, 720)).ok(),
             Some((0, 0, 1280, 720, 0, 0, 1280, 720, true))
         );
+    }
+
+    #[test]
+    fn desktop_rect_covers_the_surface() {
+        assert_eq!(desktop_rect((1280, 720)).ok(), Some((0, 0, 1280, 720)));
+    }
+
+    #[test]
+    fn a_surface_dimension_outside_i32_is_reported() {
+        let too_wide = u32::try_from(i64::from(i32::MAX) + 1).expect("fits u32");
+        let error = primary_monitor((too_wide, 720)).expect_err("must not clamp");
+        assert!(error.contains("surface width"), "error was: {error}");
+        let error = desktop_rect((720, too_wide)).expect_err("must not clamp");
+        assert!(error.contains("surface height"), "error was: {error}");
     }
 
     #[test]

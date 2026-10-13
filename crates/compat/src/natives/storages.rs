@@ -45,6 +45,7 @@ use tjs::{Engine, NativeClassBuilder, NativeMethodDef, VAL_OBJECT, VAL_STRING, V
 
 use crate::binding;
 use crate::native_util::{args, report_error, set_bool, set_void, value_as_string};
+use crate::storage::strip_file_media;
 use crate::{CompatCtx, CompatError, CompatServices};
 
 /// Validates and normalizes a `Storages.addAutoPath`/`removeAutoPath`
@@ -82,24 +83,6 @@ pub(crate) fn normalize_storage_name(name: &str) -> String {
         ),
         None => name.replace('\\', "/").to_ascii_lowercase(),
     }
-}
-
-/// Strips the local `file` media prefix from a storage name, returning the
-/// bare VFS name the L2 [`Storage`] namespace accepts. The reference parses
-/// `media://domain/path` and hands the path to the media
-/// (`reference/cpp/core/base/StorageIntf.cpp:240-430`); the application paths
-/// this port emits use `file://.` followed by an absolute host path, and
-/// `file://` / `file:` are accepted as well.
-///
-/// This is the L3→L2 boundary: the engine namespace never sees the media
-/// syntax.
-pub(crate) fn strip_file_media(name: &str) -> &str {
-    for prefix in ["file://.", "file://", "file:"] {
-        if let Some(rest) = name.strip_prefix(prefix) {
-            return rest;
-        }
-    }
-    name
 }
 
 /// `TVPExtractStorageExt`: the extension including the dot, or `""`.

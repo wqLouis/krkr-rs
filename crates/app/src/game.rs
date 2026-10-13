@@ -408,6 +408,13 @@ impl GameHost {
         unsafe { crate::install_video_source_metered(vm.compat(), &media, &storage, &stats) }
             .map_err(vm::VmError::from)?;
         crate::install_window_ex_facts(vm.compat(), host.surface_size());
+        // The reference clipboard is inert
+        // (`reference/cpp/core/utils/impl/ClipboardImpl.cpp:5-19`):
+        // `hasFormat` is false, `asText` reads void, and a write is a no-op.
+        // Installing the emulated backend keeps every `Clipboard` member from
+        // raising the missing-backend error in production.
+        vm.compat()
+            .set_clipboard_backend((|_format| false, || None, |_text| {}));
 
         // The reference auto-loads `.tpm` plugins from the exe/system/plugin
         // folders before the startup scripts run
@@ -465,6 +472,11 @@ impl GameHost {
     /// The TVP layer system the VM mutates.
     pub fn scene(&self) -> &engine::Scene {
         self.host.scene()
+    }
+
+    /// The L4 VM host bound to the scene and storage.
+    pub fn vm(&self) -> &VmHost {
+        &self.vm
     }
 
     /// Runs one frame: the VM frame body (events, polls, transitions), then

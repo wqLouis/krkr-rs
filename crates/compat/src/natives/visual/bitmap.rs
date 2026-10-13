@@ -16,6 +16,7 @@ use super::common::{
 use crate::native_util::{args, report_error, set_bool, set_int, set_void, value_as_string};
 use crate::natives::system::value_as_i64;
 use crate::resource::ResourceResolver;
+use crate::storage::strip_file_media;
 use crate::{CompatCtx, CompatError, CompatServices};
 
 /// `Bitmap` payload: the scene bitmap id plus the async-load flag.
@@ -80,13 +81,15 @@ pub(crate) fn read_image_from_storage(
     storage: &Storage,
     name: &str,
 ) -> Result<(String, Vec<u8>), String> {
-    match storage.read(name) {
+    // The media prefix is L3 syntax; the L2 namespace resolves the bare name.
+    let lookup = strip_file_media(name);
+    match storage.read(lookup) {
         Ok(bytes) => return Ok((name.to_string(), bytes)),
         Err(StorageReadError::NotFound(_)) => {}
         Err(error) => return Err(error.to_string()),
     }
     for extension in IMAGE_EXTENSION_PROBE {
-        let candidate = format!("{name}{extension}");
+        let candidate = format!("{lookup}{extension}");
         match storage.read(&candidate) {
             Ok(bytes) => return Ok((candidate, bytes)),
             Err(StorageReadError::NotFound(_)) => {}

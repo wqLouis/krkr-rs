@@ -24,6 +24,7 @@ use engine::{BitmapState, Location, Storage, StorageReadError};
 use tjs::{Tjs2Engine, TjsValue, Value};
 
 use crate::CompatCtx;
+use crate::storage::strip_file_media;
 
 /// Default face requested when `Font.getList`/`Font.defaultFaceName` need to
 /// establish a platform face (the reference `TVPDefaultFontFaceName`).
@@ -194,7 +195,9 @@ impl ResourceResolver {
         // SAFETY: the host keeps the attached storage alive for the binding's
         // lifetime (the `attach_storage` contract).
         let store = unsafe { &*store };
-        let Some(location) = store.find(storage).map_err(|error| error.to_string())? else {
+        // The media prefix is L3 syntax; the L2 namespace resolves the bare name.
+        let lookup = strip_file_media(storage);
+        let Some(location) = store.find(lookup).map_err(|error| error.to_string())? else {
             return Err(format!("Cannot find storage {storage}"));
         };
         let placed_path = placed_path_key(&location);
@@ -314,7 +317,8 @@ fn try_face(ctx: &CompatCtx, engine: &mut TextEngine, face: &str) -> Result<Font
         // SAFETY: the host keeps the attached storage alive for the binding's
         // lifetime (the `attach_storage` contract).
         let storage = unsafe { &*storage };
-        match storage.read(face) {
+        // The media prefix is L3 syntax; the L2 namespace resolves the bare name.
+        match storage.read(strip_file_media(face)) {
             Ok(bytes) => {
                 return engine
                     .add_font(&bytes, 0)
@@ -969,7 +973,7 @@ impl PrerenderedBody {
 /// the header at map time, and the index bounds we defer are unchecked reads
 /// there.
 pub(crate) struct PrerenderedFont {
-    /// The requested storage spelling, used for the first-use read.
+    /// The bare storage name, used for the first-use read.
     storage: String,
     /// The header validated at map time.
     header: PrerenderedHeader,
@@ -987,18 +991,20 @@ impl PrerenderedFont {
     /// name does not resolve (`TVPSearchPlacedPath`,
     /// `reference/cpp/core/base/StorageIntf.cpp:1111-1115`).
     pub(crate) fn map(store: &Storage, storage: &str) -> Result<Self, String> {
-        let Some(meta) = store.stat(storage).map_err(|error| error.to_string())? else {
+        // The media prefix is L3 syntax; the L2 namespace resolves the bare name.
+        let lookup = strip_file_media(storage);
+        let Some(meta) = store.stat(lookup).map_err(|error| error.to_string())? else {
             return Err(format!("Cannot find storage {storage}"));
         };
         if meta.size == 0 {
             return Err(PrerenderedFontError::ZeroSize.to_string());
         }
         let prefix = store
-            .read_prefix(storage, PRERENDERED_HEADER_LEN)
+            .read_prefix(lookup, PRERENDERED_HEADER_LEN)
             .map_err(|error| error.to_string())?;
         let header = validate_header(&prefix).map_err(|error| error.to_string())?;
         Ok(Self {
-            storage: storage.to_string(),
+            storage: lookup.to_string(),
             header,
             body: RefCell::new(None),
         })

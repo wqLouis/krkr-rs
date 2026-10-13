@@ -5,8 +5,51 @@
 
 mod common;
 
+use std::sync::{Mutex, MutexGuard};
+
 use api::host::SurfaceEvent;
 use common::{build_solid_and_bitmap_scene, headless_host};
+use tjs::TjsValue;
+use vm::VmHost;
+
+/// Serializes the tests that bind the process-global VM.
+fn vm_lock() -> MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poison| poison.into_inner())
+}
+
+/// Evaluates `expression` and returns its integer result.
+fn eval_int(vm: &VmHost, expression: &str) -> i64 {
+    match vm.eval(expression, "t").expect("eval succeeds") {
+        TjsValue::Integer(value) => value,
+        other => panic!("expected Integer for {expression:?}, got {other:?}"),
+    }
+}
+
+/// A unique temporary directory, removed by the caller.
+fn unique_temp_dir(tag: &str) -> std::path::PathBuf {
+    let mut base = std::env::temp_dir();
+    base.push(format!(
+        "krkr-app-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos()
+    ));
+    base
+}
+
+/// Boots a headless [`app::GameHost`] over a temporary directory holding a
+/// no-op `startup.tjs`, returning the host and the directory to remove.
+fn open_minimal_game(tag: &str) -> (app::GameHost, std::path::PathBuf) {
+    let base = unique_temp_dir(tag);
+    std::fs::create_dir_all(&base).expect("game dir");
+    std::fs::write(base.join("startup.tjs"), "// no-op startup\n").expect("startup script");
+    let host = app::Host::new(app::HostConfig::headless()).expect("headless host");
+    let game = app::GameHost::open(host, Vec::new(), base.clone()).expect("open game");
+    (game, base)
+}
 
 #[test]
 fn headless_frame_draws_texture_nodes() {
@@ -117,4 +160,57 @@ fn resize_propagates_to_the_primary_window() {
         (layer.rect.x, layer.rect.y, layer.rect.w, layer.rect.h),
         (0, 0, 800, 600)
     );
+}
+
+/// Boots the production composition root and confirms it installs the
+/// emulated Windows desktop rectangle.
+///
+/// `desktopLeft`/`desktopTop` are `0` and `desktopWidth`/`desktopHeight` are
+/// the render surface, so a startup script centring the window on the desktop
+/// sees the whole surface
+/// (`reference/cpp/core/base/impl/SystemImpl.cpp:897-935`,
+/// `reference/cpp/core/visual/impl/TVPScreen.cpp:16-19`).
+#[test]
+fn game_host_open_installs_the_desktop_rectangle() {
+    let _lock = vm_lock();
+    let (game, base) = open_minimal_game("desktop-rect");
+    let vm = game.vm();
+
+    assert_eq!(eval_int(vm, "System.desktopLeft"), 0);
+    assert_eq!(eval_int(vm, "System.desktopTop"), 0);
+    assert_eq!(eval_int(vm, "System.desktopWidth"), 1280);
+    assert_eq!(eval_int(vm, "System.desktopHeight"), 720);
+
+    drop(game);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Boots the production composition root and confirms it installs the inert
+/// clipboard backend.
+///
+/// The reference clipboard is inert
+/// (`reference/cpp/core/utils/impl/ClipboardImpl.cpp:5-19`): `hasFormat` is
+/// false for every format, `asText` reads void, and a write is a no-op.
+#[test]
+fn game_host_open_installs_the_inert_clipboard() {
+    let _lock = vm_lock();
+    let (game, base) = open_minimal_game("clipboard");
+    let vm = game.vm();
+
+    assert_eq!(eval_int(vm, "Clipboard.hasFormat(1)"), 0);
+    assert_eq!(
+        vm.eval("Clipboard.asText", "t").expect("eval asText"),
+        TjsValue::Void
+    );
+
+    // A write is accepted and does not change the void read.
+    vm.exec("Clipboard.asText = 'x';", "t")
+        .expect("assign asText");
+    assert_eq!(
+        vm.eval("Clipboard.asText", "t").expect("eval asText"),
+        TjsValue::Void
+    );
+
+    drop(game);
+    let _ = std::fs::remove_dir_all(&base);
 }

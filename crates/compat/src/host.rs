@@ -224,43 +224,25 @@ impl Drop for CompatHost {
 /// services.
 ///
 /// A handful of the reference `System` members describe genuine host facts —
-/// the application-data directory and the virtual-desktop geometry — with no
-/// L2 counterpart. L3 owns no platform code, so the host installs one closure
-/// per fact through [`CompatHost`]; until a fact is installed its member raises
-/// a typed TJS error rather than returning a fabricated value.
+/// the virtual-desktop geometry — with no L2 counterpart. L3 owns no platform
+/// code, so the host installs one closure per fact through [`CompatHost`];
+/// until a fact is installed its member raises a typed TJS error rather than
+/// returning a fabricated value.
 #[derive(Default)]
 pub(crate) struct HostFacts {
-    app_data_path: Option<Box<AppDataPathFn>>,
     desktop_rect: Option<Box<DesktopRectFn>>,
 }
 
-/// `System.appDataPath` provider signature.
-type AppDataPathFn = dyn Fn() -> Result<String, String>;
 /// `System.desktop*` provider signature; the tuple is `(left, top, width,
 /// height)`.
 type DesktopRectFn = dyn Fn() -> Result<(i32, i32, u32, u32), String>;
 
 impl CompatHost {
-    /// Install the `System.appDataPath` provider.
-    pub fn set_app_data_path(&self, f: impl Fn() -> Result<String, String> + 'static) {
-        self.services.state::<HostFacts>().app_data_path = Some(Box::new(f));
-    }
-
     /// Install the `System.desktopLeft`/`desktopTop`/`desktopWidth`/
     /// `desktopHeight` provider. The tuple is `(left, top, width, height)`.
     pub fn set_desktop_rect(&self, f: impl Fn() -> Result<(i32, i32, u32, u32), String> + 'static) {
         self.services.state::<HostFacts>().desktop_rect = Some(Box::new(f));
     }
-}
-
-/// Call the installed `System.appDataPath` provider, if any. The dispatch-state
-/// borrow is released before the result is returned.
-pub(crate) fn host_app_data_path(services: &CompatServices) -> Option<Result<String, String>> {
-    services
-        .state::<HostFacts>()
-        .app_data_path
-        .as_ref()
-        .map(|f| f())
 }
 
 /// Call the installed desktop-rectangle provider, if any.

@@ -48,6 +48,7 @@ use crate::binding;
 use crate::native_util::{args, report_error, set_int, set_void, value_as_string};
 use crate::natives::storages::extract_storage_name;
 use crate::natives::system::try_value_as_i64;
+use crate::storage::strip_file_media;
 use crate::{CompatCtx, CompatError, CompatServices};
 
 /// Per-family dispatch state: the `Scripts.textEncoding` override and the
@@ -306,8 +307,10 @@ fn log_script_read(name: &str, bytes: &[u8], encoding: Option<&str>, text: Optio
 /// text stream with (`reference/cpp/core/base/ScriptMgnIntf.cpp:716,783`),
 /// so the offset is applied before either path runs.
 fn read_storage_bytes(storage: &Storage, name: &str, mode: &str) -> Result<Vec<u8>, String> {
+    // The media prefix is L3 syntax; the L2 namespace resolves the bare name.
+    let lookup = strip_file_media(name);
     let bytes = storage
-        .read(name)
+        .read(lookup)
         .map_err(|error| format!("Scripts: '{name}': {error}"))?;
     Ok(match mode_offset(mode) {
         Some(offset) => bytes[offset.min(bytes.len())..].to_vec(),

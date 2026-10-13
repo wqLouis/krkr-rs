@@ -37,6 +37,7 @@ use tjs::{NativeMethodDef, NativeStaticMembers, Value};
 
 use crate::native_util::{args, report_error, set_int, set_void, value_as_string};
 use crate::natives::system::resolve;
+use crate::storage::strip_file_media;
 use crate::{CompatCtx, CompatError};
 
 /// `System.addFont(fontFileName[, extract])`.
@@ -71,7 +72,9 @@ extern "C" fn system_add_font(
     // SAFETY: the host keeps the attached storage alive for the binding's
     // lifetime (the `attach_storage` contract).
     let storage = unsafe { &*storage };
-    match storage.exists(&name) {
+    // The media prefix is L3 syntax; the L2 namespace resolves the bare name.
+    let lookup = strip_file_media(&name);
+    match storage.exists(lookup) {
         Ok(true) => {}
         // The reference resolves the path first; a name that does not resolve
         // leaves the result void.
@@ -85,7 +88,7 @@ extern "C" fn system_add_font(
     // (`reference/cpp/plugins/addFont.cpp:22-28`) — the file is re-read and
     // re-enumerated, and a source whose contents changed reports the new
     // face count — so there is deliberately no cached-count shortcut here.
-    let bytes = match storage.read(&name) {
+    let bytes = match storage.read(lookup) {
         Ok(bytes) => bytes,
         // The reference returns 0 when the file exists but cannot be opened.
         Err(error) => {

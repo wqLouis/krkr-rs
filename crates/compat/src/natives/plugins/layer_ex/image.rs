@@ -16,6 +16,7 @@ use tjs::{DetachedValue, NativeInstanceBuilder, NativeInstanceMethodDef, Tjs2Eng
 use super::draw::Mat;
 use super::set_real;
 use crate::native_util::{args, report_error, set_int, set_void};
+use crate::storage::strip_file_media;
 use crate::{CompatCtx, CompatError};
 
 /// `PixelFormatGDI` / `PixelFormatAlpha` / `PixelFormatCanonical`
@@ -85,13 +86,15 @@ fn read_image_candidate(
     storage: &Storage,
     name: &str,
 ) -> Result<Option<(String, Vec<u8>)>, StorageReadError> {
-    match storage.read(name) {
+    // The media prefix is L3 syntax; the L2 namespace resolves the bare name.
+    let lookup = strip_file_media(name);
+    match storage.read(lookup) {
         Ok(bytes) => return Ok(Some((name.to_string(), bytes))),
         Err(StorageReadError::NotFound(_)) => {}
         Err(error) => return Err(error),
     }
     for extension in IMAGE_EXTENSION_PROBE {
-        let candidate = format!("{name}{extension}");
+        let candidate = format!("{lookup}{extension}");
         match storage.read(&candidate) {
             Ok(bytes) => return Ok(Some((candidate, bytes))),
             Err(StorageReadError::NotFound(_)) => {}
