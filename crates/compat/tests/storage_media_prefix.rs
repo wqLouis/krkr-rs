@@ -211,3 +211,38 @@ fn save2_strips_the_file_media_prefix() {
         "the media prefix leaked into the written path"
     );
 }
+
+/// A `saveStruct` name that carries the `file:` media prefix and a doubled
+/// slash lands at the bare host path, not under a literal `file:/…` path.
+///
+/// `Array.saveStruct` is vendored TJS2 and opens the target through the
+/// `crates/tjs` stream factory, which resolves names itself; the reference
+/// resolves `TVPCreateStream` through `TVPGetLocallyAccessibleName`, which
+/// strips the local `file` media prefix
+/// (`reference/cpp/core/base/StorageIntf.cpp:240-430`), and the text write
+/// stream then opens the placed path
+/// (`reference/cpp/core/base/TextStream.cpp`).
+#[test]
+fn save_struct_strips_the_file_media_prefix_and_doubled_slash() {
+    let _lock = vm_lock();
+    let dir = GameDir::new();
+    let save_dir = dir.path().join("SaveData");
+    std::fs::create_dir_all(&save_dir).expect("create savedata dir");
+    let target = save_dir.join("savecheck");
+    let leaked = dir.path().join("file:");
+    let prefixed = format!("file://.{s}//savecheck", s = save_dir.to_string_lossy());
+    let literal = format!("{prefixed:?}");
+    // `Env::new` takes ownership of `dir`, so every path derived from it is
+    // computed above.
+    let env = Env::new(dir);
+    env.run(&format!(
+        "var a = ['hello']; a.saveStruct({literal}, 'o0');"
+    ));
+    let written = std::fs::read(&target)
+        .unwrap_or_else(|error| panic!("saveStruct did not write {target:?}: {error}"));
+    assert!(!written.is_empty(), "saveStruct wrote an empty file");
+    assert!(
+        !leaked.exists(),
+        "the media prefix leaked into the written path"
+    );
+}

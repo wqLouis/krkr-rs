@@ -4,11 +4,14 @@ Two bugs survived the last wave because a test encoded the implementation's
 assumption rather than the reference's behaviour:
 
 * `crates/compat/tests/text.rs`'s `fefe_mode0`/`fefe_mode1` built the `FE FE`
-  header as five bytes, matching our then-wrong decoder; the reference starts
-  the mode 0/1 payload at offset 4
-  (`reference/cpp/core/base/TextStream.cpp:87-88`). **Fixed in the working
-  tree** (`crates/compat/tests/text.rs:123-147` now writes four bytes, and the
-  decoder starts at `bytes.get(4..)`, `crates/compat/src/text.rs:240`).
+  header as five bytes, then the decoder read the mode 0/1 payload at offset 4
+  (`reference/cpp/core/base/TextStream.cpp:87-88`). The vendored `+4` is a
+  reconstruction error (AGENTS §9.9): the shipped `tTVPTextReadStream` requires
+  the `FF FE` BOM after the mode and starts the payload at offset 5, so the
+  five-byte fixture header was right and the offset-4 decoder was wrong.
+  **Resolved:** the decoder now reads offset 5 with a required BOM
+  (`crates/compat/src/text.rs` `decode_container`) and the fixtures keep the
+  five-byte `FE FE <mode> FF FE` header (see `docs/vm-defects.md` TS-1).
 * `crates/compat/tests/xp3_filter.rs` attached L2 storage before
   `CompatHost::install`, while the composition root registered the plugin
   first, so the filter was inert in production and green in the suite
@@ -369,8 +372,11 @@ once a reference file is committed (F1).
 
 ## E. Positive controls (verified as faithful)
 
-* `crates/compat/tests/text.rs:123-147` now builds the correct four-byte
-  `FE FE` header and cites `TextStream.cpp:82-105` — the known bug is closed.
+* `crates/compat/tests/text.rs:123-147` builds the correct five-byte
+  `FE FE <mode> FF FE` header and cites `TextStream.cpp:82-105`; the offset-5
+  BOM-checking reader and the wide code-unit script path are pinned in
+  `crates/compat/src/text.rs` and `crates/tjs/src/lib.rs` — the known bug is
+  closed (see `docs/vm-defects.md` TS-1).
 * `crates/compat/tests/sound.rs:51-56` builds `.sli` text matching the
   reference grammar exactly (`#2.00`, case-insensitive `Label`,
   single-quoted values), verified against
@@ -388,7 +394,8 @@ once a reference file is committed (F1).
 
 1. **Decode a real TLG5/TLG6 in the default suite.** One small committed file
    plus one `decode_image` → exact-RGBA assertion closes the largest share of
-   F1/F2/F3. This is the same lever that would have caught the `FE FE` bug.
+   F1/F2/F3. This is the same lever that would have caught the `FE FE` offset
+   bug that only the device logs exposed.
 2. **Commit one real XP3 and parse it with `Xp3Archive`.** Add a
    compressed-index fixture (nothing builds `TVP_XP3_INDEX_ENCODE_ZLIB`).
 3. **Single `build_xp3`.** Delete the three compat copies; cite

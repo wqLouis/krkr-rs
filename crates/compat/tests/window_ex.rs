@@ -246,25 +246,34 @@ fn set_message_hook_returns_the_all_hook_flag() {
     // The all-form assigns and returns.
     assert_eq!(env.eval_int("w.setMessageHook(1)"), 1);
     // The one-form returns the *all-hook* flag (still 1) and stores nothing.
-    assert_eq!(env.eval_int("w.setMessageHook(0, 'WM_MOUSEMOVE')"), 1);
+    assert_eq!(env.eval_int("w.setMessageHook(0, 'MOUSEMOVE')"), 1);
     // Turning the all-hook off…
     assert_eq!(env.eval_int("w.setMessageHook(0)"), 0);
     // …means the one-form now reports 0 — even with `on = 1`.
-    assert_eq!(env.eval_int("w.setMessageHook(1, 'WM_MOUSEMOVE')"), 0);
+    assert_eq!(env.eval_int("w.setMessageHook(1, 'MOUSEMOVE')"), 0);
     // The one-form never set anything: the all-form still reads false.
     assert_eq!(env.eval_int("w.setMessageHook()"), 0);
     // A numeric second argument takes the same path (`windowEx.cpp:609`).
     assert_eq!(env.eval_int("w.setMessageHook(1, 512)"), 0);
     assert_eq!(env.eval_int("w.setMessageHook(1)"), 1);
 
-    // Unknown names and out-of-range numbers raise TJS_E_FAIL
-    // (`windowEx.cpp:611-612`).
-    let error = env.eval_err("w.setMessageHook(1, 'WM_NOT_A_MESSAGE')");
-    assert!(error.contains("unknown message"), "unexpected: {error}");
+    // Unknown names read -1 through `getIntValue(key, -1)`
+    // (`ncbind.hpp:689-695`, `windowEx.cpp:607`) and then raise TJS_E_FAIL in
+    // the range check (`windowEx.cpp:611-612`).
+    let error = env.eval_err("w.setMessageHook(1, 'NOT_A_MESSAGE')");
+    assert!(error.contains("out of range"), "unexpected: {error}");
+    // A `WM_`-prefixed name is *not* a key in the reference dictionary; the
+    // macro writes the bare `#key` (`windowEx.cpp:801`).
+    let error = env.eval_err("w.setMessageHook(1, 'WM_MOUSEMOVE')");
+    assert!(error.contains("out of range"), "unexpected: {error}");
     let error = env.eval_err("w.setMessageHook(1, 1024)");
     assert!(error.contains("out of range"), "unexpected: {error}");
     // 0x3FF is the last accepted number.
     assert_eq!(env.eval_int("w.setMessageHook(1, 1023)"), 1);
+    // A bare `#key` name (`windowEx.cpp:801`) is accepted and takes the
+    // one-message path (`windowEx.cpp:607-613`).
+    assert_eq!(env.eval_int("w.setMessageHook(1, 'MOUSEMOVE')"), 1);
+    assert_eq!(env.eval_int("w.setMessageHook(1, 'KEYDOWN')"), 1);
 
     // `!!p[0]->AsInteger()` coercion (`windowEx.cpp:601`,
     // `reference/cpp/core/tjs2/tjsVariant.h:862-878`): 0.5 truncates to 0.
@@ -288,7 +297,9 @@ fn set_message_hook_returns_the_all_hook_flag() {
 /// dictionary with `getIntValue(key, -1)` (`windowEx.cpp:751-758`) — a
 /// case-sensitive member lookup (`reference/cpp/core/tjs2/tjsObject.h:331-336`
 /// compares names with `TJS_strcmp`), so a differently-cased name misses and
-/// the -1 default comes back. `getWindowNotificationName` reads the reverse
+/// the -1 default comes back. The dictionary keys are the bare `#key` names
+/// the macro stringizes (`windowEx.cpp:801`), e.g. `"MOUSEMOVE"`.
+/// `getWindowNotificationName` reads the reverse
 /// direction with `getStrValue(num)` whose default is the empty string
 /// (`reference/cpp/core/plugin/ncbind.hpp:703-710`); the reference signature
 /// takes exactly one parameter, enforced by ncbind
@@ -300,24 +311,20 @@ fn notification_lookup_matches_the_reference_table() {
     let _lock = vm_lock();
     let env = Env::new();
     env.run("var w = new Window();");
-    // Exact names only.
-    assert_eq!(env.eval_int("w.getNotificationNum('WM_MOUSEMOVE')"), 512);
+    // Exact bare names only (`#key` at `windowEx.cpp:801`).
+    assert_eq!(env.eval_int("w.getNotificationNum('MOUSEMOVE')"), 512);
     assert_eq!(env.eval_int("w.getNotificationNum('wm_mousemove')"), -1);
-    assert_eq!(env.eval_int("w.getNotificationNum('WM_NOPE')"), -1);
+    assert_eq!(env.eval_int("w.getNotificationNum('NOPE')"), -1);
+    // A `WM_`-prefixed name is not a key in the reference dictionary.
+    assert_eq!(env.eval_int("w.getNotificationNum('WM_MOUSEMOVE')"), -1);
     // A missing argument is rejected by ncbind.
     assert!(env.eval("w.getNotificationNum()").is_err());
     // Name lookups, including the `AsInteger` string conversion.
-    assert_eq!(env.eval_str("w.getNotificationName(512)"), "WM_MOUSEMOVE");
-    assert_eq!(
-        env.eval_str("w.getNotificationName(160.9)"),
-        "WM_NCMOUSEMOVE"
-    );
-    assert_eq!(
-        env.eval_str("w.getNotificationName('160')"),
-        "WM_NCMOUSEMOVE"
-    );
-    // "abc" parses as 0 → WM_NULL; an unknown number reads "".
-    assert_eq!(env.eval_str("w.getNotificationName('abc')"), "WM_NULL");
+    assert_eq!(env.eval_str("w.getNotificationName(512)"), "MOUSEMOVE");
+    assert_eq!(env.eval_str("w.getNotificationName(160.9)"), "NCMOUSEMOVE");
+    assert_eq!(env.eval_str("w.getNotificationName('160')"), "NCMOUSEMOVE");
+    // "abc" parses as 0 → NULL; an unknown number reads "".
+    assert_eq!(env.eval_str("w.getNotificationName('abc')"), "NULL");
     assert_eq!(env.eval_str("w.getNotificationName(9999)"), "");
     assert!(env.eval("w.getNotificationName()").is_err());
     // The `AsInteger` coercion rejects object arguments.
@@ -325,35 +332,33 @@ fn notification_lookup_matches_the_reference_table() {
 }
 
 /// Reference: `_getNotificationVariant` builds `Window._Notifications` as a
-/// two-way dictionary — `WM(name) => value` *and* `value => WM(name)` for
-/// every entry (`reference/cpp/plugins/windowEx.cpp:796-873`), attached to
-/// the `Window` class (`windowEx.cpp:874-876`). Later writes win, so the
-/// reverse of the duplicated values resolves to the last name in the macro
-/// list: `WM_KEYDOWN` (256), `WM_SETTINGCHANGE` (26), `WM_MOUSELAST` (526),
-/// `WM_KEYLAST` (265).
+/// two-way dictionary — `name => value` *and* `value => name` for every entry
+/// (`reference/cpp/plugins/windowEx.cpp:800-871`), attached to the `Window`
+/// class (`windowEx.cpp:874-876`). The name is the macro's stringized bare
+/// token `#key` (`windowEx.cpp:801`), not `WM_`-prefixed. Later writes win, so
+/// the reverse of the duplicated values resolves to the last name in the
+/// macro list: `KEYDOWN` (256), `SETTINGCHANGE` (26), `MOUSELAST` (526),
+/// `KEYLAST` (265).
 #[test]
 fn notification_dictionary_is_installed_on_the_window_class() {
     let _lock = vm_lock();
     let env = Env::new();
     env.run("var w = new Window();");
     // Both directions, plain entries.
-    assert_eq!(env.eval_int("Window._Notifications.WM_CLOSE"), 16);
-    assert_eq!(env.eval_str("Window._Notifications[16]"), "WM_CLOSE");
-    assert_eq!(env.eval_int("Window._Notifications.WM_MOUSEMOVE"), 512);
-    assert_eq!(env.eval_str("Window._Notifications[512]"), "WM_MOUSEMOVE");
+    assert_eq!(env.eval_int("Window._Notifications.CLOSE"), 16);
+    assert_eq!(env.eval_str("Window._Notifications[16]"), "CLOSE");
+    assert_eq!(env.eval_int("Window._Notifications.MOUSEMOVE"), 512);
+    assert_eq!(env.eval_str("Window._Notifications[512]"), "MOUSEMOVE");
     // Duplicated values resolve to the last-written name.
-    assert_eq!(env.eval_str("Window._Notifications[256]"), "WM_KEYDOWN");
-    assert_eq!(
-        env.eval_str("Window._Notifications[26]"),
-        "WM_SETTINGCHANGE"
-    );
-    assert_eq!(env.eval_str("Window._Notifications[526]"), "WM_MOUSELAST");
-    assert_eq!(env.eval_str("Window._Notifications[265]"), "WM_KEYLAST");
+    assert_eq!(env.eval_str("Window._Notifications[256]"), "KEYDOWN");
+    assert_eq!(env.eval_str("Window._Notifications[26]"), "SETTINGCHANGE");
+    assert_eq!(env.eval_str("Window._Notifications[526]"), "MOUSELAST");
+    assert_eq!(env.eval_str("Window._Notifications[265]"), "KEYLAST");
     // The forward direction of the duplicates stays intact.
-    assert_eq!(env.eval_int("Window._Notifications.WM_KEYFIRST"), 256);
-    assert_eq!(env.eval_int("Window._Notifications.WM_WININICHANGE"), 26);
+    assert_eq!(env.eval_int("Window._Notifications.KEYFIRST"), 256);
+    assert_eq!(env.eval_int("Window._Notifications.WININICHANGE"), 26);
     // The table is queryable through a window object too.
-    assert_eq!(env.eval_int("w.getNotificationNum('WM_CLOSE')"), 16);
+    assert_eq!(env.eval_int("w.getNotificationNum('CLOSE')"), 16);
 }
 
 // ---------------------------------------------------------------------------
@@ -686,9 +691,9 @@ fn every_window_instance_method_is_registered() {
          w.resetWindowIcon(); w.setWindowIcon(''); \
          w.getWindowRect(); w.getClientRect(); w.getNormalRect(); \
          w.setOverlayBitmap(l); w.ncHitTest(0, 0); \
-         w.setMessageHook(1, 'WM_MOUSEMOVE'); w.setMessageHook(0); \
+         w.setMessageHook(1, 'MOUSEMOVE'); w.setMessageHook(0); \
          w.bringTo(); w.sendToBack(); w.registerExEvent(); \
-         w.getNotificationNum('WM_MOUSEMOVE'); w.getNotificationName(512);",
+         w.getNotificationNum('MOUSEMOVE'); w.getNotificationName(512);",
     );
     // `disableMove` and `resetExSystemMenu` have their `RawCallback`s
     // commented out (`reference/cpp/plugins/windowEx.cpp:976-977,981-982`),

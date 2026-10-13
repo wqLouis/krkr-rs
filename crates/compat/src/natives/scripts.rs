@@ -342,6 +342,37 @@ fn decode_storage_text(name: &str, bytes: &[u8], encoding: Option<&str>) -> Resu
     decoded.map_err(|error| format!("Scripts: '{name}': {error}"))
 }
 
+/// Decode `bytes` to UTF-16 code units for execution, preserving every code
+/// unit the way the reference text stream does. This is the script path's
+/// decode: the reference reads the decrypted `FE FE` payload as a
+/// `std::u16string` (`reference/cpp/core/base/TextStream.cpp:82-135`), so a
+/// lone surrogate must survive to the VM.
+fn decode_storage_units(
+    name: &str,
+    bytes: &[u8],
+    encoding: Option<&str>,
+) -> Result<Vec<u16>, String> {
+    let encoding = encoding.map_or(crate::text::TextEncoding::Detect, |name| {
+        crate::text::TextEncoding::Named(name)
+    });
+    if log::log_enabled!(log::Level::Debug) {
+        // The diagnostic names the encoding decision and shows a lossy view of
+        // the text; the units below are the exact payload handed to the VM.
+        let reported = crate::text::decode_text_reported(bytes, encoding);
+        match &reported {
+            Ok(decoded) => log_script_read(
+                name,
+                bytes,
+                Some(decoded.encoding.as_str()),
+                Some(decoded.text.as_str()),
+            ),
+            Err(_) => log_script_read(name, bytes, None, None),
+        }
+    }
+    crate::text::decode_text_units(bytes, encoding)
+        .map_err(|error| format!("Scripts: '{name}': {error}"))
+}
+
 /// Maximum number of source bytes a failure diagnostic prints.
 const FAILURE_SOURCE_BYTES: usize = 8 * 1024;
 /// Lines printed from the head when an error names no line.
@@ -568,15 +599,15 @@ fn execute_storage(
             return Err(error);
         }
     }
-    let text = decode_storage_text(name, &bytes, encoding)?;
+    let units = decode_storage_units(name, &bytes, encoding)?;
     let result = if expression {
-        engine.eval_retained_with_context(&text, block_name, context, 0)
+        engine.eval_retained_wide_with_context(&units, block_name, context, 0)
     } else {
-        engine.exec_script_retained_with_context(&text, block_name, context, 0)
+        engine.exec_script_retained_wide_with_context(&units, block_name, context, 0)
     };
     result.map_err(|error| {
         let error = error.to_string();
-        log_script_failure(name, &text, &error);
+        log_script_failure(name, &String::from_utf16_lossy(&units), &error);
         error
     })
 }

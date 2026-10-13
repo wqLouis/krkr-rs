@@ -198,8 +198,9 @@ load-bearing (stable addresses for the log callback and the VM binding), and
 **Narrowing / size math (D11, §5).** The ABI length hand-off is clean: the
 Rust wrapper passes `script.as_ptr().cast::<c_char>()` with `script.len()`
 (usize), matching C++ `size_t`. The `FE FE` cipher path uses
-`bytes.get(4..).unwrap_or_default()` (slice, not arithmetic), `chunks_exact(2)`,
-and `u16::from_le_bytes`. The `.tpm` scan does no arithmetic casts. The only
+`bytes.get(5..).unwrap_or_default()` (slice, not arithmetic; the payload starts
+at 5 after the required `FF FE` BOM — see TS-1 in `docs/vm-defects.md`),
+`chunks_exact(2)`, and `u16::from_le_bytes`. The `.tpm` scan does no arithmetic casts. The only
 `as` on pointer-derived values are the intentional opaque `as usize` hand-offs
 (`read_instance`, the filter closure's engine address), which D37 governs and
 the pointer guard accepts.

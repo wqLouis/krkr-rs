@@ -193,6 +193,16 @@ std::u16string utf8_to_u16(const char *s, size_t len) {
     return boost::locale::conv::utf_to_utf<char16_t>(s, s + len);
 }
 
+// Build a tjs_char string from raw UTF-16 code units. Unlike the UTF-8 path
+// this keeps an unpaired surrogate, matching the reference text stream, which
+// assigns the decrypted code units without a UTF-8 round trip
+// (`reference/cpp/core/base/TextStream.cpp`).
+std::u16string units_to_u16(const uint16_t *s, size_t len) {
+    if(!s || len == 0)
+        return std::u16string();
+    return std::u16string(reinterpret_cast<const char16_t *>(s), len);
+}
+
 // Convert tjs_char (UTF-16 code units on this build) -> UTF-8 std::string.
 //
 // This must NOT go through ttstr::AsStdString(): that narrows via
@@ -1775,21 +1785,17 @@ void tjs2_set_log_cb(tjs2_engine *e, tjs2_log_cb cb, void *user) {
         g_log_engine.store(nullptr, std::memory_order_release);
 }
 
-int tjs2_exec_script(tjs2_engine *e, const char *script, size_t script_len,
-                     const char *name, void *context, int lineofs,
-                     tjs2_value *out_result, char **out_error) {
-    if(!e || (!script && script_len != 0)) {
-        if(out_error)
-            *out_error = nullptr;
-        return -1;
-    }
+// Run an ExecScript call with an already-decoded UTF-16 payload. Shared by
+// the UTF-8 entry point and the code-unit entry point.
+static int exec_script_decoded(tjs2_engine *e, std::u16string s,
+                               const char *name, void *context, int lineofs,
+                               tjs2_value *out_result, char **out_error) {
     // Clear the retained-object slot at entry: it exists so Rust can retain
     // the most recent object-valued result of THIS call; holding it across
     // calls would pin objects alive past their script lifetime.
     e->last_object.Clear();
     try {
         TJS::tTJSVariant result;
-        std::u16string s = utf8_to_u16(script, script_len);
         std::u16string n = name ? utf8_to_u16(name) : std::u16string();
         // The length-aware ttstr form keeps an interior NUL in the payload;
         // the VM's own text handling decides what that NUL means.
@@ -1826,18 +1832,39 @@ int tjs2_exec_script(tjs2_engine *e, const char *script, size_t script_len,
     }
 }
 
-int tjs2_eval(tjs2_engine *e, const char *expression, size_t expression_len,
-              const char *name, void *context, int lineofs,
-              tjs2_value *out_result, char **out_error) {
-    if(!e || (!expression && expression_len != 0)) {
+int tjs2_exec_script(tjs2_engine *e, const char *script, size_t script_len,
+                     const char *name, void *context, int lineofs,
+                     tjs2_value *out_result, char **out_error) {
+    if(!e || (!script && script_len != 0)) {
         if(out_error)
             *out_error = nullptr;
         return -1;
     }
-    e->last_object.Clear(); // see tjs2_exec_script
+    return exec_script_decoded(e, utf8_to_u16(script, script_len), name,
+                               context, lineofs, out_result, out_error);
+}
+
+int tjs2_exec_script_wide(tjs2_engine *e, const uint16_t *script,
+                          size_t script_len, const char *name, void *context,
+                          int lineofs, tjs2_value *out_result,
+                          char **out_error) {
+    if(!e || (!script && script_len != 0)) {
+        if(out_error)
+            *out_error = nullptr;
+        return -1;
+    }
+    return exec_script_decoded(e, units_to_u16(script, script_len), name,
+                               context, lineofs, out_result, out_error);
+}
+
+// Run an EvalExpression call with an already-decoded UTF-16 payload. Shared
+// by the UTF-8 entry point and the code-unit entry point.
+static int eval_decoded(tjs2_engine *e, std::u16string s, const char *name,
+                        void *context, int lineofs, tjs2_value *out_result,
+                        char **out_error) {
+    e->last_object.Clear(); // see exec_script_decoded
     try {
         TJS::tTJSVariant result;
-        std::u16string s = utf8_to_u16(expression, expression_len);
         std::u16string n = name ? utf8_to_u16(name) : std::u16string();
         if(name && n.empty()) {
             // An empty (but present) name is still a name to the reference's
@@ -1881,6 +1908,30 @@ int tjs2_eval(tjs2_engine *e, const char *expression, size_t expression_len,
         }
         return 1;
     }
+}
+
+int tjs2_eval(tjs2_engine *e, const char *expression, size_t expression_len,
+              const char *name, void *context, int lineofs,
+              tjs2_value *out_result, char **out_error) {
+    if(!e || (!expression && expression_len != 0)) {
+        if(out_error)
+            *out_error = nullptr;
+        return -1;
+    }
+    return eval_decoded(e, utf8_to_u16(expression, expression_len), name,
+                        context, lineofs, out_result, out_error);
+}
+
+int tjs2_eval_wide(tjs2_engine *e, const uint16_t *expression,
+                   size_t expression_len, const char *name, void *context,
+                   int lineofs, tjs2_value *out_result, char **out_error) {
+    if(!e || (!expression && expression_len != 0)) {
+        if(out_error)
+            *out_error = nullptr;
+        return -1;
+    }
+    return eval_decoded(e, units_to_u16(expression, expression_len), name,
+                        context, lineofs, out_result, out_error);
 }
 
 extern "C" int tjs2_assign_message_checked(const char *name,

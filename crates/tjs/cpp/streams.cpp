@@ -25,10 +25,12 @@
 //   * read mode `oN`   -> start reading at byte offset N.
 //
 // Text payload (`FE FE <mode>` crypt container):
-//   modes 0/1: four-byte header `FE FE <mode>` plus one skipped byte, then the
-//              UTF-16LE code units. There is no byte-order mark in the cipher
-//              modes; the reference reader starts at offset 4
-//              (`reference/cpp/core/base/TextStream.cpp:87-88`).
+//   modes 0/1 and 2 share the five-byte header `FE FE <mode> FF FE`. The
+//   reference reads the two bytes after the mode as the mandatory UTF-16LE
+//   byte-order mark and starts the mode 0/1 payload at offset 5, raising
+//   `TVPUnsupportedCipherMode` when the mark is absent. The vendored
+//   reconstruction's offset-4 read contradicts the shipped data and the
+//   upstream text stream, so the offset-5 reader governs.
 //   mode 2: five-byte header `FE FE 02 FF FE` (`:104-116`), then a zlib stream
 //           laid out as `[u64 compressed][u64 uncompressed]` followed by the
 //           compressed UTF-16LE bytes.
@@ -174,7 +176,23 @@ static std::string resolve_ci(const std::string &full, bool lowercase_new) {
 }
 
 // Resolve a storage-ish name to a filesystem path.
-static std::string resolve_path_str(const std::string &s) {
+//
+// The local `file` media prefix (`file://.`, `file://`, `file:`) is L3 syntax
+// the host path resolver does not understand; the reference's
+// `TVPGetLocallyAccessibleName` maps it to a local path. The prefix list
+// mirrors the compat boundary (`crates/compat/src/storage.rs`).
+static std::string strip_file_media(const std::string &s) {
+    static const char *const prefixes[] = {"file://.", "file://", "file:"};
+    for(const char *prefix : prefixes) {
+        size_t n = std::strlen(prefix);
+        if(s.size() >= n && s.compare(0, n, prefix) == 0)
+            return s.substr(n);
+    }
+    return s;
+}
+
+static std::string resolve_path_str(const std::string &raw) {
+    std::string s = strip_file_media(raw);
     if(s.empty())
         return s;
     bool absolute = s[0] == '/' || s[0] == '\\';
@@ -602,12 +620,25 @@ public:
 
         if(raw.size() >= 3 && raw[0] == 0xFE && raw[1] == 0xFE) {
             uint8_t m = raw[2];
+            if(m != 0 && m != 1 && m != 2) {
+                open_error = "FE FE container mode is not supported";
+                opened = false;
+                return;
+            }
+            // The reference reads the two bytes after the mode as the
+            // mandatory UTF-16LE byte-order mark and starts the payload at
+            // offset 5 (`FE FE <mode> FF FE`).
+            if(raw.size() < 5 || raw[3] != 0xFF || raw[4] != 0xFE) {
+                open_error =
+                    "FE FE container is missing its UTF-16LE byte-order mark";
+                opened = false;
+                return;
+            }
             if(m == 0 || m == 1) {
-                // Four-byte header `FE FE m` plus one skipped byte; the
-                // UTF-16LE payload starts at offset 4 (reference
-                // `reference/cpp/core/base/TextStream.cpp:87-88`). A `FF FE`
-                // after the mode byte is not a BOM in the cipher modes.
-                const size_t start = 4;
+                // Cipher modes 0/1: decrypt the UTF-16LE code units beginning
+                // at offset 5 (reference
+                // `reference/cpp/core/base/TextStream.cpp:82-105`).
+                const size_t start = 5;
                 for(size_t i = start; i + 1 < raw.size(); i += 2) {
                     char16_t ch = (char16_t)(raw[i] | (raw[i + 1] << 8));
                     if(m == 0) {
@@ -621,30 +652,43 @@ public:
                 }
                 return;
             }
-            if(m == 2) {
-                // `FE FE 02 FF FE [u64 compressed][u64 uncompressed][data]`
-                if(raw.size() < 5 + 16)
-                    return;
+            // m == 2
+            // `FE FE 02 FF FE [u64 compressed][u64 uncompressed][data]`
+            if(raw.size() < 5 + 16) {
+                open_error = "FE FE zlib container header is truncated";
+                opened = false;
+                return;
+            }
+            {
                 uint64_t compressed = read_u64le(raw.data() + 5);
                 uint64_t uncompressed = read_u64le(raw.data() + 13);
                 size_t payload = 5 + 16;
-                if(compressed > raw.size() - payload)
+                if(compressed > raw.size() - payload) {
+                    open_error = "FE FE zlib compressed size overruns the file";
+                    opened = false;
                     return;
+                }
                 if(uncompressed == 0)
                     return;
-                if(uncompressed % sizeof(char16_t) != 0)
-                    return; // a UTF-16 payload is an even number of bytes
                 std::vector<uint8_t> out((size_t)uncompressed);
                 uLongf dest_len = (uLongf)uncompressed;
                 int ret = uncompress(out.data(), &dest_len, raw.data() + payload,
                                      (uLong)compressed);
-                if(ret != Z_OK || dest_len != uncompressed)
+                if(ret != Z_OK || dest_len != uncompressed) {
+                    open_error = "FE FE zlib payload failed to inflate";
+                    opened = false;
                     return;
-                text.resize((size_t)uncompressed / sizeof(char16_t));
-                std::memcpy(text.data(), out.data(), (size_t)uncompressed);
+                }
+                // The reference assigns `uncompressed / 2` code units, so an
+                // odd byte count is truncated rather than rejected
+                // (reference/cpp/core/base/TextStream.cpp:129-131).
+                size_t units = (size_t)uncompressed / sizeof(char16_t);
+                text.resize(units);
+                if(units > 0)
+                    std::memcpy(text.data(), out.data(),
+                                units * sizeof(char16_t));
                 return;
             }
-            return; // unsupported mode
         }
 
         // Plain text: BOM detection (UTF-16LE/BE, UTF-8) + UTF-16LE
@@ -829,11 +873,12 @@ public:
             write_u64le(*stream, 0);
             write_u64le(*stream, 0);
         } else {
-            // Cipher modes 0/1: four-byte header `FE FE m` plus one skipped
-            // byte; the payload starts at offset 4 (reference
-            // `reference/cpp/core/base/TextStream.cpp:87-88`).
-            uint8_t sig[4] = {0xFE, 0xFE, (uint8_t)crypt_mode, 0x00};
-            stream->WriteBuffer(sig, 4);
+            // Cipher modes 0/1: the three-byte signature `FE FE m` then the
+            // UTF-16LE byte-order mark, so the reader's mandatory-BOM header
+            // matches. The reference writer emits the same 3-byte signature
+            // followed by the BOM.
+            uint8_t sig[5] = {0xFE, 0xFE, (uint8_t)crypt_mode, 0xFF, 0xFE};
+            stream->WriteBuffer(sig, 5);
         }
     }
 
@@ -960,6 +1005,8 @@ extern "C" int tjs2_read_text_stream_all(const char *path_utf8,
         std::string path = resolve_path_str(path_utf8);
         std::string mode = mode_utf8 ? mode_utf8 : "";
         TextReadStream stream(path, mode);
+        if(!stream.ok())
+            return 1;
         TJS::tTJSString content;
         stream.Read(content, 0);
         std::string utf8 =

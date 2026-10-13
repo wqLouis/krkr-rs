@@ -139,58 +139,74 @@ behaviour rather than an accident.
 
 ---
 
-## TS-1 — the `FE FE` text-stream container's reader and writer disagree (mode 1 is not round-trippable)
+## TS-1 — the `FE FE` text-stream container's reader and writer disagree (RESOLVED: the vendored offset-4 read was a reconstruction error)
 
-**Summary:** the reference writer emits a 5-byte header for cipher mode 1, but
-the reader starts the mode-1 payload at byte 4; the reference cannot read its
-own mode-1 output. Mode 2 is self-consistent; mode 0 has no writer.
+**Summary:** the vendored reference reader starts a mode 0/1 payload at byte 4
+(`(size - 4) / 2`) while its own mode-2 reader and its writer use a 5-byte
+header (`FE FE <mode> FF FE`), so the vendored reader appears not to read the
+writer's mode-1 output. The resolution is that the `+4` is a reconstruction
+error: the shipped engine reads the two bytes after the mode as the mandatory
+UTF-16LE BOM `FF FE` and starts the payload at **offset 5**, so mode 0/1 is
+self-consistent with mode 2 and with the writer. The port followed the
+reconstruction's offset 4 for a while and misread every real game script; it
+now follows the shipped data.
 
 **Related:** BLK-3 is the same class of reader/writer split, in the bytecode
 operand table.
 
-**Defect.**
-- Reader (`reference/cpp/core/base/TextStream.cpp:82-105`): for `FE FE m` with
-  `m == 0 || m == 1` the payload pointer is `raw.data() + 4` and the length is
-  `(size - 4) / 2` (`:85-88`). For `m == 2` the payload starts at
+**Defect (historical — the vendored reconstruction).**
+- Vendored reader (`reference/cpp/core/base/TextStream.cpp:82-105`): for
+  `FE FE m` with `m == 0 || m == 1` the payload pointer is `raw.data() + 4` and
+  the length is `(size - 4) / 2` (`:85-88`). For `m == 2` the payload starts at
   `raw.data() + 5` (`:104-116`).
 - Writer (`:269-280`): for `_cryptMode == 1 || 2` it writes
   `crypt_mode_sig[0..3]` where `crypt_mode_sig[0]=0xfe, [1]=0xfe, [2]=mode,
   [3]=0` — but `WriteBuffer(crypt_mode_sig, 3)` writes only **3** bytes
   (`:275`); `crypt_mode_sig[3] = 0` at `:274` is dead. It then writes an
   unconditional `FF FE` BOM (`:279-280`). So mode 1 emits
-  `FE FE 01 FF FE` (5 bytes), while the mode-1 reader starts the payload at
-  byte 4 — misaligned by the BOM. Mode 2 emits `FE FE 02 FF FE` (5 bytes) and
-  its reader uses offset 5, so mode 2 is self-consistent. The writer rejects
-  any mode other than 1 or 2 (`:258-260`), so there is no mode-0 writer.
+  `FE FE 01 FF FE` (5 bytes). The writer rejects any mode other than 1 or 2
+  (`:258-260`), so there is no mode-0 writer.
 
-**Evidence.** `reference/cpp/core/base/TextStream.cpp:82-105` (reader),
-`:255-290` (writer), dead `crypt_mode_sig[3]` at `:274`. Recorded in
-`docs/audits/save-crash.md` C1.
+**Resolution and evidence.** The shipped engine's `tTVPTextReadStream` consumes
+the 3-byte signature, then reads **2 further bytes and requires them to be
+`FF FE`** (raising `TVPUnsupportedCipherMode` otherwise), and only then reads
+the mode 0/1 payload — i.e. from offset 5, exactly like mode 2 and the writer.
+The vendored mode-0/1 `+4` contradicts both the shipped data and the rest of
+its own file (mode 2 at `+5`). The device evidence settled it:
+`krkr-rs-logs (6).txt`'s boot failures carry odd drop counts
+(`289 = 2·144 + 1`, `9 = 2·4 + 1` — a trailing half unit), the signature of a
+one-byte misalignment, and encrypting a real 70 KB UTF-16 script with the
+reference mode-0/1 cipher and reading it back shows the offset-4 read yields 32
+unpaired surrogates plus one trailing byte while the offset-5 read matches the
+plaintext exactly. This is the AGENTS §9.9 case: the vendored source
+contradicted the shipped data, so the code follows the shipped data.
 
-**Whose bug:** reference.
+**Whose bug:** the vendored reconstruction, not the shipped engine.
 
-**Script-observable:** indirectly. A script that writes a text stream in mode 1
-and reads it back (or a title whose data was written in mode 1) gets garbage;
-mode 2 (the KAG `"zN"`/default path) is unaffected. There is no mode-0/1 sample
-in the tree to confirm against (see §9).
+**Script-observable:** it was. Every real Yuzusoft-lineage boot script decoded
+through the offset-4 read one byte out of phase, producing unpaired surrogates
+the parser rejected (`startup.tjs(1) -> Initialize.tjs(1) -> Config.tjs(1):
+syntax error`); at offset 5 the payload reaches the parser byte-for-byte.
 
-**Current workaround.** Follow the **reader**, because compatibility means
-reading shipped data and the reader is the side that consumes real game files;
-the dead `crypt_mode_sig[3]` marks the writer as a reconstruction (REC-1). The
-port's reader reads mode 0/1 at `start = 4`
-(`crates/tjs/cpp/streams.cpp:509-549`) and mode 2 at offset 5
-(`:531-547`). The port's writer emits the 4-byte `FE FE m 00` for modes 0/1
-(`:736-741`) — so a port-written mode-1 stream *is* readable by the reference
-reader — and `FE FE 02 FF FE` for mode 2 (`:713-715`). This is deliberately
-**not** byte-identical to the reference writer; it is byte-compatible with the
-reference reader.
+**Resolution (code).** The port reads modes 0/1/2 at offset 5 and requires the
+`FF FE` BOM for every mode (`crates/compat/src/text.rs` `decode_container` /
+`require_container_bom`; `crates/tjs/cpp/streams.cpp` `TextReadStream`, which
+also fails a malformed container instead of returning empty). The container
+decode keeps raw `Vec<u16>` code units and the script loader hands them to the
+VM through the wide exec/eval ABI, so an unpaired surrogate is preserved like
+the reference's `std::u16string`. The port's writer emits the same 5-byte
+`FE FE <mode> FF FE` header for modes 0/1 as for mode 2, so a port-written
+stream round-trips. Pinned by
+`crates/compat/src/text.rs::fefe_cipher_payload_starts_at_offset_five`,
+`fefe_cipher_requires_the_byte_order_mark`,
+`fefe_containers_keep_every_code_unit`,
+`crates/tjs/src/lib.rs::rejects_a_cipher_container_without_the_bom` and
+`writer_emits_the_reference_crypt_header`.
 
-**What a rewrite should do.** Define **one** container format with a single
-dimensioned header (magic, version, mode, flags, payload length) and a
-round-trip property test. Keep a legacy reader for shipped files, but do not
-reproduce the mode-1 writer bug. If the project must write files the reference
-can read, the writer's contract is "the reference reader's offset", and that
-should be stated in the format comment and pinned by a byte-level test.
+**What a rewrite should do (unchanged).** Define **one** container format with
+a single dimensioned header (magic, version, mode, flags, payload length) and a
+round-trip property test. Keep a legacy reader for shipped files, and state the
+writer's contract in the format comment and pin it by a byte-level test.
 
 ---
 
@@ -438,12 +454,15 @@ from. Record the evidence when vendored source and shipped data disagree.
 be wrong about a detail the real engine got right (or vice versa), and when it
 is, the *data* wins for behaviour that must be compatible.
 
-**Evidence — the worked example.** The `FE FE` writer bug (TS-1) is only
-visible because the reader and writer disagree: the writer's
-`crypt_mode_sig[3] = 0` is declared and never written
-(`TextStream.cpp:271-275`), a classic reconstruction artifact, and mode 1 is
-not round-trippable. The reader matches how real files are laid out (modes 0/1
-payload at offset 4, mode 2 at offset 5), which is why we follow the reader.
+**Evidence — the worked example.** The `FE FE` reader (TS-1) is the clearest
+case: the vendored reader starts a mode 0/1 payload at offset 4
+(`TextStream.cpp:85-88`) while its own file, its writer
+(`crypt_mode_sig[3] = 0` is declared but never written, `:271-275`) and the
+shipped engine all use the 5-byte `FE FE <mode> FF FE` header and offset 5.
+Following the reconstruction's offset 4 misread every real game script (odd
+drop counts and unpaired surrogates); the shipped `tTVPTextReadStream` confirms
+offset 5, and the port now follows the shipped data with the evidence recorded
+in TS-1. This is the case where the *data* overruled the vendored source.
 Also: `TVPCheckExistentLocalFile`
 (`reference/cpp/core/base/impl/StorageImpl.cpp:532-546`) carries a `#if 0`
 Windows `GetFileAttributes` body and a reconstructed `tTVP_stat`/`S_IFREG`

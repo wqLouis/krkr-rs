@@ -219,13 +219,15 @@ fn builtin_save_struct_writes_the_reference_crypt_container() {
 }
 
 /// A declared uncompressed length that is not a whole number of UTF-16 code
-/// units cannot be decoded. The reader must reject it instead of copying
-/// `uncompressed` bytes into a `uncompressed / 2`-element buffer.
+/// units is truncated to `uncompressed / 2` code units, as the reference's
+/// `_buffer.assign` does; it is not a failure.
 #[test]
-fn builtin_reader_rejects_an_odd_utf16_payload_length() {
+fn builtin_reader_truncates_an_odd_utf16_payload_length() {
     let _lock = vm_lock();
     // `FE FE 02 FF FE`, compressed=11, uncompressed=3, then zlib("ABC").
-    // The declared size is odd, so no whole number of UTF-16 units follows.
+    // The declared size is odd: the reader takes `3 / 2 = 1` whole
+    // `char16_t` unit (`0x4241` from bytes `41 42`) and drops the trailing
+    // `0x43`.
     let fixture: &[u8] = &[
         0xfe, 0xfe, 0x02, 0xff, 0xfe, 0x0b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x78, 0x9c, 0x73, 0x74, 0x72, 0x06, 0x00, 0x01, 0x8d,
@@ -235,13 +237,11 @@ fn builtin_reader_rejects_an_odd_utf16_payload_length() {
     std::fs::write(&path, fixture).unwrap();
     let text = decode_stream(&path, "");
     let _ = std::fs::remove_file(&path);
-    // reference/cpp/core/base/TextStream.cpp:313-334: the decompressed bytes
-    // are read as `char16_t` units, so an odd byte count is not a decodable
-    // UTF-16 stream.
-    assert!(
-        text.is_empty(),
-        "an odd declared UTF-16 length must not yield text: {text:?}"
-    );
+    // reference/cpp/core/base/TextStream.cpp:129-131: `_buffer.assign` reads
+    // the decompressed bytes as `char16_t` and the end pointer advances by
+    // `uncompressed` bytes, so the buffer holds `uncompressed / 2` code units
+    // and the odd trailing byte is dropped rather than rejected.
+    assert_eq!(text, "䉁", "the odd trailing byte must be truncated");
 }
 
 #[test]

@@ -307,6 +307,31 @@ unsafe extern "C" {
         out_result: *mut Value,
         out_error: *mut *mut c_char,
     ) -> c_int;
+    /// Execute a TJS script from UTF-16 code units: the lossless counterpart
+    /// of `tjs2_exec_script`, so an unpaired surrogate survives the boundary.
+    /// `script` points at `script_len` `u16` values.
+    fn tjs2_exec_script_wide(
+        e: *mut Engine,
+        script: *const u16,
+        script_len: usize,
+        name: *const c_char,
+        context: *mut c_void,
+        lineofs: c_int,
+        out_result: *mut Value,
+        out_error: *mut *mut c_char,
+    ) -> c_int;
+    /// Evaluate a TJS expression from UTF-16 code units; same conventions as
+    /// `tjs2_exec_script_wide`.
+    fn tjs2_eval_wide(
+        e: *mut Engine,
+        expression: *const u16,
+        expression_len: usize,
+        name: *const c_char,
+        context: *mut c_void,
+        lineofs: c_int,
+        out_result: *mut Value,
+        out_error: *mut *mut c_char,
+    ) -> c_int;
     /// Replace the text of a registered TJS message (reference
     /// `TJS::TJSAssignMessage`). Returns 1 when the message exists, 0 when it
     /// does not, and -1 on a C++ error (reported through `out_error`).
@@ -533,7 +558,8 @@ unsafe extern "C" {}
 // Diagnostic helper implemented in cpp/streams.cpp: decode a whole text
 // stream (honoring the mode's `oN` offset and the `FE FE` crypt container)
 // into a malloc'd UTF-8 string (free with [`tjs2_free_string`]). Returns 0
-// on success. Used only by the stream tests below, so it is compiled for tests.
+// on success and non-zero when the file or container cannot be read. Used
+// only by the stream tests below, so it is compiled for tests.
 #[cfg(test)]
 unsafe extern "C" {
     fn tjs2_read_text_stream_all(
@@ -1167,6 +1193,121 @@ impl Tjs2Engine {
         lineofs: i32,
     ) -> Result<RetainedValue, TjsError> {
         let v = self.eval_with_context(expression, name, context, lineofs)?;
+        self.retain_object_result(v)
+    }
+
+    /// Execute a TJS script given as UTF-16 code units, keeping every unit
+    /// exactly as the reference text stream does.
+    ///
+    /// This is the lossless counterpart of [`Self::exec_script_with_context`]:
+    /// `script` is a code-unit slice, so an unpaired surrogate survives the
+    /// boundary instead of being dropped by a UTF-8 round trip.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn exec_script_wide_with_context(
+        &self,
+        script: &[u16],
+        name: &str,
+        context: *mut c_void,
+        lineofs: i32,
+    ) -> Result<TjsValue, TjsError> {
+        let name = CString::new(name).map_err(|_| TjsError("name contains NUL".into()))?;
+        let mut result = Value {
+            ty: VAL_VOID,
+            integer: 0,
+            real: 0.0,
+            string: ptr::null(),
+            array: ptr::null(),
+            array_count: 0,
+            retained: 0,
+        };
+        let mut error: *mut c_char = ptr::null_mut();
+        // SAFETY: `script` is a live `&[u16]` and `name` a live C string; the
+        // caller guarantees `context` is a live object handle or null.
+        let rc = unsafe {
+            tjs2_exec_script_wide(
+                self.inner,
+                script.as_ptr(),
+                script.len(),
+                name.as_ptr(),
+                context,
+                lineofs,
+                &mut result,
+                &mut error,
+            )
+        };
+        if rc != 0 {
+            return Err(take_error(error));
+        }
+        Ok(take_value(&result))
+    }
+
+    /// [`Self::exec_script_wide_with_context`] retaining an object result; see
+    /// [`Self::exec_script_retained`].
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn exec_script_retained_wide_with_context(
+        &self,
+        script: &[u16],
+        name: &str,
+        context: *mut c_void,
+        lineofs: i32,
+    ) -> Result<RetainedValue, TjsError> {
+        let v = self.exec_script_wide_with_context(script, name, context, lineofs)?;
+        self.retain_object_result(v)
+    }
+
+    /// Evaluate a TJS expression given as UTF-16 code units.
+    ///
+    /// The lossless counterpart of [`Self::eval_with_context`].
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn eval_wide_with_context(
+        &self,
+        expression: &[u16],
+        name: &str,
+        context: *mut c_void,
+        lineofs: i32,
+    ) -> Result<TjsValue, TjsError> {
+        let name = CString::new(name).map_err(|_| TjsError("name contains NUL".into()))?;
+        let mut result = Value {
+            ty: VAL_VOID,
+            integer: 0,
+            real: 0.0,
+            string: ptr::null(),
+            array: ptr::null(),
+            array_count: 0,
+            retained: 0,
+        };
+        let mut error: *mut c_char = ptr::null_mut();
+        // SAFETY: `expression` is a live `&[u16]` and `name` a live C string;
+        // the caller guarantees `context` is a live object handle or null.
+        let rc = unsafe {
+            tjs2_eval_wide(
+                self.inner,
+                expression.as_ptr(),
+                expression.len(),
+                name.as_ptr(),
+                context,
+                lineofs,
+                &mut result,
+                &mut error,
+            )
+        };
+        if rc != 0 {
+            return Err(take_error(error));
+        }
+        Ok(take_value(&result))
+    }
+
+    /// [`Self::eval_wide_with_context`] retaining an object result; see
+    /// [`Self::eval_retained`].
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn eval_retained_wide_with_context(
+        &self,
+        expression: &[u16],
+        name: &str,
+        context: *mut c_void,
+        lineofs: i32,
+    ) -> Result<RetainedValue, TjsError> {
+        let v = self.eval_wide_with_context(expression, name, context, lineofs)?;
         self.retain_object_result(v)
     }
 
@@ -5345,29 +5486,29 @@ var ra = a.get(); var rb = b.get();",
         "(const) %[ \"title\" => \"フィクスチャ\", \"scenario\" => \"01_01\", \"value\" => 42 ]";
 
     const FIXTURE_MODE0: &[u8] = &[
-        0xfe, 0xfe, 0x00, 0x00, 0x29, 0x28, 0x62, 0x62, 0x6e, 0x6e, 0x6f, 0x6e, 0x72, 0x72, 0x75,
-        0x74, 0x28, 0x28, 0x21, 0x20, 0x24, 0x24, 0x5a, 0x5a, 0x21, 0x20, 0x23, 0x22, 0x75, 0x74,
-        0x68, 0x68, 0x75, 0x74, 0x6d, 0x6c, 0x64, 0x64, 0x23, 0x22, 0x21, 0x20, 0x3c, 0x3c, 0x3f,
-        0x3e, 0x21, 0x20, 0x23, 0x22, 0xd4, 0xe4, 0xa2, 0x92, 0xae, 0x9e, 0xb8, 0x88, 0xc0, 0xf0,
-        0xe2, 0xd2, 0x23, 0x22, 0x2d, 0x2c, 0x21, 0x20, 0x23, 0x22, 0x72, 0x72, 0x62, 0x62, 0x64,
-        0x64, 0x6f, 0x6e, 0x60, 0x60, 0x73, 0x72, 0x68, 0x68, 0x6e, 0x6e, 0x23, 0x22, 0x21, 0x20,
-        0x3c, 0x3c, 0x3f, 0x3e, 0x21, 0x20, 0x23, 0x22, 0x31, 0x30, 0x30, 0x30, 0x5e, 0x5e, 0x31,
-        0x30, 0x30, 0x30, 0x23, 0x22, 0x2d, 0x2c, 0x21, 0x20, 0x23, 0x22, 0x77, 0x76, 0x60, 0x60,
-        0x6d, 0x6c, 0x74, 0x74, 0x64, 0x64, 0x23, 0x22, 0x21, 0x20, 0x3c, 0x3c, 0x3f, 0x3e, 0x21,
-        0x20, 0x35, 0x34, 0x33, 0x32, 0x21, 0x20, 0x5c, 0x5c,
+        0xfe, 0xfe, 0x00, 0xff, 0xfe, 0x29, 0x28, 0x62, 0x62, 0x6e, 0x6e, 0x6f, 0x6e, 0x72, 0x72,
+        0x75, 0x74, 0x28, 0x28, 0x21, 0x20, 0x24, 0x24, 0x5a, 0x5a, 0x21, 0x20, 0x23, 0x22, 0x75,
+        0x74, 0x68, 0x68, 0x75, 0x74, 0x6d, 0x6c, 0x64, 0x64, 0x23, 0x22, 0x21, 0x20, 0x3c, 0x3c,
+        0x3f, 0x3e, 0x21, 0x20, 0x23, 0x22, 0xd4, 0xe4, 0xa2, 0x92, 0xae, 0x9e, 0xb8, 0x88, 0xc0,
+        0xf0, 0xe2, 0xd2, 0x23, 0x22, 0x2d, 0x2c, 0x21, 0x20, 0x23, 0x22, 0x72, 0x72, 0x62, 0x62,
+        0x64, 0x64, 0x6f, 0x6e, 0x60, 0x60, 0x73, 0x72, 0x68, 0x68, 0x6e, 0x6e, 0x23, 0x22, 0x21,
+        0x20, 0x3c, 0x3c, 0x3f, 0x3e, 0x21, 0x20, 0x23, 0x22, 0x31, 0x30, 0x30, 0x30, 0x5e, 0x5e,
+        0x31, 0x30, 0x30, 0x30, 0x23, 0x22, 0x2d, 0x2c, 0x21, 0x20, 0x23, 0x22, 0x77, 0x76, 0x60,
+        0x60, 0x6d, 0x6c, 0x74, 0x74, 0x64, 0x64, 0x23, 0x22, 0x21, 0x20, 0x3c, 0x3c, 0x3f, 0x3e,
+        0x21, 0x20, 0x35, 0x34, 0x33, 0x32, 0x21, 0x20, 0x5c, 0x5c,
     ];
 
     const FIXTURE_MODE1: &[u8] = &[
-        0xfe, 0xfe, 0x01, 0x00, 0x14, 0x00, 0x93, 0x00, 0x9f, 0x00, 0x9d, 0x00, 0xb3, 0x00, 0xb8,
-        0x00, 0x16, 0x00, 0x10, 0x00, 0x1a, 0x00, 0xa7, 0x00, 0x10, 0x00, 0x11, 0x00, 0xb8, 0x00,
-        0x96, 0x00, 0xb8, 0x00, 0x9c, 0x00, 0x9a, 0x00, 0x11, 0x00, 0x10, 0x00, 0x3e, 0x00, 0x3d,
-        0x00, 0x10, 0x00, 0x11, 0x00, 0xea, 0x30, 0x53, 0x30, 0x5f, 0x30, 0x76, 0x30, 0xc2, 0x30,
-        0xd3, 0x30, 0x11, 0x00, 0x1c, 0x00, 0x10, 0x00, 0x11, 0x00, 0xb3, 0x00, 0x93, 0x00, 0x9a,
-        0x00, 0x9d, 0x00, 0x92, 0x00, 0xb1, 0x00, 0x96, 0x00, 0x9f, 0x00, 0x11, 0x00, 0x10, 0x00,
-        0x3e, 0x00, 0x3d, 0x00, 0x10, 0x00, 0x11, 0x00, 0x30, 0x00, 0x32, 0x00, 0xaf, 0x00, 0x30,
-        0x00, 0x32, 0x00, 0x11, 0x00, 0x1c, 0x00, 0x10, 0x00, 0x11, 0x00, 0xb9, 0x00, 0x92, 0x00,
-        0x9c, 0x00, 0xba, 0x00, 0x9a, 0x00, 0x11, 0x00, 0x10, 0x00, 0x3e, 0x00, 0x3d, 0x00, 0x10,
-        0x00, 0x38, 0x00, 0x31, 0x00, 0x10, 0x00, 0xae, 0x00,
+        0xfe, 0xfe, 0x01, 0xff, 0xfe, 0x14, 0x00, 0x93, 0x00, 0x9f, 0x00, 0x9d, 0x00, 0xb3, 0x00,
+        0xb8, 0x00, 0x16, 0x00, 0x10, 0x00, 0x1a, 0x00, 0xa7, 0x00, 0x10, 0x00, 0x11, 0x00, 0xb8,
+        0x00, 0x96, 0x00, 0xb8, 0x00, 0x9c, 0x00, 0x9a, 0x00, 0x11, 0x00, 0x10, 0x00, 0x3e, 0x00,
+        0x3d, 0x00, 0x10, 0x00, 0x11, 0x00, 0xea, 0x30, 0x53, 0x30, 0x5f, 0x30, 0x76, 0x30, 0xc2,
+        0x30, 0xd3, 0x30, 0x11, 0x00, 0x1c, 0x00, 0x10, 0x00, 0x11, 0x00, 0xb3, 0x00, 0x93, 0x00,
+        0x9a, 0x00, 0x9d, 0x00, 0x92, 0x00, 0xb1, 0x00, 0x96, 0x00, 0x9f, 0x00, 0x11, 0x00, 0x10,
+        0x00, 0x3e, 0x00, 0x3d, 0x00, 0x10, 0x00, 0x11, 0x00, 0x30, 0x00, 0x32, 0x00, 0xaf, 0x00,
+        0x30, 0x00, 0x32, 0x00, 0x11, 0x00, 0x1c, 0x00, 0x10, 0x00, 0x11, 0x00, 0xb9, 0x00, 0x92,
+        0x00, 0x9c, 0x00, 0xba, 0x00, 0x9a, 0x00, 0x11, 0x00, 0x10, 0x00, 0x3e, 0x00, 0x3d, 0x00,
+        0x10, 0x00, 0x38, 0x00, 0x31, 0x00, 0x10, 0x00, 0xae, 0x00,
     ];
 
     const FIXTURE_MODE2: &[u8] = &[
@@ -5441,6 +5582,23 @@ var ra = a.get(); var rb = b.get();",
         let _ = std::fs::remove_file(&path);
     }
 
+    // reference/cpp/core/base/TextStream.cpp:82-88 — a mode 0/1 container whose
+    // bytes after the mode are not the mandatory UTF-16LE BOM `FF FE` is
+    // rejected, not read as an offset-4 payload.
+    #[test]
+    fn rejects_a_cipher_container_without_the_bom() {
+        let _vm_lock = vm_lock();
+        let path = temp_path("no-bom");
+        std::fs::write(&path, [0xFEu8, 0xFE, 0x00, 0x00, 0x40, 0x40]).unwrap();
+        let path_c = CString::new(path.to_string_lossy().as_bytes()).unwrap();
+        let mode = CString::new("").unwrap();
+        let mut out: *mut c_char = ptr::null_mut();
+        // SAFETY: both C strings are valid for the call.
+        let rc = unsafe { tjs2_read_text_stream_all(path_c.as_ptr(), mode.as_ptr(), &mut out) };
+        assert_ne!(rc, 0, "a missing BOM must fail the read");
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn array_save_load_roundtrips_each_crypt_mode() {
         let _vm_lock = vm_lock();
@@ -5479,15 +5637,23 @@ var ra = a.get(); var rb = b.get();",
     }
 
     // reference/cpp/core/base/TextStream.cpp:82-105 — the cipher modes write a
-    // four-byte header (`FE FE <mode>` plus one skipped byte); mode 2 keeps
-    // the five-byte `FE FE 02 FF FE` header (`:104-116`).
+    // five-byte header (`FE FE <mode> FF FE`); mode 2 keeps the same
+    // five-byte `FE FE 02 FF FE` header (`:104-116`).
     #[test]
     fn writer_emits_the_reference_crypt_header() {
         let _vm_lock = vm_lock();
         let e = Tjs2Engine::new().unwrap();
         for (name, mode, expected) in [
-            ("header-mode0", "o8c0", &[0xFEu8, 0xFE, 0x00, 0x00][..]),
-            ("header-mode1", "o8c1", &[0xFEu8, 0xFE, 0x01, 0x00][..]),
+            (
+                "header-mode0",
+                "o8c0",
+                &[0xFEu8, 0xFE, 0x00, 0xFF, 0xFE][..],
+            ),
+            (
+                "header-mode1",
+                "o8c1",
+                &[0xFEu8, 0xFE, 0x01, 0xFF, 0xFE][..],
+            ),
             (
                 "header-mode2",
                 "o8c2",

@@ -67,31 +67,43 @@ Files:
   for the reference `tTVPTextWriteStream`, `reference/cpp/core/base/TextStream.cpp`).
 * `crates/tjs/cpp/streams.cpp:546-566` — `write_raw` (zlib).
 * `crates/tjs/cpp/streams.cpp` — constructor: writes the crypt header
-  (modes 0/1: `FE FE <mode> 00`, 4 bytes; mode 2: `FE FE 02` + `FF FE`,
-  5 bytes), `deflateInit`, then the two 64-bit `compression_size_position`
-  placeholders.
+  (modes 0/1 and 2: `FE FE <mode>` + `FF FE`, 5 bytes), `deflateInit`, then the
+  two 64-bit `compression_size_position` placeholders.
 * `crates/tjs/cpp/streams.cpp:623-656` — destructor patches the sizes.
 * `crates/tjs/cpp/streams.cpp:716-721` — `tjs2_wire_stream_factories`.
 
-### The reference's `FE FE` writer and reader disagree
+### The `FE FE` header offset (resolved: the vendored offset-4 read was a reconstruction error)
 
-The reference reader starts a mode 0/1 payload at a fixed offset 4
+The vendored reader starts a mode 0/1 payload at a fixed offset 4
 (`reference/cpp/core/base/TextStream.cpp:85-88`, `len = (size - 4) / 2`) and a
 mode 2 payload at offset 21 (`:104-116`). Its writer emits a 3-byte signature
 and then an unconditional `FF FE` BOM (`:269-280`), i.e. `FE FE <mode> FF FE`
 (5 bytes) for modes 1 and 2; `crypt_mode_sig[3] = 0` is declared but never
-written, so the fourth byte of that array is dead. Mode 2 is therefore
-self-consistent (both sides use 5) while mode 1 is not: the reference cannot
-read back its own mode 1 output. Mode 0 has no writer at all.
+written. The mode-0/1 `+4` is inconsistent with the writer, with the same
+file's mode 2 (`+5`), and with the shipped engine.
 
-The reader governs, because loading shipped data is what compatibility means,
-and the dead `crypt_mode_sig[3]` marks the writer as a reconstruction artifact
-(AGENTS §9.9). The port writes the 4-byte form for modes 0/1, so a port-written
-mode 1 stream is readable by the reference reader. No real mode 0/1 stream
-exists in the tree to check against: the fixtures in `crates/compat/tests/text.rs`
-and `crates/tjs/src/lib.rs` are port-generated, their plaintext being the
-literal `フィクスチャ`. The device log's `script read` line carries the first 32
-bytes and the container mode, so a real sample settles it.
+The shipped engine's `tTVPTextReadStream` consumes the 3-byte signature, then
+reads 2 more bytes and requires them to be `FF FE` (raising
+`TVPUnsupportedCipherMode` otherwise), and only then reads the mode 0/1
+payload — i.e. offset 5, matching mode 2 and the writer. The device evidence
+confirms it the other way: the boot failures in `krkr-rs-logs (6).txt` have odd
+drop counts (`289 = 2·144 + 1`, `9 = 2·4 + 1` — a trailing half unit), and
+encrypting a real 70 KB UTF-16 script with the reference mode-0/1 cipher shows
+an offset-4 read yields 32 unpaired surrogates plus one trailing byte while
+offset 5 matches the plaintext exactly. This is the AGENTS §9.9 case: the
+vendored reconstruction contradicted the shipped data, so the port follows the
+shipped data.
+
+The reader still governs, but it is the shipped reader at **offset 5 with a
+required `FF FE` BOM**, not the reconstruction's offset 4. The port now reads
+offset 5, requires the BOM, and writes the same 5-byte `FE FE <mode> FF FE`
+header for modes 0/1 as mode 2, so a port-written stream round-trips. Pinned by
+`crates/compat/src/text.rs::fefe_cipher_payload_starts_at_offset_five`,
+`fefe_cipher_requires_the_byte_order_mark`,
+`fefe_containers_keep_every_code_unit`,
+`crates/tjs/src/lib.rs::rejects_a_cipher_container_without_the_bom`,
+`writer_emits_the_reference_crypt_header`, and
+`crates/compat/tests/storage_media_prefix.rs::save_struct_strips_the_file_media_prefix_and_doubled_slash`.
 
 Why it can SIGSEGV:
 * The placeholders after the BOM are written **after** `deflateInit`. The

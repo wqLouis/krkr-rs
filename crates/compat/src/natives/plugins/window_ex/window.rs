@@ -610,15 +610,15 @@ extern "C" fn window_set_message_hook(
     // SAFETY: `resolve` only succeeds for the installed, live binding.
     let services = unsafe { ctx.services() };
     let enabled = if let Some(second) = arguments.get(1) {
-        // A string names a `WM_*` message; anything else converts like
+        // A string names a notification; anything else converts like
         // `(tjs_int)*p[1]` (`windowEx.cpp:602-609`).
         let number = if second.ty == tjs::VAL_STRING {
-            match notifications::number_for(&value_as_string(second)) {
-                Some(number) => number,
-                None => {
-                    return report_error(out_error, "Window.setMessageHook: unknown message name");
-                }
-            }
+            // `getIntValue(key, -1)` on `_Notifications`
+            // (`reference/cpp/core/plugin/ncbind.hpp:689-695`, called at
+            // `windowEx.cpp:607`): a name that is not in the table reads -1,
+            // which the range check below rejects exactly like an
+            // out-of-range number.
+            notifications::number_for(&value_as_string(second)).unwrap_or(-1)
         } else {
             match as_integer(second) {
                 Ok(number) => number,
@@ -782,7 +782,8 @@ int_property_getter!(ncht_border_get, 18);
 // _Notifications
 // ---------------------------------------------------------------------------
 
-/// Install `Window._Notifications`, the two-way `WM_*` name/value dictionary.
+/// Install `Window._Notifications`, the two-way bare-name/value dictionary
+/// (`#key` from `windowEx.cpp:801`, e.g. `"PAINT" => 15`).
 pub(super) fn install_notifications(engine: &Tjs2Engine) -> Result<(), CompatError> {
     let literal = notifications::dictionary_literal();
     let dict = match engine

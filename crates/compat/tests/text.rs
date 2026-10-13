@@ -120,10 +120,10 @@ fn cp932(text: &str) -> Vec<u8> {
 }
 
 /// Encrypt `text` as an `FE FE 00` legacy XOR container (writer side): the
-/// four-byte header `FE FE 00 00` then the little-endian ciphertext
+/// five-byte header `FE FE 00 FF FE` then the little-endian ciphertext
 /// (reference `reference/cpp/core/base/TextStream.cpp:82-105`).
 fn fefe_mode0(text: &str) -> Vec<u8> {
-    let mut out = vec![0xFE, 0xFE, 0x00, 0x00];
+    let mut out = vec![0xFE, 0xFE, 0x00, 0xFF, 0xFE];
     for unit in text.encode_utf16() {
         let encrypted = if unit >= 0x20 {
             unit ^ (((unit & 0xfe) << 8) ^ 1)
@@ -136,10 +136,10 @@ fn fefe_mode0(text: &str) -> Vec<u8> {
 }
 
 /// Encrypt `text` as an `FE FE 01` adjacent-bit-swap container (writer side):
-/// the four-byte header `FE FE 01 00` then the little-endian ciphertext
+/// the five-byte header `FE FE 01 FF FE` then the little-endian ciphertext
 /// (reference `reference/cpp/core/base/TextStream.cpp:82-105`).
 fn fefe_mode1(text: &str) -> Vec<u8> {
-    let mut out = vec![0xFE, 0xFE, 0x01, 0x00];
+    let mut out = vec![0xFE, 0xFE, 0x01, 0xFF, 0xFE];
     for unit in text.encode_utf16() {
         let encrypted = ((unit & 0xaaaa) >> 1) | ((unit & 0x5555) << 1);
         out.extend_from_slice(&encrypted.to_le_bytes());

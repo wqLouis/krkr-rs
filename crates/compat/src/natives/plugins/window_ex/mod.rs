@@ -37,7 +37,8 @@
 //!   `sendToBack`, `registerExEvent`, `getNotificationNum`,
 //!   `getNotificationName`, and the static constants `nchtError` …
 //!   `nchtBorder`.
-//! * `Window._Notifications`: the two-way `WM_*` name/value dictionary.
+//! * `Window._Notifications`: the two-way notification name/value dictionary
+//!   (`"PAINT" => 15`, bare `#key` names from the reference macro).
 //!
 //! # Host seam
 //!

@@ -8,11 +8,14 @@
 //!   `tTVPTextReadStream`): BOM recognition (`:24-45`), the uchardet
 //!   detection branch for BOM-less text (`:47-57`), conversion from the
 //!   reported charset (`:137-191`), and the `FE FE` crypt/compression
-//!   container (`:82-135`). The cipher modes 0/1 have a four-byte header
-//!   (`FE FE <mode>` plus one skipped byte) and the UTF-16 payload starts at
-//!   offset 4 (`:87-88`); a `FF FE` after the mode byte is header data, not a
-//!   byte-order mark. Mode 2's header (`FE FE 02 FF FE` + two little-endian
-//!   `u64` sizes) matches the reference (`:104-116`).
+//!   container (`:82-135`). Modes 0/1 and 2 share the five-byte header
+//!   `FE FE <mode> FF FE`: the reference reads the two bytes after the mode
+//!   as the mandatory UTF-16LE byte-order mark and starts the mode 0/1
+//!   payload at offset 5. The vendored reconstruction's offset-4 read
+//!   (`:87-88`) contradicts the shipped data and the upstream text stream, so
+//!   the offset-5 reader governs (see `decode_container`). Mode 2's header
+//!   (`FE FE 02 FF FE` + two little-endian `u64` sizes) matches the reference
+//!   (`:104-116`).
 //! * `crates/tjs/cpp/streams.cpp`: the same `FE FE` handling for the TJS
 //!   native text streams.
 //!
@@ -62,7 +65,43 @@ pub(crate) enum TextEncoding<'a> {
 /// reference's Boost.Locale `skip` policy; an unsupported explicit `encoding`
 /// is a typed error.
 pub(crate) fn decode_text(bytes: &[u8], encoding: TextEncoding<'_>) -> Result<String, String> {
-    decode_text_inner(bytes, encoding).0
+    let (decoded, path) = decode_text_inner(bytes, encoding);
+    decoded.map(|decoded| decoded_into_string(decoded, path))
+}
+
+/// Decode like [`decode_text`] but return UTF-16 code units.
+///
+/// The reference's text stream decrypts an `FE FE` container into a
+/// `std::u16string` and keeps every code unit, including an unpaired
+/// surrogate (`reference/cpp/core/base/TextStream.cpp:82-135`). A Rust
+/// `String` cannot hold one, so the script loader decodes through this
+/// function and hands the VM the code units instead of a lossy UTF-8 string.
+/// A charset-decoded path is valid text and converts to code units without
+/// loss.
+pub(crate) fn decode_text_units(
+    bytes: &[u8],
+    encoding: TextEncoding<'_>,
+) -> Result<Vec<u16>, String> {
+    let (decoded, _) = decode_text_inner(bytes, encoding);
+    decoded.map(|decoded| match decoded {
+        Decoded::Utf8(text) => text.encode_utf16().collect(),
+        Decoded::Units { units, .. } => units,
+    })
+}
+
+/// The text a decode produced: UTF-8 text from a charset conversion, or the
+/// raw UTF-16 code units of an `FE FE` container.
+enum Decoded {
+    /// Valid UTF-8 produced by a charset decoder.
+    Utf8(String),
+    /// `FE FE` container code units, plus any byte that did not complete a
+    /// code unit.
+    Units {
+        /// The decrypted code units.
+        units: Vec<u16>,
+        /// A trailing byte that is not part of a code unit.
+        trailing_bytes: usize,
+    },
 }
 
 /// The UTF-8 text produced by a decode plus the encoding decision that
@@ -110,9 +149,9 @@ pub(crate) fn decode_text_reported(
     bytes: &[u8],
     encoding: TextEncoding<'_>,
 ) -> Result<DecodedText, String> {
-    let (text, path) = decode_text_inner(bytes, encoding);
-    text.map(|text| DecodedText {
-        text,
+    let (decoded, path) = decode_text_inner(bytes, encoding);
+    decoded.map(|decoded| DecodedText {
+        text: decoded_into_string(decoded, path),
         encoding: path.label(),
     })
 }
@@ -122,7 +161,7 @@ pub(crate) fn decode_text_reported(
 fn decode_text_inner<'a>(
     bytes: &[u8],
     encoding: TextEncoding<'a>,
-) -> (Result<String, String>, DecodePath<'a>) {
+) -> (Result<Decoded, String>, DecodePath<'a>) {
     // 1. `FE FE` container (never a valid UTF BOM, so it wins unambiguously).
     if bytes.len() >= 3 && bytes[0] == 0xFE && bytes[1] == 0xFE {
         return (decode_container(bytes), DecodePath::Container(bytes[2]));
@@ -132,31 +171,39 @@ fn decode_text_inner<'a>(
     //    win for UTF-32LE to be reachable.
     if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE, 0x00, 0x00]) {
         return (
-            Ok(decode_utf32(rest, "UTF-32LE", u32::from_le_bytes)),
+            Ok(Decoded::Utf8(decode_utf32(
+                rest,
+                "UTF-32LE",
+                u32::from_le_bytes,
+            ))),
             DecodePath::Bom("UTF-32LE BOM"),
         );
     }
     if let Some(rest) = bytes.strip_prefix(&[0x00, 0x00, 0xFE, 0xFF]) {
         return (
-            Ok(decode_utf32(rest, "UTF-32BE", u32::from_be_bytes)),
+            Ok(Decoded::Utf8(decode_utf32(
+                rest,
+                "UTF-32BE",
+                u32::from_be_bytes,
+            ))),
             DecodePath::Bom("UTF-32BE BOM"),
         );
     }
     if let Some(rest) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
         return (
-            decode_from_encoding(rest, encoding_rs::UTF_8),
+            decode_from_encoding(rest, encoding_rs::UTF_8).map(Decoded::Utf8),
             DecodePath::Bom("UTF-8 BOM"),
         );
     }
     if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
         return (
-            decode_from_encoding(rest, encoding_rs::UTF_16LE),
+            decode_from_encoding(rest, encoding_rs::UTF_16LE).map(Decoded::Utf8),
             DecodePath::Bom("UTF-16LE BOM"),
         );
     }
     if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
         return (
-            decode_from_encoding(rest, encoding_rs::UTF_16BE),
+            decode_from_encoding(rest, encoding_rs::UTF_16BE).map(Decoded::Utf8),
             DecodePath::Bom("UTF-16BE BOM"),
         );
     }
@@ -164,7 +211,10 @@ fn decode_text_inner<'a>(
     if let TextEncoding::Named(name) = encoding
         && !name.is_empty()
     {
-        return (decode_named(bytes, name), DecodePath::Explicit(name));
+        return (
+            decode_named(bytes, name).map(Decoded::Utf8),
+            DecodePath::Explicit(name),
+        );
     }
     // 4. Detect the charset and decode from it.
     detect_and_decode(bytes)
@@ -180,7 +230,7 @@ fn decode_text_inner<'a>(
 /// per-charset tables. Neither crate allocates per input byte: `chardetng`
 /// scores fixed-size buffers and `encoding_rs` decodes the whole slice in one
 /// pass, allocating only the output string.
-fn detect_and_decode(bytes: &[u8]) -> (Result<String, String>, DecodePath<'static>) {
+fn detect_and_decode(bytes: &[u8]) -> (Result<Decoded, String>, DecodePath<'static>) {
     // `Allow` keeps ISO-2022-JP in the candidate set, matching the charsets the
     // reference's uchardet can report.
     let mut detector = EncodingDetector::new(Iso2022JpDetection::Allow);
@@ -190,7 +240,9 @@ fn detect_and_decode(bytes: &[u8]) -> (Result<String, String>, DecodePath<'stati
     // each byte to a UTF-16 code unit (Latin-1), not CP1252.
     if detected.name() == encoding_rs::WINDOWS_1252.name() {
         return (
-            Ok(encoding_rs::mem::decode_latin1(bytes).into_owned()),
+            Ok(Decoded::Utf8(
+                encoding_rs::mem::decode_latin1(bytes).into_owned(),
+            )),
             DecodePath::Detected(None),
         );
     }
@@ -198,7 +250,7 @@ fn detect_and_decode(bytes: &[u8]) -> (Result<String, String>, DecodePath<'stati
     // Shift_JIS is already Windows-31J (cp932), so the reported encoding is
     // used as-is.
     (
-        decode_from_encoding(bytes, detected),
+        decode_from_encoding(bytes, detected).map(Decoded::Utf8),
         DecodePath::Detected(Some(detected.name())),
     )
 }
@@ -249,49 +301,77 @@ fn warn_dropped(label: &str, dropped: usize) {
 }
 
 /// Decode a `FE FE` container, dispatching on its mode byte.
-fn decode_container(bytes: &[u8]) -> Result<String, String> {
+///
+/// The reference checks the two bytes after the mode for the mandatory
+/// UTF-16LE byte-order mark `FF FE` and raises `TVPUnsupportedCipherMode` when
+/// it is absent, then reads the payload from offset 5. The vendored
+/// reconstruction at `reference/cpp/core/base/TextStream.cpp:87-88` instead
+/// starts the mode 0/1 payload at offset 4 with no BOM check; that contradicts
+/// both the shipped data (mode 0/1 files have an odd length once the 5-byte
+/// header is present, and the offset-4 read drops code units) and the upstream
+/// text stream, so the offset-5 reader governs.
+fn decode_container(bytes: &[u8]) -> Result<Decoded, String> {
     let mode = bytes[2];
     match mode {
-        0 | 1 => decode_container_cipher(bytes, mode),
-        2 => decode_container_zlib(bytes),
+        0 | 1 => {
+            require_container_bom(bytes, mode)?;
+            decode_container_cipher(bytes, mode)
+        }
+        2 => {
+            require_container_bom(bytes, mode)?;
+            decode_container_zlib(bytes)
+        }
         other => Err(format!("FE FE container mode {other} is not supported")),
     }
 }
 
-/// Decrypt the UTF-16LE payload of an `FE FE 00` / `FE FE 01` container.
-///
-/// The header is four bytes -- `FE FE <mode>` plus one skipped byte -- and the
-/// payload begins at offset 4 as little-endian code units (reference
-/// `reference/cpp/core/base/TextStream.cpp:82-105`); a trailing odd byte is
-/// dropped. Mode 0 is the legacy per-code-unit XOR (only applied to units
-/// `>= 0x20`); mode 1 is the adjacent-bit swap.
-fn decode_container_cipher(bytes: &[u8], mode: u8) -> Result<String, String> {
-    // The reference reads `(size - 4) / 2` code units starting at
-    // `raw.data() + 4` (`reference/cpp/core/base/TextStream.cpp:87-88`). There
-    // is no `FF FE` sniff in the cipher modes: a `FF FE` after the mode byte
-    // is payload-adjacent header data, not a byte-order mark.
-    let payload: &[u8] = bytes.get(4..).unwrap_or_default();
-    let units = payload.chunks_exact(2).map(|chunk| {
-        let ch = u16::from_le_bytes([chunk[0], chunk[1]]);
-        if mode == 0 {
-            if ch >= 0x20 {
-                ch ^ (((ch & 0xfe) << 8) ^ 1)
-            } else {
-                ch
-            }
-        } else {
-            ((ch & 0xaaaa) >> 1) | ((ch & 0x5555) << 1)
-        }
-    });
-    let (text, dropped_units) = from_utf16(units);
-    warn_dropped("FE FE cipher", dropped_units * 2 + payload.len() % 2);
-    Ok(text)
+/// Check the `FE FE <mode> FF FE` header and return nothing when the mandatory
+/// byte-order mark is present.
+fn require_container_bom(bytes: &[u8], mode: u8) -> Result<(), String> {
+    if bytes.len() < 5 || bytes[3] != 0xFF || bytes[4] != 0xFE {
+        return Err(format!(
+            "FE FE container mode {mode} is missing its UTF-16LE byte-order mark"
+        ));
+    }
+    Ok(())
 }
 
-/// Inflate the payload of an `FE FE 02` container and decode it as UTF-16LE.
+/// Decrypt the UTF-16LE payload of an `FE FE 00` / `FE FE 01` container.
+///
+/// The payload begins at offset 5 after `FE FE <mode> FF FE` and is read as
+/// little-endian code units (reference `reference/cpp/core/base/TextStream.cpp:82-105`);
+/// a trailing odd byte is reported. Mode 0 is the legacy per-code-unit XOR
+/// (only applied to units `>= 0x20`); mode 1 is the adjacent-bit swap. The
+/// units are kept raw, as the reference keeps them; the lossy string view is
+/// applied only by [`decode_text`].
+fn decode_container_cipher(bytes: &[u8], mode: u8) -> Result<Decoded, String> {
+    let payload: &[u8] = bytes.get(5..).unwrap_or_default();
+    let units = payload
+        .chunks_exact(2)
+        .map(|chunk| {
+            let ch = u16::from_le_bytes([chunk[0], chunk[1]]);
+            if mode == 0 {
+                if ch >= 0x20 {
+                    ch ^ (((ch & 0xfe) << 8) ^ 1)
+                } else {
+                    ch
+                }
+            } else {
+                ((ch & 0xaaaa) >> 1) | ((ch & 0x5555) << 1)
+            }
+        })
+        .collect();
+    Ok(Decoded::Units {
+        units,
+        trailing_bytes: payload.len() % 2,
+    })
+}
+
+/// Inflate the payload of an `FE FE 02` container and keep it as UTF-16LE
+/// code units.
 ///
 /// Layout: `FE FE 02 FF FE <compressed:u64 LE> <uncompressed:u64 LE> <zlib>`.
-fn decode_container_zlib(bytes: &[u8]) -> Result<String, String> {
+fn decode_container_zlib(bytes: &[u8]) -> Result<Decoded, String> {
     if bytes.len() < CONTAINER_ZLIB_HEADER {
         return Err(format!(
             "FE FE zlib container needs {CONTAINER_ZLIB_HEADER} header bytes, got {}",
@@ -321,19 +401,40 @@ fn decode_container_zlib(bytes: &[u8]) -> Result<String, String> {
             out.len()
         ));
     }
-    Ok(decode_utf16le(&out, "FE FE zlib payload"))
+    let units = out
+        .chunks_exact(2)
+        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        .collect();
+    Ok(Decoded::Units {
+        units,
+        trailing_bytes: out.len() % 2,
+    })
 }
 
-/// Decode a UTF-16LE byte payload, dropping unpaired surrogates and a trailing
-/// half unit.
-fn decode_utf16le(bytes: &[u8], label: &str) -> String {
-    let (text, dropped_units) = from_utf16(
-        bytes
-            .chunks_exact(2)
-            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]])),
-    );
-    warn_dropped(label, dropped_units * 2 + bytes.len() % 2);
-    text
+/// Convert a decode result to UTF-8 text for the callers that need a
+/// `String`.
+///
+/// A charset-decoded path is already valid UTF-8; `FE FE` code units are
+/// decoded as UTF-16, dropping an unpaired surrogate with one warning. The
+/// reference keeps the raw unit, so the script loader uses
+/// [`decode_text_units`] for the lossless path.
+fn decoded_into_string(decoded: Decoded, path: DecodePath<'_>) -> String {
+    match decoded {
+        Decoded::Utf8(text) => text,
+        Decoded::Units {
+            units,
+            trailing_bytes,
+        } => {
+            let label = match path {
+                DecodePath::Container(2) => "FE FE zlib payload",
+                DecodePath::Container(_) => "FE FE cipher",
+                _ => "FE FE payload",
+            };
+            let (text, dropped_units) = from_utf16(units.into_iter());
+            warn_dropped(label, dropped_units * 2 + trailing_bytes);
+            text
+        }
+    }
 }
 
 /// Decode a UTF-32 byte payload, dropping values that are not Unicode scalar
@@ -399,7 +500,9 @@ fn decode_named(bytes: &[u8], name: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{TextEncoding, decode_from_encoding, decode_text, decode_text_reported};
+    use super::{
+        TextEncoding, decode_from_encoding, decode_text, decode_text_reported, decode_text_units,
+    };
     use encoding_rs::{BIG5, EUC_KR, GBK, SHIFT_JIS};
 
     thread_local! {
@@ -479,10 +582,11 @@ mod tests {
     }
 
     /// Encrypt code units as an `FE FE <mode>` container (writer side): the
-    /// four-byte header `FE FE <mode> 00` then the little-endian code units
-    /// (reference `reference/cpp/core/base/TextStream.cpp:82-105`).
+    /// five-byte header `FE FE <mode> FF FE` then the little-endian code units
+    /// (reference `reference/cpp/core/base/TextStream.cpp:82-105`). The `FF FE`
+    /// is the mandatory byte-order mark the reference reads after the mode.
     fn fefe_cipher(mode: u8, units: &[u16]) -> Vec<u8> {
-        let mut out = vec![0xFE, 0xFE, mode, 0x00];
+        let mut out = vec![0xFE, 0xFE, mode, 0xFF, 0xFE];
         for &unit in units {
             let encrypted = match mode {
                 0 if unit >= 0x20 => unit ^ (((unit & 0xfe) << 8) ^ 1),
@@ -498,6 +602,23 @@ mod tests {
     /// Encrypt code units as an `FE FE 00` legacy XOR container (writer side).
     fn fefe_mode0(units: &[u16]) -> Vec<u8> {
         fefe_cipher(0, units)
+    }
+
+    /// Compress code units as an `FE FE 02` zlib container (writer side):
+    /// `FE FE 02 FF FE`, the two little-endian `u64` sizes, then the zlib
+    /// stream over the little-endian code units.
+    fn fefe_zlib(units: &[u16]) -> Vec<u8> {
+        use std::io::Write;
+        let raw: Vec<u8> = units.iter().flat_map(|unit| unit.to_le_bytes()).collect();
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&raw).expect("write zlib payload");
+        let compressed = encoder.finish().expect("finish zlib");
+        let mut out = vec![0xFE, 0xFE, 0x02, 0xFF, 0xFE];
+        out.extend_from_slice(&(compressed.len() as u64).to_le_bytes());
+        out.extend_from_slice(&(raw.len() as u64).to_le_bytes());
+        out.extend_from_slice(&compressed);
+        out
     }
 
     // reference/cpp/core/base/TextStream.cpp:47-57 — BOM-less text is decoded
@@ -655,8 +776,9 @@ mod tests {
         assert_dropped_once(&logs, "Shift_JIS", 1);
     }
 
-    // The reference assigns raw UTF-16 units without failing; a Rust `String`
-    // cannot hold an unpaired surrogate, so the unit is dropped and recorded.
+    // The reference assigns raw UTF-16 units without failing; the lossy
+    // `String` view cannot hold an unpaired surrogate, so the unit is dropped
+    // and recorded. The lossless code-unit path is `decode_text_units`.
     #[test]
     fn fefe_payload_drops_unpaired_surrogates() {
         let bytes = fefe_mode0(&[0x0041, 0xD800, 0x0042]);
@@ -665,17 +787,60 @@ mod tests {
         assert_dropped_once(&logs, "FE FE cipher", 2);
     }
 
-    // reference/cpp/core/base/TextStream.cpp:82-105 — cipher modes 0/1 have a
-    // four-byte header and the payload begins at offset 4. The ciphertext
-    // below is built from the reference formula, not through a shared helper.
+    // reference/cpp/core/base/TextStream.cpp:82-135 — the reference decrypts
+    // the container into UTF-16 code units and keeps every unit, including an
+    // unpaired surrogate; `decode_text_units` is that path.
     #[test]
-    fn fefe_cipher_payload_starts_at_offset_four() {
+    fn fefe_containers_keep_every_code_unit() {
+        let units = [0x0041, 0xD800, 0x0042];
+        for (mode, bytes) in [
+            (0u8, fefe_cipher(0, &units)),
+            (1u8, fefe_cipher(1, &units)),
+            (2u8, fefe_zlib(&units)),
+        ] {
+            let decoded =
+                decode_text_units(&bytes, TextEncoding::Detect).expect("container decodes");
+            assert_eq!(decoded, units, "mode {mode}");
+        }
+    }
+
+    // reference/cpp/core/base/TextStream.cpp:129-131 — the mode-2 payload is
+    // read as `uncompressed / 2` code units, so an odd byte count is truncated
+    // rather than rejected.
+    #[test]
+    fn fefe_zlib_truncates_an_odd_payload() {
+        // `FE FE 02 FF FE`, compressed=11, uncompressed=3, then zlib("ABC").
+        let bytes = [
+            0xfe, 0xfe, 0x02, 0xff, 0xfe, 0x0b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x78, 0x9c, 0x73, 0x74, 0x72, 0x06, 0x00,
+            0x01, 0x8d, 0x00, 0xc7,
+        ];
+        assert_eq!(
+            decode_text_units(&bytes, TextEncoding::Detect).expect("zlib decodes"),
+            [0x4241]
+        );
+        assert_eq!(
+            decode_text(&bytes, TextEncoding::Detect).expect("zlib decodes"),
+            "䉁"
+        );
+    }
+
+    // reference/cpp/core/base/TextStream.cpp:82-105 — modes 0/1 have the
+    // five-byte header `FE FE <mode> FF FE` and the payload begins at offset 5.
+    // The vendored reconstruction's offset-4 read at :87-88 is contradicted by
+    // the shipped data (an odd file length once the 5-byte header is present,
+    // and an offset-4 read drops code units) and by the upstream text stream,
+    // which consumes the mode byte and the `FF FE` BOM and then reads at
+    // offset 5. The ciphertext below is built from the reference formula, not
+    // through a shared helper.
+    #[test]
+    fn fefe_cipher_payload_starts_at_offset_five() {
         // Mode 0: `(const) %` -> units 0x0028, 0x0063, 0x006f, 0x006e, 0x0073,
         // 0x0074, 0x0029, 0x0020, 0x0025. '(' is 0x0028, which is >= 0x20, so
         // it is XORed: `0x0028 ^ (((0x0028 & 0xfe) << 8) ^ 1) = 0x2829`, LE
         // `29 28`. The remaining units are XORed the same way.
         let mode0 = [
-            0xFE, 0xFE, 0x00, 0x00, // `FE FE 00` + one skipped header byte
+            0xFE, 0xFE, 0x00, 0xFF, 0xFE, // `FE FE 00` + the UTF-16LE BOM
             0x29, 0x28, // '(' 0x0028 -> 0x2829
             0x62, 0x62, // 'c' 0x0063 -> 0x6262
             0x6e, 0x6e, // 'o' 0x006f -> 0x6e6e
@@ -696,7 +861,7 @@ mod tests {
         // 0x009d, 0x0073 -> 0x00b3, 0x0074 -> 0x00b8, 0x0029 -> 0x0016,
         // 0x0020 -> 0x0010, 0x0025 -> 0x001a.
         let mode1 = [
-            0xFE, 0xFE, 0x01, 0x00, // `FE FE 01` + one skipped header byte
+            0xFE, 0xFE, 0x01, 0xFF, 0xFE, // `FE FE 01` + the UTF-16LE BOM
             0x14, 0x00, 0x93, 0x00, 0x9f, 0x00, 0x9d, 0x00, 0xb3, 0x00, 0xb8, 0x00, 0x16, 0x00,
             0x10, 0x00, 0x1a, 0x00,
         ];
@@ -706,8 +871,8 @@ mod tests {
         );
     }
 
-    // reference/cpp/core/base/TextStream.cpp:87-88 — the count is
-    // `(size - 4) / 2`, so a trailing odd byte is dropped and logged.
+    // reference/cpp/core/base/TextStream.cpp:87-88 — a trailing odd byte after
+    // the offset-5 payload is dropped and logged.
     #[test]
     fn fefe_cipher_drops_an_odd_trailing_byte() {
         let mut bytes = fefe_mode0(&[0x0041]);
@@ -717,28 +882,18 @@ mod tests {
         assert_dropped_once(&logs, "FE FE cipher", 1);
     }
 
-    // reference/cpp/core/base/TextStream.cpp:87-88 — a `FF FE` after the mode
-    // byte is not a BOM: the payload still starts at offset 4, so the `FE` at
-    // byte 4 is the low byte of the first code unit and must not be eaten. A
-    // plaintext unit ending in 0xff (0x00ff) encrypts to 0xfefe, so the
-    // container begins `FE FE 00 FF FE FE`.
+    // reference/cpp/core/base/TextStream.cpp:82-88 — the reference reads the
+    // two bytes after the mode as the mandatory UTF-16LE byte-order mark and
+    // raises `TVPUnsupportedCipherMode` when they are not `FF FE`.
     #[test]
-    fn fefe_cipher_does_not_treat_ff_fe_as_a_bom() {
+    fn fefe_cipher_requires_the_byte_order_mark() {
         let bytes = [
-            0xFE, 0xFE, 0x00, 0xFF, // header: the old code read `FF FE` as a BOM
-            0xFE, 0xFE, // 0xfefe -> plaintext 0x00ff
-            0x40, 0x40, // 0x4040 -> plaintext 0x0041 'A'
+            0xFE, 0xFE, 0x00, 0x00, // mode byte then a missing BOM
+            0x40, 0x40, // the old offset-4 read would have taken this as a unit
         ];
-        // The old 5-byte path would have skipped the `FE` at index 4 and read
-        // no complete unit (empty text); the reference path yields "\u{ff}A".
-        let (text, logs) = capture_logs(|| decode_text(&bytes, TextEncoding::Detect));
-        assert_eq!(text.expect("FE FE cipher decodes"), "\u{ff}A");
-        assert!(
-            !logs
-                .iter()
-                .any(|line| line.starts_with("WARN") && line.contains("FE FE cipher")),
-            "no unit or byte must be dropped: {logs:?}"
-        );
+        let message = decode_text(&bytes, TextEncoding::Detect)
+            .expect_err("a mode 0/1 container without its BOM must fail");
+        assert!(message.contains("byte-order mark"), "got: {message}");
     }
 
     // reference/cpp/core/base/TextStream.cpp:47-57 — a detectable legacy

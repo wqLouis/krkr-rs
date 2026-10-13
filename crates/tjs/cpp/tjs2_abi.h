@@ -8,6 +8,7 @@
 #include <vector>
 
 #include <stddef.h> /* size_t */
+#include <stdint.h> /* uint16_t */
 
 #ifdef __cplusplus
 namespace TJS {
@@ -121,6 +122,24 @@ int tjs2_exec_script(tjs2_engine *e, const char *script, size_t script_len,
 int tjs2_eval(tjs2_engine *e, const char *expression, size_t expression_len,
               const char *name, void *context, int lineofs,
               tjs2_value *out_result, char **out_error);
+
+/*
+ * Execute a TJS script whose source is UTF-16 code units (the reference
+ * `tjs_char` array). Identical to tjs2_exec_script except the payload is not
+ * a UTF-8 byte range, so an unpaired surrogate survives the boundary. The
+ * script loader uses this because the reference text stream keeps the code
+ * units (`reference/cpp/core/base/TextStream.cpp`). `script_len` counts code
+ * units; `name` is UTF-8 like tjs2_exec_script.
+ */
+int tjs2_exec_script_wide(tjs2_engine *e, const uint16_t *script,
+                          size_t script_len, const char *name, void *context,
+                          int lineofs, tjs2_value *out_result,
+                          char **out_error);
+
+/* Evaluate a TJS expression from UTF-16 code units; same conventions. */
+int tjs2_eval_wide(tjs2_engine *e, const uint16_t *expression,
+                   size_t expression_len, const char *name, void *context,
+                   int lineofs, tjs2_value *out_result, char **out_error);
 
 /*
  * Replace the text of the registered TJS message named `name` (UTF-8) and
