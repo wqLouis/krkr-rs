@@ -81,23 +81,33 @@ struct Env {
 
 impl Env {
     fn new() -> Env {
-        Self::build(true)
+        Self::build(true, None)
     }
 
     fn without_storage() -> Env {
-        Self::build(false)
+        Self::build(false, None)
     }
 
-    fn build(with_storage: bool) -> Env {
+    /// A storage mounted under a mixed-case path, so an absolute storage
+    /// name has to survive normalization with its real on-disk spelling.
+    fn mixed_case_root() -> Env {
+        Self::build(true, Some("Games/KR"))
+    }
+
+    fn build(with_storage: bool, root_suffix: Option<&str>) -> Env {
         let (storage, dir) = if with_storage {
             let dir = GameDir::new();
+            let root = match root_suffix {
+                Some(suffix) => {
+                    let root = dir.path().join(suffix);
+                    std::fs::create_dir_all(&root).expect("create storage root");
+                    root
+                }
+                None => dir.path().to_path_buf(),
+            };
             let storage = Box::new(
-                Storage::mount_archives(
-                    FileSystem::host(dir.path()),
-                    dir.path().to_path_buf(),
-                    std::iter::empty::<&str>(),
-                )
-                .expect("mount storage"),
+                Storage::mount_archives(FileSystem::host(&root), root, std::iter::empty::<&str>())
+                    .expect("mount storage"),
             );
             (Some(storage), Some(dir))
         } else {
@@ -346,6 +356,52 @@ fn directory_create_and_remove() {
     assert!(
         env.error("Storages.dirlist('data')")
             .contains("must be specified")
+    );
+}
+
+/// `isExistentDirectory` normalizes the name with `TVPNormalizeStorageName`
+/// and resolves it through `TVPGetLocalName`, so a directory reached through
+/// its real mixed-case absolute path resolves instead of raising
+/// `TVPCannotGetLocalName` (`reference/cpp/plugins/fstat/main.cpp:757-765`).
+#[test]
+fn is_existent_directory_resolves_a_mixed_case_absolute_path() {
+    let _lock = vm_lock();
+    let env = Env::mixed_case_root();
+    let root = env.dir.as_ref().unwrap().path().join("Games/KR");
+    std::fs::create_dir_all(root.join("setup/debug")).expect("create fixture");
+    let real = format!("{}/setup/debug/", root.display());
+    // reference/cpp/plugins/fstat/main.cpp:757-765
+    assert!(
+        env.bool(&format!("Storages.isExistentDirectory('{real}')")),
+        "the real mixed-case absolute path must resolve"
+    );
+}
+
+/// A case-variant absolute path inside the mount does not raise
+/// `TVPCannotGetLocalName` (`reference/cpp/plugins/fstat/main.cpp:757-765`).
+///
+/// Known approximation: the reference's `TVPGetLocalName` walks the real
+/// directory entries and case-corrects every existing component, so an
+/// existing `Assets` makes `isExistentDirectory('.../ASSETS/')` report
+/// `true` (`reference/cpp/core/base/impl/StorageImpl.cpp:339-400`). This
+/// port resolves the disk-relative spelling case-insensitively only through
+/// `Storage::find` (which is file-only) and otherwise joins the normalized
+/// spelling, so it reports `false`; only the absence of the raise is pinned
+/// here.
+#[test]
+fn is_existent_directory_case_variant_does_not_raise() {
+    let _lock = vm_lock();
+    let env = Env::mixed_case_root();
+    let root = env.dir.as_ref().unwrap().path().join("Games/KR");
+    std::fs::create_dir_all(root.join("Assets")).expect("create fixture");
+    let variant = format!("{}/ASSETS/", root.display());
+    // reference/cpp/plugins/fstat/main.cpp:757-765
+    assert!(
+        matches!(
+            env.eval_ok(&format!("Storages.isExistentDirectory('{variant}')")),
+            TjsValue::Integer(_)
+        ),
+        "a case-variant path must not raise"
     );
 }
 

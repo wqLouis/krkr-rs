@@ -1156,7 +1156,7 @@ impl Storage {
             if self.game_dir.as_os_str().is_empty() {
                 path.to_path_buf()
             } else {
-                path.strip_prefix(&self.game_dir).ok()?.to_path_buf()
+                strip_prefix_ignore_ascii_case(path, &self.game_dir)?
             }
         } else {
             path.to_path_buf()
@@ -1838,6 +1838,26 @@ fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
             }
         }
     }
+}
+
+/// Strips `prefix` from the leading components of `path`, comparing each
+/// component ASCII-case-insensitively. Returns the remaining path, or `None`
+/// when `path` does not start with `prefix`. The reference resolves an
+/// absolute name by walking its components against the real directory
+/// entries, so an absolute path that differs from the mount point only in
+/// case still points inside the mount
+/// (`reference/cpp/core/base/impl/StorageImpl.cpp:301-407`).
+fn strip_prefix_ignore_ascii_case(path: &Path, prefix: &Path) -> Option<PathBuf> {
+    let mut remaining = path.components();
+    for expected in prefix.components() {
+        let actual = remaining.next()?;
+        let actual = actual.as_os_str().to_string_lossy();
+        let expected = expected.as_os_str().to_string_lossy();
+        if !actual.eq_ignore_ascii_case(&expected) {
+            return None;
+        }
+    }
+    Some(remaining.as_path().to_path_buf())
 }
 
 /// Folds `.` and `..` components the way the reference storage-name normalizer

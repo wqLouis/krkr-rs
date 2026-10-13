@@ -725,3 +725,72 @@ work list ranked by real use — the same signal that identified `PackinOne`.
 * **A subagent's edit scope does not always widen for a running session**; apply
   its verified patch locally instead, and **verify receipt** of load-bearing
   steering messages — one was silently dropped this session.
+
+## 19. The v2.0.8 device run (log 5) and the fixes on this branch
+
+`krkr-rs-logs (5).txt` is the first real-device run of `v2.0.8-alpha`. The
+auto-path fix (18.2) worked — `Config.tjs` resolves and the scripts load — but
+three titles then hit new blockers past it. All three are fixed here, with the
+full gate green. Everything below is host-verified; none of it is device-verified
+yet.
+
+### 19.1 The failures and their root causes
+
+| title | failure in log 5 | root cause | fix |
+|---|---|---|---|
+| 宠物志愿 | `Member "innerSunken" does not exist` at `MainWindow.tjs:309` | the shipped header enables `USE_OBSOLETE_FUNCTIONS` (`WindowIntf.h:23`); the port registered none of that block | register the six members |
+| 绝对高潮 | same at `MainWindow.tjs:311` | same | same |
+| 魔女的夜宴 | same at `MainWindow.tjs:1733`; then a doubled `saveDataLocation` | same; plus `System.personalPath`/`savedGamesPath` returned `<game>/savedata/` | register the members; return `TVPGetAppPath()` |
+| 千恋万花 | `Storages.isExistentDirectory: Cannot get local name from …/setup/debug//` | the mount prefix was stripped case-sensitively, so the normalized absolute path no longer matched the on-disk `Games`/`KR` spelling | strip the prefix component-wise, ASCII-case-insensitively |
+
+### 19.2 What landed
+
+* **The `USE_OBSOLETE_FUNCTIONS` Window members.** `beginMove`, `setLayerPos`,
+  `layerLeft`, `layerTop`, `innerSunken`, `showScrollBars`. `innerSunken` is
+  stored on the window (the port already stores `focusable`/`useMouseKey`); the
+  other five are the reference form's no-ops/constants (`TVPWindow.h:135-184`).
+  Surface baseline: 2515 -> 2521 members.
+* **`TVPNormalizeStorageName`.** Both `compat` normalizers now lowercase the
+  disk/domain path (`tTVPFileMedia::NormalizeDomainName`/`NormalizePathName`,
+  `StorageImpl.cpp:95-117`) and run the in-archive part through
+  `NormalizeInArchiveStorageName` (`StorageIntf.cpp:558-604`). The old helper
+  lowercased but did not collapse the in-archive slashes.
+* **Case-insensitive mount-prefix strip.** `Storage::raw_relative_disk_name`
+  compares components with `eq_ignore_ascii_case`
+  (`GetLocallyAccessibleName`, `StorageImpl.cpp:301-407`), so an absolute name
+  that differs from the mount point only in case resolves instead of raising
+  `TVPCannotGetLocalName`.
+* **`System.personalPath`/`savedGamesPath`** return `TVPGetAppPath()` (the game
+  directory), matching `SystemImpl.cpp:341-359,387-397`. Only `System.dataPath`
+  is `<app>/savedata/` (`ApplicationSpecialPath.h:13-19`).
+
+### 19.3 Open after this branch
+
+1. **The doubled `魔女的夜宴` save path is not root-caused.** The log shows
+   `G//G/savedata/` and then a failed `…/savedata//savecheck` open. The
+   `personalPath`/`savedGamesPath` divergence is fixed, but `exePath + <any
+   property>` still doubles on the reference's own values, so no single property
+   explains an expression that works there. **Needs the game's `Config.tjs`**
+   (present only in the device's XP3 archives) or a TJS-level trace of the
+   expression that builds `saveDataLocation`. Do not add a title-specific patch
+   (D28).
+2. **Directory case-correction.** The reference `TVPGetLocalName`
+   (`GetLocallyAccessibleName`, `StorageImpl.cpp:339-400`) case-corrects every
+   component, so `isExistentDirectory('<root>/ASSETS/')` is `true` when
+   `<root>/Assets/` exists. The port's `local_path` joins the normalized
+   spelling for directories (the public `find` is file-only), so it reports
+   `false`. The file path is unaffected; a directory reached only through a
+   different case is. Fix needs an engine directory lookup that case-corrects.
+3. **`innerSunken` storage vs constant.** The vendored `iWindowLayer`
+   no-ops the setter and returns `false` (`TVPWindow.h:143-144`); the port
+   stores the value, matching the stateful `tTJSNI_Window` pattern and the
+   `useMouseKey`/`focusable` neighbours. If a later reference shows the shipped
+   form is stateless, reduce it to constant `false` and update the test.
+4. **`typeof <undeclared global>` logs an exception dump.** Three launches show
+   `motion_player.tjs(1)` raising at `typeof Motion`/`Player`/`D3DEmotePlayer`/…
+   The games continue, so the exception is caught, but if the reference's
+   `typeof` on an absent global is silent this is a `tjs` VM defect worth a
+   separate look (`docs/vm-defects.md`).
+5. **Device verification of all of the above (D36)** is still owed: a fresh run
+   of the four titles with the log exported, and the §18.3 priority list after
+   that.

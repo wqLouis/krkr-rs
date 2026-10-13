@@ -1395,9 +1395,11 @@ extern "C" fn prop_data_path(
     }
 }
 
-/// `System.personalPath` / `System.savedGamesPath`: the `savedata/` folder
-/// next to the game.
-fn saved_games_path_prop(
+/// `System.personalPath` / `System.savedGamesPath`: the application directory
+/// (the game folder), not its `savedata/` subfolder. The reference's
+/// `TVPGetPersonalPath()` and `TVPGetSavedGamesPath()` both return
+/// `TVPGetAppPath()`; only `TVPDataPath` names `savedata/`.
+fn app_path_prop(
     engine: *mut c_void,
     out: *mut Value,
     out_error: *mut *mut c_char,
@@ -1412,7 +1414,7 @@ fn saved_games_path_prop(
     let ctx = resolved.ctx();
     match project_dir(&ctx) {
         Some(dir) => {
-            set_string_out(&ctx, out, &dir_with_separator(&dir.join("savedata")));
+            set_string_out(&ctx, out, &dir_with_separator(&dir));
             0
         }
         None => report_error(
@@ -1427,7 +1429,7 @@ extern "C" fn prop_personal_path(
     out: *mut Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
-    saved_games_path_prop(engine, out, out_error, "personalPath")
+    app_path_prop(engine, out, out_error, "personalPath")
 }
 
 extern "C" fn prop_saved_games_path(
@@ -1435,7 +1437,7 @@ extern "C" fn prop_saved_games_path(
     out: *mut Value,
     out_error: *mut *mut c_char,
 ) -> c_int {
-    saved_games_path_prop(engine, out, out_error, "savedGamesPath")
+    app_path_prop(engine, out, out_error, "savedGamesPath")
 }
 
 /// The synthetic app directory reported when no L2 storage is attached.

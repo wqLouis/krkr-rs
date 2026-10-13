@@ -23,7 +23,7 @@ The checker exits non-zero when a missing member is **not** listed in `scripts/n
 | reference members | 640 |
 | matched | 640 |
 | **missing** | **0** |
-| extra (Rust only) | 2 |
+| extra (Rust only) | 8 |
 | coverage | **100.0%** |
 
 ## Reference registration mechanisms
@@ -57,7 +57,7 @@ _None._
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | `Layer` | 149 | 149 | 149 | 0 | 0 | 100.0% |
 | `Bitmap` | 19 | 19 | 19 | 0 | 0 | 100.0% |
-| `Window` | 85 | 85 | 85 | 0 | 0 | 100.0% |
+| `Window` | 85 | 91 | 85 | 0 | 6 | 100.0% |
 | `Font` | 21 | 21 | 21 | 0 | 0 | 100.0% |
 | `Timer` | 5 | 5 | 5 | 0 | 0 | 100.0% |
 | `System` | 49 | 49 | 49 | 0 | 0 | 100.0% |
@@ -84,6 +84,10 @@ _None for tracked classes._
 ## Extra members by class
 
 Rust registrations with no reference counterpart; usually intentional engine internals.
+
+### `Window` — 6 extra
+
+`beginMove`, `innerSunken`, `layerLeft`, `layerTop`, `setLayerPos`, `showScrollBars`
 
 ### `KAGParser` — 2 extra
 

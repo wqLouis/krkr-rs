@@ -10,7 +10,7 @@
 
 mod common;
 
-use common::vm_lock;
+use common::{eval_then, vm_lock};
 use compat::{CompatHost, EventAdapter};
 use engine::Scene;
 use engine::input::InputState;
@@ -455,4 +455,48 @@ fn post_input_event_key_press_delivers_the_character() {
 
     env.run("w.postInputEvent('onKeyPress', %[key: 65]);");
     assert_eq!(env.eval_int("key == 'A'"), 1);
+}
+
+/// The six obsolete `Window` members gated behind `USE_OBSOLETE_FUNCTIONS`
+/// (`reference/cpp/core/visual/WindowIntf.h:23`) are all registered:
+/// `beginMove`, `setLayerPos`, `layerLeft`, `layerTop`, `innerSunken` and
+/// `showScrollBars`.
+#[test]
+fn obsolete_window_members_are_registered() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run("var w = new Window();");
+
+    // `innerSunken`: the reference form getter defaults to `false`
+    // (`reference/cpp/core/environ/impl/TVPWindow.h:143-144`) and the write
+    // is stored and read back
+    // (`reference/cpp/core/visual/impl/WindowImpl.cpp:1687-1697`).
+    assert_eq!(env.eval_int("w.innerSunken"), 0);
+    let inner_sunken = eval_then(&env.engine, "w.innerSunken = true;", "w.innerSunken")
+        .expect("write-then-read Window.innerSunken");
+    assert_eq!(inner_sunken, TjsValue::Integer(1));
+
+    // `layerLeft`/`layerTop`: the form getters report a fixed `0` and the
+    // setters are empty (`reference/cpp/core/environ/impl/TVPWindow.h:178-182`).
+    assert_eq!(env.eval_int("w.layerLeft"), 0);
+    assert_eq!(env.eval_int("w.layerTop"), 0);
+    env.run("w.layerLeft = 42; w.layerTop = 42;");
+    assert_eq!(env.eval_int("w.layerLeft"), 0);
+    assert_eq!(env.eval_int("w.layerTop"), 0);
+
+    // `showScrollBars`: the form getter reports `true` and the setter is
+    // empty (`reference/cpp/core/environ/impl/TVPWindow.h:183-184`).
+    assert_eq!(env.eval_int("w.showScrollBars"), 1);
+    env.run("w.showScrollBars = false;");
+    assert_eq!(env.eval_int("w.showScrollBars"), 1);
+
+    // `beginMove`/`setLayerPos`: the reference delegates to the form, whose
+    // base bodies do nothing
+    // (`reference/cpp/core/visual/impl/WindowImpl.cpp:1480-1484,1682-1685`;
+    // `reference/cpp/core/environ/impl/TVPWindow.h:177,182`).
+    assert_eq!(env.eval_ok("w.beginMove()"), TjsValue::Void);
+    assert_eq!(env.eval_ok("w.setLayerPos(1, 2)"), TjsValue::Void);
+    // `setLayerPos` requires two arguments
+    // (`reference/cpp/core/visual/WindowIntf.cpp:872-882`).
+    assert!(env.eval("w.setLayerPos(1)").is_err());
 }

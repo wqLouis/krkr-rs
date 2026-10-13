@@ -41,6 +41,7 @@ struct WindowInst {
     ime_mode: i32,
     use_mouse_key: bool,
     trap_key: bool,
+    inner_sunken: bool,
     modal: bool,
     mask_region: Option<i32>,
     /// `tTVPBorderStyle` (0 = `bsNone`).
@@ -84,6 +85,7 @@ impl Default for WindowInst {
             ime_mode: 0,
             use_mouse_key: false,
             trap_key: false,
+            inner_sunken: false,
             modal: false,
             mask_region: None,
             border_style: 0,
@@ -498,6 +500,38 @@ extern "C" fn window_set_pos(
     let inst = unsafe { &mut *(instance as *mut WindowInst) };
     inst.left = value_as_i64(&a[0]) as i32;
     inst.top = value_as_i64(&a[1]) as i32;
+    set_void(out);
+    0
+}
+
+/// `Window.setLayerPos(left, top)` — the reference form's base body does
+/// nothing; two arguments are required (`reference/cpp/core/visual/WindowIntf.cpp:872-882`).
+extern "C" fn window_set_layer_pos(
+    _engine: *mut c_void,
+    _instance: *mut c_void,
+    argc: c_int,
+    _argv: *const Value,
+    out: *mut Value,
+    out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    if argc < 2 {
+        return report_error(out_error, "Window.setLayerPos requires 2 arguments");
+    }
+    set_void(out);
+    0
+}
+
+/// `Window.beginMove()` — the reference form's base body does nothing.
+extern "C" fn window_begin_move(
+    _engine: *mut c_void,
+    _instance: *mut c_void,
+    _argc: c_int,
+    _argv: *const Value,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
     set_void(out);
     0
 }
@@ -1102,6 +1136,62 @@ window_bool_prop!(
     use_mouse_key
 );
 window_bool_prop!(window_trap_key_get, window_trap_key_set, trap_key);
+window_bool_prop!(
+    window_inner_sunken_get,
+    window_inner_sunken_set,
+    inner_sunken
+);
+
+/// `Window.layerLeft` — the reference form reports a fixed `0` and ignores
+/// writes (`reference/cpp/core/environ/impl/TVPWindow.h:178-179`).
+extern "C" fn window_layer_left_get(
+    _engine: *mut c_void,
+    _instance: *mut c_void,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    set_int(out, 0);
+    0
+}
+
+/// `Window.layerTop` — the reference form reports a fixed `0` and ignores
+/// writes (`reference/cpp/core/environ/impl/TVPWindow.h:180-181`).
+extern "C" fn window_layer_top_get(
+    _engine: *mut c_void,
+    _instance: *mut c_void,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    set_int(out, 0);
+    0
+}
+
+/// `Window.showScrollBars` — the reference form reports `true` and ignores
+/// writes (`reference/cpp/core/environ/impl/TVPWindow.h:183-184`).
+extern "C" fn window_show_scroll_bars_get(
+    _engine: *mut c_void,
+    _instance: *mut c_void,
+    out: *mut Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    set_bool(out, true);
+    0
+}
+
+/// The empty setter shared by the obsolete properties whose reference form
+/// setter is a no-op (`layerLeft`, `layerTop`, `showScrollBars`).
+extern "C" fn window_ignored_prop_set(
+    _engine: *mut c_void,
+    _instance: *mut c_void,
+    _value: *const Value,
+    _out_error: *mut *mut c_char,
+    _objthis: *mut c_void,
+) -> c_int {
+    0
+}
 
 /// `Window.mainWindow` — the scene's first window object (`TVPMainWindow`).
 extern "C" fn window_main_window_get(
@@ -2133,6 +2223,10 @@ pub(super) fn register_window_class(ctx: &mut CompatCtx) -> Result<(), CompatErr
                 f: window_close,
             },
             NativeInstanceMethodDef {
+                name: "beginMove",
+                f: window_begin_move,
+            },
+            NativeInstanceMethodDef {
                 name: "bringToFront",
                 f: window_bring_to_front,
             },
@@ -2159,6 +2253,10 @@ pub(super) fn register_window_class(ctx: &mut CompatCtx) -> Result<(), CompatErr
             NativeInstanceMethodDef {
                 name: "setPos",
                 f: window_set_pos,
+            },
+            NativeInstanceMethodDef {
+                name: "setLayerPos",
+                f: window_set_layer_pos,
             },
             NativeInstanceMethodDef {
                 name: "setMinSize",
@@ -2355,6 +2453,21 @@ pub(super) fn register_window_class(ctx: &mut CompatCtx) -> Result<(), CompatErr
                 set: Some(window_top_set),
             },
             NativeInstancePropertyDef {
+                name: "layerLeft",
+                get: Some(window_layer_left_get),
+                set: Some(window_ignored_prop_set),
+            },
+            NativeInstancePropertyDef {
+                name: "layerTop",
+                get: Some(window_layer_top_get),
+                set: Some(window_ignored_prop_set),
+            },
+            NativeInstancePropertyDef {
+                name: "innerSunken",
+                get: Some(window_inner_sunken_get),
+                set: Some(window_inner_sunken_set),
+            },
+            NativeInstancePropertyDef {
                 name: "minWidth",
                 get: Some(window_min_width_get),
                 set: Some(window_min_width_set),
@@ -2486,6 +2599,11 @@ pub(super) fn register_window_class(ctx: &mut CompatCtx) -> Result<(), CompatErr
                 name: "stayOnTop",
                 get: Some(window_stay_on_top_get),
                 set: Some(window_stay_on_top_set),
+            },
+            NativeInstancePropertyDef {
+                name: "showScrollBars",
+                get: Some(window_show_scroll_bars_get),
+                set: Some(window_ignored_prop_set),
             },
             NativeInstancePropertyDef {
                 name: "touchScaleThreshold",

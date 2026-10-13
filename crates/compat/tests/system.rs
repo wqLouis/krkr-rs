@@ -438,6 +438,42 @@ fn exe_name_is_the_project_directory_with_a_trailing_separator() {
 }
 
 #[test]
+fn storage_backed_paths_match_the_reference() {
+    let _lock = vm_lock();
+    let env = Env::with_storage();
+    let dir = env.game_dir().expect("game dir");
+    let app = format!("{}/", dir.display());
+
+    // `System.exePath`, `System.personalPath` and `System.savedGamesPath` all
+    // return `TVPGetAppPath()`; only `System.dataPath` is `TVPDataPath`, the
+    // application directory plus `savedata/`.
+    // reference/cpp/core/base/impl/SystemImpl.cpp:341-359 (`TVPGetPersonalPath`)
+    // reference/cpp/core/base/impl/SystemImpl.cpp:387-397 (`TVPGetSavedGamesPath`)
+    // reference/cpp/core/base/impl/SystemImpl.cpp:798-807 (exePath)
+    // reference/cpp/core/base/impl/SystemImpl.cpp:808-816 (personalPath)
+    // reference/cpp/core/base/impl/SystemImpl.cpp:828-836 (dataPath)
+    // reference/cpp/core/base/impl/SystemImpl.cpp:849-857 (savedGamesPath)
+    // reference/cpp/core/base/impl/StorageImpl.cpp:504-507 (`TVPGetAppPath`)
+    // reference/cpp/core/environ/impl/ApplicationSpecialPath.h:13-19 (dataPath)
+    assert_eq!(
+        env.eval("System.exePath").unwrap(),
+        TjsValue::String(app.clone())
+    );
+    assert_eq!(
+        env.eval("System.personalPath").unwrap(),
+        TjsValue::String(app.clone())
+    );
+    assert_eq!(
+        env.eval("System.savedGamesPath").unwrap(),
+        TjsValue::String(app.clone())
+    );
+    assert_eq!(
+        env.eval("System.dataPath").unwrap(),
+        TjsValue::String(format!("{app}savedata/"))
+    );
+}
+
+#[test]
 fn screen_size_reads_the_l2_scene() {
     let _lock = vm_lock();
     let mut scene = engine::Scene::default();

@@ -82,7 +82,8 @@ fn string_helpers_match_reference() {
         env.eval_ok("Storages.chopStorageExt('data/x.tjs')"),
         TjsValue::String("data/x".into())
     );
-    // `getFullPath` lowercases and folds backslashes (no storage needed).
+    // `getFullPath` lowercases the disk/domain path and folds backslashes; the
+    // in-archive part is normalized too (no storage needed).
     assert_eq!(
         env.eval_ok("Storages.getFullPath('Data\\\\X.TJS')"),
         TjsValue::String("data/x.tjs".into())
@@ -95,6 +96,33 @@ fn string_helpers_match_reference() {
     assert_eq!(
         env.eval_ok("Storages.extractStorageExt('data/noext')"),
         TjsValue::String(String::new())
+    );
+}
+
+/// `Storages.getFullPath` is `TVPNormalizeStorageName`
+/// (`reference/cpp/core/base/StorageIntf.cpp:1281-1292`): the disk/domain path
+/// is lowercased and `\` folds to `/` (`tTVPFileMedia::NormalizeDomainName` /
+/// `NormalizePathName`, `reference/cpp/core/base/impl/StorageImpl.cpp:81-103`,
+/// applied at `reference/cpp/core/base/StorageIntf.cpp:362-372`), and the
+/// in-archive part after `>` is normalized the way
+/// `NormalizeInArchiveStorageName` does — lowercase, `\` → `/`, collapse runs
+/// of `/`, drop leading slashes
+/// (`reference/cpp/core/base/StorageIntf.cpp:566-606`).
+#[test]
+fn get_full_path_normalizes_the_in_archive_part() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    assert_eq!(
+        env.eval_ok("Storages.getFullPath('Arc.XP3>Data//X.TJS')"),
+        TjsValue::String("arc.xp3>data/x.tjs".into())
+    );
+    assert_eq!(
+        env.eval_ok("Storages.getFullPath('Arc.XP3>/Leading/X.TJS')"),
+        TjsValue::String("arc.xp3>leading/x.tjs".into())
+    );
+    assert_eq!(
+        env.eval_ok("Storages.getFullPath('Arc.XP3>Inner\\\\Nested.Dat')"),
+        TjsValue::String("arc.xp3>inner/nested.dat".into())
     );
 }
 

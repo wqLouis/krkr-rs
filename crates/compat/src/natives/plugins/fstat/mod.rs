@@ -60,7 +60,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use api::error::FsError;
 use api::fs::{FsPath, OpenMode};
-use engine::{Location, Storage};
+use engine::{Location, Storage, normalize_in_archive_name};
 use tjs::{
     DetachedValue, NativeInstanceBuilder, NativeInstanceMethodDef, NativeMethodDef,
     NativePropertyDef, NativeStaticMembers, RetainedValue, Tjs2Engine, Tjs2ValueId, TjsValue,
@@ -123,17 +123,26 @@ macro_rules! require_storage {
     };
 }
 
-/// `TVPNormalizeStorageName` for the common case: ASCII-lowercase and `\` → `/`.
+/// The delimiter that separates an archive from its in-archive member.
+const TVP_ARCHIVE_DELIMITER: char = '>';
+
+/// `TVPNormalizeStorageName`: unify path delimiters, lowercase the
+/// disk/domain path (`tTVPFileMedia::NormalizeDomainName` /
+/// `NormalizePathName`, `reference/cpp/core/base/impl/StorageImpl.cpp:95-117`,
+/// called at `reference/cpp/core/base/StorageIntf.cpp:362-369`) and
+/// additionally run the in-archive part after `>` through
+/// `tTVPArchive::NormalizeInArchiveStorageName`, which collapses repeated
+/// slashes and drops leading ones
+/// (`reference/cpp/core/base/StorageIntf.cpp:240-284,558-604`).
 fn normalize_name(name: &str) -> String {
-    name.chars()
-        .map(|c| {
-            if c == '\\' {
-                '/'
-            } else {
-                c.to_ascii_lowercase()
-            }
-        })
-        .collect()
+    match name.split_once(TVP_ARCHIVE_DELIMITER) {
+        Some((disk, in_archive)) => format!(
+            "{}>{}",
+            disk.replace('\\', "/").to_ascii_lowercase(),
+            normalize_in_archive_name(in_archive)
+        ),
+        None => name.replace('\\', "/").to_ascii_lowercase(),
+    }
 }
 
 /// The reference `TVPGetLocalName`: the OS path for a storage name, whether
@@ -192,9 +201,6 @@ fn raw_local(storage: &Storage, name: &str) -> Option<PathBuf> {
         .relative_disk_name(name)
         .map(|relative| storage.game_dir().join(relative))
 }
-
-/// The reference archive delimiter (`TVPArchiveDelimiter`, `>`).
-const TVP_ARCHIVE_DELIMITER: char = '>';
 
 /// The reference `TVPGetLocalName` without the storage search: reject an
 /// in-archive name and otherwise resolve against the game directory without

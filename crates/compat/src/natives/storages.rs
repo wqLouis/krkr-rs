@@ -11,7 +11,7 @@
 //! | member | behavior |
 //! |---|---|
 //! | `addAutoPath(path)` / `removeAutoPath(path)` | maintain the L2 auto-path list; the path must end with `/`, `\` or `>` |
-//! | `getFullPath(path)` | normalized storage name (lowercase, `/` separators) |
+//! | `getFullPath(path)` | normalized storage name (lowercase, `/` separators, in-archive part additionally collapsed) |
 //! | `getPlacedPath(path)` | normalized placed name when `Storage::find` resolves it, `""` otherwise; positive results are cached in per-family dispatch state |
 //! | `isExistentStorage(name)` | whether the name resolves to a file or directory in the mounted storage/auto paths |
 //! | `extractStorageExt/Name/Path`, `chopStorageExt` | pure string helpers over `/`, `\` and the `>` archive delimiter |
@@ -40,7 +40,7 @@ use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
 use std::ptr;
 
-use engine::{Location, Storage, StorageReadError};
+use engine::{Location, Storage, StorageReadError, normalize_in_archive_name};
 use tjs::{Engine, NativeClassBuilder, NativeMethodDef, VAL_OBJECT, VAL_STRING, Value};
 
 use crate::binding;
@@ -62,20 +62,26 @@ fn validate_auto_path(method: &str, path: &str) -> Result<String, String> {
     Ok(entry)
 }
 
-/// Normalize a storage name the way `TVPNormalizeStorageName` does for the
-/// common case: ASCII-lowercase and `\` → `/` (media prefixes are out of
-/// scope). Shared with the `Debug.logLocation` setter, which applies the same
-/// reference normalization (`utils/DebugIntf.cpp:519`).
+/// `TVPNormalizeStorageName`: unify path delimiters and lowercase the
+/// disk/domain path (`tTVPFileMedia::NormalizeDomainName` /
+/// `NormalizePathName`, `reference/cpp/core/base/impl/StorageImpl.cpp:95-117`,
+/// applied by `TVPNormalizeStorageName` at
+/// `reference/cpp/core/base/StorageIntf.cpp:362-369`). The in-archive part
+/// after `>` is additionally normalized the way
+/// `tTVPArchive::NormalizeInArchiveStorageName` does — lowercase, `\` → `/`,
+/// collapse runs of `/`, drop leading slashes
+/// (`reference/cpp/core/base/StorageIntf.cpp:566-606`). Shared with the
+/// `Debug.logLocation` setter, which applies the same normalization
+/// (`reference/cpp/core/utils/DebugIntf.cpp:518-520`).
 pub(crate) fn normalize_storage_name(name: &str) -> String {
-    name.chars()
-        .map(|c| {
-            if c == '\\' {
-                '/'
-            } else {
-                c.to_ascii_lowercase()
-            }
-        })
-        .collect()
+    match name.split_once('>') {
+        Some((disk, in_archive)) => format!(
+            "{}>{}",
+            disk.replace('\\', "/").to_ascii_lowercase(),
+            normalize_in_archive_name(in_archive)
+        ),
+        None => name.replace('\\', "/").to_ascii_lowercase(),
+    }
 }
 
 /// `TVPExtractStorageExt`: the extension including the dot, or `""`.

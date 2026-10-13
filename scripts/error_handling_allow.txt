@@ -99,7 +99,6 @@ crates/compat/src/null_plugin.rs:177:let _ = host.set_default_member(prop.raw_id
 # --- Option/`Vec` returns the guard's method-name heuristic flags ----------
 crates/compat/src/natives/sound.rs:1297:let _ = object.buffer.poll(channel); — SoundBuffer::poll returns Vec<SoundEvent>, not a Result; the transitional event is deliberately discarded
 crates/compat/src/natives/visual/layer/mod.rs:342:let _ = scene.update_layer(id, |layer| { — Scene::update_layer returns Option<bool>; the layer was just verified present and the change flag is tracked by the closure
-crates/engine/src/storage.rs:593:path.strip_prefix(&self.game_dir).ok()?.to_path_buf() — the contract is the mount-relative name, so a path outside the mount is genuinely None
 
 # --- Path::strip_prefix's error means "not under the prefix", and the rename
 #     filter intentionally skips those keys (audit §3.3) --------------------

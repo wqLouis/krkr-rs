@@ -210,6 +210,31 @@ fn mixed_case_disk_name_resolves() {
     }
 }
 
+/// An absolute name below the mount resolves even when its spelling differs
+/// from the mount point only in case: the reference walks the components
+/// against the real directory entries
+/// (`reference/cpp/core/base/impl/StorageImpl.cpp:301-407`).
+#[test]
+fn absolute_name_resolves_case_insensitively_below_the_mount() {
+    let fs = memory_with(&[("Game/Savedata/Data.bin", b"payload")]);
+    let storage = Storage::mount_archives(fs, "/Game", std::iter::empty::<&str>()).expect("mount");
+
+    for name in [
+        "/Game/Savedata/Data.bin",
+        "/game/savedata/data.bin",
+        "/GAME/SAVEDATA/DATA.BIN",
+    ] {
+        assert!(
+            storage.exists(name).unwrap(),
+            "{name} must resolve case-insensitively"
+        );
+        assert_eq!(storage.read(name).unwrap(), b"payload");
+    }
+
+    // An absolute name outside the mount is still a miss.
+    assert!(!storage.exists("/Other/Savedata/Data.bin").unwrap());
+}
+
 /// A `..` that leaves the mount is the reference's `TVPInvalidPathName`
 /// (`reference/cpp/core/base/StorageIntf.cpp:400`), not a plain miss; a `..`
 /// that stays inside the mount still resolves.
