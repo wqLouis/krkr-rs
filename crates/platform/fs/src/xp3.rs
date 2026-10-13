@@ -172,6 +172,43 @@ pub struct Entry {
     pub file_hash: u32,
 }
 
+/// How one index block stores its payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexEncode {
+    /// `TVP_XP3_INDEX_ENCODE_RAW` — the block's bytes are the index data.
+    Raw,
+    /// `TVP_XP3_INDEX_ENCODE_ZLIB` — the block is a zlib stream.
+    Zlib,
+}
+
+/// What one index block contributed while the archive was parsed.
+///
+/// The reference reads every block an `INDEX_CONTINUE` chain links together
+/// and appends each `File` chunk to one item vector
+/// (`reference/cpp/core/archive/xp3/XP3Archive.cpp:348-505`); this records the
+/// same blocks so a lookup miss can say how many were read and how many names
+/// each supplied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexSection {
+    /// Absolute offset of the block in the archive file.
+    pub offset: u64,
+    /// How the block is encoded.
+    pub encode: IndexEncode,
+    /// `File` chunks read from this block.
+    pub file_chunks: usize,
+    /// Names this block added that no earlier block had already supplied.
+    pub new_names: usize,
+}
+
+/// A bounded set of archive names that resemble a request that missed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NearMisses {
+    /// Up to the caller's cap, the closest names in archive order.
+    pub names: Vec<String>,
+    /// How many entries matched one of the near-miss rules in total.
+    pub total: usize,
+}
+
 /// An opened XP3 archive index.
 ///
 /// The value stores the archive base offset and the parsed entry map; it does
@@ -183,6 +220,8 @@ pub struct Xp3Archive {
     base: u64,
     /// Entries keyed by normalized name.
     entries: BTreeMap<String, Entry>,
+    /// Index blocks read while parsing, in read order.
+    sections: Vec<IndexSection>,
 }
 
 impl Xp3Archive {
@@ -226,6 +265,7 @@ impl Xp3Archive {
         let mut archive = Xp3Archive {
             base,
             entries: BTreeMap::new(),
+            sections: Vec::new(),
         };
         archive.read_index(reader)?;
         Ok(archive)
@@ -249,6 +289,48 @@ impl Xp3Archive {
     /// Iterate over all entries in normalized-name order.
     pub fn entries(&self) -> impl Iterator<Item = &Entry> {
         self.entries.values()
+    }
+
+    /// The index blocks read while parsing, in read order.
+    pub fn index_sections(&self) -> &[IndexSection] {
+        &self.sections
+    }
+
+    /// Names that resemble `request` under the reference's in-archive lookup
+    /// rules, bounded to `cap` names plus the total match count.
+    ///
+    /// A name is a near miss when, after the same normalization the reference
+    /// applies to a stored name, it either equals the request modulo a leading
+    /// path, shares the request's base name, or contains the request's stem.
+    /// The strongest matches (path and base name) come first.
+    pub fn near_misses(&self, request: &str, cap: usize) -> NearMisses {
+        let request = normalize_in_archive_name(request);
+        if request.is_empty() {
+            return NearMisses {
+                names: Vec::new(),
+                total: 0,
+            };
+        }
+        let request_base = request.rsplit('/').next().unwrap_or(request.as_str());
+        let request_stem = request_base
+            .split_once('.')
+            .map_or(request_base, |(stem, _)| stem);
+        let mut strong = Vec::new();
+        let mut weak = Vec::new();
+        let mut total = 0usize;
+        for entry in self.entries.values() {
+            let path_match = entry.name == request || ends_with_dir(&entry.name, &request);
+            let base_match = entry.name.rsplit('/').next() == Some(request_base);
+            if path_match || base_match {
+                total += 1;
+                strong.push(entry.name.clone());
+            } else if !request_stem.is_empty() && entry.name.contains(request_stem) {
+                total += 1;
+                weak.push(entry.name.clone());
+            }
+        }
+        let names = strong.into_iter().chain(weak).take(cap).collect();
+        NearMisses { names, total }
     }
 
     /// Look up an entry by name (normalized before lookup).
@@ -595,10 +677,10 @@ impl Xp3Archive {
             }
             reader.seek(SeekFrom::Start(block))?;
             let flag = read_u8(reader)?;
-            let data = match flag & INDEX_ENCODE_METHOD_MASK {
+            let (encode, data) = match flag & INDEX_ENCODE_METHOD_MASK {
                 INDEX_ENCODE_RAW => {
                     let size = read_u64_le(reader)?;
-                    read_exact_vec(reader, size)?
+                    (IndexEncode::Raw, read_exact_vec(reader, size)?)
                 }
                 INDEX_ENCODE_ZLIB => {
                     let compressed_size = read_u64_le(reader)?;
@@ -610,12 +692,19 @@ impl Xp3Archive {
                     let mut data = alloc_zeroed(real_len, "index too large")?;
                     dec.read_exact(&mut data)
                         .map_err(|_| Xp3Error::CorruptIndex("zlib decompression failed"))?;
-                    data
+                    (IndexEncode::Zlib, data)
                 }
                 other => return Err(Xp3Error::BadIndexFlag(flag | other)),
             };
 
-            self.parse_index(&data)?;
+            let before = self.entries.len();
+            let file_chunks = self.parse_index(&data)?;
+            self.sections.push(IndexSection {
+                offset: block,
+                encode,
+                file_chunks,
+                new_names: self.entries.len() - before,
+            });
 
             // On CONTINUE the stream is left right after this block's data,
             // where the next index offset is stored.
@@ -627,8 +716,11 @@ impl Xp3Archive {
     }
 
     /// Parse one index block: chunks of `[4-byte tag][u64 LE size][data]`.
-    fn parse_index(&mut self, data: &[u8]) -> Result<()> {
+    ///
+    /// Returns how many `File` chunks the block held.
+    fn parse_index(&mut self, data: &[u8]) -> Result<usize> {
         let mut rest = data;
+        let mut file_chunks = 0usize;
         while let Some((header, tail)) = split_chunk_header(rest) {
             let (tag, size) = header.split_at(4);
             let size = u64::from_le_bytes(prefix(size)?);
@@ -641,6 +733,7 @@ impl Xp3Archive {
 
             if tag == b"File" {
                 self.parse_file_chunk(payload)?;
+                file_chunks += 1;
             }
         }
         // A truncated chunk header or payload leaves trailing bytes; a
@@ -648,7 +741,7 @@ impl Xp3Archive {
         if !rest.is_empty() {
             return Err(Xp3Error::CorruptIndex("trailing bytes in index data"));
         }
-        Ok(())
+        Ok(file_chunks)
     }
 
     /// Parse one `File` chunk: `info` / `segm` / `adlr` sub-chunks.
@@ -792,6 +885,13 @@ pub fn normalize_in_archive_name(name: &str) -> String {
         }
     }
     out
+}
+
+/// Whether `name` ends with `suffix` at a path-component boundary.
+fn ends_with_dir(name: &str, suffix: &str) -> bool {
+    name.len() > suffix.len()
+        && name.ends_with(suffix)
+        && name.as_bytes()[name.len() - suffix.len() - 1] == b'/'
 }
 
 // ---------------------------------------------------------------------------
@@ -952,6 +1052,7 @@ mod tests {
         let mut archive = Xp3Archive {
             base: 0,
             entries: BTreeMap::new(),
+            sections: Vec::new(),
         };
         let mut index = Vec::new();
         index.extend_from_slice(b"File");
@@ -1016,6 +1117,7 @@ mod tests {
         let archive = Xp3Archive {
             base: 0,
             entries: BTreeMap::new(),
+            sections: Vec::new(),
         };
         let mut reader = io::Cursor::new(image.as_slice());
         assert_eq!(
@@ -1133,6 +1235,7 @@ mod tests {
         let archive = Xp3Archive {
             base: 0,
             entries: BTreeMap::new(),
+            sections: Vec::new(),
         };
 
         let mut prefix_reader = CountingReader {
@@ -1199,6 +1302,7 @@ mod tests {
         let archive = Xp3Archive {
             base: 0,
             entries: BTreeMap::new(),
+            sections: Vec::new(),
         };
 
         let mut reader = CountingReader {

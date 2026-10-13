@@ -20,9 +20,8 @@
 # docs/android.md §1).
 #
 # The commands here mirror a build that was run by hand and verified end to end
-# on a development machine (94 MB APK from a 71 MB engine .so). The workflow
-# itself has never been triggered, so treat the orchestration as unproven while
-# the commands inside it are known-good.
+# on a development machine (94 MB APK from a 71 MB engine .so); the orchestrations
+# below are exercised by every `android-*` tag.
 name: Android
 
 on:
@@ -73,9 +72,12 @@ jobs:
   apk:
     name: Release APK (arm64-v8a)
     runs-on: ubuntu-latest
+    # A build takes about seven minutes. The default is six hours, so a hung
+    # step would bill for hours before failing; this fails fast instead.
+    timeout-minutes: 60
     steps:
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # `bison` generates the TJS2 parsers; `crates/tjs/build.rs` also
       # needs python3, which the runner image already provides.
@@ -84,11 +86,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends bison
 
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
+      # JDK 21, the current LTS: Gradle 9.x and AGP 9.x both support it.
+      - name: Set up JDK 21
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: '21'
 
       # No `android-actions/setup-android` step: it installs the legacy `tools`
       # package, which no longer exists in Google's repository, so it fails with
@@ -167,7 +170,7 @@ jobs:
         run: bash ./crates/android/build-android.sh --ndk "$ANDROID_NDK_HOME"
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@v6
         with:
           gradle-version: ${{ env.GRADLE_VERSION }}
 
@@ -184,7 +187,7 @@ jobs:
         run: gradle :app:assembleRelease --no-daemon --stacktrace
 
       - name: Upload the APK
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: krkr-rs-release-arm64-v8a
           path: android/app/build/outputs/apk/release/*.apk

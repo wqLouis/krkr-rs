@@ -106,6 +106,11 @@ pub struct Storage {
     auto_paths: Vec<String>,
     /// Whether an archive is read into memory in full when it is mounted.
     preload_archives: bool,
+    /// The project storage path (the reference's current directory), supplied
+    /// by the composition root via [`Self::set_project`]. `Some` when the
+    /// project is an archive; a relative auto path is then normalized against
+    /// it. `None` for a folder project (disk-relative auto paths).
+    project: Option<PathBuf>,
     /// The per-segment XP3 extraction filter (the `xp3filter` seam), if any.
     ///
     /// L2 owns the state; the stateless L1 reader receives the closure as a
@@ -218,6 +223,9 @@ struct ResolutionCache {
     directories: HashMap<PathBuf, DirectoryListing>,
     /// Candidate tables keyed by the auto-path entry string.
     auto_paths: HashMap<String, Rc<AutoPathTable>>,
+    /// Resolved hits keyed by the requested storage name (the reference's
+    /// `TVPAutoPathCache`: a hit is cached, a miss is not).
+    placed: HashMap<String, Location>,
     /// Bottom file-system probes issued while resolving.
     probes: ProbeCounts,
     /// Entry bytes decoded and returned by `read`/`read_prefix`.
@@ -552,6 +560,28 @@ impl Storage {
         Ok(storage)
     }
 
+    /// Sets the project path a relative auto path is resolved against.
+    ///
+    /// The reference's launcher supplies `TVPProjectDir` and the engine only
+    /// decides whether that path is a storage (an archive, so the current
+    /// directory gets the archive delimiter) or a folder
+    /// (`reference/cpp/core/base/impl/SysInitImpl.cpp:160-165`). An archive
+    /// project prefixes a relative auto path (`data.xp3>system/`); a folder
+    /// project leaves it disk-relative.
+    ///
+    /// Call after the archives are mounted, so the project archive is known,
+    /// and before any startup script runs.
+    pub fn set_project(&mut self, path: impl AsRef<Path>) {
+        let path = path.as_ref();
+        let is_archive = self.archives.iter().any(|m| m.path.as_path() == path)
+            || matches!(
+                fs::stat(&self.fs, &FsPath::host(path)),
+                Ok(meta) if !meta.is_dir
+            );
+        self.project = is_archive.then(|| path.to_path_buf());
+        self.clear_resolution_cache();
+    }
+
     /// Creates an empty storage rooted at `base_dir`, validating that the
     /// base path exists and is a directory. No archives are mounted; use
     /// [`Self::mount_archive`] to add them explicitly.
@@ -570,6 +600,7 @@ impl Storage {
             archives: Vec::new(),
             auto_paths: Vec::new(),
             preload_archives,
+            project: None,
             xp3_extraction_filter: None,
             resolution_cache: RefCell::new(ResolutionCache::default()),
         })
@@ -687,9 +718,12 @@ impl Storage {
     }
 
     /// Appends an auto search path (the `Storages.addAutoPath` semantics).
-    /// Duplicates are ignored.
+    /// Duplicates are ignored. A relative path is resolved against the current
+    /// storage path first (the project archive when the project is
+    /// archive-backed), mirroring `TVPAddAutoPath`'s normalization against
+    /// `CurrentPath` (`reference/cpp/core/base/StorageIntf.cpp:921-937`).
     pub fn add_auto_path(&mut self, path: impl Into<String>) {
-        let path = path.into();
+        let path = self.current_storage_path(path.into());
         if !self.auto_paths.contains(&path) {
             self.auto_paths.push(path);
         }
@@ -700,8 +734,30 @@ impl Storage {
 
     /// Removes an auto search path.
     pub fn remove_auto_path(&mut self, path: &str) {
-        self.auto_paths.retain(|p| p != path);
+        let path = self.current_storage_path(path.to_string());
+        self.auto_paths.retain(|p| p != &path);
         self.clear_resolution_cache();
+    }
+
+    /// Resolves an auto path against the current storage path.
+    ///
+    /// `TVPAddAutoPath` normalizes a relative path against the current
+    /// directory (`TVPNormalizeStorageName` prepends `CurrentPath`,
+    /// `reference/cpp/core/base/StorageIntf.cpp:347-425`), and the current
+    /// directory is the project — the archive the reference appends `>` to
+    /// (`reference/cpp/core/base/impl/SysInitImpl.cpp:160-165`). An absolute
+    /// path, or one that already names an archive, is used as given.
+    fn current_storage_path(&self, path: String) -> String {
+        if path.contains('>') || Path::new(&path).is_absolute() {
+            return path;
+        }
+        match &self.project {
+            Some(project) => {
+                let project = project.to_string_lossy().replace('\\', "/");
+                format!("{project}>{path}")
+            }
+            None => path,
+        }
     }
 
     /// The bottom file-system probes issued so far and the miss count.
@@ -726,6 +782,7 @@ impl Storage {
         let cache = self.resolution_cache.get_mut();
         cache.directories.clear();
         cache.auto_paths.clear();
+        cache.placed.clear();
     }
 
     /// Resolves a storage name to a location, mirroring the reference search
@@ -752,12 +809,26 @@ impl Storage {
     /// mount is [`StorageReadError::InvalidPathName`] (`TVPInvalidPathName`),
     /// not a miss.
     pub fn find(&self, name: &str) -> Result<Option<Location>, StorageReadError> {
+        // The reference caches a resolved hit and never a miss
+        // (`TVPAutoPathCache`; a miss is not cached,
+        // `reference/cpp/core/base/StorageIntf.cpp:1101`).
+        if let Some(hit) = self.resolution_cache.borrow().placed.get(name).cloned() {
+            return Ok(Some(hit));
+        }
         let mut trace = SearchTrace::new(log::log_enabled!(log::Level::Debug));
         let found = self.find_recorded(name, &mut trace)?;
-        if found.is_none() {
-            self.resolution_cache.borrow_mut().probes.misses += 1;
-            if trace.enabled {
-                log::debug!("storage miss {name:?}: {}", trace.render());
+        match &found {
+            Some(location) => {
+                self.resolution_cache
+                    .borrow_mut()
+                    .placed
+                    .insert(name.to_string(), location.clone());
+            }
+            None => {
+                self.resolution_cache.borrow_mut().probes.misses += 1;
+                if trace.enabled {
+                    log::debug!("storage miss {name:?}: {}", trace.render());
+                }
             }
         }
         Ok(found)
@@ -840,10 +911,10 @@ impl Storage {
             });
         }
         for mounted in self.archives.iter().rev() {
-            trace.attempt(|| format!("archive {} entry {normalized:?}", mounted.path.display()));
             if mounted.archive.entry(&normalized).is_some() {
                 return Ok(Some(Location::Archive(mounted.path.clone(), normalized)));
             }
+            trace.attempt(|| archive_miss_line(&mounted.path, &mounted.archive, &normalized));
         }
         Ok(None)
     }
@@ -1012,10 +1083,10 @@ impl Storage {
             .unwrap_or_default();
         for mounted in self.archives.iter().rev() {
             if mounted.file_name.eq_ignore_ascii_case(&arc_name) {
-                trace.attempt(|| format!("archive {} entry {rest:?}", mounted.path.display()));
                 if mounted.archive.entry(&rest).is_some() {
                     return Ok(Some(Location::Archive(mounted.path.clone(), rest)));
                 }
+                trace.attempt(|| archive_miss_line(&mounted.path, &mounted.archive, &rest));
                 return Ok(None);
             }
         }
@@ -1041,6 +1112,7 @@ impl Storage {
         if archive.entry(&rest).is_some() {
             Ok(Some(Location::Archive(path, rest)))
         } else {
+            trace.attempt(|| archive_miss_line(&path, &archive, &rest));
             Ok(None)
         }
     }
@@ -1815,6 +1887,56 @@ fn collect_archive_children<'a>(
 /// The base storage name (the part after the last `/`).
 fn storage_base(name: &str) -> &str {
     name.rsplit('/').next().unwrap_or(name)
+}
+
+/// How many near-miss names one archive-miss line lists.
+const ARCHIVE_MISS_NEAR_NAMES: usize = 8;
+
+/// Renders one archive probe for a miss: the entry count, the index blocks
+/// that were read (how many names each contributed), and a bounded set of
+/// near-miss names.
+///
+/// This is the instrument that turns a bare `entry not found` into `1384
+/// entries, one zlib index block, and the closest names` in one run.
+fn archive_miss_line(path: &Path, archive: &Xp3Archive, request: &str) -> String {
+    let sections: Vec<String> = archive
+        .index_sections()
+        .iter()
+        .map(|section| {
+            let encode = match section.encode {
+                xp3::IndexEncode::Raw => "raw",
+                xp3::IndexEncode::Zlib => "zlib",
+            };
+            format!(
+                "{encode} {} names (+{})",
+                section.file_chunks, section.new_names
+            )
+        })
+        .collect();
+    let near = archive.near_misses(request, ARCHIVE_MISS_NEAR_NAMES);
+    let mut line = format!(
+        "archive {} entry {request:?}: {} entries, {} index section(s) [{}]",
+        path.display(),
+        archive.len(),
+        sections.len(),
+        sections.join(", "),
+    );
+    if near.total == 0 {
+        line.push_str("; no near misses");
+    } else {
+        let names = near
+            .names
+            .iter()
+            .map(|name| format!("{name:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        line.push_str(&format!(
+            "; nearest {}/{}: {names}",
+            near.names.len(),
+            near.total,
+        ));
+    }
+    line
 }
 
 /// Builds a listed child name from its parent prefix.

@@ -396,6 +396,173 @@ fn absolute_archive_auto_path_resolves_a_mounted_archive() {
     assert_eq!(storage.read("Config.tjs").unwrap(), b"mounted");
 }
 
+/// A relative folder auto path resolves against the current path. When the
+/// project is archive-backed the reference appends `>` to `TVPProjectDir` and
+/// sets it as the current directory
+/// (`reference/cpp/core/base/impl/SysInitImpl.cpp:160-165`), so a relative
+/// `Storages.addAutoPath("system/")` is normalized to `data.xp3>system/`
+/// (`reference/cpp/core/base/StorageIntf.cpp:921-937`) and the lookup searches
+/// the archive's `system/` children. This is the `Config.tjs が見つかりません`
+/// false negative: the archive holds `system/Config.tjs` but the relative auto
+/// path was resolved against disk only.
+#[test]
+fn relative_auto_path_resolves_inside_a_mounted_archive() {
+    let xp3 = build_xp3(&[("system/Config.tjs", b"cfg", false)]);
+    let mut storage = mount_memory_with_archives(&[("data.xp3", &xp3)], &["data.xp3"]);
+    storage.set_project("/data.xp3");
+    storage.add_auto_path("system/");
+
+    assert_eq!(
+        storage.find("Config.tjs").unwrap(),
+        Some(Location::Archive(
+            PathBuf::from("/data.xp3"),
+            "system/config.tjs".into()
+        ))
+    );
+    assert_eq!(storage.read("Config.tjs").unwrap(), b"cfg");
+}
+
+/// An archive-backed miss names the archive's size, its index sections and the
+/// closest names, so one device log is enough to see what the archive contains
+/// and how the request almost matched.
+#[test]
+fn archive_miss_reports_near_misses() {
+    let xp3 = build_xp3(&[("system/Config.tjs", b"cfg", false)]);
+    let storage = mount_memory_with_archives(&[("data.xp3", &xp3)], &["data.xp3"]);
+
+    let (found, logs) = capture_logs(|| storage.find("Config.tjs"));
+    assert_eq!(found.unwrap(), None);
+    let miss = logs
+        .iter()
+        .find(|line| line.contains("storage miss"))
+        .expect("a miss logs one line");
+    assert!(miss.contains("1 entries, 1 index section(s)"), "{miss}");
+    assert!(miss.contains("system/config.tjs"), "{miss}");
+    assert!(miss.contains("nearest 1/1"), "{miss}");
+}
+
+/// An archive-backed relative auto path resolves by the request's base name,
+/// in both the plain form the port stores (`system/`, which the reference
+/// resolves against the project archive) and the explicit archive form
+/// (`data.xp3>system/`). The reference indexes the direct children of an
+/// auto path once and looks a request up by its base name
+/// (`TVPRebuildAutoPathTable` `reference/cpp/core/base/StorageIntf.cpp:979-1013`,
+/// `TVPGetPlacedPath` `:1088-1093`).
+#[test]
+fn both_auto_path_forms_resolve_a_bare_name() {
+    let xp3 = build_xp3(&[("system/Config.tjs", b"cfg", false)]);
+
+    let mut plain = mount_memory_with_archives(&[("data.xp3", &xp3)], &["data.xp3"]);
+    plain.set_project("/data.xp3");
+    plain.add_auto_path("system/");
+    assert_eq!(plain.read("Config.tjs").unwrap(), b"cfg");
+
+    let mut explicit = mount_memory_with_archives(&[("data.xp3", &xp3)], &["data.xp3"]);
+    explicit.add_auto_path("data.xp3>system/");
+    assert_eq!(explicit.read("Config.tjs").unwrap(), b"cfg");
+}
+
+/// Only the **direct** children of an auto-path prefix are indexed, so a name
+/// below a subdirectory is not reachable by its base name. The reference
+/// skips an in-archive name that has another `/` after the prefix
+/// (`reference/cpp/core/base/StorageIntf.cpp:1001-1003`).
+#[test]
+fn auto_path_registers_direct_children_only() {
+    let xp3 = build_xp3(&[("system/sub/Config.tjs", b"deep", false)]);
+    let mut storage = mount_memory_with_archives(&[("data.xp3", &xp3)], &["data.xp3"]);
+    storage.set_project("/data.xp3");
+    storage.add_auto_path("system/");
+
+    assert_eq!(storage.find("Config.tjs").unwrap(), None);
+    // The full in-archive path still resolves.
+    assert_eq!(storage.read("system/sub/Config.tjs").unwrap(), b"deep");
+}
+
+/// A resolved hit is cached; a miss is not (the reference caches the placed
+/// path for a hit and explicitly does not cache a miss,
+/// `reference/cpp/core/base/StorageIntf.cpp:1101`).
+#[test]
+fn a_resolved_hit_is_cached_and_a_miss_is_not() {
+    let xp3 = build_xp3(&[("system/Config.tjs", b"cfg", false)]);
+    let mut storage = mount_memory_with_archives(&[("data.xp3", &xp3)], &["data.xp3"]);
+    storage.set_project("/data.xp3");
+    storage.add_auto_path("system/");
+
+    assert!(storage.find("Config.tjs").unwrap().is_some());
+    let after_hit = storage.probe_counts();
+    assert!(storage.find("Config.tjs").unwrap().is_some());
+    assert_eq!(
+        storage.probe_counts().stat,
+        after_hit.stat,
+        "a cached hit must not re-probe"
+    );
+    assert_eq!(
+        storage.probe_counts().list,
+        after_hit.list,
+        "a cached hit must not re-list"
+    );
+
+    assert!(storage.find("Missing.tjs").unwrap().is_none());
+    assert!(storage.find("Missing.tjs").unwrap().is_none());
+    assert_eq!(
+        storage.probe_counts().misses,
+        2,
+        "a miss must not be cached"
+    );
+}
+
+/// The project archive is an explicit input, not the first archive mounted.
+/// D35 discovery sorts case-insensitively, so `bgimage.xp3` mounts before
+/// `data.xp3`; the relative `system/` auto path must still resolve inside the
+/// archive the launcher named as the project
+/// (`reference/cpp/core/base/impl/SysInitImpl.cpp:160-165`).
+#[test]
+fn project_archive_is_not_the_first_mounted() {
+    let bgimage = build_xp3(&[("system/bg.dat", b"bg", false)]);
+    let data = build_xp3(&[("system/Config.tjs", b"cfg", false)]);
+    let mut storage = mount_memory_with_archives(
+        &[("bgimage.xp3", &bgimage), ("data.xp3", &data)],
+        &["bgimage.xp3", "data.xp3"],
+    );
+    storage.set_project("/data.xp3");
+    storage.add_auto_path("system/");
+
+    assert_eq!(
+        storage.find("Config.tjs").unwrap(),
+        Some(Location::Archive(
+            PathBuf::from("/data.xp3"),
+            "system/config.tjs".into()
+        ))
+    );
+}
+
+/// A folder project appends `/` and leaves a relative auto path disk-relative
+/// (the reference's `else` branch,
+/// `reference/cpp/core/base/impl/SysInitImpl.cpp:160-165`).
+#[test]
+fn folder_project_resolves_a_relative_auto_path_on_disk() {
+    let mut storage = mount_memory(&[("chs/Config.tjs", b"disk")]);
+    storage.set_project("/");
+    storage.add_auto_path("chs/");
+
+    assert_eq!(
+        storage.find("Config.tjs").unwrap(),
+        Some(Location::Disk(PathBuf::from("/chs/Config.tjs")))
+    );
+}
+
+/// With no project set, a relative auto path stays disk-relative: the project
+/// is never inferred from the mounted archives, so a re-introduced
+/// first-mount inference would resolve `bg.dat` here and fail.
+#[test]
+fn no_project_leaves_a_relative_auto_path_disk_relative() {
+    let bgimage = build_xp3(&[("system/bg.dat", b"bg", false)]);
+    let mut storage = mount_memory_with_archives(&[("bgimage.xp3", &bgimage)], &["bgimage.xp3"]);
+    storage.add_auto_path("system/");
+
+    assert_eq!(storage.find("bg.dat").unwrap(), None);
+}
+
 /// The same absolute `>` auto path opens and parses an archive that was not
 /// mounted: `TVPArchiveCache.Get` opens the archive named in the path when it
 /// exists and is not already cached
@@ -515,7 +682,7 @@ fn resolver_cache_lists_each_auto_path_once() {
     let fs = memory_with(&[("game/data.xp3", &xp3), ("game/parts/foo.png", b"parts")]);
     let mut storage = Storage::mount_archives(fs, "/game", ["data.xp3"]).expect("mount");
     storage.add_auto_path("data.xp3>system/");
-    storage.add_auto_path("parts/");
+    storage.add_auto_path("/game/parts/");
 
     let (found, first_logs) = capture_logs(|| storage.find("missing.txt"));
     assert_eq!(found.unwrap(), None);
@@ -975,7 +1142,7 @@ fn later_added_auto_path_wins_over_a_mounted_archive() {
         &["patch.xp3"],
     );
     storage.add_auto_path("patch.xp3>");
-    storage.add_auto_path("parts/");
+    storage.add_auto_path("/parts/");
 
     assert_eq!(storage.read("foo.png").unwrap(), b"from parts");
     assert_eq!(

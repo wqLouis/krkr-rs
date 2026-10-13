@@ -354,19 +354,29 @@ impl GameHost {
         let mount_started = Instant::now();
         let storage = Box::new(if archives.is_empty() {
             let discovered = engine::storage::discover_archives(&fs, &base_dir)?;
-            Storage::mount_discovered_archives_with(
+            let mut storage = Storage::mount_discovered_archives_with(
                 fs,
                 &base_dir,
-                discovered,
+                &discovered,
                 MountOptions { preload_archives },
-            )?
+            )?;
+            let project = directory_project(&base_dir, &discovered, |path| {
+                storage_has_boot_scripts(&storage, path)
+            });
+            storage.set_project(&project);
+            storage
         } else {
-            Storage::mount_archives_with(
+            let mut storage = Storage::mount_archives_with(
                 fs,
                 &base_dir,
-                archives,
+                &archives,
                 MountOptions { preload_archives },
-            )?
+            )?;
+            let project = explicit_project(&base_dir, &archives, |path| {
+                storage_has_boot_scripts(&storage, path)
+            });
+            storage.set_project(&project);
+            storage
         });
         let mount_time = mount_started.elapsed();
         let scene_ptr = host.scene_mut() as *mut engine::Scene;
@@ -584,6 +594,66 @@ fn log_startup(
         snapshot.startup_script_time.as_secs_f64() * 1000.0,
         startup_time.as_secs_f64() * 1000.0,
     );
+}
+
+/// Whether the archive mounted at `path` holds the boot scripts.
+///
+/// The reference's project decision only needs to know whether `TVPProjectDir`
+/// is a storage; a directory launch has no such path, so the composition root
+/// reconstructs it by finding the archive that holds `startup.tjs` or
+/// `system/Initialize.tjs` (`reference/cpp/core/base/impl/SysInitImpl.cpp:160-165`).
+fn storage_has_boot_scripts(storage: &Storage, path: &Path) -> bool {
+    let mut found = false;
+    storage.for_each_archive(|mounted, archive| {
+        if mounted == path
+            && (archive.entry("startup.tjs").is_some()
+                || archive.entry("system/initialize.tjs").is_some())
+        {
+            found = true;
+        }
+    });
+    found
+}
+
+/// The project path for a directory-only launch (the directory-scan
+/// convenience; the reference has no folder scan).
+///
+/// The reference takes `TVPProjectDir` from the launcher and the engine only
+/// decides whether it is an archive or a folder
+/// (`reference/cpp/core/base/impl/SysInitImpl.cpp:160-165`). A directory launch
+/// reconstructs that path in this order: the conventional boot archive
+/// `data.xp3` when present (what the shipped packages instruct), else the
+/// archive holding the boot scripts, else the directory as a folder project.
+fn directory_project(
+    base_dir: &Path,
+    discovered: &[PathBuf],
+    contains_boot_scripts: impl Fn(&Path) -> bool,
+) -> PathBuf {
+    if let Some(data) = discovered.iter().find(|path| {
+        path.file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case("data.xp3"))
+    }) {
+        return data.clone();
+    }
+    if let Some(archive) = discovered.iter().find(|path| contains_boot_scripts(path)) {
+        return archive.clone();
+    }
+    base_dir.to_path_buf()
+}
+
+/// The project path for an explicit `--archive` list: the archive holding the
+/// boot scripts, else the first named archive, else the directory.
+fn explicit_project(
+    base_dir: &Path,
+    archives: &[PathBuf],
+    contains_boot_scripts: impl Fn(&Path) -> bool,
+) -> PathBuf {
+    archives
+        .iter()
+        .find(|path| contains_boot_scripts(path))
+        .or_else(|| archives.first())
+        .cloned()
+        .unwrap_or_else(|| base_dir.to_path_buf())
 }
 
 /// The `.tpm` plugin files the reference auto-loads, in ASCII filename order.
@@ -939,5 +1009,56 @@ mod tests {
         );
         drop(game);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A directory launch prefers the conventional boot archive `data.xp3`
+    /// even though D35 discovery sorts `bgimage.xp3` before it.
+    // Reference: `TVPBeforeSystemInit` appends `>` only when the launcher's
+    // project path is a storage (`SysInitImpl.cpp:160-165`).
+    #[test]
+    fn directory_project_prefers_data_xp3() {
+        let base = Path::new("/game");
+        let discovered = [
+            PathBuf::from("/game/bgimage.xp3"),
+            PathBuf::from("/game/data.xp3"),
+        ];
+        assert_eq!(
+            directory_project(base, &discovered, |_| false),
+            PathBuf::from("/game/data.xp3")
+        );
+    }
+
+    /// Without `data.xp3`, the archive that holds the boot scripts is the
+    /// project.
+    #[test]
+    fn directory_project_falls_back_to_the_boot_script_archive() {
+        let base = Path::new("/game");
+        let discovered = [
+            PathBuf::from("/game/aaa.xp3"),
+            PathBuf::from("/game/bbb.xp3"),
+        ];
+        assert_eq!(
+            directory_project(base, &discovered, |path| path.ends_with("bbb.xp3")),
+            PathBuf::from("/game/bbb.xp3")
+        );
+    }
+
+    /// With no boot archive, the directory is the folder project.
+    #[test]
+    fn directory_project_falls_back_to_the_folder() {
+        let base = Path::new("/game");
+        assert_eq!(directory_project(base, &[], |_| false), base.to_path_buf());
+    }
+
+    /// An explicit archive list names the project: the boot-script archive
+    /// when one is present, else the first.
+    #[test]
+    fn explicit_project_uses_the_named_archive() {
+        let base = Path::new("/game");
+        let archives = [PathBuf::from("/game/extra.xp3")];
+        assert_eq!(
+            explicit_project(base, &archives, |_| false),
+            PathBuf::from("/game/extra.xp3")
+        );
     }
 }

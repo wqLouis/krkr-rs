@@ -7,7 +7,9 @@ use std::io::{Read, Seek, SeekFrom};
 
 use api::error::FsError;
 use api::fs::{FsPath, OpenMode};
-use fs::xp3::{SEGM_ENCODE_RAW, XP3_MAGIC, Xp3Archive, Xp3Error, normalize_in_archive_name};
+use fs::xp3::{
+    IndexEncode, SEGM_ENCODE_RAW, XP3_MAGIC, Xp3Archive, Xp3Error, normalize_in_archive_name,
+};
 use fs::{FileState, FileSystem};
 use testkit::{build_xp3, build_xp3_compressed_index};
 
@@ -211,6 +213,165 @@ fn parses_a_zlib_compressed_index() {
         archive.read(&fs, &file, "packed.bin").unwrap(),
         b"zlib segment payload"
     );
+}
+
+/// Build a reference-shaped archive whose index holds `entries` (raw 28-byte
+/// segments), stored raw or zlib-compressed.
+///
+/// The layout is copied from the reference reader, not from our writer: the
+/// index offset is an `i64` at byte 11
+/// (`reference/cpp/core/archive/xp3/XP3Archive.cpp:340-343`); a raw block is a
+/// `TVP_XP3_INDEX_ENCODE_RAW` flag byte then an `i64` size (`:392-399`); a
+/// zlib block is the flag byte, an `i64` compressed size, an `i64`
+/// uncompressed size, then the zlib stream (`:360-390`); `File` chunks carry
+/// `info` (`flags:u32 org:i64 arc:i64 namelen:i16 name:u16[]`, `:424-436`),
+/// `segm` (28-byte record, `:451-476`) and `adlr` (`:483-489`).
+fn archive_with_raw_entries(entries: &[(&str, &[u8])], zlib_index: bool) -> Vec<u8> {
+    let mut file = Vec::new();
+    file.extend_from_slice(&XP3_MAGIC);
+    file.extend_from_slice(&0u64.to_le_bytes());
+    let mut index_data = Vec::new();
+    for (name, data) in entries {
+        let start = file.len() as u64;
+        file.extend_from_slice(data);
+        index_data.extend_from_slice(&file_chunk_raw(
+            name,
+            data.len() as u64,
+            data.len() as u64,
+            start,
+        ));
+    }
+    let index_ofs = file.len() as u64;
+    if zlib_index {
+        use flate2::Compression;
+        use flate2::write::ZlibEncoder;
+        use std::io::Write as _;
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(&index_data).expect("compress index");
+        let compressed = enc.finish().expect("finish index");
+        file.push(0x01u8); // TVP_XP3_INDEX_ENCODE_ZLIB
+        file.extend_from_slice(&(compressed.len() as u64).to_le_bytes());
+        file.extend_from_slice(&(index_data.len() as u64).to_le_bytes());
+        file.extend_from_slice(&compressed);
+    } else {
+        file.push(0x00u8); // TVP_XP3_INDEX_ENCODE_RAW
+        file.extend_from_slice(&(index_data.len() as u64).to_le_bytes());
+        file.extend_from_slice(&index_data);
+    }
+    file[11..19].copy_from_slice(&index_ofs.to_le_bytes());
+    file
+}
+
+/// A known name resolves through a plain (raw-encoded) index; the count is not
+/// the contract, the name is.
+#[test]
+fn plain_index_resolves_a_known_name() {
+    let xp3 = archive_with_raw_entries(&[("Config.tjs", b"plain config")], false);
+    let (fs, file) = fs_with(&xp3);
+    let archive = Xp3Archive::open(&fs, &file).expect("open plain index");
+    assert_eq!(archive.len(), 1);
+    assert!(archive.entry("Config.tjs").is_some());
+    assert_eq!(
+        archive.read(&fs, &file, "config.tjs").unwrap(),
+        b"plain config"
+    );
+    let sections = archive.index_sections();
+    assert_eq!(sections.len(), 1);
+    assert_eq!(sections[0].offset, 31);
+    assert_eq!(sections[0].encode, IndexEncode::Raw);
+    assert_eq!(sections[0].file_chunks, 1);
+    assert_eq!(sections[0].new_names, 1);
+}
+
+/// A known name resolves through a zlib-compressed index block. The compressed
+/// bytes follow the reference reader exactly
+/// (`reference/cpp/core/archive/xp3/XP3Archive.cpp:360-390`); this is not our
+/// writer round-tripping itself.
+#[test]
+fn zlib_index_resolves_a_known_name() {
+    let xp3 = archive_with_raw_entries(&[("Config.tjs", b"packed config")], true);
+    let (fs, file) = fs_with(&xp3);
+    let archive = Xp3Archive::open(&fs, &file).expect("open zlib index");
+    assert_eq!(archive.len(), 1);
+    assert!(archive.entry("Config.tjs").is_some());
+    assert_eq!(
+        archive.read(&fs, &file, "config.tjs").unwrap(),
+        b"packed config"
+    );
+    assert_eq!(archive.index_sections().len(), 1);
+    assert_eq!(archive.index_sections()[0].encode, IndexEncode::Zlib);
+    assert_eq!(archive.index_sections()[0].file_chunks, 1);
+}
+
+/// A name that lives only in the second `INDEX_CONTINUE` block resolves, and
+/// both blocks are reported. The reference reads every linked block and merges
+/// their items (`reference/cpp/core/archive/xp3/XP3Archive.cpp:348-505`).
+#[test]
+fn two_index_sections_resolve_names_from_both() {
+    let xp3 = build_xp3_chained(&[("first.bin", b"first"), ("second.bin", b"second")]);
+    let (fs, file) = fs_with(&xp3);
+    let archive = Xp3Archive::open(&fs, &file).expect("open chained archive");
+    assert_eq!(archive.len(), 2);
+    assert!(archive.entry("first.bin").is_some());
+    assert!(archive.entry("second.bin").is_some());
+    assert_eq!(archive.index_sections().len(), 2);
+    assert_eq!(archive.index_sections()[0].new_names, 1);
+    assert_eq!(archive.index_sections()[1].new_names, 1);
+}
+
+/// A stored name is matched case-insensitively and with `\\` folded to `/`:
+/// the reference lowercases and unifies the separator when it loads the index
+/// (`NormalizeInArchiveStorageName`, `StorageIntf.cpp:566-606`) and normalizes
+/// the request again before the hash lookup (`:737-757`).
+#[test]
+fn stored_case_and_backslash_resolve() {
+    let xp3 = archive_with_raw_entries(&[(r"Dir\Config.TJS", b"mixed")], false);
+    let (fs, file) = fs_with(&xp3);
+    let archive = Xp3Archive::open(&fs, &file).expect("open archive");
+    assert!(archive.entry("dir/config.tjs").is_some());
+    assert!(archive.entry(r"DIR\CONFIG.tjs").is_some());
+    assert_eq!(
+        archive.read(&fs, &file, "Dir/Config.tjs").unwrap(),
+        b"mixed"
+    );
+}
+
+/// A stored leading `/` is dropped by the reference normalizer
+/// (`StorageIntf.cpp:566-606`), so a stored `/Config.tjs` resolves as
+/// `config.tjs`.
+#[test]
+fn stored_leading_slash_resolves() {
+    let xp3 = archive_with_raw_entries(&[("/Config.tjs", b"slashy")], false);
+    let (fs, file) = fs_with(&xp3);
+    let archive = Xp3Archive::open(&fs, &file).expect("open archive");
+    assert!(archive.entry("config.tjs").is_some());
+    assert!(archive.entry("/Config.tjs").is_some());
+    assert_eq!(archive.read(&fs, &file, "Config.tjs").unwrap(), b"slashy");
+}
+
+/// A missed lookup names its near misses: an entry whose name is the request
+/// under a leading path, and an entry sharing the request's base name.
+#[test]
+fn near_misses_report_path_and_base_name_matches() {
+    let xp3 = archive_with_raw_entries(
+        &[
+            ("system/Config.tjs", b"cfg"),
+            ("other/Config.tjs", b"cfg2"),
+            ("system/Other.tjs", b"other"),
+        ],
+        false,
+    );
+    let (fs, file) = fs_with(&xp3);
+    let archive = Xp3Archive::open(&fs, &file).expect("open archive");
+    let near = archive.near_misses("Config.tjs", 8);
+    assert_eq!(near.total, 2, "two entries end in /config.tjs");
+    assert!(near.names.contains(&"system/config.tjs".to_string()));
+    assert!(near.names.contains(&"other/config.tjs".to_string()));
+    assert!(!near.names.contains(&"system/other.tjs".to_string()));
+
+    let capped = archive.near_misses("Config.tjs", 1);
+    assert_eq!(capped.total, 2);
+    assert_eq!(capped.names.len(), 1);
 }
 
 /// A non-XP3 file is a typed `NotAnXp3` error, not an I/O surprise.
