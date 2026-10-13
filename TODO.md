@@ -581,3 +581,147 @@ extractor gaps remain, neither a missing port member:
   `getDirList`/`drawFFTGraph` as missing. Fix: enumerate global function
   members in the dump, or teach the runtime comparison that `__global__` is
   not represented. A host-only change; no script behaviour is involved.
+
+## 18. Handoff state after `android-v2.0.8-alpha`
+
+`main` is at `636f5c3`, tagged `android-v2.0.8-alpha` (run `38382613439`, the
+first build with the current action majors and JDK 21). The gate is green on
+this tree: fmt, the four guards, clippy, the workspace suite, `platform-linux`,
+`platform-android`, the per-target check, the surface lock (2515 members) and
+both parity reports (640/974 members, 0 missing). Everything below says whether
+it is verified or not; nothing in the release is device-confirmed yet.
+
+### 18.1 First task: verify v2.0.8 on a device
+
+The release fixes four separate causes of "cannot open the game". Install it,
+set the log level to `debug`, run each title, and send one export — it should
+now cover several launches.
+
+| title | previous failure | what shipped | expect |
+|---|---|---|---|
+| 宠物志愿 | `Config.tjs が見つかりません` | the auto-path project fix (18.2) | no `storage miss "Config.tjs"`; startup gets past `kag.process("first.ks")` (`system/Initialize.tjs:280`) |
+| 魔女的夜宴 | same | same | same |
+| 我的眼睛能看光光 | `Bitmap: storage not found: FRM_0303l` | probably the same fix | the frame resolves, or a different error |
+| 千恋万花 | `syntax error` (TJS2100 bytecode) | precompiled-bytecode loading | `script read 'startup.tjs' … encoding=precompiled bytecode`, no syntax error |
+| 绝对高潮 | `Member "menu" does not exist` | `Window.menu` | the property resolves |
+
+When a title still refuses, the log now says why: `script failure '<name>'`
+prints the source around the failing line, and a storage miss prints the entry
+count, the index-section breakdown and the nearest entry names
+(`docs/audits/xp3-lookup.md`, `docs/audits/startup-diagnostics.md`).
+
+Still owed from the previous release: the slow-frame line's attribution of the
+~558 ms stall (`platform_wait` vs `unaccounted`, see §16), and whether the
+`FE FE` mode 1/2 offset choice matches a real game-written container.
+
+### 18.2 The auto-path fix, and why it mattered
+
+`Storages.addAutoPath("system/")` was kept as a **disk** path, so a bare
+`Config.tjs` was searched on disk and at each archive's *root*. The reference
+normalises a relative auto path against the current directory, which is the
+**project path** — and when that path is an archive the engine appends `>`
+(`reference/cpp/core/base/impl/SysInitImpl.cpp:160-165`), so the auto path
+becomes `data.xp3>system/`; `TVPRebuildAutoPathTable`
+(`reference/cpp/core/base/StorageIntf.cpp:959-1052`) then indexes that prefix's
+**direct children** by base name, and `TVPGetPlacedPath` (`:1061-1105`) resolves
+a request by its **base name**, caching hits and never caching misses.
+
+Implemented: the auto-path table and its invalidations, the project as an
+explicit input from the composition root (never mount order — D35 sorts
+case-insensitively, so `bgimage.xp3` mounts before `data.xp3`), and the miss
+diagnostic. The rule for a directory launch lives in `crates/app/src/game.rs`:
+the conventional `data.xp3`, else the archive holding the boot scripts, else the
+directory. Host check available: `/mnt/DATA/Games/Others/test2/data.xp3` is
+宠物志愿's archive (1384 entries, one zlib index block, contains
+`system/config.tjs`) — `Config.tjs` must resolve there through an auto path.
+
+### 18.3 Open work, in priority order
+
+1. **`PackinOne.dll`** — top of the plugin queue by *observed usage* (the only
+   unemulated plugin real games actually link, 4 of 28 launches, and it
+   correlates with a failing title). Surface and priority: `plugins/analysis/`
+   (gitignored, with the DLLs). Its strings include `ProxyStorageMap`,
+   `loadDataPack`, `PackinOneList`; two registration blocks remain unresolved.
+   **If it is a storage proxy, a surface-only emulation will not fix anything —
+   it needs behaviour** (18.4, Tier 2).
+2. **Other linked but unported plugins**: `krglhwebp.dll`, `clipboardEx.dll`
+   (seen in a device log), plus the inventory's 35 unemulated names.
+3. **The hasher swap** — measured, not guesswork: `scripts/perf/hashmap_vs_btreemap.rs`
+   shows `FxHash` 2–9× faster than the default SipHash on the id/name keys this
+   tree uses, while `BTreeMap` is *worse* (and reorders observable
+   dictionaries). Swap the hasher on internal maps only; leave insertion-ordered
+   structures alone.
+4. **Delete `unsafe impl Send + Sync for Tjs2Engine`** — unsound as a public API
+   (two engines race process-global VM state) and nothing in the tree was found
+   to require the bounds, so remove them and let the compiler name any caller.
+   `docs/vm-defects.md` GLO-1 / LIFE-2.
+5. **Image decode scheduling** — the measured 6.77 s frame and ~1.9 s transition
+   are sums of synchronous decodes. The plan is prefetch, cache consultation and
+   a bounded worker pool; `fork_union`/`rayon`/std threads are the candidates,
+   to be chosen on a measurement. This is where the remaining seconds are.
+6. **`unsafe` SAFETY-note debt** — 89 findings across 19 files, baselined per
+   file by `scripts/check-layering.sh` so new debt fails the gate (§16).
+7. **Parity blind spots left** — `global.X = …` in script strings, member names
+   built at runtime, and two *false* reference members
+   (`BasicDrawDevice.name`/`PassThroughDrawDevice.name`) that the extractor
+   invents from a `#define` body. `docs/audits/propset-parity.md` §6.
+8. **`BLK-3`'s open question** — whether the shipped engine shares the reference
+   snapshot's incomplete bytecode export table. Settle with a game that uses
+   `Scripts.compileStorage` on a `+=`/`++` statement, or a reference build whose
+   translation table differs (`docs/vm-defects.md`).
+9. **`docs/migration/reviews/fs_engine.md` §1.10** — claims
+   `TVPIsExistentStorage` reports directories as existing, contradicted by
+   `StorageImpl.cpp:532-546`. Settle from the reference or mark as needing
+   device evidence; two docs must not disagree silently.
+10. **Deferred by decision**: C++ `-O2 -flto` (needs a device A/B, §12), the GPU
+    text path and render-target readback (§12), and the L2-owns-the-frame work.
+
+### 18.4 Plugin coverage plan (the next major version)
+
+Ranked by **observed links first**, shipped copies second, effort third
+(`plugins/analysis/PRIORITY.md`). Four tiers, because they need different work:
+
+1. **Surface only** — register the extracted member names so calls resolve and
+   take the null-plugin behaviour; mechanical, and it moves titles past
+   `Member "x" does not exist`.
+2. **Behaviour by decompilation** — for members a game depends on where void is
+   not enough (a storage proxy is the archetype). Bounded: the pipeline records
+   each method's implementation pointer.
+3. **Engine features** — the object-interface plugins are not plugin work:
+   `krmovie`/`yuzuex` need video/audio backends in L1/L2.
+4. **Windows-bound** — `win32ole` (real COM), `win32dialog`, `drawDeviceD3D`:
+   emulate the API or declare out of scope with evidence.
+
+The lever that keeps this measured rather than guessed: **our VM sees every
+native call**, so logging calls to unemulated members turns a device log into a
+work list ranked by real use — the same signal that identified `PackinOne`.
+
+### 18.5 Where the evidence lives
+
+| artifact | what it holds |
+|---|---|
+| `docs/vm-defects.md` | the VM/reference defects a rewrite must not rediscover |
+| `docs/audits/xp3-lookup.md` | the auto-path model, the fix, the tests |
+| `docs/audits/startup-diagnostics.md` | the failure-source excerpt and its guarantee |
+| `docs/audits/bytecode-scripts.md` | `TJS2100` loading, the loader guard, the writer defect |
+| `docs/audits/propset-parity.md`, `layering-guard.md`, `house-style-guard.md`, `test-fidelity.md` | the guards and the blind spots they close |
+| `docs/audits/unsafe-inventory.md` | the unsafe review, incl. the two real defects it found |
+| `plugins/INVENTORY.md`, `plugins/analysis/` | the DLL queue, surfaces and priorities (gitignored) |
+| `krkr-rs-logs*.txt` (gitignored) | device logs; the failure fingerprints are in §3 |
+
+### 18.6 Method notes worth carrying forward
+
+* **Read the reference before implementing.** The `Config.tjs` bug was solved in
+  ten minutes once `TVPGetPlacedPath`/`TVPRebuildAutoPathTable` were open; before
+  that, three different mechanisms were reasoned out and all three were wrong.
+* **Reuse the tools already in the tree.** Three hand-written XP3 parsers were
+  wrong in three different ways (magic, offset, layout) while
+  `scripts/extract_xp3.py` already read the format correctly.
+* **A count is not a name set.** "Both engines see 1384 entries" hid a name-level
+  lookup bug; assert that a known name resolves, per index shape.
+* **Verify tags and versions with `git ls-remote`**, never from memory — the
+  current action majors were newer than the deprecation notice implied.
+* **Releases are metered**: tag only on the user's go-ahead (AGENTS §0).
+* **A subagent's edit scope does not always widen for a running session**; apply
+  its verified patch locally instead, and **verify receipt** of load-bearing
+  steering messages — one was silently dropped this session.
