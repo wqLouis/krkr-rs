@@ -16,9 +16,9 @@ Rust source. This script compares it against the committed baseline
   * members that vanish  -> dispatch silently broken.
 
 Usage:
-    python3 scripts/surface_lock.py             # regenerate + check
-    python3 scripts/surface_lock.py --no-regen   # check the existing dump
-    python3 scripts/surface_lock.py --update     # accept the current surface
+    uv run --project scripts krkr-gate surface-lock             # regenerate + check
+    uv run --project scripts krkr-gate surface-lock --no-regen   # check the existing dump
+    uv run --project scripts krkr-gate surface-lock --update     # accept the current surface
 
 An intentional surface change therefore has to be committed *with* a new
 baseline in `docs/surface/`, where it is reviewable as a diff — that is the
@@ -34,7 +34,9 @@ import pathlib
 import subprocess
 import sys
 
-ROOT = pathlib.Path(__file__).resolve().parents[1]
+from ..common import REPO_ROOT
+
+ROOT = REPO_ROOT
 BASELINE = ROOT / "docs" / "surface" / "runtime_surface.json"
 DUMP = ROOT / "target" / "runtime_surface.json"
 
@@ -99,6 +101,25 @@ def members_total(surface: dict[str, list[str]]) -> int:
     return sum(len(v) for v in surface.values())
 
 
+def self_test() -> int:
+    """Check the class/member diff logic on a synthetic surface pair."""
+    baseline = {"A": ["x"], "B": ["p", "q"]}
+    current = {"A": ["x", "y"], "C": ["z"]}
+    added, removed = diff(baseline, current)
+    problems: list[str] = []
+    if added != {"A": ["y"], "C": ["z"]}:
+        problems.append(f"added {added} != {{'A': ['y'], 'C': ['z']}}")
+    if removed != {"B": ["p", "q"]}:
+        problems.append(f"removed {removed} != {{'B': ['p', 'q']}}")
+    if problems:
+        print("surface_lock: self-test FAILED:")
+        for problem in problems:
+            print(f"  {problem}")
+        return 1
+    print("surface_lock: self-test ok (class/member diff)")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
@@ -112,7 +133,15 @@ def main(argv: list[str] | None = None) -> int:
         help="check the existing target/runtime_surface.json without "
         "re-running the dump test",
     )
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="run the class/member diff self-test and exit",
+    )
     args = parser.parse_args(argv)
+
+    if args.self_test:
+        return self_test()
 
     if not args.no_regen:
         regenerate()
@@ -163,12 +192,17 @@ def main(argv: list[str] | None = None) -> int:
         "\n  L3 may be refactored freely, but this dump is the contract the VM\n"
         "  dispatches against (D29). If the change is intended and\n"
         "  reference-backed (D28), run\n"
-        "      python3 scripts/surface_lock.py --update\n"
+        "      uv run --project scripts krkr-gate surface-lock --update\n"
         "  and commit docs/surface/runtime_surface.json in the same change,\n"
         "  with the reasoning in the commit message."
     )
     return 1
 
 
+def run(argv=None):
+    """Run the check. ``argv`` carries the check-specific flags."""
+    return main(argv)
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(run(sys.argv[1:]))

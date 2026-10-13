@@ -1,5 +1,5 @@
 # Error-handling allowlist (AGENTS §4).  Enforced by
-# scripts/check-error-handling.sh.
+# krkr-gate error-handling.
 #
 # One entry per line:  path:line:pattern — reason
 #

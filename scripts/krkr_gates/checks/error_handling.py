@@ -1,115 +1,22 @@
-#!/usr/bin/env bash
-# Error-handling guard (AGENTS §4: errors, fallbacks and "slop").
-#
-# A compiler-free guard for the silent-fallback classes AGENTS §4 bans.  It
-# mirrors scripts/check-stateless.sh: it scans the tree, prints every offending
-# file:line with its pattern and rule, and exits non-zero unless the site has a
-# reviewed entry in scripts/error_handling_allow.txt.
-#
-# Checked rules
-# -------------
-#   parse-unwrap     `.parse(..)` immediately feeding `.unwrap_or*` — the TJS
-#                    string->number coercion bug; the reference parses a
-#                    prefix, Rust `parse` rejects the whole string.
-#   result-fallback  `.unwrap_or` / `.unwrap_or_default` / `.unwrap_or_else`
-#                    whose receiver chain calls a known-fallible operation.
-#   let-underscore   `let _ = <fallible call>;` with no `?` (the error is
-#                    dropped, not propagated).
-#   ok-discard       `.ok()` whose receiver calls a known-fallible operation.
-#   iflet-ok         `if let Ok(..)` over a known-fallible operation.
-#   debug-assert     `debug_assert*!` outside `#[cfg(test)]` — a data-integrity
-#                    condition must be a typed error, not a release no-op.
-#   non-exhaustive   `#[non_exhaustive]` under crates/compat — compat matches
-#                    its enums variant-by-variant, so a new variant must be a
-#                    compile error.
-#   allow-dead-code  `#[allow(dead_code)]` outside the one documented
-#                    exception (crates/compat/tests/common/mod.rs).
-#   pointer-sign     a pointer- or address-derived value cast to a signed
-#                    type, sign-checked (`> 0`, `.max(0)`, `abs()`), or a
-#                    hidden `__handle` property carrying a pointer into
-#                    script state.  The aarch64 heap (`0xb400007a…`) is
-#                    negative as `i64` while x86-64 (`0x55f3eb11…`) is
-#                    positive, so a `> 0` guard on a payload pointer passes
-#                    on the desktop and fails on the phone.  Address-derived
-#                    state must be an opaque id, and a cross-class handle
-#                    must use the ABI native-instance mechanism.
-#   pointer-flow     a local assigned from a pointer-derived expression and
-#                    later compared (`>`, `<`, `>=`, `<=`, `==`, `!=`),
-#                    narrowed, fed to `NonZero*::new`/`try_from`/`try_into`,
-#                    or sign-tested (`> 0`, `.max(0)`, `abs()`).  This is the
-#                    `let h = ptr as i64; if h > 0` defect the `pointer-sign`
-#                    rule misses because the cast and the test are on
-#                    different lines.
-#   pointer-compare  two pointer-derived values compared to each other
-#                    (equality or ordering).  Pointer identity is not a
-#                    stable ordering and a reused address breaks equality.
-#   char-signedness  `c_char` (i8 on x86-64 Linux, u8 on aarch64) used in a
-#                    way that depends on its signedness: cast to i8/u8,
-#                    compared as signed, matched on a negative literal, or
-#                    `as c_char` from a signed integer.  Same shape as the
-#                    escaped defect, one type over.
-#   addr-narrow      a pointer-derived value narrowed to 32 bits
-#                    (`as u32`/`as i32`), losing the top half of the address.
-#   error-swallow    a wildcard `Err(_)`/`Err(..)` match arm (or
-#                    `if let Err(_)`) that turns the failure into a non-error
-#                    value without raising or logging it.  An arm that
-#                    returns `Err(..)`/`report_error`, propagates with `?`,
-#                    maps with `map_err`, panics, or logs is not a swallow; a
-#                    `reference/cpp/**` citation beside the arm justifies it
-#                    inline.
-#
-# A grep cannot decide whether a receiver is a `Result` or an `Option`, so the
-# guard over-reports on the known-fallible method names and every accepted site
-# is justified in the allowlist.  A missed silent fallback is worse than a
-# reviewed exception.
-#
-# Allowlist: scripts/error_handling_allow.txt
-#   one entry per line:  path:line:pattern — reason
-#   `pattern` is either a rule name above (matched together with `path:line`)
-#   or a code anchor, a substring of the offending source line (matched
-#   together with `path` only, so the entry survives line churn).  `#` starts
-#   a comment line.  An entry that no longer matches any finding is reported
-#   as stale.
-#
-# The scan runs in python3 (already used by the repo) because a correct guard
-# must ignore comments, string/char literals and `#[cfg(test)]` items, and must
-# follow a method chain across lines (`.lock()\n.unwrap_or_else(..)`).
-#
-# The `pointer-flow` pass is a one-function-body taint: it still cannot see a
-# pointer laundered through a differently-named integer helper (only names that
-# suggest an address are followed), taint that crosses a struct field or a
-# closure boundary, an address used as a map key with no cast or comparison, or
-# any dataflow across function calls beyond that one heuristic.  Those cases
-# are covered by docs/audits/pointer-handles.md and the D37 review, not here.
-#
-# The `error-swallow` pass is deliberately syntactic and low-recall.  It cannot
-# tell a `Result` from an `Option` (an `Option` match never names `Err`, so it
-# does not fire), it does not follow the discarded value, and a swallow written
-# as `.unwrap_or`/`.ok()` is left to the `result-fallback`/`ok-discard` rules.
-# It only exempts an arm when a `reference/cpp/**` citation sits immediately
-# above it or inside its body, so the reference justification stays next to the
-# mapping it explains.
-#
-# Usage: scripts/check-error-handling.sh [--print-all] [--self-test]
-#   --print-all   list every finding without allowlist filtering (seeding aid)
-#   --self-test   run only the guard's own fixture self-test and exit
+"""Silent-fallback and dropped-error guard (AGENTS §4).
 
-set -uo pipefail
+Scans ``crates/**`` for parse-then-default coercion, fallbacks on known
+fallible calls, discarded results, pointer/address sign checks and narrowing,
+and wildcard ``Err`` arms that swallow a failure. Sites are reported with a
+rule name and file:line; an accepted site needs an entry in
+``scripts/allowlists/error_handling_allow.txt`` (a rule name or a source-line
+anchor).
+"""
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$ROOT" || exit 1
-
-ALLOW="scripts/error_handling_allow.txt"
-
-exec python3 - "$ALLOW" "$@" <<'PY'
 import re
 import sys
-from pathlib import Path
 
-ROOT = Path.cwd()
-ALLOW = Path(sys.argv[1])
-ARGS = set(sys.argv[2:])
-PRINT_ALL = "--print-all" in ARGS
+from ..common import ALLOWLISTS_DIR, FIXTURES_DIR, REPO_ROOT
+
+ROOT = REPO_ROOT
+ALLOW = ALLOWLISTS_DIR / "error_handling_allow.txt"
+ARGS: set[str] = set()
+PRINT_ALL = False
 
 CRATES = ROOT / "crates"
 # The one documented `#[allow(dead_code)]` exception (testing helper).
@@ -1184,9 +1091,9 @@ def entry_matches(entry, rel, line, rule, code):
     return normalize(pattern) in normalize(code)
 
 
-FIXTURES = ROOT / "scripts" / "guard_fixtures"
-BAD_FIXTURE = "scripts/guard_fixtures/bad_pointer.rs"
-GOOD_FIXTURE = "scripts/guard_fixtures/good_pointer.rs"
+FIXTURES = FIXTURES_DIR / "guard"
+BAD_FIXTURE = "scripts/fixtures/guard/bad_pointer.rs"
+GOOD_FIXTURE = "scripts/fixtures/guard/good_pointer.rs"
 POINTER_RULES = {
     "pointer-sign",
     "pointer-flow",
@@ -1205,8 +1112,8 @@ SELF_TEST_BAD_RULES = (
 SELF_TEST_GROUPS = (
     (BAD_FIXTURE, GOOD_FIXTURE, SELF_TEST_BAD_RULES),
     (
-        "scripts/guard_fixtures/bad_error_swallow.rs",
-        "scripts/guard_fixtures/good_error_swallow.rs",
+        "scripts/fixtures/guard/bad_error_swallow.rs",
+        "scripts/fixtures/guard/good_error_swallow.rs",
         ("error-swallow",),
     ),
 )
@@ -1304,18 +1211,25 @@ def main():
             "allowlist entry/entries."
         )
         print("  Either fix the fallback or add a reviewed entry to")
-        print(f"  {ALLOW}")
+        print(f"  {ALLOW.relative_to(ROOT)}")
         print("  Format: path:line:pattern — reason  (pattern is a rule name")
         print("  or a source-line anchor)")
         return 1
 
     print(
         f"error-handling guard: clean ({len(findings)} site(s) checked, "
-        f"{len(allow)} allowlisted) — {ALLOW}"
+        f"{len(allow)} allowlisted) — {ALLOW.relative_to(ROOT)}"
     )
     return 0
 
 
+def run(argv=None):
+    """Run the check. ``argv`` carries the check-specific flags."""
+    global ARGS, PRINT_ALL
+    ARGS = set(argv or [])
+    PRINT_ALL = "--print-all" in ARGS
+    return main()
+
+
 if __name__ == "__main__":
-    sys.exit(main())
-PY
+    sys.exit(run(sys.argv[1:]))

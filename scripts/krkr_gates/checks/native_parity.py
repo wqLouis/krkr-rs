@@ -39,22 +39,22 @@ How it works (short version)
 
 Ratchet
 -------
-``scripts/native_parity_allow.txt`` lists the currently accepted missing
+``scripts/allowlists/native_parity_allow.txt`` lists the currently accepted missing
 members (one ``Class.member`` per line);
-``scripts/native_parity_props_allow.txt`` lists the currently accepted
+``scripts/allowlists/native_parity_props_allow.txt`` lists the currently accepted
 accessor mismatches (one ``Class.property`` per line).  The checker fails when
 a *new* one appears, and reports an allowlisted entry that no longer applies
 as stale so the list can shrink.
 
 Usage
 -----
-    python3 scripts/native_parity.py                 # check + regenerate report
-    python3 scripts/native_parity.py --update-allow  # refresh the member allowlist
-    python3 scripts/native_parity.py --update-props-allow  # refresh the accessor allowlist
-    python3 scripts/native_parity.py --no-doc        # skip docs/native_parity.md
-    python3 scripts/native_parity.py --quiet         # only print failures
-    python3 scripts/native_parity.py --self-test     # extractor fixture self-test
-    python3 scripts/native_parity.py --runtime target/runtime_surface.json \
+    uv run --project scripts krkr-gate native-parity                 # check + regenerate report
+    uv run --project scripts krkr-gate native-parity --update-allow  # refresh the member allowlist
+    uv run --project scripts krkr-gate native-parity --update-props-allow  # refresh the accessor allowlist
+    uv run --project scripts krkr-gate native-parity --no-doc        # skip docs/native_parity.md
+    uv run --project scripts krkr-gate native-parity --quiet         # only print failures
+    uv run --project scripts krkr-gate native-parity --self-test     # extractor fixture self-test
+    uv run --project scripts krkr-gate native-parity --runtime target/runtime_surface.json \
         --no-doc                                     # check the live VM surface
 
 Do not hand-edit ``docs/native_parity.md``: it is generated.
@@ -73,12 +73,13 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+from ..common import ALLOWLISTS_DIR, REPO_ROOT
+
 REFERENCE_GLOB = "reference/cpp/core/**/*.cpp"
-ALLOWLIST_PATH = REPO_ROOT / "scripts" / "native_parity_allow.txt"
-PROPS_ALLOWLIST_PATH = REPO_ROOT / "scripts" / "native_parity_props_allow.txt"
+ALLOWLIST_PATH = ALLOWLISTS_DIR / "native_parity_allow.txt"
+PROPS_ALLOWLIST_PATH = ALLOWLISTS_DIR / "native_parity_props_allow.txt"
 DOC_PATH = REPO_ROOT / "docs" / "native_parity.md"
-FIXTURES_DIR = REPO_ROOT / "scripts" / "parity_fixtures"
+FIXTURES_DIR = REPO_ROOT / "scripts" / "fixtures" / "parity"
 
 # Classes that live in tjs2 itself (provided by the VM, not the TVP port).
 TJS2_BUILTINS = {
@@ -1439,7 +1440,7 @@ def read_allowlist_reasons(path: Path) -> "OrderedDict[str, str]":
     An entry is ``Class.member`` optionally followed by a reason after an
     em dash, a ``#`` comment marker or `` -- ``.  A reason starting with
     ``debt:`` marks a deliberately-baselined known gap (mirrors
-    ``scripts/layering_allow.txt``); a bare entry has an empty reason.
+    ``scripts/allowlists/layering_allow.txt``); a bare entry has an empty reason.
     """
     entries: "OrderedDict[str, str]" = OrderedDict()
     if not path.exists():
@@ -1465,7 +1466,7 @@ MEMBER_ALLOW_HEADER = (
     "# A reason beginning with 'debt:' records a known gap that is accepted\n"
     "# but still visible; see docs/audits/propset-parity.md.\n"
     "# Regenerate after intentional additions with:\n"
-    "#   python3 scripts/native_parity.py --update-allow\n"
+    "#   uv run --project scripts krkr-gate native-parity --update-allow\n"
     "# The checker fails when a missing member is not listed here.\n"
     "\n"
 )
@@ -1477,7 +1478,7 @@ PROPS_ALLOW_HEADER = (
     "# A reason beginning with 'debt:' records a known divergence that is\n"
     "# accepted but still visible.\n"
     "# Regenerate after intentional additions with:\n"
-    "#   python3 scripts/native_parity.py --update-props-allow\n"
+    "#   uv run --project scripts krkr-gate native-parity --update-props-allow\n"
     "# The checker fails when a mismatch is not listed here.\n"
     "\n"
 )
@@ -1525,7 +1526,7 @@ def build_report(
     lines.append("# Native surface parity")
     lines.append("")
     lines.append(
-        "> **Generated** by `scripts/native_parity.py` on "
+        "> **Generated** by `krkr-gate native-parity` on "
         f"{datetime.date.today().isoformat()} — do not edit by hand."
     )
     lines.append("")
@@ -1541,19 +1542,19 @@ def build_report(
     lines.append("## Usage")
     lines.append("")
     lines.append("```sh")
-    lines.append("python3 scripts/native_parity.py                 # check + regenerate this report")
-    lines.append("python3 scripts/native_parity.py --no-doc        # check only")
-    lines.append("python3 scripts/native_parity.py --update-allow  # accept current gaps after review")
+    lines.append("uv run --project scripts krkr-gate native-parity                 # check + regenerate this report")
+    lines.append("uv run --project scripts krkr-gate native-parity --no-doc        # check only")
+    lines.append("uv run --project scripts krkr-gate native-parity --update-allow  # accept current gaps after review")
     lines.append(
-        "python3 scripts/native_parity.py --update-props-allow  "
+        "uv run --project scripts krkr-gate native-parity --update-props-allow  "
         "# accept accessor mismatches"
     )
-    lines.append("python3 scripts/native_parity.py --self-test     # extractor fixture self-test")
+    lines.append("uv run --project scripts krkr-gate native-parity --self-test     # extractor fixture self-test")
     lines.append("```")
     lines.append("")
     lines.append(
         "The checker exits non-zero when a missing member is **not** listed in "
-        "`scripts/native_parity_allow.txt` (a regression). When an allowlisted "
+        "`scripts/allowlists/native_parity_allow.txt` (a regression). When an allowlisted "
         "member is implemented it prints a stale-entry warning so the allowlist "
         "can shrink. Coverage can therefore only move in one direction."
     )
@@ -1752,7 +1753,7 @@ def build_report(
     )
     lines.append(
         "- A member installed by a plugin at load time rather than in the core "
-        "is outside this report; `scripts/plugin_parity.py` covers the plugin "
+        "is outside this report; `krkr-gate plugin-parity` covers the plugin "
         "surface."
     )
     lines.append("")
@@ -1764,7 +1765,7 @@ def build_report(
         "expose the same accessors in Rust: a reference-readable property "
         "needs a Rust `get`, and a reference-writable one a Rust `set`. The "
         "reverse (a Rust accessor the reference denies) is listed as *extra* "
-        "and fails identically. `scripts/native_parity_props_allow.txt` "
+        "and fails identically. `scripts/allowlists/native_parity_props_allow.txt` "
         "records accepted exceptions."
     )
     lines.append("")
@@ -1850,7 +1851,7 @@ def _accessor_self_test() -> list[str]:
 def self_test(verbose: bool = True) -> int:
     """Assert the reference extractor still sees each registration mechanism.
 
-    ``scripts/parity_fixtures/native_core.cpp`` exercises every core mechanism
+    ``scripts/fixtures/parity/native_core.cpp`` exercises every core mechanism
     the extractor claims, plus a runtime-built name that must be reported as
     unrecoverable.  A regex that silently stops matching fails here rather than
     quietly shrinking the covered surface.
@@ -1948,13 +1949,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--update-allow",
         action="store_true",
-        help="rewrite scripts/native_parity_allow.txt with the current missing set",
+        help="rewrite scripts/allowlists/native_parity_allow.txt with the current missing set",
     )
     parser.add_argument(
         "--update-props-allow",
         action="store_true",
         help=(
-            "rewrite scripts/native_parity_props_allow.txt with the current "
+            "rewrite scripts/allowlists/native_parity_props_allow.txt with the current "
             "getter/setter mismatches"
         ),
     )
@@ -1967,7 +1968,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--self-test",
         action="store_true",
-        help="run the extractor self-test against scripts/parity_fixtures and exit",
+        help="run the extractor self-test against scripts/fixtures/parity and exit",
     )
     parser.add_argument(
         "--runtime",
@@ -2110,7 +2111,7 @@ def main(argv: list[str] | None = None) -> int:
     if stale:
         print(
             f"native_parity: {len(stale)} allowlisted member(s) are now "
-            "implemented — shrink scripts/native_parity_allow.txt:"
+            "implemented — shrink scripts/allowlists/native_parity_allow.txt:"
         )
         for entry in stale:
             print(f"  - {entry}")
@@ -2119,7 +2120,7 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"native_parity: {len(stale_props)} allowlisted getter/setter "
             "mismatch(es) are now resolved — shrink "
-            "scripts/native_parity_props_allow.txt:"
+            "scripts/allowlists/native_parity_props_allow.txt:"
         )
         for entry in stale_props:
             print(f"  - {entry}")
@@ -2172,5 +2173,10 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+def run(argv=None):
+    """Run the check. ``argv`` carries the check-specific flags."""
+    return main(argv)
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(run(sys.argv[1:]))

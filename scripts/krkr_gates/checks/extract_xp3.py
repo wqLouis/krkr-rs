@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Extract a file from an XP3 archive (game reference data) to stdout.
 
-Usage: extract_xp3.py <archive.xp3> <normalized-name> [--lines A:B]
+Usage: krkr-gate extract-xp3 <archive.xp3> <normalized-name> [--lines A:B]
 
 Names are normalized (lowercase, '/' separators) like the engine does.
 With --lines A:B prints only those 1-based lines of a text file (auto-decodes
@@ -76,8 +76,7 @@ def decode(raw):
         return raw.decode("cp932", errors="replace")
 
 
-def main():
-    args = sys.argv[1:]
+def main(args):
     if len(args) < 2:
         print(__doc__, file=sys.stderr)
         return 2
@@ -102,5 +101,10 @@ def main():
     return 0
 
 
+def run(argv=None):
+    """Run the extractor. ``argv`` is ``<archive> <name> [--lines A:B]``."""
+    return main(list(argv or []))
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(run(sys.argv[1:]))

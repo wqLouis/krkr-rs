@@ -1,5 +1,5 @@
 # Layering/unsafe allowlist (AGENTS §2/§5).  Enforced by
-# scripts/check-layering.sh.
+# krkr-gate layering.
 #
 # One entry per line:  path:line:pattern — reason
 #

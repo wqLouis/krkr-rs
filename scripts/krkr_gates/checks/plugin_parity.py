@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Plugin-surface parity checker for krkr-rs.
 
-This is the plugin analogue of ``scripts/native_parity.py``.  It machine-diffs
+This is the plugin analogue of ``krkr-gate native-parity``.  It machine-diffs
 the script-visible surface of the reference KiriKiri plugins
 (``reference/cpp/plugins/**``) against the Rust plugin ports
 (``crates/compat/src/natives/plugins/**``) and reports per-class coverage.
@@ -24,7 +24,7 @@ How it works (short version)
   regions disabled in a normal build (``#if 0``) are ignored, as are
   ``#define`` bodies (so the macros themselves are not mistaken for uses).
 * Rust surface: every ``.rs`` file under ``crates/compat/src/natives/plugins``
-  is parsed with ``scripts/native_parity.py`` helpers.  A class is declared by
+  is parsed with ``krkr-gate native-parity`` helpers.  A class is declared by
   ``ctx.register_instance(&NativeInstanceBuilder { name: "X", .. })`` and
   attached members by ``ctx.register_static_members(&NativeStaticMembers {
   class_name: "X", .. })`` / ``ctx.register_instance_members(&
@@ -59,7 +59,7 @@ checker models that relation:
 
 Ratchet
 -------
-``scripts/plugin_parity_allow.txt`` lists the currently accepted missing
+``scripts/allowlists/plugin_parity_allow.txt`` lists the currently accepted missing
 surface: members (``Class.member``), nested classes (``GdiPlus.Image``) and
 namespace objects (``GdiPlus``).  The checker fails when a *new* missing entry
 appears.  When an allowlisted entry becomes implemented it is reported as
@@ -67,12 +67,12 @@ stale so the list can shrink.
 
 Usage
 -----
-    python3 scripts/plugin_parity.py                 # check + regenerate report
-    python3 scripts/plugin_parity.py --update-allow  # refresh the allowlist
-    python3 scripts/plugin_parity.py --no-doc        # skip docs/plugin_parity.md
-    python3 scripts/plugin_parity.py --quiet         # only print failures
-    python3 scripts/plugin_parity.py --self-test     # extractor fixture self-test
-    python3 scripts/plugin_parity.py --runtime target/runtime_surface.json \
+    uv run --project scripts krkr-gate plugin-parity                 # check + regenerate report
+    uv run --project scripts krkr-gate plugin-parity --update-allow  # refresh the allowlist
+    uv run --project scripts krkr-gate plugin-parity --no-doc        # skip docs/plugin_parity.md
+    uv run --project scripts krkr-gate plugin-parity --quiet         # only print failures
+    uv run --project scripts krkr-gate plugin-parity --self-test     # extractor fixture self-test
+    uv run --project scripts krkr-gate plugin-parity --runtime target/runtime_surface.json \
         --no-doc                                     # check the live VM surface
 
 Do not hand-edit ``docs/plugin_parity.md``: it is generated.
@@ -90,11 +90,9 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-REPO_ROOT = SCRIPT_DIR.parent
-sys.path.insert(0, str(SCRIPT_DIR))
+from ..common import ALLOWLISTS_DIR, REPO_ROOT
 
-import native_parity as np  # noqa: E402  (shares the Rust lexer/helpers)
+from . import native_parity as np
 
 REFERENCE_DIR = REPO_ROOT / "reference" / "cpp" / "plugins"
 RUST_PLUGINS_DIR = REPO_ROOT / "crates" / "compat" / "src" / "natives" / "plugins"
@@ -102,9 +100,9 @@ RUST_PLUGINS_DIR = REPO_ROOT / "crates" / "compat" / "src" / "natives" / "plugin
 # plugin tree; reference plugins attach members to them, so the whole natives
 # tree is globbed, not just ``natives/plugins/**``.
 RUST_NATIVES_DIR = REPO_ROOT / "crates" / "compat" / "src" / "natives"
-ALLOWLIST_PATH = SCRIPT_DIR / "plugin_parity_allow.txt"
+ALLOWLIST_PATH = ALLOWLISTS_DIR / "plugin_parity_allow.txt"
 DOC_PATH = REPO_ROOT / "docs" / "plugin_parity.md"
-FIXTURES_DIR = REPO_ROOT / "scripts" / "parity_fixtures"
+FIXTURES_DIR = REPO_ROOT / "scripts" / "fixtures" / "parity"
 
 REFERENCE_GLOBS = ("**/*.cpp", "**/*.hpp", "**/*.h")
 
@@ -1555,7 +1553,7 @@ def read_allowlist_reasons(path: Path) -> "OrderedDict[str, str]":
     An entry is ``Class.member`` (optionally ``Namespace.Name`` or a namespace
     object) followed by a reason after an em dash, ``#`` or `` -- ``.  A
     reason starting with ``debt:`` marks a deliberately-baselined known gap
-    (mirrors ``scripts/layering_allow.txt``); a bare entry has an empty reason.
+    (mirrors ``scripts/allowlists/layering_allow.txt``); a bare entry has an empty reason.
     """
     entries: "OrderedDict[str, str]" = OrderedDict()
     if not path.exists():
@@ -1584,7 +1582,7 @@ def write_allowlist(
         "# A reason beginning with 'debt:' records a known gap that is accepted\n"
         "# but still visible; see docs/audits/propset-parity.md.\n"
         "# Regenerate after intentional additions with:\n"
-        "#   python3 scripts/plugin_parity.py --update-allow\n"
+        "#   uv run --project scripts krkr-gate plugin-parity --update-allow\n"
         "# The checker fails when a missing entry is not listed here.\n"
         "\n"
     )
@@ -1627,7 +1625,7 @@ def build_report(
     lines.append("# Plugin surface parity")
     lines.append("")
     lines.append(
-        "> **Generated** by `scripts/plugin_parity.py` on "
+        "> **Generated** by `krkr-gate plugin-parity` on "
         f"{datetime.date.today().isoformat()} — do not edit by hand."
     )
     lines.append("")
@@ -1645,15 +1643,15 @@ def build_report(
     lines.append("## Usage")
     lines.append("")
     lines.append("```sh")
-    lines.append("python3 scripts/plugin_parity.py                 # check + regenerate this report")
-    lines.append("python3 scripts/plugin_parity.py --no-doc        # check only")
-    lines.append("python3 scripts/plugin_parity.py --update-allow  # accept current gaps after review")
-    lines.append("python3 scripts/plugin_parity.py --self-test     # extractor fixture self-test")
+    lines.append("uv run --project scripts krkr-gate plugin-parity                 # check + regenerate this report")
+    lines.append("uv run --project scripts krkr-gate plugin-parity --no-doc        # check only")
+    lines.append("uv run --project scripts krkr-gate plugin-parity --update-allow  # accept current gaps after review")
+    lines.append("uv run --project scripts krkr-gate plugin-parity --self-test     # extractor fixture self-test")
     lines.append("```")
     lines.append("")
     lines.append(
         "The checker exits non-zero when a missing member is **not** listed in "
-        "`scripts/plugin_parity_allow.txt` (a regression). When an allowlisted "
+        "`scripts/allowlists/plugin_parity_allow.txt` (a regression). When an allowlisted "
         "member is implemented it prints a stale-entry warning so the allowlist "
         "can shrink. Coverage can therefore only move in one direction."
     )
@@ -2009,7 +2007,7 @@ def _port_only_class_failures(
 def self_test(verbose: bool = True) -> int:
     """Assert the reference extractor still sees each registration mechanism.
 
-    ``scripts/parity_fixtures/plugin_surface.cpp`` exercises the ncbind macro
+    ``scripts/fixtures/parity/plugin_surface.cpp`` exercises the ncbind macro
     blocks, class/namespace/global ``PropSet`` registrations and a script
     global, plus a runtime-built name that must be reported as unrecoverable.
     """
@@ -2160,7 +2158,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--update-allow",
         action="store_true",
-        help="rewrite scripts/plugin_parity_allow.txt with the current missing set",
+        help="rewrite scripts/allowlists/plugin_parity_allow.txt with the current missing set",
     )
     parser.add_argument(
         "--no-doc", action="store_true", help="do not regenerate docs/plugin_parity.md"
@@ -2171,7 +2169,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--self-test",
         action="store_true",
-        help="run the extractor self-test against scripts/parity_fixtures and exit",
+        help="run the extractor self-test against scripts/fixtures/parity and exit",
     )
     parser.add_argument(
         "--runtime",
@@ -2376,7 +2374,7 @@ def main(argv: list[str] | None = None) -> int:
     if stale:
         print(
             f"plugin_parity: {len(stale)} allowlisted member(s) are now "
-            "implemented — shrink scripts/plugin_parity_allow.txt:"
+            "implemented — shrink scripts/allowlists/plugin_parity_allow.txt:"
         )
         for entry in stale:
             print(f"  - {entry}")
@@ -2417,5 +2415,10 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+def run(argv=None):
+    """Run the check. ``argv`` carries the check-specific flags."""
+    return main(argv)
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(run(sys.argv[1:]))

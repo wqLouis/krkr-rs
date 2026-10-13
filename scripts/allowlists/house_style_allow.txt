@@ -1,5 +1,5 @@
 # House-style allowlist (AGENTS §5/§6).  Enforced by
-# scripts/check-house-style.sh.
+# krkr-gate house-style.
 #
 # One entry per line:  path:line:pattern — reason
 #

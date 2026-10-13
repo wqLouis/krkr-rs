@@ -1,20 +1,20 @@
 # Native surface parity
 
-> **Generated** by `scripts/native_parity.py` on 2026-10-13 — do not edit by hand.
+> **Generated** by `krkr-gate native-parity` on 2026-10-13 — do not edit by hand.
 
 Machine-diff of the reference C++ native class surface (`reference/cpp/core/**/*.cpp`) against the native classes the Rust engine registers. A *missing* member exists in the reference but is not registered by Rust; an *extra* member is registered by Rust but has no reference counterpart (engine-internal helpers such as `id` and `nativeId` are expected here).
 
 ## Usage
 
 ```sh
-python3 scripts/native_parity.py                 # check + regenerate this report
-python3 scripts/native_parity.py --no-doc        # check only
-python3 scripts/native_parity.py --update-allow  # accept current gaps after review
-python3 scripts/native_parity.py --update-props-allow  # accept accessor mismatches
-python3 scripts/native_parity.py --self-test     # extractor fixture self-test
+uv run --project scripts krkr-gate native-parity                 # check + regenerate this report
+uv run --project scripts krkr-gate native-parity --no-doc        # check only
+uv run --project scripts krkr-gate native-parity --update-allow  # accept current gaps after review
+uv run --project scripts krkr-gate native-parity --update-props-allow  # accept accessor mismatches
+uv run --project scripts krkr-gate native-parity --self-test     # extractor fixture self-test
 ```
 
-The checker exits non-zero when a missing member is **not** listed in `scripts/native_parity_allow.txt` (a regression). When an allowlisted member is implemented it prints a stale-entry warning so the allowlist can shrink. Coverage can therefore only move in one direction.
+The checker exits non-zero when a missing member is **not** listed in `scripts/allowlists/native_parity_allow.txt` (a regression). When an allowlisted member is implemented it prints a stale-entry warning so the allowlist can shrink. Coverage can therefore only move in one direction.
 
 ## Coverage summary
 
@@ -119,11 +119,11 @@ These builders have no native C++ counterpart in `reference/cpp/core` (TJS-level
 - A `PropSet` name that is not a string literal is not counted (see the runtime-built-name section): a name built at runtime cannot be recovered from source, and a coverage figure that silently dropped it would read as evidence it does not exist.
 - A `PropSet` on an *instance* object (`this`, a dictionary, a method parameter) is not a class member and is deliberately not counted; only class-object receivers are members of the class surface.
 - `global->PropSet(...)` registers a global (a class object or a free function such as `getDirList`), not a class member; the plugin reader covers that surface, this report does not.
-- A member installed by a plugin at load time rather than in the core is outside this report; `scripts/plugin_parity.py` covers the plugin surface.
+- A member installed by a plugin at load time rather than in the core is outside this report; `krkr-gate plugin-parity` covers the plugin surface.
 
 ## Property getter/setter parity
 
-A reference property declared with `TJS_BEGIN_NATIVE_PROP_DECL` must expose the same accessors in Rust: a reference-readable property needs a Rust `get`, and a reference-writable one a Rust `set`. The reverse (a Rust accessor the reference denies) is listed as *extra* and fails identically. `scripts/native_parity_props_allow.txt` records accepted exceptions.
+A reference property declared with `TJS_BEGIN_NATIVE_PROP_DECL` must expose the same accessors in Rust: a reference-readable property needs a Rust `get`, and a reference-writable one a Rust `set`. The reverse (a Rust accessor the reference denies) is listed as *extra* and fails identically. `scripts/allowlists/native_parity_props_allow.txt` records accepted exceptions.
 
 - missing accessors: 0
 - extra accessors: 0

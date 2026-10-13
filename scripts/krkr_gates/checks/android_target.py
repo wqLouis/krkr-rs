@@ -19,7 +19,7 @@ manifests are correct; its ``packages`` list also names optional dependencies
 including per-target features, which is what this guard must check.
 
 Usage:
-    python3 scripts/check-android-target.py [--quiet]
+    uv run --project scripts krkr-gate android-target [--quiet]
 
 Exit status is non-zero on any leak.
 """
@@ -32,7 +32,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+from ..common import REPO_ROOT
 ANDROID_TRIPLE = "aarch64-linux-android"
 
 # Roots whose resolved graph is checked against the Android target: the Android
@@ -57,7 +57,7 @@ HOST_PRESENT = (("platform", "platform-linux"), ("media", "video-ffmpeg"))
 HOST_ABSENT = (("platform", "platform-android"), ("media", "video-mediacodec"))
 
 
-def run(cmd: list[str]) -> str:
+def _cargo(cmd: list[str]) -> str:
     """Run a cargo subcommand in the repo, failing loudly on any error."""
     result = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True)
     if result.returncode != 0:
@@ -82,6 +82,22 @@ def host_triple() -> str:
     raise SystemExit(2)
 
 
+def _parse_tree_output(out: str) -> dict[str, set[str]]:
+    """Union the ``pkg|features`` lines printed by ``cargo tree``."""
+    features: dict[str, set[str]] = {}
+    for line in out.splitlines():
+        spec, sep, raw = line.partition("|")
+        if not sep:
+            continue
+        name = spec.split()[0]
+        if not name:
+            continue
+        raw = raw.removesuffix("(*)").strip()
+        enabled = {f for f in raw.split(",") if f}
+        features.setdefault(name, set()).update(enabled)
+    return features
+
+
 def resolved_features(root: str, triple: str) -> dict[str, set[str]]:
     """Return ``{package: {features}}`` for ``root``'s graph on ``triple``.
 
@@ -94,7 +110,7 @@ def resolved_features(root: str, triple: str) -> dict[str, set[str]]:
     root never compiles. Dropping dev edges entirely would hide a
     dev-dependency that pulls the wrong codec default.
     """
-    out = run(
+    out = _cargo(
         [
             "cargo",
             "tree",
@@ -110,18 +126,7 @@ def resolved_features(root: str, triple: str) -> dict[str, set[str]]:
             "{p}|{f}",
         ]
     )
-    features: dict[str, set[str]] = {}
-    for line in out.splitlines():
-        spec, sep, raw = line.partition("|")
-        if not sep:
-            continue
-        name = spec.split()[0]
-        if not name:
-            continue
-        raw = raw.removesuffix("(*)").strip()
-        enabled = {f for f in raw.split(",") if f}
-        features.setdefault(name, set()).update(enabled)
-    return features
+    return _parse_tree_output(out)
 
 
 def check(
@@ -161,12 +166,40 @@ def check(
     return failures
 
 
+def self_test() -> int:
+    """Check the ``cargo tree`` line parser on a synthetic graph."""
+    sample = (
+        "platform v0.1.0 (path+file:///x)|default,platform-android\n"
+        "media v0.1.0 (path+file:///y)|default,video-mediacodec,video-mediacodec\n"
+        "ignored line without a separator\n"
+    )
+    got = _parse_tree_output(sample)
+    want = {
+        "platform": {"default", "platform-android"},
+        "media": {"default", "video-mediacodec"},
+    }
+    if got != want:
+        print("check-android-target: self-test FAILED:")
+        print(f"  parsed {got} != {want}")
+        return 1
+    print("check-android-target: self-test ok (cargo tree parser)")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
         "--quiet", action="store_true", help="only print failures"
     )
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="run the cargo-tree parser self-test and exit",
+    )
     args = parser.parse_args(argv)
+
+    if args.self_test:
+        return self_test()
 
     host = host_triple()
     failures: list[str] = []
@@ -193,5 +226,10 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+def run(argv=None):
+    """Run the check. ``argv`` carries the check-specific flags."""
+    return main(argv)
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(run(sys.argv[1:]))

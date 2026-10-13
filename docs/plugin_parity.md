@@ -1,19 +1,19 @@
 # Plugin surface parity
 
-> **Generated** by `scripts/plugin_parity.py` on 2026-10-13 — do not edit by hand.
+> **Generated** by `krkr-gate plugin-parity` on 2026-10-13 — do not edit by hand.
 
 Machine-diff of the reference KiriKiri plugin surface (`reference/cpp/plugins/**`) against the plugin classes the Rust engine registers (`crates/compat/src/natives/plugins/**`). A *missing* member exists in the reference but is not registered by Rust. An *extra* is a genuine plugin-surface addition: a member registered by a plugin file that the reference class does not have. Core natives (`natives/*.rs`) and members inherited from a shared registration table are counted separately.
 
 ## Usage
 
 ```sh
-python3 scripts/plugin_parity.py                 # check + regenerate this report
-python3 scripts/plugin_parity.py --no-doc        # check only
-python3 scripts/plugin_parity.py --update-allow  # accept current gaps after review
-python3 scripts/plugin_parity.py --self-test     # extractor fixture self-test
+uv run --project scripts krkr-gate plugin-parity                 # check + regenerate this report
+uv run --project scripts krkr-gate plugin-parity --no-doc        # check only
+uv run --project scripts krkr-gate plugin-parity --update-allow  # accept current gaps after review
+uv run --project scripts krkr-gate plugin-parity --self-test     # extractor fixture self-test
 ```
 
-The checker exits non-zero when a missing member is **not** listed in `scripts/plugin_parity_allow.txt` (a regression). When an allowlisted member is implemented it prints a stale-entry warning so the allowlist can shrink. Coverage can therefore only move in one direction.
+The checker exits non-zero when a missing member is **not** listed in `scripts/allowlists/plugin_parity_allow.txt` (a regression). When an allowlisted member is implemented it prints a stale-entry warning so the allowlist can shrink. Coverage can therefore only move in one direction.
 
 ## Coverage summary
 

@@ -1,0 +1,12 @@
+{
+  "seams": [
+    "set_unwired",
+    "set_unwired_cfg_test",
+    "set_wired_app",
+    "with_registry"
+  ],
+  "unwired": [
+    "set_unwired",
+    "set_unwired_cfg_test"
+  ]
+}

@@ -1,80 +1,26 @@
-#!/usr/bin/env bash
-# House-style guard (AGENTS §5 idiomatic Rust, §6 comments/naming).
-#
-# A compiler-free guard for the house rules that no existing tool checks:
-# `cargo fmt` and `clippy -D warnings` do not see bean accessors, the
-# `&String`/`&Vec<T>` parameter shape, a decision number quoted in a comment,
-# or a flat glob re-export.  It mirrors scripts/check-error-handling.sh: it
-# scans the tree, prints every offending file:line with its rule, and exits
-# non-zero unless the site has a reviewed entry in scripts/house_style_allow.txt.
-#
-# Checked rules
-# -------------
-#   bean-accessor        a `get_*`/`set_*`/`is_*` method whose body only moves a
-#                        field: `self.field = arg;`, `self.field`,
-#                        `&self.field`, `&mut self.field`, or `Ok(self.field)`.
-#                        AGENTS §5: such a setter must be a public field and
-#                        its getter deleted.  Only `get_`/`set_`/`is_` prefixed
-#                        methods are considered; a body that does real work is
-#                        not flagged.
-#   ref-collection-param an immutable `&String`, `&Vec<T>`, `&Box<T>` or
-#                        `&PathBuf` in a function parameter list.  AGENTS §5:
-#                        use `&str`, `&[T]`, `&T`, `&Path`.  `&mut Vec<T>` /
-#                        `&mut String` are not flagged: a growable mutable
-#                        buffer cannot always be a `&mut [T]` / `&mut str`.
-#   decision-number      a decision number (D1–D37) in a code or doc comment.
-#                        AGENTS §6 / D31 ban them; history is read with git.
-#                        Test files and `#[cfg(test)]` items are exempt.
-#   glob-reexport        `pub use crate::…::*;` or `pub use <crate>::…::*;`.
-#                        AGENTS §5: a flat glob re-export of the whole crate is
-#                        not the default; freeze only the intended contract.
-#                        `self::` / `super::` module globs and non-`pub` globs
-#                        are not flagged.
-#   jargon-in-log        `L1`–`L4` or a decision number inside a string literal
-#                        passed to a `log::*!` / `println!` / `print!` family
-#                        macro.  AGENTS §6 bans internal jargon in printed or
-#                        logged text.
-#
-# A syntax-level scan cannot decide whether an accessor "does real work",
-# whether a re-export is deliberate, or whether a private-field getter is the
-# intended read API, so the guard over-reports on those shapes and every
-# accepted site is justified in the allowlist.  A missed house-style regression
-# is worse than a reviewed exception.
-#
-# Allowlist: scripts/house_style_allow.txt
-#   one entry per line:  path:line:pattern — reason
-#   `pattern` is either a rule name above (matched together with `path:line`)
-#   or a code anchor, a substring of the offending source line (matched
-#   together with `path` only, so the entry survives line churn).  `#` starts
-#   a comment line.  An entry that no longer matches any finding is reported
-#   as stale.
-#
-# Usage: scripts/check-house-style.sh [--print-all] [--self-test]
-#   --print-all   list every finding without allowlist filtering (seeding aid)
-#   --self-test   run only the guard's own fixture self-test and exit
+"""House-style guard (AGENTS §5/§6).
 
-set -uo pipefail
+Scans ``crates/**`` for bean accessors that only move a field, ``&String`` /
+``&Vec<T>`` / ``&Box<T>`` / ``&PathBuf`` parameters, decision numbers in
+comments, flat glob re-exports, and internal jargon in log/print literals.
+Accepted sites are listed in ``scripts/allowlists/house_style_allow.txt``.
+"""
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$ROOT" || exit 1
-
-ALLOW="scripts/house_style_allow.txt"
-
-exec python3 - "$ALLOW" "$@" <<'PY'
 import bisect
 import re
 import sys
-from pathlib import Path
 
-ROOT = Path.cwd()
-ALLOW = Path(sys.argv[1])
-ARGS = set(sys.argv[2:])
-PRINT_ALL = "--print-all" in ARGS
+from ..common import ALLOWLISTS_DIR, FIXTURES_DIR, REPO_ROOT
+
+ROOT = REPO_ROOT
+ALLOW = ALLOWLISTS_DIR / "house_style_allow.txt"
+ARGS: set[str] = set()
+PRINT_ALL = False
 
 CRATES = ROOT / "crates"
-FIXTURES = ROOT / "scripts" / "house_style_fixtures"
-BAD_FIXTURE = "scripts/house_style_fixtures/bad_style.rs"
-GOOD_FIXTURE = "scripts/house_style_fixtures/good_style.rs"
+FIXTURES = FIXTURES_DIR / "house_style"
+BAD_FIXTURE = "scripts/fixtures/house_style/bad_style.rs"
+GOOD_FIXTURE = "scripts/fixtures/house_style/good_style.rs"
 
 
 def scan_spans(src):
@@ -595,18 +541,25 @@ def main():
             "allowlist entry/entries."
         )
         print("  Either fix the site or add a reviewed entry to")
-        print(f"  {ALLOW}")
+        print(f"  {ALLOW.relative_to(ROOT)}")
         print("  Format: path:line:pattern — reason  (pattern is a rule name")
         print("  or a source-line anchor)")
         return 1
 
     print(
         f"house-style guard: clean ({len(findings)} site(s) checked, "
-        f"{len(allow)} allowlisted) — {ALLOW}"
+        f"{len(allow)} allowlisted) — {ALLOW.relative_to(ROOT)}"
     )
     return 0
 
 
+def run(argv=None):
+    """Run the check. ``argv`` carries the check-specific flags."""
+    global ARGS, PRINT_ALL
+    ARGS = set(argv or [])
+    PRINT_ALL = "--print-all" in ARGS
+    return main()
+
+
 if __name__ == "__main__":
-    sys.exit(main())
-PY
+    sys.exit(run(sys.argv[1:]))

@@ -1,0 +1,4 @@
+# uv-managed environment and caches for the gate project.
+.venv/
+__pycache__/
+*.pyc

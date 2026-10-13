@@ -14,7 +14,7 @@ re-opened. History is read with `git log`.
 ## 0. Conventions
 
 * **Subagents must not run `cargo`** (`build`/`check`/`clippy`/`test`/`run`) — parallel builds once exhausted a 16 GB tmpfs and broke the tree. They may use `rustfmt`/`cargo fmt`, run prebuilt artifacts (`target/debug/krkr`, `target/debug/deps/*`), and run the Python scripts. The main agent runs the gate.
-* **Only the main agent runs `scripts/surface_lock.py --update`.**
+* **Only the main agent runs `uv run --project scripts krkr-gate surface-lock --update`.**
 * **Comments** (D31): describe the code as it is — no history, no "used to", no rationale, no decision numbers. Keep `// SAFETY:`, invariants, and reference citations **in tests**.
 * **Tests** carry a `reference/cpp/...:line` citation above every behaviour assertion. An assertion without one is not evidence.
 * **Printed/logged text must not use internal jargon** (`L1`–`L4`, decision numbers). Tests are exempt.
@@ -22,25 +22,28 @@ re-opened. History is read with `git log`.
 * **Evidence** (D36): a compatibility claim names what was asserted and where — host test, device run, or both — and a knowingly-left divergence is recorded as an approximation, not an "unobservable". An engine release needs at least one real KiriKiri title run on a real device with its log captured (`<filesDir>/krkr.log`; §11 and `docs/android.md` §7).
 * **Traps that cost real time live in `AGENTS.md` §9** and are deliberately not duplicated here.
 
-## 1. The gate (run in this order)
+## 1. The gate (one command)
 
 ```bash
-cargo fmt --all -- --check
-bash scripts/check-stateless.sh                                   # D9 guard
-bash scripts/check-error-handling.sh                              # AGENTS §4 guard
-bash scripts/check-house-style.sh                                 # AGENTS §5/§6 guard
-bash scripts/check-layering.sh                                    # AGENTS §2/§5 guard
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --no-fail-fast                             # all crates; never fail-fast
-cargo test -p platform --features platform-linux
-cargo clippy -p platform --features platform-android --all-targets -- -D warnings
-cargo test -p platform --features platform-android
-python3 scripts/check-android-target.py
-python3 scripts/surface_lock.py --update                          # main agent only; review the diff
-python3 scripts/surface_lock.py
-python3 scripts/native_parity.py
-python3 scripts/plugin_parity.py --no-doc
+uv run --project scripts krkr-gate gate
 ```
+
+`krkr-gate gate` runs the sequence in order: `cargo fmt --all -- --check`; the
+`stateless`, `error-handling`, `house-style`, `layering` checks;
+`cargo clippy --workspace --all-targets -- -D warnings`;
+`cargo test --workspace --no-fail-fast`;
+`cargo test -p platform --features platform-linux`;
+`cargo clippy -p platform --features platform-android --all-targets -- -D warnings`;
+`cargo test -p platform --features platform-android`; `android-target`;
+`surface-lock --update`; `surface-lock`; `native-parity`;
+`plugin-parity --no-doc`; `host-facts`.
+
+The compiler-free checks also run individually with no build (`android-target`
+shells out to `cargo tree` only): `uv run --project scripts krkr-gate <check>`
+for `<check>` in `stateless`, `error-handling`, `house-style`, `layering`,
+`host-facts`, `android-target`, `native-parity`, `plugin-parity`, or
+`surface-lock --no-regen`; `gate --no-cargo` runs the compiler-free subset in
+the same order.
 
 The `platform-android` steps build the **feature on the host**, not the Android
 target: there is no NDK on the development host and none may be installed.

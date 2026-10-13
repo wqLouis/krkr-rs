@@ -1,0 +1,10 @@
+# Host-fact seam allowlist: provider-installation seams on CompatHost
+# that are deliberately not installed by the composition root.
+# One entry per line: CompatHost::<seam> -- reason
+# A seam wired by another production crate is allowed only when that
+# crate is genuinely the installer; state which in the reason.
+# Regenerate after review with:
+#   uv run --project scripts krkr-gate host-facts --update-allow
+# The checker fails when an unwired seam is not listed here.
+
+CompatHost::set_video_source -- the composition root installs the streaming VideoSource through the crate-root set_video_source(ctx, source); this pre-decoded-frame variant is exercised only by the compat integration tests

@@ -19,29 +19,40 @@ and corrupted the tree before. Subagents *may* run `cargo fmt` / `rustfmt`
 (formatting is not a build) and may run already-built binaries under
 `target/debug/`.
 
-The gate runs in this order and must end green:
+The gate runs in one command (main-agent only; it includes the cargo
+fmt/clippy/test steps) and must end green:
 
 ```bash
-cargo fmt --all -- --check
-bash scripts/check-stateless.sh                  # D9 guard
-bash scripts/check-error-handling.sh             # AGENTS §4 guard
-bash scripts/check-house-style.sh                # AGENTS §5/§6 guard
-bash scripts/check-layering.sh                   # AGENTS §2/§5 guard
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --no-fail-fast            # all crates; never fail-fast, so one
-                                                 # failing target cannot hide the rest
-cargo test -p platform --features platform-linux
-cargo clippy -p platform --features platform-android --all-targets -- -D warnings
-cargo test -p platform --features platform-android
-python3 scripts/check-android-target.py              # per-target feature resolution
-python3 scripts/surface_lock.py --update         # only the main agent; review the diff
-python3 scripts/surface_lock.py
-python3 scripts/native_parity.py
-python3 scripts/plugin_parity.py --no-doc
+uv run --project scripts krkr-gate gate
 ```
 
-`scripts/surface_lock.py --update` is for the **main agent only**, after the
-change is understood.
+`krkr-gate gate` runs, in order: `cargo fmt --all -- --check`; the
+`stateless`, `error-handling`, `house-style`, `layering` checks;
+`cargo clippy --workspace --all-targets -- -D warnings`;
+`cargo test --workspace --no-fail-fast`;
+`cargo test -p platform --features platform-linux`;
+`cargo clippy -p platform --features platform-android --all-targets -- -D warnings`;
+`cargo test -p platform --features platform-android`; `android-target`;
+`surface-lock --update`; `surface-lock`; `native-parity`;
+`plugin-parity --no-doc`; `host-facts`.
+
+The compiler-free checks run individually with no build (subagents may use
+these; `android-target` shells out to `cargo tree` only):
+
+```bash
+uv run --project scripts krkr-gate stateless
+uv run --project scripts krkr-gate error-handling
+uv run --project scripts krkr-gate house-style
+uv run --project scripts krkr-gate layering
+uv run --project scripts krkr-gate host-facts
+uv run --project scripts krkr-gate android-target
+uv run --project scripts krkr-gate surface-lock --no-regen
+uv run --project scripts krkr-gate native-parity
+uv run --project scripts krkr-gate plugin-parity --no-doc
+```
+
+`uv run --project scripts krkr-gate surface-lock --update` is for the **main
+agent only**, after the change is understood.
 
 ### Releases are metered — push a tag only on the user's go-ahead
 
@@ -59,7 +70,8 @@ host and none may be installed (see §9 of `TODO.md`); it is compiled and run on
 machine that has one, and Android-only code that has not been compiled is
 documented as unverified rather than described as working.
 
-`scripts/check-android-target.py` resolves the dependency graph per target
+`uv run --project scripts krkr-gate android-target` resolves the dependency
+graph per target
 without compiling anything and fails when a desktop-only backend feature leaks
 into the Android target, or when two mutually-exclusive backends are enabled
 together. A feature leak of that kind is invisible until something builds the
@@ -136,7 +148,7 @@ them by number** (§6); this section is for you to know them.
   (`RenderState`, `FileState`, `DecoderState`, …). No `static mut`,
   `thread_local!`, `LazyLock`/`OnceLock`/`OnceCell`, no process-global
   registries, no hidden caches, no `&mut self` on an L1 service. All engine
-  state is owned by L2. Guarded by `scripts/check-stateless.sh`.
+  state is owned by L2. Guarded by `krkr-gate stateless`.
 - **D10 — L1 owns traversal/rendering.** L2 maintains the `RenderScene` tree and
   calls `render`; it never builds a draw list. L1 does traversal, composition,
   batching, blend selection and drawing.
@@ -168,7 +180,7 @@ them by number** (§6); this section is for you to know them.
 - **D28 — no game-specific code.** A behaviour change must implement what
   `reference/cpp/**` does. Never special-case one title to make it work.
 - **D29 — the surface lock is the contract.** `crates/compat/tests/runtime_surface.rs`
-  dumps what `CompatHost::install` actually registered; `scripts/surface_lock.py`
+  dumps what `CompatHost::install` actually registered; `krkr-gate surface-lock`
   fails on any added/removed member. L3 internals are free to change only while
   the dump is unchanged. Adding a member needs a reviewed baseline update.
 - **D30 — tests cite the reference; the code does not.** Every behaviour

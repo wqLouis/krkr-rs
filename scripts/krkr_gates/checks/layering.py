@@ -1,119 +1,25 @@
-#!/usr/bin/env bash
-# Layering and unsafe guard (AGENTS §2: the four layers and the one allowed
-# dependency direction; AGENTS §5: idiomatic Rust / the `unsafe` policy).
-#
-# A compiler-free guard for the layer boundaries and the `unsafe` rules.  It
-# mirrors scripts/check-error-handling.sh: it scans the tree, ignores comments
-# and string/char literals, skips `#[cfg(test)]` items and test files where the
-# rule says so, prints every offending file:line with its rule, and exits
-# non-zero unless the site has a reviewed entry in scripts/layering_allow.txt.
-#
-# Checked rules
-# -------------
-#   l1-vocabulary      `crates/platform/{api,fs,media,render,platform}/src/**`
-#                      must not name TVP/TJS/KAG vocabulary in code.  A token
-#                      that is also a legitimate L1 concept is not checked; see
-#                      DROPPED TOKENS below.
-#   l2-vocabulary      `crates/engine/**` must not name TVP/TJS vocabulary in
-#                      code (the same tokens, plus the TVP `0..100000` volume
-#                      scale literal).
-#   l2-storage-name    `crates/engine/**` must not carry the TVP media/domain
-#                      storage-name prefix.  A string literal whose content
-#                      *begins* `file:` (which covers `file://`, `file://.`,
-#                      and the single-slash `file:/…` form) names a TVP
-#                      storage and belongs to L3.  The rule inspects string
-#                      literals because the prefix only ever lives inside one;
-#                      anchoring at the literal start keeps an ordinary
-#                      `file:` inside a log message from matching, and a
-#                      comment is never a literal.  `arc.xp3>path` addressing
-#                      stays L2 and is deliberately not matched.
-#   l3-platform        `crates/compat/src/**` must not contain platform code
-#                      (`#[cfg(target_os`, `winit`, `android-activity`,
-#                      `std::fs`, `jni`, `ndk`).  `crates/compat/tests/**` is
-#                      deliberately excluded: tests build fixtures with
-#                      `std::fs`, which is not the compat source's platform
-#                      leak.  A test file is scanned by no rule that bans
-#                      `std::fs`.
-#   unsafe-no-safety-note  every `unsafe { … }` block or `unsafe fn` outside
-#                      tests needs a `// SAFETY:` note adjacent to the block (or
-#                      a `# Safety` doc on the fn).  The window is tight: the
-#                      note must be on the same line, on the first line inside
-#                      the block, or in the run of `//`/`#[…]` lines
-#                      immediately above — never a note belonging to a
-#                      neighbouring block.  `unsafe impl`/`unsafe extern`
-#                      declarations are not checked (their contract is a
-#                      `// SAFETY:` on the impl, which this rule cannot tell
-#                      apart from the surrounding code).
-#   unsafe-allow-outside-ffi  a file-level `#![allow(unsafe_code)]` is allowed
-#                      only in the reviewed FFI/Vulkan locations listed in
-#                      `FFI_UNSAFE_LOCATIONS` below (each with its reason);
-#                      a file-level allow anywhere else is a finding.
-#   missing-docs-lint  every `crates/**/src/lib.rs` enables
-#                      `#![warn(missing_docs)]` (AGENTS §5).
-#
-# What the scan cannot decide
-# ---------------------------
-# A token can be TVP vocabulary or an unrelated identifier that merely matches
-# the spelling.  The rule drops every token whose meaning a syntax scan cannot
-# settle:
-#   * `Layer`  — Vulkan calls its validation layers "layer" (`VK_LAYER_…`), so
-#                the word is not TVP-specific in `render`.
-#   * `VK_`    — Vulkan's own `VK_*` constants share the prefix with the TVP
-#                virtual-key codes; it is only checked outside `render` (and in
-#                L2), and only when it is a code identifier (the Vulkan uses
-#                live in `CStr`/`format!` literals, which the mask blanks).
-#   * `.sli` / `.tjs`  — the extensions only ever occur inside string literals,
-#                and a literal is a near miss by design; the mask blanks it.
-#   * KAG tag names — the tag words (`image`, `wait`, `eval`, …) are ordinary
-#                English identifiers; deciding one is a KAG tag needs the
-#                surrounding script, which the scan does not have.
-#   * `Storage` — L1 and L2 have their own storage types; the token is not TVP.
-#   * bare `tjs` — a local named `tjs` (a test variable, a file list) is
-#                indistinguishable from the language name; only `TJS` and the
-#                `.tjs` extension are unambiguous, and the extension is a string.
-#   * `arc.xp3>path` — the VFS addressing is L2 (`06-file-system.md` §5), not
-#                TVP storage naming; the storage-name rule matches only the
-#                `file:` media prefix.
-# kag/KAG is checked because it has no L1/L2 meaning at all.
-#
-# Allowlist: scripts/layering_allow.txt
-#   one entry per line:  path:line:pattern — reason
-#   `path` may contain shell globs (`*` matches `/` too), so a whole reviewed
-#   location is one entry.  `line` is an integer, or `*`/`0` for any line.
-#   `pattern` is either a rule name above (matched together with `path` and
-#   `line`) or a code anchor, a substring of the offending source line (matched
-#   with `path` only, so the entry survives line churn).  `#` starts a comment.
-#   An entry that no longer matches any finding is reported as stale.
-#
-# Usage: scripts/check-layering.sh [--print-all] [--self-test]
-#   --print-all   list every finding without allowlist filtering (seeding aid)
-#   --self-test   run only the guard's own fixture self-test and exit
-#
-# The scan runs in python3 because a correct guard must ignore comments, string
-# and char literals and `#[cfg(test)]` items, and must measure the note window
-# per line.
+"""Layer-vocabulary and unsafe-placement guard (AGENTS §2/§5).
 
-set -uo pipefail
+Checks that the bottom crates do not name TVP/TJS/KAG vocabulary, that the
+compat layer contains no platform code, and that ``unsafe`` carries a safety
+note and a file-level allow only in a reviewed FFI location. Accepted sites
+are listed in ``scripts/allowlists/layering_allow.txt``.
+"""
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$ROOT" || exit 1
-
-ALLOW="scripts/layering_allow.txt"
-
-exec python3 - "$ALLOW" "$@" <<'PY'
 import fnmatch
 import re
 import sys
 import time
-from pathlib import Path
 
-ROOT = Path.cwd()
-ALLOW = Path(sys.argv[1])
-ARGS = set(sys.argv[2:])
-PRINT_ALL = "--print-all" in ARGS
+from ..common import ALLOWLISTS_DIR, FIXTURES_DIR, REPO_ROOT
+
+ROOT = REPO_ROOT
+ALLOW = ALLOWLISTS_DIR / "layering_allow.txt"
+ARGS: set[str] = set()
+PRINT_ALL = False
 
 CRATES = ROOT / "crates"
-FIXTURES = ROOT / "scripts" / "layering_fixtures"
+FIXTURES = FIXTURES_DIR / "layering"
 
 # L1 crates whose *source* must not name layer/TVP/TJS/KAG vocabulary.
 L1_PREFIXES = (
@@ -314,7 +220,7 @@ def logical(rel):
     """The path from the crate root, so fixture trees reuse the real scopes.
 
     Both `crates/foo/src/x.rs` and
-    `scripts/layering_fixtures/crates/foo/src/x.rs` reduce to
+    `scripts/fixtures/layering/crates/foo/src/x.rs` reduce to
     `crates/foo/src/x.rs`.
     """
     i = rel.rfind("crates/")
@@ -527,14 +433,14 @@ BAD_FIXTURES = {
     "crates/bad_crate/src/lib.rs": "missing-docs-lint",
 }
 GOOD_FIXTURES = (
-    "scripts/layering_fixtures/crates/platform/api/src/good_l1.rs",
-    "scripts/layering_fixtures/crates/engine/src/good_l2.rs",
-    "scripts/layering_fixtures/crates/engine/src/good_l2_storage_name.rs",
-    "scripts/layering_fixtures/crates/compat/src/good_l3.rs",
-    "scripts/layering_fixtures/crates/compat/src/good_unsafe_note.rs",
-    "scripts/layering_fixtures/crates/compat/src/good_allow.rs",
-    "scripts/layering_fixtures/crates/compat/tests/good_std_fs.rs",
-    "scripts/layering_fixtures/crates/good_crate/src/lib.rs",
+    "scripts/fixtures/layering/crates/platform/api/src/good_l1.rs",
+    "scripts/fixtures/layering/crates/engine/src/good_l2.rs",
+    "scripts/fixtures/layering/crates/engine/src/good_l2_storage_name.rs",
+    "scripts/fixtures/layering/crates/compat/src/good_l3.rs",
+    "scripts/fixtures/layering/crates/compat/src/good_unsafe_note.rs",
+    "scripts/fixtures/layering/crates/compat/src/good_allow.rs",
+    "scripts/fixtures/layering/crates/compat/tests/good_std_fs.rs",
+    "scripts/fixtures/layering/crates/good_crate/src/lib.rs",
 )
 
 
@@ -627,18 +533,25 @@ def main():
             "allowlist entry/entries."
         )
         print("  Either fix the violation or add a reviewed entry to")
-        print(f"  {ALLOW}")
+        print(f"  {ALLOW.relative_to(ROOT)}")
         print("  Format: path:line:pattern — reason  (pattern is a rule name")
         print("  or a source-line anchor; line `*` matches any line)")
         return 1
 
     print(
         f"layering guard: clean ({len(findings)} site(s) checked, "
-        f"{len(allow)} allowlisted, {elapsed * 1000.0:.1f} ms) — {ALLOW}"
+        f"{len(allow)} allowlisted, {elapsed * 1000.0:.1f} ms) — {ALLOW.relative_to(ROOT)}"
     )
     return 0
 
 
+def run(argv=None):
+    """Run the check. ``argv`` carries the check-specific flags."""
+    global ARGS, PRINT_ALL
+    ARGS = set(argv or [])
+    PRINT_ALL = "--print-all" in ARGS
+    return main()
+
+
 if __name__ == "__main__":
-    sys.exit(main())
-PY
+    sys.exit(run(sys.argv[1:]))

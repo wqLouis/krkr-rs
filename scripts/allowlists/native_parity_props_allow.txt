@@ -4,6 +4,6 @@
 # A reason beginning with 'debt:' records a known divergence that is
 # accepted but still visible.
 # Regenerate after intentional additions with:
-#   python3 scripts/native_parity.py --update-props-allow
+#   uv run --project scripts krkr-gate native-parity --update-props-allow
 # The checker fails when a mismatch is not listed here.
 
