@@ -300,6 +300,9 @@ pub struct Host {
     logical_size: (u32, u32),
     /// Framebuffer transform for the current presentation.
     view: ViewTransform,
+    /// Uniform factor at which the current presentation rasterizes glyph
+    /// bitmaps above their logical size (from [`Presentation::render_scale`]).
+    render_scale: f32,
 }
 
 impl Host {
@@ -349,7 +352,8 @@ impl Host {
         };
         let surface_size = (config.surface_size.0.max(1), config.surface_size.1.max(1));
         let _ = resize_render(&pipeline, &surface, &mut render_state, surface_size)?;
-        let view = Presentation::compute(config.scaling, surface_size, surface_size).view;
+        let presentation = Presentation::compute(config.scaling, surface_size, surface_size);
+        let view = presentation.view;
 
         Ok(Self {
             pipeline,
@@ -370,6 +374,7 @@ impl Host {
             design_size: None,
             logical_size: surface_size,
             view,
+            render_scale: presentation.render_scale,
         })
     }
 
@@ -495,6 +500,7 @@ impl Host {
         let presentation = Presentation::compute(self.scaling, design, size);
         self.view = presentation.view;
         self.logical_size = presentation.logical_size;
+        self.render_scale = presentation.render_scale;
 
         // The logical screen size and, when the window has one, its primary
         // layer follow the presentation; the layer stays at the origin
@@ -576,6 +582,17 @@ impl Host {
     /// Returns the framebuffer transform for the current presentation.
     pub fn view(&self) -> ViewTransform {
         self.view
+    }
+
+    /// Returns the factor at which the current presentation rasterizes glyph
+    /// bitmaps above their logical size.
+    ///
+    /// `1.0` is the reference's logical-resolution text
+    /// (`Game`/`Fit`/`Fill`/`Expand`); [`ScalingMode::FitSharp`] reports the
+    /// framebuffer scale, which a glyph draw uses to rasterize at
+    /// `size_px * render_scale` while the quad and layout stay logical.
+    pub fn render_scale(&self) -> f32 {
+        self.render_scale
     }
 
     /// Returns the number of frames rendered so far.

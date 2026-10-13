@@ -566,6 +566,24 @@ fn expand_mode_grows_the_logical_size_to_the_window_aspect() {
     }
 }
 
+/// `FitSharp` inherits `Fit`'s letterboxed uniform geometry and additionally
+/// reports the framebuffer scale glyph bitmaps are rasterized at, so text is
+/// sampled 1:1 into the framebuffer instead of upscaled from the logical size.
+/// The logical size stays the game's declared size for scripts
+/// (`reference/cpp/core/environ/cocos2d/MainScene.cpp:436-441`).
+#[test]
+fn fit_sharp_inherits_fit_and_reports_the_framebuffer_scale() {
+    for framebuffer in [(2560, 1440), (1920, 1080), (1600, 1200), (1920, 800)] {
+        let fit = Presentation::compute(ScalingMode::Fit, DESIGN, framebuffer);
+        let sharp = Presentation::compute(ScalingMode::FitSharp, DESIGN, framebuffer);
+        assert_eq!(sharp.logical_size, fit.logical_size, "{framebuffer:?}");
+        assert_eq!(sharp.view, fit.view, "{framebuffer:?}");
+        assert_eq!(fit.render_scale, 1.0, "{framebuffer:?}");
+        assert_eq!(sharp.render_scale, sharp.view.scale.0, "{framebuffer:?}");
+        assert!(sharp.render_scale > fit.render_scale, "{framebuffer:?}");
+    }
+}
+
 /// A zero window dimension is degenerate: the presentation stays the identity
 /// design projection and never divides by zero.
 #[test]
@@ -573,6 +591,7 @@ fn degenerate_windows_keep_the_identity() {
     let modes = [
         ScalingMode::Game,
         ScalingMode::Fit,
+        ScalingMode::FitSharp,
         ScalingMode::Fill,
         ScalingMode::Expand,
     ];

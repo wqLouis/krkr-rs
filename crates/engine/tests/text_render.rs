@@ -10,9 +10,10 @@
 use api::glyph::GlyphBackend;
 use raw_window_handle::{RawWindowHandle, XlibWindowHandle};
 
+use engine::projection::{Presentation, ScalingMode};
 use engine::text::{
-    GlyphAtlas, MAX_TEXT_CACHE_ENTRIES, RasterizedRun, TextCoverageCache, TextEngine, TextStyle,
-    rasterize_run,
+    GlyphAtlas, MAX_TEXT_CACHE_ENTRIES, RasterizedRun, TextCoverageCache, TextEngine, TextError,
+    TextStyle, rasterize_run,
 };
 use render::{PipelineConfig, begin_render_state, create_render_pipeline};
 
@@ -71,6 +72,7 @@ fn cpu_and_gpu_runs_share_glyph_geometry() {
     let mut atlas = GlyphAtlas::new(&pipeline, 256).expect("atlas");
     let cpu = rasterize_run(
         GlyphBackend::Cpu,
+        1.0,
         &mut cache,
         &mut atlas,
         &pipeline,
@@ -84,6 +86,7 @@ fn cpu_and_gpu_runs_share_glyph_geometry() {
     .expect("cpu run");
     let gpu = rasterize_run(
         GlyphBackend::Gpu,
+        1.0,
         &mut cache,
         &mut atlas,
         &pipeline,
@@ -187,6 +190,7 @@ fn atlas_batches_a_run_into_one_flush() {
 
     let gpu = rasterize_run(
         GlyphBackend::Gpu,
+        1.0,
         &mut cache,
         &mut atlas,
         &pipeline,
@@ -267,4 +271,161 @@ fn glyphs_queue_until_one_flush() {
         0,
         "one flush drains every queued glyph"
     );
+}
+
+/// Reference: `TVPGetCharacter` rasterizes a character at the requested font
+/// height (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:244-320`) while
+/// the shaped advance comes from the layout, not the bitmap. A presentation
+/// that renders at the framebuffer scale therefore rasterizes the coverage at
+/// `size_px * render_scale` pixels while the logical bearings, advance and
+/// destination quad stay at `size_px`: the physical bitmap grows, the
+/// script-visible geometry does not.
+#[test]
+fn fit_sharp_rasterizes_a_larger_bitmap_with_unchanged_logical_metrics() {
+    let Some(bytes) = load_test_font() else {
+        return;
+    };
+    let mut engine = TextEngine::new();
+    let Ok(font) = engine.add_font(&bytes, 0) else {
+        return;
+    };
+    let (pipeline, _surface, mut state) = null_pipeline();
+    let style = TextStyle::new(24.0);
+    let layout = engine
+        .layout(font, "A", &style, None)
+        .expect("layout of a Latin glyph");
+
+    let design = (1280u32, 720u32);
+    let framebuffer = (2560u32, 1440u32);
+    let fit = Presentation::compute(ScalingMode::Fit, design, framebuffer);
+    let fit_sharp = Presentation::compute(ScalingMode::FitSharp, design, framebuffer);
+    assert_eq!(fit.view, fit_sharp.view, "FitSharp inherits Fit's geometry");
+    assert_eq!(fit.logical_size, fit_sharp.logical_size);
+    assert_eq!(fit.render_scale, 1.0);
+    assert_eq!(fit_sharp.render_scale, 2.0);
+
+    let mut cache = TextCoverageCache::new();
+    let mut atlas = GlyphAtlas::new(&pipeline, 256).expect("atlas");
+
+    let fit_run = rasterize_run(
+        GlyphBackend::Gpu,
+        fit.render_scale,
+        &mut cache,
+        &mut atlas,
+        &pipeline,
+        &mut state,
+        &engine,
+        &layout,
+        &style,
+        true,
+        1.0,
+    )
+    .expect("gpu fit run");
+    let RasterizedRun::Atlas(fit_glyphs) = fit_run else {
+        panic!("the gpu backend must return atlas glyphs");
+    };
+    let fit_glyph = fit_glyphs[0].glyph;
+    let fit_dst = fit_glyphs[0].destination().expect("ink");
+
+    atlas.clear();
+    let sharp_run = rasterize_run(
+        GlyphBackend::Gpu,
+        fit_sharp.render_scale,
+        &mut cache,
+        &mut atlas,
+        &pipeline,
+        &mut state,
+        &engine,
+        &layout,
+        &style,
+        true,
+        1.0,
+    )
+    .expect("gpu fit-sharp run");
+    let RasterizedRun::Atlas(sharp_glyphs) = sharp_run else {
+        panic!("the gpu backend must return atlas glyphs");
+    };
+    let sharp_glyph = sharp_glyphs[0].glyph;
+    let sharp_dst = sharp_glyphs[0].destination().expect("ink");
+
+    // The physical bitmap grows with the render scale.
+    assert!(
+        sharp_glyph.region.width > fit_glyph.region.width
+            && sharp_glyph.region.height > fit_glyph.region.height,
+        "FitSharp must rasterize a larger bitmap: fit={}x{}, fit-sharp={}x{}",
+        fit_glyph.region.width,
+        fit_glyph.region.height,
+        sharp_glyph.region.width,
+        sharp_glyph.region.height,
+    );
+    assert_eq!(fit_glyph.raster_scale, 1.0);
+    assert_eq!(sharp_glyph.raster_scale, 2.0);
+
+    // The logical quad, bearings and advance stay at `size_px`.
+    assert!(
+        (fit_dst.x - sharp_dst.x).abs() < 1.0,
+        "{fit_dst:?} {sharp_dst:?}"
+    );
+    assert!(
+        (fit_dst.y - sharp_dst.y).abs() < 1.0,
+        "{fit_dst:?} {sharp_dst:?}"
+    );
+    assert!(
+        (fit_dst.width - sharp_dst.width).abs() < 1.0,
+        "{fit_dst:?} {sharp_dst:?}"
+    );
+    assert!(
+        (fit_dst.height - sharp_dst.height).abs() < 1.0,
+        "{fit_dst:?} {sharp_dst:?}"
+    );
+    assert!(
+        (fit_glyph.advance - sharp_glyph.advance).abs() < 1.0,
+        "fit={}, fit-sharp={}",
+        fit_glyph.advance,
+        sharp_glyph.advance,
+    );
+    assert!((fit_glyph.bearing_x - sharp_glyph.bearing_x).abs() < 1.0);
+    assert!((fit_glyph.bearing_y - sharp_glyph.bearing_y).abs() < 1.0);
+}
+
+/// A non-positive or non-finite rasterization scale is a typed error rather
+/// than a silent fallback to the logical size.
+#[test]
+fn a_bad_render_scale_is_a_typed_error() {
+    let Some(bytes) = load_test_font() else {
+        return;
+    };
+    let mut engine = TextEngine::new();
+    let Ok(font) = engine.add_font(&bytes, 0) else {
+        return;
+    };
+    let (pipeline, _surface, mut state) = null_pipeline();
+    let style = TextStyle::new(24.0);
+    let layout = engine
+        .layout(font, "A", &style, None)
+        .expect("layout of a Latin glyph");
+    let mut cache = TextCoverageCache::new();
+    let mut atlas = GlyphAtlas::new(&pipeline, 256).expect("atlas");
+
+    for scale in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+        let error = rasterize_run(
+            GlyphBackend::Gpu,
+            scale,
+            &mut cache,
+            &mut atlas,
+            &pipeline,
+            &mut state,
+            &engine,
+            &layout,
+            &style,
+            true,
+            1.0,
+        )
+        .expect_err("a bad scale must not fall back to the logical size");
+        let debug = format!("{error:?}");
+        assert!(
+            matches!(error, TextError::InvalidRenderScale(_)),
+            "scale {scale} produced {debug}"
+        );
+    }
 }

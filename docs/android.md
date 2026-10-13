@@ -255,7 +255,7 @@ Nothing is offered for a feature the engine has no knob for
 | option | values / range | default | basis |
 |---|---|---|---|
 | Frame-rate limit | decimal integer `1..=1000` fps | `60` | reference `fps_limit` default 60 (`reference/cpp/core/environ/ui/PreferenceConfig.h:304-309`); the same range `--fps` accepts |
-| Presentation scaling | `game`, `fit`, `fill`, `expand` | `fit` | `game` is the reference's one-to-one Win32 presentation; `fit` is the Android default (§2.2), because a phone must not present the raw logical size |
+| Presentation scaling | `game`, `fit`, `fit-sharp`, `fill`, `expand` | `fit` | `game` is the reference's one-to-one Win32 presentation; `fit` is the Android default (§2.2), because a phone must not present the raw logical size; `fit-sharp` keeps the framebuffer resolution so text renders sharply |
 | Archive preload | `true`, `false` | `false` | whether every mounted archive is read into memory when it mounts; the cost is that archive's size in resident memory, the gain is that entry reads stop touching the backing filesystem |
 | Engine log level | `off`, `error`, `warn`, `info`, `debug`, `trace` | `info` | how much the engine writes to `krkr.log`; `debug`/`trace` are diagnostic and produce large logs (see §7) |
 

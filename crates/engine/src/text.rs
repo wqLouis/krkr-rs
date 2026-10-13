@@ -125,6 +125,9 @@ pub enum TextError {
     /// The requested pixel size is zero, negative or not finite.
     #[error("invalid text size {0}")]
     InvalidSize(f32),
+    /// The requested glyph render scale is zero, negative or not finite.
+    #[error("invalid glyph render scale {0}")]
+    InvalidRenderScale(f32),
     /// The font data is not a usable face at the requested collection index.
     #[error("invalid font data: {message}")]
     InvalidFont {
@@ -947,8 +950,13 @@ struct GlyphKey {
     font: usize,
     /// Code point.
     codepoint: char,
-    /// `size_px.to_bits()` (so the key stays `Eq`).
+    /// `(size_px * render_scale).to_bits()`, the physical size the bitmap was
+    /// rasterized at (so the key stays `Eq`).
     size_bits: u32,
+    /// `render_scale.to_bits()`. The same physical size can come from
+    /// different logical-size/scale pairs with different logical bearings, so
+    /// the scale is part of the key.
+    scale_bits: u32,
     /// Synthetic bold.
     bold: bool,
     /// Synthetic italic.
@@ -959,16 +967,28 @@ struct GlyphKey {
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[non_exhaustive]
 pub struct AtlasGlyph {
-    /// Sub-rectangle of the atlas holding the glyph's RGBA pixels.
+    /// Sub-rectangle of the atlas holding the glyph's RGBA pixels, in the
+    /// physical resolution the glyph was rasterized at.
     pub region: PixelRegion,
-    /// Horizontal bearing from the pen to the bitmap's left edge.
+    /// Horizontal bearing from the pen to the bitmap's left edge, in logical
+    /// pixels (the physical bearing divided by `raster_scale`).
     pub bearing_x: f32,
-    /// Vertical bearing from the baseline to the bitmap's top edge.
+    /// Vertical bearing from the baseline to the bitmap's top edge, in logical
+    /// pixels (the physical bearing divided by `raster_scale`).
     pub bearing_y: f32,
-    /// Shaped advance after the glyph, in pixels.
+    /// Shaped advance after the glyph, in logical pixels (the physical advance
+    /// divided by `raster_scale`).
     pub advance: f32,
-    /// Em size the glyph was rasterized at.
+    /// Logical em size the bearings, advance and quad are expressed at.
+    ///
+    /// The bitmap itself is rasterized at `size_px * raster_scale` pixels.
     pub size_px: f32,
+    /// Factor `region` was rasterized above `size_px`.
+    ///
+    /// `1.0` when the atlas rasterizes at the logical size. A value above
+    /// `1.0` means the quad samples the extra physical texels down to the
+    /// logical box instead of upscaling a logical-resolution bitmap.
+    pub raster_scale: f32,
 }
 
 impl AtlasGlyph {
@@ -1008,11 +1028,14 @@ pub struct GlyphAtlas {
     cursor_y: u32,
     /// Tallest glyph in the current shelf.
     row_height: u32,
-    /// Rasterized glyphs, keyed by face/codepoint/size/style and evicted least
-    /// recently used at the reference limit.
+    /// Rasterized glyphs, keyed by face/codepoint/physical size/style and
+    /// evicted least recently used at the reference limit.
     entries: LruCache<GlyphKey, AtlasGlyph>,
     /// Regions written to the CPU mirror but not yet copied to the GPU.
     pending: Vec<PendingGlyphUpload>,
+    /// Factor at which new glyphs are rasterized above their logical size.
+    /// `1.0` rasterizes at the logical size.
+    render_scale: f32,
 }
 
 /// One rasterized glyph region waiting for its GPU copy.
@@ -1046,7 +1069,31 @@ impl GlyphAtlas {
             row_height: 0,
             entries: LruCache::new(MAX_TEXT_CACHE_ENTRIES),
             pending: Vec::new(),
+            render_scale: 1.0,
         })
+    }
+
+    /// Sets the factor at which subsequent glyphs are rasterized above their
+    /// logical size.
+    ///
+    /// A value above `1.0` rasterizes the coverage at `size_px * render_scale`
+    /// pixels while the glyph's logical bearings, advance and destination quad
+    /// stay at `size_px`, so the pipeline samples the extra texels into a
+    /// framebuffer at 1:1 instead of upscaling a logical-resolution bitmap.
+    /// The entry map is keyed by the physical size, so changing the factor
+    /// after glyphs are cached serves the new physical entries; call
+    /// [`GlyphAtlas::clear`] to reclaim the old pixel space.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TextError::InvalidRenderScale`] when `render_scale` is not
+    /// finite and positive.
+    fn set_render_scale(&mut self, render_scale: f32) -> Result<(), TextError> {
+        if !(render_scale.is_finite() && render_scale > 0.0) {
+            return Err(TextError::InvalidRenderScale(render_scale));
+        }
+        self.render_scale = render_scale;
+        Ok(())
     }
 
     /// Drops every cached glyph and resets the shelf packer, zeroing the CPU
@@ -1101,11 +1148,13 @@ impl GlyphAtlas {
 
     /// Rasterizes `codepoint` (if needed) and packs it into the atlas.
     ///
-    /// The glyph is cached by face, code point, size and style (never colour),
-    /// so a repeated request does not re-rasterize or re-upload and a colour
-    /// change reuses the cached coverage. The new region is written to the CPU
-    /// mirror and queued for [`GlyphAtlas::flush`]; it is not copied to the GPU
-    /// until that flush.
+    /// The glyph is cached by face, code point, physical size and style (never
+    /// colour), so a repeated request does not re-rasterize or re-upload and a
+    /// colour change reuses the cached coverage. The bitmap is rasterized at
+    /// `style.size_px * self.render_scale` pixels while its bearings, advance
+    /// and the projected quad stay at the logical `style.size_px`. The new
+    /// region is written to the CPU mirror and queued for
+    /// [`GlyphAtlas::flush`]; it is not copied to the GPU until that flush.
     ///
     /// # Errors
     ///
@@ -1121,10 +1170,13 @@ impl GlyphAtlas {
         if !(style.size_px.is_finite() && style.size_px > 0.0) {
             return Err(TextError::InvalidSize(style.size_px));
         }
+        let render_scale = self.render_scale;
+        let physical_size = style.size_px * render_scale;
         let key = GlyphKey {
             font: font.0,
             codepoint,
-            size_bits: style.size_px.to_bits(),
+            size_bits: physical_size.to_bits(),
+            scale_bits: render_scale.to_bits(),
             bold: style.bold,
             italic: style.italic,
         };
@@ -1140,17 +1192,22 @@ impl GlyphAtlas {
             &engine.render_system,
             &face.render,
             codepoint,
-            style.size_px,
+            physical_size,
             style.glyph_style(),
         )?;
 
+        // The rasterizer measures the bitmap in physical pixels; dividing the
+        // pen geometry by the render scale expresses it in the logical pixels
+        // the shaped layout and the destination quad use.
+        let to_logical = |value: f32| value / render_scale;
         let entry = if bitmap.is_empty() {
             AtlasGlyph {
                 region: PixelRegion::ZERO,
-                bearing_x: bitmap.bearing_x,
-                bearing_y: bitmap.bearing_y,
-                advance: bitmap.advance,
+                bearing_x: to_logical(bitmap.bearing_x),
+                bearing_y: to_logical(bitmap.bearing_y),
+                advance: to_logical(bitmap.advance),
                 size_px: style.size_px,
+                raster_scale: render_scale,
             }
         } else {
             let (x, y) =
@@ -1168,10 +1225,11 @@ impl GlyphAtlas {
             });
             AtlasGlyph {
                 region,
-                bearing_x: bitmap.bearing_x,
-                bearing_y: bitmap.bearing_y,
-                advance: bitmap.advance,
+                bearing_x: to_logical(bitmap.bearing_x),
+                bearing_y: to_logical(bitmap.bearing_y),
+                advance: to_logical(bitmap.advance),
                 size_px: style.size_px,
+                raster_scale: render_scale,
             }
         };
 
@@ -1318,15 +1376,20 @@ impl PositionedGlyph {
 
     /// Returns the destination rectangle for the glyph's bitmap, or `None`
     /// for a zero-size glyph.
+    ///
+    /// The rectangle is in logical pixels: the physical `region` is divided by
+    /// the glyph's [`AtlasGlyph::raster_scale`], so a high-resolution bitmap
+    /// occupies the same logical box the logical-resolution bitmap would.
     pub fn destination(&self) -> Option<RectF> {
         if self.glyph.is_empty() {
             return None;
         }
+        let scale = self.glyph.raster_scale;
         Some(RectF::new(
             self.x + self.glyph.bearing_x,
             self.baseline_y - self.glyph.bearing_y,
-            self.glyph.region.width as f32,
-            self.glyph.region.height as f32,
+            self.glyph.region.width as f32 / scale,
+            self.glyph.region.height as f32 / scale,
         ))
     }
 }
@@ -1375,7 +1438,10 @@ pub fn project_text(
 ///
 /// This is the buffer-based companion of [`project_text`]: it reads the same
 /// [`GlyphAtlas`] coverage, tints it with each glyph's colour and applies
-/// straight-alpha source-over with the glyph's opacity. It is not the
+/// straight-alpha source-over with the glyph's opacity. A glyph whose bitmap
+/// was rasterized above its logical size (`raster_scale`) is sampled down into
+/// its logical box with nearest-neighbour sampling, so the composited pixels
+/// are identical to a logical-resolution bitmap at scale `1.0`. It is not the
 /// production text path — the emulator composites coverage straight into the
 /// layer bitmap with [`compose_text_into`] — but it is the reference for a
 /// test that compares the projected atlas pixels with a CPU composite. The
@@ -1393,21 +1459,28 @@ pub fn compose_text_cpu(
         if region.is_empty() || width == 0 || height == 0 {
             continue;
         }
+        let scale = f64::from(positioned.glyph.raster_scale);
         let dest_x = (positioned.x + positioned.glyph.bearing_x).round() as i64;
         let dest_y = (positioned.baseline_y - positioned.glyph.bearing_y).round() as i64;
         let opacity = clamp01(positioned.opacity);
-        for row in 0..region.height as i64 {
+        // The logical glyph box is the physical region divided by the render
+        // scale. At scale `1.0` this reproduces the physical loop exactly.
+        let logical_width = (f64::from(region.width) / scale).ceil() as i64;
+        let logical_height = (f64::from(region.height) / scale).ceil() as i64;
+        for row in 0..logical_height {
             let dy = dest_y + row;
             if dy < 0 || dy >= height as i64 {
                 continue;
             }
-            for column in 0..region.width as i64 {
+            let sy =
+                region.y as i64 + ((row as f64 * scale) as i64).clamp(0, region.height as i64 - 1);
+            for column in 0..logical_width {
                 let dx = dest_x + column;
                 if dx < 0 || dx >= width as i64 {
                     continue;
                 }
-                let sx = region.x as i64 + column;
-                let sy = region.y as i64 + row;
+                let sx = region.x as i64
+                    + ((column as f64 * scale) as i64).clamp(0, region.width as i64 - 1);
                 if sx < 0 || sx >= atlas_w as i64 || sy < 0 || sy >= atlas_h as i64 {
                     continue;
                 }
@@ -1884,9 +1957,12 @@ pub enum RasterizedRun {
 /// Rasterizes `layout` through the selected glyph `backend`.
 ///
 /// `Cpu` returns the coverage masks [`compose_text_into`] composites into a
-/// bitmap, reusing `cache`. `Gpu` fills `atlas` and returns pen-positioned
-/// glyphs for [`project_text`]; it needs a live `pipeline` to upload the atlas
-/// texture.
+/// bitmap, reusing `cache`; it always rasterizes at the logical size so the
+/// readback bitmap stays byte-identical to the reference. `Gpu` fills `atlas`
+/// and returns pen-positioned glyphs for [`project_text`], rasterizing each
+/// bitmap at `size_px * render_scale` while its logical bearings, advance and
+/// destination quad stay at `size_px`; it needs a live `pipeline` to upload
+/// the atlas texture.
 ///
 /// The shaped [`TextLayout`] is the single source of glyph positions and
 /// advances, so choosing `Gpu` changes only which raster coverage the draw
@@ -1899,10 +1975,12 @@ pub enum RasterizedRun {
 /// # Errors
 ///
 /// Propagates [`rasterize_text_coverage`] / [`GlyphAtlas::rasterize_layout`]'s
-/// errors.
+/// errors, and [`TextError::InvalidRenderScale`] for a non-positive or
+/// non-finite `render_scale`.
 #[allow(clippy::too_many_arguments)]
 pub fn rasterize_run(
     backend: GlyphBackend,
+    render_scale: f32,
     cache: &mut TextCoverageCache,
     atlas: &mut GlyphAtlas,
     pipeline: &RenderPipeline,
@@ -1913,6 +1991,7 @@ pub fn rasterize_run(
     antialias: bool,
     opacity: f32,
 ) -> Result<RasterizedRun, TextError> {
+    atlas.set_render_scale(render_scale)?;
     match backend {
         GlyphBackend::Cpu => Ok(RasterizedRun::Coverage(rasterize_text_coverage(
             cache, engine, layout, style, antialias,

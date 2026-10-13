@@ -1,7 +1,7 @@
 //! `krkr` CLI: headless frame runner and windowed desktop frontend.
 //!
 //! ```text
-//! krkr [--headless] [--frames N] [--fps N] [--backend null|vulkan] [--scaling game|fit|fill|expand] [--preload-archives] [--archive XP3 ...] [--base-dir DIR] [GAME]
+//! krkr [--headless] [--frames N] [--fps N] [--backend null|vulkan] [--scaling game|fit|fit-sharp|fill|expand] [--preload-archives] [--archive XP3 ...] [--base-dir DIR] [GAME]
 //! ```
 //!
 //! * `--headless` runs an empty scene for `N` frames (default 120) through
@@ -32,7 +32,8 @@
 //!   passes both the window and display handle so a surface can be created.
 //!   The headless path has no display and uses `--backend null`.
 //! * `--scaling` selects how the engine presents the logical scene inside
-//!   the framebuffer (`game` by default, plus `fit`, `fill` and `expand`).
+//!   the framebuffer (`game` by default, plus `fit`, `fit-sharp`, `fill` and
+//!   `expand`).
 //! * Configuration is resolved **by this launcher** and handed to
 //!   [`app::run`] as an already-loaded value: the `key=value` file named by
 //!   the `KRKR_CONFIG` environment variable supplies overrides, the launch
@@ -91,7 +92,7 @@ const OPTIONS: &[OptionDoc] = &[
     OptionDoc {
         flag: "--scaling",
         value: "MODE",
-        help: "Presentation scaling (default: game, one of: game, fit, fill, expand).",
+        help: "Presentation scaling (default: game, one of: game, fit, fit-sharp, fill, expand).",
     },
     OptionDoc {
         flag: "--preload-archives",
@@ -495,6 +496,9 @@ mod tests {
             Some(FrameRateLimit::new("--fps", 30).expect("valid"))
         );
         assert_eq!(cli.scaling, Some(PresentationScaling::Fit));
+
+        let cli = parse(&["--headless", "--scaling", "fit-sharp"]).expect("parse");
+        assert_eq!(cli.scaling, Some(PresentationScaling::FitSharp));
     }
 
     #[test]
@@ -520,7 +524,10 @@ mod tests {
             .expect_err("must fail")
             .to_string();
         assert!(error.contains("--scaling"), "{error}");
-        assert!(error.contains("game, fit, fill, expand"), "{error}");
+        assert!(
+            error.contains("game, fit, fit-sharp, fill, expand"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -615,7 +622,10 @@ mod tests {
         assert!(text.contains("default: 60"), "{text}");
         assert!(text.contains("1..=1000"), "{text}");
         assert!(text.contains("default: game"), "{text}");
-        assert!(text.contains("game, fit, fill, expand"), "{text}");
+        assert!(
+            text.contains("game, fit, fit-sharp, fill, expand"),
+            "{text}"
+        );
         assert!(text.contains("default: 120"), "{text}");
     }
 

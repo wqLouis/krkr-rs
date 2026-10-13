@@ -34,8 +34,9 @@ use crate::scene::{LayerState, Rect, Scene};
 
 /// How the engine presents the logical scene inside the framebuffer.
 ///
-/// `Game` uses the declared size one-to-one; the other three modes scale the
-/// game's declared size to the window.
+/// `Game` uses the declared size one-to-one; the other modes scale the game's
+/// declared size to the window. `FitSharp` has `Fit`'s geometry and
+/// extends its glyph rasterization to the framebuffer resolution.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ScalingMode {
@@ -44,6 +45,13 @@ pub enum ScalingMode {
     Game,
     /// Uniform scale that fits the whole scene, letterboxed.
     Fit,
+    /// `Fit` geometry, with glyph bitmaps rasterized at the framebuffer scale.
+    ///
+    /// The game keeps declaring (and scripts keep observing) the logical size;
+    /// only the glyph coverage is rasterized larger, so the pipeline samples
+    /// it 1:1 into the framebuffer instead of upscaling a logical-resolution
+    /// bitmap.
+    FitSharp,
     /// Non-uniform scale that fills the window.
     Fill,
     /// Grow the logical size to the window's aspect, then scale uniformly.
@@ -57,6 +65,15 @@ pub struct Presentation {
     pub logical_size: (u32, u32),
     /// Framebuffer transform the pipeline applies while compositing.
     pub view: ViewTransform,
+    /// Uniform factor at which the mode rasterizes glyph bitmaps relative to
+    /// their logical size.
+    ///
+    /// `1.0` means the bitmap is rasterized at the logical size (the
+    /// reference's behavior, kept by `Game`/`Fit`/`Fill`/`Expand`).
+    /// [`ScalingMode::FitSharp`] reports the presentation's uniform scale, so
+    /// a `size_px` glyph is rasterized at `size_px * render_scale` pixels while
+    /// its bearings, advance and destination quad stay at `size_px`.
+    pub render_scale: f32,
 }
 
 impl Presentation {
@@ -65,6 +82,7 @@ impl Presentation {
         Self {
             logical_size: size,
             view: ViewTransform::IDENTITY,
+            render_scale: 1.0,
         }
     }
 
@@ -89,8 +107,15 @@ impl Presentation {
             // per framebuffer pixel.
             ScalingMode::Game => Self::identity(framebuffer),
             // One uniform scale, centred; the free axis is letterboxed.
-            ScalingMode::Fit => {
+            // `FitSharp` has the same geometry and only adds the framebuffer
+            // scale the text path rasterizes glyphs at.
+            ScalingMode::Fit | ScalingMode::FitSharp => {
                 let scale = (fw / dw).min(fh / dh);
+                let render_scale = if mode == ScalingMode::FitSharp {
+                    scale as f32
+                } else {
+                    1.0
+                };
                 Self {
                     logical_size: design,
                     view: ViewTransform {
@@ -100,6 +125,7 @@ impl Presentation {
                             ((fh - dh * scale) * 0.5) as f32,
                         ),
                     },
+                    render_scale,
                 }
             }
             // Independent axis scales; the frame is covered.
@@ -109,6 +135,7 @@ impl Presentation {
                     scale: ((fw / dw) as f32, (fh / dh) as f32),
                     offset: (0.0, 0.0),
                 },
+                render_scale: 1.0,
             },
             // Keep the design height and rewrite the width to the frame's
             // aspect, so the uniform height scale fills exactly.
@@ -121,6 +148,7 @@ impl Presentation {
                         scale: (scale, scale),
                         offset: (0.0, 0.0),
                     },
+                    render_scale: 1.0,
                 }
             }
         }

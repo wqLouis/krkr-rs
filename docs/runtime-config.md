@@ -83,7 +83,7 @@ parses. The recognized keys are `frame_rate`, `scaling` and
 | option | unit / range | default | basis |
 |---|---|---|---|
 | `--fps N` (`frame_rate`) | frames per second, `1..=1000` | `60` | reference `fps_limit` default `60` (`reference/cpp/core/environ/ui/PreferenceConfig.h:304-309`), applied as the animation interval `1/fps` (`reference/cpp/core/environ/cocos2d/MainScene.cpp:684-685`); the main loop sleeps the remaining interval (`reference/cpp/core/environ/RenderUtils.h`, `TVPDrawSceneOnce`) |
-| `--scaling MODE` (`scaling`) | `game`, `fit`, `fill`, `expand` | `game` (Android launchers default to `fit`) | `game` is the reference Win32 one-to-one presentation; the other three are the existing engine projection modes |
+| `--scaling MODE` (`scaling`) | `game`, `fit`, `fit-sharp`, `fill`, `expand` | `game` (Android launchers default to `fit`) | `game` is the reference Win32 one-to-one presentation; `fit-sharp` is `fit` with the render kept at the framebuffer resolution so text stays sharp; the rest are the existing engine projection modes |
 | `--preload-archives` (`preload_archives`) | `true`, `false` | `false` | read every mounted archive into memory when it mounts; the cost is that archive's size in resident memory, the gain is that entry reads stop touching the backing filesystem |
 
 The frame-rate limit paces both loops: the windowed loop through

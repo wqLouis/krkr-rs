@@ -213,7 +213,10 @@ mod tests {
             .expect_err("unknown scaling")
             .to_string();
         assert!(error.contains("scaling"), "{error}");
-        assert!(error.contains("game, fit, fill, expand"), "{error}");
+        assert!(
+            error.contains("game, fit, fit-sharp, fill, expand"),
+            "{error}"
+        );
 
         let error = resolve_runtime_config(None, None, Some("yes"))
             .expect_err("unknown preload value")

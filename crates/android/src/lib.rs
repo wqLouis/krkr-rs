@@ -246,6 +246,7 @@ mod android_entry {
         match scaling {
             PresentationScaling::Game => ScalingMode::Game,
             PresentationScaling::Fit => ScalingMode::Fit,
+            PresentationScaling::FitSharp => ScalingMode::FitSharp,
             PresentationScaling::Fill => ScalingMode::Fill,
             PresentationScaling::Expand => ScalingMode::Expand,
         }

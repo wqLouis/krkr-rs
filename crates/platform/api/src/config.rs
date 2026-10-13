@@ -109,6 +109,8 @@ pub enum PresentationScaling {
     Game,
     /// Uniform scale that fits the whole scene, letterboxed.
     Fit,
+    /// `Fit` geometry, with glyph bitmaps rasterized at the framebuffer scale.
+    FitSharp,
     /// Non-uniform scale that fills the window.
     Fill,
     /// Grow the logical size to the window's aspect, then scale uniformly.
@@ -120,7 +122,7 @@ impl PresentationScaling {
     pub const DEFAULT: Self = Self::Game;
 
     /// Human-readable accepted values for error and help text.
-    pub const RANGE: &str = "one of: game, fit, fill, expand";
+    pub const RANGE: &str = "one of: game, fit, fit-sharp, fill, expand";
 
     /// Parses a scaling name.
     ///
@@ -132,6 +134,7 @@ impl PresentationScaling {
         match value {
             "game" => Ok(Self::Game),
             "fit" => Ok(Self::Fit),
+            "fit-sharp" => Ok(Self::FitSharp),
             "fill" => Ok(Self::Fill),
             "expand" => Ok(Self::Expand),
             other => Err(ConfigError::invalid(option, other.to_owned(), Self::RANGE)),
@@ -143,6 +146,7 @@ impl PresentationScaling {
         match self {
             Self::Game => "game",
             Self::Fit => "fit",
+            Self::FitSharp => "fit-sharp",
             Self::Fill => "fill",
             Self::Expand => "expand",
         }
@@ -163,8 +167,8 @@ pub struct RuntimeConfig {
     /// step.
     pub frame_rate_limit: FrameRateLimit,
     /// How the logical scene is presented inside the framebuffer; one of
-    /// [`PresentationScaling::Game`], `Fit`, `Fill` or `Expand`, default
-    /// [`PresentationScaling::Game`].
+    /// [`PresentationScaling::Game`], `Fit`, `FitSharp`, `Fill` or `Expand`,
+    /// default [`PresentationScaling::Game`].
     pub scaling: PresentationScaling,
     /// Whether a mounted archive is read into memory in full at mount, default
     /// `false`. It trades the archive's size in resident memory for removing
@@ -348,6 +352,7 @@ mod tests {
         for (text, expected) in [
             ("game", PresentationScaling::Game),
             ("fit", PresentationScaling::Fit),
+            ("fit-sharp", PresentationScaling::FitSharp),
             ("fill", PresentationScaling::Fill),
             ("expand", PresentationScaling::Expand),
         ] {
@@ -357,6 +362,7 @@ mod tests {
             );
         }
         assert_eq!(PresentationScaling::Game.as_str(), "game");
+        assert_eq!(PresentationScaling::FitSharp.as_str(), "fit-sharp");
         assert!(PresentationScaling::parse("--scaling", "stretch").is_err());
     }
 
