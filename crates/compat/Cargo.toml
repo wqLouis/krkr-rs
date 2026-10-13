@@ -44,6 +44,9 @@ api = { workspace = true }
 
 [dev-dependencies]
 fs = { workspace = true }
+# Tests only: the shared `build_xp3` archive fixture (raw and zlib-index) so
+# the compat test binaries do not carry their own byte-for-byte copies.
+testkit = { workspace = true }
 # Tests only: cross-check the production `std`-based timestamp arithmetic in
 # `natives/debug.rs` against the C library's `gmtime_r`/`asctime_r` for the
 # same instant — "both must have the same behaviour" — without linking any

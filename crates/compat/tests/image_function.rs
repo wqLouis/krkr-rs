@@ -67,7 +67,12 @@ fn constructor_is_empty_and_the_static_surface_is_present() {
     let _lock = vm_lock();
     let env = Env::new();
     env.run("var f = new ImageFunction();");
-    // Every reference member is reachable on the class object.
+    // Reference: `ImageFunction`'s native members are registered in
+    // `reference/cpp/core/visual/ImageFunction.cpp` (`operateAffine`
+    // `:188-308`, `operateRect` `:310-406`, `operateStretch` `:408-529`,
+    // `flipLR` `:531-569`, `flipUD` `:571-609`, `adjustGamma` `:611-683`,
+    // `doBoxBlur` `:685-745`, `doGrayScale` `:747-785`, `fillRect` `:787-859`,
+    // `colorRect` `:861-965`, `drawText` `:967-1078`, `drawGlyph` `:1080-1179`).
     for member in [
         "operateAffine",
         "operateRect",
@@ -92,7 +97,8 @@ fn fill_rect_replaces_rgb_and_alpha_and_reports_the_region() {
     let _lock = vm_lock();
     let env = Env::new();
     env.run("var b = new Bitmap(4, 4);");
-    // `isalpha = true` is the reference `Fill` (a straight ARGB copy).
+    // `isalpha = true` is the reference `Fill` (a straight ARGB copy)
+    // (`reference/cpp/core/visual/ImageFunction.cpp:787-859`).
     env.run("var r = ImageFunction.fillRect(b, 0xff112233, new Rect(1, 1, 3, 3), true, null);");
     assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0);
     assert_eq!(env.eval_int("b.getPixel(1, 1)"), 0xff112233);
@@ -121,7 +127,8 @@ fn color_rect_mask_face_writes_the_alpha_channel() {
     let _lock = vm_lock();
     let env = Env::new();
     env.run("var b = new Bitmap(1, 1); b.setPixel(0, 0, 0xff102030);");
-    // `dfMask` replaces the alpha plane from the low byte (blue).
+    // `dfMask` replaces the alpha plane from the low byte (blue)
+    // (`reference/cpp/core/visual/ImageFunction.cpp:861-965`).
     env.run("ImageFunction.colorRect(b, 0x0000007f, 255, null, dfMask, null);");
     assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0x7f102030);
 }
@@ -131,6 +138,8 @@ fn color_rect_opaque_face_sets_rgb_and_holds_alpha() {
     let _lock = vm_lock();
     let env = Env::new();
     env.run("var b = new Bitmap(1, 1); b.setPixel(0, 0, 0x80112233);");
+    // `dfOpaque` holds the destination alpha
+    // (`reference/cpp/core/visual/ImageFunction.cpp:861-965`).
     env.run("ImageFunction.colorRect(b, 0xff445566, 255, null, dfOpaque, null);");
     assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0x80445566);
 }
@@ -145,6 +154,7 @@ fn flip_lr_mirrors_a_region_in_place() {
          b.setPixel(2, 0, 0xff000003); b.setPixel(3, 0, 0xff000004);",
     );
     env.run("ImageFunction.flipLR(b, new Rect(1, 0, 3, 1));");
+    // Reference: `flipLR` `reference/cpp/core/visual/ImageFunction.cpp:531-569`.
     assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0xff000001);
     assert_eq!(env.eval_int("b.getPixel(1, 0)"), 0xff000003);
     assert_eq!(env.eval_int("b.getPixel(2, 0)"), 0xff000002);
@@ -161,6 +171,7 @@ fn flip_ud_mirrors_the_full_bitmap() {
          b.setPixel(0, 2, 0xff000003);",
     );
     env.run("ImageFunction.flipUD(b, null);");
+    // Reference: `flipUD` `reference/cpp/core/visual/ImageFunction.cpp:571-609`.
     assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0xff000003);
     assert_eq!(env.eval_int("b.getPixel(0, 1)"), 0xff000002);
     assert_eq!(env.eval_int("b.getPixel(0, 2)"), 0xff000001);
@@ -186,6 +197,7 @@ fn do_gray_scale_uses_the_reference_luma() {
     // The reference luma is `(54*R + 183*G + 19*B) >> 8` and the packed
     // colour's low byte is blue (`tvpgl.h:1102-1103`), so pure red is
     // `(54*255) >> 8 == 53 == 0x35` (`tvpgl.cpp:10350-10400`).
+    // `doGrayScale` itself is `reference/cpp/core/visual/ImageFunction.cpp:747-785`.
     assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0xff353535);
 }
 
@@ -194,6 +206,7 @@ fn adjust_gamma_with_identity_data_is_a_no_op() {
     let _lock = vm_lock();
     let env = Env::new();
     env.run("var b = new Bitmap(1, 1); b.setPixel(0, 0, 0x80808080);");
+    // Identity gamma is a no-op (`reference/cpp/core/visual/ImageFunction.cpp:611-683`).
     env.run("ImageFunction.adjustGamma(b, 1.0, 0, 255, 1.0, 0, 255, 1.0, 0, 255, null, false);");
     assert_eq!(env.eval_int("b.getPixel(0, 0)"), 0x80808080);
 }
@@ -208,7 +221,8 @@ fn do_box_blur_averages_over_the_kernel() {
          b.setPixel(2, 0, 0xff000000);",
     );
     env.run("ImageFunction.doBoxBlur(b, 1, 0, null, true);");
-    // A 1x3 horizontal box average of (0, 255, 0) is 85 == 0x55.
+    // A 1x3 horizontal box average of (0, 255, 0) is 85 == 0x55
+    // (`reference/cpp/core/visual/ImageFunction.cpp:685-745`).
     assert_eq!(env.eval_int("b.getPixel(1, 0)"), 0xff555555);
 }
 
@@ -220,7 +234,8 @@ fn operate_rect_copies_a_source_region() {
         "var dst = new Bitmap(2, 2); var src = new Bitmap(1, 1); \
          src.setPixel(0, 0, 0xff112233);",
     );
-    // `omOpaque` + `dfOpaque` is the reference `bmCopy` (alpha included).
+    // `omOpaque` + `dfOpaque` is the reference `bmCopy` (alpha included)
+    // (`reference/cpp/core/visual/ImageFunction.cpp:310-406`).
     env.run(
         "ImageFunction.operateRect(dst, 1, 1, src, null, null, omOpaque, dfOpaque, 255, false);",
     );
@@ -240,6 +255,7 @@ fn operate_stretch_scales_into_the_destination_rect() {
         "ImageFunction.operateStretch(dst, src, new Rect(0, 0, 2, 2), new Rect(0, 0, 1, 1), \
          null, omOpaque, dfOpaque, 255, 0, false);",
     );
+    // Reference: `operateStretch` `reference/cpp/core/visual/ImageFunction.cpp:408-529`.
     for (x, y) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
         assert_eq!(env.eval_int(&format!("dst.getPixel({x}, {y})")), 0xff00ff00);
     }
@@ -253,7 +269,8 @@ fn operate_affine_points_mode_maps_the_source_quad() {
         "var dst = new Bitmap(2, 2); var src = new Bitmap(1, 1); \
          src.setPixel(0, 0, 0xffff0000);",
     );
-    // The source rect's LT/RT/LB corners map to (0,0)/(2,0)/(0,2).
+    // The source rect's LT/RT/LB corners map to (0,0)/(2,0)/(0,2)
+    // (`reference/cpp/core/visual/ImageFunction.cpp:188-308`).
     env.run(
         "ImageFunction.operateAffine(dst, src, 0, 0, 2, 0, 0, 2, null, null, false, \
          omOpaque, dfOpaque, 255, 0, false);",

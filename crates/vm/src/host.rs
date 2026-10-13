@@ -324,6 +324,31 @@ impl VmHost {
     /// returning, so it is ready to [`exec`](Self::exec) and
     /// [`tick`](Self::tick).
     pub fn new(registry: PluginRegistry) -> Result<Self, VmError> {
+        Self::new_with_services(registry, |_| {})
+    }
+
+    /// Create a host with the built-in plugin registry, attaching L2 service
+    /// handles before the compat surface is installed.
+    ///
+    /// A plugin may read an L2 service while it registers (the `xp3filter`
+    /// plugin reads `xp3filter.tjs` through the storage), so the handles must
+    /// be attached before [`CompatHost::install`] runs — the same order
+    /// [`CompatHost::services_mut`] documents. [`Self::with_default`] and
+    /// [`Self::new`] attach nothing.
+    pub fn with_default_services(
+        attach: impl FnOnce(&mut compat::CompatServices),
+    ) -> Result<Self, VmError> {
+        Self::new_with_services(PluginRegistry::builtin(), attach)
+    }
+
+    /// Create a host with the given plugin registry, attaching L2 service
+    /// handles through `attach` before the compat surface is installed.
+    ///
+    /// See [`Self::with_default_services`].
+    pub fn new_with_services(
+        registry: PluginRegistry,
+        attach: impl FnOnce(&mut compat::CompatServices),
+    ) -> Result<Self, VmError> {
         // The dedup state is boxed first so its address is stable for the log
         // callback and it outlives the engine on every exit path.
         let mut log_dedup = Box::new(LogDedup::default());
@@ -342,6 +367,7 @@ impl VmHost {
         let mut input = Box::new(InputState::new());
         let mut timer = Box::new(TimerState::new());
         let mut compat = CompatHost::with_registry(registry);
+        attach(compat.services_mut());
         compat.install(&engine)?;
         // SAFETY: `input`/`timer` live for the whole `VmHost` and no reference to
         // them escapes past its drop; the binding is removed first.

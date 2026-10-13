@@ -230,14 +230,24 @@ fn font_metrics_without_a_font_source_do_not_fabricate_a_metric() {
     let env = Env::new(None);
     env.run("var f = new Font('Ghost', 16, 0);");
 
-    // There is no storage to load a face from. A host with no matching
-    // installed font raises a typed error rather than returning a fabricated
-    // metric; a host whose CJK fallback matches resolves it. Either is a
-    // valid, non-fabricated outcome.
+    // There is no storage to load a face from. Whether the host has any
+    // usable face at all is host-dependent: the resolver tries the
+    // `System.addFont` registry, the storage, the installed system fonts, the
+    // well-known Noto CJK paths and finally the engine's first registered
+    // face (`crates/compat/src/resource.rs`'s `resolve_face`). A host with a
+    // fallback resolves it; a host with no font at all raises the resolver's
+    // no-face error. Pin both exact outcomes so a fabricated `0`, a
+    // non-integer or a different error fails.
     match env.eval("f.getTextWidth('x')") {
-        Ok(TjsValue::Integer(width)) => assert!(width > 0, "fallback width should be positive"),
+        Ok(TjsValue::Integer(width)) => assert!(
+            width > 0,
+            "a resolved fallback must have positive width, got {width}"
+        ),
         Ok(other) => panic!("unexpected result: {other:?}"),
-        Err(message) => assert!(!message.is_empty(), "empty error message"),
+        Err(message) => assert!(
+            message.contains("no font is available for face 'Ghost'"),
+            "a missing face must raise the resolver's no-face error, got: {message}"
+        ),
     }
 }
 
@@ -403,53 +413,86 @@ fn font_map_prerendered_font_raises_the_reference_header_errors() {
     assert_eq!(env.eval_int("f.height"), 16);
 }
 
-/// Reference: `tTVPPrerenderedFont`'s constructor reads the whole file and
-/// keeps it (`reference/cpp/core/visual/PrerenderedFont.cpp:9-76`). This port
-/// validates the fixed header at map time and defers the glyph body, so a
-/// startup-shaped run of 24 mappings reads 24 header prefixes and no glyph
-/// payload.
+/// Reference: a mapped `.tft` supplies each character's `Inc` and
+/// `GetTextSize` sums them
+/// (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:1435-1473`). Mapping
+/// many fonts in one run must serve every one of them, so this maps 24 fonts
+/// and asserts each one measures its own `Inc`. The port reads the glyph body
+/// lazily where the reference reads the whole file at map time
+/// (`reference/cpp/core/visual/PrerenderedFont.cpp:9-76`), so only the
+/// retrievable metric is pinned — a lazy reader that never loaded a glyph no
+/// longer passes.
 #[test]
-fn font_prerendered_map_reads_only_the_header() {
+fn font_prerendered_map_serves_each_mapped_font() {
     let _lock = vm_lock();
+    let Some((font_dir, font_name)) = test_font() else {
+        return;
+    };
+    let font_bytes = std::fs::read(font_dir.join(&font_name)).expect("read test font");
     let env = common::Env::with_storage();
     let game_dir = env.game_dir().expect("game dir").clone();
+    std::fs::write(game_dir.join("Pre"), &font_bytes).expect("write face");
     for i in 0..24u16 {
         std::fs::write(
             game_dir.join(format!("f{i}.tft")),
-            build_tft(&[b'A' as u16 + i], 100),
+            build_tft(&[b'A' as u16], 100 + i as i16),
         )
         .expect("write tft");
     }
-    env.run(
-        "for (var i = 0; i < 24; i = i + 1) { \
-             var f = new Font('Ghost', i + 1, 0); \
-             f.mapPrerenderedFont('f' + i + '.tft'); \
-         }",
-    );
-    let storage = env.storage().expect("storage");
-    // 24 mappings, a 36-byte header prefix each, no glyph payload.
-    assert_eq!(storage.read_bytes(), 24 * 36);
+    env.run("var w = new Window(); var l = new Layer(w, null);");
+    for i in 0..24u16 {
+        let height = i + 1;
+        env.run(&format!(
+            "var f = new Font('Pre', {height}, 0); \
+             f.mapPrerenderedFont('f{i}.tft'); \
+             l.font.face = 'Pre'; \
+             l.font.height = {height}; \
+             l.font.bold = false; \
+             l.font.italic = false; \
+             l.font.angle = 0;"
+        ));
+        assert_eq!(
+            env.eval_int("l.font.getTextWidth('A')"),
+            i64::from(100 + i as i16),
+            "font {i} should measure the `Inc` from its own `.tft`"
+        );
+    }
 }
 
 /// Reference: `TVPMapPrerenderedFont` reuses the `tTVPPrerenderedFont` already
 /// in `TVPPrerenderedFonts` for the same placed path and `AddRef`s it instead
 /// of reading again (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:129-147`).
+/// The port's read counter is an internal detail, so this pins the observable
+/// consequence: two font keys mapped to the same `.tft` both measure its
+/// `Inc` from the shared body.
 #[test]
-fn font_prerendered_remap_reads_nothing() {
+fn font_prerendered_remap_serves_both_mappings() {
     let _lock = vm_lock();
+    let Some((font_dir, font_name)) = test_font() else {
+        return;
+    };
+    let font_bytes = std::fs::read(font_dir.join(&font_name)).expect("read test font");
     let env = common::Env::with_storage();
     let game_dir = env.game_dir().expect("game dir").clone();
-    std::fs::write(game_dir.join("sample.tft"), build_tft(&[b'A' as u16], 100)).expect("write tft");
-    env.run(
-        "var f1 = new Font('Ghost', 12, 0); \
-         f1.mapPrerenderedFont('sample.tft');",
-    );
-    assert_eq!(env.storage().expect("storage").read_bytes(), 36);
-    env.run(
-        "var f2 = new Font('Ghost', 16, 0); \
-         f2.mapPrerenderedFont('sample.tft');",
-    );
-    assert_eq!(env.storage().expect("storage").read_bytes(), 36);
+    std::fs::write(game_dir.join("Pre"), &font_bytes).expect("write face");
+    std::fs::write(game_dir.join("sample.tft"), build_tft(&[b'A' as u16], 7)).expect("write tft");
+    env.run("var w = new Window(); var l = new Layer(w, null);");
+    for height in [12i16, 16] {
+        env.run(&format!(
+            "var f = new Font('Pre', {height}, 0); \
+             f.mapPrerenderedFont('sample.tft'); \
+             l.font.face = 'Pre'; \
+             l.font.height = {height}; \
+             l.font.bold = false; \
+             l.font.italic = false; \
+             l.font.angle = 0;"
+        ));
+        assert_eq!(
+            env.eval_int("l.font.getTextWidth('A')"),
+            7,
+            "height {height} should measure the shared `.tft`'s `Inc`"
+        );
+    }
 }
 
 /// Reference: `tTVPNativeBaseBitmap::DrawTextMultiple` writes each character's

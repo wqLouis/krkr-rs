@@ -201,3 +201,17 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
     }
     Ok(())
 }
+
+/// Completes the deferred, service-dependent half of plugin registration.
+///
+/// A plugin can only read an L2 service at registration when that service is
+/// already attached. The composition root attaches the storage after
+/// [`CompatHost::install`](crate::CompatHost::install), so this runs from
+/// [`CompatHost::begin_native_timing`](crate::CompatHost::begin_native_timing)
+/// before the startup scripts read anything. Idempotent.
+pub fn activate_deferred(
+    engine: &tjs::Tjs2Engine,
+    services: &crate::CompatServices,
+) -> Result<(), CompatError> {
+    xp3_filter::activate(engine, services)
+}

@@ -28,10 +28,18 @@
 //! and executes it in a **dedicated sub-engine** whose global scope holds only
 //! `Debug`/`System`/`Storages` (`xp3filter.cpp:552-559`, `:394-421`), so
 //! nothing the filter script declares is visible to the game script. The port
-//! reads the source during native registration (a read failure is returned to
-//! [`CompatHost`](crate::CompatHost) as a registration error), and executes it
-//! on the first archive read, once the engine → context binding the setters
-//! need is live. The shared engine cannot expose a second global, so the
+//! reads the source through the L2 storage at registration when the storage
+//! is already attached (a read failure is returned to
+//! [`CompatHost`](crate::CompatHost) as a registration error); when the
+//! composition root attaches the storage after registration, the read and the
+//! seam install are completed at
+//! [`CompatHost::begin_native_timing`](crate::CompatHost), which runs before
+//! the startup sequence. That completion reports the not-yet-attached storage
+//! as its own state (`ScriptLookup::StorageNotAttached` /
+//! `SeamInstall::StorageNotAttached`), never as an absent script. The script
+//! executes on the first archive read, once
+//! the engine → context binding the setters need is live. The shared engine
+//! cannot expose a second global, so the
 //! source is wrapped in a named local function: its declarations stay local to
 //! the filter script — the same isolation the sub-engine provides for
 //! top-level `function`/`var`. A function *expression* cannot host the
@@ -108,9 +116,15 @@ struct Xp3FilterState {
     /// The retained buffer `xor` helper attached to each marshalled segment
     /// (`reference/cpp/plugins/xp3filter.cpp:266-297`).
     buffer_xor: Option<DetachedValue>,
-    /// The `xp3filter.tjs` source read during registration, awaiting
-    /// execution on the first archive read (the reference reads in the
-    /// post-registration callback and executes in the decoder on first use,
+    /// Whether the L2 extraction-filter seam is installed on the attached
+    /// storage.
+    seam_installed: bool,
+    /// Whether the `xp3filter.tjs` file read has run (once the L2 storage is
+    /// attached).
+    script_read: bool,
+    /// The `xp3filter.tjs` source, awaiting execution on the first archive
+    /// read (the reference reads in the post-registration callback and
+    /// executes in the decoder on first use,
     /// `reference/cpp/plugins/xp3filter.cpp:552-559`, `:418`).
     pending_script: Option<String>,
     /// Whether `xp3filter.tjs` has been executed (or a filter was installed
@@ -162,24 +176,15 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
         properties: vec![],
     })?;
 
-    // The reference's `CBinaryAccessor` exposes an `xor` helper over the
-    // buffer (`reference/cpp/plugins/xp3filter.cpp:266-297`); the helper is
-    // attached as an own member of each marshalled buffer object rather than
-    // registered on the core `Array` class.
-    install_storage_filter(ctx);
-
-    // Read the configuration script during registration, matching the
-    // reference `PostRegistCallback` (`reference/cpp/plugins/xp3filter.cpp:552-559`):
-    // a read failure rethrows. The script is executed on the first archive
-    // read, once the engine → context binding is live (the reference's
-    // `AddXP3Decoder`, `:418`), because the setters need that binding.
+    // SAFETY: registration runs on the bound, live engine.
+    let engine = unsafe { ctx.engine() };
     // SAFETY: the caller holds the live services.
     let services = unsafe { ctx.services() };
+
     // The reference's `CBinaryAccessor` carries the `xor` helper; the port
     // retains a script helper once and attaches it to each marshalled buffer
     // as an own member (`reference/cpp/plugins/xp3filter.cpp:266-297`).
-    // SAFETY: registration runs on the bound, live engine.
-    match unsafe { ctx.engine() }.eval_retained(BUFFER_XOR_HELPER, "xp3_filter") {
+    match engine.eval_retained(BUFFER_XOR_HELPER, "xp3_filter") {
         Ok(RetainedValue::Object(helper)) => {
             services.state::<Xp3FilterState>().buffer_xor = Some(helper);
         }
@@ -194,19 +199,86 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
             )));
         }
     }
-    match read_filter_script(services) {
-        Ok(Some(text)) => services.state::<Xp3FilterState>().pending_script = Some(text),
-        Ok(None) => {}
-        Err(error) => return Err(CompatError::Register(format!("xp3_filter: {error}"))),
+
+    // The reference reads `xp3filter.tjs` from the application path in its
+    // post-registration callback (`reference/cpp/plugins/xp3filter.cpp:550-564`).
+    // The L2 storage is that path here; when it is attached this installs the
+    // seam and reads the script now.
+    activate(engine, services)?;
+
+    // A harness that registers with the binding already live can execute the
+    // pending script immediately; otherwise the first archive read executes it.
+    if binding::resolve(engine.raw()).is_some() {
+        execute_pending_script(engine, services)
+            .map_err(|error| CompatError::Register(format!("xp3_filter: {error}")))?;
+    }
+    Ok(())
+}
+
+/// The outcome of looking for `xp3filter.tjs`.
+///
+/// The not-yet-attached state is kept distinct from a genuine absence: a
+/// caller must not report "no script" when no read was possible.
+enum ScriptLookup {
+    /// The L2 storage is not attached yet, so no read was attempted.
+    StorageNotAttached,
+    /// The storage was searched and holds no `xp3filter.tjs`.
+    Absent,
+    /// The storage returned the script source.
+    Found(String),
+}
+
+/// The outcome of installing the L2 extraction-filter seam.
+enum SeamInstall {
+    /// The seam is installed (or was already installed).
+    Installed,
+    /// The L2 storage is not attached yet, so there is nothing to install on.
+    StorageNotAttached,
+}
+
+/// Install the extraction-filter seam and read `xp3filter.tjs` once the L2
+/// storage is attached.
+///
+/// Idempotent, and reports "the storage is not attached yet" as its own state
+/// rather than folding it into "no script". The reference does this in its
+/// post-registration callback before the game runs
+/// (`reference/cpp/plugins/xp3filter.cpp:550-564`); a composition root that
+/// attaches the storage after [`register`] completes it at
+/// [`CompatHost::begin_native_timing`](crate::CompatHost).
+pub fn activate(engine: &Tjs2Engine, services: &CompatServices) -> Result<(), CompatError> {
+    if !services.state::<Xp3FilterState>().script_read {
+        match read_filter_script(services) {
+            Ok(ScriptLookup::StorageNotAttached) => {
+                log::debug!(
+                    "xp3_filter: deferred: L2 storage not attached yet; {FILTER_SCRIPT} not looked for"
+                );
+                return Ok(());
+            }
+            Ok(ScriptLookup::Found(text)) => {
+                log::info!(
+                    "xp3_filter: {FILTER_SCRIPT} loaded ({} bytes); archive content is filtered",
+                    text.len()
+                );
+                services.state::<Xp3FilterState>().pending_script = Some(text);
+                services.state::<Xp3FilterState>().script_read = true;
+            }
+            Ok(ScriptLookup::Absent) => {
+                log::info!(
+                    "xp3_filter: {FILTER_SCRIPT} not found; archive content is not filtered"
+                );
+                services.state::<Xp3FilterState>().script_read = true;
+            }
+            Err(error) => return Err(CompatError::Register(format!("xp3_filter: {error}"))),
+        }
     }
 
-    // A harness that registers with the binding already installed can execute
-    // immediately.
-    // SAFETY: registration runs on the bound, live engine.
-    if binding::resolve(unsafe { ctx.engine() }.raw()).is_some() {
-        // SAFETY: the same bound, live engine.
-        execute_pending_script(unsafe { ctx.engine() }, services)
-            .map_err(|error| CompatError::Register(format!("xp3_filter: {error}")))?;
+    match install_storage_filter(engine, services) {
+        SeamInstall::Installed => {}
+        SeamInstall::StorageNotAttached => {
+            log::debug!(
+                "xp3_filter: deferred: L2 storage not attached; extraction-filter seam not installed"
+            );
+        }
     }
     Ok(())
 }
@@ -216,16 +288,16 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
 ///
 /// The closure captures the stable addresses of the live engine and
 /// [`CompatServices`] rather than the binding, so it can be installed during
-/// registration before the binding exists.
-fn install_storage_filter(ctx: &CompatCtx) {
-    // SAFETY: registration runs on the bound, live engine.
-    let engine = unsafe { ctx.engine() };
-    let engine_ptr = engine as *const Tjs2Engine as usize;
-    // SAFETY: the caller holds the live services.
-    let services = unsafe { ctx.services() };
+/// registration before the binding exists. A missing storage is reported, not
+/// swallowed.
+fn install_storage_filter(engine: &Tjs2Engine, services: &CompatServices) -> SeamInstall {
     let Some(storage) = services.storage() else {
-        return;
+        return SeamInstall::StorageNotAttached;
     };
+    if services.state::<Xp3FilterState>().seam_installed {
+        return SeamInstall::Installed;
+    }
+    let engine_ptr = engine as *const Tjs2Engine as usize;
     let services_ptr = services as *const CompatServices as usize;
     let filter = Box::new(
         move |file_hash: u32,
@@ -250,28 +322,32 @@ fn install_storage_filter(ctx: &CompatCtx) {
     );
     // SAFETY: the host keeps the attached storage alive for the VM lifetime.
     unsafe { &mut *storage }.xp3_extraction_filter = Some(filter);
+    services.state::<Xp3FilterState>().seam_installed = true;
+    log::debug!("xp3_filter: XP3 extraction-filter seam installed");
+    SeamInstall::Installed
 }
 
 /// Read and decode `<app>/xp3filter.tjs` through the storage namespace.
 ///
 /// A missing script is not an error (the reference only loads it when
 /// present); any other read failure is returned so registration can report it
-/// (`reference/cpp/plugins/xp3filter.cpp:553-559`).
-fn read_filter_script(services: &CompatServices) -> Result<Option<String>, String> {
+/// (`reference/cpp/plugins/xp3filter.cpp:553-559`). The not-yet-attached
+/// storage is a third, distinct state.
+fn read_filter_script(services: &CompatServices) -> Result<ScriptLookup, String> {
     let Some(storage) = services.storage() else {
-        return Ok(None);
+        return Ok(ScriptLookup::StorageNotAttached);
     };
     // SAFETY: the host keeps the attached storage alive for the binding.
     let storage = unsafe { &*storage };
     let bytes = match storage.read(FILTER_SCRIPT) {
         Ok(bytes) => bytes,
-        Err(StorageReadError::NotFound(_)) => return Ok(None),
+        Err(StorageReadError::NotFound(_)) => return Ok(ScriptLookup::Absent),
         Err(error) => return Err(format!("could not read {FILTER_SCRIPT}: {error}")),
     };
-    crate::text::decode_text(&bytes, crate::text::TextEncoding::Detect).map(Some)
+    crate::text::decode_text(&bytes, crate::text::TextEncoding::Detect).map(ScriptLookup::Found)
 }
 
-/// Execute the `xp3filter.tjs` source read at registration.
+/// Execute the `xp3filter.tjs` source read once the storage is attached.
 ///
 /// The source is wrapped in a named function declaration, called, and the
 /// wrapper deleted so top-level declarations stay local to the filter script,
@@ -292,9 +368,9 @@ fn execute_filter_script(engine: &Tjs2Engine, text: &str) -> Result<(), String> 
         .map_err(|error| error.to_string())
 }
 
-/// Execute the script read during registration, exactly once. A `None` means
-/// the application shipped no `xp3filter.tjs` (the reference only loads it
-/// when present).
+/// Execute the script read (at registration or deferred activation), exactly
+/// once. A `None` means the application shipped no `xp3filter.tjs` (the
+/// reference only loads it when present).
 fn execute_pending_script(engine: &Tjs2Engine, services: &CompatServices) -> Result<(), String> {
     // Take the source out before matching: a `match` scrutinee temporary
     // lives for the whole match, so binding it first drops the state borrow
@@ -679,4 +755,21 @@ fn set_filter(
     }
     set_void(out);
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A storage that is not attached yet must be its own state, never folded
+    // into "the script is absent": otherwise a caller cannot tell a genuine
+    // miss from a read that was not yet possible.
+    #[test]
+    fn no_storage_is_not_the_same_as_an_absent_script() {
+        let services = CompatServices::new();
+        assert!(matches!(
+            read_filter_script(&services),
+            Ok(ScriptLookup::StorageNotAttached)
+        ));
+    }
 }

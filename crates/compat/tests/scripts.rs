@@ -4,9 +4,7 @@
 //! `dump` and the `textEncoding` property are exercised against a bound VM.
 //! The storage-backed members (`execStorage` / `evalStorage` /
 //! `compileStorage`) are verified to require an attached L2 storage; their
-//! end-to-end resolution is covered by the L2 `engine` tests, because the
-//! `fs` crate needed to build a [`engine::Storage`] is not a dependency of
-//! `compat`.
+//! end-to-end resolution is covered by the L2 `engine` tests.
 
 mod common;
 
@@ -58,6 +56,8 @@ fn raw_exec_and_eval_run_in_the_vm() {
     let _lock = vm_lock();
     let env = Env::new();
 
+    // Reference: `Scripts.exec`/`Scripts.eval` compile and run the given text
+    // (`reference/cpp/core/base/ScriptMgnIntf.cpp:1385-1438`).
     assert_eq!(env.eval_ok("Scripts.eval('6 * 7')"), TjsValue::Integer(42));
     assert_eq!(
         env.eval_ok("Scripts.eval(\"'a' + 'b'\")"),
@@ -79,7 +79,8 @@ fn raw_exec_and_eval_run_in_the_vm() {
 fn eval_returns_a_callable_object() {
     let _lock = vm_lock();
     let env = Env::new();
-    // The Action.tjs pattern: evaluate an action string and call the result.
+    // The Action.tjs pattern: evaluate an action string and call the result
+    // (`reference/cpp/core/base/ScriptMgnIntf.cpp:1412-1438`).
     env.engine
         .exec_script("var action = 'function(a, b) { return a * b; }';", "test")
         .unwrap();
@@ -103,6 +104,9 @@ fn set_call_missing_installs_a_handler() {
     let _ = env.eval("o.absentMember");
     assert_eq!(env.eval_ok("probe"), TjsValue::String(String::new()));
 
+    // Reference: `Scripts.setCallMissing` sets the object's
+    // `TJS_CII_SET_MISSING` info to the `missing` member
+    // (`reference/cpp/core/base/ScriptMgnIntf.cpp:1474-1496`).
     assert_eq!(env.eval_ok("Scripts.setCallMissing(o)"), TjsValue::Void);
 
     // After enabling it, an absent member read routes through `missing`.
@@ -124,6 +128,9 @@ fn set_call_missing_installs_a_handler() {
 fn get_class_names_returns_the_object_class_chain() {
     let _lock = vm_lock();
     let env = Env::new();
+    // Reference: `Scripts.getClassNames` walks `TJS_CII_GET` class info into
+    // an array, most-derived class first
+    // (`reference/cpp/core/base/ScriptMgnIntf.cpp:1497-1535`).
     assert_eq!(
         env.eval_ok(
             "(function(){ var p = new Array(); var n = Scripts.getClassNames(p); return n[0]; })()"
@@ -145,6 +152,8 @@ fn get_trace_string_and_dump_run() {
         env.eval_ok("Scripts.getTraceString()"),
         TjsValue::String(_)
     ));
+    // Reference: `Scripts.getTraceString`/`Scripts.dump`
+    // (`reference/cpp/core/base/ScriptMgnIntf.cpp:1440-1461`).
     assert_eq!(env.eval_ok("Scripts.dump()"), TjsValue::Void);
 }
 
@@ -153,6 +162,9 @@ fn text_encoding_property_round_trips_through_dispatch_state() {
     let _lock = vm_lock();
     let env = Env::new();
 
+    // Reference: `Scripts.textEncoding` reads/writes
+    // `TVPGetDefaultReadEncoding`/`TVPSetDefaultReadEncoding`
+    // (`reference/cpp/core/base/ScriptMgnIntf.cpp:1537-1549`).
     // Default reports UTF-8, like `TVPGetDefaultReadEncoding`.
     assert_eq!(
         env.eval_ok("Scripts.textEncoding"),
@@ -164,7 +176,8 @@ fn text_encoding_property_round_trips_through_dispatch_state() {
         TjsValue::String("no-such-encoding".into())
     );
     // The `sjis` alias maps to `cp932` (reference
-    // `TVPSetDefaultReadEncoding`, `base/TextStream.cpp:418-430`).
+    // `TVPSetDefaultReadEncoding`,
+    // `reference/cpp/core/base/TextStream.cpp:418-430`).
     env.eval_ok("Scripts.textEncoding = 'SJIS'");
     assert_eq!(
         env.eval_ok("Scripts.textEncoding"),
@@ -187,7 +200,8 @@ fn raw_exec_and_eval_honour_context_and_lineofs() {
     // While `outputErrorLogOnEval` is at its default `true`, `windowEx`'s
     // `Scripts.eval` override delegates to the core eval, so `context` (the
     // fourth argument) becomes the evaluation `this`
-    // (`WindowEx.cpp:1542-1547`, `ScriptMgnIntf.cpp:1385-1438`).
+    // (`reference/cpp/plugins/windowEx.cpp:1542-1547`,
+    // `reference/cpp/core/base/ScriptMgnIntf.cpp:1385-1438`).
     assert_eq!(
         env.eval_ok("Scripts.eval('this.x', '', 0, c)"),
         TjsValue::Integer(5)
@@ -199,7 +213,7 @@ fn raw_exec_and_eval_honour_context_and_lineofs() {
     assert_eq!(env.eval_ok("c.x"), TjsValue::Integer(9));
 
     // `lineofs` (third argument) shifts the reported source line
-    // (`ScriptMgnIntf.cpp:1390-1396`).
+    // (`reference/cpp/core/base/ScriptMgnIntf.cpp:1390-1396`).
     let line_of = |message: &str| -> i64 {
         let start = message.find("blk(").expect("the block name is reported") + 4;
         let end = message[start..]
@@ -215,7 +229,7 @@ fn raw_exec_and_eval_honour_context_and_lineofs() {
     assert_eq!(line_of(&shifted) - line_of(&base), 10, "{shifted}");
 
     // A present, non-object context raises the variant conversion error
-    // (`tjsVariant.h:694-699`).
+    // (`reference/cpp/core/tjs2/tjsVariant.h:694-699`).
     assert!(env.eval("Scripts.eval('1', null, null, 42)").is_err());
 }
 
@@ -229,12 +243,12 @@ fn stored_scripts_honour_context_and_use_the_storage_basename() {
     std::fs::write(dir.join("data/boom.tjs"), b"1 +").unwrap();
 
     // `execStorage`'s third argument is the script's `this`
-    // (`ScriptMgnIntf.cpp:1314-1354,704-811`).
+    // (`reference/cpp/core/base/ScriptMgnIntf.cpp:1314-1354,704-811`).
     env.run("var ctx = %[]; Scripts.execStorage('data/ctx.tjs', '', ctx);");
     assert_eq!(env.eval_ok("ctx.x"), TjsValue::Integer(7));
 
     // The block name is `TVPExtractStorageName` of the placed path, not the
-    // full storage name (`ScriptMgnIntf.cpp:720,782`).
+    // full storage name (`reference/cpp/core/base/ScriptMgnIntf.cpp:720,782`).
     let error = env.error("Scripts.execStorage('data/boom.tjs')");
     assert!(error.contains("boom.tjs("), "error: {error}");
     assert!(!error.contains("data/boom.tjs("), "error: {error}");
@@ -244,6 +258,9 @@ fn stored_scripts_honour_context_and_use_the_storage_basename() {
 fn storage_backed_members_require_an_attached_storage() {
     let _lock = vm_lock();
     let env = Env::new();
+    // Reference: the storage-backed members resolve through
+    // `TVPExecuteStorage` and require a storage
+    // (`reference/cpp/core/base/ScriptMgnIntf.cpp:1314-1383`).
     for expression in [
         "Scripts.execStorage('x.tjs')",
         "Scripts.evalStorage('x.tjs')",
@@ -261,6 +278,8 @@ fn storage_backed_members_require_an_attached_storage() {
 fn missing_arguments_are_reported() {
     let _lock = vm_lock();
     let env = Env::new();
+    // Reference: each native returns `TJS_E_BADPARAMCOUNT` when a required
+    // argument is missing (`reference/cpp/core/base/ScriptMgnIntf.cpp:1314-1535`).
     for expression in [
         "Scripts.exec()",
         "Scripts.eval()",

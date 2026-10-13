@@ -72,6 +72,7 @@ fn decodes_real_images_and_probes_audio() {
     }
     assert!(!images.is_empty(), "game should ship some images");
     let mut decoded = 0usize;
+    let mut saw_non_uniform = false;
     for name in images.iter().take(8) {
         let bytes = storage.read(name).expect("read image");
         let image = decode_image(&media, &bytes, Some(name)).expect("decode image");
@@ -80,10 +81,24 @@ fn decodes_real_images_and_probes_audio() {
             image.rgba.len(),
             image.width as usize * image.height as usize * 4
         );
+        // A decoder returning a correctly sized but blank image would pass
+        // the checks above. Requiring at least one image with pixels that
+        // differ from the first proves the decode produced spatially varying
+        // content; it does not prove the pixels are reference-exact, which
+        // needs a committed reference asset to compare against (see the
+        // test-fidelity audit, F9).
+        let first = &image.rgba[..4];
+        if image.rgba.chunks_exact(4).any(|pixel| pixel != first) {
+            saw_non_uniform = true;
+        }
         decoded += 1;
     }
     println!("decoded {decoded} images");
     assert!(decoded > 0);
+    assert!(
+        saw_non_uniform,
+        "at least one decoded image should have non-uniform pixels"
+    );
 
     // Audio: Ogg/Opus voices and BGM.
     let mut audio = storage.file_list("*.ogg", 0).expect("list ogg");

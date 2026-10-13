@@ -107,7 +107,29 @@ impl CompatHost {
     /// state and the window is closed again before the first frame, so the
     /// frame path is never timed.
     pub fn begin_native_timing(&self) {
+        self.activate_deferred_plugins();
         crate::natives::begin_native_timing(self.services.as_ref());
+    }
+
+    /// Completes the plugin work that needed an L2 service not yet attached
+    /// when [`Self::install`] ran.
+    ///
+    /// The `xp3filter` plugin reads `xp3filter.tjs` through the storage while
+    /// it registers; a composition root that attaches the storage after
+    /// installing leaves that read pending until here. Idempotent and a no-op
+    /// once the work has run.
+    fn activate_deferred_plugins(&self) {
+        if !self.bound {
+            return;
+        }
+        // SAFETY: `bound` guarantees the stored engine/services addresses are
+        // live.
+        let engine = unsafe { &*(self.engine as *const Tjs2Engine) };
+        if let Err(error) =
+            crate::natives::plugins::activate_deferred(engine, self.services.as_ref())
+        {
+            log::warn!("deferred plugin activation: {error}");
+        }
     }
 
     /// Closes the per-native dispatch-timing window and emits the one report

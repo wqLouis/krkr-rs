@@ -9,7 +9,7 @@ use api::error::FsError;
 use api::fs::{FsPath, OpenMode};
 use fs::xp3::{SEGM_ENCODE_RAW, XP3_MAGIC, Xp3Archive, Xp3Error, normalize_in_archive_name};
 use fs::{FileState, FileSystem};
-use testkit::build_xp3;
+use testkit::{build_xp3, build_xp3_compressed_index};
 
 #[test]
 fn normalize_names() {
@@ -190,6 +190,27 @@ fn parses_and_reads_valid_archive() {
         archive.read(&fs, &file, "missing.bin"),
         Err(Xp3Error::NotFound(_))
     ));
+}
+
+/// A zlib-compressed index block (`TVP_XP3_INDEX_ENCODE_ZLIB`) parses and
+/// its entries read like a raw-index archive. The reference reads the method
+/// from the low three bits of the flag byte, then an `i64` compressed size
+/// and an `i64` uncompressed size before the zlib stream
+/// (`reference/cpp/core/archive/xp3/XP3Archive.cpp:360-390`).
+#[test]
+fn parses_a_zlib_compressed_index() {
+    let xp3 = build_xp3_compressed_index(&[
+        ("plain.bin", b"raw bytes", false),
+        ("packed.bin", b"zlib segment payload", true),
+    ]);
+    let (fs, file) = fs_with(&xp3);
+    let archive = Xp3Archive::open(&fs, &file).expect("open compressed-index archive");
+    assert_eq!(archive.len(), 2);
+    assert_eq!(archive.read(&fs, &file, "plain.bin").unwrap(), b"raw bytes");
+    assert_eq!(
+        archive.read(&fs, &file, "packed.bin").unwrap(),
+        b"zlib segment payload"
+    );
 }
 
 /// A non-XP3 file is a typed `NotAnXp3` error, not an I/O surprise.

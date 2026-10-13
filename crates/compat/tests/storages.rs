@@ -3,9 +3,7 @@
 //! The L3 tests exercise the members that don't need a mounted L2 storage
 //! (the pure string helpers, the placed-path cache clear and the argument /
 //! "no storage attached" error paths). Storage-backed resolution itself is
-//! covered by the L2 `engine` tests; attaching a real [`engine::Storage`]
-//! here would require the `fs` crate, which is not a dependency of `compat`
-//! (and editing `Cargo.toml` is out of scope).
+//! covered by the L2 `engine` tests.
 
 mod common;
 
@@ -57,6 +55,12 @@ fn string_helpers_match_reference() {
     let _lock = vm_lock();
     let env = Env::new();
 
+    // Reference: the pure storage-string helpers in
+    // `reference/cpp/core/base/StorageIntf.cpp`: `TVPExtractStorageExt`
+    // `:775-805`, `TVPExtractStorageName` `:809-833` (the `>` archive
+    // delimiter breaks the name), `TVPExtractStoragePath` `:837-859`,
+    // `TVPChopStorageExt` `:863-887`; `getFullPath` is the
+    // `TVPNormalizeStorageName` native (`:1281-1292`, normalizer `:527`).
     assert_eq!(
         env.eval_ok("Storages.extractStorageName('data/x.tjs')"),
         TjsValue::String("x.tjs".into())

@@ -66,11 +66,32 @@ Files:
 * `crates/tjs/cpp/streams.cpp:534-621` — `TextWriteStream` (the port replacement
   for the reference `tTVPTextWriteStream`, `reference/cpp/core/base/TextStream.cpp`).
 * `crates/tjs/cpp/streams.cpp:546-566` — `write_raw` (zlib).
-* `crates/tjs/cpp/streams.cpp:568-621` — constructor: writes `FE FE <mode>` +
-  `FF FE` (`:600-604`), `deflateInit` (`:606`), then the two 64-bit
-  `compression_size_position` placeholders (`:617-619`).
+* `crates/tjs/cpp/streams.cpp` — constructor: writes the crypt header
+  (modes 0/1: `FE FE <mode> 00`, 4 bytes; mode 2: `FE FE 02` + `FF FE`,
+  5 bytes), `deflateInit`, then the two 64-bit `compression_size_position`
+  placeholders.
 * `crates/tjs/cpp/streams.cpp:623-656` — destructor patches the sizes.
 * `crates/tjs/cpp/streams.cpp:716-721` — `tjs2_wire_stream_factories`.
+
+### The reference's `FE FE` writer and reader disagree
+
+The reference reader starts a mode 0/1 payload at a fixed offset 4
+(`reference/cpp/core/base/TextStream.cpp:85-88`, `len = (size - 4) / 2`) and a
+mode 2 payload at offset 21 (`:104-116`). Its writer emits a 3-byte signature
+and then an unconditional `FF FE` BOM (`:269-280`), i.e. `FE FE <mode> FF FE`
+(5 bytes) for modes 1 and 2; `crypt_mode_sig[3] = 0` is declared but never
+written, so the fourth byte of that array is dead. Mode 2 is therefore
+self-consistent (both sides use 5) while mode 1 is not: the reference cannot
+read back its own mode 1 output. Mode 0 has no writer at all.
+
+The reader governs, because loading shipped data is what compatibility means,
+and the dead `crypt_mode_sig[3]` marks the writer as a reconstruction artifact
+(AGENTS §9.9). The port writes the 4-byte form for modes 0/1, so a port-written
+mode 1 stream is readable by the reference reader. No real mode 0/1 stream
+exists in the tree to check against: the fixtures in `crates/compat/tests/text.rs`
+and `crates/tjs/src/lib.rs` are port-generated, their plaintext being the
+literal `フィクスチャ`. The device log's `script read` line carries the first 32
+bytes and the container mode, so a real sample settles it.
 
 Why it can SIGSEGV:
 * The placeholders after the BOM are written **after** `deflateInit`. The

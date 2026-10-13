@@ -146,7 +146,8 @@ fn global_get_dir_list_lists_immediate_children() {
     let env = Env::new();
 
     // `dirlist.cpp` exposes `getDirList` as a global function; it returns the
-    // immediate child names (directories without a trailing slash).
+    // immediate child names (directories without a trailing slash)
+    // (`reference/cpp/plugins/dirlist.cpp:13-60`, registered at `:82`).
     assert_eq!(env.integer("getDirList('data/').count"), 3);
     let names = joined(&env, "getDirList('data/')");
     assert!(
@@ -166,6 +167,8 @@ fn global_get_dir_list_enforces_trailing_slash() {
     let env = Env::new();
 
     let message = env.error("getDirList('data')");
+    // Reference: the trailing-slash check throws before listing
+    // (`reference/cpp/plugins/dirlist.cpp:25-27`).
     assert!(message.contains("'/' must be specified"), "{message}");
 }
 
@@ -174,7 +177,8 @@ fn over_scoped_storages_members_are_not_registered() {
     let _lock = vm_lock();
     let env = Env::new();
 
-    // `dirlist` owns the global function only; it must not shadow the fstat
+    // `dirlist` owns the global function only
+    // (`reference/cpp/plugins/dirlist.cpp:82`); it must not shadow the fstat
     // surface with a `Storages.getDirList` extra.
     assert!(
         !env.defined("Storages.getDirList"),
@@ -183,7 +187,8 @@ fn over_scoped_storages_members_are_not_registered() {
 
     // `varfile.cpp` registers a `var://` storage media (no L2 seam yet), while
     // `xp3filter.cpp` installs managed XP3 filter callbacks — the setters are
-    // now registered.
+    // now registered
+    // (`reference/cpp/plugins/xp3filter.cpp:407-416`).
     assert!(
         env.defined("Storages.setXP3ArchiveExtractionFilter"),
         "xp3_filter must register the extraction-filter setter"

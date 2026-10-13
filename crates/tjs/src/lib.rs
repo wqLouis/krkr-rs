@@ -290,6 +290,7 @@ unsafe extern "C" {
     fn tjs2_exec_script(
         e: *mut Engine,
         script: *const c_char,
+        script_len: usize,
         name: *const c_char,
         context: *mut c_void,
         lineofs: c_int,
@@ -299,6 +300,7 @@ unsafe extern "C" {
     fn tjs2_eval(
         e: *mut Engine,
         expression: *const c_char,
+        expression_len: usize,
         name: *const c_char,
         context: *mut c_void,
         lineofs: c_int,
@@ -324,6 +326,7 @@ unsafe extern "C" {
     pub fn tjs2_compile_script(
         e: *mut Engine,
         script: *const c_char,
+        script_len: usize,
         output_path: *const c_char,
         isresult: c_int,
         outputdebug: c_int,
@@ -827,7 +830,9 @@ impl Tjs2Engine {
         context: *mut c_void,
         lineofs: i32,
     ) -> Result<TjsValue, TjsError> {
-        let script = CString::new(script).map_err(|_| TjsError("script contains NUL".into()))?;
+        // The script is handed over as a byte pointer and a length, so the
+        // wrapper does not cut it at a NUL. `name` is a diagnostic label and
+        // stays a NUL-terminated C string.
         let name = CString::new(name).map_err(|_| TjsError("name contains NUL".into()))?;
         let mut result = Value {
             ty: VAL_VOID,
@@ -844,7 +849,8 @@ impl Tjs2Engine {
         let rc = unsafe {
             tjs2_exec_script(
                 self.inner,
-                script.as_ptr(),
+                script.as_ptr().cast::<c_char>(),
+                script.len(),
                 name.as_ptr(),
                 context,
                 lineofs,
@@ -874,8 +880,7 @@ impl Tjs2Engine {
         context: *mut c_void,
         lineofs: i32,
     ) -> Result<TjsValue, TjsError> {
-        let expression =
-            CString::new(expression).map_err(|_| TjsError("expression contains NUL".into()))?;
+        // Length-aware hand-off, as in `exec_script_with_context`.
         let name = CString::new(name).map_err(|_| TjsError("name contains NUL".into()))?;
         let mut result = Value {
             ty: VAL_VOID,
@@ -892,7 +897,8 @@ impl Tjs2Engine {
         let rc = unsafe {
             tjs2_eval(
                 self.inner,
-                expression.as_ptr(),
+                expression.as_ptr().cast::<c_char>(),
+                expression.len(),
                 name.as_ptr(),
                 context,
                 lineofs,
@@ -977,7 +983,9 @@ impl Tjs2Engine {
         name: &str,
         lineofs: i32,
     ) -> Result<(), TjsError> {
-        let script = CString::new(script).map_err(|_| TjsError("script contains NUL".into()))?;
+        // The script bytes go over as a pointer and a length; the output
+        // path and the diagnostic name stay NUL-terminated C strings (a path
+        // is handed to the OS, and a name is a label).
         let output_path =
             CString::new(output_path).map_err(|_| TjsError("output path contains NUL".into()))?;
         let name = CString::new(name).map_err(|_| TjsError("name contains NUL".into()))?;
@@ -987,7 +995,8 @@ impl Tjs2Engine {
         let rc = unsafe {
             tjs2_compile_script(
                 self.inner,
-                script.as_ptr(),
+                script.as_ptr().cast::<c_char>(),
+                script.len(),
                 output_path.as_ptr(),
                 isresult as c_int,
                 outputdebug as c_int,
@@ -2275,6 +2284,112 @@ mod tests {
         let e = Tjs2Engine::new().unwrap();
         let v = e.eval("1 + 2 * 3", "test").unwrap();
         assert_eq!(v, TjsValue::Integer(7));
+    }
+
+    // The script/expression payload crosses the ABI as a byte range, so an
+    // interior NUL is not rejected by the wrapper. The VM copies the text as
+    // a NUL-terminated buffer (reference
+    // `reference/cpp/core/tjs2/tjsScriptBlock.cpp:198-263`), so the truncated
+    // prefix is what its lexer sees and the failure is a VM compile error, not
+    // a host-side rejection.
+    #[test]
+    fn interior_nul_reaches_the_vm_and_fails_there() {
+        let _vm_lock = vm_lock();
+        let e = Tjs2Engine::new().unwrap();
+        // The text before the NUL is an incomplete expression, so the VM
+        // raises a compile error under either truncation or direct lexing.
+        let err = e.eval("1 +\0 2", "nul-test").unwrap_err();
+        let message = err.to_string();
+        assert!(
+            !message.contains("contains NUL"),
+            "the ABI must not pre-reject the payload: {message}"
+        );
+        assert!(
+            message.contains("nul-test"),
+            "the block name must still label the VM error: {message}"
+        );
+    }
+
+    // The VM stores the block text as a NUL-terminated buffer
+    // (reference `reference/cpp/core/tjs2/tjsScriptBlock.cpp:198-263`), so an
+    // interior NUL is cut by the VM itself, not by the wrapper: the bytes
+    // after it are never lexed. This documents the representation limit the
+    // reference shares.
+    #[test]
+    fn interior_nul_is_cut_by_the_vm_not_the_wrapper() {
+        let _vm_lock = vm_lock();
+        let e = Tjs2Engine::new().unwrap();
+        assert_eq!(
+            e.eval("1 + 2\0 + 100", "cut-test").unwrap(),
+            TjsValue::Integer(3)
+        );
+    }
+
+    // A trailing NUL is the ordinary terminator of the VM's text buffer, so
+    // it does not change the executed script (reference
+    // `reference/cpp/core/tjs2/tjsScriptBlock.cpp:198-263`).
+    #[test]
+    fn trailing_nul_does_not_change_the_result() {
+        let _vm_lock = vm_lock();
+        let e = Tjs2Engine::new().unwrap();
+        assert_eq!(
+            e.eval("1 + 2\0", "trail-test").unwrap(),
+            TjsValue::Integer(3)
+        );
+    }
+
+    // The length hand-off must leave an ordinary script untouched.
+    #[test]
+    fn plain_script_is_unaffected_by_the_length_hand_off() {
+        let _vm_lock = vm_lock();
+        let e = Tjs2Engine::new().unwrap();
+        assert_eq!(
+            e.eval("1 + 2 * 3", "plain-expr").unwrap(),
+            TjsValue::Integer(7)
+        );
+        e.exec_script("var plainValue = 41; plainValue += 1;", "plain-script")
+            .expect("a plain script must execute");
+        assert_eq!(
+            e.eval("plainValue", "plain-read").unwrap(),
+            TjsValue::Integer(42)
+        );
+    }
+
+    // `compile_script` also takes the payload as a byte range; an interior NUL
+    // is left for the VM, not rejected here, and the normal compile is
+    // unaffected (reference `reference/cpp/core/tjs2/tjs.h:193-197`).
+    #[test]
+    fn compile_script_hands_an_interior_nul_to_the_vm() {
+        let _vm_lock = vm_lock();
+        let e = Tjs2Engine::new().unwrap();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "krkr-rs-tjs2-compile-nul-{}-{}.tjsb",
+            std::process::id(),
+            nanos
+        ));
+        let path_str = path.to_string_lossy().into_owned();
+
+        let err = e
+            .compile_script(
+                "var x = \0 1;",
+                &path_str,
+                false,
+                false,
+                false,
+                "nul-compile",
+                0,
+            )
+            .unwrap_err();
+        assert!(
+            !err.to_string().contains("contains NUL"),
+            "compile must not pre-reject the payload: {err}"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -3650,6 +3765,7 @@ var ra = a.get(); var rb = b.get();",
             tjs2_eval(
                 engine as *mut Engine,
                 script.as_ptr(),
+                script.to_bytes().len(),
                 c"reentrant".as_ptr(),
                 ptr::null_mut(),
                 0,
@@ -3698,6 +3814,7 @@ var ra = a.get(); var rb = b.get();",
             tjs2_eval(
                 engine as *mut Engine,
                 c"%[]".as_ptr(),
+                c"%[]".to_bytes().len(),
                 c"retainProp".as_ptr(),
                 ptr::null_mut(),
                 0,
@@ -3935,6 +4052,7 @@ var ra = a.get(); var rb = b.get();",
             tjs2_eval(
                 engine as *mut Engine,
                 c"%[]".as_ptr(),
+                c"%[]".to_bytes().len(),
                 c"arrayRet".as_ptr(),
                 ptr::null_mut(),
                 0,
@@ -5143,29 +5261,29 @@ var ra = a.get(); var rb = b.get();",
         "(const) %[ \"title\" => \"フィクスチャ\", \"scenario\" => \"01_01\", \"value\" => 42 ]";
 
     const FIXTURE_MODE0: &[u8] = &[
-        0xfe, 0xfe, 0x00, 0xff, 0xfe, 0x29, 0x28, 0x62, 0x62, 0x6e, 0x6e, 0x6f, 0x6e, 0x72, 0x72,
-        0x75, 0x74, 0x28, 0x28, 0x21, 0x20, 0x24, 0x24, 0x5a, 0x5a, 0x21, 0x20, 0x23, 0x22, 0x75,
-        0x74, 0x68, 0x68, 0x75, 0x74, 0x6d, 0x6c, 0x64, 0x64, 0x23, 0x22, 0x21, 0x20, 0x3c, 0x3c,
-        0x3f, 0x3e, 0x21, 0x20, 0x23, 0x22, 0xd4, 0xe4, 0xa2, 0x92, 0xae, 0x9e, 0xb8, 0x88, 0xc0,
-        0xf0, 0xe2, 0xd2, 0x23, 0x22, 0x2d, 0x2c, 0x21, 0x20, 0x23, 0x22, 0x72, 0x72, 0x62, 0x62,
-        0x64, 0x64, 0x6f, 0x6e, 0x60, 0x60, 0x73, 0x72, 0x68, 0x68, 0x6e, 0x6e, 0x23, 0x22, 0x21,
-        0x20, 0x3c, 0x3c, 0x3f, 0x3e, 0x21, 0x20, 0x23, 0x22, 0x31, 0x30, 0x30, 0x30, 0x5e, 0x5e,
-        0x31, 0x30, 0x30, 0x30, 0x23, 0x22, 0x2d, 0x2c, 0x21, 0x20, 0x23, 0x22, 0x77, 0x76, 0x60,
-        0x60, 0x6d, 0x6c, 0x74, 0x74, 0x64, 0x64, 0x23, 0x22, 0x21, 0x20, 0x3c, 0x3c, 0x3f, 0x3e,
-        0x21, 0x20, 0x35, 0x34, 0x33, 0x32, 0x21, 0x20, 0x5c, 0x5c,
+        0xfe, 0xfe, 0x00, 0x00, 0x29, 0x28, 0x62, 0x62, 0x6e, 0x6e, 0x6f, 0x6e, 0x72, 0x72, 0x75,
+        0x74, 0x28, 0x28, 0x21, 0x20, 0x24, 0x24, 0x5a, 0x5a, 0x21, 0x20, 0x23, 0x22, 0x75, 0x74,
+        0x68, 0x68, 0x75, 0x74, 0x6d, 0x6c, 0x64, 0x64, 0x23, 0x22, 0x21, 0x20, 0x3c, 0x3c, 0x3f,
+        0x3e, 0x21, 0x20, 0x23, 0x22, 0xd4, 0xe4, 0xa2, 0x92, 0xae, 0x9e, 0xb8, 0x88, 0xc0, 0xf0,
+        0xe2, 0xd2, 0x23, 0x22, 0x2d, 0x2c, 0x21, 0x20, 0x23, 0x22, 0x72, 0x72, 0x62, 0x62, 0x64,
+        0x64, 0x6f, 0x6e, 0x60, 0x60, 0x73, 0x72, 0x68, 0x68, 0x6e, 0x6e, 0x23, 0x22, 0x21, 0x20,
+        0x3c, 0x3c, 0x3f, 0x3e, 0x21, 0x20, 0x23, 0x22, 0x31, 0x30, 0x30, 0x30, 0x5e, 0x5e, 0x31,
+        0x30, 0x30, 0x30, 0x23, 0x22, 0x2d, 0x2c, 0x21, 0x20, 0x23, 0x22, 0x77, 0x76, 0x60, 0x60,
+        0x6d, 0x6c, 0x74, 0x74, 0x64, 0x64, 0x23, 0x22, 0x21, 0x20, 0x3c, 0x3c, 0x3f, 0x3e, 0x21,
+        0x20, 0x35, 0x34, 0x33, 0x32, 0x21, 0x20, 0x5c, 0x5c,
     ];
 
     const FIXTURE_MODE1: &[u8] = &[
-        0xfe, 0xfe, 0x01, 0xff, 0xfe, 0x14, 0x00, 0x93, 0x00, 0x9f, 0x00, 0x9d, 0x00, 0xb3, 0x00,
-        0xb8, 0x00, 0x16, 0x00, 0x10, 0x00, 0x1a, 0x00, 0xa7, 0x00, 0x10, 0x00, 0x11, 0x00, 0xb8,
-        0x00, 0x96, 0x00, 0xb8, 0x00, 0x9c, 0x00, 0x9a, 0x00, 0x11, 0x00, 0x10, 0x00, 0x3e, 0x00,
-        0x3d, 0x00, 0x10, 0x00, 0x11, 0x00, 0xea, 0x30, 0x53, 0x30, 0x5f, 0x30, 0x76, 0x30, 0xc2,
-        0x30, 0xd3, 0x30, 0x11, 0x00, 0x1c, 0x00, 0x10, 0x00, 0x11, 0x00, 0xb3, 0x00, 0x93, 0x00,
-        0x9a, 0x00, 0x9d, 0x00, 0x92, 0x00, 0xb1, 0x00, 0x96, 0x00, 0x9f, 0x00, 0x11, 0x00, 0x10,
-        0x00, 0x3e, 0x00, 0x3d, 0x00, 0x10, 0x00, 0x11, 0x00, 0x30, 0x00, 0x32, 0x00, 0xaf, 0x00,
-        0x30, 0x00, 0x32, 0x00, 0x11, 0x00, 0x1c, 0x00, 0x10, 0x00, 0x11, 0x00, 0xb9, 0x00, 0x92,
-        0x00, 0x9c, 0x00, 0xba, 0x00, 0x9a, 0x00, 0x11, 0x00, 0x10, 0x00, 0x3e, 0x00, 0x3d, 0x00,
-        0x10, 0x00, 0x38, 0x00, 0x31, 0x00, 0x10, 0x00, 0xae, 0x00,
+        0xfe, 0xfe, 0x01, 0x00, 0x14, 0x00, 0x93, 0x00, 0x9f, 0x00, 0x9d, 0x00, 0xb3, 0x00, 0xb8,
+        0x00, 0x16, 0x00, 0x10, 0x00, 0x1a, 0x00, 0xa7, 0x00, 0x10, 0x00, 0x11, 0x00, 0xb8, 0x00,
+        0x96, 0x00, 0xb8, 0x00, 0x9c, 0x00, 0x9a, 0x00, 0x11, 0x00, 0x10, 0x00, 0x3e, 0x00, 0x3d,
+        0x00, 0x10, 0x00, 0x11, 0x00, 0xea, 0x30, 0x53, 0x30, 0x5f, 0x30, 0x76, 0x30, 0xc2, 0x30,
+        0xd3, 0x30, 0x11, 0x00, 0x1c, 0x00, 0x10, 0x00, 0x11, 0x00, 0xb3, 0x00, 0x93, 0x00, 0x9a,
+        0x00, 0x9d, 0x00, 0x92, 0x00, 0xb1, 0x00, 0x96, 0x00, 0x9f, 0x00, 0x11, 0x00, 0x10, 0x00,
+        0x3e, 0x00, 0x3d, 0x00, 0x10, 0x00, 0x11, 0x00, 0x30, 0x00, 0x32, 0x00, 0xaf, 0x00, 0x30,
+        0x00, 0x32, 0x00, 0x11, 0x00, 0x1c, 0x00, 0x10, 0x00, 0x11, 0x00, 0xb9, 0x00, 0x92, 0x00,
+        0x9c, 0x00, 0xba, 0x00, 0x9a, 0x00, 0x11, 0x00, 0x10, 0x00, 0x3e, 0x00, 0x3d, 0x00, 0x10,
+        0x00, 0x38, 0x00, 0x31, 0x00, 0x10, 0x00, 0xae, 0x00,
     ];
 
     const FIXTURE_MODE2: &[u8] = &[
@@ -5271,6 +5389,38 @@ var ra = a.get(); var rb = b.get();",
                 &bytes[..prefix.len()],
                 prefix,
                 "mode {mode} clobbered the prefix"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    // reference/cpp/core/base/TextStream.cpp:82-105 — the cipher modes write a
+    // four-byte header (`FE FE <mode>` plus one skipped byte); mode 2 keeps
+    // the five-byte `FE FE 02 FF FE` header (`:104-116`).
+    #[test]
+    fn writer_emits_the_reference_crypt_header() {
+        let _vm_lock = vm_lock();
+        let e = Tjs2Engine::new().unwrap();
+        for (name, mode, expected) in [
+            ("header-mode0", "o8c0", &[0xFEu8, 0xFE, 0x00, 0x00][..]),
+            ("header-mode1", "o8c1", &[0xFEu8, 0xFE, 0x01, 0x00][..]),
+            (
+                "header-mode2",
+                "o8c2",
+                &[0xFEu8, 0xFE, 0x02, 0xFF, 0xFE][..],
+            ),
+        ] {
+            let path = temp_path(name);
+            let prefix = b"PREFIX!!";
+            std::fs::write(&path, prefix).unwrap();
+            let path_lit = format!("{:?}", path.to_string_lossy());
+            let setup = format!("var a = ['x']; a.save({path_lit}, '{mode}');");
+            e.exec_script(&setup, name).unwrap();
+            let bytes = std::fs::read(&path).unwrap();
+            assert_eq!(
+                &bytes[prefix.len()..prefix.len() + expected.len()],
+                expected,
+                "mode {mode}"
             );
             let _ = std::fs::remove_file(&path);
         }

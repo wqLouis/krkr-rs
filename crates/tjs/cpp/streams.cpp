@@ -24,12 +24,14 @@
 //                         when no `z` is given).
 //   * read mode `oN`   -> start reading at byte offset N.
 //
-// Text payload (`FE FE <mode>` crypt container, after the optional 3-byte
-// signature and the UTF-16LE BOM `FF FE`):
-//   mode 0: per-char XOR cipher (old buggy crypt mode)
-//   mode 1: per-char bit swap
-//   mode 2: zlib stream laid out as `[u64 compressed][u64 uncompressed]`
-//           followed by the compressed UTF-16LE bytes.
+// Text payload (`FE FE <mode>` crypt container):
+//   modes 0/1: four-byte header `FE FE <mode>` plus one skipped byte, then the
+//              UTF-16LE code units. There is no byte-order mark in the cipher
+//              modes; the reference reader starts at offset 4
+//              (`reference/cpp/core/base/TextStream.cpp:87-88`).
+//   mode 2: five-byte header `FE FE 02 FF FE` (`:104-116`), then a zlib stream
+//           laid out as `[u64 compressed][u64 uncompressed]` followed by the
+//           compressed UTF-16LE bytes.
 //
 // Paths: names are absolute (the game builds them from System.dataPath) or
 // resolved against the data dir set via tjs2_set_data_dir.
@@ -442,12 +444,11 @@ public:
         if(raw.size() >= 3 && raw[0] == 0xFE && raw[1] == 0xFE) {
             uint8_t m = raw[2];
             if(m == 0 || m == 1) {
-                // Signature `FE FE m`, then the BOM `FF FE`, then UTF-16LE.
-                // (Tolerate a missing BOM as the reference did not enforce
-                // it for the cipher modes.)
-                size_t start = 3;
-                if(raw.size() >= 5 && raw[3] == 0xFF && raw[4] == 0xFE)
-                    start = 5;
+                // Four-byte header `FE FE m` plus one skipped byte; the
+                // UTF-16LE payload starts at offset 4 (reference
+                // `reference/cpp/core/base/TextStream.cpp:87-88`). A `FF FE`
+                // after the mode byte is not a BOM in the cipher modes.
+                const size_t start = 4;
                 for(size_t i = start; i + 1 < raw.size(); i += 2) {
                     char16_t ch = (char16_t)(raw[i] | (raw[i + 1] << 8));
                     if(m == 0) {
@@ -643,14 +644,12 @@ public:
         if(ofs != 0)
             stream->SetPosition((tjs_uint64)ofs);
 
-        // Crypt signature: written for every active crypt mode (0/1/2).
-        uint8_t sig[3] = {0xFE, 0xFE, (uint8_t)crypt_mode};
-        stream->WriteBuffer(sig, 3);
-        // Now the text stream writes unicode text.
-        uint8_t bom[2] = {0xFF, 0xFE};
-        stream->WriteBuffer(bom, 2);
-
         if(crypt_mode == 2) {
+            // `FE FE 02 FF FE` then the two little-endian u64 sizes
+            // (reference `reference/cpp/core/base/TextStream.cpp:104-116`).
+            uint8_t sig[5] = {0xFE, 0xFE, 0x02, 0xFF, 0xFE};
+            stream->WriteBuffer(sig, 5);
+
             zs.zalloc = Z_NULL;
             zs.zfree = Z_NULL;
             zs.opaque = Z_NULL;
@@ -668,6 +667,12 @@ public:
             compression_size_position = (int64_t)stream->GetPosition();
             write_u64le(*stream, 0);
             write_u64le(*stream, 0);
+        } else {
+            // Cipher modes 0/1: four-byte header `FE FE m` plus one skipped
+            // byte; the payload starts at offset 4 (reference
+            // `reference/cpp/core/base/TextStream.cpp:87-88`).
+            uint8_t sig[4] = {0xFE, 0xFE, (uint8_t)crypt_mode, 0x00};
+            stream->WriteBuffer(sig, 4);
         }
     }
 

@@ -8,14 +8,15 @@
 //! counterpart of the empty-scene [`Host`]: it adds the VM host, the mounted
 //! game [`Storage`] and the ordered frame body.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use api::error::FsError;
 use api::fs::FsPath;
 use compat::{CompatCtx, CompatError, FrameBody};
 use engine::Storage;
-use engine::storage::{MountOptions, StartupPlan};
-use fs::FileSystem;
+use engine::storage::{MountOptions, StartupPlan, StorageReadError};
+use fs::{FileSystem, list};
 use platform::{FramePacing, PlatformError, PlatformEvent};
 use vm::{FrameCtx, VmHost};
 
@@ -64,6 +65,9 @@ pub enum GameError {
     /// The VM failed to start or run a frame.
     #[error(transparent)]
     Vm(#[from] vm::VmError),
+    /// Auto-loading a `.tpm` plugin failed.
+    #[error("plugin: {0}")]
+    Plugin(#[from] CompatError),
 }
 
 /// Per-frame wall-clock costs, in milliseconds, recorded by the frame body.
@@ -365,19 +369,18 @@ impl GameHost {
             )?
         });
         let mount_time = mount_started.elapsed();
-        let mut vm = VmHost::with_default()?;
+        let scene_ptr = host.scene_mut() as *mut engine::Scene;
+        let storage_ptr = storage.as_ref() as *const Storage as *mut Storage;
         // SAFETY: `storage` and `host` are declared after `vm` in the returned
         // struct and therefore outlive it; the boxed `host` keeps the scene
         // address stable, and nothing else aliases either value while the
-        // binding is installed.
-        unsafe {
-            vm.compat_mut()
-                .services_mut()
-                .attach_scene(host.scene_mut() as *mut engine::Scene);
-            vm.compat_mut()
-                .services_mut()
-                .attach_storage(storage.as_ref() as *const Storage as *mut Storage);
-        }
+        // binding is installed. Attaching before the compat surface is
+        // installed lets a registration-time service read (the `xp3filter`
+        // `xp3filter.tjs` read) see the mounted archives.
+        let vm = VmHost::with_default_services(|services| unsafe {
+            services.attach_scene(scene_ptr);
+            services.attach_storage(storage_ptr);
+        })?;
 
         // Install the seams the compat natives compose: the L1 codecs and the
         // emulated Windows host facts. The codecs clone their backend, so the
@@ -395,6 +398,18 @@ impl GameHost {
         unsafe { crate::install_video_source_metered(vm.compat(), &media, &storage, &stats) }
             .map_err(vm::VmError::from)?;
         crate::install_window_ex_facts(vm.compat(), host.surface_size());
+
+        // The reference auto-loads `.tpm` plugins from the exe/system/plugin
+        // folders before the startup scripts run
+        // (`reference/cpp/core/plugin/PluginImpl.cpp:148-177`, called from
+        // `reference/cpp/core/environ/Application.cpp:342`). The composition
+        // root enumerates with the L1 file system and compat links the ordered
+        // names.
+        let tpm_plugins = discover_tpm_plugins(&FileSystem::host(base_dir.clone()), &base_dir)?;
+        if !tpm_plugins.is_empty() {
+            let mut ctx = vm.compat().ctx()?;
+            vm.compat().registry().autoload(&tpm_plugins, &mut ctx)?;
+        }
 
         let plan = storage.startup_plan()?;
         let startup_started = Instant::now();
@@ -567,6 +582,39 @@ fn log_startup(
     );
 }
 
+/// The `.tpm` plugin files the reference auto-loads, in ASCII filename order.
+///
+/// The reference `TVPSearchPluginsAt` keeps regular files whose name ends in
+/// `.tpm` (case-insensitive) and `tvpLoadPlugins` scans the exe directory,
+/// `<exe>/system` and `<exe>/plugin`, sorts the combined list by file name and
+/// loads each (`reference/cpp/core/plugin/PluginImpl.cpp:76-88`, `:148-177`,
+/// called from `reference/cpp/core/environ/Application.cpp:342`). The scan is
+/// the composition root's job: compat owns no file-system access. A missing or
+/// non-directory entry contributes nothing; any other listing error
+/// propagates.
+fn discover_tpm_plugins(fs: &FileSystem, base_dir: &Path) -> Result<Vec<String>, GameError> {
+    let mut found = Vec::new();
+    for dir in [
+        base_dir.to_path_buf(),
+        base_dir.join("system"),
+        base_dir.join("plugin"),
+    ] {
+        let entries = match list(fs, &FsPath::host(dir)) {
+            Ok(entries) => entries,
+            Err(FsError::NotFound { .. }) | Err(FsError::NotADirectory { .. }) => continue,
+            Err(error) => return Err(GameError::Storage(StorageReadError::Fs(error))),
+        };
+        for entry in entries {
+            if !entry.is_dir && entry.name.to_ascii_lowercase().ends_with(".tpm") {
+                found.push(entry.name);
+            }
+        }
+    }
+    // ASCII filename order, the reference's sort key (`PluginImpl.cpp:168`).
+    found.sort();
+    Ok(found)
+}
+
 /// Runs one startup script through `exec_storage` and records its cost.
 fn run_startup_script(
     vm: &VmHost,
@@ -643,6 +691,26 @@ fn run_startup(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serializes the tests that bind the process-global VM.
+    fn vm_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// A unique temporary directory, removed by the caller.
+    fn unique_temp_dir(tag: &str) -> PathBuf {
+        let mut base = std::env::temp_dir();
+        base.push(format!(
+            "krkr-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        base
+    }
 
     /// Builds a valid attribution for `frame` whose body spent `body_ms` in
     /// the `project_and_render` phase.
@@ -758,5 +826,106 @@ mod tests {
         assert!(second.contains("frame 8 slow"), "line was: {second}");
         assert!(second.contains("timer=250.0"), "line was: {second}");
         assert!(!second.contains("frame 7"), "line was: {second}");
+    }
+
+    /// The reference auto-load scan: regular `*.tpm` files only, from the exe
+    /// directory, `<exe>/system` and `<exe>/plugin`, sorted by file name
+    /// (`reference/cpp/core/plugin/PluginImpl.cpp:76-88`, `:163-168`).
+    #[test]
+    fn tpm_scan_keeps_regular_tpm_files_from_three_dirs_in_name_order() {
+        let base = unique_temp_dir("tpm-scan");
+        std::fs::create_dir_all(base.join("system")).expect("system dir");
+        std::fs::create_dir_all(base.join("plugin")).expect("plugin dir");
+        // A directory whose name ends in `.tpm` is not a plugin file.
+        std::fs::create_dir_all(base.join("subdir.tpm")).expect("a .tpm directory");
+        for (dir, name) in [
+            (&base, "b.tpm"),
+            (&base, "a.tpm"),
+            (&base, "notes.txt"),
+            (&base, "c.TPM"),
+            (&base.join("system"), "d.tpm"),
+            (&base.join("plugin"), "a.tpm"),
+        ] {
+            std::fs::write(dir.join(name), b"x").expect("write fixture");
+        }
+
+        let fs = FileSystem::host(base.clone());
+        let found = discover_tpm_plugins(&fs, &base).expect("scan");
+        assert_eq!(
+            found,
+            vec![
+                "a.tpm".to_string(),
+                "a.tpm".to_string(),
+                "b.tpm".to_string(),
+                "c.TPM".to_string(),
+                "d.tpm".to_string(),
+            ],
+            "only regular .tpm files from all three dirs, in ASCII name order"
+        );
+
+        // A missing directory contributes nothing (the reference tolerates it).
+        let missing = base.join("does-not-exist");
+        let empty = discover_tpm_plugins(&FileSystem::host(missing.clone()), &missing)
+            .expect("missing dirs are tolerated");
+        assert!(
+            empty.is_empty(),
+            "missing dirs contribute nothing: {empty:?}"
+        );
+
+        std::fs::remove_dir_all(&base).expect("cleanup");
+    }
+
+    /// Production attaches the storage before the compat surface is installed
+    /// (`VmHost::with_default_services`), so the `xp3filter` plugin installs
+    /// its L2 seam during registration — before the deferred hook in
+    /// `begin_native_timing` ever runs. Without the ordering fix the seam is
+    /// still `None` here.
+    #[test]
+    #[allow(unsafe_code)] // the service attach takes the storage pointer
+    fn vm_attaches_services_before_install_so_xp3_filter_registers() {
+        let _lock = vm_lock();
+        let base = unique_temp_dir("xp3-registration");
+        std::fs::create_dir_all(&base).expect("game dir");
+        std::fs::write(base.join("xp3filter.tjs"), "// no-op filter\n").expect("filter script");
+        let mut storage = Box::new(
+            Storage::mount_archives(
+                FileSystem::host(base.clone()),
+                base.clone(),
+                std::iter::empty::<&str>(),
+            )
+            .expect("mount storage"),
+        );
+        let vm = VmHost::with_default_services(|services| unsafe {
+            services.attach_storage(storage.as_mut() as *mut Storage);
+        })
+        .expect("create vm host");
+        assert!(
+            storage.xp3_extraction_filter.is_some(),
+            "the storage attached before install must be visible at plugin \
+             registration, which installs the xp3 filter seam"
+        );
+        drop(vm);
+        drop(storage);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The production entry point leaves the seam installed after
+    /// `GameHost::open`, proving the composition root reaches the plugin's
+    /// registration with the storage attached.
+    #[test]
+    fn game_host_open_installs_the_xp3_filter_seam() {
+        let _lock = vm_lock();
+        let base = unique_temp_dir("xp3-gamehost");
+        std::fs::create_dir_all(&base).expect("game dir");
+        std::fs::write(base.join("xp3filter.tjs"), "// no-op filter\n").expect("filter script");
+        std::fs::write(base.join("startup.tjs"), "// no-op startup\n").expect("startup script");
+        let host = crate::Host::new(crate::HostConfig::headless()).expect("headless host");
+        let game = GameHost::open(host, Vec::new(), base.clone()).expect("open game");
+        assert!(
+            game.storage().xp3_extraction_filter.is_some(),
+            "GameHost::open must leave the xp3 filter seam installed"
+        );
+        drop(game);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

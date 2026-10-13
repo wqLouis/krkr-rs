@@ -276,6 +276,26 @@ fn configured_encoding(services: &CompatServices) -> Option<String> {
         .filter(|encoding| !encoding.is_empty())
 }
 
+/// Log one line describing a script read so a device log can identify the
+/// raw bytes without dumping the script: the storage name, the byte length,
+/// the first 32 bytes in hex, the encoding decision, the number of NUL bytes
+/// in the raw input, and whether the decoded text contains a NUL.
+fn log_script_read(name: &str, bytes: &[u8], encoding: Option<&str>, text: Option<&str>) {
+    let head = bytes
+        .iter()
+        .take(32)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let nul_bytes = bytes.iter().filter(|&&byte| byte == 0).count();
+    let decoded_has_nul = text.is_some_and(|text| text.contains('\0'));
+    log::debug!(
+        "script read '{name}' bytes={} head32=[{head}] encoding={} nul_bytes={nul_bytes} decoded_has_nul={decoded_has_nul}",
+        bytes.len(),
+        encoding.unwrap_or("decode-error"),
+    );
+}
+
 /// Read storage `name`, apply the mode's `oN` offset and decode the text.
 fn load_storage_text(
     storage: &Storage,
@@ -293,7 +313,24 @@ fn load_storage_text(
     let encoding = encoding.map_or(crate::text::TextEncoding::Detect, |name| {
         crate::text::TextEncoding::Named(name)
     });
-    crate::text::decode_text(bytes, encoding).map_err(|error| format!("Scripts: '{name}': {error}"))
+    // The byte signature is only materialised when debug logging is on; the
+    // decode itself is the normal path.
+    let decoded = if log::log_enabled!(log::Level::Debug) {
+        let reported = crate::text::decode_text_reported(bytes, encoding);
+        match &reported {
+            Ok(decoded) => log_script_read(
+                name,
+                bytes,
+                Some(decoded.encoding.as_str()),
+                Some(decoded.text.as_str()),
+            ),
+            Err(_) => log_script_read(name, bytes, None, None),
+        }
+        reported.map(|decoded| decoded.text)
+    } else {
+        crate::text::decode_text(bytes, encoding)
+    };
+    decoded.map_err(|error| format!("Scripts: '{name}': {error}"))
 }
 
 /// Read `name` through storage and run it as a script (`expression == false`)

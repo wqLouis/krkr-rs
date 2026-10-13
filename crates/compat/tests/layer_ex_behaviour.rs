@@ -35,7 +35,6 @@
 
 mod common;
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -44,10 +43,8 @@ use api::media::{DecodedImage, ImageInfo};
 use common::vm_lock;
 use compat::CompatHost;
 use engine::{Scene, Storage};
-use flate2::Compression;
-use flate2::write::ZlibEncoder;
 use fs::FileSystem;
-use fs::xp3::{SEGM_ENCODE_RAW, SEGM_ENCODE_ZLIB, XP3_MAGIC};
+use testkit::build_xp3;
 use tjs::{Tjs2Engine, TjsValue};
 
 /// Script label for diagnostics.
@@ -249,73 +246,6 @@ fn memory_storage(files: &[(&str, &[u8])]) -> Storage {
 /// An in-memory storage holding `images/test.img`.
 fn image_storage() -> Storage {
     memory_storage(&[("/images/test.img", b"not-a-real-image")])
-}
-
-/// Build a minimal raw-index XP3 archive in memory: `(name, data, zlib)`.
-///
-/// Local copy of the shared `testkit::build_xp3` fixture (`compat` does not
-/// depend on `testkit`), matching the copies in `fstat.rs`/`xp3_filter.rs`.
-fn build_xp3(entries: &[(&str, &[u8], bool)]) -> Vec<u8> {
-    let mut file = Vec::new();
-    file.extend_from_slice(&XP3_MAGIC);
-    file.extend_from_slice(&0u64.to_le_bytes());
-
-    let mut file_chunks: Vec<Vec<u8>> = Vec::new();
-    for (name, data, zlib) in entries {
-        let (stored, flags): (Vec<u8>, u32) = if *zlib {
-            let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
-            enc.write_all(data).expect("zlib compress");
-            (enc.finish().expect("zlib finish"), SEGM_ENCODE_ZLIB)
-        } else {
-            (data.to_vec(), SEGM_ENCODE_RAW)
-        };
-        let start = file.len() as u64;
-        file.extend_from_slice(&stored);
-
-        let units: Vec<u16> = name.encode_utf16().collect();
-        let mut info = Vec::new();
-        info.extend_from_slice(b"info");
-        info.extend_from_slice(&((22 + units.len() * 2) as u64).to_le_bytes());
-        info.extend_from_slice(&0u32.to_le_bytes());
-        info.extend_from_slice(&(data.len() as i64).to_le_bytes());
-        info.extend_from_slice(&(stored.len() as i64).to_le_bytes());
-        info.extend_from_slice(&(units.len() as i16).to_le_bytes());
-        for unit in &units {
-            info.extend_from_slice(&unit.to_le_bytes());
-        }
-
-        let mut segm = Vec::new();
-        segm.extend_from_slice(b"segm");
-        segm.extend_from_slice(&28u64.to_le_bytes());
-        segm.extend_from_slice(&flags.to_le_bytes());
-        segm.extend_from_slice(&(start as i64).to_le_bytes());
-        segm.extend_from_slice(&(data.len() as i64).to_le_bytes());
-        segm.extend_from_slice(&(stored.len() as i64).to_le_bytes());
-
-        let mut adlr = Vec::new();
-        adlr.extend_from_slice(b"adlr");
-        adlr.extend_from_slice(&4u64.to_le_bytes());
-        adlr.extend_from_slice(&0u32.to_le_bytes());
-
-        let mut chunk = Vec::new();
-        chunk.extend_from_slice(b"File");
-        chunk.extend_from_slice(&((info.len() + segm.len() + adlr.len()) as u64).to_le_bytes());
-        chunk.extend_from_slice(&info);
-        chunk.extend_from_slice(&segm);
-        chunk.extend_from_slice(&adlr);
-        file_chunks.push(chunk);
-    }
-
-    let mut index_data = Vec::new();
-    for chunk in &file_chunks {
-        index_data.extend_from_slice(chunk);
-    }
-    let index_ofs = file.len() as u64;
-    file.push(0u8); // raw index block
-    file.extend_from_slice(&(index_data.len() as u64).to_le_bytes());
-    file.extend_from_slice(&index_data);
-    file[11..19].copy_from_slice(&index_ofs.to_le_bytes());
-    file
 }
 
 /// An in-memory storage mounting `data.xp3` with one entry, `entry`, whose

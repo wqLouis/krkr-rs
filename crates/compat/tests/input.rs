@@ -5,6 +5,14 @@
 //! the shared [`common::vm_lock`] (the engine → context binding is
 //! process-wide). Events are fed through the input seam on
 //! [`compat::EventAdapter`].
+//!
+//! **Unverified against the reference (F11a).** The vendored tree has no
+//! source for the `Mouse`/`Key`/`Pad` script surface:
+//! `reference/cpp/core/msg/` contains only `CMakeLists.txt`, and the raw-input
+//! files (`DInputMgn.cpp`, `tvpinputdefs.h`) do not define these members. The
+//! concrete values below — wheel sign/axis, click-count and repeat timing,
+//! one-frame release visibility — are therefore unverified. Adding the input
+//! native source to `reference/cpp/core/msg/` would settle them.
 
 mod common;
 

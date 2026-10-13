@@ -86,19 +86,27 @@ void tjs2_set_log_cb(tjs2_engine *e, tjs2_log_cb cb, void *user);
  * non-NULL, points it at a malloc'd UTF-8 message (free with
  * tjs2_free_string).
  *
- * `context` is the raw iTJSDispatch2* the script runs with as `this` (the
- * `context` argument of the reference `TJS::tTJS::ExecScript`), or NULL for
- * the global object. `lineofs` shifts the reported line numbers (the
- * reference `lineofs`).
+ * `script` is a byte pointer and `script_len` its length; the pair is
+ * passed to the VM as `ttstr` so the ABI neither rejects nor cuts an
+ * interior NUL. The VM's text storage is NUL-terminated, so the VM itself
+ * decides what an interior NUL means (it may cut the payload); that is the
+ * VM's behaviour, not a pre-check here.
+ *
+ * `name` stays a NUL-terminated diagnostic label: the VM consumes it as a
+ * `ttstr` as well, but a name is a C-string-shaped label and is not the
+ * payload a script byte range is. `context` is the raw iTJSDispatch2* the
+ * script runs with as `this` (the `context` argument of the reference
+ * `TJS::tTJS::ExecScript`), or NULL for the global object. `lineofs` shifts
+ * the reported line numbers (the reference `lineofs`).
  */
-int tjs2_exec_script(tjs2_engine *e, const char *script, const char *name,
-                     void *context, int lineofs, tjs2_value *out_result,
-                     char **out_error);
+int tjs2_exec_script(tjs2_engine *e, const char *script, size_t script_len,
+                     const char *name, void *context, int lineofs,
+                     tjs2_value *out_result, char **out_error);
 
 /* Evaluate a TJS expression (UTF-8). Same conventions as tjs2_exec_script. */
-int tjs2_eval(tjs2_engine *e, const char *expression, const char *name,
-              void *context, int lineofs, tjs2_value *out_result,
-              char **out_error);
+int tjs2_eval(tjs2_engine *e, const char *expression, size_t expression_len,
+              const char *name, void *context, int lineofs,
+              tjs2_value *out_result, char **out_error);
 
 /*
  * Replace the text of the registered TJS message named `name` (UTF-8) and
@@ -109,7 +117,9 @@ int tjs2_assign_message(const char *name, const char *message);
 
 /*
  * Compile a UTF-8 script to a binary bytecode stream (reference
- * `tTJS::CompileScript` / `TVPCompileStorage`). `output_path` names the
+ * `tTJS::CompileScript` / `TVPCompileStorage`). `script`/`script_len` are
+ * length-aware like tjs2_exec_script; `output_path` stays NUL-terminated
+ * because it is a filesystem path handed to the OS. `output_path` names the
  * binary file to create; it is resolved by the wired binary-stream factory
  * (absolute paths, data-dir-relative names). `isresult`, `outputdebug` and
  * `isexpression` mirror the reference bool parameters; `name` and `lineofs`
@@ -120,7 +130,7 @@ int tjs2_assign_message(const char *name, const char *message);
  * tjs2_free_string). The output file is written incrementally, so a failed
  * compile may leave a partial file (the caller controls the path).
  */
-int tjs2_compile_script(tjs2_engine *e, const char *script,
+int tjs2_compile_script(tjs2_engine *e, const char *script, size_t script_len,
                         const char *output_path, int isresult,
                         int outputdebug, int isexpression, const char *name,
                         int lineofs, char **out_error);

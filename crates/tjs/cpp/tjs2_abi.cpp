@@ -183,6 +183,15 @@ std::u16string utf8_to_u16(const char *s) {
     return boost::locale::conv::utf_to_utf<char16_t>(s);
 }
 
+// Convert a UTF-8 byte range -> tjs_char. The range form keeps an interior
+// NUL: the single-argument overload stops at the first NUL, so a script
+// supplied as a pointer and a length must use this one.
+std::u16string utf8_to_u16(const char *s, size_t len) {
+    if(!s || len == 0)
+        return std::u16string();
+    return boost::locale::conv::utf_to_utf<char16_t>(s, s + len);
+}
+
 // Convert tjs_char (UTF-16 code units on this build) -> UTF-8 std::string.
 //
 // This must NOT go through ttstr::AsStdString(): that narrows via
@@ -1765,10 +1774,10 @@ void tjs2_set_log_cb(tjs2_engine *e, tjs2_log_cb cb, void *user) {
         g_log_engine.store(nullptr, std::memory_order_release);
 }
 
-int tjs2_exec_script(tjs2_engine *e, const char *script, const char *name,
-                     void *context, int lineofs, tjs2_value *out_result,
-                     char **out_error) {
-    if(!e || !script) {
+int tjs2_exec_script(tjs2_engine *e, const char *script, size_t script_len,
+                     const char *name, void *context, int lineofs,
+                     tjs2_value *out_result, char **out_error) {
+    if(!e || (!script && script_len != 0)) {
         if(out_error)
             *out_error = nullptr;
         return -1;
@@ -1779,11 +1788,15 @@ int tjs2_exec_script(tjs2_engine *e, const char *script, const char *name,
     e->last_object.Clear();
     try {
         TJS::tTJSVariant result;
-        std::u16string s = utf8_to_u16(script);
+        std::u16string s = utf8_to_u16(script, script_len);
         std::u16string n = name ? utf8_to_u16(name) : std::u16string();
-        e->inner->ExecScript(s.c_str(), &result,
+        // The length-aware ttstr form keeps an interior NUL in the payload;
+        // the VM's own text handling decides what that NUL means.
+        TJS::ttstr script_text(s.c_str(), s.size());
+        TJS::ttstr script_name(n.c_str(), n.size());
+        e->inner->ExecScript(script_text, &result,
                              static_cast<TJS::iTJSDispatch2 *>(context),
-                             n.c_str(), (tjs_int)lineofs);
+                             name ? &script_name : nullptr, (tjs_int)lineofs);
         variant_to_value(e, result, out_result);
         if(out_error)
             *out_error = nullptr;
@@ -1812,10 +1825,10 @@ int tjs2_exec_script(tjs2_engine *e, const char *script, const char *name,
     }
 }
 
-int tjs2_eval(tjs2_engine *e, const char *expression, const char *name,
-              void *context, int lineofs, tjs2_value *out_result,
-              char **out_error) {
-    if(!e || !expression) {
+int tjs2_eval(tjs2_engine *e, const char *expression, size_t expression_len,
+              const char *name, void *context, int lineofs,
+              tjs2_value *out_result, char **out_error) {
+    if(!e || (!expression && expression_len != 0)) {
         if(out_error)
             *out_error = nullptr;
         return -1;
@@ -1823,11 +1836,24 @@ int tjs2_eval(tjs2_engine *e, const char *expression, const char *name,
     e->last_object.Clear(); // see tjs2_exec_script
     try {
         TJS::tTJSVariant result;
-        std::u16string s = utf8_to_u16(expression);
+        std::u16string s = utf8_to_u16(expression, expression_len);
         std::u16string n = name ? utf8_to_u16(name) : std::u16string();
-        e->inner->EvalExpression(s.c_str(), &result,
-                                 static_cast<TJS::iTJSDispatch2 *>(context),
-                                 n.c_str(), (tjs_int)lineofs);
+        if(name && n.empty()) {
+            // An empty (but present) name is still a name to the reference's
+            // raw entry point (`if(name)`), which selects a named block
+            // rather than the expression cache; keep that path.
+            e->inner->EvalExpression(
+                s.c_str(), &result,
+                static_cast<TJS::iTJSDispatch2 *>(context), n.c_str(),
+                (tjs_int)lineofs);
+        } else {
+            TJS::ttstr expression_text(s.c_str(), s.size());
+            TJS::ttstr expression_name(n.c_str(), n.size());
+            e->inner->EvalExpression(expression_text, &result,
+                                     static_cast<TJS::iTJSDispatch2 *>(context),
+                                     name ? &expression_name : nullptr,
+                                     (tjs_int)lineofs);
+        }
         variant_to_value(e, result, out_result);
         if(out_error)
             *out_error = nullptr;
@@ -1937,16 +1963,16 @@ const char *tjs2_compile_date(void) { return __DATE__; }
 
 const char *tjs2_compile_time(void) { return __TIME__; }
 
-int tjs2_compile_script(tjs2_engine *e, const char *script,
+int tjs2_compile_script(tjs2_engine *e, const char *script, size_t script_len,
                         const char *output_path, int isresult,
                         int outputdebug, int isexpression, const char *name,
                         int lineofs, char **out_error) {
     if(out_error)
         *out_error = nullptr;
-    if(!e || !script || !output_path)
+    if(!e || (!script && script_len != 0) || !output_path)
         return -1;
     try {
-        std::u16string s = utf8_to_u16(script);
+        std::u16string s = utf8_to_u16(script, script_len);
         std::u16string n = name ? utf8_to_u16(name) : std::u16string();
         std::u16string path = utf8_to_u16(output_path);
         // The reference opens the destination through the wired storage
@@ -1963,6 +1989,9 @@ int tjs2_compile_script(tjs2_engine *e, const char *script,
             return 1;
         }
         try {
+            // CompileScript takes the script as a NUL-terminated tjs_char*;
+            // feed it the full-length buffer so the VM, not this wrapper,
+            // owns the interpretation of any interior NUL.
             e->inner->CompileScript(s.c_str(), output, isresult != 0,
                                     outputdebug != 0, isexpression != 0,
                                     n.c_str(), (tjs_int)lineofs);

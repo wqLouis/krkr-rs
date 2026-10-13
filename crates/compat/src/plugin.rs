@@ -298,6 +298,39 @@ impl PluginRegistry {
         Ok(())
     }
 
+    /// Auto-load the `.tpm` plugins the composition root found, in order.
+    ///
+    /// The reference `tvpLoadPlugins` scans the exe directory,
+    /// `<exe>/system` and `<exe>/plugin` for `*.tpm`, sorts them by file name
+    /// and loads each in turn (`reference/cpp/core/plugin/PluginImpl.cpp:148-177`,
+    /// called from `reference/cpp/core/environ/Application.cpp:342`). The scan
+    /// itself is the composition root's job (compat owns no file-system
+    /// access); this receives the ordered file names and links each. A
+    /// trailing `.tpm` becomes `.dll` first, matching
+    /// `TVPLoadInternalPlugin` (`PluginImpl.cpp:113-133`), and each is logged
+    /// with the reference's `(info) Loading <name>` line (`:173-174`).
+    ///
+    /// Linking goes through the same path as `Plugins.link`: a ported name
+    /// activates its built-in emulation, an unported name gets the null-plugin
+    /// object and one warning (the documented D14 divergence from the
+    /// reference, which tries to load the DLL and creates no global when it
+    /// fails).
+    pub fn autoload(&self, names: &[String], ctx: &mut CompatCtx) -> Result<(), CompatError> {
+        // One null-plugin warning per distinct unported name, even when the
+        // same file is found in more than one scanned directory.
+        let mut warned: BTreeSet<String> = BTreeSet::new();
+        for name in names {
+            log::info!("(info) Loading {name}");
+            let dll = tpm_to_dll_name(name);
+            if self.activate(&dll, ctx)? == PluginOutcome::Null && warned.insert(dll) {
+                log::warn!(
+                    "Plugins auto-load {name:?}: no built-in emulation; null plugin path (D14)"
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn linked_kind(&self, key: &str) -> Option<LinkedKind> {
         self.linked
             .lock()
@@ -326,6 +359,24 @@ impl PluginRegistry {
 pub fn normalize_plugin_name(name: &str) -> String {
     let base = name.rsplit(['/', '\\', '>']).next().unwrap_or(name);
     base.trim().to_ascii_lowercase()
+}
+
+/// Replaces a trailing `.tpm` with `.dll` (case-insensitive), preserving the
+/// stem's original casing.
+///
+/// The reference does the same before loading an internal plugin
+/// (`reference/cpp/core/plugin/PluginImpl.cpp:113-133`), so an auto-loaded
+/// `foo.tpm` resolves the same built-in as `Plugins.link("foo.dll")`. A name
+/// without the extension is returned unchanged.
+fn tpm_to_dll_name(name: &str) -> String {
+    let lower = name.to_ascii_lowercase();
+    let Some(stem) = lower.strip_suffix(".tpm") else {
+        return name.to_string();
+    };
+    // `to_ascii_lowercase` preserves byte length, so the stem slice is valid.
+    let mut out = name[..stem.len()].to_string();
+    out.push_str(".dll");
+    out
 }
 
 /// The base name of a plugin with its extension removed, preserving case.
