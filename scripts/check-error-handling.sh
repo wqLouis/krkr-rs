@@ -50,6 +50,13 @@
 #                    escaped defect, one type over.
 #   addr-narrow      a pointer-derived value narrowed to 32 bits
 #                    (`as u32`/`as i32`), losing the top half of the address.
+#   error-swallow    a wildcard `Err(_)`/`Err(..)` match arm (or
+#                    `if let Err(_)`) that turns the failure into a non-error
+#                    value without raising or logging it.  An arm that
+#                    returns `Err(..)`/`report_error`, propagates with `?`,
+#                    maps with `map_err`, panics, or logs is not a swallow; a
+#                    `reference/cpp/**` citation beside the arm justifies it
+#                    inline.
 #
 # A grep cannot decide whether a receiver is a `Result` or an `Option`, so the
 # guard over-reports on the known-fallible method names and every accepted site
@@ -74,6 +81,14 @@
 # closure boundary, an address used as a map key with no cast or comparison, or
 # any dataflow across function calls beyond that one heuristic.  Those cases
 # are covered by docs/audits/pointer-handles.md and the D37 review, not here.
+#
+# The `error-swallow` pass is deliberately syntactic and low-recall.  It cannot
+# tell a `Result` from an `Option` (an `Option` match never names `Err`, so it
+# does not fire), it does not follow the discarded value, and a swallow written
+# as `.unwrap_or`/`.ok()` is left to the `result-fallback`/`ok-discard` rules.
+# It only exempts an arm when a `reference/cpp/**` citation sits immediately
+# above it or inside its body, so the reference justification stays next to the
+# mapping it explains.
 #
 # Usage: scripts/check-error-handling.sh [--print-all] [--self-test]
 #   --print-all   list every finding without allowlist filtering (seeding aid)
@@ -856,6 +871,148 @@ def scan_pointer_flow(rel, masked, offsets, ranges, ptr_funcs, orig):
     return findings
 
 
+# --- error-swallow pass (AGENTS §4: "drops the error variant") --------------
+# Wildcard `Err(_)`/`Err(..)` arms are the §4 "discards the error" shape.  The
+# body decides whether the error is really dropped: an arm that raises a new
+# error (`report_error`, `Err(..)`), forwards it (`?`), transforms it
+# (`map_err`), panics, or logs it is not silent, and a `reference/cpp/**`
+# citation beside the arm is the documented justification.  Everything else is
+# a reviewed allowlist entry.
+CITATION_WINDOW = 4
+
+
+def _arm_body(toks, start):
+    """Tokens of a match arm body, ending at the arm's terminating comma."""
+    body = []
+    depth = 0
+    i = start
+    n = len(toks)
+    while i < n:
+        tk, _pos = toks[i]
+        if tk in "([{":
+            depth += 1
+        elif tk in ")]}":
+            if depth == 0:
+                break
+            depth -= 1
+        elif tk == "," and depth == 0:
+            break
+        body.append(toks[i])
+        i += 1
+    return body
+
+
+def _brace_body(toks, brace):
+    """Tokens inside the `{ ... }` whose opening brace is at `brace`."""
+    body = []
+    depth = 0
+    i = brace
+    n = len(toks)
+    while i < n:
+        tk, _pos = toks[i]
+        if tk == "{":
+            depth += 1
+        elif tk == "}":
+            depth -= 1
+            if depth == 0:
+                break
+        elif depth >= 1:
+            body.append(toks[i])
+        i += 1
+    return body
+
+
+def _arm_raises(body):
+    """True when a wildcard-error arm raises, forwards, or logs the failure."""
+    blob = " ".join(tk for tk, _pos in body)
+    if "report_error" in blob or "map_err" in blob:
+        return True
+    if re.search(r"\bErr\b", blob):
+        return True
+    if any(tk == "?" for tk, _pos in body):
+        return True
+    for kw in ("panic", "unreachable", "todo", "unimplemented", "assert"):
+        if kw in blob:
+            return True
+    for k, (tk, _pos) in enumerate(body):
+        if tk in ("log", "tracing") and k + 1 < len(body) and body[k + 1][0] == "::":
+            return True
+    return False
+
+
+def scan_error_swallow(rel, masked, offsets, ranges, orig):
+    """Flag a wildcard-error arm that discards the error into a value.
+
+    `Err(_)`/`Err(..)` in a `match`, and `if let Err(_)`/`if let Err(..)`, are
+    the §4 "drops the error variant" shape.  The arm body and an attached
+    `reference/cpp/**` citation decide whether it is a reviewed mapping.
+    """
+    import bisect
+
+    text = _blank_ranges(masked, ranges)
+    toks = _tokenize(text)
+    findings = []
+    n = len(toks)
+    i = 0
+    while i < n:
+        tk, pos = toks[i]
+        body = None
+        if (
+            tk == "Err"
+            and i + 3 < n
+            and toks[i + 1][0] == "("
+            and toks[i + 2][0] in ("_", "..")
+            and toks[i + 3][0] == ")"
+        ):
+            # A match arm: skip an optional guard, then require `=>`.
+            m = i + 4
+            depth = 0
+            while m < n:
+                t = toks[m][0]
+                if t in "([{":
+                    depth += 1
+                elif t in ")]}":
+                    if depth == 0:
+                        break
+                    depth -= 1
+                elif t == "=>" and depth == 0:
+                    break
+                elif t == "," and depth == 0:
+                    break
+                m += 1
+            if m < n and toks[m][0] == "=>":
+                body = _arm_body(toks, m + 1)
+        elif (
+            tk == "if"
+            and i + 5 < n
+            and toks[i + 1][0] == "let"
+            and toks[i + 2][0] == "Err"
+            and toks[i + 3][0] == "("
+            and toks[i + 4][0] in ("_", "..")
+            and toks[i + 5][0] == ")"
+        ):
+            # `if let Err(_) = .. { body }` — only the braced body is checked.
+            m = i + 6
+            while m < n and toks[m][0] not in ("{", ";"):
+                m += 1
+            if m < n and toks[m][0] == "{":
+                body = _brace_body(toks, m)
+        if body is not None and not _arm_raises(body):
+            ln = max(1, min(bisect.bisect_right(offsets, pos), len(orig)))
+            end_ln = ln
+            if body:
+                end_ln = max(
+                    1,
+                    min(bisect.bisect_right(offsets, body[-1][1]), len(orig)),
+                )
+            window = "\n".join(orig[max(0, ln - 1 - CITATION_WINDOW) : end_ln])
+            if "reference/cpp/" not in window:
+                code = orig[ln - 1].strip() if ln - 1 < len(orig) else ""
+                findings.append((rel, ln, "error-swallow", code))
+        i += 1
+    return findings
+
+
 def scan(roots=None):
     findings = []
     root_dirs = [CRATES] if roots is None else list(roots)
@@ -956,6 +1113,9 @@ def scan(roots=None):
         findings.extend(
             scan_pointer_flow(rel, masked, offsets, ranges, ptr_funcs, orig)
         )
+        findings.extend(
+            scan_error_swallow(rel, masked, offsets, ranges, orig)
+        )
 
     seen = set()
     unique = []
@@ -982,6 +1142,7 @@ RULES = {
     "pointer-compare",
     "char-signedness",
     "addr-narrow",
+    "error-swallow",
 }
 
 
@@ -1039,14 +1200,24 @@ SELF_TEST_BAD_RULES = (
     "char-signedness",
     "addr-narrow",
 )
+# Each (bad, good, required) group: the bad fixture must trip every `required`
+# rule and the good fixture must trip nothing at all.
+SELF_TEST_GROUPS = (
+    (BAD_FIXTURE, GOOD_FIXTURE, SELF_TEST_BAD_RULES),
+    (
+        "scripts/guard_fixtures/bad_error_swallow.rs",
+        "scripts/guard_fixtures/good_error_swallow.rs",
+        ("error-swallow",),
+    ),
+)
 
 
 def self_test():
-    """Assert the pointer rules still match the bad fixture and not the good.
+    """Assert each rule still matches its bad fixture and not its near-miss.
 
     A regex that silently stops matching is worse than no guard, so the guard
-    runs this on every invocation: the bad fixture must trip each rule and the
-    near-miss fixture must trip none.
+    runs this on every invocation: every bad fixture must trip its required
+    rules and every near-miss fixture must trip none.
     """
     if not FIXTURES.is_dir():
         print(f"ERROR: guard self-test fixtures missing at {FIXTURES}")
@@ -1055,18 +1226,23 @@ def self_test():
     by_file = {}
     for rel, line, rule, code in findings:
         by_file.setdefault(rel, []).append((line, rule, code))
-    bad_rules = {rule for _line, rule, _code in by_file.get(BAD_FIXTURE, [])}
-    good = by_file.get(GOOD_FIXTURE, [])
     problems = []
-    for rule in SELF_TEST_BAD_RULES:
-        if rule not in bad_rules:
+    required_total = 0
+    good_total = 0
+    for bad_fixture, good_fixture, required in SELF_TEST_GROUPS:
+        bad_rules = {rule for _line, rule, _code in by_file.get(bad_fixture, [])}
+        for rule in required:
+            required_total += 1
+            if rule not in bad_rules:
+                problems.append(
+                    f"{bad_fixture}: expected a `{rule}` finding, matched none"
+                )
+        good = by_file.get(good_fixture, [])
+        good_total += len(good)
+        for line, rule, code in good:
             problems.append(
-                f"{BAD_FIXTURE}: expected a `{rule}` finding, matched none"
+                f"{good_fixture}:{line}: unexpected `{rule}` finding: {code}"
             )
-    for line, rule, code in good:
-        problems.append(
-            f"{GOOD_FIXTURE}:{line}: unexpected `{rule}` finding: {code}"
-        )
     if problems:
         print("ERROR: guard self-test failed:")
         for problem in problems:
@@ -1075,8 +1251,8 @@ def self_test():
         return 1
     print(
         "error-handling guard: self-test ok "
-        f"({len(SELF_TEST_BAD_RULES)} pointer rules flagged the bad fixture, "
-        f"{len(by_file.get(GOOD_FIXTURE, []))} finding(s) in the good fixture)"
+        f"({required_total} required rule flag(s) matched their bad fixture, "
+        f"{good_total} finding(s) in the good fixtures)"
     )
     return 0
 

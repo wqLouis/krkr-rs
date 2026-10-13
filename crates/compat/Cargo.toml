@@ -9,7 +9,7 @@ license.workspace = true
 engine = { workspace = true }
 tjs = { workspace = true }
 thiserror = { workspace = true }
-log = { workspace = true }
+log = { workspace = true, features = ["std"] }
 flate2 = { workspace = true }
 # Charset detection and bulk decoding for BOM-less legacy script encodings.
 chardetng = { workspace = true }

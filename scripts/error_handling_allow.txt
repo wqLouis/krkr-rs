@@ -158,3 +158,46 @@ crates/compat/src/natives/system.rs:1828:Ok(value) => value != 0, — this `valu
 crates/compat/src/resource.rs:921:if ptr >= self.image.len() { — `ptr` is the byte cursor `item.offset as usize` into the image, not an address
 crates/compat/src/resource.rs:928:if out.is_empty() || ptr >= self.image.len() { — `ptr` is the byte cursor `item.offset as usize` into the image, not an address
 crates/tjs/src/lib.rs:1923:if out.ty != VAL_RETAINED || out.retained == 0 { — `retained` is the ABI retained-object index, an opaque token the reference also compares to 0
+
+# --- wildcard `Err(_)`/`Err(..)` arms that map a reference-defined absence
+#     to its documented default (the `error-swallow` rule).  Each is the
+#     reference's "missing or unreadable means the default" behaviour at the
+#     boundary that already makes the decision; none hides a re-raisable error
+#     behind a success value, and none is silent about a path the reference
+#     reports.  Arms that also log or cite the reference are exempt by the rule
+#     itself. ------------------------------------------------------------------
+crates/app/src/window_ex.rs:87:Err(_) => { — env-var expansion keeps `%name` literal when the variable is missing or non-Unicode
+crates/compat/src/natives/cdda_midi.rs:235:Err(_) => (TjsValue::Void, None), — a non-retainable argument is the reference's void argument
+crates/compat/src/natives/kag/mod.rs:374:Err(_) => true, — a failed KAG callback is treated as satisfied, matching the reference's onLabel/onScript guard
+crates/compat/src/natives/plugins/csv_parser/mod.rs:321:Ok(TjsValue::Void) | Err(_) => return Ok(()), — an absent `doLine` member is not a callback (reference/cpp/plugins/csvParser.cpp:98-101,323)
+crates/compat/src/natives/plugins/fstat/mod.rs:170:Ok(Some(Location::Archive(..))) | Ok(None) | Err(_) => None, — `TVPGetPlacedPath` yields no local path for an archive-only or failed lookup
+crates/compat/src/natives/plugins/fstat/mod.rs:361:Err(_) => DiskInfo { — the reference ignores `TVP_stat`'s result and reports a failed stat as a zero file
+crates/compat/src/natives/plugins/fstat/mod.rs:1075:Err(_) => return Ok(()), — the reference `_dirtree` returns void on an unreadable directory
+crates/compat/src/natives/plugins/layer_ex/appearance.rs:177:Err(_) => None, — a missing angle member is absent, not a default the reference fabricates
+crates/compat/src/natives/plugins/layer_ex/appearance.rs:442:Err(_) => 1.0, — the reference's `AsReal` default for a non-numeric width
+crates/compat/src/natives/plugins/layer_ex/draw.rs:637:Err(_) => set_void(out), — a failed RectF construction returns void to the script, as the reference draw does
+crates/compat/src/natives/plugins/layer_ex/draw.rs:1948:Err(_) => return, — a detached scene cannot run the draw callback; the reference no-ops
+crates/compat/src/natives/plugins/layer_ex/font.rs:616:Err(_) => break, — a non-zero-index load failure ends the candidate loop; index 0 already raised above
+crates/compat/src/natives/plugins/layer_ex/image.rs:124:Err(_) => return Ok(None), — an undecodable layer image yields no image, matching the reference's failed-load path
+crates/compat/src/natives/plugins/layer_ex/image.rs:134:Err(_) => decoded.rgba.chunks_exact(4).any(|pixel| pixel[3] < 255), — a probe failure falls back to scanning the decoded alpha channel
+crates/compat/src/natives/plugins/motion_player/mod.rs:254:Err(_) => false, — a `typeof` evaluation failure means the global is not defined
+crates/compat/src/natives/plugins/scripts_ex/mod.rs:718:Err(_) => Ok(Owned::Object(object)), — a missing `clone` is one of the error codes the reference compares away
+crates/compat/src/natives/plugins/text_render/state.rs:222:Ok(TjsValue::Void) | Err(_) => None, — a missing dictionary member and TJS void are the reference `getprop` absence
+crates/compat/src/natives/plugins/window_ex/system.rs:83:Err(_) => (false, None), — a failed `System.metrics` read is the "absent" case
+crates/compat/src/natives/plugins/window_ex/system.rs:309:Ok(_) | Err(_) => 0, — the `getIntValue` default for a missing/non-numeric member
+crates/compat/src/natives/plugins/window_ex/util.rs:163:Err(_) => Ok(0), — `getIntValue` returns its default for a missing member
+crates/compat/src/natives/plugins/window_ex/util.rs:286:Err(_) => return false, — a non-retainable or class-less object argument has no matching class (both occurrences)
+crates/compat/src/natives/scripts.rs:327:Err(_) => log_script_read(name, bytes, None, None), — the undecodable read is still logged (without decoded text), not dropped
+crates/compat/src/natives/sound.rs:1968:Err(_) => (TjsValue::Void, None), — a non-retainable argument is the reference's void argument
+crates/compat/src/natives/system.rs:1467:Err(_) => FALLBACK_EXE_NAME.to_string(), — `System.exeName` falls back to the emulated executable name (D18)
+crates/compat/src/natives/system.rs:2210:Err(_) => return Ok(None), — a missing `RegisterData.tjs` clears the result, matching the reference
+crates/compat/src/natives/tree_owner.rs:332:Err(_) => false, — a failed handler call is a false callback result, as the reference treats a missing handler
+crates/compat/src/natives/video.rs:2258:Err(_) => set_null_out(resolved.engine(), out), — a non-duplicable video object yields the reference's null (both occurrences)
+crates/compat/src/natives/visual/bitmap.rs:722:Ok(_) | Err(_) => return Ok(type_name.to_string()), — a missing `bpp` uses the handler default, as a failed `PropGet` does in the reference
+crates/compat/src/natives/visual/layer/focus.rs:200:Err(_) => false, — a scene that cannot be borrowed has no live layer, so no focus event fires
+crates/compat/src/text.rs:373:Err(_) => dropped += 1, — an unpaired UTF-16 surrogate is counted as dropped; a representation limit, not a reference path
+crates/platform/media/src/image_decode.rs:123:Err(_) => {} — a mislabeled `.tlg` falls through to content detection (both occurrences)
+crates/platform/media/src/tlg.rs:78:Err(_) => return false, — `bytes[11..15]` is exactly four bytes, so `try_into` cannot fail
+crates/platform/render/src/vulkan/device.rs:278:Err(_) => false, — a failed extension-property query means the extension is unavailable
+crates/platform/render/src/vulkan/mod.rs:1361:Err(_) => { — a failed semaphore recreation sets it to null and reports failure
+crates/tjs/src/lib.rs:1694:Err(_) => return None, — a value the FFI layer cannot convert yields no value to the caller

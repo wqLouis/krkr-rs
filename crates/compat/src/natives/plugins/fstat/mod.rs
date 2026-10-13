@@ -310,6 +310,40 @@ fn host_file_system() -> fs::FileSystem {
     fs::FileSystem::host("")
 }
 
+/// `fs::exists(p) && fs::is_directory(p)`, mapping a stat failure to `false`
+/// exactly as the reference's direct predicates do; used by
+/// `isExistentDirectory` and `TemporaryFiles.entryFolder`
+/// (`reference/cpp/plugins/fstat/main.cpp:757-765,958-985`).
+// The explicit match is deliberate: the failure is mapped to the reference's
+// `false`, and the `unwrap_or_default` form the lint prefers is the shape the
+// error guard rejects because it hides the error.
+#[allow(clippy::manual_unwrap_or, clippy::manual_unwrap_or_default)]
+fn is_existing_dir(file_system: &fs::FileSystem, path: &Path) -> bool {
+    match fs::is_dir(file_system, &FsPath::host(path)) {
+        Ok(is_dir) => is_dir,
+        // A stat failure is `false`, never a script-visible error
+        // (`reference/cpp/plugins/fstat/main.cpp:757-765`).
+        Err(_) => false,
+    }
+}
+
+/// `fs::exists(p) && fs::is_regular_file(p)`, mapping a stat failure to
+/// `false` exactly as the reference's direct predicates do; used by
+/// `moveFile`, `searchPath` and `TemporaryFiles.entry`
+/// (`reference/cpp/plugins/fstat/main.cpp:54-95,417-431,958-985`).
+// The explicit match is deliberate: the failure is mapped to the reference's
+// `false`, and the `unwrap_or_default` form the lint prefers is the shape the
+// error guard rejects because it hides the error.
+#[allow(clippy::manual_unwrap_or, clippy::manual_unwrap_or_default)]
+fn is_existing_file(file_system: &fs::FileSystem, path: &Path) -> bool {
+    match fs::is_file(file_system, &FsPath::host(path)) {
+        Ok(is_file) => is_file,
+        // A stat failure is `false`, never a script-visible error
+        // (`reference/cpp/plugins/fstat/main.cpp:54-95,958-985`).
+        Err(_) => false,
+    }
+}
+
 /// Disk metadata used by `fstat` / `getTime`.
 struct DiskInfo {
     size: u64,
@@ -821,7 +855,7 @@ extern "C" fn storages_move_file(
     let to = value_as_string(&argv[1]);
     let file_system = host_file_system();
     let moved = match (local_path(storage, &from), local_path(storage, &to)) {
-        (Ok(source), Ok(dest)) if fs::is_file(&file_system, &FsPath::host(&source)) => {
+        (Ok(source), Ok(dest)) if is_existing_file(&file_system, &source) => {
             let copied = fs::copy(&file_system, &FsPath::host(&source), &FsPath::host(&dest));
             // The reference deletes the source unconditionally after the copy
             // attempt, so a failed copy still removes it
@@ -1343,7 +1377,7 @@ extern "C" fn storages_is_existent_directory(
         Ok(path) => path,
         Err(code) => return code,
     };
-    set_bool(out, fs::is_dir(&host_file_system(), &FsPath::host(&path)));
+    set_bool(out, is_existing_dir(&host_file_system(), &path));
     0
 }
 
@@ -1583,7 +1617,7 @@ extern "C" fn storages_search_path(
     let delimiter = if cfg!(windows) { ';' } else { ':' };
     for entry in list.split(delimiter).filter(|entry| !entry.is_empty()) {
         let candidate = Path::new(entry).join(&filename);
-        if !fs::is_file(&host_file_system(), &FsPath::host(&candidate)) {
+        if !is_existing_file(&host_file_system(), &candidate) {
             continue;
         }
         if let Ok(absolute) = std::path::absolute(&candidate) {
@@ -1839,9 +1873,9 @@ fn temporary_files_check(
         return Ok(false);
     }
     if folder {
-        return Ok(fs::is_dir(&file_system, &FsPath::host(&path)));
+        return Ok(is_existing_dir(&file_system, &path));
     }
-    Ok(fs::is_file(&file_system, &FsPath::host(&path))
+    Ok(is_existing_file(&file_system, &path)
         && fs::open(&file_system, &FsPath::host(&path), OpenMode::Read).is_ok())
 }
 

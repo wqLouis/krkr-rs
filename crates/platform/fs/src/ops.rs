@@ -540,25 +540,23 @@ fn system_time_millis(time: std::time::SystemTime) -> Option<i64> {
 
 /// Returns `true` if `path` exists and is a directory.
 ///
-/// A missing path or a stat failure is `false`, matching the `Path::is_dir`
-/// convenience this exposes through the bottom layer.
-pub fn is_dir(fs: &FileSystem, path: &FsPath) -> bool {
-    match metadata(fs, path) {
-        Ok(meta) => meta.is_dir,
-        Err(_) => false,
-    }
+/// A stat failure is a typed error; the bottom layer keeps a permission or I/O
+/// failure distinguishable from “not a directory”. A caller that needs the
+/// reference's “missing or unreadable is `false`” convenience decides so at
+/// its own boundary.
+pub fn is_dir(fs: &FileSystem, path: &FsPath) -> Result<bool, FsError> {
+    metadata(fs, path).map(|meta| meta.is_dir)
 }
 
 /// Returns `true` if `path` exists and is a regular file (symlinks are
 /// followed).
 ///
-/// A missing path or a stat failure is `false`, matching the `Path::is_file`
-/// convenience this exposes through the bottom layer.
-pub fn is_file(fs: &FileSystem, path: &FsPath) -> bool {
-    match metadata(fs, path) {
-        Ok(meta) => meta.is_file,
-        Err(_) => false,
-    }
+/// A stat failure is a typed error; the bottom layer keeps a permission or I/O
+/// failure distinguishable from “not a regular file”. A caller that needs the
+/// reference's “missing or unreadable is `false`” convenience decides so at
+/// its own boundary.
+pub fn is_file(fs: &FileSystem, path: &FsPath) -> Result<bool, FsError> {
+    metadata(fs, path).map(|meta| meta.is_file)
 }
 
 /// Removes the empty directory at `path`.
