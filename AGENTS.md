@@ -43,6 +43,14 @@ python3 scripts/plugin_parity.py --no-doc
 `scripts/surface_lock.py --update` is for the **main agent only**, after the
 change is understood.
 
+### Releases are metered — push a tag only on the user's go-ahead
+
+`.github/workflows/android.yml` triggers on `android-*` **tags** (a branch push
+triggers nothing). Each tag runs a full Android build, which costs CI minutes,
+so: commit locally, keep the gate green, and **hold the tag until the user says
+the build is wanted**. Do not tag and push on every green gate. Batch the work,
+report what is ready, and wait.
+
 The `platform-android` steps build the **feature on the host**, not the Android
 target: the feature compiles the platform-independent helpers plus a typed stub,
 and everything that needs `ndk` stays gated to `target_os = "android"`. The
