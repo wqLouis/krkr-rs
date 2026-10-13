@@ -72,27 +72,35 @@ pub(super) const LT_PS_EXCLUSION: i64 = 28;
 
 /// Decode a script `Layer.type` into the render pipeline's generic blend mode.
 ///
-/// Every documented type maps to its own behaviour (the core and Photoshop
-/// spellings of the same blend share a variant). `ltBinder` is a container and
-/// `ltEffect`/`ltFilter` are layer-effect callbacks, not bitmap blends; none of
-/// the three has a generic equivalent, so they degrade to
-/// [`BlendMode::SourceOver`] — a binder has no image in the reference anyway.
-/// Unknown / out-of-range values degrade safely to source-over.
-pub(super) const fn from_native(value: i64) -> BlendMode {
+/// Every documented blend type maps to its own behaviour, and the core and
+/// Photoshop spellings map to distinct variants so the encoder can reproduce
+/// the exact script value. `ltBinder` is a container and `ltEffect`/`ltFilter`
+/// are layer-effect callbacks, not bitmap blends; none of the three has a
+/// generic equivalent, so they degrade to [`BlendMode::SourceOver`] — a binder
+/// has no image in the reference anyway. Unknown / out-of-range values degrade
+/// safely to source-over.
+pub(crate) const fn from_native(value: i64) -> BlendMode {
     match value {
         LT_OPAQUE => BlendMode::Replace,
-        LT_ALPHA | LT_PS_NORMAL => BlendMode::SourceOver,
-        LT_ADDITIVE | LT_PS_ADDITIVE => BlendMode::Additive,
-        LT_SUBTRACTIVE | LT_PS_SUBTRACTIVE => BlendMode::Subtractive,
-        LT_MULTIPLICATIVE | LT_PS_MULTIPLICATIVE => BlendMode::Multiply,
-        LT_SCREEN | LT_PS_SCREEN => BlendMode::Screen,
+        LT_ALPHA => BlendMode::SourceOver,
+        LT_PS_NORMAL => BlendMode::PsNormal,
+        LT_ADDITIVE => BlendMode::Additive,
+        LT_PS_ADDITIVE => BlendMode::PsAdditive,
+        LT_SUBTRACTIVE => BlendMode::Subtractive,
+        LT_PS_SUBTRACTIVE => BlendMode::PsSubtractive,
+        LT_MULTIPLICATIVE => BlendMode::Multiply,
+        LT_PS_MULTIPLICATIVE => BlendMode::PsMultiplicative,
+        LT_SCREEN => BlendMode::Screen,
+        LT_PS_SCREEN => BlendMode::PsScreen,
         LT_ADD_ALPHA => BlendMode::AddAlpha,
-        // `ltDodge` uses the same colour-dodge math as `ltPsColorDodge`.
-        LT_DODGE | LT_PS_COLOR_DODGE => BlendMode::DestinationDependent(DstBlend::ColorDodge),
+        LT_DODGE => BlendMode::DestinationDependent(DstBlend::ColorDodge),
+        LT_PS_COLOR_DODGE => BlendMode::DestinationDependent(DstBlend::PsColorDodge),
         LT_PS_COLOR_DODGE5 => BlendMode::DestinationDependent(DstBlend::ColorDodge5),
         LT_PS_COLOR_BURN => BlendMode::DestinationDependent(DstBlend::ColorBurn),
-        LT_DARKEN | LT_PS_DARKEN => BlendMode::DestinationDependent(DstBlend::Darken),
-        LT_LIGHTEN | LT_PS_LIGHTEN => BlendMode::DestinationDependent(DstBlend::Lighten),
+        LT_DARKEN => BlendMode::DestinationDependent(DstBlend::Darken),
+        LT_PS_DARKEN => BlendMode::DestinationDependent(DstBlend::PsDarken),
+        LT_LIGHTEN => BlendMode::DestinationDependent(DstBlend::Lighten),
+        LT_PS_LIGHTEN => BlendMode::DestinationDependent(DstBlend::PsLighten),
         LT_PS_DIFFERENCE => BlendMode::DestinationDependent(DstBlend::Difference),
         LT_PS_DIFFERENCE5 => BlendMode::DestinationDependent(DstBlend::Difference5),
         LT_PS_EXCLUSION => BlendMode::DestinationDependent(DstBlend::Exclusion),
@@ -104,26 +112,33 @@ pub(super) const fn from_native(value: i64) -> BlendMode {
     }
 }
 
-/// Encode a generic blend mode as its canonical script `Layer.type`.
+/// Encode a generic blend mode as its script `Layer.type`.
 ///
-/// Several native types share one generic behaviour (e.g. `ltMultiplicative`
-/// and `ltPsMultiplicative` both map to [`BlendMode::Multiply`]); the encoder
-/// always returns the original, non-Photoshop spelling where one exists, and
-/// the `ltPs*` spelling only for the blends with no original.
+/// The inverse of [`from_native`]: every distinct native spelling round-trips
+/// to itself, including the Photoshop spellings that share a blend formula
+/// with a non-Photoshop type.
 pub(super) const fn to_native(blend: BlendMode) -> i64 {
     match blend {
         BlendMode::Replace => LT_OPAQUE,
         BlendMode::SourceOver => LT_ALPHA,
+        BlendMode::PsNormal => LT_PS_NORMAL,
         BlendMode::Additive => LT_ADDITIVE,
+        BlendMode::PsAdditive => LT_PS_ADDITIVE,
         BlendMode::Subtractive => LT_SUBTRACTIVE,
+        BlendMode::PsSubtractive => LT_PS_SUBTRACTIVE,
         BlendMode::Multiply => LT_MULTIPLICATIVE,
+        BlendMode::PsMultiplicative => LT_PS_MULTIPLICATIVE,
         BlendMode::Screen => LT_SCREEN,
+        BlendMode::PsScreen => LT_PS_SCREEN,
         BlendMode::AddAlpha => LT_ADD_ALPHA,
         BlendMode::DestinationDependent(DstBlend::ColorDodge) => LT_DODGE,
+        BlendMode::DestinationDependent(DstBlend::PsColorDodge) => LT_PS_COLOR_DODGE,
         BlendMode::DestinationDependent(DstBlend::ColorDodge5) => LT_PS_COLOR_DODGE5,
         BlendMode::DestinationDependent(DstBlend::ColorBurn) => LT_PS_COLOR_BURN,
         BlendMode::DestinationDependent(DstBlend::Darken) => LT_DARKEN,
+        BlendMode::DestinationDependent(DstBlend::PsDarken) => LT_PS_DARKEN,
         BlendMode::DestinationDependent(DstBlend::Lighten) => LT_LIGHTEN,
+        BlendMode::DestinationDependent(DstBlend::PsLighten) => LT_PS_LIGHTEN,
         BlendMode::DestinationDependent(DstBlend::Difference) => LT_PS_DIFFERENCE,
         BlendMode::DestinationDependent(DstBlend::Difference5) => LT_PS_DIFFERENCE5,
         BlendMode::DestinationDependent(DstBlend::Exclusion) => LT_PS_EXCLUSION,

@@ -4,8 +4,8 @@
 //! must implement. The middle layer maps its own TVP `Layer.type` numbering
 //! onto these values; the pipeline never learns about TVP numbering. Most
 //! modes map directly to fixed-function blend state; the
-//! [`BlendMode::DestinationDependent`] variants require reading the
-//! destination and are handled with a dedicated shader path.
+//! [`BlendMode::DestinationDependent`] variants and the Photoshop
+//! additive/subtractive modes require reading the destination.
 
 /// Destination-dependent blend mode.
 ///
@@ -17,14 +17,20 @@
 pub enum DstBlend {
     /// Photoshop `Color Dodge`: `dst / (1 - src)`.
     ColorDodge,
+    /// Photoshop `Color Dodge` under the `ltPsColorDodge` spelling.
+    PsColorDodge,
     /// The legacy `ColorDodge5` approximation used by KiriKiri.
     ColorDodge5,
     /// Photoshop `Color Burn`: `1 - (1 - dst) / src`.
     ColorBurn,
     /// Per-channel minimum.
     Darken,
+    /// Per-channel minimum under the `ltPsDarken` spelling.
+    PsDarken,
     /// Per-channel maximum.
     Lighten,
+    /// Per-channel maximum under the `ltPsLighten` spelling.
+    PsLighten,
     /// Absolute per-channel difference.
     Difference,
     /// The legacy `Difference5` approximation used by KiriKiri.
@@ -60,6 +66,20 @@ pub enum BlendMode {
     Multiply,
     /// Screen blending: `src + dst - src·dst`.
     Screen,
+    /// Photoshop normal: the same source-over result as
+    /// [`BlendMode::SourceOver`], kept distinct so the `ltPsNormal` spelling
+    /// survives a round-trip.
+    PsNormal,
+    /// Photoshop additive: the per-channel sum is saturated before the source
+    /// alpha blends it over the destination.
+    PsAdditive,
+    /// Photoshop subtractive: the per-channel difference is clamped before the
+    /// source alpha blends it over the destination.
+    PsSubtractive,
+    /// Photoshop multiplicative: `src·dst`, then source-alpha blended.
+    PsMultiplicative,
+    /// Photoshop screen: `src + dst - src·dst`, then source-alpha blended.
+    PsScreen,
     /// A mode that must sample the destination.
     DestinationDependent(DstBlend),
 }

@@ -11,12 +11,11 @@
 //!
 //! Known reference divergences that **cannot** be fixed inside the audited
 //! files (documented here so the exclusions are visible):
-//! * `Layer.type` echoes only the *canonical* spelling of the generic blend
-//!   it stores (`layer/mod.rs` getter + `engine::LayerState::blend`), while
-//!   the reference stores and re-reads the raw `tTVPLayerType`
-//!   (`LayerIntf.cpp:10832-10846`); the non-canonical spellings
-//!   (0, 6, 7, 13–17, 21, 24, 25) therefore read back canonicalised. The
-//!   canonical round-trip is pinned below.
+//! * `Layer.type` round-trips the raw `tTVPLayerType` for every bitmap blend
+//!   (1-5, 8-28) through the generic `BlendMode`
+//!   (`LayerIntf.cpp:10832-10846`); only `ltBinder` (0), `ltEffect` (6) and
+//!   `ltFilter` (7), container/callback types with no generic bitmap blend,
+//!   read back as `ltAlpha` (2). The round-trip is pinned below.
 //! * The reference `dtNone` … `dtDBD3D` members are reachable through an
 //!   *instance* as well (`tTJSNativeClass` member fallback); the port
 //!   registers them as class (static) members only, because adding
@@ -328,19 +327,21 @@ fn lock_touch_size_requires_two_arguments() {
 /// Reference: `Layer.type` reads/writes `tTVPLayerType`
 /// (`reference/cpp/core/visual/LayerIntf.cpp:10832-10846`, stored raw by
 /// `SetType` `LayerIntf.cpp:1687-1700`) and the getter writes a
-/// `tjs_int` — an **Integer**, never a real. The port stores the generic
-/// blend, so only the canonical spellings round-trip: every value whose
-/// canonical encoder (`blend::to_native`) reproduces it. See the file
-/// header for the excluded non-canonical spellings.
+/// `tjs_int` — an **Integer**, never a real. Every blend spelling
+/// round-trips, including the Photoshop spellings that share a formula with a
+/// non-Photoshop type; `ltBinder`/`ltEffect`/`ltFilter` are containers and
+/// callbacks rather than bitmap blends and read back as `ltAlpha`. See the
+/// file header.
 #[test]
-fn layer_type_round_trips_canonical_values_and_is_an_integer() {
+fn layer_type_round_trips_every_blend_spelling_as_an_integer() {
     let _lock = vm_lock();
     let env = Env::new();
     layer_with_image(&env, 1, 1);
-    // Canonical spellings of the shared blends (ltOpaque … ltPsExclusion),
-    // `reference/cpp/core/visual/drawable.h:19-51`.
+    // Every bitmap blend type (`reference/cpp/core/visual/drawable.h:19-51`);
+    // the container/callback types 0, 6 and 7 are excluded.
     for value in [
-        1, 2, 3, 4, 5, 8, 9, 10, 11, 12, 18, 19, 20, 22, 23, 26, 27, 28,
+        1, 2, 3, 4, 5, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
+        27, 28,
     ] {
         env.run(&format!("l.type = {value};"));
         assert_eq!(
@@ -1928,6 +1929,68 @@ fn df_auto_face_resolves_from_the_layer_type() {
     // dfAlpha fill writes alpha = 255; dfOpaque holds the old alpha.
     assert_eq!(env.eval_int("mask_alpha"), 255);
     assert_eq!(env.eval_int("mask_opaque"), 100);
+}
+
+/// Reference: `UpdateDrawFace` (`reference/cpp/core/visual/LayerIntf.cpp:1529-1618`)
+/// derives the effective face from the layer type when `Face == dfAuto`
+/// (128): every `ltPs*` type resolves to `dfAlpha`, `ltAddAlpha` resolves to
+/// `dfAddAlpha`, and the non-Photoshop blend types (`ltOpaque`, `ltAdditive`,
+/// `ltSubtractive`, `ltMultiplicative`, `ltDodge`, `ltDarken`, `ltLighten`,
+/// `ltScreen`) resolve to `dfOpaque`. `convertType` only accepts the
+/// `dfAlpha`/`dfAddAlpha` faces (`LayerIntf.cpp:1984-2000`), so it exposes the
+/// resolved face to script.
+#[test]
+fn df_auto_face_follows_update_draw_face_for_every_layer_type() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run("var w = new Window();");
+    // (native type, expected face: 0 = dfAlpha, 4 = dfAddAlpha, 1 = dfOpaque)
+    let cases: &[(i64, i32)] = &[
+        (1, 1),
+        (2, 0),
+        (3, 1),
+        (4, 1),
+        (5, 1),
+        (8, 1),
+        (9, 1),
+        (10, 1),
+        (11, 1),
+        (12, 4),
+        (13, 0),
+        (14, 0),
+        (15, 0),
+        (16, 0),
+        (17, 0),
+        (18, 0),
+        (19, 0),
+        (20, 0),
+        (21, 0),
+        (22, 0),
+        (23, 0),
+        (24, 0),
+        (25, 0),
+        (26, 0),
+        (27, 0),
+        (28, 0),
+    ];
+    for &(native, expected_face) in cases {
+        // A fresh layer keeps a successful conversion from carrying over.
+        env.run(&format!(
+            "var l = new Layer(w, null); l.setImageSize(1, 1); l.face = 128; l.type = {native}; \
+             var c4 = 0; try {{ l.convertType(4); c4 = 1; }} catch (e) {{}} \
+             var c0 = 0; try {{ l.convertType(0); c0 = 1; }} catch (e) {{}}"
+        ));
+        let c4 = env.eval_int("c4");
+        let c0 = env.eval_int("c0");
+        let observed = if c4 == 1 {
+            0
+        } else if c0 == 1 {
+            4
+        } else {
+            1
+        };
+        assert_eq!(observed, expected_face, "layer type {native}");
+    }
 }
 
 /// Reference: `gaussianBlur` (`ApplyGaussianBlur`,

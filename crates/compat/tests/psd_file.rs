@@ -405,6 +405,10 @@ fn get_layer_data_decodes_rle_pixels() {
     assert_eq!(env.eval_int("l.height"), 2);
     assert_eq!(env.eval_int("l.imageWidth"), 2);
     assert_eq!(env.eval_int("l.name == 'LayerOne'"), 1);
+    // `getLayerData` maps the PSD blend through the same native decoder as
+    // `Layer.type`; `norm` is `ltPsNormal` (13), not the collapsed `ltAlpha`.
+    // reference/cpp/plugins/psdfile/psdclass.cpp:16-17
+    assert_eq!(env.eval_int("l.type"), 13);
 
     // The reference `Layer` member list registers no `id`
     // (`reference/cpp/core/visual/LayerIntf.cpp:8283`): reading it raises,

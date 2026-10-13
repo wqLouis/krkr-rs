@@ -156,7 +156,7 @@ fn layer_type_maps_every_native_blend_to_its_behaviour() {
     let _lock = vm_lock();
     let env = Env::new();
     env.run("var w = new Window(); var l = new Layer(w, null);");
-    // (native `lt*`, decoded behaviour, canonical native it encodes back to)
+    // (native `lt*`, decoded behaviour, native it encodes back to)
     let cases: &[(i64, BlendMode, i64)] = &[
         (0, BlendMode::SourceOver, 2),  // ltBinder (container, no blend)
         (1, BlendMode::Replace, 1),     // ltOpaque
@@ -171,23 +171,27 @@ fn layer_type_maps_every_native_blend_to_its_behaviour() {
         (10, BlendMode::DestinationDependent(DstBlend::Lighten), 10),
         (11, BlendMode::Screen, 11),
         (12, BlendMode::AddAlpha, 12),
-        (13, BlendMode::SourceOver, 2),
-        (14, BlendMode::Additive, 3),
-        (15, BlendMode::Subtractive, 4),
-        (16, BlendMode::Multiply, 5),
-        (17, BlendMode::Screen, 11),
+        (13, BlendMode::PsNormal, 13),
+        (14, BlendMode::PsAdditive, 14),
+        (15, BlendMode::PsSubtractive, 15),
+        (16, BlendMode::PsMultiplicative, 16),
+        (17, BlendMode::PsScreen, 17),
         (18, BlendMode::DestinationDependent(DstBlend::Overlay), 18),
         (19, BlendMode::DestinationDependent(DstBlend::HardLight), 19),
         (20, BlendMode::DestinationDependent(DstBlend::SoftLight), 20),
-        (21, BlendMode::DestinationDependent(DstBlend::ColorDodge), 8),
+        (
+            21,
+            BlendMode::DestinationDependent(DstBlend::PsColorDodge),
+            21,
+        ),
         (
             22,
             BlendMode::DestinationDependent(DstBlend::ColorDodge5),
             22,
         ),
         (23, BlendMode::DestinationDependent(DstBlend::ColorBurn), 23),
-        (24, BlendMode::DestinationDependent(DstBlend::Lighten), 10),
-        (25, BlendMode::DestinationDependent(DstBlend::Darken), 9),
+        (24, BlendMode::DestinationDependent(DstBlend::PsLighten), 24),
+        (25, BlendMode::DestinationDependent(DstBlend::PsDarken), 25),
         (
             26,
             BlendMode::DestinationDependent(DstBlend::Difference),

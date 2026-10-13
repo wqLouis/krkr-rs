@@ -26,7 +26,7 @@
 
 use std::ffi::{c_char, c_int, c_void};
 
-use api::blend::{BlendMode as SceneBlend, DstBlend};
+use api::blend::BlendMode as SceneBlend;
 use api::fs::FsPath;
 use engine::{Scene, StorageReadError};
 use tjs::{
@@ -37,6 +37,7 @@ use tjs::{
 
 use crate::native_util::{args, report_error, set_bool, set_int, set_void, value_as_string};
 use crate::natives::system::{resolve, set_string_out, value_as_i64};
+use crate::natives::visual::from_native;
 use crate::storage::strip_file_media;
 use crate::{CompatCtx, CompatError};
 
@@ -269,30 +270,9 @@ fn argb_to_rgba(color: i64) -> [u8; 4] {
     ]
 }
 
-/// Map a KiriKiri `tTVPLayerType` onto the render pipeline's blend mode
-/// (mirrors `visual/layer/blend.rs::from_native`).
+/// Map a KiriKiri `tTVPLayerType` onto the render pipeline's blend mode.
 fn native_to_blend(value: i32) -> SceneBlend {
-    match value {
-        1 => SceneBlend::Replace,
-        2 | 13 => SceneBlend::SourceOver,
-        3 | 14 => SceneBlend::Additive,
-        4 | 15 => SceneBlend::Subtractive,
-        5 | 16 => SceneBlend::Multiply,
-        11 | 17 => SceneBlend::Screen,
-        12 => SceneBlend::AddAlpha,
-        8 | 21 => SceneBlend::DestinationDependent(DstBlend::ColorDodge),
-        22 => SceneBlend::DestinationDependent(DstBlend::ColorDodge5),
-        23 => SceneBlend::DestinationDependent(DstBlend::ColorBurn),
-        9 | 25 => SceneBlend::DestinationDependent(DstBlend::Darken),
-        10 | 24 => SceneBlend::DestinationDependent(DstBlend::Lighten),
-        26 => SceneBlend::DestinationDependent(DstBlend::Difference),
-        27 => SceneBlend::DestinationDependent(DstBlend::Difference5),
-        28 => SceneBlend::DestinationDependent(DstBlend::Exclusion),
-        18 => SceneBlend::DestinationDependent(DstBlend::Overlay),
-        19 => SceneBlend::DestinationDependent(DstBlend::HardLight),
-        20 => SceneBlend::DestinationDependent(DstBlend::SoftLight),
-        _ => SceneBlend::SourceOver,
-    }
+    from_native(i64::from(value))
 }
 
 /// Allocate (or resize) `layer_id`'s bitmap and return its id, filling new

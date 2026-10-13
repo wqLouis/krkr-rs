@@ -83,7 +83,7 @@ use crate::{CompatCtx, CompatError};
 mod bitmap;
 mod common;
 pub(crate) use common::{ObjectKind, duplicate_object};
-pub(crate) use layer::{clear_layer_focus, focus_layer, focus_layer_in_input_domain};
+pub(crate) use layer::{clear_layer_focus, focus_layer, focus_layer_in_input_domain, from_native};
 mod draw_device;
 mod font;
 mod layer;

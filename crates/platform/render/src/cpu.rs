@@ -393,11 +393,19 @@ fn composite(mode: BlendMode, dst: [f32; 4], src: [f32; 4]) -> ([f32; 3], f32) {
             ];
             (rgb, dst[3])
         }
-        BlendMode::SourceOver => {
+        BlendMode::SourceOver | BlendMode::PsNormal => {
+            // The reference `bmPsNormal` alpha blend is the same per-channel
+            // lerp as the non-Photoshop `bmAlpha`.
             let rgb = lerp3(d, s, a);
             (rgb, over_alpha(dst[3], a))
         }
-        BlendMode::Multiply | BlendMode::Screen | BlendMode::DestinationDependent(_) => {
+        BlendMode::Multiply
+        | BlendMode::Screen
+        | BlendMode::PsAdditive
+        | BlendMode::PsSubtractive
+        | BlendMode::PsMultiplicative
+        | BlendMode::PsScreen
+        | BlendMode::DestinationDependent(_) => {
             let blended = [
                 blend_channel(mode, d[0], s[0]),
                 blend_channel(mode, d[1], s[1]),
@@ -435,15 +443,26 @@ fn blend_channel(mode: BlendMode, d: f32, s: f32) -> f32 {
     let value = match mode {
         BlendMode::Multiply => d * s,
         BlendMode::Screen => d + s - d * s,
+        // Photoshop additive/subtractive saturate the per-channel sum or
+        // difference before the source alpha blends the result over the
+        // destination (`reference/cpp/core/visual/tvpgl.cpp:12539-12562`,
+        // `TVPPsOperationAddBlend`/`TVPPsOperationSubBlend`).
+        BlendMode::PsAdditive => (d + s).min(1.0),
+        BlendMode::PsSubtractive => (d - s).max(0.0),
+        // Photoshop multiplicative/screen share the per-channel blend
+        // function of the non-Photoshop modes; only the alpha blend around it
+        // differs, and this backend alpha-blends both.
+        BlendMode::PsMultiplicative => d * s,
+        BlendMode::PsScreen => d + s - d * s,
         BlendMode::DestinationDependent(kind) => match kind {
-            DstBlend::Darken => d.min(s),
-            DstBlend::Lighten => d.max(s),
+            DstBlend::Darken | DstBlend::PsDarken => d.min(s),
+            DstBlend::Lighten | DstBlend::PsLighten => d.max(s),
             DstBlend::Difference | DstBlend::Difference5 => (d - s).abs(),
             DstBlend::Exclusion => d + s - 2.0 * d * s,
             DstBlend::Overlay => hard_light(s, d),
             DstBlend::HardLight => hard_light(d, s),
             DstBlend::SoftLight => soft_light(d, s),
-            DstBlend::ColorDodge | DstBlend::ColorDodge5 => {
+            DstBlend::ColorDodge | DstBlend::ColorDodge5 | DstBlend::PsColorDodge => {
                 if s >= 1.0 {
                     1.0
                 } else {
@@ -647,4 +666,83 @@ fn clamp_opacity(opacity: f32) -> f32 {
 /// Encodes a `[0, 1]` channel as an 8-bit value.
 fn to_u8(channel: f32) -> u8 {
     (channel.clamp(0.0, 1.0) * 255.0 + 0.5) as u8
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Composites one pixel and encodes it as RGBA8, matching
+    /// [`Canvas::compose`].
+    fn blend_u8(mode: BlendMode, dst: [f32; 4], src: [f32; 4]) -> [u8; 4] {
+        let (rgb, alpha) = composite(mode, dst, src);
+        [to_u8(rgb[0]), to_u8(rgb[1]), to_u8(rgb[2]), to_u8(alpha)]
+    }
+
+    /// Reference: the Photoshop layer types keep their own compositing
+    /// formula (`reference/cpp/core/visual/tvpgl.cpp:12537-12593`,
+    /// `LayerBitmapIntf.cpp:1740-1763`). `bmPsNormal` is the same alpha blend
+    /// as `bmAlpha`; `bmPsAdditive`/`bmPsSubtractive` saturate the per-channel
+    /// sum/difference **before** the source alpha blends the result over the
+    /// destination; `bmPsMultiplicative`/`bmPsScreen` apply the blend function
+    /// and then the alpha blend. An opaque source isolates the blend function;
+    /// a half-transparent source shows the pre-blend saturation.
+    #[test]
+    fn photoshop_blends_match_the_reference_formula() {
+        let dst = [0.25, 0.5, 0.75, 1.0];
+        let src = [0.75, 0.5, 0.3, 1.0];
+        // The port blends in f32, so a channel landing on an 8-bit
+        // half-boundary can differ from the reference integer path by ±1
+        // (D34 rendering allowance); the values below stay off that boundary.
+        let opaque: &[(BlendMode, [u8; 4])] = &[
+            (BlendMode::PsNormal, [191, 128, 77, 255]),
+            (BlendMode::PsAdditive, [255, 255, 255, 255]),
+            (BlendMode::PsSubtractive, [0, 0, 115, 255]),
+            (BlendMode::PsMultiplicative, [48, 64, 57, 255]),
+            (BlendMode::PsScreen, [207, 191, 210, 255]),
+            (
+                BlendMode::DestinationDependent(DstBlend::PsColorDodge),
+                [255, 255, 255, 255],
+            ),
+            (
+                BlendMode::DestinationDependent(DstBlend::PsDarken),
+                [64, 128, 77, 255],
+            ),
+            (
+                BlendMode::DestinationDependent(DstBlend::PsLighten),
+                [191, 128, 191, 255],
+            ),
+        ];
+        for (mode, expected) in opaque {
+            assert_eq!(
+                blend_u8(*mode, dst, src),
+                *expected,
+                "opaque blend {mode:?}"
+            );
+        }
+
+        let half_dst = [0.2, 0.2, 0.2, 1.0];
+        let half_src = [0.9, 0.9, 0.9, 0.5];
+        let half: &[(BlendMode, [u8; 4])] = &[
+            (BlendMode::PsNormal, [140, 140, 140, 255]),
+            (BlendMode::PsAdditive, [153, 153, 153, 255]),
+            (BlendMode::PsSubtractive, [26, 26, 26, 255]),
+            (BlendMode::PsMultiplicative, [48, 48, 48, 255]),
+            (BlendMode::PsScreen, [143, 143, 143, 255]),
+        ];
+        for (mode, expected) in half {
+            assert_eq!(
+                blend_u8(*mode, half_dst, half_src),
+                *expected,
+                "half-alpha blend {mode:?}"
+            );
+        }
+
+        // The Photoshop additive saturates before the alpha blend, so it is
+        // not the non-Photoshop additive.
+        assert_ne!(
+            blend_u8(BlendMode::Additive, half_dst, half_src),
+            [153, 153, 153, 255]
+        );
+    }
 }

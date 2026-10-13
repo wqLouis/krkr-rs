@@ -1722,9 +1722,9 @@ pub fn gaussian_blur(bitmap: &mut BitmapState, rect: RectI, radius: i32, sigma: 
 }
 
 /// Blend one source pixel onto `dst` using a `tTVPBlendOperationMode`
-/// (`LayerIntf.h:76`). The Photoshop-specific modes without a C fallback in
-/// the reference reduce to source-over (the assembly pipeline is absent);
-/// `omPsHardLight` is implemented because the SDK `doBlurLight` uses it.
+/// (`LayerIntf.h:76`). The Photoshop modes (`omPs*`) apply their per-channel
+/// blend function and then the source alpha; the modes with no dedicated
+/// kernel reduce to source-over.
 pub(crate) fn blend_pixel_mode(
     dst: &mut BitmapState,
     x: i32,
@@ -1803,8 +1803,90 @@ pub(crate) fn blend_pixel_mode(
             blended[3] = src[3];
             blend_pixel(dst, x, y, blended, 255, opa);
         }
-        // Everything else (omAlpha=2, omPsNormal=13, omAddAlpha=12, and the
-        // remaining PS modes): source-over.
+        // The Photoshop modes apply their per-channel blend function and then
+        // the source alpha, matching `TVPPS_ALPHABLEND`
+        // (`reference/cpp/core/visual/tvpgl.cpp:12522-12537`).
+        // omPsNormal / ltPsNormal: the same alpha blend as omAlpha.
+        13 => blend_pixel(dst, x, y, src, 255, opa),
+        // omPsAdditive / ltPsAdditive.
+        14 => {
+            let d = read_pixel(dst, x, y);
+            let mut blended = [0u8; 4];
+            for c in 0..3 {
+                blended[c] = d[c].saturating_add(src[c]);
+            }
+            blended[3] = src[3];
+            blend_pixel(dst, x, y, blended, 255, opa);
+        }
+        // omPsSubtractive / ltPsSubtractive.
+        15 => {
+            let d = read_pixel(dst, x, y);
+            let mut blended = [0u8; 4];
+            for c in 0..3 {
+                blended[c] = d[c].saturating_sub(src[c]);
+            }
+            blended[3] = src[3];
+            blend_pixel(dst, x, y, blended, 255, opa);
+        }
+        // omPsMultiplicative / ltPsMultiplicative.
+        16 => {
+            let d = read_pixel(dst, x, y);
+            let mut blended = [0u8; 4];
+            for c in 0..3 {
+                blended[c] = (u32::from(d[c]) * u32::from(src[c]) / 255) as u8;
+            }
+            blended[3] = src[3];
+            blend_pixel(dst, x, y, blended, 255, opa);
+        }
+        // omPsScreen / ltPsScreen.
+        17 => {
+            let d = read_pixel(dst, x, y);
+            let mut blended = [0u8; 4];
+            for c in 0..3 {
+                blended[c] =
+                    (255 - (255 - u32::from(d[c])) * (255 - u32::from(src[c])) / 255) as u8;
+            }
+            blended[3] = src[3];
+            blend_pixel(dst, x, y, blended, 255, opa);
+        }
+        // omPsColorDodge / ltPsColorDodge.
+        21 => {
+            let d = read_pixel(dst, x, y);
+            let mut blended = [0u8; 4];
+            for c in 0..3 {
+                let dv = i32::from(d[c]);
+                let sv = i32::from(src[c]);
+                blended[c] = if sv >= 255 {
+                    255
+                } else {
+                    ((dv * 255) / (255 - sv)).min(255) as u8
+                };
+            }
+            blended[3] = src[3];
+            blend_pixel(dst, x, y, blended, 255, opa);
+        }
+        // omPsLighten / ltPsLighten.
+        24 => {
+            let d = read_pixel(dst, x, y);
+            let mut blended = [0u8; 4];
+            for c in 0..3 {
+                blended[c] = d[c].max(src[c]);
+            }
+            blended[3] = src[3];
+            blend_pixel(dst, x, y, blended, 255, opa);
+        }
+        // omPsDarken / ltPsDarken.
+        25 => {
+            let d = read_pixel(dst, x, y);
+            let mut blended = [0u8; 4];
+            for c in 0..3 {
+                blended[c] = d[c].min(src[c]);
+            }
+            blended[3] = src[3];
+            blend_pixel(dst, x, y, blended, 255, opa);
+        }
+        // Everything else (omAlpha=2, omAddAlpha=12 and the remaining modes):
+        // source-over.
         _ => blend_pixel(dst, x, y, src, 255, opa),
     }
 }
@@ -2003,30 +2085,38 @@ pub fn affine_blit(
 ///
 /// A `tTVPBlendOperationMode` shares the native `tTVPLayerType` numbering
 /// (`omOpaque == ltOpaque == 1`, …), so each generic mode maps to the type
-/// whose behaviour it names — preferring the original (non-`ltPs`) type where
-/// one exists. The subtree composite starts from the typed L2 blend; the
-/// `operate*` family receives an explicit native operation mode from L3.
+/// whose behaviour it names. The subtree composite starts from the typed L2
+/// blend; the `operate*` family receives an explicit native operation mode
+/// from L3.
 const fn blend_operation_mode(blend: BlendMode) -> i64 {
     match blend {
-        BlendMode::Replace => 1,     // omOpaque / ltOpaque
-        BlendMode::SourceOver => 2,  // omAlpha / ltAlpha
-        BlendMode::Additive => 3,    // omAdditive / ltAdditive
-        BlendMode::Subtractive => 4, // omSubtractive / ltSubtractive
-        BlendMode::Multiply => 5,    // omMultiplicative / ltMultiplicative
-        BlendMode::AddAlpha => 12,   // omAddAlpha / ltAddAlpha
-        BlendMode::Screen => 11,     // omScreen / ltScreen
+        BlendMode::Replace => 1,           // omOpaque / ltOpaque
+        BlendMode::SourceOver => 2,        // omAlpha / ltAlpha
+        BlendMode::Additive => 3,          // omAdditive / ltAdditive
+        BlendMode::Subtractive => 4,       // omSubtractive / ltSubtractive
+        BlendMode::Multiply => 5,          // omMultiplicative / ltMultiplicative
+        BlendMode::AddAlpha => 12,         // omAddAlpha / ltAddAlpha
+        BlendMode::Screen => 11,           // omScreen / ltScreen
+        BlendMode::PsNormal => 13,         // omPsNormal / ltPsNormal
+        BlendMode::PsAdditive => 14,       // omPsAdditive / ltPsAdditive
+        BlendMode::PsSubtractive => 15,    // omPsSubtractive / ltPsSubtractive
+        BlendMode::PsMultiplicative => 16, // omPsMultiplicative / ltPsMultiplicative
+        BlendMode::PsScreen => 17,         // omPsScreen / ltPsScreen
         BlendMode::DestinationDependent(kind) => match kind {
-            DstBlend::ColorDodge => 8,   // omDodge / ltDodge
-            DstBlend::ColorDodge5 => 22, // omPsColorDodge5 / ltPsColorDodge5
-            DstBlend::ColorBurn => 23,   // omPsColorBurn / ltPsColorBurn
-            DstBlend::Darken => 9,       // omDarken / ltDarken
-            DstBlend::Lighten => 10,     // omLighten / ltLighten
-            DstBlend::Difference => 26,  // omPsDifference / ltPsDifference
-            DstBlend::Difference5 => 27, // omPsDifference5 / ltPsDifference5
-            DstBlend::Exclusion => 28,   // omPsExclusion / ltPsExclusion
-            DstBlend::Overlay => 18,     // omPsOverlay / ltPsOverlay
-            DstBlend::HardLight => 19,   // omPsHardLight / ltPsHardLight
-            DstBlend::SoftLight => 20,   // omPsSoftLight / ltPsSoftLight
+            DstBlend::ColorDodge => 8,    // omDodge / ltDodge
+            DstBlend::PsColorDodge => 21, // omPsColorDodge / ltPsColorDodge
+            DstBlend::ColorDodge5 => 22,  // omPsColorDodge5 / ltPsColorDodge5
+            DstBlend::ColorBurn => 23,    // omPsColorBurn / ltPsColorBurn
+            DstBlend::Darken => 9,        // omDarken / ltDarken
+            DstBlend::PsDarken => 25,     // omPsDarken / ltPsDarken
+            DstBlend::Lighten => 10,      // omLighten / ltLighten
+            DstBlend::PsLighten => 24,    // omPsLighten / ltPsLighten
+            DstBlend::Difference => 26,   // omPsDifference / ltPsDifference
+            DstBlend::Difference5 => 27,  // omPsDifference5 / ltPsDifference5
+            DstBlend::Exclusion => 28,    // omPsExclusion / ltPsExclusion
+            DstBlend::Overlay => 18,      // omPsOverlay / ltPsOverlay
+            DstBlend::HardLight => 19,    // omPsHardLight / ltPsHardLight
+            DstBlend::SoftLight => 20,    // omPsSoftLight / ltPsSoftLight
         },
     }
 }

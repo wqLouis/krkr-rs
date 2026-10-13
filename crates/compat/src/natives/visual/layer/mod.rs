@@ -28,6 +28,7 @@ mod pixels;
 mod transitions;
 mod util;
 
+pub(crate) use blend::from_native;
 pub use focus::take_capture_releases;
 pub(crate) use focus::{
     blur_tree, clear_domain_focus, clear_layer_focus, focus_layer, focus_layer_in_input_domain,

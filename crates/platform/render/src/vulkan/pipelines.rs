@@ -228,15 +228,26 @@ pub(crate) fn create(
 /// [`PipelineSet::pipeline_for`] to report them as unsupported.
 fn blend_slot(mode: BlendMode) -> Option<usize> {
     match mode {
-        BlendMode::SourceOver => Some(0),
+        // Photoshop normal is the same source-over as `ltAlpha`.
+        BlendMode::SourceOver | BlendMode::PsNormal => Some(0),
         BlendMode::Replace => Some(1),
-        BlendMode::Additive => Some(2),
-        BlendMode::Subtractive => Some(3),
+        // Slot 2 is `src·a + dst` while the reference `bmPsAdditive` is
+        // `lerp(dst, min(1, dst+src), a)`; they differ only at the saturation
+        // boundary (slot 3 likewise at the clamp boundary for
+        // `bmPsSubtractive`). Reusing the slots is the same near-identical
+        // approximation the multiplicative/screen arms make, and it keeps a
+        // layer that previously rendered from failing the frame.
+        BlendMode::Additive | BlendMode::PsAdditive => Some(2),
+        BlendMode::Subtractive | BlendMode::PsSubtractive => Some(3),
         BlendMode::AddAlpha => Some(4),
-        BlendMode::Multiply => Some(5),
-        BlendMode::Screen => Some(6),
-        // These modes must read the destination color, so the fixed-function
-        // blend state cannot express them.
+        // The Photoshop multiplicative/screen fixed-function slots carry the
+        // same per-channel blend function; the source-alpha weighting the
+        // reference applies around it is the approximation the non-Photoshop
+        // slots already make.
+        BlendMode::Multiply | BlendMode::PsMultiplicative => Some(5),
+        BlendMode::Screen | BlendMode::PsScreen => Some(6),
+        // The destination-dependent modes must read the destination color and
+        // have no fixed-function equivalent.
         BlendMode::DestinationDependent(_) => None,
     }
 }

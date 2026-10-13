@@ -174,17 +174,19 @@ pub(super) fn draw_face(scene: &Scene, id: u32) -> i32 {
 }
 
 /// `UpdateDrawFace`'s type→face table for `Face == dfAuto`
-/// (`LayerIntf.cpp:1529-1618`), read on the port's canonical native
-/// spelling of the generic blend (`blend::to_native`):
-/// `ltAlpha`/`ltPs*` → `dfAlpha`, `ltAddAlpha` → `dfAddAlpha`,
-/// `ltOpaque` and every other non-PS type → `dfOpaque`. The port collapses
-/// each PS/original pair into one generic blend, so a PS-only type resolves
-/// to `dfAlpha` while a collapsed pair takes the original spelling's face —
-/// exactly the reference face for every type the canonical encoder emits.
+/// (`LayerIntf.cpp:1529-1618`): every Photoshop `ltPs*` type resolves to
+/// `dfAlpha`, `ltAddAlpha` resolves to `dfAddAlpha`, and the remaining types
+/// (`ltOpaque` and the non-Photoshop additive/subtractive/multiplicative/
+/// screen/dodge/darken/lighten blends) resolve to `dfOpaque`.
 const fn blend_face(blend: BlendMode) -> i32 {
     match blend {
         BlendMode::Replace => DF_OPAQUE,
-        BlendMode::SourceOver => DF_ALPHA,
+        BlendMode::SourceOver
+        | BlendMode::PsNormal
+        | BlendMode::PsAdditive
+        | BlendMode::PsSubtractive
+        | BlendMode::PsMultiplicative
+        | BlendMode::PsScreen => DF_ALPHA,
         BlendMode::Additive => DF_OPAQUE,
         BlendMode::Subtractive => DF_OPAQUE,
         BlendMode::Multiply => DF_OPAQUE,
@@ -201,7 +203,10 @@ const fn blend_face(blend: BlendMode) -> i32 {
             | DstBlend::Exclusion
             | DstBlend::Overlay
             | DstBlend::HardLight
-            | DstBlend::SoftLight,
+            | DstBlend::SoftLight
+            | DstBlend::PsColorDodge
+            | DstBlend::PsDarken
+            | DstBlend::PsLighten,
         ) => DF_ALPHA,
     }
 }
