@@ -150,6 +150,15 @@ fn dest_info(scene: &Scene, id: u32, method: &str) -> Result<Option<(u32, bool)>
     Ok(layer.bitmap.map(|bitmap| (bitmap, layer.hold_alpha)))
 }
 
+/// Mark a layer's image modified after a pixel write. The `imageModified`
+/// flag is the signal scripts read to decide whether the layer must be
+/// cleared before it is drawn again.
+pub(super) fn mark_image_modified(scene: &mut Scene, id: u32) {
+    if let Some(layer) = scene.layer_mut(id) {
+        layer.image_modified = true;
+    }
+}
+
 /// The layer's effective draw face — the port of the reference
 /// `UpdateDrawFace` (`reference/cpp/core/visual/LayerIntf.cpp:1525-1620`):
 /// when `face == dfAuto` the face is derived from the layer type, otherwise
@@ -361,6 +370,7 @@ extern "C" fn layer_operate_rect(
         with_two_bitmaps(scene, dst, src_id, |d, s| {
             layer_ops::operate_rect(d, dx, dy, s, src_rect, mode, opa, hold_alpha);
         })?;
+        mark_image_modified(scene, id);
         Ok(())
     })();
     match result {
@@ -443,6 +453,7 @@ extern "C" fn layer_operate_stretch(
                 hold_alpha,
             );
         })?;
+        mark_image_modified(scene, id);
         Ok(())
     })();
     match result {
@@ -553,7 +564,9 @@ fn affine_op(
         clear,
         neutral_color,
         clip,
-    )
+    )?;
+    mark_image_modified(scene, id);
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -708,6 +721,7 @@ fn stretch_op(
             })?;
         }
     }
+    mark_image_modified(scene, id);
     Ok(())
 }
 
@@ -910,6 +924,7 @@ fn rect_op(
             }
         }
     }
+    mark_image_modified(scene, id);
     Ok(())
 }
 
@@ -1097,13 +1112,14 @@ extern "C" fn layer_color_rect(
         let Some(dest) = layer_ops::intersect(bitmap, dest) else {
             return Ok(());
         };
-        match face {
+        let modified = match face {
             DF_ALPHA => {
                 if opa > 0 {
                     layer_ops::fill_color_on_alpha(bitmap, dest, color, opa);
                 } else {
                     layer_ops::remove_const_opacity(bitmap, dest, -opa);
                 }
+                opa != 0
             }
             DF_ADD_ALPHA => {
                 if opa < 0 {
@@ -1112,13 +1128,23 @@ extern "C" fn layer_color_rect(
                     );
                 }
                 layer_ops::fill_color_on_add_alpha(bitmap, dest, color, opa);
+                opa > 0
             }
-            DF_OPAQUE => layer_ops::fill_color_hold_alpha(bitmap, dest, color, opa),
-            DF_MASK => layer_ops::fill_mask(bitmap, dest, color[2]),
+            DF_OPAQUE => {
+                layer_ops::fill_color_hold_alpha(bitmap, dest, color, opa);
+                opa > 0
+            }
+            DF_MASK => {
+                layer_ops::fill_mask(bitmap, dest, color[2]);
+                true
+            }
             // Reference `ColorRect` switches on the resolved face with no
             // `default:` (`reference/cpp/core/visual/LayerIntf.cpp:4338-4411`):
             // an out-of-vocabulary face falls through silently.
-            _ => {}
+            _ => false,
+        };
+        if modified {
+            mark_image_modified(scene, id);
         }
         Ok(())
     })();

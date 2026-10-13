@@ -1335,20 +1335,29 @@ extern "C" fn layer_fill_rect(
     };
     let width = (dest.2 - dest.0) as u32;
     let height = (dest.3 - dest.1) as u32;
-    match face {
+    let modified = match face {
         pixels::DF_ALPHA | pixels::DF_ADD_ALPHA => {
             engine::raster::fill_rect_replace(bitmap, dest.0, dest.1, width, height, color);
+            true
         }
         pixels::DF_OPAQUE if !hold_alpha => {
             engine::raster::fill_rect_replace(bitmap, dest.0, dest.1, width, height, color);
+            true
         }
         pixels::DF_OPAQUE => {
             engine::layer_ops::fill_color_hold_alpha(bitmap, dest, color, 255);
+            true
         }
-        pixels::DF_MASK => engine::layer_ops::fill_mask(bitmap, dest, color[2]),
-        _ => {}
+        pixels::DF_MASK => {
+            engine::layer_ops::fill_mask(bitmap, dest, color[2]);
+            true
+        }
+        _ => false,
+    };
+    if modified {
+        bitmap.mark_dirty();
+        pixels::mark_image_modified(scene, id);
     }
-    bitmap.mark_dirty();
     set_void(out);
     0
 }

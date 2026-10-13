@@ -312,6 +312,43 @@ fn stretches_and_affine_run_without_error() {
     assert_eq!(env.eval_int("l.imageModified"), 1);
 }
 
+/// Reference: `OperateRect` marks `ImageModified` after a successful blit
+/// (`reference/cpp/core/visual/LayerIntf.cpp:5459`), and `FillRect` does too
+/// (`:4287`). KAG's message layer skips its clear when `imageModified` is
+/// false (`system/messagelayer.tjs:434`), and the floating line layer is
+/// baked onto the message layer through `operateRect` (`fixLineLayer`), so a
+/// composite that leaves the flag false makes the next message draw over the
+/// old one. This pins the flag on the composite and the KAG clear that
+/// follows it.
+#[test]
+fn composite_marks_the_layer_modified_for_the_next_message_clear() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window(); \
+         var src = new Layer(w, null); src.setImageSize(2, 2); \
+         src.fillRect(0, 0, 2, 2, 0xff00ff00); \
+         var l = new Layer(w, null); l.setImageSize(2, 2); \
+         l.type = 12; \
+         l.fillRect(0, 0, 2, 2, 0xffffffff); \
+         l.imageModified = 0; \
+         l.operateRect(0, 0, src, 0, 0, 2, 2); \
+         var afterComposite = l.imageModified; \
+         l.face = 128; \
+         l.fillRect(0, 0, 2, 2, 0x80000000); \
+         l.face = 3; \
+         l.colorRect(0, 0, 2, 2, 0); \
+         l.face = 128;",
+    );
+    // The composite, not `setImageSize`, sets the flag, so KAG's
+    // `clearLayer` guard would clear the previous page.
+    assert_eq!(env.eval_int("afterComposite"), 1);
+    // The KAG clear replaces the old coverage with the frame fill: RGB 0 and
+    // the message frame's alpha.
+    assert_eq!(env.eval_int("l.getMainPixel(0, 0)"), 0);
+    assert_eq!(env.eval_int("l.getMaskPixel(0, 0)"), 128);
+}
+
 #[test]
 fn gray_gamma_light_and_blur_operate_on_the_image() {
     let _lock = vm_lock();
