@@ -19,11 +19,11 @@ The checker exits non-zero when a missing member is **not** listed in `scripts/n
 
 | metric | value |
 | --- | ---: |
-| tracked classes | 22 |
-| reference members | 640 |
-| matched | 640 |
+| tracked classes | 25 |
+| reference members | 660 |
+| matched | 660 |
 | **missing** | **0** |
-| extra (Rust only) | 8 |
+| extra (Rust only) | 3 |
 | coverage | **100.0%** |
 
 ## Reference registration mechanisms
@@ -32,7 +32,7 @@ How each reference member becomes script-visible. `native-macro` is `TJS_BEGIN_N
 
 | mechanism | members |
 | --- | ---: |
-| `native-macro` | 753 |
+| `native-macro` | 756 |
 | `constructor` | 33 |
 | `propset` | 4 |
 
@@ -57,7 +57,7 @@ _None._
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | `Layer` | 149 | 149 | 149 | 0 | 0 | 100.0% |
 | `Bitmap` | 19 | 19 | 19 | 0 | 0 | 100.0% |
-| `Window` | 85 | 91 | 85 | 0 | 6 | 100.0% |
+| `Window` | 91 | 91 | 91 | 0 | 0 | 100.0% |
 | `Font` | 21 | 21 | 21 | 0 | 0 | 100.0% |
 | `Timer` | 5 | 5 | 5 | 0 | 0 | 100.0% |
 | `System` | 49 | 49 | 49 | 0 | 0 | 100.0% |
@@ -77,6 +77,9 @@ _None._
 | `BitmapLayerTreeOwner` | 36 | 36 | 36 | 0 | 0 | 100.0% |
 | `CDDASoundBuffer` | 14 | 14 | 14 | 0 | 0 | 100.0% |
 | `MIDISoundBuffer` | 15 | 15 | 15 | 0 | 0 | 100.0% |
+| `BasicDrawDevice` | 4 | 4 | 4 | 0 | 0 | 100.0% |
+| `PassThroughDrawDevice` | 5 | 5 | 5 | 0 | 0 | 100.0% |
+| `PhaseVocoder` | 5 | 6 | 5 | 0 | 1 | 100.0% |
 
 ## Missing members by class
 
@@ -85,22 +88,19 @@ _None for tracked classes._
 
 Rust registrations with no reference counterpart; usually intentional engine internals.
 
-### `Window` — 6 extra
-
-`beginMove`, `innerSunken`, `layerLeft`, `layerTop`, `setLayerPos`, `showScrollBars`
-
 ### `KAGParser` — 2 extra
 
 `multiLineTagEnabled`, `paramMacros`
+
+### `PhaseVocoder` — 1 extra
+
+`__TvpPhaseVocoder`
 
 ## Reference classes not registered in Rust
 
 | class | reference members |
 | --- | ---: |
-| `BasicDrawDevice` | 6 |
-| `PassThroughDrawDevice` | 7 |
-| `PhaseVocoder` | 6 |
-| `WaveFlags` | 4 |
+| `WaveFlags` | 3 |
 
 ## Rust-only registered classes
 

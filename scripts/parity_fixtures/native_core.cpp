@@ -9,6 +9,11 @@
 //   * var->PropSet(TJS_MEMBERENSURE, TJS_W("name"), ...)
 //   * var->PropSet with a runtime-built name (must be unrecoverable)
 //   * var->PropSetByNum (numeric name, must be unrecoverable)
+//   * a member behind a flag this file defines, and one behind a flag it does
+//     not (the USE_OBSOLETE_FUNCTIONS shape)
+
+// Defined here, so the guarded member must be extracted.
+#define FIXTURE_OBSOLETE_MEMBERS
 
 tTJSNativeClass_Widget::tTJSNativeClass_Widget() :
     tTJSNativeClass(TJS_W("Widget")) {
@@ -22,6 +27,20 @@ tTJSNativeClass_Widget::tTJSNativeClass_Widget() :
         return TJS_S_OK;
     }
     TJS_END_NATIVE_PROP_DECL(width)
+
+#ifdef FIXTURE_OBSOLETE_MEMBERS
+    TJS_BEGIN_NATIVE_PROP_DECL(obsoleteThing) {
+        return TJS_S_OK;
+    }
+    TJS_END_NATIVE_PROP_DECL(obsoleteThing)
+#endif
+
+#ifdef FIXTURE_NEVER_DEFINED
+    TJS_BEGIN_NATIVE_PROP_DECL(hiddenThing) {
+        return TJS_S_OK;
+    }
+    TJS_END_NATIVE_PROP_DECL(hiddenThing)
+#endif
 
     TJS_BEGIN_NATIVE_STATIC_METHOD_DECL(create) {
         return TJS_S_OK;

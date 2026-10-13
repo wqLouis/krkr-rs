@@ -18,9 +18,10 @@ How it works (short version)
   ``PropSet(TJS_MEMBERENSURE, ...)`` on a variable bound by
   ``TVPCreateNativeClass_*`` / ``registerObject`` are read too (``Window.menu``,
   ``Window.BasicDrawDevice``).  A ``PropSet`` whose name is not a literal is
-  reported as unrecoverable rather than dropped.  Preprocessor regions that
-  are disabled in a normal build (``#if 0``,
-  ``#ifdef USE_OBSOLETE_FUNCTIONS``) are ignored.
+  reported as unrecoverable rather than dropped.  A preprocessor region is
+  blanked only when a normal build would not compile it: ``#if 0``, or a flag
+  the reference source never defines.  A flag a shipped header does define
+  (``#ifdef USE_OBSOLETE_FUNCTIONS``) is part of the surface.
 * Rust surface: for the files listed in ``RUST_CLASS_MAP`` the builder whose
   ``name: "X"`` matches is scanned for ``name: "member"`` entries,
   ``method("member", ...)`` / ``property("member", ...)`` shorthands,
@@ -139,6 +140,27 @@ RUST_CLASS_MAP: "OrderedDict[str, list[tuple[str, str | None]]]" = OrderedDict(
             "MIDISoundBuffer",
             [("crates/compat/src/natives/cdda_midi.rs", "MIDISoundBuffer")],
         ),
+        # Nested class objects the reference declares in their own
+        # ``TJS_BEGIN_NATIVE_MEMBERS`` block and attaches to a host class
+        # (``Window.BasicDrawDevice``, ``WaveSoundBuffer.PhaseVocoder``).
+        # Without an entry here their members were never compared.
+        (
+            "BasicDrawDevice",
+            [("crates/compat/src/natives/visual/draw_device.rs", "BasicDrawDevice")],
+        ),
+        (
+            "PassThroughDrawDevice",
+            [
+                (
+                    "crates/compat/src/natives/visual/draw_device.rs",
+                    "PassThroughDrawDevice",
+                )
+            ],
+        ),
+        (
+            "PhaseVocoder",
+            [("crates/compat/src/natives/sound/phase_vocoder.rs", "__TvpPhaseVocoder")],
+        ),
     ]
 )
 
@@ -157,10 +179,40 @@ RUST_ONLY_CLASS_MAP: "OrderedDict[str, list[tuple[str, str | None]]]" = OrderedD
     ]
 )
 
-# Macros considered *defined* while walking the C++ preprocessor.  Deliberately
-# empty: members gated behind feature flags such as USE_OBSOLETE_FUNCTIONS are
-# not part of a normal build.
-CPP_ASSUMED_DEFINED: set[str] = set()
+def _reference_defined_macros() -> set[str]:
+    """Flags the reference source both gates code on and defines itself.
+
+    A member behind ``#ifdef FLAG`` is part of the shipped surface when the
+    reference defines ``FLAG`` — ``USE_OBSOLETE_FUNCTIONS`` is defined in
+    ``reference/cpp/core/visual/WindowIntf.h:23`` — while a flag it never
+    defines is a build option and its members are not part of the surface.
+    Collect the identifiers used in preprocessor conditions and keep the ones
+    some ``#define`` names, so an unrelated internal macro is ignored.
+    """
+    define_re = re.compile(r"^\s*#\s*define\s+([A-Za-z_]\w*)")
+    cond_re = re.compile(r"^\s*#\s*(?:if|ifdef|ifndef|elif)\b(.*)$")
+    ident_re = re.compile(r"[A-Za-z_]\w*")
+    defined_any: set[str] = set()
+    used_in_condition: set[str] = set()
+    patterns = ("reference/cpp/**/*.h", "reference/cpp/**/*.hpp", "reference/cpp/**/*.cpp")
+    paths: list[str] = []
+    for pattern in patterns:
+        paths.extend(glob.glob(str(REPO_ROOT / pattern), recursive=True))
+    for path in sorted(set(paths)):
+        for line in Path(path).read_text(encoding="utf-8", errors="replace").splitlines():
+            match = define_re.match(line)
+            if match:
+                defined_any.add(match.group(1))
+            condition = cond_re.match(line)
+            if condition:
+                used_in_condition.update(ident_re.findall(condition.group(1)))
+    return defined_any & used_in_condition
+
+
+# Macros considered *defined* while walking the C++ preprocessor: the flags the
+# reference source both gates code on and defines itself.  A flag it never
+# defines is a build option, and members behind it are not part of the surface.
+CPP_ASSUMED_DEFINED: set[str] = _reference_defined_macros()
 
 # Lifecycle hooks that are not part of the script-visible surface games call.
 IGNORED_REFERENCE_MEMBERS = {"finalize"}
@@ -212,6 +264,8 @@ _CPP_CTOR_END_RE = re.compile(
     r"TJS_END_NATIVE_(?:STATIC_)?CONSTRUCTOR_DECL\s*\(\s*([A-Za-z_]\w*)\s*\)"
 )
 _CPP_END_MEMBERS_RE = re.compile(r"TJS_END_NATIVE_MEMBERS")
+_CPP_DEFINE_RE = re.compile(r"^\s*#\s*define\s+([A-Za-z_]\w*)")
+_CPP_UNDEF_RE = re.compile(r"^\s*#\s*undef\s+([A-Za-z_]\w*)")
 
 
 def _preprocess_cpp(src: str) -> str:
@@ -222,10 +276,22 @@ def _preprocess_cpp(src: str) -> str:
     """
     lines = src.split("\n")
     active = True
+    # Flags the source itself defines (in addition to the reference-wide set),
+    # so a fixture or a same-file ``#define`` is honoured.
+    defined = set(CPP_ASSUMED_DEFINED)
     # stack entries: [parent_active, this_branch_active, any_branch_taken]
     stack: list[list[bool]] = []
     out: list[str] = []
+    # A multi-line ``#define`` body is blanked so a macro parameter (e.g.
+    # ``TVP_REGISTER_PTDD_ENUM(name)``) is not read as a member literally
+    # named ``name``.
+    in_define_body = False
     for line in lines:
+        if in_define_body:
+            out.append("")
+            if not line.rstrip().endswith("\\"):
+                in_define_body = False
+            continue
         m = _CPP_DIRECTIVE_RE.match(line)
         if m:
             kw, rest = m.group(1), m.group(2).strip()
@@ -234,9 +300,9 @@ def _preprocess_cpp(src: str) -> str:
                 if kw == "if":
                     cond = rest != "0"
                 elif kw == "ifdef":
-                    cond = rest in CPP_ASSUMED_DEFINED
+                    cond = rest in defined
                 else:  # ifndef
-                    cond = rest not in CPP_ASSUMED_DEFINED
+                    cond = rest not in defined
                 this = parent and cond
                 stack.append([parent, this, this])
                 active = this
@@ -257,6 +323,17 @@ def _preprocess_cpp(src: str) -> str:
                 active = stack[-1][1] if stack else True
             out.append("")
             continue
+        if active:
+            dm = _CPP_DEFINE_RE.match(line)
+            if dm:
+                defined.add(dm.group(1))
+                out.append("")
+                if line.rstrip().endswith("\\"):
+                    in_define_body = True
+                continue
+            um = _CPP_UNDEF_RE.match(line)
+            if um:
+                defined.discard(um.group(1))
         out.append(line if active else "")
     return "\n".join(out)
 
@@ -1381,6 +1458,12 @@ def self_test(verbose: bool = True) -> int:
     want = expected["members"]
 
     problems: list[str] = []
+    if "USE_OBSOLETE_FUNCTIONS" not in CPP_ASSUMED_DEFINED:
+        problems.append(
+            "the reference defines USE_OBSOLETE_FUNCTIONS "
+            "(reference/cpp/core/visual/WindowIntf.h:23); the preprocessor "
+            "walk must treat it as active"
+        )
     for cls in sorted(set(got) | set(want)):
         got_members = set(got.get(cls, []))
         want_members = set(want.get(cls, []))
