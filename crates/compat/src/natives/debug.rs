@@ -41,8 +41,8 @@
 
 use std::collections::VecDeque;
 use std::ffi::{c_char, c_int, c_void};
-use std::fs::{File, OpenOptions};
-use std::io::Write;
+
+use api::fs::{FsPath, OpenMode};
 
 use tjs::{
     DetachedValue, NativeClassBuilder, NativeInstanceBuilder, NativeInstanceMethodDef,
@@ -92,7 +92,7 @@ struct LoggingHandler {
 #[derive(Default)]
 struct DebugState {
     /// File opened by `startLogToFile`; `message`/`notice` append to it.
-    log_file: Option<File>,
+    log_file: Option<fs::FileState>,
     /// The reference `TVPLoggingToFile` flag — set even when no location is
     /// configured (the reference opens no stream then, `DebugIntf.cpp:241-244`).
     logging_to_file: bool,
@@ -222,19 +222,21 @@ fn open_log_file(state: &mut DebugState, truncate: bool) {
         native.push('/');
     }
     let filename = format!("{native}/krkr.console.log");
-    let opened = if truncate {
-        File::create(&filename)
+    let file_system = fs::FileSystem::host("");
+    let path = FsPath::host(&filename);
+    let mode = if truncate {
+        OpenMode::Write
     } else {
-        OpenOptions::new().create(true).append(true).open(&filename)
+        OpenMode::Append
     };
-    match opened {
-        Ok(mut file) => {
+    match fs::open(&file_system, &path, mode) {
+        Ok(file) => {
             let header = format!(
                 "{LOG_OPEN_SEPARATOR}Logging to {filename} started on {}\r\n",
                 log_date_time()
             );
-            let _ = file.write_all(header.as_bytes());
-            let _ = file.flush();
+            let _ = fs::write_at(&file_system, &file, file.cursor(), header.as_bytes());
+            let _ = fs::flush(&file_system, &file);
             state.log_file = Some(file);
         }
         Err(e) => {
@@ -259,8 +261,13 @@ fn write_log_file(services: &CompatServices, text: &str) {
         open_log_file(&mut state, false);
     }
     if let Some(file) = state.log_file.as_mut() {
-        let _ = write!(file, " {text}\r\n");
-        let _ = file.flush();
+        let file_system = fs::FileSystem::host("");
+        let mut bytes = Vec::with_capacity(text.len() + 4);
+        bytes.push(b' ');
+        bytes.extend_from_slice(text.as_bytes());
+        bytes.extend_from_slice(b"\r\n");
+        let _ = fs::append(&file_system, file, &bytes);
+        let _ = fs::flush(&file_system, file);
     }
 }
 
@@ -392,15 +399,22 @@ fn start_log_file(services: &CompatServices, clear: bool) {
         .cloned()
         .collect();
     if let Some(file) = state.log_file.as_mut() {
+        let mut block = String::new();
         if !important.is_empty() {
-            let _ = write!(file, "{important}\r\n");
+            block.push_str(&important);
+            block.push_str("\r\n");
         }
-        let _ = write!(file, "{LOG_START_SEPARATOR}");
+        block.push_str(LOG_START_SEPARATOR);
         for (time, line) in &rollback {
-            let _ = write!(file, "{time} {line}\r\n");
+            block.push_str(time);
+            block.push(' ');
+            block.push_str(line);
+            block.push_str("\r\n");
         }
-        let _ = write!(file, "\r\n");
-        let _ = file.flush();
+        block.push_str("\r\n");
+        let file_system = fs::FileSystem::host("");
+        let _ = fs::append(&file_system, file, block.as_bytes());
+        let _ = fs::flush(&file_system, file);
     }
 }
 

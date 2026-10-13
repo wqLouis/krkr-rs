@@ -130,6 +130,33 @@ impl FileStat {
     }
 }
 
+/// Full metadata for a file or directory.
+///
+/// Where [`FileStat`] carries the fields the storage namespace needs for
+/// resolution, this carries the full host metadata a compatibility layer
+/// emulating a stat call can observe: the three timestamps and the permission
+/// bits. Timestamps are milliseconds since the Unix epoch, negative before it;
+/// a time the backend cannot report (a platform without a creation time) is
+/// `None` rather than a fabricated value.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct FileMetadata {
+    /// Size in bytes.
+    pub size: u64,
+    /// Whether the entry is a directory.
+    pub is_dir: bool,
+    /// Whether the entry is a regular file (following symlinks).
+    pub is_file: bool,
+    /// Last modification time as milliseconds since the Unix epoch.
+    pub modified_ms: Option<i64>,
+    /// Creation (birth) time as milliseconds since the Unix epoch.
+    pub created_ms: Option<i64>,
+    /// Last access time as milliseconds since the Unix epoch.
+    pub accessed_ms: Option<i64>,
+    /// Permission bits (the low `0o7777` bits of `st_mode`), when the backend
+    /// exposes them.
+    pub mode: Option<u32>,
+}
+
 /// A single entry produced by a directory listing.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct DirEntry {

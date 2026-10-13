@@ -82,6 +82,20 @@ pub(crate) fn check_host_exists(path: &Path) -> Result<(), FsError> {
         .map_err(|e| io_error(&display, e))
 }
 
+/// Permission bits (the low `0o7777` bits of `st_mode`) when the platform
+/// exposes them.
+#[cfg(unix)]
+pub(crate) fn host_permissions_mode(meta: &std::fs::Metadata) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    Some(meta.permissions().mode() & 0o7777)
+}
+
+/// Non-Unix fallback: the read-only bit is all the portable layer exposes.
+#[cfg(not(unix))]
+pub(crate) fn host_permissions_mode(meta: &std::fs::Metadata) -> Option<u32> {
+    Some(u32::from(meta.permissions().readonly()))
+}
+
 /// Positional read for the host backend (Unix).
 #[cfg(unix)]
 pub(crate) fn host_read_at(file: &File, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {

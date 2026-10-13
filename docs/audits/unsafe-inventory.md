@@ -142,6 +142,49 @@ Scoped outer `#[allow(unsafe_code)]` (5): `app/src/game.rs:86,143`;
 `visual/layer/pixels.rs` 49, `video.rs` 44, `menu_item.rs` 35). AGENTS §5
 says every `unsafe` block carries a note; the compat crate does not meet it.
 
+**FFI-heaviest review (2026-10-13).** The review above left every uncited
+block baselined. A follow-up then reviewed, block by block, the three files
+where unsoundness was plausible rather than merely undocumented:
+`natives/visual/window.rs` (64 flagged), `tjs/src/lib.rs` (26) and
+`platform/render/src/vulkan/{device,mod,swapchain}.rs` (15). Every site now
+carries a note stating the argument that makes it sound, and the 105 findings
+are removed from `scripts/layering_allow.txt`.
+
+Defects fixed:
+
+1. **`window_ctor` held `&mut WindowInst` across a script call.** The
+   constructor kept the borrow live across
+   `eval_retained("new Window.BasicDrawDevice()")`, so a script re-entering a
+   `Window` member on the same instance could mint a second `&mut` to the same
+   payload. Each field write is now scoped and the borrow is released before
+   the eval (the narrowing §5.5 already applied to `window_draw_device_set`;
+   that site is also scoped in the current tree).
+2. **The tjs value/error conversion helpers required `unsafe` at every call
+   site.** `take_value` now takes `&Value`; `take_error` and
+   `take_error_string` are safe and document the ABI invariant (`out_error` is
+   null or a malloc'd NUL-terminated string) at the single deref/free site.
+   This removed 22 `unsafe { … }` blocks and left the pointer handling in one
+   place.
+
+The 15 Vulkan blocks are read-only `ash` queries on a live instance/device
+plus create/destroy calls; each note names the owning handle. They are sound
+as written.
+
+Remaining debt / needs evidence:
+
+- **`unsafe impl Send + Sync for Tjs2Engine` / `DetachedValue` (§5.3) is not
+  fixed.** `Tjs2Engine::new` is a safe function callable from any thread, so
+  the single-thread invariant is still enforced by convention only. Removing
+  `Send`/`Sync` would close part of the gap, but whether a workspace path
+  (notably the Android host) requires them could not be checked without
+  building, so it is left as an explicit open decision rather than a
+  speculative change.
+- The `window_ctor` fix narrows the aliasing window; a fully safe design would
+  hand out the payload behind a scoped callback instead of a raw pointer.
+
+The remaining 89 `unsafe-no-safety-note` findings are in the other 19 `compat`
+files listed in §1 and stay baselined per file.
+
 ### 2.7 Non-compat `unsafe` sites
 
 - **`tjs/src/lib.rs`** — the whole FFI wrapper (190 mentions). Every `tjs2_*`

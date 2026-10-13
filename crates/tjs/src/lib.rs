@@ -782,7 +782,7 @@ impl Tjs2Engine {
         // failure the C++ side stores an owned error string in `error`.
         let rc = unsafe { tjs2_set_data_dir_checked(c.as_ptr(), &mut error) };
         if rc != 0 {
-            return Err(unsafe { take_error(error) });
+            return Err(take_error(error));
         }
         Ok(())
     }
@@ -859,9 +859,9 @@ impl Tjs2Engine {
             )
         };
         if rc != 0 {
-            return Err(unsafe { take_error(error) });
+            return Err(take_error(error));
         }
-        Ok(unsafe { take_value(&result) })
+        Ok(take_value(&result))
     }
 
     /// Evaluate a TJS expression given as UTF-8 text.
@@ -907,9 +907,9 @@ impl Tjs2Engine {
             )
         };
         if rc != 0 {
-            return Err(unsafe { take_error(error) });
+            return Err(take_error(error));
         }
-        Ok(unsafe { take_value(&result) })
+        Ok(take_value(&result))
     }
 
     /// Replace the text of the registered TJS message `name` with `message`
@@ -920,15 +920,15 @@ impl Tjs2Engine {
         let message =
             CString::new(message).map_err(|_| TjsError("message text contains NUL".into()))?;
         let mut error: *mut c_char = ptr::null_mut();
-        // SAFETY: both pointers are valid, NUL-terminated UTF-8 for the call;
-        // the function reads them only and stores an owned error string in
-        // `error` on failure.
         let rc =
+            // SAFETY: both pointers are valid, NUL-terminated UTF-8 for the call;
+            // the function reads them only and stores an owned error string in
+            // `error` on failure.
             unsafe { tjs2_assign_message_checked(name.as_ptr(), message.as_ptr(), &mut error) };
         match rc {
             1 => Ok(true),
             0 => Ok(false),
-            _ => Err(unsafe { take_error(error) }),
+            _ => Err(take_error(error)),
         }
     }
 
@@ -1007,7 +1007,7 @@ impl Tjs2Engine {
             )
         };
         if rc != 0 {
-            return Err(unsafe { take_error(error) });
+            return Err(take_error(error));
         }
         Ok(())
     }
@@ -1019,7 +1019,7 @@ impl Tjs2Engine {
         // SAFETY: self.inner is a live engine.
         let rc = unsafe { tjs2_dump(self.inner, &mut error) };
         if rc != 0 {
-            return Err(unsafe { take_error(error) });
+            return Err(take_error(error));
         }
         Ok(())
     }
@@ -1033,7 +1033,7 @@ impl Tjs2Engine {
         // SAFETY: self.inner is a live engine.
         let rc = unsafe { tjs2_do_gc(self.inner, &mut error) };
         if rc != 0 {
-            return Err(unsafe { take_error(error) });
+            return Err(take_error(error));
         }
         Ok(())
     }
@@ -1515,10 +1515,10 @@ name), and none was available"
             )
         };
         if rc != 0 {
-            return Err(unsafe { take_error_string(error) });
+            return Err(take_error_string(error));
         }
         // SAFETY: `out` was filled by the C++ side on success.
-        Ok(unsafe { take_value(&out) })
+        Ok(take_value(&out))
     }
 
     /// Release a retained value immediately (the id is also released when
@@ -1751,10 +1751,10 @@ name), and none was available"
             )
         };
         if rc != 0 {
-            return Err(unsafe { take_error_string(error) });
+            return Err(take_error_string(error));
         }
         // SAFETY: `out` was filled by the C++ side on success.
-        Ok(unsafe { take_value(&out) })
+        Ok(take_value(&out))
     }
 
     /// Read a named property from a retained object value through its class
@@ -1779,10 +1779,10 @@ name), and none was available"
         // name/out follow the ABI contract for the duration of the call.
         let rc = unsafe { tjs2_prop_get(self.inner, id, name.as_ptr(), &mut out, &mut error) };
         if rc != 0 {
-            return Err(unsafe { take_error_string(error) });
+            return Err(take_error_string(error));
         }
         // SAFETY: `out` was filled by the C++ side on success.
-        Ok(unsafe { take_value(&out) })
+        Ok(take_value(&out))
     }
 
     /// Write a named property on a retained object value through its class
@@ -1813,7 +1813,7 @@ name), and none was available"
         // ABI contract for the duration of the call.
         let rc = unsafe { tjs2_prop_set(self.inner, id, name.as_ptr(), &ffi, &mut error) };
         if rc != 0 {
-            return Err(unsafe { take_error_string(error) });
+            return Err(take_error_string(error));
         }
         Ok(())
     }
@@ -1845,7 +1845,7 @@ name), and none was available"
         // name follows the ABI contract for the duration of the call.
         let rc = unsafe { tjs2_prop_delete(self.inner, id, name.as_ptr(), &mut error) };
         if rc != 0 {
-            return Err(unsafe { take_error_string(error) });
+            return Err(take_error_string(error));
         }
         Ok(())
     }
@@ -1872,7 +1872,7 @@ name), and none was available"
         // contract for the duration of the call.
         let rc = unsafe { tjs2_prop_set_default(self.inner, id, &ffi, &mut error) };
         if rc != 0 {
-            return Err(unsafe { take_error_string(error) });
+            return Err(take_error_string(error));
         }
         Ok(())
     }
@@ -1899,7 +1899,7 @@ name), and none was available"
         // alive for the call.
         let rc = unsafe { tjs2_set_arg(self.inner, index as c_int, &ffi, &mut error) };
         if rc != 0 {
-            return Err(unsafe { take_error_string(error) });
+            return Err(take_error_string(error));
         }
         Ok(())
     }
@@ -1927,7 +1927,7 @@ name), and none was available"
         // validity is owned by the caller's ValueId/DetachedValue).
         let rc = unsafe { tjs2_get_class_names(self.inner, obj, &mut out, &mut error) };
         if rc != 0 {
-            return Err(unsafe { take_error_string(error) });
+            return Err(take_error_string(error));
         }
         if out.ty != VAL_RETAINED || out.retained == 0 {
             return Err("tjs2_get_class_names returned no retained array".into());
@@ -1961,7 +1961,7 @@ name), and none was available"
         // SAFETY: self.inner is a live engine and obj is a live retained id.
         let rc = unsafe { tjs2_enum_members(self.inner, obj, &mut out, &mut error) };
         if rc != 0 {
-            return Err(unsafe { take_error_string(error) });
+            return Err(take_error_string(error));
         }
         if out.ty != VAL_RETAINED || out.retained == 0 {
             return Err("tjs2_enum_members returned no retained array".into());
@@ -2009,7 +2009,7 @@ name), and none was available"
         // C++ side dereferences it through its retained-value map.
         let rc = unsafe { tjs2_set_call_missing(self.inner, obj, &mut error) };
         if rc != 0 {
-            return Err(unsafe { take_error_string(error) });
+            return Err(take_error_string(error));
         }
         Ok(())
     }
@@ -2099,10 +2099,10 @@ name), and none was available"
             )
         };
         if rc != 0 {
-            return Err(unsafe { take_error_string(error) });
+            return Err(take_error_string(error));
         }
         // SAFETY: `out` was filled by the C++ side on success.
-        Ok(unsafe { take_value(&out) })
+        Ok(take_value(&out))
     }
 }
 
@@ -2150,15 +2150,17 @@ extern "C" fn noop_log(_level: c_int, _msg: *const c_char, _user: *mut c_void) {
 /// Convert a C value into an owned TjsValue. The string pointer is only valid
 /// until the next engine call, so it is copied immediately.
 ///
-/// # Safety
-/// `v` must point to a valid tjs2_value filled by the C side.
-unsafe fn take_value(v: *const Value) -> TjsValue {
-    let v = unsafe { &*v };
+/// The caller reaches this only after a zero return from the C entry point, so
+/// `v` holds the value that call produced.
+fn take_value(v: &Value) -> TjsValue {
     match v.ty {
         VAL_VOID => TjsValue::Void,
         VAL_INTEGER => TjsValue::Integer(v.integer),
         VAL_REAL => TjsValue::Real(v.real),
         VAL_STRING if !v.string.is_null() => {
+            // SAFETY: a `VAL_STRING` result carries a NUL-terminated UTF-8
+            // string owned by the engine and valid until the next engine call;
+            // it is copied before returning.
             let s = unsafe { CStr::from_ptr(v.string) }
                 .to_string_lossy()
                 .into_owned();
@@ -2178,24 +2180,25 @@ unsafe fn take_value(v: *const Value) -> TjsValue {
     }
 }
 
-/// Take ownership of an error string returned by the C side.
+/// Take ownership of the error the C ABI stored in an `out_error` slot.
 ///
-/// # Safety
-/// `e` must be either null or a malloc'd string owned by the C side.
-unsafe fn take_error(e: *mut c_char) -> TjsError {
-    TjsError(unsafe { take_error_string(e) })
+/// Every C entry point fills that slot with either null or a malloc'd
+/// NUL-terminated UTF-8 string, so taking it is an invariant of the ABI rather
+/// than a caller obligation; the one `unsafe` deref and free live here.
+fn take_error(e: *mut c_char) -> TjsError {
+    TjsError(take_error_string(e))
 }
 
-/// Take ownership of an error string returned by the C side, as a plain
-/// String.
-///
-/// # Safety
-/// `e` must be either null or a malloc'd string owned by the C side.
-unsafe fn take_error_string(e: *mut c_char) -> String {
+/// As [`take_error`], as a plain `String`.
+fn take_error_string(e: *mut c_char) -> String {
     if e.is_null() {
         return "unknown TJS error".into();
     }
+    // SAFETY: the C ABI stores a malloc'd NUL-terminated UTF-8 string in the
+    // out-error slot on failure.
     let msg = unsafe { CStr::from_ptr(e) }.to_string_lossy().into_owned();
+    // SAFETY: the string came from the C allocator and the ABI pairs it with
+    // `tjs2_free_string`; this is its only owner.
     unsafe { tjs2_free_string(e) };
     msg
 }
@@ -3565,7 +3568,7 @@ var ra = a.get(); var rb = b.get();",
         };
         assert_ne!(rc, 0);
         // SAFETY: error was filled by the C++ side (or left null).
-        let msg = unsafe { take_error_string(error) };
+        let msg = take_error_string(error);
         assert!(msg.contains("invalid retained value"), "unexpected: {msg}");
     }
 
@@ -3775,7 +3778,7 @@ var ra = a.get(); var rb = b.get();",
         };
         if rc != 0 {
             // SAFETY: err is malloc'd by the C++ side (or null).
-            let msg = unsafe { take_error_string(err) };
+            let msg = take_error_string(err);
             panic!("reentrant eval failed: {msg}");
         }
         // SAFETY: out is a valid return slot.
@@ -4321,7 +4324,7 @@ var ra = a.get(); var rb = b.get();",
         let rc = unsafe { tjs2_call_value(e.inner, id.id, 1, &retained_arg, &mut out, &mut error) };
         assert_ne!(rc, 0, "call with a consumed id must fail");
         // SAFETY: error was filled by the C++ side (or left null).
-        let msg = unsafe { take_error_string(error) };
+        let msg = take_error_string(error);
         assert!(msg.contains("invalid retained value"), "unexpected: {msg}");
         // The entry was consumed by the argument; the id's Drop release is
         // a no-op.
@@ -4710,7 +4713,7 @@ var ra = a.get(); var rb = b.get();",
         };
         if rc != 0 {
             // SAFETY: err is malloc'd by the C++ side (or null).
-            let msg = unsafe { take_error_string(err) };
+            let msg = take_error_string(err);
             // SAFETY: out_error is a valid slot.
             unsafe { *out_error = alloc_error_string(&msg) };
             return 1;

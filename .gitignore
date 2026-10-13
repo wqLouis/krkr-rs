@@ -37,3 +37,6 @@ __pycache__/
 
 # Device logs captured from the phone (runtime evidence, not source).
 krkr-rs-logs*.txt
+
+# Game plugin DLLs gathered for reverse engineering (binaries, not source).
+/plugins/

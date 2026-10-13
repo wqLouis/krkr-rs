@@ -521,8 +521,45 @@ carry a `debt:` marker so clearing one is visible:
   AGENTS §2 keeps platform code in L1; these should route through the L1 `fs`
 abstraction. The guard excludes `crates/compat/tests/**`, where `std::fs` is
 legitimate for fixtures.
-* **194 `unsafe` blocks with no `// SAFETY:` note, across 24 files**
+* **90 `unsafe` blocks with no `// SAFETY:` note, across 19 files**
   (`unsafe-no-safety-note`). AGENTS §5 requires a note per block; the sites are
 already inventoried in `docs/audits/unsafe-inventory.md` §2.6. Each note needs
 a real safety argument, so this is review work, not a bulk edit. Baselined
-per file, so a new file or a new rule fails the gate.
+per file, so a new file or a new rule fails the gate. The three FFI-heaviest
+files (105 blocks: `visual/window.rs`, `tjs/src/lib.rs`, the Vulkan files) are
+reviewed and cleared, and that review found two real defects — a `&mut` held
+across a script eval in `window_ctor`, and 22 call-site `unsafe` blocks the TJS
+value helpers forced.
+
+## 17. Next major version — native plugin coverage
+
+The next major version brings the unported native plugins. 36 of the 53 plugin
+names real games ship have no emulation (`plugins/INVENTORY.md`; the DLLs are
+gitignored and are not committed), so each of those takes the null-plugin path
+(D14) when a game links it: every member accepted, every call void, one
+warning. Two are already visible in a device log as null plugins —
+`PackinOne.dll` and `menu.dll` — and `yuzuex.dll` is Yuzusoft's own extension,
+which matters for the titles that still fail to start.
+
+Workflow, per plugin:
+
+1. Recover the script-visible surface (registered class and member names,
+   argument arity, the installed global) from the DLL. The pipeline and its
+   measured fidelity live in `plugins/analysis/`, validated against
+   `layerExDraw.dll`, whose reference C++ we do have.
+2. Recover semantics for the members that need them, by decompilation.
+3. Emulate it in `crates/compat/src/natives/plugins/<name>/`, register the name
+   in `BUILTIN_PLUGINS`, and add behaviour tests.
+
+Priority is how many games ship it times the effort, ranked in
+`plugins/analysis/PRIORITY.md`: `krmovie.dll` (5 versions), `yuzuex.dll` (4),
+`PackinOne.dll`, `menu.dll`, `AlphaMovie.dll`, `k2compat.dll`, `kagexopt.dll`,
+`win32ole.dll`, `wfBasicEffect.dll`, `wfTypicalDSP.dll`,
+`motionplayer_nod3d.dll`, `DrawDeviceD2D.dll`, then the single-version names.
+
+**A citation rule is owed for these.** Every behaviour assertion must cite the
+reference (D30), but an unported plugin has no `reference/cpp` source: the DLL
+is the oracle. The proposed form — the DLL path, its content hash, and the
+decompiled function or address — is recorded in `plugins/analysis/README.md`
+and needs a decision entry before the first such plugin lands, because a test
+that cannot cite its evidence is not evidence.

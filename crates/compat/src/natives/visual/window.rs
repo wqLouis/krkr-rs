@@ -129,6 +129,7 @@ fn register_window(ctx: &CompatCtx, host: &Tjs2Engine, id: u32, objthis: *mut c_
     match host.retain_object_detached(objthis) {
         // SAFETY: the caller resolved `ctx` from the installed binding.
         Ok(object) => {
+            // SAFETY: the callback resolved this context from the installed binding, whose service set is live for the whole VM lifetime.
             unsafe { ctx.services() }
                 .state::<VisualState>()
                 .objects
@@ -151,6 +152,7 @@ extern "C" fn window_destroy(engine: *mut c_void, instance: *mut c_void) {
     if instance.is_null() {
         return;
     }
+    // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM owns it and keeps it alive and unaliased for the duration of this callback.
     let inst = unsafe { &*(instance as *const WindowInst) };
     if let (Some(id), Ok((resolved, ctx))) = (inst.id, bound(engine)) {
         let registered = {
@@ -188,8 +190,8 @@ extern "C" fn window_ctor(
     let Ok((resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Window: compat context is not bound");
     };
-    let inst = unsafe { &mut *(instance as *mut WindowInst) };
-    if inst.id.is_some() {
+    // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM owns it and keeps it alive and unaliased for the duration of this callback.
+    if unsafe { &*(instance as *const WindowInst) }.id.is_some() {
         return report_error(out_error, "Window: this window is already constructed");
     }
     let scene = match scene_mut(&ctx) {
@@ -200,7 +202,11 @@ extern "C" fn window_ctor(
     // `win.width`/`win.height` sane before `setInnerSize` (the reference
     // opens with a default size).
     let id = scene.add_window(String::new(), (1280, 720));
-    inst.id = Some(id);
+    // This borrow is released before `eval_retained` below: that call runs
+    // script, which could otherwise re-enter a `Window` member and mint a
+    // second `&mut` to the same payload.
+    // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM dispatches one callback at a time on it, and this borrow ends before any call that could re-enter the VM.
+    unsafe { &mut *(instance as *mut WindowInst) }.id = Some(id);
     register_window(&ctx, resolved.engine(), id, objthis);
     // Install the default draw device: the reference constructs a
     // `BasicDrawDevice` for every window and throws `TVPInternalError` when
@@ -213,7 +219,12 @@ extern "C" fn window_ctor(
         .engine()
         .eval_retained("new Window.BasicDrawDevice()", "Window")
     {
-        Ok(RetainedValue::Object(object)) => inst.draw_device = Some(object),
+        Ok(RetainedValue::Object(object)) => {
+            // SAFETY: `instance` is the `WindowInst` boxed by `window_create`;
+            // this write runs after `eval_retained` returned, so the borrow
+            // never spans a call that could re-enter the VM.
+            unsafe { &mut *(instance as *mut WindowInst) }.draw_device = Some(object);
+        }
         Ok(RetainedValue::Value(_)) | Err(_) => {
             return report_error(out_error, "Internal error");
         }
@@ -235,6 +246,7 @@ extern "C" fn window_close(
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Window.close: compat context is not bound");
     };
+    // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM dispatches one callback at a time on it, and this borrow ends before any call that could re-enter the VM.
     let inst = unsafe { &mut *(instance as *mut WindowInst) };
     let Some(id) = inst.id else {
         return report_error(out_error, "Window.close: this window is not constructed");
@@ -271,6 +283,7 @@ extern "C" fn window_bring_to_front(
             "Window.bringToFront: compat context is not bound",
         );
     };
+    // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM owns it and keeps it alive and unaliased for the duration of this callback.
     let inst = unsafe { &*(instance as *const WindowInst) };
     if let Some(id) = inst.id {
         // SAFETY: the caller resolved `ctx` from the installed binding.
@@ -298,10 +311,12 @@ extern "C" fn window_update(
         return report_error(out_error, "Window.update: compat context is not bound");
     };
     let update_type = if argc >= 1 {
+        // SAFETY: the C++ trampoline passes `argc` live `Value`s in `argv` for the duration of this callback.
         value_as_i64(&unsafe { args(argv, argc) }[0]) as i32
     } else {
         0
     };
+    // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM owns it and keeps it alive and unaliased for the duration of this callback.
     let inst = unsafe { &*(instance as *const WindowInst) };
     let Some(id) = inst.id else {
         return report_error(out_error, "Window.update: this window is not constructed");
@@ -343,6 +358,7 @@ extern "C" fn window_add(
     let Ok((resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Window.add: compat context is not bound");
     };
+    // SAFETY: the C++ trampoline passes `argc` live `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     if a[0].ty != VAL_OBJECT {
         return report_error(out_error, "Window.add requires an object argument");
@@ -354,6 +370,7 @@ extern "C" fn window_add(
         Ok(value) => value,
         Err(error) => return report_error(out_error, &error),
     };
+    // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM owns it and keeps it alive and unaliased for the duration of this callback.
     let inst = unsafe { &*(instance as *const WindowInst) };
     let Some(window) = inst.id else {
         return report_error(out_error, "Window.add: this window is not constructed");
@@ -388,11 +405,13 @@ extern "C" fn window_remove(
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Window.remove: compat context is not bound");
     };
+    // SAFETY: the C++ trampoline passes `argc` live `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     if a[0].ty != VAL_OBJECT {
         return report_error(out_error, "Window.remove requires an object argument");
     }
     let identity = (a[0].retained, a[0].array as usize);
+    // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM owns it and keeps it alive and unaliased for the duration of this callback.
     let inst = unsafe { &*(instance as *const WindowInst) };
     let Some(window) = inst.id else {
         return report_error(out_error, "Window.remove: this window is not constructed");
@@ -422,9 +441,11 @@ extern "C" fn window_set_size(
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Window.setSize: compat context is not bound");
     };
+    // SAFETY: the C++ trampoline passes `argc` live `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     let width = value_as_i64(&a[0]).max(0) as u32;
     let height = value_as_i64(&a[1]).max(0) as u32;
+    // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM owns it and keeps it alive and unaliased for the duration of this callback.
     let inst = unsafe { &*(instance as *const WindowInst) };
     let Some(id) = inst.id else {
         return report_error(out_error, "Window.setSize: this window is not constructed");
@@ -466,7 +487,9 @@ extern "C" fn window_set_pos(
     if argc < 2 {
         return report_error(out_error, "Window.setPos requires 2 arguments");
     }
+    // SAFETY: the C++ trampoline passes `argc` live `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
+    // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM dispatches one callback at a time on it, and this borrow ends before any call that could re-enter the VM.
     let inst = unsafe { &mut *(instance as *mut WindowInst) };
     inst.left = value_as_i64(&a[0]) as i32;
     inst.top = value_as_i64(&a[1]) as i32;
@@ -487,7 +510,9 @@ extern "C" fn window_set_min_size(
     if argc < 2 {
         return report_error(out_error, "Window.setMinSize requires 2 arguments");
     }
+    // SAFETY: the C++ trampoline passes `argc` live `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
+    // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM dispatches one callback at a time on it, and this borrow ends before any call that could re-enter the VM.
     let inst = unsafe { &mut *(instance as *mut WindowInst) };
     inst.min_width = value_as_i64(&a[0]) as i32;
     inst.min_height = value_as_i64(&a[1]) as i32;
@@ -508,7 +533,9 @@ extern "C" fn window_set_max_size(
     if argc < 2 {
         return report_error(out_error, "Window.setMaxSize requires 2 arguments");
     }
+    // SAFETY: the C++ trampoline passes `argc` live `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
+    // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM dispatches one callback at a time on it, and this borrow ends before any call that could re-enter the VM.
     let inst = unsafe { &mut *(instance as *mut WindowInst) };
     inst.max_width = value_as_i64(&a[0]) as i32;
     inst.max_height = value_as_i64(&a[1]) as i32;
@@ -529,7 +556,9 @@ extern "C" fn window_set_zoom(
     if argc < 2 {
         return report_error(out_error, "Window.setZoom requires 2 arguments");
     }
+    // SAFETY: the C++ trampoline passes `argc` live `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
+    // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM dispatches one callback at a time on it, and this borrow ends before any call that could re-enter the VM.
     let inst = unsafe { &mut *(instance as *mut WindowInst) };
     let numer = value_as_i64(&a[0]).max(1) as i32;
     let denom = value_as_i64(&a[1]).max(1) as i32;
@@ -549,8 +578,10 @@ extern "C" fn window_show_modal(
     _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM dispatches one callback at a time on it, and this borrow ends before any call that could re-enter the VM.
     let inst = unsafe { &mut *(instance as *mut WindowInst) };
     inst.modal = if argc >= 1 {
+        // SAFETY: the C++ trampoline passes `argc` live `Value`s in `argv` for the duration of this callback.
         value_as_bool(&unsafe { args(argv, argc) }[0])
     } else {
         true
@@ -572,7 +603,9 @@ extern "C" fn window_set_mask_region(
     if argc < 1 {
         return report_error(out_error, "Window.setMaskRegion requires 1 argument");
     }
+    // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM dispatches one callback at a time on it, and this borrow ends before any call that could re-enter the VM.
     let inst = unsafe { &mut *(instance as *mut WindowInst) };
+    // SAFETY: the C++ trampoline passes `argc` live `Value`s in `argv` for the duration of this callback.
     inst.mask_region = Some(value_as_i64(&unsafe { args(argv, argc) }[0]) as i32);
     set_void(out);
     0
@@ -588,6 +621,7 @@ extern "C" fn window_remove_mask_region(
     _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM dispatches one callback at a time on it, and this borrow ends before any call that could re-enter the VM.
     let inst = unsafe { &mut *(instance as *mut WindowInst) };
     inst.mask_region = None;
     set_void(out);
@@ -604,6 +638,7 @@ extern "C" fn window_hide_mouse_cursor(
     _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM dispatches one callback at a time on it, and this borrow ends before any call that could re-enter the VM.
     let inst = unsafe { &mut *(instance as *mut WindowInst) };
     inst.mouse_cursor_state = 2;
     set_void(out);
@@ -774,6 +809,7 @@ extern "C" fn window_visible_get(
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Window.visible: compat context is not bound");
     };
+    // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM owns it and keeps it alive and unaliased for the duration of this callback.
     let inst = unsafe { &*(instance as *const WindowInst) };
     let Some(id) = inst.id else {
         set_bool(out, false);
@@ -797,10 +833,12 @@ extern "C" fn window_visible_set(
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Window.visible: compat context is not bound");
     };
+    // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM owns it and keeps it alive and unaliased for the duration of this callback.
     let inst = unsafe { &*(instance as *const WindowInst) };
     let Some(id) = inst.id else {
         return 0;
     };
+    // SAFETY: the C++ property dispatcher passes a live `Value` for the duration of this call.
     let visible = value_as_bool(unsafe { &*value });
     let scene = match scene_mut(&ctx) {
         Ok(scene) => scene,
@@ -822,6 +860,7 @@ extern "C" fn window_caption_get(
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Window.caption: compat context is not bound");
     };
+    // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM owns it and keeps it alive and unaliased for the duration of this callback.
     let inst = unsafe { &*(instance as *const WindowInst) };
     let Some(id) = inst.id else {
         return 0;
@@ -848,10 +887,12 @@ extern "C" fn window_caption_set(
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Window.caption: compat context is not bound");
     };
+    // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM owns it and keeps it alive and unaliased for the duration of this callback.
     let inst = unsafe { &*(instance as *const WindowInst) };
     let Some(id) = inst.id else {
         return 0;
     };
+    // SAFETY: the C++ property dispatcher passes a live `Value` for the duration of this call.
     let title = value_as_string(unsafe { &*value });
     let scene = match scene_mut(&ctx) {
         Ok(scene) => scene,
@@ -873,6 +914,7 @@ extern "C" fn window_width_get(
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Window.width: compat context is not bound");
     };
+    // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM owns it and keeps it alive and unaliased for the duration of this callback.
     let inst = unsafe { &*(instance as *const WindowInst) };
     let Some(id) = inst.id else {
         return 0;
@@ -896,10 +938,12 @@ extern "C" fn window_width_set(
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Window.width: compat context is not bound");
     };
+    // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM owns it and keeps it alive and unaliased for the duration of this callback.
     let inst = unsafe { &*(instance as *const WindowInst) };
     let Some(id) = inst.id else {
         return 0;
     };
+    // SAFETY: the C++ property dispatcher passes a live `Value` for the duration of this call.
     let width = value_as_i64(unsafe { &*value }).max(0) as u32;
     let scene = match scene_mut(&ctx) {
         Ok(scene) => scene,
@@ -921,6 +965,7 @@ extern "C" fn window_height_get(
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Window.height: compat context is not bound");
     };
+    // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM owns it and keeps it alive and unaliased for the duration of this callback.
     let inst = unsafe { &*(instance as *const WindowInst) };
     let Some(id) = inst.id else {
         return 0;
@@ -944,10 +989,12 @@ extern "C" fn window_height_set(
     let Ok((_resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Window.height: compat context is not bound");
     };
+    // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM owns it and keeps it alive and unaliased for the duration of this callback.
     let inst = unsafe { &*(instance as *const WindowInst) };
     let Some(id) = inst.id else {
         return 0;
     };
+    // SAFETY: the C++ property dispatcher passes a live `Value` for the duration of this call.
     let height = value_as_i64(unsafe { &*value }).max(0) as u32;
     let scene = match scene_mut(&ctx) {
         Ok(scene) => scene,
@@ -969,6 +1016,7 @@ macro_rules! window_i64_prop {
             _out_error: *mut *mut c_char,
             _objthis: *mut c_void,
         ) -> c_int {
+            // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM owns it and keeps it alive and unaliased for the duration of this callback.
             let inst = unsafe { &*(instance as *const WindowInst) };
             set_int(out, i64::from(inst.$field));
             0
@@ -980,7 +1028,9 @@ macro_rules! window_i64_prop {
             _out_error: *mut *mut c_char,
             _objthis: *mut c_void,
         ) -> c_int {
+            // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM dispatches one callback at a time on it, and this borrow ends before any call that could re-enter the VM.
             let inst = unsafe { &mut *(instance as *mut WindowInst) };
+            // SAFETY: the C++ property dispatcher passes a live `Value` for the duration of this call.
             inst.$field = value_as_i64(unsafe { &*value }) as i32;
             0
         }
@@ -1012,6 +1062,7 @@ macro_rules! window_bool_prop {
             _out_error: *mut *mut c_char,
             _objthis: *mut c_void,
         ) -> c_int {
+            // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM owns it and keeps it alive and unaliased for the duration of this callback.
             let inst = unsafe { &*(instance as *const WindowInst) };
             set_bool(out, inst.$field);
             0
@@ -1023,7 +1074,9 @@ macro_rules! window_bool_prop {
             _out_error: *mut *mut c_char,
             _objthis: *mut c_void,
         ) -> c_int {
+            // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM dispatches one callback at a time on it, and this borrow ends before any call that could re-enter the VM.
             let inst = unsafe { &mut *(instance as *mut WindowInst) };
+            // SAFETY: the C++ property dispatcher passes a live `Value` for the duration of this call.
             inst.$field = value_as_bool(unsafe { &*value });
             0
         }
@@ -1081,6 +1134,7 @@ extern "C" fn window_focused_layer_get(
             "Window.focusedLayer: compat context is not bound",
         );
     };
+    // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM owns it and keeps it alive and unaliased for the duration of this callback.
     let inst = unsafe { &*(instance as *const WindowInst) };
     let Some(id) = inst.id else {
         set_null_out(resolved.engine(), out);
@@ -1111,10 +1165,12 @@ extern "C" fn window_focused_layer_set(
             "Window.focusedLayer: compat context is not bound",
         );
     };
+    // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM owns it and keeps it alive and unaliased for the duration of this callback.
     let inst = unsafe { &*(instance as *const WindowInst) };
     let Some(window) = inst.id else {
         return 0;
     };
+    // SAFETY: the C++ property dispatcher passes a live `Value` for the duration of this call.
     let value = unsafe { &*value };
     let layer_id = match resolve_object_id(resolved.engine(), value, &["Layer"]) {
         Ok(id) if id >= 0 => Some(id as u32),
@@ -1156,6 +1212,7 @@ extern "C" fn window_primary_layer_get(
             "Window.primaryLayer: compat context is not bound",
         );
     };
+    // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM owns it and keeps it alive and unaliased for the duration of this callback.
     let inst = unsafe { &*(instance as *const WindowInst) };
     let Some(id) = inst.id else {
         set_null_out(resolved.engine(), out);
@@ -1220,6 +1277,7 @@ extern "C" fn window_get_touch_point(
         Ok(input) => input,
         Err(error) => return report_error(out_error, &error),
     };
+    // SAFETY: the C++ trampoline passes `argc` live `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     let Some(id) = resolve_touch_id(input, value_as_i64(&a[0])) else {
         return report_error(out_error, "Window.getTouchPoint: no such touch contact");
@@ -1279,6 +1337,7 @@ extern "C" fn window_get_touch_velocity(
         Ok(input) => input,
         Err(error) => return report_error(out_error, &error),
     };
+    // SAFETY: the C++ trampoline passes `argc` live `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     let Some(id) = resolve_touch_id(input, value_as_i64(&a[0])) else {
         set_null_out(resolved.engine(), out);
@@ -1622,6 +1681,7 @@ extern "C" fn window_get_mouse_velocity(
         Err(error) => return report_error(out_error, &error),
     };
     let (x, y) = input.pointer();
+    // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM owns it and keeps it alive and unaliased for the duration of this callback.
     let inst = unsafe { &*(instance as *const WindowInst) };
     let Some(id) = inst.id else {
         return report_error(
@@ -1667,6 +1727,7 @@ extern "C" fn window_reset_mouse_velocity(
             "Window.resetMouseVelocity: compat context is not bound",
         );
     };
+    // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM owns it and keeps it alive and unaliased for the duration of this callback.
     let inst = unsafe { &*(instance as *const WindowInst) };
     let Some(id) = inst.id else {
         return report_error(
@@ -1714,6 +1775,7 @@ extern "C" fn window_draw_device_get(
     let Ok((resolved, _ctx)) = bound(engine) else {
         return report_error(out_error, "Window.drawDevice: compat context is not bound");
     };
+    // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM owns it and keeps it alive and unaliased for the duration of this callback.
     let inst = unsafe { &*(instance as *const WindowInst) };
     let host = resolved.engine();
     match inst.draw_device.as_ref() {
@@ -1734,6 +1796,7 @@ extern "C" fn window_draw_device_set(
     out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: the C++ property dispatcher passes a live `Value` for the duration of this call.
     let value = unsafe { &*value };
     if value.ty != VAL_OBJECT {
         return 0;
@@ -1759,6 +1822,7 @@ extern "C" fn window_draw_device_set(
             // before dispatching. The stored device object is replaced
             // (`WindowIntf.cpp:255-292`).
             let previous = {
+                // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM dispatches one callback at a time on it, and this borrow ends before any call that could re-enter the VM.
                 let inst = unsafe { &mut *(instance as *mut WindowInst) };
                 inst.draw_device.replace(object)
             };
@@ -1845,10 +1909,12 @@ extern "C" fn window_register_message_receiver(
             "Window.registerMessageReceiver requires 3 arguments",
         );
     }
+    // SAFETY: the C++ trampoline passes `argc` live `Value`s in `argv` for the duration of this callback.
     let a = unsafe { args(argv, argc) };
     let mode = value_as_i64(&a[0]);
     let proc = value_as_i64(&a[1]);
     let userdata = value_as_i64(&a[2]);
+    // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM dispatches one callback at a time on it, and this borrow ends before any call that could re-enter the VM.
     let inst = unsafe { &mut *(instance as *mut WindowInst) };
     apply_message_receiver_mode(&mut inst.message_receivers, mode, proc, userdata);
     set_void(out);
@@ -1929,6 +1995,7 @@ extern "C" fn window_touch_scale_threshold_get(
     _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM owns it and keeps it alive and unaliased for the duration of this callback.
     let inst = unsafe { &*(instance as *const WindowInst) };
     set_real(out, inst.touch_scale_threshold);
     0
@@ -1941,7 +2008,9 @@ extern "C" fn window_touch_scale_threshold_set(
     _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM dispatches one callback at a time on it, and this borrow ends before any call that could re-enter the VM.
     let inst = unsafe { &mut *(instance as *mut WindowInst) };
+    // SAFETY: the C++ property dispatcher passes a live `Value` for the duration of this call.
     inst.touch_scale_threshold = value_as_f64(unsafe { &*value });
     0
 }
@@ -1954,6 +2023,7 @@ extern "C" fn window_touch_rotate_threshold_get(
     _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM owns it and keeps it alive and unaliased for the duration of this callback.
     let inst = unsafe { &*(instance as *const WindowInst) };
     set_real(out, inst.touch_rotate_threshold);
     0
@@ -1966,7 +2036,9 @@ extern "C" fn window_touch_rotate_threshold_set(
     _out_error: *mut *mut c_char,
     _objthis: *mut c_void,
 ) -> c_int {
+    // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; the VM dispatches one callback at a time on it, and this borrow ends before any call that could re-enter the VM.
     let inst = unsafe { &mut *(instance as *mut WindowInst) };
+    // SAFETY: the C++ property dispatcher passes a live `Value` for the duration of this call.
     inst.touch_rotate_threshold = value_as_f64(unsafe { &*value });
     0
 }

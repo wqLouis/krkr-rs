@@ -163,9 +163,9 @@ pub(crate) fn create(
         .clipped(true)
         .old_swapchain(old.map_or(vk::SwapchainKHR::null(), |old| old.swapchain));
 
-    // SAFETY: `create_info` borrows `surface`, which outlives the call; the
-    // old swapchain is only used as a hint and is destroyed by the caller.
     let swapchain =
+        // SAFETY: `create_info` borrows `surface`, which outlives the call; the
+        // old swapchain is only used as a hint and is destroyed by the caller.
         unsafe { swapchain_loader.create_swapchain(&create_info, None) }.map_err(|error| {
             RenderError::Framebuffer {
                 message: format!("failed to create the swapchain: {error}"),

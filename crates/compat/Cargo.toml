@@ -41,9 +41,12 @@ md-5 = "0.10.6"
 # host). The touch tests also name `api::host::TouchPhase` directly (the
 # `platform` re-export only covers `InputEvent`/`MouseButton`).
 api = { workspace = true }
+# L3 uses the L1 filesystem abstraction: `std::fs` is platform code and belongs
+# in L1 only (AGENTS §2). The compat natives route their file IO through this
+# crate rather than reaching for the host themselves.
+fs = { workspace = true }
 
 [dev-dependencies]
-fs = { workspace = true }
 # Tests only: the shared `build_xp3` archive fixture (raw and zlib-index) so
 # the compat test binaries do not carry their own byte-for-byte copies.
 testkit = { workspace = true }

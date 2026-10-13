@@ -91,6 +91,8 @@ pub(crate) fn create_instance(config: &PipelineConfig) -> Result<InstanceBundle,
         message: format!("the Vulkan loader is unavailable: {error}"),
     })?;
 
+    // SAFETY: `entry` owns the loaded Vulkan loader handle; the query is
+    // read-only and returns an owned `Vec`.
     let extension_properties = unsafe { entry.enumerate_instance_extension_properties(None) }
         .map_err(|error| RenderError::DeviceUnavailable {
             message: format!(
@@ -133,6 +135,7 @@ pub(crate) fn create_instance(config: &PipelineConfig) -> Result<InstanceBundle,
     let mut validation = false;
     let mut enabled_layers: Vec<*const c_char> = Vec::new();
     if config.validation {
+        // SAFETY: as above, `entry` is the live loader; the query is read-only.
         let layers = unsafe { entry.enumerate_instance_layer_properties() }.map_err(|error| {
             RenderError::DeviceUnavailable {
                 message: format!(
@@ -200,6 +203,8 @@ pub(crate) fn create_instance(config: &PipelineConfig) -> Result<InstanceBundle,
 fn select_physical_device(
     instance: &ash::Instance,
 ) -> Result<(vk::PhysicalDevice, u32, vk::PhysicalDeviceMemoryProperties), RenderError> {
+    // SAFETY: `instance` is the live instance created above; the query is
+    // read-only.
     let devices = unsafe { instance.enumerate_physical_devices() }.map_err(|error| {
         RenderError::DeviceUnavailable {
             message: format!(
@@ -216,6 +221,8 @@ fn select_physical_device(
         vk::PhysicalDeviceMemoryProperties,
     )> = None;
     for physical_device in devices {
+        // SAFETY: `physical_device` was enumerated from this `instance`; the
+        // query is read-only.
         let properties = unsafe { instance.get_physical_device_properties(physical_device) };
         let type_rank = match properties.device_type {
             vk::PhysicalDeviceType::DISCRETE_GPU => 3,
@@ -228,6 +235,7 @@ fn select_physical_device(
             continue;
         }
         let families =
+            // SAFETY: `physical_device` belongs to this `instance`; read-only.
             unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
         let has_graphics = families
             .iter()
@@ -238,6 +246,7 @@ fn select_physical_device(
 
         let max_dimension = properties.limits.max_image_dimension2_d.max(1);
         let memory_properties =
+            // SAFETY: `physical_device` belongs to this `instance`; read-only.
             unsafe { instance.get_physical_device_memory_properties(physical_device) };
         let candidate = (type_rank, physical_device, max_dimension, memory_properties);
         if best.as_ref().is_none_or(|current| candidate.0 > current.0) {
@@ -260,6 +269,8 @@ fn device_has_extension(
     physical_device: vk::PhysicalDevice,
     name: &CStr,
 ) -> bool {
+    // SAFETY: `physical_device` belongs to this `instance`; the query is
+    // read-only.
     match unsafe { instance.enumerate_device_extension_properties(physical_device) } {
         Ok(properties) => properties
             .iter()
@@ -278,6 +289,7 @@ pub(crate) fn create_device(
     surface_loader: &ash::khr::surface::Instance,
     surface: vk::SurfaceKHR,
 ) -> Result<DeviceBundle, RenderError> {
+    // SAFETY: `physical_device` belongs to this `instance`; read-only.
     let families = unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
     let mut chosen = None;
     for (index, family) in families.iter().enumerate() {

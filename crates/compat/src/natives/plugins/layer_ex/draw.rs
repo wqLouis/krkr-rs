@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void};
 
+use api::fs::FsPath;
 use engine::BitmapState;
 use engine::layer_ops::{self, RectI};
 use engine::raster::{self, blend_pixel};
@@ -2148,7 +2149,8 @@ extern "C" fn save_record(
         set_bool(out, false);
         return 0;
     };
-    match std::fs::write(&filename, encode_record(&ops)) {
+    let file_system = fs::FileSystem::host("");
+    match fs::write(&file_system, &FsPath::host(&filename), &encode_record(&ops)) {
         Ok(()) => set_bool(out, true),
         Err(error) => {
             return report_error(out_error, &format!("Layer.saveRecord: {error}"));
@@ -2178,7 +2180,8 @@ extern "C" fn load_record(
     let Ok(Some(layer_id)) = layer_from_objthis(resolved.engine(), objthis) else {
         return report_error(out_error, "Layer.loadRecord: the receiver is not a Layer");
     };
-    let bytes = match std::fs::read(&filename) {
+    let file_system = fs::FileSystem::host("");
+    let bytes = match fs::read(&file_system, &FsPath::host(&filename)) {
         Ok(bytes) => bytes,
         Err(error) => return report_error(out_error, &format!("Layer.loadRecord: {error}")),
     };

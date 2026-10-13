@@ -6,11 +6,11 @@
 //! split.
 
 use api::error::FsError;
-use api::fs::{DirEntry, FileStat, FsPath, OpenMode, SeekFrom};
+use api::fs::{DirEntry, FileMetadata, FileStat, FsPath, OpenMode, SeekFrom};
 
 use crate::host::{
-    check_host_exists, check_host_file, host_read_at, host_write_at, io_error, open_host,
-    resolve_host,
+    check_host_exists, check_host_file, host_permissions_mode, host_read_at, host_write_at,
+    io_error, open_host, resolve_host,
 };
 use crate::memory::{
     ensure_memory_parent, file_name_string, join_suffix, memory_key, memory_range, open_memory,
@@ -485,5 +485,214 @@ pub fn seek(fs: &FileSystem, file: &mut FileState, from: SeekFrom) -> Result<u64
 fn backend_mismatch() -> FsError {
     FsError::InvalidState {
         message: "the file handle does not belong to this file system".to_owned(),
+    }
+}
+
+/// Returns full metadata for `path`.
+///
+/// Unlike [`stat`], this reports the raw size of a directory and the three
+/// host timestamps plus the permission bits the platform exposes. A time the
+/// backend cannot represent is `None`.
+pub fn metadata(fs: &FileSystem, path: &FsPath) -> Result<FileMetadata, FsError> {
+    match &fs.backend {
+        Backend::Host { base } => {
+            let full = resolve_host(base, path)?;
+            let display = full.display().to_string();
+            let meta = std::fs::metadata(&full).map_err(|e| io_error(&display, e))?;
+            Ok(FileMetadata {
+                size: meta.len(),
+                is_dir: meta.is_dir(),
+                is_file: meta.is_file(),
+                modified_ms: meta.modified().ok().and_then(system_time_millis),
+                created_ms: meta.created().ok().and_then(system_time_millis),
+                accessed_ms: meta.accessed().ok().and_then(system_time_millis),
+                mode: host_permissions_mode(&meta),
+            })
+        }
+        Backend::Memory { .. } => {
+            let file_stat = stat(fs, path)?;
+            Ok(FileMetadata {
+                size: file_stat.size,
+                is_dir: file_stat.is_dir,
+                is_file: !file_stat.is_dir,
+                modified_ms: None,
+                created_ms: None,
+                accessed_ms: None,
+                mode: None,
+            })
+        }
+    }
+}
+
+/// Converts a `SystemTime` to milliseconds since the Unix epoch, negative for
+/// pre-epoch times.
+///
+/// A duration that does not fit `i64` is `None`; the bottom layer does not
+/// fabricate a time it cannot represent.
+fn system_time_millis(time: std::time::SystemTime) -> Option<i64> {
+    match time.duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => i64::try_from(duration.as_millis()).ok(),
+        Err(error) => i64::try_from(error.duration().as_millis())
+            .ok()
+            .map(|millis| -millis),
+    }
+}
+
+/// Returns `true` if `path` exists and is a directory.
+///
+/// A missing path or a stat failure is `false`, matching the `Path::is_dir`
+/// convenience this exposes through the bottom layer.
+pub fn is_dir(fs: &FileSystem, path: &FsPath) -> bool {
+    match metadata(fs, path) {
+        Ok(meta) => meta.is_dir,
+        Err(_) => false,
+    }
+}
+
+/// Returns `true` if `path` exists and is a regular file (symlinks are
+/// followed).
+///
+/// A missing path or a stat failure is `false`, matching the `Path::is_file`
+/// convenience this exposes through the bottom layer.
+pub fn is_file(fs: &FileSystem, path: &FsPath) -> bool {
+    match metadata(fs, path) {
+        Ok(meta) => meta.is_file,
+        Err(_) => false,
+    }
+}
+
+/// Removes the empty directory at `path`.
+///
+/// A directory with children is a typed error on both backends; use the
+/// namespace layer for a recursive delete. The in-memory backend removes only
+/// directories it explicitly created (or an implicit parent), never the root.
+pub fn remove_dir(fs: &FileSystem, path: &FsPath) -> Result<(), FsError> {
+    match &fs.backend {
+        Backend::Host { base } => {
+            let full = resolve_host(base, path)?;
+            let display = full.display().to_string();
+            std::fs::remove_dir(&full).map_err(|e| io_error(&display, e))
+        }
+        Backend::Memory { store } => {
+            let key = memory_key(path)?;
+            let display = key.display().to_string();
+            let mut guard = lock(store);
+            if !key.as_os_str().is_empty() && !guard.is_dir(&key) {
+                if guard.files.contains_key(&key) {
+                    return Err(FsError::NotADirectory { path: display });
+                }
+                return Err(FsError::NotFound { path: display });
+            }
+            if key.as_os_str().is_empty() {
+                return Err(FsError::Io {
+                    message: format!("cannot remove the storage root: {display}"),
+                });
+            }
+            let has_children = guard.dirs.iter().any(|dir| parent_is(dir, &key))
+                || guard.files.keys().any(|file| parent_is(file, &key));
+            if has_children {
+                return Err(FsError::Io {
+                    message: format!("directory not empty: {display}"),
+                });
+            }
+            guard.dirs.remove(&key);
+            Ok(())
+        }
+    }
+}
+
+/// Reads the entire file at `path` into a new buffer.
+///
+/// A path that names a directory is [`FsError::IsADirectory`], and a missing
+/// path is [`FsError::NotFound`]. The buffer grows fallibly, so a file the
+/// platform cannot allocate is a typed error rather than a panic.
+pub fn read(fs: &FileSystem, path: &FsPath) -> Result<Vec<u8>, FsError> {
+    match &fs.backend {
+        Backend::Host { base } => {
+            let full = resolve_host(base, path)?;
+            let display = full.display().to_string();
+            std::fs::read(&full).map_err(|e| io_error(&display, e))
+        }
+        Backend::Memory { store } => {
+            let key = memory_key(path)?;
+            let display = key.display().to_string();
+            let guard = lock(store);
+            if key.as_os_str().is_empty() || guard.is_dir(&key) {
+                return Err(FsError::IsADirectory { path: display });
+            }
+            match guard.files.get(&key) {
+                Some(bytes) => Ok(bytes.clone()),
+                None => Err(FsError::NotFound { path: display }),
+            }
+        }
+    }
+}
+
+/// Writes `bytes` to `path`, creating it or truncating an existing file.
+///
+/// The destination's parent directory must already exist, matching
+/// `std::fs::write`.
+pub fn write(fs: &FileSystem, path: &FsPath, bytes: &[u8]) -> Result<(), FsError> {
+    match &fs.backend {
+        Backend::Host { base } => {
+            let full = resolve_host(base, path)?;
+            let display = full.display().to_string();
+            std::fs::write(&full, bytes).map_err(|e| io_error(&display, e))
+        }
+        Backend::Memory { store } => {
+            let key = memory_key(path)?;
+            let display = key.display().to_string();
+            let mut guard = lock(store);
+            if guard.is_dir(&key) {
+                return Err(FsError::IsADirectory { path: display });
+            }
+            ensure_memory_parent(&guard, &key)?;
+            guard.files.insert(key, bytes.to_vec());
+            Ok(())
+        }
+    }
+}
+
+/// Appends `buf` at the current end of `file`.
+///
+/// The position is read from the file's current length on every call, so the
+/// logical cursor is not modified. The file must have been opened for
+/// writing.
+pub fn append(fs: &FileSystem, file: &FileState, buf: &[u8]) -> Result<usize, FsError> {
+    let end = file_size(fs, file)?;
+    write_at(fs, file, end, buf)
+}
+
+/// Sets both the access and the modification time of `path` to `seconds`
+/// since the Unix epoch.
+///
+/// This is the host `utimes`/`SetFileTime` shape: the bottom layer opens the
+/// file for writing (a read-only file is a typed error) and applies the same
+/// instant to both timestamps. The in-memory backend does not track times and
+/// reports [`FsError::Unsupported`].
+pub fn set_times(fs: &FileSystem, path: &FsPath, seconds: i64) -> Result<(), FsError> {
+    match &fs.backend {
+        Backend::Host { base } => {
+            let full = resolve_host(base, path)?;
+            let display = full.display().to_string();
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&full)
+                .map_err(|e| io_error(&display, e))?;
+            let when = if seconds >= 0 {
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds as u64)
+            } else {
+                std::time::UNIX_EPOCH - std::time::Duration::from_secs(seconds.unsigned_abs())
+            };
+            file.set_times(
+                std::fs::FileTimes::new()
+                    .set_accessed(when)
+                    .set_modified(when),
+            )
+            .map_err(|e| io_error(&display, e))
+        }
+        Backend::Memory { .. } => Err(FsError::Unsupported {
+            operation: "the in-memory backend does not track file times".to_owned(),
+        }),
     }
 }

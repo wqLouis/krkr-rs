@@ -56,8 +56,10 @@ use super::md5::md5_hex;
 use std::ffi::{c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use api::error::FsError;
+use api::fs::{FsPath, OpenMode};
 use engine::{Location, Storage};
 use tjs::{
     DetachedValue, NativeInstanceBuilder, NativeInstanceMethodDef, NativeMethodDef,
@@ -292,14 +294,20 @@ fn set_retained_out(out: *mut Value, object: DetachedValue) {
     std::mem::forget(object);
 }
 
-/// Seconds since the Unix epoch, negative for pre-epoch times.
-fn system_time_seconds(time: SystemTime) -> Option<i64> {
-    match time.duration_since(UNIX_EPOCH) {
-        Ok(duration) => i64::try_from(duration.as_secs()).ok(),
-        Err(error) => i64::try_from(error.duration().as_secs())
-            .ok()
-            .map(|seconds| -seconds),
-    }
+/// Converts milliseconds since the Unix epoch to whole seconds, dropping a
+/// sub-second remainder (truncating toward zero).
+fn millis_to_seconds(ms: Option<i64>) -> Option<i64> {
+    ms.map(|ms| ms / 1000)
+}
+
+/// The host file-system object for the already-resolved local paths this
+/// plugin works with.
+///
+/// The empty base leaves relative paths relative and passes absolute paths
+/// through, matching the host calls it replaces; a path is resolved by the
+/// storage namespace before it reaches this helper.
+fn host_file_system() -> fs::FileSystem {
+    fs::FileSystem::host("")
 }
 
 /// Disk metadata used by `fstat` / `getTime`.
@@ -315,13 +323,14 @@ struct DiskInfo {
 /// zero-valued "file" (the reference ignores `TVP_stat`'s return value), so
 /// [`fstat`] reports `size: 0` and `void` timestamps for a missing name.
 fn disk_info(path: &Path) -> DiskInfo {
-    match std::fs::metadata(path) {
+    let file_system = host_file_system();
+    match fs::metadata(&file_system, &FsPath::host(path)) {
         Ok(meta) => DiskInfo {
-            size: meta.len(),
-            is_dir: meta.is_dir(),
-            mtime: meta.modified().ok().and_then(system_time_seconds),
-            ctime: meta.created().ok().and_then(system_time_seconds),
-            atime: meta.accessed().ok().and_then(system_time_seconds),
+            size: meta.size,
+            is_dir: meta.is_dir,
+            mtime: millis_to_seconds(meta.modified_ms),
+            ctime: millis_to_seconds(meta.created_ms),
+            atime: millis_to_seconds(meta.accessed_ms),
         },
         Err(_) => DiskInfo {
             size: 0,
@@ -399,31 +408,8 @@ fn restore_date_filetime(engine: &Tjs2Engine, dict: Tjs2ValueId, member: &str) -
 }
 
 /// `TVP_utime`: set both the access and modification times, in seconds.
-fn set_file_times(path: &Path, seconds: i64) -> std::io::Result<()> {
-    let when = if seconds >= 0 {
-        UNIX_EPOCH + Duration::from_secs(seconds as u64)
-    } else {
-        UNIX_EPOCH - Duration::from_secs(seconds.unsigned_abs())
-    };
-    let file = std::fs::OpenOptions::new().write(true).open(path)?;
-    file.set_times(
-        std::fs::FileTimes::new()
-            .set_accessed(when)
-            .set_modified(when),
-    )
-}
-
-/// POSIX permission bits (the reference `static_cast<int32_t>(perms)`).
-#[cfg(unix)]
-fn permissions_mode(meta: &std::fs::Metadata) -> i64 {
-    use std::os::unix::fs::PermissionsExt;
-    i64::from(meta.permissions().mode() & 0o7777)
-}
-
-/// Non-Unix fallback: the read-only bit is all the portable layer exposes.
-#[cfg(not(unix))]
-fn permissions_mode(meta: &std::fs::Metadata) -> i64 {
-    i64::from(meta.permissions().readonly())
+fn set_file_times(path: &Path, seconds: i64) -> Result<(), FsError> {
+    fs::set_times(&host_file_system(), &FsPath::host(path), seconds)
 }
 
 // ---------------------------------------------------------------------------
@@ -747,7 +733,7 @@ extern "C" fn storages_export_file(
         Ok(path) => path,
         Err(error) => return report_error(out_error, &format!("Storages.exportFile: {error}")),
     };
-    if let Err(error) = std::fs::write(&path, &bytes) {
+    if let Err(error) = fs::write(&host_file_system(), &FsPath::host(&path), &bytes) {
         return report_error(
             out_error,
             &format!("Storages.exportFile: cannot open storefile: {dest} ({error})"),
@@ -780,7 +766,7 @@ extern "C" fn storages_delete_file(
     };
     let name = value_as_string(name);
     let removed = match placed_local(storage, &name) {
-        Some(path) => match std::fs::remove_file(&path) {
+        Some(path) => match fs::remove_file(&host_file_system(), &FsPath::host(&path)) {
             Ok(()) => true,
             Err(error) => {
                 log::warn!("Storages.deleteFile: {} failed: {error}", path.display());
@@ -833,9 +819,10 @@ extern "C" fn storages_move_file(
     }
     let from = value_as_string(&argv[0]);
     let to = value_as_string(&argv[1]);
+    let file_system = host_file_system();
     let moved = match (local_path(storage, &from), local_path(storage, &to)) {
-        (Ok(source), Ok(dest)) if source.is_file() => {
-            let copied = std::fs::copy(&source, &dest);
+        (Ok(source), Ok(dest)) if fs::is_file(&file_system, &FsPath::host(&source)) => {
+            let copied = fs::copy(&file_system, &FsPath::host(&source), &FsPath::host(&dest));
             // The reference deletes the source unconditionally after the copy
             // attempt, so a failed copy still removes it
             // (`reference/cpp/plugins/fstat/main.cpp:419-432`).
@@ -846,7 +833,7 @@ extern "C" fn storages_move_file(
                     dest.display()
                 );
             }
-            let removed = std::fs::remove_file(&source);
+            let removed = fs::remove_file(&file_system, &FsPath::host(&source));
             if let Err(error) = removed {
                 log::warn!(
                     "Storages.moveFile: cannot delete {}: {error}",
@@ -887,7 +874,7 @@ extern "C" fn storages_dirlist(
         Ok(path) => path,
         Err(code) => return code,
     };
-    let entries = match std::fs::read_dir(&path) {
+    let entries = match fs::list(&host_file_system(), &FsPath::host(&path)) {
         Ok(entries) => entries,
         Err(_) => return report_error(out_error, "Storages.dirlist: Directory not found."),
     };
@@ -895,8 +882,8 @@ extern "C" fn storages_dirlist(
         Ok(array) => array,
         Err(error) => return report_error(out_error, &format!("Storages.dirlist: {error}")),
     };
-    for (index, entry) in entries.flatten().enumerate() {
-        let name = entry.file_name().to_string_lossy().into_owned();
+    for (index, entry) in entries.iter().enumerate() {
+        let name = entry.name.clone();
         if let Err(error) =
             host.set_member(array.raw_id(), &index.to_string(), &TjsValue::String(name))
         {
@@ -934,7 +921,8 @@ extern "C" fn storages_dirlist_ex(
         Ok(path) => path,
         Err(code) => return code,
     };
-    let entries = match std::fs::read_dir(&path) {
+    let file_system = host_file_system();
+    let entries = match fs::list(&file_system, &FsPath::host(&path)) {
         Ok(entries) => entries,
         Err(_) => return report_error(out_error, "Storages.dirlistEx: Directory not found."),
     };
@@ -942,22 +930,23 @@ extern "C" fn storages_dirlist_ex(
         Ok(array) => array,
         Err(error) => return report_error(out_error, &format!("Storages.dirlistEx: {error}")),
     };
-    for (index, entry) in entries.flatten().enumerate() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let meta = match entry.metadata() {
+    for (index, entry) in entries.iter().enumerate() {
+        let name = entry.name.clone();
+        let entry_path = path.join(&entry.name);
+        let meta = match fs::metadata(&file_system, &FsPath::host(&entry_path)) {
             Ok(meta) => meta,
             Err(error) => {
                 return report_error(
                     out_error,
                     &format!(
                         "Storages.dirlistEx: cannot stat {}: {error}",
-                        entry.path().display()
+                        entry_path.display()
                     ),
                 );
             }
         };
-        let size = if meta.is_file() {
-            match i64::try_from(meta.len()) {
+        let size = if meta.is_file {
+            match i64::try_from(meta.size) {
                 Ok(size) => size,
                 Err(_) => {
                     return report_error(
@@ -969,16 +958,12 @@ extern "C" fn storages_dirlist_ex(
         } else {
             0
         };
-        let attrib = permissions_mode(&meta);
+        let attrib = i64::from(meta.mode.unwrap_or(0));
         // The reference writes raw epoch **seconds** (not `Date` objects,
         // unlike `_getTime`): `tTJSVariant vmtime = mtime;` with
         // `mtime = to_time_t(...)` and `ctime`/`atime` mirroring it
         // (`reference/cpp/plugins/fstat/main.cpp:584-597`).
-        let mtime = meta
-            .modified()
-            .ok()
-            .and_then(system_time_seconds)
-            .unwrap_or(0);
+        let mtime = millis_to_seconds(meta.modified_ms).unwrap_or(0);
         let dict = match retained_object(host, "%[]") {
             Ok(dict) => dict,
             Err(error) => return report_error(out_error, &format!("Storages.dirlistEx: {error}")),
@@ -1058,23 +1043,21 @@ fn walk_tree(
     count: &mut i64,
     dironly: bool,
 ) -> Result<(), String> {
-    let entries = match std::fs::read_dir(dir) {
+    let file_system = host_file_system();
+    let entries = match fs::list(&file_system, &FsPath::host(dir)) {
         Ok(entries) => entries,
         Err(_) => return Ok(()),
     };
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
+    for entry in entries.iter() {
+        let name = entry.name.clone();
         if name == "." || name == ".." {
             continue;
         }
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if file_type.is_dir() {
+        if entry.is_dir {
             let full = format!("{subdir}{name}/");
             engine.set_member(array, &count.to_string(), &TjsValue::String(full.clone()))?;
             *count += 1;
-            walk_tree(engine, array, &entry.path(), &full, count, dironly)?;
+            walk_tree(engine, array, &dir.join(&name), &full, count, dironly)?;
         } else if !dironly {
             engine.set_member(
                 array,
@@ -1112,7 +1095,7 @@ extern "C" fn storages_remove_directory(
         Ok(path) => path,
         Err(code) => return code,
     };
-    let removed = match std::fs::remove_dir(&path) {
+    let removed = match fs::remove_dir(&host_file_system(), &FsPath::host(&path)) {
         Ok(()) => true,
         Err(error) => {
             log::warn!(
@@ -1200,8 +1183,8 @@ fn storages_create_directory_impl(
             }
         }
     };
-    let existed = path.exists();
-    let created = match std::fs::create_dir_all(&path) {
+    let existed = fs::exists(&host_file_system(), &FsPath::host(&path));
+    let created = match fs::create_dir_all(&host_file_system(), &FsPath::host(&path)) {
         Ok(()) => !existed,
         Err(error) => {
             log::warn!("Storages.{method}: {} failed: {error}", path.display());
@@ -1360,7 +1343,7 @@ extern "C" fn storages_is_existent_directory(
         Ok(path) => path,
         Err(code) => return code,
     };
-    set_bool(out, path.is_dir());
+    set_bool(out, fs::is_dir(&host_file_system(), &FsPath::host(&path)));
     0
 }
 
@@ -1440,17 +1423,20 @@ fn storages_copy_file_impl(
         }
     };
     let copied = match (source, dest) {
-        (Some(source), Some(dest)) => match std::fs::copy(&source, &dest) {
-            Ok(_) => true,
-            Err(error) => {
-                log::warn!(
-                    "Storages.{method}: {} -> {} failed: {error}",
-                    source.display(),
-                    dest.display()
-                );
-                false
+        (Some(source), Some(dest)) => {
+            let file_system = host_file_system();
+            match fs::copy(&file_system, &FsPath::host(&source), &FsPath::host(&dest)) {
+                Ok(()) => true,
+                Err(error) => {
+                    log::warn!(
+                        "Storages.{method}: {} -> {} failed: {error}",
+                        source.display(),
+                        dest.display()
+                    );
+                    false
+                }
             }
-        },
+        }
         _ => false,
     };
     set_bool(out, copied);
@@ -1490,7 +1476,7 @@ extern "C" fn storages_is_existent_storage_no_search_no_normalize(
         } else {
             storage.game_dir().join(&name)
         };
-        candidate.exists()
+        fs::exists(&host_file_system(), &FsPath::host(&candidate))
     };
     set_bool(out, exists);
     0
@@ -1524,7 +1510,7 @@ extern "C" fn storages_get_display_name(
             return report_error(out_error, &format!("Storages.getDisplayName: {error}"));
         }
     };
-    let display = if path.exists() {
+    let display = if fs::exists(&host_file_system(), &FsPath::host(&path)) {
         path.file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default()
@@ -1597,7 +1583,7 @@ extern "C" fn storages_search_path(
     let delimiter = if cfg!(windows) { ';' } else { ':' };
     for entry in list.split(delimiter).filter(|entry| !entry.is_empty()) {
         let candidate = Path::new(entry).join(&filename);
-        if !candidate.is_file() {
+        if !fs::is_file(&host_file_system(), &FsPath::host(&candidate)) {
             continue;
         }
         if let Ok(absolute) = std::path::absolute(&candidate) {
@@ -1848,13 +1834,15 @@ fn temporary_files_check(
     let Ok(path) = local_path(storage, &name) else {
         return Ok(false);
     };
-    if !path.exists() {
+    let file_system = host_file_system();
+    if !fs::exists(&file_system, &FsPath::host(&path)) {
         return Ok(false);
     }
     if folder {
-        return Ok(path.is_dir());
+        return Ok(fs::is_dir(&file_system, &FsPath::host(&path)));
     }
-    Ok(path.is_file() && std::fs::File::open(&path).is_ok())
+    Ok(fs::is_file(&file_system, &FsPath::host(&path))
+        && fs::open(&file_system, &FsPath::host(&path), OpenMode::Read).is_ok())
 }
 
 // ---------------------------------------------------------------------------

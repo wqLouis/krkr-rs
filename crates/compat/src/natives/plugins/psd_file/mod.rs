@@ -27,6 +27,7 @@
 use std::ffi::{c_char, c_int, c_void};
 
 use api::blend::{BlendMode as SceneBlend, DstBlend};
+use api::fs::FsPath;
 use engine::{Scene, StorageReadError};
 use tjs::{
     DetachedValue, NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef,
@@ -475,7 +476,9 @@ fn read_psd_bytes(ctx: &CompatCtx, filename: &str) -> Result<Vec<u8>, String> {
             Err(error) => return Err(error.to_string()),
         }
     }
-    std::fs::read(filename).map_err(|error| format!("cannot read {filename}: {error}"))
+    let file_system = fs::FileSystem::host("");
+    fs::read(&file_system, &FsPath::host(filename))
+        .map_err(|error| format!("cannot read {filename}: {error}"))
 }
 
 /// `load()` — read the file, parse it and store the result on the instance.

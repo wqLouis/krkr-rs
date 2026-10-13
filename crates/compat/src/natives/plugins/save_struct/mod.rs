@@ -58,6 +58,7 @@
 use std::ffi::{c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
 
+use api::fs::FsPath;
 use tjs::{NativeInstanceMembers, NativeObjThisMethodDef, RetainedValue, TjsValue, Value};
 
 use super::super::system::{resolve, set_string_out, value_as_i64};
@@ -268,17 +269,19 @@ fn output_path(ctx: &CompatCtx, filename: &str) -> PathBuf {
 /// `tTVPStringStream` emits: UTF-16LE with no BOM.
 fn write_struct_file(ctx: &CompatCtx, filename: &str, content: &str) -> Result<(), String> {
     let path = output_path(ctx, filename);
+    let file_system = fs::FileSystem::host("");
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
-        std::fs::create_dir_all(parent)
+        fs::create_dir_all(&file_system, &FsPath::host(parent))
             .map_err(|error| format!("{}: {error}", parent.display()))?;
     }
     let mut bytes = Vec::with_capacity(content.len() * 2);
     for unit in content.encode_utf16() {
         bytes.extend_from_slice(&unit.to_le_bytes());
     }
-    std::fs::write(&path, bytes).map_err(|error| format!("{}: {error}", path.display()))
+    fs::write(&file_system, &FsPath::host(&path), &bytes)
+        .map_err(|error| format!("{}: {error}", path.display()))
 }
 
 /// The reference newline selector: `_newline` is LF when the flag is non-zero

@@ -681,15 +681,15 @@ impl VulkanPipeline {
         let mut present_ms = 0.0_f64;
         let mut recreate_ms = 0.0_f64;
 
+        let fence_started = Instant::now();
         // SAFETY: the fence belongs to this frame slot and was created
         // signalled, so the first wait returns immediately.
-        let fence_started = Instant::now();
         unsafe { device.wait_for_fences(&[in_flight], true, u64::MAX) }
             .map_err(|error| device::result_error("failed to wait for the frame fence", error))?;
         fence_wait_ms += fence_started.elapsed().as_secs_f64() * 1000.0;
 
-        // SAFETY: `swapchain` is valid; `image_available` must be unsignalled.
         let acquire_started = Instant::now();
+        // SAFETY: `swapchain` is valid; `image_available` must be unsignalled.
         let acquire_result = unsafe {
             swapchain_loader.acquire_next_image(
                 swapchain,
@@ -846,9 +846,9 @@ impl VulkanPipeline {
             .wait_semaphores(&signal_semaphores)
             .swapchains(&swapchains)
             .image_indices(&image_indices);
-        // SAFETY: the present info references live semaphores/swapchain.
         let present_started = Instant::now();
         let present_result =
+            // SAFETY: the present info references live semaphores/swapchain.
             unsafe { swapchain_loader.queue_present(present_queue, &present_info) };
         present_ms = present_started.elapsed().as_secs_f64() * 1000.0;
 
@@ -1123,8 +1123,8 @@ fn create_frame(device: &ash::Device, queue_family_index: u32) -> Result<VulkanF
     let pool_info = vk::CommandPoolCreateInfo::default()
         .queue_family_index(queue_family_index)
         .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
-    // SAFETY: `device` is live and the pool info is valid.
     let command_pool =
+        // SAFETY: `device` is live and the pool info is valid.
         unsafe { device.create_command_pool(&pool_info, None) }.map_err(|error| {
             RenderError::DeviceUnavailable {
                 message: format!(
@@ -1166,6 +1166,7 @@ fn create_frame(device: &ash::Device, queue_family_index: u32) -> Result<VulkanF
         )
     };
     let image_available =
+        // SAFETY: `device` is live.
         unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) };
     match (fence, image_available) {
         (Ok(in_flight), Ok(image_available)) => Ok(VulkanFrame {
@@ -1321,8 +1322,8 @@ fn rebuild_image_sync(state: &mut VulkanState, device: &ash::Device) -> Result<(
         unsafe { device.destroy_semaphore(semaphore, None) };
     }
     for _ in 0..image_count {
-        // SAFETY: `device` is live.
         let semaphore =
+            // SAFETY: `device` is live.
             unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }.map_err(
                 |error| RenderError::DeviceUnavailable {
                     message: format!(

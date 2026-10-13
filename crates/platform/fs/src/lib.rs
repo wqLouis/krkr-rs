@@ -46,8 +46,9 @@ mod ops;
 pub mod xp3;
 
 pub use ops::{
-    copy, create_dir_all, exists, file_size, flush, list, open, read_at, read_seq, remove_file,
-    rename, seek, stat, write_at,
+    append, copy, create_dir_all, exists, file_size, flush, is_dir, is_file, list, metadata, open,
+    read, read_at, read_seq, remove_dir, remove_file, rename, seek, set_times, stat, write,
+    write_at,
 };
 
 use memory::MemoryStore;

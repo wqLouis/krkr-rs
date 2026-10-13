@@ -59,6 +59,7 @@ use std::ffi::{c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr;
 
+use api::fs::FsPath;
 use serde_json::Value as Json;
 use tjs::{
     DetachedValue, NativeMethodDef, NativeStaticMembers, RetainedValue, Tjs2Engine, TjsValue,
@@ -855,7 +856,8 @@ fn read_input(ctx: &CompatCtx, name: &str) -> Result<Vec<u8>, String> {
             .read(name)
             .map_err(|error| format!("'{name}': {error}"));
     }
-    std::fs::read(name).map_err(|error| format!("'{name}': {error}"))
+    let file_system = fs::FileSystem::host("");
+    fs::read(&file_system, &FsPath::host(name)).map_err(|error| format!("'{name}': {error}"))
 }
 
 /// Whether `name` is a Windows drive-letter path (`C:/...`), which the
@@ -883,13 +885,15 @@ fn output_path(ctx: &CompatCtx, filename: &str) -> PathBuf {
 /// Write serialized bytes to the resolved output path.
 fn write_output(ctx: &CompatCtx, filename: &str, bytes: &[u8]) -> Result<(), String> {
     let path = output_path(ctx, filename);
+    let file_system = fs::FileSystem::host("");
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
-        std::fs::create_dir_all(parent)
+        fs::create_dir_all(&file_system, &FsPath::host(parent))
             .map_err(|error| format!("{}: {error}", parent.display()))?;
     }
-    std::fs::write(&path, bytes).map_err(|error| format!("{}: {error}", path.display()))
+    fs::write(&file_system, &FsPath::host(&path), bytes)
+        .map_err(|error| format!("{}: {error}", path.display()))
 }
 
 /// Encode `text` as UTF-8 (`utf8`) or the current code page (CP932).

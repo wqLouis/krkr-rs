@@ -86,7 +86,7 @@ Dependency direction (strict, one extra edge):
 
 ```
 L4 vm      → compat(L3), platform(L1)
-L3 compat  → engine(L2), platform(L1), api, tjs
+L3 compat  → engine(L2), platform(L1), api, fs, tjs
 L2 engine  → L1 type crates (api, fs, render)
 L1         → OS / Vulkan / FFmpeg / MediaCodec only
 app        → everything (wiring only)
