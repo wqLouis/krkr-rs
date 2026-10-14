@@ -94,7 +94,7 @@ const OPTIONS: &[OptionDoc] = &[
     OptionDoc {
         flag: "--scaling",
         value: "MODE",
-        help: "Presentation scaling (default: game, one of: game, fit, fill, expand).",
+        help: "Presentation scaling (default: fit, one of: game, fit, fill, expand).",
     },
     OptionDoc {
         flag: "--preload-archives",
@@ -307,9 +307,14 @@ fn load_config_file(path: &Path) -> Result<RuntimeConfigOverrides, ConfigError> 
 ///
 /// Both the argument and the file have already been validated, so the merge
 /// cannot fail; a field neither source holds falls back to
-/// [`RuntimeConfig::default`].
+/// [`RuntimeConfig::default`], except the presentation scaling, which
+/// defaults to [`PresentationScaling::Fit`] here so a native-resolution
+/// window shows the whole scaled scene instead of a one-to-one crop.
 fn resolve_runtime_config(cli: &Cli, file: RuntimeConfigOverrides) -> RuntimeConfig {
-    let defaults = RuntimeConfig::default();
+    let defaults = RuntimeConfig {
+        scaling: PresentationScaling::Fit,
+        ..RuntimeConfig::default()
+    };
     RuntimeConfig {
         frame_rate_limit: cli
             .frame_rate
@@ -579,12 +584,18 @@ mod tests {
     }
 
     #[test]
-    fn resolution_falls_back_to_the_built_in_default() {
+    fn scaling_falls_back_to_the_desktop_presentation_default() {
         let cli = parse(&["--headless"]).expect("parse");
         let config = resolve_runtime_config(&cli, RuntimeConfigOverrides::default());
-        assert_eq!(config, RuntimeConfig::default());
+        assert_eq!(
+            config,
+            RuntimeConfig {
+                scaling: PresentationScaling::Fit,
+                ..RuntimeConfig::default()
+            }
+        );
         assert_eq!(config.frame_rate_limit.fps(), 60);
-        assert_eq!(config.scaling, PresentationScaling::Game);
+        assert_eq!(config.scaling, PresentationScaling::Fit);
         assert!(!config.debug_overlay);
     }
 
@@ -666,7 +677,7 @@ mod tests {
         assert!(text.contains("GAME"), "{text}");
         assert!(text.contains("default: 60"), "{text}");
         assert!(text.contains("1..=1000"), "{text}");
-        assert!(text.contains("default: game"), "{text}");
+        assert!(text.contains("default: fit"), "{text}");
         assert!(text.contains("game, fit, fill, expand"), "{text}");
         assert!(text.contains("default: 120"), "{text}");
     }

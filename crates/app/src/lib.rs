@@ -540,7 +540,15 @@ impl Host {
     /// Returns [`HostError::Render`] if the backend rejects the resize.
     pub fn resize(&mut self, size: (u32, u32)) -> Result<SurfaceEvent, HostError> {
         let size = (size.0.max(1), size.1.max(1));
-        let event = resize_render(&self.pipeline, &self.surface, &mut self.render_state, size)?;
+        // The framebuffer is already this size, so the pipeline needs no
+        // reconfiguration; the presentation can still change because the
+        // scene's declared size did (the windowed runner calls this after
+        // startup to capture the game's design).
+        let event = if size == self.surface_size {
+            SurfaceEvent::Resized(size.0, size.1)
+        } else {
+            resize_render(&self.pipeline, &self.surface, &mut self.render_state, size)?
+        };
         self.surface_size = size;
 
         // A scene window whose `inner_size` differs from the logical size the
@@ -765,5 +773,33 @@ impl Host {
                 drop_texture(&self.pipeline, &mut self.render_state, texture);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A resize to the current framebuffer size still captures the scene
+    /// window's declared size as the presentation design, so the windowed
+    /// runner can keep a native-size window instead of shrinking it to the
+    /// game's `Window.setInnerSize`.
+    #[test]
+    fn same_size_resize_keeps_the_declared_design() {
+        let mut host = Host::new(
+            HostConfig::headless()
+                .with_surface_size((1920, 1080))
+                .with_scaling(ScalingMode::Fit),
+        )
+        .expect("headless host");
+        host.scene_mut().add_window("game", (1280, 720));
+
+        let event = host.resize((1920, 1080)).expect("resize");
+        assert_eq!(event, SurfaceEvent::Resized(1920, 1080));
+        assert_eq!(host.surface_size(), (1920, 1080));
+        // The declared 1280x720 stays the logical (script-visible) size; the
+        // presentation scales it to the 1920x1080 framebuffer instead of
+        // growing the logical screen with the window.
+        assert_eq!(host.logical_size(), (1280, 720));
     }
 }

@@ -18,9 +18,6 @@ use crate::{
     BackendKind, FrameStats, GameHost, Host, HostConfig, StepReport, map_input_to_logical,
 };
 
-/// Default window/surface size in pixels.
-const DEFAULT_SIZE: (u32, u32) = (1280, 720);
-
 /// The game a launcher asks the emulator to open.
 ///
 /// The launcher resolves the command line or the platform intent into this
@@ -211,7 +208,9 @@ fn run_headless(launch: &Launch, frames: u32) -> Result<RunReport, String> {
 fn run_windowed(launch: &Launch) -> Result<(), String> {
     let mut config = PlatformConfig::default();
     config.title = "krkr-rs".to_owned();
-    config.size = DEFAULT_SIZE;
+    // Render at the display's physical resolution; the presentation scales the
+    // game's declared logical size to it (see `DesktopApp::resumed`).
+    config.native_size = true;
     config.frame_interval = Duration::from_secs_f64(launch.runtime.frame_rate_limit.period_secs());
     platform::run(
         config,
@@ -411,7 +410,7 @@ impl EventHandler for DesktopApp {
         };
         match Host::new(config) {
             Ok(host) => {
-                let running = match &self.game {
+                let mut running = match &self.game {
                     Some(input) => {
                         match GameHost::open_with_preload(
                             host,
@@ -428,6 +427,14 @@ impl EventHandler for DesktopApp {
                     }
                     None => Running::Empty(Box::new(host)),
                 };
+                // Capture the game's declared logical size as the presentation
+                // design before aligning the OS window. The presentation
+                // scales that design to the framebuffer, so `setInnerSize`
+                // defines the logical scene instead of shrinking the window.
+                if let Err(error) = running.resize(window.size()) {
+                    eprintln!("krkr: resize failed: {error}");
+                    return Flow::Exit;
+                }
                 self.running = Some(running);
                 // Align the platform window with the client size the game
                 // declared during startup (`Window.setInnerSize`); the

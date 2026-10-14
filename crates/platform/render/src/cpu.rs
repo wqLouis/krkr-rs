@@ -506,58 +506,36 @@ fn soft_light(d: f32, s: f32) -> f32 {
     }
 }
 
-/// Samples a texture at texel coordinates `(u, v)` with bilinear filtering.
+/// Samples a texture at texel coordinates `(u, v)` with point (nearest)
+/// filtering.
+///
+/// This is the reference's default layer blit sampling: the software
+/// renderer starts at `StretchType(stNearest)` and selects the point
+/// `TVPStretchCopy` for anything below `stFastLinear`
+/// (`reference/cpp/core/visual/RenderManager.cpp:2902,3191-3226`). The GPU
+/// backend uses the same rule, so a magnified layer is point-scaled rather
+/// than interpolated.
 fn sample_texture(view: &CpuTexture<'_>, u: f64, v: f64, tint: [f32; 4]) -> [f32; 4] {
     let format = view.format;
     let width = view.width as i64;
     let height = view.height as i64;
-    let x = u - 0.5;
-    let y = v - 0.5;
-    let x0 = x.floor() as i64;
-    let y0 = y.floor() as i64;
-    let fx = (x - x0 as f64) as f32;
-    let fy = (y - y0 as f64) as f32;
-
-    let fetch = |ix: i64, iy: i64| -> [f32; 4] {
-        let ix = ix.clamp(0, width - 1) as usize;
-        let iy = iy.clamp(0, height - 1) as usize;
-        let index = (iy * view.width as usize + ix) * format.bytes_per_pixel() as usize;
-        match format {
-            TextureFormat::Rgba8Srgb | TextureFormat::Rgba8Unorm => {
-                let pixel = &view.pixels[index..index + 4];
-                [
-                    pixel[0] as f32 / 255.0,
-                    pixel[1] as f32 / 255.0,
-                    pixel[2] as f32 / 255.0,
-                    pixel[3] as f32 / 255.0,
-                ]
-            }
-            TextureFormat::R8Unorm => {
-                let coverage = view.pixels[index] as f32 / 255.0;
-                [tint[0], tint[1], tint[2], coverage * tint[3]]
-            }
-        }
-    };
-
-    let p00 = fetch(x0, y0);
-    let p10 = fetch(x0 + 1, y0);
-    let p01 = fetch(x0, y0 + 1);
-    let p11 = fetch(x0 + 1, y0 + 1);
-    let mut out = [0.0f32; 4];
-    for channel in 0..4 {
-        let top = p00[channel] + (p10[channel] - p00[channel]) * fx;
-        let bottom = p01[channel] + (p11[channel] - p01[channel]) * fx;
-        out[channel] = top + (bottom - top) * fy;
-    }
-    // The tint only applies to formats that do not carry their own colour.
+    let ix = (u.floor() as i64).clamp(0, width - 1) as usize;
+    let iy = (v.floor() as i64).clamp(0, height - 1) as usize;
+    let index = (iy * view.width as usize + ix) * format.bytes_per_pixel() as usize;
     match format {
-        TextureFormat::Rgba8Srgb | TextureFormat::Rgba8Unorm => [
-            out[0] * tint[0],
-            out[1] * tint[1],
-            out[2] * tint[2],
-            out[3] * tint[3],
-        ],
-        TextureFormat::R8Unorm => out,
+        TextureFormat::Rgba8Srgb | TextureFormat::Rgba8Unorm => {
+            let pixel = &view.pixels[index..index + 4];
+            [
+                pixel[0] as f32 / 255.0 * tint[0],
+                pixel[1] as f32 / 255.0 * tint[1],
+                pixel[2] as f32 / 255.0 * tint[2],
+                pixel[3] as f32 / 255.0 * tint[3],
+            ]
+        }
+        TextureFormat::R8Unorm => {
+            let coverage = view.pixels[index] as f32 / 255.0;
+            [tint[0], tint[1], tint[2], coverage * tint[3]]
+        }
     }
 }
 
@@ -677,6 +655,35 @@ mod tests {
     fn blend_u8(mode: BlendMode, dst: [f32; 4], src: [f32; 4]) -> [u8; 4] {
         let (rgb, alpha) = composite(mode, dst, src);
         [to_u8(rgb[0]), to_u8(rgb[1]), to_u8(rgb[2]), to_u8(alpha)]
+    }
+
+    /// Reference: the default stretch blit samples the nearest source texel
+    /// (`reference/cpp/core/visual/RenderManager.cpp:2902` starts at
+    /// `StretchType(stNearest)` and `:3191-3226` selects the point
+    /// `TVPStretchCopy` for anything below `stFastLinear`). A bilinear sampler
+    /// would blend the neighbouring texels instead.
+    #[test]
+    fn default_layer_sampling_picks_the_nearest_texel() {
+        // Four distinct corners: black, red / green, blue.
+        let pixels = [
+            0u8, 0, 0, 255, 255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255,
+        ];
+        let texture = CpuTexture {
+            pixels: &pixels,
+            width: 2,
+            height: 2,
+            format: TextureFormat::Rgba8Unorm,
+        };
+        let opaque = [1.0f32; 4];
+        let sample = |u: f64, v: f64| sample_texture(&texture, u, v, opaque).map(to_u8);
+        // Anywhere inside a texel's cell returns that texel unchanged; a
+        // bilinear read partway into a cell would return a blend of corners.
+        assert_eq!(sample(0.25, 0.25), [0, 0, 0, 255]);
+        assert_eq!(sample(1.75, 0.25), [255, 0, 0, 255]);
+        assert_eq!(sample(0.75, 1.75), [0, 255, 0, 255]);
+        assert_eq!(sample(1.25, 1.25), [0, 0, 255, 255]);
+        // A coordinate on a texel boundary belongs to the higher texel.
+        assert_eq!(sample(1.0, 0.0), [255, 0, 0, 255]);
     }
 
     /// Reference: the Photoshop layer types keep their own compositing

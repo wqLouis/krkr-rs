@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
 use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalSize, PhysicalSize};
+use winit::dpi::{LogicalSize, PhysicalSize, Size};
 use winit::event::{
     ElementState, Ime, MouseButton as WinitMouseButton, MouseScrollDelta,
     TouchPhase as WinitTouchPhase, WindowEvent,
@@ -167,12 +167,26 @@ impl<H: EventHandler> ApplicationHandler for AppLoop<H> {
         // notified so a higher layer can recreate its surface. Only the
         // window creation itself is guarded.
         if self.window.is_none() {
+            // The requested logical size doubled as the fallback: `native_size`
+            // prefers the primary monitor's physical resolution, but a host
+            // with no primary monitor (headless/offscreen, or one that reports
+            // none at resume time) uses the configured default instead.
+            let configured =
+                LogicalSize::new(f64::from(self.config.size.0), f64::from(self.config.size.1));
+            let inner_size: Size = if self.config.native_size {
+                match event_loop.primary_monitor() {
+                    Some(monitor) => {
+                        let size = monitor.size();
+                        PhysicalSize::new(size.width, size.height).into()
+                    }
+                    None => configured.into(),
+                }
+            } else {
+                configured.into()
+            };
             let attributes = Window::default_attributes()
                 .with_title(self.config.title.as_str())
-                .with_inner_size(LogicalSize::new(
-                    f64::from(self.config.size.0),
-                    f64::from(self.config.size.1),
-                ));
+                .with_inner_size(inner_size);
             let window = match event_loop.create_window(attributes) {
                 Ok(window) => window,
                 Err(error) => {

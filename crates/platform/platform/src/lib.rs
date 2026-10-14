@@ -131,8 +131,18 @@ pub struct PlatformConfig {
     /// Initial window size in logical pixels (DPI-scaled by the backend).
     ///
     /// The surface size actually created is reported physically through
-    /// [`PlatformEvent::Resized`] and `PlatformWindow::size`.
+    /// [`PlatformEvent::Resized`] and `PlatformWindow::size`. Used as the
+    /// fallback when [`native_size`](Self::native_size) is set but no primary
+    /// monitor is available.
     pub size: (u32, u32),
+    /// Whether to create the window at the primary monitor's physical
+    /// resolution when one is available, falling back to [`size`](Self::size)
+    /// otherwise.
+    ///
+    /// A host with no primary monitor (headless/offscreen, or one that reports
+    /// none at resume time) uses the configured logical default; that default
+    /// is the size the window would otherwise have had, not a fabricated one.
+    pub native_size: bool,
     /// Target interval between frames.
     ///
     /// A zero interval is normalized up by [`Ticker::new`] so the loop cannot
@@ -145,6 +155,7 @@ impl Default for PlatformConfig {
         Self {
             title: "krkr-rs".to_owned(),
             size: (1280, 720),
+            native_size: false,
             frame_interval: Duration::from_millis(16),
         }
     }
