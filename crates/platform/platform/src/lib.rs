@@ -52,6 +52,7 @@ mod clock;
 mod event;
 mod fonts;
 mod input;
+mod memory;
 mod window;
 
 // A feature/target mismatch is the bug this guards against: the winit desktop
@@ -84,6 +85,7 @@ pub use crate::clock::{Clock, Ticker};
 pub use crate::event::PlatformEvent;
 pub use crate::fonts::{ANDROID_SYSTEM_FONT_DIRS, system_font_dirs};
 pub use crate::input::{InputEvent, MouseButton, PhysicalKey};
+pub use crate::memory::memory_usage;
 pub use crate::window::headless_window_handle;
 
 use api::error::AudioError;

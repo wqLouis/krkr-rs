@@ -154,6 +154,9 @@ pub(crate) fn resolve_runtime_config(
         frame_rate_limit,
         scaling,
         preload_archives,
+        // The Android launcher has no overlay toggle yet, so it stays off;
+        // the field flows through the shared configuration value unchanged.
+        debug_overlay: false,
     })
 }
 
@@ -173,6 +176,9 @@ mod tests {
         assert_eq!(runtime.frame_rate_limit.fps(), 60);
         assert_eq!(runtime.scaling, PresentationScaling::Fit);
         assert!(!runtime.preload_archives);
+        // The Android launcher has no overlay toggle, so the shared field stays
+        // off rather than exposing a control that does nothing.
+        assert!(!runtime.debug_overlay);
     }
 
     #[test]

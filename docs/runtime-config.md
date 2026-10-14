@@ -75,8 +75,8 @@ to read files (only the compatibility layer is barred from `std::fs`).
 
 A file that is named but unreadable is a typed error, and so is an unknown key
 or a bad value; nothing is skipped and nothing is applied until the whole file
-parses. The recognized keys are `frame_rate`, `scaling` and
-`preload_archives`, matching the argument names.
+parses. The recognized keys are `frame_rate`, `scaling`,
+`preload_archives` and `debug_overlay`, matching the argument names.
 
 ## 2. Implemented options
 
@@ -85,6 +85,7 @@ parses. The recognized keys are `frame_rate`, `scaling` and
 | `--fps N` (`frame_rate`) | frames per second, `1..=1000` | `60` | reference `fps_limit` default `60` (`reference/cpp/core/environ/ui/PreferenceConfig.h:304-309`), applied as the animation interval `1/fps` (`reference/cpp/core/environ/cocos2d/MainScene.cpp:684-685`); the main loop sleeps the remaining interval (`reference/cpp/core/environ/RenderUtils.h`, `TVPDrawSceneOnce`) |
 | `--scaling MODE` (`scaling`) | `game`, `fit`, `fill`, `expand` | `game` (Android launchers default to `fit`) | `game` is the reference Win32 one-to-one presentation; the other three are the existing engine projection modes |
 | `--preload-archives` (`preload_archives`) | `true`, `false` | `false` | read every mounted archive into memory when it mounts; the cost is that archive's size in resident memory, the gain is that entry reads stop touching the backing filesystem |
+| `--debug-overlay` (`debug_overlay`) | `true`, `false` | `false` | draw the frame rate and the process's resident memory in the top-left corner; a render-only node, never a script-visible layer or bitmap, so it cannot change what a script observes. RSS comes from `platform::memory_usage()`, which reads `VmRSS` from `/proc/self/status` (Linux and Android); an unreadable value is omitted rather than fabricated |
 
 The frame-rate limit paces both loops: the windowed loop through
 `PlatformConfig::frame_interval` and the headless step through
@@ -125,4 +126,8 @@ they are reported rather than implemented.
 and `--help` completeness. `crates/app/src/runner.rs` drives `app::run` with a
 configuration passed directly — no file and no environment variable — and
 checks the run used its frame period. `crates/platform/api/src/config.rs`
-covers the value validation and the `key=value` parser.
+covers the value validation and the `key=value` parser. The overlay itself is
+covered by `crates/app/src/overlay.rs` (formatting, the built-in font and the
+missing-glyph error), `crates/app/tests/debug_overlay.rs` (the node is present
+when enabled and absent when disabled, and its texture is uploaded before the
+frame) and `crates/platform/platform/src/memory.rs` (the `VmRSS` parse).

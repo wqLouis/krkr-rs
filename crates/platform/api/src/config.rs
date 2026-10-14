@@ -171,6 +171,12 @@ pub struct RuntimeConfig {
     /// the per-entry reads a mounted archive otherwise does, which is the cost
     /// a slow backing filesystem makes visible.
     pub preload_archives: bool,
+    /// Whether the running app draws the debug overlay (frame rate and
+    /// resident memory) in the top-left corner, default `false`.
+    ///
+    /// The overlay is a render-only node: it is never a script-visible layer
+    /// or bitmap, so enabling it cannot change what a script observes.
+    pub debug_overlay: bool,
 }
 
 impl Default for RuntimeConfig {
@@ -179,6 +185,7 @@ impl Default for RuntimeConfig {
             frame_rate_limit: FrameRateLimit::DEFAULT,
             scaling: PresentationScaling::DEFAULT,
             preload_archives: false,
+            debug_overlay: false,
         }
     }
 }
@@ -196,6 +203,8 @@ pub struct RuntimeConfigOverrides {
     pub scaling: Option<PresentationScaling>,
     /// A source's archive-preload choice, if it holds one.
     pub preload_archives: Option<bool>,
+    /// A source's debug-overlay choice, if it holds one.
+    pub debug_overlay: Option<bool>,
 }
 
 /// Parses a boolean configuration value, accepting `true` and `false`.
@@ -218,7 +227,7 @@ pub fn parse_bool(option: &'static str, value: &str) -> Result<bool, ConfigError
 
 /// The configuration keys [`parse_overrides`] accepts, in the order its
 /// unknown-key diagnostic lists them.
-const ACCEPTED_KEYS: [&str; 3] = ["frame_rate", "scaling", "preload_archives"];
+const ACCEPTED_KEYS: [&str; 4] = ["frame_rate", "scaling", "preload_archives", "debug_overlay"];
 
 /// Parses `key=value` configuration text into overrides.
 ///
@@ -226,7 +235,8 @@ const ACCEPTED_KEYS: [&str; 3] = ["frame_rate", "scaling", "preload_archives"];
 /// launcher's business. Blank lines and lines whose first non-space character
 /// is `#` are ignored. A line without `=` or with an unknown key is an error,
 /// as is a value that fails validation; nothing is silently skipped. The
-/// recognized keys are `frame_rate`, `scaling` and `preload_archives`.
+/// recognized keys are `frame_rate`, `scaling`, `preload_archives` and
+/// `debug_overlay`.
 ///
 /// # Errors
 ///
@@ -253,6 +263,9 @@ pub fn parse_overrides(text: &str) -> Result<RuntimeConfigOverrides, ConfigError
             }
             "preload_archives" => {
                 overrides.preload_archives = Some(parse_bool("preload_archives", value)?);
+            }
+            "debug_overlay" => {
+                overrides.debug_overlay = Some(parse_bool("debug_overlay", value)?);
             }
             other => {
                 let keys = ACCEPTED_KEYS
@@ -363,12 +376,15 @@ mod tests {
     #[test]
     fn overrides_parse_keys_comments_and_blanks() {
         let overrides =
-            parse_overrides("# a comment\n\nframe_rate = 30\nscaling=fit\n").expect("parse");
+            parse_overrides("# a comment\n\nframe_rate = 30\nscaling=fit\npreload_archives=true\ndebug_overlay=true\n")
+                .expect("parse");
         assert_eq!(
             overrides.frame_rate_limit,
             Some(FrameRateLimit::new("frame_rate", 30).unwrap())
         );
         assert_eq!(overrides.scaling, Some(PresentationScaling::Fit));
+        assert_eq!(overrides.preload_archives, Some(true));
+        assert_eq!(overrides.debug_overlay, Some(true));
     }
 
     #[test]
@@ -396,5 +412,6 @@ mod tests {
         let error = parse_overrides("frame_rate=0").expect_err("must reject");
         assert!(error.to_string().contains("frame_rate"));
         assert!(parse_overrides("scaling=stretch").is_err());
+        assert!(parse_overrides("debug_overlay=yes").is_err());
     }
 }

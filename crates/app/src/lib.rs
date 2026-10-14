@@ -27,6 +27,7 @@
 mod audio;
 mod game;
 mod image_codec;
+mod overlay;
 mod runner;
 mod startup;
 mod video;
@@ -41,6 +42,7 @@ use engine::projection::{Presentation, ScalingMode, project_scene};
 use engine::scene::{Rect, Scene};
 use fs::FileSystem;
 use media::Media;
+use overlay::Overlay;
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 use render::{
     FrameTimings, PipelineConfig, RenderPipeline, RenderScene, RenderState, Surface, Texture,
@@ -78,6 +80,9 @@ pub enum HostError {
     /// with no window handle).
     #[error("host config: {0}")]
     Config(String),
+    /// The debug overlay could not be built or refreshed.
+    #[error("debug overlay: {0}")]
+    Overlay(String),
 }
 
 /// Outcome of one [`Host::step`].
@@ -142,6 +147,12 @@ pub struct HostConfig {
     /// [`ScalingMode::Game`] is the untransformed Win32 presentation and the
     /// default, so an unconfigured run matches the reference exactly.
     pub scaling: ScalingMode,
+    /// Whether the host draws the debug overlay (frame rate and resident
+    /// memory) in the top-left corner.
+    ///
+    /// The overlay is a render-only node: it is never a script-visible layer
+    /// or bitmap, so it cannot change the scene a script observes.
+    pub debug_overlay: bool,
 }
 
 impl Default for HostConfig {
@@ -155,6 +166,7 @@ impl Default for HostConfig {
             window_handle: None,
             display_handle: None,
             scaling: ScalingMode::Game,
+            debug_overlay: false,
         }
     }
 }
@@ -198,6 +210,12 @@ impl HostConfig {
     /// Returns this configuration with a different presentation scaling mode.
     pub fn with_scaling(mut self, scaling: ScalingMode) -> Self {
         self.scaling = scaling;
+        self
+    }
+
+    /// Returns this configuration with the debug overlay enabled or disabled.
+    pub fn with_debug_overlay(mut self, debug_overlay: bool) -> Self {
+        self.debug_overlay = debug_overlay;
         self
     }
 }
@@ -300,6 +318,8 @@ pub struct Host {
     logical_size: (u32, u32),
     /// Framebuffer transform for the current presentation.
     view: ViewTransform,
+    /// Debug overlay, or `None` when the host draws none.
+    overlay: Option<Overlay>,
 }
 
 impl Host {
@@ -350,6 +370,11 @@ impl Host {
         let surface_size = (config.surface_size.0.max(1), config.surface_size.1.max(1));
         let _ = resize_render(&pipeline, &surface, &mut render_state, surface_size)?;
         let view = Presentation::compute(config.scaling, surface_size, surface_size).view;
+        let overlay = if config.debug_overlay {
+            Some(Overlay::new(&pipeline).map_err(|error| HostError::Overlay(error.to_string()))?)
+        } else {
+            None
+        };
 
         Ok(Self {
             pipeline,
@@ -370,6 +395,7 @@ impl Host {
             design_size: None,
             logical_size: surface_size,
             view,
+            overlay,
         })
     }
 
@@ -396,8 +422,9 @@ impl Host {
         let prune_ms = prune_started.elapsed().as_secs_f64() * 1000.0;
         let sync_ms = sync_started.elapsed().as_secs_f64() * 1000.0;
 
+        self.refresh_overlay()?;
         let project_started = std::time::Instant::now();
-        self.reproject_render_scene();
+        self.reproject_render_scene()?;
         let project_ms = project_started.elapsed().as_secs_f64() * 1000.0;
 
         let render_started = std::time::Instant::now();
@@ -431,7 +458,7 @@ impl Host {
     /// kept and only the projected nodes' own allocations are touched. The
     /// revision is `None` until the first projection, so the first frame (and
     /// any forced redraw) always projects.
-    fn reproject_render_scene(&mut self) {
+    fn reproject_render_scene(&mut self) -> Result<(), HostError> {
         // The framebuffer transform can change on a resize that does not
         // change the logical layout, so it is refreshed even when the layer
         // tree is rebuilt from the persistent arena below.
@@ -439,7 +466,7 @@ impl Host {
 
         let revision = self.scene.revision();
         if self.render_scene_revision == Some(revision) {
-            return;
+            return Ok(());
         }
 
         let textures = &self.textures;
@@ -454,7 +481,42 @@ impl Host {
         self.render_scene.view = projected.view;
         self.render_scene.nodes.extend(projected.nodes);
 
+        self.attach_overlay();
         self.render_scene_revision = Some(revision);
+        Ok(())
+    }
+
+    /// Appends the debug overlay as the last child of the scene root.
+    ///
+    /// The projection clears and refills the arena, so the overlay node is
+    /// re-added after every rebuild. The overlay's texture is stable across
+    /// refreshes, so an unchanged revision does not need to touch the node.
+    fn attach_overlay(&mut self) {
+        let Some(overlay) = self.overlay.as_ref() else {
+            return;
+        };
+        let root = self.render_scene.root;
+        let mut node = overlay.node(self.view);
+        node.parent = Some(root);
+        let id = self.render_scene.push(node);
+        if let Some(root_node) = self.render_scene.node_mut(root) {
+            root_node.children.push(id);
+        }
+    }
+
+    /// Advances the overlay and re-uploads its panel when the refresh interval
+    /// has elapsed.
+    ///
+    /// The resident set size is re-read here rather than on every frame, so
+    /// the overlay's cost is bounded by its refresh cadence.
+    fn refresh_overlay(&mut self) -> Result<(), HostError> {
+        let Some(overlay) = self.overlay.as_mut() else {
+            return Ok(());
+        };
+        let rss = platform::memory_usage();
+        overlay
+            .tick(&self.pipeline, &mut self.render_state, self.elapsed_ms, rss)
+            .map_err(|error| HostError::Overlay(error.to_string()))
     }
 
     /// Replaces the stored raw input snapshot.
@@ -576,6 +638,11 @@ impl Host {
     /// Returns the framebuffer transform for the current presentation.
     pub fn view(&self) -> ViewTransform {
         self.view
+    }
+
+    /// Whether the host draws the debug overlay.
+    pub fn debug_overlay_enabled(&self) -> bool {
+        self.overlay.is_some()
     }
 
     /// Returns the number of frames rendered so far.

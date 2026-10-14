@@ -119,7 +119,9 @@ fn format_stats(stats: &FrameStats) -> String {
 
 /// Runs offscreen and prints the final frame stats (or the game's scene size).
 fn run_headless(launch: &Launch, frames: u32) -> Result<RunReport, String> {
-    let config = HostConfig::headless().with_backend(launch.backend);
+    let config = HostConfig::headless()
+        .with_backend(launch.backend)
+        .with_debug_overlay(launch.runtime.debug_overlay);
     let mut host = Host::new(config).map_err(|error| error.to_string())?;
     let dt_ms = launch.runtime.frame_rate_limit.period_ms();
 
@@ -218,6 +220,7 @@ fn run_windowed(launch: &Launch) -> Result<(), String> {
             map_scaling(launch.runtime.scaling),
             launch.game.clone(),
             launch.runtime.preload_archives,
+            launch.runtime.debug_overlay,
         ),
     )
     .map_err(|error| error.to_string())
@@ -238,6 +241,8 @@ struct DesktopApp {
     game: Option<GameInput>,
     /// Whether every mounted archive is read into memory at mount.
     preload_archives: bool,
+    /// Whether the debug overlay is drawn.
+    debug_overlay: bool,
     /// The running host, created once the window handle exists.
     running: Option<Running>,
     /// Input and focus events received since the last frame, delivered to
@@ -320,12 +325,14 @@ impl DesktopApp {
         scaling: ScalingMode,
         game: Option<GameInput>,
         preload_archives: bool,
+        debug_overlay: bool,
     ) -> Self {
         Self {
             backend,
             scaling,
             game,
             preload_archives,
+            debug_overlay,
             running: None,
             pending_events: Vec::new(),
             pending_size: None,
@@ -399,6 +406,7 @@ impl EventHandler for DesktopApp {
             window_handle: Some(window_handle),
             display_handle: Some(display_handle),
             scaling: self.scaling,
+            debug_overlay: self.debug_overlay,
             ..Default::default()
         };
         match Host::new(config) {

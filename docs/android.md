@@ -247,8 +247,8 @@ than starting the engine against a path that will not resolve.
 
 The launcher also persists the player's runtime options and carries them into
 the engine. A **Settings** screen reachable from the launcher's top bar exposes
-the three options `api::config::RuntimeConfig` carries today, with the same
-accepted values as the desktop `--fps`/`--scaling` and `preload_archives`.
+the options `api::config::RuntimeConfig` carries today, with the same accepted
+values as the desktop `--fps`/`--scaling`/`--preload-archives`.
 Nothing is offered for a feature the engine has no knob for
 — a control that silently did nothing is the bug class this project forbids.
 
@@ -261,6 +261,12 @@ Nothing is offered for a feature the engine has no knob for
 
 `fill` and `expand` are exposed because the engine honours them; the desktop
 default remains `game`.
+
+The shared `RuntimeConfig` also carries `debug_overlay` (the desktop
+`--debug-overlay`), but Android has no overlay control: there is no JNI field
+and no `settings.json` key for it, and `crates/android/src/config.rs` fixes it
+to `false`. It is a value the shared type carries, not a switch that does
+nothing.
 
 The archive-preload switch is the option to weigh on a phone: it is not a debug
 mode, it reads the archive into the same storage as before so every entry

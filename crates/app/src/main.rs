@@ -27,6 +27,9 @@
 //!   mounts, trading the archive's size in resident memory for never reading it
 //!   back from storage. Off by default; entries return the same bytes either
 //!   way.
+//! * `--debug-overlay` draws the frame rate and the process's resident memory
+//!   in the top-left corner. It is a render-only node (never a script-visible
+//!   layer or bitmap) and off by default.
 //! * `--backend vulkan` requests the Vulkan pipeline. It needs a real
 //!   window with a display connection (Wayland/X11/XCB); the windowed host
 //!   passes both the window and display handle so a surface can be created.
@@ -99,6 +102,11 @@ const OPTIONS: &[OptionDoc] = &[
         help: "Read every mounted archive into memory at mount, trading its size in resident memory for per-entry reads.",
     },
     OptionDoc {
+        flag: "--debug-overlay",
+        value: "",
+        help: "Draw frame rate and resident memory in the top-left corner.",
+    },
+    OptionDoc {
         flag: "--archive",
         value: "XP3",
         help: "Mount an XP3 archive (repeatable, later wins); with none, every *.xp3 under the base directory mounts.",
@@ -151,6 +159,8 @@ struct Cli {
     scaling: Option<PresentationScaling>,
     /// Whether `--preload-archives` was given.
     preload_archives: Option<bool>,
+    /// Whether `--debug-overlay` was given.
+    debug_overlay: Option<bool>,
     /// Explicit `--archive` list, in mount order (later wins).
     archives: Vec<PathBuf>,
     /// App path override (`--base-dir`); defaults to the current directory.
@@ -186,6 +196,7 @@ impl Cli {
             frame_rate: None,
             scaling: None,
             preload_archives: None,
+            debug_overlay: None,
             archives: Vec::new(),
             base_dir: None,
             positional: None,
@@ -222,6 +233,7 @@ impl Cli {
                     cli.scaling = Some(PresentationScaling::parse("--scaling", &value)?);
                 }
                 "--preload-archives" => cli.preload_archives = Some(true),
+                "--debug-overlay" => cli.debug_overlay = Some(true),
                 "--archive" => {
                     let value = args
                         .next()
@@ -308,6 +320,10 @@ fn resolve_runtime_config(cli: &Cli, file: RuntimeConfigOverrides) -> RuntimeCon
             .preload_archives
             .or(file.preload_archives)
             .unwrap_or(defaults.preload_archives),
+        debug_overlay: cli
+            .debug_overlay
+            .or(file.debug_overlay)
+            .unwrap_or(defaults.debug_overlay),
     }
 }
 
@@ -485,6 +501,7 @@ mod tests {
         assert_eq!(cli.frames, DEFAULT_FRAMES);
         assert_eq!(cli.frame_rate, None);
         assert_eq!(cli.scaling, None);
+        assert_eq!(cli.debug_overlay, None);
     }
 
     #[test]
@@ -495,6 +512,17 @@ mod tests {
             Some(FrameRateLimit::new("--fps", 30).expect("valid"))
         );
         assert_eq!(cli.scaling, Some(PresentationScaling::Fit));
+    }
+
+    #[test]
+    fn parse_debug_overlay() {
+        assert_eq!(parse(&["--headless"]).expect("parse").debug_overlay, None);
+        assert_eq!(
+            parse(&["--headless", "--debug-overlay"])
+                .expect("parse")
+                .debug_overlay,
+            Some(true)
+        );
     }
 
     #[test]
@@ -557,6 +585,29 @@ mod tests {
         assert_eq!(config, RuntimeConfig::default());
         assert_eq!(config.frame_rate_limit.fps(), 60);
         assert_eq!(config.scaling, PresentationScaling::Game);
+        assert!(!config.debug_overlay);
+    }
+
+    #[test]
+    fn debug_overlay_resolves_argument_then_file_then_default() {
+        // The built-in default is off.
+        let cli = parse(&["--headless"]).expect("parse");
+        assert!(!resolve_runtime_config(&cli, RuntimeConfigOverrides::default()).debug_overlay);
+
+        // The configuration file turns it on.
+        let file = RuntimeConfigOverrides {
+            debug_overlay: Some(true),
+            ..RuntimeConfigOverrides::default()
+        };
+        assert!(resolve_runtime_config(&cli, file).debug_overlay);
+
+        // The launch argument beats a file that leaves it off.
+        let file = RuntimeConfigOverrides {
+            debug_overlay: Some(false),
+            ..RuntimeConfigOverrides::default()
+        };
+        let cli = parse(&["--headless", "--debug-overlay"]).expect("parse");
+        assert!(resolve_runtime_config(&cli, file).debug_overlay);
     }
 
     /// A unique path under the system temp directory for a config file.
@@ -571,13 +622,14 @@ mod tests {
 
     #[test]
     fn config_file_parses_keys_and_rejects_bad_values() {
-        let path = temp_config("frame_rate = 30\nscaling=fit\n# comment\n");
+        let path = temp_config("frame_rate = 30\nscaling=fit\ndebug_overlay=true\n# comment\n");
         let overrides = load_config_file(&path).expect("parse");
         assert_eq!(
             overrides.frame_rate_limit,
             Some(FrameRateLimit::new("frame_rate", 30).expect("valid"))
         );
         assert_eq!(overrides.scaling, Some(PresentationScaling::Fit));
+        assert_eq!(overrides.debug_overlay, Some(true));
         std::fs::remove_file(&path).ok();
 
         let bad = temp_config("frame_rate=0\n");
