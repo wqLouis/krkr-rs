@@ -12,7 +12,8 @@ use tjs::{
 };
 
 use super::common::{
-    DEFAULT_FONT_COLOR, DEFAULT_FONT_FACE, DEFAULT_FONT_HEIGHT, ObjectKind, VisualState,
+    DEFAULT_FONT_COLOR, DEFAULT_FONT_FACE, DEFAULT_FONT_HEIGHT, ObjectHandle, ObjectKind,
+    VisualState,
     argb_to_rgba, bound, duplicate_object, input_ref, reparent_layer, resolve_object_id, scene_mut,
     scene_ref, set_null_out, set_object_out, set_retained_out, set_visual_string_out,
 };
@@ -107,21 +108,21 @@ fn pointer_or_touch(input: &InputState) -> (f32, f32) {
 }
 
 /// See `register_window`.
-fn register_layer(ctx: &CompatCtx, host: &Tjs2Engine, id: u32, objthis: *mut c_void) {
+///
+/// The layer is registered as a non-owning [`ObjectHandle`]: the script
+/// object must be able to reach reference count zero so its native
+/// `Invalidate`/destroy callbacks run and the scene record is released
+/// (reference `tTJSNI_BaseLayer::Owner`, `LayerIntf.h:173`).
+fn register_layer(ctx: &CompatCtx, id: u32, objthis: *mut c_void) {
     if objthis.is_null() {
         return;
     }
-    match host.retain_object_detached(objthis) {
-        // SAFETY: the caller resolved `ctx` from the installed binding.
-        Ok(object) => {
-            unsafe { ctx.services() }
-                .state::<VisualState>()
-                .objects
-                .layers
-                .insert(id, object);
-        }
-        Err(error) => log::warn!("Layer: could not retain the script object: {error}"),
-    }
+    // SAFETY: the caller resolved `ctx` from the installed binding.
+    unsafe { ctx.services() }
+        .state::<VisualState>()
+        .objects
+        .layers
+        .insert(id, ObjectHandle::new(objthis));
 }
 
 /// Build a TJS array of retained Layer objects (used by `Layer.children`).
@@ -322,7 +323,7 @@ extern "C" fn layer_ctor(
     };
     inst.attached = true;
     log::trace!("Layer created: id={id} parent={parent:?}");
-    register_layer(&ctx, resolved.engine(), id, objthis);
+    register_layer(&ctx, id, objthis);
     set_int(out, i64::from(id));
     0
 }

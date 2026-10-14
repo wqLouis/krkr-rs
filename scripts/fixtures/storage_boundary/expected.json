@@ -1,6 +1,9 @@
 {
   "flagged": [
+    "crates/compat/src/boundary.rs :: raw_host_path :: FsPath::host(name)",
+    "crates/compat/src/boundary.rs :: raw_host_write :: fs::write(_, name)",
     "crates/compat/src/boundary.rs :: raw_join :: game_dir().join(name)",
-    "crates/compat/src/boundary.rs :: raw_read :: read(name)"
+    "crates/compat/src/boundary.rs :: raw_read :: read(name)",
+    "crates/compat/src/boundary.rs :: raw_save :: save(name)"
   ]
 }

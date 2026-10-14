@@ -13,6 +13,10 @@ the namespace, the host filesystem, or the decoded-video seam:
 * a storage-handle method — ``read`` / ``read_prefix`` / ``find`` / ``exists``
   / ``stat`` / ``relative_disk_name`` / ``local_name`` — on a ``Storage``
   handle;
+* a storage write seam — a ``save_image`` / ``save`` method call whose callee
+  does not itself route the name through ``strip_file_media``;
+* a host write — ``fs::write`` / ``fs::open`` / ``fs::create_dir_all`` and the
+  other path-taking ``fs`` helpers;
 * ``game_dir().join(...)``;
 * the ``VideoSource`` seam — ``spec`` / ``audio`` / ``frame_at`` and the
   ``decoded_audio`` helper — which ``crates/app`` later reads through
@@ -27,7 +31,12 @@ not already known to be stripped. The check knows a name is stripped when it is
 
 * bound from a call to a function whose body routes through
   ``strip_file_media`` (directly or transitively), so a helper such as a
-  ``local_path`` / ``output_path`` wrapper is recognized;
+  ``local_path`` / ``output_path`` wrapper is recognized — across files, so a
+  shared helper such as the image ``save_image`` seam counts at its callers;
+
+* the callee of a save seam (``save_image`` / ``save``) when its own body
+  routes through ``strip_file_media``; a seam that strips is safe at every
+  call site, and a seam that does not is a finding.
 
 * a module-level ``const`` / ``static`` (a literal constant, not script data);
 
@@ -78,6 +87,10 @@ _SEAM_CALL = re.compile(
     r"(?P<recv>[A-Za-z_][A-Za-z0-9_]*)\s*\.\s*(?P<method>frame_at|spec|audio)\s*\("
 )
 _DECODED_AUDIO = re.compile(r"\bdecoded_audio\s*\(")
+_SAVE_CALL = re.compile(r"\.\s*(?P<method>save_image_on|save_image|save)\s*\(")
+_HOST_WRITE = re.compile(
+    r"\bfs\s*::\s*(?P<method>write|open|create_dir_all|remove_file|remove_dir|remove_dir_all)\s*\("
+)
 _FSPATH_HOST = re.compile(r"\bFsPath::host\s*\(")
 _PATH_NEW = re.compile(r"\bPath::new\s*\(")
 _PATHBUF_FROM = re.compile(r"\bPathBuf::from\s*\(")
@@ -293,15 +306,22 @@ def _is_definition(scrubbed: str, match: re.Match[str]) -> bool:
 
 def scan(root: pathlib.Path) -> list[dict[str, str]]:
     """Return one record per unstripped boundary call under ``root``."""
-    findings: list[dict[str, str]] = []
     src = root / "crates" / "compat" / "src"
+    parsed = []
+    stripping_fns: set[str] = set()
     for path in _rust_sources(src):
         rel = path.relative_to(root).as_posix()
         raw = path.read_text(encoding="utf-8")
         scrubbed = blank_cfg_test(strip_rust(raw))
-        consts = {m.group("name") for m in _CONST.finditer(scrubbed)}
         functions = _parse_functions(scrubbed)
-        stripping_fns = _stripping_functions(functions, raw)
+        parsed.append((rel, raw, scrubbed, functions))
+        # The stripping set spans files: a shared helper defined in one module
+        # (the image `save_image` seam) is recognized at its callers.
+        stripping_fns |= _stripping_functions(functions, raw)
+
+    findings: list[dict[str, str]] = []
+    for rel, raw, scrubbed, functions in parsed:
+        consts = {m.group("name") for m in _CONST.finditer(scrubbed)}
         scoped = []
         for name, params_text, start, end in functions:
             bindings = _local_bindings(raw[start:end], scrubbed[start:end])
@@ -392,6 +412,20 @@ def scan(root: pathlib.Path) -> list[dict[str, str]]:
             for match in regex.finditer(scrubbed):
                 arg = argument_at(match.end() - 1)
                 consider("path", f"{name}({shown(arg)})", arg, match.start())
+
+        for match in _SAVE_CALL.finditer(scrubbed):
+            method = match.group("method")
+            # A write seam whose own body strips the media prefix is safe at
+            # every call site; one that does not is the finding.
+            if method in stripping_fns:
+                continue
+            arg = argument_at(match.end() - 1)
+            consider("save", f"{method}({shown(arg)})", arg, match.start())
+
+        for match in _HOST_WRITE.finditer(scrubbed):
+            method = match.group("method")
+            arg = argument_at(match.end() - 1, 1)
+            consider("write", f"fs::{method}(_, {shown(arg)})", arg, match.start())
 
     return findings
 

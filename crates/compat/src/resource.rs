@@ -123,7 +123,9 @@ impl ResourceResolver {
             .save
             .clone()
             .ok_or_else(|| "no image encoder is installed".to_string())?;
-        saver(name, type_name, width, height, rgba)
+        // The media prefix is L3 syntax; the host writer takes the bare name,
+        // exactly as `read_image_from_storage` does on the decode path.
+        saver(strip_file_media(name), type_name, width, height, rgba)
     }
 
     /// Maps the font value `key` to the pre-rendered font `storage`.

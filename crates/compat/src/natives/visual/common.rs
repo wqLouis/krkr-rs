@@ -37,8 +37,37 @@ pub(crate) const DEFAULT_FONT_COLOR: i64 = 0xffff_ffff;
 #[derive(Default)]
 pub(crate) struct ObjectRegistry {
     pub(crate) windows: HashMap<u32, DetachedValue>,
-    pub(crate) layers: HashMap<u32, DetachedValue>,
-    pub(crate) fonts: HashMap<u32, DetachedValue>,
+    pub(crate) layers: HashMap<u32, ObjectHandle>,
+}
+
+/// A non-owning handle to a layer's script object, keyed by scene id.
+///
+/// The reference native instance holds its owner as a raw
+/// `iTJSDispatch2 *Owner` without a reference (`LayerIntf.h:173`,
+/// `GetOwnerNoAddRef`), so the script object reaches reference count zero and
+/// its `Invalidate`/destructor run. Holding a strong reference here made that
+/// impossible: the registry rooted every layer forever, so the native destroy
+/// never ran and each create/close cycle leaked its objects. Every lookup
+/// retains the object for the returned handle, the reference
+/// `tTJSVariant(GetOwnerNoAddRef(), GetOwnerNoAddRef())` shape.
+#[derive(Clone, Copy)]
+pub(crate) struct ObjectHandle {
+    raw: usize,
+}
+
+impl ObjectHandle {
+    /// Wrap a live `objthis` pointer. The registry entry is removed by the
+    /// class's destroy callback while the object is still alive.
+    pub(crate) fn new(object: *mut c_void) -> Self {
+        Self {
+            raw: object as usize,
+        }
+    }
+
+    /// The raw script object pointer.
+    pub(crate) fn as_ptr(self) -> *mut c_void {
+        self.raw as *mut c_void
+    }
 }
 
 /// One object registered with a window through `Window.add`, mirroring the
@@ -318,7 +347,12 @@ pub(crate) enum ObjectKind {
     Layer,
 }
 
-/// Duplicate a registered object into an owned [`DetachedValue`].
+/// Return a handle to a registered object as an owned [`DetachedValue`].
+///
+/// The window registry keeps its object alive (the game owns one long-lived
+/// window), so it duplicates the existing retention. A layer is registered
+/// only through a non-owning [`ObjectHandle`], so the object is retained for
+/// the returned handle here.
 pub(crate) fn duplicate_object(
     ctx: &CompatCtx,
     host: &Tjs2Engine,
@@ -327,14 +361,22 @@ pub(crate) fn duplicate_object(
 ) -> Option<DetachedValue> {
     // SAFETY: the caller resolved `ctx` from the installed binding.
     let services = unsafe { ctx.services() };
-    let state = services.state::<VisualState>();
-    let source = match kind {
-        ObjectKind::Window => state.objects.windows.get(&id),
-        ObjectKind::Layer => state.objects.layers.get(&id),
-    }?;
-    let raw = source.raw_id();
-    drop(state);
-    host.duplicate_retained(raw).ok()
+    match kind {
+        ObjectKind::Window => {
+            let held = {
+                let state = services.state::<VisualState>();
+                state.objects.windows.get(&id).map(|object| object.raw_id())
+            };
+            host.duplicate_retained(held?).ok()
+        }
+        ObjectKind::Layer => {
+            let raw = {
+                let state = services.state::<VisualState>();
+                state.objects.layers.get(&id).map(|object| object.as_ptr())
+            };
+            host.retain_object_detached(raw?).ok()
+        }
+    }
 }
 
 /// The scene id reader for one of the classes whose native-instance payload

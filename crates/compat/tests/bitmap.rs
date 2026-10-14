@@ -282,6 +282,90 @@ fn save_encodes_and_writes_through_the_host_seam() {
 }
 
 #[test]
+fn save_strips_the_file_media_prefix() {
+    let _lock = vm_lock();
+    let env = Env::new(true);
+    let saved = Arc::new(Mutex::new(None));
+    env.record_saves(saved.clone());
+
+    // The reference resolves the write target through
+    // `TVPCreateStream(TVPNormalizeStorageName(name), TJS_BS_WRITE)`, which
+    // parses the `file://` media form down to the local path
+    // (`reference/cpp/core/visual/impl/GraphicsLoaderImpl.cpp:56-63`,
+    // `reference/cpp/core/base/StorageIntf.cpp:241-430`). The seam that reaches
+    // the host writer must hand it the bare name, exactly as the decode path
+    // strips before `Storage::read`.
+    env.run("var b = new Bitmap(1, 1); b.save('file://./out/shot.bmp', 'bmp');");
+
+    assert_eq!(
+        saved
+            .lock()
+            .expect("save lock")
+            .clone()
+            .expect("save called")
+            .name,
+        "/out/shot.bmp"
+    );
+}
+
+#[test]
+fn save_with_a_file_media_prefix_writes_the_stripped_path() {
+    let _lock = vm_lock();
+
+    // The reference resolves the write target through
+    // `TVPCreateStream(TVPNormalizeStorageName(storagename), TJS_BS_WRITE)`,
+    // which parses the `file://` media form to the local path
+    // (`reference/cpp/core/visual/impl/GraphicsLoaderImpl.cpp:56-63`,
+    // `reference/cpp/core/base/StorageIntf.cpp:241-430`), so the host writer
+    // receives `/out/shot.bmp` and the file lands there, not under a
+    // `file:`-named directory.
+    let fs = FileSystem::memory();
+    let mut storage = Box::new(
+        Storage::mount_archives(fs.clone(), "/", std::iter::empty::<&str>())
+            .expect("mount storage"),
+    );
+    let engine = Box::new(Tjs2Engine::new().expect("create engine"));
+    let mut scene = Box::new(Scene::default());
+    let mut host = CompatHost::new();
+    let writer = fs.clone();
+    host.set_image_codec(
+        |_bytes, _hint| Ok(DecodedImage::new(2, 2, DECODED_RGBA.to_vec())),
+        |_bytes, _hint| {
+            Ok(ImageInfo {
+                width: 2,
+                height: 2,
+                has_alpha: true,
+                format: Some("img".to_string()),
+            })
+        },
+        move |name, _type, _width, _height, rgba| {
+            write_memory_file(&writer, name, rgba);
+            Ok(())
+        },
+    );
+    // SAFETY: the boxed scene and storage outlive the host.
+    unsafe {
+        host.services_mut()
+            .attach_scene(scene.as_mut() as *mut Scene);
+        host.services_mut()
+            .attach_storage(storage.as_mut() as *mut Storage);
+    }
+    host.install(&engine).expect("install compat surface");
+
+    engine
+        .exec_script(
+            "var b = new Bitmap(2, 2); b.save('file://./out/shot.bmp', 'bmp');",
+            "bitmap-test",
+        )
+        .expect("run the save script");
+
+    assert!(
+        fs::exists(&fs, &FsPath::host("/out/shot.bmp")),
+        "the prefixed save must land at the stripped path"
+    );
+}
+
+#[test]
 fn save_defaults_to_bmp() {
     let _lock = vm_lock();
     let env = Env::new(true);
