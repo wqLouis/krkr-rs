@@ -468,3 +468,35 @@ fn subclass_member_writes_before_the_base_constructor_land() {
     assert_eq!(env.eval_int("m.enabled"), 0);
     assert_eq!(env.eval_int("m.visible"), 0);
 }
+
+/// The reference native menu item keeps only a raw `Owner` pointer
+/// (`reference/cpp/core/visual/MenuItemIntf.h:66,102`, `GetOwnerNoAddRef`), so
+/// a script object reaches reference count zero and its native destroy runs,
+/// removing its `MenuState` node. A strong `MenuState` node reference rooted
+/// every item, so a menu reopened per cycle leaked its whole item tree; the
+/// state map is the observable form of the "map size back to baseline" rule.
+#[test]
+fn dropped_menu_items_release_their_nodes() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    let baseline = env._host.menu_node_count();
+    env.run(
+        "for (var cycle = 0; cycle < 5; cycle++) { \
+             var root = new MenuItem(); \
+             var child = new MenuItem(null, 'c'); \
+             root.add(child); \
+             root = null; \
+             child = null; \
+         }",
+    );
+    // The collector must run outside the creating frame: a separate
+    // execution's `doCompact` plus the direct GC pass, like the layer-cycle
+    // test (`crates/compat/tests/layer.rs`).
+    env.run("System.doCompact();");
+    env.engine.do_gc().expect("idle compact");
+    assert_eq!(
+        env._host.menu_node_count(),
+        baseline,
+        "a dropped MenuItem must release its dispatch-state node"
+    );
+}

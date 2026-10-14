@@ -466,9 +466,11 @@ struct SoundObject {
     /// `channels` and `totalTime` read it, not the decoder's presence, so a
     /// side-car failure still reports the format.
     format: Option<SoundFormat>,
-    /// Retained `objthis` (the `WaveSoundBuffer` or a script subclass); the
-    /// poll delivers events through its class chain.
-    self_obj: Option<DetachedValue>,
+    /// The raw `objthis` handle of the buffer (reference
+    /// `tTJSNI_BaseSoundBuffer::Owner`, `SoundBufferBaseIntf.h:45`, held with
+    /// no reference); the poll retains it on demand to deliver events through
+    /// its class chain. `0` means no owner was recorded.
+    self_obj: usize,
     /// Retained `param[0]`, the reference `ActionOwner` closure
     /// (`SoundBufferBaseIntf.cpp:44-45`); `None` is the reference's empty
     /// closure, which the native event members skip.
@@ -909,6 +911,16 @@ fn tick_fade(object: &mut SoundObject, channel: &mut SoundChannel) -> bool {
 // Event delivery
 // ---------------------------------------------------------------------------
 
+/// Retain a sound buffer's script object from its raw non-owning handle
+/// (reference `tTJSNI_BaseSoundBuffer::Owner`, `SoundBufferBaseIntf.h:45`),
+/// for the duration of an event dispatch. The buffer can therefore reach
+/// reference count zero and finalize, running its destroy callback.
+fn retain_self(host: &Tjs2Engine, handle: usize) -> Option<DetachedValue> {
+    // A zero handle is the null pointer, which `retain_object_detached`
+    // rejects, yielding `None`.
+    host.retain_object_detached(handle as *mut c_void).ok()
+}
+
 /// Deliver one event through the object's class chain, so a script override
 /// wins over the native member (reference: `TVPPostEvent(Owner, Owner, ...)` →
 /// `Owner->FuncCall(<member>, ...)`, `SoundBufferBaseIntf.cpp:83-90`).
@@ -966,13 +978,13 @@ fn is_valid_sound_object(host: &Tjs2Engine, id: Tjs2ValueId) -> bool {
 /// (`WaveIntf.cpp:897-908`, `SoundBufferBaseIntf.cpp:186-190`).
 fn drain_status_now(host: &Tjs2Engine, services: &CompatServices, id: u64) {
     let mut immediate: Vec<(&'static str, Vec<TjsValue>)> = Vec::new();
-    let owner = {
+    let owner_handle = {
         let mut state = services.state::<SoundState>();
         let SoundState { mixer, objects, .. } = &mut *state;
         let Some(object) = objects.get_mut(&id) else {
             return;
         };
-        let owner = object.self_obj.as_ref().map(DetachedValue::raw_id);
+        let owner = object.self_obj;
         if let Some(channel) = mixer.channel(object.channel_id) {
             for event in object.buffer.poll(channel) {
                 match event {
@@ -996,8 +1008,14 @@ fn drain_status_now(host: &Tjs2Engine, services: &CompatServices, id: u64) {
         }
         owner
     };
+    let owner = retain_self(host, owner_handle);
     for (member, args) in immediate {
-        dispatch_member(host, owner, member, &args);
+        dispatch_member(
+            host,
+            owner.as_ref().map(DetachedValue::raw_id),
+            member,
+            &args,
+        );
     }
 }
 
@@ -1210,10 +1228,11 @@ extern "C" fn sound_ctor(
         return report_error(out_error, "WaveSoundBuffer: already constructed");
     }
     let host = resolved.engine();
-    // Retain `this` so the poll can dispatch the event handlers through a
-    // script subclass override; a script may drop it, which simply means no
-    // events are delivered.
-    let self_obj = host.retain_object_detached(objthis).ok();
+    // `Owner = tjs_obj` (`SoundBufferBaseIntf.h:45`): the buffer object
+    // itself, for event dispatch. The reference stores a raw pointer with no
+    // reference, so the handle is not retained here; the poll retains it on
+    // demand.
+    let self_obj = objthis as usize;
     // Reference `ActionOwner = param[0]->AsObjectClosure()`
     // (`SoundBufferBaseIntf.cpp:44-45`): *any* first argument is accepted, a
     // non-object yields the empty closure — here `None` — which the native
@@ -1294,14 +1313,14 @@ extern "C" fn sound_open(
         // are `TVP_EPT_IMMEDIATE` (`SoundBufferBaseIntf.cpp:75-92`), so they
         // are dispatched inside this call.
         let mut immediate: Vec<(&'static str, Vec<TjsValue>)> = Vec::new();
-        let owner;
+        let owner_handle;
         {
             let mut state = services.state::<SoundState>();
             let SoundState { mixer, objects, .. } = &mut *state;
             let Some(object) = objects.get_mut(&id) else {
                 return report_error(out_error, "WaveSoundBuffer.open: not constructed");
             };
-            owner = object.self_obj.as_ref().map(DetachedValue::raw_id);
+            owner_handle = object.self_obj;
             let was_loaded = object.source.is_some();
             let was_playing = mixer
                 .channel(object.channel_id)
@@ -1333,8 +1352,14 @@ extern "C" fn sound_open(
                 immediate.push(("onStatusChanged", vec![TjsValue::String("unload".into())]));
             }
         }
+        let owner = retain_self(host, owner_handle);
         for (member, args) in &immediate {
-            dispatch_member(host, owner, member, args);
+            dispatch_member(
+                host,
+                owner.as_ref().map(DetachedValue::raw_id),
+                member,
+                args,
+            );
         }
 
         let Some(storage) = services.storage() else {
@@ -1666,12 +1691,15 @@ extern "C" fn sound_fade(
         // playback (`SoundBufferBaseIntf.cpp:149-171`) — and the
         // `StopFade` calls it makes along the way post `onFadeCompleted`
         // with `TVP_EPT_IMMEDIATE` (`SoundBufferBaseIntf.cpp:186-190`).
-        let owner = with_object(services, id, |object, _| {
-            object.self_obj.as_ref().map(DetachedValue::raw_id)
-        })
-        .flatten();
+        let handle = with_object(services, id, |object, _| object.self_obj).unwrap_or(0);
+        let owner = retain_self(host, handle);
         for _ in 0..completions {
-            dispatch_member(host, owner, "onFadeCompleted", &[]);
+            dispatch_member(
+                host,
+                owner.as_ref().map(DetachedValue::raw_id),
+                "onFadeCompleted",
+                &[],
+            );
         }
         set_void(out);
         0
@@ -1708,11 +1736,14 @@ extern "C" fn sound_stop_fade(
                 // (`WaveIntf.cpp:1161-1169`, `SoundBufferBaseIntf.cpp:174-193`).
                 // With no fade running (`if(InFading)`) it is a strict no-op —
                 // no event, no volume write.
-                let owner = with_object(services, id, |object, _| {
-                    object.self_obj.as_ref().map(DetachedValue::raw_id)
-                })
-                .flatten();
-                dispatch_member(host, owner, "onFadeCompleted", &[]);
+                let handle = with_object(services, id, |object, _| object.self_obj).unwrap_or(0);
+                let owner = retain_self(host, handle);
+                dispatch_member(
+                    host,
+                    owner.as_ref().map(DetachedValue::raw_id),
+                    "onFadeCompleted",
+                    &[],
+                );
             }
             set_void(out);
             0
@@ -2970,7 +3001,7 @@ fn advance_and_dispatch(ctx: &mut CompatCtx, dt: f64) -> Result<(), CompatError>
 
     // Collect `(handler, args)` pairs with the borrow held, then release it
     // before touching the VM.
-    let mut dispatches: Vec<(Tjs2ValueId, &'static str, Vec<TjsValue>)> = Vec::new();
+    let mut dispatches: Vec<(usize, &'static str, Vec<TjsValue>)> = Vec::new();
     {
         let mut state = services.state::<SoundState>();
         let SoundState {
@@ -2983,7 +3014,7 @@ fn advance_and_dispatch(ctx: &mut CompatCtx, dt: f64) -> Result<(), CompatError>
             mixer.advance(dt);
         }
         for object in objects.values_mut() {
-            let owner = object.self_obj.as_ref().map(DetachedValue::raw_id);
+            let owner = object.self_obj;
             // The reference's 60 ms sound-buffer beat drives the fade ramp
             // (`SoundBufferBaseIntf.cpp:104-128`); a natural completion is
             // posted with `TVP_EPT_POST` (`SoundBufferBaseIntf.cpp:186-190`)
@@ -3008,20 +3039,15 @@ fn advance_and_dispatch(ctx: &mut CompatCtx, dt: f64) -> Result<(), CompatError>
                 continue;
             };
             // Queued (`TVP_EPT_POST`) events first: they were posted before
-            // anything this poll observes.
-            if let Some(owner) = owner {
-                for (member, args) in std::mem::take(&mut object.pending) {
-                    dispatches.push((owner, member, args));
-                }
-            } else {
-                object.pending.clear();
+            // anything this poll observes. An absent owner handle is kept as
+            // the null pointer and skipped at dispatch, after the borrow is
+            // released.
+            for (member, args) in std::mem::take(&mut object.pending) {
+                dispatches.push((owner, member, args));
             }
             // Always poll — the watermark/status bookkeeping must advance
-            // even when the script object could not be retained.
+            // even when the script object handle is absent.
             let events = object.buffer.poll(channel);
-            let Some(owner) = owner else {
-                continue;
-            };
             for event in events {
                 match event {
                     SoundEvent::StatusChanged(status) => dispatches.push((
@@ -3040,8 +3066,14 @@ fn advance_and_dispatch(ctx: &mut CompatCtx, dt: f64) -> Result<(), CompatError>
         }
     }
 
-    for (id, member, args) in dispatches {
-        dispatch_member(host, Some(id), member, &args);
+    for (handle, member, args) in dispatches {
+        let owner = retain_self(host, handle);
+        dispatch_member(
+            host,
+            owner.as_ref().map(DetachedValue::raw_id),
+            member,
+            &args,
+        );
     }
     Ok(())
 }
@@ -3124,6 +3156,14 @@ pub fn sound_render(
 // ---------------------------------------------------------------------------
 // Registration
 // ---------------------------------------------------------------------------
+
+/// The number of live `WaveSoundBuffer` objects in the dispatch state.
+///
+/// A host diagnostic: the buffer's destroy callback removes the object, so a
+/// count that grows across create/drop cycles is a retention leak.
+pub(crate) fn object_count(services: &CompatServices) -> usize {
+    services.state::<SoundState>().objects.len()
+}
 
 /// Register the `WaveSoundBuffer` class.
 pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {

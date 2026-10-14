@@ -584,3 +584,31 @@ fn with_write_from_a_timer_callback_routes_to_the_target() {
         "the enclosing instance's channel must NOT receive the timer write"
     );
 }
+
+/// The reference native sound buffer keeps only a raw `Owner` pointer
+/// (`reference/cpp/core/sound/SoundBufferBaseIntf.h:45`), so a script object
+/// reaches reference count zero and its native destroy runs, removing the
+/// `SoundObject`. A strong `SoundObject.self_obj` rooted the buffer, so each
+/// dropped buffer leaked its object; the state map is the observable form of
+/// the "map size back to baseline" rule.
+#[test]
+fn dropped_sound_buffers_release_their_objects() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    let baseline = env._host.sound_object_count();
+    env.run(
+        "for (var cycle = 0; cycle < 5; cycle++) { \
+             var b = new WaveSoundBuffer(); \
+             b = null; \
+         }",
+    );
+    // The collector must run outside the creating frame: a separate
+    // execution's `doCompact` plus the direct GC pass.
+    env.run("System.doCompact();");
+    env.engine.do_gc().expect("idle compact");
+    assert_eq!(
+        env._host.sound_object_count(),
+        baseline,
+        "a dropped WaveSoundBuffer must release its dispatch-state object"
+    );
+}

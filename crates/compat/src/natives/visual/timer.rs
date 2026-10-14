@@ -181,6 +181,14 @@ fn timer_post_is_live(services: &CompatServices, id: TimerId, generation: u64) -
 // Timer (L3 adapter over the L2 `engine::timer::TimerState` registry)
 // ---------------------------------------------------------------------------
 
+/// The number of live `Timer` bindings in the dispatch state.
+///
+/// A host diagnostic: `timer_destroy` removes the binding, so a count that
+/// grows across create/drop cycles is a retention leak.
+pub(crate) fn binding_count(services: &CompatServices) -> usize {
+    services.state::<VisualState>().timers.len()
+}
+
 extern "C" fn timer_create(_engine: *mut c_void) -> *mut c_void {
     Box::into_raw(Box::new(TimerInst::default())) as *mut c_void
 }
@@ -263,8 +271,10 @@ extern "C" fn timer_ctor(
         _ => DEFAULT_ACTION_NAME.to_string(),
     };
     // `Owner = tjs_obj` (`TimerIntf.cpp:52`): the timer object itself, used
-    // to dispatch `onTimer` through the class chain.
-    let owner = host.retain_object_detached(objthis).ok();
+    // to dispatch `onTimer` through the class chain. The reference stores a
+    // raw pointer with no reference (`tTJSNI_BaseTimer::Owner`), so the
+    // handle is not retained here.
+    let owner = objthis as usize;
     // SAFETY: `instance` is the live `TimerInst` payload the VM allocated for this script object; `timer_ctor` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut TimerInst) };
     if inst.id.is_some() {
@@ -378,23 +388,25 @@ fn timer_callback(engine: *mut c_void) -> TimerCallback {
 /// Delivery failures are logged and never disable the timer — the reference
 /// has no disable-on-error path in `TimerIntf.cpp`/`TimerImpl.cpp`.
 fn dispatch_on_timer(host: &Tjs2Engine, services: &CompatServices, id: TimerId) {
-    let owner = {
+    let handle = {
         let state = services.state::<VisualState>();
-        state
-            .timers
-            .get(&id)
-            .and_then(|timer| timer.owner.as_ref().map(DetachedValue::raw_id))
+        state.timers.get(&id).map(|timer| timer.owner).unwrap_or(0)
     };
+    // The reference `Owner` is a raw pointer (`TimerIntf.cpp:52`); retain it
+    // for the duration of the dispatch so the object cannot finalize under
+    // the call, then release it. A zero handle is the null pointer, which
+    // `retain_object_detached` rejects, yielding `None`.
+    let owner = host.retain_object_detached(handle as *mut c_void).ok();
     log::trace!("timer {id:?}: dispatching (owner {})", owner.is_some());
-    let result: Result<(), String> = match owner {
-        Some(owner) => host.call_member(owner, "onTimer", &[]).map(|_| ()),
+    let result: Result<(), String> = match &owner {
+        Some(owner) => host.call_member(owner.raw_id(), "onTimer", &[]).map(|_| ()),
         // The reference's `Owner` is always the timer object
-        // (`TimerIntf.cpp:52`); a missing retention is a port-only failure,
+        // (`TimerIntf.cpp:52`); a missing handle is a port-only failure,
         // and delivering without it would omit the event's `target`
         // (`TVP_ACTION_INVOKE_BEGIN(0, "onTimer", objthis)`,
         // `TimerIntf.cpp:164`). Skip rather than deliver a malformed event.
         None => {
-            log::debug!("Timer {id:?}: no retained timer object; onTimer fire skipped");
+            log::debug!("Timer {id:?}: no timer object handle; onTimer fire skipped");
             return;
         }
     };

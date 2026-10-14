@@ -91,6 +91,14 @@ mod timer;
 mod window;
 
 pub use timer::timer_poll;
+
+/// The number of live `Timer` bindings in the dispatch state.
+///
+/// A host diagnostic: a binding is removed by the timer's destroy callback, so
+/// a count that grows across create/drop cycles is a retention leak.
+pub(crate) fn timer_count(services: &crate::CompatServices) -> usize {
+    timer::binding_count(services)
+}
 // The tree-owner / frame-body hand-offs: the L4 frame body drains the host
 // requests and advances transitions from its `project_and_render` step.
 pub use layer::{advance_transitions, paint_poll, take_capture_releases};

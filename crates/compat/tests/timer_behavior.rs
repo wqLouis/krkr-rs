@@ -1692,3 +1692,31 @@ fn self_disabling_action_is_invoked_once() {
     );
     assert_eq!(env.eval_int("t.enabled"), 0);
 }
+
+/// The reference native timer keeps only a raw `Owner` pointer
+/// (`reference/cpp/core/utils/TimerIntf.cpp:52,60`), so a script object reaches
+/// reference count zero and its native destroy runs, removing the
+/// `TimerBinding`. A strong `TimerBinding.owner` rooted the timer, so each
+/// dropped timer leaked its binding; the state map is the observable form of
+/// the "map size back to baseline" rule.
+#[test]
+fn dropped_timers_release_their_bindings() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    let baseline = env._host.timer_count();
+    env.run(
+        "for (var cycle = 0; cycle < 5; cycle++) { \
+             var t = new Timer(function(){}); \
+             t = null; \
+         }",
+    );
+    // The collector must run outside the creating frame: a separate
+    // execution's `doCompact` plus the direct GC pass.
+    env.run("System.doCompact();");
+    env.engine.do_gc().expect("idle compact");
+    assert_eq!(
+        env._host.timer_count(),
+        baseline,
+        "a dropped Timer must release its dispatch-state binding"
+    );
+}

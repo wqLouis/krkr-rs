@@ -101,9 +101,12 @@ pub(crate) struct TimerBinding {
     /// silently and never called back. Taken out across the VM call so the
     /// state borrow is released while the action runs.
     pub(crate) action_owner: Option<DetachedValue>,
-    /// The timer object itself (`Owner`, `TimerIntf.cpp:52`), for `onTimer`
-    /// dispatch through its class chain (a script subclass override wins).
-    pub(crate) owner: Option<DetachedValue>,
+    /// The raw `objthis` handle of the timer object itself (reference
+    /// `tTJSNI_BaseTimer::Owner`, `TimerIntf.cpp:52`, held with no
+    /// reference), for `onTimer` dispatch through its class chain (a script
+    /// subclass override wins). `dispatch_on_timer` retains it on demand.
+    /// `0` means no owner was recorded.
+    pub(crate) owner: usize,
     /// The reference `ActionName` (`TimerIntf.cpp:48-49`), stored verbatim:
     /// it defaults to `TVPActionName == "action"` (`EventIntf.cpp:740`) and
     /// is overwritten only when the script passes a non-void second

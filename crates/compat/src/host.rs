@@ -100,6 +100,30 @@ impl CompatHost {
         self.bound
     }
 
+    /// The number of live `MenuItem` nodes the engine retains.
+    ///
+    /// A host diagnostic for the native retention cycles: each live item's
+    /// destroy callback removes its node, so a count that grows across
+    /// create/drop cycles is a leak.
+    pub fn menu_node_count(&self) -> usize {
+        crate::natives::menu_item::node_count(self.services.as_ref())
+    }
+
+    /// The number of live `Timer` bindings the engine retains.
+    pub fn timer_count(&self) -> usize {
+        crate::natives::visual::timer_count(self.services.as_ref())
+    }
+
+    /// The number of live `WaveSoundBuffer` objects the engine retains.
+    pub fn sound_object_count(&self) -> usize {
+        crate::natives::sound::object_count(self.services.as_ref())
+    }
+
+    /// The number of live `AsyncTrigger` bindings the engine retains.
+    pub fn async_trigger_count(&self) -> usize {
+        crate::natives::async_trigger::trigger_count(self.services.as_ref())
+    }
+
     /// Opens the per-native dispatch-timing window (the startup sequence).
     ///
     /// Call before the startup scripts run; pair with

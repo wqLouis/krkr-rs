@@ -78,17 +78,17 @@ struct MenuNode {
     parent: Option<u64>,
     /// Child node ids, in menu order.
     children: Vec<u64>,
-    /// Retained `objthis` so `parent`/`root`/`children` hand back the real
-    /// object the script created.
-    object: Option<DetachedValue>,
     /// Retained action owner (`MenuItem` constructor argument 0); the default
     /// `onClick` handler dispatches to it.
     action_owner: Option<DetachedValue>,
     /// Retained window object (`MenuItem` constructor argument 1 when it is an
     /// object); returned by the `window` property.
     window: Option<DetachedValue>,
-    /// The raw `objthis` pointer, used to remove the instance lookup on
-    /// destroy (0 when unavailable).
+    /// The raw `objthis` pointer (reference `tTJSNI_BaseMenuItem::Owner`,
+    /// `reference/cpp/core/visual/MenuItemIntf.h:66,102`, held with no
+    /// reference). `parent`/`root`/`children`/`fireClick` retain it on demand,
+    /// so the item can reach reference count zero and finalize. It also keys
+    /// the instance lookup removed on destroy (0 when unavailable).
     self_handle: usize,
     /// Cached `children` TJS array (reference `GetChildrenArrayNoAddRef`); the
     /// same object is handed back so a held reference stays live.
@@ -110,7 +110,6 @@ impl Default for MenuNode {
             shortcut: String::new(),
             parent: None,
             children: Vec::new(),
-            object: None,
             action_owner: None,
             window: None,
             self_handle: 0,
@@ -209,6 +208,18 @@ fn emit_object_out(host: &Tjs2Engine, out: *mut Value, raw: Option<Tjs2ValueId>)
             set_null_out(host, out);
         }
     }
+}
+
+/// Retain a menu item's script object from its raw non-owning handle.
+///
+/// The reference stores only `tTJSNI_BaseMenuItem::Owner` without a reference
+/// (`reference/cpp/core/visual/MenuItemIntf.h:66,102`), so the script object
+/// can reach reference count zero and finalize; every reader retains it for
+/// the duration of the call and releases the handle afterwards.
+fn retain_handle(host: &Tjs2Engine, handle: usize) -> Option<DetachedValue> {
+    // A zero handle is the null pointer, which `retain_object_detached`
+    // rejects, yielding `None`.
+    host.retain_object_detached(handle as *mut c_void).ok()
 }
 
 /// Evaluate a TJS expression and retain the resulting object, if any.
@@ -441,13 +452,12 @@ extern "C" fn menu_item_destroy(engine: *mut c_void, instance: *mut c_void) {
 /// The VM runs this hook both for `invalidate obj` and right before object
 /// destruction (`tTJSCustomObject::Finalize` → `Invalidate`,
 /// `tjsObject.cpp:377-399`), so a destroyed parent cascades into its subtree
-/// exactly like an invalidated one. The retained `object`, `action_owner`,
-/// `window` and `children_array` are taken here and dropped *outside* the
-/// state borrow: releasing the last reference to a script object can run
-/// destructors (including this object's) that re-enter the state. Dropping
-/// `object` also breaks the script/native reference cycle — the reference
-/// keeps only a raw `Owner` pointer (`MenuItemIntf.cpp:103`), never a strong
-/// self-reference.
+/// exactly like an invalidated one. The retained `action_owner`, `window`
+/// and `children_array` are taken here and dropped *outside* the state
+/// borrow: releasing the last reference to a script object can run
+/// destructors (including this object's) that re-enter the state. The item's
+/// own `Owner` is a raw pointer (`MenuItemIntf.cpp:103`), never a strong
+/// self-reference, so nothing here roots the item itself.
 extern "C" fn menu_item_invalidate(engine: *mut c_void, instance: *mut c_void) {
     if instance.is_null() {
         return;
@@ -464,9 +474,7 @@ extern "C" fn menu_item_invalidate(engine: *mut c_void, instance: *mut c_void) {
     let services = unsafe { ctx.services() };
     // Phase 1 (state borrow held): take the retained values and unlink.
     // `Parent = nullptr` while *staying* in the parent's child list matches
-    // `MenuItemIntf.cpp:102-104` (the parent's `Release` of this item's object
-    // happens when the parent cascades or dies — here the child's own strong
-    // ref takes that role).
+    // `MenuItemIntf.cpp:102-104`.
     let (taken, children) = {
         let mut state = services.state::<MenuState>();
         let Some(node) = state.nodes.get_mut(&id) else {
@@ -478,7 +486,6 @@ extern "C" fn menu_item_invalidate(engine: *mut c_void, instance: *mut c_void) {
         node.parent = None;
         (
             (
-                node.object.take(),
                 node.action_owner.take(),
                 node.window.take(),
                 node.children_array.take(),
@@ -487,26 +494,26 @@ extern "C" fn menu_item_invalidate(engine: *mut c_void, instance: *mut c_void) {
         )
     };
     // Phase 2: cascade — `item->Owner->Invalidate(...)` for every child; the
-    // child's own hook runs, which recurses through the subtree. Children
-    // without a retained object were invalidated before.
-    let child_objects: Vec<Tjs2ValueId> = {
+    // child's own hook runs, which recurses through the subtree. The child
+    // handles are raw, so retain each one for the invalidate call and release
+    // it after.
+    let child_handles: Vec<usize> = {
         let state = services.state::<MenuState>();
         children
             .iter()
-            .filter_map(|child| {
-                state
-                    .nodes
-                    .get(child)
-                    .and_then(|node| node.object.as_ref())
-                    .map(|object| object.raw_id())
-            })
+            .filter_map(|child| state.nodes.get(child).map(|node| node.self_handle))
             .collect()
     };
-    for raw in child_objects {
-        if let Err(error) = resolved.engine().invalidate_retained(raw) {
+    let child_objects: Vec<DetachedValue> = child_handles
+        .into_iter()
+        .filter_map(|handle| retain_handle(resolved.engine(), handle))
+        .collect();
+    for object in &child_objects {
+        if let Err(error) = resolved.engine().invalidate_retained(object.raw_id()) {
             log::debug!("MenuItem.invalidate: child invalidate failed: {error}");
         }
     }
+    drop(child_objects);
     // Phase 3: dropping the retentions may run destructors (they re-enter
     // `menu_item_destroy`), so no state borrow may be held here.
     drop(taken);
@@ -598,8 +605,6 @@ extern "C" fn menu_item_ctor(
         Some(second) => (None, Some(value_as_string(second))),
         None => (None, None),
     };
-    let object = host.retain_object_detached(objthis).ok();
-
     // SAFETY: the caller resolved `ctx` from the installed binding.
     let services = unsafe { ctx.services() };
     let id = {
@@ -615,7 +620,6 @@ extern "C" fn menu_item_ctor(
                     }
                     node.action_owner = action_owner;
                     node.window = window;
-                    node.object = object;
                     node.self_handle = objthis as usize;
                 }
                 id
@@ -629,7 +633,6 @@ extern "C" fn menu_item_ctor(
                         caption: caption.unwrap_or_default(),
                         action_owner,
                         window,
-                        object,
                         self_handle: objthis as usize,
                         ..MenuNode::default()
                     },
@@ -838,25 +841,28 @@ extern "C" fn menu_item_fire_click(
     };
     // SAFETY: the caller resolved `ctx` from the installed binding.
     let services = unsafe { ctx.services() };
-    let (object, deliver) = {
+    let (handle, deliver) = {
         let state = services.state::<MenuState>();
-        let object = state
+        let handle = state
             .nodes
             .get(&id)
-            .and_then(|node| node.object.as_ref())
-            .map(|object| object.raw_id());
+            .map(|node| node.self_handle)
+            .unwrap_or(0);
         // `if(!CanDeliverEvents()) return;` (`MenuItemIntf.cpp:198-199`).
         let enabled = can_deliver(&state, id);
         // `while(!item->Window) { if(!item->Parent) break; ... }` +
         // `if(!item->Window) return;` (`MenuItemIntf.cpp:200-208`).
         let window = enabled.then(|| window_chain(&state, id)).flatten();
-        (object, window)
+        (handle, window)
     };
     let Some(window) = deliver else {
         set_void(out);
         return 0;
     };
     let host = resolved.engine();
+    // The item's `Owner` is a raw pointer (`MenuItemIntf.cpp`); retain it for
+    // the dispatch and release it when this call returns.
+    let object = retain_handle(host, handle);
     // `if(!item->Window->CanDeliverEvents()) return;`
     // (`MenuItemIntf.cpp:210-211`).
     if !window_can_deliver(host, window) {
@@ -870,8 +876,8 @@ extern "C" fn menu_item_fire_click(
     // (`MenuItemIntf.cpp:215-216`).
     let events_disabled = crate::natives::system::system_events_disabled(services);
     if !events_disabled
-        && let Some(raw) = object
-        && let Ok(self_obj) = host.duplicate_retained(raw)
+        && let Some(object) = &object
+        && let Ok(self_obj) = host.duplicate_retained(object.raw_id())
     {
         // Call the member: a script override runs directly, otherwise the
         // native `onClick` dispatches to the action owner. The state borrow
@@ -1321,17 +1327,22 @@ extern "C" fn menu_parent_get(
     };
     // SAFETY: the caller resolved `ctx` from the installed binding.
     let services = unsafe { ctx.services() };
-    let raw = {
+    let handle = {
         let state = services.state::<MenuState>();
         state
             .nodes
             .get(&id)
             .and_then(|node| node.parent)
             .and_then(|parent| state.nodes.get(&parent))
-            .and_then(|parent| parent.object.as_ref())
-            .map(|object| object.raw_id())
+            .map(|parent| parent.self_handle)
+            .unwrap_or(0)
     };
-    emit_object_out(resolved.engine(), out, raw);
+    let object = retain_handle(resolved.engine(), handle);
+    emit_object_out(
+        resolved.engine(),
+        out,
+        object.as_ref().map(DetachedValue::raw_id),
+    );
     0
 }
 
@@ -1352,7 +1363,7 @@ extern "C" fn menu_root_get(
     };
     // SAFETY: the caller resolved `ctx` from the installed binding.
     let services = unsafe { ctx.services() };
-    let raw = {
+    let handle = {
         let state = services.state::<MenuState>();
         let mut current = Some(id);
         let mut root = id;
@@ -1363,10 +1374,15 @@ extern "C" fn menu_root_get(
         state
             .nodes
             .get(&root)
-            .and_then(|node| node.object.as_ref())
-            .map(|object| object.raw_id())
+            .map(|node| node.self_handle)
+            .unwrap_or(0)
     };
-    emit_object_out(resolved.engine(), out, raw);
+    let object = retain_handle(resolved.engine(), handle);
+    emit_object_out(
+        resolved.engine(),
+        out,
+        object.as_ref().map(DetachedValue::raw_id),
+    );
     0
 }
 
@@ -1476,7 +1492,7 @@ fn refresh_children_array(
     services: &CompatServices,
     id: u64,
 ) -> Result<(), String> {
-    let (array, children) = {
+    let (array, handles) = {
         let state = services.state::<MenuState>();
         let Some(node) = state.nodes.get(&id) else {
             return Ok(());
@@ -1484,19 +1500,22 @@ fn refresh_children_array(
         let Some(array) = node.children_array.as_ref().map(|array| array.raw_id()) else {
             return Ok(());
         };
-        let children: Vec<Tjs2ValueId> = node
+        let handles: Vec<usize> = node
             .children
             .iter()
             .filter_map(|child| state.nodes.get(child))
-            .filter_map(|child| child.object.as_ref().map(|object| object.raw_id()))
+            .map(|child| child.self_handle)
             .collect();
-        (array, children)
+        (array, handles)
     };
     host.call_member(array, "clear", &[])
         .map_err(|error| format!("MenuItem.children: clear failed: {error}"))?;
-    for raw in children {
+    for handle in handles {
+        let Some(object) = retain_handle(host, handle) else {
+            continue;
+        };
         let duplicate = host
-            .duplicate_retained(raw)
+            .duplicate_retained(object.raw_id())
             .map_err(|error| format!("MenuItem.children: {error}"))?;
         let duplicate_id = duplicate.raw_id();
         host.call_member(array, "push", &[TjsValue::Retained(duplicate_id as u64)])
@@ -1633,6 +1652,14 @@ fn install_shortcut_tables(ctx: &CompatCtx) -> Result<(), CompatError> {
     state.text_to_keycode = Some(text);
     state.keycode_to_text = Some(keys);
     Ok(())
+}
+
+/// The number of live `MenuItem` nodes in the dispatch state.
+///
+/// A host diagnostic: `menu_item_destroy` removes the node, so a count that
+/// grows across create/drop cycles is a retention leak.
+pub(crate) fn node_count(services: &CompatServices) -> usize {
+    services.state::<MenuState>().nodes.len()
 }
 
 /// Register the `MenuItem` class.

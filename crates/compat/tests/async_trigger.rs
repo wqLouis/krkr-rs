@@ -281,3 +281,31 @@ fn subclass_members_before_the_base_constructor_follow_the_owner_guard() {
     env.poll();
     assert_eq!(env.eval_int("fired"), 1);
 }
+
+/// The reference native async trigger keeps only a raw `Owner` pointer
+/// (`reference/cpp/core/base/EventIntf.h:322`), so a script object reaches
+/// reference count zero and its native destroy runs, removing the
+/// `AsyncTriggerBinding`. A strong binding owner rooted the trigger, so each
+/// dropped trigger leaked its binding; the state map is the observable form of
+/// the "map size back to baseline" rule.
+#[test]
+fn dropped_async_triggers_release_their_bindings() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    let baseline = env._host.async_trigger_count();
+    env.run(
+        "for (var cycle = 0; cycle < 5; cycle++) { \
+             var t = new AsyncTrigger(function(){}, ''); \
+             t = null; \
+         }",
+    );
+    // The collector must run outside the creating frame: a separate
+    // execution's `doCompact` plus the direct GC pass.
+    env.run("System.doCompact();");
+    env.engine.do_gc().expect("idle compact");
+    assert_eq!(
+        env._host.async_trigger_count(),
+        baseline,
+        "a dropped AsyncTrigger must release its dispatch-state binding"
+    );
+}

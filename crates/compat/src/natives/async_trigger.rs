@@ -79,9 +79,11 @@ struct AsyncTriggerBinding {
     /// Member to invoke on `action`; `None` invokes `action` itself (the
     /// reference's empty action name). Defaults to `"action"`.
     action_name: Option<String>,
-    /// The object itself, for `onFire` dispatch through its class chain so a
-    /// script subclass override wins.
-    owner: Option<DetachedValue>,
+    /// The raw `objthis` handle of the object itself (reference
+    /// `tTJSNI_AsyncTrigger::Owner`, `reference/cpp/core/base/EventIntf.h:322`,
+    /// held with no reference), for `onFire` dispatch through its class chain
+    /// so a script subclass override wins. `0` means no owner was recorded.
+    owner: usize,
 }
 
 /// The `AsyncTrigger` registry: one entry per live object plus the FIFO of
@@ -122,7 +124,7 @@ impl AsyncTriggerState {
         &mut self,
         action: DetachedValue,
         action_name: Option<String>,
-        owner: Option<DetachedValue>,
+        owner: usize,
     ) -> AsyncTriggerId {
         let id = AsyncTriggerId(self.next_id);
         self.next_id = self.next_id.saturating_add(1);
@@ -368,8 +370,10 @@ extern "C" fn async_trigger_ctor(
         }
         _ => Some(DEFAULT_ACTION_NAME.to_string()),
     };
-    // The object retains itself so the poll can dispatch its `onFire` member.
-    let owner = host.retain_object_detached(objthis).ok();
+    // `Owner = tjs_obj` (`reference/cpp/core/base/EventIntf.h:322`): the
+    // object itself, held as a raw pointer with no reference so it can reach
+    // reference count zero. The poll retains it on demand.
+    let owner = objthis as usize;
     // SAFETY: `instance` is the live `AsyncTriggerInst` payload the VM allocated for this script object; `async_trigger_ctor` is its only live accessor.
     let inst = unsafe { &mut *(instance as *mut AsyncTriggerInst) };
     if inst.id.is_some() {
@@ -627,14 +631,19 @@ pub fn async_trigger_poll(ctx: &mut CompatCtx) -> Result<(), CompatError> {
     let (host, services) = unsafe { (ctx.engine(), ctx.services()) };
     let ready = services.state::<AsyncTriggerState>().take_pending();
     for id in ready {
-        // Read the owner without holding the state borrow across the call.
-        let owner = services
+        // Read the raw owner handle without holding the state borrow across
+        // the call, then retain it for the dispatch.
+        let handle = services
             .state::<AsyncTriggerState>()
             .triggers
             .get(&id)
-            .and_then(|binding| binding.owner.as_ref().map(DetachedValue::raw_id));
-        let result: Result<(), String> = match owner {
-            Some(owner) => host.call_member(owner, "onFire", &[]).map(|_| ()),
+            .map(|binding| binding.owner)
+            .unwrap_or(0);
+        // A zero handle is the null pointer, which `retain_object_detached`
+        // rejects, yielding `None`.
+        let owner = host.retain_object_detached(handle as *mut c_void).ok();
+        let result: Result<(), String> = match &owner {
+            Some(owner) => host.call_member(owner.raw_id(), "onFire", &[]).map(|_| ()),
             // Reference-equivalent fallback for an owner that could not be
             // retained: run the native `onFire` body, i.e. the action with
             // its event dictionary (no `target`, the object is unavailable).
@@ -646,6 +655,14 @@ pub fn async_trigger_poll(ctx: &mut CompatCtx) -> Result<(), CompatError> {
         }
     }
     Ok(())
+}
+
+/// The number of live `AsyncTrigger` bindings in the dispatch state.
+///
+/// A host diagnostic: the trigger's destroy callback removes the binding, so a
+/// count that grows across create/drop cycles is a retention leak.
+pub(crate) fn trigger_count(services: &CompatServices) -> usize {
+    services.state::<AsyncTriggerState>().triggers.len()
 }
 
 /// Register the `AsyncTrigger` native class.
