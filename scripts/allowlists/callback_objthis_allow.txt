@@ -1,0 +1,19 @@
+# Native callback receiver allowlist (AGENTS §0).  Enforced by
+# krkr-gate callback-objthis.
+#
+# One entry per line:  path:member — reason
+#
+#   path     repo-relative path of the file.
+#   member   the script-visible member name (matched exactly, so it survives
+#            line churn).
+#   reason   why the member legitimately does not need the caller's `objthis`,
+#            citing `reference/cpp/**` where the behaviour comes from (D30).
+#            A site is not evidence without one.
+#
+# The logging handlers are stored closures, not the member's callback
+# argument. The reference invokes each one with `FuncCall(0, nullptr, ...)`
+# on the stored closure, so the closure's own receiver is used and the static
+# `Debug.message` / `Debug.notice` caller's receiver is irrelevant.
+
+crates/compat/src/natives/debug.rs:message — the logging handler is a stored closure invoked with its own receiver (reference/cpp/core/utils/DebugIntf.cpp:132-136); the static caller's receiver is not the callback's.
+crates/compat/src/natives/debug.rs:notice — the logging handler is a stored closure invoked with its own receiver (reference/cpp/core/utils/DebugIntf.cpp:132-136); the static caller's receiver is not the callback's.

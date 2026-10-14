@@ -6,8 +6,9 @@ Usage::
 
 ``<check>`` is one of ``stateless``, ``error-handling``, ``house-style``,
 ``layering``, ``host-facts``, ``android-target``, ``surface-lock``,
-``native-parity``, ``plugin-parity``, or the ``extract-xp3`` helper. ``gate``
-runs the full ordered sequence; its ``cargo`` steps are for the main agent.
+``native-parity``, ``plugin-parity``, ``callback-objthis``, or the
+``extract-xp3`` helper. ``gate`` runs the full ordered sequence; its ``cargo``
+steps are for the main agent.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from collections.abc import Callable
 
 from .checks import (
     android_target,
+    callback_objthis,
     error_handling,
     extract_xp3,
     host_facts,
@@ -45,6 +47,7 @@ CHECKS: dict[str, Callable[[list[str]], int]] = {
     "storage-boundary": storage_boundary.run,
     "native-construction": native_construction.run,
     "storage-media": storage_media.run,
+    "callback-objthis": callback_objthis.run,
     "host-facts": host_facts.run,
     "android-target": android_target.run,
     "surface-lock": surface_lock.run,
@@ -63,6 +66,7 @@ GATE_SEQUENCE: list[tuple[str, str, str, list[str]]] = [
     ("storage-boundary", "check", "storage-boundary", []),
     ("native-construction", "check", "native-construction", []),
     ("storage-media", "check", "storage-media", []),
+    ("callback-objthis", "check", "callback-objthis", []),
     (
         "cargo clippy",
         "cargo",
@@ -122,6 +126,7 @@ Checks:
   storage-boundary script storage names that reach L2 or the host unstripped
   native-construction native instances left unconstructed at create time
   storage-media    reference storage-media domains neither served nor documented
+  callback-objthis  callback-invoking native members registered without objthis
   host-facts       host seams with no production installer
   android-target   per-target backend-feature resolution
   surface-lock     VM dispatch surface vs the committed baseline
