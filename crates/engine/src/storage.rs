@@ -224,6 +224,10 @@ struct ResolutionCache {
     read_bytes: u64,
 }
 
+/// The number of leading characters kept in the bounded `debug` storage-miss
+/// line; the rest is replaced by an elision marker naming the dropped count.
+const MISS_LOG_HEAD_CHARS: usize = 200;
+
 /// The locations a failed storage lookup searched.
 ///
 /// A lookup only records when debug logging is enabled, so a hit on the normal
@@ -261,6 +265,22 @@ impl SearchTrace {
         } else {
             self.attempts.join("; ")
         }
+    }
+
+    /// Renders at most `head_chars` leading characters followed by an elision
+    /// marker naming how many characters were dropped.
+    ///
+    /// The budget is applied per character, never per byte, so a path with
+    /// non-ASCII characters is cut only at a `char` boundary. [`Self::render`]
+    /// keeps returning the full text.
+    fn render_short(&self, head_chars: usize) -> String {
+        let full = self.render();
+        let total = full.chars().count();
+        if total <= head_chars {
+            return full;
+        }
+        let head: String = full.chars().take(head_chars).collect();
+        format!("{head}… (+{} chars)", total - head_chars)
     }
 }
 
@@ -788,11 +808,14 @@ impl Storage {
     /// unrepresentable path) is propagated as [`StorageReadError::Fs`]; neither
     /// is collapsed into "not found".
     ///
-    /// A miss logs one `debug` line naming every location tried (disk
-    /// spellings, auto-path candidates grouped by resolution shape, mounted
-    /// archives in later-first order, or the explicit `arc.xp3>path`
-    /// interpretation). A hit logs nothing, and the trace is only built when
-    /// debug logging is enabled.
+    /// A miss logs one bounded `debug` line and, when trace logging is on, the
+    /// full location list at `trace`. The `debug` line names the searched
+    /// locations (disk spellings, auto-path candidates grouped by resolution
+    /// shape, mounted archives in later-first order, or the explicit
+    /// `arc.xp3>path` interpretation) until a small character budget is
+    /// reached, then appends an elision marker with the number of dropped
+    /// characters; the `trace` line carries the complete list. A hit logs
+    /// nothing, and the trace is only built when debug logging is enabled.
     ///
     /// Storage names are case-insensitive even when the host filesystem is
     /// not. Only the storage-relative part is normalized; the mount prefix
@@ -818,7 +841,13 @@ impl Storage {
             None => {
                 self.resolution_cache.borrow_mut().probes.misses += 1;
                 if trace.enabled {
-                    log::debug!("storage miss {name:?}: {}", trace.render());
+                    log::debug!(
+                        "storage miss {name:?}: {}",
+                        trace.render_short(MISS_LOG_HEAD_CHARS)
+                    );
+                    if log::log_enabled!(log::Level::Trace) {
+                        log::trace!("storage miss {name:?}: {}", trace.render());
+                    }
                 }
             }
         }
@@ -2234,10 +2263,27 @@ mod tests {
         );
     }
 
-    /// The 41-auto-path startup shape still names every entry after the
-    /// compaction; the line is far shorter than the old per-entry format.
+    /// `render_short` cuts on a character boundary, so a non-ASCII path never
+    /// splits a UTF-8 code point; a trace within the budget is unchanged.
     #[test]
-    fn storage_miss_line_names_every_auto_path() {
+    fn render_short_never_splits_a_utf8_char() {
+        let mut trace = SearchTrace::new(true);
+        trace.attempt(|| "é".repeat(300));
+        assert_eq!(
+            trace.render_short(10),
+            format!("{}… (+290 chars)", "é".repeat(10))
+        );
+
+        let mut short = SearchTrace::new(true);
+        short.attempt(|| "ok".to_string());
+        assert_eq!(short.render_short(10), "ok");
+    }
+
+    /// The 41-auto-path startup shape still names every entry in the full
+    /// trace, while the bounded `debug` line keeps only the head and names how
+    /// much it dropped.
+    #[test]
+    fn storage_miss_line_is_bounded_and_the_trace_names_every_auto_path() {
         const AUTO_PATHS: usize = 41;
         let fs = FileSystem::memory();
         for i in 0..AUTO_PATHS {
@@ -2249,28 +2295,43 @@ mod tests {
             storage.add_auto_path(format!("ap{i:02}/"));
         }
 
+        // The full trace still names every entry after the compaction.
+        let mut trace = SearchTrace::new(true);
+        assert!(
+            storage
+                .find_recorded("missing000.txt", &mut trace)
+                .unwrap()
+                .is_none()
+        );
+        let full = trace.render();
+        for i in 0..AUTO_PATHS {
+            assert!(
+                full.contains(&format!("ap{i:02}/")),
+                "entry ap{i:02}/ is not named: {full}"
+            );
+        }
+        assert!(full.contains("ap40/missing000.txt"), "{full}");
+        assert!(full.contains("/game/missing000.txt"), "{full}");
+        assert!(
+            !full.contains("auto path \""),
+            "the per-entry boilerplate is gone: {full}"
+        );
+
+        // The `debug` line keeps a bounded head and names the dropped count.
         let (found, logs) = capture(|| storage.find("missing000.txt"));
         assert!(found.unwrap().is_none());
         let miss = logs
             .iter()
             .find(|line| line.contains("storage miss"))
             .expect("one miss line");
-
-        for i in 0..AUTO_PATHS {
-            assert!(
-                miss.contains(&format!("ap{i:02}/")),
-                "entry ap{i:02}/ is not named: {miss}"
-            );
-        }
-        assert!(miss.contains("ap40/missing000.txt"), "{miss}");
-        assert!(miss.contains("/game/missing000.txt"), "{miss}");
+        assert!(miss.contains('…'), "the debug line is bounded: {miss}");
         assert!(
-            !miss.contains("auto path \""),
-            "the per-entry boilerplate is gone: {miss}"
+            miss.contains("(+") && miss.contains(" chars)"),
+            "the dropped count is named: {miss}"
         );
         assert!(
-            miss.len() < 700,
-            "the compact miss line is still large: {miss}"
+            miss.len() < 300,
+            "the bounded miss line is still large: {miss}"
         );
     }
 }

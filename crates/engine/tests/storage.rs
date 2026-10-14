@@ -45,11 +45,15 @@ impl log::Log for CaptureLogger {
 
 /// Installs the recording sink once per test binary, clears this thread's
 /// buffer, runs `f`, and returns its result plus the thread's log lines.
+///
+/// The global level is set to `trace` so both the bounded `debug` miss line and
+/// the full `trace` miss line are visible to every test; the per-thread buffer
+/// keeps concurrently running tests from seeing each other's records.
 fn capture_logs<R>(f: impl FnOnce() -> R) -> (R, Vec<String>) {
     static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     ONCE.get_or_init(|| {
         let _ = log::set_boxed_logger(Box::new(CaptureLogger));
-        log::set_max_level(log::LevelFilter::Debug);
+        log::set_max_level(log::LevelFilter::Trace);
     });
     CAPTURED_LOGS.with(|logs| logs.borrow_mut().clear());
     let result = f();
@@ -521,8 +525,8 @@ fn archive_miss_reports_near_misses() {
     assert_eq!(found.unwrap(), None);
     let miss = logs
         .iter()
-        .find(|line| line.contains("storage miss"))
-        .expect("a miss logs one line");
+        .find(|line| line.starts_with("TRACE storage miss"))
+        .expect("a miss logs a full trace line");
     assert!(miss.contains("1 entries, 1 index section(s)"), "{miss}");
     assert!(miss.contains("system/config.tjs"), "{miss}");
     assert!(miss.contains("nearest 1/1"), "{miss}");
@@ -718,9 +722,9 @@ fn each_resolution_path_resolves_a_script_name() {
     assert_eq!(prefixed.read("Config.tjs").unwrap(), b"prefixed");
 }
 
-/// A miss logs one `debug` line naming every location searched: the disk
-/// spellings, each auto-path candidate in later-added-first order, and the
-/// mounted archives in later-first order. A hit logs nothing.
+/// A miss logs one bounded `debug` line and the full location list at `trace`:
+/// the disk spellings, each auto-path candidate in later-added-first order,
+/// and the mounted archives in later-first order. A hit logs nothing.
 #[test]
 fn miss_reports_every_searched_location() {
     let patch = build_xp3(&[("other.txt", b"x", false)]);
@@ -735,16 +739,27 @@ fn miss_reports_every_searched_location() {
         .iter()
         .filter(|line| line.contains("storage miss"))
         .collect();
-    assert_eq!(misses.len(), 1, "one line per miss: {logs:?}");
-    let miss = misses[0];
+    assert_eq!(misses.len(), 2, "a bounded line and a full line: {logs:?}");
+    let bounded = misses
+        .iter()
+        .find(|line| line.starts_with("DEBUG storage miss"))
+        .expect("a bounded debug line");
+    let full = misses
+        .iter()
+        .find(|line| line.starts_with("TRACE storage miss"))
+        .expect("a full trace line");
     assert!(
-        miss.starts_with("DEBUG storage miss \"config.tjs\""),
-        "{miss}"
+        bounded.starts_with("DEBUG storage miss \"config.tjs\""),
+        "{bounded}"
     );
-    assert!(miss.contains("disk /config.tjs"), "{miss}");
-    assert!(miss.contains("parts/config.tjs"), "{miss}");
-    assert!(miss.contains("data.xp3"), "{miss}");
-    assert!(miss.contains("/patch.xp3"), "{miss}");
+    assert!(
+        bounded.contains('…') && bounded.contains(" chars)"),
+        "the debug line is bounded: {bounded}"
+    );
+    assert!(full.contains("disk /config.tjs"), "{full}");
+    assert!(full.contains("parts/config.tjs"), "{full}");
+    assert!(full.contains("data.xp3"), "{full}");
+    assert!(full.contains("/patch.xp3"), "{full}");
 
     // A hit produces no miss line.
     let (found, logs) = capture_logs(|| storage.find("other.txt"));
@@ -776,8 +791,8 @@ fn resolver_cache_lists_each_auto_path_once() {
     assert_eq!(found.unwrap(), None);
     let miss_line = first_logs
         .iter()
-        .find(|line| line.contains("storage miss"))
-        .expect("a miss logs one line");
+        .find(|line| line.starts_with("TRACE storage miss"))
+        .expect("a miss logs a full trace line");
     assert!(miss_line.contains("parts/missing.txt"), "{miss_line}");
     assert!(miss_line.contains("data.xp3"), "{miss_line}");
     assert!(miss_line.contains("system/missing.txt"), "{miss_line}");
@@ -845,6 +860,48 @@ fn resolver_cache_probe_count_for_startup_shape() {
         "one listing per auto-path directory plus the live current-path walk: {counts:?}"
     );
     assert_eq!(counts.misses, MISSES as u64);
+}
+
+/// A miss that searched the 41-auto-path startup shape keeps the `debug` line
+/// bounded: the head is kept and the dropped character count is named, while
+/// the full list (still naming the last auto path) is available at `trace`.
+#[test]
+fn startup_miss_debug_line_is_bounded_but_trace_is_complete() {
+    const AUTO_PATHS: usize = 41;
+
+    let owned: Vec<(String, Vec<u8>)> = (0..AUTO_PATHS)
+        .map(|i| (format!("game/ap{i:02}/present.dat"), b"x".to_vec()))
+        .collect();
+    let files: Vec<(&str, &[u8])> = owned
+        .iter()
+        .map(|(path, data)| (path.as_str(), data.as_slice()))
+        .collect();
+    let fs = memory_with(&files);
+    let mut storage =
+        Storage::mount_archives(fs, "/game", std::iter::empty::<&str>()).expect("mount");
+    for i in 0..AUTO_PATHS {
+        storage.add_auto_path(format!("ap{i:02}/"));
+    }
+
+    let (found, logs) = capture_logs(|| storage.find("missing000.txt"));
+    assert_eq!(found.unwrap(), None);
+    let debug = logs
+        .iter()
+        .find(|line| line.starts_with("DEBUG storage miss"))
+        .expect("a bounded debug line");
+    let full = logs
+        .iter()
+        .find(|line| line.starts_with("TRACE storage miss"))
+        .expect("a full trace line");
+
+    assert!(debug.contains('…'), "the debug line is bounded: {debug}");
+    assert!(
+        debug.contains(" chars)"),
+        "the debug line names the dropped count: {debug}"
+    );
+    assert!(debug.len() < full.len(), "debug must be shorter than trace");
+    assert!(full.contains("ap40/missing000.txt"), "{full}");
+    assert!(full.contains("/game/missing000.txt"), "{full}");
 }
 
 /// A prefix read of a zlib entry decodes only the requested bytes: the
