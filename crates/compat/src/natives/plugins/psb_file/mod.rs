@@ -90,9 +90,6 @@ use engine::Storage;
 struct PsbFileInst {
     document: Option<PsbDocument>,
     path: Option<String>,
-    /// The `psb://…` media names this document registered, released when the
-    /// instance is reloaded, invalidated or destroyed.
-    media_keys: Vec<String>,
 }
 
 fn instance_mut<'a>(instance: *mut c_void) -> &'a mut PsbFileInst {
@@ -310,50 +307,21 @@ extern "C" fn psb_create(_engine: *mut c_void) -> *mut c_void {
     Box::into_raw(Box::new(PsbFileInst::default())) as *mut c_void
 }
 
-extern "C" fn psb_destroy(engine: *mut c_void, instance: *mut c_void) {
+extern "C" fn psb_destroy(_engine: *mut c_void, instance: *mut c_void) {
     if instance.is_null() {
         return;
     }
-    // SAFETY: `instance` came from `psb_create` and is released exactly once.
-    let inst = unsafe { &*(instance as *const PsbFileInst) };
-    release_media(engine, &inst.media_keys);
     // SAFETY: `instance` came from `psb_create` and is released exactly once.
     drop(unsafe { Box::from_raw(instance as *mut PsbFileInst) });
 }
 
-extern "C" fn psb_invalidate(engine: *mut c_void, instance: *mut c_void) {
+extern "C" fn psb_invalidate(_engine: *mut c_void, instance: *mut c_void) {
     if instance.is_null() {
         return;
     }
     let inst = instance_mut(instance);
-    release_media(engine, &inst.media_keys);
-    inst.media_keys.clear();
     inst.document = None;
     inst.path = None;
-}
-
-/// Release every `psb://…` media name this instance registered.
-///
-/// The names go through the attached storage, which owns the registration;
-/// an unbound context or missing storage has nothing to release.
-fn release_media(engine: *mut c_void, keys: &[String]) {
-    if keys.is_empty() {
-        return;
-    }
-    let Some(resolved) = resolve(engine) else {
-        return;
-    };
-    let ctx = resolved.ctx();
-    // SAFETY: the caller resolved `ctx` from the installed binding.
-    let services = unsafe { ctx.services() };
-    let Some(storage) = services.storage() else {
-        return;
-    };
-    // SAFETY: the host keeps the attached storage alive for the binding.
-    let storage = unsafe { &*storage };
-    for key in keys {
-        storage.unregister_media(key);
-    }
 }
 
 /// Load `path` through the attached storage and parse it.
@@ -382,17 +350,9 @@ fn load_document(ctx: &CompatCtx, inst: &mut PsbFileInst, path: &str) -> Result<
         .map_err(|error| error.to_string())?;
     match container::parse_stream(&bytes, 0) {
         Ok(document) => {
-            // A reload replaces the previous document's media registrations.
-            // SAFETY: the host keeps the attached storage alive for the binding.
-            let storage = unsafe { &*storage };
-            for key in &inst.media_keys {
-                storage.unregister_media(key);
-            }
-            inst.media_keys.clear();
             inst.document = Some(document);
             inst.path = Some(path.to_string());
-            inst.media_keys =
-                register_media(storage, path, inst.document.as_ref().expect("just stored"));
+            register_media(storage, path, inst.document.as_ref().expect("just stored"));
             Ok(true)
         }
         Err(error @ (PsbError::BadSignature(_) | PsbError::ArchiveNotPsb)) => {
@@ -415,12 +375,14 @@ fn load_document(ctx: &CompatCtx, inst: &mut PsbFileInst, path: &str) -> Result<
 /// container's extension (`reference/cpp/plugins/psbfile/main.cpp:60-68`,
 /// `PSBMedia.cpp:16-22`). `PSDInfo.loadPIMG` then opens those entries as
 /// `psb://<container>/<layer_id>.tlg` (`data.xp3:system/psdlayer.tjs`).
-fn register_media(storage: &Storage, path: &str, document: &PsbDocument) -> Vec<String> {
+fn register_media(storage: *mut Storage, path: &str, document: &PsbDocument) {
     let PsbValue::Dictionary(entries) = &document.root else {
-        return Vec::new();
+        return;
     };
     let container = normalize_psb_domain(path);
-    let mut keys = Vec::new();
+    // SAFETY: the caller holds the live storage pointer for the call and the
+    // registration only touches its interior-mutable media table.
+    let storage = unsafe { &*storage };
     for (key, value) in entries {
         let PsbValue::Resource(reference) = value else {
             continue;
@@ -428,11 +390,8 @@ fn register_media(storage: &Storage, path: &str, document: &PsbDocument) -> Vec<
         let Some(bytes) = document.resource_bytes(*reference) else {
             continue;
         };
-        let name = format!("psb://{container}/{key}");
         storage.register_media(format!("psb://{container}/{key}"), bytes.to_vec());
-        keys.push(name);
     }
-    keys
 }
 
 /// Reference `PSBMedia::NormalizeDomainName` (`PSBMedia.cpp:16-22`):
