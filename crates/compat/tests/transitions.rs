@@ -332,6 +332,31 @@ fn transition_names_are_matched_exactly() {
     env.run("b.beginTransition('crossfade', true, a, %[time: 100]); b.stopTransition();");
 }
 
+/// An empty method name is the KAG default (`method=""`), used by the game's
+/// `normal`/`500sec`/`300secNosync` transition entries. The reference's
+/// `TVPFindTransHandlerProvider` misses the empty key and falls back to
+/// `crossfade` (`TransIntf.cpp:331-341`), so `beginTransition("")` must
+/// start a crossfade rather than raise.
+///
+/// reference/cpp/core/visual/TransIntf.cpp:331-341
+#[test]
+fn an_empty_method_name_is_the_reference_crossfade_default() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    two_layers(&env, 2);
+    counter(&env);
+    env.run("b.beginTransition('', false, a, %[time: 100]);");
+    env.advance(100.0);
+    assert_eq!(
+        env.eval_int("hits"),
+        1,
+        "the empty-method transition completed"
+    );
+    // The crossfade endpoint is source 2 verbatim
+    // (`reference/cpp/core/visual/TransIntf.cpp:596-601`).
+    assert_eq!(env.eval_int("b.getMainPixel(0, 0)"), BLUE);
+}
+
 /// `StartTransition` refuses to begin while the layer is already in a
 /// transition (`TVPCurrentTransitionMustBeStopping`); the running
 /// transition is unaffected by the failed second call.

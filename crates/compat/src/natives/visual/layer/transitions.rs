@@ -279,6 +279,12 @@ fn main_image_size(scene: &Scene, layer: &engine::LayerState) -> Option<(u32, u3
 /// — the reference falls back to `crossfade` with a message box on a miss;
 /// a typed error here).
 ///
+/// An empty method name is the KAG default: a transition whose `method` is
+/// `""` (the `normal`/`500sec`/`300secNosync` entries in the game's
+/// `transitions` table) resolves to the reference's `crossfade` fallback,
+/// so it maps to [`TransKind::CrossFade`] rather than being treated as an
+/// unknown name.
+///
 /// Defaults are the reference's (`wave.cpp:327-331`, `mosaic.cpp:436-445`,
 /// `turn.cpp:555-563`, `rotatetrans.cpp:183-193,284-291,453-465`,
 /// `ripple.cpp:1574-1627`); every option is read through
@@ -297,7 +303,10 @@ fn build_transition(
     dest_size: Option<(u32, u32)>,
 ) -> Result<Trans, String> {
     match name {
-        "crossfade" | "fade" => Trans::cross_fade(duration).map_err(|error| error.to_string()),
+        // `""` is the KAG default method; `TVPFindTransHandlerProvider`
+        // misses the empty key and falls back to `crossfade`
+        // (`reference/cpp/core/visual/TransIntf.cpp:331-341`).
+        "crossfade" | "fade" | "" => Trans::cross_fade(duration).map_err(|error| error.to_string()),
         "scroll" | "slide" | "push" => {
             let from = scroll_from(host, options)?;
             let stay = scroll_stay(host, options)?;
