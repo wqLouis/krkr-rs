@@ -9,12 +9,14 @@
 //! reference still forwards them to the constructor's action owner, and only
 //! the disabled playback build never posts them from a timer.
 //!
-//! The two classes register the same member set and differ only in the
-//! `volume` getter: the MIDI native calls the base `GetVolume()` (which the
-//! disabled implementation overrides to return `0`), while the CD-DA getter
-//! is compiled out and leaves the result untouched (script `void`). `volume2`
-//! is `0` for both, and `status` is the base `GetStatusString()` of a buffer
-//! that never left `ssUnload`, i.e. `"unload"`.
+//! The two classes register the same playback surface and differ in the
+//! `volume` getter, the source acquisition, and `MIDISoundBuffer.midiOut` (an
+//! instance member only the MIDI class has). The MIDI `volume` native calls
+//! the base `GetVolume()` (which the disabled implementation overrides to
+//! return `0`), while the CD-DA getter is compiled out and leaves the result
+//! untouched (script `void`). `volume2` is `0` for both, and `status` is the
+//! base `GetStatusString()` of a buffer that never left `ssUnload`, i.e.
+//! `"unload"`.
 //!
 //! No object owns a mixer channel, decoder or playback device: the classes
 //! are constructed and queried, never played.
@@ -23,9 +25,9 @@
 use std::ffi::{c_char, c_int, c_void};
 
 use tjs::{
-    DetachedValue, NativeCreateInstanceFn, NativeInstanceBuilder, NativeInstanceMethodDef,
-    NativeInstancePropertyDef, NativeMethodDef, NativeStaticMembers, RetainedValue, Tjs2Engine,
-    TjsValue, VAL_INTEGER, VAL_REAL, VAL_STRING, VAL_VOID, Value,
+    DetachedValue, NativeCreateInstanceFn, NativeInstanceBuilder, NativeInstanceMembers,
+    NativeInstanceMethodDef, NativeInstancePropertyDef, NativeObjThisMethodDef, RetainedValue,
+    Tjs2Engine, TjsValue, VAL_INTEGER, VAL_REAL, VAL_STRING, VAL_VOID, Value,
 };
 
 use crate::native_util::{args, report_error, set_int, set_void, value_as_string};
@@ -36,7 +38,8 @@ use crate::{CompatCtx, CompatError};
 // Which disc class an instance belongs to
 // ---------------------------------------------------------------------------
 
-/// The two classes differ only in source acquisition and their extra static.
+/// The two classes differ only in source acquisition and their extra member
+/// (`midiOut` on the MIDI class).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Cdda,
@@ -614,15 +617,21 @@ extern "C" fn disc_volume2_set(
 }
 
 // ---------------------------------------------------------------------------
-// Static members
+// Instance members
 // ---------------------------------------------------------------------------
 
 /// `MIDISoundBuffer.midiOut(data)`: push raw MIDI bytes to the output device.
 ///
-/// With `TVP_ENABLE_MIDI` undefined the body is a no-op: after the arity
-/// check the call returns void (`MIDIImpl.cpp:978-993`).
+/// The reference registers this with `TJS_END_NATIVE_METHOD_DECL_OUTER` on the
+/// class object without `TJS_STATICMEMBER` (`MIDIImpl.cpp:978-993`), so it is a
+/// non-static (instance) member (`TJS_END_NATIVE_STATIC_METHOD_DECL_OUTER`
+/// would have made it static). Its body never calls `TJS_GET_NATIVE_INSTANCE`,
+/// so it is attached as an objthis-only member: callable on both the class
+/// object and an instance, exactly like the reference. With `TVP_ENABLE_MIDI`
+/// undefined the body is a no-op: after the arity check the call returns void.
 extern "C" fn midi_out(
     _engine: *mut c_void,
+    _objthis: *mut c_void,
     argc: c_int,
     argv: *const Value,
     out: *mut Value,
@@ -736,9 +745,11 @@ fn instance_builder(
 pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
     ctx.register_instance(&instance_builder("CDDASoundBuffer", cdda_create))?;
     ctx.register_instance(&instance_builder("MIDISoundBuffer", midi_create))?;
-    ctx.register_static_members(&NativeStaticMembers {
+    // `midiOut` is the MIDI class's extra non-static member; the class must
+    // exist before the member is attached.
+    ctx.register_instance_members(&NativeInstanceMembers {
         class_name: "MIDISoundBuffer",
-        methods: vec![NativeMethodDef {
+        methods: vec![NativeObjThisMethodDef {
             name: "midiOut",
             f: midi_out,
         }],

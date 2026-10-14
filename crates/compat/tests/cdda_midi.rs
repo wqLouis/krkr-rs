@@ -229,8 +229,12 @@ fn open_and_fade_require_their_arguments() {
     }
 }
 
-/// `MIDISoundBuffer.midiOut` is the reference's disabled static: an arity
-/// check then `TJS_S_OK` (`reference/cpp/core/sound/win32/MIDIImpl.cpp:978-993`).
+/// `MIDISoundBuffer.midiOut` is a non-static instance member: the reference
+/// registers it on the class object with `TJS_END_NATIVE_METHOD_DECL_OUTER`
+/// (no `TJS_STATICMEMBER`) and its body never calls `TJS_GET_NATIVE_INSTANCE`
+/// (`reference/cpp/core/sound/win32/MIDIImpl.cpp:978-993`). The port attaches it
+/// as an objthis-only member, so the class-object call resolves through the
+/// objthis dispatch; the body is an arity check then `TJS_S_OK`.
 #[test]
 fn midi_out_is_a_no_op_when_midi_is_disabled() {
     let _lock = vm_lock();

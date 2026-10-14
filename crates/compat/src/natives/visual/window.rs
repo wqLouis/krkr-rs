@@ -7,7 +7,7 @@ use std::ffi::{c_char, c_int, c_void};
 use engine::input::InputState;
 use tjs::{
     DetachedValue, NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef,
-    RetainedValue, Tjs2Engine, TjsValue, Value,
+    NativePropertyDef, NativeStaticMembers, RetainedValue, Tjs2Engine, TjsValue, Value,
 };
 
 use super::common::{
@@ -1241,13 +1241,13 @@ extern "C" fn window_ignored_prop_set(
     0
 }
 
-/// `Window.mainWindow` — the scene's first window object (`TVPMainWindow`).
+/// `Window.mainWindow` (static) — the scene's first window object
+/// (`TVPMainWindow`). It is a static member of the reference `Window` class,
+/// so it lives on the class object and is read as `global.Window.mainWindow`.
 extern "C" fn window_main_window_get(
     engine: *mut c_void,
-    _instance: *mut c_void,
     out: *mut Value,
     out_error: *mut *mut c_char,
-    _objthis: *mut c_void,
 ) -> c_int {
     let Ok((resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Window.mainWindow: compat context is not bound");
@@ -2591,11 +2591,6 @@ pub(super) fn register_window_class(ctx: &mut CompatCtx) -> Result<(), CompatErr
                 set: Some(window_trap_key_set),
             },
             NativeInstancePropertyDef {
-                name: "mainWindow",
-                get: Some(window_main_window_get),
-                set: None,
-            },
-            NativeInstancePropertyDef {
                 name: "focusedLayer",
                 get: Some(window_focused_layer_get),
                 set: Some(window_focused_layer_set),
@@ -2669,7 +2664,19 @@ pub(super) fn register_window_class(ctx: &mut CompatCtx) -> Result<(), CompatErr
                 set: None,
             },
         ],
-    })
+    })?;
+    // `mainWindow` is a static member of the reference `Window` class, so it
+    // is attached to the class object rather than copied onto instances.
+    ctx.register_static_members(&NativeStaticMembers {
+        class_name: "Window",
+        methods: Vec::new(),
+        properties: vec![NativePropertyDef {
+            name: "mainWindow",
+            get: Some(window_main_window_get),
+            set: None,
+        }],
+    })?;
+    Ok(())
 }
 
 #[cfg(test)]

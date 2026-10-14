@@ -233,6 +233,43 @@ fn host_fact_properties_round_trip() {
     assert_eq!(env.eval_real("w.touchRotateThreshold"), 2.25);
 }
 
+/// The shipped `msghack.tjs` `CustomMessageLayer.MessageLineLayer` getter
+/// reads `global.Window.mainWindow` to decide whether a layer belongs to the
+/// main window. `mainWindow` is the one static property of the reference
+/// `Window` class, so the read resolves on the class object and must not go
+/// through the per-instance native payload; registering it as an instance
+/// member made it raise `native instance property read on an object that is
+/// not an instance of this native class`.
+/// reference/cpp/core/visual/WindowIntf.cpp:1737-1751
+#[test]
+fn main_window_is_readable_on_the_window_class_object() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run("var w = new Window(); w.width = 640;");
+
+    // The `global.Window.mainWindow` read the game's property getter makes.
+    assert_eq!(env.eval_int("global.Window.mainWindow === w"), 1);
+
+    // The real shape: a script property getter that reads the static member.
+    env.run(
+        "class Probe { \
+             property main { \
+                 getter() { return global.Window.mainWindow; } \
+             } \
+             function Probe() {} \
+         } \
+         var probe = new Probe(); \
+         var seen = probe.main;",
+    );
+    assert_eq!(env.eval_int("seen === w"), 1);
+
+    // A static member is not copied onto instances.
+    assert!(
+        env.eval("w.mainWindow").is_err(),
+        "Window.mainWindow is static, not an instance member"
+    );
+}
+
 #[test]
 fn win32_host_facts_return_plausible_values() {
     let _lock = vm_lock();

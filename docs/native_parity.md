@@ -46,7 +46,7 @@ Members and class objects attached to an already-built class object. `kind` is `
 | `WaveSoundBuffer` | `PhaseVocoder` | unknown | true | `propset` |
 | `Window` | `BasicDrawDevice` | unknown | true | `propset` |
 | `Window` | `PassThroughDrawDevice` | unknown | true | `propset` |
-| `Window` | `menu` | unknown | true | `propset` |
+| `Window` | `menu` | unknown | false | `propset` |
 
 ## Registration sites with a runtime-built name
 
@@ -115,6 +115,7 @@ These builders have no native C++ counterpart in `reference/cpp/core` (TJS-level
 ## Extraction notes and remaining blind spots
 
 - Reference members come from `TJS_BEGIN_NATIVE_(STATIC_)METHOD/PROP_DECL` blocks, `TJS_END_NATIVE_CONSTRUCTOR_DECL`, and class-object members installed with `PropSet`/`PropSetByNum` on a variable bound by `TVPCreateNativeClass_*`/`registerObject`.
+- The class-object (`TJS_STATICMEMBER`) kind comes from the `TJS_END_NATIVE_STATIC_*` closing macro or a trailing `/* static */` comment; a `PropSet` kind comes from the `TJS_STATICMEMBER` flag in the mode argument.
 - The Rust side is read from the builders in `RUST_CLASS_MAP`, plus `attach_class(ctx, "Target", "Member")` and a class member assigned inside an `exec_script` string, so a class attached after construction is not a false missing.
 - A `PropSet` name that is not a string literal is not counted (see the runtime-built-name section): a name built at runtime cannot be recovered from source, and a coverage figure that silently dropped it would read as evidence it does not exist.
 - A `PropSet` on an *instance* object (`this`, a dictionary, a method parameter) is not a class member and is deliberately not counted; only class-object receivers are members of the class surface.
@@ -127,5 +128,13 @@ A reference property declared with `TJS_BEGIN_NATIVE_PROP_DECL` must expose the 
 
 - missing accessors: 0
 - extra accessors: 0
+
+_None._
+
+## Static/instance kind parity
+
+A reference member that lives on the class object (`TJS_STATICMEMBER`) must be registered by Rust on the class object, and an instance member on the instance; the reverse dispatches the wrong native callback shape (the `Window.mainWindow` crash). `scripts/allowlists/native_parity_static_allow.txt` records accepted exceptions.
+
+- mismatches: 0
 
 _None._

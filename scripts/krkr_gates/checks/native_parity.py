@@ -36,21 +36,30 @@ How it works (short version)
   reference-writable one whose def has no ``set``, fails the check (the
   ``Layer.imageWidth`` shape); a Rust accessor the reference denies is
   reported as *extra* and fails the same way.
+* Static-kind parity: a reference class-object member (``TJS_STATICMEMBER``,
+  marked by a ``TJS_END_NATIVE_STATIC_*`` closing macro or a trailing
+  ``/* static */`` comment) must be registered by Rust on the class object,
+  and an instance member on the instance; the reverse dispatches the wrong
+  native callback shape (the ``Window.mainWindow`` crash).  A member whose
+  Rust kind the reader cannot see is skipped.
 
 Ratchet
 -------
 ``scripts/allowlists/native_parity_allow.txt`` lists the currently accepted missing
 members (one ``Class.member`` per line);
 ``scripts/allowlists/native_parity_props_allow.txt`` lists the currently accepted
-accessor mismatches (one ``Class.property`` per line).  The checker fails when
-a *new* one appears, and reports an allowlisted entry that no longer applies
-as stale so the list can shrink.
+accessor mismatches (one ``Class.property`` per line);
+``scripts/allowlists/native_parity_static_allow.txt`` lists the currently
+accepted static/instance kind mismatches (one ``Class.member`` per line).  The
+checker fails when a *new* one appears, and reports an allowlisted entry that
+no longer applies as stale so the list can shrink.
 
 Usage
 -----
     uv run --project scripts krkr-gate native-parity                 # check + regenerate report
     uv run --project scripts krkr-gate native-parity --update-allow  # refresh the member allowlist
     uv run --project scripts krkr-gate native-parity --update-props-allow  # refresh the accessor allowlist
+    uv run --project scripts krkr-gate native-parity --update-static-allow  # refresh the static-kind allowlist
     uv run --project scripts krkr-gate native-parity --no-doc        # skip docs/native_parity.md
     uv run --project scripts krkr-gate native-parity --quiet         # only print failures
     uv run --project scripts krkr-gate native-parity --self-test     # extractor fixture self-test
@@ -78,6 +87,7 @@ from ..common import ALLOWLISTS_DIR, REPO_ROOT
 REFERENCE_GLOB = "reference/cpp/core/**/*.cpp"
 ALLOWLIST_PATH = ALLOWLISTS_DIR / "native_parity_allow.txt"
 PROPS_ALLOWLIST_PATH = ALLOWLISTS_DIR / "native_parity_props_allow.txt"
+STATIC_ALLOWLIST_PATH = ALLOWLISTS_DIR / "native_parity_static_allow.txt"
 DOC_PATH = REPO_ROOT / "docs" / "native_parity.md"
 FIXTURES_DIR = REPO_ROOT / "scripts" / "fixtures" / "parity"
 
@@ -285,12 +295,25 @@ _CPP_PROP_BEGIN_RE = re.compile(
 )
 # A property block closes with one of four DECL spellings; the getter/setter
 # blocks inside it close with ``TJS_END_NATIVE_PROP_GETTER`` / ``_SETTER`` and
-# must not end the property.
-_CPP_PROP_END_RE = re.compile(r"TJS_END_NATIVE_(?:STATIC_)?PROP_DECL(?:_OUTER)?")
+# must not end the property.  The optional ``STATIC_`` is the flag that makes
+# the member class-level (``TJS_STATICMEMBER``).
+_CPP_PROP_END_RE = re.compile(r"TJS_END_NATIVE_(STATIC_)?PROP_DECL(?:_OUTER)?")
 _CPP_PROP_GETTER_RE = re.compile(r"TJS_BEGIN_NATIVE_PROP_GETTER")
 _CPP_PROP_SETTER_RE = re.compile(r"TJS_BEGIN_NATIVE_PROP_SETTER")
+# A method block closes with a (possibly``HIDDEN_``/``_OUTER``) END macro; the
+# ``STATIC_`` spelling is the class-level flag, mirroring the property end.
+_CPP_METHOD_END_RE = re.compile(
+    r"TJS_END_NATIVE_(STATIC_)?(?:HIDDEN_)?METHOD_DECL(?:_OUTER)?"
+)
 _CPP_CTOR_END_RE = re.compile(
-    r"TJS_END_NATIVE_(?:STATIC_)?CONSTRUCTOR_DECL\s*\(\s*([A-Za-z_]\w*)\s*\)"
+    r"TJS_END_NATIVE_(STATIC_)?CONSTRUCTOR_DECL\s*\(\s*([A-Za-z_]\w*)\s*\)"
+)
+# The reference occasionally marks a class-object member with a trailing
+# comment instead of a macro spelling (``Window.mainWindow``,
+# ``WaveSoundBuffer.freeDirectSound``).  The argument may carry its own
+# ``/*func. name*/`` comment, so it is stripped when the name is recovered.
+_CPP_STATIC_DECL_COMMENT_RE = re.compile(
+    r"TJS_BEGIN_NATIVE_(METHOD|PROP)_DECL\s*\(([^()]*)\)\s*/\*\s*static\s*\*/"
 )
 _CPP_END_MEMBERS_RE = re.compile(r"TJS_END_NATIVE_MEMBERS")
 _CPP_DEFINE_RE = re.compile(r"^\s*#\s*define\s+([A-Za-z_]\w*)")
@@ -391,6 +414,39 @@ def _strip_cpp_comments(src: str) -> str:
     return "".join(out)
 
 
+def _normalize_static_decl_comments(src: str) -> str:
+    """Rewrite the ``..._DECL(name) /* static */`` comment form to a macro.
+
+    A few reference class-object members are marked static with a trailing
+    comment rather than a macro spelling (``Window.mainWindow``,
+    ``WaveSoundBuffer.freeDirectSound``).  Rewriting the declaration to
+    ``TJS_BEGIN_NATIVE_STATIC_*_DECL`` lets the reader key static-ness on the
+    macro name uniformly.  An argument that is not a plain identifier is left
+    untouched.
+    """
+
+    def repl(m: re.Match) -> str:
+        kind = m.group(1)
+        arg = re.sub(r"/\*.*?\*/", " ", m.group(2), flags=re.DOTALL).strip()
+        if not re.fullmatch(r"[A-Za-z_]\w*", arg):
+            return m.group(0)
+        return f"TJS_BEGIN_NATIVE_STATIC_{kind}_DECL({arg})"
+
+    return _CPP_STATIC_DECL_COMMENT_RE.sub(repl, src)
+
+
+def _mask_cpp_source(raw: str) -> str:
+    """Preprocess, normalize the static-comment form, then strip comments."""
+    return _strip_cpp_comments(_normalize_static_decl_comments(_preprocess_cpp(raw)))
+
+
+def _cpp_end_is_static(src: str, m: re.Match) -> bool:
+    """Whether the declaration's closing macro carries ``TJS_STATICMEMBER``."""
+    end_re = _CPP_METHOD_END_RE if m.group(2) == "METHOD" else _CPP_PROP_END_RE
+    end = end_re.search(src, m.end())
+    return end is not None and end.group(1) is not None
+
+
 def _match_brace(src: str, open_pos: int) -> int:
     """Return the index just past the ``}`` matching ``{`` at ``open_pos``."""
     depth = 0
@@ -478,11 +534,13 @@ def collect_propset_members(
 
     ``bindings`` maps a class-object variable to its TJS class name.  A
     ``var->PropSet(TJS_MEMBERENSURE, TJS_W("name"), ...)`` call on a bound
-    variable installs a class member; ``TJS_STATICMEMBER`` makes the static
-    kind explicit, but the member is class-level either way.  A name that is
-    not a string literal (``something.c_str()``, a loop variable, ...) cannot
-    be recovered and is returned in the second list so it is counted as an
-    unsupported site rather than silently dropped.
+    variable installs a class member; the ``TJS_STATICMEMBER`` flag in the
+    mode argument marks it as class-object-only, exactly like the macro
+    spelling, so the flag (not just the receiver being a class object)
+    decides the static kind.  A name that is not a string literal
+    (``something.c_str()``, a loop variable, ...) cannot be recovered and is
+    returned in the second list so it is counted as an unsupported site
+    rather than silently dropped.
     """
     members: dict[str, dict[str, MemberInfo]] = {}
     unrecoverable: list[str] = []
@@ -503,7 +561,7 @@ def collect_propset_members(
             continue
         info = MemberInfo(
             kind="unknown",
-            static=True,
+            static="TJS_STATICMEMBER" in args[0],
             mechanism="propset" if method == "PropSet" else "propset-bynum",
         )
         members.setdefault(cls, {})[name] = info
@@ -600,20 +658,26 @@ def parse_cpp_source_surface(
             pair = prop_accessors.get(m.start())
             if pair is not None:
                 get, set_ = pair
+        static = m.group(1) is not None or _cpp_end_is_static(src, m)
         _set_member(
             surface,
             cls,
             name,
-            MemberInfo(kind, m.group(1) is not None, "native-macro", get, set_),
+            MemberInfo(kind, static, "native-macro", get, set_),
         )
 
     # Constructor registrations expose a member named after the class.
     for m in _CPP_CTOR_END_RE.finditer(src):
-        name = m.group(1)
+        name = m.group(2)
         cls = enclosing(m.start())
         if cls is None:
             continue
-        _set_member(surface, cls, name, MemberInfo("constructor", False, "constructor"))
+        _set_member(
+            surface,
+            cls,
+            name,
+            MemberInfo("constructor", m.group(1) is not None, "constructor"),
+        )
 
     # Class-object registrations performed after the class is built.
     ps_members, ps_unrecoverable = collect_propset_members(
@@ -633,7 +697,7 @@ def parse_reference_surface() -> tuple[dict[str, dict[str, MemberInfo]], list[st
     files = sorted(glob.glob(str(REPO_ROOT / REFERENCE_GLOB), recursive=True))
     for fp in files:
         raw = Path(fp).read_text(encoding="utf-8", errors="replace")
-        src = _strip_cpp_comments(_preprocess_cpp(raw))
+        src = _mask_cpp_source(raw)
         file_surface, file_unrecoverable = parse_cpp_source_surface(src)
         for cls, entries in file_surface.items():
             for name, info in entries.items():
@@ -1048,27 +1112,31 @@ def _const_strings(code: str, strings: dict[int, tuple[int, str, int]]) -> dict[
     return out
 
 
-def _builder_spans(
+def _builder_spans_with_kind(
     code: str,
     strings: dict[int, tuple[int, str, int]],
     raw: str,
-) -> list[tuple[int, int, str, "int | None"]]:
-    """Return ``(start, end, class_name, name_literal_off)`` per builder.
+) -> list[tuple[int, int, str, "int | None", bool]]:
+    """Return ``(start, end, class_name, name_literal_off, is_static)`` per builder.
 
     The builder's own ``name:`` literal offset is returned so it can be
     excluded from member extraction: it is the class object (the constructor),
     not a script-callable member.  ``main`` drops the class-name entry from
-    both the reference and Rust sets for the same reason.
+    both the reference and Rust sets for the same reason.  ``is_static`` is
+    true for ``NativeClassBuilder`` / ``NativeStaticMembers`` (class-object
+    members) and false for ``NativeInstanceBuilder`` /
+    ``NativeInstanceMembers`` (instance members).
     """
-    spans: list[tuple[int, int, str, "int | None"]] = []
+    spans: list[tuple[int, int, str, "int | None", bool]] = []
     consts = _const_strings(code, strings)
     for m in re.finditer(
-        r"Native(?:Instance|Class)Builder\s*\{"
-        r"|Native(?:Static|Instance)Members\s*\{",
+        r"Native(Class|Instance)Builder\s*\{"
+        r"|Native(Static|Instance)Members\s*\{",
         code,
     ):
         open_pos = code.index("{", m.start())
         end = _match_brace(code, open_pos)
+        is_static = m.group(1) == "Class" or m.group(2) == "Static"
         # Read the builder's own `name:` field from the *original* text (the
         # literal contents are blanked in `code`); fall back to a const
         # identifier (gdiplus uses APPEARANCE_CLASS).
@@ -1086,8 +1154,22 @@ def _builder_spans(
             elif m_id:
                 cls = consts.get(m_id.group(1))
         if cls:
-            spans.append((open_pos, end, cls, name_lit))
+            spans.append((open_pos, end, cls, name_lit, is_static))
     return spans
+
+
+def _builder_spans(
+    code: str,
+    strings: dict[int, tuple[int, str, int]],
+    raw: str,
+) -> list[tuple[int, int, str, "int | None"]]:
+    """The builder spans without the static kind (see `_builder_spans_with_kind`)."""
+    return [
+        (start, end, cls, name_lit)
+        for start, end, cls, name_lit, _static in _builder_spans_with_kind(
+            code, strings, raw
+        )
+    ]
 
 
 def _def_function_ranges(code: str) -> list[tuple[int, int]]:
@@ -1144,19 +1226,24 @@ def parse_rust_file(
 ) -> tuple[
     dict[str, set[str]],
     dict[str, dict[str, tuple[bool | None, bool | None]]],
+    dict[str, dict[str, "bool | None"]],
     list[str],
 ]:
-    """Parse one Rust file into members, property accessors and unrecoverable sites.
+    """Parse one Rust file into members, accessors, static kinds and sites.
 
-    Returns ``(members, accessors, unrecoverable)`` where ``members`` is
-    ``{builder_class_name: {member, ...}}`` and ``accessors`` is
+    Returns ``(members, accessors, static_kinds, unrecoverable)`` where
+    ``members`` is ``{builder_class_name: {member, ...}}``, ``accessors`` is
     ``{builder_class_name: {property: (get, set)}}`` for the
-    ``Native*PropertyDef`` literals.  A file that does not exist yet (a native
-    family not started) contributes no members rather than failing: the
-    coverage report then shows it as unimplemented, which is the point.
+    ``Native*PropertyDef`` literals, and ``static_kinds`` is
+    ``{builder_class_name: {member: True/False/None}}`` with ``True`` for a
+    class-object (static) member, ``False`` for an instance member, and ``None``
+    when the source does not reveal it (a helper def vector).  A file that does
+    not exist yet (a native family not started) contributes no members rather
+    than failing: the coverage report then shows it as unimplemented, which is
+    the point.
     """
     if not path.is_file():
-        return {}, {}, []
+        return {}, {}, {}, []
     raw = path.read_text(encoding="utf-8", errors="replace")
     code, strings = _lex_rust(raw)
     macro_spans = _macro_rule_ranges(code)
@@ -1175,7 +1262,21 @@ def parse_rust_file(
 
     result: dict[str, set[str]] = {}
     accessors: dict[str, dict[str, tuple[bool | None, bool | None]]] = {}
-    for start, end, cls, name_lit in _builder_spans(code, strings, raw):
+    static_kinds: dict[str, dict[str, "bool | None"]] = {}
+
+    def record_static(cls: str, names: set[str], is_static: bool) -> None:
+        """Record each member's class-object/instance kind, keeping conflicts unknown."""
+        dest = static_kinds.setdefault(cls, {})
+        for name in names:
+            if name not in dest:
+                dest[name] = is_static
+            elif dest[name] != is_static:
+                # The same name reached via both kinds: not statically decidable.
+                dest[name] = None
+
+    for start, end, cls, name_lit, is_static in _builder_spans_with_kind(
+        code, strings, raw
+    ):
         members = _extract_members(
             code,
             strings,
@@ -1227,10 +1328,13 @@ def parse_rust_file(
 
         result.setdefault(cls, set()).update(members)
         accessors.setdefault(cls, {}).update(props)
+        record_static(cls, members, is_static)
 
     # Helper functions returning a def vector (`fn method_defs() -> Vec<..>`),
     # collected under ``__defs__`` so a class mapped with ``builder=None``
-    # unions them (used when a class is split across files).
+    # unions them (used when a class is split across files).  The def type can
+    # be instance or static, but the helper does not name the class, so the
+    # kind stays undecidable (``None``) and the static check skips it.
     result.setdefault("__defs__", set()).update(
         _def_function_members(code, strings, raw)
     )
@@ -1243,10 +1347,11 @@ def parse_rust_file(
     # `instance_builder("CDDASoundBuffer", ..)`: attribute the builder's
     # members to each literal class name at the call site.
     for m in re.finditer(
-        r"fn\s+([A-Za-z_]\w*)\s*\([^)]*\)\s*->\s*Native(?:Instance|Class)Builder",
+        r"fn\s+([A-Za-z_]\w*)\s*\([^)]*\)\s*->\s*Native(Instance|Class)Builder",
         code,
     ):
         fname = m.group(1)
+        factory_static = m.group(2) == "Class"
         open_pos = code.find("{", m.end())
         if open_pos == -1:
             continue
@@ -1260,8 +1365,9 @@ def parse_rust_file(
         ):
             result.setdefault(call.group(1), set()).update(bmembers)
             accessors.setdefault(call.group(1), {}).update(bprops)
+            record_static(call.group(1), bmembers, factory_static)
 
-    return result, accessors, unrecoverable
+    return result, accessors, static_kinds, unrecoverable
 
 
 _RUNTIME_ATTACH_RE = re.compile(
@@ -1270,7 +1376,7 @@ _RUNTIME_ATTACH_RE = re.compile(
 _SCRIPT_MEMBER_RE = re.compile(r"([A-Za-z_]\w*)\.([A-Za-z_]\w*)\s*=")
 
 
-def parse_runtime_class_attachments() -> dict[str, set[str]]:
+def parse_runtime_class_attachments() -> dict[str, dict[str, "bool | None"]]:
     """Class members the port installs after the class object is built.
 
     Two shapes the builder reader cannot see are recognised:
@@ -1278,10 +1384,12 @@ def parse_runtime_class_attachments() -> dict[str, set[str]]:
     ``Window``) and a class-member assignment inside an ``exec_script`` string
     (``WaveSoundBuffer.PhaseVocoder = ...``).  Only targets that are tracked
     classes are kept, so ordinary script assignments (``t.fontSize = ...``)
-    are ignored.
+    are ignored.  ``attach_class`` attaches a class-object member, so it is
+    static; a script assignment's kind is not visible from the source and is
+    left undecidable (``None``).
     """
     tracked = set(RUST_CLASS_MAP) | set(RUST_ONLY_CLASS_MAP)
-    out: dict[str, set[str]] = {}
+    out: dict[str, dict[str, "bool | None"]] = {}
     root = REPO_ROOT / "crates" / "compat" / "src" / "natives"
     if not root.is_dir():
         return out
@@ -1292,12 +1400,12 @@ def parse_runtime_class_attachments() -> dict[str, set[str]]:
         for m in _RUNTIME_ATTACH_RE.finditer(code_no_comment):
             target, member = m.group(1), m.group(2)
             if target in tracked:
-                out.setdefault(target, set()).add(member)
+                out.setdefault(target, {})[member] = True
         for _off, (_end, content, _quote) in strings.items():
             for m in _SCRIPT_MEMBER_RE.finditer(content):
                 target, member = m.group(1), m.group(2)
                 if target in tracked:
-                    out.setdefault(target, set()).add(member)
+                    out.setdefault(target, {}).setdefault(member, None)
     return out
 
 
@@ -1305,23 +1413,27 @@ def parse_rust() -> tuple[
     dict[str, set[str]],
     dict[str, dict[str, tuple[bool | None, bool | None]]],
     dict[str, list[str]],
+    dict[str, dict[str, "bool | None"]],
     list[str],
 ]:
     """Parse all mapped Rust files.
 
-    Returns ``(class_members, class_accessors, class_sources, unrecoverable)``.
+    Returns ``(class_members, class_accessors, class_sources,
+    class_static_kinds, unrecoverable)``.
     """
     cache: dict[
         str,
         tuple[
             dict[str, set[str]],
             dict[str, dict[str, tuple[bool | None, bool | None]]],
+            dict[str, dict[str, "bool | None"]],
             list[str],
         ],
     ] = {}
     class_members: dict[str, set[str]] = {}
     class_accessors: dict[str, dict[str, tuple[bool | None, bool | None]]] = {}
     class_sources: dict[str, list[str]] = {}
+    class_static_kinds: dict[str, dict[str, "bool | None"]] = {}
     rust_unrecoverable: list[str] = []
 
     def get_file(
@@ -1329,6 +1441,7 @@ def parse_rust() -> tuple[
     ) -> tuple[
         dict[str, set[str]],
         dict[str, dict[str, tuple[bool | None, bool | None]]],
+        dict[str, dict[str, "bool | None"]],
         list[str],
     ]:
         if rel not in cache:
@@ -1347,29 +1460,59 @@ def parse_rust() -> tuple[
                 "renamed/moved; update RUST_CLASS_MAP."
             )
         for rel, builder in specs:
-            parsed, parsed_accessors, parsed_unrecoverable = get_file(rel)
+            (
+                parsed,
+                parsed_accessors,
+                parsed_static,
+                parsed_unrecoverable,
+            ) = get_file(rel)
             rust_unrecoverable.extend(parsed_unrecoverable)
             sources.append(rel + (f"#{builder}" if builder else ""))
+
+            def merge_static(static_map: dict[str, "bool | None"]) -> None:
+                dest = class_static_kinds.setdefault(cls, {})
+                for name, kind in static_map.items():
+                    if name not in dest:
+                        dest[name] = kind
+                    elif kind is not None and dest[name] != kind:
+                        # A name coming from both kinds is not statically decidable.
+                        dest[name] = None
+
             if builder is None:
                 for _, mset in parsed.items():
                     members |= mset
                 for _, props in parsed_accessors.items():
                     accessors.update(props)
+                for _, static_map in parsed_static.items():
+                    merge_static(static_map)
             else:
                 members |= parsed.get(builder, set())
                 accessors.update(parsed_accessors.get(builder, {}))
+                merge_static(parsed_static.get(builder, {}))
         class_members[cls] = members
         class_accessors[cls] = accessors
         class_sources[cls] = sources
 
     for cls, members in parse_runtime_class_attachments().items():
         if cls in class_members:
-            class_members[cls] |= members
+            class_members[cls] |= set(members)
+            static_map = class_static_kinds.setdefault(cls, {})
+            for name, kind in members.items():
+                if name not in static_map:
+                    static_map[name] = kind
+                elif kind is not None and static_map[name] != kind:
+                    static_map[name] = None
             note = "runtime class attachment"
             class_sources.setdefault(cls, [])
             if note not in class_sources[cls]:
                 class_sources[cls].append(note)
-    return class_members, class_accessors, class_sources, rust_unrecoverable
+    return (
+        class_members,
+        class_accessors,
+        class_sources,
+        class_static_kinds,
+        rust_unrecoverable,
+    )
 
 
 def _yesno(value: "bool | None") -> str:
@@ -1423,6 +1566,39 @@ def accessor_mismatches(
             else:
                 extra[key] = detail
     return missing, extra
+
+
+def static_mismatches(
+    ref_surface: "dict[str, dict[str, MemberInfo]]",
+    ref_members: "dict[str, set[str]]",
+    rust_members: "dict[str, set[str]]",
+    rust_static: "dict[str, dict[str, bool | None]]",
+    classes: "list[str] | None" = None,
+) -> "OrderedDict[str, str]":
+    """Reference/port class-object vs instance kind mismatches.
+
+    A reference static (class-object) member registered by the port as an
+    instance member, or the reverse, is a finding: the script reads it on the
+    class object and the VM dispatches the wrong native callback shape (the
+    ``Window.mainWindow`` crash).  Only members present on both sides and whose
+    Rust kind is statically readable are compared; a helper-owned member whose
+    kind the reader cannot see is skipped.
+    """
+    problems: "OrderedDict[str, str]" = OrderedDict()
+    for cls in (classes if classes is not None else list(RUST_CLASS_MAP)):
+        present = rust_members.get(cls, set())
+        for name, info in ref_surface.get(cls, {}).items():
+            if name not in ref_members.get(cls, set()) or name not in present:
+                continue
+            rust_kind = rust_static.get(cls, {}).get(name)
+            if rust_kind is None:
+                continue
+            if rust_kind != info.static:
+                problems[f"{cls}.{name}"] = (
+                    f"reference {'static' if info.static else 'instance'}; "
+                    f"rust {'static' if rust_kind else 'instance'}"
+                )
+    return problems
 
 
 # ---------------------------------------------------------------------------
@@ -1483,6 +1659,17 @@ PROPS_ALLOW_HEADER = (
     "\n"
 )
 
+STATIC_ALLOW_HEADER = (
+    "# Native parity allowlist: accepted static/instance kind mismatches.\n"
+    "# One entry per line: Class.member [— reason]\n"
+    "# An entry records a reference member whose Rust registration kind\n"
+    "# (class-object/static vs instance) differs.\n"
+    "# Regenerate after intentional additions with:\n"
+    "#   uv run --project scripts krkr-gate native-parity --update-static-allow\n"
+    "# The checker fails when a mismatch is not listed here.\n"
+    "\n"
+)
+
 
 def write_allowlist(
     path: Path,
@@ -1510,11 +1697,13 @@ def build_report(
     unrecoverable: "list[str] | None" = None,
     props_missing: "dict[str, str] | None" = None,
     props_extra: "dict[str, str] | None" = None,
+    static_mismatches: "dict[str, str] | None" = None,
 ) -> str:
     ref_surface = ref_surface or {}
     unrecoverable = unrecoverable or []
     props_missing = props_missing or {}
     props_extra = props_extra or {}
+    static_mismatches = static_mismatches or {}
     tracked = [c for c in RUST_CLASS_MAP if c in ref]
     total_ref = sum(len(ref.get(c, ())) for c in tracked)
     total_matched = sum(len(ref.get(c, set()) & rust.get(c, set())) for c in tracked)
@@ -1730,6 +1919,12 @@ def build_report(
         "`TVPCreateNativeClass_*`/`registerObject`."
     )
     lines.append(
+        "- The class-object (`TJS_STATICMEMBER`) kind comes from the "
+        "`TJS_END_NATIVE_STATIC_*` closing macro or a trailing `/* static */` "
+        "comment; a `PropSet` kind comes from the `TJS_STATICMEMBER` flag in "
+        "the mode argument."
+    )
+    lines.append(
         "- The Rust side is read from the builders in `RUST_CLASS_MAP`, plus "
         "`attach_class(ctx, \"Target\", \"Member\")` and a class member assigned "
         "inside an `exec_script` string, so a class attached after construction "
@@ -1790,6 +1985,32 @@ def build_report(
     else:
         lines.append("_None._")
     lines.append("")
+
+    lines.append("## Static/instance kind parity")
+    lines.append("")
+    lines.append(
+        "A reference member that lives on the class object (`TJS_STATICMEMBER`) "
+        "must be registered by Rust on the class object, and an instance member "
+        "on the instance; the reverse dispatches the wrong native callback "
+        "shape (the `Window.mainWindow` crash). "
+        "`scripts/allowlists/native_parity_static_allow.txt` records accepted "
+        "exceptions."
+    )
+    lines.append("")
+    lines.append(f"- mismatches: {len(static_mismatches)}")
+    lines.append("")
+    if static_mismatches:
+        lines.append("| member | reference | rust |")
+        lines.append("| --- | --- | --- |")
+        for key, detail in static_mismatches.items():
+            ref_part, _, rust_part = detail.partition("; ")
+            lines.append(
+                f"| `{key}` | {ref_part.removeprefix('reference ')} "
+                f"| {rust_part.removeprefix('rust ')} |"
+            )
+    else:
+        lines.append("_None._")
+    lines.append("")
     return "\n".join(lines)
 
 
@@ -1821,7 +2042,7 @@ def _accessor_self_test() -> list[str]:
         return problems
     expected = json.loads(expected_path.read_text(encoding="utf-8"))
     raw = ref_path.read_text(encoding="utf-8")
-    src = _strip_cpp_comments(_preprocess_cpp(raw))
+    src = _mask_cpp_source(raw)
     ref_surface, _unrecoverable = parse_cpp_source_surface(src)
     for key, want in expected["reference"].items():
         cls, name = key.split(".", 1)
@@ -1835,7 +2056,7 @@ def _accessor_self_test() -> list[str]:
         ("bad", bad_path),
         ("extra", extra_path),
     ):
-        members, accessors, _unrecoverable = parse_rust_file(path)
+        members, accessors, _static, _unrecoverable = parse_rust_file(path)
         missing, extra = accessor_mismatches(
             ref_surface, ref_members, members, accessors, classes=["PropWidget"]
         )
@@ -1845,6 +2066,51 @@ def _accessor_self_test() -> list[str]:
             problems.append(f"{variant}: missing {dict(missing)} != {want_missing}")
         if dict(extra) != want_extra:
             problems.append(f"{variant}: extra {dict(extra)} != {want_extra}")
+    return problems
+
+
+def _static_self_test() -> list[str]:
+    """Fixture checks for the static/instance kind rule.
+
+    ``native_static.cpp`` declares ``mainWindow`` static through the trailing
+    ``/* static */`` comment and ``rasterizer`` through
+    ``TJS_END_NATIVE_STATIC_PROP_DECL``; ``savedWindow`` is an instance
+    property.  ``native_static_good.rs`` matches, ``native_static_bad.rs``
+    registers ``mainWindow`` on the instance builder (the `Window.mainWindow`
+    crash shape) and ``savedWindow`` on the class object (the reverse).  The
+    rule must return nothing for the good fixture and exactly the expected
+    mismatches for the bad one.
+    """
+    ref_path = FIXTURES_DIR / "native_static.cpp"
+    good_path = FIXTURES_DIR / "native_static_good.rs"
+    bad_path = FIXTURES_DIR / "native_static_bad.rs"
+    expected_path = FIXTURES_DIR / "native_static.expected.json"
+    problems: list[str] = []
+    for path in (ref_path, good_path, bad_path, expected_path):
+        if not path.is_file():
+            problems.append(f"static fixture missing: {path}")
+    if problems:
+        return problems
+    expected = json.loads(expected_path.read_text(encoding="utf-8"))
+    src = _mask_cpp_source(ref_path.read_text(encoding="utf-8"))
+    ref_surface, _unrecoverable = parse_cpp_source_surface(src)
+    for key, want in expected["reference_static"].items():
+        cls, name = key.split(".", 1)
+        info = ref_surface.get(cls, {}).get(name)
+        got = None if info is None else info.static
+        if got != want:
+            problems.append(f"{key}: reference static {got} != {want}")
+    ref_members = {cls: set(entries) for cls, entries in ref_surface.items()}
+    for variant, path in (("good", good_path), ("bad", bad_path)):
+        members, _accessors, static_kinds, _unrecoverable = parse_rust_file(path)
+        got = dict(
+            static_mismatches(
+                ref_surface, ref_members, members, static_kinds, classes=["StaticWidget"]
+            )
+        )
+        want = expected[f"{variant}_mismatch"]
+        if got != want:
+            problems.append(f"{variant}: static mismatch {got} != {want}")
     return problems
 
 
@@ -1864,7 +2130,7 @@ def self_test(verbose: bool = True) -> int:
             return 1
     expected = json.loads(expected_path.read_text(encoding="utf-8"))
     raw = fixture.read_text(encoding="utf-8")
-    src = _strip_cpp_comments(_preprocess_cpp(raw))
+    src = _mask_cpp_source(raw)
     surface, unrecoverable = parse_cpp_source_surface(src)
     got = {cls: sorted(entries) for cls, entries in surface.items()}
     want = expected["members"]
@@ -1897,6 +2163,7 @@ def self_test(verbose: bool = True) -> int:
         problems.append("runtime-built name leaked into the member set")
 
     problems.extend(_accessor_self_test())
+    problems.extend(_static_self_test())
 
     if problems:
         print("native_parity: extractor self-test FAILED:")
@@ -1960,6 +2227,14 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--update-static-allow",
+        action="store_true",
+        help=(
+            "rewrite scripts/allowlists/native_parity_static_allow.txt with the "
+            "current static/instance kind mismatches"
+        ),
+    )
+    parser.add_argument(
         "--no-doc", action="store_true", help="do not regenerate docs/native_parity.md"
     )
     parser.add_argument(
@@ -1991,7 +2266,13 @@ def main(argv: list[str] | None = None) -> int:
 
     ref_surface, unrecoverable = parse_reference_surface()
     ref = {cls: set(entries) for cls, entries in ref_surface.items()}
-    rust, rust_accessors, rust_sources, rust_unrecoverable = parse_rust()
+    (
+        rust,
+        rust_accessors,
+        rust_sources,
+        rust_static_kinds,
+        rust_unrecoverable,
+    ) = parse_rust()
     unrecoverable.extend(rust_unrecoverable)
 
     # The constructor (reference `TJS_END_NATIVE_CONSTRUCTOR_DECL(X)`, Rust
@@ -2064,6 +2345,29 @@ def main(argv: list[str] | None = None) -> int:
     new_props_extra = sorted(set(props_extra) - props_allow)
     stale_props = sorted(props_allow - set(props_missing) - set(props_extra))
 
+    # Static-kind parity: a reference class-object (static) member registered
+    # by the port as an instance member, or the reverse, dispatches the wrong
+    # native callback shape and crashes the script (the `Window.mainWindow`
+    # shape).  Only members present on both sides and whose Rust kind is
+    # statically readable are compared.
+    static_problems = static_mismatches(ref_surface, ref, rust, rust_static_kinds)
+    static_allow = read_allowlist(STATIC_ALLOWLIST_PATH)
+    if args.update_static_allow:
+        write_allowlist(
+            STATIC_ALLOWLIST_PATH,
+            set(static_problems),
+            read_allowlist_reasons(STATIC_ALLOWLIST_PATH),
+            STATIC_ALLOW_HEADER,
+        )
+        print(
+            f"native_parity: wrote {len(static_problems)} static/instance "
+            f"kind entries to "
+            f"{STATIC_ALLOWLIST_PATH.relative_to(REPO_ROOT)}"
+        )
+        static_allow = set(static_problems)
+    new_static = sorted(set(static_problems) - static_allow)
+    stale_static = sorted(static_allow - set(static_problems))
+
     if not args.no_doc:
         DOC_PATH.parent.mkdir(parents=True, exist_ok=True)
         DOC_PATH.write_text(
@@ -2078,6 +2382,7 @@ def main(argv: list[str] | None = None) -> int:
                 unrecoverable,
                 props_missing,
                 props_extra,
+                static_problems,
             ),
             encoding="utf-8",
         )
@@ -2108,6 +2413,14 @@ def main(argv: list[str] | None = None) -> int:
         for key, detail in props_extra.items():
             print(f"  ~ {key}: {detail} (extra)")
 
+    if not args.quiet and static_problems:
+        print(
+            f"native_parity: {len(static_problems)} static/instance kind "
+            f"mismatch(es):"
+        )
+        for key, detail in static_problems.items():
+            print(f"  - {key}: {detail}")
+
     if stale:
         print(
             f"native_parity: {len(stale)} allowlisted member(s) are now "
@@ -2124,6 +2437,31 @@ def main(argv: list[str] | None = None) -> int:
         )
         for entry in stale_props:
             print(f"  - {entry}")
+
+    if stale_static:
+        print(
+            f"native_parity: {len(stale_static)} allowlisted static/instance "
+            "mismatch(es) are now resolved — shrink "
+            "scripts/allowlists/native_parity_static_allow.txt:"
+        )
+        for entry in stale_static:
+            print(f"  - {entry}")
+
+    if new_static:
+        print(
+            f"native_parity: {len(new_static)} new static/instance kind "
+            f"mismatch(es) not in "
+            f"{STATIC_ALLOWLIST_PATH.relative_to(REPO_ROOT)}:",
+            file=sys.stderr,
+        )
+        for entry in new_static:
+            print(f"  - {entry}: {static_problems[entry]}", file=sys.stderr)
+        print(
+            "native_parity: run with --update-static-allow only after "
+            "reviewing these.",
+            file=sys.stderr,
+        )
+        return 1
 
     if new_props_missing:
         print(

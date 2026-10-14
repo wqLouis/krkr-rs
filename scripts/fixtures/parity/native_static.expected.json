@@ -1,0 +1,12 @@
+{
+  "reference_static": {
+    "StaticWidget.mainWindow": true,
+    "StaticWidget.rasterizer": true,
+    "StaticWidget.savedWindow": false
+  },
+  "good_mismatch": {},
+  "bad_mismatch": {
+    "StaticWidget.mainWindow": "reference static; rust instance",
+    "StaticWidget.savedWindow": "reference instance; rust static"
+  }
+}
