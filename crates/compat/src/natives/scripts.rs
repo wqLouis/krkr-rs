@@ -852,9 +852,10 @@ extern "C" fn native_eval(
         Ok(context) => context,
         Err(error) => return report_error(out_error, &format!("Scripts.eval: {error}")),
     };
+    let need_result = resolved.engine().result_needed();
     let result = resolved
         .engine()
-        .eval_retained_with_context(&expression, &name, context, lineofs)
+        .eval_retained_with_context_result(&expression, &name, context, lineofs, need_result)
         .map_err(|error| error.to_string());
     finish_retained(out, out_error, services, result)
 }

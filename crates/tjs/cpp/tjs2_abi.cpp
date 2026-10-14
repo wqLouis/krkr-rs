@@ -89,6 +89,12 @@ struct tjs2_engine {
         tjs_int count;
     };
     std::vector<tjs2_param_frame> param_stack;
+    // Whether the VM asked for the return value of the native method call
+    // currently executing. Reference native methods receive a null `result`
+    // pointer when the caller discards the value; the dispatcher saves and
+    // restores this around each callback so a nested native call reports its
+    // own value. Defaults to true for calls made outside a native callback.
+    bool result_needed = true;
 };
 
 namespace {
@@ -548,6 +554,18 @@ struct tjs2_param_frame_guard {
     }
 };
 
+// Save/restore the VM's result-needed flag around a native callback so a
+// nested native call reports its own value. See `tjs2_result_needed`.
+struct tjs2_result_needed_guard {
+    tjs2_engine *engine;
+    bool previous;
+    tjs2_result_needed_guard(tjs2_engine *e, bool needed)
+        : engine(e), previous(e->result_needed) {
+        e->result_needed = needed;
+    }
+    ~tjs2_result_needed_guard() { engine->result_needed = previous; }
+};
+
 // Convert a tjs2_value produced by a Rust native method callback into a
 // tTJSVariant result. Strings are UTF-8 and owned by the caller for the
 // duration of the callback. Throws TJS::eTJSError for types that cannot be
@@ -682,6 +700,10 @@ tjs_error tjs2_dispatch_native_method(tjs2_native_method_dispatch *self,
         // Expose the caller's by-reference argument slots to Rust for the
         // duration of the callback (tjs2_set_arg).
         tjs2_param_frame_guard param_guard(e, param, numparams);
+        // Reference native methods receive a null `result` when the caller
+        // discards the value; report that so expression-mode evaluation can
+        // compile without requiring a result.
+        tjs2_result_needed_guard result_guard(e, result != nullptr);
         // FFI handoff: `fn` is Rust code that must follow the ABI contract
         // (argv/out valid only during the call, out_error malloc'd).
         int rc = self->fn(e, (int)numparams,
@@ -1589,6 +1611,10 @@ struct native_class_holder {
 
 } // namespace
 
+int tjs2_result_needed(tjs2_engine *e) {
+    return (e && e->result_needed) ? 1 : 0;
+}
+
 // ---------------------------------------------------------------------------
 // console output adapter
 // ---------------------------------------------------------------------------
@@ -1865,19 +1891,24 @@ static int eval_decoded(tjs2_engine *e, std::u16string s, const char *name,
     e->last_object.Clear(); // see exec_script_decoded
     try {
         TJS::tTJSVariant result;
+        // A null result slot mirrors the reference's native method receiving
+        // a null `result` pointer: `MustReturnResult` is false, so an
+        // expression that produces no value (a `swap`, for instance) is
+        // legal and is discarded.
+        TJS::tTJSVariant *result_slot = out_result ? &result : nullptr;
         std::u16string n = name ? utf8_to_u16(name) : std::u16string();
         if(name && n.empty()) {
             // An empty (but present) name is still a name to the reference's
             // raw entry point (`if(name)`), which selects a named block
             // rather than the expression cache; keep that path.
             e->inner->EvalExpression(
-                s.c_str(), &result,
+                s.c_str(), result_slot,
                 static_cast<TJS::iTJSDispatch2 *>(context), n.c_str(),
                 (tjs_int)lineofs);
         } else {
             TJS::ttstr expression_text(s.c_str(), s.size());
             TJS::ttstr expression_name(n.c_str(), n.size());
-            e->inner->EvalExpression(expression_text, &result,
+            e->inner->EvalExpression(expression_text, result_slot,
                                      static_cast<TJS::iTJSDispatch2 *>(context),
                                      name ? &expression_name : nullptr,
                                      (tjs_int)lineofs);

@@ -532,6 +532,11 @@ unsafe extern "C" {
         value: *const Value,
         out_error: *mut *mut c_char,
     ) -> c_int;
+    /// Whether the VM asked for the return value of the native method call
+    /// currently executing on this engine. Reference native methods receive
+    /// a null `result` pointer when the caller discards the value; see
+    /// [`Tjs2Engine::result_needed`].
+    fn tjs2_result_needed(engine: *mut Engine) -> c_int;
     /// Invoke a named member on a retained object value (member lookup
     /// goes through the object's own class chain, so script-subclass
     /// overrides win over native methods).
@@ -820,6 +825,16 @@ impl Tjs2Engine {
         self.inner
     }
 
+    /// Whether the VM asked for the return value of the native method call
+    /// currently executing. A reference native method receives a null
+    /// `result` pointer when the caller discards the value (a bare method
+    /// call statement), and expression-mode evaluation must then compile
+    /// without requiring a result. Reads as `true` outside a native callback.
+    pub fn result_needed(&self) -> bool {
+        // SAFETY: `self.inner` is a live engine; the ABI only reads a flag.
+        unsafe { tjs2_result_needed(self.inner) != 0 }
+    }
+
     /// Point the C++ stream factories at a directory for relative save/load
     /// paths (the game's DATA_PATH is absolute, but some code passes plain
     /// names).
@@ -932,6 +947,25 @@ impl Tjs2Engine {
         context: *mut c_void,
         lineofs: i32,
     ) -> Result<TjsValue, TjsError> {
+        self.eval_with_context_result(expression, name, context, lineofs, true)
+    }
+
+    /// [`Self::eval_with_context`] with an explicit result-needed flag.
+    ///
+    /// When `need_result` is false the expression is compiled without a
+    /// result slot, matching a reference native method that received a null
+    /// `result` pointer: an expression that produces no value (a `swap`, for
+    /// instance) then compiles, and the discarded value comes back as
+    /// [`TjsValue::Void`].
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn eval_with_context_result(
+        &self,
+        expression: &str,
+        name: &str,
+        context: *mut c_void,
+        lineofs: i32,
+        need_result: bool,
+    ) -> Result<TjsValue, TjsError> {
         // Length-aware hand-off, as in `exec_script_with_context`.
         let name = CString::new(name).map_err(|_| TjsError("name contains NUL".into()))?;
         let mut result = Value {
@@ -944,6 +978,11 @@ impl Tjs2Engine {
             retained: 0,
         };
         let mut error: *mut c_char = ptr::null_mut();
+        let out_result = if need_result {
+            &mut result as *mut Value
+        } else {
+            ptr::null_mut()
+        };
         // SAFETY: all pointers point to valid, live data for the call; the
         // caller guarantees `context` is a live object handle or null.
         let rc = unsafe {
@@ -954,7 +993,7 @@ impl Tjs2Engine {
                 name.as_ptr(),
                 context,
                 lineofs,
-                &mut result,
+                out_result,
                 &mut error,
             )
         };
@@ -1192,6 +1231,27 @@ impl Tjs2Engine {
         context: *mut c_void,
         lineofs: i32,
     ) -> Result<RetainedValue, TjsError> {
+        self.eval_retained_with_context_result(expression, name, context, lineofs, true)
+    }
+
+    /// [`Self::eval_retained_with_context`] with an explicit result-needed
+    /// flag. When `need_result` is false the expression compiles without a
+    /// result slot (reference: a native method whose caller discarded the
+    /// result) and the discarded value is returned as [`TjsValue::Void`];
+    /// nothing is retained. See [`Self::eval_with_context_result`].
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn eval_retained_with_context_result(
+        &self,
+        expression: &str,
+        name: &str,
+        context: *mut c_void,
+        lineofs: i32,
+        need_result: bool,
+    ) -> Result<RetainedValue, TjsError> {
+        if !need_result {
+            self.eval_with_context_result(expression, name, context, lineofs, false)?;
+            return Ok(RetainedValue::Value(TjsValue::Void));
+        }
         let v = self.eval_with_context(expression, name, context, lineofs)?;
         self.retain_object_result(v)
     }

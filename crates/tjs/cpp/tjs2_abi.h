@@ -451,6 +451,17 @@ int tjs2_set_arg(tjs2_engine *e, int index, const tjs2_value *value,
                  char **out_error);
 
 /*
+ * Whether the VM asked for the return value of the native method call
+ * currently executing on `e`. Reference native methods receive a null
+ * `result` pointer when the caller discards the value (e.g. a bare method
+ * call statement); this exposes that to a Rust callback so expression-mode
+ * evaluation can compile without requiring a result. Returns 1 when the
+ * value is wanted, 0 when it is discarded. Only meaningful during a native
+ * method callback.
+ */
+int tjs2_result_needed(tjs2_engine *e);
+
+/*
  * Native class registration (static methods only for this milestone).
  *
  * The VM is single-threaded: register classes only from the thread that

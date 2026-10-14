@@ -73,9 +73,10 @@ extern "C" fn scripts_eval(
     } else {
         std::ptr::null_mut()
     };
+    let need_result = resolved.engine().result_needed();
     let result = resolved
         .engine()
-        .eval_retained_with_context(&expression, &name, context, lineofs)
+        .eval_retained_with_context_result(&expression, &name, context, lineofs, need_result)
         .map_err(|error| error.to_string());
     if log_errors && let Err(error) = &result {
         log::error!("Scripts.eval({name:?}): {error}");

@@ -113,6 +113,40 @@ fn raw_exec_and_eval_run_in_the_vm() {
 }
 
 #[test]
+fn eval_honours_the_callers_result_need() {
+    let _lock = vm_lock();
+    let env = Env::new();
+
+    // A native method called as a bare statement receives a null `result`
+    // (`reference/cpp/core/tjs2/tjsInterCodeExec.cpp:2124-2130` passes
+    // `code[1] ? ... : nullptr`), so `Scripts.eval` compiles with
+    // `MustReturnResult = false`
+    // (`reference/cpp/core/tjs2/tjsScriptCache.cpp:163`). The `swap` operator
+    // may then be used even though it produces no value
+    // (`reference/cpp/core/tjs2/tjsInterCodeGen.cpp:1211-1216` raises only
+    // when the result is required). The Conductor's tag dispatch reaches
+    // `Scripts.eval` exactly this way, from `MainWindow.tjs`'s `eval` tag
+    // handler.
+    env.engine
+        .exec_script(
+            "var swap_left = 1; var swap_right = 2; \
+             Scripts.eval('swap_left <-> swap_right');",
+            "test",
+        )
+        .expect("a discarded Scripts.eval of a swap must not raise");
+    assert_eq!(env.eval_ok("swap_left"), TjsValue::Integer(2));
+    assert_eq!(env.eval_ok("swap_right"), TjsValue::Integer(1));
+
+    // When the caller does need the value, the reference raises for a
+    // resultless `swap`, and so does the port.
+    let error = env.error("Scripts.eval('swap_left <-> swap_right')");
+    assert!(
+        error.contains("Cannot get the value of this expression"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
 fn eval_returns_a_callable_object() {
     let _lock = vm_lock();
     let env = Env::new();
