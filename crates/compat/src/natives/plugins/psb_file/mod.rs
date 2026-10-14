@@ -43,14 +43,15 @@
 //!   parent object (see [`set_octet_member`]);
 //! * nested lists/dictionaries → real TJS `Array`/`Dictionary` objects.
 //!
-//! # Missing seam
+//! # `psb://` media
 //!
-//! The reference registers every loaded resource into a `psb://` storage
+//! `load` registers every top-level resource into the `psb://` storage
 //! media (`PSBMedia`, `main.cpp:60-67` + `PSBMedia.h:6-45`) so scripts can
-//! open `psb://…` paths afterwards. The port's L2 storage namespace has no
-//! media-registration hook (see `var_file`'s module docs for the same
-//! seam), so the loaded bytes stay reachable through `root` only. The
-//! missing `psb://` media is documented here rather than faked.
+//! open `psb://…` paths afterwards. The registration goes through the L2
+//! [`engine::Storage::register_media`] table, which serves those names before
+//! disk and archive resolution; the container name is lower-cased from its
+//! first `.` exactly as `PSBMedia::NormalizeDomainName` does
+//! (`PSBMedia.cpp:16-22`).
 //!
 //! # Architecture
 //!
@@ -78,6 +79,7 @@ use crate::native_util::{args, report_error, set_bool, set_void, value_as_string
 use crate::natives::system::resolve;
 use crate::storage::strip_file_media;
 use crate::{CompatCtx, CompatError};
+use engine::Storage;
 
 // ---------------------------------------------------------------------------
 // Instance payload
@@ -350,6 +352,7 @@ fn load_document(ctx: &CompatCtx, inst: &mut PsbFileInst, path: &str) -> Result<
         Ok(document) => {
             inst.document = Some(document);
             inst.path = Some(path.to_string());
+            register_media(storage, path, inst.document.as_ref().expect("just stored"));
             Ok(true)
         }
         Err(error @ (PsbError::BadSignature(_) | PsbError::ArchiveNotPsb)) => {
@@ -361,6 +364,42 @@ fn load_document(ctx: &CompatCtx, inst: &mut PsbFileInst, path: &str) -> Result<
             log::warn!("PSBFile: cannot load {path}: {error}");
             Ok(false)
         }
+    }
+}
+
+/// Registers every top-level resource of a loaded PSB under
+/// `psb://<normalized path>/<key>` in the L2 storage media table.
+///
+/// Reference `PSBFile.load` walks `getObjects()` and adds each `PSBResource`
+/// to the `psb://` media after `PSBMedia::NormalizeDomainName` lower-cases the
+/// container's extension (`reference/cpp/plugins/psbfile/main.cpp:60-68`,
+/// `PSBMedia.cpp:16-22`). `PSDInfo.loadPIMG` then opens those entries as
+/// `psb://<container>/<layer_id>.tlg` (`data.xp3:system/psdlayer.tjs`).
+fn register_media(storage: *mut Storage, path: &str, document: &PsbDocument) {
+    let PsbValue::Dictionary(entries) = &document.root else {
+        return;
+    };
+    let container = normalize_psb_domain(path);
+    // SAFETY: the caller holds the live storage pointer for the call and the
+    // registration only touches its interior-mutable media table.
+    let storage = unsafe { &*storage };
+    for (key, value) in entries {
+        let PsbValue::Resource(reference) = value else {
+            continue;
+        };
+        let Some(bytes) = document.resource_bytes(*reference) else {
+            continue;
+        };
+        storage.register_media(format!("psb://{container}/{key}"), bytes.to_vec());
+    }
+}
+
+/// Reference `PSBMedia::NormalizeDomainName` (`PSBMedia.cpp:16-22`):
+/// lower-case from the first `.` onward.
+fn normalize_psb_domain(path: &str) -> String {
+    match path.find('.') {
+        Some(dot) => format!("{}{}", &path[..dot], path[dot..].to_lowercase()),
+        None => path.to_string(),
     }
 }
 

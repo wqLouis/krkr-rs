@@ -119,6 +119,11 @@ pub struct Storage {
     /// `(file_hash, offset, buffer, file_name, archive_name, file_size)` and
     /// may rewrite `buffer` in place.
     pub xp3_extraction_filter: Option<Box<Xp3ExtractionFilter<'static>>>,
+    /// Virtual media entries registered by L3 storage-media providers, keyed
+    /// by the full storage name (e.g. `psb://quickmenu.pimg/11632.tlg`).
+    /// [`Self::read`]/[`Self::read_prefix`]/[`Self::exists`] serve these
+    /// before disk and archive resolution; L2 only stores the bytes.
+    media: RefCell<HashMap<String, Vec<u8>>>,
     /// Lazily built resolver tables, invalidated when the auto-path list or
     /// the mounted archives change.
     resolution_cache: RefCell<ResolutionCache>,
@@ -233,19 +238,29 @@ const MISS_LOG_HEAD_CHARS: usize = 200;
 /// A lookup only records when debug logging is enabled, so a hit on the normal
 /// path builds no trace and allocates nothing; the closure passed to
 /// [`Self::attempt`] runs only when recording.
+///
+/// The per-entry detail an archive miss can add (the near-miss name scan)
+/// walks the whole index, so it is recorded only when the full `trace` line is
+/// on. The bounded `debug` line omits that detail, so building it there would
+/// be wasted work on every miss.
 #[derive(Default)]
 struct SearchTrace {
     /// Whether recording is on (debug logging enabled).
     enabled: bool,
+    /// Whether the full `trace` line is on, so an expensive per-entry detail
+    /// is worth building.
+    detailed: bool,
     /// The searched locations and rules, in search order.
     attempts: Vec<String>,
 }
 
 impl SearchTrace {
-    /// Creates a trace that records only when `enabled`.
-    fn new(enabled: bool) -> Self {
+    /// Creates a trace that records only when `enabled`; `detailed` selects
+    /// whether an attempt may build the expensive per-entry text.
+    fn new(enabled: bool, detailed: bool) -> Self {
         Self {
             enabled,
+            detailed,
             attempts: Vec::new(),
         }
     }
@@ -255,6 +270,14 @@ impl SearchTrace {
     fn attempt(&mut self, text: impl FnOnce() -> String) {
         if self.enabled {
             self.attempts.push(text());
+        }
+    }
+
+    /// Records one searched location, telling the closure whether the full
+    /// trace is on so it can skip an expensive detail the `debug` line drops.
+    fn attempt_detailed(&mut self, text: impl FnOnce(bool) -> String) {
+        if self.enabled {
+            self.attempts.push(text(self.detailed));
         }
     }
 
@@ -614,6 +637,7 @@ impl Storage {
             preload_archives,
             project: None,
             xp3_extraction_filter: None,
+            media: RefCell::new(HashMap::new()),
             resolution_cache: RefCell::new(ResolutionCache::default()),
         })
     }
@@ -814,8 +838,10 @@ impl Storage {
     /// shape, mounted archives in later-first order, or the explicit
     /// `arc.xp3>path` interpretation) until a small character budget is
     /// reached, then appends an elision marker with the number of dropped
-    /// characters; the `trace` line carries the complete list. A hit logs
-    /// nothing, and the trace is only built when debug logging is enabled.
+    /// characters; the `trace` line carries the complete list, including the
+    /// archive near-miss names. A hit logs nothing, and the trace is only built
+    /// when debug logging is enabled; the near-miss scan is added only at
+    /// `trace`.
     ///
     /// Storage names are case-insensitive even when the host filesystem is
     /// not. Only the storage-relative part is normalized; the mount prefix
@@ -829,7 +855,10 @@ impl Storage {
         if let Some(hit) = self.resolution_cache.borrow().placed.get(name).cloned() {
             return Ok(Some(hit));
         }
-        let mut trace = SearchTrace::new(log::log_enabled!(log::Level::Debug));
+        let mut trace = SearchTrace::new(
+            log::log_enabled!(log::Level::Debug),
+            log::log_enabled!(log::Level::Trace),
+        );
         let found = self.find_recorded(name, &mut trace)?;
         match &found {
             Some(location) => {
@@ -934,7 +963,9 @@ impl Storage {
             if mounted.archive.entry(&normalized).is_some() {
                 return Ok(Some(Location::Archive(mounted.path.clone(), normalized)));
             }
-            trace.attempt(|| archive_miss_line(&mounted.path, &mounted.archive, &normalized));
+            trace.attempt_detailed(|detailed| {
+                archive_miss_line(&mounted.path, &mounted.archive, &normalized, detailed)
+            });
         }
         Ok(None)
     }
@@ -1103,7 +1134,9 @@ impl Storage {
                 if mounted.archive.entry(&rest).is_some() {
                     return Ok(Some(Location::Archive(mounted.path.clone(), rest)));
                 }
-                trace.attempt(|| archive_miss_line(&mounted.path, &mounted.archive, &rest));
+                trace.attempt_detailed(|detailed| {
+                    archive_miss_line(&mounted.path, &mounted.archive, &rest, detailed)
+                });
                 return Ok(None);
             }
         }
@@ -1129,7 +1162,7 @@ impl Storage {
         if archive.entry(&rest).is_some() {
             Ok(Some(Location::Archive(path, rest)))
         } else {
-            trace.attempt(|| archive_miss_line(&path, &archive, &rest));
+            trace.attempt_detailed(|detailed| archive_miss_line(&path, &archive, &rest, detailed));
             Ok(None)
         }
     }
@@ -1430,8 +1463,22 @@ impl Storage {
         f(&archive, &file_name)
     }
 
+    /// Registers a virtual media entry under its full storage name.
+    ///
+    /// L3 uses this for TVP storage-media providers (`psb://…`, `psd://…`):
+    /// the bytes are served by [`Self::read`]/[`Self::read_prefix`] and
+    /// reported by [`Self::exists`] before disk and archive resolution. A
+    /// later registration for the same name replaces the earlier bytes.
+    pub fn register_media(&self, name: String, bytes: Vec<u8>) {
+        self.media.borrow_mut().insert(name, bytes);
+    }
+
     /// Reads a storage entry to bytes (disk file or archive member).
     pub fn read(&self, name: &str) -> Result<Vec<u8>, StorageReadError> {
+        if let Some(bytes) = self.media.borrow().get(name).cloned() {
+            self.count_read_bytes(bytes.len());
+            return Ok(bytes);
+        }
         let bytes = match self.find(name)? {
             Some(Location::Disk(path)) => {
                 read_fs_file(&self.fs, &path).map_err(StorageReadError::Fs)
@@ -1453,6 +1500,11 @@ impl Storage {
     /// (`tTVPXP3ArchiveStream`) instead. Resolution and filter semantics are
     /// [`Self::read`]'s.
     pub fn read_prefix(&self, name: &str, max_len: usize) -> Result<Vec<u8>, StorageReadError> {
+        if let Some(mut bytes) = self.media.borrow().get(name).cloned() {
+            bytes.truncate(max_len);
+            self.count_read_bytes(bytes.len());
+            return Ok(bytes);
+        }
         let bytes = match self.find(name)? {
             Some(Location::Disk(path)) => {
                 read_fs_file_prefix(&self.fs, &path, max_len).map_err(StorageReadError::Fs)
@@ -1599,6 +1651,9 @@ impl Storage {
     /// existing; [`Self::find`] itself is file-only. A file-system failure
     /// while probing propagates.
     pub fn exists(&self, name: &str) -> Result<bool, StorageReadError> {
+        if self.media.borrow().contains_key(name) {
+            return Ok(true);
+        }
         if self.find(name)?.is_some() {
             return Ok(true);
         }
@@ -1996,12 +2051,13 @@ fn storage_base(name: &str) -> &str {
 const ARCHIVE_MISS_NEAR_NAMES: usize = 8;
 
 /// Renders one archive probe for a miss: the entry count, the index blocks
-/// that were read (how many names each contributed), and a bounded set of
-/// near-miss names.
+/// that were read (how many names each contributed), and — when `detailed` — a
+/// bounded set of near-miss names.
 ///
-/// This is the instrument that turns a bare `entry not found` into `1384
-/// entries, one zlib index block, and the closest names` in one run.
-fn archive_miss_line(path: &Path, archive: &Xp3Archive, request: &str) -> String {
+/// The near-miss scan walks every entry in the index, so it is built only for
+/// the full `trace` line; the bounded `debug` line keeps the cheap header and
+/// omits it.
+fn archive_miss_line(path: &Path, archive: &Xp3Archive, request: &str, detailed: bool) -> String {
     let sections: Vec<String> = archive
         .index_sections()
         .iter()
@@ -2016,7 +2072,6 @@ fn archive_miss_line(path: &Path, archive: &Xp3Archive, request: &str) -> String
             )
         })
         .collect();
-    let near = archive.near_misses(request, ARCHIVE_MISS_NEAR_NAMES);
     let mut line = format!(
         "archive {} entry {request:?}: {} entries, {} index section(s) [{}]",
         path.display(),
@@ -2024,6 +2079,10 @@ fn archive_miss_line(path: &Path, archive: &Xp3Archive, request: &str) -> String
         sections.len(),
         sections.join(", "),
     );
+    if !detailed {
+        return line;
+    }
+    let near = archive.near_misses(request, ARCHIVE_MISS_NEAR_NAMES);
     if near.total == 0 {
         line.push_str("; no near misses");
     } else {
@@ -2267,14 +2326,14 @@ mod tests {
     /// splits a UTF-8 code point; a trace within the budget is unchanged.
     #[test]
     fn render_short_never_splits_a_utf8_char() {
-        let mut trace = SearchTrace::new(true);
+        let mut trace = SearchTrace::new(true, true);
         trace.attempt(|| "é".repeat(300));
         assert_eq!(
             trace.render_short(10),
             format!("{}… (+290 chars)", "é".repeat(10))
         );
 
-        let mut short = SearchTrace::new(true);
+        let mut short = SearchTrace::new(true, true);
         short.attempt(|| "ok".to_string());
         assert_eq!(short.render_short(10), "ok");
     }
@@ -2296,7 +2355,7 @@ mod tests {
         }
 
         // The full trace still names every entry after the compaction.
-        let mut trace = SearchTrace::new(true);
+        let mut trace = SearchTrace::new(true, true);
         assert!(
             storage
                 .find_recorded("missing000.txt", &mut trace)
@@ -2333,5 +2392,69 @@ mod tests {
             miss.len() < 300,
             "the bounded miss line is still large: {miss}"
         );
+    }
+
+    /// The cheap `debug` trace skips the archive near-miss scan, which walks
+    /// every entry in the index; the full `trace` still carries the near-miss
+    /// names.
+    #[test]
+    fn debug_trace_skips_the_archive_near_miss_scan() {
+        let xp3 = testkit::build_xp3(&[("system/Config.tjs", b"cfg", false)]);
+        let fs = FileSystem::memory();
+        write_mem(&fs, "/game/data.xp3", &xp3);
+        let storage = Storage::mount_archives(fs, "/game", ["data.xp3"]).expect("mount");
+
+        let mut debug_trace = SearchTrace::new(true, false);
+        assert!(
+            storage
+                .find_recorded("config.tjs", &mut debug_trace)
+                .unwrap()
+                .is_none()
+        );
+        let debug_line = debug_trace.render();
+        assert!(debug_line.contains("1 entries"), "{debug_line}");
+        assert!(
+            !debug_line.contains("nearest") && !debug_line.contains("system/config.tjs"),
+            "the cheap debug trace omits the near-miss scan: {debug_line}"
+        );
+
+        let mut full_trace = SearchTrace::new(true, true);
+        assert!(
+            storage
+                .find_recorded("config.tjs", &mut full_trace)
+                .unwrap()
+                .is_none()
+        );
+        let full_line = full_trace.render();
+        assert!(full_line.contains("nearest 1/1"), "{full_line}");
+        assert!(full_line.contains("system/config.tjs"), "{full_line}");
+    }
+
+    /// The trace level is not part of resolution: the cheap `debug` trace and
+    /// the full `trace` record the same result for a hit and for a miss.
+    #[test]
+    fn trace_detail_does_not_change_resolution() {
+        let xp3 = testkit::build_xp3(&[
+            ("system/Config.tjs", b"cfg", false),
+            ("data/bg/title.jpg", b"img", false),
+        ]);
+        let fs = FileSystem::memory();
+        write_mem(&fs, "/game/data.xp3", &xp3);
+        let storage = Storage::mount_archives(fs, "/game", ["data.xp3"]).expect("mount");
+
+        for name in [
+            "system/Config.tjs",
+            "Config.tjs",
+            "data/bg/title.jpg",
+            "missing.txt",
+        ] {
+            let mut debug_trace = SearchTrace::new(true, false);
+            let mut full_trace = SearchTrace::new(true, true);
+            assert_eq!(
+                storage.find_recorded(name, &mut debug_trace).unwrap(),
+                storage.find_recorded(name, &mut full_trace).unwrap(),
+                "resolution differs for {name:?} between trace levels"
+            );
+        }
     }
 }

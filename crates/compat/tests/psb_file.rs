@@ -435,6 +435,34 @@ fn load_exposes_the_root_tree() {
     assert_eq!(env.int("isNull"), 0);
 }
 
+// `PSBFile.load` registers each top-level `PSBResource` into the `psb://`
+// storage media (`reference/cpp/plugins/psbfile/main.cpp:60-68`,
+// `PSBMedia.cpp:24-27`), so a caller can open
+// `psb://<normalized container>/<resource key>` afterwards. `PSDInfo.loadPIMG`
+// relies on this: it builds `psb://<container>/<layer_id>.tlg`
+// (`data.xp3:system/psdlayer.tjs`).
+#[test]
+fn load_registers_psb_resources_in_the_psb_media() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.write_fixture("fixture.psb", &build_fixture());
+
+    env.run(
+        "var f = new PSBFile(); \
+         var ok = f.load('fixture.psb'); \
+         var exists = Storages.isExistentStorage('psb://fixture.psb/res'); \
+         var missing = Storages.isExistentStorage('psb://fixture.psb/nope');",
+    );
+
+    assert_eq!(env.int("ok"), 1);
+    assert_eq!(env.int("exists"), 1, "the registered resource must resolve");
+    assert_eq!(
+        env.int("missing"),
+        0,
+        "an unregistered key must not resolve"
+    );
+}
+
 // A missing storage raises: the reference's `loadPSBFile` calls
 // `TVPCreateStream`, which throws out of the call
 // (`reference/cpp/plugins/psbfile/PSBFile.cpp:529-534`,

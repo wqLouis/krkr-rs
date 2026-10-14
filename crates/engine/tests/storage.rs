@@ -185,6 +185,28 @@ fn archive_is_used_when_no_disk_file() {
     assert_eq!(storage.stat("data/inside.txt").unwrap().unwrap().size, 18);
 }
 
+// L3 registers a TVP storage-media entry (`psb://…`, `psd://…`) with
+// `register_media`; L2 serves it before disk and archive resolution so a
+// script can open the registered name (reference `TVPRegisterStorageMedia`
+// feeding `PSBMedia::CheckExistentStorage`/`Open`, `PSBMedia.cpp:24-46`).
+#[test]
+fn registered_media_is_served_before_disk_and_archive() {
+    let storage = mount_memory(&[]);
+    storage.register_media("psb://fixture.psb/res".into(), b"resource bytes".to_vec());
+
+    assert!(storage.exists("psb://fixture.psb/res").unwrap());
+    assert_eq!(
+        storage.read("psb://fixture.psb/res").unwrap(),
+        b"resource bytes"
+    );
+    assert_eq!(
+        storage.read_prefix("psb://fixture.psb/res", 4).unwrap(),
+        b"reso"
+    );
+    assert!(!storage.exists("psb://fixture.psb/other").unwrap());
+    assert!(storage.read("psb://fixture.psb/other").is_err());
+}
+
 #[test]
 fn arc_xp3_path_targets_one_archive() {
     let a = build_xp3(&[("shared.txt", b"from a", false)]);
