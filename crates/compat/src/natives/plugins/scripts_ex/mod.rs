@@ -694,7 +694,11 @@ fn call_callback(
     for argument in extra {
         arguments.push(argument.to_tjs_for_call(engine)?);
     }
-    match engine.call_detached_with_objthis(function, &arguments, objthis)? {
+    // SAFETY: `objthis` is the receiver the VM passed to the still-executing
+    // native callback: a live TJS object (or null) for the duration of this
+    // call, which is exactly the contract of `call_detached_with_objthis`.
+    let result = unsafe { engine.call_detached_with_objthis(function, &arguments, objthis)? };
+    match result {
         TjsValue::Void => Ok(None),
         other => Ok(Some(owned_from_tjs(engine, other)?)),
     }

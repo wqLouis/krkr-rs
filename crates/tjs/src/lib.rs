@@ -2359,7 +2359,10 @@ name), and none was available"
 
     /// Invoke a retained detached value (see [`Self::retain_value_detached`]).
     pub fn call_detached(&self, dv: &DetachedValue, args: &[TjsValue]) -> Result<TjsValue, String> {
-        self.call_detached_with_objthis(dv, args, ptr::null_mut())
+        // SAFETY: a null `objthis` is always valid; it means "no fallback
+        // receiver", so the callable's own ObjThis (or the function object)
+        // decides the call's `this`.
+        unsafe { self.call_detached_with_objthis(dv, args, ptr::null_mut()) }
     }
 
     /// Like [`Self::call_detached`], but supplies a fallback receiver: the
@@ -2367,7 +2370,12 @@ name), and none was available"
     /// object itself (`tTJSVariantClosure::FuncCall`). A helper that invokes
     /// an anonymous callback passes the helper's calling context as `objthis`
     /// (reference `ScriptsAdd::foreach`, `scriptsEx.cpp:690-693`).
-    pub fn call_detached_with_objthis(
+    ///
+    /// # Safety
+    ///
+    /// `objthis` must be a live TJS object pointer or null for the duration
+    /// of the call.
+    pub unsafe fn call_detached_with_objthis(
         &self,
         dv: &DetachedValue,
         args: &[TjsValue],
@@ -2391,7 +2399,8 @@ name), and none was available"
             retained: 0,
         };
         let mut error: *mut c_char = ptr::null_mut();
-        // SAFETY: self.inner is a live engine and dv.id is a live retained id.
+        // SAFETY: self.inner is a live engine, dv.id is a live retained id,
+        // and the caller guarantees `objthis` is a live object or null.
         let rc = unsafe {
             tjs2_call_value_with_objthis(
                 self.inner,
