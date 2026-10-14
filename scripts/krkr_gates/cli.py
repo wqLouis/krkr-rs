@@ -30,6 +30,7 @@ from .checks import (
     plugin_parity,
     stateless,
     storage_boundary,
+    storage_media,
     surface_lock,
 )
 from .common import REPO_ROOT
@@ -43,6 +44,7 @@ CHECKS: dict[str, Callable[[list[str]], int]] = {
     "layering": layering.run,
     "storage-boundary": storage_boundary.run,
     "native-construction": native_construction.run,
+    "storage-media": storage_media.run,
     "host-facts": host_facts.run,
     "android-target": android_target.run,
     "surface-lock": surface_lock.run,
@@ -60,6 +62,7 @@ GATE_SEQUENCE: list[tuple[str, str, str, list[str]]] = [
     ("layering", "check", "layering", []),
     ("storage-boundary", "check", "storage-boundary", []),
     ("native-construction", "check", "native-construction", []),
+    ("storage-media", "check", "storage-media", []),
     (
         "cargo clippy",
         "cargo",
@@ -118,6 +121,7 @@ Checks:
   layering         layer vocabulary and unsafe placement (AGENTS §2/§5)
   storage-boundary script storage names that reach L2 or the host unstripped
   native-construction native instances left unconstructed at create time
+  storage-media    reference storage-media domains neither served nor documented
   host-facts       host seams with no production installer
   android-target   per-target backend-feature resolution
   surface-lock     VM dispatch surface vs the committed baseline

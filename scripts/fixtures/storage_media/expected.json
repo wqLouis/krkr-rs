@@ -1,0 +1,5 @@
+{
+  "findings": ["alpha"],
+  "served": ["beta"],
+  "documented": ["gamma"]
+}
