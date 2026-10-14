@@ -26,19 +26,22 @@ fmt/clippy/test steps) and must end green:
 uv run --project scripts krkr-gate gate
 ```
 
-`krkr-gate gate` runs, in order: `cargo fmt --all -- --check`; the
-`stateless`, `error-handling`, `house-style`, `layering`, `storage-boundary`,
+`krkr-gate gate` runs the ordered **static** gate: `cargo fmt --all -- --check`;
+the `stateless`, `error-handling`, `house-style`, `layering`, `storage-boundary`,
 `native-construction`,
 `storage-media`,
 `callback-objthis`
 checks;
 `cargo clippy --workspace --all-targets -- -D warnings`;
-`cargo test --workspace --no-fail-fast`;
-`cargo test -p platform --features platform-linux`;
 `cargo clippy -p platform --features platform-android --all-targets -- -D warnings`;
-`cargo test -p platform --features platform-android`; `android-target`;
+`android-target`;
 `surface-lock --update`; `surface-lock`; `native-parity`;
 `plugin-parity --no-doc`; `host-facts`.
+
+The test suites are **not** bundled into the guard script — run them with
+`uv run --project scripts krkr-gate test` (`cargo test --workspace
+--no-fail-fast`, then the `platform` suites for `platform-linux` and
+`platform-android`), or invoke `cargo test` directly.
 
 The compiler-free checks run individually with no build (subagents may use
 these; `android-target` shells out to `cargo tree` only):

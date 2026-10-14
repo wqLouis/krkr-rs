@@ -74,18 +74,6 @@ GATE_SEQUENCE: list[tuple[str, str, str, list[str]]] = [
         ["cargo", "clippy", "--workspace", "--all-targets", "--", "-D", "warnings"],
     ),
     (
-        "cargo test",
-        "cargo",
-        "cargo",
-        ["cargo", "test", "--workspace", "--no-fail-fast"],
-    ),
-    (
-        "cargo test platform-linux",
-        "cargo",
-        "cargo",
-        ["cargo", "test", "-p", "platform", "--features", "platform-linux"],
-    ),
-    (
         "cargo clippy platform-android",
         "cargo",
         "cargo",
@@ -102,18 +90,27 @@ GATE_SEQUENCE: list[tuple[str, str, str, list[str]]] = [
             "warnings",
         ],
     ),
-    (
-        "cargo test platform-android",
-        "cargo",
-        "cargo",
-        ["cargo", "test", "-p", "platform", "--features", "platform-android"],
-    ),
     ("android-target", "check", "android-target", []),
     ("surface-lock --update", "check", "surface-lock", ["--update"]),
     ("surface-lock", "check", "surface-lock", []),
     ("native-parity", "check", "native-parity", []),
     ("plugin-parity", "check", "plugin-parity", ["--no-doc"]),
     ("host-facts", "check", "host-facts", []),
+]
+
+# The workspace and per-target test suites. These are deliberately **not** part
+# of ``GATE_SEQUENCE``: the guard script is a fast static check, and the test
+# suites are run separately with ``krkr-gate test``.
+TEST_SEQUENCE: list[tuple[str, list[str]]] = [
+    ("cargo test", ["cargo", "test", "--workspace", "--no-fail-fast"]),
+    (
+        "cargo test platform-linux",
+        ["cargo", "test", "-p", "platform", "--features", "platform-linux"],
+    ),
+    (
+        "cargo test platform-android",
+        ["cargo", "test", "-p", "platform", "--features", "platform-android"],
+    ),
 ]
 
 USAGE = """krkr-gate <check> [options]
@@ -133,9 +130,10 @@ Checks:
   native-parity    native class surface vs the reference
   plugin-parity    plugin surface vs the reference
   extract-xp3      extract a file from an XP3 archive
-  gate             the full ordered gate (cargo steps are main-agent only)
+  gate             the ordered static gate (fmt, guards, clippy)
                    --no-cargo   run only the compiler-free checks
                    --keep-going do not stop at the first failing step
+  test             the workspace and platform test suites
 
 Global options:
   --quiet          only print failing checks
@@ -221,6 +219,23 @@ def run_gate(
     return 0
 
 
+def run_tests(quiet: bool) -> int:
+    failures: list[str] = []
+    for label, step_argv in TEST_SEQUENCE:
+        code = _run_cargo(step_argv, quiet)
+        if code != 0:
+            failures.append(label)
+            print(f"krkr-gate: FAIL {label}")
+        elif not quiet:
+            print(f"krkr-gate: PASS {label}")
+    if failures:
+        print(f"krkr-gate: tests FAILED ({', '.join(failures)})")
+        return 1
+    if not quiet:
+        print("krkr-gate: tests clean")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = list(argv if argv is not None else sys.argv[1:])
     quiet = "--quiet" in args
@@ -243,6 +258,8 @@ def main(argv: list[str] | None = None) -> int:
     command, rest = args[0], args[1:]
     if command == "gate":
         return run_gate(rest, quiet=quiet, verbose=verbose)
+    if command == "test":
+        return run_tests(quiet=quiet)
     if command == "extract-xp3":
         return extract_xp3.run(rest)
     if command in CHECKS:
