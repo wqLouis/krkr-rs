@@ -28,15 +28,64 @@ proposals.
 
 ---
 
+## Measured baseline (desktop, windowed Vulkan, real title)
+
+A windowed run of the release binary on `/mnt/DATA/Games/Others/test/`
+(Yuzusoft, `data.xp3` + `patch.xp3`) with `--backend vulkan --scaling fit`, at
+the 60 fps steady state, 347 clean frames:
+
+| phase | p50 | p90 | max |
+|---|---|---|---|
+| total | 1.20 ms | 1.90 | 4.90 |
+| **audio (pump)** | **1.10 ms** | 1.20 | 2.80 |
+| host_total | 0.10 | 0.80 | 3.00 |
+| host_render | 0.10 | 0.70 | 3.00 |
+| present | 0.00 | 0.70 | 2.90 |
+| submit | 0.00 | 0.00 | 0.10 |
+| sync_upload / sync_prune / host_project | 0.00 | 0.00 | 0.00 |
+| vm tick / input_* / polls / body | 0.00 | 0.00 | 0.10 |
+
+CPU: 8.9 % of one core (main thread 6.5 %, `tvp-audio` 2.0 %). GPU: 4–5 %
+util, 40–48 % memory controller, ~6.7 W, P8. gdb sampling found the main
+thread blocked in the NVIDIA/Wayland present wait and the audio workers in
+`futex`; no user-space hot loop outside the mixer.
+
+**The port is not render-bound.** Render + present is ~0.1 ms of CPU; the frame
+is ~90 % audio-mixer CPU. The measured ranking is:
+
+1. **Audio mixer per-sample streaming reads** — the CPU/power root cause:
+   `accumulate_source` takes the buffer lock and calls `notify_all` twice per
+   output frame per playing streaming source (~88,200 lock+notify pairs/s at
+   44.1 kHz stereo). Fix: bulk window read + notify only on lookahead advance.
+2. **Unconditional draw + present every frame** — a real deviation from the
+   reference `RequestUpdate` mechanism, but a **power/GPU duty-cycle** one, not
+   a slow-frame one (render is 0.1 ms). This is a root-cause fix for the
+   always-present deviation, **not** a mitigation.
+3. The per-frame scans/allocations and full-bitmap re-upload (#4/#5) measured
+   **0.00 ms** on this title; they scale with scene size and remain
+   robustness fixes.
+
+Caveats: the slow-line only fires on a gap ≥ 250 ms, so it was forced with
+`SIGSTOP`/`SIGCONT` (the phase fields describe the previous real frame); the
+release binary is stripped, so gdb sampling is library-symbol-only; the
+mixer-vs-`device.write` split inside `audio = 1.10 ms` still needs a sub-timer
+(the code shows the write is a mutex + `VecDeque` push, so the mixer dominates).
+**The 388 ms Android stall does not reproduce on the desktop** (max clean frame
+4.9 ms); it must be localized on-device with the `host_total`/`tick`/`input_*`/
+`submit` fields before committing to a fix — lazy rendering will not explain it
+if the time is inside `vm.tick`/`host.step`.
+
+---
+
 ## 0. Ranked findings
 
 | # | Finding | Where | Class | Expected impact |
 |---|---|---|---|---|
 | **1** | The host renders **and presents every frame** regardless of scene revision or input; the reference presents only when an update event is posted | `crates/app/src/lib.rs:387,404`; `crates/platform/platform/src/linux.rs:254-261` | **needs-review** (present timing) | **Critical** power: a static VN screen keeps the GPU/display pipeline at the frame-rate cap forever |
-| **2** | Streaming audio reads the decode window through the `tvp-audio` mutex **twice per output sample** and wakes the worker on every read | `crates/engine/src/sound.rs:1884,1887` (calls), `:605` (`frame`), `:456` (lock), `:634` (`notify_all`) | **safe-to-adopt** | **High** CPU/power: ~96k–192k lock+notify pairs/s per streaming source at 48 kHz stereo |
+| **2** | Streaming audio read the decode window through the `tvp-audio` mutex **twice per output sample** and woke the worker on every read | `crates/engine/src/sound.rs` (`accumulate_source`, `StreamBuffer::notify_worker`) | **fixed** | **Measured #1 root cause**; now a bulk window read + throttled notify: ~60 locks/s and ~4 notifies/s per source (~1,470× / ~22,000× fewer) |
 | **3** | Swapchain is pinned to **`FIFO`** (vsync), so `queue_present` blocks until the display refresh and throttles the loop; the reference uses `D3DPRESENT_INTERVAL_IMMEDIATE` but compensates with update-on-demand | `crates/platform/render/src/vulkan/swapchain.rs:376-384` | **safe-to-adopt** (not script-observable, D34) | High power in combination with #1 |
-| **4** | Every dirty bitmap is re-uploaded **in full**; `BitmapState` carries only a `dirty` flag, no region | `crates/app/src/lib.rs:673` | **needs-review** (cross-cutting L2) | High on Vulkan when any bitmap changes |
-| **5** | `sync_dirty_bitmaps` and `prune_stale_textures` allocate a `Vec` and scan the whole bitmap/texture set **every frame**, even when nothing is dirty | `crates/app/src/lib.rs:612-690` | **safe-to-adopt** | Medium CPU/allocator churn, scales with scene size |
+| **4** | Every dirty bitmap is re-uploaded **in full**; `BitmapState` carries only a `dirty` flag, no region | `crates/app/src/lib.rs:673` | **needs-review** (cross-cutting L2) | Measured 0 uploads in the static steady state; matters only while a bitmap changes |
+| **5** | `sync_dirty_bitmaps` and `prune_stale_textures` allocate a `Vec` and scan the whole bitmap/texture set **every frame**, even when nothing is dirty | `crates/app/src/lib.rs:612-690` | **safe-to-adopt** | Measured 0.00 ms on the test title; scales with scene size |
 | **6** | Reference **update-region plumbing** (`tTVPComplexRect` → `BeginUpdate` → partial present) is absent | `reference/cpp/core/visual/LayerManager.cpp:1046-1065`; `WindowIntf.cpp:610-624` | **needs-review** (cross-cutting) | Medium–high; the real fix for #1/#4 |
 | **7** | `Window.waitVSync` round-trips as a property but does not defer `Show()`; the reference does | `crates/compat/src/natives/visual/window.rs:1125,2520`; `reference/cpp/core/visual/WindowIntf.cpp:626-637,1808-1824` | **needs-review** (D34 semantics) | Medium: script-observable property with no effect |
 | **8** | Per-frame GPU **upload wait** and staging-ring bookkeeping run even on frames with no upload; the decode worker allocates a chunk buffer per pull | `crates/platform/render/src/vulkan/mod.rs:823`; `crates/platform/render/src/vulkan/texture.rs:235`; `crates/engine/src/sound.rs:519` | **safe-to-adopt** | Low–medium |
@@ -191,32 +240,24 @@ There is **no compositor thread**: `Host::step` is single-threaded, and the
 Vulkan backend runs on the loop thread. The only worker is the `tvp-audio`
 decode-ahead thread (`crates/engine/src/sound.rs:469-538`, spawned at `:565`).
 
-**Hot path.** `accumulate_source` resamples one output frame at a time and
-calls `source.frame(i0u)` and `source.frame(i0u + 1)` **per output sample**
-(`crates/engine/src/sound.rs:1884,1887`). For a streaming source,
-`SoundSource::frame` → `StreamSource::frame` takes the shared `Mutex`
-(`sound.rs:605`, `lock_buffer` at `:456`), and on every successful read calls
-`self.shared.work_ready.notify_all()` (`:634`) and `trim()` (`:412`, which
-`pop_front`s one sample per channel). At 48 kHz stereo that is roughly
-96k–192k lock/notify pairs per second for one playing streaming source, plus
-a `Condvar` wake of the worker that is usually already ahead of the cursor.
-`Mixer::mix` also `fill`s and then `clamp`s the whole output buffer each call
-(`sound.rs:1792-1830`).
+**Hot path — fixed.** `accumulate_source` used to resample one output frame at
+a time, calling `source.frame(i0u)` and `source.frame(i0u + 1)` **per output
+sample** (`crates/engine/src/sound.rs:1884,1887`), each taking the shared
+`Mutex`, calling `work_ready.notify_all()`, and `trim()`ing a `pop_front` per
+channel — ~88,200 lock + notify pairs per second per playing streaming source
+at 44.1 kHz stereo.
 
-**Recommendation (safe-to-adopt).** Give `SoundSource` a bulk read
-(`read_into(&mut [f32], start_frame, frames)`) that takes the lock once and
-copies a contiguous window (the worker already keeps one second decoded
-ahead, `lookahead_frames`, `sound.rs:560`); interpolate from that scratch
-buffer. Only notify `work_ready` when the cursor advances by at least the
-retain window. Audio output is not a script-observable value (D34 governs
-member getters/return values/errors, not the mixed PCM), so this is allowed;
-keep a test that the mixed samples are byte-identical to the per-frame path
-for a non-streaming source. This is the second-largest CPU/power item after
-#1.
+It now loads a contiguous interpolation window with one bulk
+`SoundSource::read_into(&mut [f32], start_frame, frames)` under a single lock
+and interpolates from local scratch, and `StreamBuffer::notify_worker` wakes
+the worker only once the cursor advances by `retain_frames`. Measured effect:
+**~60 locks/s and ~4 notifies/s** per source (~1,470× and ~22,000× fewer),
+`trim()` once per window; `bulk_window_matches_the_per_frame_path` pins the
+mixed samples byte-identical to the per-frame path.
 
-**Worker wakeups.** The worker waits on `work_ready` while the lookahead is
-full (`sound.rs:502-514`) and is woken by every reader `notify_all`. Reducing
-the notify frequency (above) removes most spurious wakeups.
+**Worker wakeups.** The worker still waits on `work_ready` while the lookahead
+is full and is woken on leading-edge starvation and reseek, so the lookahead is
+maintained; it simply sleeps instead of being woken ~88,200×/s.
 
 ---
 

@@ -135,8 +135,10 @@ build defaults to `ScalingMode::Fit` instead — a uniform scale to the largest
 size that fits, with the remainder letterboxed — so the picture keeps its
 aspect rather than being stretched on an unusual screen. That is a deliberate
 divergence from the reference's Android environment, chosen for phones; the
-desktop default stays `Game`, which is the reference's one-to-one Win32
-presentation.
+desktop launcher also defaults to `fit`, because it opens the window at the
+display's native size, so `game` would crop the declared logical screen. The
+shared `RuntimeConfig` default is still `game`, the reference's one-to-one
+Win32 presentation.
 
 The platform side of this is already done: `PlatformWindow::size()` reports the
 physical surface size and `PlatformWindow::scale_factor()` the display density.
@@ -165,7 +167,7 @@ android/                          Kotlin + Compose M3 app (Gradle)
                                   dir + runtime settings over JNI
     GameLibrary.kt                persisted picked-folder URIs + metadata
     RuntimeSettings.kt            persisted runtime options (frame rate, scaling,
-                                  archive preload)
+                                  archive preload, debug overlay)
     ui/                           Compose screens, M3 theme
   app/src/main/jniLibs/arm64-v8a/
     libkrkr_android.so            ← the Rust engine (cargo-ndk output)
@@ -248,7 +250,7 @@ than starting the engine against a path that will not resolve.
 The launcher also persists the player's runtime options and carries them into
 the engine. A **Settings** screen reachable from the launcher's top bar exposes
 the options `api::config::RuntimeConfig` carries today, with the same accepted
-values as the desktop `--fps`/`--scaling`/`--preload-archives`.
+values as the desktop `--fps`/`--scaling`/`--preload-archives`/`--debug-overlay`.
 Nothing is offered for a feature the engine has no knob for
 — a control that silently did nothing is the bug class this project forbids.
 
@@ -257,16 +259,17 @@ Nothing is offered for a feature the engine has no knob for
 | Frame-rate limit | decimal integer `1..=1000` fps | `60` | reference `fps_limit` default 60 (`reference/cpp/core/environ/ui/PreferenceConfig.h:304-309`); the same range `--fps` accepts |
 | Presentation scaling | `game`, `fit`, `fill`, `expand` | `fit` | `game` is the reference's one-to-one Win32 presentation; `fit` is the Android default (§2.2), because a phone must not present the raw logical size |
 | Archive preload | `true`, `false` | `false` | whether every mounted archive is read into memory when it mounts; the cost is that archive's size in resident memory, the gain is that entry reads stop touching the backing filesystem |
+| Debug overlay | `true`, `false` | `false` | draw the frame rate and the process's resident memory in the top-left corner; a render-only panel, never a script-visible layer or bitmap |
 | Engine log level | `off`, `error`, `warn`, `info`, `debug`, `trace` | `info` | how much the engine writes to `krkr.log`; `debug`/`trace` are diagnostic and produce large logs (see §7) |
 
 `fill` and `expand` are exposed because the engine honours them; the desktop
-default remains `game`.
+launcher and Android both default to `fit`.
 
-The shared `RuntimeConfig` also carries `debug_overlay` (the desktop
-`--debug-overlay`), but Android has no overlay control: there is no JNI field
-and no `settings.json` key for it, and `crates/android/src/config.rs` fixes it
-to `false`. It is a value the shared type carries, not a switch that does
-nothing.
+The debug overlay is off by default and persisted under the `debug_overlay`
+key; `KrkrGameActivity` publishes it as `pendingDebugOverlay` and
+`crates/android` passes it to `app::HostConfig::with_debug_overlay`. It is a
+diagnostic panel only — a render-only node, never a script-visible layer or
+bitmap.
 
 The archive-preload switch is the option to weigh on a phone: it is not a debug
 mode, it reads the archive into the same storage as before so every entry
@@ -280,7 +283,7 @@ inspectable, atomically-written convention (§3.1):
 
 ```json
 { "version": 1, "frame_rate": "60", "scaling": "fit",
-  "preload_archives": "false", "log_level": "info" }
+  "preload_archives": "false", "debug_overlay": "false", "log_level": "info" }
 ```
 
 `RuntimeSettings.kt` keeps each value as the exact string the user chose; it
@@ -291,18 +294,20 @@ The configuration path mirrors the desktop launcher's, with the settings file
 playing the role of the `KRKR_CONFIG` file:
 
 1. **The settings UI** validates the frame rate (`1..=1000`), the scaling (one
-   of the four) and the archive preload (`true`/`false`) and writes
+   of the four), the archive preload (`true`/`false`) and the debug overlay
+   (`true`/`false`) and writes
    `settings.json` atomically. A value loaded from a hand-edited file that is
    not one of the accepted values is shown and must be corrected before it can
    be saved; the hand-edited value is preserved, not rewritten.
 2. **`KrkrGameActivity`** reads `settings.json` in `onCreate`/`onNewIntent`
-   *before* `super.onCreate` and copies the four values onto the static fields
-   `pendingFrameRate`, `pendingScaling`, `pendingPreloadArchives` and
-   `pendingLogLevel` — the same JNI channel
+   *before* `super.onCreate` and copies the five values onto the static fields
+   `pendingFrameRate`, `pendingScaling`, `pendingPreloadArchives`,
+   `pendingDebugOverlay` and `pendingLogLevel` — the same JNI channel
    `pendingGameDir`/`pendingGameName`/`pendingStateDir` already use.
 3. **`crates/android`** reads those fields (`jni_fields.rs`) and resolves them
    (`config.rs`) into a `RuntimeConfig`, applying `fit` as the presentation
-   default and `false` as the preload default. The log level is resolved first,
+   default and `false` as the preload and debug-overlay defaults. The log level
+   is resolved first,
    before the logger is installed, because it selects the filter; its default
    is `info`. An unparseable or out-of-range value is a typed `ConfigError`
    naming the option and the accepted values; it is written to `krkr_state.json`
@@ -310,7 +315,8 @@ playing the role of the `KRKR_CONFIG` file:
    default.
 4. **The shared emulator host** receives the finished value: the
    `crates/android` loop passes the scaling into the render host, the
-   archive-preload choice into `app::GameHost::open_with_preload`, and the
+   archive-preload choice into `app::GameHost::open_with_preload`, the
+   debug-overlay choice into `app::HostConfig::with_debug_overlay`, and the
    frame period into its ticker, exactly as the desktop `app::run` does; the
    log level becomes the process logger's filter. The emulator core performs no
    configuration I/O, exactly as on the desktop (`docs/runtime-config.md`).

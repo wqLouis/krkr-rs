@@ -133,6 +133,19 @@ Decision: implement the reference's own form. Where the platform seam goes, keep
 it behind the L2 menu state so a native backend can be added later without
 touching L3 — but no native backend is built now:
 
+* **The in-game system menu is not drawn at all, and that is a compat blocker,
+  not an appearance divergence.** `MenuItem.popup`
+  (`crates/compat/src/natives/menu_item.rs:786`) keeps the tree in `MenuState`
+  and returns the reference success value without drawing, so a game that puts
+  language/settings behind a popup leaves the player stuck with no way to
+  choose. The reference builds engine-drawn rows from the same tree
+  (`TVPShowPopMenu` → `TVPInGameMenuForm`,
+  `reference/cpp/core/environ/ui/InGameMenuForm.cpp:14-115`,
+  `GameMainMenu.cpp:99`), then removes the form and fires the item's `onClick`.
+  Implementing that form — rows from `MenuState`, hit-test, activation →
+  remove + `onClick` — is the fix and is the largest remaining blocker for such
+  titles.
+
 * **Linux native menus/dialogs are unsupported and deferred.** The XDG Desktop
   Portal has no menu or popup interface, so there is nothing to call; the
   toolkit route (GTK popover) wants to own the main loop, which conflicts with
@@ -203,9 +216,16 @@ raises because the reference raises.
   registered but never synthesized (no reference recognizer posts them);
   layer-native `action` forwarding (only the window path forwards, because both
   would double-fire); window `onMouseEnter`; `onMouseDown` → `PrimaryMouseMove`.
-* **IME** exists on Linux (`Ime::Commit → onKeyPress, split per character`);
-  **Android ignores text input entirely** (`crates/android/src/input.rs:45-47`),
-  which breaks any title that asks the player to type a name.
+* **IME / on-screen keyboard is platform-level and incomplete.** Linux forwards
+  `Ime::Commit → onKeyPress` (split per character), but there is no xkb/keymap
+  or dead-key handling beyond what winit provides, and the reference's
+  `Window.imeMode`/`Layer.imeMode` select an IME mode the port stores but never
+  acts on. **Android ignores text input entirely**
+  (`crates/android/src/input.rs:45-47`) and never requests the soft keyboard, so
+  a title that asks the player to type a name has no way to open the on-screen
+  keyboard. Showing the Android IME (and honouring `imeMode`) is the platform
+  piece; it is **not** the cause of the `keybinder.tjs` startup failure (that is
+  the quickmenu `DialogLayer.names` item in §5).
 
 ## 8. File system / XP3
 
