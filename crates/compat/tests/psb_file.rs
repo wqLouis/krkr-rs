@@ -463,6 +463,35 @@ fn load_registers_psb_resources_in_the_psb_media() {
     );
 }
 
+// A loaded file's `psb://` registrations belong to its lifetime: the
+// reference `PSBMedia` owns the resources while the `PSBFile` that registered
+// them is alive (`reference/cpp/plugins/psbfile/PSBMedia.cpp:79-82`, called
+// from `load` at `main.cpp:60-68`), and a page that loads then drops its PIMG
+// must not grow the storage-media table forever. The table is keyed by name
+// and owner-counted, so every registration is matched by a release.
+#[test]
+fn destroying_a_loaded_psb_file_releases_its_media() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.write_fixture("fixture.psb", &build_fixture());
+
+    let baseline = env._storage.media_count();
+    env.run(
+        "for (var cycle = 0; cycle < 5; cycle++) { \
+             var f = new PSBFile(); \
+             f.load('fixture.psb'); \
+             f = null; \
+         }",
+    );
+    env.engine.do_gc().expect("idle compact");
+
+    assert_eq!(
+        env._storage.media_count(),
+        baseline,
+        "a dropped PSBFile must release every psb:// media registration"
+    );
+}
+
 // A missing storage raises: the reference's `loadPSBFile` calls
 // `TVPCreateStream`, which throws out of the call
 // (`reference/cpp/plugins/psbfile/PSBFile.cpp:529-534`,

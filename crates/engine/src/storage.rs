@@ -123,10 +123,23 @@ pub struct Storage {
     /// by the full storage name (e.g. `psb://quickmenu.pimg/11632.tlg`).
     /// [`Self::read`]/[`Self::read_prefix`]/[`Self::exists`] serve these
     /// before disk and archive resolution; L2 only stores the bytes.
-    media: RefCell<HashMap<String, Vec<u8>>>,
+    ///
+    /// Each entry counts its live registrations so a name shared by several
+    /// providers is freed only when the last one releases it, matching the
+    /// reference `PSBMedia` shared-resource lifetime.
+    media: RefCell<HashMap<String, MediaEntry>>,
     /// Lazily built resolver tables, invalidated when the auto-path list or
     /// the mounted archives change.
     resolution_cache: RefCell<ResolutionCache>,
+}
+
+/// One virtual media entry: the bytes plus the number of live registrations.
+#[derive(Clone, Debug)]
+struct MediaEntry {
+    /// The bytes served for the name.
+    bytes: Vec<u8>,
+    /// How many providers currently hold the name registered.
+    owners: usize,
 }
 
 /// A resolved storage location.
@@ -1468,16 +1481,55 @@ impl Storage {
     /// L3 uses this for TVP storage-media providers (`psb://…`, `psd://…`):
     /// the bytes are served by [`Self::read`]/[`Self::read_prefix`] and
     /// reported by [`Self::exists`] before disk and archive resolution. A
-    /// later registration for the same name replaces the earlier bytes.
+    /// later registration for the same name replaces the earlier bytes and
+    /// adds one owner; [`Self::unregister_media`] removes one owner and frees
+    /// the bytes when the last owner is gone.
     pub fn register_media(&self, name: String, bytes: Vec<u8>) {
-        self.media.borrow_mut().insert(name, bytes);
+        let mut media = self.media.borrow_mut();
+        match media.get_mut(&name) {
+            Some(entry) => {
+                entry.bytes = bytes;
+                entry.owners = entry.owners.saturating_add(1);
+            }
+            None => {
+                media.insert(name, MediaEntry { bytes, owners: 1 });
+            }
+        }
+    }
+
+    /// Releases one registration of a virtual media entry.
+    ///
+    /// Returns `true` when the entry was freed (this was its last owner) and
+    /// `false` when the name was unknown or other owners remain. A provider
+    /// calls this for every name it registered when its owning object goes,
+    /// so the table does not grow with every load.
+    pub fn unregister_media(&self, name: &str) -> bool {
+        let mut media = self.media.borrow_mut();
+        let Some(entry) = media.get_mut(name) else {
+            return false;
+        };
+        if entry.owners > 1 {
+            entry.owners -= 1;
+            false
+        } else {
+            media.remove(name);
+            true
+        }
+    }
+
+    /// The number of virtual media names currently registered.
+    ///
+    /// A diagnostic for tests and host reporting; it is not part of
+    /// resolution.
+    pub fn media_count(&self) -> usize {
+        self.media.borrow().len()
     }
 
     /// Reads a storage entry to bytes (disk file or archive member).
     pub fn read(&self, name: &str) -> Result<Vec<u8>, StorageReadError> {
-        if let Some(bytes) = self.media.borrow().get(name).cloned() {
-            self.count_read_bytes(bytes.len());
-            return Ok(bytes);
+        if let Some(entry) = self.media.borrow().get(name).cloned() {
+            self.count_read_bytes(entry.bytes.len());
+            return Ok(entry.bytes);
         }
         let bytes = match self.find(name)? {
             Some(Location::Disk(path)) => {
@@ -1500,7 +1552,8 @@ impl Storage {
     /// (`tTVPXP3ArchiveStream`) instead. Resolution and filter semantics are
     /// [`Self::read`]'s.
     pub fn read_prefix(&self, name: &str, max_len: usize) -> Result<Vec<u8>, StorageReadError> {
-        if let Some(mut bytes) = self.media.borrow().get(name).cloned() {
+        if let Some(entry) = self.media.borrow().get(name).cloned() {
+            let mut bytes = entry.bytes;
             bytes.truncate(max_len);
             self.count_read_bytes(bytes.len());
             return Ok(bytes);

@@ -58,6 +58,23 @@ impl MotionStore {
         self.last.and_then(|id| self.get(id))
     }
 
+    /// Remove a snapshot by id (reference `detail::unregisterModuleSnapshot`,
+    /// `RuntimeSupport.cpp:1575-1582`). A player that already loaded the
+    /// snapshot keeps its own `Arc`, so an in-flight motion is unaffected.
+    pub(crate) fn remove(&mut self, id: u64) -> Option<Arc<MotionSnapshot>> {
+        if self.last == Some(id) {
+            self.last = None;
+        }
+        self.snapshots.remove(&id)
+    }
+
+    /// Drop every snapshot (reference `detail::clearModuleSnapshots`,
+    /// `RuntimeSupport.cpp:1584-1587`).
+    pub(crate) fn clear_snapshots(&mut self) {
+        self.snapshots.clear();
+        self.last = None;
+    }
+
     /// The next pseudo-random value in `[0, 1)`.
     ///
     /// The reference `Player::random()` delegates to a
@@ -394,7 +411,7 @@ extern "C" fn resource_unload(
     out_error: *mut *mut std::ffi::c_char,
     _objthis: *mut std::ffi::c_void,
 ) -> std::os::raw::c_int {
-    let Some(_res) = resolve(engine) else {
+    let Some(res) = resolve(engine) else {
         return report_error(out_error, super::helpers::NO_BINDING);
     };
     // SAFETY: the VM guarantees the live payload.
@@ -418,6 +435,7 @@ extern "C" fn resource_unload(
         .find_map(StoredValue::object_id);
     match victim {
         Some(id) => {
+            unregister_snapshot(&res, id);
             inst.loaded
                 .retain(|_, module| module.object_id() != Some(id));
         }
@@ -431,6 +449,24 @@ extern "C" fn resource_unload(
     0
 }
 
+/// Remove the snapshot a cached module registered (reference
+/// `detail::unregisterModuleSnapshot`, called from `ResourceManager::unload`
+/// at `ResourceManager.cpp:194`). The module carries its snapshot id in the
+/// `__motionSnapshot` member (`module_object`).
+fn unregister_snapshot(res: &crate::natives::system::EngineBinding, module_raw: usize) {
+    let Ok(TjsValue::Integer(snapshot_id)) = res
+        .engine()
+        .member(module_raw as *mut std::ffi::c_void, "__motionSnapshot")
+    else {
+        return;
+    };
+    let ctx = res.ctx();
+    // SAFETY: a `CompatCtx` is only created for a bound, live engine.
+    let _ = unsafe { ctx.services() }
+        .state::<MotionStore>()
+        .remove(snapshot_id as u64);
+}
+
 extern "C" fn resource_clear_cache(
     engine: *mut std::ffi::c_void,
     instance: *mut std::ffi::c_void,
@@ -440,7 +476,7 @@ extern "C" fn resource_clear_cache(
     out_error: *mut *mut std::ffi::c_char,
     _objthis: *mut std::ffi::c_void,
 ) -> std::os::raw::c_int {
-    let Some(_res) = resolve(engine) else {
+    let Some(res) = resolve(engine) else {
         return report_error(out_error, super::helpers::NO_BINDING);
     };
     // SAFETY: the VM guarantees the live payload.
@@ -448,6 +484,14 @@ extern "C" fn resource_clear_cache(
         return report_error(out_error, "ResourceManager: null instance");
     };
     inst.loaded.clear();
+    // The reference `clearCache` clears the module-snapshot registry too
+    // (`detail::clearModuleSnapshots`, `ResourceManager.cpp:220`), so the
+    // parsed documents do not outlive the cache that named them.
+    let ctx = res.ctx();
+    // SAFETY: a `CompatCtx` is only created for a bound, live engine.
+    unsafe { ctx.services() }
+        .state::<MotionStore>()
+        .clear_snapshots();
     // `clearCache` also resets the layer-id allocator in the reference
     // (`reference/cpp/plugins/motionplayer/ResourceManager.cpp:207-224`):
     // the next `requireLayerId` hands out 1 again.

@@ -207,6 +207,29 @@ fn registered_media_is_served_before_disk_and_archive() {
     assert!(storage.read("psb://fixture.psb/other").is_err());
 }
 
+// A provider releases its `register_media` names when its owning object goes.
+// The table is owner-counted, so a name registered twice survives one release
+// and is freed by the second; a load/drop cycle therefore cannot grow the
+// storage-media table without bound.
+#[test]
+fn media_registrations_are_released_by_their_owners() {
+    let storage = mount_memory(&[]);
+    storage.register_media("psb://a.pimg/res".into(), b"first".to_vec());
+    storage.register_media("psb://a.pimg/res".into(), b"second".to_vec());
+    assert_eq!(storage.media_count(), 1);
+
+    assert!(
+        !storage.unregister_media("psb://a.pimg/res"),
+        "another owner remains"
+    );
+    // The later registration owns the bytes while it is alive.
+    assert_eq!(storage.read("psb://a.pimg/res").unwrap(), b"second");
+    assert!(storage.unregister_media("psb://a.pimg/res"));
+    assert_eq!(storage.media_count(), 0);
+    assert!(storage.read("psb://a.pimg/res").is_err());
+    assert!(!storage.unregister_media("psb://missing"));
+}
+
 #[test]
 fn arc_xp3_path_targets_one_archive() {
     let a = build_xp3(&[("shared.txt", b"from a", false)]);
