@@ -12,11 +12,16 @@
 //! is its `filesDir.absolutePath`, where [`crate::state`] writes
 //! `krkr_state.json`. [`pendingFrameRate`](FIELD_FRAME_RATE),
 //! [`pendingScaling`](FIELD_SCALING),
-//! [`pendingPreloadArchives`](FIELD_PRELOAD_ARCHIVES) and
+//! [`pendingPreloadArchives`](FIELD_PRELOAD_ARCHIVES),
+//! [`pendingDebugOverlay`](FIELD_DEBUG_OVERLAY) and
 //! [`pendingLogLevel`](FIELD_LOG_LEVEL) are the launcher's
 //! persisted runtime settings; [`crate::config`] validates them into the
 //! values the emulator receives.
+//!
+//! The field-name constants compile on the host too, so a unit test pins the
+//! names `KrkrGameActivity` publishes; only the read itself is Android-only.
 
+#[cfg(target_os = "android")]
 use android_activity::AndroidApp;
 
 /// Static field on `dev.krkr.rs.KrkrGameActivity` holding the chosen folder.
@@ -34,6 +39,9 @@ pub(crate) const FIELD_SCALING: &str = "pendingScaling";
 /// Static field on the same class holding the archive-preload choice (`true`
 /// or `false`); unset means the launcher had no override.
 pub(crate) const FIELD_PRELOAD_ARCHIVES: &str = "pendingPreloadArchives";
+/// Static field on the same class holding the debug-overlay choice (`true` or
+/// `false`); unset means the launcher had no override.
+pub(crate) const FIELD_DEBUG_OVERLAY: &str = "pendingDebugOverlay";
 /// Static field on the same class holding the log level
 /// (`off`/`error`/`warn`/`info`/`debug`/`trace`); unset means the launcher had
 /// no override.
@@ -54,6 +62,7 @@ pub(crate) const SIG_STRING: &str = "Ljava/lang/String;";
 /// directory rather than silently defaulted. Every failure is logged and any
 /// pending Java exception is cleared, so the `android_main` thread is left
 /// clean for the loop's later JNI use.
+#[cfg(target_os = "android")]
 #[allow(unsafe_code)]
 pub(crate) fn activity_static_string(
     app: &AndroidApp,
@@ -103,6 +112,7 @@ pub(crate) fn activity_static_string(
 }
 
 /// Logs a failed JNI step, clears the pending exception and yields the error.
+#[cfg(target_os = "android")]
 fn report<T>(
     env: &mut jni::JNIEnv<'_>,
     field: &str,
@@ -113,4 +123,25 @@ fn report<T>(
     // JNI call on this thread is not poisoned.
     let _ = env.exception_clear();
     Err(error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The field names must match the `@JvmField` static fields
+    /// `KrkrGameActivity` publishes; a rename on one side only would make the
+    /// JNI read observe null and silently take the default.
+    #[test]
+    fn field_names_match_the_launcher_static_fields() {
+        assert_eq!(FIELD_GAME_DIR, "pendingGameDir");
+        assert_eq!(FIELD_GAME_NAME, "pendingGameName");
+        assert_eq!(FIELD_STATE_DIR, "pendingStateDir");
+        assert_eq!(FIELD_FRAME_RATE, "pendingFrameRate");
+        assert_eq!(FIELD_SCALING, "pendingScaling");
+        assert_eq!(FIELD_PRELOAD_ARCHIVES, "pendingPreloadArchives");
+        assert_eq!(FIELD_DEBUG_OVERLAY, "pendingDebugOverlay");
+        assert_eq!(FIELD_LOG_LEVEL, "pendingLogLevel");
+        assert_eq!(SIG_STRING, "Ljava/lang/String;");
+    }
 }

@@ -156,4 +156,10 @@ dependencies {
     // `com.google.androidgamesdk.GameActivity` — which is what
     // `KrkrGameActivity.kt` imports.
     implementation("androidx.games:games-activity:4.4.2")
+
+    // JVM unit tests for the pure launcher settings JSON. Android's bundled
+    // `org.json` is a stub off-device, so the upstream artifact supplies a real
+    // implementation for the round-trip tests.
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
 }

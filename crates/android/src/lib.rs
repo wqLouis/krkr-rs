@@ -17,9 +17,10 @@
 //! * **The presentation default.** Phones always present the scene scaled
 //!   uniformly to fit the screen, with the remainder letterboxed
 //!   (`ScalingMode::Fit`), instead of showing the raw logical size. The
-//!   desktop default stays `Game`, the reference's one-to-one Win32
-//!   presentation; the user's saved scaling setting overrides either. See
-//!   `docs/android.md` §2.2 and §3.2.
+//!   desktop launcher defaults to the same `fit` presentation so a
+//!   native-resolution window shows the whole scene; the shared
+//!   `RuntimeConfig` default is still `game`, and the user's saved scaling
+//!   setting overrides either. See `docs/android.md` §2.2 and §3.2.
 //!
 //! The state-file writer ([`state`]), the log-file sink ([`log_file`]) and the
 //! touch→mouse synthesizer ([`gesture`]) are plain `std` and name no Android
@@ -37,7 +38,7 @@ mod gesture;
 mod host;
 #[cfg(target_os = "android")]
 mod input;
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", test))]
 #[allow(unsafe_code)]
 mod jni_fields;
 #[cfg(any(target_os = "android", test))]
@@ -70,8 +71,9 @@ mod android_entry {
     /// file and the loop is never started. The launcher's log level is read
     /// next and validated before the logger is installed, because it selects
     /// the filter. The remaining saved runtime settings (frame-rate limit,
-    /// presentation scaling and archive preload) are read over the same JNI
-    /// channel and resolved by [`crate::config`]: the presentation default is
+    /// presentation scaling, archive preload and debug overlay) are read over
+    /// the same JNI channel and resolved by [`crate::config`]: the presentation
+    /// default is
     /// [`PresentationScaling::Fit`] and the user's stored choice overrides it,
     /// and an out-of-range value is reported and the loop is never started.
     #[allow(unsafe_code)]
@@ -190,10 +192,18 @@ mod android_entry {
                 return;
             }
         };
+        let debug_overlay = match read_settings_field(&app, jni_fields::FIELD_DEBUG_OVERLAY) {
+            Ok(value) => value,
+            Err(message) => {
+                report_startup_failure(&message);
+                return;
+            }
+        };
         let runtime = match config::resolve_runtime_config(
             frame_rate.as_deref(),
             scaling.as_deref(),
             preload_archives.as_deref(),
+            debug_overlay.as_deref(),
         ) {
             Ok(runtime) => runtime,
             Err(error) => {
@@ -204,10 +214,11 @@ mod android_entry {
             }
         };
         log::info!(
-            "krkr: frame rate {} fps, scaling {}, preload archives {}, log level {}",
+            "krkr: frame rate {} fps, scaling {}, preload archives {}, debug overlay {}, log level {}",
             runtime.frame_rate_limit.fps(),
             runtime.scaling.as_str(),
             runtime.preload_archives,
+            runtime.debug_overlay,
             log_level.as_filter()
         );
         let handler = host::AndroidHost::new(
@@ -215,6 +226,7 @@ mod android_entry {
             map_scaling(runtime.scaling),
             game_dir,
             runtime.preload_archives,
+            runtime.debug_overlay,
         );
         let outcome = host::run_loop(
             app,

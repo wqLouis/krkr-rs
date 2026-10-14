@@ -1047,11 +1047,11 @@ private fun launchGame(
  * The runtime-settings screen: the launcher's persisted copy of the engine
  * options the player can change.
  *
- * It exposes the four options the engine honours — the frame-rate limit, the
- * presentation scaling, the archive preload and the engine log level — with
- * the same accepted values and range as the desktop CLI's `--fps`, `--scaling`
- * and `preload_archives` (`api::config`). Nothing is offered for a feature the
- * engine has no knob for.
+ * It exposes the five options the engine honours — the frame-rate limit, the
+ * presentation scaling, the archive preload, the debug overlay and the engine
+ * log level — with the same accepted values and range as the desktop CLI's
+ * `--fps`, `--scaling`, `--preload-archives` and `--debug-overlay`
+ * (`api::config`). Nothing is offered for a feature the engine has no knob for.
  *
  * Saving writes the settings file atomically; [KrkrGameActivity] reads it and
  * publishes it over JNI on the next launch, which is why the change is described
@@ -1070,6 +1070,7 @@ private fun SettingsScreen(
     var frameRate by rememberSaveable { mutableStateOf(saved.frameRate) }
     var scaling by rememberSaveable { mutableStateOf(saved.scaling) }
     var preloadArchives by rememberSaveable { mutableStateOf(saved.preloadArchives) }
+    var debugOverlay by rememberSaveable { mutableStateOf(saved.debugOverlay) }
     var logLevel by rememberSaveable { mutableStateOf(saved.logLevel) }
 
     // Validate only the frame rate here: the other values can only be set from
@@ -1080,6 +1081,8 @@ private fun SettingsScreen(
     val scalingKnown = scaling in RuntimeOptions.SCALING
     val preloadKnown = preloadArchives in RuntimeOptions.PRELOAD_VALUES
     val preloadChecked = preloadArchives.toBooleanStrictOrNull() ?: false
+    val debugKnown = debugOverlay in RuntimeOptions.DEBUG_OVERLAY_VALUES
+    val debugChecked = debugOverlay.toBooleanStrictOrNull() ?: false
     val logLevelKnown = logLevel in RuntimeOptions.LOG_LEVELS
 
     Column(
@@ -1203,6 +1206,43 @@ private fun SettingsScreen(
         }
         Spacer(Modifier.height(24.dp))
 
+        Text("Debug overlay", style = MaterialTheme.typography.titleSmall)
+        Spacer(Modifier.height(4.dp))
+        Text(
+            RuntimeOptions.debugOverlayDescription(),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Switch(
+                checked = debugChecked,
+                onCheckedChange = { debugOverlay = it.toString() },
+                // The visible "Debug overlay" label is a separate node, so
+                // name the switch itself for TalkBack.
+                modifier = Modifier.semantics { contentDescription = "Debug overlay" },
+            )
+            Spacer(Modifier.width(8.dp))
+            Text(
+                text = if (debugChecked) "On" else "Off",
+                style = MaterialTheme.typography.bodyLarge,
+            )
+        }
+        if (!debugKnown) {
+            Text(
+                text = "This saved value (\"$debugOverlay\") is not one of " +
+                    "${RuntimeOptions.DEBUG_OVERLAY_VALUES.joinToString(", ")}; " +
+                    "toggle the switch before saving.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+            )
+        }
+        Spacer(Modifier.height(24.dp))
+
         Text("Log level", style = MaterialTheme.typography.titleSmall)
         Spacer(Modifier.height(4.dp))
         Text(
@@ -1258,6 +1298,7 @@ private fun SettingsScreen(
                 frameRate = RuntimeOptions.DEFAULT_FRAME_RATE.toString()
                 scaling = RuntimeOptions.DEFAULT_SCALING
                 preloadArchives = RuntimeOptions.DEFAULT_PRELOAD_ARCHIVES
+                debugOverlay = RuntimeOptions.DEFAULT_DEBUG_OVERLAY
                 logLevel = RuntimeOptions.DEFAULT_LOG_LEVEL
             }) { Text("Restore defaults") }
             Button(onClick = {
@@ -1277,6 +1318,10 @@ private fun SettingsScreen(
                     onNotify("Choose one of: ${RuntimeOptions.PRELOAD_VALUES.joinToString(", ")}.")
                     return@Button
                 }
+                if (debugOverlay !in RuntimeOptions.DEBUG_OVERLAY_VALUES) {
+                    onNotify("Choose one of: ${RuntimeOptions.DEBUG_OVERLAY_VALUES.joinToString(", ")}.")
+                    return@Button
+                }
                 if (logLevel !in RuntimeOptions.LOG_LEVELS) {
                     onNotify("Choose one of: ${RuntimeOptions.LOG_LEVELS.joinToString(", ")}.")
                     return@Button
@@ -1286,6 +1331,7 @@ private fun SettingsScreen(
                             frameRate = fps.toString(),
                             scaling = scaling,
                             preloadArchives = preloadArchives,
+                            debugOverlay = debugOverlay,
                             logLevel = logLevel,
                         ),
                     )

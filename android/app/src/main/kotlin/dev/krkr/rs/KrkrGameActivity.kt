@@ -105,6 +105,16 @@ class KrkrGameActivity : GameActivity() {
         var pendingPreloadArchives: String? = null
 
         /**
+         * Whether the debug overlay (frame rate and resident memory) is drawn
+         * (`true` or `false`), read through JNI like [pendingFrameRate].
+         *
+         * Null means the launcher had no persisted choice, so the engine's
+         * `false` default applies.
+         */
+        @JvmField
+        var pendingDebugOverlay: String? = null
+
+        /**
          * The engine log level the user chose, one of `off`, `error`, `warn`,
          * `info`, `debug`, `trace`, read through JNI like [pendingFrameRate].
          *
@@ -130,7 +140,7 @@ class KrkrGameActivity : GameActivity() {
         pendingStateDir = filesDir.absolutePath
         publishRuntimeSettings()
         LauncherLog.i(
-            "KrkrGameActivity.onCreate: game=${pendingGameName ?: "?"} dir=${pendingGameDir ?: "?"} stateDir=${pendingStateDir ?: "?"} fps=${pendingFrameRate ?: "?"} scaling=${pendingScaling ?: "?"} preload=${pendingPreloadArchives ?: "?"} log=${pendingLogLevel ?: "?"}",
+            "KrkrGameActivity.onCreate: game=${pendingGameName ?: "?"} dir=${pendingGameDir ?: "?"} stateDir=${pendingStateDir ?: "?"} fps=${pendingFrameRate ?: "?"} scaling=${pendingScaling ?: "?"} preload=${pendingPreloadArchives ?: "?"} overlay=${pendingDebugOverlay ?: "?"} log=${pendingLogLevel ?: "?"}",
         )
         super.onCreate(savedInstanceState)
 
@@ -171,7 +181,7 @@ class KrkrGameActivity : GameActivity() {
         pendingStateDir = filesDir.absolutePath
         publishRuntimeSettings()
         LauncherLog.i(
-            "KrkrGameActivity.onNewIntent: engine already running; game=${pendingGameName ?: "?"} dir=${pendingGameDir ?: "?"} fps=${pendingFrameRate ?: "?"} scaling=${pendingScaling ?: "?"} preload=${pendingPreloadArchives ?: "?"} log=${pendingLogLevel ?: "?"}",
+            "KrkrGameActivity.onNewIntent: engine already running; game=${pendingGameName ?: "?"} dir=${pendingGameDir ?: "?"} fps=${pendingFrameRate ?: "?"} scaling=${pendingScaling ?: "?"} preload=${pendingPreloadArchives ?: "?"} overlay=${pendingDebugOverlay ?: "?"} log=${pendingLogLevel ?: "?"}",
         )
     }
 
@@ -184,6 +194,7 @@ class KrkrGameActivity : GameActivity() {
         pendingFrameRate = settings.frameRate
         pendingScaling = settings.scaling
         pendingPreloadArchives = settings.preloadArchives
+        pendingDebugOverlay = settings.debugOverlay
         pendingLogLevel = settings.logLevel
     }
 }

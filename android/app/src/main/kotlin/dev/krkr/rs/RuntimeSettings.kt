@@ -19,6 +19,7 @@ data class RuntimeSettings(
     val frameRate: String,
     val scaling: String,
     val preloadArchives: String,
+    val debugOverlay: String,
     val logLevel: String,
 )
 
@@ -26,8 +27,8 @@ data class RuntimeSettings(
  * The accepted runtime options, their ranges and their defaults.
  *
  * These mirror `api::config::{FrameRateLimit, PresentationScaling}` and the
- * boolean `preload_archives` option: every default and accepted value comes
- * from there, while the Android default presentation is
+ * boolean `preload_archives` and `debug_overlay` options: every default and
+ * accepted value comes from there, while the Android default presentation is
  * [DEFAULT_SCALING] (`fit`) rather than the desktop `game`
  * (`docs/android.md` §2.2). Only options the engine can actually honour are
  * listed — there is no control for texture resolution or audio buffering,
@@ -67,11 +68,18 @@ object RuntimeOptions {
     /** The built-in archive-preload default; mirrors `RuntimeConfig`. */
     const val DEFAULT_PRELOAD_ARCHIVES = "false"
 
+    /** The two accepted debug-overlay values, as stored in the file. */
+    val DEBUG_OVERLAY_VALUES = listOf("true", "false")
+
+    /** The built-in debug-overlay default; mirrors `RuntimeConfig`. */
+    const val DEFAULT_DEBUG_OVERLAY = "false"
+
     /** The stored defaults, used when the settings file is missing or empty. */
     val DEFAULTS = RuntimeSettings(
         frameRate = DEFAULT_FRAME_RATE.toString(),
         scaling = DEFAULT_SCALING,
         preloadArchives = DEFAULT_PRELOAD_ARCHIVES,
+        debugOverlay = DEFAULT_DEBUG_OVERLAY,
         logLevel = DEFAULT_LOG_LEVEL,
     )
 
@@ -102,6 +110,16 @@ object RuntimeOptions {
         "Default: ${if (DEFAULT_PRELOAD_ARCHIVES == "true") "on" else "off"}. " +
             PRELOAD_DESCRIPTION
 
+    /**
+     * A sentence naming the default and what the panel shows, above the switch.
+     *
+     * It is a render-only panel, never a script-visible layer or bitmap, so it
+     * cannot change the scene a script observes.
+     */
+    fun debugOverlayDescription(): String =
+        "Default: ${if (DEFAULT_DEBUG_OVERLAY == "true") "on" else "off"}. " +
+            "Draw the frame rate and resident memory in the top-left corner."
+
     /** The accepted log levels, from least to most records; mirrors `pendingLogLevel`. */
     val LOG_LEVELS = listOf("off", "error", "warn", "info", "debug", "trace")
 
@@ -130,6 +148,56 @@ object RuntimeOptions {
 }
 
 /**
+ * Parses the persisted settings JSON into [RuntimeSettings].
+ *
+ * Every present value is preserved verbatim — including one that is not an
+ * accepted option — and the fallback applies only when the key is absent, null
+ * or blank. Validation belongs to the engine's read side, so an invalid value
+ * reaches it with its option name instead of being silently replaced here.
+ */
+internal fun settingsFromJson(root: JSONObject): RuntimeSettings = RuntimeSettings(
+    frameRate = stringField(root, FIELD_FRAME_RATE, RuntimeOptions.DEFAULTS.frameRate),
+    scaling = stringField(root, FIELD_SCALING, RuntimeOptions.DEFAULTS.scaling),
+    preloadArchives = stringField(
+        root,
+        FIELD_PRELOAD_ARCHIVES,
+        RuntimeOptions.DEFAULTS.preloadArchives,
+    ),
+    debugOverlay = stringField(root, FIELD_DEBUG_OVERLAY, RuntimeOptions.DEFAULTS.debugOverlay),
+    logLevel = stringField(root, FIELD_LOG_LEVEL, RuntimeOptions.DEFAULTS.logLevel),
+)
+
+/** Serialises [settings] into the JSON object [RuntimeSettingsStore.write] stores. */
+internal fun settingsToJson(settings: RuntimeSettings): JSONObject = JSONObject()
+    .put(FIELD_VERSION, SCHEMA_VERSION)
+    .put(FIELD_FRAME_RATE, settings.frameRate)
+    .put(FIELD_SCALING, settings.scaling)
+    .put(FIELD_PRELOAD_ARCHIVES, settings.preloadArchives)
+    .put(FIELD_DEBUG_OVERLAY, settings.debugOverlay)
+    .put(FIELD_LOG_LEVEL, settings.logLevel)
+
+/**
+ * A raw string field, preserving a present value verbatim (including one
+ * that is not a valid option) and falling back only when the key is absent,
+ * null or blank.
+ */
+private fun stringField(root: JSONObject, key: String, fallback: String): String {
+    if (!root.has(key) || root.isNull(key)) return fallback
+    val text = root.get(key).toString().trim()
+    return text.ifEmpty { fallback }
+}
+
+/** Schema version written into the file; bumped on breaking changes. */
+private const val SCHEMA_VERSION = 1
+
+private const val FIELD_VERSION = "version"
+private const val FIELD_FRAME_RATE = "frame_rate"
+private const val FIELD_SCALING = "scaling"
+private const val FIELD_PRELOAD_ARCHIVES = "preload_archives"
+private const val FIELD_DEBUG_OVERLAY = "debug_overlay"
+private const val FIELD_LOG_LEVEL = "log_level"
+
+/**
  * Persists the runtime settings, as **JSON** in the app's private files
  * directory.
  *
@@ -146,7 +214,7 @@ object RuntimeOptions {
  *
  * ```json
  * { "version": 1, "frame_rate": "60", "scaling": "fit",
- *   "preload_archives": "false", "log_level": "info" }
+ *   "preload_archives": "false", "debug_overlay": "false", "log_level": "info" }
  * ```
  */
 class RuntimeSettingsStore(context: Context) {
@@ -167,16 +235,7 @@ class RuntimeSettingsStore(context: Context) {
             Log.w(TAG, "$file is not valid JSON, using the defaults: ${error.message}")
             return RuntimeOptions.DEFAULTS
         }
-        return RuntimeSettings(
-            frameRate = stringField(root, FIELD_FRAME_RATE, RuntimeOptions.DEFAULTS.frameRate),
-            scaling = stringField(root, FIELD_SCALING, RuntimeOptions.DEFAULTS.scaling),
-            preloadArchives = stringField(
-                root,
-                FIELD_PRELOAD_ARCHIVES,
-                RuntimeOptions.DEFAULTS.preloadArchives,
-            ),
-            logLevel = stringField(root, FIELD_LOG_LEVEL, RuntimeOptions.DEFAULTS.logLevel),
-        )
+        return settingsFromJson(root)
     }
 
     /**
@@ -184,12 +243,7 @@ class RuntimeSettingsStore(context: Context) {
      * be replaced, so the caller can tell the user instead of claiming success.
      */
     fun write(settings: RuntimeSettings): Boolean {
-        val root = JSONObject()
-            .put(FIELD_VERSION, SCHEMA_VERSION)
-            .put(FIELD_FRAME_RATE, settings.frameRate)
-            .put(FIELD_SCALING, settings.scaling)
-            .put(FIELD_PRELOAD_ARCHIVES, settings.preloadArchives)
-            .put(FIELD_LOG_LEVEL, settings.logLevel)
+        val root = settingsToJson(settings)
         return runCatching {
             DurableWrite.text(file, root.toString(2))
         }.onFailure { error ->
@@ -197,28 +251,9 @@ class RuntimeSettingsStore(context: Context) {
         }.isSuccess
     }
 
-    /**
-     * A raw string field, preserving a present value verbatim (including one
-     * that is not a valid option) and falling back only when the key is absent,
-     * null or blank.
-     */
-    private fun stringField(root: JSONObject, key: String, fallback: String): String {
-        if (!root.has(key) || root.isNull(key)) return fallback
-        val text = root.get(key).toString().trim()
-        return text.ifEmpty { fallback }
-    }
-
     private companion object {
         const val TAG = "krkr-settings"
 
-        /** Schema version written into the file; bumped on breaking changes. */
-        const val SCHEMA_VERSION = 1
-
         const val FILE_NAME = "settings.json"
-        const val FIELD_VERSION = "version"
-        const val FIELD_FRAME_RATE = "frame_rate"
-        const val FIELD_SCALING = "scaling"
-        const val FIELD_PRELOAD_ARCHIVES = "preload_archives"
-        const val FIELD_LOG_LEVEL = "log_level"
     }
 }

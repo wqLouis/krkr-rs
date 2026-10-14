@@ -3,7 +3,8 @@
 //!
 //! `KrkrGameActivity` persists the user's choices in its own settings file and
 //! publishes them as the static string fields `pendingFrameRate`,
-//! `pendingScaling`, `pendingPreloadArchives` and `pendingLogLevel` before
+//! `pendingScaling`, `pendingPreloadArchives`, `pendingDebugOverlay` and
+//! `pendingLogLevel` before
 //! `super.onCreate` enters native code (see [`crate::jni_fields`]). This module
 //! is where those raw strings become the one validated value the emulator
 //! receives, so the launcher keeps owning configuration loading and the core
@@ -15,8 +16,9 @@
 //! it is never silently replaced by the default.
 //!
 //! The Android launcher owns its own default resolution. The frame-rate default
-//! is the shared built-in (60 fps) and the preload default is the shared
-//! built-in (`false`). The presentation default is
+//! is the shared built-in (60 fps), the preload default is the shared built-in
+//! (`false`) and the debug-overlay default is the shared built-in (`false`).
+//! The presentation default is
 //! [`PresentationScaling::Fit`], not the desktop's `Game`: a phone must never
 //! present the raw logical size, and the picture keeps its aspect rather than
 //! being stretched (`docs/android.md` §2.2). The log-level default is `info`,
@@ -31,6 +33,8 @@ const OPTION_FRAME_RATE: &str = "frame_rate";
 const OPTION_SCALING: &str = "scaling";
 /// Configuration-key name used in archive-preload errors.
 const OPTION_PRELOAD_ARCHIVES: &str = "preload_archives";
+/// Configuration-key name used in debug-overlay errors.
+const OPTION_DEBUG_OVERLAY: &str = "debug_overlay";
 /// Configuration-key name used in log-level errors.
 const OPTION_LOG_LEVEL: &str = "log_level";
 
@@ -133,6 +137,7 @@ pub(crate) fn resolve_runtime_config(
     frame_rate: Option<&str>,
     scaling: Option<&str>,
     preload_archives: Option<&str>,
+    debug_overlay: Option<&str>,
 ) -> Result<RuntimeConfig, ConfigError> {
     let defaults = RuntimeConfig {
         scaling: PresentationScaling::Fit,
@@ -150,13 +155,15 @@ pub(crate) fn resolve_runtime_config(
         Some(value) => parse_bool(OPTION_PRELOAD_ARCHIVES, value)?,
         None => defaults.preload_archives,
     };
+    let debug_overlay = match debug_overlay {
+        Some(value) => parse_bool(OPTION_DEBUG_OVERLAY, value)?,
+        None => defaults.debug_overlay,
+    };
     Ok(RuntimeConfig {
         frame_rate_limit,
         scaling,
         preload_archives,
-        // The Android launcher has no overlay toggle yet, so it stays off;
-        // the field flows through the shared configuration value unchanged.
-        debug_overlay: false,
+        debug_overlay,
     })
 }
 
@@ -171,68 +178,97 @@ mod tests {
         // `Fit` presentation default is the documented Android divergence
         // (`docs/android.md` §2.2): a phone never presents the raw logical
         // size. Archives are not preloaded, the shared built-in default
-        // (`docs/runtime-config.md` §2).
-        let runtime = resolve_runtime_config(None, None, None).expect("defaults");
+        // (`docs/runtime-config.md` §2); the debug overlay is off by default.
+        let runtime = resolve_runtime_config(None, None, None, None).expect("defaults");
         assert_eq!(runtime.frame_rate_limit.fps(), 60);
         assert_eq!(runtime.scaling, PresentationScaling::Fit);
         assert!(!runtime.preload_archives);
-        // The Android launcher has no overlay toggle, so the shared field stays
-        // off rather than exposing a control that does nothing.
         assert!(!runtime.debug_overlay);
     }
 
     #[test]
     fn present_values_override_the_defaults() {
-        let runtime =
-            resolve_runtime_config(Some("30"), Some("game"), Some("true")).expect("valid");
+        let runtime = resolve_runtime_config(Some("30"), Some("game"), Some("true"), Some("true"))
+            .expect("valid");
         assert_eq!(runtime.frame_rate_limit.fps(), 30);
         assert_eq!(runtime.scaling, PresentationScaling::Game);
         assert!(runtime.preload_archives);
+        assert!(runtime.debug_overlay);
     }
 
     #[test]
     fn each_field_falls_back_to_its_own_default() {
-        let runtime = resolve_runtime_config(Some("120"), None, None).expect("valid");
+        let runtime = resolve_runtime_config(Some("120"), None, None, None).expect("valid");
         assert_eq!(runtime.frame_rate_limit.fps(), 120);
         assert_eq!(runtime.scaling, PresentationScaling::Fit);
         assert!(!runtime.preload_archives);
+        assert!(!runtime.debug_overlay);
 
-        let runtime = resolve_runtime_config(None, Some("fill"), None).expect("valid");
+        let runtime = resolve_runtime_config(None, Some("fill"), None, None).expect("valid");
         assert_eq!(runtime.frame_rate_limit.fps(), 60);
         assert_eq!(runtime.scaling, PresentationScaling::Fill);
         assert!(!runtime.preload_archives);
 
-        let runtime = resolve_runtime_config(None, None, Some("false")).expect("valid");
+        let runtime = resolve_runtime_config(None, None, Some("false"), None).expect("valid");
+        assert!(!runtime.preload_archives);
+        assert_eq!(runtime.scaling, PresentationScaling::Fit);
+
+        // The overlay falls back independently of the options beside it.
+        let runtime = resolve_runtime_config(None, None, None, Some("true")).expect("valid");
+        assert!(runtime.debug_overlay);
         assert!(!runtime.preload_archives);
         assert_eq!(runtime.scaling, PresentationScaling::Fit);
     }
 
+    /// The overlay resolves on and off like the other booleans; an unset value
+    /// means the launcher had no override and the shared default (`false`)
+    /// applies, while an unparseable one is rejected with its option name.
+    #[test]
+    fn the_debug_overlay_resolves_on_and_off() {
+        let on = resolve_runtime_config(None, None, None, Some("true")).expect("true is valid");
+        assert!(on.debug_overlay);
+        let off = resolve_runtime_config(None, None, None, Some("false")).expect("false is valid");
+        assert!(!off.debug_overlay);
+        let unset = resolve_runtime_config(None, None, None, None).expect("defaults");
+        assert!(!unset.debug_overlay);
+    }
+
     #[test]
     fn out_of_range_values_are_rejected_with_the_option_and_range() {
-        let error = resolve_runtime_config(Some("0"), None, None)
+        let error = resolve_runtime_config(Some("0"), None, None, None)
             .expect_err("0 is out of range")
             .to_string();
         assert!(error.contains("frame_rate"), "{error}");
         assert!(error.contains("1..=1000"), "{error}");
 
-        let error = resolve_runtime_config(None, Some("stretch"), None)
+        let error = resolve_runtime_config(None, Some("stretch"), None, None)
             .expect_err("unknown scaling")
             .to_string();
         assert!(error.contains("scaling"), "{error}");
         assert!(error.contains("game, fit, fill, expand"), "{error}");
 
-        let error = resolve_runtime_config(None, None, Some("yes"))
+        let error = resolve_runtime_config(None, None, Some("yes"), None)
             .expect_err("unknown preload value")
             .to_string();
         assert!(error.contains("preload_archives"), "{error}");
+        assert!(error.contains("true, false"), "{error}");
+
+        let error = resolve_runtime_config(None, None, None, Some("yes"))
+            .expect_err("unknown debug-overlay value")
+            .to_string();
+        assert!(error.contains("debug_overlay"), "{error}");
         assert!(error.contains("true, false"), "{error}");
     }
 
     #[test]
     fn an_invalid_field_is_rejected_even_when_the_others_are_valid() {
-        assert!(resolve_runtime_config(Some("30"), Some("stretch"), Some("true")).is_err());
-        assert!(resolve_runtime_config(Some("fast"), Some("fit"), Some("false")).is_err());
-        assert!(resolve_runtime_config(Some("60"), Some("fit"), Some("yes")).is_err());
+        assert!(
+            resolve_runtime_config(Some("30"), Some("stretch"), Some("true"), Some("true"))
+                .is_err()
+        );
+        assert!(resolve_runtime_config(Some("fast"), Some("fit"), Some("false"), None).is_err());
+        assert!(resolve_runtime_config(Some("60"), Some("fit"), Some("yes"), None).is_err());
+        assert!(resolve_runtime_config(Some("60"), Some("fit"), None, Some("on")).is_err());
     }
 
     #[test]

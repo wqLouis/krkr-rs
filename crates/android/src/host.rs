@@ -37,6 +37,9 @@ pub(crate) struct AndroidHost {
     /// Whether every mounted archive is read into memory at mount, from the
     /// launcher's resolved settings.
     preload_archives: bool,
+    /// Whether the debug overlay (frame rate and resident memory) is drawn,
+    /// from the launcher's resolved settings.
+    debug_overlay: bool,
     /// The running game, created by [`EventHandler::resumed`].
     running: Option<GameHost>,
     /// Input and focus events received since the last frame.
@@ -58,12 +61,14 @@ impl AndroidHost {
         scaling: ScalingMode,
         game_dir: PathBuf,
         preload_archives: bool,
+        debug_overlay: bool,
     ) -> Self {
         Self {
             backend,
             scaling,
             game_dir,
             preload_archives,
+            debug_overlay,
             running: None,
             pending_events: Vec::new(),
             gestures: GestureSynthesizer::default(),
@@ -164,7 +169,7 @@ impl EventHandler for AndroidHost {
                 return self.fail(format!("cannot obtain the Android display handle: {error}"));
             }
         };
-        let mut config = HostConfig::default();
+        let mut config = HostConfig::default().with_debug_overlay(self.debug_overlay);
         config.backend = self.backend;
         config.surface_size = window.size();
         config.window_handle = Some(window_handle);
