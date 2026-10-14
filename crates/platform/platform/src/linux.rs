@@ -191,7 +191,6 @@ impl<H: EventHandler> ApplicationHandler for AppLoop<H> {
                     event_loop.primary_monitor().map(|monitor| monitor.size()),
                     event_loop
                         .available_monitors()
-                        .into_iter()
                         .map(|monitor| monitor.size()),
                 )
             } else {
@@ -917,7 +916,10 @@ mod window_size_tests {
     /// An event loop that reports no output keeps the configured size.
     #[test]
     fn no_output_selects_no_native_size() {
-        assert_eq!(native_monitor_size(None, std::iter::empty()), None);
+        assert_eq!(
+            native_monitor_size(None, std::iter::empty::<PhysicalSize<u32>>()),
+            None
+        );
     }
 
     /// A primary monitor still wins over the first reported output.
