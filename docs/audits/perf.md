@@ -34,7 +34,7 @@ proposals.
 |---|---|---|---|---|
 | **1** | The host renders **and presents every frame** regardless of scene revision or input; the reference presents only when an update event is posted | `crates/app/src/lib.rs:387,404`; `crates/platform/platform/src/linux.rs:254-261` | **needs-review** (present timing) | **Critical** power: a static VN screen keeps the GPU/display pipeline at the frame-rate cap forever |
 | **2** | Streaming audio reads the decode window through the `tvp-audio` mutex **twice per output sample** and wakes the worker on every read | `crates/engine/src/sound.rs:1884,1887` (calls), `:605` (`frame`), `:456` (lock), `:634` (`notify_all`) | **safe-to-adopt** | **High** CPU/power: ~96k–192k lock+notify pairs/s per streaming source at 48 kHz stereo |
-| **3** | Swapchain prefers **`MAILBOX`**, so `queue_present` never blocks on vsync; the reference uses `D3DPRESENT_INTERVAL_IMMEDIATE` but compensates with update-on-demand | `crates/platform/render/src/vulkan/swapchain.rs:382-386` | **needs-review** (present timing) | High power in combination with #1 |
+| **3** | Swapchain is pinned to **`FIFO`** (vsync), so `queue_present` blocks until the display refresh and throttles the loop; the reference uses `D3DPRESENT_INTERVAL_IMMEDIATE` but compensates with update-on-demand | `crates/platform/render/src/vulkan/swapchain.rs:376-384` | **safe-to-adopt** (not script-observable, D34) | High power in combination with #1 |
 | **4** | Every dirty bitmap is re-uploaded **in full**; `BitmapState` carries only a `dirty` flag, no region | `crates/app/src/lib.rs:673` | **needs-review** (cross-cutting L2) | High on Vulkan when any bitmap changes |
 | **5** | `sync_dirty_bitmaps` and `prune_stale_textures` allocate a `Vec` and scan the whole bitmap/texture set **every frame**, even when nothing is dirty | `crates/app/src/lib.rs:612-690` | **safe-to-adopt** | Medium CPU/allocator churn, scales with scene size |
 | **6** | Reference **update-region plumbing** (`tTVPComplexRect` → `BeginUpdate` → partial present) is absent | `reference/cpp/core/visual/LayerManager.cpp:1046-1065`; `WindowIntf.cpp:610-624` | **needs-review** (cross-cutting) | Medium–high; the real fix for #1/#4 |
@@ -124,13 +124,14 @@ show skipped frames climbing while rendered frames stay flat.
 
 **Swapchain present mode / vsync / image count.**
 
-* Present mode is chosen as `MAILBOX` whenever available, else `FIFO`
-  (`crates/platform/render/src/vulkan/swapchain.rs:380-386`). `MAILBOX`
-  returns from `queue_present` immediately, so with #1 present the loop spins
-  at the frame-rate cap. `FIFO` would block and throttle. The reference's
-  `IMMEDIATE` is not vsync-blocked either, so switching to `FIFO` alone would
-  diverge from the reference's present timing while not fixing the root
-  cause; the faithful fix is the update gate. **needs-review.**
+* Present mode is pinned to `FIFO` (vsync)
+  (`crates/platform/render/src/vulkan/swapchain.rs:376-384`). `FIFO` blocks in
+  `queue_present` until the next display refresh, throttling the loop to the
+  refresh rate instead of spinning at the frame-rate cap. The reference's
+  `IMMEDIATE` is not vsync-blocked, but it compensates with update-on-demand
+  (#1); combined with #1 the port's per-frame present would otherwise run
+  unthrottled. Present mode is not script-observable, so this is
+  **safe-to-adopt** on its own; #1 remains the root-cause fix.
 * There is no `waitVSync`-driven behaviour; see §4 and item #7.
 * Image count is `min_image_count + 1` capped by `max_image_count`
   (`crates/platform/render/src/vulkan/swapchain.rs:136-140`). One extra image

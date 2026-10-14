@@ -4,6 +4,11 @@
 //! / `VK_SUBOPTIMAL_KHR`. The surface format, present mode and render pass are
 //! pinned once (the first time the swapchain is built) and reused on every
 //! recreation, so the compiled pipelines never have to be rebuilt.
+//!
+//! `FIFO` (vsync) is pinned as the present mode: it blocks in `queue_present`
+//! until the next display refresh, so the per-frame loop is throttled to the
+//! refresh rate instead of spinning unthrottled and keeping the device at full
+//! power.
 #![allow(unsafe_code)]
 
 use ash::vk;
@@ -120,16 +125,7 @@ pub(crate) fn create(
 
     let present_mode = match old {
         Some(old) => old.present_mode,
-        None => {
-            // SAFETY: as above.
-            let modes = unsafe {
-                surface_loader.get_physical_device_surface_present_modes(physical_device, surface)
-            }
-            .map_err(|error| RenderError::Framebuffer {
-                message: format!("failed to query surface present modes: {error}"),
-            })?;
-            choose_present_mode(&modes)
-        }
+        None => choose_present_mode(),
     };
 
     let extent = choose_extent(&capabilities, requested);
@@ -377,14 +373,14 @@ fn choose_surface_format(
     formats.first().copied()
 }
 
-/// Picks the present mode: `MAILBOX` when available (low latency), else the
-/// universally supported `FIFO`.
-fn choose_present_mode(modes: &[vk::PresentModeKHR]) -> vk::PresentModeKHR {
-    if modes.contains(&vk::PresentModeKHR::MAILBOX) {
-        vk::PresentModeKHR::MAILBOX
-    } else {
-        vk::PresentModeKHR::FIFO
-    }
+/// Picks the present mode: always `FIFO` (vsync).
+///
+/// `FIFO` blocks in `queue_present` until the next display refresh, throttling
+/// the loop to the refresh rate and keeping the device from running at full
+/// power. Every Vulkan presentation surface is required to support `FIFO`, so
+/// there is no alternative to fall back to.
+fn choose_present_mode() -> vk::PresentModeKHR {
+    vk::PresentModeKHR::FIFO
 }
 
 /// Resolves the swapchain extent from the capabilities and the requested size.
