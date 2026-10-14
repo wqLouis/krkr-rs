@@ -529,6 +529,109 @@ fn mix_source_accumulates_into_the_caller_buffer() {
     ));
 }
 
+/// Resample `source` into `out` one frame at a time with `SoundSource::frame`.
+/// This is the per-frame reference the bulk window path must stay
+/// byte-identical to.
+fn mix_source_per_frame(
+    source: &SoundSource,
+    position_seconds: f64,
+    rate: f64,
+    gain: f32,
+    pan: f32,
+    out: &mut [f32],
+    out_spec: AudioSpec,
+) {
+    let out_channels = usize::try_from(out_spec.channels).expect("channel count fits");
+    let out_rate = f64::from(out_spec.sample_rate);
+    let src_rate = f64::from(source.sample_rate().max(1));
+    let src_channels = usize::try_from(source.channels()).expect("channel count fits");
+    let rate = if rate.is_finite() { rate } else { 1.0 };
+    let p = pan.clamp(-1.0, 1.0);
+    let (left_gain, right_gain) = (1.0 - p.max(0.0), 1.0 - (-p).max(0.0));
+    for (index, frame) in out.chunks_exact_mut(out_channels).enumerate() {
+        let t = position_seconds + index as f64 / out_rate * rate;
+        let sample_pos = (t * src_rate).max(0.0);
+        if !sample_pos.is_finite() || sample_pos >= u64::MAX as f64 {
+            continue;
+        }
+        let i0 = sample_pos.floor();
+        let i0u = i0 as u64;
+        let frac = (sample_pos - i0) as f32;
+        let Some((a0, b0)) = source.frame(i0u).expect("read") else {
+            continue;
+        };
+        let (a1, b1) = source
+            .frame(i0u.saturating_add(1))
+            .expect("read")
+            .unwrap_or((a0, b0));
+        let (left, right) = if src_channels == 1 {
+            let s = a0 + (a1 - a0) * frac;
+            (s, s)
+        } else {
+            (a0 + (a1 - a0) * frac, b0 + (b1 - b0) * frac)
+        };
+        if out_channels == 1 {
+            frame[0] += (left * left_gain + right * right_gain) * 0.5 * gain;
+        } else {
+            frame[0] += left * gain * left_gain;
+            frame[1] += right * gain * right_gain;
+        }
+    }
+}
+
+/// The mixer pulls a contiguous window of source frames under one lock and
+/// interpolates from it. The mixed PCM must not change: the bulk path and the
+/// per-frame path must produce byte-identical samples, including at the source
+/// end, across resampling ratios, gains and pans.
+#[test]
+fn bulk_window_matches_the_per_frame_path() {
+    for (src_channels, src_rate, out_spec) in [
+        (2u32, 44_100u32, out_spec(48_000, 2)),
+        (1, 44_100, out_spec(48_000, 1)),
+        (2, 48_000, out_spec(22_050, 2)),
+    ] {
+        let frames = 200_000u64;
+        let channel_count = usize::try_from(src_channels).expect("channel count fits");
+        let interleaved: Vec<f32> = (0..frames)
+            .flat_map(|f| {
+                let base = f as f32 * 0.001;
+                (0..channel_count).map(move |c| if c == 0 { base } else { -base })
+            })
+            .collect();
+        let spec = AudioSpec {
+            sample_rate: src_rate,
+            channels: src_channels,
+            total_frames: Some(frames),
+        };
+        let source =
+            SoundSource::new(Arc::new(DecodedAudio::new(spec, interleaved))).expect("valid source");
+
+        for position in [0.0f64, 0.5, 1.25, 4.0] {
+            for rate in [0.5f64, 1.0, 1.5, 2.0] {
+                for (gain, pan) in [(1.0f32, 0.0f32), (0.5, -0.25), (0.75, 0.8)] {
+                    let out_frames = 4096;
+                    let mut bulk = vec![0.0f32; out_frames * 2];
+                    mix_source(&source, position, rate, gain, pan, &mut bulk, out_spec).unwrap();
+                    let mut per_frame = vec![0.0f32; out_frames * 2];
+                    mix_source_per_frame(
+                        &source,
+                        position,
+                        rate,
+                        gain,
+                        pan,
+                        &mut per_frame,
+                        out_spec,
+                    );
+                    assert_eq!(
+                        bulk, per_frame,
+                        "bulk window differs at {position}s rate {rate} gain {gain} pan {pan}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn two_mixers_do_not_share_state() {
     let mut first = Mixer::new();
@@ -921,6 +1024,41 @@ fn streaming_source_returns_none_past_the_end() {
     assert_eq!(source.frame(99).unwrap().unwrap().0, 99.0);
     assert_eq!(source.frame(100).unwrap(), None);
     assert_eq!(source.frame(10_000).unwrap(), None);
+}
+
+/// The mixer pulls a contiguous window with one `SoundSource::read_into`, so
+/// the bulk read must return the same frames the per-frame path would and stop
+/// exactly at the reported end.
+#[test]
+fn streaming_read_into_copies_a_contiguous_window() {
+    let (stream, _reads, _seeks) = CountingStream::ramp(8_000, 1, 20_000);
+    let spec = AudioSpec {
+        sample_rate: 8_000,
+        channels: 1,
+        total_frames: Some(20_000),
+    };
+    let source = SoundSource::streaming(spec, Box::new(stream), None).expect("source");
+
+    let mut out = vec![0.0f32; 2_048 * 2];
+    let mut got = 0usize;
+    while got < 2_048 {
+        let n = source
+            .read_into(&mut out[got * 2..], got as u64, 2_048 - got)
+            .unwrap();
+        assert!(n > 0, "the stream ended early at {got} frames");
+        got += n;
+    }
+    assert_eq!((out[0], out[1]), (0.0, 0.0));
+    assert_eq!((out[2_047 * 2], out[2_047 * 2 + 1]), (2_047.0, 2_047.0));
+
+    // A window that crosses the reported end copies only the real frames.
+    let mut tail = vec![0.0f32; 4 * 2];
+    assert_eq!(source.read_into(&mut tail, 19_998, 4).unwrap(), 2);
+    assert_eq!((tail[0], tail[1]), (19_998.0, 19_998.0));
+    assert_eq!((tail[2], tail[3]), (19_999.0, 19_999.0));
+
+    // At or past the total nothing is copied.
+    assert_eq!(source.read_into(&mut tail, 20_000, 4).unwrap(), 0);
 }
 
 /// Reference: the decode thread keeps only a bounded buffer and drops the

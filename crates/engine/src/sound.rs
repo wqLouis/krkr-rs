@@ -344,6 +344,9 @@ struct StreamBuffer {
     lookahead_frames: u64,
     /// Frames kept behind `cursor` so an overlapping read does not reseek.
     retain_frames: u64,
+    /// The `cursor` value the worker was last woken at, so a reader signals
+    /// only after the cursor has advanced by the retain window.
+    notify_cursor: u64,
     /// Set once `read` reported the end.
     eof: bool,
     /// Total frames once the decoder reported the end.
@@ -419,6 +422,16 @@ impl StreamBuffer {
                 self.samples.pop_front();
             }
             self.start += 1;
+        }
+    }
+
+    /// Wakes the decode worker once the cursor has advanced by the retain
+    /// window since the last wake, so the worker decodes another chunk only
+    /// when the lookahead has room for it.
+    fn notify_worker(&mut self, shared: &StreamShared) {
+        if self.cursor.saturating_sub(self.notify_cursor) >= self.retain_frames {
+            self.notify_cursor = self.cursor;
+            shared.work_ready.notify_all();
         }
     }
 }
@@ -559,6 +572,7 @@ impl StreamSource {
             cursor: 0,
             lookahead_frames: u64::from(rate).max(1),
             retain_frames: chunk_frames as u64,
+            notify_cursor: 0,
             eof: false,
             total: None,
             seek_request: None,
@@ -621,23 +635,87 @@ impl StreamSource {
                 // through the skipped frames.
                 buffer.seek_request = Some(index);
                 buffer.cursor = index;
+                buffer.notify_cursor = index;
                 shared.work_ready.notify_all();
             } else if index == buffer.end() {
                 // Starved at the leading edge: the worker is decoding.
                 buffer.cursor = index;
+                buffer.notify_cursor = index;
                 shared.work_ready.notify_all();
             }
             if buffer.covers(index) {
                 let sample = buffer.read_frame(index)?;
                 buffer.cursor = index.saturating_add(1);
                 buffer.trim();
-                shared.work_ready.notify_all();
+                buffer.notify_worker(shared);
                 return Ok(Some(sample));
             }
             buffer = shared
                 .data_ready
                 .wait(buffer)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    /// Copies up to `frames` decoded frames starting at `start` into `out` as
+    /// interleaved `(left, right)` pairs, returning the number copied.
+    ///
+    /// Frames at or past the end are not copied, so a short return means the
+    /// stream ended. `out` must hold `frames * 2` samples. Like
+    /// [`Self::frame`], a frame outside the window asks the worker to reseek
+    /// and a frame at the leading edge waits for the next decoded chunk; the
+    /// difference is that the whole contiguous window is read under one lock.
+    fn read_into(&self, out: &mut [f32], start: u64, frames: usize) -> Result<usize, SoundError> {
+        let shared = &self.shared;
+        let mut buffer = lock_buffer(shared);
+        if !buffer.started {
+            buffer.started = true;
+            shared.work_ready.notify_all();
+        }
+        loop {
+            if let Some(error) = &buffer.error {
+                return Err(error.clone());
+            }
+            if start < buffer.start || start > buffer.end() {
+                // Backwards, or a forward gap: reseek instead of decoding
+                // through the skipped frames.
+                buffer.seek_request = Some(start);
+                buffer.cursor = start;
+                buffer.notify_cursor = start;
+                shared.work_ready.notify_all();
+                buffer = shared
+                    .data_ready
+                    .wait(buffer)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                continue;
+            }
+            if start == buffer.end() {
+                if buffer.eof {
+                    return Ok(0);
+                }
+                // Starved at the leading edge: the worker is decoding.
+                buffer.cursor = buffer.cursor.max(start);
+                buffer.notify_cursor = buffer.cursor;
+                shared.work_ready.notify_all();
+                buffer = shared
+                    .data_ready
+                    .wait(buffer)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                continue;
+            }
+            let available = buffer.end().saturating_sub(start).min(frames as u64);
+            let available = usize::try_from(available).map_err(|_| SoundError::Decode {
+                message: "decoded window length does not fit in memory".to_string(),
+            })?;
+            for (k, pair) in out.chunks_exact_mut(2).take(available).enumerate() {
+                let (left, right) = buffer.read_frame(start.saturating_add(k as u64))?;
+                pair[0] = left;
+                pair[1] = right;
+            }
+            buffer.cursor = buffer.cursor.max(start.saturating_add(available as u64));
+            buffer.trim();
+            buffer.notify_worker(shared);
+            return Ok(available);
         }
     }
 
@@ -988,6 +1066,75 @@ impl SoundSource {
         match &self.pcm {
             Pcm::Buffer(audio) => Ok(buffer_frame(audio, frame)),
             Pcm::Stream(source) => source.frame(frame),
+        }
+    }
+
+    /// Copy up to `frames` decoded frames starting at `start_frame` into `out`
+    /// as interleaved `(left, right)` pairs, returning the number copied.
+    ///
+    /// Frames at or past the reported/decoded end are not copied, so a short
+    /// return means the source ended there. `out` must hold `frames * 2`
+    /// samples. A streaming source takes its decode-ahead buffer lock once for
+    /// the whole window rather than once per frame, which is what the mixer's
+    /// resampler uses; a decoder failure is a typed error, never silence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SoundError::Decode`] when the window does not fit in memory
+    /// or the decoder fails.
+    pub fn read_into(
+        &self,
+        out: &mut [f32],
+        start_frame: u64,
+        frames: usize,
+    ) -> Result<usize, SoundError> {
+        let frames = match self.spec.total_frames {
+            Some(total) if start_frame >= total => return Ok(0),
+            // The container length caps the read so a frame at or past the
+            // reported end is never handed to the decoder.
+            Some(total) => {
+                usize::try_from((frames as u64).min(total - start_frame)).map_err(|_| {
+                    SoundError::Decode {
+                        message: "read window does not fit in memory".to_string(),
+                    }
+                })?
+            }
+            None => frames,
+        };
+        let needed = frames.checked_mul(2).ok_or_else(|| SoundError::Decode {
+            message: "read window does not fit in memory".to_string(),
+        })?;
+        if out.len() < needed {
+            return Err(SoundError::Decode {
+                message: format!(
+                    "read window of {frames} frames needs {needed} samples but the buffer holds {}",
+                    out.len()
+                ),
+            });
+        }
+        match &self.pcm {
+            Pcm::Buffer(audio) => {
+                let total = audio.frame_count();
+                let available = if start_frame >= total {
+                    0
+                } else {
+                    usize::try_from((total - start_frame).min(frames as u64)).map_err(|_| {
+                        SoundError::Decode {
+                            message: "decoded window length does not fit in memory".to_string(),
+                        }
+                    })?
+                };
+                for (k, pair) in out.chunks_exact_mut(2).take(available).enumerate() {
+                    let (left, right) = buffer_frame(audio, start_frame.saturating_add(k as u64))
+                        .ok_or_else(|| SoundError::Decode {
+                        message: "decoded buffer is shorter than the frame index".to_string(),
+                    })?;
+                    pair[0] = left;
+                    pair[1] = right;
+                }
+                Ok(available)
+            }
+            Pcm::Stream(source) => source.read_into(out, start_frame, frames),
         }
     }
 
@@ -1871,6 +2018,18 @@ fn accumulate_source(
     })?;
     let rate = if rate.is_finite() { rate } else { 1.0 };
     let (left_gain, right_gain) = pan_gains(pan);
+    let out_frames = out.len() / out_channels;
+
+    // The source frames the resampler needs are contiguous, so load them into
+    // a scratch window in bulk and interpolate from there. A streaming source
+    // then takes its decode-ahead buffer lock once per window instead of once
+    // per interpolated frame. `scratch` holds `(left, right)` pairs for
+    // `[window_start, window_start + window_frames)`; frames past the source
+    // end are absent and set `end_reached`.
+    let mut scratch: Vec<f32> = Vec::new();
+    let mut window_start = 0u64;
+    let mut window_frames = 0usize;
+    let mut end_reached = false;
 
     for (index, frame) in out.chunks_exact_mut(out_channels).enumerate() {
         let t = position_seconds + index as f64 / out_rate * rate;
@@ -1881,10 +2040,65 @@ fn accumulate_source(
         let i0 = sample_pos.floor();
         let i0u = i0 as u64;
         let frac = (sample_pos - i0) as f32;
-        let Some((a0, b0)) = source.frame(i0u)? else {
+
+        // A backwards read, or a forward gap the worker would otherwise
+        // decode through, starts a fresh window at the requested frame.
+        if i0u < window_start || i0u > window_start.saturating_add(window_frames as u64) {
+            window_start = i0u;
+            window_frames = 0;
+            end_reached = false;
+        }
+        if !end_reached {
+            // Grow the window until it covers the interpolated frame and its
+            // successor, requesting the rest of the output as one batch.
+            while i0u.saturating_add(1) >= window_start.saturating_add(window_frames as u64) {
+                let remaining = (out_frames - index) as u64;
+                let needed = i0u
+                    .saturating_add(2)
+                    .saturating_sub(window_start.saturating_add(window_frames as u64));
+                let want = needed.max(remaining.saturating_add(2));
+                let want = usize::try_from(want).map_err(|_| SoundError::Decode {
+                    message: "interpolation window does not fit in memory".to_string(),
+                })?;
+                let want_samples = want.checked_mul(2).ok_or_else(|| SoundError::Decode {
+                    message: "interpolation window does not fit in memory".to_string(),
+                })?;
+                let base = window_frames
+                    .checked_mul(2)
+                    .ok_or_else(|| SoundError::Decode {
+                        message: "interpolation window does not fit in memory".to_string(),
+                    })?;
+                let grown = base
+                    .checked_add(want_samples)
+                    .ok_or_else(|| SoundError::Decode {
+                        message: "interpolation window does not fit in memory".to_string(),
+                    })?;
+                scratch.resize(grown, 0.0);
+                let loaded_start = window_start.saturating_add(window_frames as u64);
+                let written = source.read_into(&mut scratch[base..], loaded_start, want)?;
+                if written == 0 {
+                    end_reached = true;
+                    break;
+                }
+                window_frames += written;
+            }
+        }
+
+        let offset =
+            usize::try_from(i0u.saturating_sub(window_start)).map_err(|_| SoundError::Decode {
+                message: "interpolation window does not fit in memory".to_string(),
+            })?;
+        if offset >= window_frames {
+            // The source ended before this output frame.
             continue;
+        }
+        let a0 = scratch[offset * 2];
+        let b0 = scratch[offset * 2 + 1];
+        let (a1, b1) = if offset + 1 < window_frames {
+            (scratch[(offset + 1) * 2], scratch[(offset + 1) * 2 + 1])
+        } else {
+            (a0, b0)
         };
-        let (a1, b1) = source.frame(i0u.saturating_add(1))?.unwrap_or((a0, b0));
         let (left, right) = if src_channels == 1 {
             let s = a0 + (a1 - a0) * frac;
             (s, s)
