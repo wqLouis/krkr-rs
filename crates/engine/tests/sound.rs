@@ -1061,6 +1061,56 @@ fn streaming_read_into_copies_a_contiguous_window() {
     assert_eq!(source.read_into(&mut tail, 20_000, 4).unwrap(), 0);
 }
 
+/// A stream whose length the container does not report must stop at the
+/// decoder's end instead of reseeking for every trailing output frame.
+///
+/// The per-frame path already returns at `eof` before the out-of-window
+/// reseek; the bulk path must too, or a compressed container is reopened once
+/// per output frame at the end of playback (a measured multi-second stall).
+#[test]
+fn streaming_read_into_past_the_end_does_not_reseek() {
+    let (stream, _reads, seeks) = CountingStream::ramp(8_000, 1, 4_000);
+    // An unknown total is what leaves the reader to discover the end from the
+    // worker, exactly as an OGG stream without a duration does.
+    let spec = AudioSpec {
+        sample_rate: 8_000,
+        channels: 1,
+        total_frames: None,
+    };
+    let source = SoundSource::streaming(spec, Box::new(stream), None).expect("source");
+
+    // Drain the window to its end, so the worker has reported `eof`.
+    let mut out = vec![0.0f32; 512 * 2];
+    let mut got = 0u64;
+    loop {
+        let n = source.read_into(&mut out, got, 512).unwrap();
+        if n == 0 {
+            break;
+        }
+        got += n as u64;
+        assert!(
+            got <= 4_000,
+            "the stream returned more frames than it holds"
+        );
+    }
+    assert_eq!(got, 4_000, "the stream did not drain to its end");
+
+    // Every request at or past the end reports the end without a reseek.
+    let seeks_before = seeks.load(Ordering::Relaxed);
+    for start in 4_000..4_064 {
+        assert_eq!(
+            source.read_into(&mut out, start, 2).unwrap(),
+            0,
+            "a past-the-end read at {start} did not report the end"
+        );
+    }
+    assert_eq!(
+        seeks.load(Ordering::Relaxed),
+        seeks_before,
+        "past-the-end reads reseeked the decoder"
+    );
+}
+
 /// Reference: the decode thread keeps only a bounded buffer and drops the
 /// consumed prefix (`reference/cpp/core/sound/win32/WaveImpl.cpp:2389-2463`
 /// fills a fixed L2 buffer); materializing the stream for a filter must not

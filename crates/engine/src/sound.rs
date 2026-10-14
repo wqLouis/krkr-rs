@@ -344,9 +344,6 @@ struct StreamBuffer {
     lookahead_frames: u64,
     /// Frames kept behind `cursor` so an overlapping read does not reseek.
     retain_frames: u64,
-    /// The `cursor` value the worker was last woken at, so a reader signals
-    /// only after the cursor has advanced by the retain window.
-    notify_cursor: u64,
     /// Set once `read` reported the end.
     eof: bool,
     /// Total frames once the decoder reported the end.
@@ -425,12 +422,15 @@ impl StreamBuffer {
         }
     }
 
-    /// Wakes the decode worker once the cursor has advanced by the retain
-    /// window since the last wake, so the worker decodes another chunk only
-    /// when the lookahead has room for it.
+    /// Wakes the decode worker when the decoded window is no longer full.
+    ///
+    /// The worker sleeps while `end >= cursor + lookahead_frames`, so the
+    /// reader must wake it exactly once its cursor has advanced far enough
+    /// that the window is no longer full. Waking later than that leaves the
+    /// worker asleep while the window drains and the reader starves at the
+    /// leading edge.
     fn notify_worker(&mut self, shared: &StreamShared) {
-        if self.cursor.saturating_sub(self.notify_cursor) >= self.retain_frames {
-            self.notify_cursor = self.cursor;
+        if self.end() < self.cursor.saturating_add(self.lookahead_frames) {
             shared.work_ready.notify_all();
         }
     }
@@ -572,7 +572,6 @@ impl StreamSource {
             cursor: 0,
             lookahead_frames: u64::from(rate).max(1),
             retain_frames: chunk_frames as u64,
-            notify_cursor: 0,
             eof: false,
             total: None,
             seek_request: None,
@@ -635,12 +634,10 @@ impl StreamSource {
                 // through the skipped frames.
                 buffer.seek_request = Some(index);
                 buffer.cursor = index;
-                buffer.notify_cursor = index;
                 shared.work_ready.notify_all();
             } else if index == buffer.end() {
                 // Starved at the leading edge: the worker is decoding.
                 buffer.cursor = index;
-                buffer.notify_cursor = index;
                 shared.work_ready.notify_all();
             }
             if buffer.covers(index) {
@@ -676,12 +673,19 @@ impl StreamSource {
             if let Some(error) = &buffer.error {
                 return Err(error.clone());
             }
+            // Once the decoder has reported the end, a request at or past the
+            // decoded end is the end of the stream, not a forward gap. The
+            // per-frame path returns the same way; without this guard,
+            // reseeking here reopens the decoder for every trailing output
+            // frame, which re-probes a compressed container each time.
+            if buffer.eof && start >= buffer.end() {
+                return Ok(0);
+            }
             if start < buffer.start || start > buffer.end() {
                 // Backwards, or a forward gap: reseek instead of decoding
                 // through the skipped frames.
                 buffer.seek_request = Some(start);
                 buffer.cursor = start;
-                buffer.notify_cursor = start;
                 shared.work_ready.notify_all();
                 buffer = shared
                     .data_ready
@@ -695,7 +699,6 @@ impl StreamSource {
                 }
                 // Starved at the leading edge: the worker is decoding.
                 buffer.cursor = buffer.cursor.max(start);
-                buffer.notify_cursor = buffer.cursor;
                 shared.work_ready.notify_all();
                 buffer = shared
                     .data_ready

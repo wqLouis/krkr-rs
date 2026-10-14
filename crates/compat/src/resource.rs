@@ -299,6 +299,13 @@ pub(crate) fn resolve_face(
 
 /// Try one face candidate through the `System.addFont` registry, the attached
 /// storage and the host's installed system fonts (exact family only).
+///
+/// A face spelled as a family name is never tried as a storage path: the
+/// reference resolves a face only through its registered font names
+/// (`TVPFindFont`, `FontImpl.cpp:277-291`), so probing the storage for a bare
+/// family name misses on every text draw (a full storage search each time).
+/// A file-shaped face (`somefont.ttf`) is still tried, which is how a script
+/// loads a font file named directly as its face.
 fn try_face(ctx: &CompatCtx, engine: &mut TextEngine, face: &str) -> Result<FontId, String> {
     if let Some(id) = engine.font_id(face) {
         return Ok(id);
@@ -312,25 +319,44 @@ fn try_face(ctx: &CompatCtx, engine: &mut TextEngine, face: &str) -> Result<Font
             .add_font(&bytes, index)
             .map_err(|error| format!("face '{face}' is not a usable font: {error}"));
     }
-    // SAFETY: the caller resolved `ctx` from the installed binding.
-    if let Some(storage) = unsafe { ctx.services() }.storage() {
-        // SAFETY: the host keeps the attached storage alive for the binding's
-        // lifetime (the `attach_storage` contract).
-        let storage = unsafe { &*storage };
-        // The media prefix is L3 syntax; the L2 namespace resolves the bare name.
-        match storage.read(strip_file_media(face)) {
-            Ok(bytes) => {
-                return engine
-                    .add_font(&bytes, 0)
-                    .map_err(|error| format!("face '{face}' is not a usable font: {error}"));
+    if is_font_file_name(face) {
+        // SAFETY: the caller resolved `ctx` from the installed binding.
+        let registered_storage = unsafe { ctx.services() }.storage();
+        if let Some(storage) = registered_storage {
+            // SAFETY: the host keeps the attached storage alive for the
+            // binding's lifetime (the `attach_storage` contract).
+            let storage = unsafe { &*storage };
+            // The media prefix is L3 syntax; the L2 namespace resolves the bare name.
+            match storage.read(strip_file_media(face)) {
+                Ok(bytes) => {
+                    return engine
+                        .add_font(&bytes, 0)
+                        .map_err(|error| format!("face '{face}' is not a usable font: {error}"));
+                }
+                Err(StorageReadError::NotFound(_)) => {}
+                Err(error) => return Err(error.to_string()),
             }
-            Err(StorageReadError::NotFound(_)) => {}
-            Err(error) => return Err(error.to_string()),
         }
     }
     engine
         .load_system_font_exact(face)
         .map_err(|error| error.to_string())
+}
+
+/// Whether `face` is spelled like a font file rather than a family name.
+///
+/// Only a file-shaped name is worth trying as a storage path; the font
+/// extensions are the OpenType/TrueType families the reference enumerates
+/// (`FontImpl.cpp:166-183`).
+fn is_font_file_name(face: &str) -> bool {
+    let face = strip_file_media(face);
+    let extension = face
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase());
+    matches!(
+        extension.as_deref(),
+        Some("ttf" | "ttc" | "otf" | "otc" | "tte" | "dfont")
+    )
 }
 
 /// Extract the text a `drawGlyph` glyph argument carries: a string, or an
